@@ -1,7 +1,7 @@
 //! Kubernetes Service 生命周期管理
 //!
-//! 为每个 agent_runner Pod 创建对应的 K8s ClusterIP Service，
-//! 提供稳定的 DNS 名，用于 Envoy Gateway 路由发现。
+//! 为每个 agent_runner Pod 创建对应的 K8s Service（集群内用 ClusterIP，
+//! deploy-host 用 NodePort），提供稳定的 DNS 名及宿主机可达地址。
 //! 使用 trait extension 模式为 `KubernetesRuntime` 添加 Service 操作方法。
 
 #[cfg(feature = "kubernetes")]
@@ -11,11 +11,11 @@ use container_runtime_api::{ContainerRuntimeError, ContainerRuntimeResult};
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
 #[cfg(feature = "kubernetes")]
-use kube::api::{Api, DeleteParams, ObjectMeta, PostParams};
+use kube::api::{Api, DeleteParams, ObjectMeta, Patch, PostParams};
 #[cfg(feature = "kubernetes")]
 use shared_types::{
-    AGENT_FILE_SERVER_PORT, GRPC_DEFAULT_PORT, HTTP_DEFAULT_PORT, NOVNC_PORT, ServiceType,
-    WS_TERMINAL_PORT,
+    AGENT_FILE_SERVER_PORT, APP_CLI_ADMIN_PORT, APP_ENTRY_PORT, DBX_PORT, GRPC_DEFAULT_PORT,
+    HTTP_DEFAULT_PORT, IME_PORT, NOVNC_PORT, ServiceType, WS_TERMINAL_PORT,
 };
 #[cfg(feature = "kubernetes")]
 use std::collections::BTreeMap;
@@ -39,11 +39,245 @@ const AGENT_NOVNC_PORT: u32 = NOVNC_PORT as u32;
 /// Agent Runner WS 终端中间层端口（agent_runner tokio-tungstenite 监听；Pingora TtydProxy 路由到此）
 const AGENT_WS_TERMINAL_PORT: u32 = WS_TERMINAL_PORT as u32;
 
+/// DBX 数据库 Web GUI 端口（agent-runner 镜像 supervisor 恒起；Pingora /api/v1/userapp/proxy/dbx/dev/{user_id}/{app_id} 路由到此）
+const AGENT_DBX_PORT: u32 = DBX_PORT as u32;
+
+/// agent per-pod Service 的 TCP 端口条目
+fn tcp_service_port(name: &str, port: u16) -> ServicePort {
+    ServicePort {
+        name: Some(name.to_string()),
+        port: port as i32,
+        target_port: Some(
+            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(port as i32),
+        ),
+        protocol: Some("TCP".to_string()),
+        ..Default::default()
+    }
+}
+
+/// agent per-pod Service 端口清单（创建与存量收敛共用同一期望）。
+///
+/// 基础六端口恒暴露；UserappBuilder 追加三个专属端口：
+/// - app-cli 管理/日志 3010：app_manager `log_api_base` dev 分支按
+///   `{svc}:{APP_CLI_ADMIN_PORT}` 连容器内 app-cli；
+/// - 应用流量入口 9080（pingap）：dev 应用代理（rcoder-proxy dev_app_proxy）
+///   按 `{svc}:{APP_ENTRY_PORT}` 拨上游；
+/// - 输入法 6091：ImeProxy（computer/userapp 两族）按 `{svc}:{IME_PORT}`
+///   拨上游（agent-runner 镜像 supervisor 恒起）。
+///
+/// 音频 6089/6090 不在此列：builder 容器内无音频服务（userapp 开发容器
+/// 无桌面音频），声明了也无对应监听。
+///
+/// ClusterIP 未声明的端口无 kube-proxy/Cilium 转发规则（SYN 被丢弃
+/// → 连接超时）。其他 agent 类型容器内不跑 app-cli/pingap/ime 桥接，不暴露。
+fn agent_service_ports(service_type: &ServiceType) -> Vec<ServicePort> {
+    let mut ports = vec![
+        tcp_service_port("http", AGENT_HTTP_PORT as u16),
+        tcp_service_port("grpc", AGENT_GRPC_PORT as u16),
+        tcp_service_port("novnc", AGENT_NOVNC_PORT as u16),
+        tcp_service_port("ws-terminal", AGENT_WS_TERMINAL_PORT as u16),
+        tcp_service_port("file-server", AGENT_FILE_SERVER_PORT),
+        tcp_service_port("dbx", AGENT_DBX_PORT as u16),
+    ];
+    if matches!(service_type, ServiceType::UserappBuilder) {
+        ports.push(tcp_service_port("app-cli-admin", APP_CLI_ADMIN_PORT));
+        ports.push(tcp_service_port("app-entry", APP_ENTRY_PORT));
+        ports.push(tcp_service_port("ime", IME_PORT));
+    }
+    ports
+}
+
+/// 组装 agent per-pod Service 的期望全量 spec（缺失创建与存量 SSA 收敛同源）
+pub(super) fn agent_service_object(
+    namespace: &str,
+    svc_name: &str,
+    identifier: &str,
+    service_type: &ServiceType,
+) -> Service {
+    Service {
+        metadata: ObjectMeta {
+            name: Some(svc_name.to_string()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(build_standard_labels(identifier, service_type)),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            // deploy-host：NodePort（server 分配 nodePort，apply 后读回登记注册表，
+            // rcoder 进程经 RCODER_K8S_NODE_IP 指定的节点地址触达 agent）
+            #[cfg(feature = "deploy-host")]
+            type_: Some(
+                if shared_types::is_deploy_host() {
+                    "NodePort"
+                } else {
+                    "ClusterIP"
+                }
+                .to_string(),
+            ),
+            #[cfg(not(feature = "deploy-host"))]
+            type_: Some("ClusterIP".to_string()),
+            selector: Some(build_selector_labels(identifier, service_type)),
+            ports: Some(agent_service_ports(service_type)),
+            ..Default::default()
+        }),
+        status: None,
+    }
+}
+
+/// deploy-host：从 Service 读回 nodePort 并登记注册表（键 = identifier，
+/// 与 funnel 的 container_name 同源）。非 NodePort/未分配的端口跳过。
+#[cfg(feature = "deploy-host")]
+pub(super) fn register_service_node_ports(
+    identifier: &str,
+    svc: &Service,
+) -> ContainerRuntimeResult<()> {
+    if !shared_types::is_deploy_host() {
+        return Ok(());
+    }
+    let Some(ports) = svc.spec.as_ref().and_then(|spec| spec.ports.as_ref()) else {
+        return Err(ContainerRuntimeError::ConnectionError(
+            "NodePort Service has no ports".into(),
+        ));
+    };
+    let host = shared_types::published::k8s_node_port_host()
+        .map_err(ContainerRuntimeError::ConfigurationError)?;
+    let mut map = std::collections::HashMap::new();
+    for port in ports {
+        if let Some(node_port) = port.node_port {
+            let container_port = port.port as u16;
+            map.insert(container_port, node_port as u16);
+        }
+    }
+    if map.len() != ports.len() {
+        return Err(ContainerRuntimeError::ConnectionError(format!(
+            "NodePort Service has {} of {} port assignments",
+            map.len(),
+            ports.len()
+        )));
+    }
+    let entries = map.len();
+    // 双键注册：identifier（create_agent_service 的短名键）+ 完整 STS 名
+    // （svc.metadata.name 去 "-svc" 后缀——get_container_info 查询键 =
+    // pod_info.container_name 完整名。单键不匹配时拨号回退容器端口，
+    // 与 Docker 端同类键分裂，2026-09-22 宿主机 OrbStack 实测）。
+    let pod_key = svc
+        .metadata
+        .name
+        .as_deref()
+        .and_then(|name| name.strip_suffix("-svc"))
+        .filter(|pod_name| *pod_name != identifier)
+        .map(str::to_owned);
+    if let Some(pod_name) = &pod_key {
+        shared_types::published::register_node_ports(pod_name, host, map.clone());
+        info!(
+            "[deploy-host] NodePorts registered: identifier={}, entries={}",
+            pod_name, entries
+        );
+    }
+    shared_types::published::register_node_ports(identifier, host, map);
+    info!(
+        "[deploy-host] NodePorts registered: identifier={}, entries={}",
+        identifier, entries
+    );
+    Ok(())
+}
+
+/// deploy-host：Service 的任一端口已分配 nodePort（创建瞬间常为 None）。
+#[cfg(feature = "deploy-host")]
+fn node_ports_assigned(svc: &Service) -> bool {
+    svc.spec
+        .as_ref()
+        .and_then(|spec| spec.ports.as_ref())
+        .is_some_and(|ports| !ports.is_empty() && ports.iter().all(|p| p.node_port.is_some()))
+}
+
+#[cfg(feature = "deploy-host")]
+async fn register_service_node_ports_when_ready(
+    services: &Api<Service>,
+    svc_name: &str,
+    identifier: &str,
+    mut service: Service,
+) -> ContainerRuntimeResult<()> {
+    if !shared_types::is_deploy_host() {
+        return Ok(());
+    }
+    for attempt in 0..=10u32 {
+        if node_ports_assigned(&service) {
+            return register_service_node_ports(identifier, &service);
+        }
+        if attempt == 10 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        service = services.get(svc_name).await.map_err(|error| {
+            crate::runtime::builder_completion::k8s_error(
+                format!("Read NodePort Service '{svc_name}' after creation: {error}"),
+                error,
+            )
+        })?;
+    }
+    Err(ContainerRuntimeError::ConnectionError(format!(
+        "NodePort Service '{svc_name}' has incomplete port assignments"
+    )))
+}
+
+/// Service 是否已声明某端口（端口值口径；ClusterIP 只路由已声明的端口）
+fn service_exposes_port(svc: &Service, port: u16) -> bool {
+    svc.spec
+        .as_ref()
+        .and_then(|spec| spec.ports.as_ref())
+        .is_some_and(|ports| ports.iter().any(|p| p.port == port as i32))
+}
+
+/// 存量 Service 是否缺任一期望端口（按 [`agent_service_ports`] 清单逐端口
+/// 比对）——SSA 收敛的触发判定：点名单端口的条件在清单再扩时必然漏检
+/// （3010 → 9080 两次同款教训），按期望清单比对后加端口即自动覆盖存量。
+fn has_missing_expected_ports(svc: &Service, service_type: &ServiceType) -> bool {
+    agent_service_ports(service_type)
+        .iter()
+        .any(|p| !service_exposes_port(svc, p.port as u16))
+}
+
+#[cfg(feature = "deploy-host")]
+fn host_requires_node_port(svc: &Service) -> bool {
+    shared_types::is_deploy_host()
+        && svc.spec.as_ref().and_then(|spec| spec.type_.as_deref()) != Some("NodePort")
+}
+
 /// K8s 标准标签前缀
 const LABEL_PREFIX: &str = "app.kubernetes.io";
 
 /// RCoder 自定义标签前缀
 const RCODER_LABEL_PREFIX: &str = "rcoder.io";
+
+/// 从 pod 标签直读容器身份（service_type + 语义槽位）。
+///
+/// 与 [`build_standard_labels`] 对偶的读取侧：STS 族 pod 经 template 继承恒带
+/// `rcoder.io/service-type` 与 `rcoder.io/identifier`，list/get 响应的
+/// `metadata.labels` 零成本可得——消费方据此读结构化字段，不再从容器名反解。
+/// 标签缺失/不可解析返回 None（防御：生产 UserApp pod 无此标签，但其不进
+/// STS 枚举面，正常不会到达此处）；identifier 单值按类型经
+/// [`container_runtime_api::slots_from_identifier`] 还原槽位。
+pub(crate) fn container_identity_from_labels(
+    labels: &BTreeMap<String, String>,
+) -> (
+    Option<ServiceType>,
+    container_runtime_api::ContainerIdentitySlots,
+) {
+    let Some(service_type) = labels
+        .get(&format!("{RCODER_LABEL_PREFIX}/service-type"))
+        .and_then(|v| v.parse::<ServiceType>().ok())
+    else {
+        return (
+            None,
+            container_runtime_api::ContainerIdentitySlots::default(),
+        );
+    };
+    let slots = labels
+        .get(&format!("{RCODER_LABEL_PREFIX}/identifier"))
+        .map(|id| container_runtime_api::slots_from_identifier(&service_type, id))
+        .unwrap_or_default();
+    (Some(service_type), slots)
+}
 
 /// 构建 K8s 标准标签
 ///
@@ -60,6 +294,10 @@ pub(crate) fn build_standard_labels(
     identifier: &str,
     service_type: &ServiceType,
 ) -> BTreeMap<String, String> {
+    // 家族归一：Computer 族共享同一物理容器，label 必须写家族值——
+    // 常规项目（ComputerNormalProject）与 Computer 同 STS/Service/label，
+    // 读取侧 selector（pod_label_selectors）同样按家族值构造
+    let service_type = service_type.container_family_key();
     let mut labels = BTreeMap::new();
 
     // K8s 推荐标签
@@ -83,6 +321,15 @@ pub(crate) fn build_standard_labels(
         format!("{}/identifier", RCODER_LABEL_PREFIX),
         identifier.to_string(),
     );
+    // builder 的 app 维度聚合标签（identifier 应用共享后即纯 app_id；存量
+    // 复合键残留右切还原，保按 app 聚合的查询/清理可用）。service_type
+    // 此处已是族代表词（&str），按词比较。
+    if service_type == ServiceType::UserappBuilder.container_family_key() {
+        labels.insert(
+            format!("{}/app-id", RCODER_LABEL_PREFIX),
+            shared_types::legacy_composite_app_segment(identifier).to_string(),
+        );
+    }
 
     labels
 }
@@ -91,6 +338,8 @@ pub(crate) fn build_standard_labels(
 ///
 /// Selector 只包含必要的标签，用于精确匹配 Pod
 fn build_selector_labels(identifier: &str, service_type: &ServiceType) -> BTreeMap<String, String> {
+    // 家族归一：selector 必须匹配 build_standard_labels 写入的家族值
+    let service_type = service_type.container_family_key();
     let mut selector = BTreeMap::new();
 
     // 使用标准标签进行选择
@@ -108,6 +357,46 @@ fn build_selector_labels(identifier: &str, service_type: &ServiceType) -> BTreeM
     );
 
     selector
+}
+
+/// Verify ownership before reusing or patching a builder Service. A name alone
+/// does not authorize updates, including the read-side port repair path.
+#[cfg(feature = "kubernetes")]
+pub(super) fn validate_builder_service(
+    service: &Service,
+    identifier: &str,
+    headless: bool,
+) -> ContainerRuntimeResult<()> {
+    let family = ServiceType::UserappBuilder;
+    let labels = service.metadata.labels.as_ref();
+    let spec = service
+        .spec
+        .as_ref()
+        .ok_or_else(|| ContainerRuntimeError::Conflict("Builder Service spec missing".into()))?;
+    if service.metadata.deletion_timestamp.is_some()
+        || labels
+            .and_then(|labels| labels.get("rcoder.io/identifier"))
+            .map(String::as_str)
+            != Some(identifier)
+        || labels
+            .and_then(|labels| labels.get("rcoder.io/service-type"))
+            .map(String::as_str)
+            != Some(family.container_family_key())
+        || build_selector_labels(identifier, &family)
+            .iter()
+            .any(|(key, value)| {
+                spec.selector
+                    .as_ref()
+                    .and_then(|selector| selector.get(key))
+                    != Some(value)
+            })
+        || (spec.cluster_ip.as_deref() == Some("None")) != headless
+    {
+        return Err(ContainerRuntimeError::Conflict(
+            "Builder Service ownership or routing differs".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// K8s Service 生命周期管理 trait extension
@@ -130,14 +419,16 @@ pub(crate) trait K8sServiceOps {
 
     /// 创建 K8s ClusterIP Service，selector 匹配 agent_runner Pod
     ///
-    /// Service 暴露以下端口：
-    /// - HTTP 8086：健康检查、状态查询
+    /// Service 暴露以下端口（`agent_service_ports` 单一事实源）：
+    /// - HTTP 8086：健康检查、状态查询（Pingora 统一入口）
     /// - gRPC 50051：rcoder 与 agent-runner 通信
-    /// - noVNC 6080：Web VNC 访问
-    /// - ttyd 7681：Web 终端访问
+    /// - noVNC 6080 / ws-terminal 17681
+    /// - file-server 60000 / dbx 4224
+    /// - app-cli-admin 3010：仅 UserappBuilder（app-cli 管理/日志 API）
     ///
     /// selector 使用与 Pod 相同的 labels（`app.kubernetes.io/managed-by=rcoder-runtime` + identifier label）。
-    /// 创建前先检查是否已存在，已存在则跳过。
+    /// 已存在则跳过——例外：builder Service 缺 app-cli-admin 端口时 SSA patch
+    /// 定向收敛（见函数内注释）。
     async fn create_agent_service(
         &self,
         identifier: &str,
@@ -176,103 +467,148 @@ impl K8sServiceOps for KubernetesRuntime {
 
         // 检查是否已存在
         match services.get(&svc_name).await {
-            Ok(_) => {
+            Ok(existing) => {
+                if *service_type == ServiceType::UserappBuilder {
+                    validate_builder_service(&existing, identifier, false)?;
+                }
+                // 定向收敛：存量 builder Service 缺任一期望端口（历史上两次
+                // 犯同款——3010 日志链路、9080 dev 应用流量代理，均按
+                // `{svc}:{port}` 拨上游必超时）——条件 patch 写入期望端口
+                // 补齐（范式对齐 apply_app_service）。条件按期望清单逐端口
+                // 比对而非点名端口：后续清单再加端口，存量 svc 访问即自愈。
+                // 宿主机模式也将已有 ClusterIP 转为 NodePort，避免同一
+                // namespace 切换部署形态时失去可达地址。
+                // Port additions are builder-specific; host reachability applies
+                // to every owned agent family, including existing ClusterIP Services.
+                #[cfg(feature = "deploy-host")]
+                let needs_node_port = host_requires_node_port(&existing);
+                #[cfg(not(feature = "deploy-host"))]
+                let needs_node_port = false;
+                let needs_ports = matches!(service_type, ServiceType::UserappBuilder)
+                    && has_missing_expected_ports(&existing, service_type);
+                if needs_ports || needs_node_port {
+                    let desired =
+                        agent_service_object(&self.namespace, &svc_name, identifier, service_type);
+                    let expected_labels = build_standard_labels(identifier, service_type);
+                    let desired_selector = desired.spec.as_ref().and_then(|s| s.selector.as_ref());
+                    if !existing.metadata.labels.as_ref().is_some_and(|labels| {
+                        expected_labels
+                            .iter()
+                            .all(|(key, value)| labels.get(key) == Some(value))
+                    }) || existing.spec.as_ref().and_then(|s| s.selector.as_ref())
+                        != desired_selector
+                        || existing.metadata.deletion_timestamp.is_some()
+                    {
+                        return Err(ContainerRuntimeError::Conflict(
+                            "Agent Service ownership or selector differs".into(),
+                        ));
+                    }
+                    let uid = existing
+                        .metadata
+                        .uid
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            ContainerRuntimeError::Conflict("Builder Service UID missing".into())
+                        })?;
+                    let version = existing
+                        .metadata
+                        .resource_version
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            ContainerRuntimeError::Conflict(
+                                "Builder Service version missing".into(),
+                            )
+                        })?;
+                    let desired_ports =
+                        desired.spec.and_then(|spec| spec.ports).ok_or_else(|| {
+                            ContainerRuntimeError::ConfigurationError(
+                                "Builder Service desired ports missing".into(),
+                            )
+                        })?;
+                    // Preserve allocated nodePorts and extra ports; only add missing entries.
+                    let mut ports = existing
+                        .spec
+                        .as_ref()
+                        .and_then(|s| s.ports.clone())
+                        .unwrap_or_default();
+                    if needs_ports {
+                        for port in desired_ports {
+                            if !ports
+                                .iter()
+                                .any(|p| p.port == port.port && p.protocol == port.protocol)
+                            {
+                                ports.push(port);
+                            }
+                        }
+                    }
+                    let mut spec = serde_json::json!({"ports": ports});
+                    if needs_node_port {
+                        spec["type"] = serde_json::Value::String("NodePort".into());
+                    }
+                    let body = serde_json::json!({"metadata": {"uid": uid, "resourceVersion": version}, "spec": spec});
+                    let patched = services
+                        .patch(
+                            &svc_name,
+                            &kube::api::PatchParams::default(),
+                            &Patch::Merge(body),
+                        )
+                        .await
+                        .map_err(|e| {
+                            crate::runtime::builder_completion::k8s_error(
+                                format!("patch agent service '{svc_name}': {e}"),
+                                e,
+                            )
+                        })?;
+                    info!(
+                        "[K8S] Service {} patched to converge ports and host reachability",
+                        svc_name
+                    );
+                    // deploy-host：patch 新增端口的 nodePort 由 apiserver 异步分配，
+                    // patch 前的 existing 拿不到——re-get 后注册（复用下方轮询）
+                    #[cfg(feature = "deploy-host")]
+                    register_service_node_ports_when_ready(
+                        &services, &svc_name, identifier, patched,
+                    )
+                    .await?;
+                    // K8s-only mode still performs the patch and propagates API errors;
+                    // it simply has no deploy-host registry consumer for the response object.
+                    #[cfg(not(feature = "deploy-host"))]
+                    drop(patched);
+                    return Ok(());
+                }
                 debug!("[K8S] Service {} already exists", svc_name);
+                #[cfg(feature = "deploy-host")]
+                register_service_node_ports_when_ready(&services, &svc_name, identifier, existing)
+                    .await?;
                 return Ok(());
             }
             Err(kube::Error::Api(ae)) if ae.code == 404 => {}
             Err(e) => {
-                return Err(ContainerRuntimeError::K8sError(format!(
-                    "Failed to check Service '{}': {}",
-                    svc_name, e
-                )));
+                return Err(crate::runtime::builder_completion::k8s_error(
+                    format!("Failed to check Service '{}': {}", svc_name, e),
+                    e,
+                ));
             }
         }
 
-        // 构建 selector labels（与 Pod labels 一致）
-        let selector = build_selector_labels(identifier, service_type);
+        let service = agent_service_object(&self.namespace, &svc_name, identifier, service_type);
 
-        let service = Service {
-            metadata: ObjectMeta {
-                name: Some(svc_name.clone()),
-                namespace: Some(self.namespace.clone()),
-                labels: Some(build_standard_labels(identifier, service_type)),
-                ..Default::default()
-            },
-            spec: Some(ServiceSpec {
-                type_: Some("ClusterIP".to_string()),
-                selector: Some(selector),
-                ports: Some(vec![
-                    ServicePort {
-                        name: Some("http".to_string()),
-                        port: AGENT_HTTP_PORT as i32,
-                        target_port: Some(
-                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                                AGENT_HTTP_PORT as i32,
-                            ),
-                        ),
-                        protocol: Some("TCP".to_string()),
-                        ..Default::default()
-                    },
-                    ServicePort {
-                        name: Some("grpc".to_string()),
-                        port: AGENT_GRPC_PORT as i32,
-                        target_port: Some(
-                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                                AGENT_GRPC_PORT as i32,
-                            ),
-                        ),
-                        protocol: Some("TCP".to_string()),
-                        ..Default::default()
-                    },
-                    ServicePort {
-                        name: Some("novnc".to_string()),
-                        port: AGENT_NOVNC_PORT as i32,
-                        target_port: Some(
-                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                                AGENT_NOVNC_PORT as i32,
-                            ),
-                        ),
-                        protocol: Some("TCP".to_string()),
-                        ..Default::default()
-                    },
-                    ServicePort {
-                        name: Some("ws-terminal".to_string()),
-                        port: AGENT_WS_TERMINAL_PORT as i32,
-                        target_port: Some(
-                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                                AGENT_WS_TERMINAL_PORT as i32,
-                            ),
-                        ),
-                        protocol: Some("TCP".to_string()),
-                        ..Default::default()
-                    },
-                    ServicePort {
-                        name: Some("file-server".to_string()),
-                        port: AGENT_FILE_SERVER_PORT as i32,
-                        target_port: Some(
-                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                                AGENT_FILE_SERVER_PORT as i32,
-                            ),
-                        ),
-                        protocol: Some("TCP".to_string()),
-                        ..Default::default()
-                    },
-                ]),
-                ..Default::default()
-            }),
-            status: None,
-        };
-
-        services
+        let _created_svc = services
             .create(&PostParams::default(), &service)
             .await
             .map_err(|e| {
-                ContainerRuntimeError::ContainerCreationError(format!(
-                    "Failed to create Service '{}': {}",
-                    svc_name, e
-                ))
+                crate::runtime::builder_completion::k8s_error(
+                    format!("Failed to create Service '{}': {}", svc_name, e),
+                    e,
+                )
             })?;
+        // deploy-host：NodePort 可能在 create 响应后才分配，必须等全量
+        // 端口到齐并登记，才能把 Service 创建视作完成。
+        #[cfg(feature = "deploy-host")]
+        register_service_node_ports_when_ready(&services, &svc_name, identifier, _created_svc)
+            .await?;
 
         info!(
             "[K8S] Service {} created for {} ({})",
@@ -289,6 +625,14 @@ impl K8sServiceOps for KubernetesRuntime {
         let svc_name = self.agent_service_name(identifier, service_type)?;
         let services: Api<Service> = Api::namespaced(self.client.clone(), &self.namespace);
 
+        // deploy-host：Service 删除同步注销发布端口注册表（双键对齐注册侧）
+        #[cfg(feature = "deploy-host")]
+        if shared_types::is_deploy_host() {
+            if let Some(sts_name) = svc_name.strip_suffix("-svc") {
+                shared_types::published::unregister(sts_name);
+            }
+            shared_types::published::unregister(identifier);
+        }
         match services.delete(&svc_name, &DeleteParams::default()).await {
             Ok(_) => {
                 info!("[K8S] Service {} deleted", svc_name);
@@ -301,5 +645,178 @@ impl K8sServiceOps for KubernetesRuntime {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builder_service_ports_expose_app_cli_admin() {
+        let ports = agent_service_ports(&ServiceType::UserappBuilder);
+        let admin = ports
+            .iter()
+            .find(|p| p.name.as_deref() == Some("app-cli-admin"))
+            .expect("builder Service 必须暴露 app-cli-admin");
+        assert_eq!(admin.port, APP_CLI_ADMIN_PORT as i32);
+        assert_eq!(
+            admin.target_port,
+            Some(
+                k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
+                    APP_CLI_ADMIN_PORT as i32
+                )
+            )
+        );
+        // 端口名必须唯一（K8s 校验 "port names must be unique"）
+        let mut names: Vec<_> = ports.iter().filter_map(|p| p.name.clone()).collect();
+        names.sort();
+        let total = names.len();
+        names.dedup();
+        assert_eq!(names.len(), total, "端口名重复: {names:?}");
+        // 基础六端口仍在
+        for expected in [
+            AGENT_HTTP_PORT,
+            AGENT_GRPC_PORT,
+            AGENT_NOVNC_PORT,
+            AGENT_WS_TERMINAL_PORT,
+            AGENT_FILE_SERVER_PORT as u32,
+            AGENT_DBX_PORT,
+        ] {
+            assert!(
+                ports.iter().any(|p| p.port == expected as i32),
+                "基础端口 {expected} 缺失"
+            );
+        }
+    }
+
+    #[test]
+    fn other_agent_types_do_not_expose_builder_only_ports() {
+        for service_type in [
+            ServiceType::ComputerAgentRunner,
+            ServiceType::WebAgentRunner,
+        ] {
+            let ports = agent_service_ports(&service_type);
+            assert!(
+                !ports.iter().any(|p| p.port == APP_CLI_ADMIN_PORT as i32),
+                "{service_type} 容器内不跑 app-cli，不应暴露 3010"
+            );
+            assert!(
+                !ports.iter().any(|p| p.port == APP_ENTRY_PORT as i32),
+                "{service_type} 容器内不跑 pingap，不应暴露 9080"
+            );
+            assert!(
+                !ports.iter().any(|p| p.port == IME_PORT as i32),
+                "{service_type} ime 直连 pod IP 不经 svc，不应暴露 6091"
+            );
+            // 基础六端口恒在
+            assert_eq!(ports.len(), 6, "{service_type} 端口数应为基础六端口");
+        }
+    }
+
+    /// dev 应用流量代理按 `{svc}:{APP_ENTRY_PORT}` 拨上游（pingap）——
+    /// 未声明则 kube-proxy 无转发规则、必 502（app 19 事故回归锁）。
+    #[test]
+    fn builder_service_ports_expose_app_entry() {
+        let ports = agent_service_ports(&ServiceType::UserappBuilder);
+        let entry = ports
+            .iter()
+            .find(|p| p.name.as_deref() == Some("app-entry"))
+            .expect("builder Service 必须暴露 app-entry");
+        assert_eq!(entry.port, APP_ENTRY_PORT as i32);
+        assert_eq!(
+            entry.target_port,
+            Some(
+                k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
+                    APP_ENTRY_PORT as i32
+                )
+            )
+        );
+        // builder 总端口数 = 基础六 + 3010 + 9080 + 6091
+        assert_eq!(ports.len(), 9, "ports={ports:?}");
+        // ime：ImeProxy 按 {svc}:{IME_PORT} 拨上游（userapp 族）
+        let ime = ports
+            .iter()
+            .find(|p| p.name.as_deref() == Some("ime"))
+            .expect("builder Service 必须暴露 ime");
+        assert_eq!(ime.port, IME_PORT as i32);
+    }
+
+    /// SSA 收敛触发判定：缺任一期望端口即收敛（点名 3010 的旧条件在 9080
+    /// 加入后必然漏检——泛化后的回归锁）。
+    #[test]
+    fn convergence_triggers_on_any_missing_expected_port() {
+        // 全量期望 svc：不触发
+        let full = agent_service_object("ns", "s", "1", &ServiceType::UserappBuilder);
+        assert!(!has_missing_expected_ports(
+            &full,
+            &ServiceType::UserappBuilder
+        ));
+
+        // legacy：有 3010（3010 修复期存量）但缺 9080 → 触发
+        let legacy = Service {
+            metadata: ObjectMeta::default(),
+            spec: Some(ServiceSpec {
+                ports: Some(
+                    agent_service_ports(&ServiceType::UserappBuilder)
+                        .into_iter()
+                        .filter(|p| p.port != APP_ENTRY_PORT as i32)
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            status: None,
+        };
+        assert!(has_missing_expected_ports(
+            &legacy,
+            &ServiceType::UserappBuilder
+        ));
+
+        // 非 builder 类型期望即六基础端口：基础 svc 不触发
+        let base = agent_service_object("ns", "s", "1", &ServiceType::ComputerAgentRunner);
+        assert!(!has_missing_expected_ports(
+            &base,
+            &ServiceType::ComputerAgentRunner
+        ));
+    }
+
+    #[cfg(feature = "deploy-host")]
+    #[test]
+    fn complete_cluster_ip_builder_still_requires_host_reachability() {
+        let mut service = agent_service_object(
+            "ns",
+            "rcoder-app-builder-1-svc",
+            "1",
+            &ServiceType::UserappBuilder,
+        );
+        service.spec.as_mut().expect("service spec").type_ = Some("ClusterIP".into());
+        assert!(!has_missing_expected_ports(
+            &service,
+            &ServiceType::UserappBuilder
+        ));
+        assert!(host_requires_node_port(&service));
+        service.spec.as_mut().expect("service spec").type_ = Some("NodePort".into());
+        assert!(!host_requires_node_port(&service));
+    }
+
+    #[test]
+    fn service_exposes_port_matches_declared_only() {
+        let svc = agent_service_object(
+            "ns",
+            "rcoder-app-builder-1-svc",
+            "1",
+            &ServiceType::UserappBuilder,
+        );
+        assert!(service_exposes_port(&svc, APP_CLI_ADMIN_PORT));
+        assert!(!service_exposes_port(&svc, 9999));
+        let legacy = Service {
+            metadata: ObjectMeta::default(),
+            spec: Some(ServiceSpec {
+                ports: Some(agent_service_ports(&ServiceType::ComputerAgentRunner)),
+                ..Default::default()
+            }),
+            status: None,
+        };
+        assert!(!service_exposes_port(&legacy, APP_CLI_ADMIN_PORT));
     }
 }

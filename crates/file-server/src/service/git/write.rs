@@ -62,6 +62,14 @@ fn collect_stage_paths(workdir: &Path, dir: &Path, out: &mut Vec<String>) -> App
 }
 
 fn stage_file(repo: &Repository, worktree_path: &str) -> AppResult<()> {
+    stage_file_with_metadata(repo, worktree_path, |path| std::fs::symlink_metadata(path))
+}
+
+fn stage_file_with_metadata(
+    repo: &Repository,
+    worktree_path: &str,
+    metadata: impl FnOnce(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> AppResult<()> {
     let mut index = repo
         .open_index()
         .map_err(|e| map_git_err(e, "git open_index"))?;
@@ -71,7 +79,19 @@ fn stage_file(repo: &Repository, worktree_path: &str) -> AppResult<()> {
     let abs = crate::path_safety::ensure_within(workdir, worktree_path)?;
     let bstr_owned = index_bstr_path(worktree_path);
     let bstr_path: &BStr = bstr_owned.as_ref();
-    let metadata = std::fs::symlink_metadata(&abs).ok();
+    // NotFound = 文件确已删除 → 从 index 移除（对齐 git add 删档语义）；
+    // 其他 IO 错误（EACCES/ESTALE——CephFS 瞬时 stat 失败是现实场景）必须传播：
+    // 静默按删除写入 index 会让存在的文件被后续 commit 从历史里删掉。
+    let metadata = match metadata(&abs) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(AppError::system(format!(
+                "git stat {}: {error}",
+                abs.display()
+            )));
+        }
+    };
     if let Some(metadata) = metadata {
         let (blob_id, mode) = if metadata.file_type().is_symlink() {
             let target = std::fs::read_link(&abs)?;
@@ -184,9 +204,16 @@ pub fn commit_indexed(
     let tree_id = editor
         .write()
         .map_err(|e| map_git_err(e, "git editor write"))?;
-    let parents: Vec<ObjectId> = match repo.head_id() {
-        Ok(id) => vec![id.detach()],
-        Err(_) => vec![],
+    // unborn → root commit（合法首提交）；head() 真错误传播，不吞成"无 parent"
+    let head = repo.head().map_err(|e| map_git_err(e, "git head"))?;
+    let parents: Vec<ObjectId> = if head.is_unborn() {
+        vec![]
+    } else {
+        vec![
+            head.into_peeled_id()
+                .map_err(|e| map_git_err(e, "git head_id"))?
+                .detach(),
+        ]
     };
     let sig = Signature {
         name: BString::from(author_name),
@@ -211,17 +238,26 @@ pub fn commit_indexed(
 // ── init / unstage / discard ───────────────────────────────────────────────────
 
 /// 初始化仓库 (对齐 nuwax init): 已存在返回 already=true; 否则 init + .gitignore + initial commit。
+///
+/// 幂等门是"已有提交"而非"仓库已存在": 此前 initial commit 失败 (仓库停留在
+/// unborn) 时重试会真正补提交, 失败不再被吞 (fail-fast, 落盘工作区必须带提交)。
 pub fn init_repo(path: &Path, author_name: &str, author_email: &str) -> AppResult<bool> {
-    let already = super::is_git_repo(path);
+    let existed = super::is_git_repo(path);
     let repo = super::ensure_repo(path)?;
     super::ensure_gitignore(path)?;
-    if !already {
+    if !has_any_commit(&repo)? {
         stage_path(&repo, ".gitignore")?;
-        if let Err(e) = commit_indexed(&repo, "Initial commit", author_name, author_email) {
-            tracing::warn!(error = %e, "initial commit failed (best-effort, skipping)");
-        }
+        commit_indexed(&repo, "Initial commit", author_name, author_email)?;
     }
-    Ok(already)
+    Ok(existed)
+}
+
+/// 仓库是否已有至少一个提交（unborn → false）。
+/// "缺席"只来自类型化状态（`is_unborn`），不来自错误发生——`head()` 的
+/// IO/损坏错误必须传播，否则会被误判"无提交"而触发 initial commit 误写。
+fn has_any_commit(repo: &Repository) -> AppResult<bool> {
+    let head = repo.head().map_err(|e| map_git_err(e, "git head"))?;
+    Ok(!head.is_unborn())
 }
 
 /// 公开 `/api/git/init` 使用：只初始化仓库并维护 .gitignore，不创建提交。
@@ -245,10 +281,9 @@ pub fn init_and_commit(
     super::ensure_gitignore(path)?;
     // stage 全部变更 (addAll: modified + untracked + deleted)
     stage_files(&repo, &[])?;
-    // 提交 (无变更也会产生提交, 与 nuwax 一致; commit 失败 best-effort 不阻断业务)
-    if let Err(e) = commit_indexed(&repo, message, author_name, author_email) {
-        tracing::warn!(error = %e, "commit failed (best-effort, skipping)");
-    }
+    // 提交 (无变更也会产生提交, 与 nuwax 一致); 失败传播——nuwax initProjectTemplate
+    // 的 init+commit 组合同样不 catch, 吞错是移植自创且会留下 unborn 工作区。
+    commit_indexed(&repo, message, author_name, author_email)?;
     Ok(())
 }
 
@@ -356,13 +391,14 @@ pub fn discard_files(repo: &Repository, files: &[String]) -> AppResult<DiscardBu
         {
             Some(entry) => {
                 // tracked (modified/deleted): 恢复 worktree 到 HEAD 内容 + 同步 index
-                let blob = repo
-                    .find_blob(entry.id())
-                    .map_err(|e| map_git_err(e, "git find_blob"))?;
-                if let Some(p) = abs.parent() {
-                    std::fs::create_dir_all(p)?;
-                }
-                std::fs::write(&abs, &blob.data)?;
+                // （共享安全物化器: 界内目录链 + leaf 不跟随 + mode 如实恢复, FS-03/06）
+                let planned = super::materialize::plan_tree_entry(
+                    workdir,
+                    Path::new(f),
+                    entry.mode(),
+                    entry.id(),
+                )?;
+                super::materialize::materialize_planned(repo, workdir, &planned)?;
                 stage_path(repo, f)?;
                 buckets.tracked_files.push(f.clone());
             }
@@ -383,10 +419,108 @@ pub fn discard_files(repo: &Repository, files: &[String]) -> AppResult<DiscardBu
     Ok(buckets)
 }
 
+/// [`init_repo`] / [`init_and_commit`] 的 async 安全包装：git2 全同步 IO
+/// （index 写、对象写、commit——在 Ceph RBD/CephFS 卷上含多次 fsync，高负载
+/// 下可达秒级）。此前在 async 上下文直接调用会阻塞 runtime worker：accept
+/// 停滞 → readiness/liveness 探针与业务转发的连接被 reset（131 userapp 套件
+/// build 转发 IncompleteMessage 的根因链；同因诱发 liveness 30s 窗口误杀）。
+/// 挪 blocking 池执行；git 失败语义不变（调用方 best-effort warn）。
+pub async fn init_repo_offloaded(
+    path: std::path::PathBuf,
+    author_name: String,
+    author_email: String,
+) -> AppResult<bool> {
+    tokio::task::spawn_blocking(move || init_repo(&path, &author_name, &author_email))
+        .await
+        .map_err(|e| map_git_err(e, "git init_repo join"))?
+}
+
+/// [`init_and_commit`] 的 async 安全包装（同 [`init_repo_offloaded`] 动因）。
+pub async fn init_and_commit_offloaded(
+    path: std::path::PathBuf,
+    message: String,
+    author_name: String,
+    author_email: String,
+) -> AppResult<()> {
+    tokio::task::spawn_blocking(move || {
+        init_and_commit(&path, &message, &author_name, &author_email)
+    })
+    .await
+    .map_err(|e| map_git_err(e, "git init_and_commit join"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gix::open;
+
+    #[test]
+    fn init_repo_propagates_corrupt_head_without_touching_index() {
+        // G-C1 反例: "缺席"判定只认 is_unborn 状态。HEAD 损坏 = 真错误, 必须
+        // 响亮失败, 不得误判"无提交"后 stage .gitignore 甚至写出孤立 root commit。
+        let dir = tempfile::tempdir().expect("create test directory");
+        let path = dir.path();
+        super::super::ensure_repo(path).expect("init unborn repo");
+        std::fs::write(path.join(".git/HEAD"), "garbage-not-a-ref\n").expect("corrupt HEAD");
+
+        let err = init_repo(path, "Test", "test@example.com").expect_err("损坏 HEAD 必须响亮失败");
+        assert!(matches!(err, AppError::System(..)), "{err:?}");
+
+        let repo = open(path).expect("open repo");
+        let index = repo.open_index().expect("open index");
+        assert!(
+            index.entries().is_empty(),
+            "失败的 init_repo 不得改动 index: {} entries",
+            index.entries().len()
+        );
+    }
+
+    /// 反例（审查 H-1）：stat 的非 NotFound IO 错误（EACCES/ESTALE——CephFS
+    /// 现实场景）曾被 `.ok()` 当作"文件已删除"写入 index 并持久化，存在的
+    /// 文件会被后续 commit 从历史里删掉。修复后必须传播错误、index 不动。
+    #[test]
+    fn stage_file_propagates_stat_io_error_instead_of_treating_as_deleted() {
+        let directory = tempfile::tempdir().expect("test repository");
+        let dir = directory.path();
+        std::fs::create_dir_all(dir.join("protected")).expect("建目录");
+        init_repo(dir, "Test", "test@example.com").expect("init");
+        std::fs::write(dir.join("protected/a.txt"), "alive").expect("写文件");
+        let repo = open(dir).expect("open");
+        stage_file(&repo, "protected/a.txt").expect("正常 stage");
+        commit_indexed(&repo, "c1", "Test", "test@example.com").expect("commit");
+
+        let before = std::fs::read(repo.index_path()).expect("index bytes");
+        // 受控 stat 故障走完整 stage 分支，不依赖 chmod 对 root/Windows 的行为。
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+        ] {
+            let error = stage_file_with_metadata(&repo, "protected/a.txt", |path| {
+                assert_eq!(path, dir.join("protected/a.txt"));
+                Err(std::io::Error::new(kind, "injected stat failure"))
+            })
+            .expect_err("stat IO 错误必须传播而非按删除处理");
+            assert!(
+                matches!(error, AppError::System(_)),
+                "应为系统错误: {error:?}"
+            );
+            assert_eq!(
+                std::fs::read(repo.index_path()).expect("unchanged index"),
+                before
+            );
+        }
+        // index 未被写入删除态：文件仍在 index 中。
+        let index = repo.open_index().expect("reopen index");
+        assert!(
+            index
+                .entry_by_path_and_stage(
+                    gix::bstr::ByteSlice::as_bstr(b"protected/a.txt"),
+                    Stage::Unconflicted
+                )
+                .is_some(),
+            "存在的文件不得因 stat 失败被移出 index"
+        );
+    }
 
     struct TestRepo(std::path::PathBuf);
 
@@ -512,5 +646,54 @@ mod tests {
                 .is_some(),
             "checkout overlay must not stage deletion of paths absent from target"
         );
+    }
+
+    fn commit_count(repo: &Repository) -> usize {
+        crate::service::git::read::log_history(repo, 50, 0, None, None)
+            .expect("log count")
+            .len()
+    }
+
+    #[test]
+    fn init_repo_is_idempotent_and_leaves_born_repo() {
+        // 不变量: 走 provisioning 的工作区必须带着初始提交落地
+        let test = TestRepo::new();
+        let repo = test.open();
+        assert!(
+            repo.head_id().is_ok(),
+            "全新目录 init_repo 后必须已有初始提交"
+        );
+        let before = commit_count(&repo);
+        let existed = init_repo(&test.0, "Test", "test@example.com").expect("re-init");
+        assert!(existed, "已存在仓库的第二次调用应返回 already=true");
+        assert_eq!(
+            commit_count(&repo),
+            before,
+            "已有提交的仓库不得重复补 Initial commit"
+        );
+    }
+
+    #[test]
+    fn init_repo_retries_initial_commit_on_unborn_repo() {
+        // 粘性失败回归: 仓库已存在但无提交 (初始提交曾失败 / init-only) 时,
+        // 修复前的 already=is_git_repo 门会跳过提交, unborn 状态永远无法自愈
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "file-server-git-test-unborn-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create unborn repo dir");
+        crate::service::git::ensure_repo(&path).expect("init only (no commit)");
+        let existed = init_repo(&path, "Test", "test@example.com").expect("retry init_repo");
+        assert!(existed, "仓库已存在, 返回值语义保持 already=true");
+        let repo = open(&path).expect("open after retry");
+        assert!(
+            repo.head_id().is_ok(),
+            "unborn 仓库上的 init_repo 必须补出初始提交"
+        );
+        drop(std::fs::remove_dir_all(&path));
     }
 }

@@ -1,0 +1,73 @@
+[package]
+name = "file-server-proxy"
+# 独立版本号: 支持 file-server-proxy 单独打 tag (file-server-proxy-v*) 经 CI 发
+# npm/OSS, 与 rcoder 主版本解耦 (与 crates/file-server 同款纪律)。
+# 0.3.0: N06 跨进程实例锁 + N07 独立入口令牌认证、受管声明默认值与 env 三态优先
+# （破坏性：public_bind_declared 默认 true）+ owner 控制加固；0.2.x 见 git 历史
+# 0.2.2: 独立双文件日志+日志目录本机回退（用户指正：proxy 要有独立日志方便排查）
+# 0.2.1 子项见 git 历史
+version = "0.3.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+# 默认集成 file-server(以 lib 方式进程内直连)——裸 `cargo build -p file-server-proxy`
+# 即产出 npm 同款单二进制(自带 rust 上游)。容器/rcoder 嵌入形态不受影响:
+# additive feature 只多编译不激活(运行时 EMBED_FILE_SERVER 未设即纯转发)。
+default = ["embed-file-server"]
+embed-file-server = ["dep:file-server", "dep:file-server-userapp", "dep:axum", "dep:tower", "dep:tracing-appender"]
+
+[lib]
+name = "file_server_proxy"
+path = "src/lib.rs"
+
+# 独立入口：默认(default feature)=npm 独立分发形态（file-server 以 lib 集成，
+# rust 域进程内直连）；--no-default-features=纯转发形态（容器 supervisord 用，
+# 上游由外部进程提供）。CLI 参数 > env > 默认，详见 src/main.rs 文档。
+[[bin]]
+name = "file-server-proxy"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+bytes = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tempfile = { workspace = true }
+process_utils = { workspace = true }
+runtime-supervisor = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+
+# 轻量 HTTP 反代用 hyper: 生命周期需可编程 start/stop/restart
+# (pingora Server run_forever 无停机 API, 无法支撑运行时切换 60000 归属)
+hyper = { workspace = true, features = ["client"] }
+hyper-util = { workspace = true, features = ["client", "client-legacy"] }
+http-body-util = { workspace = true }
+http-body = { workspace = true }
+
+# 跨 crate 契约: x-service-type 分流 header 定义在 shared_types（防双头事实源）
+shared_types = { workspace = true }
+
+# bin 入口的日志初始化（lib 内只发事件不装 subscriber）
+tracing-subscriber = { workspace = true }
+
+# npm 独立形态的可选集成依赖 (feature embed-file-server)
+file-server = { workspace = true, optional = true }
+file-server-userapp = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tracing-appender = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_yaml = { workspace = true }
+tokio = { workspace = true }

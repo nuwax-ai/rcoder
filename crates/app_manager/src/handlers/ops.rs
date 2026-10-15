@@ -2,110 +2,638 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Json, Path, State};
+use axum::extract::{Json, Path, Query, State};
+use garde::Validate as _;
 use tracing::{info, instrument};
 
 use shared_types::{AppError, HttpResult};
 
 use super::state::AppManagerState;
-use crate::models::{AppRuntimeInfo, RecyclePolicyRequest};
+use crate::models::{AppRuntimeInfo, RecyclePolicyRequest, StartAppRequest, StartAppResult};
 
-/// 启动应用（scale replicas = 1）
+/// 启动应用或轻量部署
+///
+/// 无 body = 传统启动；带 url = 轻量部署。
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_id}/start",
-    params(
-        ("app_id" = String, Path, description = "应用 ID")
+    path = "/api/v1/userapp/{app_id}/start",
+    params(("app_id" = String, Path, description = "应用 ID")),
+    request_body(
+        content = StartAppRequest,
+        description = "按 app_id 定位，不使用 user_id；其余可选——空对象 = 显式启动（已有容器同时更新到平台默认运行时镜像；app 不存在即创建空容器，PG/ttyd/dbx 可用）。带 url 触发部署：deploy_mode 缺省 pod（app_stage 注入 → Recreate 换 Pod），hot = 容器内原地换应用（不换 Pod、PG/终端不断连；前置不满足自动回退 pod，等编排+bridge 就绪才返回）；release_id 缺省自动生成并在响应返回；sha256 可选校验；app_stage/idle_timeout_seconds 覆盖；pg 凭据与捕获的配置版本一致，凭据应用失败返回操作错误。同步等待边界 = 部署段完成（下载/sha256/解压成功、编排已启动）+ 包内 database SQL 执行——服务启动结果异步可见（GET /apps/{app_id} 或访问探活确认）；成功返回 ≠ 立即接流量（readiness 摘流窗口，配置 bridge_service 的应用摘流到后端就绪）。建议客户端读超时 ≥ 120s；超时 ≠ 失败（服务端继续收敛，先查状态再决定是否重试）"
     ),
     responses(
-        (status = 200, description = "启动成功", body = HttpResult<AppRuntimeInfo>),
-        (status = 404, description = "应用不存在", body = HttpResult<String>)
+        (status = 200, description = "启动/部署成功（部署 = 制品已部署 + SQL 已执行，服务启动中）", body = HttpResult<StartAppResult>)
     ),
-    tag = "应用管理"
+    tag = "Userapp · prod · 部署与启停"
 )]
-#[instrument(skip(state))]
+#[instrument(skip(state, body))]
 pub async fn start_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
-) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
-    info!("[APP] starting app: {}", app_id);
-    let runtime = state.app_service.start_app(&app_id).await?;
-    Ok(Json(HttpResult::success(runtime)))
+    body: Result<Json<StartAppRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<HttpResult<StartAppResult>>, AppError> {
+    let Json(mut request) =
+        body.map_err(|_| AppError::validation_error("A valid start JSON body is required"))?;
+    request
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
+    info!(
+        "[APP] starting app: {} (deploy={}={})",
+        app_id,
+        request.url.is_some(),
+        String::new()
+    );
+    // The accepted coordinator owns its lease even when the HTTP client disconnects.
+    let request_id = request
+        .request_id
+        .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+        .clone();
+    let owner = String::new();
+    let worker_app_id = app_id.clone();
+    let service = state.app_service.clone();
+    let result = await_deployment_response(
+        tokio::spawn(async move { service.start_app_enhanced(&worker_app_id, request).await }),
+        std::time::Duration::from_secs(300),
+    )
+    .await;
+    let result =
+        correlate_deployment_response(&state, &app_id, &owner, &request_id, result).await?;
+    let operation_id = result.operation_id.clone();
+    let mut response = HttpResult::success(result);
+    response.operation_id = operation_id;
+    Ok(Json(response))
 }
 
 /// 停止应用（scale replicas = 0）
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_id}/stop",
+    path = "/api/v1/userapp/{app_id}/stop",
     params(
-        ("app_id" = String, Path, description = "应用 ID")
+        ("app_id" = String, Path, description = "应用 ID"),
+        ("user_id" = String, Query, description = "Application owner"),
+        ("lifecycle_id" = Option<String>, Query, description = "Required after explicit recreation"),
+        ("request_id" = Option<String>, Query, description = "Idempotent request token"),
     ),
+    description = r#"
+把运行容器缩到 0 副本停止应用：**数据卷 / 元数据全部保留**，随时可 `start` 重启
+（区别于 delete 后的 storage 面）。
+
+- 拍板 2026-09-23：手动 stop 与闲置回收统一——停止后到达的 prod 流量
+  （应用代理与 ttyd/dbx 工具族）会自动唤醒拉起，也可随时显式 `start`；
+- 需要"彻底销毁"走 delete → （可选）storage/clear | destroy。
+
+- 另一操作占用时立即拒绝，不等待或排队。业务信封保持 HTTP 200、success=false，
+  code=ERR_OPERATION_IN_PROGRESS，data 携带权威 holder 与重试提示；
+  holder 不明或需恢复时 retryable=false。生命周期/版本/请求指纹冲突仍为 ERR_CONFLICT。
+"#,
     responses(
-        (status = 200, description = "停止成功", body = HttpResult<AppRuntimeInfo>),
-        (status = 404, description = "应用不存在", body = HttpResult<String>)
+        (status = 200, description = "停止成功", body = HttpResult<AppRuntimeInfo>)
     ),
-    tag = "应用管理"
+    tag = "Userapp · prod · 部署与启停"
 )]
 #[instrument(skip(state))]
 pub async fn stop_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
+    request: Result<
+        Query<shared_types::UserAppControlRequest>,
+        axum::extract::rejection::QueryRejection,
+    >,
 ) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
+    let Query(mut request) = request
+        .map_err(|_| AppError::validation_error("Valid stop query parameters are required"))?;
+    let request_id = request
+        .request_id
+        .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+        .clone();
     info!("[APP] stopping app: {}", app_id);
-    let runtime = state.app_service.stop_app(&app_id).await?;
-    Ok(Json(HttpResult::success(runtime)))
+    let result = state
+        .app_service
+        .stop_app_controlled(&app_id, request)
+        .await;
+    let runtime = super::control::control_result(&state, &app_id, &request_id, result).await?;
+    let operation = state
+        .app_service
+        .get_control_operation_by_request(&app_id, &request_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::internal_server_error("Stop completed without a durable operation record")
+        })?;
+    Ok(Json(
+        HttpResult::success(runtime).with_operation_id(operation.operation_id),
+    ))
 }
 
-/// 重启应用（rollout restart）
+/// 重启应用
+///
+/// rollout restart；可选参数与 start 同款——带 url 即部署新版本并重启。
+/// 无 url/env 的裸重启同时把容器滚动到平台默认运行时镜像
+/// （env `RCODER_RUNTIME_IMAGE_DIGEST`；env 缺失时保持原镜像并 warn）。
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_id}/restart",
-    params(
-        ("app_id" = String, Path, description = "应用 ID")
+    path = "/api/v1/userapp/{app_id}/restart",
+    params(("app_id" = String, Path, description = "应用 ID")),
+    request_body(
+        content = StartAppRequest,
+        description = "按 app_id 定位，不使用 user_id；其余可选——空对象 = 传统 rollout restart（同时滚动到平台默认运行时镜像）。带 url = 部署新版本（等待边界同 start：部署段完成 + SQL 执行，服务启动异步可见，成功 ≠ 立即接流量）；其余字段语义同 start"
     ),
+    description = r#"
+- 受理前遇到可重试的正常流量唤醒、部署或重启占用时，共享一个总等待预算（默认 30 秒，
+  app_manager.restart_admission_wait_secs / RCODER_USERAPP_RESTART_ADMISSION_WAIT_SECS
+  可配置），每 200ms 重新核验 lifecycle、intent 和物理租约；带 url 的部署式重启同样适用。
+- 预算耗尽返回 HTTP 200、success=false、ERR_OPERATION_IN_PROGRESS；data 是原持有者的
+  operation/kind/state/step、traffic wake 与 retryable/retry_after_seconds。物理 Stop/Restart
+  控制、未知持有者、RecoveryRequired 或陈旧 Running 立即拒绝，不受理排队。
+- 等待期间断开可放弃；进入持久受理后原操作继续收敛。已成功 request_id 重放返回原结果。
+  等待预算不改变业务停止宽限或部署执行预算；客户端读超时需覆盖等待预算和执行时长。
+  lifecycle、版本、目标替换、request_id 指纹冲突仍返回 ERR_CONFLICT。
+"#,
     responses(
-        (status = 200, description = "重启成功", body = HttpResult<AppRuntimeInfo>),
-        (status = 404, description = "应用不存在", body = HttpResult<String>)
+        (status = 200, description = "重启/部署成功（部署 = 制品已部署 + SQL 已执行，服务启动中）", body = HttpResult<StartAppResult>)
     ),
-    tag = "应用管理"
+    tag = "Userapp · prod · 部署与启停"
 )]
-#[instrument(skip(state))]
+#[instrument(skip(state, body))]
 pub async fn restart_app(
     State(state): State<Arc<AppManagerState>>,
     Path(app_id): Path<String>,
-) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
-    info!("[APP] restarting app: {}", app_id);
-    let runtime = state.app_service.restart_app(&app_id).await?;
-    Ok(Json(HttpResult::success(runtime)))
+    body: Result<Json<StartAppRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<HttpResult<StartAppResult>>, AppError> {
+    let Json(mut request) =
+        body.map_err(|_| AppError::validation_error("A valid restart JSON body is required"))?;
+    request
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
+    info!(
+        "[APP] restarting app: {} (deploy={})",
+        app_id,
+        request.url.is_some()
+    );
+    // Waiting restarts are abandoned with the receiver. Once durable admission
+    // begins, the owned coordinator must resolve its transaction and writes.
+    let admission = Arc::new(crate::service::restart_wait::RestartAdmission::default());
+    let _waiting_client = admission.client();
+    let response_wait = std::time::Duration::from_secs(
+        300_u64.saturating_add(state.app_service.restart_admission_wait_secs()),
+    );
+    let request_id = request
+        .request_id
+        .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+        .clone();
+    let owner = String::new();
+    let worker_app_id = app_id.clone();
+    let service = state.app_service.clone();
+    let result = await_deployment_response(
+        tokio::spawn(
+            admission
+                .scope(async move { service.restart_app_enhanced(&worker_app_id, request).await }),
+        ),
+        response_wait,
+    )
+    .await;
+    let result =
+        correlate_deployment_response(&state, &app_id, &owner, &request_id, result).await?;
+    let operation_id = result.operation_id.clone();
+    let mut response = HttpResult::success(result);
+    response.operation_id = operation_id;
+    Ok(Json(response))
 }
 
-/// 设置闲置回收策略（动态、免重启：免费↔付费 tier 变更）
+/// 设置闲置回收策略
 ///
-/// strategic-merge Deployment 注解,不碰 pod template → 不触发 rollout,下个扫描 tick 生效。
-/// 比 update 轻（无需 image）。两字段皆 None → 400。
+/// 动态、免重启（策略即时调整，无需重新部署）：strategic-merge Deployment 注解,不碰 pod template → 不触发 rollout,下个扫描 tick 生效。
+/// 比 update 轻（无需 image）。三字段（recycle_enabled/idle_timeout_seconds/wake_on_traffic）皆 None → 400。
+/// **仅 prod**：策略作用于运行容器 Deployment 注解，dev 开发环境无回收语义。
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_id}/recycle-policy",
+    path = "/api/v1/userapp/{app_id}/{app_stage}/recycle-policy",
     params(
-        ("app_id" = String, Path, description = "应用 ID")
+        ("app_id" = String, Path, description = "应用 ID"),
+        ("app_stage" = String, Path, description = "目标环境：仅支持 `prod`（运行容器 Deployment 注解）")
     ),
     request_body = RecyclePolicyRequest,
+    description = r#"
+动态设置应用的闲置自动回收与流量唤醒策略，免重启、下个扫描 tick 生效：
+- `recycle_enabled`：开关闲置回收
+- `idle_timeout_seconds`：闲置阈值秒数
+- `wake_on_traffic`：流量唤醒注解（拍板 2026-09-23 统一唤醒后仅作展示，
+  不再阻断任何停止档位的流量唤醒）
+
+三字段全 None → 400。
+
+> **仅 prod**：传 `app_stage=dev` 返回 400（开发容器常驻自愈，无回收语义）。
+"#,
     responses(
-        (status = 200, description = "策略已更新（免重启）", body = HttpResult<AppRuntimeInfo>),
-        (status = 400, description = "参数错误（两字段皆空）", body = HttpResult<String>),
-        (status = 404, description = "应用不存在", body = HttpResult<String>)
+        (status = 200, description = "策略已更新（免重启）", body = HttpResult<AppRuntimeInfo>)
     ),
-    tag = "应用管理"
+    tag = "Userapp · 双态 · 生命周期"
 )]
 #[instrument(skip(state, request))]
 pub async fn set_recycle_policy(
     State(state): State<Arc<AppManagerState>>,
-    Path(app_id): Path<String>,
-    Json(request): Json<RecyclePolicyRequest>,
+    Path((app_id, app_stage)): Path<(String, String)>,
+    request: Result<Json<RecyclePolicyRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<HttpResult<AppRuntimeInfo>>, AppError> {
-    let runtime = state
+    let Json(mut request) = request
+        .map_err(|_| AppError::validation_error("A valid recycle policy JSON body is required"))?;
+    if shared_types::UserappStage::parse(&app_stage) != Some(shared_types::UserappStage::Prod) {
+        return Err(AppError::validation_error(
+            "`recycle-policy` is a prod-runtime capability: pass app_stage=prod (dev environment has no recycle semantics)",
+        ));
+    }
+    request
+        .validate()
+        .map_err(shared_types::garde_err_to_app_error)?;
+    info!(
+        "[APP] setting recycle policy: {} (user_id={})",
+        app_id,
+        String::new()
+    );
+    let request_id = request
+        .request_id
+        .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+        .clone();
+    let result = state.app_service.set_recycle_policy(&app_id, request).await;
+    let runtime = super::control::control_result(&state, &app_id, &request_id, result).await?;
+    let operation = state
         .app_service
-        .set_recycle_policy(&app_id, request)
-        .await?;
-    Ok(Json(HttpResult::success(runtime)))
+        .get_control_operation_by_request(&app_id, &request_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::internal_server_error("Policy completed without a durable operation record")
+        })?;
+    Ok(Json(
+        HttpResult::success(runtime).with_operation_id(operation.operation_id),
+    ))
+}
+
+/// Dropping the JoinHandle on timeout detaches the owned coordinator; it does not
+/// cancel a remote mutation or release its application lease prematurely.
+async fn correlate_deployment_response<T>(
+    state: &AppManagerState,
+    app_id: &str,
+    _owner: &str,
+    request_id: &str,
+    result: Result<T, AppError>,
+) -> Result<T, AppError> {
+    let error = match result {
+        Ok(value) => return Ok(value),
+        Err(error) => error,
+    };
+    if matches!(&error, AppError::Structured(detail) if detail.operation_id.is_some()) {
+        return Err(error);
+    }
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state
+            .app_service
+            .get_control_operation_by_request(app_id, request_id),
+    )
+    .await
+    {
+        Ok(Ok(Some(operation))) => Err(error.with_operation_id(operation.operation_id)),
+        Ok(Ok(None)) => {
+            tracing::debug!(
+                app_id,
+                request_id,
+                "Deployment error has no admitted operation for this request"
+            );
+            Err(error)
+        }
+        Ok(Err(lookup_error)) => {
+            tracing::warn!(app_id, request_id, %lookup_error, "Deployment error operation correlation failed");
+            Err(error)
+        }
+        Err(_) => {
+            tracing::warn!(
+                app_id,
+                request_id,
+                "Deployment error operation correlation exceeded its 5 second budget"
+            );
+            Err(error)
+        }
+    }
+}
+
+async fn await_deployment_response<T>(
+    task: tokio::task::JoinHandle<crate::error::AppResult<T>>,
+    budget: std::time::Duration,
+) -> Result<T, AppError> {
+    tokio::time::timeout(budget, task).await
+        .map_err(|_| AppError::internal_server_error("deployment confirmation timed out; reconciliation continues; inspect deployment status before retrying"))?
+        .map_err(|error| AppError::internal_server_error(&format!("deployment coordinator failed: {error}")))?
+        .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod deployment_response_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn invalid_start_and_restart_bodies_use_the_business_envelope() {
+        let directory = tempfile::tempdir().expect("handler test directory");
+        let runtime = Arc::new(crate::test_support::MockRuntime::default());
+        let service =
+            Arc::new(crate::test_support::test_service(directory.path(), runtime.clone()).await);
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/userapp/{app_id}/start",
+                axum::routing::post(start_app),
+            )
+            .route(
+                "/api/v1/userapp/{app_id}/restart",
+                axum::routing::post(restart_app),
+            )
+            .layer(axum::middleware::from_fn(
+                shared_types::userapp_http::envelope_errors,
+            ))
+            .with_state(Arc::new(AppManagerState {
+                app_service: service.clone(),
+                http_client: reqwest::Client::new(),
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        struct Server(tokio::task::JoinHandle<()>);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _server = Server(tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("HTTP test server");
+        }));
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .expect("HTTP client");
+        for action in ["start", "restart"] {
+            for (content_type, body) in [
+                ("application/json", "{"),
+                ("application/json", r#"{"deploy_mode":"invalid"}"#),
+                ("text/plain", r#"{}"#),
+            ] {
+                let response = client
+                    .post(format!(
+                        "http://{address}/api/v1/userapp/invalid-body/{action}"
+                    ))
+                    .header("content-type", content_type)
+                    .body(body)
+                    .send()
+                    .await
+                    .expect("HTTP response");
+                assert_eq!(response.status(), reqwest::StatusCode::OK);
+                let envelope: serde_json::Value =
+                    response.json().await.expect("JSON error envelope");
+                assert_eq!(envelope["code"], shared_types::error_codes::ERR_VALIDATION);
+                assert!(envelope["message"].as_str().expect("message").is_ascii());
+            }
+        }
+        assert_eq!(
+            runtime
+                .create_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(
+            service
+                .metadata
+                .store
+                .get_application("invalid-body")
+                .await
+                .expect("application query")
+                .is_none()
+        );
+    }
+
+    /// 消息透传回归闸（2026-09-22 app-105 事故）：deploy_wait 的确定性失败
+    /// 消息（含 CrashLoopBackOff 根因）必须原样到达 HTTP 响应——不允许任何
+    /// 一环降级为 i18n key（前端拿到 "en-US.error.backend_error" 不可行动）。
+    #[tokio::test]
+    async fn backend_failure_message_reaches_http_response() {
+        use tower::ServiceExt as _;
+        const MESSAGE: &str = "deterministic deployment failure on app 210 (operation op-x): SQL migration failed — relation already exists";
+        async fn failed_deployment() -> Result<Json<()>, AppError> {
+            let task = tokio::spawn(async {
+                Err::<(), crate::error::AppOperationError>(
+                    crate::error::AppOperationError::Backend(MESSAGE.into())
+                        .with_operation_id("op-x".into()),
+                )
+            });
+            await_deployment_response(task, std::time::Duration::from_secs(5)).await?;
+            Ok(Json(()))
+        }
+        // Include the final formal middleware: IntoResponse alone previously
+        // missed the ASCII filter that replaced this English UTF-8 cause.
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/userapp/210/start",
+                axum::routing::post(failed_deployment),
+            )
+            .route(
+                "/api/v1/userapp/210/restart",
+                axum::routing::post(failed_deployment),
+            )
+            .layer(axum::middleware::from_fn(
+                shared_types::userapp_http::envelope_errors,
+            ));
+        for action in ["start", "restart"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/userapp/210/{action}"))
+                        .body(axum::body::Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("body bytes");
+            let envelope: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("envelope JSON");
+            assert_eq!(
+                envelope["code"],
+                shared_types::error_codes::ERR_BACKEND_ERROR
+            );
+            assert_eq!(envelope["message"], MESSAGE);
+            assert_eq!(envelope["operation_id"], "op-x");
+            assert_eq!(envelope["success"], false);
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_deployment_identity_is_not_replaced_by_fallback_lookup() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = Arc::new(
+            crate::test_support::test_service(
+                directory.path(),
+                Arc::new(crate::test_support::MockRuntime::default()),
+            )
+            .await,
+        );
+        let identity = service
+            .metadata
+            .store
+            .ensure_identity("identity")
+            .await
+            .unwrap();
+        let accepted = crate::service::OwnedOperation::admit(
+            service.metadata.store.clone(),
+            shared_types::UserAppAdmission {
+                runtime_policy_on_success: None,
+                command: None,
+                metadata: None,
+                app_id: "identity".into(),
+                lifecycle_id: Some(identity.lifecycle_id.clone()),
+                operation_id: "original-operation".into(),
+                request_id: Some("original-request".into()),
+                request_fingerprint: "b".repeat(64),
+                kind: shared_types::UserAppOperationKind::Start,
+            },
+        )
+        .await
+        .unwrap();
+        accepted
+            .reject_without_mutation(&crate::error::AppOperationError::Backend(
+                "Original failure".into(),
+            ))
+            .await
+            .unwrap();
+        let outcome = service
+            .metadata
+            .store
+            .admit(&shared_types::UserAppAdmission {
+                runtime_policy_on_success: None,
+                command: None,
+                metadata: None,
+                app_id: "identity".into(),
+                lifecycle_id: Some(identity.lifecycle_id),
+                operation_id: "other-operation".into(),
+                request_id: Some("other-request".into()),
+                request_fingerprint: "a".repeat(64),
+                kind: shared_types::UserAppOperationKind::Start,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            shared_types::UserAppAdmissionOutcome::Accepted(_)
+        ));
+        let state = AppManagerState {
+            app_service: service,
+            http_client: reqwest::Client::new(),
+        };
+        let original: AppError = crate::error::AppOperationError::Backend(
+            "Original failure — preserve this cause".into(),
+        )
+        .with_operation_id("original-operation".into())
+        .into();
+        let error = correlate_deployment_response::<()>(
+            &state,
+            "identity",
+            "",
+            "other-request",
+            Err(original),
+        )
+        .await
+        .expect_err("original failure");
+        let AppError::Structured(detail) = error else {
+            panic!("structured error expected");
+        };
+        assert_eq!(detail.operation_id.as_deref(), Some("original-operation"));
+        assert_eq!(detail.code, shared_types::ERR_BACKEND_ERROR);
+        assert_eq!(
+            detail.internal_message.as_deref(),
+            Some("Original failure — preserve this cause")
+        );
+        let recovered = correlate_deployment_response::<()>(
+            &state,
+            "identity",
+            "",
+            "original-request",
+            Err(AppError::with_message(
+                shared_types::ERR_BACKEND_ERROR,
+                "Uncorrelated failure",
+            )),
+        )
+        .await
+        .expect_err("persisted correlation");
+        let AppError::Structured(detail) = recovered else {
+            panic!("structured error expected");
+        };
+        assert_eq!(
+            detail.operation_id.as_deref(),
+            Some("original-operation"),
+            "fallback must use the exact request, not the current other operation"
+        );
+        let error = correlate_deployment_response::<()>(
+            &state,
+            "identity",
+            "",
+            "not-admitted",
+            Err(AppError::with_message(
+                shared_types::ERR_BACKEND_ERROR,
+                "Unaccepted failure",
+            )),
+        )
+        .await
+        .expect_err("unaccepted failure");
+        let AppError::Structured(detail) = error else {
+            panic!("structured error expected");
+        };
+        assert!(
+            detail.operation_id.is_none(),
+            "unaccepted request must not inherit a different operation"
+        );
+        let error = correlate_deployment_response::<()>(
+            &state,
+            "missing-identity",
+            "",
+            "original-request",
+            Err(AppError::with_message(
+                shared_types::ERR_BACKEND_ERROR,
+                "Original backend cause",
+            )),
+        )
+        .await
+        .expect_err("failed lookup preserves original failure");
+        let AppError::Structured(detail) = error else {
+            panic!("structured error expected");
+        };
+        assert_eq!(detail.code, shared_types::ERR_BACKEND_ERROR);
+        assert_eq!(
+            detail.internal_message.as_deref(),
+            Some("Original backend cause")
+        );
+        assert!(detail.operation_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn response_timeout_does_not_cancel_owned_coordinator() {
+        let (release, proceed) = tokio::sync::oneshot::channel();
+        let (completed, completion) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            proceed.await.unwrap();
+            completed.send(()).unwrap();
+            Ok(())
+        });
+        assert!(
+            await_deployment_response(task, std::time::Duration::ZERO)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), completion)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }

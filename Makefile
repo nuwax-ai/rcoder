@@ -1,10 +1,10 @@
 # RCoder Makefile
-# 包含子模块: docker, dev, k8s, test, pyroscope, agent-runner
+# 包含子模块: docker, dev, k8s, test, agent-runner
 
 # Phony targets
 .PHONY: help \
 	build install install-agent uninstall \
-	dev-build dev-up dev-restart dev-down dev-logs \
+	dev-build dev-up dev-restart dev-down dev-logs dev-clean \
 	dev-build-k8s dev-up-k8s dev-restart-k8s dev-down-k8s dev-logs-k8s \
 	dev-build-k8s-local dev-up-k8s-local dev-restart-k8s-local dev-down-k8s-local dev-logs-k8s-local dev-local-k8s \
 	devspace-init devspace-dev devspace-build devspace-down devspace-purge devspace-logs devspace-enter devspace-help \
@@ -15,21 +15,32 @@
 	docker-pre-download-libreoffice docker-clean-libreoffice-downloads \
 	update-image-tag \
 	test test-unit test-integration test-all test-blocking \
-	test-ebpf-install test-ebpf-no-install test-ebpf-debug test-pyroscope-offcpu \
-	pyroscope-up pyroscope-down pyroscope-logs \
+	audit deny geiger quality coverage fuzz \
 	agent-runner-up agent-runner-down agent-runner-logs agent-runner-restart agent-runner-status \
-	k8s-offline-bundle k8s-offline-import k8s-offline-images-list k8s-offline-clean
+	dial9-on dial9-off dial9-view \
+	k8s-offline-bundle k8s-offline-import k8s-offline-images-list k8s-offline-clean \
+	dev-host dev-host-k8s \
+	logs-help logs-up logs-down logs-query logs-fidelity
 
 # 包含子 Makefile
+include make/build-assets.mk
 include make/docker.mk
 include make/libreoffice.mk
+include make/dbx.mk
+include make/app-runtime-downloads.mk
 include make/dev.mk
 include make/devspace.mk
 include make/k8s.mk
 include make/k8s-offline.mk
 include make/test.mk
-include make/pyroscope.mk
+include make/quality.mk
+include make/verify-kani.mk
 include make/agent-runner.mk
+include make/observability.mk
+include make/remote-k8s.mk
+include make/dev-host.mk
+include make/file-server-ab.mk
+include make/native-runtime.mk
 
 # 本地编译（仅编译，不构建镜像）
 build:
@@ -62,6 +73,12 @@ uninstall:
 
 # 默认目标：显示帮助信息
 help:
+	@echo "  make remote-k8s-verify SUITE=smoke - 远端同步、构建、部署及验证（配置见 specs/remote-k8s-dev/README.md）"
+	@echo "  make file-server-ab - 本地独立运行 Rust/TypeScript file-server HTTP 对照（参数见 make file-server-ab-help）"
+	@echo ""
+	@echo "🖥️  deploy-host 宿主机运行形态（详见 docs/deploy-host.md）："
+	@echo "  make dev-host       - 宿主机 Docker 形态（--features deploy-host，默认 ~/.rcoder）"
+	@echo "  make dev-host-k8s   - 宿主机 K8s 形态（--features kubernetes,deploy-host + kubeconfig）"
 	@echo "rcoder 开发模式 Makefile"
 	@echo ""
 	@echo "📦 编译和安装："
@@ -90,6 +107,7 @@ help:
 	@echo "  make dev-restart    - 重启开发模式容器（重新构建镜像并启动）"
 	@echo "  make dev-down       - 停止开发模式容器"
 	@echo "  make dev-logs       - 查看开发模式容器日志"
+	@echo "  make dev-clean      - 清理历史日志（保留最新一份）+ 已迁 volume 的旧目录"
 	@echo ""
 	@echo "🚀 DevSpace 开发模式（推荐）："
 	@echo "  make devspace-init    - 初始化 DevSpace（首次使用）"
@@ -124,10 +142,15 @@ help:
 	@echo "  make k8s-offline-images-list  - 打印所有离线依赖镜像清单"
 	@echo "  make k8s-offline-clean        - 清理构建产物"
 	@echo ""
-	@echo "📊 Pyroscope 持续剖析："
-	@echo "  make pyroscope-up   - 启动 Pyroscope Server"
-	@echo "  make pyroscope-down - 停止 Pyroscope Server"
-	@echo "  make pyroscope-logs - 查看 Pyroscope 日志"
+	@echo "🔥 hotpath 本地性能剖析（dev 默认编入；容器内 loopback 6770/6771，见 docs/observability.md）："
+	@echo "  容器内 curl 127.0.0.1:6770/functions_timing|/server|/tokio_runtime|/threads|/profiler_status"
+	@echo "  /channels /mutexes 通道与登记表锁观测（channel!/mutex! 选点）"
+	@echo "  MCP 档（6771/mcp，AI 实时查询）：构建时 --features hotpath,hotpath-mcp 显式叠加"
+	@echo ""
+	@echo "🔬 dial9 事件级 Tokio tracing（compose 运行期开关，默认关）："
+	@echo "  make dial9-on    - 启用 dial9 记录（重建 rcoder 容器注入 DIAL9_ENABLED=1）"
+	@echo "  make dial9-off   - 关闭 dial9 记录"
+	@echo "  make dial9-view  - 启动单二进制 viewer 查看 docker/logs/dial9 trace"
 	@echo ""
 	@echo "🚀 agent_runner 本地服务:"
 	@echo "  make agent-runner-up        - 启动 agent_runner HTTP server（前台运行）"
@@ -136,11 +159,26 @@ help:
 	@echo "  变量: AGENT_RUNNER_PORT=8286 AGENT_RUNNER_GRPC=no AGENT_RUNNER_PROXY=no AGENT_RUNNER_PROJECTS_DIR=./project_workspace"
 	@echo ""
 	@echo "🧪 测试命令："
-	@echo "  make test           - 运行所有测试"
-	@echo "  make test-unit      - 运行单元测试"
-	@echo "  make test-integration - 运行集成测试"
-	@echo "  make test-blocking  - 运行极端场景测试（包含阻塞）"
-	@echo "  make test-all       - 运行完整测试套件（所有 features）"
+	@echo "  make test           - nextest 根 workspace，所有 features，收集全部失败"
+	@echo "  make test-default   - nextest 根 workspace，默认 features"
+	@echo "  make test-unit      - nextest 库单元测试"
+	@echo "  make test-integration - nextest Rust 集成测试目标（非 Compose E2E）"
+	@echo "  make test-blocking  - testing feature 阻塞场景，串行测试"
+	@echo "  make test-app-cli   - nextest 独立 app-cli 项目"
+	@echo "  make test-doc       - workspace + app-cli 文档测试"
+	@echo "  make test-all       - 串行运行 test + test-app-cli + test-doc（不含 E2E）"
+	@echo "  make test-e2e       - 本地 Compose 核心业务回归，防止逻辑偏移"
+	@echo "  make test-e2e-host     - deploy-host 宿主机 Docker 形态 e2e（需 make dev-host）"
+	@echo "  make test-e2e-host-k8s - deploy-host 宿主机 K8s 形态 e2e（需 make dev-host-k8s）"
+	@echo "  参数: TEST_FEATURES= 验证默认 features；NEXTEST_ARGS='-p rcoder' 聚焦 Rust 测试"
+	@echo ""
+	@echo "🔍 质量检查："
+	@echo "  make audit     - 依赖安全公告扫描（RustSec）"
+	@echo "  make deny      - 许可证/重复版本/来源检查（deny.toml）"
+	@echo "  make geiger    - 依赖 unsafe 审计（首次编译较慢）"
+	@echo "  make quality   - audit + deny + geiger 一键三连"
+	@echo "  make coverage  - 测试覆盖率 HTML 报告（llvm-cov，排除 e2e）"
+	@echo "  make fuzz      - 模糊测试冒烟（默认每目标 60s；FUZZ_SECONDS/FUZZ_TARGET 可调）"
 	@echo ""
 	@echo "开发模式工作流程（推荐使用 DevSpace）："
 	@echo "  DevSpace 模式（增量编译、自动同步）："
@@ -152,7 +190,7 @@ help:
 	@echo "  或者手动进入容器："
 	@echo "    1. make devspace-dev     # 启动开发模式"
 	@echo "    2. make devspace-enter   # 进入容器"
-	@echo "    3. cargo run --bin rcoder --features ebpf-debug,pyroscope,otel,debug,kubernetes -- --port 8290"
+	@echo "    3. cargo run --bin rcoder --features otel,debug,dial9,kubernetes -- --port 8290"
 	@echo ""
 	@echo "  传统 Docker 模式："
 	@echo "    1. make dev-build    # 首次：构建所有 Docker 镜像（容器内编译）"

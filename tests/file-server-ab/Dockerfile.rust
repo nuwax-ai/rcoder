@@ -1,0 +1,37 @@
+FROM toolchain AS builder
+
+WORKDIR /src
+RUN --mount=type=bind,target=/src,rw \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git/db \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    cargo build --release -p file-server-proxy --bin file-server-proxy -p file-server-ab --bin file-server-ab \
+    && install -D /src/target/release/file-server-proxy /out/file-server-proxy \
+    && install -D /src/target/release/file-server-ab /out/file-server-ab
+
+FROM toolchain AS runtime
+
+COPY --from=builder /out/file-server-proxy /usr/local/bin/file-server-proxy
+COPY --from=builder /out/file-server-ab /usr/local/bin/file-server-ab
+
+ENV FILE_SERVER_PROXY_HOST=0.0.0.0 \
+    NODE_ENV=ab \
+    PROJECT_SOURCE_DIR=/data/project-workspace \
+    COMPUTER_WORKSPACE_DIR=/data/computer-workspace \
+    USERAPP_WORKSPACE_DIR=/data/userapp-workspace \
+    INIT_PROJECT_DIR=/data/init-project \
+    UPLOAD_PROJECT_DIR=/data/project-zips \
+    DIST_TARGET_DIR=/data/project-nginx \
+    LOG_BASE_DIR=/data/logs/project \
+    COMPUTER_LOG_DIR=/data/logs/computer \
+    FILE_SERVER_LOG_DIR=/data/logs/file-server \
+    TEMPLATE_CACHE_DIR=/data/cache/templates \
+    NODE_MODULES_LOCAL_DIR=/data/cache/node-modules \
+    GIT_ENABLED=true \
+    GIT_DEFAULT_AUTHOR_NAME="File Server A-B" \
+    GIT_DEFAULT_AUTHOR_EMAIL=ab@example.invalid \
+    DEPLOYMENT_MODE=docker-compose \
+    RUST_LOG=info
+
+EXPOSE 60000
+ENTRYPOINT ["file-server-proxy", "--embed", "--policy", "all_rust", "--port", "60000"]

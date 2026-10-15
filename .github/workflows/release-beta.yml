@@ -73,7 +73,7 @@ jobs:
     container: ${{ matrix.container && matrix.container.image || null }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      RUSTUP_TOOLCHAIN: "1.91.0"
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - name: enable windows longpaths
         if: runner.os == 'Windows'
@@ -88,9 +88,16 @@ jobs:
         if: ${{ matrix.container }}
         run: |
           if ! command -v cargo > /dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
+
+      - name: Update and record Rust stable
+        shell: bash
+        run: |
+          rustup update stable
+          rustc --version
+          cargo --version
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'

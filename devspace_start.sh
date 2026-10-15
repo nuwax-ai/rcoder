@@ -26,7 +26,7 @@ This is how you can work with it:
 - Some ports will be forwarded, so you can access this container via localhost
 - Run \`${COLOR_GREEN}make devspace-install-deps${COLOR_RESET}\` to install dependencies (first time)
 - Run \`${COLOR_GREEN}make run-in-container${COLOR_RESET}\` to start the application
-- Or run \`${COLOR_GREEN}cargo run --bin rcoder --features ebpf-debug,pyroscope,otel,debug,kubernetes -- --port 8290${COLOR_RESET}\` directly
+- Or run \`${COLOR_GREEN}cargo run --bin rcoder --features otel,debug,hotpath,dial9,kubernetes -- --port 8290${COLOR_RESET}\` directly
 "
 
 # Set terminal prompt

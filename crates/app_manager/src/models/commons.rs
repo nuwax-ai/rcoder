@@ -10,7 +10,10 @@ pub struct ResourceLimits {
     pub cpu: Option<String>,
     /// 内存: "512Mi", "1Gi"
     pub memory: Option<String>,
-    /// 存储: "10Gi"（仅 K8s，UserApp 用于 ephemeral-storage 回退）
+    /// 存储: "100Gi"（仅 K8s 有效，per-app PVC 容量）。create=首次容量（缺省
+    /// 100Gi）；update=扩容目标（**仅扩不缩**，缩容请求返回 400；在线生效不
+    /// 重建 Pod）。未指定 ephemeral_storage 时亦回退本值。Docker 模式无 PVC
+    /// 容量语义（no-op）
     pub storage: Option<String>,
     /// 临时存储限制（overlay 可写层，K8s ephemeral-storage）
     /// 未指定时回退到 storage 值
@@ -24,7 +27,7 @@ pub struct PortConfig {
     pub name: String,
     /// 容器端口
     pub port: u16,
-    /// 暴露类型
+    /// 暴露类型（枚举：`http` HTTP 访问 / `tcp` TCP 直连）
     pub expose_type: ExposeType,
     /// [HTTP 端口] 是否 strip `/apps/{app_id}` 前缀（EG URLRewrite）。
     /// - `None`/`true`（默认）：EG strip 前缀，后端收到 `/api`（与 Docker Pingora 一致）
@@ -35,6 +38,7 @@ pub struct PortConfig {
 
 /// 暴露类型
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
 pub enum ExposeType {
     /// HTTP 服务（通过 Gateway）
     Http,
@@ -59,6 +63,7 @@ pub struct HealthCheckConfig {
 
 /// 健康检查类型
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
 pub enum HealthCheckType {
     Http,
     Tcp,
@@ -68,6 +73,7 @@ pub enum HealthCheckType {
 
 /// 应用状态
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
 pub enum AppStatus {
     Created,
     Starting,

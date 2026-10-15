@@ -1,0 +1,97 @@
+//! 编排事件（EVT）——builtin 引擎启动过程的机器可读事件行（stdout）。
+//!
+//! 行协议：`APP-CLI-EVT {json}`（一行一条，serde tag="event" snake_case）——
+//! wire 与平台侧 `BuildProgressEvent` 的 `service_*` 变体同构（跨进程契约，
+//! 两端各自测试锁同一组字符串）。dev 链路 file-server 的 stdout 管道识别
+//! 此前缀转发任务 SSE（`/tasks/{id}/logs/stream`）。
+//!
+//! stdout 无 tracing 噪声（日志只配 stderr + 文件层），EVT 行不混杂；
+//! owner 下两种引擎都经事件桥转发迁移诊断，供原操作重放和任务日志流读取。
+
+/// EVT 行前缀（唯一事实源在 `shared_types::app_cli_evt`, 生产/转发/消费三方共用）。
+pub use shared_types::APP_CLI_EVT_PREFIX as EVT_PREFIX;
+pub use shared_types::AppCliFailedService as FailedService;
+pub use shared_types::AppCliOrchestrationEvent as OrchestrationEvent;
+
+/// 输出一条 EVT 行到 stdout（单行 + 立即 flush 保证行完整性；写失败静默——
+/// 事件是尽力而为的观测通道，不得影响编排主流程）。
+pub fn emit(event: &OrchestrationEvent) {
+    use std::io::Write;
+    let Ok(json) = serde_json::to_string(event) else {
+        return;
+    };
+    // R06 事件桥：owner（serve）形态下同步转发到运行事件 journal——
+    // 复用 owner 的平台侧经运行 API 读事件流，读不到本进程 stdout。
+    // stdout 仍是本地 spawn 路径（file-server 管道）的唯一通道，行为不变。
+    if let Some(bridge) = bridge() {
+        bridge(json.clone());
+    }
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{EVT_PREFIX}{json}");
+    let _ = out.flush();
+}
+
+/// 进程内事件桥（server 形态安装；直跑/测试形态为 None）。
+/// 携带 EVT 行的裸 JSON（无前缀）——桥接方自行解析 service/event 字段。
+static EVENT_BRIDGE: std::sync::OnceLock<Box<dyn Fn(String) + Send + Sync>> =
+    std::sync::OnceLock::new();
+
+/// 安装进程内事件桥（幂等：首次安装生效）。
+pub fn install_bridge(bridge: Box<dyn Fn(String) + Send + Sync>) {
+    let _ = EVENT_BRIDGE.set(bridge);
+}
+
+fn bridge() -> Option<&'static (dyn Fn(String) + Send + Sync)> {
+    EVENT_BRIDGE.get().map(|f| f.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// wire 字符串契约：与 shared_types::BuildProgressEvent 的 service_* 变体
+    /// 测试锁同一组字符串（跨进程 stdout 行协议，两端无类型共享）。
+    #[test]
+    fn wire_tags_match_platform_contract() {
+        let starting = serde_json::to_string(&OrchestrationEvent::ServiceStarting {
+            service: "frontend".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            starting, r#"{"event":"service_starting","service":"frontend"}"#,
+            "wire must match BuildProgressEvent::ServiceStarting exactly"
+        );
+
+        let ok = serde_json::to_string(&OrchestrationEvent::ServiceStartOk {
+            service: "backend-go".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            ok, r#"{"event":"service_start_ok","service":"backend-go"}"#,
+            "wire must match BuildProgressEvent::ServiceStartOk exactly"
+        );
+
+        let fail = serde_json::to_string(&OrchestrationEvent::ServiceStartFail {
+            service: "backend-java".into(),
+            error: "probe timeout".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            fail,
+            r#"{"event":"service_start_fail","service":"backend-java","error":"probe timeout"}"#,
+            "wire must match BuildProgressEvent::ServiceStartFail exactly"
+        );
+
+        let done = serde_json::to_string(&OrchestrationEvent::OrchestrationDone {
+            failed: vec![FailedService {
+                service: "s".into(),
+                error: "e".into(),
+            }],
+        })
+        .unwrap();
+        assert_eq!(
+            done,
+            r#"{"event":"orchestration_done","failed":[{"service":"s","error":"e"}]}"#
+        );
+    }
+}

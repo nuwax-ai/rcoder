@@ -2,17 +2,21 @@
 name = "app_manager"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [features]
 default = []
 # Kubernetes 后端模式：启用后 AppAccessMode 默认值 = Kubernetes（仍可被 env 覆盖）
 # 由 rcoder 的 kubernetes feature 转发开启，保持双后端编译期同源。
 kubernetes = []
+# deploy-host 宿主机运行形态（锁根/内网域分支）
+deploy-host = ["shared_types/deploy-host", "docker_manager/deploy-host"]
 
 [lints]
 workspace = true
 
 [dependencies]
+garde = { workspace = true }
 # Internal crates
 container-runtime-api = { workspace = true }
 docker_manager = { workspace = true }
@@ -24,6 +28,9 @@ workspace-manifest = { workspace = true }
 # Async runtime
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
+
+# shared_types 持久化契约(AppMetadataPersistence 等)的签名使用 anyhow::Result
+anyhow = { workspace = true }
 
 # HTTP server
 axum = { workspace = true }
@@ -59,4 +66,9 @@ tokio-util = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 zip = { workspace = true }
-fs2 = "0.4"
+
+[dev-dependencies]
+rcoder-storage = { workspace = true, features = ["userapp-turso"] }
+tower = { workspace = true, features = ["util"] }
+toasty = { workspace = true }
+toasty-driver-turso = { workspace = true }

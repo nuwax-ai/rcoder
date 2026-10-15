@@ -144,12 +144,12 @@ commands:
 
   # 运行 rcoder 服务
   run:
-    command: "devspace enter --namespace=rcoder-dev -- bash -c 'cd /app && CONTAINER_RUNTIME=kubernetes cargo run --bin rcoder --features ebpf-debug,pyroscope,otel,debug,kubernetes -- --port 8290'"
+    command: "devspace enter --namespace=rcoder-dev -- bash -c 'cd /app && CONTAINER_RUNTIME=kubernetes cargo run --bin rcoder --features otel,debug,hotpath,dial9,kubernetes -- --port 8290'"
     description: "编译并运行 rcoder 服务"
 
   # 只编译
   build:
-    command: "devspace enter --namespace=rcoder-dev -- bash -c 'cd /app && cargo build --release --bin rcoder --features ebpf-debug,pyroscope,otel,debug,kubernetes'"
+    command: "devspace enter --namespace=rcoder-dev -- bash -c 'cd /app && cargo build --release --bin rcoder --features otel,debug,hotpath,dial9,kubernetes'"
     description: "编译 rcoder"
 
   # 运行测试

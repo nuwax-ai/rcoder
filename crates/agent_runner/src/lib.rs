@@ -2,18 +2,27 @@
 //!
 //! 提供 AI 代理运行时和 ACP 协议集成
 
+// 单树化：全部模块在 lib 树唯一声明（main.rs 只做编排入口经 `agent_runner::`）。
 pub mod agent_mgmt;
 pub mod api_key_manager;
-pub mod auto_reload;
-mod config;
+pub mod config;
+/// dial9 事件级 Tokio tracing 装配（`dial9` feature 专用）
+#[cfg(feature = "dial9")]
+pub mod dial9_obs;
+/// 内嵌 file-server（env RCODER_EMBED_FILE_SERVER 运行时开关，编译期无门控）
+pub mod file_server_embed;
 pub mod grpc;
-mod handler;
-mod model;
+pub mod handler;
+pub mod model;
 pub mod otel_tracing; // 🔥 设为 public，供其他模块使用
-mod proxy_agent;
+pub mod proxy_agent;
 pub mod router;
 pub mod service; // 🔥 设为 public，供测试使用
-mod utils;
+pub mod shutdown;
+pub mod utils;
+
+// Userapp builder 容器内运行时路径解析（env 驱动，与 file-server 同源）
+pub(crate) mod userapp_env;
 
 // 条件性编译：HTTP 服务器模块
 #[cfg(feature = "http-server")]
@@ -24,7 +33,7 @@ pub mod ws_terminal;
 
 // VNC 桌面连接活跃度计数（读 /proc/net/tcp 数 noVNC 端口 ESTABLISHED 连接，
 // 供 get_active_tasks_count 折入 active_tasks，使「桌面开着」的容器不被闲置回收）
-pub mod vnc_activity;
+pub(crate) mod vnc_activity;
 
 // 测试辅助模块 (仅在 testing feature 启用时编译)
 #[cfg(feature = "testing")]

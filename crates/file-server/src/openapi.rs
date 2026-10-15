@@ -2,43 +2,12 @@
 //!
 //! 路径、参数和请求体由各 Axum handler 的 `#[utoipa::path]` 提供；
 //! `utoipa_axum::OpenApiRouter` 在注册 handler 时同步收集文档，避免维护第二套路由表。
+//! wire 契约类型（信封/Body/Query/响应载荷）集中在 [`crate::models`]。
 
-use serde::Serialize;
-use serde_json::Value;
-use utoipa::{IntoResponses, OpenApi, ToSchema};
+use utoipa::{IntoResponses, OpenApi};
 use utoipa_swagger_ui::{Config, SwaggerUi};
 
-/// OpenAPI multipart binary item，支持单文件和文件数组。
-#[allow(dead_code, reason = "OpenAPI-only multipart schema")]
-#[derive(ToSchema)]
-#[schema(value_type = String, format = Binary)]
-pub struct BinaryFile(String);
-
-/// JSON 成功响应的公共字段。具体接口会附加各自业务字段。
-#[derive(Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SuccessResponse {
-    pub success: bool,
-    pub message: Option<String>,
-}
-
-#[derive(Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct ErrorDetail {
-    pub r#type: String,
-    pub message: String,
-    pub timestamp: String,
-    pub request_id: String,
-    #[schema(value_type = Object)]
-    pub details: Option<Value>,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct ErrorResponse {
-    pub success: bool,
-    pub code: String,
-    pub error: ErrorDetail,
-}
+use crate::models::{ErrorResponse, SuccessResponse};
 
 /// JSON 接口的公共 HTTP 响应集合。
 #[derive(IntoResponses)]
@@ -51,10 +20,19 @@ pub enum JsonApiResponses {
     Forbidden(ErrorResponse),
     #[response(status = 404, description = "Resource not found")]
     NotFound(ErrorResponse),
+    #[response(
+        status = 409,
+        description = "Conflicting operation or physical recovery required"
+    )]
+    Conflict(ErrorResponse),
     #[response(status = 500, description = "System, file, or process error")]
     InternalServerError(ErrorResponse),
     #[response(status = 502, description = "Network error")]
     BadGateway(ErrorResponse),
+    #[response(status = 503, description = "Runtime management or address not ready")]
+    ServiceUnavailable(ErrorResponse),
+    #[response(status = 504, description = "Runtime request timed out")]
+    GatewayTimeout(ErrorResponse),
 }
 
 /// 文件流接口只复用错误响应，成功媒体类型由 handler 单独声明。
@@ -66,10 +44,19 @@ pub enum ErrorApiResponses {
     Forbidden(ErrorResponse),
     #[response(status = 404, description = "Resource not found")]
     NotFound(ErrorResponse),
+    #[response(
+        status = 409,
+        description = "Conflicting operation or physical recovery required"
+    )]
+    Conflict(ErrorResponse),
     #[response(status = 500, description = "System, file, or process error")]
     InternalServerError(ErrorResponse),
     #[response(status = 502, description = "Network error")]
     BadGateway(ErrorResponse),
+    #[response(status = 503, description = "Runtime management or address not ready")]
+    ServiceUnavailable(ErrorResponse),
+    #[response(status = 504, description = "Runtime request timed out")]
+    GatewayTimeout(ErrorResponse),
 }
 
 #[derive(OpenApi)]
@@ -80,6 +67,8 @@ pub enum ErrorApiResponses {
         description = "Rust file-server API, compatible with nuwax-file-server."
     ),
     servers((url = "/", description = "Current file-server")),
+    // IntoResponses 不会自动收集其 body 的 schema；显式登记错误信封及嵌套模型。
+    components(schemas(ErrorResponse)),
     tags(
         (name = "System", description = "Service health"),
         (name = "Project", description = "Project lifecycle and content"),
@@ -88,7 +77,12 @@ pub enum ErrorApiResponses {
         (name = "Git", description = "Git repository operations"),
         (name = "Computer", description = "Computer workspace operations"),
         (name = "Static", description = "Project and workspace static files"),
-        (name = "UserApp", description = "UserApp workspace build and static")
+        // userapp 域 tag（file_server_document 会 merge file-server-userapp 域文档；
+        // 未在此声明则 merge 后 UI 分组顺序退化为 operation 首现顺序。TS 老族与
+        // app-files 在两份聚合文档均属内部剔除面，其 tag 只在容器侧独立文档声明）
+        (name = "Userapp · dev · 构建任务", description = "dev 专属（目标容器恒为 UserappBuilder 开发容器）：构建触发、任务查询/取消与进度 SSE、制品包下载"),
+        (name = "Userapp · dev · 工作区与工具链", description = "dev 专属（目标容器 UserappBuilder 开发容器）：workspace 创建、命令执行、打包下载、模板与技能安装、项目类型探测确认"),
+        (name = "Userapp · dev · 进程管理", description = "dev 专属（目标容器 UserappBuilder 开发容器，路径自带 dev）：dev server 进程启停/列表/日志")
     )
 )]
 struct ApiMetadata;
@@ -120,14 +114,89 @@ pub fn swagger_ui(routes: utoipa::openapi::OpenApi) -> SwaggerUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     fn generated_document() -> utoipa::openapi::OpenApi {
         document(crate::routes::api_router().into_openapi())
     }
 
+    /// 文档质量守卫：全部 components schema 的字段必须有非空 description
+    /// （doc comment 是 swagger description 唯一来源——同事按 swagger 对接，
+    /// 缺描述即对接盲区；与 file-server-userapp 的同款守卫对齐）。serde
+    /// flatten 生成的 allOf 组合 schema（git 写操作族）逐 part 解引用后同
+    /// 规则检查；$ref / array 取值的字段不带自身 description，跳过（与
+    /// userapp 守卫同口径）。走序列化 JSON 而非 utoipa 类型 API（版本无关）。
+    #[test]
+    fn schema_fields_are_documented() {
+        let value = serde_json::to_value(generated_document()).expect("serialize OpenAPI");
+        let schemas = value["components"]["schemas"]
+            .as_object()
+            .expect("component schemas");
+        let mut checked = 0usize;
+        let mut missing = Vec::new();
+
+        fn check_props(
+            label: &str,
+            props: &serde_json::Map<String, Value>,
+            checked: &mut usize,
+            missing: &mut Vec<String>,
+        ) {
+            for (field, field_schema) in props {
+                let Some(obj) = field_schema.as_object() else {
+                    continue;
+                };
+                if !obj.contains_key("type") && !obj.contains_key("$ref") {
+                    continue;
+                }
+                let documented = obj
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .is_some_and(|d| !d.trim().is_empty());
+                if documented {
+                    *checked += 1;
+                } else {
+                    missing.push(format!("{label}.{field}"));
+                }
+            }
+        }
+
+        for (name, schema) in schemas {
+            let Some(obj) = schema.as_object() else {
+                continue;
+            };
+            if let Some(props) = obj.get("properties").and_then(Value::as_object) {
+                check_props(name, props, &mut checked, &mut missing);
+            }
+            if let Some(parts) = obj.get("allOf").and_then(Value::as_array) {
+                for part in parts {
+                    let target = part
+                        .get("$ref")
+                        .and_then(Value::as_str)
+                        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+                        .and_then(|key| schemas.get(key))
+                        .unwrap_or(part);
+                    if let Some(props) = target.get("properties").and_then(Value::as_object) {
+                        check_props(name, props, &mut checked, &mut missing);
+                    }
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "schema 字段缺 description（补 doc comment）：\n{}",
+            missing.join("\n")
+        );
+        assert!(checked > 250, "sanity: 覆盖异常, 实际 {checked}");
+    }
+
     #[test]
     fn document_contains_every_registered_operation() {
         let document = generated_document();
+        // 76 = TS 对齐域全量（镜像族+build+dev）+ /fs/roots + /fs/children
+        // （对齐 TS 1.4.5 目录浏览）+ /get-file-meta（TS 1.5.0）+ /fs/mkdir
+        // + /fs/rename（TS 1.5.1 目录弹窗写操作）。userApp 域
+        // 33 条已拆至 file-server-userapp crate（其 routes.rs 测试守卫）。路由
+        // 增删须同步本计数（防"注册了但没进文档"回归）。
         assert_eq!(document.paths.paths.len(), 76);
         assert!(document.paths.paths.contains_key("/"));
         assert!(document.paths.paths.contains_key("/api/build/start-dev"));
@@ -148,53 +217,206 @@ mod tests {
             document
                 .paths
                 .paths
+                .contains_key("/api/computer/get-file-meta")
+        );
+        assert!(
+            document
+                .paths
+                .paths
+                .contains_key("/api/computer/resolve-file")
+        );
+        assert!(
+            document
+                .paths
+                .paths
+                .contains_key("/api/computer/search-files")
+        );
+        assert!(document.paths.paths.contains_key("/api/computer/fs/mkdir"));
+        assert!(document.paths.paths.contains_key("/api/computer/fs/rename"));
+        let list_params = document
+            .paths
+            .paths
+            .get("/api/computer/get-file-list")
+            .and_then(|item| item.get.as_ref())
+            .and_then(|operation| operation.parameters.as_ref())
+            .expect("get-file-list query parameters")
+            .iter()
+            .map(|parameter| match parameter {
+                utoipa::openapi::RefOr::T(parameter) => parameter,
+                utoipa::openapi::RefOr::Ref(reference) => {
+                    panic!(
+                        "expected inline query parameter, got {}",
+                        reference.ref_location
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(list_params.iter().any(|param| param.name == "type"));
+        assert!(list_params.iter().any(|param| param.name == "limit"));
+        assert!(!list_params.iter().any(|param| param.name == "file_type"));
+        assert!(
+            document
+                .paths
+                .paths
                 .contains_key("/api/page/static/{project_id}/{rest}")
         );
-        assert!(document.paths.paths.contains_key("/api/userapp/build"));
+        // userApp 域已拆出：本文档不得再出现 /api/v1/userapp 路径（防回流）
         assert!(
-            document
+            !document
                 .paths
                 .paths
-                .contains_key("/api/userapp/projects/detect")
-        );
-        assert!(
-            document
-                .paths
-                .paths
-                .contains_key("/api/userapp/projects/confirm")
-        );
-        assert!(
-            document
-                .paths
-                .paths
-                .contains_key("/api/userapp/static/{app_id}/{rest}")
-        );
-        assert!(
-            document
-                .paths
-                .paths
-                .contains_key("/api/userapp/tasks/{task_id}")
-        );
-        assert!(
-            document
-                .paths
-                .paths
-                .contains_key("/api/userapp/tasks/{task_id}/logs")
-        );
-        assert!(
-            document
-                .paths
-                .paths
-                .contains_key("/api/userapp/tasks/{task_id}/logs/stream")
-        );
-        assert!(
-            document
-                .paths
-                .paths
-                .contains_key("/api/userapp/tasks/{task_id}/cancel")
+                .keys()
+                .any(|path| path.starts_with("/api/v1/userapp"))
         );
         assert!(document.paths.paths.keys().all(|path| !path.contains("{*")));
     }
+
+    /// computer 域全端点 workspacePath 契约守卫（对齐 TS 1.4.5：TS 全部存量
+    /// computer 路由 + 静态路由都接受项目绑定目录）。遍历文档中 `/api/computer`
+    /// 前缀全部 operation：GET 参数面须含 `workspacePath`、POST requestBody
+    /// schema（JSON / multipart form）须含 `workspacePath` 属性；`/fs/*` 目录
+    /// 浏览端点例外（TS 侧不带会话上下文）。新增端点漏带字段在此报红——
+    /// 文档驱动 = 与路由注册面同源，接线遗漏的最强检测。
+    #[test]
+    fn computer_endpoints_accept_workspace_path() {
+        let value = serde_json::to_value(generated_document()).expect("serialize OpenAPI");
+        let schemas = value["components"]["schemas"]
+            .as_object()
+            .expect("component schemas");
+        let paths = value["paths"].as_object().expect("paths");
+        let mut offenders = Vec::new();
+        let mut checked = 0usize;
+
+        for (path, item) in paths {
+            if !path.starts_with("/api/computer") {
+                continue;
+            }
+            // 目录浏览端点不带会话上下文（TS 同款例外）
+            if path.starts_with("/api/computer/fs/") {
+                continue;
+            }
+            let Some(ops) = item.as_object() else {
+                continue;
+            };
+            for (method, op) in ops {
+                if !matches!(method.as_str(), "get" | "post") {
+                    continue;
+                }
+                let Some(op) = op.as_object() else {
+                    continue;
+                };
+                let has_workspace_path = if method == "get" {
+                    op.get("parameters")
+                        .and_then(Value::as_array)
+                        .is_some_and(|params| {
+                            params.iter().any(|p| {
+                                p.get("name").and_then(Value::as_str) == Some("workspacePath")
+                            })
+                        })
+                } else {
+                    op.get("requestBody")
+                        .and_then(|rb| rb.get("content"))
+                        .and_then(Value::as_object)
+                        .and_then(|content| {
+                            content.values().find_map(|media| {
+                                let target = media
+                                    .get("schema")
+                                    .and_then(|s| s.get("$ref"))
+                                    .and_then(Value::as_str)
+                                    .and_then(|r| r.strip_prefix("#/components/schemas/"))
+                                    .and_then(|key| schemas.get(key))
+                                    .or_else(|| media.get("schema"))?;
+                                target
+                                    .get("properties")
+                                    .and_then(Value::as_object)
+                                    .map(|props| props.contains_key("workspacePath"))
+                            })
+                        })
+                        .unwrap_or(false)
+                };
+                if !has_workspace_path {
+                    offenders.push(format!(
+                        "{method} {path}: 契约面缺 workspacePath (GET 查参数 / POST 查 body schema)"
+                    ));
+                }
+                checked += 1;
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "computer 端点缺 workspacePath 契约（对齐 TS 1.4.5 全路由接受绑定目录）：\n{}",
+            offenders.join("\n")
+        );
+        assert!(
+            checked >= 20,
+            "sanity: 至少覆盖 20 个 computer operation, 实际 {checked}"
+        );
+    }
+
+    fn operations_of(
+        item: &utoipa::openapi::PathItem,
+    ) -> Vec<(&'static str, &utoipa::openapi::path::Operation)> {
+        fn push<'a>(
+            ops: &mut Vec<(&'static str, &'a utoipa::openapi::path::Operation)>,
+            method: &'static str,
+            op: &'a Option<utoipa::openapi::path::Operation>,
+        ) {
+            if let Some(op) = op {
+                ops.push((method, op));
+            }
+        }
+        let mut ops = Vec::new();
+        push(&mut ops, "get", &item.get);
+        push(&mut ops, "post", &item.post);
+        push(&mut ops, "put", &item.put);
+        push(&mut ops, "delete", &item.delete);
+        push(&mut ops, "options", &item.options);
+        push(&mut ops, "head", &item.head);
+        push(&mut ops, "patch", &item.patch);
+        push(&mut ops, "trace", &item.trace);
+        ops
+    }
+
+    /// operation summary 适配文档 UI（Scalar 左侧菜单与详情区标题显示它）：
+    /// 非空、单行、≤50 字符、不带 `` `GET ...`` 方法/路径前缀（UI 已单独显示
+    /// method+path）。utoipa 取 doc comment 首段为 summary——首段写长文在此报红。
+    #[test]
+    fn operation_summaries_are_ui_concise() {
+        let document = generated_document();
+        const METHODS: [&str; 8] = [
+            "GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD", "TRACE",
+        ];
+        let mut checked = 0usize;
+        for (path, item) in &document.paths.paths {
+            for (method, op) in operations_of(item) {
+                let Some(summary) = op.summary.as_deref().filter(|s| !s.trim().is_empty()) else {
+                    panic!("{method} {path}: summary 缺失（doc comment 首段必填）");
+                };
+                assert!(
+                    !summary.contains('\n'),
+                    "{method} {path}: summary 须为单行（多行内容移到空行后的详细段）"
+                );
+                assert!(
+                    summary.chars().count() <= 50,
+                    "{method} {path}: summary 过长（>50 字符），详细内容移入 description: {summary}"
+                );
+                let method_prefixed =
+                    summary.starts_with('`') && METHODS.iter().any(|m| summary[1..].starts_with(m));
+                assert!(
+                    !method_prefixed,
+                    "{method} {path}: summary 不得带方法/路径前缀（UI 已单独显示）: {summary}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 60,
+            "sanity: 至少遍历 60 个 operation，实际 {checked}"
+        );
+    }
+
+    // userapp 字段文档/HttpResult 信封两测试已随域迁至 file-server-userapp crate
+    // （routes.rs 测试模块）——本文档不再含 /api/v1/userapp 路径。
 
     #[test]
     fn generated_document_round_trips_as_openapi() {
@@ -226,6 +448,42 @@ mod tests {
             assert!(
                 schema_has_named_fields(schema, schemas),
                 "POST {path} request schema must expose named fields"
+            );
+        }
+    }
+
+    /// build/dev 族 200 响应必须类型化（防回退到通用 SuccessResponse 占位——
+    /// 同事按 swagger 对接，业务字段不可见即盲区）。
+    #[test]
+    fn build_dev_endpoints_have_typed_success_bodies() {
+        let value = serde_json::to_value(generated_document()).expect("serialize OpenAPI");
+        let paths = value["paths"].as_object().expect("paths object");
+        // (路径, 方法, 期望 schema 名)——dev/logs/build 族均为 GET（对齐 nuwax 路由形态）
+        let expected = [
+            ("/api/build/start-dev", "get", "DevStarted"),
+            ("/api/build/stop-dev", "get", "DevStopped"),
+            ("/api/build/restart-dev", "get", "DevStarted"),
+            ("/api/build/list-dev", "get", "DevList"),
+            ("/api/build/keep-alive", "get", "KeepAlive"),
+            ("/api/build/port-pool-status", "get", "PortPool"),
+            ("/api/build/get-dev-log", "get", "DevLog"),
+            ("/api/build/get-log-cache-stats", "get", "LogCacheStats"),
+            ("/api/build/clear-all-log-cache", "get", "Simple"),
+            ("/api/build/parse-build-error", "post", "Simple"),
+            ("/api/build/build", "get", "BuildDone"),
+        ];
+        for (path, method, schema_name) in expected {
+            let operation = &paths[path][method];
+            assert!(
+                !operation.is_null(),
+                "{method} {path} must be registered in the document"
+            );
+            let reference =
+                &operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"];
+            assert_eq!(
+                reference,
+                &serde_json::json!(format!("#/components/schemas/{schema_name}")),
+                "{method} {path} 200 响应必须类型化为 {schema_name}（不得回退 SuccessResponse 占位）"
             );
         }
     }

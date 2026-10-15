@@ -13,6 +13,9 @@ pub struct ChatPrompt {
     pub project_path: PathBuf,
     /// agent 的会话ID ,可能没有,如果没有,agent使用自动创建会话,返回会话id
     pub session_id: Option<String>,
+    /// 内部创建意图：不复用或恢复旧 ACP session。
+    #[builder(default)]
+    pub force_new_session: bool,
     /// 提示内容 prompt
     pub prompt: String,
     /// 可选的附件列表

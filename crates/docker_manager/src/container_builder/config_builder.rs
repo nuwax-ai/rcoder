@@ -35,6 +35,10 @@ pub struct ContainerConfigBuilder {
     work_dir: Option<String>,
     env_vars: HashMap<String, String>,
     port_bindings: HashMap<String, String>,
+    /// deploy-host 自动发布端口（容器端口号；宿主端口由 Docker 分配）。
+    /// serde default 空 = 非 deploy-host 构建零行为变化。
+    #[cfg(feature = "deploy-host")]
+    auto_port_bindings: Vec<u16>,
     network_mode: Option<String>,
     auto_remove: bool,
     resource_limits: Option<ServiceResourceLimits>,
@@ -49,6 +53,8 @@ pub struct ContainerConfigBuilder {
     isolation_type: Option<String>,
     // 容器安全配置（可选，仅 Docker 模式生效）
     security: Option<ServiceSecurityConfig>,
+    // 容器 labels（身份标签等）
+    labels: Option<HashMap<String, String>>,
 }
 
 impl ContainerConfigBuilder {
@@ -66,6 +72,8 @@ impl ContainerConfigBuilder {
             work_dir: None,
             env_vars: HashMap::new(),
             port_bindings: HashMap::new(),
+            #[cfg(feature = "deploy-host")]
+            auto_port_bindings: Vec::new(),
             network_mode: None,
             auto_remove: false,
             resource_limits: None,
@@ -79,6 +87,7 @@ impl ContainerConfigBuilder {
             space_id: None,
             isolation_type: None,
             security: None,
+            labels: None,
         }
     }
 
@@ -138,6 +147,13 @@ impl ContainerConfigBuilder {
     /// 批量添加端口映射
     pub fn port_bindings(mut self, bindings: HashMap<String, String>) -> Self {
         self.port_bindings.extend(bindings);
+        self
+    }
+
+    /// deploy-host：追加自动发布端口（容器端口号，宿主端口由 Docker 分配）。
+    #[cfg(feature = "deploy-host")]
+    pub fn auto_port_binding(mut self, container_port: u16) -> Self {
+        self.auto_port_bindings.push(container_port);
         self
     }
 
@@ -219,6 +235,14 @@ impl ContainerConfigBuilder {
         self
     }
 
+    /// 附加容器 label（身份标签等；重复键后者覆盖）
+    pub fn label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.labels
+            .get_or_insert_with(HashMap::new)
+            .insert(key.into(), value.into());
+        self
+    }
+
     /// 构建 DockerContainerConfig
     ///
     /// # Returns
@@ -251,6 +275,8 @@ impl ContainerConfigBuilder {
             work_dir,
             env_vars: self.env_vars,
             port_bindings: self.port_bindings,
+            #[cfg(feature = "deploy-host")]
+            auto_port_bindings: self.auto_port_bindings,
             network_mode,
             auto_remove: self.auto_remove,
             resource_limits: self.resource_limits,
@@ -264,6 +290,7 @@ impl ContainerConfigBuilder {
             space_id: self.space_id,
             isolation_type: self.isolation_type,
             security: self.security,
+            labels: self.labels,
         };
 
         debug!(

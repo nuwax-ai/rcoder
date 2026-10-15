@@ -16,6 +16,7 @@ pub mod computer_vnc_status;
 pub mod devcomputer_chat;
 pub mod devcomputer_handlers;
 pub mod pod_count;
+pub mod progress_sse;
 pub mod rcoder_progress;
 
 pub(super) fn locale_from_headers(headers: &HeaderMap) -> &'static str {

@@ -1,5 +1,7 @@
 //! 应用服务 trait 定义
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use super::models::*;
@@ -12,6 +14,81 @@ use super::models::*;
 ///   业务元数据由调用方（Java）持久化。
 #[async_trait]
 pub trait AppServiceTrait: Send + Sync {
+    /// Response wait includes pre-admission restart waiting without changing
+    /// the deployment execution deadline itself.
+    fn restart_admission_wait_secs(&self) -> u64 {
+        30
+    }
+    async fn verify_recovered_storage(
+        &self,
+        app_id: &str,
+        scope: shared_types::UserAppOperationScope,
+    ) -> AppResult<()>;
+    async fn discover_missing_identity(
+        &self,
+        app_id: &str,
+    ) -> AppResult<Option<shared_types::UserAppLifecycleRecord>>;
+
+    /// Prepare only the captured prod management container and PostgreSQL.
+    /// Does not promote pending configuration or assert application readiness.
+    async fn prepare_prod_database(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+        request_id: &str,
+        fingerprint: &str,
+        deadline: tokio::time::Instant,
+    ) -> AppResult<()>;
+    async fn retry_control_operation(
+        &self,
+        app_id: &str,
+        operation_id: &str,
+        request: shared_types::UserAppRetryRequest,
+    ) -> AppResult<shared_types::UserAppOperationView>;
+    /// Internal recovery entry, not an HTTP mutation API. Returns false for
+    /// operations that lack safe Pending control inputs or were claimed elsewhere.
+    async fn resume_pending_control(
+        &self,
+        operation: &shared_types::UserAppOperationRecord,
+    ) -> AppResult<bool>;
+    /// Inspect and retire only an interrupted deletion's captured write scopes.
+    /// Returns false when a live holder/another recovery still owns the attempt;
+    /// never replays an unknown purge or revives a lifecycle deletion tombstone.
+    async fn reconcile_interrupted_deletion(
+        &self,
+        _operation: &shared_types::UserAppOperationRecord,
+    ) -> AppResult<bool> {
+        Err(AppOperationError::Backend(
+            "Interrupted deletion recovery is not configured".into(),
+        ))
+    }
+    async fn get_lifecycle(&self, app_id: &str) -> AppResult<shared_types::UserAppLifecycleRecord>;
+    async fn get_control_operation(
+        &self,
+        app_id: &str,
+        operation_id: Option<&str>,
+    ) -> AppResult<Option<shared_types::UserAppOperationView>>;
+    async fn get_control_operation_by_request(
+        &self,
+        app_id: &str,
+        request_id: &str,
+    ) -> AppResult<Option<shared_types::UserAppOperationView>>;
+    /// All in-flight operations across scopes (application, dev, prod), fixed
+    /// order. Read-only: never blocked by any environment's busy slot.
+    async fn get_current_operations(
+        &self,
+        app_id: &str,
+    ) -> AppResult<Vec<shared_types::UserAppOperationView>>;
+    async fn recreate_identity(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppRecreateRequest,
+    ) -> AppResult<shared_types::UserAppLifecycleRecord>;
+
+    /// 记录开发注册（userApp create-workspace 时落 identity；name 为空 = 开发期，
+    /// 部署 create_app 后 upsert 补全业务字段）
+    async fn record_dev_registration(&self, app_id: &str) -> AppResult<()>;
+
     /// 创建应用（返回完整 [`AppInfo`]，rcoder 此时持有请求参数）
     async fn create_app(&self, request: CreateAppRequest) -> AppResult<AppInfo>;
 
@@ -25,10 +102,36 @@ pub trait AppServiceTrait: Send + Sync {
     /// 对账接口：列出集群中所有 rcoder 托管的应用运行时状态
     ///
     /// 供 Java 在 rcoder/自身重启后对账（rcoder 不持久化 app 元数据）。
+    /// 应用共享（无 owner 过滤），与 [`Self::list_all_app_runtimes`] 同口径。
     async fn list_app_runtimes(&self) -> AppResult<Vec<AppRuntimeInfo>>;
+
+    /// 无过滤全量版（系统内部扫描面：闲置回收器覆盖所有 app，与归属无关）。
+    async fn list_all_app_runtimes(&self) -> AppResult<Vec<AppRuntimeInfo>>;
 
     /// 获取应用运行时详情（实时查集群）
     async fn get_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo>;
+
+    /// Public owner-scoped read. The second identity read prevents returning a
+    /// runtime observation across deletion/recreation without taking a write lease.
+    async fn get_app_for_owner(&self, app_id: &str) -> AppResult<AppRuntimeInfo> {
+        let before = self.get_lifecycle(app_id).await?;
+        if before.state != shared_types::UserAppLifecycleState::Active {
+            return Err(AppOperationError::Conflict(
+                "Application lifecycle is not active".into(),
+            ));
+        }
+        let runtime = self.get_app(app_id).await?;
+        let after = self.get_lifecycle(app_id).await?;
+        if after.lifecycle_id != before.lifecycle_id
+            || after.lifecycle_epoch != before.lifecycle_epoch
+            || after.state != shared_types::UserAppLifecycleState::Active
+        {
+            return Err(AppOperationError::Conflict(
+                "Application lifecycle changed during runtime query".into(),
+            ));
+        }
+        Ok(runtime)
+    }
 
     /// 更新应用（全量替换 desired state）。rcoder 无状态，调用方需发送完整新状态
     /// （`image` 必填）。K8s SSA re-apply 幂等；Docker 重建容器。详见 v2 设计 §5.2。
@@ -46,92 +149,194 @@ pub trait AppServiceTrait: Send + Sync {
         expected_resource_version: Option<&str>,
     ) -> AppResult<()>;
 
-    /// 查询单个应用持久存储状态（v2 §5.4，O(1) stat，不含 size_bytes）
-    async fn get_app_storage(&self, app_id: &str) -> AppResult<StorageInfo>;
+    async fn delete_app_controlled(&self, app_id: &str, request: DeleteAppRequest)
+    -> AppResult<()>;
 
-    /// 清空应用持久存储内容（留 PVC，可恢复；仅当 app 已 delete 时允许，否则 INVALID_STATE）
-    async fn clear_app_storage(&self, app_id: &str) -> AppResult<()>;
+    /// Delete captured userApp resources and retain a lifecycle tombstone.
+    async fn purge_app(&self, app_id: &str) -> AppResult<()>;
 
-    /// 销毁应用持久存储 PVC（高危·不可逆·释放配额；需 confirm==app_id，仅 app 已 delete 后允许）
-    async fn destroy_app_storage(&self, app_id: &str, confirm: &str) -> AppResult<()>;
-
-    /// 重置 app 容器内 PG 密码（exec psql ALTER USER，本地 trust 认证绕过当前密码）
-    async fn reset_db_password(
+    async fn purge_app_controlled(
         &self,
         app_id: &str,
-        request: ResetDbPasswordRequest,
+        request: shared_types::UserAppControlRequest,
     ) -> AppResult<()>;
 
-    /// 新建 PG 库（exec psql CREATE DATABASE）
-    async fn create_database(&self, app_id: &str, request: CreateDatabaseRequest) -> AppResult<()>;
+    /// 查询单个应用持久存储状态（prod=运行卷 / dev=开发卷；O(1) stat，不含 size_bytes）
+    async fn get_app_storage(
+        &self,
+        app_stage: shared_types::UserappStage,
+        app_id: &str,
+    ) -> AppResult<StorageInfo>;
 
-    /// 分页查询持久存储（强制分页，无全量模式）
+    /// 清空应用持久存储内容（prod：留 PVC 可恢复，仅当 app 已 delete；dev：清空
+    /// workspace 内容留容器留卷——"重置开发工作区"）
+    async fn clear_app_storage(
+        &self,
+        app_stage: shared_types::UserappStage,
+        app_id: &str,
+    ) -> AppResult<()>;
+    async fn clear_app_storage_controlled(
+        &self,
+        app_stage: shared_types::UserappStage,
+        app_id: &str,
+        request: ClearStorageRequest,
+    ) -> AppResult<String>;
+
+    /// 销毁应用持久存储（prod：删 PVC，需 confirm==app_id 且 app 已 delete；
+    /// dev：销毁整个开发环境=builder 容器+dev 卷+目录，不动 metadata）
+    async fn destroy_app_storage(
+        &self,
+        app_stage: shared_types::UserappStage,
+        app_id: &str,
+        confirm: &str,
+    ) -> AppResult<()>;
+    async fn destroy_app_storage_controlled(
+        &self,
+        app_stage: shared_types::UserappStage,
+        app_id: &str,
+        request: DestroyStorageRequest,
+    ) -> AppResult<String>;
+
+    /// PG 凭据对齐（Userapp 运行容器内）：验证传入密码，不一致则重置
+    /// （流程单头 `shared_types::align_pg_credentials`，exec 通道实现）
+    async fn align_db_credentials(
+        &self,
+        app_id: &str,
+        request: shared_types::AlignCredentialsRequest,
+    ) -> AppResult<shared_types::AlignCredentialsOutcome>;
+
+    /// database 目录 SQL 自动执行（发布 activate 后；失败收集进 report 不阻断）
+    async fn execute_database_sql(&self, app_id: &str) -> AppResult<DatabaseSqlReport>;
+
+    /// 查 app 的 owner user_id（userapp_metadata；create-workspace/publish 注册）。
+    /// 未注册返回 None（调用方自行兜底）。
+    async fn get_app_owner(&self, app_id: &str) -> AppResult<Option<String>>;
+
+    /// 分页查询持久存储（强制分页，无全量模式；prod=运行卷清单，dev=开发卷清单）
     async fn query_storage(
         &self,
+        app_stage: shared_types::UserappStage,
         request: QueryStorageRequest,
     ) -> AppResult<PaginatedResponse<StorageInfo>>;
 
-    /// 启动应用（scale replicas = 1）
+    /// 启动应用（scale replicas = 1；内部传统语义，发布链/编排用）
     async fn start_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo>;
+    async fn start_app_controlled(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppControlRequest,
+    ) -> AppResult<AppRuntimeInfo>;
+
+    /// 统一部署+启动（无参数 = 传统 start；带 url = 轻量部署 prepare→activate→启动；
+    /// 可选 app_stage/idle/pg 对齐）——REST 面删除 create 后的统一入口
+    async fn start_app_enhanced(
+        &self,
+        app_id: &str,
+        request: StartAppRequest,
+    ) -> AppResult<StartAppResult>;
+
+    /// restart 变体（同款可选参数；无 url 时走传统 restart）
+    async fn restart_app_enhanced(
+        &self,
+        app_id: &str,
+        request: StartAppRequest,
+    ) -> AppResult<StartAppResult>;
 
     /// 停止应用（scale replicas = 0）
     async fn stop_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo>;
+    async fn stop_app_controlled(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppControlRequest,
+    ) -> AppResult<AppRuntimeInfo>;
 
     /// 闲置回收专用 scale0：持久化允许流量唤醒的停止原因。
     async fn recycle_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo>;
 
     /// 重启应用（rollout restart）
     async fn restart_app(&self, app_id: &str) -> AppResult<AppRuntimeInfo>;
+    async fn restart_app_controlled(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppControlRequest,
+    ) -> AppResult<AppRuntimeInfo>;
 
-    /// 设置闲置回收策略（动态、免重启：只 patch Deployment 注解）。供免费↔付费 tier 变更调用。
+    /// 设置闲置回收策略（动态、免重启：只 patch Deployment 注解）。供管理/运营面策略调整调用。
     async fn set_recycle_policy(
         &self,
         app_id: &str,
         request: RecyclePolicyRequest,
     ) -> AppResult<AppRuntimeInfo>;
 
-    async fn prepare_release(
+    /// 获取资源使用情况（best-effort：restart_count 来自运行时；CPU/内存需 metrics-server）。
+    /// app_stage=prod 查运行容器（label app-id）；app_stage=dev 查开发容器（双键 instance+service-type），
+    /// Docker/compose 形态无 metrics → 用量 0（降级语义与 prod 一致）
+    async fn get_app_stats(
         &self,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
-        request: PrepareReleaseRequest,
-    ) -> AppResult<ReleaseInfo>;
+    ) -> AppResult<ResourceStats>;
 
-    async fn activate_release(&self, app_id: &str, release_id: &str) -> AppResult<ReleaseInfo>;
-
-    async fn confirm_release(
+    /// 获取应用健康状态：prod=运行时状态派生；dev=探活开发容器内 file-server
+    /// `/health`（常驻自愈容器，phase=Running 即达）。不支持 dev 语义的能力接口
+    /// （events/recycle-policy 等）由 handler 层拦截，不进 trait。
+    async fn get_app_health(
         &self,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
-        release_id: &str,
-        healthy: bool,
-        message: Option<String>,
-    ) -> AppResult<ReleaseInfo>;
+    ) -> AppResult<HealthInfo>;
 
-    /// 中止 pending 发布（index-only compare-and-clear）。
-    /// confirm(false) 自身失败导致 pending 卡死时的运维自救手段：仅当 pending 恰指该 release
-    /// 时置 Failed + 清 pending，不做任何文件/运行时操作。
-    async fn abort_release(
+    /// 业务就绪查询（只读观察）：合并权威记录、scope 控制意图与 app-cli 业务
+    /// 快照；查询成功恒 200，`data.ready` 才表示业务可用。
+    async fn get_app_readiness(
         &self,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
-        release_id: &str,
-        message: Option<String>,
-    ) -> AppResult<ReleaseInfo>;
+    ) -> AppResult<shared_types::UserAppReadinessResponse>;
 
-    async fn list_releases(&self, app_id: &str) -> AppResult<ReleaseListResponse>;
+    /// dbx-web（容器内恒起 :4224）只读就绪查询：不唤醒、不建容器。
+    async fn get_app_dbx_readiness(
+        &self,
+        app_stage: shared_types::UserappStage,
+        app_id: &str,
+    ) -> AppResult<shared_types::DbxReadinessResponse>;
 
-    async fn delete_release(&self, app_id: &str, release_id: &str) -> AppResult<()>;
+    /// 只读观察器句柄（宿主注入后的回读；代理失败诊断顾问等消费）。
+    fn readiness_reader(&self) -> Option<Arc<dyn shared_types::UserAppReadinessReader>> {
+        None
+    }
 
-    /// 获取资源使用情况（best-effort：restart_count 来自运行时；CPU/内存需 metrics-server）
-    async fn get_app_stats(&self, app_id: &str) -> AppResult<ResourceStats>;
+    /// Existing file-peer credentials; configuration reads never ensure compute.
+    /// Hosts without the optional provider retain the default disabled auth.
+    async fn file_request_credentials(
+        &self,
+        _stage: shared_types::UserappStage,
+        _app_id: &str,
+        _deadline: tokio::time::Instant,
+    ) -> AppResult<shared_types::FileServerRequestCredentials> {
+        Ok(shared_types::FileServerRequestCredentials::default())
+    }
 
-    /// 获取应用事件（K8s Events API：调度/拉取/启动/崩溃）
+    /// 日志转发基址：prod=app-cli 管理面；dev=已有容器 file-server。
+    /// dev 查询不创建/唤醒计算，也不要求业务或 owner 运行。
+    async fn log_api_base(
+        &self,
+        app_stage: shared_types::UserappStage,
+        app_id: &str,
+    ) -> AppResult<String>;
+
+    /// 获取应用事件（K8s Events API：调度/拉取/启动/崩溃；仅 prod 运行容器——
+    /// 调用方 handler 层负责环境校验）
     async fn get_app_events(
         &self,
         app_id: &str,
     ) -> AppResult<Vec<container_runtime_api::AppEventInfo>>;
 
-    /// 上传文件 / 压缩包（魔数判断：zip/tar.gz → 解压到 target 目录；单文件存 target；flatten 剥 wrapper）
+    /// 上传文件 / 压缩包（魔数判断：zip/tar.gz → 解压到 target 目录；单文件存 target；flatten 剥 wrapper）。
+    /// app_stage=prod 转发运行容器（target 相对 /app 根）；app_stage=dev 转发开发容器（target 相对 workspace 根）
     async fn upload_file(
         &self,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
         file_data: Vec<u8>,
         target: &str,
@@ -141,15 +346,27 @@ pub trait AppServiceTrait: Send + Sync {
     /// 从 HTTP(S) URL 下载文件/压缩包并上传；允许内网地址，复用 upload_file 解压和路径安全校验。
     async fn upload_from_url(
         &self,
+        app_stage: shared_types::UserappStage,
         app_id: &str,
         url: &str,
         target: &str,
         flatten: bool,
     ) -> AppResult<UploadResult>;
 
-    /// 列出文件（app 根或其子目录 code/data/logs；subpath=None 列 app 根）
-    async fn list_files(&self, app_id: &str, subpath: Option<&str>) -> AppResult<Vec<FileInfo>>;
+    /// 列出文件（app 根或其子目录 code/data/logs；subpath=None 列 app 根。
+    /// dev 环境根基准为开发容器 workspace 根）
+    async fn list_files(
+        &self,
+        app_stage: shared_types::UserappStage,
+        app_id: &str,
+        subpath: Option<&str>,
+    ) -> AppResult<Vec<FileInfo>>;
 
     /// 删除文件（app 根相对路径，可指向 code/data/logs 下任意文件）
-    async fn delete_file(&self, app_id: &str, file_path: &str) -> AppResult<()>;
+    async fn delete_file(
+        &self,
+        app_stage: shared_types::UserappStage,
+        app_id: &str,
+        file_path: &str,
+    ) -> AppResult<()>;
 }

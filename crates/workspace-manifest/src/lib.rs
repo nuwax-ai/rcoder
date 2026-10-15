@@ -1,4 +1,4 @@
-//! UserApp Manifest v1 shared contract.
+//! Userapp Manifest v1 shared contract.
 //!
 //! Build-time (`file-server`) and runtime (`app-cli`) both consume this crate。
 //!
@@ -35,15 +35,29 @@ mod release_lock;
 mod types;
 mod validation;
 
-pub use discovery::{assemble_discovered, discover_projects};
+pub use discovery::{
+    DiscoveryReport, assemble_discovered, discover_projects, discover_projects_lenient,
+    discover_projects_report,
+};
 pub use error::{DiscoverError, LoadError, ManifestError};
 pub use release_lock::{ReleaseMetadata, build_release_lock, load_release_lock};
 pub use types::*;
 pub use validation::{
-    parse_project, parse_workspace, validate_project, validate_service_id, validate_topology,
-    validate_workspace,
+    DiagnosticKind, ManifestDiagnostic, ValidationIssue, collect_topology_issues,
+    collect_workspace_issues, collect_workspace_startup_issues, manifest_file_of, parse_project,
+    parse_project_toml, parse_workspace, parse_workspace_for_inspection, parse_workspace_toml,
+    require_startup_probe_capability, validate_project, validate_project_at,
+    validate_release_startup, validate_service_id, validate_topology, validate_workspace,
+    validate_workspace_startup,
 };
 
 pub const SCHEMA_VERSION: u32 = 1;
+/// release.lock 声明的最低 app-cli 版本（`validate_runtime_compatibility`
+/// 消费）。**版本线纪律**：修改 release.lock 相关 schema（新增/变更
+/// LockedService/HealthSection 等序列化字段）时，必须同步 bump app-cli 的
+/// Cargo 版本与本常量，并重建 app-runtime 镜像——已发布的旧二进制内嵌
+/// 编译时点的 schema（deny_unknown_fields），序列化新增字段会让其部署死循环
+/// （前车之鉴：startup_timeout_seconds，序列化侧须 skip 默认值兜底）。
+pub const MINIMUM_APP_CLI_VERSION: &str = "0.3.9";
 pub const INTERNAL_PORT_MIN: u16 = 4000;
 pub const INTERNAL_PORT_MAX: u16 = 7999;

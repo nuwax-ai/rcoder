@@ -1,0 +1,286 @@
+# RCoder 配置文件
+# 这是默认配置，会在首次启动时自动生成
+
+# 默认使用的 AI 代理类型 (Claude/Codex)
+default_agent: "Claude"
+
+# 项目工作目录
+projects_dir: "./project_workspace"
+
+# 主服务端口
+port: 8087
+
+# 容器清理配置
+cleanup_config:
+  # 是否启用容器清理功能（默认启用）
+  # 设置为 false 可以禁用自动清理闲置容器
+  # - true: 启用（默认，自动清理闲置容器）
+  # - false: 禁用
+  enabled: true
+  # 闲置超时时间（秒），超过此时间未活动的容器将被清理
+  # 默认值: 600 (10分钟)
+  idle_timeout_seconds: 600
+  # 清理任务执行间隔（秒）
+  # 默认值: 300 (5分钟)
+  cleanup_interval_seconds: 300
+  # Docker 容器停止超时时间（秒）
+  # 默认值: 30
+  docker_stop_timeout_seconds: 30
+  # 日志清理配置
+  log_cleanup:
+    # 日志目录路径（容器内路径）
+    # 默认值: /app/logs/container
+    log_dir: "/app/logs/container"
+    # 日志保留天数
+    # 默认值: 10
+    log_retention_days: 10
+
+# Pingora 反向代理配置
+proxy_config:
+  # 代理服务监听端口 (用于接收外部请求)
+  listen_port: 8088
+  # 默认后端服务端口 (当请求未指定端口时使用)
+  default_backend_port: 8087
+  # 后端服务主机地址
+  backend_host: "127.0.0.1"
+  # URL 中端口参数的名称 (用于从路径中提取端口号)
+  port_param: "port"
+  # 健康检查配置
+  health_check:
+    enabled: true
+    interval_seconds: 5
+    timeout_seconds: 1
+    healthy_threshold: 2
+    unhealthy_threshold: 3
+
+  # HTTP 客户端配置（协议转换时连接上游 API）
+  http_client:
+    request_timeout_seconds: 600
+    connect_timeout_seconds: 10
+    pool_idle_timeout_seconds: 90
+
+# Docker 配置
+docker_config:
+  # 多镜像配置系统
+  multi_image_config:
+    # 全局默认配置
+    global_defaults:
+      # 默认镜像仓库前缀
+      registry_prefix: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/dev"
+      # 其他默认镜像配置（可选）
+      # image: "custom/default-image:latest"
+      # arm64_image: "custom/default-image:arm64"
+      # amd64_image: "custom/default-image:amd64"
+      # default_image: "custom/default-image:latest"
+
+    # 服务镜像配置
+    services:
+      # RCoder 主服务配置
+      rcoder:
+        service_type: "RCoder"
+        # 镜像配置（使用架构特定镜像）
+        # image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax/rcoder:latest"  # 通用镜像,"nuwax"是生产环境镜像, "nuwax-test"和"dev"都是测试镜像,默认生产环境镜像
+        arm64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax/rcoder:latest"
+        amd64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax/rcoder:latest"
+        default_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax/rcoder:latest"
+        image_tag_prefix: "rcoder"
+        enabled: true
+
+        # 容器内挂载路径模板（支持变量替换）
+        # 默认值: "/app/project_workspace/{project_id}"
+        # 支持变量: {project_id}, {user_id}, {service_type}
+        container_path_template: "/app/project_workspace/{project_id}"
+
+        # 环境变量
+        environment:
+          RUST_LOG: "info"
+          SERVICE_MODE: "full"
+          API_PORT: "8086"
+
+        # 容器启动命令
+        command:
+          - "/app/bin/agent_runner"
+          - "--port"
+          - "8086"
+
+        # 容器入口点（可选，如果为空则使用镜像默认）
+        # entrypoint: []
+
+        # 资源限制配置
+        resource_limits:
+          memory_limit: 2147483648 # 2GB (字节)
+          cpu_limit: 2.0 # 2 核 CPU
+          swap_limit: 4294967296 # 4GB 交换空间 (字节)
+
+        # 容器工作目录
+        work_dir: "/app"
+
+        # 网络模式
+        network_mode: "bridge"
+
+        # 卷挂载配置
+        # 注释掉默认挂载配置，临时测试用，改为空数组
+        # mounts:
+        #   - container_path: "/app/specs"
+        #     host_path: "/app/specs"
+        #     read_only: true
+        #     mount_type: "bind"
+        mounts: []
+
+      # ComputerAgentRunner 服务配置
+      computer-agent-runner:
+        service_type: "ComputerAgentRunner"
+        # 镜像配置（使用架构特定镜像）
+        arm64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-computer-agent-runner:latest"
+        amd64_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-computer-agent-runner:latest"
+        default_image: "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-test/dev-computer-agent-runner:latest"
+        image_tag_prefix: "rcoder-computer-agent-runner"
+        enabled: true
+
+        # 容器内挂载路径模板（支持变量替换）
+        # 默认值: "/app/project_workspace/{project_id}"
+        # 支持变量: {project_id}, {user_id}, {service_type}
+        container_path_template: "/app/project_workspace/{project_id}"
+
+        # 环境变量
+        environment:
+          RUST_LOG: "debug"
+          SERVICE_MODE: "agent-only"
+          AGENT_PORT: "8086"
+
+        # 容器启动命令
+        command:
+          - "/app/bin/agent_runner"
+          - "--port"
+          - "8086"
+
+        # 容器入口点（可选，如果为空则使用镜像默认）
+        # entrypoint: []
+
+        # 资源限制配置（AgentRunner 通常需要更多资源）
+        resource_limits:
+          memory_limit: 4294967296 # 4GB (字节)
+          cpu_limit: 3.0 # 3 核 CPU
+          swap_limit: 8589934592 # 8GB 交换空间 (字节)
+
+        # 容器工作目录
+        work_dir: "/app"
+
+        # 网络模式
+        network_mode: "bridge"
+
+        # 卷挂载配置
+        # 注释掉默认挂载配置，临时测试用，改为空数组
+        # mounts:
+        #   - container_path: "/app/specs"
+        #     host_path: "/app/specs"
+        #     read_only: true
+        #     mount_type: "bind"
+        mounts: []
+
+    # 镜像选择策略
+    selection_strategy: "ServiceOnly"
+
+    # 缓存配置
+    cache_config:
+      enabled: true
+      ttl_seconds: 3600
+      max_entries: 50
+
+  # 其他 Docker 配置
+  # 网络基础名称（不含 project name 前缀）
+  # Docker Compose 会自动添加 project name 前缀，实际网络名称为 {project_name}_{network_base_name}
+  # 例如: network_base_name="agent-network" 时，实际网络为 "rcoder_agent-network"
+  network_base_name: "agent-network"
+
+  # 默认网络模式
+  network_mode: "bridge"
+
+  # 默认工作目录
+  work_dir: "/app"
+
+  # 是否启用自动清理
+  auto_cleanup: true
+
+  # 容器存活时间（秒）
+  container_ttl_seconds: 3600
+
+  # 🔧 Docker API 调用超时时间（秒）
+  # 用于大多数 Docker API 调用的超时保护
+  api_timeout_seconds: 10
+
+  # 🔧 快速操作超时时间（秒）
+  # 用于状态查询等轻量级操作的超时保护
+  api_timeout_quick_seconds: 5
+
+  # 🔧 状态缓存 TTL（秒）
+  # 用于缓存容器状态信息（container_id, container_name, status, is_running）
+  # 建议值：
+  #   - 高频查询环境: 30-60
+  #   - 平衡模式: 10-15（默认）
+  #   - 实时要求高: 5-10
+  cache_status_ttl_seconds: 10
+
+  # 🔧 网络缓存 TTL（秒）
+  # 用于缓存容器网络信息（network_name -> ip_address）
+  # 建议值：
+  #   - 高频查询环境: 60-120
+  #   - 平衡模式: 15-30（默认）
+  #   - 实时要求高: 10-15
+  cache_network_ttl_seconds: 15
+
+  # 🔧 缓存最大容量
+  # 用于 DockerApiCache 的 status_cache 和 network_cache 的最大条目数
+  # 建议值：
+  #   - 小型环境: 1000-5000
+  #   - 中型环境: 5000-10000（默认）
+  #   - 大型环境: 10000-50000
+  cache_max_capacity: 10000
+
+# deploy-host 宿主机形态 Reach 寻址（可选；容器/K8s 形态忽略此段）
+# reach 决定宿主机如何拨号容器端口：
+#   - auto（默认）: 按生效 Docker socket 检测——OrbStack/原生 Linux 用
+#     direct（容器 IPv4 直拨、零端口发布），Docker Desktop 用 published
+#   - direct: 容器 IPv4 直拨，不发布任何端口到宿主机
+#   - published: 端口发布到宿主机（既有行为）
+# 可用环境变量 RCODER_DEPLOY_HOST_REACH 覆盖（优先于本段）
+# deploy_host:
+#   reach: auto
+
+# API Key 鉴权配置（可选）
+api_key_auth:
+  # 是否启用 API Key 鉴权（默认关闭）
+  # 启用后，所有 HTTP 请求必须携带正确的 x-api-key header
+  # 豁免端点：/health, /metrics, /api/docs, /proxy/status, /proxy/stats
+  enabled: false
+
+  # API Key 值（首次生成时自动创建随机密钥）
+  # 格式：sk-{32位十六进制字符串}
+  # 示例：sk-a1b2c3d4e5f6789012345678abcdef01
+  # 可以通过环境变量 RCODER_API_KEY 覆盖此配置
+  api_key: "{{GENERATED_API_KEY}}"
+
+# 存储后端配置（rcoder-pg；默认 memory，docker compose 部署无需配置）
+# postgres 模式需二进制以 --features rcoder-pg 编译（k8s 变体），
+# 映射关系持久化到 PG，rcoder 重启后 session resolve 不丢、用户容器不被清理。
+# 所有字段均可用环境变量覆盖（env > 本文件 > 默认值）：
+#   RCODER_STORAGE_BACKEND / RCODER_PG_HOST / RCODER_PG_PORT / RCODER_PG_USERNAME /
+#   RCODER_PG_PASSWORD / RCODER_PG_DATABASE / RCODER_PG_URL / RCODER_PG_MAX_CONNECTIONS /
+#   RCODER_PG_CONNECT_TIMEOUT_SECS / RCODER_PG_STATEMENT_TIMEOUT_SECS
+storage:
+  # 存储后端：memory（默认，纯内存单节点）| postgres（PG 持久化，多副本前置条件）
+  backend: memory
+  # PG 连接配置（backend=postgres 时生效）
+  postgres:
+    # K8s 内通常是 <release>-pg.<namespace>.svc.cluster.local
+    host: ""
+    port: 5432
+    username: ""
+    # k8s 部署建议留空，经 RCODER_PG_PASSWORD env + Secret 注入
+    password: ""
+    database: rcoder
+    # 可选：整串 DSN，设置后优先于上面的离散字段（特殊字符/SSL 参数逃生口）
+    # url: "postgres://user:pass@host:5432/rcoder"
+    max_connections: 10
+    connect_timeout_secs: 10
+    statement_timeout_secs: 5

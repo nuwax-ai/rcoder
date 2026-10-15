@@ -1,0 +1,313 @@
+//! git 域请求体与 Query 参数（对齐 nuwax gitRoutes）。
+//!
+//! 写操作 body 经 `#[serde(flatten)]` 复用 `GitWriteBody` 基类（serde flatten
+//! 与 deserialize_with 的交互是已知坑区，见 handlers/git/write.rs 测试）。
+//! 字段为 `pub`（models 是 crate 内公共层）。
+
+use garde::Validate;
+use serde::{Deserialize, Serialize};
+
+/// GET 路由公共查询 (workspaceType + project/computer 标识 + 多租户 +
+/// serviceContext body/query 通道)。
+#[derive(Deserialize, utoipa::IntoParams, utoipa::ToSchema)]
+#[into_params(parameter_in = Query)]
+#[serde(rename_all = "camelCase")]
+pub struct GitQuery {
+    /// 工作区类型（四值词表 userApp/pageApp/normalProject/taskAgent，大小写
+    /// 不敏感；header `x-workspace-type` 优先——收口层合并；完全未传 →
+    /// 缺省 taskAgent 会话工作区，对齐 TS a29cbc0/1.4.7）
+    pub workspace_type: Option<String>,
+    /// 项目 ID（workspaceType=pageApp 时必填）
+    pub project_id: Option<String>,
+    /// 用户 ID（会话工作区模式必填）
+    pub user_id: Option<String>,
+    /// 容器/实例 ID（会话工作区模式必填）
+    pub c_id: Option<String>,
+    /// 租户 ID（多租户隔离；本地部署可缺省）
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    /// 空间 ID（多租户隔离；本地部署可缺省）
+    #[serde(default)]
+    pub space_id: Option<String>,
+    /// 隔离类型（多租户隔离；本地部署可缺省）
+    #[serde(default)]
+    pub isolation_type: Option<String>,
+    /// 旧运行时路由字段（保留形态；B06 契约下不参与工作区定位）
+    #[serde(default)]
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
+    /// header `x-app-id` 优先——收口层合并）
+    #[serde(
+        default,
+        deserialize_with = "crate::extract::deserialize_optional_id_string"
+    )]
+    pub app_id: Option<String>,
+    /// serviceContext 通道：用户维度工作目录（header `x-workspace-path` 优先
+    /// ——收口层合并）
+    #[serde(default)]
+    pub workspace_path: Option<String>,
+}
+
+/// POST 路由公共 body (写操作基类, 被 FilesBody / CommitBody 等经 serde flatten 复用)。
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GitWriteBody {
+    /// 工作区类型（四值词表 userApp/pageApp/normalProject/taskAgent，大小写
+    /// 不敏感；header `x-workspace-type` 优先——收口层合并；可选——完全
+    /// 未传时缺省 taskAgent 会话工作区，对齐 TS a29cbc0/1.4.7（TS 侧该
+    /// 参数本就可选，移植早期误设为必填））
+    #[serde(default)]
+    pub workspace_type: Option<String>,
+    /// 项目 ID（workspaceType=pageApp 时必填）
+    #[serde(
+        default,
+        deserialize_with = "crate::extract::deserialize_optional_id_string"
+    )]
+    pub project_id: Option<String>,
+    /// 用户 ID（会话工作区模式必填）
+    #[serde(
+        default,
+        deserialize_with = "crate::extract::deserialize_optional_id_string"
+    )]
+    pub user_id: Option<String>,
+    /// 容器/实例 ID（会话工作区模式必填）
+    #[serde(
+        default,
+        deserialize_with = "crate::extract::deserialize_optional_id_string"
+    )]
+    pub c_id: Option<String>,
+    /// 租户 ID（多租户隔离；本地部署可缺省）
+    #[serde(
+        default,
+        deserialize_with = "crate::extract::deserialize_optional_id_string"
+    )]
+    pub tenant_id: Option<String>,
+    /// 空间 ID（多租户隔离；本地部署可缺省）
+    #[serde(
+        default,
+        deserialize_with = "crate::extract::deserialize_optional_id_string"
+    )]
+    pub space_id: Option<String>,
+    /// 隔离类型（多租户隔离；本地部署可缺省）
+    #[serde(default)]
+    pub isolation_type: Option<String>,
+    /// 旧运行时路由字段（保留形态；B06 契约下不参与工作区定位）
+    #[serde(default)]
+    pub service_type: Option<String>,
+    /// serviceContext 通道：appId（userapp=app 定位 / normalProject=projectId；
+    /// header `x-app-id` 优先——收口层合并）
+    #[serde(
+        default,
+        deserialize_with = "crate::extract::deserialize_optional_id_string"
+    )]
+    pub app_id: Option<String>,
+    /// serviceContext 通道：用户维度工作目录（header `x-workspace-path` 优先
+    /// ——收口层合并）
+    #[serde(default)]
+    pub workspace_path: Option<String>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FileContentBody {
+    #[serde(flatten)]
+    pub base: GitWriteBody,
+    /// nuwax 字段名 `ref` (Rust 关键字, 用 ref_ + serde rename)
+    #[serde(rename = "ref", default)]
+    pub ref_: Option<String>,
+    /// 文件相对路径
+    pub file_path: String,
+}
+
+/// discard 成功响应 (对齐 TS gitService discard 返回形状)。
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscardResult {
+    /// 恒为 true；失败走 AppError 错误响应。
+    pub success: bool,
+    /// 对齐 TS 契约文案 (gitService.js discard)。
+    pub message: &'static str,
+    /// 本次操作归属的日志标识。
+    pub log_id: String,
+    /// 丢弃的文件总数 (三类分桶之和)。
+    pub discarded_count: usize,
+    /// 已跟踪文件中丢弃改动的路径。
+    pub tracked_files: Vec<String>,
+    /// 丢弃的暂存新增文件路径。
+    pub new_files: Vec<String>,
+    /// 丢弃的未跟踪文件路径。
+    pub untracked_files: Vec<String>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FilesBody {
+    #[serde(flatten)]
+    pub base: GitWriteBody,
+    /// 暂存文件集合（缺省等价 git add -A）
+    #[serde(default)]
+    pub files: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitBody {
+    #[serde(flatten)]
+    #[garde(skip)]
+    pub base: GitWriteBody,
+    /// 提交信息（必填非空）
+    #[garde(custom(crate::validation_rules::not_blank))]
+    pub message: String,
+    /// 限定提交的文件集合（缺省等价提交全部暂存）
+    #[serde(default)]
+    #[garde(skip)]
+    pub files: Option<Vec<String>>,
+    /// 覆盖提交者名称（缺省用服务端配置）
+    #[serde(default)]
+    #[garde(skip)]
+    pub author_name: Option<String>,
+    /// 覆盖提交者邮箱（缺省用服务端配置）
+    #[serde(default)]
+    #[garde(skip)]
+    pub author_email: Option<String>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffBody {
+    #[serde(flatten)]
+    pub base: GitWriteBody,
+    /// 差异来源：worktree / staged / commit（缺省 worktree）
+    #[serde(default)]
+    pub source: String,
+    /// 起始 ref（缺省 HEAD）
+    #[serde(default)]
+    pub from: Option<String>,
+    /// 结束 ref（缺省工作区）
+    #[serde(default)]
+    pub to: Option<String>,
+    /// 限定差异的路径集合
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
+}
+
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetBody {
+    #[serde(flatten)]
+    #[garde(skip)]
+    pub base: GitWriteBody,
+    /// 目标 ref（checkout 用，必填非空）
+    #[garde(custom(crate::validation_rules::not_blank))]
+    pub target: String,
+}
+
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetBody {
+    #[serde(flatten)]
+    #[garde(skip)]
+    pub base: GitWriteBody,
+    /// 重置目标 ref（必填非空）
+    #[garde(custom(crate::validation_rules::not_blank))]
+    pub target: String,
+    /// 重置模式：soft / mixed / hard（缺省 mixed）
+    #[serde(default)]
+    #[garde(skip)]
+    pub mode: String,
+}
+
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RevertBody {
+    #[serde(flatten)]
+    #[garde(skip)]
+    pub base: GitWriteBody,
+    /// 要 revert 的目标 ref（必填非空）
+    #[garde(custom(crate::validation_rules::not_blank))]
+    pub target: String,
+    /// revert 提交信息（缺省自动生成）
+    #[serde(default)]
+    #[garde(skip)]
+    pub message: Option<String>,
+    /// 覆盖提交者名称（缺省用服务端配置）
+    #[serde(default)]
+    #[garde(skip)]
+    pub author_name: Option<String>,
+    /// 覆盖提交者邮箱（缺省用服务端配置）
+    #[serde(default)]
+    #[garde(skip)]
+    pub author_email: Option<String>,
+}
+
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchCreateBody {
+    #[serde(flatten)]
+    #[garde(skip)]
+    pub base: GitWriteBody,
+    /// 新建分支名（必填非空）
+    #[garde(custom(crate::validation_rules::not_blank))]
+    pub branch_name: String,
+    /// 分支起点（缺省当前 HEAD）
+    #[serde(default)]
+    #[garde(skip)]
+    pub start_point: Option<String>,
+}
+
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchNameBody {
+    #[serde(flatten)]
+    #[garde(skip)]
+    pub base: GitWriteBody,
+    /// 分支名（必填非空）
+    #[garde(custom(crate::validation_rules::not_blank))]
+    pub branch_name: String,
+    /// branch-delete 强制删除未合并分支 (对齐 nuwax deleteBranch force)。
+    #[serde(default)]
+    #[garde(skip)]
+    pub force: Option<bool>,
+}
+
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TagCreateBody {
+    #[serde(flatten)]
+    #[garde(skip)]
+    pub base: GitWriteBody,
+    /// 标签名（必填非空）
+    #[garde(custom(crate::validation_rules::not_blank))]
+    pub tag_name: String,
+    /// 附注标签的消息（缺省创建轻量标签）
+    #[serde(default)]
+    #[garde(skip)]
+    pub message: Option<String>,
+}
+
+#[derive(Deserialize, Validate, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TagNameBody {
+    #[serde(flatten)]
+    #[garde(skip)]
+    pub base: GitWriteBody,
+    /// 标签名（必填非空）
+    #[garde(custom(crate::validation_rules::not_blank))]
+    pub tag_name: String,
+}
+
+/// git 提交历史查询（无 utoipa 注解：path 参数在 handler 注解里逐项声明，
+/// 见 openapi.rs 测试 flattened_git_log_query_is_exposed_as_individual_parameters）。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitLogQuery {
+    #[serde(flatten)]
+    pub base: GitQuery,
+    pub max_count: Option<usize>,
+    pub skip: Option<usize>,
+    /// 指定分支 (对齐 nuwax git.log ref); 默认 HEAD。
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub file_path: Option<String>,
+}

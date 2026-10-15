@@ -1,0 +1,292 @@
+//! Axum 主路由装配（目录化拆分）。
+//!
+//! [`create_router`] 只做「构建各域 → merge → 挂中间件」的装配骨架：
+//! - 域路由分属 `api`（chat/agent 会话）、`computer`（Computer Agent Runner
+//!   与 pod 管理）、`userapp_proxy`（Pingora 状态 + userApp 工具族文档接口）、
+//!   `devcomputer`（调试委托）、`agent_mgmt`（agent 安装管理）
+//! - app_manager / userapp_forward / file-server-admin 为外部 crate 或
+//!   crate 级模块的路由，装配在本文件
+//! - 全局中间件与安全头在 `layers`（层序敏感）；/metrics 在 `metrics`
+//!
+//! // AppState/SessionInfo 拆至 app_state.rs（状态+会话注册表自成一档）；
+//! // re-export 保持 crate::router::AppState 既有引用稳定。
+
+// router 整体由 binary (main.rs) 使用，lib 内不直接调用 create_router / ApiDoc 等。
+// （--all-targets 口径下 bin 本身即调用点，实测零 dead_code，无需 blanket allow。）
+
+mod agent_mgmt;
+mod api;
+mod computer;
+mod devcomputer;
+mod layers;
+mod metrics;
+mod userapp_proxy;
+
+use std::sync::Arc;
+
+use axum::{
+    Router,
+    routing::{get, post},
+};
+
+use crate::handler;
+use rcoder_telemetry::TelemetryGuard;
+
+pub use crate::app_state::AppState;
+
+/// 内部 API 路由（供 rcoder-gateway 调用）
+///
+/// 默认可信内网；显式开启服务 key 时与业务、文件接口共用鉴权。
+fn create_internal_routes(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/internal/pod/ensure", post(handler::internal_pod_ensure))
+        .route(
+            "/internal/session/{session_id}/resolve",
+            get(handler::internal_session_resolve),
+        )
+        .with_state(state)
+}
+
+/// 健康检查与版本元数据路由
+///
+/// `/version` 的免鉴权由 `ApiKeyValidator::EXEMPT_PATHS` 白名单实现
+/// （中间件链：body 限制/trace/HTTP 指标/locale 仍然生效）。
+fn health_routes(state: &Arc<AppState>) -> Router {
+    Router::new()
+        .route("/health", get(handler::health_check))
+        .route("/version", get(handler::version_check))
+        .with_state(state.clone())
+}
+
+/// 调试路由（仅用于开发和问题排查，需要 feature flag "debug" 启用）
+#[cfg(feature = "debug")]
+fn debug_routes(state: &Arc<AppState>) -> Router {
+    Router::new()
+        .route("/debug/sql", get(handler::debug_dump_summary))
+        .route("/debug/projects", get(handler::debug_list_projects))
+        .route("/debug/containers", get(handler::debug_list_containers))
+        .route("/debug/storage/stats", get(handler::debug_storage_stats))
+        .with_state(state.clone())
+}
+
+/// app_manager 域（外部 crate；upload 压缩包 1GiB 覆盖全局 50MB 限制）
+fn app_manager_routes(state: &Arc<AppState>) -> Router {
+    let app_manager_state = Arc::new(app_manager::handlers::AppManagerState {
+        app_service: state.app_service.clone(),
+        // 共享客户端 (连接超时 + 连接池复用; SSE 流不能设总超时, 见 http_client 模块)
+        http_client: crate::http_client::shared_client().clone(),
+    });
+    app_manager::routes::app_manager_routes()
+        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024 * 1024))
+        .with_state(app_manager_state)
+}
+
+/// file-server 基础路由 + computer 域拦截层（构造失败不阻断主服务启动，
+/// warn 可见、缺路由面可诊断）。
+///
+/// TS 移植版老路径：/api/project、/api/computer、/api/git、/api/build、/api/page；
+/// 排除 /api/v1/userapp——由 rcoder 转发层接管。显式服务 key 与主接口同源；computer 域拦截层：
+/// header X-Service-Type=userapp 的请求短路转发到该 app 开发容器
+/// （反向代理转来的 TS 老路径，body 零解析）。
+fn file_server_routes_with_intercept(
+    state: &Arc<AppState>,
+    merged: crate::file_server_embed::MergedFileServer,
+) -> Router {
+    merged.router.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::userapp_forward::computer_intercept,
+    ))
+}
+
+/// 创建 Axum 路由
+pub fn create_router(
+    state: Arc<AppState>,
+    telemetry: Option<Arc<TelemetryGuard>>,
+    merged_fs: crate::file_server_embed::MergedFileServer,
+) -> Router {
+    let mut router = Router::new()
+        .merge(health_routes(&state))
+        .merge(api::api_routes(state.clone()))
+        .merge(computer::computer_routes(state.clone()))
+        .merge(devcomputer::devcomputer_routes(state.clone()))
+        .merge(userapp_proxy::proxy_api_routes(state.clone()))
+        .merge(agent_mgmt::agent_mgmt_routes(state.clone()))
+        .merge(app_manager_routes(&state))
+        .merge(crate::userapp_builder::adoption::routes().with_state(state.clone()))
+        .merge(crate::userapp_builder::app_adoption::routes().with_state(state.clone()))
+        // userApp 文件域转发层: /api/v1/userapp 本地入口 + 容器侧接口显式透传清单
+        // （build/tasks/static 等构建链接口在 file-server 侧，逐条登记于
+        // CONTAINER_PASS_THROUGH_PATHS；原 {*rest} 通配与 {app_id} 参数路由同树时
+        // matchit 冲突启动即 panic，已移除）
+        .merge(crate::userapp_forward::routes().with_state(state.clone()))
+        // file-server 分流代理运行时启停 (无 state, 受全局 API key 中间件保护;
+        // `rcoder file-server {start,stop,restart,status}` CLI 的服务端)
+        .merge(crate::file_server_admin::admin_routes())
+        // UserApp 错误页管理接口（PUT/GET/DELETE；受全局 API key 中间件保护）
+        .merge(handler::error_page_admin::routes().with_state(state.clone()))
+        // OpenAPI 文档 UI 两面（Swagger + Scalar）。在此 merge = 受下方 API key
+        // 中间件保护（与拆分前 router.rs 的挂载语义一致）
+        .merge(crate::router_docs::create_swagger_ui())
+        .merge(crate::router_docs::create_scalar_docs());
+
+    // 仅在启用 debug feature 时添加调试路由
+    #[cfg(feature = "debug")]
+    {
+        router = router.merge(debug_routes(&state));
+    }
+
+    // /metrics 端点（仅启用 Prometheus 时）
+    if let Some(ref guard) = telemetry {
+        router = metrics::mount(router, guard);
+    }
+
+    // 🆕 克隆共享的 API Key 配置用于中间件
+    let api_key_config = Arc::clone(&state.api_key_config);
+
+    hotpath::axum!(apply_route_security(
+        router,
+        create_internal_routes(state.clone()),
+        merged_fs
+            .coordinator
+            .clone()
+            .map_or_else(Router::new, preview_coordinator::internal_router),
+        file_server_routes_with_intercept(&state, merged_fs),
+        api_key_config,
+    ))
+    .layer(axum::middleware::from_fn_with_state(
+        state.userapp_op_flight.clone(),
+        admission_during_shutdown,
+    ))
+}
+
+/// Compose the real protected surfaces; preview keeps its own peer token.
+fn apply_route_security(
+    router: Router,
+    internal: Router,
+    preview: Router,
+    files: Router,
+    api_key_config: Arc<arc_swap::ArcSwap<shared_types::ApiKeyAuthConfig>>,
+) -> Router {
+    layers::apply_security_headers(
+        layers::apply_global_middleware(router.merge(internal).merge(files), api_key_config)
+            .merge(preview),
+    )
+}
+
+async fn admission_during_shutdown(
+    axum::extract::State(gate): axum::extract::State<Arc<shared_types::OperationFlightGate>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Ok(_flight) = gate.guard() else {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"code": "ERR_SHUTTING_DOWN", "message": "Service is shutting down"}))).into_response();
+    };
+    next.run(request).await
+}
+
+#[cfg(test)]
+mod assembly_guard {
+    /// 主装配防丢件守卫：create_router 的 merge 链必须覆盖全部对外路由面。
+    ///
+    /// 背景：ac99d63 目录化拆分曾漏挂 router_docs 两面（/api/docs 全 404）——
+    /// router_docs 自身的 HTTP 守卫直接构造子 Router 测试、不经过 create_router
+    /// 装配层，装配遗漏是测试盲区。以源码快照断言兜底（同 userapp_forward
+    /// guard_tables 快照闭包模式）：新增对外路由面须同步本清单。
+    #[test]
+    fn create_router_merges_all_public_route_families() {
+        let src = include_str!("mod.rs");
+        for family in [
+            "router_docs::create_swagger_ui()",
+            "router_docs::create_scalar_docs()",
+            "userapp_forward::routes()",
+            "file_server_admin::admin_routes()",
+            "handler::error_page_admin::routes()",
+            "app_manager::routes::app_manager_routes()",
+            "internal_pod_ensure",
+            "api::api_routes",
+            "computer::computer_routes",
+            "userapp_proxy::proxy_api_routes",
+            "agent_mgmt::agent_mgmt_routes",
+        ] {
+            assert!(
+                src.contains(family),
+                "create_router 装配缺路由面: {family}（对照拆分前 router.rs merge 链）"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod optional_key_tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn optional_service_key_covers_internal_and_file_surfaces() {
+        for enabled in [false, true] {
+            let config = Arc::new(arc_swap::ArcSwap::from_pointee(
+                shared_types::ApiKeyAuthConfig {
+                    enabled,
+                    api_key: "configured-service-key".into(),
+                },
+            ));
+            let app = apply_route_security(
+                Router::new().route("/chat", post(|| async { "accepted" })),
+                Router::new().route("/internal/pod/ensure", post(|| async { "accepted" })),
+                // Preview is tested through its own token layer elsewhere.
+                Router::new().route("/preview-peer", get(|| async { "peer route" })),
+                Router::new().route("/api/computer/fs/roots", get(|| async { "accepted" })),
+                config,
+            );
+            for (path, method) in [
+                ("/chat", "POST"),
+                ("/internal/pod/ensure", "POST"),
+                ("/api/computer/fs/roots", "GET"),
+            ] {
+                for key in [None, Some("incorrect"), Some("configured-service-key")] {
+                    let mut builder = Request::builder().uri(path).method(method);
+                    if let Some(key) = key {
+                        builder = builder.header("x-api-key", key);
+                    }
+                    let response = app
+                        .clone()
+                        .oneshot(builder.body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    let expected = if enabled && key != Some("configured-service-key") {
+                        StatusCode::UNAUTHORIZED
+                    } else {
+                        StatusCode::OK
+                    };
+                    assert_eq!(
+                        response.status(),
+                        expected,
+                        "{path} enabled={enabled} configured_key={}",
+                        key == Some("configured-service-key")
+                    );
+                }
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/preview-peer")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "service key must not replace peer token contract"
+            );
+        }
+    }
+}

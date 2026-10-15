@@ -95,7 +95,10 @@ pub async fn handle_audio_request(
 
     // 记录上下文
     ctx.target_port = Some(target_port);
-    ctx.upstream_host = Some(format!("{}:{}", container_ip, target_port));
+    ctx.upstream_host = Some(super::super::upstream::dial_addr(
+        &container_ip,
+        target_port,
+    )?);
 
     info!(
         "[AUDIO] Audio proxy: user_id={}, project_id={}, path={}, target={}:{}",
@@ -161,20 +164,16 @@ pub async fn handle_audio_upstream(
     // 保存音频目标 IP 到上下文（用于响应过滤）
     ctx.vnc_target_ip = Some(container_ip.clone());
 
-    let peer_addr = format!("{}:{}", container_ip, target_port);
+    let peer_addr = super::super::upstream::dial_addr(&container_ip, target_port)?;
     let mut peer = Box::new(HttpPeer::new(
-        (container_ip.as_str(), target_port),
+        super::super::upstream::dial_peer(&container_ip, target_port)?,
         false,          // 不使用 TLS
         "".to_string(), // SNI
     ));
 
     // 音频流长连接优化配置
-    // 音频流可能持续数小时，需要宽松的超时设置
-    peer.options.connection_timeout = Some(Duration::from_secs(10));
-    peer.options.read_timeout = None; // 无限等待（音频流可能持续数小时）
-    peer.options.write_timeout = None; // 无限等待（WebSocket 双向流）
-    peer.options.total_connection_timeout = Some(Duration::from_secs(15));
-    peer.options.idle_timeout = Some(Duration::from_secs(3600)); // 1 小时空闲超时
+    // 音频流可能持续数小时，需要宽松的超时设置（idle 1 小时）
+    super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
 
     debug!("[AUDIO] connection to: {}", peer_addr);
 

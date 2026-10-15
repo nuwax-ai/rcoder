@@ -6,26 +6,33 @@
 # 平时不需要重新构建，只有在修改系统依赖时才需要重新构建
 # ============================================================================
 
-FROM rust:bookworm
+FROM rust:trixie
+
+ARG RCODER_MASTER_BASE_SOURCE_SHA
+LABEL io.rcoder.master-base.source-sha=$RCODER_MASTER_BASE_SOURCE_SHA
 
 # 设置环境变量
 ENV TZ=Asia/Shanghai
 
-# 使用 LinuxMirrors 一键配置阿里云镜像源
+# 使用 LinuxMirrors 配置 apt 源（默认腾讯云，可用 APT_MIRROR_HOST 构建参数切换）
 # 参考: https://github.com/SuperManito/LinuxMirrors
-# rust:bookworm (基于 buildpack-deps) 已预装 curl，可直接执行脚本配置镜像源
-RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
-    --source mirrors.aliyun.com \
+# rust:trixie (基于 buildpack-deps) 已预装 curl，可直接执行脚本配置镜像源
+ARG APT_MIRROR_HOST=mirrors.cloud.tencent.com
+RUN printf '%s\n' "${APT_MIRROR_HOST}" | LC_ALL=C grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$' || { echo "ERROR: APT_MIRROR_HOST must be a hostname, without URL scheme or path" >&2; exit 2; }; \
+    curl -fsSL https://linuxmirrors.cn/main.sh -o /tmp/nuwax-apt-mirror.sh && \
+    bash /tmp/nuwax-apt-mirror.sh \
+    --source "${APT_MIRROR_HOST}" \
     --protocol https \
     --use-intranet-source false \
     --install-epel false \
     --backup false \
     --upgrade-software false \
     --clean-cache true \
-    --ignore-backup-tips
+    --ignore-backup-tips && \
+    rm -f /tmp/nuwax-apt-mirror.sh
 
 # 安装必要的运行时依赖（apt 包管理器）
-# ca-certificates / curl / wget / gnupg / unzip 已由 rust:bookworm (buildpack-deps) 预装, 不重装
+# ca-certificates / curl / wget / gnupg / unzip 已由 rust:trixie (buildpack-deps) 预装, 不重装
 RUN apt-get update && apt-get install -y \
     zip \
     tzdata \
@@ -44,7 +51,7 @@ RUN apt-get update && apt-get install -y \
     && echo $TZ > /etc/timezone
 
 # ============================================================================
-# 安装 Node.js 22.x + npm (rust:bookworm 不带 Node, 手动装; NodeSource 套路, 与 agent-runner 统一)
+# 安装 Node.js 22.x + npm (rust:trixie 不带 Node, 手动装; NodeSource 套路, 与 agent-runner 统一)
 # npm install -g yarn: node:22 原捆绑 yarn, NodeSource 的 Node 不带, 单独装回 (yarn config 需要)
 # ============================================================================
 RUN apt-get update && \
@@ -56,8 +63,36 @@ RUN apt-get update && \
     update-ca-certificates && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Rust cargo 国内镜像配置 (rsproxy-sparse); rust:bookworm CARGO_HOME=/usr/local/cargo, dev 容器 cargo run/build 走加速源
-COPY .cargo/config.toml /usr/local/cargo/config.toml
+# Rust cargo 国内镜像配置 (rsproxy-sparse); rust:trixie CARGO_HOME=/usr/local/cargo, dev 容器 cargo run/build 走加速源
+# heredoc 内联生成, 仓库不携带 .cargo/config.toml（项目级 cargo 源配置会与全局配置撞 URL 导致 Docker 构建失败）
+COPY <<'EOF' /usr/local/cargo/config.toml
+[source.crates-io]
+replace-with = 'rsproxy-sparse'
+
+[source.rsproxy]
+registry = "https://rsproxy.cn/crates.io-index"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[source.aliyun]
+registry = "https://mirrors.aliyun.com/crates.io-index"
+
+[source.aliyun-sparse]
+registry = "sparse+https://mirrors.aliyun.com/crates.io-index/"
+
+[source.tencent]
+registry = "https://mirrors.cloud.tencent.com/crates.io-index"
+
+[source.tencent-sparse]
+registry = "sparse+https://mirrors.cloud.tencent.com/crates.io-index/"
+
+[registries.rsproxy]
+index = "https://rsproxy.cn/crates.io-index"
+
+[net]
+git-fetch-with-cli = true
+EOF
 
 # 复制 npmrc 配置镜像（使用国内镜像加速）
 COPY .npmrc /root/.npmrc
@@ -112,17 +147,18 @@ RUN echo '[install]' > /root/.bunfig.toml && \
     # 运行时 bunx @upstash/context7-mcp 会命中 ~/.bun/install/global 全局缓存，无需再下载
     echo '"@upstash" = "https://registry.npmmirror.com"' >> /root/.bunfig.toml
 
-# 安装 python3-pip（rust:bookworm 基础镜像默认不带 Python，用 pip 装 uv 需要先安装）
+# 安装 python3-pip（rust:trixie 基础镜像默认不带 Python，用 pip 装 uv 需要先安装；trixie 原生为 3.13）
 RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
-# 安装 uv 并验证（使用 pip 从阿里云 PyPI 镜像安装，避免从 astral.sh 下载二进制慢/不稳定）
+# 安装 uv 并验证（使用 pip 从所选 PyPI 镜像安装，避免从 astral.sh 下载二进制慢/不稳定；默认腾讯云，可用构建参数切换）
 # --break-system-packages: Debian 12+ 的 PEP 668 限制，系统 Python 默认不允许直接 pip install
-RUN pip3 install --break-system-packages --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple uv && \
+ARG PYPI_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple
+RUN pip3 install --break-system-packages --no-cache-dir -i "${PYPI_INDEX_URL}" uv && \
     uv --version || (echo "ERROR: uv installation failed" && exit 1)
 
 # 设置 uv 镜像加速地址
-ENV UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+ENV UV_INDEX_URL=${PYPI_INDEX_URL}
 
 # 设置工作目录
 WORKDIR /app
@@ -151,7 +187,7 @@ RUN rm -f /etc/nginx/sites-enabled/default && \
     rm -f /etc/nginx/conf.d/default.conf
 
 # ============================================================================
-# 🔧 创建非 root 用户（用于 ttyd 等服务降权运行）
+# 🔧 保留普通用户（供显式选择 TTYD_USER=user 或其他工具使用）
 # ============================================================================
 RUN useradd -ms /bin/bash user && \
     usermod -aG sudo user && \

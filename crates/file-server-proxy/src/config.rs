@@ -1,0 +1,442 @@
+//! 分流代理配置与路由策略（纯函数域，无 IO）。
+
+use serde::{Deserialize, Serialize};
+
+pub use shared_types::{SERVICE_TYPE_HEADER, SERVICE_TYPE_USERAPP};
+
+/// userApp 业务路由前缀（header 未接入期的兜底判据）。
+pub const USERAPP_PATH_PREFIX: &str = "/api/v1/userapp";
+
+/// 60000（对外入口）与 60001（TS 内部端口）的单一事实源见 shared_types。
+pub use shared_types::{AGENT_FILE_SERVER_PORT, NUWAX_FILE_SERVER_INTERNAL_PORT};
+
+/// 分流代理配置（config.yml 顶层 `file_server_proxy:` 段 / agent_runner env 构造）。
+#[derive(Clone, Serialize, Deserialize)]
+pub struct FileServerProxyConfig {
+    /// 对外监听主机（N03：容器形态 0.0.0.0（K8s NodePort 入口）；原生
+    /// standalone 经 env `FILE_SERVER_PROXY_HOST` 收敛到 127.0.0.1——
+    /// 默认保持容器行为，原生按需收紧）。旧 config.yml 无此字段 → 0.0.0.0。
+    #[serde(default = "default_listen_host")]
+    pub listen_host: String,
+    /// 对外监听端口（Java/外部入口；K8s NodePort 30779 → 此端口）。
+    /// N03：0 = 请求动态分配——绑定后发布 listener.local_addr 真实地址
+    /// （状态/日志携带，不返回 ":0"）。
+    pub listen_port: u16,
+    /// rcoder 主服务端口（userApp 业务上游；容器形态=内嵌 Rust file-server 端口）
+    pub rust_upstream_port: u16,
+    /// TS nuwax-file-server 内部端口（存量域上游；容器形态为复用面预留，未使用）
+    pub ts_upstream_port: u16,
+    /// 路由策略（两种部署形态）
+    #[serde(default)]
+    pub policy: RoutePolicy,
+    /// N07：独立入口令牌（env `FILE_SERVER_PROXY_TOKEN`）。Some = 所有请求
+    /// 须带 `X-Proxy-Token` 头（缺失/不符 401）；None 且监听非 loopback →
+    /// 启动拒绝（fail-fast，不裸奔对外）。凭据不进日志。
+    #[serde(default)]
+    pub auth_token: Option<String>,
+    /// N07（修订）：受管形态声明，**默认 true**。本服务的部署形态以受管
+    /// 容器为绝对主流（K8s chart / compose / supervisor——0.0.0.0:60000 是
+    /// NodePort/端口映射的文件入口前提，网络边界由编排层承担），原"默认
+    /// false + 各处显式声明"的门在实战中只挡自己人（09-19 事故：漏配一处
+    /// 即 60000 全断）。使用方需要严格模式时显式配 `false` 收紧（无令牌 +
+    /// 非 loopback 即拒启）；原生 standalone 的安全收紧走
+    /// `FILE_SERVER_PROXY_HOST=127.0.0.1`（地址即声明，优于布尔门）。
+    /// env `FILE_SERVER_PROXY_PUBLIC_BIND=1`/`true` 声明通道保留（冗余无害）。
+    #[serde(default = "default_public_bind_declared")]
+    pub public_bind_declared: bool,
+    /// dev 生命周期路径（start/stop/restart/keep-alive 等 7 端点）在**所有策略**下
+    /// 导向 Rust 上游（Custom Page 预览协调收口；与 rcoder `preview_coordinator.enabled`
+    /// 同源配置渲染）。默认 false=分流行为与历史完全一致。
+    #[serde(default)]
+    pub coordinated_dev_lifecycle: bool,
+}
+
+impl std::fmt::Debug for FileServerProxyConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FileServerProxyConfig")
+            .field("listen_host", &self.listen_host)
+            .field("listen_port", &self.listen_port)
+            .field("rust_upstream_port", &self.rust_upstream_port)
+            .field("ts_upstream_port", &self.ts_upstream_port)
+            .field("policy", &self.policy)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("public_bind_declared", &self.public_bind_declared)
+            .field("coordinated_dev_lifecycle", &self.coordinated_dev_lifecycle)
+            .finish()
+    }
+}
+
+fn default_listen_host() -> String {
+    "0.0.0.0".to_string()
+}
+
+fn default_public_bind_declared() -> bool {
+    true
+}
+
+impl Default for FileServerProxyConfig {
+    fn default() -> Self {
+        Self {
+            listen_host: std::env::var("FILE_SERVER_PROXY_HOST")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "0.0.0.0".to_string()),
+            listen_port: AGENT_FILE_SERVER_PORT,
+            rust_upstream_port: 8086,
+            ts_upstream_port: NUWAX_FILE_SERVER_INTERNAL_PORT,
+            policy: RoutePolicy::default(),
+            auth_token: None,
+            public_bind_declared: default_public_bind_declared(),
+            coordinated_dev_lifecycle: false,
+        }
+    }
+}
+
+/// 路由策略——同一 crate 服务多种部署形态。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutePolicy {
+    /// TS 优先模式（存量切流档，测试/生产在跑）：userApp 判据（`/api/v1/userapp*`
+    /// 路径前缀 **或** `x-service-type: userapp` header）→ rust 上游（rcoder
+    /// 拦截层转发 per-app 容器——per-app RBD 架构下只有容器读得到 app 工作区）；
+    /// 其余（无 userApp 标记的存量流量）→ TS nuwax-file-server。
+    ///
+    /// 历史：曾为「仅路径判据、header 失效」的过渡档（假设 TS 以 service_type
+    /// 入参自载 userApp 业务）——共享卷时代 TS 可达 app 卷，per-app RBD 后 TS
+    /// 物理不可达，该假设失效，已并入 header 判据（原 userapp_split 档删除）。
+    #[default]
+    TsFirst,
+    /// 全 Rust 模式（切流终态）：一律 rust 上游，全部流量由 Rust 重写的
+    /// file-server 承载（TS 热备于 [`NUWAX_FILE_SERVER_INTERNAL_PORT`]，不接流量）
+    AllRust,
+    /// 全 TS 模式（npm 独立形态的回退/AB 对照档）：一律 ts 上游。
+    /// 无路径白名单（TS 本就是全量老路由面，白名单语义不适用）；
+    /// TS 没有的 userApp 新接口（/api/v1/userapp/*）在此模式下由 TS 返回 404。
+    AllTs,
+}
+
+impl RoutePolicy {
+    /// 策略的 wire 值（serde/CLI/env/helm 共用词汇表）。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RoutePolicy::TsFirst => "ts_first",
+            RoutePolicy::AllRust => "all_rust",
+            RoutePolicy::AllTs => "all_ts",
+        }
+    }
+}
+
+/// 解析策略值（env/CLI 入口共用；serde 之外的运行时入口）。
+///
+/// 受认可值与 serde wire 契约一致：`ts_first|all_rust|all_ts`。
+/// 非法值返回 Err（带受认可值清单，调用方 exit 前可直接展示）。
+pub fn parse_route_policy(value: &str) -> Result<RoutePolicy, String> {
+    match value.trim() {
+        "ts_first" => Ok(RoutePolicy::TsFirst),
+        "all_rust" => Ok(RoutePolicy::AllRust),
+        "all_ts" => Ok(RoutePolicy::AllTs),
+        other => Err(format!(
+            "invalid route policy {other:?}: expected one of ts_first | all_rust | all_ts"
+        )),
+    }
+}
+
+/// 业务域分流的选中上游。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upstream {
+    /// rcoder 主服务（userApp 业务）
+    Rust(u16),
+    /// TS nuwax-file-server（存量域）
+    Ts(u16),
+}
+
+/// userApp 路径前缀的段边界形式（`/api/v1/userapplication` 不误命中）。
+const USERAPP_PATH_PREFIX_SLASH: &str = "/api/v1/userapp/";
+
+/// userApp 业务判定的 path 判据：`/api/v1/userapp` 精确或 `/api/v1/userapp/*`。
+/// TS 无此路由（走 TS 也 404），按前缀分流零歧义——Java 同事加
+/// `x-service-type` header 前的兜底判据，header 是未来的正名路径。
+fn is_userapp_path(path: &str) -> bool {
+    path == USERAPP_PATH_PREFIX || path.starts_with(USERAPP_PATH_PREFIX_SLASH)
+}
+
+/// userApp 业务判定的 header 判据：`x-service-type` 值为 `userapp`
+/// （大小写不敏感 + 前后空白容忍，单一事实源
+/// [`shared_types::is_userapp_service_type_value`]）。
+fn is_userapp_service_type(header_value: Option<&str>) -> bool {
+    header_value.is_some_and(shared_types::is_userapp_service_type_value)
+}
+
+/// dev 生命周期精确端点集合（`/api/build/*` 下由预览协调器收口的子集；
+/// build/parse 等其余 build 端点不受影响）。
+pub const COORDINATED_DEV_PATHS: [&str; 7] = [
+    "/api/build/start-dev",
+    "/api/build/stop-dev",
+    "/api/build/restart-dev",
+    "/api/build/keep-alive",
+    "/api/build/list-dev",
+    "/api/build/port-pool-status",
+    "/api/build/get-dev-log",
+];
+
+/// dev 生命周期端点判定（容忍尾斜杠；非前缀匹配——`/api/build/start-dev-2` 不命中）。
+pub fn is_coordinated_dev_path(path: &str) -> bool {
+    let trimmed = path.trim_end_matches('/');
+    COORDINATED_DEV_PATHS.contains(&trimmed)
+}
+
+impl FileServerProxyConfig {
+    /// N07（修订）受管声明 env **三态**解析（独立进程形态与 rcoder 内嵌
+    /// 形态共用）：`"1"`/`"true"`（trim、大小写不敏感）→ `Ok(Some(true))` 放行；
+    /// `"0"`/`"false"` → `Ok(Some(false))` 显式收紧；未设/空串 → `Ok(None)`
+    /// （用形态默认——受管放行 true）。
+    ///
+    /// PX-10: 其它**显式**值（`flase`/`yes`/非规范词）一律 `Err`——非法显式
+    /// 设置与未设置必须区分, 调用方 fail-fast, 不得静默落回公开缺省。
+    pub fn env_public_bind_setting(value: Option<&str>) -> Result<Option<bool>, String> {
+        let Some(raw) = value.map(str::trim) else {
+            return Ok(None);
+        };
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        if raw == "1" || raw.eq_ignore_ascii_case("true") {
+            Ok(Some(true))
+        } else if raw == "0" || raw.eq_ignore_ascii_case("false") {
+            Ok(Some(false))
+        } else {
+            Err(format!(
+                "invalid explicit value {raw:?} (expected 1/true/0/false; empty or unset selects the managed default)"
+            ))
+        }
+    }
+
+    /// Read explicit settings without treating invalid UTF-8 as an unset value.
+    pub fn public_bind_env_setting() -> Result<Option<bool>, String> {
+        Self::public_bind_os_setting(std::env::var_os("FILE_SERVER_PROXY_PUBLIC_BIND"))
+    }
+
+    fn public_bind_os_setting(value: Option<std::ffi::OsString>) -> Result<Option<bool>, String> {
+        let raw = value
+            .map(|raw| {
+                raw.into_string()
+                    .map_err(|_| "FILE_SERVER_PROXY_PUBLIC_BIND must be valid UTF-8".to_owned())
+            })
+            .transpose()?;
+        Self::env_public_bind_setting(raw.as_deref())
+    }
+
+    /// 叠加 env 声明（env 优先）：`FILE_SERVER_PROXY_PUBLIC_BIND` 显式值
+    /// （true/false）覆盖 config 值；未设保持 config 值不变（含默认 true）；
+    /// 非法显式值返回 Err（PX-10: 调用方必须让错误生效, 不得静默公开）。
+    pub fn apply_public_bind_env(&mut self) -> Result<(), String> {
+        if let Some(declared) = Self::public_bind_env_setting()? {
+            self.public_bind_declared = declared;
+        }
+        Ok(())
+    }
+
+    /// 非空环境令牌优先；空值或未设置保留配置，不创建新凭据。
+    pub fn resolve_auth_token(
+        configured: Option<String>,
+        environment: Option<std::ffi::OsString>,
+    ) -> Result<Option<String>, String> {
+        let environment = environment
+            .map(|value| {
+                value
+                    .into_string()
+                    .map_err(|_| "FILE_SERVER_PROXY_TOKEN must be valid UTF-8".to_owned())
+            })
+            .transpose()?;
+        Ok(environment
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .or(configured))
+    }
+
+    pub fn apply_auth_token_env(&mut self) -> Result<(), String> {
+        self.auth_token = Self::resolve_auth_token(
+            self.auth_token.clone(),
+            std::env::var_os("FILE_SERVER_PROXY_TOKEN"),
+        )?;
+        Ok(())
+    }
+
+    /// 分流规则纯函数（按 [`RoutePolicy`] 分派）：
+    /// - [`RoutePolicy::TsFirst`]：`/api/v1/userapp*` 前缀或
+    ///   `x-service-type: userapp` header（任一命中）→ Rust 上游，其余 → TS 上游
+    /// - [`RoutePolicy::AllRust`]：一律 Rust 上游
+    /// - [`RoutePolicy::AllTs`]：一律 TS 上游
+    ///
+    /// 例外（优先于策略）：`coordinated_dev_lifecycle` 开启时，dev 生命周期 7 端点
+    /// 在**所有策略**下导向 Rust 上游——TS 无身份协调（多副本下误重建/误停），
+    /// 这些端点必须由 Rust 协调器受理。
+    pub fn upstream_port_for(&self, path: &str, service_type_header: Option<&str>) -> Upstream {
+        if self.coordinated_dev_lifecycle && is_coordinated_dev_path(path) {
+            return Upstream::Rust(self.rust_upstream_port);
+        }
+        let to_rust = match self.policy {
+            RoutePolicy::TsFirst => {
+                is_userapp_path(path) || is_userapp_service_type(service_type_header)
+            }
+            RoutePolicy::AllRust => true,
+            RoutePolicy::AllTs => false,
+        };
+        if to_rust {
+            Upstream::Rust(self.rust_upstream_port)
+        } else {
+            Upstream::Ts(self.ts_upstream_port)
+        }
+    }
+}
+
+#[cfg(test)]
+mod coordinated_dev_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_public_bind_is_not_an_unset_setting() {
+        use std::os::unix::ffi::OsStringExt as _;
+        assert!(
+            FileServerProxyConfig::public_bind_os_setting(Some(std::ffi::OsString::from_vec(
+                vec![0xff]
+            )))
+            .is_err()
+        );
+        assert_eq!(
+            FileServerProxyConfig::public_bind_os_setting(None).unwrap(),
+            None
+        );
+        assert_eq!(
+            FileServerProxyConfig::public_bind_os_setting(Some("false".into())).unwrap(),
+            Some(false)
+        );
+    }
+
+    fn config(policy: RoutePolicy, coordinated: bool) -> FileServerProxyConfig {
+        FileServerProxyConfig {
+            policy,
+            coordinated_dev_lifecycle: coordinated,
+            ..FileServerProxyConfig::default()
+        }
+    }
+
+    #[test]
+    fn dev_lifecycle_paths_go_rust_in_all_policies_when_enabled() {
+        for policy in [
+            RoutePolicy::TsFirst,
+            RoutePolicy::AllRust,
+            RoutePolicy::AllTs,
+        ] {
+            let cfg = config(policy, true);
+            for path in COORDINATED_DEV_PATHS {
+                assert!(
+                    matches!(cfg.upstream_port_for(path, None), Upstream::Rust(_)),
+                    "{policy:?} {path} must route to rust"
+                );
+                // 尾斜杠容忍
+                assert!(
+                    matches!(
+                        cfg.upstream_port_for(&format!("{path}/"), None),
+                        Upstream::Rust(_)
+                    ),
+                    "{policy:?} {path}/ must route to rust"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn other_paths_keep_policy_semantics_when_enabled() {
+        // build 域其余端点不受影响
+        let ts_first = config(RoutePolicy::TsFirst, true);
+        assert!(matches!(
+            ts_first.upstream_port_for("/api/build/build", None),
+            Upstream::Ts(_)
+        ));
+        assert!(matches!(
+            ts_first.upstream_port_for("/api/project/list", None),
+            Upstream::Ts(_)
+        ));
+        assert!(matches!(
+            ts_first.upstream_port_for("/api/v1/userapp/dev/list", None),
+            Upstream::Rust(_)
+        ));
+        // 前缀不误命中
+        assert!(matches!(
+            ts_first.upstream_port_for("/api/build/start-dev-2", None),
+            Upstream::Ts(_)
+        ));
+        // AllTs 下非 dev 端点仍全走 TS（回退通道语义保留）
+        let all_ts = config(RoutePolicy::AllTs, true);
+        assert!(matches!(
+            all_ts.upstream_port_for("/api/build/build", None),
+            Upstream::Ts(_)
+        ));
+    }
+
+    #[test]
+    fn disabled_flag_keeps_legacy_routing_exactly() {
+        let ts_first = config(RoutePolicy::TsFirst, false);
+        for path in COORDINATED_DEV_PATHS {
+            assert!(
+                matches!(ts_first.upstream_port_for(path, None), Upstream::Ts(_)),
+                "{path} must stay on ts when coordination disabled"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod token_configuration_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_token_precedence_preserves_config_without_generating_credentials() {
+        for (configured, environment, expected) in [
+            (None, None, None),
+            (None, Some(""), None),
+            (Some("configured"), None, Some("configured")),
+            (Some("configured"), Some("  "), Some("configured")),
+            (Some("configured"), Some(" supplied "), Some("supplied")),
+        ] {
+            assert_eq!(
+                FileServerProxyConfig::resolve_auth_token(
+                    configured.map(str::to_owned),
+                    environment.map(std::ffi::OsString::from)
+                )
+                .expect("valid token setting"),
+                expected.map(str::to_owned)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_unicode_token_is_an_error_without_echoing_secret() {
+        use std::os::unix::ffi::OsStringExt;
+        let error = FileServerProxyConfig::resolve_auth_token(
+            Some("configured-secret".into()),
+            Some(std::ffi::OsString::from_vec(vec![0xff, 0xfe])),
+        )
+        .expect_err("invalid Unicode token");
+        assert_eq!(error, "FILE_SERVER_PROXY_TOKEN must be valid UTF-8");
+        assert!(!error.contains("configured-secret"));
+    }
+
+    #[test]
+    fn config_debug_redacts_token() {
+        let config = FileServerProxyConfig {
+            auth_token: Some("secret-value".into()),
+            ..Default::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("secret-value"));
+    }
+}

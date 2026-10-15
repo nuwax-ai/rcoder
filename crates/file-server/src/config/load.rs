@@ -4,13 +4,13 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 use shared_types::AGENT_FILE_SERVER_PORT;
-use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, WORKSPACE_ROOT};
+use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, USERAPP_WORKSPACE_ROOT, WORKSPACE_ROOT};
 
 use super::Config;
 use super::DeploymentMode;
 use super::env::{
-    MAX_UPLOAD_FILE_SIZE_BYTES, default_attachment_extensions, env_bool, env_list, env_parse,
-    env_str, request_body_max_bytes, validate_request_body_limit, validate_upload_limit,
+    MAX_UPLOAD_FILE_SIZE_BYTES, default_attachment_extensions, env_bool, env_list, env_opt_string,
+    env_parse, env_str, request_body_max_bytes, validate_request_body_limit, validate_upload_limit,
 };
 
 impl Config {
@@ -89,9 +89,25 @@ impl Config {
             Err(error) => return Err(anyhow!(error)).context("read FILE_SERVER_PORT/PORT"),
         };
         path!(project_source_dir, "PROJECT_SOURCE_DIR");
+        // 部署形态判据：env 显式注入（沙箱形态）才置位——path! 宏无法区分
+        // "env 提供"与"默认回退"，独立探测（trim 后非空才算注入）。
+        self.project_source_dir_explicit = env_opt_string("PROJECT_SOURCE_DIR")?.is_some();
         path!(computer_workspace_dir, "COMPUTER_WORKSPACE_DIR");
+        path!(userapp_workspace_dir, "USERAPP_WORKSPACE_DIR");
+        // FS-01: 环境只覆盖实际提供的值——env 缺失时保留配置文件值
+        // （单 app 归属/自定义 CLI 路径/探测地址此前在 env 缺失时被静默清除）。
+        self.userapp_single_app_id =
+            env_opt_string("USERAPP_SINGLE_APP_ID")?.or(self.userapp_single_app_id.take());
         path!(service_log_dir, "FILE_SERVER_LOG_DIR");
         parse!(service_log_retention_days, "FILE_SERVER_LOG_RETENTION_DAYS");
+        parse!(
+            build_artifact_retain_count,
+            "FILE_SERVER_BUILD_ARTIFACT_RETAIN_COUNT"
+        );
+        parse!(
+            build_log_retention_days,
+            "FILE_SERVER_BUILD_LOG_RETENTION_DAYS"
+        );
         path!(init_project_dir, "INIT_PROJECT_DIR");
         path!(upload_project_dir, "UPLOAD_PROJECT_DIR");
         path!(dist_target_dir, "DIST_TARGET_DIR");
@@ -153,8 +169,19 @@ impl Config {
         parse!(dev_alive_poll_interval_ms, "DEV_ALIVE_POLL_INTERVAL_MS");
         parse!(dev_stop_check_interval_ms, "DEV_STOP_CHECK_INTERVAL_MS");
         parse!(dev_stop_max_attempts, "DEV_STOP_MAX_ATTEMPTS");
+        parse!(
+            dev_supervision_stop_budget_secs,
+            "DEV_SUPERVISION_STOP_BUDGET_SECS"
+        );
         parse!(dev_command_timeout_secs, "DEV_COMMAND_TIMEOUT_SECS");
         parse!(max_build_concurrency, "MAX_BUILD_CONCURRENCY");
+        parse!(
+            userapp_build_wait_timeout_secs,
+            "USERAPP_BUILD_WAIT_TIMEOUT_SECS"
+        );
+        self.app_cli_bin = env_opt_string("FILE_SERVER_APP_CLI_BIN")?.or(self.app_cli_bin.take());
+        self.app_cli_admin_probe_addr = env_opt_string("FILE_SERVER_APP_CLI_ADMIN_PROBE_ADDR")?
+            .unwrap_or_else(|| self.app_cli_admin_probe_addr.clone());
         self.validate()?;
         Ok(self)
     }
@@ -171,15 +198,23 @@ impl Config {
                 Err(error) => return Err(anyhow!(error)).context("read FILE_SERVER_PORT/PORT"),
             },
             project_source_dir: PathBuf::from(env_str("PROJECT_SOURCE_DIR", WORKSPACE_ROOT)?),
+            project_source_dir_explicit: env_opt_string("PROJECT_SOURCE_DIR")?.is_some(),
             computer_workspace_dir: PathBuf::from(env_str(
                 "COMPUTER_WORKSPACE_DIR",
                 COMPUTER_WORKSPACE_ROOT,
             )?),
+            userapp_workspace_dir: PathBuf::from(env_str(
+                "USERAPP_WORKSPACE_DIR",
+                USERAPP_WORKSPACE_ROOT,
+            )?),
+            userapp_single_app_id: env_opt_string("USERAPP_SINGLE_APP_ID")?,
             service_log_dir: PathBuf::from(env_str(
                 "FILE_SERVER_LOG_DIR",
                 "/app/logs/file-server",
             )?),
             service_log_retention_days: env_parse("FILE_SERVER_LOG_RETENTION_DAYS", 7)?,
+            build_artifact_retain_count: env_parse("FILE_SERVER_BUILD_ARTIFACT_RETAIN_COUNT", 3)?,
+            build_log_retention_days: env_parse("FILE_SERVER_BUILD_LOG_RETENTION_DAYS", 7)?,
             init_project_dir: PathBuf::from(env_str("INIT_PROJECT_DIR", "/app/project_init")?),
             upload_project_dir: PathBuf::from(env_str("UPLOAD_PROJECT_DIR", "/app/project_zips")?),
             dist_target_dir: PathBuf::from(env_str("DIST_TARGET_DIR", "/app/project_nginx")?),
@@ -211,31 +246,30 @@ impl Config {
             attachment_allowed_extensions: default_attachment_extensions(),
             traverse_exclude_dirs: env_list(
                 "TRAVERSE_EXCLUDE_DIRS",
-                "dist,node_modules,.pnpm-store,__MACOSX,.attachments,.git,.agents,.codex,.opencode,.grok,.pi,.logs",
+                super::DEFAULT_TRAVERSE_EXCLUDE_DIRS,
             )?,
             backup_traverse_exclude_files: env_list(
                 "BACKUP_TRAVERSE_EXCLUDE_FILES",
-                "pnpm-lock.yaml,yarn.lock,package-lock.json",
+                super::DEFAULT_BACKUP_TRAVERSE_EXCLUDE_FILES,
             )?,
             content_traverse_exclude_files: env_list(
                 "CONTENT_TRAVERSE_EXCLUDE_FILES",
-                "pnpm-lock.yaml,yarn.lock,package-lock.json",
+                super::DEFAULT_CONTENT_TRAVERSE_EXCLUDE_FILES,
             )?,
             inline_image_extensions: env_list(
                 "INLINE_IMAGE_EXTENSIONS",
-                ".png,.jpg,.jpeg,.gif,.bmp,.svg,.ico,.webp,.avif",
+                super::DEFAULT_INLINE_IMAGE_EXTENSIONS,
             )?,
             zip_workspace_exclude: env_list(
                 "ZIP_WORKSPACE_EXCLUDE",
-                ".git,.tmp,.claude,.agents,.codex,.opencode,.grok,.pi,.logs,.npmrc,__pycache__,node_modules,dist,pnpm-lock.yaml,yarn.lock,package-lock.json",
+                super::DEFAULT_ZIP_WORKSPACE_EXCLUDE,
             )?,
             git_enabled: env_bool("GIT_ENABLED", false)?,
             git_default_author_name: env_str("GIT_DEFAULT_AUTHOR_NAME", "Nuwax File Server")?,
             git_default_author_email: env_str("GIT_DEFAULT_AUTHOR_EMAIL", "git@nuwax.com")?,
-            git_diff_max_file_size_bytes: env_parse(
-                "GIT_DIFF_MAX_FILE_SIZE_BYTES",
-                16 * 1024 * 1024,
-            )?,
+            // 单文件超限已降级为 binary 标记（不加载内容、不跑 diff 算法），
+            // 阈值语义 = "多大以上的文本 diff 已无呈现意义"；env 可覆盖。
+            git_diff_max_file_size_bytes: env_parse("GIT_DIFF_MAX_FILE_SIZE_BYTES", 1024 * 1024)?,
             git_diff_max_total_bytes: env_parse("GIT_DIFF_MAX_TOTAL_BYTES", 64 * 1024 * 1024)?,
             git_diff_max_output_bytes: env_parse("GIT_DIFF_MAX_OUTPUT_BYTES", 64 * 1024 * 1024)?,
             git_file_content_max_bytes: env_parse("GIT_FILE_CONTENT_MAX_BYTES", 64 * 1024 * 1024)?,
@@ -257,8 +291,13 @@ impl Config {
             dev_alive_poll_interval_ms: env_parse("DEV_ALIVE_POLL_INTERVAL_MS", 300)?,
             dev_stop_check_interval_ms: env_parse("DEV_STOP_CHECK_INTERVAL_MS", 100)?,
             dev_stop_max_attempts: env_parse("DEV_STOP_MAX_ATTEMPTS", 50)?,
+            dev_supervision_stop_budget_secs: env_parse("DEV_SUPERVISION_STOP_BUDGET_SECS", 90)?,
             dev_command_timeout_secs: env_parse("DEV_COMMAND_TIMEOUT_SECS", 600)?,
             max_build_concurrency: env_parse("MAX_BUILD_CONCURRENCY", 20)?,
+            userapp_build_wait_timeout_secs: env_parse("USERAPP_BUILD_WAIT_TIMEOUT_SECS", 3600)?,
+            app_cli_bin: env_opt_string("FILE_SERVER_APP_CLI_BIN")?,
+            app_cli_admin_probe_addr: env_opt_string("FILE_SERVER_APP_CLI_ADMIN_PROBE_ADDR")?
+                .unwrap_or_else(|| "127.0.0.1:3010".to_string()),
         };
         config.validate()?;
         Ok(config)
@@ -273,11 +312,20 @@ impl Config {
             ("COMPUTER_LOG_DIR", &self.computer_log_dir),
             ("PROJECT_SOURCE_DIR", &self.project_source_dir),
             ("COMPUTER_WORKSPACE_DIR", &self.computer_workspace_dir),
+            ("USERAPP_WORKSPACE_DIR", &self.userapp_workspace_dir),
             ("FILE_SERVER_LOG_DIR", &self.service_log_dir),
         ] {
             if path.as_os_str().is_empty() {
                 return Err(anyhow!("{name} must not be empty"));
             }
+        }
+        // 单 app 模式归属须过 identifier 白名单（该值直接参与路径与 appId 比对）
+        if let Some(single) = self.userapp_single_app_id.as_deref()
+            && shared_types::validate_identifier(single, "USERAPP_SINGLE_APP_ID").is_err()
+        {
+            return Err(anyhow!(
+                "USERAPP_SINGLE_APP_ID must be a valid identifier: '{single}'"
+            ));
         }
         if self.dev_port_range_start == 0 {
             return Err(anyhow!("DEV_PORT_RANGE_START must be greater than zero"));
@@ -302,6 +350,16 @@ impl Config {
         }
         if self.listen_host.trim().is_empty() {
             return Err(anyhow!("listen_host must not be empty"));
+        }
+        if self.build_artifact_retain_count == 0 {
+            return Err(anyhow!(
+                "BUILD_ARTIFACT_RETAIN_COUNT must be greater than zero"
+            ));
+        }
+        if self.build_log_retention_days == 0 {
+            return Err(anyhow!(
+                "BUILD_LOG_RETENTION_DAYS must be greater than zero"
+            ));
         }
         if self.service_log_retention_days == 0 {
             return Err(anyhow!(
@@ -357,6 +415,10 @@ impl Config {
                 self.dev_stop_check_interval_ms,
             ),
             ("DEV_COMMAND_TIMEOUT_SECS", self.dev_command_timeout_secs),
+            (
+                "USERAPP_BUILD_WAIT_TIMEOUT_SECS",
+                self.userapp_build_wait_timeout_secs,
+            ),
             ("LOG_READ_MAX_BYTES", self.log_read_max_bytes),
         ] {
             if value == 0 {
@@ -366,6 +428,15 @@ impl Config {
         if self.dev_stop_max_attempts == 0 {
             return Err(anyhow!("DEV_STOP_MAX_ATTEMPTS must be greater than zero"));
         }
+        // FS-09: 停止预算乘积在加载时前置拒绝溢出, 而不是在清理路径上回绕。
+        if u64::from(self.dev_stop_max_attempts)
+            .checked_mul(self.dev_stop_check_interval_ms)
+            .is_none()
+        {
+            return Err(anyhow!(
+                "DEV_STOP_MAX_ATTEMPTS * DEV_STOP_CHECK_INTERVAL_MS overflows the budget"
+            ));
+        }
         Ok(())
     }
 }
@@ -374,6 +445,71 @@ impl Config {
 mod tests {
     use super::super::env::MAX_UPLOAD_FILE_SIZE_BYTES;
     use super::Config;
+
+    /// FS-09: 停止预算保持毫秒精度——修复前 `attempts × interval / 1000` 整除
+    /// 把 200ms 截断为 0 秒（既有 975707f77 基线清理时序失败的根因）。
+    #[test]
+    fn dev_stop_drain_budget_keeps_millisecond_precision() {
+        let config = Config {
+            dev_stop_check_interval_ms: 200,
+            dev_stop_max_attempts: 1,
+            ..Config::default()
+        };
+        assert_eq!(
+            config.dev_stop_drain_budget(),
+            std::time::Duration::from_millis(200),
+            "200ms must stay 200ms, not truncate to 0 seconds"
+        );
+        let tripled = Config {
+            dev_stop_check_interval_ms: 200,
+            dev_stop_max_attempts: 3,
+            ..Config::default()
+        };
+        assert_eq!(
+            tripled.dev_stop_drain_budget(),
+            std::time::Duration::from_millis(600)
+        );
+    }
+
+    /// FS-09: 预算乘积溢出在配置校验时显式拒绝（fail fast）, 不在清理路径回绕。
+    #[test]
+    fn dev_stop_budget_overflow_is_rejected_at_validation() {
+        let config = Config {
+            dev_stop_max_attempts: u32::MAX,
+            dev_stop_check_interval_ms: u64::MAX,
+            ..Config::default()
+        };
+        let error = config.validate().expect_err("budget overflow must fail");
+        assert!(
+            error.to_string().contains("overflows"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// FS-01 反例: 环境变量缺失时, 配置文件声明的单 app 归属/CLI 路径/探测地址
+    /// 必须保留（默认→文件→env 的叠加语义）。修复前 with_env_overrides 把三项
+    /// 静默清为 None/默认, 单 app 归属拒绝分支随之失效。
+    #[test]
+    fn env_absence_preserves_file_owned_settings() {
+        let file = tempfile::Builder::new()
+            .suffix(".yaml")
+            .tempfile()
+            .expect("config fixture");
+        std::fs::write(
+            file.path(),
+            "userapp_single_app_id: app-9\n\
+             app_cli_bin: /opt/custom/app-cli\n\
+             app_cli_admin_probe_addr: 127.0.0.1:3999\n",
+        )
+        .expect("write config fixture");
+        let config = Config::from_file(file.path())
+            .expect("load file config")
+            .with_env_overrides()
+            .expect("apply env layer");
+        assert_eq!(config.userapp_single_app_id.as_deref(), Some("app-9"));
+        assert_eq!(config.app_cli_bin.as_deref(), Some("/opt/custom/app-cli"));
+        assert_eq!(config.app_cli_admin_probe_addr, "127.0.0.1:3999");
+    }
 
     #[test]
     fn partial_yaml_config_uses_defaults() {
@@ -388,6 +524,8 @@ mod tests {
         assert!(config.git_enabled);
         assert_eq!(config.request_body_max_bytes, MAX_UPLOAD_FILE_SIZE_BYTES);
         assert_eq!(config.service_log_retention_days, 7);
+        assert_eq!(config.build_artifact_retain_count, 3);
+        assert_eq!(config.build_log_retention_days, 7);
     }
 
     #[test]

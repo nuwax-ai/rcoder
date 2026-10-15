@@ -3,97 +3,63 @@
 
 use axum::extract::State;
 use garde::Validate;
-use serde::Deserialize;
-use serde_json::{Value, json};
 
-use super::{GitWriteBody, resolve_body};
+use super::resolve_body;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::AppJson as Json;
+use crate::models::{
+    BranchCreateBody, BranchNameBody, GitBranchOpResult, GitTagOpResult, TagCreateBody, TagNameBody,
+};
 use crate::service::git;
 
-#[derive(Deserialize, Validate, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct BranchCreateBody {
-    #[serde(flatten)]
-    #[garde(skip)]
-    pub base: GitWriteBody,
-    #[garde(length(min = 1))]
-    pub branch_name: String,
-    #[serde(default)]
-    #[garde(skip)]
-    pub start_point: Option<String>,
-}
-
-#[derive(Deserialize, Validate, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct BranchNameBody {
-    #[serde(flatten)]
-    #[garde(skip)]
-    pub base: GitWriteBody,
-    #[garde(length(min = 1))]
-    pub branch_name: String,
-    /// branch-delete 强制删除未合并分支 (对齐 nuwax deleteBranch force)。
-    #[serde(default)]
-    #[garde(skip)]
-    pub force: Option<bool>,
-}
-
-#[derive(Deserialize, Validate, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct TagCreateBody {
-    #[serde(flatten)]
-    #[garde(skip)]
-    pub base: GitWriteBody,
-    #[garde(length(min = 1))]
-    pub tag_name: String,
-    #[serde(default)]
-    #[garde(skip)]
-    pub message: Option<String>,
-}
-
-#[derive(Deserialize, Validate, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct TagNameBody {
-    #[serde(flatten)]
-    #[garde(skip)]
-    pub base: GitWriteBody,
-    #[garde(length(min = 1))]
-    pub tag_name: String,
-}
-
-/// `POST /api/git/branch-create`
-#[utoipa::path(post, path = "/branch-create", request_body = BranchCreateBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
+/// 创建分支
+#[utoipa::path(post, path = "/branch-create", request_body = BranchCreateBody, description = r#"
+从当前 HEAD 创建新分支。
+"#,
+    responses((status = 200, description = "分支操作结果", body = GitBranchOpResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn branch_create(
     State(state): State<AppState>,
     Json(body): Json<BranchCreateBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<GitBranchOpResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let name = body.branch_name.clone();
     let sp = body.start_point.clone();
+    let author_name = state.config.git_default_author_name.clone();
+    let author_email = state.config.git_default_author_email.clone();
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         let repo = git::ensure_repo(&path)?;
         git::ensure_gitignore(&path)?;
         // switch=true: 创建后立即 checkout (对齐 nuwax git.branch checkout:true)
-        git::create_branch(&repo, &name, sp.as_deref(), true)
+        git::create_branch(
+            &repo,
+            &name,
+            sp.as_deref(),
+            true,
+            &author_name,
+            &author_email,
+        )
     })
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Branch created and switched to",
-        "logId": log_id,
-        "branchName": body.branch_name,
-    })))
+    Ok(Json(GitBranchOpResult {
+        success: true,
+        message: "Branch created and switched to".to_string(),
+        log_id,
+        branch_name: body.branch_name,
+    }))
 }
 
-/// `POST /api/git/branch-delete`
-#[utoipa::path(post, path = "/branch-delete", request_body = BranchNameBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
+/// 删除分支
+#[utoipa::path(post, path = "/branch-delete", request_body = BranchNameBody, description = r#"
+删除指定分支（当前检出分支拒绝删除）。
+"#,
+    responses((status = 200, description = "分支操作结果", body = GitBranchOpResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn branch_delete(
     State(state): State<AppState>,
     Json(body): Json<BranchNameBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<GitBranchOpResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let name = body.branch_name.clone();
@@ -107,20 +73,23 @@ pub(crate) async fn branch_delete(
     })
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Branch deleted successfully",
-        "logId": log_id,
-        "branchName": body.branch_name,
-    })))
+    Ok(Json(GitBranchOpResult {
+        success: true,
+        message: "Branch deleted successfully".to_string(),
+        log_id,
+        branch_name: body.branch_name,
+    }))
 }
 
-/// `POST /api/git/tag-create`
-#[utoipa::path(post, path = "/tag-create", request_body = TagCreateBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
+/// 创建标签
+#[utoipa::path(post, path = "/tag-create", request_body = TagCreateBody, description = r#"
+在指定/当前 commit 上打标签（轻量版本标记）。
+"#,
+    responses((status = 200, description = "标签操作结果", body = GitTagOpResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn tag_create(
     State(state): State<AppState>,
     Json(body): Json<TagCreateBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<GitTagOpResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let name = body.tag_name.clone();
@@ -134,20 +103,23 @@ pub(crate) async fn tag_create(
     })
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Tag created successfully",
-        "logId": log_id,
-        "tagName": body.tag_name,
-    })))
+    Ok(Json(GitTagOpResult {
+        success: true,
+        message: "Tag created successfully".to_string(),
+        log_id,
+        tag_name: body.tag_name,
+    }))
 }
 
-/// `POST /api/git/tag-delete`
-#[utoipa::path(post, path = "/tag-delete", request_body = TagNameBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
+/// 删除标签
+#[utoipa::path(post, path = "/tag-delete", request_body = TagNameBody, description = r#"
+删除指定标签。
+"#,
+    responses((status = 200, description = "标签操作结果", body = GitTagOpResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn tag_delete(
     State(state): State<AppState>,
     Json(body): Json<TagNameBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<GitTagOpResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let name = body.tag_name.clone();
@@ -157,20 +129,25 @@ pub(crate) async fn tag_delete(
     })
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Tag deleted successfully",
-        "logId": log_id,
-        "tagName": body.tag_name,
-    })))
+    Ok(Json(GitTagOpResult {
+        success: true,
+        message: "Tag deleted successfully".to_string(),
+        log_id,
+        tag_name: body.tag_name,
+    }))
 }
 
-/// `POST /api/git/branch-switch` (对齐 nuwax switchBranch; 切到已存在分支)。
-#[utoipa::path(post, path = "/branch-switch", request_body = BranchNameBody, responses(crate::openapi::JsonApiResponses), tag = "Git")]
+/// 切换分支
+///
+/// 对齐 nuwax switchBranch; 切到已存在分支。
+#[utoipa::path(post, path = "/branch-switch", request_body = BranchNameBody, description = r#"
+切换当前检出到指定分支（工作区未提交改动可能阻止切换）。
+"#,
+    responses((status = 200, description = "分支操作结果", body = GitBranchOpResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn branch_switch(
     State(state): State<AppState>,
     Json(body): Json<BranchNameBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Json<GitBranchOpResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let name = body.branch_name.clone();
@@ -181,10 +158,10 @@ pub(crate) async fn branch_switch(
     })
     .await
     .map_err(|e| AppError::system(format!("git join: {e}")))??;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Branch switched successfully",
-        "logId": log_id,
-        "branchName": body.branch_name,
-    })))
+    Ok(Json(GitBranchOpResult {
+        success: true,
+        message: "Branch switched successfully".to_string(),
+        log_id,
+        branch_name: body.branch_name,
+    }))
 }

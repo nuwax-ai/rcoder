@@ -7,20 +7,22 @@
 //! - [`types`] - 类型定义（PerPortMetrics, ProxyMetrics, TrackingCtx 等）
 //! - [`utils`] - 工具函数（normalize_path, rewrite_uri, set_common_headers 等）
 //! - [`handlers`] - 请求处理函数（VNC, ttyd, audio, IME, API proxy, port proxy）
-//! - [`proxy_http`] - `ProxyHttp for PortProxy` 实现（请求生命周期 filter/peer/response）
-//! - [`backends`] - `PingoraProxyService` 后端映射管理（port/app/vnc/project + health check）
+//! - `proxy_http` - `ProxyHttp for PortProxy` 实现（请求生命周期 filter/peer/response）
+//! - `backends` - `PingoraProxyService` 后端映射管理（port/app/vnc/project + health check）
 //!
 //! 本模块（mod.rs）仅保留 struct 定义 + 构造（new/builders/create_pingora_proxy）+ Clone。
 
 mod backends;
+mod dispatch;
 mod proxy_http;
 
 pub mod handlers;
 pub mod types;
+pub mod upstream;
 pub mod utils;
 
 use anyhow::Result;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use matchit::Router;
 use std::collections::HashMap;
@@ -53,7 +55,7 @@ pub struct PingoraProxyService {
     /// 用于 /web/ttyd/{user_id}/{project_id} 路由（共享容器场景）
     pub project_backends: Arc<DashMap<String, String>>,
     /// app 后端映射: (app_id, port) -> host
-    /// 用于 /proxy/apps/{app_id}/{port} 路由（app_manager 部署的应用，按 app_id+port 路由避免同端口冲突）
+    /// 用于 /api/v1/userapp/proxy/app/prod/{user_id}/{app_id} 路由（app_manager 部署的应用，按 (app_id, APP_ENTRY_PORT) 路由）
     pub app_backends: Arc<DashMap<(String, u16), String>>,
     /// 🔒 API 密钥管理器: service_name -> ModelProviderConfig
     /// 用于 /api/{service_name}/{*path} 路由
@@ -62,10 +64,31 @@ pub struct PingoraProxyService {
     pub api_key_config: Option<Arc<ArcSwap<shared_types::ApiKeyAuthConfig>>>,
     /// 容器查找服务（统一数据源）
     container_lookup: Option<Arc<dyn shared_types::ContainerLookup>>,
-    /// UserApp 访问追踪（Pingora 热路径 touch 记录最近访问，供闲置回收判断）
+    /// Userapp 访问追踪（Pingora 热路径 touch 记录最近访问，供闲置回收判断）
     access_tracker: Option<Arc<dyn shared_types::AppAccessTracker>>,
-    /// UserApp 流量唤醒（stopped app 收到请求时 hold-and-wait 拉起）
+    /// Userapp 流量唤醒（stopped app 收到请求时 hold-and-wait 拉起）
     wake_control: Option<Arc<dyn shared_types::AppWakeControl>>,
+    /// 开发容器懒启动回调（dev 终端族 miss 时自动 ensure，而非 404）。
+    /// ArcSwap 槽——AppState 就绪晚于 Pingora 启动，main 侧经
+    /// [`Self::set_dev_ensure`] 回填（PortProxy 共享同槽实时见）
+    pub(crate) dev_ensure_slot: Arc<ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>>,
+    /// userApp 运行容器 IPv4 解析（Docker 模式；ArcSwap 槽——启动后经
+    /// [`Self::set_app_runtime_ip_resolver`] 回填，PortProxy 共享同槽实时见）
+    pub(crate) app_runtime_ip_slot: Arc<ArcSwapOption<Arc<dyn shared_types::AppRuntimeIpResolver>>>,
+    /// Custom Page 预览路由依赖（ArcSwap 槽——协调器装配晚于 Pingora 启动，
+    /// main 侧经 [`Self::set_preview_routing`] 回填）
+    pub(crate) preview_slot: Arc<ArcSwapOption<Arc<PreviewRouteDeps>>>,
+    /// UserApp 错误页呈现器槽（ArcSwap——engine 的页面存储/加载器装配后回填，
+    /// PortProxy 共享同槽实时见；None 时失败出口保持原极简响应）
+    pub(crate) error_pages_slot: Arc<ArcSwapOption<Arc<crate::error_page::ErrorPageRenderer>>>,
+    /// UserApp 失败诊断顾问槽（engine 注入：就绪观察短缓存；失败路径文案/
+    /// Pingap 来源确认用。None = 无证据，一律通用文案 + 不替换上游正文）
+    pub(crate) failure_advisor_slot:
+        Arc<ArcSwapOption<Arc<dyn crate::error_page::UserAppProxyFailureAdvisor>>>,
+    /// dev 入口连接恢复总预算（P0）：拒连/超时重试与端口等待的 deadline。
+    /// 共享槽——engine 配置装配后经 [`Self::set_dev_entry_wait`] 覆盖，
+    /// PortProxy 共享同槽实时见。
+    dev_entry_wait_slot: Arc<ArcSwap<std::time::Duration>>,
 }
 
 /// 为了兼容现有接口，我们保留原来的 PortProxyService 别名
@@ -85,7 +108,7 @@ pub struct PortProxy {
     vnc_backends: Arc<DashMap<String, String>>,
     /// Project 后端映射: project_id -> container_ip
     project_backends: Arc<DashMap<String, String>>,
-    /// app 后端映射: (app_id, port) -> host（/proxy/apps/{app_id}/{port} 路由）
+    /// app 后端映射: (app_id, port) -> host（/api/v1/userapp/proxy/app/prod 免端口代理按 (app_id, APP_ENTRY_PORT) 查）
     app_backends: Arc<DashMap<(String, u16), String>>,
     /// 路由表
     router: Router<RouteType>,
@@ -96,9 +119,29 @@ pub struct PortProxy {
     api_key_config: Option<Arc<ArcSwap<shared_types::ApiKeyAuthConfig>>>,
     /// 容器查找服务（统一数据源）
     container_lookup: Option<Arc<dyn shared_types::ContainerLookup>>,
-    /// UserApp 访问追踪 + 流量唤醒（/proxy/apps/* 路由用）
+    /// Userapp 访问追踪 + 流量唤醒（/api/v1/userapp/proxy/app/prod/* 路由用）
     access_tracker: Option<Arc<dyn shared_types::AppAccessTracker>>,
     wake_control: Option<Arc<dyn shared_types::AppWakeControl>>,
+    /// 开发容器懒启动回调槽（与 PingoraProxyService 共享同一 Arc）
+    pub(crate) dev_ensure_slot: Arc<ArcSwapOption<Arc<dyn shared_types::UserappDevEnsure>>>,
+    /// userApp 运行容器 IPv4 解析槽（与 PingoraProxyService 共享同一 Arc）
+    pub(crate) app_runtime_ip_slot: Arc<ArcSwapOption<Arc<dyn shared_types::AppRuntimeIpResolver>>>,
+    /// 预览路由依赖槽（与 PingoraProxyService 共享同一 Arc）
+    pub(crate) preview_slot: Arc<ArcSwapOption<Arc<PreviewRouteDeps>>>,
+    /// UserApp 错误页呈现器槽（与 PingoraProxyService 共享同一 Arc）
+    pub(crate) error_pages_slot: Arc<ArcSwapOption<Arc<crate::error_page::ErrorPageRenderer>>>,
+    /// UserApp 失败诊断顾问槽（与 PingoraProxyService 共享同一 Arc）
+    pub(crate) failure_advisor_slot:
+        Arc<ArcSwapOption<Arc<dyn crate::error_page::UserAppProxyFailureAdvisor>>>,
+    /// dev 入口恢复预算槽（与 PingoraProxyService 共享同一 Arc）
+    pub(crate) dev_entry_wait_slot: Arc<ArcSwap<std::time::Duration>>,
+}
+
+impl PortProxy {
+    /// dev 入口恢复总预算（共享槽实时值）。
+    pub(crate) fn dev_entry_wait(&self) -> std::time::Duration {
+        *self.dev_entry_wait_slot.load_full()
+    }
 }
 
 impl PingoraProxyService {
@@ -122,7 +165,49 @@ impl PingoraProxyService {
             container_lookup: None,
             access_tracker: None,
             wake_control: None,
+            dev_ensure_slot: Arc::new(ArcSwapOption::from(None)),
+            app_runtime_ip_slot: Arc::new(ArcSwapOption::from(None)),
+            preview_slot: Arc::new(ArcSwapOption::from(None)),
+            error_pages_slot: Arc::new(ArcSwapOption::from(None)),
+            failure_advisor_slot: Arc::new(ArcSwapOption::from(None)),
+            dev_entry_wait_slot: Arc::new(ArcSwap::from_pointee(Self::DEFAULT_DEV_ENTRY_WAIT)),
         }
+    }
+
+    /// dev 入口恢复默认预算（15s，clamp 区间 5-60s；配置接线见 engine 侧）。
+    pub(crate) const DEFAULT_DEV_ENTRY_WAIT: std::time::Duration =
+        std::time::Duration::from_secs(15);
+
+    /// 覆盖 dev 入口恢复预算（engine 配置装配后调用；越界值 clamp 到
+    /// [5s, 60s]——配置错误不得放大等待面；PortProxy 共享槽实时见）。
+    pub fn set_dev_entry_wait(&self, wait: std::time::Duration) {
+        const MIN: std::time::Duration = std::time::Duration::from_secs(5);
+        const MAX: std::time::Duration = std::time::Duration::from_secs(60);
+        self.dev_entry_wait_slot
+            .store(Arc::new(wait.clamp(MIN, MAX)));
+    }
+
+    /// 回填 UserApp 失败诊断顾问（engine 装配后调用；PortProxy 共享槽）。
+    pub fn set_failure_advisor(
+        &self,
+        advisor: Arc<dyn crate::error_page::UserAppProxyFailureAdvisor>,
+    ) {
+        self.failure_advisor_slot.store(Some(Arc::new(advisor)));
+    }
+
+    /// 回填 UserApp 错误页呈现器（engine 页面服务装配后调用；PortProxy
+    /// 共享槽实时见）。呈现器内含共享页面快照——与 Axum 管理面同一实例。
+    pub fn set_error_pages(&self, renderer: Arc<crate::error_page::ErrorPageRenderer>) {
+        self.error_pages_slot.store(Some(Arc::new(renderer)));
+    }
+
+    /// 回填 userApp 运行容器 IPv4 解析器（启动后调用——main 侧 RuntimeManager
+    /// 就绪晚于 Pingora 启动；PortProxy 共享槽，无锁生效）。
+    pub fn set_app_runtime_ip_resolver(
+        &self,
+        resolver: Arc<dyn shared_types::AppRuntimeIpResolver>,
+    ) {
+        self.app_runtime_ip_slot.store(Some(Arc::new(resolver)));
     }
 
     /// 设置容器查找服务（统一数据源）
@@ -134,16 +219,27 @@ impl PingoraProxyService {
         self
     }
 
-    /// 设置 UserApp 访问追踪（闲置回收的 HTTP 访问信号源）
+    /// 设置 Userapp 访问追踪（闲置回收的 HTTP 访问信号源）
     pub fn with_access_tracker(mut self, tracker: Arc<dyn shared_types::AppAccessTracker>) -> Self {
         self.access_tracker = Some(tracker);
         self
     }
 
-    /// 设置 UserApp 流量唤醒控制
+    /// 设置 Userapp 流量唤醒控制
     pub fn with_wake_control(mut self, wc: Arc<dyn shared_types::AppWakeControl>) -> Self {
         self.wake_control = Some(wc);
         self
+    }
+
+    /// 回填开发容器懒启动回调（启动后调用——AppState 就绪晚于 Pingora 启动；
+    /// PortProxy 共享槽，无锁生效）
+    pub fn set_dev_ensure(&self, de: Arc<dyn shared_types::UserappDevEnsure>) {
+        self.dev_ensure_slot.store(Some(Arc::new(de)));
+    }
+
+    /// 回填预览路由依赖（协调器装配晚于 Pingora 启动；PortProxy 共享槽实时见）。
+    pub fn set_preview_routing(&self, deps: PreviewRouteDeps) {
+        self.preview_slot.store(Some(Arc::new(Arc::new(deps))));
     }
 
     /// 设置负载均衡算法
@@ -196,6 +292,12 @@ impl PingoraProxyService {
             container_lookup: self.container_lookup.clone(),
             access_tracker: self.access_tracker.clone(),
             wake_control: self.wake_control.clone(),
+            dev_ensure_slot: Arc::clone(&self.dev_ensure_slot),
+            app_runtime_ip_slot: self.app_runtime_ip_slot.clone(),
+            preview_slot: Arc::clone(&self.preview_slot),
+            error_pages_slot: Arc::clone(&self.error_pages_slot),
+            failure_advisor_slot: Arc::clone(&self.failure_advisor_slot),
+            dev_entry_wait_slot: Arc::clone(&self.dev_entry_wait_slot),
         })
     }
 }
@@ -216,6 +318,12 @@ impl Clone for PingoraProxyService {
             container_lookup: self.container_lookup.clone(),
             access_tracker: self.access_tracker.clone(),
             wake_control: self.wake_control.clone(),
+            dev_ensure_slot: Arc::clone(&self.dev_ensure_slot),
+            app_runtime_ip_slot: self.app_runtime_ip_slot.clone(),
+            preview_slot: Arc::clone(&self.preview_slot),
+            error_pages_slot: Arc::clone(&self.error_pages_slot),
+            failure_advisor_slot: Arc::clone(&self.failure_advisor_slot),
+            dev_entry_wait_slot: Arc::clone(&self.dev_entry_wait_slot),
         }
     }
 }
@@ -224,6 +332,38 @@ impl Clone for PingoraProxyService {
 mod tests {
     use super::*;
     use crate::config::ProxyConfig;
+
+    /// dev 入口恢复预算：默认 15s；配置覆盖经 clamp 收敛到 [5s, 60s]——
+    /// 配置错误不得放大等待面，也不得低于最小有效恢复窗口。
+    #[test]
+    fn dev_entry_wait_clamps_to_bounds() {
+        let service = PingoraProxyService::new(ProxyConfig::default());
+        let current = || *service.dev_entry_wait_slot.load_full();
+        assert_eq!(current(), PingoraProxyService::DEFAULT_DEV_ENTRY_WAIT);
+        assert_eq!(
+            PingoraProxyService::DEFAULT_DEV_ENTRY_WAIT,
+            std::time::Duration::from_secs(15)
+        );
+
+        service.set_dev_entry_wait(std::time::Duration::from_secs(1));
+        assert_eq!(
+            current(),
+            std::time::Duration::from_secs(5),
+            "below-minimum config must clamp up"
+        );
+        service.set_dev_entry_wait(std::time::Duration::from_secs(3600));
+        assert_eq!(
+            current(),
+            std::time::Duration::from_secs(60),
+            "above-maximum config must clamp down"
+        );
+        service.set_dev_entry_wait(std::time::Duration::from_secs(20));
+        assert_eq!(
+            current(),
+            std::time::Duration::from_secs(20),
+            "in-range config passes through"
+        );
+    }
 
     #[test]
     fn test_service_creation() {

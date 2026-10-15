@@ -10,12 +10,9 @@ use agent_client_protocol::schema::v1::{CancelNotification, SessionId};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use shared_types::{
-    AgentStatusResponse, ChatResponse, HttpResult, RcoderChatRequest, ServiceType,
-    agent_http_service::AgentHttpService,
-    rcoder_agent_types::{
-        RcoderAgentCancelRequest, RcoderAgentCancelResponse, RcoderAgentStopRequest,
-        RcoderAgentStopResponse,
-    },
+    AgentHttpService, AgentStatusResponse, ChatResponse, HttpResult, RcoderAgentCancelRequest,
+    RcoderAgentCancelResponse, RcoderAgentStopRequest, RcoderAgentStopResponse, RcoderChatRequest,
+    ServiceType,
 };
 use tokio::sync::oneshot;
 use tracing::{info, warn};
@@ -92,8 +89,13 @@ impl AgentHttpService for LocalAgentHttpService {
 
         // 校验 agent_work_dir（如果提供了）
         // 注意：这里使用 project_id 作为 fallback，所以 work_dir_id 不会为空
-        // 但如果 agent_work_dir 有值且不合法，需要返回错误
-        if let Err(e) = shared_types::validate_identifier(&work_dir_id, "agent_work_dir") {
+        // 但如果 agent_work_dir 有值且不合法，需要返回错误。
+        // 本服务是 WebAgentRunner 形态（HTTP Server 直跑模式）：绝对路径形态
+        // 不支持（work_dir 会流入容器挂载配置语义），for_service 显式拒绝
+        if let Err(e) = shared_types::validate_agent_work_dir_for_service(
+            &ServiceType::WebAgentRunner,
+            &work_dir_id,
+        ) {
             return HttpResult::error(shared_types::error_codes::ERR_VALIDATION, &e);
         }
 
@@ -104,7 +106,8 @@ impl AgentHttpService for LocalAgentHttpService {
                 .map(|info| info.session_id.to_string())
         });
 
-        // 3. 创建项目工作目录
+        // 3. 创建项目工作目录（work_dir_id 已由上方校验保证为单段，
+        // join 不会被绝对路径替换前缀）
         let project_dir = self.projects_dir.join(&work_dir_id);
         if let Err(e) = tokio::fs::create_dir_all(&project_dir).await {
             let error_msg = format!("Failed to create project dir: {}", e);
@@ -125,6 +128,7 @@ impl AgentHttpService for LocalAgentHttpService {
             project_id: project_id.clone(),
             project_dir,
             session_id,
+            force_new_session: false,
             prompt: request.prompt,
             request_id: request_id.clone(),
             attachments: request.attachments,
@@ -150,11 +154,13 @@ impl AgentHttpService for LocalAgentHttpService {
 
         // 8. 将 session 写入 SESSION_CACHE（SSE 进度流需要）
         // 🛡️ 关键修复：不在 DashMap entry() 持锁范围内调用 .await
+        // 仅成功且有有效 session_id 时才写入,避免预检失败/prepare 失败时创建 SESSION_CACHE[""]
         let session_id_str = output.session_id.clone();
-        if SESSION_CACHE.contains_key(&session_id_str) {
-            // 已存在，无需创建
-        } else {
-            let session_data = SessionData::new(1000).await;
+        if output.success
+            && !session_id_str.is_empty()
+            && !SESSION_CACHE.contains_key(&session_id_str)
+        {
+            let session_data = SessionData::new(super::RING_BUFFER_SIZE).await;
             match SESSION_CACHE.entry(session_id_str) {
                 dashmap::mapref::entry::Entry::Occupied(_) => {
                     // 其他任务已创建，丢弃我们创建的 session_data

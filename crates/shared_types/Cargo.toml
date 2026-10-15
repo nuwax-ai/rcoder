@@ -8,11 +8,14 @@ license.workspace = true
 [features]
 default = []
 kubernetes = []
+# deploy-host 宿主机运行形态（Phase 2 引入；编译期隔离，生产二进制不含）
+deploy-host = []
 
 [lints]
 workspace = true
 
 [dependencies]
+sha2.workspace = true
 
 serde.workspace = true
 workspace-manifest = { workspace = true }
@@ -44,6 +47,7 @@ thiserror = { workspace = true }
 
 # Validation
 garde = { workspace = true }
+regex = { workspace = true }
 
 base64 = { workspace = true }
 
@@ -66,7 +70,10 @@ axum-tracing-opentelemetry = { workspace = true }
 arc-swap = { workspace = true }
 
 # Persistent data structures for multi-session tracking (C2/M3 fix)
-im = { workspace = true }
+imbl = { workspace = true }
+
+# 系统信息采集（VersionResponse::current 链路，/version 端点）
+sysinfo = { workspace = true }
 
 # i18n (国际化)
 shared_types_i18n = { workspace = true }
@@ -90,5 +97,9 @@ async-trait = { workspace = true }
 shared_types_grpc = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 serde_yaml = { workspace = true }
 toml = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }

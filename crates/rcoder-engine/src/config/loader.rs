@@ -1,0 +1,526 @@
+//! 配置加载器（从 config/mod.rs 拆出）。
+//!
+//! `load_config_with_args`（CLI + config.yml + env 覆盖）、`load_config` 及
+//! 默认配置文件生成；CONFIG_FILE 常量在 [`super`]。
+
+use std::fs;
+use std::path::PathBuf;
+
+use tracing::{info, warn};
+
+use super::sections::*;
+use super::sections::{env_override_bool, env_override_u64};
+use super::storage;
+use super::{ApiKeyAuthConfig, AppConfig, CliArgs, config_file_path, generate_random_api_key};
+
+pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
+    let config_path = config_file_path();
+    let mut config = if config_path.exists() {
+        // fail fast: 配置文件存在但解析失败 → 直接退出（不降级默认配置带病运行）。
+        // 历史教训（0.1.233 部署事故）：降级默认值后 docker_config 无镜像，
+        // 报错与真因（configmap 模板缩进坏）隔三层，CrashLoop 排障一小时；
+        // 真实解析错误含行号列号，直接暴露才是最短路径
+        load_config_from_file()?
+    } else {
+        info!(
+            "config file not found, created default config file: {}",
+            config_path.display().to_string()
+        );
+        let default_config = default_config_with_deploy_budget()?;
+        create_default_config_file()?;
+        default_config
+    };
+
+    // 命令行参数覆盖配置文件
+    if let Some(port) = cli_args.port {
+        config.port = port;
+    }
+
+    if let Some(projects_dir) = cli_args.projects_dir {
+        config.projects_dir = PathBuf::from(projects_dir);
+    }
+
+    // 环境变量覆盖所有配置
+    if let Ok(port) = std::env::var("RCODER_PORT") {
+        if let Ok(port) = port.parse::<u16>() {
+            config.port = port;
+        } else {
+            warn!(" parse RCODER_PORT failed: {}", port);
+        }
+    }
+
+    if let Ok(projects_dir) = std::env::var("RCODER_PROJECTS_DIR") {
+        config.projects_dir = PathBuf::from(projects_dir);
+    }
+
+    // 如果启用了代理，配置代理相关参数
+    if cli_args.enable_proxy {
+        let mut proxy_config = ProxyConfig::default();
+
+        if let Some(proxy_port) = cli_args.proxy_port {
+            proxy_config.listen_port = proxy_port;
+        }
+
+        if let Some(default_backend_port) = cli_args.default_backend_port {
+            proxy_config.default_backend_port = default_backend_port;
+        }
+
+        config.proxy_config = Some(proxy_config);
+    }
+
+    // 应用 Docker 配置的环境变量覆盖
+    if let Some(docker_config) = &mut config.docker_config {
+        docker_config.apply_env_overrides()?;
+    }
+
+    // 应用 API Key 配置的环境变量覆盖（与热加载共用同一规则）
+    apply_api_key_env_overrides(&mut config.api_key_auth);
+
+    // 应用 Userapp 自动回收配置的环境变量覆盖
+    env_override_bool(
+        "RCODER_USERAPP_RECYCLE_ENABLED",
+        &mut config.userapp_recycle.enabled,
+    );
+    env_override_u64(
+        "RCODER_USERAPP_IDLE_TIMEOUT_SECONDS",
+        &mut config.userapp_recycle.idle_timeout_seconds,
+    );
+    env_override_u64(
+        "RCODER_USERAPP_SCAN_INTERVAL_SECONDS",
+        &mut config.userapp_recycle.scan_interval_seconds,
+    );
+    env_override_u64(
+        "RCODER_USERAPP_WAKE_TIMEOUT_SECONDS",
+        &mut config.userapp_recycle.wake_timeout_seconds,
+    );
+    env_override_u64(
+        "RCODER_USERAPP_DEV_ENTRY_WAIT_SECONDS",
+        &mut config.userapp_recycle.dev_entry_wait_timeout_seconds,
+    );
+    env_override_u64(
+        "RCODER_USERAPP_PROTECTION_SECONDS",
+        &mut config.userapp_recycle.protection_seconds,
+    );
+
+    storage::apply_storage_env_overrides(&mut config)?;
+    config
+        .userapp_storage
+        .apply_overrides(|key| std::env::var(key).ok())?;
+
+    // deploy-host Reach 模式：env 覆盖 config（非法 token fail-fast，对齐
+    // userapp_storage 覆盖链语义），随后进程级定模式——必须发生在任何容器
+    // 创建之前（Docker 创建后不能补绑端口）；tunnel 占位显式拒绝不虚报
+    use shared_types::deploy_host_reach::{REACH_ENV, ReachSetting};
+    if let Ok(val) = std::env::var(REACH_ENV) {
+        let token = val.trim();
+        if !token.is_empty() {
+            let setting = ReachSetting::from_token(token).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid {REACH_ENV}: {token} (expected auto|direct|published|tunnel)"
+                )
+            })?;
+            config.deploy_host.reach = setting;
+            info!(" {REACH_ENV} (env override): {}", setting.as_token());
+        }
+    }
+    #[cfg(feature = "deploy-host")]
+    shared_types::deploy_host_reach::init(config.deploy_host.reach)?;
+
+    // 验证 API Key 配置
+    if config.api_key_auth.enabled && config.api_key_auth.api_key.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "API Key authentication is enabled but API Key is empty, please check config file or environment variables"
+        ));
+    }
+
+    // 配置验证
+    if let Some(docker_config) = &config.docker_config
+        && let Err(e) = docker_config.validate_multi_image_config()
+    {
+        return Err(anyhow::anyhow!(
+            "Docker configuration validation failed: {}",
+            e
+        ));
+    }
+
+    info!(
+        "Final config: port={}, projects_dir={:?}, default_agent_id={}, proxy_enabled={}",
+        config.port,
+        config.projects_dir,
+        config.default_agent_id,
+        config.proxy_config.is_some()
+    );
+
+    Ok(config)
+}
+
+/// CLI 管理子命令专用的配置加载：文件缺失时**不落盘生成**默认配置
+/// （`rcoder file-server status` 这类只读短命令不应有写文件副作用），
+/// 仅用内存默认值补齐端口/API key 后返回。
+pub fn load_config_for_cli(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
+    if config_file_path().exists() {
+        return load_config_with_args(cli_args);
+    }
+    info!(
+        "{} 不存在, CLI 子命令使用内存默认配置（不写盘）",
+        config_file_path().display()
+    );
+    let mut config = default_config_with_deploy_budget()?;
+    if let Some(port) = cli_args.port {
+        config.port = port;
+    }
+    Ok(config)
+}
+
+/// 从文件加载配置
+fn load_config_from_file() -> anyhow::Result<AppConfig> {
+    let config_content = fs::read_to_string(config_file_path())
+        .map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
+
+    // 安全修复：移除完整配置内容的 debug 日志，避免泄露 API Key 等敏感信息
+    tracing::debug!("config file loaded, size: {} bytes", config_content.len());
+
+    let config = parse_config_with_deploy_budget(&config_content)?;
+
+    // 调试：打印解析后的多镜像配置
+    if let Some(ref docker_config) = config.docker_config {
+        tracing::info!("[CONFIG] docker_config is Some, checking multi_image_config");
+        if let Some(ref multi_config) = docker_config.multi_image_config {
+            tracing::info!(
+                "[CONFIG] multi_image_config is Some, services count: {}",
+                multi_config.services.len()
+            );
+            for (service_key, service_config) in &multi_config.services {
+                tracing::info!(
+                    "[CONFIG]   Service '{}': service_type={}, image={:?}, arm64_image={:?}, amd64_image={:?}, default_image={:?}, enabled={}",
+                    service_key,
+                    service_config.service_type,
+                    service_config.image,
+                    service_config.arm64_image,
+                    service_config.amd64_image,
+                    service_config.default_image,
+                    service_config.enabled
+                );
+                tracing::debug!(
+                    "  Service '{}' mount config (total {} mounts):",
+                    service_key,
+                    service_config.mounts.len()
+                );
+                for (i, mount) in service_config.mounts.iter().enumerate() {
+                    tracing::debug!(
+                        "    [{}]: {} -> {} ({})",
+                        i,
+                        mount.container_path,
+                        mount.host_path,
+                        mount.mount_type
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(config)
+}
+
+fn default_config_with_deploy_budget() -> anyhow::Result<AppConfig> {
+    let mut config = AppConfig::default();
+    if config.app_manager.enabled {
+        config.app_manager.deploy_budget = app_manager::config::deploy_budget_from_env()?;
+        config.app_manager.restart_admission_wait_secs =
+            app_manager::config::restart_admission_wait_from_env()?;
+    }
+    Ok(config)
+}
+
+/// An explicit YAML budget section owns all budget fields, including its own
+/// defaults. Resolve environment only when that section was not selected.
+fn parse_config_with_deploy_budget(content: &str) -> anyhow::Result<AppConfig> {
+    let parse_error = |error: serde_yaml::Error| {
+        let message =
+            shared_types::sanitize_error_text(&format!("Failed to parse config file: {error}"));
+        // Keep field/line diagnostics; never dump configuration (credentials)
+        // or cut a byte prefix through a Unicode character.
+        tracing::error!(%message, "Configuration parsing failed");
+        anyhow::Error::from(
+            shared_types::AppError::with_message(shared_types::ERR_RUNTIME_CONFIGURATION, &message)
+                .with_error_detail(shared_types::ErrorDetail::new(
+                    shared_types::ERR_RUNTIME_CONFIGURATION,
+                    "configuration_parse",
+                    message,
+                )),
+        )
+    };
+    let mut config: AppConfig = serde_yaml::from_str(content).map_err(parse_error)?;
+    let document: serde_yaml::Value = serde_yaml::from_str(content).map_err(parse_error)?;
+    let explicit_budget = document
+        .get("app_manager")
+        .and_then(|manager| manager.get("deploy_budget"))
+        .is_some();
+    if config.app_manager.enabled && !explicit_budget {
+        config.app_manager.deploy_budget = app_manager::config::deploy_budget_from_env()?;
+    }
+    let explicit_restart_wait = document
+        .get("app_manager")
+        .and_then(|manager| manager.get("restart_admission_wait_secs"))
+        .is_some();
+    if config.app_manager.enabled && !explicit_restart_wait {
+        config.app_manager.restart_admission_wait_secs =
+            app_manager::config::restart_admission_wait_from_env()?;
+    }
+    if config.app_manager.enabled {
+        app_manager::config::validate_restart_admission_wait_secs(
+            config.app_manager.restart_admission_wait_secs,
+        )?;
+    }
+    Ok(config)
+}
+
+/// 应用 API Key 配置的环境变量覆盖（`RCODER_API_KEY_ENABLED` /
+/// `RCODER_API_KEY`）。启动加载与热加载共用——热加载若只读文件，任何一次
+/// 无关配置的修改都会静默覆盖环境变量显式指定的鉴权状态。
+pub fn apply_api_key_env_overrides(config: &mut ApiKeyAuthConfig) {
+    if let Ok(val) = std::env::var("RCODER_API_KEY_ENABLED") {
+        if let Ok(enabled) = val.parse::<bool>() {
+            config.enabled = enabled;
+            info!(" RCODER_API_KEY_ENABLED: {}", enabled);
+        } else {
+            warn!(" parse RCODER_API_KEY_ENABLED failed: {}", val);
+        }
+    }
+
+    if let Ok(val) = std::env::var("RCODER_API_KEY") {
+        config.api_key = val;
+        info!(" RCODER_API_KEY configured");
+    }
+}
+
+/// 从配置内容（YAML 文本）中仅加载 API Key 配置（热更新用）。
+///
+/// 语义约束：
+/// - 只解析 `api_key_auth` 段——其余段字段增删/类型演进不使 api_key 热加载
+///   整体失效（其余段的 **YAML 语法损坏** 仍会解析失败，由调用方保留旧配置）；
+/// - **`api_key_auth` 段缺失视为错误**（可能是写到一半的半成品文件）——
+///   热加载不得据此隐式关闭鉴权；关闭鉴权必须在文件中显式写
+///   `enabled: false`；
+/// - 解析结果应用与启动一致的环境变量覆盖（见
+///   [`apply_api_key_env_overrides`]）。
+pub fn parse_api_key_config(content: &str) -> anyhow::Result<ApiKeyAuthConfig> {
+    #[derive(serde::Deserialize)]
+    struct ApiKeySectionOnly {
+        api_key_auth: Option<ApiKeyAuthConfig>,
+    }
+    let section: ApiKeySectionOnly = serde_yaml::from_str(content)
+        .map_err(|e| anyhow::anyhow!("Failed to parse config file: {}", e))?;
+    let mut config = section
+        .api_key_auth
+        .ok_or_else(|| anyhow::anyhow!("api_key_auth section missing"))?;
+    apply_api_key_env_overrides(&mut config);
+    Ok(config)
+}
+
+/// 从配置文件中仅加载 API Key 配置（用于热更新）
+///
+/// 此函数由 config_watcher 模块调用,用于配置热重载。
+#[allow(dead_code)]
+pub fn load_api_key_config_from_file(
+    config_path: &std::path::Path,
+) -> anyhow::Result<ApiKeyAuthConfig> {
+    let config_content = fs::read_to_string(config_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read config file: {}", e))?;
+    parse_api_key_config(&config_content)
+}
+
+/// 创建默认配置文件
+fn create_default_config_file() -> anyhow::Result<()> {
+    // 检查配置文件是否已存在
+    if config_file_path().exists() {
+        return Ok(());
+    }
+
+    // 创建配置文件目录（如果不存在）
+    let config_path = config_file_path();
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("Failed to create config directory: {}", e))?;
+    }
+
+    // 使用嵌入式配置文件
+    let default_config = include_str!("rcoder_default.yml");
+
+    // 🆕 生成随机 API Key 并替换模板占位符
+    let generated_api_key = generate_random_api_key();
+    let config_content = default_config.replace("{{GENERATED_API_KEY}}", &generated_api_key);
+
+    fs::write(&config_path, config_content)
+        .map_err(|e| anyhow::anyhow!("Failed to write default config file: {}", e))?;
+
+    info!("Created default config file: {}", config_path.display());
+    info!(
+        "Generated a random API key into {} (not echoed to logs)",
+        config_path.display().to_string()
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser as _;
+    use std::env;
+    use std::fs;
+    use std::path::Path;
+    use std::process;
+
+    use crate::config::CONFIG_FILE;
+
+    /// fail fast 防回归：配置文件存在但解析失败必须返回 Err（不降级默认配置）。
+    /// 历史教训（0.1.233 部署事故）：降级默认值后报错与真因隔三层
+    /// （configmap 缩进坏 → missing field 被吞 → 默认 docker_config 无镜像
+    /// → CrashLoop 报 image=None）。
+    #[test]
+    fn malformed_config_file_fails_fast_instead_of_defaulting() {
+        let dir = env::temp_dir().join(format!("rcoder-badcfg-{}", process::id()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        // health_check 缺必填字段（复刻事故形态：模板缩进坏导致字段跌出 health_check）
+        fs::write(
+            dir.join(CONFIG_FILE),
+            "proxy_config:\n  listen_port: 8088\n  health_check:\n    enabled: true\n",
+        )
+        .expect("write");
+
+        let origin = env::current_dir().expect("cwd");
+        env::set_current_dir(&dir).expect("chdir");
+        // RCODER_CONFIG_FILE 显式指向临时配置：两种编译形态（容器 cwd 相对 /
+        // deploy-host ~/.rcoder）都读到本测试写入的坏配置
+        #[allow(unsafe_code)]
+        unsafe {
+            env::set_var("RCODER_CONFIG_FILE", dir.join(CONFIG_FILE));
+        }
+        let result = load_config_with_args(CliArgs::try_parse_from(["rcoder"]).expect("cli args"));
+        #[allow(unsafe_code)]
+        unsafe {
+            env::remove_var("RCODER_CONFIG_FILE");
+        }
+        // 恢复 cwd 尽早执行（断言失败也不留脏 cwd）
+        if let Err(e) = env::set_current_dir(origin) {
+            eprintln!("restore cwd failed: {e}");
+        }
+        fs::remove_dir_all(&dir).ok();
+
+        let err = result.expect_err("坏配置必须 fail fast 而非降级默认配置");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Failed to parse config file"),
+            "错误信息应指向配置解析: {msg}"
+        );
+    }
+
+    /// 临时最小合法配置 + RCODER_CONFIG_FILE 指向；返回其路径。
+    /// 两侧测试约束与 malformed 用例同款（绝对路径双形态生效）。
+    fn write_min_config(extra: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "rcoder-reach-{}-{}",
+            process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            format!("projects_dir: /tmp/rcoder-reach-test\nport: 8087\n{extra}"),
+        )
+        .expect("write");
+        path
+    }
+
+    fn load_with_config(path: &Path) -> anyhow::Result<AppConfig> {
+        #[allow(unsafe_code)]
+        unsafe {
+            env::set_var("RCODER_CONFIG_FILE", path);
+        }
+        let result = load_config_with_args(CliArgs::try_parse_from(["rcoder"]).expect("cli args"));
+        #[allow(unsafe_code)]
+        unsafe {
+            env::remove_var("RCODER_CONFIG_FILE");
+        }
+        result
+    }
+
+    #[test]
+    fn missing_deploy_host_section_defaults_to_auto() {
+        let path = write_min_config("");
+        let config = load_with_config(&path).expect("config loads without deploy_host");
+        assert_eq!(
+            config.deploy_host.reach,
+            shared_types::deploy_host_reach::ReachSetting::Auto,
+            "缺段必须回落 auto 而非报错"
+        );
+        fs::remove_dir_all(path.parent().expect("parent")).ok();
+    }
+
+    #[test]
+    fn reach_env_overrides_config_value() {
+        let path = write_min_config("deploy_host:\n  reach: published\n");
+        #[allow(unsafe_code)]
+        unsafe {
+            env::set_var("RCODER_DEPLOY_HOST_REACH", "Direct ");
+        }
+        let config = load_with_config(&path).expect("env override applies");
+        #[allow(unsafe_code)]
+        unsafe {
+            env::remove_var("RCODER_DEPLOY_HOST_REACH");
+        }
+        assert_eq!(
+            config.deploy_host.reach.as_token(),
+            "direct",
+            "env 必须优先于 config 段且容忍大小写空白"
+        );
+        fs::remove_dir_all(path.parent().expect("parent")).ok();
+    }
+
+    #[test]
+    fn invalid_reach_env_token_bails() {
+        let path = write_min_config("");
+        #[allow(unsafe_code)]
+        unsafe {
+            env::set_var("RCODER_DEPLOY_HOST_REACH", "orb");
+        }
+        let result = load_with_config(&path);
+        #[allow(unsafe_code)]
+        unsafe {
+            env::remove_var("RCODER_DEPLOY_HOST_REACH");
+        }
+        let err = result.expect_err("非法 token 必须 fail fast");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("RCODER_DEPLOY_HOST_REACH") && msg.contains("orb"),
+            "错误应点名 env 键与原值: {msg}"
+        );
+        fs::remove_dir_all(path.parent().expect("parent")).ok();
+    }
+
+    /// tunnel 契约占位：token 可解析（config 合法），deploy-host 编译下
+    /// init 显式 bail 拒绝——不虚报支持。
+    #[test]
+    #[cfg(feature = "deploy-host")]
+    fn tunnel_reach_rejected_at_init() {
+        let path = write_min_config("");
+        #[allow(unsafe_code)]
+        unsafe {
+            env::set_var("RCODER_DEPLOY_HOST_REACH", "tunnel");
+        }
+        let result = load_with_config(&path);
+        #[allow(unsafe_code)]
+        unsafe {
+            env::remove_var("RCODER_DEPLOY_HOST_REACH");
+        }
+        let err = result.expect_err("tunnel 未实现必须拒绝启动");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("tunnel"), "错误应点名 tunnel: {msg}");
+        fs::remove_dir_all(path.parent().expect("parent")).ok();
+    }
+}
+
+#[cfg(test)]
+#[path = "loader/budget_tests.rs"]
+mod budget_tests;

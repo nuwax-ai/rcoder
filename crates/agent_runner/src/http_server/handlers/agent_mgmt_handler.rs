@@ -191,7 +191,13 @@ pub async fn install_agent(
         "BINARY" | "binary" => InstallType::Binary,
         "URL" | "url" => InstallType::Url,
         "NPM" | "npm" => InstallType::Npm,
-        _ => InstallType::Binary,
+        // 未知值不能静默回退 Binary：调用方实际按 URL/NPM 语义发的 body 会被
+        // 当压缩包解析, 报"only tar.gz and zip archives are supported"误导排障
+        other => {
+            return error_to_response(AgentMgmtError::InvalidChunk(format!(
+                "unknown install_type: {other:?} (expected BINARY/URL/NPM)"
+            )));
+        }
     };
     let source_url = meta
         .get("source_url")

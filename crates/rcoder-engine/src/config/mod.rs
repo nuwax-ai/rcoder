@@ -1,0 +1,199 @@
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
+
+mod storage;
+mod userapp_storage;
+pub use crate::userapp_error_page::UserAppErrorPageConfig;
+pub use storage::{StorageBackend, StorageConfig};
+pub use userapp_storage::{UserAppStorageBackend, UserAppStorageConfig};
+
+/// 命令行参数
+#[derive(Parser, Debug)]
+#[command(name = "rcoder")]
+#[command(about = "RCoder - Rust-based AI Agent Framework")]
+#[command(version)]
+pub struct CliArgs {
+    /// 主服务端口
+    #[arg(short = 'p', long)]
+    pub port: Option<u16>,
+
+    /// 项目工作目录
+    #[arg(short = 'd', long, default_value = "./project_workspace")]
+    pub projects_dir: Option<String>,
+
+    /// 启用反向代理
+    #[arg(short, long)]
+    pub enable_proxy: bool,
+
+    /// 代理服务端口
+    #[arg(long = "proxy-port")]
+    pub proxy_port: Option<u16>,
+
+    /// 默认后端服务端口
+    #[arg(long = "backend-port")]
+    pub default_backend_port: Option<u16>,
+
+    /// 管理子命令 (不传 = 正常启动服务)
+    #[command(subcommand)]
+    pub command: Option<AdminCommand>,
+}
+
+/// 管理子命令 (操作运行中的 rcoder 进程, 经 localhost HTTP)。
+#[derive(Subcommand, Debug)]
+pub enum AdminCommand {
+    /// 管理 60000 file-server 分流反向代理 (开发测试期 TS↔分流代理切换对比)
+    FileServer {
+        #[command(subcommand)]
+        action: FileServerAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum FileServerAction {
+    /// 启动分流反向代理 (幂等; 端口取 config.yml file_server_proxy 段, 默认 60000)
+    Start,
+    /// 停止并释放 60000 端口 (幂等; 10s 超时强制) —— 释放后可起 TS nuwax-file-server 直跑对比
+    Stop,
+    /// 停止后重新启动
+    Restart,
+    /// 查看运行状态
+    Status,
+}
+
+// 从 shared_types 导入 API Key 鉴权配置
+pub use shared_types::ApiKeyAuthConfig;
+
+/// 应用程序配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppConfig {
+    /// 默认使用的 Agent ID
+    #[serde(default = "default_agent_id", alias = "default_agent")]
+    pub default_agent_id: String,
+    /// 项目工作目录
+    pub projects_dir: PathBuf,
+    /// 主服务端口
+    pub port: u16,
+    /// 反向代理配置
+    pub proxy_config: Option<ProxyConfig>,
+    /// file-server 分流反向代理（60000 入口：userApp → 主服务, 其余 → TS nuwax-file-server）
+    ///
+    /// host 段缺失时自动监听 loopback:60000 / AllRust；容器段缺失时仅注册，
+    /// 可经管理入口启动。显式配置段优先。K8s 部署经 helm 渲染此段。
+    #[serde(default)]
+    pub file_server_proxy: Option<file_server_proxy::FileServerProxyConfig>,
+    /// Custom Page 预览协调器（多副本 dev 生命周期/预览路由收口）。
+    /// 段缺失/None/enabled=false → 不装配（全部现状行为）。K8s 经 helm 渲染。
+    #[serde(default)]
+    pub preview_coordinator: Option<preview_coordinator::CoordinatorConfig>,
+    /// Docker 配置(docker 运行时读,K8s 不读)
+    pub docker_config: Option<DockerConfig>,
+    /// deploy-host 宿主机形态 Reach 寻址配置（容器端口如何被宿主机拨号；
+    /// docker/K8s 容器形态忽略。模式进程级一次——容器创建前决定，
+    /// Docker 创建后不能补绑端口）
+    #[serde(default)]
+    pub deploy_host: DeployHostConfig,
+    /// K8s 运行时配置(K8s 运行时读,docker 不读;与 docker_config 完全分家)
+    ///
+    /// docker 部署下此键缺失 → None;AppConfig 无 deny_unknown_fields,
+    /// 故 docker 部署即使误带 kubernetes_config 键也不会报错(被忽略)。
+    #[serde(default)]
+    pub kubernetes_config: Option<shared_types::KubernetesConfig>,
+    /// 容器清理配置
+    #[serde(default)]
+    pub cleanup_config: CleanupConfigSettings,
+    /// Userapp 闲置自动回收 + 流量唤醒配置
+    #[serde(default)]
+    pub userapp_recycle: UserAppRecycleConfig,
+    /// 存储后端配置（rcoder-pg：memory=纯内存单节点，postgres=PG 持久化）
+    #[serde(default)]
+    pub storage: StorageConfig,
+    /// Durable userApp control plane, independent of Agent storage.
+    #[serde(default)]
+    pub userapp_storage: UserAppStorageConfig,
+    /// API Key 鉴权配置
+    #[serde(default)]
+    pub api_key_auth: ApiKeyAuthConfig,
+    /// 应用管理配置
+    #[serde(default)]
+    pub app_manager: app_manager::AppManagerConfig,
+    /// UserApp 错误页存储/加载配置（段缺失 → 不装配外部存储：内置页兜底、
+    /// 管理上传返回存储未配置；不影响代理失败响应本身）
+    #[serde(default)]
+    pub userapp_error_page: Option<UserAppErrorPageConfig>,
+    /// 围栏 holder 死亡兜底收束的超龄门槛（秒）；None/缺省 = 默认 900s
+    /// （≫ 操作 deadline + 租约 TTL 60s）。RecoveryRequired 围栏超龄且持有者
+    /// 已死（无租约绑定 / 物理租约过期）→ 自动收束 Failed，不再永久占受理 slot。
+    #[serde(default)]
+    pub fence_settle_grace_secs: Option<u64>,
+}
+
+pub(crate) fn default_agent_id() -> String {
+    shared_types::DEFAULT_AGENT_ID.to_string()
+}
+
+/// 生成随机 API Key
+/// 使用 UUID v4 生成随机密钥，格式：sk-{uuid}
+pub(crate) fn generate_random_api_key() -> String {
+    use uuid::Uuid;
+    let uuid = Uuid::new_v4();
+    format!("sk-{}", uuid.simple())
+}
+
+pub const CONFIG_FILE: &str = "config.yml";
+
+/// config 文件定位：默认 CWD 相对 `config.yml`（容器形态，既有行为）；
+/// deploy-host 宿主机形态解析 `~/.rcoder/config.yml`（env `RCODER_CONFIG_FILE`
+/// 可覆盖）——宿主机形态自包含、不依赖仓库 cwd。
+pub fn config_file_path() -> PathBuf {
+    if let Some(explicit) = std::env::var_os("RCODER_CONFIG_FILE").filter(|value| !value.is_empty())
+    {
+        return PathBuf::from(explicit);
+    }
+    #[cfg(feature = "deploy-host")]
+    if shared_types::is_deploy_host()
+        && let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty())
+    {
+        return PathBuf::from(home).join(".rcoder").join(CONFIG_FILE);
+    }
+    PathBuf::from(CONFIG_FILE)
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            default_agent_id: default_agent_id(),
+            projects_dir: PathBuf::from("./project_workspace"),
+            port: 8087,
+            proxy_config: Some(ProxyConfig::default()),
+            file_server_proxy: None,
+            preview_coordinator: None,
+            docker_config: Some(DockerConfig::default()),
+            deploy_host: DeployHostConfig::default(),
+            kubernetes_config: None,
+            cleanup_config: CleanupConfigSettings::default(),
+            userapp_recycle: UserAppRecycleConfig::default(),
+            userapp_error_page: None,
+            storage: StorageConfig::default(),
+            userapp_storage: UserAppStorageConfig::default(),
+            api_key_auth: ApiKeyAuthConfig {
+                enabled: false,
+                api_key: generate_random_api_key(),
+            },
+            app_manager: app_manager::AppManagerConfig::default(),
+            fence_settle_grace_secs: None,
+        }
+    }
+}
+
+mod loader;
+mod sections;
+
+pub use loader::{
+    apply_api_key_env_overrides, load_api_key_config_from_file, load_config_for_cli,
+    load_config_with_args, parse_api_key_config,
+};
+pub use sections::{
+    CleanupConfigSettings, DeployHostConfig, DockerConfig, ProxyConfig, UserAppRecycleConfig,
+};

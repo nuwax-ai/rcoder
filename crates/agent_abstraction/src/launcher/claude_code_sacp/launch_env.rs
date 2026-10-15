@@ -168,6 +168,7 @@ pub(super) async fn resolve_agent_command(
 
     // 🔧 解析 {PREFIX_WORKSPACE_DIR} 占位符
     // 根据不同场景解析为不同的路径：
+    // - 环境变量 LOG_DIR/OPENCODE_LOG_DIR + UserappBuilder → USERAPP_LOG_DIR（PVC 持久）
     // - 环境变量 LOG_DIR/OPENCODE_LOG_DIR + devcomputer → /home/user/
     // - 环境变量 LOG_DIR/OPENCODE_LOG_DIR + computer → /app/container-logs
     // - command / args → /home/user/
@@ -175,14 +176,19 @@ pub(super) async fn resolve_agent_command(
 
     // 解析 command 中的 {PREFIX_WORKSPACE_DIR}
     let mut resolved_command = command_path.clone();
-    render_prefix_workspace_dir(&mut resolved_command, None, is_devcomputer);
+    render_prefix_workspace_dir(
+        &mut resolved_command,
+        None,
+        is_devcomputer,
+        &start_config.service_type,
+    );
 
     // 解析 args 中的 {PREFIX_WORKSPACE_DIR}
     let resolved_args: Vec<String> = command_args
         .iter()
         .map(|arg| {
             let mut arg = arg.clone();
-            render_prefix_workspace_dir(&mut arg, None, is_devcomputer);
+            render_prefix_workspace_dir(&mut arg, None, is_devcomputer, &start_config.service_type);
             arg
         })
         .collect();
@@ -192,7 +198,12 @@ pub(super) async fn resolve_agent_command(
         .iter()
         .map(|(k, v)| {
             let mut v = v.clone();
-            render_prefix_workspace_dir(&mut v, Some(k), is_devcomputer);
+            render_prefix_workspace_dir(
+                &mut v,
+                Some(k),
+                is_devcomputer,
+                &start_config.service_type,
+            );
             (k.clone(), v)
         })
         .collect();

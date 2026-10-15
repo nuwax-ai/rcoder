@@ -1,40 +1,191 @@
 //! `/api/computer` HTTP handlers (对齐 nuwax computerRoutes)。
 //!
-//! computer 工作区路径: `{COMPUTER_WORKSPACE_ROOT}/{userId}/{cId}/`。
+//! computer 工作区路径: `{COMPUTER_WORKSPACE_ROOT}/{userId}/{cId}/`
+//! (或用户维度工作目录 workspacePath, 对齐 TS 1.4.5)。
 //!
-//! 拆分: [`files`] (get-file-list / files-update / upload / import / delete-workspace) /
+//! 拆分: [`files_read`] (get-file-list / resolve-file / search-files) /
+//! [`files`] (files-update / upload / generate-file / import-project / delete-workspace) /
 //! [`archive`] (zip-workspace / download-all-files) / [`workspace`] (create-workspace /
-//! push-skills / init-project-template) / [`exec`] (execute-command / install-project /
-//! get-logs / build-agent-package / cleanup-build-artifacts)。本 mod.rs 仅提供跨组共享 helper。
+//! push-skills / init-project-template) / [`exec`] (execute-command / get-logs) /
+//! [`packages`] (install-project / build-agent-package / cleanup-build-artifacts)。
+//! 本 mod.rs 仅提供跨组共享 helper。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::AppState;
 use crate::error::AppError;
 use crate::workspace::ComputerContext;
-use serde::Deserialize;
-
-use super::multipart::{file_field, text_field, validate_zip_ext};
 
 // ID 字段反序列化 helper (deserialize_id_string / deserialize_optional_id_string) 已提升至
 // `crate::extract`, 供 computer / project 等所有 handler 共用。
 
-pub(crate) mod archive;
-pub(crate) mod exec;
-pub(crate) mod files;
-mod process_capture;
-pub(crate) mod workspace;
+pub mod archive;
+pub mod exec;
+pub mod files;
+pub mod files_read;
+pub mod fs_browser;
+pub mod packages;
+pub mod workspace;
 
 // ── 跨组共享 helper (子模块经 super:: 访问) ──────────────────────────────────────
 
-async fn ws_path(state: &AppState, user_id: &str, cid: &str) -> Result<PathBuf, AppError> {
-    state
-        .resolver
-        .resolve_computer(&ComputerContext {
-            user_id: user_id.to_string(),
-            cid: cid.to_string(),
-        })
-        .await
+/// 请求级 serviceContext 显式通道（body/query 字段——header 通道由中间件
+/// task-local 承担，收口内合并：header 优先 > 显式字段，对齐 TS
+/// `resolveServiceContext` 的 merged 取值序）。
+#[derive(Default)]
+pub(crate) struct ServiceScope<'a> {
+    /// body/query 的 `workspaceType` 字段（R06：定位显式通道，优先于 serviceType）
+    pub workspace_type: Option<&'a str>,
+    /// body/query 的旧 `serviceType` 字段（R06：回退通道，归一化在收口内做）
+    pub service_type: Option<&'a str>,
+    /// body/query 的 `appId` 字段
+    pub app_id: Option<&'a str>,
+    /// body/query 的 `workspacePath` 字段（与 header 的合并在收口内做）
+    pub workspace_path: Option<&'a str>,
+}
+
+async fn ws_path(
+    state: &AppState,
+    user_id: &str,
+    cid: &str,
+    scope: ServiceScope<'_>,
+) -> Result<PathBuf, AppError> {
+    computer_root_for_request(state, user_id, cid, scope).await
+}
+
+/// computer 域请求根目录（通道合并薄壳）：header（task-local）优先 > 显式
+/// body/query 字段，合并后调 [`computer_root_for_context`] 核心收口。
+pub(crate) async fn computer_root_for_request(
+    state: &AppState,
+    user_id: &str,
+    cid: &str,
+    scope: ServiceScope<'_>,
+) -> Result<PathBuf, AppError> {
+    computer_root_for_context(
+        state,
+        user_id,
+        cid,
+        crate::extract::merged_workspace_kind(scope.workspace_type, scope.service_type)?,
+        crate::extract::merged_request_app_id(scope.app_id).as_deref(),
+        scope.workspace_path,
+    )
+    .await
+}
+
+/// computer 域定位核心（服务场景类型 + 用户维度工作目录的**单一收口**——
+/// task-local 薄壳与 git 族 serviceContext 分支共用，消除多处独立 if 的漂移面）。
+///
+/// `kind`/`app_id` 由调用方合并（header 通道 task-local 或 body/query 显式值）；
+/// `workspace_path` 传入**未与 header 合并**的显式值，本函数内经
+/// [`crate::extract::merged_workspace_path`] 合并（header 优先）。
+///
+/// 定位优先级（对齐 TS 1.4.5 `resolveWorkspaceDir`）：
+/// 1. **用户维度工作目录 workspacePath**（header `x-workspace-path` > body/query
+///    显式值，经 [`crate::extract::merged_workspace_path`] 合并）→
+///    [`crate::workspace::normalize_workspace_path`] fail-fast 校验后直接使用
+///    （优先认传入）。短路在服务类型分派与 resolver **之前**——不经 Subvolume
+///    resolver 的 ensure-PVC 副作用（携带非法路径的请求不得创建 PVC）。信任模型
+///    与 customTargetDir 一致（不做根白名单，容器/沙箱内网部署）。
+///    ⚠️ single-app 模式（生产运行容器）fail-closed 拒绝——运行容器只服务
+///    本 app 卷，与 customTargetDir 在该模式的收紧先例一致（workspace.rs
+///    `resolve_userapp_dev`）；TS 无 single-app 概念，此为有意偏离。
+/// 2. userApp 分流（kind=userapp，经反向代理/rcoder 拦截层透传）：
+///    workspace 切到开发卷 `{USERAPP_WORKSPACE_DIR}/{app_id}`。**app_id 是独立
+///    字段**（header `x-app-id` > query `appId`，见 [`crate::extract::userapp_app_id`]），
+///    cId 是会话字段**不参与** userapp 定位（勿兼任）；缺失 fail-fast。
+/// 3. normalProject 分流（kind=normalProject，常规项目共享工作区，同一物理
+///    布局的两种部署视角，对齐 TS 1.4.8 `resolveWorkspaceDir`）：沙箱形态
+///    （`PROJECT_SOURCE_DIR` env 注入）`{PROJECT_SOURCE_DIR}/normalProject/{projectId}`
+///    （userId 层被 computer 挂载吸收）；主容器形态（未注入，rcoder 主 Pod /
+///    cutover 接管 TS 存量域）`{COMPUTER_WORKSPACE_DIR}/{userId}/normalProject/{projectId}`。
+///    projectId 复用 app_id 通道传递，TS 字面规则不走 WorkspaceResolver；
+///    app_id 缺失 fail-fast（文案对齐 TS）。⚠️ TS 侧 projectId 不过路径段校验，
+///    此处过 [`crate::workspace`] identifier 校验为有意加固（进宿主树路径拼接，
+///    与 resolve_userapp_dev 同源纪律；主容器形态 userId 同理）。
+/// 4. 默认 resolver（pageApp/taskAgent/缺省：Local `{root}/{userId}/{cId}` /
+///    Subvolume per-agent PVC）。
+pub(crate) async fn computer_root_for_context(
+    state: &AppState,
+    user_id: &str,
+    cid: &str,
+    kind: Option<shared_types::ComputerServiceKind>,
+    app_id: Option<&str>,
+    workspace_path: Option<&str>,
+) -> Result<PathBuf, AppError> {
+    let single_app = state
+        .config
+        .userapp_single_app_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
+    if let Some(raw) = crate::extract::merged_workspace_path(workspace_path) {
+        if single_app {
+            return Err(AppError::validation(
+                "workspacePath is not allowed in single-app mode \
+                 (this container serves its own app volume only)",
+            ));
+        }
+        let dir = crate::workspace::normalize_workspace_path(&raw)?;
+        return Ok(PathBuf::from(dir));
+    }
+    match kind {
+        Some(shared_types::ComputerServiceKind::Userapp) => {
+            let app_id = crate::extract::non_empty_trimmed(app_id).ok_or_else(|| {
+                AppError::validation(
+                    "userapp request missing app_id: pass `X-App-Id` header or query `appId`",
+                )
+            })?;
+            crate::workspace::resolve_userapp_dev(app_id, None, &state.config)
+        }
+        Some(shared_types::ComputerServiceKind::NormalProject) => {
+            if single_app {
+                return Err(AppError::validation(
+                    "normalProject is not supported in single-app mode \
+                     (this container serves its own app volume only)",
+                ));
+            }
+            let app_id = crate::extract::non_empty_trimmed(app_id).ok_or_else(|| {
+                AppError::validation("appId(projectId) is required for normalProject workspace")
+            })?;
+            shared_types::validate_identifier(app_id, "appId").map_err(AppError::validation)?;
+            // 同一物理布局的两种部署视角（对齐 TS 1.4.8 resolveWorkspaceDir）：
+            // - 沙箱形态（PROJECT_SOURCE_DIR=/home/user 由 start-up.sh 注入，
+            //   userId 层被 computer 挂载吸收）：{PROJECT_SOURCE_DIR}/normalProject/
+            //   {projectId}，与 agent cwd（chat resolve_project_dir / ttyd cwd）
+            //   三方同根；
+            // - 主容器形态（rcoder 主 Pod / cutover 接管 TS 存量域，未注入该
+            //   env）：{COMPUTER_WORKSPACE_DIR}/{userId}/normalProject/{projectId}，
+            //   userId 层主容器视角显式存在。
+            // 目录段统一小写 normalProject（存量大写 NormalProject 目录不迁移，
+            // 新旧不互通）；旧公式大写段已废弃。
+            if state.config.project_source_dir_explicit {
+                Ok(state
+                    .config
+                    .project_source_dir
+                    .join("normalProject")
+                    .join(app_id))
+            } else {
+                shared_types::validate_identifier(user_id, "userId")
+                    .map_err(AppError::validation)?;
+                Ok(state
+                    .config
+                    .computer_workspace_dir
+                    .join(user_id)
+                    .join("normalProject")
+                    .join(app_id))
+            }
+        }
+        // pageApp / taskAgent / 缺省：默认 resolver
+        _ => {
+            state
+                .resolver
+                .resolve_computer(&ComputerContext {
+                    user_id: user_id.to_string(),
+                    cid: cid.to_string(),
+                })
+                .await
+        }
+    }
 }
 
 /// computer 目标路径: `customTargetDir` trim 后非空则用之, 否则回退默认工作区 (对齐 nuwax)。
@@ -43,27 +194,645 @@ async fn ws_path(state: &AppState, user_id: &str, cid: &str) -> Result<PathBuf, 
 /// 产品运行于容器内、内网私有化部署, 且用户客户端复用本 file-server 模块逻辑,
 /// 每个用户电脑上的路径各不相同, 限制根路径会误伤正常业务;
 /// 其内部相对路径仍由 [`crate::path_safety::ensure_within`] 防逃逸。
+///
+/// 优先级（对齐 TS 1.4.5 targetDir 链）: customTargetDir > workspacePath > 默认。
 async fn resolve_computer_target(
     state: &AppState,
     user_id: &str,
     cid: &str,
     custom_target_dir: Option<&str>,
+    scope: ServiceScope<'_>,
 ) -> Result<PathBuf, AppError> {
-    let default_path = ws_path(state, user_id, cid).await?;
+    let default_path = ws_path(state, user_id, cid, scope).await?;
     match custom_target_dir.map(str::trim).filter(|s| !s.is_empty()) {
         Some(ct) => Ok(PathBuf::from(ct)),
         None => Ok(default_path),
     }
 }
 
-#[derive(Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct UserCidQuery {
-    pub user_id: String,
-    pub c_id: String,
-    #[serde(default)]
-    pub proxy_path: Option<String>,
-    #[serde(default)]
-    pub custom_target_dir: Option<String>,
+/// agent-store 用户级根目录（create-workspace-v2 / push-skills 实体存储的锚定点，
+/// 对齐 TS `agentStoreUtils.getAgentStorePath`——store **始终锚定配置根**，
+/// 不随会话绑定目录漂移，防 `.agent-store` 写进绑定目录的任意父目录）：
+///
+/// - userapp 分流 → `{USERAPP_WORKSPACE_DIR}`（开发卷自身，无 userId 段）
+/// - normalProject 分流 → 用户根（与 taskAgent 同一实体子树——同一智能体
+///   全局一份实体，对齐 TS 1.4.8；两部署视角：主容器 `{COMPUTER_WORKSPACE_DIR}/{userId}` /
+///   沙箱 `PROJECT_SOURCE_DIR`，与定位收口同源分流）
+/// - 用户维度工作目录（非 userapp）→ 用户根（同上两视角）
+/// - 默认 → `ws.parent()`（Local=`{root}/{userId}` 与 TS 等价；
+///   Subvolume=per-user PVC 稳定根，既有阶段 2 语义不动）
+///
+/// `session_workspace` 与 `user_root` 解耦的原因：默认布局下两者同树
+/// （ws = user_root/cid），绑定布局下会话工作区=绑定目录、store=配置根，
+/// 不能再从 `user_root.join(cid)` 倒推会话目录（见
+/// `computer_ws::create_workspace_with_agent_store` 的显式 session_workspace 参数）。
+pub(crate) fn agent_store_user_root(
+    state: &AppState,
+    user_id: &str,
+    ws: &Path,
+    workspace_path: Option<&str>,
+) -> Result<PathBuf, AppError> {
+    if crate::extract::is_userapp_request() {
+        return Ok(state.config.userapp_workspace_dir.clone());
+    }
+    // normalProject 与用户维度工作目录（非 userapp）同锚点：store 锚定用户根
+    // 不随绑定漂移——用户根的两种部署视角（与 NormalProject 定位分流同源）：
+    // 沙箱形态=PROJECT_SOURCE_DIR（/home/user，userId 层被 computer 挂载吸收）；
+    // 主容器形态={COMPUTER_WORKSPACE_DIR}/{userId}（对齐 TS 1.4.8）。
+    // F03：与定位收口同源（merged kind，header 优先 > body）——body-only
+    // normalProject 的 store 根同样锚定用户根，不再依赖 header 通道存在
+    if crate::extract::workspace_kind() == Some(shared_types::ComputerServiceKind::NormalProject)
+        || crate::extract::merged_workspace_path(workspace_path).is_some()
+    {
+        if state.config.project_source_dir_explicit {
+            return Ok(state.config.project_source_dir.clone());
+        }
+        shared_types::validate_identifier(user_id, "userId").map_err(AppError::validation)?;
+        return Ok(state.config.computer_workspace_dir.join(user_id));
+    }
+    Ok(ws.parent().unwrap_or(ws).to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::error::AppResult;
+    use crate::workspace::{ComputerContext, ProjectContext, WorkspaceResolver};
+
+    /// 计数 mock resolver: 记录 resolve_computer 调用次数——
+    /// 断言"绑定时 resolver 零调用"(防 Subvolume ensure-PVC 副作用回归的核心探针)。
+    struct CountingResolver {
+        root: PathBuf,
+        computer_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl WorkspaceResolver for CountingResolver {
+        async fn resolve_project(&self, _ctx: &ProjectContext) -> AppResult<PathBuf> {
+            Err(AppError::system("computer 域测试不触达 resolve_project"))
+        }
+
+        async fn resolve_computer(&self, ctx: &ComputerContext) -> AppResult<PathBuf> {
+            self.computer_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.root.join(&ctx.user_id).join(&ctx.cid))
+        }
+    }
+
+    fn make_state() -> (AppState, Arc<CountingResolver>) {
+        let config = Arc::new(crate::Config::default());
+        let resolver = Arc::new(CountingResolver {
+            root: config.computer_workspace_dir.clone(),
+            computer_calls: AtomicUsize::new(0),
+        });
+        let state = AppState {
+            resolver: resolver.clone(),
+            dev_server: Arc::new(crate::DevServerManager::new(config.clone())),
+            build_manager: Arc::new(crate::BuildManager::new(config.max_build_concurrency)),
+            log_cache: Arc::new(crate::LogCacheManager::new(&config)),
+            skill_downloader: Arc::new(
+                crate::SkillDownloader::new(&config).expect("construct skill downloader"),
+            ),
+            config,
+            preview: None,
+            started_at: std::time::Instant::now(),
+        };
+        (state, resolver)
+    }
+
+    #[tokio::test]
+    async fn no_binding_resolves_default_two_level() {
+        let (state, resolver) = make_state();
+        let path = computer_root_for_request(&state, "u1", "c1", ServiceScope::default())
+            .await
+            .expect("resolve default");
+        // 默认二级布局 {computer_root}/{user}/{cid} (现状回归)
+        assert_eq!(
+            path,
+            state.config.computer_workspace_dir.join("u1").join("c1")
+        );
+        assert_eq!(resolver.computer_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn bound_dir_short_circuits_resolver_and_normalizes() {
+        let (state, resolver) = make_state();
+        // 反斜杠输入 → 归一为 / (对齐 TS canonicalizeDir)
+        let path = computer_root_for_request(
+            &state,
+            "u1",
+            "c1",
+            ServiceScope {
+                workspace_path: Some("/tmp/bound\\\\ws"),
+                ..ServiceScope::default()
+            },
+        )
+        .await
+        .expect("resolve bound");
+        assert_eq!(path, PathBuf::from("/tmp/bound/ws"));
+        // 绑定短路在 resolver 之前: 零调用 (Subvolume ensure-PVC 副作用不可达)
+        assert_eq!(resolver.computer_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn bound_dir_wins_over_userapp_flag() {
+        let (state, resolver) = make_state();
+        let path = scope_kind(shared_types::ComputerServiceKind::Userapp, None, async {
+            computer_root_for_request(
+                &state,
+                "u1",
+                "c1",
+                ServiceScope {
+                    workspace_path: Some("/tmp/bound"),
+                    ..ServiceScope::default()
+                },
+            )
+            .await
+        })
+        .await
+        .expect("bound wins over userapp");
+        assert_eq!(path, PathBuf::from("/tmp/bound"));
+        assert_eq!(resolver.computer_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn userapp_flag_resolves_by_independent_app_id() {
+        let (state, _resolver) = make_state();
+        // app_id 是独立字段（task-local 两级提取的结果）；cId 传任意会话值
+        // 证明不参与 userapp 定位（勿让会话字段兼任 app_id）
+        let path = scope_kind(
+            shared_types::ComputerServiceKind::Userapp,
+            Some("app-9"),
+            async {
+                computer_root_for_request(&state, "u1", "1561913", ServiceScope::default()).await
+            },
+        )
+        .await
+        .expect("userapp dev volume");
+        assert_eq!(path, state.config.userapp_workspace_dir.join("app-9"));
+    }
+
+    #[tokio::test]
+    async fn userapp_flag_without_app_id_fails_fast() {
+        let (state, resolver) = make_state();
+        let err = scope_kind(shared_types::ComputerServiceKind::Userapp, None, async {
+            computer_root_for_request(&state, "u1", "app-9", ServiceScope::default()).await
+        })
+        .await
+        .expect_err("missing app_id must fail fast");
+        assert!(
+            matches!(err, AppError::Validation(..)),
+            "缺 app_id 应 4xx 校验错: {err:?}"
+        );
+        assert!(err.to_string().contains("missing app_id"));
+        // 不触达 resolver（userapp 域与 computer 默认定位互不相干）
+        assert_eq!(resolver.computer_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn userapp_app_id_blank_treated_as_missing() {
+        let (state, _resolver) = make_state();
+        // 空白串视为未携带（与 header trim 语义一致）→ 同样 fail-fast
+        let err = scope_kind(
+            shared_types::ComputerServiceKind::Userapp,
+            Some("  "),
+            async { computer_root_for_request(&state, "u1", "c1", ServiceScope::default()).await },
+        )
+        .await
+        .expect_err("blank app_id must fail fast");
+        assert!(err.to_string().contains("missing app_id"));
+    }
+
+    #[tokio::test]
+    async fn normal_project_resolves_shared_workspace_by_project_id() {
+        let (mut state, resolver) = make_state();
+        // 常规项目共享工作区（projectId 复用 app_id 通道；cId 会话字段不参与）。
+        // 主容器形态（默认：PROJECT_SOURCE_DIR 未注入）= {CWS}/{userId}/normalProject/{id}
+        let path = scope_kind(
+            shared_types::ComputerServiceKind::NormalProject,
+            Some("proj-7"),
+            async {
+                computer_root_for_request(&state, "u1", "1561913", ServiceScope::default()).await
+            },
+        )
+        .await
+        .expect("normalProject workspace");
+        assert_eq!(
+            path,
+            state
+                .config
+                .computer_workspace_dir
+                .join("u1")
+                .join("normalProject")
+                .join("proj-7")
+        );
+        // 沙箱形态（env 注入标记）= {PROJECT_SOURCE_DIR}/normalProject/{id}
+        // （userId 层被挂载吸收）
+        state.config = Arc::new(crate::Config {
+            project_source_dir_explicit: true,
+            ..(*state.config).clone()
+        });
+        let path = scope_kind(
+            shared_types::ComputerServiceKind::NormalProject,
+            Some("proj-7"),
+            async {
+                computer_root_for_request(&state, "u1", "1561913", ServiceScope::default()).await
+            },
+        )
+        .await
+        .expect("normalProject workspace (sandbox form)");
+        assert_eq!(
+            path,
+            state
+                .config
+                .project_source_dir
+                .join("normalProject")
+                .join("proj-7")
+        );
+        assert_eq!(resolver.computer_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn normal_project_without_app_id_fails_fast() {
+        let (state, _resolver) = make_state();
+        let err = scope_kind(
+            shared_types::ComputerServiceKind::NormalProject,
+            None,
+            async { computer_root_for_request(&state, "u1", "c1", ServiceScope::default()).await },
+        )
+        .await
+        .expect_err("normalProject missing projectId must fail fast");
+        assert!(
+            err.to_string()
+                .contains("appId(projectId) is required for normalProject")
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_project_rejects_path_traversal_project_id() {
+        let (state, _resolver) = make_state();
+        // TS 侧 projectId 不过路径段校验；Rust 有意加固（进宿主树路径拼接）
+        let err = scope_kind(
+            shared_types::ComputerServiceKind::NormalProject,
+            Some("../escape"),
+            async { computer_root_for_request(&state, "u1", "c1", ServiceScope::default()).await },
+        )
+        .await
+        .expect_err("traversal projectId must be rejected");
+        assert!(matches!(err, AppError::Validation(..)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn normal_project_rejected_in_single_app_mode() {
+        let (mut state, _resolver) = make_state();
+        state.config = Arc::new(crate::Config {
+            userapp_single_app_id: Some("app-owned".into()),
+            ..crate::Config::default()
+        });
+        let err = scope_kind(
+            shared_types::ComputerServiceKind::NormalProject,
+            Some("proj-7"),
+            async { computer_root_for_request(&state, "u1", "c1", ServiceScope::default()).await },
+        )
+        .await
+        .expect_err("single-app must reject normalProject");
+        assert!(err.to_string().contains("single-app"));
+    }
+
+    /// 测试助手：同时 scope 服务场景类型与独立 app_id（模拟中间件注入形态）。
+    async fn scope_kind<F, T>(
+        kind: shared_types::ComputerServiceKind,
+        app_id: Option<&str>,
+        f: F,
+    ) -> T
+    where
+        F: Future<Output = T>,
+    {
+        let app_id = app_id.map(str::to_string);
+        crate::extract::WORKSPACE_KIND
+            .scope(Some(kind), async move {
+                crate::extract::USERAPP_APP_ID.scope(app_id, f).await
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn invalid_bound_dirs_fail_fast_400() {
+        let (state, resolver) = make_state();
+        for bad in ["relative/path", "/a/../b", "C:", "/a/./b"] {
+            let err = computer_root_for_request(
+                &state,
+                "u1",
+                "c1",
+                ServiceScope {
+                    workspace_path: Some(bad),
+                    ..ServiceScope::default()
+                },
+            )
+            .await
+            .expect_err(bad);
+            assert!(matches!(err, AppError::Validation(..)), "{bad}: {err:?}");
+        }
+        // 无效绑定同样不触达 resolver
+        assert_eq!(resolver.computer_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn single_app_mode_rejects_bound_dir() {
+        let (mut state, _resolver) = make_state();
+        state.config = Arc::new(crate::Config {
+            userapp_single_app_id: Some("app-owned".into()),
+            ..crate::Config::default()
+        });
+        let err = computer_root_for_request(
+            &state,
+            "u1",
+            "c1",
+            ServiceScope {
+                workspace_path: Some("/tmp/bound"),
+                ..ServiceScope::default()
+            },
+        )
+        .await
+        .expect_err("single-app must reject binding");
+        assert!(err.to_string().contains("single-app"));
+    }
+
+    #[tokio::test]
+    async fn custom_target_dir_wins_over_bound_dir() {
+        // 优先级: customTargetDir > workspacePath > 默认 (对齐 TS targetDir 链)
+        let (state, resolver) = make_state();
+        let path = resolve_computer_target(
+            &state,
+            "u1",
+            "c1",
+            Some("/tmp/custom-target"),
+            ServiceScope {
+                workspace_path: Some("/tmp/bound"),
+                ..ServiceScope::default()
+            },
+        )
+        .await
+        .expect("custom wins");
+        assert_eq!(path, PathBuf::from("/tmp/custom-target"));
+        assert_eq!(resolver.computer_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn agent_store_user_root_anchors_per_layout() {
+        let (mut state, _resolver) = make_state();
+
+        // 默认布局: ws.parent() (Local={root}/{userId} 与 TS 等价)
+        let ws = state.config.computer_workspace_dir.join("u1").join("c1");
+        assert_eq!(
+            agent_store_user_root(&state, "u1", &ws, None).expect("valid store root"),
+            state.config.computer_workspace_dir.join("u1")
+        );
+
+        // 用户维度工作目录布局: store 锚定用户根, 不随绑定漂移——主容器形态
+        // （默认：PROJECT_SOURCE_DIR 未注入）= {CWS}/{userId}（对齐 TS 1.4.8）
+        assert_eq!(
+            agent_store_user_root(&state, "u1", Path::new("/tmp/bound"), Some("/tmp/bound"))
+                .expect("valid store root"),
+            state.config.computer_workspace_dir.join("u1")
+        );
+
+        // userapp 分流: 开发卷自身 (无 userId 段)
+        let root = scope_kind(shared_types::ComputerServiceKind::Userapp, None, async {
+            agent_store_user_root(&state, "u1", Path::new("/any/ws"), None)
+                .expect("valid store root")
+        })
+        .await;
+        assert_eq!(root, state.config.userapp_workspace_dir);
+
+        // normalProject 分流: 与 taskAgent 同一实体子树锚点（主容器形态={CWS}/{userId}）
+        let root = scope_kind(
+            shared_types::ComputerServiceKind::NormalProject,
+            Some("proj-7"),
+            async {
+                agent_store_user_root(&state, "u1", Path::new("/any/ws"), None)
+                    .expect("valid store root")
+            },
+        )
+        .await;
+        assert_eq!(root, state.config.computer_workspace_dir.join("u1"));
+
+        // 沙箱形态（PROJECT_SOURCE_DIR env 注入标记）: 用户根=PROJECT_SOURCE_DIR
+        // （/home/user，userId 层被挂载吸收）——绑定与 normalProject 两臂同锚
+        state.config = Arc::new(crate::Config {
+            project_source_dir_explicit: true,
+            ..(*state.config).clone()
+        });
+        assert_eq!(
+            agent_store_user_root(&state, "u1", Path::new("/tmp/bound"), Some("/tmp/bound"))
+                .expect("valid store root"),
+            state.config.project_source_dir
+        );
+        let root = scope_kind(
+            shared_types::ComputerServiceKind::NormalProject,
+            Some("proj-7"),
+            async {
+                agent_store_user_root(&state, "u1", Path::new("/any/ws"), None)
+                    .expect("valid store root")
+            },
+        )
+        .await;
+        assert_eq!(root, state.config.project_source_dir);
+    }
+    /// body/query 显式 serviceType 通道（P1 回归锁，对齐 TS `resolveServiceContext`
+    /// 的 header > body/query 合并序）：无 header 时显式 `serviceType=normalProject`
+    /// + `appId` 必须走 NormalProject 共享工作区定位——此前实现只读 header 通道，
+    /// 该请求静默落默认 `{CWS}/{userId}/{cId}`，读写目标与 TS 上游分歧。
+    #[tokio::test]
+    async fn legacy_service_type_body_does_not_select_normal_project() {
+        // B06：body serviceType 是运行时路由概念——不参与目录定位，
+        // 仅带旧字段 + appId 时落缺省 taskAgent 布局（TS 同款）。
+        let (state, resolver) = make_state();
+        let path = computer_root_for_request(
+            &state,
+            "u1",
+            "c1",
+            ServiceScope {
+                service_type: Some("normalProject"),
+                workspace_type: None,
+                app_id: Some("proj-7"),
+                workspace_path: None,
+            },
+        )
+        .await
+        .expect("legacy body field still parses; location falls to default");
+        assert_eq!(
+            path,
+            resolver
+                .root
+                .join("u1")
+                .join("c1")
+                .to_string_lossy()
+                .to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_workspace_type_body_resolves_normal_project() {
+        let (mut state, resolver) = make_state();
+        let path = computer_root_for_request(
+            &state,
+            "u1",
+            "c1",
+            ServiceScope {
+                service_type: None,
+                workspace_type: Some("normalProject"),
+                app_id: Some("proj-7"),
+                workspace_path: None,
+            },
+        )
+        .await
+        .expect("explicit workspaceType resolves shared workspace");
+        // 主容器形态（默认：PROJECT_SOURCE_DIR 未注入）= {CWS}/{userId}/normalProject/{id}
+        assert_eq!(
+            path,
+            state
+                .config
+                .computer_workspace_dir
+                .join("u1")
+                .join("normalProject")
+                .join("proj-7")
+        );
+
+        // 沙箱形态（env 注入标记）= {PROJECT_SOURCE_DIR}/normalProject/{id}
+        // （userId 层被 computer 挂载吸收）
+        state.config = Arc::new(crate::Config {
+            project_source_dir_explicit: true,
+            ..(*state.config).clone()
+        });
+        let path = computer_root_for_request(
+            &state,
+            "u1",
+            "c1",
+            ServiceScope {
+                service_type: None,
+                workspace_type: Some("normalProject"),
+                app_id: Some("proj-7"),
+                workspace_path: None,
+            },
+        )
+        .await
+        .expect("sandbox form resolves shared workspace");
+        assert_eq!(
+            path,
+            state
+                .config
+                .project_source_dir
+                .join("normalProject")
+                .join("proj-7")
+        );
+        // 两形态同为 TS 字面规则，均不触达 resolver
+        assert_eq!(resolver.computer_calls.load(Ordering::SeqCst), 0);
+
+        // B06 对照：仅 body serviceType=userapp（无 workspaceType 通道）→
+        // 不参与定位，落缺省 taskAgent 布局（userapp 开发卷需显式
+        // workspace_type）
+        let path = computer_root_for_request(
+            &state,
+            "u1",
+            "c1",
+            ServiceScope {
+                service_type: Some("userapp"),
+                workspace_type: None,
+                app_id: Some("app-9"),
+                workspace_path: None,
+            },
+        )
+        .await
+        .expect("legacy userapp body field still parses; location falls to default");
+        assert_eq!(
+            path,
+            resolver
+                .root
+                .join("u1")
+                .join("c1")
+                .to_string_lossy()
+                .to_string()
+        );
+
+        // 显式 workspace_type=userapp 落开发卷（B06 正径）
+        let path = computer_root_for_request(
+            &state,
+            "u1",
+            "c1",
+            ServiceScope {
+                service_type: None,
+                workspace_type: Some("userapp"),
+                app_id: Some("app-9"),
+                workspace_path: None,
+            },
+        )
+        .await
+        .expect("explicit workspaceType userapp resolves dev volume");
+        assert_eq!(path, state.config.userapp_workspace_dir.join("app-9"));
+    }
+
+    /// 1.4.7 fail-fast（TS a29cbc0）：workspaceType 传了垃圾值（无法归一）→
+    /// 400 拒绝，不再静默回落缺省 `{CWS}/{userId}/{cId}` 布局——文件操作含
+    /// 破坏性，错误类型静默错定位是上游修复的核心缺陷。
+    #[tokio::test]
+    async fn garbage_workspace_type_rejected_instead_of_default_layout() {
+        let (state, resolver) = make_state();
+        let err = computer_root_for_request(
+            &state,
+            "u1",
+            "c1",
+            ServiceScope {
+                service_type: None,
+                workspace_type: Some("not-a-type"),
+                app_id: Some("proj-7"),
+                workspace_path: None,
+            },
+        )
+        .await
+        .expect_err("garbage workspaceType must fail fast");
+        assert!(matches!(err, AppError::Validation(..)), "{err:?}");
+        assert!(
+            err.to_string().contains(
+                "workspaceType must be one of userApp, pageApp, normalProject, taskAgent"
+            ),
+            "{err:?}"
+        );
+        // 静默回落形态（定位到默认布局）必须消失：resolver 零调用
+        assert_eq!(resolver.computer_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// header 通道优先于显式字段（TS 合并序锁）：header=taskAgent 显式传
+    /// normalProject → header 胜出落默认布局。
+    #[tokio::test]
+    async fn header_kind_wins_over_explicit_service_type() {
+        let (state, resolver) = make_state();
+        let path = scope_kind(shared_types::ComputerServiceKind::TaskAgent, None, async {
+            computer_root_for_request(
+                &state,
+                "u1",
+                "c1",
+                ServiceScope {
+                    service_type: Some("normalProject"),
+                    workspace_type: None,
+                    app_id: Some("proj-7"),
+                    workspace_path: None,
+                },
+            )
+            .await
+        })
+        .await
+        .expect("header wins");
+        assert_eq!(
+            path,
+            state.config.computer_workspace_dir.join("u1").join("c1")
+        );
+        assert_eq!(resolver.computer_calls.load(Ordering::SeqCst), 1);
+    }
 }

@@ -85,10 +85,7 @@ impl ServiceHealthChecker {
     /// 创建新的健康检查器
     pub fn new() -> Self {
         Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(HEALTH_CHECK_TIMEOUT_SECS))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            client: Self::build_client(),
             http_port: DEFAULT_HTTP_HEALTH_PORT,
             grpc_port: shared_types::GRPC_DEFAULT_PORT,
             timeout_secs: HEALTH_CHECK_TIMEOUT_SECS,
@@ -99,6 +96,33 @@ impl ServiceHealthChecker {
                     .build(),
             ),
         }
+    }
+
+    /// 构建带健康检查总超时的 HTTP 客户端。
+    ///
+    /// 构建失败（仅 TLS 后端初始化异常等极端场景）不再静默退化为无超时裸
+    /// `Client::new()`：warn 留痕后重试等价构建；二次仍失败才落默认客户端——
+    /// 届时 HTTP 检查仍受 `check_http_health` 外层 `tokio::time::timeout` 兜底。
+    fn build_client() -> Client {
+        Client::builder()
+            .timeout(Duration::from_secs(HEALTH_CHECK_TIMEOUT_SECS))
+            .build()
+            .unwrap_or_else(|error| {
+                warn!(
+                    "health check client build failed ({error}); rebuilding with {}s timeout",
+                    HEALTH_CHECK_TIMEOUT_SECS
+                );
+                Client::builder()
+                    .timeout(Duration::from_secs(HEALTH_CHECK_TIMEOUT_SECS))
+                    .build()
+                    .unwrap_or_else(|fallback_error| {
+                        warn!(
+                            "health check client fallback build failed ({fallback_error}); \
+                             using default client, HTTP timeout relies on outer tokio timeout"
+                        );
+                        Client::new()
+                    })
+            })
     }
 
     /// 使用自定义端口创建检查器

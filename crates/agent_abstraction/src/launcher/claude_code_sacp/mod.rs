@@ -22,5 +22,8 @@ pub use launcher_impl::SacpClaudeCodeLauncher;
 pub use mcp::{convert_context_servers_sacp, set_mcp_proxy_log_dir};
 pub use types::{SacpAgentLaunchConfig, SacpLauncherConnectionInfo};
 
+// 豁免仅限测试模块：edition-2024 的 env 变异（set_var/remove_var）是 unsafe，
+// 测试内有 ENV_TEST_LOCK 串行化保护（各处带 SAFETY 注释）
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests;

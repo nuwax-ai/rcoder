@@ -24,6 +24,48 @@ pub struct HostPathResolver {
     inspector: Option<Arc<ContainerSelfInspector>>,
 }
 
+#[cfg(feature = "deploy-host")]
+impl HostPathResolver {
+    /// deploy-host 宿主机模式构造器（Phase 2）。
+    ///
+    /// 不做容器自检（宿主机无 `/proc/self/cgroup`），挂载表来自
+    /// [`crate::path::host_map::resolve_map`]（默认 `~/.rcoder` 约定 + env
+    /// 覆盖）；最长前缀匹配复用 [`HostPathResolver::resolve_to_host_path`]
+    /// 的既有算法。工作区锚点取 `/app/project_workspace` 项（缺失则取表首项）。
+    pub fn new_host_mode() -> DockerResult<Self> {
+        let map = crate::path::host_map::resolve_map()?;
+        crate::path::host_map::ensure_host_roots(&map)?;
+        let mut all_mounts: Vec<(PathBuf, PathBuf)> = map.into_iter().collect();
+        // 与容器模式同款排序：容器路径长度降序，最具体路径优先匹配
+        all_mounts.sort_by_key(|m| std::cmp::Reverse(m.0.as_os_str().len()));
+        let (container_project_workspace, host_project_workspace) = all_mounts
+            .iter()
+            .find(|(container, _)| container == &PathBuf::from("/app/project_workspace"))
+            .or_else(|| all_mounts.first())
+            .cloned()
+            .ok_or_else(|| {
+                DockerError::ConfigurationError("deploy-host: path map is empty".to_owned())
+            })?;
+        info!(
+            "[deploy-host] host mode resolver: {} mounts, workspace {} -> {}",
+            all_mounts.len(),
+            container_project_workspace.display(),
+            host_project_workspace.display()
+        );
+        Ok(Self {
+            host_project_workspace,
+            container_project_workspace,
+            all_mounts,
+            inspector: None,
+        })
+    }
+
+    /// 映射表快照（启动日志/验收比对用）。
+    pub fn snapshot_map(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.all_mounts.clone()
+    }
+}
+
 impl HostPathResolver {
     /// 创建新的路径解析器（自动检测配置）
     ///
@@ -45,13 +87,21 @@ impl HostPathResolver {
     pub async fn new_with_docker_socket(docker_socket_path: Option<String>) -> DockerResult<Self> {
         debug!("startingcreated HostPathResolver");
 
-        // 创建容器自检器
+        // 创建容器自检器；未显式指定时沿用与 DockerManager::new 同源的
+        // 容器侧 socket 约定（DOCKER_SOCKET_PATH，如隔离测试的代理 socket）。
         let socket_path = docker_socket_path
             .as_deref()
-            .unwrap_or("/var/run/docker.sock");
+            .map(str::to_owned)
+            .or_else(|| {
+                std::env::var("DOCKER_SOCKET_PATH")
+                    .ok()
+                    .map(|socket| socket.trim().to_owned())
+                    .filter(|socket| !socket.is_empty())
+            })
+            .unwrap_or_else(|| "/var/run/docker.sock".to_owned());
 
         let inspector = Arc::new(
-            ContainerSelfInspector::new(socket_path)
+            ContainerSelfInspector::new(&socket_path)
                 .await
                 .map_err(|e| {
                     DockerError::ConfigurationError(format!(

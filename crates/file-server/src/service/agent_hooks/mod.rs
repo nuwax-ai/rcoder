@@ -14,10 +14,10 @@
 //!
 //! hook 配置是 schemaless 的嵌套 JSON, 用 `serde_json::Value` 透传处理。
 //!
-//! 子模块: [`claude`] (Claude Code settings/scripts) / [`parse`] (hooks 解析) /
-//! [`codex`] (Codex 转换 + shell 辅助) /
-//! [`opencode`] (vendored 插件) / [`scripts`] (外挂脚本) / [`staging`] (staging 预生成) /
-//! [`io_util`] (原子写) / [`types`] (输入类型)。
+//! 子模块: `claude` (Claude Code settings/scripts) / `parse` (hooks 解析) /
+//! `codex` (Codex 转换 + shell 辅助) /
+//! `opencode` (vendored 插件) / `scripts` (外挂脚本) / `staging` (staging 预生成) /
+//! `io_util` (原子写) / `types` (输入类型)。
 
 use std::path::Path;
 

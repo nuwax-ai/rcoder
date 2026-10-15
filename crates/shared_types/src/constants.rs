@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 pub struct FeatureFlags {
     /// 主线 Web/Computer per-agent PVC (per-agent subvolume + 配额 + lazy mv + batch migrate)
     pub per_agent_pvc: bool,
-    /// UserApp per-app PVC (新功能, 独立于主线; 依赖 cephfs-root 派生挂载 + SC Immediate)
+    /// Userapp per-app PVC (新功能, 独立于主线; 依赖 cephfs-root 派生挂载 + SC Immediate)
     pub userapp_per_app_pvc: bool,
     /// rcoder 嵌入 Rust file-server (替代 nuwax-file-server 独立进程)
     pub embed_file_server: bool,
@@ -42,7 +42,7 @@ impl FeatureFlags {
         );
     }
 
-    /// 取单例; 未 [`init`] 时 lazy 读 env (测试 / 忘记 init 兜底, 保证永远可用)。
+    /// 取单例; 未 [`Self::init`] 时 lazy 读 env (测试 / 忘记 init 兜底, 保证永远可用)。
     pub fn get() -> &'static FeatureFlags {
         FEATURE_FLAGS.get_or_init(Self::from_env)
     }
@@ -60,7 +60,7 @@ pub fn per_agent_pvc_enabled() -> bool {
     FeatureFlags::get().per_agent_pvc
 }
 
-// UserApp K8s 永远 per-app (代码不读开关, 无分裂);
+// Userapp K8s 永远 per-app (代码不读开关, 无分裂);
 // FeatureFlags.userapp_per_app_pvc 字段保留供启动日志 + chart cephfs-root 派生标记。
 
 // === 端口配置 ===
@@ -102,15 +102,45 @@ pub const TTYD_PORT: u16 = 7681;
 /// 仅 agent_runner 内部连接，不对外暴露（K8s Service 暴露此 17681 而非 ttyd 7681）。
 pub const WS_TERMINAL_PORT: u16 = 17681;
 
+/// dbx-web 端口（agent-runner 与 app-runtime 容器恒为 4224）
+///
+/// DBX 数据库 Web GUI（60+ 数据库），两镜像 supervisor 均恒起（无 CLI 参数，全 env 配置）。
+/// 经 Pingora `/api/v1/userapp/proxy/dbx/dev/{user_id}/{app_id}`（UserappBuilder 开发容器）与
+/// `/api/v1/userapp/proxy/dbx/prod/{user_id}/{app_id}`（Userapp 运行容器）两阶段代理暴露；
+/// dbx 前端运行时自推断 base path（webPath.ts），代理剥前缀直连 root 模式即可。
+pub const DBX_PORT: u16 = 4224;
+
+/// 输入法服务端口（agent-runner 容器内 fcitx/ime 桥接服务，恒为 6091）
+///
+/// agent_runner 镜像 supervisor 恒起；Pingora 的 ImeProxy（computer `/computer/ime/*`
+/// 与 userapp `/userapp/ime/{app_id}/*` 两族）按 `{host}:6091` 拨上游——K8s 下
+/// host 为 per-app Service FQDN，Service 端口清单须声明（未声明无转发规则）。
+pub const IME_PORT: u16 = 6091;
+
+/// userApp 应用统一入口端口（pingap 监听，恒为 9080）
+///
+/// 容器内 app-cli 编排的 pingap 统一入口：dev 容器（UserappBuilder，manifest 流程
+/// `start_dev_manifest` 恒起 pingap）与 prod 运行容器（release 流程 pin 唯一 HTTP 端口）
+/// 同值。Pingora 应用流量族 `/api/v1/userapp/proxy/app/{dev,prod}/{user_id}/{app_id}` 免端口——
+/// 内部固定拨此端口，调用方无需传端口。
+/// 与 app-cli 本地 `PINGAP_PORT`（crates/app-cli/src/proxy/pingap.rs，因 workspace
+/// exclude 锁隔离不便引 shared_types）同值互指，两处须同步改。
+pub const APP_ENTRY_PORT: u16 = 9080;
+
 /// agent-runner 内嵌 file-server 端口
 ///
-/// agent-runner 内嵌的 file-server 监听端口（UserApp workspace build / package 下载；
+/// agent-runner 内嵌的 file-server 监听端口（Userapp workspace build / package 下载；
 /// rcoder 的 prepare 与 agent-runner build 都走它）。四方共用此单一来源,避免各处硬编码
 /// `60_000` 漂移:
 /// - file-server 自身默认监听端口（可被 `FILE_SERVER_PORT`/`PORT` env 覆盖）
 /// - docker_manager 在 K8s Service/containerPort 上暴露该端口
 /// - rcoder `userapp_publish` 连接该端口
+/// - file-server-proxy 对外入口端口（rcoder 主 pod 与 agent-runner 容器双形态）
 pub const AGENT_FILE_SERVER_PORT: u16 = 60_000;
+
+/// TS nuwax-file-server 的容器内部端口（file-server-proxy 的存量域上游；
+/// 60000 由代理接管后 TS 恒退此端口，两形态热切换零重启）。
+pub const NUWAX_FILE_SERVER_INTERNAL_PORT: u16 = 60_001;
 
 // === K8s 配置 ===
 
@@ -132,6 +162,14 @@ pub fn get_k8s_cluster_domain() -> String {
 /// 返回 `true` 表示当前是 K8s 运行时，`false` 表示 Docker 运行时
 pub fn is_kubernetes_runtime() -> bool {
     cfg!(feature = "kubernetes")
+}
+
+/// 判断是否是 deploy-host 宿主机运行形态（通过 feature flag）
+///
+/// 与 [`is_kubernetes_runtime`] 对偶的编译期判定：宿主机原生运行的控制平面，
+/// agent 寻址一律经 published-port 注册表（[`crate::published`]) 拨 loopback。
+pub fn is_deploy_host() -> bool {
+    cfg!(feature = "deploy-host")
 }
 
 /// 构建 K8s Service FQDN
@@ -174,12 +212,31 @@ pub fn build_backend_addr(
     namespace: &str,
     cluster_domain: &str,
 ) -> String {
-    if is_kubernetes_runtime() {
+    if is_deploy_host() {
+        // 宿主机形态：返回注册表查表键（地址经 build_grpc_addr/build_http_addr
+        // 查 published-port 组装 127.0.0.1:host_port）。macOS 宿主机无法路由
+        // 容器网段 IP，也无法解析集群内 FQDN，发布端口是唯一可达路径。
+        container_name.to_string()
+    } else if is_kubernetes_runtime() {
         // K8s 环境：使用 K8s Service FQDN
         build_k8s_service_fqdn(container_name, namespace, cluster_domain)
     } else {
         // Docker 环境：使用容器 IP
         container_ip.to_string()
+    }
+}
+
+/// Missing deploy-host reach registration or port binding.
+#[derive(Debug, thiserror::Error)]
+#[error("container address not ready: {container}:{port}")]
+pub struct ReachNotReady {
+    pub container: String,
+    pub port: u16,
+}
+
+impl From<ReachNotReady> for crate::AppError {
+    fn from(error: ReachNotReady) -> Self {
+        Self::with_message(crate::error_codes::ERR_BACKEND_ERROR, error.to_string())
     }
 }
 
@@ -202,9 +259,14 @@ pub fn build_grpc_addr(
     container_ip: &str,
     namespace: &str,
     cluster_domain: &str,
-) -> String {
+) -> Result<String, ReachNotReady> {
     let backend_addr = build_backend_addr(container_name, container_ip, namespace, cluster_domain);
-    format!("{}:{}", backend_addr, GRPC_DEFAULT_PORT)
+    #[cfg(feature = "deploy-host")]
+    if is_deploy_host() {
+        return crate::published::resolve_published_addr(&backend_addr, GRPC_DEFAULT_PORT)
+            .map(|addr| addr.to_string());
+    }
+    Ok(format!("{}:{}", backend_addr, GRPC_DEFAULT_PORT))
 }
 
 /// 构建 HTTP 地址
@@ -226,15 +288,70 @@ pub fn build_http_addr(
     container_ip: &str,
     namespace: &str,
     cluster_domain: &str,
-) -> String {
+) -> Result<String, ReachNotReady> {
     let backend_addr = build_backend_addr(container_name, container_ip, namespace, cluster_domain);
-    format!("{}:{}", backend_addr, HTTP_DEFAULT_PORT)
+    #[cfg(feature = "deploy-host")]
+    if is_deploy_host() {
+        return crate::published::resolve_published_addr(&backend_addr, HTTP_DEFAULT_PORT)
+            .map(|addr| addr.to_string());
+    }
+    Ok(format!("{}:{}", backend_addr, HTTP_DEFAULT_PORT))
+}
+
+/// 构建指定容器端口的后端地址：deploy-host 经 published-port 注册表解析
+/// `127.0.0.1:{host_port}`，K8s 形态拼 FQDN，Docker 容器形态用容器 IP。
+/// 与 [`build_grpc_addr`]/[`build_http_addr`] 同一收敛语义，供非标准端口
+/// （file-server 60000 等）的直连点统一走查表。
+pub fn build_container_port_addr(
+    container_name: &str,
+    container_ip: &str,
+    namespace: &str,
+    cluster_domain: &str,
+    port: u16,
+) -> Result<String, ReachNotReady> {
+    let backend_addr = build_backend_addr(container_name, container_ip, namespace, cluster_domain);
+    #[cfg(feature = "deploy-host")]
+    if is_deploy_host() {
+        return crate::published::resolve_published_addr(&backend_addr, port)
+            .map(|addr| addr.to_string());
+    }
+    Ok(format!("{}:{}", backend_addr, port))
+}
+
+/// 服务 bind 地址单一事实源：env `RCODER_BIND_HOST` 永远优先；deploy-host
+/// 默认 127.0.0.1（宿主机安全边界），其余形态 0.0.0.0。listener（http-server
+/// server.rs）与本机自拨（rcoder-proxy dispatch HealthCheck）共用，保证
+/// 自拨永远打到实际监听地址。
+pub fn service_bind_host() -> String {
+    if let Some(explicit) = std::env::var("RCODER_BIND_HOST")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    {
+        return explicit;
+    }
+    #[cfg(feature = "deploy-host")]
+    if is_deploy_host() {
+        return "127.0.0.1".to_owned();
+    }
+    "0.0.0.0".to_owned()
+}
+
+/// 本机自拨目标：bind 地址为通配（0.0.0.0/::）时回落 loopback——通配地址
+/// 不能作为 connect 目标；其余（含 deploy-host 默认 127.0.0.1）原样返回。
+pub fn local_probe_host() -> String {
+    let bind = service_bind_host();
+    if bind == "0.0.0.0" || bind == "::" || bind.is_empty() {
+        "127.0.0.1".to_owned()
+    } else {
+        bind
+    }
 }
 
 // === gRPC 超时配置 ===
 
 /// gRPC 连接超时（秒）
-pub const GRPC_CONNECT_TIMEOUT_SECS: u64 = 10;
+pub const GRPC_CONNECT_TIMEOUT_SECS: u64 = 3;
 
 /// gRPC 消息大小限制（字节）
 ///
@@ -261,6 +378,9 @@ pub const GRPC_REQUEST_TIMEOUT_SECS: u64 = 300;
 ///
 /// 进度推送不依赖这个超时，走 SubscribeProgress 流（长连接，独立超时）。
 pub const GRPC_CHAT_TIMEOUT_SECS: u64 = 120;
+
+/// ACP 创建的总预算：替代旧执行、初始化、历史恢复及新会话均共享该 deadline。
+pub const DEFAULT_ACP_SESSION_CREATE_TIMEOUT_SECS: u64 = 100;
 
 /// CancelSession 请求超时（秒）
 ///

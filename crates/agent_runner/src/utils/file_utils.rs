@@ -327,7 +327,7 @@ impl FileUtils {
     /// 清理临时文件
     pub async fn cleanup_temp_files(&self, temp_files: &[PathBuf]) -> Result<()> {
         for temp_file in temp_files {
-            if temp_file.exists() {
+            if fs::try_exists(temp_file).await.unwrap_or(false) {
                 fs::remove_file(temp_file)
                     .await
                     .with_context(|| format!("failed to delete temp file: {:?}", temp_file))?;

@@ -1,0 +1,570 @@
+#!/usr/bin/env python3
+"""Strict E2E launcher. Each selected libtest case owns an isolated report directory."""
+import atexit
+from contextlib import nullcontext
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from cleanup import cleanup_case
+from contracts import REQUIRED
+
+ROOT = Path(__file__).resolve().parents[1]
+# 显式输入模式（remote-k8s 冻结快照）：E2E_SOURCE_ROOT 指向快照根（无 .git），
+# E2E_INPUT_MANIFEST 提供冻结清单（name→条目），E2E_ORIGIN_HEAD 提供历史基线
+# HEAD，E2E_RUN_ROOT 重定向报告根。全部缺省时保持活动工作目录旧行为。
+REPO = Path(os.environ.get('E2E_SOURCE_ROOT') or ROOT.parent)
+INPUT_MANIFEST = os.environ.get('E2E_INPUT_MANIFEST')
+ORIGIN_HEAD = os.environ.get('E2E_ORIGIN_HEAD')
+RUN_ROOT = Path(os.environ['E2E_RUN_ROOT']) if os.environ.get('E2E_RUN_ROOT') else ROOT / 'reports'
+GROUPS = {
+    'userapp': ['compose_userapp', 'compose_userapp_dev', 'compose_userapp_build_rules', 'compose_userapp_faults', 'compose_userapp_deploy', 'compose_lifecycle', 'pg_storage_faults', 'turso_storage_contract', 'turso_compose_runtime', 'userapp_concurrency_contract', 'native_lifecycle_crash', 'docker_lifecycle_crash'],
+    'compose': ['compose_sse', 'compose_session', 'compose_userapp', 'compose_userapp_dev', 'compose_userapp_build_rules', 'compose_webchat', 'custom_page_preview'],
+    'deploy': ['compose_userapp_deploy'],
+    'k8s': ['k8s_lb'],
+    'host': ['host_docker_lifecycle'],
+    'host_direct': ['host_docker_direct_lifecycle'],
+    'host_k8s': ['host_k8s_lifecycle'],
+}
+
+
+def select_registered_cases(suite, discovered, case_filter='', *, catalog=None,
+                            required=None, identities=None):
+    """Freeze suite membership independently of executable discovery.
+
+    An explicit filter narrows required membership, never adds unknown cases.
+    Full suites must retain every reviewed scenario, even when others still run.
+    """
+    catalog = catalog if catalog is not None else json.loads(
+        Path(__file__).with_name('suite_cases.json').read_text())
+    required = REQUIRED if required is None else required
+    identities = identities if identities is not None else json.loads(
+        Path(__file__).with_name('report_identities.json').read_text())
+    registered = catalog.get(suite, [])
+    if not registered or len(registered) != len(set(registered)):
+        raise ValueError('missing or duplicate suite contract: ' + suite)
+    invalid = [name for name in registered if name not in required or not identities.get(name)]
+    if invalid:
+        raise ValueError('incomplete acceptance registration: ' + ', '.join(sorted(invalid)))
+    discovered = {name for name in discovered if not name.startswith('gate_')}
+    unknown = discovered - set(registered)
+    if unknown:
+        raise ValueError('unregistered suite scenarios: ' + ', '.join(sorted(unknown)))
+    expected = {name for name in registered if not case_filter or case_filter in name}
+    missing = expected - discovered
+    if missing:
+        raise ValueError('required scenarios missing from executable: ' + ', '.join(sorted(missing)))
+    return sorted(expected)
+
+
+def check_registry(catalog=None, required=None, identities=None, groups=None):
+    """Static three-registration consistency check (suite_cases / contracts /
+    report identities + GROUPS references). Runs in milliseconds; catches
+    registration drift at write time instead of mid acceptance run."""
+    root = Path(__file__).parent
+    catalog = catalog if catalog is not None else json.loads(
+        (root / 'suite_cases.json').read_text())
+    required = required if required is not None else REQUIRED
+    identities = identities if identities is not None else json.loads(
+        (root / 'report_identities.json').read_text())
+    groups = groups if groups is not None else GROUPS
+    errors = []
+    for suite, registered in catalog.items():
+        if not registered:
+            errors.append(f'suite contract is empty: {suite}')
+            continue
+        # discovered=registered：单套件内部的自洽（必经断言 + 报告身份 + 去重）
+        try:
+            select_registered_cases(suite, registered, catalog=catalog,
+                                    required=required, identities=identities)
+        except ValueError as error:
+            errors.append(f'{suite}: {error}')
+    catalog_cases = {name for names in catalog.values() for name in names}
+    for name in required:
+        if name not in catalog_cases:
+            errors.append(f'acceptance contract not in any suite: {name}')
+    for name in identities:
+        if name not in catalog_cases:
+            errors.append(f'report identity not in any suite: {name}')
+    for group, suites in groups.items():
+        for suite in suites:
+            if suite not in catalog:
+                errors.append(f'group {group} references unknown suite: {suite}')
+    return errors
+
+
+def recent_outcomes(reports_root, wanted, scan_limit=200):
+    """Last verdict/duration per (suite, test) from newest summaries.
+
+    Scans newest-first and stops once every wanted case has an outcome or the
+    scan budget is spent; missing cases map to None instead of forcing a full
+    historical sweep of every archived run.
+    """
+    outcomes = {}
+    root = Path(reports_root)
+    if not root.is_dir():
+        return outcomes
+    candidates = []
+    for entry in root.iterdir():
+        if not entry.is_dir() or entry.name.startswith('_'):
+            continue
+        summary = entry / 'summary.json'
+        marker = summary if summary.exists() else entry / 'manifest.json'
+        if marker.exists():
+            candidates.append((marker.stat().st_mtime, entry))
+    candidates.sort(reverse=True)
+    for _mtime, entry in candidates[:scan_limit]:
+        summary = entry / 'summary.json'
+        if not summary.exists():
+            continue
+        try:
+            rows = json.loads(summary.read_text()).get('results') or []
+        except (OSError, ValueError):
+            continue
+        for row in rows:
+            key = (row.get('suite'), row.get('test'))
+            if key in wanted and key not in outcomes:
+                outcomes[key] = {
+                    'verdict': row.get('verdict'),
+                    'duration_s': row.get('duration_s'),
+                    'run_id': entry.name,
+                }
+        if all(key in outcomes for key in wanted):
+            break
+    return outcomes
+
+
+def print_case_listing(catalog, groups, outcomes):
+    """Suite→case listing for --list, newest group order preserved."""
+    order = {suite: index for index, suites in enumerate(groups.values()) for suite in suites}
+    for suite in sorted(catalog, key=lambda name: (order.get(name, len(order)), name)):
+        if suite in order:
+            group = next(g for g, suites in groups.items() if suite in suites)
+            print(f'[{group}] {suite}')
+        else:
+            print(f'[unlisted] {suite}')
+        for name in catalog[suite]:
+            last = outcomes.get((suite, name))
+            if last:
+                duration = last.get('duration_s')
+                duration_text = f"{duration:6.1f}s " if isinstance(duration, (int, float)) else '   -    '
+                print(f'    {duration_text} {str(last.get("verdict") or "-"):5s}  {name}')
+            else:
+                print(f'        -        {name}')
+
+
+def validate_reports(directory, scenario=None, run_id=None, case_id=None):
+    files = list(directory.glob('*.jsonl'))
+    errors = []
+    observed = set()
+    identities = json.loads(Path(__file__).with_name('report_identities.json').read_text())
+    expected_identities = {(row['scenario'], row['backend']) for row in identities.get(scenario, [])}
+    observed_identities = set()
+    if scenario is not None and scenario not in REQUIRED:
+        errors.append(f"unregistered acceptance contract: {scenario}")
+    if not files:
+        return ['no scenario reports produced']
+    for path in files:
+        try:
+            lines = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+            if any(not isinstance(line, dict) for line in lines):
+                raise ValueError('report rows must be JSON objects')
+            if not lines or lines[0].get('kind') != 'scenario_begin':
+                errors.append(f'{path.name}: scenario begin must be the first record')
+            if run_id is not None and any(line.get('run_id') != run_id for line in lines):
+                errors.append(f'{path.name}: run identity mismatch')
+            if case_id is not None and any(line.get('case_id') != case_id for line in lines):
+                errors.append(f'{path.name}: case identity mismatch')
+            if run_id is not None and any(line.get('test_name') != scenario for line in lines):
+                errors.append(f'{path.name}: canonical test identity mismatch')
+            for line in lines:
+                if line.get('kind') == 'scenario_begin':
+                    identity = (line.get('scenario'), line.get('backend'))
+                    if identity in observed_identities:
+                        errors.append(f'{path.name}: duplicate scenario/backend report')
+                    observed_identities.add(identity)
+                    if scenario is not None and identity not in expected_identities:
+                        errors.append(f'{path.name}: unregistered scenario/backend identity')
+            ends = [line for line in lines if line.get('kind') == 'scenario_end']
+            if sum(line.get('kind') == 'scenario_begin' for line in lines) != 1:
+                errors.append(f'{path.name}: missing or duplicate scenario begin')
+            if len(ends) != 1 or ends[0].get('verdict') != 'pass':
+                errors.append(f'{path.name}: missing, duplicate, or unsuccessful terminal')
+            assertions = [line for line in lines if line.get('kind') == 'assert' and line.get('level') == 'hard']
+            observed.update(a.get("name") for a in assertions if a.get("ok") is True)
+            if not assertions:
+                errors.append(f'{path.name}: no hard assertions')
+            if any(line.get('ok') is not True for line in assertions):
+                errors.append(f'{path.name}: unsuccessful hard assertion')
+            if len(ends) == 1 and (ends[0].get('hard_pass') != sum(a.get('ok') is True for a in assertions) or ends[0].get('hard_fail') != sum(a.get('ok') is not True for a in assertions)):
+                errors.append(f'{path.name}: assertion counters disagree with records')
+            if len(ends) == 1 and lines[-1] != ends[0]:
+                errors.append(f'{path.name}: records after terminal')
+        except (ValueError, OSError) as exc:
+            errors.append(f'{path.name}: unreadable report: {exc}')
+    if scenario is not None and not expected_identities:
+        errors.append(f'unregistered report identity contract: {scenario}')
+    if expected_identities - observed_identities:
+        errors.append('missing required scenario/backend reports')
+    missing = REQUIRED.get(scenario, set()) - observed
+    if missing:
+        errors.append("missing required acceptance steps: " + ", ".join(sorted(missing)))
+    return errors
+
+
+def output(*args):
+    return subprocess.check_output(args, cwd=REPO, text=True).strip()
+
+
+def source_fingerprint():
+    digest = hashlib.sha256()
+    if INPUT_MANIFEST:
+        # 冻结快照模式：身份 = 快照清单条目 + 各文件**实际内容**（T03）——
+        # 只哈希清单 JSON 无法发现"文件名不变、内容被改"的输入漂移；也不
+        # 触达活动工作目录，不需要 .git。
+        frozen = json.loads(Path(INPUT_MANIFEST).read_text())
+        for name in sorted(frozen):
+            digest.update(name.encode() + b'\0')
+            path = REPO / name
+            if path.is_symlink():
+                digest.update(b'<link>' + os.readlink(path).encode())
+            elif path.is_file():
+                digest.update(path.read_bytes())
+            else:
+                digest.update(b'<missing>')
+        return digest.hexdigest()
+    paths = subprocess.check_output(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], cwd=REPO).split(b'\0')
+    for raw in sorted(set(paths)):
+        if not raw:
+            continue
+        path = REPO / os.fsdecode(raw)
+        digest.update(raw + b'\0')
+        if path.is_file():
+            digest.update(path.read_bytes())
+        else:
+            digest.update(b'<missing>')
+    return digest.hexdigest()
+
+
+def container_identities():
+    try:
+        ids = output('docker', 'ps', '-aq').split()
+        if not ids:
+            return []
+        # Explicit format intentionally excludes environment variables and credentials.
+        rows = output('docker', 'inspect', '--format', '{{json .Id}} {{json .Name}} {{json .Image}} {{json .Config.Image}}', *ids)
+        return rows.splitlines()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        return {'unavailable': type(exc).__name__}
+
+
+def signal_owned_group(process, number):
+    """False means confirmed gone; permission failures on live groups still fail."""
+    try:
+        os.killpg(process.pid, number)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Darwin can return EPERM during teardown of an empty orphan group.
+        # Reaped leader alone is insufficient: a cleanup child may still run.
+        if sys.platform != 'darwin' or process.poll() is None:
+            raise
+        inventory = subprocess.run(['ps', '-axo', 'pgid='], capture_output=True,
+                                   text=True, check=True, timeout=5)
+        groups = {int(line.strip()) for line in inventory.stdout.splitlines() if line.strip()}
+        if not groups:
+            raise RuntimeError('process group inventory returned no processes')
+        if process.pid in groups:
+            raise
+        return False
+
+
+def terminate_process_group(process, grace=90):
+    """Wait for cleanup children as well as the libtest parent before fallback cleanup."""
+    if not signal_owned_group(process, signal.SIGTERM):
+        return
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        process.poll()  # reap the parent; its children can still be cleaning up
+        if not signal_owned_group(process, 0):
+            return
+        time.sleep(0.1)
+    signal_owned_group(process, signal.SIGKILL)
+    process.wait()
+
+
+class CaseCancellation:
+    """Install before launch and keep cancellation non-throwing until cleanup ends."""
+    def __init__(self, interrupted=False):
+        self.cancelled = interrupted
+        self.previous = {}
+
+    def __enter__(self):
+        for number in (signal.SIGINT, signal.SIGTERM):
+            self.previous[number] = signal.signal(number, self.record)
+        return self
+
+    def record(self, _signal, _frame):
+        self.cancelled = True
+
+    def __exit__(self, *_error):
+        for number, handler in self.previous.items():
+            signal.signal(number, handler)
+
+
+def settle_case(process, cleanup, exit_code=0, interrupted=False, cancellation=None):
+    """Settle owned resources under the same cancellation scope as process launch."""
+    scope = nullcontext(cancellation) if cancellation is not None else CaseCancellation(interrupted)
+    errors = []
+    with scope as state:
+        try:
+            if process is not None:
+                terminate_process_group(process)
+        except Exception as error:
+            errors.append('case process group cleanup failed: ' + type(error).__name__)
+        try:
+            errors.extend(cleanup())
+        except Exception as error:
+            errors.append('owned case cleanup failed: ' + type(error).__name__)
+        return errors, 130 if state.cancelled else exit_code, state.cancelled
+
+
+def execute_case(cmd, env, log, cleanup, timeout=3600):
+    # No owned process exists before this handler is installed. It remains active
+    # across Popen's return, wait exit, finally entry and all resource cleanup.
+    with CaseCancellation() as cancellation:
+        process = None
+        exit_code = 1
+        errors = []
+        try:
+            process = subprocess.Popen(cmd, cwd=REPO, env=env, stdout=log,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
+            deadline = time.monotonic() + timeout
+            while True:
+                if cancellation.cancelled:
+                    exit_code = 130
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    exit_code = 124
+                    break
+                try:
+                    exit_code = process.wait(timeout=min(0.2, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        except Exception as error:
+            errors.append('case execution failed: ' + type(error).__name__)
+        finally:
+            cleanup_errors, exit_code, interrupted = settle_case(
+                process, cleanup, exit_code, cancellation=cancellation)
+            errors.extend(cleanup_errors)
+        return errors, 130 if cancellation.cancelled else exit_code, cancellation.cancelled
+
+
+def main():
+    def cancelled(_signal, _frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, cancelled)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--group', choices=GROUPS, default='userapp')
+    parser.add_argument('--suite', default=os.environ.get('E2E_SUITE', ''))
+    parser.add_argument('--filter', default=os.environ.get('E2E_FILTER', ''))
+    parser.add_argument('--ignored', action='store_true')
+    parser.add_argument('--remote-k8s', action='store_true', help='Dedicated owned namespace; no Docker inventory or cleanup')
+    parser.add_argument('--list', action='store_true',
+                        help='Print suite→case registry with last verdict/duration; no run started')
+    parser.add_argument('--check-registry', action='store_true',
+                        help='Validate the three registrations are mutually consistent; no run started')
+    args = parser.parse_args()
+    if args.list or args.check_registry:
+        catalog = json.loads(Path(__file__).with_name('suite_cases.json').read_text())
+        if args.check_registry:
+            registry_errors = check_registry(catalog=catalog)
+            if registry_errors:
+                print('REGISTRY DRIFT:', file=sys.stderr)
+                for error in registry_errors:
+                    print(f'  {error}', file=sys.stderr)
+                return 2
+            print(f'registry OK: {len(catalog)} suites / '
+                  f'{sum(len(v) for v in catalog.values())} cases consistent')
+            if not args.list:
+                return 0
+        if args.list:
+            wanted = {(suite, name) for suite, names in catalog.items() for name in names}
+            outcomes = recent_outcomes(RUN_ROOT, wanted)
+            print_case_listing(catalog, GROUPS, outcomes)
+            return 0
+    if args.remote_k8s:
+        if args.group != 'k8s':
+            parser.error('--remote-k8s requires --group k8s')
+        from remote_k8s_cleanup import validate
+        validate(os.environ)
+    if args.group == 'host_k8s':
+        from local_k8s_cleanup import validate
+        validate(os.environ)
+    suites = args.suite.split(',') if args.suite else GROUPS[args.group]
+    known = set(sum(GROUPS.values(), []))
+    if not suites or any(s not in known for s in suites):
+        parser.error('unknown or empty suite selection')
+    if args.remote_k8s and any(s not in GROUPS['k8s'] for s in suites):
+        parser.error('--remote-k8s only accepts K8s suites')
+    run_id = uuid.uuid4().hex
+    run_started = time.monotonic()
+    run = RUN_ROOT / run_id
+    run.mkdir(parents=True)
+    env = dict(os.environ, E2E_RUN_ID=run_id, E2E_STRICT='1')
+    # 历史基线 HEAD：冻结快照模式下经 E2E_ORIGIN_HEAD 显式提供（快照无
+    # .git；origin head 只是历史锚点，本轮身份是 worktree_sha256）
+    head = ORIGIN_HEAD or output('git', 'rev-parse', 'HEAD')
+    manifest = {'run_id': run_id, 'head': head,
+                'worktree_sha256': source_fingerprint(),
+                'containers_before': [] if args.remote_k8s or args.group == 'host_k8s' else container_identities(),
+                'remote_k8s': args.remote_k8s,
+                'suites': suites, 'filter': args.filter, 'planned': [], 'results': []}
+    def persist():
+        completed = {(row['suite'], row['test']) for row in manifest['results']}
+        unfinished = [{**case, 'verdict': 'aborted', 'errors': ['no completed process result']} for case in manifest['planned'] if (case['suite'], case['test']) not in completed]
+        # 迭代定位瓶颈的基础数据：每 case 墙钟耗时随结果落盘，快照层聚合
+        # 总耗时与 top-N 慢场景（abort 未完成的 case 无 duration_s，跳过）
+        timed = [(row['test'], row['suite'], row['duration_s']) for row in manifest['results'] if isinstance(row.get('duration_s'), (int, float))]
+        snapshot = {**manifest,
+                    'results': manifest['results'] + unfinished,
+                    'total_duration_s': round(time.monotonic() - run_started, 1),
+                    'slowest_cases': sorted(
+                        ({'test': t, 'suite': s, 'duration_s': d} for t, s, d in timed),
+                        key=lambda row: row['duration_s'], reverse=True)[:5]}
+        (run / 'summary.json').write_text(json.dumps(snapshot, indent=2))
+    atexit.register(persist)
+    persist()
+    inventory = manifest['containers_before']
+    if not isinstance(inventory, list) and args.group not in ('k8s', 'host_k8s'):
+        manifest['infrastructure_error'] = 'Docker inventory unavailable before acceptance'
+        return 2
+    existing_ids = [json.loads(row.split()[0]) for row in inventory] if isinstance(inventory, list) else []
+    env['E2E_EXISTING_CONTAINER_IDS'] = json.dumps(existing_ids)
+    command = ['cargo', 'test', '-p', 'rcoder-e2e', '--locked', '--no-run', '--message-format=json']
+    for suite in suites:
+        command += ['--test', suite]
+    build = subprocess.run(command, cwd=REPO, env=env, text=True, stdout=subprocess.PIPE)
+    (run / 'build.jsonl').write_text(build.stdout)
+    if build.returncode:
+        manifest['infrastructure_error'] = f'build exited {build.returncode}'
+        return build.returncode
+    if source_fingerprint() != manifest['worktree_sha256']:
+        manifest['infrastructure_error'] = 'source changed while compiling acceptance binaries'
+        return 2
+    executables = {}
+    for line in build.stdout.splitlines():
+        event = json.loads(line)
+        if event.get('reason') == 'compiler-artifact' and event.get('executable'):
+            name = event['target']['name']
+            # 内容寻址共享：二进制按 sha256 存 RUN_ROOT/_bin/<sha>/，各 run
+            # 目录内放硬链接——同源码多轮 run 不再各留一份 150MB+ 副本
+            # （938 轮曾累积 32.6GB）。证据语义不变：test_binary_sha256 仍是
+            # 实际执行二进制的内容指纹，冻结副本内容逐字节一致。
+            digest = hashlib.sha256()
+            with open(event['executable'], 'rb') as binary:
+                for chunk in iter(lambda: binary.read(1 << 20), b''):
+                    digest.update(chunk)
+            sha = digest.hexdigest()
+            canonical_dir = RUN_ROOT / '_bin' / sha
+            canonical = canonical_dir / name
+            if not canonical.exists():
+                canonical_dir.mkdir(parents=True, exist_ok=True)
+                staging = canonical_dir / f'.{name}.{run_id}.tmp'
+                shutil.copy2(event['executable'], staging)
+                os.replace(staging, canonical)
+            frozen = run / 'bin' / name
+            frozen.parent.mkdir(exist_ok=True)
+            try:
+                os.link(canonical, frozen)
+            except OSError:
+                shutil.copy2(canonical, frozen)
+            executables[name] = str(frozen)
+            manifest.setdefault('test_binary_sha256', {})[name] = sha
+    for suite in suites:
+        executable = executables[suite]
+        listing = subprocess.check_output([executable, '--list', '--format=terse'], text=True)
+        discovered = [line.removesuffix(': test') for line in listing.splitlines()
+                      if line.endswith(': test')]
+        try:
+            selected = select_registered_cases(suite, discovered, args.filter)
+        except ValueError as error:
+            manifest['infrastructure_error'] = str(error)
+            persist()
+            print(f'ERROR: {error}; report: {run}', file=sys.stderr)
+            return 2
+        for name in selected:
+            manifest['planned'].append({'suite': suite, 'test': name, 'executable': executable})
+    (run / 'manifest.json').write_text(json.dumps(manifest, indent=2))
+    if not manifest['planned']:
+        manifest['infrastructure_error'] = 'selection matched no scenarios'
+        print(f'ERROR: selection matched no scenarios; report: {run}', file=sys.stderr)
+        return 1
+    unknown = [case['test'] for case in manifest['planned'] if case['test'] not in REQUIRED]
+    if unknown:
+        manifest['infrastructure_error'] = 'unregistered acceptance contracts: ' + ', '.join(unknown)
+        persist()
+        return 2
+    for case in manifest['planned']:
+        case_dir = run / case['suite'] / case['test']
+        case_dir.mkdir(parents=True)
+        case_started = time.monotonic()
+        case_id = uuid.uuid4().hex
+        case['case_id'] = case_id
+        persist()
+        case_env = dict(env, E2E_REPORT_DIR=str(case_dir), E2E_TEST_NAME=case['test'], E2E_CASE_ID=case_id)
+        cmd = [case['executable'], case['test'], '--exact', '--test-threads=1', '--nocapture']
+        if args.ignored:
+            cmd += ['--include-ignored']
+        if args.remote_k8s:
+            from remote_k8s_cleanup import cleanup as remote_cleanup
+            cleanup_action = lambda: remote_cleanup(case_id, run_id, case_dir, case_env)
+        elif args.group == 'host_k8s':
+            from local_k8s_cleanup import cleanup as local_cleanup
+            cleanup_action = lambda: local_cleanup(case_id, run_id, case_dir, case_env)
+        else:
+            cleanup_action = lambda: cleanup_case(case_id, run_id, case_dir, existing_ids)
+        with (case_dir / 'process.log').open('w') as log:
+            cleanup_errors, exit_code, interrupted = execute_case(
+                cmd, case_env, log,
+                cleanup_action,
+            )
+        errors = validate_reports(case_dir, case["test"], run_id, case_id)
+        errors.extend(cleanup_errors)
+        for cleanup in (case_dir / 'resources').glob('*-cleanup.json'):
+            try:
+                if json.loads(cleanup.read_text()).get('ok') is not True:
+                    errors.append(f'cleanup failed: {cleanup.name}')
+            except (OSError, ValueError):
+                errors.append(f'unreadable cleanup evidence: {cleanup.name}')
+        manifest['containers_after'] = [] if args.remote_k8s or args.group == 'host_k8s' else container_identities()
+        if exit_code:
+            errors.append(f'libtest exit {exit_code}')
+        verdict = 'fail' if errors else 'pass'
+        manifest['results'].append({**case, 'verdict': verdict, 'errors': errors,
+                                    'duration_s': round(time.monotonic() - case_started, 1)})
+        persist()
+        print(f'{verdict}: {case["suite"]}::{case["test"]}', flush=True)
+        if interrupted:
+            return 130
+    manifest['worktree_sha256_after'] = source_fingerprint()
+    if manifest['worktree_sha256_after'] != manifest['worktree_sha256']:
+        manifest['infrastructure_error'] = 'source changed during acceptance run'
+        print(f'ERROR: source changed during run; report: {run}', file=sys.stderr)
+        return 2
+    print(f'Report: {run}')
+    return int(any(case['verdict'] != 'pass' for case in manifest['results']))
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,28 @@
+[package]
+name = "rcoder-obs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "dial9 spawner facade for observability instrumentation (feature off = plain tokio)"
+publish = false
+
+[package.metadata.dist]
+dist = false
+
+[features]
+default = []
+# dial9 事件级 Tokio tracing：开启后 spawn 系 API 经 dial9 插桩（wake 因果/task
+# 生命周期）；关闭时直通原 Tokio API，零插桩。运行期是否记录由进程级
+# DIAL9_ENABLED 与 runtime 是否 attach 决定（未挂线 = 静默退化，见 lib.rs 文档）。
+dial9 = ["dep:dial9"]
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+
+# 仅经各消费 crate 的 `dial9` feature 转发引入，普通构建不含。
+dial9 = { workspace = true, optional = true }

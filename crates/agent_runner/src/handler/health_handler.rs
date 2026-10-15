@@ -8,8 +8,6 @@
 //!
 //! 只有当所有启用的服务都就绪时，才返回 "healthy" 状态。
 
-#![allow(dead_code)]
-
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Json;
@@ -91,6 +89,10 @@ pub async fn ready_check() -> (
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(HttpResult {
+                operation_in_progress_data: None,
+                error_detail: None,
+                operation_id: None,
+                blocker: None,
                 code: "SERVICE_NOT_READY".to_string(),
                 message: "Service is starting, gRPC not ready".to_string(),
                 data: Some(health_response),
@@ -163,6 +165,10 @@ pub fn build_health_response(
         HttpResult::success(health_response)
     } else {
         HttpResult {
+            operation_in_progress_data: None,
+            error_detail: None,
+            operation_id: None,
+            blocker: None,
             code: "SERVICE_NOT_READY".to_string(),
             message: "Service is starting, gRPC not ready".to_string(),
             data: Some(health_response),

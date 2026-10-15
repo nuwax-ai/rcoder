@@ -40,9 +40,22 @@ pub struct ChatRequest {
     /// 🆕 是否是 DevComputer 接口请求（用于 {PREFIX_WORKSPACE_DIR} 变量解析）
     #[prost(bool, tag = "13")]
     pub is_devcomputer: bool,
-    /// 🆕 自定义工作目录标识符（可选，用于替代 project_id 参与工作目录拼接）
+    /// 🆕 自定义工作目录（可选，替代 project_id 参与工作目录拼接）。两形态：
+    ///
+    /// 1. 单段目录名（原语义）；
+    /// 1. 绝对路径（跨平台字符串规则：POSIX /a/b、Windows X:/a/b、UNC //s/a，
+    ///    识别并原样透传 Windows verbatim \\?\C:\a\b / \\?\UNC\s\a 扩展长度路径），
+    ///    常规项目场景 Java 传子容器内 /home/user/{projectType}/{projectId}。
+    ///    绝对路径形态仅 service_type=ComputerAgentRunner 支持，其余显式拒绝
     #[prost(string, optional, tag = "14")]
     pub agent_work_dir: ::core::option::Option<::prost::alloc::string::String>,
+    /// 🆕 UserApp 开发对话定位键（UserappBuilder 场景必填，缺失即拒绝；语义独立于
+    /// project_id 承载会话执行身份，app_id 仅定位共享开发工作目录。其他 service_type 不填）
+    #[prost(string, optional, tag = "15")]
+    pub app_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// 内部创建意图：忽略旧会话提示，只替换本 project 的执行并创建全新 ACP session。
+    #[prost(bool, tag = "16")]
+    pub force_new_session: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChatResponse {
@@ -214,6 +227,9 @@ pub struct StopAgentRequest {
     /// 是否强制停止（不等待当前任务完成）
     #[prost(bool, tag = "3")]
     pub force: bool,
+    /// 只停止仍匹配该 session 的 project 执行，防止延迟请求误停替代实例。
+    #[prost(string, optional, tag = "4")]
+    pub expected_session_id: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct StopAgentResponse {

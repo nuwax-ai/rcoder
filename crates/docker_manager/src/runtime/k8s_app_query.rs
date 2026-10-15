@@ -1,16 +1,20 @@
-//! UserApp Deployment 查询/状态(从 k8s_deployment.rs 拆出)。
+//! Userapp Deployment 查询/状态(从 k8s_deployment.rs 拆出)。
 //!
 //! get_app_status/read_app_container_spec/list_app_status + deployment_to_status +
 //! container_error_message。
 
 #[cfg(feature = "kubernetes")]
+use std::collections::HashMap;
+
+#[cfg(feature = "kubernetes")]
 use container_runtime_api::{
-    AppPortStatus, ContainerRuntimeError, ContainerRuntimeResult, ContainerSpecSnapshot,
+    AppPortSpec, ContainerRuntimeError, ContainerRuntimeResult, ContainerSpecSnapshot,
     DeploymentStatus, ExposeType,
 };
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::apps::v1::Deployment;
 #[cfg(feature = "kubernetes")]
+use kube::Api;
 use kube::api::ListParams;
 
 use super::k8s_app_helpers::{
@@ -38,14 +42,18 @@ impl KubernetesRuntime {
                 )));
             }
         };
-        Ok(Some(self.deployment_to_status(app_id, &deploy).await))
+        Ok(Some(self.deployment_to_status(app_id, &deploy).await?))
     }
 
-    /// 读 app 当前容器的 `command`/`env` 快照（update 部分更新回退用）。
+    /// 读 app 当前容器的 desired 快照（update 部分更新回退用）。
     ///
-    /// - **command**：UserApp 存于 `container.args`（用镜像 ENTRYPOINT + 用户命令作 args），
+    /// - **command**：Userapp 存于 `container.args`（用镜像 ENTRYPOINT + 用户命令作 args），
     ///   兼顾 `container.command`（其他路径内联）→ `command.or(args)`。
-    /// - **env**：UserApp env 走 ConfigMap（envFrom 引用 `{app}-config`），读 `.data` 还原字面值。
+    /// - **env**：Userapp env 走 ConfigMap（envFrom 引用 `{app}-config`），读 `.data` 还原字面值。
+    /// - **secrets**：Secret `{app}-secret`（写入用 string_data，API 返回在 `.data` 并 base64）。
+    /// - **resources**：pod template `resources.limits` 原样还原 Quantity 字符串
+    ///   （写入与读出同格式，无换算损耗；storage 是 per-app PVC 配额不在容器层，不读）。
+    /// - **health_check**：liveness/readiness probe 反推（`build_probe` 的逆映射）。
     ///
     /// 任一资源 404 → 对应字段 None（互不影响）。读失败上抛（update 调用方降级 warn）。
     /// 注：trait 方法 `ContainerRuntime::get_app_container_spec` 委派到这里（见 kubernetes_runtime.rs）。
@@ -53,17 +61,15 @@ impl KubernetesRuntime {
         &self,
         app_id: &str,
     ) -> ContainerRuntimeResult<ContainerSpecSnapshot> {
-        // command：Deployment 主容器的 args（UserApp）/ command（其他）
-        let command = match self
+        use container_runtime_api::AppResourceRequirements;
+
+        // deployment GET 一次：command + resources + probes 同源提取。
+        let deploy = match self
             .deployments_api()
             .get(&self.app_deployment_name(app_id))
             .await
         {
-            Ok(deploy) => deploy
-                .spec
-                .and_then(|s| s.template.spec)
-                .and_then(|ps| ps.containers.into_iter().next())
-                .and_then(|c| c.command.or(c.args)),
+            Ok(deploy) => Some(deploy),
             Err(kube::Error::Api(ae)) if ae.code == 404 => None,
             Err(e) => {
                 return Err(ContainerRuntimeError::K8sError(format!(
@@ -71,12 +77,42 @@ impl KubernetesRuntime {
                 )));
             }
         };
+        let container = deploy
+            .as_ref()
+            .and_then(|d| d.spec.as_ref())
+            .and_then(|s| s.template.spec.as_ref())
+            .and_then(|ps| ps.containers.first());
+        let command = container.and_then(|c| c.command.clone().or_else(|| c.args.clone()));
+        let resources = container
+            .and_then(|c| c.resources.as_ref())
+            .and_then(|r| r.limits.as_ref())
+            .map(|limits| AppResourceRequirements {
+                // Quantity 是 newtype String，取 .0 原样还原（写入读出同格式无换算）
+                cpu: limits.get("cpu").map(|q| q.0.clone()),
+                memory: limits.get("memory").map(|q| q.0.clone()),
+                storage: None,
+                ephemeral_storage: limits.get("ephemeral-storage").map(|q| q.0.clone()),
+            })
+            .filter(|r| r.cpu.is_some() || r.memory.is_some() || r.ephemeral_storage.is_some());
+        let health_check = container.and_then(probe_to_health_check);
+
+        let env_sources = container.and_then(|c| c.env_from.as_ref());
+        let config_name = env_sources
+            .and_then(|sources| {
+                sources
+                    .iter()
+                    .find_map(|source| source.config_map_ref.as_ref().map(|r| r.name.clone()))
+            })
+            .unwrap_or_else(|| self.app_config_name(app_id));
+        let secret_name = env_sources
+            .and_then(|sources| {
+                sources
+                    .iter()
+                    .find_map(|source| source.secret_ref.as_ref().map(|r| r.name.clone()))
+            })
+            .unwrap_or_else(|| self.app_secret_name(app_id));
         // env：ConfigMap `{app}-config`.data（apply_app_configmap 写入 = params.env 原样）
-        let env = match self
-            .configmaps_api()
-            .get(&self.app_config_name(app_id))
-            .await
-        {
+        let env = match self.configmaps_api().get(&config_name).await {
             Ok(cm) => cm
                 .data
                 .filter(|m| !m.is_empty())
@@ -88,13 +124,66 @@ impl KubernetesRuntime {
                 )));
             }
         };
-        Ok(ContainerSpecSnapshot { command, env })
+
+        // secrets：Secret `.data` base64 解码还原（写入走 string_data，API 侧自动转 data；
+        // 值类型是 ByteString，直接取内部字节，无需再按文本 base64 解码字符串）
+        let secrets = match self.secrets_api().get(&secret_name).await {
+            Ok(secret) => decode_secret_environment(secret.data)?,
+            Err(kube::Error::Api(ae)) if ae.code == 404 => None,
+            Err(e) => {
+                return Err(ContainerRuntimeError::K8sError(format!(
+                    "get secret for container spec: {e}"
+                )));
+            }
+        };
+
+        // ports：container.ports（name/port）join port-expose 注解（expose_type；缺省
+        // Http）。strip_prefix 未持久化（仅体现在 HTTPRoute URLRewrite filter），读回
+        // None——显式 false 的用户部分更新后回默认剥前缀行为（罕见配置，取舍见
+        // ContainerSpecSnapshot.ports 文档）。空 ports = 未设置（None）。
+        let ports = container
+            .and_then(|c| c.ports.as_ref())
+            .filter(|ps| !ps.is_empty())
+            .map(|ps| {
+                let expose_map = deploy
+                    .as_ref()
+                    .and_then(|d| d.metadata.annotations.as_ref())
+                    .and_then(|ann| ann.get(PORT_EXPOSE_ANNOTATION))
+                    .map(|value| parse_port_expose(value))
+                    .unwrap_or_default();
+                ps.iter()
+                    .map(|p| AppPortSpec {
+                        name: p.name.clone().unwrap_or_default(),
+                        port: p.container_port as u16,
+                        expose_type: expose_map
+                            .get(&(p.container_port as u16))
+                            .cloned()
+                            .unwrap_or(ExposeType::Http),
+                        strip_prefix: None,
+                    })
+                    .collect::<Vec<_>>()
+            });
+
+        Ok(ContainerSpecSnapshot {
+            command,
+            env,
+            secrets,
+            resources,
+            health_check,
+            ports,
+        })
     }
 
     /// 列出所有 rcoder-app-manager 托管的 app 状态（对账用）
     pub async fn list_app_status(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
-        let lp = ListParams::default()
-            .labels(&format!("{}/managed-by={APP_MANAGED_BY}", APP_LABEL_PREFIX));
+        let lp = ListParams {
+            label_selector: Some(format!("{}/managed-by={APP_MANAGED_BY}", APP_LABEL_PREFIX)),
+            // resourceVersion=0 走 apiserver watch cache（内存读）——不带 rv 的
+            // list 是 quorum read（等 etcd 多副本确认），查询面高频轮询会把
+            // 压力传导到 etcd；列表展示容忍 cache 的短暂陈旧
+            resource_version: Some("0".to_string()),
+            ..Default::default()
+        };
         let deploys = self
             .deployments_api()
             .list(&lp)
@@ -113,7 +202,7 @@ impl KubernetesRuntime {
             if app_id.is_empty() {
                 continue;
             }
-            out.push(self.deployment_to_status(&app_id, &d).await);
+            out.push(self.deployment_to_status(&app_id, &d).await?);
         }
         Ok(out)
     }
@@ -125,17 +214,24 @@ impl KubernetesRuntime {
     /// - `derive_phase`：replicas+ready+error → phase —— 纯函数
     /// - `collect_tcp_nodeports`：查 NodePort Service 的 TCP node_port —— IO
     /// - `derive_port_statuses`：container ports + annotation + nodeports → 端口状态 —— 纯函数
-    async fn deployment_to_status(&self, app_id: &str, deploy: &Deployment) -> DeploymentStatus {
+    async fn deployment_to_status(
+        &self,
+        app_id: &str,
+        deploy: &Deployment,
+    ) -> ContainerRuntimeResult<DeploymentStatus> {
         let replicas = deploy.spec.as_ref().and_then(|s| s.replicas).unwrap_or(0);
-        let ready_replicas = deploy
+        let mut ready_replicas = deploy
             .status
             .as_ref()
             .and_then(|s| s.ready_replicas)
             .unwrap_or(0);
 
         // 关联 Pod 信息先取：phase 判定需要容器状态（CrashLoop/ImagePull/异常退出 → Error）。
-        let (pod_ip, node, restart_count, started_at, error_message) =
-            self.fetch_app_pod_info(app_id).await;
+        let (pod_ip, node, restart_count, started_at, error_message, error_reason, pod_ready) =
+            self.fetch_app_pod_info(app_id, deploy).await?;
+        if !pod_ready {
+            ready_replicas = 0;
+        }
         let phase = derive_phase(replicas, ready_replicas, &error_message);
         let tcp_nodeports = self.collect_tcp_nodeports(app_id).await;
         let ports = derive_port_statuses(deploy, &tcp_nodeports);
@@ -158,12 +254,19 @@ impl KubernetesRuntime {
             .as_ref()
             .map(|t| t.0.to_string());
 
-        DeploymentStatus {
+        Ok(DeploymentStatus {
             app_id: app_id.to_string(),
+            lifecycle_id: deploy
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("rcoder.io/lifecycle-id"))
+                .cloned(),
             replicas,
             ready_replicas,
             phase,
             message: error_message,
+            reason: error_reason,
             pod_ip: if pod_ip.is_empty() {
                 None
             } else {
@@ -178,53 +281,255 @@ impl KubernetesRuntime {
             idle_timeout_seconds,
             wake_on_traffic,
             created_at,
-        }
+            deployment_uid: deploy.metadata.uid.clone(),
+        })
     }
 
-    /// 拉取 app 关联 Pod 的实时信息（取一个；app 当前为单副本）。
-    /// 返回 (pod_ip, node, restart_count, started_at, error_message)；无 Pod 或 list 失败返默认空值。
+    /// Read only the current Pod belonging to the captured Prod Deployment.
+    /// API failures remain typed errors; an absent current Pod has no address.
     async fn fetch_app_pod_info(
         &self,
         app_id: &str,
-    ) -> (String, String, u32, Option<String>, Option<String>) {
-        let lp = ListParams::default().labels(&format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX));
-        match self.pods_api().list(&lp).await {
-            Ok(pods) => pods
-                .items
-                .into_iter()
-                .next()
-                .and_then(|p| {
-                    let st = p.status?;
-                    // 按容器名取 "app" 容器状态（防御 sidecar 注入后 pop() 取错容器）
-                    let cs = st
-                        .container_statuses
-                        .and_then(|v| v.into_iter().find(|c| c.name == APP_CONTAINER_NAME))?;
-                    // started_at：从 container state.running 提取实际启动时间
-                    let started_at = cs
-                        .state
-                        .as_ref()
-                        .and_then(|s| s.running.as_ref())
-                        .and_then(|r| r.started_at.as_ref())
-                        .map(|t| t.0.to_string());
-                    // 启动失败原因（CrashLoop / 镜像拉取失败 / 异常退出）；正常拉起的中间态
-                    // （ContainerCreating）不在此列，不会被误判为 Error。
-                    let error_message = container_error_message(&cs);
-                    Some((
-                        st.pod_ip.unwrap_or_default(),
-                        p.spec.and_then(|s| s.node_name).unwrap_or_default(),
-                        cs.restart_count as u32,
-                        started_at,
-                        error_message,
-                    ))
-                })
-                .unwrap_or_default(),
-            Err(_) => (String::new(), String::new(), 0, None, None),
+        deployment: &Deployment,
+    ) -> ContainerRuntimeResult<(
+        String,
+        String,
+        u32,
+        Option<String>,
+        Option<String>,
+        Option<container_runtime_api::ContainerFailureReason>,
+        bool,
+    )> {
+        let Some(pod) = self.current_app_pod(app_id, deployment).await? else {
+            return Ok(Default::default());
+        };
+        let Some(status) = pod.status.as_ref() else {
+            return Ok(Default::default());
+        };
+        let node = pod
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.node_name.clone())
+            .unwrap_or_default();
+        let ip = status.pod_ip.clone().unwrap_or_default();
+        let container = status.container_statuses.as_ref().and_then(|containers| {
+            containers
+                .iter()
+                .find(|container| container.name == APP_CONTAINER_NAME)
+        });
+        let Some(container) = container else {
+            return Ok((
+                ip,
+                node,
+                0,
+                None,
+                unschedulable_message(status),
+                None,
+                false,
+            ));
+        };
+        let started = container
+            .state
+            .as_ref()
+            .and_then(|state| state.running.as_ref())
+            .and_then(|running| running.started_at.as_ref())
+            .map(|time| time.0.to_string());
+        Ok((
+            ip,
+            node,
+            container.restart_count as u32,
+            started,
+            container_error_message(container),
+            container_error_reason(container),
+            container.ready,
+        ))
+    }
+
+    /// 结构化应用 Pod 故障观察（部署等待循环的确定性失败信号数据源）。
+    ///
+    /// 身份核验（计划 v3.2 固定实现）：目标 Deployment UID 比对 + pod template
+    /// 令牌比对（`rcoder.io/deploy-template-token` = 本次操作 operation_id）；
+    /// owner 链按 `controller=true` + kind 逐级解析，禁止取 ownerReferences[0]。
+    /// 链不完整/身份不可证 → UncertainIdentity（只诊断）；列表观察失败 → Err
+    /// （与 NoPod 严格区分）。
+    pub(crate) async fn observe_app_pods_structured(
+        &self,
+        app_id: &str,
+        target: &container_runtime_api::AppDeployTarget,
+    ) -> ContainerRuntimeResult<Vec<container_runtime_api::PodObservation>> {
+        use container_runtime_api::{ContainerExit, PodFailureObservation, PodObservation};
+
+        let deployment_name = self.app_deployment_name(app_id);
+        let deployment = match self.deployments_api().get(&deployment_name).await {
+            Ok(deploy) => deploy,
+            Err(kube::Error::Api(error)) if error.code == 404 => {
+                return Ok(vec![PodObservation::NoPod]);
+            }
+            Err(error) => {
+                return Err(ContainerRuntimeError::K8sError(format!(
+                    "observe application deployment: {error}"
+                )));
+            }
+        };
+        let deployment_uid = deployment.metadata.uid.clone().unwrap_or_default();
+        if deployment_uid.is_empty() || deployment_uid != target.deployment_uid {
+            // 目标 Deployment 已被替换（UID 变化）或身份缺失——本次等待的
+            // 写入已非当前对象，观察只诊断不分类
+            return Ok(vec![PodObservation::UncertainIdentity(format!(
+                "deployment uid changed: target={}, observed={deployment_uid}",
+                target.deployment_uid
+            ))]);
         }
+
+        let lp = ListParams {
+            label_selector: Some(format!("{}/app-id={app_id}", RCODER_LABEL_PREFIX)),
+            resource_version: Some("0".to_string()),
+            ..Default::default()
+        };
+        let pods = self.pods_api().list(&lp).await.map_err(|error| {
+            ContainerRuntimeError::K8sError(format!("observe application pods: {error}"))
+        })?;
+        if pods.items.is_empty() {
+            return Ok(vec![PodObservation::NoPod]);
+        }
+
+        let replicasets: Api<k8s_openapi::api::apps::v1::ReplicaSet> =
+            Api::namespaced(self.client.clone(), &self.namespace);
+        let mut observations = Vec::with_capacity(pods.items.len());
+        for pod in pods.items {
+            let pod_uid = pod.metadata.uid.clone().unwrap_or_default();
+            let Some(status) = pod.status.clone() else {
+                observations.push(PodObservation::UncertainIdentity(format!(
+                    "pod has no status: {}",
+                    pod.metadata.name.unwrap_or_default()
+                )));
+                continue;
+            };
+            // owner 链：pod --controller=true--> ReplicaSet --controller=true--> Deployment
+            let owner_rs = pod
+                .metadata
+                .owner_references
+                .as_ref()
+                .and_then(|refs| {
+                    refs.iter()
+                        .find(|r| r.controller == Some(true) && r.kind == "ReplicaSet")
+                })
+                .map(|r| r.name.clone());
+            let Some(owner_rs) = owner_rs else {
+                observations.push(PodObservation::UncertainIdentity(format!(
+                    "pod has no controlling ReplicaSet owner: {}",
+                    pod.metadata.name.unwrap_or_default()
+                )));
+                continue;
+            };
+            let rs = match replicasets.get(&owner_rs).await {
+                Ok(rs) => rs,
+                Err(kube::Error::Api(error)) if error.code == 404 => {
+                    observations.push(PodObservation::UncertainIdentity(format!(
+                        "owning ReplicaSet gone: {owner_rs}"
+                    )));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(ContainerRuntimeError::K8sError(format!(
+                        "observe owning ReplicaSet {owner_rs}: {error}"
+                    )));
+                }
+            };
+            let rs_owner = rs
+                .metadata
+                .owner_references
+                .as_ref()
+                .and_then(|refs| {
+                    refs.iter()
+                        .find(|r| r.controller == Some(true) && r.kind == "Deployment")
+                })
+                .map(|r| (r.name.clone(), r.uid.clone()));
+            let chain_matches = matches!(&rs_owner, Some((name, uid))
+                if *name == deployment_name && *uid == deployment_uid);
+            // 模板令牌：pod template annotations 携带本次操作写入的令牌
+            let pod_token = pod
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(super::k8s_app_helpers::DEPLOY_TEMPLATE_TOKEN_ANNOTATION));
+            let token_matches =
+                pod_token.map(String::as_str) == Some(target.template_token.as_str());
+            if !chain_matches {
+                // 旧 ReplicaSet 的 Pod（同 Deployment UID 下换代残留）——保留观察
+                // 作诊断，matches=false 不参与故障分类
+                let uid_for_observation = deployment_uid.clone();
+                observations.push(PodObservation::Observed(PodFailureObservation {
+                    deployment_uid: uid_for_observation,
+                    matches_target_template: false,
+                    pod_uid,
+                    pod_phase: status.phase.clone().unwrap_or_default(),
+                    scheduled: None,
+                    scheduling_reason: None,
+                    container_waiting_reason: None,
+                    container_waiting_message: None,
+                    container_last_exit: None,
+                    restart_count: 0,
+                    ready: false,
+                }));
+                continue;
+            }
+            let scheduled_condition = status
+                .conditions
+                .as_ref()
+                .and_then(|cs| cs.iter().find(|c| c.type_ == "PodScheduled"));
+            let scheduled = scheduled_condition.map(|c| c.status == "True");
+            let scheduling_reason = match scheduled_condition {
+                Some(c) if c.status == "False" => c.reason.clone(),
+                _ => None,
+            };
+            let app_container = status
+                .container_statuses
+                .as_ref()
+                .and_then(|v| v.iter().find(|c| c.name == APP_CONTAINER_NAME));
+            let (waiting_reason, waiting_message, last_exit, restart_count) = match app_container {
+                Some(cs) => {
+                    let waiting = cs.state.as_ref().and_then(|s| s.waiting.as_ref());
+                    let terminated = cs.last_state.as_ref().and_then(|s| s.terminated.as_ref());
+                    (
+                        waiting.and_then(|w| w.reason.clone()),
+                        waiting.and_then(|w| w.message.clone()),
+                        terminated.map(|t| ContainerExit {
+                            code: t.exit_code,
+                            reason: t.reason.clone(),
+                        }),
+                        cs.restart_count as u32,
+                    )
+                }
+                None => (None, None, None, 0),
+            };
+            let ready = status
+                .conditions
+                .as_ref()
+                .and_then(|cs| cs.iter().find(|c| c.type_ == "Ready"))
+                .map(|c| c.status == "True")
+                .unwrap_or(false);
+            let uid_for_observation = deployment_uid.clone();
+            observations.push(PodObservation::Observed(PodFailureObservation {
+                deployment_uid: uid_for_observation,
+                matches_target_template: token_matches,
+                pod_uid,
+                pod_phase: status.phase.clone().unwrap_or_default(),
+                scheduled,
+                scheduling_reason,
+                container_waiting_reason: waiting_reason,
+                container_waiting_message: waiting_message,
+                container_last_exit: last_exit,
+                restart_count,
+                ready,
+            }));
+        }
+        Ok(observations)
     }
 
     /// TCP 端口的 node_port：查 NodePort Service，按 port name 关联（TCP 对外时用）。
     /// Service 不存在（无 TCP 端口）返空 map。
-    async fn collect_tcp_nodeports(&self, app_id: &str) -> std::collections::HashMap<String, u16> {
+    async fn collect_tcp_nodeports(&self, app_id: &str) -> HashMap<String, u16> {
         self.services_api()
             .get(&self.app_nodeport_name(app_id))
             .await
@@ -245,330 +550,63 @@ impl KubernetesRuntime {
     }
 }
 
-/// phase 推导（纯函数）。
-///
-/// replicas=0 → Stopped；容器启动失败 → Error（优先于 ready 判定，避免 CrashLoop 期间
-/// 偶发 ready_replicas>0 被误报 Running）；就绪副本达标 → Running；否则 Starting。
-fn derive_phase(replicas: i32, ready_replicas: i32, error_message: &Option<String>) -> String {
-    if replicas == 0 {
-        "Stopped".to_string()
-    } else if error_message.is_some() {
-        "Error".to_string()
-    } else if ready_replicas >= replicas && ready_replicas > 0 {
-        "Running".to_string()
-    } else {
-        "Starting".to_string()
-    }
-}
+// 纯推导函数（derive_phase/derive_port_statuses/container_error_message/
+// probe_to_health_check）与测试已拆至 k8s_app_status_derive.rs；
+// re-export 保持 k8s_agent_query 的既有引用路径不变
+pub(crate) use super::k8s_app_status_derive::container_error_message;
+use super::k8s_app_status_derive::container_error_reason;
+use super::k8s_app_status_derive::unschedulable_message;
+use super::k8s_app_status_derive::{derive_phase, derive_port_statuses, probe_to_health_check};
 
-/// 端口状态推导（纯函数）：从 Deployment spec container ports + annotation port-expose +
-/// TCP nodeports 推导每端口 expose_type/external_port。
-///
-/// expose_type 优先用 annotation（create 时写入，TCP 不对外也能准确区分）；
-/// 缺失（旧 app）回退 NodePort 推导：在 NodePort Service 里 = Tcp，否则 Http。
-fn derive_port_statuses(
-    deploy: &Deployment,
-    tcp_nodeports: &std::collections::HashMap<String, u16>,
-) -> Vec<AppPortStatus> {
-    let port_expose: std::collections::HashMap<u16, ExposeType> = deploy
-        .metadata
-        .annotations
-        .as_ref()
-        .and_then(|a| a.get(PORT_EXPOSE_ANNOTATION))
-        .map(|s| parse_port_expose(s))
-        .unwrap_or_default();
-    deploy
-        .spec
-        .as_ref()
-        .and_then(|s| s.template.spec.as_ref())
-        .and_then(|s| s.containers.first())
-        .and_then(|c| c.ports.as_ref())
-        .map(|ps| {
-            ps.iter()
-                .map(|p| {
-                    let name = p.name.clone().unwrap_or_default();
-                    let port = p.container_port as u16;
-                    let (expose_type, external_port) = match port_expose.get(&port) {
-                        Some(ExposeType::Tcp) => {
-                            (ExposeType::Tcp, tcp_nodeports.get(&name).copied())
-                        }
-                        Some(ExposeType::Http) => (ExposeType::Http, None),
-                        // 回退：无 annotation（旧 app）—— 在 NodePort Service 里 = Tcp，否则 Http
-                        None => tcp_nodeports
-                            .get(&name)
-                            .map_or((ExposeType::Http, None), |np| (ExposeType::Tcp, Some(*np))),
-                    };
-                    AppPortStatus {
-                        name,
-                        port,
-                        expose_type,
-                        external_port,
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
-}
-
-/// 从容器状态提取"启动失败"原因（供 phase=Error 的 message）。
-///
-/// 命中条件（任一）：
-/// - `state.waiting.reason` ∈ {CrashLoopBackOff, ImagePullBackOff, ErrImagePull,
-///   CreateContainerConfigError, CreateContainerError, InvalidImageName, RunContainerError,
-///   StartError}（`ContainerCreating` 是正常拉起中间态，不在此列，不会被误判）
-/// - `state.terminated.exit_code != 0`（容器异常退出）
-///
-/// CrashLoop 时当前 `state=waiting`，真实退出码在 `last_state.terminated`，一并附带，
-/// 便于定位"挂在哪一次退出、退出码多少"。
-pub(crate) fn container_error_message(
-    cs: &k8s_openapi::api::core::v1::ContainerStatus,
-) -> Option<String> {
-    let state = cs.state.as_ref()?;
-    const BAD_WAITING: &[&str] = &[
-        "CrashLoopBackOff",
-        "ImagePullBackOff",
-        "ErrImagePull",
-        "CreateContainerConfigError",
-        "CreateContainerError",
-        "InvalidImageName",
-        "RunContainerError",
-        "StartError",
-    ];
-    if let Some(w) = state.waiting.as_ref()
-        && let Some(reason) = w.reason.as_ref()
-        && BAD_WAITING.contains(&reason.as_str())
-    {
-        let detail = w
-            .message
-            .as_ref()
-            .filter(|m| !m.is_empty())
-            .map(|m| format!(": {m}"))
-            .unwrap_or_default();
-        let term = cs
-            .last_state
-            .as_ref()
-            .and_then(|ls| ls.terminated.as_ref())
-            .map(|t| {
-                format!(
-                    " (last exit={}, reason={})",
-                    t.exit_code,
-                    t.reason.as_deref().unwrap_or("")
-                )
+// Kubernetes ByteString deserialization already removes the wire base64 layer.
+fn decode_secret_environment(
+    data: Option<std::collections::BTreeMap<String, k8s_openapi::ByteString>>,
+) -> ContainerRuntimeResult<Option<HashMap<String, String>>> {
+    data.map(|data| {
+        data.into_iter()
+            .map(|(key, value)| {
+                String::from_utf8(value.0)
+                    .map(|decoded| (key, decoded))
+                    .map_err(|_| {
+                        ContainerRuntimeError::ConfigurationError(
+                            "Application Secret contains a non-UTF-8 environment value".into(),
+                        )
+                    })
             })
-            .unwrap_or_default();
-        return Some(format!("{reason}{detail}{term}"));
+            .collect::<ContainerRuntimeResult<HashMap<String, String>>>()
+    })
+    .transpose()
+    .map(|values| values.filter(|values| !values.is_empty()))
+}
+
+#[cfg(test)]
+mod secret_environment_tests {
+    use super::*;
+    use k8s_openapi::api::core::v1::Secret;
+
+    #[test]
+    fn secret_wire_encoding_is_removed_exactly_once() {
+        let secret: Secret = serde_json::from_value(serde_json::json!({
+            "data": {"POSTGRES_PASSWORD": "WVdKag=="}
+        }))
+        .unwrap();
+        let values = decode_secret_environment(secret.data).unwrap().unwrap();
+        assert_eq!(values["POSTGRES_PASSWORD"], "YWJj");
     }
-    if let Some(t) = state.terminated.as_ref()
-        && t.exit_code != 0
-    {
-        let reason = t.reason.as_deref().unwrap_or("");
-        let msg = t
-            .message
-            .as_ref()
-            .filter(|m| !m.is_empty())
-            .map(|m| format!(": {m}"))
-            .unwrap_or_default();
-        return Some(format!(
-            "terminated: exit code={exit}, reason={reason}{msg}",
-            exit = t.exit_code
+
+    #[test]
+    fn invalid_utf8_is_an_error_instead_of_discarding_all_secrets() {
+        let secret: Secret = serde_json::from_value(serde_json::json!({
+            "data": {"POSTGRES_PASSWORD": "/w==", "OTHER": "b2s="}
+        }))
+        .unwrap();
+        assert!(matches!(
+            decode_secret_environment(secret.data),
+            Err(ContainerRuntimeError::ConfigurationError(_))
         ));
     }
-    None
 }
 
-#[cfg(all(test, feature = "kubernetes"))]
-mod tests {
-    use super::*;
-    use k8s_openapi::api::core::v1::{
-        ContainerState, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus,
-    };
-
-    // ---- derive_phase：四态 + 边界优先级 ----
-
-    #[test]
-    fn phase_zero_replicas_is_stopped_regardless_of_error() {
-        // replicas=0 最先判断：已缩容，即便容器报 error 也归 Stopped
-        assert_eq!(derive_phase(0, 0, &None), "Stopped");
-        assert_eq!(derive_phase(0, 0, &Some("CrashLoop".into())), "Stopped");
-    }
-
-    #[test]
-    fn phase_error_preferred_over_ready() {
-        // CrashLoop 期间偶发 ready_replicas>0，error 必须优先 → Error（防误报 Running）
-        assert_eq!(derive_phase(1, 1, &Some("err".into())), "Error");
-        assert_eq!(derive_phase(2, 2, &Some("err".into())), "Error");
-    }
-
-    #[test]
-    fn phase_running_when_ready_meets_replicas() {
-        assert_eq!(derive_phase(1, 1, &None), "Running");
-        assert_eq!(derive_phase(3, 3, &None), "Running");
-    }
-
-    #[test]
-    fn phase_starting_when_ready_below_replicas() {
-        assert_eq!(derive_phase(1, 0, &None), "Starting");
-        assert_eq!(derive_phase(3, 1, &None), "Starting");
-    }
-
-    #[test]
-    fn phase_running_requires_ready_positive() {
-        // ready_replicas > 0 是 Running 硬条件：replicas>0 但 ready=0 → Starting
-        assert_eq!(derive_phase(2, 0, &None), "Starting");
-    }
-
-    // ---- container_error_message：启动失败原因提取 ----
-
-    fn cs_waiting(reason: &str, message: Option<&str>) -> ContainerStatus {
-        ContainerStatus {
-            state: Some(ContainerState {
-                waiting: Some(ContainerStateWaiting {
-                    reason: Some(reason.to_string()),
-                    message: message.map(|m| m.to_string()),
-                }),
-                ..Default::default()
-            }),
-            last_state: None,
-            ..Default::default()
-        }
-    }
-
-    fn cs_terminated(exit: i32, reason: Option<&str>) -> ContainerStatus {
-        ContainerStatus {
-            state: Some(ContainerState {
-                terminated: Some(ContainerStateTerminated {
-                    exit_code: exit,
-                    reason: reason.map(|r| r.to_string()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            last_state: None,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn error_message_crashloop_with_detail() {
-        let cs = cs_waiting("CrashLoopBackOff", Some("back-off 5s"));
-        assert_eq!(
-            container_error_message(&cs).as_deref(),
-            Some("CrashLoopBackOff: back-off 5s")
-        );
-    }
-
-    #[test]
-    fn error_message_image_pull_no_detail() {
-        let cs = cs_waiting("ImagePullBackOff", None);
-        assert_eq!(
-            container_error_message(&cs).as_deref(),
-            Some("ImagePullBackOff")
-        );
-    }
-
-    #[test]
-    fn error_message_includes_last_terminated_exit_code() {
-        // CrashLoop 时当前 state=waiting，真实退出码在 last_state.terminated，应附带
-        let mut cs = cs_waiting("CrashLoopBackOff", None);
-        cs.last_state = Some(ContainerState {
-            terminated: Some(ContainerStateTerminated {
-                exit_code: 137,
-                reason: Some("OOMKilled".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        assert_eq!(
-            container_error_message(&cs).as_deref(),
-            Some("CrashLoopBackOff (last exit=137, reason=OOMKilled)")
-        );
-    }
-
-    #[test]
-    fn error_message_container_creating_is_none() {
-        // ContainerCreating 是正常拉起中间态，不在 BAD_WAITING → None（不误判 Error）
-        let cs = cs_waiting("ContainerCreating", None);
-        assert!(container_error_message(&cs).is_none());
-    }
-
-    #[test]
-    fn error_message_nonzero_exit() {
-        let cs = cs_terminated(137, Some("OOMKilled"));
-        assert_eq!(
-            container_error_message(&cs).as_deref(),
-            Some("terminated: exit code=137, reason=OOMKilled")
-        );
-    }
-
-    #[test]
-    fn error_message_zero_exit_is_none() {
-        let cs = cs_terminated(0, None);
-        assert!(container_error_message(&cs).is_none());
-    }
-
-    #[test]
-    fn error_message_empty_state_is_none() {
-        let cs = ContainerStatus {
-            state: None,
-            ..Default::default()
-        };
-        assert!(container_error_message(&cs).is_none());
-    }
-
-    // ---- derive_port_statuses：annotation 优先 + NodePort 回退 ----
-
-    fn deploy_from_json(json: &str) -> Deployment {
-        serde_json::from_str(json).expect("解析测试 Deployment 失败")
-    }
-
-    #[test]
-    fn port_status_annotation_tcp_with_nodeport() {
-        // annotation 标 5432=tcp + NodePort 有该 name → Tcp + external_port
-        let deploy = deploy_from_json(
-            r#"{"metadata":{"annotations":{"rcoder.io/port-expose":"80:http,5432:tcp"}},
-               "spec":{"template":{"spec":{"containers":[{"name":"app","ports":[
-                   {"name":"http","containerPort":80},
-                   {"name":"pg","containerPort":5432}
-               ]}]}}}}"#,
-        );
-        let mut nodeports = std::collections::HashMap::new();
-        nodeports.insert("pg".to_string(), 30001u16);
-        let ports = derive_port_statuses(&deploy, &nodeports);
-        assert_eq!(ports.len(), 2);
-        let pg = ports.iter().find(|p| p.port == 5432).unwrap();
-        assert_eq!(pg.expose_type, ExposeType::Tcp);
-        assert_eq!(pg.external_port, Some(30001));
-        let http = ports.iter().find(|p| p.port == 80).unwrap();
-        assert_eq!(http.expose_type, ExposeType::Http);
-        assert_eq!(http.external_port, None);
-    }
-
-    #[test]
-    fn port_status_no_annotation_falls_back_to_nodeport() {
-        // 旧 app 无 annotation：端口在 NodePort Service 里 = Tcp，否则 Http
-        let deploy = deploy_from_json(
-            r#"{"metadata":{},"spec":{"template":{"spec":{"containers":[{"name":"app","ports":[
-                {"name":"http","containerPort":80},
-                {"name":"pg","containerPort":5432}
-            ]}]}}}}"#,
-        );
-        let mut nodeports = std::collections::HashMap::new();
-        nodeports.insert("pg".to_string(), 30002u16);
-        let ports = derive_port_statuses(&deploy, &nodeports);
-        let pg = ports.iter().find(|p| p.port == 5432).unwrap();
-        assert_eq!(pg.expose_type, ExposeType::Tcp); // nodeport 里有 → Tcp
-        assert_eq!(pg.external_port, Some(30002));
-        let http = ports.iter().find(|p| p.port == 80).unwrap();
-        assert_eq!(http.expose_type, ExposeType::Http); // nodeport 里无 → Http
-    }
-
-    #[test]
-    fn port_status_no_container_ports_empty() {
-        let deploy = deploy_from_json(
-            r#"{"metadata":{"annotations":{"rcoder.io/port-expose":"80:http"}},
-               "spec":{"template":{"spec":{"containers":[{"name":"app"}]}}}}"#,
-        );
-        let ports = derive_port_statuses(&deploy, &std::collections::HashMap::new());
-        assert!(ports.is_empty());
-    }
-}
+#[cfg(test)]
+#[path = "k8s_app_query/pod_identity_tests.rs"]
+mod pod_identity_tests;

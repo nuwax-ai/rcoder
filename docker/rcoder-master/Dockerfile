@@ -2,7 +2,7 @@
 # 最终镜像 Dockerfile - master-rcoder
 # ============================================================================
 # 此 Dockerfile 使用多阶段构建：
-# 1. 第一阶段：在 rust:bookworm 中构建 Rust 项目
+# 1. 第一阶段：在 rust:trixie 中构建 Rust 项目
 # 2. 第二阶段：基于 master-rcoder-base 基础镜像运行
 # ============================================================================
 
@@ -12,7 +12,7 @@ ARG BASE_IMAGE=dev-master-rcoder-base:latest
 # ============================================================================
 # 第一阶段：构建 Rust 项目
 # ============================================================================
-FROM rust:bookworm AS rust-builder
+FROM rust:trixie AS rust-builder
 
 # 设置环境变量避免交互式提示
 ENV DEBIAN_FRONTEND=noninteractive
@@ -24,20 +24,24 @@ ARG TARGETARCH
 # 设置工作目录
 WORKDIR /build
 
-# 使用 LinuxMirrors 一键配置阿里云镜像源
-# 参考: https://github.com/SuperMantero/LinuxMirrors
-RUN curl -sSL https://linuxmirrors.cn/main.sh | bash -s -- \
-    --source mirrors.aliyun.com \
+# 使用 LinuxMirrors 配置 apt 源（默认腾讯云，可用 APT_MIRROR_HOST 构建参数切换）
+# 参考: https://github.com/SuperManito/LinuxMirrors
+ARG APT_MIRROR_HOST=mirrors.cloud.tencent.com
+RUN printf '%s\n' "${APT_MIRROR_HOST}" | LC_ALL=C grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$' || { echo "ERROR: APT_MIRROR_HOST must be a hostname, without URL scheme or path" >&2; exit 2; }; \
+    curl -fsSL https://linuxmirrors.cn/main.sh -o /tmp/nuwax-apt-mirror.sh && \
+    bash /tmp/nuwax-apt-mirror.sh \
+    --source "${APT_MIRROR_HOST}" \
     --protocol https \
     --use-intranet-source false \
     --install-epel false \
     --backup false \
     --upgrade-software false \
     --clean-cache true \
-    --ignore-backup-tips
+    --ignore-backup-tips && \
+    rm -f /tmp/nuwax-apt-mirror.sh
 
 # 安装 Rust 构建所需的额外系统依赖
-# rust:bookworm (= buildpack-deps:bookworm 完整版) 已预装 build-essential / libssl-dev / git / curl 等,
+# rust:trixie (= buildpack-deps:trixie 完整版) 已预装 build-essential / libssl-dev / git / curl 等,
 # 这里补镜像里没有的: cmake + protobuf (rcoder/agent_runner/file-server gRPC 依赖); pkg-config 保留兜底
 RUN apt-get update && apt-get install -y \
     cmake \
@@ -46,7 +50,7 @@ RUN apt-get update && apt-get install -y \
     libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Rust 工具链已由 rust:bookworm 镜像提供 (cargo 在 /usr/local/cargo/bin, CARGO_HOME=/usr/local/cargo, 已在 PATH)。
+# Rust 工具链已由 rust:trixie 镜像提供 (cargo 在 /usr/local/cargo/bin, CARGO_HOME=/usr/local/cargo, 已在 PATH)。
 # builder 阶段 cargo 镜像 (rsproxy-sparse) 写到 /usr/local/cargo/config.toml 生效
 # (仓库根 .cargo/config.toml 为空, 故用 printf 内联生成, 不污染宿主)
 RUN mkdir -p /usr/local/cargo && \
@@ -57,10 +61,13 @@ RUN mkdir -p /usr/local/cargo && \
 COPY . .
 
 # 🔧 支持 CARGO_FLAGS 参数，允许外部传递 feature flags
+# RUSTFLAGS：dial9 feature 在 CARGO_FLAGS 中时由 make/docker.mk 传入
+# --cfg tokio_unstable（runtime hooks 全量 task 覆盖必需）
 ARG CARGO_FLAGS=""
-RUN echo "🔧 Cargo flags: ${CARGO_FLAGS}" && \
-    cargo build --release --bin rcoder --bin agent_runner ${CARGO_FLAGS} && \
-    cargo build --release -p file-server --bin file-server
+ARG RUSTFLAGS=""
+ENV RUSTFLAGS="${RUSTFLAGS}"
+RUN echo "🔧 Cargo flags: ${CARGO_FLAGS} RUSTFLAGS: ${RUSTFLAGS}" && \
+    cargo build --release --bin rcoder --bin agent_runner ${CARGO_FLAGS}
 
 # ============================================================================
 # 第二阶段：运行阶段（基于基础镜像）
@@ -81,15 +88,24 @@ WORKDIR /app
 
 # --- 静态层（代码无关）---
 
-# 安装 git（用于 nuwaxcode 源码安装）
+# 安装 git（用于 nuwaxcode 源码安装）+ 容器内源码构建工具。
+# cmake/protobuf（tonic gRPC → protoc/libprotobuf；duckdb → cmake）与 rsync
+# （observability taskdump 诊断副本复制）固化进镜像：dev-hot 热编译与
+# tools/taskdump/build-taskdump-linux.sh 不再每次运行时 apt 补装（见
+# docker/dev-hot-build.sh 前言与 docs/observability.md taskdump 节）。
 RUN apt-get update && apt-get install -y \
     git \
+    cmake \
+    pkg-config \
+    protobuf-compiler \
+    libprotobuf-dev \
+    rsync \
     && rm -rf /var/lib/apt/lists/*
 
 # 复制 .npmrc 文件
 COPY docker/rcoder-master/.npmrc /root/.npmrc
 
-# Rust 工具链 + cargo rsproxy 配置 已由 base (rust:bookworm) 提供:
+# Rust 工具链 + cargo rsproxy 配置 已由 base (rust:trixie) 提供:
 # cargo 在 /usr/local/cargo/bin, config 在 /usr/local/cargo/config.toml (base COPY)。
 # dev 容器 cargo run/build 直接可用, 不再单独 rustup 安装。
 
@@ -101,13 +117,16 @@ RUN  echo "Cache bust: ${CACHEBUST}" && npm install -g claude-code-acp-ts@latest
 RUN echo "Cache bust: ${CACHEBUST}" && npm install -g @zed-industries/codex-acp
 
 # 安装 nuwaxcode（频繁更新的工具，放在最终镜像以加快构建）
-RUN echo "Cache bust: ${CACHEBUST}" && npm i -g nuwaxcode@latest
+# 使用官方 npm 源，国内镜像可能未同步平台二进制包（nuwaxcode-linux-arm64 等）
+RUN echo "Cache bust: ${CACHEBUST}" && npm i -g nuwaxcode@latest --registry=https://registry.npmjs.org/
 
 # 安装 nuwax-file-server（文件服务器）
-RUN echo "Cache bust: ${CACHEBUST}" && npm i -g nuwax-file-server@latest
+# 使用官方 npm 源，国内镜像可能未同步
+RUN echo "Cache bust: ${CACHEBUST}" && npm i -g nuwax-file-server@latest --registry=https://registry.npmjs.org/
 
 # 根据codex-acp改造的codex cli,使用cli是: nuwax-codex-acp
-RUN  echo "Cache bust: ${CACHEBUST}" &&  npm install -g nuwax-codex-acp@latest
+# 使用官方 npm 源，国内镜像可能未同步
+RUN  echo "Cache bust: ${CACHEBUST}" &&  npm install -g nuwax-codex-acp@latest --registry=https://registry.npmjs.org/
 
 # 配置 nuwaxcode - 禁用 websearch, webfetch 和 question 权限
 RUN mkdir -p /root/.config/opencode && \
@@ -116,6 +135,8 @@ RUN mkdir -p /root/.config/opencode && \
 # ============================================================================
 # 🖥️ ttyd Web 终端配置
 # ============================================================================
+# 默认 root 权限；终端工作目录仍由项目 --cwd 指定
+ENV TTYD_USER=root
 # 复制 ttyd 启动脚本和自定义前端页面
 COPY docker/rcoder-master/ttyd/start-ttyd.sh /usr/local/bin/start-ttyd.sh
 COPY docker/rcoder-master/ttyd/ttyd-index.html /usr/local/share/ttyd/index.html
@@ -131,8 +152,6 @@ RUN chmod +x /app/agent-runner-start.sh
 RUN mkdir -p /app/bin
 COPY --from=rust-builder /build/target/release/rcoder /app/bin/rcoder
 COPY --from=rust-builder /build/target/release/agent_runner /app/bin/agent_runner
-# Rust file-server (替代 node nuwax-file-server; node 版仍经 npm i -g 保留作回滚)
-COPY --from=rust-builder /build/target/release/file-server /app/bin/file-server
 
 # 只有在二进制文件存在时才复制（避免feature构建时的错误）
 RUN if [ -f /build/target/release/codex-acp-agent ]; then \
@@ -140,7 +159,12 @@ RUN if [ -f /build/target/release/codex-acp-agent ]; then \
     fi
 
 # 设置执行权限
-RUN chmod +x /app/bin/rcoder /app/bin/agent_runner /app/bin/file-server
+RUN chmod +x /app/bin/rcoder /app/bin/agent_runner
+
+# Both shipped binaries must load and exit successfully in the actual runtime stage.
+# A healthy dev-hot rcoder alone does not prove the embedded WebChat agent can run.
+COPY docker/verify-runtime-binaries.py /usr/local/bin/verify-runtime-binaries.py
+RUN python3 /usr/local/bin/verify-runtime-binaries.py /app/bin
 
 # 暴露端口
 EXPOSE 8086

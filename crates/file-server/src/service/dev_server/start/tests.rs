@@ -1,0 +1,2559 @@
+use super::manifest::{append_managed_launch_env, platform_launch_env};
+use super::*;
+
+#[test]
+fn managed_launch_context_is_complete_and_scoped_to_the_platform_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = std::fs::canonicalize(temp.path()).unwrap().join("11");
+    let state = source.join("state/11");
+    std::fs::create_dir_all(&state).unwrap();
+    let environment = [
+        ("SERVICE_TYPE", std::ffi::OsString::from("user-app-builder")),
+        ("APP_CLI_MANAGED", "1".into()),
+        ("PROJECT_ID", "11".into()),
+        (
+            "USERAPP_WORKSPACE_DIR",
+            source.parent().unwrap().as_os_str().to_owned(),
+        ),
+        ("APP_CLI_RUNTIME_WORKSPACE", source.clone().into_os_string()),
+        ("APP_CLI_STATE_ROOT", state.clone().into_os_string()),
+    ];
+    let lookup = |key: &str| {
+        environment
+            .iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| value.clone())
+    };
+    let mut extra = Vec::new();
+    platform_launch_env(
+        Some(std::ffi::OsStr::new("11")),
+        Some(state.as_os_str()),
+        &source,
+        &mut extra,
+    );
+    append_managed_launch_env(&source, &state, &mut extra, lookup).unwrap();
+    for (key, value) in &environment {
+        assert!(
+            extra
+                .iter()
+                .any(|(name, actual)| name == key && std::ffi::OsStr::new(actual) == value)
+        );
+    }
+    assert!(
+        append_managed_launch_env(&source.join("foreign"), &state, &mut Vec::new(), lookup)
+            .is_err()
+    );
+    let mut standalone = Vec::new();
+    append_managed_launch_env(&source, &state, &mut standalone, |_| None).unwrap();
+    assert!(standalone.is_empty());
+
+    let mut stale = vec![
+        ("SERVICE_TYPE".into(), "userapp-builder".into()),
+        (
+            "APP_CLI_RUNTIME_WORKSPACE".into(),
+            source.join("code").display().to_string(),
+        ),
+    ];
+    append_managed_launch_env(&source, &state, &mut stale, |key| {
+        if key == "APP_CLI_RUNTIME_WORKSPACE" {
+            Some(source.join("code").into_os_string())
+        } else {
+            lookup(key)
+        }
+    })
+    .unwrap();
+    for (name, _) in &environment {
+        assert_eq!(
+            stale.iter().filter(|(key, _)| key == name).count(),
+            1,
+            "managed child authority must not include duplicate keys: {name}"
+        );
+    }
+    assert!(
+        stale
+            .iter()
+            .any(|(key, value)| key == "APP_CLI_RUNTIME_WORKSPACE"
+                && value == &source.display().to_string())
+    );
+}
+
+// These two environment-injection tests execute a POSIX shell fixture.
+#[cfg(all(test, unix))]
+mod cases {
+    use super::*;
+    use std::time::Duration;
+
+    /// 假编排器测试装配：脚本 dump 自身 env 后驻留 60s（宽松就绪——HTTP 探不到
+    /// 但进程存活即过，与 vite 路径同语义）。返回 env dump 文件路径。
+    fn fake_orchestrator(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dump = dir.join("env.txt");
+        let script = dir.join("fake-app-cli.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\n[ \"$1\" = run ] && [ \"$2\" = --workspace ] || exit 2\nenv | sort > '{}'\nsleep 60\n", dump.display()),
+        )
+        .expect("write fake orchestrator");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod script");
+        }
+        (dump, script)
+    }
+
+    fn manager_with(script: &Path, logs: &Path) -> DevServerManager {
+        let mut config = crate::Config::from_env().expect("test config");
+        config.app_cli_bin = Some(script.display().to_string());
+        config.log_base_dir = logs.to_path_buf();
+        // 探测地址指向必然拒绝连接的端口：spawn 前探测恒 fallthrough，
+        // 避免与 owner_probe_branches（占用 3010）跨测试进程竞争
+        config.app_cli_admin_probe_addr = "127.0.0.1:1".to_string();
+        // 快速宽松就绪（假编排器不监听 9080，走"进程存活"分支）
+        config.dev_alive_max_wait_ms = 300;
+        config.dev_alive_check_timeout_ms = 100;
+        config.dev_alive_poll_interval_ms = 50;
+        DevServerManager::new(Arc::new(config))
+    }
+
+    /// 等待假编排器落盘 env dump（spawn 异步于断言）。
+    async fn wait_dump(dump: &Path) -> String {
+        for _ in 0..200 {
+            if let Ok(txt) = std::fs::read_to_string(dump)
+                && !txt.is_empty()
+            {
+                return txt;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("fake orchestrator env dump not written: {}", dump.display());
+    }
+
+    /// R1（DEV-1 Fix A 事故锚点 app 211）：平台身份指向本项目时
+    /// PROJECT_ID/APP_CLI_STATE_ROOT 必须透传编排子进程（原 env_clear 白名单
+    /// 缺这两键 → 子进程 standalone registry 段与父进程平台根分岔）。
+    /// 纯函数反例覆盖三种身份组合；接线用默认进程 env（无平台变量）验证
+    /// standalone 不注入。
+    #[test]
+    fn platform_launch_env_decides_passthrough_by_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("211");
+        std::fs::create_dir_all(&ws).unwrap();
+        let state_root = dir.path().join("state").join("211");
+
+        // 匹配：两键透传 + 根返回。
+        let mut extra = Vec::new();
+        let root = platform_launch_env(
+            Some(std::ffi::OsStr::new("211")),
+            Some(state_root.as_os_str()),
+            &ws,
+            &mut extra,
+        );
+        assert_eq!(root.as_deref(), Some(state_root.as_path()));
+        assert!(extra.contains(&("PROJECT_ID".into(), "211".into())));
+        assert!(extra.contains(&(
+            "APP_CLI_STATE_ROOT".into(),
+            state_root.display().to_string()
+        )));
+
+        // 不匹配：完全不注入（standalone 语义）。
+        let mut extra = Vec::new();
+        let root = platform_launch_env(
+            Some(std::ffi::OsStr::new("other-app")),
+            Some(state_root.as_os_str()),
+            &ws,
+            &mut extra,
+        );
+        assert!(root.is_none());
+        assert!(extra.is_empty(), "mismatched identity must forward nothing");
+
+        // 无平台变量：standalone。
+        let mut extra = Vec::new();
+        let root = platform_launch_env(None, None, &ws, &mut extra);
+        assert!(root.is_none());
+        assert!(extra.is_empty());
+
+        // 匹配但无显式根：仍透传 PROJECT_ID（identity 连续性），根为 None。
+        let mut extra = Vec::new();
+        let root = platform_launch_env(Some(std::ffi::OsStr::new("211")), None, &ws, &mut extra);
+        assert!(root.is_none());
+        assert!(extra.contains(&("PROJECT_ID".into(), "211".into())));
+    }
+
+    /// R1 接线（真实 spawn）：测试进程无平台变量（standalone）时编排子进程
+    /// env 不含 PROJECT_ID——与 platform_launch_env 决策一致的端到端锚点。
+    #[tokio::test]
+    async fn start_dev_manifest_standalone_env_has_no_platform_identity() {
+        if std::env::var_os("PROJECT_ID").is_some() {
+            // 宿主环境带平台变量时跳过（避免与决策函数的匹配分支耦合）。
+            return;
+        }
+        let ws = tempfile::tempdir().expect("workspace tempdir");
+        std::fs::write(ws.path().join("workspace.manifest.toml"), "").expect("marker");
+        let dir = tempfile::tempdir().expect("harness tempdir");
+        let (dump, script) = fake_orchestrator(dir.path());
+        let manager = manager_with(&script, &dir.path().join("logs"));
+        manager
+            .start_dev(
+                "standalone-env-test",
+                ws.path(),
+                crate::service::dev_server::DevLaunch {
+                    base_path: None,
+                    hooks: None,
+                    pg: None,
+                    request_context: None,
+                    artifact_release_id: None,
+                },
+            )
+            .await
+            .expect("start manifest dev");
+        let env_txt = wait_dump(&dump).await;
+        assert!(
+            !env_txt.lines().any(|l| l.starts_with("PROJECT_ID=")),
+            "standalone spawn must not receive platform identity:\n{env_txt}"
+        );
+        manager
+            .stop_dev("standalone-env-test")
+            .await
+            .expect("stop dev");
+    }
+
+    /// pg 凭据注入：start_dev_manifest(Some) 必须把 POSTGRES_USER/PASSWORD
+    /// 写进编排进程 env（覆盖容器默认透传）——save-db-credential 改密后的
+    /// 新凭据经此到达服务进程；None 则维持容器 env 透传行为（父进程无该键
+    /// 时结果里不出现）。
+    #[tokio::test]
+    async fn start_dev_manifest_pg_credential_env_injection() {
+        let ws = tempfile::tempdir().expect("workspace tempdir");
+        // manifest 分流标记（内容不消费——分流只看存在性；假编排器不读它）
+        std::fs::write(ws.path().join("workspace.manifest.toml"), "").expect("manifest marker");
+        let dir = tempfile::tempdir().expect("harness tempdir");
+        let (dump, script) = fake_orchestrator(dir.path());
+        let manager = manager_with(&script, &dir.path().join("logs"));
+
+        // Some(pg)：注入覆盖
+        let pg = shared_types::StartPgCredential {
+            username: "biz_user".into(),
+            password: "s3cret".into(),
+        };
+        let started = manager
+            .start_dev(
+                "pg-inject-test",
+                ws.path(),
+                crate::service::dev_server::DevLaunch {
+                    base_path: None,
+                    hooks: None,
+                    pg: Some(&pg),
+                    request_context: None,
+                    artifact_release_id: None,
+                },
+            )
+            .await
+            .expect("start manifest dev");
+        assert_eq!(started.port, shared_types::APP_ENTRY_PORT);
+        let env_txt = wait_dump(&dump).await;
+        for expect in [
+            "POSTGRES_USER=biz_user",
+            "POSTGRES_PASSWORD=s3cret",
+            "APP_CLI_RUN_PROFILE=dev",
+        ] {
+            assert!(
+                env_txt.lines().any(|l| l == expect),
+                "expect {expect} in orchestrator env:\n{env_txt}"
+            );
+        }
+        manager.stop_dev("pg-inject-test").await.expect("stop dev");
+
+        // None：不注入——期望值 = 父进程 env 透传结果（无则不出现）
+        std::fs::remove_file(&dump).expect("reset dump");
+        let started = manager
+            .start_dev(
+                "pg-inject-none-test",
+                ws.path(),
+                crate::service::dev_server::DevLaunch {
+                    base_path: None,
+                    hooks: None,
+                    pg: None,
+                    request_context: None,
+                    artifact_release_id: None,
+                },
+            )
+            .await
+            .expect("start manifest dev (no pg)");
+        assert_eq!(started.port, shared_types::APP_ENTRY_PORT);
+        let env_txt = wait_dump(&dump).await;
+        for (key, injected) in [
+            ("POSTGRES_USER", "biz_user"),
+            ("POSTGRES_PASSWORD", "s3cret"),
+        ] {
+            let lines: Vec<String> = env_txt
+                .lines()
+                .filter(|l| l.starts_with(&format!("{key}=")))
+                .map(|l| l.to_string())
+                .collect();
+            match std::env::var(key) {
+                Ok(parent) => {
+                    // 白名单透传：值 = 父进程值（绝不能是注入值）
+                    assert_eq!(lines, vec![format!("{key}={parent}")], "passthrough {key}");
+                }
+                Err(_) => assert!(lines.is_empty(), "{key} 不得凭空出现: {lines:?}"),
+            }
+            assert!(
+                !lines.iter().any(|l| l == &format!("{key}={injected}")),
+                "None 时不得注入 {key}"
+            );
+        }
+        manager
+            .stop_dev("pg-inject-none-test")
+            .await
+            .expect("stop dev");
+    }
+}
+
+#[cfg(test)]
+mod owner_reuse_tests {
+    use super::*;
+    use crate::Config;
+    use std::sync::Arc;
+
+    /// P3-02 探测分支（串行四阶段——nextest 每测试独立进程，3010 需独占）：
+    /// ① 无监听 → fallthrough spawn；② legacy 应答 → 拒绝；
+    /// ③ 匹配 owner + token → 经运行 API 复用并登记 external；
+    /// ④ foreign workspace → 拒绝。
+    #[tokio::test]
+    async fn owner_probe_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::from_env().expect("test config");
+        config.log_base_dir = dir.path().join("logs");
+        let mgr = DevServerManager::new(Arc::new(config));
+
+        // ① 无监听（此阶段 3010 必须空闲——串行前提）
+        let ws_fresh = dir.path().join("ws-fresh");
+        std::fs::create_dir_all(&ws_fresh).unwrap();
+        assert!(
+            mgr.reuse_or_refuse_owner("userapp:app", &ws_fresh, None, None, None, None)
+                .await
+                .expect("probe")
+                .is_none(),
+            "no responder must fall through to spawn"
+        );
+
+        // ② legacy app-cli 应答（仅 /v1/deploy/status，真实 wire 信封：
+        // HttpResult 外壳 + data 内嵌 protocol_version——R2 事故锚点：顶层
+        // 裸值曾被误当契约）
+        #[derive(serde::Serialize)]
+        struct LegacyDeployStatus {
+            protocol_version: u32,
+            phase: &'static str,
+        }
+        let legacy = axum::Router::new().route(
+            "/v1/deploy/status",
+            axum::routing::get(|| async {
+                axum::Json(shared_types::HttpResult::success(LegacyDeployStatus {
+                    protocol_version: 4,
+                    phase: "running",
+                }))
+            }),
+        );
+        let legacy_mock = serve_mock(legacy).await;
+        let ws_legacy = dir.path().join("ws-legacy");
+        std::fs::create_dir_all(&ws_legacy).unwrap();
+        let error = mgr
+            .reuse_or_refuse_owner("userapp:app", &ws_legacy, None, None, None, None)
+            .await
+            .expect_err("legacy responder must be refused");
+        let AppError::Business(message) = &error else {
+            panic!("expected business error, got {error:?}")
+        };
+        assert!(
+            message.contains("legacy app-cli"),
+            "diagnostic should name legacy: {message}"
+        );
+
+        legacy_mock.release().await;
+
+        // ③ 匹配 owner + token 文件 → 复用
+        let ws_reuse = dir.path().join("ws-reuse");
+        std::fs::create_dir_all(&ws_reuse).unwrap();
+        let state_root = dir.path().join(".app-cli-state").join("unknown-app");
+        std::fs::create_dir_all(&state_root).unwrap();
+        std::fs::write(state_root.join("token"), "test-token").unwrap();
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let owner = mock_owner_router("hashed-workspace", &ws_reuse).with_state(polls);
+        let owner_mock = serve_mock(owner).await;
+        let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = received.clone();
+        let hooks = crate::service::dev_server::supervise::DevEventHooks {
+            on_line: std::sync::Arc::new(move |json: &str| {
+                sink.lock().unwrap().push(json.to_string());
+            }) as process::OnLineCallback,
+            on_end: None,
+            launch_deadline: None,
+            on_submitted: None,
+        };
+        let started = mgr
+            .reuse_or_refuse_owner("userapp:app", &ws_reuse, Some(hooks), None, None, None)
+            .await
+            .expect("reuse path")
+            .expect("must reuse existing owner");
+        assert_eq!(started.port, shared_types::APP_ENTRY_PORT);
+        // R06：事件按游标重放转发为旧 EVT 形态——服务级事件透传、纯 stage
+        // 记录跳过、终态 Completed 映射为平台 orchestration_done（真实 owner
+        // 成功也产生 Done 终局）
+        let (got_done, got_service) = {
+            let events = received.lock().unwrap();
+            (
+                events.iter().any(|json| {
+                    json.contains("\"event\":\"orchestration_done\"")
+                        && json.contains("\"failed\":[]")
+                }),
+                events.iter().any(|json| {
+                    json.contains("\"event\":\"service_starting\"") && json.contains("\"frontend\"")
+                }),
+            )
+        };
+        assert!(
+            got_done,
+            "terminal Completed must map to orchestration_done with empty failed; got {:?}",
+            received.lock().unwrap()
+        );
+        assert!(
+            got_service,
+            "service events must pass through; got {:?}",
+            received.lock().unwrap()
+        );
+        {
+            let registered = lock(&mgr.processes).unwrap();
+            let entry = registered.get("userapp:app").expect("registered");
+            assert_eq!(
+                entry.external_owner.as_ref().expect("external").token,
+                "test-token"
+            );
+        }
+
+        owner_mock.release().await;
+
+        // ④ foreign workspace → 拒绝
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let foreign = mock_owner_router("ws-someone-else", &dir.path().join("someone-else"))
+            .with_state(polls);
+        let _foreign_mock = serve_mock(foreign).await;
+        let ws_mine = dir.path().join("ws-mine");
+        std::fs::create_dir_all(&ws_mine).unwrap();
+        let error = mgr
+            .reuse_or_refuse_owner("userapp:app", &ws_mine, None, None, None, None)
+            .await
+            .expect_err("foreign owner must be refused");
+        let AppError::Business(message) = &error else {
+            panic!("expected business error, got {error:?}")
+        };
+        assert!(
+            message.contains("different app-cli owner"),
+            "diagnostic should name the conflict: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_restart_attaches_verified_owner_without_prior_registration_or_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let root = dir.path().join(".app-cli-state/unknown-app");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("token"), "test-token").unwrap();
+        let requests = Arc::new(Mutex::new(
+            Vec::<shared_types::RuntimeOperationRequest>::new(),
+        ));
+        let captured = requests.clone();
+        let router = mock_owner_router("hashed-workspace", &workspace)
+            .with_state(Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let captured = captured.clone();
+                    async move {
+                        if request.method() == axum::http::Method::POST {
+                            assert_eq!(request.headers()["x-deploy-token"], "test-token");
+                            let (parts, body) = request.into_parts();
+                            let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                            captured
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::from_slice(&bytes).unwrap());
+                            next.run(axum::extract::Request::from_parts(
+                                parts,
+                                axum::body::Body::from(bytes),
+                            ))
+                            .await
+                        } else {
+                            next.run(request).await
+                        }
+                    }
+                },
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::from_env().unwrap();
+        config.log_base_dir = dir.path().join("logs");
+        config.app_cli_admin_probe_addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let manager = DevServerManager::new(Arc::new(config));
+        assert!(manager.list_dev().unwrap().is_empty());
+        manager
+            .restart_dev(
+                "userapp:123",
+                &workspace,
+                None,
+                None,
+                None,
+                Some("new-explicit-task"),
+            )
+            .await
+            .unwrap();
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(
+                requests.len(),
+                1,
+                "Restart must not issue a preliminary Stop"
+            );
+            assert_eq!(
+                requests[0].kind,
+                shared_types::RuntimeOperationKind::Restart
+            );
+            assert_eq!(requests[0].expected_runtime_instance_id, "instance-test");
+            assert_eq!(
+                requests[0].request_context.as_deref(),
+                Some("new-explicit-task")
+            );
+            assert_eq!(requests[0].expected_revision, 0);
+        }
+        // A different canonical project must not use the same authenticated control endpoint.
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        assert!(
+            manager
+                .restart_dev(
+                    "userapp:456",
+                    &other,
+                    None,
+                    None,
+                    None,
+                    Some("foreign-task")
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        server.abort();
+    }
+
+    /// DEV-R1（正常 serve 复用不被磁盘 phase 挡住）：同项目 serve owner 存活
+    ///（identity/status/operations 全 wire），磁盘监督记录 phase=ready——
+    /// 复用分支先于本地 run 分类执行：start_dev 返回复用结果（提交
+    /// Restart），不以"still running"拒绝（旧序在此 phase 直接拒绝 Start）。
+    #[tokio::test]
+    async fn ready_serve_owner_is_reused_despite_ready_supervision_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("ws-serve-reuse");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("workspace.manifest.toml"), "# t\n").unwrap();
+        // registry 登记 + phase=ready 的监督记录（发现侧会将其视为活 run 目标）。
+        let state_root = dir.path().join(".app-cli-state").join("unknown-app");
+        std::fs::create_dir_all(&state_root).unwrap();
+        std::fs::write(state_root.join("token"), "test-token").unwrap();
+        let canonical = std::fs::canonicalize(&workspace).unwrap();
+        let registry = std::collections::BTreeMap::from([(
+            canonical.to_string_lossy().into_owned(),
+            "unknown-app".to_string(),
+        )]);
+        std::fs::write(
+            dir.path().join(".app-cli-state/registry.json"),
+            serde_json::to_string(&registry).unwrap(),
+        )
+        .unwrap();
+        let discovery = crate::service::dev_server::supervision_tests::WireDiscoveryFile {
+            version: 2,
+            instance: "serve-supervisor".into(),
+            address: "127.0.0.1:1".into(),
+            token: "fixture-token".into(),
+            snapshot: runtime_supervisor::Snapshot {
+                version: 1,
+                binding: runtime_supervisor::Binding {
+                    component: "app-cli".into(),
+                    resource: canonical,
+                },
+                supervisor_id: "serve-supervisor".into(),
+                generation: None,
+                phase: runtime_supervisor::Phase::Ready,
+                intent: runtime_supervisor::Intent::Run,
+                operation_id: None,
+                error: None,
+                problem: None,
+            },
+            requests: Vec::new(),
+        };
+        std::fs::write(
+            state_root.join("supervisor.json"),
+            serde_json::to_vec(&discovery).unwrap(),
+        )
+        .unwrap();
+
+        let requests = Arc::new(Mutex::new(
+            Vec::<shared_types::RuntimeOperationRequest>::new(),
+        ));
+        let captured = requests.clone();
+        let router = mock_owner_router("hashed-workspace", &workspace)
+            .with_state(Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let captured = captured.clone();
+                    async move {
+                        if request.method() == axum::http::Method::POST {
+                            let (parts, body) = request.into_parts();
+                            let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                            captured
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::from_slice(&bytes).unwrap());
+                            next.run(axum::extract::Request::from_parts(
+                                parts,
+                                axum::body::Body::from(bytes),
+                            ))
+                            .await
+                        } else {
+                            next.run(request).await
+                        }
+                    }
+                },
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::from_env().unwrap();
+        config.log_base_dir = dir.path().join("logs");
+        config.app_cli_admin_probe_addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let manager = DevServerManager::new(Arc::new(config));
+
+        let started = manager
+            .start_dev(
+                "userapp:serve-reuse",
+                &workspace,
+                crate::service::dev_server::DevLaunch {
+                    base_path: None,
+                    hooks: None,
+                    pg: None,
+                    request_context: None,
+                    artifact_release_id: None,
+                },
+            )
+            .await
+            .expect("a ready serve owner must be reused, not refused by the disk phase");
+        // 复用结果形态（owner 进程保留，pid 0 + 固定入口端口）。
+        assert_eq!(started.pid, 0);
+        assert_eq!(started.port, shared_types::APP_ENTRY_PORT);
+        let posted = requests.lock().unwrap();
+        assert_eq!(
+            posted.len(),
+            1,
+            "exactly the reuse Restart submission: {posted:?}"
+        );
+        assert_eq!(posted[0].kind, shared_types::RuntimeOperationKind::Restart);
+        server.abort();
+    }
+
+    /// Actual manager/HTTP-owner coordination must not expire a valid Source
+    /// operation at a hidden 180s while the configured launch budget remains.
+    /// This is a protocol counterexample, not a container/AI validation.
+    #[tokio::test]
+    async fn source_owner_launch_uses_configured_budget_beyond_migration_300_seconds() {
+        source_owner_budget_case(None, Duration::ZERO, false).await;
+    }
+
+    #[tokio::test]
+    async fn short_parent_launch_deadline_ends_observation_without_rewriting_original_operation() {
+        source_owner_budget_case(Some(Duration::from_secs(20)), Duration::ZERO, true).await;
+    }
+
+    #[tokio::test]
+    async fn consumed_parent_launch_budget_is_not_reset_at_owner_submission() {
+        source_owner_budget_case(
+            Some(Duration::from_secs(500)),
+            Duration::from_secs(480),
+            true,
+        )
+        .await;
+    }
+
+    async fn source_owner_budget_case(
+        parent_budget: Option<Duration>,
+        consumed: Duration,
+        expect_expiration: bool,
+    ) {
+        use axum::response::IntoResponse as _;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("source");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("workspace.manifest.toml"),
+            "# protocol fixture\n",
+        )
+        .unwrap();
+        let root = dir.path().join(".app-cli-state/unknown-app");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("token"), "test-token").unwrap();
+        let requests: Arc<Mutex<Vec<shared_types::RuntimeOperationRequest>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let ready = Arc::new(AtomicBool::new(false));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let router = mock_owner_router("hashed-workspace", &workspace)
+            .with_state(Arc::new(AtomicUsize::new(0)))
+            .layer(axum::middleware::from_fn({
+                let requests = requests.clone();
+                let ready = ready.clone();
+                let polls = polls.clone();
+                let accepted = accepted.clone();
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let requests = requests.clone();
+                    let ready = ready.clone();
+                    let polls = polls.clone();
+                    let accepted = accepted.clone();
+                    async move {
+                        let path = request.uri().path().to_owned();
+                        if request.method() == axum::http::Method::POST {
+                            assert_eq!(request.headers()["x-deploy-token"], "test-token");
+                            let (parts, body) = request.into_parts();
+                            let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                            requests
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::from_slice(&bytes).unwrap());
+                            return next
+                                .run(axum::extract::Request::from_parts(
+                                    parts,
+                                    axum::body::Body::from(bytes),
+                                ))
+                                .await;
+                        }
+                        if let Some(id) = path.strip_prefix("/v1/runtime/operations/")
+                            && !id.contains('/')
+                        {
+                            if !requests.lock().unwrap().iter().any(|request| request.operation_id == id) {
+                                return (axum::http::StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"message":"original operation has not been submitted"}))).into_response();
+                            }
+                            polls.fetch_add(1, Ordering::SeqCst);
+                            accepted.notify_one();
+                            let state = if ready.load(Ordering::SeqCst) {
+                                shared_types::RuntimeOperationState::Succeeded
+                            } else {
+                                shared_types::RuntimeOperationState::Accepted
+                            };
+                            let mut view = operation_view(id, state);
+                            let original = requests.lock().unwrap().iter().find(|request| request.operation_id == id).cloned().unwrap();
+                            view.kind = original.kind;
+                            view.request_digest = shared_types::runtime_request_digest(&original).unwrap();
+                            return axum::Json(envelope(&view)).into_response();
+                        }
+                        next.run(request).await
+                    }
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::from_env().unwrap();
+        config.log_base_dir = dir.path().join("logs");
+        config.app_cli_admin_probe_addr = listener.local_addr().unwrap().to_string();
+        config.dev_command_timeout_secs = 600;
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let manager = Arc::new(DevServerManager::new(Arc::new(config)));
+        let deadline = parent_budget.map(|budget| tokio::time::Instant::now() + budget);
+        if !consumed.is_zero() {
+            tokio::time::pause();
+            tokio::time::advance(consumed).await;
+            tokio::time::resume();
+        }
+        let hooks = deadline.map(|deadline| {
+            let mut hooks = crate::service::dev_server::DevEventHooks::noop();
+            hooks.launch_deadline = Some(deadline);
+            hooks
+        });
+        let mut launch = {
+            let manager = manager.clone();
+            let workspace = workspace.clone();
+            tokio::spawn(async move {
+                manager
+                    .start_dev(
+                        "userapp:budget",
+                        &workspace,
+                        crate::service::dev_server::DevLaunch {
+                            base_path: None,
+                            hooks,
+                            pg: None,
+                            request_context: Some("original-task"),
+                            artifact_release_id: None,
+                        },
+                    )
+                    .await
+            })
+        };
+        accepted.notified().await;
+        // Finish the loopback response before advancing time: a network
+        // request timeout must not stand in for the owner's execution budget.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(181)).await;
+        tokio::time::resume();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if expect_expiration {
+            let outcome = tokio::time::timeout(Duration::from_secs(3), &mut launch)
+                .await
+                .unwrap()
+                .unwrap();
+            let error = outcome.expect_err("the inherited parent deadline must end observation");
+            let original = requests.lock().unwrap().clone();
+            assert_eq!(
+                original.len(),
+                1,
+                "expiration must not submit a replacement request"
+            );
+            assert_eq!(
+                original[0].request_context.as_deref(),
+                Some("original-task")
+            );
+            assert!(
+                error.to_string().contains(&original[0].operation_id)
+                    && error.to_string().contains("deadline")
+                    && error.to_string().contains("query"),
+                "{error}"
+            );
+            let owner = crate::service::dev_server::owner_client::OwnerClient::new(
+                &manager.config.app_cli_admin_probe_addr,
+                "test-token",
+            )
+            .unwrap();
+            let observed = owner
+                .operation_if_exists(&original[0].operation_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(observed.operation_id, original[0].operation_id);
+            assert_eq!(
+                observed.state,
+                shared_types::RuntimeOperationState::Accepted,
+                "observation expiry must not fabricate operation failure or business cancellation"
+            );
+            assert!(!ready.load(Ordering::SeqCst));
+            server.abort();
+            return;
+        }
+        if launch.is_finished() {
+            let outcome = launch.await.unwrap();
+            panic!(
+                "the accepted original Source request was cut off at 180s despite its configured budget; outcome={outcome:?}; requests={:?}",
+                requests.lock().unwrap()
+            );
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::time::resume();
+        ready.store(true, Ordering::SeqCst);
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut launch)
+            .await
+            .unwrap()
+            .unwrap();
+        let started =
+            result.expect("one original Source request must still be observable after 300s");
+        assert_eq!(started.pid, 0);
+        assert_eq!(started.port, shared_types::APP_ENTRY_PORT);
+        let posted = requests.lock().unwrap();
+        assert_eq!(
+            posted.len(),
+            1,
+            "a slow original operation must never be resubmitted"
+        );
+        assert_eq!(posted[0].request_context.as_deref(), Some("original-task"));
+        assert_eq!(posted[0].expected_runtime_instance_id, "instance-test");
+        assert_eq!(posted[0].kind, shared_types::RuntimeOperationKind::Restart);
+        assert!(polls.load(Ordering::SeqCst) >= 2);
+        drop(posted);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn admitted_source_with_lost_post_ack_reuses_original_operation_and_events() {
+        admitted_without_post_ack(None).await;
+    }
+
+    #[tokio::test]
+    async fn admitted_artifact_with_lost_post_ack_reuses_original_operation_and_events() {
+        admitted_without_post_ack(Some("original-release")).await;
+    }
+
+    /// Real loopback admission persists the original request, then withholds
+    /// only its HTTP acknowledgement. The manager must reconcile the same
+    /// operation within its original launch budget, including terminal events.
+    async fn admitted_without_post_ack(artifact: Option<&str>) {
+        use axum::response::IntoResponse as _;
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("source");
+        std::fs::create_dir_all(&workspace).unwrap();
+        if let Some(release) = artifact {
+            use std::io::Write as _;
+            std::fs::create_dir_all(workspace.join("builds")).unwrap();
+            let file = std::fs::File::create(
+                workspace
+                    .join("builds")
+                    .join(format!("workspace-package-{release}.zip")),
+            )
+            .unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file(
+                "release.lock.toml",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(include_bytes!(
+                "../../../../../workspace-manifest/tests/fixtures/lock_v1.toml"
+            ))
+            .unwrap();
+            zip.finish().unwrap();
+        }
+        let root = dir.path().join(".app-cli-state/unknown-app");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("token"), "test-token").unwrap();
+        let requests = Arc::new(Mutex::new(
+            Vec::<shared_types::RuntimeOperationRequest>::new(),
+        ));
+        let router = mock_owner_router("hashed-workspace", &workspace)
+            .with_state(Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+            .layer(axum::middleware::from_fn({
+                let requests = requests.clone();
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let requests = requests.clone();
+                    async move {
+                        if request.method() == axum::http::Method::POST {
+                            assert_eq!(request.headers()["x-deploy-token"], "test-token");
+                            let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+                                .await
+                                .unwrap();
+                            requests
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::from_slice(&bytes).unwrap());
+                            // Keep the original operation queryable while the
+                            // accepted POST's response is lost past the SDK's 10s timeout.
+                            std::future::pending::<()>().await;
+                            unreachable!("the fixture never returns the lost acknowledgement");
+                        }
+                        if let Some(id) =
+                            request.uri().path().strip_prefix("/v1/runtime/operations/")
+                            && !id.contains('/')
+                        {
+                            let captured = requests
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .find(|r| r.operation_id == id)
+                                .cloned();
+                            let Some(original) = captured else {
+                                return axum::http::StatusCode::NOT_FOUND.into_response();
+                            };
+                            let mut view =
+                                operation_view(id, shared_types::RuntimeOperationState::Succeeded);
+                            view.kind = original.kind;
+                            view.request_digest =
+                                shared_types::runtime_request_digest(&original).unwrap();
+                            return axum::Json(envelope(&view)).into_response();
+                        }
+                        next.run(request).await
+                    }
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = Config::from_env().unwrap();
+        config.log_base_dir = dir.path().join("logs");
+        config.app_cli_admin_probe_addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let manager = DevServerManager::new(Arc::new(config));
+        let events = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let lines = events.clone();
+        let submitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admitted = submitted.clone();
+        let mut hooks = crate::service::dev_server::DevEventHooks::noop();
+        hooks.launch_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(25));
+        hooks.on_line = Arc::new(move |line| {
+            lines
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str(line).unwrap())
+        });
+        hooks.on_submitted = Some(Arc::new(move || {
+            admitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let result = manager
+            .reuse_or_refuse_owner(
+                "userapp:ack",
+                &workspace,
+                Some(hooks),
+                None,
+                artifact,
+                Some("original-task"),
+            )
+            .await;
+        // Close the listener even when the old implementation fails this assertion.
+        server.abort();
+        let started = result.expect("an admitted operation must be reconciled after only its POST acknowledgement times out").unwrap();
+        assert_eq!(started.pid, 0);
+        assert_eq!(submitted.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let posted = requests.lock().unwrap();
+        assert_eq!(
+            posted.len(),
+            1,
+            "reconciliation must not dispatch another POST"
+        );
+        let original = &posted[0];
+        assert_eq!(original.expected_runtime_instance_id, "instance-test");
+        assert_eq!(original.request_context.as_deref(), Some("original-task"));
+        assert_eq!(
+            original.kind,
+            if artifact.is_some() {
+                shared_types::RuntimeOperationKind::Deploy
+            } else {
+                shared_types::RuntimeOperationKind::Restart
+            }
+        );
+        let delivered = events.lock().unwrap();
+        assert!(
+            delivered
+                .iter()
+                .any(|event| event["event"] == "orchestration_done"),
+            "the original terminal event must reach the caller: {delivered:?}"
+        );
+        let state = manager.read_external_state().unwrap();
+        assert!(state.intents.is_empty());
+        assert_eq!(
+            manager
+                .external_operation_for_task("userapp:ack", "original-task")
+                .unwrap(),
+            Some(original.operation_id.clone())
+        );
+    }
+
+    /// HttpResult 信封（wire 层格式手拼 OK；data 载荷一律 typed 构造——
+    /// 契约结构体字段偏移时编译器强制 mock 同步，不靠字符串检查）。
+    fn envelope<T: serde::Serialize>(data: &T) -> serde_json::Value {
+        serde_json::json!({"success": true, "code": "OK", "data": data, "message": "ok"})
+    }
+
+    fn operation_view(
+        id: &str,
+        state: shared_types::RuntimeOperationState,
+    ) -> shared_types::RuntimeOperationView {
+        shared_types::RuntimeOperationView {
+            operation_id: id.to_string(),
+            kind: shared_types::RuntimeOperationKind::Restart,
+            state,
+            request_digest: "digest".to_string(),
+            revision: 1,
+            runtime_instance_id: "instance-test".to_string(),
+            error_code: None,
+            error_message: None,
+            failure_detail: None,
+        }
+    }
+
+    fn mock_owner_router(
+        ws: &str,
+        root: &Path,
+    ) -> axum::Router<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
+        use shared_types::{
+            DesiredState, ObservedHealth, RuntimeEventRecord, RuntimeIdentityView,
+            RuntimeOperationState, RuntimeStatusView,
+        };
+
+        let source_root = root.to_string_lossy().into_owned();
+        let identity_of = move |workspace: String| RuntimeIdentityView {
+            application_id: "unknown-app".to_string(),
+            service_family: "userapp-dev".to_string(),
+            workspace_id: workspace,
+            source_root: source_root.clone(),
+            runtime_instance_id: "instance-test".to_string(),
+            deployment_generation_id: "gen-test".to_string(),
+            protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+            capabilities: vec![shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into()],
+        };
+        let status_view = || RuntimeStatusView {
+            desired: DesiredState::Running,
+            observed: ObservedHealth::Ready,
+            active_target: None,
+            revision: 0,
+            active_operation_id: None,
+            recovery_protection: false,
+            runtime_instance_id: "instance-test".to_string(),
+        };
+
+        let ws = ws.to_string();
+        let identity_ws = ws.clone();
+        let requests = Arc::new(Mutex::new(std::collections::HashMap::<
+            String,
+            shared_types::RuntimeOperationRequest,
+        >::new()));
+        let queried = requests.clone();
+        axum::Router::new()
+            .route(
+                "/v1/runtime/identity",
+                axum::routing::get(move || {
+                    let identity = identity_of(identity_ws.clone());
+                    async move { axum::Json(envelope(&identity)) }
+                }),
+            )
+            .route(
+                "/v1/runtime/status",
+                axum::routing::get(move || async move { axum::Json(envelope(&status_view())) }),
+            )
+            .route(
+                "/v1/runtime/operations",
+                axum::routing::post(
+                    move |axum::extract::State(polls): axum::extract::State<
+                        Arc<std::sync::atomic::AtomicUsize>,
+                    >,
+                          axum::Json(req): axum::Json<serde_json::Value>| {
+                        let requests = requests.clone();
+                        async move {
+                            let original: shared_types::RuntimeOperationRequest =
+                                serde_json::from_value(req.clone()).unwrap();
+                            requests
+                                .lock()
+                                .unwrap()
+                                .insert(original.operation_id.clone(), original);
+                            assert_eq!(req["workspace_id"], "hashed-workspace");
+                            polls.store(1, std::sync::atomic::Ordering::SeqCst);
+                            let id = req
+                                .get("operation_id")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("op")
+                                .to_string();
+                            let receipt = shared_types::RuntimeOperationAccepted {
+                                operation_id: id.clone(),
+                                state: RuntimeOperationState::Accepted,
+                                poll: format!("/v1/runtime/operations/{id}"),
+                            };
+                            (
+                                axum::http::StatusCode::ACCEPTED,
+                                axum::Json(envelope(&receipt)),
+                            )
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/v1/runtime/operations/{id}",
+                axum::routing::get(
+                    move |axum::extract::Path(id): axum::extract::Path<String>,
+                          axum::extract::State(polls): axum::extract::State<
+                        Arc<std::sync::atomic::AtomicUsize>,
+                    >| {
+                        let queried = queried.clone();
+                        async move {
+                            if polls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                                return (
+                                    axum::http::StatusCode::NOT_FOUND,
+                                    axum::Json(serde_json::json!({"message": "not found"})),
+                                );
+                            }
+                            // 首查 accepted（留事件流消费窗口），其后 succeeded
+                            let seen = polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let state = if seen == 1 {
+                                RuntimeOperationState::Accepted
+                            } else {
+                                RuntimeOperationState::Succeeded
+                            };
+                            let mut view = operation_view(&id, state);
+                            let original = queried.lock().unwrap()[&id].clone();
+                            view.kind = original.kind;
+                            view.request_digest =
+                                shared_types::runtime_request_digest(&original).unwrap();
+                            (axum::http::StatusCode::OK, axum::Json(envelope(&view)))
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/v1/runtime/operations/{id}/events",
+                axum::routing::get(
+                    |axum::extract::Path(id): axum::extract::Path<String>,
+                     axum::extract::Query(query): axum::extract::Query<
+                        std::collections::HashMap<String, String>,
+                    >| async move {
+                        // typed 构造事件记录（R06 重放端点契约：after_seq 游标）：
+                        // 服务级事件透传 + 无 event_name 的纯 stage（适配层跳过）
+                        // + 终态 Completed（映射为平台 orchestration_done）
+                        let after: u64 = query
+                            .get("after_seq")
+                            .and_then(|value| value.parse().ok())
+                            .unwrap_or(0);
+                        let all = [
+                            RuntimeEventRecord {
+                                operation_id: id.clone(),
+                                sequence: 1,
+                                runtime_instance_id: "instance-test".to_string(),
+                                stage: "service".to_string(),
+                                service: Some("frontend".to_string()),
+                                event_name: Some("service_starting".to_string()),
+                                payload: None,
+                            },
+                            RuntimeEventRecord {
+                                operation_id: id.clone(),
+                                sequence: 2,
+                                runtime_instance_id: "instance-test".to_string(),
+                                stage: "stage-only".to_string(),
+                                service: None,
+                                event_name: None,
+                                payload: None,
+                            },
+                            RuntimeEventRecord {
+                                operation_id: id.clone(),
+                                sequence: 3,
+                                runtime_instance_id: "instance-test".to_string(),
+                                stage: "terminal".to_string(),
+                                service: None,
+                                event_name: Some("Completed".to_string()),
+                                payload: None,
+                            },
+                        ];
+                        let events: Vec<_> = all
+                            .into_iter()
+                            .filter(|record| record.sequence > after)
+                            .collect();
+                        axum::Json(envelope(&serde_json::json!({
+                            "operation_id": id,
+                            "events": events,
+                        })))
+                    },
+                ),
+            )
+    }
+
+    /// R07/R08 反例：构建期观察失败 → 迟到提交拒绝（不刷新期望绕过停止
+    /// 屏障）；携带 pg 的复用提交在 wire 上包含 run_config.pg。
+    /// 独立自由端口 + 可配置 probe addr（不与 owner_probe_branches 的 3010 竞争）。
+    #[tokio::test]
+    async fn observation_failure_blocks_late_submission_and_pg_travels_on_wire() {
+        use crate::Config;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws-r78");
+        std::fs::create_dir_all(&ws).unwrap();
+        let state_root = dir.path().join(".app-cli-state").join("unknown-app");
+        std::fs::create_dir_all(&state_root).unwrap();
+        // 刻意**先不写 token**：构建期 capture 时 owner 在但凭据缺 →
+        // ObservationFailed（真实分类路径，非手工注入）
+        let submitted: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = submitted.clone();
+        let identity = shared_types::RuntimeIdentityView {
+            application_id: "unknown-app".to_string(),
+            service_family: "userapp-dev".to_string(),
+            workspace_id: "ws-r78".to_string(),
+            source_root: ws.to_string_lossy().into_owned(),
+            runtime_instance_id: "instance-r78".to_string(),
+            deployment_generation_id: "gen".to_string(),
+            protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+            capabilities: vec![shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into()],
+        };
+        let status_view = shared_types::RuntimeStatusView {
+            desired: shared_types::DesiredState::Running,
+            observed: shared_types::ObservedHealth::Ready,
+            active_target: None,
+            revision: 7,
+            active_operation_id: None,
+            recovery_protection: false,
+            runtime_instance_id: "instance-r78".to_string(),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/v1/runtime/identity",
+                axum::routing::get(move || {
+                    let identity = identity.clone();
+                    async move { axum::Json(envelope(&identity)) }
+                }),
+            )
+            .route(
+                "/v1/runtime/status",
+                axum::routing::get(move || async move { axum::Json(envelope(&status_view)) }),
+            )
+            .route(
+                "/v1/runtime/operations",
+                axum::routing::post(move |body: axum::Json<serde_json::Value>| {
+                    let sink = sink.clone();
+                    async move {
+                        sink.lock().unwrap().push(body.0.clone());
+                        axum::Json(envelope(&serde_json::json!({
+                            "operation_id": "op-x",
+                            "state": "accepted",
+                            "poll": "/v1/runtime/operations/op-x",
+                        })))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let probe_addr = listener.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock serve");
+        });
+
+        let mut config = Config::from_env().expect("test config");
+        config.log_base_dir = dir.path().join("logs");
+        config.app_cli_admin_probe_addr = probe_addr.clone();
+        let mgr = DevServerManager::new(Arc::new(config));
+
+        // ── R07：构建期 owner 在但凭据缺 → ObservationFailed 分类
+        mgr.capture_owner_expectation("userapp:r78", &ws).await;
+        {
+            let map = lock(&mgr.owner_expectations).unwrap();
+            match map.get("userapp:r78") {
+                Some(crate::service::dev_server::types::OwnerExpectation::ObservationFailed {
+                    ..
+                }) => {}
+                other => panic!("expected ObservationFailed, got {other:?}"),
+            }
+        }
+        // 网络恢复（补 token）+ 用户 Stop 已推进 revision（mock revision=7）：
+        // 旧构建迟到提交必须被拒——不得刷新期望
+        std::fs::write(state_root.join("token"), "test-token").unwrap();
+        let error = mgr
+            .reuse_or_refuse_owner("userapp:r78", &ws, None, None, None, None)
+            .await
+            .expect_err("late build submission must be refused");
+        assert!(
+            error.to_string().contains("observation failed"),
+            "diagnostic: {error}"
+        );
+        assert!(
+            submitted.lock().unwrap().is_empty(),
+            "no operation may be submitted when the admission context is unverified"
+        );
+
+        // ── R07 对照：确认无 owner（无人监听端口）→ NoOwner 分类
+        let mut config = Config::from_env().expect("test config");
+        config.log_base_dir = dir.path().join("other-logs");
+        config.app_cli_admin_probe_addr = "127.0.0.1:1".to_string();
+        let mgr2 = DevServerManager::new(Arc::new(config));
+        mgr2.capture_owner_expectation("userapp:none", &ws).await;
+        {
+            let map = lock(&mgr2.owner_expectations).unwrap();
+            assert!(matches!(
+                map.get("userapp:none"),
+                Some(crate::service::dev_server::types::OwnerExpectation::NoOwner)
+            ));
+        }
+
+        // ── R08：清除失败期望（模拟下一轮构建成功捕获后），复用提交在
+        // wire 上携带 run_config.pg（新凭据到达 owner）
+        lock(&mgr.owner_expectations).unwrap().remove("userapp:r78");
+        let pg = shared_types::StartPgCredential {
+            username: "biz_user".to_string(),
+            password: "new-s3cret".to_string(),
+        };
+        // This wire-only fixture returns a complete but foreign ACK. It is
+        // refused immediately and cannot claim that the original operation
+        // was admitted; PG propagation is checked on the actual POST below.
+        let reuse_result = mgr
+            .reuse_or_refuse_owner("userapp:r78", &ws, None, Some(&pg), None, None)
+            .await;
+        assert!(
+            reuse_result
+                .unwrap_err()
+                .to_string()
+                .contains("mismatched operation receipt")
+        );
+        let posted = submitted.lock().unwrap();
+        let last = posted
+            .last()
+            .cloned()
+            .unwrap_or_else(|| panic!("restart must be submitted; got {:?}", posted));
+        assert_eq!(
+            last["run_config"]["pg"]["username"], "biz_user",
+            "wire must carry the new pg credential: {last}"
+        );
+        assert_eq!(last["run_config"]["pg"]["password"], "new-s3cret");
+        task.abort();
+    }
+
+    /// R03 反例：制品态 owner 路由——owner 拒绝（revision 推进）时 `.run`
+    /// 保持原样（提交拒绝不改变 active 内容）；owner 受理时请求按
+    /// ArtifactId 形态上 wire（不是 Source restart）。
+    #[tokio::test]
+    async fn artifact_owner_route_preserves_run_dir_on_rejection() {
+        use crate::Config;
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws-art");
+        std::fs::create_dir_all(&ws).unwrap();
+        // 既有 .run（旧版本运行目录）+ 标记文件——必须原样保留
+        std::fs::create_dir_all(ws.join(".run")).unwrap();
+        std::fs::write(ws.join(".run").join("marker-old"), "v1").unwrap();
+        std::fs::create_dir_all(ws.join("builds")).unwrap();
+        let write_candidate = |explicit: bool| {
+            let mut lock = shared_types::load_release_lock(include_str!(
+                "../../../../../workspace-manifest/tests/fixtures/lock_v1.toml"
+            ))
+            .unwrap();
+            if explicit {
+                lock.services[0].health.startup_probe = Some(shared_types::StartupProbe::Http);
+            }
+            let file =
+                std::fs::File::create(ws.join("builds/workspace-package-rel-new.zip")).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file(
+                "release.lock.toml",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(toml::to_string(&lock).unwrap().as_bytes())
+                .unwrap();
+            zip.finish().unwrap();
+        };
+        write_candidate(false);
+
+        // mock owner：workspace_id=".run"（产物态绑定）、token 文件、
+        // 受理后固定返回 ERR_REVISION_MISMATCH 拒绝
+        let state_root = dir.path().join(".app-cli-state").join("unknown-app");
+        std::fs::create_dir_all(&state_root).unwrap();
+        std::fs::write(state_root.join("token"), "test-token").unwrap();
+        let submitted: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = submitted.clone();
+        let identity = shared_types::RuntimeIdentityView {
+            application_id: "unknown-app".to_string(),
+            service_family: "userapp-dev".to_string(),
+            workspace_id: ".run".to_string(),
+            source_root: ws.join(".run").to_string_lossy().into_owned(),
+            runtime_instance_id: "instance-art".to_string(),
+            deployment_generation_id: "gen".to_string(),
+            protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+            capabilities: vec![shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into()],
+        };
+        let identity_ws = identity.clone();
+        let app = axum::Router::new()
+            .route(
+                "/v1/runtime/identity",
+                axum::routing::get(move || {
+                    let identity = identity_ws.clone();
+                    async move { axum::Json(envelope(&identity)) }
+                }),
+            )
+            .route(
+                "/v1/runtime/status",
+                axum::routing::get(|| async {
+                    let status = shared_types::RuntimeStatusView {
+                        desired: shared_types::DesiredState::Running,
+                        observed: shared_types::ObservedHealth::Ready,
+                        active_target: None,
+                        revision: 9,
+                        active_operation_id: None,
+                        recovery_protection: false,
+                        runtime_instance_id: "instance-art".to_string(),
+                    };
+                    axum::Json(envelope(&status))
+                }),
+            )
+            .route(
+                "/v1/runtime/operations",
+                axum::routing::post(move |body: axum::Json<serde_json::Value>| {
+                    let sink = sink.clone();
+                    async move {
+                        sink.lock().unwrap().push(body.0.clone());
+                        // 模拟构建期间用户 Stop 推进 revision → 受理拒绝
+                        axum::response::Response::builder()
+                            .status(409)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(
+                                serde_json::json!({
+                                    "success": false,
+                                    "code": "ERR_REVISION_MISMATCH",
+                                    "message": "expected revision 8 does not match current 9",
+                                })
+                                .to_string(),
+                            ))
+                            .expect("reject response")
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut config = Config::from_env().expect("test config");
+        config.log_base_dir = dir.path().join("logs");
+        config.app_cli_admin_probe_addr = addr;
+        let mgr = DevServerManager::new(Arc::new(config));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock serve");
+        });
+
+        // owner 在但拒绝（revision 已推进）
+        let error = mgr
+            .route_artifact_restart("userapp:art", &ws, "rel-new", None, None, None)
+            .await
+            .expect_err("owner rejection must propagate");
+        assert!(
+            error.to_string().contains("ERR_REVISION_MISMATCH"),
+            "diagnostic: {error}"
+        );
+        // An explicit probe on a candidate artifact is checked before any POST,
+        // against the artifact lock (the serving .run has no such field).
+        write_candidate(true);
+        let error = mgr
+            .route_artifact_restart("userapp:art", &ws, "rel-new", None, None, None)
+            .await
+            .expect_err("old owner cannot execute explicit startup probes");
+        assert!(
+            error
+                .to_string()
+                .contains(shared_types::STARTUP_PROBE_CAPABILITY),
+            "{error}"
+        );
+        assert_eq!(
+            submitted.lock().unwrap().len(),
+            1,
+            "unsupported candidate must not submit another restart"
+        );
+        // R03 核心：`.run` 原样（提交拒绝不改变 active 内容）
+        assert!(
+            ws.join(".run").join("marker-old").is_file(),
+            "active .run must be untouched on owner rejection"
+        );
+        assert!(
+            !ws.join(".previous").exists(),
+            "no rotation may happen on rejection"
+        );
+        // wire：提交按 ArtifactId 形态（artifact_id 上 wire，非 Source）
+        let posted = submitted.lock().unwrap();
+        let last = posted
+            .last()
+            .cloned()
+            .unwrap_or_else(|| panic!("{posted:?}"));
+        // wire 形态跟随 RunProfileInput 的 serde tag（tag="profile"/
+        // content="input" + ArtifactInput 的 tag="source"/content="value"）
+        assert_eq!(
+            last["kind"], "deploy",
+            "the owner only admits Deploy + Artifact"
+        );
+        assert_eq!(
+            last["profile"]["profile"], "artifact",
+            "artifact restart must use Artifact profile: {last}"
+        );
+        assert_eq!(
+            last["profile"]["input"]["artifact"]["source"],
+            "artifact_id"
+        );
+        assert_eq!(
+            last["profile"]["input"]["artifact"]["value"]["artifact_id"],
+            "rel-new"
+        );
+        drop(last);
+        drop(posted);
+        task.abort();
+    }
+
+    /// 起 mock 在 3010；返回显式释放句柄（顺序关闭 + 等待端口回收）。
+    async fn serve_mock(app: axum::Router<()>) -> MockOwner {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:3010")
+            .await
+            .expect("bind 3010");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("mock serve");
+        });
+        MockOwner {
+            task: Some(task),
+            tx: Some(tx),
+        }
+    }
+
+    struct MockOwner {
+        task: Option<tokio::task::JoinHandle<()>>,
+        tx: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+    impl MockOwner {
+        /// 显式关闭并等待端口回收（下一阶段绑定的前提）。
+        async fn release(mut self) {
+            if let Some(tx) = self.tx.take() {
+                let _ = tx.send(());
+            }
+            if let Some(task) = self.task.take() {
+                let _joined = task.await;
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while tokio::net::TcpListener::bind("127.0.0.1:3010")
+                .await
+                .is_err()
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "mock owner did not release port 3010"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    impl Drop for MockOwner {
+        fn drop(&mut self) {
+            if let Some(task) = self.task.take() {
+                task.abort();
+            }
+        }
+    }
+    /// HTTP readiness may finish while the one-shot launcher is still alive.
+    /// Its later exit must not turn the retained registration into a permanent
+    /// guard against the next real Start/owner Restart submission.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn manifest_http_ready_before_run_exit_allows_repeat_start() {
+        if std::env::var_os("PROJECT_ID").is_some() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("source");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("workspace.manifest.toml"), "# fixture\n").unwrap();
+        let root = dir.path().join(".app-cli-state/unknown-app");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("token"), "test-token").unwrap();
+        let canonical = std::fs::canonicalize(&workspace).unwrap();
+        std::fs::write(
+            dir.path().join(".app-cli-state/registry.json"),
+            serde_json::to_vec(&std::collections::BTreeMap::from([(
+                canonical.to_string_lossy().into_owned(),
+                "unknown-app",
+            )]))
+            .unwrap(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let posted = Arc::new(Mutex::new(Vec::new()));
+        let router = mock_owner_router("hashed-workspace", &workspace)
+            .with_state(Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let router = record_runtime_operations(router, posted.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let manager = DevServerManager::new(Arc::new(wait_test_config(
+            &address,
+            &dir.path().join("logs"),
+        )));
+        let flag = workspace.join("exit-flag");
+        let child = tokio::process::Command::new("sh")
+            .kill_on_drop(true)
+            .args([
+                "-c",
+                "while [ ! -f \"$1\" ]; do sleep 0.01; done; exit 0",
+                "fixture",
+            ])
+            .arg(&flag)
+            .spawn()
+            .unwrap();
+        let ring = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let supervised = SupervisedChild::adopt(child, ring.clone());
+        let pid = supervised.pid();
+        let key = "userapp:http-before-exit";
+        lock(&manager.launches).unwrap().insert(
+            key.into(),
+            super::super::super::types::LocalLaunch {
+                launch_id: "original-launch".into(),
+                state_root: None,
+            },
+        );
+        lock(&manager.processes).unwrap().insert(
+            key.into(),
+            DevProcess {
+                pid,
+                port: shared_types::APP_ENTRY_PORT,
+                project_id: key.into(),
+                instance_id: None,
+                base_path: None,
+                started_at: 0,
+                log_dir: dir.path().join("logs"),
+                temp_log_name: String::new(),
+                external_owner: None,
+            },
+        );
+        lock(&manager.supervised)
+            .unwrap()
+            .insert(key.into(), supervised.clone());
+        let ready = manager
+            .wait_alive(
+                pid,
+                AliveWatch {
+                    port: 1,
+                    base_path: None,
+                    stderr_ring: &ring,
+                    probe: &|_, _, _| Box::pin(async { true }),
+                    launch_deadline: None,
+                    exit_policy: &ExitPolicy::ConfirmOwner {
+                        workspace: &workspace,
+                        supervised: &supervised,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(ready, LaunchObservation::Ready));
+        assert!(supervised.exited().is_none());
+        let repeat = manager.start_dev_manifest(
+            key,
+            &workspace,
+            crate::service::dev_server::DevLaunch {
+                base_path: None,
+                hooks: None,
+                pg: None,
+                request_context: None,
+                artifact_release_id: None,
+            },
+        );
+        tokio::pin!(repeat);
+        // Poll the real Start while the captured launcher is still awaiting its
+        // flag. The old snapshot-only guard returns an immediate error here.
+        tokio::select! {
+            result = &mut repeat => panic!("repeat Start finished before the original run exited: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+        }
+        assert!(supervised.exited().is_none());
+        assert!(
+            posted.lock().unwrap().is_empty(),
+            "no Restart before run exit"
+        );
+        std::fs::write(flag, "").unwrap();
+        let started = repeat
+            .await
+            .expect("repeat Start must await the captured run and reuse its verified owner");
+        assert_eq!(started.pid, 0);
+        assert!(matches!(supervised.exited(),
+            Some(crate::service::dev_server::supervise::ChildExit::Exited(status)) if status.success()));
+        assert!(
+            lock(&manager.processes)
+                .unwrap()
+                .get(key)
+                .unwrap()
+                .external_owner
+                .is_some()
+        );
+        let posted = posted.lock().unwrap();
+        assert_eq!(posted.len(), 1, "exactly one owner Restart");
+        assert_eq!(posted[0].kind, shared_types::RuntimeOperationKind::Restart);
+        server.abort();
+    }
+
+    fn record_runtime_operations(
+        router: axum::Router,
+        captured: Arc<Mutex<Vec<shared_types::RuntimeOperationRequest>>>,
+    ) -> axum::Router {
+        router.layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let captured = captured.clone();
+                async move {
+                    if request.method() == axum::http::Method::POST {
+                        let (parts, body) = request.into_parts();
+                        let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                        captured
+                            .lock()
+                            .unwrap()
+                            .push(serde_json::from_slice(&bytes).unwrap());
+                        next.run(axum::extract::Request::from_parts(
+                            parts,
+                            axum::body::Body::from(bytes),
+                        ))
+                        .await
+                    } else {
+                        next.run(request).await
+                    }
+                }
+            },
+        ))
+    }
+
+    #[derive(Clone, Copy)]
+    enum RetainedRunRefusal {
+        FailedExit,
+        ForeignOwner,
+        UnconfirmedExit,
+        ReplacedLaunch,
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn manifest_repeat_wait_rejects_failed_run_without_owner_restart() {
+        retained_run_refusal_case(RetainedRunRefusal::FailedExit).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn manifest_repeat_wait_rejects_foreign_owner_without_restart() {
+        retained_run_refusal_case(RetainedRunRefusal::ForeignOwner).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn manifest_repeat_wait_honors_parent_deadline_and_retains_original_run() {
+        retained_run_refusal_case(RetainedRunRefusal::UnconfirmedExit).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn manifest_repeat_wait_never_promotes_replaced_launch() {
+        retained_run_refusal_case(RetainedRunRefusal::ReplacedLaunch).await;
+    }
+
+    async fn retained_run_refusal_case(case: RetainedRunRefusal) {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("source");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("workspace.manifest.toml"), "# fixture\n").unwrap();
+        let foreign = dir.path().join("foreign");
+        std::fs::create_dir_all(&foreign).unwrap();
+        let root = dir.path().join(".app-cli-state/unknown-app");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("token"), "test-token").unwrap();
+        let canonical = std::fs::canonicalize(&workspace).unwrap();
+        std::fs::write(
+            dir.path().join(".app-cli-state/registry.json"),
+            serde_json::to_vec(&std::collections::BTreeMap::from([(
+                canonical.to_string_lossy().into_owned(),
+                "unknown-app",
+            )]))
+            .unwrap(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let owner_workspace = if matches!(case, RetainedRunRefusal::ForeignOwner) {
+            &foreign
+        } else {
+            &workspace
+        };
+        let posted = Arc::new(Mutex::new(Vec::new()));
+        let router = record_runtime_operations(
+            mock_owner_router("hashed-workspace", owner_workspace)
+                .with_state(Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+            posted.clone(),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let manager = DevServerManager::new(Arc::new(wait_test_config(
+            &address,
+            &dir.path().join("logs"),
+        )));
+        let flag = workspace.join("exit-flag");
+        let exit_code = if matches!(case, RetainedRunRefusal::FailedExit) {
+            "17"
+        } else {
+            "0"
+        };
+        let child = tokio::process::Command::new("sh")
+            .kill_on_drop(true)
+            .args([
+                "-c",
+                "while [ ! -f \"$1\" ]; do sleep 0.01; done; exit \"$2\"",
+                "fixture",
+            ])
+            .arg(&flag)
+            .arg(exit_code)
+            .spawn()
+            .unwrap();
+        let supervised = SupervisedChild::adopt(
+            child,
+            Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        );
+        let pid = supervised.pid();
+        let key = "userapp:retained-refusal";
+        lock(&manager.launches).unwrap().insert(
+            key.into(),
+            super::super::super::types::LocalLaunch {
+                launch_id: "original-launch".into(),
+                state_root: None,
+            },
+        );
+        lock(&manager.processes).unwrap().insert(
+            key.into(),
+            DevProcess {
+                pid,
+                port: shared_types::APP_ENTRY_PORT,
+                project_id: key.into(),
+                instance_id: None,
+                base_path: None,
+                started_at: 0,
+                log_dir: dir.path().join("logs"),
+                temp_log_name: String::new(),
+                external_owner: None,
+            },
+        );
+        lock(&manager.supervised)
+            .unwrap()
+            .insert(key.into(), supervised.clone());
+        let short_deadline = matches!(case, RetainedRunRefusal::UnconfirmedExit);
+        let hooks = short_deadline.then(|| crate::service::dev_server::DevEventHooks {
+            launch_deadline: Some(tokio::time::Instant::now() + Duration::from_millis(80)),
+            ..crate::service::dev_server::DevEventHooks::noop()
+        });
+        let repeat = manager.start_dev_manifest(
+            key,
+            &workspace,
+            crate::service::dev_server::DevLaunch {
+                base_path: None,
+                hooks,
+                pg: None,
+                request_context: None,
+                artifact_release_id: None,
+            },
+        );
+        tokio::pin!(repeat);
+        tokio::select! {
+            result = &mut repeat => panic!("captured run has not exited yet: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+        }
+        assert!(supervised.exited().is_none());
+        assert!(posted.lock().unwrap().is_empty());
+        if matches!(case, RetainedRunRefusal::ReplacedLaunch) {
+            // The same numeric PID deliberately remains; only the launch
+            // identity changes while the original exit is being observed.
+            lock(&manager.launches)
+                .unwrap()
+                .get_mut(key)
+                .unwrap()
+                .launch_id = "successor-launch".into();
+        }
+        if !short_deadline {
+            std::fs::write(&flag, "").unwrap();
+        }
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(if short_deadline { 250 } else { 4_000 }),
+            &mut repeat,
+        )
+        .await
+        .expect("retained observation must respect its existing deadline");
+        assert!(
+            outcome.is_err(),
+            "unconfirmed/failed/foreign/replaced handover must fail: {outcome:?}"
+        );
+        assert!(
+            posted.lock().unwrap().is_empty(),
+            "refused handover must not submit owner Restart"
+        );
+        assert!(
+            lock(&manager.processes)
+                .unwrap()
+                .get(key)
+                .unwrap()
+                .external_owner
+                .is_none()
+        );
+        assert_eq!(lock(&manager.processes).unwrap().get(key).unwrap().pid, pid);
+        assert!(Arc::ptr_eq(
+            lock(&manager.supervised).unwrap().get(key).unwrap(),
+            &supervised
+        ));
+        assert_eq!(
+            lock(&manager.launches).unwrap().get(key).unwrap().launch_id,
+            if matches!(case, RetainedRunRefusal::ReplacedLaunch) {
+                "successor-launch"
+            } else {
+                "original-launch"
+            }
+        );
+        if short_deadline {
+            assert!(
+                supervised.exited().is_none(),
+                "unconfirmed exit must remain unconfirmed"
+            );
+            assert!(
+                process::is_process_running(pid),
+                "deadline must not kill the captured child"
+            );
+            std::fs::write(&flag, "").unwrap();
+        }
+        let exit = supervised
+            .wait_exit(Duration::from_secs(2))
+            .await
+            .expect("fixture child must be reaped");
+        assert!(
+            matches!(exit, crate::service::dev_server::supervise::ChildExit::Exited(status)
+            if status.code() == Some(if matches!(case, RetainedRunRefusal::FailedExit) { 17 } else { 0 }))
+        );
+        server.abort();
+    }
+
+    /// R3 回归：成功移交后本地登记转换为外部 owner——重复 Start 走 owner
+    /// 复用链（向 owner 提交 Restart），不再被"local orchestrator is already
+    /// registered"的死 run guard 拒绝。run 引导为受控脚本（等待放行文件后
+    /// exit 0），owner 为进程内 mock（identity/status/operations 全 wire，
+    /// 复用前置探测时端口未监听——bind 延迟到 spawn 之后）。
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn manifest_handover_converts_registration_for_repeat_start() {
+        manifest_handover_registration_case(false).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn manifest_handover_after_original_launch_retired_never_reports_success() {
+        manifest_handover_registration_case(true).await;
+    }
+
+    async fn manifest_handover_registration_case(retire_before_handover: bool) {
+        if std::env::var_os("PROJECT_ID").is_some() {
+            // 身份核验的 application_id 锚定 unknown-app 回退；宿主平台变量下跳过
+            return;
+        }
+        let dir = tempfile::tempdir().expect("harness tempdir");
+        let workspace = dir.path().join("ws-handover-reg");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("workspace.manifest.toml"), "# t\n").unwrap();
+        // owner 复用提交所需的平台状态根（registry 段 + deploy token）。
+        let state_root = dir.path().join(".app-cli-state").join("unknown-app");
+        std::fs::create_dir_all(&state_root).unwrap();
+        std::fs::write(state_root.join("token"), "test-token").unwrap();
+        let canonical = std::fs::canonicalize(&workspace).unwrap();
+        let registry = std::collections::BTreeMap::from([(
+            canonical.to_string_lossy().into_owned(),
+            "unknown-app".to_string(),
+        )]);
+        std::fs::write(
+            dir.path().join(".app-cli-state/registry.json"),
+            serde_json::to_string(&registry).unwrap(),
+        )
+        .unwrap();
+
+        // 受控 run 引导：argv = [script, run, --workspace, <ws>, ...] → $3 为
+        // 工作区；等待工作区内出现 .release-flag 后 exit 0。
+        let script = dir.path().join("fake-app-cli");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nwhile [ ! -f \"$3/.release-flag\" ]; do sleep 0.05; done\nexit 0\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // 预留 owner 端口（此刻不监听——首次 Start 的复用前置探测必须扑空，
+        // 才会走 spawn+移交路径）。
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+
+        let requests = Arc::new(Mutex::new(
+            Vec::<shared_types::RuntimeOperationRequest>::new(),
+        ));
+        let captured = requests.clone();
+        let router = mock_owner_router("hashed-workspace", &workspace)
+            .with_state(Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let captured = captured.clone();
+                    async move {
+                        if request.method() == axum::http::Method::POST {
+                            let (parts, body) = request.into_parts();
+                            let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                            captured
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::from_slice(&bytes).unwrap());
+                            next.run(axum::extract::Request::from_parts(
+                                parts,
+                                axum::body::Body::from(bytes),
+                            ))
+                            .await
+                        } else {
+                            next.run(request).await
+                        }
+                    }
+                },
+            ));
+
+        // The fake run has no business server. Own a random HTTP 503 endpoint
+        // for readiness instead of relying on the host's fixed port 9080.
+        let readiness_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let readiness_addr = readiness_listener.local_addr().unwrap();
+        let readiness_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorded_hits = readiness_hits.clone();
+        let readiness_router = axum::Router::new().route(
+            "/",
+            axum::routing::get(move || {
+                let hits = recorded_hits.clone();
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        );
+        let readiness_server = tokio::spawn(async move {
+            axum::serve(readiness_listener, readiness_router)
+                .await
+                .unwrap()
+        });
+        let readiness_client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let mut config = wait_test_config(&reserved.to_string(), &dir.path().join("logs"));
+        // 宽松就绪窗覆盖脚本等待 + owner 上线 + 移交核验。
+        config.dev_alive_max_wait_ms = 4_000;
+        config.app_cli_bin = Some(script.display().to_string());
+        let manager = Arc::new(DevServerManager::new(Arc::new(config)));
+
+        let launch = || crate::service::dev_server::DevLaunch {
+            base_path: None,
+            hooks: None,
+            pg: None,
+            request_context: None,
+            artifact_release_id: None,
+        };
+        let first_workspace = workspace.clone();
+        let (submitted_tx, submitted_rx) = tokio::sync::oneshot::channel();
+        let submitted_tx = Arc::new(Mutex::new(Some(submitted_tx)));
+        let first = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                let submitted_manager = manager.clone();
+                let hooks = Some(crate::service::dev_server::DevEventHooks {
+                    on_submitted: Some(Arc::new(move || {
+                        let original_child = {
+                            // A controlled retirement barrier after atomic
+                            // publication, before launcher exit/owner handover.
+                            let mut launches = lock(&submitted_manager.launches).unwrap();
+                            let mut processes = lock(&submitted_manager.processes).unwrap();
+                            let mut children = lock(&submitted_manager.supervised).unwrap();
+                            let child = children.get("userapp:handover-reg").unwrap().clone();
+                            if retire_before_handover {
+                                launches.remove("userapp:handover-reg");
+                                processes.remove("userapp:handover-reg");
+                                children.remove("userapp:handover-reg");
+                            }
+                            child
+                        };
+                        assert!(
+                            submitted_tx
+                                .lock()
+                                .unwrap()
+                                .take()
+                                .unwrap()
+                                .send(original_child)
+                                .is_ok()
+                        );
+                    })),
+                    ..crate::service::dev_server::DevEventHooks::noop()
+                });
+                manager
+                    .start_dev_manifest_with_readiness_probe(
+                        "userapp:handover-reg",
+                        &first_workspace,
+                        crate::service::dev_server::DevLaunch { hooks, ..launch() },
+                        Some(&|_, _, timeout_ms| {
+                            let client = readiness_client.clone();
+                            Box::pin(async move {
+                                client
+                                    .get(format!("http://{readiness_addr}/"))
+                                    .timeout(Duration::from_millis(timeout_ms))
+                                    .send()
+                                    .await
+                                    .is_ok_and(|response| response.status().is_success())
+                            })
+                        }),
+                    )
+                    .await
+            })
+        };
+        // A real submission signal proves preflight missed the owner, spawn
+        // completed, and all three registration tables were published.
+        let original_child = tokio::time::timeout(Duration::from_secs(10), submitted_rx)
+            .await
+            .expect("original launch must be submitted")
+            .unwrap();
+        assert!(original_child.exited().is_none());
+        let listener = tokio::net::TcpListener::bind(reserved)
+            .await
+            .expect("rebind reserved owner port");
+        let server = tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, router).await {
+                tracing::warn!(%error, "test owner server terminated");
+            }
+        });
+        assert!(
+            crate::service::dev_server::owner_client::probe_owner(&reserved.to_string())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        std::fs::write(workspace.join(".release-flag"), "").unwrap();
+
+        let result = first.await.expect("start task join");
+        assert!(
+            matches!(original_child.exited(),
+            Some(crate::service::dev_server::supervise::ChildExit::Exited(status)) if status.success()),
+            "original run must really exit before handover is reported"
+        );
+        assert!(
+            readiness_hits.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "startup must use the owned HTTP readiness endpoint"
+        );
+        if retire_before_handover {
+            let error = result.expect_err("a retired launch cannot report a successful handover");
+            assert!(matches!(error, AppError::Conflict(_)), "{error}");
+            assert!(
+                !lock(&manager.processes)
+                    .unwrap()
+                    .contains_key("userapp:handover-reg")
+            );
+            assert!(
+                !lock(&manager.launches)
+                    .unwrap()
+                    .contains_key("userapp:handover-reg")
+            );
+            assert!(
+                !lock(&manager.supervised)
+                    .unwrap()
+                    .contains_key("userapp:handover-reg")
+            );
+            server.abort();
+            readiness_server.abort();
+            return;
+        }
+        let started = result.expect("handover startup must succeed (run exit 0 + verified owner)");
+        assert_ne!(started.pid, 0, "首启走 spawn 路径（pid 为真实引导进程）");
+        assert!(
+            lock(&manager.processes)
+                .unwrap()
+                .get("userapp:handover-reg")
+                .unwrap()
+                .external_owner
+                .is_some()
+        );
+
+        // R3 核心：重复 Start 不被死 run 的本地登记 guard 拒绝——登记已转换为
+        // 外部 owner，复用链受理并提交 Restart。
+        let again = manager
+            .start_dev("userapp:handover-reg", &workspace, launch())
+            .await
+            .expect("repeat start after handover must route through the owner reuse chain");
+        assert_eq!(again.pid, 0, "复用形态（owner 进程保留，pid 0）");
+        let posted = requests.lock().unwrap();
+        assert_eq!(posted.len(), 1, "恰好一次复用 Restart 提交: {posted:?}");
+        assert_eq!(posted[0].kind, shared_types::RuntimeOperationKind::Restart);
+        server.abort();
+        readiness_server.abort();
+    }
+}
+
+/// 0.3.16+ 契约：spawn 的 `app-cli run` 是一次性引导（可重复执行），常驻
+/// 主体是 `app-cli serve` owner。run 进程退出后：匹配 owner 在 → 移交
+/// 成立，宽松就绪成功；无 owner → 启动失败（stderr 分类文案不变）。
+/// 起"匹配 owner"身份服务（仅 /v1/runtime/identity，返回本工作区身份；
+/// instance 标识便于区分测试），返回探测地址。项目环境变量存在时身份
+/// 核验锚点不同，调用方测试自行跳过。
+async fn spawn_identity_owner(ws: &Path, instance: &str) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind owner");
+    let addr = listener.local_addr().expect("owner addr");
+    let source_root = ws.display().to_string();
+    let identity = shared_types::RuntimeIdentityView {
+        application_id: "unknown-app".to_string(),
+        service_family: "userapp-dev".to_string(),
+        workspace_id: source_root.clone(),
+        source_root,
+        runtime_instance_id: instance.to_string(),
+        deployment_generation_id: format!("gen-{instance}"),
+        protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+        capabilities: vec![shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into()],
+    };
+    let router = axum::Router::new().route(
+        "/v1/runtime/identity",
+        axum::routing::get(move || {
+            let identity = identity.clone();
+            async move {
+                axum::Json(serde_json::json!({
+                    "success": true, "code": "OK", "data": identity, "message": "ok"
+                }))
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, router).await {
+            tracing::warn!(%error, "test owner server terminated");
+        }
+    });
+    format!("127.0.0.1:{}", addr.port())
+}
+
+async fn spawn_dead_run(exit_code: i32) -> (u32, Arc<SupervisedChild>) {
+    // 跨平台的一次性 run 引导：unix 用 sh -c、windows 用 cmd /C——只按命令名
+    // 走 PATH 解析，不硬编码具体路径（发行版 sh 位置差异不受影响）。
+    // 经 SupervisedChild 收割：wait_exit 给出真实 ExitStatus（R2 判据源）。
+    let mut command = if cfg!(windows) {
+        let mut command = tokio::process::Command::new("cmd");
+        command.arg("/C").arg(format!("exit {exit_code}"));
+        command
+    } else {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg(format!("exit {exit_code}"));
+        command
+    };
+    let child = command.spawn().expect("spawn transient run");
+    let pid = child.id().expect("transient run pid");
+    let ring: Arc<StderrRing> = Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
+        STDERR_RING_CAP,
+    )));
+    let supervised = SupervisedChild::adopt(child, ring);
+    supervised
+        .wait_exit(Duration::from_secs(5))
+        .await
+        .expect("transient run must exit and be reaped");
+    (pid, supervised)
+}
+
+fn wait_test_config(probe_addr: &str, logs: &Path) -> crate::Config {
+    let mut config = crate::Config::from_env().expect("test config");
+    config.app_cli_admin_probe_addr = probe_addr.to_string();
+    config.log_base_dir = logs.to_path_buf();
+    // 快速宽松就绪（不监听 9080，走移交核验分支）
+    config.dev_alive_max_wait_ms = 300;
+    config.dev_alive_check_timeout_ms = 100;
+    config.dev_alive_poll_interval_ms = 50;
+    config
+}
+
+#[tokio::test]
+async fn manifest_wait_treats_run_exit_as_owner_handover_when_owner_present() {
+    if std::env::var_os("PROJECT_ID").is_some() {
+        // 身份核验的 application_id 锚定 unknown-app 回退；宿主平台变量下跳过
+        return;
+    }
+    let ws = tempfile::tempdir().expect("workspace tempdir");
+    let dir = tempfile::tempdir().expect("harness tempdir");
+
+    // 假 serve owner：/v1/runtime/identity 返回与本工作区匹配的身份
+    let probe_addr = spawn_identity_owner(ws.path(), "instance-handover").await;
+    let config = wait_test_config(&probe_addr, &dir.path().join("logs"));
+    let manager = DevServerManager::new(Arc::new(config));
+    let (pid, supervised) = spawn_dead_run(0).await;
+    let ring: Arc<StderrRing> = Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
+        STDERR_RING_CAP,
+    )));
+    let observation = manager
+        .wait_manifest_alive(pid, 1, ws.path(), &supervised, &ring, None)
+        .await
+        .expect("handover-confirmed startup must be lenient-ready");
+    assert!(
+        matches!(observation, LaunchObservation::HandedOver { .. }),
+        "expected HandedOver (with verified identity) after confirmed owner handover: {observation:?}"
+    );
+}
+
+/// R2 回归：run 非零退出时，匹配 owner 在线也不能把启动报成功——监督
+/// 退出码是直接失败证据（管理面独立于业务存活是产品契约）。
+#[tokio::test]
+async fn manifest_wait_reports_failure_when_run_exits_nonzero_despite_owner() {
+    if std::env::var_os("PROJECT_ID").is_some() {
+        return;
+    }
+    let ws = tempfile::tempdir().expect("workspace tempdir");
+    let dir = tempfile::tempdir().expect("harness tempdir");
+
+    // 与移交测试同款的匹配 owner（identity 返回本工作区身份）
+    let probe_addr = spawn_identity_owner(ws.path(), "instance-nonzero").await;
+    let config = wait_test_config(&probe_addr, &dir.path().join("logs"));
+    let manager = DevServerManager::new(Arc::new(config));
+    let (pid, supervised) = spawn_dead_run(17).await;
+    let ring: Arc<StderrRing> = Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
+        STDERR_RING_CAP,
+    )));
+    let outcome = manager
+        .wait_manifest_alive(pid, 1, ws.path(), &supervised, &ring, None)
+        .await;
+    let error = match outcome {
+        Ok(observation) => panic!(
+            "non-zero run exit must be startup failure even with a live owner: {observation:?}"
+        ),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("启动失败"),
+        "classified startup failure expected: {error}"
+    );
+}
+
+#[tokio::test]
+async fn manifest_wait_reports_startup_failure_when_run_exits_without_owner() {
+    let ws = tempfile::tempdir().expect("workspace tempdir");
+    let dir = tempfile::tempdir().expect("harness tempdir");
+    // 探测地址恒拒绝连接（引导失败未留下 serve owner）
+    let config = wait_test_config("127.0.0.1:1", &dir.path().join("logs"));
+    let manager = DevServerManager::new(Arc::new(config));
+    let (pid, supervised) = spawn_dead_run(0).await;
+    let ring: Arc<StderrRing> = Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
+        STDERR_RING_CAP,
+    )));
+    let outcome = manager
+        .wait_manifest_alive(pid, 1, ws.path(), &supervised, &ring, None)
+        .await;
+    let error = match outcome {
+        Ok(_) => panic!("bootstrap without owner must be reported as startup failure"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("启动失败"),
+        "classified startup failure expected: {error}"
+    );
+}
+
+#[tokio::test]
+async fn manifest_http_ready_preserves_verified_handover() {
+    if std::env::var_os("PROJECT_ID").is_some() {
+        return;
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    let logs = tempfile::tempdir().unwrap();
+    let address = spawn_identity_owner(workspace.path(), "http-ready-owner").await;
+    let manager = DevServerManager::new(Arc::new(wait_test_config(&address, logs.path())));
+    let (pid, supervised) = spawn_dead_run(0).await;
+    let ring = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let outcome = manager
+        .wait_alive(
+            pid,
+            AliveWatch {
+                port: 1,
+                base_path: None,
+                stderr_ring: &ring,
+                probe: &|_, _, _| Box::pin(async { true }),
+                launch_deadline: None,
+                exit_policy: &ExitPolicy::ConfirmOwner {
+                    workspace: workspace.path(),
+                    supervised: &supervised,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, LaunchObservation::HandedOver { identity }
+        if identity.runtime_instance_id == "http-ready-owner"));
+}
+
+#[tokio::test]
+async fn manifest_reaped_failure_is_authoritative_even_if_pid_is_live() {
+    let workspace = tempfile::tempdir().unwrap();
+    let logs = tempfile::tempdir().unwrap();
+    let manager = DevServerManager::new(Arc::new(wait_test_config("127.0.0.1:1", logs.path())));
+    let (_dead_pid, supervised) = spawn_dead_run(17).await;
+    let ring = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    // A live PID simulates reuse deterministically; the original Child's reaped
+    // result must win over this unrelated numeric process observation.
+    let outcome = manager
+        .wait_alive(
+            std::process::id(),
+            AliveWatch {
+                port: 1,
+                base_path: None,
+                stderr_ring: &ring,
+                probe: &|_, _, _| Box::pin(async { true }),
+                launch_deadline: None,
+                exit_policy: &ExitPolicy::ConfirmOwner {
+                    workspace: workspace.path(),
+                    supervised: &supervised,
+                },
+            },
+        )
+        .await;
+    assert!(
+        outcome.is_err(),
+        "ready HTTP cannot mask the original run's exit17: {outcome:?}"
+    );
+}
+
+#[test]
+fn manifest_late_handover_does_not_replace_successor_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = DevServerManager::new(Arc::new(wait_test_config("127.0.0.1:1", dir.path())));
+    let key = "userapp:handover-cas";
+    lock(&manager.launches).unwrap().insert(
+        key.into(),
+        super::super::types::LocalLaunch {
+            launch_id: "successor".into(),
+            state_root: None,
+        },
+    );
+    lock(&manager.processes).unwrap().insert(
+        key.into(),
+        DevProcess {
+            pid: 42,
+            port: shared_types::APP_ENTRY_PORT,
+            project_id: key.into(),
+            instance_id: None,
+            base_path: None,
+            started_at: 1,
+            log_dir: dir.path().to_path_buf(),
+            temp_log_name: String::new(),
+            external_owner: None,
+        },
+    );
+    let identity = shared_types::RuntimeIdentityView {
+        application_id: "unknown-app".into(),
+        service_family: "userapp-dev".into(),
+        workspace_id: "workspace".into(),
+        source_root: dir.path().display().to_string(),
+        runtime_instance_id: "original-owner".into(),
+        deployment_generation_id: "deploy".into(),
+        protocol_version: shared_types::RUNTIME_CONTROL_PROTOCOL_VERSION,
+        capabilities: vec![shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into()],
+    };
+    assert!(
+        !manager
+            .publish_owner_handover(key, Some("old-launch"), 42, &identity)
+            .unwrap(),
+        "equal numeric PIDs cannot authorize an old launch to convert a successor"
+    );
+    assert!(
+        lock(&manager.processes)
+            .unwrap()
+            .get(key)
+            .unwrap()
+            .external_owner
+            .is_none()
+    );
+    assert!(
+        !manager
+            .publish_owner_handover(key, None, 42, &identity)
+            .unwrap()
+    );
+    lock(&manager.launches).unwrap().remove(key);
+    assert!(
+        !manager
+            .publish_owner_handover(key, None, 42, &identity)
+            .unwrap(),
+        "a missing current/captured launch cannot degrade to PID-only ownership"
+    );
+    assert!(
+        lock(&manager.processes)
+            .unwrap()
+            .get(key)
+            .unwrap()
+            .external_owner
+            .is_none()
+    );
+    lock(&manager.launches).unwrap().insert(
+        key.into(),
+        super::super::types::LocalLaunch {
+            launch_id: "successor".into(),
+            state_root: None,
+        },
+    );
+    assert!(
+        manager
+            .publish_owner_handover(key, Some("successor"), 42, &identity)
+            .unwrap()
+    );
+}

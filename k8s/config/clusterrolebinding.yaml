@@ -1,4 +1,4 @@
-# ClusterRoleBinding：把 rcoder-role 绑定到两个 ServiceAccount。
+# ClusterRoleBinding：仅 RCoder 主服务拥有编排权限，租户不能修改 Pod 标签或读取 Secret。
 # 单文档（见 rbac.yaml 顶部说明）。
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -7,9 +7,6 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: rcoder-sa
-    namespace: rcoder-dev
-  - kind: ServiceAccount
-    name: rcoder-pods-sa
     namespace: rcoder-dev
 roleRef:
   kind: ClusterRole

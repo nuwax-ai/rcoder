@@ -1,0 +1,95 @@
+//! project skills 推送 handler: push-skills-to-workspace。
+
+use axum::extract::State;
+use garde::Validate;
+
+use super::ctx_from;
+use crate::AppState;
+use crate::error::AppError;
+use crate::extract::{AppJson as Json, AppMultipart as Multipart};
+use crate::models::{ProjectPushSkillsResult, PushProjectSkillsForm};
+use crate::ops::multipart::{file_field, text_field};
+use crate::ops::workspace::pushed_skills_message;
+use crate::service::skills as skills_service;
+
+/// project_id 必填 (multipart 提取后构造 + garde 校验)。
+#[derive(garde::Validate)]
+struct ProjectIdField {
+    #[garde(custom(crate::validation_rules::required_not_blank))]
+    project_id: Option<String>,
+}
+
+/// 校验 project_id 并取数 (multipart 提取后)。
+fn require_project_id(project_id: Option<String>) -> Result<String, AppError> {
+    let f = ProjectIdField { project_id };
+    f.validate().map_err(crate::error::from_garde)?;
+    f.project_id
+        .ok_or_else(|| AppError::system("project_id missing after garde validation"))
+}
+
+/// 技能推送到工作区
+#[utoipa::path(post, path = "/push-skills-to-workspace", request_body(content = PushProjectSkillsForm, content_type = "multipart/form-data"), responses((status = 200, description = "推送结果（含技能列表）", body = ProjectPushSkillsResult), crate::openapi::ErrorApiResponses), tag = "Project")]
+pub(crate) async fn push_skills_to_workspace(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<Json<ProjectPushSkillsResult>, AppError> {
+    let mut project_id = None;
+    let mut zip_data = None;
+    let mut skill_urls: Vec<String> = Vec::new();
+    let mut tenant = None;
+    let mut space = None;
+    let mut iso = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::validation(format!("multipart parse: {e}")))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "projectId" => project_id = Some(text_field(field).await?),
+            "file" => {
+                zip_data = Some(
+                    file_field(
+                        field,
+                        state.config.upload_max_file_size_bytes,
+                        &state.config.upload_temp_dir(),
+                    )
+                    .await?,
+                )
+            }
+            "skillUrls" => {
+                let t = text_field(field).await?;
+                // 兼容 JSON 数组字符串 / 单 URL
+                if let Ok(urls) = serde_json::from_str::<Vec<String>>(&t) {
+                    skill_urls.extend(urls);
+                } else {
+                    skill_urls.push(t);
+                }
+            }
+            "tenantId" => tenant = Some(text_field(field).await?),
+            "spaceId" => space = Some(text_field(field).await?),
+            "isolationType" => iso = Some(text_field(field).await?),
+            _ => {}
+        }
+    }
+    let project_id = require_project_id(project_id)?;
+    state
+        .skill_downloader
+        .validate_url_count(skill_urls.len())?;
+    let ctx = ctx_from(project_id.trim(), tenant, space, iso);
+    let result = skills_service::push_skills(
+        &*state.resolver,
+        &ctx,
+        zip_data.as_ref().map(|file| file.path()),
+        skill_urls,
+        &state.skill_downloader,
+    )
+    .await?;
+    Ok(Json(ProjectPushSkillsResult {
+        success: true,
+        message: pushed_skills_message(&result.updated_skills, false),
+        project_path: result.project_path,
+        updated_skills: result.updated_skills,
+        failed_skills: result.failed_skills,
+    }))
+}

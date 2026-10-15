@@ -37,7 +37,10 @@ pub fn shared_client() -> Result<&'static reqwest::Client, DownloadError> {
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .timeout(Duration::from_secs(TIMEOUT_SECS))
         .build()
-        .map_err(|e| DownloadError::Http(format!("build memory download client: {e}")))?;
+        .map_err(|e| DownloadError::Http {
+            message: format!("build memory download client: {e}"),
+            status: None,
+        })?;
     // 并发首调时可能重复构建, get_or_init 只保留其一, 多余实例丢弃即可。
     Ok(CLIENT.get_or_init(|| client))
 }
@@ -49,10 +52,16 @@ pub async fn download_bytes_limited(url: &str, max_bytes: u64) -> Result<Bytes, 
         .get(url)
         .send()
         .await
-        .map_err(|e| DownloadError::Http(format!("download from {url}: {e}")))?
+        .map_err(|e| DownloadError::Http {
+            message: format!("download from {url}: {e}"),
+            status: e.status().map(|code| code.as_u16()),
+        })?
         // 4xx/5xx 直接报错, 避免错误页被当作内容
         .error_for_status()
-        .map_err(|e| DownloadError::Http(format!("error status from {url}: {e}")))?;
+        .map_err(|e| DownloadError::Http {
+            message: format!("error status from {url}: {e}"),
+            status: e.status().map(|code| code.as_u16()),
+        })?;
 
     // Content-Length 已知时快速拒绝
     if let Some(len) = response.content_length()
@@ -67,7 +76,10 @@ pub async fn download_bytes_limited(url: &str, max_bytes: u64) -> Result<Bytes, 
     let mut buf: Vec<u8> = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| DownloadError::Http(format!("read body from {url}: {e}")))?;
+        let chunk = chunk.map_err(|e| DownloadError::Http {
+            message: format!("read body from {url}: {e}"),
+            status: None,
+        })?;
         // 先判超限再写入：避免单个 chunk 让 buf 越过 cap 一个 chunk 才触发（更紧 + 不分配超限内存）
         let projected = buf.len() as u64 + chunk.len() as u64;
         if projected > max_bytes {
@@ -84,8 +96,10 @@ pub async fn download_bytes_limited(url: &str, max_bytes: u64) -> Result<Bytes, 
 /// GET 下载 `url` 并解码为 UTF-8 文本 (同 [`download_bytes_limited`] 的安全约束)。
 pub async fn download_text_limited(url: &str, max_bytes: u64) -> Result<String, DownloadError> {
     let bytes = download_bytes_limited(url, max_bytes).await?;
-    String::from_utf8(bytes.to_vec())
-        .map_err(|e| DownloadError::Http(format!("content is not valid UTF-8 ({url}): {e}")))
+    String::from_utf8(bytes.to_vec()).map_err(|e| DownloadError::Http {
+        message: format!("content is not valid UTF-8 ({url}): {e}"),
+        status: None,
+    })
 }
 
 #[cfg(test)]
@@ -169,7 +183,13 @@ mod tests {
             .await
             .expect_err("404 must be rejected");
         assert!(
-            matches!(&err, DownloadError::Http(msg) if msg.contains("404")),
+            matches!(
+                &err,
+                DownloadError::Http {
+                    status: Some(404),
+                    ..
+                }
+            ),
             "error should mention status: {err}"
         );
     }

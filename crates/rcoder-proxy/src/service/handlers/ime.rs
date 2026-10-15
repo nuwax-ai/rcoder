@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use crate::service::types::{IME_PORT, ProxyMetrics, TrackingCtx};
+use crate::service::types::{ProxyMetrics, TrackingCtx};
 use crate::service::utils;
+use shared_types::IME_PORT;
 
 /// 处理 IME 输入法代理请求
 ///
@@ -58,7 +59,7 @@ pub async fn handle_ime_request(
         })?;
 
     ctx.target_port = Some(IME_PORT);
-    ctx.upstream_host = Some(format!("{}:{}", container_ip, IME_PORT));
+    ctx.upstream_host = Some(super::super::upstream::dial_addr(&container_ip, IME_PORT)?);
 
     info!(
         "IME proxy: user_id={}, project_id={}, path={}, target={}:{}",
@@ -111,15 +112,11 @@ pub async fn handle_ime_upstream(
     // 保存目标 IP 到上下文（用于响应过滤）
     ctx.vnc_target_ip = Some(container_ip.clone());
 
-    let peer_addr = format!("{}:{}", container_ip, IME_PORT);
+    let peer_addr = super::super::upstream::dial_addr(&container_ip, IME_PORT)?;
     let mut peer = Box::new(HttpPeer::new(peer_addr.clone(), false, "".to_string()));
 
-    // IME WebSocket 长连接优化配置
-    peer.options.connection_timeout = Some(Duration::from_secs(10));
-    peer.options.read_timeout = None; // 无限等待（WebSocket 持续流）
-    peer.options.write_timeout = None; // 无限等待（WebSocket 双向流）
-    peer.options.total_connection_timeout = Some(Duration::from_secs(15));
-    peer.options.idle_timeout = Some(Duration::from_secs(3600)); // 1小时空闲超时
+    // IME WebSocket 长连接优化配置（idle 1 小时）
+    super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
 
     debug!("IME connection from: {}", peer_addr);
 

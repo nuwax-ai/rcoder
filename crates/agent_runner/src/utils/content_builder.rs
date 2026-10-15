@@ -82,7 +82,7 @@ impl ContentBuilder {
                 let file_path = project_path.join(path);
 
                 // 检查文件是否存在
-                if !file_path.exists() {
+                if !tokio::fs::try_exists(&file_path).await.unwrap_or(false) {
                     tracing::warn!("Attachment file not found, ignored: {:?}", file_path);
                     return Ok(None);
                 }
@@ -147,7 +147,7 @@ impl ContentBuilder {
                 let file_path = project_path.join(path);
 
                 // 检查文件是否存在
-                if !file_path.exists() {
+                if !tokio::fs::try_exists(&file_path).await.unwrap_or(false) {
                     tracing::warn!("Image file not found, ignored: {:?}", file_path);
                     return Ok(None);
                 }
@@ -196,7 +196,7 @@ impl ContentBuilder {
                 let file_path = project_path.join(path);
 
                 // 检查文件是否存在
-                if !file_path.exists() {
+                if !tokio::fs::try_exists(&file_path).await.unwrap_or(false) {
                     tracing::warn!("Audio file not found, ignored: {:?}", file_path);
                     return Ok(None);
                 }
@@ -241,7 +241,7 @@ impl ContentBuilder {
                 let file_path = project_path.join(path);
 
                 // 检查文件是否存在
-                if !file_path.exists() {
+                if !tokio::fs::try_exists(&file_path).await.unwrap_or(false) {
                     tracing::warn!("Document file not found, ignored: {:?}", file_path);
                     return Ok(None);
                 }

@@ -1,0 +1,7 @@
+# Use together with docker-compose.yml when the host bind filesystem is unsuitable.
+services:
+  rcoder:
+    volumes:
+      - rcoder-userapp-data:/app/data
+volumes:
+  rcoder-userapp-data:

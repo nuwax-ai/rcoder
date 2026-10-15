@@ -244,9 +244,9 @@ fn draw_composer(
     area: Rect,
 ) {
     let status_indicator = if pending_prompt.is_some() {
-        " [Queued] "
+        "[Queued] "
     } else if chat.waiting {
-        " [Running...] "
+        "[Running...] "
     } else {
         ""
     };

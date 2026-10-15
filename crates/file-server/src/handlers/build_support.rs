@@ -1,13 +1,13 @@
 //! Build handler 的文件系统与错误解析职责。
 
 use axum::extract::State;
-use serde::Deserialize;
 
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::AppJson as Json;
+use crate::models::ParseErrorBody;
 
-use super::build::response;
+use crate::models::Simple;
 
 pub(super) fn normalize_build_base(base: Option<&str>) -> String {
     let base = base.map(str::trim).unwrap_or("/").to_string();
@@ -56,22 +56,16 @@ pub(super) fn copy_dir_all(
     Ok(())
 }
 
-#[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ParseErrorBody {
-    #[allow(dead_code)]
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    project_id: String,
-    error_message: String,
-}
-
-#[utoipa::path(post, path = "/parse-build-error", request_body = ParseErrorBody, responses(crate::openapi::JsonApiResponses), tag = "Build")]
+/// 解析构建错误输出
+///
+/// 识别常见编译/构建工具错误模式，返回结构化信息。
+#[utoipa::path(post, path = "/parse-build-error", request_body = ParseErrorBody, responses((status = 200, description = "解析出的结构化错误信息（message）", body = Simple), crate::openapi::ErrorApiResponses), tag = "Build")]
 pub(crate) async fn parse_build_error(
     State(_state): State<AppState>,
     Json(body): Json<ParseErrorBody>,
-) -> Result<Json<response::Simple>, AppError> {
+) -> Result<Json<Simple>, AppError> {
     let message = crate::service::build_error::parse(&body.error_message);
-    Ok(Json(response::Simple {
+    Ok(Json(Simple {
         success: true,
         message,
     }))

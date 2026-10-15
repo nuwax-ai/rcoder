@@ -1,9 +1,10 @@
 //! Git 操作 (对齐 nuwax gitService, gix 组合)。
 //!
-//! 拆分: 本模块 (公共) / [`read`] (读) / [`write`] (写); 后续 diff/reset/checkout 再加子模块。
+//! 拆分: 本模块 (公共) / `read` (读) / `write` (写); 后续 diff/reset/checkout 再加子模块。
 //! gix 同步库且 `Repository` `!Send`, 函数均同步; axum handler 经 `spawn_blocking` 调用。
 
 pub mod diff;
+pub(crate) mod materialize;
 pub mod ops;
 pub mod read;
 pub mod refs;
@@ -23,7 +24,7 @@ use gix::refs::{FullName, Target};
 use gix::{Repository, init, open};
 
 use crate::error::{AppError, AppResult};
-use crate::workspace::{ComputerContext, ProjectContext, WorkspaceResolver};
+use crate::workspace::{ProjectContext, WorkspaceResolver};
 
 /// `.gitignore` 默认条目 (对齐 nuwax appConfig GIT_GITIGNORE_ENTRIES)。
 pub const DEFAULT_GITIGNORE_ENTRIES: &[&str] = &[
@@ -32,6 +33,9 @@ pub const DEFAULT_GITIGNORE_ENTRIES: &[&str] = &[
     "dist/",
     "dist-packages/",
     "build/",
+    // userApp 整体包产物（{ws}/builds/——ensure_gitignore append-only,
+    // 存量 workspace 下次 git 操作自动补齐）
+    "builds/",
     ".idea/",
     ".vscode/",
     ".DS_Store",
@@ -42,6 +46,8 @@ pub const DEFAULT_GITIGNORE_ENTRIES: &[&str] = &[
     ".codex/",
     ".grok/",
     ".pi/",
+    // 智能体技能实体库（对齐 TS 6ab47b7——store 不入 git 版本管理）
+    ".agent-store/",
     ".tmp/",
     ".logs/",
     "pnpm-lock.yaml",
@@ -49,78 +55,22 @@ pub const DEFAULT_GITIGNORE_ENTRIES: &[&str] = &[
     "package-lock.json",
 ];
 
-/// workspaceType 分发目标 (对齐 nuwax resolveAndCheck)。
-pub enum GitTarget {
-    PageApp {
-        project_id: String,
-        path: PathBuf,
-    },
-    TaskAgent {
-        user_id: String,
-        cid: String,
-        path: PathBuf,
-    },
-}
-
-impl GitTarget {
-    pub fn path(&self) -> &Path {
-        match self {
-            GitTarget::PageApp { path, .. } | GitTarget::TaskAgent { path, .. } => path,
-        }
-    }
-    pub fn log_id(&self) -> String {
-        match self {
-            GitTarget::PageApp { project_id, .. } => project_id.clone(),
-            GitTarget::TaskAgent { user_id, cid, .. } => format!("computer:{user_id}:{cid}"),
-        }
-    }
-}
-
-/// 解析 workspaceType + 路径 (对齐 nuwax resolveAndCheck)。
-pub async fn resolve_target(
+/// pageApp 项目隔离模型解析（对齐 nuwax a29cbc0/1.4.7 `resolveAndCheck`
+/// pageApp 分支——归一类型为 pageApp 时项目模型优先，serviceContext 定位
+/// 参数不再能覆盖）：projectId 必填 → `resolver.resolve_project` → 目录
+/// 必须已存在（git 操作只面向已存在工作区，不创建）。
+pub async fn resolve_page_project(
     resolver: &dyn WorkspaceResolver,
-    workspace_type: &str,
-    project_ctx: Option<&ProjectContext>,
-    computer_ctx: Option<&ComputerContext>,
-) -> AppResult<GitTarget> {
-    match workspace_type {
-        "taskAgent" => {
-            let ctx = computer_ctx
-                .ok_or_else(|| AppError::validation("taskAgent mode requires userId and cId"))?;
-            if ctx.user_id.trim().is_empty() || ctx.cid.trim().is_empty() {
-                return Err(AppError::validation(
-                    "taskAgent mode requires userId and cId",
-                ));
-            }
-            let path = resolver.resolve_computer(ctx).await?;
-            if !path.exists() {
-                return Err(AppError::resource("Computer workspace does not exist"));
-            }
-            Ok(GitTarget::TaskAgent {
-                user_id: ctx.user_id.clone(),
-                cid: ctx.cid.clone(),
-                path,
-            })
-        }
-        "pageApp" => {
-            let ctx = project_ctx
-                .ok_or_else(|| AppError::validation("pageApp mode requires projectId"))?;
-            if ctx.project_id.trim().is_empty() {
-                return Err(AppError::validation("pageApp mode requires projectId"));
-            }
-            let path = resolver.resolve_project(ctx).await?;
-            if !path.exists() {
-                return Err(AppError::resource("Project does not exist"));
-            }
-            Ok(GitTarget::PageApp {
-                project_id: ctx.project_id.clone(),
-                path,
-            })
-        }
-        _ => Err(AppError::validation(
-            "workspaceType is required and must be pageApp or taskAgent",
-        )),
+    ctx: &ProjectContext,
+) -> AppResult<PathBuf> {
+    if ctx.project_id.trim().is_empty() {
+        return Err(AppError::validation("pageApp mode requires projectId"));
     }
+    let path = resolver.resolve_project(ctx).await?;
+    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        return Err(AppError::resource("Project does not exist"));
+    }
+    Ok(path)
 }
 
 /// 是否已是 git 仓库 (对齐 nuwax isGitRepo)。
@@ -192,24 +142,73 @@ pub fn ensure_gitignore(path: &Path) -> AppResult<()> {
 /// 打开或初始化仓库 (对齐 nuwax ensureGitRepo 的 open/init 部分; initial commit 见 write::commit_indexed)。
 pub fn ensure_repo(path: &Path) -> AppResult<Repository> {
     if is_git_repo(path) {
-        open(path).map_err(|e| AppError::system(format!("git open failed: {e}")))
+        let repo = open(path).map_err(|e| AppError::system(format!("git open failed: {e}")))?;
+        ensure_index_file(&repo)?;
+        Ok(repo)
     } else {
         let repo = init(path).map_err(|e| AppError::system(format!("git init failed: {e}")))?;
         // nuwax 显式 defaultBranch=main；覆盖宿主机/镜像中的 init.defaultBranch 配置。
         set_unborn_head_to_main(&repo)?;
-        // 新 repo 无 .git/index 文件, 从空 tree 创建空 index (否则首次 stage 的 open_index 失败)
-        let empty_id = repo
-            .head_tree_id_or_empty()
-            .map_err(|e| AppError::system(format!("git head_tree: {e}")))?
-            .detach();
-        let mut idx = repo
-            .index_from_tree(&empty_id)
-            .map_err(|e| AppError::system(format!("git index_from_tree: {e}")))?;
-        idx.remove_tree();
-        idx.write(IndexWriteOptions::default())
-            .map_err(|e| AppError::system(format!("git index write: {e}")))?;
+        ensure_index_file(&repo)?;
         Ok(repo)
     }
+}
+
+/// gix `open_index` 严格失败，而 git CLI 把缺失的 index 视为合法空态——TS 时代
+/// (git CLI/isomorphic-git init) 与外部工具创建的仓库只有 `.git` 没有 index 文件，
+/// 首次 gix 读操作即报 "An IO error occurred while opening the index"。在所有
+/// git 操作的必经收口自愈一次：unborn HEAD → 空 index；有提交 → 从 HEAD tree
+/// 重建 (git reset 语义，未提交改动按 modified/untracked 正常呈现)。
+fn ensure_index_file(repo: &Repository) -> AppResult<()> {
+    ensure_index_file_with_probe(repo, |path| std::fs::symlink_metadata(path))
+}
+
+fn ensure_index_file_with_probe(
+    repo: &Repository,
+    mut probe: impl FnMut(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> AppResult<()> {
+    let index_path = repo.index_path();
+    let exists = |result: std::io::Result<std::fs::Metadata>| match result {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(AppError::system(format!(
+            "git stat index {}: {error}",
+            index_path.display()
+        ))),
+    };
+    if exists(probe(&index_path))? {
+        return Ok(());
+    }
+
+    // 与 git add / gix index.write 使用同一个 index.lock。初次探测之后可能
+    // 已有请求补齐并暂存了文件，必须持锁复核，不能再覆盖成 HEAD tree。
+    let lock = gix::lock::File::acquire_to_update_resource(
+        &index_path,
+        gix::lock::acquire::Fail::Immediately,
+        None,
+    )
+    .map_err(|error| map_git_err(error, "git lock initial index"))?;
+    if exists(probe(&index_path))? {
+        return Ok(());
+    }
+    let tree_id = repo
+        .head_tree_id_or_empty()
+        .map_err(|e| AppError::system(format!("git head_tree: {e}")))?
+        .detach();
+    let mut idx = repo
+        .index_from_tree(&tree_id)
+        .map_err(|e| AppError::system(format!("git index_from_tree: {e}")))?;
+    idx.remove_tree();
+    // 锁已由本函数持有，write_to 不会像 idx.write 那样再次申请锁。
+    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, lock);
+    idx.write_to(&mut writer, IndexWriteOptions::default())
+        .map_err(|error| map_git_err(error, "git write initial index"))?;
+    let lock = writer
+        .into_inner()
+        .map_err(|error| map_git_err(error, "git flush initial index"))?;
+    lock.commit()
+        .map_err(|error| map_git_err(error, "git commit initial index"))?;
+    Ok(())
 }
 
 fn set_unborn_head_to_main(repo: &Repository) -> AppResult<()> {
@@ -256,7 +255,7 @@ mod tests {
     use crate::workspace::LocalWorkspaceResolver;
 
     #[tokio::test]
-    async fn resolve_target_rejects_missing_workspace_without_creating_it() {
+    async fn resolve_page_project_rejects_missing_workspace_without_creating_it() {
         let root =
             std::env::temp_dir().join(format!("file-server-git-resolve-{}", std::process::id()));
         let project_root = root.join("projects");
@@ -269,12 +268,154 @@ mod tests {
             isolation_type: None,
         };
 
-        let error = match resolve_target(&resolver, "pageApp", Some(&context), None).await {
+        let error = match resolve_page_project(&resolver, &context).await {
             Ok(_) => panic!("missing workspace must be rejected"),
             Err(error) => error,
         };
 
         assert!(matches!(error, AppError::Resource(_)));
         assert!(!project_root.join("missing").exists());
+    }
+
+    fn fresh_repo_dir(kind: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "file-server-git-mod-test-{kind}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create test repo");
+        path
+    }
+
+    /// 反例 (线上 app-1694246): TS 时代/git CLI 创建的仓库只有 .git 没有 index
+    /// 文件 (gix init 亦然)，gix open_index 严格失败——修复前 get_status 报
+    /// "git status open_index: An IO error occurred while opening the index"。
+    #[test]
+    fn ensure_repo_backfills_missing_index_for_index_less_unborn_repo() {
+        let dir = fresh_repo_dir("ts-era");
+        let repo = init(&dir).expect("gix init (不写 index)");
+        set_unborn_head_to_main(&repo).expect("HEAD → main");
+        drop(repo);
+        std::fs::write(dir.join("note.md"), "工作区已有文件").expect("写工作区文件");
+        assert!(
+            !dir.join(".git/index").exists(),
+            "前置: git CLI/gix init 均不写 .git/index"
+        );
+
+        let repo = ensure_repo(&dir).expect("打开无 index 的既有仓库");
+        assert!(dir.join(".git/index").exists(), "自愈: 补写 index 文件");
+        let status = get_status(&repo).expect("补写后 status 可用");
+        assert_eq!(status.untracked, vec!["note.md".to_string()]);
+        assert!(status.staged.is_empty());
+        assert!(status.conflicted.is_empty());
+    }
+
+    /// 有提交的仓库丢了 index: 从 HEAD tree 重建 (git reset 语义)，
+    /// 已提交文件回到干净态，未提交改动按 modified/untracked 呈现。
+    #[test]
+    fn ensure_repo_rebuilds_missing_index_from_head_tree_for_born_repo() {
+        let dir = fresh_repo_dir("born-lost-index");
+        let repo = ensure_repo(&dir).expect("init");
+        std::fs::write(dir.join("app.txt"), "v1").expect("写文件");
+        stage_path(&repo, "app.txt").expect("stage");
+        commit_indexed(&repo, "c1", "Test", "test@example.com").expect("commit");
+        std::fs::remove_file(dir.join(".git/index")).expect("模拟 index 丢失");
+        std::fs::write(dir.join("app.txt"), "v2").expect("提交后修改");
+        std::fs::write(dir.join("new.txt"), "n").expect("新增未跟踪");
+
+        let repo = ensure_repo(&dir).expect("重开丢 index 仓库");
+        let status = get_status(&repo).expect("status");
+        assert_eq!(status.modified, vec!["app.txt".to_string()]);
+        assert_eq!(status.untracked, vec!["new.txt".to_string()]);
+        assert!(status.staged.is_empty());
+        assert!(status.deleted.is_empty());
+    }
+
+    #[test]
+    fn missing_index_recheck_preserves_concurrent_stage() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().expect("test repository");
+        let root = directory.path();
+        let repo = ensure_repo(root).expect("init");
+        std::fs::write(root.join("app.txt"), "head").expect("head content");
+        stage_path(&repo, "app.txt").expect("stage head");
+        commit_indexed(&repo, "head", "Test", "test@example.com").expect("commit");
+        std::fs::remove_file(repo.index_path()).expect("remove index");
+
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let late_root = root.to_path_buf();
+        let late_reader = std::thread::spawn(move || {
+            let repo = open(late_root).expect("open late reader");
+            let mut first = true;
+            ensure_index_file_with_probe(&repo, |path| {
+                let observed = std::fs::symlink_metadata(path);
+                if first {
+                    first = false;
+                    assert_eq!(
+                        observed.as_ref().expect_err("missing index").kind(),
+                        std::io::ErrorKind::NotFound
+                    );
+                    observed_tx.send(()).expect("report missing index");
+                    resume_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("resume late reader");
+                } else {
+                    assert!(
+                        path.with_extension("lock").exists(),
+                        "second probe holds the Git index lock"
+                    );
+                }
+                observed
+            })
+        });
+
+        observed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reader observed missing index");
+        let writer = ensure_repo(root).expect("other request repairs index");
+        std::fs::write(root.join("app.txt"), "staged").expect("staged content");
+        stage_path(&writer, "app.txt").expect("other request stages");
+        let staged_index = std::fs::read(writer.index_path()).expect("saved staged index");
+        std::fs::write(root.join("app.txt"), "later worktree edit").expect("unstaged edit");
+        resume_tx.send(()).expect("resume original request");
+        late_reader
+            .join()
+            .expect("reader thread")
+            .expect("reader reuses existing index");
+
+        assert_eq!(
+            std::fs::read(writer.index_path()).expect("index after repair"),
+            staged_index
+        );
+        assert!(
+            !root.join(".git/index.lock").exists(),
+            "repair releases its lock"
+        );
+    }
+
+    #[test]
+    fn index_stat_error_preserves_staged_bytes_without_attempting_repair() {
+        let directory = tempfile::tempdir().expect("test repository");
+        let repo = ensure_repo(directory.path()).expect("init");
+        std::fs::write(directory.path().join("app.txt"), "staged").expect("file");
+        stage_path(&repo, "app.txt").expect("stage");
+        let before = std::fs::read(repo.index_path()).expect("index bytes");
+
+        let error = ensure_index_file_with_probe(&repo, |_| {
+            Err(std::io::Error::other("injected stat I/O failure"))
+        })
+        .expect_err("stat error must not authorize repair");
+        assert!(matches!(error, AppError::System(_)));
+        assert_eq!(
+            std::fs::read(repo.index_path()).expect("unchanged index"),
+            before
+        );
+        assert!(!directory.path().join(".git/index.lock").exists());
     }
 }

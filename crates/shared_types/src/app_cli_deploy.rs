@@ -1,0 +1,280 @@
+//! app-cli 部署相位契约（rcoder ↔ app-cli 单一事实源）。
+//!
+//! 容器内 app-cli 管理 API `GET /v1/deploy/status` 的 `phase` 字段枚举。
+//! 此前 rcoder 侧（app_manager hot_deploy）以裸字符串 `"running"`/`"failed"`
+//! 比较——新增相位无编译期防护。收敛为共享枚举后：
+//! - app-cli [`DeployStatus`](crate::app_cli_logs) 序列化直接产出本枚举
+//!   （wire 值与历史字符串逐字节一致）；
+//! - rcoder 侧判据用穷尽 `match`——新增变体时消费点编译错，强制显式决策
+//!   该相位算「部署段完成」还是「继续等」。
+//!
+//! [`FromStr`] 对未知字符串返回 `Err`：滚动升级窗口旧镜像可能返回新版本
+//! 不认识的相位，消费方按「继续等」处理（与编译期检查互补，不矛盾）。
+
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+/// Protocol v2 identifies operations but does not promise process-group quiescence.
+pub const APP_CLI_OPERATION_ID_DEPLOY_PROTOCOL: u32 = 2;
+
+/// Protocol v3 publishes terminal operations only after mutations have stopped.
+pub const APP_CLI_QUIESCENT_DEPLOY_PROTOCOL: u32 = 3;
+
+/// Protocol v4 separates cold/hot operation identity, deployment stage and serving health.
+/// A successful operation is durably recorded before it becomes observable.
+pub const APP_CLI_UNIFIED_DEPLOY_PROTOCOL: u32 = 4;
+pub const APP_DEPLOY_OPERATION_ID: &str = "APP_DEPLOY_OPERATION_ID";
+pub const APP_DEPLOY_GENERATION_ID: &str = "APP_DEPLOY_GENERATION_ID";
+
+/// Immutable result of the artifact activation stage, independent of service readiness.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AppDeploymentStage {
+    #[default]
+    Pending,
+    Succeeded,
+    Failed,
+}
+
+/// app-cli server 状态机相位（wire 值 snake_case，锁死勿漂移）。
+///
+/// 转移图：`Idle → Deploying → Orchestrating → Running`；任一部署/编排
+/// 失败进 `Failed`（error 细节走 status 响应的独立 `error` 字段，枚举
+/// 不带负载）。`Failed` 常驻不被 Idle 覆盖，直到下一次部署请求受理。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AppCliDeployPhase {
+    /// 空容器/等待首次部署（基础设施就绪即应答）。
+    #[default]
+    Idle,
+    /// 部署段进行中：下载制品 → sha256 校验 → 解压 → 换 code。
+    Deploying,
+    /// 部署段完成，编排进行中：等 PG → migrate → 起服务 → pingap → readiness。
+    Orchestrating,
+    /// 编排完成，supervise 运行中（readiness 视 bridge 探活而定）。
+    Running,
+    /// 最近一次部署/编排失败（现场保留，可再次部署）。
+    Failed,
+}
+
+impl AppCliDeployPhase {
+    /// wire 字符串（与 serde 序列化值一致；`Display` 委托此处）。
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            AppCliDeployPhase::Idle => "idle",
+            AppCliDeployPhase::Deploying => "deploying",
+            AppCliDeployPhase::Orchestrating => "orchestrating",
+            AppCliDeployPhase::Running => "running",
+            AppCliDeployPhase::Failed => "failed",
+        }
+    }
+}
+
+impl std::fmt::Display for AppCliDeployPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for AppCliDeployPhase {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "idle" => Ok(AppCliDeployPhase::Idle),
+            "deploying" => Ok(AppCliDeployPhase::Deploying),
+            "orchestrating" => Ok(AppCliDeployPhase::Orchestrating),
+            "running" => Ok(AppCliDeployPhase::Running),
+            "failed" => Ok(AppCliDeployPhase::Failed),
+            other => Err(format!("unknown app-cli deploy phase: {other}")),
+        }
+    }
+}
+
+/// Identity and result of one deployment attempt, independent of serving health.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct AppDeploymentOperation {
+    pub operation_id: String,
+    #[serde(default)]
+    pub deployment_generation_id: String,
+    #[serde(default)]
+    pub deploy_stage: AppDeploymentStage,
+    /// This operation result has been committed to the journal and verified.
+    #[serde(default)]
+    pub persisted: bool,
+    pub request_release_id: String,
+    pub artifact_release_id: Option<String>,
+    #[serde(default)]
+    pub recovery: Option<AppDeploymentRecovery>,
+    pub phase: AppCliDeployPhase,
+    pub error: Option<String>,
+}
+
+/// Recovery reports code/process restoration only, never database rollback.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct AppDeploymentRecovery {
+    pub status: String,
+    pub error: Option<String>,
+    pub database_migrations_reversed: bool,
+}
+
+/// Snapshot used for a conditional configuration write after hot deployment.
+#[derive(Debug, Clone, Default)]
+pub struct AppEnvSnapshot {
+    pub env: std::collections::HashMap<String, String>,
+    pub deployment_uid: Option<String>,
+    pub deployment_version: Option<String>,
+    pub resource_name: Option<String>,
+    pub resource_version: Option<String>,
+}
+
+/// progress_v1 部署进度载荷（app-cli → rcoder 轮询消费）。
+///
+/// 计量与展示分离：`step` 是人类可读的阶段标签（未知值容忍），
+/// `activity` 是 epoch 内单调不减的进度计数器（rcoder 只认"严格增长"）。
+/// `epoch` 是执行实例标识（进程重启换 epoch；rcoder 见 epoch 变化不算进展）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct AppDeploymentProgress {
+    /// 执行实例标识（UUID；进程重启换 epoch）。
+    pub epoch: String,
+    /// 当前阶段（human-readable，未知值容忍）。
+    pub step: String,
+    /// epoch 内单调不减的活动计数器（rcoder 只认严格增长）。
+    #[serde(default)]
+    pub activity: u64,
+    /// 当前步骤已完成的单元数（可选，展示用）。
+    #[serde(default)]
+    pub step_completed: Option<u64>,
+    /// 当前步骤总单元数（可选，展示用）。
+    #[serde(default)]
+    pub step_total: Option<u64>,
+    /// 人类可读的阶段细节（可选，展示用）。
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// 最后更新时间（epoch ms）。
+    #[serde(default)]
+    pub updated_at: Option<i64>,
+}
+
+/// Actual runtime write precondition. None is supported only by Docker.
+#[derive(Debug, Clone, Default)]
+pub struct AppMutationPrecondition {
+    pub resource_version: Option<String>,
+}
+
+/// Read from the captured physical owner, never a Service or cached pod address.
+/// This evidence closes a failed hot write; it cannot authorize another deploy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HotDeploymentFailureEvidence {
+    pub target: crate::RuntimeConfigurationTarget,
+    pub protocol_version: u32,
+    pub server_phase: AppCliDeployPhase,
+    pub operation: AppDeploymentOperation,
+}
+
+impl HotDeploymentFailureEvidence {
+    pub fn validate(&self, record: &crate::UserAppOperationRecord) -> Result<(), String> {
+        self.validate_outcome(record, "submit", AppCliDeployPhase::Failed)
+    }
+
+    /// Success variant: the owner reported a terminal Running outcome for
+    /// exactly this operation. The checkpoint phase may be submit (crash
+    /// before convergence began) or converging (crash during convergence);
+    /// both retain the same identity chain.
+    pub fn validate_success(&self, record: &crate::UserAppOperationRecord) -> Result<(), String> {
+        self.validate_outcome(record, "converging", AppCliDeployPhase::Running)
+            .or_else(|_| self.validate_outcome(record, "submit", AppCliDeployPhase::Running))
+    }
+
+    fn validate_outcome(
+        &self,
+        record: &crate::UserAppOperationRecord,
+        checkpoint_phase: &str,
+        owner_phase: AppCliDeployPhase,
+    ) -> Result<(), String> {
+        let hot = record
+            .checkpoint
+            .get("hot_execution")
+            .ok_or("Hot deployment checkpoint missing")?;
+        let context: crate::UserAppExecutionContext = serde_json::from_value(
+            hot.get("context")
+                .cloned()
+                .ok_or("Hot execution context missing")?,
+        )
+        .map_err(|_| "Invalid hot execution context")?;
+        let target: crate::RuntimeConfigurationTarget = serde_json::from_value(
+            hot.get("target")
+                .cloned()
+                .ok_or("Hot physical target missing")?,
+        )
+        .map_err(|_| "Invalid hot physical target")?;
+        if hot
+            .get("receipt_protocol")
+            .and_then(serde_json::Value::as_u64)
+            != Some(1)
+            || hot.get("phase").and_then(serde_json::Value::as_str) != Some(checkpoint_phase)
+            || hot.get("release_id").and_then(serde_json::Value::as_str)
+                != Some(self.operation.request_release_id.as_str())
+            || record.scope != crate::UserAppOperationScope::Prod
+            || context.app_id != record.app_id
+            || context.lifecycle_id != record.lifecycle_id
+            || context.operation_id != record.operation_id
+            || Some(&context.executor_id) != record.executor_id.as_ref()
+            || context.request_fingerprint != record.request_fingerprint
+            || target != self.target
+            || target.physical_uid.is_empty()
+            || target.deployment_generation.is_empty()
+            || self.protocol_version != APP_CLI_UNIFIED_DEPLOY_PROTOCOL
+            || self.operation.operation_id != record.operation_id
+            || self.operation.deployment_generation_id != target.deployment_generation
+            || self.operation.phase != owner_phase
+            || !self.operation.persisted
+            || !matches!(
+                self.server_phase,
+                AppCliDeployPhase::Failed | AppCliDeployPhase::Running
+            )
+            || self
+                .operation
+                .recovery
+                .as_ref()
+                .is_some_and(|recovery| !matches!(recovery.status.as_str(), "restored" | "failed"))
+        {
+            return Err("Hot deployment evidence does not confirm the original write".into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// wire 值快照：锁死 snake_case 序列化（Java/rcoder 消费契约）。
+    #[test]
+    fn wire_values_snapshot() {
+        let cases = [
+            (AppCliDeployPhase::Idle, "\"idle\""),
+            (AppCliDeployPhase::Deploying, "\"deploying\""),
+            (AppCliDeployPhase::Orchestrating, "\"orchestrating\""),
+            (AppCliDeployPhase::Running, "\"running\""),
+            (AppCliDeployPhase::Failed, "\"failed\""),
+        ];
+        for (phase, wire) in cases {
+            assert_eq!(serde_json::to_string(&phase).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<AppCliDeployPhase>(wire).unwrap(),
+                phase
+            );
+            assert_eq!(phase.to_string(), wire.trim_matches('"'));
+            assert_eq!(phase.as_str().parse::<AppCliDeployPhase>().unwrap(), phase);
+        }
+    }
+
+    /// 未知字符串 Err（滚动窗口旧/新镜像互不认识时的容错入口）。
+    #[test]
+    fn unknown_string_is_err() {
+        assert!("migrating".parse::<AppCliDeployPhase>().is_err());
+        assert!("".parse::<AppCliDeployPhase>().is_err());
+        assert!("Running".parse::<AppCliDeployPhase>().is_err()); // 大小写敏感
+    }
+}

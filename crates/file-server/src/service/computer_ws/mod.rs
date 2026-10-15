@@ -1,15 +1,19 @@
 //! computer 工作区装配 (对齐 nuwax `computerUtils.createWorkspace` +
 //! `computerFileUtils.importProject` + `AgentWorkspaceUtils`)。
 //!
-//! 拆分: [`import_ws`] (import-project) / [`create_ws`] (create-workspace) /
-//! [`helpers`] (move_dir / temp_sibling / find_dir / remove_top_level_dir 等共享)。
+//! 拆分: `import_ws` (import-project) / `create_ws` (create-workspace 旧路径) /
+//! `agent_store_ws` (create-workspace agent-store 路径) /
+//! `helpers` (move_dir / temp_sibling / find_dir / remove_top_level_dir 等共享)。
 //! 本 mod.rs 仅做模块声明 + 公共 API re-export + 共享常量。
 
+mod agent_store_ws;
 mod create_ws;
 mod helpers;
 mod import_ws;
+mod preservation;
 
-pub use create_ws::{CreateWorkspaceResult, SkillFailure, create_workspace};
+pub use agent_store_ws::{CreateAgentStoreParams, create_workspace_with_agent_store};
+pub use create_ws::{CreateWorkspaceResult, create_workspace};
 pub use helpers::remove_top_level_dir;
 pub use import_ws::{ImportResult, import_project};
 

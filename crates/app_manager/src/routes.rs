@@ -14,99 +14,125 @@ use super::handlers;
 /// 创建应用管理路由
 pub fn app_manager_routes() -> Router<Arc<AppManagerState>> {
     Router::new()
+        .route(
+            "/api/v1/userapp/{app_id}/lifecycle",
+            get(handlers::get_lifecycle),
+        )
+        .route(
+            "/api/v1/userapp/{app_id}/operations/current",
+            get(handlers::get_current_operation),
+        )
+        .route(
+            "/api/v1/userapp/{app_id}/operations/by-request",
+            get(handlers::get_operation_by_request),
+        )
+        .route(
+            "/api/v1/userapp/{app_id}/operations/{operation_id}",
+            get(handlers::get_operation),
+        )
+        .route(
+            "/api/v1/userapp/{app_id}/operations/{operation_id}/retry",
+            post(handlers::retry_operation),
+        )
+        .route(
+            "/api/v1/userapp/{app_id}/recreate",
+            post(handlers::recreate_identity),
+        )
         // 应用生命周期
-        .route("/api/v1/apps", post(handlers::create_app))
-        .route("/api/v1/apps/query", post(handlers::query_apps))
-        .route("/api/v1/apps/runtime", get(handlers::list_app_runtimes))
-        .route("/api/v1/apps/{app_id}", get(handlers::get_app))
-        .route("/api/v1/apps/{app_id}/update", post(handlers::update_app))
-        .route("/api/v1/apps/{app_id}/delete", post(handlers::delete_app))
+        .route("/api/v1/userapp/query", post(handlers::query_apps))
+        .route("/api/v1/userapp/runtime", get(handlers::list_app_runtimes))
+        .route("/api/v1/userapp/{app_id}", get(handlers::get_app))
+        .route(
+            "/api/v1/userapp/{app_id}/update",
+            post(handlers::update_app),
+        )
+        .route(
+            "/api/v1/userapp/{app_id}/{app_stage}/delete",
+            post(handlers::delete_app),
+        )
+        .route(
+            "/api/v1/userapp/{app_id}/delete/app",
+            post(handlers::purge_app),
+        )
         // 应用操作
-        .route("/api/v1/apps/{app_id}/start", post(handlers::start_app))
-        .route("/api/v1/apps/{app_id}/stop", post(handlers::stop_app))
-        .route("/api/v1/apps/{app_id}/restart", post(handlers::restart_app))
+        .route("/api/v1/userapp/{app_id}/start", post(handlers::start_app))
+        .route("/api/v1/userapp/{app_id}/stop", post(handlers::stop_app))
         .route(
-            "/api/v1/apps/{app_id}/recycle-policy",
+            "/api/v1/userapp/{app_id}/restart",
+            post(handlers::restart_app),
+        )
+        .route(
+            "/api/v1/userapp/{app_id}/{app_stage}/recycle-policy",
             post(handlers::set_recycle_policy),
-        )
-        .route(
-            "/api/v1/apps/{app_id}/releases/prepare",
-            post(handlers::prepare_release),
-        )
-        .route(
-            "/api/v1/apps/{app_id}/releases/{release_id}/activate",
-            post(handlers::activate_release),
-        )
-        .route(
-            "/api/v1/apps/{app_id}/releases/{release_id}/confirm",
-            post(handlers::confirm_release),
-        )
-        .route(
-            "/api/v1/apps/{app_id}/releases/{release_id}/abort",
-            post(handlers::abort_release),
-        )
-        .route(
-            "/api/v1/apps/{app_id}/releases",
-            get(handlers::list_releases),
-        )
-        .route(
-            "/api/v1/apps/{app_id}/releases/{release_id}/delete",
-            post(handlers::delete_release),
         )
         // 查询接口
         .route(
-            "/api/v1/apps/{app_id}/logs/sources/query",
+            "/api/v1/userapp/{app_id}/{app_stage}/logs/sources/query",
             post(handlers::query_app_log_sources),
         )
         .route(
-            "/api/v1/apps/{app_id}/logs/query",
+            "/api/v1/userapp/{app_id}/{app_stage}/logs/query",
             post(handlers::query_app_logs),
         )
         .route(
-            "/api/v1/apps/{app_id}/logs/stream",
+            "/api/v1/userapp/{app_id}/{app_stage}/logs/stream",
             post(handlers::stream_app_logs_v1),
         )
         .route(
-            "/api/v1/apps/{app_id}/health",
+            "/api/v1/userapp/{app_id}/{app_stage}/health",
             get(handlers::get_app_health),
         )
-        .route("/api/v1/apps/{app_id}/stats", get(handlers::get_app_stats))
         .route(
-            "/api/v1/apps/{app_id}/events",
+            "/api/v1/userapp/{app_id}/{app_stage}/readiness",
+            get(handlers::get_app_readiness),
+        )
+        .route(
+            "/api/v1/userapp/{app_id}/{app_stage}/dbx/readiness",
+            get(handlers::get_app_dbx_readiness),
+        )
+        .route(
+            "/api/v1/userapp/{app_id}/{app_stage}/stats",
+            get(handlers::get_app_stats),
+        )
+        .route(
+            "/api/v1/userapp/{app_id}/{app_stage}/events",
             get(handlers::get_app_events),
         )
-        // 文件管理
-        .route("/api/v1/apps/{app_id}/upload", post(handlers::upload_file))
+        // 文件管理（app_stage 显式分派：dev=开发容器 workspace / prod=运行容器 /app）
         .route(
-            "/api/v1/apps/{app_id}/upload-from-url",
+            "/api/v1/userapp/{app_id}/{app_stage}/upload",
+            post(handlers::upload_file),
+        )
+        .route(
+            "/api/v1/userapp/{app_id}/{app_stage}/upload-from-url",
             post(handlers::upload_from_url),
         )
-        .route("/api/v1/apps/{app_id}/files", get(handlers::list_files))
         .route(
-            "/api/v1/apps/{app_id}/files/delete",
+            "/api/v1/userapp/{app_id}/{app_stage}/files",
+            get(handlers::list_files),
+        )
+        .route(
+            "/api/v1/userapp/{app_id}/{app_stage}/files/delete",
             post(handlers::delete_file),
         )
-        // 持久存储管理（v2 §5.4）
+        // 持久存储管理（v2 §5.4；app_stage=dev 为开发卷/开发环境语义）
         .route(
-            "/api/v1/apps/{app_id}/storage",
+            "/api/v1/userapp/{app_id}/{app_stage}/storage",
             get(handlers::get_app_storage),
         )
         .route(
-            "/api/v1/apps/{app_id}/storage/clear",
+            "/api/v1/userapp/{app_id}/{app_stage}/storage/clear",
             post(handlers::clear_app_storage),
         )
         .route(
-            "/api/v1/apps/{app_id}/storage/destroy",
+            "/api/v1/userapp/{app_id}/{app_stage}/storage/destroy",
             post(handlers::destroy_app_storage),
         )
-        .route("/api/v1/apps/storage/query", post(handlers::query_storage))
-        // 数据库管理（app-runtime 镜像单容器自带 PG；rcoder exec psql 操作）
         .route(
-            "/api/v1/apps/{app_id}/db/reset-password",
-            post(handlers::reset_db_password),
+            "/api/v1/userapp/storage/{app_stage}/query",
+            post(handlers::query_storage),
         )
-        .route(
-            "/api/v1/apps/{app_id}/db/create-database",
-            post(handlers::create_database),
-        )
+        .layer(axum::middleware::from_fn(
+            shared_types::userapp_http::envelope_errors,
+        ))
 }

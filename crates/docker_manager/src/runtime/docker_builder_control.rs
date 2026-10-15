@@ -1,0 +1,1004 @@
+//! Compute-only operations against immutable Docker IDs. No storage deletion.
+use super::docker_runtime::DockerRuntime;
+use container_runtime_api::{ContainerRuntimeError as Error, ContainerRuntimeResult as Result};
+use shared_types::{
+    BuilderControlTarget, ContainerBasicInfo, ServiceType, UserAppExecutionContext,
+};
+
+#[derive(Clone)]
+pub(super) struct BuilderReuseSnapshot {
+    pub(super) target: BuilderControlTarget,
+    pub(super) volumes: Vec<shared_types::AppResourceIdentity>,
+}
+
+impl DockerRuntime {
+    pub(super) async fn observe_retained_builder_stopped(
+        &self,
+        target: &BuilderControlTarget,
+    ) -> Result<bool> {
+        target.validate().map_err(Error::ConfigurationError)?;
+        let Some(resource) = target.workload.as_ref() else {
+            return Ok(false);
+        };
+        if resource.kind != shared_types::AppResourceKind::Container {
+            return Ok(false);
+        }
+        let client = self.inner.get_docker_client();
+        let current = match client.inspect_container(&resource.uid, None).await {
+            Ok(current) => current,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Ok(false),
+            Err(error) => {
+                return Err(Error::DockerError(format!(
+                    "Observe captured stopped builder: {error}"
+                )));
+            }
+        };
+        if control_identity_with_binding(
+            &current,
+            &resource.name,
+            &target.context,
+            target.resource_binding.as_ref(),
+            false,
+        )? != *resource
+        {
+            return Err(Error::Conflict(
+                "Captured Docker builder changed during stop observation".into(),
+            ));
+        }
+        Ok(current.state.as_ref().is_some_and(|state| {
+            state.running == Some(false)
+                && state.restarting != Some(true)
+                && state.dead != Some(true)
+                // CREATED is a retained container that has never executed.
+                // Like EXITED, it needs the durable management-only wake path;
+                // this observation itself does not acknowledge or permit a write.
+                && matches!(
+                    &state.status,
+                    Some(
+                        bollard::models::ContainerStateStatusEnum::CREATED
+                            | bollard::models::ContainerStateStatusEnum::EXITED
+                    )
+                )
+        }))
+    }
+
+    pub(super) async fn read_builder_file_credentials(
+        &self,
+        target: &BuilderControlTarget,
+    ) -> Result<shared_types::FileServerRequestCredentials> {
+        target.validate().map_err(Error::ConfigurationError)?;
+        let resource = target
+            .workload
+            .as_ref()
+            .ok_or(Error::ManagementNotRunning)?;
+        let before = self
+            .capture_builder_compute_with_binding(
+                &target.context,
+                target.resource_binding.as_ref(),
+                false,
+            )
+            .await?;
+        if before.workload.as_ref().map(|value| &value.uid) != Some(&resource.uid) {
+            return Err(Error::Conflict(
+                "Builder physical identity changed before credential read".into(),
+            ));
+        }
+        let client = self.inner.get_docker_client();
+        let info = client
+            .inspect_container(&resource.uid, None)
+            .await
+            .map_err(|error| {
+                Error::DockerError(format!("Inspect builder credential target: {error}"))
+            })?;
+        if info.state.as_ref().and_then(|state| state.running) != Some(true) {
+            return Err(Error::ManagementNotRunning);
+        }
+        let result = super::docker_app_runtime::execute_container_command(
+            client,
+            &resource.uid,
+            super::builder_file_credentials::read_command(),
+        )
+        .await?;
+        let after = self
+            .capture_builder_compute_with_binding(
+                &target.context,
+                target.resource_binding.as_ref(),
+                false,
+            )
+            .await?;
+        if after.workload.as_ref().map(|value| &value.uid) != Some(&resource.uid) {
+            return Err(Error::Conflict(
+                "Builder physical identity changed during credential read".into(),
+            ));
+        }
+        super::builder_file_credentials::credentials(result)
+    }
+
+    pub(super) async fn reconcile_builder_start(
+        &self,
+        target: &BuilderControlTarget,
+    ) -> Result<Option<ContainerBasicInfo>> {
+        if !super::docker_compute_receipt::matches_start(target).await? {
+            return Ok(None);
+        }
+        let Some(resource) = &target.workload else {
+            return Ok(None);
+        };
+        #[cfg(feature = "deploy-host")]
+        let observation = shared_types::published::begin_physical_observation(&resource.uid);
+        let info = self
+            .inner
+            .get_docker_client()
+            .inspect_container(&resource.uid, None)
+            .await
+            .map_err(|error| {
+                Error::DockerError(format!("Observe acknowledged builder start: {error}"))
+            })?;
+        if control_identity_with_binding(
+            &info,
+            &resource.name,
+            &target.context,
+            target.resource_binding.as_ref(),
+            false,
+        )? != *resource
+        {
+            return Err(Error::Conflict(
+                "Acknowledged builder identity changed".into(),
+            ));
+        }
+        if !info
+            .state
+            .as_ref()
+            .is_some_and(|state| state.running == Some(true) && state.restarting != Some(true))
+        {
+            return Ok(None);
+        }
+        #[cfg(feature = "deploy-host")]
+        if shared_types::is_deploy_host() {
+            let ready = self
+                .confirm_builder_reach(resource, &info, observation)
+                .await?;
+            return running_builder_info(&ready, target);
+        }
+        running_builder_info(&info, target)
+    }
+    pub(super) async fn reconcile_builder_stop(
+        &self,
+        target: &BuilderControlTarget,
+    ) -> Result<bool> {
+        if !super::docker_compute_receipt::matches_stop(target).await? {
+            return Ok(false);
+        }
+        let Some(resource) = &target.workload else {
+            return Ok(false);
+        };
+        if resource.kind != shared_types::AppResourceKind::Container {
+            return Ok(false);
+        }
+        match self
+            .inner
+            .get_docker_client()
+            .inspect_container(&resource.uid, None)
+            .await
+        {
+            Ok(info) => Ok(control_identity_with_binding(
+                &info,
+                &resource.name,
+                &target.context,
+                target.resource_binding.as_ref(),
+                false,
+            )? == *resource
+                && info.state.as_ref().and_then(|state| state.running) == Some(false)),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(true),
+            Err(error) => Err(Error::DockerError(format!(
+                "Reconcile Docker builder stop: {error}"
+            ))),
+        }
+    }
+    pub(super) async fn exec_bound_builder(
+        &self,
+        target: &BuilderControlTarget,
+        command: Vec<String>,
+    ) -> Result<container_runtime_api::ExecResult> {
+        target.validate().map_err(Error::Conflict)?;
+        let resource = target
+            .workload
+            .as_ref()
+            .ok_or_else(|| Error::Conflict("Captured builder is absent".into()))?;
+        if resource.kind != shared_types::AppResourceKind::Container || command.is_empty() {
+            return Err(Error::ConfigurationError(
+                "Builder exec requires a container and command".into(),
+            ));
+        }
+        let client = self.inner.get_docker_client();
+        let before = client
+            .inspect_container(&resource.uid, None)
+            .await
+            .map_err(|error| Error::DockerError(format!("Inspect builder exec target: {error}")))?;
+        let actual = control_identity_with_binding(
+            &before,
+            &resource.name,
+            &target.context,
+            target.resource_binding.as_ref(),
+            false,
+        )?;
+        if actual != *resource {
+            return Err(Error::Conflict(
+                "Captured builder exec identity changed".into(),
+            ));
+        }
+        super::docker_app_runtime::execute_container_command(client, &resource.uid, command).await
+    }
+
+    /// Resume the captured adopted container; Docker labels/config are immutable.
+    /// This never runs create, removes storage, or restarts an already-running app.
+    #[cfg(test)]
+    pub(super) async fn resume_bound_builder(
+        &self,
+        params: &container_runtime_api::ContainerCreateParams,
+        expected_image: Option<&str>,
+    ) -> Result<ContainerBasicInfo> {
+        let captured = self
+            .capture_builder_reuse_snapshot(params)
+            .await?
+            .ok_or_else(|| rejected_before_write("Builder execution context missing".into()))?;
+        self.resume_captured_builder(params, captured, expected_image)
+            .await
+    }
+
+    pub(super) async fn capture_builder_reuse_snapshot(
+        &self,
+        params: &container_runtime_api::ContainerCreateParams,
+    ) -> Result<Option<BuilderReuseSnapshot>> {
+        let Some(context) = params.execution_context.as_ref() else {
+            return Ok(None);
+        };
+        let captured = async {
+            let mut target = self
+                .capture_builder_compute_with_binding(
+                    context,
+                    params.resource_binding.as_ref(),
+                    false,
+                )
+                .await?;
+            target.builder_startup_mode = params.builder_startup_mode;
+            let volumes = if target.workload.is_some() {
+                self.capture_builder_volume_witness(&target).await?
+            } else {
+                vec![]
+            };
+            Ok::<_, Error>(BuilderReuseSnapshot { target, volumes })
+        }
+        .await
+        .map_err(|error| rejected_before_write(error.to_string()))?;
+        Ok(Some(captured))
+    }
+
+    pub(super) async fn resume_captured_builder(
+        &self,
+        params: &container_runtime_api::ContainerCreateParams,
+        captured: BuilderReuseSnapshot,
+        expected_image: Option<&str>,
+    ) -> Result<ContainerBasicInfo> {
+        let check_cancelled = || {
+            if params
+                .creation_cancelled
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                Err(Error::CreationCancelled)
+            } else {
+                Ok(())
+            }
+        };
+        check_cancelled()?;
+        let target = async {
+            let context = params.execution_context.as_ref().ok_or_else(|| {
+                Error::ConfigurationError("Bound builder requires execution context".into())
+            })?;
+            if captured.target.context != *context
+                || captured.target.resource_binding != params.resource_binding
+            {
+                return Err(Error::Conflict(
+                    "Existing builder capture differs from its request".into(),
+                ));
+            }
+            let fresh = self
+                .capture_builder_reuse_snapshot(params)
+                .await?
+                .ok_or_else(|| {
+                    Error::ConfigurationError("Builder execution context missing".into())
+                })?;
+            if fresh.target.workload != captured.target.workload
+                || fresh.volumes != captured.volumes
+            {
+                return Err(Error::Conflict(
+                    "Existing builder identity or workspace changed before reuse".into(),
+                ));
+            }
+            let mut target = fresh.target;
+            target.builder_startup_mode = params.builder_startup_mode;
+            let resource = target.workload.as_ref().ok_or_else(|| {
+                Error::Conflict(
+                    "Bound builder disappeared; automatic replacement is forbidden".into(),
+                )
+            })?;
+            let info = self
+                .inner
+                .get_docker_client()
+                .inspect_container(&resource.uid, None)
+                .await
+                .map_err(|error| {
+                    Error::DockerError(format!("Inspect bound builder configuration: {error}"))
+                })?;
+            if expected_image.is_some_and(|expected_image| {
+                info.config
+                    .as_ref()
+                    .and_then(|config| config.image.as_deref())
+                    != Some(expected_image)
+            }) {
+                tracing::info!(app = %context.app_id,
+                    "bound Docker builder retained; image rollout requires explicit restart");
+            }
+            Ok::<_, Error>(target)
+        }
+        .await
+        .map_err(|error| rejected_before_write(error.to_string()))?;
+        check_cancelled()?;
+        // Await the start and its receipt before acknowledging cancellation.
+        // Dropping a Docker mutation future does not cancel the daemon's write.
+        let result = self.apply_builder_compute_mode(&target, true, true).await?;
+        check_cancelled()?;
+        let fresh = self
+            .capture_builder_reuse_snapshot(params)
+            .await
+            .map_err(|error| {
+                Error::ConnectionError(format!("Confirm builder after startup: {error}"))
+            })?
+            .ok_or_else(|| Error::Conflict("Builder capture missing after reuse".into()))?;
+        if fresh.target.workload != captured.target.workload || fresh.volumes != captured.volumes {
+            return Err(Error::Conflict(
+                "Existing builder identity or workspace changed after reuse".into(),
+            ));
+        }
+        result.ok_or_else(|| {
+            Error::Conflict("Bound builder did not return a running container".into())
+        })
+    }
+
+    pub(super) async fn capture_builder_compute(
+        &self,
+        context: &UserAppExecutionContext,
+    ) -> Result<BuilderControlTarget> {
+        self.capture_builder_compute_with_binding(context, None, false)
+            .await
+    }
+
+    pub(super) async fn capture_builder_compute_with_binding(
+        &self,
+        context: &UserAppExecutionContext,
+        binding: Option<&shared_types::UserAppResourceBinding>,
+        adoption: bool,
+    ) -> Result<BuilderControlTarget> {
+        context
+            .validate_identity(&context.app_id)
+            .map_err(Error::Conflict)?;
+        let name = crate::utils::DockerUtils::generate_container_name(
+            ServiceType::UserappBuilder.container_prefix(),
+            &context.app_id,
+        )
+        .map_err(Error::ConfigurationError)?;
+        let workload = match self
+            .inner
+            .get_docker_client()
+            .inspect_container(&name, None)
+            .await
+        {
+            Ok(info) => {
+                // Auto-remove deletion is asynchronous: a stopped builder can
+                // still answer inspect while "marked for removal". Such a
+                // container can never be started again — treating it as
+                // present would route restart straight into a 409 at start.
+                let removing = info.state.as_ref().is_some_and(|state| {
+                    state.dead == Some(true)
+                        || state.status.as_ref().is_some_and(|status| {
+                            matches!(
+                                status,
+                                bollard::models::ContainerStateStatusEnum::REMOVING
+                                    | bollard::models::ContainerStateStatusEnum::DEAD
+                            )
+                        })
+                });
+                if removing {
+                    None
+                } else {
+                    Some(control_identity_with_binding(
+                        &info, &name, context, binding, adoption,
+                    )?)
+                }
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => None,
+            Err(error) => {
+                return Err(Error::DockerError(format!(
+                    "Inspect builder control target: {error}"
+                )));
+            }
+        };
+        Ok(BuilderControlTarget {
+            resource_binding: binding.cloned(),
+            context: context.clone(),
+            workload,
+            pod: None,
+            restart_image: None,
+            restart_runtime_workspace: None,
+            builder_startup_mode: shared_types::BuilderStartupMode::default(),
+        })
+    }
+
+    /// Continue a compute restart after its stop boundary. Starting an already
+    /// running captured container is idempotent; it must not restart it again.
+    pub(super) async fn start_builder_compute(
+        &self,
+        target: &BuilderControlTarget,
+    ) -> Result<Option<ContainerBasicInfo>> {
+        self.apply_builder_compute_mode(target, true, true).await
+    }
+
+    pub(super) async fn apply_builder_compute(
+        &self,
+        target: &BuilderControlTarget,
+        restart: bool,
+    ) -> Result<Option<ContainerBasicInfo>> {
+        self.apply_builder_compute_mode(target, restart, false)
+            .await
+    }
+
+    async fn apply_builder_compute_mode(
+        &self,
+        target: &BuilderControlTarget,
+        restart: bool,
+        only_start: bool,
+    ) -> Result<Option<ContainerBasicInfo>> {
+        target.validate().map_err(rejected_before_write)?;
+        let Some(resource) = &target.workload else {
+            return Ok(None);
+        };
+        if resource.kind != shared_types::AppResourceKind::Container {
+            return Err(rejected_before_write(
+                "Non-Docker builder control target".into(),
+            ));
+        }
+        let client = self.inner.get_docker_client();
+        let before = match client.inspect_container(&resource.uid, None).await {
+            Ok(info) => info,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) if !restart => return Ok(None),
+            Err(error) => {
+                return Err(rejected_before_write(format!(
+                    "Inspect captured builder before mutation: {error}"
+                )));
+            }
+        };
+        if control_identity_with_binding(
+            &before,
+            &resource.name,
+            &target.context,
+            target.resource_binding.as_ref(),
+            false,
+        )
+        .map_err(|error| rejected_before_write(error.to_string()))?
+            != *resource
+        {
+            return Err(rejected_before_write(
+                "Builder control identity changed".into(),
+            ));
+        }
+        if restart
+            && only_start
+            && target.builder_startup_mode == shared_types::BuilderStartupMode::ManagementOnly
+            && before.state.as_ref().and_then(|state| state.running) != Some(true)
+        {
+            let env = before
+                .config
+                .as_ref()
+                .and_then(|config| config.env.as_ref());
+            let control_only = env.is_some_and(|env| {
+                env.iter().any(|entry| {
+                    entry == &format!("{}=true", shared_types::APP_CLI_CONTROL_ONLY_ENV)
+                })
+            });
+            let boot_id = env.is_some_and(|env| {
+                env.iter().any(|entry| {
+                    entry
+                        == &format!(
+                            "{}={}",
+                            shared_types::APP_CLI_MANAGEMENT_BOOT_ID_ENV,
+                            target.context.operation_id
+                        )
+                })
+            });
+            if !control_only || !boot_id {
+                return Err(Error::ConfigurationError(
+                    "Management-only wake requires the operation's restored boot environment; use its controlled restart".into(),
+                ));
+            }
+        }
+        if restart && only_start {
+            match client
+                .start_container(
+                    &resource.uid,
+                    None::<bollard::query_parameters::StartContainerOptions>,
+                )
+                .await
+            {
+                Ok(())
+                | Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 304, ..
+                }) => {}
+                Err(error) => return Err(first_write_error(error)),
+            }
+        } else if restart {
+            client
+                .restart_container(
+                    &resource.uid,
+                    Some(bollard::query_parameters::RestartContainerOptions {
+                        t: Some(30),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .map_err(first_write_error)?;
+        } else {
+            match client
+                .stop_container(
+                    &resource.uid,
+                    Some(bollard::query_parameters::StopContainerOptions {
+                        t: Some(30),
+                        ..Default::default()
+                    }),
+                )
+                .await
+            {
+                Ok(())
+                | Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 304 | 404,
+                    ..
+                }) => {}
+                Err(error) => {
+                    return Err(first_write_error(error));
+                }
+            }
+        }
+        #[cfg(feature = "deploy-host")]
+        let observation = shared_types::published::begin_physical_observation(&resource.uid);
+        let after = match client.inspect_container(&resource.uid, None).await {
+            Ok(info) => info,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) if !restart => {
+                // Auto-remove already deleted the stopped builder. The Docker
+                // stop acknowledgement is still the causal evidence recovery
+                // observers match on; persist it before reporting success.
+                super::docker_compute_receipt::save_stop(target).await?;
+                #[cfg(feature = "deploy-host")]
+                if shared_types::is_deploy_host() {
+                    shared_types::published::unregister_if_physical(&resource.name, &resource.uid);
+                    shared_types::published::unregister_if_physical(
+                        &target.context.app_id,
+                        &resource.uid,
+                    );
+                }
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(Error::DockerError(format!(
+                    "Confirm builder control: {error}"
+                )));
+            }
+        };
+        if control_identity_with_binding(
+            &after,
+            &resource.name,
+            &target.context,
+            target.resource_binding.as_ref(),
+            false,
+        )? != *resource
+        {
+            return Err(Error::Conflict(
+                "Builder control identity changed after mutation".into(),
+            ));
+        }
+        let running = after
+            .state
+            .as_ref()
+            .and_then(|state| state.running)
+            .ok_or_else(|| Error::Conflict("Builder running state is unavailable".into()))?;
+        if running != restart {
+            return Err(Error::Conflict(
+                "Builder control result does not match requested state".into(),
+            ));
+        }
+        if !restart {
+            super::docker_compute_receipt::save_stop(target).await?;
+            #[cfg(feature = "deploy-host")]
+            if shared_types::is_deploy_host() {
+                shared_types::published::unregister_if_physical(&resource.name, &resource.uid);
+                shared_types::published::unregister_if_physical(
+                    &target.context.app_id,
+                    &resource.uid,
+                );
+            }
+            return Ok(None);
+        }
+        if only_start {
+            super::docker_compute_receipt::save_start(target).await?;
+        }
+        crate::native_domain::reconcile_bounded(client, &resource.uid, &target.context.app_id)
+            .await;
+        // A Docker start acknowledgment can precede IP/port publication. Do
+        // not report a successful restart until its new physical reach is
+        // verified and registered.
+        #[cfg(feature = "deploy-host")]
+        if shared_types::is_deploy_host() {
+            let ready = self
+                .confirm_builder_reach(resource, &after, observation)
+                .await?;
+            return running_builder_info(&ready, target);
+        }
+        running_builder_info(&after, target)
+    }
+
+    #[cfg(feature = "deploy-host")]
+    async fn confirm_builder_reach(
+        &self,
+        resource: &shared_types::AppResourceIdentity,
+        initial: &bollard::models::ContainerInspectResponse,
+        initial_observation: shared_types::published::PhysicalObservation,
+    ) -> Result<bollard::models::ContainerInspectResponse> {
+        let client = self.inner.get_docker_client();
+        for attempt in 0..10 {
+            let observation = if attempt == 0 {
+                initial_observation.clone()
+            } else {
+                shared_types::published::begin_physical_observation(&resource.uid)
+            };
+            let inspect = if attempt == 0 {
+                initial.clone()
+            } else {
+                client
+                    .inspect_container(&resource.uid, None)
+                    .await
+                    .map_err(|error| {
+                        Error::DockerError(format!("Inspect started builder reach: {error}"))
+                    })?
+            };
+            if inspect.id.as_deref() != Some(resource.uid.as_str())
+                || inspect.state.as_ref().and_then(|state| state.running) != Some(true)
+            {
+                return Err(Error::Conflict(
+                    "Started builder physical identity changed".into(),
+                ));
+            }
+            let ready = if crate::deploy_host_ports::is_direct_reach() {
+                let raw = super::docker_runtime::extract_container_ip(&inspect, None);
+                raw.parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| !ip.is_unspecified())
+            } else {
+                crate::deploy_host_ports::missing_builder_ports(&inspect).is_empty()
+            };
+            if ready {
+                crate::deploy_host_ports::register_reach_from_inspect(
+                    &resource.name,
+                    None,
+                    &inspect,
+                    &observation,
+                )
+                .map_err(|error| Error::DockerError(format!("Register builder reach: {error}")))?;
+                return Ok(inspect);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        Err(Error::DockerError(format!(
+            "Started builder {} has no usable {} reach (missing published ports: {:?})",
+            resource.uid,
+            if crate::deploy_host_ports::is_direct_reach() {
+                "Direct"
+            } else {
+                "Published"
+            },
+            if crate::deploy_host_ports::is_direct_reach() {
+                Vec::new()
+            } else {
+                crate::deploy_host_ports::missing_builder_ports(initial)
+            }
+        )))
+    }
+}
+
+fn running_builder_info(
+    after: &bollard::models::ContainerInspectResponse,
+    target: &BuilderControlTarget,
+) -> Result<Option<ContainerBasicInfo>> {
+    let resource = target
+        .workload
+        .as_ref()
+        .ok_or_else(|| Error::Conflict("Builder identity missing".into()))?;
+    let preferred = after
+        .host_config
+        .as_ref()
+        .and_then(|config| config.network_mode.as_deref());
+    let address = super::docker_runtime::extract_container_ip(after, preferred)
+        .parse::<std::net::IpAddr>()
+        .map_err(|error| Error::ConfigurationError(format!("Builder IP is invalid: {error}")))?;
+    if address.is_unspecified() {
+        return Err(Error::ConfigurationError(
+            "Builder IP is unspecified".into(),
+        ));
+    }
+    let created = after
+        .created
+        .as_deref()
+        .ok_or_else(|| Error::ConfigurationError("Builder creation time is missing".into()))?;
+    let created_at = chrono::DateTime::parse_from_rfc3339(created)
+        .map_err(|error| {
+            Error::ConfigurationError(format!("Builder creation time is invalid: {error}"))
+        })?
+        .with_timezone(&chrono::Utc);
+    Ok(Some(ContainerBasicInfo {
+        container_id: resource.uid.clone(),
+        container_name: resource.name.clone(),
+        container_ip: address.to_string(),
+        internal_port: shared_types::GRPC_DEFAULT_PORT,
+        external_port: 0,
+        project_id: target.context.app_id.clone(),
+        status: "Running".into(),
+        created_at,
+        service_url: format!("http://{address}:{}", shared_types::GRPC_DEFAULT_PORT),
+        workload_uid: None,
+    }))
+}
+
+fn rejected_before_write(message: String) -> Error {
+    Error::RequestRejected(shared_types::RuntimeRequestRejection {
+        status: 409,
+        message,
+    })
+}
+fn first_write_error(error: bollard::errors::Error) -> Error {
+    super::builder_completion::docker_error(crate::DockerError::BollardError(error))
+}
+
+#[cfg(test)]
+fn control_identity(
+    info: &bollard::models::ContainerInspectResponse,
+    name: &str,
+    context: &UserAppExecutionContext,
+) -> Result<shared_types::AppResourceIdentity> {
+    control_identity_with_binding(info, name, context, None, false)
+}
+
+pub(super) fn control_identity_with_binding(
+    info: &bollard::models::ContainerInspectResponse,
+    name: &str,
+    context: &UserAppExecutionContext,
+    binding: Option<&shared_types::UserAppResourceBinding>,
+    adoption: bool,
+) -> Result<shared_types::AppResourceIdentity> {
+    let identity =
+        super::docker_builder_deletion::builder_identity(info.clone(), name, &context.app_id)?;
+    let labels = info
+        .config
+        .as_ref()
+        .and_then(|config| config.labels.as_ref())
+        .ok_or_else(|| Error::Conflict("Builder labels missing".into()))?;
+    let metadata = labels
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if !shared_types::builder_identity_is_bound(context, &metadata, &identity.uid, binding)
+        .map_err(Error::Conflict)?
+        && !adoption
+    {
+        return Err(Error::Conflict(
+            "Builder requires explicit physical resource adoption".into(),
+        ));
+    }
+    Ok(identity)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 测试内 env 变异（nextest 进程隔离；对齐 loader.rs / app-cli 测试先例）。
+    pub(super) mod receipt_env {
+        #![allow(unsafe_code)]
+
+        pub fn set_root(path: &std::path::Path) {
+            unsafe { std::env::set_var("RCODER_OPERATION_RECEIPT_ROOT", path) };
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_wake_starts_only_the_captured_id_and_accepts_already_running() {
+        // 回执落盘需可写根：容器常量 /app/... 在宿主机（macOS 只读根 /）会
+        // EROFS——显式 env 注入 tempfile 根（生产同链路：env > host_map >
+        // 容器常量，见 docker_compute_receipt::receipts_base）。
+        let receipt_root = tempfile::tempdir().expect("receipt root tempdir");
+        receipt_env::set_root(receipt_root.path());
+        for start_status in [204, 304, 403] {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let context = UserAppExecutionContext {
+                app_id: "app".into(),
+                lifecycle_id: "life".into(),
+                operation_id: "wake".into(),
+                executor_id: "worker".into(),
+                request_fingerprint: "a".repeat(64),
+            };
+            let mut labels: std::collections::BTreeMap<String, String> =
+                std::collections::BTreeMap::new();
+            labels.insert(
+                "service-type".into(),
+                ServiceType::UserappBuilder.to_string(),
+            );
+            labels.insert("identifier".into(), "app".into());
+            let object = serde_json::json!({"Id":"original-id","Created":"2026-01-01T00:00:00Z","Config":{"Labels":labels,"Env":["USER_ID=owner"]},"State":{"Running":true},"HostConfig":{"NetworkMode":"test"},"NetworkSettings":{"Networks":{"test":{"IPAddress":"172.20.0.4"}}}});
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let address = listener.local_addr().expect("address");
+            let server = tokio::spawn(async move {
+                for index in 0..if start_status == 403 { 2 } else { 3 } {
+                    let (mut stream, _) = listener.accept().await.expect("accept");
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0u8; 2048];
+                    loop {
+                        let n = stream.read(&mut buffer).await.expect("read");
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&buffer[..n]);
+                        if bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let headers = String::from_utf8_lossy(&bytes);
+                    let request = headers.lines().next().expect("request");
+                    assert!(
+                        !request.contains("/restart")
+                            && !request.contains("/create")
+                            && !request.starts_with("DELETE ")
+                    );
+                    let (code, body) = if index == 1 {
+                        assert!(
+                            request.starts_with("POST ")
+                                && request.contains("/containers/original-id/start")
+                        );
+                        (
+                            start_status,
+                            if start_status == 403 {
+                                "{\"message\":\"denied\"}".to_owned()
+                            } else {
+                                String::new()
+                            },
+                        )
+                    } else {
+                        assert!(
+                            request.starts_with("GET ")
+                                && request.contains("/containers/original-id/json")
+                        );
+                        (200, object.to_string())
+                    };
+                    stream.write_all(format!("HTTP/1.1 {code} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.expect("respond");
+                }
+            });
+            let (actor, containers) = crate::container_state_actor::ContainerStateActor::new();
+            let actor_task = tokio::spawn(actor.run());
+            let manager = std::sync::Arc::new(crate::DockerManager {
+                docker: bollard::Docker::connect_with_http(
+                    &format!("http://{address}"),
+                    1,
+                    bollard::API_DEFAULT_VERSION,
+                )
+                .expect("client"),
+                config: crate::DockerManagerConfig::default(),
+                containers,
+                main_network_name: std::sync::Arc::new(tokio::sync::RwLock::new("test".into())),
+                api_cache: std::sync::Arc::new(crate::api_cache::DockerApiCache::new(
+                    600, 600, 100,
+                )),
+            });
+            let runtime = DockerRuntime::new(manager);
+            let target = BuilderControlTarget {
+                context,
+                resource_binding: Some(shared_types::UserAppResourceBinding {
+                    app_id: "app".into(),
+                    lifecycle_id: "life".into(),
+                    service_type: ServiceType::UserappBuilder,
+                    physical_uid: "original-id".into(),
+                    adopted_by_operation: "adopt".into(),
+                }),
+                workload: Some(shared_types::AppResourceIdentity {
+                    kind: shared_types::AppResourceKind::Container,
+                    name: "builder-app".into(),
+                    uid: "original-id".into(),
+                    resource_version: None,
+                }),
+                pod: None,
+                restart_image: None,
+                restart_runtime_workspace: None,
+                builder_startup_mode: shared_types::BuilderStartupMode::default(),
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let result = runtime
+                    .apply_builder_compute_mode(&target, true, true)
+                    .await;
+                if start_status == 403 {
+                    assert!(matches!(result, Err(Error::RequestRejected(_))));
+                } else {
+                    assert_eq!(
+                        result.expect("wake").expect("container").container_id,
+                        "original-id"
+                    );
+                }
+                server.await.expect("server");
+            })
+            .await
+            .expect("total contract deadline");
+            actor_task.abort();
+            if let Err(error) = actor_task.await {
+                assert!(error.is_cancelled(), "actor failed before cleanup: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn control_identity_rejects_owner_lifecycle_and_family_changes() {
+        let context = UserAppExecutionContext {
+            app_id: "app".into(),
+            lifecycle_id: "life".into(),
+            operation_id: "stop".into(),
+            executor_id: "worker".into(),
+            request_fingerprint: "a".repeat(64),
+        };
+        let mut labels = context.resource_metadata();
+        labels.insert(
+            "service-type".into(),
+            ServiceType::UserappBuilder.to_string(),
+        );
+        labels.insert("identifier".into(), "app".into());
+        let info = serde_json::from_value(
+            serde_json::json!({"Id":"actual-id", "Config":{"Labels":labels}}),
+        )
+        .expect("inspect");
+        assert_eq!(
+            control_identity(&info, "builder", &context)
+                .expect("identity")
+                .uid,
+            "actual-id"
+        );
+        let mut wrong = context.clone();
+        wrong.lifecycle_id = "new-life".into();
+        assert!(control_identity(&info, "builder", &wrong).is_err());
+        wrong = context.clone();
+        wrong.app_id = "other".into();
+        assert!(control_identity(&info, "builder", &wrong).is_err());
+        labels.insert("service-type".into(), ServiceType::Userapp.to_string());
+        let info = serde_json::from_value(
+            serde_json::json!({"Id":"actual-id", "Config":{"Labels":labels}}),
+        )
+        .expect("inspect");
+        assert!(control_identity(&info, "builder", &context).is_err());
+    }
+}
+
+#[cfg(test)]
+mod recapture_tests;
+#[cfg(test)]
+mod resume_tests;
+#[cfg(test)]
+mod stopped_tests;

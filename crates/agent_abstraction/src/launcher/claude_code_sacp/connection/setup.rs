@@ -6,11 +6,12 @@
 //! 3. agent_mode=ask 时的 SetSessionModeRequest
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_client_protocol::schema::v1::{
     CancelNotification, InitializeRequest, LoadSessionRequest, McpServer, NewSessionRequest,
-    SessionId, SetSessionModeRequest,
+    SessionConfigOption, SessionId, SetSessionModeRequest,
 };
 use agent_client_protocol::{Agent, ConnectionTo};
 use tokio_util::sync::CancellationToken;
@@ -21,6 +22,14 @@ use crate::traits::AgentStartConfig;
 
 /// InitializeRequest 超时时间（秒）
 pub(super) const INIT_TIMEOUT_SECS: u64 = 50;
+
+/// 会话建立结果：session_id + LoadSession 响应透传的配置项
+pub(super) struct SessionSetupOutcome {
+    pub(super) session_id: SessionId,
+    /// 仅 LoadSession 成功路径填充（agent 声明的会话配置项，含模型选项），
+    /// 供 resume 后的模型引用同步使用
+    pub(super) config_options: Option<Vec<SessionConfigOption>>,
+}
 
 /// Step 1: 初始化 ACP 连接（INIT_TIMEOUT_SECS 秒超时，同时与 cancel_token 竞速）
 pub(super) async fn initialize_connection(
@@ -131,13 +140,18 @@ pub(super) async fn initialize_connection(
 /// - 有 resume_session_id 时优先 LoadSession，失败/超时降级到 NewSession
 /// - 无 resume_session_id 时直接 NewSession
 /// - 不使用 ? 提前返回，确保错误以字符串累积后统一映射为协议错误
+///
+/// 返回 [`SessionSetupOutcome`]：config_options 仅在 LoadSession 成功时从响应
+/// 透传（agent 声明的会话配置项，含模型选项），供 resume 后的模型引用同步
+/// 使用；NewSession 路径（含降级）引用由 agent 按当前 env 建立，为 None。
 pub(super) async fn create_or_load_session(
     cx: &ConnectionTo<Agent>,
     project_id: &str,
     project_path: PathBuf,
     mcp_servers: Vec<McpServer>,
     start_config: &AgentStartConfig,
-) -> Result<SessionId, agent_client_protocol::Error> {
+    resuming: &Arc<AtomicBool>,
+) -> Result<SessionSetupOutcome, agent_client_protocol::Error> {
     // 2. 构建 meta（包含系统提示词和可能的 resume）
     let system_prompt_meta = start_config.build_meta();
 
@@ -156,8 +170,15 @@ pub(super) async fn create_or_load_session(
     };
 
     // 3. 创建或加载会话
-    // 从配置获取超时值，默认 60 秒
-    let timeout_secs = start_config.acp_session_create_timeout_secs.unwrap_or(60);
+    // 包含停旧、命令解析、Initialize 和 Load→New 的同一总预算。
+    let timeout_secs = start_config
+        .acp_session_create_timeout_secs
+        .unwrap_or(shared_types::DEFAULT_ACP_SESSION_CREATE_TIMEOUT_SECS);
+    let deadline = start_config.session_create_deadline.unwrap_or_else(|| {
+        tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs)
+    });
+    let available = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let recovery_pause = tokio::time::Duration::from_millis(500).min(available.div_f64(4.0));
     info!(
         "[SACP] Step 3/4: Creating/loading session, project_id={}, timeout={}s, has_resume={}",
         project_id,
@@ -167,31 +188,38 @@ pub(super) async fn create_or_load_session(
 
     // 🔥 修复：使用 Result 累积错误，避免 ? 操作符提前返回
     // 无论成功失败，都确保能执行到 session_id_tx.send()
-    let session_result: Result<SessionId, String> = if let Some(ref resume_id) =
+    let session_result: Result<SessionSetupOutcome, String> = if let Some(ref resume_id) =
         start_config.resume_session_id
     {
         // 有 resume_session_id，尝试加载历史会话
         info!("[SACP] Attempting to load existing session: {}", resume_id);
-
+        // resume 窗口守卫：块作用域覆盖整个 load 匹配（含降级路径），
+        // 任何出口 Drop 自动复位（替代此前手动 store 的三处复位——曾漏超时分支）
         let load_request = LoadSessionRequest::new(resume_id.clone(), project_path.clone())
             .mcp_servers(mcp_servers.clone())
             .meta(system_prompt_meta.clone());
 
         debug!("load_session_request: {:?}", load_request);
 
-        match tokio::time::timeout(
-            tokio::time::Duration::from_secs(timeout_secs),
-            cx.send_request(load_request).block_task(),
-        )
-        .await
-        {
-            Ok(Ok(_response)) => {
-                // LoadSession 成功，使用请求中的 session_id
+        // LoadSession 只是恢复尝试，需要在总创建预算内为 NewSession 留下时间。
+        let load_timeout = available.saturating_sub(recovery_pause).div_f64(2.0);
+        let load_outcome = {
+            let _resuming_guard =
+                crate::launcher::claude_code_sacp::connection::ResumingGuard::new(resuming.clone());
+            tokio::time::timeout(load_timeout, cx.send_request(load_request).block_task()).await
+        };
+        match load_outcome {
+            Ok(Ok(response)) => {
+                // LoadSession 成功，使用请求中的 session_id；
+                // config_options（agent 声明的会话配置项）透传给模型引用同步
                 info!(
                     "[SACP] Session loaded successfully: {}, resuming session",
                     resume_id
                 );
-                Ok(SessionId::from(resume_id.clone()))
+                Ok(SessionSetupOutcome {
+                    session_id: SessionId::from(resume_id.clone()),
+                    config_options: response.config_options,
+                })
             }
             Ok(Err(load_err)) => {
                 // LoadSession 返回错误，降级到 NewSessionRequest
@@ -209,7 +237,7 @@ pub(super) async fn create_or_load_session(
                     );
                 }
                 // 等待一小段时间让 agent 有机会清理
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(recovery_pause).await;
 
                 let new_request = NewSessionRequest::new(project_path.clone())
                     .mcp_servers(mcp_servers.clone())
@@ -218,13 +246,13 @@ pub(super) async fn create_or_load_session(
                 debug!("new_session_request: {:?}", new_request);
 
                 // 🔥 尝试 NewSession，不要用 ? 操作符
-                match tokio::time::timeout(
-                    tokio::time::Duration::from_secs(timeout_secs),
-                    cx.send_request(new_request).block_task(),
-                )
-                .await
+                match tokio::time::timeout_at(deadline, cx.send_request(new_request).block_task())
+                    .await
                 {
-                    Ok(Ok(response)) => Ok(response.session_id),
+                    Ok(Ok(response)) => Ok(SessionSetupOutcome {
+                        session_id: response.session_id,
+                        config_options: None,
+                    }),
                     Ok(Err(new_err)) => Err(format!(
                         "[SACP] LoadSession failed ({}), NewSession also failed ({})",
                         load_err, new_err
@@ -237,8 +265,8 @@ pub(super) async fn create_or_load_session(
             Err(_) => {
                 // LoadSession 超时，降级到 NewSessionRequest
                 warn!(
-                    "[SACP] LoadSession timeout ({}s), falling back to NewSession",
-                    timeout_secs
+                    "[SACP] LoadSession timeout ({:?}), falling back to NewSession",
+                    load_timeout
                 );
 
                 let cancel_notification =
@@ -250,7 +278,7 @@ pub(super) async fn create_or_load_session(
                     );
                 }
                 // 等待一小段时间让 agent 有机会清理
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(recovery_pause).await;
 
                 let new_request = NewSessionRequest::new(project_path.clone())
                     .mcp_servers(mcp_servers.clone())
@@ -259,13 +287,13 @@ pub(super) async fn create_or_load_session(
                 debug!("new_session_request: {:?}", new_request);
 
                 // 🔥 尝试 NewSession，不要用 ? 操作符
-                match tokio::time::timeout(
-                    tokio::time::Duration::from_secs(timeout_secs),
-                    cx.send_request(new_request).block_task(),
-                )
-                .await
+                match tokio::time::timeout_at(deadline, cx.send_request(new_request).block_task())
+                    .await
                 {
-                    Ok(Ok(response)) => Ok(response.session_id),
+                    Ok(Ok(response)) => Ok(SessionSetupOutcome {
+                        session_id: response.session_id,
+                        config_options: None,
+                    }),
                     Ok(Err(new_err)) => Err(format!(
                         "[SACP] LoadSession timeout, NewSession failed ({})",
                         new_err
@@ -285,13 +313,11 @@ pub(super) async fn create_or_load_session(
         debug!("new_session_request: {:?}", new_request);
 
         // 🔥 尝试 NewSession，不要用 ? 操作符
-        match tokio::time::timeout(
-            tokio::time::Duration::from_secs(timeout_secs),
-            cx.send_request(new_request).block_task(),
-        )
-        .await
-        {
-            Ok(Ok(response)) => Ok(response.session_id),
+        match tokio::time::timeout_at(deadline, cx.send_request(new_request).block_task()).await {
+            Ok(Ok(response)) => Ok(SessionSetupOutcome {
+                session_id: response.session_id,
+                config_options: None,
+            }),
             Ok(Err(e)) => Err(format!("[SACP] NewSession failed: {}", e)),
             Err(_) => Err(format!("[SACP] NewSession timeout ({}s)", timeout_secs)),
         }
@@ -299,15 +325,15 @@ pub(super) async fn create_or_load_session(
 
     // 🔥 关键修复：在闭包最后统一处理 session 创建结果
     // 确保无论成功失败都能执行到发送逻辑
-    let session_id = match session_result {
-        Ok(sid) => sid,
+    let outcome = match session_result {
+        Ok(outcome) => outcome,
         Err(err_msg) => {
             error!("[SACP] Session creation failed: {}", err_msg);
             return Err(agent_client_protocol::Error::new(1000, err_msg));
         }
     };
 
-    Ok(session_id)
+    Ok(outcome)
 }
 
 /// 🆕 当 agent_mode=ask 时，通过 ACP 协议设置 session mode

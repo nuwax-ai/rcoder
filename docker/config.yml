@@ -30,6 +30,26 @@ cleanup_config:
   # 默认值: 300 (5分钟)
   container_protection_seconds: 300
 
+# 60000 file-server 分流代理（本地 dev 形态：默认 all_rust 全走本服务主端口 8090；
+# TS nuwax-file-server 已由 compose 的 nuwax-file-server 服务（共享网络栈）提供
+# 127.0.0.1:60001，可切 userapp_split/ts_first/all_ts 验证分流——
+# ts_first=仅 /api/v1/userapp*→8090，存量同名接口（含 x-service-type 标记）全走 TS）
+file_server_proxy:
+  listen_port: 60000
+  rust_upstream_port: 8090
+  ts_upstream_port: 60001
+  policy: all_rust
+  # dev 生命周期 7 端点全策略导向 Rust 上游（与 preview_coordinator.enabled 联动）
+  coordinated_dev_lifecycle: true
+
+# Custom Page 多副本预览协调器（Compose 单节点=进程内权威存储；dev 生命周期
+# 收口 + /proxy/{port} 预览路由。令牌经 env RCODER_PREVIEW_INTERNAL_TOKEN 注入，
+# 缺失/过短启动 fail-fast）
+preview_coordinator:
+  enabled: true
+  internal_token_env: RCODER_PREVIEW_INTERNAL_TOKEN
+  peer_api_port: 8090
+
 # Pingora 反向代理配置
 proxy_config:
   listen_port: 8088
@@ -72,6 +92,8 @@ docker_config:
           SERVICE_MODE: "full"
           API_PORT: "8086"
           PROJECT_WORKSPACE_BASE: "/app/project_workspace"
+          # OTLP 分布式追踪（App → otel-collector → Tempo；K8s 由 kubernetes_config.environment 同名覆盖）
+          OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
         command:
           - "/bin/bash"
           - "/app/agent-runner-start.sh"
@@ -130,6 +152,8 @@ docker_config:
           # 🔥 Agent 清理配置（闲置超时时间，秒）
           # 默认值: 3600 (1小时)
           RCODER_AGENT_IDLE_TIMEOUT_SECS: "3600"
+          # OTLP 分布式追踪（App → otel-collector → Tempo；K8s 由 kubernetes_config.environment 同名覆盖）
+          OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
           # 🖼️ 自定义壁纸配置
           # 通过挂载的 /app/assets 目录使用宿主机壁纸
           # 使用方法：在宿主机 ./wallpaper 目录放置 wallpaper.jpeg
@@ -188,9 +212,13 @@ docker_config:
             mount_type: "bind"
             resolve_from: "/app/assets"
 
-      # UserAppBuilder 服务配置(路B:UserApp 构建 agent-runner)
-      # 复用 dev-rcoder-agent-runner 镜像(容器隔离但镜像共享),独立 per-app PVC。
-      # 容器名 rcoder-app-builder-{app_id},PVC 复用运行时 rcoder-app-{app_id}-workspace。
+      # UserAppBuilder 服务配置: per-app 完整开发容器(agent_runner + 内嵌 file-server:60000 + PG 全套)
+      # 复用 dev-rcoder-agent-runner 镜像,默认 ENTRYPOINT/start-up.sh 启动(不设 command);
+      # 容器名 rcoder-app-builder-{app_id},K8s per-app RWO PVC / Docker per-app bind。
+      # workspace_resolution_path = Docker 模式宿主路径反解锚点(compose 挂载 ./userapp-workspace
+      # → /app/userapp-workspace);容器内挂载点用镜像默认 /home/user/userapp-workspace
+      # (不覆盖 USERAPP_WORKSPACE_DIR/PROJECT_SOURCE_DIR/PROJECT_WORKSPACE_BASE)。
+      # K8s 完整 env 在 build-agent-docker chart。
       user-app-builder:
         service_type: "user-app-builder"
         image: "dev-rcoder-agent-runner:latest"
@@ -202,18 +230,16 @@ docker_config:
         workspace_resolution_path: "/app/userapp-workspace"
         environment:
           RUST_LOG: "debug"
-          PROJECT_WORKSPACE_BASE: "/app/userapp-workspace"
-          # UserAppBuilder 跑内嵌 file-server(build 入口 :60000)
+          # agent_runner 进程读此 flag 启内嵌 file-server(build/文件接口入口 :60000)
           RCODER_EMBED_FILE_SERVER: "true"
-          PROJECT_SOURCE_DIR: "/app/userapp-workspace"
-        command:
-          - "/usr/local/bin/agent_runner"
-          - "--port"
-          - "8086"
+          # release.lock 的 Pingap 身份继承 builder 镜像内的配对 ENV；
+          # 不在服务配置中覆盖，升级镜像后自动使用该镜像的身份。
+          # runtime digest 是独立部署元数据，仍由部署环境注入。
+          RCODER_RUNTIME_IMAGE_DIGEST: "sha256:local-development"
         resource_limits:
-          memory_limit: 2147483648 # 2GB
+          memory_limit: 8589934592 # 8GB（rust/maven 全量冷编内存峰值超 2G 会 swap 颠簸卡死——e2e 全链实测）
           cpu_limit: 2.0
-          swap_limit: 4294963648 # 4GB
+          swap_limit: 17179869184 # 16GB（docker 约束 memoryswap 必须 ≥ memory）
         work_dir: "/app"
         network_mode: "bridge"
         mounts: []
@@ -238,10 +264,15 @@ docker_config:
   container_ttl_seconds: 3600
 
 # API Key 鉴权配置（可选）
+# UserApp 错误页（宿主机/Compose 形态：本地持久化文件；管理 API 热替换）
+userapp_error_page:
+  backend: file
+  file: /etc/rcoder/error-pages/userapp-error.html
+
 api_key_auth:
   # 是否启用 API Key 鉴权（默认关闭）
   # 启用后，所有 HTTP 请求必须携带正确的 x-api-key header
-  # 豁免端点：/health, /metrics, /api/docs, /proxy/status, /proxy/stats
+  # 豁免端点：/health, /metrics, /api/docs, /version, /proxy/status, /proxy/stats
   enabled: false
 
   # API Key 值（首次生成时自动创建随机密钥）

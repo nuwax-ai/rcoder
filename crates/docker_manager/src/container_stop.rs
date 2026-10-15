@@ -3,7 +3,7 @@
 //! 提供两种容器停止策略：
 //! 1. 启动时清理（startup_cleanup）：用于服务启动时清理遗留容器
 //!    - 使用5秒超时
-//!    - 过滤409冲突错误（容器已在删除中）
+//!    - 409冲突错误（容器已在删除中）单列 `already_removing` 统计
 //!    - 不阻塞服务启动
 //!
 //! 2. 运行时清理（runtime_cleanup）：用于运行时快速清理容器
@@ -62,7 +62,7 @@ const POST_STOP_WAIT_MS: u64 = 100;
 /// - 查找匹配指定模式的所有容器
 /// - 🚀 并发停止所有容器（提高清理速度）
 /// - 使用5秒超时停止每个容器
-/// - 过滤409冲突错误（容器已在删除中）
+/// - 409冲突错误（容器已在删除中）单列 `already_removing` 统计，不计成功也不计失败
 /// - 返回详细的清理统计信息
 ///
 /// # Arguments
@@ -89,7 +89,7 @@ const POST_STOP_WAIT_MS: u64 = 100;
 ///     "rcoder-agent-*"
 /// ).await?;
 ///
-/// println!("cleanup message {} message container", result.successfully_removed);
+/// println!("启动清理完成：成功删除 {} 个容器", result.successfully_removed);
 /// # Ok(())
 /// # }
 /// ```
@@ -115,6 +115,7 @@ pub async fn startup_cleanup_containers(
             successfully_removed: 0,
             failed_removals: 0,
             skipped_running: 0,
+            already_removing: 0,
             removed_container_ids: Vec::new(),
             failed_removals_details: Vec::new(),
             duration_ms: start_time.elapsed().as_millis().min(u64::MAX as u128) as u64,
@@ -123,6 +124,7 @@ pub async fn startup_cleanup_containers(
 
     let mut successfully_removed = 0;
     let mut failed_removals = 0;
+    let mut already_removing = 0;
     let mut removed_container_ids = Vec::new();
     let mut failed_removals_details = Vec::new();
 
@@ -167,9 +169,9 @@ pub async fn startup_cleanup_containers(
                             "[STARTUP_CLEANUP] Container already being removed, skipping: container_id={}, name={}",
                             container_id, container_name
                         );
-                        // 409错误不计入失败统计
-                        successfully_removed += 1;
-                        removed_container_ids.push(container_id);
+                        // 409 = 容器已在删除中：单列 already_removing，不计入
+                        // successfully_removed / removed_container_ids（本次并未删除它）
+                        already_removing += 1;
                     } else {
                         failed_removals += 1;
                         warn!(
@@ -194,8 +196,8 @@ pub async fn startup_cleanup_containers(
     let duration_ms = start_time.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
     info!(
-        "[STARTUP_CLEANUP] Cleanup completed: total={}, success={}, failed={}, duration={}ms",
-        total_found, successfully_removed, failed_removals, duration_ms
+        "[STARTUP_CLEANUP] Cleanup completed: total={}, success={}, already_removing={}, failed={}, duration={}ms",
+        total_found, successfully_removed, already_removing, failed_removals, duration_ms
     );
 
     Ok(CleanupResult {
@@ -203,6 +205,7 @@ pub async fn startup_cleanup_containers(
         successfully_removed,
         failed_removals,
         skipped_running: 0, // 启动清理不跳过运行中的容器
+        already_removing,
         removed_container_ids,
         failed_removals_details,
         duration_ms,
@@ -424,7 +427,8 @@ pub async fn runtime_cleanup_containers(
         total_found,
         successfully_removed,
         failed_removals,
-        skipped_running: 0, // 运行时清理不跳过运行中的容器
+        skipped_running: 0,  // 运行时清理不跳过运行中的容器
+        already_removing: 0, // 运行时清理不区分 409（错误一律计失败）
         removed_container_ids,
         failed_removals_details,
         duration_ms,
@@ -478,16 +482,21 @@ async fn stop_container_runtime_mode(
 ///
 /// let config = shared_types::create_default_multi_image_config();
 /// let patterns = container_stop::get_container_patterns_for_enabled_services(&config);
-/// println!("container message : {:?}", patterns);
+/// println!("启用的服务容器清理模式: {:?}", patterns);
 /// ```
 pub fn get_container_patterns_for_enabled_services(
     multi_image_config: &shared_types::MultiImageConfig,
 ) -> Vec<String> {
-    // 直接遍历 services，获取启用的服务配置并使用其 container_prefix()
+    // 直接遍历 services，获取启用的服务配置并使用其 container_prefix()。
+    // UserappBuilder 排除：userApp 生命周期为持久化权威（SQLite/PG），builder
+    // 容器跨 rcoder 重启存活，重启后经注册表 miss→权威发现再导入；启动/停机
+    // 全量清删会摧毁在途工作区（Agent 容器仍属内存注册表语义，照旧清理）。
     multi_image_config
         .services
         .values()
-        .filter(|config| config.enabled)
+        .filter(|config| {
+            config.enabled && config.service_type != shared_types::ServiceType::UserappBuilder
+        })
         .map(|config| {
             let prefix = config.container_prefix();
             let pattern = format!("{}-*", prefix);
@@ -536,7 +545,7 @@ pub fn get_container_patterns_for_enabled_services(
 ///     &config
 /// ).await?;
 ///
-/// println!("cleanup message {} message container", result.successfully_removed);
+/// println!("启动清理完成：成功删除 {} 个容器", result.successfully_removed);
 /// # Ok(())
 /// # }
 /// ```
@@ -575,6 +584,7 @@ pub async fn startup_cleanup_all_enabled_services(
                 aggregated_result.successfully_removed += result.successfully_removed;
                 aggregated_result.failed_removals += result.failed_removals;
                 aggregated_result.skipped_running += result.skipped_running;
+                aggregated_result.already_removing += result.already_removing;
                 aggregated_result
                     .removed_container_ids
                     .extend(result.removed_container_ids);
@@ -594,9 +604,10 @@ pub async fn startup_cleanup_all_enabled_services(
     aggregated_result.duration_ms = start_time.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
     info!(
-        "[MULTI_SERVICE_CLEANUP] Multi-service cleanup completed: total={}, success={}, failed={}, duration={}ms",
+        "[MULTI_SERVICE_CLEANUP] Multi-service cleanup completed: total={}, success={}, already_removing={}, failed={}, duration={}ms",
         aggregated_result.total_found,
         aggregated_result.successfully_removed,
+        aggregated_result.already_removing,
         aggregated_result.failed_removals,
         aggregated_result.duration_ms
     );

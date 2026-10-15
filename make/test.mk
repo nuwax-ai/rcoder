@@ -1,90 +1,245 @@
 # ============================================================================
-# 测试命令
+# Rust 测试：nextest 为默认入口；严格业务 E2E 使用下方独立启动器。
+# TEST_FEATURES= 可验证默认 features；NEXTEST_ARGS 可传 -p / -E 等筛选。
+# 不要并发执行共享 Cargo target 的多个 Make 测试目标。
 # ============================================================================
+TEST_FEATURES ?= --all-features
+NEXTEST_ARGS ?=
 
-# 运行所有测试
+.PHONY: test test-default test-unit test-integration test-blocking test-app-cli test-doc test-all
+
 test:
-	@echo "🧪 运行所有测试..."
-	@cargo test --workspace
+	cargo nextest run --workspace --no-fail-fast $(TEST_FEATURES) $(NEXTEST_ARGS)
 
-# 运行单元测试
+test-default:
+	cargo nextest run --workspace --no-fail-fast $(NEXTEST_ARGS)
+
 test-unit:
-	@echo "🧪 运行单元测试..."
-	@cargo test --workspace --lib
+	cargo nextest run --workspace --lib --no-fail-fast $(TEST_FEATURES) $(NEXTEST_ARGS)
 
-# 运行集成测试
+# Rust integration test targets；不是 Compose 核心业务 E2E。
 test-integration:
-	@echo "🧪 运行集成测试..."
-	@cargo test --workspace --test '*'
+	cargo nextest run --workspace --test '*' --no-fail-fast $(TEST_FEATURES) $(NEXTEST_ARGS)
 
-# 运行极端场景测试（包含阻塞）
 test-blocking:
-	@echo "🧪 运行极端场景测试（包含阻塞）..."
-	@cargo test --workspace --features testing --test '*_blocking*' -- --test-threads=1
+	cargo nextest run --workspace --features testing --test '*_blocking*' --no-fail-fast --test-threads=1 $(NEXTEST_ARGS)
 
-# 运行完整测试套件
+# app-cli 被根 workspace 排除，必须单独运行。
+test-app-cli:
+	cargo nextest run --manifest-path crates/app-cli/Cargo.toml --no-fail-fast $(TEST_FEATURES) $(NEXTEST_ARGS)
+
+# nextest 不覆盖 doctest；两部分串行执行，任一失败整体失败。
+test-doc:
+	@status=0; \
+	cargo test --workspace --doc --no-fail-fast $(TEST_FEATURES) || status=1; \
+	cargo test --manifest-path crates/app-cli/Cargo.toml --doc --no-fail-fast $(TEST_FEATURES) || status=1; \
+	exit $$status
+
+# Rust 完整检查：即便某部分失败仍收集其他部分结果；不隐式部署或运行 E2E。
+# 显式 recipe 保证 make -j 时各子步骤仍串行。
 test-all:
-	@echo "🧪 运行完整测试套件..."
-	@cargo test --workspace --all-features
+	@status=0; \
+	$(MAKE) test || status=1; \
+	$(MAKE) test-app-cli || status=1; \
+	$(MAKE) test-doc || status=1; \
+	exit $$status
 
 # ============================================================================
-# 🧪 eBPF 工具安装测试（快速验证 Makefile 变量传递）
+# Rust e2e 黑盒集成测试（tests-e2e crate；JSONL 报告供 agent 追溯）
 # ============================================================================
 
-# 测试 1: 模拟 Makefile 变量传递（启用 eBPF）
-test-ebpf-install:
-	@echo "🧪 测试 1: 启用 eBPF 工具安装..."
-	@(if [ "$(CARGO_FEATURES)" != "" ]; then \
-		INSTALL_EBPF="true"; \
-		echo "✅ CARGO_FEATURES=[$(CARGO_FEATURES)], INSTALL_EBPF=$${INSTALL_EBPF}"; \
-	else \
-		INSTALL_EBPF="false"; \
-		echo "⚠️  CARGO_FEATURES=[$(CARGO_FEATURES)], INSTALL_EBPF=$${INSTALL_EBPF}"; \
-	fi; \
-	cd docker/rcoder-agent-runner && \
-		docker build --build-arg INSTALL_EBPF_TOOLS="$${INSTALL_EBPF}" \
-			-f Dockerfile.test -t test-ebpf-install . 2>&1 | tail -20; \
-	docker run --rm test-ebpf-install which bpftrace && echo "✅ 测试通过: bpftrace 已安装" || echo "❌ 测试失败: bpftrace 未安装")
+# 显式入口严格验收：缺少前置、skip、aborted、空筛选和报告遗漏均失败。
+# E2E_SUITE=compose_userapp_dev E2E_FILTER=case_name 可聚焦；无环境 workspace 测试仍可 skip。
+.PHONY: test-e2e test-e2e-compose test-e2e-compose-deploy test-e2e-k8s
 
-# 测试 2: 模拟生产模式（禁用 eBPF）
-test-ebpf-no-install:
-	@echo "🧪 测试 2: 禁用 eBPF 工具安装（生产模式）..."
-	@(INSTALL_EBPF="false"; \
-		echo "🔒 INSTALL_EBPF=$${INSTALL_EBPF}"; \
-		cd docker/rcoder-agent-runner && \
-		docker build --build-arg INSTALL_EBPF_TOOLS="$${INSTALL_EBPF}" \
-			-f Dockerfile.test -t test-ebpf-no-install . 2>&1 | tail -20; \
-		docker run --rm test-ebpf-no-install which bpftrace && echo "❌ 测试失败: 生产模式不应安装 bpftrace" || echo "✅ 测试通过: 生产模式正确跳过安装")
+test-e2e:
+	python3 tests-e2e/tools/run.py --group userapp
 
-# 测试 3: 直接测试变量传递（调试用）
-test-ebpf-debug:
-	@echo "🧪 测试 3: 变量传递调试..."
-	@echo "CARGO_FEATURES=[$(CARGO_FEATURES)]"
-	@(if [ "$(CARGO_FEATURES)" != "" ]; then \
-		INSTALL_EBPF="true"; \
-		echo "Shell: INSTALL_EBPF=$${INSTALL_EBPF}"; \
-		echo "Docker: INSTALL_EBPF_TOOLS=\"$${INSTALL_EBPF}\""; \
-	else \
-		INSTALL_EBPF="false"; \
-		echo "Shell: INSTALL_EBPF=$${INSTALL_EBPF}"; \
-		echo "Docker: INSTALL_EBPF_TOOLS=\"$${INSTALL_EBPF}\""; \
-	fi)
+test-e2e-compose:
+	python3 tests-e2e/tools/run.py --group compose
 
-# 测试 4: 完整测试 Pyroscope + Off-CPU 工具
-test-pyroscope-offcpu:
-	@echo "🧪 测试 4: Pyroscope Agent + Off-CPU 工具完整测试..."
-	@(if [ "$(CARGO_FEATURES)" != "" ]; then \
-		INSTALL_EBPF="true"; \
-		echo "✅ CARGO_FEATURES=[$(CARGO_FEATURES)], INSTALL_EBPF=$${INSTALL_EBPF}"; \
-	else \
-		INSTALL_EBPF="false"; \
-		echo "⚠️  CARGO_FEATURES=[$(CARGO_FEATURES)], INSTALL_EBPF=$${INSTALL_EBPF}"; \
-	fi; \
-	cd docker/rcoder-agent-runner && \
-		docker build --build-arg INSTALL_EBPF_TOOLS="$${INSTALL_EBPF}" \
-			--build-arg INSTALL_PYROSCOPE="$${INSTALL_EBPF}" \
-			-f Dockerfile.test-full -t test-pyroscope-offcpu . 2>&1 | tail -30; \
-	echo "=== 验证 pyroscope ===" && \
-	docker run --rm test-pyroscope-offcpu which pyroscope && echo "✅ pyroscope 已安装" || echo "❌ pyroscope 未安装"; \
-	echo "=== 验证 offcputime-bpfcc ===" && \
-	docker run --rm test-pyroscope-offcpu which offcputime-bpfcc && echo "✅ offcputime-bpfcc 已安装" || echo "❌ offcputime-bpfcc 未安装")
+test-e2e-compose-deploy:
+	python3 tests-e2e/tools/run.py --group deploy
+
+# 仅显式选择测试集群。
+test-e2e-k8s:
+	python3 tests-e2e/tools/run.py --group k8s $(if $(RUN_LB),--ignored,)
+
+# Real K8s userApp acceptance; explicit NodePort URLs and SSH test target required.
+.PHONY: test-e2e-k8s-userapp
+test-e2e-k8s-userapp:
+	python3 tests-e2e/tools/k8s_userapp.py --ssh "$(TEST_K8S_SSH)" --url "$(RCODER_URL)" --proxy-url "$(E2E_PINGORA_URL)"
+
+# deploy-host 宿主机 Published 形态严格 E2E（前置：make dev-host-published 已运行）
+.PHONY: test-e2e-host
+test-e2e-host:
+	python3 tests-e2e/tools/run.py --group host
+
+.PHONY: test-e2e-host-userapp
+test-e2e-host-userapp:
+	E2E_FILTER=host_userapp_dev_compute_no_llm python3 tests-e2e/tools/run.py --group host
+
+# deploy-host Direct 直拨形态严格 E2E（前置：make dev-host-direct 已运行——
+# RCODER_DEPLOY_HOST_REACH=direct 的宿主机 rcoder；反向断言 fail-loud 模式门）
+.PHONY: test-e2e-host-direct
+test-e2e-host-direct:
+	python3 tests-e2e/tools/run.py --group host_direct
+
+# deploy-host 宿主机 K8s 形态严格 E2E（前置：CONTAINER_RUNTIME=kubernetes 的宿主机 rcoder）
+.PHONY: test-e2e-host-k8s
+test-e2e-host-k8s:
+	python3 tests-e2e/tools/run.py --group host_k8s
+
+.PHONY: test-e2e-host-k8s-userapp
+test-e2e-host-k8s-userapp:
+	E2E_FILTER=host_k8s_userapp_dev_compute_no_llm python3 tests-e2e/tools/run.py --group host_k8s
+
+# e2e 可用性辅助：场景清单（含最近一次 verdict/耗时）/ 三份登记一致性秒级校验
+.PHONY: test-e2e-list test-e2e-check
+test-e2e-list:
+	python3 tests-e2e/tools/run.py --list
+test-e2e-check:
+	python3 tests-e2e/tools/run.py --check-registry
+
+# e2e 报告目录修剪：默认 dry-run 只列清单；APPLY=1 执行删除。
+# DAYS/KEEP 可覆盖（默认 14 天 / 至少保留 30 个最新 run）；DEDUPE=1 额外把
+# 各 run 的 bin/ 副本收敛为 _bin/ 内容寻址硬链接；_bin 按剩余 run 引用 GC。
+.PHONY: test-e2e-prune
+test-e2e-prune:
+	python3 tests-e2e/tools/prune_reports.py --days "$${DAYS:-14}" --keep "$${KEEP:-30}" $(if $(APPLY),--apply) $(if $(DEDUPE),--dedupe)
+
+# ============================================================================
+# app-cli 运行恢复专项（recovery v2 plan §11：本地 app-runtime 故障矩阵）
+# ============================================================================
+# 一次构建当前 Linux 二进制，真实容器内注入 A/B/C/G/J/I/D/E 场景：
+# 并发调用、owner 强杀/TERM、pkill 全部同名进程、挂死边界（SIGSTOP）、
+# app-11 升级 fixture、同容器重启与同卷重建。不含 LLM/RCoder 控制面。
+# 不清理工作卷（保留检查）；仅移除自建容器。ARCH 缺省取本机。
+.PHONY: test-e2e-app-cli-recovery test-e2e-app-cli-recovery-build
+
+APP_CLI_RECOVERY_ARCH ?= $(shell uname -m | sed 's/arm64/aarch64/;s/x86_64/x86_64/')
+APP_CLI_RECOVERY_TARGET ?= $(APP_CLI_RECOVERY_ARCH)-unknown-linux-gnu.2.17
+APP_CLI_RECOVERY_REPORT ?= tests-e2e/reports/app-cli-recovery-$(shell date +%Y%m%d-%H%M%S).json
+APP_CLI_RECOVERY_BIN_DIR ?= tests-e2e/reports/_bin
+
+# Linux 二进制（zigbuild，glibc 2.17 兼容 agent-runner 镜像）。
+# 只取本次 Cargo JSON 指定的 executable，兼容 CARGO_TARGET_DIR / Cargo config。
+RECOVERY_CARGO_ARTIFACT_TOOL := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))../tools/build/cargo_build_artifact.py
+test-e2e-app-cli-recovery-build:
+	@set -eu; \
+	echo "🔨 构建 Linux app-cli / file-server-proxy ($(APP_CLI_RECOVERY_TARGET))"; \
+	python3 "$(RECOVERY_CARGO_ARTIFACT_TOOL)" \
+	  --manifest-path crates/app-cli/Cargo.toml --bin app-cli \
+	  --target "$(APP_CLI_RECOVERY_TARGET)" --output "$(APP_CLI_RECOVERY_BIN_DIR)/app-cli-linux" \
+	  -- cargo zigbuild --release --manifest-path crates/app-cli/Cargo.toml \
+	  --target "$(APP_CLI_RECOVERY_TARGET)" --bin app-cli --message-format=json; \
+	python3 "$(RECOVERY_CARGO_ARTIFACT_TOOL)" \
+	  --manifest-path crates/file-server-proxy/Cargo.toml --bin file-server-proxy \
+	  --target "$(APP_CLI_RECOVERY_TARGET)" --output "$(APP_CLI_RECOVERY_BIN_DIR)/file-server-proxy-linux" \
+	  -- cargo zigbuild --release -p file-server-proxy --bin file-server-proxy \
+	  --target "$(APP_CLI_RECOVERY_TARGET)" --message-format=json; \
+	echo "✅ 专项二进制构建完成"
+
+# 聚焦真实链：旧 code 管理目录、停服日志、同容器强杀恢复；不跑完整 E2E。
+USERAPP_ROOT_LOGS_REPORT ?= tests-e2e/reports/userapp-root-logs-$(shell date +%Y%m%d-%H%M%S).json
+.PHONY: test-e2e-userapp-root-logs
+USERAPP_ROOT_LOGS_BUILD_SOURCE ?= tests-e2e/reports/userapp-root-logs-source.json
+test-e2e-userapp-root-logs:
+	python3 tests-e2e/tools/userapp_root_logs.py --write-build-source "$(USERAPP_ROOT_LOGS_BUILD_SOURCE)"
+	$(MAKE) test-e2e-app-cli-recovery-build
+	python3 tests-e2e/tools/userapp_root_logs.py \
+	  --app-cli tests-e2e/reports/_bin/app-cli-linux \
+	  --file-server-proxy tests-e2e/reports/_bin/file-server-proxy-linux \
+	  --build-source "$(USERAPP_ROOT_LOGS_BUILD_SOURCE)" --report "$(USERAPP_ROOT_LOGS_REPORT)"
+
+# 显式PG源启动→私人回执持久化/公开脱敏→原卷换容器→同入口restart/stop/start。
+SOURCE_CREDENTIAL_REPORT ?= tests-e2e/reports/source-credential-recovery-$(shell date +%Y%m%d-%H%M%S).json
+SOURCE_CREDENTIAL_BUILD_SOURCE ?= tests-e2e/reports/source-credential-build-source.json
+.PHONY: test-e2e-source-credential-recovery
+test-e2e-source-credential-recovery:
+	python3 tests-e2e/tools/userapp_root_logs.py --write-build-source "$(SOURCE_CREDENTIAL_BUILD_SOURCE)"
+	$(MAKE) test-e2e-app-cli-recovery-build
+	python3 tests-e2e/tools/userapp_root_logs.py --register-binaries \
+	  --app-cli tests-e2e/reports/_bin/app-cli-linux \
+	  --file-server-proxy tests-e2e/reports/_bin/file-server-proxy-linux \
+	  --build-source "$(SOURCE_CREDENTIAL_BUILD_SOURCE)"
+	USERAPP_E2E_BUILD_SOURCE="$(SOURCE_CREDENTIAL_BUILD_SOURCE)" USERAPP_E2E_REPORT="$(SOURCE_CREDENTIAL_REPORT)" \
+	  node crates/file-server-proxy/tests/e2e/source-credential-recovery.test.js \
+	  tests-e2e/reports/_bin/app-cli-linux tests-e2e/reports/_bin/file-server-proxy-linux dev-rcoder-agent-runner:latest
+
+test-e2e-app-cli-recovery: test-e2e-app-cli-recovery-build
+	python3 tests-e2e/tools/app_cli_recovery.py \
+	  --app-cli tests-e2e/reports/_bin/app-cli-linux \
+	  --file-server-proxy tests-e2e/reports/_bin/file-server-proxy-linux \
+	  --report $(APP_CLI_RECOVERY_REPORT)
+	@echo "📋 报告: $(APP_CLI_RECOVERY_REPORT)"
+
+# 新迁移策略：本轮不可变二进制、真实300秒超时及Stop取消；保留私人卷。
+USERAPP_MIGRATION_VERIFY_DIR ?= tests-e2e/reports/migration-advisory-$(shell date +%Y%m%d-%H%M%S)
+USERAPP_MIGRATION_VERIFY_DIR := $(USERAPP_MIGRATION_VERIFY_DIR)
+USERAPP_MIGRATION_IMAGE ?= dev-rcoder-agent-runner:latest
+.PHONY: test-e2e-userapp-migration-advisory
+test-e2e-userapp-migration-advisory:
+	@test ! -e "$(USERAPP_MIGRATION_VERIFY_DIR)"
+	python3 tests-e2e/tools/userapp_root_logs.py --write-build-source "$(USERAPP_MIGRATION_VERIFY_DIR)/build-source.json"
+	$(MAKE) test-e2e-app-cli-recovery-build APP_CLI_RECOVERY_BIN_DIR="$(USERAPP_MIGRATION_VERIFY_DIR)/bin"
+	python3 tests-e2e/tools/userapp_root_logs.py --register-binaries \
+	  --app-cli "$(USERAPP_MIGRATION_VERIFY_DIR)/bin/app-cli-linux" \
+	  --file-server-proxy "$(USERAPP_MIGRATION_VERIFY_DIR)/bin/file-server-proxy-linux" \
+	  --build-source "$(USERAPP_MIGRATION_VERIFY_DIR)/build-source.json"
+	chmod a-w "$(USERAPP_MIGRATION_VERIFY_DIR)/bin/app-cli-linux" "$(USERAPP_MIGRATION_VERIFY_DIR)/bin/file-server-proxy-linux" "$(USERAPP_MIGRATION_VERIFY_DIR)/bin"
+	python3 tests-e2e/tools/userapp_migration_advisory.py \
+	  --image "$(USERAPP_MIGRATION_IMAGE)" \
+	  --app-cli "$(USERAPP_MIGRATION_VERIFY_DIR)/bin/app-cli-linux" \
+	  --file-server-proxy "$(USERAPP_MIGRATION_VERIFY_DIR)/bin/file-server-proxy-linux" \
+	  --build-source "$(USERAPP_MIGRATION_VERIFY_DIR)/build-source.json" \
+	  --report "$(USERAPP_MIGRATION_VERIFY_DIR)/result.json"
+
+# ============================================================================
+# app-cli K8s 实机恢复实验（recovery v2 plan §11.2/§11.3：RBD 锁链 + 同 Pod 重启）
+# ============================================================================
+# 显式个人集群实验：冻结的单平台镜像与构建回执先准备，不在测试时猜测旧缓存。
+# K8S_LOCK_NODE_A/B 必须两个不同 Ready 节点。CephFS-only 不要求节点 SSH。
+# all 另含 RBD + 同 Pod 重启，需要 K8S_LOCK_NODE_SSH（首节点免密 SSH 映射）。
+.PHONY: test-e2e-app-cli-k8s-lock test-e2e-app-cli-cephfs-lock
+
+test-e2e-app-cli-k8s-lock test-e2e-app-cli-cephfs-lock:
+	@set -eu; \
+	test -n "$$K8S_LOCK_CONTEXT" || { echo "K8S_LOCK_CONTEXT 未设置"; exit 2; }; \
+	test -n "$$K8S_LOCK_IMAGE" || { echo "K8S_LOCK_IMAGE 必须是单平台 @sha256 镜像"; exit 2; }; \
+	test -f "$${K8S_LOCK_BUILD_RECEIPT:-}" || { echo "K8S_LOCK_BUILD_RECEIPT 缺失"; exit 2; }; \
+	test -n "$$K8S_LOCK_NODE_A" && test -n "$$K8S_LOCK_NODE_B" || { echo "须显式指定两个节点"; exit 2; }; \
+	scenario=all; \
+	if [ "$@" = "test-e2e-app-cli-cephfs-lock" ]; then scenario=cephfs-lock; fi; \
+	mkdir -p tests-e2e/reports; \
+	if [ "$$scenario" = "all" ]; then \
+	  test -n "$$K8S_LOCK_NODE_SSH" || { echo "all 需要首节点免密 K8S_LOCK_NODE_SSH"; exit 2; }; \
+	  set -- --node-ssh "$$K8S_LOCK_NODE_SSH"; \
+	else set --; fi; \
+	python3 tests-e2e/tools/app_cli_k8s_lock.py \
+	  --context "$$K8S_LOCK_CONTEXT" --scenario "$$scenario" \
+	  --image "$$K8S_LOCK_IMAGE" --build-receipt "$$K8S_LOCK_BUILD_RECEIPT" \
+	  --source-dir "$${E2E_SOURCE_ROOT:-.}" \
+	  --node "$$K8S_LOCK_NODE_A" --node "$$K8S_LOCK_NODE_B" \
+	  --storage-class "$${K8S_LOCK_RBD_CLASS:-ceph-rbd}" \
+	  --cephfs-class "$${K8S_LOCK_CEPHFS_CLASS:-cephfs}" \
+	  "$$@" --report "tests-e2e/reports/app-cli-$$scenario-$$(date +%Y%m%d-%H%M%S).json"
+
+# 独立真实 supervisord：透明转发迟到 Stop/Remove，原 StopWork/Restart 恢复。
+# 先写源码回执，再构建 Linux app-cli，再登记产物；不依赖 Compose/LLM。
+OFFICIAL_PROXY_RECOVERY_PYTHON ?= python3
+OFFICIAL_PROXY_RECOVERY_BIN ?= tests-e2e/reports/_bin/app-cli-linux
+OFFICIAL_PROXY_RECOVERY_BUILD_SOURCE ?= tests-e2e/reports/official-proxy-recovery-source.json
+OFFICIAL_PROXY_RECOVERY_IMAGE ?= dev-app-runtime:latest
+OFFICIAL_PROXY_RECOVERY_PLATFORM ?= linux/amd64
+OFFICIAL_PROXY_RECOVERY_REPORT ?= tests-e2e/reports/official-proxy-recovery-$(shell date +%Y%m%d-%H%M%S)
+.PHONY: test-e2e-official-proxy-recovery-source test-e2e-official-proxy-recovery-register test-e2e-official-proxy-recovery
+
+test-e2e-official-proxy-recovery-source:
+	$(OFFICIAL_PROXY_RECOVERY_PYTHON) tests-e2e/tools/official_pingap_recovery_contract.py --write-build-source "$(OFFICIAL_PROXY_RECOVERY_BUILD_SOURCE)"
+
+test-e2e-official-proxy-recovery-register:
+	$(OFFICIAL_PROXY_RECOVERY_PYTHON) tests-e2e/tools/official_pingap_recovery_contract.py --register-binary --app-cli "$(OFFICIAL_PROXY_RECOVERY_BIN)" --build-source "$(OFFICIAL_PROXY_RECOVERY_BUILD_SOURCE)"
+
+test-e2e-official-proxy-recovery:
+	$(OFFICIAL_PROXY_RECOVERY_PYTHON) tests-e2e/tools/official_pingap_recovery_contract.py --app-cli "$(OFFICIAL_PROXY_RECOVERY_BIN)" --build-source "$(OFFICIAL_PROXY_RECOVERY_BUILD_SOURCE)" --image "$(OFFICIAL_PROXY_RECOVERY_IMAGE)" --platform "$(OFFICIAL_PROXY_RECOVERY_PLATFORM)" --report "$(OFFICIAL_PROXY_RECOVERY_REPORT)"

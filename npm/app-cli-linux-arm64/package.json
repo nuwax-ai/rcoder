@@ -1,0 +1,22 @@
+{
+  "name": "@nuwax-ai/app-cli-linux-arm64",
+  "version": "0.0.0",
+  "description": "app-cli binary for linux-arm64",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "app-cli"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nuwax-ai/rcoder.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

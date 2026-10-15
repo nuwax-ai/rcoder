@@ -1,29 +1,92 @@
+mod agent;
+pub mod app_cli_evt;
+pub mod archive_links;
+pub mod file_entry_policy;
+pub use app_cli_evt::{
+    APP_CLI_EVT_PREFIX, AppCliEvtDecodeError, AppCliFailedService, AppCliOrchestrationEvent,
+};
 mod container;
 mod model;
+mod runtime_config;
+mod userapp;
+pub use model::{ApiBody, OperationInProgressData, OperationOutcomeUnknown};
 
-// UserApp build 进度事件 —— file-server(发送)与 rcoder(接收)共享的类型化 DTO
-pub mod build_event;
-pub use build_event::BuildProgressEvent;
+// 容器域类型（高内聚收拢于 container/ 模块）—— 条目/查找/清理/统计 + 服务与隔离枚举
+pub use container::{
+    AppRuntimeIpResolver, CLEANUP_CHANNEL_CAPACITY, CleanupRequest, ContainerEntry,
+    ContainerLookup, IdleContainerInfo, IsolationType, IsolationTypeError, MissingIdentifier,
+    ProjectScope, ServiceType, ServiceTypeError, StorageStats, get_enabled_service_types,
+    get_supported_service_types,
+};
 
-// 清理请求模块
-pub mod cleanup_request;
-pub use cleanup_request::CleanupRequest;
+// project/session/container 映射存储契约（内存与 PG 双后端统一接口）
+pub mod project_store;
+pub use project_store::ProjectStore;
+pub mod userapp_agent;
+pub use userapp_agent::{UserAppAgentBinding, UserAppAgentSession};
 
-// 存储类型模块
-pub mod storage_types;
-pub use storage_types::{IdleContainerInfo, StorageStats};
-
-// 容器查找接口模块
-pub mod container_lookup;
-pub use container_lookup::{ContainerLookup, ProjectScope};
-
-// UserApp 活动追踪 + 流量唤醒接口模块（闲置自动回收 / wake-on-traffic）
-pub mod app_activity;
-pub use app_activity::{AppAccessTracker, AppWakeControl, WakeOutcome};
-
-// 容器条目模块（refcount + 活跃时间跟踪）
-pub mod container_entry;
-pub use container_entry::ContainerEntry;
+// Userapp 域（高内聚收拢于 userapp/ 模块）—— 活动追踪/唤醒 + 业务元数据 + build 进度事件 + 开发资源回收契约
+pub use userapp::activity::{
+    ActivityPersistence, ActivityRow, AppAccessTracker, AppWakeControl, RemoteWakeState,
+    WakeFailure, WakeOutcome,
+};
+pub use userapp::app_stage::{UserappStage, invalid_app_stage_error};
+pub use userapp::build_event::BuildProgressEvent;
+pub use userapp::business_readiness::{
+    BUSINESS_READINESS_CAPABILITY, PINGAP_ETYPE_ORIGIN_CONTRACT, UserAppBusinessReadiness,
+    UserAppContainerOperation, UserAppContainerReadiness, UserAppContainerStatus,
+    UserAppNoComputeState, UserAppProxyReadiness, UserAppReadinessChannel,
+    UserAppReadinessObservation, UserAppReadinessPhysical, UserAppReadinessReader,
+    UserAppReadinessReason, UserAppReadinessResponse, UserAppReadinessStatus,
+    UserAppServiceReadiness, X_PINGAP_ETYPE_HEADER,
+};
+pub use userapp::db_admin::{
+    DbAdminError, DbUserUpsertOutcome, StartPgCredential, UserappDbCreateDatabaseRequest,
+    UserappDbPasswordRecoveryRequest, UserappDbPasswordRecoveryResponse,
+    UserappDbResetPasswordRequest, UserappDeployPgRecoveryRequest, UserappDeployPgRecoveryResponse,
+    create_pg_database, upsert_pg_user,
+};
+pub use userapp::db_align::{
+    AlignCredentialsOutcome, AlignCredentialsRequest, AlignError, CommandOutcome,
+    CredentialMutationEvidence, PgCommandDiagnostic, PgCommandError, PgCommandEvidence,
+    PgCommandMode, PgCommandRunner, align_pg_credentials, align_pg_credentials_with_admin,
+};
+pub use userapp::db_password::*;
+pub use userapp::dbx_readiness::{
+    DbxComputeFact, DbxReadinessObservation, DbxReadinessProber, DbxReadinessReason,
+    DbxReadinessResponse, DbxReadinessStatus,
+};
+pub use userapp::dev_cleanup::{
+    BuilderCollaboratorDeletionReceipt, BuilderDeletionSnapshot, BuilderRegistryIdentity,
+    DeletionInspection, UserappDevCleanup, UserappDevDeletion, UserappDevDeletionReceipt,
+};
+pub use userapp::dev_locator::{
+    DevBuilderInstance, DevEnsureError, UserappDevEnsure, UserappDevLocator,
+};
+pub use userapp::forward_contract::{
+    APP_ID_HEADER, APP_STAGE_DEV, APP_STAGE_HEADER, APP_STAGE_PROD, ComputerServiceKind,
+    SERVICE_TYPE_HEADER, SERVICE_TYPE_NORMAL_PROJECT, SERVICE_TYPE_PAGE_APP,
+    SERVICE_TYPE_TASK_AGENT, SERVICE_TYPE_USERAPP, WORKSPACE_PATH_HEADER, WORKSPACE_TYPE_HEADER,
+    is_userapp_service_type_value, normalize_computer_service_type,
+};
+pub use userapp::http_credentials::{FileServerCredentialsProvider, FileServerRequestCredentials};
+pub use userapp::metadata::AppMetadataRecord;
+pub use userapp::proxy_control::{
+    OFFICIAL_PROXY_RESTART_CAPABILITY, ProxyConfirmation, ProxyConfirmationContract, ProxyPhase,
+    ProxyReloadOperation, ProxyReloadState,
+};
+pub use userapp::run_credentials::{SourceRunCredentialError, resolve_source_run_pg};
+pub use userapp::runtime_configuration::*;
+pub use userapp::runtime_control::{
+    ArtifactInput, DesiredState, ERR_INTERRUPTED_OWNER_EXIT, ERR_OPERATION_ID_CONFLICT,
+    ERR_PROTOCOL_UNSUPPORTED, ERR_RECOVERY_REQUIRED, ERR_REVISION_MISMATCH,
+    ERR_RUNTIME_INSTANCE_MISMATCH, ERR_STOP_PENDING, ERR_WORKSPACE_MISMATCH, ObservedHealth,
+    OperationRunConfig, RUNTIME_CONTROL_PROTOCOL_VERSION, RunProfileInput, RuntimeEventRecord,
+    RuntimeFailureDetail, RuntimeIdentityView, RuntimeMigrationRecoveryState,
+    RuntimeOperationAccepted, RuntimeOperationKind, RuntimeOperationRequest, RuntimeOperationState,
+    RuntimeOperationView, RuntimeRecoveryView, RuntimeStatusView, runtime_request_digest,
+    validate_runtime_operation_request,
+};
 
 // 灵活的字符串反序列化器（支持 JSON 字符串和数字）
 pub mod flexible_string;
@@ -38,29 +101,34 @@ pub use shared_types_i18n::{
 pub mod request_locale;
 pub use request_locale::{current_request_locale, scope_request_locale};
 
+// Custom Page（WebAgentRunner 开发阶段 Vite 预览）协调契约——身份/状态机/存储与协调
+// trait/HTTP 兼容信封；kube-free、storage-free，后端由 rcoder-storage(PG) 与
+// preview-coordinator(进程内) 提供。
+pub mod preview;
+pub use preview::{
+    AcceptStartInput, AcceptStartOutcome, ActivityFlushEntry, ExecutorLogChunk, ExecutorLogLine,
+    ExecutorStartTicket, ExecutorStopOutcome, ExecutorVerifyReport, PREVIEW_PORT_MAX,
+    PREVIEW_PORT_MIN, PREVIEW_PORT_RESERVED_MAX, PREVIEW_PORT_RESERVED_MIN, PreviewCoordination,
+    PreviewCoordinationError, PreviewExecutor, PreviewExecutorError, PreviewForwardCheck,
+    PreviewHostIdentity, PreviewInstanceRecord, PreviewInstanceState, PreviewKeepAliveEnvelope,
+    PreviewKeepAliveRequest, PreviewKeyInput, PreviewLifecycleStore, PreviewListEntry,
+    PreviewOperationKind, PreviewOperationRecord, PreviewOperationState, PreviewProjectIdentity,
+    PreviewRecoveryEvidence, PreviewRestartEnvelope, PreviewRestartRequest, PreviewRouteResolution,
+    PreviewStartEnvelope, PreviewStartRequest, PreviewStopEnvelope, PreviewStopRequest,
+    PreviewStoreError, is_preview_port, preview_key,
+};
+pub use preview::{PreviewPortAllocation, PreviewPortPoolStatus};
+
 // HTTP 请求提取器模块（支持 JSON body 和 Query string 两种参数方式）
 pub mod i18n_extractors;
 pub use i18n_extractors::I18nJsonOrQuery;
-
-// Chat Agent 配置模块
-mod chat_agent_config;
-pub use chat_agent_config::{
-    AgentMode, AutoReloadConfig, ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig,
-    ModelEnvBinding, ModelEnvBindingSource, ToolApprovalAction, ToolApprovalRule, VALID_TOOL_KINDS,
-};
 
 // API Key 验证器模块
 pub mod api_key_validator;
 pub use api_key_validator::{ApiKeyAuthConfig, ApiKeyAuthError, ApiKeyValidator};
 
-// 新增多镜像配置相关模块
-pub mod multi_image_config;
 pub mod permission_types;
 pub mod pg_utils;
-pub mod service_config;
-pub mod service_type;
-// K8s 运行时专用配置(与 docker_config 分家)
-pub mod k8s_config;
 pub use permission_types::{
     PermissionResolveRequest, ResolvePermissionHttpRequest, ResolvePermissionRequestDto,
     ResolvePermissionResponseDto,
@@ -70,6 +138,15 @@ pub use permission_types::{
 pub mod constants;
 // 工作区路径常量 (单一事实源, 所有 crate 共用: rcoder/docker_manager/agent_runner)
 pub mod paths;
+
+/// deploy-host Reach 寻址模式解析（env > config > auto 检测；
+/// ReachSetting 不门控——config 面无 feature 也要可反序列化）
+pub mod deploy_host_reach;
+/// deploy-host published-port 注册表（宿主机形态寻址单一事实源；feature 门控）
+#[cfg(feature = "deploy-host")]
+pub mod published;
+pub mod storage_contents;
+pub use app_resource_deletion::{UserAppStorageClear, UserAppStorageClearTarget};
 pub use constants::*;
 
 // 错误码定义模块 — 重导出自 shared_types_i18n（过渡期兼容）
@@ -85,23 +162,59 @@ pub use shared_types_i18n::{
     ERR_AGENT_MGMT_UNINSTALL_FAILED, ERR_AGENT_MGMT_UNKNOWN_AGENT, ERR_AGENT_MGMT_UNSUPPORTED_TYPE,
     ERR_AGENT_NOT_FOUND, ERR_AGENT_RUNNER_UNAVAILABLE, ERR_API_KEY_AUTH_FAILED,
     ERR_APP_ALREADY_EXISTS, ERR_APP_NOT_FOUND, ERR_BACKEND_ERROR, ERR_CANCEL_FAILED, ERR_CONFLICT,
-    ERR_CONTAINER_ERROR, ERR_CONTAINER_NOT_FOUND, ERR_FILE_NOT_FOUND, ERR_GRPC_ADDR_ERROR,
-    ERR_GRPC_ERROR, ERR_HTTP_FALLBACK_FAILED, ERR_IMAGE_PULL_FAILED, ERR_INTERNAL_SERVER_ERROR,
-    ERR_INVALID_PARAMS, ERR_INVALID_RESOURCE_LIMITS, ERR_INVALID_STATE, ERR_NOT_FOUND,
-    ERR_OPERATION_NOT_SUPPORTED, ERR_PERMISSION_EXPIRED, ERR_PERMISSION_NOT_FOUND,
-    ERR_PERMISSION_RESOLVE_FAILED, ERR_PROJECT_NOT_FOUND, ERR_PROXY_DISABLED,
-    ERR_PROXY_SERVICE_UNAVAILABLE, ERR_RESOURCE_EXHAUSTED, ERR_RESUME_FAILED, ERR_RETRY_EXHAUSTED,
-    ERR_SERVICE_UNAVAILABLE, ERR_SESSION_NOT_FOUND, ERR_STOP_FAILED, ERR_TOO_MANY_REQUESTS,
-    ERR_UNKNOWN, ERR_VALIDATION, ERR_WORKSPACE_ERROR, SUCCESS, error_codes, get_error_description,
-    get_error_message, get_i18n_message, get_i18n_message_default,
+    ERR_CONTAINER_ADDRESS_NOT_READY, ERR_CONTAINER_CREATE_FAILED, ERR_CONTAINER_ERROR,
+    ERR_CONTAINER_EXEC_FAILED, ERR_CONTAINER_NOT_FOUND, ERR_CONTAINER_START_FAILED,
+    ERR_CONTAINER_STOP_FAILED, ERR_DATABASE_COMMAND_FAILED, ERR_DATABASE_NOT_READY,
+    ERR_DEV_NOT_RUNNING, ERR_FILE_NOT_FOUND, ERR_GRPC_ADDR_ERROR, ERR_GRPC_ERROR,
+    ERR_HTTP_FALLBACK_FAILED, ERR_IMAGE_PULL_FAILED, ERR_INTERNAL_SERVER_ERROR, ERR_INVALID_PARAMS,
+    ERR_INVALID_RESOURCE_LIMITS, ERR_INVALID_STATE, ERR_MODEL_UNAVAILABLE, ERR_NOT_FOUND,
+    ERR_OPERATION_IN_PROGRESS, ERR_OPERATION_NOT_SUPPORTED, ERR_OPERATION_OUTCOME_UNKNOWN,
+    ERR_PERMISSION_EXPIRED, ERR_PERMISSION_NOT_FOUND, ERR_PERMISSION_RESOLVE_FAILED,
+    ERR_PROJECT_NOT_FOUND, ERR_PROXY_DISABLED, ERR_PROXY_SERVICE_UNAVAILABLE,
+    ERR_RESOURCE_EXHAUSTED, ERR_RESUME_FAILED, ERR_RETRY_EXHAUSTED, ERR_RUNTIME_CONFIGURATION,
+    ERR_RUNTIME_TIMEOUT, ERR_RUNTIME_UNAVAILABLE, ERR_SERVICE_UNAVAILABLE, ERR_SESSION_NOT_FOUND,
+    ERR_STOP_FAILED, ERR_TOO_MANY_REQUESTS, ERR_UNKNOWN, ERR_USERAPP_WAIT_TIMEOUT,
+    ERR_USERAPP_WAKE_FAILED, ERR_VALIDATION, ERR_WORKSPACE_ERROR, SUCCESS, error_codes,
+    get_error_description, get_error_hint, get_error_message, get_i18n_message,
+    get_i18n_message_default, get_operation_in_progress_message,
 };
 
 // Validation 模块
 pub mod validation;
-pub use validation::{garde_err_to_app_error, validate_identifier};
+pub use validation::{
+    ABSOLUTE_DIR_MAX_LEN, AGENT_WORK_DIR_MAX_SEGMENTS, IDENTIFIER_RE, USERAPP_APP_ID_MAX_LEN,
+    garde_err_to_app_error, is_absolute_path_like, normalize_absolute_dir, validate_agent_work_dir,
+    validate_agent_work_dir_for_service, validate_identifier,
+};
 
-pub mod quantity;
-pub use quantity::{parse_cpu_quantity, parse_memory_quantity, validate_k8s_storage_size};
+pub use userapp::builder_instance::legacy_composite_app_segment;
+pub use userapp::builder_instance::validate_builder_app_id;
+
+// Userapp 日志域契约（rcoder ↔ app-cli 单一事实源；OpenAPI schema 同源派生）
+pub mod app_cli_logs;
+pub use app_cli_logs::{
+    APP_CLI_ADMIN_PORT, LogQueryRequest, LogQueryResponse, LogRecord, LogSelector, LogSourceInfo,
+    MAX_CURSOR_BYTES, MAX_KEYWORD_BYTES, MAX_SERVICES, MAX_SOURCES, MAX_TAIL_PER_SOURCE,
+    SourceError,
+};
+
+// app-cli 部署相位契约（rcoder ↔ app-cli 单一事实源；deploy/status wire 枚举）
+pub mod app_cli_deploy;
+pub mod app_resource_deletion;
+pub mod runtime_request_failure;
+pub use app_resource_deletion::{
+    AppDeletionSnapshot, AppFileMutationMarker, AppOperationLease, AppPreparationFailure,
+    AppResourceIdentity, AppResourceKind, AppRestartTemplate, USERAPP_DOCKER_APP_ID_LABEL,
+    UserAppDeletionCheckpoint, UserAppDeletionStage, UserAppMutationTarget,
+    UserAppStorageDestruction, UserAppStorageResizeTarget,
+};
+pub use runtime_request_failure::RuntimeRequestRejection;
+
+pub use app_cli_deploy::{
+    APP_CLI_UNIFIED_DEPLOY_PROTOCOL, APP_DEPLOY_GENERATION_ID, APP_DEPLOY_OPERATION_ID,
+    AppCliDeployPhase, AppDeploymentOperation, AppDeploymentProgress, AppDeploymentRecovery,
+    AppDeploymentStage, AppEnvSnapshot, AppMutationPrecondition, HotDeploymentFailureEvidence,
+};
 
 // gRPC 模块 — 重导出自 shared_types_grpc（过渡期兼容）
 pub use shared_types_grpc::grpc;
@@ -138,11 +251,13 @@ pub use model::{
     ChatResponse,
     ContainerBasicInfo,
     DocumentAttachment,
+    ErrorDetail,
     HealthCheckResponse,
     HealthResponse,
     HttpResult,
     ImageAttachment,
     ImageDimensions,
+    MAX_ERROR_DETAIL_CHARS,
     ModelApiProtocol,
     ModelProviderConfig,
     ModelProviderSafeInfo,
@@ -160,57 +275,50 @@ pub use model::{
     SessionPromptStart,
     TextAttachment,
     UnifiedSessionMessage,
+    VersionResponse,
     VncStatusResponse,
+    current_otel_trace_id,
+    error_status_from_code,
+    redact_error_text,
+    sanitize_error_text,
 };
 
-// 导出多镜像配置相关类型
-pub use k8s_config::{
+// 部署配置域（高内聚收拢于 runtime_config/ 模块）—— Docker/K8s 双运行时配置族 + Quantity 解析
+pub use runtime_config::k8s::{
     K8sGlobalDefaults, K8sServiceConfig, K8sSidecarSpec, K8sVolumeMountSpec, K8sVolumeSpec,
     K8sVolumeType, KubernetesConfig,
 };
-pub use multi_image_config::{
+pub use runtime_config::multi_image::{
     GlobalImageDefaults, IMAGE_CACHE_DEFAULT_MAX_ENTRIES, IMAGE_CACHE_DEFAULT_TTL_SECS,
     ImageCacheConfig, ImageSelectionStrategy, MultiImageConfig, ProjectImageOverrides,
     create_default_multi_image_config, create_legacy_multi_image_config,
 };
-pub use service_config::{
-    ServiceImageConfig, ServiceMountConfig, ServiceResourceLimits, ServiceSecurityConfig,
+pub use runtime_config::quantity::{
+    parse_cpu_quantity, parse_memory_quantity, validate_k8s_storage_size,
+};
+pub use runtime_config::service::{
+    DEFAULT_AGENT_CPU_LIMIT_CORES, DEFAULT_AGENT_MEMORY_LIMIT_BYTES, ServiceImageConfig,
+    ServiceMountConfig, ServiceResourceLimits, ServiceSecurityConfig,
     default_agent_runner_service_config, default_rcoder_service_config,
 };
-pub use service_type::{
-    MissingIdentifier, ServiceType, ServiceTypeError, get_enabled_service_types,
-    get_supported_service_types,
-};
-
-// 隔离类型模块
-pub mod isolation_type;
-pub use isolation_type::{IsolationType, IsolationTypeError};
 
 // 导出ChatPrompt的Builder
 pub use model::chat_prompt::ChatPromptBuilder;
 
-// Agent HTTP API 类型（rcoder 和 agent_runner 共用）
-pub mod agent_types;
-pub use agent_types::*;
+// Agent HTTP 契约域（高内聚收拢于 agent/ 模块）—— API 类型/服务 trait/通用 handler/安装管理/Chat 配置
+pub use agent::chat_config::{
+    AgentMode, AutoReloadConfig, ChatAgentConfig, ChatAgentServerConfig, ChatContextServerConfig,
+    ModelEnvBinding, ModelEnvBindingSource, ToolApprovalAction, ToolApprovalRule, VALID_TOOL_KINDS,
+};
+pub use agent::computer_types::*;
+// 模块 re-export：保住 agent_runner 的 `use shared_types::http_handlers;` 路径
+pub use agent::http_handlers;
+pub use agent::http_service::AgentHttpService;
+pub use agent::rcoder_types::*;
+pub use agent::types::*;
 
-// Computer Agent HTTP API 类型
-pub mod computer_agent_types;
-pub use computer_agent_types::*;
-
-// RCoder Agent HTTP Service trait
-pub mod agent_http_service;
-pub use agent_http_service::AgentHttpService;
-
-// RCoder Agent HTTP API 类型
-pub mod rcoder_agent_types;
-pub use rcoder_agent_types::*;
-
-// 通用 HTTP Handlers（基于 trait）
-pub mod agent_mgmt_types;
-pub mod http_handlers;
-
-// UserApp workspace manifest 类型（极轻量独立 crate，file-server build + app-cli runtime 共用）
-pub use agent_mgmt_types::{
+// Userapp workspace manifest 类型（极轻量独立 crate，file-server build + app-cli runtime 共用）
+pub use agent::mgmt_types::{
     AGENT_CACHE_DIR, AgentDetailInfo, AgentIdentity, AgentInfo, AgentInstallStatus,
     CheckAgentRequest, CheckAgentResponse, DEFAULT_ACP_AGENT_INSTALL_DIR, GetAgentRequest,
     InstallAction, InstallAgentResponse, InstallBinaryRequest, InstallFromPackageManagerRequest,
@@ -219,10 +327,45 @@ pub use agent_mgmt_types::{
     UPLOAD_CHUNK_SIZE, URL_DOWNLOAD_TIMEOUT_SECS, UninstallAgentRequest, UninstallAgentResponse,
 };
 pub use workspace_manifest::{
-    BuildSection, DiscoverError, DiscoveredProject, HealthSection, LockedPingap, LockedService,
-    LogFormat, LogSource, LogsSection, ManifestError, PingapMode, PingapSection, ProjectKind,
-    ProjectManifest, ProjectMeta, ProjectType, ProxySection, ReleaseLock, ReleaseMetadata,
-    RunSection, WorkspaceManifest, WorkspaceMeta, build_release_lock, discover_projects,
-    parse_project, parse_workspace, validate_project, validate_service_id, validate_topology,
-    validate_workspace,
+    BuildSection, DevbuildSection, DevrunSection, DiagnosticKind, DiscoverError, DiscoveredProject,
+    DiscoveryReport, HealthSection, LockedPingap, LockedService, LogFormat, LogSource, LogsSection,
+    MINIMUM_APP_CLI_VERSION, ManifestDiagnostic, ManifestError, PingapMode, PingapSection,
+    ProjectKind, ProjectManifest, ProjectMeta, ProjectType, ProxySection, ReleaseLock,
+    ReleaseMetadata, RunSection, STARTUP_PROBE_CAPABILITY, StartupProbe, WorkspaceManifest,
+    WorkspaceMeta, build_release_lock, collect_workspace_issues, collect_workspace_startup_issues,
+    discover_projects, discover_projects_report, load_release_lock, parse_project, parse_workspace,
+    parse_workspace_for_inspection, require_startup_probe_capability, validate_project,
+    validate_service_id, validate_topology, validate_workspace, validate_workspace_startup,
 };
+
+pub mod userapp_http;
+
+pub mod persistence;
+pub use persistence::FlushOutcome;
+
+pub use userapp::lifecycle::*;
+pub use userapp::workspace_clear::*;
+
+pub use userapp::builder_control::*;
+
+pub use userapp::resource_binding::{
+    AdoptApplicationRequest, AdoptBuilderRequest, AppAdoptionTarget, UserAppResourceBinding,
+    builder_identity_is_bound,
+};
+
+pub use userapp::operation_lease::*;
+
+pub use userapp::builder_recovery::UserAppBuilderRecovery;
+
+mod operation_flight;
+pub use operation_flight::{FlightAdmissionClosed, FlightGuard, OperationFlightGate};
+
+pub use userapp::compute_control::*;
+pub use userapp::compute_recovery::*;
+pub use userapp::recovery_scan::UserAppRecoveryScanPage;
+
+pub use userapp::discovery::UserAppDiscoveredIdentity;
+
+pub use app_resource_deletion::UserAppComputeStartTarget;
+
+pub use userapp::diagnostic::*;

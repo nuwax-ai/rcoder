@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use crate::error::{AppError, AppResult};
+use crate::models::PortAllocation;
 
 /// 端口池快照 (供 port-pool-status 路由)。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -17,13 +18,6 @@ pub struct PortPoolStatus {
     pub port_range: String,
     pub total_allocated: usize,
     pub allocations: Vec<PortAllocation>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PortAllocation {
-    pub project_id: String,
-    pub port: u16,
 }
 
 /// 单例端口池 (经 Arc 共享于 DevServerManager)。
@@ -73,8 +67,14 @@ impl PortPool {
     }
 
     /// 释放端口 (从 Map 移除)。返回被释放的端口 (无则 None)。
-    pub fn release(&self, project_id: &str) -> Option<u16> {
-        self.allocated.lock().ok()?.remove(project_id)
+    /// 锁毒化等真实锁错误按 [`AppError::system`] 传播（对齐 allocate/status，
+    /// 不再 `.ok()` 静默吞掉）。
+    pub fn release(&self, project_id: &str) -> AppResult<Option<u16>> {
+        let mut alloc = self
+            .allocated
+            .lock()
+            .map_err(|e| AppError::system(format!("port pool lock: {e}")))?;
+        Ok(alloc.remove(project_id))
     }
 
     /// 当前分配快照。
@@ -135,7 +135,7 @@ mod tests {
     fn release_returns_port_to_pool() {
         let p = pool();
         let a = p.allocate("a").unwrap();
-        assert_eq!(p.release("a"), Some(a));
+        assert_eq!(p.release("a").expect("release under live lock"), Some(a));
         // 再分配应重新拿到同一最小端口
         let a2 = p.allocate("a").unwrap();
         assert_eq!(a2, a);

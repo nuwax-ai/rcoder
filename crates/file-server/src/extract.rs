@@ -1,4 +1,16 @@
 //! HTTP 提取器适配层：把 Axum 原生 rejection 统一映射为 file-server `AppError`。
+//!
+//! 另含请求级 task-local 标记（中间件 scope 注入）：
+//! - 工作空间定位类型（`WORKSPACE_KIND`）：`X-Workspace-Type` header 值经
+//!   `normalize_computer_service_type` 归一后的四值类型（userApp 切开发卷 /
+//!   normalProject 共享工作区 / pageApp·taskAgent 默认）——由
+//!   [`scope_service_context`] 读 header 注入，computer 域 workspace 定位
+//!   （`ws_path` 等）据此分派——HTTP 层标记，与 ServiceType 枚举（容器编排层）
+//!   互不相干。
+//! - 用户维度工作目录（`WORKSPACE_PATH`，对齐 TS 1.4.5）：`x-workspace-path`
+//!   header 的原始值，由 [`scope_workspace_path`] 注入；与 body/query 的
+//!   `workspacePath` 字段经 [`merged_workspace_path`] 合并（header 优先）后由
+//!   computer 域收口 fail-fast 校验。
 
 use axum::extract::multipart::MultipartRejection;
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
@@ -7,6 +19,198 @@ use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 
 use crate::error::AppError;
+
+// 分流契约常量与 rcoder 转发层共用 shared_types 单一事实源。
+pub use shared_types::{
+    APP_ID_HEADER, ComputerServiceKind, SERVICE_TYPE_HEADER, SERVICE_TYPE_USERAPP,
+    WORKSPACE_PATH_HEADER, WORKSPACE_TYPE_HEADER,
+};
+
+// ── 请求级服务场景上下文 (task_local, 由请求中间件 scope 注入) ──────────────────
+tokio::task_local! {
+    /// `X-Workspace-Type` 归一化后的工作空间定位类型（B06：定位单一通道；
+    /// header 缺失/未匹配 scope `None`，轮到 body/query 通道）。
+    pub(crate) static WORKSPACE_KIND: Option<ComputerServiceKind>;
+    /// `X-Workspace-Type` header 的原始非空值（trim 后存储，`None` = 缺失/空白）。
+    /// 垃圾值与缺失在 [`WORKSPACE_KIND`]（归一产物）里同为 `None`，fail-fast
+    /// 判定（TS a29cbc0/1.4.7：传了但无法归一必须 400）需要原始值区分两者。
+    pub(crate) static WORKSPACE_TYPE_RAW: Option<String>;
+    /// 定位的独立 app_id（header `x-app-id` 优先，缺省 query `appId`
+    /// 兜底；原始值存储，合法性由定位收口 `resolve_userapp_dev` 校验——与
+    /// WORKSPACE_PATH 同款「中间件存原始值、收口 fail-fast」模式）。
+    pub(crate) static USERAPP_APP_ID: Option<String>;
+}
+
+/// 当前请求 `x-workspace-type` header 通道的定位类型（`None` = 缺失/未匹配）。
+pub fn workspace_kind() -> Option<ComputerServiceKind> {
+    WORKSPACE_KIND.try_with(|kind| *kind).ok().flatten()
+}
+
+/// 当前请求是否为 userApp 场景（`X-Service-Type: userapp`）。
+pub fn is_userapp_request() -> bool {
+    // B06：定位判定只看 workspaceType 通道（header 快径；body 显式值经
+    // merged_workspace_kind 由收口处理）——serviceType 不参与定位
+    workspace_kind() == Some(ComputerServiceKind::Userapp)
+}
+
+/// 当前请求是否为 normalProject 场景（`X-Service-Type: normalProject`，
+/// 常规项目主容器共享工作区 `{CWS}/{userId}/NormalProject/{projectId}`）。
+pub fn is_normal_project_request() -> bool {
+    workspace_kind() == Some(ComputerServiceKind::NormalProject)
+}
+
+/// 当前请求的独立 app_id（对齐 TS `resolveServiceContext` 的两级提取：
+/// header `x-app-id` > query `appId`）。非 userApp/normalProject 请求或两处
+/// 皆缺 → None。
+///
+/// cId（会话字段）**不参与**定位——app_id 是独立字段，缺失由 computer 域
+/// 收口 fail-fast（勿让 cId 兼任，语义违例先例）。
+pub fn userapp_app_id() -> Option<String> {
+    USERAPP_APP_ID
+        .try_with(|v| v.clone())
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// 中间件：读 `X-Service-Type` header → 归一化为四值类型 scope 注入
+/// （缺失/未匹配 scope `None`——header 通道视为无值，对齐 TS `headerType ||
+/// bodyType` 链；缺省 taskAgent 由消费方处理，词表终态无 general 兼容），
+/// 同时提取定位用 app_id（header `x-app-id` 优先，缺省 query `appId` 兜底——
+/// Java 静态文件族 query 恒带 `appId`）。query 值不做 percent-decode：
+/// app_id 是 identifier 字符集，含转义序列会在定位收口校验 fail-fast。
+pub async fn scope_service_context(req: Request, next: axum::middleware::Next) -> Response {
+    // 工作空间定位 header 通道（TS 88a1827 / B06）：x-workspace-type 是
+    // 定位**唯一** header 通道；旧 x-service-type 是运行时路由概念，
+    // 不解析、不参与目录定位（两级旧字段回退已删除——对齐 TS 契约）。
+    // 原始值另行 scope：归一失败的垃圾值不再静默视为缺失（TS a29cbc0/1.4.7），
+    // 由 merged_workspace_kind 收口 fail-fast。
+    let raw_workspace_type = req
+        .headers()
+        .get(WORKSPACE_TYPE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    let workspace_kind = raw_workspace_type
+        .as_deref()
+        .and_then(shared_types::normalize_computer_service_type);
+    let app_id = req
+        .headers()
+        .get(APP_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .or_else(|| query_param_raw(req.uri().query(), "appId"));
+    let fut = next.run(req);
+    async {
+        USERAPP_APP_ID
+            .scope(app_id, async {
+                WORKSPACE_TYPE_RAW
+                    .scope(raw_workspace_type, async {
+                        WORKSPACE_KIND.scope(workspace_kind, fut).await
+                    })
+                    .await
+            })
+            .await
+    }
+    .await
+}
+
+/// 从原始 query 串取单值参数（`appId=19&x=y` → `Some("19")`；多值取首个）。
+fn query_param_raw(query: Option<&str>, key: &str) -> Option<String> {
+    query?.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key && !v.is_empty()).then(|| v.to_string())
+    })
+}
+
+// ── 请求级用户维度工作目录 (task_local, 存原始 header 值; 对齐 TS 1.4.5) ────────
+tokio::task_local! {
+    pub(crate) static WORKSPACE_PATH: Option<String>;
+}
+
+/// 当前请求 `x-workspace-path` header 的**原始值**（未校验；中间件外恒 None）。
+///
+/// 校验/归一不在此处做——由收口 [`crate::handlers::computer`]
+/// `computer_root_for_request` 经 [`merged_workspace_path`] 合并后 fail-fast
+/// （对齐 TS：`resolveServiceContext` 在路由入口校验，非 computer 域路由不受影响）。
+pub fn workspace_path_header_raw() -> Option<String> {
+    WORKSPACE_PATH.try_with(|v| v.clone()).ok().flatten()
+}
+
+/// 中间件：读 `x-workspace-path` header → task-local scope 注入原始值
+/// （header 缺失也 scope `None`，与 `scope_service_context` 恒 scope 形态一致；
+/// 对不消费该目录的路由是 no-op）。
+pub async fn scope_workspace_path(req: Request, next: axum::middleware::Next) -> Response {
+    let raw = req
+        .headers()
+        .get(WORKSPACE_PATH_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    WORKSPACE_PATH.scope(raw, next.run(req)).await
+}
+
+/// 合并用户维度工作目录来源（对齐 TS `resolveServiceContext` 的取值顺序）：
+/// header（trim 非空）> 调用方显式值（body/query 的 `workspacePath` 字段，trim 非空）。
+///
+/// header 为空白串时落回显式值；两者皆空/缺失 → `None`（未传入，走默认定位）。
+/// 只做 trim/非空过滤，合法性校验（绝对路径/点段/长度/控制字符）由收口处
+/// [`crate::workspace::normalize_workspace_path`] fail-fast。
+pub fn merged_workspace_path(explicit: Option<&str>) -> Option<String> {
+    if let Some(header) = workspace_path_header_raw().filter(|s| !s.trim().is_empty()) {
+        return Some(header);
+    }
+    non_empty_trimmed(explicit).map(str::to_string)
+}
+
+/// trim 后非空才保留（对齐 TS `String(x).trim() || null` 的取值语义——
+/// 空白串视为未传）。serviceContext 三要素（appId/workspacePath）与定位
+/// 收口的 trim 过滤统一走此 helper，防止「空白值假激活」与 TS 分歧。
+pub(crate) fn non_empty_trimmed(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// 合并工作空间定位类型来源（R06 优先级 + TS a29cbc0/1.4.7 fail-fast）：
+/// `x-workspace-type` header > body/query 的 `workspaceType` 字段。
+///
+/// - 任一通道归一成功 → 该值（header 优先）；「一垃圾一合法」→ 合法值胜出
+///   不报错（TS 同构：`headerNorm || bodyNorm` 链）
+/// - 两通道皆未传（或空白）→ `Ok(None)`（缺省 taskAgent 布局，存量直连兼容）
+/// - 有通道传了非空值但**均**无法归一 → `Err`——文件/git 均含破坏性操作，
+///   垃圾类型静默回落会把操作落到 `{userId}/{cId}` 默认工作区
+///
+/// 文案对齐 TS computer 域 `resolveServiceContext`（git 域 TS 原文多
+/// "is required and"，统一用前者）。旧 `serviceType` 字段不参与定位
+/// （B06 契约），参数仅为消费方形态保留。
+pub(crate) fn merged_workspace_kind(
+    workspace_type: Option<&str>,
+    // 保留参数形态（消费方仍传旧字段值）；B06 契约下旧值不参与定位
+    _service_type: Option<&str>,
+) -> Result<Option<ComputerServiceKind>, AppError> {
+    let header_norm = workspace_kind();
+    let body_norm = workspace_type.and_then(shared_types::normalize_computer_service_type);
+    if let Some(kind) = header_norm.or(body_norm) {
+        return Ok(Some(kind));
+    }
+    let header_present = WORKSPACE_TYPE_RAW
+        .try_with(|v| v.is_some())
+        .unwrap_or(false);
+    let body_present = workspace_type.map(str::trim).is_some_and(|v| !v.is_empty());
+    if header_present || body_present {
+        return Err(AppError::validation(
+            "workspaceType must be one of userApp, pageApp, normalProject, taskAgent",
+        ));
+    }
+    Ok(None)
+}
+
+/// 合并 appId 来源（header `x-app-id` > query `appId`（task-local 读取器内
+/// 已合并））优先 > body/query 的 `appId` 显式字段（trim 非空过滤）。
+pub(crate) fn merged_request_app_id(explicit: Option<&str>) -> Option<String> {
+    userapp_app_id().or_else(|| non_empty_trimmed(explicit).map(str::to_string))
+}
 
 pub struct AppJson<T>(pub T);
 
@@ -142,7 +346,406 @@ mod tests {
     use serde::Deserialize;
     use tower::ServiceExt;
 
-    use super::AppJson;
+    use super::{AppJson, ComputerServiceKind, WORKSPACE_KIND, is_userapp_request};
+
+    /// B06 契约：旧 x-service-type（或 body serviceType）**不参与目录定位**
+    /// ——没有 workspaceType 时即便旧字段=userapp，定位仍落缺省（None→
+    /// taskAgent），与 TS 一致。旧 header 抢占目录类型属契约违背。
+    #[tokio::test]
+    async fn legacy_service_fields_never_select_directory() {
+        WORKSPACE_KIND
+            .scope(None, async {
+                // body serviceType 旧字段不回退
+                assert_eq!(
+                    super::merged_workspace_kind(None, Some("userapp")).ok(),
+                    Some(None)
+                );
+                // 显式 body workspaceType 正常生效（同请求带旧 serviceType 不影响）
+                assert_eq!(
+                    super::merged_workspace_kind(Some("normalProject"), Some("userapp")).ok(),
+                    Some(Some(ComputerServiceKind::NormalProject))
+                );
+            })
+            .await;
+    }
+
+    /// R06 场景 2：新 header 优先于 body workspaceType（header 通道 > body 通道）。
+    #[tokio::test]
+    async fn workspace_header_beats_body_channel() {
+        WORKSPACE_KIND
+            .scope(Some(ComputerServiceKind::Userapp), async {
+                assert_eq!(
+                    super::merged_workspace_kind(Some("normalProject"), None).ok(),
+                    Some(Some(ComputerServiceKind::Userapp))
+                );
+            })
+            .await;
+    }
+
+    /// R06 场景 3：body 同时携带 serviceType 与 workspaceType（独立字段，
+    /// 不再是同一反序列化字段的别名冲突）——workspaceType 优先。
+    #[tokio::test]
+    async fn both_body_fields_deserialize_independently() {
+        #[derive(serde::Deserialize)]
+        struct Body {
+            #[serde(default)]
+            #[serde(rename = "workspaceType")]
+            workspace_type: Option<String>,
+            #[serde(default)]
+            #[serde(rename = "serviceType")]
+            service_type: Option<String>,
+        }
+        let body: Body =
+            serde_json::from_str(r#"{"workspaceType":"normalProject","serviceType":"userapp"}"#)
+                .expect("both fields deserialize independently");
+        assert_eq!(body.workspace_type.as_deref(), Some("normalProject"));
+        assert_eq!(body.service_type.as_deref(), Some("userapp"));
+        // 合并序：workspaceType 通道胜出
+        WORKSPACE_KIND
+            .scope(None, async {
+                assert_eq!(
+                    super::merged_workspace_kind(
+                        body.workspace_type.as_deref(),
+                        body.service_type.as_deref()
+                    )
+                    .ok(),
+                    Some(Some(ComputerServiceKind::NormalProject))
+                );
+            })
+            .await;
+    }
+
+    /// B06 缺省：无 workspaceType 任何通道 → `Ok(None)`（缺省 taskAgent 布局）。
+    /// 1.4.7 fail-fast：传了非空值但无法归一 → `Err`，不再静默回落旧字段。
+    #[tokio::test]
+    async fn absent_workspace_type_defaults_garbage_fails_fast() {
+        WORKSPACE_KIND
+            .scope(None, async {
+                assert_eq!(super::merged_workspace_kind(None, None).ok(), Some(None));
+                assert!(
+                    super::merged_workspace_kind(Some("not-a-type"), None).is_err(),
+                    "垃圾值必须 fail-fast 而非静默缺省"
+                );
+                // 旧 serviceType 通道仍不参与定位（垃圾 serviceType 不触发 Err）
+                assert_eq!(
+                    super::merged_workspace_kind(None, Some("userapp")).ok(),
+                    Some(None)
+                );
+            })
+            .await;
+    }
+
+    /// 1.4.7「一垃圾一合法」：任一通道归一成功即用该值不报错（TS
+    /// `headerNorm || bodyNorm` 链）；双通道皆垃圾 → `Err`。header 垃圾与
+    /// 缺失的区分依赖 `WORKSPACE_TYPE_RAW` 原始值。
+    #[tokio::test]
+    async fn one_garbage_one_valid_channel_uses_valid() {
+        // header 垃圾 + body 合法 → body 值
+        super::WORKSPACE_TYPE_RAW
+            .scope(
+                Some("junk".into()),
+                WORKSPACE_KIND.scope(None, async {
+                    assert_eq!(
+                        super::merged_workspace_kind(Some("userApp"), None).ok(),
+                        Some(Some(ComputerServiceKind::Userapp))
+                    );
+                }),
+            )
+            .await;
+        // header 合法 + body 垃圾 → header 值
+        super::WORKSPACE_TYPE_RAW
+            .scope(
+                Some("userapp".into()),
+                WORKSPACE_KIND.scope(Some(ComputerServiceKind::Userapp), async {
+                    assert_eq!(
+                        super::merged_workspace_kind(Some("garbage"), None).ok(),
+                        Some(Some(ComputerServiceKind::Userapp))
+                    );
+                }),
+            )
+            .await;
+        // 双通道皆垃圾 → Err
+        super::WORKSPACE_TYPE_RAW
+            .scope(
+                Some("junk".into()),
+                WORKSPACE_KIND.scope(None, async {
+                    assert!(super::merged_workspace_kind(Some("also-junk"), None).is_err());
+                }),
+            )
+            .await;
+    }
+
+    /// task-local 定位类型：中间件 scope 注入后 handler 内可读；判定只认
+    /// x-workspace-type（userapp/normalProject 命中各自档；旧 x-service-type
+    /// 不再参与——B06 契约），未知值/无 header 落缺省 TaskAgent。
+    #[tokio::test]
+    async fn service_kind_scoped_by_middleware() {
+        let probe = Router::new().route(
+            "/probe",
+            post(|| async {
+                format!(
+                    "{}|{}",
+                    is_userapp_request(),
+                    super::is_normal_project_request()
+                )
+            }),
+        );
+        let app = probe.layer(axum::middleware::from_fn(super::scope_service_context));
+
+        // x-workspace-type: userapp → userapp=true
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/probe")
+                    .header(super::WORKSPACE_TYPE_HEADER, super::SERVICE_TYPE_USERAPP)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(resp.into_body(), 1024).await.unwrap(),
+            "true|false"
+        );
+
+        // 大小写不敏感变体（单一事实源 shared_types::normalize_computer_service_type）
+        for variant in ["Userapp", "USERAPP"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post("/probe")
+                        .header(super::WORKSPACE_TYPE_HEADER, variant)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                to_bytes(resp.into_body(), 1024).await.unwrap(),
+                "true|false",
+                "{variant}"
+            );
+        }
+
+        // normalProject → userapp=false、normalProject=true（驼峰与全小写均命中）
+        for variant in ["normalProject", "NormalProject", "normalproject"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post("/probe")
+                        .header(super::WORKSPACE_TYPE_HEADER, variant)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                to_bytes(resp.into_body(), 1024).await.unwrap(),
+                "false|true",
+                "{variant}"
+            );
+        }
+
+        // 旧 x-service-type header（任意值）不参与定位 → 双 false（B06 契约）
+        for variant in ["userapp", "normalProject"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post("/probe")
+                        .header(super::SERVICE_TYPE_HEADER, variant)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                to_bytes(resp.into_body(), 1024).await.unwrap(),
+                "false|false",
+                "legacy x-service-type must not select the directory type ({variant})"
+            );
+        }
+
+        // 无 header / 未匹配值（含 general 旧值）→ 双 false（缺省 TaskAgent 档）
+        for case in ["none", "general", "unknown-x"] {
+            let mut req = Request::post("/probe").body(Body::empty()).unwrap();
+            if case != "none" {
+                req.headers_mut().insert(
+                    super::WORKSPACE_TYPE_HEADER,
+                    case.parse().expect("static header value"),
+                );
+            }
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                to_bytes(resp.into_body(), 1024).await.unwrap(),
+                "false|false",
+                "{case}"
+            );
+        }
+    }
+
+    /// userapp app_id 两级提取（对齐 TS resolveServiceContext）：
+    /// header `x-app-id` 优先 > query `appId` 兜底 > None（缺失由定位收口 fail-fast）。
+    #[tokio::test]
+    async fn userapp_app_id_extracted_header_first_then_query() {
+        let app = Router::new()
+            .route(
+                "/probe",
+                post(|| async { format!("{:?}", super::userapp_app_id()) }),
+            )
+            .layer(axum::middleware::from_fn(super::scope_service_context));
+
+        // 仅 header
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/probe")
+                    .header(super::SERVICE_TYPE_HEADER, super::SERVICE_TYPE_USERAPP)
+                    .header(super::APP_ID_HEADER, "app-19")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(resp.into_body(), 1024).await.unwrap(),
+            r#"Some("app-19")"#
+        );
+
+        // header 优先于 query（两处都有 → header 胜出）
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/probe?appId=from-query")
+                    .header(super::SERVICE_TYPE_HEADER, super::SERVICE_TYPE_USERAPP)
+                    .header(super::APP_ID_HEADER, "from-header")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(resp.into_body(), 1024).await.unwrap(),
+            r#"Some("from-header")"#
+        );
+
+        // 仅 query 兜底（Java 静态文件族形态：query 恒带 appId）
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/probe?appId=19&other=1")
+                    .header(super::SERVICE_TYPE_HEADER, super::SERVICE_TYPE_USERAPP)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(resp.into_body(), 1024).await.unwrap(),
+            r#"Some("19")"#
+        );
+
+        // 两处皆缺 → None；空白 header 值视为未携带（回落 query）
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/probe")
+                    .header(super::SERVICE_TYPE_HEADER, super::SERVICE_TYPE_USERAPP)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(to_bytes(resp.into_body(), 1024).await.unwrap(), "None");
+        let resp = app
+            .oneshot(
+                Request::post("/probe?appId=q1")
+                    .header(super::SERVICE_TYPE_HEADER, super::SERVICE_TYPE_USERAPP)
+                    .header(super::APP_ID_HEADER, "   ")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(resp.into_body(), 1024).await.unwrap(),
+            r#"Some("q1")"#
+        );
+    }
+
+    /// 用户维度工作目录 task-local：中间件 scope 注入原始 header 值（可读、未校验），
+    /// header 缺失时 scope None（handler 内 None）；中间件外恒 None。
+    #[tokio::test]
+    async fn workspace_path_task_local_scoped_by_middleware() {
+        use super::{merged_workspace_path, scope_workspace_path, workspace_path_header_raw};
+
+        let app = Router::new().route(
+            "/probe",
+            post(|| async {
+                format!(
+                    "{:?}|{:?}",
+                    workspace_path_header_raw(),
+                    merged_workspace_path(Some("/from-query"))
+                )
+            }),
+        );
+        let app = app.layer(axum::middleware::from_fn(scope_workspace_path));
+
+        // 带 x-workspace-path → 原始值可读 + merge 时压过显式值
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/probe")
+                    .header(super::WORKSPACE_PATH_HEADER, "/bound/dir")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(resp.into_body(), 1024).await.unwrap(),
+            r#"Some("/bound/dir")|Some("/bound/dir")"#
+        );
+
+        // header 为空白串 → scope Some(空白) 但 merge 落回显式值（对齐 TS）
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/probe")
+                    .header(super::WORKSPACE_PATH_HEADER, "   ")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(resp.into_body(), 1024).await.unwrap(),
+            r#"Some("   ")|Some("/from-query")"#
+        );
+
+        // 无 header → scope None + merge 取显式值
+        let resp = app
+            .oneshot(Request::post("/probe").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(resp.into_body(), 1024).await.unwrap(),
+            r#"None|Some("/from-query")"#
+        );
+    }
+
+    /// merge 优先级（对齐 TS resolveServiceContext：header > body/query > 无）。
+    /// 显式值同样 trim 过滤：空白显式值视为未传。
+    #[test]
+    fn merged_workspace_path_filters_empty_explicit() {
+        use super::merged_workspace_path;
+        assert_eq!(merged_workspace_path(Some("   ")), None);
+        assert_eq!(
+            merged_workspace_path(Some("  /bound  ")),
+            Some("/bound".to_string())
+        );
+        // 中间件外（无 task_local）显式为空 → None（不 panic）
+        assert_eq!(merged_workspace_path(None), None);
+    }
 
     #[derive(Deserialize)]
     struct Input {

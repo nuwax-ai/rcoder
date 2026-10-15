@@ -129,16 +129,16 @@ pub async fn create_project(
         }
         return Err(error);
     }
-    // GIT_ENABLED → git init + commit("init project: {id}") (对齐 nuwax createProject)
-    if config.git_enabled
-        && let Err(e) = crate::service::git::init_and_commit(
-            &project_path,
-            &format!("init project: {project_id}"),
-            &config.git_default_author_name,
-            &config.git_default_author_email,
+    // GIT_ENABLED → git init + commit("init project: {id}") (对齐 nuwax createProject);
+    // 失败传播——nuwax 不 catch, 吞错会留下无提交的 unborn 工作区 (重试经幂等门可自愈)
+    if config.git_enabled {
+        crate::service::git::write::init_and_commit_offloaded(
+            project_path.clone(),
+            format!("init project: {project_id}"),
+            config.git_default_author_name.clone(),
+            config.git_default_author_email.clone(),
         )
-    {
-        tracing::warn!(error = %e, "git init/commit after create failed (skipping)");
+        .await?;
     }
 
     Ok(CreateResult {
@@ -179,13 +179,8 @@ pub async fn copy_project(
         ));
     }
     fs::create_dir_all(&target_path).await?;
-    if let Err(e) = crate::service::fs_util::copy_dir_filtered(
-        &source_path,
-        &target_path,
-        &config.traverse_exclude_dirs,
-        &config.backup_traverse_exclude_files,
-    )
-    .await
+    if let Err(e) =
+        copy_project_tree(&source_path, &target_path, &config.traverse_exclude_dirs).await
     {
         if let Err(cleanup_err) = fs::remove_dir_all(&target_path).await {
             tracing::warn!(error = %cleanup_err, "cleanup target_path on copy failure failed (skipping)");
@@ -198,16 +193,16 @@ pub async fn copy_project(
         }
         return Err(error);
     }
-    // GIT_ENABLED → git init + commit("copy project: {src} -> {tgt}") (对齐 nuwax copyProject)
-    if config.git_enabled
-        && let Err(e) = crate::service::git::init_and_commit(
-            &target_path,
-            &format!("copy project: {source_id} -> {target_id}"),
-            &config.git_default_author_name,
-            &config.git_default_author_email,
+    // GIT_ENABLED → git init + commit("copy project: {src} -> {tgt}") (对齐 nuwax copyProject);
+    // 失败传播——吞错会留下无提交的 unborn 工作区
+    if config.git_enabled {
+        crate::service::git::write::init_and_commit_offloaded(
+            target_path.to_path_buf(),
+            format!("copy project: {source_id} -> {target_id}"),
+            config.git_default_author_name.clone(),
+            config.git_default_author_email.clone(),
         )
-    {
-        tracing::warn!(error = %e, "git init/commit after copy failed (skipping)");
+        .await?;
     }
 
     Ok(CopyResult {
@@ -215,6 +210,51 @@ pub async fn copy_project(
         target_project_id: target_id.to_string(),
         target_project_path: target_path.to_string_lossy().to_string(),
     })
+}
+
+/// 复制项目源文件。
+///
+/// `traverse_exclude_dirs` 也包含 `.agents` 等用户项目配置目录，因为普通文件遍历不应
+/// 把它们当作业务源码返回；项目复制则必须保留这些根目录。备份专用的文件排除规则
+/// （例如 `pnpm-lock.yaml`）同样不适用于项目复制。
+async fn copy_project_tree(src: &Path, dst: &Path, exclude_dirs: &[String]) -> AppResult<()> {
+    const PRESERVED_ROOT_DIRS: &[&str] = &[
+        ".agents",
+        ".attachments",
+        ".codex",
+        ".grok",
+        ".opencode",
+        ".pi",
+    ];
+
+    fs::create_dir_all(dst).await?;
+    let mut entries = fs::read_dir(src).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name();
+        let name_for_match = name.to_string_lossy();
+        let source = entry.path();
+        let target = dst.join(&name);
+        let file_type = entry.file_type().await?;
+
+        if file_type.is_dir() {
+            let excluded = exclude_dirs
+                .iter()
+                .any(|excluded| excluded == &name_for_match);
+            let preserved_user_data = PRESERVED_ROOT_DIRS
+                .iter()
+                .any(|preserved| *preserved == name_for_match);
+            if excluded && !preserved_user_data {
+                continue;
+            }
+            // 递归时仍过滤生成目录（例如技能仓中的 node_modules），但不套用备份文件规则。
+            crate::service::fs_util::copy_dir_filtered(&source, &target, exclude_dirs, &[]).await?;
+        } else if file_type.is_file() {
+            // 根目录文件及递归目录中的文件均保留，包括各级 package lockfile。
+            fs::copy(&source, &target).await?;
+        }
+        // 与 TS Dirent 行为一致，不跟随或复制符号链接。
+    }
+    Ok(())
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────────
@@ -348,16 +388,15 @@ pub async fn upload_project(
         tracing::warn!(error = %cleanup_err, "cleanup rollback backup after upload failed (skipping)");
     }
 
-    // 4. GIT_ENABLED → init + commit
-    if config.git_enabled
-        && let Err(e) = crate::service::git::init_and_commit(
-            &project_path,
-            &format!("upload project v{version}"),
-            &config.git_default_author_name,
-            &config.git_default_author_email,
+    // 4. GIT_ENABLED → init + commit; 失败传播——吞错会留下无提交的 unborn 工作区
+    if config.git_enabled {
+        crate::service::git::write::init_and_commit_offloaded(
+            project_path.clone(),
+            format!("upload project v{version}"),
+            config.git_default_author_name.clone(),
+            config.git_default_author_email.clone(),
         )
-    {
-        tracing::warn!(error = %e, "git init/commit after upload failed (skipping)");
+        .await?;
     }
 
     Ok(UploadProjectResult {
@@ -388,8 +427,8 @@ async fn remove_node_modules(project_path: &Path) {
 
 // ── export-project (zip 文件流) ─────────────────────────────────────────────────
 
-/// 导出项目 zip: exportType=LATEST 或 zip 不存在时重打; 可选写 cpage_config.json (打包后删)。
-/// 返回 zip 路径, 由 handler 流式响应。
+/// 导出项目 zip: exportType=LATEST 或 zip 不存在时重打; 可选 cpage_config 作为
+/// zip 显式 entry (不动真实项目文件)。返回 zip 路径, 由 handler 流式响应。
 pub async fn export_project(
     resolver: &dyn WorkspaceResolver,
     config: &Config,
@@ -419,33 +458,502 @@ pub async fn export_project(
         }
         return Ok(zip_path);
     }
-    // LATEST 重打: 写 cpage_config.json (打包后删除, 避免污染项目目录)
-    let config_path = project_path.join("cpage_config.json");
-    let config_written = if let Some(cfg) = cpage_config {
-        let bytes = serde_json::to_vec(cfg)
-            .map_err(|error| AppError::system(format!("serialize cpage_config.json: {error}")))?;
-        fs::write(&config_path, bytes).await.map_err(|error| {
-            AppError::system(format!("write {}: {error}", config_path.display()))
-        })?;
-        Some(config_path.clone())
-    } else {
-        None
+    // LATEST 重打: 导出配置作为 zip 显式 entry (源内同名文件被替代), 不再
+    // 写/删真实项目文件——已有配置（含外向链接）原样保留 (FS-02)。
+    let explicit_entry = match cpage_config {
+        Some(cfg) => {
+            let bytes = serde_json::to_vec(cfg).map_err(|error| {
+                AppError::system(format!("serialize cpage_config.json: {error}"))
+            })?;
+            Some(crate::service::zip::ExplicitEntry {
+                name: "cpage_config.json".to_string(),
+                bytes,
+            })
+        }
+        None => None,
     };
-    let repack_result = crate::service::zip::pack_dir(
+    crate::service::zip::pack_with_opts(
         project_path.clone(),
         zip_path.clone(),
-        config.traverse_exclude_dirs.clone(),
-        config.backup_traverse_exclude_files.clone(),
+        crate::service::zip::PackOpts {
+            exclude_dirs: config.traverse_exclude_dirs.clone(),
+            exclude_files: config.backup_traverse_exclude_files.clone(),
+            explicit_entry,
+            ..Default::default()
+        },
     )
-    .await;
-    if let Some(p) = &config_written
-        && let Err(cleanup_err) = fs::remove_file(p).await
-    {
-        tracing::warn!(error = %cleanup_err, "cleanup temp config file after export failed (skipping)");
-    }
-    repack_result?;
+    .await?;
     if !try_exists(&zip_path).await? {
         return Err(AppError::system("Exported zip file does not exist"));
     }
     Ok(zip_path)
+}
+
+#[cfg(test)]
+mod tests {
+    //! project 域核心路径回归网（此前 0 测试、e2e 零命中）。
+    //! 锁住的偏移敏感点：
+    //! - delete 的 resolve 校验先于旁路目录 join（顺序颠倒 = 穿越防护静默失效）
+    //! - create 的错误变体分派（Validation vs Business——前端按 error.type 分流）
+    //! - copy 的源/目标双检
+    //! - remove_node_modules 的 symlink 分支（误递归 = 删掉链接目标的内容）
+
+    use super::*;
+    use crate::workspace::{LocalWorkspaceResolver, ProjectContext};
+    use std::path::PathBuf;
+
+    struct Fixture {
+        _root: tempfile::TempDir,
+        resolver: LocalWorkspaceResolver,
+        config: Config,
+    }
+
+    fn fixture() -> Fixture {
+        let root = tempfile::tempdir().expect("tempdir");
+        let resolver =
+            LocalWorkspaceResolver::new(root.path().join("ws"), root.path().join("computer"));
+        let config = Config {
+            upload_project_dir: root.path().join("uploads"),
+            dist_target_dir: root.path().join("dist"),
+            log_base_dir: root.path().join("logs"),
+            init_project_dir: root.path().join("init"),
+            git_enabled: false,
+            ..Config::default()
+        };
+        Fixture {
+            _root: root,
+            resolver,
+            config,
+        }
+    }
+
+    fn ctx(id: &str) -> ProjectContext {
+        ProjectContext {
+            project_id: id.to_string(),
+            tenant_id: None,
+            space_id: None,
+            isolation_type: None,
+        }
+    }
+
+    /// FS-02 反例: LATEST 导出的 cpage_config 只能作为 zip 显式 entry, 不得把
+    /// 真实项目文件当临时文件（覆盖后删除）。修复前真实文件被改写并删除。
+    #[tokio::test]
+    async fn export_latest_config_entry_only_real_file_untouched() {
+        use std::io::Read;
+        let root = tempfile::tempdir().expect("tempdir");
+        let resolver =
+            LocalWorkspaceResolver::new(root.path().join("ws"), root.path().join("computer"));
+        let config = Config {
+            upload_project_dir: root.path().join("uploads"),
+            ..Config::default()
+        };
+        let project_dir = root.path().join("ws/p1");
+        fs::create_dir_all(&project_dir).await.expect("project dir");
+        fs::write(project_dir.join("index.html"), b"<html>")
+            .await
+            .expect("page");
+        fs::write(project_dir.join("cpage_config.json"), br#"{"user":true}"#)
+            .await
+            .expect("real config");
+
+        let export_cfg = serde_json::json!({"export": true});
+        let zip_path = export_project(
+            &resolver,
+            &config,
+            &ctx("p1"),
+            "3",
+            Some("LATEST"),
+            Some(&export_cfg),
+        )
+        .await
+        .expect("export");
+
+        let real = fs::read_to_string(project_dir.join("cpage_config.json"))
+            .await
+            .expect("real config must survive export");
+        assert_eq!(real, r#"{"user":true}"#);
+
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut z = zip::ZipArchive::new(file).unwrap();
+        let mut matches = 0;
+        for i in 0..z.len() {
+            let mut entry = z.by_index(i).unwrap();
+            if entry.name() == "cpage_config.json" {
+                matches += 1;
+                let mut buf = String::new();
+                Read::read_to_string(&mut entry, &mut buf).unwrap();
+                assert_eq!(buf, r#"{"export":true}"#);
+            }
+        }
+        assert_eq!(
+            matches, 1,
+            "zip must contain exactly one explicit cpage_config.json entry"
+        );
+        assert!(z.by_name("index.html").is_ok());
+    }
+
+    /// FS-02 反例（symlink 变体）: 已有 cpage_config.json 是外向链接时, 导出不得
+    /// 跟随链接改写外部目标。修复前 `fs::write` 跟随链接覆盖外部文件。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn export_latest_follows_no_outward_config_link() {
+        use std::io::Read;
+        let root = tempfile::tempdir().expect("tempdir");
+        let resolver =
+            LocalWorkspaceResolver::new(root.path().join("ws"), root.path().join("computer"));
+        let config = Config {
+            upload_project_dir: root.path().join("uploads"),
+            ..Config::default()
+        };
+        let project_dir = root.path().join("ws/p1");
+        fs::create_dir_all(&project_dir).await.expect("project dir");
+        fs::write(project_dir.join("index.html"), b"x")
+            .await
+            .expect("page");
+        let external = root.path().join("external-config.json");
+        fs::write(&external, b"external-original")
+            .await
+            .expect("external");
+        std::os::unix::fs::symlink(&external, project_dir.join("cpage_config.json")).expect("link");
+
+        let export_cfg = serde_json::json!({"export": true});
+        let zip_path = export_project(
+            &resolver,
+            &config,
+            &ctx("p1"),
+            "2",
+            Some("LATEST"),
+            Some(&export_cfg),
+        )
+        .await
+        .expect("export");
+
+        let external_now = fs::read_to_string(&external)
+            .await
+            .expect("external survives");
+        assert_eq!(
+            external_now, "external-original",
+            "outward link target must not be followed or rewritten"
+        );
+        let link_meta = fs::symlink_metadata(project_dir.join("cpage_config.json"))
+            .await
+            .expect("link kept in place");
+        assert!(link_meta.file_type().is_symlink());
+
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut z = zip::ZipArchive::new(file).unwrap();
+        let mut entry = z.by_name("cpage_config.json").expect("explicit entry");
+        let mut buf = String::new();
+        Read::read_to_string(&mut entry, &mut buf).unwrap();
+        assert_eq!(buf, r#"{"export":true}"#);
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_traversal_id_before_touching_bypass_dirs() {
+        let f = fixture();
+        // 三个旁路目录（delete 直接按 project_id join，不经 resolver）预置哨兵
+        let bypass_dirs = [
+            f.config.upload_project_dir.clone(),
+            f.config.dist_target_dir.clone(),
+            f.config.log_base_dir.clone(),
+        ];
+        for dir in &bypass_dirs {
+            fs::create_dir_all(dir).await.expect("建旁路目录");
+            fs::write(dir.join("sentinel.txt"), b"x")
+                .await
+                .expect("写哨兵");
+        }
+
+        let result = delete_project(&f.resolver, &f.config, &ctx("../evil")).await;
+
+        assert!(
+            result.is_err(),
+            "非法 project_id 必须在 resolve 阶段被拒（validation）"
+        );
+        for dir in &bypass_dirs {
+            assert!(
+                dir.join("sentinel.txt").exists(),
+                "旁路目录 {} 的哨兵必须原封不动——resolve 拒绝是 join 的前提",
+                dir.display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_non_whitelisted_template_with_validation_error() {
+        let f = fixture();
+        let err = create_project(&f.resolver, &f.config, &ctx("p1"), "angular")
+            .await
+            .map(|_: CreateResult| ())
+            .expect_err("模板白名单外必须拒绝");
+        assert!(
+            matches!(err, AppError::Validation(..)),
+            "模板白名单拒绝必须是 Validation 变体（前端按 error.type 分流）"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_duplicate_project_is_business_error() {
+        let f = fixture();
+        let ws = f._root.path().join("ws");
+        fs::create_dir_all(ws.join("dup"))
+            .await
+            .expect("预置已存在目录");
+
+        let err = create_project(&f.resolver, &f.config, &ctx("dup"), "react")
+            .await
+            .map(|_: CreateResult| ())
+            .expect_err("重名必须拒绝");
+        assert!(
+            matches!(err, AppError::Business(msg) if msg.contains("already exists")),
+            "重名必须是 Business 变体（与 Validation 的 400 同码不同 type）"
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_requires_existing_source_and_missing_target() {
+        let f = fixture();
+        let ws = f._root.path().join("ws");
+
+        // 源不存在 → Business
+        let err = copy_project(&f.resolver, &f.config, &ctx("nope"), &ctx("t1"))
+            .await
+            .map(|_: CopyResult| ())
+            .expect_err("源不存在必须拒绝");
+        assert!(
+            matches!(err, AppError::Business(msg) if msg.contains("Source project does not exist")),
+            "源不存在必须是 Business 变体"
+        );
+
+        // 源在 + 目标在 → Business
+        fs::create_dir_all(ws.join("src")).await.expect("建源目录");
+        fs::create_dir_all(ws.join("tgt"))
+            .await
+            .expect("建目标目录");
+        let err = copy_project(&f.resolver, &f.config, &ctx("src"), &ctx("tgt"))
+            .await
+            .map(|_: CopyResult| ())
+            .expect_err("目标已存在必须拒绝");
+        assert!(
+            matches!(err, AppError::Business(msg) if msg.contains("already exists")),
+            "目标已存在必须是 Business 变体"
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_preserves_agent_data_and_lockfiles_but_skips_generated_dirs() {
+        let f = fixture();
+        let source = f._root.path().join("ws/source");
+        for directory in [
+            ".agents/skills/review",
+            ".agents/skills/review/node_modules/cache",
+            ".attachments",
+            ".codex",
+            ".grok",
+            ".opencode",
+            ".pi",
+            ".git/objects",
+            "node_modules/dependency",
+            "dist/assets",
+            "packages/frontend",
+        ] {
+            fs::create_dir_all(source.join(directory))
+                .await
+                .expect("create source fixture directory");
+        }
+        for (path, contents) in [
+            (".agents/skills/review/SKILL.md", "skill"),
+            (".attachments/design.txt", "attachment"),
+            (".codex/instructions.md", "codex instructions"),
+            (".grok/config.md", "grok config"),
+            (".opencode/agents.md", "opencode agents"),
+            (".pi/settings.json", "pi settings"),
+            ("pnpm-lock.yaml", "root lockfile"),
+            ("packages/frontend/package-lock.json", "nested lockfile"),
+            (
+                ".agents/skills/review/node_modules/cache/index.js",
+                "generated",
+            ),
+            (".git/HEAD", "git metadata"),
+            ("node_modules/dependency/index.js", "dependency"),
+            ("dist/assets/app.js", "built output"),
+        ] {
+            fs::write(source.join(path), contents)
+                .await
+                .expect("write source fixture file");
+        }
+
+        copy_project(&f.resolver, &f.config, &ctx("source"), &ctx("target"))
+            .await
+            .expect("copy project");
+
+        let target = f._root.path().join("ws/target");
+        for path in [
+            ".agents/skills/review/SKILL.md",
+            ".attachments/design.txt",
+            ".codex/instructions.md",
+            ".grok/config.md",
+            ".opencode/agents.md",
+            ".pi/settings.json",
+            "pnpm-lock.yaml",
+            "packages/frontend/package-lock.json",
+        ] {
+            assert!(target.join(path).is_file(), "expected copied file: {path}");
+        }
+        for path in [
+            ".git",
+            "node_modules",
+            "dist",
+            ".agents/skills/review/node_modules",
+        ] {
+            assert!(
+                !target.join(path).exists(),
+                "generated path should be skipped: {path}"
+            );
+        }
+    }
+
+    /// 上传 zip 夹具：tempdir 内一个源目录 + pack 成 zip
+    async fn make_zip(root: &Path, name: &str) -> PathBuf {
+        let src = root.join(format!("{name}-src"));
+        fs::create_dir_all(&src).await.expect("建 zip 源目录");
+        fs::write(src.join("index.txt"), format!("content of {name}"))
+            .await
+            .expect("写 zip 源文件");
+        let zip = root.join(format!("{name}.zip"));
+        crate::service::zip::pack_dir(src, zip.clone(), vec![], vec![])
+            .await
+            .expect("打包 zip");
+        zip
+    }
+
+    #[tokio::test]
+    async fn upload_v0_skips_backup_and_v2_backs_up_previous_version_zip() {
+        let f = fixture();
+        let ws = f._root.path().join("ws");
+        let proj = ws.join("app");
+        fs::create_dir_all(&proj).await.expect("建项目目录");
+        fs::write(proj.join("existing.txt"), "old")
+            .await
+            .expect("预置非空项目");
+
+        // v0 上传：version >= 1 不满足 → 无备份 zip
+        let zip0 = make_zip(f._root.path(), "up0").await;
+        upload_project(&f.resolver, &f.config, &ctx("app"), "0", &zip0)
+            .await
+            .expect("v0 上传应成功");
+        let backup_dir = f.config.upload_project_dir.join("app");
+        assert!(
+            !backup_dir.join("app-v0.zip").exists(),
+            "v0 上传不得产生任何版本备份 zip"
+        );
+
+        // 重建非空项目后 v2 上传：备份的是 v1（off-by-one 语义——备份前一号而非当前号）
+        fs::write(proj.join("regen.txt"), "old2")
+            .await
+            .expect("项目被 v0 换入后重置非空");
+        let zip2 = make_zip(f._root.path(), "up2").await;
+        upload_project(&f.resolver, &f.config, &ctx("app"), "2", &zip2)
+            .await
+            .expect("v2 上传应成功");
+        assert!(
+            backup_dir.join("app-v1.zip").exists(),
+            "v2 上传必须生成 v1 备份（备份前一号而非当前号）"
+        );
+        assert!(
+            !backup_dir.join("app-v2.zip").exists(),
+            "上传 zip 本体不得存为版本 zip"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_with_git_enabled_skips_zip_backup() {
+        let f = fixture();
+        let mut config = {
+            // 独立 config：git_enabled=true（zip 备份由 git 历史替代）
+            let mut c = f.config.clone();
+            c.git_enabled = true;
+            c
+        };
+        config.upload_project_dir = f._root.path().join("uploads-git");
+        let proj = f._root.path().join("ws").join("app");
+        fs::create_dir_all(&proj).await.expect("建项目目录");
+        fs::write(proj.join("existing.txt"), "old")
+            .await
+            .expect("预置非空项目");
+
+        let zip = make_zip(f._root.path(), "upg").await;
+        upload_project(&f.resolver, &config, &ctx("app"), "3", &zip)
+            .await
+            .expect("git 模式上传应成功");
+
+        assert!(
+            !config
+                .upload_project_dir
+                .join("app")
+                .join("app-v2.zip")
+                .exists(),
+            "git_enabled 模式不得产生 zip 备份（git 历史替代）"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_keeps_existing_prev_zip_untouched() {
+        let f = fixture();
+        let proj = f._root.path().join("ws").join("app");
+        fs::create_dir_all(&proj).await.expect("建项目目录");
+        fs::write(proj.join("existing.txt"), "old")
+            .await
+            .expect("预置非空项目");
+
+        // 预置哨兵 v1 zip（内容可鉴别）
+        let backup_dir = f.config.upload_project_dir.join("app");
+        fs::create_dir_all(&backup_dir).await.expect("建备份目录");
+        fs::write(backup_dir.join("app-v1.zip"), b"sentinel-bytes")
+            .await
+            .expect("预置哨兵备份");
+
+        let zip = make_zip(f._root.path(), "upx").await;
+        upload_project(&f.resolver, &f.config, &ctx("app"), "2", &zip)
+            .await
+            .expect("已存在备份时上传应成功");
+
+        let content = fs::read(backup_dir.join("app-v1.zip"))
+            .await
+            .expect("哨兵 zip 应仍存在");
+        assert_eq!(
+            content, b"sentinel-bytes",
+            "prev zip 已存在时必须跳过重打（幂等）"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_node_modules_unlinks_symlink_without_recursing_into_target() {
+        let f = fixture();
+        let external = f._root.path().join("external_store");
+        fs::create_dir_all(&external).await.expect("建外部目录");
+        fs::write(external.join("keep.txt"), b"payload")
+            .await
+            .expect("写外部内容");
+
+        let project = f._root.path().join("proj");
+        fs::create_dir_all(&project).await.expect("建项目目录");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&external, project.join("node_modules"))
+                .expect("造 node_modules symlink");
+        }
+
+        remove_node_modules(&project).await;
+
+        assert!(
+            !project.join("node_modules").exists(),
+            "symlink 本体应被移除"
+        );
+        assert!(
+            external.join("keep.txt").exists(),
+            "symlink 指向的外部内容绝不能被递归删除"
+        );
+    }
 }

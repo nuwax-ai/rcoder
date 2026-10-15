@@ -1,0 +1,26 @@
+[package]
+name = "rcoder-e2e"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+description = "黑盒 e2e 集成测试：/computer/chat + SSE 进度流（compose/K8s 双环境门控；JSONL 报告供 agent 追溯）"
+
+[dependencies]
+rcoder-storage = { workspace = true, features = ["userapp-turso"] }
+async-trait = { workspace = true }
+shared_types = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+futures-util = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+zip = { workspace = true, default-features = false, features = ["deflate"] }
+# 终端 ws 场景（ttyd 协议）：workspace 级 0.30，与 agent_runner ws_terminal 同款
+tokio-tungstenite = { workspace = true }
+
+[lints]
+workspace = true

@@ -14,7 +14,10 @@ use anyhow::Result;
 use shared_types::{ProjectAndAgentInfo, SessionEntry};
 use tracing::{debug, error, info, warn};
 
-use super::{AcpSessionManager, AgentWorker, SessionHandles, WorkerRequest, WorkerResponse};
+use super::{
+    AcpSessionManager, AgentWorker, SessionCreationConfig, SessionHandles, WorkerRequest,
+    WorkerResponse,
+};
 use crate::launcher::convert_context_servers;
 use crate::traits::{AgentStartConfig, SessionNotifier, SessionRegistry};
 
@@ -138,7 +141,7 @@ where
         debug!("MCP servers: {}", mcp_servers.len());
 
         // 构建 AgentStartConfig 并传递 MCP 服务器、service_type
-        let mut start_config = AgentStartConfig::new(request.prompt_message.service_type.clone())
+        let mut start_config = AgentStartConfig::new(request.prompt_message.service_type)
             .with_system_prompt(system_prompt)
             .with_mcp_servers(mcp_servers)
             .with_user_id(request.prompt_message.user_id.clone())
@@ -182,7 +185,9 @@ where
         // - Agent 层面统一处理，无需本地检查文件
         // - 与 Agent 行为保持一致
         // - 自动降级（有会话就恢复，没有就创建）
-        if let Some(ref session_id) = request.prompt_message.session_id {
+        if !request.prompt_message.force_new_session
+            && let Some(ref session_id) = request.prompt_message.session_id
+        {
             info!("Setting resume_session_id: {}", session_id);
             start_config = start_config.with_resume_session_id(session_id.clone());
         }
@@ -191,54 +196,87 @@ where
         let mut prompt_message = request.prompt_message.clone();
         prompt_message.content = final_user_prompt;
 
-        // 5. 获取或创建会话 (SACP 版本 - 不需要 client 和 shared_api_key_manager)
-        let (session_entry, is_new) = self
-            .session_manager
-            .get_or_create_session(
-                &project_id,
-                normalized_path,
-                prompt_message.session_id.clone(),
-                request.model_provider.clone(),
-                start_config.clone(),
-                request.service_uuid.clone(),
-            )
-            .await
-            .map_err(|e| {
-                error!("Failed to create session: {:?}", e);
-                e
-            })?;
-
-        // 使用 SessionEntry trait 方法访问会话信息
-        info!(
-            "Session ready, session_id: {}, is_new: {}",
-            session_entry.session_id(),
-            is_new
+        // 5-7. 获取/创建会话 → 构建 Prompt → 发送。
+        //
+        // 发送失败且为通道死亡（mpsc SendError）时重走一次完整路径：
+        // mpsc send 是 await（背压等待），等待期间连接也可能死亡——
+        // 第三阶段复检 + entry 直传已消除大部分窗口，这里是最后防线，
+        // 重走的 get_or_create_session 会检测死通道触发重建。
+        let mut session_entry = None;
+        let mut is_new = false;
+        // 投递前的两次创建共用绝对 deadline，死通道重试不能重新获得整段预算。
+        start_config.session_create_deadline = Some(
+            tokio::time::Instant::now()
+                + std::time::Duration::from_secs(self.acp_session_create_timeout_secs),
         );
+        for attempt in 1..=2 {
+            let (entry, new) = self
+                .session_manager
+                .get_or_create_session(
+                    &project_id,
+                    normalized_path.clone(),
+                    prompt_message.session_id.clone(),
+                    SessionCreationConfig {
+                        model_provider: request.model_provider.clone(),
+                        start_config: start_config.clone(),
+                        service_uuid: request.service_uuid.clone(),
+                        force_new_session: prompt_message.force_new_session,
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    error!("Failed to create session: {:?}", e);
+                    e
+                })?;
 
-        // 6. 构建 Prompt 请求
-        let prompt_request = if let Some(ref attachment_blocks) = request.attachment_blocks {
-            debug!("Built Prompt request with attachments");
-            AcpSessionManager::<N, R>::build_prompt_request_with_attachments(
-                &prompt_message,
-                session_entry.session_id().clone(),
-                attachment_blocks.clone(),
-            )?
-        } else {
-            debug!("Built text Prompt request");
-            AcpSessionManager::<N, R>::build_text_prompt_request(
-                &prompt_message,
-                session_entry.session_id().clone(),
-            )?
+            // 使用 SessionEntry trait 方法访问会话信息
+            info!(
+                "Session ready (attempt {}), session_id: {}, is_new: {}",
+                attempt,
+                entry.session_id(),
+                new
+            );
+
+            // 构建 Prompt 请求（session_id 取自本次裁决的 entry，与通道一致）
+            let prompt_request = if let Some(ref attachment_blocks) = request.attachment_blocks {
+                debug!("Built Prompt request with attachments");
+                AcpSessionManager::<N, R>::build_prompt_request_with_attachments(
+                    &prompt_message,
+                    entry.session_id().clone(),
+                    attachment_blocks.clone(),
+                )?
+            } else {
+                debug!("Built text Prompt request");
+                AcpSessionManager::<N, R>::build_text_prompt_request(
+                    &prompt_message,
+                    entry.session_id().clone(),
+                )?
+            };
+
+            // send 的失败原因唯一（通道死亡），Err 类型即重试信号
+            if let Err(send_err) =
+                super::session_manager::send_prompt_to_entry(&entry, prompt_request).await
+            {
+                if attempt == 1 {
+                    warn!(
+                        "Prompt channel died during send ({}), retrying with session rebuild: project_id={}",
+                        send_err, project_id
+                    );
+                    continue;
+                }
+                error!("send Prompt requestfailed: {}", send_err);
+                return Err(anyhow::Error::new(send_err).context("Failed to send Prompt request"));
+            }
+            session_entry = Some(entry);
+            is_new = new;
+            break;
+        }
+        let Some(session_entry) = session_entry else {
+            return Err(anyhow::anyhow!(
+                "Prompt send failed after retry: project_id={}",
+                project_id
+            ));
         };
-
-        // 7. 发送 Prompt（异步，支持背压）
-        self.session_manager
-            .send_prompt_request(&project_id, prompt_request)
-            .await
-            .map_err(|e| {
-                error!("send Prompt requestfailed: {:?}", e);
-                e
-            })?;
 
         info!("Prompt request already sent, project_id: {}", project_id);
 
@@ -248,7 +286,7 @@ where
                 project_id,
                 session_entry.session_id().to_string(),
                 Some(request.request_id().to_string()),
-                prompt_message.service_type.clone(),
+                prompt_message.service_type,
                 SessionHandles {
                     prompt_tx: session_entry.prompt_tx().clone(),
                     cancel_tx: session_entry.cancel_tx().clone(),
@@ -260,7 +298,7 @@ where
                 project_id,
                 session_entry.session_id().to_string(),
                 Some(request.request_id().to_string()),
-                prompt_message.service_type.clone(),
+                prompt_message.service_type,
             ))
         }
     }

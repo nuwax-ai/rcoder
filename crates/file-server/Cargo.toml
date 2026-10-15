@@ -26,14 +26,12 @@ kubernetes = []
 name = "file_server"
 path = "src/lib.rs"
 
-[[bin]]
-name = "file-server"
-path = "src/main.rs"
 
 [dependencies]
 # 共享类型 (WORKSPACE_ROOT / COMPUTER_WORKSPACE_ROOT 常量)
 shared_types = { workspace = true }
 process_utils = { workspace = true }
+runtime-supervisor = { workspace = true }
 
 # Web 框架
 axum = { workspace = true }
@@ -45,6 +43,9 @@ utoipa-swagger-ui = { workspace = true }
 
 # 异步运行时
 tokio = { workspace = true, features = ["full"] }
+
+# 文件系统工具 (fs_browser 的 home 目录探测; workspace 根依赖, agent_abstraction 同款先例)
+dirs = { workspace = true }
 
 # 日志
 tracing = { workspace = true }
@@ -70,6 +71,13 @@ async-trait = { workspace = true }
 # 时间 (错误响应 timestamp)
 chrono = { workspace = true }
 
+# app-files 转发族：容器内流式下载 + zip/tar.gz 解压（与 app_manager 原实现同源）
+download_utils = { workspace = true }
+# 下载取消令牌（download_to_file 签名要求）
+tokio-util = { workspace = true }
+# 运行态状态根解析契约（R09：与 app-cli 同一解析规则）
+runtime-state-layout = { path = "../runtime-state-layout" }
+
 # 编码检测 / content-type 推断
 encoding_rs = { workspace = true }
 mime_guess = { workspace = true }
@@ -82,6 +90,9 @@ percent-encoding = { workspace = true }
 
 # 文件系统无关的词法路径规范化（消除手写 Component 归约）
 path-clean = { workspace = true }
+
+# 并行目录遍历 (work-stealing 线程池), 用于 search-files 的无索引实时搜索。
+dua-core = { workspace = true }
 
 # Zip 解压/打包 (模板/upload/export/skills)
 zip = { workspace = true }
@@ -113,6 +124,18 @@ shlex = { workspace = true }
 
 # 安全临时文件/目录（Hook 配置原子替换与 staging 生命周期由 RAII 管理）
 tempfile = { workspace = true }
+rustix = { workspace = true }
 
 # 异步流构造 (UserApp build 进度 SSE: async_stream::stream!)
 async-stream = { workspace = true }
+
+# 相对路径计算 (agent-store 软链: pathdiff::diff_paths)
+pathdiff = { workspace = true }
+
+# Windows 目录 junction (无特权软链, 仅 Windows 编译时引入)
+[target.'cfg(windows)'.dependencies]
+junction = "2.0"
+winapi-util = "0.1.11"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

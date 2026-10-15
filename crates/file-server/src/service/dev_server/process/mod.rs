@@ -1,0 +1,884 @@
+//! Dev server 进程 spawn/kill/探活 (对齐 nuwax `processManager.js`)。
+//!
+//! 拆分: [`mod@self`] (spawn + run_command + 进程发现/探活) / `signal` (跨平台
+//! 进程组信号) / `log_pipe` (stdout/stderr 日志管道 + vite 噪音过滤)。
+//!
+//! 关键点 (对齐 nuwax):
+//! - `exec` 前缀让 child.pid == vite/next 本体 pid (非 sh wrapper)
+//! - `process_group(0)` 新进程组, kill 时 `kill(-pid)` 杀整组
+//! - env 最小化 (PATH + HOME + NODE_ENV=development + extra), env_clear 后显式赋值
+//! - detached: 丢弃 Child 句柄 (kill_on_drop=false), 进程独立存活, 靠 pid 杀
+
+use std::path::Path;
+use std::time::Duration;
+
+use chrono::Local;
+use tokio::process::{Child, ChildStderr, ChildStdout, Command};
+use tokio::task::JoinHandle;
+
+use crate::error::{AppError, AppResult};
+
+mod log_pipe;
+mod signal;
+
+pub use signal::*;
+
+use log_pipe::pipe_stream;
+
+/// dev server 启动参数 (program + args + env_extra)。
+pub struct DevArgs {
+    pub program: &'static str,
+    pub args: Vec<String>,
+    pub env_extra: Vec<(String, String)>,
+}
+
+/// 构造 dev server 启动参数 (vite/next)。用 arg 数组而非 shell 字符串拼接, 避免注入
+/// (base_path 来自用户, 经 sh -c 拼接会注入)。
+///
+/// HMR 机制 (调研 nuwax + vite 5.4 源码结论): 不注入 server.hmr, 靠 vite 默认行为 +
+/// 反代透传 ws。vite HMR 客户端从 `@vite/client` 脚本 origin (= 反代 origin) 自动推出 ws
+/// URL → ws 自然连回反代; ws 监听路径 = `--base` 本身。故 **base 必须等于完整代理路径**
+/// (带尾 `/`, 如 `/proxy/{port}/foo/`), 否则资源/ws 全 404。port 由本进程分配, 故 base
+/// 为空时默认 `/proxy/{port}/`, 让 HMR 开箱即用。
+pub fn build_dev_args(dev_script: &str, port: u16, base_path: Option<&str>) -> AppResult<DevArgs> {
+    let lower = dev_script.to_ascii_lowercase();
+    // base 为空 → 默认完整代理路径 /proxy/{port}/ (HMR 依赖)
+    let base = match base_path.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(b) => normalize_base_path(b),
+        None => format!("/proxy/{port}/"),
+    };
+    let mut env_extra: Vec<(String, String)> = Vec::new();
+    let port_str = port.to_string();
+    let args: Vec<String> = if lower.contains("vite") {
+        vec![
+            "vite".into(),
+            "--port".into(),
+            port_str,
+            "--strictPort".into(),
+            "--host".into(),
+            "0.0.0.0".into(),
+            // 抑制 ANSI 清屏转义码 (否则污染日志管道), 对齐 vite-rs
+            "--clearScreen".into(),
+            "false".into(),
+            // base = 完整代理路径 (vite 资源前缀 + HMR ws 路径, 二者同源)
+            "--base".into(),
+            base,
+        ]
+    } else if lower.contains("next") {
+        env_extra.push(("NEXT_PUBLIC_BASE_PATH".into(), base.clone()));
+        env_extra.push(("BASE_PATH".into(), base));
+        vec!["next".into(), "dev".into(), "-p".into(), port_str]
+    } else {
+        return Err(AppError::business(format!(
+            "unsupported dev script (must contain vite or next): {dev_script}"
+        )));
+    };
+    Ok(DevArgs {
+        program: "npx",
+        args,
+        env_extra,
+    })
+}
+
+/// 规范化 basePath 为 `/x/` 形式 (对齐 nuwax)。
+pub(super) fn normalize_base_path(b: &str) -> String {
+    let b = b.trim();
+    if b.is_empty() {
+        "/".to_string()
+    } else if let Some(stripped) = b.strip_prefix('/') {
+        let s = stripped.trim_end_matches('/');
+        if s.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{s}/")
+        }
+    } else {
+        format!("/{}/", b.trim_end_matches('/'))
+    }
+}
+
+/// 数据库凭据族透传白名单：用户服务连 app 数据库所需。生产形态服务经
+/// supervisord/run-service 继承容器全 env 恒可拿到这组变量；dev 编排若被
+/// env_clear 卡断，服务回落自身代码内默认凭据（如 user=app）→ 认证失败
+/// → readiness 探活超时 → dev 任务误报「服务启动失败」。
+const DB_CREDENTIAL_ENV_KEYS: [&str; 9] = [
+    "POSTGRES_USER",
+    "POSTGRES_PASSWORD",
+    "POSTGRES_DB",
+    "PGHOST",
+    "PGPORT",
+    "PGUSER",
+    "PGPASSWORD",
+    "PGDATABASE",
+    "DATABASE_URL",
+];
+
+/// 容器执行域族透传白名单：app-cli 编排器的容器身份判定所需（跨容器
+/// 前代次分类、Pod UID 域章解析、pingap 版本门禁）。这些变量是容器级
+/// 事实（子进程与父进程同容器），不存在按项目身份取舍的问题——缺
+/// `RCODER_EXECUTION_DOMAIN` 时子编排器把带域章的旧 Running 代次误判为
+/// 本容器残留，落入 cleanup_unconfirmed 围栏（app 11 事故根因，recovery
+/// v2 plan §6.1 过渡桥）。
+const EXECUTION_DOMAIN_ENV_KEYS: [&str; 4] = [
+    "RCODER_EXECUTION_DOMAIN",
+    "RCODER_PHYSICAL_POD_UID",
+    "RCODER_PINGAP_VERSION",
+    "RCODER_PINGAP_COMMIT",
+];
+
+/// 最小化 env (对齐 nuwax: PATH + NODE_ENV=development + extra; 补 HOME 供 pnpm cache;
+/// 透传数据库凭据族——dev 形态与生产形态的取数行为对齐)。
+///
+/// 同键冲突 last-wins：`extra` 追加在透传之后，可覆盖白名单透传值——
+/// dev start/restart 请求的 `pg` 凭据（POSTGRES_USER/POSTGRES_PASSWORD）
+/// 经此通道覆盖容器 env 默认（save-db-credential 改密后的新值）。
+fn minimal_env(extra: &[(String, String)]) -> Vec<(String, String)> {
+    minimal_env_with_source(extra, |k| std::env::var(k).ok())
+}
+
+/// [`minimal_env`] 的可测试形态：透传源经参数注入（测试不依赖/不修改全局
+/// env——Rust 2024 set_var 为 unsafe，项目禁用）。
+fn minimal_env_with_source(
+    extra: &[(String, String)],
+    passthrough: impl Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    /// 追加键值，同键覆盖（last-wins）：保证 extra 覆盖透传值的契约显式成立，
+    /// 不依赖 `Command::envs` 对重复键的顺序语义。
+    fn push_override(env: &mut Vec<(String, String)>, k: &str, v: String) {
+        if let Some(slot) = env.iter_mut().find(|(ek, _)| ek == k) {
+            slot.1 = v;
+        } else {
+            env.push((k.to_string(), v));
+        }
+    }
+
+    let mut env: Vec<(String, String)> = Vec::new();
+    if let Some(p) = passthrough("PATH") {
+        push_override(&mut env, "PATH", p);
+    }
+    if let Some(h) = passthrough("HOME") {
+        push_override(&mut env, "HOME", h);
+    }
+    for key in DB_CREDENTIAL_ENV_KEYS {
+        if let Some(v) = passthrough(key) {
+            push_override(&mut env, key, v);
+        }
+    }
+    for key in EXECUTION_DOMAIN_ENV_KEYS {
+        if let Some(v) = passthrough(key) {
+            push_override(&mut env, key, v);
+        }
+    }
+    push_override(&mut env, "NODE_ENV", "development".into());
+    push_override(&mut env, "ROLLUP_WASM", "1".into());
+    push_override(&mut env, "ROLLUP_DISABLE_NATIVE", "1".into());
+    for (k, v) in extra {
+        push_override(&mut env, k, v.clone());
+    }
+    env
+}
+
+/// spawn detached dev server (运维专用 override, sh -c 整条命令)。
+/// 仅 `DEV_SERVER_OVERRIDE_CMD` (部署时运维设置, 非外部用户输入) 走此路径,
+/// 故 shell 拼接无注入风险。用户输入路径必须走 [`spawn_dev`] (arg 数组)。
+pub fn spawn_override_shell(
+    full_command: &str,
+    cwd: &Path,
+) -> AppResult<(Child, Option<ChildStdout>, Option<ChildStderr>)> {
+    // N08：不再硬编码 sh——Unix sh -c / Windows cmd /C（运维 override 命令
+    // 按目标平台 shell 语法书写；Windows 无 sh）
+    #[cfg(unix)]
+    let mut cmd = {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(full_command);
+        cmd
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C").arg(full_command);
+        cmd
+    };
+    cmd.current_dir(cwd);
+    cmd.env_clear();
+    cmd.envs(minimal_env(&[]));
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd.spawn().map_err(|e| {
+        AppError::system(format!(
+            "spawn override dev server failed (cwd={}): {e}",
+            cwd.display()
+        ))
+    })?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    Ok((child, stdout, stderr))
+}
+
+/// spawn detached dev server (arg 数组, 无 shell; 进程组 + 丢弃 Child 句柄)。
+/// 返回 (child, stdout, stderr); 调用方负责取走 stdout/stderr 起日志管道。
+pub fn spawn_dev(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    env_extra: &[(String, String)],
+) -> AppResult<(Child, Option<ChildStdout>, Option<ChildStderr>)> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    cmd.current_dir(cwd);
+    cmd.env_clear();
+    cmd.envs(minimal_env(env_extra));
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    // 新进程组 (unix): child.pid == pgid, 后续 kill(-pid) 杀整组 (含 vite 子进程)
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd.spawn().map_err(|e| {
+        AppError::system(format!(
+            "spawn dev server failed (program={program}, cwd={}): {e}",
+            cwd.display()
+        ))
+    })?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    Ok((child, stdout, stderr))
+}
+
+/// 构建输出行回调（原始行、时间戳前缀之前）。Arc 所有权式：需跨入日志管道
+/// spawn task（'static）。供上层实时推送 SSE `log` 事件。
+pub type OnLineCallback = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+/// 仅在实际进程树退出、命令回执持久化为 Quiescent 后发出的完成分类。
+/// 取消、等待结果未知、清理或持久化失败不提供可放行的完成证据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandCompletion {
+    Exited {
+        code: Option<i32>,
+        output_complete: bool,
+    },
+    TimedOut,
+    NotStarted,
+}
+
+/// 一次性命令的过程回调集合（pid 回写供 cancel；行回调供 SSE 实时日志）。
+#[derive(Default)]
+pub struct CommandObservers<'a> {
+    /// Spawn PID callback for diagnostics; cancellation uses the scoped token.
+    pub on_pid: Option<&'a (dyn Fn(u32) + Send + Sync)>,
+    /// 每行输出回调（见 [`OnLineCallback`]）；None 不回调。
+    pub on_line: Option<OnLineCallback>,
+    /// 精确完成分类；无回调表示原副作用仍需保护，而非普通工具失败。
+    pub on_completed: Option<&'a (dyn Fn(CommandCompletion) + Send + Sync)>,
+}
+
+/// 运行一次性非 pnpm-install 命令 (build/preprocess), arg 数组 + stdout/stderr 管道到日志, 阻塞等待。
+/// 用 current_dir 替代 `cd ... &&`, arg 数组替代 shell 拼接; 错误为类型化 io::Error/退出码。
+///
+/// `observers`: 过程回调集合（pid / 行回调，均可 None）。
+pub async fn run_command_to_log(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    main_log: &Path,
+    temp_log: &Path,
+    timeout_secs: u64,
+    observers: CommandObservers<'_>,
+) -> AppResult<()> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    cmd.current_dir(cwd);
+    // 一次性 Node 命令继承 PATH/HOME，仅删会改变依赖/脚本行为的环境变量。
+    if let Ok(p) = std::env::var("PATH") {
+        cmd.env("PATH", p);
+    }
+    if let Ok(h) = std::env::var("HOME") {
+        cmd.env("HOME", h);
+    }
+    cmd.env_remove("CI");
+    cmd.env_remove("NPM_CONFIG_PRODUCTION");
+    cmd.env("NODE_ENV", "development");
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let context = process_utils::command_context::CommandContext::current();
+    let cancellation = context
+        .as_ref()
+        .map(|c| c.cancellation.clone())
+        .unwrap_or_default();
+    if cancellation.is_cancelled() {
+        return Err(AppError::business("command cancelled before spawn"));
+    }
+    if crate::service::build_manager::BuildGuard::current()
+        .is_some_and(|guard| guard.cleanup_pending())
+    {
+        return Err(AppError::process(
+            "previous command process-tree cleanup is still pending",
+        ));
+    }
+    let deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(timeout_secs))
+        .ok_or_else(|| AppError::validation("command timeout exceeds the clock range"))?;
+    let record = process_utils::command_context::CommandRecord::prepare()
+        .map_err(|e| AppError::system(format!("persist command intent: {e}")))?;
+    let (mut child, spawn_error) = match process_utils::guardian::spawn_owned_checked_until(
+        cmd,
+        record.as_ref(),
+        true,
+        deadline,
+    )
+    .await
+    {
+        Ok(child) => (child, None),
+        Err(failure) => {
+            let unstarted_tool = context
+                .as_ref()
+                .is_none_or(|context| context.journal_root.is_none())
+                && process_utils::command_authority::current_root().is_none()
+                && failure
+                    .source
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| {
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                        )
+                    });
+            let error = AppError::system(format!(
+                "spawn command failed (program={program}, cwd={}): {:#}",
+                cwd.display(),
+                failure.source
+            ));
+            match failure.child {
+                Some(child) => (child, Some(error)),
+                None => {
+                    // Checked spawn proves no OS Child was started. A failed
+                    // durable acknowledgement still denies environment pass-through.
+                    if let Some(record) = &record {
+                        record
+                            .quiescent()
+                            .map_err(|e| AppError::system(format!("persist spawn failure: {e}")))?;
+                    }
+                    if unstarted_tool
+                        && !cancellation.is_cancelled()
+                        && let Some(callback) = observers.on_completed
+                    {
+                        callback(CommandCompletion::NotStarted);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    };
+    if spawn_error.is_none()
+        && let Some(receipt) = &record
+        && let Err(error) = receipt.running(child.id())
+    {
+        crate::service::build_manager::BuildGuard::retain_command_cleanup(child, record);
+        return Err(AppError::system(format!("persist owned child: {error}")));
+    }
+    // PID is diagnostic only; cancellation reaches the retained child owner.
+    if let Some(cb) = observers.on_pid
+        && let Some(pid) = child.id()
+    {
+        cb(pid);
+    }
+    let stdout = child.take_stdout();
+    let stderr = child.take_stderr();
+    let main = main_log.to_path_buf();
+    let temp = temp_log.to_path_buf();
+    // 收集日志管道 JoinHandle:child.wait() 后 drain 尾部日志,避免主流程在日志未写完时返回(#17)。
+    let stdout_handle = stdout.map(|out| {
+        let main = main.clone();
+        let temp = temp.clone();
+        let on_line = observers.on_line.clone();
+        tokio::spawn(async move { pipe_stream(out, main, temp, on_line).await })
+    });
+    let stderr_handle = stderr.map(|err| {
+        let main = main.clone();
+        let temp = temp.clone();
+        let on_line = observers.on_line.clone();
+        tokio::spawn(async move { pipe_stream(err, main, temp, on_line).await })
+    });
+    let (result, completion) = if let Some(error) = spawn_error {
+        (Err(error), None)
+    } else {
+        tokio::select! {
+            result = tokio::time::timeout_at(deadline, child.wait_root()) => {
+                match result {
+                    Ok(Ok(status)) => {
+                        let completion = Some(CommandCompletion::Exited { code: status.code(), output_complete: false });
+                        let result = if status.success() { Ok(()) } else { Err(AppError::system(format!("command exited non-zero: {status}"))) };
+                        (result, completion)
+                    }
+                    Ok(Err(error)) => (Err(AppError::system(format!("command wait failed: {error}"))), None),
+                    Err(_) => (Err(AppError::system(format!("command timed out after {timeout_secs}s"))), Some(CommandCompletion::TimedOut)),
+                }
+            }
+            () = cancellation.cancelled() => (Err(AppError::business("owned command cancelled")), None),
+        }
+    };
+    // Root exit alone cannot release the workspace while descendants still run.
+    let cleanup = child.stop(Duration::from_secs(1)).await;
+    let mut confirmed = false;
+    let outcome = if matches!(
+        cleanup,
+        process_utils::managed_tree::StopOutcome::Unconfirmed
+    ) {
+        crate::service::build_manager::BuildGuard::retain_command_cleanup(child, record);
+        Err(AppError::system(
+            "owned command process-tree cleanup unconfirmed",
+        ))
+    } else if let Some(record) = record {
+        match record.quiescent() {
+            Ok(()) => {
+                confirmed = true;
+                result
+            }
+            Err(error) => {
+                process_utils::command_context::retain_cleanup(None, Some(record));
+                Err(AppError::system(format!(
+                    "persist command cleanup: {error}"
+                )))
+            }
+        }
+    } else {
+        confirmed = true;
+        result
+    };
+
+    // 等日志管道 drain(超时放弃,不阻塞返回;尾部日志可能截断但会告警)。
+    let output_complete = drain_log_pipes(stdout_handle, stderr_handle).await;
+    if confirmed
+        && !cancellation.is_cancelled()
+        && let Some(callback) = observers.on_completed
+        && let Some(completion) = completion
+    {
+        let completion = match completion {
+            CommandCompletion::Exited { code, .. } => CommandCompletion::Exited {
+                code,
+                output_complete,
+            },
+            other => other,
+        };
+        callback(completion);
+    }
+
+    // 失败时把本次运行输出尾部嵌入错误信息——只报退出码的笼统错误
+    // （"command exited non-zero: exit status: 1"）无法定位是哪条命令、
+    // 因何而败；temp_log 仅含本次运行输出（stdout+stderr 双写），读尾部
+    // 即真实报错现场（有界读取防大日志）。
+    match outcome {
+        Err(e) => Err(append_run_log_tail(e, temp_log).await),
+        outcome => outcome,
+    }
+}
+
+/// 失败错误附加本次运行日志尾部（尾部 16KB 内取最后 30 行；读失败静默返回
+/// 原错误——诊断增强不改变错误本体）。
+async fn append_run_log_tail(err: AppError, temp_log: &Path) -> AppError {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    const TAIL_BYTES: u64 = 16 * 1024;
+    const TAIL_LINES: usize = 30;
+
+    let Ok(meta) = tokio::fs::metadata(temp_log).await else {
+        return err;
+    };
+    let start = meta.len().saturating_sub(TAIL_BYTES);
+    let Ok(mut file) = tokio::fs::File::open(temp_log).await else {
+        return err;
+    };
+    if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        return err;
+    }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).await.is_err() {
+        return err;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<&str> = text.lines().collect();
+    // 非零偏移=窗口起点可能落在行中间，首行是残行——丢弃防半行误导排查
+    if start > 0 && lines.len() > 1 {
+        lines.remove(0);
+    }
+    let take = lines.len().saturating_sub(TAIL_LINES);
+    lines.drain(..take);
+    if lines.is_empty() {
+        return err;
+    }
+    let name = temp_log
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("temp.log");
+    // UA-06: tail 同时进入结构化字段（机器分类用）与拼接文本（人读/SSE 展示
+    // 不变）; 消费方（pnpm 自愈等）从 output_tail 字段分类, 不再解析 Display。
+    let tail = lines.join("\n");
+    let message = format!(
+        "{err}\n--- output tail ({name}, last {} lines) ---\n{tail}",
+        lines.len(),
+    );
+    AppError::CommandExecution {
+        message,
+        output_tail: Some(tail),
+    }
+}
+
+/// 等待 stdout/stderr 日志管道 task 结束,确保 child 退出后尾部日志写完(#17)。
+/// 两个 handle 共用 2s drain 窗口；超时/panic 仅告警，不影响构建结果。
+async fn drain_log_pipes(
+    stdout: Option<JoinHandle<bool>>,
+    stderr: Option<JoinHandle<bool>>,
+) -> bool {
+    let mut complete = true;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    for mut handle in stdout.into_iter().chain(stderr) {
+        match tokio::time::timeout_at(deadline, &mut handle).await {
+            Ok(Ok(observed)) => complete &= observed,
+            Ok(Err(e)) => {
+                complete = false;
+                tracing::warn!(error = %e, "log pipe task ended with error");
+            }
+            Err(_) => {
+                complete = false;
+                handle.abort();
+                // Drop its log callback as well, so the caller can close its
+                // progress channel instead of waiting forever on an orphan.
+                drop(handle.await);
+                tracing::warn!("log pipe drain timed out; tail logs may be incomplete");
+            }
+        }
+    }
+    complete
+}
+
+/// 轮询等待进程退出 (对齐 nuwax waitForProcessStop)。
+pub async fn wait_for_stop(pid: u32, interval_ms: u64, max_attempts: u32) {
+    for _ in 0..max_attempts {
+        if !is_process_running(pid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+    }
+}
+
+/// 系统级扫描某 project_id 的所有相关 pid (对齐 nuwax findPidsByProjectId)。
+/// `ps -Ao pid,command -ww` → 只匹配 `/{projectId}` 路径片段。
+/// N08：Unix 工具——Windows 无 ps，spawn 失败走空兜底（调用方内存 Map 兜底，
+/// 不假装扫到）。
+/// 不使用 nuwax 的宽松回退：本地调用时 curl/shell 命令行也含有
+/// `projectId=...`，宽松匹配会把请求发起进程误当成 Vite 并终止。
+/// ps 不存在/失败返回空 (调用方仍可用内存 Map 的 pid 兜底)。
+pub async fn find_pids_by_project_id(project_id: &str) -> Vec<u32> {
+    let out = Command::new("ps")
+        .arg("-Ao")
+        .arg("pid,command")
+        .arg("-ww")
+        .output()
+        .await;
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut pids: Vec<u32> = Vec::new();
+    // 精确匹配
+    for line in text.lines() {
+        if contains_project_path_segment(line, project_id)
+            && let Some(pid) = parse_pid_from_line(line)
+        {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+/// 匹配命令行中的完整项目路径段，避免项目 `abc` 误命中 `abc2`。
+fn contains_project_path_segment(command_line: &str, project_id: &str) -> bool {
+    let needle = format!("/{project_id}");
+    command_line.match_indices(&needle).any(|(offset, _)| {
+        command_line[offset + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|next| next == '/' || next.is_whitespace() || matches!(next, '\'' | '"'))
+    })
+}
+
+/// 从 `ps` 输出行提取首列 pid。
+fn parse_pid_from_line(line: &str) -> Option<u32> {
+    let trimmed = line.trim_start();
+    let pid_str = trimmed.split_whitespace().next()?;
+    pid_str.parse().ok()
+}
+
+/// HTTP 探活 dev server (对齐 nuwax isProjectAlive): GET 127.0.0.1:port{basePath}, 仅 2xx 视为存活。
+/// (nuwax aliveJudge 仅 200-299; 3xx 如反代 302 到登录页不能误判存活)
+///
+/// 路径必须与 vite `--base` 一致且**保留尾斜杠**: vite 对 `/proxy/41000` 返回 404,
+/// 对 `/proxy/41000/` 返回 200。base_path 缺省时 vite --base 默认 `/proxy/{port}/`
+/// (见 build_dev_args), 探活须用同一路径, 否则永远探不到 200 → poll 跑满超时、
+/// keep-alive 误判重启。
+pub async fn is_project_alive(port: u16, base_path: Option<&str>, timeout_ms: u64) -> bool {
+    let base = match base_path.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(b) => normalize_base_path(b),
+        None => format!("/proxy/{port}/"),
+    };
+    let url = format!("http://127.0.0.1:{port}{base}");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .redirect(reqwest::redirect::Policy::none())
+        .build();
+    let Ok(client) = client else {
+        return false;
+    };
+    // 对齐 nuwax: 自定义 User-Agent, 便于服务端区分探活流量
+    match client
+        .get(&url)
+        .header("User-Agent", "xagi-keepalive-check")
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let ok = resp.status().is_success();
+            if !ok {
+                tracing::debug!(port, status = %resp.status(), "alive probe non-2xx");
+            }
+            ok
+        }
+        Err(error) => {
+            tracing::debug!(port, %error, "alive probe failed");
+            false
+        }
+    }
+}
+
+/// 当前时间毫秒 (chrono, 非 std::time 获取以保持可测)。
+pub fn now_ms() -> i64 {
+    Local::now().timestamp_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CommandObservers, DB_CREDENTIAL_ENV_KEYS, contains_project_path_segment, minimal_env,
+        run_command_to_log,
+    };
+
+    /// 守卫：数据库凭据族白名单内容快照——dev 编排 spawn 链的取数契约，
+    /// 误删键会让用户服务回落代码内默认凭据（dev/生产取数行为分叉）。
+    #[test]
+    fn db_credential_env_keys_snapshot() {
+        assert_eq!(
+            DB_CREDENTIAL_ENV_KEYS,
+            [
+                "POSTGRES_USER",
+                "POSTGRES_PASSWORD",
+                "POSTGRES_DB",
+                "PGHOST",
+                "PGPORT",
+                "PGUSER",
+                "PGPASSWORD",
+                "PGDATABASE",
+                "DATABASE_URL",
+            ]
+        );
+    }
+
+    /// 白名单键在当前进程 env 存在时必须透传（取一条真实存在的验证结构路径；
+    /// 逐键取值受全局 env 不可写约束——Rust 2024 set_var 为 unsafe，项目禁用）。
+    #[test]
+    fn minimal_env_passes_through_whitelisted_db_credentials() {
+        let env = minimal_env(&[]);
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        // PATH/HOME 测试环境恒存在
+        assert!(keys.contains(&"PATH") && keys.contains(&"HOME"));
+        // CI/本地环境常驻 DATABASE_URL 以外的白名单键不可靠，改为结构性断言：
+        // 白名单键要么全部透传（存在）、要么完全不在结果里（不存在）——
+        // 由 env_clear + 白名单的实现保证，这里锁"非白名单键永不透传"边界。
+        assert!(
+            !keys.contains(&"HOSTNAME") && !keys.contains(&"APP_LOG_DIR"),
+            "非白名单键不得透传: {keys:?}"
+        );
+        // extra 注入仍生效（APP_CLI_RUN_PROFILE 走此通道）
+        let with_extra = minimal_env(&[("APP_CLI_RUN_PROFILE".into(), "dev".into())]);
+        assert!(
+            with_extra
+                .iter()
+                .any(|(k, v)| k == "APP_CLI_RUN_PROFILE" && v == "dev")
+        );
+    }
+
+    /// 反例锁（app 11 事故根因）：容器执行域变量在父 env 存在时必须透传给
+    /// 编排器子进程——修复前白名单缺这组键，`env_clear` 后子 app-cli 的
+    /// `PhysicalDomain::from_env()` 返回 None，带域章的旧 Running 代次不被
+    /// 识别为前容器历史，owner 落入 cleanup_unconfirmed 围栏且零日志。
+    #[test]
+    fn minimal_env_passes_through_execution_domain_identity() {
+        use super::minimal_env_with_source;
+
+        const DOMAIN_JSON: &str = r#"{"authority":"k8s:b48f","instance":"","instance_source_env":"RCODER_PHYSICAL_POD_UID","volume":"pvc:ws"}"#;
+        let passthrough = |k: &str| match k {
+            "RCODER_EXECUTION_DOMAIN" => Some(DOMAIN_JSON.to_string()),
+            "RCODER_PHYSICAL_POD_UID" => Some("340e6388-e747-443d-8019-e029b3d9cc55".to_string()),
+            _ => None,
+        };
+        let env = minimal_env_with_source(&[], passthrough);
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "RCODER_EXECUTION_DOMAIN" && v == DOMAIN_JSON),
+            "执行域必须透传: {env:?}"
+        );
+        assert!(
+            env.iter().any(|(k, v)| k == "RCODER_PHYSICAL_POD_UID"
+                && v == "340e6388-e747-443d-8019-e029b3d9cc55"),
+            "Pod UID 必须透传: {env:?}"
+        );
+
+        // 父 env 不含域变量（standalone/宿主机）：不注入空值、不改变结构。
+        let absent = minimal_env_with_source(&[], |k| match k {
+            "PATH" => Some("/usr/bin".to_string()),
+            _ => None,
+        });
+        assert!(absent.iter().all(|(k, _)| !k.starts_with("RCODER_")));
+    }
+
+    /// extra 覆盖白名单透传值（last-wins 契约）：save-db-credential 改密后
+    /// dev start/restart 的 pg 凭据必须能覆盖容器 env 透传的 POSTGRES_*——
+    /// 覆盖失效会让服务进程拿旧密码连新密码库（凭据断链复发）。
+    #[test]
+    fn minimal_env_extra_overrides_passthrough() {
+        use super::minimal_env_with_source;
+
+        let passthrough = |k: &str| match k {
+            "POSTGRES_USER" | "POSTGRES_PASSWORD" | "POSTGRES_DB" => Some("dev".to_string()),
+            _ => None,
+        };
+        let env = minimal_env_with_source(
+            &[
+                ("APP_CLI_RUN_PROFILE".to_string(), "dev".to_string()),
+                ("POSTGRES_USER".to_string(), "biz_user".to_string()),
+                ("POSTGRES_PASSWORD".to_string(), "s3cret".to_string()),
+            ],
+            passthrough,
+        );
+        // 同键恰一项，值为 extra（覆盖透传的 dev/dev）
+        for (key, expect) in [
+            ("POSTGRES_USER", "biz_user"),
+            ("POSTGRES_PASSWORD", "s3cret"),
+        ] {
+            let hits: Vec<&String> = env
+                .iter()
+                .filter(|(k, _)| k == key)
+                .map(|(_, v)| v)
+                .collect();
+            assert_eq!(hits.len(), 1, "{key} 恰一项: {env:?}");
+            assert_eq!(hits[0], expect);
+        }
+        // 未被 extra 覆盖的白名单键维持透传值
+        assert!(env.iter().any(|(k, v)| k == "POSTGRES_DB" && v == "dev"));
+    }
+
+    #[test]
+    fn project_process_match_requires_a_path_segment_boundary() {
+        assert!(contains_project_path_segment(
+            "123 node /workspace/abc/node_modules/vite/bin/vite.js",
+            "abc"
+        ));
+        assert!(contains_project_path_segment(
+            "123 sh -c 'cd /workspace/abc'",
+            "abc"
+        ));
+        assert!(!contains_project_path_segment(
+            "123 node /workspace/abc2/node_modules/vite/bin/vite.js",
+            "abc"
+        ));
+    }
+
+    /// 失败错误必须携带真实报错现场：退出码 + 本次运行输出尾部（stdout/stderr
+    /// 均管道写入 temp_log）——"command exited non-zero" 笼统错误无法排障。
+    #[tokio::test]
+    async fn run_command_to_log_error_carries_output_tail() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main_log = tmp.path().join("dev-test.log");
+        let temp_log = tmp.path().join("temp-1.log");
+        let err = run_command_to_log(
+            "sh",
+            &[
+                "-c",
+                "echo boom-marker-stderr >&2; echo plain-out-line; exit 7",
+            ],
+            tmp.path(),
+            &main_log,
+            &temp_log,
+            30,
+            CommandObservers::default(),
+        )
+        .await
+        .expect_err("must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("exit status: 7"), "退出码缺失: {msg}");
+        assert!(msg.contains("boom-marker-stderr"), "stderr 尾部缺失: {msg}");
+        assert!(msg.contains("plain-out-line"), "stdout 尾部缺失: {msg}");
+        assert!(msg.contains("output tail"), "尾部标注缺失: {msg}");
+    }
+
+    /// 成功路径不受尾部增强影响（错误才附加）。
+    /// on_line 行回调：逐行收到原始输出（无时间戳前缀），与文件写入同源同序。
+    #[tokio::test]
+    async fn run_command_to_log_invokes_line_callback_per_line() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main_log = tmp.path().join("dev-test.log");
+        let temp_log = tmp.path().join("temp-3.log");
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lines_cb = lines.clone();
+        run_command_to_log(
+            "sh",
+            &["-c", "echo first-line; echo second-line"],
+            tmp.path(),
+            &main_log,
+            &temp_log,
+            30,
+            CommandObservers {
+                on_line: Some(std::sync::Arc::new(move |line: &str| {
+                    lines_cb.lock().expect("lock").push(line.to_string());
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("command ok");
+        assert_eq!(
+            lines.lock().expect("lock").clone(),
+            vec!["first-line".to_string(), "second-line".to_string()]
+        );
+        // 文件行仍带时间戳前缀（回调行是原文）
+        let file = std::fs::read_to_string(&main_log).expect("main log");
+        assert!(file.contains("first-line") && file.contains("["), "{file}");
+    }
+
+    #[tokio::test]
+    async fn run_command_to_log_success_writes_logs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main_log = tmp.path().join("dev-test.log");
+        let temp_log = tmp.path().join("temp-2.log");
+        run_command_to_log(
+            "sh",
+            &["-c", "echo ok-line"],
+            tmp.path(),
+            &main_log,
+            &temp_log,
+            30,
+            CommandObservers::default(),
+        )
+        .await
+        .expect("must succeed");
+        let temp = tokio::fs::read_to_string(&temp_log)
+            .await
+            .expect("read temp");
+        assert!(temp.contains("ok-line"));
+    }
+}

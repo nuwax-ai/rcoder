@@ -1,0 +1,61 @@
+//! HTTP 路由和处理器模块
+mod agent_cancel_handler;
+pub mod agent_install_strategy;
+pub mod agent_mgmt;
+mod agent_session_notification;
+mod agent_status_handler;
+mod agent_stop_handler;
+pub(crate) mod chat_forward;
+mod chat_handler;
+mod computer_agent_status_handler;
+mod computer_agent_stop_handler;
+mod computer_cache_handler;
+mod computer_chat_handler;
+mod computer_db_handler;
+mod computer_desktop;
+mod devcomputer_handler;
+mod docs;
+pub mod error_page_admin;
+mod health_handler;
+mod internal_handler;
+mod permission_handler;
+pub mod pod_handler;
+pub mod proxy_api;
+pub mod proxy_handler_api;
+mod sse_builder;
+pub(crate) mod userapp_agent_target;
+pub mod userapp_terminal_proxy_api;
+pub mod utils;
+pub mod validation_rules;
+mod version_handler;
+
+// 调试处理器（仅在启用 debug feature 时可用）
+#[cfg(feature = "debug")]
+mod debug_handler;
+
+pub use agent_cancel_handler::*;
+pub use agent_mgmt::*;
+pub use agent_session_notification::*;
+pub use agent_status_handler::*;
+pub use agent_stop_handler::*;
+pub use chat_handler::*;
+pub use computer_agent_status_handler::*;
+pub use computer_agent_stop_handler::*;
+pub use computer_cache_handler::*;
+pub use computer_chat_handler::*;
+pub use computer_db_handler::*;
+pub use computer_desktop::*;
+pub use devcomputer_handler::*;
+pub use docs::*;
+pub use health_handler::*;
+pub use internal_handler::*;
+pub use permission_handler::*;
+pub use pod_handler::*;
+pub use proxy_api::*;
+pub use proxy_handler_api::*;
+pub use userapp_terminal_proxy_api::*;
+pub use version_handler::*;
+
+// 仅在启用 debug feature 时导出 debug handler
+#[cfg(feature = "debug")]
+pub use debug_handler::*;

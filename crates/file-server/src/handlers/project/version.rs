@@ -3,54 +3,39 @@
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
-use serde_json::json;
+use garde::Validate;
 
 use super::ctx_from;
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::AppJson as Json;
-use crate::response;
+use crate::models::{
+    BackupVersionBody, BackupVersionResponse, BackupVersionResult, DeprecatedResult, ExportBody,
+    RollbackBody, RollbackVersionResponse, RollbackVersionResult,
+};
 use crate::service::{project as project_service, version as version_service};
 
-#[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct BackupVersionBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    pub project_id: String,
-    pub code_version: String,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub tenant_id: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub space_id: Option<String>,
-    #[serde(default)]
-    pub isolation_type: Option<String>,
+/// 废弃引导响应构造（类型化，对齐旧 response::deprecated 的 wire 形状）。
+fn deprecated(message: &str) -> DeprecatedResult {
+    DeprecatedResult::new(message)
 }
 
-/// `POST /api/project/backup-current-version`
-#[utoipa::path(post, path = "/backup-current-version", request_body = BackupVersionBody, responses(crate::openapi::JsonApiResponses), tag = "Project")]
+/// 备份当前版本
+#[utoipa::path(post, path = "/backup-current-version", request_body = BackupVersionBody, description = r#"
+将当前项目状态备份为一个版本快照（记录 logId/时间戳），供 rollback-version 回退目标。
+"#,
+    responses((status = 200, description = "备份结果或废弃引导", body = BackupVersionResponse), crate::openapi::ErrorApiResponses), tag = "Project")]
 pub(crate) async fn backup_current_version(
     State(state): State<AppState>,
     Json(body): Json<BackupVersionBody>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<BackupVersionResponse>, AppError> {
     if state.config.git_enabled {
-        return Ok(response::deprecated(
-            "此接口已废弃,请使用 Git 版本管理 API（/api/git/*）",
-        ));
+        return Ok(Json(BackupVersionResponse::Deprecated(deprecated(
+            "此接口已废弃，请使用 Git 版本管理 API（/api/git/*）",
+        ))));
     }
+    body.validate().map_err(crate::error::from_garde)?;
     let project_id = body.project_id.trim().to_string();
-    if project_id.is_empty() {
-        return Err(AppError::validation("Project ID cannot be empty"));
-    }
-    if body.code_version.trim().is_empty() {
-        return Err(AppError::validation("codeVersion cannot be empty"));
-    }
     let ctx = ctx_from(
         &project_id,
         body.tenant_id,
@@ -64,49 +49,29 @@ pub(crate) async fn backup_current_version(
         &body.code_version,
     )
     .await?;
-    Ok(Json(json!({
-        "success": true,
-        "projectId": result.project_id,
-        "zipPath": result.zip_path,
+    Ok(Json(BackupVersionResponse::Ok(BackupVersionResult {
+        success: true,
+        project_id: result.project_id,
+        zip_path: result.zip_path,
     })))
 }
 
-#[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct RollbackBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    pub project_id: String,
-    pub code_version: String,
-    pub rollback_to: String,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub tenant_id: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub space_id: Option<String>,
-    #[serde(default)]
-    pub isolation_type: Option<String>,
-}
-
-/// `POST /api/project/rollback-version`
-#[utoipa::path(post, path = "/rollback-version", request_body = RollbackBody, responses(crate::openapi::JsonApiResponses), tag = "Project")]
+/// 回滚版本
+#[utoipa::path(post, path = "/rollback-version", request_body = RollbackBody, description = r#"
+回滚项目到指定版本快照（覆盖当前内容；当前态建议先 backup 再回滚）。
+"#,
+    responses((status = 200, description = "回滚结果或废弃引导", body = RollbackVersionResponse), crate::openapi::ErrorApiResponses), tag = "Project")]
 pub(crate) async fn rollback_version(
     State(state): State<AppState>,
     Json(body): Json<RollbackBody>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<RollbackVersionResponse>, AppError> {
     if state.config.git_enabled {
-        return Ok(response::deprecated(
-            "此接口已废弃,请使用 /api/git/rollback 进行版本回滚",
-        ));
+        return Ok(Json(RollbackVersionResponse::Deprecated(deprecated(
+            "此接口已废弃，请使用 /api/git/rollback 进行版本回滚",
+        ))));
     }
+    body.validate().map_err(crate::error::from_garde)?;
     let project_id = body.project_id.trim().to_string();
-    if project_id.is_empty() {
-        return Err(AppError::validation("Project ID cannot be empty"));
-    }
     let ctx = ctx_from(
         &project_id,
         body.tenant_id,
@@ -121,46 +86,23 @@ pub(crate) async fn rollback_version(
         &body.rollback_to,
     )
     .await?;
-    Ok(Json(json!({
-        "success": true,
-        "message": "Project rolled back successfully",
-        "newVersion": result.new_version,
-        "rollbackTo": result.rollback_to,
+    Ok(Json(RollbackVersionResponse::Ok(RollbackVersionResult {
+        success: true,
+        message: "Project rolled back successfully".to_string(),
+        new_version: result.new_version,
+        rollback_to: result.rollback_to,
     })))
 }
 
-#[derive(Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ExportBody {
-    #[serde(deserialize_with = "crate::extract::deserialize_id_string")]
-    pub project_id: String,
-    pub code_version: String,
-    #[serde(default)]
-    pub export_type: Option<String>,
-    #[serde(default)]
-    #[schema(value_type = Object)]
-    pub config: Option<serde_json::Value>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub tenant_id: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::extract::deserialize_optional_id_string"
-    )]
-    pub space_id: Option<String>,
-    #[serde(default)]
-    pub isolation_type: Option<String>,
-}
-
-/// `POST /api/project/export-project` (返回 application/zip 文件流)
+/// 导出项目
+///
+/// 返回 application/zip 文件流。
 #[utoipa::path(
     post,
     path = "/export-project",
     request_body = ExportBody,
     responses(
-        (status = 200, description = "Project ZIP archive", body = crate::openapi::BinaryFile, content_type = "application/zip"),
+        (status = 200, description = "Project ZIP archive", body = crate::models::BinaryFile, content_type = "application/zip"),
         crate::openapi::ErrorApiResponses
     ),
     tag = "Project"
@@ -169,10 +111,8 @@ pub(crate) async fn export_project(
     State(state): State<AppState>,
     Json(body): Json<ExportBody>,
 ) -> Result<Response, AppError> {
+    body.validate().map_err(crate::error::from_garde)?;
     let project_id = body.project_id.trim().to_string();
-    if project_id.is_empty() {
-        return Err(AppError::validation("Project ID cannot be empty"));
-    }
     let ctx = ctx_from(
         &project_id,
         body.tenant_id,

@@ -5,7 +5,9 @@
 
 use std::time::Duration;
 
+use crate::control_plane_client::diagnostic;
 use moka::future::Cache;
+use shared_types::{AppError, error_codes};
 use tracing::debug;
 
 use crate::control_plane_client::ControlPlaneClient;
@@ -36,7 +38,7 @@ impl SessionResolver {
     }
 
     /// 解析 session_id → (identifier, service_type)
-    pub async fn resolve(&self, session_id: &str) -> anyhow::Result<SessionInfo> {
+    pub async fn resolve(&self, session_id: &str) -> Result<SessionInfo, AppError> {
         if let Some(info) = self.cache.get(session_id).await {
             debug!("[SESSION] cache hit: {} → {}", session_id, info.identifier);
             return Ok(info);
@@ -47,11 +49,23 @@ impl SessionResolver {
 
         if !resp.success {
             let msg = resp.message.unwrap_or_else(|| "unknown error".to_string());
-            anyhow::bail!("session resolve failed for {}: {}", session_id, msg);
+            return Err(diagnostic(
+                error_codes::ERR_RUNTIME_UNAVAILABLE,
+                error_codes::ERR_RUNTIME_UNAVAILABLE,
+                "gateway_session_resolve",
+                &msg,
+                false,
+            ));
         }
 
         let data = resp.data.ok_or_else(|| {
-            anyhow::anyhow!("session resolve returned no data for {}", session_id)
+            diagnostic(
+                error_codes::ERR_RUNTIME_UNAVAILABLE,
+                error_codes::ERR_RUNTIME_UNAVAILABLE,
+                "gateway_session_resolve",
+                "Session resolution did not return routing data",
+                false,
+            )
         })?;
 
         let info = SessionInfo {

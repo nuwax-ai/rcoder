@@ -1,0 +1,982 @@
+//! Durable admission and execution claims. No SQL transaction spans runtime I/O.
+use crate::models::{AppOperationError, AppResult};
+use shared_types::{
+    UserAppAdmission, UserAppAdmissionOutcome, UserAppLifecycleStore, UserAppOperationProgress,
+    UserAppOperationRecord, UserAppOperationState,
+};
+use std::sync::Arc;
+
+pub(crate) struct OwnedOperation {
+    store: Arc<dyn UserAppLifecycleStore>,
+    record: UserAppOperationRecord,
+    executor: String,
+}
+
+impl OwnedOperation {
+    /// This parent identity is durable; downstream observations cannot replace it.
+    pub(crate) fn correlate_error(&self, error: AppOperationError) -> AppOperationError {
+        if error.operation_id() == Some(self.record.operation_id.as_str()) {
+            return error;
+        }
+        AppOperationError::Operation {
+            operation_id: self.record.operation_id.clone(),
+            source: Box::new(error),
+        }
+    }
+
+    /// Claim an existing unexecuted command; never mint a replacement operation.
+    /// The caller already holds the application resource operation guard.
+    pub(crate) async fn claim_pending(
+        store: Arc<dyn UserAppLifecycleStore>,
+        record: UserAppOperationRecord,
+    ) -> AppResult<Option<Self>> {
+        if record.state != UserAppOperationState::Pending
+            || record.step != "admitted"
+            || record.executor_id.is_some()
+            || !record.checkpoint.is_null()
+            || record
+                .command
+                .as_ref()
+                .is_none_or(|command| command.kind() != record.kind)
+        {
+            return Ok(None);
+        }
+        let executor = uuid::Uuid::new_v4().to_string();
+        let progress = UserAppOperationProgress {
+            app_id: record.app_id.clone(),
+            lifecycle_id: record.lifecycle_id.clone(),
+            operation_id: record.operation_id.clone(),
+            expected_revision: record.revision,
+            executor_id: executor.clone(),
+            state: UserAppOperationState::Running,
+            step: "claimed".into(),
+            checkpoint: serde_json::Value::Null,
+            error_code: None,
+            error_message: None,
+        };
+        let record = match store.advance(&progress).await {
+            Ok(record) => record,
+            Err(shared_types::UserAppStoreError::VersionConflict) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Some(Self {
+            store,
+            record,
+            executor,
+        }))
+    }
+
+    pub(crate) async fn admit(
+        store: Arc<dyn UserAppLifecycleStore>,
+        request: UserAppAdmission,
+    ) -> AppResult<Self> {
+        Self::admit_with_input(store, request, None).await
+    }
+
+    pub(crate) async fn admit_with_input(
+        store: Arc<dyn UserAppLifecycleStore>,
+        request: UserAppAdmission,
+        input: Option<&shared_types::UserAppExecutionInput>,
+    ) -> AppResult<Self> {
+        Self::admit_with_configuration(store, request, input, None).await
+    }
+
+    pub(crate) async fn admit_with_configuration(
+        store: Arc<dyn UserAppLifecycleStore>,
+        request: UserAppAdmission,
+        input: Option<&shared_types::UserAppExecutionInput>,
+        pg: Option<&shared_types::StartPgCredential>,
+    ) -> AppResult<Self> {
+        super::restart_wait::begin_admission()?;
+        let outcome = if let Some(input) = input {
+            store.admit_with_configuration(&request, input, pg).await
+        } else {
+            if pg.is_some() {
+                return Err(AppOperationError::Validation(
+                    "Deployment credentials require private input".into(),
+                ));
+            }
+            store.admit_with_input(&request, None).await
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(shared_types::UserAppStoreError::OperationInProgress(blocker)) => {
+                // This transaction definitively rejected admission. An HTTP
+                // disconnect that raced ADMITTING must now cancel the waiter.
+                super::restart_wait::rejected_before_admission();
+                super::restart_wait::capture_rejected_blocker(&request.app_id, &blocker)?;
+                return Err(super::restart_wait::prepare(
+                    super::operation_progress::enrich_store_blocker(
+                        store.as_ref(),
+                        &request.app_id,
+                        &blocker,
+                    ),
+                )
+                .await?
+                .into_error());
+            }
+            Err(error) => {
+                let error = AppOperationError::from(error);
+                return Err(if error.requires_recovery() {
+                    error.with_operation_id(request.operation_id.clone())
+                } else {
+                    error
+                });
+            }
+        };
+        let record = match outcome {
+            UserAppAdmissionOutcome::Accepted(record) => record,
+            UserAppAdmissionOutcome::Existing(record) => {
+                return Err(AppOperationError::Conflict(format!(
+                    "Application operation {} already exists ({:?})",
+                    record.operation_id, record.state
+                )));
+            }
+        };
+        Self::claim_admitted(store, record).await
+    }
+
+    /// The record is already durable even if the execution claim fails.
+    async fn claim_admitted(
+        store: Arc<dyn UserAppLifecycleStore>,
+        record: UserAppOperationRecord,
+    ) -> AppResult<Self> {
+        let operation_id = record.operation_id.clone();
+        let mut owned = Self {
+            store,
+            record,
+            executor: uuid::Uuid::new_v4().to_string(),
+        };
+        owned
+            .advance(
+                UserAppOperationState::Running,
+                "claimed",
+                serde_json::Value::Null,
+                None,
+            )
+            .await
+            .map_err(|error| error.with_operation_id(operation_id))?;
+        Ok(owned)
+    }
+
+    /// Bind before runtime writes, retaining the accepted identity on failure.
+    pub(crate) async fn bind_deadline(&self, deadline_epoch_ms: i64) -> AppResult<i64> {
+        self.store
+            .bind_operation_deadline(
+                &self.record.app_id,
+                &self.record.operation_id,
+                &self.record.lifecycle_id,
+                deadline_epoch_ms,
+            )
+            .await
+            .map_err(|error| {
+                AppOperationError::from(error).with_operation_id(self.record.operation_id.clone())
+            })
+    }
+
+    pub(crate) async fn execution_input(&self) -> AppResult<shared_types::UserAppExecutionInput> {
+        Ok(self
+            .store
+            .read_execution_input(&self.execution_context())
+            .await?)
+    }
+
+    pub(crate) async fn authorize_mutation(&self) -> AppResult<()> {
+        self.store
+            .check_business_execution(&self.execution_context())
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn bind_lease(&self, guard: &super::AppOperationGuard) -> AppResult<()> {
+        self.store
+            .bind_operation_lease(&self.execution_context(), &guard.lease_receipt()?)
+            .await?;
+        Ok(())
+    }
+    pub(crate) async fn confirm_effects(&mut self) -> AppResult<()> {
+        self.checkpoint("control_confirmed", self.record.checkpoint.clone())
+            .await
+    }
+    pub(crate) async fn begin_hot_convergence(
+        &mut self,
+        converge_env: &std::collections::HashMap<String, String>,
+    ) -> AppResult<()> {
+        if self.record.step != "hot_execution"
+            || self
+                .record
+                .checkpoint
+                .pointer("/hot_execution/phase")
+                .and_then(serde_json::Value::as_str)
+                != Some("submit")
+        {
+            return Err(AppOperationError::InvalidState(
+                "Hot convergence checkpoint changed".into(),
+            ));
+        }
+        let mut checkpoint = self.record.checkpoint.clone();
+        checkpoint["hot_execution"]["phase"] = serde_json::json!("converging");
+        // Persist the convergence target so a crash between this CAS and the
+        // ConfigMap write leaves a recovery observer a comparable expectation.
+        checkpoint["hot_execution"]["converge_env"] =
+            serde_json::to_value(converge_env).map_err(|error| {
+                AppOperationError::Backend(format!("Encode hot convergence target: {error}"))
+            })?;
+        // CAS must win before any ConfigMap write. A recovery observer that
+        // already finalized this snapshot prevents a late coordinator write.
+        self.checkpoint("hot_converging", checkpoint).await
+    }
+    pub(crate) async fn checkpoint(
+        &mut self,
+        step: &str,
+        evidence: serde_json::Value,
+    ) -> AppResult<()> {
+        self.advance(UserAppOperationState::Running, step, evidence, None)
+            .await
+    }
+    /// Advance only one confirmed deletion boundary, keeping the original
+    /// resource/context evidence unchanged. Publish the local stage after SQL.
+    pub(crate) async fn deletion_progress(
+        &mut self,
+        evidence: &mut shared_types::UserAppDeletionCheckpoint,
+        stage: shared_types::UserAppDeletionStage,
+    ) -> AppResult<()> {
+        use shared_types::UserAppDeletionStage as Stage;
+        evidence
+            .validate_operation(&self.record)
+            .map_err(AppOperationError::Conflict)?;
+        let persisted: shared_types::UserAppDeletionCheckpoint =
+            serde_json::from_value(self.record.checkpoint.clone()).map_err(|error| {
+                AppOperationError::Backend(format!("Read stored deletion checkpoint: {error}"))
+            })?;
+        if persisted != *evidence
+            || !matches!(
+                (evidence.stage, stage),
+                (Stage::Captured, Stage::ComputeRemoved)
+                    | (Stage::ComputeRemoved, Stage::ProductionStorageRemoved)
+                    | (Stage::ProductionStorageRemoved, Stage::DevelopmentRemoved)
+            )
+        {
+            return Err(AppOperationError::Conflict(
+                "Deletion progress must preserve evidence and confirm the next stage".into(),
+            ));
+        }
+        let mut next = evidence.clone();
+        next.stage = stage;
+        next.validate().map_err(AppOperationError::Conflict)?;
+        let value = serde_json::to_value(&next).map_err(|error| {
+            AppOperationError::Backend(format!("Encode deletion progress: {error}"))
+        })?;
+        self.checkpoint("deletion_progress", value).await?;
+        *evidence = next;
+        Ok(())
+    }
+
+    pub(crate) async fn succeed(mut self) -> AppResult<()> {
+        self.advance(
+            UserAppOperationState::Succeeded,
+            "completed",
+            self.record.checkpoint.clone(),
+            None,
+        )
+        .await
+    }
+    pub(crate) async fn fail(mut self, error: &AppOperationError) -> AppResult<()> {
+        let state = if !error.requires_recovery()
+            && self.record.step == "claimed"
+            && self.record.checkpoint.is_null()
+        {
+            UserAppOperationState::Failed
+        } else {
+            UserAppOperationState::RecoveryRequired
+        };
+        let step = if state == UserAppOperationState::RecoveryRequired {
+            self.record.step.clone()
+        } else {
+            "failed".into()
+        };
+        self.advance(state, &step, self.record.checkpoint.clone(), Some(error))
+            .await
+    }
+
+    /// Evidence for this executor's completed wake write, not business readiness.
+    pub(crate) fn has_confirmed_wake_write(&self) -> bool {
+        if self.record.kind != shared_types::UserAppOperationKind::Start
+            || self.record.step != "traffic_wake_observing"
+            || self.record.checkpoint.get("start_write_acknowledged")
+                != Some(&serde_json::Value::Bool(true))
+        {
+            return false;
+        }
+        self.record
+            .checkpoint
+            .get("target")
+            .and_then(|value| {
+                serde_json::from_value::<shared_types::UserAppMutationTarget>(value.clone()).ok()
+            })
+            .is_some_and(|target| target.context == self.execution_context())
+    }
+
+    /// Only the read-only observation failed. Terminal persistence retains the
+    /// acknowledged write evidence; it does not assert that the application stopped.
+    /// Callers release their exact lease only after this CAS succeeds.
+    pub(crate) async fn fail_confirmed_wake_observation(
+        mut self,
+        error: &AppOperationError,
+    ) -> AppResult<()> {
+        if !self.has_confirmed_wake_write() {
+            return Err(AppOperationError::Conflict(
+                "Wake write acknowledgement is missing or belongs to another executor".into(),
+            ));
+        }
+        self.advance(
+            UserAppOperationState::Failed,
+            "traffic_wake_observation_failed",
+            self.record.checkpoint.clone(),
+            Some(error),
+        )
+        .await
+    }
+    /// Only use when the runtime explicitly proves that no application mutation
+    /// remains in flight. A timeout or transport failure is not such evidence.
+    pub(crate) async fn reject_without_mutation(
+        mut self,
+        error: &AppOperationError,
+    ) -> AppResult<()> {
+        if error.requires_recovery() {
+            return self.fail(error).await;
+        }
+        if self.record.kind.ends_lifecycle() {
+            return Err(AppOperationError::Conflict(
+                "Deletion requires checkpoint-specific failure handling".into(),
+            ));
+        }
+        self.advance(
+            UserAppOperationState::Failed,
+            "rejected_without_mutation",
+            self.record.checkpoint.clone(),
+            Some(error),
+        )
+        .await
+    }
+
+    pub(crate) fn execution_context(&self) -> shared_types::UserAppExecutionContext {
+        shared_types::UserAppExecutionContext {
+            app_id: self.record.app_id.clone(),
+            lifecycle_id: self.record.lifecycle_id.clone(),
+            operation_id: self.record.operation_id.clone(),
+            executor_id: self.executor.clone(),
+            request_fingerprint: self.record.request_fingerprint.clone(),
+        }
+    }
+    async fn advance(
+        &mut self,
+        state: UserAppOperationState,
+        step: &str,
+        checkpoint: serde_json::Value,
+        error: Option<&AppOperationError>,
+    ) -> AppResult<()> {
+        self.record = self
+            .store
+            .advance(&UserAppOperationProgress {
+                app_id: self.record.app_id.clone(),
+                operation_id: self.record.operation_id.clone(),
+                lifecycle_id: self.record.lifecycle_id.clone(),
+                expected_revision: self.record.revision,
+                executor_id: self.executor.clone(),
+                state,
+                step: step.into(),
+                checkpoint,
+                error_code: error.map(|e| e.code().into()),
+                error_message: error.map(ToString::to_string),
+            })
+            .await
+            .map_err(|error| self.correlate_error(error.into()))?;
+        Ok(())
+    }
+}
+
+impl super::AppService {
+    pub(crate) async fn replay_control(
+        &self,
+        app_id: &str,
+        request: &shared_types::UserAppControlRequest,
+        kind: shared_types::UserAppOperationKind,
+        fingerprint: &str,
+    ) -> AppResult<Option<UserAppOperationRecord>> {
+        let Some(request_id) = request.request_id.as_deref() else {
+            return Ok(None);
+        };
+        let app = self.get_lifecycle(app_id).await?;
+        let Some(operation) = self
+            .metadata
+            .store
+            .get_operation_by_request(app_id, request_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if operation.lifecycle_id != app.lifecycle_id {
+            return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
+        }
+        if operation.kind != kind || operation.request_fingerprint != fingerprint {
+            return Err(AppOperationError::Conflict(
+                "Request identity was reused with different parameters".into(),
+            ));
+        }
+        match operation.state {
+            UserAppOperationState::Succeeded => Ok(Some(operation)),
+            UserAppOperationState::Failed => {
+                // A terminal replay reports the stored outcome, not a newly
+                // executed backend failure. Older/unknown nonempty codes remain
+                // intact; the record has no full original diagnostic to invent.
+                let mut failure = shared_types::WakeFailure::new(
+                    operation
+                        .error_code
+                        .clone()
+                        .filter(|code| !code.is_empty())
+                        .unwrap_or_else(|| shared_types::ERR_BACKEND_ERROR.into()),
+                    operation.step.clone(),
+                    shared_types::sanitize_error_text(&format!(
+                        "Application operation {} failed: {}",
+                        operation.operation_id,
+                        operation
+                            .error_message
+                            .as_deref()
+                            .unwrap_or("No failure details recorded")
+                    )),
+                );
+                failure.operation_id = Some(operation.operation_id);
+                Err(AppOperationError::Diagnostic(failure))
+            }
+            _ => Err(AppOperationError::Conflict(format!(
+                "Application operation {} is not complete ({:?})",
+                operation.operation_id, operation.state
+            ))
+            .with_operation_id(operation.operation_id.clone())),
+        }
+    }
+    pub async fn get_lifecycle(
+        &self,
+        app_id: &str,
+    ) -> AppResult<shared_types::UserAppLifecycleRecord> {
+        crate::utils::validate_app_id(app_id)?;
+        let app = self
+            .metadata
+            .store
+            .get_application(app_id)
+            .await?
+            .ok_or_else(|| {
+                AppOperationError::NotFound(format!("Application identity not found: {app_id}"))
+            })?;
+        Ok(app)
+    }
+    pub async fn get_control_operation(
+        &self,
+        app_id: &str,
+        operation_id: Option<&str>,
+    ) -> AppResult<Option<shared_types::UserAppOperationView>> {
+        let app = self.get_lifecycle(app_id).await?;
+        // No explicit id: fall back to the first occupied scope slot in a fixed
+        // order (application, then dev, then prod). Reads are never blocked by
+        // another environment's busy slot.
+        let id: Option<&str> = match operation_id {
+            Some(id) => Some(id),
+            None => app
+                .active_operations
+                .occupied_scopes()
+                .find_map(|scope| app.active_operations.slot(scope))
+                .map(String::as_str),
+        };
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        let operation = self
+            .metadata
+            .store
+            .get_operation(app_id, id)
+            .await?
+            .ok_or_else(|| {
+                AppOperationError::OperationNotFound(format!(
+                    "Application operation not found: {id}"
+                ))
+            })?;
+        if operation.lifecycle_id != app.lifecycle_id {
+            return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
+        }
+        Ok(Some(operation.into()))
+    }
+    pub async fn get_control_operation_by_request(
+        &self,
+        app_id: &str,
+        request_id: &str,
+    ) -> AppResult<Option<shared_types::UserAppOperationView>> {
+        let app = self.get_lifecycle(app_id).await?;
+        let operation = self
+            .metadata
+            .store
+            .get_operation_by_request(app_id, request_id)
+            .await?;
+        if operation
+            .as_ref()
+            .is_some_and(|operation| operation.lifecycle_id != app.lifecycle_id)
+        {
+            return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
+        }
+        Ok(operation.map(Into::into))
+    }
+
+    /// All in-flight operations across scopes, in fixed order (application,
+    /// dev, prod). Read-only: never blocked by any environment's busy slot.
+    pub async fn get_current_operations(
+        &self,
+        app_id: &str,
+    ) -> AppResult<Vec<shared_types::UserAppOperationView>> {
+        let app = self.get_lifecycle(app_id).await?;
+        let mut operations = Vec::new();
+        for scope in app.active_operations.occupied_scopes() {
+            let Some(id) = app.active_operations.slot(scope) else {
+                continue;
+            };
+            let operation = self
+                .metadata
+                .store
+                .get_operation(app_id, id)
+                .await?
+                .ok_or_else(|| {
+                    AppOperationError::Conflict(format!("Active operation record is missing: {id}"))
+                })?;
+            if operation.lifecycle_id != app.lifecycle_id {
+                return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
+            }
+            operations.push(operation.into());
+        }
+        // Compute controls (restart/stop of builder or production compute) hold
+        // their own physical lease instead of an operation slot; surface them so
+        // callers observe in-flight compute operations instead of discovering
+        // them as opaque 409 blockers on unrelated requests.
+        for record in self.metadata.store.active_compute_controls(app_id).await? {
+            if record.lifecycle_id != app.lifecycle_id {
+                continue;
+            }
+            let kind = match (record.scope, record.action) {
+                (
+                    shared_types::UserAppOperationScope::Dev,
+                    shared_types::ComputeControlAction::Restart,
+                ) => shared_types::UserAppOperationKind::RestartBuilder,
+                (
+                    shared_types::UserAppOperationScope::Dev,
+                    shared_types::ComputeControlAction::Stop,
+                ) => shared_types::UserAppOperationKind::StopBuilder,
+                (
+                    shared_types::UserAppOperationScope::Prod,
+                    shared_types::ComputeControlAction::Restart,
+                ) => shared_types::UserAppOperationKind::Restart,
+                (
+                    shared_types::UserAppOperationScope::Prod,
+                    shared_types::ComputeControlAction::Stop,
+                ) => shared_types::UserAppOperationKind::Stop,
+                (shared_types::UserAppOperationScope::Application, _) => continue,
+            };
+            let state = match record.state {
+                shared_types::ComputeControlState::Pending => UserAppOperationState::Pending,
+                shared_types::ComputeControlState::Running => UserAppOperationState::Running,
+                shared_types::ComputeControlState::RecoveryRequired => {
+                    UserAppOperationState::RecoveryRequired
+                }
+                shared_types::ComputeControlState::Succeeded
+                | shared_types::ComputeControlState::Failed
+                | shared_types::ComputeControlState::Superseded => continue,
+            };
+            operations.push(shared_types::UserAppOperationView {
+                operation_id: record.operation_id,
+                app_id: record.app_id,
+                lifecycle_id: record.lifecycle_id,
+                request_id: Some(record.request_id),
+                kind,
+                scope: record.scope,
+                state,
+                revision: record.revision,
+                step: record.stage,
+                error_code: record.error_code,
+                error_message: record.error_message,
+                created_at: record.created_at,
+            });
+        }
+        Ok(operations)
+    }
+
+    pub async fn recreate_identity(
+        &self,
+        app_id: &str,
+        request: shared_types::UserAppRecreateRequest,
+    ) -> AppResult<shared_types::UserAppLifecycleRecord> {
+        use garde::Validate as _;
+        request
+            .validate()
+            .map_err(|error| AppOperationError::Validation(error.to_string()))?;
+        let lease = self.acquire_process_release_lock(app_id).await?;
+        let current = self.get_lifecycle(app_id).await?;
+        if current.state != shared_types::UserAppLifecycleState::Deleted {
+            // On an active lifecycle the store can only return an exact prior
+            // recreation result; it cannot create another generation here.
+            let existing = self
+                .metadata
+                .store
+                .recreate(app_id, &request.expected_lifecycle_id, &request.request_id)
+                .await?;
+            lease.finish().await?;
+            return Ok(existing);
+        }
+        if self
+            .runtime
+            .get_deployment_status(app_id)
+            .await
+            .map_err(|error| crate::utils::map_runtime_error("verify recreation resources", error))?
+            .is_some()
+        {
+            return Err(AppOperationError::Conflict(
+                "Application compute resources remain; recovery is required".into(),
+            ));
+        }
+        let locator = self
+            .dev_locator
+            .read()
+            .map_err(|_| AppOperationError::Backend("Dev locator lock poisoned".into()))?
+            .clone()
+            .ok_or_else(|| AppOperationError::Backend("Dev locator is not configured".into()))?;
+        if locator
+            .dev_container_alive(app_id)
+            .await
+            .map_err(AppOperationError::Backend)?
+        {
+            return Err(AppOperationError::Conflict(
+                "Application builder resources remain; recovery is required".into(),
+            ));
+        }
+        let app = self
+            .metadata
+            .store
+            .recreate(app_id, &request.expected_lifecycle_id, &request.request_id)
+            .await?;
+        lease.finish().await?;
+        Ok(app)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{MockRuntime, test_service};
+    struct NoBuilder;
+    #[async_trait::async_trait]
+    impl shared_types::UserappDevLocator for NoBuilder {
+        async fn dev_file_server_addr(&self, _: &str) -> Result<String, String> {
+            Err("No builder".into())
+        }
+        async fn dev_container_alive(&self, _: &str) -> Result<bool, String> {
+            Ok(false)
+        }
+    }
+    #[tokio::test]
+    async fn credential_uncertainty_cannot_use_no_mutation_terminal_path() {
+        for (suffix, mutation) in [
+            ("unknown", shared_types::CredentialMutationEvidence::Unknown),
+            (
+                "unverified",
+                shared_types::CredentialMutationEvidence::AppliedButUnverified,
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let service = test_service(directory.path(), Arc::new(MockRuntime::default())).await;
+            let app_id = format!("credential{suffix}");
+            let identity = service
+                .metadata
+                .store
+                .ensure_identity(&app_id)
+                .await
+                .unwrap();
+            let operation_id = format!("operation{suffix}");
+            let operation = OwnedOperation::admit(
+                service.metadata.store.clone(),
+                UserAppAdmission {
+                    runtime_policy_on_success: None,
+                    command: None,
+                    metadata: None,
+                    app_id: app_id.clone(),
+                    lifecycle_id: Some(identity.lifecycle_id),
+                    operation_id: operation_id.clone(),
+                    request_id: None,
+                    request_fingerprint: "a".repeat(64),
+                    kind: shared_types::UserAppOperationKind::Start,
+                },
+            )
+            .await
+            .unwrap();
+            let error = AppOperationError::CredentialApplication {
+                diagnostic: None,
+                message: "Credential result requires recovery".into(),
+                mutation,
+            }
+            .with_operation_id(operation_id.clone());
+            operation.reject_without_mutation(&error).await.unwrap();
+            let current = service
+                .get_control_operation(&app_id, Some(&operation_id))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.state, UserAppOperationState::RecoveryRequired);
+            assert!(
+                service
+                    .get_control_operation(&app_id, None)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "uncertain credentials must retain the operation slot"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_claim_and_deadline_failures_keep_the_durable_operation() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = test_service(directory.path(), Arc::new(MockRuntime::default())).await;
+        let app_id = "admission-identity";
+        let identity = service
+            .metadata
+            .store
+            .ensure_identity(app_id)
+            .await
+            .unwrap();
+        let outcome = service
+            .metadata
+            .store
+            .admit(&UserAppAdmission {
+                runtime_policy_on_success: None,
+                command: None,
+                metadata: None,
+                app_id: app_id.into(),
+                lifecycle_id: Some(identity.lifecycle_id),
+                operation_id: "accepted-operation".into(),
+                request_id: Some("accepted-request".into()),
+                request_fingerprint: "a".repeat(64),
+                kind: shared_types::UserAppOperationKind::Start,
+            })
+            .await
+            .unwrap();
+        let UserAppAdmissionOutcome::Accepted(admitted) = outcome else {
+            panic!("fresh request must be accepted");
+        };
+        let owner =
+            OwnedOperation::claim_admitted(service.metadata.store.clone(), admitted.clone())
+                .await
+                .unwrap();
+        // The accepted receipt became stale before another executor's claim.
+        let claim_error =
+            match OwnedOperation::claim_admitted(service.metadata.store.clone(), admitted).await {
+                Ok(_) => panic!("stale claim must not replace the executor"),
+                Err(error) => error,
+            };
+        assert_eq!(claim_error.operation_id(), Some("accepted-operation"));
+        assert_eq!(claim_error.code(), shared_types::ERR_CONFLICT);
+        let before = service
+            .metadata
+            .store
+            .get_operation(app_id, "accepted-operation")
+            .await
+            .unwrap()
+            .unwrap();
+        // Invalid deadline exercises a real store rejection after admission.
+        let bind_error = owner
+            .bind_deadline(0)
+            .await
+            .expect_err("deadline must be positive");
+        assert_eq!(bind_error.operation_id(), Some("accepted-operation"));
+        assert!(bind_error.message().contains("deadline must be positive"));
+        let after = service
+            .metadata
+            .store
+            .get_operation(app_id, "accepted-operation")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "failed claim/bind must preserve execution evidence"
+        );
+        assert_eq!(after.state, UserAppOperationState::Running);
+        assert!(
+            service
+                .get_control_operation(app_id, None)
+                .await
+                .unwrap()
+                .is_some(),
+            "the accepted operation must still occupy its original scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn operation_queries_validate_owner_and_hide_internal_checkpoints() {
+        let directory = tempfile::tempdir().expect("directory");
+        let service = test_service(directory.path(), Arc::new(MockRuntime::default())).await;
+        let identity = service
+            .metadata
+            .store
+            .ensure_identity("query")
+            .await
+            .expect("identity");
+        let mut operation = OwnedOperation::admit(
+            service.metadata.store.clone(),
+            UserAppAdmission {
+                runtime_policy_on_success: None,
+                command: None,
+                metadata: None,
+                app_id: "query".into(),
+                lifecycle_id: Some(identity.lifecycle_id),
+                operation_id: "operation-query".into(),
+                request_id: Some("request".into()),
+                request_fingerprint: "a".repeat(64),
+                kind: shared_types::UserAppOperationKind::Start,
+            },
+        )
+        .await
+        .expect("admit");
+        operation
+            .checkpoint(
+                "prepared",
+                serde_json::json!({"private_reference":"not-public"}),
+            )
+            .await
+            .expect("checkpoint");
+        let public = service
+            .get_control_operation("query", None)
+            .await
+            .expect("query")
+            .expect("current");
+        let wire = serde_json::to_value(public).expect("JSON");
+        assert_eq!(wire["operation_id"], "operation-query");
+        for internal in ["executor_id", "checkpoint", "request_fingerprint"] {
+            assert!(wire.get(internal).is_none());
+        }
+        operation.succeed().await.expect("complete");
+        assert!(
+            service
+                .get_control_operation("query", None)
+                .await
+                .expect("current")
+                .is_none()
+        );
+        assert_eq!(
+            service
+                .get_control_operation("query", Some("operation-query"))
+                .await
+                .expect("history")
+                .expect("record")
+                .state,
+            UserAppOperationState::Succeeded
+        );
+    }
+    #[tokio::test]
+    async fn recreation_requires_old_lifecycle_and_duplicate_returns_same_new_identity() {
+        let directory = tempfile::tempdir().expect("directory");
+        let runtime = Arc::new(MockRuntime::default());
+        let service = test_service(directory.path(), runtime.clone()).await;
+        service
+            .set_dev_locator(Arc::new(NoBuilder))
+            .expect("locator");
+        let old = service
+            .metadata
+            .store
+            .ensure_identity("recreate")
+            .await
+            .expect("identity");
+        let deletion = OwnedOperation::admit(
+            service.metadata.store.clone(),
+            UserAppAdmission {
+                runtime_policy_on_success: None,
+                command: None,
+                metadata: None,
+                app_id: "recreate".into(),
+                lifecycle_id: Some(old.lifecycle_id.clone()),
+                operation_id: "delete".into(),
+                request_id: None,
+                request_fingerprint: "a".repeat(64),
+                kind: shared_types::UserAppOperationKind::DeleteApplication,
+            },
+        )
+        .await
+        .expect("admit");
+        crate::test_support::complete_empty_deletion_fixture(deletion).await;
+        let request = shared_types::UserAppRecreateRequest {
+            expected_lifecycle_id: old.lifecycle_id.clone(),
+            request_id: "recreate-request".into(),
+        };
+        let next = service
+            .recreate_identity("recreate", request.clone())
+            .await
+            .expect("recreate");
+        assert_ne!(next.lifecycle_id, old.lifecycle_id);
+        assert_eq!(next.lifecycle_epoch, 2);
+        for lifecycle_id in [None, Some(old.lifecycle_id.clone())] {
+            let late = crate::models::StartAppRequest {
+                lifecycle_id,
+                ..Default::default()
+            };
+            assert!(matches!(
+                service.start_app_enhanced("recreate", late.clone()).await,
+                Err(AppOperationError::Conflict(_))
+            ));
+            assert!(matches!(
+                service.restart_app_enhanced("recreate", late).await,
+                Err(AppOperationError::Conflict(_))
+            ));
+        }
+        assert_eq!(
+            runtime
+                .create_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            runtime
+                .delete_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        service
+            .metadata
+            .validate_request_lifecycle("recreate", Some(&next.lifecycle_id))
+            .await
+            .expect("current lifecycle is accepted");
+        runtime.deployments.insert(
+            "recreate".into(),
+            container_runtime_api::DeploymentStatus {
+                app_id: "recreate".into(),
+                ..Default::default()
+            },
+        );
+        let duplicate = service
+            .recreate_identity("recreate", request)
+            .await
+            .expect("duplicate despite new runtime");
+        assert_eq!(next, duplicate);
+        assert!(
+            service
+                .get_control_operation("recreate", Some("delete"))
+                .await
+                .is_err()
+        );
+        assert!(
+            service
+                .recreate_identity(
+                    "recreate",
+                    shared_types::UserAppRecreateRequest {
+                        expected_lifecycle_id: old.lifecycle_id,
+                        request_id: "different-request".into()
+                    }
+                )
+                .await
+                .is_err()
+        );
+    }
+}

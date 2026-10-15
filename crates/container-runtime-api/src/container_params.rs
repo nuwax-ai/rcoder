@@ -9,14 +9,36 @@ use super::types::{AppHealthCheck, AppPortSpec, AppResourceRequirements};
 ///
 /// Bundles all parameters needed for container creation to avoid
 /// long parameter lists that hurt code readability and maintainability.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ContainerCreateParams {
-    /// Project identifier (used as container name base for RCoder service)
+    /// Local signal derived from durable priority control; never serialized.
+    /// Runtimes consume it only between acknowledged writes or in readonly waits.
+    #[serde(skip)]
+    pub creation_cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Durable userApp operation identity; absent for Agent operations.
+    pub execution_context: Option<shared_types::UserAppExecutionContext>,
+    /// Physical update target captured before any application mutation.
+    pub mutation_target: Option<shared_types::UserAppMutationTarget>,
+    /// Explicit durable proof for an adopted legacy builder resource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_binding: Option<shared_types::UserAppResourceBinding>,
+    /// Project identifier (used as container name base for RCoder service)。
+    /// UserappBuilder 场景此槽位装复合实例串 `{user_id}-{app_id}`（命名链
+    /// 单一事实源）——**容器内契约消费方（env 注入等）不得直接用本字段**，
+    /// 改用 [`Self::builder_app_id`]（显式纯段，语义不重载）。
     pub project_id: Option<String>,
+    /// UserappBuilder 的纯 app_id 段（容器内契约：agent_runner profiler 标签、
+    /// PROJECT_ID env 等）。仅 builder 创建路径填充；None=非 builder 或存量
+    /// 路径（消费方回落 project_id 右切，兼容存量裸 app_id 形态）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder_app_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "shared_types::BuilderStartupMode::is_preserve"
+    )]
+    pub builder_startup_mode: shared_types::BuilderStartupMode,
     /// User identifier (used as container name base for ComputerAgentRunner)
     pub user_id: Option<String>,
-    /// Workspace path on host
-    pub host_workspace_path: String,
     /// Service type determining container purpose
     pub service_type: ServiceType,
     /// Optional resource constraints
@@ -33,10 +55,10 @@ pub struct ContainerCreateParams {
     /// Only effective in K8s mode, Docker mode ignores this parameter
     pub storage_size: Option<String>,
 
-    // ===== UserApp 专用字段（agent 路径不传，全 Option 向后兼容）=====
-    /// 镜像覆盖（UserApp 必填，优先于 ServiceType 驱动的 select_image）
+    // ===== Userapp 专用字段（agent 路径不传，全 Option 向后兼容）=====
+    /// 镜像覆盖（Userapp 必填，优先于 ServiceType 驱动的 select_image）
     pub image_override: Option<String>,
-    /// 启动命令（UserApp 用，agent 路径由 ServiceType 决定）
+    /// 启动命令（Userapp 用，agent 路径由 ServiceType 决定）
     pub command: Option<Vec<String>>,
     /// 启动参数
     pub args: Option<Vec<String>>,
@@ -44,19 +66,90 @@ pub struct ContainerCreateParams {
     pub env: Option<HashMap<String, String>>,
     /// 敏感环境变量（K8s 模式进 Secret，Docker 模式合并进 env）
     pub secrets: Option<HashMap<String, String>>,
-    /// 端口配置（UserApp 用）
+    /// 端口配置（Userapp 用）
     pub ports: Option<Vec<AppPortSpec>>,
-    /// 健康检查配置（UserApp 用）
+    /// 健康检查配置（Userapp 用）
     pub health_check: Option<AppHealthCheck>,
-    /// 应用资源需求（字符串格式；与 resource_limits 二选一，UserApp 专用）
+    /// 应用资源需求（字符串格式；与 resource_limits 二选一，Userapp 专用）
     pub app_resources: Option<AppResourceRequirements>,
-    /// 是否参与闲置自动回收（UserApp 用；None/Some(true)=可回收=免费用户默认，Some(false)=永不回收=付费/常驻）
+    /// 是否参与闲置自动回收（Userapp 用；None/Some(true)=可回收=免费用户默认，Some(false)=永不回收=付费/常驻）
     pub recycle_enabled: Option<bool>,
-    /// 闲置回收阈值秒数（UserApp 用；None=用全局默认，Some=per-app 覆盖）
+    /// 闲置回收阈值秒数（Userapp 用；None=用全局默认，Some=per-app 覆盖）
     pub idle_timeout_seconds: Option<u64>,
 }
 
 impl ContainerCreateParams {
+    pub fn validate_execution_context(&self) -> super::types::ContainerRuntimeResult<()> {
+        // UserApp platform identity is checked in each input independently:
+        // Docker merges secrets over env, while Kubernetes uses envFrom.
+        if self.service_type == ServiceType::Userapp {
+            let app_id = self
+                .execution_context
+                .as_ref()
+                .map(|context| context.app_id.as_str())
+                .or(self.project_id.as_deref());
+            for environment in [&self.env, &self.secrets] {
+                if let Some(value) = environment
+                    .as_ref()
+                    .and_then(|values| values.get("PROJECT_ID"))
+                    && Some(value.as_str()) != app_id
+                {
+                    return Err(super::types::ContainerRuntimeError::ConfigurationError(
+                        "Explicit PROJECT_ID differs from the UserApp operation identity".into(),
+                    ));
+                }
+            }
+        }
+        let Some(context) = &self.execution_context else {
+            if self.mutation_target.is_some() || self.resource_binding.is_some() {
+                return Err(super::types::ContainerRuntimeError::ConfigurationError(
+                    "Captured mutation target or binding requires execution context".into(),
+                ));
+            }
+            return Ok(());
+        };
+        if let Some(binding) = &self.resource_binding {
+            if self.service_type != ServiceType::UserappBuilder {
+                return Err(super::types::ContainerRuntimeError::ConfigurationError(
+                    "Physical builder binding requires builder service family".into(),
+                ));
+            }
+            binding
+                .validate(context, &binding.physical_uid)
+                .map_err(super::types::ContainerRuntimeError::ConfigurationError)?;
+        }
+        if let Some(target) = &self.mutation_target
+            && (&target.context != context
+                || target.resource.uid.is_empty()
+                || target.resource.name.is_empty())
+        {
+            return Err(super::types::ContainerRuntimeError::ConfigurationError(
+                "Captured mutation target does not belong to this operation".into(),
+            ));
+        }
+        if !matches!(
+            self.service_type,
+            ServiceType::Userapp | ServiceType::UserappBuilder
+        ) {
+            return Err(super::types::ContainerRuntimeError::ConfigurationError(
+                "Application context requires UserApp service family".into(),
+            ));
+        }
+        let identifier = self
+            .service_type
+            .container_identifier(
+                self.pod_id.as_deref(),
+                self.user_id.as_deref(),
+                self.project_id.as_deref(),
+            )
+            .map_err(|error| {
+                super::types::ContainerRuntimeError::ConfigurationError(error.to_string())
+            })?;
+        context
+            .validate_identity(identifier)
+            .map_err(super::types::ContainerRuntimeError::ConfigurationError)
+    }
+
     /// Create a new builder for container create params
     pub fn builder() -> ContainerCreateParamsBuilder {
         ContainerCreateParamsBuilder::default()
@@ -65,9 +158,12 @@ impl ContainerCreateParams {
 
 #[derive(Debug, Clone, Default)]
 pub struct ContainerCreateParamsBuilder {
+    execution_context: Option<shared_types::UserAppExecutionContext>,
+    resource_binding: Option<shared_types::UserAppResourceBinding>,
     project_id: Option<String>,
+    builder_app_id: Option<String>,
+    builder_startup_mode: shared_types::BuilderStartupMode,
     user_id: Option<String>,
-    host_workspace_path: Option<String>,
     service_type: Option<ServiceType>,
     resource_limits: Option<ServiceResourceLimits>,
     pod_id: Option<String>,
@@ -88,6 +184,25 @@ pub struct ContainerCreateParamsBuilder {
 }
 
 impl ContainerCreateParamsBuilder {
+    pub fn resource_binding(mut self, binding: shared_types::UserAppResourceBinding) -> Self {
+        self.resource_binding = Some(binding);
+        self
+    }
+    pub fn execution_context(mut self, context: shared_types::UserAppExecutionContext) -> Self {
+        self.execution_context = Some(context);
+        self
+    }
+    /// UserappBuilder 容器内契约的纯 app_id（显式传值，避免 project_id 复用歧义）。
+    pub fn builder_app_id(mut self, app_id: impl Into<String>) -> Self {
+        self.builder_app_id = Some(app_id.into());
+        self
+    }
+
+    pub fn builder_startup_mode(mut self, mode: shared_types::BuilderStartupMode) -> Self {
+        self.builder_startup_mode = mode;
+        self
+    }
+
     pub fn project_id(mut self, project_id: impl Into<String>) -> Self {
         self.project_id = Some(project_id.into());
         self
@@ -95,11 +210,6 @@ impl ContainerCreateParamsBuilder {
 
     pub fn user_id(mut self, user_id: impl Into<String>) -> Self {
         self.user_id = Some(user_id.into());
-        self
-    }
-
-    pub fn host_workspace_path(mut self, host_workspace_path: impl Into<String>) -> Self {
-        self.host_workspace_path = Some(host_workspace_path.into());
         self
     }
 
@@ -190,9 +300,14 @@ impl ContainerCreateParamsBuilder {
 
     pub fn build(self) -> ContainerCreateParams {
         ContainerCreateParams {
+            creation_cancelled: Default::default(),
+            execution_context: self.execution_context,
+            mutation_target: None,
+            resource_binding: self.resource_binding,
             project_id: self.project_id,
+            builder_app_id: self.builder_app_id,
+            builder_startup_mode: self.builder_startup_mode,
             user_id: self.user_id,
-            host_workspace_path: self.host_workspace_path.unwrap_or_default(),
             service_type: self.service_type.unwrap_or(ServiceType::WebAgentRunner),
             resource_limits: self.resource_limits,
             pod_id: self.pod_id,
@@ -213,3 +328,92 @@ impl ContainerCreateParamsBuilder {
         }
     }
 }
+
+#[cfg(test)]
+mod mutation_target_tests {
+    use super::*;
+    #[test]
+    fn captured_target_requires_the_exact_admitted_operation() {
+        let context = shared_types::UserAppExecutionContext {
+            app_id: "app-one".into(),
+            lifecycle_id: "life-one".into(),
+            operation_id: "update-one".into(),
+            executor_id: "executor-one".into(),
+            request_fingerprint: "a".repeat(64),
+        };
+        let mut params = ContainerCreateParams::builder()
+            .project_id("app-one")
+            .user_id("owner-one")
+            .service_type(ServiceType::Userapp)
+            .execution_context(context.clone())
+            .build();
+        params.mutation_target = Some(shared_types::UserAppMutationTarget {
+            context,
+            resource: shared_types::AppResourceIdentity {
+                kind: shared_types::AppResourceKind::Deployment,
+                name: "rcoder-app-one".into(),
+                uid: "original-uid".into(),
+                resource_version: Some("12".into()),
+            },
+        });
+        params.validate_execution_context().expect("same operation");
+        let mut foreign = params.clone();
+        foreign
+            .mutation_target
+            .as_mut()
+            .expect("target")
+            .context
+            .operation_id = "other-operation".into();
+        assert!(foreign.validate_execution_context().is_err());
+        let mut missing = params.clone();
+        missing.execution_context = None;
+        assert!(missing.validate_execution_context().is_err());
+        params
+            .mutation_target
+            .as_mut()
+            .expect("target")
+            .resource
+            .uid
+            .clear();
+        assert!(params.validate_execution_context().is_err());
+    }
+    #[test]
+    fn adopted_binding_requires_builder_context_and_current_lifecycle() {
+        let context = shared_types::UserAppExecutionContext {
+            app_id: "app".into(),
+            lifecycle_id: "life".into(),
+            operation_id: "wake".into(),
+            executor_id: "worker".into(),
+            request_fingerprint: "a".repeat(64),
+        };
+        let binding = shared_types::UserAppResourceBinding {
+            app_id: "app".into(),
+            lifecycle_id: "life".into(),
+            service_type: ServiceType::UserappBuilder,
+            physical_uid: "physical-original".into(),
+            adopted_by_operation: "adopt".into(),
+        };
+        let mut params = ContainerCreateParams::builder()
+            .project_id("app")
+            .user_id("owner")
+            .service_type(ServiceType::UserappBuilder)
+            .resource_binding(binding)
+            .build();
+        assert!(params.validate_execution_context().is_err());
+        params.execution_context = Some(context);
+        params.validate_execution_context().expect("bound builder");
+        params.service_type = ServiceType::Userapp;
+        assert!(params.validate_execution_context().is_err());
+        params.service_type = ServiceType::UserappBuilder;
+        params
+            .resource_binding
+            .as_mut()
+            .expect("binding")
+            .lifecycle_id = "obsolete-life".into();
+        assert!(params.validate_execution_context().is_err());
+    }
+}
+
+#[cfg(test)]
+#[path = "container_params/project_identity_tests.rs"]
+mod project_identity_tests;

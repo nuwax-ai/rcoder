@@ -3,7 +3,7 @@
 //! 按职责拆分:
 //! - [`mod@self`] (本文件): [`Config`] 结构定义、默认值与常量;
 //! - [`env`][]: 环境变量解析工具与限额校验;
-//! - [`load`][]: 配置文件/环境变量加载入口与 [`Config::validate`]。
+//! - `load`: 配置文件/环境变量加载入口与 [`Config::validate`]。
 //!
 //! 仅含业务路径与开关; 工作区根 (project/computer) 由 [`crate::workspace::WorkspaceResolver`] 负责。
 
@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use shared_types::AGENT_FILE_SERVER_PORT;
-use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, WORKSPACE_ROOT};
+use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, USERAPP_WORKSPACE_ROOT, WORKSPACE_ROOT};
 
 pub use self::env::MAX_UPLOAD_FILE_SIZE_BYTES;
 use self::env::{default_attachment_extensions, split_default};
@@ -79,6 +79,23 @@ impl std::str::FromStr for DeploymentMode {
     }
 }
 
+// ── 默认值常量 (Default impl 与 load.rs env 回退共享, 单一事实源) ────────────────
+
+/// 遍历时排除的目录 (对齐 TS env.development TRAVERSE_EXCLUDE_DIRS)。
+pub(crate) const DEFAULT_TRAVERSE_EXCLUDE_DIRS: &str = "dist,node_modules,.pnpm-store,__MACOSX,.attachments,.git,.agents,.codex,.opencode,.grok,.pi,.logs";
+/// 备份时排除的文件。
+pub(crate) const DEFAULT_BACKUP_TRAVERSE_EXCLUDE_FILES: &str =
+    "pnpm-lock.yaml,yarn.lock,package-lock.json";
+/// 内容遍历时排除的文件 (对齐 TS env.development CONTENT_TRAVERSE_EXCLUDE_FILES)。
+pub(crate) const DEFAULT_CONTENT_TRAVERSE_EXCLUDE_FILES: &str =
+    "AGENT.md,AGENTS.md,CLAUDE.md,pnpm-lock.yaml,yarn.lock,package-lock.json";
+/// 内联图片扩展名。
+pub(crate) const DEFAULT_INLINE_IMAGE_EXTENSIONS: &str =
+    ".png,.jpg,.jpeg,.gif,.bmp,.svg,.ico,.webp,.avif";
+/// zip-workspace 排除列表（含 dev 部署运行目录 .run/.previous/.staging——平台
+/// 生成的解压产物与轮换现场，不进下载包；.agent-store 技能实体库对齐 TS 6ab47b7）。
+pub(crate) const DEFAULT_ZIP_WORKSPACE_EXCLUDE: &str = ".git,.tmp,.claude,.agents,.codex,.opencode,.grok,.pi,.agent-store,.logs,.npmrc,__pycache__,node_modules,dist,pnpm-lock.yaml,yarn.lock,package-lock.json,.run,.previous,.staging";
+
 /// 全局配置 (启动时构造一次, 经 AppState 共享)。
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -87,9 +104,31 @@ pub struct Config {
     pub listen_host: String,
     pub port: u16,
     pub project_source_dir: PathBuf,
+    /// [`Config::project_source_dir`] 是否经 env `PROJECT_SOURCE_DIR` 显式注入——
+    /// **部署形态判据**（非配置开关）：沙箱（agent 容器）形态 start-up.sh 恒
+    /// `export PROJECT_SOURCE_DIR=/home/user`；主容器（rcoder 主 Pod / cutover
+    /// 接管 TS 存量域）形态不注入。normalProject 定位与 agent-store 锚点据此
+    /// 分流视角（computer::computer_root_for_context：显式注入=沙箱视角，
+    /// 未注入=主容器视角 `{COMPUTER_WORKSPACE_DIR}/{userId}/...`，对齐 TS 1.4.8）。
+    /// 配置文件直接给 `project_source_dir` 赋值不置位（部署契约只认 env 注入）。
+    #[serde(skip)]
+    pub project_source_dir_explicit: bool,
     pub computer_workspace_dir: PathBuf,
+    /// Userapp 开发卷根 (env `USERAPP_WORKSPACE_DIR`; 沙箱挂载点, 见 paths::USERAPP_WORKSPACE_ROOT)。
+    pub userapp_workspace_dir: PathBuf,
+    /// 单 app 模式归属 (env `USERAPP_SINGLE_APP_ID`)。
+    ///
+    /// Some 时本 file-server 只服务该 app——**生产运行容器形态**：卷根即 app 根
+    /// (`resolve_userapp_dev` 不 join app_id、拒绝不匹配 appId 与 customTargetDir)。
+    /// None = 开发容器形态（多 app 共享开发卷，现状）。
+    pub userapp_single_app_id: Option<String>,
     pub service_log_dir: PathBuf,
     pub service_log_retention_days: usize,
+    /// workspace 构建产物（`builds/workspace-package-*.zip`）与构建 temp 日志
+    /// （`dev-temp-*.log`）保留的最近构建数（按文件名字典序=uuid v7 时间序）。
+    pub build_artifact_retain_count: usize,
+    /// workspace 构建与 dev server 的 main 日志（`dev-YYYY-MM-DD.log`）保留天数。
+    pub build_log_retention_days: usize,
 
     // —— 业务目录 ——
     pub init_project_dir: PathBuf,
@@ -168,10 +207,22 @@ pub struct Config {
     pub dev_stop_check_interval_ms: u64,
     /// stop 后最大轮询次数 (对齐 nuwax 50, 合计 5s)。
     pub dev_stop_max_attempts: u32,
+    /// 本地监督停止（同请求续行）的单目标预算秒数（默认 90：覆盖守护树
+    /// 排空与离线收据；超时 attempt 保留续行，不放大不截断合法慢收束。
+    /// 测试注入小值确定性覆盖续查路径）。
+    pub dev_supervision_stop_budget_secs: u64,
     /// build/install 命令超时秒 (对齐 nuwax 10min)。
     pub dev_command_timeout_secs: u64,
     /// build 全局并发上限 (对齐 nuwax MAX_BUILD_CONCURRENCY, 默认 20)。
     pub max_build_concurrency: usize,
+    /// UserApp 等待构建槽的独立预算（秒）；不计入每条编译命令超时。
+    pub userapp_build_wait_timeout_secs: u64,
+    /// UserApp manifest 编排器程序（P1-03 测试注入：受控假编排器路径；
+    /// None = PATH 上的 `app-cli`，生产行为不变）。
+    pub app_cli_bin: Option<String>,
+    /// app-cli 管理 API 探测地址（P3-02 owner 复用：spawn 前探测既有
+    /// owner；生产默认 127.0.0.1:3010，测试注入空闲端口避免跨测试竞争）。
+    pub app_cli_admin_probe_addr: String,
 }
 
 impl Default for Config {
@@ -180,9 +231,14 @@ impl Default for Config {
             listen_host: "0.0.0.0".to_string(),
             port: AGENT_FILE_SERVER_PORT,
             project_source_dir: PathBuf::from(WORKSPACE_ROOT),
+            project_source_dir_explicit: false,
             computer_workspace_dir: PathBuf::from(COMPUTER_WORKSPACE_ROOT),
+            userapp_workspace_dir: PathBuf::from(USERAPP_WORKSPACE_ROOT),
+            userapp_single_app_id: None,
             service_log_dir: PathBuf::from("/app/logs/file-server"),
             service_log_retention_days: 7,
+            build_artifact_retain_count: 3,
+            build_log_retention_days: 7,
             init_project_dir: PathBuf::from("/app/project_init"),
             upload_project_dir: PathBuf::from("/app/project_zips"),
             dist_target_dir: PathBuf::from("/app/project_nginx"),
@@ -208,25 +264,15 @@ impl Default for Config {
             log_read_max_bytes: 64 * 1024 * 1024,
             upload_allowed_extensions: vec![".zip".to_string()],
             attachment_allowed_extensions: default_attachment_extensions(),
-            traverse_exclude_dirs: split_default(
-                "dist,node_modules,.pnpm-store,__MACOSX,.attachments,.git,.agents,.codex,.opencode,.grok,.pi,.logs",
-            ),
-            backup_traverse_exclude_files: split_default(
-                "pnpm-lock.yaml,yarn.lock,package-lock.json",
-            ),
-            content_traverse_exclude_files: split_default(
-                "pnpm-lock.yaml,yarn.lock,package-lock.json",
-            ),
-            inline_image_extensions: split_default(
-                ".png,.jpg,.jpeg,.gif,.bmp,.svg,.ico,.webp,.avif",
-            ),
-            zip_workspace_exclude: split_default(
-                ".git,.tmp,.claude,.agents,.codex,.opencode,.grok,.pi,.logs,.npmrc,__pycache__,node_modules,dist,pnpm-lock.yaml,yarn.lock,package-lock.json",
-            ),
+            traverse_exclude_dirs: split_default(DEFAULT_TRAVERSE_EXCLUDE_DIRS),
+            backup_traverse_exclude_files: split_default(DEFAULT_BACKUP_TRAVERSE_EXCLUDE_FILES),
+            content_traverse_exclude_files: split_default(DEFAULT_CONTENT_TRAVERSE_EXCLUDE_FILES),
+            inline_image_extensions: split_default(DEFAULT_INLINE_IMAGE_EXTENSIONS),
+            zip_workspace_exclude: split_default(DEFAULT_ZIP_WORKSPACE_EXCLUDE),
             git_enabled: false,
             git_default_author_name: "Nuwax File Server".to_string(),
             git_default_author_email: "git@nuwax.com".to_string(),
-            git_diff_max_file_size_bytes: 16 * 1024 * 1024,
+            git_diff_max_file_size_bytes: 1024 * 1024,
             git_diff_max_total_bytes: 64 * 1024 * 1024,
             git_diff_max_output_bytes: 64 * 1024 * 1024,
             git_file_content_max_bytes: 64 * 1024 * 1024,
@@ -245,8 +291,12 @@ impl Default for Config {
             dev_alive_poll_interval_ms: 300,
             dev_stop_check_interval_ms: 100,
             dev_stop_max_attempts: 50,
+            dev_supervision_stop_budget_secs: 90,
             dev_command_timeout_secs: 600,
             max_build_concurrency: 20,
+            userapp_build_wait_timeout_secs: 3600,
+            app_cli_bin: None,
+            app_cli_admin_probe_addr: "127.0.0.1:3010".to_string(),
         }
     }
 }
@@ -256,5 +306,21 @@ impl Config {
     pub fn ext_allowed(&self, list: &[String], ext: &str) -> bool {
         list.iter()
             .any(|candidate| candidate.eq_ignore_ascii_case(ext))
+    }
+
+    /// 上传/构建共享临时目录（`{upload_project_dir}/temp`）——收敛各处
+    /// `upload_project_dir.join("temp")` 咒语的单一事实源。
+    pub fn upload_temp_dir(&self) -> PathBuf {
+        self.upload_project_dir.join("temp")
+    }
+
+    /// dev 停止排空/等待预算（FS-09 统一换算）：`attempts × interval` 以毫秒
+    /// 精度计算（200ms 不再截断为 0 秒）, 溢出由 `validate()` 在配置加载时
+    /// 前置拒绝, 此处 saturating 仅作防御。stdout 排空与进程退出等待共用
+    /// 同一个 deadline。
+    pub fn dev_stop_drain_budget(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            u64::from(self.dev_stop_max_attempts).saturating_mul(self.dev_stop_check_interval_ms),
+        )
     }
 }

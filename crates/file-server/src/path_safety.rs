@@ -5,7 +5,8 @@
 //! - `path-clean` 按成熟的词法规约规则消除 `.`/`..`，不访问文件系统;
 //! - 规范化后用 `starts_with` 比较 → 确保落在 base 下。
 //!
-//! 全程不依赖文件系统存在性 (不 `canonicalize`), 不做字符串 `replace` / 手动 `split`。
+//! 基础 helper 仅做词法检查，不依赖文件系统存在性；`ensure_resolved_within`
+//! 另解析最近存在的祖先，拒绝经 symlink/junction 逃出所选根目录。
 //!
 //! 注: 本模块**不做根目录白名单限制** (`customTargetDir` 等根路径完全信任调用方):
 //! 产品运行于容器内、内网私有化部署, 且用户客户端复用本模块逻辑,
@@ -16,6 +17,11 @@ use std::path::{Path, PathBuf};
 use path_clean::PathClean;
 
 use crate::error::{AppError, AppResult};
+
+#[cfg(unix)]
+mod scoped_parent;
+#[cfg(unix)]
+pub use scoped_parent::ScopedParent;
 
 /// 业务文件路径校验: `relative` 解析后必须落在 `base` 下, 越界返回 `Err`。
 /// 对齐 nuwax `uploadSingleFile` (抛错风格)。
@@ -71,10 +77,167 @@ pub fn safe_zip_entry(extract_path: &Path, entry_name: &str) -> AppResult<PathBu
     }
 }
 
+/// Validate both lexical containment and the actual existing ancestor chain.
+/// The caller may freely select a workspace root, including a root that is a link.
+/// Links below that root must not resolve outside it. Missing suffixes are kept so
+/// new directories/files can be validated before any filesystem mutation.
+/// This is a preflight/recheck, not a handle-relative defense against a concurrent
+/// hostile OS process replacing links between this check and the subsequent I/O.
+pub async fn ensure_resolved_within(base: &Path, relative: &str) -> AppResult<PathBuf> {
+    let target = ensure_within(base, relative)?;
+    let resolved_base = resolve_existing_ancestor(base).await?;
+    let resolved_target = resolve_existing_ancestor(&target).await?;
+    if !resolved_target.starts_with(&resolved_base) {
+        return Err(AppError::validation(
+            "File path resolves outside the workspace directory",
+        ));
+    }
+    Ok(target)
+}
+
+/// realpath 级根边界 (对齐 TS e822516 escapesRoot): `target` 是调用方字面解析后的
+/// 绝对路径 (如 `resolve_subdir` 的产物), 与 `base` 一起沿存在祖先链解析符号链接
+/// (含目录链接中段、链式链接) 后必须满足前缀包含。缺失后缀保留——不存在的
+/// 路径不在此层报错, 由调用方常规缺失流程处理; 与 [`ensure_resolved_within`]
+/// 同水位, 区别是入口已是绝对路径而非待解析的相对字符串。
+pub async fn ensure_resolved_target_within(base: &Path, target: &Path) -> AppResult<()> {
+    let resolved_base = resolve_existing_ancestor(base).await?;
+    let resolved_target = resolve_existing_ancestor(target).await?;
+    if !resolved_target.starts_with(&resolved_base) {
+        return Err(AppError::validation(
+            "File path resolves outside the workspace directory",
+        ));
+    }
+    Ok(())
+}
+
+async fn resolve_existing_ancestor(path: &Path) -> AppResult<PathBuf> {
+    let mut probe = std::path::absolute(path)
+        .map_err(|error| AppError::validation(format!("Resolve file path: {error}")))?
+        .clean();
+    let mut suffix = Vec::new();
+    loop {
+        match tokio::fs::symlink_metadata(&probe).await {
+            Ok(_) => {
+                let mut resolved = tokio::fs::canonicalize(&probe).await.map_err(|error| {
+                    AppError::validation(format!("Resolve workspace path ancestor: {error}"))
+                })?;
+                for component in suffix.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = probe
+                    .file_name()
+                    .ok_or_else(|| {
+                        AppError::validation("No accessible ancestor for workspace path")
+                    })?
+                    .to_os_string();
+                suffix.push(component);
+                if !probe.pop() {
+                    return Err(AppError::validation(
+                        "No accessible ancestor for workspace path",
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(AppError::validation(format!(
+                    "Inspect workspace path ancestor: {error}"
+                )));
+            }
+        }
+    }
+}
+
+/// 宿主相对路径 → wire 名（FS-08 唯一转换点）：仅 Windows 把 `\` 归一为 `/`
+/// （宿主路径分隔符）; POSIX 下反斜杠是合法文件名字符, **原样保留**——无条件
+/// 替换曾把 Linux 的 `a\b.txt` 回传成 `a/b.txt`（URL 指向错误路径、与真实
+/// `a/b.txt` 归档同名碰撞）。
+pub fn host_relative_to_wire(relative: &str) -> String {
+    if cfg!(windows) {
+        relative.replace('\\', "/")
+    } else {
+        relative.to_string()
+    }
+}
+
+/// no-follow leaf 写入（Unix `O_NOFOLLOW`）：目标已是符号链接时得到 ELOOP，
+/// 不会跟随写出所选根。供 Git 物化与 UserApp 上传等落盘路径共用。
+pub fn write_file_nofollow_blocking(dest: &Path, data: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode as RawMode, OFlags};
+        use std::io::Write as _;
+        let fd = rustix::fs::openat(
+            rustix::fs::CWD,
+            dest,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            RawMode::RUSR
+                | RawMode::WUSR
+                | RawMode::RGRP
+                | RawMode::WGRP
+                | RawMode::ROTH
+                | RawMode::WOTH,
+        )?;
+        let mut file = std::fs::File::from(fd);
+        file.write_all(data)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(dest, data)
+    }
+}
+
+/// 流式 no-follow 拷贝（`src` 已落盘文件 → `dest` leaf）：dest 为符号链接时
+/// 失败而非跟随。Unix 用 `O_NOFOLLOW`; 非 Unix 退化为普通拷贝（词法与祖先
+/// 预检仍生效, 如实声明）。
+pub fn copy_file_nofollow_blocking(src: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode as RawMode, OFlags};
+        let mut input = std::fs::File::open(src)?;
+        let fd = rustix::fs::openat(
+            rustix::fs::CWD,
+            dest,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            RawMode::RUSR
+                | RawMode::WUSR
+                | RawMode::RGRP
+                | RawMode::WGRP
+                | RawMode::ROTH
+                | RawMode::WOTH,
+        )?;
+        let mut output = std::fs::File::from(fd);
+        std::io::copy(&mut input, &mut output)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::copy(src, dest).map(|_| ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// FS-08: 宿主→wire 转换的单一语义——POSIX 保留反斜杠文件名, 仅 Windows
+    /// 归一宿主分隔符。
+    #[test]
+    fn host_relative_to_wire_preserves_posix_backslash() {
+        #[cfg(unix)]
+        {
+            assert_eq!(host_relative_to_wire(r"a\b.txt"), r"a\b.txt");
+            assert_eq!(host_relative_to_wire("sub/a\\b.txt"), "sub/a\\b.txt");
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(host_relative_to_wire(r"a\b.txt"), "a/b.txt");
+        }
+    }
 
     #[test]
     fn ensure_within_accepts_nested() {
@@ -131,5 +294,47 @@ mod tests {
             safe_zip_entry(&ex, "skills/foo/SKILL.md").unwrap(),
             PathBuf::from("/tmp/extract/skills/foo/SKILL.md")
         );
+    }
+
+    // ── TS e822516 escapesRoot 对齐: realpath 级根边界 (绝对路径入口) ────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_resolved_target_within_three_states() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("session");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("a.txt"), "x").unwrap();
+        std::os::unix::fs::symlink("sub", root.join("inside-dir")).unwrap();
+        std::os::unix::fs::symlink("..", root.join("outside-dir")).unwrap();
+
+        // 界内: 字面子目录 / 界内目录链接中段 / 缺失后缀 (不在此层报错)
+        ensure_resolved_target_within(&root, &root.join("sub"))
+            .await
+            .unwrap();
+        ensure_resolved_target_within(&root, &root.join("inside-dir").join("a.txt"))
+            .await
+            .unwrap();
+        ensure_resolved_target_within(&root, &root.join("sub").join("missing.txt"))
+            .await
+            .unwrap();
+
+        // 界外: relativePath 指进越界目录链接 (realpath 后落在根之外)
+        let err = ensure_resolved_target_within(&root, &root.join("outside-dir"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(..)), "{err:?}");
+        let err =
+            ensure_resolved_target_within(&root, &root.join("outside-dir").join("secret.txt"))
+                .await
+                .unwrap_err();
+        assert!(matches!(err, AppError::Validation(..)), "{err:?}");
+        // 越界目录链接自身指向的文件 (链接条目在界内, 目标在界外)
+        std::fs::write(outer.path().join("secret.txt"), "x").unwrap();
+        std::os::unix::fs::symlink("../secret.txt", root.join("outside-file.txt")).unwrap();
+        let err = ensure_resolved_target_within(&root, &root.join("outside-file.txt"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(..)), "{err:?}");
     }
 }

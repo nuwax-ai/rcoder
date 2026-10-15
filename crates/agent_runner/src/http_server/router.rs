@@ -2,8 +2,6 @@
 //!
 //! 定义所有 HTTP 端点和路由
 
-#![allow(dead_code)]
-
 use axum::{
     Json, Router,
     routing::{get, post},
@@ -38,13 +36,15 @@ impl AppState {
         config: AppConfig,
         agent_session_service: Arc<AgentSessionService>,
         shared_api_key_manager: Arc<DashMap<String, shared_types::ModelProviderConfig>>,
+        project_uuid_map: Option<Arc<DashMap<String, String>>>,
     ) -> Self {
         Self {
             config,
             agent_session_service: agent_session_service.clone(),
             api_key_manager: Arc::new(ApiKeyManager::from_shared(shared_api_key_manager.clone())),
             shared_api_key_manager,
-            project_uuid_map: Arc::new(DashMap::new()),
+            // 注入共享实例（gRPC 双开时跨协议清理可见）；None = 单 HTTP 形态自建
+            project_uuid_map: project_uuid_map.unwrap_or_else(|| Arc::new(DashMap::new())),
             agent_mgmt_http_state: None,
         }
     }
@@ -125,7 +125,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .with_state(state.clone());
 
     // DevComputer 调试路由 — 共享 /computer/* 容器和处理逻辑
-    // chat 需要注入 auto_reload（devcomputer_chat.rs），progress 需要返回类型适配（devcomputer_handlers.rs）
+    // chat 需要注入 auto_reload（devcomputer_chat.rs）；progress 需要独立的 #[utoipa::path]
+    // 属性才能保住自己的 OpenAPI 条目（devcomputer_handlers.rs），流式逻辑仍无副本
     // 其余路由直接复用 computer_* handler
     let devcomputer_routes = Router::new()
         .route(
@@ -195,15 +196,34 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         Router::new()
     };
 
-    // 组合路由
-    Router::new()
-        .merge(computer_routes)
-        .merge(devcomputer_routes)
-        .merge(rcoder_routes)
-        .merge(api_routes)
-        .merge(agent_mgmt_routes)
-        .merge(create_swagger_ui())
-        .layer(RequestBodyLimitLayer::new(50 * 1024 * 1024)) // 🔥 50MB body 限制
+    // 内嵌 file-server 路由（RCODER_EMBED_FILE_SERVER=true；路径族 /api/* 与
+    // agent_runner 自身路由零冲突）。构造失败降级空 Router（warn 可见，与
+    // rcoder 主服务的 merged_router 同款语义）
+    let file_server_routes = if shared_types::FeatureFlags::get().embed_file_server {
+        match crate::file_server_embed::merged_router() {
+            Ok(fs_router) => fs_router,
+            Err(e) => {
+                tracing::warn!("file-server routes not mounted on agent_runner: {e}");
+                Router::new()
+            }
+        }
+    } else {
+        Router::new()
+    };
+
+    // 组合路由。最外层 hotpath::axum! 剖析层（feature 关闭时原样返回 router）：
+    // 按路由模板统计延迟/4xx/5xx，覆盖 body limit 之下全部路由；须在所有 merge 之后包裹。
+    hotpath::axum!(
+        Router::new()
+            .merge(computer_routes)
+            .merge(devcomputer_routes)
+            .merge(rcoder_routes)
+            .merge(api_routes)
+            .merge(agent_mgmt_routes)
+            .merge(file_server_routes)
+            .merge(create_swagger_ui())
+            .layer(RequestBodyLimitLayer::new(50 * 1024 * 1024))
+    ) // 🔥 50MB body 限制
 }
 
 /// liveness 检查端点（/health）：纯"进程活"立即 200，不检查 gRPC。
@@ -264,6 +284,7 @@ fn create_swagger_ui() -> SwaggerUi {
         devcomputer_chat::__path_handle_devcomputer_chat,
         devcomputer_handlers::__path_devcomputer_progress,
         pod_count::__path_handle_pod_count,
+        rcoder_progress::__path_handle_rcoder_progress,
     };
 
     #[derive(OpenApi)]
@@ -278,6 +299,8 @@ fn create_swagger_ui() -> SwaggerUi {
             // DevComputer Agent 端点
             handle_devcomputer_chat,
             devcomputer_progress,
+            // RCoder Agent 端点
+            handle_rcoder_progress,
             // Pod 管理端点
             handle_pod_count,
             // 健康检查

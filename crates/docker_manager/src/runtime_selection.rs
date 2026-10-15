@@ -53,7 +53,10 @@ impl RuntimeType {
     }
 }
 
+// 豁免仅限测试模块：edition-2024 的 env 变异（set_var/remove_var）是 unsafe，
+// 测试内有 ENV_MUTEX 串行化保护（各处带 SAFETY 注释）
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use std::sync::Mutex;

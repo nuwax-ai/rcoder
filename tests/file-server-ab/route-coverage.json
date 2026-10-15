@@ -1,0 +1,949 @@
+{
+  "schema_version": 1,
+  "typescript_revision": "0a7417f3f56b8766063ddb8dd22a62127322a762",
+  "route_sources": [
+    "src/routes/*.js",
+    "src/server.js"
+  ],
+  "rust_route_source": "crates/file-server/src/routes/mod.rs + handlers OpenAPI annotations",
+  "entries": [
+    {
+      "method": "GET",
+      "path": "/",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "root"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/build/build",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "build",
+      "cases": [
+        "build-react-production-build",
+        "build-vue3-production-build"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/build/clear-all-log-cache",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "build",
+      "cases": [
+        "build-react-clear-log-cache"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/build/get-dev-log",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "build",
+      "cases": [
+        "build-react-get-dev-log",
+        "build-react-get-dev-log-page-2"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/build/get-log-cache-stats",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "build",
+      "cases": [
+        "build-react-log-cache-stats",
+        "build-react-log-cache-stats-after-clear"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/build/keep-alive",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "build",
+      "cases": [
+        "build-react-keep-alive",
+        "build-vue3-keep-alive"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/build/list-dev",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "build",
+      "cases": [
+        "build-react-list-after-stop",
+        "build-vue3-list-after-stop"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/build/parse-build-error",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "build",
+      "cases": [
+        "build-parse-error"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/build/port-pool-status",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "build",
+      "cases": [
+        "build-react-port-pool-status"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/build/restart-dev",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "build",
+      "cases": [
+        "build-react-restart-dev",
+        "build-vue3-restart-dev"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/build/start-dev",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "build",
+      "cases": [
+        "build-react-start-dev",
+        "build-vue3-start-dev"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/build/stop-dev",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "build",
+      "cases": [
+        "build-react-stop-dev",
+        "build-vue3-stop-dev"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/computer/build-agent-package",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-build-agent-package-synthetic"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/computer/cleanup-build-artifacts",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-cleanup-build-artifacts"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/computer/create-workspace",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-create-workspace-v1-local-skills"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/computer/create-workspace-v2",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-create-workspace-v2-local-config"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/computer/delete-workspace",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-delete-workspace-owned-fixture"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/computer/download-all-files",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-download-all-files-semantic-zip"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/computer/execute-command",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-execute-command-fixed-output",
+        "computer-init-template-git-tree",
+        "computer-import-preservation-contract"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/computer/files-update",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-files-update-mixed-operations"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/computer/fs/children",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "fs-children"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/computer/fs/mkdir",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "fs-mkdir-preserve-spaces"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/computer/fs/rename",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "fs-rename-preserve-spaces"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/computer/fs/roots",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "fs-roots"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/computer/generate-file",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-generate-file-utf8"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/computer/get-file-list",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-file-list-all",
+        "computer-file-list-boundary-fixtures",
+        "computer-file-list-files-limited",
+        "computer-file-list-empty-directories",
+        "computer-file-list-subdirectory",
+        "computer-file-list-invalid-type",
+        "computer-file-list-invalid-limit",
+        "computer-file-list-depth-decimal-rejected",
+        "computer-file-list-limit-whitespace-rejected",
+        "computer-file-list-relative-path-outside-dir-link",
+        "computer-file-list-posix-backslash-link-recursive",
+        "computer-file-list-posix-backslash-link-depth-two",
+        "computer-file-list-dangling-link-hidden"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/computer/get-file-meta",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-file-meta",
+        "computer-file-meta-boundary",
+        "computer-get-file-meta-outside-dir-link"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/computer/get-logs",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-get-logs-tail-lines"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/computer/import-project",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-import-project-local-zip"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/computer/init-project-template",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-init-project-template-package-fixture"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/computer/install-project",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-install-empty-typescript-project"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/computer/push-skills-to-workspace",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-push-skills-v1-local-zip"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/computer/push-skills-to-workspace-v2",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-push-skills-v2-local-zip"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/computer/resolve-file",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-resolve-file-existing",
+        "computer-resolve-file-hidden",
+        "computer-resolve-file-symlink-inside",
+        "computer-resolve-file-symlink-outside-root",
+        "computer-resolve-file-path-traversal"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/computer/search-files",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-search-files",
+        "computer-search-relative-path-outside-dir-link"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/computer/static/:userId/:cId/*",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-read-files-update-content",
+        "computer-read-uploaded-single-binary",
+        "computer-read-uploaded-batch-binary",
+        "computer-read-generated-file-utf8",
+        "computer-read-imported-project-file",
+        "computer-static-dir-link-outside-root"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/computer/upload-file",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-upload-file-binary"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/computer/upload-files",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-upload-files-mixed-content"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/computer/zip-workspace",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "computer-zip-workspace-semantic"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/git/add",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-add-initial-files",
+        "git-add-second-change",
+        "git-restage-second-change",
+        "git-branch-delete-seed-add-initial",
+        "git-revert-seed-add-initial",
+        "git-revert-seed-add-second",
+        "git-reset-mixed-seed-add-initial",
+        "git-reset-mixed-seed-add-second",
+        "git-reset-hard-seed-add-initial",
+        "git-reset-hard-seed-add-second",
+        "git-reset-soft-seed-add-initial",
+        "git-reset-soft-seed-add-second",
+        "git-checkout-seed-add-initial",
+        "git-discard-seed-add-initial"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/git/branch-create",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-create-branch"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/git/branch-delete",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-delete-branch"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/git/branch-switch",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-switch-main"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/git/branches",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-list-branches-after-create",
+        "git-list-branches-after-delete"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/git/checkout",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-checkout-head"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/git/commit",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-commit-initial",
+        "git-commit-second",
+        "git-branch-delete-seed-commit-initial",
+        "git-revert-seed-commit-initial",
+        "git-revert-seed-commit-second",
+        "git-reset-mixed-seed-commit-initial",
+        "git-reset-mixed-seed-commit-second",
+        "git-reset-hard-seed-commit-initial",
+        "git-reset-hard-seed-commit-second",
+        "git-reset-soft-seed-commit-initial",
+        "git-reset-soft-seed-commit-second",
+        "git-checkout-seed-commit-initial",
+        "git-discard-seed-commit-initial"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/git/diff",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-worktree-diff",
+        "git-staged-diff"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/git/discard",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-discard-all"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/git/file-content",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-read-head-file",
+        "git-file-content-directory-ref",
+        "git-file-content-directory-worktree"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/git/init",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-init",
+        "git-branch-delete-seed-init",
+        "git-revert-seed-init",
+        "git-reset-mixed-seed-init",
+        "git-reset-hard-seed-init",
+        "git-reset-soft-seed-init",
+        "git-checkout-seed-init",
+        "git-discard-seed-init"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/git/log",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-log",
+        "project-copy-git-history"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/git/reset",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-reset-mixed-to-first",
+        "git-reset-hard-to-first",
+        "git-reset-soft-to-first"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/git/revert",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-revert-to-initial"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/git/status",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-status-before-first-commit",
+        "git-status-clean",
+        "git-status-after-worktree-change",
+        "git-status-after-unstage",
+        "git-status-after-checkout",
+        "git-status-after-merge-conflict"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/git/tag-create",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-create-tag"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/git/tag-delete",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-delete-tag"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/git/tags",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-list-tags"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/git/unstage",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "git",
+      "cases": [
+        "git-unstage-new-file"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/page/static/:projectId/*",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "read-project-static-file",
+        "read-project-static-file-if-none-match",
+        "read-project-static-file-range",
+        "build-react-static-dist-index",
+        "build-vue3-static-dist-index",
+        "project-read-uploaded-project-file",
+        "project-all-files-update-removes-omitted-file"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/project/all-files-update",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-all-files-update-replace"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/project/backup-current-version",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-backup-deprecated-under-git"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/project/copy-project",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-copy-project-tree"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/project/create-project",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "create-react-template-project",
+        "create-vue-template-project",
+        "build-react-create-project",
+        "build-vue3-create-project",
+        "project-fixture-lifecycle-create",
+        "project-fixture-upload-create",
+        "project-fixture-delete-create"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/project/delete-project",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-delete-owned-fixture"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/project/export-project",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-export-latest-semantic-zip"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/project/get-project-content",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "read-react-template-project",
+        "read-vue-template-project"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/project/get-project-content-by-version",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-get-version-deprecated-under-git"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/project/push-skills-to-workspace",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-push-skills-local-zip"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/project/rollback-version",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-rollback-deprecated-under-git"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/project/specified-files-update",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "update-project-file",
+        "project-all-files-update-seed-obsolete"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/project/upload-attachment-file",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-upload-attachment-deterministic-name"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/project/upload-batch-files",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-upload-batch-mixed-bytes"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/project/upload-project",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-upload-project-wrapper-zip"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/project/upload-single-file",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "project-upload-single-file-bytes"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/version",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "version"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/health",
+      "typescript": "supported",
+      "rust": "supported",
+      "status": "covered",
+      "suite": "core",
+      "cases": [
+        "health"
+      ]
+    }
+  ],
+  "notes": [
+    "Rust-only /api/v1/userapp routes are validated by existing UserApp tests and are outside this TS parity inventory.",
+    "A route is covered only when at least one listed A/B case executes it; all others remain pending.",
+    "Revision 9f636bf vs 0cffa11 touched only src/utils (search exclusion + git quoting); route inventory re-verified unchanged (no src/routes or server.js deltas).",
+    "Revision 55ac510 (1.5.4) adds get-file-list depth and search-files type params over 104d285/9f636bf; route paths unchanged, new-param cases registered per entry.",
+    "Revision 02bec84 (1.5.5) adds X-File-Size static header (compared as protocol header) and git file-content directory/symlink semantics; new directory cases registered, revert --ignore-unmatch is TS-shell-specific (Rust gix tree-apply immune, covered by unit test).",
+    "Revision cd0f075 (1.5.6) tightens limit/depth to strict decimal /^\\d+$/ (no trim) and adds .tmp to search noise; Rust mirrored both plus contract 1.5.6. TS also converged to Rust on outside-root symlink invisibility, status --untracked-files=all, path no-trim, platform-aware leading-separator, rename lstat — corresponding approved rules should retire after the next A/B run confirms.",
+    "Revision e822516 (1.5.7) upgrades boundary guard to realpath-level escapesRoot (static mounts, file-list/resolve-file/get-file-meta entries, relativePath for list/search); Rust mirrored via ensure_resolved_target_within at the three literal-parse sites. New outside-dir-link cases registered; error message texts intentionally differ (TS Chinese vs Rust English default) and are normalized in-case.",
+    "Revision 0a7417f (1.5.8) tightens file-list traversal: dangling symlinks hidden (isHiddenSymlink, replacing escapesRoot fail-open in list filtering only), recursive traversal always emits directory entries with per-subtree WARN tolerance (naturalCount removed), Windows exclude-dir matching case-insensitive. Rust mirrored via is_safe_list_link flip, traverse_meta restructure, is_traverse_excluded_dir; explicit dangling case registered after the mid-suite delete."
+  ]
+}

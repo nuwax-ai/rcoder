@@ -89,6 +89,7 @@ impl TestRequestBuilder {
     /// 返回构建的 PromptMessage，可以直接访问字段进行断言验证
     pub fn build_prompt_message(&self) -> PromptMessage {
         PromptMessage {
+            force_new_session: false,
             content: self.content.clone(),
             project_id: self.project_id.clone(),
             project_path: self

@@ -5,8 +5,6 @@
 //! 2. 从PROJECT_AND_AGENT_INFO_MAP中移除
 //! 3. AgentLifecycleGuard自动drop并清理资源
 
-#![allow(dead_code)]
-
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::time::Duration;
@@ -192,17 +190,21 @@ impl AgentCleaner {
                     idle_duration,
                     agent_info.created_at
                 );
-                agents_to_remove.push(project_id.clone());
+                agents_to_remove.push((project_id.clone(), agent_info.clone()));
             }
         }
 
-        // 执行清理：先从 Registry 移除，再显式停止对应 Agent 子进程。
-        for project_id in agents_to_remove {
-            match self.cleanup_agent_explicit_stop(&project_id).await {
-                Ok(_) => {
+        // 保持原执行注册到真实退出，随后条件移除；扫描后的新回合不能被旧清理接管。
+        for (project_id, captured) in agents_to_remove {
+            match self
+                .cleanup_agent_explicit_stop(&project_id, &captured)
+                .await
+            {
+                Ok(true) => {
                     success_count += 1;
                     info!("Agent cleaned successfully: {}", project_id);
                 }
+                Ok(false) => continue,
                 Err(e) => {
                     failed_count += 1;
                     warn!("Failed to clean agent: {} - {}", project_id, e);
@@ -250,56 +252,52 @@ impl AgentCleaner {
     ///
     /// Registry 中的 lifecycle handle 只是一个 Arc 克隆，删除 Registry 不能保证这是最后
     /// 一个引用。这里主动调用 graceful_stop，避免 idle cleanup 后子进程继续存活。
-    async fn cleanup_agent_explicit_stop(&self, project_id: &str) -> Result<()> {
-        debug!("Starting explicit cleanup for agent: {}", project_id);
-
-        // 使用统一 Registry 检查并移除（内部自动同步清理所有映射）
-        if AGENT_REGISTRY.contains_project(project_id) {
-            let removed = AGENT_REGISTRY.remove_by_project(project_id);
-
-            // 同步清理 SESSION_REQUEST_CONTEXT 中的 request_id
-            crate::proxy_agent::SESSION_REQUEST_CONTEXT.remove(project_id);
-            debug!(
-                "🧼 [cleanup] Cleared project_id from SESSION_REQUEST_CONTEXT: {}",
-                project_id
-            );
-
-            match removed {
-                Some(agent_info) => {
-                    let session_id = agent_info.session_id.to_string();
-                    info!(
-                        "Agent removed from Registry: project_id={}, session_id={}",
-                        project_id, session_id
-                    );
-                    // 清理该 session 的动态权限状态（复用 session 没有 lifecycle watcher，idle cleanup 兜底防泄漏）。
-                    PERMISSION_MANAGER.clear_session_state(&session_id);
-
-                    if let Some(stop_handle) = agent_info.stop_handle {
-                        info!(
-                            "Requesting Agent process stop: project_id={}, session_id={}",
-                            project_id, session_id
-                        );
-                        stop_handle.graceful_stop().await?;
-                        info!(
-                            "Agent process stop completed: project_id={}, session_id={}",
-                            project_id, session_id
-                        );
-                    } else {
-                        warn!(
-                            "Agent removed from Registry without stop_handle: project_id={}, session_id={}",
-                            project_id, session_id
-                        );
-                    }
-                }
-                None => {
-                    warn!("Tried to remove agent but it was not found: {}", project_id);
-                }
+    async fn cleanup_agent_explicit_stop(
+        &self,
+        project_id: &str,
+        captured: &shared_types::ProjectAndAgentInfo,
+    ) -> Result<bool> {
+        let _transition = agent_abstraction::session::lock_execution_transition(project_id).await;
+        let session_id = captured.session_id.to_string();
+        let admitted = AGENT_REGISTRY.try_update_agent_info(project_id, |current| {
+            if current.session_id.to_string() == session_id
+                && current.cancel_tx.same_channel(&captured.cancel_tx)
+                && current.status == AgentStatus::Idle
+                && current.last_activity == captured.last_activity
+            {
+                current.status = AgentStatus::Terminating;
+                true
+            } else {
+                false
             }
-        } else {
-            warn!("Agent not found in Registry: {}", project_id);
+        });
+        if !admitted {
+            return Ok(false);
         }
-
-        Ok(())
+        if let Some(handle) = &captured.stop_handle {
+            handle.graceful_stop().await?;
+            handle.wait_for_exit().await?;
+        } else if !captured.prompt_tx.is_closed() {
+            anyhow::bail!("idle agent has no lifecycle handle: {project_id}/{session_id}");
+        }
+        // 同步清理期间持有匹配执行的读锁；没有跨 await，防同 sid 新进程的权限被误删。
+        if let Some(current) = AGENT_REGISTRY.get_agent_info(project_id)
+            && current.session_id.to_string() == session_id
+            && current.cancel_tx.same_channel(&captured.cancel_tx)
+        {
+            PERMISSION_MANAGER.cancel_session_permissions(&session_id);
+            PERMISSION_MANAGER.clear_session_state(&session_id);
+            if let Some(request_id) = captured.request_id.as_deref() {
+                crate::proxy_agent::SESSION_REQUEST_CONTEXT
+                    .remove_if(project_id, |_, current| current == request_id);
+            }
+        }
+        let removed = AGENT_REGISTRY.remove_by_project_if_session_and_channel_matches(
+            project_id,
+            &session_id,
+            &captured.cancel_tx,
+        );
+        Ok(removed.is_some())
     }
 
     /// 运行清理任务 - 简化版，只做定时清理
@@ -333,4 +331,41 @@ pub fn start_cleanup_task(config: CleanupConfig) -> tokio::task::JoinHandle<()> 
     tokio::task::spawn(async move {
         cleaner.run().await;
     })
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use agent_client_protocol::schema::v1::SessionId;
+
+    #[tokio::test]
+    async fn stale_idle_scan_preserves_a_replacement_with_the_same_sid() {
+        let project = format!("idle-scan-{}", uuid::Uuid::new_v4());
+        AGENT_REGISTRY.set_pending(&project);
+        let mut first = AGENT_REGISTRY
+            .view_agent_info(&project, Clone::clone)
+            .unwrap();
+        first.status = AgentStatus::Idle;
+        first.session_id = SessionId::from("idle-scan-session");
+        let (old_cancel, _old_receiver) = tokio::sync::mpsc::channel(1);
+        first.cancel_tx = old_cancel;
+        AGENT_REGISTRY.register(&project, "idle-scan-session", first.clone());
+        let (new_cancel, _new_receiver) = tokio::sync::mpsc::channel(1);
+        let mut replacement = first.clone();
+        replacement.cancel_tx = new_cancel.clone();
+        AGENT_REGISTRY.register(&project, "idle-scan-session", replacement);
+        let cleaner = AgentCleaner::new(CleanupConfig::default());
+        assert!(
+            !cleaner
+                .cleanup_agent_explicit_stop(&project, &first)
+                .await
+                .unwrap()
+        );
+        assert!(
+            AGENT_REGISTRY
+                .view_agent_info(&project, |info| info.cancel_tx.same_channel(&new_cancel))
+                .unwrap()
+        );
+        AGENT_REGISTRY.remove_by_project(&project);
+    }
 }

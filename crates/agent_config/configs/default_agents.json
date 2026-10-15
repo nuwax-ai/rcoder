@@ -42,10 +42,11 @@
       "command": "npx",
       "args": [
         "-y",
-        "chrome-devtools-mcp@latest",
+        "@nuwax-ai/chrome-devtools-mcp@latest",
         "--headless",
         "--isolated",
         "--executablePath=/usr/bin/chromium",
+        "--maxTabs=10",
         "--chrome-arg=--no-sandbox",
         "--chrome-arg=--disable-gpu",
         "--chrome-arg=--disable-dev-shm-usage",

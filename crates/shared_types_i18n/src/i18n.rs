@@ -29,8 +29,16 @@ pub fn t(key: &str, locale: &str) -> String {
         DEFAULT_LOCALE
     };
 
-    // 使用 rust-i18n 运行时翻译函数
-    _rust_i18n_translate(locale, key).to_string()
+    // 使用 rust-i18n 运行时翻译函数。完全未命中（含 fallback locale）时
+    // rust-i18n 返回 "{locale}.{key}" 形状——locale 前缀会原样漏给前端
+    // （2026-09-22 app-105 "en-US.error.backend_error" 事故），此处归一为
+    // 裸 key：缺条目是本仓可修的缺陷，泄露 locale 前缀只会更难排查。
+    let translated = _rust_i18n_translate(locale, key).to_string();
+    if translated == format!("{locale}.{key}") {
+        key.to_string()
+    } else {
+        translated
+    }
 }
 
 /// 获取默认语言的翻译消息
@@ -153,6 +161,29 @@ mod tests {
         let msg = t("error.agent_busy", "invalid-locale");
         // 应该回退到默认语言 en-US
         assert_eq!(msg, "Agent is busy processing");
+    }
+
+    /// 事故回归闸（2026-09-22 app-105）：① ERR_BACKEND_ERROR 的 i18n 条目
+    /// 三语齐备（此前缺条目导致 key 泄漏给前端）；② 完全未命中时回退为裸
+    /// key——不允许 rust-i18n 的 "{locale}.{key}" 形状漏出。
+    #[test]
+    fn backend_error_entry_resolves_and_miss_falls_back_to_bare_key() {
+        for locale in ["en-US", "zh-CN", "zh-TW"] {
+            let msg = t("error.backend_error", locale);
+            assert_ne!(
+                msg, "error.backend_error",
+                "locale {locale} must have a real entry"
+            );
+            assert!(
+                !msg.contains("error.backend_error"),
+                "locale {locale} leaked the key: {msg}"
+            );
+        }
+        // 完全未命中（含 fallback en-US 也无此 key）→ 裸 key，无 locale 前缀
+        let miss = t("error.definitely_missing_key_xyz", "en-US");
+        assert_eq!(miss, "error.definitely_missing_key_xyz");
+        let miss_zh = t("error.definitely_missing_key_xyz", "zh-CN");
+        assert_eq!(miss_zh, "error.definitely_missing_key_xyz");
     }
 
     #[test]

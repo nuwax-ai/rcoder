@@ -1,0 +1,808 @@
+//! file-server-proxy 独立二进制入口。两种构建形态、一套 CLI/env 契约：
+//!
+//! - **default feature（npm/Electron 独立分发形态）**：file-server 以 lib 方式集成，
+//!   `--embed`（或 `EMBED_FILE_SERVER=1`）装配进程内直连——rust 域请求直接
+//!   `router.oneshot()` 进 file-server 的 axum Router，**无内部监听端口**；
+//!   单二进制 = 分流代理 + rust 上游。TS nuwax-file-server 由 npm CLI 托管于
+//!   随机端口（`--ts-port` / `TS_UPSTREAM_PORT`）。
+//! - **`--no-default-features`（容器 supervisord 纯转发形态）**：上游由外部进程
+//!   提供（file-server 路由 merge 进 rcoder/agent_runner 的 8086），本代理只做
+//!   60000 分流转发。
+//!
+//! 配置优先级：**CLI 参数 > 环境变量 > 默认值**。
+//!
+//! | 项 | CLI | env | 默认 |
+//! |---|---|---|---|
+//! | 监听端口 | `--port N` | `FILE_SERVER_PORT` | 60000 |
+//! | rust 上游端口（仅纯转发形态使用） | `--rust-port N` | `RUST_UPSTREAM_PORT` | 8086 |
+//! | TS 上游端口 | `--ts-port N` | `TS_UPSTREAM_PORT` | 60001 |
+//! | 路由策略 | `--policy P` | `ROUTE_POLICY` | `all_rust` |
+//! | 内嵌直连装配 | `--embed` / `--no-embed` | `EMBED_FILE_SERVER=1/0` | 不装配（纯转发，容器安全缺省） |
+//!
+//! 策略词汇（serde/CLI/env/helm 同源）：`ts_first | all_rust | all_ts`
+//! （语义见 `RoutePolicy` 文档）。容器内切换模式：改 supervisord conf 的
+//! command/env 后 `supervisorctl reread && supervisorctl update`，重启生效。
+//!
+//! 失败即退出非零（bind 冲突/非法配置等）——supervisord/守护 CLI 重试可见。
+
+use file_server_proxy::{FileServerProxyConfig, RoutePolicy};
+use shared_types::{AGENT_FILE_SERVER_PORT, NUWAX_FILE_SERVER_INTERNAL_PORT};
+mod native_control;
+mod native_supervisor;
+
+/// CLI 参数覆盖项（未指定的项为 None，交给 env/默认兜底）。
+#[derive(Default, Debug, PartialEq, Eq)]
+struct CliOverrides {
+    listen_port: Option<u16>,
+    rust_upstream_port: Option<u16>,
+    ts_upstream_port: Option<u16>,
+    policy: Option<RoutePolicy>,
+    embed: Option<bool>,
+    native: Option<bool>,
+}
+
+/// 启动设置（CLI > env > 默认 归一后的终值）。
+#[derive(Debug, PartialEq, Eq)]
+struct Settings {
+    listen_port: u16,
+    rust_upstream_port: u16,
+    ts_upstream_port: u16,
+    policy: RoutePolicy,
+    /// true = 装配进程内直连（feature 编译 + 显式启用）；false = 纯转发。
+    embed: bool,
+    /// PX-03: 原生桌面/宿主形态——缺省 loopback + 自动文件 API 凭据（与
+    /// 受管容器公开缺省分开; 显式来源 CLI/env, 不按 OS/目录猜）。
+    native_profile: bool,
+}
+
+fn usage() -> String {
+    format!(
+        "file-server-proxy {}\n\n\
+         Usage:\n  \
+         file-server-proxy [--policy <ts_first|all_rust|all_ts>] \\\n \
+         [--port <60000>] [--rust-port <8086>] [--ts-port <60001>] \\\n \
+         [--embed|--no-embed] [--version]\n\n\
+         CLI args take precedence over env (FILE_SERVER_PORT / RUST_UPSTREAM_PORT /\n\
+         TS_UPSTREAM_PORT / ROUTE_POLICY / EMBED_FILE_SERVER). Default policy is\n\
+         all_rust; embed is off by default (pure forward mode for containers).\n\n\
+         Policies:\n  \
+         ts_first       /api/v1/userapp* or x-service-type:userapp -> rust; rest -> ts\n  \
+         all_rust       everything -> rust upstream\n  \
+         all_ts         everything -> ts upstream",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn fail(message: String) -> ! {
+    eprintln!("file-server-proxy: {message}");
+    std::process::exit(1);
+}
+
+fn parse_port(flag: &str, value: &str) -> Result<u16, String> {
+    value
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid {flag} {value:?}: {e}"))
+}
+
+/// CLI 参数解析（手写轻量解析，file-server bin 同款风格；纯函数供单测）。
+fn parse_cli_args(args: &[String]) -> Result<CliOverrides, String> {
+    let mut out = CliOverrides::default();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let mut value = |flag: &str| -> Result<&String, String> {
+            iter.next()
+                .ok_or_else(|| format!("missing value for {flag}"))
+        };
+        match arg.as_str() {
+            "--policy" => {
+                out.policy = Some(
+                    file_server_proxy::parse_route_policy(value("--policy")?)
+                        .map_err(|e| format!("--policy: {e}"))?,
+                );
+            }
+            "--port" => out.listen_port = Some(parse_port("--port", value("--port")?)?),
+            "--rust-port" => {
+                out.rust_upstream_port = Some(parse_port("--rust-port", value("--rust-port")?)?);
+            }
+            "--ts-port" => {
+                out.ts_upstream_port = Some(parse_port("--ts-port", value("--ts-port")?)?);
+            }
+            "--embed" => out.embed = Some(true),
+            "--no-embed" => out.embed = Some(false),
+            "--native" => out.native = Some(true),
+            "--no-native" => out.native = Some(false),
+            other => return Err(format!("unknown argument {other:?}\n\n{}", usage())),
+        }
+    }
+    Ok(out)
+}
+
+fn env_port(key: &str, default: u16) -> Result<u16, String> {
+    match std::env::var(key) {
+        Ok(value) => value
+            .trim()
+            .parse()
+            .map_err(|e| format!("invalid {key}: {e}")),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(e) => Err(format!("read {key}: {e}")),
+    }
+}
+
+/// env 布尔词汇解析（纯函数）：1/true 启用，0/false 禁用，其他值 None（报错）。
+fn parse_env_bool_value(raw: &str) -> Option<bool> {
+    match raw.trim() {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// env 布尔（词汇：1/true 启用，0/false 禁用；其他值报错——消歧义）。
+fn env_bool(key: &str) -> Result<Option<bool>, String> {
+    match std::env::var(key) {
+        Ok(value) => parse_env_bool_value(&value)
+            .map(Some)
+            .ok_or_else(|| format!("invalid {key} {value:?}: expected 1|0|true|false")),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => Err(format!("read {key}: {e}")),
+    }
+}
+
+fn env_policy() -> Result<RoutePolicy, String> {
+    match std::env::var("ROUTE_POLICY") {
+        Ok(value) => {
+            file_server_proxy::parse_route_policy(&value).map_err(|e| format!("ROUTE_POLICY: {e}"))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(RoutePolicy::AllRust),
+        Err(e) => Err(format!("read ROUTE_POLICY: {e}")),
+    }
+}
+
+/// 归一：CLI > env > 默认。全部惰性求值——CLI 显式提供时**不读**对应 env
+/// （PX-05: 合法 `--policy all_rust`/`--embed` 不得被遗留的非法 ROUTE_POLICY/
+/// EMBED_FILE_SERVER 拒启; `unwrap_or`/`Option::or` 是急切求值, 曾经违反此序）。
+fn resolve_settings(cli: CliOverrides) -> Result<Settings, String> {
+    Ok(Settings {
+        listen_port: match cli.listen_port {
+            Some(port) => port,
+            None => env_port("FILE_SERVER_PORT", AGENT_FILE_SERVER_PORT)?,
+        },
+        rust_upstream_port: match cli.rust_upstream_port {
+            Some(port) => port,
+            None => env_port("RUST_UPSTREAM_PORT", 8086)?,
+        },
+        ts_upstream_port: match cli.ts_upstream_port {
+            Some(port) => port,
+            None => env_port("TS_UPSTREAM_PORT", NUWAX_FILE_SERVER_INTERNAL_PORT)?,
+        },
+        policy: match cli.policy {
+            Some(policy) => policy,
+            None => env_policy()?,
+        },
+        // 未显式指定（CLI/env 都没给）= 纯转发：容器形态安全缺省
+        embed: match cli.embed {
+            Some(embed) => embed,
+            None => env_bool("EMBED_FILE_SERVER")?.unwrap_or(false),
+        },
+        // PX-03: CLI > env 惰性（同 PX-05 求值序）, 未设 = 受管缺省。
+        native_profile: match cli.native {
+            Some(native) => native,
+            None => env_bool("FILE_SERVER_PROXY_NATIVE_PROFILE")?.unwrap_or(false),
+        },
+    })
+}
+
+/// 纯代理形态（未装配直连）的日志：console fmt + `RUST_LOG`。
+fn init_tracing_plain() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+}
+
+/// 监督器进程日志（PX-09）：console（前台形态）+ owner root 下 `supervisor.log`
+/// 追加（detached stdio=ignore 时围栏/恢复/限频事件仍可按 root 找到）。
+/// worker 是监督器派生的子进程, 自己初始化业务日志, 与本层互不覆盖。
+fn init_supervisor_tracing(root: &std::path::Path) {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join("supervisor.log"));
+    match file {
+        Ok(log) => {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer())
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(std::sync::Arc::new(log)),
+                )
+                .init();
+        }
+        Err(error) => {
+            eprintln!(
+                "警告: 无法打开监督器日志 {} ({error}); 仅 console 输出",
+                root.join("supervisor.log").display()
+            );
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                )
+                .init();
+        }
+    }
+}
+
+fn main() {
+    if let Some(result) = runtime_supervisor::auxiliary_entry() {
+        match result {
+            Ok(code) => std::process::exit(code),
+            Err(error) => fail(format!("guardian failed: {error:#}")),
+        }
+    }
+    match runtime_supervisor::runtime() {
+        Ok(runtime) => runtime.block_on(run()),
+        Err(error) => fail(format!("initialize proxy runtime: {error}")),
+    }
+}
+async fn run() {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let request_id = if let Some(index) = args.iter().position(|arg| arg == "--request-id") {
+        args.remove(index);
+        if index >= args.len() {
+            fail("missing --request-id value".into());
+        }
+        Some(args.remove(index))
+    } else {
+        None
+    };
+    let expected_supervisor =
+        if let Some(index) = args.iter().position(|arg| arg == "--supervisor-id") {
+            args.remove(index);
+            if index >= args.len() {
+                fail("missing --supervisor-id value".into());
+            }
+            Some(args.remove(index))
+        } else {
+            None
+        };
+    let expected_instance = if let Some(index) = args.iter().position(|arg| arg == "--instance-id")
+    {
+        args.remove(index);
+        if index >= args.len() {
+            fail("missing --instance-id value".into());
+        }
+        Some(args.remove(index))
+    } else {
+        None
+    };
+    args.retain(|a| a != "--native-owner");
+    let action = args
+        .first()
+        .filter(|a| {
+            matches!(
+                a.as_str(),
+                "start" | "stop" | "status" | "restart" | "recover" | "retire"
+            )
+        })
+        .cloned();
+    if action.is_some() {
+        args.remove(0);
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("file-server-proxy {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        eprintln!("{}", usage());
+        return;
+    }
+    let mut settings = match parse_cli_args(&args).and_then(resolve_settings) {
+        Ok(settings) => settings,
+        Err(e) => fail(e),
+    };
+    // owner root 目录名是稳定作用域键——不随 native/managed 的监听缺省漂移
+    // （否则 start 与 status/stop 会落进不同 root）; PX-03 的 loopback 只作用于
+    // 实际监听 host（run() 内独立推导）。
+    let host = std::env::var("FILE_SERVER_PROXY_HOST")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "0.0.0.0".into());
+    let owner_root =
+        Some(native_control::directory(&host, settings.listen_port).unwrap_or_else(|e| fail(e)));
+    if let (Some(root), Some(action)) = (&owner_root, action.as_deref())
+        && matches!(action, "stop" | "status" | "restart" | "recover" | "retire")
+    {
+        let supervised = root
+            .join("supervisor.json")
+            .try_exists()
+            .unwrap_or_else(|e| fail(format!("read supervisor discovery: {e}")));
+        match native_control::control_with_request(
+            root,
+            if action == "restart" && !supervised {
+                "stop"
+            } else {
+                action
+            },
+            expected_instance.as_deref(),
+            request_id.as_deref(),
+            expected_supervisor.as_deref(),
+        )
+        .await
+        {
+            Ok(result) => {
+                if action != "restart" || supervised {
+                    println!("{result}");
+                    return;
+                }
+            }
+            Err(error) => fail(error),
+        }
+    }
+    if let Some(root) = &owner_root
+        && std::env::var_os(runtime_supervisor::WORKER_ENV).is_none()
+    {
+        // PX-09: 监督器进程先于 worker 有自己的日志——围栏/恢复/限频事件不再
+        // 丢失; detached（stdio=ignore）形态经 owner root 下 supervisor.log
+        // 仍可追踪, console 层服务前台形态。
+        init_supervisor_tracing(root);
+        match native_supervisor::run(root, &args).await {
+            Ok(code) => std::process::exit(code),
+            Err(error) => fail(error),
+        }
+    }
+    let mut owner = if let Some(root) = owner_root.clone() {
+        Some(
+            native_control::Owner::acquire(root)
+                .await
+                .unwrap_or_else(|e| fail(e)),
+        )
+    } else {
+        None
+    };
+
+    // 内嵌直连装配（feature 编译 + 显式启用）。日志与 file-server 的 file layer
+    // 必须一次组装（全局 subscriber 只能 init 一次）。
+    #[cfg(feature = "embed-file-server")]
+    let _log_guard = if settings.embed {
+        match prepare_embed(owner.as_ref().map(native_control::Owner::work_root)) {
+            Ok(guard) => guard,
+            Err(e) => {
+                if let Some(owner) = &mut owner {
+                    let _cleanup = owner.stop().await;
+                }
+                fail(e);
+            }
+        }
+    } else {
+        init_tracing_plain();
+        None
+    };
+    #[cfg(not(feature = "embed-file-server"))]
+    {
+        init_tracing_plain();
+        // N05：请求 embed 而产物未编译该能力 → fail-fast（非零退出）。
+        // 旧行为 warn 后继续转发 127.0.0.1:8086 是"假装成功"——原生场景
+        // 上游并不存在，请求只会 502。
+        if settings.embed {
+            eprintln!(
+                "错误: --embed/EMBED_FILE_SERVER=1 被拒绝——本二进制未编译 \
+                 embed-file-server feature（--no-default-features 纯转发形态）。\
+                 原生标准模式需要 embed 产物；请安装对应平台完整包或去掉 --embed \
+                 使用纯转发形态"
+            );
+            std::process::exit(2);
+        }
+    }
+
+    #[cfg(feature = "embed-file-server")]
+    if let (Some(owner), Some((_, _, handle))) = (&mut owner, &_log_guard) {
+        owner.set_embedded(handle.clone());
+    }
+    // Register signal observation before any managed child is launched.
+    let mut signal_task = tokio::spawn(shutdown_signal());
+    tokio::task::yield_now().await;
+    if let Some(entry) = std::env::var_os("FILE_SERVER_PROXY_TS_ENTRY") {
+        let node = std::env::var_os("FILE_SERVER_PROXY_TS_NODE")
+            .unwrap_or_else(|| fail("managed TS requires FILE_SERVER_PROXY_TS_NODE".into()));
+        let native_owner = owner
+            .as_mut()
+            .unwrap_or_else(|| fail("managed TS requires native owner mode".into()));
+        let launch = tokio::select! {
+            result = native_owner.start_ts(std::path::Path::new(&node), std::path::Path::new(&entry)) => result,
+            signal = &mut signal_task => {
+                Err(format!("managed TS startup interrupted: {signal:?}"))
+            }
+        };
+        match launch {
+            Ok(port) => settings.ts_upstream_port = port,
+            Err(error) => {
+                if let Err(cleanup) = native_owner.stop().await {
+                    fail(format!("{error}; {cleanup}"));
+                }
+                fail(error);
+            }
+        }
+    }
+
+    // PX-03: native 形态的缺省绑定与凭据——与受管容器公开缺省分开。
+    // - 缺省 host: 受管 0.0.0.0 / native 127.0.0.1（显式 FILE_SERVER_PROXY_HOST 均可覆盖;
+    //   非 loopback 监听仍需令牌, 由既有 start 侧 fail-fast 校验兜底）。
+    // - 凭据: env 未提供且 native 时自动生成文件 API 令牌并落盘 owner root 下
+    //   credentials.json(0600), 供宿主 helper 读取; 令牌不进日志/stdout/回执/argv。
+    let listen_host = std::env::var("FILE_SERVER_PROXY_HOST")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            if settings.native_profile {
+                "127.0.0.1".to_string()
+            } else {
+                "0.0.0.0".to_string()
+            }
+        });
+    let auth_token = FileServerProxyConfig::resolve_auth_token(
+        None,
+        std::env::var_os("FILE_SERVER_PROXY_TOKEN"),
+    )
+    .unwrap_or_else(|reason| fail(reason))
+    .or_else(|| {
+        if !settings.native_profile {
+            return None;
+        }
+        let token = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        if let Some(root) = &owner_root
+            && let Err(error) = file_server_proxy::write_native_credentials(root, &token)
+        {
+            fail(format!("persist native file-api credentials: {error}"));
+        }
+        Some(token)
+    });
+    file_server_proxy::init(FileServerProxyConfig {
+        listen_host,
+        auth_token,
+        // N07（修订）：env 优先三态（1/true 放行、0/false 收紧）、未设默认
+        // 受管放行 true（本服务部署形态以容器/supervisor 为主流，09-19 前
+        // "默认严格+各处声明"的门只挡自己人）。独立进程形态无 config.yml
+        // 载体，env 是唯一显式收紧通道；亦可用 HOST=127.0.0.1+令牌双保险。
+        // PX-10: 非法显式值（flase/yes/…）直接拒启, 不静默落回公开缺省。
+        public_bind_declared: FileServerProxyConfig::public_bind_env_setting()
+            .unwrap_or_else(|reason| {
+                fail(format!("invalid FILE_SERVER_PROXY_PUBLIC_BIND: {reason}"))
+            })
+            .unwrap_or(true),
+        listen_port: settings.listen_port,
+        rust_upstream_port: settings.rust_upstream_port,
+        ts_upstream_port: settings.ts_upstream_port,
+        policy: settings.policy,
+        // 独立形态（npm/Electron）无预览协调器（rcoder 主进程装配），恒关；
+        // rcoder 嵌入形态由 config.yml 渲染该开关。
+        coordinated_dev_lifecycle: false,
+    });
+    match file_server_proxy::try_start().await {
+        Ok(address) => {
+            if let Some(owner) = &mut owner
+                && let Err(error) = owner.started(address.clone())
+            {
+                let _cleanup = owner.stop().await;
+                fail(error);
+            }
+            #[cfg(feature = "embed-file-server")]
+            let embed_note = if settings.embed {
+                "直连内嵌"
+            } else {
+                "转发 127.0.0.1"
+            };
+            #[cfg(not(feature = "embed-file-server"))]
+            let embed_note = "转发 127.0.0.1";
+            tracing::info!(
+                "file-server-proxy (standalone) 运行中: {address} → rust[{embed_note} \
+                 :{}], ts=127.0.0.1:{} ({})",
+                settings.rust_upstream_port,
+                settings.ts_upstream_port,
+                settings.policy.as_str()
+            );
+        }
+        Err(e) => {
+            if let Some(owner) = &mut owner
+                && let Err(cleanup) = owner.stop().await
+            {
+                fail(format!("{e}; owner cleanup unconfirmed: {cleanup}"));
+            }
+            fail(e);
+        }
+    }
+    // Always close the listener and drain connections, even if installing the
+    // host signal handler failed. Failure cannot be reported as successful stop.
+    let signal_result = if let Some(owner) = owner {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut task = tokio::spawn(owner.run(shutdown.clone()));
+        tokio::select! {
+            result = &mut task => result.map_err(|e| format!("native owner task failed: {e}")).and_then(std::convert::identity),
+            signal = &mut signal_task => {
+                shutdown.cancel();
+                let drained = task.await.map_err(|e| format!("native owner task failed: {e}")).and_then(std::convert::identity);
+                signal.map_err(|e| format!("signal task failed: {e}")).and_then(std::convert::identity).and(drained)
+            }
+        }
+    } else {
+        signal_task
+            .await
+            .map_err(|e| format!("signal task failed: {e}"))
+            .and_then(std::convert::identity)
+    };
+    let stop_result = file_server_proxy::stop().await;
+    if let Err(error) = stop_result {
+        fail(format!("proxy shutdown could not be confirmed: {error}"));
+    }
+    if let Err(error) = signal_result {
+        fail(error);
+    }
+    tracing::info!("file-server-proxy stopped after draining active requests");
+}
+
+async fn shutdown_signal() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|error| format!("install SIGTERM handler: {error}"))?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.map_err(|error| format!("wait for Ctrl-C: {error}")),
+            signal = sigterm.recv() => signal.ok_or_else(|| "SIGTERM signal stream closed".to_owned()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|error| format!("wait for Ctrl-C: {error}"))
+    }
+}
+
+/// 直连装配：加载 file-server 配置（工作目录/日志）+ 一次组装全局 subscriber
+/// （console + **双文件日志**：file-server.log 收 `file_server` target、
+/// file-server-proxy.log 收 `file_server_proxy` target——代理自身的分流决策/
+/// 上游错误/生命周期独立成文件，排查文件服务问题互不淹没）+ 独立全量 Router
+/// 注册进直连通道。
+///
+/// 日志目录不可用（npm 本机默认 /app/... 建不了）时回退系统临时目录——对齐
+/// TS 源工程 appConfig 的 LOG_BASE_DIR 回退行为（本机人体工学优先，容器内
+/// 配置错误仍经 warn 留痕可见）。
+///
+/// 返回的 (file-server guard, proxy guard) 必须持有到 main 结束（文件日志完整
+/// 刷盘——guard 仅 Drop 语义，tuple 解构成 `_` 绑定持有，与 file-server bin 同款）。
+#[cfg(feature = "embed-file-server")]
+fn prepare_embed(
+    journal_root: Option<std::path::PathBuf>,
+) -> Result<
+    Option<(
+        file_server::logging::WorkerGuard,
+        file_server::logging::WorkerGuard,
+        file_server_userapp::EmbeddedRuntimeHandle,
+    )>,
+    String,
+> {
+    let mut config = file_server::Config::load()
+        .map_err(|e| format!("load embedded file-server config: {e:#}"))?;
+    // 日志目录回退：默认 /app/... 是容器路径，npm/mac 本机不可写——回退 tmpdir
+    let (file_layer, fs_guard) = match file_server::logging::build_file_layer(&config) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!(
+                "file-server-proxy: 日志目录 {} 不可用 ({e:#}), 回退系统临时目录",
+                config.service_log_dir.display()
+            );
+            config.service_log_dir = std::env::temp_dir().join("file-server-proxy").join("logs");
+            file_server::logging::build_file_layer(&config)
+                .map_err(|e| format!("build embedded file-server log layer: {e:#}"))?
+        }
+    };
+
+    // proxy 独立文件日志（与 file-server 同目录、独立文件名、同款按日滚动与保留数）
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::filter::{LevelFilter, Targets};
+    let proxy_appender = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("file-server-proxy.log")
+        .max_log_files(config.service_log_retention_days)
+        .build(&config.service_log_dir)
+        .map_err(|e| format!("build proxy log appender: {e}"))?;
+    let (proxy_writer, proxy_guard) = tracing_appender::non_blocking(proxy_appender);
+    let proxy_file_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_target(true)
+        .with_writer(proxy_writer)
+        .with_filter(
+            Targets::new()
+                .with_target("file_server_proxy", tracing::Level::INFO)
+                .with_default(LevelFilter::OFF),
+        );
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(
+            "file_server=info,file_server_proxy=info,tower_http=info",
+        )
+    });
+    let console = tracing_subscriber::fmt::layer().with_target(true);
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    tracing_subscriber::registry()
+        .with(file_layer)
+        .with(proxy_file_layer)
+        .with(filter)
+        .with(console)
+        .init();
+    tracing::info!(
+        log_dir = %config.service_log_dir.display(),
+        "双文件日志已启用: file-server.log(内嵌 file-server) + file-server-proxy.log(代理)"
+    );
+    let server = file_server::FileServer::builder(config)
+        .build()
+        .map_err(|e| format!("build embedded file-server: {e:#}"))?;
+    // 独立全量集（含 /、/health、swagger 与完整中间件栈 + /api/v1/userapp 子树——
+    // userApp 域拆至 file-server-userapp crate，组装经其 full_router）——直连行为
+    // 与原独立 file-server bin 完全同构
+    let (router, embedded) = file_server_userapp::full_router_with_lifecycle(&server, journal_root)
+        .map_err(|e| format!("build embedded file-server router: {e:#}"))?;
+    file_server_proxy::set_in_process_router(router);
+    tracing::info!("内嵌 file-server 直连已装配（进程内 router，无内部监听端口）");
+    Ok(Some((fs_guard, proxy_guard, embedded)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// env 变更测试串行锁（env 是进程全局——避免并行测试互踩）。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 测试专用 env 写入：Rust 2024 将 set_var/remove_var 标记 unsafe。
+    /// 仅在串行锁内使用——豁免通道仅限测试模块（workspace lint 注释明示;
+    /// 生产代码保持 deny unsafe）。
+    #[allow(unsafe_code)]
+    fn set_test_env(key: &str, value: Option<&str>) {
+        // SAFETY: ENV_LOCK 保证同一时刻仅一个测试线程操作 env;
+        // 被测函数在此期间同步读取, 无并发读者窗口。
+        match value {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    /// PX-05 反例: 合法 CLI 显式值必须短路对应 env——遗留的非法 ROUTE_POLICY/
+    /// EMBED_FILE_SERVER 不得把带着 `--policy all_rust`/`--embed` 的合法启动
+    /// 拒之门外。修复前 `unwrap_or(env_policy()?)`/`Option::or(env_bool(..)?)`
+    /// 急切求值违反 CLI > env。
+    #[test]
+    fn cli_explicit_values_short_circuit_invalid_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        set_test_env("ROUTE_POLICY", Some("bogus"));
+        set_test_env("EMBED_FILE_SERVER", Some("bogus"));
+        let settings = resolve_settings(CliOverrides {
+            policy: Some(RoutePolicy::AllRust),
+            embed: Some(true),
+            ..CliOverrides::default()
+        })
+        .expect("legal CLI values must win over invalid env");
+        assert_eq!(settings.policy, RoutePolicy::AllRust);
+        assert!(settings.embed);
+        set_test_env("ROUTE_POLICY", None);
+        set_test_env("EMBED_FILE_SERVER", None);
+    }
+
+    /// PX-05: 无 CLI 时非法 env 仍按 fail-fast 拒启（不因惰性化放松校验）。
+    #[test]
+    fn invalid_env_without_cli_still_rejects_startup() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        set_test_env("ROUTE_POLICY", Some("bogus"));
+        let error = resolve_settings(CliOverrides::default())
+            .expect_err("invalid ROUTE_POLICY without CLI must reject");
+        assert!(error.contains("ROUTE_POLICY"), "unexpected: {error}");
+        set_test_env("ROUTE_POLICY", None);
+    }
+
+    /// PX-10: 非法显式 PUBLIC_BIND 词（flase/yes）解析为 Err 而非缺省——
+    /// run 层对 Err 走 fail()（拒启）, 不再静默采用公开缺省 true。
+    #[test]
+    fn invalid_public_bind_words_are_errors_not_unset() {
+        for invalid in ["flase", "yes", "on"] {
+            assert!(
+                FileServerProxyConfig::env_public_bind_setting(Some(invalid)).is_err(),
+                "invalid word {invalid:?} must be an explicit error"
+            );
+        }
+        assert_eq!(
+            FileServerProxyConfig::env_public_bind_setting(Some("")),
+            Ok(None)
+        );
+        assert_eq!(
+            FileServerProxyConfig::env_public_bind_setting(None),
+            Ok(None)
+        );
+        assert_eq!(
+            FileServerProxyConfig::env_public_bind_setting(Some("false")),
+            Ok(Some(false))
+        );
+    }
+
+    fn arg(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// CLI 参数解析：四值 policy、端口、embed 开关、非法/缺值/未知参数报错。
+    #[test]
+    fn cli_args_parse_full_surface() {
+        let cli = parse_cli_args(&arg(&[
+            "--policy",
+            "ts_first",
+            "--port",
+            "61000",
+            "--rust-port",
+            "18086",
+            "--ts-port",
+            "16001",
+            "--embed",
+        ]))
+        .unwrap();
+        assert_eq!(cli.policy, Some(RoutePolicy::TsFirst));
+        assert_eq!(cli.listen_port, Some(61000));
+        assert_eq!(cli.rust_upstream_port, Some(18086));
+        assert_eq!(cli.ts_upstream_port, Some(16001));
+        assert_eq!(cli.embed, Some(true));
+
+        assert_eq!(
+            parse_cli_args(&arg(&["--no-embed"])).unwrap().embed,
+            Some(false)
+        );
+        assert_eq!(parse_cli_args(&arg(&[])).unwrap(), CliOverrides::default());
+
+        assert!(parse_cli_args(&arg(&["--policy", "bogus"])).is_err());
+        assert!(parse_cli_args(&arg(&["--policy"])).is_err());
+        assert!(parse_cli_args(&arg(&["--port", "notnum"])).is_err());
+        assert!(parse_cli_args(&arg(&["--bogus"])).is_err());
+    }
+
+    /// 归一优先级：CLI 覆盖 env/默认；默认 policy=all_rust、embed=false（纯转发
+    /// 安全缺省）。env 变体路径由本地冒烟覆盖（测试进程 env 不可独占设置）。
+    #[test]
+    fn resolve_cli_overrides_default_policy_all_rust() {
+        let settings = resolve_settings(parse_cli_args(&arg(&[])).unwrap()).unwrap();
+        assert_eq!(settings.policy, RoutePolicy::AllRust);
+        assert!(!settings.embed);
+        assert_eq!(settings.listen_port, AGENT_FILE_SERVER_PORT);
+
+        let settings = resolve_settings(
+            parse_cli_args(&arg(&["--policy", "ts_first", "--embed", "--port", "7"])).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settings.policy, RoutePolicy::TsFirst);
+        assert!(settings.embed);
+        assert_eq!(settings.listen_port, 7);
+    }
+
+    /// env 布尔词汇：1/true/0/false 归一，非法值 None，trim 容差。
+    /// （set_var 在 Rust 2024 是 unsafe 且项目禁 unsafe——测纯函数层。）
+    #[test]
+    fn env_bool_vocabulary() {
+        assert_eq!(parse_env_bool_value("1"), Some(true));
+        assert_eq!(parse_env_bool_value("true"), Some(true));
+        assert_eq!(parse_env_bool_value("0"), Some(false));
+        assert_eq!(parse_env_bool_value("false"), Some(false));
+        assert_eq!(parse_env_bool_value(" 1\n"), Some(true));
+        assert_eq!(parse_env_bool_value("yes"), None);
+        assert_eq!(parse_env_bool_value(""), None);
+        assert_eq!(parse_env_bool_value("TRUE"), None);
+    }
+}

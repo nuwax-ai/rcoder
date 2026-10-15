@@ -1,34 +1,30 @@
 //! 代理配置模块
 //!
 //! 定义了端口反向代理的配置结构体和相关功能。
-
-use structopt::StructOpt;
+//
+// 注：历史上此结构体带 StructOpt derive，但 from_args() 从未被调用（配置全部
+// 经 Default/字面量构造），故随 structopt 退役（unmaintained，RUSTSEC-2022-0104）
+// 一并移除；默认值以手写 Default 为唯一来源。
 
 /// 端口反向代理配置
-#[derive(Debug, Clone, StructOpt)]
+#[derive(Debug, Clone)]
 pub struct ProxyConfig {
     /// 监听端口
-    #[structopt(long, default_value = "8080")]
     pub listen_port: u16,
 
     /// 默认后端端口（当 URL 中没有 port 参数时使用）
-    #[structopt(long, default_value = "3000")]
     pub default_backend_port: u16,
 
     /// 后端服务主机（默认为 localhost）
-    #[structopt(long, default_value = "127.0.0.1")]
     pub backend_host: String,
 
     /// URL 中端口参数的名称
-    #[structopt(long, default_value = "port")]
     pub port_param: String,
 
     /// Pingora 配置文件路径
-    #[structopt(long)]
     pub config_file: Option<String>,
 
     /// 启用详细日志
-    #[structopt(long)]
     pub verbose: bool,
 
     /// 请求超时（秒），None 使用默认 600

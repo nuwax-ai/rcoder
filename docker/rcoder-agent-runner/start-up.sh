@@ -77,6 +77,25 @@ source /usr/local/bin/start-up-common.sh
 
 
 # ============================================================================
+# 🎯 claude(Bun/JSC) 内存感知: 按 cgroup limit 设堆预算
+# JSC 用 sysinfo() 系统调用感知物理内存, 看不见 cgroup limit —— 大物理机小容器时
+# 探测值虚高数十倍(123GB 物理/8Gi 容器=15 倍), GC 毫无提前收缩动力 → claude
+# 棘轮式膨胀顶爆 limit(2026-09-18 双 OOM 实锤, 单进程 6.15GiB)。forceRAMSize
+# 直接覆盖探测值让 JSC 按"小内存机器"规划堆。外部显式设置(如 rcoder service
+# environment)优先, 不覆盖; 无 cgroup v2 限制时静默跳过。
+# ============================================================================
+if [ -z "${BUN_JSC_forceRAMSize:-}" ]; then
+    _CG_LIMIT=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)
+    if [ "$_CG_LIMIT" != "max" ] && [ "$_CG_LIMIT" -gt 0 ] 2>/dev/null; then
+        # 60%: 余量留给 chromium/桌面/agent_runner 等非 Bun 进程
+        export BUN_JSC_forceRAMSize=$(( _CG_LIMIT * 60 / 100 ))
+        log "BUN_JSC_forceRAMSize=${BUN_JSC_forceRAMSize} (60% of cgroup memory.max=${_CG_LIMIT})"
+    fi
+fi
+unset _CG_LIMIT
+
+
+# ============================================================================
 # 🎯 动态时区设置（支持通过 TZ 环境变量自定义时区）
 # 默认时区为 Asia/Shanghai（在 Dockerfile 中配置）
 # 启动时如果检测到 TZ 环境变量，则更新系统时区
@@ -353,8 +372,8 @@ function initialize_user_home() {
         # ========== 清除残留的 sudo-supervisord autostart ==========
         # 老镜像 Dockerfile.old 曾写入 $USER_HOME/.config/autostart/supervisord.desktop
         # (Exec=sudo supervisord); 当前镜像不再生成, 但 /home/user 是持久化 PVC, 旧文件残留。
-        # XFCE 启动会 autostart 它 → sudo 净化环境 → 那把 supervisord 解析 pgweb.conf
-        # %(ENV_PGWEB_PORT)s 失败(error.log 噪音) + 第二把 supervisord 隐患(socket 冲突)。
+        # XFCE 启动会 autostart 它 → sudo 净化环境 → 那把 supervisord 起第二把
+        # supervisord 隐患(socket 冲突)。(pgweb.conf 已随 pgweb 退役删除,此处仅历史背景)
         # 必须在 start_display_and_desktop(XFCE 起来)前删掉。定向清理, 不动其它 autostart。
         rm -f "$USER_HOME/.config/autostart/supervisord.desktop" /usr/local/bin/start-supervisord.sh 2>/dev/null || true
 
@@ -486,12 +505,15 @@ function initialize_user_home() {
         log_success "  xfce4-desktop.xml pre-configured from system (fixes wallpaper scaling)"
     fi
 
-    # ========== 无条件补齐桌面系统图标 (每次启动确保预设图标存在) ==========
+    # ========== 无条件补齐/对齐桌面系统图标 (每次启动确保预设图标存在且与镜像一致) ==========
     # 与下方 launcher 补齐同理, 属于"系统预设, 每次启动确保存在"。
-    # 语义: 只补缺失的, 不删除用户自定义图标, 不覆盖用户改过的同名图标:
+    # 语义: 只管理骨架集合内的平台预置启动器, 骨架外的用户自定义图标一律不动:
     #   - 用户删了图标 (链接不存在)              → 补
     #   - 链接损坏 (目标无效, -e 跟踪失败)        → 补
-    #   - 用户保留或改过 (存在且有效)             → 不动
+    #   - 内容与骨架漂移 (镜像升级改了 Icon 等)   → 覆盖为骨架版
+    #     (平台启动器须跟随镜像版本; /home/user 是持久化 PVC, 镜像升级不触碰
+    #      卷内旧文件——不覆盖则存量沙箱永远停在旧内容, 如 0.1.245 dbx 官方图标)
+    #   - 骨架集合外的用户自定义 .desktop         → 不动
     # 背景: /home/user 是持久化 PVC (rcoder-computer-workspace/{user_id}),
     #       用户删图标会被 PVC 保留; 而上方 need_restore 只在"目录不存在"时触发,
     #       删图标后 Desktop 目录还在 → 不触发 → 桌面图标必须靠这里无条件补齐才能恢复。
@@ -507,12 +529,25 @@ function initialize_user_home() {
                 chmod +x "$user_icon" 2>/dev/null || true
                 chown user:user "$user_icon" 2>/dev/null || true
                 log_success "  Desktop icon ensured (was missing): $icon_name"
+            elif ! cmp -s "$user_icon" "$skel_icon"; then   # 平台预置启动器内容漂移 → 以骨架版对齐
+                cp -aL "$skel_icon" "$user_icon"
+                chmod 755 "$user_icon" 2>/dev/null || true
+                chown user:user "$user_icon" 2>/dev/null || true
+                log_success "  Desktop icon refreshed (drifted from skeleton): $icon_name"
             fi
         done
     fi
 
-    # 无条件确保桌面图标可执行 + 属主 (X 启动前; 补齐段只补缺失/断链,
-    # rsync 同步带过来的旧图标 (644) 会跳过补齐 → xfdesktop 读到 644 弹 mark executable。
+    # ========== 退役清理: pgweb 桌面图标 (存量残留, 须在补齐循环之后) ==========
+    # pgweb 已退役(dbx 替代)。清理在补齐循环**之后**执行——顺序即防御:
+    # 若 base 层未重建(骨架仍含旧 pgweb.desktop, 曾见于 0.1.250 混搭),
+    # 先清后补会被循环从骨架补回; 放在循环后则无论骨架新旧都能清掉。
+    # 幂等: 不存在时 rm -f 静默。骨架侧残留一并清理(防 need_restore 大恢复
+    # 分支从骨架整体复制时再次带回)。
+    rm -f "$USER_HOME/Desktop/pgweb.desktop" "$SKEL_DIR/Desktop/pgweb.desktop" 2>/dev/null || true
+
+    # 无条件确保桌面图标可执行 + 属主 (X 启动前; 补齐/对齐段只覆盖缺失/断链/漂移,
+    # rsync 同步带过来且内容恰好一致的旧图标 (644) 会跳过上方分支 → xfdesktop 读到 644 弹 mark executable。
     # 这里无条件 chmod 兜底, 保证 xfdesktop 启动时桌面图标一定 755)
     if [ -d "$USER_HOME/Desktop" ]; then
         chmod 755 "$USER_HOME/Desktop/"*.desktop 2>/dev/null || true
@@ -749,42 +784,71 @@ function start_vnc_services() {
 	return 0
 }
 
-# ========== 桌面图标信任化 (xfdesktop 双击实体 .desktop 仍可能弹 untrusted) ==========
-# 三层: 1) 实体 + 属主 user + 可执行  2) gio set metadata::trusted (GIO 通用, 需 D-Bus session)
-#        3) 兜底禁 Thunar launch-confirm (恢复被删的 ae73d82 逻辑)
-# 需在 X11 + D-Bus 起来后 (start_vnc_services 成功后) 调用。任何一层失败都不阻断启动。
+# ========== 桌面图标信任化 ==========
+# xfdesktop 4.18 桌面 launcher 免弹 "untrusted" 需五件套齐 (ef0bcdc 实测):
+#   实体文件 + 属主 user(uid) + 可执行 755 + DBUS_SESSION 连上 gvfsd-metadata
+#   + gio metadata (metadata::trusted=true + metadata::xfce-exe-checksum)。
+# 历史两轮误判, 机制结论:
+#   - 7a39a79 只靠文件属性删 gio → 新图标/新 PVC 必弹 (旧图标靠 PVC 残留旧 metadata 幸免);
+#   - checksum 形态=sha256(整个文件字节流)(libxfce4util xfce_g_file_create_checksum
+#     源码实锤; 02228da 曾误判为 Exec 行 sha256 致 0.1.251 全量弹, 已回滚);
+#     is_trusted=FALSE 时 thunar 拒按 launcher 渲染(图标空白文档样式)且双击弹窗。
+# metadata 持久化在 PVC (~/.local/share/gvfs-metadata), 正常启动每次重写自愈
+# (内容漂移对齐后 checksum 同批刷新); 热修改文件后需重跑本函数或重启容器。
 function trust_desktop_icons() {
     local f
-    # 1) 实体 + 属主 user + 可执行 (xfdesktop 较宽容的信任条件)
+    # 1) 实体 + 属主 user(uid 1000) + 可执行 755  (XFCE 4.18 五件套 条件 1+2)
     for f in /home/user/Desktop/*.desktop; do
         [ -f "$f" ] || continue
         chown user:user "$f" 2>/dev/null || true
         chmod 755 "$f" 2>/dev/null || true
     done
-    # 2) gio set metadata::trusted + xfce-exe-checksum (XFCE 4.18 五件套: uid(user) + 755 + checksum + trusted)
-    if command -v gio >/dev/null 2>&1; then
-        local oh=$HOME od=$DISPLAY odb=${DBUS_SESSION_BUS_ADDRESS:-}
-        export HOME=/home/user DISPLAY=${DISPLAY:-:0}
-        [ -f /tmp/dbus-session-env ] && . /tmp/dbus-session-env     # 关键: gio set 要 DBUS 连 gvfsd, 否则 not supported
+
+    # 2) gio set metadata::xfce-exe-checksum + metadata::trusted  (五件套 条件 4+5)
+    #    xfdesktop 4.18 + GLib 2.74 桌面 launcher 信任要 5 条件全满足 (ef0bcdc 实测 chromium 五件套齐即不弹):
+    #      uid(user) + 755 + DBUS_SESSION + xfce-exe-checksum + trusted。
+    #    7a39a79 误判"只靠文件属性"删了 gio → 仅老图标靠 PVC 残留旧 metadata 不弹, 新图标/新 PVC 必弹。此处恢复。
+    #    gio set 要 D-Bus session 连上 gvfsd-metadata; 启动早期没就绪会静默失败 → 先探测 gvfsd (最长 30s) 再批量写。
+    [ -f /tmp/dbus-session-env ] && . /tmp/dbus-session-env
+    export HOME=/home/user
+    local _first _gvfs_ready=0 i
+    _first=$(ls /home/user/Desktop/*.desktop 2>/dev/null | head -1)
+    if [ -n "$_first" ] && [ -n "$DBUS_SESSION_BUS_ADDRESS" ]; then
+        for i in $(seq 1 60); do
+            gio set "$_first" metadata::trusted true 2>/dev/null && { _gvfs_ready=1; break; }
+            sleep 0.5
+        done
+    fi
+    if [ "$_gvfs_ready" = "1" ]; then
         for f in /home/user/Desktop/*.desktop; do
             [ -f "$f" ] || continue
-            local cksum=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)
+            # checksum 形态=sha256(整个文件字节流)——libxfce4util 源码实锤
+            # (xfce_g_file_create_checksum 逐字节读文件做 SHA-256; is_trusted 只比对
+            # xfce-exe-checksum, metadata::trusted 不参与判定仅仪式值; 无 checksum 属性
+            # =必弹。02228da 曾误改为 sha256(Exec 行) → 0.1.251 全量弹 untrusted, 此处回滚)。
+            local cksum="$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)"
             [ -n "$cksum" ] && gio set "$f" metadata::xfce-exe-checksum "$cksum" 2>/dev/null || true
             gio set "$f" metadata::trusted true 2>/dev/null || true
         done
-        export HOME=$oh DISPLAY=$od
-        [ -n "$odb" ] && export DBUS_SESSION_BUS_ADDRESS=$odb || unset DBUS_SESSION_BUS_ADDRESS
+        log_success "Desktop icons trusted (XFCE 4.18: uid+755+DBUS+checksum(整文件)+trusted)"
+        # 3) 刷新 xfdesktop 缓存: gio set 写在 xfdesktop 启动之后, 它已缓存旧信任状态;
+        #    用 session env 重启 xfdesktop 让它重读 metadata (aaf10f4 的 refresh, 7a39a79 误删)。
+        if pgrep -x xfdesktop >/dev/null 2>&1; then
+            pkill -x xfdesktop 2>/dev/null || true
+            sleep 1
+            (env DISPLAY=:0 HOME=/home/user XDG_CURRENT_DESKTOP=XFCE \
+                 DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
+                 nohup xfdesktop >/tmp/xfdesktop-trust.log 2>&1 &)
+            log "xfdesktop restarted to refresh desktop icon trust"
+        fi
+    else
+        log_warn "gvfs metadata 后端未就绪, gio set 跳过 (图标可能双击弹 untrusted; metadata 持久化在 PVC, 下次启动恢复)"
     fi
-    # 3) 兜底: 禁 Thunar 启动确认 (对 Thunar 内双击生效)
+
+    # 4) 兜底: 禁 Thunar 启动确认 (Thunar 文件管理器内双击 .desktop 时生效)
     if command -v xfconf-query >/dev/null 2>&1; then
         HOME=/home/user xfconf-query -c thunar -p /misc-executable-launch-confirm -s false 2>/dev/null || true
     fi
-    # 4) xfdesktop restart (刷新 GDesktopAppInfo 缓存; gio set 后旧 xfdesktop 进程仍缓存 untrusted,
-    #    --reload 不刷 GDesktopAppInfo, 必须 kill+restart 新进程读 metadata::trusted + checksum)
-    killall xfdesktop 2>/dev/null || true
-    sleep 1
-    DISPLAY=${DISPLAY:-:0} HOME=/home/user nohup xfdesktop >/dev/null 2>&1 &
-    log_success "Desktop icons trusted"
 }
 
 function start_display_and_desktop() {
@@ -920,7 +984,7 @@ function start_display_and_desktop() {
 		fi
 
 		log "Starting PolicyKit daemon..."
-		/usr/lib/policykit-1/polkitd --no-debug >/var/log/polkitd.log 2>&1 &
+		/usr/lib/polkit-1/polkitd --no-debug >/var/log/polkitd.log 2>&1 &
 
 		if wait_for_process "polkitd" 5; then
 			log_success "PolicyKit daemon started"
@@ -999,8 +1063,8 @@ function start_display_and_desktop() {
 	# 启动 gnome-keyring-daemon
 	gnome-keyring-daemon --start --components=secrets,ssh,pkcs11 >/dev/null 2>&1 &
 
-	# 启动 PolicyKit 认证代理
-	/usr/lib/policykit-1-gnome/polkit-gnome-authentication-agent-1 >/var/log/polkit-agent.log 2>&1 &
+	# 不启动 polkit GUI 认证代理：容器无 systemd-logind，任何进程都没有登录会话，
+	# 代理注册必失败且 lxpolkit 会把失败弹成桌面 Error 对话框（镜像 autostart 已一并移除）。
 
 	# 等待 gnome-keyring-daemon 启动（智能等待，最长 2 秒）
 	wait_for_process_pattern "gnome-keyring-daemon" 2 || true
@@ -1844,9 +1908,9 @@ function start_ime_services() {
 }
 
 # ============================================================================
-# 🐘 PostgreSQL + pgweb（开发环境本地数据库 + Web UI）
+# 🐘 PostgreSQL（开发环境本地数据库）
 # 用户在 agent-runner 容器开发时用本地 PG 测试；开发完打包发布到 UserApp。
-# PG 数据落 /home/user/.pgdata（持久化，容器重启保留）；pgweb Web UI 操作数据库。
+# PG 数据落 /home/user/.pgdata（持久化，容器重启保留）；数据库操作走 dbx（Web GUI + AI MCP）。
 #
 # ⚠️ 启动模型: 此处只做"非阻塞"准备（备 PGDATA 归属 + 写连接信息）；首次 initdb
 # 与 postgres 进程均由 supervisor 托管的 pg-supervisor-entry.sh 异步拉起。
@@ -1858,20 +1922,43 @@ function prepare_pg() {
     export POSTGRES_USER="${POSTGRES_USER:-dev}"
     export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-dev}"
     export POSTGRES_DB="${POSTGRES_DB:-dev}"
-    export PGWEB_PORT="${PGWEB_PORT:-8081}"
+
+    # dbx-web(DBX 数据库 Web GUI):默认配置导出,supervisor conf.d/dbx.conf 进程继承。
+    # 面板免登(DBX_DISABLE_PASSWORD=1,conf.d/dbx.conf 注入)+ local-pg 预置连接
+    # 由 fork dbx 启动时自管(local_pg.rs:unix socket 免密直连,凭据不落盘)——
+    # 本脚本不再播种 connections.json。
+    export DBX_PORT="${DBX_PORT:-4224}"
+    export DBX_DATA_DIR="${DBX_DATA_DIR:-/home/user/.dbx}"
+    export DBX_STATIC_DIR="${DBX_STATIC_DIR:-/usr/local/share/dbx/static}"
+    mkdir -p "$DBX_DATA_DIR"
 
     mkdir -p /app/logs
-    # 仅备好 PGDATA 目录归属（瞬时: 无 fsync、无递归 chown）。
+    # 仅备好 PGDATA 目录归属（瞬时: 无 fsync；递归 chown 仅在下方检测到属主漂移时触发）。
     # 只 chown .pgdata 本身，不碰 /home/user —— 旧版 `chown -R $(dirname $PGDATA)`
     # 会递归 chown 整个用户主目录（= /home/user），既慢（CephFS 递归）又会把用户
     # 项目文件属主错改成 postgres。
     install -d -o postgres -g postgres "$PGDATA"
 
-    # 连接信息（供用户参考；postgres/pgweb 进程由 supervisor 管）
+    # 存量数据属主兜底：镜像换代可能漂移 postgres 系统用户 uid（bookworm=111:121，
+    # trixie 0.1.253 包集变化曾漂成 110:116，现已在镜像里钉死），旧 PVC 上 PGDATA 内
+    # 文件属主对不上时 postgres 读 600 的 postgresql.conf 直接 FATAL Permission denied。
+    # 此处以 root 在 supervisord 拉起 PG 之前整目录收敛（一次性，命中过即跳过）；
+    # 不能放进 pg-supervisor-entry.sh —— 它以 user=postgres 运行，无权 chown 他人文件。
+    # 递归只落在 .pgdata 内（dev 库几百 MB，CephFS 秒级），不碰 /home/user 其余文件。
+    if [ -s "$PGDATA/PG_VERSION" ]; then
+        _pg_ver_owner="$(stat -c '%u' "$PGDATA/PG_VERSION" 2>/dev/null || true)"
+        if [ -n "$_pg_ver_owner" ] && [ "$_pg_ver_owner" != "$(id -u postgres)" ]; then
+            log "PGDATA 属主漂移: PG_VERSION owner=$_pg_ver_owner != postgres(uid=$(id -u postgres)) → 递归 chown 收敛"
+            chown -R postgres:postgres "$PGDATA" || log "WARN: 递归 chown 失败，postgres 大概率仍将 FATAL（查 dmesg/存储）"
+        fi
+    fi
+
+    # 连接信息（供用户参考；postgres/dbx-web 进程由 supervisor 管）
+    # （pgweb 已退役——数据库 Web 控制台由 dbx 承担）
     cat > /home/user/pg-connection.txt <<EOF
 PostgreSQL 开发数据库:
   容器内: host=localhost port=5432 user=$POSTGRES_USER password=$POSTGRES_PASSWORD database=$POSTGRES_DB sslmode=disable
-pgweb: http://localhost:$PGWEB_PORT  (Add Connection 填上述信息)
+dbx:   http://localhost:$DBX_PORT  (免登录; local-pg 预置连接开箱即用, 双击桌面 DBX 图标)
 EOF
     log "PG prepared (PGDATA=$PGDATA); initdb/postgres 由 supervisor 异步拉起"
 }
@@ -1888,12 +1975,56 @@ export VNC_AUTO_START=true
 # 从骨架目录恢复配置（解决挂载空目录导致的花屏和图标消失）
 initialize_user_home
 
-# ========== supervisor 管 ttyd/PG/pgweb（不依赖 X11，初始化后启动）==========
-# 阶段1：ttyd/PG/pgweb 迁 supervisor（autorestart 崩溃自动拉起）
+# ========== supervisor 管 ttyd/PG/dbx（不依赖 X11，初始化后启动）==========
+# 阶段1：ttyd/PG/dbx 迁 supervisor（autorestart 崩溃自动拉起）
 # VNC/XFCE/MCP/audio/IME 仍由下方 start-up.sh 管（保留自定义）
 prepare_pg                                       # PG 非阻塞准备（initdb 已异步进 supervisor）
-supervisord -c /etc/supervisor/supervisord.conf  # daemon，autostart postgres/pgweb/ttyd
-log "supervisord started (manages: postgresql, pgweb, ttyd — autorestart on crash)"
+supervisord -c /etc/supervisor/supervisord.conf  # daemon，autostart postgres/dbx/ttyd
+log "supervisord started (manages: postgresql, dbx, ttyd — autorestart on crash)"
+
+# ========== TS nuwax-file-server 热备（60001，file-server-proxy 第二上游）==========
+# 对齐主 pod start-services.sh：nuwax-file-server start --env production --port 60001
+# 后台 daemonize + /health 轮询 + 失败重试。ENABLE_TS_FILE_SERVER 默认 true。
+start_ts_file_server() {
+    if [ "${ENABLE_TS_FILE_SERVER:-true}" != "true" ]; then
+        log "TS file-server skipped (ENABLE_TS_FILE_SERVER=${ENABLE_TS_FILE_SERVER:-true})"
+        return
+    fi
+    if ! command -v nuwax-file-server >/dev/null 2>&1; then
+        log "TS file-server skipped (nuwax-file-server not found)"
+        return
+    fi
+
+    local TS_PORT=60001
+    local TS_LOG="/home/user/logs/nuwax-file-server.log"
+    mkdir -p /home/user/logs
+
+    log "Starting nuwax-file-server (TS) on port ${TS_PORT}..."
+    nuwax-file-server start --env production --port ${TS_PORT} >> ${TS_LOG} 2>&1 &
+    log "nuwax-file-server (TS) start triggered, health check in background..."
+
+    (
+        MAX_RETRIES=3
+        RETRY_COUNT=0
+        while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            sleep 5
+            HTTP_STATUS=$(curl -s --connect-timeout 3 --max-time 5 -o /dev/null -w "%{http_code}" http://127.0.0.1:${TS_PORT}/health 2>/dev/null || echo "000")
+            if [ "$HTTP_STATUS" = "200" ]; then
+                echo "[$(date)] nuwax-file-server (TS) health check passed" >> ${TS_LOG}
+                break
+            fi
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "[$(date)] nuwax-file-server (TS) health check failed (attempt ${RETRY_COUNT}/${MAX_RETRIES}), HTTP: ${HTTP_STATUS}" >> ${TS_LOG}
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                # serviceManager 内部检查 PID 文件 + start.lock，有旧进程先 stop 再 start
+                sleep 2
+                nuwax-file-server start --env production --port ${TS_PORT} >> ${TS_LOG} 2>&1 &
+                echo "[$(date)] nuwax-file-server (TS) restart triggered" >> ${TS_LOG}
+            fi
+        done
+    ) &
+}
+start_ts_file_server
 
 # ========== MCP Proxy 服务在 X11 就绪后启动 ==========
 # 注意：chrome-devtools-mcp 需要 X11 来启动 Chromium 浏览器
@@ -1937,7 +2068,7 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
             log_success "VNC services started successfully!"
             log_success "VNC URL: http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
             log_success "Direct VNC port: 5900"
-            # 桌面图标信任化 (xfdesktop 起来后; 后台延迟调用, 不阻塞主流程)
+            # 桌面图标信任化: 兜底保证文件属性(user属主+755); 骨架恢复 cp -aL 已做过, 这里后台二次确认, 不阻塞主流程
             ( sleep 3 && trust_desktop_icons ) &
         else
             log_error "VNC services failed to start, /tmp/novnc_port_ready will NOT be written"
@@ -1964,7 +2095,7 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
     ) &
     ime_pid=$!
 
-    # 4.5 ttyd + PostgreSQL + pgweb —— 由 supervisor 管（autorestart），不在此启动
+    # 4.5 ttyd + PostgreSQL + dbx —— 由 supervisor 管（autorestart），不在此启动
     # （见上方 supervisord 启动；阶段1 迁 supervisor）
 
     # 5. 应用 XFCE 壁纸（后台）
@@ -2044,158 +2175,15 @@ log "VNC will be available at: http://localhost:6080/vnc.html?autoconnect=true&r
             fi
         fi
 
-        # 🔥 注意：僵尸进程回收已由 agent_runner 的 process_reaper 模块处理
-        # agent_runner 作为 PID 1 会自动回收所有孤儿进程，无需脚本额外清理
+        # 注:孤儿/僵尸进程回收 + 信号转发由 agent_runner 内置的 pid1 库负责 —— start-up.sh
+        # exec 进 agent_runner 后,若它是 PID 1,pid1 会 re-exec 自己为子进程 + 本进程做监督
+        # (进程外 waitpid,不与 tokio::process 冲突)。旧 in-process process_reaper 模块已删。
     done
 ) &
 
 # 启动 agent_runner 服务，支持从环境变量读取端口
 log "Starting agent_runner service on port ${PORT:-8086}..."
 
-# 🔧 如果启用 eBPF 调试模式，启动自动火焰图生成
-if [ "${ENABLE_EBPF_AUTO_FLAMEGRAPH:-false}" = "true" ]; then
-    log "🔧 启动 eBPF 自动火焰图生成..."
-    /usr/local/bin/ebpf-tools/auto-flamegraph.sh start &
-    AUTO_FLAME_PID=$!
-    log "✅ eBPF 自动火焰图生成已启动 (PID: $AUTO_FLAME_PID)"
-    log "📋 火焰图将每 ${GENERATE_INTERVAL:-60} 秒生成一次"
-    log "💡 火焰图保存到: ${DIAG_OUTPUT_DIR:-/app/container-logs/diag}/flamegraph-*.svg"
-fi
-
-# ============================================================================
-# 📊 Grafana Alloy - 持续性能数据采集（替代已废弃的 Pyroscope Agent）
-# 默认禁用，通过环境变量 ENABLE_ALLOY=true 启用
-# ============================================================================
-if [ "${ENABLE_ALLOY:-false}" = "true" ]; then
-    log "🔧 启动 Grafana Alloy (eBPF Profiling)..."
-
-    # Pyroscope Server 地址
-    PYROSCOPE_URL="${PYROSCOPE_URL:-http://pyroscope:4040}"
-
-    # 设置环境变量（用于 Alloy 配置文件）
-    export PYROSCOPE_URL
-    export PROJECT_ID="${PROJECT_ID:-default}"
-    export ENV="${ENV:-dev}"
-    export HOSTNAME="${HOSTNAME:-$(hostname)}"
-
-    # 显示环境变量（用于调试）
-    log "  环境变量:"
-    log "    PYROSCOPE_URL=$PYROSCOPE_URL"
-    log "    PROJECT_ID=$PROJECT_ID"
-    log "    ENV=$ENV"
-    log "    HOSTNAME=$HOSTNAME"
-
-    # 等待 Pyroscope Server 就绪
-    log "  等待 Pyroscope Server 就绪: $PYROSCOPE_URL"
-    local pyro_ready=false
-    local counter=0
-    while [ $counter -lt 60 ]; do
-        if curl -s -o /dev/null -w "%{http_code}" "$PYROSCOPE_URL" 2>/dev/null | grep -q "200\|404"; then
-            pyro_ready=true
-            break
-        fi
-        sleep 0.5
-        counter=$((counter + 1))
-    done
-
-    if [ "$pyro_ready" = false ]; then
-        log_warn "  Pyroscope Server 未就绪，跳过 Alloy 启动"
-    else
-        log_success "  Pyroscope Server 已就绪"
-
-        # 创建日志目录
-        mkdir -p "${CONTAINER_LOGS_DIR:-/app/container-logs}/diag"
-
-        # 检查 Alloy 是否安装
-        if ! command -v alloy >/dev/null 2>&1; then
-            log_warn "  Alloy 未安装，跳过启动"
-        else
-            # 验证 Alloy 配置文件
-            log "  验证 Alloy 配置文件..."
-            if alloy validate /etc/alloy/config.alloy 2>&1 | tee -a "${CONTAINER_LOGS_DIR:-/app/container-logs}/diag/alloy.log"; then
-                log_success "  Alloy 配置文件验证通过"
-            else
-                log_warn "  Alloy 配置文件验证失败，但仍将尝试启动"
-            fi
-
-            # 后台启动 Grafana Alloy
-            # 注意：eBPF 需要 root 权限，容器已通过 privileged 运行
-            log "  启动 Alloy 进程..."
-            nohup alloy run /etc/alloy/config.alloy \
-                > "${CONTAINER_LOGS_DIR:-/app/container-logs}/diag/alloy.log" 2>&1 &
-
-            local alloy_pid=$!
-            log_success "  Grafana Alloy 已启动 (PID: $alloy_pid)"
-            log "  📊 性能数据发送到: $PYROSCOPE_URL"
-            log "  💡 Web UI: http://localhost:4040"
-            log "  🔍 监控进程: agent_runner 及其子进程"
-            log "  📝 日志文件: ${CONTAINER_LOGS_DIR:-/app/container-logs}/diag/alloy.log"
-
-            # 等待 3 秒后检查 Alloy 进程状态
-            sleep 3
-            if ps -p "$alloy_pid" > /dev/null 2>&1; then
-                log_success "  Alloy 进程运行中"
-                # 显示最近的日志（用于调试）
-                log "  最近的 Alloy 日志:"
-                tail -n 5 "${CONTAINER_LOGS_DIR:-/app/container-logs}/diag/alloy.log" 2>/dev/null | while IFS= read -r line; do
-                    log "    $line"
-                done
-            else
-                log_warn "  Alloy 进程已退出，请检查日志"
-                log "  错误日志:"
-                tail -n 10 "${CONTAINER_LOGS_DIR:-/app/container-logs}/diag/alloy.log" 2>/dev/null | while IFS= read -r line; do
-                    log "    $line"
-                done
-            fi
-        fi
-    fi
-else
-    log "📊 Grafana Alloy 已禁用 (设置 ENABLE_ALLOY=true 启用)"
-fi
-
-# ============================================================================
-# 🔍 Off-CPU 阻塞监控 (offcputime-bpfcc)
-# ============================================================================
-if [ "${ENABLE_OFFCPUTIME:-false}" = "true" ]; then
-    log "🔧 启动 Off-CPU 阻塞监控..."
-
-    # 检查 offcputime-bpfcc 是否可用
-    if ! command -v offcputime-bpfcc &> /dev/null; then
-        log_warn "  offcputime-bpfcc 未安装，跳过 Off-CPU 监控"
-    else
-        # 创建 offcpu-monitor.sh 脚本（如果不存在）
-        if [ ! -f "/usr/local/bin/ebpf-tools/offcpu-monitor.sh" ]; then
-            log_warn "  offcpu-monitor.sh 未找到，跳过 Off-CPU 监控"
-        else
-            # 启动 Off-CPU 监控
-            /usr/local/bin/ebpf-tools/offcpu-monitor.sh start &
-            local offcpu_monitor_pid=$!
-            log_success "  Off-CPU 监控已启动 (PID: $offcpu_monitor_pid)"
-            log "  📊 阻塞火焰图将每 ${OFFCPU_INTERVAL:-300} 秒生成一次"
-            log "  💡 阻塞火焰图保存到: ${DIAG_OUTPUT_DIR:-/app/container-logs/diag}/offcpu-*.svg"
-        fi
-    fi
-fi
-
-# ============================================================================
-# 🔍 系统调用监控 (syscalls)
-# ============================================================================
-if [ "${ENABLE_SYSCALL_MONITOR:-false}" = "true" ]; then
-    log "🔧 启动系统调用监控..."
-
-    # 检查 syscount-bpfcc 是否可用
-    if ! command -v syscount-bpfcc &> /dev/null; then
-        log_warn "  syscount-bpfcc 未安装，跳过系统调用监控"
-    else
-        # 启动系统调用监控
-        /usr/local/bin/ebpf-tools/syscall-monitor.sh start &
-        local syscall_monitor_pid=$!
-        log_success "  系统调用监控已启动 (PID: $syscall_monitor_pid)"
-        log "  📊 系统调用统计将每 ${GENERATE_INTERVAL:-60} 秒生成一次"
-        log "  📝 日志文件: ${DIAG_OUTPUT_DIR:-/app/container-logs/diag}/syscall-monitor.log"
-        log "  💡 统计结果保存到: ${DIAG_OUTPUT_DIR:-/app/container-logs/diag}/syscall-count-*.txt"
-    fi
-fi
 
 # ========== 关键修复：确保 agent_runner 及其子进程继承输入法环境 ==========
 # 从 /tmp/dbus-session-env 加载 D-Bus 地址
@@ -2294,6 +2282,15 @@ export INPUT_METHOD=fcitx; \
 export LANG=C.UTF-8; \
 export LC_ALL=C.UTF-8; \
 export BROWSER=/usr/bin/chromium-browser-launcher; \
+export RCODER_EMBED_FILE_SERVER=true; \
+export PROJECT_SOURCE_DIR=/home/user; \
+export USERAPP_WORKSPACE_DIR=\${USERAPP_WORKSPACE_DIR:-/home/user}; \
+export USERAPP_LOG_DIR=\${USERAPP_LOG_DIR:-/home/user/logs}; \
+export USERAPP_SINGLE_APP_ID=\${USERAPP_SINGLE_APP_ID:-\${APP_ID:-}}; \
+export LOG_BASE_DIR=/home/user/logs; \
+export COMPUTER_LOG_DIR=/home/user/logs; \
+export FILE_SERVER_PORT=60000; \
+export FILE_SERVER_PROXY_POLICY=\${FILE_SERVER_PROXY_POLICY:-all_rust}; \
 export PATH=/usr/local/bin:/usr/local/cargo/bin:\$PATH"
 
 # 如果命令行传递了参数，则执行该参数（以 root 身份，但 HOME=/home/user）

@@ -286,3 +286,45 @@ fn test_load_test_environment_config_file() {
         );
     }
 }
+
+/// storage 段解析：postgres 模式字段 + 缺省默认 memory（rcoder-pg M4）
+#[test]
+fn test_storage_section_parsing() {
+    let yaml_postgres = r#"
+projects_dir: /tmp/projects
+port: 8087
+storage:
+  backend: postgres
+  postgres:
+    host: rcoder-pg.test.svc
+    port: 5433
+    username: rcoder
+    password: secret
+    database: rcoder
+    max_connections: 7
+"#;
+    let config: rcoder::config::AppConfig =
+        serde_yaml::from_str(yaml_postgres).expect("postgres storage section must parse");
+    assert_eq!(
+        config.storage.backend,
+        rcoder::config::StorageBackend::Postgres
+    );
+    let pg = &config.storage.postgres;
+    assert_eq!(pg.host.as_deref(), Some("rcoder-pg.test.svc"));
+    assert_eq!(pg.port, Some(5433));
+    assert_eq!(pg.max_connections, Some(7));
+    let dsn = pg.to_dsn().expect("dsn");
+    assert!(
+        dsn.starts_with("postgres://rcoder:secret@rcoder-pg.test.svc:5433/rcoder"),
+        "{dsn}"
+    );
+
+    // 缺省：无 storage 键 → memory + 默认 PG 配置（docker compose 旧配置零改动兼容）
+    let yaml_legacy = "projects_dir: /tmp/projects\nport: 8087\n";
+    let legacy: rcoder::config::AppConfig =
+        serde_yaml::from_str(yaml_legacy).expect("legacy config without storage must parse");
+    assert_eq!(
+        legacy.storage.backend,
+        rcoder::config::StorageBackend::Memory
+    );
+}

@@ -20,3 +20,13 @@ scrape_configs:
   - job_name: 'grafana'
     static_configs:
       - targets: ['grafana:3000']
+
+  # rcoder 业务指标（http_* 请求指标 + SpanMetricsLayer span 耗时直方图）
+  - job_name: 'rcoder'
+    static_configs:
+      - targets: ['rcoder:8090']
+
+  # otel-collector 自身指标（accepted/exported spans——追踪链路丢数排障抓手）
+  - job_name: 'otel-collector'
+    static_configs:
+      - targets: ['otel-collector:8888']

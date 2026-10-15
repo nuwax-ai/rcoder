@@ -27,6 +27,27 @@ error.invalid_resource_limits: "Invalid resource limits configuration"
 # Container
 error.container_error: "Container operation failed"
 error.container_not_found: "Container not found"
+error.runtime_configuration: "Platform runtime configuration is invalid"
+error.runtime_unavailable: "Container runtime is unavailable"
+error.runtime_timeout: "Runtime operation timed out"
+error.container_stop_failed: "Failed to stop container"
+error.container_exec_failed: "Container command execution failed"
+error.container_address_not_ready: "Container management address is not ready"
+error.database_not_ready: "Database is not ready"
+error.database_command_failed: "Database command failed"
+error.userapp_wake_failed: "Application wake failed"
+error.operation_outcome_unknown: "Operation completion was not confirmed"
+error.operation_in_progress: "Another application operation is in progress"
+error.operation_in_progress_retryable: "Another operation is running (%{kind}); estimated wait %{seconds} seconds. Please retry later."
+error.operation_in_progress_review: "The application has an unfinished operation (%{kind}). Inspect its state before retrying."
+error.operation_holder_unknown: "holder unknown"
+hint.operation_in_progress: "Use the structured retry guidance. Keep the same request identity and input; inspect accepted or unconfirmed operations instead of replaying writes."
+hint.runtime_configuration: "Correct the platform runtime configuration, then submit a new request."
+hint.runtime_unavailable: "Check runtime connectivity and permissions; preserve the original operation identity."
+hint.runtime_timeout: "Inspect the original operation and its failing stage before retrying."
+hint.readiness: "Inspect the management or database logs; do not restart solely because readiness is false."
+hint.operation_outcome_unknown: "Inspect or recover the original operation; do not replay the write automatically."
+hint.runtime_failure: "Inspect the recorded cause, stage and original operation; correct the issue before retrying."
 
 # Workspace
 error.workspace_error: "Workspace error"
@@ -39,6 +60,7 @@ error.agent_container_oom: "Compute environment restarted due to out-of-memory, 
 error.agent_container_crashloop: "Compute environment is crash-looping (exit code {}). Please contact the administrator"
 error.agent_container_not_found: "Compute environment is not running. Please start a new session"
 error.agent_container_starting: "Compute environment is starting up, please retry shortly"
+error.model_unavailable: "Model service is unavailable (connection failed or returned an error). Check model config or retry later."
 
 # Service status
 error.service_unavailable: "Service temporarily unavailable"
@@ -134,6 +156,13 @@ error.system_busy: "System is busy: concurrent Agent sessions reached limit ({})
 error.project_not_found: "Project not found or stopped"
 error.agent_runner_unavailable: "Agent Runner container is unavailable"
 
+# UserApp workspace readiness (dev/start & build acceptance precheck)
+error.workspace_empty: "UserApp workspace is empty: no project created or imported yet"
+error.workspace_no_services: "UserApp workspace has no enabled services: manifest missing, invalid, or all projects disabled"
+
+# UserApp dev session (dev logs precheck)
+error.dev_not_running: "Dev server is not running: dev logs are only available while the dev server is running; start it first"
+
 # === gRPC service messages ===
 
 # Common (shared across cancel/stop)
@@ -172,3 +201,67 @@ grpc.status.vnc_ready: "VNC service is ready"
 grpc.status.vnc_port_unreachable: "VNC marker exists, but noVNC port 6080 is unreachable"
 grpc.status.vnc_not_ready: "VNC service is not ready (starting or failed)"
 grpc.status.vnc_backend_not_ready: "noVNC proxy ready, but Xvnc backend (5900) is not responding — backend may be frozen or crashed"
+
+
+error.hot_deploy_env_change: "Hot deployment cannot change business env; use pod mode"
+
+error.userapp_wait_timeout: "The application container is taking longer to start. Please try again shortly."
+
+# Backend fallback (2026-09-22 app-105: code previously leaked as "en-US.error.backend_error")
+error.backend_error: "Backend service failed; see the operation message or service logs for the underlying cause"
+
+# UserApp source recovery diagnostics (CLI/log default; HTTP selects locale)
+error.source_history.missing_artifact: "The previous artifact directory is missing; submit a new source start or an explicit deployment request."
+error.source_history.derived_source_changed: "The previous source release metadata has changed; submit a new source start using the current workspace."
+error.source_history.ambiguous_artifact: "The previous artifact directory cannot be identified uniquely; a new source request can use the currently authorized source root."
+error.source_history.generation_changed: "The previous deployment generation does not match the current owner; submit a new source start or an explicit deployment request."
+error.source_history.inconsistent_identity: "The previous deployment identity fields are inconsistent; the original record is preserved. Submit a new source start or an explicit deployment request."
+error.source_recovery.unconfirmed_outcome: "Runtime recovery still has an unconfirmed write outcome; inspect the recovery status before retrying."
+error.source_recovery.cleanup_unconfirmed: "Previous service cleanup is not confirmed; new services cannot start yet."
+error.source_recovery.missing_credentials: "The platform did not provide database runtime credentials; the application has not started. Please retry."
+error.source_recovery.workspace_unbound: "The current owner is not bound to a source workspace."
+error.source_recovery.artifact_history_unavailable: "The previous artifact directory is missing or its identity is unknown; use a new source start or an explicit deployment request."
+error.source_recovery.artifact_identity_mismatch: "The deployment identity or confirmed boundary does not match the artifact being restored."
+error.source_recovery.artifact_target_missing: "The previous local artifact has no confirmed execution directory."
+error.source_recovery.artifact_release_changed: "The original artifact release identity has changed; submit an explicit deployment request."
+error.source_credentials.incomplete_environment: "Database runtime configuration requires both POSTGRES_USER and POSTGRES_PASSWORD; check the platform configuration and retry."
+error.source_credentials.invalid_account: "The database runtime account format is invalid; the application has not started."
+error.source_credentials.invalid_password: "The database runtime password is empty or invalid; the application has not started."
+
+# UserApp proxy failure page (pingora friendly page, 9 causes)
+userapp_error_page.starting.title: "App is starting"
+userapp_error_page.starting.message: "The application is starting and taking longer than usual. Please revisit shortly."
+userapp_error_page.stopped.title: "App is stopped"
+userapp_error_page.stopped.message: "The application is stopped. Start it from the app management page and try again."
+userapp_error_page.failed.title: "App failed to start"
+userapp_error_page.failed.message: "The application failed to start. Please redeploy or try again later."
+userapp_error_page.missing.title: "App not found or reclaimed"
+userapp_error_page.missing.message: "The application you are visiting does not exist or has been reclaimed and cannot be accessed. Check the app status or redeploy it."
+userapp_error_page.blocked.title: "App operation in progress"
+userapp_error_page.blocked.message: "An operation such as stop or delete is in progress on the application. It is temporarily unavailable; please try again later."
+userapp_error_page.recovery_required.title: "App recovery required"
+userapp_error_page.recovery_required.message: "The application must complete a recovery step before it can be accessed. Please redeploy it or contact your administrator."
+userapp_error_page.platform_unavailable.title: "Platform service unavailable"
+userapp_error_page.platform_unavailable.message: "A platform service is temporarily unavailable. Please try again later; this is not an issue with the application itself."
+userapp_error_page.outcome_unknown.title: "App status being confirmed"
+userapp_error_page.outcome_unknown.message: "The result of an application operation is being confirmed. Please try again shortly; if this keeps happening, redeploy the application."
+userapp_error_page.generic.title: "App temporarily unavailable"
+userapp_error_page.generic.message: "The application is temporarily unavailable. Please try again later."
+userapp_error_page.ui.browser: "Browser"
+userapp_error_page.ui.connected: "Connected"
+userapp_error_page.ui.gateway: "Gateway"
+userapp_error_page.ui.normal: "Normal"
+userapp_error_page.ui.app_service: "App service"
+userapp_error_page.ui.unavailable: "Unavailable"
+userapp_error_page.ui.starting: "Starting"
+userapp_error_page.ui.stopped: "Stopped"
+userapp_error_page.ui.failed: "Failed to start"
+userapp_error_page.ui.reload: "Reload"
+userapp_error_page.ui.hint: "Include this ID when reporting the issue to help locate this request"
+userapp_error_page.ui.copy: "Copy"
+userapp_error_page.ui.copied: "Copied"
+userapp_error_page.ui.aria_chain: "Path diagnostics: browser and gateway are healthy, the app service is currently unavailable"
+error.dev_container_unreachable: "The dev container is temporarily unreachable. Please try again shortly."
+
+userapp_error_page.restarting.title: "Application service is restarting"
+userapp_error_page.restarting.message: "The application service is starting or restarting. Please try again shortly."

@@ -1,0 +1,1300 @@
+//! Userapp 异步编译/发布任务:BuildTaskStore(`Mutex<HashMap>`)+ 状态机 + 进度事件。
+//!
+//! 设计参考 app_manager `ReleaseStatus`(Prepared/PendingStart/Active/Failed)状态机;
+//! 进度事件用 `broadcast`(实时 SSE 推送)+ `VecDeque` ring(seq replay,断线重连)。
+//! 无新重依赖:broadcast(tokio)、VecDeque(std)。
+//!
+//! 任务生命周期:Pending(创建)→ Running(spawn 执行)→ Completed/Failed/Cancelled。
+//! cancel 通过任务 CancellationToken 通知持有进程树的执行者收束。
+
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+
+use chrono::Utc;
+use tokio::sync::{Mutex, broadcast};
+use uuid::Uuid;
+
+// 进度事件类型复用 shared_types(file-server 发送 ↔ rcoder 接收,统一 wire)。
+pub use shared_types::BuildProgressEvent;
+
+/// 历史事件 ring 容量(断线重连 seq replay)。log 事件（构建输出逐行）纳入后
+/// 事件总量可达数千，容量按"典型构建全程 + 早期进度不滚掉"取值。
+const RING_CAP: usize = 4000;
+/// broadcast 通道容量(实时 SSE fan-out)。高频 log 行下给慢消费者留裕量，
+/// 降低 Lagged 关流概率。
+const BROADCAST_CAP: usize = 2048;
+const TERMINAL_TASK_TTL_SECS: i64 = 24 * 60 * 60;
+const MAX_RETAINED_TASKS: usize = 1_000;
+
+use crate::models::{BuildTaskId, BuildTaskKind, BuildTaskSnapshot, BuildTaskStatus};
+
+/// 任务可变状态:全部收在【一把】`state` 锁后(status/seq/history 同步变更,保证一致性)。
+struct TaskState {
+    app_id: String,
+    kind: BuildTaskKind,
+    status: BuildTaskStatus,
+    stage: Option<String>,
+    current_service: Option<String>,
+    release_id: Option<String>,
+    /// build 产物包摘要(完成时填;rcoder publish 经 GET /tasks/{id} 读取做 prepare)。
+    sha256: Option<String>,
+    size_bytes: Option<u64>,
+    file_name: Option<String>,
+    /// 相对 workspace 根的产物路径(start_build_task 预生成时 set;Completed 一致覆盖)。
+    artifact_path: Option<String>,
+    error: Option<String>,
+    diagnostics: Vec<shared_types::UserAppDiagnostic>,
+    /// workspace 根 (build/publish 工作区): logs/SSE 查询路径解析用。预 resolve 后存入。
+    workspace_root: Option<PathBuf>,
+    seq: u64,
+    history: VecDeque<(u64, BuildProgressEvent)>,
+    updated_at: i64,
+}
+
+/// 单个异步任务:状态 + 进度事件流 + cancel + build 进程 pid。
+///
+/// 并发模型:所有可变状态在【一把】`state` 锁后;`emit`/`subscribe` 各取一次锁、互不嵌套调用
+/// (共享临界逻辑在自由函数 `publish_mut`,它吃 `&mut TaskState`、无 `&self`,类型上无法再去
+/// 取 state 锁),从结构上根除锁序/重入死锁。`cancelled`/`terminal_at`/`created_at`/`pid`
+/// 保持在锁外:供 cancel/store/同步 on_pid 回调无锁读写。
+pub struct BuildTask {
+    pub id: BuildTaskId,
+    /// 所属 app（锁外不可变：供 store 在 map 锁内无锁做 per-app 扫描——
+    /// dev_stop 联动取消在途任务用，与 rcoder PublishTask 的 app_id 同款设计）
+    pub app_id: String,
+    /// 任务类型（锁外不可变，同上）
+    pub kind: BuildTaskKind,
+    state: Mutex<TaskState>,
+    tx: broadcast::Sender<(u64, BuildProgressEvent)>,
+    cancelled: AtomicBool,
+    cancellation: tokio_util::sync::CancellationToken,
+    cleanup_pending: Arc<std::sync::atomic::AtomicUsize>,
+    terminal_at: AtomicI64,
+    created_at: i64,
+    /// 当前 build 子进程 PID，仅诊断；取消必须使用 CancellationToken。
+    /// AtomicU32 (0 = 未设置) 而非 Mutex: build_generic 的 on_pid 回调是同步的, 需同步写。
+    pid: AtomicU32,
+    commit: Mutex<()>,
+}
+
+/// [`BuildTask::from_initial_state`] 的显式差异参数（WIP-01）：执行工厂走
+/// `Default`（Pending 起步、terminal_at=0 非终态哨兵）; 终态诊断工厂预填
+/// Failed 状态、诊断 history 与 terminal_at。
+struct InitialTaskState {
+    status: BuildTaskStatus,
+    stage: Option<String>,
+    current_service: Option<String>,
+    error: Option<String>,
+    diagnostics: Vec<shared_types::UserAppDiagnostic>,
+    history: VecDeque<(u64, BuildProgressEvent)>,
+    terminal_at: i64,
+}
+
+impl Default for InitialTaskState {
+    fn default() -> Self {
+        Self {
+            status: BuildTaskStatus::Pending,
+            stage: None,
+            current_service: None,
+            error: None,
+            diagnostics: Vec::new(),
+            history: VecDeque::with_capacity(RING_CAP),
+            terminal_at: 0,
+        }
+    }
+}
+
+impl BuildTask {
+    #[cfg(test)]
+    fn new(app_id: String, kind: BuildTaskKind) -> Arc<Self> {
+        Self::with_cancellation(
+            app_id,
+            kind,
+            tokio_util::sync::CancellationToken::new(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+    }
+    fn with_cancellation(
+        app_id: String,
+        kind: BuildTaskKind,
+        cancellation: tokio_util::sync::CancellationToken,
+        cleanup_pending: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Arc<Self> {
+        Self::from_initial_state(
+            app_id,
+            kind,
+            cancellation,
+            cleanup_pending,
+            InitialTaskState::default(),
+        )
+    }
+
+    /// 公共任务构造器（WIP-01 收口）：执行工厂与终态诊断工厂共用同一字段
+    /// 装配, 差异只经 [`InitialTaskState`] 显式表达——Pending 起步（执行）或
+    /// 直接终态 Failed 带诊断 history（诊断回执）。诊断任务同样**不占执行
+    /// slot/lease/worker**（调用方直接登记进 store, 不经过 BuildGuard）。
+    fn from_initial_state(
+        app_id: String,
+        kind: BuildTaskKind,
+        cancellation: tokio_util::sync::CancellationToken,
+        cleanup_pending: Arc<std::sync::atomic::AtomicUsize>,
+        initial: InitialTaskState,
+    ) -> Arc<Self> {
+        let (tx, _rx) = broadcast::channel(BROADCAST_CAP);
+        let now = Utc::now().timestamp();
+        let InitialTaskState {
+            status,
+            stage,
+            current_service,
+            error,
+            diagnostics,
+            history,
+            terminal_at,
+        } = initial;
+        Arc::new(Self {
+            id: Uuid::now_v7().simple().to_string(),
+            app_id: app_id.clone(),
+            kind,
+            state: Mutex::new(TaskState {
+                app_id,
+                kind,
+                status,
+                stage,
+                current_service,
+                release_id: None,
+                sha256: None,
+                size_bytes: None,
+                file_name: None,
+                artifact_path: None,
+                error,
+                diagnostics,
+                workspace_root: None,
+                seq: history.len() as u64,
+                history,
+                updated_at: now,
+            }),
+            tx,
+            cancelled: AtomicBool::new(false),
+            cancellation,
+            cleanup_pending,
+            terminal_at: AtomicI64::new(terminal_at),
+            created_at: now,
+            pid: AtomicU32::new(0),
+            commit: Mutex::new(()),
+        })
+    }
+
+    pub fn command_context(&self) -> process_utils::command_context::CommandContext {
+        process_utils::command_context::CommandContext {
+            identity: process_utils::command_context::WorkIdentity {
+                task_id: Some(self.id.clone()),
+                app_id: Some(self.app_id.clone()),
+            },
+            cancellation: self.cancellation.clone(),
+            cleanup_pending: self.cleanup_pending.clone(),
+            journal_root: process_utils::command_context::CommandContext::current()
+                .and_then(|c| c.journal_root),
+        }
+    }
+    /// Serializes process creation with cancellation's commit boundary.
+    pub async fn commit_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.commit.lock().await
+    }
+
+    /// Holds both lifecycle and task boundaries until process submission completes.
+    pub async fn commit_start<F, E>(
+        &self,
+        lifecycle: &Mutex<u64>,
+        expected: u64,
+        start: F,
+    ) -> Result<bool, E>
+    where
+        F: Future<Output = Result<(), E>>,
+    {
+        let generation = lifecycle.lock().await;
+        let _commit = self.commit_guard().await;
+        if *generation != expected || self.is_cancelled() {
+            self.cancel();
+            self.emit(BuildProgressEvent::Cancelled).await;
+            return Ok(false);
+        }
+        start.await?;
+        Ok(true)
+    }
+
+    /// Release admission locks only once the start future proves that its
+    /// original execution was submitted. Continue observing that execution
+    /// outside the locks, so Stop can cancel it while migration is still running.
+    pub async fn commit_start_until_submitted<F, E>(
+        &self,
+        lifecycle: &Mutex<u64>,
+        expected: u64,
+        submitted: &tokio_util::sync::CancellationToken,
+        start: F,
+    ) -> Result<bool, E>
+    where
+        F: Future<Output = Result<(), E>>,
+    {
+        let generation = lifecycle.lock().await;
+        let commit = self.commit_guard().await;
+        if *generation != expected || self.is_cancelled() {
+            self.cancel();
+            self.emit(BuildProgressEvent::Cancelled).await;
+            return Ok(false);
+        }
+        tokio::pin!(start);
+        tokio::select! {
+            result = &mut start => return result.map(|()| true),
+            () = submitted.cancelled() => {}
+        }
+        drop(commit);
+        drop(generation);
+        start.await?;
+        Ok(true)
+    }
+
+    /// Pending stays Pending while queued; expose the reason through the
+    /// existing snapshot stage and log event, without a new protocol variant.
+    pub async fn waiting_for_build_slot(&self, seconds: u64) {
+        {
+            let mut state = self.state.lock().await;
+            if is_terminal_status(state.status) {
+                return;
+            }
+            state.stage = Some("waiting_for_build_slot".to_owned());
+            state.updated_at = Utc::now().timestamp();
+        }
+        self.emit(BuildProgressEvent::Log {
+            service: "workspace".to_owned(),
+            line: format!(
+                "Waiting for a build slot (maximum {seconds}s); cancellation remains available"
+            ),
+        })
+        .await;
+    }
+
+    /// 当前快照(查询用)。
+    pub async fn snapshot(&self) -> BuildTaskSnapshot {
+        let s = self.state.lock().await;
+        BuildTaskSnapshot {
+            id: self.id.clone(),
+            app_id: s.app_id.clone(),
+            kind: s.kind,
+            status: s.status,
+            stage: s.stage.clone(),
+            current_service: s.current_service.clone(),
+            release_id: s.release_id.clone(),
+            sha256: s.sha256.clone(),
+            size_bytes: s.size_bytes,
+            file_name: s.file_name.clone(),
+            artifact_path: s.artifact_path.clone(),
+            error: s.error.clone(),
+            diagnostics: s.diagnostics.clone(),
+            seq: s.seq,
+            created_at: self.created_at,
+            updated_at: s.updated_at,
+        }
+    }
+
+    pub(crate) async fn record_diagnostic(&self, item: shared_types::UserAppDiagnostic) {
+        let mut state = self.state.lock().await;
+        if !is_terminal_status(state.status)
+            && state.diagnostics.len() < super::diagnostics::MAX_DIAGNOSTICS
+            && !state.diagnostics.contains(&item)
+        {
+            state.diagnostics.push(item);
+        }
+    }
+
+    pub(crate) async fn mark_admission_failure(&self) {
+        let mut state = self.state.lock().await;
+        if !is_terminal_status(state.status) {
+            state.stage = Some("admission".into());
+        }
+    }
+
+    /// 当前状态(轻量,无完整快照)。
+    pub async fn status(&self) -> BuildTaskStatus {
+        self.state.lock().await.status
+    }
+
+    /// 记录 workspace 根 (start_build_task 预 resolve 后存入),供 logs/SSE 解析日志目录。
+    pub async fn set_workspace_root(&self, root: PathBuf) {
+        self.state.lock().await.workspace_root = Some(root);
+    }
+
+    /// 预置产物路径与 release_id（start_build_task 预生成 release_id 后存入,
+    /// 快照 pending 期即可见;Completed 事件携带一致值覆盖,两处同源不漂移）。
+    pub async fn set_artifact_path(&self, release_id: String, artifact_path: String) {
+        let mut s = self.state.lock().await;
+        s.release_id = Some(release_id);
+        s.artifact_path = Some(artifact_path);
+    }
+
+    /// workspace 根; 任务 resolve 前为 None (logs handler 据此判断日志目录是否就绪)。
+    pub async fn workspace_root(&self) -> Option<PathBuf> {
+        self.state.lock().await.workspace_root.clone()
+    }
+
+    /// 发进度事件:取一次 state 锁 → `publish_mut` → broadcast → 释放。
+    /// 已 Completed/Failed/Cancelled 的任务丢弃后续事件(终态)。
+    pub async fn emit(&self, event: BuildProgressEvent) {
+        self.emit_with_diagnostic(event, None).await;
+    }
+
+    /// Keep typed infrastructure errors separate from failures emitted for a
+    /// known project service. No error-message matching participates here.
+    pub(crate) async fn emit_failure(&self, error: &file_server::error::AppError) {
+        use file_server::error::AppError;
+        use shared_types::{
+            UserAppDiagnosticCode as Code, UserAppDiagnosticPhase as Phase,
+            UserAppDiagnosticScope as Scope, UserAppRepairTarget as Target,
+        };
+        let item = {
+            let state = self.state.lock().await;
+            let phase = diagnostic_phase(state.stage.as_deref());
+            let known_service_failure = state
+                .diagnostics
+                .iter()
+                .any(|item| item.phase == phase && item.scope == Scope::Service);
+            let target = if known_service_failure
+                || (phase == Phase::Build
+                    && matches!(
+                        error,
+                        AppError::Validation(..)
+                            | AppError::ValidationI18n(..)
+                            | AppError::Business(_)
+                    )) {
+                Target::Project
+            } else {
+                Target::Platform
+            };
+            super::diagnostics::diagnostic(
+                match phase {
+                    Phase::Admission
+                        if state.stage.as_deref() == Some("waiting_for_build_slot") =>
+                    {
+                        Code::TaskCapacity
+                    }
+                    Phase::Admission => Code::WorkerAdmission,
+                    Phase::Start => Code::StartFailed,
+                    _ => Code::BuildFailed,
+                },
+                phase,
+                target,
+                state.workspace_root.as_deref(),
+                error.to_string(),
+                if target == Target::Project {
+                    "查看对应阶段和服务日志，修复失败原因后重试。"
+                } else {
+                    "检查平台运行配置、工作区权限或管理通道；保留原运行所有者身份后重试。"
+                },
+            )
+        };
+        self.emit_with_diagnostic(
+            BuildProgressEvent::Failed {
+                error: error.to_string(),
+            },
+            Some(item),
+        )
+        .await;
+    }
+
+    async fn emit_with_diagnostic(
+        &self,
+        event: BuildProgressEvent,
+        diagnostic_override: Option<shared_types::UserAppDiagnostic>,
+    ) {
+        let terminal = {
+            let mut s = self.state.lock().await;
+            // Supersede signals cancellation under the admission lock before
+            // awaiting event publication. Late success/failure cannot overtake it.
+            let event = if matches!(
+                event,
+                BuildProgressEvent::Completed { .. } | BuildProgressEvent::Failed { .. }
+            ) && self.is_cancelled()
+                // Registry shutdown may reject a worker before it ever starts.
+                // Only an explicit task cancellation wins over that admission error.
+                && !(s.stage.as_deref() == Some("admission") && !self.cancelled.load(Ordering::Relaxed))
+            {
+                BuildProgressEvent::Cancelled
+            } else {
+                event
+            };
+            if is_terminal_status(s.status) {
+                return;
+            }
+            // Failure diagnostics and the final explanatory log are committed
+            // under the same lock, before the terminal event becomes observable.
+            let failure = match &event {
+                BuildProgressEvent::BuildFail { service, error } => Some((
+                    shared_types::UserAppDiagnosticPhase::Build,
+                    Some(service.clone()),
+                    error,
+                )),
+                BuildProgressEvent::ServiceStartFail { service, error } => Some((
+                    shared_types::UserAppDiagnosticPhase::Start,
+                    Some(service.clone()),
+                    error,
+                )),
+                BuildProgressEvent::Failed { error } => {
+                    Some((diagnostic_phase(s.stage.as_deref()), None, error))
+                }
+                _ => None,
+            };
+            if let Some((phase, service, error)) = failure {
+                use shared_types::{
+                    UserAppDiagnosticCode as Code, UserAppDiagnosticPhase as Phase,
+                    UserAppDiagnosticScope as Scope, UserAppRepairTarget as Target,
+                };
+                let mut item = super::diagnostics::diagnostic(
+                    match phase {
+                        Phase::Start => Code::StartFailed,
+                        Phase::Admission => Code::WorkerAdmission,
+                        _ => Code::BuildFailed,
+                    },
+                    phase,
+                    if phase == Phase::Admission {
+                        Target::Platform
+                    } else {
+                        Target::Project
+                    },
+                    s.workspace_root.as_deref(),
+                    error,
+                    "查看对应阶段和服务日志，修复失败原因后重试。",
+                );
+                item.scope = if service.is_some() {
+                    Scope::Service
+                } else {
+                    Scope::Task
+                };
+                item.service_id = service;
+                if let Some(override_item) = diagnostic_override {
+                    item = override_item;
+                }
+                if matches!(
+                    event,
+                    BuildProgressEvent::Failed { .. } | BuildProgressEvent::BuildFail { .. }
+                ) {
+                    // Startup service summaries already come from StartEventPipe.
+                    // Build failures need the same visibility for log-only clients.
+                    let log = BuildProgressEvent::Log {
+                        service: item
+                            .service_id
+                            .clone()
+                            .unwrap_or_else(|| "workspace".into()),
+                        line: super::diagnostics::log_line(&item),
+                    };
+                    if let Some((seq, log, _)) = publish_mut(&mut s, log) {
+                        drop(self.tx.send((seq, log)));
+                    }
+                }
+                if s.diagnostics.len() < super::diagnostics::MAX_DIAGNOSTICS {
+                    s.diagnostics.push(item);
+                }
+            }
+            let Some((seq, event, terminal)) = publish_mut(&mut s, event) else {
+                return;
+            };
+            // broadcast 必须在持 state 锁内:与 subscribe 的"创建 receiver + 读 replay"互斥串行,
+            // 否则同一事件可能既进 replay 又被 receiver 收到 → 重复(broadcast::send 非阻塞,持锁安全)。
+            // 进度事件无订阅者时 send 失败属预期(接收方可能已退出)；记 debug 便于诊断
+            if let Err(send_err) = self.tx.send((seq, event)) {
+                tracing::warn!("progress event send failed (consumer gone): {send_err}");
+            }
+            terminal
+        };
+        if terminal {
+            self.terminal_at
+                .store(Utc::now().timestamp(), Ordering::Release);
+        }
+    }
+
+    pub async fn is_terminal(&self) -> bool {
+        matches!(
+            self.state.lock().await.status,
+            BuildTaskStatus::Completed | BuildTaskStatus::Failed | BuildTaskStatus::Cancelled
+        )
+    }
+
+    /// 订阅:回放 ring 里 seq >= from_seq 的历史 + 实时 broadcast receiver。
+    /// 一把 state 锁兜住"创建 receiver + 取 replay",保证两者之间无 emit 缝隙。
+    /// 供 SSE 断线重连(带 from_seq)+ 首次订阅(from_seq=0)。
+    pub async fn subscribe(
+        &self,
+        from_seq: u64,
+    ) -> (
+        Vec<(u64, BuildProgressEvent)>,
+        broadcast::Receiver<(u64, BuildProgressEvent)>,
+    ) {
+        let (replay, receiver, _) = self.subscribe_snapshot(from_seq).await;
+        (replay, receiver)
+    }
+
+    /// Receiver, replay and terminal cursor belong to one atomic snapshot.
+    /// A terminal emitted after this snapshot must be consumed from the receiver.
+    pub async fn subscribe_snapshot(
+        &self,
+        from_seq: u64,
+    ) -> (
+        Vec<(u64, BuildProgressEvent)>,
+        broadcast::Receiver<(u64, BuildProgressEvent)>,
+        Option<u64>,
+    ) {
+        let s = self.state.lock().await;
+        let terminal_seq = matches!(
+            s.status,
+            BuildTaskStatus::Completed | BuildTaskStatus::Failed | BuildTaskStatus::Cancelled
+        )
+        .then(|| s.seq.saturating_sub(1));
+        let receiver = self.tx.subscribe();
+        let replay = s
+            .history
+            .iter()
+            .filter(|(seq, _)| *seq >= from_seq)
+            .cloned()
+            .collect();
+        (replay, receiver, terminal_seq)
+    }
+
+    /// 记录当前 build 子进程 pid (build_generic spawn 后经 on_pid 回调同步写入)。
+    pub fn set_pid(&self, pid: u32) {
+        self.pid.store(pid, Ordering::Relaxed);
+    }
+
+    /// 清除记录的 build pid。子进程退出(或超时被 kill)后调用,缩短 stale-pid 窗口(#2 防御性加固)。
+    pub fn clear_pid(&self) {
+        self.pid.store(0, Ordering::Relaxed);
+    }
+
+    /// 当前 build child 进程 pid (cancel 时 kill_process_group 用); 0 = 未设置。
+    pub fn pid(&self) -> Option<u32> {
+        match self.pid.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed) || self.cancellation.is_cancelled()
+    }
+
+    /// 标记取消(外部再 kill 进程组);build 循环可检 is_cancelled 主动退出。
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.cancellation.cancel();
+    }
+
+    /// 任务的取消内核（soft cancel + emit `Cancelled` 终态）。
+    ///
+    /// 三个入口共用：cancel 端点、dev_stop/工作区重置的在途任务联动取消、
+    /// 构建自动接替（同 app 新构建请求取消更早的在途构建）。
+    /// 进程树清理由持有 ManagedChild 的 worker 负责；缓存的数字 pid 仅诊断，
+    /// 不能授权取消。主动 emit `Cancelled`：若 build 在循环间隙（非
+    /// build_generic 内），靠此置终态；若在 build_generic 内被 kill，错误
+    /// 分支的 is_cancelled 分支也会 emit（终态保护丢弃这里的重复）。
+    pub async fn request_cancel(&self) {
+        let _commit = self.commit_guard().await;
+        self.cancel();
+        self.emit(BuildProgressEvent::Cancelled).await;
+    }
+}
+
+fn diagnostic_phase(stage: Option<&str>) -> shared_types::UserAppDiagnosticPhase {
+    match stage {
+        Some("starting") => shared_types::UserAppDiagnosticPhase::Start,
+        Some("admission" | "waiting_for_build_slot") => {
+            shared_types::UserAppDiagnosticPhase::Admission
+        }
+        _ => shared_types::UserAppDiagnosticPhase::Build,
+    }
+}
+
+fn is_terminal_status(status: BuildTaskStatus) -> bool {
+    matches!(
+        status,
+        BuildTaskStatus::Completed | BuildTaskStatus::Failed | BuildTaskStatus::Cancelled
+    )
+}
+
+/// 临界逻辑(自由函数,吃 `&mut TaskState`、无 `&self`):终态检查 → apply → seq → ring。
+/// 返回 `(seq, event, terminal)`:event 供调用方在【持 state 锁时】做 broadcast(必须持锁,
+/// 与 subscribe 串行,防同一事件既进 replay 又进 broadcast);任务已终态返回 None。
+/// 没有 `&self` → 类型上无法再去取 state 锁 → 根除"持锁时调 emit"的重入死锁(与 rcoder PublishTask 同构)。
+fn publish_mut(
+    state: &mut TaskState,
+    event: BuildProgressEvent,
+) -> Option<(u64, BuildProgressEvent, bool)> {
+    if is_terminal_status(state.status) {
+        return None;
+    }
+    apply_event(state, &event);
+    let terminal = is_terminal_status(state.status);
+    let seq = state.seq;
+    state.seq += 1;
+    if state.history.len() >= RING_CAP {
+        state.history.pop_front();
+    }
+    state.history.push_back((seq, event.clone()));
+    Some((seq, event, terminal))
+}
+
+fn apply_event(state: &mut TaskState, event: &BuildProgressEvent) {
+    state.updated_at = Utc::now().timestamp();
+    match event {
+        BuildProgressEvent::Stage { stage } => {
+            state.stage = Some(stage.clone());
+            state.status = BuildTaskStatus::Running;
+        }
+        BuildProgressEvent::Building { service } => {
+            state.stage = Some("building".to_owned());
+            state.current_service = Some(service.clone());
+            state.status = BuildTaskStatus::Running;
+        }
+        BuildProgressEvent::BuildOk { .. } => state.current_service = None,
+        BuildProgressEvent::BuildFail { service, error } => {
+            state.current_service = Some(service.clone());
+            state.error = Some(error.clone());
+        }
+        BuildProgressEvent::Log { .. } => {}
+        // dev 启动阶段事件：更新 current_service（消费方轮询快照可见进行中的
+        // 服务）；失败记录 error（快照侧可读，终态仍由汇总 Failed 决定）。
+        BuildProgressEvent::ServiceStarting { service }
+        | BuildProgressEvent::ServiceStartOk { service } => {
+            state.stage = Some("starting".to_owned());
+            state.current_service = Some(service.clone());
+            state.status = BuildTaskStatus::Running;
+        }
+        BuildProgressEvent::ServiceStartFail { service, error } => {
+            state.stage = Some("starting".to_owned());
+            state.current_service = Some(service.clone());
+            state.error = Some(error.clone());
+        }
+        BuildProgressEvent::Completed {
+            release_id,
+            sha256,
+            size_bytes,
+            file_name,
+            artifact_path,
+        } => {
+            state.release_id = Some(release_id.clone());
+            state.sha256 = Some(sha256.clone());
+            state.size_bytes = Some(*size_bytes);
+            state.file_name = Some(file_name.clone());
+            state.artifact_path = Some(artifact_path.clone());
+            state.status = BuildTaskStatus::Completed;
+        }
+        BuildProgressEvent::Failed { error } => {
+            state.error = Some(error.clone());
+            state.status = BuildTaskStatus::Failed;
+        }
+        BuildProgressEvent::Cancelled => state.status = BuildTaskStatus::Cancelled,
+    }
+}
+
+/// 全局任务表(`Mutex<HashMap>`,内存;build 短期不需持久化,发布产物由 app_manager release index 持久)。
+/// 用 tokio::sync::Mutex(无 poison,符合禁止 unwrap/expect);并发度低(任务数有限)。
+pub struct BuildTaskStore {
+    pub workers: Arc<process_utils::workers::WorkerRegistry>,
+    map: Mutex<HashMap<BuildTaskId, Arc<BuildTask>>>,
+    max_retained_tasks: usize,
+    dev_lifecycles: Mutex<HashMap<String, std::sync::Weak<Mutex<u64>>>>,
+    workspace_activity: Mutex<HashMap<String, std::sync::Weak<tokio::sync::RwLock<()>>>>,
+}
+
+/// `BuildTaskStore::create` 容量耗尽错误(硬上限:全活跃任务达上限且无终态任务可淘汰)。
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BuildTaskStoreError {
+    #[error("build task capacity exhausted (limit={limit}); wait for an active build to finish")]
+    CapacityExceeded { limit: usize },
+}
+
+impl Default for BuildTaskStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BuildTaskStore {
+    /// Workers retain a read lease until execution exits. A workspace reset
+    /// obtains the write lease, so a Cancelled event alone cannot authorize deletion.
+    pub async fn workspace_activity(&self, app_id: &str) -> Arc<tokio::sync::RwLock<()>> {
+        let mut entries = self.workspace_activity.lock().await;
+        entries.retain(|_, value| value.strong_count() > 0);
+        if let Some(existing) = entries.get(app_id).and_then(std::sync::Weak::upgrade) {
+            return existing;
+        }
+        let activity = Arc::new(tokio::sync::RwLock::new(()));
+        entries.insert(app_id.to_owned(), Arc::downgrade(&activity));
+        activity
+    }
+    /// Weak entries avoid retaining every app ever seen by this process.
+    pub async fn dev_lifecycle(&self, app_id: &str) -> Arc<Mutex<u64>> {
+        let mut entries = self.dev_lifecycles.lock().await;
+        entries.retain(|_, value| value.strong_count() > 0);
+        if let Some(existing) = entries.get(app_id).and_then(std::sync::Weak::upgrade) {
+            return existing;
+        }
+        let lifecycle = Arc::new(Mutex::new(0));
+        entries.insert(app_id.to_owned(), Arc::downgrade(&lifecycle));
+        lifecycle
+    }
+
+    pub fn new() -> Self {
+        Self {
+            workers: process_utils::workers::WorkerRegistry::new(None),
+            map: Mutex::new(HashMap::new()),
+            dev_lifecycles: Mutex::new(HashMap::new()),
+            workspace_activity: Mutex::new(HashMap::new()),
+            max_retained_tasks: MAX_RETAINED_TASKS,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_max_retained_tasks(max_retained_tasks: usize) -> Self {
+        Self {
+            workers: process_utils::workers::WorkerRegistry::new(None),
+            map: Mutex::new(HashMap::new()),
+            dev_lifecycles: Mutex::new(HashMap::new()),
+            workspace_activity: Mutex::new(HashMap::new()),
+            max_retained_tasks,
+        }
+    }
+
+    pub fn with_workers(workers: Arc<process_utils::workers::WorkerRegistry>) -> Self {
+        let mut store = Self::new();
+        store.workers = workers;
+        store
+    }
+    pub async fn create(
+        &self,
+        app_id: String,
+        kind: BuildTaskKind,
+    ) -> Result<Arc<BuildTask>, BuildTaskStoreError> {
+        self.create_inner(app_id, kind, false).await
+    }
+
+    /// Registration is the ordering point, not UUID generation on another
+    /// thread. Select and signal older Builds under the same short map lock.
+    pub async fn create_superseding_build(
+        &self,
+        app_id: String,
+    ) -> Result<Arc<BuildTask>, BuildTaskStoreError> {
+        self.create_inner(app_id, BuildTaskKind::Build, true).await
+    }
+
+    async fn create_inner(
+        &self,
+        app_id: String,
+        kind: BuildTaskKind,
+        supersede: bool,
+    ) -> Result<Arc<BuildTask>, BuildTaskStoreError> {
+        let mut map = self.map.lock().await;
+        reserve_capacity(&mut map, self.max_retained_tasks)?;
+        let task = BuildTask::with_cancellation(
+            app_id.clone(),
+            kind,
+            self.workers.cancellation(),
+            self.workers.cleanup_pending(),
+        );
+        let older: Vec<_> = if supersede {
+            map.values()
+                .filter(|existing| {
+                    existing.app_id == app_id
+                        && existing.kind == BuildTaskKind::Build
+                        && existing.terminal_at.load(Ordering::Acquire) == 0
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for existing in &older {
+            existing.cancel();
+        }
+        map.insert(task.id.clone(), task.clone());
+        drop(map);
+        for existing in older {
+            existing.request_cancel().await;
+        }
+        Ok(task)
+    }
+
+    /// Register a fully terminal diagnostic task. It never owns an execution
+    /// lease, build slot, worker, or cancellation child of the worker registry.
+    pub async fn create_failed_diagnostic(
+        &self,
+        app_id: String,
+        kind: BuildTaskKind,
+        error: String,
+        diagnostics: Vec<shared_types::UserAppDiagnostic>,
+    ) -> Result<Arc<BuildTask>, BuildTaskStoreError> {
+        let now = Utc::now().timestamp();
+        let mut diagnostics: Vec<_> = diagnostics
+            .into_iter()
+            .take(super::diagnostics::MAX_DIAGNOSTICS)
+            .collect();
+        if diagnostics.is_empty() {
+            diagnostics.push(super::diagnostics::diagnostic(
+                shared_types::UserAppDiagnosticCode::OwnerPreflight,
+                shared_types::UserAppDiagnosticPhase::Precheck,
+                shared_types::UserAppRepairTarget::Platform,
+                None,
+                &error,
+                "检查任务错误详情后重试。",
+            ));
+        }
+        let stage = match diagnostics[0].phase {
+            shared_types::UserAppDiagnosticPhase::Precheck => "precheck",
+            shared_types::UserAppDiagnosticPhase::OwnerPreflight => "owner_preflight",
+            shared_types::UserAppDiagnosticPhase::Admission => "admission",
+            shared_types::UserAppDiagnosticPhase::Build => "building",
+            shared_types::UserAppDiagnosticPhase::Start => "starting",
+        };
+        let current_service = diagnostics.iter().find_map(|item| item.service_id.clone());
+        let mut history = VecDeque::new();
+        for item in &diagnostics {
+            history.push_back((
+                history.len() as u64,
+                BuildProgressEvent::Log {
+                    service: item
+                        .service_id
+                        .clone()
+                        .unwrap_or_else(|| "workspace".into()),
+                    line: super::diagnostics::log_line(item),
+                },
+            ));
+        }
+        history.push_back((
+            history.len() as u64,
+            BuildProgressEvent::Failed {
+                error: error.clone(),
+            },
+        ));
+        // WIP-01: 与执行工厂共用同一构造器; 差异全部在 InitialTaskState 里
+        // 显式表达（终态 Failed + 诊断 history + terminal_at）。
+        let task = BuildTask::from_initial_state(
+            app_id,
+            kind,
+            tokio_util::sync::CancellationToken::new(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            InitialTaskState {
+                status: BuildTaskStatus::Failed,
+                stage: Some(stage.into()),
+                current_service,
+                error: Some(error),
+                diagnostics,
+                history,
+                terminal_at: now,
+            },
+        );
+        let mut map = self.map.lock().await;
+        reserve_capacity(&mut map, self.max_retained_tasks)?;
+        map.insert(task.id.clone(), task.clone());
+        Ok(task)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn retained_count(&self) -> usize {
+        self.map.lock().await.len()
+    }
+
+    pub async fn get(&self, id: &str) -> Option<Arc<BuildTask>> {
+        self.map.lock().await.get(id).cloned()
+    }
+
+    /// UA-04: 按 app 归属取任务——格式合法的 task_id 不等于资源归属。
+    /// 归属不匹配与"不存在"同形返回 None（不向跨 app 调用方泄露其他 app
+    /// 任务的存在性）; 快照/SSE/取消/诊断回查统一走本入口。
+    pub async fn get_scoped(&self, app_id: &str, task_id: &str) -> Option<Arc<BuildTask>> {
+        let task = self.get(task_id).await?;
+        (task.app_id == app_id).then_some(task)
+    }
+
+    /// 该 app 的在途（非终态）任务列表——dev_stop 联动取消用：不取消的话，
+    /// 编译中的 start/restart 任务会在编译完成后把刚停的服务重新拉起，
+    /// 停止意图被异步任务推翻。map 锁内原子读 terminal_at + 锁外不可变
+    /// app_id，无锁嵌套。
+    pub async fn active_tasks_for_app(&self, app_id: &str) -> Vec<Arc<BuildTask>> {
+        self.map
+            .lock()
+            .await
+            .values()
+            .filter(|t| t.terminal_at.load(Ordering::Acquire) == 0 && t.app_id == app_id)
+            .cloned()
+            .collect()
+    }
+}
+
+fn reserve_capacity(
+    map: &mut HashMap<BuildTaskId, Arc<BuildTask>>,
+    limit: usize,
+) -> Result<(), BuildTaskStoreError> {
+    let now = Utc::now().timestamp();
+    map.retain(|_, existing| {
+        let terminal_at = existing.terminal_at.load(Ordering::Acquire);
+        terminal_at == 0 || now.saturating_sub(terminal_at) < TERMINAL_TASK_TTL_SECS
+    });
+    // 硬上限:全活跃任务达上限时,优先淘汰最旧终态任务;无终态可淘汰则拒绝(不再越过上限插入,#12)。
+    while map.len() >= limit {
+        let Some(oldest_terminal_id) = map
+            .values()
+            .filter(|existing| existing.terminal_at.load(Ordering::Acquire) > 0)
+            .min_by_key(|existing| existing.created_at)
+            .map(|existing| existing.id.clone())
+        else {
+            return Err(BuildTaskStoreError::CapacityExceeded { limit });
+        };
+        map.remove(&oldest_terminal_id);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_build_admission_supersedes_pending_builds_but_not_dev() {
+        let store = Arc::new(BuildTaskStore::new());
+        let dev = store
+            .create("application".into(), BuildTaskKind::DevStart)
+            .await
+            .unwrap();
+        let older = store
+            .create_superseding_build("application".into())
+            .await
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut joins = Vec::new();
+        for _ in 0..2 {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            joins.push(tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .create_superseding_build("application".into())
+                    .await
+                    .unwrap()
+            }));
+        }
+        barrier.wait().await;
+        let a = joins.remove(0).await.unwrap();
+        let b = joins.remove(0).await.unwrap();
+        let (earlier, latest) = if a.id < b.id { (a, b) } else { (b, a) };
+        assert!(older.is_cancelled());
+        assert!(earlier.is_cancelled());
+        assert!(!latest.is_cancelled());
+        assert!(!dev.is_cancelled());
+        assert_eq!(earlier.status().await, BuildTaskStatus::Cancelled);
+        // Late worker fallback and success cannot override cancellation or add a terminal.
+        earlier
+            .emit(BuildProgressEvent::Failed {
+                error: "cancelled command exited".into(),
+            })
+            .await;
+        earlier
+            .emit(BuildProgressEvent::Completed {
+                release_id: "unused".into(),
+                sha256: String::new(),
+                size_bytes: 0,
+                file_name: String::new(),
+                artifact_path: String::new(),
+            })
+            .await;
+        let (events, _) = earlier.subscribe(0).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(_, event)| matches!(
+                    event,
+                    BuildProgressEvent::Cancelled
+                        | BuildProgressEvent::Completed { .. }
+                        | BuildProgressEvent::Failed { .. }
+                ))
+                .count(),
+            1
+        );
+        // Signal/publication gap: a worker may finish before request_cancel
+        // obtains the state lock. Its fallback must still publish Cancelled.
+        latest.cancel();
+        latest
+            .emit(BuildProgressEvent::Failed {
+                error: "worker finished before cancel event publication".into(),
+            })
+            .await;
+        latest.request_cancel().await;
+        assert_eq!(latest.status().await, BuildTaskStatus::Cancelled);
+        let (events, _) = latest.subscribe(0).await;
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].1, BuildProgressEvent::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn terminal_event_does_not_release_a_workers_workspace_lease() {
+        let store = BuildTaskStore::new();
+        let activity = store.workspace_activity("reset-app").await;
+        let worker = activity.clone().read_owned().await;
+        let task = store
+            .create("reset-app".into(), BuildTaskKind::Build)
+            .await
+            .expect("task");
+        task.cancel();
+        task.emit(BuildProgressEvent::Cancelled).await;
+        assert!(task.is_terminal().await);
+        let same_activity = store.workspace_activity("reset-app").await;
+        assert!(Arc::ptr_eq(&activity, &same_activity));
+        assert!(
+            same_activity.clone().try_write_owned().is_err(),
+            "cancelled worker still owns workspace until it exits"
+        );
+        let unrelated = store.workspace_activity("another-app").await;
+        let _unrelated_reset = unrelated
+            .try_write_owned()
+            .expect("other apps are independent");
+        drop(worker);
+        let reset = same_activity
+            .clone()
+            .try_write_owned()
+            .expect("worker has exited");
+        assert!(
+            same_activity.clone().try_read_owned().is_err(),
+            "reset excludes new work"
+        );
+        drop(reset);
+        assert!(same_activity.try_read_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn failure_diagnostics_classify_phase_and_repair_target_without_message_matching() {
+        use shared_types::{
+            UserAppDiagnosticCode as Code, UserAppDiagnosticPhase as Phase,
+            UserAppRepairTarget as Target,
+        };
+        for (stage, phase, code, target) in [
+            (
+                "waiting_for_build_slot",
+                Phase::Admission,
+                Code::TaskCapacity,
+                Target::Platform,
+            ),
+            (
+                "admission",
+                Phase::Admission,
+                Code::WorkerAdmission,
+                Target::Platform,
+            ),
+            ("building", Phase::Build, Code::BuildFailed, Target::Project),
+            (
+                "starting",
+                Phase::Start,
+                Code::StartFailed,
+                Target::Platform,
+            ),
+        ] {
+            let task = BuildTask::new("app-a".into(), BuildTaskKind::DevStart);
+            task.emit(BuildProgressEvent::Stage {
+                stage: stage.into(),
+            })
+            .await;
+            task.emit_failure(&file_server::error::AppError::business(
+                "same arbitrary text",
+            ))
+            .await;
+            let snapshot = task.snapshot().await;
+            assert_eq!(snapshot.status, BuildTaskStatus::Failed);
+            assert_eq!(snapshot.diagnostics.len(), 1);
+            let item = &snapshot.diagnostics[0];
+            assert_eq!(
+                (item.phase, item.code, item.repair_target),
+                (phase, code, target)
+            );
+            let (events, _) = task.subscribe(0).await;
+            assert!(matches!(
+                events[events.len() - 2].1,
+                BuildProgressEvent::Log { .. }
+            ));
+            assert!(matches!(
+                events[events.len() - 1].1,
+                BuildProgressEvent::Failed { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn subscription_has_no_gap_between_replay_and_live_events() {
+        let task = BuildTask::new("app-a".into(), BuildTaskKind::Build);
+        let (replay, mut receiver) = task.subscribe(0).await;
+        assert!(replay.is_empty());
+
+        task.emit(BuildProgressEvent::Stage {
+            stage: "Build".into(),
+        })
+        .await;
+        let (seq, event) = receiver.recv().await.expect("live event");
+        assert_eq!(seq, 0);
+        assert!(matches!(event, BuildProgressEvent::Stage { .. }));
+    }
+
+    /// log 事件（构建日志行）实时入流、非终态，且不污染任务快照状态。
+    #[tokio::test]
+    async fn log_events_flow_through_subscription_without_touching_snapshot_status() {
+        let task = BuildTask::new("app-a".into(), BuildTaskKind::Build);
+        let (replay, mut receiver) = task.subscribe(0).await;
+        assert!(replay.is_empty());
+
+        task.emit(BuildProgressEvent::Building {
+            service: "java".into(),
+        })
+        .await;
+        task.emit(BuildProgressEvent::Log {
+            service: "java".into(),
+            line: "[INFO] build...".into(),
+        })
+        .await;
+        task.emit(BuildProgressEvent::BuildOk {
+            service: "java".into(),
+        })
+        .await;
+
+        let (seq, event) = receiver.recv().await.expect("building");
+        assert_eq!(seq, 0);
+        assert!(matches!(event, BuildProgressEvent::Building { .. }));
+        let (seq, event) = receiver.recv().await.expect("log");
+        assert_eq!(seq, 1);
+        assert!(
+            matches!(
+                &event,
+                BuildProgressEvent::Log { service, line }
+                    if service == "java" && line == "[INFO] build..."
+            ),
+            "{event:?}"
+        );
+        // 回放环含全部三条（from_seq=0 重连可完整回放）
+        let (replay, _) = task.subscribe(0).await;
+        assert_eq!(replay.len(), 3);
+        // 快照状态不被 log 事件污染（apply_event 对 Log no-op；Building 已置 Running）
+        let snapshot = task.snapshot().await;
+        assert!(matches!(snapshot.status, BuildTaskStatus::Running));
+    }
+
+    #[tokio::test]
+    async fn concurrent_terminal_events_commit_exactly_once() {
+        let task = BuildTask::new("app-a".into(), BuildTaskKind::Build);
+        let completed = task.emit(BuildProgressEvent::Completed {
+            release_id: "release-1".into(),
+            sha256: "a".repeat(64),
+            size_bytes: 1,
+            file_name: "release-1.zip".into(),
+            artifact_path: "builds/release-1.zip".into(),
+        });
+        let failed = task.emit(BuildProgressEvent::Failed {
+            error: "late failure".into(),
+        });
+        tokio::join!(completed, failed);
+
+        let snapshot = task.snapshot().await;
+        assert!(matches!(
+            snapshot.status,
+            BuildTaskStatus::Completed | BuildTaskStatus::Failed
+        ));
+        let (replay, _) = task.subscribe(0).await;
+        assert_eq!(snapshot.seq as usize, replay.len());
+        assert_eq!(
+            replay
+                .iter()
+                .filter(|(_, event)| matches!(
+                    event,
+                    BuildProgressEvent::Completed { .. } | BuildProgressEvent::Failed { .. }
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn store_rejects_new_task_when_all_capacity_is_active() {
+        let store = BuildTaskStore::with_max_retained_tasks(2);
+        for app_id in ["app-a", "app-b"] {
+            store
+                .create(app_id.into(), BuildTaskKind::Build)
+                .await
+                .expect("active task within capacity");
+        }
+
+        let result = store.create("app-c".into(), BuildTaskKind::Build).await;
+        let error = match result {
+            Ok(_) => panic!("active tasks must never be silently evicted"),
+            Err(error) => error,
+        };
+        assert_eq!(error, BuildTaskStoreError::CapacityExceeded { limit: 2 });
+        assert_eq!(store.map.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn store_evicts_terminal_task_before_rejecting_new_task() {
+        let store = BuildTaskStore::with_max_retained_tasks(1);
+        let completed = store
+            .create("app-a".into(), BuildTaskKind::Build)
+            .await
+            .expect("first task");
+        completed
+            .emit(BuildProgressEvent::Completed {
+                release_id: "release-a".into(),
+                sha256: "a".repeat(64),
+                size_bytes: 1,
+                file_name: "release-a.zip".into(),
+                artifact_path: "builds/release-a.zip".into(),
+            })
+            .await;
+
+        let replacement = store
+            .create("app-b".into(), BuildTaskKind::Build)
+            .await
+            .expect("terminal task should be evicted");
+        let map = store.map.lock().await;
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&replacement.id));
+        assert!(!map.contains_key(&completed.id));
+    }
+    #[tokio::test]
+    async fn stopped_generation_cannot_commit_after_preparation() {
+        let store = BuildTaskStore::new();
+        let task = store
+            .create("app-gap".into(), BuildTaskKind::DevStart)
+            .await
+            .expect("task");
+        let lifecycle = store.dev_lifecycle("app-gap").await;
+        let expected = *lifecycle.lock().await;
+        let prepared = Arc::new(tokio::sync::Barrier::new(2));
+        let resume = Arc::new(tokio::sync::Barrier::new(2));
+        let worker_lifecycle = lifecycle.clone();
+        let worker_prepared = prepared.clone();
+        let worker_resume = resume.clone();
+        let submitted = Arc::new(AtomicBool::new(false));
+        let worker_submitted = submitted.clone();
+        let worker = tokio::spawn(async move {
+            worker_prepared.wait().await;
+            worker_resume.wait().await;
+            task.commit_start(&worker_lifecycle, expected, async {
+                worker_submitted.store(true, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            })
+            .await
+            .expect("commit check")
+        });
+        prepared.wait().await;
+        // Same boundary used by dev_stop, while preparation is paused outside it.
+        *lifecycle.lock().await += 1;
+        resume.wait().await;
+        assert!(
+            !tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+                .await
+                .expect("bounded")
+                .expect("worker")
+        );
+        assert!(!submitted.load(Ordering::SeqCst));
+    }
+}

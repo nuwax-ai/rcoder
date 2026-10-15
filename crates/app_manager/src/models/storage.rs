@@ -3,10 +3,29 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+/// 清空应用持久存储请求
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, garde::Validate)]
+pub struct ClearStorageRequest {
+    #[serde(default)]
+    #[garde(length(min = 1, max = 128))]
+    pub lifecycle_id: Option<String>,
+    #[serde(default)]
+    #[garde(length(min = 1, max = 128))]
+    pub request_id: Option<String>,
+}
+
 /// 销毁 PVC 请求（高危·不可逆；强制 `confirm == app_id` 二次确认）
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, garde::Validate)]
 pub struct DestroyStorageRequest {
-    /// 必须等于 path 的 `app_id`（防误调 / 防脚本批量误删 / 防重放）
+    #[serde(default)]
+    #[garde(length(min = 1, max = 128))]
+    pub lifecycle_id: Option<String>,
+    #[serde(default)]
+    #[garde(length(min = 1, max = 128))]
+    pub request_id: Option<String>,
+    /// 二次确认值：必须等于 path 的 `app_id`
+    /// （防误调 / 防脚本批量误删 / 防重放）
+    #[garde(skip)]
     pub confirm: String,
 }
 
@@ -47,4 +66,22 @@ pub struct StorageInfo {
     pub modified_at: Option<String>,
     /// 是否孤儿（无对应运行应用）
     pub is_orphan: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// wire 契约：destroy body 的 confirm 必填——缺字段即拒。
+    #[test]
+    fn destroy_requires_confirm() {
+        serde_json::from_value::<DestroyStorageRequest>(serde_json::json!({
+            "confirm": "app1",
+        }))
+        .expect("destroy body");
+        assert!(
+            serde_json::from_value::<DestroyStorageRequest>(serde_json::json!({})).is_err(),
+            "destroy 缺 confirm 应拒"
+        );
+    }
 }

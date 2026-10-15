@@ -6,14 +6,15 @@
 
 ## 快速运行
 
-核心套件要求 Node.js 22+、Rust/Cargo 和 git；运行 Vite 慢速套件时还需要 pnpm。TS 源码默认位于 `/Users/soddy/Documents/git-workspace/nuwax-file-server`，可覆盖。
+核心套件要求 Node.js 22+、Rust/Cargo 和 git；运行 Vite 慢速套件时还需要 pnpm。必须显式设置 `TS_SERVER_ROOT`，指向已安装依赖的 TypeScript 源码目录。`prepare.sh` 与 `start.sh` 会先检查源码与依赖，再重建运行目录或构建、启动服务。
 
 ```bash
-cd /Users/soddy/Documents/git-workspace/rcoder
+export TS_SERVER_ROOT=/path/to/nuwax-file-server
+# 在 RCoder 仓库根目录执行
 tools/file-server-differential/run.sh
 ```
 
-只管理服务或重复执行测试：
+只管理服务或重复执行测试时，继续使用上述导出的 `TS_SERVER_ROOT`：
 
 ```bash
 tools/file-server-differential/prepare.sh
@@ -22,12 +23,14 @@ node tools/file-server-differential/test.mjs
 tools/file-server-differential/stop.sh
 ```
 
-覆盖源码位置或端口：
+单次指定源码位置或端口：
 
 ```bash
 TS_SERVER_ROOT=/path/to/nuwax-file-server TS_PORT=62000 RUST_PORT=62001 \
   tools/file-server-differential/run.sh
 ```
+
+`stop.sh` 不要求设置 `TS_SERVER_ROOT`，可独立用于停止已有测试服务。
 
 `prepare.sh` 会重建本目录下被忽略的 `runtime/`，并把 `tmp/template/*.zip` 分别复制到两套 `project_init`。报告写入 `runtime/report/`；失败时服务日志保留在 `runtime/*/logs/server.log`。
 

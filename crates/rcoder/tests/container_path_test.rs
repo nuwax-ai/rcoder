@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use shared_types::service_config::default_rcoder_service_config;
+    use shared_types::default_rcoder_service_config;
     use std::collections::HashMap;
     #[test]
     fn test_default_container_path_template() {

@@ -30,8 +30,9 @@ pub async fn get_status(
 
         let project_id = if !req.session_id.is_empty() {
             AGENT_REGISTRY.get_project_by_session(&req.session_id)
+                .filter(|owner| req.project_id.is_empty() || *owner == req.project_id)
         } else if !req.project_id.is_empty() {
-            Some(req.project_id)
+            Some(req.project_id.clone())
         } else {
             info!("[gRPC] GetStatus: all parameters are empty, returning not_found");
             return Ok(Response::new(GetStatusResponse {
@@ -42,7 +43,8 @@ pub async fn get_status(
         };
 
         let (status_str, is_found) = if let Some(ref pid) = project_id {
-            if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(pid) {
+            if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(pid)
+                .filter(|info| req.session_id.is_empty() || info.session_id.to_string() == req.session_id) {
                 let status_str = match agent_info.status {
                     AgentStatus::Pending => "busy",
                     AgentStatus::Active => "busy",
@@ -73,7 +75,7 @@ pub async fn get_status(
         );
 
         // session 的 stream epoch(供 rcoder 判断 seq epoch 是否变化,#15)。
-        let stream_epoch = if !req.session_id.is_empty() {
+        let stream_epoch = if is_found && !req.session_id.is_empty() {
             crate::service::SESSION_CACHE.view(&req.session_id, |_, d| d.epoch().to_string())
         } else {
             None
@@ -197,12 +199,25 @@ fn get_active_tasks_count() -> i32 {
     // 但两次对话间 agent 处于 Idle 时，靠这个计数让容器被判活跃、不被闲置回收。
     let vnc_count = crate::vnc_activity::active_vnc_client_count() as i32;
 
+    // Embedded UserApp build/start/restart workers continue after HTTP 202.
+    // Task polling is read-only and does not refresh project activity. Count
+    // their real execution so an idle scan cannot reap a building container.
+    // Explicit Stop/Restart still follows its normal cancellation path.
+    let local_workers =
+        i32::try_from(process_utils::workers::active_in_process()).unwrap_or(i32::MAX);
+    let http_requests =
+        i32::try_from(process_utils::request_activity::active_in_process()).unwrap_or(i32::MAX);
+
     debug!(
-        "[GET_CONTAINER_STATUS] active breakdown: agents={}, terminals={}, vnc={}",
-        agent_count, terminal_count, vnc_count
+        "[GET_CONTAINER_STATUS] active breakdown: agents={}, terminals={}, vnc={}, local_workers={}, http_requests={}",
+        agent_count, terminal_count, vnc_count, local_workers, http_requests
     );
 
-    agent_count + terminal_count + vnc_count
+    agent_count
+        .saturating_add(terminal_count)
+        .saturating_add(vnc_count)
+        .saturating_add(local_workers)
+        .saturating_add(http_requests)
 }
 
 fn get_uptime_seconds() -> i64 {
@@ -211,4 +226,27 @@ fn get_uptime_seconds() -> i64 {
     let start = START_TIME.get_or_init(std::time::Instant::now);
 
     start.elapsed().as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn embedded_worker_keeps_container_active_until_cancelled_execution_exits() {
+        let registry = process_utils::workers::WorkerRegistry::new(None);
+        let (release, released) = tokio::sync::oneshot::channel();
+        let worker = registry
+            .spawn(async move { released.await.unwrap() })
+            .unwrap();
+        assert!(get_active_tasks_count() > 0);
+        registry.close().unwrap();
+        assert!(
+            get_active_tasks_count() > 0,
+            "cancellation is not execution exit"
+        );
+        release.send(()).unwrap();
+        worker.await.unwrap().unwrap();
+        assert_eq!(process_utils::workers::active_in_process(), 0);
+    }
 }

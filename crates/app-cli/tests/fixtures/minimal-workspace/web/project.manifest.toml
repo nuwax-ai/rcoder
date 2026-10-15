@@ -1,0 +1,18 @@
+# pair-gate fixture 的最小可代理服务（managed 模式要求至少一个 [proxy] 服务，
+# 否则 compile_effective_config 报 "workspace has no proxied web service"）。
+schema_version = 1
+
+[project]
+service_id = "web"
+name = "web"
+type = "node"
+
+[build]
+command = ["echo", "no-op"]
+artifact = "."
+
+[run]
+command = ["node", "server.js"]
+
+[proxy]
+path = "/"

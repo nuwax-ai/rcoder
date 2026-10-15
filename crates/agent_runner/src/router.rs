@@ -1,6 +1,5 @@
 // 顶层 router 仅 AppState 被 grpc/main 使用；create_router/ApiDoc 等已迁至
-// http_server::router，保留这里的实现以兼容现有引用。抑制 dead_code 警告。
-#![allow(dead_code)]
+// http_server::router，保留这里的实现以兼容现有引用。
 
 use std::sync::Arc;
 
@@ -44,7 +43,7 @@ pub struct AppState {
     pub api_key_manager: Arc<crate::api_key_manager::ApiKeyManager>,
 
     /// 🔒 共享的 API 密钥 DashMap（直接与 Pingora 共享）
-    /// 存储格式：<UUID> -> ModelProviderConfig
+    /// 存储格式：`<UUID>` -> ModelProviderConfig
     pub shared_api_key_manager: Arc<DashMap<String, shared_types::ModelProviderConfig>>,
 
     /// 🔒 project_id -> service_uuid 映射（用于清理时查找对应的配置）

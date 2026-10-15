@@ -205,6 +205,42 @@ pub struct HealthInfo {
 }
 
 /// 请求追踪上下文
+/// 连接恢复的目标阶段——两阶段恢复语义不同：
+/// - `Prod`：走 wake control（stopped/starting 触发 ensure_running 等待拉起）；
+/// - `Dev`：无唤醒语义（流量只 ensure 容器，服务编排由显式操作驱动），
+///   仅重解析地址 + 等待端口就绪。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectRecoveryStage {
+    Dev,
+    Prod,
+}
+
+/// UserApp 连接恢复上下文（dev/prod 共用结构，按 [`ConnectRecoveryStage`]
+/// 分支恢复行为）：拒连/超时在 deadline 内重试；上游建连成功即清除。
+#[derive(Clone)]
+pub struct AppConnectRecovery {
+    pub app_id: String,
+    pub stage: ConnectRecoveryStage,
+    pub deadline: tokio::time::Instant,
+    pub retry_requested: bool,
+    /// prod：首次重试前核对集群真实运行态（wake）；dev 恒 true（无该环节）。
+    pub runtime_checked: bool,
+    pub unavailable_response: bool,
+    /// dev 失败分档证据（V2-08：等待期内提前采集，终局只读不再加管理面
+    /// 等待）：app-cli 业务快照状态，Starting → starting 文案，其余/无 →
+    /// Generic。操作 kind 白名单级证据随 P1 的 app-cli 快照扩展收窄。
+    pub dev_evidence_status: Option<shared_types::UserAppReadinessStatus>,
+}
+
+/// UserApp app 代理路由上下文（URI 改写前捕获；失败出口/响应阶段读取，
+/// 不再从改写后的 `/` 猜测路由）。
+#[derive(Debug, Clone)]
+pub struct UserAppRouteCtx {
+    pub app_id: String,
+    /// `prod` / `dev`
+    pub stage: &'static str,
+}
+
 #[derive(Clone)]
 pub struct TrackingCtx {
     pub start: std::time::Instant,
@@ -225,6 +261,48 @@ pub struct TrackingCtx {
     pub upstream_status: Option<u16>,
     /// 错误响应体缓冲（仅在 4xx/5xx 时收集）
     pub error_body_buf: Vec<u8>,
+    /// 预览路由覆盖上游（跨 Pod 转发=宿主 Pod:peer_api_port；
+    /// 宿主侧 internal 路由=127.0.0.1:vite_port）。None=非预览路径。
+    /// 由 upstream_peer 阶段的 resolve_route 决策写入（pingora 阶段序
+    /// upstream_peer 先于 upstream_request_filter——决策必须发生在 peer
+    /// 选择时，否则非宿主副本在连接 127.0.0.1:vite_port 时即失败）。
+    pub preview_peer: Option<(String, u16)>,
+    /// 预览跨 Pod 转发的路径重写要素 (instance_id, preview_port)——与
+    /// preview_peer 同点（upstream_peer 阶段）产出，upstream_request_filter
+    /// 阶段消费为 `/internal/preview-forward/{instance}/{port}{path}` + 令牌头。
+    /// 用 `take()` 一次性消费（request 阶段不再 load slot 二次读取令牌）。
+    pub preview_rewrite: Option<(String, u16)>,
+    /// 预览内部令牌——peer 阶段从 deps 取出写入，request 阶段直接消费
+    /// （避免 ArcSwap 二次 load；token 与决策同批次、同值保证一致性）。
+    pub preview_internal_token: Option<String>,
+    /// 预览转发校验已过的 vite 端口（internal/preview-forward 路由用，
+    /// request_filter 校验通过后记录，后续阶段免重复校验）。
+    pub preview_forward_port: Option<u16>,
+    /// 预览跨 Pod 转发的原始入口端口（`/proxy/{port}`；宿主 410 后失效缓存用）。
+    pub preview_origin_port: Option<u16>,
+    /// UserApp app 代理路由（request_filter 阶段捕获；错误页/来源识别只覆盖该域）
+    pub userapp_route: Option<UserAppRouteCtx>,
+    /// Captured wake failure; later readiness advice must not replace its identity.
+    pub wake_failure: Option<shared_types::WakeFailure>,
+    /// Fresh UID-rechecked evidence; never copied from the advisor TTL cache.
+    pub failure_hint: Option<crate::error_page::UserAppProxyFailureHint>,
+    pub fresh_failure_evidence: bool,
+    pub failure_hint_at: Option<tokio::time::Instant>,
+    /// 已确认来源的 Pingap 自产错误正文替换（response_filter 决定；body filter
+    /// 首块输出新正文并丢弃原错误体，不拼接）。None = 不替换。
+    pub replace_error_body: Option<bytes::Bytes>,
+    /// 替换正文是否已输出（body filter 只发一次）
+    pub error_replacement_emitted: bool,
+    /// Request-scoped deadline and retry state for prod UserApp connections.
+    pub app_connect_recovery: Option<AppConnectRecovery>,
+    /// Keep prod app request counting stable across retries, including route failures.
+    pub prod_request_recorded: bool,
+    /// Only one handler metric increment and active gauge increment per request.
+    pub prod_metrics_counted: bool,
+    /// dev 族同款守卫：连接恢复的重试/周期重解析会重跑 upstream handler，
+    /// 请求计数与活跃 gauge 每请求只计一次。
+    pub dev_request_recorded: bool,
+    pub dev_metrics_counted: bool,
 }
 
 impl Default for TrackingCtx {
@@ -237,6 +315,13 @@ impl TrackingCtx {
     pub fn new() -> Self {
         Self {
             start: std::time::Instant::now(),
+            userapp_route: None,
+            wake_failure: None,
+            failure_hint: None,
+            fresh_failure_evidence: false,
+            failure_hint_at: None,
+            replace_error_body: None,
+            error_replacement_emitted: false,
             target_port: None,
             vnc_target_ip: None,
             upstream_host: None,
@@ -246,6 +331,16 @@ impl TrackingCtx {
             api_service_name: None,
             upstream_status: None,
             error_body_buf: Vec::new(),
+            preview_peer: None,
+            preview_rewrite: None,
+            preview_internal_token: None,
+            preview_forward_port: None,
+            preview_origin_port: None,
+            app_connect_recovery: None,
+            prod_request_recorded: false,
+            prod_metrics_counted: false,
+            dev_request_recorded: false,
+            dev_metrics_counted: false,
         }
     }
 }
@@ -254,12 +349,26 @@ impl TrackingCtx {
 // 端口常量
 // ============================================================================
 
-/// 音频服务端口（rcoder-proxy 专用，shared_types 未定义）
+/// 音频服务端口（rcoder-proxy 专用，shared_types 未定义——builder 容器内无
+/// 音频服务，不进 K8s Service 端口清单）
 pub const AUDIO_HTTP_PORT: u16 = 6090; // 音频静态文件服务
 pub const AUDIO_WS_PORT: u16 = 6089; // 音频 WebSocket 流
 
-/// IME 输入法服务端口（rcoder-proxy 专用，shared_types 未定义）
-pub const IME_PORT: u16 = 6091;
+// 注：跨 crate 共享的端口常量（NOVNC_PORT、WS_TERMINAL_PORT、TTYD_PORT、IME_PORT 等）
+// 统一定义在 `shared_types::constants`，本 crate 直接引用，不在本地重复定义。
+// （IME_PORT 已提升 shared_types——K8s Service 端口清单消费同值。）
 
-// 注：跨 crate 共享的端口常量（NOVNC_PORT、WS_TERMINAL_PORT、TTYD_PORT 等）统一定义在
-// `shared_types::constants`，本 crate 直接引用，不在本地重复定义。
+/// 预览路由依赖（rcoder 装配后经 ArcSwap 槽回填；None 槽=预览路由未启用）。
+///
+/// rcoder 主进程装配协调器晚于 Pingora 启动——与 dev_ensure/app_runtime_ip
+/// 槽同款回填模式（PortProxy 与 PingoraProxyService 共享同一 Arc）。
+pub struct PreviewRouteDeps {
+    pub coordination: Arc<dyn shared_types::PreviewCoordination>,
+    /// 对等副本主 API 端口（跨 Pod stop/verify/log 派发 → axum 内部端点）。
+    pub peer_api_port: u16,
+    /// 对等副本 Pingora 代理端口（跨 Pod 预览转发 `/internal/preview-forward`
+    /// 的宿主面——该路由注册在 Pingora 路由表，非 axum 主 API）。
+    pub peer_proxy_port: u16,
+    /// 内部令牌（转发 hop 注入；宿主侧校验，不符 404）。
+    pub internal_token: String,
+}

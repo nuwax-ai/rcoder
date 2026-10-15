@@ -37,10 +37,6 @@ pub enum AgentDownloadError {
     /// 平台未找到
     #[error("platform not found: {0}")]
     PlatformNotFound(String),
-
-    /// 安装失败
-    #[error("install failed: {0}")]
-    InstallFailed(String),
 }
 
 impl AgentDownloadError {
@@ -48,7 +44,6 @@ impl AgentDownloadError {
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Download(e) => e.is_retryable(),
-            Self::InstallFailed(msg) => !msg.contains("HTTP 4"),
             _ => false,
         }
     }

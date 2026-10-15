@@ -1,207 +1,37 @@
-mod background_tasks;
-mod batch_migrate;
-mod bootstrap;
-mod cleanup_task;
-mod config;
-mod config_watcher;
-mod docker_init;
-mod file_server_embed;
-mod handler;
-mod middleware;
-mod proxy_init;
-mod router;
-mod server;
-mod service;
-mod shutdown;
-mod skill_sync_reconciler;
-mod userapp_publish;
-mod userapp_recycle;
-mod utils;
-mod workspace_migrate;
+// bin 只做入口：`--version` 探测 + dial9 runtime 变体；完整服务组合（bootstrap →
+// 引擎装配 → 路由挂载 → serve → 优雅关停）在 `rcoder::run()`。
+fn version_probe() -> bool {
+    std::env::args_os()
+        .skip(1)
+        .eq([std::ffi::OsString::from("--version")])
+}
 
-use std::sync::Arc;
+// dial9 变体：手动构建 runtime 才能把 hooks 挂进 Builder（`#[tokio::main]`
+// 做不到）。`#[hotpath::main]` 只在函数体前插 guard、不构建 runtime，可共存。
+// 退出顺序：先 drop(runtime) 停事件流，再 graceful_shutdown 刷盘终段
+// （5s 预算 < docker stop 10s 宽限）。
+#[cfg(feature = "dial9")]
+#[hotpath::main]
+fn main() -> anyhow::Result<()> {
+    if version_probe() {
+        println!("rcoder {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    let (recorder, runtime) = rcoder::dial9_obs::runtime_from_env()
+        .map_err(|e| anyhow::anyhow!("dial9 runtime init failed: {e}"))?;
+    let exit = runtime.block_on(rcoder::run());
+    drop(runtime);
+    recorder.graceful_shutdown(std::time::Duration::from_secs(5));
+    exit
+}
 
-use tracing::{info, warn};
-
-use rcoder::*;
-
-use router::AppState;
-
-use docker_manager::runtime_selection::RuntimeType;
-
+#[cfg(not(feature = "dial9"))]
 #[tokio::main]
+#[hotpath::main]
 async fn main() -> anyhow::Result<()> {
-    // Feature 开关: 启动读一次 env + eprintln 打印状态 (console, tracing 未就绪也可见)
-    shared_types::FeatureFlags::init();
-
-    // 版本标识 (先 eprintln 保证 console 一定输出; bootstrap 后再 info! 写文件日志)
-    let version_line = format!(
-        "🚀 rcoder v{} — BUILD: {} @ {} (branch: {})",
-        env!("CARGO_PKG_VERSION"),
-        env!("RCODER_BUILD_GIT_HASH"),
-        env!("RCODER_BUILD_TIME"),
-        env!("RCODER_BUILD_GIT_BRANCH")
-    );
-    eprintln!("{version_line}");
-
-    let bootstrap_result = bootstrap::bootstrap().await?;
-
-    // bootstrap 完成 (tracing 已初始化) → 再写一次到文件日志
-    info!("{version_line}");
-    info!(target: "feature_flags", "{:?}", shared_types::FeatureFlags::get());
-
-    let runtime_type = RuntimeType::from_env();
-    let is_kubernetes = shared_types::is_kubernetes_runtime();
-    info!(
-        "Runtime type: {:?}, is_kubernetes_runtime: {}",
-        runtime_type, is_kubernetes
-    );
-    info!(
-        "🔧 [STARTUP] Container runtime: {}",
-        if is_kubernetes {
-            "Kubernetes"
-        } else {
-            "Docker"
-        }
-    );
-
-    docker_init::init_path_resolver(runtime_type).await?;
-    docker_init::init_docker_manager(&bootstrap_result.config).await?;
-    docker_init::startup_cleanup(&bootstrap_result.config).await;
-
-    // 提前创建 ProjectAdapter，以便同一 Arc 实例同时作为
-    // Arc<dyn ContainerLookup> 注入 Pingora 代理层（统一容器 IP 数据源）
-    // 和作为 AppState.projects 共享给业务逻辑。
-    let cluster_domain = shared_types::get_k8s_cluster_domain();
-    let (projects, cleanup_rx) = ProjectAdapter::new(
-        bootstrap_result.config.app_manager.namespace.clone(),
-        cluster_domain.clone(),
-    );
-    let projects = Arc::new(projects);
-
-    // 克隆同一 Arc 实例供 Pingora 代理层使用（共享 DashMap 数据）。
-    // 必须先得到具体类型 Arc<ProjectAdapter>，再在其上做 unsized coercion
-    // 到 trait object，避免类型推断把 clone 的类型参数反向绑定为 dyn。
-    let projects_for_lookup = Arc::clone(&projects);
-    let container_lookup: Arc<dyn shared_types::ContainerLookup> = projects_for_lookup;
-
-    // UserApp 活动状态注册表（闲置回收 + 流量唤醒的共享状态）。
-    // 独立 Arc 在 Pingora 之前构造（注入代理层）；runtime 延迟到下方 RuntimeManager::get 后
-    // 经 set_runtime 填充（OnceLock）——wake 只在 is_stopped 真时触发，而 stopped 表要到
-    // AppService::new 才填充，此时 OnceLock 早已 set。
-    let wake_timeout = std::time::Duration::from_secs(
-        bootstrap_result.config.userapp_recycle.wake_timeout_seconds,
-    );
-    let activity_registry: Arc<app_manager::AppActivityRegistry> =
-        Arc::new(app_manager::AppActivityRegistry::new(wake_timeout));
-    let access_tracker: Arc<dyn shared_types::AppAccessTracker> = activity_registry.clone();
-    let wake_control: Arc<dyn shared_types::AppWakeControl> = activity_registry.clone();
-
-    let proxy_result = proxy_init::init_proxy(
-        &bootstrap_result.config,
-        Arc::clone(&bootstrap_result.api_key_config),
-        container_lookup,
-        access_tracker,
-        wake_control,
-    )
-    .await;
-    proxy_init::log_proxy_info(&bootstrap_result.config);
-
-    let shutdown_tx = shutdown::setup_signal_handlers();
-
-    let _config_watcher = if bootstrap_result.config_watcher_enabled {
-        match config_watcher::ConfigWatcher::new(
-            bootstrap_result.config_file_path.clone(),
-            Arc::clone(&bootstrap_result.api_key_config),
-        ) {
-            Ok(watcher) => {
-                info!(
-                    "📁 Config file watcher started: {:?}",
-                    bootstrap_result.config_file_path
-                );
-                Some(watcher)
-            }
-            Err(e) => {
-                warn!("config file watcher start failed: {}, API Key updated", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let (container_prefix_rcoder, container_prefix_computer) =
-        docker_init::get_container_prefixes(&bootstrap_result.config).await?;
-
-    // 获取容器运行时（在 init_docker_manager 之后可用）
-    let runtime = docker_manager::runtime::RuntimeManager::get()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to get container runtime: {}", e))?;
-
-    // 注入 runtime 到活动注册表（wake 需要 scale + 查 status；启动早期 OnceLock 为空，此处填充）。
-    // trait upcasting: Arc<dyn ContainerRuntime> → Arc<dyn UserAppRuntime>（supertrait，Rust 1.86+）
-    activity_registry.set_runtime(runtime.clone());
-
-    // 阶段2 批量迁移: 启动后台 task 将共享 PVC 老数据一次性迁到 per-agent PVC (env 开关, 默认 false)
-    batch_migrate::spawn_if_enabled(runtime.clone());
-
-    // 启动 skill sync reconciler: 后台补齐旧 workspace 缺的 fan-out 目录 (grok/pi/...),
-    // 版本 marker 驱动, 已同步的 O(1) 跳过。env RCODER_SKILL_SYNC_RECONCILE_ON_STARTUP 默认 true。
-    skill_sync_reconciler::spawn_skill_sync_reconciler();
-
-    // 阶段2 方案C: rcoder 同进程嵌入 file-server (FeatureFlags.embed_file_server, 灰度)。
-    // 启用时 rcoder 进程内 spawn file-server (端口 60000), 经 SubvolumeWorkspaceResolver
-    // 复用本进程 ContainerRuntime 解析 per-agent subvolume 聚合路径 (file-server 不加 kube 依赖)。
-    // 配套: start-services.sh 须检查本 env, 嵌入时不再单独启 file-server 二进制 (避免端口冲突)。
-    if shared_types::FeatureFlags::get().embed_file_server {
-        // spawn_embedded_file_server 取 Arc<dyn WorkspaceRuntime>; trait upcast 需两步.
-        let ws_runtime: Arc<dyn container_runtime_api::WorkspaceRuntime> = runtime.clone();
-        file_server_embed::spawn_embedded_file_server(ws_runtime).await;
+    if version_probe() {
+        println!("rcoder {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
     }
-
-    let state = Arc::new(
-        AppState::new(
-            bootstrap_result.config.clone(),
-            proxy_result.pingora_service.clone(),
-            bootstrap_result.api_key_config,
-            container_prefix_rcoder,
-            container_prefix_computer,
-            runtime,
-            projects,
-            cleanup_rx,
-            activity_registry.clone(),
-        )
-        .await?,
-    );
-
-    let _bg_handles = background_tasks::start_all_background_tasks(
-        &bootstrap_result.config,
-        state.clone(),
-        shutdown_tx.clone(),
-    )
-    .await?;
-
-    let runtime_for_shutdown = state.runtime().clone();
-    let app = router::create_router(state, Some(bootstrap_result.telemetry));
-    let server_handle =
-        server::start_http_server(app, bootstrap_result.config.port, shutdown_tx.clone()).await?;
-
-    shutdown::graceful_shutdown(
-        shutdown_tx.subscribe(),
-        bootstrap_result.config.clone(),
-        runtime_for_shutdown,
-    )
-    .await;
-    server_handle.abort();
-
-    if let Some(pingora_shutdown_tx) = proxy_result.pingora_shutdown_tx {
-        let _ = pingora_shutdown_tx.send(());
-    }
-    if let Some(proxy_handle) = proxy_result.proxy_handle
-        && let Err(e) = proxy_handle.await
-    {
-        warn!("proxy task join failed during shutdown: {}", e);
-    }
-
-    Ok(())
+    rcoder::run().await
 }

@@ -30,6 +30,24 @@
     }
   },
   "context_servers": {
+    "dbx": {
+      "source": "custom",
+      "enabled": true,
+      "command": "dbx-mcp-server",
+      "args": [],
+      "env": {
+        "DBX_WEB_URL": "http://localhost:4224"
+      },
+      "metadata": {
+        "description": "DBX 数据库 MCP - AI agent 免配置查询/操作容器内 PostgreSQL",
+        "note": "stdio 直连按需 spawn（轻量 HTTP 客户端，不走 mcp-proxy 18099 共享）。WebBackend 连容器内免登 dbx-web :4224，经 local-pg socket 免密连接（C+ 方案），AI 操作 PG 全链零配置。npm 包由 agent-runner 镜像预装（@dbx-app/mcp-server）。",
+        "capabilities": [
+          "database_schema_inspection",
+          "sql_query",
+          "connection_management"
+        ]
+      }
+    },
     "chrome-devtools": {
       "source": "custom",
       "enabled": false,

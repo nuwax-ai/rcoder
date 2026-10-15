@@ -176,8 +176,13 @@ async fn run_single_prompt(
         }
         Err(e) => {
             formatter.separator();
-            let err_str = format!("{}", e);
-            if err_str.contains("timed out") {
+            // R11：类型化分类——仅"等待 prompt 完成"超时映射 Timeout 退出码
+            //（旧 contains("timed out") 会把连接/取消类超时文案混入）
+            if e.downcast_ref::<agent_abstraction::acp::AcpError>()
+                .is_some_and(|error| {
+                    matches!(error, agent_abstraction::acp::AcpError::Timeout { .. })
+                })
+            {
                 formatter.error(&format!("请求超时 ({}s): {}", timeout_secs, e));
                 ExitCode::Timeout
             } else {

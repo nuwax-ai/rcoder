@@ -1,10 +1,13 @@
 [workspace]
-members = ["crates/*"]
+members = ["crates/*", "tests-e2e"]
 exclude = ["tmp/*", "crates/app-cli"]
 resolver = "2"
 
 default-members = [
     "crates/rcoder",
+    "crates/rcoder-engine",
+    "crates/http-server",
+    "crates/rcoder-storage",
     "crates/agent_runner",
     "crates/shared_types",
     "crates/docker_manager",
@@ -19,9 +22,16 @@ default-members = [
 
 
 [workspace.lints]
+# Kani proof harness 放在 #[cfg(kani)] 内；日常 rustc 会提示未知 cfg，这里显式放行。
+# 不引入 kani 为 Cargo 依赖（见 specs/002-kani-high-value-proofs）。
+rust.unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 rustdoc.unescaped_backticks = "warn"
 rustdoc.redundant_explicit_links = "warn"
 rust.unused_lifetimes = "warn"
+# 项目红线「禁止 unsafe」编译器化：生产代码新增 unsafe 直接报错。deny 而非
+# forbid 是为给 cfg(test) 的 edition-2024 env 变异（set_var/remove_var 在测试
+# 内是 unsafe）留 #[allow(unsafe_code)] 豁免通道；豁免仅限测试模块。
+rust.unsafe_code = "deny"
 # 防回归: 多余路径限定 (如 `crate::foo::Bar` 而 `Bar` 已在作用域内) 降低可读性。
 # 存量已清零, 升级 deny 拦截新增; prost 生成代码在 shared_types_grpc 内局部 allow。
 rust.unused_qualifications = "deny"
@@ -50,7 +60,7 @@ publish = false
 agent-client-protocol = { version = "2" }
 
 # MCP 协议 - rmcp 官方库
-rmcp = { version = "1.8"}
+rmcp = { version = "3.4"}
 # mcp-proxy convert fallback 参数解析与文件重写。
 mcp-proxy-args = { version = "=0.2.3" }
 
@@ -59,7 +69,7 @@ piper = "0.2"
 clap = { version = "4.6", features = ["derive", "env"] }
 
 # Async runtime
-tokio = { version = "1.52", features = ["full"] }
+tokio = { version = "1.53", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat", "time"] }
 tokio-stream = "0.1"
 async-stream = "0.3"
@@ -76,8 +86,9 @@ axum = { version = "0.8", features = [
     "macros",
 ] }
 tower = "0.5"
+rustix = { version = "1.1.5", features = ["fs"] }
 tower-http = { version = "0.7", features = ["cors", "trace", "set-header", "fs"] }
-hyper = { version = "1.8", features = ["server", "http1", "http2"] }
+hyper = { version = "1.11", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
 # gRPC。tonic 0.14 全系 TLS 特性均基于 rustls：tls-native-roots = rustls + 系统根证书(rustls-native-certs)，
 # 并非 native-tls。保留以信任私有部署的系统/私有 CA（与 reqwest 的 rustls-platform-verifier 一致）。
@@ -86,23 +97,23 @@ tonic-prost = "0.14"
 prost = "0.14"
 prost-types = "0.14"
 tonic-prost-build = "0.14"
-http = "1.4"
-http-body = "1.0"
+http = "1.5"
+http-body = "1.1"
 http-body-util = "0.1"
 
 # WebSocket（终端中间层：接浏览器 + 连本地 ttyd）
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.150"
+serde_json = "1.0.151"
 serde_yaml = "=0.9.33"
 serde_urlencoded = "0.7"
 schemars = { version = "1.2", features = ["derive"] }
 config = "0.15"
 
 # Validation
-garde = { version = "0.22.1", features = ["derive"] }
+garde = { version = "0.23.0", features = ["derive", "regex"] }
 
 # Error handling
 anyhow = "1.0"
@@ -128,7 +139,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 
 # UUID
-uuid = { version = "1.23", features = ["serde", "v4", "v7"] }
+uuid = { version = "1.26", features = ["serde", "v4", "v7"] }
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }
@@ -137,7 +148,6 @@ chrono = { version = "0.4", features = ["serde"] }
 notify = "8.2"
 
 # File system utilities
-tokio-fs = "0.1"
 path-clean = "1.0"
 
 # Utilities
@@ -149,7 +159,7 @@ bytes = "1.12"
 arrayvec = "0.7"
 arc-swap = "1.9"
 md5 = "0.8"
-process-wrap = { version = "9.0", features = ["tokio1", "process-group", "job-object"] }
+process-wrap = { version = "10.0.1", features = ["tokio1", "process-group", "job-object"] }
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
 
 url = { version = "2.5", features = ["serde"] }
@@ -162,15 +172,16 @@ rustls = { version = "0.23", features = ["ring"] }
 indoc = "2.0"
 parking_lot = "0.12"
 lockmap = "0.2.3"
-convert_case = "0.11"
+convert_case = "0.12"
 # Persistent data structures for CoW-friendly multi-session tracking (C2/M3 fix)
-im = { version = "15.1", features = ["serde"] }
-handlebars = { version = "6.3", features = ["rust-embed"] }
-rust-embed = "8.0"
-zstd = "0.13"
+# imbl = im 的活跃维护 fork（im 15.1 已 unmaintained，RUSTSEC-2026-0248）
+imbl = { version = "7.0", features = ["serde"] }
+handlebars = { version = "6.4", features = ["rust-embed"] }
+rust-embed = "8.12"
+zstd = "0.14"
 
 # Kubernetes
-kube = { version = "4.0", features = ["runtime", "client", "kube-runtime", "config", "ws"] }
+kube = { version = "4.2", features = ["runtime", "client", "kube-runtime", "config", "ws"] }
 k8s-openapi = { version = "0.28", features = ["v1_32"] }
 
 
@@ -180,11 +191,13 @@ derive_builder = "0.20"
 # Zed 核心功能依赖
 libc = "0.2"
 nix = { version = "0.31.3", features = ["fs", "process", "term", "signal"] }
+# Windows 引导会话身份（runtime-supervisor epoch：GetTickCount64/FILETIME FFI）。
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_SystemInformation"] }
 # /proc 解析（agent_runner 统计容器内 noVNC 端口 ESTABLISHED 连接，判 VNC 桌面是否在用）。
 # 仅在 Linux target 的 agent_runner 里引入（target-gated），Mac 开发编译不拉它。
 procfs = "0.18"
 unindent = "0.2"                                                   # 使用 crates.io 版本
-open = "5.0"                                                       # 使用 crates.io 版本
+open = "5.4"                                                       # 使用 crates.io 版本
 git2 = "0.21"
 tree-sitter-rust = "0.24"                                          # 使用 crates.io 版本
 
@@ -193,63 +206,77 @@ tree-sitter-rust = "0.24"                                          # 使用 crat
 sha2 = "0.11"
 hex = "0.4"
 walkdir = "2.5"
+# 并行目录遍历 (work-stealing 线程池), 用于 file-server search-files。
+# 取代手写 BFS: 零 syscall d_type + 多线程并行, dua-cli (gitoxide 作者 Byron 维护) 的核心库。
+dua-core = "4.1"
 # HTTP client。reqwest 0.13 的 default-tls 本就是 rustls(aws-lc-rs + rustls-platform-verifier 读 OS 根证书)，
 # 并无 openssl/native-tls。这里 default-features=false + 显式 rustls 固化“全 workspace 用 rustls”，
 # 防止未来 reqwest 改默认后悄悄回退；charset/http2/system-proxy 补回原默认特性。
 reqwest = { version = "0.13", default-features = false, features = [
     "json",
+    "query",
     "stream",
     "rustls",
     "charset",
     "http2",
     "system-proxy",
+    "multipart",
 ] }
+
+# Multi-AI provider client (Anthropic/OpenAI 协议抽象,用于 model_probe 探活)
+# 0.6.5 稳定版;默认 rustls-tls,依赖足迹与 workspace 基本重合
+genai = "0.6.5"
 
 # 项目依赖 - 保留核心功能
 aho-corasick = "1.1"
-base64 = "0.22"
+base64 = "0.23"
 circular-buffer = "2.0"
-fancy-regex = "0.18"
+fancy-regex = "0.19"
 fuzzy = "0.0.1"
 globset = "0.4"
 image = "0.25"
 indexmap = "2.14"
 pathdiff = "0.2"
 postage = "0.5"
-regex = "1.12"
+regex = "1.13"
 semver = "1.0"
 # npm/node 版本范围语义（与 package.json 依赖版本一致；不同于 Cargo semver）
 node-semver = "2.2"
 shellexpand = "3.1"
-winnow = "1.0.3"
+winnow = "1.0.4"
 workspace-manifest = { path = "crates/workspace-manifest" }
+userapp-log-reader = { path = "crates/userapp-log-reader" }
 shlex = "2.0"
-smallvec = "1.15"
+smallvec = "1.16"
 
-toml = "1.1.2"
+toml = "1.1.6"
 which = "8.0"
 
 
 # Dev dependencies for testing
-ctor = "1.0.7"
+ctor = "1.0.13"
 pretty_assertions = "1.4"
-tempfile = "3.24"
+tempfile = "3.27"
 filetime = "0.2"
 rand = "0.10"
 tokio-test = "0.4"
 expect-test = "1.5"
 
 # File system utilities
-dirs = "6.0"
+dirs = "7.0"
 
 # Archive utilities
 flate2 = "1.1"
 tar = "0.4"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
-utoipa = { version = "5.4", features = ["axum_extras", "uuid", "chrono"] }
-utoipa-axum = "0.2"
-utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
+utoipa = { version = "6", features = ["axum_extras", "uuid", "chrono"] }
+utoipa-axum = "0.3"
+# vendored：swagger-ui 资源随 utoipa-swagger-ui-vendored crate 内嵌（include_bytes），
+# 构建期零 GitHub 依赖——build.rs 默认会用 curl 从 github.com 下载 swagger-ui zip，
+# Docker 构建/离线环境概率性失败；四个 workspace 成员经 workspace = true 统一继承
+utoipa-swagger-ui = { version = "10.0.1", features = ["axum", "vendored"] }
+utoipa-scalar = { version = "0.4", features = ["axum"] }
 
 
 ringbuf = "0.5"
@@ -257,18 +284,21 @@ ringbuf = "0.5"
 
 diffy = { version = "0.5" }
 
-pingora = { version = "0.8", features = ["lb", "rustls"] }
-pingora-core = { version = "0.8", features = ["rustls"] }
-pingora-http = "0.8"
-pingora-proxy = { version = "0.8", features = ["rustls"] }
-pingora-load-balancing = { version = "0.8", features = ["rustls"] }
-matchit = "0.9.2"
-structopt = "0.3"
+pingora = { version = "0.9", features = ["lb", "rustls"] }
+pingora-core = { version = "0.9", features = ["rustls"] }
+pingora-http = "0.9"
+pingora-proxy = { version = "0.9", features = ["rustls"] }
+pingora-load-balancing = { version = "0.9", features = ["rustls"] }
+matchit = "0.9"
 
 bollard = { version = "0.21" }
 
 # Cache library
 moka = { version = "0.12", features = ["future", "sync"] }
+
+# 系统信息（/version 端点跨平台读 OS 版本/内核版本）；default-features=false
+# 裁掉磁盘/网络/进程/rayon 模块，仅保留 system（os_version/kernel_version 等）。
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 # TUI
 ratatui = { version = "0.30", features = ["crossterm"] }
@@ -281,16 +311,34 @@ encoding_rs = "0.8"
 mime_guess = "2"
 
 # Git (file-server, 纯 Rust; gitoxide 0.85 源码可参考)
-gix = { version = "0.85", features = ["tree-editor"] }
+# 0.87 起 tree-editor feature 名被上游移除（API 本体无条件可用——MSRV 超过 1.75 后
+# 不再需要 gate，见 gitoxide 3a4350cd），声明里不得再带该 feature；
+# 升级同时带走 gix-protocol 0.65.1（其依赖已无 bisync yanked）
+gix = "0.88"
 
 # i18n (国际化)
 rust-i18n = "4"
 
+# Control storage ORM and official drivers. Backend features are selected by rcoder-storage.
+toasty = { version = "=0.11", default-features = false }
+toasty-core = "=0.11"
+# Toasty 0.11 不再默认开启 Turso features；保留既有 FTS 能力，使用系统分配器。
+toasty-driver-turso = { version = "=0.11", features = ["fts"] }
+
 # Internal crates
 rcoder-telemetry = { path = "crates/rcoder-telemetry" }
+frontend-detector = { path = "crates/frontend-detector" }
+# dial9 spawner 门面（叶子 crate：tokio 必选 + dial9 optional；见 crates/rcoder-obs）
+rcoder-obs = { path = "crates/rcoder-obs" }
 shared_types = { path = "crates/shared_types" }
 shared_types_grpc = { path = "crates/shared_types_grpc" }
 shared_types_i18n = { path = "crates/shared_types_i18n" }
+# Custom Page 预览协调器（进程内权威存储 + 契约测试套件；协调服务对象批次 2 接入）
+preview-coordinator = { path = "crates/preview-coordinator" }
+rcoder-storage = { path = "crates/rcoder-storage" }
+rcoder-engine = { path = "crates/rcoder-engine" }
+rcoder = { path = "crates/rcoder" }
+http-server = { path = "crates/http-server" }
 agent_config = { path = "crates/agent_config" }
 agent_abstraction = { path = "crates/agent_abstraction" }
 agent_provisioning = { path = "crates/agent_provisioning" }
@@ -299,10 +347,33 @@ rcoder-proxy = { path = "crates/rcoder-proxy" }
 container-runtime-api = { path = "crates/container-runtime-api" }
 download_utils = { path = "crates/download_utils" }
 process_utils = { path = "crates/process_utils" }
+runtime-supervisor = { path = "crates/runtime-supervisor" }
 file-server = { path = "crates/file-server" }
+file-server-userapp = { path = "crates/file-server-userapp" }
+file-server-proxy = { path = "crates/file-server-proxy" }
+model_probe = { path = "crates/model_probe" }
 
-# Pyroscope Continuous Profiling
-pyroscope = { version = "2.0", features = ["backend-pprof-rs"] }
+# Hotpath 本地性能剖析（hotpath-rs，本地开发观测；见 AGENTS.md「AI 调试路由」）。
+# 非 optional（官方推荐）：不开 feature 时宏全 no-op、内部依赖零编译；
+# 不进 default features → 生产构建（build-agent-docker）完全无感。
+hotpath = { version = "0.28.0", default-features = false }
+
+# dial9 事件级 Tokio tracing（本地开发观测，取代已移除的 tokio-console）。
+# default=[] 必须显式开 `tokio`（runtime hooks + recorder_from_env）；不开
+# cpu/memory-profiling——它们需要 force-frame-pointers，会改 RUSTFLAGS 指纹。
+# 仅经 rcoder/agent_runner 的 `dial9` feature 引入，生产构建不含。
+dial9 = { version = "0.5", default-features = false, features = ["tokio"] }
+
+# 开发调试使用日志，不使用源码断点；workspace 成员不产出 debuginfo（DWARF）。
+[profile.dev]
+debug = false
+
+# 依赖同样不产出 debuginfo，回溯缺行号可接受。
+# 收益：unpacked split-debuginfo 下依赖不再生成海量 .o 调试小文件
+# （曾致 deps 百万文件 / target 717GB 的随机小 IO 风暴），编译、链接、清理全面提速。
+# "*" 通配只匹配依赖。
+[profile.dev.package."*"]
+debug = false
 
 # The profile that 'dist' will build with
 [profile.dist]

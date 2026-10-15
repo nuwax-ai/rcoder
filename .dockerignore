@@ -1,9 +1,18 @@
 # 构建产物（最重要：排除 target 避免传输19GB）
 target/
 **/target/
+# Make BuildKit ignore the directories and contents explicitly; in particular,
+# crates/app-cli/target is independent of the root Cargo target directory.
+target/**
+**/target
+**/target/**
+target-check/
+target-appcli/
 
 # Git 相关
 .git
+/.git/**
+/.git/
 .gitignore
 .gitattributes
 
@@ -27,6 +36,12 @@ docker/specs/
 # docker/rcoder-agent-runner/  # 保留（包含 downloads/ 用于 LibreOffice 预下载）
 docker/computer-cache/
 docker/computer-project-workspace/
+# Local UserApp workspaces and persistent application data are runtime mounts.
+docker/userapp-workspace/
+docker/app-workspace/
+# SQLite databases, WAL/SHM and instance locks must never enter image layers.
+data/rcoder/
+docker/data/
 
 # 测试文件
 tests/
@@ -49,3 +64,27 @@ dist
 *.swp
 *.swo
 *~
+
+# Local credentials, acceptance reports and alternate build output are never image inputs.
+.env*
+**/.env*
+.codex/
+tests-e2e/reports/
+target-console/
+# 其余构建/同步产物（曾致 3GB+ 上下文）
+target-tssync/
+target-console/
+target-unstable/
+fuzz/
+.remote-k8s/
+.devspace/
+.devspace/
+.claude/
+.codeartsdoer/
+.qoder/
+.workbuddy/
+.zcode/
+.specify/
+specs/
+crates/app-cli/node_modules/
+crates/app-cli/dist/

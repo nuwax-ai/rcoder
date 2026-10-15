@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use crate::Config;
 use crate::error::{AppError, AppResult};
-use crate::service::dev_server::log::{LogFileSnapshot, LogLine, ReadDevLogResult};
+use crate::models::{LogLine, ReadDevLogResult};
+use crate::service::dev_server::log::LogFileSnapshot;
 
 #[derive(Clone)]
 struct Entry {

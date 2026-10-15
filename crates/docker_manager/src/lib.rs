@@ -15,9 +15,12 @@ pub mod api_cache;
 pub mod container_builder;
 pub mod container_creator;
 pub mod container_query;
+#[cfg(feature = "deploy-host")]
+pub mod deploy_host_ports;
 pub mod health;
 pub mod image_management;
 pub mod manager_cleanup;
+mod native_domain;
 pub mod network;
 pub mod network_management;
 pub mod runtime_selection;
@@ -47,6 +50,20 @@ pub use path::{
 /// Docker manager error type
 #[derive(Error, Debug)]
 pub enum DockerError {
+    /// Cancellation observed only before writes or after all issued writes returned.
+    #[error("builder creation cancelled after acknowledged writes")]
+    BuilderCreationCancelled,
+
+    /// The create request already returned a physical ID. A subsequent start
+    /// failure cannot be classified as rejection of the whole creation.
+    #[error("container {container_id} exists but {phase} failed: {source}")]
+    ContainerCreationIncomplete {
+        container_id: String,
+        phase: ContainerCreationPhase,
+        #[source]
+        source: Box<DockerError>,
+    },
+
     #[error("docker connection failed: {0}")]
     ConnectionError(String),
 
@@ -89,6 +106,20 @@ pub enum DockerError {
 
 /// Docker 管理器结果类型
 pub type DockerResult<T> = Result<T, DockerError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerCreationPhase {
+    Start,
+    Observe,
+}
+impl std::fmt::Display for ContainerCreationPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Start => "start",
+            Self::Observe => "observe started container",
+        })
+    }
+}
 
 /// 默认的 Docker 镜像配置常量
 pub mod default_images {
@@ -294,3 +325,6 @@ pub mod global {
         Ok(f(&manager))
     }
 }
+
+#[cfg(test)]
+mod cache_retirement_tests;

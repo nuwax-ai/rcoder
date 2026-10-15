@@ -1,0 +1,190 @@
+use super::*;
+
+// ── supervise（信号 + 任一退出 → kill all → return）─────────────────────────────
+
+/// 优雅停机：所有受管子进程并发停止（信号 → 共享宽限 deadline → 整树强杀），
+/// 任何一个进程树收束未确认即整体失败（R01：停止完成要求整个受管树收束，
+/// 不能只等直接 Child）。
+pub(super) async fn supervise(
+    mut children: ManagedChildren,
+    shutdown_timeout_seconds: u64,
+    cancel: Option<tokio_util::sync::CancellationToken>,
+    known_failed: Vec<String>,
+) -> Result<()> {
+    let captured_scope = runtime_supervisor::current_scope();
+    let forced = tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("📡 received SIGINT, shutting down");
+            true
+        }
+        _ = wait_sigterm() => {
+            info!("📡 received SIGTERM, shutting down");
+            true
+        }
+        // server 形态的外部取消（热部署切换 / 容器停服级联）：与信号同路径优雅停
+        () = async {
+            match cancel {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending().await,
+            }
+        } => {
+            info!("📡 orchestration cancelled (hot deploy / shutdown), stopping services");
+            false
+        }
+        exited = poll_any_exit(&mut children, &known_failed) => {
+            if let Some(name) = exited {
+                error!("❌ {name} exited — shutting down (supervisor will restart)");
+            }
+            true
+        }
+    };
+    // User controls cross the drain barrier before cancelling this task. A
+    // second publication here would introduce a failure after the old Child
+    // ownership has already been surrendered. Unexpected exits and signals
+    // cannot preserve a live business execution; close an undrainable proxy.
+    let fault = if forced {
+        super::resident::begin_fault_cleanup(captured_scope)
+    } else {
+        Ok(None)
+    };
+    let drain: Result<()> = if forced {
+        match &fault {
+            Ok(Some(fault)) => {
+                if let Err(drain_error) = fault
+                    .drain(tokio::time::Instant::now() + crate::proxy::admin_probe::CONFIRM_BUDGET)
+                    .await
+                {
+                    super::resident::close_entry().await.map_err(|close_error|ShutdownUnconfirmed(format!("fault entry drain failed: {drain_error:#}; closure unconfirmed: {close_error:#}")).into())
+                } else {
+                    Ok(())
+                }
+            }
+            Ok(None) => Ok(()),
+            Err(error) => Err(anyhow::anyhow!(
+                "fault cleanup coordination failed: {error:#}"
+            )),
+        }
+    } else {
+        Ok(())
+    };
+    let stopped = shutdown_all(children, shutdown_timeout_seconds).await;
+    let result = match (drain, stopped) {
+        (_, Err(stop_error)) => Err(stop_error),
+        (Err(drain_error), Ok(())) => Err(drain_error),
+        (Ok(()), Ok(())) => Ok(()),
+    };
+    if let Ok(Some(fault)) = fault {
+        fault.finish(&result);
+    }
+    result
+}
+
+pub(super) async fn drain_or_close_resident() -> Result<()> {
+    if let Err(drain_error) = super::resident::publish_standby_if_serving().await {
+        super::resident::close_entry().await.map_err(|close_error| {
+            ShutdownUnconfirmed(format!(
+                "entry drain failed: {drain_error:#}; entry shutdown unconfirmed: {close_error:#}"
+            ))
+        })?;
+        warn!("entry drain failed; resident shutdown confirmed: {drain_error:#}");
+    }
+    Ok(())
+}
+
+pub(super) async fn drain_or_close_resident_for_startup(
+    captured_scope: &Option<runtime_supervisor::SessionScope>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    match super::resident::await_captured_control_for_startup(captured_scope, cancel, deadline)
+        .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => drain_or_close_resident().await,
+        Err(error) => Err(ShutdownUnconfirmed(format!(
+            "captured startup drain remains unconfirmed: {error:#}"
+        ))
+        .into()),
+    }
+}
+
+/// A deployment cannot publish a terminal status until shutdown is confirmed.
+#[derive(Debug)]
+pub(crate) struct ShutdownUnconfirmed(pub String);
+impl std::fmt::Display for ShutdownUnconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "shutdown not confirmed: {}", self.0)
+    }
+}
+impl std::error::Error for ShutdownUnconfirmed {}
+
+pub(super) async fn shutdown_all(
+    children: ManagedChildren,
+    shutdown_timeout_seconds: u64,
+) -> Result<()> {
+    // 并发停止：每个 stop 的首个 poll 即发出信号，宽限窗口共享同一时刻起算
+    //（与旧实现"先全体 TERM、再并行等宽限、超时全体 KILL"等时序）。
+    let grace =
+        Duration::from_secs(shutdown_timeout_seconds.min(crate::supervision::STOP_GRACE_SECONDS));
+    let results =
+        futures::future::join_all(children.into_iter().map(|(name, mut child)| async move {
+            let outcome = child.stop(grace).await;
+            (name, outcome)
+        }))
+        .await;
+    let unconfirmed: Vec<String> = results
+        .into_iter()
+        .filter_map(|(name, outcome)| match outcome {
+            StopOutcome::Unconfirmed => Some(name),
+            _ => None,
+        })
+        .collect();
+    if unconfirmed.is_empty() {
+        Ok(())
+    } else {
+        Err(ShutdownUnconfirmed(format!(
+            "process tree(s) remain after termination deadline: {}",
+            unconfirmed.join(", ")
+        ))
+        .into())
+    }
+}
+
+/// Detect an unexpected child exit without discarding handles or tree
+/// identities: final shutdown still has to confirm every original tree stopped.
+/// root 语义（孙进程存活不掩盖根进程死亡，见 [`ManagedChild::try_wait_root`]）。
+pub(super) async fn poll_any_exit(
+    children: &mut [(String, ManagedChild)],
+    known_failed: &[String],
+) -> Option<String> {
+    loop {
+        for (name, child) in children.iter_mut() {
+            if matches!(child.try_wait_root(), Ok(Some(_)) | Err(_))
+                && !known_failed.iter().any(|failed| failed == name)
+            {
+                return Some(name.clone());
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// 等 SIGTERM（Unix 专属）。handler 安装失败时降级（不 panic），
+/// 由 [`tokio::signal::ctrl_c`] / `poll_any_exit` 兜底触发关闭。
+#[cfg(unix)]
+pub(super) async fn wait_sigterm() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sig = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("install SIGTERM handler failed: {e} — SIGTERM 不会被捕获");
+            return;
+        }
+    };
+    sig.recv().await;
+}
+
+#[cfg(not(unix))]
+pub(super) async fn wait_sigterm() {
+    std::future::pending::<()>().await;
+}

@@ -1,0 +1,9 @@
+# The production proxy listener contract includes 0.0.0.0:9080. Protocol
+# lifecycle fixtures and readiness combinations share that real socket; only
+# their group is serialized while unrelated tests retain default parallelism.
+[test-groups.public-proxy]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary(run_source_owner) | binary(retry_after_failure) | binary(tree_lifecycle) | test(business_readiness) | test(publication_receipt_tests) | test(pingap_failure_emits_single_done_and_exits_non_zero)'
+test-group = 'public-proxy'

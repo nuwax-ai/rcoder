@@ -6,12 +6,13 @@
 //! - `notification_handlers`: SessionNotification 等消息类型处理
 
 mod message_loop;
+mod model_sync;
 mod notification_handlers;
 mod setup;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_client_protocol::schema::v1::{
     McpServer, PromptRequest, RequestPermissionRequest, RequestPermissionResponse, SessionId,
@@ -27,6 +28,25 @@ use crate::diagnostics::DiagnosticsListener;
 use crate::traits::session_notifier::SessionNotifier;
 use crate::traits::{AgentStartConfig, PermissionRequestContext, PermissionRequestHandler};
 use shared_types::error_codes;
+
+/// resume 窗口 RAII 守卫：创建时置位，Drop 时自动复位——任何出口
+/// （成功/失败/超时/`?` 提前返回/panic）都保证 resuming 归零，
+/// 从结构上杜绝"漏一个出口导致通知被永久过滤"的缺陷
+/// （曾因超时分支漏复位引入该 bug，870b102 修复后才重构为本形态）。
+pub(crate) struct ResumingGuard(Arc<AtomicBool>);
+
+impl ResumingGuard {
+    pub(crate) fn new(flag: Arc<AtomicBool>) -> Self {
+        flag.store(true, Ordering::Release);
+        Self(flag)
+    }
+}
+
+impl Drop for ResumingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 /// SACP 连接参数（封装 run_sacp_connection 的参数）
 pub(crate) struct SacpConnectionParams<N: SessionNotifier> {
@@ -53,6 +73,10 @@ pub(crate) struct SacpConnectionParams<N: SessionNotifier> {
     pub(crate) child_pid: u32,
     /// 子进程命令行（用于错误诊断）
     pub(crate) command_line: String,
+    /// 本次请求的模型 id（源自 model_provider，裸名如 `deepseek-v4-pro`）。
+    /// resume 后用于 `session/set_config_option(configId=model)` 对齐 session
+    /// 模型引用，值形态从 agent 的 configOptions 响应匹配
+    pub(crate) session_model_id: Option<String>,
     /// 进程诊断监听器（可选，注入自 AcpClientBuilder）
     pub(crate) diagnostics_listener: Option<Arc<dyn DiagnosticsListener>>,
 }
@@ -85,9 +109,12 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
         mut connection_failed_tx,
         child_pid,
         command_line,
+        session_model_id,
         diagnostics_listener,
     } = params;
 
+    // resume 窗口标志：session/load 期间为 true（通知 handler 据此过滤历史重放）
+    let resuming = Arc::new(AtomicBool::new(false));
     // 克隆变量供 handlers 使用
     let notifier_for_handlers = notifier.clone();
     let project_id_for_handlers = project_id.clone();
@@ -96,7 +123,7 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
         project_id: project_id.clone(),
         user_id: start_config.user_id.clone(),
         agent_mode: start_config.agent_mode,
-        service_type: start_config.service_type.clone(),
+        service_type: start_config.service_type,
         request_id: None,
         tool_approval_rules: start_config.tool_approval_rules.clone(),
     };
@@ -112,11 +139,13 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
             {
                 let notifier = notifier_for_handlers.clone();
                 let project_id = project_id_for_handlers.clone();
+                let resuming = resuming.clone();
                 async move |dispatch: Dispatch, _cx: ConnectionTo<Agent>| {
                     notification_handlers::handle_incoming_dispatch(
                         dispatch,
                         notifier.clone(),
                         project_id.clone(),
+                        resuming.clone(),
                     )
                     .await
                 }
@@ -148,10 +177,12 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
             let project_path = project_path.clone();
             let mcp_servers = mcp_servers.clone();
             let start_config = start_config.clone();
+            let session_model_id = session_model_id.clone();
             let notifier_for_prompt = notifier_for_prompt_end.clone();
             let project_id_for_prompt = project_id_for_prompt_end.clone();
             let abnormal_exit_flag = abnormal_exit_flag.clone();
             let session_id_shared = session_id_shared.clone();
+            let resuming = resuming.clone();
 
             async move {
                 // 1. 初始化连接（INIT_TIMEOUT_SECS 秒超时）
@@ -167,14 +198,16 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
                 .await?;
 
                 // 2+3. 构建会话 meta 并创建/加载会话
-                let session_id = setup::create_or_load_session(
+                let outcome = setup::create_or_load_session(
                     &cx,
                     &project_id,
                     project_path,
                     mcp_servers,
                     &start_config,
+                    &resuming,
                 )
                 .await?;
+                let session_id = outcome.session_id;
 
                 info!(
                     "[SACP] ACP session ready, session_id={}",
@@ -184,6 +217,15 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
                 // 🆕 当 agent_mode=ask 时，通过 ACP 协议设置 session mode
                 setup::apply_ask_session_mode(&cx, &start_config, &command_line, &session_id)
                     .await;
+
+                // 🆕 resume 场景对齐 session 模型引用（防切模型后旧引用解析失败）
+                model_sync::sync_session_model_config(
+                    &cx,
+                    &session_model_id,
+                    &outcome.config_options,
+                    &session_id,
+                )
+                .await;
 
                 // 发送会话 ID 到主任务
                 if session_id_tx.send(session_id.clone()).is_err() {
@@ -228,4 +270,52 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod resuming_guard_tests {
+    use super::*;
+
+    #[test]
+    fn guard_resumes_flag_and_drop_resets() {
+        let flag = Arc::new(AtomicBool::new(false));
+        {
+            let _g = ResumingGuard::new(flag.clone());
+            assert!(flag.load(Ordering::Acquire), "guard held: flag must be set");
+        }
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "guard dropped: flag must reset"
+        );
+    }
+
+    #[test]
+    fn guard_resets_on_early_return() {
+        // 模拟 load 失败提前返回路径：函数内创建 guard 后 ?/return，Drop 仍复位
+        fn fallible_load(flag: Arc<AtomicBool>) -> Result<(), ()> {
+            let _g = ResumingGuard::new(flag.clone());
+            Err(()) // 提前返回出口
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(fallible_load(flag.clone()).is_err());
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "early-return exit must reset flag"
+        );
+    }
+
+    #[test]
+    fn guard_resets_on_panic() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let f = flag.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _g = ResumingGuard::new(f.clone());
+            panic!("simulated load crash");
+        }));
+        assert!(result.is_err());
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "panic exit must reset flag (unwind runs Drop)"
+        );
+    }
 }

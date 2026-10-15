@@ -11,10 +11,12 @@ mod permission;
 mod status;
 mod stop_agent;
 mod subscribe_progress;
+mod trace_ctx;
 pub(crate) mod utils;
 pub(crate) mod vnc_probe;
 
 // HTTP 停止路径复用 gRPC 的清理逻辑（含 graceful_stop），故 crate 内重导出
+#[cfg(feature = "http-server")]
 pub(crate) use cleanup::remove_agent_and_cleanup;
 
 use std::sync::Arc;
@@ -28,7 +30,7 @@ use shared_types::grpc::{
     StopAgentResponse, agent_service_server::AgentService,
 };
 use tonic::{Request, Response, Status};
-use tracing::instrument;
+use tracing::Instrument;
 
 use crate::router::AppState;
 
@@ -44,69 +46,85 @@ impl AgentServiceImpl {
 
 #[tonic::async_trait]
 impl AgentService for AgentServiceImpl {
-    #[instrument(skip(self, request))]
     async fn chat(
         &self,
         request: Request<GrpcChatRequest>,
     ) -> Result<Response<GrpcChatResponse>, Status> {
-        chat::chat(&self.app_state, request).await
+        // trace_ctx::in_span：span 创建期挂接 traceparent（见 trace_ctx.rs 注释）
+        let span = rcoder_telemetry::grpc_span!("chat", request.metadata());
+        chat::chat(&self.app_state, request).instrument(span).await
     }
 
     type SubscribeProgressStream = subscribe_progress::SubscribeProgressStream;
 
-    #[instrument(skip(self, request))]
     async fn subscribe_progress(
         &self,
         request: Request<ProgressRequest>,
     ) -> Result<Response<Self::SubscribeProgressStream>, Status> {
-        subscribe_progress::subscribe_progress(&self.app_state, request).await
+        let span = rcoder_telemetry::grpc_span!("subscribe_progress", request.metadata());
+        subscribe_progress::subscribe_progress(&self.app_state, request)
+            .instrument(span)
+            .await
     }
 
-    #[instrument(skip(self, request))]
     async fn cancel_session(
         &self,
         request: Request<CancelRequest>,
     ) -> Result<Response<CancelResponse>, Status> {
-        cancel::cancel_session(&self.app_state, request).await
+        let span = rcoder_telemetry::grpc_span!("cancel_session", request.metadata());
+        cancel::cancel_session(&self.app_state, request)
+            .instrument(span)
+            .await
     }
 
-    #[instrument(skip(self, request))]
     async fn resolve_permission(
         &self,
         request: Request<GrpcResolvePermissionRequest>,
     ) -> Result<Response<GrpcResolvePermissionResponse>, Status> {
-        permission::resolve_permission(request).await
+        let span = rcoder_telemetry::grpc_span!("resolve_permission", request.metadata());
+        permission::resolve_permission(request)
+            .instrument(span)
+            .await
     }
 
-    #[instrument(skip(self, request))]
     async fn get_status(
         &self,
         request: Request<GetStatusRequest>,
     ) -> Result<Response<GetStatusResponse>, Status> {
-        status::get_status(&self.app_state, request).await
+        let span = rcoder_telemetry::grpc_span!("get_status", request.metadata());
+        status::get_status(&self.app_state, request)
+            .instrument(span)
+            .await
     }
 
-    #[instrument(skip(self, request))]
     async fn stop_agent(
         &self,
         request: Request<StopAgentRequest>,
     ) -> Result<Response<StopAgentResponse>, Status> {
-        stop_agent::stop_agent(&self.app_state, request).await
+        let span = rcoder_telemetry::grpc_span!("stop_agent", request.metadata());
+        stop_agent::stop_agent(&self.app_state, request)
+            .instrument(span)
+            .await
     }
 
-    #[instrument(skip(self))]
     async fn get_container_status(
         &self,
         request: Request<GetContainerStatusRequest>,
     ) -> Result<Response<GetContainerStatusResponse>, Status> {
-        status::get_container_status(&self.app_state, request).await
+        // 后台状态探测无 traceparent（rcoder 有意不注入）——独立根 span
+        let span = rcoder_telemetry::grpc_span!("get_container_status", request.metadata());
+        status::get_container_status(&self.app_state, request)
+            .instrument(span)
+            .await
     }
 
-    #[instrument(skip(self))]
     async fn get_vnc_status(
         &self,
         request: Request<GetVncStatusRequest>,
     ) -> Result<Response<GetVncStatusResponse>, Status> {
-        status::get_vnc_status(&self.app_state, request).await
+        let span = rcoder_telemetry::grpc_span!("get_vnc_status", request.metadata());
+        status::get_vnc_status(&self.app_state, request)
+            .instrument(span)
+            .await
     }
 }

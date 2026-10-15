@@ -1,59 +1,26 @@
 use clap::Parser;
-#[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, warn};
+#[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
+use tracing::error;
+use tracing::{info, warn};
 
 // 🆕 使用共享的遥测模块
 use rcoder_telemetry::{TelemetryConfig, TelemetryGuard};
 
-mod agent_mgmt;
-mod api_key_manager;
-mod auto_reload;
-mod config;
+pub use agent_runner::model::*;
+
+use agent_runner::config::{CliArgs, load_config_with_args};
+use agent_runner::proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
 #[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
-mod grpc;
-mod handler;
-mod model;
-mod proxy_agent;
-
-// 🔥 Pyroscope Profiler 模块（可选：需要 pyroscope feature）
-#[cfg(feature = "pyroscope")]
-mod profiler;
-
-// 🔥 OpenTelemetry 追踪模块（可选：保留用于向后兼容）
-#[allow(dead_code)]
-mod otel_tracing;
-
-mod router;
-mod service;
-mod shutdown;
-mod utils;
-
-// HTTP 服务器模块 (仅在 http-server feature 启用时)
-#[cfg(feature = "http-server")]
-mod http_server;
-
-// ttyd WebSocket 终端中间层（接浏览器 + 连本地 ttyd，代码控制 cd）
-mod file_server_embed;
-mod ws_terminal;
-// VNC 桌面连接活跃度计数（读 /proc/net/tcp 数 noVNC 端口 ESTABLISHED 连接，
-// 供 get_active_tasks_count 折入 active_tasks，使「桌面开着」的容器不被闲置回收）
-mod vnc_activity;
-
-pub use model::*;
-
-use config::{CliArgs, load_config_with_args};
-use proxy_agent::cleanup_task::{CleanupConfig, start_cleanup_task};
-#[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
-use router::AppState;
-use service::AgentSessionService;
-use shutdown::{set_panic_hook, setup_shutdown_handler};
-use utils::spawn_tool_version_log;
+use agent_runner::router::AppState;
+use agent_runner::service::AgentSessionService;
+use agent_runner::shutdown::{set_panic_hook, setup_shutdown_handler};
+use agent_runner::utils::spawn_tool_version_log;
 
 fn create_model_env_resolver(
-    config: &config::AppConfig,
+    config: &agent_runner::config::AppConfig,
 ) -> Arc<dyn agent_abstraction::launcher::ModelRuntimeEnvResolver> {
     #[cfg(feature = "proxy")]
     {
@@ -85,6 +52,8 @@ fn create_model_env_resolver(
 // 路由创建函数已移动到 handler 模块
 
 fn main() -> anyhow::Result<()> {
+    // Help/version exit before PID 1 supervision, telemetry, or background tool launches.
+    let cli_args = CliArgs::parse();
     // 容器内若为 PID 1(被 start-up.sh exec / 直跑),re-exec 自己为子进程 + 本进程做 PID 1 监督
     // (回收孤儿 + 转发 SIGTERM/SIGINT)。等价 tini,但纯 Rust 库、无需镜像装 tini 或命令前置。
     // 关键:监督进程的 waitpid(-1) 与 app 的 tokio::process 在 **不同进程**(app 是 PID 2 子进程),
@@ -94,11 +63,35 @@ fn main() -> anyhow::Result<()> {
         .enable_log(true)
         .timeout(Duration::from_secs(15))
         .launch()?;
-    agent_runner_main()
+    agent_runner_main(cli_args)
 }
 
+// dial9 变体：手动构建 runtime 才能把 hooks 挂进 Builder（`#[tokio::main]`
+// 做不到）。`#[hotpath::main]` 只在函数体前插 guard、不构建 runtime，可共存。
+// 退出顺序：先 drop(runtime) 停事件流，再 graceful_shutdown 刷盘终段
+// （5s 预算 < docker stop 10s 宽限）。
+#[cfg(feature = "dial9")]
+#[hotpath::main]
+fn agent_runner_main(cli_args: CliArgs) -> anyhow::Result<()> {
+    let (recorder, runtime) = agent_runner::dial9_obs::runtime_from_env()
+        .map_err(|e| anyhow::anyhow!("dial9 runtime init failed: {e}"))?;
+    let exit = runtime.block_on(agent_runner_run(cli_args));
+    drop(runtime);
+    recorder.graceful_shutdown(Duration::from_secs(5));
+    exit
+}
+
+#[cfg(not(feature = "dial9"))]
 #[tokio::main]
-async fn agent_runner_main() -> anyhow::Result<()> {
+#[hotpath::main]
+async fn agent_runner_main(cli_args: CliArgs) -> anyhow::Result<()> {
+    agent_runner_run(cli_args).await
+}
+
+async fn agent_runner_run(cli_args: CliArgs) -> anyhow::Result<()> {
+    // Hotpath tokio runtime 指标采样线程（feature 关闭时 no-op）
+    hotpath::tokio_runtime!();
+
     // 🔥 设置自定义 Panic Hook，确保 panic 信息被记录
     set_panic_hook();
 
@@ -115,6 +108,7 @@ async fn agent_runner_main() -> anyhow::Result<()> {
 
     // 🆕 Initializing telemetry system（使用 rcoder-telemetry，包含控制台 + 文件日志）
     let telemetry_config = TelemetryConfig::from_env("agent_runner").with_file_log("agent-runner"); // 启用文件日志，前缀为 agent-runner
+
     let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
     let _telemetry = Arc::new(telemetry);
 
@@ -129,26 +123,6 @@ async fn agent_runner_main() -> anyhow::Result<()> {
         tokio::runtime::Handle::current().metrics().num_workers()
     );
 
-    // 🆕 Pyroscope Profiler 初始化（可选：需要 pyroscope feature）
-    #[cfg(feature = "pyroscope")]
-    let _pyroscope_guard: Option<profiler::ProfilerGuard> = {
-        info!("Pyroscope profiling feature enabled");
-        match profiler::init_pyroscope_profiler_default() {
-            Ok(guard) => {
-                info!("Pyroscope profiler initialized successfully");
-                Some(guard)
-            }
-            Err(e) => {
-                warn!("Failed to initialize Pyroscope profiler: {}", e);
-                warn!("Continuing without Pyroscope profiling");
-                None
-            }
-        }
-    };
-
-    #[cfg(not(feature = "pyroscope"))]
-    let _pyroscope_guard: Option<()> = None;
-
     info!("Starting rcoder - AI-powered development platform");
     info!("agent-runner version: {}", env!("CARGO_PKG_VERSION"));
 
@@ -161,14 +135,11 @@ async fn agent_runner_main() -> anyhow::Result<()> {
 
     // 异步初始化内置 agent 版本缓存（不阻塞主流程）
     tokio::spawn(async {
-        agent_mgmt::checker::init_builtin_agent_versions().await;
+        agent_runner::agent_mgmt::checker::init_builtin_agent_versions().await;
     });
 
-    // 解析命令行参数
-    let cli_args = CliArgs::parse();
-
     // 加载配置（包含命令行参数）
-    let config = load_config_with_args(cli_args);
+    let config = load_config_with_args(cli_args)?;
 
     // 注:容器以 tini 做 PID 1(见镜像 ENTRYPOINT / chart command 前置 tini),由 tini 负责回收
     // 孤儿进程 + 转发信号。agent_runner 不再自带 in-process reaper(旧 process_reaper 模块已删:
@@ -197,12 +168,28 @@ async fn agent_runner_main() -> anyhow::Result<()> {
     info!("[MAIN] Shared API key DashMap created");
 
     #[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
-    let api_key_manager = Arc::new(api_key_manager::ApiKeyManager::from_shared(
+    let api_key_manager = Arc::new(agent_runner::api_key_manager::ApiKeyManager::from_shared(
         shared_api_key_manager.clone(),
     ));
 
+    // 跨协议共享的 project_id → service_uuid 映射：gRPC 域创建（chat 路径
+    // insert），HTTP 域注入同一实例——两份独立 map 会让 gRPC StopAgent 找不到
+    // HTTP 域写入的映射，shared_api_key_manager 中该 uuid 的 api_key 永不清理
     #[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
     let project_uuid_map: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
+    // HTTP 侧注入视图：grpc 双开时共享；http-only 时 None（AppState 自建，
+    // 单协议形态无跨协议清理需求）
+    #[allow(unused_variables)]
+    let http_shared_uuid_map: Option<Arc<DashMap<String, String>>> = {
+        #[cfg(any(feature = "grpc-server", not(feature = "http-server")))]
+        {
+            Some(project_uuid_map.clone())
+        }
+        #[cfg(all(not(feature = "grpc-server"), feature = "http-server"))]
+        {
+            None
+        }
+    };
 
     let model_env_resolver: Arc<dyn agent_abstraction::launcher::ModelRuntimeEnvResolver> =
         create_model_env_resolver(&config);
@@ -220,10 +207,11 @@ async fn agent_runner_main() -> anyhow::Result<()> {
     info!("[MAIN] AgentSessionService created");
 
     // 🆕 P0-1: 创建 Agent 管理注册表(从磁盘加载,失败则用空注册表 + 警告)
-    // 注:用二进制自己的 `crate::agent_mgmt` 模块(与 router::AppState 同编译单元),
-    //     lib 和 binary 是两个独立 crate,类型不能混用。
-    let agent_mgmt_path_manager = agent_mgmt::PathManager::new();
-    let agent_mgmt_registry = match agent_mgmt::AgentRegistry::load(agent_mgmt_path_manager.clone())
+    let agent_mgmt_path_manager = agent_runner::agent_mgmt::PathManager::new();
+    let agent_mgmt_registry = match agent_runner::agent_mgmt::AgentRegistry::load(
+        agent_mgmt_path_manager.clone(),
+    )
+    .await
     {
         Ok(r) => {
             info!(
@@ -234,8 +222,8 @@ async fn agent_runner_main() -> anyhow::Result<()> {
             Arc::new(r)
         }
         Err(e) => {
-            tracing::warn!("[MAIN] Failed to load agent management registry, starting empty: {e}");
-            Arc::new(agent_mgmt::AgentRegistry::empty(
+            warn!("[MAIN] Failed to load agent management registry, starting empty: {e}");
+            Arc::new(agent_runner::agent_mgmt::AgentRegistry::empty(
                 agent_mgmt_path_manager.clone(),
             ))
         }
@@ -244,7 +232,7 @@ async fn agent_runner_main() -> anyhow::Result<()> {
     // 🔥 http-server 模式：启动 HTTP + (可选 gRPC) + Pingora
     #[cfg(feature = "http-server")]
     {
-        use http_server::{HttpServerConfig, start_http_server};
+        use agent_runner::http_server::{HttpServerConfig, start_http_server};
         // 🔥 1. 可选：启动 gRPC 服务（当 grpc-server feature 启用时）
         #[cfg(feature = "grpc-server")]
         let grpc_handle = {
@@ -271,13 +259,13 @@ async fn agent_runner_main() -> anyhow::Result<()> {
 
             // gRPC 消息大小限制
             let grpc_service = shared_types::grpc::agent_service_server::AgentServiceServer::new(
-                grpc::AgentServiceImpl::new(grpc_state.clone()),
+                agent_runner::grpc::AgentServiceImpl::new(grpc_state.clone()),
             )
             .max_decoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
             .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE);
 
             // P0-1: Agent 管理 gRPC 服务
-            let agent_mgmt_service = agent_mgmt::grpc::AgentMgmtServiceImpl::new(
+            let agent_mgmt_service = agent_runner::agent_mgmt::grpc::AgentMgmtServiceImpl::new(
                 agent_mgmt_registry.clone(),
                 agent_mgmt_path_manager.clone(),
             );
@@ -316,16 +304,10 @@ async fn agent_runner_main() -> anyhow::Result<()> {
         }
 
         // 🔥 1.5. 启动 ttyd WS 终端中间层（tokio-tungstenite：接浏览器 + 连本地 ttyd）
-        //         cd 逻辑由代码每次连接（含重连）控制，解决 WS 重连不进项目目录的问题
+        //         cd 逻辑由代码每次连接（含重连）时执行，解决 WS 重连不进项目目录的问题
         tokio::spawn(async move {
-            ws_terminal::start_ws_terminal().await;
+            agent_runner::ws_terminal::start_ws_terminal().await;
         });
-
-        // 🔥 1.6. 可选：启动嵌入式 file-server (RCODER_EMBED_FILE_SERVER=true)
-        //         让 workspace build 在 agent-runner 全量工具链下执行 (UserApp)
-        if shared_types::FeatureFlags::get().embed_file_server {
-            file_server_embed::spawn_embedded_file_server().await;
-        }
 
         // 🔥 2. 创建 HttpServerConfig（包含所有配置）
         let http_config = HttpServerConfig {
@@ -333,12 +315,21 @@ async fn agent_runner_main() -> anyhow::Result<()> {
             app_config: config.clone(),
             agent_session_service: agent_session_service.clone(),
             shared_api_key_manager: shared_api_key_manager.clone(),
+            project_uuid_map: http_shared_uuid_map.clone(),
             agent_mgmt_registry: Some(agent_mgmt_registry.clone()),
             agent_mgmt_path_manager: Some(agent_mgmt_path_manager.clone()),
         };
 
         // 🔥 3. 启动 HTTP 服务器（内部会启动 Pingora）
-        let _handle = start_http_server(http_config).await?;
+        let http_handle = start_http_server(http_config).await?;
+
+        // 🔥 3.5 可选：内嵌 file-server (RCODER_EMBED_FILE_SERVER=true)
+        //         路由 merge 进 8086 主服务（create_router 内按开关注入）；
+        //         60000 由 file-server-proxy 前置接管（AllRust → 本进程 8086）。
+        //         置于 HTTP server 之后: 避免 proxy 先占 60000 而上游 8086 未就绪的 502 窗口
+        if shared_types::FeatureFlags::get().embed_file_server {
+            agent_runner::file_server_embed::spawn_file_server_proxy(config.port).await;
+        }
 
         // 🔥 4. 同时等待 gRPC（如果有）和信号
         info!("HTTP + Pingora services started; running until shutdown signal is received");
@@ -385,6 +376,7 @@ async fn agent_runner_main() -> anyhow::Result<()> {
             info!("Received shutdown signal, preparing graceful shutdown...");
         }
 
+        http_handle.stop().await?;
         Ok(())
     }
 
@@ -415,13 +407,13 @@ async fn agent_runner_main() -> anyhow::Result<()> {
 
         // gRPC 消息大小限制
         let grpc_service = shared_types::grpc::agent_service_server::AgentServiceServer::new(
-            grpc::AgentServiceImpl::new(grpc_state.clone()),
+            agent_runner::grpc::AgentServiceImpl::new(grpc_state.clone()),
         )
         .max_decoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE)
         .max_encoding_message_size(shared_types::GRPC_MAX_MESSAGE_SIZE);
 
         // P0-1: Agent 管理 gRPC 服务
-        let agent_mgmt_service = crate::agent_mgmt::grpc::AgentMgmtServiceImpl::new(
+        let agent_mgmt_service = agent_runner::agent_mgmt::grpc::AgentMgmtServiceImpl::new(
             agent_mgmt_registry.clone(),
             agent_mgmt_path_manager.clone(),
         );
@@ -453,8 +445,10 @@ async fn agent_runner_main() -> anyhow::Result<()> {
         // 启动轻量 HTTP 健康检查服务（供 docker_manager 健康检查使用）
         let health_port = config.port; // 默认 8086，来自 --port 参数
         let _health_handle = tokio::spawn(async move {
+            use agent_runner::handler::health_handler::{
+                build_health_response, check_grpc_port_simple,
+            };
             use axum::{Json, Router, routing::get};
-            use handler::health_handler::{build_health_response, check_grpc_port_simple};
 
             async fn health_check()
             -> Json<shared_types::HttpResult<shared_types::HealthCheckResponse>> {
@@ -499,7 +493,7 @@ async fn agent_runner_main() -> anyhow::Result<()> {
         // 启动 Pingora（如有配置且启用了 proxy feature）
         #[cfg(feature = "proxy")]
         let pingora_result = {
-            use proxy_agent::start_pingora;
+            use agent_runner::proxy_agent::start_pingora;
 
             if let Some(proxy_config) = &config.proxy_config {
                 Some(start_pingora(proxy_config, shared_api_key_manager.clone())?)
@@ -529,7 +523,7 @@ async fn agent_runner_main() -> anyhow::Result<()> {
         // 停止 Pingora 服务
         #[cfg(feature = "proxy")]
         if let Some(mut result) = pingora_result {
-            result.stop().await;
+            result.stop().await?;
         }
 
         #[cfg(not(feature = "proxy"))]

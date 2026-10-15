@@ -25,6 +25,9 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# K8s Secret `.data` base64 解码(read_app_container_spec secrets 回退)
+base64 = { workspace = true }
+
 # Error handling
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -44,6 +47,8 @@ moka = { workspace = true, features = ["future"] }
 
 # Shared types
 shared_types = { workspace = true }
+runtime-supervisor = { workspace = true }
+sha2 = { workspace = true }
 
 # gRPC client (for health checks)
 tonic = { workspace = true }
@@ -56,13 +61,21 @@ async-trait = { workspace = true }
 
 # Kubernetes runtime support (feature-gated)
 kube = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
 k8s-openapi = { workspace = true, optional = true }
 
 [features]
 default = []
 # Kubernetes runtime support
 # 阶段2: xattr 目录配额已退役 (改 per-agent subvolume PVC + CSI 服务端配额), xattr crate 已移除
-kubernetes = ["kube", "k8s-openapi"]
-# 🔧 eBPF 调试模式：启用容器特权，允许使用 eBPF 诊断工具
-# 警告：仅在开发调试时使用，生产环境请勿启用
-ebpf-debug = []
+kubernetes = ["kube", "k8s-openapi", "tokio-util"]
+# deploy-host 宿主机运行形态：路径恒等映射/独立网络/端口发布
+deploy-host = ["shared_types/deploy-host"]
+
+[dev-dependencies]
+rustls = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

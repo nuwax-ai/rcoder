@@ -90,7 +90,7 @@ impl PingoraProxyService {
         }
     }
 
-    /// 添加 app 后端（按 app_id+port 路由，用于 /proxy/apps/{app_id}/{port}）。
+    /// 添加 app 后端（免端口代理按 (app_id, APP_ENTRY_PORT) 优先查，用于 /api/v1/userapp/proxy/app/prod）。
     /// 同步（DashMap），与 vnc/project 一致。
     pub fn add_app_backend(&self, app_id: &str, port: u16, host: String) {
         self.app_backends
@@ -198,15 +198,29 @@ impl PingoraProxyService {
     }
 
     /// 启动健康检查循环
-    pub fn start_health_check_loop(&self, interval_secs: u64, timeout_ms: u64) {
+    pub fn start_health_check_loop(
+        &self,
+        interval_secs: u64,
+        timeout_ms: u64,
+        mut stop: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         let svc = self.clone();
         tokio::spawn(async move {
             let interval = Duration::from_secs(interval_secs);
             loop {
-                svc.update_health_once(timeout_ms).await;
-                tokio::time::sleep(interval).await;
+                if *stop.borrow_and_update() {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    _ = stop.changed() => break,
+                    _ = async {
+                        svc.update_health_once(timeout_ms).await;
+                        tokio::time::sleep(interval).await;
+                    } => {}
+                }
             }
-        });
+        })
     }
 
     /// 获取健康状态快照（兼容接口）
@@ -324,8 +338,15 @@ impl PingoraProxyService {
         }
 
         // 2. 回退到 vnc_backends/project_backends（向后兼容）
-        // 优先使用 pod_id
+        // pod_id 是 computer 共享子 pod 语义，仅 computer 查询下用它回退——
+        // vnc_backends 混存 user_id/pod_id 键（均 computer 容器），非 computer
+        // 查询误用 pod_id 直查会撞 user_id 键空间拿到别人的后端
         if let Some(pid) = pod_id
+            && matches!(
+                service_type,
+                shared_types::ServiceType::ComputerAgentRunner
+                    | shared_types::ServiceType::ComputerNormalProject
+            )
             && let Some(ip) = self.vnc_backends.get(pid)
         {
             return Some(ip.value().clone());
@@ -333,7 +354,9 @@ impl PingoraProxyService {
 
         // 根据 ServiceType 选择路由键
         match service_type {
-            shared_types::ServiceType::ComputerAgentRunner => {
+            // Computer 族共享 per-user 容器：VNC/ttyd 桌面流量常规项目同样路由
+            shared_types::ServiceType::ComputerAgentRunner
+            | shared_types::ServiceType::ComputerNormalProject => {
                 if let Some(uid) = user_id {
                     self.vnc_backends.get(uid).map(|r| r.value().clone())
                 } else {
@@ -347,10 +370,10 @@ impl PingoraProxyService {
                     None
                 }
             }
-            // UserApp / UserAppBuilder 不走 VNC/project backend 查找:
-            // UserApp 经 /proxy/{port} 的 backends map 路由;
-            // UserAppBuilder 经 agent lookup(project_id)由上层解析,此处返 None
-            shared_types::ServiceType::UserApp | shared_types::ServiceType::UserAppBuilder => None,
+            // Userapp / UserappBuilder 不走 VNC/project backend 查找:
+            // Userapp 经 /proxy/{port} 的 backends map 路由;
+            // UserappBuilder 经 agent lookup(project_id)由上层解析,此处返 None
+            shared_types::ServiceType::Userapp | shared_types::ServiceType::UserappBuilder => None,
         }
     }
 
@@ -361,5 +384,23 @@ impl PingoraProxyService {
     /// 获取 API 密钥管理器的引用（用于共享）
     pub fn get_api_key_manager(&self) -> Arc<DashMap<String, ModelProviderConfig>> {
         self.api_key_manager.clone()
+    }
+}
+
+#[cfg(test)]
+mod supervised_health_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn health_check_shutdown_confirms_task_exit_without_waiting_for_next_interval() {
+        let service = PingoraProxyService::new(ProxyConfig::with_listen_port(0));
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let task = service.start_health_check_loop(3600, 100, stopped);
+        tokio::task::yield_now().await;
+        stop.send_replace(true);
+        timeout(Duration::from_millis(500), task)
+            .await
+            .expect("health loop ignored cancellation")
+            .expect("health loop panicked");
     }
 }

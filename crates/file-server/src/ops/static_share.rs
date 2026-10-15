@@ -1,0 +1,432 @@
+//! 静态文件服务共享面：CORS 配置族 + serve_from_root + 响应辅助。
+//!
+//! serve_page / serve_computer 壳在 handlers/static_files.rs；
+//! file-server-userapp 的 userapp static 取包复用本层——Range 断点续传走
+//! COMPUTER_CORS 头集。
+
+use std::path::Path;
+
+use axum::extract::{OriginalUri, Request};
+use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use tower::util::ServiceExt;
+use tower_http::services::ServeFile;
+
+use crate::error::AppError;
+
+/// CORS 头配置 (两套路由不同)。
+pub struct CorsConfig {
+    pub allow_headers: &'static str,
+    pub expose_headers: &'static str,
+}
+
+pub const PAGE_CORS: CorsConfig = CorsConfig {
+    allow_headers: "Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control, Fragment",
+    expose_headers: "Content-Type, X-File-Size",
+};
+
+pub const COMPUTER_CORS: CorsConfig = CorsConfig {
+    allow_headers: "Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control, Range, If-Range",
+    expose_headers: "Content-Type, Content-Length, Content-Range, Accept-Ranges, ETag, Last-Modified, X-File-Size",
+};
+
+const ALLOW_METHODS: &str = "HEAD,GET,POST,PUT,DELETE,OPTIONS";
+
+/// Serve a decoded, workspace-relative path. Axum's Path extractor already
+/// percent-decodes once; decoding again aliases literal `%23` and `#` filenames.
+/// Server-generated artifact paths are likewise passed as literal filenames.
+pub async fn serve_from_root(root: &Path, rest: &str, cors: &CorsConfig, req: Request) -> Response {
+    let relative = rest.trim_start_matches('/');
+    if relative.is_empty() {
+        return cors_404(&req, cors);
+    }
+    // 路径安全: 仅防穿越 (dotfiles allow, 不拦隐藏名)
+    let full = match crate::path_safety::ensure_resolved_within(root, relative).await {
+        Ok(p) => p,
+        Err(_) => return cors_404(&req, cors),
+    };
+    if req.method() == axum::http::Method::OPTIONS {
+        return cors_empty(&req, cors);
+    }
+    let origin = origin_value(&req);
+    // Axum strips nested router prefixes from `Request::uri()`. Error responses
+    // should retain the public URL (as Express `sendFile` errors do), so prefer
+    // its original URI and keep the nested URI only for direct service tests.
+    let request_path = req
+        .extensions()
+        .get::<OriginalUri>()
+        .map(|uri| uri.0.path())
+        .unwrap_or_else(|| req.uri().path())
+        .to_owned();
+    // tokio::fs::metadata 而非阻塞的 Path::is_file()：本函数每次静态请求都会走到，
+    // 阻塞调用会占住 tokio worker。NotFound 使用与 TS 一致的结构化资源错误；其他
+    // I/O 错误按种类传播，不能把权限/设备故障伪装成文件缺失。
+    // 对齐 TS 02bec84 (v1.5.5): 始终以 X-File-Size 返回完整文件大小（Range 请求
+    // 也是全量）—— 网关 gzip 会去掉 Content-Length（改 chunked），且 CORS 未暴露
+    // 的头前端读不到。
+    let file_size = match tokio::fs::metadata(&full).await {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => return cors_404(&req, cors),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return cors_resource_404(&request_path, origin.as_deref(), cors);
+        }
+        Err(error) => {
+            let response = AppError::from(error).into_response();
+            return add_cors_headers(response, origin.as_deref(), cors);
+        }
+    };
+    // ServeFile 处理 Range / ETag / Last-Modified / conditional GET
+    let serve = ServeFile::new(full);
+    match serve.oneshot(req).await {
+        Ok(resp) if resp.status() == StatusCode::NOT_FOUND => {
+            cors_resource_404(&request_path, origin.as_deref(), cors)
+        }
+        Ok(resp) => {
+            let mut resp = resp.into_response();
+            let headers = resp.headers_mut();
+            headers.insert(
+                HeaderName::from_static("x-file-size"),
+                HeaderValue::from(file_size),
+            );
+            // 对齐 TS 静态服务 (send 模块) 的浏览器语义: 总是允许重新验证
+            // (`public, max-age=0`, 避免用户内容被启发式缓存出陈旧副本), 并通告
+            // ServeFile 已实现的 Range 能力; tower-http 默认不发送这两个头。
+            headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=0"),
+            );
+            headers.insert(
+                axum::http::header::ACCEPT_RANGES,
+                HeaderValue::from_static("bytes"),
+            );
+            add_cors_headers(resp, origin.as_deref(), cors)
+        }
+        Err(_) => cors_404_static(origin.as_deref(), cors),
+    }
+}
+
+pub fn origin_value(req: &Request) -> Option<String> {
+    req.headers()
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+pub fn add_cors_headers(mut resp: Response, origin: Option<&str>, cors: &CorsConfig) -> Response {
+    let allow_origin = origin.unwrap_or("*");
+    let headers = resp.headers_mut();
+    drop(headers.insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_str(allow_origin).unwrap_or(HeaderValue::from_static("*")),
+    ));
+    drop(headers.insert(
+        HeaderName::from_static("access-control-allow-methods"),
+        HeaderValue::from_static(ALLOW_METHODS),
+    ));
+    drop(headers.insert(
+        HeaderName::from_static("access-control-allow-headers"),
+        HeaderValue::from_str(cors.allow_headers).unwrap_or_else(|_| HeaderValue::from_static("")),
+    ));
+    drop(headers.insert(
+        HeaderName::from_static("access-control-expose-headers"),
+        HeaderValue::from_str(cors.expose_headers).unwrap_or_else(|_| HeaderValue::from_static("")),
+    ));
+    // 注: CORS 凭据策略不在本层拦截 —— 前置有网关/代理系统,
+    // 需要收紧时由前置系统统一处理, file-server 保持原行为 (有 Origin 即下发凭据头)。
+    if origin.is_some() {
+        drop(headers.insert(
+            HeaderName::from_static("access-control-allow-credentials"),
+            HeaderValue::from_static("true"),
+        ));
+        headers.append(axum::http::header::VARY, HeaderValue::from_static("Origin"));
+    }
+    resp
+}
+
+fn cors_empty(req: &Request, cors: &CorsConfig) -> Response {
+    let origin = origin_value(req);
+    add_cors_headers(StatusCode::OK.into_response(), origin.as_deref(), cors)
+}
+
+fn cors_resource_404(path: &str, origin: Option<&str>, cors: &CorsConfig) -> Response {
+    let response = AppError::resource(format!("Path not found: {path}")).into_response();
+    add_cors_headers(response, origin, cors)
+}
+
+pub fn cors_404(req: &Request, cors: &CorsConfig) -> Response {
+    let origin = origin_value(req);
+    add_cors_headers(
+        (StatusCode::NOT_FOUND, "Not Found").into_response(),
+        origin.as_deref(),
+        cors,
+    )
+}
+
+fn cors_404_static(origin: Option<&str>, cors: &CorsConfig) -> Response {
+    add_cors_headers(
+        (StatusCode::NOT_FOUND, "Not Found").into_response(),
+        origin,
+        cors,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn generated_static_urls_preserve_literal_percent_names_after_axum_decode() {
+        use tower::ServiceExt as _;
+        let root = tempfile::tempdir().unwrap();
+        for (name, content) in [
+            ("name%23.txt", "PERCENT"),
+            ("name#.txt", "HASH"),
+            ("literal%2Fname.txt", "LITERAL-SLASH"),
+        ] {
+            std::fs::write(root.path().join(name), content).unwrap();
+        }
+        let entries = crate::service::tree::list_files(
+            root.path(),
+            &crate::Config::default(),
+            Some("/files"),
+        )
+        .await
+        .unwrap();
+        let selected_root = root.path().to_owned();
+        let router = axum::Router::new().route(
+            "/files/{*rest}",
+            axum::routing::get(
+                move |axum::extract::Path(rest): axum::extract::Path<String>, request: Request| {
+                    let root = selected_root.clone();
+                    async move { serve_from_root(&root, &rest, &PAGE_CORS, request).await }
+                },
+            ),
+        );
+        for (name, expected) in [
+            ("name%23.txt", "PERCENT"),
+            ("name#.txt", "HASH"),
+            ("literal%2Fname.txt", "LITERAL-SLASH"),
+        ] {
+            let entry = entries.iter().find(|entry| entry.name == name).unwrap();
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(entry.file_proxy_url.as_deref().expect("generated URL"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{name}");
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), expected.as_bytes(), "{name}");
+        }
+    }
+
+    #[test]
+    fn ensure_within_rejects_traversal_allows_dotfiles() {
+        let root = Path::new("/app/ws");
+        assert!(crate::path_safety::ensure_within(root, "../etc").is_err());
+        assert!(crate::path_safety::ensure_within(root, "/etc/passwd").is_err());
+        assert!(crate::path_safety::ensure_within(root, "src/a.js").is_ok());
+        // dotfiles allow: .env / .git/config 不被隐藏拦截 (ensure_within 只防穿越)
+        assert!(crate::path_safety::ensure_within(root, ".env").is_ok());
+        assert!(crate::path_safety::ensure_within(root, ".git/config").is_ok());
+    }
+
+    #[test]
+    fn cors_headers_echo_origin_with_credentials() {
+        // 有 Origin: 回显 + 凭据头 (CORS 拦截由前置网关负责, 本层不做)
+        let resp = add_cors_headers(
+            StatusCode::OK.into_response(),
+            Some("http://client.example.com"),
+            &PAGE_CORS,
+        );
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "http://client.example.com"
+        );
+        assert_eq!(
+            resp.headers().get("access-control-allow-credentials"),
+            Some(&HeaderValue::from_static("true"))
+        );
+        // 无 Origin: `*` 且无凭据头
+        let resp = add_cors_headers(StatusCode::OK.into_response(), None, &PAGE_CORS);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "*"
+        );
+        assert!(
+            resp.headers()
+                .get("access-control-allow-credentials")
+                .is_none()
+        );
+    }
+    #[tokio::test]
+    async fn native_path_link_reads_reject_outside_and_preserve_inside() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("workspace");
+        let inside = base.join("inside");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(inside.join("sentinel.txt"), "inside").unwrap();
+        std::fs::write(outside.join("sentinel.txt"), "outside").unwrap();
+        let mut outcomes = Vec::new();
+        for (name, target) in [("internal", &inside), ("external", &outside)] {
+            let link = base.join(name);
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            #[cfg(windows)]
+            assert!(
+                std::process::Command::new("cmd.exe")
+                    .args(["/d", "/c", "mklink", "/J"])
+                    .arg(&link)
+                    .arg(target)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+            let relative = format!("{name}/sentinel.txt");
+            let resolved =
+                crate::service::tree::resolve::resolve_existing_file(&base, &relative, None)
+                    .await
+                    .unwrap()
+                    .is_some();
+            let response = serve_from_root(
+                &base,
+                &relative,
+                &COMPUTER_CORS,
+                Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            #[cfg(unix)]
+            std::fs::remove_file(&link).unwrap();
+            #[cfg(windows)]
+            std::fs::remove_dir(&link).unwrap();
+            outcomes.push((resolved, status, body));
+        }
+        assert!(outcomes[0].0, "internal link remains readable");
+        assert_eq!(outcomes[0].1, StatusCode::OK);
+        assert_eq!(outcomes[0].2.as_ref(), b"inside");
+        assert!(!outcomes[1].0, "external link resolves to exists:false");
+        assert_eq!(outcomes[1].1, StatusCode::NOT_FOUND);
+        assert_ne!(outcomes[1].2.as_ref(), b"outside");
+    }
+
+    #[tokio::test]
+    async fn missing_static_file_returns_structured_resource_error_with_cors() {
+        let root = tempfile::tempdir().unwrap();
+        let path = "/api/page/static/project/missing.txt";
+        let request = Request::builder()
+            .uri("/static/project/missing.txt")
+            .header("origin", "https://client.example")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let (mut parts, body) = request.into_parts();
+        parts.extensions.insert(OriginalUri(path.parse().unwrap()));
+        let request = Request::from_parts(parts, body);
+
+        let response = serve_from_root(root.path(), "missing.txt", &PAGE_CORS, request).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            "https://client.example"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["code"], "UNKNOWN_ERROR");
+        assert_eq!(value["error"]["type"], "RESOURCE_ERROR");
+        assert_eq!(value["error"]["message"], format!("Path not found: {path}"));
+    }
+
+    // ── TS 02bec84 (v1.5.5): X-File-Size 全量大小自定义头 ─────────────────────
+
+    #[tokio::test]
+    async fn success_responses_carry_full_x_file_size_header() {
+        // 对齐 TS: 网关 gzip 会去掉 Content-Length、CORS 未暴露的头前端读不到，
+        // 因此自定义头始终携带完整文件大小（Range 请求也是全量）。
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.txt"), b"0123456789").unwrap();
+        let response = serve_from_root(
+            root.path(),
+            "a.txt",
+            &PAGE_CORS,
+            Request::builder()
+                .uri("/")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("x-file-size").unwrap(), "10");
+        let expose = response
+            .headers()
+            .get("access-control-expose-headers")
+            .unwrap();
+        assert!(
+            expose
+                .to_str()
+                .unwrap()
+                .split(',')
+                .any(|token| token.trim() == "X-File-Size"),
+            "CORS 必须暴露 X-File-Size: {expose:?}"
+        );
+
+        // Range 请求: 206 携带的仍是全量大小（TS 同款语义）
+        let response = serve_from_root(
+            root.path(),
+            "a.txt",
+            &COMPUTER_CORS,
+            Request::builder()
+                .uri("/")
+                .header("range", "bytes=0-3")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers().get("x-file-size").unwrap(), "10");
+
+        // 目录与缺失: 404 不携带该头（TS 在 stat 失败时不设置，交由 404 流程）
+        std::fs::create_dir_all(root.path().join("sub")).unwrap();
+        for rest in ["sub", "missing.txt"] {
+            let response = serve_from_root(
+                root.path(),
+                rest,
+                &PAGE_CORS,
+                Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{rest}");
+            assert!(
+                response.headers().get("x-file-size").is_none(),
+                "{rest}: 404 不得携带 x-file-size"
+            );
+        }
+    }
+}

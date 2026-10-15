@@ -2,8 +2,8 @@
 //!
 //! 阶段3 ISP 拆分: 原 `ContainerRuntime` 32 方法拆为 3 个聚焦子 trait + 1 个聚合 super-trait:
 //! - [`AgentContainerRuntime`] (Group A, 13): agent 容器生命周期 (create/stop/find/list/health).
-//! - [`WorkspaceRuntime`]    (Group B, 5):  workspace/file-server PVC 解析 (resolve/ensure/destroy).
-//! - [`UserAppDeploymentRuntime`] (Group C, 14): UserApp Deployment CRUD (create/patch/scale/logs/exec).
+//! - [`WorkspaceRuntime`]    (Group B, 8):  workspace/file-server PVC 解析 (resolve/ensure/resize/destroy).
+//! - [`UserAppDeploymentRuntime`] (Group C, 14): Userapp Deployment CRUD (create/patch/scale/logs/exec).
 //! - [`ContainerRuntime`]:    聚合 super-trait = A + B + C; 旧调用点零改 (`Arc<dyn ContainerRuntime>`).
 //! - [`UserAppRuntime`]:      B + C 视图; 供 app_manager 收紧 (不需 agent 能力).
 //!
@@ -16,7 +16,7 @@ use super::container_params::ContainerCreateParams;
 use super::types::{
     AgentPodDiagnostic, AppEventInfo, ContainerLogEntry, ContainerRuntimeError,
     ContainerRuntimeResult, ContainerRuntimeStatus, ContainerSpecSnapshot, DeploymentStatus,
-    ExecResult, RemovedContainerInfo, ResourceUsage, RuntimeContainerInfo,
+    ExecResult, RemovedContainerInfo, ResourceUsage, RuntimeContainerInfo, StorageResizeOutcome,
 };
 
 // mpsc 仍在 lib.rs re-export（`container_runtime_api::mpsc::Receiver` 被 docker_manager /
@@ -32,7 +32,7 @@ pub use tokio::sync::mpsc;
 /// Agent 容器生命周期运行时 (Group A)。
 ///
 /// 用于 rcoder 主服务对 agent pod/container (WebAgentRunner / ComputerAgentRunner) 的管理。
-/// 不含 UserApp Deployment 或 workspace PVC 解析能力。
+/// 不含 Userapp Deployment 或 workspace PVC 解析能力。
 #[async_trait]
 pub trait AgentContainerRuntime: Send + Sync {
     /// Create and start a container
@@ -40,6 +40,414 @@ pub trait AgentContainerRuntime: Send + Sync {
         &self,
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo>;
+
+    async fn acquire_builder_operation(
+        &self,
+        _app_id: &str,
+    ) -> ContainerRuntimeResult<Box<dyn shared_types::AppOperationLease>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "builder operation lease unsupported".into(),
+        ))
+    }
+    async fn capture_builder_deletion(
+        &self,
+        _app_id: &str,
+    ) -> ContainerRuntimeResult<shared_types::BuilderDeletionSnapshot> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "identity-bound builder deletion unsupported".into(),
+        ))
+    }
+
+    /// Observe/fence the original captured deletion after its durable executor
+    /// was revoked. Does not delete resources or grant continuation authority.
+    async fn inspect_builder_deletion(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
+        _snapshot: &shared_types::BuilderDeletionSnapshot,
+    ) -> ContainerRuntimeResult<shared_types::DeletionInspection> {
+        Ok(shared_types::DeletionInspection::Unknown(
+            "Builder deletion inspection is unsupported".into(),
+        ))
+    }
+
+    /// 按 app 维度枚举全部 builder 实例 identifier（协作模型多实例——同 app
+    /// 每用户独立容器，复合键 `{user_id}-{app_id}`）。destroy 链清盘用：
+    /// owner 实例之外还要清扫全部协作者实例及其 PVC。
+    /// K8s 按 `rcoder.io/app-id` label（STS + PVC）；Docker 按容器名前缀解析。
+    /// 默认空（后端不支持时 destroy 仅覆盖 owner 实例，调用方自行告警）。
+    async fn find_builder_instances(&self, _app_id: &str) -> ContainerRuntimeResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+    async fn delete_builder_snapshot(
+        &self,
+        _snapshot: &shared_types::BuilderDeletionSnapshot,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "identity-bound builder deletion unsupported".into(),
+        ))
+    }
+
+    async fn inspect_builder_workspace(
+        &self,
+        _snapshot: &shared_types::BuilderDeletionSnapshot,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::UserAppBuilderWorkspaceEndpoint> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Physical builder workspace inspection is unsupported".into(),
+        ))
+    }
+
+    /// Read-only inspection for explicit adoption. It must verify immutable
+    /// physical identity and owner; missing lifecycle metadata is allowed here.
+    /// Read-only candidate identity, including a scaled-to-zero StatefulSet.
+    /// Missing lifecycle labels do not authorize writes; callers must retrieve
+    /// the durable binding and revalidate through capture_bound_builder_control.
+    async fn inspect_builder_candidate(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Builder candidate inspection is unsupported".into(),
+        ))
+    }
+
+    async fn capture_builder_adoption(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _expected_container_id: &str,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Explicit builder adoption is unsupported".into(),
+        ))
+    }
+    async fn capture_bound_builder_control(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        binding: Option<&shared_types::UserAppResourceBinding>,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        if binding.is_some() {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Physical builder bindings are unsupported".into(),
+            ));
+        }
+        self.capture_builder_control(context).await
+    }
+
+    /// Read credentials from this captured live builder, never from a later
+    /// platform template. Implementations must not expose the credential in logs.
+    async fn get_bound_builder_file_credentials(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<shared_types::FileServerRequestCredentials> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Captured builder file credentials are unsupported".into(),
+        ))
+    }
+
+    /// Recover an original successful create response from a durable runtime
+    /// receipt. May release only that receipt's original inactive lease; never
+    /// create/start resources or infer success from a same-named container.
+    /// A durable cancellation acknowledgement returns `CreationCancelled`
+    /// only after its original lease was released. It does not imply resource
+    /// absence and must never be converted into a successful creation.
+    async fn recover_builder_creation(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderCreationEvidence>> {
+        Ok(None)
+    }
+
+    /// Inspect an identity-bound orphan Pod for compute-only Stop. No adoption,
+    /// storage mutation or controller creation is authorized by this witness.
+    async fn capture_builder_orphan_stop(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderOrphanStopTarget>> {
+        Ok(None)
+    }
+    /// Read-only candidate discovery; missing native metadata still requires
+    /// revalidation with a durable physical binding before a stop is allowed.
+    async fn inspect_builder_orphan_stop(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderOrphanStopTarget>> {
+        self.capture_builder_orphan_stop(context).await
+    }
+    async fn capture_bound_builder_orphan_stop(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        binding: Option<&shared_types::UserAppResourceBinding>,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderOrphanStopTarget>> {
+        if binding.is_some() {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Orphan physical bindings are unsupported".into(),
+            ));
+        }
+        self.capture_builder_orphan_stop(context).await
+    }
+    async fn stop_builder_orphan(
+        &self,
+        _target: &shared_types::BuilderOrphanStopTarget,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Orphan builder stop is unsupported".into(),
+        ))
+    }
+    async fn confirm_builder_orphan_stopped(
+        &self,
+        _target: &shared_types::BuilderOrphanStopTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    async fn capture_builder_control(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Identity-bound builder controls are unsupported".into(),
+        ))
+    }
+
+    /// Execute only in the captured builder. Callers retain the durable operation
+    /// and runtime lease; no name-based fallback is permitted on target mismatch.
+    async fn exec_builder_control_target(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+        _command: Vec<String>,
+    ) -> ContainerRuntimeResult<ExecResult> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Identity-bound builder execution is unsupported".into(),
+        ))
+    }
+
+    async fn apply_builder_control(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+        _restart: bool,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Identity-bound builder controls are unsupported".into(),
+        ))
+    }
+
+    /// Observe an atomic stop receipt and absence of the captured builder's Pods.
+    /// Unsupported backends cannot infer completion from a stopped-looking state.
+    async fn reconcile_builder_compute_stop(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    /// Read actual stopped compute, including an external stop without a
+    /// platform receipt. This does not authorize a write or retire a lease.
+    /// Pending/restarting resources cannot be treated as stopped.
+    async fn observe_builder_compute_stopped(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    fn supports_builder_compute_fencing(&self) -> bool {
+        false
+    }
+
+    /// Causal acknowledgement of a completed Docker API call. This is for
+    /// draining superseded work, not for claiming current service readiness.
+    async fn builder_compute_write_acknowledged(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+        _starting: bool,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    /// Read an immutable completed creation under its original receipt. This
+    /// never creates, retries or adopts a builder, and verifies the original
+    /// lease identity as well as the currently running physical resources.
+    async fn observe_completed_builder_creation(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+        _receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        Ok(None)
+    }
+
+    /// Capture private original configuration before a compute-only restart.
+    async fn archive_builder_restart(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderRestartTemplate>> {
+        Ok(None)
+    }
+
+    /// Recapture the same retained stopped builder when its historical archive
+    /// is unreadable. This only saves configuration; the caller must retain the
+    /// original operation lease, validate its volume witnesses, and persist the
+    /// replacement reference before any compute restore. Unsupported backends
+    /// cannot infer this capability from an absent or pending resource.
+    async fn recapture_stopped_builder_restart(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<shared_types::BuilderRestartTemplate> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Stopped builder restart recapture is unsupported".into(),
+        ))
+    }
+
+    /// Observe the private archive referenced by an existing checkpoint.
+    /// `Some(false)` identifies missing/damaged history; `None` means this
+    /// backend did not observe its bytes. This is a recovery aid, not a normal
+    /// query admission gate or authority to replace compute.
+    async fn inspect_builder_restart_archive(
+        &self,
+        _template: &shared_types::BuilderRestartTemplate,
+    ) -> ContainerRuntimeResult<Option<bool>> {
+        Ok(None)
+    }
+
+    /// Recreate a lost controller from an operation-bound archive, retaining
+    /// original volumes. Never infer this authority from a resource name.
+    async fn restore_builder_restart(
+        &self,
+        _template: &shared_types::BuilderRestartTemplate,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Builder controller restoration is unsupported".into(),
+        ))
+    }
+
+    async fn capture_builder_compute_volumes(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Vec<shared_types::AppResourceIdentity>> {
+        Ok(Vec::new())
+    }
+
+    /// Observe a captured running Docker builder's Published reach. `None`
+    /// means this runtime/mode is not eligible for automatic repair; an empty
+    /// vector means all required ports are bound. This never mutates compute.
+    async fn missing_builder_published_ports(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<Vec<u16>>> {
+        Ok(None)
+    }
+
+    async fn fence_builder_compute_write(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    async fn reconcile_builder_compute_start(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        Ok(None)
+    }
+
+    /// None means the original start committed and must only be observed.
+    async fn prepare_builder_compute_retry(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderControlTarget>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Conditional builder retry is unsupported".into(),
+        ))
+    }
+
+    /// Start a captured, stopped builder without deleting its controller or data.
+    async fn start_builder_control(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Captured builder startup is unsupported".into(),
+        ))
+    }
+
+    /// Restore actually absent builder compute under the original control lease.
+    /// Retained workspace witnesses are verified before and after creation;
+    /// this never opens another operation or reacquires the application lease.
+    async fn ensure_absent_builder_control(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+        _volumes: &[shared_types::AppResourceIdentity],
+        _receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Absent builder creation under the original lease is unsupported".into(),
+        ))
+    }
+
+    /// Start using the restart archive captured before stopping old compute.
+    /// Runtimes that freeze a candidate configuration consume that same archive;
+    /// legacy archives retain their original startup semantics.
+    async fn start_builder_control_with_restart(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+        template: &shared_types::BuilderRestartTemplate,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        if template.source.context != target.context {
+            return Err(ContainerRuntimeError::Conflict(
+                "Builder restart archive belongs to a different operation".into(),
+            ));
+        }
+        self.start_builder_control(target).await
+    }
+
+    /// Consume the original startup intent and optional restart snapshot.
+    async fn start_builder_control_with_options(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+        options: &shared_types::BuilderStartOptions,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        if options.startup_mode != target.builder_startup_mode {
+            return Err(ContainerRuntimeError::Conflict(
+                "Builder startup options changed after admission".into(),
+            ));
+        }
+        if options.startup_mode == shared_types::BuilderStartupMode::ManagementOnly {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Management-only builder startup is unsupported".into(),
+            ));
+        }
+        match options.restart_template.as_ref() {
+            Some(template) => {
+                self.start_builder_control_with_restart(target, template)
+                    .await
+            }
+            None => self.start_builder_control(target).await,
+        }
+    }
+
+    /// Return the currently configured builder image for an explicit compute
+    /// start. The coordinator freezes it in its durable checkpoint before any
+    /// runtime write; backends without a managed image may return `None`.
+    async fn current_builder_image(&self) -> ContainerRuntimeResult<Option<String>> {
+        Ok(None)
+    }
+
+    /// Whether a retained stopped builder must be replaced to apply its frozen image.
+    async fn builder_image_replacement_needed(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    /// Refresh an address observation without starting or replacing compute.
+    async fn refresh_container_reach(
+        &self,
+        _info: &ContainerBasicInfo,
+    ) -> ContainerRuntimeResult<()> {
+        Ok(())
+    }
 
     /// Get container information by project_id
     async fn get_container_info(
@@ -76,6 +484,8 @@ pub trait AgentContainerRuntime: Send + Sync {
                 pod.container_ip,
                 shared_types::GRPC_DEFAULT_PORT
             ),
+            // workload 身份随 RuntimeContainerInfo 透传（§1.1 捕获链）。
+            workload_uid: pod.workload_uid.clone(),
         }))
     }
 
@@ -100,6 +510,32 @@ pub trait AgentContainerRuntime: Send + Sync {
         _service_type: &ServiceType,
     ) -> ContainerRuntimeResult<()> {
         self.stop_container(identifier).await
+    }
+
+    /// Retire only the idle builder compute captured by the caller. A stable
+    /// name is not deletion authority for a replacement container or Pod.
+    /// Implementations must preserve workspace data and all volumes/PVCs.
+    async fn stop_idle_builder_compute(
+        &self,
+        _identifier: &str,
+        _captured: &ContainerBasicInfo,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Captured idle builder retirement is unsupported".into(),
+        ))
+    }
+
+    /// agent 容器镜像是否漂移（当前进程期望 vs 存量容器实际）。
+    ///
+    /// 空闲滚动升级判据：true = 该 agent 落后于当前版本，闲置回收时可提前
+    /// 换代（销毁后下次 ensure 用新模板重建）。默认 false——Docker 模式
+    /// 容器重建即新镜像、测试桩无此语义，均不覆写。
+    async fn is_agent_image_drifted(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
     }
 
     /// Get container status
@@ -239,7 +675,23 @@ pub trait WorkspaceRuntime: Send + Sync {
         Ok(()) // default no-op (Docker / 未实现)
     }
 
-    /// 销毁 per-app PVC(UserApp 专用;Docker 默认 no-op)。
+    /// 解析 identifier 对应持久卷的**标识字符串**（storage 面展示/对账用）。
+    ///
+    /// K8s: 返回 PVC 名（`{prefix}-{id}-workspace`——RBD 卷 rcoder 不可挂载，
+    /// 无路径视角，PVC 名即存储事实）；Docker: 返回 userapp-workspace prod 树
+    /// 通配标识（`{锚点}/prod/*/{app_id}`——四目录无单一物理路径，存在性由
+    /// storage 层按元数据 uid 精确定位）。
+    async fn workspace_volume_name(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<String> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "workspace_volume_name not supported by this runtime".to_string(),
+        ))
+    }
+
+    /// 销毁 per-app PVC(Userapp 专用;Docker 默认 no-op)。
     ///
     /// K8s: 删 PVC 对象 → ceph-csi 回收 subvolume(释放配额)。调用方须保证 app 已 delete
     /// (PVC 无 Pod 引用 → pvc-protection finalizer 正常移除,不会卡)。幂等:PVC 不存在返 Ok。
@@ -247,20 +699,274 @@ pub trait WorkspaceRuntime: Send + Sync {
     async fn destroy_app_pvc(&self, _app_id: &str) -> ContainerRuntimeResult<()> {
         Ok(()) // default no-op (Docker / 未实现)
     }
+
+    /// Destroy only the storage identities captured before compute deletion.
+    async fn destroy_app_storage_snapshot(
+        &self,
+        _snapshot: &shared_types::AppDeletionSnapshot,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "identity-bound storage deletion is not supported by this runtime".into(),
+        ))
+    }
+
+    /// None explicitly means a backend without volume-capacity semantics.
+    async fn capture_app_storage_resize(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppStorageResizeTarget>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Captured application storage resize is unsupported".into(),
+        ))
+    }
+
+    async fn resize_app_storage_target(
+        &self,
+        _target: &shared_types::UserAppStorageResizeTarget,
+        _new_size: &str,
+    ) -> ContainerRuntimeResult<StorageResizeOutcome> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Captured application storage resize is unsupported".into(),
+        ))
+    }
+
+    /// 调整 per-app PVC 容量（Userapp 专用；K8s PVC **只扩不能缩**）。
+    ///
+    /// K8s: 读 PVC 当前 `requests.storage` → 等量 no-op / 更大 patch 扩容
+    /// （external-resizer 异步生效，不重建 Pod）/ 更小 [`StorageResizeOutcome::ShrinkRejected`]
+    /// 事实上抛（调用方转 400）。Docker 默认 no-op（bind 目录无容量语义）。
+    /// 前提：StorageClass `allowVolumeExpansion=true`，否则 patch 被接受但静默不生效。
+    async fn resize_app_storage(
+        &self,
+        _app_id: &str,
+        _new_size: &str,
+    ) -> ContainerRuntimeResult<StorageResizeOutcome> {
+        Ok(StorageResizeOutcome::Noop) // default no-op (Docker / 未实现)
+    }
+
+    /// 按 service_type 销毁 workspace PVC（幂等；Docker 默认 no-op）。
+    ///
+    /// 现有调用方：UserappBuilder 开发 PVC 回收（app purge 经 `UserappDevCleanup`
+    /// 契约）。Userapp 运行 PVC 走语义化包装 [`Self::destroy_app_pvc`]。
+    /// 调用方须保证该 service_type 的容器已停（PVC 无 Pod 引用才可删）。
+    async fn destroy_workspace_pvc(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<()> {
+        Ok(()) // default no-op (Docker / 未实现)
+    }
 }
 
 // ============================================================================
 // Group C — UserAppDeploymentRuntime (14 方法)
-// UserApp Deployment CRUD: create/patch/scale/restart/delete + status/logs/events/exec.
+// Userapp Deployment CRUD: create/patch/scale/restart/delete + status/logs/events/exec.
 // 默认实现: 核心操作返 ConfigurationError; 容器快照/events/resource/prerequisites Ok(default).
 // ============================================================================
 
-/// UserApp Deployment 运行时 (Group C)。
+/// Userapp Deployment 运行时 (Group C)。
 ///
 /// K8s 由 `KubernetesRuntime` 实现真实 Deployment 操作；
 /// Docker 由 `DockerRuntime` 做等价语义映射（容器 create/stop/start）。
 #[async_trait]
 pub trait UserAppDeploymentRuntime: Send + Sync {
+    /// Inspect the exact dev/prod compute instance without ensure, adoption,
+    /// cache registration or operation admission. Missing is a confirmed absence.
+    async fn observe_userapp_readiness(
+        &self,
+        _app_id: &str,
+        _stage: shared_types::UserappStage,
+    ) -> ContainerRuntimeResult<crate::UserAppRuntimeReadiness> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Read-only UserApp discovery is unsupported".into(),
+        ))
+    }
+
+    /// Run only the fixed readiness command in this captured physical instance.
+    /// None means the target disappeared/changed; callers may observe again.
+    async fn exec_userapp_readiness(
+        &self,
+        _target: &crate::UserAppReadinessTarget,
+    ) -> ContainerRuntimeResult<Option<ExecResult>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Read-only UserApp exec is unsupported".into(),
+        ))
+    }
+
+    /// Run only USERAPP_DBX_READINESS_COMMAND in the captured instance, with
+    /// identity checked before and after. None means the target changed.
+    async fn exec_userapp_dbx_readiness(
+        &self,
+        _target: &crate::UserAppReadinessTarget,
+    ) -> ContainerRuntimeResult<Option<ExecResult>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Read-only DBX exec is unsupported".into(),
+        ))
+    }
+
+    /// Remove only a successful restart's private archive. Caller must have
+    /// committed its terminal result and released the original operation lease.
+    async fn cleanup_builder_restart_archive(
+        &self,
+        _template: &shared_types::BuilderRestartTemplate,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Restart archive cleanup is unsupported".into(),
+        ))
+    }
+
+    /// Capture private original configuration before an application (prod)
+    /// compute-only restart. None means the backend cannot archive; the
+    /// restart then fails closed when the controller disappears.
+    async fn archive_app_restart(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<Option<shared_types::AppRestartTemplate>> {
+        Ok(None)
+    }
+
+    /// Recreate a lost application controller from an operation-bound archive,
+    /// retaining the original volumes. The replacement starts at zero
+    /// replicas; never infer this authority from a resource name.
+    async fn restore_app_restart(
+        &self,
+        _template: &shared_types::AppRestartTemplate,
+    ) -> ContainerRuntimeResult<shared_types::UserAppMutationTarget> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Application compute restoration is unsupported".into(),
+        ))
+    }
+
+    /// Verify that the existing application controller was committed by
+    /// exactly this operation's identity, returning the live resource view.
+    /// The stamped identity is the durable receipt for a creation whose
+    /// checkpoint was lost to a crash. None means the controller is absent or
+    /// belongs to a different operation; callers keep their conflict.
+    async fn verify_committed_creation(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        Ok(None)
+    }
+
+    /// Remove a successful application restart's private archive under the
+    /// same terminal-committed preconditions as the builder variant.
+    async fn cleanup_app_restart_archive(
+        &self,
+        _template: &shared_types::AppRestartTemplate,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Application restart archive cleanup is unsupported".into(),
+        ))
+    }
+
+    /// List operation contexts that still hold durable builder creation or
+    /// cancellation receipts. Receipt sweeps use this to find reclaimable
+    /// recovery evidence; an empty list skips the pass entirely.
+    async fn list_builder_creation_receipt_contexts(
+        &self,
+    ) -> ContainerRuntimeResult<Vec<shared_types::UserAppExecutionContext>> {
+        Ok(Vec::new())
+    }
+
+    /// Remove one operation's builder creation and cancellation receipts.
+    /// Callers must first confirm the operation record is terminal — the
+    /// record itself then carries the durable outcome.
+    async fn cleanup_builder_creation_receipts(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Builder creation receipt cleanup is unsupported".into(),
+        ))
+    }
+
+    /// Remove a terminal compute operation's durable stop/start receipt files.
+    /// Backends without file receipts are a no-op; callers must have confirmed
+    /// the operation's terminal state before invoking this.
+    async fn cleanup_compute_receipt_files(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<()> {
+        Ok(())
+    }
+
+    /// Live-verify an existing production controller as an adoption candidate:
+    /// name matches, UID equals the operator's expectation, the resource is
+    /// not deleting, and rcoder family identity is present (an older
+    /// lifecycle's values are acceptable — rebinding is the point). Volume
+    /// witnesses pin the workspace. None means absent or not adoptable.
+    async fn capture_app_adoption(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _expected_uid: &str,
+    ) -> ContainerRuntimeResult<Option<shared_types::AppAdoptionTarget>> {
+        Ok(None)
+    }
+
+    /// Register the adopted controller under the current operation identity.
+    /// K8s stamps the lifecycle annotations on the Deployment (preconditioned
+    /// on the verified UID and resource version); Docker labels are immutable,
+    /// so registration is the caller's durable store binding alone.
+    async fn bind_app_adoption(
+        &self,
+        _target: &shared_types::AppAdoptionTarget,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Application adoption is unsupported".into(),
+        ))
+    }
+
+    /// Read the application controller's physical UID by its derived name
+    /// without any lifecycle validation. Binding lookups use this; absence
+    /// yields None. This grants no authority by itself.
+    async fn adopted_app_physical_uid(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<String>> {
+        Ok(None)
+    }
+
+    /// Capture the application mutation target for a resource whose native
+    /// identity does not validate against the current lifecycle: a durable
+    /// binding that matches the observed physical UID authorizes the capture
+    /// instead. Mirrors the builder's bound control capture.
+    async fn capture_bound_app_control(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _binding: &shared_types::UserAppResourceBinding,
+    ) -> ContainerRuntimeResult<shared_types::UserAppMutationTarget> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Bound application capture is unsupported".into(),
+        ))
+    }
+
+    /// Verify preserved physical storage before a recovered workspace is used.
+    /// This is read-only and is deliberately not a prerequisite for Stop.
+    async fn verify_recovered_volumes(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _scope: shared_types::UserAppOperationScope,
+        volumes: &[shared_types::AppResourceIdentity],
+    ) -> ContainerRuntimeResult<()> {
+        if volumes.is_empty() {
+            return Ok(());
+        }
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Recovered volume verification is unsupported".into(),
+        ))
+    }
+    /// Inspect both scopes before creating a replacement SQL lifecycle. Never
+    /// repairs resource labels or starts workloads. Conflicting owners are errors.
+    async fn discover_application_identity(
+        &self,
+        _app_id: &str,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppDiscoveredIdentity>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Lifecycle discovery is unsupported".into(),
+        ))
+    }
+
     /// 创建并启动一个 Deployment（K8s）或等价容器（Docker）
     async fn create_deployment(
         &self,
@@ -268,6 +974,60 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
         Err(ContainerRuntimeError::ConfigurationError(
             "create_deployment not supported by this runtime".to_string(),
+        ))
+    }
+
+    async fn app_env_snapshot(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<shared_types::AppEnvSnapshot> {
+        let spec = self.get_app_container_spec(app_id).await?;
+        Ok(shared_types::AppEnvSnapshot {
+            env: spec.env.unwrap_or_default(),
+            ..Default::default()
+        })
+    }
+
+    async fn update_env_configmap_if_version(
+        &self,
+        app_id: &str,
+        env: &std::collections::HashMap<String, String>,
+        snapshot: &shared_types::AppEnvSnapshot,
+    ) -> ContainerRuntimeResult<()> {
+        if snapshot.resource_version.is_some() {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "conditional env writes unsupported".into(),
+            ));
+        }
+        self.update_env_configmap(app_id, env).await
+    }
+
+    async fn patch_deployment_if_version(
+        &self,
+        params: ContainerCreateParams,
+        expected: shared_types::AppMutationPrecondition,
+    ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        if expected.resource_version.is_some() {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "conditional deployment writes unsupported".into(),
+            ));
+        }
+        self.patch_deployment(params).await
+    }
+
+    /// 仅更新 app env 的 ConfigMap（K8s），**不触碰 Deployment 模板**——热部署成功后
+    /// 把部署三元组收敛进 env（Pod 重建时恢复最新版本），又不触发 config-hash
+    /// 变更导致的 Recreate（保持热部署"不换 Pod"的效果）。
+    ///
+    /// Docker 无 ConfigMap 概念（env 恒为容器创建时注入）：默认 no-op——热部署后
+    /// 容器重启将按 env 种子部署（本地开发已知限制，生产 K8s 不受影响）。
+    async fn update_env_configmap(
+        &self,
+        _app_id: &str,
+        _env: &std::collections::HashMap<String, String>,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "runtime does not support mutable deployment environment".into(),
         ))
     }
 
@@ -282,6 +1042,177 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
         Err(ContainerRuntimeError::ConfigurationError(
             "patch_deployment not supported by this runtime".to_string(),
+        ))
+    }
+
+    /// Capture and validate a mutation target for the already admitted lifecycle.
+    async fn capture_app_mutation_target(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _expected_resource_version: Option<&str>,
+    ) -> ContainerRuntimeResult<shared_types::UserAppMutationTarget> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Identity-bound application stop is not supported by this runtime".into(),
+        ))
+    }
+
+    async fn restart_app_target(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+        _image: Option<&str>,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Identity-bound application restart is unsupported".into(),
+        ))
+    }
+
+    /// Start the captured compute solely for management; preserve wake policy.
+    /// Never substitute ordinary start, which may enable automatic traffic wake.
+    async fn start_app_management_target(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Identity-bound management startup is unsupported by this runtime".into(),
+        ))
+    }
+
+    async fn start_app_target(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Identity-bound application start is unsupported".into(),
+        ))
+    }
+
+    /// Explicit start with an optional platform image. Implementations should
+    /// retain their ordinary start receipt and wake policy while updating the
+    /// image in the same identity-fenced runtime write.
+    async fn start_app_target_with_image(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+        image: Option<&str>,
+    ) -> ContainerRuntimeResult<()> {
+        if image.is_some() {
+            self.restart_app_target(target, image).await
+        } else {
+            self.start_app_target(target).await
+        }
+    }
+
+    /// Stop only this captured target. K8s commits wake policy and scale in one
+    /// conditional write; Docker addresses the immutable physical container ID.
+    async fn stop_app_target(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+        _wake_on_traffic: bool,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Identity-bound application stop is not supported by this runtime".into(),
+        ))
+    }
+
+    /// Capture restart-only startup witnesses without changing storage ownership.
+    async fn prepare_app_compute_start(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<shared_types::UserAppComputeStartTarget> {
+        Ok(shared_types::UserAppComputeStartTarget {
+            target: target.clone(),
+            compute_start_single_write: false,
+            volumes: Vec::new(),
+            restart_image: None,
+        })
+    }
+
+    /// Prepare a stopped image replacement. A returned target is still stopped;
+    /// the coordinator persists its UID before authorizing start. Backends which
+    /// can update images in place return None.
+    async fn replace_stopped_app_image(
+        &self,
+        _prior: &shared_types::UserAppComputeStartTarget,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppMutationTarget>> {
+        Ok(None)
+    }
+
+    /// Refresh only a single-write restart target after proving its original
+    /// write has not committed. None means observe the original result instead.
+    async fn prepare_app_compute_start_retry(
+        &self,
+        _target: &shared_types::UserAppComputeStartTarget,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppComputeStartTarget>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Conditional compute retry is unsupported".into(),
+        ))
+    }
+
+    /// Fence the exact conditional startup write of a superseded compute
+    /// operation. True proves it cannot commit later, not that compute is stopped.
+    async fn fence_app_compute_start(
+        &self,
+        _target: &shared_types::UserAppComputeStartTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    /// Fence the captured single-write scale-down of a superseded Restart.
+    /// The successor must still perform and confirm its own Stop.
+    async fn fence_app_compute_stop(
+        &self,
+        _target: &shared_types::UserAppComputeStartTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    async fn start_app_compute(
+        &self,
+        target: &shared_types::UserAppComputeStartTarget,
+    ) -> ContainerRuntimeResult<()> {
+        self.start_app_target(&target.target).await
+    }
+
+    /// Live absence observation under the caller's drained operation lease.
+    /// False means absence is not proven; errors must never be treated as absence.
+    async fn app_compute_absent(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    /// Reconcile a lost stop response using an atomic runtime receipt, not age
+    /// or readiness alone. Implementations that cannot prove it return false.
+    async fn reconcile_app_compute_stop(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    async fn app_compute_write_acknowledged(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+        _starting: bool,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    /// Verify the exact atomic start receipt after a lost restart response.
+    async fn reconcile_app_compute_start(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    /// Confirm no old compute remains before reusing its workspace volume.
+    async fn confirm_app_compute_stopped(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Compute stop confirmation is unsupported".into(),
         ))
     }
 
@@ -302,8 +1233,23 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     }
 
     /// 修改闲置回收策略（只 patch Deployment `metadata.annotations`，不碰 pod template → 不触发 rollout）。
-    /// 字段 `None` = 不改该键；至少一个 `Some` 由上层校验。K8s/Docker 均已 override；
-    /// 未实现的 runtime 返回 Err（Fail Fast，避免策略被静默丢弃）。生效于下个扫描 tick。
+    /// Project policy onto a captured workload. Docker deliberately leaves policy
+    /// persistence to the coordinator's lifecycle store; K8s updates all supplied
+    /// annotations in one UID/resourceVersion-conditional request.
+    async fn patch_app_policy_target(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+        _policy: &shared_types::UserAppRuntimePolicy,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Captured policy projection is unsupported".into(),
+        ))
+    }
+
+    /// Legacy uncoordinated policy interface; formal controls use captured targets.
+    /// Fields set to None remain unchanged. K8s retains this adapter for internal
+    /// compatibility; Docker rejects it because applied policy belongs to the
+    /// lifecycle store and cannot be persisted by an uncoordinated runtime call.
     async fn patch_recycle_policy(
         &self,
         app_id: &str,
@@ -327,6 +1273,167 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     }
 
     /// 删除 Deployment 及其关联资源（Service/HTTPRoute/ConfigMap/Secret 等）
+    async fn capture_app_deletion(
+        &self,
+        _app_id: &str,
+        _expected_resource_version: Option<&str>,
+    ) -> ContainerRuntimeResult<shared_types::AppDeletionSnapshot> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "identity-bound deletion is not supported by this runtime".into(),
+        ))
+    }
+
+    /// Inspect the original target set after durable deletion revocation. A
+    /// Kubernetes adapter may advance captured resource versions to retire old
+    /// conditional DELETEs; it must never replay storage destruction.
+    async fn inspect_app_deletion(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
+        _snapshot: &shared_types::AppDeletionSnapshot,
+    ) -> ContainerRuntimeResult<shared_types::DeletionInspection> {
+        Ok(shared_types::DeletionInspection::Unknown(
+            "Application deletion inspection is unsupported".into(),
+        ))
+    }
+
+    /// Read-only verification of the retained physical operation lease.
+    /// Absence or an unsupported backend never grants continuation authority.
+    async fn validate_app_operation_receipt(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    /// Observe the retained original identity without granting write authority.
+    /// Validation's false result also includes absence and unsupported backends,
+    /// so it cannot be converted into a same-owner expiry observation.
+    async fn observe_app_operation_lease(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<super::types::AppOperationLeaseObservation> {
+        Ok(super::types::AppOperationLeaseObservation::Unconfirmed)
+    }
+
+    /// Holder-death proof for fenced-operation settlement: `Ok(true)` only
+    /// when the receipt's holder is provably gone (released, expired, or
+    /// superseded by takeover); `Ok(false)` while a holder may still be
+    /// active; transport errors propagate and keep the fence (fail-safe).
+    ///
+    /// 默认实现从 [`Self::validate_app_operation_receipt`] 推导：authority
+    /// 已释放/过期（`Ok(false)`）或身份被取代（`Err(Conflict)`）都证明旧
+    /// 持有者已去。但 `Ok(true)` 的语义各后端不同——Docker 文件租约的
+    /// `Ok(true)` 是「孤儿 marker 的 authority 残留」而非「活跃持有」，
+    /// 极性相反的后端必须覆写本探针，不得由 validate 极性推导。
+    async fn app_operation_receipt_holder_dead(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<bool> {
+        match self.validate_app_operation_receipt(context, receipt).await {
+            Ok(held) => Ok(!held),
+            Err(ContainerRuntimeError::Conflict(_)) => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Release only the captured mutex after the coordinator has reserved a
+    /// confirmed final checkpoint with a database revision claim.
+    async fn release_app_operation_receipt(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Conditional operation release is unsupported".into(),
+        ))
+    }
+
+    async fn acquire_app_operation(
+        &self,
+        _app_id: &str,
+    ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
+        Ok(None)
+    }
+
+    /// Prepare an attempt-specific mutex without an unregistered Docker marker.
+    /// The caller binds its receipt durably before activation or compute writes.
+    async fn prepare_compute_operation(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _scope: shared_types::UserAppOperationScope,
+    ) -> ContainerRuntimeResult<Box<dyn shared_types::PreparedComputeLease>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Prepared compute leases are unsupported".into(),
+        ))
+    }
+
+    /// Inspect only an executor already revoked by an early-stage store CAS.
+    /// No fallback from an observation error to an absent or released lease.
+    async fn inspect_compute_drain_lease(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _scope: shared_types::UserAppOperationScope,
+        _receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
+    ) -> ContainerRuntimeResult<shared_types::ComputeLeaseInspection> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Compute lease inspection is unsupported".into(),
+        ))
+    }
+
+    /// The coordinator has verified this exact previous ordinary owner is
+    /// terminal and has no execution authority. Release only an unchanged,
+    /// expired mutex using the observed UID/token/resourceVersion. This never
+    /// authorizes compute mutations or releases a successor's lease.
+    async fn release_previous_compute_lease(
+        &self,
+        _current: &shared_types::UserAppExecutionContext,
+        _scope: shared_types::UserAppOperationScope,
+        _owner: &shared_types::UserAppExecutionContext,
+        _receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Previous compute lease release is unsupported".into(),
+        ))
+    }
+
+    /// Builder-family runtime mutex for dev-scope operations. Durable receipts
+    /// must carry the UserappBuilder service family. Named distinctly from
+    /// AgentContainerRuntime::acquire_builder_operation so `dyn ContainerRuntime`
+    /// call sites stay unambiguous.
+    async fn acquire_builder_family_operation(
+        &self,
+        _app_id: &str,
+    ) -> ContainerRuntimeResult<Box<dyn shared_types::AppOperationLease>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "builder-family operation lease unsupported".into(),
+        ))
+    }
+
+    /// Sweep migration-stock operation locks: delete those older than
+    /// `older_than` under uid preconditions and return their names for
+    /// logging. Deletion only releases a stale mutex — it never authorizes
+    /// any mutation. Runtimes without a legacy lock mechanism no-op.
+    async fn sweep_legacy_operation_locks(
+        &self,
+        _older_than: std::time::Duration,
+    ) -> ContainerRuntimeResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// Delete only the captured compute identities, never newly discovered resources.
+    async fn delete_app_snapshot(
+        &self,
+        _snapshot: &shared_types::AppDeletionSnapshot,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "identity-bound deletion is not supported by this runtime".into(),
+        ))
+    }
+
     async fn delete_deployment(&self, app_id: &str) -> ContainerRuntimeResult<()> {
         let _ = app_id;
         Err(ContainerRuntimeError::ConfigurationError(
@@ -345,6 +1452,21 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         ))
     }
 
+    /// 结构化应用 Pod 故障观察（部署等待循环的确定性失败信号数据源）。
+    ///
+    /// 按 [`AppDeployTarget`] 核验每个 Pod 的归属身份（完整 owner 链 → 目标
+    /// Deployment UID ∧ pod template 携带目标令牌）；列表观察失败返回 Err
+    /// （与"无 Pod"的 NoPod 严格区分）。默认返回空 vec = 该运行时无观察
+    /// 能力（Docker 模式天然 no-op，等待循环只跳过故障分类）。
+    async fn observe_app_pods(
+        &self,
+        app_id: &str,
+        target: &crate::AppDeployTarget,
+    ) -> ContainerRuntimeResult<Vec<crate::PodObservation>> {
+        let _ = (app_id, target);
+        Ok(Vec::new())
+    }
+
     /// 读 app 当前容器的 `command`/`env` 快照（`update` 部分更新回退用，见
     /// [`ContainerSpecSnapshot`]）。
     ///
@@ -359,7 +1481,7 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         Ok(ContainerSpecSnapshot::default())
     }
 
-    /// 列出当前 runtime 托管的所有 UserApp Deployment（供对账接口）
+    /// 列出当前 runtime 托管的所有 Userapp Deployment（供对账接口）
     async fn list_deployments(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
         Err(ContainerRuntimeError::ConfigurationError(
             "list_deployments not supported by this runtime".to_string(),
@@ -400,7 +1522,7 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         ))
     }
 
-    /// 在 UserApp 容器内执行命令（exec）。
+    /// 在 Userapp 容器内执行命令（exec）。
     ///
     /// 用于数据库管理等场景（reset-password / create-database：在 app 容器内跑 psql，
     /// 利用本地 trust 认证绕过当前密码）。默认不支持（返回 ConfigurationError），
@@ -413,6 +1535,30 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     ) -> ContainerRuntimeResult<ExecResult> {
         Err(ContainerRuntimeError::ConfigurationError(
             "exec not supported by this runtime".to_string(),
+        ))
+    }
+
+    /// Execute against a captured physical container/pod and deployment generation.
+    /// Caller must own the durable operation and retain its runtime lease. Never
+    /// fall back to name-based exec when identity-bound execution is unavailable.
+    async fn capture_app_configuration_target(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _generation: &str,
+    ) -> ContainerRuntimeResult<shared_types::RuntimeConfigurationTarget> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Identity-bound configuration target capture is unsupported by this runtime".into(),
+        ))
+    }
+
+    async fn exec_app_configuration_target(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _target: &shared_types::RuntimeConfigurationTarget,
+        _command: Vec<String>,
+    ) -> ContainerRuntimeResult<ExecResult> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Identity-bound configuration execution is unsupported by this runtime".into(),
         ))
     }
 
@@ -432,6 +1578,20 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         Ok(ResourceUsage::default())
     }
 
+    /// 按[`ServiceType`]维度查询容器资源用量——env 显式化路由用：
+    /// prod 运行容器走 [`Self::get_app_resource_usage`]；开发容器
+    /// （UserappBuilder）经此方法以双键 label selector
+    /// （`app.kubernetes.io/instance` + `rcoder.io/service-type`）定位 Pod。
+    /// 默认返回空（Docker/compose 形态 metrics 本就缺失，语义为降级 0 不报错）。
+    async fn get_app_resource_usage_for(
+        &self,
+        app_id: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<ResourceUsage> {
+        let _ = (app_id, service_type);
+        Ok(ResourceUsage::default())
+    }
+
     /// 校验 app 管理前置条件（启动时 Fail Fast，防静默失败）
     ///
     /// K8s 模式探测 RBAC（list deployments，403 则明确报错指向 ClusterRole 缺权限）；
@@ -446,7 +1606,7 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
 // 聚合 super-trait — ContainerRuntime (A + B + C) / UserAppRuntime (B + C 视图)
 // ============================================================================
 
-/// UserApp 视图: 同时具备 workspace (B) + UserApp Deployment (C) 能力, **不含 agent (A)**.
+/// Userapp 视图: 同时具备 workspace (B) + Userapp Deployment (C) 能力, **不含 agent (A)**.
 ///
 /// 供 app_manager 类型收紧 (file_server_embed 同理用 [`WorkspaceRuntime`] 单独收紧):
 /// 任何调用点声明 `Arc<dyn UserAppRuntime>` 即可在编译期阻止使用 agent 方法 (Group A),
@@ -458,7 +1618,7 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
 pub trait UserAppRuntime: WorkspaceRuntime + UserAppDeploymentRuntime {}
 impl<T> UserAppRuntime for T where T: WorkspaceRuntime + UserAppDeploymentRuntime {}
 
-/// 聚合 super-trait: 同时具备 agent / workspace / UserApp 三类能力。
+/// 聚合 super-trait: 同时具备 agent / workspace / Userapp 三类能力。
 ///
 /// 旧调用点 (`Arc<dyn ContainerRuntime>`) 零改 —— 任何 impl A+B+C 的具体类型
 /// (KubernetesRuntime / DockerRuntime) 自动 impl ContainerRuntime:

@@ -23,6 +23,7 @@ pub fn build_release_lock(
     metadata: ReleaseMetadata<'_>,
 ) -> Result<ReleaseLock, ManifestError> {
     validate_workspace(workspace)?;
+    crate::validate_workspace_startup(workspace, projects)?;
     let dependency_order = validate_topology(projects)?;
     let ports = allocate_ports(projects)?;
     let by_id: BTreeMap<_, _> = projects
@@ -47,11 +48,16 @@ pub fn build_release_lock(
                 kind: manifest.project.kind.clone(),
                 enabled: manifest.project.enabled,
                 port,
+                devbuild: manifest.devbuild.clone(),
                 run: manifest.run.clone(),
+                devrun: manifest.devrun.clone(),
                 health: manifest.health.clone(),
                 proxy: manifest.proxy.clone(),
                 logs: manifest.logs.sources.clone(),
                 env: manifest.env.clone(),
+                // static 服务：托管内容目录（= [build].artifact 目录语义）
+                static_content_dir: (manifest.project.r#type == crate::ProjectType::Static)
+                    .then(|| manifest.build.artifact.clone()),
             })
         })
         .collect::<Result<Vec<_>, ManifestError>>()?;
@@ -66,7 +72,7 @@ pub fn build_release_lock(
             "[health].bridge_service references unknown service_id '{bridge_id}'"
         )));
     }
-    Ok(ReleaseLock {
+    let lock = ReleaseLock {
         schema_version: SCHEMA_VERSION,
         release_id: metadata.release_id.to_owned(),
         workspace_name: workspace.workspace.name.clone(),
@@ -80,7 +86,9 @@ pub fn build_release_lock(
         runtime_image_digest: metadata.runtime_image_digest.to_owned(),
         services,
         bridge_service,
-    })
+    };
+    crate::validate_release_startup(&lock)?;
+    Ok(lock)
 }
 
 fn allocate_ports(projects: &[DiscoveredProject]) -> Result<BTreeMap<String, u16>, ManifestError> {
@@ -169,6 +177,8 @@ fn parse_current(content: &str) -> Result<ReleaseLock, LoadError> {
     if lock.services.is_empty() {
         return Err(LoadError::Invariant("release lock has no services".into()));
     }
+    crate::validate_release_startup(&lock)
+        .map_err(|error| LoadError::Invariant(error.to_string()))?;
     Ok(lock)
 }
 
@@ -199,12 +209,14 @@ mod tests {
                     command: vec!["true".into()],
                     artifact: "artifact.zip".into(),
                 },
+                devbuild: None,
                 run: RunSection {
                     command: vec!["./server".into()],
                     migrate: Vec::new(),
                     depends_on: Vec::new(),
                     shutdown_timeout_seconds: 30,
                 },
+                devrun: None,
                 health: HealthSection::default(),
                 proxy: None,
                 logs: LogsSection::default(),
@@ -233,5 +245,143 @@ mod tests {
                 .values()
                 .all(|port| !RESERVED_RUNTIME_PORTS.contains(port))
         );
+    }
+
+    /// devbuild/devrun 透传进 lock，且 None 服务序列化后 lock 无新键
+    /// （未配置 dev 段的服务，旧版 app-cli 读新链路产出的 lock 完全兼容）。
+    #[test]
+    fn dev_sections_pass_through_and_omit_when_absent() {
+        use crate::{DevbuildSection, DevrunSection};
+        let mut with_dev = discovered("frontend");
+        with_dev.manifest.devbuild = Some(DevbuildSection {
+            command: vec!["pnpm".into(), "run".into(), "type-check".into()],
+        });
+        with_dev.manifest.devrun = Some(DevrunSection {
+            command: vec!["pnpm".into(), "exec".into(), "vite".into()],
+        });
+        let plain = discovered("backend");
+
+        let workspace = WorkspaceManifest {
+            schema_version: 1,
+            workspace: crate::WorkspaceMeta {
+                name: "ws".into(),
+                description: None,
+            },
+            pingap: Default::default(),
+            health: Default::default(),
+        };
+        let lock = build_release_lock(
+            &workspace,
+            &[with_dev, plain],
+            ReleaseMetadata {
+                release_id: "rel",
+                pingap_version: "0",
+                pingap_commit: "0",
+                minimum_app_cli_version: "0",
+                runtime_image_digest: "local-dev",
+            },
+        )
+        .expect("lock");
+
+        let frontend = lock
+            .services
+            .iter()
+            .find(|service| service.service_id == "frontend")
+            .expect("frontend");
+        assert_eq!(
+            frontend.devbuild.as_ref().expect("devbuild").command,
+            vec!["pnpm", "run", "type-check"]
+        );
+        assert_eq!(
+            frontend.devrun.as_ref().expect("devrun").command,
+            vec!["pnpm", "exec", "vite"]
+        );
+        let backend = lock
+            .services
+            .iter()
+            .find(|service| service.service_id == "backend")
+            .expect("backend");
+        assert!(backend.devbuild.is_none() && backend.devrun.is_none());
+
+        // 序列化兼容性：lock 文本中 dev 段键仅在配置处出现；未配置服务不产生
+        // devbuild/devrun 键（serde skip None），旧 app-cli（deny_unknown_fields）
+        // 读该 lock 不报 unknown field。
+        let text = toml::to_string_pretty(&lock).expect("serialize");
+        assert!(text.contains("[services.devbuild]"));
+        assert!(text.contains("[services.devrun]"));
+        assert_eq!(
+            text.matches("devbuild").count(),
+            1,
+            "devbuild key must appear exactly once (frontend only)"
+        );
+        assert_eq!(
+            text.matches("devrun").count(),
+            1,
+            "devrun key must appear exactly once (frontend only)"
+        );
+        // roundtrip：带 dev 段的 lock 可被 load_release_lock 读回（当前版本路径）
+        let reloaded = load_release_lock(&text).expect("reload lock with dev sections");
+        assert!(
+            reloaded
+                .services
+                .iter()
+                .any(|service| service.devrun.is_some())
+        );
+    }
+
+    /// startup_timeout_seconds 序列化前向兼容（d576ee5 补完）：默认值（25）不写入
+    /// lock——已发布旧 app-cli 二进制（deny_unknown_fields，无此字段）可解析；
+    /// 显式非默认值仍写入；读侧 default 补 25。回归背景：8/30 构建的生产镜像
+    /// 读 9/3 后生成的 lock 报 unknown field → app-cli deploy 阶段无限重启。
+    #[test]
+    fn startup_timeout_omitted_at_default_and_written_when_custom() {
+        let mut plain = discovered("backend");
+        let mut slow_boot = discovered("spring");
+        slow_boot.manifest.health.startup_timeout_seconds = 60;
+        plain.manifest.health.startup_timeout_seconds = 25;
+
+        let workspace = WorkspaceManifest {
+            schema_version: 1,
+            workspace: crate::WorkspaceMeta {
+                name: "ws".into(),
+                description: None,
+            },
+            pingap: Default::default(),
+            health: Default::default(),
+        };
+        let lock = build_release_lock(
+            &workspace,
+            &[plain, slow_boot],
+            ReleaseMetadata {
+                release_id: "rel",
+                pingap_version: "0",
+                pingap_commit: "0",
+                minimum_app_cli_version: "0",
+                runtime_image_digest: "local-dev",
+            },
+        )
+        .expect("lock");
+
+        let text = toml::to_string_pretty(&lock).expect("serialize");
+        assert_eq!(
+            text.matches("startup_timeout_seconds").count(),
+            1,
+            "键仅出现一次（显式 60 的服务；默认值服务必须省略）"
+        );
+        assert!(text.contains("startup_timeout_seconds = 60"));
+
+        // 读侧：省略处 default 补 25，显式处保持 60
+        let reloaded = load_release_lock(&text).expect("reload");
+        let get = |id: &str| {
+            reloaded
+                .services
+                .iter()
+                .find(|service| service.service_id == id)
+                .expect(id)
+                .health
+                .startup_timeout_seconds
+        };
+        assert_eq!(get("backend"), 25, "省略键读回默认 25");
+        assert_eq!(get("spring"), 60);
     }
 }

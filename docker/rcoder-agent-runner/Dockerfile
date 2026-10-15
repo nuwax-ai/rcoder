@@ -8,6 +8,7 @@
 
 # 使用本地基础镜像
 ARG BASE_IMAGE=rcoder-agent-base:latest
+
 FROM ${BASE_IMAGE}
 
 # 设置工作目录
@@ -54,15 +55,20 @@ RUN  echo "Cache bust: ${CACHEBUST}" && npm install -g claude-code-acp-ts@latest
 # 安装 codex-acp（Codex ACP 代理）
 RUN echo "Cache bust: ${CACHEBUST}" && npm install -g @zed-industries/codex-acp
 
+# 安装 template-cli（userApp workspace 模板脚手架；生产 build_config 同源）
+RUN echo "Cache bust: ${CACHEBUST}" && npm i -g @nuwax-ai/template-cli@latest --registry https://registry.npmjs.org
+
 # 根据codex-acp改造的codex cli,使用cli是: nuwax-codex-acp
-RUN  echo "Cache bust: ${CACHEBUST}" &&  npm install -g nuwax-codex-acp@latest
+# 使用官方 npm 源，国内镜像可能未同步
+RUN  echo "Cache bust: ${CACHEBUST}" &&  npm install -g nuwax-codex-acp@latest --registry=https://registry.npmjs.org/
 
 # 安装 nuwaxcode（频繁更新的工具，放在最终镜像以加快构建）
 # 使用 CACHEBUST 变量触发缓存失效
 # 安装失败时主动退出，避免构建包含不完整的镜像
+# 使用官方 npm 源，国内镜像可能未同步平台二进制包（nuwaxcode-linux-arm64 等）
 RUN echo "Cache bust: ${CACHEBUST}" && \
     echo "📦 开始安装 nuwaxcode..." && \
-    npm i -g nuwaxcode@latest && \
+    npm i -g nuwaxcode@latest --registry=https://registry.npmjs.org/ && \
     echo "✅ nuwaxcode 安装完成，开始验证..." && \
     which nuwaxcode && \
     echo "✅ nuwaxcode 验证成功: $(nuwaxcode -v)" || \
@@ -85,7 +91,7 @@ RUN mkdir -p /root/.config/opencode && \
 
 # ============================================================================
 # 🔧 eBPF 诊断工具安装
-# 注意：这些工具会增加镜像大小 (~500MB)
+# 注意：这些工具会增加镜像大小
 # 通过 make dev-restart 默认启用
 # ============================================================================
 ARG INSTALL_EBPF_TOOLS=false
@@ -108,58 +114,41 @@ RUN if [ "$INSTALL_EBPF_TOOLS" = "true" ]; then \
     echo "⚠️  eBPF 工具未安装（生产模式）"; \
     fi
 
-# 安装 FlameGraph 工具
-RUN if [ "$INSTALL_EBPF_TOOLS" = "true" ]; then \
-    if [ "${USE_GITHUB_MIRROR}" = "true" ]; then \
-    git clone ${GITHUB_MIRROR_URL}brendangregg/FlameGraph /tmp/FlameGraph; \
-    else \
-    git clone https://github.com/brendangregg/FlameGraph /tmp/FlameGraph; \
-    fi && \
-    cp /tmp/FlameGraph/*.pl /usr/local/bin/ \
-    && rm -rf /tmp/FlameGraph \
-    && echo "✅ FlameGraph 工具已安装"; \
-    fi
-
-# ============================================================================
-# 📊 Grafana Alloy - 持续性能数据采集
-# ============================================================================
-ARG INSTALL_ALLOY=false
-ARG ALLOY_VERSION=v1.12.2
-RUN if [ "$INSTALL_ALLOY" = "true" ]; then \
-    echo "📦 安装 Grafana Alloy ${ALLOY_VERSION}..."; \
-    apt-get update && \
-    apt-get install -y wget ca-certificates && \
-    echo "检测系统架构..."; \
-    ARCH=$(dpkg --print-architecture); \
-    echo "系统架构: ${ARCH}"; \
-    ALLOY_VER=${ALLOY_VERSION}; \
-    ALLOY_VER_NUM=${ALLOY_VER#v}; \
-    echo "下载 Alloy deb 包 (${ARCH})..."; \
-    wget -qO- "https://github.com/grafana/alloy/releases/download/${ALLOY_VER}/alloy-${ALLOY_VER_NUM}-1.${ARCH}.deb" > /tmp/alloy.deb && \
-    echo "下载完成，文件大小: $(ls -lh /tmp/alloy.deb | awk '{print $5}')"; \
-    echo "安装 Alloy..."; \
-    dpkg -i /tmp/alloy.deb && \
-    apt-get install -y -f && \
-    rm /tmp/alloy.deb && \
-    echo "验证 Alloy 安装..."; \
-    alloy --version; \
-    else \
-    echo "⚠️  Alloy 未安装"; \
-    fi
-
-# ============================================================================
-# 🔍 bpfcc-tools - Off-CPU 阻塞分析工具
-# ============================================================================
-RUN if [ "$INSTALL_EBPF_TOOLS" = "true" ]; then \
-    echo "📦 安装 bpfcc-tools (包含 offcputime)..."; \
-    apt-get update && \
-    apt-get install -y bpfcc-tools && \
-    rm -rf /var/lib/apt/lists/* && \
-    which offcputime-bpfcc && offcputime-bpfcc --help | head -3 || echo "⚠️  offcputime-bpfcc 安装失败"; \
-    fi
-
 # 复制预构建的 agent_runner 二进制文件
 COPY bin/agent_runner /usr/local/bin/agent_runner
+# app-cli（dev/start manifest 引擎前置；与生产 L324-329 同源——从 Dockerfile.build
+# 的 crates/app-cli/target 复制，bin/ 目录由 make 步骤同步）
+COPY bin/app-cli /usr/local/bin/app-cli
+
+# 安装 pingap（app-cli 编排的反向代理；dev/start 的 manifest 引擎必需——缺失时
+# start_pingap fail-fast 整组退出。与生产 build_config Dockerfile L386-405 同源：
+# tarball 从 build_config downloads/ 同版本分发；版本单一来源 = app-cli
+# devtool.rs DEFAULT_PINGAP_VERSION/COMMIT（make/docker.mk 注入，两处同步改）。
+ARG PINGAP_VERSION
+ARG PINGAP_COMMIT
+ENV RCODER_PINGAP_VERSION=${PINGAP_VERSION} \
+    RCODER_PINGAP_COMMIT=${PINGAP_COMMIT}
+COPY downloads/pingap-v*-linux-gnu-*-full.tar.gz /tmp/pingap/
+COPY pingap-official/ /usr/local/share/rcoder/
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+        amd64) PINGAP_ARCH=x86 ;; \
+        arm64) PINGAP_ARCH=aarch64 ;; \
+        *) echo "Unsupported arch: $(dpkg --print-architecture)" && exit 1 ;; \
+    esac && \
+    TARBALL="/tmp/pingap/pingap-v${PINGAP_VERSION}-linux-gnu-${PINGAP_ARCH}-full.tar.gz" && \
+    python3 /usr/local/share/rcoder/pingap_official.py --version "${PINGAP_VERSION}" --commit "${PINGAP_COMMIT}" install \
+        --archive "$TARBALL" --arch ${TARGETARCH} --output /usr/local/bin/pingap && \
+    rm -rf /tmp/pingap
+
+# 安装 dbx-web（DBX 数据库 Web GUI，supervisor conf.d/dbx.conf 托管 :4224；
+# 对齐生产 L358-365——二进制从 build_config downloads/ 分发，本地直接 COPY）
+ARG TARGETARCH
+COPY downloads/dbx-web-${TARGETARCH} /usr/local/bin/dbx-web
+COPY downloads/dbx-static/ /usr/local/share/dbx/static
+RUN chmod +x /usr/local/bin/dbx-web
+# supervisor conf.d/dbx.conf（:4224 恒起；与生产 supervisor/conf.d 同源）
+COPY supervisor/conf.d/dbx.conf /etc/supervisor/conf.d/dbx.conf
 RUN chmod +x /usr/local/bin/agent_runner
 
 # 复制启动脚本
@@ -190,56 +179,22 @@ RUN chmod +x /usr/local/bin/ime_server.py
 # ============================================================================
 # 🖥️ ttyd Web 终端配置
 # ============================================================================
+# 默认 root 权限；终端工作目录仍由项目 --cwd 指定
+ENV TTYD_USER=root
 # 复制 ttyd 启动脚本和自定义前端页面
 COPY ttyd/start-ttyd.sh /usr/local/bin/start-ttyd.sh
 
-# 复制 PostgreSQL supervisor 入口脚本（幂等 initdb + exec postgres，异步于 agent_runner）
+# 复制 PostgreSQL supervisor 入口脚本（幂等 initdb + owned postgres/bootstrap，异步于 agent_runner）
+COPY pg-admin-identity.sh /usr/local/bin/pg-admin-identity.sh
+COPY pg-supervise.py /usr/local/bin/pg-supervise.py
 COPY pg-supervisor-entry.sh /usr/local/bin/pg-supervisor-entry.sh
 RUN chmod +x /usr/local/bin/pg-supervisor-entry.sh
 
-# 复制 supervisor 配置（管 ttyd/PG/pgweb，autorestart 自动拉起；见 start-up.sh 的 supervisord 启动）
+# 复制 supervisor 配置（管 ttyd/PG/dbx，autorestart 自动拉起；见 start-up.sh 的 supervisord 启动）
 COPY supervisor/supervisord.conf /etc/supervisor/supervisord.conf
 COPY supervisor/conf.d/ /etc/supervisor/conf.d/
 COPY ttyd/ttyd-index.html /usr/local/share/ttyd/index.html
 RUN chmod +x /usr/local/bin/start-ttyd.sh
-
-# ============================================================================
-# 🔧 eBPF 工具目录
-# ============================================================================
-# 复制整个 eBPF 工具目录到容器中
-COPY ebpf-tools /usr/local/bin/ebpf-tools
-RUN chmod +x /usr/local/bin/ebpf-tools/*.sh && \
-    ls -la /usr/local/bin/ebpf-tools/ && \
-    echo "✅ eBPF 工具目录已创建: /usr/local/bin/ebpf-tools/"
-
-# 创建便捷的快捷命令（包装脚本）
-RUN echo '#!/bin/bash\n/usr/local/bin/ebpf-tools/diag-tool.sh offcpu "$@"' > /usr/local/bin/e-offcpu && \
-    echo '#!/bin/bash\n/usr/local/bin/ebpf-tools/diag-tool.sh flame "$@"' > /usr/local/bin/e-flame && \
-    echo '#!/bin/bash\n/usr/local/bin/ebpf-tools/diag-tool.sh profile "$@"' > /usr/local/bin/e-profile && \
-    echo '#!/bin/bash\n/usr/local/bin/ebpf-tools/diag-tool.sh all "$@"' > /usr/local/bin/e-all && \
-    echo '#!/bin/bash\n/usr/local/bin/ebpf-tools/auto-flamegraph.sh start' > /usr/local/bin/e-auto-flame && \
-    echo '#!/bin/bash\n/usr/local/bin/ebpf-tools/offcpu-monitor.sh start' > /usr/local/bin/e-offcpu-monitor && \
-    echo '#!/bin/bash\n/usr/local/bin/ebpf-tools/syscall-monitor.sh start' > /usr/local/bin/e-syscall-monitor && \
-    chmod +x /usr/local/bin/e-offcpu /usr/local/bin/e-flame /usr/local/bin/e-profile /usr/local/bin/e-all /usr/local/bin/e-auto-flame /usr/local/bin/e-offcpu-monitor /usr/local/bin/e-syscall-monitor && \
-    echo "✅ eBPF 诊断快捷命令已创建:" && \
-    echo "   - e-offcpu, e-flame, e-profile, e-all (手动 CPU 诊断)" && \
-    echo "   - e-auto-flame (自动火焰图生成)" && \
-    echo "   - e-offcpu-monitor (Off-CPU 阻塞监控)" && \
-    echo "   - e-syscall-monitor (系统调用监控)"
-
-# ============================================================================
-# 📊 Grafana Alloy 配置文件
-# ============================================================================
-# 复制 Alloy 配置文件到容器（从 ebpf-tools 目录统一管理）
-COPY ebpf-tools/alloy-config.alloy /etc/alloy/config.alloy
-
-# 验证 Alloy 配置文件语法
-RUN if command -v alloy >/dev/null 2>&1; then \
-    echo "验证 Alloy 配置文件..." && \
-    alloy validate /etc/alloy/config.alloy || echo "⚠️  Alloy 配置验证失败"; \
-    else \
-    echo "⚠️  Alloy 未安装，跳过配置验证"; \
-    fi
 
 # ============================================================================
 # 🔧 暴露端口

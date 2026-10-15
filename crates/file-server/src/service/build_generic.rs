@@ -25,8 +25,12 @@ pub struct GenericBuildRequest<'a> {
     pub log_dir: &'a Path,
     /// 单命令超时秒数。
     pub timeout_secs: u64,
-    /// spawn 后回调 child pid（供外部 cancel kill 进程组）；None 则不回调。
+    /// Spawn PID callback for diagnostics; cancellation uses the scoped owner token.
     pub on_pid: Option<&'a (dyn Fn(u32) + Send + Sync)>,
+    /// 每行输出回调（原始行，时间戳前缀之前；供上层实时推送 SSE `log` 事件）；
+    /// None 则不回调。与文件写入同源（vite 噪音行同样被过滤）。
+    /// Arc 所有权式（区别于 on_pid 的借用式）：回调需跨入日志管道的 spawn task（'static）。
+    pub on_line: Option<crate::service::dev_server::process::OnLineCallback>,
 }
 
 /// 通用 build：在给定工作目录执行 `argv`，产 `artifact_rel`。
@@ -37,15 +41,15 @@ pub struct GenericBuildRequest<'a> {
 /// 整个构建周期,避免子项目间隙释放锁导致同 app_id 构建穿插、首个构建中途 409 失败,#13),
 /// 也可作任意单项目构建(调用方自己 `try_start` 取一个 guard 传入)。
 ///
-/// `guard` 以引用传入:仅用于在类型层面证明调用方已持有并发 guard(其借用在本次调用期间
-/// 有效,阻止 guard 被提前释放),函数体内不直接使用。
+/// `guard` 以引用传入并进入命令执行作用域。子进程清理暂未确认时，清理任务会
+/// 保留同一租约，直到原进程树退出，避免新构建和遗留进程同时写工作区。
 ///
 /// # 工具链盲区
 /// agent-runner 镜像当前缺 **Go** 和 **Gradle**（`Dockerfile.base` 未装）。这两类项目
 /// 需先在镜像补装，或在 `cmd` 里自行 `curl` 拉取 —— 否则 build 会失败。
 pub async fn build_generic(
     req: &GenericBuildRequest<'_>,
-    _guard: &BuildGuard<'_>,
+    guard: &BuildGuard,
 ) -> AppResult<PathBuf> {
     let (program, args) = req
         .argv
@@ -59,20 +63,25 @@ pub async fn build_generic(
     let temp_log = req.log_dir.join(temp_log_name(now));
 
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_command_to_log(
-        program,
-        &args,
-        req.cwd,
-        &main_log,
-        &temp_log,
-        req.timeout_secs,
-        req.on_pid,
-    )
-    .await?;
+    guard
+        .scope(run_command_to_log(
+            program,
+            &args,
+            req.cwd,
+            &main_log,
+            &temp_log,
+            req.timeout_secs,
+            crate::service::dev_server::process::CommandObservers {
+                on_pid: req.on_pid,
+                on_line: req.on_line.clone(),
+                ..Default::default()
+            },
+        ))
+        .await?;
 
     // 校验产物
     let artifact = req.cwd.join(req.artifact_rel);
-    if !artifact.exists() {
+    if !tokio::fs::try_exists(&artifact).await.unwrap_or(false) {
         return Err(AppError::business(format!(
             "build produced no artifact: {} (cwd={})",
             req.artifact_rel,

@@ -19,6 +19,9 @@ LIBREOFFICE_ARM_URL := https://mirror.csclub.uwaterloo.ca/tdf/libreoffice/stable
 LIBREOFFICE_ARM_FALLBACK := https://download.documentfoundation.org/libreoffice/stable/$(LIBREOFFICE_VERSION)/deb/aarch64/LibreOffice_$(LIBREOFFICE_VERSION)_Linux_aarch64_deb.tar.gz
 LIBREOFFICE_ARM_PATH := $(LIBREOFFICE_DOWNLOAD_DIR)/$(LIBREOFFICE_ARM_FILE)
 
+# Buildx 远程 builder（留空=本地 docker build；CI/远程构建时设为 nuwax-clusters 等）
+BUILDX_BUILDER ?=
+
 # docker-build-agent-base 构建时使用的架构（检测宿主 Docker 架构）
 # OrbStack on Apple Silicon = linux/arm64, 普通 Linux = linux/amd64
 # 注意：docker version --format '{{.Server.Arch}}' 在 OrbStack 上返回 "arm64"，不是 "aarch64"
@@ -122,11 +125,22 @@ docker-build-agent-base: docker-pre-download-libreoffice
 	@echo "⏳ 这可能需要较长时间（包含所有系统依赖安装）..."
 	@# CACHEBUST_NOVNC: 传入时间戳强制每次重新克隆 noVNC
 	@# 使用 --platform 确保 TARGETARCH 正确传递给 Dockerfile.base
-	@cd docker/rcoder-agent-runner && \
-		docker buildx build --platform linux/$(LIBREOFFICE_ARCH) --load \
-		--build-arg LIBREOFFICE_FILE=$(LIBREOFFICE_FILE) \
-		--build-arg CACHEBUST_NOVNC=$$(date +%s) \
-		-f Dockerfile.base -t dev-rcoder-agent-base:latest .
+	cd docker/rcoder-agent-runner && \
+		if [ -n "$(BUILDX_BUILDER)" ]; then \
+			docker buildx build --builder $(BUILDX_BUILDER) --platform linux/$(LIBREOFFICE_ARCH) --load \
+			--build-arg LIBREOFFICE_FILE=$(LIBREOFFICE_FILE) \
+			--build-arg CACHEBUST_NOVNC=$$(date +%s) \
+			--build-arg APT_MIRROR_HOST=$(APT_MIRROR_HOST) \
+			--build-arg PYPI_INDEX_URL=$(PYPI_INDEX_URL) \
+			-f Dockerfile.base -t dev-rcoder-agent-base:latest . ; \
+		else \
+			docker build \
+			--build-arg LIBREOFFICE_FILE=$(LIBREOFFICE_FILE) \
+			--build-arg CACHEBUST_NOVNC=$$(date +%s) \
+			--build-arg APT_MIRROR_HOST=$(APT_MIRROR_HOST) \
+			--build-arg PYPI_INDEX_URL=$(PYPI_INDEX_URL) \
+			-f Dockerfile.base -t dev-rcoder-agent-base:latest . ; \
+		fi
 	@echo "✅ rcoder-agent-base 基础镜像构建完成！"
 	@if [ "$(PUSH_IMAGE)" = "true" ]; then \
 		$(MAKE) docker-push-agent-base; \
@@ -134,3 +148,6 @@ docker-build-agent-base: docker-pre-download-libreoffice
 		echo "⏭️  跳过基础镜像推送（PUSH_IMAGE != true）。如需推送：make ... PUSH_IMAGE=true"; \
 	fi
 	@echo "💡 提示: 平时开发只需运行 make dev-restart，无需重新构建基础镜像"
+
+# （dbx-web 的准备已迁移至 make/dbx.mk：本仓直接构建 nuwax-ai/dbx fork，
+# 不再从生产仓 build_config 复制；docker-build-agent-runner 已接线为前置。）

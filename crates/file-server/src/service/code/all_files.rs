@@ -14,7 +14,7 @@ use crate::path_safety::safe_within_or_skip;
 use crate::service::version;
 use crate::workspace::{ProjectContext, WorkspaceResolver};
 
-use super::types::FileEntry;
+use crate::models::FileEntry;
 
 pub struct AllResult {
     pub project_id: String,

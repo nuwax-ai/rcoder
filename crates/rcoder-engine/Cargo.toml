@@ -1,0 +1,169 @@
+[package]
+name = "rcoder-engine"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[package.metadata.dist]
+dist = false
+
+[lib]
+name = "rcoder_engine"
+path = "src/lib.rs"
+
+[features]
+default = ["userapp-turso"]
+
+# Hotpath 本地性能剖析（hotpath-rs；仅本地开发，不进 default）。
+# feature 关闭时 hotpath 宏全部 no-op、零依赖编译，代码里宏裸用不配 cfg。
+# axum-0-8 供 userapp_forward 路由装配处 hotpath::axum!（关闭时原样返回 router）；
+# tokio 供 hotpath::tokio_runtime!() runtime 指标线程。
+hotpath = ["hotpath/hotpath", "hotpath/threads", "hotpath/tokio", "hotpath/axum-0-8"]
+# 叠加 MCP server（127.0.0.1:6771，AI 实时查询性能数据；见 AGENTS.md）
+hotpath-mcp = ["hotpath", "hotpath/hotpath-mcp"]
+
+# dial9 事件级 Tokio tracing（本地开发专用；编译须配 RUSTFLAGS="--cfg tokio_unstable"
+# 才有全量 task 覆盖——见 make/dev.mk dial9-on 与 docker/dev-hot-build.sh）。
+# 运行期 DIAL9_ENABLED 开关（默认关=纯 passthrough runtime，零开销）。
+# rcoder-obs/dial9：业务 spawn 点经门面插桩（feature 关=直通 Tokio）。
+dial9 = ["dep:dial9", "rcoder-obs/dial9"]
+
+# Kubernetes 支持：启用 Kubernetes 运行时模式
+# 启用后可通过 CONTAINER_RUNTIME=kubernetes 环境变量切换到 K8s 模式
+userapp-turso = ["rcoder-storage/userapp-turso"]
+
+kubernetes = ["rcoder-storage/pg", "docker_manager/kubernetes", "shared_types/kubernetes", "app_manager/kubernetes", "file-server/kubernetes", "kube", "k8s-openapi"]
+
+# Agent 项目/会话 PostgreSQL 后端；运行期由 [storage].backend 选择。
+# userApp 后端独立配置，不因 Agent 仍使用 memory 而回退到内存。
+rcoder-pg = ["kubernetes", "rcoder-storage/pg"]
+
+# deploy-host 宿主机运行形态：引擎层主开关（启动门/路径映射/端口发布）
+deploy-host = ["shared_types/deploy-host", "docker_manager/deploy-host", "rcoder-storage/deploy-host", "rcoder-proxy/deploy-host", "app_manager/deploy-host"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+filetime = { workspace = true }
+http-body-util = { workspace = true }
+toasty = { workspace = true }
+toasty-driver-turso = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+sha2 = { workspace = true }
+hex = { workspace = true }
+# Internal crates
+shared_types = { workspace = true }
+rcoder-storage = { workspace = true }
+rcoder-proxy = { workspace = true }
+container-runtime-api = { workspace = true }
+download_utils = { workspace = true }
+agent_provisioning = { workspace = true }
+file-server = { workspace = true }
+file-server-userapp = { workspace = true }
+file-server-proxy = { workspace = true }
+preview-coordinator = { workspace = true }
+app_manager = { path = "../app_manager" }
+
+# 🚀 无锁配置热更新
+arc-swap = { workspace = true }
+docker_manager = { workspace = true }
+rcoder-telemetry = { workspace = true }
+# dial9 spawner 门面（常依赖：feature 关闭时直通 Tokio；dial9 插桩经本 crate 的
+# dial9 feature 转发 rcoder-obs/dial9）
+rcoder-obs = { workspace = true }
+dial9 = { workspace = true, optional = true }
+
+clap = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+lockmap = { workspace = true }
+tempfile = { workspace = true }
+
+# 本地性能剖析（hotpath-rs）：非 optional + 零特性 = 零编译开销；上方 hotpath* feature 开内部特性
+hotpath = { workspace = true, features = ["tokio"] }
+
+# HTTP server
+axum = { workspace = true, features = ["multipart", "ws"] }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["cors", "trace", "set-header", "limit"] }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+futures = { workspace = true }
+tokio-stream = { workspace = true }
+async-stream = { workspace = true }
+
+# gRPC Client
+tonic = { workspace = true }
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+serde_urlencoded = { workspace = true }
+
+# Validation
+garde = { workspace = true }
+regex = { workspace = true }
+
+# Parsing
+winnow = { workspace = true }
+
+derive_builder = { workspace = true }
+
+# Workspace dependencies
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = [
+    "fmt",
+    "env-filter",
+    "json",
+] }
+tracing-appender = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+chrono = { workspace = true, features = ["serde"] }
+dashmap = { workspace = true }
+notify = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+piper = { workspace = true }
+base64 = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+bollard = { workspace = true }
+rustls = { workspace = true }
+
+# OpenTelemetry
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+axum-tracing-opentelemetry = { workspace = true }
+
+# File system
+path-clean = { workspace = true }
+
+# OpenAPI documentation
+utoipa = { workspace = true }
+utoipa-swagger-ui = { workspace = true }
+utoipa-scalar = { workspace = true }
+
+ringbuf = { workspace = true }
+
+# Random and hashing
+rand = { workspace = true }
+md5 = { workspace = true }
+
+# Cache
+moka = { workspace = true }
+
+# Kubernetes (optional)
+kube = { workspace = true, optional = true }
+k8s-openapi = { workspace = true, optional = true }

@@ -1,0 +1,140 @@
+//! 启动引导：Rustls 初始化、CLI 解析、配置加载、遥测初始化
+
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
+use clap::Parser;
+use rcoder_telemetry::{FileLogConfig, TelemetryConfig, TelemetryGuard};
+use tracing::info;
+
+use crate::config::{CliArgs, load_config_for_cli, load_config_with_args};
+
+pub struct BootstrapResult {
+    pub config: crate::config::AppConfig,
+    pub api_key_config: Arc<ArcSwap<shared_types::ApiKeyAuthConfig>>,
+    pub telemetry: Arc<TelemetryGuard>,
+    pub config_file_path: std::path::PathBuf,
+}
+
+pub async fn bootstrap() -> anyhow::Result<BootstrapResult> {
+    // 此处不用 expect/panic：此刻 telemetry 尚未初始化，panic 只会留下裸
+    // stderr 输出、断掉 tracing 日志链；以错误返回向上传播，由 main 的统一
+    // 错误出口记录。install_default 仅在已有其他 provider 抢先安装时失败
+    //（错误值即已安装的 provider，无 Display/name 字段可格式化，不外带）。
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "install rustls crypto provider: a crypto provider is already installed"
+            )
+        })?;
+
+    let mut cli_args = CliArgs::parse();
+
+    // 管理子命令模式 (rcoder file-server stop 等): 不启动服务, 不初始化 telemetry,
+    // 仅加载同源配置 (端口 + api key) 后 HTTP 调运行中的 rcoder 进程, 完成即退出。
+    if let Some(command) = cli_args.command.take() {
+        let cli_port = cli_args.port;
+        let config = load_config_for_cli(cli_args)?;
+        let action = match command {
+            crate::config::AdminCommand::FileServer { action } => match action {
+                crate::config::FileServerAction::Start => "start",
+                crate::config::FileServerAction::Stop => "stop",
+                crate::config::FileServerAction::Restart => "restart",
+                crate::config::FileServerAction::Status => "status",
+            },
+        };
+        let port = cli_port.unwrap_or(config.port);
+        let api_key = if config.api_key_auth.enabled {
+            Some(config.api_key_auth.api_key.clone())
+        } else {
+            None
+        };
+        crate::file_server_admin::run_cli_command(action, port, api_key.as_deref()).await?;
+        std::process::exit(0);
+    }
+
+    let config = load_config_with_args(cli_args)?;
+
+    let api_key_config = Arc::new(ArcSwap::from_pointee(config.api_key_auth.clone()));
+
+    let file_log_config = FileLogConfig::new("logs", "rcoder")
+        .with_max_files(config.cleanup_config.log_cleanup.log_retention_days as usize);
+
+    let mut telemetry_config =
+        TelemetryConfig::from_env("rcoder").with_file_log_config(file_log_config);
+
+    // file-server 路由常驻主服务 → 独立日志 layer 无条件注入（target=file_server
+    // 的请求日志/业务日志落 file-server 独立文件，不混入 rcoder.log）
+    match file_server::Config::load() {
+        Ok(fs_config) => match file_server::logging::build_file_layer(&fs_config) {
+            Ok((layer, guard)) => {
+                // tracing 尚未 init（下方才 init），用 eprintln 保证可见（与 main.rs 一致）
+                eprintln!(
+                    "[BOOTSTRAP] file-server independent log layer injected: dir={}",
+                    fs_config.service_log_dir.display()
+                );
+                telemetry_config = telemetry_config.with_extra_layer(layer, guard);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[BOOTSTRAP] failed to build file-server log layer (falling back to rcoder.log): {e}"
+                );
+            }
+        },
+        Err(e) => {
+            eprintln!(
+                "[BOOTSTRAP] failed to load file-server config (file-server logs will mix into rcoder.log): {e}"
+            );
+        }
+    }
+
+    // span 耗时→直方图指标规则：调用点只写 #[instrument]，耗时指标由
+    // SpanMetricsLayer 自动记录（span 即计时事实源，零 Instant 侵入）
+    let telemetry_config = telemetry_config.with_span_metric_rules(vec![
+        rcoder_telemetry::SpanMetricRule {
+            span_name: "forward_chat",
+            metric: rcoder_telemetry::prometheus::GRPC_REQUEST_DURATION_SECONDS,
+            label: ("method", "chat"),
+        },
+        rcoder_telemetry::SpanMetricRule {
+            span_name: "grpc_dial",
+            metric: rcoder_telemetry::prometheus::GRPC_REQUEST_DURATION_SECONDS,
+            label: ("method", "dial"),
+        },
+        rcoder_telemetry::SpanMetricRule {
+            span_name: "ensure_container_ready",
+            metric: rcoder_telemetry::prometheus::CONTAINER_ENSURE_DURATION_SECONDS,
+            label: ("op", "ensure"),
+        },
+        rcoder_telemetry::SpanMetricRule {
+            span_name: "sse_subscribe",
+            metric: rcoder_telemetry::prometheus::SSE_SUBSCRIPTION_DURATION_SECONDS,
+            label: ("kind", "client"),
+        },
+    ]);
+
+    let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
+    let telemetry = Arc::new(telemetry);
+
+    info!("Starting rcoder - AI-powered development platform");
+    info!(" rcoder version: {}", env!("CARGO_PKG_VERSION"));
+    info!(
+        " Log config: keeping log files for {} days",
+        config.cleanup_config.log_cleanup.log_retention_days
+    );
+
+    tokio::fs::create_dir_all(&config.projects_dir)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create projects directory: {}", e))?;
+    info!("Projects directory: {:?}", config.projects_dir);
+
+    let config_file_path = crate::config::config_file_path();
+
+    Ok(BootstrapResult {
+        config,
+        api_key_config,
+        telemetry,
+        config_file_path,
+    })
+}

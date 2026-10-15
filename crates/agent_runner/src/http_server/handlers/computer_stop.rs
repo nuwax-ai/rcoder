@@ -70,11 +70,20 @@ pub async fn handle_computer_stop(
         request.user_id, project_id
     );
 
-    // 清理该 project 的所有 pending permissions
-    PERMISSION_MANAGER.cancel_project_permissions(project_id);
-
+    let _transition = agent_abstraction::session::lock_execution_transition(project_id).await;
     let (success, message) = if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(project_id) {
         let session_id = agent_info.session_id.to_string();
+        if request
+            .session_id
+            .as_deref()
+            .filter(|sid| !sid.is_empty())
+            .is_some_and(|sid| sid != session_id)
+        {
+            return Err(shared_types::AppError::with_message(
+                ERR_VALIDATION,
+                "session_id belongs to a different execution",
+            ));
+        }
         let cancel_tx = agent_info.cancel_tx.clone();
         drop(agent_info);
 
@@ -142,7 +151,14 @@ pub async fn handle_computer_stop(
 
         // 从 AGENT_REGISTRY 移除并优雅停止子进程（对齐 gRPC 路径：
         // remove_agent_and_cleanup 内部 remove_by_project + 后台 graceful_stop SIGTERM+wait）
-        remove_agent_and_cleanup(project_id);
+        remove_agent_and_cleanup(project_id, &session_id)
+            .await
+            .map_err(|error| {
+                shared_types::AppError::with_message(
+                    shared_types::error_codes::ERR_AGENT_ERROR,
+                    error.to_string(),
+                )
+            })?;
         info!("[HTTP] Agent stopped: project_id={}", project_id);
         (true, get_error_message(SUCCESS, locale))
     } else {

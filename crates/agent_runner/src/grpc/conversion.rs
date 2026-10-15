@@ -105,8 +105,19 @@ pub fn convert_agent_server_config(
                 grpc_config
                     .platforms
                     .into_iter()
-                    .filter_map(|(k, bytes)| serde_json::from_slice(&bytes).ok().map(|v| (k, v)))
-                    .collect(),
+                    .map(|(key, bytes)| {
+                        serde_json::from_slice(&bytes)
+                            .map(|value| (key.clone(), value))
+                            .map_err(|error| {
+                                // serde's Display can include the rejected value;
+                                // downloaded platform configuration may contain tokens.
+                                Status::invalid_argument(format!(
+                                    "Invalid platforms entry {key}: {:?} JSON error at line {} column {}",
+                                    error.classify(), error.line(), error.column()
+                                ))
+                            })
+                    })
+                    .collect::<Result<_, _>>()?,
             )
         },
     })
@@ -325,4 +336,34 @@ pub fn convert_attachments(
     }
 
     converted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_platform_rejects_the_whole_config_without_logging_values() {
+        let mut config = GrpcChatAgentServerConfig::default();
+        config.platforms.insert(
+            "linux".into(),
+            br#"{"url":"https://example.test/agent"}"#.to_vec(),
+        );
+        let accepted = convert_agent_server_config(config.clone()).unwrap();
+        assert_eq!(
+            accepted.platforms.unwrap()["linux"].url,
+            "https://example.test/agent"
+        );
+        for bad in [
+            br#"{"url":false}"#.as_slice(),
+            br#"{"url":"secret", "size":"private-secret"}"#,
+            b"{",
+        ] {
+            config.platforms.insert("macos".into(), bad.to_vec());
+            let error = convert_agent_server_config(config.clone()).unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(error.message().contains("macos"));
+            assert!(!error.message().contains("secret"));
+        }
+    }
 }

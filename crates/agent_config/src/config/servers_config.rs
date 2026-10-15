@@ -76,7 +76,7 @@ impl AgentServersConfig {
     /// 用于加载用户自定义的配置文件，覆盖默认配置。
     pub async fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        if !path.exists() {
+        if !tokio::fs::try_exists(path).await.unwrap_or(false) {
             return Err(ConfigError::file_not_found(path.display()).into());
         }
 

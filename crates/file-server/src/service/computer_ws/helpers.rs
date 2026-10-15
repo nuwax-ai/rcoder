@@ -48,9 +48,9 @@ pub async fn remove_top_level_dir(dir: &Path, extra_excludes: &[&str]) -> AppRes
 
 /// 跨设备 rename 的 errno：unix EXDEV(18)，Windows ERROR_NOT_SAME_DEVICE(17)。
 #[cfg(unix)]
-const CROSS_DEVICE_ERRNO: i32 = nix::libc::EXDEV;
+pub(super) const CROSS_DEVICE_ERRNO: i32 = nix::libc::EXDEV;
 #[cfg(not(unix))]
-const CROSS_DEVICE_ERRNO: i32 = 17;
+pub(super) const CROSS_DEVICE_ERRNO: i32 = 17;
 
 /// 移动目录 (rename; 跨设备 fallback copy + rm, 对齐 nuwax moveDirectory EXDEV 降级)。
 pub(super) async fn move_dir(src: &Path, dst: &Path) -> AppResult<()> {
@@ -90,8 +90,24 @@ pub(super) async fn find_dir(root: &Path, name: &str) -> Option<PathBuf> {
     if is_dir(&direct).await {
         return Some(direct);
     }
-    let mut entries = fs::read_dir(root).await.ok()?;
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    // 探测型语义: 读失败/截断视为"没找到"返回 None, 但留痕 —— root 是本地
+    // tempdir, 失败概率低, 一旦发生不该零线索
+    let mut entries = match fs::read_dir(root).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(error = %e, dir = %root.display(), "find_dir read failed (treated as not found)");
+            return None;
+        }
+    };
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!(error = %e, dir = %root.display(), "find_dir iterate interrupted (treated as not found)");
+                break;
+            }
+        };
         let sub = entry.path().join(name);
         if is_dir(&sub).await {
             return Some(sub);

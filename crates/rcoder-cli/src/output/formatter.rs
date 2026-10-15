@@ -15,10 +15,6 @@ pub(crate) mod colors {
     pub const YELLOW: &str = "\x1b[33m";
     pub const BLUE: &str = "\x1b[34m";
     pub const MAGENTA: &str = "\x1b[35m";
-    #[allow(dead_code)]
-    pub const CYAN: &str = "\x1b[36m";
-    #[allow(dead_code)]
-    pub const WHITE: &str = "\x1b[37m";
 }
 
 /// 输出级别
@@ -51,7 +47,6 @@ impl OutputLevel {
 /// 终端输出格式化器
 ///
 /// 自动检测 stderr 是否为 TTY，非 TTY 时禁用 ANSI 颜色码。
-/// 可通过 `with_color()` 显式覆盖（例如 `--no-color` 参数）。
 pub struct OutputFormatter {
     level: OutputLevel,
     color: bool,
@@ -63,13 +58,6 @@ impl OutputFormatter {
             level,
             color: std::io::stderr().is_terminal(),
         }
-    }
-
-    /// 显式设置颜色输出开关（用于 `--no-color` 或 `--color=always` 参数）。
-    #[allow(dead_code)]
-    pub fn with_color(mut self, color: bool) -> Self {
-        self.color = color;
-        self
     }
 
     /// 输出信息提示（蓝色）
@@ -167,12 +155,6 @@ impl OutputFormatter {
         print!("{}", text);
     }
 
-    /// 输出 agent 内容文本并换行
-    #[allow(dead_code)]
-    pub fn agent_text_ln(&self, text: &str) {
-        println!("{}", text);
-    }
-
     /// 输出工具调用信息（品红色）
     pub fn tool_call(&self, tool_name: &str, status: &str) {
         if self.level != OutputLevel::Quiet {
@@ -202,10 +184,5 @@ impl OutputFormatter {
                 eprintln!("────────────────────────────────────────────────────────");
             }
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn level(&self) -> OutputLevel {
-        self.level
     }
 }

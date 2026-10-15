@@ -33,6 +33,21 @@ pub const ERR_INVALID_RESOURCE_LIMITS: &str = "INVALID_RESOURCE_LIMITS";
 /// 容器操作失败
 pub const ERR_CONTAINER_ERROR: &str = "ERR_CONTAINER_ERROR";
 
+/// Platform runtime configuration is invalid, independent of user input validation.
+pub const ERR_RUNTIME_CONFIGURATION: &str = "ERR_RUNTIME_CONFIGURATION";
+pub const ERR_RUNTIME_UNAVAILABLE: &str = "ERR_RUNTIME_UNAVAILABLE";
+pub const ERR_RUNTIME_TIMEOUT: &str = "ERR_RUNTIME_TIMEOUT";
+pub const ERR_CONTAINER_CREATE_FAILED: &str = "ERR_CONTAINER_CREATE_FAILED";
+pub const ERR_CONTAINER_START_FAILED: &str = "ERR_CONTAINER_START_FAILED";
+pub const ERR_CONTAINER_STOP_FAILED: &str = "ERR_CONTAINER_STOP_FAILED";
+pub const ERR_CONTAINER_EXEC_FAILED: &str = "ERR_CONTAINER_EXEC_FAILED";
+pub const ERR_CONTAINER_ADDRESS_NOT_READY: &str = "ERR_CONTAINER_ADDRESS_NOT_READY";
+pub const ERR_DATABASE_NOT_READY: &str = "ERR_DATABASE_NOT_READY";
+pub const ERR_DATABASE_COMMAND_FAILED: &str = "ERR_DATABASE_COMMAND_FAILED";
+pub const ERR_USERAPP_WAKE_FAILED: &str = "ERR_USERAPP_WAKE_FAILED";
+/// Dispatched mutation completion was not proven; never blindly retry.
+pub const ERR_OPERATION_OUTCOME_UNKNOWN: &str = "ERR_OPERATION_OUTCOME_UNKNOWN";
+
 /// 工作目录错误
 pub const ERR_WORKSPACE_ERROR: &str = "WORKSPACE_ERROR";
 
@@ -83,8 +98,8 @@ pub const ERR_RETRY_EXHAUSTED: &str = "8002";
 /// 请求过多（DoS 防护触发）
 pub const ERR_TOO_MANY_REQUESTS: &str = "TOO_MANY_REQUESTS";
 
-/// API Key 鉴权失败
-pub const ERR_API_KEY_AUTH_FAILED: &str = "4010";
+/// API Key 鉴权失败，独立于前端登录失效错误码 4010
+pub const ERR_API_KEY_AUTH_FAILED: &str = "API_KEY_AUTH_FAILED";
 
 /// Permission request not found or already resolved
 pub const ERR_PERMISSION_NOT_FOUND: &str = "ERR_PERMISSION_NOT_FOUND";
@@ -170,6 +185,10 @@ pub const ERR_AGENT_RUNNER_UNAVAILABLE: &str = "ERR_AGENT_RUNNER_UNAVAILABLE";
 /// 可重试 —— 通常容器会自动恢复(STS restartPolicy)或可重新发起会话。
 pub const ERR_AGENT_CONTAINER_UNAVAILABLE: &str = "ERR_AGENT_CONTAINER_UNAVAILABLE";
 
+/// 模型服务不可用(预检探活发现:模型端点返回 5xx 或连接拒绝/DNS/TLS 失败)。
+/// 可重试 —— 模型恢复后用户重试即可。
+pub const ERR_MODEL_UNAVAILABLE: &str = "ERR_MODEL_UNAVAILABLE";
+
 // ========== 应用管理服务错误码 ==========
 
 /// 资源不存在
@@ -177,6 +196,11 @@ pub const ERR_NOT_FOUND: &str = "ERR_NOT_FOUND";
 
 /// 资源冲突（已存在）
 pub const ERR_CONFLICT: &str = "ERR_CONFLICT";
+/// Another application operation owns the admission slot or physical lease.
+/// Retry safety is carried in OperationInProgressData, not implied by this code.
+pub const ERR_OPERATION_IN_PROGRESS: &str = "ERR_OPERATION_IN_PROGRESS";
+/// Waiting expired; the accepted operation may still be running.
+pub const ERR_USERAPP_WAIT_TIMEOUT: &str = "ERR_USERAPP_WAIT_TIMEOUT";
 
 // ========== 应用管理服务（app_manager v2）错误码 ==========
 //
@@ -207,9 +231,27 @@ pub const ERR_IMAGE_PULL_FAILED: &str = "ERR_IMAGE_PULL_FAILED";
 /// 集群资源不足（调度失败）。可重试 → 503
 pub const ERR_RESOURCE_EXHAUSTED: &str = "ERR_RESOURCE_EXHAUSTED";
 
+// ========== UserApp workspace 就绪性错误码 ==========
+//
+// dev/start、dev/restart、build 受理期前置校验专用：失败即刻同步拒绝（HTTP 400），
+// 不再走"受理成功 → 任务异步 failed"的旧链路。终态（放好项目前重试无用）。
+
+/// UserApp workspace 为空（目录不存在或没有任何文件）——尚未创建/导入项目。终态 → 400
+pub const ERR_WORKSPACE_EMPTY: &str = "ERR_WORKSPACE_EMPTY";
+
+/// UserApp workspace 无可用服务（manifest 缺失/损坏，或所有项目 disabled）。终态 → 400
+pub const ERR_WORKSPACE_NO_SERVICES: &str = "ERR_WORKSPACE_NO_SERVICES";
+
+/// UserApp dev 会话未运行——dev 日志仅在开发服务运行期间可用（app-cli 管理
+/// API :3010 随 dev 会话拉起/退出）。日志受理期快速失败 → 400；启动 dev 后即可查询。
+pub const ERR_HOT_DEPLOY_ENV_CHANGE: &str = "ERR_HOT_DEPLOY_ENV_CHANGE";
+
+pub const ERR_DEV_NOT_RUNNING: &str = "ERR_DEV_NOT_RUNNING";
+
 /// 判断错误码是否可重试（Java 据此决定是否指数退避重发）。
 ///
-/// 注意：`retryable` 是错误码的固有属性，不在响应体重复（HttpResult 不变）。
+/// 历史错误码保留既有建议。结构化运行时错误及 ERR_OPERATION_IN_PROGRESS
+/// 必须以响应中的执行证据判断；错误码本身不授权重放未知写入。
 /// 详见 docs/application-management-service-v2-design.md §12.3。
 pub fn is_retryable_code(code: &str) -> bool {
     matches!(
@@ -218,6 +260,7 @@ pub fn is_retryable_code(code: &str) -> bool {
             | ERR_IMAGE_PULL_FAILED
             | ERR_RESOURCE_EXHAUSTED
             | ERR_AGENT_CONTAINER_UNAVAILABLE
+            | ERR_MODEL_UNAVAILABLE
     )
 }
 
@@ -232,6 +275,18 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_INVALID_PARAMS => "error.invalid_params",
         ERR_INVALID_RESOURCE_LIMITS => "error.invalid_resource_limits",
         ERR_CONTAINER_ERROR => "error.container_error",
+        ERR_RUNTIME_CONFIGURATION => "error.runtime_configuration",
+        ERR_RUNTIME_UNAVAILABLE => "error.runtime_unavailable",
+        ERR_RUNTIME_TIMEOUT => "error.runtime_timeout",
+        ERR_CONTAINER_CREATE_FAILED => "error.container_create_failed",
+        ERR_CONTAINER_START_FAILED => "error.container_start_failed",
+        ERR_CONTAINER_STOP_FAILED => "error.container_stop_failed",
+        ERR_CONTAINER_EXEC_FAILED => "error.container_exec_failed",
+        ERR_CONTAINER_ADDRESS_NOT_READY => "error.container_address_not_ready",
+        ERR_DATABASE_NOT_READY => "error.database_not_ready",
+        ERR_DATABASE_COMMAND_FAILED => "error.database_command_failed",
+        ERR_USERAPP_WAKE_FAILED => "error.userapp_wake_failed",
+        ERR_OPERATION_OUTCOME_UNKNOWN => "error.operation_outcome_unknown",
         ERR_WORKSPACE_ERROR => "error.workspace_error",
         ERR_GRPC_ADDR_ERROR => "error.grpc_addr_error",
         ERR_GRPC_ERROR => "error.grpc_error",
@@ -274,8 +329,11 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_PROJECT_NOT_FOUND => "error.project_not_found",
         ERR_AGENT_RUNNER_UNAVAILABLE => "error.agent_runner_unavailable",
         ERR_AGENT_CONTAINER_UNAVAILABLE => "error.agent_container_unavailable",
+        ERR_MODEL_UNAVAILABLE => "error.model_unavailable",
         ERR_NOT_FOUND => "error.not_found",
         ERR_CONFLICT => "error.conflict",
+        ERR_OPERATION_IN_PROGRESS => "error.operation_in_progress",
+        ERR_USERAPP_WAIT_TIMEOUT => "error.userapp_wait_timeout",
         ERR_APP_NOT_FOUND => "error.app_not_found",
         ERR_APP_ALREADY_EXISTS => "error.app_already_exists",
         ERR_INVALID_STATE => "error.invalid_state",
@@ -284,6 +342,10 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_BACKEND_ERROR => "error.backend_error",
         ERR_IMAGE_PULL_FAILED => "error.image_pull_failed",
         ERR_RESOURCE_EXHAUSTED => "error.resource_exhausted",
+        ERR_WORKSPACE_EMPTY => "error.workspace_empty",
+        ERR_WORKSPACE_NO_SERVICES => "error.workspace_no_services",
+        ERR_HOT_DEPLOY_ENV_CHANGE => "error.hot_deploy_env_change",
+        ERR_DEV_NOT_RUNNING => "error.dev_not_running",
         ERR_UNKNOWN => "error.unknown",
         _ => "error.undefined",
     }
@@ -302,6 +364,20 @@ pub fn get_error_message(code: &str, locale: &str) -> String {
     t(key, locale)
 }
 
+/// Catalog guidance is advisory; retry permission comes from execution evidence.
+pub fn get_error_hint(reason_code: &str, locale: &str) -> String {
+    let key = match reason_code {
+        ERR_RUNTIME_CONFIGURATION => "hint.runtime_configuration",
+        ERR_RUNTIME_UNAVAILABLE => "hint.runtime_unavailable",
+        ERR_RUNTIME_TIMEOUT => "hint.runtime_timeout",
+        ERR_CONTAINER_ADDRESS_NOT_READY | ERR_DATABASE_NOT_READY => "hint.readiness",
+        ERR_OPERATION_OUTCOME_UNKNOWN => "hint.operation_outcome_unknown",
+        ERR_OPERATION_IN_PROGRESS => "hint.operation_in_progress",
+        _ => "hint.runtime_failure",
+    };
+    t(key, locale)
+}
+
 /// 通过 i18n key 直接获取多语言消息
 ///
 /// # Arguments
@@ -312,6 +388,27 @@ pub fn get_error_message(code: &str, locale: &str) -> String {
 /// 多语言消息
 pub fn get_i18n_message(key: &str, locale: &str) -> String {
     t(key, locale)
+}
+
+/// Per-request conflict text; the structured fields, rather than this text,
+/// determine whether a rejected admission can safely be retried.
+pub fn get_operation_in_progress_message(
+    holder_kind: Option<&str>,
+    retryable: bool,
+    retry_after_seconds: u64,
+    locale: &str,
+) -> String {
+    let kind = holder_kind
+        .map(str::to_owned)
+        .unwrap_or_else(|| t("error.operation_holder_unknown", locale));
+    let key = if retryable {
+        "error.operation_in_progress_retryable"
+    } else {
+        "error.operation_in_progress_review"
+    };
+    t(key, locale)
+        .replace("%{kind}", &kind)
+        .replace("%{seconds}", &retry_after_seconds.to_string())
 }
 
 /// 通过 i18n key 获取默认语言消息
@@ -338,6 +435,19 @@ pub fn get_error_description(code: &str) -> &'static str {
         ERR_INVALID_PARAMS => "Parameter missing or invalid",
         ERR_INVALID_RESOURCE_LIMITS => "Invalid resource limit configuration",
         ERR_CONTAINER_ERROR => "Container operation failed",
+        ERR_RUNTIME_CONFIGURATION => "Platform runtime configuration is invalid",
+        ERR_RUNTIME_UNAVAILABLE => "Container runtime is unavailable",
+        ERR_RUNTIME_TIMEOUT => "Runtime operation timed out",
+        ERR_CONTAINER_CREATE_FAILED => "Container creation failed",
+        ERR_CONTAINER_START_FAILED => "Container start failed",
+        ERR_CONTAINER_STOP_FAILED => "Container stop failed",
+        ERR_CONTAINER_EXEC_FAILED => "Container command execution failed",
+        ERR_CONTAINER_ADDRESS_NOT_READY => "Container management address is not ready",
+        ERR_DATABASE_NOT_READY => "Database is not ready",
+        ERR_DATABASE_COMMAND_FAILED => "Database command failed",
+        ERR_USERAPP_WAKE_FAILED => "Application wake failed",
+        ERR_OPERATION_OUTCOME_UNKNOWN => "Operation completion was not confirmed",
+        ERR_OPERATION_IN_PROGRESS => "Another application operation is in progress",
         ERR_WORKSPACE_ERROR => "Workspace error",
         ERR_GRPC_ADDR_ERROR => "gRPC address resolution failed",
         ERR_GRPC_ERROR => "gRPC call failed",
@@ -378,14 +488,26 @@ pub fn get_error_description(code: &str) -> &'static str {
         ERR_PROJECT_NOT_FOUND => "Project not found or stopped",
         ERR_AGENT_RUNNER_UNAVAILABLE => "Agent Runner container is unavailable",
         ERR_AGENT_CONTAINER_UNAVAILABLE => "Agent compute environment is unavailable",
+        ERR_MODEL_UNAVAILABLE => "Model service is unavailable",
         ERR_APP_NOT_FOUND => "Application not found",
         ERR_APP_ALREADY_EXISTS => "Application already exists",
         ERR_INVALID_STATE => "Operation not allowed in current state",
         ERR_OPERATION_NOT_SUPPORTED => "Operation not supported",
         ERR_FILE_NOT_FOUND => "File not found",
         ERR_BACKEND_ERROR => "Backend API call failed",
+        ERR_USERAPP_WAIT_TIMEOUT => {
+            "The application container is taking longer to start. Please try again shortly."
+        }
         ERR_IMAGE_PULL_FAILED => "Image pull failed",
         ERR_RESOURCE_EXHAUSTED => "Cluster resources exhausted",
+        ERR_WORKSPACE_EMPTY => "UserApp workspace is empty (no project created or imported yet)",
+        ERR_WORKSPACE_NO_SERVICES => {
+            "UserApp workspace has no enabled services (invalid or missing manifest)"
+        }
+        ERR_HOT_DEPLOY_ENV_CHANGE => "Hot deployment cannot change business env; use pod mode",
+        ERR_DEV_NOT_RUNNING => {
+            "UserApp dev server is not running (dev logs are only available while it runs)"
+        }
         ERR_UNKNOWN => "Unknown error",
         _ => "Undefined error code",
     }
@@ -394,6 +516,77 @@ pub fn get_error_description(code: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_error_codes_and_guidance_have_all_supported_catalogs() {
+        for code in [
+            ERR_RUNTIME_CONFIGURATION,
+            ERR_RUNTIME_UNAVAILABLE,
+            ERR_RUNTIME_TIMEOUT,
+            ERR_CONTAINER_CREATE_FAILED,
+            ERR_CONTAINER_START_FAILED,
+            ERR_CONTAINER_STOP_FAILED,
+            ERR_CONTAINER_EXEC_FAILED,
+            ERR_CONTAINER_ADDRESS_NOT_READY,
+            ERR_DATABASE_NOT_READY,
+            ERR_DATABASE_COMMAND_FAILED,
+            ERR_USERAPP_WAKE_FAILED,
+            ERR_OPERATION_OUTCOME_UNKNOWN,
+            ERR_OPERATION_IN_PROGRESS,
+        ] {
+            for locale in crate::SUPPORTED_LOCALES {
+                let message = get_error_message(code, locale);
+                let hint = get_error_hint(code, locale);
+                assert!(
+                    !message.is_empty() && !message.starts_with("error."),
+                    "{code}: {locale}"
+                );
+                assert!(
+                    !hint.is_empty() && !hint.starts_with("hint."),
+                    "{code}: {locale}"
+                );
+            }
+            assert!(
+                !is_retryable_code(code),
+                "new code alone must not authorize retry: {code}"
+            );
+        }
+        assert_eq!(ERR_APP_NOT_FOUND, "ERR_APP_NOT_FOUND");
+    }
+
+    #[test]
+    fn operation_in_progress_text_uses_requested_locale_and_keeps_retry_evidence_separate() {
+        for locale in crate::SUPPORTED_LOCALES {
+            let message = get_operation_in_progress_message(Some("start"), true, 20, locale);
+            assert!(
+                message.contains("start") && message.contains("20"),
+                "{locale}: {message}"
+            );
+            assert!(!message.contains("%{") && !message.starts_with("error."));
+            let review = get_operation_in_progress_message(None, false, 0, locale);
+            assert!(!review.starts_with("error.") && !review.contains("%{"));
+            assert_ne!(message, review);
+        }
+        assert!(!is_retryable_code(ERR_OPERATION_IN_PROGRESS));
+        assert_eq!(ERR_CONFLICT, "ERR_CONFLICT");
+    }
+
+    #[test]
+    fn userapp_wait_timeout_prompt_gives_a_simple_retry_action() {
+        for (locale, expected) in [
+            ("zh-CN", "应用容器启动较慢，请稍后重试。"),
+            ("zh-TW", "應用容器啟動較慢，請稍後重試。"),
+            (
+                "en-US",
+                "The application container is taking longer to start. Please try again shortly.",
+            ),
+        ] {
+            assert_eq!(
+                get_error_message(ERR_USERAPP_WAIT_TIMEOUT, locale),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn test_all_error_codes_have_messages() {
@@ -447,6 +640,11 @@ mod tests {
             ERR_PROJECT_NOT_FOUND,
             ERR_AGENT_RUNNER_UNAVAILABLE,
             ERR_AGENT_CONTAINER_UNAVAILABLE,
+            ERR_MODEL_UNAVAILABLE,
+            ERR_WORKSPACE_EMPTY,
+            ERR_WORKSPACE_NO_SERVICES,
+            ERR_HOT_DEPLOY_ENV_CHANGE,
+            ERR_DEV_NOT_RUNNING,
         ];
 
         for code in codes {
@@ -462,6 +660,30 @@ mod tests {
                 !get_error_message(code, "zh-TW").is_empty(),
                 "missing zh-TW: {code}"
             );
+        }
+    }
+
+    /// 新增 workspace 就绪性码的三语 yml 真命中：t() 未命中时返回 key 本身，
+    /// 仅断言非空拦不住 yml 加载失败/键名写错。
+    #[test]
+    fn workspace_readiness_codes_translate_in_all_locales() {
+        for (code, key, zh) in [
+            (ERR_WORKSPACE_EMPTY, "error.workspace_empty", "工作区为空"),
+            (
+                ERR_WORKSPACE_NO_SERVICES,
+                "error.workspace_no_services",
+                "无可用服务",
+            ),
+        ] {
+            assert_eq!(get_error_i18n_key(code), key);
+            for locale in ["zh-CN", "zh-TW", "en-US"] {
+                let msg = get_error_message(code, locale);
+                assert_ne!(msg, key, "locale={locale} fell back to raw key");
+                assert!(!msg.is_empty());
+            }
+            // zh-CN 译文内容抽检（防键值错位配到别的条目）
+            let zh_msg = get_error_message(code, "zh-CN");
+            assert!(zh_msg.contains(zh), "zh-CN={zh_msg}");
         }
     }
 }

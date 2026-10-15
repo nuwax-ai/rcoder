@@ -1,0 +1,1694 @@
+//! Durable deployment receipts outside the directory exchanged during activation.
+use crate::server::DeployRequest;
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use shared_types::AppDeploymentOperation;
+use std::{
+    fs::{File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+};
+
+mod generation_compat;
+mod source_history;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Boundary {
+    Preparing,
+    Switching,
+    Activated,
+    Active,
+    /// The previous artifact is serving again; the failed attempt stays failed.
+    RestoredActive,
+    /// Artifact and shutdown confirmed; only business startup failed.
+    StartupFailed,
+    Failed,
+}
+
+/// A confirmed serving artifact can predate URL deployment. Such an existing
+/// workspace has content identity but deliberately has no invented download URL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ActiveVersion {
+    pub artifact_release_id: String,
+    pub request: Option<DeployRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct Receipt {
+    pub generation: String,
+    pub operation: AppDeploymentOperation,
+    pub request: DeployRequest,
+    pub boundary: Boundary,
+    pub active: Option<ActiveVersion>,
+}
+
+/// Flattening keeps old receipts readable, including historical redaction.
+/// New internal receipts retain actual credentials for recovery and audit.
+/// History is committed with the current receipt, never separately.
+#[derive(Serialize, Deserialize)]
+struct StoredReceipt {
+    #[serde(flatten)]
+    receipt: Receipt,
+    #[serde(default)]
+    deploy_replays: super::deploy_replay::History,
+}
+
+const RECOVERY_REQUIRED_RECORD: &str = ".deploy-recovery-required.json";
+
+/// Lost deployment input cannot authorize an automatic Source/credential
+/// fallback. A new explicit operation may replace it; only its confirmed
+/// receipt clears this marker. Original damaged files remain archived.
+#[derive(Serialize, Deserialize)]
+struct LostDeploymentRecord {
+    version: u8,
+    originals: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replacement_operation_id: Option<String>,
+}
+
+fn read_lost_deployment_record(root: &Path) -> Result<Option<LostDeploymentRecord>> {
+    let bytes = match std::fs::read(root.join(RECOVERY_REQUIRED_RECORD)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("read lost deployment input marker"),
+    };
+    let value: LostDeploymentRecord =
+        serde_json::from_slice(&bytes).context("decode lost deployment input marker")?;
+    anyhow::ensure!(
+        value.version == 1 && !value.originals.is_empty(),
+        "invalid lost deployment input marker"
+    );
+    Ok(Some(value))
+}
+
+/// This marker contains recovery bookkeeping, not migration or deployment
+/// results. Under the journal lock, preserve malformed bookkeeping verbatim
+/// and rebuild a conservative marker; it must never permanently veto a fresh
+/// explicit request or silently authorize automatic recovery.
+fn read_or_preserve_lost_deployment_record(root: &Path) -> Result<Option<LostDeploymentRecord>> {
+    match read_lost_deployment_record(root) {
+        Ok(value) => Ok(value),
+        Err(error) if error.downcast_ref::<std::io::Error>().is_some() => Err(error),
+        Err(error) => {
+            let marker = root.join(RECOVERY_REQUIRED_RECORD);
+            let bytes =
+                std::fs::read(&marker).context("read damaged deployment recovery marker")?;
+            let backup =
+                marker.with_extension(format!("corrupt-{}.json", uuid::Uuid::new_v4().simple()));
+            let mut temp = tempfile::NamedTempFile::new_in(root)?;
+            temp.write_all(&bytes)?;
+            temp.as_file().sync_all()?;
+            temp.persist(&backup)
+                .map_err(|error| error.error)
+                .context("preserve damaged deployment recovery marker")?;
+            #[cfg(unix)]
+            File::open(root)?.sync_all()?;
+            tracing::warn!(%error, backup = %backup.display(), "preserved damaged deployment recovery bookkeeping; automatic recovery remains disabled");
+            Ok(Some(LostDeploymentRecord {
+                version: 1,
+                originals: vec![backup],
+                replacement_operation_id: None,
+            }))
+        }
+    }
+}
+
+fn write_record_verified<T: Serialize + serde::de::DeserializeOwned>(
+    root: &Path,
+    name: &str,
+    value: &T,
+) -> Result<T> {
+    let mut temp = tempfile::NamedTempFile::new_in(root)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        temp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .context("protect deployment record before writing credentials")?;
+    }
+    temp.write_all(&serde_json::to_vec(value)?)?;
+    temp.as_file().sync_all()?;
+    temp.persist(root.join(name))
+        .map_err(|error| error.error)
+        .with_context(|| format!("commit deployment record {name}"))?;
+    #[cfg(unix)]
+    File::open(root)?.sync_all()?;
+    let readback: T = serde_json::from_slice(&std::fs::read(root.join(name))?)?;
+    anyhow::ensure!(
+        serde_json::to_value(&readback)? == serde_json::to_value(value)?,
+        "deployment record readback mismatch: {name}"
+    );
+    Ok(readback)
+}
+
+/// Carry lost-input protection into the canonical authority before removing
+/// the legacy marker. The caller holds both journal lock domains.
+fn migrate_lost_deployment_record(legacy: &Path, authority: &Path) -> Result<()> {
+    let Some(old) = read_or_preserve_lost_deployment_record(legacy)? else {
+        return Ok(());
+    };
+    let mut merged =
+        read_or_preserve_lost_deployment_record(authority)?.unwrap_or(LostDeploymentRecord {
+            version: 1,
+            originals: Vec::new(),
+            replacement_operation_id: None,
+        });
+    merged.originals.extend(old.originals);
+    merged.originals.sort();
+    merged.originals.dedup();
+    // Lost legacy input is not resolved by a previously selected operation in
+    // another state root. A new explicit replacement must cover both.
+    merged.replacement_operation_id = None;
+    write_record_verified(authority, RECOVERY_REQUIRED_RECORD, &merged)?;
+    std::fs::remove_file(legacy.join(RECOVERY_REQUIRED_RECORD))
+        .context("retire migrated deployment recovery marker")?;
+    #[cfg(unix)]
+    File::open(legacy)?.sync_all()?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum OwnerState {
+    #[default]
+    Active,
+    Quiescent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CoordinatorOwner {
+    #[serde(default)]
+    state: OwnerState,
+    process_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_generation: Option<String>,
+}
+
+pub(crate) struct Journal {
+    root: PathBuf,
+    lease: Option<File>,
+    pub receipt: Option<Receipt>,
+    pub(super) deploy_replays: super::deploy_replay::History,
+    pub process_scope: Option<String>,
+    /// 本协调者关联的原生执行代次（统一 owner 进程内会话显式附加；
+    /// 旧 worker 路径派生自 guardian 注入的 env）。
+    worker_generation: Option<String>,
+    previous_owner: Option<CoordinatorOwner>,
+    // Retain the old lock domain for the entire owner lifetime: an old binary
+    // must not start against now-empty legacy record paths during migration.
+    legacy_leases: Vec<File>,
+    legacy_root: Option<PathBuf>,
+    legacy_conflicts: Vec<PathBuf>,
+}
+impl Drop for Journal {
+    fn drop(&mut self) {
+        for lease in &self.legacy_leases {
+            if let Err(error) = lease.unlock() {
+                tracing::error!(%error, "Failed to release legacy journal lease");
+            }
+        }
+        if let Some(lease) = &self.lease
+            && let Err(error) = lease.unlock()
+        {
+            tracing::error!(%error, "Failed to release deployment journal lease");
+        }
+    }
+}
+fn read_record<T: serde::de::DeserializeOwned>(path: &Path, supervised: bool) -> Result<Option<T>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if supervised => {
+            let backup =
+                path.with_extension(format!("corrupt-{}.json", uuid::Uuid::new_v4().simple()));
+            if path
+                .file_name()
+                .is_some_and(|name| name == ".deploy-operation.json")
+            {
+                let root = path
+                    .parent()
+                    .context("deployment record has no state root")?;
+                let mut lost = read_or_preserve_lost_deployment_record(root)?.unwrap_or(
+                    LostDeploymentRecord {
+                        version: 1,
+                        originals: Vec::new(),
+                        replacement_operation_id: None,
+                    },
+                );
+                lost.originals.push(backup.clone());
+                lost.replacement_operation_id = None;
+                // Publish first: a crash after rename must not make the next
+                // owner mistake lost deployment input for a fresh application.
+                write_record_verified(root, RECOVERY_REQUIRED_RECORD, &lost)?;
+            }
+            std::fs::rename(path, &backup).context("preserve damaged deployment record")?;
+            #[cfg(unix)]
+            File::open(
+                path.parent()
+                    .context("deployment record has no state root")?,
+            )?
+            .sync_all()?;
+            tracing::warn!(backup = %backup.display(), %error, "rebuilding damaged deployment bookkeeping after supervisor takeover");
+            Ok(None)
+        }
+        Err(error) => Err(error).with_context(|| format!("decode {}", path.display())),
+    }
+}
+
+impl Journal {
+    #[cfg(test)]
+    pub fn open(workspace: &Path) -> Result<Self> {
+        // B04：平台显式状态根权威（与 runtime_kernel 同 env）——source/.run
+        // 别名经同一目录竞争同一把锁。缺省沿用卷根推导（历史布局兼容）。
+        let root = match std::env::var_os("APP_CLI_STATE_ROOT").filter(|value| !value.is_empty()) {
+            Some(explicit) => PathBuf::from(explicit),
+            None => workspace
+                .parent()
+                .context("workspace has no volume root")?
+                .to_path_buf(),
+        };
+        Self::open_root(root)
+    }
+
+    /// Caller already holds the common OwnerGuard. Merely opening never moves
+    /// records: migration waits until the management listener has bound.
+    pub fn open_with_root(workspace: &Path, root: PathBuf) -> Result<Self> {
+        // RV03/F2：统一 owner 即监督者——损坏（无法解码）的业务部署 journal
+        // 与内核操作记录同语义：隔离为 .corrupt-*.json 备份后重建，不永久
+        // 否决显式业务请求（用户不需编辑 state）。丢失的部署输入以独立
+        // marker 压制自动恢复；新的明确请求与未知迁移各自保持原契约。
+        Self::open_recovering(workspace, root, true)
+    }
+
+    /// Management and explicit requests remain usable after quarantine, while
+    /// automatic startup waits for a new operation's confirmed deployment input.
+    pub(crate) fn automatic_recovery_allowed(&self) -> Result<bool> {
+        // Presence is enough to suppress automatic work, even if the marker's
+        // diagnostic JSON was damaged. A fresh explicit Preparing request can
+        // preserve and rebuild that bookkeeping under the journal lock.
+        if self.root.join(RECOVERY_REQUIRED_RECORD).try_exists()? {
+            return Ok(false);
+        }
+        if let Some(legacy) = self.legacy_root.as_ref()
+            && legacy.join(RECOVERY_REQUIRED_RECORD).try_exists()?
+        {
+            return Ok(false);
+        }
+        for legacy in &self.legacy_conflicts {
+            if legacy.join(RECOVERY_REQUIRED_RECORD).try_exists()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// 统一 owner 进程内会话：显式附加本会话的原生执行代次——没有 guardian
+    /// env 可派生，协调者登记与后续会话的「上一代清理已核验」判定都以此为准。
+    pub fn attach_worker_generation(&mut self, generation: String) {
+        self.worker_generation = Some(generation);
+    }
+
+    /// The independent supervisor has retired preceding managed executions.
+    /// Malformed bookkeeping can be preserved and reconstructed without making
+    /// the public management API depend on an intact business journal.
+    pub fn open_recovering(workspace: &Path, root: PathBuf, supervised: bool) -> Result<Self> {
+        let mut journal = Self::open_root_recovering(root, supervised)?;
+        let project = runtime_state_layout::canonical_project_root(workspace);
+        let mut candidates = vec![project.clone()];
+        if let Some(parent) = project.parent() {
+            candidates.push(parent.to_path_buf());
+        }
+        let root_identity = std::fs::canonicalize(&journal.root)?;
+        for legacy in candidates {
+            if std::fs::canonicalize(&legacy).is_ok_and(|path| path == root_identity) {
+                continue;
+            }
+            let has_records = legacy.join(".deploy-operation.json").try_exists()?
+                || legacy.join(".deploy-coordinator.json").try_exists()?;
+            let has_recovery_marker = legacy.join(RECOVERY_REQUIRED_RECORD).try_exists()?;
+            if !has_records && !has_recovery_marker {
+                continue;
+            }
+            if !has_records {
+                let mut old = Self::open_root_recovering(legacy.clone(), supervised)?;
+                journal.legacy_conflicts.push(legacy.clone());
+                journal.legacy_leases.push(
+                    old.lease
+                        .take()
+                        .context("legacy deployment lease missing")?,
+                );
+                continue;
+            }
+            if journal.receipt.is_none()
+                && journal.previous_owner.is_none()
+                && journal.legacy_root.is_none()
+            {
+                let mut old = Self::open_root_recovering(legacy.clone(), supervised)?;
+                journal.receipt = old.receipt.take();
+                journal.deploy_replays = std::mem::take(&mut old.deploy_replays);
+                journal.previous_owner = old.previous_owner.take();
+                let lease = old
+                    .lease
+                    .take()
+                    .context("legacy deployment lease missing")?;
+                journal.legacy_leases.push(lease);
+                journal.legacy_root = Some(legacy);
+                continue;
+            }
+            // 双权威域（2026-09-22 app-105 死锁修复）：权威根已有记录且 legacy
+            // 也残留记录时，旧守卫一律拒绝——但"权威侧是一笔 failed 待重部署
+            // + legacy 是被取代的陈旧记录"恰恰是升级窗口被中断部署的必然产
+            // 物，此时 serve 起不来则重部署（journal 自己要求的恢复方式）永
+            // 远无法发生：守卫死锁自己的补救路径。改为状态感知收束：
+            // - 双侧均无在途交接（coordinator quiescent ∧ boundary 终态）且
+            //   权威记录不旧于 legacy → 陈旧侧改名归档（不删除、可回滚），
+            //   serve 正常启动，重部署路径恢复；
+            // - 任一侧在途、或 legacy 反而更新（旧运行时在新布局之后又跑过，
+            //   降级混跑）→ 仍显式拒绝，文案给出两侧路径。
+            let mut old = Self::open_root_recovering(legacy.clone(), supervised)?;
+            journal.legacy_conflicts.push(legacy.clone());
+            tracing::warn!(
+                legacy = %legacy.display(),
+                authority = %journal.root.display(),
+                "retained conflicting journal history under both real locks; reconciliation waits for actual business quiescence"
+            );
+            // 保留 legacy 锁到 owner 生命周期结束（与迁移路径同理）：归档后旧
+            // 二进制不得在 legacy 路径上以全新记录启动。
+            if let Some(lease) = old.lease.take() {
+                journal.legacy_leases.push(lease);
+            }
+        }
+        Ok(journal)
+    }
+
+    pub fn migrate_after_bind(&mut self) -> Result<()> {
+        let Some(legacy) = self.legacy_root.as_ref() else {
+            return Ok(());
+        };
+        migrate_lost_deployment_record(legacy, &self.root)?;
+        for name in [".deploy-operation.json", ".deploy-coordinator.json"] {
+            let source = legacy.join(name);
+            if source.try_exists()? {
+                anyhow::ensure!(
+                    !self.root.join(name).try_exists()?,
+                    "migration destination already exists"
+                );
+                std::fs::rename(&source, self.root.join(name))
+                    .with_context(|| format!("migrate deployment journal {name}"))?;
+            }
+        }
+        #[cfg(unix)]
+        {
+            File::open(&self.root)?.sync_all()?;
+            File::open(legacy)?.sync_all()?;
+        }
+        self.legacy_root = None;
+        Ok(())
+    }
+
+    /// The native/engine startup cleanup has actually finished. Historical
+    /// boundary, owner state and mtime no longer veto a new source request.
+    pub(crate) fn reconcile_legacy_after_quiescence(&mut self) -> Result<()> {
+        self.migrate_after_bind()?;
+        for legacy in &self.legacy_conflicts {
+            migrate_lost_deployment_record(legacy, &self.root)?;
+            archive_superseded_records(legacy)?;
+        }
+        self.legacy_conflicts.clear();
+        Ok(())
+    }
+
+    fn open_root(root: PathBuf) -> Result<Self> {
+        Self::open_root_recovering(root, false)
+    }
+
+    fn open_root_recovering(root: PathBuf, supervised: bool) -> Result<Self> {
+        std::fs::create_dir_all(&root)?;
+        let lease = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join(".deploy-operation.lock"))?;
+        lease
+            .try_lock()
+            .context("another deployment coordinator owns this volume")?;
+        let stored: Option<StoredReceipt> =
+            read_record(&root.join(".deploy-operation.json"), supervised)?;
+        let (receipt, deploy_replays) = match stored {
+            Some(stored) => (Some(stored.receipt), stored.deploy_replays),
+            None => (None, Default::default()),
+        };
+        let previous_owner = read_record(&root.join(".deploy-coordinator.json"), supervised)?;
+        Ok(Self {
+            root,
+            lease: Some(lease),
+            receipt,
+            deploy_replays,
+            process_scope: process_scope(),
+            worker_generation: current_worker_generation(),
+            previous_owner,
+            legacy_leases: Vec::new(),
+            legacy_root: None,
+            legacy_conflicts: Vec::new(),
+        })
+    }
+    fn write_verified<T: Serialize + serde::de::DeserializeOwned>(
+        &self,
+        name: &str,
+        value: &T,
+    ) -> Result<T> {
+        write_record_verified(&self.root, name, value)
+    }
+    pub fn write(&mut self, receipt: Receipt) -> Result<()> {
+        let mut history = self.deploy_replays.clone();
+        if let Some(replay) = history.get_mut(&receipt.operation.operation_id) {
+            replay.operation = receipt.operation.clone();
+        }
+        self.write_with_history(receipt, history)
+    }
+
+    pub(super) fn write_with_history(
+        &mut self,
+        receipt: Receipt,
+        deploy_replays: super::deploy_replay::History,
+    ) -> Result<()> {
+        let mut document = serde_json::to_value(StoredReceipt {
+            receipt,
+            deploy_replays,
+        })?;
+        match std::fs::read(self.root.join(".deploy-operation.json")) {
+            Ok(bytes) => {
+                let previous: serde_json::Value = serde_json::from_slice(&bytes)
+                    .context("decode deployment fields before journal update")?;
+                preserve_unknown_deployment_fields(&mut document, previous);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).context("read deployment fields before journal update");
+            }
+        }
+        let stored: StoredReceipt =
+            serde_json::from_value(self.write_verified(".deploy-operation.json", &document)?)?;
+        self.receipt = Some(stored.receipt);
+        self.deploy_replays = stored.deploy_replays;
+        let explicit_replacement = self
+            .receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.boundary == Boundary::Preparing);
+        let lost = if explicit_replacement {
+            read_or_preserve_lost_deployment_record(&self.root)?
+        } else {
+            read_lost_deployment_record(&self.root)?
+        };
+        if let Some(mut lost) = lost {
+            let receipt = self
+                .receipt
+                .as_ref()
+                .context("committed deployment receipt missing")?;
+            if receipt.boundary == Boundary::Preparing {
+                if lost.replacement_operation_id.as_deref()
+                    != Some(receipt.operation.operation_id.as_str())
+                {
+                    lost.replacement_operation_id = Some(receipt.operation.operation_id.clone());
+                    self.write_verified(RECOVERY_REQUIRED_RECORD, &lost)?;
+                }
+            } else if lost.replacement_operation_id.as_deref()
+                == Some(receipt.operation.operation_id.as_str())
+                && matches!(
+                    receipt.boundary,
+                    Boundary::Active | Boundary::RestoredActive | Boundary::StartupFailed
+                )
+                && receipt.active.is_some()
+                && receipt.operation.persisted
+                && receipt.operation.deploy_stage
+                    == shared_types::app_cli_deploy::AppDeploymentStage::Succeeded
+                && receipt.operation.recovery.is_none()
+            {
+                std::fs::remove_file(self.root.join(RECOVERY_REQUIRED_RECORD))
+                    .context("clear confirmed deployment recovery marker")?;
+                #[cfg(unix)]
+                File::open(&self.root)?.sync_all()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Caller verified the target directory against the persisted switch intent
+    /// after old writers stopped. No directory mutation is performed here.
+    pub(crate) fn confirm_switched_artifact(
+        &mut self,
+        expected: &Receipt,
+        artifact: &str,
+    ) -> Result<Receipt> {
+        let current = self.receipt.as_ref().context("switch journal missing")?;
+        anyhow::ensure!(
+            serde_json::to_value(current)? == serde_json::to_value(expected)?,
+            "switch journal changed during reconciliation"
+        );
+        anyhow::ensure!(
+            current.boundary == Boundary::Switching
+                && current.operation.artifact_release_id.as_deref() == Some(artifact)
+                && !artifact.is_empty()
+                && current.operation.recovery.is_none(),
+            "switch intent does not confirm the observed artifact"
+        );
+        let mut resolved = current.clone();
+        resolved.boundary = Boundary::Activated;
+        resolved.operation.deploy_stage =
+            shared_types::app_cli_deploy::AppDeploymentStage::Succeeded;
+        resolved.operation.persisted = true;
+        resolved.operation.phase = shared_types::AppCliDeployPhase::Orchestrating;
+        resolved.active = Some(ActiveVersion {
+            artifact_release_id: artifact.into(),
+            request: Some(resolved.request.clone()),
+        });
+        self.write(resolved)?;
+        self.receipt
+            .clone()
+            .context("reconciled switch journal missing")
+    }
+
+    /// The old artifact remains at the original execution path after quiescence.
+    /// Preserve it as active; the attempted deployment remains a failed attempt.
+    pub(crate) fn confirm_preserved_active(
+        &mut self,
+        expected: &Receipt,
+        artifact: &str,
+    ) -> Result<Receipt> {
+        let current = self.receipt.as_ref().context("switch journal missing")?;
+        anyhow::ensure!(
+            serde_json::to_value(current)? == serde_json::to_value(expected)?,
+            "switch journal changed during reconciliation"
+        );
+        let active = current
+            .active
+            .as_ref()
+            .context("previous active artifact missing")?;
+        anyhow::ensure!(
+            current.boundary == Boundary::Switching
+                && current.operation.recovery.is_none()
+                && active.artifact_release_id == artifact
+                && active.request.as_ref().is_some_and(
+                    |request| request.execution_target == current.request.execution_target
+                ),
+            "previous artifact execution binding does not match"
+        );
+        let mut resolved = current.clone();
+        resolved.boundary = Boundary::Preparing;
+        resolved.operation.deploy_stage = shared_types::app_cli_deploy::AppDeploymentStage::Failed;
+        resolved.operation.phase = shared_types::AppCliDeployPhase::Failed;
+        resolved.operation.error =
+            Some("Activation interrupted; the confirmed previous artifact remains in place".into());
+        self.write(resolved)?;
+        self.receipt
+            .clone()
+            .context("preserved active journal missing")
+    }
+
+    /// Caller proved process quiescence and current artifact identity.
+    /// This records startup interruption, not rollback.
+    pub(crate) fn confirm_interrupted_activation(&mut self, expected: &Receipt) -> Result<Receipt> {
+        let current = self
+            .receipt
+            .as_ref()
+            .context("activation journal missing")?;
+        anyhow::ensure!(
+            serde_json::to_value(current)? == serde_json::to_value(expected)?,
+            "activation journal changed during reconciliation"
+        );
+        anyhow::ensure!(
+            current.boundary == Boundary::Activated
+                && current.operation.persisted
+                && current.operation.deploy_stage
+                    == shared_types::app_cli_deploy::AppDeploymentStage::Succeeded
+                && current.operation.recovery.is_none()
+                && current.active.is_some(),
+            "activation is not eligible for confirmed startup interruption"
+        );
+        let mut resolved = current.clone();
+        resolved.boundary = Boundary::StartupFailed;
+        resolved.operation.phase = shared_types::AppCliDeployPhase::Failed;
+        resolved.operation.error =
+            Some("Owner restarted after activation before startup completed".into());
+        self.write(resolved)?;
+        self.receipt
+            .clone()
+            .context("reconciled activation journal missing")
+    }
+    pub fn require_fresh_process_scope(&self) -> Result<()> {
+        // The in-process native owner launches a generation only after its
+        // actual prior command ranges completed cleanup. Its held owner and
+        // generation locks are stronger than an incomplete legacy coordinator.
+        if let Some(scope) = runtime_supervisor::current_scope()
+            && std::fs::canonicalize(&self.root).ok().as_deref()
+                == scope.work_root.parent().and_then(Path::parent)
+        {
+            runtime_supervisor::verify_live(&self.root, &scope.supervisor_id, &scope.generation)
+                .context("verify current native execution after prior business cleanup")?;
+            return Ok(());
+        }
+        if self
+            .previous_owner
+            .as_ref()
+            .is_some_and(|owner| owner.state == OwnerState::Quiescent)
+        {
+            return Ok(());
+        }
+        if self.previous_owner.is_none() && self.receipt.is_none() {
+            return Ok(());
+        }
+        if let Some(generation) = self
+            .previous_owner
+            .as_ref()
+            .and_then(|owner| owner.worker_generation.as_deref())
+        {
+            runtime_supervisor::verify_local_quiescent(&self.root, generation)
+                .context("previous native execution cleanup remains unconfirmed")?;
+            return Ok(());
+        }
+        let previous = self
+            .previous_owner
+            .as_ref()
+            .and_then(|owner| owner.process_scope.as_ref());
+        anyhow::ensure!(
+            self.process_scope.is_some()
+                && previous.is_some()
+                && self.process_scope.as_ref() != previous,
+            "cannot confirm previous builtin process groups stopped; restart the container before deployment"
+        );
+        Ok(())
+    }
+    /// Call only after the previous coordinator's processes are confirmed stopped.
+    /// Opening the journal never overwrites the evidence needed for that decision.
+    pub fn commit_coordinator(&mut self) -> Result<()> {
+        // A temporary compatibility failure must not erase the retired native
+        // identity needed to prove the same repair on the next launch.
+        self.preserve_legacy_generation_owner()?;
+        let owner = CoordinatorOwner {
+            state: OwnerState::Active,
+            process_scope: self.process_scope.clone(),
+            worker_generation: self.worker_generation.clone(),
+        };
+        self.previous_owner = Some(self.write_verified(".deploy-coordinator.json", &owner)?);
+        Ok(())
+    }
+    pub fn commit_quiescent(&mut self) -> Result<()> {
+        let previous = self
+            .previous_owner
+            .as_ref()
+            .context("coordinator ownership was never claimed")?;
+        anyhow::ensure!(
+            previous.state == OwnerState::Active
+                && previous.process_scope == self.process_scope
+                && previous.worker_generation == self.worker_generation,
+            "coordinator ownership changed before shutdown"
+        );
+        let owner = CoordinatorOwner {
+            state: OwnerState::Quiescent,
+            process_scope: self.process_scope.clone(),
+            worker_generation: self.worker_generation.clone(),
+        };
+        self.previous_owner = Some(self.write_verified(".deploy-coordinator.json", &owner)?);
+        Ok(())
+    }
+    pub fn clear(&mut self) -> Result<()> {
+        match std::fs::remove_file(self.root.join(".deploy-operation.json")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        #[cfg(unix)]
+        File::open(&self.root)?.sync_all()?;
+        self.receipt = None;
+        self.deploy_replays.clear();
+        Ok(())
+    }
+    pub fn resume(&self, generation: &str) -> Result<Option<Receipt>> {
+        let Some(receipt) = self.receipt.as_ref().filter(|r| r.generation == generation) else {
+            return Ok(None);
+        };
+        match receipt.boundary {
+            Boundary::Switching | Boundary::Activated | Boundary::Failed => {
+                bail!("deployment interrupted after switch; explicit redeployment required")
+            }
+            Boundary::Preparing if receipt.active.is_none() => bail!(
+                "deployment preparation has no confirmed active version; explicit redeployment required"
+            ),
+            _ => Ok(Some(receipt.clone())),
+        }
+    }
+}
+
+/// Preserve extensions without retaining replay entries deliberately removed by
+/// an admission rollback. Known fields always come from the new typed record.
+fn preserve_unknown_deployment_fields(
+    current: &mut serde_json::Value,
+    mut previous: serde_json::Value,
+) {
+    // These are known retired fields, not forward-compatible extensions.
+    // DeployRequest.runtime_operation_id is process-local and serde(skip):
+    // an old on-disk copy must not be restored by the raw-field merge.
+    if let Some(object) = previous.as_object_mut() {
+        object.remove("generation_handoff");
+    }
+    for pointer in ["/request", "/active/request"] {
+        if let Some(request) = previous
+            .pointer_mut(pointer)
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            request.remove("requires_configuration_activation");
+            request.remove("runtime_operation_id");
+        }
+    }
+    let previous_replays = previous
+        .as_object_mut()
+        .and_then(|object| object.remove("deploy_replays"));
+    if let (Some(current), Some(previous)) = (
+        current
+            .get_mut("deploy_replays")
+            .and_then(serde_json::Value::as_object_mut),
+        previous_replays
+            .as_ref()
+            .and_then(serde_json::Value::as_object),
+    ) {
+        for (id, replay) in current {
+            if let Some(old) = previous.get(id) {
+                preserve_unknown_fields(replay, old.clone());
+            }
+        }
+    }
+    preserve_unknown_fields(current, previous);
+}
+
+fn preserve_unknown_fields(current: &mut serde_json::Value, previous: serde_json::Value) {
+    if let (Some(current), serde_json::Value::Object(previous)) =
+        (current.as_object_mut(), previous)
+    {
+        for (key, old) in previous {
+            if let Some(new) = current.get_mut(&key) {
+                preserve_unknown_fields(new, old);
+            } else {
+                current.insert(key, old);
+            }
+        }
+    }
+}
+
+/// A record domain is settled when no deployment handoff is mid-flight:
+/// the coordinator is quiescent (or absent) and the receipt sits at a
+/// terminal boundary (or is absent). Preparing/Switching/Activated mean an
+/// interrupted handoff the owner may still reconcile — such records stay
+/// untouchable by automatic supersession.
+fn domain_settled(boundary: Option<&Boundary>, owner: Option<&CoordinatorOwner>) -> bool {
+    owner.is_none_or(|owner| owner.state == OwnerState::Quiescent)
+        && boundary.is_none_or(|boundary| {
+            !matches!(
+                boundary,
+                Boundary::Preparing | Boundary::Switching | Boundary::Activated
+            )
+        })
+}
+
+/// Authority records must be at least as new as the legacy ones before the
+/// legacy set may be treated as superseded. Any unprovable mtime refuses.
+fn authority_covers_legacy(authority: &Path, legacy: &Path) -> bool {
+    let newest = |root: &Path| {
+        [".deploy-operation.json", ".deploy-coordinator.json"]
+            .into_iter()
+            .filter_map(|name| {
+                std::fs::metadata(root.join(name))
+                    .ok()
+                    .and_then(|meta| meta.modified().ok())
+            })
+            .max()
+    };
+    match (newest(authority), newest(legacy)) {
+        (Some(authority_time), Some(legacy_time)) => authority_time >= legacy_time,
+        _ => false,
+    }
+}
+
+/// Archive (rename, never delete) the superseded legacy record set. The
+/// `.deploy-operation.lock` stays in place and stays held by the caller so an
+/// old binary cannot start fresh against the archived legacy paths.
+fn archive_superseded_records(legacy: &Path) -> Result<()> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    for name in [
+        ".deploy-operation.json",
+        ".deploy-coordinator.json",
+        ".deploy-state.toml",
+    ] {
+        let source = legacy.join(name);
+        let archived = legacy.join(format!("{name}.superseded-{stamp}"));
+        match std::fs::metadata(&source) {
+            Ok(_) => std::fs::rename(&source, &archived)
+                .with_context(|| format!("archive legacy record {name}"))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("stat legacy record"),
+        }
+    }
+    #[cfg(unix)]
+    File::open(legacy)?.sync_all()?;
+    Ok(())
+}
+
+/// `app-cli journal adopt`：双权威域冲突的可审计显式裁决。
+///
+/// - 无 legacy 记录 → no-op 成功（可作升级前批量预检）；
+/// - 权威根为空 → 拒绝归档（legacy 是下次 serve 自动迁移的来源，归档即
+///   掐断迁移），报告引导直接启动；
+/// - 有冲突（默认）：执行与 serve 启动同款的判定——双侧 settled 且权威
+///   记录不旧于 legacy → 归档陈旧侧；不满足则非零退出并给出具体原因；
+/// - `--force`：跳过 settled/新旧判定（操作者断言权威根为真相），仅保留
+///   两侧活锁拒绝这一道防线。归档改名可回滚，永不删除。
+pub fn adopt_superseded_legacy(workspace: &Path, force: bool) -> Result<String> {
+    let root = match std::env::var_os("APP_CLI_STATE_ROOT").filter(|value| !value.is_empty()) {
+        Some(explicit) => PathBuf::from(explicit),
+        None => workspace
+            .parent()
+            .context("workspace has no volume root")?
+            .to_path_buf(),
+    };
+    adopt_superseded_legacy_with_root(workspace, root, force)
+}
+
+/// [`adopt_superseded_legacy`] 的显式 root 形态（serve 的 open_with_root 同款
+/// 布局：authority root 独立于 legacy 候选路径）。
+pub fn adopt_superseded_legacy_with_root(
+    workspace: &Path,
+    root: PathBuf,
+    force: bool,
+) -> Result<String> {
+    // 活 owner 在跑 → open_root 的 try_lock 直接拒绝（与 serve 同因同文案）。
+    let authority = Journal::open_root(root.clone())?;
+    let project = runtime_state_layout::canonical_project_root(workspace);
+    let mut candidates = vec![project.clone()];
+    if let Some(parent) = project.parent() {
+        candidates.push(parent.to_path_buf());
+    }
+    let root_identity = std::fs::canonicalize(&root)?;
+    let conflicts: Vec<PathBuf> = candidates
+        .into_iter()
+        .filter(|legacy| {
+            std::fs::canonicalize(legacy).is_ok_and(|path| path != root_identity)
+                && (legacy
+                    .join(".deploy-operation.json")
+                    .try_exists()
+                    .unwrap_or(false)
+                    || legacy
+                        .join(".deploy-coordinator.json")
+                        .try_exists()
+                        .unwrap_or(false))
+        })
+        .collect();
+    if conflicts.is_empty() {
+        return Ok(format!(
+            "authority root: {}\nno conflicting legacy deployment records found",
+            root.display()
+        ));
+    }
+    anyhow::ensure!(
+        authority.receipt.is_some() || authority.previous_owner.is_some(),
+        "authority root {} has no deployment records; legacy records \
+         migrate automatically on the next serve — nothing to adopt",
+        root.display()
+    );
+    let mut report = format!("authority root: {}\n", root.display());
+    for legacy in conflicts {
+        let old = Journal::open_root(legacy.clone())?;
+        if !force {
+            let legacy_settled = domain_settled(
+                old.receipt.as_ref().map(|receipt| &receipt.boundary),
+                old.previous_owner.as_ref(),
+            );
+            let authority_settled = domain_settled(
+                authority.receipt.as_ref().map(|receipt| &receipt.boundary),
+                authority.previous_owner.as_ref(),
+            );
+            anyhow::ensure!(
+                authority_settled && legacy_settled,
+                "legacy {} or authority {} has an in-flight deployment handoff; \
+                 settle it or rerun with --force after verifying the authority root",
+                legacy.display(),
+                root.display()
+            );
+            anyhow::ensure!(
+                authority_covers_legacy(&root, &legacy),
+                "legacy records at {} are newer than authority {}; verify for \
+                 downgrade mixing, then rerun with --force",
+                legacy.display(),
+                root.display()
+            );
+        }
+        archive_superseded_records(&legacy)?;
+        report.push_str(&format!(
+            "archived superseded legacy records at {}\n",
+            legacy.display()
+        ));
+    }
+    Ok(report)
+}
+
+/// Current shared supervisor generation; cleanup is proved by its guardian.
+fn current_worker_generation() -> Option<String> {
+    process_utils::command_authority::current_root()?
+        .file_name()?
+        .to_str()
+        .map(str::to_owned)
+}
+
+/// Legacy container identity. This predates the shared supervisor and relies
+/// on the container orchestrator having stopped the previous instance. It is
+/// not sufficient evidence for retiring shared supervisor generations.
+fn process_scope() -> Option<String> {
+    let namespace = std::fs::read_link("/proc/1/ns/pid").ok()?;
+    let stat = std::fs::read_to_string("/proc/1/stat").ok()?;
+    let (_, fields) = stat.rsplit_once(") ")?;
+    let start = fields.split_whitespace().nth(19)?;
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    Some(format!("{}:{}:{start}", boot.trim(), namespace.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared_types::{AppCliDeployPhase, app_cli_deploy::AppDeploymentStage};
+    #[test]
+    fn source_and_run_alias_use_one_resolved_journal_without_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("project");
+        let run = source.join(".run");
+        std::fs::create_dir_all(&run).unwrap();
+        let root = runtime_state_layout::ensure_state_root(&source, None, None).unwrap();
+        let alias_root = runtime_state_layout::ensure_state_root(&run, None, None).unwrap();
+        assert_eq!(root, alias_root);
+        let mut first = Journal::open_with_root(&source, root.clone()).unwrap();
+        first.commit_coordinator().unwrap();
+        first.write(receipt(Boundary::Active)).unwrap();
+        first.commit_quiescent().unwrap();
+        assert!(Journal::open_with_root(&run, alias_root.clone()).is_err());
+        drop(first);
+        let second = Journal::open_with_root(&run, alias_root).unwrap();
+        second.require_fresh_process_scope().unwrap();
+        assert_eq!(
+            second.receipt.as_ref().unwrap().operation.operation_id,
+            "hot-b"
+        );
+        assert!(!source.join(".deploy-operation.json").exists());
+        assert!(!dir.path().join(".deploy-operation.json").exists());
+        assert!(root.join(".deploy-operation.json").exists());
+    }
+
+    #[test]
+    fn legacy_journal_migrates_only_after_bind_and_retains_old_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("project");
+        std::fs::create_dir_all(&source).unwrap();
+        let mut legacy = Journal::open_root(dir.path().to_path_buf()).unwrap();
+        legacy.commit_coordinator().unwrap();
+        legacy.write(receipt(Boundary::Active)).unwrap();
+        legacy.commit_quiescent().unwrap();
+        drop(legacy);
+        let root = runtime_state_layout::ensure_state_root(&source, None, None).unwrap();
+        let mut migrated = Journal::open_with_root(&source, root.clone()).unwrap();
+        assert!(dir.path().join(".deploy-operation.json").exists());
+        assert!(!root.join(".deploy-operation.json").exists());
+        migrated.migrate_after_bind().unwrap();
+        assert!(!dir.path().join(".deploy-operation.json").exists());
+        assert!(root.join(".deploy-operation.json").exists());
+        assert!(Journal::open_root(dir.path().to_path_buf()).is_err());
+        assert_eq!(
+            migrated.receipt.as_ref().unwrap().operation.operation_id,
+            "hot-b"
+        );
+    }
+
+    /// 双权威域·放行（2026-09-22 app-105 死锁修复的正例）：权威根记录更新且
+    /// 双侧均无在途交接（coordinator quiescent ∧ boundary 终态）→ 陈旧 legacy
+    /// 记录改名归档（不删除）、权威记录原样保留、serve 可正常启动。修复前该
+    /// 形态恒拒绝，"failed 待重部署"的自我补救（重新部署）永远无法发生。
+    #[test]
+    fn superseded_legacy_records_are_archived_when_authority_newer_and_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("project");
+        std::fs::create_dir_all(&source).unwrap();
+        let root = runtime_state_layout::ensure_state_root(&source, None, None).unwrap();
+        // legacy 先落（settled：quiescent + 终态 boundary + 遗留 state.toml）
+        let mut legacy = Journal::open_root(dir.path().to_path_buf()).unwrap();
+        legacy.commit_coordinator().unwrap();
+        legacy.write(receipt(Boundary::Active)).unwrap();
+        legacy.commit_quiescent().unwrap();
+        std::fs::write(dir.path().join(".deploy-state.toml"), "legacy").unwrap();
+        drop(legacy);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // 权威根后落（app-105 形态：一笔 failed 待重部署 + quiescent）
+        let mut authority = Journal::open_root(root.clone()).unwrap();
+        authority.commit_coordinator().unwrap();
+        authority.write(receipt(Boundary::Failed)).unwrap();
+        authority.commit_quiescent().unwrap();
+        let authority_bytes = std::fs::read(root.join(".deploy-operation.json")).unwrap();
+        drop(authority);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let mut journal = Journal::open_with_root(&source, root.clone()).unwrap();
+        assert!(
+            dir.path().join(".deploy-operation.json").exists(),
+            "history remains before actual cleanup"
+        );
+        journal.reconcile_legacy_after_quiescence().unwrap();
+        // 权威记录原样保留；journal 直接可用（重部署路径恢复）
+        assert_eq!(
+            std::fs::read(root.join(".deploy-operation.json")).unwrap(),
+            authority_bytes
+        );
+        assert_eq!(
+            journal.receipt.as_ref().unwrap().operation.operation_id,
+            "hot-b"
+        );
+        // legacy 三类记录全部改名归档；锁文件原样保留（旧二进制不得在 legacy
+        // 路径以全新记录启动）
+        assert!(!dir.path().join(".deploy-operation.json").exists());
+        assert!(!dir.path().join(".deploy-coordinator.json").exists());
+        assert!(!dir.path().join(".deploy-state.toml").exists());
+        assert!(dir.path().join(".deploy-operation.lock").exists());
+        let archived = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.contains(".superseded-"))
+            })
+            .count();
+        assert!(archived >= 3, "archived records: {archived}");
+    }
+
+    /// 双权威域·拒绝（任一侧在途）：legacy 侧 coordinator 从未 quiescent
+    /// （可能在跑/被中断未收束）→ 归档不生效，记录原样保留。
+    #[test]
+    fn old_active_legacy_metadata_does_not_block_after_real_quiescence() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("project");
+        std::fs::create_dir_all(&source).unwrap();
+        let root = runtime_state_layout::ensure_state_root(&source, None, None).unwrap();
+        let mut legacy = Journal::open_root(dir.path().to_path_buf()).unwrap();
+        legacy.commit_coordinator().unwrap();
+        legacy.write(receipt(Boundary::Active)).unwrap();
+        // 不 commit_quiescent：owner 仍 Active
+        drop(legacy);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut authority = Journal::open_root(root.clone()).unwrap();
+        authority.commit_coordinator().unwrap();
+        authority.write(receipt(Boundary::Failed)).unwrap();
+        authority.commit_quiescent().unwrap();
+        drop(authority);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let before = std::fs::read(dir.path().join(".deploy-operation.json")).unwrap();
+        let mut journal = Journal::open_with_root(&source, root.clone()).unwrap();
+        assert!(dir.path().join(".deploy-operation.json").exists());
+        assert!(root.join(".deploy-operation.json").exists());
+        assert!(
+            Journal::open_root(dir.path().to_path_buf()).is_err(),
+            "retain the actual old lock"
+        );
+        journal.reconcile_legacy_after_quiescence().unwrap();
+        assert!(!dir.path().join(".deploy-operation.json").exists());
+        let archived = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".deploy-operation.json.superseded-")
+            })
+            .unwrap();
+        assert_eq!(std::fs::read(archived).unwrap(), before);
+    }
+
+    /// 双权威域·拒绝（权威侧在途）：权威 boundary 处于交接中
+    /// （Switching）→ 不允许自动归档 legacy。
+    #[test]
+    fn old_switching_metadata_is_preserved_without_blocking_new_source_after_quiescence() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("project");
+        std::fs::create_dir_all(&source).unwrap();
+        let root = runtime_state_layout::ensure_state_root(&source, None, None).unwrap();
+        let mut legacy = Journal::open_root(dir.path().to_path_buf()).unwrap();
+        legacy.commit_coordinator().unwrap();
+        legacy.write(receipt(Boundary::Active)).unwrap();
+        legacy.commit_quiescent().unwrap();
+        drop(legacy);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut authority = Journal::open_root(root.clone()).unwrap();
+        authority.commit_coordinator().unwrap();
+        authority.write(receipt(Boundary::Switching)).unwrap();
+        authority.commit_quiescent().unwrap();
+        drop(authority);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let before = std::fs::read(root.join(".deploy-operation.json")).unwrap();
+        let mut journal = Journal::open_with_root(&source, root.clone()).unwrap();
+        assert!(dir.path().join(".deploy-operation.json").exists());
+        journal.reconcile_legacy_after_quiescence().unwrap();
+        assert_eq!(
+            std::fs::read(root.join(".deploy-operation.json")).unwrap(),
+            before
+        );
+        assert_eq!(
+            journal.receipt.as_ref().unwrap().boundary,
+            Boundary::Switching
+        );
+    }
+
+    /// 双权威域·拒绝（legacy 反而更新）：旧运行时在新布局迁移之后又写过
+    /// legacy 记录（降级混跑）——真相有争议，必须显式恢复。
+    #[test]
+    fn old_legacy_mtime_never_vetoes_current_authority_after_quiescence() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("project");
+        std::fs::create_dir_all(&source).unwrap();
+        let root = runtime_state_layout::ensure_state_root(&source, None, None).unwrap();
+        // 权威先落（settled）
+        let mut authority = Journal::open_root(root.clone()).unwrap();
+        authority.commit_coordinator().unwrap();
+        authority.write(receipt(Boundary::Failed)).unwrap();
+        authority.commit_quiescent().unwrap();
+        drop(authority);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // legacy 后落（settled 但更新）
+        let mut legacy = Journal::open_root(dir.path().to_path_buf()).unwrap();
+        legacy.commit_coordinator().unwrap();
+        legacy.write(receipt(Boundary::Active)).unwrap();
+        legacy.commit_quiescent().unwrap();
+        drop(legacy);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let before = std::fs::read(root.join(".deploy-operation.json")).unwrap();
+        let mut journal = Journal::open_with_root(&source, root.clone()).unwrap();
+        assert!(dir.path().join(".deploy-operation.json").exists());
+        assert!(root.join(".deploy-operation.json").exists());
+        journal.reconcile_legacy_after_quiescence().unwrap();
+        assert!(!dir.path().join(".deploy-operation.json").exists());
+        assert_eq!(
+            std::fs::read(root.join(".deploy-operation.json")).unwrap(),
+            before
+        );
+    }
+
+    // ── `app-cli journal adopt` 子命令（可审计显式裁决）────────────────────
+
+    /// 无冲突 → no-op 成功（升级前批量预检语义）。
+    #[test]
+    fn adopt_without_conflict_is_noop_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("code");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let root = runtime_state_layout::ensure_state_root(&workspace, None, None).unwrap();
+        let report = adopt_superseded_legacy_with_root(&workspace, root, false).unwrap();
+        assert!(report.contains("no conflicting legacy deployment records found"));
+    }
+
+    /// 权威根为空 → 拒绝归档：legacy 是下次 serve 自动迁移的来源，
+    /// 归档即掐断迁移（journal 历史丢失）。
+    #[test]
+    fn adopt_never_archives_when_authority_root_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("code");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let root = runtime_state_layout::ensure_state_root(&workspace, None, None).unwrap();
+        let mut legacy = Journal::open_root(dir.path().to_path_buf()).unwrap();
+        legacy.commit_coordinator().unwrap();
+        legacy.write(receipt(Boundary::Active)).unwrap();
+        legacy.commit_quiescent().unwrap();
+        drop(legacy);
+
+        let error = adopt_superseded_legacy_with_root(&workspace, root, false).unwrap_err();
+        assert!(error.to_string().contains("nothing to adopt"));
+        assert!(dir.path().join(".deploy-operation.json").exists());
+    }
+
+    /// 默认判定与 serve 自动收束同款：settled+权威新 → 归档；
+    /// legacy 在途 → 拒绝且记录原样；--force → 归档放行。
+    #[test]
+    fn adopt_follows_settled_checks_and_force_overrides() {
+        // 形态一：settled + 权威新（可自动收束的冲突）→ adopt 默认即归档
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("code");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let root = runtime_state_layout::ensure_state_root(&workspace, None, None).unwrap();
+        let mut legacy = Journal::open_root(dir.path().to_path_buf()).unwrap();
+        legacy.commit_coordinator().unwrap();
+        legacy.write(receipt(Boundary::Active)).unwrap();
+        legacy.commit_quiescent().unwrap();
+        drop(legacy);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut authority = Journal::open_root(root.clone()).unwrap();
+        authority.commit_coordinator().unwrap();
+        authority.write(receipt(Boundary::Failed)).unwrap();
+        authority.commit_quiescent().unwrap();
+        drop(authority);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let report = adopt_superseded_legacy_with_root(&workspace, root.clone(), false).unwrap();
+        assert!(report.contains("archived superseded legacy records"));
+        assert!(!dir.path().join(".deploy-operation.json").exists());
+        assert!(root.join(".deploy-operation.json").exists());
+
+        // 形态二：legacy 在途（coordinator 未 quiescent）→ 默认拒绝带原因，
+        // --force 归档放行
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("code");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let root = runtime_state_layout::ensure_state_root(&workspace, None, None).unwrap();
+        let mut legacy = Journal::open_root(dir.path().to_path_buf()).unwrap();
+        legacy.commit_coordinator().unwrap();
+        legacy.write(receipt(Boundary::Active)).unwrap();
+        // 不 quiescent：在途
+        drop(legacy);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut authority = Journal::open_root(root.clone()).unwrap();
+        authority.commit_coordinator().unwrap();
+        authority.write(receipt(Boundary::Failed)).unwrap();
+        authority.commit_quiescent().unwrap();
+        drop(authority);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let error = adopt_superseded_legacy_with_root(&workspace, root.clone(), false).unwrap_err();
+        assert!(error.to_string().contains("in-flight"));
+        assert!(dir.path().join(".deploy-operation.json").exists());
+        let report = adopt_superseded_legacy_with_root(&workspace, root, true).unwrap();
+        assert!(report.contains("archived superseded legacy records"));
+        assert!(!dir.path().join(".deploy-operation.json").exists());
+    }
+    fn receipt(boundary: Boundary) -> Receipt {
+        let request = DeployRequest {
+            runtime_operation_id: None,
+            url: "http://artifact/b".into(),
+            release_id: "b".into(),
+            sha256: None,
+            local_path: None,
+            execution_target: None,
+            run_pg: None,
+        };
+        Receipt {
+            generation: "generation-a".into(),
+
+            operation: AppDeploymentOperation {
+                operation_id: "hot-b".into(),
+                deployment_generation_id: "generation-a".into(),
+                request_release_id: "b".into(),
+                artifact_release_id: Some("manifest-b".into()),
+                persisted: true,
+                deploy_stage: AppDeploymentStage::Succeeded,
+                phase: AppCliDeployPhase::Running,
+                error: None,
+                recovery: None,
+            },
+            request: request.clone(),
+            boundary,
+            active: Some(ActiveVersion {
+                request: Some(request),
+                artifact_release_id: "manifest-b".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn deployment_receipt_keeps_actual_pg_across_atomic_write_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("state");
+        let mut original = receipt(Boundary::Active);
+        let credential = shared_types::StartPgCredential {
+            username: "business".into(),
+            password: "deployment-private-credential".into(),
+        };
+        original.request.run_pg = Some(credential.clone());
+        original
+            .active
+            .as_mut()
+            .unwrap()
+            .request
+            .as_mut()
+            .unwrap()
+            .run_pg = Some(credential.clone());
+        let mut journal = Journal::open_root(root.clone()).unwrap();
+        journal.write(original).unwrap();
+        let bytes = std::fs::read(root.join(".deploy-operation.json")).unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for pointer in [
+            "/request/run_pg/password",
+            "/active/request/run_pg/password",
+        ] {
+            assert_eq!(
+                stored.pointer(pointer).unwrap(),
+                "deployment-private-credential"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(root.join(".deploy-operation.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        drop(journal);
+        let reopened = Journal::open_root(root).unwrap();
+        let active = reopened.receipt.as_ref().unwrap().active.as_ref().unwrap();
+        assert_eq!(
+            active.request.as_ref().unwrap().run_pg.as_ref(),
+            Some(&credential)
+        );
+    }
+    #[test]
+    fn retired_configuration_fields_do_not_change_deployment_identity_or_boundary() {
+        let mut legacy = serde_json::to_value(receipt(Boundary::RestoredActive)).unwrap();
+        legacy["generation_handoff"] = serde_json::json!({"retired": true});
+        legacy["request"]["requires_configuration_activation"] = true.into();
+        legacy["active"]["request"]["requires_configuration_activation"] = true.into();
+        let restored: Receipt = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.generation, "generation-a");
+        assert_eq!(restored.boundary, Boundary::RestoredActive);
+        assert_eq!(restored.operation.operation_id, "hot-b");
+        assert_eq!(
+            restored.active.as_ref().unwrap().artifact_release_id,
+            "manifest-b"
+        );
+        let saved = serde_json::to_value(restored).unwrap();
+        assert!(saved.get("generation_handoff").is_none());
+        assert!(
+            saved["request"]
+                .get("requires_configuration_activation")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn journal_write_retires_known_fields_and_preserves_extensions_without_reviving_replays() {
+        use super::super::deploy_replay::{History, Replay};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let original_receipt = receipt(Boundary::RestoredActive);
+        let mut history = History::new();
+        for id in ["hot-b", "retained-op", "removed-op"] {
+            let mut operation = original_receipt.operation.clone();
+            operation.operation_id = id.into();
+            history.insert(
+                id.into(),
+                Replay {
+                    fingerprint: Some(format!("fingerprint-{id}")),
+                    operation,
+                },
+            );
+        }
+        let mut original = serde_json::to_value(StoredReceipt {
+            receipt: original_receipt,
+            deploy_replays: history,
+        })
+        .unwrap();
+        original["generation_handoff"] = serde_json::json!({"retired": true});
+        for pointer in ["/request", "/active/request"] {
+            let request = original
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap();
+            request.insert("requires_configuration_activation".into(), true.into());
+            request.insert("runtime_operation_id".into(), "retired-runtime".into());
+            request.insert(
+                "unknown_input_extension".into(),
+                serde_json::json!({"keep": true}),
+            );
+        }
+        original["unknown_receipt_extension"] = serde_json::json!({"keep": [1, 2, 3]});
+        original["operation"]["unknown_result_extension"] = "keep".into();
+        for id in ["hot-b", "retained-op", "removed-op"] {
+            original["deploy_replays"][id]["unknown_replay_extension"] = id.into();
+        }
+        let original_bytes = serde_json::to_vec_pretty(&original).unwrap();
+        std::fs::write(root.join(".deploy-operation.json"), &original_bytes).unwrap();
+        let backup = root.join(".deploy-operation.json.generation-compat-fixture.backup");
+        std::fs::write(&backup, &original_bytes).unwrap();
+
+        let mut journal = Journal::open_root(root.clone()).unwrap();
+        let mut updated = journal.receipt.clone().unwrap();
+        updated.request.runtime_operation_id = Some("current-process-only".into());
+        let mut history = journal.deploy_replays.clone();
+        history.remove("removed-op");
+        journal.write_with_history(updated, history).unwrap();
+        // Exercise a subsequent ordinary boundary write and a real disk reopen.
+        journal.write(journal.receipt.clone().unwrap()).unwrap();
+        drop(journal);
+        let reopened = Journal::open_root(root.clone()).unwrap();
+        assert!(!reopened.deploy_replays.contains_key("removed-op"));
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join(".deploy-operation.json")).unwrap())
+                .unwrap();
+        assert!(saved.get("generation_handoff").is_none());
+        for pointer in ["/request", "/active/request"] {
+            let request = saved.pointer(pointer).unwrap();
+            assert!(request.get("requires_configuration_activation").is_none());
+            assert!(request.get("runtime_operation_id").is_none());
+            assert_eq!(
+                request["unknown_input_extension"],
+                original.pointer(pointer).unwrap()["unknown_input_extension"]
+            );
+        }
+        assert_eq!(
+            saved["unknown_receipt_extension"],
+            original["unknown_receipt_extension"]
+        );
+        assert_eq!(
+            saved["operation"]["unknown_result_extension"],
+            original["operation"]["unknown_result_extension"]
+        );
+        for id in ["hot-b", "retained-op"] {
+            assert_eq!(
+                saved["deploy_replays"][id]["unknown_replay_extension"],
+                original["deploy_replays"][id]["unknown_replay_extension"]
+            );
+        }
+        assert!(saved["deploy_replays"].get("removed-op").is_none());
+        assert_eq!(
+            std::fs::read(backup).unwrap(),
+            original_bytes,
+            "raw backup must remain byte-for-byte intact"
+        );
+    }
+
+    #[test]
+    fn confirmed_startup_failure_keeps_artifact_but_legacy_failure_stays_protected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&dir.path().join("code")).unwrap();
+        journal.write(receipt(Boundary::StartupFailed)).unwrap();
+        let saved = journal.resume("generation-a").unwrap().unwrap();
+        assert_eq!(saved.boundary, Boundary::StartupFailed);
+        assert_eq!(saved.active.unwrap().artifact_release_id, "manifest-b");
+        journal.write(receipt(Boundary::Failed)).unwrap();
+        assert!(journal.resume("generation-a").is_err());
+    }
+
+    #[test]
+    fn durable_hot_receipt_overrides_same_generation_stale_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("code");
+        let mut journal = Journal::open(&workspace).unwrap();
+        journal.write(receipt(Boundary::Active)).unwrap();
+        assert!(Journal::open(&workspace).is_err());
+        drop(journal);
+        let journal = Journal::open(&workspace).unwrap();
+        let resumed = journal.resume("generation-a").unwrap().unwrap();
+        assert_eq!(resumed.active.unwrap().request.unwrap().release_id, "b");
+        assert_eq!(resumed.operation.operation_id, "hot-b");
+        assert!(journal.resume("generation-new").unwrap().is_none());
+    }
+    #[test]
+    fn interrupted_switch_fails_closed_but_prepare_preserves_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&dir.path().join("code")).unwrap();
+        journal.write(receipt(Boundary::Preparing)).unwrap();
+        assert!(journal.resume("generation-a").unwrap().is_some());
+        journal.write(receipt(Boundary::Switching)).unwrap();
+        assert!(journal.resume("generation-a").is_err());
+        assert!(journal.resume("generation-new").unwrap().is_none());
+    }
+    #[test]
+    fn coordinator_scope_survives_two_opens_without_a_deployment_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("code");
+        let mut first = Journal::open(&workspace).unwrap();
+        first.process_scope = Some("container-a".into());
+        first.require_fresh_process_scope().unwrap();
+        first.commit_coordinator().unwrap();
+        assert!(first.receipt.is_none());
+        drop(first);
+        let before = std::fs::read(dir.path().join(".deploy-coordinator.json")).unwrap();
+        let mut second = Journal::open(&workspace).unwrap();
+        second.process_scope = Some("container-a".into());
+        assert_eq!(
+            std::fs::read(dir.path().join(".deploy-coordinator.json")).unwrap(),
+            before
+        );
+        assert!(second.require_fresh_process_scope().is_err());
+        second.process_scope = Some("container-b".into());
+        second.require_fresh_process_scope().unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(".deploy-coordinator.json")).unwrap(),
+            before
+        );
+        second.commit_coordinator().unwrap();
+        drop(second);
+        let mut third = Journal::open(&workspace).unwrap();
+        third.process_scope = Some("container-b".into());
+        assert!(third.require_fresh_process_scope().is_err());
+    }
+
+    #[test]
+    fn clean_owner_allows_unknown_and_same_scope_restarts_but_claim_is_active() {
+        for scope in [None, Some("native-linux".to_owned())] {
+            let dir = tempfile::tempdir().unwrap();
+            let workspace = dir.path().join("code");
+            let mut first = Journal::open(&workspace).unwrap();
+            first.process_scope = scope.clone();
+            first.commit_coordinator().unwrap();
+            first.commit_quiescent().unwrap();
+            drop(first);
+            let mut second = Journal::open(&workspace).unwrap();
+            second.process_scope = scope;
+            second.require_fresh_process_scope().unwrap();
+            second.commit_coordinator().unwrap();
+            assert!(second.require_fresh_process_scope().is_err());
+        }
+    }
+    #[test]
+    fn legacy_owner_without_state_defaults_active() {
+        let owner: CoordinatorOwner = serde_json::from_str(r#"{"process_scope":null}"#).unwrap();
+        assert_eq!(owner.state, OwnerState::Active);
+    }
+
+    #[test]
+    fn unreadable_or_unknown_coordinator_scope_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("code");
+        let owner = dir.path().join(".deploy-coordinator.json");
+        std::fs::create_dir(&owner).unwrap();
+        assert!(Journal::open(&workspace).is_err());
+        std::fs::remove_dir(&owner).unwrap();
+        std::fs::write(&owner, br#"{"process_scope":null}"#).unwrap();
+        let mut journal = Journal::open(&workspace).unwrap();
+        journal.process_scope = Some("container-b".into());
+        assert!(journal.require_fresh_process_scope().is_err());
+        drop(journal);
+        std::fs::write(&owner, b"invalid-json").unwrap();
+        assert!(Journal::open(&workspace).is_err());
+    }
+
+    #[test]
+    fn corrupted_receipt_is_not_treated_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".deploy-operation.json"), b"invalid").unwrap();
+        assert!(Journal::open(&dir.path().join("code")).is_err());
+        // A supervised successor has independently retired the old processes.
+        // Rebuild bookkeeping without destroying the original diagnostic record.
+        let journal =
+            Journal::open_recovering(&dir.path().join("code"), dir.path().into(), true).unwrap();
+        assert!(journal.receipt.is_none());
+        let backup = std::fs::read_dir(dir.path())
+            .unwrap()
+            .find_map(|entry| {
+                let path = entry.unwrap().path();
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".corrupt-")
+                    .then_some(path)
+            })
+            .expect("original receipt preserved");
+        assert_eq!(std::fs::read(backup).unwrap(), b"invalid");
+    }
+
+    #[test]
+    fn quarantined_deployment_input_survives_restart_until_explicit_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("code");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let migrations = dir.path().join("migration-receipts");
+        std::fs::create_dir_all(&migrations).unwrap();
+        let pending_migration = migrations.join("pending.json");
+        let pending_bytes = br#"{"identity":"pending","completed":false}"#;
+        std::fs::write(&pending_migration, pending_bytes).unwrap();
+        std::fs::write(dir.path().join(".deploy-operation.json"), b"invalid").unwrap();
+        let mut journal = Journal::open_with_root(&workspace, dir.path().into()).unwrap();
+        assert!(!journal.automatic_recovery_allowed().unwrap());
+        journal.commit_coordinator().unwrap();
+        journal.commit_quiescent().unwrap();
+        drop(journal);
+
+        let mut journal = Journal::open_with_root(&workspace, dir.path().into()).unwrap();
+        assert!(!journal.automatic_recovery_allowed().unwrap());
+        // A damaged marker is diagnostic bookkeeping too: explicit replacement
+        // repairs it without discarding the raw bytes or migration diagnostics.
+        std::fs::write(dir.path().join(RECOVERY_REQUIRED_RECORD), b"invalid-marker").unwrap();
+        assert!(!journal.automatic_recovery_allowed().unwrap());
+        journal.write(receipt(Boundary::Preparing)).unwrap();
+        assert!(!journal.automatic_recovery_allowed().unwrap());
+        let mut unrelated = receipt(Boundary::Active);
+        unrelated.operation.operation_id = "another-operation".into();
+        journal.write(unrelated).unwrap();
+        assert!(!journal.automatic_recovery_allowed().unwrap());
+        journal.write(receipt(Boundary::Active)).unwrap();
+        assert!(journal.automatic_recovery_allowed().unwrap());
+        assert_eq!(std::fs::read(&pending_migration).unwrap(), pending_bytes);
+        assert!(!crate::migration_journal::inspect_migrations(&workspace).unwrap());
+        drop(journal);
+        assert!(
+            Journal::open_with_root(&workspace, dir.path().into())
+                .unwrap()
+                .automatic_recovery_allowed()
+                .unwrap()
+        );
+        assert!(std::fs::read_dir(dir.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".corrupt-")
+        }));
+        assert!(std::fs::read_dir(dir.path()).unwrap().any(|entry| {
+            std::fs::read(entry.unwrap().path()).is_ok_and(|bytes| bytes == b"invalid-marker")
+        }));
+    }
+
+    #[test]
+    fn lost_legacy_input_marker_migrates_with_the_journal_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join(".deploy-operation.json"), b"invalid").unwrap();
+        let root = dir.path().join("authority");
+        let mut journal = Journal::open_with_root(&workspace, root.clone()).unwrap();
+        assert!(!journal.automatic_recovery_allowed().unwrap());
+        journal.migrate_after_bind().unwrap();
+        assert!(!workspace.join(RECOVERY_REQUIRED_RECORD).exists());
+        assert!(root.join(RECOVERY_REQUIRED_RECORD).exists());
+        drop(journal);
+        let journal = Journal::open_with_root(&workspace, root).unwrap();
+        assert!(!journal.automatic_recovery_allowed().unwrap());
+    }
+}

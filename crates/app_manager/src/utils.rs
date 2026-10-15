@@ -1,10 +1,9 @@
 //! service 层工具函数（错误映射 / 校验 / 状态派生 / 类型映射）
 
 use container_runtime_api::{
-    ContainerRuntimeError, DeploymentStatus, ExposeType as RtExposeType,
-    HealthCheckType as RtHealthCheckType,
+    ContainerFailureReason, ContainerRuntimeError, CreationStage, DeploymentStatus,
+    ExposeType as RtExposeType, HealthCheckType as RtHealthCheckType,
 };
-use download_utils::ArchiveError;
 use shared_types::ServiceType;
 
 use super::models::*;
@@ -15,15 +14,73 @@ use super::models::*;
 /// thiserror variant 无 source，`{e}` 即 variant Display（含原始 daemon message）。
 pub(super) fn map_runtime_error(ctx: &str, e: ContainerRuntimeError) -> AppOperationError {
     match e {
-        // 容器/deployment 不存在 = app 不存在（404）
-        ContainerRuntimeError::ContainerNotFound(_) => {
-            AppOperationError::NotFound(format!("{ctx}: {e}"))
+        ContainerRuntimeError::RequestRejected(mut rejection) => {
+            rejection.message = format!("{ctx}: {}", rejection.message);
+            AppOperationError::RuntimeRejected(rejection)
         }
-        // 其余 8 类（Connection/Creation/Start/Stop/Configuration/Timeout/K8s/Docker）
-        // 都是后端运行时/基础设施问题，客户端不可恢复，归 Backend(500)。
-        // ConfigurationError 在 runtime 是内部前置条件（params 缺字段），非用户输入，
-        // 归 Backend 最保守，避免误判 400。
-        _ => AppOperationError::Backend(format!("{ctx}: {e}")),
+        ContainerRuntimeError::Conflict(_) => AppOperationError::Conflict(format!("{ctx}: {e}")),
+        ContainerRuntimeError::OperationInProgress(operation) => {
+            tracing::debug!(%operation, context = ctx, "runtime occupied operation has no authoritative holder projection at this boundary");
+            AppOperationError::operation_in_progress(
+                None,
+                shared_types::OperationInProgressData::default(),
+            )
+        }
+        ContainerRuntimeError::CreationAborted { progress, source } => {
+            if progress.safe_finish_ok() {
+                return map_runtime_error(ctx, *source);
+            }
+            // Cumulative write evidence belongs to this creation, even when
+            // its last transport error looks like an ordinary read timeout.
+            let stage = match progress.failed_at {
+                CreationStage::Capture => "creation_capture",
+                CreationStage::PvcEnsure => "creation_pvc_ensure",
+                CreationStage::StorageClaim => "creation_storage_claim",
+                CreationStage::WriteGeneration => "creation_write_generation",
+                CreationStage::ApplyService => "creation_apply_service",
+            };
+            let mut failure = map_runtime_error(ctx, *source).wake_failure(stage);
+            failure.code = shared_types::ERR_OPERATION_OUTCOME_UNKNOWN.into();
+            failure.stage = stage.into();
+            failure.retryable = false;
+            AppOperationError::Diagnostic(failure)
+        }
+        // Runtime variants retain their specific diagnostic code. Mutation
+        // completion and durable recovery fences are decided by the caller.
+        _ => {
+            let (code, _) = container_runtime_api::runtime_error_code(&e);
+            AppOperationError::Diagnostic(shared_types::WakeFailure::new(
+                code,
+                "runtime",
+                format!("{ctx}: {e}"),
+            ))
+        }
+    }
+}
+
+/// Mapping for an actual runtime write, after the caller has captured its target.
+/// A lost reply retains the underlying cause and never authorizes a replay.
+pub(super) fn map_runtime_mutation_error(
+    stage: &'static str,
+    ctx: &str,
+    error: ContainerRuntimeError,
+) -> AppOperationError {
+    let unknown = container_runtime_api::runtime_mutation_outcome_unknown(&error);
+    let creation = matches!(&error, ContainerRuntimeError::CreationAborted { .. });
+    let mapped = map_runtime_error(ctx, error);
+    if unknown {
+        let mut failure = mapped.wake_failure(stage);
+        failure.code = shared_types::ERR_OPERATION_OUTCOME_UNKNOWN.into();
+        if !creation {
+            failure.stage = stage.into();
+        }
+        failure.retryable = false;
+        AppOperationError::Diagnostic(failure)
+    } else if let AppOperationError::Diagnostic(mut failure) = mapped {
+        failure.stage = stage.into();
+        AppOperationError::Diagnostic(failure)
+    } else {
+        mapped
     }
 }
 
@@ -39,42 +96,6 @@ pub(super) fn map_io_error(ctx: &str, e: std::io::Error, is_file_op: bool) -> Ap
         }
         _ => AppOperationError::Backend(format!("{ctx}: {e}")),
     }
-}
-
-/// `ArchiveError`（download_utils 解压错误）→ `AppOperationError`。
-/// 非法路径 / 解压超限 / 无效压缩包 → `Validation`（400，客户端错误）；
-/// IO → `Backend`（500）。
-pub(super) fn map_archive_error(e: ArchiveError) -> AppOperationError {
-    match e {
-        ArchiveError::PathTraversal(msg) => {
-            AppOperationError::Validation(format!("archive contains illegal path: {msg}"))
-        }
-        ArchiveError::InvalidArchive(msg) => {
-            AppOperationError::Validation(format!("invalid archive: {msg}"))
-        }
-        ArchiveError::Io(e) => map_io_error("archive IO error", e, true),
-    }
-}
-
-/// canonicalize `target` 并校验仍在 `canonical_app_dir` 内（path traversal 防护）。
-///
-/// 文件操作（upload/extract/list/delete）共用。
-/// 调用前需保证 `target` 已存在（否则 canonicalize 抛 OS 错误 → Backend）；
-/// 需要 NotFound 语义的调用方（如日志文件读取）应先 `target.exists()` 守卫。
-/// `canonical_app_dir` 应由调用方预先 canonicalize（通常在创建目录后立即取）。
-pub(super) fn ensure_within_app_dir(
-    target: &std::path::Path,
-    canonical_app_dir: &std::path::Path,
-) -> AppResult<std::path::PathBuf> {
-    let canonical = target
-        .canonicalize()
-        .map_err(|e| map_io_error("failed to resolve path", e, false))?;
-    if !canonical.starts_with(canonical_app_dir) {
-        return Err(AppOperationError::Validation(
-            "path is outside app dir".to_string(),
-        ));
-    }
-    Ok(canonical)
 }
 
 /// 校验 upload target（app 根相对路径）。
@@ -104,78 +125,60 @@ pub(super) fn validate_upload_target(target: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// 校验 app_id 格式（create_app 生成 `app-` + 8 个十六进制字符）
+/// 校验 app_id 格式（小写字母数字，≤ USERAPP_APP_ID_MAX_LEN）
 ///
 /// app_id 直接来自 HTTP 路径参数，会流入文件系统路径拼接（delete/upload/logs/list）。
-/// 此校验是路径穿越的纵深防御（Fail Fast）：拒绝 `..`、绝对路径、非法格式，
-/// 避免恶意 app_id 触达工作空间目录之外。
+/// 此校验是路径穿越的纵深防御（Fail Fast）：白名单字符集 `[a-z0-9]` 天然排除
+/// `..`、`/`、绝对路径，避免恶意 app_id 触达工作空间目录之外。
+///
+/// 不强制 `app` 前缀：create_app 缺省自动生成 `app{8hex}`，外部也可指定自有
+/// 体系 ID（如 Java 侧数值 project_id，≤20 位）。两者命名空间不冲突——下游无
+/// `strip_prefix("app")` 归一化，`app123` 与 `123` 是两个独立 app；create 侧
+/// 另有唯一性检查兜底。
+///
+/// **禁 `-`（builder 复合键结构性要求）**：dev builder 容器以
+/// `{user_id}-{app_id}` 复合 identifier 定位（见
+/// `shared_types::builder_instance_id`），唯一可用分隔符是 `-`（K8s svc 名
+/// DNS-1035 不允许 `.`/`_`），app_id 段含 `-` 会使复合串解析歧义——入口拒绝。
+///
+/// 长度上限 22（`USERAPP_APP_ID_MAX_LEN`）：K8s 下 builder STS pod 的
+/// controller-revision-hash label = `rcoder-app-builder-{user_id}-{app_id}-{10位hash}`
+/// 受 K8s 63 字节限（user_id 现网 10 位），超长复合 id 创建必然失败且表象
+/// 含糊——入口拒绝。
 pub(super) fn validate_app_id(app_id: &str) -> AppResult<()> {
-    // 必须 app- 前缀（统一，和自动生成一致）
-    let rest = app_id.strip_prefix("app-").ok_or_else(|| {
-        AppOperationError::Validation("invalid app_id: must start with 'app-'".to_string())
-    })?;
-    if rest.is_empty() {
+    if app_id.is_empty() {
         return Err(AppOperationError::Validation(
-            "invalid app_id: empty after 'app-'".to_string(),
+            "invalid app_id: must not be empty".to_string(),
         ));
     }
-    // DNS-1123 label 合规（[a-z0-9]([-a-z0-9]*[a-z0-9])?，≤63；支持 app-order-svc 等业务名）
-    if rest.len() > 63
-        || !rest
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
+    if app_id.len() > shared_types::USERAPP_APP_ID_MAX_LEN {
         return Err(AppOperationError::Validation(format!(
-            "invalid app_id: must be DNS-1123 label (lowercase alphanumeric or '-', got '{rest}')"
+            "invalid app_id: length {} exceeds {} (K8s StatefulSet label 63-byte limit, \
+             see USERAPP_APP_ID_MAX_LEN)",
+            app_id.len(),
+            shared_types::USERAPP_APP_ID_MAX_LEN
         )));
     }
-    if rest.starts_with('-') || rest.ends_with('-') {
-        return Err(AppOperationError::Validation(
-            "invalid app_id: must not start/end with '-'".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// 校验 PG 标识符（数据库名 / 用户名）：首字符字母或下划线，其余字母/数字/下划线，≤63 字符。
-/// 防 SQL 注入（标识符进双引号，但严格白名单更稳）。
-pub(super) fn validate_pg_identifier(name: &str) -> AppResult<()> {
-    if name.is_empty() || name.len() > 63 {
-        return Err(AppOperationError::Validation(
-            "PG identifier must be 1..=63 chars".to_string(),
-        ));
-    }
-    // 首字符：必须字母或下划线（is_empty 已由上方长度校验拦截，无需再处理 None）
-    if let Some(first) = name.chars().next()
-        && !(first.is_ascii_alphabetic() || first == '_')
-    {
-        return Err(AppOperationError::Validation(
-            "PG identifier must start with letter or '_'".to_string(),
-        ));
-    }
-    if !name
+    // 小写字母数字与内部 '-'（DNS-1123 label segment：首尾必须字母数字；
+    // 复合键时代的 '-' 全禁令随用户绑定移除失效——共享模型下 app_id 无
+    // 分隔符歧义，支持 `app-xxx` 形态与纯数值 project_id）
+    let valid_charset = app_id
         .chars()
-        .skip(1)
-        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return Err(AppOperationError::Validation(
-            "PG identifier: only [a-zA-Z0-9_] allowed".to_string(),
-        ));
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    let valid_edges = app_id
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && app_id
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+    if !valid_charset || !valid_edges {
+        return Err(AppOperationError::Validation(format!(
+            "invalid app_id: must be lowercase alphanumeric with inner hyphens (DNS-1123 label), got '{app_id}'"
+        )));
     }
     Ok(())
-}
-
-/// 从 PortConfig 列表提取 HTTP 端口号（供 Pingora backend 注册，create/update 共用）
-pub(super) fn http_port_numbers(ports: &Option<Vec<PortConfig>>) -> Vec<u16> {
-    ports
-        .as_ref()
-        .map(|ps| {
-            ps.iter()
-                .filter(|p| p.expose_type == ExposeType::Http)
-                .map(|p| p.port)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// 运行时 phase → 应用状态枚举
@@ -189,20 +192,29 @@ pub(super) fn phase_to_status(phase: &str) -> AppStatus {
     }
 }
 
-/// 从 message 中提取简短机器码原因（CrashLoopBackOff / ImagePullBackOff 等）
-pub(super) fn extract_reason(msg: &str) -> Option<&str> {
-    const KNOWN: &[&str] = &[
-        "CrashLoopBackOff",
-        "ImagePullBackOff",
-        "ErrImagePull",
-        "CreateContainerConfigError",
-        "CreateContainerError",
-        "InvalidImageName",
-        "RunContainerError",
-        "StartError",
-        "OOMKilled",
-    ];
-    KNOWN.iter().find(|k| msg.contains(*k)).copied()
+/// 容器失败原因分类（契约 C4）：**结构化 reason 字段优先**（[`ContainerFailureReason`]
+/// 类型化、边界已 parse），message 白名单仅作单点收窄兜底（[`extract_reason`]，
+/// 整 token 不子串）。都未命中 → None，调用方按 "Error" 兜底
+/// （输出与 message 回扫时代一致）。
+pub(super) fn classify_k8s_reason(
+    reason: Option<ContainerFailureReason>,
+    message: Option<&str>,
+) -> Option<ContainerFailureReason> {
+    reason.or_else(|| message.and_then(extract_reason))
+}
+
+/// message 兜底白名单（单点文档化，非主判据——主判据是结构化 reason 字段）。
+/// 整 token 等值匹配（不子串），命中顺序按 [`ContainerFailureReason::ALL`] 优先序。
+fn extract_reason(msg: &str) -> Option<ContainerFailureReason> {
+    ContainerFailureReason::ALL
+        .into_iter()
+        .find(|r| message_has_token(msg, r.as_str()))
+}
+
+fn message_has_token(msg: &str, token: &str) -> bool {
+    msg.split_whitespace()
+        .map(|raw| raw.trim_matches(|c: char| !(c.is_alphanumeric() || c == '_')))
+        .any(|t| t == token)
 }
 
 /// 由 DeploymentStatus 派生 conditions（见设计文档 §6.3 派生表）
@@ -221,11 +233,8 @@ pub(super) fn derive_conditions(status: &DeploymentStatus) -> Vec<Condition> {
     };
     match app_status {
         AppStatus::Error => {
-            let reason = status
-                .message
-                .as_deref()
-                .and_then(extract_reason)
-                .unwrap_or("Error");
+            let reason = classify_k8s_reason(status.reason, status.message.as_deref())
+                .map_or("Error", |r| r.as_str());
             vec![
                 mk("Error", "True", Some(reason), status.message.clone()),
                 mk("Ready", "False", Some("Error"), None),
@@ -254,7 +263,7 @@ pub(super) fn health_from_status(status: &DeploymentStatus) -> HealthInfo {
         instance: Some(InstanceInfo {
             name: format!(
                 "{}-{}",
-                ServiceType::UserApp.container_prefix(),
+                ServiceType::Userapp.container_prefix(),
                 status.app_id
             ),
             phase: status.phase.clone(),
@@ -302,80 +311,63 @@ mod tests {
 
     #[test]
     fn validate_app_id_ok() {
-        assert!(validate_app_id("app-order-svc").is_ok());
-        assert!(validate_app_id("app-1a2b3c4d").is_ok());
-        assert!(validate_app_id("app-a").is_ok()); // 最短合法
+        assert!(validate_app_id("appordersvc").is_ok());
+        assert!(validate_app_id("app1a2b3c4d").is_ok());
+        assert!(validate_app_id("appa").is_ok()); // 最短合法
+        assert!(validate_app_id("app-e2e-empty1").is_ok()); // 内部连字符（复合键禁令解除）
+        // 外部自有体系 ID：纯数值（Java 侧 project_id，≤20 位）
+        assert!(validate_app_id("1234567890123456789").is_ok());
+        assert!(validate_app_id("123").is_ok());
+        // 上限边界：恰好 22 字符
+        let edge = format!("app{}", "x".repeat(19));
+        assert_eq!(edge.len(), shared_types::USERAPP_APP_ID_MAX_LEN);
+        assert!(validate_app_id(&edge).is_ok());
     }
 
     #[test]
-    fn validate_app_id_err_no_prefix() {
-        // 无 app- 前缀
-        assert!(validate_app_id("order-svc").is_err());
+    fn validate_app_id_err_too_long() {
+        // 超 22：K8s builder STS revision-hash label 超 63 字节必炸
+        //（复合 identifier {user_id}-{app_id} 预算），
+        // 入口 Fail Fast（而非 apiserver FailedCreate 含糊表象）
+        let too_long = format!("app{}", "x".repeat(20));
+        let err = validate_app_id(&too_long).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("USERAPP_APP_ID_MAX_LEN") || msg.contains("22"),
+            "报错应带上限指引: {msg}"
+        );
     }
 
     #[test]
-    fn validate_app_id_err_empty_after_prefix() {
-        // prefix 后为空
+    fn validate_app_id_err_empty() {
+        // 空串非法
+        assert!(validate_app_id("").is_err());
+    }
+
+    #[test]
+    fn validate_app_id_err_bare_prefix() {
+        // 裸 "app"（无 '-' 前缀时代尾部 '-'）现为合法短 id；
+        // 连字符拒绝改由本用例锚定
+        assert!(validate_app_id("app").is_ok());
         assert!(validate_app_id("app-").is_err());
     }
 
     #[test]
     fn validate_app_id_err_uppercase() {
         // 大写非法（DNS-1123 label）
-        assert!(validate_app_id("app-UPPER").is_err());
+        assert!(validate_app_id("appUPPER").is_err());
     }
 
     #[test]
     fn validate_app_id_err_path_traversal() {
         // 含 ../ 等穿越字符
-        assert!(validate_app_id("app-../../../etc").is_err());
-    }
-
-    #[test]
-    fn validate_app_id_err_too_long() {
-        // rest > 63 字符
-        let too_long = format!("app-{}", "a".repeat(64));
-        assert!(validate_app_id(&too_long).is_err());
+        assert!(validate_app_id("app../../../etc").is_err());
     }
 
     #[test]
     fn validate_app_id_err_trailing_dash() {
         // 尾部 '-' 非法
-        assert!(validate_app_id("app-trailing-").is_err());
-    }
-
-    // ---------------- validate_pg_identifier ----------------
-
-    #[test]
-    fn validate_pg_identifier_ok() {
-        assert!(validate_pg_identifier("mydb").is_ok());
-        assert!(validate_pg_identifier("_underscore").is_ok());
-        assert!(validate_pg_identifier("MixedCase123").is_ok());
-    }
-
-    #[test]
-    fn validate_pg_identifier_err_empty() {
-        assert!(validate_pg_identifier("").is_err());
-    }
-
-    #[test]
-    fn validate_pg_identifier_err_starts_with_digit() {
-        assert!(validate_pg_identifier("1num").is_err());
-    }
-
-    #[test]
-    fn validate_pg_identifier_err_dash() {
-        assert!(validate_pg_identifier("has-dash").is_err());
-    }
-
-    #[test]
-    fn validate_pg_identifier_err_space() {
-        assert!(validate_pg_identifier("has space").is_err());
-    }
-
-    #[test]
-    fn validate_pg_identifier_err_injection() {
-        assert!(validate_pg_identifier("a;b").is_err());
+        assert!(validate_app_id("apptrailing-").is_err());
     }
 
     // ---------------- validate_upload_target ----------------
@@ -437,14 +429,20 @@ mod tests {
     fn extract_reason_finds_known_code() {
         assert_eq!(
             extract_reason("Back-off restarting... CrashLoopBackOff"),
-            Some("CrashLoopBackOff")
+            Some(ContainerFailureReason::CrashLoopBackOff)
         );
         assert_eq!(
             extract_reason("ImagePullBackOff: pull failed"),
-            Some("ImagePullBackOff")
+            Some(ContainerFailureReason::ImagePullBackOff)
         );
-        assert_eq!(extract_reason("ErrImagePull"), Some("ErrImagePull"));
-        assert_eq!(extract_reason("OOMKilled"), Some("OOMKilled"));
+        assert_eq!(
+            extract_reason("ErrImagePull"),
+            Some(ContainerFailureReason::ErrImagePull)
+        );
+        assert_eq!(
+            extract_reason("OOMKilled"),
+            Some(ContainerFailureReason::OOMKilled)
+        );
     }
 
     #[test]
@@ -452,44 +450,37 @@ mod tests {
         assert_eq!(extract_reason("normal log message"), None);
     }
 
-    // ---------------- http_port_numbers ----------------
+    // ---------------- classify_k8s_reason（契约 C4） ----------------
 
     #[test]
-    fn http_port_numbers_filters_http_only() {
-        // 2 HTTP + 1 TCP → 只返回 HTTP 端口
-        let ports = Some(vec![
-            PortConfig {
-                name: "web".into(),
-                port: 8080,
-                expose_type: ExposeType::Http,
-                strip_prefix: None,
-            },
-            PortConfig {
-                name: "db".into(),
-                port: 5432,
-                expose_type: ExposeType::Tcp,
-                strip_prefix: None,
-            },
-        ]);
-        assert_eq!(http_port_numbers(&ports), vec![8080]);
+    fn structured_reason_wins_without_message_match() {
+        // T003 反例（修复前必挂）: reason 字段结构化命中, message 无该词也必须分类。
+        assert_eq!(
+            classify_k8s_reason(
+                Some(ContainerFailureReason::CrashLoopBackOff),
+                Some("back-off 5m0s")
+            ),
+            Some(ContainerFailureReason::CrashLoopBackOff)
+        );
+        assert_eq!(
+            classify_k8s_reason(Some(ContainerFailureReason::OOMKilled), None),
+            Some(ContainerFailureReason::OOMKilled)
+        );
     }
 
     #[test]
-    fn http_port_numbers_none_returns_empty() {
-        let result: Vec<u16> = http_port_numbers(&None);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn http_port_numbers_tcp_only_returns_empty() {
-        let tcp_only = Some(vec![PortConfig {
-            name: "db".into(),
-            port: 5432,
-            expose_type: ExposeType::Tcp,
-            strip_prefix: None,
-        }]);
-        let result: Vec<u16> = http_port_numbers(&tcp_only);
-        assert!(result.is_empty());
+    fn message_fallback_is_whitelist_only_and_token_scoped() {
+        // 结构化字段缺失/未知 → 单点 message 白名单兜底; 过宽子串不得吞错。
+        assert_eq!(
+            classify_k8s_reason(None, Some("ImagePullBackOff: pull failed")),
+            Some(ContainerFailureReason::ImagePullBackOff)
+        );
+        assert_eq!(
+            classify_k8s_reason(None, Some("xCrashLoopBackOffx foo")),
+            None,
+            "子串含关键词但非整 token 不得吞错"
+        );
+        assert_eq!(classify_k8s_reason(None, Some("normal log message")), None);
     }
 
     // ---------------- map_expose_type / map_health_check_type ----------------
@@ -524,5 +515,31 @@ mod tests {
             map_health_check_type(&HealthCheckType::None),
             RtHealthCheckType::None
         ));
+    }
+}
+
+#[cfg(test)]
+mod implementation_runtime_identity_tests {
+    use super::*;
+    #[test]
+    fn runtime_in_progress_does_not_promote_legacy_annotation_to_operation_identity() {
+        let error = map_runtime_error(
+            "wake status probe",
+            ContainerRuntimeError::OperationInProgress(Box::new(
+                shared_types::UserAppOperationInProgress {
+                    app_id: "app1".into(),
+                    service_type: ServiceType::Userapp,
+                    resource_name: "app1-operation".into(),
+                    operation_id: Some("original-runtime-op".into()),
+                },
+            )),
+        );
+        assert_eq!(error.code(), shared_types::ERR_OPERATION_IN_PROGRESS);
+        assert_eq!(error.operation_id(), None);
+        assert!(!error.message().contains("original-runtime-op"));
+        assert_eq!(
+            error.operation_in_progress_data(),
+            Some(shared_types::OperationInProgressData::default())
+        );
     }
 }

@@ -38,6 +38,15 @@ pub const AGENT_TASK_DURATION_SECONDS: &str = "agent_task_duration_seconds";
 /// 活跃任务数
 pub const AGENT_ACTIVE_TASKS: &str = "agent_active_tasks";
 
+/// 容器操作总数（op=ensure/create/destroy，result=ok/fail）
+pub const CONTAINER_OPS_TOTAL: &str = "container_ops_total";
+/// 容器 ensure（就绪/唤醒/创建）端到端耗时——chat 冷启动观测核心指标
+pub const CONTAINER_ENSURE_DURATION_SECONDS: &str = "container_ensure_duration_seconds";
+/// SSE 在线订阅数（客户端连接 gauge，连接建立 +1 / 断开 -1）
+pub const SSE_ACTIVE_SUBSCRIPTIONS: &str = "sse_active_subscriptions";
+/// SSE 订阅持续时长（sse_subscribe span 整个生命周期，SpanMetricsLayer 记录）
+pub const SSE_SUBSCRIPTION_DURATION_SECONDS: &str = "sse_subscription_duration_seconds";
+
 // ============= 初始化 =============
 
 /// Initializing Prometheus 指标系统
@@ -115,6 +124,30 @@ fn register_metric_descriptions() {
         AGENT_ACTIVE_TASKS,
         Unit::Count,
         "Current number of active agent tasks"
+    );
+
+    // 容器操作指标
+    describe_counter!(
+        CONTAINER_OPS_TOTAL,
+        Unit::Count,
+        "Total number of container operations"
+    );
+    describe_histogram!(
+        CONTAINER_ENSURE_DURATION_SECONDS,
+        Unit::Seconds,
+        "Container ensure (ready/wake/create) end-to-end duration"
+    );
+
+    // SSE 订阅指标
+    describe_gauge!(
+        SSE_ACTIVE_SUBSCRIPTIONS,
+        Unit::Count,
+        "Current number of active SSE client subscriptions"
+    );
+    describe_histogram!(
+        SSE_SUBSCRIPTION_DURATION_SECONDS,
+        Unit::Seconds,
+        "SSE subscription lifetime duration (sse_subscribe span)"
     );
 }
 
@@ -232,6 +265,30 @@ pub fn inc_active_tasks() {
 /// 减少活跃任务数
 pub fn dec_active_tasks() {
     gauge!(AGENT_ACTIVE_TASKS).decrement(1.0);
+}
+
+// ============= 容器操作指标 =============
+
+/// 记录容器操作结果（op=ensure/create/destroy，result=ok/fail）
+pub fn record_container_op(op: &str, result: &str) {
+    counter!(
+        CONTAINER_OPS_TOTAL,
+        "op" => op.to_string(),
+        "result" => result.to_string()
+    )
+    .increment(1);
+}
+
+// ============= SSE 订阅指标 =============
+
+/// SSE 订阅 +1（客户端连接建立时调用）
+pub fn inc_sse_subscription() {
+    gauge!(SSE_ACTIVE_SUBSCRIPTIONS).increment(1.0);
+}
+
+/// SSE 订阅 -1（客户端断开/流结束时调用；RAII guard 保证调用）
+pub fn dec_sse_subscription() {
+    gauge!(SSE_ACTIVE_SUBSCRIPTIONS).decrement(1.0);
 }
 
 #[cfg(test)]

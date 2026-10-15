@@ -1,4 +1,4 @@
-# ClusterRole：rcoder 主 SA 与 app Pod SA 共用的集群级权限。
+# ClusterRole：仅 rcoder 主 SA 使用的集群编排权限，不能绑定租户 app Pod SA。
 #
 # 单文档（每文件单资源，兼容单文档 YAML 解析器，与同目录 deployment.yaml / pvc.yaml /
 # service.yaml / serviceaccount.yaml 的"一文件一资源"风格一致）。
@@ -17,6 +17,10 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumes"]
     verbs: ["get", "list", "watch"]
+  # nodes（只读）用于节点诊断；Ready 心跳不证明已删除 Pod 的进程退出。
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
     resources: ["deployments", "replicasets", "statefulsets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
@@ -31,3 +35,11 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps", "secrets"]
     verbs: ["create", "delete", "deletecollection", "get", "list", "watch", "patch", "update"]
+  # kube-runtime Event publisher（批次 C）：诊断事件仅 create/patch，最小授权
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # 操作互斥租约（docker_manager k8s_app_operation：acquire/renew/接管/release）
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create", "delete", "get", "list", "watch", "patch", "update"]

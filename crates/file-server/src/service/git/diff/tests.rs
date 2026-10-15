@@ -80,11 +80,155 @@ fn commit_diff_handles_nested_tree_and_preserves_from_to_direction() {
             max_total_bytes: 2,
             max_output_bytes: 64 * 1024 * 1024,
         },
+    )
+    .expect("超限工作区文件降级为 binary 标记而非报错（对齐 TS git CLI）");
+    assert!(
+        oversized
+            .diff
+            .contains("Binary files a/src/app.txt and b/src/app.txt differ")
     );
-    assert!(oversized.is_err());
+    assert!(
+        oversized
+            .files
+            .iter()
+            .any(|file| file.file == "src/app.txt" && file.binary)
+    );
 
     drop(repo);
     drop(std::fs::remove_dir_all(root));
+}
+
+/// 反例 (线上 cid 1694931): 提交了 >16MiB PDF 后 `from` 提交里的 blob 超限，
+/// commit diff 曾报 "git diff blob exceeds limit (max 16777216 bytes)" 整体
+/// 500——降级为 binary 标记 + warn（两侧均超限也必须呈现为变更，不能静默跳过）。
+#[test]
+fn oversized_committed_blob_degrades_to_binary_marker_instead_of_error() {
+    let directory = tempfile::tempdir().expect("create test directory");
+    let root = directory.path();
+    init_repo(root, "Test", "test@example.com").expect("init repo");
+    let repo = open(root).expect("open repo");
+
+    std::fs::write(root.join("big.bin"), vec![b'x'; 64]).expect("write big old");
+    stage_path(&repo, "big.bin").expect("stage big old");
+    commit_indexed(&repo, "c1", "Test", "test@example.com").expect("commit c1");
+    std::fs::write(root.join("big.bin"), vec![b'y'; 64]).expect("write big new");
+    stage_path(&repo, "big.bin").expect("stage big new");
+    let head = commit_indexed(&repo, "c2", "Test", "test@example.com").expect("commit c2");
+
+    let result = compute_diff(
+        &repo,
+        &DiffParams {
+            source: DiffSource::Commit,
+            from: Some(head),
+            to: None,
+            paths: Vec::new(),
+            max_file_size_bytes: 32,
+            max_total_bytes: 64 * 1024 * 1024,
+            max_output_bytes: 64 * 1024 * 1024,
+        },
+    )
+    .expect("超限 blob 降级为 binary 标记而非报错");
+    assert!(
+        result
+            .diff
+            .contains("Binary files a/big.bin and b/big.bin differ")
+    );
+    assert_eq!(result.files.len(), 1);
+    assert!(result.files[0].binary);
+    assert_eq!(result.insertions, 0);
+    assert_eq!(result.deletions, 0);
+    assert!(
+        !result.diff.contains("index 0000000.."),
+        "oversized blobs retain their object IDs"
+    );
+}
+
+#[test]
+fn oversized_worktree_restored_to_head_has_no_diff_despite_staged_change() {
+    let directory = tempfile::tempdir().expect("test repository");
+    let root = directory.path();
+    init_repo(root, "Test", "test@example.com").expect("init");
+    let repo = open(root).expect("open");
+    let original = vec![b'a'; 128];
+    std::fs::write(root.join("large.txt"), &original).expect("head content");
+    stage_path(&repo, "large.txt").expect("stage head");
+    commit_indexed(&repo, "head", "Test", "test@example.com").expect("commit");
+    std::fs::write(root.join("large.txt"), vec![b'b'; 128]).expect("changed content");
+    stage_path(&repo, "large.txt").expect("stage changed content");
+    std::fs::write(root.join("large.txt"), original).expect("restore only worktree");
+    let index_before = std::fs::read(repo.index_path()).expect("staged index");
+    let mut params = DiffParams {
+        source: DiffSource::Worktree,
+        from: None,
+        to: None,
+        paths: vec![],
+        max_file_size_bytes: 32,
+        max_total_bytes: 1024,
+        max_output_bytes: 1024,
+    };
+
+    let worktree = compute_diff(&repo, &params).expect("HEAD versus restored worktree");
+    assert!(worktree.files.is_empty());
+    assert!(worktree.diff.is_empty());
+    params.source = DiffSource::Staged;
+    let staged = compute_diff(&repo, &params).expect("HEAD versus changed index");
+    assert_eq!(staged.files.len(), 1);
+    assert!(staged.files[0].binary);
+    assert!(
+        staged
+            .diff
+            .contains("Binary files a/large.txt and b/large.txt differ")
+    );
+    assert_eq!(
+        std::fs::read(repo.index_path()).expect("index after diff"),
+        index_before
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mode_only_changes_do_not_report_binary_content_changes_at_any_size() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().expect("test repository");
+    let root = directory.path();
+    init_repo(root, "Test", "test@example.com").expect("init");
+    let repo = open(root).expect("open");
+    let path = root.join("large.sh");
+    std::fs::write(&path, vec![0; 128]).expect("binary file");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("initial mode");
+    stage_path(&repo, "large.sh").expect("stage");
+    commit_indexed(&repo, "head", "Test", "test@example.com").expect("commit");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("executable mode");
+    stage_path(&repo, "large.sh").expect("stage mode change");
+    for (source, max_file_size_bytes) in [
+        (DiffSource::Worktree, 32),
+        (DiffSource::Staged, 32),
+        (DiffSource::Worktree, 256),
+        (DiffSource::Staged, 256),
+    ] {
+        let result = compute_diff(
+            &repo,
+            &DiffParams {
+                source,
+                from: None,
+                to: None,
+                paths: vec![],
+                max_file_size_bytes,
+                max_total_bytes: 1024,
+                max_output_bytes: 1024,
+            },
+        )
+        .expect("mode-only diff");
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].changes, 0);
+        assert!(!result.files[0].binary);
+        assert_eq!(
+            result.diff,
+            "diff --git a/large.sh b/large.sh\nold mode 100644\nnew mode 100755\n"
+        );
+    }
 }
 
 #[test]
@@ -194,7 +338,8 @@ fn worktree_symlink_reads_link_target_without_following_it() {
     std::fs::create_dir(&worktree).expect("create worktree fixture");
     symlink(&outside, worktree.join("link")).expect("create symlink fixture");
 
-    let side = read_worktree_file(&worktree, "link", 4096).expect("read symlink side");
+    let side = read_worktree_file(&worktree, "link", 4096, gix::hash::Kind::Sha1)
+        .expect("read symlink side");
     assert_eq!(
         side.bytes.expect("symlink bytes"),
         outside.as_os_str().as_bytes()
@@ -248,4 +393,108 @@ fn diff_source_has_canonical_string_roundtrip() {
         assert_eq!(parsed, expected);
         assert_eq!(parsed.to_string(), expected.to_string());
     }
+}
+
+// ── G-B1: from/to 统一走 resolve_rev（修订表达式/短 hash 能力 + 显式错误契约） ──
+
+fn commit_diff_params(from: Option<&str>, to: Option<&str>) -> DiffParams {
+    DiffParams {
+        source: DiffSource::Commit,
+        from: from.map(str::to_string),
+        to: to.map(str::to_string),
+        paths: Vec::new(),
+        max_file_size_bytes: 16 * 1024 * 1024,
+        max_total_bytes: 64 * 1024 * 1024,
+        max_output_bytes: 64 * 1024 * 1024,
+    }
+}
+
+#[test]
+fn commit_diff_resolves_revision_expressions_and_short_oid() {
+    let directory = tempfile::tempdir().expect("create test directory");
+    init_repo(directory.path(), "Test", "test@example.com").expect("init repo");
+    let repo = open(directory.path()).expect("open repo");
+    std::fs::write(directory.path().join("a.txt"), "old\n").expect("write old");
+    stage_path(&repo, "a.txt").expect("stage old");
+    let old = commit_indexed(&repo, "old", "Test", "test@example.com").expect("commit old");
+    std::fs::write(directory.path().join("a.txt"), "new\n").expect("write new");
+    stage_path(&repo, "a.txt").expect("stage new");
+    let new = commit_indexed(&repo, "new", "Test", "test@example.com").expect("commit new");
+
+    let expected =
+        compute_diff(&repo, &commit_diff_params(Some(&old), Some(&new))).expect("显式 hash diff");
+    let by_expr = compute_diff(&repo, &commit_diff_params(Some("HEAD~1"), Some("HEAD")))
+        .expect("HEAD~1/HEAD 必须可解析");
+    assert_eq!(
+        by_expr.diff, expected.diff,
+        "修订表达式 diff 必须与显式 hash 一致"
+    );
+    let by_short = compute_diff(&repo, &commit_diff_params(Some(&old[..7]), Some(&new[..7])))
+        .expect("短 hash 必须可解析");
+    assert_eq!(
+        by_short.diff, expected.diff,
+        "短 hash diff 必须与显式 hash 一致"
+    );
+}
+
+#[test]
+fn commit_diff_missing_from_is_explicit_and_bad_expression_is_validation() {
+    // T-d6: 缺 from 显式报错（system 类, 保持既有 HTTP 类别）, 不得静默空 diff;
+    // 坏修订表达式 = 显式 Validation（新显式错误面; 修复前是 System + 擦除文案）。
+    let directory = tempfile::tempdir().expect("create test directory");
+    init_repo(directory.path(), "Test", "test@example.com").expect("init repo");
+    let repo = open(directory.path()).expect("open repo");
+    std::fs::write(directory.path().join("a.txt"), "x\n").expect("write");
+    stage_path(&repo, "a.txt").expect("stage");
+    commit_indexed(&repo, "c", "Test", "test@example.com").expect("commit");
+
+    let missing = compute_diff(&repo, &commit_diff_params(Some("no-such-ref"), None))
+        .expect_err("缺 from 必须显式报错");
+    assert!(
+        matches!(missing, AppError::System(..)),
+        "缺 from 保持 system 类别（零 HTTP 变化）: {missing:?}"
+    );
+    let malformed = compute_diff(&repo, &commit_diff_params(Some("HEAD~x"), None))
+        .expect_err("坏修订表达式必须显式报错");
+    assert!(
+        matches!(malformed, AppError::Validation(..)),
+        "坏修订表达式应 Validation: {malformed:?}"
+    );
+}
+
+#[test]
+fn diff_paths_preserve_non_ascii_utf8() {
+    // nuwax commit 4e05db7 给 parseNumstat 补了 porcelain 路径解码 (system-git 在
+    // core.quotePath 默认开启时把中文路径 C-quote, 逐码点解码成 Latin-1 mojibake)。
+    // gix 程序化 diff 无 CLI 文本层, 本测试锁定 numstat 摘要 (files[].file) 与
+    // unified diff 文件头 (---/+++) 对中文路径原样 UTF-8 输出。
+    let directory = tempfile::tempdir().expect("create test directory");
+    init_repo(directory.path(), "Test", "test@example.com").expect("init repo");
+    std::fs::create_dir_all(directory.path().join("数据")).expect("建父目录");
+    std::fs::write(directory.path().join("数据/成都天气.md"), "v1\n").expect("write v1");
+    let repo = open(directory.path()).expect("open repo");
+    stage_path(&repo, "数据/成都天气.md").expect("stage v1");
+    commit_indexed(&repo, "c1", "Test", "test@example.com").expect("commit v1");
+    std::fs::write(directory.path().join("数据/成都天气.md"), "v2\n").expect("write v2");
+
+    let params = DiffParams {
+        source: DiffSource::Worktree,
+        from: None,
+        to: None,
+        paths: Vec::new(),
+        max_file_size_bytes: 16 * 1024 * 1024,
+        max_total_bytes: 64 * 1024 * 1024,
+        max_output_bytes: 64 * 1024 * 1024,
+    };
+    let r = compute_diff(&repo, &params).expect("worktree diff 不应失败");
+    assert!(
+        r.files.iter().any(|f| f.file == "数据/成都天气.md"),
+        "numstat 摘要应含原样 UTF-8 中文路径 (不得八进制转义/mojibake): {:?}",
+        r.files
+    );
+    assert!(
+        r.diff.contains("+++ b/数据/成都天气.md"),
+        "unified diff 文件头应原样输出中文路径: {}",
+        r.diff
+    );
 }

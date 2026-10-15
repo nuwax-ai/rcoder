@@ -1,13 +1,15 @@
-//! UserApp Deployment 纯辅助函数(从 k8s_deployment.rs 拆出)。
+//! Userapp Deployment 纯辅助函数(从 k8s_deployment.rs 拆出)。
 //!
 //! port-expose 注解编解码 + config_hash 注解 + probe 构建。create/query 共用。
 
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::{AppResourceRequirements, ContainerCreateParams, ExposeType};
 #[cfg(feature = "kubernetes")]
-use k8s_openapi::api::core::v1::{Probe, ResourceRequirements};
+use k8s_openapi::api::core::v1::{Probe, ResourceRequirements, TopologySpreadConstraint};
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+#[cfg(feature = "kubernetes")]
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 #[cfg(feature = "kubernetes")]
@@ -18,6 +20,10 @@ pub(crate) const PORT_EXPOSE_ANNOTATION: &str = "rcoder.io/port-expose";
 pub(crate) const RECYCLE_ENABLED_ANNOTATION: &str = "rcoder.io/recycle-enabled";
 /// 闲置回收阈值秒数注解（per-app 覆盖全局）
 pub(crate) const IDLE_TIMEOUT_ANNOTATION: &str = "rcoder.io/idle-timeout-seconds";
+/// pod template annotations 里的部署写入者身份令牌（= 本次操作 operation_id）。
+/// 部署故障观察用确定性令牌比较核验 Pod 模板归属（generation/revision/
+/// pod-template-hash 三者互不可比，不使用）。
+pub(crate) const DEPLOY_TEMPLATE_TOKEN_ANNOTATION: &str = "rcoder.io/deploy-template-token";
 pub(crate) const WAKE_ON_TRAFFIC_ANNOTATION: &str = "rcoder.io/wake-on-traffic";
 
 /// ports → annotation（`rcoder.io/port-expose: "80:http,5432:tcp"`）；无端口返 None。
@@ -173,18 +179,22 @@ pub(crate) fn build_probe(
     }
 }
 
-/// 构建 **requests/limits 解耦** 的 ResourceRequirements（agent 与 UserApp 两端共享策略）。
+/// 构建 **requests/limits 解耦** 的 ResourceRequirements（agent 与 Userapp 两端共享策略）。
 ///
 /// ⚙️ 策略：requests 设超小固定值（仅作 scheduler 调度保障量），limits 保留配置上限。
-///   背景：常态空闲的 pod（agent-runner / UserApp）若 requests=limits（大值），scheduler
+///   背景：常态空闲的 pod（agent-runner / Userapp）若 requests=limits（大值），scheduler
 ///   严格按 requests 预订 → 节点迅速占满 → Pod Pending。requests 小 → 支持超卖调度；
 ///   limits 大 → 单 Pod 突发不受限（最多 throttle / evict，不崩）。如需调整改下方固定值。
 ///
 /// 各字段固定 requests（按资源可压缩性区分）：
-/// - `cpu`（可压缩）：requests=`5m`。⚠️ cpu.shares 按 requests 算，5m 权重极低：节点 CPU
-///   严重争抢时此 pod 会被深度 throttle（可能慢到 healthcheck 失败/启动超时）。集群 CPU
-///   实测仅 5~7% 闲置，日常可轻松用超 requests；若遇 pod 启动超时或 healthcheck 失败，
-///   先排查是否 CPU 饿死，必要时调大（如 50m）。
+/// - `cpu`（可压缩）：requests=`50m`。cpu.shares 按 requests 算，5m 权重极低，节点 CPU
+///   严重争抢时此 pod 会被深度 throttle（曾观察到 healthcheck 失败/启动超时）。50m 是防
+///   CPU 饿死的最低安全值（约为实际峰值 100~1200m 的零头，不影响"低 requests + 高 limits
+///   超卖"的设计）。集群 CPU 实测仅 5~7% 闲置，日常可轻松用超 requests；若仍遇 pod 启动
+///   超时或 healthcheck 失败，先排查是否 CPU 饿死，再考虑继续调大。
+///   ⚠️ 50m 只缓解 throttle，**不解决调度均衡**：requests 仍很低，调度器仍按"节点很轻"
+///   看待，会把 pod 全堆在最闲节点。跨节点均衡由 PodSpec 的 topologySpreadConstraints
+///   保证（见 build_agent_pod_spec），不靠调 requests。
 /// - `memory`（不可压缩）：requests=`64Mi`。pod 开了 swap，内存吃紧可换出不易 OOM；
 ///   运行时实际可用到 limits 上限（swap + limits 双兜底）。⚠️ 代价：节点内存严重紧张时，
 ///   低 requests + 高实际占用的 pod 可能被优先 evict；集群内存余量充足（实测 13~34%）
@@ -202,7 +212,7 @@ pub(crate) fn build_decoupled_resources(
     let mut requests = BTreeMap::new();
     if let Some(c) = cpu {
         limits.insert("cpu".to_string(), Quantity(c));
-        requests.insert("cpu".to_string(), Quantity("5m".to_string()));
+        requests.insert("cpu".to_string(), Quantity("50m".to_string()));
     }
     if let Some(m) = memory {
         limits.insert("memory".to_string(), Quantity(m));
@@ -225,9 +235,42 @@ pub(crate) fn build_decoupled_resources(
     })
 }
 
-/// UserApp 资源需求 → ResourceRequirements（包一层共享 `build_decoupled_resources`）。
+/// 构建"按节点(hostname)均衡"的 topologySpreadConstraint（软约束），agent-runner 与
+/// Userapp 动态创建路径共用（统一均衡策略，改参数只改这一处）。
 ///
-/// UserApp 的 `ephemeral_storage` 未指定时回退 `storage`（与 agent 侧
+/// - `topologyKey=hostname`：每个 Node 一个 domain，pod 往节点间摊。
+/// - `labelSelector=app.kubernetes.io/name=<label_value>`：分组统计 key——只统计同 label
+///   的 pod（agent 侧与 `build_standard_labels`、app 侧与 `build_app_labels` 写入的 name
+///   label 值一致），各组各管各的均衡，跨 STS/跨 Deployment 统计。
+/// - `whenUnsatisfiable=ScheduleAnyway`：★绝不阻断调度。即使放到任何节点都违反 maxSkew
+///   也照常调度（优先选 pod 最少的节点）。业务 pod（agent-runner/用户 app）绝不能因均衡
+///   约束 Pending/创建失败（对比 DoNotSchedule：不满足就 Pending，会卡住业务，不采用）。
+/// - `maxSkew=5`：⚠️ ScheduleAnyway 下 maxSkew 只在 DoNotSchedule 模式才作硬过滤阈值；
+///   软约束模式下调度器永远优先 pod 最少的节点，与数值基本无关，取 5 仅表"允许一定倾斜"。
+///
+/// 根因分析与方案见 docs/agent-runner-scheduling-balance.md（requests 虚标致调度失衡）。
+#[cfg(feature = "kubernetes")]
+pub(crate) fn build_hostname_spread_constraint(label_value: &str) -> TopologySpreadConstraint {
+    let mut match_labels = BTreeMap::new();
+    match_labels.insert(
+        "app.kubernetes.io/name".to_string(),
+        label_value.to_string(),
+    );
+    TopologySpreadConstraint {
+        max_skew: 5,
+        topology_key: "kubernetes.io/hostname".to_string(),
+        when_unsatisfiable: "ScheduleAnyway".to_string(),
+        label_selector: Some(LabelSelector {
+            match_labels: Some(match_labels),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Userapp 资源需求 → ResourceRequirements（包一层共享 `build_decoupled_resources`）。
+///
+/// Userapp 的 `ephemeral_storage` 未指定时回退 `storage`（与 agent 侧
 /// `ephemeral_storage_limit.or(storage_size)` 对称），二者同义（overlay 可写层配额）。
 #[cfg(feature = "kubernetes")]
 pub(crate) fn build_app_resource_requirements(
@@ -249,8 +292,7 @@ mod tests {
     fn params_with_ports(ports: Vec<AppPortSpec>) -> ContainerCreateParams {
         ContainerCreateParams::builder()
             .project_id("test")
-            .service_type(ServiceType::UserApp)
-            .host_workspace_path("/tmp")
+            .service_type(ServiceType::Userapp)
             .image_override("img")
             .ports(ports)
             .build()
@@ -259,8 +301,7 @@ mod tests {
     fn params_with_env(env: std::collections::HashMap<String, String>) -> ContainerCreateParams {
         ContainerCreateParams::builder()
             .project_id("test")
-            .service_type(ServiceType::UserApp)
-            .host_workspace_path("/tmp")
+            .service_type(ServiceType::Userapp)
             .image_override("img")
             .env(env)
             .build()
@@ -274,12 +315,12 @@ mod tests {
     }
 
     #[test]
-    fn decoupled_resources_cpu_only_sets_5m_request() {
+    fn decoupled_resources_cpu_only_sets_50m_request() {
         let rr = build_decoupled_resources(Some("2".into()), None, None).unwrap();
         let limits = rr.limits.unwrap();
         let requests = rr.requests.unwrap();
         assert_eq!(limits["cpu"].0.clone(), "2");
-        assert_eq!(requests["cpu"].0.clone(), "5m");
+        assert_eq!(requests["cpu"].0.clone(), "50m");
         assert!(!limits.contains_key("memory"));
         assert!(!limits.contains_key("ephemeral-storage"));
     }
@@ -292,7 +333,7 @@ mod tests {
         let limits = rr.limits.unwrap();
         let requests = rr.requests.unwrap();
         assert_eq!(limits["cpu"].0.clone(), "1");
-        assert_eq!(requests["cpu"].0.clone(), "5m");
+        assert_eq!(requests["cpu"].0.clone(), "50m");
         assert_eq!(limits["memory"].0.clone(), "512Mi");
         assert_eq!(requests["memory"].0.clone(), "64Mi");
         assert_eq!(limits["ephemeral-storage"].0.clone(), "1Gi");

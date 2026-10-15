@@ -110,6 +110,76 @@ fn validated_identifier<'a>(value: &'a str, field: &str) -> AppResult<&'a str> {
     Ok(value)
 }
 
+/// Userapp 开发卷定位: `{config.userapp_workspace_dir}/{app_id}`。
+///
+/// 不走 [`WorkspaceResolver`] trait——开发卷是容器挂载事实 (env `USERAPP_WORKSPACE_DIR`
+/// 指向各自视角的挂载点), 沙箱与 builder 共享同一块卷同构目录, 与拓扑无关。
+/// `custom_target_dir` trim 非空则直接信任 (与 computer 域 `resolve_computer_target`
+/// 对称, 由调用方 Java 负责合法性)。
+///
+/// **单 app 模式**（`config.userapp_single_app_id` = Some，生产运行容器形态）：
+/// 卷根即 app 根——路径直接返回 `userapp_workspace_dir`（不 join app_id），
+/// appId 必须与本容器归属一致（防跨 app 误操作），`custom_target_dir` 信任
+/// 覆盖一并收紧（fail-closed）。
+pub fn resolve_userapp_dev(
+    app_id: &str,
+    custom_target_dir: Option<&str>,
+    config: &crate::Config,
+) -> AppResult<PathBuf> {
+    // identifier 校验先于 override（与 computer 域 resolve_computer_target 对称:
+    // 总是先校验定位字段, 再应用 customTargetDir 信任覆盖）
+    let app_id = validated_identifier(app_id, "appId")?;
+    if let Some(single) = config
+        .userapp_single_app_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if app_id != single {
+            return Err(AppError::validation(format!(
+                "appId '{app_id}' does not match this single-app file-server (owns '{single}')"
+            )));
+        }
+        if non_empty(custom_target_dir).is_some() {
+            return Err(AppError::validation(
+                "customTargetDir is not allowed in single-app mode",
+            ));
+        }
+        return Ok(config.userapp_workspace_dir.clone());
+    }
+    if let Some(ct) = non_empty(custom_target_dir) {
+        return Ok(PathBuf::from(ct));
+    }
+    Ok(config.userapp_workspace_dir.join(app_id))
+}
+
+// ── 用户维度工作目录 (workspacePath, 对齐 TS nuwax-file-server 1.4.5) ──────────────
+
+/// 校验并归一化用户维度工作目录：薄封装 [`shared_types::normalize_absolute_dir`]
+/// （规则自本文件提取至 shared_types 单一事实源，行为与 TS
+/// `normalizeWorkspacePath` + `canonicalizeDir` 同构不变），错误类型转换为
+/// 带 `field: workspacePath` 的 `AppError`。
+///
+/// 绝对路径判断是**跨平台字符串规则**（任意宿主平台上 POSIX 与 Windows 两种
+/// 形态都接受，对齐 TS 平台无关校验）；只做格式校验，不限制目录范围
+/// （信任模型与 customTargetDir 一致：产品运行于容器/用户沙箱，可绑定任意
+/// 绝对路径）。
+///
+/// # 为什么不用 `std::path::Component`
+///
+/// `components()` 是宿主平台语义：Linux/mac 上 `C:/x` 被解析为两个普通段
+/// （非绝对路径，会误拒）、`//server/share` 的 UNC 前导被折叠丢失；且它把
+/// `.` 段**静默规范化掉**（std 文档明示 CurDir 被 normalize away），与"含点段
+/// 须拒绝"的 fail-fast 语义冲突。灰度切流期间同一请求须在 TS/Rust 两上游
+/// 行为同构（TS 校验刻意平台无关），故 shared_types 侧为纯字符串实现。宿主
+/// 语义的 `Path::is_absolute()` 仅用于 `/fs/children`（TS 该处用的正是宿主
+/// 语义 `path.isAbsolute`，两侧恰好同构）。
+pub fn normalize_workspace_path(raw: &str) -> AppResult<String> {
+    shared_types::normalize_absolute_dir(raw, "workspacePath").map_err(|message| {
+        AppError::validation_with(&message, serde_json::json!({ "field": "workspacePath" }))
+    })
+}
+
 #[async_trait]
 impl WorkspaceResolver for LocalWorkspaceResolver {
     async fn resolve_project(&self, ctx: &ProjectContext) -> AppResult<PathBuf> {
@@ -172,8 +242,8 @@ pub trait WorkspacePathResolver: Send + Sync {
 /// 聚合路径, 拼上 leaf → `{cephfs-root}/{subvolumePath}/{leaf}`。
 ///
 /// 多租户 tenant/space 被 per-project PVC 吸收 (PVC 身份=project), leaf 不含 tenant/space;
-/// computer PVC per-user, leaf 不含 user_id。resolve 返回 None (Docker 模式 / K8s API 抖动 /
-/// PVC 未 Bound) → 降级到内置 [`LocalWorkspaceResolver`] (fail-open, 不阻断服务)。
+/// computer PVC per-user, leaf 不含 user_id。运行时明确返回 None (Docker 无聚合视角)
+/// 时使用内置 [`LocalWorkspaceResolver`]；查询失败传播，不改变源码权威。
 pub struct SubvolumeWorkspaceResolver {
     path_resolver: Arc<dyn WorkspacePathResolver>,
     fallback: LocalWorkspaceResolver,
@@ -198,7 +268,7 @@ impl WorkspaceResolver for SubvolumeWorkspaceResolver {
         if !shared_types::per_agent_pvc_enabled() {
             return self.fallback.resolve_project(ctx).await;
         }
-        // 主动 ensure per-agent PVC + 迁移 (不被动 fallback; 失败才降级 Local)
+        // 主动 ensure per-agent PVC + 迁移；错误传播，只有明确 None 才用 Local。
         match self
             .path_resolver
             .ensure_and_resolve(project_id, &ServiceType::WebAgentRunner)
@@ -246,10 +316,31 @@ impl WorkspaceResolver for SubvolumeWorkspaceResolver {
 mod tests {
     use super::*;
 
+    /// FS-01 消费层验收: 单 app 归属（文件声明、env 未清除）必须实际生效——
+    /// 不匹配 appId 拒绝、customTargetDir 拒绝、匹配 appId 返回卷根。
+    #[test]
+    fn single_app_mode_enforces_ownership_and_rejects_custom_target() {
+        let config = crate::Config {
+            userapp_workspace_dir: PathBuf::from("/data/userapp"),
+            userapp_single_app_id: Some("app-9".to_string()),
+            ..crate::Config::default()
+        };
+        assert_eq!(
+            resolve_userapp_dev("app-9", None, &config).expect("own app resolves"),
+            PathBuf::from("/data/userapp")
+        );
+        let mismatch =
+            resolve_userapp_dev("app-8", None, &config).expect_err("foreign app must be rejected");
+        assert!(matches!(mismatch, AppError::Validation(..)), "{mismatch:?}");
+        let custom = resolve_userapp_dev("app-9", Some("/elsewhere"), &config)
+            .expect_err("customTargetDir must be rejected in single-app mode");
+        assert!(matches!(custom, AppError::Validation(..)), "{custom:?}");
+    }
+
     fn resolver() -> LocalWorkspaceResolver {
         LocalWorkspaceResolver::new(
-            PathBuf::from("/app/project_workspace"),
-            PathBuf::from("/app/computer-project-workspace"),
+            PathBuf::from(WORKSPACE_ROOT),
+            PathBuf::from(COMPUTER_WORKSPACE_ROOT),
         )
     }
 
@@ -367,5 +458,131 @@ mod tests {
             cid: "../../outside".into(),
         };
         assert!(resolver.resolve_computer(&computer).await.is_err());
+    }
+
+    // ── 单 app 模式（生产运行容器形态）──────────────────────────────────────
+
+    fn dev_config(single: Option<&str>) -> crate::Config {
+        crate::Config {
+            userapp_workspace_dir: PathBuf::from("/app"),
+            userapp_single_app_id: single.map(str::to_string),
+            ..crate::Config::default()
+        }
+    }
+
+    #[test]
+    fn single_app_mode_returns_root_without_app_id_join() {
+        let config = dev_config(Some("app-abc123"));
+        let path = resolve_userapp_dev("app-abc123", None, &config).expect("resolve");
+        // 卷根即 app 根：不 join app_id（生产运行容器 /app = code/data/logs）
+        assert_eq!(path, PathBuf::from("/app"));
+    }
+
+    #[test]
+    fn single_app_mode_rejects_mismatched_app_id() {
+        let config = dev_config(Some("app-abc123"));
+        let err = resolve_userapp_dev("app-other", None, &config)
+            .expect_err("mismatched appId must be rejected");
+        assert!(err.to_string().contains("single-app"));
+    }
+
+    #[test]
+    fn single_app_mode_rejects_custom_target_dir() {
+        let config = dev_config(Some("app-abc123"));
+        let err = resolve_userapp_dev("app-abc123", Some("/etc"), &config)
+            .expect_err("customTargetDir must be rejected in single-app mode");
+        assert!(err.to_string().contains("customTargetDir"));
+    }
+
+    #[test]
+    fn blank_single_app_id_falls_back_to_dev_semantics() {
+        // trim 为空 = 未启用单 app 模式（显式置空关闭），走开发容器 join 语义
+        let config = dev_config(Some("   "));
+        let path = resolve_userapp_dev("app-abc123", None, &config).expect("resolve");
+        assert_eq!(path, PathBuf::from("/app/app-abc123"));
+    }
+
+    #[test]
+    fn dev_mode_still_joins_app_id() {
+        let config = dev_config(None);
+        let path = resolve_userapp_dev("app-abc123", None, &config).expect("resolve");
+        assert_eq!(path, PathBuf::from("/app/app-abc123"));
+    }
+
+    // ── 用户维度工作目录校验 (对齐 TS 1.4.5 normalizeWorkspacePath) ────────────────
+
+    #[test]
+    fn normalize_workspace_path_accepts_posix_absolute() {
+        assert_eq!(normalize_workspace_path("/a/b").expect("posix"), "/a/b");
+        assert_eq!(normalize_workspace_path("  /a/b  ").expect("trim"), "/a/b");
+        // 任何 // 开头的输入 TS 都按 UNC 处理：折叠中间重复分隔符、保留前导 //
+        assert_eq!(
+            normalize_workspace_path("//a//b").expect("unc lead"),
+            "//a/b"
+        );
+        assert_eq!(normalize_workspace_path("/").expect("bare root"), "/");
+        // 裸 UNC 前导保留（与 TS 逐位一致：折叠成 / 后 unc 补回 //）
+        assert_eq!(normalize_workspace_path("//").expect("bare unc"), "//");
+    }
+
+    #[test]
+    fn normalize_workspace_path_normalizes_windows_forms() {
+        // 平台无关规则：Windows 形态在任意宿主平台上都接受（macOS 上可全量测试）
+        assert_eq!(
+            normalize_workspace_path("c:/x").expect("drive upper"),
+            "C:/x"
+        );
+        assert_eq!(
+            normalize_workspace_path("C:\\a\\b").expect("backslash"),
+            "C:/a/b"
+        );
+        assert_eq!(
+            normalize_workspace_path("\\\\srv\\share\\a").expect("unc backslash"),
+            "//srv/share/a"
+        );
+        assert_eq!(
+            normalize_workspace_path("//srv/share/a").expect("unc slash"),
+            "//srv/share/a"
+        );
+        assert_eq!(
+            normalize_workspace_path("C:/").expect("minimal drive"),
+            "C:/"
+        );
+    }
+
+    #[test]
+    fn normalize_workspace_path_de_verbatims_windows_extended_length() {
+        // Windows verbatim（\\?\ 扩展长度路径）de-verbatim：剥前缀产出可用路径
+        // （Electron 客户端长路径场景）；消费方拿到的归一化值在 Windows fs 可用
+        assert_eq!(
+            normalize_workspace_path(r"\\?\C:\Users\dev\proj").expect("verbatim drive"),
+            "C:/Users/dev/proj"
+        );
+        assert_eq!(
+            normalize_workspace_path(r"\\?\UNC\server\share\p").expect("verbatim unc"),
+            "//server/share/p"
+        );
+        // 非法 verbatim / 设备命名空间显式拒绝
+        assert!(normalize_workspace_path(r"\\?\foo\bar").is_err());
+        assert!(normalize_workspace_path(r"\\.\PhysicalDrive0").is_err());
+    }
+
+    #[test]
+    fn normalize_workspace_path_rejects_invalid() {
+        // 相对路径 / 裸盘符（无斜杠）
+        assert!(normalize_workspace_path("a/b").is_err());
+        assert!(normalize_workspace_path("./a").is_err());
+        assert!(normalize_workspace_path("C:").is_err());
+        // 点段拒绝（fail-fast，不静默归一）
+        assert!(normalize_workspace_path("/a/./b").is_err());
+        assert!(normalize_workspace_path("/a/../b").is_err());
+        assert!(normalize_workspace_path("C:/a/..").is_err());
+        // 超长（trim 后计；512 边界通过、513 拒绝）
+        assert!(normalize_workspace_path(&format!("/{}", "a".repeat(511))).is_ok());
+        assert!(normalize_workspace_path(&format!("/{}", "a".repeat(512))).is_err());
+        // 控制字符（\x01 / \x7f / \0）
+        assert!(normalize_workspace_path("/a\u{1}b").is_err());
+        assert!(normalize_workspace_path("/a\u{7f}b").is_err());
+        assert!(normalize_workspace_path("/a\0b").is_err());
     }
 }

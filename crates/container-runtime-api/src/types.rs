@@ -1,4 +1,4 @@
-//! Container runtime 类型定义（错误、状态、UserApp 相关 DTO）
+//! Container runtime 类型定义（错误、状态、Userapp 相关 DTO）
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -10,9 +10,31 @@ use utoipa::ToSchema;
 
 use crate::ContainerRuntime;
 
+/// Observation of an original coordinator lease, separate from write authority.
+/// No persisted or HTTP representation: unsupported/absent observations stay
+/// unconfirmed, while expiry alone never proves a completed runtime mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AppOperationLeaseObservation {
+    Held,
+    ExpiredOriginalIdentity,
+    Unconfirmed,
+}
+
 /// Container runtime errors
 #[derive(Error, Debug)]
 pub enum ContainerRuntimeError {
+    /// All issued writes have returned; retained resources are for Stop to clean.
+    /// Never produced by dropping an in-flight mutation future.
+    #[error("Builder creation cancelled after acknowledged writes")]
+    CreationCancelled,
+    #[error(transparent)]
+    OperationInProgress(Box<shared_types::UserAppOperationInProgress>),
+    #[error("Runtime request rejected: {0}")]
+    RequestRejected(shared_types::RuntimeRequestRejection),
+    #[error("Application preparation failed before replacement: {0}")]
+    PreparationFailed(shared_types::AppPreparationFailure),
+    #[error("Concurrent resource update: {0}")]
+    Conflict(String),
     #[error("Connection error: {0}")]
     ConnectionError(String),
 
@@ -24,6 +46,11 @@ pub enum ContainerRuntimeError {
 
     #[error("Container stop failed: {0}")]
     ContainerStopError(String),
+
+    /// The owned workload exists, but no running management container is available.
+    /// Not an ownership/transport error and never permission to bypass admission.
+    #[error("Owned management container is not running")]
+    ManagementNotRunning,
 
     #[error("Container not found: {0}")]
     ContainerNotFound(String),
@@ -42,12 +69,134 @@ pub enum ContainerRuntimeError {
 
     #[error("Container exec failed: {0}")]
     ContainerExecError(String),
+
+    /// A multi-stage creation chain aborted at [`CreationProgress::failed_at`].
+    /// The `source` preserves the original error for wire-faithful mapping;
+    /// `progress` carries the in-process orchestration knowledge (stages,
+    /// retained idempotent resources, rejection definitiveness) that upper
+    /// layers may use to prove the whole operation can safely finish as
+    /// Failed. This is NOT derived from remote observation.
+    #[error("Application creation aborted: {source}")]
+    CreationAborted {
+        progress: CreationProgress,
+        source: Box<ContainerRuntimeError>,
+    },
+}
+
+/// One stage of the K8s application creation chain, in execution order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub enum CreationStage {
+    /// Read-only capture of the current deployment identity (no write-capable
+    /// call exists at this stage).
+    #[default]
+    Capture,
+    /// Workspace PVC ensure: read-verify when the PVC exists, create only
+    /// when absent.
+    PvcEnsure,
+    /// Conditional storage-claim annotation writes (uid/resourceVersion
+    /// preconditions; may touch several PVCs in sequence).
+    StorageClaim,
+    /// Generation ConfigMap/Secret writes plus the conditional Deployment
+    /// submit. The first stage whose retained artifacts are not idempotent.
+    WriteGeneration,
+    /// Service publish.
+    ApplyService,
+}
+
+impl CreationStage {
+    /// Stages whose failure can never carry a whole-operation safe-finish
+    /// proof: once generation writes start, retained artifacts are no longer
+    /// idempotent and a definitive rejection of one request does not describe
+    /// the whole operation.
+    pub fn generation_started(self) -> bool {
+        matches!(self, Self::WriteGeneration | Self::ApplyService)
+    }
+}
+
+/// Cumulative progress of a creation chain up to its failure point. Recorded
+/// by the orchestrator as stages complete — in-process knowledge, never
+/// inferred from post-hoc remote reads (a late-landing in-flight request is
+/// invisible to observation, which is exactly why the proof below only relies
+/// on per-request definitive outcomes).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CreationProgress {
+    /// Stage whose request failed.
+    pub failed_at: CreationStage,
+    /// Whether the failing request itself returned a definitive rejection
+    /// (conditional-write precondition failure, explicit API denial, or local
+    /// validation before dispatch) rather than a timeout/transport/5xx whose
+    /// remote outcome remains pending.
+    pub definitive_rejection: bool,
+    /// Idempotent artifacts this operation may leave behind (PVC ensure /
+    /// claim annotations). Recorded explicitly so a safe failure never
+    /// masquerades as zero mutation.
+    pub retained_idempotent_resources: Vec<String>,
+}
+
+impl CreationProgress {
+    /// Whole-operation safe-finish predicate: the caller may settle the
+    /// operation as Failed (releasing fences) because every issued request
+    /// either completed or was definitively rejected, and no
+    /// generation-or-later stage was ever attempted.
+    pub fn safe_finish_ok(&self) -> bool {
+        if self.failed_at.generation_started() {
+            return false;
+        }
+        // Capture has no write-capable call: nothing was dispatched, so a
+        // lost response proves nothing is pending. Ensure/claim stages may
+        // dispatch writes, so only a definitive rejection counts.
+        self.failed_at == CreationStage::Capture || self.definitive_rejection
+    }
+
+    /// Human-readable retention summary (empty means nothing was attempted).
+    pub fn retained_summary(&self) -> String {
+        if self.retained_idempotent_resources.is_empty() {
+            "no remote writes were issued".to_string()
+        } else {
+            self.retained_idempotent_resources.join(", ")
+        }
+    }
+}
+
+impl ContainerRuntimeError {
+    /// Whether this error class represents a definitive rejection of the
+    /// request (nothing remains pending remotely), as opposed to
+    /// timeout/transport/5xx classes whose outcome may still land.
+    pub fn is_definitive_rejection(&self) -> bool {
+        matches!(
+            self,
+            Self::Conflict(_)
+                | Self::RequestRejected(_)
+                | Self::ConfigurationError(_)
+                | Self::ContainerNotFound(_)
+        )
+    }
+
+    /// True when this error is a creation abort carrying a whole-operation
+    /// safe-finish proof (see [`CreationProgress::safe_finish_ok`]).
+    pub fn creation_safe_finish(&self) -> bool {
+        matches!(
+            self,
+            Self::CreationAborted { progress, .. } if progress.safe_finish_ok()
+        )
+    }
+
+    /// Retention note for a safe finish; `None` when the abort does not
+    /// qualify (upper layers must not decorate unsafe failures with it).
+    pub fn creation_safe_finish_note(&self) -> Option<String> {
+        match self {
+            Self::CreationAborted { progress, .. } if progress.safe_finish_ok() => {
+                Some(progress.retained_summary())
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Result type for container operations
 pub type ContainerRuntimeResult<T> = Result<T, ContainerRuntimeError>;
 
-/// exec 命令执行结果(UserApp 容器内跑命令的输出)
+/// exec 命令执行结果(Userapp 容器内跑命令的输出)
 #[derive(Debug, Clone)]
 pub struct ExecResult {
     /// 标准输出
@@ -140,6 +289,93 @@ impl Default for AgentPodDiagnostic {
             waiting_reason: None,
             detail: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod creation_progress_tests {
+    use super::{ContainerRuntimeError, CreationProgress, CreationStage};
+
+    fn progress(failed_at: CreationStage, definitive: bool) -> CreationProgress {
+        CreationProgress {
+            failed_at,
+            definitive_rejection: definitive,
+            retained_idempotent_resources: Vec::new(),
+        }
+    }
+
+    /// 安全结束谓词矩阵：捕获阶段任意错误安全（无写能力调用被发出）；
+    /// ensure/claim 阶段仅确定性拒绝安全；generation 之后永不安全。
+    #[test]
+    fn safe_finish_matrix() {
+        // 捕获阶段：只读，无在途写——超时也算安全
+        assert!(progress(CreationStage::Capture, false).safe_finish_ok());
+        assert!(progress(CreationStage::Capture, true).safe_finish_ok());
+        // ensure/claim：确定性拒→安全；未知（超时/传输/5xx）→保持围栏
+        assert!(progress(CreationStage::PvcEnsure, true).safe_finish_ok());
+        assert!(!progress(CreationStage::PvcEnsure, false).safe_finish_ok());
+        assert!(progress(CreationStage::StorageClaim, true).safe_finish_ok());
+        assert!(!progress(CreationStage::StorageClaim, false).safe_finish_ok());
+        // generation 写面开始后：确定性拒也不构成整操作证明（保留物非幂等）
+        assert!(!progress(CreationStage::WriteGeneration, true).safe_finish_ok());
+        assert!(!progress(CreationStage::ApplyService, true).safe_finish_ok());
+    }
+
+    /// 确定性拒绝分类：条件写冲突/结构化拒绝/本地前置校验/404 是确定性；
+    /// 超时/连接/5xx/K8sError 字符串不可证。
+    #[test]
+    fn definitive_rejection_classification() {
+        assert!(ContainerRuntimeError::Conflict("precondition".into()).is_definitive_rejection());
+        assert!(
+            ContainerRuntimeError::RequestRejected(shared_types::RuntimeRequestRejection {
+                status: 403,
+                message: "denied".into()
+            })
+            .is_definitive_rejection()
+        );
+        assert!(
+            ContainerRuntimeError::ConfigurationError("local".into()).is_definitive_rejection()
+        );
+        assert!(ContainerRuntimeError::ContainerNotFound("gone".into()).is_definitive_rejection());
+        assert!(!ContainerRuntimeError::Timeout("pending".into()).is_definitive_rejection());
+        assert!(!ContainerRuntimeError::ConnectionError("lost".into()).is_definitive_rejection());
+        assert!(!ContainerRuntimeError::K8sError("503 text".into()).is_definitive_rejection());
+    }
+
+    /// 安全结束注记仅在证明成立时给出，且显式列出保留物（无保留物=
+    /// 「无远端写被发出」，不冒充零变更语义由清单自证）。
+    #[test]
+    fn safe_finish_note_gates_on_proof() {
+        let safe = ContainerRuntimeError::CreationAborted {
+            progress: CreationProgress {
+                failed_at: CreationStage::StorageClaim,
+                definitive_rejection: true,
+                retained_idempotent_resources: vec!["workspace pvc ensured: p1".into()],
+            },
+            source: Box::new(ContainerRuntimeError::Conflict("rejected".into())),
+        };
+        assert_eq!(
+            safe.creation_safe_finish_note().as_deref(),
+            Some("workspace pvc ensured: p1")
+        );
+        assert!(safe.creation_safe_finish());
+
+        let unsafe_abort = ContainerRuntimeError::CreationAborted {
+            progress: progress(CreationStage::StorageClaim, false),
+            source: Box::new(ContainerRuntimeError::Timeout("pending".into())),
+        };
+        assert_eq!(unsafe_abort.creation_safe_finish_note(), None);
+        assert!(!unsafe_abort.creation_safe_finish());
+
+        // 捕获阶段安全且无保留物：注记如实陈述「无远端写被发出」
+        let nothing_issued = ContainerRuntimeError::CreationAborted {
+            progress: progress(CreationStage::Capture, false),
+            source: Box::new(ContainerRuntimeError::ConnectionError("probe lost".into())),
+        };
+        assert_eq!(
+            nothing_issued.creation_safe_finish_note().as_deref(),
+            Some("no remote writes were issued")
+        );
     }
 }
 
@@ -243,6 +479,76 @@ pub struct RuntimeContainerInfo {
     pub created_at: DateTime<Utc>,
     /// 容器环境变量（可选，用于获取 project_id 等信息）
     pub env_vars: Option<HashMap<String, String>>,
+    /// 容器服务类型（结构化身份，消费方不再从 container_name 反解）：
+    /// K8s 恒 `Some`（pod 标签 `rcoder.io/service-type` 直读）；Docker 为内存
+    /// 缓存值（rcoder 生命周期内 `Some`，重启窗口 `None` 由名字反解兜底）。
+    pub service_type: Option<ServiceType>,
+    /// 身份槽位（与创建入参一一对应，**语义单一不兼任**——派生定位键走
+    /// [`RuntimeContainerInfo::identity_key`] 的官方优先级，消费方不自行猜测）：
+    pub project_id: Option<String>,
+    /// computer 族用户标识
+    pub user_id: Option<String>,
+    /// 共享子 pod 标识（定位优先级最高）
+    pub pod_id: Option<String>,
+    /// userapp / userapp-builder 的 app 标识
+    pub app_id: Option<String>,
+    /// K8s workload 身份（STS `metadata.uid`，ownerReference 一跳权威派生；
+    /// 注册表零包袱方案 §1.1）：与 Pod UID（container_id）一同捕获。
+    /// Docker 恒 None；Deployment 族（owner 是 ReplicaSet）不在热路径两跳
+    /// 解析——其绑定身份由部署捕获侧写入 userapp 生命周期表。
+    pub workload_uid: Option<String>,
+}
+
+/// 身份槽位组（填充侧的中间结构；单值标识按 [`slots_from_identifier`] 还原）。
+#[derive(Debug, Clone, Default)]
+pub struct ContainerIdentitySlots {
+    pub project_id: Option<String>,
+    pub user_id: Option<String>,
+    pub pod_id: Option<String>,
+    pub app_id: Option<String>,
+}
+
+/// 单值标识按服务类型还原到语义槽位。
+///
+/// 两个"身份坍缩为单值"的来源共用：K8s 标签 `rcoder.io/identifier`（写入侧
+/// 即 container_identifier 派生值）与 Docker 缓存主键（ContainerConfigBuilder
+/// 的 project_id 槽存的就是派生 identifier）。computer 场景下独立容器（user_id
+/// 派生）与共享 pod（pod_id 派生）在单值上不可分，归 user_id 槽——键值恒与
+/// 创建时命名一致（identity_key 语义正确），槽位语义在该场景有损（注释声明）。
+pub fn slots_from_identifier(
+    service_type: &ServiceType,
+    identifier: &str,
+) -> ContainerIdentitySlots {
+    let mut slots = ContainerIdentitySlots::default();
+    match service_type {
+        ServiceType::WebAgentRunner => slots.project_id = Some(identifier.to_string()),
+        // Computer 族共享 per-user 容器：identifier 恒为 user_id 派生
+        ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
+            slots.user_id = Some(identifier.to_string())
+        }
+        ServiceType::Userapp | ServiceType::UserappBuilder => {
+            slots.app_id = Some(identifier.to_string())
+        }
+    }
+    slots
+}
+
+impl RuntimeContainerInfo {
+    /// 结构化身份 → 定位键（复用 `ServiceType::container_identifier` 官方优先级：
+    /// pod_id > 类型槽位）。`service_type` 或槽位缺失（Docker 重启窗口）返回
+    /// None，调用方落名字反解兜底。
+    pub fn identity_key(&self) -> Option<&str> {
+        let service_type = self.service_type.as_ref()?;
+        // app_id 槽映射到 container_identifier 的 project_id 参数位
+        //（userapp 族的标识语义经该参数承载，见其文档）
+        service_type
+            .container_identifier(
+                self.pod_id.as_deref(),
+                self.user_id.as_deref(),
+                self.project_id.as_deref().or(self.app_id.as_deref()),
+            )
+            .ok()
+    }
 }
 
 /// 已被移除的容器信息（用于清理关联资源）
@@ -271,11 +577,12 @@ impl From<ContainerRuntimeStatus> for String {
 }
 
 // ============================================================================
-// 应用（UserApp）相关类型
+// 应用（Userapp）相关类型
 // ============================================================================
 
 /// 应用端口暴露类型（只描述协议；对外暴露机制由 [`HttpExpose`] 决定）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
 pub enum ExposeType {
     /// HTTP 服务
     Http,
@@ -298,7 +605,7 @@ pub enum HttpExpose {
 }
 
 /// 应用端口规格（创建时由调用方提供）
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct AppPortSpec {
     /// 端口名称
     pub name: String,
@@ -323,7 +630,7 @@ pub enum HealthCheckType {
 }
 
 /// 应用健康检查配置
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 pub struct AppHealthCheck {
     pub check_type: HealthCheckType,
     /// readiness 探针路径(Http 类型时)。
@@ -338,7 +645,7 @@ pub struct AppHealthCheck {
 }
 
 /// 应用资源需求（字符串格式：cpu="1"/"500m"，memory="512Mi"/"1Gi"，storage="10Gi"）
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 pub struct AppResourceRequirements {
     pub cpu: Option<String>,
     pub memory: Option<String>,
@@ -348,14 +655,95 @@ pub struct AppResourceRequirements {
     pub ephemeral_storage: Option<String>,
 }
 
+/// PVC 容量调整结果（`resize_app_storage` 返回；仅日志/域层决策用，不进 HTTP 响应）。
+///
+/// K8s PVC 只扩不能缩（API server 硬限制），缩容请求以 [`Self::ShrinkRejected`]
+/// 事实形态上抛，由调用方（app_manager）转语义错误——K8s 层不做错误决策。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageResizeOutcome {
+    /// 已提交扩容 patch（external-resizer 异步生效，秒~分钟级；kubelet 在线
+    /// 扩展文件系统，不重建 Pod）。from/to 为 quantity 原始字符串。
+    Resized { from: String, to: String },
+    /// 请求值与当前值等量（quantity 归一比较，如 "100Gi" == "102400Mi"），no-op。
+    AlreadyEqual,
+    /// 该 runtime 无 PVC 容量语义（Docker bind 目录等），no-op。
+    Noop,
+    /// 请求值小于当前值——K8s PVC 不支持缩容。
+    ShrinkRejected { current: String, requested: String },
+}
+
 /// 应用端口运行时状态（含实际分配的对外端口）
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AppPortStatus {
+    /// 端口名
     pub name: String,
+    /// 容器端口
     pub port: u16,
+    /// 暴露类型（枚举：`http` HTTP 访问 / `tcp` TCP 直连）
     pub expose_type: ExposeType,
     /// K8s: NodePort；Docker: host_port；未暴露则为 None
     pub external_port: Option<u16>,
+}
+
+/// 容器失败原因（诊断分类封闭集）。来源是运行时结构化字段——K8s container status
+/// 的 `waiting.reason`/`terminated.reason`；K8s API 把 reason 定义为开放字符串
+/// （k8s-openapi 仅 `Option<String>`，生态无现成枚举），本枚举是边界收口：
+/// [`parse`][Self::parse] 一次，下游只消费类型，不再对 message 做子串回扫。
+///
+/// 变体顺序 = 诊断优先序（[`Self::ALL`]）；字符串值 = K8s 原始 token。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+pub enum ContainerFailureReason {
+    CrashLoopBackOff,
+    ImagePullBackOff,
+    ErrImagePull,
+    CreateContainerConfigError,
+    CreateContainerError,
+    InvalidImageName,
+    RunContainerError,
+    StartError,
+    OOMKilled,
+}
+
+impl ContainerFailureReason {
+    /// 全部变体（按诊断优先序）。新增变体须同步本数组——[`Self::as_str`] 的
+    /// 穷尽 match 会先强制更新字符串映射。
+    pub const ALL: [Self; 9] = [
+        Self::CrashLoopBackOff,
+        Self::ImagePullBackOff,
+        Self::ErrImagePull,
+        Self::CreateContainerConfigError,
+        Self::CreateContainerError,
+        Self::InvalidImageName,
+        Self::RunContainerError,
+        Self::StartError,
+        Self::OOMKilled,
+    ];
+
+    /// K8s 原始 token（穷尽 match：新增变体时编译器强制同步）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CrashLoopBackOff => "CrashLoopBackOff",
+            Self::ImagePullBackOff => "ImagePullBackOff",
+            Self::ErrImagePull => "ErrImagePull",
+            Self::CreateContainerConfigError => "CreateContainerConfigError",
+            Self::CreateContainerError => "CreateContainerError",
+            Self::InvalidImageName => "InvalidImageName",
+            Self::RunContainerError => "RunContainerError",
+            Self::StartError => "StartError",
+            Self::OOMKilled => "OOMKilled",
+        }
+    }
+
+    /// 边界解析：K8s reason 字符串 → 枚举（整值等值匹配；未知 reason → None）。
+    pub fn parse(reason: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.as_str() == reason)
+    }
+}
+
+impl std::fmt::Display for ContainerFailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Deployment 运行时状态（供 app_manager 实时查询，rcoder 无状态化读路径的数据载体）
@@ -363,6 +751,10 @@ pub struct AppPortStatus {
 pub struct DeploymentStatus {
     /// 应用 ID（app_id）
     pub app_id: String,
+    /// Docker owner label, used when restoring in-memory routes after a
+    /// controller restart. Older/unlabelled containers remain untrusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_id: Option<String>,
     /// 期望副本数
     pub replicas: i32,
     /// 就绪副本数
@@ -372,6 +764,11 @@ pub struct DeploymentStatus {
     /// 阶段附加信息（如失败原因：CrashLoopBackOff / ImagePullBackOff / 容器退出码等）。
     /// phase=Error 时必填，便于调用方定位"服务为啥没起来"。
     pub message: Option<String>,
+    /// 机器可读失败原因（[`ContainerFailureReason`]），来自运行时结构化字段
+    /// （K8s container status 的 waiting.reason / terminated.reason）。
+    /// 诊断分类优先消费本字段，[`Self::message`] 仅作兜底——不得对 message
+    /// 做子串回扫当主判据。
+    pub reason: Option<ContainerFailureReason>,
     /// Pod IP（K8s）/ 容器 IP（Docker）
     pub pod_ip: Option<String>,
     /// 所在节点（K8s）
@@ -394,12 +791,106 @@ pub struct DeploymentStatus {
     pub wake_on_traffic: Option<bool>,
     /// Deployment 创建时间（RFC3339，来自 metadata.creationTimestamp；回收扫描器做 protection 龄期判断）。
     pub created_at: Option<String>,
+    /// K8s Deployment UID（部署故障观察的身份锚点：pod owner 链归属核验）。
+    /// Docker 无此概念，填 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_uid: Option<String>,
+}
+
+impl DeploymentStatus {
+    /// A requested workload has not reached its desired ready replica count.
+    /// An explicit runtime error remains a separate, non-wakeable phase.
+    pub fn is_starting(&self) -> bool {
+        self.replicas > 0 && self.ready_replicas < self.replicas && self.phase != "Error"
+    }
+}
+
+#[cfg(test)]
+mod deployment_status_tests {
+    use super::DeploymentStatus;
+
+    #[test]
+    fn starting_requires_desired_replicas_without_runtime_error() {
+        for (phase, replicas, ready, expected) in [
+            ("Stopped", 0, 0, false),
+            ("Starting", 1, 0, true),
+            ("Starting", 2, 1, true),
+            ("Running", 1, 1, false),
+            ("Running", 1, 2, false),
+            ("Error", 1, 0, false),
+        ] {
+            let status = DeploymentStatus {
+                phase: phase.into(),
+                replicas,
+                ready_replicas: ready,
+                ..Default::default()
+            };
+            assert_eq!(status.is_starting(), expected, "{phase}/{replicas}/{ready}");
+        }
+    }
+}
+
+/// 部署故障观察的目标身份（本次操作实际写入的模板归属）。
+///
+/// `template_token` = 写入 pod template annotations 的 `rcoder.io/deploy-template-token`
+/// （rcoder 在 create/SSA patch 时写入，取值 = 本次操作的 operation_id——每次变更的
+/// 写入者身份，确定性比较，不使用 generation/revision/pod-template-hash 互比）。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AppDeployTarget {
+    /// 目标 Deployment UID（与 pod owner 链解析结果比对）
+    pub deployment_uid: String,
+    /// 本次写入的模板令牌（operation_id）
+    pub template_token: String,
+}
+
+/// 容器最近一次退出的结构化身份（区别于自由文本 message）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ContainerExit {
+    /// 退出码
+    pub code: i32,
+    /// K8s 终止原因（OOMKilled / Error / Completed…）
+    pub reason: Option<String>,
+}
+
+/// 单个应用 Pod 的结构化故障观察（K8s 原生字段，非文本解析）。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PodFailureObservation {
+    /// 完整 owner 链解析出的 Deployment UID（pod --controller=true--> RS --controller=true--> Deployment）
+    pub deployment_uid: String,
+    /// owner 链 → 目标 Deployment UID ∧ pod template 携带目标令牌（身份匹配才可参与故障分类）
+    pub matches_target_template: bool,
+    pub pod_uid: String,
+    /// Pod phase：Pending/Running/Succeeded/Failed/Unknown
+    pub pod_phase: String,
+    /// PodScheduled condition（None = 缺失）
+    pub scheduled: Option<bool>,
+    /// 调度拒绝原因（Unschedulable 等；scheduled=false 时有意义）
+    pub scheduling_reason: Option<String>,
+    /// app 容器 waiting reason（K8s 原生：CrashLoopBackOff/ImagePullBackOff/ContainerCreating…）
+    pub container_waiting_reason: Option<String>,
+    /// waiting 诊断文本（镜像永久失败分类仍需匹配：NotFound/Unauthorized/denied）
+    pub container_waiting_message: Option<String>,
+    /// app 容器最近一次退出（含 OOMKilled）
+    pub container_last_exit: Option<ContainerExit>,
+    pub restart_count: u32,
+    pub ready: bool,
+}
+
+/// 应用 Pod 观察结果三态。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub enum PodObservation {
+    /// 观察到一个 Pod
+    Observed(PodFailureObservation),
+    /// 无 Pod（合法状态：尚未调度/已删除——与观察失败严格区分）
+    NoPod,
+    /// 身份不确定（owner 链不完整/多候选无法归因）——只诊断，不参与故障分类
+    UncertainIdentity(String),
 }
 
 /// app 容器当前 `command`/`env` 快照（`update` 部分更新回退用）。
 ///
 /// rcoder 无状态、不存业务元数据（name/image/command/env 由调用方持久化）。
-/// `update` 请求若漏 `command`/`env`，从 live 容器读当前值回退——与 `ports` 从运行时状态
+/// `update` 请求若漏字段，从 live 容器读当前值回退——与 `ports` 从运行时状态
 /// 回退一致，避免部分更新静默清空（`command` 丢 → 镜像无 ENTRYPOINT 时 CrashLoop；
 /// `env` 丢 → K8s `cleanup_orphan_port_resources` 删 ConfigMap → 容器丢环境变量）。
 ///
@@ -407,10 +898,25 @@ pub struct DeploymentStatus {
 /// `valueFrom`（secret/configmap 引用）无字面值，读不回，需调用方 update 时重发 `secrets`。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContainerSpecSnapshot {
-    /// 启动命令（K8s UserApp 存于 `container.args`，Docker 存于 `Config.cmd`）
+    /// 启动命令（K8s Userapp 存于 `container.args`，Docker 存于 `Config.cmd`）
     pub command: Option<Vec<String>>,
     /// 字面值环境变量
     pub env: Option<HashMap<String, String>>,
+    /// 敏感环境变量（K8s 从 `{app}-secret` 读回 base64 解码；
+    /// Docker 与 env 合并存储不可分，恒 None——但 env 回退已含其值，容器行为不丢）
+    pub secrets: Option<HashMap<String, String>>,
+    /// 资源限制（K8s 从 pod template `resources.limits` 原样还原 Quantity 字符串；
+    /// Docker 从 inspect HostConfig 换算；storage 是 per-app PVC 配额不在容器层，恒 None）
+    pub resources: Option<AppResourceRequirements>,
+    /// 健康检查（K8s 从 liveness/readiness probe 反推 `build_probe` 的逆映射；
+    /// Docker 无探针概念，恒 None）
+    pub health_check: Option<AppHealthCheck>,
+    /// 端口配置（K8s 从 pod template container.ports + `rcoder.io/port-expose` 注解还原
+    /// name/port/expose_type——strip_prefix 未持久化，读回 None（显式 false 的用户部分
+    /// 更新后 HTTPRoute 回默认剥前缀行为）；Docker 从 Config.ExposedPorts 还原端口列表
+    /// （name 空串、expose_type 恒 Http、strip_prefix None——单机模式尽力回退，
+    /// 保住端口号不丢是主要目标）。
+    pub ports: Option<Vec<AppPortSpec>>,
 }
 
 /// 应用资源用量（运行时层；K8s 来自 metrics.k8s.io PodMetrics，Docker 可来自 bollard stats）。
@@ -455,4 +961,58 @@ pub struct AppEventInfo {
     pub object: String,
     /// 发生次数
     pub count: i32,
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    /// 单值标识按类型还原槽位：语义单一不兼任——web→project_id、
+    /// computer→user_id、userapp 两族→app_id；pod_id 不由单值产生。
+    #[test]
+    fn slots_from_identifier_routes_by_service_type() {
+        let s = slots_from_identifier(&ServiceType::WebAgentRunner, "proj-1");
+        assert_eq!(s.project_id.as_deref(), Some("proj-1"));
+        assert!(s.user_id.is_none() && s.app_id.is_none() && s.pod_id.is_none());
+
+        let s = slots_from_identifier(&ServiceType::ComputerAgentRunner, "user-6");
+        assert_eq!(s.user_id.as_deref(), Some("user-6"));
+        assert!(s.project_id.is_none() && s.app_id.is_none());
+
+        for st in [ServiceType::Userapp, ServiceType::UserappBuilder] {
+            let s = slots_from_identifier(&st, "39");
+            assert_eq!(s.app_id.as_deref(), Some("39"), "{st}");
+            assert!(s.project_id.is_none() && s.user_id.is_none(), "{st}");
+        }
+    }
+
+    /// identity_key 复用 container_identifier 官方优先级：pod_id 最高，
+    /// userapp 族经 app_id 槽（映射 project_id 参数位）。
+    #[test]
+    fn identity_key_uses_official_priority() {
+        let mut info = RuntimeContainerInfo {
+            container_id: "c".into(),
+            container_name: "n".into(),
+            container_ip: "127.0.0.1".into(),
+            status: ContainerRuntimeStatus::Running,
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+            env_vars: None,
+            service_type: Some(ServiceType::UserappBuilder),
+            project_id: None,
+            user_id: None,
+            pod_id: None,
+            workload_uid: None,
+            app_id: Some("app-23".into()),
+        };
+        assert_eq!(info.identity_key(), Some("app-23"));
+
+        // pod_id 槽优先于类型槽位
+        info.pod_id = Some("pod-9".into());
+        info.user_id = Some("user-6".into());
+        assert_eq!(info.identity_key(), Some("pod-9"));
+
+        // service_type 缺失（Docker 重启窗口）→ None（消费方落反解兜底）
+        info.service_type = None;
+        assert_eq!(info.identity_key(), None);
+    }
 }

@@ -102,7 +102,7 @@ pub async fn load_sacp_agent_config_with_resolver(
             agent_config.command,
             resolved_env
                 .get("ANTHROPIC_API_KEY")
-                .map(&mask_key)
+                .map(mask_key)
                 .unwrap_or_default(),
             resolved_env
                 .get("ANTHROPIC_BASE_URL")

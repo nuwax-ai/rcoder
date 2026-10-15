@@ -2,10 +2,11 @@
 //!
 //! 错误响应体:
 //! ```jsonc
-//! { "success": false, "code": "<TYPE>",
+//! { "success": false, "code": "UNKNOWN_ERROR",
 //!   "error": { "type": "<TYPE>", "message": "...", "timestamp": "<CST>", "requestId": "..."[, "details": {}] } }
 //! ```
-//! HTTP 状态码由错误类型决定 (见 [`AppError::status_code`])。
+//! HTTP 状态码由错误类型决定 (见 `AppError::status_code`)；运行时诊断使用
+//! shared_types 的真实 code/status，同时保留现有 file 错误包装。
 
 use axum::Json;
 use axum::http::StatusCode;
@@ -17,8 +18,22 @@ use serde_json::{Value, json};
 pub enum AppError {
     /// VALIDATION_ERROR (400)
     Validation(String, Option<Value>),
+    /// VALIDATION_ERROR (400) — 带 i18n key 的校验错误 (英文 fallback, i18n_key)。
+    /// `into_response` 时优先用 `t(key, locale)` 翻译, 未命中则回退 fallback。
+    ///
+    /// 预留: 当前校验消息统一用英文 (garde + Validation), 此变体暂无生产调用方,
+    /// 供未来业务错误 i18n 使用 (locale 中间件已就绪)。
+    #[allow(dead_code, reason = "预留 i18n 入口, locale 中间件已就绪, 暂未接入")]
+    ValidationI18n(String, &'static str),
     /// BUSINESS_ERROR (400)
     Business(String),
+    /// 业务错误的 TypeScript details（保留原信封；可携带 TYPECHECK_FAILED）。
+    BusinessWithDetails(String, Value),
+    /// CONFLICT (409): an existing identified operation must be resolved first.
+    Conflict(String),
+    /// Management recovery needs physical cleanup evidence (409), with the
+    /// original supervisor/generation/operation and recovery stage in details.
+    RuntimeRecovery(String, Value),
     /// PERMISSION_ERROR (403)
     Permission(String),
     /// RESOURCE_ERROR (404)
@@ -27,21 +42,105 @@ pub enum AppError {
     Network(String),
     /// SYSTEM_ERROR (500)
     System(String),
+    /// 共享运行时诊断；保留原因、阶段、重试证据和原操作身份。
+    RuntimeDiagnostic(Box<shared_types::AppError>),
+    /// SYSTEM_ERROR (500) — 命令执行失败的结构化形态（UA-06）：`output_tail`
+    /// 是机器可读的本次运行输出尾段（原始行, 未拼接展示标记）; 错误分类
+    /// （如 pnpm 缺 lockfile 自愈）走字段, 不再解析 Display 文本——另一处
+    /// 改动错误包裹/展示/截断格式时, 机器分类不受影响。Display 仍为人读全文。
+    CommandExecution {
+        message: String,
+        output_tail: Option<String>,
+    },
     /// FILE_ERROR (500)
     File(String),
     /// PROCESS_ERROR (500)
     Process(String),
+    /// PROCESS_ERROR (500) — dev server 启动端口占用（R11 类型化：
+    /// ViteStartupError::PortInUse 的结构化承载——协调器按变体分类，
+    /// 不再匹配中文文案）。
+    ProcessPortInUse { port: u16, detail: String },
 }
 
 impl AppError {
+    /// 前缀包装并**保留** [`AppError::CommandExecution`] 的结构化输出尾段
+    /// （UA-06）：展示层加前缀不得抹掉机器分类字段——此前 `system(format!(
+    /// "{prefix}: {e}"))` 会把结构化错误降级回纯文本, 使依赖 Display 文本
+    /// 约定的分类（pnpm 缺 lockfile 自愈）在包装层碎裂。运行时诊断也保留
+    /// 结构化类型与身份，其余变体维持原有 System 包装语义。
+    pub fn prefixed(self, prefix: &str) -> Self {
+        match self {
+            Self::CommandExecution {
+                message,
+                output_tail,
+            } => Self::CommandExecution {
+                message: format!("{prefix}: {message}"),
+                output_tail,
+            },
+            Self::RuntimeDiagnostic(error) => {
+                let message = shared_types::sanitize_error_text(&format!("{prefix}: {error}"));
+                let error = match *error {
+                    shared_types::AppError::Structured(mut detail) => {
+                        detail.internal_message = Some(message);
+                        if let Some(diagnostic) = &mut detail.error_detail {
+                            diagnostic.detail = shared_types::sanitize_error_text(&format!(
+                                "{prefix}: {}",
+                                diagnostic.detail
+                            ));
+                        }
+                        shared_types::AppError::Structured(detail)
+                    }
+                    _ => shared_types::AppError::generic(message),
+                };
+                Self::RuntimeDiagnostic(Box::new(error))
+            }
+            other => Self::system(format!("{prefix}: {other}")),
+        }
+    }
+
+    pub(crate) fn owner_error(context: &str, error: anyhow::Error) -> Self {
+        if let Some(recovery) = error.downcast_ref::<runtime_supervisor::RecoveryError>() {
+            return Self::RuntimeRecovery(
+                format!("{context}: {error:#}"),
+                json!(&recovery.snapshot),
+            );
+        }
+        if error
+            .downcast_ref::<runtime_supervisor::Problem>()
+            .is_some_and(|p| p.code == runtime_supervisor::FailureCode::Busy)
+        {
+            return Self::Conflict(format!("{context}: {error:#}"));
+        }
+        Self::business(format!("{context}: {error:#}"))
+    }
     pub fn validation(msg: impl Into<String>) -> Self {
         AppError::Validation(msg.into(), None)
     }
     pub fn validation_with(msg: impl Into<String>, details: Value) -> Self {
         AppError::Validation(msg.into(), Some(details))
     }
+    /// 结构体 details 的校验错误: 字段集在编译期锁定 (裸 `json!` 宏改名字段
+    /// 不会有任何编译感知)。序列化失败降级为无 details 的校验错误并 warn,
+    /// 不 panic、不向调用方传染 `Result`。
+    pub fn validation_with_details(msg: impl Into<String>, details: impl serde::Serialize) -> Self {
+        match serde_json::to_value(details) {
+            Ok(value) => AppError::Validation(msg.into(), Some(value)),
+            Err(error) => {
+                tracing::warn!(%error, "serialize validation error details failed");
+                AppError::Validation(msg.into(), None)
+            }
+        }
+    }
+    /// 带 i18n key 的校验错误: `fallback` 为英文兜底消息 (支持 String 动态拼接),
+    /// `key` 为 i18n 翻译 key。`into_response` 时优先按请求 locale 翻译 key, 未命中则用 fallback。
+    pub fn validation_i18n(fallback: impl Into<String>, key: &'static str) -> Self {
+        AppError::ValidationI18n(fallback.into(), key)
+    }
     pub fn business(msg: impl Into<String>) -> Self {
         AppError::Business(msg.into())
+    }
+    pub fn business_with_details(msg: impl Into<String>, details: Value) -> Self {
+        AppError::BusinessWithDetails(msg.into(), details)
     }
     pub fn permission(msg: impl Into<String>) -> Self {
         AppError::Permission(msg.into())
@@ -55,6 +154,9 @@ impl AppError {
     pub fn system(msg: impl Into<String>) -> Self {
         AppError::System(msg.into())
     }
+    pub fn runtime_diagnostic(error: shared_types::AppError) -> Self {
+        AppError::RuntimeDiagnostic(Box::new(error))
+    }
     pub fn file(msg: impl Into<String>) -> Self {
         AppError::File(msg.into())
     }
@@ -64,21 +166,29 @@ impl AppError {
 
     fn type_name(&self) -> &'static str {
         match self {
-            AppError::Validation(..) => "VALIDATION_ERROR",
-            AppError::Business(_) => "BUSINESS_ERROR",
+            AppError::Validation(..) | AppError::ValidationI18n(..) => "VALIDATION_ERROR",
+            AppError::Business(_) | AppError::BusinessWithDetails(..) => "BUSINESS_ERROR",
+            AppError::Conflict(_) | AppError::RuntimeRecovery(..) => "CONFLICT",
             AppError::Permission(_) => "PERMISSION_ERROR",
             AppError::Resource(_) => "RESOURCE_ERROR",
             AppError::Network(_) => "NETWORK_ERROR",
-            AppError::System(_) => "SYSTEM_ERROR",
+            AppError::System(_)
+            | AppError::CommandExecution { .. }
+            | AppError::RuntimeDiagnostic(_) => "SYSTEM_ERROR",
             AppError::File(_) => "FILE_ERROR",
-            AppError::Process(_) => "PROCESS_ERROR",
+            AppError::Process(_) | AppError::ProcessPortInUse { .. } => "PROCESS_ERROR",
         }
     }
 
     fn status_code(&self) -> StatusCode {
         match self {
-            AppError::Validation(..) | AppError::Business(_) => StatusCode::BAD_REQUEST,
+            AppError::RuntimeDiagnostic(error) => error.status_code(),
+            AppError::Validation(..)
+            | AppError::ValidationI18n(..)
+            | AppError::Business(_)
+            | AppError::BusinessWithDetails(..) => StatusCode::BAD_REQUEST,
             AppError::Permission(_) => StatusCode::FORBIDDEN,
+            AppError::Conflict(_) | AppError::RuntimeRecovery(..) => StatusCode::CONFLICT,
             AppError::Resource(_) => StatusCode::NOT_FOUND,
             AppError::Network(_) => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -88,19 +198,33 @@ impl AppError {
     fn message(&self) -> &str {
         match self {
             AppError::Validation(m, _) => m,
-            AppError::Business(m) => m,
+            // 返回英文 fallback; 实际翻译在 into_response 里按 locale 做。
+            AppError::ValidationI18n(fallback, _) => fallback,
+            AppError::Business(m) | AppError::BusinessWithDetails(m, _) | AppError::Conflict(m) => {
+                m
+            }
+            AppError::RuntimeRecovery(m, _) => m,
             AppError::Permission(m) => m,
             AppError::Resource(m) => m,
             AppError::Network(m) => m,
-            AppError::System(m) => m,
+            AppError::System(m) | AppError::CommandExecution { message: m, .. } => m,
+            AppError::RuntimeDiagnostic(error) => match error.as_ref() {
+                shared_types::AppError::Structured(detail) => detail
+                    .internal_message
+                    .as_deref()
+                    .unwrap_or("Runtime request failed"),
+                _ => "Runtime request failed",
+            },
             AppError::File(m) => m,
             AppError::Process(m) => m,
+            AppError::ProcessPortInUse { detail, .. } => detail,
         }
     }
 
     fn details(&self) -> Option<&Value> {
         match self {
             AppError::Validation(_, d) => d.as_ref(),
+            AppError::RuntimeRecovery(_, d) | AppError::BusinessWithDetails(_, d) => Some(d),
             _ => None,
         }
     }
@@ -157,7 +281,11 @@ fn base36(mut n: u64) -> String {
 
 impl std::fmt::Display for AppError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.message())
+        if matches!(self, Self::RuntimeDiagnostic(_)) {
+            f.write_str(&shared_types::sanitize_error_text(self.message()))
+        } else {
+            f.write_str(self.message())
+        }
     }
 }
 
@@ -165,7 +293,48 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
         let typ = self.type_name();
-        let message = self.message().to_string();
+        if let AppError::RuntimeDiagnostic(origin) = self {
+            let result = origin.into_http_result::<()>(shared_types::current_request_locale());
+            let mut body = json!({
+                "success": false,
+                "code": result.code,
+                "error": {
+                    "type": typ,
+                    "message": result.message,
+                    "timestamp": now_cst_timestamp(),
+                    "requestId": current_request_id(),
+                },
+            });
+            if let Some(detail) = result.error_detail {
+                body["error_detail"] = json!(detail);
+            }
+            if let Some(id) = result.operation_id {
+                body["operation_id"] = json!(id);
+            }
+            if let Some(blocker) = result.blocker {
+                body["blocker"] = json!(blocker);
+            }
+            if let Some(tid) = result.tid {
+                body["tid"] = json!(tid);
+            }
+            return (status, Json(body)).into_response();
+        }
+        // 对 ValidationI18n: 优先按请求 locale 翻译, 未命中则用 fallback。
+        // shared_types::t 未命中归一为裸 key (旧形状 "{locale}.{key}" 一并兜底):
+        // 以 key 结尾 (裸 key 即相等) 判定未命中。
+        let message = match &self {
+            AppError::ValidationI18n(fallback, key) => {
+                let locale = shared_types::current_request_locale();
+                let translated = shared_types::t(key, locale);
+                if translated == *key || (translated.len() > key.len() && translated.ends_with(key))
+                {
+                    fallback.clone()
+                } else {
+                    translated
+                }
+            }
+            _ => self.message().to_string(),
+        };
         let mut error = json!({
             "type": typ,
             "message": message,
@@ -175,15 +344,21 @@ impl IntoResponse for AppError {
         if let Some(d) = self.details() {
             error["details"] = d.clone();
         }
-        // code 恒 "UNKNOWN_ERROR" (对齐 nuwax: AppError 不设 code, formatErrorResponse
-        // 兜底 UNKNOWN_ERROR; 具体类型在 error.type)。
-        let body = json!({ "success": false, "code": "UNKNOWN_ERROR", "error": error });
+        // 新业务 details.code 对齐 TS formatErrorResponse；既有错误代码不变。
+        let code = match &self {
+            AppError::BusinessWithDetails(_, details) => details
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("UNKNOWN_ERROR"),
+            _ => "UNKNOWN_ERROR",
+        };
+        let body = json!({ "success": false, "code": code, "error": error });
         (status, Json(body)).into_response()
     }
 }
 
 /// garde 校验错误 (Report) → AppError::validation (对齐 shared_types::garde_err_to_app_error,
-/// 但返回 file-server 本地的 AppError)。消息形如 "field: <rule message>; field2: ..."。
+/// 但返回 file-server 本地的 AppError)。消息形如 "field: `<rule message>`; field2: ..."。
 pub fn from_garde(report: garde::Report) -> AppError {
     let msg = report
         .iter()
@@ -247,5 +422,140 @@ mod tests {
     fn current_request_id_fallback_without_scope() {
         // task_local 未 scope 时回退 "unknown"
         assert_eq!(current_request_id(), "unknown");
+    }
+
+    #[test]
+    fn validation_i18n_type_name_and_status() {
+        let err = AppError::validation_i18n("test", "error.validation");
+        assert_eq!(err.type_name(), "VALIDATION_ERROR");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn validation_i18n_message_returns_fallback() {
+        // message() (Display) 始终返回英文 fallback, 不做翻译
+        let err = AppError::validation_i18n("test fallback", "error.validation");
+        assert_eq!(err.message(), "test fallback");
+        assert_eq!(err.to_string(), "test fallback");
+    }
+
+    #[tokio::test]
+    async fn validation_i18n_into_response_translates_by_locale() {
+        // zh-CN locale: into_response 应返回 error.validation 的中文翻译
+        let result = shared_types::scope_request_locale("zh-CN", async {
+            let err = AppError::validation_i18n("test fallback", "error.validation");
+            let response = err.into_response();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            v["error"]["message"].as_str().unwrap().to_string()
+        })
+        .await;
+        // error.validation 的 zh-CN 翻译是 "参数验证失败"
+        assert_eq!(result, "参数验证失败");
+    }
+
+    #[tokio::test]
+    async fn validation_i18n_into_response_uses_en_us_when_no_locale() {
+        // 无 locale 上下文 → 回退 en-US → 翻译命中英文
+        let err = AppError::validation_i18n("test fallback", "error.validation");
+        let response = err.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        // error.validation 的 en-US 翻译是 "Validation failed"
+        assert_eq!(v["error"]["message"].as_str(), Some("Validation failed"));
+    }
+
+    #[tokio::test]
+    async fn validation_i18n_into_response_fallback_on_unknown_key() {
+        // key 不存在 → t() 返回 key 本身 → 走 fallback 分支
+        let err = AppError::validation_i18n("my fallback msg", "error.no_such_key_xyz");
+        let response = err.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["message"].as_str(), Some("my fallback msg"));
+    }
+
+    #[tokio::test]
+    async fn workspace_diagnostic_keeps_identity_locale_and_file_error_shape() {
+        let origin = shared_types::AppError::with_message(
+            shared_types::error_codes::ERR_RUNTIME_UNAVAILABLE,
+            "PV query failed password=controlled-secret",
+        )
+        .with_error_detail(
+            shared_types::ErrorDetail::new(
+                shared_types::error_codes::ERR_RUNTIME_UNAVAILABLE,
+                "workspace_resolve",
+                "PV query failed password=controlled-secret",
+            )
+            .with_task_id("real-task")
+            .with_retryable(true),
+        )
+        .with_operation_id("original-operation".into());
+        let response = REQUEST_ID
+            .scope("file-request".into(), async {
+                shared_types::scope_request_locale("zh-CN", async {
+                    AppError::runtime_diagnostic(origin)
+                        .prefixed("project lookup")
+                        .into_response()
+                })
+                .await
+            })
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["code"],
+            shared_types::error_codes::ERR_RUNTIME_UNAVAILABLE
+        );
+        assert_eq!(value["success"], false);
+        assert_eq!(value["error"]["type"], "SYSTEM_ERROR");
+        assert_eq!(value["error"]["requestId"], "file-request");
+        assert!(value["error"]["timestamp"].as_str().is_some());
+        assert_eq!(value["operation_id"], "original-operation");
+        assert_eq!(value["error_detail"]["task_id"], "real-task");
+        assert_eq!(value["error_detail"]["stage"], "workspace_resolve");
+        assert_eq!(value["error_detail"]["retryable"], true);
+        assert_eq!(
+            value["error_detail"]["hint"],
+            shared_types::error_codes::get_error_hint(
+                shared_types::error_codes::ERR_RUNTIME_UNAVAILABLE,
+                "zh-CN"
+            )
+        );
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("project lookup")
+        );
+        assert!(
+            !String::from_utf8(bytes.to_vec())
+                .unwrap()
+                .contains("controlled-secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_file_error_does_not_gain_runtime_fields_or_code() {
+        let response = AppError::system("ordinary file failure").into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["code"], "UNKNOWN_ERROR");
+        for field in ["error_detail", "operation_id", "blocker", "tid"] {
+            assert!(value.get(field).is_none(), "{value}");
+        }
+        assert_eq!(value["error"]["message"], "ordinary file failure");
     }
 }

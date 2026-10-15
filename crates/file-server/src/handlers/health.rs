@@ -9,12 +9,11 @@
 use axum::Json;
 use axum::extract::State;
 use axum::response::Html;
-use serde::Serialize;
-use utoipa::ToSchema;
 
 use crate::AppState;
+use crate::models::{HealthResponse, MemoryUsage, VersionResponse};
 
-/// `GET /`，兼容 nuwax 根路径探测。
+/// 根路径探测（兼容 nuwax）
 #[utoipa::path(
     get,
     path = "/",
@@ -25,30 +24,15 @@ pub async fn root() -> Html<&'static str> {
     Html("Hello")
 }
 
-#[derive(Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct HealthResponse {
-    pub status: String,
-    pub timestamp: i64,
-    pub uptime: u64,
-    pub version: String,
-    pub platform: String,
-    pub node_version: String,
-    pub pid: u32,
-    pub memory: MemoryUsage,
-    pub env: String,
-}
+/// file-server 产品契约版本。
+///
+/// 消费方用它做能力门禁: Java `FileServerVersionSupport` 读取 `/api/version` 并与
+/// `AGENT_STORE_MIN_VERSION = 1.4.0` 比较, 决定是否走 v2 agent-store API。本实现
+/// 已覆盖该契约面 (create-workspace-v2/agent-store), 因此报告所实现的 TS 契约线
+/// 版本; crate 版本只是构建编号, 不参与能力判断。升级功能面时同步提升此常量。
+pub const API_CONTRACT_VERSION: &str = "1.5.8";
 
-#[derive(Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct MemoryUsage {
-    pub rss: f64,
-    pub heap_used: f64,
-    pub heap_total: f64,
-    pub external: f64,
-}
-
-/// `GET /health`
+/// 健康检查
 #[utoipa::path(
     get,
     path = "/health",
@@ -62,13 +46,32 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         status: "ok".to_string(),
         timestamp: now_ms(),
         uptime,
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: API_CONTRACT_VERSION.to_string(),
         platform: std::env::consts::OS.to_string(),
         // Rust 无 node 运行时, 用 rust edition 标识 (对齐 nuwax nodeVersion 字段位)
         node_version: "rust-2024".to_string(),
         pid: std::process::id(),
         memory,
         env: std::env::var("NODE_ENV").unwrap_or_else(|_| "unknown".to_string()),
+    })
+}
+
+/// 版本协商
+///
+/// 版本协商 (对齐 TS v1.4.0 router.js)。
+/// Java 网关据此决定走 v2 新 API (agent-store) 还是旧 API, 因此必须报告
+/// [`API_CONTRACT_VERSION`] (契约能力线), 不能报告 crate 构建号——后者会让
+/// Java 的 `>= 1.4.0` 门禁误判为不支持 agent-store。
+#[utoipa::path(
+    get,
+    path = "/api/version",
+    responses((status = 200, description = "Service version", body = VersionResponse)),
+    tag = "System"
+)]
+pub async fn version() -> Json<VersionResponse> {
+    Json(VersionResponse {
+        success: true,
+        version: API_CONTRACT_VERSION.to_string(),
     })
 }
 
@@ -97,7 +100,6 @@ fn rss_mb() -> f64 {
             for line in s.lines() {
                 if let Some(rest) = line.strip_prefix("VmRSS:") {
                     let kb: f64 = rest
-                        .trim()
                         .split_whitespace()
                         .next()
                         .and_then(|t| t.parse::<f64>().ok())

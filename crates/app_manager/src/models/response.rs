@@ -40,7 +40,7 @@ pub struct AppInfo {
     pub app_id: String,
     /// 应用名称
     pub name: String,
-    /// 应用状态
+    /// 应用状态（枚举：`created` 已创建 / `starting` 启动中 / `running` 运行 / `stopped` 已停止 / `error` 异常）
     pub status: AppStatus,
     /// 阶段附加信息（phase=Error 时为失败原因，如 CrashLoopBackOff）
     pub message: Option<String>,
@@ -73,7 +73,7 @@ pub struct AppInfo {
 pub struct AppRuntimeInfo {
     /// 应用 ID
     pub app_id: String,
-    /// 应用状态（由运行时 phase 映射）
+    /// 应用状态（由运行时 phase 映射；枚举：`created` / `starting` / `running` / `stopped` / `error`）
     pub status: AppStatus,
     /// 运行时阶段原始值：Running/Stopped/Starting/Error 等
     pub phase: String,

@@ -1,0 +1,38 @@
+{
+  "protocol": "pingap-release-assets-v1",
+  "repository": "vicanso/pingap",
+  "releases": {
+    "0.14.3": {
+      "tag": "v0.14.3",
+      "commit": "cd74a461a3e778ae83f7c4dd7fd03ea483f3e3e8",
+      "assets": {
+        "amd64": {
+          "id": 561530013,
+          "name": "pingap-linux-gnu-x86-full.tar.gz",
+          "sha256": "f19372531edf336c12e33f24df265fb55ad70bece49bbe88d662471aeff232e9"
+        },
+        "arm64": {
+          "id": 561525562,
+          "name": "pingap-linux-gnu-aarch64-full.tar.gz",
+          "sha256": "67b9fb43b6f57b9264a688f66ac7a040dc7f7adab4ae2487b8a7879b8e822312"
+        }
+      }
+    },
+    "0.15.0": {
+      "tag": "v0.15.0",
+      "commit": "8270a1ebb7a238ea86fa220215714613410378bb",
+      "assets": {
+        "amd64": {
+          "id": 602311135,
+          "name": "pingap-linux-gnu-x86-full.tar.gz",
+          "sha256": "0539eeac37e9bf81307885983a4906e41e03aba1bf093b3c6bc5952e809e8334"
+        },
+        "arm64": {
+          "id": 602308525,
+          "name": "pingap-linux-gnu-aarch64-full.tar.gz",
+          "sha256": "25b583c9820d8da260dfaeb0af0e9c602c26dfba950f082a527057244f94cedd"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,385 @@
+//! UserApp control storage is independent of Agent project/session persistence.
+use std::{path::PathBuf, sync::Arc};
+
+use anyhow::{Context, bail};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserAppStorageBackend {
+    #[default]
+    Auto,
+    Turso,
+    Postgres,
+}
+
+impl std::str::FromStr for UserAppStorageBackend {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value.trim() {
+            "auto" => Ok(Self::Auto),
+            // 旧值 fail-fast：控制面 SQLite 已按 spec 一次性切换为 Turso，不静默
+            // 映射（specs/userapp-turso-local-storage T3；docker/TURSO.md 记录
+            // 该契约）。
+            "sqlite" => {
+                bail!("backend sqlite was replaced by turso; update the deployment configuration")
+            }
+            "turso" => Ok(Self::Turso),
+            "postgres" => Ok(Self::Postgres),
+            _ => bail!("backend must be auto, turso or postgres"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UserAppStorageConfig {
+    pub backend: UserAppStorageBackend,
+    pub turso_path: PathBuf,
+    /// None reuses PostgreSQL connection settings, never the Agent backend mode.
+    #[serde(skip_serializing)]
+    pub postgres: Option<rcoder_storage::config::PostgresConfig>,
+    pub ensure_timeout_seconds: u64,
+    /// 交互转发请求（git/file 列表等）定位 builder 的等待上限；实际预算
+    /// 取 min(ensure_timeout_seconds, 本值)。冷启动（空闲回收后重建）实测
+    /// 10~13s，默认 30s 覆盖并留余量。
+    pub interactive_ensure_wait_seconds: u64,
+    /// dev 转发发送前的 TCP 连接预检预算（对齐 prod `wait_for_prod_service`
+    /// 语义）：覆盖 builder 原地容器重启（实测 ~12s）与全量 pod 重建
+    /// （~18-20s）的不可达窗口；耗尽后按在途证据分级报错而非裸连接错误。
+    pub dev_forward_connect_wait_seconds: u64,
+}
+
+impl Default for UserAppStorageConfig {
+    fn default() -> Self {
+        Self {
+            backend: UserAppStorageBackend::Auto,
+            turso_path: PathBuf::from("data/rcoder/userapp.turso.db"),
+            postgres: None,
+            ensure_timeout_seconds: 90,
+            interactive_ensure_wait_seconds: 30,
+            dev_forward_connect_wait_seconds: 20,
+        }
+    }
+}
+
+impl UserAppStorageConfig {
+    pub fn resolved_backend(
+        &self,
+        mode: app_manager::AppAccessMode,
+    ) -> anyhow::Result<UserAppStorageBackend> {
+        use app_manager::AppAccessMode;
+        let backend = match self.backend {
+            UserAppStorageBackend::Auto if mode == AppAccessMode::Kubernetes => {
+                UserAppStorageBackend::Postgres
+            }
+            UserAppStorageBackend::Auto => UserAppStorageBackend::Turso,
+            backend => backend,
+        };
+        if mode == AppAccessMode::Kubernetes && backend != UserAppStorageBackend::Postgres {
+            bail!("Kubernetes userApp control storage requires PostgreSQL");
+        }
+        Ok(backend)
+    }
+
+    pub(crate) fn apply_overrides(
+        &mut self,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<()> {
+        if let Some(value) = lookup("RCODER_USERAPP_STORAGE_BACKEND") {
+            self.backend = value
+                .parse()
+                .with_context(|| format!("invalid RCODER_USERAPP_STORAGE_BACKEND={value:?}"))?;
+        }
+        if lookup("RCODER_USERAPP_SQLITE_PATH").is_some() {
+            bail!(
+                "RCODER_USERAPP_SQLITE_PATH was replaced by RCODER_USERAPP_TURSO_PATH; \
+                 update the deployment configuration"
+            );
+        }
+        if let Some(value) = lookup("RCODER_USERAPP_TURSO_PATH") {
+            if value.trim().is_empty() {
+                bail!("RCODER_USERAPP_TURSO_PATH must not be empty");
+            }
+            self.turso_path = PathBuf::from(value);
+        }
+        if let Some(value) = lookup("RCODER_USERAPP_ENSURE_TIMEOUT_SECONDS") {
+            self.ensure_timeout_seconds =
+                value.parse().context("invalid userApp ensure timeout")?;
+        }
+        if self.ensure_timeout_seconds == 0 || self.ensure_timeout_seconds > 3600 {
+            bail!("userApp ensure timeout must be between 1 and 3600 seconds");
+        }
+        if let Some(value) = lookup("RCODER_USERAPP_INTERACTIVE_ENSURE_WAIT_SECONDS") {
+            self.interactive_ensure_wait_seconds = value
+                .parse()
+                .context("invalid userApp interactive ensure wait")?;
+        }
+        if self.interactive_ensure_wait_seconds == 0 || self.interactive_ensure_wait_seconds > 3600
+        {
+            bail!("userApp interactive ensure wait must be between 1 and 3600 seconds");
+        }
+        if let Some(value) = lookup("RCODER_USERAPP_DEV_FORWARD_CONNECT_WAIT_SECONDS") {
+            self.dev_forward_connect_wait_seconds = value
+                .parse()
+                .context("invalid userApp dev forward connect wait")?;
+        }
+        if self.dev_forward_connect_wait_seconds == 0
+            || self.dev_forward_connect_wait_seconds > 3600
+        {
+            bail!("userApp dev forward connect wait must be between 1 and 3600 seconds");
+        }
+        if let Some(value) = lookup("RCODER_USERAPP_PG_URL") {
+            if value.trim().is_empty() {
+                bail!("RCODER_USERAPP_PG_URL must not be empty");
+            }
+            self.postgres.get_or_insert_with(Default::default).url = Some(value);
+        }
+        Ok(())
+    }
+
+    /// 装配（trait-design §6）：返回业务接口 + 关机控制句柄；`control` 只
+    /// 注入 shutdown coordinator，不进入业务消费者。
+    pub async fn open(
+        &self,
+        mode: app_manager::AppAccessMode,
+        postgres_fallback: &rcoder_storage::config::PostgresConfig,
+    ) -> anyhow::Result<rcoder_storage::userapp_lifecycle::OpenedUserAppStore> {
+        match self.resolved_backend(mode)? {
+            UserAppStorageBackend::Turso => {
+                #[cfg(feature = "userapp-turso")]
+                {
+                    let path = if self.turso_path.is_absolute() {
+                        self.turso_path.clone()
+                    } else {
+                        std::env::current_dir()?.join(&self.turso_path)
+                    };
+                    let directory = path.parent().context("Turso path must name a file")?;
+                    tokio::fs::create_dir_all(directory)
+                        .await
+                        .context("create userApp database directory")?;
+                    let store =
+                        rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(&path)
+                            .await
+                            .context("initialize userApp Turso storage")?;
+                    // Turso 后端新库目录不含旧 SQLite 文件时不迁移；指向的
+                    // 文件若是旧 SQLite 库，迁移在启动时 fail-fast。
+                    let store: Arc<rcoder_storage::userapp_lifecycle::TursoUserAppStore> =
+                        Arc::new(store);
+                    Ok(rcoder_storage::userapp_lifecycle::OpenedUserAppStore {
+                        store: store.clone(),
+                        configuration: store.clone(),
+                        activity: store.clone(),
+                        control: store,
+                    })
+                }
+                #[cfg(not(feature = "userapp-turso"))]
+                bail!("Turso userApp storage requires the userapp-turso build feature")
+            }
+            UserAppStorageBackend::Postgres => {
+                let config = self.postgres.as_ref().unwrap_or(postgres_fallback);
+                config
+                    .to_dsn()
+                    .map_err(anyhow::Error::msg)
+                    .context("configure userApp PostgreSQL storage")?;
+                #[cfg(feature = "kubernetes")]
+                {
+                    let store = rcoder_storage::userapp_lifecycle::PgUserAppStore::connect(config)
+                        .await
+                        .context("initialize userApp PostgreSQL storage")?;
+                    let store: Arc<rcoder_storage::userapp_lifecycle::PgUserAppStore> =
+                        Arc::new(store);
+                    Ok(rcoder_storage::userapp_lifecycle::OpenedUserAppStore {
+                        store: store.clone(),
+                        configuration: store.clone(),
+                        activity: store.clone(),
+                        control: store,
+                    })
+                }
+                #[cfg(not(feature = "kubernetes"))]
+                bail!("PostgreSQL userApp storage requires the kubernetes build feature")
+            }
+            UserAppStorageBackend::Auto => bail!("userApp storage backend was not resolved"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "userapp-turso")]
+    #[tokio::test]
+    async fn configured_file_is_durable_and_invalid_directory_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control/userapp.turso.db");
+        let config = UserAppStorageConfig {
+            turso_path: path.clone(),
+            ..Default::default()
+        };
+        let pg = rcoder_storage::config::PostgresConfig::default();
+        let opened = config
+            .open(app_manager::AppAccessMode::Docker, &pg)
+            .await
+            .unwrap();
+        let before = opened.store.ensure_identity("config-app").await.unwrap();
+        assert!(path.is_file());
+        assert!(
+            config
+                .open(app_manager::AppAccessMode::Docker, &pg)
+                .await
+                .is_err(),
+            "second instance must be rejected while the directory lock is held"
+        );
+        // All four interfaces share the owner; dropping only store/control
+        // leaves configuration/activity alive and must not release its lock.
+        drop(opened);
+        // R01 修正后的不变量：目录锁在 worker 线程内、随线程退出释放——
+        // Drop 只发信号不 join，锁释放是"线程退出后"而非"结构体 Drop 后"
+        // 同步完成。立即重开需容忍短暂的异步收束窗口（有界轮询）。
+        let restored = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match config.open(app_manager::AppAccessMode::Docker, &pg).await {
+                    Ok(opened) => break opened,
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                }
+            }
+        })
+        .await
+        .expect("database owner must release the directory lock after all interfaces drop");
+        assert_eq!(
+            restored.store.get_application("config-app").await.unwrap(),
+            Some(before)
+        );
+        restored.control.shutdown().await.unwrap();
+        drop(restored);
+        let invalid = UserAppStorageConfig {
+            turso_path: path.join("cannot-be-created.turso.db"),
+            ..config
+        };
+        assert!(
+            invalid
+                .open(app_manager::AppAccessMode::Docker, &pg)
+                .await
+                .is_err()
+        );
+    }
+    #[test]
+    fn runtime_selects_durable_backend_and_k8s_rejects_turso() {
+        let mut config = UserAppStorageConfig::default();
+        assert_eq!(
+            config
+                .resolved_backend(app_manager::AppAccessMode::Docker)
+                .unwrap(),
+            UserAppStorageBackend::Turso
+        );
+        assert_eq!(
+            config
+                .resolved_backend(app_manager::AppAccessMode::Kubernetes)
+                .unwrap(),
+            UserAppStorageBackend::Postgres
+        );
+        config.backend = UserAppStorageBackend::Turso;
+        assert!(
+            config
+                .resolved_backend(app_manager::AppAccessMode::Kubernetes)
+                .is_err()
+        );
+    }
+    #[test]
+    fn backend_from_str_parses_known_values_and_fails_fast_on_legacy() {
+        assert_eq!(
+            "auto".parse::<UserAppStorageBackend>().unwrap(),
+            UserAppStorageBackend::Auto
+        );
+        assert_eq!(
+            " turso ".parse::<UserAppStorageBackend>().unwrap(),
+            UserAppStorageBackend::Turso,
+            "env override trims surrounding whitespace"
+        );
+        assert_eq!(
+            "postgres".parse::<UserAppStorageBackend>().unwrap(),
+            UserAppStorageBackend::Postgres
+        );
+        for invalid in ["sqlite", "memory", ""] {
+            assert!(
+                invalid.parse::<UserAppStorageBackend>().is_err(),
+                "{invalid:?} must be rejected without silent fallback"
+            );
+        }
+    }
+    #[test]
+    fn interactive_ensure_wait_defaults_and_overrides() {
+        let config = UserAppStorageConfig::default();
+        assert_eq!(config.ensure_timeout_seconds, 90);
+        assert_eq!(config.interactive_ensure_wait_seconds, 30);
+        let legacy: UserAppStorageConfig =
+            serde_yaml::from_str("ensure_timeout_seconds: 90").unwrap();
+        assert_eq!(legacy.interactive_ensure_wait_seconds, 30);
+        let mut config = UserAppStorageConfig::default();
+        config
+            .apply_overrides(|name| {
+                (name == "RCODER_USERAPP_INTERACTIVE_ENSURE_WAIT_SECONDS").then(|| "45".into())
+            })
+            .unwrap();
+        assert_eq!(config.interactive_ensure_wait_seconds, 45);
+        assert_eq!(
+            config.ensure_timeout_seconds, 90,
+            "interactive override must not touch the full ensure budget"
+        );
+    }
+    #[test]
+    fn dev_forward_connect_wait_defaults_overrides_and_rejects_invalid_config() {
+        let mut config: UserAppStorageConfig =
+            serde_yaml::from_str("ensure_timeout_seconds: 90").unwrap();
+        assert_eq!(config.dev_forward_connect_wait_seconds, 20);
+        config
+            .apply_overrides(|name| {
+                (name == "RCODER_USERAPP_DEV_FORWARD_CONNECT_WAIT_SECONDS").then(|| "45".into())
+            })
+            .unwrap();
+        assert_eq!(config.dev_forward_connect_wait_seconds, 45);
+        for value in ["0", "oops", "3601"] {
+            assert!(
+                UserAppStorageConfig::default()
+                    .apply_overrides(|name| {
+                        (name == "RCODER_USERAPP_DEV_FORWARD_CONNECT_WAIT_SECONDS")
+                            .then(|| value.into())
+                    })
+                    .is_err(),
+                "invalid environment value {value} must fail at startup"
+            );
+        }
+        for value in [0, 3601] {
+            let mut config = UserAppStorageConfig {
+                dev_forward_connect_wait_seconds: value,
+                ..Default::default()
+            };
+            assert!(config.apply_overrides(|_| None).is_err());
+        }
+    }
+    #[test]
+    fn explicit_invalid_settings_never_fall_back_to_memory() {
+        for (key, value) in [
+            ("RCODER_USERAPP_STORAGE_BACKEND", "memory"),
+            ("RCODER_USERAPP_STORAGE_BACKEND", "sqlite"),
+            ("RCODER_USERAPP_TURSO_PATH", ""),
+            ("RCODER_USERAPP_SQLITE_PATH", "/old/path"),
+            ("RCODER_USERAPP_ENSURE_TIMEOUT_SECONDS", "0"),
+            ("RCODER_USERAPP_ENSURE_TIMEOUT_SECONDS", "oops"),
+            ("RCODER_USERAPP_INTERACTIVE_ENSURE_WAIT_SECONDS", "0"),
+            ("RCODER_USERAPP_INTERACTIVE_ENSURE_WAIT_SECONDS", "oops"),
+            ("RCODER_USERAPP_INTERACTIVE_ENSURE_WAIT_SECONDS", "3601"),
+            ("RCODER_USERAPP_PG_URL", ""),
+        ] {
+            let mut config = UserAppStorageConfig::default();
+            assert!(
+                config
+                    .apply_overrides(|name| (name == key).then(|| value.into()))
+                    .is_err(),
+                "{key}={value} must be rejected"
+            );
+        }
+    }
+}

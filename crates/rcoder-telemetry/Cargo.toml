@@ -37,9 +37,13 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 tracing-appender = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
 pin-project-lite = { workspace = true }
+rand.workspace = true
 
 [features]
 default = []
@@ -48,3 +52,4 @@ full = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }

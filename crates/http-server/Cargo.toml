@@ -1,0 +1,155 @@
+[package]
+name = "http-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[package.metadata.dist]
+dist = false
+
+[lib]
+name = "http_server"
+path = "src/lib.rs"
+
+[features]
+default = ["userapp-turso"]
+
+# 调试功能：启用 /debug/* 路由，用于开发和问题排查
+debug = []
+
+# Hotpath 本地性能剖析（hotpath-rs；仅本地开发，不进 default）。
+hotpath = ["hotpath/hotpath", "hotpath/threads", "hotpath/tokio", "hotpath/axum-0-8"]
+hotpath-mcp = ["hotpath", "hotpath/hotpath-mcp"]
+
+userapp-turso = ["rcoder-engine/userapp-turso"]
+
+kubernetes = ["rcoder-engine/kubernetes"]
+
+rcoder-pg = ["rcoder-engine/rcoder-pg"]
+
+# deploy-host 宿主机运行形态（handler dial 点经 funnel 查表）
+deploy-host = ["rcoder-engine/deploy-host"]
+
+# dial9 事件级 Tokio tracing（本地开发专用）。本 crate 不直接依赖 dial9，
+# 仅经 rcoder-obs/dial9 让 accept/连接任务插桩（feature 关=直通 Tokio）。
+dial9 = ["rcoder-obs/dial9"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+filetime = { workspace = true }
+http-body-util = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+sha2 = { workspace = true }
+# Internal crates
+shared_types = { workspace = true }
+rcoder-storage = { workspace = true }
+rcoder-engine = { workspace = true }
+rcoder-proxy = { workspace = true }
+container-runtime-api = { workspace = true }
+download_utils = { workspace = true }
+agent_provisioning = { workspace = true }
+file-server = { workspace = true }
+file-server-userapp = { workspace = true }
+file-server-proxy = { workspace = true }
+preview-coordinator = { workspace = true }
+app_manager = { path = "../app_manager" }
+
+# 🚀 无锁配置热更新
+arc-swap = { workspace = true }
+docker_manager = { workspace = true }
+rcoder-telemetry = { workspace = true }
+
+clap = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+lockmap = { workspace = true }
+tempfile = { workspace = true }
+
+# 本地性能剖析（hotpath-rs）：非 optional + 零特性 = 零编译开销；上方 hotpath* feature 开内部特性
+hotpath = { workspace = true }
+
+# dial9 spawner 门面（常依赖：accept/连接任务 spawn 点经它插桩）
+rcoder-obs = { workspace = true }
+
+# HTTP server
+axum = { workspace = true, features = ["multipart", "ws"] }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["cors", "trace", "set-header", "limit"] }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+futures = { workspace = true }
+tokio-stream = { workspace = true }
+async-stream = { workspace = true }
+
+# gRPC Client
+tonic = { workspace = true }
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+serde_urlencoded = { workspace = true }
+
+# Validation
+garde = { workspace = true }
+regex = { workspace = true }
+
+# Parsing
+winnow = { workspace = true }
+
+derive_builder = { workspace = true }
+
+# Workspace dependencies
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = [
+    "fmt",
+    "env-filter",
+    "json",
+] }
+tracing-appender = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+chrono = { workspace = true, features = ["serde"] }
+dashmap = { workspace = true }
+notify = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+piper = { workspace = true }
+base64 = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+bollard = { workspace = true }
+rustls = { workspace = true }
+
+# OpenTelemetry
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+axum-tracing-opentelemetry = { workspace = true }
+
+# File system
+path-clean = { workspace = true }
+
+# OpenAPI documentation
+utoipa = { workspace = true }
+utoipa-swagger-ui = { workspace = true }
+utoipa-scalar = { workspace = true }
+
+ringbuf = { workspace = true }
+
+# Random and hashing
+rand = { workspace = true }
+md5 = { workspace = true }
+
+# Cache
+moka = { workspace = true }

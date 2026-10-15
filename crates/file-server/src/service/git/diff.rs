@@ -5,17 +5,22 @@
 //! - `staged`: HEAD ↔ 暂存区 (index)
 //! - `commit`: `from` ↔ `to` (to 缺省取 from 的首个 parent; 无 parent 则对空 tree)
 //!
-//! unified diff 文本由 gix [`UnifiedDiff`] 渲染 (上下文 3 行, Myers 算法),
+//! unified diff 文本由 gix `UnifiedDiff` 渲染 (上下文 3 行, Myers 算法),
 //! 文件级头 (`diff --git` / `index` / `---` / `+++` / `new file mode` / `deleted file mode`)
 //! 按 git CLI 规则自行拼装 (对齐 nuwax `makeDiffPatch`)。
 //!
-//! gix [`UnifiedDiff`] 负责 hunk 边界，定制 [`ConsumeHunk`] delegate 负责 Git 无尾换行标记与统计；
+//! gix `UnifiedDiff` 负责 hunk 边界，定制 `ConsumeHunk` delegate 负责 Git 无尾换行标记与统计；
 //! 文件级头和 JSON summary 由本模块按 API 契约组织。
+//!
+//! 单文件超限（`GIT_DIFF_MAX_FILE_SIZE_BYTES`）不报错：超限侧 warn 后按
+//! binary 标记渲染（对齐 TS git CLI 的 Binary files differ 语义，生产反例：
+//! 会话提交了 >16MiB PDF 后 commit diff 整体 500）；总量与输出上限仍 fail-fast。
 
 use std::collections::BTreeSet;
 
 use crate::error::{AppError, AppResult};
 
+use super::read::resolve_rev_required;
 use super::{get_status, map_git_err};
 
 use gix::Repository;
@@ -63,9 +68,7 @@ fn collect_commit_changes(repo: &Repository, params: &DiffParams) -> AppResult<V
         .from
         .as_deref()
         .ok_or_else(|| AppError::validation("commit diff requires `from`"))?;
-    let from_id = repo
-        .rev_parse_single(from)
-        .map_err(|e| map_git_err(e, "git rev_parse from"))?;
+    let from_id = resolve_rev_required(repo, from, "git diff from")?;
     let requested_tree = repo
         .find_commit(from_id)
         .map_err(|e| map_git_err(e, "git find_commit from"))?
@@ -77,9 +80,7 @@ fn collect_commit_changes(repo: &Repository, params: &DiffParams) -> AppResult<V
     // 只给 from: old=from 的首个 parent (无 parent 则空树), new=from。
     let (old_tree_id, new_tree_id) = match &params.to {
         Some(to) => {
-            let to_id = repo
-                .rev_parse_single(to.as_str())
-                .map_err(|e| map_git_err(e, "git rev_parse to"))?;
+            let to_id = resolve_rev_required(repo, to.as_str(), "git diff to")?;
             let to_tree = repo
                 .find_commit(to_id)
                 .map_err(|e| map_git_err(e, "git find_commit to"))?
@@ -179,8 +180,8 @@ fn collect_commit_changes(repo: &Repository, params: &DiffParams) -> AppResult<V
         if !includes_path(&params.paths, &path) {
             continue;
         }
-        let old = read_blob(repo, old_id, old_mode, params.max_file_size_bytes)?;
-        let new = read_blob(repo, new_id, new_mode, params.max_file_size_bytes)?;
+        let old = read_blob(repo, &path, old_id, old_mode, params.max_file_size_bytes)?;
+        let new = read_blob(repo, &path, new_id, new_mode, params.max_file_size_bytes)?;
         let change = FileChange { path, old, new };
         account_change(&change, &mut total_bytes, params.max_total_bytes)?;
         out.push(change);
@@ -217,7 +218,7 @@ fn collect_worktree_changes(
             continue;
         }
         let old = read_head_blob(repo, &head_tree, f, max_bytes)?;
-        let new = read_worktree_file(workdir, f, max_bytes)?;
+        let new = read_worktree_file(workdir, f, max_bytes, repo.object_hash())?;
         let change = FileChange {
             path: f.clone(),
             old,
@@ -300,15 +301,6 @@ fn ensure_output_size(output: &str, max_bytes: u64) -> AppResult<()> {
 
 fn includes_path(paths: &[String], path: &str) -> bool {
     paths.is_empty() || paths.iter().any(|candidate| candidate == path)
-}
-
-/// blob 7 字符短 hash (对齐 nuwax gitBlobHash[..7])。
-/// 纯计算对象 ID，不修改对象数据库。
-fn short_hash(repo: &Repository, bytes: &[u8]) -> AppResult<String> {
-    let id = gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, bytes)
-        .map_err(|error| AppError::system(format!("git compute blob hash: {error}")))?;
-    let hex = id.to_hex().to_string();
-    Ok(hex.chars().take(7).collect())
 }
 
 #[cfg(test)]

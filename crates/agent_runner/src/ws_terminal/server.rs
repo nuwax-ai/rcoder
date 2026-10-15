@@ -34,6 +34,9 @@ const PROJECT_ID_HEADER: &str = "x-ttyd-project-id";
 const SERVICE_TYPE_HEADER: &str = "x-ttyd-service-type";
 const TENANT_ID_HEADER: &str = "x-ttyd-tenant-id";
 const SPACE_ID_HEADER: &str = "x-ttyd-space-id";
+/// Pingora 注入的显式终端初始目录（终端 query 契约 `?cwd=`，见 rcoder-proxy
+/// `ttyd_params.rs`；仅代理可写——代理侧无条件剥离客户端伪造值）
+const CWD_HEADER: &str = "x-ttyd-cwd";
 
 /// 启动 WS 终端中间层
 ///
@@ -100,8 +103,13 @@ async fn handle_conn(stream: tokio::net::TcpStream, peer: SocketAddr) {
 
     let metadata = metadata_slot.get().cloned().unwrap_or_default();
     info!(
-        "[WS_TERMINAL] {} connected (service_type={}, project_id={}, tenant_id={}, space_id={})",
-        peer, metadata.service_type, metadata.project_id, metadata.tenant_id, metadata.space_id
+        "[WS_TERMINAL] {} connected (service_type={}, project_id={}, tenant_id={}, space_id={}, explicit_cwd={})",
+        peer,
+        metadata.service_type,
+        metadata.project_id,
+        metadata.tenant_id,
+        metadata.space_id,
+        metadata.cwd
     );
 
     // 计入活跃终端连接：覆盖整个 handle_terminal（含其全部 return 路径），
@@ -113,6 +121,7 @@ async fn handle_conn(stream: tokio::net::TcpStream, peer: SocketAddr) {
         &metadata.project_id,
         &metadata.tenant_id,
         &metadata.space_id,
+        &metadata.cwd,
     )
     .await;
 }
@@ -139,6 +148,7 @@ struct HandshakeMetadata {
     service_type: String,
     tenant_id: String,
     space_id: String,
+    cwd: String,
 }
 
 /// 握手回调：读 project_id + service_type header + 协商 `tty` 子协议
@@ -148,11 +158,13 @@ struct HandshakeCallback {
 
 impl Callback for HandshakeCallback {
     fn on_request(self, req: &Request, mut resp: Response) -> Result<Response, ErrorResponse> {
-        // 1. 读 project_id + service_type（Pingora 注入的 X-Ttyd-Project-Id / X-Ttyd-Service-Type）
+        // 1. 读 project_id + service_type + cwd（Pingora 注入的 X-Ttyd-*）。
+        //    字节级 UTF-8 读：X-Ttyd-Cwd 可承载中文路径（HeaderValue::to_str
+        //    对非 visible-ASCII 会 Err，中文 cwd 会被静默吞成空串）
         let header = |name| {
             req.headers()
                 .get(name)
-                .and_then(|value| value.to_str().ok())
+                .and_then(|value| std::str::from_utf8(value.as_bytes()).ok())
                 .unwrap_or_default()
                 .to_string()
         };
@@ -163,6 +175,7 @@ impl Callback for HandshakeCallback {
                 service_type: header(SERVICE_TYPE_HEADER),
                 tenant_id: header(TENANT_ID_HEADER),
                 space_id: header(SPACE_ID_HEADER),
+                cwd: header(CWD_HEADER),
             })
             .is_err()
         {

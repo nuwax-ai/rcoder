@@ -18,6 +18,7 @@ use shared_types::{
 };
 use tracing::info;
 
+use super::k8s_app_helpers::build_hostname_spread_constraint;
 use super::k8s_pod::K8sPodOps;
 use super::k8s_pvc::K8sPvcOps;
 use super::k8s_service::K8sServiceOps;
@@ -28,15 +29,38 @@ impl KubernetesRuntime {
     ///
     /// 编排顺序：identifier 解析 → per-agent PVC ensure（副作用）→ cache-hit 早返回 →
     /// `build_agent_pod_spec` 纯构造 → headless svc + STS(replicas=1) → 等 Ready →
-    /// ClusterIP svc → 取 info。UserApp 不走此路径（用 create_deployment）。
+    /// ClusterIP svc → 取 info。Userapp 不走此路径（用 create_deployment）。
     pub(crate) async fn create_agent_container(
         &self,
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        self.create_agent_container_with_creation_receipt(params, None)
+            .await
+    }
+
+    pub(super) async fn create_agent_container_with_creation_receipt(
+        &self,
+        params: ContainerCreateParams,
+        creation_lease: Option<shared_types::UserAppOperationLeaseReceipt>,
+    ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        if params.execution_context.is_some() && creation_lease.is_none() {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Managed builder creation requires its original lease receipt".into(),
+            ));
+        }
+        let cancelled = params.creation_cancelled.clone();
+        let check_cancelled = || {
+            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                Err(ContainerRuntimeError::CreationCancelled)
+            } else {
+                Ok(())
+            }
+        };
+        check_cancelled()?;
         // 确定容器标识符（复用 ServiceType::container_identifier 单一事实源，
         // 与 docker 模式 / handler 层保持一致）。identifier 借自 pod_id/user_id/project_id 之一。
         // ⚠️ 不要在此重写优先级逻辑，否则会与 handler 层不一致 → ensure/chat 造出不同名 pod+PVC。
-        let service_type = params.service_type.clone();
+        let service_type = params.service_type;
         let project_id = params.project_id.clone();
         let user_id = params.user_id.clone();
         let pod_id = params.pod_id.clone();
@@ -51,34 +75,94 @@ impl KubernetesRuntime {
         // 阶段2 per-agent PVC (CephFS subvolume, ceph-csi 服务端配额, 绕开 client setfattr):
         // 仅隔离容器 (pod_id=None, project/user 级) 且 per_agent_pvc_enabled=true 走 per-agent PVC。
         // 共享容器 (pod_id=Some) 或回滚开关 false → 共享 PVC (选项A 行为)。
-        // UserAppBuilder 天然 per-app PVC(不受灰度开关限制),总是 ensure。
+        // UserappBuilder 天然 per-app PVC(不受灰度开关限制),总是 ensure。
         if pod_id.is_none()
             && (shared_types::per_agent_pvc_enabled()
-                || matches!(service_type, ServiceType::UserAppBuilder))
+                || matches!(service_type, ServiceType::UserappBuilder))
         {
-            self.ensure_workspace_pvc(identifier, &service_type, params.storage_size.as_deref())
+            if let Some(context) = &params.execution_context {
+                self.ensure_owned_workspace_pvc(
+                    context,
+                    &service_type,
+                    params.storage_size.as_deref(),
+                )
+                .await?;
+            } else {
+                self.ensure_workspace_pvc(
+                    identifier,
+                    &service_type,
+                    params.storage_size.as_deref(),
+                )
+                .await?;
+            }
+        }
+
+        check_cancelled()?;
+        if service_type == ServiceType::UserappBuilder {
+            self.claim_builder_storage_with_context(identifier, params.execution_context.as_ref())
                 .await?;
         }
 
-        // Check if pod already exists and is running
-        // .cloned() 让 cached 成为 owned,读守卫在条件求值结束即释放 —— 否则守卫会跨下面
-        // get_container_info_by_identifier_inner().await,而后者会再次进入同一把 RwLock;
-        // tokio RwLock 写优先,并发 ensure+stop 时会自死锁。
-        if let Some(entry) = self.pod_cache.read().await.get(identifier).cloned()
-            && entry.cached_at.elapsed() < POD_CACHE_TTL
-            && entry.info.status == ContainerRuntimeStatus::Running
-        {
+        // Check if pod already exists and is running.
+        // 读守卫物化到独立块内结束（scrutinee 临时值在 Rust 里存活到整个 if 语句
+        // 结束——即便 .cloned() 只解决 entry 的数据借用，guard 仍会跨下方 await；
+        // 若 body 内再入 pod_cache 写锁即自死锁，tokio RwLock 不可升级）。
+        // 类型校验：同 identifier 异族条目（如生产 UserApp）视为不存在。
+        let cached_running = {
+            let entry = self.pod_cache.read().await.get(identifier).cloned();
+            entry.is_some_and(|entry| {
+                entry.cached_at.elapsed() < POD_CACHE_TTL
+                    // cache 恒存族代表值，查询侧归一后字面比较（本义查询同命中）
+                    && entry.service_type == service_type.family_representative()
+                    && entry.info.status == ContainerRuntimeStatus::Running
+            })
+        };
+        if cached_running && params.execution_context.is_none() {
             info!("[K8S] Pod {} already exists and is running", pod_name);
+            // Creation owns a mutation lease: service reconciliation errors must
+            // reach its completion policy, not be swallowed by read-side self-heal.
+            self.create_agent_service(identifier, &service_type).await?;
             return self
-                .get_container_info_by_identifier_inner(identifier, &service_type)
+                .get_container_info_inner(identifier, &service_type)
                 .await?
                 .ok_or_else(|| ContainerRuntimeError::ContainerNotFound(identifier.to_string()));
         }
 
+        check_cancelled()?;
         // 构造 PodSpec（纯计算，无 K8s API 副作用）。
         // Pod 的 ObjectMeta（name/labels）不传给 STS——STS 模板的 labels 由
         // build_agent_statefulset 经 build_standard_labels 自行设置，故此处只返回 PodSpec。
-        let pod_spec = self.build_agent_pod_spec(identifier, &service_type, &params)?;
+        let credential = if service_type == ServiceType::UserappBuilder {
+            let existing = self
+                .statefulsets()
+                .get_opt(&pod_name)
+                .await
+                .map_err(|error| {
+                    ContainerRuntimeError::K8sError(format!(
+                        "Read builder credential source: {error}"
+                    ))
+                })?;
+            let retained = existing
+                .as_ref()
+                .and_then(|sts| sts.spec.as_ref())
+                .and_then(|spec| spec.template.spec.as_ref())
+                .map(super::k8s_builder_control::retained_builder_credential)
+                .transpose()?
+                .flatten();
+            retained.or_else(|| {
+                existing.is_none().then(|| EnvVar {
+                    name: "APP_CLI_DEPLOY_TOKEN".into(),
+                    value: Some(uuid::Uuid::new_v4().simple().to_string()),
+                    ..Default::default()
+                })
+            })
+        } else {
+            None
+        };
+        let mut pod_spec = self.build_agent_pod_spec(identifier, &service_type, &params)?;
+        if let Some(credential) = credential {
+            Self::install_builder_credential(&mut pod_spec, credential)?;
+        }
 
         // agent-runner 走 StatefulSet（K8s 原生 pod 级自愈）：把 pod spec
         // wrap 进 STS（而非裸 Pod）。STS replicas=1 时 pod 被 evict/删除 → 控制器自动重建
@@ -86,23 +170,71 @@ impl KubernetesRuntime {
         // service_type 重名/不匹配由 ensure_agent_statefulset 内部删旧重建处理。
         self.ensure_agent_headless_service(identifier, &service_type)
             .await?;
-        self.ensure_agent_statefulset(identifier, &service_type, pod_spec, 1)
-            .await?;
+        check_cancelled()?;
+        if let Some(context) = params.execution_context.as_ref() {
+            if service_type != ServiceType::UserappBuilder {
+                return Err(ContainerRuntimeError::ConfigurationError(
+                    "Application context requires builder StatefulSet".into(),
+                ));
+            }
+            self.ensure_builder_statefulset(context, pod_spec).await?;
+        } else {
+            self.ensure_agent_statefulset(identifier, &service_type, pod_spec, 1)
+                .await?;
+        }
 
         // Wait for pod to be ready
-        self.wait_for_pod_ready(identifier, &service_type).await?;
+        check_cancelled()?;
+        tokio::select! {
+            result = self.wait_for_pod_ready(identifier, &service_type) => result?,
+            _ = async {
+                loop {
+                    if cancelled.load(std::sync::atomic::Ordering::Acquire) { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            } => return Err(ContainerRuntimeError::CreationCancelled),
+        }
+        check_cancelled()?;
+        if service_type == ServiceType::UserappBuilder {
+            // Pod 就绪后的管理面恢复：对上一物理 Pod 遗留的执行代次做平台核验
+            // （失败只保留保护并记原因，不阻塞 ensure）。
+            self.reconcile_builder_execution_domain_bounded(identifier)
+                .await;
+        }
 
-        // Create K8s Service for Envoy Gateway routing
+        // Host-side address materialization needs the Service's assigned
+        // NodePorts. Keep the admitted builder lease while creating it; the
+        // completion receipt remains a separate final, identity-checked
+        // Service mutation below. A crash between these steps leaves a
+        // discoverable Service without a success receipt.
         self.create_agent_service(identifier, &service_type).await?;
-
-        // Get pod info
-        self.get_container_info_by_identifier_inner(identifier, &service_type)
+        let info = self
+            .get_container_info_inner(identifier, &service_type)
             .await?
             .ok_or_else(|| {
                 ContainerRuntimeError::ContainerCreationError(
-                    "Pod created but info not found".to_string(),
+                    "Pod created but info not found".into(),
                 )
-            })
+            })?;
+        if let (Some(context), Some(lease)) = (&params.execution_context, creation_lease) {
+            let target = self
+                .capture_builder_compute_with_binding(
+                    context,
+                    params.resource_binding.as_ref(),
+                    false,
+                )
+                .await?;
+            let receipt = super::builder_creation_receipt::BuilderCreationReceipt {
+                target,
+                container: info.clone(),
+                lease,
+            };
+            // The final resource mutation carries its own acknowledgement.
+            // Nothing after this call creates, scales or patches compute.
+            check_cancelled()?;
+            self.commit_builder_service_creation(&receipt).await?;
+        }
+        Ok(info)
     }
 
     /// 纯构造 agent-runner 的 PodSpec（image 选择、PVC 名、volumes/mounts 翻译、env 合并、
@@ -118,14 +250,32 @@ impl KubernetesRuntime {
     ) -> ContainerRuntimeResult<PodSpec> {
         let project_id_val = params.project_id.clone().unwrap_or_default();
         let user_id_val = params.user_id.clone().unwrap_or_default();
-        let service_type_str = service_type.to_string();
-        let image = self.select_image(service_type);
+        // 家族归一：容器身份/环境（SERVICE_TYPE env 等）按家族值——agent_runner
+        // 的 cwd 由 gRPC service_type 决定，不消费该 env
+        let service_type_str = service_type.container_family_key().to_string();
+        let image = if *service_type == ServiceType::UserappBuilder {
+            params
+                .image_override
+                .clone()
+                .unwrap_or_else(|| self.select_image(service_type))
+        } else {
+            self.select_image(service_type)
+        };
 
-        // Build resource requirements if limits are provided
-        let resources = params
-            .resource_limits
-            .as_ref()
-            .and_then(Self::build_resource_requirements);
+        // Build resource requirements if limits are provided; agent 族容器
+        // （ensure/chat 等全部创建入口）未显式传入时用统一常量默认
+        // （6Gi/2 核，见 shared_types::DEFAULT_AGENT_*）——不给环境留隐式套
+        // 上限的空间（131 实证 547Mi 隐式上限 → 容器冻结）。
+        let resources = match params.resource_limits.as_ref() {
+            Some(limits) => Self::build_resource_requirements(limits),
+            None => Self::build_resource_requirements(&shared_types::ServiceResourceLimits {
+                memory: Some(shared_types::DEFAULT_AGENT_MEMORY_LIMIT_BYTES),
+                cpu: Some(shared_types::DEFAULT_AGENT_CPU_LIMIT_CORES),
+                swap: None,
+                ephemeral_storage_limit: None,
+                storage_size: None,
+            }),
+        };
 
         // workspace PVC:
         // - per-agent (pod_id=None + per_agent_pvc_enabled=true): per-agent PVC (subPath=None)
@@ -145,13 +295,17 @@ impl KubernetesRuntime {
                             .unwrap_or_else(|| "workspace".to_string()),
                     ),
                 ),
-                ServiceType::ComputerAgentRunner => (
+                ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => (
                     std::env::var("RCODER_COMPUTER_WORKSPACE_PVC_NAME").unwrap_or_else(|_| {
                         format!("{}-rcoder-computer-workspace", self.namespace)
                     }),
                     Some(user_id_val.clone()),
                 ),
-                _ => (self.workspace_pvc_name(identifier, service_type)?, None),
+                // Userapp 实际走 create_deployment（k8s_app_create），不经此路径
+                // （防御性兜底）；UserappBuilder 显式列出防漏臂
+                ServiceType::Userapp | ServiceType::UserappBuilder => {
+                    (self.workspace_pvc_name(identifier, service_type)?, None)
+                }
             }
         };
 
@@ -171,15 +325,36 @@ impl KubernetesRuntime {
             .multi_image_config
             .get_service_config(service_type);
 
-        // workspace 挂载路径(K8s 模式 computer→/home/user, web→/app/project_workspace)
+        // workspace 挂载路径(K8s 模式 computer→/home/user, web→/app/project_workspace)。
+        // UserappBuilder 不走 docker fallback：docker 段的 workspace_resolution_path 是
+        // rcoder 容器视角的宿主反解锚点（/app/userapp-workspace），K8s 下误用会把
+        // PVC 挂到 overlay 路径造成数据面分裂——k8s 配置缺失时直接用镜像契约默认。
+        // （UserappBuilder 的实际挂载不走此单挂载点——见下方 volume_mounts 的
+        //  四 subPath 压平分支，此值对 builder 不生效。）
         let workspace_mount_path = k8s_service
             .map(|sc| sc.workspace_container_path())
-            .or_else(|| docker_service.map(|sc| sc.workspace_container_path()))
+            .or_else(|| {
+                if matches!(service_type, ServiceType::UserappBuilder) {
+                    None
+                } else {
+                    docker_service.map(|sc| sc.workspace_container_path())
+                }
+            })
             .unwrap_or_else(|| match service_type {
-                ServiceType::ComputerAgentRunner => "/home/user".to_string(),
-                // UserAppBuilder: per-app PVC 挂载点(file-server PROJECT_SOURCE_DIR 与之一致)
-                ServiceType::UserAppBuilder => "/app/userapp-workspace".to_string(),
-                _ => "/app/project_workspace".to_string(),
+                // 常规项目与 Computer 共容器，挂载点同源常量（见 paths.rs
+                // COMPUTER_AGENT_MOUNT_ROOT 与 WORKSPACE_ROOT 的视角说明）
+                ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
+                    shared_types::paths::COMPUTER_AGENT_MOUNT_ROOT.to_string()
+                }
+                // Userapp 域 per-app 工作区定位 {USERAPP_WORKSPACE_ROOT}/{app_id}
+                // （容器内 userapp 共享卷根，builder 与生产容器同源）。UserappBuilder
+                // 挂载压平（四 subPath 分支在 volume_mounts 构造处短路）；Userapp
+                // 实际走 create_deployment 不经此路径——此兜底值均为 match
+                // 完备性保留，但语义须正确（勿落 web 的 /app/project_workspace）
+                ServiceType::Userapp | ServiceType::UserappBuilder => {
+                    shared_types::paths::USERAPP_WORKSPACE_ROOT.to_string()
+                }
+                ServiceType::WebAgentRunner => shared_types::paths::WORKSPACE_ROOT.to_string(),
             });
 
         // 构建 volumes: 硬编码 workspace PVC(保留) + 翻译 kubernetes_config 额外卷
@@ -196,15 +371,69 @@ impl KubernetesRuntime {
         for v in extra_volumes.iter().flat_map(Self::translate_k8s_volume) {
             volumes_vec.push(v);
         }
+        if matches!(service_type, ServiceType::UserappBuilder) {
+            // 固定只读平台绑定（recovery v2 plan §6.1）：Downward API 投放
+            // pod UID + 执行域注解；容器身份不再依赖 spawn 链透传 env。
+            volumes_vec.push(super::k8s_native_domain::platform_binding_volume());
+        }
 
         // 构建 volume_mounts: workspace 挂载 + 翻译 kubernetes_config 额外挂载(挂到 agent 容器)
-        let mut volume_mounts_vec: Vec<VolumeMount> = vec![VolumeMount {
-            name: "workspace".to_string(),
-            mount_path: workspace_mount_path,
-            sub_path: workspace_sub_path, // computer→Some(user_id)，web→None
-            read_only: Some(false),
-            ..Default::default()
-        }];
+        let mut volume_mounts_vec: Vec<VolumeMount> =
+            if matches!(service_type, ServiceType::UserappBuilder) {
+                // UserappBuilder 开发容器: 同一块 per-app RWO PVC 的四个 subPath 视图
+                // （挂载压平）。卷内布局 {app_id}/ + data/ + logs/ + agent-store/
+                // （一卷一 app 拍平, env/user 层只存在于宿主/卷内, 容器内不体现）;
+                // 容器内路径是平台契约（file-server USERAPP_WORKSPACE_DIR / PGDATA /
+                // DBX_DATA_DIR env 均按此注入; .agent-store 挂载点与 agent_store.rs
+                // 的 user_root/.agent-store 契约对齐——workspace 内相对软链
+                // `../.agent-store/...` 恰好解析到该挂载点）, 不读
+                // workspace_container_path 配置——误配会造成数据面分裂（同上方排除
+                // docker fallback 的理由）。subPath 目录由 kubelet 挂载时自动创建
+                // （运行中勿在容器内删除, 重启后挂载点失效）。
+                vec![
+                    VolumeMount {
+                        name: "workspace".to_string(),
+                        mount_path: format!(
+                            "{}/{}",
+                            shared_types::paths::USERAPP_DEV_HOME,
+                            identifier
+                        ),
+                        sub_path: Some(identifier.to_string()),
+                        read_only: Some(false),
+                        ..Default::default()
+                    },
+                    VolumeMount {
+                        name: "workspace".to_string(),
+                        mount_path: shared_types::paths::USERAPP_DEV_DATA.to_string(),
+                        sub_path: Some("data".to_string()),
+                        read_only: Some(false),
+                        ..Default::default()
+                    },
+                    VolumeMount {
+                        name: "workspace".to_string(),
+                        mount_path: shared_types::paths::USERAPP_DEV_LOGS.to_string(),
+                        sub_path: Some("logs".to_string()),
+                        read_only: Some(false),
+                        ..Default::default()
+                    },
+                    VolumeMount {
+                        name: "workspace".to_string(),
+                        mount_path: shared_types::paths::USERAPP_DEV_AGENT_STORE.to_string(),
+                        sub_path: Some("agent-store".to_string()),
+                        read_only: Some(false),
+                        ..Default::default()
+                    },
+                ]
+            } else {
+                // computer→subPath=Some(user_id)，web→共享 PVC subPath；builder 不走此分支
+                vec![VolumeMount {
+                    name: "workspace".to_string(),
+                    mount_path: workspace_mount_path,
+                    sub_path: workspace_sub_path,
+                    read_only: Some(false),
+                    ..Default::default()
+                }]
+            };
         let extra_mounts: Vec<K8sVolumeMountSpec> = k8s_service
             .map(|s| s.volume_mounts.clone())
             .unwrap_or_default();
@@ -213,6 +442,14 @@ impl KubernetesRuntime {
         }
 
         let volumes = Some(volumes_vec);
+        if matches!(service_type, ServiceType::UserappBuilder) {
+            volume_mounts_vec.push(VolumeMount {
+                name: "rcoder-platform-binding".to_string(),
+                mount_path: super::k8s_native_domain::PLATFORM_BINDING_MOUNT.to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            });
+        }
         let volume_mounts = Some(volume_mounts_vec);
 
         // sidecar 容器(只来自 kubernetes_config):如 log-collector tail 容器内日志到 stdout
@@ -225,6 +462,25 @@ impl KubernetesRuntime {
                 name: secret.clone(),
             }]
         });
+
+        // topologySpreadConstraints：动态 agent-runner 跨节点均衡，修复"全部堆在一个节点"的
+        // 调度失衡（根因：requests 50m 极低，调度器按 requests 以为节点很轻，反复选最闲节点）。
+        // 策略与参数理由见 build_hostname_spread_constraint 和
+        // docs/agent-runner-scheduling-balance.md。label 值必须用家族值
+        // （build_standard_labels 写入的 app.kubernetes.io/name 是 container_family
+        // 归一值——原始值 computer-normal-project 永远匹配不到自己的 Pod，约束失效）；
+        // 常规项目与 Computer 同容器同 label，归入同臂。
+        let topology_spread_constraints = match service_type {
+            ServiceType::ComputerAgentRunner
+            | ServiceType::ComputerNormalProject
+            | ServiceType::WebAgentRunner
+            | ServiceType::UserappBuilder => Some(vec![build_hostname_spread_constraint(
+                service_type.container_family_key(),
+            )]),
+            // Userapp 实际走 create_deployment（k8s_app_create），不经此路径（防御性兜底）；
+            // 其均衡在 build_app_deployment 用共享 label user-app 注入。
+            ServiceType::Userapp => None,
+        };
 
         Ok(PodSpec {
             volumes,
@@ -280,147 +536,50 @@ impl KubernetesRuntime {
                                 .unwrap_or_else(|| vec!["/app/bin/agent_runner".to_string()]);
                             Some(cmd)
                         }
-                        // ComputerAgentRunner / UserApp 用镜像自带 ENTRYPOINT/CMD
-                        // (UserApp 实际走 create_deployment,不经此路径;
-                        //  ComputerAgentRunner 走 start-up.sh 启 ttyd/VNC + agent_runner)
-                        ServiceType::ComputerAgentRunner | ServiceType::UserApp => None,
-                        // UserAppBuilder 是 lean build agent(无桌面):显式跑 agent_runner
-                        // (读 kubernetes_config.user-app-builder.command),不经 start-up.sh/ttyd/VNC。
-                        // agent_runner 读 RCODER_EMBED_FILE_SERVER=true 内嵌 file-server(build 入口 :60000)。
-                        // 裸跑 fallback 用 agent-runner 镜像路径 /usr/local/bin/agent_runner(非 rcoder 主镜像的 /app/bin)。
-                        ServiceType::UserAppBuilder => {
-                            let cmd = k8s_service
-                                .and_then(|sc| {
-                                    if sc.command.is_empty() {
-                                        None
-                                    } else {
-                                        Some(sc.command.clone())
-                                    }
-                                })
-                                .unwrap_or_else(|| {
-                                    vec![
-                                        "/usr/local/bin/agent_runner".to_string(),
-                                        "--port".to_string(),
-                                        "8086".to_string(),
-                                    ]
-                                });
-                            Some(cmd)
-                        }
+                        // ComputerAgentRunner / Userapp 用镜像自带 ENTRYPOINT/CMD
+                        // (Userapp 实际走 create_deployment,不经此路径;
+                        //  ComputerAgentRunner 走 start-up.sh 启 ttyd/VNC + agent_runner;
+                        //  常规项目与 Computer 共享容器,同 ENTRYPOINT)
+                        ServiceType::ComputerAgentRunner
+                        | ServiceType::ComputerNormalProject
+                        | ServiceType::Userapp => None,
+                        // UserappBuilder 完整开发容器: 默认镜像 ENTRYPOINT/start-up.sh
+                        // 起 agent_runner + 内嵌 file-server(60000) + PG 全套——userApp 的
+                        // 文件/exec/dev-server/构建/chat 开发对话都在此容器内执行;
+                        // kubernetes_config.user-app-builder.command 仍可显式覆盖。
+                        ServiceType::UserappBuilder => k8s_service.and_then(|sc| {
+                            if sc.command.is_empty() {
+                                None
+                            } else {
+                                Some(sc.command.clone())
+                            }
+                        }),
                     },
                     env: {
-                        let mut env_vars = vec![
-                            EnvVar {
-                                name: "PROJECT_ID".to_string(),
-                                value: Some(project_id_val.to_string()),
-                                ..Default::default()
-                            },
-                            EnvVar {
-                                name: "USER_ID".to_string(),
-                                value: Some(user_id_val.to_string()),
-                                ..Default::default()
-                            },
-                            EnvVar {
-                                name: "SERVICE_TYPE".to_string(),
-                                value: Some(service_type_str.clone()),
-                                ..Default::default()
-                            },
-                            // 部署模式标识: start-up.sh 据此 source extra (K8s 下 /home/user 是 PVC, 跳过 bind mount 权限修复)
-                            EnvVar {
-                                name: "DEPLOY_MODE".to_string(),
-                                value: Some("k8s".to_string()),
-                                ..Default::default()
-                            },
-                        ];
-                        // 多租户环境变量（agent_runner 用于构建工作目录路径）
-                        if let Some(ref tid) = params.tenant_id {
-                            env_vars.push(EnvVar {
-                                name: "TENANT_ID".to_string(),
-                                value: Some(tid.clone()),
+                        let mut env = super::k8s_agent_env::build_agent_env_vars(
+                            &project_id_val,
+                            &user_id_val,
+                            &service_type_str,
+                            service_type,
+                            (docker_service, k8s_service),
+                            params,
+                            None,
+                        );
+                        if matches!(service_type, ServiceType::UserappBuilder) {
+                            // 执行域身份（进程域退出回执的绑定锚点）：instance 经
+                            // RCODER_PHYSICAL_POD_UID 在 Pod 内解析（调度前不可知）；
+                            // volume 绑定 per-app PVC 与其挂载视图，跨 Pod 重建稳定。
+                            env.push(EnvVar {
+                                name: runtime_supervisor::domain::DOMAIN_ENV.to_string(),
+                                value: Some(super::k8s_native_domain::builder_domain_env(
+                                    &self.config.execution_authority,
+                                    &workspace_pvc,
+                                    volume_mounts.as_deref().unwrap_or_default(),
+                                )),
                                 ..Default::default()
                             });
                         }
-                        if let Some(ref sid) = params.space_id {
-                            env_vars.push(EnvVar {
-                                name: "SPACE_ID".to_string(),
-                                value: Some(sid.clone()),
-                                ..Default::default()
-                            });
-                        }
-                        if let Some(ref it) = params.isolation_type {
-                            env_vars.push(EnvVar {
-                                name: "ISOLATION_TYPE".to_string(),
-                                value: Some(it.clone()),
-                                ..Default::default()
-                            });
-                        }
-                        // 透传 service environment
-                        // (PROJECT_WORKSPACE_BASE/RUST_LOG/SERVICE_MODE/AGENT_PORT 等,
-                        //  让 sub-container 行为与 Docker 模式一致)。跳过已硬编码的同名 env。
-                        // 合并顺序:docker_config 兜底 → kubernetes_config 覆盖(K8s 主)。
-                        const RESERVED: [&str; 6] = [
-                            "PROJECT_ID",
-                            "USER_ID",
-                            "SERVICE_TYPE",
-                            "TENANT_ID",
-                            "SPACE_ID",
-                            "ISOLATION_TYPE",
-                        ];
-                        let mut merged_env: std::collections::HashMap<String, String> =
-                            std::collections::HashMap::new();
-                        if let Some(sc) = docker_service {
-                            for (k, v) in &sc.environment {
-                                merged_env.insert(k.clone(), v.clone());
-                            }
-                        }
-                        if let Some(sc) = k8s_service {
-                            for (k, v) in &sc.environment {
-                                merged_env.insert(k.clone(), v.clone());
-                            }
-                        }
-                        for (k, v) in &merged_env {
-                            if RESERVED.contains(&k.as_str()) {
-                                continue;
-                            }
-                            env_vars.push(EnvVar {
-                                name: k.clone(),
-                                value: Some(v.clone()),
-                                ..Default::default()
-                            });
-                        }
-                        // 透传 UserApp build 必需 env 给 agent-runner（build 在 agent-runner 执行）:
-                        // release lock 三元组（rcoder 自身 env 已有，来自 helm runtime identity 注入）。
-                        // 缺这些 agent-runner 无法生成 release.lock.toml。
-                        for var in [
-                            "RCODER_PINGAP_VERSION",
-                            "RCODER_PINGAP_COMMIT",
-                            "RCODER_RUNTIME_IMAGE_DIGEST",
-                        ] {
-                            if merged_env.contains_key(var) {
-                                continue;
-                            }
-                            if let Ok(val) = std::env::var(var)
-                                && !val.is_empty()
-                            {
-                                env_vars.push(EnvVar {
-                                    name: var.to_string(),
-                                    value: Some(val),
-                                    ..Default::default()
-                                });
-                            }
-                        }
-                        // build timeout: rcoder env 透传，缺省 1800s（全量多语言 workspace build）
-                        if !merged_env.contains_key("DEV_COMMAND_TIMEOUT_SECS") {
-                            let timeout = std::env::var("DEV_COMMAND_TIMEOUT_SECS")
-                                .ok()
-                                .filter(|v| !v.is_empty())
-                                .unwrap_or_else(|| "1800".to_string());
-                            env_vars.push(EnvVar {
-                                name: "DEV_COMMAND_TIMEOUT_SECS".to_string(),
-                                value: Some(timeout),
-                                ..Default::default()
-                            });
-                        }
-                        Some(env_vars)
+                        Some(env)
                     },
                     ports: Some(vec![
                         ContainerPort {
@@ -434,7 +593,7 @@ impl KubernetesRuntime {
                             name: Some("http".to_string()),
                             ..Default::default()
                         },
-                        // file-server port (embedded, UserApp workspace build / package download)
+                        // file-server port (embedded, Userapp workspace build / package download)
                         ContainerPort {
                             container_port: shared_types::AGENT_FILE_SERVER_PORT as i32,
                             name: Some("file-server".to_string()),
@@ -451,8 +610,14 @@ impl KubernetesRuntime {
                         }),
                         initial_delay_seconds: Some(30),
                         period_seconds: Some(10),
-                        timeout_seconds: Some(3),
-                        failure_threshold: Some(3),
+                        // 131 实证（userapp 套件多轮）：control-plane 混部节点高负载下
+                        // 8086 响应间歇 >3s（readiness 同端口 deadline exceeded 多次记录，
+                        // 空闲 pod 亦出现），原 timeout=3×failure=3 在 30s 窗口内连败即
+                        // SIGTERM 误杀活容器——在途连接 RST（rcoder 转发表现为
+                        // IncompleteMessage），builder 链路整轮瘫痪。放宽为 10s×6（60s
+                        // 宽限）：真死锁进程晚 30s 被杀无碍，误杀活容器代价高得多。
+                        timeout_seconds: Some(10),
+                        failure_threshold: Some(6),
                         success_threshold: Some(1),
                         ..Default::default()
                     }),
@@ -518,7 +683,25 @@ impl KubernetesRuntime {
             // /computer/agent/stop 是 gRPC 取消会话(进程继续), 故 Always 只补崩盘自愈、不冲突。
             restart_policy: Some("Always".to_string()),
             service_account_name: Some(self.config.service_account_name.clone()),
+            topology_spread_constraints,
             ..Default::default()
         })
+    }
+
+    pub(crate) fn install_builder_credential(
+        pod_spec: &mut PodSpec,
+        credential: EnvVar,
+    ) -> ContainerRuntimeResult<()> {
+        let agent = pod_spec
+            .containers
+            .iter_mut()
+            .find(|container| container.name == "agent")
+            .ok_or_else(|| {
+                ContainerRuntimeError::ConfigurationError("Builder agent container missing".into())
+            })?;
+        let env = agent.env.get_or_insert_default();
+        env.retain(|entry| entry.name != "APP_CLI_DEPLOY_TOKEN");
+        env.push(credential);
+        Ok(())
     }
 }

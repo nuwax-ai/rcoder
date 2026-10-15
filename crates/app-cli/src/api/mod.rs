@@ -1,27 +1,47 @@
 //! app-cli internal management API.
+//!
+//! server 形态下 AppState 持 `Arc<ServerState>`：release/phase 随部署动态变化
+//! （idle 态全部日志/代理端点降级，探针按状态机应答）；legacy 直跑形态由
+//! main 构造等价 ServerState（读 lock 后直接 Running 相位），路由面零分叉。
+//!
+//! 响应形态：JSON 端点统一 [`envelope::HttpResult`] 信封
+//! （`{code, message, data, tid, success}`，保留语义状态码）；豁免 = SSE
+//! （`/v1/logs/stream`）、kubelet 探针（`/health`、`/ready`）、TOML 文本
+//! （`/v1/proxy/effective-config`）。
 
-use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
+use axum::Json;
+use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::sse::{Event, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
-use futures::Stream;
+use futures::StreamExt;
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::{Value, json};
 use utoipa::OpenApi;
 
 use crate::log::model::{LogQueryRequest, LogQueryResponse, LogSourceInfo};
 use crate::log::service::LogService;
-use crate::runtime_status::RuntimeStatusService;
+use crate::server::{DeployRequest, ServerState};
+use userapp_log_reader::{CancelOnDrop, LogProvider};
 
+mod envelope;
 mod proxy;
+#[cfg(test)]
+mod proxy_admission_tests;
+mod proxy_reload;
+mod readiness;
+mod runtime;
+
+use envelope::ApiJson;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -29,11 +49,22 @@ mod proxy;
         query_sources,
         query_logs,
         stream_logs,
+        submit_deploy,
+        deploy_status,
+
         proxy::validate,
         proxy::reload,
         proxy::status,
         proxy::effective_config,
-        proxy::upstreams
+        proxy::upstreams,
+        readiness::readiness,
+        runtime::identity,
+        runtime::status,
+        runtime::recovery,
+        runtime::submit_operation,
+        runtime::get_operation,
+        runtime::operation_events,
+        runtime::cancel_operation,
     ),
     components(schemas(
         LogQueryRequest,
@@ -41,45 +72,117 @@ mod proxy;
         LogQueryResponse,
         LogSourceInfo,
         crate::log::model::LogRecord,
-        crate::log::model::SourceError
+        crate::log::model::SourceError,
+        DeployBody,
+        DeployAcceptedData,
+
+        crate::server::DeployStatus,
+
+        shared_types::UserAppBusinessReadiness,
+        shared_types::UserAppProxyReadiness,
+        shared_types::UserAppServiceReadiness,
+        shared_types::UserAppReadinessStatus,
+        shared_types::UserAppReadinessReason,
+        shared_types::ProxyConfirmation,
+        shared_types::ProxyConfirmationContract,
+        shared_types::ProxyPhase,
+        shared_types::ProxyReloadOperation,
+        shared_types::ProxyReloadState,
     )),
     tags(
         (name = "Runtime Logs", description = "Multi-service declared file logs"),
-        (name = "Runtime Proxy", description = "Pingap validation and runtime status")
+        (name = "Runtime Proxy", description = "Pingap validation and runtime status"),
+        (name = "Runtime Deploy", description = "Hot deploy without pod replacement"),
+        (name = "Runtime Control", description = "Single runtime owner operations (start/restart/deploy/stop)"),
+        (name = "Runtime Readiness", description = "Read-only business readiness observation")
     )
 )]
 struct ApiDoc;
 
 #[derive(Clone)]
 pub(super) struct AppState {
-    logs: LogService,
-    workspace: PathBuf,
+    server: Arc<ServerState>,
     pingap_bin: PathBuf,
-    release: workspace_manifest::ReleaseLock,
-    runtime_status: RuntimeStatusService,
+    log_dir: PathBuf,
+    /// 业务就绪观察器（进程级单例语义；bind 时装配）。
+    readiness: Arc<crate::business_readiness::BusinessReadinessObserver>,
 }
 
+impl AppState {
+    /// Same persistent source description remains available after business Stop.
+    fn logs(&self) -> LogService {
+        self.server.observed_log_service(&self.log_dir)
+    }
+}
+
+/// 管理 API 预绑定：构造 router 并真实完成 listener bind，成功才返回。
+/// 调用方必须 await 本函数成功后才允许执行任何运行态副作用（部署清理/
+/// 恢复/业务启停）——bind 失败（端口被占等）在副作用前 fail-fast，不留
+/// "无管理面的运行态"（P1-01）。初始恢复期的写端点由 [`ServerState::initializing`]
+/// 门控拒绝；`serve` future 由调用方 spawn 并监督（故障须触发受控收尾）。
+pub async fn bind(
+    addr: &str,
+    workspace: PathBuf,
+    log_dir: PathBuf,
+    pingap_bin: PathBuf,
+    server: Arc<ServerState>,
+) -> Result<(tokio::net::TcpListener, Router)> {
+    let listener = bind_listener(addr).await?;
+    let app = bound_router(workspace, log_dir, pingap_bin, server);
+    Ok((listener, app))
+}
+
+pub(crate) async fn bind_listener(addr: &str) -> Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind app-cli API {addr}"))
+}
+
+pub(crate) fn bound_router(
+    workspace: PathBuf,
+    log_dir: PathBuf,
+    pingap_bin: PathBuf,
+    server: Arc<ServerState>,
+) -> Router {
+    // Legacy run captures its startup profile here; serve replaces it when
+    // an operation selects the actual execution workspace/profile.
+    server.configure_log_catalog(&workspace, &log_dir);
+    server.set_proxy_context(workspace, crate::supervisor::dev_run_profile());
+    let state = AppState {
+        server: server.clone(),
+        pingap_bin,
+        log_dir,
+        readiness: Arc::new(crate::business_readiness::BusinessReadinessObserver::new(
+            server,
+        )),
+    };
+    api_router(state)
+}
+
+/// 便捷包装（bind + 常驻 serve）：不监督运行期故障，仅供测试等简单场景；
+/// 生产形态（legacy main / serve server）必须用 [`bind`] 并监控 serve future。
 pub async fn serve(
     addr: &str,
     workspace: PathBuf,
     log_dir: PathBuf,
     pingap_bin: PathBuf,
-    runtime_status: RuntimeStatusService,
+    server: Arc<ServerState>,
 ) -> Result<()> {
-    let release = crate::manifest::read_release_lock(&workspace)?;
-    let state = AppState {
-        logs: LogService::new(release.clone(), log_dir),
-        workspace,
-        pingap_bin,
-        release,
-        runtime_status,
-    };
-    let app = Router::new()
-        // liveness 探针:app-cli 进程能响应即活(永远 200,不依赖任何后端)。
+    let (listener, app) = bind(addr, workspace, log_dir, pingap_bin, server).await?;
+    axum::serve(listener, app)
+        .await
+        .context("serve app-cli management API")
+}
+
+/// 管理 API 路由（serve 与测试共用）。
+fn api_router(state: AppState) -> Router {
+    Router::new()
+        // liveness 探针:app-cli 进程能响应即活(永远 200,不依赖任何后端/部署态)。
         // 后端 app 有 bug 起不来时,liveness 不杀容器,用户可 kubectl exec 进去排查。
         .route("/health", get(health))
-        // readiness 探针:默认 app-cli 初始化完成(与后端无关);配了 [health].bridge_service
-        // 才桥接到那个后端的 readiness_path 深检查(fail→503 摘流,但 liveness 仍 200)。
+        // readiness 探针:状态机驱动——Idle=基础设施就绪(PG/ttyd/dbx supervisord
+        // 自治,空容器可用);Running=编排完成/bridge 桥接;Deploying/Orchestrating/
+        // Failed=503(摘流不杀)。
         .route("/ready", get(ready))
         .route("/openapi.json", get(openapi))
         .route("/v1/logs/sources/query", post(query_sources))
@@ -90,14 +193,30 @@ pub async fn serve(
         .route("/v1/proxy/status", get(proxy::status))
         .route("/v1/proxy/effective-config", get(proxy::effective_config))
         .route("/v1/proxy/upstreams", get(proxy::upstreams))
-        .with_state(state);
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("bind app-cli API {addr}"))?;
-    tracing::info!("app-cli management API listening on http://{addr}");
-    axum::serve(listener, app)
-        .await
-        .context("serve app-cli management API")
+        .route("/v1/app/readiness", get(readiness::readiness))
+        .route("/v1/deploy", post(submit_deploy))
+        .route("/v1/deploy/status", get(deploy_status))
+        .route("/v1/runtime/identity", get(runtime::identity))
+        .route("/v1/runtime/status", get(runtime::status))
+        .route("/v1/runtime/recovery", get(runtime::recovery))
+        .route("/v1/runtime/operations", post(runtime::submit_operation))
+        .route(
+            "/v1/runtime/operations/{operation_id}",
+            get(runtime::get_operation),
+        )
+        .route(
+            "/v1/runtime/operations/{operation_id}/events",
+            get(runtime::operation_events),
+        )
+        .route(
+            "/v1/runtime/operations/{operation_id}/events/stream",
+            get(runtime::operation_events_sse),
+        )
+        .route(
+            "/v1/runtime/operations/{operation_id}/cancel",
+            post(runtime::cancel_operation),
+        )
+        .with_state(state)
 }
 
 async fn openapi() -> Json<utoipa::openapi::OpenApi> {
@@ -112,19 +231,315 @@ async fn health() -> (StatusCode, Json<Value>) {
     )
 }
 
-/// `/ready` — readiness 探针:默认 app-cli 初始化完成;配了 bridge_service 时反映桥接后端就绪。
+/// `/ready` — readiness 探针:状态机驱动（见路由注册处注释）。
+/// 初始化恢复期（serve 形态 API 先于恢复 bind——P1-01）：503 摘流，
+/// 不以 Idle 基础设施语义应答尚未恢复完成的实例。
 async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    if state.runtime_status.is_ready() {
+    if state.server.initializing() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "initializing", "phase": "Initializing" })),
+        );
+    }
+    let phase = state.server.phase();
+    if state.server.readiness_ok() {
         (
             StatusCode::OK,
-            Json(json!({ "status": "ready", "service": "app-cli" })),
+            Json(json!({ "status": "ready", "phase": phase.as_str() })),
         )
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "status": "not_ready", "service": "app-cli" })),
+            Json(json!({ "status": "not_ready", "phase": phase.as_str() })),
         )
     }
+}
+
+/// `POST /v1/deploy` 请求体（热部署）。
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub(super) struct DeployBody {
+    /// Operation credentials applied by the caller; used by migration and service processes.
+    #[serde(default)]
+    pub pg: Option<shared_types::StartPgCredential>,
+    #[serde(default)]
+    pub operation_id: Option<String>,
+    /// Captured management instance. A stale caller cannot submit to a new owner.
+    /// Omit to retain the existing deployment client contract.
+    #[serde(default)]
+    pub expected_runtime_instance_id: Option<String>,
+    /// Expected cold deployment generation; stale callers cannot mutate a replacement.
+    #[serde(default)]
+    pub deployment_generation_id: Option<String>,
+    /// 制品包下载 URL（workspace 整体包 zip）。
+    pub url: String,
+    /// 发布版本标记（幂等键）。
+    pub release_id: String,
+    /// 制品 sha256（64 位十六进制小写，可选——给出则下载后校验）。
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
+/// `POST /v1/deploy` 受理成功响应 data。
+#[derive(Serialize, utoipa::ToSchema)]
+pub(super) struct DeployAcceptedData {
+    pub operation_id: String,
+    /// 受理状态（"accepted"）
+    pub status: String,
+    /// 轮询部署进度的端点路径
+    pub poll: String,
+    /// Present on replay; this is the original operation, not a new deployment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<shared_types::AppDeploymentOperation>,
+}
+
+/// `POST /v1/deploy` — 热部署受理（不换 Pod：PG/ttyd/dbx 不断连，仅应用服务切换）。
+///
+/// 鉴权：请求头 `X-Deploy-Token` 必须等于容器 env `APP_CLI_DEPLOY_TOKEN`
+///（未设置该 env = 端点禁用，403——安全默认）。进行中相位（deploying/
+/// orchestrating）拒绝 409；受理后由 server 主循环执行（下载成功才停旧服务）。
+/// 若旧操作已收束，唯一恢复原因是缺少脱敏后的运行凭据，携带 pg 的显式部署
+/// 可在确认原制品和迁移回执后受理；未知操作或迁移不会因此解除保护。
+/// 相同 operation_id 与相同输入返回原操作，不重复执行；更换输入须使用新 ID。
+/// 响应 poll 可查询原操作，之后受理的新部署不会替换其结果。
+#[utoipa::path(
+    post,
+    path = "/v1/deploy",
+    request_body = DeployBody,
+    params(("X-Deploy-Token" = String, Header, description = "Owner control token (APP_CLI_DEPLOY_TOKEN or owner state file)")),
+    responses(
+        (status = 202, body = envelope::HttpResult<DeployAcceptedData>, description = "Deploy accepted; poll /v1/deploy/status"),
+        (status = 403, body = envelope::HttpResult<String>, description = "Token missing/mismatch or endpoint disabled"),
+        (status = 409, body = envelope::HttpResult<String>, description = "Deployment busy, reused operation ID with different input, captured runtime instance or generation mismatch, or unresolved recovery"),
+        (status = 503, body = envelope::HttpResult<String>, description = "Captured runtime identity cannot be verified; deployment was not accepted"),
+        (status = 400, body = envelope::HttpResult<String>, description = "Invalid body (sha256 shape etc.)"),
+        (status = 500, body = envelope::HttpResult<String>, description = "Deployment admission task failed; inspect operation status before retrying")
+    ),
+    tag = "Runtime Deploy"
+)]
+async fn submit_deploy(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    ApiJson(body): ApiJson<DeployBody>,
+) -> Response {
+    if let Err(message) = authorize_deploy(&state, &headers) {
+        return envelope::error(StatusCode::FORBIDDEN, "DEPLOY_FORBIDDEN", message);
+    }
+    if let Some(expected) = body.expected_runtime_instance_id.as_deref() {
+        let Some(kernel) = state.server.runtime_kernel() else {
+            return envelope::error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "DEPLOY_RUNTIME_IDENTITY_UNAVAILABLE",
+                "management identity is unavailable; deployment was not accepted",
+            );
+        };
+        // The kernel is installed once for this process. This immutable
+        // identity remains valid through journal admission below.
+        if kernel.identity().runtime_instance_id != expected {
+            return envelope::error(
+                StatusCode::CONFLICT,
+                "DEPLOY_RUNTIME_INSTANCE_CONFLICT",
+                "captured management instance does not match this owner; deployment was not accepted",
+            );
+        }
+    }
+    // 初始化恢复期拒绝运行态变更（P1-01：API 先 bind，恢复完成前写端点门控；
+    // token 校验优先——不向未授权方暴露恢复状态）。
+    if state.server.initializing() {
+        return envelope::error(
+            StatusCode::CONFLICT,
+            "SERVER_INITIALIZING",
+            "runtime state changes are rejected until startup recovery completes",
+        );
+    }
+    if let Some(pg) = body.pg.as_ref()
+        && (shared_types::pg_utils::validate_pg_identifier(&pg.username).is_err()
+            || pg.password.is_empty()
+            || pg.password.contains('\0'))
+    {
+        return envelope::error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_PG_CREDENTIALS",
+            "PostgreSQL credentials require a valid role and a nonempty password without NUL",
+        );
+    }
+    if let Some(sha) = body.sha256.as_deref()
+        && (sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return envelope::error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_SHA256",
+            "sha256 must be 64 hex characters",
+        );
+    }
+    if let Some(generation) = body.deployment_generation_id.as_deref()
+        && !state.server.matches_generation(generation)
+    {
+        return envelope::error(
+            StatusCode::CONFLICT,
+            "DEPLOY_GENERATION_CONFLICT",
+            "deployment generation does not match this container",
+        );
+    }
+    let operation_id = body
+        .operation_id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+    if operation_id.is_empty()
+        || operation_id.len() > 128
+        || !operation_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return envelope::error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_OPERATION_ID",
+            "invalid operation_id",
+        );
+    }
+    let server = state.server.clone();
+    let accepted_id = operation_id.clone();
+    // Journal fsync runs on the blocking pool; accepted commits survive HTTP cancellation.
+    let admission = tokio::task::spawn_blocking(move || {
+        server.try_accept_deploy_with_id(
+            DeployRequest {
+                runtime_operation_id: None,
+                url: body.url,
+                release_id: body.release_id,
+                sha256: body.sha256.map(|value| value.to_ascii_lowercase()),
+                local_path: None,
+                execution_target: None,
+
+                run_pg: body.pg,
+            },
+            accepted_id,
+        )
+    })
+    .await;
+    let admission = match admission {
+        Ok(result) => result,
+        Err(error) => {
+            return envelope::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DEPLOY_ADMISSION_FAILED",
+                format!("deployment admission task failed: {error}"),
+            );
+        }
+    };
+    match admission {
+        Ok(outcome) => envelope::ok(
+            StatusCode::ACCEPTED,
+            DeployAcceptedData {
+                poll: format!("/v1/deploy/status?operation_id={operation_id}"),
+                operation_id,
+                status: match &outcome {
+                    crate::server::DeployAdmission::Accepted => "accepted",
+                    crate::server::DeployAdmission::Replayed(_) => "replayed",
+                }
+                .into(),
+                operation: match outcome {
+                    crate::server::DeployAdmission::Accepted => None,
+                    crate::server::DeployAdmission::Replayed(operation) => Some(operation),
+                },
+            },
+        ),
+        Err(crate::server::AdmissionError::Busy(message)) => {
+            envelope::error(StatusCode::CONFLICT, "DEPLOY_IN_PROGRESS", message)
+        }
+        Err(crate::server::AdmissionError::Conflict(message)) => {
+            envelope::error(StatusCode::CONFLICT, "DEPLOY_OPERATION_CONFLICT", message)
+        }
+        Err(error) => envelope::error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DEPLOY_ADMISSION_FAILED",
+            error.to_string(),
+        ),
+    }
+}
+
+/// 校验部署令牌：env 未配置 = 端点禁用（安全默认——:3010 在 pod 网络内可达）。
+fn authorize_deploy(state: &AppState, headers: &axum::http::HeaderMap) -> Result<(), String> {
+    let expected = state
+        .server
+        .control_token()
+        .ok_or_else(|| "deploy endpoint disabled (APP_CLI_DEPLOY_TOKEN not set)".to_string())?;
+    let provided = headers
+        .get("x-deploy-token")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if provided == expected {
+        Ok(())
+    } else {
+        Err("deploy token mismatch".to_string())
+    }
+}
+
+#[derive(Deserialize, utoipa::IntoParams)]
+struct DeployStatusQuery {
+    /// Omit for the current runtime; supply to read the original operation.
+    operation_id: Option<String>,
+}
+
+/// `GET /v1/deploy/status` — 部署进度快照（phase/release_id/error）。
+#[utoipa::path(
+    get,
+    path = "/v1/deploy/status",
+    params(DeployStatusQuery),
+    responses(
+        (status = 200, body = envelope::HttpResult<crate::server::DeployStatus>, description = "Current deploy/server phase"),
+        (status = 404, description = "Operation not recorded"),
+        (status = 500, description = "Recorded operation could not be read"),
+    ),
+    tag = "Runtime Deploy"
+)]
+async fn deploy_status(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<DeployStatusQuery>,
+) -> Response {
+    // Initializing gate (recovery v2 T1b): during startup recovery/fencing, the
+    // deployment state machine has not been reconstructed yet — answering
+    // "idle" would misreport recovery as complete. Management identity, health
+    // and control stay available; callers retry like the cold-start window.
+    if state.server.initializing() || state.server.business_recovery_active() {
+        return envelope::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ERR_INITIALIZING",
+            "runtime owner is initializing",
+        );
+    }
+    if let Some(id) = query.operation_id {
+        let current = state.server.deploy_status();
+        if current
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.operation_id == id)
+        {
+            return envelope::ok(StatusCode::OK, current);
+        }
+        return match state.server.recorded_deployment(&id) {
+            Ok(Some(operation)) => envelope::ok(
+                StatusCode::OK,
+                crate::server::DeployStatus {
+                    protocol_version: state.server.deploy_status().protocol_version,
+                    phase: operation.phase,
+                    release_id: operation.artifact_release_id.clone(),
+                    request_release_id: Some(operation.request_release_id.clone()),
+                    error: operation.error.clone(),
+                    operation: Some(operation),
+                    ..Default::default()
+                },
+            ),
+            Ok(None) => envelope::error(
+                StatusCode::NOT_FOUND,
+                "DEPLOY_OPERATION_NOT_FOUND",
+                "deployment operation not recorded",
+            ),
+            Err(error) => envelope::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DEPLOY_STATUS_FAILED",
+                error.to_string(),
+            ),
+        };
+    }
+    envelope::ok(StatusCode::OK, state.server.deploy_status())
 }
 
 #[utoipa::path(
@@ -132,21 +547,19 @@ async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     path = "/v1/logs/sources/query",
     request_body = LogQueryRequest,
     responses(
-        (status = 200, body = Vec<LogSourceInfo>),
-        (status = 400, description = "Invalid selector or query")
+        (status = 200, body = envelope::HttpResult<Vec<LogSourceInfo>>, description = "Declared log sources and matched files"),
+        (status = 400, body = envelope::HttpResult<String>, description = "Invalid selector or query")
     ),
     tag = "Runtime Logs"
 )]
 async fn query_sources(
     State(state): State<AppState>,
-    Json(request): Json<LogQueryRequest>,
-) -> Result<Json<Vec<LogSourceInfo>>, (StatusCode, Json<Value>)> {
-    state
-        .logs
-        .sources(request)
-        .await
-        .map(Json)
-        .map_err(bad_request)
+    ApiJson(request): ApiJson<LogQueryRequest>,
+) -> Response {
+    match state.logs().sources(request).await {
+        Ok(data) => envelope::ok(StatusCode::OK, data),
+        Err(error) => bad_request(error),
+    }
 }
 
 #[utoipa::path(
@@ -154,23 +567,21 @@ async fn query_sources(
     path = "/v1/logs/query",
     request_body = LogQueryRequest,
     responses(
-        (status = 200, body = LogQueryResponse),
-        (status = 400, description = "Invalid selector or query")
+        (status = 200, body = envelope::HttpResult<LogQueryResponse>, description = "Multi-service log snapshot with checkpoint cursor"),
+        (status = 400, body = envelope::HttpResult<String>, description = "Invalid selector or query")
     ),
     tag = "Runtime Logs"
 )]
 async fn query_logs(
     State(state): State<AppState>,
-    Json(request): Json<LogQueryRequest>,
-) -> Result<Json<LogQueryResponse>, (StatusCode, Json<Value>)> {
+    ApiJson(request): ApiJson<LogQueryRequest>,
+) -> Response {
     let cancelled = Arc::new(AtomicBool::new(false));
     let _cancel_on_drop = CancelOnDrop(cancelled.clone());
-    state
-        .logs
-        .query_with_cancel(request, cancelled)
-        .await
-        .map(Json)
-        .map_err(bad_request)
+    match state.logs().query_with_cancel(request, cancelled).await {
+        Ok(data) => envelope::ok(StatusCode::OK, data),
+        Err(error) => bad_request(error),
+    }
 }
 
 #[utoipa::path(
@@ -179,100 +590,503 @@ async fn query_logs(
     request_body = LogQueryRequest,
     responses(
         (status = 200, description = "SSE events: log, source_error, source_recovered, cursor_reset, checkpoint, heartbeat"),
-        (status = 400, description = "Invalid selector or query")
+        (status = 400, body = envelope::HttpResult<String>, description = "Invalid selector or query")
     ),
     tag = "Runtime Logs"
 )]
 async fn stream_logs(
     State(state): State<AppState>,
-    Json(mut request): Json<LogQueryRequest>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)> {
-    state
-        .logs
-        .sources(request.clone())
-        .await
-        .map_err(bad_request)?;
-    let stream = async_stream::stream! {
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let _cancel_on_drop = CancelOnDrop(cancelled.clone());
-        let mut first = true;
-        let mut last_checkpoint: Option<String> = None;
-        let mut failed_sources: BTreeSet<(String, String)> = BTreeSet::new();
-        loop {
-            if !first {
-                request.tail = None;
-            }
-            match state.logs.query_with_cancel(request.clone(), cancelled.clone()).await {
-                Ok(response) => {
-                    if response.cursor_reset {
-                        yield Ok(Event::default()
-                            .event("cursor_reset")
-                            .data(json!({"message": "cursor belongs to a previous app-cli boot"}).to_string()));
-                    }
-                    for record in response.logs {
-                        if let Ok(data) = serde_json::to_string(&record) {
-                            yield Ok(Event::default().event("log").data(data));
-                        }
-                    }
-                    let mut current_failures = BTreeSet::new();
-                    for error in response.source_errors {
-                        let key = (error.service_id.clone(), error.source_id.clone());
-                        current_failures.insert(key.clone());
-                        if !failed_sources.contains(&key)
-                            && let Ok(data) = serde_json::to_string(&error)
-                        {
-                            yield Ok(Event::default().event("source_error").data(data));
-                        }
-                    }
-                    for (service_id, source_id) in failed_sources.difference(&current_failures) {
-                        yield Ok(Event::default().event("source_recovered").data(
-                            json!({
-                                "serviceId": service_id,
-                                "sourceId": source_id,
-                            })
-                            .to_string(),
-                        ));
-                    }
-                    failed_sources = current_failures;
-                    request.cursor = Some(response.cursor.clone());
-                    if last_checkpoint.as_deref() != Some(response.cursor.as_str()) {
-                        last_checkpoint = Some(response.cursor.clone());
-                        yield Ok(Event::default().event("checkpoint").data(response.cursor));
-                    }
-                }
-                Err(error) => {
-                    yield Ok(Event::default()
-                        .event("cursor_reset")
-                        .data(json!({"message": error.to_string()}).to_string()));
-                    request.cursor = None;
-                    last_checkpoint = None;
-                }
-            }
-            first = false;
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-    };
-    Ok(Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .event(Event::default().event("heartbeat").data("{}")),
-    ))
+    ApiJson(request): ApiJson<LogQueryRequest>,
+) -> Response {
+    // 参数错在建流前 → 信封 400（流本身是 SSE，豁免信封）
+    if let Err(error) = state.logs().sources(request.clone()).await {
+        return bad_request(error);
+    }
+    let provider: Arc<dyn LogProvider> = Arc::new(state);
+    let stream = userapp_log_reader::stream(provider, request).map(|event| {
+        let name = event.name();
+        let data = match event.data() {
+            Ok(data) => data,
+            Err(error) => return Ok::<Event, Infallible>(Event::default().event("source_error")
+                .data(json!({"service_id": "workspace", "source_id": "stream", "code": "serialization_failed", "message": error.to_string()}).to_string())),
+        };
+        Ok::<Event, Infallible>(Event::default().event(name).data(data))
+    });
+    Sse::new(stream).into_response()
 }
 
-struct CancelOnDrop(Arc<AtomicBool>);
-
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
+impl LogProvider for AppState {
+    fn load(&self) -> futures::future::BoxFuture<'_, Result<LogService>> {
+        Box::pin(async move { Ok(self.logs()) })
     }
 }
 
-fn bad_request(error: anyhow::Error) -> (StatusCode, Json<Value>) {
-    (
+fn bad_request(error: anyhow::Error) -> Response {
+    envelope::error(
         StatusCode::BAD_REQUEST,
-        Json(json!({
-            "code": "INVALID_LOG_QUERY",
-            "message": error.to_string(),
-        })),
+        "INVALID_LOG_QUERY",
+        error.to_string(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime_status::RuntimeStatusService;
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tower::util::ServiceExt;
+
+    /// idle 态 AppState（无 release）：日志空集、proxy 端点走 idle 降级错误。
+    fn test_state() -> AppState {
+        let server = Arc::new(ServerState::new(RuntimeStatusService::default()));
+        AppState {
+            readiness: Arc::new(crate::business_readiness::BusinessReadinessObserver::new(
+                server.clone(),
+            )),
+            server,
+            pingap_bin: PathBuf::from("/bin/true"),
+            log_dir: tempfile::tempdir().unwrap().keep(),
+        }
+    }
+
+    #[tokio::test]
+    async fn deploy_http_retry_returns_original_operation_and_query() {
+        let state = test_state();
+        state.server.mark_initialized();
+        state.server.initialize_owner_token().unwrap();
+        let token = state.server.control_token().unwrap();
+        for (release, expected, replay) in [
+            ("release-a", StatusCode::ACCEPTED, false),
+            ("release-a", StatusCode::ACCEPTED, true),
+            ("release-b", StatusCode::CONFLICT, false),
+        ] {
+            let request = axum::http::Request::builder().method("POST").uri("/v1/deploy")
+                .header("X-Deploy-Token", &token).header("Content-Type", "application/json")
+                .body(Body::from(json!({"url":"https://example.test/app.zip", "release_id":release, "operation_id":"retry-id"}).to_string())).unwrap();
+            let response = api_router(state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected);
+            let body: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            if expected == StatusCode::ACCEPTED {
+                assert_eq!(
+                    body["data"]["status"],
+                    if replay { "replayed" } else { "accepted" }
+                );
+                if replay {
+                    assert_eq!(body["data"]["operation"]["operation_id"], "retry-id");
+                }
+                let poll = body["data"]["poll"].as_str().unwrap();
+                let (status, original) = call(&state, "GET", poll, "").await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(
+                    original["data"]["operation"]["request_release_id"],
+                    "release-a"
+                );
+            } else {
+                assert_eq!(body["code"], "DEPLOY_OPERATION_CONFLICT");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deployment_from_an_old_runtime_instance_has_no_admission_or_side_effects() {
+        let state = test_state();
+        state.server.mark_initialized();
+        state.server.initialize_owner_token().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::runtime_kernel::RuntimeStore::open_with_root(
+            root.path().join("state"),
+            root.path(),
+        )
+        .unwrap();
+        let identity = store
+            .load_or_init_identity(
+                "instance-test".into(),
+                "userapp-dev".into(),
+                "instance-test".into(),
+                root.path().to_string_lossy().into_owned(),
+                "deployment-test".into(),
+            )
+            .unwrap();
+        state
+            .server
+            .set_runtime_kernel(Arc::new(crate::runtime_kernel::RuntimeKernel::new(
+                store,
+                identity,
+                Box::new(|_| panic!("stale runtime must never dispatch")),
+            )));
+        let token = state.server.control_token().unwrap();
+        let request = axum::http::Request::builder().method("POST").uri("/v1/deploy")
+            .header("X-Deploy-Token", token).header("Content-Type", "application/json")
+            .body(Body::from(json!({"url":"http://127.0.0.1:1/unreachable.zip", "release_id":"explicit-release", "operation_id":"stale-caller", "expected_runtime_instance_id":"old-instance"}).to_string())).unwrap();
+        let response = api_router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["code"], "DEPLOY_RUNTIME_INSTANCE_CONFLICT");
+        assert!(
+            state
+                .server
+                .recorded_deployment("stale-caller")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(state.server.pending_deploy_count().await, 0);
+        assert_eq!(
+            state.server.deploy_status().phase,
+            shared_types::AppCliDeployPhase::Idle
+        );
+        assert!(!root.path().join(".incoming").exists());
+    }
+
+    #[tokio::test]
+    async fn proxy_writes_honor_configured_owner_token_before_any_runtime_mutation() {
+        let state = test_state();
+        state.server.initialize_owner_token().unwrap();
+        let token = state.server.control_token().unwrap();
+        for path in ["/v1/proxy/validate", "/v1/proxy/reload"] {
+            for provided in [None, Some("invalid"), Some(token.as_str())] {
+                let mut request = axum::http::Request::builder().method("POST").uri(path);
+                if let Some(value) = provided {
+                    request = request.header("x-deploy-token", value);
+                }
+                let response = api_router(state.clone())
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                if provided == Some(token.as_str()) {
+                    // Idle/initializing is a real runtime error, not an auth rejection.
+                    assert_ne!(response.status(), StatusCode::FORBIDDEN);
+                } else {
+                    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                }
+            }
+        }
+    }
+
+    async fn call(
+        state: &AppState,
+        method: &str,
+        uri: &str,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = api_router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value = serde_json::from_slice(&bytes).expect("response body is JSON");
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn credential_replacement_endpoints_are_retired_without_removing_runtime_control() {
+        let document = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        for (method, path) in [
+            ("POST", "/v1/runtime/configuration/source-seal"),
+            ("GET", "/v1/runtime/configuration/prepared"),
+            ("POST", "/v1/runtime/configuration/activate"),
+        ] {
+            assert!(document["paths"].get(path).is_none());
+            let response = api_router(test_state())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+        assert!(document["paths"].get("/v1/runtime/identity").is_some());
+        assert!(document["paths"].get("/v1/deploy").is_some());
+        assert!(document["paths"].get("/v1/proxy/reload").is_some());
+    }
+
+    /// 成功信封：恒 5 键、data 载荷透出（idle 空 selector → 空日志快照）。
+    #[tokio::test]
+    async fn logs_query_success_envelope() {
+        let state = test_state();
+        let (status, body) = call(&state, "POST", "/v1/logs/query", r#"{"selectors": []}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["code"], "0000");
+        assert_eq!(body["success"], true);
+        assert_eq!(body["tid"], serde_json::Value::Null);
+        assert!(body["data"]["logs"].as_array().unwrap().is_empty());
+        assert_eq!(body["data"].as_object().unwrap().len(), 4);
+    }
+
+    /// 业务就绪查询（idle 空 owner）：观察成功 200 + ready=false + not_deployed
+    /// ——查询完成与业务可用分开；不依赖 release/探测。
+    #[tokio::test]
+    async fn readiness_idle_empty_owner_reports_not_deployed() {
+        let state = test_state();
+        // 空 owner 的稳态（初始化完成后）：真实形态在 bind 后 mark_initialized。
+        state.server.mark_initialized();
+        let (status, body) = call(&state, "GET", "/v1/app/readiness", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["code"], "0000");
+        assert_eq!(body["data"]["ready"], false);
+        assert_eq!(body["data"]["status"], "not_deployed");
+        assert_eq!(body["data"]["runtime_instance_id"], serde_json::Value::Null);
+        // OpenAPI 文档同步注册
+        let document = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        assert!(document["paths"].get("/v1/app/readiness").is_some());
+    }
+
+    /// 初始化恢复期（API 先于恢复 bind，P1-01）：仍能应答 starting——不等待
+    /// kernel 恢复完成，也不宣称任何业务事实。
+    #[tokio::test]
+    async fn readiness_during_initialization_reports_starting() {
+        let state = test_state();
+        let (status, body) = call(&state, "GET", "/v1/app/readiness", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["status"], "starting");
+        assert_eq!(body["data"]["reason_code"], "SERVICE_STARTING");
+    }
+
+    /// T1b 反例锁：启动恢复/围栏窗口内 deploy/status 不得谎报 idle——
+    /// 200+idle 会把"围栏未清"误判为"恢复完成"（serve_restart 语义）。
+    #[tokio::test]
+    async fn deploy_status_gated_while_initializing() {
+        let state = test_state();
+        let (status, body) = call(&state, "GET", "/v1/deploy/status", "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "ERR_INITIALIZING");
+    }
+
+    /// sources/query 端点信封：idle 态编排器内置源（app-cli/orchestrator）可见
+    /// ——空容器排障正是该源的核心场景。
+    #[tokio::test]
+    async fn logs_sources_query_envelope_with_orchestrator_source() {
+        let state = test_state();
+        let (status, body) = call(
+            &state,
+            "POST",
+            "/v1/logs/sources/query",
+            r#"{"selectors": []}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["code"], "0000");
+        assert_eq!(body["success"], true);
+        let sources = body["data"].as_array().expect("sources array");
+        assert!(
+            sources
+                .iter()
+                .any(|source| source["service_id"] == "app-cli"
+                    && source["source_id"] == "orchestrator"),
+            "{sources:?}"
+        );
+    }
+
+    /// 业务错误信封：INVALID_LOG_QUERY + data 恒 null（未知 service selector）。
+    #[tokio::test]
+    async fn logs_query_invalid_selector_error_envelope() {
+        let state = test_state();
+        let (status, body) = call(
+            &state,
+            "POST",
+            "/v1/logs/query",
+            r#"{"selectors": [{"service_id": "nope"}]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "INVALID_LOG_QUERY");
+        assert_eq!(body["success"], false);
+        assert_eq!(body["data"], serde_json::Value::Null);
+        assert!(body["message"].as_str().unwrap().contains("nope"));
+    }
+
+    /// 请求体解析失败也回信封（不漏 axum 默认纯文本 400）。
+    #[tokio::test]
+    async fn invalid_json_body_rejected_with_envelope() {
+        let state = test_state();
+        let (status, body) = call(&state, "POST", "/v1/logs/query", "not-json").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "INVALID_BODY");
+        assert_eq!(body["success"], false);
+    }
+
+    /// 无令牌 → 403 信封（env 未配置=端点禁用 / 已配置但不匹配，两路都是
+    /// DEPLOY_FORBIDDEN，测试不依赖宿主机 env）。
+    #[tokio::test]
+    async fn deploy_without_token_403_envelope() {
+        let state = test_state();
+        let (status, body) = call(
+            &state,
+            "POST",
+            "/v1/deploy",
+            r#"{"url": "http://x/p.zip", "release_id": "rel-1"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], "DEPLOY_FORBIDDEN");
+        assert_eq!(body["data"], serde_json::Value::Null);
+    }
+
+    /// P1-01 初始化门：恢复期 /ready 以 initializing 摘流（不以 Idle 基础
+    /// 设施语义应答未恢复完成的实例）；mark_initialized 后恢复常规相位判定。
+    #[tokio::test]
+    async fn initializing_gate_reports_ready_503_until_marked() {
+        let state = test_state();
+        assert!(state.server.initializing());
+        let (status, body) = call(&state, "GET", "/ready", "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "initializing");
+
+        state.server.mark_initialized();
+        let (status, body) = call(&state, "GET", "/ready", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+    }
+
+    /// P1-01 初始化门：恢复期写端点拒绝运行态变更——未配置 token 时，
+    /// 直接以 initializing 门拒绝；mark_initialized 后走常规校验路径（本
+    /// 测试环境无 pingap admin → 正常错误，但不再是初始化门文案）。
+    /// deploy 端点的同款门在 token 校验之后（403 优先——不向未授权方暴露
+    /// 恢复状态），与 reload 共用 `ServerState::initializing` 同一判据。
+    #[tokio::test]
+    async fn initializing_gate_blocks_runtime_state_writes() {
+        let state = test_state();
+        assert!(state.server.initializing());
+        let (status, body) = call(&state, "POST", "/v1/proxy/reload", "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("until startup recovery completes"),
+            "initializing gate must reject runtime state writes: {body}"
+        );
+
+        // 门开放后：不再以初始化门拒绝（无 pingap admin → 常规错误文案）。
+        state.server.mark_initialized();
+        let (status, body) = call(&state, "POST", "/v1/proxy/reload", "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            !body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("until startup recovery completes"),
+            "gate must be open after mark_initialized: {body}"
+        );
+    }
+
+    /// deploy/status 成功信封：data.phase 为状态机相位（初始 idle）。
+    #[tokio::test]
+    async fn deploy_status_envelope() {
+        let state = test_state();
+        state.server.mark_initialized();
+        let (status, body) = call(&state, "GET", "/v1/deploy/status", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["code"], "0000");
+        assert_eq!(body["data"]["phase"], "idle");
+        assert_eq!(body["success"], true);
+    }
+
+    /// deploy/status 相位 wire 矩阵：Deploying 可查（rcoder 部署段等待点的
+    /// 观察依赖——下载期 API 常驻应答）；Failed 携带 error。wire 值锁死
+    /// snake_case（rcoder 侧 AppCliDeployPhase 同枚举解析）。
+    #[tokio::test]
+    async fn deploy_status_phase_wire_matrix() {
+        let state = test_state();
+        state.server.mark_initialized();
+        state
+            .server
+            .set_phase(crate::server::ServerPhase::Deploying);
+        let (status, body) = call(&state, "GET", "/v1/deploy/status", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["phase"], "deploying");
+        assert_eq!(body["data"].get("error"), None);
+
+        state.server.set_phase(crate::server::ServerPhase::Failed(
+            "artifact sha256 mismatch".into(),
+        ));
+        let (status, body) = call(&state, "GET", "/v1/deploy/status", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["phase"], "failed");
+        assert_eq!(
+            body["data"]["error"].as_str(),
+            Some("artifact sha256 mismatch")
+        );
+    }
+
+    /// 令牌回显 wire：request_release_id Some 时透出（rcoder 部署等待的比对源）、
+    /// None 时跳过（无请求方路径，旧消费者看不到字段）。
+    #[tokio::test]
+    async fn deploy_status_request_release_id_wire() {
+        let state = test_state();
+        state.server.mark_initialized();
+        // 无请求方：字段不出现在 wire
+        let (status, body) = call(&state, "GET", "/v1/deploy/status", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"].get("request_release_id"), None);
+
+        state.server.set_request_release_id("rel-token-x");
+        let (status, body) = call(&state, "GET", "/v1/deploy/status", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["data"]["request_release_id"].as_str(),
+            Some("rel-token-x")
+        );
+    }
+
+    /// proxy/status idle 信封：data.mode=idle、release_id=null。
+    #[tokio::test]
+    async fn proxy_status_idle_envelope() {
+        let state = test_state();
+        let (status, body) = call(&state, "GET", "/v1/proxy/status", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["code"], "0000");
+        assert_eq!(body["data"]["mode"], "idle");
+        assert_eq!(body["data"]["release_id"], serde_json::Value::Null);
+    }
+
+    /// proxy/validate idle 错误信封：PINGAP_CONFIG_INVALID + data=null。
+    #[tokio::test]
+    async fn proxy_validate_idle_error_envelope() {
+        let state = test_state();
+        let (status, body) = call(&state, "POST", "/v1/proxy/validate", "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "PINGAP_CONFIG_INVALID");
+        assert_eq!(body["data"], serde_json::Value::Null);
+    }
+
+    /// 启动窗口内 recovery 端点返回 ERR_INITIALIZING（不是 ERR_INVALID_STATE）
+    /// ——file-server owner_client 的有界等待只重试 ERR_INITIALIZING，其他码
+    /// 立即放弃（矩阵 R3 实测：降级 owner 初始化期 Stop 的恢复证据被秒拒）。
+    #[tokio::test]
+    async fn recovery_during_startup_reports_initializing_code() {
+        let state = test_state();
+        // 新建 ServerState 默认 initializing=true，不调用 mark_initialized。
+        // This is a managed owner assembling its kernel, not unsupported mode.
+        state.server.mark_kernel_required();
+        state.server.initialize_owner_token().unwrap();
+        let token = state.server.control_token().unwrap();
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/runtime/recovery")
+            .header("X-Deploy-Token", &token)
+            .body(Body::empty())
+            .unwrap();
+        let response = api_router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON envelope");
+        assert_eq!(body["code"], "ERR_INITIALIZING");
+    }
 }

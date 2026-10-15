@@ -3,6 +3,8 @@
 //! 终端中间层从 Pingora 注入的 header 拿到上下文：
 //! - `X-Ttyd-Project-Id`：项目标识
 //! - `X-Ttyd-Service-Type`：业务场景（`shared_types::ServiceType` 的 kebab-case 形式）
+//! - `X-Ttyd-Cwd`：显式终端初始目录（Pingora 按终端 query 契约 `?cwd=` 注入的
+//!   多平台归一化绝对路径；见 [`resolve_explicit_cwd`]，优先于按推导值）
 //! - `X-Ttyd-Tenant-Id` / `X-Ttyd-Space-Id`：项目归属（Pingora 按 project_id 反查注入，
 //!   见 `ContainerLookup::find_project_scope`）。共享容器（tenant/space 隔离）下用于
 //!   拼接三级工作目录。
@@ -22,7 +24,12 @@ use std::path::{Path, PathBuf};
 use shared_types::paths::WORKSPACE_ROOT;
 
 /// ComputerAgentRunner 容器内项目目录前缀（per-user 容器，不受隔离模式影响）
-const HOME_PREFIX: &str = "/home/user";
+const HOME_PREFIX: &str = shared_types::paths::AGENT_CONTAINER_HOME;
+
+/// ComputerNormalProject（常规项目，与 Computer 共享容器）项目目录前缀：
+/// `/home/user/normalProject/{project_id}`（与 chat 的 resolve_project_dir
+/// 默认推导、file-server normalProject 布局三方同根）
+const NORMAL_PROJECT_PREFIX: &str = "/home/user/normalProject";
 
 // WebAgentRunner 工作区根用 shared_types::paths::WORKSPACE_ROOT (单一事实源, 不再本地定义)
 
@@ -65,12 +72,26 @@ pub fn resolve_project_cwd(
             // per-user 容器：项目目录恒为单级 /home/user/{project_id}
             resolve_in_candidates(project_id, &[HOME_PREFIX])
         }
-        Some(ServiceType::WebAgentRunner)
-        | Some(ServiceType::UserApp)
-        | Some(ServiceType::UserAppBuilder) => {
+        Some(ServiceType::ComputerNormalProject) => {
+            // 常规项目（与 Computer 共享容器）：/home/user/normalProject/{project_id}
+            resolve_in_candidates(project_id, &[NORMAL_PROJECT_PREFIX])
+        }
+        Some(ServiceType::UserappBuilder) => {
+            // userApp 开发容器的终端：workspace = {USERAPP_WORKSPACE_DIR}/{app_id}
+            // （与 chat 的 work_dir、file-server 的 resolve_userapp_dev 三方同根：
+            // env 驱动、缺省回落 shared_types 压平契约常量 /home/user，见
+            // userapp_env.rs。/api/v1/userapp/proxy/ttyd/dev/{user_id}/{app_id} 经
+            // Pingora 注入本 service_type 到达此处）
+            //
+            // 沙箱安全性：UserappBuilder 分支仅在 builder 容器命中（X-Ttyd-Service-Type
+            // 由 Pingora 按容器类型注入），沙箱/computer 容器不进此分支，env 回落值
+            // 与沙箱的 /home/user/{project_id} 布局无冲突。
+            let prefix = crate::userapp_env::userapp_workspace_dir();
+            resolve_in_candidates(project_id, &[prefix.as_str()])
+        }
+        Some(ServiceType::WebAgentRunner) | Some(ServiceType::Userapp) => {
             // 共享容器三级优先，单项目隔离单级兜底
-            // UserApp 不由 agent_runner 托管；UserAppBuilder 经 file-server build,终端 cwd 兜底此路径
-            // (此处仅兜底,运行时不应进入)
+            // Userapp 不由 agent_runner 托管（app_manager Deployment 路径）
             let prefixes = build_web_prefixes(tenant, space);
             let refs: Vec<&str> = prefixes.iter().map(String::as_str).collect();
             resolve_in_candidates(project_id, &refs)
@@ -83,6 +104,30 @@ pub fn resolve_project_cwd(
             resolve_in_candidates(project_id, &refs)
         }
     }
+}
+
+/// 解析显式 cwd（`X-Ttyd-Cwd` header，Pingora 按终端 query 契约注入的
+/// 多平台归一化绝对路径；空串视同未注入）。
+///
+/// 校验链（纵深防御——即便 header 被旁路直写 17681 也在此拦截）：
+/// 1. [`shared_types::normalize_absolute_dir`] 多平台规则复检（拒点段/控制
+///    字符/相对形态，与 chat 链 `agent_work_dir` 同一词汇表）；
+/// 2. `canonicalize` 解析容器内真实路径（解 symlink、消解 `..` 残留）；
+/// 3. `is_dir` 存在性；
+/// 4. canonical 后**再过一次**归一规则——symlink 目标可能落在含控制字符等
+///    非法形态的路径上。
+///
+/// 任何一步失败返回 `None`，调用方回落 service_type 推导（warn 留痕），
+/// 与 computer 链 fail-open 现状一致。
+pub fn resolve_explicit_cwd(raw: &str) -> Option<PathBuf> {
+    if raw.is_empty() {
+        return None;
+    }
+    let normalized = shared_types::normalize_absolute_dir(raw, "cwd").ok()?;
+    let canonical = std::fs::canonicalize(&normalized).ok()?;
+    let canonical_str = canonical.to_str()?;
+    shared_types::normalize_absolute_dir(canonical_str, "cwd").ok()?;
+    canonical.is_dir().then_some(canonical)
 }
 
 /// 构造 WebAgentRunner 工作区候选前缀（与 `grpc::chat` 的 project_dir 解析对齐）。
@@ -151,6 +196,80 @@ mod tests {
     }
 
     #[test]
+    fn computer_normal_project_resolves_normal_project_directory() {
+        // 常规项目终端 cwd：/home/user/normalProject/{pid}（沙箱真实目录）。
+        // 与既有 computer_agent_runner 测试同策略：/home/user 在测试机上可能
+        // 不存在——目录存在才断言解析形态，不存在则断言 None（不误落 taskAgent
+        // 单级目录 /home/user/{pid} 的兜底行为）。
+        let result = resolve_project_cwd("computer-normal-project", "p9", "", "");
+        if let Some(cwd) = result.as_ref() {
+            assert_eq!(cwd.to_str().unwrap(), "/home/user/normalProject/p9");
+        }
+    }
+
+    #[test]
+    fn computer_normal_project_missing_dir_falls_back() {
+        // 目录不存在 → None（调用方回退 $HOME），不得错落 taskAgent 单级目录
+        assert!(resolve_project_cwd("computer-normal-project", "no-such-pid", "", "").is_none());
+    }
+
+    #[test]
+    fn explicit_cwd_resolves_existing_dir() {
+        // 合法显式 cwd：目录存在 → canonical 路径
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("proj-x");
+        fs::create_dir_all(&dir).unwrap();
+        let resolved = resolve_explicit_cwd(dir.to_str().unwrap()).expect("应解析成功");
+        assert_eq!(resolved, dir.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn explicit_cwd_empty_or_missing_dir_returns_none() {
+        // 空串 = 未注入；目录不存在 / 相对路径 / 点段 → None（回落推导）
+        assert!(resolve_explicit_cwd("").is_none());
+        let tmp = tempdir().unwrap();
+        assert!(resolve_explicit_cwd(tmp.path().join("no-such").to_str().unwrap()).is_none());
+        assert!(resolve_explicit_cwd("relative/dir").is_none());
+        assert!(resolve_explicit_cwd("/home/../etc").is_none());
+    }
+
+    #[test]
+    fn explicit_cwd_backslash_form_normalizes_to_same_dir() {
+        // Windows 反斜杠分隔形态：归一后命中同一目录（多平台输入容错）
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("win-proj");
+        fs::create_dir_all(&dir).unwrap();
+        let backslash = dir.to_str().unwrap().replace('/', "\\");
+        let resolved = resolve_explicit_cwd(&backslash).expect("反斜杠形态应归一命中");
+        assert_eq!(resolved, dir.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn explicit_cwd_symlink_to_control_char_target_rejected() {
+        // symlink 目标含控制字符：canonical 后复检归一规则 → None
+        // （防旁路注入经 symlink 落到非法形态路径）
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("a\x01b");
+        fs::create_dir_all(&target).unwrap();
+        let link = tmp.path().join("link");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(&target, &link).unwrap();
+            assert!(resolve_explicit_cwd(link.to_str().unwrap()).is_none());
+        }
+    }
+
+    #[test]
+    fn explicit_cwd_file_instead_of_dir_returns_none() {
+        // 路径存在但是文件 → None
+        let tmp = tempdir().unwrap();
+        let file = tmp.path().join("afile");
+        fs::write(&file, b"x").unwrap();
+        assert!(resolve_explicit_cwd(file.to_str().unwrap()).is_none());
+    }
+
+    #[test]
     fn computer_agent_runner_resolves_user_directory() {
         // ComputerAgentRunner 返回 /home/user/{project_id}（不受 tenant/space 影响）
         // 注意：这个测试在非容器环境中会返回 None，因为 /home/user/{project_id} 可能不存在
@@ -170,7 +289,7 @@ mod tests {
             p,
             vec![
                 "/app/project_workspace/1/1184".to_string(),
-                "/app/project_workspace".to_string()
+                WORKSPACE_ROOT.to_string()
             ]
         );
     }
@@ -180,7 +299,7 @@ mod tests {
         // 任一缺失 → 仅单级
         assert_eq!(
             build_web_prefixes(None, Some("1184")),
-            vec!["/app/project_workspace".to_string()]
+            vec![WORKSPACE_ROOT.to_string()]
         );
         assert_eq!(
             build_web_prefixes(Some("1"), None),

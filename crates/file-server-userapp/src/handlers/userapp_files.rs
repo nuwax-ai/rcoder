@@ -1,0 +1,945 @@
+//! `/api/v1/userapp` 文件操作镜像族（读+写）: computer 域同参镜像, workspace 走 Userapp 开发卷。
+//!
+//! 参数对齐 computer 域语义但自有命名: `app_id`（原 cId 改名）、`user_id`
+//! （保留, 不参与路径, 为挂载分区组成段）。定位统一 `resolve_userapp_dev` =
+//! `{USERAPP_WORKSPACE_DIR}/{app_id}`; 编排复用 file-server `*_core`（类型化
+//! 业务核心），**响应在本壳层自拼 snake JSON**——computer 域 TS 驼峰契约
+//! 不经本域（键风格分歧归各域拼装层，两域不复制编排防漂移）。
+
+use axum::extract::State;
+use garde::Validate;
+
+use crate::UserAppState;
+use crate::models::response::{
+    UserappBatchUploadItem, UserappFileListReply, UserappFileMetaEntry, UserappFileMetaReply,
+    UserappFilesUpdateReply, UserappGenerateFileReply, UserappImportProjectReply,
+    UserappResolveFileReply, UserappSearchFilesReply, UserappUploadFileReply,
+    UserappUploadFilesReply,
+};
+use crate::models::{
+    UserappFileEntry, UserappFileListQuery, UserappFileMetaBody, UserappFilesUpdateBody,
+    UserappGenerateFileBody, UserappImportProjectForm, UserappResolveFileQuery,
+    UserappSearchFilesQuery, UserappUploadFileForm, UserappUploadFilesForm,
+};
+use file_server::error::AppError;
+use file_server::extract::{AppJson as Json, AppMultipart as Multipart, AppQuery as Query};
+use file_server::ops::files::files_update_core;
+use file_server::ops::files::{
+    BatchUploadItem, generate_file_core, import_project_core, upload_file_core, upload_files_core,
+};
+use file_server::ops::files_read::{
+    FileListParams, effective_file_meta_max_batch, get_file_list_core, get_file_meta_core,
+    resolve_file_core, search_files_core,
+};
+use file_server::ops::multipart::{file_field, text_field, validate_zip_ext};
+use file_server::service::code as code_service;
+use file_server::service::temp_file::TemporaryFile;
+use file_server::workspace::resolve_userapp_dev;
+
+// ── get-file-list ───────────────────────────────────────────────────────────────
+
+/// 文件树列表（轻量元信息，不读内容）
+///
+/// 列开发卷 workspace 内指定目录的文件清单（名称/大小/mtime 等元信息，不读
+/// 内容）。`relative_path` 相对 workspace 根（缺省列根一层）；`recursive`
+/// 缺省 true 递归展开整棵子树，显式 "false" 仅当前层。`type`/`limit`
+/// 过滤输出并提前停止，响应回显生效值；传 `proxy_path` 时条目附 `proxy_url`
+/// 预览地址（`custom_target_dir` 非空时自动追加同名 query 参数）。
+#[utoipa::path(
+    get,
+    path = "/get-file-list",
+    params(UserappFileListQuery),
+    responses(file_server::openapi::JsonApiResponses),
+    tag = "Userapp · 双态 · 文件镜像"
+)]
+pub(crate) async fn get_file_list(
+    State(state): State<UserAppState>,
+    Query(q): Query<UserappFileListQuery>,
+) -> Result<Json<UserappFileListReply>, AppError> {
+    q.validate().map_err(file_server::error::from_garde)?;
+    let path = resolve_userapp_dev(&q.app_id, q.custom_target_dir.as_deref(), &state.fs.config)?;
+    let result = get_file_list_core(
+        &state.fs,
+        &path,
+        FileListParams {
+            proxy_path: q.proxy_path.as_deref(),
+            relative_path: q.relative_path.as_deref(),
+            recursive: q.recursive.as_deref(),
+            depth: q.depth.as_deref(),
+            file_type: q.file_type.as_deref(),
+            limit: q.limit.as_deref(),
+            custom_target_dir: q.custom_target_dir.as_deref(),
+        },
+    )
+    .await?;
+    let mut files: Vec<UserappFileEntry> = result.files.into_iter().map(Into::into).collect();
+    append_proxy_url_suffix(&mut files, q.custom_target_dir.as_deref());
+    Ok(Json(UserappFileListReply {
+        success: true,
+        files,
+        recursive: result.recursive,
+        depth: result.depth,
+        file_type: result.file_type.as_str().to_string(),
+        limit: result.limit,
+    }))
+}
+
+// ── resolve-file ────────────────────────────────────────────────────────────────
+
+/// 校验文件存在性，存在返回预览 URL
+///
+/// 探测 `file_path`（workspace 内相对路径，必填非空）指向的文件：不存在返回
+/// `{ success, exists: false }`；存在返回 `{ success, exists: true, name,
+/// file_proxy_url }`——`proxy_path` 为预览 URL 前缀（缺省则响应不含
+/// file_proxy_url）；`custom_target_dir` 非空时自动追加
+/// `?custom_target_dir=`（语义同 computer 域 customTargetDir 后缀）。
+#[utoipa::path(
+    get,
+    path = "/resolve-file",
+    params(UserappResolveFileQuery),
+    responses(file_server::openapi::JsonApiResponses),
+    tag = "Userapp · 双态 · 文件镜像"
+)]
+pub(crate) async fn resolve_file(
+    State(state): State<UserAppState>,
+    Query(q): Query<UserappResolveFileQuery>,
+) -> Result<Json<UserappResolveFileReply>, AppError> {
+    q.validate().map_err(file_server::error::from_garde)?;
+    let path = resolve_userapp_dev(&q.app_id, q.custom_target_dir.as_deref(), &state.fs.config)?;
+    let mut r = match resolve_file_core(path, q.file_path.trim(), q.proxy_path.as_deref()).await? {
+        Some(r) => r,
+        None => {
+            return Ok(Json(UserappResolveFileReply::Missing {
+                success: true,
+                exists: false,
+            }));
+        }
+    };
+    // file_proxy_url 追加 ?custom_target_dir=（语义同 computer 域 customTargetDir 后缀）
+    if let (Some(ct), Some(url)) = (
+        trimmed_non_empty(q.custom_target_dir.as_deref()),
+        r.file_proxy_url.as_mut(),
+    ) {
+        url.push_str("?custom_target_dir=");
+        url.push_str(&code_service::encode_uri_component(ct));
+    }
+    Ok(Json(UserappResolveFileReply::Found {
+        success: true,
+        exists: true,
+        name: r.name,
+        file_proxy_url: r.file_proxy_url,
+    }))
+}
+
+// ── search-files ────────────────────────────────────────────────────────────────
+
+/// 无索引有界实时搜索
+///
+/// 按 `kw`（文件名/相对路径子串，大小写不敏感）遍历 workspace 实时匹配，
+/// 三重上限防大目录失控：`limit` 命中条数上限、`max_visit` 访问条目硬上限
+/// （含未命中）、`timeout_ms` 超时毫秒。响应 `{ success, files[], truncated,
+/// visited }`——`truncated=true` 表示因上限/超时提前结束、结果不完整，
+/// 调用方应提示而非当作全量。
+#[utoipa::path(
+    get,
+    path = "/search-files",
+    params(UserappSearchFilesQuery),
+    responses(file_server::openapi::JsonApiResponses),
+    tag = "Userapp · 双态 · 文件镜像"
+)]
+pub(crate) async fn search_files(
+    State(state): State<UserAppState>,
+    Query(q): Query<UserappSearchFilesQuery>,
+) -> Result<Json<UserappSearchFilesReply>, AppError> {
+    q.validate().map_err(file_server::error::from_garde)?;
+    let path = resolve_userapp_dev(&q.app_id, q.custom_target_dir.as_deref(), &state.fs.config)?;
+    let r = search_files_core(
+        &state.fs,
+        path,
+        file_server::ops::files_read::SearchFilesParams {
+            proxy_path: q.proxy_path.as_deref(),
+            relative_path: q.relative_path.as_deref(),
+            kw: q.kw.trim(),
+            limit: &q.limit,
+            max_visit: &q.max_visit,
+            timeout_ms: &q.timeout_ms,
+            custom_target_dir: q.custom_target_dir.as_deref(),
+            search_type: q.search_type.as_deref(),
+        },
+    )
+    .await?;
+    let mut files: Vec<UserappFileEntry> = r.files.into_iter().map(Into::into).collect();
+    append_proxy_url_suffix(&mut files, q.custom_target_dir.as_deref());
+    Ok(Json(UserappSearchFilesReply {
+        success: true,
+        files,
+        truncated: r.truncated,
+        visited: r.visited,
+    }))
+}
+
+// ── get-file-meta ───────────────────────────────────────────────────────────────
+
+/// 批量查询文件元数据（大小/mtime/MIME 等）
+///
+/// 对齐 computer 域 get-file-meta（TS 1.5.0 getFileMeta）：与 get-file-list
+/// 解耦按需查询，`file_paths` 为相对 workspace 根的路径数组（通常为
+/// get-file-list 返回的 name）。响应 `{ success, metas[] }`——条目含
+/// `path/is_dir/is_link/size/mtime_ms/extension/mime_type/link_target/
+/// child_count`；单条失败仅该条带 `error`、其余字段 null，不影响整批；
+/// 目录 `size/extension/mime_type` 恒 null，`child_count` 可见性与
+/// get-file-list 同口径（1000 截断）。`file_meta_max_batch` 缺省 100、
+/// 服务端硬顶 1000，超限 400。
+#[utoipa::path(
+    post,
+    path = "/get-file-meta",
+    request_body = UserappFileMetaBody,
+    responses(file_server::openapi::JsonApiResponses),
+    tag = "Userapp · 双态 · 文件镜像"
+)]
+pub(crate) async fn get_file_meta(
+    State(state): State<UserAppState>,
+    Json(body): Json<UserappFileMetaBody>,
+) -> Result<Json<UserappFileMetaReply>, AppError> {
+    body.validate().map_err(file_server::error::from_garde)?;
+    // 非空与上限联合校验 (对齐 computer 域同款位置与消息)
+    if body.file_paths.is_empty() {
+        return Err(AppError::validation("filePaths must be a non-empty array"));
+    }
+    let max_batch = effective_file_meta_max_batch(body.file_meta_max_batch);
+    if body.file_paths.len() > max_batch {
+        return Err(AppError::validation(format!(
+            "filePaths batch size {} exceeds limit {max_batch}",
+            body.file_paths.len()
+        )));
+    }
+    let path = resolve_userapp_dev(
+        &body.app_id,
+        body.custom_target_dir.as_deref(),
+        &state.fs.config,
+    )?;
+    let metas = get_file_meta_core(&state.fs, &path, &body.file_paths).await?;
+    let metas: Vec<UserappFileMetaEntry> = metas
+        .iter()
+        .map(|m| UserappFileMetaEntry {
+            path: m.path.clone(),
+            is_dir: m.is_dir,
+            is_link: m.is_link,
+            size: m.size,
+            mtime_ms: m.mtime_ms,
+            extension: m.extension.clone(),
+            mime_type: m.mime_type.clone(),
+            link_target: m.link_target.clone(),
+            child_count: m.child_count,
+            error: m.error.clone(),
+        })
+        .collect();
+    Ok(Json(UserappFileMetaReply {
+        success: true,
+        metas,
+    }))
+}
+
+// ── files-update ────────────────────────────────────────────────────────────────
+
+/// 批量文件增删改（modify 字节比较）
+///
+/// 对 `files` 数组逐项执行 create / delete / rename / modify（`operation`
+/// 字段区分；rename 须带 `rename_from`，create/modify 携 `contents` 文本、
+/// 服务端做 URL 解码）。modify 以字节比较判变更，内容相同跳过写入。
+/// 响应 `{ success, message, user_id, app_id, files_count }`（files_count
+/// = 实际执行动作数）。注意 delete 按路径直删无回收站，调用方自行确认。
+#[utoipa::path(post, path = "/files-update", request_body = UserappFilesUpdateBody, responses(file_server::openapi::JsonApiResponses), tag = "Userapp · 双态 · 文件镜像")]
+pub(crate) async fn files_update(
+    State(state): State<UserAppState>,
+    Json(body): Json<UserappFilesUpdateBody>,
+) -> Result<Json<UserappFilesUpdateReply>, AppError> {
+    let _workspace_activity = state
+        .build_tasks
+        .workspace_activity(&body.app_id)
+        .await
+        .read_owned()
+        .await;
+    let path = resolve_userapp_dev(
+        &body.app_id,
+        body.custom_target_dir.as_deref(),
+        &state.fs.config,
+    )?;
+    let files: Vec<_> = body.files.into_iter().map(Into::into).collect();
+    let count = files_update_core(&path, files).await?;
+    Ok(Json(UserappFilesUpdateReply {
+        success: true,
+        message: "User files updated successfully".into(),
+        app_id: body.app_id,
+        files_count: count,
+    }))
+}
+
+// ── upload-file / upload-files ──────────────────────────────────────────────────
+
+/// 单文件上传（multipart）
+///
+/// 上传单个文件到开发卷：`file_path` 指定 workspace 内相对路径，按原字节
+/// 直写落盘（不解析压缩包——zip/tar.gz 保存为文件本体）。`custom_target_dir`
+/// 可覆盖 workspace 根（Java 侧负责合法性）。
+#[utoipa::path(post, path = "/upload-file", request_body(content = UserappUploadFileForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "Userapp · 双态 · 文件镜像")]
+pub(crate) async fn upload_file(
+    State(state): State<UserAppState>,
+    mut multipart: Multipart,
+) -> Result<Json<UserappUploadFileReply>, AppError> {
+    let mut app_id = None;
+    let mut user_id = None;
+    let mut file_path = None;
+    let mut custom_target_dir = None;
+    let mut data = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::validation(format!("multipart parse: {e}")))?
+    {
+        match field.name().unwrap_or("") {
+            "app_id" => app_id = Some(text_field(field).await?),
+            "user_id" => user_id = Some(text_field(field).await?),
+            "file_path" => file_path = Some(text_field(field).await?),
+            "custom_target_dir" => custom_target_dir = Some(text_field(field).await?),
+            "file" => {
+                data = Some(
+                    file_field(
+                        field,
+                        state.fs.config.upload_max_file_size_bytes,
+                        &state.fs.config.upload_temp_dir(),
+                    )
+                    .await?,
+                )
+            }
+            _ => {}
+        }
+    }
+    let app_id = require_app_field(app_id, "app_id")?;
+    let _workspace_activity = state
+        .build_tasks
+        .workspace_activity(&app_id)
+        .await
+        .read_owned()
+        .await;
+    let user_id = require_app_field(user_id, "user_id")?;
+    let file_path = require_app_field(file_path, "file_path")?;
+    let data = data.ok_or_else(|| AppError::validation("file is required"))?;
+    tracing::debug!(app_id = %app_id, user_id = %user_id, "userapp upload-file");
+    let ws = resolve_userapp_dev(&app_id, custom_target_dir.as_deref(), &state.fs.config)?;
+    let r = upload_file_core(&ws, &file_path, data).await?;
+    Ok(Json(UserappUploadFileReply {
+        success: true,
+        message: "File uploaded successfully".into(),
+        file_size: r.file_size,
+    }))
+}
+
+/// 多文件上传（单文件错误隔离）
+///
+/// multipart 重复字段批量上传：`file_paths` 与 `files` 一一对应落盘；
+/// 单个文件失败不影响其余（错误隔离，逐项返回结果）。
+#[utoipa::path(post, path = "/upload-files", request_body(content = UserappUploadFilesForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "Userapp · 双态 · 文件镜像")]
+pub(crate) async fn upload_files(
+    State(state): State<UserAppState>,
+    mut multipart: Multipart,
+) -> Result<Json<UserappUploadFilesReply>, AppError> {
+    let mut app_id = None;
+    let mut user_id = None;
+    let mut custom_target_dir = None;
+    let mut file_paths: Vec<String> = Vec::new();
+    let mut files_vec = Vec::new();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::validation(format!("multipart parse: {e}")))?
+    {
+        match field.name().unwrap_or("") {
+            "app_id" => app_id = Some(text_field(field).await?),
+            "user_id" => user_id = Some(text_field(field).await?),
+            "custom_target_dir" => custom_target_dir = Some(text_field(field).await?),
+            "file_paths" => file_paths.push(text_field(field).await?),
+            "files" => {
+                let original = field.file_name().map(|s| s.to_string());
+                files_vec.push((
+                    original,
+                    file_field(
+                        field,
+                        state.fs.config.upload_max_file_size_bytes,
+                        &state.fs.config.upload_temp_dir(),
+                    )
+                    .await?,
+                ));
+            }
+            _ => {}
+        }
+    }
+    let app_id = require_app_field(app_id, "app_id")?;
+    let _workspace_activity = state
+        .build_tasks
+        .workspace_activity(&app_id)
+        .await
+        .read_owned()
+        .await;
+    let user_id = require_app_field(user_id, "user_id")?;
+    tracing::debug!(app_id = %app_id, user_id, "userapp upload-files");
+    if file_paths.len() != files_vec.len() {
+        return Err(AppError::validation("file_paths and files count mismatch"));
+    }
+    let ws = resolve_userapp_dev(&app_id, custom_target_dir.as_deref(), &state.fs.config)?;
+    let r = upload_files_core(&ws, &file_paths, &files_vec).await?;
+    let results: Vec<UserappBatchUploadItem> = r
+        .results
+        .into_iter()
+        .map(|item| match item {
+            BatchUploadItem::Ok {
+                file_path,
+                original,
+                file_size,
+            } => UserappBatchUploadItem::Ok {
+                success: true,
+                file_path,
+                originalname: original,
+                message: "File uploaded successfully".into(),
+                file_size,
+            },
+            BatchUploadItem::Err {
+                file_path,
+                original,
+                error,
+            } => UserappBatchUploadItem::Err {
+                success: false,
+                file_path,
+                originalname: original,
+                error,
+            },
+        })
+        .collect();
+    Ok(Json(UserappUploadFilesReply {
+        success: true,
+        message: "Batch upload completed".into(),
+        total_count: r.total,
+        success_count: r.success_count,
+        fail_count: r.total - r.success_count,
+        results,
+    }))
+}
+
+// ── generate-file ───────────────────────────────────────────────────────────────
+
+/// JSON 文本生成文件
+///
+/// 以 `file_name`（可含相对子路径，自动剥前导 `/`）在 workspace 内写入
+/// `content` 文本（缺省空串）；父目录自动创建。适合生成配置/代码骨架等
+/// 纯文本产物。
+#[utoipa::path(
+    post,
+    path = "/generate-file",
+    request_body = UserappGenerateFileBody,
+    responses(file_server::openapi::JsonApiResponses),
+    tag = "Userapp · 双态 · 文件镜像"
+)]
+pub(crate) async fn generate_file(
+    State(state): State<UserAppState>,
+    Json(body): Json<UserappGenerateFileBody>,
+) -> Result<Json<UserappGenerateFileReply>, AppError> {
+    body.validate().map_err(file_server::error::from_garde)?;
+    let _workspace_activity = state
+        .build_tasks
+        .workspace_activity(&body.app_id)
+        .await
+        .read_owned()
+        .await;
+    let ws = resolve_userapp_dev(
+        &body.app_id,
+        body.custom_target_dir.as_deref(),
+        &state.fs.config,
+    )?;
+    let r = generate_file_core(ws, body.file_name.trim(), body.content.unwrap_or_default()).await?;
+    Ok(Json(UserappGenerateFileReply {
+        success: true,
+        message: "File generated successfully".into(),
+        file_name: r.file_name,
+        file_size: r.file_size,
+    }))
+}
+
+// ── import-project ──────────────────────────────────────────────────────────────
+
+/// 项目 zip 导入开发卷（解压合并）
+///
+/// 上传项目 zip 解压合并到开发卷 workspace（`file` 必填；zip 按魔数识别
+/// 解压，单文件直写）；`custom_target_dir` 可覆盖 workspace 根。
+#[utoipa::path(post, path = "/import-project", request_body(content = UserappImportProjectForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "Userapp · 双态 · 文件镜像")]
+pub(crate) async fn import_project(
+    State(state): State<UserAppState>,
+    mut multipart: Multipart,
+) -> Result<Json<UserappImportProjectReply>, AppError> {
+    let mut app_id = None;
+    let mut user_id = None;
+    let mut custom_target_dir = None;
+    let mut data = None;
+    let mut file_name = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::validation(format!("multipart parse: {e}")))?
+    {
+        match field.name().unwrap_or("") {
+            "app_id" => app_id = Some(text_field(field).await?),
+            "user_id" => user_id = Some(text_field(field).await?),
+            "custom_target_dir" => custom_target_dir = Some(text_field(field).await?),
+            "file" => {
+                file_name = field.file_name().map(|s| s.to_string());
+                data = Some(
+                    file_field(
+                        field,
+                        state.fs.config.upload_max_file_size_bytes,
+                        &state.fs.config.upload_temp_dir(),
+                    )
+                    .await?,
+                );
+            }
+            _ => {}
+        }
+    }
+    let app_id = require_app_field(app_id, "app_id")?;
+    let _workspace_activity = state
+        .build_tasks
+        .workspace_activity(&app_id)
+        .await
+        .read_owned()
+        .await;
+    let user_id = require_app_field(user_id, "user_id")?;
+    let data: TemporaryFile = data.ok_or_else(|| AppError::validation("file is required"))?;
+    validate_zip_ext(file_name.as_deref())?;
+    let ws = resolve_userapp_dev(&app_id, custom_target_dir.as_deref(), &state.fs.config)?;
+    let target = import_project_core(ws, data).await?;
+    Ok(Json(UserappImportProjectReply {
+        success: true,
+        message: "Project imported successfully".into(),
+        user_id,
+        app_id,
+        target_dir: target,
+    }))
+}
+
+/// 预览 URL 追加 custom_target_dir 后缀（list/search 条目统一处理）。
+fn append_proxy_url_suffix(files: &mut [UserappFileEntry], custom_target_dir: Option<&str>) {
+    let Some(ct) = trimmed_non_empty(custom_target_dir) else {
+        return;
+    };
+    let suffix = format!(
+        "?custom_target_dir={}",
+        code_service::encode_uri_component(ct)
+    );
+    for f in files.iter_mut() {
+        if let Some(u) = f.file_proxy_url.as_mut() {
+            u.push_str(&suffix);
+        }
+    }
+}
+
+/// trim 后非空才返回（custom_target_dir 的 URL 后缀语义）。
+fn trimmed_non_empty(s: Option<&str>) -> Option<&str> {
+    s.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// multipart 提取后必填字段校验 (空/缺失 → 400, 错误消息带字段名便于定位)。
+pub(crate) fn require_app_field(value: Option<String>, field: &str) -> Result<String, AppError> {
+    value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::validation(format!("{field} is required (missing or blank)")))
+}
+
+/// 测试夹具（handlers 域共享）：userapp AppState 构造。
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use std::sync::Arc;
+
+    use crate::UserAppState;
+    use crate::service::userapp::tasks::BuildTaskStore;
+    use file_server::{
+        BuildManager, Config, DevServerManager, LocalWorkspaceResolver, LogCacheManager,
+        SkillDownloader, WorkspaceResolver,
+    };
+
+    /// userapp 版 make_state: `userapp_workspace_dir` 指向 tempdir (resolve_userapp_dev 的根)。
+    pub(crate) fn make_state(userapp_root: std::path::PathBuf) -> UserAppState {
+        let config = Arc::new(Config {
+            userapp_workspace_dir: userapp_root,
+            ..Config::default()
+        });
+        let resolver: Arc<dyn WorkspaceResolver> = Arc::new(LocalWorkspaceResolver::new(
+            config.project_source_dir.clone(),
+            config.computer_workspace_dir.clone(),
+        ));
+        let fs = file_server::AppState {
+            resolver,
+            dev_server: Arc::new(DevServerManager::new(config.clone())),
+            build_manager: Arc::new(BuildManager::new(config.max_build_concurrency)),
+            log_cache: Arc::new(LogCacheManager::new(&config)),
+            skill_downloader: Arc::new(
+                SkillDownloader::new(&config).expect("construct skill downloader"),
+            ),
+            // userapp 沙箱形态无 Custom Page 预览协调（None=现状本机行为）
+            preview: None,
+            config,
+            started_at: std::time::Instant::now(),
+        };
+        UserAppState {
+            fs,
+            build_tasks: Arc::new(BuildTaskStore::new()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::Path;
+    use serde_json::{Value, json};
+
+    use crate::extract::AppJson;
+
+    use super::tests_support::make_state;
+
+    /// typed 回复 → wire JSON（测试断言锁 wire 形态, 与序列化产物一致）。
+    fn wire<T: serde::Serialize>(reply: &T) -> Value {
+        serde_json::to_value(reply).expect("serialize reply")
+    }
+
+    /// 经公共 Writer API 构造 TemporaryFile (与 multipart file_field 同路径), 内容为单层 zip。
+    async fn make_temp_zip(entries: &[(&str, &str)], parent: &std::path::Path) -> TemporaryFile {
+        use std::io::Write;
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default();
+        for (name, content) in entries {
+            zw.start_file(name.to_string(), opts).unwrap();
+            zw.write_all(content.as_bytes()).unwrap();
+        }
+        let bytes = zw.finish().unwrap().into_inner();
+        let mut writer = file_server::service::temp_file::TemporaryFileWriter::create(
+            parent,
+            "test-zip-",
+            u64::MAX,
+        )
+        .await
+        .expect("create temp writer");
+        writer
+            .write(&bytes::Bytes::from(bytes))
+            .await
+            .expect("write zip bytes");
+        writer.finish().await.expect("finish temp file")
+    }
+
+    /// 闭环铁证: init-project-template 与 get-file-list / detect_project 读同一棵开发卷。
+    #[tokio::test]
+    async fn init_file_list_detect_share_dev_volume() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().to_path_buf());
+
+        // 1. init: 定位 = resolve_userapp_dev (与镜像壳一致), 模板含 react 项目
+        let data = make_temp_zip(
+            &[
+                (
+                    "demo-app/package.json",
+                    r#"{"name":"demo","scripts":{"dev":"vite"}}"#,
+                ),
+                ("demo-app/src/main.tsx", "export {}\n"),
+            ],
+            &tmp.path().join("zips"),
+        )
+        .await;
+        let ws = resolve_userapp_dev("app-1", None, &state.fs.config).unwrap();
+        file_server::ops::workspace::init_project_template_core(&state.fs, ws, data, false)
+            .await
+            .expect("init template");
+
+        // 2. get-file-list (镜像壳 Query handler) 应看到模板文件
+        let q = Query(UserappFileListQuery {
+            app_id: "app-1".into(),
+            proxy_path: None,
+            custom_target_dir: None,
+            relative_path: None,
+            recursive: Some("false".into()),
+            depth: None,
+            file_type: Some("dir".into()),
+            limit: Some("1".into()),
+        });
+        let res = get_file_list(State(state.clone()), q)
+            .await
+            .expect("list ok");
+        let payload = wire(&res.0);
+        let names: Vec<&str> = payload["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"demo-app"), "names={names:?}");
+        assert_eq!(wire(&res.0)["type"], "dir");
+        assert_eq!(wire(&res.0)["limit"], 1);
+
+        // 3. detect_project ({app_id}/{app_stage} 新形态) 应在开发卷里找到项目
+        let reply = super::super::userapp::detect_project(
+            State(state),
+            Path(("app-1".into(), "dev".into())),
+            AppJson(crate::models::ProjectChainBody {
+                project_dir: "demo-app".into(),
+            }),
+        )
+        .await;
+        let crate::handlers::userapp::UserAppReply::Ok(data) = reply else {
+            panic!("detect should succeed");
+        };
+        assert!(!data.detection.detected_type.is_empty());
+        assert!(data.detection.manifest.contains("schema_version = 1"));
+    }
+
+    /// generate-file (Json 壳) → resolve-file (Query 壳) 往返, 落点在开发卷。
+    #[tokio::test]
+    async fn generate_then_resolve_roundtrip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().to_path_buf());
+        generate_file(
+            State(state.clone()),
+            Json(UserappGenerateFileBody {
+                app_id: "app-2".into(),
+                file_name: "src/a.txt".into(),
+                content: Some("hi".into()),
+                custom_target_dir: None,
+            }),
+        )
+        .await
+        .expect("generate ok");
+        // 物理落点断言: 开发卷 {root}/{app_id}/src/a.txt
+        assert_eq!(
+            std::fs::read(tmp.path().join("app-2").join("src").join("a.txt")).unwrap(),
+            b"hi"
+        );
+        let res = resolve_file(
+            State(state),
+            Query(UserappResolveFileQuery {
+                app_id: "app-2".into(),
+                proxy_path: Some("/proxy".into()),
+                custom_target_dir: None,
+                file_path: "src/a.txt".into(),
+            }),
+        )
+        .await
+        .expect("resolve ok");
+        assert_eq!(wire(&res.0)["exists"], serde_json::json!(true));
+        assert_eq!(wire(&res.0)["file_proxy_url"], "/proxy/src/a.txt");
+    }
+
+    /// files-update (Json 壳) 写入开发卷 + 响应回显 appId。
+    #[tokio::test]
+    async fn files_update_writes_into_dev_volume() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().to_path_buf());
+        let res = files_update(
+            State(state),
+            Json(UserappFilesUpdateBody {
+                app_id: "app-3".into(),
+                files: vec![crate::models::UserappFileOp {
+                    operation: "create".into(),
+                    name: "pkg.json".into(),
+                    is_dir: None,
+                    contents: Some("{}".into()),
+                    rename_from: None,
+                }],
+                custom_target_dir: None,
+            }),
+        )
+        .await
+        .expect("update ok");
+        assert_eq!(wire(&res.0)["success"], serde_json::json!(true));
+        assert_eq!(wire(&res.0)["app_id"], "app-3");
+        assert_eq!(
+            std::fs::read(tmp.path().join("app-3").join("pkg.json")).unwrap(),
+            b"{}"
+        );
+    }
+
+    #[tokio::test]
+    async fn files_update_waits_for_workspace_reset_to_finish() {
+        use futures_util::FutureExt as _;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().to_path_buf());
+        let reset = state
+            .build_tasks
+            .workspace_activity("app-reset")
+            .await
+            .write_owned()
+            .await;
+        let update = files_update(
+            State(state),
+            Json(UserappFilesUpdateBody {
+                app_id: "app-reset".into(),
+                files: vec![crate::models::UserappFileOp {
+                    operation: "create".into(),
+                    name: "after-reset.txt".into(),
+                    is_dir: None,
+                    contents: Some("new content".into()),
+                    rename_from: None,
+                }],
+                custom_target_dir: None,
+            }),
+        );
+        tokio::pin!(update);
+        assert!(
+            update.as_mut().now_or_never().is_none(),
+            "write must wait for reset"
+        );
+        let path = tmp.path().join("app-reset/after-reset.txt");
+        assert!(
+            !path.exists(),
+            "no workspace write before reset releases its lease"
+        );
+        drop(reset);
+        tokio::time::timeout(std::time::Duration::from_secs(2), update)
+            .await
+            .expect("write deadline")
+            .expect("write after reset");
+        assert_eq!(tokio::fs::read(path).await.expect("file"), b"new content");
+    }
+
+    /// resolve_userapp_dev: customTargetDir 信任覆盖 + identifier 路径穿越拒绝。
+    #[test]
+    fn resolve_userapp_dev_semantics() {
+        let config = file_server::Config {
+            userapp_workspace_dir: std::path::PathBuf::from("/data/userapp"),
+            ..file_server::Config::default()
+        };
+        // 常规: {root}/{appId}
+        assert_eq!(
+            resolve_userapp_dev("my-app", None, &config).unwrap(),
+            std::path::PathBuf::from("/data/userapp/my-app")
+        );
+        // customTargetDir 信任 (trim 非空)
+        assert_eq!(
+            resolve_userapp_dev("my-app", Some("  /anywhere  "), &config).unwrap(),
+            std::path::PathBuf::from("/anywhere")
+        );
+        // 空白 customTargetDir 视为未设置
+        assert_eq!(
+            resolve_userapp_dev("my-app", Some("   "), &config).unwrap(),
+            std::path::PathBuf::from("/data/userapp/my-app")
+        );
+        // 路径穿越拒绝
+        assert!(resolve_userapp_dev("../escape", None, &config).is_err());
+    }
+
+    // ── get_file_meta 镜像测试 (对齐 computer 域, snake 键) ──────────────────────
+
+    /// 元数据种子: 开发卷 {root}/{app_id}/ 下 a.txt + sub/(c.txt + .hidden +
+    /// node_modules/) + unix 软链 link→a.txt。
+    async fn seed_meta_volume(userapp_root: &std::path::Path) {
+        let ws = userapp_root.join("app-meta");
+        tokio::fs::create_dir_all(ws.join("sub").join("node_modules"))
+            .await
+            .unwrap();
+        tokio::fs::write(ws.join("a.txt"), "abc").await.unwrap();
+        tokio::fs::write(ws.join("sub").join("c.txt"), "c")
+            .await
+            .unwrap();
+        tokio::fs::write(ws.join("sub").join(".hidden"), "h")
+            .await
+            .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("a.txt", ws.join("link")).unwrap();
+    }
+
+    fn snake_meta_of<'a>(val: &'a Value, path: &str) -> &'a Value {
+        val["metas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["path"].as_str() == Some(path))
+            .unwrap_or_else(|| panic!("meta {path} missing"))
+    }
+
+    /// snake 键镜像 + app_id 定位开发卷 + childCount 口径 (隐藏/排除不计)。
+    #[tokio::test]
+    async fn get_file_meta_mirror_snake_keys_and_visibility() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().to_path_buf());
+        seed_meta_volume(tmp.path()).await;
+        let res = get_file_meta(
+            State(state),
+            Json(UserappFileMetaBody {
+                app_id: "app-meta".into(),
+                file_paths: vec!["a.txt".into(), "sub".into(), "nope.txt".into()],
+                file_meta_max_batch: None,
+                custom_target_dir: None,
+            }),
+        )
+        .await
+        .expect("meta ok");
+        let val = wire(&res.0);
+        assert_eq!(val["success"], json!(true));
+        // 常规文件: snake 键 is_dir/size/extension/mime_type, 无 error 键
+        let f = snake_meta_of(&val, "a.txt");
+        assert_eq!(f["is_dir"], json!(false));
+        assert_eq!(f["size"], json!(3));
+        assert_eq!(f["extension"], json!("txt"));
+        assert_eq!(f["mime_type"], json!("text/plain"));
+        assert!(f["mtime_ms"].as_f64().unwrap() > 0.0);
+        assert!(f.get("error").is_none());
+        // 目录: size/extension/mime_type null; childCount 只计可见 (c.txt,
+        // .hidden 隐藏、node_modules 排除)
+        let d = snake_meta_of(&val, "sub");
+        assert_eq!(d["child_count"], json!(1));
+        assert_eq!(d["size"], json!(null));
+        // 不存在: 该条 error、其余 null, 不影响整批
+        let missing = snake_meta_of(&val, "nope.txt");
+        assert!(missing["error"].as_str().is_some_and(|e| !e.is_empty()));
+        assert_eq!(missing["size"], json!(null));
+    }
+
+    /// 软链: is_link 如实 + link_target 回显 (lstat 不跟随)。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_file_meta_mirror_symlink_link_target() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().to_path_buf());
+        seed_meta_volume(tmp.path()).await;
+        let res = get_file_meta(
+            State(state),
+            Json(UserappFileMetaBody {
+                app_id: "app-meta".into(),
+                file_paths: vec!["link".into()],
+                file_meta_max_batch: None,
+                custom_target_dir: None,
+            }),
+        )
+        .await
+        .expect("meta ok");
+        let payload = wire(&res.0);
+        let l = snake_meta_of(&payload, "link");
+        assert_eq!(l["is_link"], json!(true));
+        assert_eq!(l["link_target"], json!("a.txt"));
+    }
+
+    /// 超批量 → 400 (与 computer 域同款校验)。
+    #[tokio::test]
+    async fn get_file_meta_mirror_rejects_over_limit_batch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = make_state(tmp.path().to_path_buf());
+        let err = get_file_meta(
+            State(state),
+            Json(UserappFileMetaBody {
+                app_id: "app-meta".into(),
+                file_paths: vec!["a".into(), "b".into(), "c".into()],
+                file_meta_max_batch: Some(2),
+                custom_target_dir: None,
+            }),
+        )
+        .await
+        .err()
+        .expect("should reject");
+        assert!(err.to_string().contains("exceeds limit"));
+    }
+}

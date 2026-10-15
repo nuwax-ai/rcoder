@@ -1,0 +1,2260 @@
+//! Detached compute coordination. Admission never waits for a business slot.
+//! Runtime calls retain their physical receipt until their outcome is confirmed.
+use crate::app_state::AppState;
+use anyhow::{Context, Result, anyhow, ensure};
+use futures::FutureExt as _;
+use sha2::{Digest, Sha256};
+use shared_types::*;
+use std::{sync::Arc, time::Duration};
+
+mod builder_start;
+use builder_start::prepare_start_options;
+mod stopped_template;
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct ComputeOperationView {
+    pub operation_id: String,
+    pub app_id: String,
+    pub lifecycle_id: String,
+    /// Operation slot scope: Dev / Prod / Application.
+    pub scope: UserAppOperationScope,
+    /// Compute intent kind: one of stop / restart.
+    pub action: ComputeControlAction,
+    /// Intent state: pending / running / recovery_required / succeeded /
+    /// failed / superseded.
+    pub state: ComputeControlState,
+    pub stage: String,
+    pub revision: i64,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub status_url: String,
+    /// 物理工作负载创建是否已被观察（pod/ensure 有界等待的输出；
+    /// None = 本视图不经该路径，语义不变）。
+    pub creation_observed: Option<bool>,
+}
+impl From<ComputeControlRecord> for ComputeOperationView {
+    fn from(r: ComputeControlRecord) -> Self {
+        Self {
+            status_url: format!("/computer/pod/operations/{}/{}", r.app_id, r.operation_id),
+            operation_id: r.operation_id,
+            app_id: r.app_id,
+            lifecycle_id: r.lifecycle_id,
+            scope: r.scope,
+            action: r.action,
+            state: r.state,
+            stage: r.stage,
+            revision: r.revision,
+            error_code: r.error_code,
+            error_message: r.error_message,
+            creation_observed: None,
+        }
+    }
+}
+
+pub(crate) fn auto_repair_fingerprint(
+    app_id: &str,
+    lifecycle_id: &str,
+    physical_id: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(app_id.as_bytes());
+    digest.update([0]);
+    digest.update(lifecycle_id.as_bytes());
+    digest.update([0]);
+    digest.update(physical_id.as_bytes());
+    hex::encode(digest.finalize())
+}
+
+pub async fn submit(
+    state: &Arc<AppState>,
+    app_id: String,
+    scope: UserAppOperationScope,
+    action: ComputeControlAction,
+    request: UserAppControlRequest,
+) -> Result<ComputeOperationView> {
+    submit_with_image_policy(
+        state,
+        app_id,
+        scope,
+        action,
+        request,
+        action == ComputeControlAction::Restart,
+    )
+    .await
+}
+
+/// Revive an existing stopped compute resource with the current platform image
+/// without entering the ordinary business-operation slot.
+pub async fn submit_physical_start(
+    state: &Arc<AppState>,
+    app_id: String,
+    scope: UserAppOperationScope,
+    request: UserAppControlRequest,
+) -> Result<ComputeOperationView> {
+    submit_with_image_policy(
+        state,
+        app_id,
+        scope,
+        ComputeControlAction::Restart,
+        request,
+        true,
+    )
+    .await
+}
+
+/// Restore compute for a file or Source request without replaying old business.
+pub(crate) async fn submit_physical_start_for_access(
+    state: &Arc<AppState>,
+    app_id: String,
+    scope: UserAppOperationScope,
+    request: UserAppControlRequest,
+    mode: BuilderStartupMode,
+) -> Result<ComputeOperationView> {
+    submit_with_startup_mode(
+        state,
+        app_id,
+        scope,
+        ComputeControlAction::Restart,
+        request,
+        false,
+        mode,
+    )
+    .await
+}
+
+async fn submit_with_image_policy(
+    state: &Arc<AppState>,
+    app_id: String,
+    scope: UserAppOperationScope,
+    action: ComputeControlAction,
+    request: UserAppControlRequest,
+    restart_image_roll: bool,
+) -> Result<ComputeOperationView> {
+    submit_with_startup_mode(
+        state,
+        app_id,
+        scope,
+        action,
+        request,
+        restart_image_roll,
+        BuilderStartupMode::PreserveBusinessIntent,
+    )
+    .await
+}
+
+async fn submit_with_startup_mode(
+    state: &Arc<AppState>,
+    app_id: String,
+    scope: UserAppOperationScope,
+    action: ComputeControlAction,
+    request: UserAppControlRequest,
+    restart_image_roll: bool,
+    builder_startup_mode: BuilderStartupMode,
+) -> Result<ComputeOperationView> {
+    validate_identifier(&app_id, "app_id").map_err(anyhow::Error::msg)?;
+    if let Some(request_id) = request.request_id.as_deref() {
+        validate_user_compute_request_id(request_id)
+            .map_err(UserAppStoreError::InvalidOperation)?;
+    }
+    let app = super::adoption::discover_missing_identity(state, &app_id)
+        .await?
+        .ok_or_else(|| {
+            app_manager::AppOperationError::NotFound(format!("Application {app_id} was not found"))
+        })?;
+    if app.state != UserAppLifecycleState::Active {
+        return Err(UserAppStoreError::LifecycleConflict.into());
+    }
+    if request
+        .lifecycle_id
+        .as_ref()
+        .is_some_and(|id| id != &app.lifecycle_id)
+    {
+        return Err(UserAppStoreError::LifecycleConflict.into());
+    }
+    let explicit_request_id = request.request_id.clone();
+    let request_id = request
+        .request_id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    validate_identifier(&request_id, "request_id").map_err(anyhow::Error::msg)?;
+    let original_intent = serde_json::to_vec(&(
+        &app_id,
+        &app.lifecycle_id,
+        scope,
+        action,
+        restart_image_roll,
+    ))?;
+    let encoded_intent = if builder_startup_mode.is_preserve() {
+        original_intent
+    } else {
+        serde_json::to_vec(&(original_intent, builder_startup_mode))?
+    };
+    let fingerprint: String = Sha256::digest(encoded_intent)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    // Own shutdown accounting before admission; HTTP cancellation cannot discard
+    // a committed intent. Pending records are also picked up by discovery.
+    let flight = state.userapp_op_flight.guard()?;
+    let admitted = state
+        .userapp_store
+        .admit_compute_control(&ComputeControlRequest {
+            app_id: app_id.clone(),
+            lifecycle_id: app.lifecycle_id.clone(),
+            scope,
+            action,
+            request_id,
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            request_fingerprint: fingerprint.clone(),
+            restart_image_roll,
+            builder_startup_mode,
+        })
+        .await;
+    let record = match admitted {
+        Ok(record) => record,
+        Err(UserAppStoreError::OperationInProgress(blocker))
+            if blocker.scope == scope
+                && matches!(
+                    blocker.state,
+                    UserAppOperationState::Running | UserAppOperationState::RecoveryRequired
+                ) =>
+        {
+            // A retry of the same physical intent must continue the original
+            // operation. A new operation would discard its unknown remote write
+            // receipt and could race the old container after the HTTP timeout.
+            let previous = state
+                .userapp_store
+                .get_compute_control(&app_id, &blocker.operation_id)
+                .await?
+                .ok_or(UserAppStoreError::NotFound)?;
+            if previous.lifecycle_id != app.lifecycle_id
+                || previous.scope != scope
+                || previous.action != action
+                || previous.request_fingerprint != fingerprint
+                || !(previous.state == ComputeControlState::RecoveryRequired
+                    || previous.can_recover_compute_drain())
+                || explicit_request_id
+                    .as_ref()
+                    .is_some_and(|id| id != &previous.request_id)
+            {
+                return Err(UserAppStoreError::OperationInProgress(blocker).into());
+            }
+            previous
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if record.state == ComputeControlState::RecoveryRequired || record.can_recover_compute_drain() {
+        let state = state.clone();
+        let retry = record.clone();
+        tokio::spawn(async move {
+            let _flight = flight;
+            if let Err(error) =
+                recover(&state, &retry.app_id, &retry.operation_id, retry.revision).await
+            {
+                tracing::warn!(%error, operation_id = %retry.operation_id, "Compute retry still requires inspection");
+            }
+        });
+    } else if record.state == ComputeControlState::Pending {
+        let state = state.clone();
+        let pending = record.clone();
+        tokio::spawn(async move {
+            let _flight = flight;
+            if let Err(error) = execute_pending(&state, pending).await {
+                tracing::error!(%error, "Compute coordinator stopped; inspect durable operation");
+            }
+        });
+    }
+    Ok(record.into())
+}
+
+/// An explicit retry keeps the operation/request identity and cannot discard
+/// unknown runtime effects. Pending discovery closes the HTTP/spawn crash gap.
+pub async fn recover(
+    state: &Arc<AppState>,
+    app_id: &str,
+    operation_id: &str,
+    expected_revision: i64,
+) -> Result<ComputeOperationView> {
+    let current = state
+        .userapp_store
+        .get_compute_control(app_id, operation_id)
+        .await?
+        .ok_or(UserAppStoreError::NotFound)?;
+    if current.revision != expected_revision {
+        return Err(UserAppStoreError::VersionConflict.into());
+    }
+    let flight = state.userapp_op_flight.guard()?;
+    if current.action == ComputeControlAction::Restart
+        && (current.stage == "stopped"
+            || (current.stage == "starting"
+                && (current.has_conditional_compute_write()
+                    || builder_start::missing_creation(&current))))
+    {
+        let worker = current.clone();
+        let state = state.clone();
+        tokio::spawn(async move {
+            let _flight = flight;
+            if let Err(error) = resume_restart_start(&state, &worker).await {
+                tracing::warn!(%error, "Restart continuation requires inspection");
+            }
+        });
+        return Ok(current.into());
+    }
+    if matches!(
+        (current.action, current.stage.as_str()),
+        (ComputeControlAction::Stop, "stopped" | "stopping")
+            | (ComputeControlAction::Restart, "verifying" | "starting")
+    ) || (current.scope == UserAppOperationScope::Prod
+        && matches!(
+            (current.action, current.stage.as_str()),
+            (ComputeControlAction::Stop, "stopping") | (ComputeControlAction::Restart, "starting")
+        ))
+    {
+        let completed = recover_confirmed(state, &current).await?;
+        drop(flight);
+        return Ok(completed.into());
+    }
+    if !current.can_recover_compute_drain() {
+        return Err(UserAppStoreError::InvalidOperation(
+            "Compute stage requires physical result inspection".into(),
+        )
+        .into());
+    }
+    let worker = current.clone();
+    let state = state.clone();
+    tokio::spawn(async move {
+        let _flight = flight;
+        if let Err(error) =
+            super::compute_drain_recovery::recover_and_execute(&state, &worker).await
+        {
+            tracing::warn!(%error, "Compute early recovery requires further inspection");
+        }
+    });
+    Ok(current.into())
+}
+
+/// Recover a durable completion boundary or an exact atomic remote stop receipt.
+/// This path contains no start/stop/redeploy calls, even after a lost response.
+pub(crate) async fn recover_confirmed(
+    state: &AppState,
+    record: &ComputeControlRecord,
+) -> Result<ComputeControlRecord> {
+    let observed_stop = record.action == ComputeControlAction::Stop && record.stage == "stopping";
+    let observed_restart =
+        record.action == ComputeControlAction::Restart && record.stage == "starting";
+    let mut observation_only = false;
+    if observed_restart || observed_stop {
+        let context = record.execution_context().map_err(anyhow::Error::msg)?;
+        let receipt = record
+            .lease
+            .as_ref()
+            .context("Compute completion recovery lease is missing")?;
+        if !state
+            .runtime()
+            .validate_app_operation_receipt(&context, receipt)
+            .await?
+        {
+            require_original_lease_identity(state, &context, receipt).await?;
+            observation_only = true;
+        }
+    }
+    if observed_stop {
+        let context = record.execution_context().map_err(anyhow::Error::msg)?;
+        let observed = ComputeStopObservation::from_checkpoint(&record.checkpoint, record.scope)?;
+        ensure!(
+            observed.context() == &context,
+            "Stop recovery context differs"
+        );
+        let confirmed = match observed {
+            ComputeStopObservation::Orphan(orphan) => {
+                orphan.validate().map_err(anyhow::Error::msg)?;
+                state
+                    .runtime()
+                    .confirm_builder_orphan_stopped(&orphan)
+                    .await?
+            }
+            ComputeStopObservation::Absent(_) => match record.scope {
+                UserAppOperationScope::Dev => state
+                    .runtime()
+                    .capture_builder_control(&context)
+                    .await?
+                    .workload
+                    .is_none(),
+                UserAppOperationScope::Prod => state.runtime().app_compute_absent(&context).await?,
+                UserAppOperationScope::Application => false,
+            },
+            ComputeStopObservation::Builder(target) => {
+                state
+                    .runtime()
+                    .reconcile_builder_compute_stop(&target)
+                    .await?
+            }
+            ComputeStopObservation::Application(target) => {
+                state.runtime().reconcile_app_compute_stop(&target).await?
+            }
+        };
+        ensure!(
+            confirmed,
+            "Original stop has no confirmed atomic runtime receipt; ownership retained"
+        );
+    }
+    let mut observed_builder = None;
+    let mut observed_checkpoint = None;
+    if observed_restart && record.scope == UserAppOperationScope::Dev {
+        let target: BuilderControlTarget =
+            BuilderControlTarget::from_observation_checkpoint(&record.checkpoint)?;
+        ensure!(
+            target.context == record.execution_context().map_err(anyhow::Error::msg)?,
+            "Builder start recovery context differs"
+        );
+        let observe = || async {
+            if observation_only && target.workload.is_none() {
+                state
+                    .runtime()
+                    .observe_completed_builder_creation(
+                        &target,
+                        record
+                            .lease
+                            .as_ref()
+                            .context("Original builder receipt missing")?,
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)
+            } else {
+                state
+                    .runtime()
+                    .reconcile_builder_compute_start(&target)
+                    .await
+                    .map_err(anyhow::Error::from)
+            }
+        };
+        let info = observe().await?.ok_or_else(|| {
+            anyhow!("Original builder startup receipt or running container is not confirmed")
+        })?;
+        let repeated = observe()
+            .await?
+            .context("Builder startup identity or container state changed during recovery")?;
+        ensure!(
+            info.container_id == repeated.container_id
+                && info.workload_uid == repeated.workload_uid,
+            "Builder completion changed during observation"
+        );
+        if observation_only {
+            ensure!(
+                target
+                    .workload
+                    .as_ref()
+                    .is_none_or(|workload| info.workload_uid.as_ref() == Some(&workload.uid)),
+                "Observed builder differs from the original retained controller"
+            );
+            if target.workload.is_none() {
+                observed_checkpoint = Some(
+                    confirmed_missing_builder_checkpoint(state, &target, &record.checkpoint, &info)
+                        .await?,
+                );
+            }
+            observed_builder = Some(info);
+        }
+        // Runtime observation must not refresh a cache before the terminal CAS.
+    }
+    if record.action == ComputeControlAction::Restart && record.scope == UserAppOperationScope::Prod
+    {
+        let context = record.execution_context().map_err(anyhow::Error::msg)?;
+        let expected: UserAppMutationTarget = serde_json::from_value(record.checkpoint.clone())?;
+        ensure!(
+            expected.context == context,
+            "Compute recovery context differs"
+        );
+        if observed_restart {
+            ensure!(
+                state
+                    .runtime()
+                    .reconcile_app_compute_start(&expected)
+                    .await?,
+                "Original start receipt or current running container is not confirmed"
+            );
+        }
+        let before = super::app_adoption::capture_bound_app_target(state, &context).await?;
+        ensure!(
+            before.resource.uid == expected.resource.uid,
+            "Production identity changed during recovery"
+        );
+        ensure!(
+            state
+                .runtime()
+                .reconcile_app_compute_start(&expected)
+                .await?,
+            "Production container has not reached the captured running generation"
+        );
+        let after = super::app_adoption::capture_bound_app_target(state, &context).await?;
+        ensure!(
+            after.resource.uid == before.resource.uid
+                && after.resource.name == before.resource.name,
+            "Production workload changed while reading container state"
+        );
+        if observed_restart {
+            ensure!(
+                state
+                    .runtime()
+                    .reconcile_app_compute_start(&expected)
+                    .await?,
+                "Original start receipt changed during container observation"
+            );
+        }
+    }
+    let completed = if observation_only {
+        let context = record.execution_context().map_err(anyhow::Error::msg)?;
+        require_original_lease_identity(
+            state,
+            &context,
+            record
+                .lease
+                .as_ref()
+                .context("Original completion receipt disappeared")?,
+        )
+        .await?;
+        if let Some(checkpoint) = observed_checkpoint {
+            let target: BuilderControlTarget =
+                BuilderControlTarget::from_observation_checkpoint(&checkpoint)?;
+            let volumes = builder_start::retained_volumes(&checkpoint)?;
+            state
+                .userapp_store
+                .finalize_observed_builder_creation(record, &target, &volumes)
+                .await?
+        } else if observed_stop {
+            state
+                .userapp_store
+                .finalize_observed_compute_stop(record)
+                .await?
+        } else {
+            state
+                .userapp_store
+                .finalize_observed_compute_restart(record)
+                .await?
+        }
+    } else if observed_stop {
+        state
+            .userapp_store
+            .finalize_observed_compute_stop(record)
+            .await?
+    } else if observed_restart {
+        state
+            .userapp_store
+            .finalize_observed_compute_restart(record)
+            .await?
+    } else {
+        state
+            .userapp_store
+            .finalize_confirmed_compute(record)
+            .await?
+    };
+    if let Some(info) = observed_builder {
+        super::register_builder(state, &completed.app_id, &info)?;
+    }
+    // A release failure leaves terminal + receipt for the ordinary cleanup scan.
+    // It must not turn the confirmed runtime outcome back into uncertainty.
+    if let Some(receipt) = &completed.lease {
+        let context = completed.execution_context().map_err(anyhow::Error::msg)?;
+        match state
+            .runtime()
+            .release_app_operation_receipt(&context, receipt)
+            .await
+        {
+            Ok(()) => {
+                let identity = ComputeExecutorIdentity {
+                    app_id: completed.app_id.clone(),
+                    lifecycle_id: completed.lifecycle_id.clone(),
+                    scope: completed.scope,
+                    operation_id: completed.operation_id.clone(),
+                    generation: completed.generation,
+                    executor_id: context.executor_id,
+                };
+                if let Err(error) = state
+                    .userapp_store
+                    .forget_compute_lease(&identity, receipt)
+                    .await
+                {
+                    tracing::warn!(%error, operation_id = %completed.operation_id, "Terminal compute receipt awaits cleanup");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, operation_id = %completed.operation_id, "Terminal compute lease awaits cleanup")
+            }
+        }
+    }
+    Ok(completed)
+}
+
+async fn require_original_lease_identity(
+    state: &AppState,
+    context: &UserAppExecutionContext,
+    receipt: &UserAppOperationLeaseReceipt,
+) -> Result<()> {
+    use container_runtime_api::AppOperationLeaseObservation;
+    ensure!(
+        matches!(
+            state
+                .runtime()
+                .observe_app_operation_lease(context, receipt)
+                .await?,
+            AppOperationLeaseObservation::Held
+                | AppOperationLeaseObservation::ExpiredOriginalIdentity
+        ),
+        "Original compute lease identity is not confirmed for result observation"
+    );
+    Ok(())
+}
+
+async fn progress(
+    state: &AppState,
+    record: &mut ComputeControlRecord,
+    identity: &ComputeExecutorIdentity,
+    stage: ComputeControlStage,
+    checkpoint: serde_json::Value,
+) -> Result<()> {
+    *record = state
+        .userapp_store
+        .advance_compute_control(&ComputeControlProgress {
+            identity: identity.clone(),
+            expected_revision: record.revision,
+            state: if stage == ComputeControlStage::Completed {
+                ComputeControlState::Succeeded
+            } else {
+                ComputeControlState::Running
+            },
+            stage,
+            checkpoint,
+            error_code: None,
+            error_message: None,
+        })
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn execute_pending(state: &AppState, pending: ComputeControlRecord) -> Result<()> {
+    let identity = ComputeExecutorIdentity {
+        app_id: pending.app_id.clone(),
+        lifecycle_id: pending.lifecycle_id.clone(),
+        operation_id: pending.operation_id.clone(),
+        generation: pending.generation,
+        scope: pending.scope,
+        executor_id: uuid::Uuid::new_v4().to_string(),
+    };
+    let mut record = match state
+        .userapp_store
+        .claim_compute_control(&identity, pending.revision)
+        .await
+    {
+        Ok(record) => record,
+        Err(UserAppStoreError::VersionConflict) => return Ok(()), // another replica won
+        Err(error) => return Err(error.into()),
+    };
+    if record
+        .request_id
+        .starts_with(AUTOMATIC_REPAIR_REQUEST_PREFIX)
+    {
+        let preflight =
+            async {
+                let context = record.execution_context().map_err(anyhow::Error::msg)?;
+                let target = super::adoption::capture_bound_target(state, &context).await?;
+                let resource = target
+                    .workload
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Automatic repair target disappeared"))?;
+                ensure!(
+                    record.request_fingerprint
+                        == auto_repair_fingerprint(
+                            &record.app_id,
+                            &record.lifecycle_id,
+                            &resource.uid,
+                        ),
+                    "Automatic repair physical target changed",
+                );
+                let missing = state
+                    .runtime()
+                    .missing_builder_published_ports(&target)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!("Automatic repair target is no longer a running Published builder")
+                    })?;
+                ensure!(
+                    !missing.is_empty(),
+                    "Automatic repair target is already healthy"
+                );
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+        if let Err(error) = preflight {
+            state
+                .userapp_store
+                .advance_compute_control(&ComputeControlProgress {
+                    identity,
+                    expected_revision: record.revision,
+                    state: ComputeControlState::Failed,
+                    stage: ComputeControlStage::DrainingPrevious,
+                    checkpoint: serde_json::Value::Null,
+                    error_code: Some(ERR_BACKEND_ERROR.into()),
+                    error_message: Some(format!("Automatic repair preflight: {error:#}")),
+                })
+                .await?;
+            return Ok(());
+        }
+    }
+    let mut stage = ComputeControlStage::DrainingPrevious;
+    let mut settled = true;
+    let result = std::panic::AssertUnwindSafe(execute_claimed(
+        state,
+        &mut record,
+        &identity,
+        &mut stage,
+        &mut settled,
+    ))
+    .catch_unwind()
+    .await
+    .unwrap_or_else(|_| {
+        Err(anyhow!(
+            "Compute execution panicked; inspect its captured runtime stage"
+        ))
+    });
+    if let Err(error) = result {
+        // A superseding Stop owns the head now; this executor cannot rewrite it.
+        if state
+            .userapp_store
+            .check_compute_executor(&identity)
+            .await
+            .is_ok()
+        {
+            let failure = ComputeControlProgress {
+                identity: identity.clone(),
+                expected_revision: record.revision,
+                state: if settled && stage == ComputeControlStage::Stopped {
+                    ComputeControlState::Failed
+                } else {
+                    ComputeControlState::RecoveryRequired
+                },
+                stage,
+                checkpoint: record.checkpoint.clone(),
+                error_code: Some(ERR_BACKEND_ERROR.into()),
+                error_message: Some(format!("{error:#}")),
+            };
+            state
+                .userapp_store
+                .advance_compute_control(&failure)
+                .await
+                .context("Persist compute execution recovery state")?;
+        }
+        if settled
+            && let Some(current) = state
+                .userapp_store
+                .get_compute_control(&identity.app_id, &identity.operation_id)
+                .await?
+            && current.state == ComputeControlState::Superseded
+        {
+            let evidence = if current.stage == "draining_previous" {
+                ComputeControlDrainEvidence::NoMutationSubmitted
+            } else {
+                ComputeControlDrainEvidence::MutationCompleted {
+                    checkpoint: current.checkpoint.clone(),
+                }
+            };
+            let drained = state
+                .userapp_store
+                .acknowledge_compute_drain(&ComputeControlDrainAcknowledgement {
+                    identity: identity.clone(),
+                    expected_revision: current.revision,
+                    evidence,
+                })
+                .await?;
+            if let Some(ref receipt) = drained.lease {
+                state
+                    .runtime()
+                    .release_app_operation_receipt(
+                        &drained.execution_context().map_err(anyhow::Error::msg)?,
+                        receipt,
+                    )
+                    .await?;
+                state
+                    .userapp_store
+                    .forget_compute_lease(&identity, receipt)
+                    .await?;
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub(super) async fn drain_previous_once(
+    state: &AppState,
+    record: &ComputeControlRecord,
+    identity: &ComputeExecutorIdentity,
+) -> Result<bool> {
+    let mut drained = true;
+    for id in &record.interrupted_operations {
+        if let Some(mut old) = state
+            .userapp_store
+            .get_operation(&record.app_id, id)
+            .await?
+        {
+            ensure!(
+                old.lifecycle_id == record.lifecycle_id,
+                "Interrupted business lifecycle differs from compute control"
+            );
+            if !old.state.is_terminal()
+                && userapp_operation_has_drain_evidence(&old)
+                && !old.kind.ends_lifecycle()
+            {
+                match state
+                    .userapp_store
+                    .finalize_compute_interrupted_operation(identity, &old)
+                    .await
+                {
+                    Ok(finalized) => old = finalized,
+                    Err(UserAppStoreError::VersionConflict) => {
+                        drained = false;
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            // Do not depend on another scanner slot to release terminal
+            // leases: all recovery slots may themselves be draining controls.
+            if old.state.is_terminal()
+                && let Some(binding) = state
+                    .userapp_store
+                    .get_operation_lease(&record.app_id, id)
+                    .await?
+            {
+                state
+                    .runtime()
+                    .release_app_operation_receipt(&binding.context, &binding.receipt)
+                    .await?;
+                state.userapp_store.forget_operation_lease(&binding).await?;
+            }
+            drained &= old.state.is_terminal()
+                && state
+                    .userapp_store
+                    .get_operation_lease(&record.app_id, id)
+                    .await?
+                    .is_none();
+        } else if let Some(mut old) = state
+            .userapp_store
+            .get_compute_control(&record.app_id, id)
+            .await?
+        {
+            ensure!(
+                old.lifecycle_id == record.lifecycle_id,
+                "Interrupted compute lifecycle differs from current control"
+            );
+            if old.state == ComputeControlState::Superseded
+                && old.action == ComputeControlAction::Restart
+                && (matches!(old.stage.as_str(), "stopped" | "verifying")
+                    || (matches!(old.stage.as_str(), "starting" | "stopping")
+                        && (old.has_conditional_compute_write()
+                            || old.has_docker_compute_target())))
+                && old.lease.is_some()
+            {
+                match reconcile_superseded(state, &old).await {
+                    Ok(closed) => old = closed,
+                    Err(error)
+                        if matches!(
+                            error.downcast_ref::<UserAppStoreError>(),
+                            Some(UserAppStoreError::VersionConflict)
+                        ) =>
+                    {
+                        drained = false;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if matches!(
+                old.state,
+                ComputeControlState::Succeeded | ComputeControlState::Failed
+            ) && let Some(receipt) = old.lease.as_ref()
+            {
+                let context = old.execution_context().map_err(anyhow::Error::msg)?;
+                state
+                    .runtime()
+                    .release_app_operation_receipt(&context, receipt)
+                    .await?;
+                state
+                    .userapp_store
+                    .forget_compute_lease(
+                        &ComputeExecutorIdentity {
+                            app_id: old.app_id.clone(),
+                            lifecycle_id: old.lifecycle_id.clone(),
+                            scope: old.scope,
+                            operation_id: old.operation_id.clone(),
+                            generation: old.generation,
+                            executor_id: context.executor_id,
+                        },
+                        receipt,
+                    )
+                    .await?;
+                old.lease = None;
+            }
+            if !super::compute_drain_recovery::observe_unsubmitted_predecessor(state, &old, record)
+                .await?
+            {
+                drained = false;
+                continue;
+            }
+            drained &= (matches!(
+                old.state,
+                ComputeControlState::Succeeded | ComputeControlState::Failed
+            ) || (old.state == ComputeControlState::Superseded
+                && old.executor_id.is_none()))
+                && old.lease.is_none();
+        } else {
+            return Err(anyhow!("Interrupted operation evidence is missing: {id}"));
+        }
+    }
+    Ok(drained)
+}
+
+async fn execute_claimed(
+    state: &AppState,
+    record: &mut ComputeControlRecord,
+    identity: &ComputeExecutorIdentity,
+    stage: &mut ComputeControlStage,
+    settled: &mut bool,
+) -> Result<()> {
+    // Pending business operations were atomically cancelled by claim. Running
+    // writers must finish their actual calls and leave a terminal receipt.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        state.userapp_store.check_compute_executor(identity).await?;
+        let drained = drain_previous_once(state, record, identity).await?;
+        if drained {
+            break;
+        }
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "Previous execution is not yet reconciled; retain the original operation and physical receipt"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let mut lease =
+        super::compute_drain_recovery::prepare_and_bind(state, record, identity).await?;
+    let receipt = lease.receipt().map_err(anyhow::Error::msg)?;
+    lease
+        .begin_external_mutation()
+        .map_err(anyhow::Error::msg)?;
+    let context = record.execution_context().map_err(anyhow::Error::msg)?;
+    if record.action == ComputeControlAction::Stop
+        && identity.scope == UserAppOperationScope::Dev
+        && let Some(orphan) = super::adoption::capture_bound_orphan_stop(state, &context).await?
+    {
+        let checkpoint = serde_json::to_value(&orphan)?;
+        progress(
+            state,
+            record,
+            identity,
+            ComputeControlStage::Stopping,
+            checkpoint.clone(),
+        )
+        .await?;
+        *stage = ComputeControlStage::Stopping;
+        state.userapp_store.check_compute_executor(identity).await?;
+        *settled = false;
+        state.runtime().stop_builder_orphan(&orphan).await?;
+        *settled = true;
+        progress(
+            state,
+            record,
+            identity,
+            ComputeControlStage::Stopped,
+            checkpoint.clone(),
+        )
+        .await?;
+        *stage = ComputeControlStage::Stopped;
+        crate::userapp_forward::invalidate_probe_cache(&record.app_id);
+        progress(
+            state,
+            record,
+            identity,
+            ComputeControlStage::Completed,
+            checkpoint,
+        )
+        .await?;
+        *stage = ComputeControlStage::Completed;
+        lease
+            .finish_external_mutation()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        state
+            .userapp_store
+            .forget_compute_lease(identity, &receipt)
+            .await?;
+        return Ok(());
+    }
+    let absent = if record.action == ComputeControlAction::Stop {
+        match identity.scope {
+            UserAppOperationScope::Dev => super::adoption::capture_bound_target(state, &context)
+                .await?
+                .workload
+                .is_none(),
+            UserAppOperationScope::Prod => state.runtime().app_compute_absent(&context).await?,
+            UserAppOperationScope::Application => false,
+        }
+    } else {
+        false
+    };
+    if absent {
+        state.userapp_store.check_compute_executor(identity).await?;
+        let evidence = serde_json::to_value(ComputeAbsenceCheckpoint {
+            context,
+            compute_absent: true,
+        })?;
+        // Follow the same durable stage sequence; this branch issues no writes
+        // to compute, never creates a missing container, and leaves volumes alone.
+        for next in [
+            ComputeControlStage::Stopping,
+            ComputeControlStage::Stopped,
+            ComputeControlStage::Completed,
+        ] {
+            progress(state, record, identity, next, evidence.clone()).await?;
+            *stage = next;
+        }
+        lease
+            .finish_external_mutation()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        state
+            .userapp_store
+            .forget_compute_lease(identity, &receipt)
+            .await?;
+        return Ok(());
+    }
+    let mut target = if identity.scope == UserAppOperationScope::Dev {
+        let mut captured = super::adoption::capture_bound_target(state, &context).await?;
+        captured.builder_startup_mode = record
+            .checkpoint
+            .get("builder_startup_mode")
+            .map(|mode| serde_json::from_value(mode.clone()))
+            .transpose()
+            .context("Decode captured builder startup mode")?
+            .unwrap_or_default();
+        if record.action == ComputeControlAction::Restart
+            && (captured.workload.is_none()
+                || captured.builder_startup_mode == BuilderStartupMode::ManagementOnly
+                || record
+                    .checkpoint
+                    .get("restart_image_roll")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false))
+        {
+            // A stopped legacy runtime cannot honor management-only boot.
+            // Freeze the current paired runner once; ordinary running reuse
+            // never enters this path and keeps its actual image/configuration.
+            captured.restart_image = state.runtime().current_builder_image().await?;
+        }
+        freeze_builder_restart_workspace(&mut captured, record.action);
+        builder_compute_checkpoint(
+            state,
+            &captured,
+            record.action == ComputeControlAction::Restart,
+        )
+        .await?
+    } else {
+        let target = super::app_adoption::capture_bound_app_target(state, &context).await?;
+        if record.action == ComputeControlAction::Restart {
+            let mut prepared_target = state.runtime().prepare_app_compute_start(&target).await?;
+            // Freeze the platform-default image into the very first checkpoint:
+            // every later stage (including crash resume) replays this frozen
+            // value instead of re-reading the env.
+            prepared_target.restart_image = if record
+                .checkpoint
+                .get("restart_image_roll")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true)
+            {
+                prod_restart_image()
+            } else {
+                None
+            };
+            let mut prepared = serde_json::to_value(prepared_target)?;
+            if let Some(template) = state.runtime().archive_app_restart(&target).await? {
+                prepared["app_restart_template"] = serde_json::to_value(template)?;
+            }
+            prepared
+        } else {
+            serde_json::to_value(target)?
+        }
+    };
+    if identity.scope == UserAppOperationScope::Dev
+        && record.action == ComputeControlAction::Restart
+    {
+        let captured: BuilderControlTarget = serde_json::from_value(target.clone())?;
+        state.userapp_store.check_compute_executor(identity).await?;
+        if captured.workload.is_some()
+            && let Some(template) = state.runtime().archive_builder_restart(&captured).await?
+        {
+            target["builder_restart_template"] = serde_json::to_value(template)?;
+        }
+    }
+    progress(
+        state,
+        record,
+        identity,
+        ComputeControlStage::Stopping,
+        target.clone(),
+    )
+    .await?;
+    *stage = ComputeControlStage::Stopping;
+    state.userapp_store.check_compute_executor(identity).await?;
+    *settled = false;
+    if identity.scope == UserAppOperationScope::Dev {
+        let target: BuilderControlTarget = serde_json::from_value(target.clone())?;
+        state
+            .runtime()
+            .apply_builder_control(&target, false)
+            .await?;
+    } else {
+        let target: UserAppMutationTarget = serde_json::from_value(target.clone())?;
+        state.runtime().stop_app_target(&target, false).await?;
+        state.runtime().confirm_app_compute_stopped(&target).await?;
+    }
+    *settled = true;
+    progress(
+        state,
+        record,
+        identity,
+        ComputeControlStage::Stopped,
+        target.clone(),
+    )
+    .await?;
+    *stage = ComputeControlStage::Stopped;
+    if identity.scope == UserAppOperationScope::Dev {
+        crate::userapp_forward::invalidate_probe_cache(&record.app_id);
+    }
+    if record.action == ComputeControlAction::Restart {
+        // Scale-down changed resourceVersion. Refresh only the SAME physical UID.
+        let mut fresh = if identity.scope == UserAppOperationScope::Dev {
+            let old: BuilderControlTarget = serde_json::from_value(target.clone())?;
+            let mut fresh = super::adoption::capture_bound_target(state, &context).await?;
+            fresh.restart_image = old.restart_image.clone();
+            fresh.restart_runtime_workspace = old.restart_runtime_workspace.clone();
+            fresh.builder_startup_mode = old.builder_startup_mode;
+            if old.workload.is_none() {
+                ensure!(
+                    fresh.workload.is_none()
+                        && fresh.pod.is_none()
+                        && fresh.resource_binding.is_none(),
+                    "A builder appeared before the original missing-compute startup"
+                );
+            } else if fresh.workload.is_none() {
+                fresh = builder_start::prepare_missing_restart_target(
+                    state.runtime().as_ref(),
+                    &old,
+                    &fresh,
+                    &target,
+                    &receipt,
+                )
+                .await?;
+            } else if old.workload.as_ref().map(|r| &r.uid)
+                != fresh.workload.as_ref().map(|r| &r.uid)
+                || state
+                    .runtime()
+                    .builder_image_replacement_needed(&fresh)
+                    .await?
+            {
+                let template: BuilderRestartTemplate = serde_json::from_value(
+                    target
+                        .get("builder_restart_template")
+                        .context("Original restart template is unavailable")?
+                        .clone(),
+                )?;
+                ensure!(template.source == old, "Restart archive source differs");
+                state.userapp_store.check_compute_executor(identity).await?;
+                *settled = false;
+                fresh = state.runtime().restore_builder_restart(&template).await?;
+                fresh.restart_image = old.restart_image.clone();
+                fresh.restart_runtime_workspace = old.restart_runtime_workspace.clone();
+                fresh.builder_startup_mode = old.builder_startup_mode;
+                *settled = true;
+            }
+            let mut prepared = builder_compute_checkpoint(state, &fresh, true).await?;
+            if fresh.workload.is_none() {
+                builder_start::retain_template_history(&target, &mut prepared)?;
+            } else if let Some(template) = target.get("builder_restart_template") {
+                prepared["builder_restart_template"] = template.clone();
+            }
+            verify_builder_volume_witness(&target, &prepared)?;
+            prepared
+        } else {
+            let prior: UserAppComputeStartTarget = serde_json::from_value(target.clone())?;
+            state.userapp_store.check_compute_executor(identity).await?;
+            *settled = false;
+            let fresh = stopped_app_restart_target(state, &prior, &target).await?;
+            *settled = true;
+            let mut prepared = state.runtime().prepare_app_compute_start(&fresh).await?;
+            prior
+                .verify_same_volumes(&prepared)
+                .map_err(anyhow::Error::msg)?;
+            prepared.restart_image = prior.restart_image.clone();
+            let mut fresh = serde_json::to_value(prepared)?;
+            // Keep the restart archive reachable from every later stage: an
+            // interrupted Starting resume still needs its recovery source.
+            if let Some(template) = target.get("app_restart_template") {
+                fresh["app_restart_template"] = template.clone();
+            }
+            fresh
+        };
+        let builder_options = if identity.scope == UserAppOperationScope::Dev {
+            let captured: BuilderControlTarget = serde_json::from_value(fresh.clone())?;
+            Some(prepare_start_options(state.runtime().as_ref(), &captured, &fresh).await?)
+        } else {
+            None
+        };
+        progress(
+            state,
+            record,
+            identity,
+            ComputeControlStage::Starting,
+            fresh.clone(),
+        )
+        .await?;
+        *stage = ComputeControlStage::Starting;
+        state
+            .app_service
+            .verify_recovered_storage(&record.app_id, identity.scope)
+            .await?;
+        state.userapp_store.check_compute_executor(identity).await?;
+        *settled = false;
+        if identity.scope == UserAppOperationScope::Dev {
+            let target: BuilderControlTarget = serde_json::from_value(fresh.clone())?;
+            let options = builder_options
+                .as_ref()
+                .context("Prepared builder startup options missing")?;
+            let info = builder_start::start_with_options(
+                state.runtime().as_ref(),
+                &target,
+                options,
+                &fresh,
+                &receipt,
+            )
+            .await?
+            .ok_or_else(|| anyhow!("Restart did not return a builder"))?;
+            *settled = true;
+            state.userapp_store.check_compute_executor(identity).await?;
+            if target.workload.is_none() {
+                fresh = confirmed_missing_builder_checkpoint(state, &target, &fresh, &info).await?;
+            }
+            super::register_builder(state, &record.app_id, &info)?;
+        } else {
+            state
+                .runtime()
+                .start_app_compute(&serde_json::from_value::<UserAppComputeStartTarget>(
+                    fresh.clone(),
+                )?)
+                .await?;
+        }
+        *settled = true;
+        progress(
+            state,
+            record,
+            identity,
+            ComputeControlStage::Verifying,
+            fresh,
+        )
+        .await?;
+        *stage = ComputeControlStage::Verifying;
+        if identity.scope == UserAppOperationScope::Prod {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+            loop {
+                state.userapp_store.check_compute_executor(identity).await?;
+                let expected: UserAppMutationTarget =
+                    serde_json::from_value(record.checkpoint.clone())?;
+                let actual = super::app_adoption::capture_bound_app_target(state, &context).await?;
+                ensure!(
+                    actual.resource.uid == expected.resource.uid,
+                    "Production identity changed during verification"
+                );
+                if state
+                    .runtime()
+                    .reconcile_app_compute_start(&expected)
+                    .await?
+                {
+                    // Status observations and controller reconciliation are not
+                    // atomic. Recheck the workload UID, then its compute receipt.
+                    let after =
+                        super::app_adoption::capture_bound_app_target(state, &context).await?;
+                    ensure!(
+                        after.resource.uid == actual.resource.uid
+                            && after.resource.name == actual.resource.name,
+                        "Production workload changed while reading restart state"
+                    );
+                    ensure!(
+                        state
+                            .runtime()
+                            .reconcile_app_compute_start(&expected)
+                            .await?,
+                        "Production compute start receipt changed during verification"
+                    );
+                    state.userapp_store.check_compute_executor(identity).await?;
+                    break;
+                }
+                ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "Production container did not reach the captured running generation"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+    progress(
+        state,
+        record,
+        identity,
+        ComputeControlStage::Completed,
+        record.checkpoint.clone(),
+    )
+    .await?;
+    lease
+        .finish_external_mutation()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    state
+        .userapp_store
+        .forget_compute_lease(identity, &receipt)
+        .await?;
+    Ok(())
+}
+
+/// Restart-path platform image resolution: a missing or blank env degrades to
+/// `None` (plain restart) with a warning — restart availability must not brick
+/// on deployment config gaps (create/update keep their fail-fast contract).
+fn prod_restart_image() -> Option<String> {
+    let resolved = std::env::var("RCODER_RUNTIME_IMAGE_DIGEST")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if resolved.is_none() {
+        tracing::warn!(
+            "RCODER_RUNTIME_IMAGE_DIGEST missing/blank: compute restart keeps the current image"
+        );
+    }
+    resolved
+}
+
+/// Recover only from the durable Stopped boundary. Absence is structured;
+/// authorization and connectivity failures must never become permission to create.
+async fn stopped_app_restart_target(
+    state: &AppState,
+    prior: &UserAppComputeStartTarget,
+    checkpoint: &serde_json::Value,
+) -> Result<UserAppMutationTarget> {
+    if let Some(replacement) = state.runtime().replace_stopped_app_image(prior).await? {
+        return Ok(replacement);
+    }
+    let captured =
+        super::app_adoption::capture_bound_app_target(state, &prior.target.context).await;
+    resolve_stopped_app_restart(state.runtime().as_ref(), prior, checkpoint, captured).await
+}
+
+async fn resolve_stopped_app_restart<
+    R: container_runtime_api::UserAppDeploymentRuntime + ?Sized,
+>(
+    runtime: &R,
+    prior: &UserAppComputeStartTarget,
+    checkpoint: &serde_json::Value,
+    captured: Result<UserAppMutationTarget>,
+) -> Result<UserAppMutationTarget> {
+    match captured {
+        Ok(current) if current.resource.uid == prior.target.resource.uid => {
+            ensure!(
+                runtime.reconcile_app_compute_stop(&prior.target).await?,
+                "Original stopped boundary is not confirmed"
+            );
+            return Ok(current);
+        }
+        Ok(_) => {} // restore validates the archive marker of a previous replacement.
+        Err(error)
+            if matches!(
+                error.downcast_ref::<container_runtime_api::ContainerRuntimeError>(),
+                Some(container_runtime_api::ContainerRuntimeError::ContainerNotFound(_))
+            ) => {}
+        Err(error) => return Err(error),
+    }
+    let template: AppRestartTemplate = serde_json::from_value(
+        checkpoint
+            .get("app_restart_template")
+            .context("Original restart archive is unavailable; redeploy or adopt explicitly")?
+            .clone(),
+    )?;
+    ensure!(
+        template.source == prior.target,
+        "Restart archive source differs"
+    );
+    runtime
+        .restore_app_restart(&template)
+        .await
+        .map_err(Into::into)
+}
+
+/// Continue a proven stopped restart under the same durable lease. A CAS
+/// selects one starter; losing observers never submit the runtime request.
+pub(crate) async fn resume_restart_start(
+    state: &AppState,
+    snapshot: &ComputeControlRecord,
+) -> Result<()> {
+    if snapshot.scope == UserAppOperationScope::Dev {
+        return resume_builder_start(state, snapshot).await;
+    }
+    let context = snapshot.execution_context().map_err(anyhow::Error::msg)?;
+    let receipt = snapshot
+        .lease
+        .as_ref()
+        .context("Restart lease is missing")?;
+    if !state
+        .runtime()
+        .validate_app_operation_receipt(&context, receipt)
+        .await?
+    {
+        recover_confirmed(state, snapshot).await?;
+        return Ok(());
+    }
+    let prior: UserAppComputeStartTarget = serde_json::from_value(snapshot.checkpoint.clone())?;
+    ensure!(
+        prior.target.context == context,
+        "Restart context differs from original capture"
+    );
+    let prepared = if snapshot.stage == "starting" {
+        if state
+            .runtime()
+            .reconcile_app_compute_start(&prior.target)
+            .await?
+        {
+            recover_confirmed(state, snapshot).await?;
+            return Ok(());
+        }
+        state.runtime().prepare_app_compute_start_retry(&prior).await?
+            .context("Original startup is committed but not ready; continue observing the same operation")?
+    } else {
+        ensure!(
+            snapshot.stage == "stopped",
+            "Restart has no durable stopped boundary"
+        );
+        let target = stopped_app_restart_target(state, &prior, &snapshot.checkpoint).await?;
+        let mut prepared = state.runtime().prepare_app_compute_start(&target).await?;
+        prior
+            .verify_same_volumes(&prepared)
+            .map_err(anyhow::Error::msg)?;
+        prepared.restart_image = prior.restart_image.clone();
+        prepared
+    };
+    ensure!(
+        state
+            .runtime()
+            .validate_app_operation_receipt(&context, receipt)
+            .await?,
+        "Restart lease changed before continuation claim"
+    );
+    let record = state
+        .userapp_store
+        .resume_compute_restart_start(snapshot, &prepared.target)
+        .await?;
+    run_restart_continuation(state, record, RestartContinuation::Prod(prepared)).await
+}
+
+enum RestartContinuation {
+    Prod(UserAppComputeStartTarget),
+    Dev(BuilderControlTarget),
+    ObservedMissing(BuilderControlTarget, ContainerBasicInfo),
+    PartialMissing(BuilderControlTarget, Box<BuilderControlTarget>),
+}
+
+async fn run_restart_continuation(
+    state: &AppState,
+    mut record: ComputeControlRecord,
+    prepared: RestartContinuation,
+) -> Result<()> {
+    let context = record.execution_context().map_err(anyhow::Error::msg)?;
+    let mut checkpoint = match &prepared {
+        RestartContinuation::Prod(target) => {
+            let mut value = serde_json::to_value(target)?;
+            // Preserve the restart archive reference through later stages.
+            if let Some(template) = record.checkpoint.get("app_restart_template") {
+                value["app_restart_template"] = template.clone();
+            }
+            value
+        }
+        RestartContinuation::Dev(_)
+        | RestartContinuation::ObservedMissing(_, _)
+        | RestartContinuation::PartialMissing(_, _) => record.checkpoint.clone(),
+    };
+    let identity = ComputeExecutorIdentity {
+        app_id: record.app_id.clone(),
+        lifecycle_id: record.lifecycle_id.clone(),
+        operation_id: record.operation_id.clone(),
+        scope: record.scope,
+        generation: record.generation,
+        executor_id: context.executor_id.clone(),
+    };
+    let mut unknown_write = false;
+    let result: Result<()> = async {
+        state
+            .app_service
+            .verify_recovered_storage(&record.app_id, identity.scope)
+            .await?;
+        state
+            .userapp_store
+            .check_compute_executor(&identity)
+            .await?;
+        match &prepared {
+            RestartContinuation::Prod(target) => {
+                unknown_write = true;
+                state.runtime().start_app_compute(target).await?
+            },
+            RestartContinuation::Dev(target) | RestartContinuation::ObservedMissing(target, _) | RestartContinuation::PartialMissing(target, _) => {
+                let info = if let RestartContinuation::ObservedMissing(_, observed) = &prepared {
+                    observed.clone()
+                } else {
+                    let options = if let RestartContinuation::PartialMissing(_, partial) = &prepared {
+                        let current = capture_missing_partial(state, target, &checkpoint).await?;
+                        ensure!(same_partial_controller(partial, &current),
+                            "Original partial builder changed before continuation dispatch");
+                        // Whole absence is intentionally not required here: only
+                        // the positively owned original partial may finish.
+                        BuilderStartOptions { startup_mode: target.builder_startup_mode, restart_template: None }
+                    } else {
+                        prepare_start_options(state.runtime().as_ref(), target, &checkpoint).await?
+                    };
+                    let receipt = record.lease.as_ref().context("Builder continuation lease missing")?;
+                    unknown_write = true;
+                    builder_start::start_with_options(state.runtime().as_ref(), target, &options, &checkpoint, receipt).await?
+                        .context("Builder continuation did not return a ready instance")?
+                };
+                state.userapp_store.check_compute_executor(&identity).await?;
+                if target.workload.is_none() {
+                    checkpoint = confirmed_missing_builder_checkpoint(state, target, &checkpoint, &info).await?;
+                    if let RestartContinuation::PartialMissing(_, partial) = &prepared {
+                        let actual: BuilderControlTarget = serde_json::from_value(checkpoint.clone())?;
+                        ensure!(same_partial_controller(partial, &actual),
+                            "Original partial builder identity changed while completing creation");
+                    }
+                }
+                unknown_write = false;
+                super::register_builder(state, &record.app_id, &info)?;
+            }
+        }
+        unknown_write = false;
+        progress(
+            state,
+            &mut record,
+            &identity,
+            ComputeControlStage::Verifying,
+            checkpoint,
+        )
+        .await?;
+        // Readiness may still be pending. Persisted Verifying lets the existing
+        // scanner finish later without launching a second startup.
+        recover_confirmed(state, &record).await?;
+        // The restart reached its terminal boundary; the private archive has
+        // no remaining recovery value. Records that crash before this point
+        // stay covered by the scan-based GC instead.
+        if record.action == ComputeControlAction::Restart {
+            let cleanup = match record.scope {
+                UserAppOperationScope::Dev => {
+                    match record.checkpoint.get("builder_restart_template") {
+                        Some(value) => {
+                            match serde_json::from_value::<BuilderRestartTemplate>(value.clone()) {
+                                Ok(template) => Some(state.runtime().cleanup_builder_restart_archive(&template).await),
+                                Err(error) => {
+                                    tracing::warn!(%error, operation_id = %record.operation_id,
+                                        "Completed builder restart retains undecodable historical archive; cleanup was not dispatched");
+                                    None
+                                }
+                            }
+                        }
+                        None => None,
+                    }
+                }
+                UserAppOperationScope::Prod => match record.checkpoint.get("app_restart_template")
+                {
+                    Some(value) => {
+                        let template: AppRestartTemplate =
+                            serde_json::from_value(value.clone()).map_err(|error| {
+                                anyhow::anyhow!("Decode application restart archive: {error}")
+                            })?;
+                        Some(state.runtime().cleanup_app_restart_archive(&template).await)
+                    }
+                    None => None,
+                },
+                UserAppOperationScope::Application => None,
+            };
+            if let Some(result) = cleanup
+                && let Err(error) = result
+            {
+                tracing::warn!(%error, operation_id = %record.operation_id, "Restart archive awaits scan cleanup");
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = &result {
+        if state
+            .userapp_store
+            .check_compute_executor(&identity)
+            .await
+            .is_ok()
+        {
+            state
+                .userapp_store
+                .advance_compute_control(&ComputeControlProgress {
+                    identity: identity.clone(),
+                    expected_revision: record.revision,
+                    state: if !unknown_write && record.stage != "verifying" {
+                        ComputeControlState::Failed
+                    } else {
+                        ComputeControlState::RecoveryRequired
+                    },
+                    stage: if record.stage == "verifying" {
+                        ComputeControlStage::Verifying
+                    } else {
+                        ComputeControlStage::Starting
+                    },
+                    checkpoint: record.checkpoint.clone(),
+                    error_code: Some(ERR_BACKEND_ERROR.into()),
+                    error_message: Some(format!("{error:#}")),
+                })
+                .await?;
+        } else if !unknown_write
+            && let Some(current) = state
+                .userapp_store
+                .get_compute_control(&identity.app_id, &identity.operation_id)
+                .await?
+            && current.state == ComputeControlState::Superseded
+        {
+            state
+                .userapp_store
+                .acknowledge_compute_drain(&ComputeControlDrainAcknowledgement {
+                    identity,
+                    expected_revision: current.revision,
+                    evidence: ComputeControlDrainEvidence::MutationCompleted {
+                        checkpoint: current.checkpoint,
+                    },
+                })
+                .await?;
+        }
+    }
+    result
+}
+
+pub(crate) fn missing_builder_creation(record: &ComputeControlRecord) -> bool {
+    builder_start::missing_creation(record)
+}
+
+/// Close only a superseded execution with a durable boundary or a verified
+/// remote conditional-write fence. The store CAS is shared by scanning and Stop.
+pub(crate) async fn reconcile_superseded(
+    state: &AppState,
+    old: &ComputeControlRecord,
+) -> Result<ComputeControlRecord> {
+    ensure!(
+        old.state == ComputeControlState::Superseded && old.action == ComputeControlAction::Restart,
+        "Compute operation is not a superseded restart"
+    );
+    let context = old.execution_context().map_err(anyhow::Error::msg)?;
+    let evidence = if old.stage == "starting" && missing_builder_creation(old) {
+        let receipt = old
+            .lease
+            .as_ref()
+            .context("Original missing builder lease unavailable")?;
+        ensure!(
+            state
+                .runtime()
+                .validate_app_operation_receipt(&context, receipt)
+                .await?,
+            "Original missing builder lease cannot be verified"
+        );
+        let target: BuilderControlTarget = serde_json::from_value(old.checkpoint.clone())?;
+        // Complete immutable creation receipts prove the multi-step writer has
+        // exited. Readiness is separate: Stop also drains a later absent Pod.
+        ensure!(
+            state
+                .runtime()
+                .builder_compute_write_acknowledged(&target, true)
+                .await?,
+            "Original missing-builder pipeline has no complete acknowledgement"
+        );
+        ComputeControlDrainEvidence::PersistedRuntimeAcknowledgement {
+            checkpoint: old.checkpoint.clone(),
+        }
+    } else if matches!(old.stage.as_str(), "starting" | "stopping")
+        && old.has_docker_compute_target()
+    {
+        let receipt = old
+            .lease
+            .as_ref()
+            .context("Original Docker compute lease missing")?;
+        ensure!(
+            state
+                .runtime()
+                .validate_app_operation_receipt(&context, receipt)
+                .await?,
+            "Original Docker compute lease cannot be verified"
+        );
+        let acknowledged = match old.scope {
+            UserAppOperationScope::Dev => {
+                state
+                    .runtime()
+                    .builder_compute_write_acknowledged(
+                        &serde_json::from_value::<BuilderControlTarget>(old.checkpoint.clone())?,
+                        old.stage == "starting",
+                    )
+                    .await?
+            }
+            UserAppOperationScope::Prod => {
+                state
+                    .runtime()
+                    .app_compute_write_acknowledged(
+                        &serde_json::from_value::<UserAppMutationTarget>(old.checkpoint.clone())?,
+                        old.stage == "starting",
+                    )
+                    .await?
+            }
+            UserAppOperationScope::Application => false,
+        };
+        ensure!(
+            acknowledged,
+            "Superseded Docker write has no durable acknowledgement"
+        );
+        ComputeControlDrainEvidence::PersistedRuntimeAcknowledgement {
+            checkpoint: old.checkpoint.clone(),
+        }
+    } else if matches!(old.stage.as_str(), "starting" | "stopping") {
+        ensure!(
+            old.has_conditional_compute_write(),
+            "Original conditional-write capability missing"
+        );
+        let receipt = old
+            .lease
+            .as_ref()
+            .ok_or_else(|| anyhow!("Original compute lease missing"))?;
+        ensure!(
+            state
+                .runtime()
+                .validate_app_operation_receipt(&context, receipt)
+                .await?,
+            "Original compute lease cannot be verified"
+        );
+        let fenced = if old.scope == UserAppOperationScope::Dev {
+            let target: BuilderControlTarget = serde_json::from_value(old.checkpoint.clone())?;
+            ensure!(target.context == context, "Builder fence context differs");
+            state.runtime().fence_builder_compute_write(&target).await?
+        } else {
+            let captured: UserAppComputeStartTarget =
+                serde_json::from_value(old.checkpoint.clone())?;
+            ensure!(
+                captured.target.context == context,
+                "Startup fence context differs"
+            );
+            if old.stage == "stopping" {
+                state.runtime().fence_app_compute_stop(&captured).await?
+            } else {
+                state.runtime().fence_app_compute_start(&captured).await?
+            }
+        };
+        ensure!(
+            fenced,
+            "Superseded conditional compute write is not yet fenced"
+        );
+        if old.stage == "stopping" {
+            ComputeControlDrainEvidence::ConditionalStopFenced {
+                checkpoint: old.checkpoint.clone(),
+            }
+        } else {
+            ComputeControlDrainEvidence::ConditionalStartupFenced {
+                checkpoint: old.checkpoint.clone(),
+            }
+        }
+    } else {
+        ComputeControlDrainEvidence::PersistedMutationBoundary {
+            checkpoint: old.checkpoint.clone(),
+        }
+    };
+    // Completed boundaries and exact completion acknowledgements need no
+    // new runtime write. Unknown requests still require their original fence;
+    // supersession alone cannot drain an in-flight request.
+    state
+        .userapp_store
+        .acknowledge_compute_drain(&ComputeControlDrainAcknowledgement {
+            identity: ComputeExecutorIdentity {
+                app_id: old.app_id.clone(),
+                lifecycle_id: old.lifecycle_id.clone(),
+                scope: old.scope,
+                operation_id: old.operation_id.clone(),
+                generation: old.generation,
+                executor_id: context.executor_id,
+            },
+            expected_revision: old.revision,
+            evidence,
+        })
+        .await
+        .map_err(Into::into)
+}
+
+async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord) -> Result<()> {
+    let mut continuing = snapshot.clone();
+    let context = snapshot.execution_context().map_err(anyhow::Error::msg)?;
+    let receipt = snapshot
+        .lease
+        .as_ref()
+        .context("Builder continuation lease missing")?;
+    if !state
+        .runtime()
+        .validate_app_operation_receipt(&context, receipt)
+        .await?
+    {
+        recover_confirmed(state, snapshot).await?;
+        return Ok(());
+    }
+    // Result observation needs only the original submitted identity. New
+    // writes still require both the Held lease and the existing strict target.
+    ensure!(
+        snapshot.stage == "stopped"
+            || (snapshot.stage == "starting"
+                && (snapshot.has_conditional_compute_write()
+                    || builder_start::missing_creation(snapshot))),
+        "Builder continuation requires a stopped boundary or conditional-write witness"
+    );
+    let old: BuilderControlTarget = serde_json::from_value(snapshot.checkpoint.clone())?;
+    ensure!(
+        old.context == context,
+        "Builder continuation context differs"
+    );
+
+    if old.workload.is_none() {
+        ensure!(
+            builder_start::missing_creation(snapshot),
+            "Missing builder continuation has no original retained PVC/lease witness"
+        );
+        let prepared = if snapshot.stage == "starting" {
+            if let Some(info) = state
+                .runtime()
+                .reconcile_builder_compute_start(&old)
+                .await?
+            {
+                RestartContinuation::ObservedMissing(old.clone(), info)
+            } else {
+                // A lost accepted POST can be completed only when current actual
+                // compute proves the same original partial creator. None/unknown
+                // grants no fresh creation and never reaches the factory.
+                let retry = state.runtime().prepare_builder_compute_retry(&old).await?
+                    .context("Original missing-builder creation remains unknown; no owned partial exists to resume")?;
+                ensure!(
+                    retry == old,
+                    "Missing builder retry changed its original intent"
+                );
+                let partial = capture_missing_partial(state, &old, &snapshot.checkpoint).await?;
+                RestartContinuation::PartialMissing(old.clone(), Box::new(partial))
+            }
+        } else {
+            let mut current = super::adoption::capture_bound_target(state, &context).await?;
+            current.restart_image = old.restart_image.clone();
+            current.restart_runtime_workspace = old.restart_runtime_workspace.clone();
+            current.builder_startup_mode = old.builder_startup_mode;
+            ensure!(
+                current == old,
+                "Missing builder target changed before continuation"
+            );
+            let prepared = builder_compute_checkpoint(state, &current, true).await?;
+            verify_builder_volume_witness(&snapshot.checkpoint, &prepared)?;
+            RestartContinuation::Dev(old.clone())
+        };
+        ensure!(
+            state
+                .runtime()
+                .validate_app_operation_receipt(&context, receipt)
+                .await?,
+            "Original missing builder lease changed before continuation claim"
+        );
+        let record = state
+            .userapp_store
+            .resume_builder_restart_start(snapshot, &old)
+            .await?;
+        return run_restart_continuation(state, record, prepared).await;
+    }
+    let target = if snapshot.stage == "starting" {
+        if state
+            .runtime()
+            .reconcile_builder_compute_start(&old)
+            .await?
+            .is_some()
+        {
+            recover_confirmed(state, snapshot).await?;
+            return Ok(());
+        }
+        state
+            .runtime()
+            .prepare_builder_compute_retry(&old)
+            .await?
+            .context("Original builder startup is committed but not ready; keep observing")?
+    } else {
+        let mut fresh = super::adoption::capture_bound_target(state, &context).await?;
+        fresh.restart_image = old.restart_image.clone();
+        fresh.restart_runtime_workspace = old.restart_runtime_workspace.clone();
+        fresh.builder_startup_mode = old.builder_startup_mode;
+        if fresh.workload.is_none() {
+            builder_start::prepare_missing_restart_target(
+                state.runtime().as_ref(),
+                &old,
+                &fresh,
+                &snapshot.checkpoint,
+                receipt,
+            )
+            .await?
+        } else if fresh.workload.as_ref().map(|r| &r.uid) != old.workload.as_ref().map(|r| &r.uid)
+            || state
+                .runtime()
+                .builder_image_replacement_needed(&fresh)
+                .await?
+        {
+            let (captured, template) = stopped_template::prepare(
+                state.runtime().as_ref(),
+                state.userapp_store.as_ref(),
+                snapshot,
+                &old,
+                &fresh,
+            )
+            .await?;
+            continuing = captured;
+            // The durable stopped boundary already confirms old compute exited.
+            // Restore only a zero-replica controller; the CAS below must succeed
+            // before any new business instance can start.
+            let mut restored = state.runtime().restore_builder_restart(&template).await?;
+            restored.restart_image = old.restart_image.clone();
+            restored.restart_runtime_workspace = old.restart_runtime_workspace.clone();
+            restored.builder_startup_mode = old.builder_startup_mode;
+            restored
+        } else {
+            ensure!(
+                state.runtime().reconcile_builder_compute_stop(&old).await?,
+                "Original builder stop receipt is not confirmed"
+            );
+            fresh
+        }
+    };
+    state
+        .app_service
+        .verify_recovered_storage(&snapshot.app_id, UserAppOperationScope::Dev)
+        .await?;
+    ensure!(
+        target.pod.is_none(),
+        "Builder Pod appeared before continuation"
+    );
+    ensure!(
+        state
+            .runtime()
+            .validate_app_operation_receipt(&context, receipt)
+            .await?,
+        "Builder lease changed before continuation claim"
+    );
+    let prepared = builder_compute_checkpoint(state, &target, true).await?;
+    verify_builder_volume_witness(&continuing.checkpoint, &prepared)?;
+    let record = state
+        .userapp_store
+        .resume_builder_restart_start(&continuing, &target)
+        .await?;
+    run_restart_continuation(state, record, RestartContinuation::Dev(target)).await
+}
+
+/// Only a captured Kubernetes dev workload receives directory convergence.
+/// Called before the first Stopping checkpoint; retries copy the frozen value.
+fn freeze_builder_restart_workspace(
+    target: &mut BuilderControlTarget,
+    action: ComputeControlAction,
+) {
+    if action == ComputeControlAction::Restart
+        && target
+            .workload
+            .as_ref()
+            .is_some_and(|workload| workload.kind == AppResourceKind::StatefulSet)
+    {
+        target.restart_runtime_workspace =
+            Some(paths::userapp_dev_workspace(&target.context.app_id));
+    }
+}
+
+async fn builder_compute_checkpoint(
+    state: &AppState,
+    target: &BuilderControlTarget,
+    capture_volumes: bool,
+) -> Result<serde_json::Value> {
+    let mut checkpoint = serde_json::to_value(target)?;
+    if target.workload.is_some() && state.runtime().supports_builder_compute_fencing() {
+        checkpoint["builder_compute_single_write"] = serde_json::Value::Bool(true);
+    }
+    if capture_volumes {
+        checkpoint["builder_volumes"] = serde_json::to_value(
+            state
+                .runtime()
+                .capture_builder_compute_volumes(target)
+                .await?,
+        )?;
+    }
+    Ok(checkpoint)
+}
+
+fn same_partial_controller(original: &BuilderControlTarget, actual: &BuilderControlTarget) -> bool {
+    original.context == actual.context
+        && original
+            .workload
+            .as_ref()
+            .map(|resource| (resource.kind, &resource.name, &resource.uid))
+            == actual
+                .workload
+                .as_ref()
+                .map(|resource| (resource.kind, &resource.name, &resource.uid))
+}
+
+async fn capture_missing_partial(
+    state: &AppState,
+    original: &BuilderControlTarget,
+    checkpoint: &serde_json::Value,
+) -> Result<BuilderControlTarget> {
+    let expected = builder_start::retained_volumes(checkpoint)?;
+    let actual = super::adoption::capture_bound_target(state, &original.context).await?;
+    actual.validate().map_err(anyhow::Error::msg)?;
+    ensure!(
+        actual.context == original.context
+            && actual
+                .workload
+                .as_ref()
+                .is_some_and(|workload| workload.kind == AppResourceKind::StatefulSet),
+        "Original missing-builder creation has no current owned partial controller"
+    );
+    ensure!(
+        state
+            .runtime()
+            .capture_builder_compute_volumes(&actual)
+            .await?
+            == expected,
+        "Original partial builder changed the retained workspace PVC"
+    );
+    Ok(actual)
+}
+
+/// Publish the new real controller identity only after the original creation
+/// returned or its completion was physically reconciled, preserving its data.
+async fn confirmed_missing_builder_checkpoint(
+    state: &AppState,
+    original: &BuilderControlTarget,
+    checkpoint: &serde_json::Value,
+    info: &ContainerBasicInfo,
+) -> Result<serde_json::Value> {
+    let expected = builder_start::retained_volumes(checkpoint)?;
+    let mut actual = super::adoption::capture_bound_target(state, &original.context).await?;
+    actual.restart_image = original.restart_image.clone();
+    actual.restart_runtime_workspace = original.restart_runtime_workspace.clone();
+    actual.builder_startup_mode = original.builder_startup_mode;
+    let workload = actual
+        .workload
+        .as_ref()
+        .context("Ensured builder has no actual controller")?;
+    let pod = actual
+        .pod
+        .as_ref()
+        .context("Ensured builder has no actual running Pod")?;
+    ensure!(
+        workload.kind == AppResourceKind::StatefulSet
+            && info.project_id == original.context.app_id
+            && info.workload_uid.as_ref() == Some(&workload.uid)
+            && info.container_id == pod.uid,
+        "Ensured builder differs from the original operation's actual resource"
+    );
+    let mut prepared = builder_compute_checkpoint(state, &actual, true).await?;
+    ensure!(
+        builder_start::retained_volumes(&prepared)? == expected,
+        "Ensured builder changed the original retained workspace PVC"
+    );
+    prepared
+        .as_object_mut()
+        .context("Builder checkpoint is not an object")?
+        .remove("builder_compute_single_write");
+    builder_start::retain_template_history(checkpoint, &mut prepared)?;
+    Ok(prepared)
+}
+
+fn verify_builder_volume_witness(
+    original: &serde_json::Value,
+    prepared: &serde_json::Value,
+) -> Result<()> {
+    let old = original
+        .get("builder_volumes")
+        .context("Original builder volume witness missing; explicit recovery required")?;
+    let new = prepared
+        .get("builder_volumes")
+        .context("Prepared builder volume witness missing")?;
+    let old: Vec<AppResourceIdentity> = serde_json::from_value(old.clone())?;
+    let new: Vec<AppResourceIdentity> = serde_json::from_value(new.clone())?;
+    ensure!(
+        old == new,
+        "Builder workspace volume identity changed during restart"
+    );
+    if prepared
+        .get("builder_compute_single_write")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        ensure!(
+            !old.is_empty(),
+            "Conditional builder restart requires workspace volume evidence"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod restart_resolution_tests {
+    use super::*;
+    use container_runtime_api::{
+        ContainerRuntimeError, ContainerRuntimeResult, UserAppDeploymentRuntime,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Runtime {
+        restores: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl UserAppDeploymentRuntime for Runtime {
+        async fn restore_app_restart(
+            &self,
+            template: &AppRestartTemplate,
+        ) -> ContainerRuntimeResult<UserAppMutationTarget> {
+            self.restores.fetch_add(1, Ordering::SeqCst);
+            let mut target = template.source.clone();
+            target.resource.uid = "replacement".into();
+            Ok(target)
+        }
+        async fn reconcile_app_compute_stop(
+            &self,
+            _: &UserAppMutationTarget,
+        ) -> ContainerRuntimeResult<bool> {
+            Ok(false)
+        }
+    }
+    #[tokio::test]
+    async fn stopped_restart_restores_absence_but_not_unknown_or_unconfirmed_stop() {
+        let runtime = Runtime {
+            restores: AtomicUsize::new(0),
+        };
+        let target = UserAppMutationTarget {
+            context: UserAppExecutionContext {
+                app_id: "review1".into(),
+                lifecycle_id: "life".into(),
+                operation_id: "operation".into(),
+                executor_id: "executor".into(),
+                request_fingerprint: "a".repeat(64),
+            },
+            resource: AppResourceIdentity {
+                kind: AppResourceKind::Deployment,
+                name: "deployment".into(),
+                uid: "original".into(),
+                resource_version: Some("1".into()),
+            },
+        };
+        let prior = UserAppComputeStartTarget {
+            target: target.clone(),
+            compute_start_single_write: true,
+            volumes: vec![],
+            restart_image: None,
+        };
+        let template = AppRestartTemplate {
+            source: target.clone(),
+            archive: AppResourceIdentity {
+                kind: AppResourceKind::Secret,
+                name: "archive".into(),
+                uid: "archiveuid".into(),
+                resource_version: None,
+            },
+            volumes: vec![],
+        };
+        let checkpoint = serde_json::json!({"app_restart_template":template});
+        let restored = resolve_stopped_app_restart(
+            &runtime,
+            &prior,
+            &checkpoint,
+            Err(ContainerRuntimeError::ContainerNotFound("deployment".into()).into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored.resource.uid, "replacement");
+        assert!(
+            resolve_stopped_app_restart(
+                &runtime,
+                &prior,
+                &checkpoint,
+                Err(ContainerRuntimeError::K8sError("forbidden".into()).into())
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            resolve_stopped_app_restart(&runtime, &prior, &checkpoint, Ok(target))
+                .await
+                .is_err()
+        );
+        assert_eq!(runtime.restores.load(Ordering::SeqCst), 1);
+        let mut wrong = checkpoint;
+        wrong["app_restart_template"]["source"]["resource"]["uid"] = serde_json::json!("other");
+        assert!(
+            resolve_stopped_app_restart(
+                &runtime,
+                &prior,
+                &wrong,
+                Err(ContainerRuntimeError::ContainerNotFound("deployment".into()).into())
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(runtime.restores.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod restart_workspace_tests {
+    use super::*;
+
+    #[test]
+    fn only_new_kubernetes_dev_restart_freezes_source_directory() {
+        let mut target = BuilderControlTarget {
+            builder_startup_mode: Default::default(),
+            context: UserAppExecutionContext {
+                app_id: "228".into(),
+                lifecycle_id: "life".into(),
+                operation_id: "restart".into(),
+                executor_id: "worker".into(),
+                request_fingerprint: "a".repeat(64),
+            },
+            resource_binding: None,
+            workload: Some(AppResourceIdentity {
+                kind: AppResourceKind::StatefulSet,
+                name: "builder".into(),
+                uid: "physical".into(),
+                resource_version: Some("1".into()),
+            }),
+            pod: None,
+            restart_image: None,
+            restart_runtime_workspace: None,
+        };
+        freeze_builder_restart_workspace(&mut target, ComputeControlAction::Stop);
+        assert_eq!(target.restart_runtime_workspace, None);
+        freeze_builder_restart_workspace(&mut target, ComputeControlAction::Restart);
+        assert_eq!(
+            target.restart_runtime_workspace.as_deref(),
+            Some("/home/user/228")
+        );
+        let mut docker = target.clone();
+        docker.restart_runtime_workspace = None;
+        docker.workload.as_mut().unwrap().kind = AppResourceKind::Container;
+        freeze_builder_restart_workspace(&mut docker, ComputeControlAction::Restart);
+        assert_eq!(docker.restart_runtime_workspace, None);
+    }
+}
+
+#[cfg(all(test, feature = "userapp-turso"))]
+mod missing_tests;

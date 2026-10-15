@@ -15,11 +15,14 @@ if [ -n "$CREDENTIAL" ]; then
     AUTH_OPT="-c ${CREDENTIAL}"
 fi
 
+# workspace 根（rcoder 创建容器时注入 /home/user/{app_id}；本地直跑回退 /app）
+WS="${USERAPP_WORKSPACE_DIR:-/app}"
+
 # 创建 wrapper 脚本
 WRAPPER="/tmp/ttyd-wrapper.sh"
-cat > "${WRAPPER}" <<'EOF'
+cat > "${WRAPPER}" <<EOF
 #!/bin/bash
-export HOME="/app"
+export HOME="$WS"
 
 # 解析 --cwd 参数
 TARGET_DIR=""
@@ -30,11 +33,11 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# 设定初始工作目录：--cwd 指定则 cd 到该目录，否则 cd /app（非访问控制，bash 后可 cd 任意）
+# 设定初始工作目录：--cwd 指定则 cd 到该目录，否则 cd $WS（非访问控制，bash 后可 cd 任意）
 if [ -n "$TARGET_DIR" ] && [ -d "$TARGET_DIR" ]; then
-    cd "$TARGET_DIR" 2>/dev/null || cd /app 2>/dev/null || true
+    cd "$TARGET_DIR" 2>/dev/null || cd "$WS" 2>/dev/null || true
 else
-    cd /app 2>/dev/null || true
+    cd "$WS" 2>/dev/null || true
 fi
 
 exec bash
@@ -48,6 +51,6 @@ exec ttyd \
     -p "${PORT}" \
     -W \
     -a \
-    -w "/app" \
+    -w "$WS" \
     ${AUTH_OPT} \
     "${WRAPPER}"

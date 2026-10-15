@@ -1,0 +1,244 @@
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import Config, LABEL
+import main
+import manifests
+import snapshot
+import tenant_isolation
+import pingap_runtime_identity
+
+
+class WorkflowTests(unittest.TestCase):
+    def config(self, directory):
+        file = Path(directory) / 'config'
+        file.write_text('REMOTE_K8S_SSH=test-host\nREMOTE_K8S_DIR=/tmp/isolated/project\nREMOTE_K8S_CONTEXT=test\n')
+        with patch.dict(os.environ, {}, clear=True):
+            return Config(file)
+
+    def test_default_namespace_remains_dedicated_without_personal_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(directory)
+            self.assertEqual(config.ns, 'rcoder-e2e-local')
+            file = Path(directory) / 'config'
+            base = file.read_text()
+            for namespace in ('default', 'rcoder-e2e'):
+                file.write_text(base + 'REMOTE_K8S_NAMESPACE=' + namespace + '\n')
+                with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(ValueError, 'dedicated'):
+                    Config(file)
+
+    def paired_identity(self):
+        source = pingap_runtime_identity.source_identity()
+        bases = {key: 'example/' + key.lower() + '@sha256:' + 'b' * 64
+                 for key in pingap_runtime_identity.BASES}
+        class Observed:
+            def ssh(self, args, **kwargs):
+                if args[args.index('--entrypoint') + 1] == 'node':
+                    return 'v22.23.2'
+                return ('pingap ' + source['version'] + ' (' + source['commit'] + ', tls=openssl)'
+                        if args[-1] == '--version' else 'pingap ' + source['version'])
+        return pingap_runtime_identity.inspect_bases(Observed(), bases, source)
+
+    def test_render_isolated_and_retains_storage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            c = self.config(temp)
+            images = {x: 'example/' + x + '@sha256:' + 'a' * 64 for x in ['rcoder', 'computer', 'runtime']}
+            rows = manifests.render(c, images, 'test-only', pingap_identity=self.paired_identity())
+            for row in rows:
+                self.assertEqual(row['metadata']['labels'][LABEL], c.id)
+                if 'namespace' in row['metadata']:
+                    self.assertEqual(row['metadata']['namespace'], c.ns)
+            pv = next(r for r in rows if r['kind'] == 'PersistentVolume')
+            self.assertEqual(pv['spec']['persistentVolumeReclaimPolicy'], 'Retain')
+            self.assertEqual(pv['spec']['claimRef']['namespace'], c.ns)
+            dep = next(r for r in rows if r['kind'] == 'Deployment')
+            self.assertEqual(dep['spec']['replicas'], 2)
+            self.assertEqual(dep['spec']['selector']['matchLabels'], {'app': 'rcoder', LABEL: c.id})
+            self.assertEqual(dep['spec']['template']['metadata']['labels']['app.kubernetes.io/component'], 'rcoder-main')
+            self.assertEqual(dep['spec']['template']['spec']['containers'][0]['image'], images['rcoder'])
+            config = json.loads(next(r for r in rows if r['kind'] == 'ConfigMap')['data']['config.yml'])
+            self.assertEqual(config['docker_config']['multi_image_config']['services'], config['kubernetes_config']['services'])
+            self.assertEqual(config['kubernetes_config']['services']['user-app-builder']['image'], images['computer'])
+            self.assertEqual(config['kubernetes_config']['services']['user-app']['image'], images['runtime'])
+            role = next(r for r in rows if r['kind'] == 'ClusterRole')
+            self.assertTrue(all(set(r['verbs']) <= {'get', 'list', 'watch'} for r in role['rules']))
+            namespaced = next(r for r in rows if r['kind'] == 'Role')
+            # Event publisher（kube-runtime 批次 C）：events.k8s.io 仅 create/patch
+            events = next(r for r in namespaced['rules'] if r['apiGroups'] == ['events.k8s.io'])
+            self.assertEqual(events['resources'], ['events'])
+            self.assertEqual(sorted(events['verbs']), ['create', 'patch'])
+            binding = next(r for r in rows if r['kind'] == 'RoleBinding')
+            self.assertEqual(binding['roleRef']['name'], namespaced['metadata']['name'])
+            self.assertTrue(all(s['kind'] == 'ServiceAccount' and s['name'] == 'rcoder' for s in binding['subjects']))
+            for binding in (r for r in rows if r['kind'] in ('RoleBinding', 'ClusterRoleBinding')):
+                self.assertEqual(binding['subjects'], [{'kind': 'ServiceAccount', 'name': 'rcoder', 'namespace': c.ns}])
+
+    def test_build_uses_the_toolchain_digest_recorded_in_receipt(self):
+        # A mutable compiler tag can move after resolution. The actual three
+        # image builds must use the same digest as the receipt/cache identity.
+        with tempfile.TemporaryDirectory() as temp:
+            c = self.config(temp)
+            c.state = Path(temp) / 'state'
+            c.values.update({
+                'REMOTE_K8S_RUST_IMAGE': 'example/rust:stable',
+                'REMOTE_K8S_REGISTRY': 'example/test',
+                **{'REMOTE_K8S_' + key: 'example/' + key.lower() + ':base'
+                   for key in ['RCODER_BASE', 'COMPUTER_BASE', 'RUNTIME_BASE']},
+            })
+            resolved = 'sha256:' + 'b' * 64
+
+            def ssh(args, *unused, **kwargs):
+                if args[:3] == ['docker', 'buildx', 'ls']:
+                    return 'rcoder-' + c.id
+                if args[:4] == ['docker', 'buildx', 'imagetools', 'inspect']:
+                    return 'Digest: ' + resolved
+                if args[:1] == ['python3'] and args[1].endswith('/tools/build/pingap_identity.py'):
+                    return json.dumps(pingap_runtime_identity.source_identity())
+                if args[:2] == ['docker', 'run']:
+                    source = pingap_runtime_identity.source_identity()
+                    if args[args.index('--entrypoint') + 1] == 'node':
+                        return 'v22.23.2'
+                    return ('pingap ' + source['version'] + ' (' + source['commit'] + ', tls=openssl)'
+                            if args[-1] == '--version' else 'pingap ' + source['version'])
+                if args[0] == 'cat':
+                    return json.dumps({'containerimage.digest': 'sha256:' + 'a' * 64})
+                self.fail('unexpected remote command: ' + repr(args))
+
+            frozen = {'path': '/tmp/isolated/project/snapshots/one',
+                      'source_sha256': 'c' * 64, 'manifest': {}}
+            with patch.object(c, 'ssh', side_effect=ssh), \
+                    patch.object(main, 'doctor'), patch.object(main, 'sync_start'), \
+                    patch.object(main, 'alive'), \
+                    patch.object(main.snapshot, 'create', return_value=frozen), \
+                    patch.object(main.remote_process, 'execute') as execute:
+                receipt = main.build(c)
+            self.assertEqual(receipt['rust_image'], 'example/rust:stable@' + resolved)
+            self.assertEqual(execute.call_count, 3)
+            for call in execute.call_args_list:
+                self.assertIn('RUST_IMAGE=' + receipt['rust_image'], call.args[1])
+
+    def test_isolation_does_not_count_broken_source_network_as_a_policy_drop(self):
+        pod = {'metadata': {'name': 'tenant'}, 'spec': {'containers': [{'name': 'agent'}]}}
+        with tempfile.TemporaryDirectory() as temp:
+            c = self.config(temp)
+            for error in ['ENETUNREACH', 'EHOSTUNREACH', 'EMFILE', 'EADDRNOTAVAIL', None]:
+                with self.subTest(error=error), \
+                        patch.object(c, 'kube', return_value=json.dumps(
+                            {'connected': False, 'errno': error, 'timeout': False})), \
+                        self.assertRaisesRegex(RuntimeError, 'inconclusive'):
+                    tenant_isolation.connect(c, pod, '10.0.0.5', 8080)
+            for observation in [{'connected': True},
+                                {'connected': False, 'errno': 'ECONNREFUSED', 'timeout': False},
+                                {'connected': False, 'errno': None, 'timeout': True}]:
+                with patch.object(c, 'kube', return_value=json.dumps(observation)):
+                    self.assertEqual(tenant_isolation.connect(c, pod, '10.0.0.5', 8080), observation)
+
+    def test_foreign_resource_rejected_before_mutation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            c = self.config(temp)
+            with patch.object(c, 'kube', return_value=json.dumps({'metadata': {'labels': {LABEL: 'someone-else'}}})) as kube:
+                with self.assertRaisesRegex(RuntimeError, 'foreign'):
+                    main.apply(c, {'kind': 'Namespace', 'metadata': {'name': c.ns}})
+                self.assertEqual(kube.call_count, 1)
+
+    def test_namespace_and_ssh_injection_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self.config(temp)
+            file = Path(temp) / 'config'
+            for setting in ['REMOTE_K8S_NAMESPACE=default', 'REMOTE_K8S_SSH=-oProxyCommand=bad', 'REMOTE_K8S_DIR=/tmp/../etc']:
+                original = file.read_text()
+                file.write_text(original + setting + '\n')
+                with patch.dict(os.environ, {}, clear=True), self.assertRaises(ValueError):
+                    Config(file)
+                file.write_text(original)
+
+    def test_snapshot_hash_permissions_links_and_extras(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            live = root / 'live'
+            live.mkdir()
+            f = live / 'hello.rs'
+            f.write_text('hello')
+            f.chmod(0o755)
+            (live / 'link').symlink_to('hello.rs')
+            (live / 'stale.rs').write_text('never in build')
+            import hashlib
+            manifest = {'hello.rs': {'kind': 'file', 'sha256': hashlib.sha256(b'hello').hexdigest(), 'executable': True},
+                        'link': {'kind': 'link', 'target': 'hello.rs'}}
+            result = subprocess.run([sys.executable, '-c', snapshot.REMOTE_SNAPSHOT, temp, 'one'], input=json.dumps(manifest), text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((root / 'snapshots/one/stale.rs').exists())
+            f.write_text('changed after snapshot')
+            self.assertEqual((root / 'snapshots/one/hello.rs').read_text(), 'hello')
+            result = subprocess.run([sys.executable, '-c', snapshot.REMOTE_SNAPSHOT, temp, 'two'], input=json.dumps(manifest), text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((root / 'snapshots/two').exists())
+
+    def test_snapshot_rejects_symlink_ancestor(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'live').mkdir()
+            (root / 'outside').mkdir()
+            (root / 'outside/file').write_text('secret')
+            (root / 'live/escape').symlink_to(root / 'outside')
+            expected = {'escape/file': {'kind': 'file', 'sha256': 'bad', 'executable': False}}
+            result = subprocess.run([sys.executable, '-c', snapshot.REMOTE_SNAPSHOT, temp, 'bad'], input=json.dumps(expected), text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('Symlink ancestor', result.stderr)
+
+    def test_credentials_excluded_even_if_git_tracked(self):
+        for path in ['.env.local', 'nested/.env.production', 'private.key', '.kube/config', '.remote-k8s/state.json', 'target/foo', 'tests-e2e/reports/a']:
+            self.assertTrue(snapshot.excluded(path), path)
+        self.assertFalse(snapshot.excluded('crates/rcoder/src/main.rs'))
+        self.assertFalse(snapshot.excluded('crates/rcoder/src/cleanup_task/logs/mod.rs'))
+        self.assertTrue(snapshot.excluded('logs/runtime.json'))
+        self.assertTrue(snapshot.excluded('docker/data/rcoder-toasty-case/userapp.turso.db'))
+        self.assertTrue(snapshot.excluded('docker/data/rcoder-toasty-case/userapp.turso.db-wal'))
+        self.assertFalse(snapshot.excluded('crates/rcoder-storage/schema/userapp-pg-v1.sql'))
+
+    def test_tracked_ignored_outputs_are_not_build_inputs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(['git', 'init', '-q', temp], check=True)
+            for name, text in [('Cargo.toml', '[workspace]'), ('Cargo.lock', 'version = 4'),
+                               ('.gitignore', 'generated.bin\n'), ('generated.bin', 'old generated binary'),
+                               ('.env.local', 'FAKE_KEY=never-sync')]:
+                (root / name).write_text(text)
+            subprocess.run(['git', '-C', temp, 'add', '-f', '.'], check=True)
+            with patch.object(snapshot, 'ROOT', root):
+                rows = snapshot.manifest()
+            self.assertIn('Cargo.lock', rows)
+            self.assertNotIn('generated.bin', rows)
+            self.assertNotIn('.env.local', rows)
+
+    def test_private_pull_credentials_stay_in_namespace_secret(self):
+        with tempfile.TemporaryDirectory() as temp:
+            c = self.config(temp)
+            images = {x: 'example/' + x + '@sha256:' + 'a' * 64 for x in ['rcoder', 'computer', 'runtime']}
+            auth = {'auths': {'example': {'auth': 'FAKE_TEST_ONLY'}}}
+            rows = manifests.render(c, images, 'test-only', auth, self.paired_identity())
+            for row in rows:
+                if 'FAKE_TEST_ONLY' in json.dumps(row):
+                    self.assertEqual((row['kind'], row['metadata']['name']), ('Secret', 'registry'))
+                    self.assertEqual(row['metadata']['namespace'], c.ns)
+            accounts = [r for r in rows if r['kind'] == 'ServiceAccount']
+            self.assertEqual({r['metadata']['name'] for r in accounts}, {'default', 'rcoder', 'rcoder-pods-sa'})
+            self.assertTrue(all(r['imagePullSecrets'] == [{'name': 'registry'}] for r in accounts))
+
+    def test_deployment_changed_blocks_tests(self):
+        with tempfile.TemporaryDirectory() as temp:
+            c = self.config(temp)
+            with patch.object(main, 'owned', return_value={'metadata': {'uid': 'new', 'generation': 2}}):
+                with self.assertRaisesRegex(RuntimeError, 'changed'):
+                    main.identity(c, {'deployment_uid': 'old', 'generation': 1})
+
+
+if __name__ == '__main__':
+    unittest.main()

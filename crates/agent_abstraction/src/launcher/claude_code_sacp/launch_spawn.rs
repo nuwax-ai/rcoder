@@ -148,7 +148,7 @@ pub(super) fn spawn_stderr_reader(
     (stderr_task_handle, stderr_output_shared)
 }
 
-/// 等待会话 ID（超时取自 start_config / GrpcTimeoutConfig，默认 60s），同时监听连接失败
+/// 在总创建 deadline 内观察会话 ID 或连接错误；调用者统一停止并回收子进程。
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn wait_for_session_id(
     project_id: &str,
@@ -160,13 +160,14 @@ pub(super) async fn wait_for_session_id(
     connection_error_shared: &Arc<std::sync::Mutex<Option<String>>>,
     full_command_line: &str,
     child_pid: u32,
+    creation_deadline: tokio::time::Instant,
 ) -> Result<SessionId> {
     info!(
         "[SACP] Waiting for session_id from ACP agent, project_id={}, timeout={}s",
         project_id, session_create_timeout_secs
     );
-    let session_id = match tokio::time::timeout(
-        std::time::Duration::from_secs(session_create_timeout_secs),
+    let session_id = match tokio::time::timeout_at(
+        creation_deadline,
         async {
             tokio::select! {
                 result = session_id_rx => {
@@ -194,7 +195,7 @@ pub(super) async fn wait_for_session_id(
             session_id
         }
         Err(_timeout_elapsed) => {
-            // 60 秒超时，连接任务仍在运行
+            // 总创建预算耗尽，连接任务仍可能在等待 ACP 回复。
             let stderr_info = stderr_output_shared.lock().ok()
                 .map(|buf| buf.join("\n"))
                 .filter(|s| !s.is_empty())
@@ -204,42 +205,9 @@ pub(super) async fn wait_for_session_id(
                 "[SACP] Agent initialization timeout ({}s), project_id={}, command=[{}], child_pid={}, stderr={}",
                 session_create_timeout_secs, project_id, full_command_line, child_pid, stderr_info
             );
-            // 超时后取消 spawned 任务，避免子进程泄漏
+            // 只结束协议任务。caller 持有 lifecycle guard，负责发信号和真实
+            // child.wait；这里不能在 reaper 之外使用可能已被复用的裸 PID。
             connection_task_handle.abort();
-            // kill 子进程（使用进程组 kill 清理所有孙进程）
-            #[cfg(unix)]
-            {
-                use nix::errno::Errno;
-                use nix::sys::signal::{Signal, kill};
-                use nix::unistd::Pid;
-                if child_pid > 1 {
-                    // kill(2) 的负数 pid 表示「整个进程组」；子进程以 ProcessGroup::leader() 启动，pgid == child_pid，
-                    // 故 -child_pid 能杀掉 claude-code-acp-ts 及其所有 MCP 孙进程。
-                    // ⚠️ 绝不能用 libc killpg 并预先取负：killpg 期望正数 pgrp（内部自取负），负数会直接 EINVAL。
-                    // 与 lifecycle.rs 的正常关闭路径保持一致。
-                    // ⚠️ child_pid==1 时 kill(-1) 语义是「所有进程组」且 PID 1 信号被内核忽略，必须跳过。
-                    let target = Pid::from_raw(-(child_pid as i32));
-                    match kill(target, Signal::SIGKILL) {
-                        Ok(_) => warn!(
-                            "[SACP] Killed process group (SIGKILL) for child_pid={}, project_id={}",
-                            child_pid, project_id
-                        ),
-                        Err(Errno::ESRCH) => debug!(
-                            "[SACP] Process group already exited: child_pid={}, project_id={}",
-                            child_pid, project_id
-                        ),
-                        Err(e) => error!(
-                            "[SACP] Failed to kill process group for child_pid={}: {}, project_id={}",
-                            child_pid, e, project_id
-                        ),
-                    }
-                } else if child_pid == 1 {
-                    warn!(
-                        "[SACP] child_pid==1（容器 PID 1），跳过进程组 kill，依赖 init 收割: project_id={}",
-                        project_id
-                    );
-                }
-            }
             return Err(anyhow::anyhow!(
                 "{}: agent initialization timeout ({}s){}",
                 error_codes::get_i18n_message_default("error.agent_init_timeout"),

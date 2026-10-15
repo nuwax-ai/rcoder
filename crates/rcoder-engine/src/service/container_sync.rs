@@ -1,0 +1,122 @@
+//! 容器状态同步任务
+//!
+//! 定期从运行时同步容器状态。
+//! 在 K8s 模式下通过 Runtime API 获取 Pod 状态；在 Docker 模式下同样通过 Runtime 抽象层访问。
+//!
+//! 注意：本模块由 binary (main.rs) 使用，lib 内部不直接调用。
+
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{Instrument, debug, info, warn};
+
+use container_runtime_api::ContainerRuntime;
+
+use crate::grpc::GrpcChannelPool;
+
+/// 容器状态同步配置
+#[derive(Debug, Clone)]
+pub struct ContainerSyncConfig {
+    /// 同步间隔
+    pub sync_interval: Duration,
+}
+
+impl Default for ContainerSyncConfig {
+    fn default() -> Self {
+        Self {
+            sync_interval: Duration::from_secs(60), // 默认 60 秒
+        }
+    }
+}
+
+/// 启动容器状态同步任务
+///
+/// 定期调用 `ContainerRuntime::sync_states()` 方法，
+/// 检查缓存中的容器是否仍然存在于运行时（Docker/K8s）中，
+/// 如果不存在则从缓存中移除。
+///
+/// 同时清理已移除容器的关联资源：
+/// - gRPC 连接池中的旧连接
+pub fn start_container_sync_task(
+    config: ContainerSyncConfig,
+    grpc_pool: Arc<GrpcChannelPool>,
+    runtime: Arc<dyn ContainerRuntime>,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
+) -> tokio::task::JoinHandle<()> {
+    info!(
+        "🔄 [CONTAINER_SYNC] Starting container state sync task: interval={}s",
+        config.sync_interval.as_secs()
+    );
+
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    tokio::task::spawn(async move {
+        let mut interval = tokio::time::interval(config.sync_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    // 同步缓存状态 - 清理失效的容器记录（bg_container_sync span：周期任务可观测）
+                    debug!("[CONTAINER_SYNC] Syncing container states...");
+                    match runtime
+                        .sync_states()
+                        .instrument(tracing::info_span!("bg_container_sync"))
+                        .await
+                    {
+                        Ok((checked, removed)) => {
+                            if !removed.is_empty() {
+                                info!(
+                                    "[CONTAINER_SYNC] Sync completed: checked={}, removed_stale={}",
+                                    checked,
+                                    removed.len()
+                                );
+
+                                // 清理关联资源
+                                for container in removed {
+                                    // 清理 gRPC 连接池。deploy-host 下地址经
+                                    // 注册表按 name 查表，空 IP 也清理（豁免外层守卫）
+                                    #[cfg(feature = "deploy-host")]
+                                    let cleanable =
+                                        !container.container_ip.is_empty() || shared_types::is_deploy_host();
+                                    #[cfg(not(feature = "deploy-host"))]
+                                    let cleanable = !container.container_ip.is_empty();
+                                    if cleanable {
+                                        #[cfg(feature = "deploy-host")]
+                                        let grpc_addr = if shared_types::is_deploy_host() {
+                                            shared_types::published::resolve_published_addr(
+                                                &container.container_name,
+                                                shared_types::GRPC_DEFAULT_PORT,
+                                            )
+                                            .ok().map(|addr| addr.to_string())
+                                        } else {
+                                            Some(format!(
+                                                "{}:{}",
+                                                container.container_ip,
+                                                shared_types::GRPC_DEFAULT_PORT
+                                            ))
+                                        };
+                                        #[cfg(not(feature = "deploy-host"))]
+                                        let grpc_addr = Some(format!(
+                                            "{}:{}",
+                                            container.container_ip,
+                                            shared_types::GRPC_DEFAULT_PORT
+                                        ));
+                                        if let Some(grpc_addr) = grpc_addr {
+                                            grpc_pool.remove(&grpc_addr).await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("[CONTAINER_SYNC] sync failed: {}", e);
+                        }
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    info!("[CONTAINER_SYNC] shutdown");
+                    break;
+                }
+            }
+        }
+    })
+}

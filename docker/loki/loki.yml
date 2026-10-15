@@ -1,0 +1,57 @@
+# Loki 3.7.7 单机配置（本地 compose 演练台）
+# 与生产对齐点：tsdb/v13 schema + 三条 limits（复制自
+# build-agent-docker k8s/logging/loki-stack/upgrade-step3-3.7.yaml:26-30，
+# 该文件由 .131 彩排 + 生产升级验证过）：
+#   allow_structured_metadata: false  # filesystem 后端必须显式关（3.0 默认 true 要求对象存储）
+#   max_label_names_per_series: 40    # Auto_Kubernetes_Labels 下防整条拒收（键名彩排实测）
+#   max_line_size: 2MB                # 行内嵌 k8s 元数据 map 会超 3.0 默认 256KB
+# 差异（本地简化）：无 retention/compactor（volume 可随时 wipe）、单 period 从过去日期起。
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+storage_config:
+  filesystem:
+    directory: /loki/chunks
+  tsdb_shipper:
+    active_index_directory: /loki/tsdb-index
+    cache_location: /loki/tsdb-cache
+
+limits_config:
+  allow_structured_metadata: false
+  max_label_names_per_series: 40
+  max_line_size: 2MB
+
+query_range:
+  align_queries_with_step: true
+
+ruler:
+  alertmanager_url: http://localhost:9093
+  ring:
+    kvstore:
+      store: inmemory

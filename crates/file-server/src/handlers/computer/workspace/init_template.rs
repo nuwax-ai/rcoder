@@ -1,0 +1,116 @@
+//! init-project-template handler: 模板 zip 解压到工作区 (可选 git init)。
+
+use axum::extract::State;
+use garde::Validate;
+
+use crate::ops::multipart::{file_field, text_field};
+use crate::ops::workspace::init_project_template_impl;
+
+use super::super::ServiceScope;
+use super::super::ws_path;
+use crate::AppState;
+use crate::error::AppError;
+use crate::extract::{AppJson as Json, AppMultipart as Multipart};
+use crate::models::{InitProjectTemplateForm, InitProjectTemplateResult};
+use crate::service::temp_file::TemporaryFile;
+
+/// init-project-template 必填字段 (含模板 zip 文件)。
+#[derive(garde::Validate)]
+struct InitTemplateFields {
+    #[garde(custom(crate::validation_rules::required_not_blank))]
+    user_id: Option<String>,
+    #[garde(custom(crate::validation_rules::required_not_blank))]
+    cid: Option<String>,
+    #[garde(required)]
+    data: Option<TemporaryFile>,
+}
+
+/// [`InitTemplateFields`] 校验后的全必填形态。
+struct ValidatedInitTemplate {
+    user_id: String,
+    cid: String,
+    data: TemporaryFile,
+}
+
+impl InitTemplateFields {
+    fn into_validated(self) -> Result<ValidatedInitTemplate, AppError> {
+        self.validate().map_err(crate::error::from_garde)?;
+        Ok(ValidatedInitTemplate {
+            user_id: self
+                .user_id
+                .ok_or_else(|| AppError::system("user_id missing after garde validation"))?,
+            cid: self
+                .cid
+                .ok_or_else(|| AppError::system("c_id missing after garde validation"))?,
+            data: self
+                .data
+                .ok_or_else(|| AppError::system("template zip missing after garde validation"))?,
+        })
+    }
+}
+
+/// 初始化项目模板
+///
+/// 对齐 nuwax initProjectTemplate。
+/// multipart: userId, cId, file(模板 zip), enableGit。解压到工作区。
+/// git 触发双开关: GIT_ENABLED && enableGit → init + commit (对齐 nuwax)。
+#[utoipa::path(post, path = "/init-project-template", request_body(content = InitProjectTemplateForm, content_type = "multipart/form-data"), responses((status = 200, description = "初始化结果（含工作区根路径）", body = InitProjectTemplateResult), crate::openapi::ErrorApiResponses), tag = "Computer")]
+pub(crate) async fn init_project_template(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<Json<InitProjectTemplateResult>, AppError> {
+    let mut user_id = None;
+    let mut cid = None;
+    let mut workspace_path = None; // 用户维度工作目录 (对齐 TS 1.4.5, 可选 multipart 字段)
+    let mut service_type = None; // serviceContext 通道 (对齐 TS 1.4.5)
+    let mut workspace_type = None;
+    let mut app_id = None;
+    let mut data = None;
+    let mut enable_git = false;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::validation(format!("multipart parse: {e}")))?
+    {
+        match field.name().unwrap_or("") {
+            "userId" => user_id = Some(text_field(field).await?),
+            "cId" => cid = Some(text_field(field).await?),
+            "workspacePath" => workspace_path = Some(text_field(field).await?),
+            "workspaceType" => workspace_type = Some(text_field(field).await?),
+            "serviceType" => service_type = Some(text_field(field).await?),
+            "appId" => app_id = Some(text_field(field).await?),
+            "file" => {
+                data = Some(
+                    file_field(
+                        field,
+                        state.config.upload_max_file_size_bytes,
+                        &state.config.upload_temp_dir(),
+                    )
+                    .await?,
+                )
+            }
+            "enableGit" => {
+                enable_git = matches!(
+                    text_field(field).await?.trim().to_lowercase().as_str(),
+                    "true" | "1" | "yes"
+                );
+            }
+            _ => {}
+        }
+    }
+    let fields = InitTemplateFields { user_id, cid, data };
+    let v = fields.into_validated()?;
+    let ws = ws_path(
+        &state,
+        &v.user_id,
+        &v.cid,
+        ServiceScope {
+            workspace_type: workspace_type.as_deref(),
+            service_type: service_type.as_deref(),
+            app_id: app_id.as_deref(),
+            workspace_path: workspace_path.as_deref(),
+        },
+    )
+    .await?;
+    init_project_template_impl(&state, ws, v.data, enable_git).await
+}

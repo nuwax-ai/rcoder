@@ -3,44 +3,37 @@
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
-use serde_json::json;
+use garde::Validate;
 
 use crate::AppState;
 use crate::error::AppError;
 use crate::extract::{AppJson as Json, AppQuery as Query};
+use crate::models::{
+    GetByVersionParams, GetContentParams, ProjectContentResult, ProjectVersionContentResult,
+};
 use crate::response;
 use crate::service::{tree, version as version_service};
 use crate::workspace::ProjectContext;
 
-#[derive(Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct GetContentParams {
-    pub project_id: String,
-    pub command: Option<String>,
-    pub proxy_path: Option<String>,
-    pub tenant_id: Option<String>,
-    pub space_id: Option<String>,
-    pub isolation_type: Option<String>,
-}
-
-/// `GET /api/project/get-project-content`
+/// 获取项目内容
 #[utoipa::path(
     get,
     path = "/get-project-content",
     params(GetContentParams),
-    responses(crate::openapi::JsonApiResponses),
+    description = r#"
+拉取项目内容树 + 前端框架探测结果：返回 `files` 树、`frontendFramework`/`devFramework`（探测失败时可传 `command` 兜底执行自定义命令）——打开工作台的第一数据源。
+"#,
+    responses((status = 200, description = "项目文件树", body = ProjectContentResult), crate::openapi::ErrorApiResponses),
     tag = "Project"
 )]
 pub(crate) async fn get_project_content(
     State(state): State<AppState>,
     Query(params): Query<GetContentParams>,
 ) -> Response {
-    let project_id = params.project_id.trim();
-    if project_id.is_empty() {
-        return AppError::validation("Project ID cannot be empty").into_response();
+    if let Err(report) = params.validate() {
+        return crate::error::from_garde(report).into_response();
     }
+    let project_id = params.project_id.trim();
     let ctx = ProjectContext {
         project_id: project_id.to_string(),
         tenant_id: params.tenant_id.clone(),
@@ -66,12 +59,12 @@ pub(crate) async fn get_project_content(
     )
     .await
     {
-        Ok(content) => Json(json!({
-            "success": true,
-            "files": content.files,
-            "frontendFramework": content.frontend_framework,
-            "devFramework": content.dev_framework,
-        }))
+        Ok(content) => Json(ProjectContentResult {
+            success: true,
+            files: content.files,
+            frontend_framework: content.frontend_framework,
+            dev_framework: content.dev_framework,
+        })
         .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -81,29 +74,15 @@ pub(crate) async fn get_project_content(
     }
 }
 
-#[derive(Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct GetByVersionParams {
-    pub project_id: String,
-    pub code_version: String,
-    pub proxy_path: Option<String>,
-    #[serde(default)]
-    pub command: Option<String>,
-    #[serde(default)]
-    pub tenant_id: Option<String>,
-    #[serde(default)]
-    pub space_id: Option<String>,
-    #[serde(default)]
-    pub isolation_type: Option<String>,
-}
-
-/// `GET /api/project/get-project-content-by-version`
+/// 按版本获取项目内容
 #[utoipa::path(
     get,
     path = "/get-project-content-by-version",
     params(GetByVersionParams),
-    responses(crate::openapi::JsonApiResponses),
+    description = r#"
+同 [`get-project-content`](#) 但以 `codeVersion` 指定历史版本读取内容树（版本对比/回滚预览场景）。
+"#,
+    responses((status = 200, description = "版本快照文件树", body = ProjectVersionContentResult), crate::openapi::ErrorApiResponses),
     tag = "Project"
 )]
 pub(crate) async fn get_project_content_by_version(
@@ -112,14 +91,14 @@ pub(crate) async fn get_project_content_by_version(
 ) -> Response {
     if state.config.git_enabled {
         return response::deprecated(
-            "此接口已废弃,请使用 /api/git/log + /api/git/diff 查看历史版本内容",
+            "此接口已废弃，请使用 /api/git/log + /api/git/diff 查看历史版本内容",
         )
         .into_response();
     }
-    let project_id = params.project_id.trim();
-    if project_id.is_empty() {
-        return AppError::validation("Project ID cannot be empty").into_response();
+    if let Err(report) = params.validate() {
+        return crate::error::from_garde(report).into_response();
     }
+    let project_id = params.project_id.trim();
     let ctx = ProjectContext {
         project_id: project_id.to_string(),
         tenant_id: params.tenant_id.clone(),
@@ -136,7 +115,11 @@ pub(crate) async fn get_project_content_by_version(
     )
     .await
     {
-        Ok(files) => Json(json!({ "success": true, "files": files })).into_response(),
+        Ok(files) => Json(ProjectVersionContentResult {
+            success: true,
+            files,
+        })
+        .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             response::failure_msg(&e.to_string()),

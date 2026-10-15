@@ -100,8 +100,13 @@ pub(crate) async fn handle_computer_chat_internal(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| project_id.clone());
 
-    // 校验 work_dir_id（无论来源，用于路径拼接的标识符都应校验）
-    if let Err(e) = shared_types::validate_identifier(&work_dir_id, "agent_work_dir") {
+    // 校验 work_dir_id（无论来源，用于路径拼接的标识符都应校验）。
+    // 两形态：单段目录名（原语义）或绝对路径（常规项目场景，
+    // /home/user/{projectType}/{projectId}）——for_service(Computer) 放行
+    if let Err(e) = shared_types::validate_agent_work_dir_for_service(
+        &ServiceType::ComputerAgentRunner,
+        &work_dir_id,
+    ) {
         return Err(shared_types::AppError::with_message(ERR_VALIDATION, &e));
     }
 
@@ -114,8 +119,13 @@ pub(crate) async fn handle_computer_chat_internal(
 
     // 4. 创建项目工作目录（使用配置中的 projects_dir，支持外部配置）
     // Docker 挂载：宿主机 /computer-project-workspace/{user_id} → 容器 /home/user
-    // Agent 工作目录：/home/user/{work_dir_id}
-    let project_dir = state.config.projects_dir.join(&work_dir_id);
+    // Agent 工作目录：/home/user/{work_dir_id}；绝对路径形态原样使用
+    // （显式分派，不依赖 join 对绝对参数的隐式前缀替换语义）
+    let project_dir = if shared_types::is_absolute_path_like(&work_dir_id) {
+        std::path::PathBuf::from(&work_dir_id)
+    } else {
+        state.config.projects_dir.join(&work_dir_id)
+    };
 
     if let Err(e) = tokio::fs::create_dir_all(&project_dir).await {
         let error_msg = format!(
@@ -140,6 +150,7 @@ pub(crate) async fn handle_computer_chat_internal(
         project_id: project_id.clone(),
         project_dir,
         session_id,
+        force_new_session: false,
         prompt: request.prompt,
         request_id: request_id.clone(),
         attachments: request.attachments,
@@ -165,11 +176,11 @@ pub(crate) async fn handle_computer_chat_internal(
 
     // 🔧 关键修复：将 session 写入 SESSION_CACHE（SSE 进度流需要从这里读取）
     // 🛡️ 关键修复：不在 DashMap entry() 持锁范围内调用 .await
+    // 仅成功且有有效 session_id 时才写入,避免预检失败/prepare 失败时创建 SESSION_CACHE[""]
     let session_id_str = output.session_id.clone();
-    if SESSION_CACHE.contains_key(&session_id_str) {
-        // 已存在，无需创建
-    } else {
-        let data = SessionData::new(1000).await;
+    if output.success && !session_id_str.is_empty() && !SESSION_CACHE.contains_key(&session_id_str)
+    {
+        let data = SessionData::new(crate::service::RING_BUFFER_SIZE).await;
         match SESSION_CACHE.entry(session_id_str.clone()) {
             Entry::Occupied(_entry) => {
                 // 其他任务已创建，丢弃我们创建的 data
