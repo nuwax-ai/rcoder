@@ -300,6 +300,10 @@ RCoder AI 服务 API
 
 基于 ACP (Agent Client Protocol) 的 AI 驱动开发平台，提供完整的 AI 代理集成解决方案。
 
+## API Key 鉴权
+
+启用 `api_key_auth` 后，非豁免请求需携带 `x-api-key`。缺失或错误的 Key 返回 HTTP 401，业务错误码为 `API_KEY_AUTH_FAILED`；前端应提示检查 API Key 配置，不应按登录失效错误码 `4010` 跳转登录页。
+
 ## 主要功能
 
 - **Userapp 应用引擎**: 无状态应用 Pod 的完整生命周期（开发构建 → 部署发布 → 终端/代理访问），按 `Userapp ·` 前缀环境维度分组（dev / prod / 双态 / 访问入口）

@@ -72,6 +72,8 @@ cargo run -p rcoder-cli -- --help
 
 `api_key_auth` 控制 RCoder 服务鉴权；`RCODER_API_KEY_ENABLED` 与 `RCODER_API_KEY` 可覆盖对应设置。启用后，请求携带 `x-api-key`，豁免路径以实际配置为准。首次创建配置会生成随机 API Key，但模板的 `api_key_auth.enabled` 默认为 `false`，deploy-host 也不会自动启用。生成了 key 不等于鉴权已生效，应检查实际配置并显式启用。
 
+缺少或提供错误的 `x-api-key` 时，返回 HTTP 401，响应体的业务错误码为 `API_KEY_AUTH_FAILED`。此错误表示服务 API Key 鉴权失败，前端应提示检查 API Key 配置，不应按登录失效错误码 `4010` 跳转登录页。
+
 ```bash
 curl http://127.0.0.1:8090/api/docs/openapi.json \
   -H "x-api-key: ${RCODER_API_KEY}"

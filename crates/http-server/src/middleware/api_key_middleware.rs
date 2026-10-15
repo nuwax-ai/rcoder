@@ -105,7 +105,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             json.get("code").and_then(|v| v.as_str()),
-            Some(shared_types::error_codes::ERR_API_KEY_AUTH_FAILED)
+            Some("API_KEY_AUTH_FAILED")
         );
         let expected_message = shared_types::get_error_message(
             shared_types::error_codes::ERR_API_KEY_AUTH_FAILED,
@@ -118,7 +118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_api_key_invalid_without_accept_language_falls_back_to_en_us() {
+    async fn test_api_key_missing_without_accept_language_falls_back_to_en_us() {
         let config = Arc::new(ArcSwap::from_pointee(ApiKeyAuthConfig {
             enabled: true,
             api_key: "valid-key".to_string(),
@@ -135,7 +135,6 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/chat")
-                    .header("x-api-key", "wrong")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -145,6 +144,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json.get("code").and_then(|v| v.as_str()),
+            Some("API_KEY_AUTH_FAILED")
+        );
         let expected_message = shared_types::get_error_message(
             shared_types::error_codes::ERR_API_KEY_AUTH_FAILED,
             "en-US",

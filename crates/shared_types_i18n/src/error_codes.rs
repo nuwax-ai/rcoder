@@ -98,8 +98,8 @@ pub const ERR_RETRY_EXHAUSTED: &str = "8002";
 /// 请求过多（DoS 防护触发）
 pub const ERR_TOO_MANY_REQUESTS: &str = "TOO_MANY_REQUESTS";
 
-/// API Key 鉴权失败
-pub const ERR_API_KEY_AUTH_FAILED: &str = "4010";
+/// API Key 鉴权失败，独立于前端登录失效错误码 4010
+pub const ERR_API_KEY_AUTH_FAILED: &str = "API_KEY_AUTH_FAILED";
 
 /// Permission request not found or already resolved
 pub const ERR_PERMISSION_NOT_FOUND: &str = "ERR_PERMISSION_NOT_FOUND";
