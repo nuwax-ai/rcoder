@@ -5,10 +5,11 @@
 ## 运行
 
 ```bash
+export AB_TS_SOURCE=/path/to/nuwax-file-server
 make file-server-ab
 ```
 
-默认执行离线 `core` 套件。需要比较 Git 或模板依赖安装/构建/开发服务时显式选套件：
+`AB_TS_SOURCE` 必须指向已有的 TypeScript 源码目录；未设置或目录不存在时，在调用 Docker 前退出。后续命令沿用上述导出的路径。默认执行离线 `core` 套件。需要比较 Git 或模板依赖安装/构建/开发服务时显式选套件：
 
 ```bash
 make file-server-ab AB_SUITE=git
@@ -18,7 +19,7 @@ make file-server-ab AB_SUITE=all
 
 `build` / `all` 会从两份 ZIP 模板创建项目，访问 npm registry 安装依赖并构建，再验证 dev server 的启动、HTTP 可达、日志分页、日志缓存接口、端口池登记、keep-alive、重启和停止；也会对照构建错误解析。项目创建包含模板解压和初始 Git 提交，驱动为这一步单独留出 120 秒，避免慢磁盘上的 30 秒通用请求预算过早中断后继续请求尚未初始化完成的项目。模板依赖安装仍在每个被测项目内真实执行，不把项目 `node_modules` 预装进镜像。
 
-可选参数：
+必填源码路径与可选参数：
 
 ```bash
 make file-server-ab \
@@ -85,7 +86,7 @@ pnpm 包内容 store 与 registry 元数据缓存使用持久 Docker named volum
 - `build`：分别用两份模板走项目初始化、依赖安装、production build、产物静态读取、start-dev、真实页面 HTTP、开发日志分页、日志缓存查询/清理、端口池状态、keep-alive、restart-dev 和 stop-dev，并对照构建错误解析。依赖 registry 网络；报告记下环境版本与错误。`get-dev-log` 逐行校验每侧页面契约（行号从请求的 startIndex 连续、content 为字符串、totalLines 覆盖末行、`dev-temp-<epoch-millis>.log` 文件名形状），并用第二页查询（`build-react-get-dev-log-page-2`，startIndex=首页末行+1）验证分页不重不漏——日志可能增长，不要求两次 totalLines 相等。日志正文与 `logFileName` 是两侧各自的安装/vite instrumentation（结构化 pnpm 事件 vs 原始输出、体量不同），按场景级语义比较归一：页面契约（非空分页、行号、totalLines 一致性）由独立断言保证，`success`/`startIndex` 仍逐字比较，动态的日志正文、`logFileName`、行量派生的 `totalLines` 及正文派生的 `content-length`/`etag` 响应头随之归一。TS Compose 未启用 `FAST_RESTART_ENABLED` 时 restart 走全量重装（删除 node_modules 与 lockfile 后重装），Rust restart 为 stop+start 保留 lockfile；两侧 lockfile 终态差异是该已记录行为差异的后果，不以忽略规则抹除。
 - `all`：顺序执行以上套件。路由清单按当前 TypeScript 基线快照维护；没有 A/B 场景的共同路由明确标为 pending。
 
-路由清单的 `typescript_revision` 必须与本次准备的 TypeScript Git 提交一致；基线变化时 Make 运行会在发请求前失败，要求先复核并更新路由清单。当前清单中的 76 条共同路由均登记了至少一个场景；截至 2026-09-25，`core` 的真实 A/B 报告已执行此前待测的 27 条路由。`covered` 只表示场景实际执行过，不表示两端语义一致；是否一致以差异审阅和精确规则为准。
+路由清单的 `typescript_revision` 必须与本次准备的 TypeScript Git 提交一致；基线变化时 Make 运行会在发请求前失败，要求先复核并更新路由清单。`covered` 只表示场景实际执行过，不表示两端语义一致；是否一致以该轮差异审阅和精确规则为准。
 
 这不是“所有路由都已覆盖”的声明。真实结果以报告中的 `route-coverage.json` 与 `requests.jsonl` 为准；Rust-only `/api/v1/userapp` 由既有 UserApp 测试单独覆盖。
 
@@ -114,6 +115,6 @@ pnpm 包内容 store 与 registry 元数据缓存使用持久 Docker named volum
 
 `summary.md` 的 **Classified outcome** 段把每个差异归入：Rust 契约失败（`/assertions/rust/*`）、TS 已知缺陷（`/assertions/typescript/*`，如 git-revert 500、stop-dev 500）、已批准差异（命中 `diff-rules.json`）、未解释差异、传输失败与 blocked。分类只改善定位，strict 退出规则不变。
 
-当前 `diff-rules.json` 登记 25 条已批准差异（值逐条精确匹配并带复核者与到期日）：越根 symlink 边界（Rust 保留边界、TS 越根为已知缺陷）×5、UTF-8 字节数 fileSize ×1、TS `.tmp`/上传 zip 残留 ×7、Rust 复制保留嵌套 lockfile ×1、`.agents/.sync_version` 标记 ×2、TS 删除清单含日志目录 ×1（Java 消费者只读 success/message，2026-09-26 核对）、log-cache-stats Rust 附加字段 ×8（agent-platform 无消费者）。**仍然未分类**的已知项：TS git-revert 500 与 stop-dev 500（失败断言如实保留，不豁免冒充通过）、project-copy Git 历史（待产品决策）、dev 日志缓存口径（Rust 将 dev 日志写入日志缓存：stats 的 `cacheSize`/容量字段与 `get-dev-log` 的 `cacheHit`/消息文案不同；Java `CustomPageBuildController` 会透传 `cacheHit` 到前端，属消费者可见差异，待产品裁定）、export zip 的 TS 框架头（POST 下载上的 Accept-Ranges/Last-Modified/Cache-Control）。`get-dev-log-page-2` 的 `startIndex` 归一是因为各侧回显自己请求的行号（两侧行数不同），回显正确性由 `validate_log_page` 断言。
+`diff-rules.json` 保存经确认的精确差异及其复核者、原因和到期日，规则数量与内容以实际文件为准。传输失败、失败断言和未分类差异继续使严格比较失败；消费者差异应按公开 API 合同单独核对，不通过扩大归一范围消除。`get-dev-log-page-2` 的 `startIndex` 归一仅用于各侧回显自己的请求行号，两侧回显正确性仍由 `validate_log_page` 断言。
 
-版本端点：各端报告自身实现的契约线版本（Rust 报 `API_CONTRACT_VERSION`，非 crate 构建号——Java `FileServerVersionSupport` 以 `>=1.4.0` 门禁 agent-store 能力）；A/B 断言语义版本形状而非跨端相等。
+版本端点：各端报告自身实现的契约线版本；Rust 使用 `API_CONTRACT_VERSION`，不同于 crate 构建号。A/B 断言语义版本形状，不要求跨端版本相等；调用方按所需能力与契约版本判断兼容性。

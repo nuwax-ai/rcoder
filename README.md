@@ -2,409 +2,75 @@
 
 > [English](README_EN.md)
 
-RCoder 是一个基于 Rust 构建的现代化 AI 驱动开发平台，通过 **ACP (Agent Client Protocol)** 协议统一接入多种 AI 代理（Claude Code、Codex 等）。项目采用**微服务架构**，支持 **Docker 与 Kubernetes 双运行时**、**gRPC 高性能通信**，并内置完整的 **UserApp 应用管理**（开发/生产双环境、发布链、自动回收）。
+RCoder 是基于 Rust 和 ACP（Agent Client Protocol）的 AI 开发平台。它通过 HTTP/SSE 接入 Claude Code、Codex 等 Agent，并管理 UserApp 从源码开发、构建到部署的生命周期。同一套代码支持 Docker 与 Kubernetes 运行时。
 
-## ✨ 核心特性
+## 主要能力
 
-- 🤖 **多代理支持**：基于官方 ACP SDK（`agent-client-protocol v2`，wire 兼容所有 ACP v1 agent）统一接入 Claude Code、Codex 等
-- 🐳 **双运行时**：Docker Compose（本地开发）与 Kubernetes（生产，STS + per-agent PVC + CephFS）同一套代码
-- 📦 **UserApp 应用管理**：dev/prod 双环境、构建发布链、文件/日志/存储管理、闲置回收与流量唤醒、彻底删除
-- 🔁 **反向代理**：集成 Cloudflare Pingora，高性能端口路由与 UserApp 子路径代理
-- 🌐 **HTTP API**：基于 Axum 的 REST API + 统一 SSE 进度流，utoipa 自动生成 OpenAPI 文档（Swagger UI + Scalar 双面）
-- ⚡ **gRPC 通信**：基于 Tonic 的高性能内部通信，支持 Server Streaming 实时进度
-- 🖥️ **Computer Agent**：容器化 AI 代理环境，集成 VNC 远程桌面、音频流和 IME 输入
-- 🧩 **可插拔存储**：内存后端（默认）与 PostgreSQL 后端（K8s 变体）feature 切换
-- 📊 **可观测性**：Tracing + OpenTelemetry 链路追踪 + dial9 事件级 Tokio tracing
-- 🔒 **安全红线**：workspace 级 lint 禁止 `unsafe` 代码、禁止 `unwrap/expect` 进生产路径
+- **Agent 会话**：统一 ACP 接入、gRPC 内部通信、SSE 实时进度与断线续传。
+- **UserApp 托管**：开发/生产环境、构建发布、闲置回收、流量唤醒，以及保留数据的启停与恢复。
+- **文件与开发服务**：工作区、Git、技能、开发服务器及应用日志接口。
+- **Computer Agent**：容器化桌面，支持 VNC、音频和输入法透传。
+- **双运行时**：本地 Docker 与 Kubernetes 容器编排，共享业务契约。
+- **独立存储选择**：Agent 项目/会话支持内存或 PostgreSQL；UserApp 控制记录在本地使用 Turso，在 Kubernetes 使用 PostgreSQL。
+- **API 与观测**：OpenAPI、Tracing、OpenTelemetry，以及按需启用的性能诊断。
 
-## 📚 文档
+## 架构
 
-完整文档见 [docs/](docs/README.md)：
-
-- [架构总览](docs/architecture/overview.md) —— 主链路、核心组件、crate 地图与三种部署形态
-- [gRPC 内部通信](docs/architecture/grpc.md)
-- 业务概念：[UserApp 应用管理](docs/concepts/userapp.md) · [会话与 SSE](docs/concepts/agent-sessions.md) · [权限审批](docs/concepts/permissions.md) · [文件服务](docs/concepts/file-services.md)
-- 部署形态：[Docker Compose](docs/deployment/docker.md) · [Kubernetes](docs/deployment/kubernetes.md) · [宿主机单机 deploy-host](docs/deployment/host.md)
-- [可观测性指南](docs/observability.md)
-
-## 🏠 架构概览
-
-### 整体架构
-
-```
-外部客户端 (HTTP/SSE)
+```text
+客户端 HTTP/SSE
     ↓
-RCoder (HTTP API Server + 容器管理 + gRPC 客户端)
-    ↓ gRPC (Chat, CancelSession, SubscribeProgress)
-Agent Runner (gRPC Server in 容器/Pod)
-    ↓ Server Streaming (实时进度事件)
-RCoder (转换为 SSE)
-    ↓
-外部客户端 (SSE)
+RCoder：HTTP 接口 + 引擎编排 + 容器运行时
+    ↓ Tonic gRPC
+agent_runner：容器内运行环境
+    ↓ ACP
+AI Agent
 ```
 
-### 核心组件
+HTTP 接口位于 `http-server`，业务编排位于 `rcoder-engine`，`rcoder` 负责应用装配。UserApp 由应用管理层、Docker/K8s 运行时及容器内 app-cli 管理。详见[架构总览](docs/architecture/overview.md)。
 
-- **RCoder 主服务**：Axum HTTP 装配 + 容器编排 + gRPC 客户端 + file-server 嵌入
-- **Agent Runner**：容器内的 AI 代理运行环境，提供 gRPC 服务并驱动 ACP 连接
-- **App Manager**：UserApp 全生命周期（dev 开发环境 / prod 运行环境）
-- **Pingora 代理**：高性能反向代理（端口路由 + UserApp 应用代理）
-- **Docker Manager**：容器生命周期管理（Docker / K8s 双后端抽象）
+<a id="quick-start"></a>
 
-### 🛠️ 技术栈
+## 快速开始
 
-| 组件类型 | 技术选型 | 说明 |
-|----------|---------|------|
-| **编程语言** | Rust 2024 Edition | 使用最新 Rust stable；构建记录实际工具链版本 |
-| **HTTP 框架** | Axum 0.8 + Tower | 高性能异步 Web 框架 |
-| **RPC 框架** | Tonic 0.14 | 高性能 gRPC 通信（全 rustls） |
-| **AI 协议** | agent-client-protocol v2 + MCP (rmcp) | ACP 官方 SDK，v1 wire 兼容 |
-| **容器化** | Docker (Bollard) + Kubernetes (kube-rs) | 双运行时抽象 |
-| **持久化** | PostgreSQL (SQLx, feature-gated) / 内存 | K8s 变体启用 PG，Docker 路径零依赖 |
-| **日志系统** | Tracing + OpenTelemetry | 结构化日志（K8s 下写文件按天滚动） |
-| **性能分析** | dial9 + hotpath | 事件级 Tokio tracing（本地 dev）+ 函数耗时剖析 |
-| **API 文档** | utoipa + Swagger UI + Scalar | 自动生成 OpenAPI |
-
-## 🚀 快速开始
-
-### 📝 环境要求
-
-- Rust: 1.85+（2024 Edition）
-- Docker（本地 Docker Compose 模式）或 K8s 集群（devspace，推荐 OrbStack）
-- 可选：Claude Code CLI（用于 Claude 代理）
-
-### 🛠️ 安装与运行
-
-#### 本地开发
+推荐使用本地 Docker Compose。准备 Docker、Compose 和 Make；源码构建工具链使用 Rust stable（2024 Edition），完整前置见[贡献指南](CONTRIBUTING.md#开发环境)。
 
 ```bash
-# 克隆仓库
 git clone https://github.com/nuwax-ai/rcoder.git
 cd rcoder
-
-# 本地编译（workspace 全量）
-cargo build --workspace
-
-# 运行主服务（默认端口 8087）
-cargo run --bin rcoder
-
-# 指定端口和项目目录
-cargo run --bin rcoder -- --port 8087 --projects-dir ./my-projects
+make dev-build
+make dev-up
+curl http://127.0.0.1:8090/health
 ```
 
-#### Docker Compose 开发模式（推荐，端口 8090）
+启动后访问 [API 文档](http://127.0.0.1:8090/api/docs)。健康检查验证控制面；真实 AI 会话还需准备 Agent、模型地址与凭据，见[配置指南](docs/configuration.md)。
 
-```bash
-# 首次部署：构建镜像 + 启动容器
-make dev-build    # 构建 Docker 镜像
-make dev-up       # 启动容器（主服务 8090 / Pingora 8089）
+日常修改 Rust 后可用 `make dev-hot` 增量编译并重启；查看日志用 `make dev-logs`，停止用 `make dev-down`。镜像、持久化与完整操作步骤见 [Docker 指南](docs/deployment/docker.md)。
 
-# 日常开发：改 Rust 源码后秒级热编译（容器内增量编译 + 替换二进制 + 重启）
-make dev-hot      # 推荐！增量 <2min，无需全量重建
+## 文档
 
-# 全量重建（仅改 Dockerfile / Cargo.toml 依赖 / 非 Rust 文件时需要，10+ 分钟）
-make dev-restart
+完整目录见 [docs/README.md](docs/README.md)。
 
-# 日志 / 停止
-make dev-logs
-make dev-down
-```
+| 目的 | 指南 |
+|---|---|
+| 配置与模型准备 | [配置指南](docs/configuration.md) |
+| 部署 | [Docker Compose](docs/deployment/docker.md)、[宿主机](docs/deployment/host.md)、[Kubernetes](docs/deployment/kubernetes.md) |
+| 接入会话 | [Agent 与 SSE](docs/concepts/agent-sessions.md)、[权限审批](docs/concepts/permissions.md) |
+| 使用应用与文件服务 | [UserApp](docs/concepts/userapp.md)、[文件服务](docs/concepts/file-services.md)、[Computer Agent](docs/concepts/computer-agent.md) |
+| 构建与服务管理 | [app-cli](docs/development/app-cli.md)、[配置校验](docs/development/app-cli-validate.md) |
+| 运行与排障 | [错误与重试](docs/runtime-error-contract.md)、[owner 恢复](docs/userapp-dev-owner-recovery.md)、[可观测性](docs/observability.md) |
 
-#### 本地 K8s 模式（devspace + OrbStack，端口 8290）
+完整 API 契约以运行时 OpenAPI 为准：`/api/docs` 提供 Swagger UI，`/api/docs/scalar` 提供 Scalar；包含主服务和 file-server 文档。
 
-```bash
-# 初始化并启动（namespace: rcoder-dev）
-make devspace-init
-make devspace-dev
+## 开发与验证
 
-# 健康检查
-curl http://127.0.0.1:8290/health
-```
+开发环境、构建、格式化、Clippy 和测试要求见 [CONTRIBUTING.md](CONTRIBUTING.md)。根 workspace 使用 `make test`；`crates/app-cli` 是独立 Cargo 项目，需要单独检查。
 
-> ⚠️ K8s/devspace 模式下 rcoder 日志**写文件不写 stdout**（`/app/logs/rcoder.YYYY-MM-DD`，JSON 格式），`kubectl logs` 几乎为空属正常现象。
+核心业务的真实 Compose 回归使用 `make test-e2e`，前置和验收边界见 [E2E 说明](tests-e2e/tools/README.md)。组件测试、部署验收和发布结果分别记录。
 
-#### 启用反向代理
+## 贡献与安全
 
-```bash
-# 启用 Pingora 反向代理
-cargo run --bin rcoder -- --enable-proxy --proxy-port 8080
+欢迎通过 [Issues](https://github.com/nuwax-ai/rcoder/issues) 与 Pull Request 参与。提交前阅读[贡献指南](CONTRIBUTING.md)；漏洞请按 [SECURITY.md](SECURITY.md) 私下报告。
 
-# 指定默认后端端口
-cargo run --bin rcoder -- --enable-proxy --proxy-port 8080 --backend-port 3000
-```
+## 许可证
 
-### 💻 命令行参数
-
-| 参数 | 短参数 | 说明 | 示例 |
-|------|--------|------|------|
-| `--port` | `-p` | 设置主服务端口 | `--port 8087` |
-| `--projects-dir` | `-d` | 设置项目工作目录 | `--projects-dir ./projects` |
-| `--enable-proxy` | `-e` | 启用 Pingora 反向代理 | `--enable-proxy` |
-| `--proxy-port` | 无 | 设置 Pingora 监听端口 | `--proxy-port 8080` |
-| `--backend-port` | 无 | 默认后端端口 | `--backend-port 3000` |
-
-```bash
-# 查看所有参数
-cargo run --bin rcoder -- --help
-```
-
-## 📚 API 文档
-
-接口的**权威定义**是运行时自动生成的 OpenAPI 文档：启动服务后访问 `/api/docs`（Swagger UI 与 Scalar 双面，含主文档与 file-server 双文档），全部端点的参数、响应与错误契约都在其中。
-
-核心入口（各域概念见文档）：
-
-| 入口 | 域 |
-|------|------|
-| `POST /chat` + `GET /agent/progress/{session_id}` (SSE) | AI 会话主链（[会话与 SSE](docs/concepts/agent-sessions.md)） |
-| `/api/v1/userapp/*` | UserApp 应用管理（[概念](docs/concepts/userapp.md)） |
-| `/computer/*` | Computer Agent：VNC/音频/IME 容器化代理环境 |
-| gRPC `AgentService` | rcoder ↔ agent_runner 内部通信（[gRPC](docs/architecture/grpc.md)），proto 在 `crates/shared_types_grpc/proto/agent.proto` |
-
-### 💬 使用示例
-
-```bash
-# 健康检查
-curl http://localhost:8087/health
-
-# 聊天
-curl -X POST http://localhost:8087/chat \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "你好，请帮我创建一个 Rust Web API 项目",
-    "project_id": "my-project"
-  }'
-
-# 实时进度流
-curl http://localhost:8087/agent/progress/your-session-id \
-  -H "Accept: text/event-stream"
-```
-
-## 📁 项目结构
-
-```
-crates/
-├── rcoder/                  # 主应用（HTTP 装配 + 容器编排 + gRPC 客户端）
-├── agent_runner/            # Agent 运行时（容器内 gRPC 服务端 + ACP 连接驱动）
-├── agent_abstraction/       # ACP Agent 抽象层（Claude Code / Codex 统一接入）
-├── agent_config/            # Agent 配置管理
-├── agent_provisioning/      # Agent 安装/供应
-├── model_probe/             # 模型预检探活（建会话前 fail-fast）
-├── docker_manager/          # 容器/运行时管理（Docker + K8s 双后端实现）
-├── container-runtime-api/   # 容器运行时抽象 trait 层
-├── app_manager/             # UserApp 生命周期/存储/文件管理
-├── file-server/             # 独立文件服务（可嵌入 rcoder，也可 npm 独立分发）
-├── file-server-userapp/     # file-server 的 userapp 域实现
-├── file-server-proxy/       # file-server 分流代理
-├── rcoder-proxy/            # Pingora 反向代理封装
-├── rcoder-storage/          # 存储层（memory / PostgreSQL 后端）
-├── rcoder-gateway/          # K8s 无状态网关（header 注入 + Envoy Gateway 路由）
-├── rcoder-telemetry/        # 遥测（Tracing + OTel）
-├── rcoder-cli/              # 本地测试 ACP agent 的 CLI 工具
-├── shared_types/            # 共享类型与常量
-├── shared_types_grpc/       # gRPC proto 定义（proto/agent.proto）
-├── shared_types_i18n/       # 错误码国际化
-├── workspace-manifest/      # UserApp workspace 两级 manifest 类型
-├── frontend-detector/       # 前端项目框架探测（纯函数）
-├── download_utils/          # 下载工具
-├── process_utils/           # 进程工具
-├── app-cli/                 # 跨平台 UserApp 构建与服务管理器（独立 workspace，npm 分发）
-tests-e2e/                   # e2e 测试（Docker Compose 真实环境）
-```
-
-## ⚙️ 配置
-
-### 配置优先级
-
-1. **环境变量** - 最高优先级
-2. **命令行参数** - 次高优先级
-3. **配置文件**（config.yml，自动生成/挂载）- 较低优先级
-4. **默认配置** - 最低优先级
-
-### 配置文件示例（节选，完整见 [docker/config.yml](docker/config.yml)）
-
-```yaml
-# 默认使用的 AI 代理类型 (Claude/Codex)
-default_agent: "Claude"
-
-# 项目工作目录
-projects_dir: "/app/project_workspace"
-
-# 主服务端口（会被环境变量 RCODER_PORT 覆盖）
-port: 8090
-
-# 容器清理配置
-cleanup_config:
-  enabled: true
-  idle_timeout_seconds: 600
-  cleanup_interval_seconds: 500
-  docker_stop_timeout_seconds: 30
-  container_protection_seconds: 300
-
-# Pingora 反向代理配置
-proxy_config:
-  listen_port: 8088
-  default_backend_port: 8090
-  backend_host: "127.0.0.1"
-
-# Docker 配置（多镜像 + 按服务类型资源限额，K8s 模式下作为 Pod resources 来源）
-docker_config:
-  multi_image_config:
-    # 全局默认 / 按架构（arm64/amd64）/ 按服务类型的镜像配置
-    ...
-
-# 60000 file-server 分流代理（dev 形态）
-file_server_proxy:
-  listen_port: 60000
-  rust_upstream_port: 8090
-  ts_upstream_port: 60001
-  policy: all_rust
-```
-
-### 环境变量（常用）
-
-| 变量名 | 说明 | 默认值 |
-|--------|------|--------|
-| `RCODER_PORT` | 服务端口 | 8087 |
-| `RCODER_PROJECTS_DIR` | 项目目录 | ./project_workspace |
-| `RCODER_STORAGE_BACKEND` | 存储后端（memory/postgres） | memory |
-| `DOCKER_SOCKET_PATH` | Docker socket 路径 | /var/run/docker.sock |
-| `RCODER_DOCKER_IMAGE` 等 | 自定义镜像配置 | - |
-| `RUST_LOG` | 日志级别 | info |
-
-## 🔧 开发指南
-
-### 运行测试
-
-```bash
-# 根 workspace：nextest，开启所有 features，收集全部失败
-make test
-
-# 单 crate
-make test NEXTEST_ARGS='-p app_manager'
-
-# 默认 feature 回归 / 独立 app-cli / 文档测试
-make test-default
-make test-app-cli
-make test-doc
-
-# 串行执行 workspace + app-cli + 文档测试；任一失败整体失败
-make test-all
-
-# 仅库单元 / Rust 集成测试目标
-make test-unit
-make test-integration
-
-# 本地 Docker Compose 核心业务集成回归，防止逻辑偏移
-make test-e2e
-```
-
-需安装 `cargo-nextest`（`cargo install cargo-nextest --locked`）。`make test` 等价于 `cargo nextest run --workspace --no-fail-fast --all-features`；`TEST_FEATURES=` 可切换为默认 features，`NEXTEST_ARGS` 可传 nextest 筛选参数。crate 专用筛选用于对应单个目标，不用于跨 workspace/app-cli 的 `test-all`。`test-doc` 使用 Cargo 文档测试，不接收 `NEXTEST_ARGS`。
-
-`test-all` 不包含 Compose/K8s E2E，也不代替默认 feature 回归。`make test-e2e` 通过专用严格启动器验证核心业务链路；运行前准备本地 Compose 及所需镜像，详见 [E2E 说明](tests-e2e/tools/README.md)。nextest 的环境门控用例通过或跳过不能代替该门禁。失败时逐项区分已批准需求导致的测试预期偏移、代码缺陷和环境问题，修复后重跑对应回归。
-
-### 代码质量
-
-```bash
-# 格式化
-cargo fmt
-
-# Lint（workspace 当前零告警，含 -D unsafe_code / await_holding_lock 等红线）
-cargo clippy --workspace --all-features --tests
-```
-
-### 日常开发节奏
-
-```bash
-# Docker Compose 模式：改码 → 热编译秒级生效
-make dev-hot
-
-# K8s/devspace 模式：源码自动 sync，但需重启 rcoder 进程生效
-# （容器内 /app/dev-rcoder.sh restart，增量编译 ~1min）
-
-# 本地直跑
-RUST_LOG=debug cargo run --bin rcoder -- --port 8087
-```
-
-## 🚀 部署指南
-
-三种部署形态的完整说明见文档：[Docker Compose](docs/deployment/docker.md)（本地推荐，含 dev-hot 秒级热编译）、[Kubernetes](docs/deployment/kubernetes.md)（生产：Agent Runner 为 STS + per-agent PVC 停止不删卷、OOM 容器级自愈；UserApp prod 为 Deployment + per-app PVC）、[宿主机单机 deploy-host](docs/deployment/host.md)（有 Docker 就能跑的桌面基座形态）。
-
-```bash
-# 镜像构建
-make docker-build                  # 全量
-make docker-build-master           # 主服务镜像
-make docker-build-agent-runner     # Agent Runner 镜像
-make docker-build-agent-production # 生产镜像（无调试工具）
-make docker-build-app-runtime      # UserApp 运行时镜像（统一多语言）
-
-# 本地 K8s 开发
-make devspace-dev
-```
-
-性能诊断（dial9 事件级 Tokio tracing）：`make dial9-on` / `dial9-off` / `dial9-view`，详见[可观测性指南](docs/observability.md)。
-
-## 🐛 问题排查
-
-### 常见问题
-
-- **端口被占用**：使用 `--port` 参数指定其他端口
-- **容器启动失败**：检查 Docker 服务状态和网络配置
-- **gRPC 连接失败**：确认容器网络和端口配置（K8s 下为 `{pod}-svc.{ns}.svc.cluster.local:50051`）
-- **K8s 下 kubectl logs 为空**：正常现象，rcoder 日志写 pod 内 `/app/logs/rcoder.YYYY-MM-DD`（JSON 按天滚动）
-- **API Key 错误**：检查 `api_key_auth` 配置
-
-### 调试模式
-
-```bash
-# 启用详细日志
-RUST_LOG=debug cargo run --bin rcoder
-
-# 查看容器日志
-make dev-logs
-
-# 进入容器调试
-docker exec -it <container_id> /bin/bash
-
-# 本地测试 ACP agent（无需起完整服务）
-cargo run -p rcoder-cli
-```
-
-## 📈 版本与主要能力
-
-当前 workspace 版本 **0.1.3**。主要能力：
-
-- ✅ ACP 官方 SDK v2（wire 兼容 Claude Code / Codex 等 ACP v1 agent）
-- ✅ gRPC 通信架构（Tonic 0.14，Server Streaming 进度流）
-- ✅ Docker + Kubernetes 双运行时（STS/PVC 生命周期、OOM 自愈）
-- ✅ UserApp 应用管理（dev/prod 双环境、发布链、回收/唤醒、彻底删除）
-- ✅ Computer Agent（VNC/noVNC、音频流、IME）
-- ✅ 模型预检 fail-fast（model_probe）
-- ✅ API Key 鉴权中间件
-- ✅ OpenTelemetry 追踪 + dial9 事件级 Tokio tracing（本地 dev）
-- ✅ file-server / app-cli npm 独立分发
-
-## 🔗 相关链接
-
-- **项目仓库**: [github.com/nuwax-ai/rcoder](https://github.com/nuwax-ai/rcoder)
-- **问题追踪**: [Issues](https://github.com/nuwax-ai/rcoder/issues)
-- **ACP 协议**: [agent-client-protocol](https://crates.io/crates/agent-client-protocol)
-- **MCP 协议**: [rmcp](https://crates.io/crates/rmcp)
-
-## 📝 许可证
-
-本项目采用 Apache-2.0 许可证。详见 [LICENSE](LICENSE) 文件。
-
-## 🤝 贡献
-
-欢迎贡献！参与方式见 [CONTRIBUTING.md](CONTRIBUTING.md)，安全漏洞报告见 [SECURITY.md](SECURITY.md)。
-
-1. Fork 项目
-2. 创建特性分支 (`git checkout -b feature/amazing-feature`)
-3. 提交更改（遵循 Conventional Commits，中文描述）
-4. 推送到分支 (`git push origin feature/amazing-feature`)
-5. 开启 Pull Request
-
----
-
-💫 **由 RCoder 团队精心打造，致力于推进 AI 驱动的现代化开发体验。**
+本项目采用 [Apache-2.0](LICENSE) 许可证。

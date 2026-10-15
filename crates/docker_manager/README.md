@@ -1,234 +1,47 @@
-# Docker Manager
+# Docker 与 Kubernetes 运行时
 
-基于 bollard 库的 Docker 容器动态管理模块，用于 RCoder 项目中的 Docker Agent 管理。
+`docker_manager` 实现 RCoder 的 Docker 与 Kubernetes 容器运行时，管理 Agent、UserApp builder 和生产应用的计算资源。跨 crate 接口定义在 [container-runtime-api](../container-runtime-api/src/runtime_trait.rs)，业务生命周期和持久化协调由上层处理。
 
-## 功能特性
+## 主要入口
 
-- ✅ 动态创建和销毁 Docker 容器
-- ✅ 支持项目工作目录挂载
-- ✅ 容器状态监控和日志获取
-- ✅ 支持环境变量和端口映射配置
-- ✅ 自动镜像拉取和资源限制
-- ✅ 容器生命周期管理
+| 入口 | 职责 |
+|---|---|
+| [RuntimeManager](src/runtime/manager.rs) | 初始化选中的后端，完成健康检查，提供 `Arc<dyn ContainerRuntime>` |
+| [DockerRuntime](src/runtime/docker_runtime/mod.rs) | 将统一运行时接口适配到 Docker |
+| [KubernetesRuntime](src/runtime/kubernetes_runtime/mod.rs) | 将统一接口适配到 K8s；需要 `kubernetes` feature |
+| [DockerManager](src/manager.rs) | Docker 连接、容器创建、查询、停止及底层资源操作 |
+| [ContainerConfigBuilder](src/container_builder/config_builder.rs) | 构造 Docker 容器配置 |
 
-## 核心组件
+Agent 执行通过容器内的 agent_runner 完成；本 crate 负责运行资源，不直接实现 ACP 会话。
 
-### 1. DockerManager
-主要的 Docker 管理器，提供容器的完整生命周期管理。
+## 配置与初始化
 
-```rust
-use docker_manager::{DockerManager, DockerManagerConfig};
+后端由 `CONTAINER_RUNTIME` 选择：`docker` 或未设置时使用 Docker，`kubernetes` / `k8s` 使用 Kubernetes。选择 Kubernetes 而二进制未编入对应 feature 时，初始化返回配置错误。
 
-// 创建 Docker 管理器
-let config = DockerManagerConfig::default();
-let docker_manager = DockerManager::new(config).await?;
+RCoder 从应用配置构造 [DockerManagerConfig](src/types/config.rs)，再调用 `RuntimeManager::init`。配置装配见 [docker_init.rs](../rcoder-engine/src/docker_init.rs)：Docker 的镜像及服务配置读取 `multi_image_config`，K8s 读取 `kubernetes_config`。具体镜像、网络、资源限制和工作目录由所选部署配置提供，不能假定所有服务使用同一镜像或固定的 host 网络。
 
-// 创建容器
-let container_info = docker_manager.create_container(config).await?;
+Docker 连接优先使用显式 `docker_host`；未设置时，非默认的 `DOCKER_SOCKET_PATH` 用于指定本地 socket，否则使用 Docker 本地默认连接。初始化会验证 daemon 连接和所需网络，失败直接返回原因。K8s 的连接和资源配置见 [Kubernetes 部署说明](../../docs/deployment/kubernetes.md)。
 
-// 停止容器
-docker_manager.stop_container("project_id").await?;
-```
+业务层通过统一运行时接口调用后端。只有需要 Docker 专有能力的底层代码才直接使用 `DockerManager`；完整字段以源码类型为准，配置说明见 [项目配置](../../docs/configuration.md)。
 
-### 2. DockerContainerConfig
-容器配置结构体，定义容器的各种参数。
+## 生命周期与数据保护
 
-```rust
-use docker_manager::DockerContainerConfig;
+- 创建、停止、重启和删除使用捕获的应用、生命周期及物理资源身份，不能以同名资源或端口连通授权接管。
+- UserApp builder 的复用、配置更新和恢复由上层协调器与运行时共同完成。停止未确认或已发写入结果未知时，继续核验原操作，不能另起第二套业务。
+- Agent 停止保留 PVC；UserApp 的计算停止与数据销毁分开，数据销毁必须通过对应的显式业务入口。
+- 状态缓存和健康检查提供观察结果，不代替资源归属、操作结果或业务就绪证明。
 
-let config = DockerContainerConfig {
-    project_id: "my_project".to_string(),
-    image: "registry.yichamao.com/rcoder:latest".to_string(),
-    host_path: "/path/to/project".to_string(),
-    container_path: "/app/workspace".to_string(),
-    env_vars: env_map,
-    port_bindings: port_map,
-    ..Default::default()
-};
-```
+应用行为见 [UserApp 指南](../../docs/concepts/userapp.md)，错误分类和重试规则见 [运行时错误契约](../../docs/runtime-error-contract.md)。
 
-### 3. DockerUtils
-工具函数集合，简化常见操作。
+## 验证与排障
 
-```rust
-use docker_manager::DockerUtils;
-
-// 根据项目ID创建配置
-let config = DockerUtils::create_config_from_project_id(
-    "project_123",
-    "./project_workspace",
-    Some("custom:image".to_string()),
-);
-```
-
-## 使用场景
-
-### 1. RCoder Docker Agent
-
-在 RCoder 项目中，Docker Agent 用于为每个项目创建独立的运行环境：
-
-```rust
-use docker_manager::{DockerAgentManager, DockerUtils};
-use rcoder::model::{AgentType, ChatPrompt};
-
-// 创建 Docker Agent 管理器
-let docker_agent_manager = DockerAgentManager::new().await?;
-
-// 为项目创建 Docker Agent
-let chat_prompt = ChatPrompt {
-    project_id: "project_123".to_string(),
-    agent_type: AgentType::Docker,
-    // ... 其他字段
-};
-
-let docker_agent = docker_agent_manager.create_docker_agent(
-    &chat_prompt,
-    AgentType::Docker
-).await?;
-```
-
-### 2. 项目隔离
-
-每个项目在独立的 Docker 容器中运行，确保环境隔离：
-
-- 挂载路径: `./project_workspace/{project_id}` → `/app/workspace`
-- 镜像: `registry.yichamao.com/rcoder:latest`
-- 网络: 使用 host 模式以获得更好的性能
-
-### 3. 环境变量配置
-
-Docker Agent 支持丰富的环境变量配置：
-
-```rust
-let mut env_vars = HashMap::new();
-env_vars.insert("ANTHROPIC_AUTH_TOKEN".to_string(), "your_token".to_string());
-env_vars.insert("PROJECT_ID".to_string(), "project_123".to_string());
-env_vars.insert("DOCKER_AGENT_TYPE".to_string(), "claude".to_string());
-```
-
-## 配置选项
-
-### DockerManagerConfig
-
-```rust
-pub struct DockerManagerConfig {
-    pub docker_host: Option<String>,          // Docker 守护进程地址
-    pub default_image: String,               // 默认镜像
-    pub default_network_mode: String,         // 默认网络模式
-    pub default_work_dir: String,             // 默认工作目录
-    pub auto_cleanup: bool,                   // 是否启用自动清理
-    pub container_ttl_seconds: Option<u64>,   // 容器存活时间
-}
-```
-
-### 环境变量配置
-
-可以通过环境变量配置 Docker 管理器：
-
-- `DOCKER_HOST`: Docker 守护进程地址
-- `DEFAULT_DOCKER_IMAGE`: 默认镜像
-- `DOCKER_NETWORK_MODE`: 网络模式
-- `DOCKER_WORK_DIR`: 工作目录
-- `DOCKER_AUTO_CLEANUP`: 自动清理
-- `DOCKER_CONTAINER_TTL`: 容器TTL
-
-## 集成到 RCoder
-
-### 1. 启用 Docker Agent
-
-设置环境变量启用 Docker Agent：
+从仓库根执行受影响的组件检查：
 
 ```bash
-export USE_DOCKER_AGENT=true
+cargo nextest run -p docker_manager --no-fail-fast
+cargo nextest run -p docker_manager --no-fail-fast --all-features
 ```
 
-### 2. 项目目录结构
+组件测试不能替代真实 Docker/K8s 资源验证。Docker 场景使用 [Compose 部署与验证](../../docs/deployment/docker.md)，K8s 场景使用 [远端工作流](../../docs/deployment/kubernetes.md#remote-workflow)；只操作本轮拥有的资源并保留要求保护的数据卷。
 
-```
-./project_workspace/
-├── project_123/          # 项目 123 的工作目录
-│   ├── src/
-│   ├── Cargo.toml
-│   └── ...
-├── project_456/          # 项目 456 的工作目录
-│   └── ...
-```
-
-### 3. Docker 镜像
-
-使用预构建的 RCoder Docker 镜像：
-- 镜像地址: `registry.yichamao.com/rcoder:latest`
-- 包含完整的 AI 开发工具链
-- 支持 Claude Code 和 Codex Agent
-
-## 错误处理
-
-所有操作都返回 `DockerResult<T>`，包含详细的错误信息：
-
-```rust
-match docker_manager.create_container(config).await {
-    Ok(container_info) => {
-        println!("容器创建成功: {}", container_info.container_name);
-    }
-    Err(DockerError::ContainerCreationError(msg)) => {
-        eprintln!("容器创建失败: {}", msg);
-    }
-    Err(e) => {
-        eprintln!("其他错误: {}", e);
-    }
-}
-```
-
-## 日志和监控
-
-### 获取容器日志
-
-```rust
-// 获取最后 50 行日志
-let logs = docker_manager.get_container_logs("project_id", 50).await?;
-println!("容器日志:\n{}", logs);
-```
-
-### 监控容器状态
-
-```rust
-// 检查容器状态
-let status = docker_manager.update_container_status("project_id").await?;
-if let Some(status) = status {
-    println!("容器状态: {:?}", status);
-}
-```
-
-## 最佳实践
-
-1. **资源管理**: 及时停止不用的容器以释放资源
-2. **错误处理**: 始终检查操作结果并处理错误
-3. **日志监控**: 定期检查容器日志以了解运行状态
-4. **环境隔离**: 为每个项目使用独立的容器
-5. **镜像管理**: 使用固定版本的镜像以避免意外更新
-
-## 故障排除
-
-### 常见问题
-
-1. **Docker 连接失败**
-   - 检查 Docker 守护进程是否运行
-   - 验证 Docker socket 权限
-
-2. **镜像拉取失败**
-   - 检查网络连接
-   - 验证镜像地址和认证信息
-
-3. **容器启动失败**
-   - 检查资源限制（内存、CPU）
-   - 验证挂载路径权限
-   - 查看容器日志了解详细错误
-
-### 调试模式
-
-启用详细日志进行调试：
-
-```bash
-export RUST_LOG=debug
-cargo run --example basic_usage
-```
+连接或创建失败时，核对当前后端、socket/kubeconfig 权限、镜像拉取凭据、实际挂载及资源状态。结合原 operation ID 和物理资源 ID 查询日志，不把查询失败解释为资源不存在。日志与追踪入口见 [可观测性指南](../../docs/observability.md)。

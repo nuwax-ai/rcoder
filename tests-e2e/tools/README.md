@@ -2,7 +2,7 @@
 
 整体入口、分组、验收与清理逻辑见 [测试逻辑与验收流程](../architecture.md)；本页维护场景命令和前置条件。
 
-owner 丢失的容器内专项回归使用 `owner_recovery.py`，入口与验收边界见 [开发环境 owner 恢复](../../docs/userapp-dev-owner-recovery.md)。它不替代下列完整 Compose/K8s 套件。
+owner 丢失的容器内专项回归使用 `owner_recovery.py`，入口与验收边界见 [UserApp 指南](../../docs/concepts/userapp.md)。它不替代下列完整 Compose/K8s 套件。
 
 Source 凭据恢复专项使用 `make test-e2e-source-credential-recovery`，先串行构建当前 Linux app-cli/file-server-proxy 并绑定源码、二进制 SHA256，再验证内部真实 PostgreSQL 输入的 0600 持久化、对外 HTTP/SSE 裁剪、同卷新 owner 无继承 PG 环境时的真实 TCP 登录与自动业务恢复、旧脱敏记录无永久 hold、新 Source 版本、错误当前凭据失败日志、Stop/Start 和迁移去重。密码只在私有容器内比较，公开报告保存身份、权限和布尔结果；只清理自己创建的容器、保留工作卷。缺工具、源码漂移、业务失败或缺断言均为失败。报告默认为 `tests-e2e/reports/source-credential-recovery-*.json`，不代表 RCoder/Java 或远端 K8s 验收。
 
@@ -114,7 +114,7 @@ A/B 制品由本机 HTTP 服务器提供；受控阻塞制造并发窗口，断�
 
 运行前必须先构建 builder/runtime，并确认 Compose 的 `RCODER_RUNTIME_IMAGE_DIGEST=dev-app-runtime:latest`。
 生产集群与远程开发集群不属于默认入口；K8s API 契约测试使用本机适配器。
-修复编号与行为不变量见 `specs/userapp-review-repair/spec.md`，实际验证证据见该目录 `tasks.md`。
+运行、恢复及错误处理契约见 [UserApp 指南](../../docs/concepts/userapp.md) 与 [运行时错误契约](../../docs/runtime-error-contract.md)。实际结果以本轮生成的报告和必测断言为准。
 
 `contracts.py` 固定热部署与完整链的必需断言名：早退后写 pass 也会因缺步骤失败。
 `suite_cases.json` 独立固定每个测试套件的场景成员，并核对断言与报告身份登记。新增场景须同步三份登记；完整套件中删除既有测试会失败，不能通过动态发现缩减必测集合。显式 `E2E_FILTER` 只要求匹配的已登记子集，整体未命中仍失败。
@@ -130,16 +130,16 @@ A/B 制品由本机 HTTP 服务器提供；受控阻塞制造并发窗口，断�
 
 ```bash
 make test-e2e-k8s-userapp \
-  TEST_K8S_SSH=soddy@192.168.32.131 \
-  RCODER_URL=http://192.168.32.131:30295 \
-  E2E_PINGORA_URL=http://192.168.32.131:30435
+  TEST_K8S_SSH=your-cluster-alias \
+  RCODER_URL=http://node.example.com:30295 \
+  E2E_PINGORA_URL=http://gateway.example.com:8089
 ```
 
 仅支持 `nuwax-k8s-test`，检查入口属于实际节点。通过 SSH 转发直连不同 rcoder Pod；构建真实 A/B 静态制品，验证任务/SSE、冷部署、容器内热部署、失败保旧、停止后新 Pod 恢复 B 和资源清理。无需改动日常 Compose 配置。
 
 该入口独立生成 `reports/<run-id>/summary.json`、断言、请求、源码指纹和 K8s 镜像/UID 证据。所有必要断言必须通过；并发失败可记录后继续验证后续链路，但整体仍返回非零。它不覆盖原有 Agent/SSE LB、真实 AI 或七语言工具链全套场景。
 
-行为规范和真实结果见 `specs/k8s-userapp-acceptance/`。测试前必须已有用户对目标集群的明确授权。
+集群配置与资源保护见 [Kubernetes 指南](../../docs/deployment/kubernetes.md)，运行与恢复规则见 [UserApp 指南](../../docs/concepts/userapp.md)。真实结果保存在本轮报告中；测试前必须已有用户对目标集群的明确授权。
 
 ## Turso Compose configuration contract
 
@@ -212,7 +212,7 @@ CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_dev E2E_FILTER=userap
 
 ## 本机 K8s 保卷计算回归
 
-`local_k8s_core.py` 是独立的首批 Dev compute 验证入口，不执行 Cargo、部署或 AI 请求。
+`local_k8s_core.py` 是独立的 Dev compute 验证入口，不执行 Cargo、部署或 AI 请求。
 它要求新建、带本轮 owner 标签的专属 `rcoder-*` namespace；拒绝 `rcoder-dev`。
 已有 DevSpace、Gateway、PVC 和 namespace 不作为清理对象。
 
@@ -226,9 +226,12 @@ namespace 必须有 `rcoder.e2e.owner=<run_id>` 标签。不要把 kubeconfig �
 `executable`、`namespace` 和 `url`。build identity 必须含实际构建输入的
 `source_inputs_sha256`，缺失或与当前输入不同即拒绝；不以程序版本号代替源码身份。
 
+设置 `VALIDATION_ROOT` 为已准备上述身份文件的专用 run 目录。
+
 ```bash
+: "${VALIDATION_ROOT:?请设置专用 run 目录}"
 python3 tests-e2e/tools/local_k8s_core.py \
-  --root /Volumes/your-workspace/rcoder/.cache/build-verification/owned-run \
+  --root "$VALIDATION_ROOT" \
   --url http://127.0.0.1:18297 \
   --app coreyouruniquerun
 ```
@@ -251,4 +254,4 @@ python3 -m unittest discover -s tests-e2e/tools -p test_local_k8s_core.py -v
 `local_k8s_business.py`、`local_k8s_owner_fault.py`、`local_k8s_prod.py`、
 `local_k8s_prod_execute.py` 和 `local_k8s_prod_expiry.py`。各脚本的 `--help`
 列出明确前置；续跑保留旧报告并核验原身份。验收边界和实例就绪规则见
-[本机 K8s 核心回归](../../docs/development/local-k8s-core-validation.md)。
+[Kubernetes 指南](../../docs/deployment/kubernetes.md)。

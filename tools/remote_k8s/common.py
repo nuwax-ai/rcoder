@@ -106,7 +106,7 @@ class Config:
         self.context = self.get('CONTEXT', required=True)
         if not re.fullmatch(r'[a-zA-Z0-9_@./:-]+', self.context):
             raise ValueError('CONTEXT contains unsupported characters')
-        self.ns = self.get('NAMESPACE', 'rcoder-e2e-soddy')
+        self.ns = self.get('NAMESPACE', 'rcoder-e2e-local')
         if not re.fullmatch(r'rcoder-e2e-[a-z0-9][a-z0-9-]{0,35}', self.ns):
             raise ValueError('Namespace must be a dedicated rcoder-e2e-* name')
         self.id = digest([self.host, self.context, self.ns])[:16]

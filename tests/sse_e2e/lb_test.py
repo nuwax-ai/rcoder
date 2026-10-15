@@ -2,17 +2,18 @@
 """多副本负载均衡专项测试：同一会话的请求经不同节点入口/不同 rcoder 副本，
 验证会话延续、seq 连续、无重复/丢失。
 
-两类路由维度：
+路由验证维度：
   ① 副本轮换（确定性）：Pod IP 直连（:8086）——turn 依次走副本 A/B/A/B...
-  ② 节点入口轮换（用户场景）：三个节点的 NodePort(:30295) 轮换——kube-proxy
+  ② 节点入口轮换（用户场景）：配置节点的 NodePort(:30295) 轮换——kube-proxy
      随机落点，验证多入口混合访问的整体正确性
   ③ 跨副本 SSE：chat 发副本 A、SSE 订阅副本 B；断开带游标重连另一副本
 
 前置：TEST_K8S_SSH 指向集群（解析 rcoder Pod IP）；LB_ENTRY_HOSTS 为节点
-入口列表（默认 192.168.1.19,192.168.1.34,192.168.1.18）。
+入口列表（必填，逗号分隔）；单入口只验证会话/SSE 语义。
 
 用法：
-  TEST_K8S_SSH=swufe@192.168.1.19 python3 tests/sse_e2e/lb_test.py
+  TEST_K8S_SSH=your-cluster-alias LB_ENTRY_HOSTS=node-a.example.com,node-b.example.com \
+    python3 tests/sse_e2e/lb_test.py
 """
 
 import json
@@ -28,13 +29,11 @@ from common import (  # noqa: E402
     scoped_user,
 )
 
-K8S_SSH = os.environ.get("TEST_K8S_SSH", "")
+K8S_SSH = os.environ.get("TEST_K8S_SSH", "").strip()
 K8S_NS = os.environ.get("TEST_K8S_NS", "nuwax-k8s-test")
 ENTRY_HOSTS = [
     h.strip()
-    for h in os.environ.get(
-        "LB_ENTRY_HOSTS", "192.168.1.19,192.168.1.34,192.168.1.18"
-    ).split(",")
+    for h in os.environ.get("LB_ENTRY_HOSTS", "").split(",")
     if h.strip()
 ]
 NODEPORT = os.environ.get("LB_NODEPORT", "30295")
@@ -128,19 +127,26 @@ def snippet(a: str, b: str, win: int = 24) -> str:
 
 
 def main():
+    missing = []
     if not K8S_SSH:
-        print("❌ 需要 TEST_K8S_SSH（解析副本 IP 与清理）")
-        sys.exit(1)
+        missing.append("TEST_K8S_SSH（解析副本 IP 与清理）")
+    if not ENTRY_HOSTS:
+        missing.append("LB_ENTRY_HOSTS（逗号分隔的节点入口 IP/主机名）")
+    if missing:
+        print("❌ 缺少必填配置：" + "、".join(missing), file=sys.stderr)
+        sys.exit(2)
     entries = [f"http://{h}:{NODEPORT}" for h in ENTRY_HOSTS]
     print(f"节点入口: {entries}")
+    if len(entries) == 1:
+        print("单入口模式：验证会话与 SSE 语义，不证明多节点负载均衡。")
 
     user = scoped_user("lb")
     c = Check()
 
-    # ===== 场景 1（主路径）：chat 经三个节点 NodePort 轮换，SSE 也轮换入口 =====
-    # 真实用户路径：宿主机 IP + NodePort；kube-proxy 落点随机（后端 3 副本），
+    # ===== 场景 1（主路径）：chat 经配置节点 NodePort 轮换，SSE 也轮换入口 =====
+    # 真实用户路径：宿主机 IP + NodePort；kube-proxy 落点由实际副本部署决定，
     # 多轮轮换自然遍历"chat 落副本 X、SSE 落副本 Y"的组合。
-    print("\n▶ lb_entry_rotation（chat 三节点 NodePort 轮换 + SSE 入口轮换）")
+    print("\n▶ lb_entry_rotation（chat 节点 NodePort 轮换 + SSE 入口轮换）")
     prompts = [
         "从1数到5，每行一个数字",
         "我上一条让你做什么了？一句话回答，再解释 CAP 定理三点",
@@ -150,8 +156,8 @@ def main():
     replies, turn_max = [], 0
     sid = pid = None
     for i, prompt in enumerate(prompts):
-        chat_url = entries[i % len(entries)]  # chat: .19 → .34 → .18 → .19
-        sse_url = entries[(i + 1) % len(entries)]  # SSE: .34 → .18 → .19 → .34
+        chat_url = entries[i % len(entries)]  # chat 依次轮换配置入口
+        sse_url = entries[(i + 1) % len(entries)]  # SSE 使用下一个配置入口
         p = base_payload(prompt, f"{RUN_TAG}-lb{i}", user)
         if sid:
             p["session_id"], p["project_id"] = sid, pid
@@ -184,13 +190,13 @@ def main():
     sid3 = d3["session_id"]
     p3 = base_payload("我数到几了？直接答数字", f"{RUN_TAG}-lr2", user)
     p3["session_id"], p3["project_id"] = sid3, d3["project_id"]
-    threading.Thread(target=bg_chat, args=(entries[1], p3), daemon=True).start()
+    threading.Thread(target=bg_chat, args=(entries[1 % len(entries)], p3), daemon=True).start()
     time.sleep(0.8)
     evs_a = sse_collect_at(entries[0], sid3, 12)  # A 收一段即断
     ids_a = ids_of(evs_a)
     c.ok(len(ids_a) > 0, f"首段经入口 {entries[0].split('//')[1]} 收到 {len(ids_a)} 事件")
     cursor = max(ids_a) if ids_a else 0
-    evs_b = sse_collect_at(entries[2], sid3, 40, last_event_id=cursor)  # B 续
+    evs_b = sse_collect_at(entries[2 % len(entries)], sid3, 40, last_event_id=cursor)  # B 续
     ids_b = ids_of(evs_b)
     c.ok(all(x > cursor for x in ids_b),
          f"续传事件全 > 游标（min={min(ids_b) if ids_b else '-'} > {cursor}）——无重复")
@@ -204,7 +210,7 @@ def main():
 
     # ===== 场景 3：新会话跨入口（NodePort 随机落点，多轮统计覆盖跨副本）=====
     # durable 直写 + SSE 回源的验收场景：chat 落随机副本 X，1 秒后从另一入口
-    # 订阅（落随机副本 Y，3 副本下每轮 2/3 概率 X≠Y）——多轮组合覆盖跨副本，
+    # 订阅（可能落另一副本 Y）——多轮组合观察跨副本行为，
     # 且就是真实用户的负载均衡形态（无需也不应指定副本）。
     print("\n▶ lb_new_session_cross_entry（新会话 chat 后 1s 从另一入口订阅）")
     for i, kw in enumerate(["分布式", "微服务", "负载均衡"]):

@@ -56,7 +56,7 @@ Pingap 配置目录由 `APP_CLI_PINGAP_RUNTIME_DIR` 指定；未指定时统一�
 日常改公共路径只改该服务 TOML，改后重启 dev、重新构建 prod，同时更新业务导航。
 已有 Vite 进程及已构建 dist 不会仅因 TOML 改变就自动刷新。
 
-前置条件：Python 3.11+、Node、pnpm；已构建和打包的 template-cli；React/Vue 模板目录已安装依赖；与 app-cli 配套的 Pingap 0.14.3。9080、9081、3018 必须空闲。脚本在临时目录生成项目、复制每个模块独立的依赖目录并保留日志，不修改模板源码；pnpm 运行时可能校正临时项目的安装状态。
+前置条件：Python 3.11+、Node、pnpm；已构建和打包的 template-cli；React/Vue 模板目录已安装依赖；与 app-cli 配套的 Pingap 0.15.0。9080、9081、3018 必须空闲。脚本在临时目录生成项目、复制每个模块独立的依赖目录并保留日志，不修改模板源码；pnpm 运行时可能校正临时项目的安装状态。
 
 ```bash
 cargo build --manifest-path crates/app-cli/Cargo.toml --bin app-cli

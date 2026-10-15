@@ -48,9 +48,13 @@ dev 与 prod 各有独立的存储：删除 prod 运行容器默认保留数据�
 
 ## 访问方式
 
-- **路径代理**（内置，两种形态同一路由契约）：真实流量走 Pingora 数据面 `GET /proxy/app/{stage}/{user_id}/{app_id}/{*path}`（`stage` 区分 dev/prod，prod 流量会触发唤醒）；HTTP API 侧登记的文档接口为 `/api/v1/userapp/proxy/app/...` 同形态。
+- **路径代理**：应用流量使用 Pingora 数据面 `/api/v1/userapp/proxy/app/{stage}/{user_id}/{app_id}/{*path}`，`stage` 为 `dev` 或 `prod`，prod 流量会触发唤醒。两个环境使用同一完整前缀，切换环境只改变 stage 段。
 - **子域名**：由外部网关/前端层实现（host → app 解析后转发到 rcoder 的代理路径），rcoder 后端本身是路径代理。
 - dev 环境支持开发模式（Vite 等热更新预览），构建期间的日志与事件可实时获取。
+
+应用入口的主机和端口使用实际对外的数据面地址。Compose 默认主 HTTP API 为 8090，Pingora 宿主映射为 8089（容器内监听 8088）；本地应用预览应将上述完整路径拼接到数据面地址。Kubernetes/Gateway 地址从部署配置读取，不能照搬本地端口。
+
+主服务 OpenAPI 也描述同形态的应用代理路径，但当前主 HTTP 路由并未挂载这两个应用代理 handler，不能将主 API 端口当作应用流量入口。ttyd/VNC/音频/IME/DBX 工具族的主 HTTP 入口另有 307 跳转；重定向中的 loopback 地址也不能自动代表远程浏览器可达地址。实际业务流量应使用部署对外暴露的代理/Gateway 入口。
 
 ### 业务就绪查询（只读）
 
@@ -102,7 +106,7 @@ DELETE /api/v1/admin/userapp/error-page   # 幂等恢复内置页
 | `POST /{app_id}/recreate` | 已删除应用确认无计算资源后创建新生命周期，同请求重试返回原结果 |
 | `GET /{app_id}/{app_stage}/storage` 等存储族 | 存储查询/清空/销毁 |
 | `POST /{app_id}/{app_stage}/upload` 等文件族 | 文件上传/列表/删除 |
-| `GET /api/v1/userapp/proxy/app/{stage}/{user_id}/{app_id}/{*path}` | 应用访问代理（文档接口；数据面见下） |
+| `/api/v1/userapp/proxy/app/{stage}/{user_id}/{app_id}/{*path}`（数据面） | 应用流量路径；直接访问 Pingora/Gateway 对外入口，端口关系见上文“访问方式” |
 
 ## 相关文档
 

@@ -3,6 +3,8 @@
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/lib.sh"
 
+require_ts_source
+
 [[ -d "${DIFF_RUNTIME}/ts/project_init" ]] || { echo "runtime is not prepared; run prepare.sh first" >&2; exit 1; }
 "${DIFF_TOOL_DIR}/stop.sh" >/dev/null 2>&1 || true
 

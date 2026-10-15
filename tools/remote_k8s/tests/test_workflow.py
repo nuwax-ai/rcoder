@@ -23,6 +23,17 @@ class WorkflowTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             return Config(file)
 
+    def test_default_namespace_remains_dedicated_without_personal_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(directory)
+            self.assertEqual(config.ns, 'rcoder-e2e-local')
+            file = Path(directory) / 'config'
+            base = file.read_text()
+            for namespace in ('default', 'rcoder-e2e'):
+                file.write_text(base + 'REMOTE_K8S_NAMESPACE=' + namespace + '\n')
+                with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(ValueError, 'dedicated'):
+                    Config(file)
+
     def paired_identity(self):
         source = pingap_runtime_identity.source_identity()
         bases = {key: 'example/' + key.lower() + '@sha256:' + 'b' * 64

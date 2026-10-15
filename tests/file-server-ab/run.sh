@@ -5,7 +5,15 @@ umask 077
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../.." && pwd)"
 cd "${repo_root}"
-ts_source="${AB_TS_SOURCE:-/Users/soddy/Documents/git-workspace/nuwax-file-server}"
+ts_source="${AB_TS_SOURCE:-}"
+if [[ -z "${ts_source//[[:space:]]/}" ]]; then
+  echo "AB_TS_SOURCE is required; set it to the TypeScript file-server checkout path" >&2
+  exit 2
+fi
+if [[ ! -d "${ts_source}" ]]; then
+  echo "AB_TS_SOURCE must point to an existing TypeScript file-server checkout directory" >&2
+  exit 2
+fi
 ts_ref="${AB_TS_REF:-HEAD}"
 report_root="${AB_REPORT_ROOT:-${repo_root}/tests-e2e/reports/file-server-ab}"
 run_id="$(date -u +%Y%m%dT%H%M%SZ | tr '[:upper:]' '[:lower:]')-$(python3 -c 'import uuid; print(uuid.uuid4().hex[:8])')"

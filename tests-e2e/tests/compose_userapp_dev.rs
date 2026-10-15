@@ -8,7 +8,7 @@
 //! - create-workspace 起手（ensure 开发容器 + 建目录 + owner 注册）
 //! - X-App-Id 直连转发 + X-Service-Type 拦截分流（两路落同一 workspace）
 //! - x-user-id owner 显式档懒创建（无注册前置的拦截分流；502 故障钉住 +
-//!   白名单 400——生产 192.168.1.19 cannot resolve owner user_id 回归）
+//!   白名单 400——生产 环境 cannot resolve owner user_id 回归）
 //! - `/api/userapp/db/dev/reset-password`（PG 改密；凭据对齐已内嵌 start 链）
 //! - userApp 开发对话全轮：session 创建（project_id 保留会话身份）+ SSE 事件流
 //!   （/computer/progress/{sid} 经 session→project 映射路由到开发容器）
@@ -2297,7 +2297,7 @@ async fn userapp_agent_dispatch_anthropic() {
 
 // ============================================================
 // 场景 6：x-user-id owner 显式档懒创建（生产故障回归）
-//   192.168.1.19 实测断链：Java computer 文件族 + X-Service-Type/X-App-Id
+//   历史环境 实测断链：Java computer 文件族 + X-Service-Type/X-App-Id
 //   分流、无注册前置也无 x-user-id 时，透传层 owner 三档两档皆空 →
 //   502 "cannot resolve owner user_id"（fail-fast 防宿主树孤儿目录）。
 //   修复（d9e208b）：拦截层从 x-user-id header 提取 owner 显式档。

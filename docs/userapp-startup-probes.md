@@ -89,6 +89,6 @@ python3 tools/native_worker_smoke.py \
   --root /absolute/path/to/isolated-test-directory
 ```
 
-Windows 用 `python` 和 `.exe` 路径。需当前 app-cli 及匹配的 Pingap 0.14.3，不需要 Docker、数据库或 Node。脚本创建唯一子目录并保存操作回执和 `result.json`，使用 builtin 引擎，避免接管宿主机已有的 supervisord；3018/9080 已被占用时失败，不清理其他实例。supervisord 另由隔离 Docker 场景验证。
+Windows 用 `python` 和 `.exe` 路径。需当前 app-cli 及匹配的 Pingap 0.15.0，不需要 Docker、数据库或 Node。脚本创建唯一子目录并保存操作回执和 `result.json`，使用 builtin 引擎，避免接管宿主机已有的 supervisord；3018/9080 已被占用时失败，不清理其他实例。supervisord 另由隔离 Docker 场景验证。
 
 覆盖无监听进程启动、实际静态 HTTP、Stop/Start/Restart、提前退出失败及 owner 保留。API identity 可读不表示恢复完成，脚本先通过只读 recovery 接口确认初始化，再提交操作。Windows 最后结束自己空闲 owner 使用 TerminateProcess；不能据此声称 Windows 优雅关机已验证。此入口也不替代完整三平台、Compose 或 K8s 套件。

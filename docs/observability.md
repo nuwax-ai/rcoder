@@ -1,6 +1,6 @@
 # rcoder 可观测性指南
 
-统一整理本地开发排查工具的启用方式与使用方法。release/CI 构建不带任何观测 feature——零代码零开销。
+统一整理本地开发排查工具的启用方式与使用方法。观测能力取决于实际构建 features 和运行环境；生产使用前核对镜像构建参数。
 
 ## 快速索引
 
@@ -33,7 +33,7 @@ agent_runner (OTLP) ─┘         └─ self-metrics :8888（Prometheus 抓取
 - **过滤**：collector 丢掉 `/health`、`/metrics` 的 http_request span（探活噪声不进 Tempo）
 - **保留**：Tempo 72h（`docker/tempo/tempo.yml`）
 
-**查看**：Grafana http://localhost:3000（admin/admin）→ Explore → 数据源 Tempo
+**查看**：Grafana http://localhost:3300（admin/admin）→ Explore → 数据源 Tempo
 - 按 trace_id 精确查：`Query type: TraceQL` 直接粘贴 trace_id（与日志 JSON 顶层的 trace_id 同值）
 - 按 service 查：`{resource.service.name = "rcoder"}` / `= "agent_runner"`
 - Trace 视图自带 **Flame graph** 与瀑布渲染；span 点按可见耗时；
@@ -55,8 +55,10 @@ agent_runner (OTLP) ─┘         └─ self-metrics :8888（Prometheus 抓取
 e2e 或上游注入 W3C `traceparent` header 时，rcoder 的日志 JSON **顶层自动出现** `trace_id` 字段：
 
 ```bash
-# 发请求带 traceparent
-curl -H "traceparent: 00-abcdef1234567890abcdef1234567890-0123456789abcdef-01" ...
+# 向本地 API 发请求；启用鉴权时附加配置的 x-api-key
+RCODER_API_URL=http://127.0.0.1:8090
+curl --fail -H "traceparent: 00-abcdef1234567890abcdef1234567890-0123456789abcdef-01" \
+  "$RCODER_API_URL/computer/pod/count"
 
 # 日志过滤（每行 JSON 顶层）
 jq 'select(.trace_id == "abcdef1234567890abcdef1234567890")' logs/rcoder.$(date +%Y-%m-%d)
@@ -72,9 +74,9 @@ jq 'select(.trace_id == "abcdef1234567890abcdef1234567890")' logs/rcoder.$(date 
 /app/logs/*.log（stdout 重定向产物） ──> fluent-bit:3.2.10 ──> Loki:3.7.7 ──> Grafana
 ```
 
-本地复刻生产采集链路（同版本、OUTPUT 逐字复制、`Line_Format` 随 stage 演进）；配置在
-`docker/fluent-bit/`、`docker/loki/`。生产无 kube-apiserver 的两处替身见文件头注释
-（Lua `synthesize_k8s_meta` 构造同构 kubernetes map + Merge_Log/Keep_Log 仿真）。
+本地采集配置在 `docker/fluent-bit/`、`docker/loki/`。Compose 没有 kube-apiserver，
+Lua `synthesize_k8s_meta` 补充开发查询所需的 kubernetes 字段；这些合成字段不作为
+真实集群部署或生命周期身份的证据。
 
 ```bash
 make logs-up          # 启动 Loki + fluent-bit（Grafana 重启装载合并数据源）
@@ -85,9 +87,9 @@ make logs-fidelity    # fluent-bit health/storage + Loki ready 自检
 **控制台 JSON 开关**：`TELEMETRY_CONSOLE_JSON=1` 时 stdout 输出与文件层同款的单行 JSON
 （root trace_id），stdout 重定向进 `rcoder.log`（生产 `start-services.sh` 即此形态）后
 采集器直接拿到结构化日志；默认 0=ANSI 文本（线上零影响）。JSON 模式额外拦掉两种
-OTel 导出噪声拼写（`opentelemetry-otlp` / `opentelemetry_sdk`，B0 基线占 20.3%）。
+OTel 导出噪声拼写（`opentelemetry-otlp` / `opentelemetry_sdk`）。
 
-Grafana（http://localhost:3000）→ Explore → Loki：日志行内 trace_id 生成可点击
+Grafana（http://localhost:3300）→ Explore → Loki：日志行内 trace_id 生成可点击
 **TraceID** 字段跳 Tempo；Tempo trace 视图反向 tracesToLogsV2 跳回日志行。
 
 ## dial9 事件级 Tokio tracing
@@ -163,12 +165,14 @@ taskdump 是 dial9 独有能力：对空闲超阈值（`DIAL9_TASK_DUMP_IDLE_THR
 脚本化诊断构建（主仓零改动）：
 
 ```bash
-# Linux 环境（dev 镜像容器内亦可）：
-bash tools/taskdump/build-taskdump-linux.sh [源码目录] [诊断目录]
-# 产物 <诊断目录>/target-taskdump/release/rcoder；运行期：
-DIAL9_ENABLED=1 DIAL9_TASK_DUMP_ENABLED=1 DIAL9_TRACE_DIR=<诊断目录>/traces <binary>
-# 解码断言 dump 事件（宿主 macOS 可跑）：
-cd tools/dial9-probe && cargo run -- --expect-dump <诊断目录>/traces
+# Linux 环境，在仓库根目录执行；诊断目录须位于源码目录之外
+TASKDUMP_DIR=/tmp/rcoder-taskdump
+bash tools/taskdump/build-taskdump-linux.sh "$PWD" "$TASKDUMP_DIR"
+# 运行产物，业务配置按当前验证环境提供
+DIAL9_ENABLED=1 DIAL9_TASK_DUMP_ENABLED=1 DIAL9_TRACE_DIR="$TASKDUMP_DIR/traces" \
+  "$TASKDUMP_DIR/target-taskdump/release/rcoder"
+# 进程停止后解码并断言 dump 事件（复制 traces 后亦可在宿主 macOS 执行）
+cargo run --manifest-path tools/dial9-probe/Cargo.toml -- --expect-dump "$TASKDUMP_DIR/traces"
 ```
 
 ## hotpath 本地性能剖析
@@ -218,19 +222,13 @@ docker exec $DEV_CID curl -s -X POST 127.0.0.1:6771/mcp \
 ```
 
 
-## tracing-flame（已移除，勿再引入）
+## 已移除的剖析工具
 
-依赖已删除（2026-08-21）。**耗时数据在多任务并发 async 下系统性失真**——它不测
-span 自身耗时，folded 每行数字 = thread-local `LAST_EVENT` 的"距上一 span 事件
-间隔"（源码 0.2.0 lib.rs:478），挂起期线程被其他任务复用会不断重置 gap、
-tokio work-stealing 跨线程迁移直接断链。对照实验：`grpc_dial` span 同源双记录，
-metrics 直方图 p50=3.1s / p99=10s，folded 里 max 仅 67ms（差 150 倍）。
-
-其原有职责的承接：**耗时** → SpanMetricsLayer 直方图（/metrics）；**调用结构 +
-正确耗时的火焰图/瀑布** → OTLP → Tempo（Grafana Explore 自带 Flame graph 视图）；
-**事件级 async 行为** → dial9（Pyroscope/eBPF 持续剖析链已下线；CPU 采样可按需
-开 dial9 cpu-profiling feature，需 frame pointers）。容器内手动诊断保留
-bpftrace/strace/sysstat/jq（需在 config.yml services.security 显式提权）。
+当前项目已移除 tracing-flame、tokio-console 与 Pyroscope/eBPF 持续剖析链。
+异步 span 的耗时通过 SpanMetricsLayer 与 OTLP/Tempo 观察，task 的 poll/wake
+行为使用 dial9。不要把 thread-local 事件间隔当作并发异步任务的 span 耗时。
+容器内手动诊断保留 bpftrace/strace/sysstat/jq，使用时按当前配置的
+`services.security` 核对所需权限。
 
 ## span 耗时指标（SpanMetricsLayer，精确计时）
 

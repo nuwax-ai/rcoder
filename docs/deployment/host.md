@@ -68,7 +68,7 @@ CONTAINER_RUNTIME=kubernetes cargo run -p rcoder --bin rcoder --features kuberne
 
 ## 安全明示
 
-- docker.sock 等价 root：与容器内 rcoder 挂载 docker.sock 同等权限面，非新增风险，但宿主机形态感知更直接——默认只监听 `127.0.0.1` + api_key_auth 首启启用，不要在不受信网络上开放 `RCODER_BIND_HOST`。
+- docker.sock 提供主机容器管理权限。宿主机主 HTTP 默认只监听 `127.0.0.1`；首次生成配置中的随机 API Key 不代表已启用鉴权，模板的 `api_key_auth.enabled` 默认为 `false`。需要鉴权时显式启用并核对实际请求行为，不要在不受信网络上开放 `RCODER_BIND_HOST`。
 - 单租户单实例定位：多实例共写 `~/.rcoder` 属误用；desktop 与同机 rcoder server 占同一组端口，二选一。
 
 ## 快速集成回归

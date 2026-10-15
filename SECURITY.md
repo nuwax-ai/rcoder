@@ -20,5 +20,5 @@
 ## 部署安全提示
 
 - rcoder 控制面管理容器运行时（Docker socket / K8s ServiceAccount），请勿在不受信网络暴露
-- deploy-host 形态默认只监听 `127.0.0.1` 并启用 api_key 鉴权，保持默认或自行加固
+- deploy-host 的主 HTTP 默认只监听 `127.0.0.1`；首次创建配置会生成随机 API Key，但默认不启用鉴权，需要显式配置 `api_key_auth.enabled` 或 `RCODER_API_KEY_ENABLED`
 - 生产部署请启用 API Key 鉴权中间件并限制网络入口

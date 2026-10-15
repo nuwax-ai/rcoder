@@ -8,7 +8,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
-const root = path.resolve(__dirname, '../../../../..');
+const root = path.resolve(__dirname, '../../..');
 const pagePath = 'crates/rcoder-proxy/assets/userapp-error-default.html';
 const template = fs.readFileSync(path.join(root, pagePath), 'utf8');
 const uiKeys = {

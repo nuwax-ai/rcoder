@@ -8,21 +8,41 @@
 
 ## 正常使用
 
-```bash
-app-cli serve --workspace /path/to/workspace
-app-cli owner status --workspace /path/to/workspace
-app-cli owner stop --workspace /path/to/workspace --request-id stop-20260927
-app-cli owner recover --workspace /path/to/workspace --request-id recover-20260927
-app-cli owner shutdown --workspace /path/to/workspace --request-id shutdown-20260927
+先在一个终端运行常驻管理器，宿主机使用自己可写的日志目录：
 
+```bash
+export APP_CLI_LOG_DIR=/path/to/writable/logs
+export APP_CLI_ADMIN_ADDR=127.0.0.1:3010
+app-cli serve --workspace /path/to/workspace
+```
+
+下面是在另一个终端按需使用的控制命令，传入同一应用工作区和管理配置。Stop、Recover、Shutdown 是不同选择，不需要依次执行：
+
+```bash
+app-cli owner status --workspace /path/to/workspace
+app-cli owner stop --workspace /path/to/workspace
+app-cli owner recover --workspace /path/to/workspace
+app-cli owner shutdown --workspace /path/to/workspace
+```
+
+file-server-proxy 的启动同样常驻前台：
+
+```bash
 file-server-proxy start --embed --policy all_rust
+```
+
+在另一终端查询或停止它：
+
+```bash
 file-server-proxy status
-file-server-proxy stop --request-id proxy-stop-20260927
+file-server-proxy stop
 ```
 
 app-cli 的 `owner stop` 停止业务执行，并恢复管理入口到已停止状态；随后可显式启动业务。`owner recover` 收束旧执行进程，再恢复管理入口，业务能否继续由既有 journal 决定。`owner shutdown` 结束该 CLI。停止 file-server-proxy 不等于停止 app-cli，即使后者最初由 proxy 启动。
 
-CLI `owner` 命令返回包含 `operation_id`、`generation`、`supervisor_id` 和 `phase` 的 JSON；有恢复缺口时还包含结构化 `problem.code/message`。受理的 `stopping` 不是完成；使用同一请求 ID 和参数重试可读取原结果。不要把一次退出码 0 当成业务停止已经完成。相同 ID 改参数会拒绝；不同控制请求在已有用户控制尚未完成时返回 Busy，不做内部排队。
+CLI `owner` 命令返回包含 `operation_id`、`generation`、`supervisor_id` 和 `phase` 的 JSON；有恢复缺口时还包含结构化 `problem.code/message`。省略 `--request-id` 时自动为新的控制操作生成 ID；保存返回的 `operation_id`，重试或继续观察同一次操作时通过 `--request-id` 传回原 ID 和相同参数。后续新一次控制操作使用新 ID，不能重用上次停止的 ID，否则会读取历史结果。相同 ID 改参数会拒绝；不同控制请求在已有用户控制尚未完成时返回 Busy，不做内部排队。
+
+受理的 `stopping` 不是完成，`cleanup_pending` 仍需确认清理。不要把一次退出码 0 当成业务停止已完成；需要结束 owner 的流程还应确认原管理进程退出，再启动其替代实例。
 
 业务操作入口与上述监督控制命令不同：新 Start/Restart 可以替换单个待执行意图；旧操作明确失败或取消后继续执行新的请求。Stop 执行期间收到的新启动在停止完成后执行，旧 Stop 不会再停止新服务。尚未确认的进程收束仍由独立监督器处理。
 
@@ -62,7 +82,7 @@ CLI `owner` 命令返回包含 `operation_id`、`generation`、`supervisor_id` �
 - supervisord 引擎收束先撤回动态配置，再停止和移除 `app-svc-*`/`app-pingap` 组，并复核进程表。配置撤回或 reload 失败时仍尝试停止动态组，但保留失败结果。worker 在第一次外部变更前记录所用引擎；该引擎的 socket 消失不能被视作 builtin 清理成功。root guardian 在 worker 与命令退出后执行同一清理适配器，外部清理未确认时不提交 Quiescent；固定 PG/dbx/ttyd 保留。
 - `cleanup_pending` 表示仍在收束；`recovery_required` 表示当前缺少继续恢复所需的证据。file-server Start/Stop/Recover 同时查询独立监督通道，返回监督代次、操作和原因；不能只轮询公共 3010 并给出泛化超时。仍在清理的状态在同一总预算内等待。
 - 私有监督控制协议现为 v2（结构化错误）。磁盘 v1 记录可读，新旧活动监督进程不混用私有控制协议；部署时两个 CLI、agent_runner 与 RCoder 需要配套更新并重启旧管理父进程。公开业务协议版本没有因此改变。
-- 外层系统服务管理器必须给内部收束留出预算，不能用无条件 autorestart 抵消显式 shutdown。部署仓的 app-cli 与 proxy program 已调整为 `autorestart=unexpected`、`exitcodes=0`、`startsecs=0`，并留出 90 秒外层停止预算；仍需随配套镜像实测。
+- 外层系统服务管理器必须给内部收束留出预算，不能用无条件 autorestart 抵消显式 shutdown。使用 supervisord 托管时，可通过 `autorestart=unexpected`、`exitcodes=0`、`startsecs=0` 保持显式退出后的停止意图；外层停止预算须覆盖内部收束和退出确认，并在实际镜像中核验。
 - 正常 HTTP/SSE 仍由执行进程提供；换代期间可能短暂断连，不重放用户 POST。
 
 ## 快速复合验收

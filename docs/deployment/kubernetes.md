@@ -12,6 +12,54 @@
 
 gateway 侧（rcoder-gateway）：无状态网关做 header 注入与路由，多副本共享 PG 控制面。
 
+<a id="remote-workflow"></a>
+## 远端 K8s 开发与验证
+
+远端工作流从本地编辑工作树，经 Mutagen 同步到构建主机，再创建独立源码快照，在 Linux 构建 amd64 镜像并推送，按 digest 部署到专用测试 namespace。同步不是构建或部署；构建镜像也不代表执行过 Rust 组件测试。
+
+### 环境准备
+
+复用仓库根未跟踪的 `.env.local`，按 [配置模板](../../tools/remote_k8s/env.example) 补充 SSH、远端目录、context、namespace、registry、基础镜像和访问地址；不要覆盖已有无关项。构建主机与全部节点必须能拉取所选镜像。模型相关场景还需要模板列出的 LLM 配置。
+
+仅选择自己获准使用的测试环境。所有环境值保留在本地配置，不写入公共示例；不要向共享生产环境运行测试。资源预算、超时和存储类以该环境实际配置为准。
+
+```bash
+make remote-k8s-doctor
+make remote-k8s-sync-start
+make remote-k8s-sync-status
+make remote-k8s-verify SUITE=smoke
+
+# 同一源码快照和部署追加受影响套件。
+make remote-k8s-test SUITE=userapp
+make remote-k8s-test SUITE=chat
+make remote-k8s-test SUITE=gateway
+
+# 失败后收集诊断。
+make remote-k8s-logs
+```
+
+`verify` 校验并构建当前源码、部署后测试；`test` 只验证已部署版本。本地源码修改后必须重新 `verify`。同一环境构建、部署、测试串行，测试期间保持源码与部署稳定。远端套件使用 `SUITE`，不要与 Compose 的 `E2E_SUITE`/`E2E_FILTER` 混用。
+
+### 套件与证据
+
+| 套件 | 验证范围 |
+|---|---|
+| `smoke` | 当前部署身份、双副本就绪、PVC Bound 和直连健康接口 |
+| `userapp` | UserApp 工作区、构建与部署；检查完整场景报告 |
+| `chat` | 真实 AI、会话与续传；缺模型配置不能视为通过 |
+| `gateway` | Gateway/HTTPRoute 条件与实际 HTTP 路径 |
+| `all` | 组合验证；完整范围以启动器场景目录为准 |
+
+直连与 Gateway 是不同路径。实际地址从本地部署回执的 `url`、`gateway_url` 读取，IP + NodePort 可作为直连入口。Gateway 不可用时可以运行不依赖它的直连场景，但不能替换路径后宣称 Gateway 通过。smoke 不证明完整生命周期、跨副本业务或动态应用路由正确。
+
+源码摘要、镜像 digest、namespace、部署与测试回执写入本地 `.remote-k8s/`；E2E 明细写入 `tests-e2e/reports/`，均不提交。实际问题与每轮结果另记入本地工作文档，不将历史报告当作当前通过。严格验收规则见 [E2E 说明](../../tests-e2e/tools/README.md)。
+
+### 诊断与资源保护
+
+先运行 `make remote-k8s-logs`，结合 RCoder 容器内 `/app/logs/`、agent_runner stdout、Pod 状态与事件定位问题。`doctor` 仅检查前置，不证明网络和存储全链路可用。
+
+只操作本环境拥有的资源、同步会话和镜像标签。agent PVC 永不删除，停止计算保留 PVC；`remote-k8s-down` 保留 namespace 和数据卷。namespace 不能作为共享 CephFS 数据隔离依据，禁止删除共享存储根数据。
+
 ## 本地 K8s 开发（devspace）
 
 ```bash
@@ -20,7 +68,7 @@ make devspace-dev    # 启动
 curl http://127.0.0.1:8290/health
 ```
 
-本地集群推荐 OrbStack 等；devspace 负责源码同步，改码后需重启容器内 rcoder 进程生效（`/app/dev-rcoder.sh restart`，增量编译约 1 分钟）。
+本地集群可使用 OrbStack 等；devspace 负责源码同步，改码后需重启容器内 rcoder 进程生效（`/app/dev-rcoder.sh restart`）。
 
 > ⚠️ K8s 下 rcoder 日志**写文件不写 stdout**（`/app/logs/rcoder.YYYY-MM-DD`，JSON 按天滚动）——`kubectl logs` 几乎为空属正常现象，排障要看容器内文件日志。
 

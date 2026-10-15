@@ -70,7 +70,7 @@ const sha = crypto.createHash("sha256").update(Buffer.from(buf)).digest("hex");
 if (sha !== t.sha256) throw new Error(`sha256 mismatch for ${t.archive}`);
 
 // 4) 解压到 resources/file-server/{plat}-{arch}/bin/file-server[.exe]
-const resKey = key === "win32-x64" ? "windows-x64" : key; // 对齐 nuwaclaw 资源目录命名
+const resKey = key === "win32-x64" ? "windows-x64" : key; // 对齐宿主应用资源目录命名
 const dest = path.join("resources/file-server", resKey, "bin");
 await extractTarGzOrZip(buf, dest); // tar.gz 用 tar；zip 用 Expand-Archive
 
@@ -82,15 +82,8 @@ if (!v.endsWith(m.version)) throw new Error(`binary version mismatch: ${v}`);
 
 ## 运行时约定（给 spawn/服务管理）
 
-- **端口**：二进制读 `FILE_SERVER_PORT` 或 `PORT` 环境变量。nuwaclaw 默认 `60005`，spawn 时传 `PORT=60005` 即可，**无需改 file-server 默认端口**。
+- **端口**：二进制读 `FILE_SERVER_PORT` 或 `PORT` 环境变量。宿主应用可选择 `60005` 等空闲端口，spawn 时显式传 `PORT`，**无需改 file-server 默认端口**。
 - **健康检查**：`GET /health` → `200 {"status":"ok",...}`，启动后据此判活。
 - **优雅关闭**：Unix 收 `SIGTERM`/`SIGINT` 优雅退出；Windows 收 Ctrl-C。ManagedProcess 的 SIGTERM→SIGKILL 升级可直接套用。
 - **`--version`**：打印 `file-server {version}` 后退出 0，不启动服务。供依赖检查 / prepare 脚本核验。
-- 其余配置（工作空间目录等）走环境变量，见 [`src/config.rs`](../src/config.rs)。Electron 场景一般把这些指向 app userData 下的可写目录。
-
-## nuwaclaw 迁移（参考，不在本仓库范围）
-
-替换现有 Node 版 `nuwax-file-server` 需要动 nuwaclaw 侧：新写 `prepare-file-server.js`（按上文流程）、
-`binaryLocator` 的 `getNuwaxFileServerBundledDir` 改为按 plat-arch 查二进制、`serviceManager` 的 spawn
-从「`ELECTRON_RUN_AS_NODE=1` 跑 `server.js`」切到「直接 spawn 二进制」、`extraResources` / 依赖版本读取相应调整。
-这些改动都在 nuwaclaw 仓库，本文档仅给出 file-server 侧的产物契约。
+- 其余配置（工作空间目录等）走环境变量，见 [配置模块](../src/config/mod.rs)。Electron 场景一般把这些指向 app userData 下的可写目录。

@@ -125,7 +125,7 @@ class ClusterExperiment:
         self.sleep = sleep
         self.clock = clock
         self.run_id = 'rcv' + uuid.uuid4().hex[:8]
-        self.namespace = f'rcoder-e2e-soddy-lock-{self.run_id}'
+        self.namespace = f'rcoder-e2e-lock-{self.run_id}'
         self.pods = {}
         self.volumes = {}
         self.unconfirmed_creations = []
@@ -560,7 +560,7 @@ print(json.dumps(ports))'''
         self.delete_pod('lock-c')
         return pvc
 
-    def ssh_node(self, node, command):
+    def node_ssh_config(self, node):
         mapping = next((m.partition('=')[2] for m in self.args.node_ssh
                         if m.partition('=')[0] == node), None)
         if mapping is None:
@@ -569,9 +569,14 @@ print(json.dumps(ports))'''
         user, _, password = rest.partition(':')
         if not re.fullmatch(r'[A-Za-z0-9._-]+', host):
             raise ValueError('invalid SSH host')
-        user = user or 'soddy'
+        if not user:
+            raise ValueError('--node-ssh requires an explicit SSH user: node=host:user[:password]')
         if not re.fullmatch(r'[A-Za-z0-9._-]+', user):
             raise ValueError('invalid SSH user')
+        return host, user, password
+
+    def ssh_node(self, node, command):
+        host, user, password = self.node_ssh_config(node)
         remote = 'sudo ' + ('-S' if password else '-n') + ' -- sh -ec ' + shlex.quote(command)
         # 密码只从 stdin 进入 sudo，既不进命令行，也不写报告。
         return self.runner(['ssh', '-o', 'BatchMode=yes', f'{user}@{host}', remote],
@@ -643,6 +648,8 @@ print(json.dumps(ports))'''
                 raise ValueError('--cleanup-volume is forbidden: namespace and PVC must be retained')
             if not self.args.cephfs_class:
                 raise ValueError('CephFS is required; --cephfs-class must not be empty')
+            if self.args.scenario == 'all':
+                self.node_ssh_config(self.args.node[0])
             self.source_before = source_identity(self.source_dir)
             self.report['source_before'] = self.source_before
             self.receipt = load_build_receipt(self.args.build_receipt, self.args.image,
@@ -651,9 +658,6 @@ print(json.dumps(ports))'''
             nodes = select_nodes(json.loads(self.kubectl('get', 'nodes', '-o', 'json',
                                                         cluster=True).stdout), self.args.node)
             self.report['nodes'] = nodes
-            if self.args.scenario == 'all' and not any(m.startswith(nodes[0] + '=')
-                                                       for m in self.args.node_ssh):
-                raise ValueError('all requires --node-ssh for its first node (K8s-E)')
             namespace = {'apiVersion': 'v1', 'kind': 'Namespace', 'metadata': {
                 'name': self.namespace, 'labels': {'rcoder.io/lock-test-run': self.run_id}}}
             out = self.kubectl('create', '-f', '-', '-o', 'json', cluster=True,
@@ -727,7 +731,7 @@ def parse_args(argv=None):
     parser.add_argument('--cleanup-volume', action='store_true',
                         help='rejected: namespace/PVC deletion is forbidden')
     parser.add_argument('--node-ssh', action='append', default=[],
-                        help='node=host[:user[:password]], only all/K8s-E uses it; '
+                        help='node=host:user[:password], explicit user required for all/K8s-E; '
                              'prefer passwordless sudo and never put real credentials in documents')
     return parser.parse_args(argv)
 

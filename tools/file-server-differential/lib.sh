@@ -5,7 +5,7 @@ set -euo pipefail
 DIFF_TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RCODER_ROOT="$(cd "${DIFF_TOOL_DIR}/../.." && pwd)"
 DIFF_RUNTIME="${DIFF_TOOL_DIR}/runtime"
-TS_SERVER_ROOT="${TS_SERVER_ROOT:-/Users/soddy/Documents/git-workspace/nuwax-file-server}"
+TS_SERVER_ROOT="${TS_SERVER_ROOT:-}"
 TS_PORT="${TS_PORT:-61000}"
 RUST_PORT="${RUST_PORT:-61001}"
 DIFF_CARGO_TARGET="${DIFF_CARGO_TARGET:-/tmp/rcoder-file-server-target}"
@@ -17,6 +17,15 @@ require_command() {
     echo "required command not found: $1" >&2
     exit 1
   fi
+}
+
+require_ts_source() {
+  if [[ -z "${TS_SERVER_ROOT//[[:space:]]/}" ]]; then
+    echo "TS_SERVER_ROOT is required; set it to the TypeScript file-server checkout path" >&2
+    exit 2
+  fi
+  [[ -f "${TS_SERVER_ROOT}/src/server.js" ]] || { echo "TS server source not found: ${TS_SERVER_ROOT}/src/server.js" >&2; exit 1; }
+  [[ -d "${TS_SERVER_ROOT}/node_modules" ]] || { echo "TS dependencies are missing; run pnpm install in ${TS_SERVER_ROOT}" >&2; exit 1; }
 }
 
 service_root() { printf '%s/%s' "${DIFF_RUNTIME}" "$1"; }

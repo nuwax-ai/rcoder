@@ -15,10 +15,11 @@ RCoder 是基于 ACP 的 AI 开发平台，主体为 Rust 2024 Cargo workspace�
 
 | 问题 | 优先查看 |
 |---|---|
-| HTTP 路由、应用装配、配置 | `crates/rcoder/src/`，尤其 `app_state.rs`、`config/`、`router_docs/api_doc.rs` |
+| HTTP 路由、OpenAPI | `crates/http-server/src/`，尤其 `router_docs/api_doc.rs` |
+| 应用装配、配置与业务编排 | `crates/rcoder-engine/src/`，尤其 `app_state.rs`、`config/`；可执行入口在 `crates/rcoder/src/` |
 | agent 执行、gRPC 服务端 | `crates/agent_runner/` |
 | ACP 连接与协议适配 | `crates/agent_abstraction/` |
-| UserApp 生命周期、存储接口 | `crates/app_manager/`；builder 接入在 `crates/rcoder/src/userapp_builder/` |
+| UserApp 生命周期、存储接口 | `crates/app_manager/`；builder 接入在 `crates/rcoder-engine/src/userapp_builder/` |
 | UserApp 容器内编排、启动、部署与控制协议 | `crates/app-cli/`（独立 Cargo 项目） |
 | 文件、工作区、Git、技能与开发服务 | `crates/file-server/` |
 | UserApp 文件服务接口、构建任务与启动事件 | `crates/file-server-userapp/` |
@@ -73,6 +74,8 @@ RCoder 是基于 ACP 的 AI 开发平台，主体为 Rust 2024 Cargo workspace�
 | `tasks.md` | 执行步骤、依赖、完成标准与验收证据 |
 | `verification.md` | 每轮源码基线、实际命令、退出码、证据与未完成项 |
 
+- 开发计划、评审、交接、问题记录和每轮实际验收证据写入已忽略的 `specs/`；公开文档写入 `docs/`，只保留当前使用方法、业务契约与可复用验证流程。公开文档不得依赖仅本地存在的文件。
+- 文档、配置示例及开发脚本不得写入真实凭据、个人网络地址、SSH 用户或机器路径；使用环境变量、明确占位符和可公开的项目默认值。提交前检查变更中的环境信息，忽略规则不会自动移除已跟踪文件。
 - 按原需求逐项推进，不能自行把必做项改为可选。分批交付时明确本批范围和剩余工作。
 - 临时关闭能力、显式拒绝未支持请求属于止血，不等于该功能开发完成。
 - Tasks 与实际进展同步；验证未通过的项目不得仅凭代码存在就勾为完成。历史报告保留其原基线，不改写成新一轮结果。
@@ -141,7 +144,7 @@ cargo nextest run --manifest-path crates/app-cli/Cargo.toml --no-fail-fast --all
 | K8s Gateway 实际 HTTP 请求 | `make remote-k8s-verify SUITE=gateway` |
 | 远端全部套件 | `make remote-k8s-verify SUITE=all` |
 
-- K8s 默认使用远端工作流；原 DevSpace 与 `test-e2e-k8s` 入口保留。先读 [远端 K8s 使用说明](specs/remote-k8s-dev/README.md)，工具版本、资源预算、同步/构建/诊断步骤以该文档及配置为准。
+- K8s 默认使用远端工作流；原 DevSpace 与 `test-e2e-k8s` 入口保留。先读 [远端 K8s 使用说明](docs/deployment/kubernetes.md#remote-workflow)，工具版本、资源预算、同步/构建/诊断步骤以该文档及配置为准。
 - `specs/` 是仅本地保留的内部工作目录（spec/plan/tasks/verification、问题记录等，已 gitignore，不随开源仓库发布）：本地开发照常读写；对公众可见的说明一律放 `docs/`。
 - 复用未提交的 `.env.local`，缺项参考 [配置示例](tools/remote_k8s/env.example)，不覆盖已有无关配置。主机、目录、context、namespace、registry、访问地址从配置读取；不把真实凭据写入源码、文档或日志。
 - `remote-k8s-verify` 校验并构建当前源码、部署后测试；`remote-k8s-test` 仅测试已部署版本，不能证明本地新修改有效。同步不会自动构建或部署；远端接收目录不是编辑源。
@@ -180,7 +183,7 @@ make remote-k8s-logs
 - `smoke` 核查部署身份、双副本就绪、PVC Bound 和直连健康接口，不能证明应用生命周期、数据保留或跨副本业务正确。
 - `gateway` 套件检查 Gateway/HTTPRoute 条件并请求 Gateway 健康接口，仍不能替代动态 UserApp 路由、预览、WebSocket/SSE 等业务场景。直连 RCoder 与经过 Gateway 是两条不同路径，须分别记录结果。
 - Gateway 不可用时，可以继续不依赖它的直连测试；依赖 Gateway 的场景必须记为失败或受阻，不能改成直连、跳过断言后宣称通过。控制面超时、存储异常等环境故障应与业务逻辑失败分开归因。
-- `doctor` 只检查前置，不证明网络与存储全链路可用；历史部署记录也不证明本轮通过。当前故障与修复进展放在 `specs/remote-k8s-dev/` 的日期化验证记录中，不将临时故障固化为测试豁免。
+- `doctor` 只检查前置，不证明网络与存储全链路可用；历史部署记录也不证明本轮通过。当前故障与修复进展放在 `specs/` 对应专题的日期化验证记录中，不将临时故障固化为测试豁免。
 
 ### 资源保护
 

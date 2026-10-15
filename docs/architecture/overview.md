@@ -61,11 +61,12 @@ RCoder（gRPC 流转换为 SSE）
 | crate | 职责 |
 |-------|------|
 | `app_manager` | UserApp 生命周期 / 存储 / 文件管理（REST API） |
-| `app-cli` | UserApp 构建 CLI（**独立 Cargo workspace**，npm 分发 `@nuwax-ai/app-cli`） |
+| `app-cli` | UserApp 构建与服务管理器（**独立 Cargo 项目**，npm 分发 `@nuwax-ai/app-cli`）；`run` 经常驻单 owner 处理源码启动与恢复 |
 | `workspace-manifest` | UserApp workspace 两级 manifest 类型 |
 | `frontend-detector` | 前端项目框架探测（纯函数） |
 | `preview-coordinator` | WebAgentRunner 开发阶段的 Vite 预览协调 |
 | `runtime-state-layout` | 运行态状态根解析契约（app-cli 与平台同一解析规则） |
+| `runtime-supervisor` | app-cli / file-server-proxy 的进程监督、控制与恢复 |
 
 ### 文件服务
 
@@ -83,7 +84,7 @@ RCoder（gRPC 流转换为 SSE）
 | `container-runtime-api` | 容器运行时抽象 trait 层 |
 | `rcoder-proxy` | Pingora 反向代理封装 |
 | `rcoder-gateway` | K8s 无状态网关（header 注入 + Gateway API 路由） |
-| `rcoder-storage` | 存储层（memory / PostgreSQL 后端） |
+| `rcoder-storage` | Agent 项目/会话 memory / PostgreSQL；独立 UserApp 控制存储 Turso / PostgreSQL |
 | `rcoder-telemetry` | 遥测（Tracing + OpenTelemetry） |
 
 ### 共享契约
@@ -101,6 +102,12 @@ RCoder（gRPC 流转换为 SSE）
 
 **UserApp 操作**：客户端调 `/api/v1/userapp/*` REST 接口 → app_manager 受理生命周期操作 → 按 dev/prod 环境分派：dev 走 UserappBuilder 容器（构建/开发编排），prod 走容器运行时（Deployment + per-app PVC）→ 状态经 SSE 任务事件与 REST 查询暴露。业务概念详见 [UserApp 应用管理](../concepts/userapp.md)。
 
+开发容器内，重复 `app-cli run` 通过常驻 `serve` owner 提交当前源码启动；必要时自动恢复管理入口，再等待本次操作结果。业务失败或停止后管理继续可用，旧锁文件与历史状态不单独阻止新请求。命令边界见 [app-cli 使用指南](../development/app-cli.md)。
+
+## 持久化边界
+
+Agent 项目、会话和容器关联使用 `storage` 配置，默认 memory，也可启用 PostgreSQL。UserApp 生命周期、操作和恢复记录使用独立的 `userapp_storage`：Docker/宿主机的 `auto` 选择本地 Turso，Kubernetes 选择 PostgreSQL。Agent 使用 memory 时，UserApp 仍有自己的持久化控制记录；应用工作区与数据库数据卷另由运行时保留。具体配置见[配置指南](../configuration.md)。
+
 ## 部署形态
 
 同一引擎，三种形态：
@@ -115,12 +122,12 @@ RCoder（gRPC 流转换为 SSE）
 
 | 组件类型 | 技术选型 | 说明 |
 |----------|---------|------|
-| 编程语言 | Rust 2024 Edition (1.85+) | MSRV 1.85 |
+| 编程语言 | Rust 2024 Edition | 开发与 CI 使用 stable；工具链说明见[贡献指南](../../CONTRIBUTING.md#开发环境) |
 | HTTP 框架 | Axum 0.8 + Tower | 高性能异步 Web 框架 |
 | RPC 框架 | Tonic 0.14 | gRPC 通信（全 rustls） |
 | AI 协议 | agent-client-protocol v2 + MCP (rmcp) | ACP 官方 SDK，v1 wire 兼容 |
 | 容器化 | Docker (Bollard) + Kubernetes (kube-rs) | 双运行时抽象 |
-| 持久化 | PostgreSQL (SQLx, feature-gated) / 内存 | K8s 变体启用 PG，Docker 路径零依赖 |
+| 持久化 | PostgreSQL / Turso / 内存 | Agent 与 UserApp 分别配置；本地 UserApp 默认 Turso，K8s 使用 PostgreSQL |
 | 日志系统 | Tracing + OpenTelemetry | 结构化日志（K8s 下写文件按天滚动） |
 | 性能分析 | dial9 + hotpath | 事件级 Tokio tracing（本地 dev）+ 函数耗时剖析 |
 | API 文档 | utoipa + Swagger UI + Scalar | 自动生成 OpenAPI |

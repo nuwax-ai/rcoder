@@ -52,6 +52,12 @@ crates/*/target/
 
 # 模型探活集成测试本地配置(含 API key,不提交)
 *.env.local
+# 本地环境文件默认不入库；仅公开示例与既有镜像标签文件例外。
+.env
+.env.*
+!.env.example
+!.env.*.example
+!/docker/.env
 tests/sse_e2e/results/
 tests/userapp_e2e_local/
 tests-e2e/reports/

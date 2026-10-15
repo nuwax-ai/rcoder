@@ -1,127 +1,38 @@
-# RCoder CLI npm Packages
+# RCoder CLI 的 npm 分发
 
-This directory contains npm package templates for distributing rcoder-cli binaries.
+本目录维护 `rcoder-cli` 与 `@nuwax-ai/app-cli` 的 npm 主包、启动 wrapper 和平台二进制包模板。安装使用说明与包维护分别见下文；app-cli 的完整命令行为集中在[使用指南](../docs/development/app-cli.md)。
 
-## Package Structure
+## 安装
 
-```
-npm/
-├── rcoder-cli/                    # Main package (platform detection + wrapper)
-│   ├── package.json
-│   └── bin/cli.js
-├── rcoder-cli-linux-x64/          # Linux x86_64 binary
-├── rcoder-cli-linux-arm64/        # Linux ARM64 binary
-├── rcoder-cli-darwin-x64/         # macOS x86_64 binary
-├── rcoder-cli-darwin-arm64/       # macOS ARM64 binary
-└── rcoder-cli-win32-x64/          # Windows x86_64 binary
-```
-
-## Installation
-
-### Stable version
 ```bash
 npm install -g rcoder-cli
-```
+rcoder-cli --help
 
-### Beta version
-```bash
-npm install -g rcoder-cli@beta
-```
-
-### Using China mirror
-```bash
-npm config set registry https://registry.npmmirror.com
-npm install -g rcoder-cli
-```
-
-## CI/CD
-
-Two GitHub Actions workflows handle publishing:
-
-- `release.yml` - Publishes stable versions with `@latest` tag
-  - Triggered by tags like `v1.0.0` or `1.0.0`
-- `release-beta.yml` - Publishes beta versions with `@beta` tag
-  - Triggered by tags like `v1.0.0-beta.1` or `1.0.0-beta.1`
-
-## How it works
-
-1. User runs `npm install -g rcoder-cli`
-2. npm installs main package + optional dependency for current platform
-3. When user runs `rcoder-cli`, `bin/cli.js` detects platform and executes the binary from the platform package
-
-## Version Management
-
-All packages share the same version number. The CI automatically updates versions from the git tag before publishing.
-
----
-
-# @nuwax-ai/app-cli Packages
-
-跨平台 UserApp 构建与服务管理器的 npm 分发，支持宿主机和容器中的服务编排、Pingap 路由及管理 API。
-
-## Package Structure
-
-```
-npm/
-├── app-cli/                      # 主包（平台探测 wrapper，bin: app-cli）
-│   ├── package.json
-│   └── bin/cli.js
-├── app-cli-linux-x64/            # Linux x86_64 二进制
-├── app-cli-linux-arm64/          # Linux ARM64 二进制
-├── app-cli-darwin-x64/           # macOS x86_64 二进制
-├── app-cli-darwin-arm64/         # macOS ARM64 二进制
-└── app-cli-windows-x64/          # Windows x86_64 二进制
-```
-
-## Installation
-
-```bash
 npm install -g @nuwax-ai/app-cli
 app-cli --help
 ```
 
-典型用法：UserApp workspace 模板的本地验证三步闭环——
+预发布版本使用 `@beta`。支持的平台以对应主包、wrapper 与发布 workflow 为准；安装时保留 optionalDependencies，以便 npm 安装当前平台二进制。
 
-```bash
-app-cli gen-lock --workspace <workspace>          # manifest 校验 + release.lock.toml
-app-cli build --workspace <workspace> --deploy-dir <dir>        # 逐服务编译 + 产物态部署布局（或 --dev 三分派）
-app-cli serve --workspace <dir>         # 产物态运行（pingap :9080 / admin :3010）
-```
+## 包结构与启动
 
-### 如何选择子命令
+| 包 | 主包目录 | 平台目录 | 作用 |
+|---|---|---|---|
+| `rcoder-cli` | [rcoder-cli/](rcoder-cli/) | `rcoder-cli-*` | 本机测试 ACP Agent 的 CLI |
+| `@nuwax-ai/app-cli` | [app-cli/](app-cli/) | `app-cli-*` | UserApp 构建与服务管理器 |
 
-| 命令 | 用途 |
-|---|---|
-| `serve` | 常驻服务管理器，统一处理启动、停止、重启与部署；平台和长期运行优先使用 |
-| `run` | 前台运行当前工作区服务，本地编排时持续监督到停止或退出；不执行构建 |
-| `build` | 构建服务，可生成部署目录；不启动服务 |
-| `gen-lock` | 校验 manifest 并生成 `release.lock.toml`；不构建、不启动服务 |
-| `readiness` | 只读查询业务就绪状态；不启动管理器或业务服务 |
-| `owner` | 通过独立监督通道查询状态、停止、恢复或关闭 CLI；管理 API 不可用时仍可使用 |
-| `run-service` | supervisord 调用的内部服务执行入口 |
-| `journal adopt` | 处理部署日志的状态冲突，属于运维命令 |
+主包的 `bin/cli.js` 读取操作系统和架构，定位 optional dependency 中的二进制，再转发命令参数。app-cli wrapper 使用 spawn 并转发 SIGTERM/SIGINT/SIGHUP，支持 `serve` 常驻运行；平台包随附配套 Pingap，调用方显式设置 `APP_CLI_PINGAP_BIN` 或 `--pingap-bin` 时使用指定配置。
 
-`run` 不是启动后立即退出的短命令，也不天然代表开发模式。
-开发模式由 `APP_CLI_RUN_PROFILE=dev` 选择，优先使用 `[devrun]`；未设置时使用 `[run]`。
-`run` 和 `serve` 都参与同一工作区的所有者协调，不应用另起进程的方式绕过已有所有者。
-`serve` 同样以前台常驻方式运行，不会自动把自己变成后台服务；后台托管由调用方负责。
-参数统一放在子命令后，例如 `app-cli run --workspace <workspace>`。
+`app-cli run` 向独立常驻 owner 提交启动请求并等待本次结果；已有 owner 会被复用，没有可用 owner 时会自动启动管理进程。CLI 请求返回后管理仍运行。它与前台常驻的 `app-cli serve` 职责不同，详见[源码启动与重复运行](../docs/development/app-cli.md#当前源码启动与重复运行)。
 
-## CI/CD
+## 发布入口
 
-`release-app-cli.yml` 发布，触发 tag：`app-cli-v*`（如 `app-cli-v0.2.0`）。
-linux 双架构经 cargo-zigbuild（glibc 钉 2.17）；darwin 双架构 macos runner 原生编译。
+| 产物 | Workflow | Tag |
+|---|---|---|
+| rcoder-cli 正式版本 | [release.yml](../.github/workflows/release.yml) | `v<VERSION>` 或 `<VERSION>` |
+| rcoder-cli beta | [release-beta.yml](../.github/workflows/release-beta.yml) | `v<VERSION>-beta*` 或 `<VERSION>-beta*` |
+| app-cli | [release-app-cli.yml](../.github/workflows/release-app-cli.yml) | `app-cli-v<VERSION>` |
 
-## Version Management
+app-cli 版本以 [crates/app-cli/Cargo.toml](../crates/app-cli/Cargo.toml) 为单一来源。发布 tag 必须对应同版本源码提交，workflow 会核验一致性；稳定版本发 `latest`，预发布版本发 `beta`。主包与平台子包的仓库版本使用占位 `0.0.0`，发布时注入实际版本。
 
-单一事实源 = `crates/app-cli/Cargo.toml` 的 `version`。发版流程：改 Cargo.toml
-版本 → 在该 commit 打同版本 tag `app-cli-v<VERSION>`（workflow 的 meta job 强校验
-一致）。仓库内包 version 恒为占位 `0.0.0`，发布时 CI 注入。prerelease（版本含
-`-`）发 `beta` dist-tag。
-
-## How it works（与 rcoder-cli 的差异）
-
-wrapper 同为 optionalDependencies 平台子包方案，但 `bin/cli.js` 用 **spawn + 信号
-转发**（SIGTERM/SIGINT/SIGHUP）而非 execFileSync——`app-cli serve` 是长驻进程
-（容器 PID1 语义），docker stop 时信号必须到达二进制才能优雅停（级联停 pingap
-与各子服务）。
+app-cli 的 Linux 双架构构建使用 cargo-zigbuild，并设 glibc 2.17 基线；macOS 与 Windows 使用各自构建 runner。Pingap 与 app-cli 配对检查由发布 workflow 执行。源码或版本号改变不等于已发布，应分别核验主包、平台子包、dist-tag 与实际安装版本。

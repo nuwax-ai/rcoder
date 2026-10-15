@@ -12,7 +12,7 @@ npm install @nuwax-ai/file-server-proxy
 
 安装时自动：
 
-1. 从 OSS 预下载当前平台的 proxy 二进制（失败仅警告，首次运行会重试；`FILE_SERVER_PROXY_SKIP_DOWNLOAD=1` 跳过）；
+1. 从 OSS 准备当前平台的 proxy 二进制并校验发布回执；下载或校验失败时安装准备步骤返回失败，首次启动不补下载（`FILE_SERVER_PROXY_SKIP_DOWNLOAD=1` 可显式跳过，打包或启动前仍需完成准备）；
 2. 安装 `nuwax-file-server`（**精确版本 pin**，与 proxy 版本同步测试，`npm update` 不会拉动它）。
 
 要求 Node ≥ 22（nuwax-file-server 的硬门槛）。
@@ -51,7 +51,7 @@ npm install @nuwax-ai/file-server-proxy
 
 ## 命令
 
-```bash
+```text
 file-server-proxy start [--policy <ts_first|all_rust|all_ts>]
                         [--port <60000>] [--rust-port <8086>]
                         [--ts-port <N>] [--detached]

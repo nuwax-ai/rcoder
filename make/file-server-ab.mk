@@ -1,5 +1,5 @@
 # Isolated black-box comparison of the embedded Rust file-server and TS baseline.
-AB_TS_SOURCE ?= /Users/soddy/Documents/git-workspace/nuwax-file-server
+AB_TS_SOURCE ?=
 AB_TS_REF ?= HEAD
 AB_REPORT_ROOT ?= $(CURDIR)/tests-e2e/reports/file-server-ab
 AB_PNPM_CACHE_VOLUME_PREFIX ?= rcoder-file-server-ab-pnpm
@@ -41,7 +41,7 @@ file-server-ab-doctor:
 	 --ts-url "$(TS_URL)"
 
 file-server-ab-help:
-	@echo "make file-server-ab [AB_SUITE=core|git|build|all] [AB_TS_SOURCE=/path/to/nuwax-file-server] [AB_TS_REF=HEAD] [AB_PNPM_VERSION=10.34.5] [AB_PNPM_REGISTRY=https://registry.npmmirror.com] [AB_PNPM_NETWORK_CONCURRENCY=32] [AB_PNPM_CACHE_VOLUME_PREFIX=rcoder-file-server-ab-pnpm] [AB_BUILDER=buildx-builder] [DOCKER_MIRROR=registry-prefix/]"
+	@echo "make file-server-ab [AB_SUITE=core|git|build|all] AB_TS_SOURCE=/path/to/nuwax-file-server [AB_TS_REF=HEAD] [AB_PNPM_VERSION=10.34.5] [AB_PNPM_REGISTRY=https://registry.npmmirror.com] [AB_PNPM_NETWORK_CONCURRENCY=32] [AB_PNPM_CACHE_VOLUME_PREFIX=rcoder-file-server-ab-pnpm] [AB_BUILDER=buildx-builder] [DOCKER_MIRROR=registry-prefix/]"
 	@echo "  DOCKER_MIRROR can also be set in .env.local; it only selects local image pull/build sources."
 	@echo "  core: offline API/file behavior; git: gix-vs-system-Git API; build: template install/build/dev lifecycle; all: all three."
 	@echo "  Prefer the active local Docker builder; set AB_BUILDER only when another build occupies it (docker-container builders may export large OCI images)."

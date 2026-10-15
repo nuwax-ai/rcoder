@@ -60,7 +60,7 @@ RCoder 的错误响应保留 `code`、`message`、`data`、`tid`、`operation_id
 - 新码 + `retryable=false` 或结构化 data 缺失：查询 holder/应用状态并提示排查，不自动重试。
 - 其余 `ERR_CONFLICT`：保留现有错误处理，不转成自动重试。
 
-一旦请求已经受理，改为查询自己的原 `operation_id`；`holder_operation_id` 只说明谁阻塞本次请求，不表示新的重启已经受理。Java 浏览器响应链目前仍需保留此 data，详见交接说明。
+一旦请求已经受理，改为查询自己的原 `operation_id`；`holder_operation_id` 只说明谁阻塞本次请求，不表示新的重启已经受理。调用方应将结构化 `data` 完整透传到最终响应，保留操作身份与重试证据。
 
 `POST /api/v1/userapp/{app_id}/restart` 在业务受理前遇到有明确进度证据的正常流量唤醒、部署或重启占用时，每 200ms 重核生命周期、持久 intent 和物理租约。两层及所有受理前只读准备共用同一个单调时钟 deadline，默认 30 秒；可用 YAML `app_manager.restart_admission_wait_secs` 或环境 `RCODER_USERAPP_RESTART_ADMISSION_WAIT_SECS` 配置，显式 YAML 值优先，选中的非法输入直接报配置错误。等待耗尽保留原 blocker/data，不受理另一项业务操作。物理 Stop/Restart 控制、未知 holder、`recovery_required` 与陈旧 `running` 立即拒绝；外部 Stop 仍快失败，Start 与内部回收器保持原排队语义。
 
@@ -132,4 +132,4 @@ HTTP 状态并不代替业务结果：原有 `HttpResult` 入口和正式 UserAp
 
 诊断查询和业务 readiness 失败不授权停止或重启容器。SSE 后续观测可以补充 OOM、CrashLoop 等信息，但不能替换原失败原因和身份。
 
-Java 对接说明见 [Java 错误契约交接](development/java-error-contract-handoff.md)。
+调用方应保留本页定义的结构化错误字段、原操作身份和重试语义，避免仅透传 message 或通过文案判断错误类型。

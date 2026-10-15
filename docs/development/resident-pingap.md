@@ -71,7 +71,15 @@ RecoveryRequired。不自动回滚业务制品，不重放未知数据库迁移�
 
 Linux 容器使用已校验的官方 full/openssl 发行包。npm 根据原平台与 ABI 约束从未修改的
 官方源码编译，Linux 保留 glibc 2.17；源码、资产和最终二进制身份在构建阶段核验。
-历史补丁见 history/pingap-applied，不参与构建或运行准入。
+历史补丁不参与构建或运行准入。
 
 组件/协议 fixture、真实官方进程、Compose/K8s 部署和发布分别验收。版本正确、管理接口
 应答、一个 HTTP 标记或组件通过数量，都不能替代完整业务启动与取消/恢复验证。
+
+## 版本配套与构建核验
+
+app-cli 的 SDK pin、运行身份和实际 Pingap 二进制必须配套；官方资产及 SHA256 由 `tools/build/pingap-assets.json` 记录。仅修改镜像环境变量不能替换旧二进制，也不能作为升级完成的证据。
+
+镜像构建应固定同一份源码输入，分别记录 app-cli、Pingap、Node 和基础镜像的实际身份。版本门禁可使用 `python3 k8s/scripts/pingap_version_gate.py --help` 查看本仓及跨仓模式；跨仓模式需要显式提供配套构建仓。
+
+`tools/verify_pingap_upgrade.py` 验证真实程序生成的配置、admin、路由、错误来源头、WebSocket、SSE 和健康状态；`tools/verify_userapp_subpath.py` 补充 React/Vue 资源路径与 HMR。使用各工具的 `--help` 核对所需二进制与临时项目输入。协议验证、完整容器生命周期、Compose/K8s 部署与发布是不同验收层级。

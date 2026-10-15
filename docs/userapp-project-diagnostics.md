@@ -133,15 +133,9 @@ data: {"event":"failed","error":"……"}
 
 调用方如需长期保留失败记录，应保存响应诊断及其与应用、请求、任务的关联。app-cli 的持久运行操作及恢复记录是另一套身份和保留机制，不因内存任务不存在就允许改用新操作重放未知结果。相关说明见 [dev 管理进程恢复](userapp-dev-owner-recovery.md) 和 [构建排队合同](userapp-build-queue.md)。
 
-## Java / 前端接入边界
-
-当前 Java 失败处理路径仍会丢失响应 `data`，失败 `task_id` 与应用任务、日志视图的关联仍需后续接入。本批不修改 Java 或前端，也不宣称用户界面已经完成展示。
-
-后续接入至少需要：
+## 调用方接入要求
 
 - 在 `success=false` 分支保留 `data`，不要只抛出 `message` 后丢失任务和诊断。
 - 使用服务端实际返回的 ID 关联任务，并允许为已经 Failed 的任务读取 GET/SSE。
 - 展示阶段、修复目标、文件/字段和真实服务身份；保留原 Recovery 数据。
 - 对 `task_id=null`、参数拒绝以及任务过期分别处理，不能伪造 ID 或无限重试查询。
-
-Rust 的 TCP 透传回归覆盖 file-server-userapp 真实响应 → `forward_to_addr` → 任务 GET/SSE；它不替代 Java/前端接入、完整容器生命周期或 K8s 部署验收。

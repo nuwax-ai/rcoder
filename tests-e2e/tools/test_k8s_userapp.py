@@ -266,11 +266,11 @@ class RestObservationTests(unittest.TestCase):
 
     def test_ssh_deadline_propagates_without_changing_arguments(self):
         run = self.run_fixture()
-        run.args.context, run.args.namespace, run.args.ssh = 'default', 'nuwax-k8s-test', 'swufe@192.168.1.18'
+        run.args.context, run.args.namespace, run.args.ssh = 'default', 'nuwax-k8s-test', 'test-user@192.0.2.10'
         run.local = Mock(return_value='inventory')
         self.assertEqual(run.kube('get', 'pods', deadline=10), 'inventory')
         self.assertEqual(run.local.call_args.args, ('ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
-                                                  'swufe@192.168.1.18', 'kubectl --context default -n nuwax-k8s-test get pods'))
+                                                  'test-user@192.0.2.10', 'kubectl --context default -n nuwax-k8s-test get pods'))
         self.assertEqual(run.local.call_args.kwargs, {'deadline': 10})
         with patch.object(acceptance.subprocess, 'check_output', return_value='result') as output, \
                 patch.object(acceptance.time, 'monotonic', return_value=3):

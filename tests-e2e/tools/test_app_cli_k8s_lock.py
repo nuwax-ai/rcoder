@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 SPEC = importlib.util.spec_from_file_location(
@@ -83,6 +83,35 @@ class K8sLockToolTests(unittest.TestCase):
         experiment = TOOL.ClusterExperiment(args, runner=controlled, sleep=lambda _: None)
         controlled.experiment = experiment
         return experiment, controlled
+
+    def test_node_ssh_requires_explicit_user_before_ssh(self):
+        for mapping in ('node-a=test-host', 'node-a=test-host:', 'node-a=test-host::fixture-password'):
+            with self.subTest(mapping=mapping):
+                experiment, controlled = self.make_experiment(node_ssh=[mapping])
+                with self.assertRaisesRegex(ValueError, 'explicit SSH user'):
+                    experiment.ssh_node('node-a', 'true')
+                self.assertEqual(controlled.calls, [])
+
+    def test_node_ssh_preserves_explicit_target_and_passwordless_sudo(self):
+        experiment, _ = self.make_experiment(node_ssh=['node-a=test-host:test-user'])
+        experiment.runner = Mock(return_value=SimpleNamespace(stdout='done'))
+        self.assertEqual(experiment.ssh_node('node-a', 'true').stdout, 'done')
+        argv = experiment.runner.call_args.args[0]
+        self.assertEqual(argv[:5], ['ssh', '-o', 'BatchMode=yes', 'test-user@test-host', 'sudo -n -- sh -ec true'])
+        self.assertIsNone(experiment.runner.call_args.kwargs['input'])
+
+    def test_all_scenario_rejects_missing_ssh_user_before_cluster_or_source_calls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = str(Path(directory) / 'report.json')
+            experiment, controlled = self.make_experiment(
+                report=report, scenario='all', node_ssh=['node-a=test-host'])
+            with patch.object(TOOL, 'source_identity') as identity:
+                self.assertEqual(experiment.run(), 1)
+            identity.assert_not_called()
+            self.assertEqual(controlled.calls, [])
+            result = json.loads(Path(report).read_text())
+            self.assertFalse(result['success'])
+            self.assertIn('explicit SSH user', result['error'])
 
     def captured_resources(self, experiment):
         experiment.namespace_uid = 'namespace-original'

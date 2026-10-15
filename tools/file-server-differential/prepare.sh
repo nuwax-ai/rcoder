@@ -3,12 +3,12 @@
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/lib.sh"
 
+require_ts_source
+
 require_command node
 require_command cargo
 require_command curl
 require_command git
-[[ -f "${TS_SERVER_ROOT}/src/server.js" ]] || { echo "TS server source not found: ${TS_SERVER_ROOT}/src/server.js" >&2; exit 1; }
-[[ -d "${TS_SERVER_ROOT}/node_modules" ]] || { echo "TS dependencies are missing; run pnpm install in ${TS_SERVER_ROOT}" >&2; exit 1; }
 
 case "${DIFF_RUNTIME}" in
   "${DIFF_TOOL_DIR}"/runtime) ;;
