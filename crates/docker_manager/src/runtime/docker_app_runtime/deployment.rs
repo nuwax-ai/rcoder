@@ -345,6 +345,11 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             let uid = info.id.clone().ok_or_else(|| {
                 ContainerRuntimeError::Conflict("Discovered container ID missing".into())
             })?;
+            if scope == UserAppOperationScope::Prod {
+                let host_root =
+                    crate::runtime::docker_app_configuration::host_workspace_root().await?;
+                crate::runtime::docker_app_configuration::verify_mounts(&info, app_id, &host_root)?;
+            }
             let metadata = info
                 .config
                 .as_ref()

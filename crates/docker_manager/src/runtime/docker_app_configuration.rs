@@ -64,7 +64,7 @@ fn validate_identity(app_id: &str, lifecycle_id: &str) -> Result<()> {
         .map_err(Error::ConfigurationError)
 }
 
-async fn host_workspace_root() -> Result<PathBuf> {
+pub(super) async fn host_workspace_root() -> Result<PathBuf> {
     crate::path::resolve_container_path_to_host(Path::new(
         shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT,
     ))
@@ -96,7 +96,10 @@ fn is_immutable_image_id(image: &str) -> bool {
     })
 }
 
-fn verify_mounts(
+/// Confirm the actual prod storage belongs to this installation and application.
+/// Native labels identify a lifecycle but do not authorize adopting another
+/// controller's same-named container on a shared Docker daemon.
+pub(super) fn verify_mounts(
     inspect: &bollard::models::ContainerInspectResponse,
     app_id: &str,
     host_root: &Path,
@@ -568,6 +571,70 @@ mod tests {
     fn captured(root: &Path) -> AppliedConfiguration {
         let (inspect, spec) = fixture(root);
         capture_configuration("app1", "life1", root.to_owned(), &inspect, spec, None).unwrap()
+    }
+
+    #[test]
+    fn prod_mount_ownership_accepts_current_installation_in_any_order() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut inspect, _) = fixture(root.path());
+        verify_mounts(&inspect, "app1", root.path()).unwrap();
+        inspect.mounts.as_mut().unwrap().reverse();
+        verify_mounts(&inspect, "app1", root.path()).unwrap();
+    }
+
+    #[test]
+    fn native_labels_do_not_authorize_foreign_installation_or_application_mounts() {
+        let root = tempfile::tempdir().unwrap();
+        let (inspect, _) = fixture(root.path());
+        for (app_id, expected_root) in [
+            ("app1", root.path().join("other-installation")),
+            ("app2", root.path().to_owned()),
+        ] {
+            assert!(matches!(
+                verify_mounts(&inspect, app_id, &expected_root),
+                Err(Error::Conflict(_))
+            ));
+        }
+        for index in 0..4 {
+            let mut foreign = inspect.clone();
+            foreign.mounts.as_mut().unwrap()[index].source = Some(
+                root.path()
+                    .join("foreign-data")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            assert!(matches!(
+                verify_mounts(&foreign, "app1", root.path()),
+                Err(Error::Conflict(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn prod_mount_ownership_requires_each_unambiguous_actual_bind() {
+        let root = tempfile::tempdir().unwrap();
+        let (inspect, _) = fixture(root.path());
+        for index in 0..4 {
+            let mut missing = inspect.clone();
+            missing.mounts.as_mut().unwrap().remove(index);
+            assert!(matches!(
+                verify_mounts(&missing, "app1", root.path()),
+                Err(Error::Conflict(_))
+            ));
+            let mut duplicate = inspect.clone();
+            let mount = duplicate.mounts.as_ref().unwrap()[index].clone();
+            duplicate.mounts.as_mut().unwrap().push(mount);
+            assert!(matches!(
+                verify_mounts(&duplicate, "app1", root.path()),
+                Err(Error::Conflict(_))
+            ));
+            let mut volume = inspect.clone();
+            volume.mounts.as_mut().unwrap()[index].typ = Some("volume".into());
+            assert!(matches!(
+                verify_mounts(&volume, "app1", root.path()),
+                Err(Error::Conflict(_))
+            ));
+        }
     }
 
     #[test]

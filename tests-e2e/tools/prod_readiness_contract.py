@@ -663,6 +663,8 @@ exec psql -h "${PGHOST:-localhost}" -p "${PGPORT:-5432}" \
         self.wait(phase + ': real prod proxy serves restored artifact',
                   lambda: self.proxy(marker=marker),
                   lambda row: row['status'] == 200 and row['matches'], seconds=180)
+        self.wait(phase + ': restored business readiness is confirmed', self.readiness,
+                  lambda data: data['ready'] is True, seconds=180)
         after, restored_mounts = self.current()
         restored = self.inspect(after)
         self.check('traffic recovery preserves applied environment and image',
@@ -713,12 +715,34 @@ exec psql -h "${PGHOST:-localhost}" -p "${PGPORT:-5432}" \
                    == self.build_receipt['rcoder']['binary_sha256'])
         self.check('controller restart retains the restored production runtime', self.current()[0] == runtime_id)
 
+    def wait_runtime_commit(self, cid, phase, expected_deployment, expected_generation, release=None):
+        # Real HTTP/readiness can become healthy before the asynchronous Active
+        # receipt is committed. Keep one captured physical UID and exact intent;
+        # only its observed orchestrating -> running transition may be awaited.
+        def observe():
+            data = self.runtime_json(cid, '/v1/deploy/status')
+            operation = data.get('operation') or {}
+            if (operation.get('operation_id') != expected_deployment
+                    or operation.get('deployment_generation_id') != expected_generation
+                    or (release is not None and (operation.get('artifact_release_id') != release
+                                                 or operation.get('request_release_id') != release))):
+                raise RuntimeError(f'{phase}: captured runtime deployment identity changed: {operation}')
+            state = operation.get('phase')
+            if state == 'running':
+                if operation.get('persisted') is not True or operation.get('deploy_stage') != 'succeeded':
+                    raise RuntimeError(f'{phase}: running deployment has no committed success receipt: {operation}')
+            elif state != 'orchestrating':
+                raise RuntimeError(f'{phase}: original deployment failed or entered an unexpected phase: {operation}')
+            return data
+        return self.wait(phase + ': original deployment running receipt is committed', observe,
+                         lambda data: data['operation']['phase'] == 'running', seconds=60)
+
     def verify_runtime(self, phase, expected_deployment, expected_generation=None, marker=None, release=None):
         expected_generation = expected_generation or expected_deployment
         marker = marker or self.marker
         cid, mounts = self.current()
+        deploy = self.wait_runtime_commit(cid, phase, expected_deployment, expected_generation, release)
         identity = self.runtime_json(cid, '/v1/runtime/identity')
-        deploy = self.runtime_json(cid, '/v1/deploy/status')
         workspace = identity['source_root']
         self.check(phase + ': owner workspace identity', identity['application_id'] == self.app
                    and workspace == f'/home/user/{self.app}/code', identity)
@@ -1057,7 +1081,7 @@ def main():
         contract.check('real ZIP was fetched', bool(downloads), downloads)
         initial_downloads = len(downloads)
         contract.owner_recovery(cid, identity)
-        contract.verify_runtime('owner-recovered', deployment)
+        contract.verify_runtime('owner-recovered', deployment, release=release)
         contract.check('owner recovery reuses the confirmed artifact', len(downloads) == initial_downloads, downloads)
         hot_url = f'http://{args.artifact_advertise_host}:{server.server_port}/{artifact_b.name}'
         _, hot = contract.api(f'/api/v1/userapp/{app}/start', {

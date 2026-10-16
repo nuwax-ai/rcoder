@@ -193,6 +193,57 @@ class InvalidArtifactEnvelopeContracts(unittest.TestCase):
                     self.exercise(**kwargs)
 
 
+class RuntimeCommitObservationContracts(unittest.TestCase):
+    def fixture(self):
+        return contract.Contract(SimpleNamespace(), {'checks': []}, 'ownedfixture')
+
+    def status(self, phase='orchestrating', **changes):
+        operation = {'operation_id': 'original-op', 'deployment_generation_id': 'original-generation',
+                     'request_release_id': 'release-b', 'artifact_release_id': 'release-b',
+                     'phase': phase, 'persisted': True, 'deploy_stage': 'succeeded'}
+        operation.update(changes)
+        return {'phase': phase, 'operation': operation}
+
+    def test_two_orchestrating_observations_wait_for_the_exact_running_receipt(self):
+        fixture = self.fixture()
+        with patch.object(fixture, 'runtime_json', side_effect=[self.status(), self.status(), self.status('running')]) as observe, \
+             patch.object(contract.time, 'sleep') as sleep, patch.object(contract, 'run') as docker, patch('builtins.print'):
+            final = fixture.wait_runtime_commit('captured-physical-uid', 'restored', 'original-op', 'original-generation', 'release-b')
+        self.assertEqual(final['operation']['phase'], 'running')
+        self.assertEqual(observe.call_count, 3)
+        self.assertTrue(all(call.args == ('captured-physical-uid', '/v1/deploy/status') for call in observe.call_args_list))
+        self.assertEqual(sleep.call_count, 2)
+        docker.assert_not_called()
+
+    def test_changed_identity_failed_or_uncommitted_running_is_not_a_startup_transition(self):
+        cases = [self.status(operation_id='foreign-op'), self.status(deployment_generation_id='foreign-generation'),
+                 self.status(request_release_id='release-a'), self.status(artifact_release_id='release-a'),
+                 self.status('failed'), self.status('idle'), self.status('deploying'),
+                 self.status('running', persisted=False), self.status('running', deploy_stage='failed')]
+        for status in cases:
+            with self.subTest(operation=status['operation']):
+                fixture = self.fixture()
+                with patch.object(fixture, 'runtime_json', return_value=status) as observe, \
+                     patch.object(contract.time, 'sleep') as sleep, patch.object(contract, 'run') as docker, patch('builtins.print'):
+                    with self.assertRaises(RuntimeError):
+                        fixture.wait_runtime_commit('captured-physical-uid', 'restored', 'original-op', 'original-generation', 'release-b')
+                self.assertEqual(observe.call_count, 1)
+                sleep.assert_not_called()
+                docker.assert_not_called()
+
+    def test_a_finite_orchestration_wait_cannot_report_timeout_as_success(self):
+        fixture = self.fixture()
+        with patch.object(fixture, 'runtime_json', return_value=self.status()) as observe, \
+             patch.object(contract.time, 'monotonic', side_effect=[0.0, 0.0, 61.0]), \
+             patch.object(contract.time, 'sleep'), patch.object(contract, 'run') as docker, patch('builtins.print'):
+            with self.assertRaisesRegex(RuntimeError, 'running receipt is committed'):
+                fixture.wait_runtime_commit('captured-physical-uid', 'restored', 'original-op', 'original-generation', 'release-b')
+        self.assertEqual(observe.call_count, 1)
+        self.assertIs(fixture.report['checks'][-1]['ok'], False)
+        self.assertEqual(fixture.report['checks'][-1]['detail']['timeout_seconds'], 60)
+        docker.assert_not_called()
+
+
 class OwnedPreparationContracts(unittest.TestCase):
     def receipt(self, root, state='unknown'):
         return {'version': 1, 'root': str(root), 'project': 'rcoder-prod-' + 'a' * 16,
