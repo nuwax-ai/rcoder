@@ -3,14 +3,64 @@ import copy
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
+import zipfile
 
 import prod_readiness_contract as contract
 
 
 class InputContracts(unittest.TestCase):
+    def test_generated_probe_artifact_matches_current_manifest_protocol(self):
+        repo = Path(__file__).resolve().parents[2]
+        types = (repo / 'crates/workspace-manifest/src/types.rs').read_text()
+
+        def declaration(kind, name):
+            found = re.search(r'pub ' + kind + r' ' + name + r'\s*\{(.*?)\n\}', types, re.S)
+            self.assertIsNotNone(found, 'current manifest protocol declaration missing: ' + name)
+            return found.group(1)
+
+        # Read the real Rust enum vocabulary instead of validating the fixture
+        # against a copied list that could repeat its invalid "api" assumption.
+        kinds = {name.lower() for name in re.findall(r'^\s*([A-Z]\w*),\s*$', declaration('enum', 'ProjectKind'), re.M)}
+        languages = {name.lower() for name in re.findall(r'^\s*([A-Z]\w*),\s*$', declaration('enum', 'ProjectType'), re.M)}
+
+        def fields(name):
+            return set(re.findall(r'^\s*pub (?:r#)?(\w+)\s*:', declaration('struct', name), re.M))
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = contract.make_artifact(repo, Path(directory), 'fixture-release', 'FIXTURE_MARKER')
+            with zipfile.ZipFile(artifact) as archive:
+                self.assertIsNone(archive.testzip())
+                lock = tomllib.loads(archive.read('release.lock.toml').decode())
+                self.assertLessEqual(set(lock), fields('ReleaseLock'))
+                self.assertEqual({service['service_id'] for service in lock['services']}, {'web', 'probe'})
+                for service in lock['services']:
+                    self.assertLessEqual(set(service), fields('LockedService'))
+                    self.assertIn(service['kind'], kinds)
+                    self.assertIn(service['type'], languages)
+                    for section, rust_type in [('run', 'RunSection'), ('health', 'HealthSection'), ('proxy', 'ProxySection')]:
+                        self.assertLessEqual(set(service[section]), fields(rust_type))
+                    project = tomllib.loads(archive.read(service['dir'] + '/project.manifest.toml').decode())
+                    self.assertLessEqual(set(project), fields('ProjectManifest'))
+                    self.assertLessEqual(set(project['project']), fields('ProjectMeta'))
+                    self.assertEqual(project['project'].get('kind', 'web'), service['kind'])
+                    self.assertEqual(project['project']['type'], service['type'])
+                probe = next(service for service in lock['services'] if service['service_id'] == 'probe')
+                project = tomllib.loads(archive.read('probe/project.manifest.toml').decode())
+                self.assertEqual(probe['run']['command'], project['run']['command'])
+                self.assertEqual(probe['run']['migrate'], project['run']['migrate'])
+                self.assertGreater(probe['run']['shutdown_timeout_seconds'], 0)
+                self.assertTrue(all(path.startswith('/') for path in probe['health'].values()))
+                self.assertEqual(probe['proxy']['path'], '/contract-probe')
+                for argv in (probe['run']['command'], probe['run']['migrate']):
+                    self.assertEqual(argv[0], 'python3')
+                    path = 'probe/' + argv[1]
+                    compile(archive.read(path), path, 'exec')
+
     def test_snapshot_without_git_hashes_actual_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

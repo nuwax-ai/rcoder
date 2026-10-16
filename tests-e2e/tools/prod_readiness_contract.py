@@ -358,7 +358,7 @@ service_id = "probe"
 name = "Contract migration probe"
 dir = "probe"
 type = "python"
-kind = "api"
+kind = "web"
 enabled = true
 port = 4200
 logs = []
@@ -389,7 +389,7 @@ upstream_includes = []
         'web/project.manifest.toml': 'schema_version = 1\n[project]\nservice_id="web"\nname="Contract frontend"\ntype="static"\n[build]\ncommand=["true"]\nartifact="dist"\n[proxy]\npath="/"\nstrip_prefix=false\n',
         'web/dist/index.html': f'<!doctype html><title>{marker}</title><main>{marker}</main><script src="/app.js"></script>\n',
         'web/dist/app.js': f'window.contractMarker = "{marker}";\n',
-        'probe/project.manifest.toml': 'schema_version=1\n[project]\nservice_id="probe"\nname="Contract probe"\ntype="python"\nkind="api"\n[build]\ncommand=["true"]\nartifact="artifact.zip"\n[run]\ncommand=["python3","main.py"]\nmigrate=["python3","migrate.py"]\n',
+        'probe/project.manifest.toml': 'schema_version=1\n[project]\nservice_id="probe"\nname="Contract probe"\ntype="python"\nkind="web"\n[build]\ncommand=["true"]\nartifact="artifact.zip"\n[run]\ncommand=["python3","main.py"]\nmigrate=["python3","migrate.py"]\n',
         'probe/main.py': 'import os\nfrom http.server import BaseHTTPRequestHandler,HTTPServer\nclass Handler(BaseHTTPRequestHandler):\n def do_GET(self):\n  self.send_response(200);self.end_headers();self.wfile.write(b"contract-probe")\nHTTPServer(("0.0.0.0",int(os.environ["PORT"])),Handler).serve_forever()\n',
         'probe/migrate.py': f'from pathlib import Path\nwith Path("/home/user/data/prod-contract-migrations.log").open("a") as handle:\n handle.write({release!r}+"\\n")\n',
         'database/001-contract.sql': 'CREATE TABLE IF NOT EXISTS public.codex_contract_sql (release_id text NOT NULL);\n' + f"INSERT INTO public.codex_contract_sql VALUES ('{release}');\n",
