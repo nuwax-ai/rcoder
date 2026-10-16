@@ -185,6 +185,8 @@ def validate_reports(directory, scenario=None, run_id=None, case_id=None):
             if run_id is not None and any(line.get('test_name') != scenario for line in lines):
                 errors.append(f'{path.name}: canonical test identity mismatch')
             for line in lines:
+                if line.get('kind') == 'chat_request' and line.get('ok') is not True:
+                    errors.append(f"{path.name}: unsuccessful chat request: {line.get('phase', '<missing>')}")
                 if line.get('kind') == 'scenario_begin':
                     identity = (line.get('scenario'), line.get('backend'))
                     if identity in observed_identities:

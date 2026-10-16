@@ -55,6 +55,74 @@ class SelectionTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
+    def chat_report(self, scenario, phase, ok):
+        rows = [{'kind': 'scenario_begin', 'scenario': scenario, 'backend': 'k8s'},
+                {'kind': 'chat_request', 'phase': phase, 'ok': ok}]
+        rows.extend({'kind': 'assert', 'name': name, 'level': 'hard', 'ok': True}
+                    for name in sorted(REQUIRED[scenario]))
+        rows.append({'kind': 'scenario_end', 'verdict': 'pass',
+                     'hard_pass': len(REQUIRED[scenario]), 'hard_fail': 0})
+        for row in rows:
+            row.update(run_id='run', case_id='case', test_name=scenario)
+        return rows
+
+    def test_captured_background_chat_conflicts_cannot_pass_on_sse_assertions(self):
+        # Both captured cases completed their accepted task over SSE but returned
+        # this registration conflict from the background POST. Preserve that
+        # negative acknowledgement even when every existing hard step passed.
+        for scenario, phase in (('lb_entry_rotation', 'turn1_bg'),
+                                ('lb_cross_entry_cursor_reconnect', 'turn2_bg')):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                rows = self.chat_report(scenario, phase, False)
+                rows[1]['error'] = json.dumps({
+                    'code': 'ERR_CONFLICT', 'success': False,
+                    'message': 'The captured execution identity was replaced before session registration',
+                    'error_detail': {'reason_code': 'ERR_CONFLICT',
+                                     'stage': 'chat.session_registration',
+                                     'retryable': False, 'task_id': 'accepted-session'},
+                    'data': {'session_id': 'accepted-session',
+                             'request_id': 'accepted-request', 'error': None},
+                })
+                (root / 'case.jsonl').write_text('\n'.join(map(json.dumps, rows)))
+                errors = validate_reports(root, scenario, 'run', 'case')
+                self.assertTrue(any('unsuccessful chat request' in error for error in errors), errors)
+
+    def test_successful_background_chat_keeps_existing_acceptance_steps(self):
+        for scenario, phase in (('lb_entry_rotation', 'turn1_bg'),
+                                ('lb_cross_entry_cursor_reconnect', 'turn2_bg')):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                rows = self.chat_report(scenario, phase, True)
+                rows[1]['response'] = {'session_id': 'accepted-session',
+                                       'request_id': 'accepted-request', 'error': None}
+                (root / 'case.jsonl').write_text('\n'.join(map(json.dumps, rows)))
+                self.assertFalse(validate_reports(root, scenario, 'run', 'case'))
+
+    def test_chat_request_requires_explicit_boolean_success(self):
+        for value in (None, 'true', 1):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                rows = self.chat_report('lb_entry_rotation', 'turn1_bg', value)
+                (root / 'case.jsonl').write_text('\n'.join(map(json.dumps, rows)))
+                self.assertTrue(validate_reports(root, 'lb_entry_rotation', 'run', 'case'))
+
+    def test_expected_negative_http_and_metrics_are_not_failed_chat_requests(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            rows = self.chat_report('lb_entry_rotation', 'turn1_bg', True)
+            rows.insert(-1, {'kind': 'assert', 'name': 'expected stale-version rejection',
+                             'level': 'hard', 'ok': True,
+                             'detail': {'status': 200,
+                                        'response': {'code': 'ERR_CONFLICT', 'success': False}},
+                             'run_id': 'run', 'case_id': 'case', 'test_name': 'lb_entry_rotation'})
+            rows.insert(-1, {'kind': 'assert', 'level': 'diagnostic', 'name': 'metrics_diff',
+                             'ok': False, 'value': 'unavailable',
+                             'run_id': 'run', 'case_id': 'case', 'test_name': 'lb_entry_rotation'})
+            rows[-1]['hard_pass'] += 1
+            (root / 'case.jsonl').write_text('\n'.join(map(json.dumps, rows)))
+            self.assertFalse(validate_reports(root, 'lb_entry_rotation', 'run', 'case'))
+
     def test_first_cancellation_during_settle_or_cleanup_is_deferred(self):
         for phase in ('settle', 'cleanup'):
             for signum in (signal.SIGINT, signal.SIGTERM):
