@@ -104,7 +104,12 @@ pub async fn startup_cleanup_containers(
     let start_time = Instant::now();
 
     // 查找匹配模式的容器
-    let matched_containers = docker_manager.list_containers_with_pattern(pattern).await?;
+    let matched_containers = docker_manager
+        .list_containers_with_pattern(pattern)
+        .await?
+        .into_iter()
+        .filter(|container| automatic_agent_cleanup_candidate(container, pattern))
+        .collect::<Vec<_>>();
 
     let total_found = matched_containers.len();
     info!("[STARTUP_CLEANUP] Found {} containers", total_found);
@@ -209,6 +214,55 @@ pub async fn startup_cleanup_containers(
         removed_container_ids,
         failed_removals_details,
         duration_ms,
+    })
+}
+
+/// A name pattern is a discovery hint, never authority to remove persistent
+/// UserApp compute. Only the ordinary memory-managed Agent family with its
+/// canonical name/identifier labels participates in implicit startup/shutdown
+/// cleanup. Unlabelled, foreign and application-owned resources remain intact.
+fn automatic_agent_cleanup_candidate(
+    container: &bollard::models::ContainerSummary,
+    pattern: &str,
+) -> bool {
+    use shared_types::ServiceType;
+
+    let Some(labels) = &container.labels else {
+        return false;
+    };
+    let Some(service_type) = labels
+        .get("service-type")
+        .and_then(|value| value.parse::<ServiceType>().ok())
+    else {
+        return false;
+    };
+    if !matches!(
+        service_type,
+        ServiceType::WebAgentRunner
+            | ServiceType::ComputerAgentRunner
+            | ServiceType::ComputerNormalProject
+    ) || labels.contains_key(shared_types::USERAPP_DOCKER_APP_ID_LABEL)
+        || shared_types::USERAPP_RESOURCE_IDENTITY_KEYS
+            .iter()
+            .any(|key| labels.contains_key(*key))
+        || labels.contains_key("managed-by")
+    {
+        return false;
+    }
+    let Some(identifier) = labels.get("identifier").filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let Some(prefix) = pattern.strip_suffix("-*") else {
+        return false;
+    };
+    let Ok(expected_name) = crate::utils::DockerUtils::generate_container_name(prefix, identifier)
+    else {
+        return false;
+    };
+    container.names.as_ref().is_some_and(|names| {
+        names
+            .iter()
+            .any(|name| name.trim_start_matches('/') == expected_name)
     })
 }
 
@@ -488,14 +542,20 @@ pub fn get_container_patterns_for_enabled_services(
     multi_image_config: &shared_types::MultiImageConfig,
 ) -> Vec<String> {
     // 直接遍历 services，获取启用的服务配置并使用其 container_prefix()。
-    // UserappBuilder 排除：userApp 生命周期为持久化权威（SQLite/PG），builder
+    // UserApp 族排除：userApp 生命周期为持久化权威（SQLite/PG），builder
     // 容器跨 rcoder 重启存活，重启后经注册表 miss→权威发现再导入；启动/停机
     // 全量清删会摧毁在途工作区（Agent 容器仍属内存注册表语义，照旧清理）。
     multi_image_config
         .services
         .values()
         .filter(|config| {
-            config.enabled && config.service_type != shared_types::ServiceType::UserappBuilder
+            config.enabled
+                && matches!(
+                    config.service_type,
+                    shared_types::ServiceType::WebAgentRunner
+                        | shared_types::ServiceType::ComputerAgentRunner
+                        | shared_types::ServiceType::ComputerNormalProject
+                )
         })
         .map(|config| {
             let prefix = config.container_prefix();
@@ -614,3 +674,6 @@ pub async fn startup_cleanup_all_enabled_services(
 
     Ok(aggregated_result)
 }
+
+#[cfg(test)]
+mod tests;

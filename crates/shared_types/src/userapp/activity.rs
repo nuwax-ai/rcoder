@@ -144,6 +144,10 @@ impl std::fmt::Display for WakeFailure {
 pub enum RemoteWakeState {
     WakePending,
     Running,
+    /// The runtime was queried successfully and its physical workload is absent.
+    /// Only an application-traffic entry may authorize reconstruction from the
+    /// retained deployment. Observation and tool access remain read-only here.
+    Missing,
     Unavailable,
 }
 
@@ -164,6 +168,15 @@ pub trait AppWakeControl: Send + Sync {
     /// bounded wake result.
     async fn ensure_running(&self, app_id: &str) -> WakeOutcome;
 
+    /// Serve real production application traffic. In addition to starting an
+    /// existing stopped workload, an implementation may restore a physically
+    /// missing workload from the current application's retained deployment.
+    /// Queries and tool access must keep using their observation or existing
+    /// workload paths; they do not authorize deployment reconstruction.
+    async fn ensure_serving(&self, app_id: &str) -> WakeOutcome {
+        self.ensure_running(app_id).await
+    }
+
     /// Remote stopped or starting status, cached to keep hot requests cheap.
     /// Probe errors do not authorize a wake and are not cached.
     async fn remote_wake_pending(&self, _app_id: &str) -> bool {
@@ -176,8 +189,16 @@ pub trait AppWakeControl: Send + Sync {
         Ok(self.remote_wake_pending(app_id).await)
     }
 
+    /// Read-only routing hint for actual production application traffic. A
+    /// confirmed missing physical workload may require `ensure_serving`; a
+    /// query error never grants permission to create a replacement.
+    async fn remote_serving_pending_result(&self, app_id: &str) -> Result<bool, WakeFailure> {
+        self.remote_wake_pending_result(app_id).await
+    }
+
     /// Bypass the advisory cache after an actual upstream connection failure.
-    /// Error, missing workload and query failures are Unavailable, never wakeable.
+    /// Physical absence is Missing; query failures and unhealthy workloads are
+    /// Unavailable. Only a serving entry may reconstruct a Missing workload.
     async fn remote_wake_state_fresh(&self, _app_id: &str) -> RemoteWakeState {
         RemoteWakeState::Unavailable
     }

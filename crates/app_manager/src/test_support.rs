@@ -58,6 +58,24 @@ pub(crate) struct MockRuntime {
     pub list_calls: AtomicUsize,
     pub create_calls: AtomicUsize,
     pub create_fails: AtomicBool,
+    /// Current applied Docker-like configuration survives physical compute loss.
+    pub retained_params: DashMap<String, (String, ContainerCreateParams)>,
+    /// Physical daemon configuration is separate from its private saved copy.
+    pub native_params: DashMap<String, ContainerCreateParams>,
+    /// Daemon inspect.Image is immutable even when Config.Image was a tag.
+    pub native_image_ids: DashMap<String, String>,
+    pub create_retention_fails: AtomicBool,
+    pub retained_load_calls: AtomicUsize,
+    pub retained_save_calls: AtomicUsize,
+    /// Startup snapshot migration can fail independently of a live workload.
+    pub retained_save_fails: AtomicBool,
+    /// Load returns None/error without changing the retained private bytes.
+    pub retained_unavailable: AtomicBool,
+    pub retained_load_fails: AtomicBool,
+    /// Pause a create after it was counted, before its physical commitment.
+    pub create_started: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    pub create_release: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    pub exec_commands: std::sync::Mutex<Vec<Vec<String>>>,
     pub status_fails: AtomicUsize,
     /// Inject a read failure only after a captured Stop has acknowledged its write.
     pub post_stop_status_fails: AtomicUsize,
@@ -241,6 +259,156 @@ impl shared_types::AppOperationLease for MockOperationLease {
 
 #[async_trait]
 impl UserAppDeploymentRuntime for MockRuntime {
+    async fn app_runtime_configuration_uid(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Option<String>> {
+        let Some(_) = self.get_deployment_status(app_id).await? else {
+            return Ok(None);
+        };
+        Ok(self
+            .mutation_uid_override
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| {
+                self.native_params.get(app_id).and_then(|params| {
+                    params
+                        .execution_context
+                        .as_ref()
+                        .map(|context| format!("test-{}", context.lifecycle_id))
+                })
+            })
+            .or_else(|| {
+                self.retained_params
+                    .get(app_id)
+                    .map(|configuration| format!("test-{}", configuration.0))
+            }))
+    }
+
+    async fn retain_app_runtime_configuration(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+        _binding: Option<&shared_types::UserAppResourceBinding>,
+    ) -> ContainerRuntimeResult<()> {
+        self.retained_save_calls.fetch_add(1, Ordering::SeqCst);
+        if self.retained_save_fails.load(Ordering::SeqCst) {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Injected retained configuration publication failure".into(),
+            ));
+        }
+        if let Some(configuration) = self.retained_params.get(app_id)
+            && configuration.0 != lifecycle_id
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "Retained mock application lifecycle differs".into(),
+            ));
+        }
+        if let Some(native) = self.native_params.get(app_id) {
+            let mut params = native.value().clone();
+            drop(native);
+            if params
+                .execution_context
+                .as_ref()
+                .map(|context| context.lifecycle_id.as_str())
+                != Some(lifecycle_id)
+            {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Native mock application lifecycle differs".into(),
+                ));
+            }
+            if let Some(actual) = self.native_image_ids.get(app_id) {
+                params.image_override = Some(actual.clone());
+            }
+            self.retained_params
+                .insert(app_id.to_owned(), (lifecycle_id.to_owned(), params));
+        }
+        Ok(())
+    }
+
+    async fn verify_committed_creation(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        if !self.deployments.contains_key(&context.app_id) {
+            return Ok(None);
+        }
+        let Some(native) = self.native_params.get(&context.app_id) else {
+            return Ok(None);
+        };
+        if native.execution_context.as_ref() != Some(context) {
+            return Ok(None);
+        }
+        drop(native);
+        self.retain_app_runtime_configuration(&context.app_id, &context.lifecycle_id, None)
+            .await?;
+        Ok(Some(ContainerBasicInfo {
+            container_id: format!("test-{}", context.lifecycle_id),
+            container_name: format!("userapp-{}", context.app_id),
+            container_ip: "10.0.0.1".into(),
+            project_id: context.app_id.clone(),
+            internal_port: 0,
+            external_port: 0,
+            status: "Running".into(),
+            created_at: chrono::Utc::now(),
+            service_url: String::new(),
+            workload_uid: None,
+        }))
+    }
+
+    async fn retained_app_runtime_configuration(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+    ) -> ContainerRuntimeResult<Option<ContainerCreateParams>> {
+        self.retained_load_calls.fetch_add(1, Ordering::SeqCst);
+        if self.retained_load_fails.load(Ordering::SeqCst) {
+            return Err(ContainerRuntimeError::ConnectionError(
+                "Injected retained configuration read failure".into(),
+            ));
+        }
+        if self.retained_unavailable.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let Some(configuration) = self.retained_params.get(app_id) else {
+            return Ok(None);
+        };
+        if configuration.0 != lifecycle_id {
+            return Err(ContainerRuntimeError::Conflict(
+                "Retained mock application lifecycle differs".into(),
+            ));
+        }
+        let mut params = configuration.1.clone();
+        drop(configuration);
+        params.execution_context = None;
+        params.mutation_target = None;
+        params.resource_binding = None;
+        for environment in [&mut params.env, &mut params.secrets].into_iter().flatten() {
+            for key in [
+                "APP_DEPLOY_URL",
+                "APP_RELEASE_ID",
+                "APP_DEPLOY_SHA256",
+                shared_types::APP_DEPLOY_OPERATION_ID,
+                shared_types::APP_DEPLOY_GENERATION_ID,
+            ] {
+                environment.remove(key);
+            }
+        }
+        Ok(Some(params))
+    }
+
+    async fn exec(
+        &self,
+        _app_id: &str,
+        command: Vec<String>,
+    ) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
+        self.exec_commands.lock().unwrap().push(command);
+        Err(ContainerRuntimeError::ConfigurationError(
+            "exec not supported by this runtime".into(),
+        ))
+    }
+
     async fn capture_app_configuration_target(
         &self,
         context: &shared_types::UserAppExecutionContext,
@@ -724,6 +892,14 @@ impl UserAppDeploymentRuntime for MockRuntime {
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
         self.create_calls.fetch_add(1, Ordering::SeqCst);
+        let started = self.create_started.lock().unwrap().clone();
+        let release = self.create_release.lock().unwrap().clone();
+        if let Some(started) = started {
+            started.wait().await;
+        }
+        if let Some(release) = release {
+            release.wait().await;
+        }
         if let Some((stage, definitive)) = *self
             .create_abort
             .lock()
@@ -757,6 +933,16 @@ impl UserAppDeploymentRuntime for MockRuntime {
             .entry(project_id.clone())
             .or_default()
             .push(params.clone());
+        self.native_params
+            .insert(project_id.clone(), params.clone());
+        if let Some(context) = &params.execution_context
+            && !self.create_retention_fails.load(Ordering::SeqCst)
+        {
+            self.retained_params.insert(
+                project_id.clone(),
+                (context.lifecycle_id.clone(), params.clone()),
+            );
+        }
         // 登记 deployments（后续 get_app/update 流程的 fetch_runtime_status 需要）
         self.deployments
             .entry(project_id.clone())
@@ -767,6 +953,11 @@ impl UserAppDeploymentRuntime for MockRuntime {
                 phase: "Running".into(),
                 ..Default::default()
             });
+        if self.create_retention_fails.load(Ordering::SeqCst) {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Injected post-start retained configuration publication failure".into(),
+            ));
+        }
         Ok(ContainerBasicInfo {
             container_id: "mock-container-id".into(),
             container_name: format!("userapp-{project_id}"),
@@ -1024,4 +1215,16 @@ pub(crate) async fn complete_empty_deletion_fixture(mut operation: crate::servic
         .succeed()
         .await
         .expect("fixture deletion completion");
+}
+
+// 豁免仅限测试 helper：edition-2024 env 变异是 unsafe；同值重复 set 对并行测试无害
+// （与 lifecycle/start.rs 的 with_runtime_image_env 同款约定）。
+#[allow(unsafe_code)]
+pub(crate) fn restart_image_env() {
+    unsafe {
+        std::env::set_var(
+            "RCODER_RUNTIME_IMAGE_DIGEST",
+            "registry.test/app-runtime:ut",
+        );
+    }
 }

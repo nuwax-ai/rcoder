@@ -20,6 +20,10 @@
 /// ```
 pub const WORKSPACE_ROOT: &str = "/app/project_workspace";
 
+/// RCoder 管理进程的私有持久数据根，不属于用户应用或普通沙箱的工作区。
+/// Docker Compose 将独立 data 目录挂载到这里；deploy-host 经路径映射解析。
+pub const RCODER_DATA_ROOT: &str = "/app/data";
+
 /// computer agent 工作区根目录 (**rcoder 主容器视角**)。
 ///
 /// 注意: computer agent sub-container 的挂载点是 `/home/user`

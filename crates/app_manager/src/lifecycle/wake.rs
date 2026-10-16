@@ -20,6 +20,24 @@ impl AppService {
         app_id: &str,
         budget: Duration,
     ) -> AppResult<WakeOutcome> {
+        self.wake_existing_or_retained(app_id, budget, None).await
+    }
+
+    pub(crate) async fn wake_app_for_serving(
+        self: &std::sync::Arc<Self>,
+        app_id: &str,
+        budget: Duration,
+    ) -> AppResult<WakeOutcome> {
+        self.wake_existing_or_retained(app_id, budget, Some(self.clone()))
+            .await
+    }
+
+    async fn wake_existing_or_retained(
+        &self,
+        app_id: &str,
+        budget: Duration,
+        restoration_owner: Option<std::sync::Arc<Self>>,
+    ) -> AppResult<WakeOutcome> {
         validate_app_id(app_id)?;
         let deadline = Instant::now() + budget;
         let preflight = async {
@@ -42,7 +60,18 @@ impl AppService {
             self.metadata
                 .validate_request_lifecycle(app_id, Some(&identity.lifecycle_id))
                 .await?;
-            let status = self.fetch_runtime_status_or_err(app_id).await?;
+            let status = if restoration_owner.is_some()
+                && self.config.access_mode == crate::config::AppAccessMode::Docker
+            {
+                self.runtime
+                    .get_deployment_status(app_id)
+                    .await
+                    .map_err(|error| {
+                        crate::utils::map_runtime_error("Read application serving runtime", error)
+                    })?
+            } else {
+                Some(self.fetch_runtime_status_or_err(app_id).await?)
+            };
             Ok::<_, AppOperationError>((guard, identity, status))
         };
         let (guard, identity, previous) = match timeout_at(deadline, preflight).await {
@@ -54,6 +83,63 @@ impl AppService {
                     true,
                 )));
             }
+        };
+        let Some(previous) = previous else {
+            // A missing physical container is not a new application. Release the
+            // unmutated observation lease, then let the existing deployment
+            // coordinator reacquire it and revalidate the same lifecycle. Its
+            // durable private input and creation receipts own all create/start
+            // effects, including cancelled or unknown Docker responses.
+            guard.finish().await?;
+            let service = restoration_owner.ok_or_else(|| {
+                AppOperationError::InvalidState(
+                    "Only serving traffic may restore missing application compute".into(),
+                )
+            })?;
+            let admission = std::sync::Arc::new(
+                crate::service::restart_wait::RestartAdmission::with_deadline(deadline),
+            );
+            let _waiting_client = admission.client();
+            let observer = std::sync::Arc::new(std::sync::OnceLock::new());
+            let worker_observer = observer.clone();
+            let worker_app_id = app_id.to_owned();
+            let lifecycle_id = identity.lifecycle_id.clone();
+            let owner_admission = admission.clone();
+            let restore = tokio::spawn(async move {
+                owner_admission.scope(async move {
+                    let result = service.restore_runtime_on_traffic(
+                        &worker_app_id, &lifecycle_id, worker_observer,
+                    ).await;
+                    if let Err(error) = &result {
+                        tracing::warn!(app_id = %worker_app_id, %error, "Owned application runtime restoration failed");
+                    }
+                    result
+                }).await
+            });
+            return match timeout_at(deadline, restore).await {
+                Ok(Ok(Ok(_))) => Ok(WakeOutcome::Ready),
+                Ok(Ok(Err(error))) => Err(error),
+                Ok(Err(error)) => Err(AppOperationError::Backend(format!(
+                    "Application restoration worker failed: {error}"
+                ))),
+                Err(_) => {
+                    if !admission.has_started() {
+                        return Ok(WakeOutcome::Timeout(shared_types::WakeFailure::timeout(
+                            "wake_runtime_reconstruction_preflight",
+                            None,
+                            true,
+                        )));
+                    }
+                    let mut failure = shared_types::WakeFailure::new(
+                        shared_types::ERR_OPERATION_OUTCOME_UNKNOWN,
+                        "wake_runtime_reconstruction",
+                        "Application runtime reconstruction is still being reconciled by its original operation",
+                    );
+                    failure.cause_code = shared_types::ERR_RUNTIME_TIMEOUT.into();
+                    failure.operation_id = observer.get().cloned();
+                    Ok(WakeOutcome::Timeout(failure))
+                }
+            };
         };
         // Even an already-running workload must be bound to the current lifecycle.
         // The operation records that observation and prevents a stale cache from

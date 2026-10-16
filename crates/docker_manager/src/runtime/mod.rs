@@ -6,6 +6,7 @@
 pub(crate) mod builder_completion;
 mod builder_creation_receipt;
 mod builder_file_credentials;
+mod docker_app_configuration;
 pub(crate) mod docker_app_create;
 pub(crate) mod docker_app_mounts;
 mod docker_app_restart;

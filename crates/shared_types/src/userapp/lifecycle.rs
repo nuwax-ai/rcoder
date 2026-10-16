@@ -1292,6 +1292,17 @@ pub trait UserAppLifecycleStore: Send + Sync {
         &self,
         context: &UserAppExecutionContext,
     ) -> Result<UserAppExecutionInput, UserAppStoreError>;
+    /// Read an interrupted executor's original private input for observation
+    /// only. The full fenced snapshot and its lifecycle slot must still match.
+    /// This does not reopen execution authority or authorize replaying writes.
+    async fn read_recovery_execution_input(
+        &self,
+        _snapshot: &UserAppOperationRecord,
+    ) -> Result<UserAppExecutionInput, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Private recovery input observation is unsupported".into(),
+        ))
+    }
     /// 绑定操作执行 deadline（epoch ms，旁记录——不动 DeployInput；bind-once：
     /// 已存在时返回持久化值不覆盖，不同副本配置不同也不得各绑各的候选值）。
     /// 与受理原子写入（或至少在任何运行时副作用之前完成；失败 fail-closed）。

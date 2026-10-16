@@ -7,6 +7,20 @@ use serde::{Deserialize, Serialize};
 use shared_types::{UserAppControlCommand, UserAppExecutionInput, UserAppOperationKind};
 use std::sync::Arc;
 
+/// Preparation for an explicit deployment or for serving an existing application.
+/// The latter never creates an application identity or guesses an empty runtime.
+#[derive(Clone)]
+pub(super) enum DeploymentPreparation {
+    Requested,
+    RetainedRuntime(Arc<std::sync::OnceLock<String>>),
+}
+
+impl DeploymentPreparation {
+    fn is_retained(&self) -> bool {
+        matches!(self, Self::RetainedRuntime(_))
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct DeployInput {
@@ -23,6 +37,22 @@ pub(super) struct DeployInput {
     restart_image: Option<String>,
 }
 impl DeployInput {
+    pub(super) fn compute_only_creation(
+        &self,
+    ) -> Option<&container_runtime_api::ContainerCreateParams> {
+        if self.previous.is_none()
+            && !self.restart
+            && self.request.url.is_none()
+            && self.request.pg.is_none()
+            && self.request.env.is_none()
+            && self.request.idle_timeout_seconds.is_none()
+            && self.request.deploy_mode.is_none()
+        {
+            self.params.as_ref()
+        } else {
+            None
+        }
+    }
     fn encode(&self) -> AppResult<UserAppExecutionInput> {
         let mut value = serde_json::to_value(self)
             .map_err(|_| AppOperationError::Backend("Encode deployment input".into()))?;
@@ -93,13 +123,46 @@ impl AppService {
         request: StartAppRequest,
         restart: bool,
     ) -> AppResult<StartAppResult> {
+        self.deploy_controlled_prepared(app_id, request, restart, DeploymentPreparation::Requested)
+            .await
+    }
+
+    pub(super) async fn restore_runtime_on_traffic(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+        operation_id: Arc<std::sync::OnceLock<String>>,
+    ) -> AppResult<StartAppResult> {
+        self.deploy_controlled_prepared(
+            app_id,
+            StartAppRequest {
+                lifecycle_id: Some(lifecycle_id.to_owned()),
+                ..Default::default()
+            },
+            false,
+            DeploymentPreparation::RetainedRuntime(operation_id),
+        )
+        .await
+    }
+
+    async fn deploy_controlled_prepared(
+        &self,
+        app_id: &str,
+        request: StartAppRequest,
+        restart: bool,
+        preparation: DeploymentPreparation,
+    ) -> AppResult<StartAppResult> {
         let wait_deadline = if restart {
             Some(self.restart_admission_deadline()?)
         } else {
             None
         };
         super::start::validate_start_request(app_id, &request)?;
-        let identity = self.discover_missing_identity(app_id).await?;
+        let identity = if preparation.is_retained() {
+            self.metadata.store.get_application(app_id).await?
+        } else {
+            self.discover_missing_identity(app_id).await?
+        };
         if restart
             && request
                 .url
@@ -155,7 +218,13 @@ impl AppService {
                 self.try_acquire_process_release_lock(app_id).await?
             });
             let result = self
-                .deploy_admitted(app_id, request.clone(), restart, guard.clone())
+                .deploy_admitted(
+                    app_id,
+                    request.clone(),
+                    restart,
+                    preparation.clone(),
+                    guard.clone(),
+                )
                 .await;
             let operation_id = match &result {
                 Ok(result) => result.operation_id.clone(),
@@ -205,6 +274,7 @@ impl AppService {
         app_id: &str,
         request: StartAppRequest,
         restart: bool,
+        preparation: DeploymentPreparation,
         guard: Arc<AppOperationGuard>,
     ) -> AppResult<StartAppResult> {
         crate::service::restart_wait::prepare(
@@ -212,7 +282,22 @@ impl AppService {
                 .validate_request_lifecycle(app_id, request.lifecycle_id.as_deref()),
         )
         .await?;
-        let initial_identity = if restart {
+        let initial_identity = if preparation.is_retained() {
+            let identity = self
+                .metadata
+                .store
+                .get_application(app_id)
+                .await?
+                .ok_or_else(|| {
+                    AppOperationError::NotFound(format!("Application identity not found: {app_id}"))
+                })?;
+            if identity.state != shared_types::UserAppLifecycleState::Active {
+                return Err(AppOperationError::NotFound(format!(
+                    "Application is not active: {app_id}"
+                )));
+            }
+            Some(identity)
+        } else if restart {
             None
         } else {
             Some(self.metadata.store.ensure_identity(app_id).await?)
@@ -238,14 +323,26 @@ impl AppService {
             app_id,
             request,
             restart,
+            preparation.clone(),
             &operation_id,
         ))
         .await?;
         let encoded = input.encode()?;
-        let policy = shared_types::UserAppRuntimePolicy {
-            recycle_enabled: input.request.idle_timeout_seconds.map(|value| value > 0),
-            idle_timeout_seconds: input.request.idle_timeout_seconds,
-            wake_on_traffic: Some(true),
+        let policy = if preparation.is_retained() {
+            let mut policy = initial_identity
+                .as_ref()
+                .map(|identity| identity.runtime_policy.clone())
+                .ok_or_else(|| {
+                    AppOperationError::NotFound(format!("Application identity not found: {app_id}"))
+                })?;
+            policy.wake_on_traffic = Some(true);
+            policy
+        } else {
+            shared_types::UserAppRuntimePolicy {
+                recycle_enabled: input.request.idle_timeout_seconds.map(|value| value > 0),
+                idle_timeout_seconds: input.request.idle_timeout_seconds,
+                wake_on_traffic: Some(true),
+            }
         };
         // All runtime/configuration reads have finished. From this point the
         // identity/admission writes are owned even if the receiver disappears.
@@ -256,21 +353,23 @@ impl AppService {
             Some(identity) => identity,
             None => self.metadata.store.ensure_identity(app_id).await?,
         };
+        if let DeploymentPreparation::RetainedRuntime(observer) = &preparation {
+            drop(observer.set(operation_id.clone()));
+        }
         let mut operation = OwnedOperation::admit_with_input(
             self.metadata.store.clone(),
             shared_types::UserAppAdmission {
                 runtime_policy_on_success: Some(policy),
-                metadata: input
-                    .previous
-                    .is_none()
-                    .then(|| shared_types::UserAppMetadataPatch {
+                metadata: (input.previous.is_none() && !preparation.is_retained()).then(|| {
+                    shared_types::UserAppMetadataPatch {
                         app_id: app_id.into(),
                         lifecycle_id: identity.lifecycle_id.clone(),
                         expected_revision: identity.metadata_revision,
                         name: Some(Some(app_id.into())),
                         tenant_id: None,
                         space_id: None,
-                    }),
+                    }
+                }),
                 command: Some(UserAppControlCommand::Deploy {
                     restart,
                     input_digest: encoded.digest(),
@@ -296,12 +395,17 @@ impl AppService {
                 .await?;
         }
         let result = async {
-            if restart {
-                self.metadata
-                    .store
-                    .check_compute_access(app_id, shared_types::UserAppOperationScope::Prod, true)
-                    .await?;
-            }
+            // Explicit Start/Deploy supersedes a completed Stop. Restoration
+            // only observes it, including a Stop completed while the original
+            // traffic preflight released its lease and prepared this operation.
+            self.metadata
+                .store
+                .check_compute_access(
+                    app_id,
+                    shared_types::UserAppOperationScope::Prod,
+                    !preparation.is_retained(),
+                )
+                .await?;
             self.execute_deploy_input(app_id, input, &mut operation, guard.clone())
                 .await
         }
@@ -339,6 +443,7 @@ impl AppService {
         app_id: &str,
         request: StartAppRequest,
         restart: bool,
+        preparation: DeploymentPreparation,
         operation_id: &str,
     ) -> AppResult<DeployInput> {
         let mut request = self.validate_hot_env(app_id, request).await?;
@@ -353,6 +458,46 @@ impl AppService {
             .url
             .as_deref()
             .is_some_and(|url| !url.trim().is_empty());
+        if preparation.is_retained() {
+            let identity = self
+                .metadata
+                .store
+                .get_application(app_id)
+                .await?
+                .ok_or_else(|| {
+                    AppOperationError::NotFound(format!("Application identity not found: {app_id}"))
+                })?;
+            if identity.state != shared_types::UserAppLifecycleState::Active {
+                return Err(AppOperationError::NotFound(format!(
+                    "Application is not active: {app_id}"
+                )));
+            }
+            let params = if previous.is_none() {
+                let mut params = self.runtime
+                    .retained_app_runtime_configuration(app_id, &identity.lifecycle_id)
+                    .await
+                    .map_err(|error| map_runtime_error("Read retained application runtime configuration", error))?
+                    .ok_or_else(|| AppOperationError::InvalidState(
+                        "The application has no retained runtime configuration; its existing deployment must restore the configuration before traffic can recreate compute".into()
+                    ))?;
+                params.recycle_enabled = identity.runtime_policy.recycle_enabled;
+                params.idle_timeout_seconds = identity.runtime_policy.idle_timeout_seconds;
+                Some(params)
+            } else {
+                // Another admitted control may have restored compute while the
+                // traffic coordinator reacquired the deployment lease. Reuse it,
+                // without rolling its image or reapplying an older configuration.
+                None
+            };
+            return Ok(DeployInput {
+                version: 1,
+                request,
+                params,
+                previous,
+                restart: false,
+                restart_image: None,
+            });
+        }
         if restart && !has_url && previous.is_none() {
             return Err(map_runtime_error(
                 "Read deployment restart target",
@@ -753,3 +898,7 @@ impl AppService {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "deploy_control/terminal_stop_tests.rs"]
+mod terminal_stop_tests;

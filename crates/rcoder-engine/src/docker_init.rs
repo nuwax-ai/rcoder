@@ -1,8 +1,7 @@
-//! Docker/K8s 运行时初始化与启动时容器清理
+//! Docker/K8s 运行时初始化；管理进程重启保留现有计算资源。
 
-use docker_manager::container_stop;
 use docker_manager::runtime_selection::RuntimeType;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::config::AppConfig;
 use crate::utils;
@@ -194,89 +193,13 @@ pub async fn init_docker_manager(config: &AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn startup_cleanup(config: &AppConfig) {
-    info!("checking cleanup for container (enabled)...");
-    if !config.cleanup_config.enabled {
-        info!("Container cleanup task already started (cleanup_config.enabled=false)");
-        return;
-    }
-    // PG 模式跳过启动清理：project/session/container 映射以 PG 为真源（启动全量加载），
-    // 用户容器跨 rcoder 重启存活；孤儿容器由 status_checker/cleaner/pod_ensure 兜底对账。
-    // （内存模式保留"重启即推倒重来 + 懒重建"的单节点自愈语义，行为零改动）
-    if config.storage.backend == crate::config::StorageBackend::Postgres {
-        info!(
-            "[STORAGE_PG] startup cleanup skipped (postgres mode: state restored from PG, agent containers survive restarts)"
-        );
-        return;
-    }
-
-    match docker_manager::runtime::RuntimeManager::runtime_type() {
-        RuntimeType::Docker => {
-            let docker_manager = match docker_manager::global::get_global_docker_manager().await {
-                Ok(dm) => {
-                    info!("Docker Manager initialized successfully (with config)");
-                    dm
-                }
-                Err(e) => {
-                    error!("get Docker Manager failed: {}", e);
-                    return;
-                }
-            };
-
-            let multi_image_config = if let Some(docker_config) = &config.docker_config {
-                docker_config.get_multi_image_config()
-            } else {
-                shared_types::create_default_multi_image_config()
-            };
-
-            match container_stop::startup_cleanup_all_enabled_services(
-                &docker_manager,
-                &multi_image_config,
-            )
-            .await
-            {
-                Ok(result) => {
-                    let enabled_services =
-                        shared_types::get_enabled_service_types(&multi_image_config);
-                    if result.successfully_removed > 0 {
-                        info!(
-                            " Startup cleanup completed, removed {} leftover containers (covering {} service types)",
-                            result.successfully_removed,
-                            enabled_services.len()
-                        );
-                    } else {
-                        info!("no containers to cleanup");
-                    }
-
-                    if result.failed_removals > 0 {
-                        warn!(
-                            "container cleanup failed: failed count={}",
-                            result.failed_removals
-                        );
-                        for failure in &result.failed_removals_details {
-                            warn!(
-                                "  - Container {} ({}): {}",
-                                failure.container_id, failure.container_name, failure.error_message
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("container cleanup failed: {}, cleanup skipped", e);
-                }
-            }
-        }
-        RuntimeType::Kubernetes => match docker_manager::runtime::RuntimeManager::get().await {
-            Ok(runtime) => {
-                if let Err(e) = runtime.cleanup_all().await {
-                    warn!("k8s startup cleanup failed: {}", e);
-                } else {
-                    info!("k8s startup cleanup completed");
-                }
-            }
-            Err(e) => warn!("failed to get runtime for k8s startup cleanup: {}", e),
-        },
-    }
+/// Starting this management process grants no authority to stop or delete
+/// application/Agent compute. Existing containers are rediscovered by their
+/// runtime identity; explicit controls and configured idle policies own removal.
+pub async fn startup_cleanup(_config: &AppConfig) {
+    info!(
+        "Management startup preserves existing Agent and UserApp compute; idle cleanup remains governed by cleanup_config.enabled"
+    );
 }
 
 pub async fn get_container_prefixes(config: &AppConfig) -> anyhow::Result<(String, String)> {
@@ -522,3 +445,7 @@ async fn rehydrate_deploy_host_docker_ports() {
          (skipped: {skipped_stopped} stopped, {skipped_unmanaged} unmanaged, {failed} failed)"
     );
 }
+
+#[cfg(test)]
+#[path = "docker_init/preservation_tests.rs"]
+mod preservation_tests;

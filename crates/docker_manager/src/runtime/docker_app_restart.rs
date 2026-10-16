@@ -195,6 +195,8 @@ impl DockerRuntime {
         }
         let mut target = prior.target.clone();
         target.resource.uid = replacement_uid.into();
+        self.retain_app_configuration(&target.context.app_id, &target.context.lifecycle_id, None)
+            .await?;
         super::docker_compute_receipt::finish_app_replacement(&prior.target).await?;
         Ok(Some(target))
     }
@@ -273,8 +275,26 @@ mod tests {
             request_fingerprint: "a".repeat(64),
         };
         let name = app_deployment_name(&app_id);
-        let volume = tempfile::tempdir().unwrap();
-        std::fs::write(volume.path().join("retained"), "original data").unwrap();
+        // Use the complete production bind contract: retention must prove the
+        // original workspace root independently of this physical container.
+        let host_root = crate::path::resolve_container_path_to_host(std::path::Path::new(
+            shared_types::paths::RCODER_USERAPP_WORKSPACE_ROOT,
+        ))
+        .await
+        .unwrap();
+        let subpaths = shared_types::paths::userapp_prod_subpaths(&app_id);
+        let volume = host_root.join(&subpaths[0]);
+        for relative in &subpaths {
+            std::fs::create_dir_all(host_root.join(relative)).unwrap();
+        }
+        std::fs::write(volume.join("retained"), "original data").unwrap();
+        let binds = subpaths
+            .iter()
+            .zip(super::super::docker_app_mounts::prod_flat_container_paths(
+                &app_id,
+            ))
+            .map(|(relative, target)| format!("{}:{target}", host_root.join(relative).display()))
+            .collect();
         let mut labels: HashMap<String, String> = context.resource_metadata().into_iter().collect();
         labels.insert(
             shared_types::USERAPP_DOCKER_APP_ID_LABEL.into(),
@@ -291,7 +311,7 @@ mod tests {
             env: Some(vec!["PGPASSWORD=fixture-preserved".into()]),
             labels: Some(labels),
             host_config: Some(bollard::models::HostConfig {
-                binds: Some(vec![format!("{}:/workspace", volume.path().display())]),
+                binds: Some(binds),
                 port_bindings: Some(HashMap::from([(
                     "8080/tcp".into(),
                     Some(vec![bollard::models::PortBinding {
@@ -351,7 +371,7 @@ mod tests {
                     .contains(&"PGPASSWORD=fixture-preserved".into())
             );
             assert_eq!(
-                std::fs::read_to_string(volume.path().join("retained"))?,
+                std::fs::read_to_string(volume.join("retained"))?,
                 "original data"
             );
             let mut prepared = runtime.prepare_app_compute_start(&fresh).await?;

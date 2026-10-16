@@ -720,6 +720,18 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         })
         .await
     }
+    async fn read_recovery_execution_input(
+        &self,
+        snapshot: &UserAppOperationRecord,
+    ) -> Result<UserAppExecutionInput, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(
+                async move { ops::read_recovery_execution_input(tx, backend, &snapshot).await },
+            )
+        })
+        .await
+    }
     async fn bind_operation_deadline(
         &self,
         app_id: &str,

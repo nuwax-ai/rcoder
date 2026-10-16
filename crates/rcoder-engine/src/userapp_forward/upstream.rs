@@ -661,7 +661,10 @@ async fn wait_for_prod_service(
                     }
                 }
                 Ok(shared_types::RemoteWakeState::Running) => {}
-                Ok(shared_types::RemoteWakeState::Unavailable) => {
+                Ok(
+                    shared_types::RemoteWakeState::Missing
+                    | shared_types::RemoteWakeState::Unavailable,
+                ) => {
                     return Err(HttpResultError::bad_gateway(format!(
                         "app {app_id} runtime is unavailable"
                     )));

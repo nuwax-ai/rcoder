@@ -298,6 +298,13 @@ impl super::AppServiceTrait for AppService {
     ) -> AppResult<bool> {
         self.resume_pending_control(operation).await
     }
+    async fn reconcile_created_runtime_configuration(
+        &self,
+        operation: &shared_types::UserAppOperationRecord,
+    ) -> AppResult<bool> {
+        self.reconcile_created_runtime_configuration(operation)
+            .await
+    }
 
     async fn reconcile_interrupted_deletion(
         &self,

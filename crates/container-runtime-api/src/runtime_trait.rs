@@ -770,6 +770,39 @@ pub trait WorkspaceRuntime: Send + Sync {
 /// Docker 由 `DockerRuntime` 做等价语义映射（容器 create/stop/start）。
 #[async_trait]
 pub trait UserAppDeploymentRuntime: Send + Sync {
+    /// Observe the current physical configuration source without adopting,
+    /// starting or rebinding it. The UID lets the caller look up an existing
+    /// resource binding before retaining an adopted Docker configuration.
+    async fn app_runtime_configuration_uid(
+        &self,
+        _app_id: &str,
+    ) -> ContainerRuntimeResult<Option<String>> {
+        Ok(None)
+    }
+
+    /// Preserve the current production configuration independently of compute.
+    /// Docker stores its verified live specification; runtimes with native
+    /// desired-state controllers do not need this additional snapshot.
+    async fn retain_app_runtime_configuration(
+        &self,
+        _app_id: &str,
+        _lifecycle_id: &str,
+        _binding: Option<&shared_types::UserAppResourceBinding>,
+    ) -> ContainerRuntimeResult<()> {
+        Ok(())
+    }
+
+    /// Read a retained production specification for this exact lifecycle.
+    /// None means there is no recoverable specification; callers must never
+    /// substitute an empty/default deployment for a missing configured app.
+    async fn retained_app_runtime_configuration(
+        &self,
+        _app_id: &str,
+        _lifecycle_id: &str,
+    ) -> ContainerRuntimeResult<Option<ContainerCreateParams>> {
+        Ok(None)
+    }
+
     /// Inspect the exact dev/prod compute instance without ensure, adoption,
     /// cache registration or operation admission. Missing is a confirmed absence.
     async fn observe_userapp_readiness(

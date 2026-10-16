@@ -289,6 +289,27 @@ async fn discover(
             }
             *cursor = Some(operation.operation_id.clone());
             if operation.state == UserAppOperationState::RecoveryRequired
+                && operation.kind == UserAppOperationKind::StartDeployment
+                && operation.step == "creating_runtime"
+            {
+                let state = state.clone();
+                tasks.push(operation.operation_id.clone(), async move {
+                    if !state
+                        .app_service
+                        .reconcile_created_runtime_configuration(&operation)
+                        .await?
+                    {
+                        with_stall_budget(
+                            "observe interrupted production creation",
+                            super::creation::reconcile_fenced_ensure(&state, &operation),
+                        )
+                        .await??;
+                    }
+                    Ok(())
+                });
+                continue;
+            }
+            if operation.state == UserAppOperationState::RecoveryRequired
                 && operation.step == "hot_execution"
                 && operation
                     .checkpoint

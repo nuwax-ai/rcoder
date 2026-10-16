@@ -2,6 +2,55 @@ use super::*;
 
 #[async_trait]
 impl UserAppDeploymentRuntime for DockerRuntime {
+    async fn app_runtime_configuration_uid(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Option<String>> {
+        shared_types::validate_identifier(app_id, "app_id")
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        match self
+            .inner
+            .get_docker_client()
+            .inspect_container(&app_deployment_name(app_id), None)
+            .await
+        {
+            Ok(inspect) => inspect
+                .id
+                .filter(|uid| !uid.is_empty())
+                .map(Some)
+                .ok_or_else(|| {
+                    ContainerRuntimeError::DockerError(
+                        "Application configuration source has no physical identity".into(),
+                    )
+                }),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(None),
+            Err(error) => Err(ContainerRuntimeError::DockerError(format!(
+                "Inspect application configuration source: {error}"
+            ))),
+        }
+    }
+
+    async fn retain_app_runtime_configuration(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+        binding: Option<&shared_types::UserAppResourceBinding>,
+    ) -> ContainerRuntimeResult<()> {
+        self.retain_app_configuration(app_id, lifecycle_id, binding)
+            .await
+    }
+
+    async fn retained_app_runtime_configuration(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+    ) -> ContainerRuntimeResult<Option<ContainerCreateParams>> {
+        self.load_retained_app_configuration(app_id, lifecycle_id)
+            .await
+    }
+
     async fn observe_userapp_readiness(
         &self,
         app_id: &str,
@@ -236,6 +285,11 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             // keep their AlreadyExists conflict.
             return Ok(None);
         }
+        // A prior create may have committed before its snapshot publication
+        // failed. Retrying the original operation repairs that publication from
+        // the verified physical configuration, without issuing another create.
+        self.retain_app_configuration(&context.app_id, &context.lifecycle_id, None)
+            .await?;
         let preferred = inspect
             .host_config
             .as_ref()

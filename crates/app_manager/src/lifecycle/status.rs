@@ -225,6 +225,51 @@ impl AppService {
                 continue;
             }
             if let Some(identity) = self.metadata.store.get_application(&s.app_id).await? {
+                if self.config.access_mode == AppAccessMode::Docker
+                    && identity.state == shared_types::UserAppLifecycleState::Active
+                {
+                    let retained = async {
+                        let Some(uid) = self
+                            .runtime
+                            .app_runtime_configuration_uid(&s.app_id)
+                            .await
+                            .map_err(|error| {
+                                map_runtime_error(
+                                    "Observe retained runtime configuration source",
+                                    error,
+                                )
+                            })?
+                        else {
+                            return Ok::<(), AppOperationError>(());
+                        };
+                        let binding = self
+                            .metadata
+                            .store
+                            .get_resource_binding(&ServiceType::Userapp, &uid)
+                            .await?;
+                        self.runtime
+                            .retain_app_runtime_configuration(
+                                &s.app_id,
+                                &identity.lifecycle_id,
+                                binding.as_ref(),
+                            )
+                            .await
+                            .map_err(|error| {
+                                map_runtime_error(
+                                    "Retain existing application runtime configuration",
+                                    error,
+                                )
+                            })
+                    }
+                    .await;
+                    if let Err(error) = retained {
+                        // This is migration of one live application's current
+                        // configuration, not an admission gate for the whole
+                        // controller. Keep its prior snapshot and live workload;
+                        // a missing workload will report its own recovery error.
+                        warn!(app_id = %s.app_id, %error, "Application runtime configuration was not retained during startup");
+                    }
+                }
                 self.activity.bind_lifecycle(
                     &s.app_id,
                     &identity.lifecycle_id,

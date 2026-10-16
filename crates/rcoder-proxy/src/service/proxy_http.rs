@@ -12,7 +12,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 use shared_types::RemoteWakeState;
 use std::time::Duration;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use crate::router::RouteType;
 
@@ -52,6 +52,65 @@ async fn wait_for_peer_connection(peer: &HttpPeer, deadline: tokio::time::Instan
 }
 
 impl PortProxy {
+    fn validate_request_api_key(&self, session: &Session, path: &str) -> PingoraResult<()> {
+        let Some(config) = self.api_key_config.as_ref() else {
+            return Ok(());
+        };
+        let key = session
+            .req_header()
+            .headers
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok());
+        shared_types::ApiKeyValidator::validate(config, path, key).map_err(|error| {
+            let (status, detail) = match error {
+                shared_types::ApiKeyAuthError::Invalid => (401, "Invalid API key"),
+                shared_types::ApiKeyAuthError::Missing => (401, "Missing x-api-key header"),
+                shared_types::ApiKeyAuthError::ConfigError => (500, "Internal configuration error"),
+            };
+            warn!(%path, status, "[PINGORA_AUTH] {detail}");
+            pingora_core::Error::new(ErrorType::HTTPStatus(status)).more_context(detail.to_string())
+        })
+    }
+
+    /// An address can disappear after the initial routing probe. Only a fresh,
+    /// successful absence observation may turn a failed application dispatch
+    /// into deployment recovery; DNS/API/transport failures are not absence.
+    async fn restore_missing_app_after_dispatch(
+        &self,
+        app_id: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, shared_types::WakeFailure> {
+        let Some(control) = self.wake_control.as_ref() else {
+            return Ok(false);
+        };
+        if !matches!(
+            tokio::time::timeout_at(deadline, control.remote_wake_state_fresh(app_id)).await,
+            Ok(RemoteWakeState::Missing)
+        ) {
+            return Ok(false);
+        }
+        match tokio::time::timeout_at(deadline, control.ensure_serving(app_id)).await {
+            Ok(shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning) => {
+                Ok(true)
+            }
+            Ok(
+                shared_types::WakeOutcome::Failed(failure)
+                | shared_types::WakeOutcome::Timeout(failure),
+            ) => Err(failure),
+            Ok(shared_types::WakeOutcome::Blocked { message, blocker }) => {
+                Err(shared_types::WakeFailure {
+                    blocker: Some(Box::new(blocker)),
+                    ..shared_types::WakeFailure::new(
+                        shared_types::ERR_CONFLICT,
+                        "wake_admission",
+                        message,
+                    )
+                })
+            }
+            Err(_) => Err(shared_types::WakeFailure::timeout("wake_wait", None, false)),
+        }
+    }
+
     /// Fresh diagnostics stay inside the original connection deadline. Each
     /// failed attempt replaces earlier evidence, including an absent observation.
     async fn collect_connection_evidence(
@@ -227,6 +286,10 @@ impl ProxyHttp for PortProxy {
             return Self::preview_forward_gate(session, ctx, &self.preview_slot).await;
         }
 
+        // Admission must precede touch, wake, dev ensure and prod reconstruction.
+        // Internal preview forwarding above keeps its separate token contract.
+        self.validate_request_api_key(session, session.req_header().uri.path())?;
+
         // dbx 入口尾斜杠规范化（先于唤醒判定——重定向后的二次请求才进入 wake，
         // stopped app 不在无子路径请求上空等一轮）。
         let raw_uri = session.req_header().uri.clone();
@@ -302,9 +365,14 @@ impl ProxyHttp for PortProxy {
                 let wake_pending = if wc.is_stopped(&app_id) {
                     true
                 } else {
-                    match tokio::time::timeout_at(deadline, wc.remote_wake_pending_result(&app_id))
-                        .await
-                    {
+                    let probe = async {
+                        if touch {
+                            wc.remote_serving_pending_result(&app_id).await
+                        } else {
+                            wc.remote_wake_pending_result(&app_id).await
+                        }
+                    };
+                    match tokio::time::timeout_at(deadline, probe).await {
                         Ok(Ok(pending)) => pending,
                         Ok(Err(failure)) => {
                             self.respond_wake_failure(session, ctx, failure).await;
@@ -333,7 +401,14 @@ impl ProxyHttp for PortProxy {
                     if touch { "app" } else { "tool" },
                     app_id
                 );
-                match tokio::time::timeout_at(deadline, wc.ensure_running(&app_id)).await {
+                let wake = async {
+                    if touch {
+                        wc.ensure_serving(&app_id).await
+                    } else {
+                        wc.ensure_running(&app_id).await
+                    }
+                };
+                match tokio::time::timeout_at(deadline, wake).await {
                     Ok(
                         shared_types::WakeOutcome::Ready
                         | shared_types::WakeOutcome::AlreadyRunning,
@@ -383,41 +458,7 @@ impl ProxyHttp for PortProxy {
             upstream_request.uri.path()
         );
 
-        // ========================================
-        // API Key 验证（在所有路由处理之前）
-        // ========================================
-        if let Some(ref api_key_config) = self.api_key_config {
-            let path = upstream_request.uri.path();
-
-            // 提取 x-api-key header
-            let api_key = session
-                .req_header()
-                .headers
-                .get("x-api-key")
-                .and_then(|v| v.to_str().ok());
-
-            // 验证 API Key（无锁同步验证）
-            match shared_types::ApiKeyValidator::validate(api_key_config, path, api_key) {
-                Ok(()) => {
-                    // 验证通过，继续处理
-                }
-                Err(shared_types::ApiKeyAuthError::Invalid) => {
-                    warn!("[PINGORA_AUTH] Invalid API key for path: {}", path);
-                    return Err(pingora_core::Error::new(ErrorType::HTTPStatus(401))
-                        .more_context("Invalid API key".to_string()));
-                }
-                Err(shared_types::ApiKeyAuthError::Missing) => {
-                    warn!("[PINGORA_AUTH] Missing x-api-key header for path: {}", path);
-                    return Err(pingora_core::Error::new(ErrorType::HTTPStatus(401))
-                        .more_context("Missing x-api-key header".to_string()));
-                }
-                Err(shared_types::ApiKeyAuthError::ConfigError) => {
-                    error!("[PINGORA_AUTH] Configuration error");
-                    return Err(pingora_core::Error::new(ErrorType::HTTPStatus(500))
-                        .more_context("Internal configuration error".to_string()));
-                }
-            }
-        }
+        self.validate_request_api_key(session, upstream_request.uri.path())?;
 
         let path = Self::normalize_path(upstream_request.uri.path()).to_string();
 
@@ -487,15 +528,47 @@ impl ProxyHttp for PortProxy {
                         tokio::time::timeout_at(*deadline, wc.remote_wake_state_fresh(app_id))
                             .await;
                     match state {
-                        Ok(RemoteWakeState::WakePending) => {
-                            match tokio::time::timeout_at(*deadline, wc.ensure_running(app_id))
-                                .await
-                            {
+                        Ok(state @ (RemoteWakeState::WakePending | RemoteWakeState::Missing)) => {
+                            let serving = *matched.value == RouteType::ProdAppProxy;
+                            if state == RemoteWakeState::Missing && !serving {
+                                return Err(pingora_core::Error::new(ErrorType::HTTPStatus(502)));
+                            }
+                            let wake = async {
+                                if serving {
+                                    wc.ensure_serving(app_id).await
+                                } else {
+                                    wc.ensure_running(app_id).await
+                                }
+                            };
+                            match tokio::time::timeout_at(*deadline, wake).await {
                                 Ok(
                                     shared_types::WakeOutcome::Ready
                                     | shared_types::WakeOutcome::AlreadyRunning,
                                 ) => {}
-                                _ => {
+                                outcome => {
+                                    ctx.wake_failure = match outcome {
+                                        Ok(
+                                            shared_types::WakeOutcome::Failed(failure)
+                                            | shared_types::WakeOutcome::Timeout(failure),
+                                        ) => Some(failure),
+                                        Ok(shared_types::WakeOutcome::Blocked {
+                                            message,
+                                            blocker,
+                                        }) => Some(shared_types::WakeFailure {
+                                            blocker: Some(Box::new(blocker)),
+                                            ..shared_types::WakeFailure::new(
+                                                shared_types::ERR_CONFLICT,
+                                                "wake_admission",
+                                                message,
+                                            )
+                                        }),
+                                        Err(_) => Some(shared_types::WakeFailure::timeout(
+                                            "wake_wait",
+                                            None,
+                                            false,
+                                        )),
+                                        Ok(_) => None,
+                                    };
                                     if let Some(ctx_state) = ctx.app_connect_recovery.as_mut() {
                                         ctx_state.unavailable_response = true;
                                     }
@@ -521,9 +594,40 @@ impl ProxyHttp for PortProxy {
         }
         // T4a：定位/ensure 纳入恢复总预算——超时不取消已受理的独立创建
         // 工作（builder 租约自有生命周期），本请求诚实失败、后续请求受益。
-        let mut peer = self
+        let mut peer = match self
             .dispatch_peer_with_recovery_deadline(*matched.value, matched.params.clone(), ctx)
-            .await?;
+            .await
+        {
+            Ok(peer) => peer,
+            Err(error) => {
+                let restore = ctx
+                    .app_connect_recovery
+                    .as_ref()
+                    .filter(|_| *matched.value == RouteType::ProdAppProxy)
+                    .map(|state| (state.app_id.clone(), state.deadline));
+                let Some((app_id, deadline)) = restore else {
+                    return Err(error);
+                };
+                match self
+                    .restore_missing_app_after_dispatch(&app_id, deadline)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => return Err(error),
+                    Err(failure) => {
+                        let status = failure.clone().into_app_error().status_code().as_u16();
+                        ctx.wake_failure = Some(failure);
+                        return Err(pingora_core::Error::new(ErrorType::HTTPStatus(status)));
+                    }
+                }
+                self.dispatch_peer_with_recovery_deadline(
+                    *matched.value,
+                    matched.params.clone(),
+                    ctx,
+                )
+                .await?
+            }
+        };
         if let Some(deadline) = ctx
             .app_connect_recovery
             .as_ref()

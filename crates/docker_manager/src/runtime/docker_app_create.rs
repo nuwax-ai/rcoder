@@ -194,7 +194,10 @@ impl DockerRuntime {
             })?;
         let network_mode = Some(main_network.clone());
 
+        let (nano_cpus, memory) = app_resource_limits(params.app_resources.as_ref())?;
         let host_config = HostConfig {
+            nano_cpus,
+            memory,
             mounts,
             port_bindings: if port_bindings.is_empty() {
                 None
@@ -239,6 +242,12 @@ impl DockerRuntime {
             main_network,
             config,
         } = prepared;
+        let [_, lifecycle_key, _] = shared_types::USERAPP_RESOURCE_IDENTITY_KEYS;
+        let lifecycle_id = config
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(lifecycle_key))
+            .cloned();
         let client = self.inner.get_docker_client();
         let created = client
             .create_container(
@@ -288,6 +297,14 @@ impl DockerRuntime {
                 );
             }
             return Err(ContainerRuntimeError::ContainerStartError(e.to_string()));
+        }
+        if let Some(lifecycle_id) = lifecycle_id {
+            // Creation/update/restart must leave a recoverable specification
+            // even if startup cleanup or an operator later removes compute.
+            // Retention failure is propagated with the running resource kept;
+            // verify_committed_creation can repair the original operation.
+            self.retain_app_configuration(&app_id, &lifecycle_id, None)
+                .await?;
         }
 
         // 短轮询等待 container_ip 就绪（容器刚 start，IP 可能尚未分配）。
@@ -970,9 +987,66 @@ pub(super) fn recreate_body_from_inspect(
     }
 }
 
+fn app_resource_limits(
+    resources: Option<&container_runtime_api::AppResourceRequirements>,
+) -> ContainerRuntimeResult<(Option<i64>, Option<i64>)> {
+    let Some(resources) = resources else {
+        return Ok((None, None));
+    };
+    let cpu = resources
+        .cpu
+        .as_deref()
+        .map(|value| {
+            shared_types::parse_cpu_quantity(value)
+                .map(|cores| cores * 1_000_000_000.0)
+                .filter(|nano| nano.is_finite() && *nano >= 0.0 && *nano < i64::MAX as f64)
+                .map(|nano| nano.round() as i64)
+                .ok_or_else(|| {
+                    ContainerRuntimeError::ConfigurationError(
+                        "Application CPU limit is invalid or out of range".into(),
+                    )
+                })
+        })
+        .transpose()?;
+    let memory = resources
+        .memory
+        .as_deref()
+        .map(|value| {
+            shared_types::parse_memory_quantity(value)
+                .and_then(|bytes| i64::try_from(bytes).ok())
+                .ok_or_else(|| {
+                    ContainerRuntimeError::ConfigurationError(
+                        "Application memory limit is invalid or out of range".into(),
+                    )
+                })
+        })
+        .transpose()?;
+    Ok((cpu, memory))
+}
+
 #[cfg(test)]
 mod mutation_target_tests {
     use super::*;
+    #[test]
+    fn retained_application_resources_are_applied_without_dropping_limits() {
+        let resources = container_runtime_api::AppResourceRequirements {
+            cpu: Some("500m".into()),
+            memory: Some("128Mi".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            app_resource_limits(Some(&resources)).unwrap(),
+            (Some(500_000_000), Some(128 * 1024 * 1024))
+        );
+        assert_eq!(app_resource_limits(None).unwrap(), (None, None));
+        for invalid in ["-1", "NaN", "not-a-limit", "1e99"] {
+            let bad = container_runtime_api::AppResourceRequirements {
+                cpu: Some(invalid.into()),
+                ..Default::default()
+            };
+            assert!(app_resource_limits(Some(&bad)).is_err());
+        }
+    }
     #[test]
     fn application_mutation_requires_physical_identity_and_correct_family() {
         let target: bollard::models::ContainerInspectResponse = serde_json::from_value(serde_json::json!({

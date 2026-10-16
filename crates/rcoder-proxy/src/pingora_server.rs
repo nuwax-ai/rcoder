@@ -23,6 +23,10 @@ use crate::config::ProxyConfig;
 use crate::service::{PingoraProxyService, PortProxy};
 use shared_types::ModelProviderConfig;
 
+#[cfg(all(test, unix))]
+#[path = "prod_serving_recovery_tests.rs"]
+mod prod_serving_recovery_tests;
+
 /// Pingora 服务器管理器
 pub struct PingoraServerManager {
     config: ProxyConfig,

@@ -98,6 +98,17 @@ impl Drop for WaitingRestartClient {
     }
 }
 impl RestartAdmission {
+    pub(crate) fn with_deadline(deadline: tokio::time::Instant) -> Self {
+        Self {
+            deadline: std::sync::OnceLock::from(deadline),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn has_started(&self) -> bool {
+        self.phase.load(Ordering::SeqCst) == ADMITTING
+    }
+
     pub(crate) fn client(self: &Arc<Self>) -> WaitingRestartClient {
         WaitingRestartClient(self.clone())
     }

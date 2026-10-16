@@ -18,6 +18,7 @@ Example: python3 tests-e2e/tools/prod_readiness_contract.py \
   --build-receipt /tmp/frozen-paired-build.json --report /tmp/prod-contract.json
 """
 import argparse
+import concurrent.futures
 import hashlib
 import http.server
 import json
@@ -59,6 +60,14 @@ REQUIRED_STEPS = frozenset({
     'owner recovery keeps exact physical container',
     'invalid artifact retains concrete failure and accepted operation',
     'invalid artifact result belongs to accepted operation',
+    'deleted prod queries remain read only',
+    'unauthenticated prod traffic cannot recreate deleted compute',
+    'concurrent prod traffic recreates exactly one runtime',
+    'traffic recovery preserves applied environment and image',
+    'traffic recovery preserves four bind mounts and PostgreSQL data',
+    'traffic recovery does not download artifacts or replay SQL and migrations',
+    'controller restart retains the restored production runtime',
+    'persisted configuration restores deleted prod compute after controller restart',
     'source stayed stable throughout the run',
     'owned containers removed and volumes retained',
 })
@@ -150,7 +159,7 @@ def validate_controller(row, receipt):
             raise ValueError('isolated controller writable mount is foreign')
 
 
-def prepare_controller(root, repo, build, source, run_id, case_id, app_id):
+def prepare_controller(root, repo, build, source, run_id, case_id, app_id, api_key=None):
     """Only a frozen, validated build may create a private control plane."""
     from turso_runtime_contract import isolated_config, service_config, wait_ready
     validate_receipt(build, source)  # Before directory/ownership or Docker side effects.
@@ -164,6 +173,12 @@ def prepare_controller(root, repo, build, source, run_id, case_id, app_id):
                'controller_state': 'not_started', 'application_state': 'not_started',
                'controller_id': None, 'application_containers': {}, 'source': source}
     source_config = isolated_config((repo / 'docker/config.yml').read_text())
+    if not api_key:
+        raise ValueError('owned prod fixture requires its private authentication key')
+    source_config, count = re.subn(r'(?ms)^api_key_auth:\n.*?(?=^[^ \t#\n]|\Z)',
+        'api_key_auth:\n  enabled: true\n  api_key: "provided-through-private-environment"\n\n', source_config)
+    if count != 1:
+        raise ValueError('expected exactly one API Key configuration section')
     # Service image references remain unused in this no-agent fixture. The one
     # production runtime is selected by the same platform env used by Start.
     source_config = source_config.replace('sha256:local-development', build['runtime']['image_id'])
@@ -174,13 +189,16 @@ def prepare_controller(root, repo, build, source, run_id, case_id, app_id):
                             os.environ.get('DOCKER_SOCKET_PATH', '/var/run/docker.sock'), config_path)
     service = config['services']['rcoder']
     service['environment'].update(RCODER_RUNTIME_IMAGE_DIGEST=build['runtime']['image_id'],
-                                  COMPOSE_PROJECT_NAME=receipt['project'], DOCKER_NETWORK_BASE_NAME='agent-network')
+                                  COMPOSE_PROJECT_NAME=receipt['project'], DOCKER_NETWORK_BASE_NAME='agent-network',
+                                  RCODER_API_KEY=api_key)
+    service['ports'].append('127.0.0.1::8088')
     service['networks'] = ['agent-network']
     config['networks'] = {'agent-network': {'labels': {'rcoder.e2e.run': run_id, 'rcoder.e2e.case': case_id}}}
     for mount in service['volumes']:
         if mount.get('type') == 'bind' and not mount.get('read_only') and mount['target'] != '/var/run/docker.sock':
             Path(mount['source']).mkdir(parents=True, exist_ok=True)
     (root / 'compose.json').write_text(json.dumps(config, indent=2))
+    (root / 'compose.json').chmod(0o600)
     persist_ownership(root, receipt)
     compose = ['docker', 'compose', '-p', receipt['project'], '-f', str(root / 'compose.json')]
     receipt['controller_state'] = 'unknown'
@@ -334,6 +352,35 @@ plugins = []
 upstream_includes = []
 
 [services.env]
+
+[[services]]
+service_id = "probe"
+name = "Contract migration probe"
+dir = "probe"
+type = "python"
+kind = "api"
+enabled = true
+port = 4200
+logs = []
+
+[services.run]
+command = ["python3", "main.py"]
+migrate = ["python3", "migrate.py"]
+depends_on = []
+shutdown_timeout_seconds = 5
+
+[services.health]
+startup_path = "/health"
+readiness_path = "/health"
+liveness_path = "/health"
+
+[services.proxy]
+path = "/contract-probe"
+strip_prefix = true
+plugins = []
+upstream_includes = []
+
+[services.env]
 '''
     tomllib.loads(lock)
     files = {
@@ -342,6 +389,10 @@ upstream_includes = []
         'web/project.manifest.toml': 'schema_version = 1\n[project]\nservice_id="web"\nname="Contract frontend"\ntype="static"\n[build]\ncommand=["true"]\nartifact="dist"\n[proxy]\npath="/"\nstrip_prefix=false\n',
         'web/dist/index.html': f'<!doctype html><title>{marker}</title><main>{marker}</main><script src="/app.js"></script>\n',
         'web/dist/app.js': f'window.contractMarker = "{marker}";\n',
+        'probe/project.manifest.toml': 'schema_version=1\n[project]\nservice_id="probe"\nname="Contract probe"\ntype="python"\nkind="api"\n[build]\ncommand=["true"]\nartifact="artifact.zip"\n[run]\ncommand=["python3","main.py"]\nmigrate=["python3","migrate.py"]\n',
+        'probe/main.py': 'import os\nfrom http.server import BaseHTTPRequestHandler,HTTPServer\nclass Handler(BaseHTTPRequestHandler):\n def do_GET(self):\n  self.send_response(200);self.end_headers();self.wfile.write(b"contract-probe")\nHTTPServer(("0.0.0.0",int(os.environ["PORT"])),Handler).serve_forever()\n',
+        'probe/migrate.py': f'from pathlib import Path\nwith Path("/home/user/data/prod-contract-migrations.log").open("a") as handle:\n handle.write({release!r}+"\\n")\n',
+        'database/001-contract.sql': 'CREATE TABLE IF NOT EXISTS public.codex_contract_sql (release_id text NOT NULL);\n' + f"INSERT INTO public.codex_contract_sql VALUES ('{release}');\n",
     }
     artifact = directory / f'workspace-package-{release}.zip'
     with zipfile.ZipFile(artifact, 'w', zipfile.ZIP_DEFLATED) as archive:
@@ -361,6 +412,7 @@ class Contract:
         self.build_receipt = None
         self.owned_controller = None
         self.fixture_root = None
+        self.proxy_base = None
 
     def check(self, name, ok, detail=None):
         self.report['checks'].append({'name': name, 'ok': bool(ok), 'detail': detail})
@@ -513,10 +565,11 @@ exec psql -h "${PGHOST:-localhost}" -p "${PGPORT:-5432}" \
 
     def verify_mounts(self, cid, mounts, phase):
         relevant = sorted((mount for mount in mounts if mount['Destination'] in
-                    (f'/home/user/{self.app}', f'/home/user/{self.app}/code', '/home/user/data', '/home/user/logs')),
+                    (f'/home/user/{self.app}', '/home/user/data', '/home/user/logs', '/home/user/.agent-store')),
                     key=lambda mount: mount['Destination'])
         if self.volumes is None:
-            self.check('owned data mount exists', any(m['Destination'] == '/home/user/data' for m in relevant), relevant)
+            self.check('owned data mount exists', len(relevant) == 4
+                       and all(m['Type'] == 'bind' for m in relevant), relevant)
             self.volumes = relevant
             self.report['retained_mounts'] = relevant
             self.execute(cid, 'python3', '-c', 'from pathlib import Path;import sys;Path(sys.argv[1]).write_text(sys.argv[2])', self.sentinel, self.marker)
@@ -524,6 +577,131 @@ exec psql -h "${PGHOST:-localhost}" -p "${PGPORT:-5432}" \
             self.check(phase + ': original mounts retained', relevant == self.volumes, relevant)
         self.check(phase + ': data sentinel retained', self.execute(cid, 'cat', self.sentinel) == self.marker)
         return relevant
+
+    def application_ids(self):
+        return run(['docker', 'ps', '-aq', '--no-trunc', '--filter', f'label=app-id={self.app}',
+                    '--filter', 'label=managed-by=rcoder-app-manager', '--filter', 'label=service-type=user-app']).split()
+
+    def proxy(self, path='/', authenticated=True, marker=None):
+        headers = {'x-api-key': self.args.api_key} if authenticated else {}
+        route = '/api/v1/userapp/proxy/app/prod/' + urllib.parse.quote(self.args.user_id, safe='') + '/' + self.app
+        request = urllib.request.Request(self.proxy_base + route + path, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=90) as response:
+                status, body = response.status, response.read()
+        except urllib.error.HTTPError as error:
+            status, body = error.code, error.read()
+        return {'status': status, 'sha256': hashlib.sha256(body).hexdigest(),
+                'matches': marker is not None and marker.encode() in body}
+
+    def recovery_counters(self, cid):
+        migrations = self.execute(cid, 'cat', '/home/user/data/prod-contract-migrations.log').splitlines()
+        sql = self.sql(cid, 'SELECT count(*) FROM public.codex_contract_sql')
+        return {'migrations': migrations, 'sql_executions': int(sql)}
+
+    def assert_deleted_queries_read_only(self, phase):
+        user = urllib.parse.quote(self.args.user_id, safe='')
+        observations = []
+        for _ in range(2):
+            readiness = self.readiness()
+            self.check(phase + ': readiness observes missing compute', readiness.get('ready') is False
+                       and readiness['container'].get('status') == 'missing', readiness)
+            observations.append({'readiness': readiness})
+            for route in (f'/api/v1/userapp/{self.app}/prod/stats?user_id={user}',
+                          f'/api/v1/userapp/{self.app}'):
+                status, envelope = self.api_raw(route)
+                self.check(phase + ': missing workload remains a runtime diagnostic',
+                           status == 404 and envelope.get('success') is False
+                           and envelope.get('code') == 'CONTAINER_NOT_FOUND',
+                           {'path': route, 'status': status, 'code': envelope.get('code')})
+                observations.append({'path': route, 'status': status, 'code': envelope.get('code')})
+            self.check(phase + ': query calls did not recreate compute', not self.application_ids())
+            time.sleep(0.25)
+        self.check('deleted prod queries remain read only', not self.application_ids(), observations)
+
+    def traffic_recreate(self, phase, marker, release, deployment, generation, downloads):
+        before, mounts = self.current()
+        original = self.inspect(before)
+        once = {'APP_DEPLOY_URL', 'APP_RELEASE_ID', 'APP_DEPLOY_SHA256',
+                'APP_DEPLOY_OPERATION_ID', 'APP_DEPLOY_GENERATION_ID'}
+        def environment(row):
+            return {key: value for entry in row['Config']['Env'] if '=' in entry
+                    for key, value in [entry.split('=', 1)] if key not in once}
+        expected_environment = environment(original)
+        counters = self.recovery_counters(before)
+        self.check(phase + ': real migration and SQL preconditions exist',
+                   bool(counters['migrations']) and counters['sql_executions'] == 1, counters)
+        download_count = len(downloads)
+        event_since = int(time.time())
+        if self.owned_controller is not None:
+            self.owned_controller['application_state'] = 'unknown'
+            persist_ownership(self.fixture_root, self.owned_controller)
+        # Fault injection deletes exactly the captured application's compute.
+        # The retained workspace/data and control-plane database are untouched.
+        run(['docker', 'rm', '-f', before], timeout=90)
+        self.check(phase + ': exact runtime was removed', not self.application_ids(), {'removed_id': before})
+        self.assert_deleted_queries_read_only(phase)
+        refused = self.proxy(authenticated=False)
+        self.check('unauthenticated prod traffic cannot recreate deleted compute',
+                   refused['status'] == 401 and not self.application_ids(), refused)
+        if self.owned_controller is not None:
+            self.owned_controller['application_state'] = 'unknown'
+            persist_ownership(self.fixture_root, self.owned_controller)
+        barrier = threading.Barrier(8)
+        def request(_index):
+            barrier.wait(timeout=10)
+            return self.proxy(marker=marker)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            fanout = list(pool.map(request, range(8)))
+        self.check(phase + ': authenticated fanout uses actual business traffic',
+                   all(row['status'] in (200, 503) for row in fanout), fanout)
+        self.wait(phase + ': real prod proxy serves restored artifact',
+                  lambda: self.proxy(marker=marker),
+                  lambda row: row['status'] == 200 and row['matches'], seconds=180)
+        after, restored_mounts = self.current()
+        restored = self.inspect(after)
+        self.check('traffic recovery preserves applied environment and image',
+                   restored['Image'] == original['Image'] and environment(restored) == expected_environment,
+                   {'before_image': original['Image'], 'after_image': restored['Image'],
+                    'retained_env_sha256': hashlib.sha256(json.dumps(expected_environment, sort_keys=True).encode()).hexdigest(),
+                    'restored_env_sha256': hashlib.sha256(json.dumps(environment(restored), sort_keys=True).encode()).hexdigest()})
+        raw_environment = dict(entry.split('=', 1) for entry in restored['Config']['Env'] if '=' in entry)
+        self.check(phase + ': old deployment declaration is not replayed', not once.intersection(raw_environment))
+        self.check(phase + ': real prod proxy serves restored JavaScript', self.proxy('/app.js', marker=marker)['matches'])
+        self.verify_runtime(phase, deployment, generation, marker, release)
+        self.check('traffic recovery preserves four bind mounts and PostgreSQL data',
+                   after != before and mounts == restored_mounts and len(self.volumes) == 4
+                   and self.sql(after, 'SELECT marker FROM public.codex_contract_sentinel WHERE id=1') == self.marker,
+                   {'before': before, 'after': after, 'mounts': restored_mounts})
+        self.check('traffic recovery does not download artifacts or replay SQL and migrations',
+                   len(downloads) == download_count and self.recovery_counters(after) == counters,
+                   {'downloads_before': download_count, 'downloads_after': len(downloads),
+                    'counters_before': counters, 'counters_after': self.recovery_counters(after)})
+        events = run(['docker', 'events', '--since', str(event_since), '--until', str(int(time.time()) + 1),
+                      '--filter', 'type=container', '--filter', 'event=create', '--filter', f'label=app-id={self.app}',
+                      '--format', '{{json .}}'], timeout=15)
+        created_ids = [json.loads(line).get('Actor', {}).get('ID') for line in events.splitlines() if line]
+        self.check('concurrent prod traffic recreates exactly one runtime',
+                   created_ids == [after] and self.application_ids() == [after],
+                   {'new_container_ids': created_ids, 'current_id': after, 'fanout': fanout})
+        return after
+
+    def restart_owned_controller(self, runtime_id):
+        controller = json.loads(run(['docker', 'inspect', self.args.controller_container]))[0]
+        if self.owned_controller is not None:
+            validate_controller(controller, self.owned_controller)
+        self.check('restart targets the exact frozen control plane',
+                   controller['Id'] == self.args.controller_container
+                   and controller['Image'] == self.build_receipt['rcoder']['image_id'])
+        run(['docker', 'restart', '-t', '30', self.args.controller_container], timeout=120)
+        from turso_runtime_contract import wait_ready
+        wait_ready(self.args.url)
+        restored = json.loads(run(['docker', 'inspect', self.args.controller_container]))[0]
+        self.check('controller restart keeps the same private instance and binary',
+                   restored['Id'] == controller['Id'] and restored['Image'] == controller['Image']
+                   and run(['docker', 'exec', restored['Id'], 'sha256sum', '/app/bin/rcoder']).split()[0]
+                   == self.build_receipt['rcoder']['binary_sha256'])
+        self.check('controller restart retains the restored production runtime', self.current()[0] == runtime_id)
 
     def verify_runtime(self, phase, expected_deployment, expected_generation=None, marker=None, release=None):
         expected_generation = expected_generation or expected_deployment
@@ -712,6 +890,9 @@ def main():
     args = parser.parse_args()
     if bool(args.url) != bool(args.controller_container):
         parser.error('--url and --controller-container must be supplied together')
+    if args.controller_container and not args.api_key:
+        parser.error('external isolated controller requires its existing --api-key')
+    args.api_key = args.api_key or 'sk-' + uuid.uuid4().hex
     if args.url:
         parsed = urllib.parse.urlsplit(args.url)
         if (parsed.scheme not in ('http', 'https') or parsed.hostname not in ('127.0.0.1', 'localhost', '::1')
@@ -733,7 +914,7 @@ def main():
             run_id = os.environ.get('E2E_RUN_ID') or uuid.uuid4().hex
             case_id = os.environ.get('E2E_CASE_ID') or uuid.uuid4().hex
             contract.owned_controller = prepare_controller(contract.fixture_root, repo, contract.build_receipt,
-                                                           report['source'], run_id, case_id, app)
+                                                           report['source'], run_id, case_id, app, args.api_key)
             args.controller_container = contract.owned_controller['controller_id']
             args.url = contract.owned_controller['base']
         args.runtime_image = args.runtime_image or contract.build_receipt['runtime']['image_id']
@@ -750,6 +931,14 @@ def main():
                           for bindings in ports.values() for binding in (bindings or []))
         if not matches_url:
             raise ValueError('loopback URL is not bound to captured controller')
+        proxy_bindings = [binding for binding in (ports.get('8088/tcp') or [])
+                          if binding.get('HostIp') in ('127.0.0.1', '::1')]
+        if len(proxy_bindings) != 1:
+            raise ValueError('isolated controller requires one explicit loopback 8088 proxy binding')
+        proxy_host = '[::1]' if proxy_bindings[0]['HostIp'] == '::1' else '127.0.0.1'
+        contract.proxy_base = 'http://' + proxy_host + ':' + proxy_bindings[0]['HostPort']
+        contract.check('real business proxy rejects missing authentication before recovery',
+                       contract.proxy(authenticated=False)['status'] == 401)
         image = json.loads(run(['docker', 'image', 'inspect', args.runtime_image]))[0]
         expected = contract.build_receipt
         controller_hash = run(['docker', 'exec', args.controller_container, 'sha256sum', '/app/bin/rcoder']).split()[0]
@@ -768,7 +957,7 @@ def main():
             persist_ownership(contract.fixture_root, contract.owned_controller)
         _, base = contract.api(f'/api/v1/userapp/{app}/start', {
             'user_id': args.user_id, 'request_id': 'base-' + uuid.uuid4().hex,
-            'env': {'PROJECT_ID': app}}, timeout=330)
+            'env': {'PROJECT_ID': app, 'CONTRACT_ENV_MARKER': contract.marker}}, timeout=330)
         contract.check('empty Start creates a provisioned base container',
             bool(base.get('operation_id')) and base['data'].get('operation_id') == base['operation_id'], base['data'])
         _, lifecycle = contract.api(f'/api/v1/userapp/{app}/lifecycle')
@@ -815,10 +1004,14 @@ def main():
             'user_id': args.user_id, 'request_id': 'deploy-' + uuid.uuid4().hex,
             'lifecycle_id': contract.lifecycle, 'deploy_mode': 'pod',
             'url': artifact_url, 'sha256': report['artifact']['sha256'], 'release_id': release,
-            'auto_execute_sql': False, 'env': {'PROJECT_ID': app}}, timeout=330)
+            'auto_execute_sql': True, 'env': {'PROJECT_ID': app, 'CONTRACT_ENV_MARKER': contract.marker}}, timeout=330)
         deployment = response.get('operation_id')
         contract.check('deploy response carries the accepted operation',
                        bool(deployment) and response['data'].get('operation_id') == deployment, response['data'])
+        sql_report = response['data'].get('sql_report') or {}
+        contract.check('cold deployment actually executes the artifact SQL once',
+                       sql_report.get('executed') == ['database/001-contract.sql']
+                       and sql_report.get('failed') == [], sql_report)
         cold_cid, cold_mounts = contract.current()
         contract.check('cold deployment replaces the base physical container', cold_cid != base_cid,
             {'before': base_cid, 'after': cold_cid})
@@ -869,6 +1062,13 @@ def main():
         contract.wait('explicit Start restores business readiness', contract.readiness, lambda data: data['ready'] is True)
         contract.verify_runtime('started-again', hot_operation, deployment, marker_b, release_b)
         contract.check('compute restarts reuse the confirmed artifact', len(downloads) == initial_downloads, downloads)
+        restored = contract.traffic_recreate('traffic-restored', marker_b, release_b,
+                                             hot_operation, deployment, downloads)
+        contract.restart_owned_controller(restored)
+        restored_again = contract.traffic_recreate('controller-restarted-traffic-restored', marker_b, release_b,
+                                                   hot_operation, deployment, downloads)
+        contract.check('persisted configuration restores deleted prod compute after controller restart',
+                       restored_again != restored, {'before': restored, 'after': restored_again})
         invalid_release = uuid.uuid4().hex
         invalid_url = f'http://{args.artifact_advertise_host}:{server.server_port}/invalid.zip'
         status, failed = contract.api_raw(f'/api/v1/userapp/{app}/start', {
