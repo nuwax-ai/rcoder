@@ -244,6 +244,101 @@ class RuntimeCommitObservationContracts(unittest.TestCase):
         docker.assert_not_called()
 
 
+class ControllerRestartEndpointContracts(unittest.TestCase):
+    def fixture(self, root):
+        root = root.resolve()
+        receipt = {'version': 1, 'root': str(root), 'project': 'rcoder-prod-' + 'a' * 16,
+                   'run_id': 'run', 'case_id': 'case', 'app_id': 'private-app',
+                   'rcoder_image_id': 'sha256:' + 'b' * 64, 'controller_id': 'captured-controller',
+                   'base': 'http://127.0.0.1:32777'}
+        labels = {'com.docker.compose.project': receipt['project'], 'com.docker.compose.service': 'rcoder',
+                  'rcoder.e2e.run': 'run', 'rcoder.e2e.case': 'case'}
+        row = {'Id': receipt['controller_id'], 'Image': receipt['rcoder_image_id'],
+               'Name': '/' + receipt['project'] + '-rcoder-1', 'State': {'Running': True},
+               'Config': {'Labels': labels},
+               'Mounts': [{'Type': 'bind', 'Source': str(root / folder), 'Destination': '/app/' + folder}
+                          for folder in ('data', 'logs', 'project_workspace', 'computer-project-workspace',
+                                         'userapp-workspace', 'app-workspace')],
+               'NetworkSettings': {'Ports': {'8090/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '32777'}],
+                                             '8088/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '32778'}]}}}
+        fixture = contract.Contract(SimpleNamespace(controller_container=row['Id'], url=receipt['base']),
+                                    {'checks': []}, 'private-app')
+        fixture.owned_controller = receipt
+        fixture.fixture_root = root
+        fixture.proxy_base = 'http://127.0.0.1:32778'
+        fixture.build_receipt = {'rcoder': {'image_id': row['Image'], 'binary_sha256': 'c' * 64}}
+        return fixture, row
+
+    def test_restart_refreshes_both_random_ports_and_persists_before_waiting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture, before = self.fixture(Path(directory))
+            after = copy.deepcopy(before)
+            after['NetworkSettings']['Ports']['8090/tcp'][0]['HostPort'] = '32779'
+            after['NetworkSettings']['Ports']['8088/tcp'][0]['HostPort'] = '32780'
+            calls = []
+            def docker(argv, **_kwargs):
+                calls.append(argv)
+                if argv[1] == 'inspect':
+                    return json.dumps([before if len(calls) == 1 else after])
+                if argv[1] == 'exec':
+                    return 'c' * 64 + '  /app/bin/rcoder'
+                self.assertEqual(argv, ['docker', 'restart', '-t', '30', before['Id']])
+                return ''
+            def ready(base):
+                self.assertEqual(base, 'http://127.0.0.1:32779')
+                self.assertEqual(fixture.args.url, base)
+                self.assertEqual(fixture.proxy_base, 'http://127.0.0.1:32780')
+                persisted = json.loads((Path(directory) / 'ownership.json').read_text())
+                self.assertEqual(persisted['base'], base)
+                self.assertEqual(persisted['controller_id'], before['Id'])
+            with patch.object(contract, 'run', side_effect=docker), \
+                 patch('turso_runtime_contract.wait_ready', side_effect=ready) as wait, \
+                 patch.object(fixture, 'current', return_value=('same-runtime', {})), patch('builtins.print'):
+                fixture.restart_owned_controller('same-runtime')
+            wait.assert_called_once_with('http://127.0.0.1:32779')
+            self.assertEqual(sum(argv[1] == 'restart' for argv in calls), 1)
+            self.assertEqual([argv[1] for argv in calls], ['inspect', 'restart', 'inspect', 'exec'])
+
+    def test_each_endpoint_requires_one_actual_loopback_mapping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, row = self.fixture(Path(directory))
+            self.assertEqual(contract.controller_loopback_endpoints(row),
+                             ('http://127.0.0.1:32777', 'http://127.0.0.1:32778'))
+            for port in ('8090/tcp', '8088/tcp'):
+                for bindings in ([], [{'HostIp': '0.0.0.0', 'HostPort': '32777'}],
+                                 [{'HostIp': '192.0.2.1', 'HostPort': '32777'}],
+                                 [{'HostIp': '127.0.0.1', 'HostPort': '32777'}] * 2,
+                                 [{'HostIp': '127.0.0.1', 'HostPort': '32777'}, {'HostIp': '0.0.0.0', 'HostPort': '32777'}],
+                                 [{'HostIp': '127.0.0.1', 'HostPort': '0'}],
+                                 [{'HostIp': '127.0.0.1', 'HostPort': '65536'}]):
+                    with self.subTest(port=port, bindings=bindings):
+                        invalid = copy.deepcopy(row)
+                        invalid['NetworkSettings']['Ports'][port] = bindings
+                        with self.assertRaises(ValueError):
+                            contract.controller_loopback_endpoints(invalid)
+            row['NetworkSettings']['Ports']['8088/tcp'][0]['HostIp'] = '::1'
+            self.assertEqual(contract.controller_loopback_endpoints(row)[1], 'http://[::1]:32778')
+
+    def test_changed_controller_identity_is_rejected_before_waiting_or_rebinding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for change in ('Id', 'Image', 'ownership'):
+                with self.subTest(change=change):
+                    fixture, before = self.fixture(Path(directory))
+                    after = copy.deepcopy(before)
+                    if change == 'ownership':
+                        after['Config']['Labels']['rcoder.e2e.run'] = 'foreign-run'
+                    else:
+                        after[change] = 'foreign-value'
+                    with patch.object(contract, 'run', side_effect=[json.dumps([before]), '', json.dumps([after])]) as docker, \
+                         patch('turso_runtime_contract.wait_ready') as wait, patch('builtins.print'):
+                        with self.assertRaises(ValueError):
+                            fixture.restart_owned_controller('same-runtime')
+                    wait.assert_not_called()
+                    self.assertEqual(docker.call_count, 3)
+                    self.assertEqual(fixture.args.url, 'http://127.0.0.1:32777')
+                    self.assertFalse((Path(directory) / 'ownership.json').exists())
+
+
 class OwnedPreparationContracts(unittest.TestCase):
     def receipt(self, root, state='unknown'):
         return {'version': 1, 'root': str(root), 'project': 'rcoder-prod-' + 'a' * 16,

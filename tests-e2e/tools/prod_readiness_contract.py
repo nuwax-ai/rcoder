@@ -168,6 +168,24 @@ def validate_controller(row, receipt):
             raise ValueError('isolated controller writable mount is foreign')
 
 
+
+def controller_loopback_endpoints(row):
+    """Resolve current Docker-assigned ports without accepting public bindings."""
+    ports = row.get('NetworkSettings', {}).get('Ports') or {}
+    endpoints = []
+    for port in ('8090/tcp', '8088/tcp'):
+        bindings = ports.get(port) or []
+        if len(bindings) != 1:
+            raise ValueError('isolated controller requires one explicit loopback ' + port + ' binding')
+        binding = bindings[0]
+        host = binding.get('HostIp')
+        published = str(binding.get('HostPort', ''))
+        if host not in ('127.0.0.1', '::1') or not published.isascii() or not published.isdigit() or not 0 < int(published) < 65536:
+            raise ValueError('isolated controller has an invalid loopback ' + port + ' binding')
+        endpoints.append('http://' + ('[::1]' if host == '::1' else host) + ':' + published)
+    return tuple(endpoints)
+
+
 def prepare_controller(root, repo, build, source, run_id, case_id, app_id, api_key=None):
     """Only a frozen, validated build may create a private control plane."""
     from turso_runtime_contract import isolated_config, service_config, wait_ready
@@ -706,13 +724,21 @@ exec psql -h "${PGHOST:-localhost}" -p "${PGPORT:-5432}" \
                    controller['Id'] == self.args.controller_container
                    and controller['Image'] == self.build_receipt['rcoder']['image_id'])
         run(['docker', 'restart', '-t', '30', self.args.controller_container], timeout=120)
-        from turso_runtime_contract import wait_ready
-        wait_ready(self.args.url)
         restored = json.loads(run(['docker', 'inspect', self.args.controller_container]))[0]
+        if self.owned_controller is not None:
+            validate_controller(restored, self.owned_controller)
         self.check('controller restart keeps the same private instance and binary',
                    restored['Id'] == controller['Id'] and restored['Image'] == controller['Image']
+                   and restored['State']['Running'] is True
+                   and restored['Config'].get('Labels') == controller['Config'].get('Labels')
                    and run(['docker', 'exec', restored['Id'], 'sha256sum', '/app/bin/rcoder']).split()[0]
                    == self.build_receipt['rcoder']['binary_sha256'])
+        self.args.url, self.proxy_base = controller_loopback_endpoints(restored)
+        if self.owned_controller is not None:
+            self.owned_controller['base'] = self.args.url
+            persist_ownership(self.fixture_root, self.owned_controller)
+        from turso_runtime_contract import wait_ready
+        wait_ready(self.args.url)
         self.check('controller restart retains the restored production runtime', self.current()[0] == runtime_id)
 
     def wait_runtime_commit(self, cid, phase, expected_deployment, expected_generation, release=None):
