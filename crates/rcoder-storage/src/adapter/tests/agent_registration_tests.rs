@@ -51,8 +51,9 @@ fn memory_completion_preserves_current_metadata_and_rejects_retirement() {
     );
 }
 
-#[test]
-fn memory_shared_replacement_retains_predecessor_snapshots_and_new_entry() {
+fn assert_memory_shared_replacement_retains_predecessor_snapshots_and_new_entry(
+    same_workload: bool,
+) {
     let adapter = make_adapter();
     adapter
         .insert("first".into(), Arc::new(owned_project("first", "shared")))
@@ -73,7 +74,9 @@ fn memory_shared_replacement_retains_predecessor_snapshots_and_new_entry() {
     let old = first.container_info().unwrap();
     let mut replacement = old.clone();
     replacement.container_id = "new-physical-pod".into();
-    replacement.workload_uid = Some("new-physical-workload".into());
+    if !same_workload {
+        replacement.workload_uid = Some("new-physical-workload".into());
+    }
     let proof = shared_types::VerifiedAgentReplacement {
         identifier: "shared".into(),
         service_type: ServiceType::ComputerAgentRunner,
@@ -145,6 +148,19 @@ fn memory_shared_replacement_retains_predecessor_snapshots_and_new_entry() {
             .container_id,
         replacement.container_id
     );
+    let new_first = freeze("first");
+    assert!(
+        adapter
+            .append_session_for_container(&new_first, "first-session")
+            .unwrap(),
+        "a new message on the migrated original SID must not be blocked by its retired old generation"
+    );
+    assert!(
+        !adapter
+            .append_session_for_container(&first, "first-session")
+            .unwrap(),
+        "an old completion on that same SID must remain fenced"
+    );
     adapter.remove("second");
     assert_eq!(
         adapter
@@ -172,4 +188,14 @@ fn memory_shared_replacement_retains_predecessor_snapshots_and_new_entry() {
             .container_id,
         replacement.container_id
     );
+}
+
+#[test]
+fn memory_shared_replacement_retains_predecessor_snapshots_and_new_entry() {
+    assert_memory_shared_replacement_retains_predecessor_snapshots_and_new_entry(false);
+}
+
+#[test]
+fn memory_same_statefulset_pod_recreation_rebinds_shared_projects_and_fences_old_completion() {
+    assert_memory_shared_replacement_retains_predecessor_snapshots_and_new_entry(true);
 }

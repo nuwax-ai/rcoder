@@ -1,4 +1,4 @@
-//! Registration-only recovery after an Agent StatefulSet was replaced. All
+//! Registration-only recovery after an Agent StatefulSet or its Pod was replaced. All
 //! observations come from the API server; no cache, resource writes or new ledger.
 
 use container_runtime_api::{
@@ -8,7 +8,7 @@ use container_runtime_api::{
 use k8s_openapi::api::core::v1::{Pod, PodSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::{Api, api::ListParams};
-use shared_types::{ContainerBasicInfo, ServiceType};
+use shared_types::{AgentRegistrationChange, ContainerBasicInfo, ServiceType};
 
 use super::{KubernetesRuntime, k8s_pod::K8sPodOps};
 
@@ -330,13 +330,15 @@ impl KubernetesRuntime {
             .as_deref()
             .filter(|uid| !uid.is_empty())
             .ok_or_else(|| conflict("Replacement Agent workload identity is missing"))?;
+        let change = AgentRegistrationChange::between(previous, replacement).ok_or_else(|| {
+            conflict("Agent replacement has no captured physical identity change")
+        })?;
         if replacement.container_id.is_empty()
             || replacement.project_id != identifier
             || replacement.container_name != workload_name
             || previous.is_some_and(|previous| {
                 previous.container_id.is_empty()
                     || previous.container_id == replacement.container_id
-                    || old_uid == Some(new_uid)
                     || previous.project_id != identifier
                     || previous.container_name != workload_name
             })
@@ -421,21 +423,22 @@ impl KubernetesRuntime {
         if previous.is_some_and(|previous| {
             pods.items.iter().any(|pod| {
                 pod.metadata.uid.as_deref() == Some(previous.container_id.as_str())
-                    || pod
-                        .metadata
-                        .owner_references
-                        .as_ref()
-                        .is_some_and(|owners| {
-                            owners.iter().any(|owner| {
-                                owner.controller == Some(true)
-                                    && Some(owner.uid.as_str()) == old_uid
-                            })
-                        })
+                    || (change == AgentRegistrationChange::WorkloadReplaced
+                        && pod
+                            .metadata
+                            .owner_references
+                            .as_ref()
+                            .is_some_and(|owners| {
+                                owners.iter().any(|owner| {
+                                    owner.controller == Some(true)
+                                        && Some(owner.uid.as_str()) == old_uid
+                                })
+                            }))
             })
         }) {
             return Err(conflict("Previous Agent Pod has not exited; retry ensure"));
         }
-        if old_uid.is_some()
+        if change == AgentRegistrationChange::WorkloadReplaced
             && controllers
                 .list(&ListParams::default())
                 .await
@@ -452,14 +455,15 @@ impl KubernetesRuntime {
         // logical owner must still have a unique active candidate.
         if pods.items.iter().any(|candidate| {
             candidate.metadata.uid != pod.metadata.uid
-                && labels.iter().all(|(key, value)| {
-                    candidate
-                        .metadata
-                        .labels
-                        .as_ref()
-                        .and_then(|labels| labels.get(key))
-                        == Some(value)
-                })
+                && (controlled_by(candidate, &workload_name, new_uid)
+                    || labels.iter().all(|(key, value)| {
+                        candidate
+                            .metadata
+                            .labels
+                            .as_ref()
+                            .and_then(|labels| labels.get(key))
+                            == Some(value)
+                    }))
                 && !matches!(
                     Self::extract_pod_status(candidate),
                     ContainerRuntimeStatus::Succeeded | ContainerRuntimeStatus::Failed

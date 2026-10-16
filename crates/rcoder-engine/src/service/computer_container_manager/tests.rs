@@ -15,6 +15,9 @@ struct Runtime {
     creates: AtomicUsize,
     stops: AtomicUsize,
     observation_failed: AtomicBool,
+    cached: Mutex<Option<ContainerBasicInfo>>,
+    fresh_queries: AtomicUsize,
+    stale_info_reads: Mutex<usize>,
 }
 
 impl Runtime {
@@ -24,6 +27,9 @@ impl Runtime {
             creates: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             observation_failed: AtomicBool::new(false),
+            cached: Mutex::new(None),
+            fresh_queries: AtomicUsize::new(0),
+            stale_info_reads: Mutex::new(0),
         })
     }
 
@@ -40,6 +46,20 @@ impl Runtime {
             service_url: "http://127.0.0.1:8888".into(),
             workload_uid: Some("retained-statefulset-uid".into()),
         }
+    }
+
+    fn cached_info(&self) -> ContainerBasicInfo {
+        if let Some(cached) = self.cached.lock().unwrap().clone() {
+            return cached;
+        }
+        let mut remaining = self.stale_info_reads.lock().unwrap();
+        if *remaining > 0 {
+            *remaining -= 1;
+            let mut stale = self.info();
+            stale.container_id = "externally-deleted-pod".into();
+            return stale;
+        }
+        self.info()
     }
 }
 
@@ -60,14 +80,14 @@ impl AgentContainerRuntime for Runtime {
         &self,
         _: &str,
     ) -> container_runtime_api::ContainerRuntimeResult<Option<ContainerBasicInfo>> {
-        Ok(Some(self.info()))
+        Ok(Some(self.cached_info()))
     }
     async fn get_container_info_by_identifier(
         &self,
         _: &str,
         _: &ServiceType,
     ) -> container_runtime_api::ContainerRuntimeResult<Option<ContainerBasicInfo>> {
-        Ok(Some(self.info()))
+        Ok(Some(self.cached_info()))
     }
     async fn find_container(
         &self,
@@ -81,7 +101,12 @@ impl AgentContainerRuntime for Runtime {
                 ),
             );
         }
-        let info = self.info();
+        let info = self
+            .cached
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| self.info());
         Ok(Some(RuntimeContainerInfo {
             container_id: info.container_id,
             container_name: info.container_name,
@@ -96,6 +121,15 @@ impl AgentContainerRuntime for Runtime {
             app_id: None,
             workload_uid: info.workload_uid,
         }))
+    }
+    async fn find_container_for_ensure(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> container_runtime_api::ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
+        self.fresh_queries.fetch_add(1, Ordering::SeqCst);
+        *self.cached.lock().unwrap() = None;
+        self.find_container(identifier, service_type).await
     }
     async fn stop_container(&self, _: &str) -> container_runtime_api::ContainerRuntimeResult<()> {
         self.stops.fetch_add(1, Ordering::SeqCst);
@@ -118,6 +152,38 @@ impl AgentContainerRuntime for Runtime {
     async fn health_check(&self) -> container_runtime_api::ContainerRuntimeResult<()> {
         Ok(())
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn ensure_inside_cache_ttl_uses_current_pod_before_dispatch() {
+    let runtime = Runtime::new(ContainerRuntimeStatus::Running);
+    let mut stale = runtime.info();
+    stale.container_id = "externally-deleted-pod".into();
+    *runtime.cached.lock().unwrap() = Some(stale);
+    let service: Arc<dyn ContainerRuntime> = runtime.clone();
+    let info = ComputerContainerManager::get_or_create_container_for_user_with_type(
+        &options("cache-replaced-pod"),
+        &service,
+    )
+    .await
+    .unwrap();
+    assert_eq!(info.container_id, "pending-pod-uid");
+    assert!(runtime.fresh_queries.load(Ordering::SeqCst) > 0);
+    assert_eq!(runtime.creates.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.stops.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn ensure_reobserves_intervening_address_snapshot_within_original_budget() {
+    let runtime = Runtime::new(ContainerRuntimeStatus::Running);
+    *runtime.stale_info_reads.lock().unwrap() = 1;
+    let service: Arc<dyn ContainerRuntime> = runtime.clone();
+    let info = ComputerContainerManager::get_or_create_container_for_user_with_type(&options("cache-address-race"), &service).await
+        .expect("a changed address snapshot must converge in the original ensure, without prompting the caller to replay");
+    assert_eq!(info.container_id, "pending-pod-uid");
+    assert!(runtime.fresh_queries.load(Ordering::SeqCst) >= 2);
+    assert_eq!(runtime.creates.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.stops.load(Ordering::SeqCst), 0);
 }
 #[async_trait]
 impl WorkspaceRuntime for Runtime {}

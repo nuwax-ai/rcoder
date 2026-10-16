@@ -66,6 +66,27 @@ pub(in crate::pg) async fn fetch_project_by_session(
         project.generation == session.project_generation,
         "Session belongs to a different project generation"
     );
+    read_project_registration(tx, project).await.map(Some)
+}
+
+pub(in crate::pg) async fn fetch_project_registration(
+    tx: &mut dyn Executor,
+    project_id: &str,
+) -> Result<Option<(ProjectRow, Option<ContainerRow>)>> {
+    let Some(project) = Project::filter_by_project_id(project_id)
+        .first()
+        .exec(tx)
+        .await?
+    else {
+        return Ok(None);
+    };
+    read_project_registration(tx, project).await.map(Some)
+}
+
+async fn read_project_registration(
+    tx: &mut dyn Executor,
+    project: Project,
+) -> Result<(ProjectRow, Option<ContainerRow>)> {
     let fields = Session::fields();
     let sessions = Session::filter(
         fields
@@ -95,7 +116,7 @@ pub(in crate::pg) async fn fetch_project_by_session(
         (None, None) => None,
         _ => anyhow::bail!("Incomplete project container identity"),
     };
-    Ok(Some((project, container)))
+    Ok((project, container))
 }
 
 pub(in crate::pg) async fn project_exists(tx: &mut dyn Executor, id: &str) -> Result<bool> {
@@ -104,6 +125,38 @@ pub(in crate::pg) async fn project_exists(tx: &mut dyn Executor, id: &str) -> Re
         .exec(tx)
         .await?
         .is_some())
+}
+
+pub(in crate::pg) async fn project_generation_is_retired(
+    tx: &mut dyn Executor,
+    project_id: &str,
+    generation: &str,
+) -> Result<bool> {
+    Ok(!toasty::sql::query(
+        "SELECT project_id FROM project_tombstones WHERE project_id=$1 AND generation=$2",
+    )
+    .bind(project_id)
+    .bind(generation)
+    .exec(tx)
+    .await?
+    .is_empty())
+}
+
+pub(in crate::pg) async fn container_generation_is_retired(
+    tx: &mut dyn Executor,
+    name: &str,
+    generation: &str,
+    physical_uid: &str,
+) -> Result<bool> {
+    Ok(!toasty::sql::query(
+        "SELECT container_name FROM container_tombstones WHERE container_name=$1 AND container_generation=$2 AND physical_uid=$3",
+    )
+    .bind(name)
+    .bind(generation)
+    .bind(physical_uid)
+    .exec(tx)
+    .await?
+    .is_empty())
 }
 pub(in crate::pg) async fn session_exists(tx: &mut dyn Executor, id: &str) -> Result<bool> {
     Ok(Session::filter_by_session_id(id)

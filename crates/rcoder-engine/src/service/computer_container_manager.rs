@@ -102,92 +102,89 @@ impl ComputerContainerManager {
             .map_err(|error| AppError::validation_error(&error.to_string()))?;
         let deadline = tokio::time::Instant::now() + creation::WAITER_BUDGET;
         let _creation = creation::acquire(&options.service_type, identifier, deadline).await?;
-        let observed = runtime
-            .find_container(identifier, &options.service_type)
+        let mut waiting_existing = false;
+        loop {
+            let observed = tokio::time::timeout_at(
+                deadline,
+                runtime.find_container_for_ensure(identifier, &options.service_type),
+            )
             .await
+            .map_err(|_| creation::not_ready("Container startup observation timed out"))?
             .map_err(|error| {
                 runtime_app_error(&error, "container.query", RuntimeErrorContext::ReadOnly)
             })?;
-
-        match observed {
-            Some(observed) if observed.status == ContainerRuntimeStatus::Running => {
-                return Self::running_info(
-                    runtime,
-                    identifier,
-                    options.service_type,
-                    &observed.container_id,
-                )
-                .await
-                .map(|info| (info, false));
-            }
-            Some(observed) if observed.status == ContainerRuntimeStatus::Pending => {
-                // ContainerCreating/Restarting is live work, including when a
-                // different RCoder replica submitted it. Neither a marker age
-                // nor a waiter timeout authorizes deleting that workload.
-                loop {
-                    tokio::time::timeout_at(
+            match observed {
+                Some(observed) if observed.status == ContainerRuntimeStatus::Running => {
+                    let info = tokio::time::timeout_at(
                         deadline,
-                        tokio::time::sleep(std::time::Duration::from_millis(250)),
+                        Self::running_info(
+                            runtime,
+                            identifier,
+                            options.service_type,
+                            &observed.container_id,
+                        ),
                     )
                     .await
-                    .map_err(|_| creation::not_ready("Existing container is still starting"))?;
-                    let current = tokio::time::timeout_at(
-                        deadline,
-                        runtime.find_container(identifier, &options.service_type),
-                    )
-                    .await
-                    .map_err(|_| creation::not_ready("Container startup observation timed out"))?
-                    .map_err(|error| {
-                        runtime_app_error(&error, "container.status", RuntimeErrorContext::ReadOnly)
-                    })?;
-                    match current {
-                        Some(current) if current.status == ContainerRuntimeStatus::Running => {
-                            return Self::running_info(
-                                runtime,
-                                identifier,
-                                options.service_type,
-                                &current.container_id,
-                            )
-                            .await
-                            .map(|info| (info, false));
-                        }
-                        Some(current) if current.status == ContainerRuntimeStatus::Pending => {}
-                        _ => {
-                            return Err(creation::not_ready(
-                                "Container startup changed before readiness; retry to observe its current state",
-                            ));
-                        }
+                    .map_err(|_| {
+                        creation::not_ready("Container address observation timed out")
+                    })??;
+                    if let Some(info) = info {
+                        return Ok((info, false));
                     }
                 }
+                Some(observed) if observed.status == ContainerRuntimeStatus::Pending => {}
+                Some(observed)
+                    if matches!(
+                        observed.status,
+                        ContainerRuntimeStatus::Succeeded | ContainerRuntimeStatus::Failed
+                    ) =>
+                {
+                    if waiting_existing {
+                        return Err(creation::not_ready(
+                            "Container startup changed before readiness; retry to observe its current state",
+                        ));
+                    }
+                    runtime
+                        .stop_agent_container_if_matches(
+                            identifier,
+                            &options.service_type,
+                            &observed.container_id,
+                        )
+                        .await
+                        .map_err(|error| {
+                            runtime_app_error(
+                                &error,
+                                "container.stop",
+                                RuntimeErrorContext::Mutation,
+                            )
+                        })?;
+                    return Self::create_container_for_user(options, runtime)
+                        .await
+                        .map(|info| (info, true));
+                }
+                Some(_) => {
+                    return Err(creation::not_ready(
+                        "Container state is unknown; retained until its execution state can be observed",
+                    ));
+                }
+                None if !waiting_existing => {
+                    return Self::create_container_for_user(options, runtime)
+                        .await
+                        .map(|info| (info, true));
+                }
+                None => {}
             }
-            Some(observed)
-                if matches!(
-                    observed.status,
-                    ContainerRuntimeStatus::Succeeded | ContainerRuntimeStatus::Failed
-                ) =>
-            {
-                runtime
-                    .stop_agent_container_if_matches(
-                        identifier,
-                        &options.service_type,
-                        &observed.container_id,
-                    )
-                    .await
-                    .map_err(|error| {
-                        runtime_app_error(&error, "container.stop", RuntimeErrorContext::Mutation)
-                    })?;
-            }
-            Some(_) => {
-                return Err(creation::not_ready(
-                    "Container state is unknown; retained until its execution state can be observed",
-                ));
-            }
-            None => {}
-        }
-
-        Self::create_container_for_user(options, runtime)
+            // A fresh discovery can race the following address projection. Stay
+            // in this admitted request and its original budget, never dispatch
+            // the stale UID or require a new chat prompt to make progress.
+            waiting_existing = true;
+            tokio::time::timeout_at(
+                deadline,
+                tokio::time::sleep(std::time::Duration::from_millis(250)),
+            )
             .await
-            .map(|info| (info, true))
+            .map_err(|_| creation::not_ready("Existing container is still starting"))?;
+        }
     }
 
     async fn running_info(
@@ -195,23 +192,18 @@ impl ComputerContainerManager {
         identifier: &str,
         service_type: ServiceType,
         observed_container_id: &str,
-    ) -> Result<ContainerBasicInfo, AppError> {
+    ) -> Result<Option<ContainerBasicInfo>, AppError> {
         let info = runtime
             .get_container_info_by_identifier(identifier, &service_type)
             .await
             .map_err(|error| {
                 runtime_app_error(&error, "container.query", RuntimeErrorContext::ReadOnly)
-            })?
-            .ok_or_else(|| creation::not_ready("Container information is not available yet"))?;
-        if info.container_id != observed_container_id
-            || !docker_manager::types::ContainerStatus::from(info.status.clone()).is_running()
-            || info.container_ip.trim().is_empty()
-        {
-            return Err(creation::not_ready(
-                "Container changed or its address is not available yet",
-            ));
-        }
-        Ok(info)
+            })?;
+        Ok(info.filter(|info| {
+            info.container_id == observed_container_id
+                && docker_manager::types::ContainerStatus::from(info.status.clone()).is_running()
+                && !info.container_ip.trim().is_empty()
+        }))
     }
 
     /// 根据 user_id 或 pod_id 获取或创建容器（向后兼容，默认使用 ComputerAgentRunner）

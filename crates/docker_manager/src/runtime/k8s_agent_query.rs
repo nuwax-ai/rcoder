@@ -169,6 +169,16 @@ impl KubernetesRuntime {
             return Ok(Some(info));
         }
 
+        self.find_container_uncached(identifier, service_type).await
+    }
+
+    /// Execution admission reads the API server even while ordinary query TTL
+    /// entries remain usable. Reuse the resolver and its Pending/Unknown rules.
+    pub(crate) async fn find_container_uncached(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
         // 契约四分层解析：label 发现 + 身份核验 + STS 规范名兜底 + 缺席证据
         //（细节见 k8s_resolution）。冲突/未知如实上报；仍无候选时保留旧标签
         // 兼容查询（平滑迁移，生产 UserApp Deployment 无这些标签，无撞车面）。

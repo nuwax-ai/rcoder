@@ -397,6 +397,19 @@ impl ProjectStoreBackend {
         }
     }
 
+    /// Refresh one registration from its authoritative store before verifying a
+    /// runtime transition. This does not adopt a physical container or relax CAS.
+    pub async fn refresh_project_registration(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Option<Arc<ProjectAndContainerInfo>>> {
+        match self {
+            Self::Memory(inner) => Ok(inner.get(project_id)),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => store.refresh_project_registration(project_id).await,
+        }
+    }
+
     /// PG 后端引用（P2：sync/leader 等后端特有任务的装配入口；Memory 为 None）。
     /// 返回 &Arc：调用方可 clone 独立句柄传给后台任务
     #[cfg(feature = "pg")]

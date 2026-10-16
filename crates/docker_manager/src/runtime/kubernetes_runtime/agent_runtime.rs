@@ -529,6 +529,23 @@ impl AgentContainerRuntime for KubernetesRuntime {
         self.find_container_inner(identifier, service_type).await
     }
 
+    async fn find_container_for_ensure(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
+        if matches!(
+            service_type,
+            ServiceType::WebAgentRunner
+                | ServiceType::ComputerAgentRunner
+                | ServiceType::ComputerNormalProject
+        ) {
+            self.find_container_uncached(identifier, service_type).await
+        } else {
+            self.find_container_inner(identifier, service_type).await
+        }
+    }
+
     async fn stop_container(&self, project_id: &str) -> ContainerRuntimeResult<()> {
         // First check if pod exists with either service type to avoid unnecessary 404
         // Try both service types - one of them should have the pod

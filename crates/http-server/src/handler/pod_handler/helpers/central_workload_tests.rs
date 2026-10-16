@@ -133,7 +133,13 @@ fn project(
     info
 }
 
-async fn new_project_replacement(first_user: &str, second_user: &str, pod: Option<&str>) {
+async fn project_replacement(
+    first_user: &str,
+    second_user: &str,
+    pod: Option<&str>,
+    same_workload: bool,
+    second_exists: bool,
+) {
     use crate::app_state::RegistrationMetadata;
     let fixture = Fixture::new().await;
     let identifier = pod.unwrap_or(first_user);
@@ -149,11 +155,23 @@ async fn new_project_replacement(first_user: &str, second_user: &str, pod: Optio
             "a-historical-session",
         )
         .unwrap();
+    if second_exists {
+        fixture
+            .state
+            .insert_project_with_session(
+                "canonical-b".into(),
+                Arc::new(project("canonical-b", second_user, pod, &original)),
+                "b-historical-session",
+            )
+            .unwrap();
+    }
     let mut dispatched_old_a = (*fixture.state.get_project("canonical-a").unwrap()).clone();
     dispatched_old_a.set_container(Some(original.clone()));
     let mut fresh = original.clone();
     fresh.container_id = "replacement-pod".into();
-    fresh.workload_uid = Some("replacement-controller".into());
+    if !same_workload {
+        fresh.workload_uid = Some("replacement-controller".into());
+    }
     fresh.container_ip = "127.0.0.2".into();
     fresh.service_url = "http://127.0.0.2:50051".into();
     let runtime = Arc::new(ReplacementRuntime {
@@ -165,7 +183,7 @@ async fn new_project_replacement(first_user: &str, second_user: &str, pod: Optio
     let mut state = (*fixture.state).clone();
     state.runtime = runtime.clone();
     let state = Arc::new(state);
-    assert!(state.get_project("canonical-b").is_none());
+    assert_eq!(state.get_project("canonical-b").is_some(), second_exists);
     let options = ContainerCreateOptions {
         user_id: second_user.into(),
         project_id: "canonical-b".into(),
@@ -253,10 +271,34 @@ async fn new_project_replacement(first_user: &str, second_user: &str, pod: Optio
 
 #[tokio::test]
 async fn new_project_recovers_same_user_canonical_replacement_and_fences_old_completion() {
-    new_project_replacement("same-user", "same-user", None).await;
+    project_replacement("same-user", "same-user", None, false, false).await;
 }
 
 #[tokio::test]
 async fn new_project_in_explicit_shared_pod_keeps_distinct_users_while_recovering_workload() {
-    new_project_replacement("shared-user-a", "shared-user-b", Some("shared-tenant-pod")).await;
+    project_replacement(
+        "shared-user-a",
+        "shared-user-b",
+        Some("shared-tenant-pod"),
+        false,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn same_statefulset_recreated_pod_existing_project_recovers_shared_registration() {
+    project_replacement("same-user", "same-user", None, true, true).await;
+}
+
+#[tokio::test]
+async fn same_statefulset_recreated_pod_new_shared_user_project_recovers_canonical_registration() {
+    project_replacement(
+        "shared-user-a",
+        "shared-user-b",
+        Some("shared-tenant-pod"),
+        true,
+        false,
+    )
+    .await;
 }

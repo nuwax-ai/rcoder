@@ -523,6 +523,17 @@ pub trait AgentContainerRuntime: Send + Sync {
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>>;
 
+    /// Observe compute for execution admission, where a cached physical UID
+    /// cannot authorize dispatch. Backends with a read cache override this;
+    /// ordinary query callers retain `find_container` and its existing policy.
+    async fn find_container_for_ensure(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
+        self.find_container(identifier, service_type).await
+    }
+
     /// Stop and remove container
     async fn stop_container(&self, project_id: &str) -> ContainerRuntimeResult<()>;
 

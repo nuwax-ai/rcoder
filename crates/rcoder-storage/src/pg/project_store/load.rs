@@ -158,7 +158,128 @@ fn parse_service_type(s: Option<&str>) -> Option<ServiceType> {
 
 // ========== SSE 回源直查（miss → PG 单查 → hydrate 镜像） ==========
 
+#[derive(Clone, Copy)]
+enum ProjectRead<'a> {
+    Session(&'a str),
+    Registration { retired_generation: Option<&'a str> },
+}
+
+fn same_registration_scope(
+    current: &ProjectAndContainerInfo,
+    persisted: &ProjectAndContainerInfo,
+) -> bool {
+    current.project_id() == persisted.project_id()
+        && current.user_id() == persisted.user_id()
+        && current.pod_id() == persisted.pod_id()
+        && current.tenant_id() == persisted.tenant_id()
+        && current.space_id() == persisted.space_id()
+        && current.isolation_type() == persisted.isolation_type()
+        && current
+            .service_type()
+            .zip(persisted.service_type())
+            .is_some_and(|(left, right)| left.same_container_family(right))
+}
+
+fn same_admitted_registration_payload(
+    current: &ProjectAndContainerInfo,
+    persisted: &ProjectAndContainerInfo,
+) -> anyhow::Result<bool> {
+    Ok(same_registration_scope(current, persisted)
+        && current.request_id() == persisted.request_id()
+        && current.latest_session() == persisted.latest_session()
+        && current.persistence_identity().sessions == persisted.persistence_identity().sessions
+        && current
+            .persistence_identity()
+            .retired_sessions
+            .iter()
+            .all(|(sid, generation)| {
+                persisted.persistence_identity().sessions.get(sid) != Some(generation)
+            })
+        && serde_json::to_value((current.model_provider(), current.status()))?
+            == serde_json::to_value((persisted.model_provider(), persisted.status()))?)
+}
+
 impl crate::pg::PgStore {
+    /// A prior ordinary same-workload update may leave a shared project with
+    /// refreshed physical hints and an older persistence identity. Read its real
+    /// SQL registration, including a detached binding, instead of inventing an
+    /// old Pod snapshot or waiting for the background mirror sync.
+    pub async fn refresh_project_registration(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Option<Arc<ProjectAndContainerInfo>>> {
+        let (baseline, baseline_containers) = {
+            let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                self.inner
+                    .get(project_id)
+                    .map(|info| HashMap::from([(project_id.to_owned(), info)]))
+                    .unwrap_or_default(),
+                self.container_registration
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone(),
+            )
+        };
+        let id = project_id.to_owned();
+        let previous_registration = baseline.get(project_id).cloned();
+        let Some((fetched, retired_generation)) =
+            super::database::read(&self.database, move |tx| {
+                Box::pin(async move {
+                    let Some(fetched) = repo::fetch_project_registration(tx, &id).await? else {
+                        return Ok(None);
+                    };
+                    let retired_generation = if let Some(previous) = previous_registration
+                        && previous.persistence_identity().generation != fetched.0.generation
+                    {
+                        let generation = &previous.persistence_identity().generation;
+                        let retired_project =
+                            repo::project_generation_is_retired(tx, &id, generation).await?;
+                        let retired_container = match (
+                            previous.persistence_identity().container.as_ref(),
+                            previous.container_info(),
+                            fetched.1.as_ref(),
+                        ) {
+                            (Some(identity), Some(old), Some(target)) => {
+                                if let Some(physical_uid) = identity.physical_uid.as_deref() {
+                                    old.container_name == target.container_name
+                                        && target.logical_id == previous.container_key()
+                                        && repo::container_generation_is_retired(
+                                            tx,
+                                            &old.container_name,
+                                            &identity.generation,
+                                            physical_uid,
+                                        )
+                                        .await?
+                                } else {
+                                    false
+                                }
+                            }
+                            (None, None, _) => true,
+                            _ => false,
+                        };
+                        (retired_project && retired_container).then(|| generation.clone())
+                    } else {
+                        None
+                    };
+                    Ok(Some((fetched, retired_generation)))
+                })
+            })
+            .await
+            .context("Refresh persistent project registration")?
+        else {
+            return Ok(None);
+        };
+        self.hydrate_project_read(
+            ProjectRead::Registration {
+                retired_generation: retired_generation.as_deref(),
+            },
+            fetched,
+            &baseline,
+            &baseline_containers,
+        )
+    }
+
     pub async fn is_session_registration_committed(
         &self,
         expected: &ProjectAndContainerInfo,
@@ -272,6 +393,44 @@ impl crate::pg::PgStore {
             shared_types::persistence::ContainerPersistenceIdentity,
         >,
     ) -> anyhow::Result<Option<Arc<ProjectAndContainerInfo>>> {
+        self.hydrate_project_read(
+            ProjectRead::Session(fetched_by),
+            (project_row, container_row),
+            baseline,
+            baseline_containers,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn hydrate_registration_fetched(
+        &self,
+        fetched: (ProjectRow, Option<ContainerRow>),
+        baseline: &HashMap<String, Arc<ProjectAndContainerInfo>>,
+        baseline_containers: &HashMap<
+            String,
+            shared_types::persistence::ContainerPersistenceIdentity,
+        >,
+    ) -> anyhow::Result<Option<Arc<ProjectAndContainerInfo>>> {
+        self.hydrate_project_read(
+            ProjectRead::Registration {
+                retired_generation: None,
+            },
+            fetched,
+            baseline,
+            baseline_containers,
+        )
+    }
+
+    fn hydrate_project_read(
+        &self,
+        read: ProjectRead<'_>,
+        (project_row, container_row): (ProjectRow, Option<ContainerRow>),
+        baseline: &HashMap<String, Arc<ProjectAndContainerInfo>>,
+        baseline_containers: &HashMap<
+            String,
+            shared_types::persistence::ContainerPersistenceIdentity,
+        >,
+    ) -> anyhow::Result<Option<Arc<ProjectAndContainerInfo>>> {
         let registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
         let current = self.inner.get(&project_row.project_id);
         let unchanged = match (baseline.get(&project_row.project_id), current.as_ref()) {
@@ -285,16 +444,23 @@ impl crate::pg::PgStore {
             container_by_name.insert(name, row);
         }
         // Corrupt or mismatched persistence is an error, never a routable placeholder.
-        let info = hydrate_project(&project_row, &container_by_name)?;
-        anyhow::ensure!(
-            info.sessions().contains(fetched_by),
-            "Fetched session identity missing from snapshot"
-        );
-        let fetched_generation = info.persistence_identity().sessions.get(fetched_by);
+        let mut info = hydrate_project(&project_row, &container_by_name)?;
+        if let ProjectRead::Session(session_id) = read {
+            anyhow::ensure!(
+                info.sessions().contains(session_id),
+                "Fetched session identity missing from snapshot"
+            );
+        }
         // A local accepted retirement wins over an older SQL response, even
         // before its immutable delete reaches PostgreSQL.
         if registration.get(&project_row.project_id) == Some(&project_row.generation) {
             return Ok(None);
+        }
+        if matches!(read, ProjectRead::Registration { .. }) && !unchanged {
+            // An admitted local clear, retirement or metadata update wins over
+            // a delayed SQL read. The caller can continue from that winning
+            // view; a refresh must never undo accepted in-process intent.
+            return Ok(current);
         }
         if let Some(existing) = &current {
             let same_generation =
@@ -302,17 +468,20 @@ impl crate::pg::PgStore {
             if !same_generation && !unchanged {
                 return Ok(None);
             }
-            if same_generation
+            if let ProjectRead::Session(session_id) = read
+                && same_generation
                 && (existing
                     .persistence_identity()
                     .retired_sessions
-                    .get(fetched_by)
-                    == fetched_generation
+                    .get(session_id)
+                    == info.persistence_identity().sessions.get(session_id)
                     || existing
                         .persistence_identity()
                         .sessions
-                        .get(fetched_by)
-                        .is_some_and(|generation| Some(generation) != fetched_generation))
+                        .get(session_id)
+                        .is_some_and(|generation| {
+                            Some(generation) != info.persistence_identity().sessions.get(session_id)
+                        }))
             {
                 return Ok(None);
             }
@@ -346,11 +515,57 @@ impl crate::pg::PgStore {
                 }
             }
         }
+        let pending = self.pending_ops.load(std::sync::atomic::Ordering::Acquire) != 0;
+        let registration_pending_safe = if let ProjectRead::Registration { retired_generation } =
+            read
+        {
+            match current.as_ref() {
+                None => true,
+                Some(current)
+                    if current.persistence_identity().generation == project_row.generation =>
+                {
+                    current.persistence_identity().revision <= project_row.row_revision
+                        && same_admitted_registration_payload(current, &info)?
+                }
+                Some(current) => {
+                    // No cross-generation revision comparison: only a retired
+                    // local project and its known physical successor may be
+                    // admitted while unrelated work is pending.
+                    retired_generation == Some(current.persistence_identity().generation.as_str())
+                        && same_registration_scope(current, &info)
+                        && current
+                            .persistence_identity()
+                            .container
+                            .as_ref()
+                            .is_some_and(|old| {
+                                container_by_name.iter().any(|(name, row)| {
+                                    containers.get(name).is_some_and(|target| {
+                                        target.generation == row.container_generation
+                                            && target.physical_uid == row.container_id
+                                            && row.container_generation != old.generation
+                                    })
+                                })
+                            })
+                }
+            }
+        } else {
+            false
+        };
+        if pending && matches!(read, ProjectRead::Registration { .. }) && !registration_pending_safe
+        {
+            return Ok(current);
+        }
+        let revision_allows_publish = current.as_ref().is_none_or(|current| match read {
+            ProjectRead::Registration { .. }
+                if current.persistence_identity().generation != project_row.generation =>
+            {
+                registration_pending_safe
+            }
+            _ => current.persistence_identity().revision <= project_row.row_revision,
+        });
         let can_publish = unchanged
-            && self.pending_ops.load(std::sync::atomic::Ordering::Acquire) == 0
-            && current.as_ref().is_none_or(|current| {
-                current.persistence_identity().revision <= project_row.row_revision
-            })
+            && (!pending || registration_pending_safe)
+            && revision_allows_publish
             && container_by_name.iter().all(|(name, row)| {
                 containers.get(name).is_none_or(|current| {
                     current.generation == row.container_generation
@@ -361,6 +576,27 @@ impl crate::pg::PgStore {
                             .is_none_or(|uid| row.container_id.as_ref() == Some(uid))
                 })
             });
+        if matches!(read, ProjectRead::Registration { .. }) && !can_publish {
+            // A registration caller subsequently performs a guarded write. Do
+            // not return a projection that was unsafe to admit over its local
+            // source; continue from the winning local view instead.
+            return Ok(current);
+        }
+        if can_publish
+            && matches!(read, ProjectRead::Registration { .. })
+            && let Some(current) = current.as_ref()
+            && current.persistence_identity().generation == project_row.generation
+        {
+            let mut identity = info.persistence_identity().clone();
+            identity
+                .retired_sessions
+                .extend(current.persistence_identity().retired_sessions.clone());
+            info.set_persistence_identity(identity);
+            info.set_timestamps(
+                info.created_at(),
+                current.last_activity().max(info.last_activity()),
+            );
+        }
         let info = Arc::new(info);
         if can_publish {
             self.inner.insert_with_session(

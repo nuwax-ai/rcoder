@@ -13,7 +13,7 @@ use container_runtime_api::{
 };
 use shared_types::{ContainerBasicInfo, ProjectAndContainerInfo, ServiceType};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use tower::ServiceExt as _;
@@ -23,6 +23,17 @@ const PROJECT: &str = "completion-project";
 struct Runtime {
     basic: ContainerBasicInfo,
     writes: AtomicUsize,
+    cached: Mutex<Option<ContainerBasicInfo>>,
+    fresh_reads: AtomicUsize,
+}
+impl Runtime {
+    fn observed(&self) -> ContainerBasicInfo {
+        self.cached
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| self.basic.clone())
+    }
 }
 #[async_trait]
 impl AgentContainerRuntime for Runtime {
@@ -41,7 +52,7 @@ impl AgentContainerRuntime for Runtime {
         &self,
         _: &str,
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
-        Ok(Some(self.basic.clone()))
+        Ok(Some(self.observed()))
     }
     async fn get_container_info_by_identifier(
         &self,
@@ -49,7 +60,7 @@ impl AgentContainerRuntime for Runtime {
         _: &ServiceType,
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
         assert_eq!(identifier, USER);
-        Ok(Some(self.basic.clone()))
+        Ok(Some(self.observed()))
     }
     async fn find_container(
         &self,
@@ -61,20 +72,30 @@ impl AgentContainerRuntime for Runtime {
             service_type,
             ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject
         ));
+        let observed = self.observed();
         Ok(Some(RuntimeContainerInfo {
-            container_id: self.basic.container_id.clone(),
-            container_name: self.basic.container_name.clone(),
-            container_ip: self.basic.container_ip.clone(),
+            container_id: observed.container_id.clone(),
+            container_name: observed.container_name.clone(),
+            container_ip: observed.container_ip.clone(),
             status: ContainerRuntimeStatus::Running,
-            created_at: self.basic.created_at,
+            created_at: observed.created_at,
             env_vars: None,
             service_type: Some(*service_type),
             project_id: None,
             user_id: Some(USER.into()),
             pod_id: None,
             app_id: None,
-            workload_uid: self.basic.workload_uid.clone(),
+            workload_uid: observed.workload_uid.clone(),
         }))
+    }
+    async fn find_container_for_ensure(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
+        self.fresh_reads.fetch_add(1, Ordering::SeqCst);
+        *self.cached.lock().unwrap() = None;
+        self.find_container(identifier, service_type).await
     }
     async fn stop_container(&self, _: &str) -> ContainerRuntimeResult<()> {
         self.writes.fetch_add(1, Ordering::SeqCst);
@@ -107,6 +128,8 @@ fn state(fixture: &Fixture) -> (Arc<crate::app_state::AppState>, Arc<Runtime>) {
     let runtime = Arc::new(Runtime {
         basic: super::project().container_info().unwrap(),
         writes: AtomicUsize::new(0),
+        cached: Mutex::new(None),
+        fresh_reads: AtomicUsize::new(0),
     });
     #[cfg(feature = "deploy-host")]
     shared_types::published::register_direct(
@@ -152,6 +175,45 @@ fn chats(fixture: &Fixture) -> usize {
         .iter()
         .filter(|call| matches!(call, AgentCall::Chat(_)))
         .count()
+}
+
+#[tokio::test]
+async fn http_chat_inside_cache_ttl_dispatches_once_with_current_physical_pod() {
+    let fixture = Fixture::new().await;
+    let (state, runtime) = state(&fixture);
+    let mut dead = runtime.basic.clone();
+    dead.container_id = "externally-deleted-pod".into();
+    *runtime.cached.lock().unwrap() = Some(dead);
+    let dispatched = Arc::new(Mutex::new(Vec::new()));
+    *fixture.agent.after_chat.lock().unwrap() = Some(Box::new({
+        let state = state.clone();
+        let dispatched = dispatched.clone();
+        move || {
+            dispatched.lock().unwrap().push(
+                state
+                    .get_project(PROJECT)
+                    .unwrap()
+                    .container_info()
+                    .unwrap()
+                    .container_id,
+            );
+        }
+    }));
+    let (status, response) = chat(router(state.clone())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(
+        *dispatched.lock().unwrap(),
+        vec![runtime.basic.container_id.clone()],
+        "a cached dead Pod identity must never reach the actual tonic chat dispatch"
+    );
+    assert!(runtime.fresh_reads.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        chats(&fixture),
+        1,
+        "one prompt must be dispatched exactly once"
+    );
+    assert_eq!(runtime.writes.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

@@ -46,7 +46,7 @@ pub(crate) fn validate_agent_replacement(
                         .workload_uid
                         .as_ref()
                         .is_some_and(|uid| !uid.is_empty())
-                    && verified.workload_uid != evidence.replacement.workload_uid
+                    && evidence.change().is_some()
                     && expected
                         .persistence_identity()
                         .container

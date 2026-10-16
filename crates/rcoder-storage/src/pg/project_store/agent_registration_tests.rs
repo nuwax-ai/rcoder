@@ -9,6 +9,12 @@ use shared_types::{
 };
 use std::{sync::Arc, time::Duration};
 
+#[path = "agent_registration_tests/same_workload_pod.rs"]
+mod same_workload_pod;
+
+#[path = "agent_registration_tests/registration_refresh.rs"]
+mod registration_refresh;
+
 fn basic(owner: &str) -> ContainerBasicInfo {
     ContainerBasicInfo {
         container_id: format!("old-pod-{owner}"),

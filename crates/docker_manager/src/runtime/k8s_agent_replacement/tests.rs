@@ -21,6 +21,12 @@ impl Drop for PublishedPort {
 #[derive(Clone, Copy)]
 enum Case {
     Owned,
+    PodRecreated,
+    CachedAdmission,
+    PodRecreatedOldPod,
+    PodRecreatedOtherOwnedPod,
+    PodRecreatedForeign,
+    PodRecreatedClaimReplaced,
     OldPod,
     OldController,
     Foreign,
@@ -48,6 +54,17 @@ enum Case {
 }
 
 impl Case {
+    fn same_workload(self) -> bool {
+        matches!(
+            self,
+            Self::PodRecreated
+                | Self::PodRecreatedOldPod
+                | Self::PodRecreatedOtherOwnedPod
+                | Self::PodRecreatedForeign
+                | Self::PodRecreatedClaimReplaced
+        )
+    }
+
     fn cross_user_shared(self) -> bool {
         matches!(
             self,
@@ -175,7 +192,7 @@ async fn run(case: Case) -> (Result<VerifiedAgentReplacement>, Vec<String>) {
         "status":{"phase":"Bound"}
     });
     match case {
-        Case::Foreign | Case::DetachedForeign => {
+        Case::Foreign | Case::DetachedForeign | Case::PodRecreatedForeign => {
             controller["metadata"]["labels"] = serde_json::json!({});
         }
         Case::Workspace => {
@@ -248,7 +265,14 @@ async fn run(case: Case) -> (Result<VerifiedAgentReplacement>, Vec<String>) {
         status: "running".into(),
         created_at: chrono::Utc::now(),
         service_url: "http://old-address".into(),
-        workload_uid: Some("old-workload".into()),
+        workload_uid: Some(
+            if case.same_workload() {
+                "new-workload"
+            } else {
+                "old-workload"
+            }
+            .into(),
+        ),
     };
     let replacement = ContainerBasicInfo {
         container_id: "new-pod".into(),
@@ -261,7 +285,7 @@ async fn run(case: Case) -> (Result<VerifiedAgentReplacement>, Vec<String>) {
     cached.container_id = previous.container_id.clone();
     cached.workload_uid = previous.workload_uid.clone();
     runtime.pod_cache.write().await.insert(
-        identifier,
+        identifier.clone(),
         CachedPod {
             info: cached,
             service_type: ServiceType::ComputerAgentRunner,
@@ -302,12 +326,25 @@ async fn run(case: Case) -> (Result<VerifiedAgentReplacement>, Vec<String>) {
                 serde_json::json!({"apiVersion":"apps/v1","kind":"StatefulSetList","metadata":{},"items":items})
             } else if path.ends_with("/pods") {
                 let mut items = vec![pod.clone()];
-                if matches!(case, Case::OldPod) {
+                if matches!(
+                    case,
+                    Case::OldPod | Case::PodRecreatedOldPod | Case::PodRecreatedOtherOwnedPod
+                ) {
                     let mut old = pod.clone();
                     old["metadata"]["name"] = "orphan-without-labels".into();
-                    old["metadata"]["uid"] = "old-orphan-pod".into();
+                    old["metadata"]["uid"] = if matches!(case, Case::PodRecreatedOldPod) {
+                        "old-pod"
+                    } else {
+                        "old-orphan-pod"
+                    }
+                    .into();
                     old["metadata"]["labels"] = serde_json::json!({});
-                    old["metadata"]["ownerReferences"][0]["uid"] = "old-workload".into();
+                    old["metadata"]["ownerReferences"][0]["uid"] = if case.same_workload() {
+                        "new-workload"
+                    } else {
+                        "old-workload"
+                    }
+                    .into();
                     items.push(old);
                 }
                 if matches!(case, Case::DetachedMultiple) {
@@ -342,7 +379,9 @@ async fn run(case: Case) -> (Result<VerifiedAgentReplacement>, Vec<String>) {
             } else if path.contains("/persistentvolumeclaims/") {
                 claim_reads += 1;
                 let mut result = claim.clone();
-                if claim_reads > 1 && matches!(case, Case::ClaimReplaced) {
+                if claim_reads > 1
+                    && matches!(case, Case::ClaimReplaced | Case::PodRecreatedClaimReplaced)
+                {
                     result["metadata"]["uid"] = "another-pvc".into();
                 }
                 if matches!(case, Case::ApiFailure) {
@@ -357,27 +396,41 @@ async fn run(case: Case) -> (Result<VerifiedAgentReplacement>, Vec<String>) {
             stream.write_all(format!("HTTP/1.1 {status} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
         }
     });
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        runtime.verify_agent_replacement(
-            &request_params,
-            if matches!(
-                case,
-                Case::Detached | Case::DetachedForeign | Case::DetachedMultiple
-            ) {
-                None
-            } else {
-                Some(&previous)
-            },
-            &replacement,
-        ),
-    )
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let admitted = if matches!(case, Case::CachedAdmission) {
+            let current = runtime
+                .find_container_for_ensure(&identifier, &params.service_type)
+                .await?
+                .ok_or_else(|| conflict("Current Agent was absent during admission"))?;
+            runtime
+                .build_container_basic_info(&identifier, &current)
+                .await?
+        } else {
+            replacement.clone()
+        };
+        runtime
+            .verify_agent_replacement(
+                &request_params,
+                if matches!(
+                    case,
+                    Case::Detached | Case::DetachedForeign | Case::DetachedMultiple
+                ) {
+                    None
+                } else {
+                    Some(&previous)
+                },
+                &admitted,
+            )
+            .await
+    })
     .await
     .unwrap();
     server.abort();
     drop(server.await);
     let requests = requests.lock().unwrap().clone();
-    assert!(!requests.is_empty());
+    if !case.same_workload() && !matches!(case, Case::CachedAdmission) {
+        assert!(!requests.is_empty());
+    }
     assert!(requests.iter().all(|request| request.starts_with("GET ")));
     (result, requests)
 }
@@ -484,4 +537,51 @@ async fn agent_replacement_detached_project_attaches_owned_current_instance_with
     for case in [Case::DetachedForeign, Case::DetachedMultiple] {
         assert!(matches!(run(case).await.0, Err(Error::Conflict(_))));
     }
+}
+
+#[tokio::test]
+async fn agent_replacement_same_statefulset_recreated_pod_preserves_controller_and_workspace() {
+    let (result, requests) = run(Case::PodRecreated).await;
+    let proof =
+        result.expect("a recreated Pod under the retained controller must recover registration");
+    let previous = proof.previous.unwrap();
+    assert_eq!(previous.workload_uid, proof.replacement.workload_uid);
+    assert_ne!(previous.container_id, proof.replacement.container_id);
+    assert_eq!(proof.workspace.claim_uid, "retained-pvc");
+    assert_eq!(proof.replacement.container_ip, "10.0.0.9");
+    assert_eq!(requests.len(), 7);
+    assert!(requests.iter().all(|request| request.starts_with("GET ")));
+}
+
+#[tokio::test]
+async fn agent_replacement_same_statefulset_rejects_live_old_or_other_owned_pod_and_foreign_or_changed_pvc()
+ {
+    for case in [
+        Case::PodRecreatedOldPod,
+        Case::PodRecreatedOtherOwnedPod,
+        Case::PodRecreatedForeign,
+        Case::PodRecreatedClaimReplaced,
+    ] {
+        let (result, _) = run(case).await;
+        assert!(matches!(result, Err(Error::Conflict(_))), "{result:?}");
+    }
+}
+
+#[tokio::test]
+async fn agent_ensure_inside_cache_ttl_observes_recreated_pod_from_real_api_protocol() {
+    let (result, requests) = run(Case::CachedAdmission).await;
+    let proof = result.expect(
+        "cached old physical UID must not bypass fresh admission after external Pod replacement",
+    );
+    assert_eq!(proof.replacement.container_id, "new-pod");
+    assert_eq!(proof.replacement.container_ip, "10.0.0.9");
+    assert_ne!(
+        proof.previous.as_ref().unwrap().workload_uid,
+        proof.replacement.workload_uid
+    );
+    assert!(
+        requests.len() > 7,
+        "admission must observe the current API before verification"
+    );
+    assert!(requests.iter().all(|request| request.starts_with("GET ")));
 }

@@ -7,8 +7,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail, ensure};
 use container_runtime_api::ContainerCreateParams;
 use shared_types::{
-    AppError, ContainerBasicInfo, ErrorDetail, ProjectAndContainerInfo, ProjectStore as _,
-    persistence::PersistenceWriteOutcome,
+    AgentRegistrationChange, AppError, ContainerBasicInfo, ErrorDetail, ProjectAndContainerInfo,
+    ProjectStore as _, persistence::PersistenceWriteOutcome,
 };
 
 use super::AppState;
@@ -33,14 +33,26 @@ impl AppState {
             .container_info()
             .context("Computer registration has no observed container")?;
 
-        if let Some(previous) = self.projects.get(project_id) {
-            ensure_request_owner(&previous, &incoming)?;
+        let initial = self.projects.get(project_id);
+        if let Some(previous) = initial.as_ref() {
+            ensure_request_owner(previous, &incoming)?;
+        }
+        let (current_registration, refreshed) = self
+            .refresh_inconsistent_computer_registration(project_id)
+            .await?;
+        if refreshed && current_registration.is_none() {
+            return Err(
+                AppError::conflict("Computer registration was retired during refresh").into(),
+            );
+        }
+        if let Some(current) = current_registration.as_ref() {
+            ensure_request_owner(current, &incoming)?;
         }
 
         // A first request for project B may be the first observer of a shared
         // workload replacement. Recover its existing canonical registration A
         // before registering B; absence of B does not authorize overwriting A.
-        let related = match incoming.pod_id() {
+        let related = || match incoming.pod_id() {
             Some(pod_id) => self.projects.find_projects_by_pod_id(pod_id),
             None => incoming
                 .user_id()
@@ -50,38 +62,62 @@ impl AppState {
                 })
                 .unwrap_or_default(),
         };
-        if let Some(expected) = related.into_iter().find(|project| {
-            project.container_key() == observed.project_id
+        // Older ordinary registrations could mutate a shared Basic while a
+        // project's captured physical generation still named its predecessor.
+        // Read that registration from authoritative storage; never manufacture
+        // predecessor evidence by substituting an old UID into a newer Basic.
+        if let Some(expected) = related().into_iter().find(|project| {
+            project.project_id() != project_id
+                && project.container_key() == observed.project_id
                 && project
                     .service_type()
                     .is_some_and(|kind| kind.same_container_family(params.service_type))
                 && project.container_info().is_some_and(|basic| {
                     basic.container_name == observed.container_name
-                        && basic.workload_uid.is_some()
-                        && observed.workload_uid.is_some()
-                        && basic.workload_uid != observed.workload_uid
-                        && project
-                            .persistence_identity()
-                            .container
-                            .as_ref()
-                            .is_none_or(|identity| {
-                                identity.physical_uid.as_deref()
-                                    == Some(basic.container_id.as_str())
-                            })
+                        && (inconsistent_physical_registration(project)
+                            || (AgentRegistrationChange::between(Some(&basic), &observed)
+                                .is_some()
+                                && project
+                                    .persistence_identity()
+                                    .container
+                                    .as_ref()
+                                    .is_none_or(|identity| {
+                                        identity.physical_uid.as_deref()
+                                            == Some(basic.container_id.as_str())
+                                    })))
                 })
         }) {
-            observed = self
-                .recover_computer_project_registration(params, &expected, &observed)
-                .await?;
+            let expected = if inconsistent_physical_registration(&expected) {
+                self.refresh_inconsistent_computer_registration(expected.project_id())
+                    .await?
+                    .0
+                    .ok_or_else(|| {
+                        AppError::conflict(
+                            "Canonical Computer registration was retired during refresh",
+                        )
+                    })?
+            } else {
+                expected
+            };
+            if AgentRegistrationChange::between(expected.container_info().as_ref(), &observed)
+                .is_some()
+            {
+                observed = self
+                    .recover_computer_project_registration(params, &expected, &observed)
+                    .await?;
+            }
         }
 
-        if let Some(previous) = self.projects.get(project_id) {
+        // A validated SQL projection need not be published into the read cache
+        // while unrelated writes are pending. Use the returned snapshot as the
+        // controlled replacement expectation instead of rereading that cache.
+        if let Some(previous) = if refreshed {
+            current_registration
+        } else {
+            self.projects.get(project_id)
+        } {
             let previous_container = previous.container_info();
-            if observed.workload_uid.is_some()
-                && previous_container.as_ref().is_none_or(|old| {
-                    old.workload_uid.is_some() && old.workload_uid != observed.workload_uid
-                })
-            {
+            if AgentRegistrationChange::between(previous_container.as_ref(), &observed).is_some() {
                 ensure_request_owner(&previous, &incoming)?;
                 observed = self
                     .recover_computer_project_registration(params, &previous, &observed)
@@ -185,6 +221,43 @@ impl AppState {
         bail!("Computer project metadata is changing concurrently; retry ensure")
     }
 
+    async fn refresh_inconsistent_computer_registration(
+        &self,
+        project_id: &str,
+    ) -> Result<(Option<Arc<ProjectAndContainerInfo>>, bool)> {
+        let current = self.projects.get(project_id);
+        if !current
+            .as_ref()
+            .is_some_and(|info| inconsistent_physical_registration(info))
+        {
+            return Ok((current, false));
+        }
+        let current = self
+            .projects
+            .refresh_project_registration(project_id)
+            .await
+            .context("Refresh Computer registration after its physical projection changed")?;
+        if current
+            .as_ref()
+            .is_some_and(|info| inconsistent_physical_registration(info))
+        {
+            return Err(AppError::with_message(
+                shared_types::ERR_SERVICE_UNAVAILABLE,
+                "Computer registration is changing; no chat task was dispatched",
+            )
+            .with_error_detail(
+                ErrorDetail::new(
+                    shared_types::ERR_SERVICE_UNAVAILABLE,
+                    "computer.registration",
+                    "The current physical projection could not be confirmed from storage",
+                )
+                .with_retryable(true),
+            )
+            .into());
+        }
+        Ok((current, true))
+    }
+
     async fn recover_computer_project_registration(
         &self,
         params: &ContainerCreateParams,
@@ -263,6 +336,17 @@ impl AppState {
             .is_session_registration_committed(expected, session_id)
             .await
     }
+}
+
+fn inconsistent_physical_registration(project: &ProjectAndContainerInfo) -> bool {
+    project.container_info().is_some_and(|basic| {
+        project
+            .persistence_identity()
+            .container
+            .as_ref()
+            .and_then(|identity| identity.physical_uid.as_deref())
+            .is_some_and(|physical| physical != basic.container_id)
+    })
 }
 
 fn ensure_request_owner(
