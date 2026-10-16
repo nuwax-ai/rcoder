@@ -12,6 +12,29 @@ pub(in crate::pg) async fn upsert_container(
     tx: &mut dyn Executor,
     c: &ContainerSnapshot,
 ) -> Result<PersistenceOperationOutcome> {
+    upsert_container_admitted(tx, c, ContainerAdmission::Observed).await
+}
+
+/// Only the existing typed runtime/lifecycle recovery paths call this after
+/// validating ownership and predecessor absence. Generation CAS still applies.
+pub(in crate::pg) async fn upsert_verified_replacement_container(
+    tx: &mut dyn Executor,
+    c: &ContainerSnapshot,
+) -> Result<PersistenceOperationOutcome> {
+    upsert_container_admitted(tx, c, ContainerAdmission::VerifiedReplacement).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContainerAdmission {
+    Observed,
+    VerifiedReplacement,
+}
+
+async fn upsert_container_admitted(
+    tx: &mut dyn Executor,
+    c: &ContainerSnapshot,
+    admission: ContainerAdmission,
+) -> Result<PersistenceOperationOutcome> {
     ensure!(
         c.expected_revision >= 0 && !c.generation.is_empty(),
         "Invalid container write identity"
@@ -40,8 +63,41 @@ pub(in crate::pg) async fn upsert_container(
         .exec(tx)
         .await?;
     if let Some(current) = current {
+        if admission == ContainerAdmission::Observed
+            && current
+                .workload_uid
+                .as_ref()
+                .is_some_and(|uid| c.workload_uid.as_ref() != Some(uid))
+        {
+            // The database is authoritative even when a replica has not seen
+            // this shared resource yet. A new project's missing local row is
+            // never evidence that another workload can be retired.
+            return Ok(PersistenceOperationOutcome::Superseded);
+        }
         if current.container_generation == c.generation {
             if current.row_revision != c.expected_revision {
+                // Another replica may have registered a different project on
+                // this same shared container. The container is already bound;
+                // keep its newer metadata and let this project's registration
+                // proceed. Never use this path for a replacement, placeholder,
+                // foreign logical owner, or an impossible future revision.
+                if current.row_revision > c.expected_revision
+                    && c.container_id.is_some()
+                    && current.container_id == c.container_id
+                    && current.workload_uid == c.workload_uid
+                    && current.logical_id == c.logical_id
+                    && current
+                        .service_type
+                        .parse::<shared_types::ServiceType>()
+                        .map_err(anyhow::Error::msg)?
+                        .same_container_family(
+                            c.service_type
+                                .parse::<shared_types::ServiceType>()
+                                .map_err(anyhow::Error::msg)?,
+                        )
+                {
+                    return Ok(PersistenceOperationOutcome::Committed);
+                }
                 return Ok(PersistenceOperationOutcome::Superseded);
             }
             if current.container_id.is_some() && current.container_id != c.container_id {

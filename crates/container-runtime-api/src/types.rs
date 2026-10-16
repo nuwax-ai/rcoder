@@ -9,6 +9,7 @@ use thiserror::Error;
 use utoipa::ToSchema;
 
 use crate::ContainerRuntime;
+pub use shared_types::{AgentWorkspaceIdentity, VerifiedAgentReplacement};
 
 /// Observation of an original coordinator lease, separate from write authority.
 /// No persisted or HTTP representation: unsupported/absent observations stay

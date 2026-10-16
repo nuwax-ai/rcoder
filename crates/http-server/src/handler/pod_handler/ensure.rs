@@ -107,34 +107,11 @@ pub(crate) async fn ensure_ordinary_pod(
         request.user_id, request.project_id, service_type, container_identifier
     );
 
-    // === 并发保护：检查是否有其他请求正在创建同一用户的容器 ===
-    // 使用原子标记（DashMap）避免并发请求互相干扰，无死锁风险
-    if let Some(response) = ensure_flow::wait_for_concurrent_creation(
-        state,
-        request,
-        &service_type,
-        &container_identifier,
-    )
-    .await
-    {
-        return response;
-    }
-
-    // 2. 🔍 实时查询 runtime 检查容器是否存在（不依赖缓存），未运行的旧容器
-    // 连同 SSE/gRPC 连接一并清理
-    let need_create =
-        ensure_flow::resolve_need_create(state, &container_identifier, &service_type).await?;
-
-    // 3. 获取或创建容器（带重试机制 + 标记）
-    let (container_info, created) = if need_create {
-        let info =
-            ensure_flow::create_with_retry(state, request, &service_type, &container_identifier)
-                .await?;
-        (info, true)
-    } else {
-        ensure_flow::get_existing_with_sync(state, request, &service_type, &container_identifier)
-            .await?
-    };
+    // Ensure and chat share one lifetime-bound creation admission. A waiter
+    // timeout or Pending observation never grants permission to replace compute.
+    let (container_info, created) =
+        ensure_flow::ensure_with_retry(state, request, &service_type, &container_identifier)
+            .await?;
 
     // 4/5/6. 注册 VNC backend + 更新存储记录 + 构建响应
     let message = if created {
@@ -150,6 +127,7 @@ pub(crate) async fn ensure_ordinary_pod(
         created,
         message,
     )
+    .await
 }
 
 // ============================================================================

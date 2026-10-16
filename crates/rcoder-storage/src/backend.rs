@@ -148,6 +148,119 @@ impl ProjectStoreBackend {
         }
     }
 
+    /// Confirm registration before dispatching the first task to a runner.
+    /// Deferred registration retains the original immutable fallback command.
+    pub async fn insert_project_registration_durable(
+        &self,
+        project_id: String,
+        info: Arc<ProjectAndContainerInfo>,
+    ) -> anyhow::Result<shared_types::persistence::PersistenceWriteOutcome> {
+        use shared_types::persistence::PersistenceWriteOutcome;
+        anyhow::ensure!(
+            project_id == info.project_id(),
+            "Project registration key differs from its payload"
+        );
+        match self {
+            Self::Memory(inner) => {
+                let captured = Arc::clone(&info);
+                inner.insert(project_id, info)?;
+                Ok(
+                    if inner.get(captured.project_id()).is_some_and(|current| {
+                        crate::adapter::session_container_matches(&captured, &current)
+                    }) {
+                        PersistenceWriteOutcome::Committed
+                    } else {
+                        PersistenceWriteOutcome::Superseded
+                    },
+                )
+            }
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => {
+                store
+                    .insert_project_registration_durable(project_id, info)
+                    .await
+            }
+        }
+    }
+
+    /// Complete a dispatched chat by appending only its routing identity to the
+    /// same captured runner. Metadata revisions do not invalidate completion.
+    pub async fn append_session_for_container_durable(
+        &self,
+        expected: &ProjectAndContainerInfo,
+        session_id: &str,
+    ) -> anyhow::Result<shared_types::persistence::PersistenceWriteOutcome> {
+        use shared_types::persistence::PersistenceWriteOutcome;
+        match self {
+            Self::Memory(inner) => Ok(
+                if inner.append_session_for_container(expected, session_id)? {
+                    PersistenceWriteOutcome::Committed
+                } else {
+                    PersistenceWriteOutcome::Superseded
+                },
+            ),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => {
+                store
+                    .append_session_for_container_durable(expected, session_id)
+                    .await
+            }
+        }
+    }
+
+    /// Confirm durability independently of the local accepted-write mirror.
+    /// PostgreSQL always reads the authoritative primary transaction here.
+    pub async fn is_session_registration_committed(
+        &self,
+        expected: &ProjectAndContainerInfo,
+        session_id: &str,
+    ) -> anyhow::Result<bool> {
+        match self {
+            Self::Memory(inner) => Ok(inner.get_by_session_id(session_id).is_some_and(|current| {
+                crate::adapter::session_container_matches(expected, &current)
+                    && expected
+                        .persistence_identity()
+                        .sessions
+                        .get(session_id)
+                        .is_none_or(|generation| {
+                            current.persistence_identity().sessions.get(session_id)
+                                == Some(generation)
+                        })
+            })),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => {
+                store
+                    .is_session_registration_committed(expected, session_id)
+                    .await
+            }
+        }
+    }
+
+    /// Rebind only a replacement whose physical ownership and workspace have
+    /// already been verified by the runtime. Keep historical session IDs.
+    pub async fn replace_agent_container_registration_durable(
+        &self,
+        expected: &ProjectAndContainerInfo,
+        evidence: &shared_types::VerifiedAgentReplacement,
+    ) -> anyhow::Result<shared_types::persistence::PersistenceWriteOutcome> {
+        use shared_types::persistence::PersistenceWriteOutcome;
+        match self {
+            Self::Memory(inner) => Ok(
+                if inner.replace_agent_container_registration(expected, evidence)? {
+                    PersistenceWriteOutcome::Committed
+                } else {
+                    PersistenceWriteOutcome::Superseded
+                },
+            ),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => {
+                store
+                    .replace_agent_container_registration_durable(expected, evidence)
+                    .await
+            }
+        }
+    }
+
     /// 追加 session 的 durable 变体（/chat 域响应后映射补录）：与
     /// [`Self::insert_project_with_session_durable`] 同契约——返回 `Ok(true)`
     /// 即主库已提交（超时/失败内部降级 write-behind，chat 不失败）。
@@ -268,6 +381,19 @@ impl ProjectStoreBackend {
             Self::Memory(inner) => inner.get_by_session_id(session_id),
             #[cfg(feature = "pg")]
             Self::Postgres(store) => store.get_by_session_id_with_fetch(session_id).await,
+        }
+    }
+
+    /// Fallible SSE lookup: an unavailable or invalid database is not a missing
+    /// session. Callers translate that failure into a retriable server error.
+    pub async fn get_by_session_id_with_fetch_result(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Option<Arc<ProjectAndContainerInfo>>> {
+        match self {
+            Self::Memory(inner) => Ok(inner.get_by_session_id(session_id)),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => store.get_by_session_id_with_fetch_result(session_id).await,
         }
     }
 

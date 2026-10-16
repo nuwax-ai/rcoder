@@ -124,6 +124,14 @@ HTTP 状态并不代替业务结果：原有 `HttpResult` 入口和正式 UserAp
 
 ## 重试与结果未知
 
+### Computer 聊天与进度订阅
+
+`POST /computer/chat` 在 Agent Runner 已受理任务后，只追加该执行实例的会话登记，不重发原消息。同一共享容器的其他项目登记或普通版本更新不表示容器已被替换；K8s 工作负载确实被替换时，由原入口重新观察当前实例、归属与工作区后恢复映射，保留已有会话标识和数据卷。
+
+任务已经受理但会话登记未确认时，响应保留原 `data.session_id`：登记结果未知返回 `ERR_SERVICE_UNAVAILABLE`，执行身份已被替换返回 `ERR_CONFLICT`；沿既有 `HttpResult` 契约使用 HTTP 200 + `success=false`，保留会话数据。派发前的标准 `AppError` 则分别使用 503/409。`error_detail.stage` 为 `chat.session_registration`，`task_id` 为原会话标识，`retryable=false` 指原消息不能自动重发。调用方应保留会话标识，仅重连 `GET /computer/progress/{session_id}`；本地待提交缓存不构成持久化确认。已有 Agent Runner 业务失败继续保留原失败码和数据。
+
+普通 Computer 会话的进度查询在存储读取失败时返回可重试的 503，只有确认找不到会话时才返回 404。进度入口仍优先解析 UserApp 会话，按该领域原有错误契约传播失败；不能将查询异常伪装成会话不存在。连接建立后，仍通过既有 SSE 事件报告后续错误。
+
 `error_detail.retryable` 表示在当前证据下，使用原身份和相同输入重试是否安全。不能仅因 HTTP 502–504、出现“timeout/starting”或中文提示就重试。
 
 - 明确的只读或派发前失败可以标记可重试；配置、凭据错误需修正输入后发起新请求。

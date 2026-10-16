@@ -189,6 +189,13 @@ impl KubernetesRuntime {
             super::k8s_resolution::PodResolution::Absent { evidence } => {
                 tracing::debug!(%evidence, %identifier, "pod resolution: absent");
             }
+            super::k8s_resolution::PodResolution::WorkloadWithoutPod { workload_name }
+                if service_type.same_container_family(ServiceType::ComputerAgentRunner) =>
+            {
+                return self
+                    .observe_computer_workload_without_pod(identifier, service_type, &workload_name)
+                    .await;
+            }
             super::k8s_resolution::PodResolution::WorkloadWithoutPod { .. } => {}
         }
 
@@ -216,6 +223,57 @@ impl KubernetesRuntime {
             }
         }
 
+        Ok(None)
+    }
+
+    /// A different RCoder replica may have submitted the controller before
+    /// Kubernetes creates its first Pod. Only an explicitly scaled-down, owned
+    /// controller permits the ordinary ensure path to resume compute. Starting
+    /// or terminating controllers remain live work; neither is creation absence.
+    async fn observe_computer_workload_without_pod(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        workload_name: &str,
+    ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
+        let Some(workload) = self
+            .statefulsets()
+            .get_opt(workload_name)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::K8sError(format!(
+                    "Inspect Computer controller without Pod: {error}"
+                ))
+            })?
+        else {
+            return Ok(None);
+        };
+        let labels = super::k8s_service::build_selector_labels(identifier, service_type);
+        if workload.metadata.namespace.as_deref() != Some(self.namespace.as_str())
+            || workload.metadata.name.as_deref() != Some(workload_name)
+            || workload
+                .metadata
+                .uid
+                .as_deref()
+                .is_none_or(|uid| uid.is_empty())
+            || !labels.iter().all(|(key, value)| {
+                workload
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get(key))
+                    == Some(value)
+            })
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "Computer controller without Pod has unverified ownership".into(),
+            ));
+        }
+        if workload.metadata.deletion_timestamp.is_some()
+            || workload.spec.as_ref().and_then(|spec| spec.replicas) != Some(0)
+        {
+            return Err(ContainerRuntimeError::ManagementNotRunning);
+        }
         Ok(None)
     }
 

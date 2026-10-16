@@ -41,6 +41,8 @@ pub(crate) const TEMPLATE_HASH_ANNOTATION: &str = "rcoder.io/template-hash";
 mod agent_statefulset_winner_tests;
 mod agent_sts;
 mod builder_sts;
+#[cfg(all(test, feature = "kubernetes"))]
+mod computer_pending_tests;
 pub(crate) mod helpers;
 #[cfg(all(test, feature = "kubernetes"))]
 mod tests;

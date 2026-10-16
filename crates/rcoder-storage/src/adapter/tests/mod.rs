@@ -6,6 +6,7 @@
 //!
 //! 公共 fixture（make_adapter / create_test_info / join_with_timeout 等）在本文件。
 
+mod agent_registration_tests;
 mod concurrency_tests;
 mod crud_session_tests;
 mod index_lookup_tests;

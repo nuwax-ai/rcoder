@@ -1,6 +1,6 @@
 //! Durable writes and queued fallbacks execute identical, identity-fenced operations.
 //! SQL transaction order is not business order; retired identities fence delayed retries.
-use super::persist_ops::{PersistOp, structural_ops_for_insert};
+use super::persist_ops::{ContainerSessionAppend, PersistOp, structural_ops_for_insert};
 use super::writer::execute_registered;
 use crate::adapter::container_entry_key;
 use crate::pg::PgStore;
@@ -47,6 +47,117 @@ impl PgStore {
     }
 
     const DURABLE_COMMIT_TIMEOUT: Duration = Duration::from_millis(600);
+
+    /// Establish the exact accepted project/container registration before a
+    /// caller dispatches work. A background writer is not a commit barrier.
+    pub async fn insert_project_registration_durable(
+        &self,
+        project_id: String,
+        info: Arc<ProjectAndContainerInfo>,
+    ) -> anyhow::Result<PersistenceWriteOutcome> {
+        anyhow::ensure!(
+            project_id == info.project_id(),
+            "Project registration key differs from its payload"
+        );
+        let (pending, captured) = {
+            let registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+            anyhow::ensure!(
+                !self.closing.load(std::sync::atomic::Ordering::Acquire),
+                "Persistence is shutting down"
+            );
+            let info = self.prepare_info(info, &registration)?;
+            let op = super::persist_ops::registration_for_info(&info)?;
+            self.inner.insert(project_id, Arc::clone(&info))?;
+            (self.register_durable(vec![op]), info)
+        };
+        let outcome = self.execute_durable(pending, "register_project").await;
+        if outcome == PersistenceWriteOutcome::Committed {
+            let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+            if self.inner.get(captured.project_id()).is_none_or(|current| {
+                !crate::adapter::session_container_matches(&captured, &current)
+            }) {
+                return Ok(PersistenceWriteOutcome::Superseded);
+            }
+        }
+        Ok(outcome)
+    }
+
+    pub async fn append_session_for_container_durable(
+        &self,
+        expected: &ProjectAndContainerInfo,
+        session_id: &str,
+    ) -> anyhow::Result<PersistenceWriteOutcome> {
+        let (pending, append, was_present) = {
+            let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+            anyhow::ensure!(
+                !self.closing.load(std::sync::atomic::Ordering::Acquire),
+                "Persistence is shutting down"
+            );
+            let Some(current) = self.inner.get(expected.project_id()) else {
+                return Ok(PersistenceWriteOutcome::Superseded);
+            };
+            let was_present = current.sessions().contains(session_id);
+            if !self
+                .inner
+                .append_session_for_container(expected, session_id)?
+            {
+                return Ok(PersistenceWriteOutcome::Superseded);
+            }
+            let current = self.inner.get(expected.project_id()).ok_or_else(|| {
+                anyhow::anyhow!("Project disappeared during session registration")
+            })?;
+            let identity = current.persistence_identity();
+            let container_identity = identity
+                .container
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Container registration identity is missing"))?;
+            let basic = current.container_info().ok_or_else(|| {
+                anyhow::anyhow!("Physical container is missing during session registration")
+            })?;
+            let append =
+                ContainerSessionAppend {
+                    project_id: expected.project_id().to_owned(),
+                    project_generation: identity.generation.clone(),
+                    container_name: container_entry_key(&current),
+                    container_generation: container_identity.generation.clone(),
+                    physical_uid: basic.container_id,
+                    workload_uid: basic.workload_uid,
+                    logical_id: basic.project_id,
+                    service_type: current
+                        .service_type()
+                        .ok_or_else(|| anyhow::anyhow!("Project service type is missing"))?
+                        .to_string(),
+                    session_id: session_id.to_owned(),
+                    session_generation: identity.sessions.get(session_id).cloned().ok_or_else(
+                        || anyhow::anyhow!("Session registration identity is missing"),
+                    )?,
+                    predecessor: identity.retired_sessions.get(session_id).cloned(),
+                    at: current.last_activity(),
+                };
+            (
+                self.register_durable(vec![PersistOp::AppendSessionForContainer(Box::new(
+                    append.clone(),
+                ))]),
+                append,
+                was_present,
+            )
+        };
+        let outcome = self
+            .execute_durable(pending, "append_session_for_container")
+            .await;
+        if outcome == PersistenceWriteOutcome::Superseded && !was_present {
+            let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(current) = self.inner.get(expected.project_id())
+                && crate::adapter::session_container_matches(expected, &current)
+                && current.persistence_identity().sessions.get(session_id)
+                    == Some(&append.session_generation)
+            {
+                self.inner
+                    .clear_session_one(expected.project_id(), session_id);
+            }
+        }
+        Ok(outcome)
+    }
 
     pub async fn insert_with_session_durable(
         &self,

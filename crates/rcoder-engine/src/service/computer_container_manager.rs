@@ -16,15 +16,20 @@
 use crate::AppError;
 use crate::utils::{COMPUTER_WORKSPACE_ROOT, user_dir};
 use container_runtime_api::{
-    ContainerCreateParams, ContainerRuntime, RuntimeErrorContext, runtime_app_error,
+    ContainerCreateParams, ContainerRuntime, ContainerRuntimeStatus, RuntimeErrorContext,
+    runtime_app_error,
 };
 use docker_manager::ContainerBasicInfo;
-use shared_types::error_codes::{ERR_CONTAINER_ADDRESS_NOT_READY, ERR_WORKSPACE_ERROR};
+use shared_types::error_codes::ERR_WORKSPACE_ERROR;
 use shared_types::{ServiceResourceLimits, ServiceType};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info};
+
+mod creation;
+#[cfg(test)]
+mod tests;
 
 /// 容器创建参数
 ///
@@ -76,72 +81,137 @@ impl ComputerContainerManager {
         options: &ContainerCreateOptions,
         runtime: &Arc<dyn ContainerRuntime>,
     ) -> Result<ContainerBasicInfo, AppError> {
-        // 确定容器标识符：pod_id 有值时使用 pod_id，否则根据 service_type 使用 user_id 或 project_id
-        let container_identifier =
-            options
-                .pod_id
-                .as_deref()
-                .unwrap_or_else(|| match options.service_type {
-                    ServiceType::WebAgentRunner
-                    | ServiceType::Userapp
-                    | ServiceType::UserappBuilder => &options.project_id,
-                    ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
-                        &options.user_id
+        Self::ensure_container_for_user_with_type(options, runtime)
+            .await
+            .map(|(info, _created)| info)
+    }
+
+    /// The same workload admission covers ensure and chat. `created` means
+    /// this request created/replaced compute, not that a Pending waiter did.
+    pub async fn ensure_container_for_user_with_type(
+        options: &ContainerCreateOptions,
+        runtime: &Arc<dyn ContainerRuntime>,
+    ) -> Result<(ContainerBasicInfo, bool), AppError> {
+        let identifier = options
+            .service_type
+            .container_identifier(
+                options.pod_id.as_deref(),
+                Some(&options.user_id),
+                Some(&options.project_id),
+            )
+            .map_err(|error| AppError::validation_error(&error.to_string()))?;
+        let deadline = tokio::time::Instant::now() + creation::WAITER_BUDGET;
+        let _creation = creation::acquire(&options.service_type, identifier, deadline).await?;
+        let observed = runtime
+            .find_container(identifier, &options.service_type)
+            .await
+            .map_err(|error| {
+                runtime_app_error(&error, "container.query", RuntimeErrorContext::ReadOnly)
+            })?;
+
+        match observed {
+            Some(observed) if observed.status == ContainerRuntimeStatus::Running => {
+                return Self::running_info(
+                    runtime,
+                    identifier,
+                    options.service_type,
+                    &observed.container_id,
+                )
+                .await
+                .map(|info| (info, false));
+            }
+            Some(observed) if observed.status == ContainerRuntimeStatus::Pending => {
+                // ContainerCreating/Restarting is live work, including when a
+                // different RCoder replica submitted it. Neither a marker age
+                // nor a waiter timeout authorizes deleting that workload.
+                loop {
+                    tokio::time::timeout_at(
+                        deadline,
+                        tokio::time::sleep(std::time::Duration::from_millis(250)),
+                    )
+                    .await
+                    .map_err(|_| creation::not_ready("Existing container is still starting"))?;
+                    let current = tokio::time::timeout_at(
+                        deadline,
+                        runtime.find_container(identifier, &options.service_type),
+                    )
+                    .await
+                    .map_err(|_| creation::not_ready("Container startup observation timed out"))?
+                    .map_err(|error| {
+                        runtime_app_error(&error, "container.status", RuntimeErrorContext::ReadOnly)
+                    })?;
+                    match current {
+                        Some(current) if current.status == ContainerRuntimeStatus::Running => {
+                            return Self::running_info(
+                                runtime,
+                                identifier,
+                                options.service_type,
+                                &current.container_id,
+                            )
+                            .await
+                            .map(|info| (info, false));
+                        }
+                        Some(current) if current.status == ContainerRuntimeStatus::Pending => {}
+                        _ => {
+                            return Err(creation::not_ready(
+                                "Container startup changed before readiness; retry to observe its current state",
+                            ));
+                        }
                     }
-                });
+                }
+            }
+            Some(observed)
+                if matches!(
+                    observed.status,
+                    ContainerRuntimeStatus::Succeeded | ContainerRuntimeStatus::Failed
+                ) =>
+            {
+                runtime
+                    .stop_agent_container_if_matches(
+                        identifier,
+                        &options.service_type,
+                        &observed.container_id,
+                    )
+                    .await
+                    .map_err(|error| {
+                        runtime_app_error(&error, "container.stop", RuntimeErrorContext::Mutation)
+                    })?;
+            }
+            Some(_) => {
+                return Err(creation::not_ready(
+                    "Container state is unknown; retained until its execution state can be observed",
+                ));
+            }
+            None => {}
+        }
 
-        info!(
-            "🔍 [COMPUTER_CONTAINER] Getting/creating user container: user_id={}, pod_id={:?}, container_identifier={}, service_type={}",
-            options.user_id, options.pod_id, container_identifier, options.service_type
-        );
+        Self::create_container_for_user(options, runtime)
+            .await
+            .map(|info| (info, true))
+    }
 
-        // Only an authoritative absence permits creation. An address is not
-        // physical liveness evidence and cannot authorize replacement.
-        if let Some(info) = runtime
-            .get_container_info_by_identifier(container_identifier, &options.service_type)
+    async fn running_info(
+        runtime: &Arc<dyn ContainerRuntime>,
+        identifier: &str,
+        service_type: ServiceType,
+        observed_container_id: &str,
+    ) -> Result<ContainerBasicInfo, AppError> {
+        let info = runtime
+            .get_container_info_by_identifier(identifier, &service_type)
             .await
             .map_err(|error| {
                 runtime_app_error(&error, "container.query", RuntimeErrorContext::ReadOnly)
             })?
+            .ok_or_else(|| creation::not_ready("Container information is not available yet"))?;
+        if info.container_id != observed_container_id
+            || !docker_manager::types::ContainerStatus::from(info.status.clone()).is_running()
+            || info.container_ip.trim().is_empty()
         {
-            let running = runtime
-                .is_container_running_by_identifier(container_identifier, &options.service_type)
-                .await
-                .map_err(|error| {
-                    runtime_app_error(&error, "container.status", RuntimeErrorContext::ReadOnly)
-                })?;
-            if running {
-                if info.container_ip.trim().is_empty() {
-                    let detail = shared_types::ErrorDetail::new(
-                        ERR_CONTAINER_ADDRESS_NOT_READY,
-                        "container.address",
-                        "Owned container is running but its address is not available yet",
-                    )
-                    .with_retryable(true);
-                    return Err(AppError::with_message(
-                        ERR_CONTAINER_ADDRESS_NOT_READY,
-                        detail.detail.clone(),
-                    )
-                    .with_error_detail(detail));
-                }
-                return Ok(info);
-            }
-            // Cleanup must acknowledge completion before a new container is
-            // requested; a lost reply protects the affected execution.
-            runtime
-                .stop_container_by_identifier(container_identifier, &options.service_type)
-                .await
-                .map_err(|error| {
-                    runtime_app_error(&error, "container.stop", RuntimeErrorContext::Mutation)
-                })?;
+            return Err(creation::not_ready(
+                "Container changed or its address is not available yet",
+            ));
         }
-
-        // 2. 容器不存在或已停止，创建新容器
-        info!(
-            "🏗️ [COMPUTER_CONTAINER] Creating new user container: container_identifier={}, service_type={}",
-            container_identifier, options.service_type
-        );
-        Self::create_container_for_user(options, runtime).await
+        Ok(info)
     }
 
     /// 根据 user_id 或 pod_id 获取或创建容器（向后兼容，默认使用 ComputerAgentRunner）
@@ -186,6 +256,12 @@ impl ComputerContainerManager {
                 options.pod_id.as_deref().unwrap_or(&options.user_id)
             }
         };
+        let _creation = creation::acquire(
+            &options.service_type,
+            container_identifier,
+            tokio::time::Instant::now() + creation::WAITER_BUDGET,
+        )
+        .await?;
         info!(
             "🏗️ [COMPUTER_CONTAINER] Force creating new user container: container_identifier={}, service_type={}",
             container_identifier, options.service_type
@@ -223,38 +299,7 @@ impl ComputerContainerManager {
             options.user_id
         );
 
-        // 2. 调用 DockerManager 启动容器
-        // 注意：不再传递 host_path，挂载由 config.yml 的 mounts 配置管理
-        // 使用 container_identifier 作为 project_id（用于容器名称生成）
-        let mut params_builder = ContainerCreateParams::builder()
-            .project_id(container_identifier) // 用于容器名称生成和查找
-            .user_id(&options.user_id) // user_id 用于容器内配置
-            .service_type(options.service_type);
-
-        // 只有在有资源限制时才设置
-        if let Some(ref limits) = options.resource_limits {
-            // 提取 storage_size 用于 K8s PVC 创建
-            if let Some(ref storage_size) = limits.storage_size {
-                params_builder = params_builder.storage_size(storage_size.clone());
-            }
-            params_builder = params_builder.resource_limits(limits.clone());
-        }
-
-        // 设置可选的隔离参数
-        if let Some(ref pid) = options.pod_id {
-            params_builder = params_builder.pod_id(pid);
-        }
-        if let Some(ref it) = options.isolation_type {
-            params_builder = params_builder.isolation_type(it);
-        }
-        if let Some(ref tid) = options.tenant_id {
-            params_builder = params_builder.tenant_id(tid);
-        }
-        if let Some(ref sid) = options.space_id {
-            params_builder = params_builder.space_id(sid);
-        }
-
-        let params = params_builder.build();
+        let params = Self::creation_params(options)?;
 
         let create_started = Instant::now();
         info!(
@@ -307,6 +352,50 @@ impl ComputerContainerManager {
         }
 
         Ok(container_info)
+    }
+
+    /// Pure request-to-runtime mapping shared by creation and replacement
+    /// verification. Workspace topology remains owned by the runtime.
+    pub fn creation_params(
+        options: &ContainerCreateOptions,
+    ) -> Result<ContainerCreateParams, AppError> {
+        let container_identifier = options
+            .service_type
+            .container_identifier(
+                options.pod_id.as_deref(),
+                Some(&options.user_id),
+                Some(&options.project_id),
+            )
+            .map_err(|error| AppError::validation_error(&error.to_string()))?;
+        let mut params_builder = ContainerCreateParams::builder()
+            .project_id(container_identifier) // 用于容器名称生成和查找
+            .user_id(&options.user_id) // user_id 用于容器内配置
+            .service_type(options.service_type);
+
+        // 只有在有资源限制时才设置
+        if let Some(ref limits) = options.resource_limits {
+            // 提取 storage_size 用于 K8s PVC 创建
+            if let Some(ref storage_size) = limits.storage_size {
+                params_builder = params_builder.storage_size(storage_size.clone());
+            }
+            params_builder = params_builder.resource_limits(limits.clone());
+        }
+
+        // 设置可选的隔离参数
+        if let Some(ref pid) = options.pod_id {
+            params_builder = params_builder.pod_id(pid);
+        }
+        if let Some(ref it) = options.isolation_type {
+            params_builder = params_builder.isolation_type(it);
+        }
+        if let Some(ref tid) = options.tenant_id {
+            params_builder = params_builder.tenant_id(tid);
+        }
+        if let Some(ref sid) = options.space_id {
+            params_builder = params_builder.space_id(sid);
+        }
+
+        Ok(params_builder.build())
     }
 
     /// 创建用户工作区目录

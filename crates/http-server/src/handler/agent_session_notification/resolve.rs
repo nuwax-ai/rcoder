@@ -102,8 +102,8 @@ pub(super) async fn lookup_project_info_by_session(
 ) -> Result<Arc<ProjectAndContainerInfo>, AppError> {
     // 内存镜像 miss → 回源直查 PG 主库一次（跨副本可见性兜底：新会话在
     // write-behind/镜像同步窗口内、或 durable 降级场景；命中顺带 hydrate 镜像）
-    match state.get_by_session_with_fetch(session_id).await {
-        Some(info) => {
+    match state.get_by_session_with_fetch_result(session_id).await {
+        Ok(Some(info)) => {
             debug!(
                 "[SSE_PROXY] Getting project info: session_id={}, project_id={}",
                 session_id,
@@ -111,7 +111,7 @@ pub(super) async fn lookup_project_info_by_session(
             );
             Ok(info)
         }
-        None => {
+        Ok(None) => {
             error!(
                 "[SSE_PROXY] Project info for session not found: session_id={}",
                 session_id
@@ -120,6 +120,26 @@ pub(super) async fn lookup_project_info_by_session(
                 "SESSION_NOT_FOUND",
                 "Session does not exist or has expired. Please submit a new request.",
             ))
+        }
+        Err(error) => {
+            error!(
+                session_id,
+                "[SSE_PROXY] Session storage lookup failed: {error:#}"
+            );
+            let code = shared_types::ERR_SERVICE_UNAVAILABLE;
+            Err(
+                AppError::with_message(code, "Session storage is temporarily unavailable")
+                    .with_error_detail(
+                        shared_types::ErrorDetail::new(
+                            code,
+                            "sse.session_lookup",
+                            format!("{error:#}"),
+                        )
+                        .with_task_id(session_id)
+                        .with_retryable(true)
+                        .with_hint("请使用原 session_id 重连进度，不要重复发送消息。"),
+                    ),
+            )
         }
     }
 }
@@ -307,3 +327,10 @@ pub(super) async fn verify_container_with_memory_preference(
         }
     }
 }
+
+#[cfg(all(
+    test,
+    feature = "userapp-turso",
+    any(feature = "kubernetes", feature = "rcoder-pg")
+))]
+mod tests;

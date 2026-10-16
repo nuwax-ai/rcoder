@@ -3,7 +3,8 @@ use super::{computer_container_manager, container_manager};
 use async_trait::async_trait;
 use container_runtime_api::{
     AgentContainerRuntime, ContainerCreateParams, ContainerRuntime, ContainerRuntimeError,
-    ContainerRuntimeResult, RuntimeContainerInfo, UserAppDeploymentRuntime, WorkspaceRuntime,
+    ContainerRuntimeResult, ContainerRuntimeStatus, RuntimeContainerInfo, UserAppDeploymentRuntime,
+    WorkspaceRuntime,
 };
 use shared_types::{ContainerBasicInfo, ServiceType};
 use std::sync::{
@@ -98,6 +99,16 @@ impl AgentContainerRuntime for Runtime {
             "controlled cleanup result unknown".into(),
         ))
     }
+    async fn stop_agent_container_if_matches(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        expected_container_id: &str,
+    ) -> ContainerRuntimeResult<()> {
+        assert_eq!(expected_container_id, "captured-container");
+        self.stop_container_by_identifier(identifier, service_type)
+            .await
+    }
     async fn is_container_running(&self, _: &str) -> ContainerRuntimeResult<bool> {
         Ok(false)
     }
@@ -117,9 +128,34 @@ impl AgentContainerRuntime for Runtime {
     async fn find_container(
         &self,
         _: &str,
-        _: &ServiceType,
+        service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
-        Ok(None)
+        // Typed discovery and basic-info discovery describe the same runtime.
+        // The manager now distinguishes Pending from terminal states rather
+        // than treating the old false-running boolean as exit evidence.
+        if matches!(self.scenario, Scenario::StatusUnknown) {
+            return Err(ContainerRuntimeError::ConnectionError(
+                "controlled status unavailable".into(),
+            ));
+        }
+        Ok(self.query()?.map(|info| RuntimeContainerInfo {
+            container_id: info.container_id,
+            container_name: info.container_name,
+            container_ip: info.container_ip,
+            status: if matches!(self.scenario, Scenario::StopUnknown) {
+                ContainerRuntimeStatus::Failed
+            } else {
+                ContainerRuntimeStatus::Running
+            },
+            created_at: info.created_at,
+            env_vars: None,
+            service_type: Some(*service_type),
+            project_id: Some("project".into()),
+            user_id: Some("test-user".into()),
+            pod_id: Some("isolated-pod".into()),
+            app_id: None,
+            workload_uid: None,
+        }))
     }
     async fn list_containers(&self) -> ContainerRuntimeResult<Vec<RuntimeContainerInfo>> {
         Ok(vec![])

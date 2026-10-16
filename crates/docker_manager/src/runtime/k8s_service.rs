@@ -337,7 +337,10 @@ pub(crate) fn build_standard_labels(
 /// 构建 K8s Selector 标签
 ///
 /// Selector 只包含必要的标签，用于精确匹配 Pod
-fn build_selector_labels(identifier: &str, service_type: &ServiceType) -> BTreeMap<String, String> {
+pub(super) fn build_selector_labels(
+    identifier: &str,
+    service_type: &ServiceType,
+) -> BTreeMap<String, String> {
     // 家族归一：selector 必须匹配 build_standard_labels 写入的家族值
     let service_type = service_type.container_family_key();
     let mut selector = BTreeMap::new();

@@ -49,6 +49,155 @@ fn pg_config(dsn: &str) -> PostgresConfig {
 }
 
 #[tokio::test]
+async fn shared_container_revision_does_not_reject_session_registration() {
+    let Some(dsn) = test_dsn().await else {
+        eprintln!("[skip] {DSN_ENV} not set");
+        return;
+    };
+    let suffix = uuid_suffix();
+    let first_id = format!("shared-first-{suffix}");
+    let second_id = format!("shared-second-{suffix}");
+    let user_id = format!("shared-user-{suffix}");
+    let first_session = format!("shared-session-first-{suffix}");
+    let second_session = format!("shared-session-second-{suffix}");
+    let mut container = container_for(&user_id);
+    container.workload_uid = Some(format!("shared-workload-{suffix}"));
+    let (store, _rx) = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .expect("connect disposable PG");
+    let project = |id: &str| {
+        let mut info = ProjectAndContainerInfo::new(id.to_owned());
+        info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+        info.set_user_id(Some(user_id.clone()));
+        info.set_container(Some(container.clone()));
+        Arc::new(info)
+    };
+    store.insert(first_id.clone(), project(&first_id)).unwrap();
+    assert!(store.wait_drained(Duration::from_secs(5)).await);
+    // Chat A captured its own project before chat B registered the same actual
+    // shared container. Only the container's ordinary row revision advances.
+    let first_snapshot = store.get(&first_id).unwrap();
+    store
+        .insert_with_session_durable(second_id.clone(), project(&second_id), &second_session)
+        .await
+        .unwrap();
+    store
+        .insert_with_session_durable(first_id.clone(), first_snapshot, &first_session)
+        .await
+        .expect("another project using the same physical container is not a replacement");
+    assert_eq!(
+        store
+            .get_by_session_id(&first_session)
+            .unwrap()
+            .project_id(),
+        first_id
+    );
+    assert_eq!(
+        store
+            .get_by_session_id(&second_session)
+            .unwrap()
+            .project_id(),
+        second_id
+    );
+    assert!(store.wait_drained(Duration::from_secs(5)).await);
+    let (peer, _rx) = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        peer.get_by_session_id(&first_session).unwrap().project_id(),
+        first_id
+    );
+    assert_eq!(
+        peer.get_by_session_id(&second_session)
+            .unwrap()
+            .project_id(),
+        second_id
+    );
+    assert!(peer.writer().flush_and_stop(Duration::from_secs(5)).await);
+    assert!(store.writer().flush_and_stop(Duration::from_secs(5)).await);
+}
+
+#[tokio::test]
+async fn peer_shared_container_revision_keeps_session_registration_durable() {
+    let Some(dsn) = test_dsn().await else {
+        eprintln!("[skip] {DSN_ENV} not set");
+        return;
+    };
+    let suffix = uuid_suffix();
+    let first_id = format!("peer-shared-first-{suffix}");
+    let second_id = format!("peer-shared-second-{suffix}");
+    let user_id = format!("peer-shared-user-{suffix}");
+    let first_session = format!("peer-shared-session-first-{suffix}");
+    let second_session = format!("peer-shared-session-second-{suffix}");
+    let mut container = container_for(&user_id);
+    container.workload_uid = Some(format!("peer-shared-workload-{suffix}"));
+    let project = |id: &str| {
+        let mut info = ProjectAndContainerInfo::new(id.to_owned());
+        info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+        info.set_user_id(Some(user_id.clone()));
+        info.set_container(Some(container.clone()));
+        Arc::new(info)
+    };
+    let (first, _rx) = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .unwrap();
+    first.insert(first_id.clone(), project(&first_id)).unwrap();
+    assert!(first.wait_drained(Duration::from_secs(5)).await);
+    let first_snapshot = first.get(&first_id).unwrap();
+    // The second replica has its own cursor. Its commit is deliberately not
+    // synchronized into the first replica before chat A's completion arrives.
+    let (second, _rx) =
+        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+            .await
+            .unwrap();
+    let mut peer_project = (*project(&second_id)).clone();
+    let mut latest_container = container.clone();
+    latest_container.service_url = format!("http://updated-shared-{suffix}");
+    peer_project.set_container(Some(latest_container.clone()));
+    second
+        .insert_with_session_durable(second_id.clone(), Arc::new(peer_project), &second_session)
+        .await
+        .unwrap();
+    assert!(second.wait_drained(Duration::from_secs(5)).await);
+    first
+        .insert_with_session_durable(first_id.clone(), first_snapshot, &first_session)
+        .await
+        .unwrap();
+    assert!(first.wait_drained(Duration::from_secs(5)).await);
+    let (reader, _rx) =
+        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+            .await
+            .unwrap();
+    assert_eq!(
+        reader
+            .get_by_session_id(&first_session)
+            .expect("accepted chat A must be subscribable on a different replica immediately")
+            .project_id(),
+        first_id
+    );
+    assert_eq!(
+        reader
+            .get_by_session_id(&second_session)
+            .unwrap()
+            .project_id(),
+        second_id
+    );
+    assert_eq!(
+        reader
+            .get(&first_id)
+            .unwrap()
+            .container_info()
+            .unwrap()
+            .service_url,
+        latest_container.service_url,
+        "a stale shared-container registration must preserve the peer's newer metadata"
+    );
+    assert!(reader.writer().flush_and_stop(Duration::from_secs(5)).await);
+    assert!(second.writer().flush_and_stop(Duration::from_secs(5)).await);
+    assert!(first.writer().flush_and_stop(Duration::from_secs(5)).await);
+}
+
+#[tokio::test]
 async fn roundtrip_persists_and_reload_recovers() {
     let Some(dsn) = test_dsn().await else {
         eprintln!("[skip] {DSN_ENV} not set");

@@ -252,6 +252,15 @@ impl PgStore {
             .ok_or_else(|| anyhow::anyhow!("Project registration revision exhausted"))?;
         identity.container = if let Some(basic) = info.container_info() {
             let key = container_entry_key(&info);
+            // A new project still shares the canonical physical container with
+            // existing projects. Its own missing row does not authorize a
+            // workload change through ordinary registration.
+            if registered_workload_uid.is_none() {
+                registered_workload_uid = self
+                    .inner
+                    .registered_container_by_key(&key)
+                    .and_then(|canonical| canonical.workload_uid);
+            }
             let registrations = self
                 .container_registration
                 .lock()
@@ -264,9 +273,16 @@ impl PgStore {
             if let (Some(previous), Some(supplied)) = (&current, &supplied.container) {
                 anyhow::ensure!(
                     supplied.generation == previous.generation
-                        && supplied.revision == previous.revision,
+                        && (supplied.revision == previous.revision
+                            || (supplied.revision < previous.revision
+                                && physical_uid.is_some()
+                                && supplied.physical_uid == physical_uid
+                                && previous.physical_uid == physical_uid)),
                     "Container registration changed; stale snapshot cannot be rebased"
                 );
+                // A shared container's ordinary row revision advances when any
+                // project registers it. Rebase only that same physical instance;
+                // replacement still requires the exact captured predecessor.
             }
             let next = match current {
                 Some(mut previous)

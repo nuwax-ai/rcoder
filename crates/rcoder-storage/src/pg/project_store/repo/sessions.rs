@@ -8,6 +8,84 @@ use toasty_core::schema::db::Type;
 
 use super::store_repo::outcome;
 
+pub(in crate::pg) async fn append_session_for_container(
+    tx: &mut dyn Executor,
+    append: &crate::pg::project_store::persist_ops::ContainerSessionAppend,
+) -> Result<PersistenceOperationOutcome> {
+    let Some(container) =
+        crate::db::models::Container::filter_by_container_name(&append.container_name)
+            .first()
+            .exec(tx)
+            .await?
+    else {
+        return Ok(PersistenceOperationOutcome::Superseded);
+    };
+    if !container
+        .service_type
+        .parse::<shared_types::ServiceType>()
+        .map_err(anyhow::Error::msg)?
+        .same_container_family(
+            append
+                .service_type
+                .parse::<shared_types::ServiceType>()
+                .map_err(anyhow::Error::msg)?,
+        )
+    {
+        return Ok(PersistenceOperationOutcome::Superseded);
+    }
+    let owned = toasty::sql::query(
+        "SELECT p.project_id FROM projects p JOIN containers c
+           ON c.container_name=p.container_name AND c.container_generation=p.container_generation
+         WHERE p.project_id=$1 AND p.generation=$2 AND c.container_name=$3
+           AND c.container_generation=$4 AND c.container_id=$5
+           AND c.workload_uid IS NOT DISTINCT FROM $6 AND c.logical_id=$7
+           AND NOT EXISTS(SELECT 1 FROM project_tombstones t WHERE t.project_id=p.project_id AND t.generation=p.generation)
+           AND NOT EXISTS(SELECT 1 FROM container_tombstones t WHERE
+             (t.container_name=c.container_name AND t.container_generation=c.container_generation)
+             OR t.physical_uid=c.container_id)"
+    ).bind(&append.project_id).bind(&append.project_generation)
+        .bind(&append.container_name).bind(&append.container_generation).bind(&append.physical_uid)
+        .bind_typed(append.workload_uid.as_deref(), Type::Text)
+        .bind(&append.logical_id).exec(tx).await?;
+    if owned.is_empty() {
+        return Ok(PersistenceOperationOutcome::Superseded);
+    }
+    let outcome = add_session(
+        tx,
+        &append.project_id,
+        &append.session_id,
+        &append.project_generation,
+        &append.session_generation,
+        append.predecessor.as_deref(),
+    )
+    .await?;
+    if outcome == PersistenceOperationOutcome::Committed {
+        super::touch_project(
+            tx,
+            &append.project_id,
+            &append.project_generation,
+            append.at,
+        )
+        .await?;
+        super::touch_container(
+            tx,
+            &append.container_name,
+            &append.container_generation,
+            append.at,
+        )
+        .await?;
+        toasty::sql::statement(
+            "UPDATE projects SET latest_session=$1 WHERE project_id=$2 AND generation=$3",
+        )
+        .bind(&append.session_id)
+        .bind(&append.project_id)
+        .bind(&append.project_generation)
+        .exec(tx)
+        .await?;
+    }
+    Ok(outcome)
+}
+
 pub(in crate::pg) async fn add_session(
     tx: &mut dyn Executor,
     project_id: &str,

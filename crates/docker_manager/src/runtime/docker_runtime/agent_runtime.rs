@@ -2,6 +2,16 @@ use super::*;
 
 #[async_trait]
 impl AgentContainerRuntime for DockerRuntime {
+    async fn stop_agent_container_if_matches(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        expected_container_id: &str,
+    ) -> ContainerRuntimeResult<()> {
+        self.stop_captured_agent(identifier, service_type, expected_container_id)
+            .await
+    }
+
     async fn stop_idle_builder_compute(
         &self,
         identifier: &str,

@@ -18,10 +18,14 @@
 //! - `session_ops`: session 映射操作
 //! - `store_impl`: ProjectStore 契约实现
 
+mod agent_replacement;
 mod container_ops;
 mod lookup;
 mod session_ops;
 mod store_impl;
+#[cfg(feature = "pg")]
+pub(crate) use agent_replacement::validate_agent_replacement;
+pub(crate) use session_ops::session_container_matches;
 
 use std::sync::Arc;
 
@@ -88,6 +92,9 @@ pub struct ProjectAdapter {
     /// 消除跨 DashMap（projects ↔ containers）的 TOCTOU 竞态。
     /// `Arc<LockMap>` 保证 clone 后共享同一锁实例。
     project_locks: Arc<LockMap<String, ()>>,
+    /// Same physical-container updates and session admission share this lock.
+    /// Always acquire after a project lock; no guard crosses an await.
+    container_locks: Arc<LockMap<String, ()>>,
     pub(crate) userapp_agents: Arc<std::sync::Mutex<crate::userapp_agent::MemoryBindings>>,
 }
 
@@ -113,6 +120,7 @@ impl ProjectAdapter {
             user_id_to_project_ids: DashMap::new(),
             pod_id_to_project_id: DashMap::new(),
             project_locks: Arc::new(LockMap::new()),
+            container_locks: Arc::new(LockMap::new()),
             userapp_agents: Arc::new(std::sync::Mutex::new(Default::default())),
         };
         info!("[STORAGE] ProjectAdapter initialized (DashMap, RAII enabled)");
@@ -152,6 +160,17 @@ impl ProjectAdapter {
     ) -> anyhow::Result<()> {
         // DashMap 键：优先 container_name（跨重建稳定、含 service_type 前缀防跨类型碰撞），
         // 无容器信息时回退裸 logical_id（仅占位，不建容器条目）。
+        let key = container_entry_key(&info);
+        let _container_guard = self.container_locks.entry_by_ref(&key);
+        self.insert_container_locked(project_id, info)
+    }
+
+    /// Caller holds the project lock, then the target container lock.
+    fn insert_container_locked(
+        &self,
+        project_id: String,
+        info: Arc<ProjectAndContainerInfo>,
+    ) -> anyhow::Result<()> {
         let key = container_entry_key(&info);
 
         // 读取旧键（view: 读后立即释放锁）
@@ -280,6 +299,65 @@ impl ProjectAdapter {
                 .insert(pid.to_string(), project_id);
         }
         Ok(())
+    }
+
+    /// Publish a verified replacement without mutating the old shared Arc held
+    /// by other projects. They retain their captured predecessor until migrated.
+    pub(crate) fn publish_verified_agent_registration(
+        &self,
+        expected: &ProjectAndContainerInfo,
+        committed: ProjectAndContainerInfo,
+    ) -> anyhow::Result<bool> {
+        let project_id = committed.project_id().to_owned();
+        let _project_guard = self.project_locks.entry_by_ref(&project_id);
+        let Some(current) = self.get(&project_id) else {
+            return Ok(false);
+        };
+        let basic = committed
+            .container_info()
+            .ok_or_else(|| anyhow::anyhow!("Replacement container missing"))?;
+        if current.persistence_identity().generation != expected.persistence_identity().generation {
+            return Ok(current.persistence_identity().generation
+                == committed.persistence_identity().generation
+                && current.container_info().is_some_and(|c| {
+                    c.container_id == basic.container_id && c.workload_uid == basic.workload_uid
+                }));
+        }
+        let key = container_entry_key(&committed);
+        let _container_guard = self.container_locks.entry_by_ref(&key);
+        let previous = expected.container_info();
+        let existing = self.containers.view(&key, |_, entry| Arc::clone(entry));
+        if let Some(entry) = existing {
+            let current_basic = entry.info();
+            anyhow::ensure!(
+                (previous
+                    .as_ref()
+                    .is_some_and(
+                        |previous| current_basic.container_id == previous.container_id
+                            && current_basic.workload_uid == previous.workload_uid
+                    ))
+                    || (current_basic.container_id == basic.container_id
+                        && current_basic.workload_uid == basic.workload_uid),
+                "Agent container changed before verified registry publication"
+            );
+            if current_basic.container_id != basic.container_id {
+                let service_type = committed
+                    .service_type()
+                    .ok_or_else(|| anyhow::anyhow!("Agent service type missing"))?;
+                self.containers.insert(
+                    key.clone(),
+                    Arc::new(ContainerEntry::with_ref_count(
+                        basic.clone(),
+                        service_type,
+                        entry.logical_id().to_owned(),
+                        entry.ref_count(),
+                    )),
+                );
+                self.container_id_to_key.remove(&current_basic.container_id);
+            }
+        }
+        self.insert_container_locked(project_id, Arc::new(committed))?;
+        Ok(true)
     }
 
     pub(crate) fn insert_after_verified_builder_replacement(

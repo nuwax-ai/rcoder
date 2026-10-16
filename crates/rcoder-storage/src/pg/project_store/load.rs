@@ -159,6 +159,60 @@ fn parse_service_type(s: Option<&str>) -> Option<ServiceType> {
 // ========== SSE 回源直查（miss → PG 单查 → hydrate 镜像） ==========
 
 impl crate::pg::PgStore {
+    pub async fn is_session_registration_committed(
+        &self,
+        expected: &ProjectAndContainerInfo,
+        session_id: &str,
+    ) -> anyhow::Result<bool> {
+        let id = session_id.to_owned();
+        let Some((project, container)) = super::database::read(&self.database, move |tx| {
+            Box::pin(async move { repo::fetch_project_by_session(tx, &id).await })
+        })
+        .await
+        .context("Confirm durable session registration")?
+        else {
+            return Ok(false);
+        };
+        let containers = container
+            .map(|row| HashMap::from([(row.container_name.clone(), row)]))
+            .unwrap_or_default();
+        let persisted = hydrate_project(&project, &containers)?;
+        if !crate::adapter::session_container_matches(expected, &persisted) {
+            return Ok(false);
+        }
+        let session_generation = persisted.persistence_identity().sessions.get(session_id);
+        if expected
+            .persistence_identity()
+            .sessions
+            .get(session_id)
+            .is_some_and(|expected| Some(expected) != session_generation)
+        {
+            return Ok(false);
+        }
+        let registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+        if registration.get(expected.project_id())
+            == Some(&expected.persistence_identity().generation)
+        {
+            return Ok(false);
+        }
+        if let Some(current) = self.inner.get(expected.project_id())
+            && (!crate::adapter::session_container_matches(expected, &current)
+                || current
+                    .persistence_identity()
+                    .retired_sessions
+                    .get(session_id)
+                    == session_generation
+                || current
+                    .persistence_identity()
+                    .sessions
+                    .get(session_id)
+                    .is_some_and(|current| Some(current) != session_generation))
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// 按 session_id 读：内存镜像 hit 直接返回；miss 回源直查主库一次
     /// （所有副本连 `-rw` 主库，无复制延迟——正常路径 durable 提交后必中），
     /// 命中则 hydrate 进本地镜像（旁路持久化，此后走内存）。
@@ -166,60 +220,65 @@ impl crate::pg::PgStore {
         &self,
         session_id: &str,
     ) -> Option<Arc<ProjectAndContainerInfo>> {
-        if let Some(hit) = self.inner.get_by_session_id(session_id) {
-            return Some(hit);
+        match self.get_by_session_id_with_fetch_result(session_id).await {
+            Ok(info) => info,
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "Persistent session lookup failed");
+                None
+            }
         }
-        let baseline: HashMap<_, _> = self.inner.iter().into_iter().collect();
+    }
+
+    pub async fn get_by_session_id_with_fetch_result(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Option<Arc<ProjectAndContainerInfo>>> {
+        if let Some(hit) = self.inner.get_by_session_id(session_id) {
+            return Ok(Some(hit));
+        }
+        let (baseline, baseline_containers) = {
+            let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                self.inner.iter().into_iter().collect::<HashMap<_, _>>(),
+                self.container_registration
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone(),
+            )
+        };
         let id = session_id.to_owned();
-        let fetched = match super::database::read(&self.database, move |tx| {
+        let Some(fetched) = super::database::read(&self.database, move |tx| {
             Box::pin(async move { repo::fetch_project_by_session(tx, &id).await })
         })
         .await
-        {
-            Ok(Some(rows)) => rows,
-            Ok(None) => return None, // 真 miss（session 不存在）
-            Err(e) => {
-                // DB 错误 ≠ miss：区分记录，避免把存储故障误判为"流量打到错误副本"
-                tracing::warn!(
-                    "[STORAGE_PG] session backfill fetch failed (treating as miss): session_id={}, error={e}",
-                    session_id
-                );
-                return None;
-            }
+        .context("Read persistent session routing")?
+        else {
+            return Ok(None);
         };
-        let hydrated = match self.hydrate_fetched(session_id, fetched, &baseline) {
-            Ok(info) => info,
-            Err(error) => {
-                tracing::warn!(%session_id, %error, "Persistent session hydration failed");
-                return None;
-            }
-        };
-        tracing::info!(
-            "[STORAGE_PG] session miss backfilled from PG: session_id={}, project_id={}",
-            session_id,
-            hydrated.project_id()
-        );
-        Some(hydrated)
+        self.hydrate_fetched(session_id, fetched, &baseline, &baseline_containers)
     }
 
     /// 回源行组装为 info 并旁路写入内存镜像（数据本就来自 PG，回写不走持久化，
     /// 与 sync.rs 的 hydrate 同模式——复用 load 的组装逻辑）。
     /// `fetched_by` 是触发回源的 session_id（可能与 latest_session 不同）——
     /// 必须一并补进镜像，否则该 session 键下次查询仍 miss（回源缓存失效）
-    fn hydrate_fetched(
+    pub(super) fn hydrate_fetched(
         &self,
         fetched_by: &str,
         (project_row, container_row): (ProjectRow, Option<ContainerRow>),
         baseline: &HashMap<String, Arc<ProjectAndContainerInfo>>,
-    ) -> anyhow::Result<Arc<ProjectAndContainerInfo>> {
-        let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+        baseline_containers: &HashMap<
+            String,
+            shared_types::persistence::ContainerPersistenceIdentity,
+        >,
+    ) -> anyhow::Result<Option<Arc<ProjectAndContainerInfo>>> {
+        let registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
         let current = self.inner.get(&project_row.project_id);
         let unchanged = match (baseline.get(&project_row.project_id), current.as_ref()) {
             (None, None) => true,
             (Some(previous), Some(current)) => Arc::ptr_eq(previous, current),
             _ => false,
         };
-        anyhow::ensure!(unchanged, "Local project changed during session fetch");
         let mut container_by_name = HashMap::new();
         if let Some(row) = container_row {
             let name = row.container_name.clone();
@@ -228,31 +287,93 @@ impl crate::pg::PgStore {
         // Corrupt or mismatched persistence is an error, never a routable placeholder.
         let info = hydrate_project(&project_row, &container_by_name)?;
         anyhow::ensure!(
-            self.pending_ops.load(std::sync::atomic::Ordering::Acquire) == 0,
-            "Local persistence changed during backfill"
-        );
-        if let Some(existing) = self.inner.get(&project_row.project_id) {
-            anyhow::ensure!(
-                existing.persistence_identity().generation == project_row.generation
-                    && existing.persistence_identity().revision <= project_row.row_revision,
-                "Project changed during backfill"
-            );
-        }
-        for (name, row) in &container_by_name {
-            self.container_registration
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(name.clone(), row.persistence_identity());
-        }
-        anyhow::ensure!(
             info.sessions().contains(fetched_by),
             "Fetched session identity missing from snapshot"
         );
+        let fetched_generation = info.persistence_identity().sessions.get(fetched_by);
+        // A local accepted retirement wins over an older SQL response, even
+        // before its immutable delete reaches PostgreSQL.
+        if registration.get(&project_row.project_id) == Some(&project_row.generation) {
+            return Ok(None);
+        }
+        if let Some(existing) = &current {
+            let same_generation =
+                existing.persistence_identity().generation == project_row.generation;
+            if !same_generation && !unchanged {
+                return Ok(None);
+            }
+            if same_generation
+                && (existing
+                    .persistence_identity()
+                    .retired_sessions
+                    .get(fetched_by)
+                    == fetched_generation
+                    || existing
+                        .persistence_identity()
+                        .sessions
+                        .get(fetched_by)
+                        .is_some_and(|generation| Some(generation) != fetched_generation))
+            {
+                return Ok(None);
+            }
+            // Metadata changes are harmless; a physical-instance change during
+            // the database read must never route an old session to its successor.
+            if !unchanged && !crate::adapter::session_container_matches(&info, existing) {
+                return Ok(None);
+            }
+        } else if baseline.contains_key(&project_row.project_id) {
+            return Ok(None);
+        }
+        let mut containers = self
+            .container_registration
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for (name, row) in &container_by_name {
+            if let Some(current) = containers.get(name) {
+                let different_instance = current.generation != row.container_generation
+                    || current
+                        .physical_uid
+                        .as_ref()
+                        .is_some_and(|uid| row.container_id.as_ref() != Some(uid));
+                // A locally admitted successor may predate the SQL fetch but
+                // commit while its old response is in flight. Comparing only
+                // cursor changes since admission misses that legitimate race.
+                if (current.predecessor.as_ref() == Some(&row.container_generation)
+                    && different_instance)
+                    || (baseline_containers.get(name) != Some(current) && different_instance)
+                {
+                    return Ok(None);
+                }
+            }
+        }
+        let can_publish = unchanged
+            && self.pending_ops.load(std::sync::atomic::Ordering::Acquire) == 0
+            && current.as_ref().is_none_or(|current| {
+                current.persistence_identity().revision <= project_row.row_revision
+            })
+            && container_by_name.iter().all(|(name, row)| {
+                containers.get(name).is_none_or(|current| {
+                    current.generation == row.container_generation
+                        && current.revision <= row.row_revision
+                        && current
+                            .physical_uid
+                            .as_ref()
+                            .is_none_or(|uid| row.container_id.as_ref() == Some(uid))
+                })
+            });
         let info = Arc::new(info);
-        // 旁路写入镜像（数据来自 PG，不走持久化）
-        let pid = info.project_id().to_string();
-        self.inner
-            .insert_with_session(pid, Arc::clone(&info), None)?;
-        Ok(info)
+        if can_publish {
+            self.inner.insert_with_session(
+                info.project_id().to_owned(),
+                Arc::clone(&info),
+                None,
+            )?;
+            for (name, row) in &container_by_name {
+                containers.insert(name.clone(), row.persistence_identity());
+            }
+        }
+        // Cache admission is optional. An unrelated pending write or a harmless
+        // project metadata update cannot turn a validated SQL result into 404.
+        Ok(Some(info))
     }
 }

@@ -215,7 +215,10 @@ impl KubernetesRuntime {
                     .as_ref()
                     .and_then(|spec| spec.template.spec.as_ref())
                     .and_then(workspace_claim_name);
-                if existing_st != Some(&service_type.to_string()) {
+                let same_family = existing_st
+                    .and_then(|value| value.parse::<ServiceType>().ok())
+                    .is_some_and(|existing| existing.same_container_family(*service_type));
+                if !same_family {
                     warn!(
                         "[K8S-STS] {} exists but service_type mismatch (existing={:?}, requested={:?}); recreating",
                         sts_name, existing_st, service_type

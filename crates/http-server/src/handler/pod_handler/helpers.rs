@@ -420,7 +420,7 @@ pub(crate) fn validate_agent_dev_stage(app_stage: Option<&str>) -> Result<(), St
 ///
 /// pod_ensure 的并发等待命中分支与主流程尾部共用（两处逐字同构提取）：
 /// 容器就绪后无论新建、复用还是由并发请求代建，注册/记录/响应三步一致。
-pub(super) fn persist_and_respond(
+pub(super) async fn persist_and_respond(
     state: &AppState,
     request: &EnsurePodRequest,
     service_type: &ServiceType,
@@ -455,12 +455,50 @@ pub(super) fn persist_and_respond(
         pinfo
     };
 
-    state
-        .insert_project(request.project_id.clone(), Arc::new(project_info))
-        .map_err(|e| {
-            tracing::error!("[STORAGE] insert_project failed: {}", e);
-            e
-        })?;
+    let registered = if matches!(
+        service_type,
+        ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject
+    ) {
+        // Compare the actual request identity at the central boundary. Copying
+        // historical owner/pod/type from an existing record would authorize a
+        // different request merely because its old record matched itself.
+        let mut project_info = project_info;
+        project_info.set_user_id(Some(request.user_id.clone()));
+        project_info.set_pod_id(request.pod_id.clone());
+        project_info.set_service_type(Some(*service_type));
+        let options = ContainerCreateOptions {
+            user_id: request.user_id.clone(),
+            project_id: request.project_id.clone(),
+            resource_limits: resolve_resource_limits_from_config(
+                state,
+                service_type,
+                request.resource_limits.clone(),
+            )?,
+            pod_id: request.pod_id.clone(),
+            isolation_type: request.isolation_type.clone(),
+            tenant_id: request.tenant_id.clone(),
+            space_id: request.space_id.clone(),
+            service_type: *service_type,
+        };
+        let params = ComputerContainerManager::creation_params(&options)?;
+        state
+            .ensure_computer_project_mapping(
+                &params, Arc::new(project_info),
+                crate::app_state::RegistrationMetadata::PreserveChatMetadata,
+            )
+            .await
+            .map_err(|error| {
+                tracing::error!(project_id = %request.project_id, %error, "Computer project registration failed");
+                error.downcast::<AppError>().unwrap_or_else(|error| AppError::internal_server_error(&format!("Computer project registration: {error:#}")))
+            })?
+    } else {
+        let project_info = Arc::new(project_info);
+        state.insert_project(request.project_id.clone(), project_info.clone())?;
+        project_info
+    };
+    let info = registered.container_info().ok_or_else(|| {
+        AppError::internal_server_error("Registered project has no current container")
+    })?;
     debug!(
         "[POD_ENSURE] project record updated: project_id={}, user_id={}, container_id={}",
         request.project_id, request.user_id, info.container_id
@@ -571,3 +609,6 @@ pub(crate) fn validate_pod_ids<T>(
     }
     None
 }
+
+#[cfg(all(test, feature = "userapp-turso"))]
+mod identity_tests;

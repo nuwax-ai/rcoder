@@ -41,6 +41,33 @@ pub trait AgentContainerRuntime: Send + Sync {
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo>;
 
+    /// Verify a fresh Agent workload replacement without stopping, creating or
+    /// modifying resources. A cached address or a same-named workload is not
+    /// sufficient. Unsupported backends retain their ordinary registration path.
+    async fn verify_agent_replacement(
+        &self,
+        _params: &ContainerCreateParams,
+        _previous: Option<&ContainerBasicInfo>,
+        _replacement: &ContainerBasicInfo,
+    ) -> ContainerRuntimeResult<super::types::VerifiedAgentReplacement> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Verified Agent workload replacement is unsupported".into(),
+        ))
+    }
+
+    /// Stop only the captured Agent physical instance. Implementations must
+    /// never resolve a later same-named resource as a replacement delete target.
+    async fn stop_agent_container_if_matches(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+        _expected_container_id: &str,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Captured Agent stop is unsupported".into(),
+        ))
+    }
+
     async fn acquire_builder_operation(
         &self,
         _app_id: &str,

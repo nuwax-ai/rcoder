@@ -1,4 +1,6 @@
 mod agent;
+mod agent_registration;
+pub use agent_registration::{AgentWorkspaceIdentity, VerifiedAgentReplacement};
 pub mod app_cli_evt;
 pub mod archive_links;
 pub mod file_entry_policy;

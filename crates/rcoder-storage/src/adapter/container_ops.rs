@@ -17,6 +17,11 @@ use shared_types::IdleContainerInfo;
 impl ProjectAdapter {
     // ========== 容器操作 ==========
 
+    #[cfg(feature = "pg")]
+    pub(crate) fn registered_container_by_key(&self, key: &str) -> Option<ContainerBasicInfo> {
+        self.containers.view(key, |_, entry| entry.info())
+    }
+
     /// 保存容器信息（更新或创建）
     ///
     /// 通过 view() 获取 `Arc<ContainerEntry>`，利用内部可变性（RwLock）更新。
@@ -43,6 +48,8 @@ impl ProjectAdapter {
                 ));
             }
         };
+
+        let _container_guard = self.container_locks.entry_by_ref(&container.container_name);
 
         // view() 获取 Arc（DashMap 读锁立即释放），通过 RwLock 更新字段。
         // 键用 container_name（与 insert 的 container_entry_key 一致）。

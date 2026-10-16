@@ -583,7 +583,8 @@ async fn rebind_rows(
         basic.workload_uid.as_deref(),
     )?;
     ensure!(
-        repo::upsert_container(tx, &container).await? == PersistenceOperationOutcome::Committed,
+        repo::upsert_verified_replacement_container(tx, &container).await?
+            == PersistenceOperationOutcome::Committed,
         "Builder registry predecessor changed during replacement"
     );
     ensure!(

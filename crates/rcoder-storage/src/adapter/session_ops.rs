@@ -11,8 +11,93 @@ use shared_types::ProjectAndContainerInfo;
 use super::{ProjectAdapter, container_entry_key};
 use tracing::debug;
 
+/// Structural revisions are metadata cursors, not physical runner identities.
+pub(crate) fn session_container_matches(
+    expected: &ProjectAndContainerInfo,
+    current: &ProjectAndContainerInfo,
+) -> bool {
+    let (Some(expected_basic), Some(current_basic)) =
+        (expected.container_info(), current.container_info())
+    else {
+        return false;
+    };
+    expected.project_id() == current.project_id()
+        && expected.persistence_identity().generation == current.persistence_identity().generation
+        && expected
+            .service_type()
+            .zip(current.service_type())
+            .is_some_and(|(expected, current)| expected.same_container_family(current))
+        && expected.user_id() == current.user_id()
+        && expected.pod_id() == current.pod_id()
+        && expected
+            .persistence_identity()
+            .container
+            .as_ref()
+            .map(|c| &c.generation)
+            == current
+                .persistence_identity()
+                .container
+                .as_ref()
+                .map(|c| &c.generation)
+        && !expected_basic.container_id.is_empty()
+        && expected_basic.container_id == current_basic.container_id
+        && expected_basic.container_name == current_basic.container_name
+        && expected_basic.project_id == current_basic.project_id
+        && expected_basic.workload_uid == current_basic.workload_uid
+        && expected
+            .persistence_identity()
+            .container
+            .as_ref()
+            .is_none_or(|identity| {
+                identity.physical_uid.as_deref() == Some(expected_basic.container_id.as_str())
+            })
+        && current
+            .persistence_identity()
+            .container
+            .as_ref()
+            .is_none_or(|identity| {
+                identity.physical_uid.as_deref() == Some(current_basic.container_id.as_str())
+            })
+}
+
 impl ProjectAdapter {
     // ========== Session 操作 ==========
+
+    /// Append to the exact runner captured before dispatch. Preserve all current
+    /// project metadata and other sessions, including concurrent request updates.
+    pub(crate) fn append_session_for_container(
+        &self,
+        expected: &ProjectAndContainerInfo,
+        session_id: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(!session_id.is_empty(), "Session identity is empty");
+        let project_id = expected.project_id();
+        let _project_guard = self.project_locks.entry_by_ref(project_id);
+        let Some(current) = self.get(project_id) else {
+            return Ok(false);
+        };
+        let key = container_entry_key(&current);
+        let _container_guard = self.container_locks.entry_by_ref(&key);
+        if !session_container_matches(expected, &current)
+            || current
+                .persistence_identity()
+                .retired_sessions
+                .get(session_id)
+                != expected
+                    .persistence_identity()
+                    .retired_sessions
+                    .get(session_id)
+        {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            self.session_index
+                .view(session_id, |_, owner| owner.1 == project_id)
+                .unwrap_or(true),
+            "Session belongs to another project"
+        );
+        Ok(self.add_session_to_project(project_id, session_id))
+    }
 
     /// 通过 session_id 获取项目信息
     ///

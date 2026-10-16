@@ -38,6 +38,9 @@ pub(crate) struct ProtocolAgent {
     pub(crate) calls: Mutex<Vec<AgentCall>>,
     pub(crate) sessions: Mutex<BTreeMap<String, String>>,
     pub(crate) events: Mutex<BTreeMap<String, Vec<ProgressEvent>>>,
+    /// Optional protocol fault boundary: the RPC is accepted, but its response
+    /// has not reached the HTTP handler's completion registration yet.
+    pub(crate) after_chat: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     sequence: AtomicUsize,
 }
 
@@ -66,6 +69,11 @@ impl agent_service_server::AgentService for ProtocolAgent {
                 })
         };
         sessions.insert(request.project_id.clone(), sid.clone());
+        drop(sessions);
+        let after_chat = self.after_chat.lock().unwrap().take();
+        if let Some(after_chat) = after_chat {
+            after_chat();
+        }
         Ok(Response::new(ChatResponse {
             success: true,
             project_id: request.project_id,

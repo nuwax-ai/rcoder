@@ -20,6 +20,9 @@ use crate::{
 };
 use agent_provisioning::AgentDownloadManager;
 
+mod agent_registration;
+pub use agent_registration::RegistrationMetadata;
+
 // 存储契约 trait 引入作用域：AppState.projects 为枚举 ProjectStoreBackend，
 // 其上的 get/insert/... 方法均经 shared_types::ProjectStore 解析。
 use shared_types::ProjectStore as _;

@@ -26,6 +26,9 @@ mod tests;
 #[cfg(test)]
 mod lifecycle_tests;
 
+#[cfg(test)]
+mod agent_registration_tests;
+mod agent_replacement;
 mod builder_replacement;
 mod database;
 pub(in crate::pg) mod userapp_agent;

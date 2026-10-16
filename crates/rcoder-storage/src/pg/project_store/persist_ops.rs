@@ -15,6 +15,24 @@ use shared_types::{ContainerBasicInfo, ProjectAndContainerInfo, ServiceType};
 
 use crate::adapter::container_entry_key;
 
+/// Session completion is an append to the captured physical runner, not a
+/// whole-project metadata replacement. Revisions may advance independently.
+#[derive(Debug, Clone)]
+pub struct ContainerSessionAppend {
+    pub project_id: String,
+    pub project_generation: String,
+    pub container_name: String,
+    pub container_generation: String,
+    pub physical_uid: String,
+    pub workload_uid: Option<String>,
+    pub logical_id: String,
+    pub service_type: String,
+    pub session_id: String,
+    pub session_generation: String,
+    pub predecessor: Option<String>,
+    pub at: DateTime<Utc>,
+}
+
 /// 单个 project 的持久化快照（whole-row upsert）
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ProjectSnapshot {
@@ -181,6 +199,7 @@ impl ContainerSnapshot {
 /// （variant_size_differences），队列常驻内存更紧凑。
 #[derive(Debug, Clone)]
 pub enum PersistOp {
+    AppendSessionForContainer(Box<ContainerSessionAppend>),
     // ===== 结构性（永不丢弃） =====
     UserAppAgentMapping {
         request_id: String,
@@ -281,6 +300,7 @@ impl PersistOp {
     /// 日志用的简短标签
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::AppendSessionForContainer(_) => "append_session_for_container",
             Self::UserAppAgentMapping { .. } => "userapp_agent_mapping",
             Self::RegisterProject { .. } => "register_project",
             #[cfg(test)]

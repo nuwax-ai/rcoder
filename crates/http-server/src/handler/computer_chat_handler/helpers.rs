@@ -97,116 +97,43 @@ pub(super) async fn ensure_project_workspace_exists(
 /// * `project_id` - 项目 ID
 /// * `container_info` - 容器信息
 /// * `request` - 聊天请求
-pub(super) fn ensure_project_mapping_in_state(
+pub(super) async fn ensure_project_mapping_in_state(
     state: &Arc<AppState>,
     user_id: &str,
     project_id: &str,
     container_info: &ContainerBasicInfo,
     request: &ComputerChatRequest,
-) -> Result<(), AppError> {
-    // 检查是否已存在该 project_id 的记录
-    let existing_project = state.get_project(project_id);
-    if let Some(ref existing) = existing_project {
-        // 如果记录存在，检查容器ID是否变更
-        if let Some(existing_container) = existing.container_info() {
-            if existing_container.container_id == container_info.container_id {
-                debug!(
-                    "🔄 [COMPUTER_CHAT] project record already exists and container unchanged: project_id={}",
-                    project_id
-                );
-                return Ok(());
-            } else {
-                info!(
-                    "🔄 [COMPUTER_CHAT] Detected container change: project_id={}, old_cid={}, new_cid={}",
-                    project_id, existing_container.container_id, container_info.container_id
-                );
-                // 容器变更，继续执行后续的插入/更新逻辑（insert_project 会执行 upsert）
-            }
-        } else {
-            // 现有记录没有容器信息，继续更新
-        }
-    }
-
-    // 创建新的 ProjectAndContainerInfo
-    let mut project_info = shared_types::ProjectAndContainerInfo::new(project_id.to_string());
-
-    // 设置 user_id（ComputerAgentRunner 模式）
-    project_info.set_user_id(Some(user_id.to_string()));
-    // 设置 pod_id（共享容器模式）
-    project_info.set_pod_id(request.pod_id.clone());
-
-    // 🛡️ 关键修复：如果现有记录有 session_id，保留它
-    // 多 session 模型下：把 existing 的所有 session 都迁过来（容器变更场景）
-    if let Some(ref existing) = existing_project {
-        let existing_sessions = existing.sessions();
-        if !existing_sessions.is_empty() {
-            for sid in &existing_sessions {
-                project_info.add_session(sid.clone());
-            }
-            debug!(
-                "🔄 [COMPUTER_CHAT] Preserved {} existing session(s): project_id={}",
-                existing_sessions.len(),
-                project_id
-            );
-        }
-    }
-
-    // 更新容器信息
-    project_info.update_extended_from_request(
+    options: &crate::service::computer_container_manager::ContainerCreateOptions,
+) -> Result<Arc<shared_types::ProjectAndContainerInfo>, AppError> {
+    let mut incoming = shared_types::ProjectAndContainerInfo::new(project_id.to_owned());
+    incoming.set_user_id(Some(user_id.to_owned()));
+    incoming.set_pod_id(request.pod_id.clone());
+    incoming.update_extended_from_request(
         Some(container_info.clone()),
         request.model_provider.clone(),
         request.request_id.clone(),
-        Some(shared_types::ServiceType::ComputerAgentRunner),
+        Some(options.service_type),
     );
-    project_info.set_scope(
+    incoming.set_scope(
         request.tenant_id.clone(),
         request.space_id.clone(),
         request.isolation_type.clone(),
     );
-
-    // immediately insert project record
-    // 注意：如果有现有 session，必须使用 insert_with_session 来同步更新 session_index
-    // 否则容器重建后，session_index 中会丢失 session 映射，导致 SSE 连接失败
-    let project_info_arc = Arc::new(project_info);
-    let existing_sessions: Vec<String> = existing_project
-        .as_ref()
-        .map(|p| p.sessions().into_iter().collect())
-        .unwrap_or_default();
-
-    if existing_sessions.is_empty() {
-        // 没有现有 session，直接插入
-        state
-            .insert_project(project_id.to_string(), project_info_arc)
-            .map_err(|e| {
-                tracing::error!("[STORAGE] insert_project failed: {}", e);
-                e
-            })?;
-    } else {
-        // 有现有 session，使用 insert_with_session 同步更新 session_index
-        // 对于多个 session，先插入项目，再逐个添加 session
-        state
-            .insert_project(project_id.to_string(), project_info_arc.clone())
-            .map_err(|e| {
-                tracing::error!("[STORAGE] insert_project failed: {}", e);
-                e
-            })?;
-
-        // 逐个添加现有 session 到 session_index
-        for sid in &existing_sessions {
-            state.add_session_to_project(project_id, sid);
-        }
-
-        debug!(
-            "🔄 [COMPUTER_CHAT] Synced {} existing session(s) to session_index: project_id={}",
-            existing_sessions.len(),
-            project_id
-        );
-    }
-
-    info!(
-        "🆕 [COMPUTER_CHAT] Inserted project record (immediately after container creation): user_id={}, project_id={}, container_id={}",
-        user_id, project_id, container_info.container_id
-    );
-
-    Ok(())
+    let params = crate::service::ComputerContainerManager::creation_params(options)?;
+    state
+        .ensure_computer_project_mapping(
+            &params,
+            Arc::new(incoming),
+            crate::app_state::RegistrationMetadata::UpdateChatMetadata,
+        )
+        .await
+        .map_err(|error| {
+            error!(
+                project_id,
+                "[STORAGE] Computer registration failed before dispatch: {error:#}"
+            );
+            error.downcast::<AppError>().unwrap_or_else(|error| {
+                AppError::internal_server_error(&format!("Register Computer container: {error:#}"))
+            })
+        })
 }
