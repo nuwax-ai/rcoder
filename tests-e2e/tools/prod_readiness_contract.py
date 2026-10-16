@@ -72,6 +72,15 @@ REQUIRED_STEPS = frozenset({
     'owned containers removed and volumes retained',
 })
 
+ONE_TIME_DEPLOY_ENV_KEYS = frozenset({'APP_DEPLOY_URL', 'APP_RELEASE_ID', 'APP_DEPLOY_SHA256',
+                                    'APP_DEPLOY_OPERATION_ID'})
+
+
+def retained_runtime_environment(raw_environment):
+    """Keep the stable deployment generation and applied business configuration."""
+    return {key: value for entry in raw_environment if '=' in entry
+            for key, value in [entry.split('=', 1)] if key not in ONE_TIME_DEPLOY_ENV_KEYS}
+
 
 def source_identity(repo, input_manifest=None):
     """Match strict launcher input hashing, including snapshots without .git."""
@@ -611,7 +620,7 @@ exec psql -h "${PGHOST:-localhost}" -p "${PGPORT:-5432}" \
                           f'/api/v1/userapp/{self.app}'):
                 status, envelope = self.api_raw(route)
                 self.check(phase + ': missing workload remains a runtime diagnostic',
-                           status == 404 and envelope.get('success') is False
+                           status == 200 and envelope.get('success') is False
                            and envelope.get('code') == 'CONTAINER_NOT_FOUND',
                            {'path': route, 'status': status, 'code': envelope.get('code')})
                 observations.append({'path': route, 'status': status, 'code': envelope.get('code')})
@@ -622,12 +631,8 @@ exec psql -h "${PGHOST:-localhost}" -p "${PGPORT:-5432}" \
     def traffic_recreate(self, phase, marker, release, deployment, generation, downloads):
         before, mounts = self.current()
         original = self.inspect(before)
-        once = {'APP_DEPLOY_URL', 'APP_RELEASE_ID', 'APP_DEPLOY_SHA256',
-                'APP_DEPLOY_OPERATION_ID', 'APP_DEPLOY_GENERATION_ID'}
-        def environment(row):
-            return {key: value for entry in row['Config']['Env'] if '=' in entry
-                    for key, value in [entry.split('=', 1)] if key not in once}
-        expected_environment = environment(original)
+        once = ONE_TIME_DEPLOY_ENV_KEYS
+        expected_environment = retained_runtime_environment(original['Config']['Env'])
         counters = self.recovery_counters(before)
         self.check(phase + ': real migration and SQL preconditions exist',
                    bool(counters['migrations']) and counters['sql_executions'] == 1, counters)
@@ -661,12 +666,17 @@ exec psql -h "${PGHOST:-localhost}" -p "${PGPORT:-5432}" \
         after, restored_mounts = self.current()
         restored = self.inspect(after)
         self.check('traffic recovery preserves applied environment and image',
-                   restored['Image'] == original['Image'] and environment(restored) == expected_environment,
+                   restored['Image'] == original['Image'] and retained_runtime_environment(restored['Config']['Env']) == expected_environment,
                    {'before_image': original['Image'], 'after_image': restored['Image'],
                     'retained_env_sha256': hashlib.sha256(json.dumps(expected_environment, sort_keys=True).encode()).hexdigest(),
-                    'restored_env_sha256': hashlib.sha256(json.dumps(environment(restored), sort_keys=True).encode()).hexdigest()})
+                    'restored_env_sha256': hashlib.sha256(json.dumps(retained_runtime_environment(restored['Config']['Env']), sort_keys=True).encode()).hexdigest()})
         raw_environment = dict(entry.split('=', 1) for entry in restored['Config']['Env'] if '=' in entry)
         self.check(phase + ': old deployment declaration is not replayed', not once.intersection(raw_environment))
+        self.check(phase + ': original deployment generation is retained',
+                   raw_environment.get('APP_DEPLOY_GENERATION_ID') == generation
+                   and expected_environment.get('APP_DEPLOY_GENERATION_ID') == generation,
+                   {'before': expected_environment.get('APP_DEPLOY_GENERATION_ID'),
+                    'after': raw_environment.get('APP_DEPLOY_GENERATION_ID')})
         self.check(phase + ': real prod proxy serves restored JavaScript', self.proxy('/app.js', marker=marker)['matches'])
         self.verify_runtime(phase, deployment, generation, marker, release)
         self.check('traffic recovery preserves four bind mounts and PostgreSQL data',
@@ -767,6 +777,23 @@ exec psql -h "${PGHOST:-localhost}" -p "${PGPORT:-5432}" \
                 seconds=60)
         self.wait(action + ': original operation succeeded', terminal, lambda value: value.get('state') == 'succeeded')
         return operation_id
+
+    def verify_invalid_artifact_failure(self, status, failed, downloads):
+        failed_id = failed.get('operation_id')
+        fetched = any(row.get('path') == '/invalid.zip' for row in downloads)
+        self.check('invalid artifact retains concrete failure and accepted operation', status == 200
+                   and failed.get('success') is False and failed.get('code') == 'ERR_BACKEND_ERROR'
+                   and bool(failed_id) and fetched
+                   and bool(failed.get('message')) and 'underlying cause' not in failed['message']
+                   and failed['message'] != 'Backend service failed',
+                   {'response': failed, 'invalid_artifact_fetched': fetched})
+        _, observation = self.api(f'/api/v1/userapp/{self.app}/operations/{urllib.parse.quote(failed_id, safe="")}')
+        record = observation['data']
+        self.check('invalid artifact result belongs to accepted operation',
+                   record.get('operation_id') == failed_id and record.get('app_id') == self.app
+                   and record.get('state') == 'Failed' and record.get('error_code') == failed['code']
+                   and bool(record.get('error_message')), record)
+        return failed_id
 
     def owner_recovery(self, cid, original_identity):
         before = self.runtime_json(cid, '/v1/runtime/identity')
@@ -1076,17 +1103,7 @@ def main():
             'lifecycle_id': contract.lifecycle, 'deploy_mode': 'hot', 'url': invalid_url,
             'sha256': hashlib.sha256(paths['/invalid.zip']).hexdigest(), 'release_id': invalid_release,
             'auto_execute_sql': False}, timeout=330)
-        failed_id = failed.get('operation_id')
-        contract.check('invalid artifact retains concrete failure and accepted operation', status >= 400
-                       and failed.get('success') is False and bool(failed_id)
-                       and bool(failed.get('message')) and 'underlying cause' not in failed['message']
-                       and failed['message'] != 'Backend service failed', failed)
-        _, failure_observation = contract.api(f'/api/v1/userapp/{app}/operations/{urllib.parse.quote(failed_id, safe="")}')
-        contract.check('invalid artifact result belongs to accepted operation',
-                       failure_observation['data'].get('operation_id') == failed_id
-                       and failure_observation['data'].get('app_id') == app
-                       and failure_observation['data'].get('state') == 'Failed'
-                       and bool(failure_observation['data'].get('error_message')), failure_observation['data'])
+        contract.verify_invalid_artifact_failure(status, failed, downloads)
         contract.check('source stayed stable throughout the run', source_identity(repo) == report['source'])
         if contract.owned_controller is not None:
             outcome = cleanup(contract.fixture_root, contract.owned_controller['run_id'], contract.owned_controller['case_id'])

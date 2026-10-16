@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+from types import SimpleNamespace
 import tomllib
 import unittest
 from unittest.mock import patch
@@ -14,6 +15,16 @@ import prod_readiness_contract as contract
 
 
 class InputContracts(unittest.TestCase):
+    def test_runtime_restoration_retains_generation_without_replaying_the_previous_request(self):
+        before = ['APP_DEPLOY_URL=http://artifact.invalid/old.zip', 'APP_RELEASE_ID=old-release',
+                  'APP_DEPLOY_SHA256=old-sha', 'APP_DEPLOY_OPERATION_ID=old-request',
+                  'APP_DEPLOY_GENERATION_ID=stable-generation', 'APP_ID=ownedapp', 'BUSINESS_SECRET=x=y']
+        after = ['APP_DEPLOY_GENERATION_ID=stable-generation', 'APP_ID=ownedapp', 'BUSINESS_SECRET=x=y']
+        retained = contract.retained_runtime_environment(before)
+        self.assertEqual(retained, dict(entry.split('=', 1) for entry in after))
+        self.assertNotEqual(retained, contract.retained_runtime_environment(
+            [entry.replace('stable-generation', 'another-generation') for entry in after]))
+
     def test_generated_probe_artifact_matches_current_manifest_protocol(self):
         repo = Path(__file__).resolve().parents[2]
         types = (repo / 'crates/workspace-manifest/src/types.rs').read_text()
@@ -103,6 +114,83 @@ class InputContracts(unittest.TestCase):
         self.assertFalse(contract.declaration_matches(['APP_DEPLOY_OPERATION_ID=cold-A',
                          'APP_DEPLOY_GENERATION_ID=native-session'], expected))
         self.assertFalse(contract.declaration_matches(['APP_DEPLOY_OPERATION_ID=cold-A'], expected))
+
+
+class FormalReadOnlyQueryContracts(unittest.TestCase):
+    def exercise(self, status, envelope, compute_ids=()):
+        report = {'checks': []}
+        fixture = contract.Contract(SimpleNamespace(user_id='fixture-user'), report, 'formalapp')
+        with patch.object(fixture, 'readiness', return_value={'ready': False, 'container': {'status': 'missing'}}), \
+             patch.object(fixture, 'api_raw', return_value=(status, envelope)) as query, \
+             patch.object(fixture, 'application_ids', return_value=list(compute_ids)), \
+             patch.object(contract.time, 'sleep'), patch.object(contract, 'run') as docker, \
+             patch('builtins.print'):
+            fixture.assert_deleted_queries_read_only('formal-query')
+            docker.assert_not_called()
+            return report, [call.args[0] for call in query.call_args_list]
+
+    def test_formal_error_envelope_observes_missing_compute_without_creating(self):
+        # app_manager::routes installs userapp_http::envelope_errors: status 200
+        # is only transport success; exact code + false still describe failure.
+        report, paths = self.exercise(200, {'success': False, 'code': 'CONTAINER_NOT_FOUND'})
+        self.assertTrue(all(row['ok'] is True for row in report['checks']))
+        self.assertEqual(paths, [
+            '/api/v1/userapp/formalapp/prod/stats?user_id=fixture-user',
+            '/api/v1/userapp/formalapp',
+        ] * 2)
+        self.assertIn('deleted prod queries remain read only', {row['name'] for row in report['checks']})
+
+    def test_transport_404_wrong_semantic_errors_and_success_cannot_pass(self):
+        cases = [(404, {'success': False, 'code': 'CONTAINER_NOT_FOUND'}),
+                 (200, {'success': True, 'code': 'CONTAINER_NOT_FOUND'}),
+                 (200, {'success': False, 'code': 'ERR_APP_NOT_FOUND'}),
+                 (200, {'success': False, 'code': 'ERR_BACKEND_ERROR'}),
+                 (200, {'success': False, 'code': 'ERR_VALIDATION'}),
+                 (200, {'success': False, 'code': '0000'}),
+                 (200, {'success': 0, 'code': 'CONTAINER_NOT_FOUND'})]
+        for status, envelope in cases:
+            with self.subTest(status=status, envelope=envelope):
+                with self.assertRaises(RuntimeError):
+                    self.exercise(status, envelope)
+
+    def test_query_side_effect_cannot_pass_even_with_the_expected_error_envelope(self):
+        with self.assertRaises(RuntimeError):
+            self.exercise(200, {'success': False, 'code': 'CONTAINER_NOT_FOUND'}, ['unexpected-runtime'])
+
+
+class InvalidArtifactEnvelopeContracts(unittest.TestCase):
+    def exercise(self, status=200, response_patch=None, record_patch=None, fetched=True):
+        report = {'checks': []}
+        fixture = contract.Contract(SimpleNamespace(), report, 'artifactapp')
+        response = {'success': False, 'code': 'ERR_BACKEND_ERROR', 'operation_id': 'invalid-op',
+                    'message': 'invalid ZIP archive: central directory is missing'}
+        response.update(response_patch or {})
+        record = {'operation_id': 'invalid-op', 'app_id': 'artifactapp', 'state': 'Failed',
+                  'error_code': 'ERR_BACKEND_ERROR', 'error_message': 'invalid ZIP archive'}
+        record.update(record_patch or {})
+        with patch.object(fixture, 'api', return_value=(200, {'success': True, 'code': '0000', 'data': record})) as query, \
+             patch.object(contract, 'run') as docker, patch('builtins.print'):
+            failed_id = fixture.verify_invalid_artifact_failure(status, response, [{'path': '/invalid.zip'}] if fetched else [])
+            docker.assert_not_called()
+            query.assert_called_once_with('/api/v1/userapp/artifactapp/operations/invalid-op')
+            return failed_id, report
+
+    def test_formal_200_error_keeps_the_exact_failed_operation_and_actual_bad_download(self):
+        failed_id, report = self.exercise()
+        self.assertEqual(failed_id, 'invalid-op')
+        self.assertTrue(all(row['ok'] is True for row in report['checks']))
+
+    def test_unrelated_rejection_or_foreign_receipt_cannot_masquerade_as_a_bad_artifact(self):
+        cases = [dict(status=500), dict(response_patch={'success': True}),
+                 dict(response_patch={'code': '0000'}), dict(response_patch={'code': 'ERR_VALIDATION'}),
+                 dict(response_patch={'operation_id': None}), dict(fetched=False),
+                 dict(response_patch={'message': 'Backend service failed'}),
+                 dict(record_patch={'operation_id': 'foreign-op'}), dict(record_patch={'app_id': 'foreign-app'}),
+                 dict(record_patch={'state': 'Succeeded'}), dict(record_patch={'error_code': 'ERR_CONFLICT'})]
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(RuntimeError):
+                    self.exercise(**kwargs)
 
 
 class OwnedPreparationContracts(unittest.TestCase):

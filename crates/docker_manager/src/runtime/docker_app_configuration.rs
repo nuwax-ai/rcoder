@@ -27,12 +27,11 @@ const CONFIGURATION_DIRECTORY: &str = ".runtime-config";
 const PROD_DIRECTORY: &str = "prod";
 const CONFIGURATION_VERSION: u8 = 1;
 const CONFIGURATION_LIMIT: u64 = 4 * 1024 * 1024;
-const DEPLOYMENT_ENVIRONMENT: [&str; 5] = [
+const DEPLOYMENT_ENVIRONMENT: [&str; 4] = [
     "APP_DEPLOY_URL",
     "APP_RELEASE_ID",
     "APP_DEPLOY_SHA256",
     shared_types::APP_DEPLOY_OPERATION_ID,
-    shared_types::APP_DEPLOY_GENERATION_ID,
 ];
 
 // Deliberately no Debug: environment values can contain credentials.
@@ -231,6 +230,9 @@ fn strip_deployment_intent(params: &mut ContainerCreateParams) {
     params.execution_context = None;
     params.mutation_target = None;
     params.resource_binding = None;
+    // APP_DEPLOY_GENERATION_ID is the stable container/deployment identity used
+    // by app-cli restoration and subsequent hot deployments. Preserve it while
+    // removing the former request's download and operation instructions.
     for environment in [&mut params.env, &mut params.secrets].into_iter().flatten() {
         for key in DEPLOYMENT_ENVIRONMENT {
             environment.remove(key);
@@ -536,6 +538,10 @@ mod tests {
         let mut env = HashMap::from([
             ("BUSINESS_TOKEN".into(), "secret=retained".into()),
             ("POSTGRES_PASSWORD".into(), "database-secret".into()),
+            (
+                shared_types::APP_DEPLOY_GENERATION_ID.into(),
+                "stable-generation".into(),
+            ),
         ]);
         for key in DEPLOYMENT_ENVIRONMENT {
             env.insert(key.into(), "old-deployment-value".into());
@@ -600,6 +606,10 @@ mod tests {
         let env = params.env.unwrap();
         assert_eq!(env["BUSINESS_TOKEN"], "secret=retained");
         assert_eq!(env["POSTGRES_PASSWORD"], "database-secret");
+        assert_eq!(
+            env[shared_types::APP_DEPLOY_GENERATION_ID],
+            "stable-generation"
+        );
         assert!(
             DEPLOYMENT_ENVIRONMENT
                 .iter()
@@ -613,6 +623,60 @@ mod tests {
             Some("128Mi")
         );
         assert_eq!(params.ports.unwrap()[0].strip_prefix, Some(false));
+    }
+
+    #[test]
+    fn loading_keeps_stable_generation_without_replaying_an_old_operation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut snapshot = captured(root.path());
+        for key in DEPLOYMENT_ENVIRONMENT {
+            snapshot
+                .params
+                .env
+                .as_mut()
+                .unwrap()
+                .insert(key.into(), "former-request".into());
+        }
+        let mut secrets = HashMap::from([
+            (
+                shared_types::APP_DEPLOY_GENERATION_ID.into(),
+                "stable-generation".into(),
+            ),
+            ("BUSINESS_SECRET".into(), "secret=preserved".into()),
+        ]);
+        for key in DEPLOYMENT_ENVIRONMENT {
+            secrets.insert(key.into(), "former-request".into());
+        }
+        snapshot.params.secrets = Some(secrets);
+        snapshot.params.execution_context = Some(shared_types::UserAppExecutionContext {
+            app_id: "app1".into(),
+            lifecycle_id: "life1".into(),
+            operation_id: "old-request".into(),
+            executor_id: "old-executor".into(),
+            request_fingerprint: "a".repeat(64),
+        });
+        let restored = snapshot.into_params("app1", "life1", root.path()).unwrap();
+        assert!(restored.execution_context.is_none());
+        assert!(restored.mutation_target.is_none());
+        assert!(restored.resource_binding.is_none());
+        for environment in [
+            restored.env.as_ref().unwrap(),
+            restored.secrets.as_ref().unwrap(),
+        ] {
+            assert_eq!(
+                environment[shared_types::APP_DEPLOY_GENERATION_ID],
+                "stable-generation"
+            );
+            assert!(
+                DEPLOYMENT_ENVIRONMENT
+                    .iter()
+                    .all(|key| !environment.contains_key(*key))
+            );
+        }
+        assert_eq!(
+            restored.secrets.as_ref().unwrap()["BUSINESS_SECRET"],
+            "secret=preserved"
+        );
     }
 
     #[test]

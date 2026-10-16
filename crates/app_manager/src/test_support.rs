@@ -390,7 +390,6 @@ impl UserAppDeploymentRuntime for MockRuntime {
                 "APP_RELEASE_ID",
                 "APP_DEPLOY_SHA256",
                 shared_types::APP_DEPLOY_OPERATION_ID,
-                shared_types::APP_DEPLOY_GENERATION_ID,
             ] {
                 environment.remove(key);
             }

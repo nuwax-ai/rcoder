@@ -6036,7 +6036,8 @@ mod retained_traffic_runtime_tests {
         {
             let mut retained = runtime.retained_params.get_mut(app_id).unwrap();
             let env = retained.1.env.get_or_insert_default();
-            // These were one-time cold-deployment inputs, not a new command.
+            // The declaration is one-time input; the serving generation remains
+            // the stable identity used by later hot deployments.
             for (key, value) in [
                 ("APP_DEPLOY_URL", "http://artifact.invalid/expired.zip"),
                 ("APP_RELEASE_ID", "original-release"),
@@ -6142,7 +6143,12 @@ mod retained_traffic_runtime_tests {
         assert_eq!(restored.image_override, original.image_override);
         assert_eq!(restored.command, original.command);
         assert_eq!(restored.ports, original.ports);
-        assert_eq!(restored.env, original.env);
+        let mut expected_env = original.env.clone().unwrap_or_default();
+        expected_env.insert(
+            shared_types::APP_DEPLOY_GENERATION_ID.into(),
+            "original-generation".into(),
+        );
+        assert_eq!(restored.env.as_ref(), Some(&expected_env));
         assert_eq!(restored.secrets, original.secrets);
         assert_eq!(restored.recycle_enabled, Some(false));
         assert_eq!(restored.idle_timeout_seconds, Some(0));
@@ -6155,7 +6161,6 @@ mod retained_traffic_runtime_tests {
             "APP_RELEASE_ID",
             "APP_DEPLOY_SHA256",
             shared_types::APP_DEPLOY_OPERATION_ID,
-            shared_types::APP_DEPLOY_GENERATION_ID,
         ] {
             assert!(!restored.env.as_ref().unwrap().contains_key(key));
         }
