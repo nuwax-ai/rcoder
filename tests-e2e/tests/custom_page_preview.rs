@@ -19,9 +19,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use rcoder_e2e::common::Env;
 use rcoder_e2e::common::scenario::assert_hard_all;
-use rcoder_e2e::common::{Env, TestUserGuard};
 use serde_json::Value;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 // ============================================================
 // 工具：最小 vite 项目 zip 上传 + 生命周期 API
@@ -149,8 +150,11 @@ async fn keep_alive(env: &Env, project: &str, pid: i64, port: u16) -> Result<Val
     response.json().await.map_err(|e| format!("decode: {e}"))
 }
 
-/// Compose 的 Pingora 入口（宿主 8089 → 容器 8088，docker-compose 固定映射）。
+/// 隔离环境使用启动器指定的 Pingora 入口；日常 Compose 沿用 8089。
 fn proxy_base(env: &Env) -> String {
+    if let Ok(url) = std::env::var("E2E_PINGORA_URL") {
+        return url.trim_end_matches('/').to_owned();
+    }
     let rcoder = env.rcoder.trim_end_matches('/');
     match rcoder.rsplit_once(':') {
         Some((head, _port)) => format!("{head}:8089"),
@@ -167,7 +171,8 @@ async fn scenario_lifecycle_envelopes() {
         return;
     };
     let project = format!("cpp-{}", env.run_tag);
-    let _guard = TestUserGuard::new(&env, &format!("g-{scenario}"));
+    // Preview runs in the controller, so cleanup uses stop-dev for this project.
+    // It does not create a per-user agent container for TestUserGuard.
 
     if !upload_project(&env, &report, &project).await {
         assert_hard_all(report).await;
@@ -179,6 +184,7 @@ async fn scenario_lifecycle_envelopes() {
         Ok(v) => v,
         Err(e) => {
             report.assert_hard("start-dev 协调受理并起动", false, e);
+            note_stop(&report, stop_dev(&env, &project, 0).await);
             assert_hard_all(report).await;
             return;
         }
@@ -272,10 +278,8 @@ async fn scenario_lifecycle_envelopes() {
             && rebuilt["action"].as_str().unwrap_or_default() == "start",
         rebuilt.to_string(),
     );
-    let rebuilt_port = rebuilt["port"].as_u64().unwrap_or_default() as u16;
-    if rebuilt_port > 0 {
-        note_stop(stop_dev(&env, &project, rebuilt["pid"].as_i64().unwrap_or_default()).await);
-    }
+    // A lost or malformed response does not prove that rebuilding never started.
+    note_stop(&report, stop_dev(&env, &project, 0).await);
 
     assert_hard_all(report).await;
 }
@@ -289,13 +293,15 @@ async fn scenario_preview_http() {
         return;
     };
     let project = format!("cpph-{}", env.run_tag);
-    let _guard = TestUserGuard::new(&env, &format!("g-{scenario}"));
+    // Preview runs in the controller, so cleanup uses stop-dev for this project.
+    // It does not create a per-user agent container for TestUserGuard.
 
     if !upload_project(&env, &report, &project).await {
         assert_hard_all(report).await;
         return;
     }
     let Some(started) = start_dev_or_report(&env, &report, &project).await else {
+        note_stop(&report, stop_dev(&env, &project, 0).await);
         assert_hard_all(report).await;
         return;
     };
@@ -327,7 +333,7 @@ async fn scenario_preview_http() {
     }
 
     // 停止后：负缓存/未命中 → 回环拒绝（pingora 502 语义与现状一致）
-    note_stop(stop_dev(&env, &project, started.pid).await);
+    note_stop(&report, stop_dev(&env, &project, started.pid).await);
     tokio::time::sleep(Duration::from_secs(2)).await;
     let dead = env
         .http
@@ -354,20 +360,39 @@ async fn scenario_hmr_websocket() {
         return;
     };
     let project = format!("cppw-{}", env.run_tag);
-    let _guard = TestUserGuard::new(&env, &format!("g-{scenario}"));
+    // Preview runs in the controller, so cleanup uses stop-dev for this project.
+    // It does not create a per-user agent container for TestUserGuard.
 
     if !upload_project(&env, &report, &project).await {
         assert_hard_all(report).await;
         return;
     }
     let Some(started) = start_dev_or_report(&env, &report, &project).await else {
+        note_stop(&report, stop_dev(&env, &project, 0).await);
         assert_hard_all(report).await;
         return;
     };
     let proxy = proxy_base(&env).replace("http://", "");
     // vite 5：HMR ws 路径 = base（默认 /proxy/{port}/）
     let ws_url = format!("ws://{proxy}/proxy/{}/", started.port);
-    let (stream, _resp) = match tokio_tungstenite::connect_async(ws_url.clone()).await {
+    let mut request = ws_url
+        .clone()
+        .into_client_request()
+        .expect("HMR WebSocket URL");
+    request.headers_mut().insert(
+        "sec-websocket-protocol",
+        "vite-hmr".parse().expect("Vite HMR subprotocol"),
+    );
+    let handshake = match tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio_tungstenite::connect_async(request),
+    )
+    .await
+    {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(_) => Err("HMR WebSocket handshake deadline exceeded".to_owned()),
+    };
+    let (stream, response) = match handshake {
         Ok(pair) => pair,
         Err(e) => {
             report.assert_hard(
@@ -375,18 +400,26 @@ async fn scenario_hmr_websocket() {
                 false,
                 format!("{ws_url}: {e}"),
             );
-            note_stop(stop_dev(&env, &project, 0).await);
+            note_stop(&report, stop_dev(&env, &project, 0).await);
             assert_hard_all(report).await;
             return;
         }
     };
     report.assert_hard(
         "HMR WebSocket 握手（Upgrade 全链透传）",
-        true,
-        ws_url.clone(),
+        response.status().as_u16() == 101
+            && response
+                .headers()
+                .get("sec-websocket-protocol")
+                .is_some_and(|value| value == "vite-hmr"),
+        format!(
+            "{ws_url}: status={} protocol={:?}",
+            response.status(),
+            response.headers().get("sec-websocket-protocol")
+        ),
     );
     drop(stream);
-    note_stop(stop_dev(&env, &project, 0).await);
+    note_stop(&report, stop_dev(&env, &project, 0).await);
 
     assert_hard_all(report).await;
 }
@@ -434,9 +467,11 @@ async fn cpp_hmr_websocket() {
 #[allow(unused)]
 fn _type_anchor(_: Option<HashMap<String, String>>) {}
 
-/// 收尾 stop 的结果只记录（场景断言不依赖收尾成败）。
-fn note_stop(result: Result<Value, String>) {
-    if let Err(e) = result {
-        eprintln!("[cleanup] stop-dev: {e}");
-    }
+/// 原项目的受控停止也是验收的一部分，不清理虚构的 agent 容器。
+fn note_stop(report: &rcoder_e2e::common::report::JsonlReporter, result: Result<Value, String>) {
+    let (ok, detail) = match result {
+        Ok(body) => (body["success"].as_bool() == Some(true), body.to_string()),
+        Err(error) => (false, error),
+    };
+    report.assert_hard("owned preview cleanup via stop-dev", ok, detail);
 }
