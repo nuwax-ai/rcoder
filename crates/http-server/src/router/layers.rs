@@ -7,7 +7,6 @@ use arc_swap::ArcSwap;
 use axum::{
     Router, extract::DefaultBodyLimit, http::Request, middleware::Next, response::Response,
 };
-use rcoder_telemetry::HttpMetricsLayer;
 
 async fn locale_context_middleware(mut req: Request<axum::body::Body>, next: Next) -> Response {
     let locale = shared_types::parse_accept_language(
@@ -21,8 +20,9 @@ async fn locale_context_middleware(mut req: Request<axum::body::Body>, next: Nex
     shared_types::scope_request_locale(locale, async move { next.run(req).await }).await
 }
 
-/// 业务面全局中间件链：body 限制 → Trace（traceparent 贯通）→ HTTP 指标 →
+/// 业务面全局中间件链：body 限制 → Trace（traceparent 贯通）→
 /// API Key 鉴权（支持热更新）→ locale 注入。
+/// HTTP 指标在所有路由合并后统一挂载。
 ///
 /// internal / file-server 同用可选服务 key；预览对等接口保留自身 token。
 pub(super) fn apply_global_middleware(
@@ -40,7 +40,6 @@ pub(super) fn apply_global_middleware(
                 },
             ),
         )
-        .layer(HttpMetricsLayer::new()) // HTTP 指标中间件
         // API Key 鉴权中间件（支持热更新）
         .layer(axum::middleware::from_fn(move |req, next| {
             crate::middleware::api_key_middleware::api_key_middleware_handler(
