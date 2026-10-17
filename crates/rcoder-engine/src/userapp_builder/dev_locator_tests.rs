@@ -29,13 +29,113 @@ impl shared_types::AppOperationLease for LocatorOperationLease {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum TargetChange {
+    WorkloadKind,
+    WorkloadName,
+    WorkloadUid,
+    PodAdded,
+    PodRemoved,
+    PodName,
+    PodUid,
+    Context,
+    Binding,
+    StartupMode,
+    RestartImage,
+    RestartRuntimeWorkspace,
+}
+
+impl TargetChange {
+    const ALL: [Self; 12] = [
+        Self::WorkloadKind,
+        Self::WorkloadName,
+        Self::WorkloadUid,
+        Self::PodAdded,
+        Self::PodRemoved,
+        Self::PodName,
+        Self::PodUid,
+        Self::Context,
+        Self::Binding,
+        Self::StartupMode,
+        Self::RestartImage,
+        Self::RestartRuntimeWorkspace,
+    ];
+
+    fn apply(self, target: &mut BuilderControlTarget) {
+        match self {
+            Self::WorkloadKind => {
+                target.workload.as_mut().unwrap().kind = AppResourceKind::Container
+            }
+            Self::WorkloadName => {
+                target.workload.as_mut().unwrap().name = "replacement-builder".into();
+            }
+            Self::WorkloadUid => {
+                target.workload.as_mut().unwrap().uid = "replacement-sts".into();
+            }
+            Self::PodAdded => {
+                target.pod = Some(BuilderPodIdentity {
+                    name: "builder-locator-app-0".into(),
+                    uid: "pod-current".into(),
+                    resource_version: "1".into(),
+                });
+            }
+            Self::PodRemoved => target.pod = None,
+            Self::PodName => target.pod.as_mut().unwrap().name = "replacement-builder-0".into(),
+            Self::PodUid => target.pod.as_mut().unwrap().uid = "replacement-pod".into(),
+            Self::Context => target.context.operation_id = "different-read-operation".into(),
+            Self::Binding => {
+                target.resource_binding = Some(UserAppResourceBinding {
+                    app_id: target.context.app_id.clone(),
+                    lifecycle_id: target.context.lifecycle_id.clone(),
+                    service_type: ServiceType::UserappBuilder,
+                    physical_uid: target.workload.as_ref().unwrap().uid.clone(),
+                    adopted_by_operation: "different-adoption".into(),
+                });
+            }
+            Self::StartupMode => {
+                target.builder_startup_mode = shared_types::BuilderStartupMode::ManagementOnly;
+            }
+            Self::RestartImage => target.restart_image = Some("public-test-image:next".into()),
+            Self::RestartRuntimeWorkspace => {
+                target.restart_runtime_workspace = Some(
+                    shared_types::paths::userapp_dev_workspace(&target.context.app_id),
+                );
+            }
+        }
+    }
+
+    fn initially_has_pod(self) -> bool {
+        match self {
+            Self::WorkloadKind | Self::PodAdded => false,
+            Self::WorkloadName
+            | Self::WorkloadUid
+            | Self::PodRemoved
+            | Self::PodName
+            | Self::PodUid
+            | Self::Context
+            | Self::Binding
+            | Self::StartupMode
+            | Self::RestartImage
+            | Self::RestartRuntimeWorkspace => true,
+        }
+    }
+}
+
+struct CaptureTransition {
+    change: TargetChange,
+    activated: bool,
+}
+
 struct LocatorRuntime {
     observations: Mutex<Vec<Option<RuntimeContainerInfo>>>,
+    read_sequence: Mutex<Vec<&'static str>>,
+    captured_targets: Mutex<Vec<BuilderControlTarget>>,
     reads: AtomicUsize,
     captures: AtomicUsize,
     readiness_reads: AtomicUsize,
     credential_reads: AtomicUsize,
     writes: AtomicUsize,
+    operation_acquisitions: AtomicUsize,
     native_context: UserAppExecutionContext,
     pod_uid: String,
     workload_uid: String,
@@ -51,6 +151,11 @@ struct LocatorRuntime {
     readiness: Mutex<shared_types::UserAppNoComputeState>,
     running_observation: Mutex<Option<container_runtime_api::UserAppReadinessTarget>>,
     remove_workload_on_readiness: AtomicBool,
+    workload_resource_version: AtomicUsize,
+    pod_resource_version: AtomicUsize,
+    update_workload_version_on_readiness: AtomicBool,
+    update_pod_version_on_readiness: AtomicBool,
+    capture_transition: Mutex<Option<CaptureTransition>>,
 }
 
 impl LocatorRuntime {
@@ -70,7 +175,11 @@ impl LocatorRuntime {
                     },
                     name: "builder-locator-app".into(),
                     uid: self.workload_uid.clone(),
-                    resource_version: Some("1".into()),
+                    resource_version: Some(
+                        self.workload_resource_version
+                            .load(Ordering::SeqCst)
+                            .to_string(),
+                    ),
                 }),
             pod: self
                 .pod_exists
@@ -78,11 +187,26 @@ impl LocatorRuntime {
                 .then(|| BuilderPodIdentity {
                     name: "builder-locator-app-0".into(),
                     uid: self.pod_uid.clone(),
-                    resource_version: "1".into(),
+                    resource_version: self.pod_resource_version.load(Ordering::SeqCst).to_string(),
                 }),
             restart_image: None,
             restart_runtime_workspace: None,
         }
+    }
+
+    fn observed_target(
+        &self,
+        context: &UserAppExecutionContext,
+        binding: Option<&UserAppResourceBinding>,
+    ) -> BuilderControlTarget {
+        let mut target = self.target(context);
+        target.resource_binding = binding.cloned();
+        if let Some(transition) = self.capture_transition.lock().unwrap().as_ref()
+            && transition.activated
+        {
+            transition.change.apply(&mut target);
+        }
+        target
     }
 
     fn reject_write<T>(&self) -> ContainerRuntimeResult<T> {
@@ -114,6 +238,7 @@ impl AgentContainerRuntime for LocatorRuntime {
     ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
         assert_eq!(identifier, APP_ID);
         assert_eq!(service_type, &ServiceType::UserappBuilder);
+        self.read_sequence.lock().unwrap().push("find");
         self.reads.fetch_add(1, Ordering::SeqCst);
         let mut observations = self.observations.lock().unwrap();
         if observations.len() > 1 {
@@ -148,7 +273,8 @@ impl AgentContainerRuntime for LocatorRuntime {
         &self,
         context: &UserAppExecutionContext,
     ) -> ContainerRuntimeResult<BuilderControlTarget> {
-        Ok(self.target(context))
+        self.read_sequence.lock().unwrap().push("inspect");
+        Ok(self.observed_target(context, None))
     }
     async fn capture_builder_control(
         &self,
@@ -161,6 +287,7 @@ impl AgentContainerRuntime for LocatorRuntime {
         context: &UserAppExecutionContext,
         binding: Option<&UserAppResourceBinding>,
     ) -> ContainerRuntimeResult<BuilderControlTarget> {
+        self.read_sequence.lock().unwrap().push("capture");
         self.captures.fetch_add(1, Ordering::SeqCst);
         if self.capture_fails.load(Ordering::SeqCst) {
             return Err(ContainerRuntimeError::ConnectionError(
@@ -193,8 +320,8 @@ impl AgentContainerRuntime for LocatorRuntime {
             )
             .await;
         }
-        let mut target = self.target(context);
-        target.resource_binding = binding.cloned();
+        let target = self.observed_target(context, binding);
+        self.captured_targets.lock().unwrap().push(target.clone());
         Ok(target)
     }
 }
@@ -214,6 +341,7 @@ impl UserAppDeploymentRuntime for LocatorRuntime {
         &self,
         _: &str,
     ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
+        self.operation_acquisitions.fetch_add(1, Ordering::SeqCst);
         Ok(Some(Box::new(LocatorOperationLease)))
     }
 
@@ -224,6 +352,7 @@ impl UserAppDeploymentRuntime for LocatorRuntime {
     ) -> ContainerRuntimeResult<container_runtime_api::UserAppRuntimeReadiness> {
         assert_eq!(app_id, APP_ID);
         assert_eq!(stage, shared_types::UserappStage::Dev);
+        self.read_sequence.lock().unwrap().push("readiness");
         self.readiness_reads.fetch_add(1, Ordering::SeqCst);
         if self.readiness_fails.load(Ordering::SeqCst) {
             return Err(ContainerRuntimeError::ConnectionError(
@@ -245,6 +374,22 @@ impl UserAppDeploymentRuntime for LocatorRuntime {
             .swap(false, Ordering::SeqCst)
         {
             self.workload_exists.store(false, Ordering::SeqCst);
+        }
+        if self
+            .update_workload_version_on_readiness
+            .swap(false, Ordering::SeqCst)
+        {
+            self.workload_resource_version
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        if self
+            .update_pod_version_on_readiness
+            .swap(false, Ordering::SeqCst)
+        {
+            self.pod_resource_version.fetch_add(1, Ordering::SeqCst);
+        }
+        if let Some(transition) = self.capture_transition.lock().unwrap().as_mut() {
+            transition.activated = true;
         }
         if let Some(target) = self.running_observation.lock().unwrap().clone() {
             return Ok(container_runtime_api::UserAppRuntimeReadiness::Running(
@@ -317,11 +462,14 @@ async fn fixture_on_application(
     let workload_exists = observations.iter().any(Option::is_some);
     let runtime = Arc::new(LocatorRuntime {
         observations: Mutex::new(observations),
+        read_sequence: Mutex::new(vec![]),
+        captured_targets: Mutex::new(vec![]),
         reads: AtomicUsize::new(0),
         captures: AtomicUsize::new(0),
         readiness_reads: AtomicUsize::new(0),
         credential_reads: AtomicUsize::new(0),
         writes: AtomicUsize::new(0),
+        operation_acquisitions: AtomicUsize::new(0),
         native_context: UserAppExecutionContext {
             app_id: APP_ID.into(),
             lifecycle_id: if old_native_lifecycle {
@@ -351,6 +499,11 @@ async fn fixture_on_application(
         }),
         running_observation: Mutex::new(None),
         remove_workload_on_readiness: AtomicBool::new(false),
+        workload_resource_version: AtomicUsize::new(1),
+        pod_resource_version: AtomicUsize::new(1),
+        update_workload_version_on_readiness: AtomicBool::new(false),
+        update_pod_version_on_readiness: AtomicBool::new(false),
+        capture_transition: Mutex::new(None),
     });
     let state =
         super::super::creation::fence_settler_tests::runtime_state(runtime.clone(), store, None)
@@ -386,6 +539,393 @@ async fn admit(
 
 fn make_locator(state: &Arc<AppState>) -> UserappDevLocator {
     UserappDevLocator::new(Arc::downgrade(state))
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ReadOnlyEntry {
+    Locate,
+    Alive,
+    Logs,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MetadataOnlyScenario {
+    StartingController,
+    StoppedController,
+    RunningPodWithoutAddress,
+}
+
+/// Exercise the public callbacks, including the two bound captures around a
+/// separate runtime read. Kubernetes status updates change resourceVersion
+/// without replacing the StatefulSet/Pod or changing lifecycle ownership.
+async fn assert_metadata_only_update(entry: ReadOnlyEntry, scenario: MetadataOnlyScenario) {
+    let (state, runtime, _directory) = fixture(vec![None], false).await;
+    runtime.workload_exists.store(true, Ordering::SeqCst);
+    match scenario {
+        MetadataOnlyScenario::StartingController => {
+            *runtime.readiness.lock().unwrap() = shared_types::UserAppNoComputeState::Starting;
+            runtime
+                .update_workload_version_on_readiness
+                .store(true, Ordering::SeqCst);
+        }
+        MetadataOnlyScenario::StoppedController => {
+            *runtime.readiness.lock().unwrap() = shared_types::UserAppNoComputeState::Stopped;
+            runtime
+                .update_workload_version_on_readiness
+                .store(true, Ordering::SeqCst);
+        }
+        MetadataOnlyScenario::RunningPodWithoutAddress => {
+            runtime.pod_exists.store(true, Ordering::SeqCst);
+            *runtime.running_observation.lock().unwrap() =
+                Some(container_runtime_api::UserAppReadinessTarget {
+                    app_id: APP_ID.into(),
+                    stage: shared_types::UserappStage::Dev,
+                    instance: container_runtime_api::UserAppReadinessInstance::Kubernetes {
+                        namespace: "test-ns".into(),
+                        pod_name: "builder-locator-app-0".into(),
+                        pod_uid: "pod-current".into(),
+                        container_name: "agent".into(),
+                        container_id: None,
+                        owner_uid: "sts-current".into(),
+                    },
+                    address: None,
+                    published_address: None,
+                    dbx_published_address: None,
+                });
+            runtime
+                .update_pod_version_on_readiness
+                .store(true, Ordering::SeqCst);
+        }
+    }
+    let before = state.userapp_store.get_application(APP_ID).await.unwrap();
+    let locator = make_locator(&state);
+    match entry {
+        ReadOnlyEntry::Locate => {
+            let result = shared_types::UserappDevEnsure::locate_dev_builder(&locator, APP_ID).await;
+            match scenario {
+                MetadataOnlyScenario::StoppedController => assert_eq!(result.unwrap(), None),
+                MetadataOnlyScenario::StartingController
+                | MetadataOnlyScenario::RunningPodWithoutAddress => match result {
+                    Err(shared_types::DevEnsureError::NotReady { app_id, .. }) => {
+                        assert_eq!(app_id, APP_ID);
+                    }
+                    Err(
+                        error @ (shared_types::DevEnsureError::BuilderAbsent { .. }
+                        | shared_types::DevEnsureError::OperationInFlight { .. }
+                        | shared_types::DevEnsureError::ObserveFailed { .. }
+                        | shared_types::DevEnsureError::EnsureFailed { .. }),
+                    ) => panic!("{scenario:?}: metadata-only update was misclassified: {error:?}"),
+                    Ok(instance) => panic!("{scenario:?}: no address was observed: {instance:?}"),
+                },
+            }
+        }
+        ReadOnlyEntry::Alive => assert!(
+            shared_types::UserappDevLocator::dev_container_alive(&locator, APP_ID)
+                .await
+                .unwrap(),
+            "{scenario:?}: retained compute is present after an RV-only update"
+        ),
+        ReadOnlyEntry::Logs => {
+            let error =
+                shared_types::UserappDevLocator::dev_logs_file_server_addr(&locator, APP_ID)
+                    .await
+                    .unwrap_err();
+            assert_eq!(
+                error,
+                format!(
+                    "Development container for app {APP_ID} is not running; its file logs are currently unavailable"
+                ),
+                "{scenario:?}: normal log unavailability must not become an identity conflict"
+            );
+        }
+    }
+    assert_eq!(
+        *runtime.read_sequence.lock().unwrap(),
+        [
+            "find",
+            "inspect",
+            "capture",
+            "readiness",
+            "inspect",
+            "capture"
+        ],
+        "{entry:?}/{scenario:?}: keep discovery and capture ordering without retries"
+    );
+    assert_eq!(runtime.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.captures.load(Ordering::SeqCst), 2);
+    assert_eq!(runtime.readiness_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.writes.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.operation_acquisitions.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.credential_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        state.userapp_store.get_application(APP_ID).await.unwrap(),
+        before,
+        "read-only discovery must preserve the actual persisted lifecycle"
+    );
+    let captured = runtime.captured_targets.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    for target in captured.iter() {
+        let workload = target.workload.as_ref().unwrap();
+        assert_eq!(workload.kind, AppResourceKind::StatefulSet);
+        assert_eq!(workload.uid, "sts-current");
+        assert_eq!(workload.name, "builder-locator-app");
+        assert_eq!(target.context, captured[0].context);
+        assert_eq!(target.resource_binding, captured[0].resource_binding);
+    }
+    match scenario {
+        MetadataOnlyScenario::StartingController | MetadataOnlyScenario::StoppedController => {
+            assert_eq!(
+                captured[0]
+                    .workload
+                    .as_ref()
+                    .unwrap()
+                    .resource_version
+                    .as_deref(),
+                Some("1")
+            );
+            assert_eq!(
+                captured[1]
+                    .workload
+                    .as_ref()
+                    .unwrap()
+                    .resource_version
+                    .as_deref(),
+                Some("2")
+            );
+            assert!(captured[0].pod.is_none());
+            assert!(captured[1].pod.is_none());
+        }
+        MetadataOnlyScenario::RunningPodWithoutAddress => {
+            let first = captured[0].pod.as_ref().unwrap();
+            let second = captured[1].pod.as_ref().unwrap();
+            assert_eq!(first.uid, "pod-current");
+            assert_eq!(second.uid, first.uid);
+            assert_eq!(second.name, first.name);
+            assert_eq!(first.resource_version, "1");
+            assert_eq!(second.resource_version, "2");
+            assert_eq!(captured[0].workload, captured[1].workload);
+        }
+    }
+}
+
+#[tokio::test]
+async fn dev_locator_locate_tolerates_controller_resource_version_churn() {
+    for scenario in [
+        MetadataOnlyScenario::StartingController,
+        MetadataOnlyScenario::StoppedController,
+    ] {
+        assert_metadata_only_update(ReadOnlyEntry::Locate, scenario).await;
+    }
+}
+
+#[tokio::test]
+async fn dev_locator_alive_tolerates_controller_resource_version_churn() {
+    for scenario in [
+        MetadataOnlyScenario::StartingController,
+        MetadataOnlyScenario::StoppedController,
+    ] {
+        assert_metadata_only_update(ReadOnlyEntry::Alive, scenario).await;
+    }
+}
+
+#[tokio::test]
+async fn dev_locator_logs_tolerates_controller_resource_version_churn() {
+    for scenario in [
+        MetadataOnlyScenario::StartingController,
+        MetadataOnlyScenario::StoppedController,
+    ] {
+        assert_metadata_only_update(ReadOnlyEntry::Logs, scenario).await;
+    }
+}
+
+#[tokio::test]
+async fn dev_locator_callbacks_tolerate_pod_resource_version_churn_without_address() {
+    for entry in [
+        ReadOnlyEntry::Locate,
+        ReadOnlyEntry::Alive,
+        ReadOnlyEntry::Logs,
+    ] {
+        assert_metadata_only_update(entry, MetadataOnlyScenario::RunningPodWithoutAddress).await;
+    }
+}
+
+#[tokio::test]
+async fn dev_locator_deleted_retained_builder_tolerates_resource_version_churn() {
+    let (state, runtime, _directory) = fixture(vec![None], false).await;
+    let (tombstone, original_deletion) = recreate_tests::seed_deleted_application(&runtime).await;
+    runtime.workload_exists.store(true, Ordering::SeqCst);
+    *runtime.readiness.lock().unwrap() = shared_types::UserAppNoComputeState::Stopped;
+    runtime
+        .update_workload_version_on_readiness
+        .store(true, Ordering::SeqCst);
+
+    assert!(
+        shared_types::UserappDevLocator::dev_container_alive(&make_locator(&state), APP_ID)
+            .await
+            .unwrap(),
+        "a retained stopped controller still exists after an RV-only metadata update"
+    );
+    assert_eq!(
+        *runtime.read_sequence.lock().unwrap(),
+        ["inspect", "capture", "readiness", "inspect", "capture"],
+        "Deleted discovery must retain the tombstone capture context without ordinary lookup"
+    );
+    assert_eq!(runtime.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.captures.load(Ordering::SeqCst), 2);
+    assert_eq!(runtime.readiness_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.writes.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.operation_acquisitions.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.credential_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        state.userapp_store.get_application(APP_ID).await.unwrap(),
+        Some(tombstone.clone()),
+        "the query must not replace or rewrite the durable tombstone"
+    );
+    assert_eq!(
+        state
+            .userapp_store
+            .get_operation(APP_ID, &original_deletion.operation_id)
+            .await
+            .unwrap(),
+        Some(original_deletion),
+        "the original completed deletion evidence must remain unchanged"
+    );
+    let captured = runtime.captured_targets.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    for target in captured.iter() {
+        assert_eq!(target.context.lifecycle_id, tombstone.lifecycle_id);
+        assert_eq!(target.context.operation_id, "read-only-recreation");
+        assert_eq!(target.context, captured[0].context);
+        let workload = target.workload.as_ref().unwrap();
+        assert_eq!(workload.kind, AppResourceKind::StatefulSet);
+        assert_eq!(workload.uid, "sts-current");
+        assert_eq!(workload.name, "builder-locator-app");
+        assert!(target.pod.is_none());
+    }
+    assert_eq!(
+        captured[0]
+            .workload
+            .as_ref()
+            .unwrap()
+            .resource_version
+            .as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        captured[1]
+            .workload
+            .as_ref()
+            .unwrap()
+            .resource_version
+            .as_deref(),
+        Some("2")
+    );
+}
+
+async fn assert_non_version_target_change_is_rejected(entry: ReadOnlyEntry, change: TargetChange) {
+    // Each callback gets a fresh transition. Reusing a runtime across callbacks
+    // would make later queries see an already stable replacement and would not
+    // exercise the capture/readiness/capture race.
+    let (state, runtime, _directory) = fixture(vec![None], false).await;
+    runtime.workload_exists.store(true, Ordering::SeqCst);
+    runtime
+        .pod_exists
+        .store(change.initially_has_pod(), Ordering::SeqCst);
+    *runtime.readiness.lock().unwrap() = shared_types::UserAppNoComputeState::Starting;
+    *runtime.capture_transition.lock().unwrap() = Some(CaptureTransition {
+        change,
+        activated: false,
+    });
+    let before = state.userapp_store.get_application(APP_ID).await.unwrap();
+    let locator = make_locator(&state);
+    match entry {
+        ReadOnlyEntry::Locate => {
+            match shared_types::UserappDevEnsure::locate_dev_builder(&locator, APP_ID).await {
+                Err(shared_types::DevEnsureError::ObserveFailed { .. }) => {}
+                Err(
+                    error @ (shared_types::DevEnsureError::BuilderAbsent { .. }
+                    | shared_types::DevEnsureError::OperationInFlight { .. }
+                    | shared_types::DevEnsureError::NotReady { .. }
+                    | shared_types::DevEnsureError::EnsureFailed { .. }),
+                ) => panic!("{change:?}: unsafe capture transition was misclassified: {error:?}"),
+                Ok(instance) => {
+                    panic!("{change:?}: changed capture must not authorize discovery: {instance:?}")
+                }
+            }
+        }
+        ReadOnlyEntry::Alive => {
+            shared_types::UserappDevLocator::dev_container_alive(&locator, APP_ID)
+                .await
+                .expect_err("a non-RV capture change must not become an existence answer");
+        }
+        ReadOnlyEntry::Logs => {
+            let error =
+                shared_types::UserappDevLocator::dev_logs_file_server_addr(&locator, APP_ID)
+                    .await
+                    .unwrap_err();
+            assert!(
+                error.starts_with("observe development log container:"),
+                "{change:?}: a rejected capture must not become ordinary unavailable logs: {error}"
+            );
+        }
+    }
+    assert_eq!(
+        *runtime.read_sequence.lock().unwrap(),
+        [
+            "find",
+            "inspect",
+            "capture",
+            "readiness",
+            "inspect",
+            "capture"
+        ],
+        "{entry:?}/{change:?}: fail during the original observation without retry or mutation"
+    );
+    assert_eq!(runtime.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.captures.load(Ordering::SeqCst), 2);
+    assert_eq!(runtime.readiness_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.writes.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.operation_acquisitions.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.credential_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        state.userapp_store.get_application(APP_ID).await.unwrap(),
+        before,
+        "a failed read-only observation must not change the durable lifecycle"
+    );
+    let captured = runtime.captured_targets.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    assert_ne!(captured[0], captured[1]);
+    let mut expected = captured[0].clone();
+    change.apply(&mut expected);
+    assert_eq!(
+        captured[1], expected,
+        "the controlled runtime must change only the requested non-RV target field"
+    );
+    assert_eq!(
+        captured[0].workload.as_ref().unwrap().resource_version,
+        captured[1].workload.as_ref().unwrap().resource_version
+    );
+}
+
+#[tokio::test]
+async fn dev_locator_locate_rejects_non_version_target_changes() {
+    for change in TargetChange::ALL {
+        assert_non_version_target_change_is_rejected(ReadOnlyEntry::Locate, change).await;
+    }
+}
+
+#[tokio::test]
+async fn dev_locator_alive_rejects_non_version_target_changes() {
+    for change in TargetChange::ALL {
+        assert_non_version_target_change_is_rejected(ReadOnlyEntry::Alive, change).await;
+    }
+}
+
+#[tokio::test]
+async fn dev_locator_logs_rejects_non_version_target_changes() {
+    for change in TargetChange::ALL {
+        assert_non_version_target_change_is_rejected(ReadOnlyEntry::Logs, change).await;
+    }
 }
 
 async fn assert_read_only_rejection(state: &Arc<AppState>, runtime: &LocatorRuntime) {

@@ -156,7 +156,7 @@ impl RestartAdmission {
         let mut diagnostic = self.diagnostic()?;
         // A completed unknown/foreign/change observation or real read error
         // supersedes every previous diagnostic, even if its timeout is imminent.
-        diagnostic.holder = match observation {
+        let mut holder = match observation {
             Ok(observation) => observation.verified.clone().filter(|holder| {
                 matches!(
                     holder.blocker.scope,
@@ -173,6 +173,10 @@ impl RestartAdmission {
             }),
             Err(_) => None,
         };
+        if let (Some(holder), Some(previous)) = (holder.as_mut(), diagnostic.holder.as_ref()) {
+            holder.retain_compatible_physical(previous);
+        }
+        diagnostic.holder = holder;
         Ok(())
     }
 
@@ -463,7 +467,20 @@ impl AppService {
                 }
             }
             AppOperationError::ConflictBlocked { blocker, .. } => Some(blocker),
-            _ => {
+            AppOperationError::NotFound(_)
+            | AppOperationError::OperationNotFound(_)
+            | AppOperationError::AlreadyExists(_)
+            | AppOperationError::InvalidState(_)
+            | AppOperationError::FileNotFound(_)
+            | AppOperationError::Validation(_)
+            | AppOperationError::DevNotRunning(_)
+            | AppOperationError::Backend(_)
+            | AppOperationError::Diagnostic(_)
+            | AppOperationError::CredentialApplication { .. }
+            | AppOperationError::RuntimeRejected(_)
+            | AppOperationError::Conflict(_)
+            | AppOperationError::HotDeployEnvChange(_)
+            | AppOperationError::Operation { .. } => {
                 invalidate_diagnostic()?;
                 return Err(error);
             }

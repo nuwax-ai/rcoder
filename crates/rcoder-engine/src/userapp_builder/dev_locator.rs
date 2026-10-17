@@ -1,5 +1,10 @@
 //! `UserappDevLocator` 契约实现：app_manager 文件/存储八接口 `env=dev` 分支的
-//! 开发容器定位回调（复用注册表 ensure + 探活自愈 + file-server 地址解析）。
+//! 开发容器定位回调；只读观察与显式 ensure/唤醒保留独立入口。
+
+#![deny(
+    clippy::wildcard_enum_match_arm,
+    clippy::match_wildcard_for_single_variants
+)]
 
 use std::sync::{Arc, Weak};
 
@@ -7,6 +12,8 @@ use shared_types::ServiceType;
 
 use super::{dev_file_server_addr, ensure_userapp_builder_probed};
 use crate::app_state::AppState;
+
+mod observation;
 
 #[cfg(test)]
 #[path = "dev_locator_tests.rs"]
@@ -66,7 +73,7 @@ impl UserappDevLocator {
         if current.as_ref() != Some(app)
             || before.context != context
             || after.context != context
-            || before != after
+            || !observation::same_read_capture(&before, &after)
         {
             return Err(anyhow::anyhow!(
                 "Application or builder changed during recreation verification; retry the query"
@@ -107,10 +114,7 @@ impl UserappDevLocator {
             .await?
             .ok_or_else(|| anyhow::anyhow!("Builder disappeared during discovery"))?;
         super::validate_builder_identity(app_id, &current)?;
-        if current.container_id != observed.container_id
-            || current.container_name != observed.container_name
-            || current.workload_uid != observed.workload_uid
-            || current.container_ip != observed.container_ip
+        if !observation::same_discovery_endpoint(&observed, &current)
             || current.status != observed.status
         {
             return Err(anyhow::anyhow!(
@@ -121,7 +125,7 @@ impl UserappDevLocator {
         // validates the durable binding; a later runtime change cannot be made
         // atomic with a network dial, so callers retain normal retry semantics.
         super::adoption::verify_live_builder_observation(state, app_id, app_id, &current).await?;
-        if current.status != container_runtime_api::ContainerRuntimeStatus::Running {
+        if !observation::is_running(&current.status) {
             // Some runtimes return a retained stopped container rather than
             // None. Only actual read-only compute observation permits wake.
             return Self::verify_without_address(state, app_id).await;
@@ -159,7 +163,7 @@ impl UserappDevLocator {
             .observe_userapp_readiness(app_id, UserappStage::Dev)
             .await?;
         let current = super::adoption::verified_live_builder_target(state, app_id, app_id).await?;
-        if captured != current {
+        if !observation::same_read_capture(&captured, &current) {
             return Err(anyhow::anyhow!(
                 "Builder changed while verifying missing address; retry the query"
             ));
@@ -207,10 +211,12 @@ fn readiness_matches_capture(
     captured: &shared_types::BuilderControlTarget,
 ) -> bool {
     use container_runtime_api::UserAppReadinessInstance;
-    if observed.app_id != captured.context.app_id
-        || observed.stage != shared_types::UserappStage::Dev
-    {
+    if observed.app_id != captured.context.app_id {
         return false;
+    }
+    match observed.stage {
+        shared_types::UserappStage::Dev => {}
+        shared_types::UserappStage::Prod => return false,
     }
     match &observed.instance {
         UserAppReadinessInstance::Docker { container_id, .. } => {
@@ -266,7 +272,7 @@ impl shared_types::UserappDevLocator for UserappDevLocator {
                 ));
             }
         };
-        if actual.status != container_runtime_api::ContainerRuntimeStatus::Running {
+        if !observation::is_running(&actual.status) {
             return Err(format!(
                 "Development container for app {app_id} is not running; its file logs are currently unavailable"
             ));
@@ -277,11 +283,7 @@ impl shared_types::UserappDevLocator for UserappDevLocator {
             .await
             .map_err(|error| format!("observe development file-server address: {error}"))?
             .ok_or_else(|| format!("Development file-server for app {app_id} is unavailable"))?;
-        if info.container_id != actual.container_id
-            || info.container_name != actual.container_name
-            || info.workload_uid != actual.workload_uid
-            || info.container_ip != actual.container_ip
-        {
+        if !observation::same_log_endpoint(&actual, &info) {
             return Err(
                 "Development container changed while locating logs; retry the query".into(),
             );
@@ -296,13 +298,18 @@ impl shared_types::UserappDevLocator for UserappDevLocator {
             .get_application(app_id)
             .await
             .map_err(|error| format!("read builder lifecycle (app {app_id}): {error}"))?
-            && app.state == shared_types::UserAppLifecycleState::Deleted
         {
-            return Self::deleted_builder_exists(&state, &app)
-                .await
-                .map_err(|error| {
-                    format!("verify deleted UserappBuilder (app {app_id}): {error:#}")
-                });
+            match app.state {
+                shared_types::UserAppLifecycleState::Deleted => {
+                    return Self::deleted_builder_exists(&state, &app)
+                        .await
+                        .map_err(|error| {
+                            format!("verify deleted UserappBuilder (app {app_id}): {error:#}")
+                        });
+                }
+                shared_types::UserAppLifecycleState::Active
+                | shared_types::UserAppLifecycleState::Deleting => {}
+            }
         }
         self.verified_builder(&state, app_id)
             .await
@@ -348,9 +355,7 @@ impl shared_types::UserappDevEnsure for UserappDevLocator {
             }
             VerifiedDevBuilder::Present(info) => info,
         };
-        if info.status != container_runtime_api::ContainerRuntimeStatus::Running
-            || info.container_ip.is_empty()
-        {
+        if !observation::is_running(&info.status) || info.container_ip.is_empty() {
             // 权威存在但无地址（Pending/重启窗口）：不可拨流也不可 ensure 绕过，
             // 交调用方等待语义（P0 总预算内重试）。
             return Err(shared_types::DevEnsureError::NotReady {
@@ -429,7 +434,16 @@ fn classify_app_operation_error(
                 }
             }
         }
-        _ => shared_types::DevEnsureError::EnsureFailed {
+        AppOperationError::OperationNotFound(_)
+        | AppOperationError::AlreadyExists(_)
+        | AppOperationError::InvalidState(_)
+        | AppOperationError::FileNotFound(_)
+        | AppOperationError::Validation(_)
+        | AppOperationError::DevNotRunning(_)
+        | AppOperationError::Backend(_)
+        | AppOperationError::CredentialApplication { .. }
+        | AppOperationError::RuntimeRejected(_)
+        | AppOperationError::HotDeployEnvChange(_) => shared_types::DevEnsureError::EnsureFailed {
             app_id,
             detail: error.to_string(),
         },

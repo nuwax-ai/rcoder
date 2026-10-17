@@ -13,10 +13,44 @@ pub(super) fn check(point: &str) -> Result<(), UserAppStoreError> {
     }
     Ok(())
 }
+/// Only the owning test transaction can pause here. Notify permits make the
+/// schedule explicit; no timing-based assumption is used to trigger the race.
+#[derive(Default)]
+pub(super) struct ComputeAccessClaimProbe {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+impl ComputeAccessClaimProbe {
+    #[cfg(feature = "pg")]
+    pub(super) async fn reached(&self) {
+        self.reached.notified().await;
+    }
+    #[cfg(feature = "pg")]
+    pub(super) fn release(&self) {
+        self.resume.notify_one();
+    }
+}
+tokio::task_local! {
+    static COMPUTE_ACCESS_CLAIM_PROBE: std::sync::Arc<ComputeAccessClaimProbe>;
+}
+#[cfg(feature = "pg")]
+pub(super) async fn with_compute_access_claim_probe<F: Future>(
+    probe: std::sync::Arc<ComputeAccessClaimProbe>,
+    future: F,
+) -> F::Output {
+    COMPUTE_ACCESS_CLAIM_PROBE.scope(probe, future).await
+}
+pub(super) async fn before_compute_access_root_claim() {
+    let probe = COMPUTE_ACCESS_CLAIM_PROBE.try_with(Clone::clone).ok();
+    if let Some(probe) = probe {
+        probe.reached.notify_one();
+        probe.resume.notified().await;
+    }
+}
 fn accepted(value: UserAppAdmissionOutcome) -> UserAppOperationRecord {
     match value {
         UserAppAdmissionOutcome::Accepted(op) => op,
-        _ => panic!("fresh admission required"),
+        UserAppAdmissionOutcome::Existing(op) => panic!("fresh admission required: {op:?}"),
     }
 }
 fn request(app: &UserAppLifecycleRecord, kind: UserAppOperationKind) -> UserAppAdmission {
@@ -75,6 +109,82 @@ async fn empty_children(store: &ToastyUserAppStore, app: &str) {
         .await
         .unwrap();
 }
+async fn completed_compute_before_recreate(
+    store: &ToastyUserAppStore,
+    app: &UserAppLifecycleRecord,
+) -> ComputeControlRecord {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let pending = store
+        .admit_compute_control(&ComputeControlRequest {
+            builder_startup_mode: Default::default(),
+            app_id: app.app_id.clone(),
+            lifecycle_id: app.lifecycle_id.clone(),
+            scope: UserAppOperationScope::Dev,
+            operation_id: id.clone(),
+            request_id: id,
+            request_fingerprint: "c".repeat(64),
+            action: ComputeControlAction::Stop,
+            restart_image_roll: false,
+        })
+        .await
+        .unwrap();
+    let identity = ComputeExecutorIdentity {
+        app_id: app.app_id.clone(),
+        lifecycle_id: app.lifecycle_id.clone(),
+        scope: UserAppOperationScope::Dev,
+        operation_id: pending.operation_id.clone(),
+        generation: pending.generation,
+        executor_id: "faultcompute".into(),
+    };
+    store
+        .claim_compute_control(&identity, pending.revision)
+        .await
+        .unwrap();
+    let receipt = UserAppOperationLeaseReceipt::Docker {
+        service_type: ServiceType::UserappBuilder,
+        device: 1,
+        inode: 42,
+        token: "faultfixturetoken".into(),
+    };
+    let mut record = store.bind_compute_lease(&identity, &receipt).await.unwrap();
+    for stage in [
+        ComputeControlStage::Stopping,
+        ComputeControlStage::Stopped,
+        ComputeControlStage::Completed,
+    ] {
+        record = store
+            .advance_compute_control(&ComputeControlProgress {
+                identity: identity.clone(),
+                expected_revision: record.revision,
+                state: match stage {
+                    ComputeControlStage::Completed => ComputeControlState::Succeeded,
+                    ComputeControlStage::DrainingPrevious
+                    | ComputeControlStage::Stopping
+                    | ComputeControlStage::Stopped
+                    | ComputeControlStage::Starting
+                    | ComputeControlStage::Verifying => ComputeControlState::Running,
+                },
+                stage,
+                checkpoint: serde_json::json!({"fixture":"byte-preserved-history"}),
+                error_code: None,
+                error_message: None,
+            })
+            .await
+            .unwrap();
+    }
+    record
+}
+async fn compute_head_and_raw_receipts(store: &ToastyUserAppStore, app_id: &str) -> Vec<String> {
+    let id = app_id.to_owned();
+    store.run(true, move |tx, backend| {
+        let id = id.clone();
+        Box::pin(async move {
+            repo::strings(toasty::sql::query(repo::sql(backend,
+                "SELECT lifecycle_id || '|' || scope || '|' || CAST(generation AS TEXT) || '|' || CAST(revision AS TEXT) || '|' || desired_state || '|' || COALESCE(control_operation_id,'null') || '|' || CAST(updated_at_us AS TEXT) FROM userapp_compute_intents WHERE app_id=$1 UNION ALL SELECT checkpoint_json || '|' || COALESCE(lease_json,'null') || '|' || evidence_json FROM userapp_compute_controls WHERE app_id=$1 ORDER BY 1"))
+                .bind(id).exec(tx).await.map_err(super::storage)?)
+        })
+    }).await.unwrap()
+}
 async fn contract(store: &ToastyUserAppStore) {
     for point in [
         "admission_operation",
@@ -122,6 +232,7 @@ async fn contract(store: &ToastyUserAppStore) {
         );
     }
     for point in [
+        "recreate_compute_intents",
         "recreate_deleted_slots",
         "recreate_application",
         "recreate_slots",
@@ -131,6 +242,8 @@ async fn contract(store: &ToastyUserAppStore) {
             .ensure_identity(&format!("recreate{}", uuid::Uuid::new_v4().simple()))
             .await
             .unwrap();
+        let compute = completed_compute_before_recreate(store, &app).await;
+        let original_compute_rows = compute_head_and_raw_receipts(store, &app.app_id).await;
         let req = request(&app, UserAppOperationKind::DeleteApplication);
         let mut op = accepted(store.admit(&req).await.unwrap());
         op = store
@@ -225,6 +338,18 @@ async fn contract(store: &ToastyUserAppStore) {
                 .unwrap(),
             op
         );
+        assert_eq!(
+            compute_head_and_raw_receipts(store, &app.app_id).await,
+            original_compute_rows,
+            "head retirement and every raw checkpoint/receipt must roll back: {point}"
+        );
+        assert_eq!(
+            store
+                .get_compute_control(&app.app_id, &compute.operation_id)
+                .await
+                .unwrap(),
+            Some(compute.clone())
+        );
         let (id, expected, retry_check) =
             (app.app_id.clone(), app.lifecycle_id.clone(), retry.clone());
         let backend = store.backend;
@@ -257,6 +382,20 @@ async fn contract(store: &ToastyUserAppStore) {
             .await
             .unwrap();
         assert_ne!(after.lifecycle_id, before.lifecycle_id);
+        assert_eq!(
+            store
+                .get_compute_control(&app.app_id, &compute.operation_id)
+                .await
+                .unwrap(),
+            Some(compute)
+        );
+        assert_eq!(
+            store
+                .read_compute_status(&app.app_id, &after.lifecycle_id, UserAppOperationScope::Dev)
+                .await
+                .unwrap(),
+            UserAppComputeStatus::default()
+        );
         assert_eq!(after.lifecycle_epoch, before.lifecycle_epoch + 1);
         assert_eq!(
             store

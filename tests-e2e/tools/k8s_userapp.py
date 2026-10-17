@@ -45,6 +45,11 @@ REQUIRED = {'cluster_ready', 'concurrent_ensure', 'ensure_retry', 'builder_ident
             'stop_idempotent', 'stop_zero_pods', 'wake_new_pod', 'wake', 'wake_content_B', 'cleanup',
             'tombstone_deleted', 'tombstone_old_ensure_rejected', 'recreate_new_lifecycle',
             'recreate_deleted', 'baseline_preserved', 'worker_artifact_contract', 'worker_process_running'}
+REQUIRED |= {'dev_readonly_seed_data', 'dev_compute_stop_identity', 'dev_stopped_resource_identity',
+             'dev_stopped_rv_advanced', 'dev_stopped_storage_both_replicas',
+             'dev_stopped_logs_both_replicas', 'dev_stopped_no_wake',
+             'dev_readonly_annotation_removed', 'dev_compute_restart_identity',
+             'dev_readonly_data_preserved'}
 
 RESTART_ADMISSION_WAIT_SECONDS = 30
 RESTART_EXECUTION_TIMEOUT_SECONDS = 300
@@ -150,6 +155,47 @@ def remaining_timeout(deadline, limit):
     if remaining <= 0:
         raise TimeoutError('Original REST observation deadline expired')
     return min(limit, remaining)
+
+
+def dev_compute_view(view, app, lifecycle, action, operation_id):
+    """Only the original public compute identity can finish this normal scenario."""
+    if (not isinstance(view, dict) or not operation_id
+            or view.get('operation_id') != operation_id or view.get('app_id') != app
+            or view.get('lifecycle_id') != lifecycle or view.get('scope') != 'Dev'
+            or view.get('action') != action):
+        raise AssertionError('Development compute operation identity differs')
+    state = view.get('state')
+    if state in ('pending', 'running'):
+        return False
+    if state == 'succeeded':
+        if view.get('stage') != 'completed':
+            raise AssertionError('Succeeded development compute operation is not completed')
+        return True
+    if state in ('recovery_required', 'failed', 'superseded'):
+        raise AssertionError('Development compute did not succeed: ' + str(view))
+    raise AssertionError('Unknown development compute state: ' + str(state))
+
+
+def stopped_dev_logs(status, envelope):
+    # The existing locator diagnostic is wrapped by AppOperationError::Backend.
+    # This tests that diagnostic, without changing or inventing a public code.
+    return (status == 200 and isinstance(envelope, dict)
+            and envelope.get('code') == 'ERR_BACKEND_ERROR' and envelope.get('success') is False
+            and 'not running; its file logs are currently unavailable' in envelope.get('message', ''))
+
+
+def dev_controller_identity(row, app, lifecycle, expected_uid=None):
+    meta = row.get('metadata') or {}
+    labels, annotations = meta.get('labels') or {}, meta.get('annotations') or {}
+    if (row.get('kind') != 'StatefulSet' or meta.get('name') != 'rcoder-app-builder-' + app
+            or not meta.get('uid') or not meta.get('resourceVersion') or meta.get('deletionTimestamp')
+            or (expected_uid is not None and meta['uid'] != expected_uid)
+            or labels.get('rcoder.io/identifier') != app
+            or labels.get('rcoder.io/service-type') != 'user-app-builder'
+            or annotations.get('rcoder.io/application-id') != app
+            or annotations.get('rcoder.io/lifecycle-id') != lifecycle):
+        raise AssertionError('Refusing a different development controller identity')
+    return meta
 
 
 def rejected_without_execution(view, kind):
@@ -403,6 +449,269 @@ class Run:
         _, data = self.request('/api/v1/userapp/get-file-list?' + urllib.parse.urlencode(payload), base=self.entries[-1], headers={'X-App-Id': self.app})
         names = {f['name'] for f in data.get('files', [])}
         self.check('cross_replica_files', all(f'replica-{i}.txt' in names for i in range(len(self.entries))), names.__str__())
+
+    def dev_compute(self, action, budget, deadline=None):
+        if action not in ('stop', 'restart'):
+            raise ValueError('Explicit development compute action required')
+        if deadline is None:
+            deadline = time.monotonic() + budget
+        body = {'app_id': self.app, 'app_stage': 'dev', 'service_type': 'userapp',
+                'lifecycle_id': self.lifecycle_id, 'request_id': 'readonly-' + action + '-' + self.id}
+        status, response = self.request('/computer/pod/' + action, body, self.entries[0],
+                                        timeout=remaining_timeout(deadline, 90))
+        remaining_timeout(deadline, 90)
+        view = response.get('data')
+        operation_id = response.get('operation_id')
+        if status not in (200, 202) or response.get('code') != '0000' or response.get('success') is not True:
+            raise AssertionError('Development compute admission failed: ' + str(response))
+        path = '/computer/pod/operations/' + self.app + '/' + str(operation_id)
+        while True:
+            self.save('readonly-dev-' + action + '-operation.json', view)
+            if dev_compute_view(view, self.app, self.lifecycle_id, action, operation_id):
+                return view
+            time.sleep(min(.2, remaining_timeout(deadline, .2)))
+            view = self.api(path, base=self.entries[-1], timeout=remaining_timeout(deadline, 30))
+            remaining_timeout(deadline, 30)
+
+    def dev_controller(self, expected_uid=None, deadline=None):
+        row = json.loads(self.kube('get', 'statefulset', 'rcoder-app-builder-' + self.app,
+                                   '-o', 'json', deadline=deadline))
+        dev_controller_identity(row, self.app, self.lifecycle_id, expected_uid)
+        return row
+
+    def stopped_dev_view(self, uid, deadline):
+        row = self.dev_controller(uid, deadline)
+        resources = self.inventory(deadline=deadline)
+        pods = [r for r in resources if r['kind'] == 'Pod'
+                and r['name'].startswith('rcoder-app-builder-' + self.app + '-')]
+        if row.get('spec', {}).get('replicas') != 0 or pods:
+            raise AssertionError('Read-only query woke development compute: ' + str(pods))
+        return {'controller': compact_resource(row), 'replicas': 0,
+                'claims': sorted((r['name'], r['uid']) for r in resources
+                                 if r['kind'] == 'PersistentVolumeClaim')}
+
+    def observe_restarted_dev(self, uid, claims, deadline):
+        """Compute completion can precede kubelet Ready; share its original budget."""
+        observed_uid = None
+        last = None
+        try:
+            while True:
+                remaining_timeout(deadline, 90)
+                controller = self.dev_controller(uid, deadline)
+                resources = self.inventory(deadline=deadline)
+                builders = [r for r in resources if r['kind'] == 'Pod'
+                            and r['name'].startswith('rcoder-app-builder-' + self.app + '-')]
+                current_claims = sorted((r['name'], r['uid']) for r in resources
+                                        if r['kind'] == 'PersistentVolumeClaim')
+                last = {'controller': compact_resource(controller), 'pods': builders,
+                        'claims': current_claims}
+                self.save('readonly-dev-restart-readiness.json', last)
+                remaining_timeout(deadline, 90)
+                if controller.get('spec', {}).get('replicas') != 1 or current_claims != claims:
+                    raise AssertionError('Development restart changed replica intent or PVC identity')
+                if len(builders) > 1:
+                    raise AssertionError('Development restart has multiple builder Pods')
+                if builders:
+                    pod = builders[0]
+                    if (not pod.get('uid') or pod['uid'] == self.builder_uid
+                            or pod.get('deletionTimestamp')
+                            or (observed_uid is not None and pod['uid'] != observed_uid)):
+                        raise AssertionError('Development restart Pod identity changed')
+                    observed_uid = pod['uid']
+                    if pod.get('phase') not in ('Pending', 'Running'):
+                        raise AssertionError('Unexpected development restart Pod phase')
+                    if (pod['phase'] == 'Running'
+                            and any(c.get('type') == 'Ready' and c.get('status') == 'True'
+                                    for c in pod.get('conditions', []))):
+                        return controller, builders
+                time.sleep(min(.2, remaining_timeout(deadline, .2)))
+        except TimeoutError as error:
+            raise TimeoutError('Development restart Ready deadline expired; last observation: '
+                               + str(last)) from error
+
+    def patch_readonly_annotation(self, uid, value, deadline):
+        row = self.dev_controller(uid, deadline)
+        meta = row['metadata']
+        intent = self.dev_readonly_annotation
+        current = (meta.get('annotations') or {}).get(intent['key'])
+        if current is not None and current not in intent['values']:
+            raise AssertionError('Refusing to overwrite another annotation value')
+        # Record intent before dispatch so an unknown SSH outcome can still be
+        # cleaned by its exact UID and this run's issued values.
+        intent['values'].add(value)
+        patch = {'metadata': {'uid': uid, 'resourceVersion': meta['resourceVersion'],
+                              'annotations': {intent['key']: value}}}
+        result = json.loads(self.kube('patch', 'statefulset', meta['name'], '--type=merge',
+                                     '-p', json.dumps(patch), '-o', 'json', deadline=deadline))
+        after = dev_controller_identity(result, self.app, self.lifecycle_id, uid)
+        if ((after.get('annotations') or {}).get(intent['key']) != value
+                or after['resourceVersion'] == meta['resourceVersion']):
+            raise AssertionError('Conditional test annotation did not advance resourceVersion')
+        return after['resourceVersion']
+
+    def remove_readonly_annotation(self):
+        intent = getattr(self, 'dev_readonly_annotation', None)
+        if intent is None:
+            return
+        deadline = time.monotonic() + 30
+        row = self.dev_controller(intent['uid'], deadline)
+        meta = row['metadata']
+        current = (meta.get('annotations') or {}).get(intent['key'])
+        if current is None:
+            self.dev_readonly_annotation = None
+            return
+        if current not in intent['values']:
+            raise AssertionError('Refusing removal of a foreign annotation value')
+        path = '/metadata/annotations/' + intent['key'].replace('~', '~0').replace('/', '~1')
+        patch = [{'op': 'test', 'path': '/metadata/uid', 'value': intent['uid']},
+                 {'op': 'test', 'path': '/metadata/resourceVersion', 'value': meta['resourceVersion']},
+                 {'op': 'test', 'path': path, 'value': current}, {'op': 'remove', 'path': path}]
+        result = json.loads(self.kube('patch', 'statefulset', meta['name'], '--type=json',
+                                     '-p', json.dumps(patch), '-o', 'json', deadline=deadline))
+        after = dev_controller_identity(result, self.app, self.lifecycle_id, intent['uid'])
+        if intent['key'] in (after.get('annotations') or {}):
+            raise AssertionError('Test annotation remains after conditional removal')
+        self.dev_readonly_annotation = None
+
+    def readonly_dev_pair(self, entry, deadline):
+        payload = {'page': 1, 'page_size': 10, 'filters': {'app_ids': [self.app]}}
+        storage = self.api('/api/v1/userapp/storage/dev/query', payload, entry,
+                           timeout=remaining_timeout(deadline, 15))
+        remaining_timeout(deadline, 15)
+        items = storage.get('items')
+        storage_ok = (isinstance(items, list) and len(items) == 1
+                      and items[0].get('app_id') == self.app and items[0].get('exists') is True
+                      and items[0].get('is_orphan') is False)
+        path = '/api/v1/userapp/' + self.app + '/dev/logs/sources/query?' + urllib.parse.urlencode({'user_id': self.user})
+        status, logs = self.request(path, {}, entry, timeout=remaining_timeout(deadline, 15))
+        remaining_timeout(deadline, 15)
+        if not storage_ok or not stopped_dev_logs(status, logs):
+            raise AssertionError('Stopped development read contract differs: ' + str({'storage': storage, 'logs': logs}))
+        return {'entry': self.entries.index(entry), 'storage_nonorphan': True,
+                'logs_stopped': True, 'logs_code': logs['code']}
+
+    def dev_git(self, suffix, extra=None, entry=None, query=False):
+        context = {'workspaceType': 'userApp', 'serviceType': 'userapp', 'appId': self.app,
+                   'workspacePath': '/home/user/' + self.app, 'userId': self.user, 'cId': self.app}
+        context.update(extra or {})
+        headers = {'X-Service-Type': 'userapp', 'X-Workspace-Type': 'userApp', 'X-App-Id': self.app}
+        path = '/api/git/' + suffix
+        status, response = self.request(path + ('?' + urllib.parse.urlencode(context) if query else ''),
+                                        None if query else context, entry, headers)
+        if status != 200 or response.get('success') is not True:
+            raise AssertionError('Development Git request failed: ' + str(response))
+        return response
+
+    def dev_data_proof(self, filename, commit):
+        proof = {'commit': commit}
+        for ref in ('worktree', commit):
+            response = self.dev_git('file-content', {'filePath': filename, 'ref': ref}, self.entries[-1])
+            content = response.get('content')
+            if content != self.id:
+                raise AssertionError('Original development sentinel content differs')
+            proof['sentinel_sha256' if ref == 'worktree' else 'git_blob_sha256'] = hashlib.sha256(content.encode()).hexdigest()
+        log = self.dev_git('log', {'maxCount': 10}, self.entries[-1], query=True)
+        if not any(row.get('hash') == commit for row in log.get('commits', [])):
+            raise AssertionError('Original development Git commit is missing')
+        payload = {'app_id': self.app, 'user_id': self.user}
+        status, files = self.request('/api/v1/userapp/get-file-list?' + urllib.parse.urlencode(payload),
+                                     base=self.entries[-1], headers={'X-App-Id': self.app})
+        names = {f['name'] for f in files.get('files', [])}
+        expected = {filename, *('replica-' + str(i) + '.txt' for i in range(len(self.entries)))}
+        if status != 200 or files.get('success') is not True or not expected.issubset(names):
+            raise AssertionError('Original development files are missing')
+        proof['files'] = sorted(expected)
+        return proof
+
+    def dev_readonly_locator(self):
+        """Real RV churn plus no-wake checks; deterministic cross-capture is a unit regression."""
+        if len(self.entries) < 2 or len(set(self.entries[:2])) != 2 or not self.lifecycle_id:
+            raise AssertionError('Two distinct RCoder replicas and a lifecycle are required')
+        filename = 'readonly-sentinel-' + self.id[:12] + '.txt'
+        status, seeded = self.request('/api/v1/userapp/generate-file',
+                                      {'app_id': self.app, 'user_id': self.user,
+                                       'file_name': filename, 'content': self.id}, self.entries[0],
+                                      {'X-App-Id': self.app})
+        if status != 200 or seeded.get('success') is not True:
+            raise AssertionError('Development sentinel file creation failed')
+        self.dev_git('init', entry=self.entries[0])
+        committed = self.dev_git('commit', {'files': [filename], 'message': 'e2e readonly locator ' + self.id}, self.entries[0])
+        commit = committed.get('commit')
+        if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit):
+            raise AssertionError('Sentinel seed did not create an actual Git commit')
+        data_before = self.dev_data_proof(filename, commit)
+        before = self.dev_controller()
+        uid = before['metadata']['uid']
+        claims = sorted((r['name'], r['uid']) for r in self.inventory() if r['kind'] == 'PersistentVolumeClaim')
+        evidence = {'controller_uid': uid, 'old_pod_uid': self.builder_uid, 'claims': claims,
+                    'data_before': data_before, 'reads': [], 'versions': [],
+                    'cross_capture_rv_deterministic': False}
+        self.save('dev-readonly-locator.json', evidence)
+        self.check('dev_readonly_seed_data', True, data_before)
+        stop = self.dev_compute('stop', 120)
+        self.check('dev_compute_stop_identity', True, stop)
+        deadline = time.monotonic() + 90
+        stopped = self.stopped_dev_view(uid, deadline)
+        self.check('dev_stopped_resource_identity', stopped['claims'] == claims, stopped)
+        key = 'rcoder.e2e/readonly-locator-' + self.id[:12]
+        row = self.dev_controller(uid, deadline)
+        if key in (row['metadata'].get('annotations') or {}):
+            raise AssertionError('Refusing an existing test annotation')
+        self.dev_readonly_annotation = {'uid': uid, 'key': key, 'values': set()}
+        failure = None
+        try:
+            # Concurrent reads and UID/RV-conditioned metadata writes exercise
+            # genuine API-server RV changes without changing the Pod template.
+            # The report deliberately makes no per-capture scheduling claim.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                for index in range(4):
+                    futures = [pool.submit(self.readonly_dev_pair, entry, deadline) for entry in self.entries[:2]]
+                    evidence['versions'].append(self.patch_readonly_annotation(uid, self.id + ':' + str(index), deadline))
+                    evidence['reads'].extend(future.result() for future in futures)
+                    current = self.stopped_dev_view(uid, deadline)
+                    if current['claims'] != claims:
+                        raise AssertionError('Read-only query changed a PVC identity')
+                    self.save('dev-readonly-locator.json', evidence)
+            lifecycle = self.api('/api/v1/userapp/' + self.app + '/lifecycle?'
+                                 + urllib.parse.urlencode({'user_id': self.user}),
+                                 timeout=remaining_timeout(deadline, 15))
+            remaining_timeout(deadline, 15)
+            if (lifecycle.get('lifecycle_id') != self.lifecycle_id or lifecycle.get('state') != 'Active'
+                    or lifecycle.get('lifecycle_epoch') != 1):
+                raise AssertionError('Development lifecycle changed during read-only queries')
+            self.check('dev_stopped_rv_advanced', len(set(evidence['versions'])) == 4, evidence['versions'])
+            self.check('dev_stopped_storage_both_replicas', {r['entry'] for r in evidence['reads'] if r['storage_nonorphan']} == {0, 1})
+            self.check('dev_stopped_logs_both_replicas', {r['entry'] for r in evidence['reads'] if r['logs_stopped']} == {0, 1})
+            self.check('dev_stopped_no_wake', True, current)
+        except (Exception, KeyboardInterrupt) as error:
+            failure = error
+        try:
+            self.remove_readonly_annotation()
+        except (Exception, KeyboardInterrupt) as cleanup_error:
+            evidence['annotation_cleanup_error'] = repr(cleanup_error)
+            evidence['scenario_error'] = repr(failure) if failure else None
+            self.save('dev-readonly-locator.json', evidence)
+            if failure:
+                raise RuntimeError('Read-only scenario and annotation cleanup both failed: ' + repr(cleanup_error)) from failure
+            raise
+        if failure:
+            raise failure
+        self.check('dev_readonly_annotation_removed', True)
+        restart_deadline = time.monotonic() + 300
+        restarted = self.dev_compute('restart', 300, deadline=restart_deadline)
+        controller, builders = self.observe_restarted_dev(uid, claims, restart_deadline)
+        valid = (len(builders) == 1 and builders[0]['uid'] != self.builder_uid
+                 and builders[0].get('phase') == 'Running'
+                 and any(c.get('type') == 'Ready' and c.get('status') == 'True' for c in builders[0].get('conditions', []))
+                 and controller.get('spec', {}).get('replicas') == 1)
+        self.check('dev_compute_restart_identity', valid, {'operation': restarted, 'pods': builders})
+        self.builder_uid = builders[0]['uid']
+        data_after = self.dev_data_proof(filename, commit)
+        after_claims = sorted((r['name'], r['uid']) for r in self.inventory() if r['kind'] == 'PersistentVolumeClaim')
+        evidence.update(new_pod_uid=self.builder_uid, data_after=data_after,
+                        controller_uid_after=controller['metadata']['uid'], claims_after=after_claims)
+        self.save('dev-readonly-locator.json', evidence)
+        self.check('dev_readonly_data_preserved', data_before == data_after and claims == after_claims, evidence)
 
     def build(self, version):
         buf = io.BytesIO()
@@ -1060,6 +1369,7 @@ def main():
     try:
         run.prepare()
         run.workspace()
+        run.dev_readonly_locator()
         a, ra = run.build('A')
         b, rb = run.build('B')
         run.deploy(a, ra, b, rb)

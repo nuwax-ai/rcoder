@@ -13,8 +13,8 @@ use async_trait::async_trait;
 /// `dev_container_alive` 无副作用（只探测不 ensure——orphan 判定不能有创建
 /// 副作用）。
 ///
-/// 定位键 = 复合 identifier `{user_id}-{app_id}`（协作模型多实例）：`user_id`
-/// 显式传即该用户的实例，缺失由宿主实现回落 metadata owner。
+/// 应用共享：定位键为 `app_id`，同一应用只有一个 Dev 执行域；用户与 URL
+/// 中的用户占位段不参与定位。只读观察结果不授予创建、唤醒或接管权限。
 #[async_trait]
 pub trait UserappDevLocator: Send + Sync {
     /// 幂等 ensure 开发容器并返回其 file-server 基址（`http://{host}:60000`）。

@@ -97,6 +97,147 @@ pub(super) async fn get(
         .transpose()
 }
 
+enum ScopedComputeHead {
+    Absent,
+    Current(models::ComputeIntent),
+    Historical(models::ComputeIntent),
+}
+
+async fn read_scoped_head(
+    tx: &mut dyn Executor,
+    app: &UserAppLifecycleRecord,
+    scope: UserAppOperationScope,
+) -> Result<ScopedComputeHead, Error> {
+    let head =
+        models::ComputeIntent::filter_by_app_id_and_scope(&app.app_id, codec::scope_name(scope))
+            .first()
+            .exec(tx)
+            .await
+            .map_err(storage)?;
+    match head {
+        Some(head) => classify_scoped_head(tx, app, scope, head).await,
+        None => Ok(ScopedComputeHead::Absent),
+    }
+}
+
+async fn classify_scoped_head(
+    tx: &mut dyn Executor,
+    app: &UserAppLifecycleRecord,
+    scope: UserAppOperationScope,
+    head: models::ComputeIntent,
+) -> Result<ScopedComputeHead, Error> {
+    if head.app_id != app.app_id || head.scope != codec::scope_name(scope) {
+        return Err(invalid("Compute intent scope identity mismatch"));
+    }
+    if head.lifecycle_id == app.lifecycle_id {
+        return Ok(ScopedComputeHead::Current(head));
+    }
+    // An old intent cannot authorize execution in this lifecycle. Before
+    // treating it as history, retain protection for every unresolved executor
+    // in its old scope, including a writer no longer referenced by the head.
+    validate_settled_head(tx, &head).await?;
+    Ok(ScopedComputeHead::Historical(head))
+}
+
+async fn validate_settled_head(
+    tx: &mut dyn Executor,
+    head: &models::ComputeIntent,
+) -> Result<(), Error> {
+    if head.generation < 1 || head.revision < 1 {
+        return Err(invalid("Invalid compute intent revision"));
+    }
+    let scope = codec::scope(&head.scope).map_err(storage)?;
+    match scope {
+        UserAppOperationScope::Dev | UserAppOperationScope::Prod => {}
+        UserAppOperationScope::Application => return Err(invalid("Invalid compute intent scope")),
+    }
+    let fields = models::ComputeControl::fields();
+    let controls = models::ComputeControl::filter(
+        fields
+            .app_id()
+            .eq(&head.app_id)
+            .and(fields.lifecycle_id().eq(&head.lifecycle_id))
+            .and(fields.scope().eq(&head.scope)),
+    )
+    .exec(tx)
+    .await
+    .map_err(storage)?;
+    let mut referenced_control_found = head.control_operation_id.is_none();
+    for row in controls {
+        let control = decode(row)?;
+        if head.control_operation_id.as_deref() == Some(control.operation_id.as_str()) {
+            if control.app_id != head.app_id
+                || control.lifecycle_id != head.lifecycle_id
+                || control.scope != scope
+                || control.generation != head.generation
+            {
+                return Err(invalid("Compute intent operation identity mismatch"));
+            }
+            referenced_control_found = true;
+        }
+        match control.state {
+            // These states cannot submit another runtime write. Their own
+            // receipt may remain for exact-identity historical lease cleanup.
+            ComputeControlState::Succeeded | ComputeControlState::Failed => {}
+            ComputeControlState::Superseded => {
+                if control.executor_id.is_some()
+                    || control.stage != "accepted"
+                    || control.lease.is_some()
+                {
+                    return Err(Error::LifecycleConflict);
+                }
+            }
+            ComputeControlState::Pending
+            | ComputeControlState::Running
+            | ComputeControlState::RecoveryRequired => return Err(Error::LifecycleConflict),
+        }
+        super::compute_execution::drained(tx, &control).await?;
+    }
+    if !referenced_control_found {
+        return Err(invalid(
+            "Compute intent operation missing or outside its scope",
+        ));
+    }
+    // Historical desired_state belongs to the old lifecycle and is deliberately
+    // not parsed. Only a current intent can constrain the current desired state.
+    Ok(())
+}
+
+async fn retire_head(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    head: &models::ComputeIntent,
+) -> Result<(), Error> {
+    let changed = toasty::sql::statement(repo::sql(backend,
+        "DELETE FROM userapp_compute_intents WHERE app_id=$1 AND scope=$2 AND lifecycle_id=$3 AND revision=$4 AND generation=$5"))
+        .bind(&head.app_id).bind(&head.scope).bind(&head.lifecycle_id)
+        .bind(head.revision).bind(head.generation).exec(tx).await.map_err(storage)?;
+    if changed != 1 {
+        return Err(Error::VersionConflict);
+    }
+    Ok(())
+}
+
+/// Called under the recreation root CAS. Only current pointers are retired;
+/// original controls, diagnostics, checkpoints and receipts remain unchanged.
+pub(super) async fn retire_lifecycle_heads(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    app: &UserAppLifecycleRecord,
+) -> Result<(), Error> {
+    for scope in [UserAppOperationScope::Dev, UserAppOperationScope::Prod] {
+        match read_scoped_head(tx, app, scope).await? {
+            ScopedComputeHead::Current(head) => {
+                validate_settled_head(tx, &head).await?;
+                retire_head(tx, backend, &head).await?;
+            }
+            ScopedComputeHead::Historical(head) => retire_head(tx, backend, &head).await?,
+            ScopedComputeHead::Absent => {}
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn read_status(
     tx: &mut dyn Executor,
     app_id: &str,
@@ -113,18 +254,12 @@ pub(super) async fn read_status(
     if app.lifecycle_id != lifecycle_id {
         return Err(Error::LifecycleConflict);
     }
-    let Some(head) =
-        models::ComputeIntent::filter_by_app_id_and_scope(app_id, codec::scope_name(scope))
-            .first()
-            .exec(tx)
-            .await
-            .map_err(storage)?
-    else {
-        return Ok(UserAppComputeStatus::default());
+    let head = match read_scoped_head(tx, &app, scope).await? {
+        ScopedComputeHead::Current(head) => head,
+        ScopedComputeHead::Historical(_) | ScopedComputeHead::Absent => {
+            return Ok(UserAppComputeStatus::default());
+        }
     };
-    if head.lifecycle_id != lifecycle_id {
-        return Err(Error::LifecycleConflict);
-    }
     if head.generation < 1 || head.revision < 1 {
         return Err(invalid("Invalid compute intent revision"));
     }
@@ -260,11 +395,14 @@ pub(super) async fn admit(
     {
         return Err(Error::LifecycleConflict);
     }
-    let head = models::ComputeIntent::filter_by_app_id_and_scope(&request.app_id, scope)
-        .first()
-        .exec(tx)
-        .await
-        .map_err(storage)?;
+    let head = match read_scoped_head(tx, &app, request.scope).await? {
+        ScopedComputeHead::Current(head) => Some(head),
+        ScopedComputeHead::Historical(head) => {
+            retire_head(tx, backend, &head).await?;
+            None
+        }
+        ScopedComputeHead::Absent => None,
+    };
     // Only background repair consumes the old desired state. An explicit
     // Stop/Restart replaces that intent and must not gain a new admission
     // restriction merely because an obsolete desired value cannot be decoded.
@@ -309,7 +447,10 @@ pub(super) async fn admit(
                 .ok_or_else(|| invalid("Compute revision exhausted"))?,
         )
     } else {
-        (1, 1)
+        (
+            next_generation(tx, backend, &request.app_id, scope).await?,
+            1,
+        )
     };
     for scope in [request.scope, UserAppOperationScope::Application] {
         if let Some(id) = app.active_operations.slot(scope) {
@@ -552,6 +693,12 @@ pub(super) async fn check_business_authority(
     tx: &mut dyn Executor,
     operation: &UserAppOperationRecord,
 ) -> Result<(), Error> {
+    let app = repo::app(tx, &operation.app_id)
+        .await?
+        .ok_or(Error::NotFound)?;
+    if app.lifecycle_id != operation.lifecycle_id {
+        return Err(Error::LifecycleConflict);
+    }
     let scopes: &[UserAppOperationScope] = match operation.scope {
         UserAppOperationScope::Application => {
             &[UserAppOperationScope::Dev, UserAppOperationScope::Prod]
@@ -560,20 +707,10 @@ pub(super) async fn check_business_authority(
         UserAppOperationScope::Prod => &[UserAppOperationScope::Prod],
     };
     for scope in scopes {
-        let head = models::ComputeIntent::filter_by_app_id_and_scope(
-            &operation.app_id,
-            codec::scope_name(*scope),
-        )
-        .first()
-        .exec(tx)
-        .await
-        .map_err(storage)?;
-        let Some(head) = head else {
-            continue;
+        let head = match read_scoped_head(tx, &app, *scope).await? {
+            ScopedComputeHead::Current(head) => head,
+            ScopedComputeHead::Historical(_) | ScopedComputeHead::Absent => continue,
         };
-        if head.lifecycle_id != operation.lifecycle_id {
-            return Err(Error::LifecycleConflict);
-        }
         if let Some(id) = head.control_operation_id {
             let control = get(tx, &operation.app_id, &id)
                 .await?
@@ -605,20 +742,10 @@ pub(super) async fn guard_admission(
         UserAppOperationScope::Prod => &[UserAppOperationScope::Prod],
     };
     for scope in scopes {
-        let head = models::ComputeIntent::filter_by_app_id_and_scope(
-            &app.app_id,
-            codec::scope_name(*scope),
-        )
-        .first()
-        .exec(tx)
-        .await
-        .map_err(storage)?;
-        let Some(head) = head else {
-            continue;
+        let head = match read_scoped_head(tx, app, *scope).await? {
+            ScopedComputeHead::Current(head) => head,
+            ScopedComputeHead::Historical(_) | ScopedComputeHead::Absent => continue,
         };
-        if head.lifecycle_id != app.lifecycle_id {
-            return Err(Error::LifecycleConflict);
-        }
         if let Some(id) = head.control_operation_id {
             let control = get(tx, &app.app_id, &id)
                 .await?
@@ -659,13 +786,22 @@ fn control_conflict(control: ComputeControlRecord) -> Error {
             (UserAppOperationScope::Dev, ComputeControlAction::Restart) => {
                 UserAppOperationKind::RestartBuilder
             }
-            (_, ComputeControlAction::Stop) => UserAppOperationKind::Stop,
-            (_, ComputeControlAction::Restart) => UserAppOperationKind::Restart,
+            (
+                UserAppOperationScope::Prod | UserAppOperationScope::Application,
+                ComputeControlAction::Stop,
+            ) => UserAppOperationKind::Stop,
+            (
+                UserAppOperationScope::Prod | UserAppOperationScope::Application,
+                ComputeControlAction::Restart,
+            ) => UserAppOperationKind::Restart,
         },
         state: match control.state {
             ComputeControlState::Pending => UserAppOperationState::Pending,
             ComputeControlState::RecoveryRequired => UserAppOperationState::RecoveryRequired,
-            _ => UserAppOperationState::Running,
+            ComputeControlState::Running
+            | ComputeControlState::Succeeded
+            | ComputeControlState::Failed
+            | ComputeControlState::Superseded => UserAppOperationState::Running,
         },
         step: control.stage,
     })
@@ -707,15 +843,29 @@ pub(super) async fn desired_stopped(
     if scope == UserAppOperationScope::Application {
         return Err(invalid("Compute intent requires dev or prod scope"));
     }
-    let head = models::ComputeIntent::filter_by_app_id_and_scope(app_id, codec::scope_name(scope))
-        .first()
-        .exec(tx)
-        .await
-        .map_err(storage)?;
-    match head {
-        Some(head) if head.lifecycle_id != lifecycle_id => Err(Error::LifecycleConflict),
-        Some(head) => persisted_desired_stopped(&head.desired_state),
-        None => Ok(false),
+    let app = match repo::app(tx, app_id).await? {
+        Some(app) => app,
+        None => {
+            // No application and no intent is an ordinary absence observation.
+            // A dangling intent cannot establish a current lifecycle identity.
+            let head =
+                models::ComputeIntent::filter_by_app_id_and_scope(app_id, codec::scope_name(scope))
+                    .first()
+                    .exec(tx)
+                    .await
+                    .map_err(storage)?;
+            return match head {
+                Some(_) => Err(Error::LifecycleConflict),
+                None => Ok(false),
+            };
+        }
+    };
+    if app.lifecycle_id != lifecycle_id {
+        return Err(Error::LifecycleConflict);
+    }
+    match read_scoped_head(tx, &app, scope).await? {
+        ScopedComputeHead::Current(head) => persisted_desired_stopped(&head.desired_state),
+        ScopedComputeHead::Historical(_) | ScopedComputeHead::Absent => Ok(false),
     }
 }
 
@@ -728,6 +878,13 @@ pub(super) async fn check_access(
     scope: UserAppOperationScope,
     explicit_start: bool,
 ) -> Result<(), Error> {
+    if explicit_start {
+        #[cfg(test)]
+        super::transaction_fault_tests::before_compute_access_root_claim().await;
+        // Admission may replace the lifecycle and head while this writer waits.
+        // Read both only after competing for the same root token.
+        repo::claim_app(tx, backend, app_id).await?;
+    }
     let Some(head) =
         models::ComputeIntent::filter_by_app_id_and_scope(app_id, codec::scope_name(scope))
             .first()
@@ -737,14 +894,16 @@ pub(super) async fn check_access(
     else {
         return Ok(());
     };
+    let app = repo::app(tx, app_id)
+        .await?
+        .ok_or(Error::LifecycleConflict)?;
     if explicit_start {
-        repo::claim_app(tx, backend, app_id).await?;
-        let app = repo::app(tx, app_id).await?.ok_or(Error::NotFound)?;
         domain::validate_active(&app)?;
-        if app.lifecycle_id != head.lifecycle_id {
-            return Err(Error::LifecycleConflict);
-        }
     }
+    let head = match classify_scoped_head(tx, &app, scope, head).await? {
+        ScopedComputeHead::Current(head) => head,
+        ScopedComputeHead::Historical(_) | ScopedComputeHead::Absent => return Ok(()),
+    };
     if let Some(id) = &head.control_operation_id {
         let control = get(tx, app_id, id)
             .await?

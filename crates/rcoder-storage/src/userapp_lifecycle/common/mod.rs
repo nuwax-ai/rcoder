@@ -252,7 +252,7 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         explicit_start: bool,
     ) -> Result<(), UserAppStoreError> {
         let app_id = app_id.to_owned();
-        self.run(false, move |tx, backend| {
+        self.run(!explicit_start, move |tx, backend| {
             Box::pin(async move {
                 compute::check_access(tx, backend, &app_id, scope, explicit_start).await
             })

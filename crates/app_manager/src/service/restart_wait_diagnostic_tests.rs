@@ -844,6 +844,13 @@ async fn restart_new_physical_identity_invalidates_history_before_a_budget_exhau
                         .as_deref(),
                     Some(holder.operation_id.as_str())
                 );
+                // The production admission loop rechecks the durable holder
+                // after a physical conflict before starting its next attempt.
+                // This observation must retain the compatible physical proof.
+                second
+                    .wait_restart_blocker(app_id, verified, deadline)
+                    .await
+                    .unwrap();
                 tokio::time::sleep_until(deadline).await;
                 let mut incoming = shared_types::UserAppOperationInProgress {
                     app_id: app_id.into(),
