@@ -50,6 +50,13 @@ impl DevServerManager {
             starting: &self.starting,
             project_id: ticket.preview_key.clone(),
         };
+        let matching_instance = lock(&self.processes)?
+            .get(&ticket.preview_key)
+            .is_none_or(|record| record.instance_id.as_deref() == Some(&ticket.instance_id));
+        if matching_instance {
+            self.resume_pending_registered_stop(&ticket.preview_key)
+                .await?;
+        }
         // 幂等：同实例重放返回现有登记；异实例残留为异常态，fail-fast。
         if let Some(p) = lock(&self.processes)?.get(&ticket.preview_key).cloned() {
             if p.instance_id.as_deref() == Some(&ticket.instance_id) {
@@ -108,44 +115,40 @@ impl DevServerManager {
         };
         let _stop_guard = stop_lock.lock().await;
 
-        // Keep the registration until termination finishes. If this future is
-        // cancelled after SIGTERM, a later stop still finds the original PID
-        // and can finish the same instance instead of returning NotRegistered.
-        let proc = lock(&self.processes)?.get(preview_key).cloned();
+        // Capture under the same publication lock order. The shared closure
+        // retains the exact launch/Child, confirms root and tree exit, and only
+        // then retires the maps. A signal callback cannot authorize retirement.
+        let (proc, launch) = {
+            let launches = lock(&self.launches)?;
+            let processes = lock(&self.processes)?;
+            (
+                processes.get(preview_key).cloned(),
+                launches
+                    .get(preview_key)
+                    .map(|launch| launch.launch_id.clone()),
+            )
+        };
         let Some(p) = proc else {
             return Ok(ExecutorStopOutcome::NotRegistered);
         };
         if p.instance_id.as_deref() != Some(instance_id) {
             return Ok(ExecutorStopOutcome::IdentityMismatch);
         }
-        let killed = terminate(p.pid).await;
-        if !killed {
-            if process::is_process_running(p.pid) {
-                return Err(AppError::business(format!(
-                    "coordinated stop could not terminate recorded pid {}",
-                    p.pid
-                )));
+        // FnOnce is enough: the fallback has at most one registered PID. Owned
+        // modern children use their original managed tree instead of callback.
+        let terminate = tokio::sync::Mutex::new(Some(terminate));
+        self.close_local_registration_with_termination(preview_key, launch.as_deref(), |pid| {
+            let terminate = &terminate;
+            async move {
+                let call = terminate.lock().await.take();
+                match call {
+                    Some(call) => call(pid).await,
+                    None => false,
+                }
             }
-            // 进程组已不在（先期退出）也按 Stopped 收口。
-            tracing::warn!(
-                preview_key,
-                pid = p.pid,
-                "coordinated stop found process already gone"
-            );
-        }
-        super::log::cleanup_temp_logs(&p.log_dir).await;
-        let removed = {
-            let mut processes = lock(&self.processes)?;
-            if processes.get(preview_key).is_some_and(|current| {
-                current.instance_id.as_deref() == Some(instance_id) && current.pid == p.pid
-            }) {
-                processes.remove(preview_key);
-                true
-            } else {
-                false
-            }
-        };
-        if !removed {
+        })
+        .await?;
+        if lock(&self.processes)?.contains_key(preview_key) {
             return Ok(ExecutorStopOutcome::IdentityMismatch);
         }
         Ok(ExecutorStopOutcome::Stopped)
@@ -196,6 +199,67 @@ impl DevServerManager {
             pid: Some(i64::from(p.pid)),
             port: Some(p.port),
         })
+    }
+}
+
+#[cfg(all(test, unix))]
+mod signal_ack_regression {
+    use super::*;
+    use crate::models::DevProcess;
+    use std::process::Stdio;
+
+    /// The injected callback acknowledges dispatch but deliberately sends no
+    /// signal. The real child remains alive; this is not an "unkillable sleep".
+    /// Old stop_coordinated_with treats this bool as completion and goes RED.
+    #[tokio::test]
+    async fn signal_ack_without_observed_exit_keeps_original_registration() {
+        let logs = tempfile::tempdir().unwrap();
+        let manager = DevServerManager::new(Arc::new(crate::Config::default()));
+        let key = format!("signal-ack-{}", uuid::Uuid::new_v4().simple());
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        lock(&manager.processes).unwrap().insert(
+            key.clone(),
+            DevProcess {
+                pid,
+                port: 19002,
+                project_id: key.clone(),
+                started_at: 1,
+                instance_id: Some("original-instance".into()),
+                base_path: None,
+                log_dir: logs.path().to_path_buf(),
+                temp_log_name: String::new(),
+                external_owner: None,
+            },
+        );
+        let outcome = manager
+            .stop_coordinated_with(&key, "original-instance", |_pid| async { true })
+            .await;
+        let retained = lock(&manager.processes)
+            .unwrap()
+            .get(&key)
+            .is_some_and(|row| row.pid == pid);
+        let still_alive = child.try_wait().unwrap().is_none();
+        // Own-handle cleanup always precedes assertions, including an old RED.
+        lock(&manager.processes).unwrap().remove(&key);
+        child.kill().await.unwrap();
+        let _exit = child.wait().await.unwrap();
+        assert!(still_alive, "the counterexample must still be executing");
+        assert!(
+            outcome.is_err(),
+            "signal acknowledgement was misreported as stopped: {outcome:?}"
+        );
+        assert!(
+            retained,
+            "the exact registration was retired before exit observation"
+        );
     }
 }
 
@@ -336,7 +400,7 @@ mod r11_tests {
         lock(&manager.processes).expect("process registry").insert(
             key.to_string(),
             DevProcess {
-                pid: 42,
+                pid: 2_147_483_646,
                 port: 4001,
                 project_id: key.to_string(),
                 instance_id: Some(instance_id.to_string()),

@@ -1,12 +1,13 @@
 //! Filesystem observation failures must not choose another execution engine or
 //! erase an existing project's local-supervision observation.
+use super::super::supervise::{ChildExit, SupervisedChild};
 use super::super::{DevLaunch, DevServerManager, discovery};
 use crate::error::AppError;
 use crate::models::DevProcess;
 use shared_types::{ExecutorStartTicket, ExecutorStopOutcome};
-use std::os::unix::{fs::symlink, process::CommandExt};
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 
 struct Fixture {
@@ -35,7 +36,9 @@ impl Fixture {
             app_cli_bin: Some("/bin/false".into()),
             app_cli_admin_probe_addr: "127.0.0.1:1".into(),
             dev_stop_check_interval_ms: 5,
-            dev_stop_max_attempts: 2,
+            // This is an IO-routing fixture, not a 10ms stop-budget test.
+            // Allow the actual kernel-pinned group-state observation to finish.
+            dev_stop_max_attempts: 40,
             ..crate::Config::default()
         };
         Self {
@@ -74,10 +77,15 @@ impl Fixture {
         } else {
             self.manager.port_pool.allocate(&self.project).unwrap()
         };
+        self.manager
+            .supervised
+            .lock()
+            .unwrap()
+            .insert(self.project.clone(), child.0.clone());
         self.manager.processes.lock().unwrap().insert(
             self.project.clone(),
             DevProcess {
-                pid: child.0.id(),
+                pid: child.0.pid(),
                 port,
                 project_id: self.project.clone(),
                 started_at: 1,
@@ -114,33 +122,38 @@ impl Drop for Fixture {
     }
 }
 
-struct OwnedChild(Child);
+struct OwnedChild(Arc<SupervisedChild>);
 
 impl OwnedChild {
     fn spawn() -> Self {
-        Self(
-            Command::new("sleep")
-                .arg("60")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .process_group(0)
-                .spawn()
-                .unwrap(),
-        )
+        let mut command = tokio::process::Command::new("sleep");
+        command
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = process_utils::managed_tree::spawn_managed(command).unwrap();
+        Self(SupervisedChild::adopt_managed(child, Arc::new(Default::default())).unwrap())
     }
 
-    fn wait(&mut self) -> ExitStatus {
-        self.0.wait().unwrap()
+    async fn wait(&self) -> ExitStatus {
+        match self
+            .0
+            .wait_exit(std::time::Duration::from_secs(2))
+            .await
+            .unwrap()
+        {
+            ChildExit::Exited(status) => status,
+            ChildExit::WaitFailed(error) => panic!("original fixture Child wait failed: {error}"),
+        }
     }
 }
 
 impl Drop for OwnedChild {
     fn drop(&mut self) {
-        if self.0.try_wait().unwrap().is_none() {
-            let _kill_result = self.0.kill();
+        if self.0.exited().is_none() {
+            super::super::process::kill_process_group_force(self.0.pid());
         }
-        let _wait_result = self.0.wait();
     }
 }
 
@@ -192,7 +205,7 @@ async fn manifest_probe_io_coordinated_start_never_enters_legacy_preparation() {
 #[tokio::test]
 async fn manifest_probe_io_direct_start_preserves_registration_and_retries_after_repair() {
     let fixture = Fixture::new(false);
-    let mut child = OwnedChild::spawn();
+    let child = OwnedChild::spawn();
     let port = fixture.register_legacy_child(&child, false);
     let original = fixture.manifest_loop();
     let error = fixture
@@ -204,7 +217,7 @@ async fn manifest_probe_io_direct_start_preserves_registration_and_retries_after
     assert!(fixture.manager.starting.lock().unwrap().is_empty());
     assert_eq!(
         fixture.manager.processes.lock().unwrap()[&fixture.project].pid,
-        child.0.id()
+        child.0.pid()
     );
     assert_eq!(
         fixture.manager.port_pool.status().unwrap().total_allocated,
@@ -219,22 +232,22 @@ async fn manifest_probe_io_direct_start_preserves_registration_and_retries_after
         .start_dev(&fixture.project, &fixture.workspace, launch())
         .await
         .unwrap();
-    assert_eq!((started.pid, started.port), (child.0.id(), port));
+    assert_eq!((started.pid, started.port), (child.0.pid(), port));
     let stopped = fixture.manager.stop_dev(&fixture.project).await.unwrap();
     assert!(
         stopped
             .killed_pids
             .iter()
-            .any(|row| row.pid == child.0.id() && row.killed)
+            .any(|row| row.pid == child.0.pid() && row.killed)
     );
-    let _actual_exit = child.wait();
+    let _actual_exit = child.wait().await;
     fixture.assert_idle_maps();
 }
 
 #[tokio::test]
 async fn manifest_probe_io_coordinated_start_preserves_registration_and_retries_after_repair() {
     let fixture = Fixture::new(false);
-    let mut child = OwnedChild::spawn();
+    let child = OwnedChild::spawn();
     let port = fixture.register_legacy_child(&child, true);
     let original = fixture.manifest_loop();
     let error = fixture
@@ -246,7 +259,7 @@ async fn manifest_probe_io_coordinated_start_preserves_registration_and_retries_
     assert!(fixture.manager.starting.lock().unwrap().is_empty());
     assert_eq!(
         fixture.manager.processes.lock().unwrap()[&fixture.project].pid,
-        child.0.id()
+        child.0.pid()
     );
     assert!(!fixture.logs.exists());
     assert!(!fixture.workspace.join(".npmrc").exists());
@@ -257,7 +270,7 @@ async fn manifest_probe_io_coordinated_start_preserves_registration_and_retries_
         .start_coordinated(&fixture.ticket())
         .await
         .unwrap();
-    assert_eq!((started.pid, started.port), (child.0.id(), port));
+    assert_eq!((started.pid, started.port), (child.0.pid(), port));
     assert_eq!(
         fixture
             .manager
@@ -266,7 +279,7 @@ async fn manifest_probe_io_coordinated_start_preserves_registration_and_retries_
             .unwrap(),
         ExecutorStopOutcome::Stopped
     );
-    let _actual_exit = child.wait();
+    let _actual_exit = child.wait().await;
     fixture.assert_idle_maps();
 }
 

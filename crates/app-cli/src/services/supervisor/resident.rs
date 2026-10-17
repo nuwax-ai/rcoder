@@ -1586,14 +1586,19 @@ impl ResidentProxy {
         if tokio::time::Instant::now() >= deadline || self.owner.stopping.load(Ordering::Acquire) {
             return Ok(());
         }
-        if self.confirmed.is_none() || tokio::time::Instant::now() < self.next_restart {
+        if self.confirmed.is_none() || !self.observe_exit()? {
             return Ok(());
         }
-        if !self.observe_exit()? {
+        // A rebuild backoff delays only the next spawn. It must not retain an
+        // exited root or its old tree: the owned POSIX Child remains waitable
+        // until this exact cleanup commits and reaps its identity pin.
+        if self.child.is_some() {
+            self.retire_dead_child().await?;
+        }
+        if tokio::time::Instant::now() < self.next_restart {
             return Ok(());
         }
         self.next_restart = tokio::time::Instant::now() + Duration::from_secs(1);
-        self.retire_dead_child().await?;
         self.restore_with_deadline(deadline, epoch).await
     }
 

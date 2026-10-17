@@ -16,6 +16,8 @@
 pub mod atomic_file;
 pub mod command_authority;
 pub mod command_context;
+#[cfg(unix)]
+pub mod execution_tree;
 pub mod managed_tree;
 pub mod observe;
 pub mod request_activity;

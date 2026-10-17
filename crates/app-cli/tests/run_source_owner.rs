@@ -363,6 +363,31 @@ impl Fixture {
         }
     }
 
+    async fn operation_until(
+        &self,
+        client: &reqwest::Client,
+        base: &str,
+        identity: &Value,
+        kind: &str,
+        deadline: tokio::time::Instant,
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fresh Source admission budget ended before dispatch"
+        );
+        // Bound the unchanged submit/terminal helper with the caller's original
+        // deadline, including a POST whose result might become unknown. Never
+        // resend that POST when this timeout fires.
+        tokio::time::timeout_at(deadline, self.operation(client, base, identity, kind))
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "fresh Source operation exceeded its original deadline: {error}; {}",
+                    self.diagnostics()
+                )
+            });
+    }
+
     async fn same_owner(
         &self,
         client: &reqwest::Client,

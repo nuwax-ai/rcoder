@@ -20,6 +20,67 @@ use crate::error::{AppError, AppResult};
 use crate::models::KilledPid;
 
 impl DevServerManager {
+    /// Continue captured cleanup or retire the actual exited current child
+    /// before a Start reuses its registration. A cached dead PID is not Ready.
+    /// The marker cannot authorize work against a replacement, and historical
+    /// records are not erased or promoted to proof of a live process.
+    pub(super) async fn resume_pending_registered_stop(&self, project_id: &str) -> AppResult<()> {
+        let (launch, legacy_candidates) = {
+            let launches = lock(&self.launches)?;
+            let processes = lock(&self.processes)?;
+            let children = lock(&self.supervised)?;
+            if processes
+                .get(project_id)
+                .is_some_and(|process| process.external_owner.is_some())
+            {
+                return Ok(());
+            }
+            let current = super::cleanup_record::CleanupRecord::capture(
+                super::types::CleanupStatus::Cleaning,
+                launches
+                    .get(project_id)
+                    .map(|launch| launch.launch_id.as_str()),
+                processes.get(project_id),
+                children.get(project_id),
+            );
+            let pending = lock(&self.cleanup_state)?
+                .get(project_id)
+                .is_some_and(|record| {
+                    matches!(record.status, super::types::CleanupStatus::Cleaning)
+                        && record.same_incarnation(&current)
+                });
+            let exited_current_child = children.get(project_id).is_some_and(|child| {
+                child.has_managed_tree()
+                    && match child.exited() {
+                        Some(ChildExit::Exited(_)) => true,
+                        Some(ChildExit::WaitFailed(_)) | None => false,
+                    }
+            });
+            if !pending && !exited_current_child {
+                return Ok(());
+            }
+            (
+                launches
+                    .get(project_id)
+                    .map(|launch| launch.launch_id.clone()),
+                !project_id.starts_with("userapp:")
+                    && processes
+                        .get(project_id)
+                        .is_none_or(|process| process.instance_id.is_none()),
+            )
+        };
+        if legacy_candidates {
+            // An interrupted legacy Stop may have captured more than its
+            // registered root. Resume the original project stop/discovery so
+            // normal Start cannot retire the root while another candidate lives.
+            self.stop_dev(project_id).await?;
+        } else {
+            self.close_local_registration(project_id, launch.as_deref())
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Rebuild locator metadata only under its actual owner lock. The owning
     /// CLI still drains every retained execution before a new start is allowed.
     pub(super) async fn recover_unreadable_local_roots(
@@ -392,6 +453,22 @@ impl DevServerManager {
         project_id: &str,
         captured_launch: Option<&str>,
     ) -> AppResult<Vec<KilledPid>> {
+        self.close_local_registration_with_termination(project_id, captured_launch, |pid| {
+            self.terminate_pid_group(pid)
+        })
+        .await
+    }
+
+    pub(super) async fn close_local_registration_with_termination<F, Fut>(
+        &self,
+        project_id: &str,
+        captured_launch: Option<&str>,
+        terminate: F,
+    ) -> AppResult<Vec<KilledPid>>
+    where
+        F: Fn(u32) -> Fut,
+        Fut: Future<Output = bool>,
+    {
         // Check the launch before capturing a child to signal, under the same
         // lock order as publication. A post-kill comparison protects the maps
         // but is too late to protect a replacement process.
@@ -419,57 +496,118 @@ impl DevServerManager {
             }
             (captured, lock(&self.supervised)?.get(project_id).cloned())
         };
+        let cleanup_capture = super::cleanup_record::CleanupRecord::capture(
+            super::types::CleanupStatus::Cleaning,
+            captured_launch,
+            captured_process.as_ref(),
+            supervised.as_ref(),
+        );
+        {
+            let launches = lock(&self.launches)?;
+            let processes = lock(&self.processes)?;
+            let children = lock(&self.supervised)?;
+            let current = super::cleanup_record::CleanupRecord::capture(
+                super::types::CleanupStatus::Cleaning,
+                launches
+                    .get(project_id)
+                    .map(|launch| launch.launch_id.as_str()),
+                processes.get(project_id),
+                children.get(project_id),
+            );
+            if !cleanup_capture.same_incarnation(&current)
+                || processes
+                    .get(project_id)
+                    .is_some_and(|process| process.external_owner.is_some())
+            {
+                return Ok(Vec::new());
+            }
+            lock(&self.cleanup_state)?.insert(project_id.into(), cleanup_capture.clone());
+        }
+        let deadline = tokio::time::Instant::now() + self.config.dev_stop_drain_budget();
         let mut killed: Vec<KilledPid> = Vec::new();
         if let Some(supervised) = supervised {
             let pid = supervised.pid();
-            // FS-09: 统一毫秒精度预算（200ms 不再截断为 0 秒）; 排空与退出等待共用同一 deadline。
-            let drain_timeout = self.config.dev_stop_drain_budget();
-            let observed_exit = supervised.exited();
-            // A reaped launcher no longer owns its numeric PID; signaling that
-            // number could kill an unrelated process after PID reuse. A failed
-            // wait is also insufficient evidence to signal or confirm cleanup.
-            // Business-tree cleanup remains the captured StopWork's authority.
-            match &observed_exit {
-                Some(ChildExit::Exited(_) | ChildExit::WaitFailed(_)) => {}
-                None => {
-                    let terminated = self.terminate_pid_group(pid).await;
-                    killed.push(KilledPid {
-                        pid,
-                        killed: terminated,
-                    });
+            let mut stop_error = None;
+            let confirmed = if supervised.has_managed_tree() {
+                let outcome = supervised
+                    .stop_managed_until(self.stop_grace_budget(), deadline)
+                    .await;
+                let confirmed = match outcome {
+                    Ok(confirmed) => confirmed,
+                    Err(error) => {
+                        stop_error = Some(error);
+                        false
+                    }
+                };
+                killed.push(KilledPid {
+                    pid,
+                    killed: confirmed,
+                });
+                confirmed
+            } else {
+                // Manifest one-shot run has native StopWork business-tree
+                // authority already checked by stop_local_targets. A reaped
+                // launcher does not authorize another signal to its old PID.
+                let observed_exit = supervised.exited();
+                match &observed_exit {
+                    Some(ChildExit::Exited(_) | ChildExit::WaitFailed(_)) => {}
+                    None => {
+                        let terminated = terminate(pid).await;
+                        killed.push(KilledPid {
+                            pid,
+                            killed: terminated,
+                        });
+                    }
                 }
-            }
-            supervised.drain_stdout(drain_timeout).await;
-            let exited = match observed_exit {
-                Some(exit) => Some(exit),
-                None => supervised.wait_exit(drain_timeout).await,
+                let exited = match observed_exit {
+                    Some(exit) => Some(exit),
+                    None => {
+                        supervised
+                            .wait_exit(
+                                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                            )
+                            .await
+                    }
+                };
+                matches!(exited, Some(ChildExit::Exited(_)))
             };
-            let confirmed = matches!(exited, Some(ChildExit::Exited(_)));
+            supervised
+                .drain_stdout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+                .await;
             if !confirmed {
                 let launches = lock(&self.launches)?;
-                if launches
-                    .get(project_id)
-                    .map(|launch| launch.launch_id.as_str())
-                    == captured_launch
+                let processes = lock(&self.processes)?;
+                let children = lock(&self.supervised)?;
+                let current = super::cleanup_record::CleanupRecord::capture(
+                    super::types::CleanupStatus::Cleaning,
+                    launches
+                        .get(project_id)
+                        .map(|launch| launch.launch_id.as_str()),
+                    processes.get(project_id),
+                    children.get(project_id),
+                );
+                if cleanup_capture.same_incarnation(&current)
+                    && processes
+                        .get(project_id)
+                        .is_none_or(|process| process.external_owner.is_none())
                 {
-                    lock(&self.cleanup_state)?.insert(
-                        project_id.to_string(),
-                        super::types::CleanupStatus::Cleaning,
-                    );
+                    lock(&self.cleanup_state)?.insert(project_id.into(), cleanup_capture.clone());
                 }
-                return Err(AppError::business(
-                    "local orchestrator exit not confirmed; registration kept, retry stop",
-                ));
+                return Err(stop_error.unwrap_or_else(|| {
+                    AppError::business(
+                        "local orchestrator exit not confirmed; registration kept, retry stop",
+                    )
+                }));
             }
         } else if let Some(process) = &captured_process
             && process.pid > 0
         {
-            let terminated = self.terminate_pid_group(process.pid).await;
+            let terminated = terminate(process.pid).await;
             killed.push(KilledPid {
                 pid: process.pid,
                 killed: terminated,
             });
-            if !terminated {
+            if !super::process::stop_exit_observed(process.pid, deadline).await? {
                 return Err(AppError::business(
                     "registered process exit not confirmed; retry stop",
                 ));
@@ -500,9 +638,28 @@ impl DevServerManager {
                 return Ok(killed);
             }
             let mut supervised_map = lock(&self.supervised)?;
+            let current = super::cleanup_record::CleanupRecord::capture(
+                super::types::CleanupStatus::Cleaning,
+                current_launch.as_deref(),
+                processes.get(project_id),
+                supervised_map.get(project_id),
+            );
+            let mut cleanup = lock(&self.cleanup_state)?;
+            if !current.same_incarnation(&cleanup_capture)
+                || processes
+                    .get(project_id)
+                    .is_some_and(|process| process.external_owner.is_some())
+                || cleanup.get(project_id).is_some_and(|pending| {
+                    matches!(pending.status, super::types::CleanupStatus::Cleaning)
+                        && !pending.same_incarnation(&cleanup_capture)
+                })
+            {
+                return Ok(killed);
+            }
+            // A previous Cleaned observation is history, not a barrier for this
+            // exact current launch. Never release a replacement's port first.
             self.port_pool.release(project_id)?;
-            lock(&self.cleanup_state)?
-                .insert(project_id.to_string(), super::types::CleanupStatus::Cleaned);
+            cleanup.insert(project_id.to_string(), cleanup_capture.completed());
             launches.remove(project_id);
             let proc = processes.remove(project_id);
             supervised_map.remove(project_id);

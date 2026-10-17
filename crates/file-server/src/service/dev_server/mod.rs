@@ -1,7 +1,8 @@
 //! Dev server 进程管理器 (对齐 nuwax `processManager.js` + `startDevUtils.js` 等)。
 //!
 //! 替换 nuwax 的裸 `child_process.spawn` (detached) + 内存 Map。
-//! 用 `tokio::process::Command` (process_group + 丢弃 Child 句柄) + `Mutex<HashMap>`。
+//! Preview retains its spawn-owned process group/Job and root wait handle;
+//! UserApp one-shot launchers retain the native owner handover/StopWork path.
 //!
 //! 拆分: `types` (类型定义 + 管理器本体) / `start` (启动 + 就绪轮询 + 守卫) /
 //! `stop` (终止 + shutdown_all + Drop)。本 mod.rs 保留组合方法 (restart/keep-alive/查询)。
@@ -11,6 +12,7 @@
 //! - 存活轮询超时后仍返回成功 (nuwax 行为)
 //! - keep-alive 被动探活, 无空闲自动停止
 
+mod cleanup_record;
 pub mod coordinated;
 mod discovery;
 pub mod error_classify;
@@ -20,6 +22,8 @@ mod historical_discovery_tests;
 mod local_stop;
 pub mod log;
 mod migration_receipts;
+#[cfg(all(test, unix))]
+mod owned_stop_tests;
 mod owner_client;
 mod owner_recovery;
 mod owner_supervision;
@@ -176,13 +180,27 @@ impl DevServerManager {
         lock(&self.supervised).ok()?.get(project_id).cloned()
     }
 
-    /// 是否存在未完成的进程清理状态（P1-05）：stop_dev 未在停止窗口内
-    /// 观察到退出时记录 Cleaning；再次受理 dev/start 必须确认清理完毕。
+    /// Pending cleanup applies only to its exact current local registration.
+    /// History alone cannot veto a later launch; actual local execution and
+    /// native StopWork observations keep their existing admission/recovery path.
     pub fn has_uncleaned_cleanup(&self, project_id: &str) -> AppResult<bool> {
-        Ok(matches!(
-            lock(&self.cleanup_state)?.get(project_id),
-            Some(types::CleanupStatus::Cleaning)
-        ))
+        let launches = lock(&self.launches)?;
+        let processes = lock(&self.processes)?;
+        let children = lock(&self.supervised)?;
+        let current = cleanup_record::CleanupRecord::capture(
+            types::CleanupStatus::Cleaning,
+            launches
+                .get(project_id)
+                .map(|launch| launch.launch_id.as_str()),
+            processes.get(project_id),
+            children.get(project_id),
+        );
+        Ok(lock(&self.cleanup_state)?
+            .get(project_id)
+            .is_some_and(|record| {
+                matches!(record.status, types::CleanupStatus::Cleaning)
+                    && record.same_incarnation(&current)
+            }))
     }
 
     /// P3-03/R07：构建前捕获 owner 期望（三态）。

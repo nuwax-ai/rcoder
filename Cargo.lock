@@ -10212,6 +10212,7 @@ dependencies = [
  "anyhow",
  "nix 0.31.3",
  "process-wrap",
+ "rustix 1.1.5",
  "serde",
  "serde_json",
  "sha2 0.11.0",

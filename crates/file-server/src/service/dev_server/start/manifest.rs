@@ -392,6 +392,28 @@ impl DevServerManager {
         if process.pid != pid || process.external_owner.is_some() {
             return Ok(false);
         }
+        // Only the exact reaped one-shot launch can retire its old local
+        // Cleaning entry. A new launch/child or an unobserved exit keeps the
+        // original protection; owner readiness alone never clears a marker.
+        let supervised = lock(&self.supervised)?;
+        let captured = super::super::cleanup_record::CleanupRecord::capture(
+            super::super::types::CleanupStatus::Cleaning,
+            Some(captured_launch),
+            Some(process),
+            supervised.get(project_id),
+        );
+        let mut cleanup = lock(&self.cleanup_state)?;
+        if let Some(pending) = cleanup.get(project_id)
+            && matches!(pending.status, super::super::types::CleanupStatus::Cleaning)
+        {
+            let exited_successfully = supervised.get(project_id).is_some_and(|child| {
+                matches!(child.exited(), Some(super::super::supervise::ChildExit::Exited(status)) if status.success())
+            });
+            if !pending.same_incarnation(&captured) || !exited_successfully {
+                return Ok(false);
+            }
+            cleanup.insert(project_id.to_string(), captured.completed());
+        }
         process.external_owner = Some(ExternalOwner {
             address: self.config.app_cli_admin_probe_addr.clone(),
             token: String::new(),
