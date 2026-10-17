@@ -225,6 +225,22 @@ REQUIRED['docker_runtime_crash_recovery_contract'] = {'Docker crash contract pro
     )
 }
 
+REQUIRED['userapp_compute_stopped_failure_recovery_contract'] = {
+    'compute failure contract process completed',
+    'compute failure contract reports full success',
+    'compute failure frozen inputs verified',
+    'compute failure isolated controller and real builder prepared',
+    'compute failure original source serves HTTP',
+    'compute failure exact Stopped phase fault observed',
+    'compute failure diagnostic belongs to original operation',
+    'compute failure stop acknowledged without any start dispatch',
+    'compute failure revoked fault resumes original operation',
+    'compute failure one builder retains original data mounts',
+    'compute failure corrected source rebuild serves HTTP',
+    'compute failure source stayed frozen',
+    'compute failure owned cleanup retains volumes',
+}
+
 REQUIRED['userapp_dev_app_proxy_lazy_start'].update({
     'lazy recreation removes only captured builder',
     'lazy recreation records same-lifecycle replacement',

@@ -152,3 +152,58 @@ async fn userapp_prod_readiness_contract() {
     }
     assert!(report.finish(), "prod readiness contract failed");
 }
+
+/// Real Stopped failure and same-operation recovery; no shared services or AI.
+#[tokio::test]
+async fn userapp_compute_stopped_failure_recovery_contract() {
+    if !rcoder_e2e::common::require_context_or_skip() {
+        return;
+    }
+    let report = JsonlReporter::begin(
+        "userapp_compute_stopped_failure_recovery_contract",
+        "compose",
+        serde_json::json!({"fixture": "isolated-compute-stopped-failure", "llm": false}),
+    );
+    let result = (|| -> Result<(), String> {
+        let directory = std::env::var_os("E2E_REPORT_DIR")
+            .map(std::path::PathBuf::from)
+            .ok_or("run via the strict E2E launcher")?;
+        let status = std::process::Command::new("python3")
+            .arg(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tools/compute_failure_contract.py"),
+            )
+            .env(
+                "E2E_COMPUTE_APP_ENTRY_PORT",
+                shared_types::APP_ENTRY_PORT.to_string(),
+            )
+            .status()
+            .map_err(|error| format!("cannot launch compute fixture: {error}"))?;
+        report.assert_hard(
+            "compute failure contract process completed",
+            status.success(),
+            status.to_string(),
+        );
+        let path = directory.join("compute-failure-contract/result.json");
+        let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        for check in value["checks"].as_array().ok_or("compute checks missing")? {
+            report.assert_hard(
+                check["name"].as_str().ok_or("compute check name missing")?,
+                check["ok"] == true,
+                check["detail"].to_string(),
+            );
+        }
+        report.assert_hard(
+            "compute failure contract reports full success",
+            value["success"] == true,
+            "see private compute-failure-contract diagnostics".into(),
+        );
+        Ok(())
+    })();
+    if let Err(error) = result {
+        report.assert_hard("compute failure evidence readable", false, error);
+    }
+    assert!(report.finish(), "compute stopped failure recovery failed");
+}

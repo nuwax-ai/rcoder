@@ -815,5 +815,20 @@
     "recreate old life with another request cannot replace current life",
     "recreate lifecycle sequence completed",
     "recreate explicit current lifecycle deletion leaves no compute"
+  ],
+  "userapp_compute_stopped_failure_recovery_contract": [
+    "compute failure contract process completed",
+    "compute failure contract reports full success",
+    "compute failure corrected source rebuild serves HTTP",
+    "compute failure diagnostic belongs to original operation",
+    "compute failure exact Stopped phase fault observed",
+    "compute failure frozen inputs verified",
+    "compute failure isolated controller and real builder prepared",
+    "compute failure one builder retains original data mounts",
+    "compute failure original source serves HTTP",
+    "compute failure owned cleanup retains volumes",
+    "compute failure revoked fault resumes original operation",
+    "compute failure source stayed frozen",
+    "compute failure stop acknowledged without any start dispatch"
   ]
 }

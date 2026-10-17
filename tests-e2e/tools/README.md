@@ -25,6 +25,38 @@ E2E_TEMPLATE_SOURCE_DIR=/absolute/frozen-userapp-workspace-template \
   CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_build_rules E2E_FILTER=userapp_python_dependency_cache_survives_builder_recycle
 ```
 
+`userapp_compute_stopped_failure_recovery_contract` 使用 Python 3.11+、本轮冻结的
+RCoder/builder 配对构建和独立 Compose 项目，验证真实 Docker Stop 已完成、原操作
+持久化为 `stopped` 后的目标读取失败。仅本应用及生命周期的失败 GET 返回受控 500；
+停止确认阶段的读取和全部成功响应仍来自真实 Docker。原错误必须进入原操作的
+`recovery_required/stopped`，撤销故障后重试相同请求，必须沿原 operation 恢复，
+保留工作区数据并重新编译当前源码、检查实际 HTTP 内容。它不声称覆盖 Docker
+`starting` 前的存储校验或私有 lease/checkpoint 的完整存储契约。
+
+```bash
+E2E_COMPUTE_BUILD_RECEIPT=/absolute/frozen-compute-build.json \
+  CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_faults \
+  E2E_FILTER=userapp_compute_stopped_failure_recovery_contract
+```
+
+构建回执为 `version:1`，`source` 采用下方 `source_identity` 的
+`origin_head/worktree_sha256`；`rcoder` 包含 `image_id/binary_sha256`，`builder`
+包含 `image_id/agent_runner_sha256/app_cli_sha256`。镜像须为不可变 ID，哈希须由本轮
+真实构建阶段生成，运行中逐项核验。不能给旧镜像现算摘要冒充本轮构建。该入口不构建
+镜像、不修改日常服务；仅清理本轮捕获的计算资源，保留独立 Turso 命名卷、工作区与
+`compute-failure-contract/` 下的私有报告。
+
+该场景的 Rust 严格入口从 `shared_types::APP_ENTRY_PORT` 向工具传入
+`E2E_COMPUTE_APP_ENTRY_PORT`，避免 Python 重复维护业务入口端口；它不是产品端口配置。
+缺少或无效的入口契约会在 Docker 操作前失败。源码文件编辑属于提交前的 fixture 准备；
+准备完成后，构建、故障观察和恢复阶段分别保留180、120、180秒总预算，从各自的
+POST开始，覆盖状态轮询、退避；构建还包含实际HTTP和构建计数读取。未知状态和迟到
+成功均明确失败。PG前置仍有独立180秒预算。
+
+故障配置由单一 writer 分两次发布到不同文件：固定目标身份和原 operation 身份各只写
+一次，避免 Docker Desktop bind 读到重写 JSON 的不一致内容。等待 operation 发布仍
+使用原15秒预算；损坏 JSON 直接失败，撤销故障只删除目标 arm 文件。
+
 prod 用例先核验构建输入，随后自动创建本 case 的私有 Compose RCoder/Turso、工作目录、loopback 端口，结束与中断后均按捕获身份清计算，保留数据。构建阶段生成的 `E2E_PROD_BUILD_RECEIPT` 格式如下；不能在验收时给任意旧镜像现算哈希冒充本轮构建：
 
 ```json

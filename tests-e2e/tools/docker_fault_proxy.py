@@ -14,6 +14,7 @@ import socketserver
 import threading
 import time
 import urllib.parse
+import urllib.request
 
 ROOT = Path(os.environ.get('FAULT_CONTROL_DIR', '/control'))
 APP = os.environ.get('FAULT_APP_ID', '')
@@ -25,6 +26,8 @@ PROXY = os.environ.get('FAULT_PROXY_SOCKET', '/proxy/docker.sock')
 GATE_LOCK = threading.Lock()
 GATED = False
 OWNED_CONTAINERS = {}
+OWNED_EXECS = {}
+STOPPED_CONTAINERS = set()
 
 
 class DockerConnection(http.client.HTTPConnection):
@@ -71,12 +74,97 @@ def allowed(method, path, body):
                 and bool(labels.get('rcoder.io/lifecycle-id')) and labels.get('rcoder.io/application-id') == APP
                 and labels.get('service-type') == 'user-app-builder')
     if len(segments) >= 2 and segments[0] == 'containers':
+        if (MODE == 'compute_stopped' and segments[-1] == 'exec'
+                and json.loads(body).get('AttachStdin') is True):
+            return False  # this fixture relays only noninteractive exec output
         return container_owned(segments[1])
+    if MODE == 'compute_stopped' and len(segments) == 3 and segments[0] == 'exec':
+        with GATE_LOCK:
+            container = OWNED_EXECS.get(segments[1])
+        return container is not None and container_owned(container)
     if segments == ['networks', 'create']:
         return json.loads(body).get('Name', '').startswith(PROJECT + '_')
     # Exec mutation is never needed to acknowledge a newly started builder;
     # rejecting an unexpected mutator makes fixture assumptions explicit.
     return False
+
+
+def compute_fault(method, path):
+    """Fail a read only after the actual control plane committed Stopped.
+
+    The stop acknowledgement alone is insufficient: Docker's internal stop
+    confirmation must continue normally while the durable phase is Stopping.
+    No fixture edits the database or fabricates a successful runtime response.
+    """
+    arm_path = ROOT / 'compute-arm.json'
+    if MODE != 'compute_stopped' or method != 'GET' or not arm_path.exists():
+        return None
+    try:
+        arm = json.loads(arm_path.read_text())
+    except FileNotFoundError:
+        return None  # the test revoked the read fault between exists/read
+    identifier = urllib.parse.urlsplit(path).path.strip('/').split('/')
+    if identifier and identifier[0].startswith('v1.'):
+        identifier = identifier[1:]
+    cid, life = arm['container_id'], arm['lifecycle_id']
+    if identifier not in (['containers', cid, 'json'],
+                          ['containers', 'rcoder-app-builder-' + APP, 'json']):
+        return None
+    with GATE_LOCK:
+        ready = OWNED_CONTAINERS.get(cid) == life and cid in STOPPED_CONTAINERS
+    if not ready:
+        return None
+    deadline = time.monotonic() + 15
+    operation_path = ROOT / 'compute-operation.json'
+    while True:
+        if not arm_path.exists():
+            return None
+        if time.monotonic() >= deadline:
+            raise TimeoutError('compute fault operation was not recorded')
+        try:
+            operation_identity = json.loads(operation_path.read_text())
+        except FileNotFoundError:
+            time.sleep(0.02)
+            continue
+        if not isinstance(operation_identity, dict):
+            raise ValueError('compute fault operation identity must be an object')
+        operation_id = operation_identity['operation_id']
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError('compute fault operation identity is invalid')
+        break
+    url = 'http://rcoder:8090/computer/pod/operations/' + urllib.parse.quote(APP, safe='') + '/' + urllib.parse.quote(operation_id, safe='')
+    with urllib.request.urlopen(url, timeout=5) as response:
+        envelope = json.load(response)
+    operation = envelope.get('data') or {}
+    if (envelope.get('code') != '0000' or operation.get('app_id') != APP
+            or operation.get('lifecycle_id') != life or operation.get('operation_id') != operation_id):
+        raise ValueError('compute fault operation identity changed')
+    if operation.get('stage') != 'stopped' or operation.get('state') not in ('running', 'recovery_required'):
+        return None
+    # Verify this is still the captured physical object, or its acknowledged
+    # AutoRemove absence. A replacement is never attributed to the old target.
+    connection, response = exchange('GET', '/containers/' + urllib.parse.quote(cid, safe='') + '/json')
+    try:
+        if response.status == 200:
+            actual = json.loads(response.read())
+            labels = actual['Config'].get('Labels') or {}
+            if (actual['Id'] != cid or labels.get('rcoder.io/application-id') != APP
+                    or labels.get('rcoder.io/lifecycle-id') != life
+                    or labels.get('service-type') != 'user-app-builder'
+                    or actual['State'].get('Running')):
+                raise ValueError('compute fault target physical identity is not stopped')
+        elif response.status != 404:
+            raise ValueError('compute fault target absence is unconfirmed')
+        marker = 'owned-compute-stopped-inspect-fault'
+        event = {'operation': operation, 'container_id': cid, 'lifecycle_id': life,
+                 'method': method, 'path': path, 'physical_status': response.status,
+                 'marker': marker}
+        with GATE_LOCK:
+            with (ROOT / 'compute-faults.jsonl').open('a') as output:
+                output.write(json.dumps(event) + '\n')
+        return marker
+    finally:
+        connection.close()
 
 
 def gate(stage, path, status=None):
@@ -97,6 +185,20 @@ def gate(stage, path, status=None):
     (ROOT / 'barrier-settled').write_text(stage)
     if (ROOT / 'release').read_text() != 'continue':
         raise ConnectionAbortedError('fault controller discarded this request')
+
+
+def audit_proxy_error(method, path, error):
+    """Keep private transport context without exception text or request secrets."""
+    if MODE != 'compute_stopped':
+        return
+    event = {'method': method, 'path': urllib.parse.urlsplit(path).path,
+             'error_type': type(error).__name__}
+    if isinstance(getattr(error, 'errno', None), int):
+        event['errno'] = error.errno
+    with GATE_LOCK:
+        descriptor = os.open(ROOT / 'proxy-errors.jsonl', os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(descriptor, 'a') as audit:
+            audit.write(json.dumps(event) + '\n')
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -120,7 +222,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not allowed(self.command, self.path, body):
                 self.send_error(403, 'Mutation outside the owned fault scenario')
                 return
+            marker = compute_fault(self.command, self.path)
+            if marker:
+                payload = json.dumps({'message': marker}).encode()
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(payload)))
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                self.wfile.write(payload)
+                self.close_connection = True
+                return
             path = urllib.parse.urlsplit(self.path).path
+            if MODE == 'compute_stopped' and self.command not in ('GET', 'HEAD'):
+                with GATE_LOCK:
+                    with (ROOT / 'compute-writes.jsonl').open('a') as audit:
+                        audit.write(json.dumps({'method': self.command, 'path': self.path}) + '\n')
             if self.command == 'POST' and path.endswith('/containers/create'):
                 with GATE_LOCK:
                     with (ROOT / 'create-attempts.jsonl').open('a') as audit:
@@ -128,6 +245,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 gate('before_create', self.path)
             headers = {key: value for key, value in self.headers.items()
                        if key.lower() not in ('connection', 'host', 'transfer-encoding')}
+            owned_exec_start = (MODE == 'compute_stopped' and self.command == 'POST'
+                                and '/exec/' in path and path.endswith('/start'))
+            if owned_exec_start and self.headers.get('Connection'):
+                headers['Connection'] = self.headers['Connection']
             connection, response = exchange(self.command, self.path, body, headers)
             payload = None
             if self.command == 'POST' and path.endswith('/containers/create') and response.status == 201:
@@ -136,15 +257,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 lifecycle = json.loads(body)['Labels']['rcoder.io/lifecycle-id']
                 with GATE_LOCK:
                     OWNED_CONTAINERS[created_id] = lifecycle
+            if MODE == 'compute_stopped' and self.command == 'POST' and '/containers/' in path:
+                if path.endswith('/exec') and response.status == 201:
+                    payload = response.read()
+                    with GATE_LOCK:
+                        OWNED_EXECS[json.loads(payload)['Id']] = path.split('/')[-2]
+                if path.endswith('/stop') and response.status in (204, 304):
+                    with GATE_LOCK:
+                        STOPPED_CONTAINERS.add(path.split('/')[-2])
             if self.command == 'POST' and '/containers/' in path and path.endswith('/start') and 200 <= response.status < 300:
                 gate('after_start', self.path, response.status)
+            # Docker exec start upgrades HTTP to a raw multiplexed stream.
+            # HTTPResponse.read() treats all 1xx as bodyless and would end the
+            # client stream before the real command exits. Only this fixture's
+            # already-authorized, noninteractive exec receives the raw relay.
+            upgraded_exec = owned_exec_start and response.status == 101
+            if response.status == 101 and not upgraded_exec:
+                raise ValueError('Unexpected Docker protocol upgrade')
             self.send_response(response.status)
             for key, value in response.getheaders():
                 if key.lower() not in ('connection', 'transfer-encoding', 'content-length'):
                     self.send_header(key, value)
-            self.send_header('Connection', 'close')
+            self.send_header('Connection', 'Upgrade' if upgraded_exec else 'close')
             self.end_headers()
-            if payload is not None:
+            if upgraded_exec:
+                deadline = time.monotonic() + 180
+                while chunk := response.fp.read1(65536):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('owned exec stream exceeded total budget')
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            elif payload is not None:
                 self.wfile.write(payload)
                 self.wfile.flush()
             else:
@@ -155,7 +298,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(chunk)
                     self.wfile.flush()
             self.close_connection = True
-        except (OSError, ValueError, KeyError, http.client.HTTPException):
+        except (OSError, ValueError, KeyError, http.client.HTTPException) as error:
+            try:
+                audit_proxy_error(self.command, self.path, error)
+            except (OSError, ValueError):
+                pass  # diagnostics cannot replace the original transport failure
             self.close_connection = True
         finally:
             if connection is not None:
@@ -169,7 +316,7 @@ class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 
 
 if __name__ == '__main__':
-    if not APP or not OWNER or not PROJECT or MODE not in ('before_create', 'after_start'):
+    if not APP or not OWNER or not PROJECT or MODE not in ('before_create', 'after_start', 'compute_stopped'):
         raise SystemExit('Complete owned fault scenario configuration is required')
     ROOT.mkdir(parents=True, exist_ok=True)
     Path(PROXY).parent.mkdir(parents=True, exist_ok=True)

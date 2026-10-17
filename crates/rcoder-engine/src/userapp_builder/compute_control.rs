@@ -1,5 +1,9 @@
 //! Detached compute coordination. Admission never waits for a business slot.
 //! Runtime calls retain their physical receipt until their outcome is confirmed.
+#![deny(
+    clippy::wildcard_enum_match_arm,
+    clippy::match_wildcard_for_single_variants
+)]
 use crate::app_state::AppState;
 use anyhow::{Context, Result, anyhow, ensure};
 use futures::FutureExt as _;
@@ -9,7 +13,14 @@ use std::{sync::Arc, time::Duration};
 
 mod builder_start;
 use builder_start::prepare_start_options;
+mod failure;
+mod policy;
 mod stopped_template;
+
+const PREVIOUS_EXECUTIONS_DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
+const PREVIOUS_EXECUTIONS_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const RESTART_READINESS_TIMEOUT: Duration = Duration::from_secs(300);
+const RESTART_READINESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct ComputeOperationView {
@@ -78,7 +89,7 @@ pub async fn submit(
         scope,
         action,
         request,
-        action == ComputeControlAction::Restart,
+        policy::is_restart(action),
     )
     .await
 }
@@ -161,8 +172,11 @@ async fn submit_with_startup_mode(
         .ok_or_else(|| {
             app_manager::AppOperationError::NotFound(format!("Application {app_id} was not found"))
         })?;
-    if app.state != UserAppLifecycleState::Active {
-        return Err(UserAppStoreError::LifecycleConflict.into());
+    match app.state {
+        UserAppLifecycleState::Active => {}
+        UserAppLifecycleState::Deleting | UserAppLifecycleState::Deleted => {
+            return Err(UserAppStoreError::LifecycleConflict.into());
+        }
     }
     if request
         .lifecycle_id
@@ -213,10 +227,15 @@ async fn submit_with_startup_mode(
         Ok(record) => record,
         Err(UserAppStoreError::OperationInProgress(blocker))
             if blocker.scope == scope
-                && matches!(
-                    blocker.state,
-                    UserAppOperationState::Running | UserAppOperationState::RecoveryRequired
-                ) =>
+                && match blocker.state {
+                    UserAppOperationState::Running | UserAppOperationState::RecoveryRequired => {
+                        true
+                    }
+                    UserAppOperationState::Pending
+                    | UserAppOperationState::WaitingRetry
+                    | UserAppOperationState::Succeeded
+                    | UserAppOperationState::Failed => false,
+                } =>
         {
             // A retry of the same physical intent must continue the original
             // operation. A new operation would discard its unknown remote write
@@ -242,7 +261,15 @@ async fn submit_with_startup_mode(
         }
         Err(error) => return Err(error.into()),
     };
-    if record.state == ComputeControlState::RecoveryRequired || record.can_recover_compute_drain() {
+    let resume_existing = match record.state {
+        ComputeControlState::RecoveryRequired => true,
+        ComputeControlState::Pending
+        | ComputeControlState::Running
+        | ComputeControlState::Succeeded
+        | ComputeControlState::Failed
+        | ComputeControlState::Superseded => record.can_recover_compute_drain(),
+    };
+    if resume_existing {
         let state = state.clone();
         let retry = record.clone();
         tokio::spawn(async move {
@@ -253,15 +280,24 @@ async fn submit_with_startup_mode(
                 tracing::warn!(%error, operation_id = %retry.operation_id, "Compute retry still requires inspection");
             }
         });
-    } else if record.state == ComputeControlState::Pending {
-        let state = state.clone();
-        let pending = record.clone();
-        tokio::spawn(async move {
-            let _flight = flight;
-            if let Err(error) = execute_pending(&state, pending).await {
-                tracing::error!(%error, "Compute coordinator stopped; inspect durable operation");
+    } else {
+        match record.state {
+            ComputeControlState::Pending => {
+                let state = state.clone();
+                let pending = record.clone();
+                tokio::spawn(async move {
+                    let _flight = flight;
+                    if let Err(error) = execute_pending(&state, pending).await {
+                        tracing::error!(%error, "Compute coordinator stopped; inspect durable operation");
+                    }
+                });
             }
-        });
+            ComputeControlState::Running
+            | ComputeControlState::RecoveryRequired
+            | ComputeControlState::Succeeded
+            | ComputeControlState::Failed
+            | ComputeControlState::Superseded => {}
+        }
     }
     Ok(record.into())
 }
@@ -283,9 +319,9 @@ pub async fn recover(
         return Err(UserAppStoreError::VersionConflict.into());
     }
     let flight = state.userapp_op_flight.guard()?;
-    if current.action == ComputeControlAction::Restart
-        && (current.stage == "stopped"
-            || (current.stage == "starting"
+    if policy::is_restart(current.action)
+        && (current.stage == ComputeControlStage::Stopped.as_str()
+            || (current.stage == ComputeControlStage::Starting.as_str()
                 && (current.has_conditional_compute_write()
                     || builder_start::missing_creation(&current))))
     {
@@ -299,16 +335,7 @@ pub async fn recover(
         });
         return Ok(current.into());
     }
-    if matches!(
-        (current.action, current.stage.as_str()),
-        (ComputeControlAction::Stop, "stopped" | "stopping")
-            | (ComputeControlAction::Restart, "verifying" | "starting")
-    ) || (current.scope == UserAppOperationScope::Prod
-        && matches!(
-            (current.action, current.stage.as_str()),
-            (ComputeControlAction::Stop, "stopping") | (ComputeControlAction::Restart, "starting")
-        ))
-    {
+    if policy::can_observe_completion(current.action, &current.stage) {
         let completed = recover_confirmed(state, &current).await?;
         drop(flight);
         return Ok(completed.into());
@@ -338,9 +365,10 @@ pub(crate) async fn recover_confirmed(
     state: &AppState,
     record: &ComputeControlRecord,
 ) -> Result<ComputeControlRecord> {
-    let observed_stop = record.action == ComputeControlAction::Stop && record.stage == "stopping";
+    let observed_stop = !policy::is_restart(record.action)
+        && record.stage == ComputeControlStage::Stopping.as_str();
     let observed_restart =
-        record.action == ComputeControlAction::Restart && record.stage == "starting";
+        policy::is_restart(record.action) && record.stage == ComputeControlStage::Starting.as_str();
     let mut observation_only = false;
     if observed_restart || observed_stop {
         let context = record.execution_context().map_err(anyhow::Error::msg)?;
@@ -399,7 +427,7 @@ pub(crate) async fn recover_confirmed(
     }
     let mut observed_builder = None;
     let mut observed_checkpoint = None;
-    if observed_restart && record.scope == UserAppOperationScope::Dev {
+    if observed_restart && policy::uses_builder(record.scope)? {
         let target: BuilderControlTarget =
             BuilderControlTarget::from_observation_checkpoint(&record.checkpoint)?;
         ensure!(
@@ -456,8 +484,7 @@ pub(crate) async fn recover_confirmed(
         }
         // Runtime observation must not refresh a cache before the terminal CAS.
     }
-    if record.action == ComputeControlAction::Restart && record.scope == UserAppOperationScope::Prod
-    {
+    if policy::is_restart(record.action) && !policy::uses_builder(record.scope)? {
         let context = record.execution_context().map_err(anyhow::Error::msg)?;
         let expected: UserAppMutationTarget = serde_json::from_value(record.checkpoint.clone())?;
         ensure!(
@@ -590,15 +617,17 @@ async fn require_original_lease_identity(
     receipt: &UserAppOperationLeaseReceipt,
 ) -> Result<()> {
     use container_runtime_api::AppOperationLeaseObservation;
+    let confirmed = match state
+        .runtime()
+        .observe_app_operation_lease(context, receipt)
+        .await?
+    {
+        AppOperationLeaseObservation::Held
+        | AppOperationLeaseObservation::ExpiredOriginalIdentity => true,
+        AppOperationLeaseObservation::Unconfirmed => false,
+    };
     ensure!(
-        matches!(
-            state
-                .runtime()
-                .observe_app_operation_lease(context, receipt)
-                .await?,
-            AppOperationLeaseObservation::Held
-                | AppOperationLeaseObservation::ExpiredOriginalIdentity
-        ),
+        confirmed,
         "Original compute lease identity is not confirmed for result observation"
     );
     Ok(())
@@ -616,10 +645,13 @@ async fn progress(
         .advance_compute_control(&ComputeControlProgress {
             identity: identity.clone(),
             expected_revision: record.revision,
-            state: if stage == ComputeControlStage::Completed {
-                ComputeControlState::Succeeded
-            } else {
-                ComputeControlState::Running
+            state: match stage {
+                ComputeControlStage::Completed => ComputeControlState::Succeeded,
+                ComputeControlStage::DrainingPrevious
+                | ComputeControlStage::Stopping
+                | ComputeControlStage::Stopped
+                | ComputeControlStage::Starting
+                | ComputeControlStage::Verifying => ComputeControlState::Running,
             },
             stage,
             checkpoint,
@@ -699,86 +731,61 @@ pub(crate) async fn execute_pending(state: &AppState, pending: ComputeControlRec
             return Ok(());
         }
     }
-    let mut stage = ComputeControlStage::DrainingPrevious;
-    let mut settled = true;
-    let result = std::panic::AssertUnwindSafe(execute_claimed(
-        state,
-        &mut record,
-        &identity,
-        &mut stage,
-        &mut settled,
-    ))
-    .catch_unwind()
-    .await
-    .unwrap_or_else(|_| {
-        Err(anyhow!(
-            "Compute execution panicked; inspect its captured runtime stage"
-        ))
-    });
-    if let Err(error) = result {
-        // A superseding Stop owns the head now; this executor cannot rewrite it.
-        if state
-            .userapp_store
-            .check_compute_executor(&identity)
+    // Until predecessor drain and lease preparation finish, absence of our
+    // local receipt does not establish that all outstanding effects are settled.
+    let mut settled = false;
+    let result =
+        std::panic::AssertUnwindSafe(execute_claimed(state, &mut record, &identity, &mut settled))
+            .catch_unwind()
             .await
-            .is_ok()
-        {
-            let failure = ComputeControlProgress {
-                identity: identity.clone(),
-                expected_revision: record.revision,
-                state: if settled && stage == ComputeControlStage::Stopped {
-                    ComputeControlState::Failed
-                } else {
-                    ComputeControlState::RecoveryRequired
-                },
-                stage,
-                checkpoint: record.checkpoint.clone(),
-                error_code: Some(ERR_BACKEND_ERROR.into()),
-                error_message: Some(format!("{error:#}")),
-            };
-            state
-                .userapp_store
-                .advance_compute_control(&failure)
-                .await
-                .context("Persist compute execution recovery state")?;
-        }
-        if settled
-            && let Some(current) = state
-                .userapp_store
-                .get_compute_control(&identity.app_id, &identity.operation_id)
-                .await?
-            && current.state == ComputeControlState::Superseded
-        {
-            let evidence = if current.stage == "draining_previous" {
-                ComputeControlDrainEvidence::NoMutationSubmitted
-            } else {
-                ComputeControlDrainEvidence::MutationCompleted {
-                    checkpoint: current.checkpoint.clone(),
-                }
-            };
-            let drained = state
-                .userapp_store
-                .acknowledge_compute_drain(&ComputeControlDrainAcknowledgement {
-                    identity: identity.clone(),
-                    expected_revision: current.revision,
-                    evidence,
-                })
-                .await?;
-            if let Some(ref receipt) = drained.lease {
-                state
-                    .runtime()
-                    .release_app_operation_receipt(
-                        &drained.execution_context().map_err(anyhow::Error::msg)?,
-                        receipt,
-                    )
-                    .await?;
-                state
+            .unwrap_or_else(|_| {
+                Err(anyhow!(
+                    "Compute execution panicked; inspect its captured runtime stage"
+                ))
+            });
+    if let Err(error) = result {
+        let reporting = async {
+            failure::record(state, &record, &identity, settled, &error).await?;
+            if settled
+                && let Some(current) = state
                     .userapp_store
-                    .forget_compute_lease(&identity, receipt)
+                    .get_compute_control(&identity.app_id, &identity.operation_id)
+                    .await?
+                && current.state == ComputeControlState::Superseded
+            {
+                let evidence = if current.stage == ComputeControlStage::DrainingPrevious.as_str() {
+                    ComputeControlDrainEvidence::NoMutationSubmitted
+                } else {
+                    ComputeControlDrainEvidence::MutationCompleted {
+                        checkpoint: current.checkpoint.clone(),
+                    }
+                };
+                let drained = state
+                    .userapp_store
+                    .acknowledge_compute_drain(&ComputeControlDrainAcknowledgement {
+                        identity: identity.clone(),
+                        expected_revision: current.revision,
+                        evidence,
+                    })
                     .await?;
+                if let Some(ref receipt) = drained.lease {
+                    state
+                        .runtime()
+                        .release_app_operation_receipt(
+                            &drained.execution_context().map_err(anyhow::Error::msg)?,
+                            receipt,
+                        )
+                        .await?;
+                    state
+                        .userapp_store
+                        .forget_compute_lease(&identity, receipt)
+                        .await?;
+                }
             }
+            Ok(())
         }
-        return Err(error);
+        .await;
+        return Err(failure::with_reporting_error(error, reporting));
     }
     Ok(())
 }
@@ -846,9 +853,9 @@ pub(super) async fn drain_previous_once(
                 "Interrupted compute lifecycle differs from current control"
             );
             if old.state == ComputeControlState::Superseded
-                && old.action == ComputeControlAction::Restart
-                && (matches!(old.stage.as_str(), "stopped" | "verifying")
-                    || (matches!(old.stage.as_str(), "starting" | "stopping")
+                && policy::is_restart(old.action)
+                && (policy::persisted_mutation_boundary(&old.stage)
+                    || (policy::write_in_flight(&old.stage)
                         && (old.has_conditional_compute_write()
                             || old.has_docker_compute_target())))
                 && old.lease.is_some()
@@ -856,10 +863,9 @@ pub(super) async fn drain_previous_once(
                 match reconcile_superseded(state, &old).await {
                     Ok(closed) => old = closed,
                     Err(error)
-                        if matches!(
-                            error.downcast_ref::<UserAppStoreError>(),
-                            Some(UserAppStoreError::VersionConflict)
-                        ) =>
+                        if error
+                            .downcast_ref::<UserAppStoreError>()
+                            .is_some_and(policy::is_version_conflict) =>
                     {
                         drained = false;
                         continue;
@@ -867,10 +873,8 @@ pub(super) async fn drain_previous_once(
                     Err(error) => return Err(error),
                 }
             }
-            if matches!(
-                old.state,
-                ComputeControlState::Succeeded | ComputeControlState::Failed
-            ) && let Some(receipt) = old.lease.as_ref()
+            if policy::completed_result(old.state)
+                && let Some(receipt) = old.lease.as_ref()
             {
                 let context = old.execution_context().map_err(anyhow::Error::msg)?;
                 state
@@ -899,11 +903,8 @@ pub(super) async fn drain_previous_once(
                 drained = false;
                 continue;
             }
-            drained &= (matches!(
-                old.state,
-                ComputeControlState::Succeeded | ComputeControlState::Failed
-            ) || (old.state == ComputeControlState::Superseded
-                && old.executor_id.is_none()))
+            drained &= (policy::completed_result(old.state)
+                || (old.state == ComputeControlState::Superseded && old.executor_id.is_none()))
                 && old.lease.is_none();
         } else {
             return Err(anyhow!("Interrupted operation evidence is missing: {id}"));
@@ -916,12 +917,12 @@ async fn execute_claimed(
     state: &AppState,
     record: &mut ComputeControlRecord,
     identity: &ComputeExecutorIdentity,
-    stage: &mut ComputeControlStage,
     settled: &mut bool,
 ) -> Result<()> {
+    let builder_scope = policy::uses_builder(identity.scope)?;
     // Pending business operations were atomically cancelled by claim. Running
     // writers must finish their actual calls and leave a terminal receipt.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline = tokio::time::Instant::now() + PREVIOUS_EXECUTIONS_DRAIN_TIMEOUT;
     loop {
         state.userapp_store.check_compute_executor(identity).await?;
         let drained = drain_previous_once(state, record, identity).await?;
@@ -932,17 +933,21 @@ async fn execute_claimed(
             tokio::time::Instant::now() < deadline,
             "Previous execution is not yet reconciled; retain the original operation and physical receipt"
         );
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(PREVIOUS_EXECUTIONS_DRAIN_POLL_INTERVAL).await;
     }
+    // Preparation/binding can itself have an unconfirmed outcome. A missing
+    // local receipt after an error does not prove that nothing was prepared.
+    *settled = false;
     let mut lease =
         super::compute_drain_recovery::prepare_and_bind(state, record, identity).await?;
+    *settled = true;
     let receipt = lease.receipt().map_err(anyhow::Error::msg)?;
     lease
         .begin_external_mutation()
         .map_err(anyhow::Error::msg)?;
     let context = record.execution_context().map_err(anyhow::Error::msg)?;
-    if record.action == ComputeControlAction::Stop
-        && identity.scope == UserAppOperationScope::Dev
+    if !policy::is_restart(record.action)
+        && builder_scope
         && let Some(orphan) = super::adoption::capture_bound_orphan_stop(state, &context).await?
     {
         let checkpoint = serde_json::to_value(&orphan)?;
@@ -954,7 +959,6 @@ async fn execute_claimed(
             checkpoint.clone(),
         )
         .await?;
-        *stage = ComputeControlStage::Stopping;
         state.userapp_store.check_compute_executor(identity).await?;
         *settled = false;
         state.runtime().stop_builder_orphan(&orphan).await?;
@@ -967,7 +971,6 @@ async fn execute_claimed(
             checkpoint.clone(),
         )
         .await?;
-        *stage = ComputeControlStage::Stopped;
         crate::userapp_forward::invalidate_probe_cache(&record.app_id);
         progress(
             state,
@@ -977,7 +980,6 @@ async fn execute_claimed(
             checkpoint,
         )
         .await?;
-        *stage = ComputeControlStage::Completed;
         lease
             .finish_external_mutation()
             .await
@@ -988,7 +990,7 @@ async fn execute_claimed(
             .await?;
         return Ok(());
     }
-    let absent = if record.action == ComputeControlAction::Stop {
+    let absent = if !policy::is_restart(record.action) {
         match identity.scope {
             UserAppOperationScope::Dev => super::adoption::capture_bound_target(state, &context)
                 .await?
@@ -1014,7 +1016,6 @@ async fn execute_claimed(
             ComputeControlStage::Completed,
         ] {
             progress(state, record, identity, next, evidence.clone()).await?;
-            *stage = next;
         }
         lease
             .finish_external_mutation()
@@ -1026,7 +1027,7 @@ async fn execute_claimed(
             .await?;
         return Ok(());
     }
-    let mut target = if identity.scope == UserAppOperationScope::Dev {
+    let mut target = if builder_scope {
         let mut captured = super::adoption::capture_bound_target(state, &context).await?;
         captured.builder_startup_mode = record
             .checkpoint
@@ -1035,9 +1036,9 @@ async fn execute_claimed(
             .transpose()
             .context("Decode captured builder startup mode")?
             .unwrap_or_default();
-        if record.action == ComputeControlAction::Restart
+        if policy::is_restart(record.action)
             && (captured.workload.is_none()
-                || captured.builder_startup_mode == BuilderStartupMode::ManagementOnly
+                || policy::management_only(captured.builder_startup_mode)
                 || record
                     .checkpoint
                     .get("restart_image_roll")
@@ -1050,15 +1051,10 @@ async fn execute_claimed(
             captured.restart_image = state.runtime().current_builder_image().await?;
         }
         freeze_builder_restart_workspace(&mut captured, record.action);
-        builder_compute_checkpoint(
-            state,
-            &captured,
-            record.action == ComputeControlAction::Restart,
-        )
-        .await?
+        builder_compute_checkpoint(state, &captured, policy::is_restart(record.action)).await?
     } else {
         let target = super::app_adoption::capture_bound_app_target(state, &context).await?;
-        if record.action == ComputeControlAction::Restart {
+        if policy::is_restart(record.action) {
             let mut prepared_target = state.runtime().prepare_app_compute_start(&target).await?;
             // Freeze the platform-default image into the very first checkpoint:
             // every later stage (including crash resume) replays this frozen
@@ -1082,9 +1078,7 @@ async fn execute_claimed(
             serde_json::to_value(target)?
         }
     };
-    if identity.scope == UserAppOperationScope::Dev
-        && record.action == ComputeControlAction::Restart
-    {
+    if builder_scope && policy::is_restart(record.action) {
         let captured: BuilderControlTarget = serde_json::from_value(target.clone())?;
         state.userapp_store.check_compute_executor(identity).await?;
         if captured.workload.is_some()
@@ -1101,10 +1095,9 @@ async fn execute_claimed(
         target.clone(),
     )
     .await?;
-    *stage = ComputeControlStage::Stopping;
     state.userapp_store.check_compute_executor(identity).await?;
     *settled = false;
-    if identity.scope == UserAppOperationScope::Dev {
+    if builder_scope {
         let target: BuilderControlTarget = serde_json::from_value(target.clone())?;
         state
             .runtime()
@@ -1124,13 +1117,12 @@ async fn execute_claimed(
         target.clone(),
     )
     .await?;
-    *stage = ComputeControlStage::Stopped;
-    if identity.scope == UserAppOperationScope::Dev {
+    if builder_scope {
         crate::userapp_forward::invalidate_probe_cache(&record.app_id);
     }
-    if record.action == ComputeControlAction::Restart {
+    if policy::is_restart(record.action) {
         // Scale-down changed resourceVersion. Refresh only the SAME physical UID.
-        let mut fresh = if identity.scope == UserAppOperationScope::Dev {
+        let mut fresh = if builder_scope {
             let old: BuilderControlTarget = serde_json::from_value(target.clone())?;
             let mut fresh = super::adoption::capture_bound_target(state, &context).await?;
             fresh.restart_image = old.restart_image.clone();
@@ -1143,7 +1135,15 @@ async fn execute_claimed(
                         && fresh.resource_binding.is_none(),
                     "A builder appeared before the original missing-compute startup"
                 );
-            } else if fresh.workload.is_none() {
+            } else if fresh.workload.is_none()
+                && old
+                    .workload
+                    .as_ref()
+                    .is_some_and(|workload| policy::uses_retained_pvc(workload.kind))
+            {
+                // Kubernetes can recreate compute from its retained PVCs.
+                // An auto-removed Docker container needs its original archive
+                // and follows the existing replacement branch below instead.
                 fresh = builder_start::prepare_missing_restart_target(
                     state.runtime().as_ref(),
                     &old,
@@ -1201,7 +1201,7 @@ async fn execute_claimed(
             }
             fresh
         };
-        let builder_options = if identity.scope == UserAppOperationScope::Dev {
+        let builder_options = if builder_scope {
             let captured: BuilderControlTarget = serde_json::from_value(fresh.clone())?;
             Some(prepare_start_options(state.runtime().as_ref(), &captured, &fresh).await?)
         } else {
@@ -1215,14 +1215,13 @@ async fn execute_claimed(
             fresh.clone(),
         )
         .await?;
-        *stage = ComputeControlStage::Starting;
         state
             .app_service
             .verify_recovered_storage(&record.app_id, identity.scope)
             .await?;
         state.userapp_store.check_compute_executor(identity).await?;
         *settled = false;
-        if identity.scope == UserAppOperationScope::Dev {
+        if builder_scope {
             let target: BuilderControlTarget = serde_json::from_value(fresh.clone())?;
             let options = builder_options
                 .as_ref()
@@ -1259,9 +1258,8 @@ async fn execute_claimed(
             fresh,
         )
         .await?;
-        *stage = ComputeControlStage::Verifying;
-        if identity.scope == UserAppOperationScope::Prod {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+        if !builder_scope {
+            let deadline = tokio::time::Instant::now() + RESTART_READINESS_TIMEOUT;
             loop {
                 state.userapp_store.check_compute_executor(identity).await?;
                 let expected: UserAppMutationTarget =
@@ -1299,7 +1297,7 @@ async fn execute_claimed(
                     tokio::time::Instant::now() < deadline,
                     "Production container did not reach the captured running generation"
                 );
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(RESTART_READINESS_POLL_INTERVAL).await;
             }
         }
     }
@@ -1373,10 +1371,9 @@ async fn resolve_stopped_app_restart<
         }
         Ok(_) => {} // restore validates the archive marker of a previous replacement.
         Err(error)
-            if matches!(
-                error.downcast_ref::<container_runtime_api::ContainerRuntimeError>(),
-                Some(container_runtime_api::ContainerRuntimeError::ContainerNotFound(_))
-            ) => {}
+            if error
+                .downcast_ref::<container_runtime_api::ContainerRuntimeError>()
+                .is_some_and(policy::is_runtime_absence) => {}
         Err(error) => return Err(error),
     }
     let template: AppRestartTemplate = serde_json::from_value(
@@ -1401,7 +1398,7 @@ pub(crate) async fn resume_restart_start(
     state: &AppState,
     snapshot: &ComputeControlRecord,
 ) -> Result<()> {
-    if snapshot.scope == UserAppOperationScope::Dev {
+    if policy::uses_builder(snapshot.scope)? {
         return resume_builder_start(state, snapshot).await;
     }
     let context = snapshot.execution_context().map_err(anyhow::Error::msg)?;
@@ -1422,7 +1419,7 @@ pub(crate) async fn resume_restart_start(
         prior.target.context == context,
         "Restart context differs from original capture"
     );
-    let prepared = if snapshot.stage == "starting" {
+    let prepared = if snapshot.stage == ComputeControlStage::Starting.as_str() {
         if state
             .runtime()
             .reconcile_app_compute_start(&prior.target)
@@ -1435,7 +1432,7 @@ pub(crate) async fn resume_restart_start(
             .context("Original startup is committed but not ready; continue observing the same operation")?
     } else {
         ensure!(
-            snapshot.stage == "stopped",
+            snapshot.stage == ComputeControlStage::Stopped.as_str(),
             "Restart has no durable stopped boundary"
         );
         let target = stopped_app_restart_target(state, &prior, &snapshot.checkpoint).await?;
@@ -1556,7 +1553,7 @@ async fn run_restart_continuation(
         // The restart reached its terminal boundary; the private archive has
         // no remaining recovery value. Records that crash before this point
         // stay covered by the scan-based GC instead.
-        if record.action == ComputeControlAction::Restart {
+        if policy::is_restart(record.action) {
             let cleanup = match record.scope {
                 UserAppOperationScope::Dev => {
                     match record.checkpoint.get("builder_restart_template") {
@@ -1595,53 +1592,33 @@ async fn run_restart_continuation(
         Ok(())
     }
     .await;
-    if let Err(error) = &result {
-        if state
-            .userapp_store
-            .check_compute_executor(&identity)
-            .await
-            .is_ok()
-        {
-            state
-                .userapp_store
-                .advance_compute_control(&ComputeControlProgress {
-                    identity: identity.clone(),
-                    expected_revision: record.revision,
-                    state: if !unknown_write && record.stage != "verifying" {
-                        ComputeControlState::Failed
-                    } else {
-                        ComputeControlState::RecoveryRequired
-                    },
-                    stage: if record.stage == "verifying" {
-                        ComputeControlStage::Verifying
-                    } else {
-                        ComputeControlStage::Starting
-                    },
-                    checkpoint: record.checkpoint.clone(),
-                    error_code: Some(ERR_BACKEND_ERROR.into()),
-                    error_message: Some(format!("{error:#}")),
-                })
-                .await?;
-        } else if !unknown_write
-            && let Some(current) = state
-                .userapp_store
-                .get_compute_control(&identity.app_id, &identity.operation_id)
-                .await?
-            && current.state == ComputeControlState::Superseded
-        {
-            state
-                .userapp_store
-                .acknowledge_compute_drain(&ComputeControlDrainAcknowledgement {
-                    identity,
-                    expected_revision: current.revision,
-                    evidence: ComputeControlDrainEvidence::MutationCompleted {
-                        checkpoint: current.checkpoint,
-                    },
-                })
-                .await?;
+    if let Err(error) = result {
+        let reporting = async {
+            if !failure::record(state, &record, &identity, !unknown_write, &error).await?
+                && !unknown_write
+                && let Some(current) = state
+                    .userapp_store
+                    .get_compute_control(&identity.app_id, &identity.operation_id)
+                    .await?
+                && current.state == ComputeControlState::Superseded
+            {
+                state
+                    .userapp_store
+                    .acknowledge_compute_drain(&ComputeControlDrainAcknowledgement {
+                        identity,
+                        expected_revision: current.revision,
+                        evidence: ComputeControlDrainEvidence::MutationCompleted {
+                            checkpoint: current.checkpoint,
+                        },
+                    })
+                    .await?;
+            }
+            Ok(())
         }
+        .await;
+        return Err(failure::with_reporting_error(error, reporting));
     }
-    result
+    Ok(())
 }
 
 pub(crate) fn missing_builder_creation(record: &ComputeControlRecord) -> bool {
@@ -1655,11 +1632,13 @@ pub(crate) async fn reconcile_superseded(
     old: &ComputeControlRecord,
 ) -> Result<ComputeControlRecord> {
     ensure!(
-        old.state == ComputeControlState::Superseded && old.action == ComputeControlAction::Restart,
+        old.state == ComputeControlState::Superseded && policy::is_restart(old.action),
         "Compute operation is not a superseded restart"
     );
     let context = old.execution_context().map_err(anyhow::Error::msg)?;
-    let evidence = if old.stage == "starting" && missing_builder_creation(old) {
+    let evidence = if old.stage == ComputeControlStage::Starting.as_str()
+        && missing_builder_creation(old)
+    {
         let receipt = old
             .lease
             .as_ref()
@@ -1684,9 +1663,7 @@ pub(crate) async fn reconcile_superseded(
         ComputeControlDrainEvidence::PersistedRuntimeAcknowledgement {
             checkpoint: old.checkpoint.clone(),
         }
-    } else if matches!(old.stage.as_str(), "starting" | "stopping")
-        && old.has_docker_compute_target()
-    {
+    } else if policy::write_in_flight(&old.stage) && old.has_docker_compute_target() {
         let receipt = old
             .lease
             .as_ref()
@@ -1704,7 +1681,7 @@ pub(crate) async fn reconcile_superseded(
                     .runtime()
                     .builder_compute_write_acknowledged(
                         &serde_json::from_value::<BuilderControlTarget>(old.checkpoint.clone())?,
-                        old.stage == "starting",
+                        old.stage == ComputeControlStage::Starting.as_str(),
                     )
                     .await?
             }
@@ -1713,7 +1690,7 @@ pub(crate) async fn reconcile_superseded(
                     .runtime()
                     .app_compute_write_acknowledged(
                         &serde_json::from_value::<UserAppMutationTarget>(old.checkpoint.clone())?,
-                        old.stage == "starting",
+                        old.stage == ComputeControlStage::Starting.as_str(),
                     )
                     .await?
             }
@@ -1726,7 +1703,7 @@ pub(crate) async fn reconcile_superseded(
         ComputeControlDrainEvidence::PersistedRuntimeAcknowledgement {
             checkpoint: old.checkpoint.clone(),
         }
-    } else if matches!(old.stage.as_str(), "starting" | "stopping") {
+    } else if policy::write_in_flight(&old.stage) {
         ensure!(
             old.has_conditional_compute_write(),
             "Original conditional-write capability missing"
@@ -1742,7 +1719,7 @@ pub(crate) async fn reconcile_superseded(
                 .await?,
             "Original compute lease cannot be verified"
         );
-        let fenced = if old.scope == UserAppOperationScope::Dev {
+        let fenced = if policy::uses_builder(old.scope)? {
             let target: BuilderControlTarget = serde_json::from_value(old.checkpoint.clone())?;
             ensure!(target.context == context, "Builder fence context differs");
             state.runtime().fence_builder_compute_write(&target).await?
@@ -1753,7 +1730,7 @@ pub(crate) async fn reconcile_superseded(
                 captured.target.context == context,
                 "Startup fence context differs"
             );
-            if old.stage == "stopping" {
+            if old.stage == ComputeControlStage::Stopping.as_str() {
                 state.runtime().fence_app_compute_stop(&captured).await?
             } else {
                 state.runtime().fence_app_compute_start(&captured).await?
@@ -1763,7 +1740,7 @@ pub(crate) async fn reconcile_superseded(
             fenced,
             "Superseded conditional compute write is not yet fenced"
         );
-        if old.stage == "stopping" {
+        if old.stage == ComputeControlStage::Stopping.as_str() {
             ComputeControlDrainEvidence::ConditionalStopFenced {
                 checkpoint: old.checkpoint.clone(),
             }
@@ -1816,8 +1793,8 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
     // Result observation needs only the original submitted identity. New
     // writes still require both the Held lease and the existing strict target.
     ensure!(
-        snapshot.stage == "stopped"
-            || (snapshot.stage == "starting"
+        snapshot.stage == ComputeControlStage::Stopped.as_str()
+            || (snapshot.stage == ComputeControlStage::Starting.as_str()
                 && (snapshot.has_conditional_compute_write()
                     || builder_start::missing_creation(snapshot))),
         "Builder continuation requires a stopped boundary or conditional-write witness"
@@ -1833,7 +1810,7 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
             builder_start::missing_creation(snapshot),
             "Missing builder continuation has no original retained PVC/lease witness"
         );
-        let prepared = if snapshot.stage == "starting" {
+        let prepared = if snapshot.stage == ComputeControlStage::Starting.as_str() {
             if let Some(info) = state
                 .runtime()
                 .reconcile_builder_compute_start(&old)
@@ -1879,7 +1856,7 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
             .await?;
         return run_restart_continuation(state, record, prepared).await;
     }
-    let target = if snapshot.stage == "starting" {
+    let target = if snapshot.stage == ComputeControlStage::Starting.as_str() {
         if state
             .runtime()
             .reconcile_builder_compute_start(&old)
@@ -1899,7 +1876,12 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
         fresh.restart_image = old.restart_image.clone();
         fresh.restart_runtime_workspace = old.restart_runtime_workspace.clone();
         fresh.builder_startup_mode = old.builder_startup_mode;
-        if fresh.workload.is_none() {
+        if fresh.workload.is_none()
+            && old
+                .workload
+                .as_ref()
+                .is_some_and(|workload| policy::uses_retained_pvc(workload.kind))
+        {
             builder_start::prepare_missing_restart_target(
                 state.runtime().as_ref(),
                 &old,
@@ -1969,11 +1951,11 @@ fn freeze_builder_restart_workspace(
     target: &mut BuilderControlTarget,
     action: ComputeControlAction,
 ) {
-    if action == ComputeControlAction::Restart
+    if policy::is_restart(action)
         && target
             .workload
             .as_ref()
-            .is_some_and(|workload| workload.kind == AppResourceKind::StatefulSet)
+            .is_some_and(|workload| policy::uses_retained_pvc(workload.kind))
     {
         target.restart_runtime_workspace =
             Some(paths::userapp_dev_workspace(&target.context.app_id));
@@ -2025,7 +2007,7 @@ async fn capture_missing_partial(
             && actual
                 .workload
                 .as_ref()
-                .is_some_and(|workload| workload.kind == AppResourceKind::StatefulSet),
+                .is_some_and(|workload| policy::uses_retained_pvc(workload.kind)),
         "Original missing-builder creation has no current owned partial controller"
     );
     ensure!(
@@ -2061,7 +2043,7 @@ async fn confirmed_missing_builder_checkpoint(
         .as_ref()
         .context("Ensured builder has no actual running Pod")?;
     ensure!(
-        workload.kind == AppResourceKind::StatefulSet
+        policy::uses_retained_pvc(workload.kind)
             && info.project_id == original.context.app_id
             && info.workload_uid.as_ref() == Some(&workload.uid)
             && info.container_id == pod.uid,
@@ -2258,3 +2240,6 @@ mod restart_workspace_tests {
 
 #[cfg(all(test, feature = "userapp-turso"))]
 mod missing_tests;
+
+#[cfg(all(test, feature = "userapp-turso"))]
+mod failure_tests;

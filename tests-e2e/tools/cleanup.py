@@ -136,6 +136,20 @@ def cleanup_case(case_id, run_id, directory, existing_ids=()):
             (receipt_path.parent / 'fallback-cleanup.json').write_text(json.dumps(result, indent=2))
         except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
             errors.append('Turso isolated runtime cleanup failed: ' + type(error).__name__)
+    compute_root = directory / 'compute-failure-contract'
+    if (compute_root / 'ownership.json').exists():
+        try:
+            receipt = json.loads((compute_root / 'ownership.json').read_text())
+            managed_names.update({receipt['project'] + '-rcoder-1',
+                                  receipt['project'] + '-docker-proxy-1',
+                                  'rcoder-app-builder-' + receipt['app_id']})
+            from compute_failure_contract import cleanup as cleanup_compute_failure
+            result = cleanup_compute_failure(compute_root, run_id, case_id, existing_ids)
+            (compute_root / 'fallback-cleanup.json').write_text(json.dumps(result, indent=2))
+            if not result.get('ok'):
+                errors.append('Compute failure fixture cleanup incomplete')
+        except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+            errors.append('Compute failure fixture cleanup failed: ' + type(error).__name__)
     idle_root = directory / 'idle-owner-runtime'
     if (idle_root / 'ownership.json').exists():
         try:

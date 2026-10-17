@@ -58,7 +58,9 @@ impl AppService {
                         .finalize_observed_hot_success(snapshot, &encoded)
                         .await?
                 }
-                _ => return Ok(None),
+                shared_types::AppCliDeployPhase::Idle
+                | shared_types::AppCliDeployPhase::Deploying
+                | shared_types::AppCliDeployPhase::Orchestrating => return Ok(None),
             }
         };
         if let Some(binding) = binding {
@@ -157,11 +159,11 @@ impl AppService {
                 AppOperationError::Conflict("Original hot operation status missing".into())
             })?)
             .map_err(|_| AppOperationError::Conflict("Invalid hot operation status".into()))?;
-        if !matches!(
-            operation.phase,
-            shared_types::AppCliDeployPhase::Failed | shared_types::AppCliDeployPhase::Running
-        ) {
-            return Ok(None);
+        match operation.phase {
+            shared_types::AppCliDeployPhase::Failed | shared_types::AppCliDeployPhase::Running => {}
+            shared_types::AppCliDeployPhase::Idle
+            | shared_types::AppCliDeployPhase::Deploying
+            | shared_types::AppCliDeployPhase::Orchestrating => return Ok(None),
         }
         let evidence =
             shared_types::HotDeploymentFailureEvidence {
@@ -224,18 +226,26 @@ impl AppService {
                 ));
             };
             if let Some(owner) = self.observe_hot_owner(snapshot, binding).await? {
-                if owner.operation.phase == shared_types::AppCliDeployPhase::Running {
-                    owner
-                        .validate_success(snapshot)
-                        .map_err(AppOperationError::Conflict)?;
-                    evidence = Some(serde_json::to_value(&owner).map_err(|error| {
-                        AppOperationError::Backend(format!("Encode hot success evidence: {error}"))
-                    })?);
-                } else {
-                    return Err(AppOperationError::Conflict(
-                        "Hot owner reports failure after convergence began; manual reconciliation required"
-                            .into(),
-                    ));
+                match owner.operation.phase {
+                    shared_types::AppCliDeployPhase::Running => {
+                        owner
+                            .validate_success(snapshot)
+                            .map_err(AppOperationError::Conflict)?;
+                        evidence = Some(serde_json::to_value(&owner).map_err(|error| {
+                            AppOperationError::Backend(format!(
+                                "Encode hot success evidence: {error}"
+                            ))
+                        })?);
+                    }
+                    shared_types::AppCliDeployPhase::Failed
+                    | shared_types::AppCliDeployPhase::Idle
+                    | shared_types::AppCliDeployPhase::Deploying
+                    | shared_types::AppCliDeployPhase::Orchestrating => {
+                        return Err(AppOperationError::Conflict(
+                            "Hot owner reports failure after convergence began; manual reconciliation required"
+                                .into(),
+                        ));
+                    }
                 }
             }
         }

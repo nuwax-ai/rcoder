@@ -497,7 +497,7 @@ async fn fixture_with_canonical_binding(
         Some(2) => recorded_volumes[0].uid.clear(),
         Some(3) => recorded_volumes.push(recorded_volumes[0].clone()),
         None => {}
-        _ => unreachable!(),
+        Some(_) => unreachable!(),
     }
     checkpoint["builder_volumes"] = serde_json::to_value(&recorded_volumes).unwrap();
     checkpoint["builder_restart_template"] =

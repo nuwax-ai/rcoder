@@ -2,8 +2,8 @@
 use anyhow::{Context as _, Result, ensure};
 use container_runtime_api::{AgentContainerRuntime, UserAppDeploymentRuntime};
 use shared_types::{
-    AppResourceKind, BuilderControlTarget, BuilderRestartTemplate, ComputeControlAction,
-    ComputeControlRecord, ComputeControlState, UserAppLifecycleStore, UserAppOperationScope,
+    BuilderControlTarget, BuilderRestartTemplate, ComputeControlRecord, ComputeControlState,
+    UserAppLifecycleStore, UserAppOperationScope,
 };
 
 pub(super) async fn prepare<R, S>(
@@ -36,14 +36,11 @@ where
         && template.volumes == expected
         && !template.archive.uid.is_empty()
         && !template.archive.name.is_empty()
-        && matches!(
-            (
-                original.workload.as_ref().map(|resource| resource.kind),
-                template.archive.kind
-            ),
-            (Some(AppResourceKind::Container), AppResourceKind::File)
-                | (Some(AppResourceKind::StatefulSet), AppResourceKind::Secret)
-        )
+        && original
+            .workload
+            .as_ref()
+            .and_then(|resource| super::policy::restart_archive_kind(resource.kind))
+            == Some(template.archive.kind)
         && runtime.inspect_builder_restart_archive(&template).await? != Some(false)
     {
         return Ok((snapshot.clone(), template));
@@ -51,13 +48,18 @@ where
     // A positive corrupt-content observation is not an unknown write. It
     // still grants no recapture without every physical check below.
     ensure!(
-        snapshot.scope == UserAppOperationScope::Dev
-            && snapshot.action == ComputeControlAction::Restart
-            && snapshot.stage == "stopped"
-            && matches!(
-                snapshot.state,
-                ComputeControlState::Running | ComputeControlState::RecoveryRequired
-            ),
+        match snapshot.scope {
+            UserAppOperationScope::Dev => true,
+            UserAppOperationScope::Prod | UserAppOperationScope::Application => false,
+        } && super::policy::is_restart(snapshot.action)
+            && snapshot.stage == shared_types::ComputeControlStage::Stopped.as_str()
+            && match snapshot.state {
+                ComputeControlState::Running | ComputeControlState::RecoveryRequired => true,
+                ComputeControlState::Pending
+                | ComputeControlState::Succeeded
+                | ComputeControlState::Failed
+                | ComputeControlState::Superseded => false,
+            },
         "Historical builder archive can only be recaptured at its original stopped boundary"
     );
     let context = snapshot.execution_context().map_err(anyhow::Error::msg)?;
