@@ -164,7 +164,7 @@ impl PgStore {
                     &container,
                     None,
                     &[],
-                    Some(&expected),
+                    RegistrationAuthority::ExplicitAdoption(&expected),
                 )
                 .await
             })
@@ -263,7 +263,7 @@ pub(super) async fn rebind(
         &evidence.container,
         evidence.registration_predecessor.as_ref(),
         &recorded_predecessors,
-        None,
+        RegistrationAuthority::CompletedCurrent,
     )
     .await
 }
@@ -324,6 +324,14 @@ async fn recorded_registration_predecessors(
     Ok(predecessors)
 }
 
+#[derive(Clone, Copy)]
+enum RegistrationAuthority<'a> {
+    /// Created only after the current lifecycle's immutable completion and
+    /// binding pass the same root CAS as compute and deletion admission.
+    CompletedCurrent,
+    ExplicitAdoption(&'a ProjectAndContainerInfo),
+}
+
 async fn rebind_rows(
     tx: &mut dyn Executor,
     context: &shared_types::UserAppExecutionContext,
@@ -331,8 +339,12 @@ async fn rebind_rows(
     basic: &shared_types::ContainerBasicInfo,
     predecessor: Option<&shared_types::BuilderCreationPredecessor>,
     recorded_predecessors: &[shared_types::BuilderCreationPredecessor],
-    expected_registry: Option<&ProjectAndContainerInfo>,
+    authority: RegistrationAuthority<'_>,
 ) -> Result<ProjectAndContainerInfo> {
+    let expected_registry = match authority {
+        RegistrationAuthority::CompletedCurrent => None,
+        RegistrationAuthority::ExplicitAdoption(expected) => Some(expected),
+    };
     let source = predecessor.and_then(|source| source.target.workload.as_ref());
     let replacement = target
         .workload
@@ -383,8 +395,22 @@ async fn rebind_rows(
         .first()
         .exec(tx)
         .await?;
+    let mut project_family_needs_write = false;
     let mut old = match project {
-        Some(project) => {
+        Some(mut project) => {
+            if project.service_type.is_none() {
+                match authority {
+                    RegistrationAuthority::CompletedCurrent => {
+                        // Only the independently verified current completion
+                        // can normalize a missing legacy registration field.
+                        project.service_type = Some(ServiceType::UserappBuilder.to_string());
+                        project_family_needs_write = true;
+                    }
+                    RegistrationAuthority::ExplicitAdoption(_) => {
+                        anyhow::bail!("Builder registration service family is missing");
+                    }
+                }
+            }
             ensure!(
                 project.service_type.as_deref()
                     == Some(ServiceType::UserappBuilder.to_string().as_str()),
@@ -465,16 +491,22 @@ async fn rebind_rows(
                     .is_none_or(|uid| uid == &replacement.uid),
             "The same builder Pod has a conflicting recorded workload identity"
         );
-        let source_uid = match previous.workload_uid.as_deref() {
-            Some(uid) => uid.to_owned(),
+        let mut source_uid = match previous.workload_uid.as_deref() {
+            Some(uid) => Some(uid.to_owned()),
             // The checked current completion acknowledges this exact Pod and
             // STS. Fill an absent historical controller column without retiring
             // the still-live physical Pod or its registration generation.
-            None if same_pod => replacement.uid.clone(),
-            None => verify_legacy_registration_history(tx, context, previous, None).await?,
+            None if same_pod => Some(replacement.uid.clone()),
+            None => match authority {
+                // An absent historical field cannot veto an independently
+                // confirmed current builder. Never invent an old workload UID.
+                RegistrationAuthority::CompletedCurrent => None,
+                RegistrationAuthority::ExplicitAdoption(_) => {
+                    Some(verify_legacy_registration_history(tx, context, previous, None).await?)
+                }
+            },
         };
-        let same_workload = source_uid == replacement.uid;
-        if !same_workload {
+        if source_uid.as_deref() != Some(replacement.uid.as_str()) {
             // A null-predecessor confirmation must not bypass an earlier
             // durable replacement proof for this same current resource.
             for recorded in recorded_predecessors {
@@ -489,25 +521,29 @@ async fn rebind_rows(
                     .as_ref()
                     .context("Recorded builder predecessor Pod missing")?;
                 ensure!(
-                    source_uid == workload.uid
+                    source_uid.as_ref().is_none_or(|uid| uid == &workload.uid)
                         && previous.container_id.as_deref() == Some(pod.uid.as_str())
                         && previous.container_name == workload.name,
                     "Recorded builder predecessor differs from the current registry"
                 );
+                // This is a typed predecessor constraint for the current
+                // physical completion, not an arbitrary old diagnostic row.
+                source_uid = Some(workload.uid.clone());
             }
         }
+        let same_workload = source_uid.as_deref() == Some(replacement.uid.as_str());
         if same_workload && same_pod {
             let registered = old
                 .container_info()
                 .context("Builder replacement registry reference is missing")?;
-            if registered == *basic {
+            if registered == *basic && !project_family_needs_write {
                 return Ok(old);
             }
             // A completed confirmation can refresh the address of the same
             // physical Pod without retiring its generation/physical identity.
         } else if let Some(source) = source {
             ensure!(
-                source_uid == source.uid
+                source_uid.as_ref().is_none_or(|uid| uid == &source.uid)
                     && predecessor
                         .and_then(|proof| proof.target.pod.as_ref())
                         .is_some_and(|pod| previous.container_id.as_deref()
@@ -516,28 +552,44 @@ async fn rebind_rows(
                 "Builder predecessor workload or Pod differs from the current registry"
             );
         } else {
-            let binding = models::ResourceBinding::filter_by_service_type_and_physical_uid(
-                ServiceType::UserappBuilder.to_string(),
-                &source_uid,
-            )
-            .first()
-            .exec(tx)
-            .await?;
-            if let Some(binding) = &binding {
-                // A conflicting binding can never be bypassed with history.
-                ensure!(
-                    binding.app_id == context.app_id
-                        && binding.lifecycle_id == context.lifecycle_id,
-                    "Legacy builder registry belongs to another lifecycle"
-                );
-            }
-            if binding.is_none() || same_workload {
-                // Pre-binding deployments still have durable successful Ensure
-                // results. Match the exact old Pod, STS and name, in this root-
-                // locked transaction. This proves registration ownership only;
-                // it does not invent a historical runtime creator receipt.
-                verify_legacy_registration_history(tx, context, previous, Some(&source_uid))
+            match authority {
+                RegistrationAuthority::CompletedCurrent => {
+                    check_historical_binding_ownership(
+                        tx,
+                        context,
+                        previous,
+                        source_uid.as_deref(),
+                    )
                     .await?;
+                }
+                RegistrationAuthority::ExplicitAdoption(_) => {
+                    let source_uid = source_uid
+                        .as_deref()
+                        .context("Explicit builder adoption requires its old workload identity")?;
+                    let binding = models::ResourceBinding::filter_by_service_type_and_physical_uid(
+                        ServiceType::UserappBuilder.to_string(),
+                        source_uid,
+                    )
+                    .first()
+                    .exec(tx)
+                    .await?;
+                    if let Some(binding) = &binding {
+                        // A conflicting binding can never be bypassed with history.
+                        ensure!(
+                            binding.app_id == context.app_id
+                                && binding.lifecycle_id == context.lifecycle_id,
+                            "Legacy builder registry belongs to another lifecycle"
+                        );
+                    }
+                    if binding.is_none() || same_workload {
+                        // Pre-binding deployments still have durable successful Ensure
+                        // results. Match the exact old Pod, STS and name, in this root-
+                        // locked transaction. This proves registration ownership only;
+                        // it does not invent a historical runtime creator receipt.
+                        verify_legacy_registration_history(tx, context, previous, Some(source_uid))
+                            .await?;
+                    }
+                }
             }
         }
     }
@@ -603,6 +655,72 @@ struct LegacyRegistrationIdentity {
     container_id: String,
     container_name: String,
     workload_uid: Option<String>,
+}
+
+/// Current completion authorizes registry publication, never a write to an old
+/// physical resource. Retained diagnostics can expose a concrete foreign
+/// binding, but missing/opaque history does not grant or revoke that authority.
+async fn check_historical_binding_ownership(
+    tx: &mut dyn Executor,
+    context: &shared_types::UserAppExecutionContext,
+    previous: &repo::ContainerRow,
+    known_workload_uid: Option<&str>,
+) -> Result<()> {
+    let mut workloads = std::collections::BTreeSet::new();
+    if let Some(uid) = known_workload_uid {
+        workloads.insert(uid.to_owned());
+    } else if let Some(pod_uid) = previous.container_id.as_deref() {
+        // Do not cast old JSON in SQL: a malformed legacy checkpoint is opaque
+        // history, not a database failure or a permanent startup prerequisite.
+        let rows = toasty::sql::query("SELECT operation_id,checkpoint_json FROM userapp_operations WHERE app_id=$1 AND kind='ensure_builder' AND state='succeeded'")
+            .bind(&context.app_id).exec(tx).await?;
+        for row in rows {
+            let toasty_core::stmt::Value::Record(row) = row else {
+                anyhow::bail!("Invalid historical builder diagnostic row");
+            };
+            let [
+                toasty_core::stmt::Value::String(operation_id),
+                toasty_core::stmt::Value::String(checkpoint),
+            ] = row.fields.as_slice()
+            else {
+                anyhow::bail!("Invalid historical builder diagnostic columns");
+            };
+            let stored: LegacyRegistrationIdentity = match serde_json::from_str(checkpoint) {
+                Ok(stored) => stored,
+                Err(error) => {
+                    tracing::warn!(operation_id = %operation_id, app_id = %context.app_id,
+                        serde_category = ?error.classify(),
+                        "retained opaque historical builder identity during current registration");
+                    continue;
+                }
+            };
+            if stored.project_id == context.app_id
+                && stored.container_id == pod_uid
+                && stored.container_name == previous.container_name
+                && let Some(uid) = stored.workload_uid.filter(|uid| !uid.trim().is_empty())
+            {
+                workloads.insert(uid);
+            }
+        }
+    }
+    for uid in workloads {
+        if let Some(binding) = models::ResourceBinding::filter_by_service_type_and_physical_uid(
+            ServiceType::UserappBuilder.to_string(),
+            &uid,
+        )
+        .first()
+        .exec(tx)
+        .await?
+        {
+            ensure!(
+                binding.app_id == context.app_id,
+                "Historical builder registry belongs to another application"
+            );
+            // A same-application binding retains its original lifecycle and
+            // creator. It is history, not a binding for the current workload.
+        }
+    }
+    Ok(())
 }
 
 async fn verify_legacy_registration_history(

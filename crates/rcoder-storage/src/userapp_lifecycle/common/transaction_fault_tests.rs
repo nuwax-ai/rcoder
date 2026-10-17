@@ -21,11 +21,11 @@ pub(super) struct ComputeAccessClaimProbe {
     resume: tokio::sync::Notify,
 }
 impl ComputeAccessClaimProbe {
-    #[cfg(feature = "pg")]
+    #[cfg(all(feature = "pg", feature = "userapp-turso"))]
     pub(super) async fn reached(&self) {
         self.reached.notified().await;
     }
-    #[cfg(feature = "pg")]
+    #[cfg(all(feature = "pg", feature = "userapp-turso"))]
     pub(super) fn release(&self) {
         self.resume.notify_one();
     }
@@ -33,7 +33,7 @@ impl ComputeAccessClaimProbe {
 tokio::task_local! {
     static COMPUTE_ACCESS_CLAIM_PROBE: std::sync::Arc<ComputeAccessClaimProbe>;
 }
-#[cfg(feature = "pg")]
+#[cfg(all(feature = "pg", feature = "userapp-turso"))]
 pub(super) async fn with_compute_access_claim_probe<F: Future>(
     probe: std::sync::Arc<ComputeAccessClaimProbe>,
     future: F,
