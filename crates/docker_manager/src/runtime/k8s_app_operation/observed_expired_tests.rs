@@ -19,6 +19,22 @@ fn old_lease() -> serde_json::Value {
     object
 }
 
+fn lifecycle_case_lease(empty_lifecycle: bool) -> serde_json::Value {
+    let mut object = old_lease();
+    if empty_lifecycle {
+        object["metadata"]["annotations"]["rcoder.io/lifecycle-id"] = "".into();
+    }
+    object
+}
+
+fn lifecycle_case_observed(empty_lifecycle: bool) -> AppOperationMutexIdentity {
+    let mut identity = observed();
+    if empty_lifecycle {
+        identity.lifecycle_id = None;
+    }
+    identity
+}
+
 async fn reject_additional_request(listener: &tokio::net::TcpListener) {
     if let Ok(Ok((mut stream, _))) =
         tokio::time::timeout(std::time::Duration::from_millis(40), listener.accept()).await
@@ -31,6 +47,15 @@ async fn reject_additional_request(listener: &tokio::net::TcpListener) {
 
 #[tokio::test]
 async fn exact_expired_old_lifecycle_uses_uid_rv_cas_and_standard_receipt_release() {
+    assert_expired_lifecycle_case_uses_exact_cas_and_release(false).await;
+}
+
+#[tokio::test]
+async fn empty_lifecycle_expired_lease_uses_uid_rv_cas_and_standard_receipt_release() {
+    assert_expired_lifecycle_case_uses_exact_cas_and_release(true).await;
+}
+
+async fn assert_expired_lifecycle_case_uses_exact_cas_and_release(empty_lifecycle: bool) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -38,7 +63,7 @@ async fn exact_expired_old_lifecycle_uses_uid_rv_cas_and_standard_receipt_releas
             let (mut stream, _) = listener.accept().await.unwrap();
             let (head, _) = read_request(&mut stream).await;
             assert!(head.starts_with("GET "), "must not POST: {head}");
-            write_reply(&mut stream, 200, &old_lease()).await;
+            write_reply(&mut stream, 200, &lifecycle_case_lease(empty_lifecycle)).await;
 
             let (mut stream, _) = listener.accept().await.unwrap();
             let (head, body) = read_request(&mut stream).await;
@@ -65,7 +90,7 @@ async fn exact_expired_old_lifecycle_uses_uid_rv_cas_and_standard_receipt_releas
                 .unwrap()
                 .to_owned();
             assert!(!token.is_empty());
-            let mut taken = old_lease();
+            let mut taken = lifecycle_case_lease(empty_lifecycle);
             taken["metadata"]["resourceVersion"] = "42".into();
             for (key, value) in patch["metadata"]["annotations"].as_object().unwrap() {
                 if value.is_null() {
@@ -104,7 +129,11 @@ async fn exact_expired_old_lifecycle_uses_uid_rv_cas_and_standard_receipt_releas
         });
         let runtime = runtime_for(client_for(address).await);
         let lease = runtime
-            .acquire_observed_expired_app_operation("takeover", "life-current", &observed())
+            .acquire_observed_expired_app_operation(
+                "takeover",
+                "life-current",
+                &lifecycle_case_observed(empty_lifecycle),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -222,6 +251,15 @@ async fn foreign_scope_or_deleting_expired_object_refuses_without_patch() {
 
 #[tokio::test]
 async fn cas_loser_reports_actual_winner_without_rebased_patch_or_post() {
+    assert_lifecycle_case_cas_loser_does_not_rebase(false).await;
+}
+
+#[tokio::test]
+async fn empty_lifecycle_cas_loser_reports_winner_without_rebased_patch_or_post() {
+    assert_lifecycle_case_cas_loser_does_not_rebase(true).await;
+}
+
+async fn assert_lifecycle_case_cas_loser_does_not_rebase(empty_lifecycle: bool) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -229,7 +267,7 @@ async fn cas_loser_reports_actual_winner_without_rebased_patch_or_post() {
             let (mut stream, _) = listener.accept().await.unwrap();
             let (head, _) = read_request(&mut stream).await;
             assert!(head.starts_with("GET "), "{head}");
-            write_reply(&mut stream, 200, &old_lease()).await;
+            write_reply(&mut stream, 200, &lifecycle_case_lease(empty_lifecycle)).await;
             let (mut stream, _) = listener.accept().await.unwrap();
             let (head, body) = read_request(&mut stream).await;
             assert!(head.starts_with("PATCH "), "{head}");
@@ -248,7 +286,11 @@ async fn cas_loser_reports_actual_winner_without_rebased_patch_or_post() {
             reject_additional_request(&listener).await;
         });
         let result = runtime_for(client_for(address).await)
-            .acquire_observed_expired_app_operation("takeover", "life-current", &observed())
+            .acquire_observed_expired_app_operation(
+                "takeover",
+                "life-current",
+                &lifecycle_case_observed(empty_lifecycle),
+            )
             .await;
         let Err(ContainerRuntimeError::OperationInProgress(detail)) = result else {
             panic!("CAS loser must retain definitive occupied result");
@@ -258,4 +300,118 @@ async fn cas_loser_reports_actual_winner_without_rebased_patch_or_post() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn empty_lifecycle_candidate_preserves_live_foreign_changed_and_unknown_guards() {
+    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        for variant in [
+            "live",
+            "uid",
+            "token",
+            "rv",
+            "lifecycle",
+            "foreign-app",
+            "foreign-family",
+            "deleting",
+            "missing-uid",
+            "absent",
+            "unknown-read",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (head, _) = read_request(&mut stream).await;
+                assert!(
+                    head.starts_with("GET "),
+                    "must read before any write: {head}"
+                );
+                let mut object = lifecycle_case_lease(true);
+                match variant {
+                    "live" => {
+                        object["spec"]["renewTime"] = serde_json::to_value(lease_now()).unwrap()
+                    }
+                    "uid" => object["metadata"]["uid"] = "replacement-uid".into(),
+                    "token" => {
+                        object["metadata"]["annotations"]["rcoder.io/operation-id"] =
+                            "replacement-token".into()
+                    }
+                    "rv" => object["metadata"]["resourceVersion"] = "42".into(),
+                    "lifecycle" => {
+                        object["metadata"]["annotations"]["rcoder.io/lifecycle-id"] =
+                            "replacement-life".into()
+                    }
+                    "foreign-app" => {
+                        object["metadata"]["labels"]["rcoder.io/operation-app"] =
+                            "foreign-app".into()
+                    }
+                    "foreign-family" => {
+                        object["metadata"]["labels"]["rcoder.io/operation-family"] =
+                            "user-app-builder".into()
+                    }
+                    "deleting" => {
+                        object["metadata"]["deletionTimestamp"] = "2026-01-01T00:00:00Z".into()
+                    }
+                    "missing-uid" => object["metadata"]["uid"] = "".into(),
+                    "absent" | "unknown-read" => {}
+                    _ => unreachable!(),
+                }
+                match variant {
+                    "absent" => write_reply(&mut stream, 404, &status(404, "gone")).await,
+                    "unknown-read" => {
+                        write_reply(&mut stream, 500, &status(500, "read outcome unknown")).await
+                    }
+                    _ => write_reply(&mut stream, 200, &object).await,
+                }
+                reject_additional_request(&listener).await;
+            });
+            let result = runtime_for(client_for(address).await)
+                .acquire_observed_expired_app_operation(
+                    "takeover",
+                    "life-current",
+                    &lifecycle_case_observed(true),
+                )
+                .await;
+            match variant {
+                "foreign-app" | "foreign-family" | "deleting" | "missing-uid" => {
+                    assert!(
+                        matches!(result, Err(ContainerRuntimeError::Conflict(_))),
+                        "{variant}"
+                    );
+                }
+                "unknown-read" => {
+                    assert!(
+                        matches!(result, Err(ContainerRuntimeError::K8sError(_))),
+                        "{variant}"
+                    );
+                }
+                _ => {
+                    assert!(
+                        matches!(result, Err(ContainerRuntimeError::OperationInProgress(_))),
+                        "{variant}"
+                    );
+                }
+            }
+            server.await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn empty_lifecycle_manual_candidate_is_rejected_before_any_native_request() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        reject_additional_request(&listener).await;
+    });
+    let mut manual = lifecycle_case_observed(true);
+    manual.lifecycle_id = Some(String::new());
+    let result = runtime_for(client_for(address).await)
+        .acquire_observed_expired_app_operation("takeover", "life-current", &manual)
+        .await;
+    assert!(matches!(result, Err(ContainerRuntimeError::Conflict(_))));
+    server.await.unwrap();
 }

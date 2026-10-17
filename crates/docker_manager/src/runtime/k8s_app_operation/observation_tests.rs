@@ -755,3 +755,79 @@ async fn zero_budget_or_invalid_observation_issues_no_request() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn empty_lifecycle_live_lease_is_occupied_without_lifecycle_authority() {
+    let mut object = lease_json("uid-one", "private-token-one", "41");
+    object["metadata"]["annotations"]["rcoder.io/lifecycle-id"] = "".into();
+    let (runtime, server) = fixture(vec![(Endpoint::Lease, Reply::Json(200, object))]).await;
+    let AppOperationMutexObservation::Occupied(identity) = runtime
+        .observe_app_operation_mutex(APP, LIFE)
+        .await
+        .unwrap()
+    else {
+        panic!("an empty optional lifecycle must not hide a live mutex");
+    };
+    let mut expected = original();
+    expected.lifecycle_id = None;
+    assert_eq!(identity, expected);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn empty_lifecycle_expired_lease_is_only_an_exact_observation_candidate() {
+    let mut object = lease_json("uid-one", "private-token-one", "41");
+    object["metadata"]["annotations"]["rcoder.io/lifecycle-id"] = "".into();
+    object["spec"]["renewTime"] = "2000-01-01T00:00:00.000000Z".into();
+    let (runtime, server) = fixture(vec![(Endpoint::Lease, Reply::Json(200, object))]).await;
+    let AppOperationMutexObservation::Expired(identity) = runtime
+        .observe_app_operation_mutex(APP, LIFE)
+        .await
+        .unwrap()
+    else {
+        panic!("an expired empty-lifecycle mutex is a candidate, never absence");
+    };
+    let mut expected = original();
+    expected.lifecycle_id = None;
+    assert_eq!(identity, expected);
+    server.await.unwrap();
+}
+
+#[test]
+fn empty_lifecycle_manual_identity_stays_invalid_and_nonempty_values_are_not_trimmed() {
+    let mut manual = original();
+    manual.lifecycle_id = Some(String::new());
+    assert!(matches!(
+        validate_observed_scope(&manual, NAMESPACE, NAME, LIFE),
+        Err(ContainerRuntimeError::Conflict(_))
+    ));
+    for value in [" ", "\t", "life-old"] {
+        let mut object = lease_json("uid-one", "private-token-one", "41");
+        object["metadata"]["annotations"]["rcoder.io/lifecycle-id"] = value.into();
+        let object: Lease = serde_json::from_value(object).unwrap();
+        let identity = mutex_identity(&object, NAMESPACE, NAME, APP, LIFE).unwrap();
+        assert_eq!(identity.lifecycle_id.as_deref(), Some(value));
+    }
+}
+
+#[test]
+fn empty_lifecycle_never_relaxes_physical_mutex_identity() {
+    for pointer in [
+        "/metadata/namespace",
+        "/metadata/name",
+        "/metadata/labels/rcoder.io~1operation-app",
+        "/metadata/labels/rcoder.io~1operation-family",
+        "/metadata/uid",
+        "/metadata/resourceVersion",
+        "/metadata/annotations/rcoder.io~1lease-token",
+    ] {
+        let mut object = lease_json("uid-one", "private-token-one", "41");
+        object["metadata"]["annotations"]["rcoder.io/lifecycle-id"] = "".into();
+        *object.pointer_mut(pointer).unwrap() = "".into();
+        let object: Lease = serde_json::from_value(object).unwrap();
+        assert!(
+            mutex_identity(&object, NAMESPACE, NAME, APP, LIFE).is_err(),
+            "{pointer}"
+        );
+    }
+}

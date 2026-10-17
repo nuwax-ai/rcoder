@@ -55,6 +55,7 @@ pub(super) fn mutex_identity(
         .annotations
         .as_ref()
         .and_then(|annotations| annotations.get("rcoder.io/lifecycle-id"))
+        .filter(|lifecycle_id| !lifecycle_id.is_empty())
         .cloned();
     if object.metadata.namespace.as_deref() != Some(namespace)
         || object.metadata.name.as_deref() != Some(name)
