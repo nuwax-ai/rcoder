@@ -79,7 +79,7 @@ impl DevServerManager {
         // 移植，对多服务模板不适用——web/computer 项目（无 workspace manifest）
         // 继续走原路径。
         let manifest = project_path.join("workspace.manifest.toml");
-        if tokio::fs::try_exists(&manifest).await.unwrap_or(false) {
+        if tokio::fs::try_exists(&manifest).await? {
             return self
                 .start_dev_manifest(project_id, project_path, launch)
                 .await;

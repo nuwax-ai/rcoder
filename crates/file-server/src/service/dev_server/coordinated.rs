@@ -21,13 +21,17 @@ use super::support::lock;
 use super::types::{DevServerManager, StartedDev};
 use crate::error::{AppError, AppResult};
 
+#[cfg(all(test, unix))]
+#[path = "io_probe_tests.rs"]
+mod io_probe_tests;
+
 impl DevServerManager {
     /// 票据启动（协调器签发端口与实例身份）。
     pub async fn start_coordinated(&self, ticket: &ExecutorStartTicket) -> AppResult<StartedDev> {
         let project_path = Path::new(&ticket.project_path);
         // workspace.manifest.toml = userapp 域（app-cli 引擎），不进 Custom Page 协调。
         let manifest = project_path.join("workspace.manifest.toml");
-        if tokio::fs::try_exists(&manifest).await.unwrap_or(false) {
+        if tokio::fs::try_exists(&manifest).await? {
             return Err(AppError::business(
                 "workspace manifest projects are userapp domain, not coordinated previews",
             ));

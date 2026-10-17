@@ -135,8 +135,15 @@ pub(crate) fn discover_targets_with(workspace: &Path, extra_roots: &[PathBuf]) -
         }
     };
     for root in project_state_root_candidates(workspace, extra_roots) {
-        if !root.join("supervisor.json").try_exists().unwrap_or(false) {
-            continue;
+        match root.join("supervisor.json").try_exists() {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                report
+                    .unreadable
+                    .push((root, format!("inspect supervisor record: {error}")));
+                continue;
+            }
         }
         match last_snapshot(&root) {
             Ok(snapshot) => {
