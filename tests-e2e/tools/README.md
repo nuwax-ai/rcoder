@@ -366,3 +366,19 @@ python3 -m unittest discover -s tests-e2e/tools -p test_local_k8s_core.py -v
 `local_k8s_prod_execute.py` 和 `local_k8s_prod_expiry.py`。各脚本的 `--help`
 列出明确前置；续跑保留旧报告并核验原身份。验收边界和实例就绪规则见
 [Kubernetes 指南](../../docs/deployment/kubernetes.md)。
+
+
+### 隔离恢复 CI
+
+`isolated-e2e.yml` 是手动触发的独立 Docker 恢复门禁，不连接已有 Compose 或 K8s 服务。必须提供一对包含编译/运行前置的不可变镜像：controller 基底需 Rust、protoc、C/C++ 工具链与 Node/pnpm；builder 基底需 app-cli/Pingap 对应运行依赖。镜像 ID 或仓库 `@sha256:` 引用均可；可变 tag、缺失工具、空筛选、skip、业务失败或清理未确认均使任务失败。
+
+本地可用同一入口；报告目录应放在代码仓库之外：
+
+```bash
+python3 tests-e2e/tools/isolated_ci.py \
+  --controller-base "$E2E_CONTROLLER_BASE" \
+  --builder-base "$E2E_BUILDER_BASE" \
+  --report-root "$E2E_CI_REPORT_ROOT"
+```
+
+入口冻结源码并实际编译 RCoder、Agent Runner、独立 app-cli 和离线观察器，再启动本次专属控制面与动态随机应用。它核对二进制、严格逐用例报告、源码不漂移和既有容器保留；只清理本轮确认归属的计算资源，保留数据卷与失败证据。当前覆盖 owner 冲突、文件/Git、重复启停、多服务、预览 HTTP/HMR、闲置/owner 强杀及真实 Stop 回复超时和迟到 Stop。此 job 不代替 K8s 81 步与跨副本聊天/SSE 验收，也不代替独立 app-cli 的组件检查。

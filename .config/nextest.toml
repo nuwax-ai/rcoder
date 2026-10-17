@@ -6,3 +6,11 @@ max-threads = 1
 [[profile.default.overrides]]
 filter = '(package(http-server) & (test(handler::userapp_agent_target::tests::) | test(handler::computer_agent_stop_handler::tests::) | test(handler::computer_chat_handler::userapp::tests::) | test(handler::computer_chat_handler::session::tests::) | test(handler::agent_session_notification::resolve::tests::) | test(handler::pod_handler::helpers::identity_tests::) | test(handler::computer_chat_handler::userapp::forward_protocol_tests::) | test(handler::agent_session_notification::tests::))) | (package(agent_runner) & (test(handler::health_handler::tests::ready_check_503_when_grpc_not_listening) | test(handler::health_handler::tests::ready_check_200_when_grpc_listening)))'
 test-group = 'userapp-http-protocol'
+
+# The default-mode forwarding pipeline uses its real file-peer port 60000.
+[test-groups.userapp-file-peer-60000]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(rcoder-engine) & test(userapp_forward::upstream::probe_pipeline_tests::)'
+test-group = 'userapp-file-peer-60000'

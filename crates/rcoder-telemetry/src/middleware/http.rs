@@ -2,7 +2,10 @@
 //!
 //! 为 Axum 提供 HTTP 请求指标收集功能。
 
-use axum::http::{Request, Response};
+use axum::{
+    extract::MatchedPath,
+    http::{Request, Response},
+};
 use pin_project_lite::pin_project;
 use std::{
     future::Future,
@@ -71,7 +74,13 @@ where
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let method = req.method().to_string();
-        let path = normalize_path(req.uri().path());
+        // Router::layer runs after route matching. Never label arbitrary URI
+        // segments, including unknown paths, with user-controlled values.
+        let path = req
+            .extensions()
+            .get::<MatchedPath>()
+            .map_or("__unmatched__", MatchedPath::as_str)
+            .to_owned();
         let start = Instant::now();
 
         let future = self.inner.call(req);
@@ -123,72 +132,75 @@ where
     }
 }
 
-/// 标准化路径
-///
-/// 移除路径参数中的具体值，保留路径模式。
-/// 例如：`/api/users/123` -> `/api/users/:id`
-fn normalize_path(path: &str) -> String {
-    // 简单实现：直接返回路径
-    // 可以根据需要扩展为更复杂的路径模式匹配
-    let parts: Vec<&str> = path.split('/').collect();
-    let normalized: Vec<String> = parts
-        .iter()
-        .map(|part| {
-            // 如果是纯数字或 UUID 格式，替换为 :id
-            if part.chars().all(|c| c.is_ascii_digit()) && !part.is_empty() {
-                ":id".to_string()
-            } else if is_uuid(part) {
-                ":uuid".to_string()
-            } else {
-                part.to_string()
-            }
-        })
-        .collect();
-
-    normalized.join("/")
-}
-
-/// 检查是否是 UUID 格式
-fn is_uuid(s: &str) -> bool {
-    if s.len() != 36 {
-        return false;
-    }
-    // 简单检查 UUID 格式：8-4-4-4-12
-    let parts: Vec<&str> = s.split('-').collect();
-    parts.len() == 5
-        && parts[0].len() == 8
-        && parts[1].len() == 4
-        && parts[2].len() == 4
-        && parts[3].len() == 4
-        && parts[4].len() == 12
-        && parts
-            .iter()
-            .all(|p| p.chars().all(|c| c.is_ascii_hexdigit()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, body::Body, routing::get};
+    use metrics_exporter_prometheus::PrometheusBuilder;
+    use tower::ServiceExt;
 
     #[test]
-    fn test_normalize_path() {
-        assert_eq!(normalize_path("/api/users/123"), "/api/users/:id");
-        assert_eq!(normalize_path("/health"), "/health");
-        assert_eq!(normalize_path("/api/v1/projects"), "/api/v1/projects");
-    }
-
-    #[test]
-    fn test_is_uuid() {
-        assert!(is_uuid("550e8400-e29b-41d4-a716-446655440000"));
-        assert!(!is_uuid("not-a-uuid"));
-        assert!(!is_uuid("123"));
-    }
-
-    #[test]
-    fn test_normalize_path_with_uuid() {
-        assert_eq!(
-            normalize_path("/api/sessions/550e8400-e29b-41d4-a716-446655440000/progress"),
-            "/api/sessions/:uuid/progress"
-        );
+    fn router_layer_uses_templates_for_parameters_wildcards_and_fixed_fallback() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let app = Router::new()
+                    .nest(
+                        "/api",
+                        Router::new()
+                            .route("/progress/{session_id}", get(|| async { "progress" }))
+                            .route("/assets/{*path}", get(|| async { "asset" })),
+                    )
+                    .layer(HttpMetricsLayer::new());
+                for (path, status) in [
+                    ("/api/progress/session-alpha", 200),
+                    ("/api/progress/session-beta?value=private-query", 200),
+                    ("/api/assets/folder-one/file-one", 200),
+                    ("/api/assets/folder-two/file-two", 200),
+                    ("/missing/arbitrary-one", 404),
+                    ("/missing/arbitrary-two", 404),
+                ] {
+                    let response = app
+                        .clone()
+                        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status().as_u16(), status);
+                }
+            })
+        });
+        let output = handle.render();
+        for path in [
+            "/api/progress/{session_id}",
+            "/api/assets/{*path}",
+            "__unmatched__",
+        ] {
+            let label = format!("path=\"{path}\"");
+            let counters: Vec<_> = output
+                .lines()
+                .filter(|line| line.starts_with("http_requests_total{") && line.contains(&label))
+                .collect();
+            assert_eq!(counters.len(), 1, "{path}: {output}");
+            assert!(counters[0].ends_with(" 2"), "{output}");
+        }
+        for private in [
+            "session-alpha",
+            "session-beta",
+            "private-query",
+            "folder-one",
+            "folder-two",
+            "arbitrary-one",
+            "arbitrary-two",
+        ] {
+            assert!(
+                !output.contains(private),
+                "raw URI escaped into metrics: {private}"
+            );
+        }
     }
 }

@@ -1,0 +1,57 @@
+name: isolated Docker E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      controller_base:
+        description: Immutable compiler/controller runtime base reference (digest required)
+        required: true
+        type: string
+      builder_base:
+        description: Immutable paired Agent Runner runtime base reference (digest required)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: isolated-e2e-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  recovery:
+    name: frozen source / owned Docker / strict reports
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      CONTROLLER_BASE: ${{ inputs.controller_base }}
+      BUILDER_BASE: ${{ inputs.builder_base }}
+      E2E_RUN_ROOT: ${{ runner.temp }}/rcoder-isolated-e2e
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install native client prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config libssl-dev libclang-dev protobuf-compiler
+      - name: Verify local Docker prerequisites
+        run: |
+          docker info
+          docker compose version
+      - name: Build frozen source and run strict recovery scenarios
+        run: |
+          python3 tests-e2e/tools/isolated_ci.py \
+            --controller-base "$CONTROLLER_BASE" \
+            --builder-base "$BUILDER_BASE" \
+            --report-root "$E2E_RUN_ROOT"
+      - name: Preserve evidence including failed prerequisites and cleanup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: isolated-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rcoder-isolated-e2e
+          if-no-files-found: error

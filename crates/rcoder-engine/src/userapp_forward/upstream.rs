@@ -229,17 +229,24 @@ async fn resolve_dev_addr_inner(
     let probe_fresh = cache
         .view(&probe_key, |_, t| t.elapsed() < PROBE_TTL)
         .unwrap_or(false);
-    let credentials = super::file_credentials::credentials(
-        state,
-        shared_types::UserappStage::Dev,
-        app_id,
-        deadline,
-    )
-    .await
-    .map_err(|failure| {
-        HttpResultError::from_app_error(failure.into_app_error()).into_boxed_response()
-    })?;
-    if !probe_fresh && !probe_dev_container(&addr, &credentials).await {
+    let probe_failed = if probe_fresh {
+        false
+    } else {
+        // These credentials are only for this probe. Forwarding independently
+        // resolves the current peer after any remediation or replacement.
+        let credentials = super::file_credentials::credentials(
+            state,
+            shared_types::UserappStage::Dev,
+            app_id,
+            deadline,
+        )
+        .await
+        .map_err(|failure| {
+            HttpResultError::from_app_error(failure.into_app_error()).into_boxed_response()
+        })?;
+        !probe_dev_container(&addr, &credentials).await
+    };
+    if probe_failed {
         warn!(
             "[USERAPP_FORWARD] dev container probe failed (stale registry entry?), verifying container state: app_id={app_id}, addr={addr}"
         );
@@ -882,3 +889,7 @@ mod implementation_file_boundary_baseline_tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "userapp-turso"))]
+#[path = "upstream_probe_pipeline_tests.rs"]
+mod probe_pipeline_tests;
