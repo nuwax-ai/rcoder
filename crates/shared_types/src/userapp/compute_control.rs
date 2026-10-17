@@ -10,6 +10,119 @@ pub use stop_observation::ComputeStopObservation;
 /// Request IDs in this namespace are issued only by idle repair admission.
 pub const AUTOMATIC_REPAIR_REQUEST_PREFIX: &str = "auto-repair-";
 
+/// Private checkpoint evidence for the original Docker Restart stop boundary.
+pub const BUILDER_RESTART_STOP_OBSERVATION_KEY: &str = "builder_restart_stop_observation";
+
+/// The runtime must hold the original physical lease while producing this fact.
+/// A retained container reporting stopped without its original Stop receipt is
+/// deliberately not an observation kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuilderRestartStopKind {
+    StopReceiptAcknowledged,
+    CapturedContainerAbsent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuilderRestartStopObservation {
+    pub target: crate::BuilderControlTarget,
+    pub volumes: Vec<crate::AppResourceIdentity>,
+    pub kind: BuilderRestartStopKind,
+}
+
+impl BuilderRestartStopObservation {
+    pub fn validate(&self) -> Result<(), String> {
+        self.target.validate()?;
+        let workload = self
+            .target
+            .workload
+            .as_ref()
+            .ok_or("Restart stop observation has no captured Docker Container")?;
+        if workload.kind != crate::AppResourceKind::Container
+            || workload.uid.len() != 64
+            || !workload
+                .uid
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || self.target.pod.is_some()
+            || self.volumes.is_empty()
+        {
+            return Err(
+                "Restart stop observation requires its exact full Docker ID and retained mounts"
+                    .into(),
+            );
+        }
+        let mut destinations = std::collections::BTreeSet::new();
+        if self.volumes.iter().any(|volume| {
+            volume.kind != crate::AppResourceKind::HostPath
+                || volume.name.is_empty()
+                || volume.uid.is_empty()
+                || !destinations.insert(&volume.name)
+        }) {
+            return Err("Restart stop observation has invalid retained Docker mounts".into());
+        }
+        match self.kind {
+            BuilderRestartStopKind::StopReceiptAcknowledged
+            | BuilderRestartStopKind::CapturedContainerAbsent => Ok(()),
+        }
+    }
+}
+
+/// Preserve the first stop-boundary observation and its original diagnostic in
+/// the existing checkpoint when continuation clears the live error fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuilderRestartStopRecoveryEvidence {
+    pub observation: BuilderRestartStopObservation,
+    pub original_state: ComputeControlState,
+    pub original_error_code: Option<String>,
+    pub original_error_message: Option<String>,
+    /// Opaque original reference; stop observation need not decode a recipe.
+    /// A restore continuation must match and validate this exact reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_restart_template: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unrebuildable: Option<BuilderRestartUnrebuildableEvidence>,
+    /// Preserve an opaque pre-existing value when the original physical result
+    /// permits reclassification; historical decoding is not a write admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_observation: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuilderRestartUnrebuildableReason {
+    MissingArchive,
+    UnreadableArchive,
+    ArchiveUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuilderRestartArchiveUnavailableKind {
+    /// Runtime inspection returned Some(false) for this exact private recipe.
+    /// An inspection error, None/unknown, or Some(true) never creates this fact.
+    PositiveUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuilderRestartArchiveUnavailable {
+    pub template: crate::BuilderRestartTemplate,
+    pub kind: BuilderRestartArchiveUnavailableKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuilderRestartUnrebuildableEvidence {
+    pub reason: BuilderRestartUnrebuildableReason,
+    /// May follow an earlier acknowledged stop; preserve that first fact too.
+    pub observation: BuilderRestartStopObservation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_unavailable: Option<BuilderRestartArchiveUnavailable>,
+}
+
 /// Validate public compute controls before discovery or durable admission.
 pub fn validate_user_compute_request_id(request_id: &str) -> Result<(), String> {
     crate::validate_identifier(request_id, "request_id")?;

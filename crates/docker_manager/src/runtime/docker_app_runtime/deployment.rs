@@ -398,6 +398,16 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         self.prepare_compute_file_lease(context, scope).await
     }
 
+    async fn resume_original_compute_operation(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        scope: shared_types::UserAppOperationScope,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<Box<dyn shared_types::AppOperationLease>> {
+        self.resume_original_compute_file_lease(context, scope, receipt)
+            .await
+    }
+
     async fn inspect_compute_drain_lease(
         &self,
         context: &shared_types::UserAppExecutionContext,

@@ -83,6 +83,7 @@
     "userapp_manual_owner_multi_process_control"
   ],
   "compose_userapp_faults": [
+    "userapp_compute_late_stop_cid_absence_recovery_contract",
     "userapp_compute_stop_timeout_recovery_contract",
     "userapp_compute_stopped_failure_recovery_contract",
     "userapp_hot_deployment_builtin_contract",

@@ -17,6 +17,21 @@ where
     R: AgentContainerRuntime + UserAppDeploymentRuntime + ?Sized,
     S: UserAppLifecycleStore + ?Sized,
 {
+    prepare_with_guard(runtime, store, snapshot, original, retained, None).await
+}
+
+pub(super) async fn prepare_with_guard<R, S>(
+    runtime: &R,
+    store: &S,
+    snapshot: &ComputeControlRecord,
+    original: &BuilderControlTarget,
+    retained: &BuilderControlTarget,
+    held_guard: Option<&dyn shared_types::AppOperationLease>,
+) -> Result<(ComputeControlRecord, BuilderRestartTemplate)>
+where
+    R: AgentContainerRuntime + UserAppDeploymentRuntime + ?Sized,
+    S: UserAppLifecycleStore + ?Sized,
+{
     let expected: Vec<shared_types::AppResourceIdentity> = serde_json::from_value(
         snapshot
             .checkpoint
@@ -69,9 +84,7 @@ where
         .context("Original builder lease missing")?;
     verify_retained(original, retained, &context)?;
     ensure!(
-        runtime
-            .validate_app_operation_receipt(&context, receipt)
-            .await?,
+        original_lease_current(runtime, &context, receipt, held_guard).await?,
         "Original builder lease changed before archive recapture"
     );
     ensure!(
@@ -98,9 +111,7 @@ where
         "Retained builder changed during archive recapture"
     );
     ensure!(
-        runtime
-            .validate_app_operation_receipt(&context, receipt)
-            .await?
+        original_lease_current(runtime, &context, receipt, held_guard).await?
             && runtime.reconcile_builder_compute_stop(original).await?
             && runtime.capture_builder_compute_volumes(retained).await? == expected,
         "Original builder stop, lease or volumes changed during archive recapture"
@@ -110,6 +121,25 @@ where
         .await?;
     // No restore/start occurs before this complete old-snapshot CAS commits.
     Ok((persisted, template))
+}
+
+async fn original_lease_current<R: UserAppDeploymentRuntime + ?Sized>(
+    runtime: &R,
+    context: &shared_types::UserAppExecutionContext,
+    receipt: &shared_types::UserAppOperationLeaseReceipt,
+    held_guard: Option<&dyn shared_types::AppOperationLease>,
+) -> Result<bool> {
+    if let Some(guard) = held_guard {
+        ensure!(
+            guard.receipt().as_ref() == Some(receipt),
+            "Retained archive guard receipt differs"
+        );
+        return guard.validate_retained().await.map_err(anyhow::Error::msg);
+    }
+    runtime
+        .validate_app_operation_receipt(context, receipt)
+        .await
+        .map_err(Into::into)
 }
 
 fn verify_retained(

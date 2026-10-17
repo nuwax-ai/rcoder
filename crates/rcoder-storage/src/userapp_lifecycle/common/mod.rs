@@ -12,6 +12,8 @@ pub(crate) use builder_registration::{
 mod activity_tests;
 #[cfg(test)]
 mod admission_cancellation_tests;
+#[cfg(all(test, any(feature = "userapp-turso", feature = "pg")))]
+mod builder_restart_stop_observation_tests;
 mod codec;
 mod compute;
 mod compute_execution;
@@ -421,6 +423,51 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         self.run(false, move |tx, backend| {
             Box::pin(async move {
                 compute_execution::resume_stopped_restart(tx, backend, &snapshot, &target).await
+            })
+        })
+        .await
+    }
+
+    async fn confirm_builder_restart_stopped(
+        &self,
+        snapshot: &ComputeControlRecord,
+        observation: &BuilderRestartStopObservation,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let observation = observation.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_execution::confirm_builder_restart_stopped(
+                    tx,
+                    backend,
+                    &snapshot,
+                    &observation,
+                )
+                .await
+            })
+        })
+        .await
+    }
+
+    async fn fail_unrebuildable_builder_restart(
+        &self,
+        snapshot: &ComputeControlRecord,
+        observation: &BuilderRestartStopObservation,
+        unavailable: Option<&BuilderRestartArchiveUnavailable>,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let observation = observation.clone();
+        let unavailable = unavailable.cloned();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_execution::fail_unrebuildable_builder_restart(
+                    tx,
+                    backend,
+                    &snapshot,
+                    &observation,
+                    unavailable.as_ref(),
+                )
+                .await
             })
         })
         .await

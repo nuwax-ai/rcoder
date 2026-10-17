@@ -21,6 +21,34 @@ fn lease_name(
 }
 
 impl DockerRuntime {
+    pub(crate) async fn resume_original_compute_file_lease(
+        &self,
+        context: &UserAppExecutionContext,
+        scope: UserAppOperationScope,
+        receipt: &UserAppOperationLeaseReceipt,
+    ) -> Result<Box<dyn shared_types::AppOperationLease>> {
+        let (family, name) = lease_name(context, scope)?;
+        receipt.validate().map_err(Error::ConfigurationError)?;
+        if receipt.service_type() != &family {
+            return Err(Error::Conflict(
+                "Original compute guard scope differs".into(),
+            ));
+        }
+        let path = ops::application_lease_root()
+            .await?
+            .join(".app-operation-locks")
+            .join(name);
+        let (receipt, executor) = (receipt.clone(), context.executor_id.clone());
+        // No UnclaimedBuilderLease wrapper: cancelling this observation may
+        // unlock its fd but must never clear an unknown operation's marker.
+        let guard = tokio::task::spawn_blocking(move || {
+            resume_original_builder_file(&path, &receipt, &executor)
+        })
+        .await
+        .map_err(|error| Error::DockerError(error.to_string()))??;
+        Ok(Box::new(guard))
+    }
+
     pub(crate) async fn prepare_compute_file_lease(
         &self,
         context: &UserAppExecutionContext,

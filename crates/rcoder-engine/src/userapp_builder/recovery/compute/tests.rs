@@ -260,3 +260,5 @@ async fn early_recovery_retains_held_foreign_and_unobserved_receipts_then_retrie
     .expect("explicit recovery completes original Stop");
     store.shutdown().await.unwrap();
 }
+
+mod restart_stop_tests;

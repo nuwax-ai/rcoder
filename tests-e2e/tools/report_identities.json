@@ -604,5 +604,11 @@
       "scenario": "userapp_compute_stop_timeout_recovery_contract",
       "backend": "compose"
     }
+  ],
+  "userapp_compute_late_stop_cid_absence_recovery_contract": [
+    {
+      "scenario": "userapp_compute_late_stop_cid_absence_recovery_contract",
+      "backend": "compose"
+    }
   ]
 }

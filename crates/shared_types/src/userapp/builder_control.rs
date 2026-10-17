@@ -127,6 +127,9 @@ impl<'de> Deserialize<'de> for BuilderControlTarget {
             // Private historical archive references only; no permission to
             // relax physical identity or unknown-write protection.
             builder_restart_template_history: Vec<serde_json::Value>,
+            #[serde(default)]
+            #[allow(dead_code)]
+            builder_restart_stop_observation: Option<serde_json::Value>,
         }
         let wire = Wire::deserialize(deserializer)?;
         Ok(Self {

@@ -9,6 +9,11 @@ pub trait AppOperationLease: Send + Sync {
     fn receipt(&self) -> Option<crate::UserAppOperationLeaseReceipt> {
         None
     }
+    /// Verify this live retained guard, not a second temporary flock probe.
+    /// Unsupported guards grant no recovery mutation authority.
+    async fn validate_retained(&self) -> Result<bool, String> {
+        Ok(false)
+    }
     async fn release(self: Box<Self>) -> Result<(), String>;
 }
 

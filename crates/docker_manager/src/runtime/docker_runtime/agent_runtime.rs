@@ -317,6 +317,13 @@ impl AgentContainerRuntime for DockerRuntime {
         self.reconcile_builder_stop(target).await
     }
 
+    async fn observe_builder_restart_stop(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderRestartStopKind>> {
+        self.observe_original_builder_restart_stop(target).await
+    }
+
     async fn reconcile_builder_compute_start(
         &self,
         target: &shared_types::BuilderControlTarget,

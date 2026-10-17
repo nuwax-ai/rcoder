@@ -867,5 +867,23 @@
     "compute stop timeout released reply resumes original operation",
     "compute stop timeout source stayed frozen",
     "compute stop timeout unknown period has no Start or Create"
+  ],
+  "userapp_compute_late_stop_cid_absence_recovery_contract": [
+    "compute failure contract process completed",
+    "compute failure contract reports full success",
+    "compute stop timeout corrected source rebuild serves HTTP",
+    "compute stop timeout delayed original Stop misses only the old CID",
+    "compute stop timeout durable checkpoint retains original physical intent",
+    "compute stop timeout expired original request preserves original recovery diagnostic",
+    "compute stop timeout frozen inputs verified",
+    "compute stop timeout isolated controller and real builder prepared",
+    "compute stop timeout one builder retains original data mounts",
+    "compute stop timeout original Stop request held before upstream",
+    "compute stop timeout original operation remains Stopping while reply unknown",
+    "compute stop timeout original source serves HTTP",
+    "compute stop timeout owned cleanup retains volumes",
+    "compute stop timeout released reply resumes original operation",
+    "compute stop timeout source stayed frozen",
+    "compute stop timeout unknown period has no Start or Create"
   ]
 }

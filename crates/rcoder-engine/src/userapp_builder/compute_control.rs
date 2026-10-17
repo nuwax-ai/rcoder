@@ -15,6 +15,7 @@ mod builder_start;
 use builder_start::prepare_start_options;
 mod failure;
 mod policy;
+mod restart_stop_recovery;
 mod stopped_template;
 
 const PREVIOUS_EXECUTIONS_DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
@@ -319,6 +320,17 @@ pub async fn recover(
         return Err(UserAppStoreError::VersionConflict.into());
     }
     let flight = state.userapp_op_flight.guard()?;
+    if restart_stop_recovery::eligible(&current) {
+        let (state, current_worker) = (state.clone(), current.clone());
+        tokio::spawn(async move {
+            let _flight = flight;
+            if let Err(error) = restart_stop_recovery::recover(&state, &current_worker).await {
+                tracing::warn!(%error, operation_id = %current_worker.operation_id,
+                    "Original Docker Restart stop recovery requires inspection");
+            }
+        });
+        return Ok(current.into());
+    }
     if policy::is_restart(current.action)
         && (current.stage == ComputeControlStage::Stopped.as_str()
             || (current.stage == ComputeControlStage::Starting.as_str()
@@ -359,11 +371,33 @@ pub async fn recover(
     Ok(current.into())
 }
 
+/// Shared by explicit same-operation recovery and the bounded background scan.
+/// Scheduling is not execution authority; the original runtime FD and store CAS
+/// remain mandatory inside the recovery worker.
+pub(crate) fn can_recover_original_docker_stop(record: &ComputeControlRecord) -> bool {
+    restart_stop_recovery::eligible(record)
+}
+
+pub(crate) async fn recover_original_docker_stop(
+    state: &AppState,
+    record: &ComputeControlRecord,
+) -> Result<()> {
+    restart_stop_recovery::recover(state, record).await
+}
+
 /// Recover a durable completion boundary or an exact atomic remote stop receipt.
 /// This path contains no start/stop/redeploy calls, even after a lost response.
 pub(crate) async fn recover_confirmed(
     state: &AppState,
     record: &ComputeControlRecord,
+) -> Result<ComputeControlRecord> {
+    recover_confirmed_with_guard(state, record, None).await
+}
+
+async fn recover_confirmed_with_guard(
+    state: &AppState,
+    record: &ComputeControlRecord,
+    held_guard: Option<&dyn AppOperationLease>,
 ) -> Result<ComputeControlRecord> {
     let observed_stop = !policy::is_restart(record.action)
         && record.stage == ComputeControlStage::Stopping.as_str();
@@ -376,7 +410,9 @@ pub(crate) async fn recover_confirmed(
             .lease
             .as_ref()
             .context("Compute completion recovery lease is missing")?;
-        if !state
+        if let Some(guard) = held_guard {
+            restart_stop_recovery::validate_guard(guard, record).await?;
+        } else if !state
             .runtime()
             .validate_app_operation_receipt(&context, receipt)
             .await?
@@ -579,7 +615,9 @@ pub(crate) async fn recover_confirmed(
     }
     // A release failure leaves terminal + receipt for the ordinary cleanup scan.
     // It must not turn the confirmed runtime outcome back into uncertainty.
-    if let Some(receipt) = &completed.lease {
+    if held_guard.is_none()
+        && let Some(receipt) = &completed.lease
+    {
         let context = completed.execution_context().map_err(anyhow::Error::msg)?;
         match state
             .runtime()
@@ -1466,8 +1504,17 @@ enum RestartContinuation {
 
 async fn run_restart_continuation(
     state: &AppState,
+    record: ComputeControlRecord,
+    prepared: RestartContinuation,
+) -> Result<()> {
+    run_restart_continuation_with_guard(state, record, prepared, None).await
+}
+
+async fn run_restart_continuation_with_guard(
+    state: &AppState,
     mut record: ComputeControlRecord,
     prepared: RestartContinuation,
+    held_guard: Option<&dyn AppOperationLease>,
 ) -> Result<()> {
     let context = record.execution_context().map_err(anyhow::Error::msg)?;
     let mut checkpoint = match &prepared {
@@ -1501,6 +1548,9 @@ async fn run_restart_continuation(
             .userapp_store
             .check_compute_executor(&identity)
             .await?;
+        if let Some(guard) = held_guard {
+            restart_stop_recovery::validate_guard(guard, &record).await?;
+        }
         match &prepared {
             RestartContinuation::Prod(target) => {
                 unknown_write = true;
@@ -1549,7 +1599,7 @@ async fn run_restart_continuation(
         .await?;
         // Readiness may still be pending. Persisted Verifying lets the existing
         // scanner finish later without launching a second startup.
-        recover_confirmed(state, &record).await?;
+        recover_confirmed_with_guard(state, &record, held_guard).await?;
         // The restart reached its terminal boundary; the private archive has
         // no remaining recovery value. Records that crash before this point
         // stay covered by the scan-based GC instead.
@@ -1776,18 +1826,43 @@ pub(crate) async fn reconcile_superseded(
 }
 
 async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord) -> Result<()> {
+    resume_builder_start_with_guard(state, snapshot, None).await
+}
+
+async fn original_continuation_lease_current(
+    state: &AppState,
+    snapshot: &ComputeControlRecord,
+    held_guard: Option<&dyn AppOperationLease>,
+) -> Result<bool> {
+    if let Some(guard) = held_guard {
+        restart_stop_recovery::validate_guard(guard, snapshot).await?;
+        return Ok(true);
+    }
+    let context = snapshot.execution_context().map_err(anyhow::Error::msg)?;
+    let receipt = snapshot
+        .lease
+        .as_ref()
+        .context("Builder continuation lease missing")?;
+    state
+        .runtime()
+        .validate_app_operation_receipt(&context, receipt)
+        .await
+        .map_err(Into::into)
+}
+
+async fn resume_builder_start_with_guard(
+    state: &AppState,
+    snapshot: &ComputeControlRecord,
+    held_guard: Option<&dyn AppOperationLease>,
+) -> Result<()> {
     let mut continuing = snapshot.clone();
     let context = snapshot.execution_context().map_err(anyhow::Error::msg)?;
     let receipt = snapshot
         .lease
         .as_ref()
         .context("Builder continuation lease missing")?;
-    if !state
-        .runtime()
-        .validate_app_operation_receipt(&context, receipt)
-        .await?
-    {
-        recover_confirmed(state, snapshot).await?;
+    if !original_continuation_lease_current(state, snapshot, held_guard).await? {
+        recover_confirmed_with_guard(state, snapshot, held_guard).await?;
         return Ok(());
     }
     // Result observation needs only the original submitted identity. New
@@ -1844,17 +1919,14 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
             RestartContinuation::Dev(old.clone())
         };
         ensure!(
-            state
-                .runtime()
-                .validate_app_operation_receipt(&context, receipt)
-                .await?,
+            original_continuation_lease_current(state, snapshot, held_guard).await?,
             "Original missing builder lease changed before continuation claim"
         );
         let record = state
             .userapp_store
             .resume_builder_restart_start(snapshot, &old)
             .await?;
-        return run_restart_continuation(state, record, prepared).await;
+        return run_restart_continuation_with_guard(state, record, prepared, held_guard).await;
     }
     let target = if snapshot.stage == ComputeControlStage::Starting.as_str() {
         if state
@@ -1863,7 +1935,7 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
             .await?
             .is_some()
         {
-            recover_confirmed(state, snapshot).await?;
+            recover_confirmed_with_guard(state, snapshot, held_guard).await?;
             return Ok(());
         }
         state
@@ -1896,14 +1968,26 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
                 .builder_image_replacement_needed(&fresh)
                 .await?
         {
-            let (captured, template) = stopped_template::prepare(
-                state.runtime().as_ref(),
-                state.userapp_store.as_ref(),
-                snapshot,
-                &old,
-                &fresh,
-            )
-            .await?;
+            let (captured, template) = if held_guard.is_some() {
+                stopped_template::prepare_with_guard(
+                    state.runtime().as_ref(),
+                    state.userapp_store.as_ref(),
+                    snapshot,
+                    &old,
+                    &fresh,
+                    held_guard,
+                )
+                .await?
+            } else {
+                stopped_template::prepare(
+                    state.runtime().as_ref(),
+                    state.userapp_store.as_ref(),
+                    snapshot,
+                    &old,
+                    &fresh,
+                )
+                .await?
+            };
             continuing = captured;
             // The durable stopped boundary already confirms old compute exited.
             // Restore only a zero-replica controller; the CAS below must succeed
@@ -1930,10 +2014,7 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
         "Builder Pod appeared before continuation"
     );
     ensure!(
-        state
-            .runtime()
-            .validate_app_operation_receipt(&context, receipt)
-            .await?,
+        original_continuation_lease_current(state, &continuing, held_guard).await?,
         "Builder lease changed before continuation claim"
     );
     let prepared = builder_compute_checkpoint(state, &target, true).await?;
@@ -1942,7 +2023,8 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
         .userapp_store
         .resume_builder_restart_start(&continuing, &target)
         .await?;
-    run_restart_continuation(state, record, RestartContinuation::Dev(target)).await
+    run_restart_continuation_with_guard(state, record, RestartContinuation::Dev(target), held_guard)
+        .await
 }
 
 /// Only a captured Kubernetes dev workload receives directory convergence.

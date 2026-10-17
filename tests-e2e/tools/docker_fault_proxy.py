@@ -30,6 +30,7 @@ GATED = False
 OWNED_CONTAINERS = {}
 OWNED_EXECS = {}
 OWNED_ALIASES = {}
+OWNED_AUTO_REMOVE = {}
 STOPPED_CONTAINERS = set()
 COMPUTE_MODES = frozenset({'compute_stopped', 'compute_stop_timeout'})
 STOP_REPLY_HOLD_SECONDS = 180
@@ -72,6 +73,7 @@ def container_owned(identifier, *, allow_known_absent=False):
         if owned:
             with GATE_LOCK:
                 OWNED_ALIASES[identifier] = info['Id']
+                OWNED_AUTO_REMOVE[info['Id']] = (info.get('HostConfig') or {}).get('AutoRemove')
         return owned
     finally:
         connection.close()
@@ -207,6 +209,132 @@ def gate(stage, path, status=None):
         raise ConnectionAbortedError('fault controller discarded this request')
 
 
+def observe_exact_old_cid_absence(cid, seconds=15):
+    """Real upstream GET by captured ID; errors never become fake absence."""
+    deadline = time.monotonic() + seconds
+    statuses = []
+    while True:
+        connection, response = exchange('GET', '/containers/' + urllib.parse.quote(cid, safe='') + '/json')
+        try:
+            statuses.append(response.status)
+            if response.status == 404:
+                return {'container_id': cid, 'status': 404, 'observed_statuses': statuses}
+            if response.status != 200:
+                raise ValueError('Original Docker CID absence is not confirmed')
+            actual = json.loads(response.read())
+            if actual.get('Id') != cid:
+                raise ValueError('Original Docker CID inspection changed identity')
+        finally:
+            connection.close()
+        if time.monotonic() >= deadline:
+            return {'container_id': cid, 'status': statuses[-1], 'observed_statuses': statuses}
+        time.sleep(.05)
+
+
+def stop_captured_fault_actor(cid):
+    """One independent real Stop, outside the platform request audit/retries."""
+    arm = json.loads((ROOT / 'compute-arm.json').read_text())
+    if (MODE != 'compute_stop_timeout' or arm.get('stop_window') != 'before_write'
+            or arm.get('container_id') != cid or len(cid) != 64
+            or any(c not in '0123456789abcdef' for c in cid)):
+        raise ValueError('Independent Stop requires the original captured full CID')
+    connection, response = exchange('GET', '/containers/' + cid + '/json')
+    try:
+        if response.status != 200:
+            raise ValueError('Independent Stop target is not physically present')
+        actual = json.loads(response.read())
+    finally:
+        connection.close()
+    labels = actual.get('Config', {}).get('Labels') or {}
+    if (actual.get('Id') != cid or labels.get('rcoder.io/application-id') != APP
+            or labels.get('rcoder.io/lifecycle-id') != arm['lifecycle_id']
+            or labels.get('service-type') != 'user-app-builder'
+            or actual.get('HostConfig', {}).get('AutoRemove') is not True
+            or actual.get('State', {}).get('Running') is not True):
+        raise ValueError('Independent Stop target ownership/AutoRemove changed')
+    path = '/containers/' + cid + '/stop?t=1'
+    # Exclusive attempt publication also forbids a fixture retry after an
+    # unknown transport result. There is no Docker SDK retry layer here.
+    with (ROOT / 'compute-fault-actor-attempt.json').open('x') as output:
+        os.chmod(output.name, 0o600)
+        json.dump({'container_id': cid, 'lifecycle_id': arm['lifecycle_id'],
+                   'method': 'POST', 'path': path, 'stop_request_count': 1}, output)
+    connection, response = exchange('POST', path)
+    try:
+        status = response.status
+        response.read()
+        if status not in (204, 304):
+            raise ValueError('Independent Stop did not receive a real acknowledgement')
+    finally:
+        connection.close()
+    return {'captured_container_id': cid, 'actual_auto_remove': True,
+            'distinct_from_original_platform_request': True,
+            'fault_actor_stop_request_count': 1, 'sdk_retry_layer': False,
+            'method': 'POST', 'path': path, 'upstream_status': status,
+            'actual_old_cid_inspection': observe_exact_old_cid_absence(cid)}
+
+
+def hold_timeout_checkpoint_read(method, path):
+    """Pause one owned recovery read for the formal offline observation.
+
+    The original Stop still reaches its real 120s client timeout. Only after
+    that failure is durable can a background recovery GET reach this barrier.
+    No Docker result is fabricated, and no mutation is delayed by this gate.
+    """
+    arm_path = ROOT / 'compute-arm.json'
+    if MODE != 'compute_stop_timeout' or method != 'GET' or not arm_path.exists():
+        return
+    arm = json.loads(arm_path.read_text())
+    if arm.get('observe_timeout_checkpoint') is not True:
+        return
+    if (ROOT / 'compute-timeout-observation-release.json').exists():
+        return  # The offline observation is over; fresh recovery reads are real.
+    cid, life = arm['container_id'], arm['lifecycle_id']
+    parts = urllib.parse.urlsplit(path).path.strip('/').split('/')
+    if parts and parts[0].startswith('v1.'):
+        parts = parts[1:]
+    if parts != ['containers', cid, 'json']:
+        return
+    operation_path = ROOT / 'compute-operation.json'
+    if not operation_path.exists():
+        return
+    operation_id = json.loads(operation_path.read_text())['operation_id']
+    with GATE_LOCK:
+        if OWNED_CONTAINERS.get(cid) != life:
+            raise ValueError('Checkpoint barrier lost the original physical ownership')
+    with urllib.request.urlopen('http://rcoder:8090/computer/pod/operations/'
+            + urllib.parse.quote(APP, safe='') + '/' + urllib.parse.quote(operation_id, safe=''), timeout=5) as response:
+        envelope = json.load(response)
+    operation = envelope.get('data') or {}
+    if (envelope.get('code') != '0000' or operation.get('app_id') != APP
+            or operation.get('lifecycle_id') != life or operation.get('operation_id') != operation_id):
+        raise ValueError('Checkpoint barrier observed another operation')
+    if operation.get('state') != 'recovery_required' or operation.get('stage') != 'stopping':
+        return
+    if not operation.get('error_code') or not operation.get('error_message'):
+        raise ValueError('Checkpoint barrier observed no real failure diagnostic')
+    held = ROOT / 'compute-timeout-observation.json'
+    with GATE_LOCK:
+        if not held.exists():
+            temporary = ROOT / 'compute-timeout-observation.tmp'
+            with temporary.open('x') as output:
+                json.dump({'operation': operation, 'container_id': cid, 'lifecycle_id': life,
+                    'method': method, 'path': path, 'read_held_before_upstream': True}, output)
+            temporary.chmod(0o600)
+            temporary.replace(held)
+    release = ROOT / 'compute-timeout-observation-release.json'
+    deadline = time.monotonic() + 180
+    while not release.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError('Offline checkpoint observation did not release its owned read')
+        time.sleep(.02)
+    action = json.loads(release.read_text()).get('action')
+    if action == 'discard':
+        raise ConnectionAbortedError('Original controller stopped before its observation read completed')
+    if action != 'continue':
+        raise ValueError('Checkpoint observation release action is invalid')
+
+
 def hold_compute_stop_reply(method, path, status):
     """Withhold only an already-completed real Stop response, never its write.
 
@@ -224,6 +352,8 @@ def hold_compute_stop_reply(method, path, status):
     if len(segments) != 3 or segments[0] != 'containers' or segments[2] != 'stop' or not arm_path.exists():
         return
     arm = json.loads(arm_path.read_text())
+    if arm.get('stop_window') == 'before_write':
+        return  # This distinct fixture withholds the original request, not its reply.
     cid, life = arm['container_id'], arm['lifecycle_id']
     if segments[1] != cid or status not in (204, 304):
         raise ValueError('Stop timeout must capture the exact successful real Stop')
@@ -252,6 +382,10 @@ def hold_compute_stop_reply(method, path, status):
              'operation': operation, 'method': method, 'path': path,
              'upstream_status': status, 'upstream_completed': True,
              'response_released': False, 'held_at_monotonic': time.monotonic()}
+    with GATE_LOCK:
+        event['actual_auto_remove'] = OWNED_AUTO_REMOVE.get(cid)
+    event['old_cid_inspection'] = (observe_exact_old_cid_absence(cid)
+        if event['actual_auto_remove'] is True else None)
     with GATE_LOCK:
         # A second actual Stop must be visible as a failure, not silently gated.
         held = ROOT / 'compute-stop-held.json'
@@ -283,6 +417,64 @@ def hold_compute_stop_reply(method, path, status):
             json.dump(event, output)
         temporary.chmod(0o600)
         temporary.replace(settled)
+
+
+def hold_original_stop_request(method, path):
+    """A real late-write counterexample: do not submit the one original Stop yet."""
+    arm_path = ROOT / 'compute-arm.json'
+    if MODE != 'compute_stop_timeout' or method != 'POST' or not arm_path.exists():
+        return False
+    arm = json.loads(arm_path.read_text())
+    if arm.get('stop_window') != 'before_write':
+        return False
+    cid, life = arm['container_id'], arm['lifecycle_id']
+    parts = urllib.parse.urlsplit(path).path.strip('/').split('/')
+    if parts and parts[0].startswith('v1.'):parts = parts[1:]
+    if parts != ['containers', cid, 'stop']:
+        return False
+    with GATE_LOCK:
+        if OWNED_CONTAINERS.get(cid) != life or OWNED_AUTO_REMOVE.get(cid) is not True:
+            raise ValueError('Late Stop requires the captured real AutoRemove container')
+    deadline = time.monotonic() + 15
+    while not (ROOT / 'compute-operation.json').exists():
+        if time.monotonic() >= deadline:raise TimeoutError('Original operation is not published')
+        time.sleep(.02)
+    operation_id = json.loads((ROOT / 'compute-operation.json').read_text())['operation_id']
+    with urllib.request.urlopen('http://rcoder:8090/computer/pod/operations/'
+            + urllib.parse.quote(APP, safe='') + '/' + urllib.parse.quote(operation_id, safe=''), timeout=5) as response:
+        operation = (json.load(response).get('data') or {})
+    if (operation.get('app_id') != APP or operation.get('lifecycle_id') != life
+            or operation.get('operation_id') != operation_id or operation.get('stage') != 'stopping'):
+        raise ValueError('Late Stop request does not belong to the original checkpoint')
+    event = {'app_id': APP, 'container_id': cid, 'lifecycle_id': life, 'operation': operation,
+        'actual_auto_remove': True, 'request_held_before_upstream': True,
+        'upstream_submitted': False, 'upstream_completed': False, 'response_released': False}
+    held = ROOT / 'compute-stop-held.json'
+    with GATE_LOCK:
+        with held.open('x') as output:json.dump(event, output)
+        held.chmod(0o600)
+    deadline = time.monotonic() + 420  # fixture budget only; production timeout stays 120s
+    while not (ROOT / 'compute-stop-release.json').exists():
+        if time.monotonic() >= deadline:raise TimeoutError('Original late Stop was not released')
+        time.sleep(.02)
+    action = json.loads((ROOT / 'compute-stop-release.json').read_text()).get('action')
+    if action == 'discard':
+        event['release_action'] = action
+        (ROOT / 'compute-stop-settled.json').write_text(json.dumps(event))
+        (ROOT / 'compute-stop-settled.json').chmod(0o600)
+        raise ConnectionAbortedError('Original controller stopped before the held request was submitted')
+    if action != 'continue':raise ValueError('Invalid original Stop release action')
+    return True
+
+
+def record_late_stop_result(path, status):
+    arm = json.loads((ROOT / 'compute-arm.json').read_text())
+    event = {'container_id': arm['container_id'], 'lifecycle_id': arm['lifecycle_id'],
+        'method': 'POST', 'path': urllib.parse.urlsplit(path).path,
+        'request_held_before_upstream': True, 'upstream_submitted': True,
+        'upstream_completed': True, 'upstream_status': status, 'response_released': True}
+    with (ROOT / 'compute-stop-settled.json').open('x') as output:json.dump(event, output)
+    (ROOT / 'compute-stop-settled.json').chmod(0o600)
 
 
 def audit_proxy_error(method, path, error):
@@ -370,6 +562,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 result_recorded = True
                 self.send_error(403, 'Mutation outside the owned fault scenario')
                 return
+            hold_timeout_checkpoint_read(self.command, self.path)
             marker = compute_fault(self.command, self.path)
             if marker:
                 payload = json.dumps({'message': marker}).encode()
@@ -393,7 +586,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                 and '/exec/' in path and path.endswith('/start'))
             if owned_exec_start and self.headers.get('Connection'):
                 headers['Connection'] = self.headers['Connection']
+            delayed_original_stop = hold_original_stop_request(self.command, self.path)
             connection, response = exchange(self.command, self.path, body, headers)
+            if delayed_original_stop:
+                record_late_stop_result(self.path, response.status)
             payload = None
             if self.command == 'POST' and path.endswith('/containers/create') and response.status == 201:
                 payload = response.read()

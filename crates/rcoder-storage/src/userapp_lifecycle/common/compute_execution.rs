@@ -699,6 +699,260 @@ async fn finalize_observed(
     finalize_confirmed(tx, backend, &confirmed).await
 }
 
+/// Only a runtime-adapter observation under the original FD lease may bridge
+/// Docker Restart/Stopping. This transaction does not restore, create, start,
+/// release the lease, or manufacture the missing Stop acknowledgement.
+pub(super) async fn confirm_builder_restart_stopped(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    snapshot: &ComputeControlRecord,
+    observation: &BuilderRestartStopObservation,
+) -> Result<ComputeControlRecord, Error> {
+    repo::claim_app(tx, backend, &snapshot.app_id).await?;
+    observation.validate().map_err(Error::InvalidOperation)?;
+    let context = snapshot
+        .execution_context()
+        .map_err(|error| invalid(&error))?;
+    let identity = ComputeExecutorIdentity {
+        app_id: snapshot.app_id.clone(),
+        lifecycle_id: snapshot.lifecycle_id.clone(),
+        scope: snapshot.scope,
+        operation_id: snapshot.operation_id.clone(),
+        generation: snapshot.generation,
+        executor_id: context.executor_id.clone(),
+    };
+    let lease = snapshot.lease.as_ref().ok_or(Error::VersionConflict)?;
+    validate_receipt(&identity, lease)?;
+    let docker_lease = match lease {
+        UserAppOperationLeaseReceipt::Docker { service_type, .. } => {
+            service_type == &ServiceType::UserappBuilder
+        }
+        UserAppOperationLeaseReceipt::Kubernetes { .. } => false,
+    };
+    let original =
+        BuilderControlTarget::from_observation_checkpoint(&snapshot.checkpoint).map_err(storage)?;
+    let volumes: Vec<AppResourceIdentity> = serde_json::from_value(
+        snapshot
+            .checkpoint
+            .get("builder_volumes")
+            .cloned()
+            .ok_or_else(|| invalid("Original builder mount witness missing"))?,
+    )
+    .map_err(storage)?;
+    let eligible_state = match snapshot.state {
+        ComputeControlState::Running | ComputeControlState::RecoveryRequired => true,
+        ComputeControlState::Pending
+        | ComputeControlState::Succeeded
+        | ComputeControlState::Failed
+        | ComputeControlState::Superseded => false,
+    };
+    if snapshot.scope != UserAppOperationScope::Dev
+        || snapshot.action != ComputeControlAction::Restart
+        || snapshot.stage != "stopping"
+        || !eligible_state
+        || !docker_lease
+        || original != observation.target
+        || original.context != context
+        || volumes != observation.volumes
+    {
+        return Err(invalid("Invalid original Docker Restart stop observation"));
+    }
+    // Exact equality protects the original target, archive reference, mounts,
+    // lease, diagnostics, executor and revision against every stale observer.
+    if compute::current(tx, &identity).await? != *snapshot {
+        return Err(Error::VersionConflict);
+    }
+    drained(tx, snapshot).await?;
+    let revision = snapshot
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| invalid("Compute revision exhausted"))?;
+    let mut checkpoint = snapshot.checkpoint.clone();
+    let object = checkpoint
+        .as_object_mut()
+        .ok_or_else(|| invalid("Builder checkpoint must be an object"))?;
+    let previous_observation = object.get(BUILDER_RESTART_STOP_OBSERVATION_KEY).cloned();
+    object.insert(
+        BUILDER_RESTART_STOP_OBSERVATION_KEY.into(),
+        serde_json::to_value(BuilderRestartStopRecoveryEvidence {
+            observation: observation.clone(),
+            original_state: snapshot.state,
+            original_error_code: snapshot.error_code.clone(),
+            original_error_message: snapshot.error_message.clone(),
+            original_restart_template: snapshot.checkpoint.get("builder_restart_template").cloned(),
+            unrebuildable: None,
+            previous_observation,
+        })
+        .map_err(storage)?,
+    );
+    let changed = toasty::sql::statement(repo::sql(backend,
+        "UPDATE userapp_compute_controls SET stage='stopped',checkpoint_json=$3,revision=$6,updated_at_us=$4 WHERE operation_id=$1 AND revision=$2 AND executor_id=$5 AND stage='stopping' AND state IN ('running','recovery_required')"))
+        .bind(&snapshot.operation_id).bind(snapshot.revision)
+        .bind(serde_json::to_string(&checkpoint).map_err(storage)?)
+        .bind(chrono::Utc::now().timestamp_micros()).bind(&context.executor_id).bind(revision)
+        .exec(tx).await.map_err(storage)?;
+    if changed != 1 {
+        return Err(Error::VersionConflict);
+    }
+    compute::current(tx, &identity).await
+}
+
+/// Exact old-CID absence closes an unrebuildable pre-restore Stopping execution.
+/// An already-Stopped row can hide an unknown Create and cannot be settled here.
+/// This submits no current Source work and preserves the opaque old recipe.
+pub(super) async fn fail_unrebuildable_builder_restart(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    snapshot: &ComputeControlRecord,
+    observation: &BuilderRestartStopObservation,
+    unavailable: Option<&BuilderRestartArchiveUnavailable>,
+) -> Result<ComputeControlRecord, Error> {
+    repo::claim_app(tx, backend, &snapshot.app_id).await?;
+    observation.validate().map_err(Error::InvalidOperation)?;
+    let context = snapshot
+        .execution_context()
+        .map_err(|error| invalid(&error))?;
+    let identity = ComputeExecutorIdentity {
+        app_id: snapshot.app_id.clone(),
+        lifecycle_id: snapshot.lifecycle_id.clone(),
+        scope: snapshot.scope,
+        operation_id: snapshot.operation_id.clone(),
+        generation: snapshot.generation,
+        executor_id: context.executor_id.clone(),
+    };
+    let lease = snapshot.lease.as_ref().ok_or(Error::VersionConflict)?;
+    validate_receipt(&identity, lease)?;
+    let docker_lease = match lease {
+        UserAppOperationLeaseReceipt::Docker { service_type, .. } => {
+            service_type == &ServiceType::UserappBuilder
+        }
+        UserAppOperationLeaseReceipt::Kubernetes { .. } => false,
+    };
+    let original =
+        BuilderControlTarget::from_observation_checkpoint(&snapshot.checkpoint).map_err(storage)?;
+    let volumes: Vec<AppResourceIdentity> = serde_json::from_value(
+        snapshot
+            .checkpoint
+            .get("builder_volumes")
+            .cloned()
+            .ok_or_else(|| invalid("Original builder mounts missing"))?,
+    )
+    .map_err(storage)?;
+    let eligible_state = match snapshot.state {
+        ComputeControlState::Running | ComputeControlState::RecoveryRequired => true,
+        ComputeControlState::Pending
+        | ComputeControlState::Succeeded
+        | ComputeControlState::Failed
+        | ComputeControlState::Superseded => false,
+    };
+    if snapshot.scope != UserAppOperationScope::Dev
+        || snapshot.action != ComputeControlAction::Restart
+        || snapshot.stage != "stopping"
+        || !eligible_state
+        || !docker_lease
+        || observation.kind != BuilderRestartStopKind::CapturedContainerAbsent
+        || original != observation.target
+        || original.context != context
+        || volumes != observation.volumes
+    {
+        return Err(invalid(
+            "Unrebuildable restart requires original pre-start Docker Container absence",
+        ));
+    }
+    let reference = snapshot.checkpoint.get("builder_restart_template").cloned();
+    let reason = match &reference {
+        None if unavailable.is_none() => BuilderRestartUnrebuildableReason::MissingArchive,
+        None => {
+            return Err(invalid(
+                "Unavailable recipe witness has no original reference",
+            ));
+        }
+        Some(value) => match serde_json::from_value::<BuilderRestartTemplate>(value.clone()) {
+            Err(_) if unavailable.is_none() => BuilderRestartUnrebuildableReason::UnreadableArchive,
+            Err(_) => {
+                return Err(invalid(
+                    "Unavailable recipe witness cannot replace an unreadable reference",
+                ));
+            }
+            Ok(template)
+                if template.source != original
+                    || template.volumes != volumes
+                    || template.archive.kind != AppResourceKind::File
+                    || template.archive.name.is_empty()
+                    || template.archive.uid.is_empty() =>
+            {
+                if unavailable.is_some() {
+                    return Err(invalid(
+                        "An unbound historical recipe cannot borrow a runtime witness",
+                    ));
+                }
+                // It cannot be decoded as this original operation's recipe;
+                // preserve it, and never inspect another application's archive.
+                BuilderRestartUnrebuildableReason::UnreadableArchive
+            }
+            Ok(template) => {
+                let witness = unavailable.ok_or_else(|| {
+                    invalid("A readable recipe needs positive runtime unavailability")
+                })?;
+                match witness.kind {
+                    BuilderRestartArchiveUnavailableKind::PositiveUnavailable => {}
+                }
+                if witness.template != template
+                    || serde_json::to_value(&witness.template).map_err(storage)? != *value
+                    || witness.template.source != original
+                    || witness.template.volumes != volumes
+                    || witness.template.archive.kind != AppResourceKind::File
+                    || witness.template.archive.name.is_empty()
+                    || witness.template.archive.uid.is_empty()
+                {
+                    return Err(invalid(
+                        "Unavailable recipe witness differs from the original private archive",
+                    ));
+                }
+                BuilderRestartUnrebuildableReason::ArchiveUnavailable
+            }
+        },
+    };
+    if compute::current(tx, &identity).await? != *snapshot {
+        return Err(Error::VersionConflict);
+    }
+    drained(tx, snapshot).await?;
+    let mut checkpoint = snapshot.checkpoint.clone();
+    let mut evidence = BuilderRestartStopRecoveryEvidence {
+        observation: observation.clone(),
+        original_state: snapshot.state,
+        original_error_code: snapshot.error_code.clone(),
+        original_error_message: snapshot.error_message.clone(),
+        original_restart_template: reference,
+        unrebuildable: None,
+        previous_observation: checkpoint
+            .get(BUILDER_RESTART_STOP_OBSERVATION_KEY)
+            .cloned(),
+    };
+    evidence.unrebuildable = Some(BuilderRestartUnrebuildableEvidence {
+        reason,
+        observation: observation.clone(),
+        archive_unavailable: unavailable.cloned(),
+    });
+    checkpoint[BUILDER_RESTART_STOP_OBSERVATION_KEY] =
+        serde_json::to_value(evidence).map_err(storage)?;
+    let revision = snapshot
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| invalid("Compute revision exhausted"))?;
+    let changed = toasty::sql::statement(repo::sql(backend,
+        "UPDATE userapp_compute_controls SET state='failed',stage='stopped',checkpoint_json=$3,revision=$4,updated_at_us=$5,terminal_at_us=$5 WHERE operation_id=$1 AND revision=$2 AND executor_id=$6 AND stage='stopping' AND state IN ('running','recovery_required')"))
+        .bind(&snapshot.operation_id).bind(snapshot.revision).bind(serde_json::to_string(&checkpoint).map_err(storage)?)
+        .bind(revision).bind(chrono::Utc::now().timestamp_micros()).bind(&context.executor_id)
+        .exec(tx).await.map_err(storage)?;
+    if changed != 1 {
+        return Err(Error::VersionConflict);
+    }
+    compute::get(tx, &snapshot.app_id, &snapshot.operation_id)
+        .await?
+        .ok_or(Error::NotFound)
+}
+
 /// Atomically assigns the remaining start step, preserving operation and lease.
 pub(super) async fn resume_stopped_restart(
     tx: &mut dyn Executor,
@@ -1012,6 +1266,14 @@ pub(super) async fn resume_builder_restart(
     }
     if let Some(mode) = snapshot.checkpoint.get("builder_startup_mode") {
         checkpoint["builder_startup_mode"] = mode.clone();
+    }
+    // Historical observation JSON is diagnostic during an existing Stopped
+    // continuation, not a prerequisite to its original physical/lease CAS.
+    if let Some(value) = snapshot
+        .checkpoint
+        .get(BUILDER_RESTART_STOP_OBSERVATION_KEY)
+    {
+        checkpoint[BUILDER_RESTART_STOP_OBSERVATION_KEY] = value.clone();
     }
     let changed = toasty::sql::statement(repo::sql(backend,
         "UPDATE userapp_compute_controls SET state='running',stage='starting',checkpoint_json=$4,error_code=NULL,error_message=NULL,revision=$3 WHERE operation_id=$1 AND revision=$2"))

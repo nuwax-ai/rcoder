@@ -4,8 +4,11 @@
 The proxy injects a failed Docker GET only after reading the same operation's
 persisted Stopped phase. Docker stop/confirmation and all successful responses
 are real. stop_reply_timeout instead forwards Stop, withholds its completed
-response until the unchanged client times out, and reads its private checkpoint
-only with the formal offline same-engine observer after stopping the controller.
+response until the unchanged client times out; before_write instead holds the
+one original request until an independent fault actor has stopped its exact CID.
+The private checkpoint is read only with the formal offline same-engine observer
+after stopping the controller. A scoped recovery-read barrier makes this
+observation independent of how quickly the real background worker resumes.
 This does not claim coverage of the Starting storage preflight: that
 Docker check uses host paths, and needs separate storage/runtime fixtures.
 Requires E2E_COMPUTE_BUILD_RECEIPT with source_identity plus immutable rcoder /
@@ -61,6 +64,19 @@ STOP_TIMEOUT_STEPS = {
 }
 FAULT_MODES = {'stopped_read': 'compute_stopped', 'stop_reply_timeout': 'compute_stop_timeout'}
 DOCKER_CLIENT_TIMEOUT_SECONDS = 120  # unchanged DockerManager socket client
+
+def timeout_step_name(name, window):
+    if window == 'before_write':
+        return name.replace('real Stop completed before held reply', 'original Stop request held before upstream').replace(
+            'expired reply preserves', 'expired original request preserves')
+    return name
+
+
+def stop_fault_window(environment):
+    value = environment.get('E2E_COMPUTE_STOP_WINDOW', 'after_response')
+    if value not in ('after_response', 'before_write'):
+        raise ValueError('unsupported E2E_COMPUTE_STOP_WINDOW')
+    return value
 
 TASK_STATUSES = frozenset({'pending', 'running', 'completed', 'failed', 'cancelled'})
 COMPUTE_STATES = frozenset({'pending', 'running', 'recovery_required', 'succeeded', 'failed', 'superseded'})
@@ -159,7 +175,8 @@ def compute_write_counts(writes):
     return len(stops), len(starts)
 
 
-def validate_timeout_write_window(writes, results, *, old_id, new_id, app, lifecycle):
+def validate_timeout_write_window(writes, results, *, old_id, new_id, app, lifecycle,
+                                  original_stop_statuses=(204, 304)):
     """Audit attempts through recovered-source HTTP, not just successful writes.
 
     Retries are deliberately counted as additional dispatches. There is no
@@ -197,7 +214,7 @@ def validate_timeout_write_window(writes, results, *, old_id, new_id, app, lifec
                 raise ValueError('write audit creation is not the captured replacement')
         elif len(parts) == 3 and parts[0] == 'containers' and parts[2] == 'stop' and method == 'POST':
             counts['stop'] += 1
-            if parts[1] != old_id or result.get('container_id') != old_id or status not in (204, 304):
+            if parts[1] != old_id or result.get('container_id') != old_id or status not in original_stop_statuses:
                 raise ValueError('write audit Stop does not target the original full ID')
         elif len(parts) == 3 and parts[0] == 'containers' and parts[2] == 'start' and method == 'POST':
             counts['start'] += 1
@@ -232,7 +249,8 @@ def validate_timeout_write_window(writes, results, *, old_id, new_id, app, lifec
             'all_targets_captured': True, 'all_upstream_results_observed': True}
 
 
-def validate_timeout_checkpoint(snapshot, *, app, lifecycle, operation, request, captured_id):
+def validate_timeout_checkpoint(snapshot, *, app, lifecycle, operation, request, captured_id,
+                                original_error=None):
     """Private offline-reader contract, never a SQLite read of a live Turso DB."""
     if (not isinstance(snapshot, dict) or snapshot.get('version') != 1 or snapshot.get('read_only') is not True
             or snapshot.get('controller_stopped') is not True):
@@ -261,7 +279,32 @@ def validate_timeout_checkpoint(snapshot, *, app, lifecycle, operation, request,
         raise ValueError('checkpoint lost the original captured target, executor or lease')
     if not record.get('error_code') or not record.get('error_message'):
         raise ValueError('checkpoint reader lost the original failure diagnostic')
+    if original_error is not None and (record['error_code'], record['error_message']) != original_error:
+        raise ValueError('checkpoint reader changed the observed original failure diagnostic')
     return record
+
+
+def release_timeout_observation(control, action):
+    """Release only the test-side read gate after its controller has stopped."""
+    if not control.exists():
+        return
+    release = control / 'compute-timeout-observation-release.json'
+    if not release.exists():
+        publish_fault_config(release, {'action': action})
+
+
+def wait_timeout_diagnostic(api, path, control, deadline):
+    """Accept a captured transient failure, not a permanently frozen state."""
+    while True:
+        observed = control / 'compute-timeout-observation.json'
+        result = (json.loads(observed.read_text())['operation'] if observed.exists()
+                  else deadline.request(api, path))
+        value = checked_state(result, 'state', COMPUTE_STATES, deadline.label)
+        if value == 'recovery_required':
+            return result
+        if value in {'failed', 'succeeded', 'superseded'}:
+            raise RuntimeError('original Stop diagnostic was not captured before automatic recovery')
+        deadline.pause(.5)
 
 
 def settle_stop_reply(control, action, deadline):
@@ -373,6 +416,7 @@ def cleanup(root, run_id, case_id, existing_ids=()):
                 if actual['Id'] != row['Id'] or actual['State']['Running']:
                     raise RuntimeError('cannot release a held reply while its original controller runs')
         settle_stop_reply(root / 'control', 'discard', PhaseDeadline(20, 'cleanup held Stop reply'))
+        release_timeout_observation(root / 'control', 'discard')
     for row in builder_rows(receipt):
         if row['Id'] in existing_ids:
             raise ValueError('compute cleanup cannot remove a preexisting builder')
@@ -402,6 +446,9 @@ def main():
     reader = source_root / 'tests-e2e/tools/compute_checkpoint_snapshot.py'
     if observer_sha256 and not reader.is_file():
         raise ValueError('Stop timeout requires the frozen formal compute checkpoint helper')
+    window = stop_fault_window(os.environ)
+    if window == 'before_write' and mode != 'stop_reply_timeout':
+        raise ValueError('the late original Stop fixture requires the timeout contract')
     run_id, case_id = os.environ['E2E_RUN_ID'], os.environ['E2E_CASE_ID']
     root = report_dir / 'compute-failure-contract'
     root.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -410,9 +457,10 @@ def main():
     workspace = '/home/user/' + app
     receipt = {'root': str(root), 'run_id': run_id, 'case_id': case_id, 'project': project,
                'app_id': app, 'builder_image': build['builder']['image_id'], 'creation_started': False,
-               'fault_mode': mode}
+               'fault_mode': mode, 'stop_window': window}
     evidence = {'checks': [], 'source': source, 'build': build,
-                'scope': ('real_http_stop_reply_timeout_and_original_recovery' if mode == 'stop_reply_timeout'
+                'scope': ('real_http_delayed_original_stop_and_exact_cid_recovery' if mode == 'stop_reply_timeout' and window == 'before_write'
+                          else 'real_http_stop_reply_timeout_and_original_recovery' if mode == 'stop_reply_timeout'
                           else 'real_http_stopped_failure_and_recovery'),
                 'starting_preflight_covered': False, 'private_lease_checkpoint_covered': False,
                 'operations': [], 'cleanup': {}}
@@ -431,6 +479,7 @@ def main():
     def check(name, ok, detail=None):
         if mode == 'stop_reply_timeout':
             name = name.replace('compute failure ', 'compute stop timeout ', 1)
+            name = timeout_step_name(name, window)
         evidence['checks'].append({'name': name, 'ok': bool(ok), 'detail': detail})
         save()
         print(name, 'PASS' if ok else 'FAIL', flush=True)
@@ -585,7 +634,8 @@ def main():
                 'exec app-cli serve --control-only --workspace "$1" > /home/user/logs/compute-fixture-owner.log 2>&1', '--', workspace)
         ok, detail = task_start('before-compute-failure', 1)
         check('compute failure original source serves HTTP', ok, detail)
-        arm = {'container_id': cid, 'lifecycle_id': receipt['lifecycle_id']}
+        arm = {'container_id': cid, 'lifecycle_id': receipt['lifecycle_id'], 'stop_window': window,
+               'observe_timeout_checkpoint': mode == 'stop_reply_timeout'}
         publish_fault_config(control / 'compute-arm.json', arm)
         write_offset = len((control / 'compute-writes.jsonl').read_text().splitlines())
         body = {'app_id': app, 'app_stage': 'dev', 'service_type': 'userapp',
@@ -651,19 +701,46 @@ def main():
                   and restored['lifecycle_id'] == receipt['lifecycle_id'], restored)
         else:
             held = wait_control_json(control / 'compute-stop-held.json', deadline)
-            check('compute stop timeout real Stop completed before held reply',
+            if window == 'before_write':
+                # The independent fault actor stops ONLY this captured owned
+                # AutoRemove CID. The platform's one original request remains
+                # held and will really reach Docker only after recovery.
+                actual = builder_rows(receipt)
+                if (len(actual) != 1 or actual[0]['Id'] != before['id']
+                        or (actual[0].get('HostConfig') or {}).get('AutoRemove') is not True):
+                    raise RuntimeError('late Stop fault actor lost its captured AutoRemove target')
+                proxy_id = command(*compose, 'ps', '-q', 'docker-proxy')
+                proxy_row = json.loads(command('docker', 'inspect', proxy_id))[0]
+                labels = proxy_row['Config'].get('Labels') or {}
+                if (labels.get('com.docker.compose.project') != project or labels.get('rcoder.e2e.run') != run_id
+                        or labels.get('rcoder.e2e.case') != case_id):
+                    raise RuntimeError('late Stop observer proxy ownership changed')
+                actor = 'import runpy,json,sys;m=runpy.run_path("/fault.py",run_name="fault_actor");print(json.dumps(m["stop_captured_fault_actor"](sys.argv[1])))'
+                actor_result = json.loads(command('docker', 'exec', proxy_id, 'python3', '-c', actor, before['id']))
+                absent = actor_result.get('actual_old_cid_inspection') or {}
+                evidence['late_write_fault_actor'] = actor_result
+                check('compute stop timeout real Stop completed before held reply',
+                    held.get('request_held_before_upstream') is True and held.get('upstream_submitted') is False
+                    and held.get('actual_auto_remove') is True and absent.get('status') == 404
+                    and absent.get('container_id') == before['id']
+                    and actor_result.get('captured_container_id') == before['id']
+                    and actor_result.get('fault_actor_stop_request_count') == 1
+                    and actor_result.get('sdk_retry_layer') is False
+                    and actor_result.get('upstream_status') in (204, 304), evidence['late_write_fault_actor'])
+            else:
+                check('compute stop timeout real Stop completed before held reply',
                   held.get('upstream_completed') is True and held.get('upstream_status') in (204, 304)
                   and held.get('response_released') is False and held.get('container_id') == before['id']
-                  and held.get('lifecycle_id') == receipt['lifecycle_id'], held)
+                  and held.get('lifecycle_id') == receipt['lifecycle_id']
+                  and held.get('actual_auto_remove') is True
+                  and (held.get('old_cid_inspection') or {}).get('container_id') == before['id']
+                  and (held.get('old_cid_inspection') or {}).get('status') == 404, held)
             waiting = deadline.request(api, operation_path)
             check('compute stop timeout original operation remains Stopping while reply unknown',
                   waiting.get('operation_id') == operation_id and waiting.get('lifecycle_id') == receipt['lifecycle_id']
                   and waiting.get('state') == 'running' and waiting.get('stage') == 'stopping'
                   and held['operation']['operation_id'] == operation_id, waiting)
-            failed = poll_state(api, operation_path, deadline,
-                                field='state', expected='recovery_required',
-                                waiting={'pending', 'running'}, rejected={'failed', 'succeeded', 'superseded'},
-                                known=COMPUTE_STATES, interval=.5)
+            failed = wait_timeout_diagnostic(api, operation_path, control, deadline)
             elapsed = time.monotonic() - fault_started_at
             evidence['operations'] += [original, waiting, failed]
             evidence['timeout_observation'] = {'elapsed_seconds': elapsed,
@@ -682,10 +759,11 @@ def main():
             check('compute stop timeout unknown period has no Start or Create',
                   stops == 1 and starts == 0 and not any(row['State']['Running'] for row in builder_rows(receipt)),
                   {'stop_dispatches': stops, 'start_create_restart_dispatches': starts})
-            settled = settle_stop_reply(control, 'continue', PhaseDeadline(20, 'release completed Stop response'))
-            if settled.get('response_released') is not True or settled.get('container_id') != before['id']:
-                raise RuntimeError('held real Stop response was not explicitly released')
-            (control / 'compute-arm.json').unlink()
+            if window == 'after_response':
+                settled = settle_stop_reply(control, 'continue', PhaseDeadline(20, 'release completed Stop response'))
+                if settled.get('response_released') is not True or settled.get('container_id') != before['id']:
+                    raise RuntimeError('held real Stop response was not explicitly released')
+                (control / 'compute-arm.json').unlink()
             # The formal observer holds the original volume's directory lock.
             # Never open live Turso from sqlite3 or add a public diagnostics API.
             command(*compose, 'stop', 'rcoder', timeout=90)
@@ -707,7 +785,8 @@ def main():
             reader_report.chmod(0o600)
             snapshot = json.loads(reader_report.read_text())
             persisted = validate_timeout_checkpoint(snapshot, app=app, lifecycle=receipt['lifecycle_id'],
-                operation=operation_id, request=body['request_id'], captured_id=before['id'])
+                operation=operation_id, request=body['request_id'], captured_id=before['id'],
+                original_error=(failed['error_code'], failed['error_message']))
             evidence['private_lease_checkpoint_covered'] = True
             evidence['checkpoint_reader']['report_sha256'] = hashlib.sha256(reader_report.read_bytes()).hexdigest()
             evidence['checkpoint_reader']['checkpoint_sha256'] = hashlib.sha256(
@@ -715,6 +794,9 @@ def main():
             check('compute stop timeout durable checkpoint retains original physical intent', True,
                   {'operation_id': operation_id, 'report': str(reader_report),
                    'checkpoint_sha256': evidence['checkpoint_reader']['checkpoint_sha256']})
+            # Every paused GET is now from the stopped controller. Discarding
+            # that read creates no Docker write and returns no fake response.
+            release_timeout_observation(control, 'discard')
             command(*compose, 'start', 'rcoder', timeout=90)
             base = 'http://' + command(*compose, 'port', 'rcoder', '8090')
             wait_ready(base)
@@ -737,6 +819,15 @@ def main():
         check('compute failure corrected source rebuild serves HTTP', ok, detail)
         check('compute failure source stayed frozen', source_identity(source_root) == source)
         if mode == 'stop_reply_timeout':
+            if window == 'before_write':
+                settled = settle_stop_reply(control, 'continue', PhaseDeadline(20, 'release the original late Stop write'))
+                current = capture()
+                check('compute stop timeout delayed original Stop misses only the old CID',
+                    settled.get('upstream_submitted') is True and settled.get('upstream_status') == 404
+                    and settled.get('container_id') == before['id'] and current['id'] == after['id']
+                    and execute('curl', '-fsS', '--max-time', '5', f'http://127.0.0.1:{app_entry_port}/health')
+                        == 'after-compute-recovery', settled)
+                (control / 'compute-arm.json').unlink()
             writes = [json.loads(line) for line in (control / 'compute-writes.jsonl').read_text().splitlines()]
             results = [json.loads(line) for line in (control / 'compute-write-results.jsonl').read_text().splitlines()]
             evidence['writes_full_window'] = writes[write_offset:]
@@ -744,7 +835,10 @@ def main():
                 if result['request_id'] in {row['request_id'] for row in evidence['writes_full_window']}]
             save()  # Preserve failing raw attempts/results before validating.
             audit = validate_timeout_write_window(evidence['writes_full_window'], evidence['write_results_full_window'],
-                old_id=before['id'], new_id=after['id'], app=app, lifecycle=receipt['lifecycle_id'])
+                old_id=before['id'], new_id=after['id'], app=app, lifecycle=receipt['lifecycle_id'],
+                original_stop_statuses=(404,) if window == 'before_write' else (204, 304))
+            if audit['counts']['remove'] != 0 or before['id'] == after['id']:
+                raise RuntimeError('AutoRemove stop recovery must use the absent old CID without active DELETE')
             evidence['full_window_write_audit'] = audit
             check('compute stop timeout released reply resumes original operation',
                   restored.get('operation_id') == operation_id and restored.get('stage') == 'completed'
@@ -775,7 +869,10 @@ def main():
         except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
             evidence['checks'].append({'name': 'compute failure owned cleanup retains volumes', 'ok': False, 'detail': type(error).__name__})
         names = {c['name'] for c in evidence['checks'] if c['ok']}
-        required = STOP_TIMEOUT_STEPS if mode == 'stop_reply_timeout' else STEPS
+        required = ({timeout_step_name(name, window) for name in STOP_TIMEOUT_STEPS}
+                    if mode == 'stop_reply_timeout' else STEPS)
+        if window == 'before_write':
+            required |= {'compute stop timeout delayed original Stop misses only the old CID'}
         evidence['success'] = required <= names and all(c['ok'] for c in evidence['checks'])
         save()
     return int(not evidence['success'])

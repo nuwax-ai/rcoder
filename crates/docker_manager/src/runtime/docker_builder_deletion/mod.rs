@@ -46,6 +46,8 @@ mod endpoint;
 mod file_lease;
 mod ops;
 #[cfg(test)]
+mod retained_guard_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod workspace_endpoint_tests;

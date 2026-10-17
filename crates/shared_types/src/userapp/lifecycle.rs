@@ -1103,6 +1103,34 @@ pub trait UserAppLifecycleStore: Send + Sync {
         ))
     }
 
+    /// Record only the original Docker Restart's confirmed stop boundary.
+    /// The runtime must observe the exact captured Container while retaining
+    /// its original FD lease; this CAS never restores/creates/starts compute.
+    async fn confirm_builder_restart_stopped(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+        _observation: &crate::BuilderRestartStopObservation,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Builder restart stop observation is unsupported".into(),
+        ))
+    }
+
+    /// Settle an original Docker Restart whose exact old CID is absent and
+    /// whose saved archive reference is missing/unreadable, or whose exact
+    /// referenced private recipe was positively observed unavailable. This never
+    /// grants reconstruction or settles Starting/unknown creation.
+    async fn fail_unrebuildable_builder_restart(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+        _observation: &crate::BuilderRestartStopObservation,
+        _unavailable: Option<&crate::BuilderRestartArchiveUnavailable>,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Unrebuildable builder restart settlement is unsupported".into(),
+        ))
+    }
+
     async fn resume_builder_restart_start(
         &self,
         snapshot: &crate::ComputeControlRecord,

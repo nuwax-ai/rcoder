@@ -429,6 +429,10 @@ class StopTimeoutContractTests(unittest.TestCase):
         kwargs = {'app': 'app', 'lifecycle': 'life', 'operation': 'op', 'request': 'request', 'captured_id': 'captured-id'}
         before = copy.deepcopy(snapshot)
         self.assertEqual(contract.validate_timeout_checkpoint(snapshot, **kwargs), record)
+        diagnostic = (record['error_code'], record['error_message'])
+        self.assertEqual(contract.validate_timeout_checkpoint(snapshot, **kwargs, original_error=diagnostic), record)
+        with self.assertRaisesRegex(ValueError, 'original failure diagnostic'):
+            contract.validate_timeout_checkpoint(snapshot, **kwargs, original_error=(diagnostic[0], 'replaced error'))
         self.assertEqual(snapshot, before, 'observation must not repair the durable checkpoint')
         mutations = [
             ('app_id', 'foreign'), ('lifecycle_id', 'foreign'), ('operation_id', 'foreign'),

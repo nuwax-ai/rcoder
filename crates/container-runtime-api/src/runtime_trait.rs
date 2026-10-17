@@ -268,6 +268,15 @@ pub trait AgentContainerRuntime: Send + Sync {
         Ok(false)
     }
 
+    /// Read-only original-result classification. A stopped-looking container
+    /// without its real Stop acknowledgement is never enough.
+    async fn observe_builder_restart_stop(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderRestartStopKind>> {
+        Ok(None)
+    }
+
     /// Read actual stopped compute, including an external stop without a
     /// platform receipt. This does not authorize a write or retire a lease.
     /// Pending/restarting resources cannot be treated as stopped.
@@ -1439,6 +1448,19 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     ) -> ContainerRuntimeResult<Box<dyn shared_types::PreparedComputeLease>> {
         Err(ContainerRuntimeError::ConfigurationError(
             "Prepared compute leases are unsupported".into(),
+        ))
+    }
+
+    /// Retain the exact original Docker fd/inode/token while recovering a
+    /// proven Stop result. This must not create, truncate or renew a marker.
+    async fn resume_original_compute_operation(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _scope: shared_types::UserAppOperationScope,
+        _receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<Box<dyn shared_types::AppOperationLease>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Retained compute guards are unsupported".into(),
         ))
     }
 

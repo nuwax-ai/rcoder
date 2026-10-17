@@ -159,6 +159,7 @@ async fn userapp_compute_stopped_failure_recovery_contract() {
     compute_failure_scenario(
         "userapp_compute_stopped_failure_recovery_contract",
         "stopped_read",
+        "after_response",
     )
     .await;
 }
@@ -169,18 +170,30 @@ async fn userapp_compute_stop_timeout_recovery_contract() {
     compute_failure_scenario(
         "userapp_compute_stop_timeout_recovery_contract",
         "stop_reply_timeout",
+        "after_response",
     )
     .await;
 }
 
-async fn compute_failure_scenario(scenario: &str, mode: &str) {
+/// The original Stop is held before Docker, then released after exact old-CID recovery.
+#[tokio::test]
+async fn userapp_compute_late_stop_cid_absence_recovery_contract() {
+    compute_failure_scenario(
+        "userapp_compute_late_stop_cid_absence_recovery_contract",
+        "stop_reply_timeout",
+        "before_write",
+    )
+    .await;
+}
+
+async fn compute_failure_scenario(scenario: &str, mode: &str, stop_window: &str) {
     if !rcoder_e2e::common::require_context_or_skip() {
         return;
     }
     let report = JsonlReporter::begin(
         scenario,
         "compose",
-        serde_json::json!({"fixture": "isolated-compute-failure", "fault_mode": mode, "llm": false}),
+        serde_json::json!({"fixture": "isolated-compute-failure", "fault_mode": mode, "stop_window": stop_window, "llm": false}),
     );
     let result = (|| -> Result<(), String> {
         let directory = std::env::var_os("E2E_REPORT_DIR")
@@ -196,6 +209,7 @@ async fn compute_failure_scenario(scenario: &str, mode: &str) {
                 shared_types::APP_ENTRY_PORT.to_string(),
             )
             .env("E2E_COMPUTE_FAILURE_MODE", mode)
+            .env("E2E_COMPUTE_STOP_WINDOW", stop_window)
             .status()
             .map_err(|error| format!("cannot launch compute fixture: {error}"))?;
         report.assert_hard(

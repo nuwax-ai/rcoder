@@ -238,6 +238,25 @@ pub(super) async fn discover_pending(
             );
             continue;
         }
+        if crate::userapp_builder::compute_control::can_recover_original_docker_stop(&record) {
+            let flight = state.userapp_op_flight.guard()?;
+            let state = state.clone();
+            tasks.push(
+                format!("compute-original-docker-stop:{}", record.operation_id),
+                async move {
+                    let _flight = flight;
+                    // Bound scheduling exactly like the existing compute-resume
+                    // branch. Its Docker/readiness deadlines remain unchanged;
+                    // a new 60s whole-worker timeout would cancel legitimate
+                    // restore/Start before those original budgets expire.
+                    crate::userapp_builder::compute_control::recover_original_docker_stop(
+                        &state, &record,
+                    )
+                    .await
+                },
+            );
+            continue;
+        }
         if record.can_recover_compute_drain() {
             let flight = state.userapp_op_flight.guard()?;
             let state = state.clone();
