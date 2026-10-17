@@ -75,7 +75,8 @@ pub(in crate::pg) async fn upsert_project(
         "INSERT INTO projects(project_id,generation,user_id,pod_id,tenant_id,space_id,isolation_type,container_name,container_generation,latest_session,model_provider_json,request_id,agent_status_json,service_type,payload_version,last_activity_at_us,created_at_us,row_revision)
          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL,$10,$11,$12,$13,1,$14,$15,$16)
          ON CONFLICT(project_id) DO UPDATE SET user_id=EXCLUDED.user_id,pod_id=EXCLUDED.pod_id,tenant_id=EXCLUDED.tenant_id,space_id=EXCLUDED.space_id,isolation_type=EXCLUDED.isolation_type,
-           container_name=EXCLUDED.container_name,container_generation=EXCLUDED.container_generation,latest_session=NULL,
+           container_name=EXCLUDED.container_name,container_generation=EXCLUDED.container_generation,
+           latest_session=CASE WHEN $18 THEN projects.latest_session ELSE NULL END,
            model_provider_json=EXCLUDED.model_provider_json,request_id=EXCLUDED.request_id,agent_status_json=EXCLUDED.agent_status_json,service_type=EXCLUDED.service_type,
            last_activity_at_us=GREATEST(projects.last_activity_at_us,EXCLUDED.last_activity_at_us),row_revision=EXCLUDED.row_revision
          WHERE projects.generation=EXCLUDED.generation AND projects.row_revision=$17")
@@ -89,6 +90,7 @@ pub(in crate::pg) async fn upsert_project(
         .bind_typed(p.agent_status.as_ref().map(serde_json::to_string).transpose()?, Type::Text)
         .bind_typed(p.service_type.as_deref(), Type::Text)
         .bind(p.last_activity.timestamp_micros()).bind(p.created_at.timestamp_micros()).bind(revision).bind(p.expected_revision)
+        .bind(p.preserve_latest_session)
         .exec(tx).await?;
     if changed == 0 {
         return Ok(PersistenceOperationOutcome::Superseded);
@@ -109,7 +111,9 @@ pub(in crate::pg) async fn upsert_project(
             return Ok(PersistenceOperationOutcome::Superseded);
         }
     }
-    if let Some(id) = &p.latest_session {
+    if !p.preserve_latest_session
+        && let Some(id) = &p.latest_session
+    {
         let generation = p
             .sessions
             .get(id)

@@ -180,6 +180,13 @@ REQUIRED['lb_new_session_cross_entry'] = {
     f'轮{i} {step}' for i, keyword in enumerate(('分布式', '微服务', '负载均衡'))
     for step in ('新会话跨入口收到事件', f'内容正确（含 {keyword}）')
 }
+REQUIRED['lb_stop_resume_same_sid_cross_entry'] = {
+    '停止前真实对话完整执行', '普通 Computer Stop 明确成功',
+    '停止后原 SID 一次受理且无降级', '停止后跨入口 SSE 收到当前请求',
+    '停止后原会话上下文保留', '停止后新轮完整且没有错误事件',
+    '普通 Computer Stop 后原入口自动恢复',
+    '本 case 计算资源受控停止',
+}
 
 REQUIRED['docker_deletion_identity_contract'] |= {
     'Docker lifecycle process completed', 'Q01 real Docker test executed',

@@ -15,6 +15,18 @@ mod same_workload_pod;
 #[path = "agent_registration_tests/registration_refresh.rs"]
 mod registration_refresh;
 
+#[path = "agent_registration_tests/cross_replica_existing_session.rs"]
+mod cross_replica_existing_session;
+
+#[path = "agent_registration_tests/cross_replica_readback.rs"]
+mod cross_replica_readback;
+
+#[path = "agent_registration_tests/stop_generation.rs"]
+mod stop_generation;
+
+#[path = "agent_registration_tests/container_intent.rs"]
+mod container_intent;
+
 fn basic(owner: &str) -> ContainerBasicInfo {
     ContainerBasicInfo {
         container_id: format!("old-pod-{owner}"),

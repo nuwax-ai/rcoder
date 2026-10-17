@@ -21,6 +21,8 @@ use crate::adapter::container_entry_key;
 pub struct ContainerSessionAppend {
     pub project_id: String,
     pub project_generation: String,
+    pub dispatch_revision: i64,
+    pub request_id: Option<String>,
     pub container_name: String,
     pub container_generation: String,
     pub physical_uid: String,
@@ -29,8 +31,60 @@ pub struct ContainerSessionAppend {
     pub service_type: String,
     pub session_id: String,
     pub session_generation: String,
+    /// Captured and local incarnations must remain unretired through COMMIT,
+    /// even when SQL routing binds this append to a different canonical UUID.
+    pub retirement_fences: Vec<String>,
     pub predecessor: Option<String>,
     pub at: DateTime<Utc>,
+}
+
+impl ContainerSessionAppend {
+    pub(in crate::pg) fn from_registration(
+        expected: &ProjectAndContainerInfo,
+        current: &ProjectAndContainerInfo,
+        session_id: &str,
+    ) -> anyhow::Result<Self> {
+        let identity = current.persistence_identity();
+        let container = identity
+            .container
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Container registration identity is missing"))?;
+        let basic = current.container_info().ok_or_else(|| {
+            anyhow::anyhow!("Physical container is missing during session registration")
+        })?;
+        Ok(Self {
+            project_id: expected.project_id().to_owned(),
+            project_generation: identity.generation.clone(),
+            dispatch_revision: expected.persistence_identity().revision,
+            request_id: expected.request_id().map(str::to_owned),
+            container_name: container_entry_key(current),
+            container_generation: container.generation.clone(),
+            physical_uid: basic.container_id,
+            workload_uid: basic.workload_uid,
+            logical_id: basic.project_id,
+            service_type: current
+                .service_type()
+                .ok_or_else(|| anyhow::anyhow!("Project service type is missing"))?
+                .to_string(),
+            session_id: session_id.to_owned(),
+            session_generation: identity
+                .sessions
+                .get(session_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Session registration identity is missing"))?,
+            retirement_fences: identity
+                .sessions
+                .get(session_id)
+                .into_iter()
+                .chain(expected.persistence_identity().sessions.get(session_id))
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            predecessor: identity.retired_sessions.get(session_id).cloned(),
+            at: current.last_activity(),
+        })
+    }
 }
 
 /// 单个 project 的持久化快照（whole-row upsert）
@@ -51,6 +105,8 @@ pub struct ProjectSnapshot {
     /// containers 表键（container_name 或 logical_id 回退占位）
     pub container_name: Option<String>,
     pub latest_session: Option<String>,
+    /// Metadata admission does not select or clear an existing session.
+    pub preserve_latest_session: bool,
     /// ModelProviderConfig JSON（含明文 api_key，运维排查决策）
     pub model_provider: Option<Value>,
     pub request_id: Option<String>,
@@ -104,6 +160,7 @@ impl ProjectSnapshot {
             // 避免引用不存在的容器行（内存镜像的 logical_id 回退键不落库）
             container_name: info.container_info().map(|_| container_entry_key(info)),
             latest_session: info.latest_session().map(str::to_string),
+            preserve_latest_session: false,
             model_provider: info
                 .model_provider()
                 .map(serde_json::to_value)
@@ -200,6 +257,7 @@ impl ContainerSnapshot {
 #[derive(Debug, Clone)]
 pub enum PersistOp {
     AppendSessionForContainer(Box<ContainerSessionAppend>),
+    StopProject(Box<super::project_stop::ProjectStop>),
     // ===== 结构性（永不丢弃） =====
     UserAppAgentMapping {
         request_id: String,
@@ -301,6 +359,7 @@ impl PersistOp {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::AppendSessionForContainer(_) => "append_session_for_container",
+            Self::StopProject(_) => "stop_project",
             Self::UserAppAgentMapping { .. } => "userapp_agent_mapping",
             Self::RegisterProject { .. } => "register_project",
             #[cfg(test)]
@@ -337,7 +396,22 @@ pub(in crate::pg) fn structural_ops_for_insert(
 pub(in crate::pg) fn registration_for_info(
     info: &ProjectAndContainerInfo,
 ) -> anyhow::Result<PersistOp> {
-    let project = Box::new(ProjectSnapshot::from_info(info)?);
+    registration_with_selection(info, false)
+}
+
+pub(in crate::pg) fn registration_for_metadata(
+    info: &ProjectAndContainerInfo,
+) -> anyhow::Result<PersistOp> {
+    registration_with_selection(info, true)
+}
+
+fn registration_with_selection(
+    info: &ProjectAndContainerInfo,
+    preserve_latest_session: bool,
+) -> anyhow::Result<PersistOp> {
+    let mut project = ProjectSnapshot::from_info(info)?;
+    project.preserve_latest_session = preserve_latest_session;
+    let project = Box::new(project);
     let container = if let (Some(basic), Some(st)) = (info.container_info(), info.service_type()) {
         // workload_uid：注册链捕获侧（K8s ownerReference UID）随契约四解析器
         // 分层接入；Docker 无 workload 对象恒 None。schema 已冻结本列。

@@ -208,6 +208,17 @@ impl crate::pg::PgStore {
         &self,
         project_id: &str,
     ) -> anyhow::Result<Option<Arc<ProjectAndContainerInfo>>> {
+        if let Some(current) = self.inner.get(project_id) {
+            self.reconcile_rejected_container_intent(
+                &crate::adapter::container_entry_key(&current),
+                tokio::time::Instant::now() + Self::DURABLE_COMMIT_TIMEOUT,
+            )
+            .await?;
+        }
+        anyhow::ensure!(
+            self.resolve_project_stop(project_id).await?,
+            "Project Stop is awaiting durable confirmation"
+        );
         let (baseline, baseline_containers) = {
             let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
             (
@@ -258,7 +269,18 @@ impl crate::pg::PgStore {
                             (None, None, _) => true,
                             _ => false,
                         };
-                        (retired_project && retired_container).then(|| generation.clone())
+                        let containers = fetched
+                            .1
+                            .clone()
+                            .map(|row| HashMap::from([(row.container_name.clone(), row)]))
+                            .unwrap_or_default();
+                        let persisted = hydrate_project(&fetched.0, &containers)?;
+                        let same_instance_stop = super::project_stop::may_rebase_stop_successor(
+                            tx, &previous, &persisted,
+                        )
+                        .await?;
+                        (same_instance_stop || (retired_project && retired_container))
+                            .then(|| generation.clone())
                     } else {
                         None
                     };
@@ -285,28 +307,61 @@ impl crate::pg::PgStore {
         expected: &ProjectAndContainerInfo,
         session_id: &str,
     ) -> anyhow::Result<bool> {
+        let captured_generation = expected
+            .persistence_identity()
+            .sessions
+            .get(session_id)
+            .cloned();
+        let local_generation = {
+            let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+            self.inner.get(expected.project_id()).and_then(|current| {
+                current
+                    .persistence_identity()
+                    .sessions
+                    .get(session_id)
+                    .cloned()
+            })
+        };
         let id = session_id.to_owned();
-        let Some((project, container)) = super::database::read(&self.database, move |tx| {
-            Box::pin(async move { repo::fetch_project_by_session(tx, &id).await })
+        let checked_captured = captured_generation.clone();
+        let Some((persisted, retired)) = super::database::read(&self.database, move |tx| {
+            Box::pin(async move {
+                let Some((project, container)) = repo::fetch_project_by_session(tx, &id).await?
+                else {
+                    return Ok(None);
+                };
+                let containers = container
+                    .map(|row| HashMap::from([(row.container_name.clone(), row)]))
+                    .unwrap_or_default();
+                let persisted = hydrate_project(&project, &containers)?;
+                let canonical = super::persist_ops::ContainerSessionAppend::from_registration(
+                    &persisted, &persisted, &id,
+                )?;
+                let mut retired = !repo::session_execution_is_current(tx, &canonical).await?;
+                let generations = std::iter::once(canonical.session_generation.as_str())
+                    .chain(checked_captured.as_deref())
+                    .chain(local_generation.as_deref())
+                    .collect::<std::collections::BTreeSet<_>>();
+                for generation in generations {
+                    retired |= repo::session_generation_is_retired(tx, &id, generation).await?;
+                }
+                Ok(Some((persisted, retired)))
+            })
         })
         .await
         .context("Confirm durable session registration")?
         else {
             return Ok(false);
         };
-        let containers = container
-            .map(|row| HashMap::from([(row.container_name.clone(), row)]))
-            .unwrap_or_default();
-        let persisted = hydrate_project(&project, &containers)?;
-        if !crate::adapter::session_container_matches(expected, &persisted) {
+        if retired || !crate::adapter::session_container_matches(expected, &persisted) {
             return Ok(false);
         }
         let session_generation = persisted.persistence_identity().sessions.get(session_id);
         if expected
             .persistence_identity()
-            .sessions
+            .retired_sessions
             .get(session_id)
-            .is_some_and(|expected| Some(expected) != session_generation)
+            == session_generation
         {
             return Ok(false);
         }
@@ -316,8 +371,17 @@ impl crate::pg::PgStore {
         {
             return Ok(false);
         }
-        if let Some(current) = self.inner.get(expected.project_id())
-            && (!crate::adapter::session_container_matches(expected, &current)
+        let current = self.inner.get(expected.project_id());
+        if let Some(current) = current.as_ref()
+            && (!crate::adapter::session_container_matches(expected, current)
+                || current
+                    .persistence_identity()
+                    .retired_sessions
+                    .get(session_id)
+                    != expected
+                        .persistence_identity()
+                        .retired_sessions
+                        .get(session_id)
                 || current
                     .persistence_identity()
                     .retired_sessions
@@ -327,9 +391,30 @@ impl crate::pg::PgStore {
                     .persistence_identity()
                     .sessions
                     .get(session_id)
-                    .is_some_and(|current| Some(current) != session_generation))
+                    .is_some_and(|generation| Some(generation) != session_generation))
         {
             return Ok(false);
+        }
+        if captured_generation
+            .as_ref()
+            .is_some_and(|generation| Some(generation) != session_generation)
+        {
+            // A cancelled lookup may have left an uncommitted local UUID in
+            // the captured view. Only an already-corrected current membership,
+            // with all captured/local/canonical retirements checked above, may
+            // confirm the SQL incarnation. This does not perform a boolean-only
+            // repair or publish old metadata.
+            return Ok(current.as_ref().is_some_and(|current| {
+                current.persistence_identity().sessions.get(session_id) == session_generation
+                    && current
+                        .persistence_identity()
+                        .retired_sessions
+                        .get(session_id)
+                        == expected
+                            .persistence_identity()
+                            .retired_sessions
+                            .get(session_id)
+            }));
         }
         Ok(true)
     }
@@ -528,24 +613,25 @@ impl crate::pg::PgStore {
                         && same_admitted_registration_payload(current, &info)?
                 }
                 Some(current) => {
-                    // No cross-generation revision comparison: only a retired
-                    // local project and its known physical successor may be
-                    // admitted while unrelated work is pending.
+                    // A retired source (or an uncommitted Stop successor whose
+                    // source is retired) may join the exact same physical
+                    // project epoch, or a previously proven container successor.
                     retired_generation == Some(current.persistence_identity().generation.as_str())
                         && same_registration_scope(current, &info)
-                        && current
-                            .persistence_identity()
-                            .container
-                            .as_ref()
-                            .is_some_and(|old| {
-                                container_by_name.iter().any(|(name, row)| {
-                                    containers.get(name).is_some_and(|target| {
-                                        target.generation == row.container_generation
-                                            && target.physical_uid == row.container_id
-                                            && row.container_generation != old.generation
+                        && (super::project_stop::same_stop_scope(current, &info)
+                            || current
+                                .persistence_identity()
+                                .container
+                                .as_ref()
+                                .is_some_and(|old| {
+                                    container_by_name.iter().any(|(name, row)| {
+                                        containers.get(name).is_some_and(|target| {
+                                            target.generation == row.container_generation
+                                                && target.physical_uid == row.container_id
+                                                && row.container_generation != old.generation
+                                        })
                                     })
-                                })
-                            })
+                                }))
                 }
             }
         } else {

@@ -7,12 +7,20 @@ use crate::pg::PgStore;
 use shared_types::{ProjectAndContainerInfo, persistence::PersistenceWriteOutcome};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::Instant;
 
 /// Dropping a cancelled durable request queues its immutable registered operations.
 pub(super) struct PendingWrite<'a> {
     store: &'a PgStore,
     ops: Option<Vec<PersistOp>>,
 }
+
+enum SessionBinding {
+    Missing,
+    Bound,
+    Rejected,
+}
+
 impl Drop for PendingWrite<'_> {
     fn drop(&mut self) {
         if let Some(ops) = self.ops.take() {
@@ -46,19 +54,37 @@ impl PgStore {
         }
     }
 
-    const DURABLE_COMMIT_TIMEOUT: Duration = Duration::from_millis(600);
+    pub(super) const DURABLE_COMMIT_TIMEOUT: Duration = Duration::from_millis(600);
 
     /// Establish the exact accepted project/container registration before a
     /// caller dispatches work. A background writer is not a commit barrier.
     pub async fn insert_project_registration_durable(
         &self,
         project_id: String,
-        info: Arc<ProjectAndContainerInfo>,
+        mut info: Arc<ProjectAndContainerInfo>,
     ) -> anyhow::Result<PersistenceWriteOutcome> {
+        let deadline = Instant::now() + Self::DURABLE_COMMIT_TIMEOUT;
         anyhow::ensure!(
             project_id == info.project_id(),
             "Project registration key differs from its payload"
         );
+        if let Some(reconciled) = self
+            .reconcile_rejected_container_intent(&container_entry_key(&info), deadline)
+            .await?
+        {
+            reconciled.rebase_fresh_info(&mut info);
+        }
+        match tokio::time::timeout_at(deadline, self.resolve_project_stop(&project_id)).await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) | Err(_) => {
+                return Ok(PersistenceWriteOutcome::Deferred {
+                    reason:
+                        "Project Stop is awaiting durable confirmation; no new task was dispatched"
+                            .into(),
+                });
+            }
+            Ok(Err(error)) => return Err(error),
+        }
         let (pending, captured) = {
             let registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
             anyhow::ensure!(
@@ -66,11 +92,32 @@ impl PgStore {
                 "Persistence is shutting down"
             );
             let info = self.prepare_info(info, &registration)?;
-            let op = super::persist_ops::registration_for_info(&info)?;
-            self.inner.insert(project_id, Arc::clone(&info))?;
-            (self.register_durable(vec![op]), info)
+            let op = super::persist_ops::registration_for_metadata(&info)?;
+            self.inner.insert(project_id.clone(), Arc::clone(&info))?;
+            let captured = self
+                .inner
+                .get(&project_id)
+                .ok_or_else(|| anyhow::anyhow!("Registered project disappeared"))?;
+            (self.register_durable(vec![op]), captured)
         };
-        let outcome = self.execute_durable(pending, "register_project").await;
+        let outcome = self
+            .execute_durable_before(pending, "register_project", deadline)
+            .await;
+        if outcome == PersistenceWriteOutcome::Superseded {
+            // RegisterProject's SQL savepoint rolled back its container write
+            // too. Do not let this rejected optimistic cursor permanently block
+            // a proven same-physical project-epoch refresh.
+            self.record_rejected_container_intent(&captured);
+            if let Err(error) = self
+                .reconcile_rejected_container_intent(&container_entry_key(&captured), deadline)
+                .await
+            {
+                // The mutation is definitively rejected. Keep that fact and
+                // its narrow correction proof for the next fresh entrance;
+                // a readback fault never turns Superseded into unknown write.
+                tracing::warn!(%error, "Known rejected container cursor readback failed");
+            }
+        }
         if outcome == PersistenceWriteOutcome::Committed {
             let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
             if self.inner.get(captured.project_id()).is_none_or(|current| {
@@ -87,7 +134,8 @@ impl PgStore {
         expected: &ProjectAndContainerInfo,
         session_id: &str,
     ) -> anyhow::Result<PersistenceWriteOutcome> {
-        let (pending, append, was_present) = {
+        let deadline = Instant::now() + Self::DURABLE_COMMIT_TIMEOUT;
+        let (mut pending, mut append, was_present) = {
             let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
             anyhow::ensure!(
                 !self.closing.load(std::sync::atomic::Ordering::Acquire),
@@ -106,34 +154,7 @@ impl PgStore {
             let current = self.inner.get(expected.project_id()).ok_or_else(|| {
                 anyhow::anyhow!("Project disappeared during session registration")
             })?;
-            let identity = current.persistence_identity();
-            let container_identity = identity
-                .container
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Container registration identity is missing"))?;
-            let basic = current.container_info().ok_or_else(|| {
-                anyhow::anyhow!("Physical container is missing during session registration")
-            })?;
-            let append =
-                ContainerSessionAppend {
-                    project_id: expected.project_id().to_owned(),
-                    project_generation: identity.generation.clone(),
-                    container_name: container_entry_key(&current),
-                    container_generation: container_identity.generation.clone(),
-                    physical_uid: basic.container_id,
-                    workload_uid: basic.workload_uid,
-                    logical_id: basic.project_id,
-                    service_type: current
-                        .service_type()
-                        .ok_or_else(|| anyhow::anyhow!("Project service type is missing"))?
-                        .to_string(),
-                    session_id: session_id.to_owned(),
-                    session_generation: identity.sessions.get(session_id).cloned().ok_or_else(
-                        || anyhow::anyhow!("Session registration identity is missing"),
-                    )?,
-                    predecessor: identity.retired_sessions.get(session_id).cloned(),
-                    at: current.last_activity(),
-                };
+            let append = ContainerSessionAppend::from_registration(expected, &current, session_id)?;
             (
                 self.register_durable(vec![PersistOp::AppendSessionForContainer(Box::new(
                     append.clone(),
@@ -142,9 +163,47 @@ impl PgStore {
                 was_present,
             )
         };
-        let outcome = self
-            .execute_durable(pending, "append_session_for_container")
-            .await;
+        // Keep the accepted mirror and immutable fallback through lookup failure
+        // or cancellation: Stop must still capture this exact pending generation.
+        // Every completion checks SQL, including a provisional SID left by an
+        // earlier cancelled lookup. No prompt or uncertain write is replayed.
+        let rejected = match tokio::time::timeout_at(
+            deadline,
+            self.bind_committed_session(expected, &mut append),
+        )
+        .await
+        {
+            Ok(Ok(SessionBinding::Bound)) => {
+                // The original command has not executed. Bind its routing to
+                // the committed incarnation, never to a new guessed SID UUID.
+                pending.ops = Some(vec![PersistOp::AppendSessionForContainer(Box::new(
+                    append.clone(),
+                ))]);
+                false
+            }
+            Ok(Ok(SessionBinding::Missing)) => false,
+            Ok(Ok(SessionBinding::Rejected)) => true,
+            Ok(Err(error)) => {
+                return Ok(PersistenceWriteOutcome::Deferred {
+                    reason: format!("Read committed session identity: {error}"),
+                });
+            }
+            Err(_) => {
+                return Ok(PersistenceWriteOutcome::Deferred {
+                    reason: "Session identity lookup exceeded the durable deadline".into(),
+                });
+            }
+        };
+        let outcome = if rejected {
+            if let Some(ops) = pending.ops.take() {
+                self.pending_ops
+                    .fetch_sub(ops.len() as i64, std::sync::atomic::Ordering::AcqRel);
+            }
+            PersistenceWriteOutcome::Superseded
+        } else {
+            self.execute_durable_before(pending, "append_session_for_container", deadline)
+                .await
+        };
         if outcome == PersistenceWriteOutcome::Superseded && !was_present {
             let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(current) = self.inner.get(expected.project_id())
@@ -157,6 +216,116 @@ impl PgStore {
             }
         }
         Ok(outcome)
+    }
+
+    async fn bind_committed_session(
+        &self,
+        expected: &ProjectAndContainerInfo,
+        append: &mut ContainerSessionAppend,
+    ) -> anyhow::Result<SessionBinding> {
+        let checked = append.clone();
+        let captured_generation = expected
+            .persistence_identity()
+            .sessions
+            .get(&append.session_id)
+            .cloned();
+        let (fetched, retired) = super::database::read(&self.database, move |tx| {
+            Box::pin(async move {
+                if !super::repo::session_execution_is_current(tx, &checked).await? {
+                    return Ok((None, true));
+                }
+                let generations = std::iter::once(checked.session_generation.as_str())
+                    .chain(captured_generation.as_deref())
+                    .collect::<std::collections::BTreeSet<_>>();
+                for generation in generations {
+                    if super::repo::session_generation_is_retired(
+                        tx,
+                        &checked.session_id,
+                        generation,
+                    )
+                    .await?
+                    {
+                        return Ok((None, true));
+                    }
+                }
+                let Some((project, container)) =
+                    super::repo::fetch_project_by_session(tx, &checked.session_id).await?
+                else {
+                    return Ok((None, false));
+                };
+                let generation = project
+                    .session_identities
+                    .get(&checked.session_id)
+                    .ok_or_else(|| anyhow::anyhow!("Committed SID has no generation"))?;
+                let retired =
+                    super::repo::session_generation_is_retired(tx, &checked.session_id, generation)
+                        .await?;
+                Ok((Some((project, container)), retired))
+            })
+        })
+        .await?;
+        if retired {
+            return Ok(SessionBinding::Rejected);
+        }
+        let Some((project, container)) = fetched else {
+            return Ok(SessionBinding::Missing);
+        };
+        let containers = container
+            .map(|row| std::collections::HashMap::from([(row.container_name.clone(), row)]))
+            .unwrap_or_default();
+        let persisted = super::load::hydrate_project(&project, &containers)?;
+        let generation = persisted
+            .persistence_identity()
+            .sessions
+            .get(&append.session_id)
+            .ok_or_else(|| anyhow::anyhow!("Committed SID has no hydrated generation"))?;
+        if !crate::adapter::session_container_matches(expected, &persisted) {
+            return Ok(SessionBinding::Rejected);
+        }
+        let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(current) = self.inner.get(expected.project_id()) else {
+            return Ok(SessionBinding::Rejected);
+        };
+        let local_generation = current
+            .persistence_identity()
+            .sessions
+            .get(&append.session_id);
+        if !crate::adapter::session_container_matches(expected, &current)
+            || (local_generation != Some(&append.session_generation)
+                && local_generation != Some(generation))
+            || current
+                .persistence_identity()
+                .retired_sessions
+                .get(&append.session_id)
+                != expected
+                    .persistence_identity()
+                    .retired_sessions
+                    .get(&append.session_id)
+            || current
+                .persistence_identity()
+                .retired_sessions
+                .get(&append.session_id)
+                == Some(generation)
+        {
+            return Ok(SessionBinding::Rejected);
+        }
+        // Only the unretired canonical routing is joined. Keep the winning
+        // metadata and any selection made by a newer accepted request.
+        let latest = current.latest_session().map(str::to_owned);
+        let preserve_latest = current.persistence_identity().revision != append.dispatch_revision
+            || current.request_id() != append.request_id.as_deref();
+        let mut merged = (*current).clone();
+        merged.restore_session_identity(&append.session_id, generation.clone());
+        if preserve_latest {
+            anyhow::ensure!(
+                merged.restore_latest_session(latest.as_deref()),
+                "Current session selection disappeared during routing merge"
+            );
+        }
+        self.inner
+            .insert(expected.project_id().to_owned(), Arc::new(merged))?;
+        append.session_generation = generation.clone();
+        Ok(SessionBinding::Bound)
     }
 
     pub async fn insert_with_session_durable(
@@ -330,28 +499,17 @@ impl PgStore {
     }
 
     pub async fn clear_session_durable(&self, project_id: &str) {
-        let op = {
-            let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
-            if self.closing.load(std::sync::atomic::Ordering::Acquire) {
+        let expected = match self.capture_project_stop_registration(project_id).await {
+            Ok(Some(expected)) => expected,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(project_id, %error, "Stop source capture failed");
                 return;
             }
-            let Some(info) = self.inner.get(project_id) else {
-                return;
-            };
-            let op = PersistOp::ClearSessions {
-                project_id: project_id.to_string(),
-                generation: info.persistence_identity().generation.clone(),
-                sessions: info
-                    .persistence_identity()
-                    .sessions
-                    .iter()
-                    .map(|(id, g)| (id.clone(), g.clone()))
-                    .collect(),
-            };
-            self.inner.clear_session(project_id);
-            self.register_durable(vec![op])
         };
-        self.execute_durable(op, "clear_sessions").await;
+        if let Err(error) = self.clear_sessions_if_current_durable(&expected).await {
+            tracing::warn!(project_id, %error, "Stop registration failed");
+        }
     }
 
     pub async fn clear_session_one_durable(&self, project_id: &str, session_id: &str) -> bool {
@@ -427,12 +585,26 @@ impl PgStore {
 
     pub(super) async fn execute_durable(
         &self,
+        registered: PendingWrite<'_>,
+        name: &str,
+    ) -> PersistenceWriteOutcome {
+        self.execute_durable_before(
+            registered,
+            name,
+            Instant::now() + Self::DURABLE_COMMIT_TIMEOUT,
+        )
+        .await
+    }
+
+    pub(super) async fn execute_durable_before(
+        &self,
         mut registered: PendingWrite<'_>,
         name: &str,
+        deadline: Instant,
     ) -> PersistenceWriteOutcome {
         let durable =
             execute_registered(&self.database, registered.ops.clone().unwrap_or_default());
-        match tokio::time::timeout(Self::DURABLE_COMMIT_TIMEOUT, durable).await {
+        match tokio::time::timeout_at(deadline, durable).await {
             Ok(Ok(superseded)) => {
                 if let Some(ops) = registered.ops.take() {
                     tracing::info!(

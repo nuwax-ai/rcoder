@@ -26,6 +26,8 @@ mod store_impl;
 #[cfg(feature = "pg")]
 pub(crate) use agent_replacement::validate_agent_replacement;
 pub(crate) use session_ops::session_container_matches;
+#[cfg(feature = "pg")]
+pub(crate) use session_ops::stop_frame_matches;
 
 use std::sync::Arc;
 

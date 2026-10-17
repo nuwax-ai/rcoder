@@ -5,6 +5,18 @@ use crate::db::models::{Container, Project, Session};
 use anyhow::{Context, Result, ensure};
 use toasty::Executor;
 
+pub(in crate::pg) async fn fetch_container_registration(
+    tx: &mut dyn Executor,
+    name: &str,
+) -> Result<Option<ContainerRow>> {
+    Container::filter_by_container_name(name)
+        .first()
+        .exec(tx)
+        .await?
+        .map(TryInto::try_into)
+        .transpose()
+}
+
 pub(in crate::pg) async fn fetch_all_containers(
     tx: &mut dyn Executor,
 ) -> Result<Vec<ContainerRow>> {

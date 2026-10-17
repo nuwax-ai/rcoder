@@ -26,7 +26,7 @@ def cleanup(case_id, run_id, directory, env):
         raise ValueError('Invalid E2E ownership IDs')
     # Env.scoped_user adds a per-scenario suffix. Match the complete identifier
     # plus runtime labels, rather than guessing a truncated workload name.
-    identifier_pattern = re.compile('ue' + case_id[:12] + r'-(?:lb|lr|ln)')
+    identifier_pattern = re.compile('ue' + case_id[:12] + r'-(?:lb|lr|ln|lsr)')
     claims = json.loads(kube(env, 'get', 'pvc', '-o', 'json'))['items']
     before = {p['metadata']['name']: p['metadata']['uid'] for p in claims}
     rows = json.loads(kube(env, 'get', 'sts,svc', '-o', 'json'))['items']

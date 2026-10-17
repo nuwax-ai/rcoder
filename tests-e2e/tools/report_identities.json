@@ -77,6 +77,12 @@
       "backend": "k8s"
     }
   ],
+  "lb_stop_resume_same_sid_cross_entry": [
+    {
+      "scenario": "lb_stop_resume_same_sid_cross_entry",
+      "backend": "k8s"
+    }
+  ],
   "model_switch_anthropic": [
     {
       "scenario": "model_switch",

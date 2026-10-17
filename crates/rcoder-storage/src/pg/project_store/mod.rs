@@ -30,7 +30,9 @@ mod lifecycle_tests;
 mod agent_registration_tests;
 mod agent_replacement;
 mod builder_replacement;
+pub(crate) mod container_intent;
 mod database;
+pub(crate) mod project_stop;
 pub(in crate::pg) mod userapp_agent;
 
 #[cfg(test)]

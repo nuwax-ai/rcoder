@@ -680,6 +680,7 @@ fn clone_container_row(row: &repo::ContainerRow) -> repo::ContainerRow {
         container_id: row.container_id.clone(),
         workload_uid: row.workload_uid.clone(),
         logical_id: row.logical_id.clone(),
+        service_type: row.service_type.clone(),
         container_ip: row.container_ip.clone(),
         internal_port: row.internal_port,
         external_port: row.external_port,

@@ -81,12 +81,16 @@ impl Drop for StreamTaskGuard {
     }
 }
 
+/// Opaque snapshot of one observed first-client claim, used by delayed Stop cleanup.
+#[derive(Clone)]
+pub(crate) struct FirstClientClaimToken(Arc<()>);
+
 /// SSE 流注册表（rcoder 进程级单例，挂在 `AppState`）。
 pub struct SessionStreamRegistry {
     /// 已服务过客户端的 session（首连资格）：跨转发 task 生命周期——
     /// 长 turn 中客户端断连重连不会误重放已收消息；终端事件时移除条目
     /// = 新一轮 turn 的首连重新获得资格。
-    served_sessions: DashMap<String, ()>,
+    served_sessions: DashMap<String, Arc<()>>,
     /// grpc_addr → 活跃 per-client 转发 task（容器销毁按 addr 批量取消）
     active: DashMap<String, Vec<ActiveStreamRegistration>>,
     admission: Mutex<Admission>,
@@ -164,8 +168,28 @@ impl SessionStreamRegistry {
     /// （live-only，不重放——防重复红线）。turn 终态自动归还资格。
     pub fn claim_first_client(&self, session_id: &str) -> bool {
         self.served_sessions
-            .insert(session_id.to_string(), ())
+            .insert(session_id.to_string(), Arc::new(()))
             .is_none()
+    }
+
+    pub(crate) fn capture_first_client_claim(
+        &self,
+        session_id: &str,
+    ) -> Option<FirstClientClaimToken> {
+        self.served_sessions
+            .get(session_id)
+            .map(|entry| FirstClientClaimToken(Arc::clone(entry.value())))
+    }
+
+    /// A delayed Stop cannot release a later subscription's same-SID claim.
+    pub(crate) fn release_first_client_claim_if_current(
+        &self,
+        session_id: &str,
+        captured: &FirstClientClaimToken,
+    ) -> bool {
+        self.served_sessions
+            .remove_if(session_id, |_, current| Arc::ptr_eq(current, &captured.0))
+            .is_some()
     }
 
     /// turn 终态（end_turn/error）归还首连资格：新一轮 turn 的首个客户端

@@ -8,17 +8,17 @@ use toasty_core::schema::db::Type;
 
 use super::store_repo::outcome;
 
-pub(in crate::pg) async fn append_session_for_container(
+pub(in crate::pg) async fn session_execution_is_current(
     tx: &mut dyn Executor,
     append: &crate::pg::project_store::persist_ops::ContainerSessionAppend,
-) -> Result<PersistenceOperationOutcome> {
+) -> Result<bool> {
     let Some(container) =
         crate::db::models::Container::filter_by_container_name(&append.container_name)
             .first()
             .exec(tx)
             .await?
     else {
-        return Ok(PersistenceOperationOutcome::Superseded);
+        return Ok(false);
     };
     if !container
         .service_type
@@ -31,7 +31,7 @@ pub(in crate::pg) async fn append_session_for_container(
                 .map_err(anyhow::Error::msg)?,
         )
     {
-        return Ok(PersistenceOperationOutcome::Superseded);
+        return Ok(false);
     }
     let owned = toasty::sql::query(
         "SELECT p.project_id FROM projects p JOIN containers c
@@ -47,8 +47,22 @@ pub(in crate::pg) async fn append_session_for_container(
         .bind(&append.container_name).bind(&append.container_generation).bind(&append.physical_uid)
         .bind_typed(append.workload_uid.as_deref(), Type::Text)
         .bind(&append.logical_id).exec(tx).await?;
-    if owned.is_empty() {
+    Ok(!owned.is_empty())
+}
+
+pub(in crate::pg) async fn append_session_for_container(
+    tx: &mut dyn Executor,
+    append: &crate::pg::project_store::persist_ops::ContainerSessionAppend,
+) -> Result<PersistenceOperationOutcome> {
+    if !session_execution_is_current(tx, append).await? {
         return Ok(PersistenceOperationOutcome::Superseded);
+    }
+    // The writer already holds this SID's advisory lock. Keep the point-read
+    // decision fenced against a Stop committed before the final append.
+    for generation in &append.retirement_fences {
+        if session_generation_is_retired(tx, &append.session_id, generation).await? {
+            return Ok(PersistenceOperationOutcome::Superseded);
+        }
     }
     let outcome = add_session(
         tx,
@@ -75,15 +89,33 @@ pub(in crate::pg) async fn append_session_for_container(
         )
         .await?;
         toasty::sql::statement(
-            "UPDATE projects SET latest_session=$1 WHERE project_id=$2 AND generation=$3",
+            "UPDATE projects SET latest_session=$1 WHERE project_id=$2 AND generation=$3
+               AND row_revision=$4 AND request_id IS NOT DISTINCT FROM $5",
         )
         .bind(&append.session_id)
         .bind(&append.project_id)
         .bind(&append.project_generation)
+        .bind(append.dispatch_revision)
+        .bind_typed(append.request_id.as_deref(), Type::Text)
         .exec(tx)
         .await?;
     }
     Ok(outcome)
+}
+
+pub(in crate::pg) async fn session_generation_is_retired(
+    tx: &mut dyn Executor,
+    session_id: &str,
+    generation: &str,
+) -> Result<bool> {
+    Ok(!toasty::sql::query(
+        "SELECT session_id FROM session_tombstones WHERE session_id=$1 AND generation=$2",
+    )
+    .bind(session_id)
+    .bind(generation)
+    .exec(tx)
+    .await?
+    .is_empty())
 }
 
 pub(in crate::pg) async fn add_session(

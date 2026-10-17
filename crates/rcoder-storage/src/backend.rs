@@ -28,6 +28,37 @@ pub enum ProjectStoreBackend {
 }
 
 impl ProjectStoreBackend {
+    pub async fn capture_project_stop_registration(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Option<crate::ProjectStopFrame>> {
+        let source = match self {
+            Self::Memory(inner) => inner.get(project_id),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => store.capture_project_stop_registration(project_id).await?,
+        };
+        Ok(source.map(crate::ProjectStopFrame::capture))
+    }
+
+    pub async fn clear_sessions_if_current_durable(
+        &self,
+        frame: &crate::ProjectStopFrame,
+    ) -> anyhow::Result<shared_types::persistence::PersistenceWriteOutcome> {
+        use shared_types::persistence::PersistenceWriteOutcome;
+        match self {
+            Self::Memory(inner) => Ok(if inner.clear_sessions_if_current_frame(frame) {
+                PersistenceWriteOutcome::Committed
+            } else {
+                PersistenceWriteOutcome::Superseded
+            }),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => {
+                store
+                    .clear_sessions_if_current_durable(frame.project())
+                    .await
+            }
+        }
+    }
     /// Complete an explicit, registration-only adoption under the same PG
     /// transaction as the lifecycle outcome. No historical creator is invented.
     pub async fn complete_builder_registration_adoption(

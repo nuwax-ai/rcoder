@@ -3,6 +3,7 @@
 use crate::db::models;
 use anyhow::{Context, Result, ensure};
 
+#[derive(Clone)]
 pub(in crate::pg) struct ContainerRow {
     pub container_name: String,
     pub container_generation: String,
@@ -13,6 +14,7 @@ pub(in crate::pg) struct ContainerRow {
     #[allow(dead_code)]
     pub workload_uid: Option<String>,
     pub logical_id: String,
+    pub service_type: String,
     pub container_ip: String,
     pub internal_port: u16,
     pub external_port: u16,
@@ -79,6 +81,7 @@ impl TryFrom<models::Container> for ContainerRow {
             container_id: row.container_id,
             workload_uid: row.workload_uid,
             logical_id: row.logical_id,
+            service_type: row.service_type,
             container_ip: row.container_ip,
             internal_port: u16::try_from(row.internal_port)
                 .context("Invalid container internal port")?,

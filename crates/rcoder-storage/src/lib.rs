@@ -24,6 +24,7 @@ mod db;
 mod adapter;
 mod backend;
 pub mod config;
+mod stop_frame;
 mod userapp_agent;
 
 #[cfg(feature = "pg")]
@@ -34,6 +35,7 @@ pub use backend::ProjectStoreBackend;
 pub use shared_types::{
     CLEANUP_CHANNEL_CAPACITY, CleanupRequest, ContainerEntry, IdleContainerInfo, StorageStats,
 };
+pub use stop_frame::ProjectStopFrame;
 
 #[cfg(any(feature = "pg", feature = "userapp-turso"))]
 pub mod userapp_lifecycle;

@@ -33,6 +33,8 @@ pub(crate) enum AgentCall {
     Progress(ProgressRequest),
 }
 
+type StopCallback = Box<dyn FnOnce() -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+
 #[derive(Default)]
 pub(crate) struct ProtocolAgent {
     pub(crate) calls: Mutex<Vec<AgentCall>>,
@@ -41,6 +43,8 @@ pub(crate) struct ProtocolAgent {
     /// Optional protocol fault boundary: the RPC is accepted, but its response
     /// has not reached the HTTP handler's completion registration yet.
     pub(crate) after_chat: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// The captured execution has stopped, but its RPC response is held back.
+    pub(crate) after_stop: Mutex<Option<StopCallback>>,
     sequence: AtomicUsize,
 }
 
@@ -185,20 +189,26 @@ impl agent_service_server::AgentService for ProtocolAgent {
             .lock()
             .unwrap()
             .push(AgentCall::Stop(request.clone()));
-        let mut sessions = self.sessions.lock().unwrap();
-        if request
-            .expected_session_id
-            .as_ref()
-            .is_some_and(|sid| sessions.get(&request.project_id) != Some(sid))
-        {
-            return Ok(Response::new(StopAgentResponse {
-                success: false,
-                result: "session_mismatch".into(),
-                message: None,
-                project_id: request.project_id,
-            }));
+        let found = {
+            let mut sessions = self.sessions.lock().unwrap();
+            if request
+                .expected_session_id
+                .as_ref()
+                .is_some_and(|sid| sessions.get(&request.project_id) != Some(sid))
+            {
+                return Ok(Response::new(StopAgentResponse {
+                    success: false,
+                    result: "session_mismatch".into(),
+                    message: None,
+                    project_id: request.project_id,
+                }));
+            }
+            sessions.remove(&request.project_id).is_some()
+        };
+        let after_stop = self.after_stop.lock().unwrap().take();
+        if let Some(after_stop) = after_stop {
+            after_stop().await;
         }
-        let found = sessions.remove(&request.project_id).is_some();
         Ok(Response::new(StopAgentResponse {
             success: found,
             result: if found { "stopped" } else { "not_found" }.into(),

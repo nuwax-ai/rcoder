@@ -82,6 +82,20 @@ async fn first_client_claim_semantics() {
     );
 }
 
+#[tokio::test]
+async fn captured_stop_claim_only_releases_the_same_claim_incarnation() {
+    let reg = registry();
+    assert!(reg.claim_first_client("same-sid"));
+    let stopped = reg.capture_first_client_claim("same-sid").unwrap();
+    assert!(!reg.claim_first_client("same-sid"));
+    assert!(!reg.release_first_client_claim_if_current("same-sid", &stopped));
+    assert!(!reg.claim_first_client("same-sid"));
+    let current = reg.capture_first_client_claim("same-sid").unwrap();
+    assert!(reg.release_first_client_claim_if_current("same-sid", &current));
+    assert!(!reg.release_first_client_claim_if_current("same-sid", &current));
+    assert!(reg.claim_first_client("same-sid"));
+}
+
 /// 跨 session 隔离：s1 的资格状态不影响 s2
 #[tokio::test]
 async fn claim_is_per_session() {

@@ -958,7 +958,7 @@ async fn only_malformed_history_returns_to_admitted_same_resource_confirmation()
                 .unwrap()
                 .unwrap();
             server.abort();
-            let _ = server.await;
+            drop(server.await);
             (info, later)
         };
         #[cfg(not(feature = "deploy-host"))]

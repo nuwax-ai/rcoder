@@ -60,7 +60,33 @@ pub(crate) fn session_container_matches(
             })
 }
 
+pub(crate) fn stop_frame_matches(
+    expected: &ProjectAndContainerInfo,
+    current: &ProjectAndContainerInfo,
+) -> bool {
+    session_container_matches(expected, current)
+        && expected.persistence_identity().revision == current.persistence_identity().revision
+        && expected.request_id() == current.request_id()
+        && expected.tenant_id() == current.tenant_id()
+        && expected.space_id() == current.space_id()
+        && expected.isolation_type() == current.isolation_type()
+}
+
 impl ProjectAdapter {
+    pub(crate) fn clear_sessions_if_current_frame(&self, frame: &crate::ProjectStopFrame) -> bool {
+        let expected = frame.project();
+        let _project_guard = self.project_locks.entry_by_ref(expected.project_id());
+        let Some(current) = self.get(expected.project_id()) else {
+            return false;
+        };
+        let key = container_entry_key(&current);
+        let _container_guard = self.container_locks.entry_by_ref(&key);
+        if !Arc::ptr_eq(&frame.local_version, &current) || !stop_frame_matches(expected, &current) {
+            return false;
+        }
+        self.clear_session(expected.project_id());
+        true
+    }
     // ========== Session 操作 ==========
 
     /// Append to the exact runner captured before dispatch. Preserve all current
@@ -96,7 +122,21 @@ impl ProjectAdapter {
                 .unwrap_or(true),
             "Session belongs to another project"
         );
-        Ok(self.add_session_to_project(project_id, session_id))
+        let preserve_latest = current.persistence_identity().revision
+            != expected.persistence_identity().revision
+            || current.request_id() != expected.request_id();
+        let latest = current.latest_session().map(str::to_owned);
+        let appended = self.add_session_to_project(project_id, session_id);
+        if appended
+            && preserve_latest
+            && let Entry::Occupied(mut entry) = self.projects.entry(project_id.to_owned())
+        {
+            anyhow::ensure!(
+                Arc::make_mut(entry.get_mut()).restore_latest_session(latest.as_deref()),
+                "Current session selection disappeared during completion"
+            );
+        }
+        Ok(appended)
     }
 
     /// 通过 session_id 获取项目信息

@@ -192,6 +192,21 @@ impl AppState {
                     .into());
                 }
                 Ok(PersistenceWriteOutcome::Superseded) => {
+                    // A fresh request may have reached a replica caching the
+                    // project epoch retired by clear-all. Only the store's
+                    // proven same-physical refresh may rebase before dispatch.
+                    if let Some(refreshed) = self
+                        .projects
+                        .refresh_project_registration(project_id)
+                        .await?
+                        && refreshed.container_info().is_some_and(|basic| {
+                            basic.container_id == observed.container_id
+                                && basic.workload_uid == observed.workload_uid
+                        })
+                    {
+                        ensure_request_owner(&refreshed, &incoming)?;
+                        continue;
+                    }
                     return Err(AppError::conflict(
                         "Computer registration was retired or replaced before task dispatch",
                     )
@@ -205,8 +220,6 @@ impl AppState {
                             .zip(after.as_ref())
                             .is_some_and(|(before, after)| {
                                 !Arc::ptr_eq(before, after)
-                                    && before.persistence_identity().generation
-                                        == after.persistence_identity().generation
                                     && after.container_info().is_some_and(|basic| {
                                         basic.container_id == observed.container_id
                                             && basic.workload_uid == observed.workload_uid

@@ -394,6 +394,13 @@ pub(in crate::pg) async fn lock_ops(
     let mut keys = std::collections::BTreeSet::new();
     for op in ops {
         match op {
+            PersistOp::StopProject(stop) => {
+                keys.insert(format!("project:{}", stop.expected.project_id()));
+                if let Some(basic) = stop.expected.container_info() {
+                    keys.insert(format!("container-name:{}", basic.container_name));
+                    keys.insert(format!("container:{}", basic.container_id));
+                }
+            }
             PersistOp::AppendSessionForContainer(append) => {
                 keys.insert(format!("project:{}", append.project_id));
                 keys.insert(format!("session:{}", append.session_id));
@@ -508,6 +515,7 @@ pub(in crate::pg) async fn execute_op(
     use PersistOp as Op;
     let db = tx;
     let outcome = match op {
+        Op::StopProject(stop) => super::project_stop::execute_stop(db, stop).await?,
         Op::AppendSessionForContainer(append) => {
             repo::append_session_for_container(db, append).await?
         }

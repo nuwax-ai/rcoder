@@ -563,6 +563,29 @@ impl AppState {
         }
     }
 
+    /// Capture the catalog/physical identity before stopping a Computer agent.
+    pub async fn capture_project_stop_registration(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Option<rcoder_storage::ProjectStopFrame>> {
+        self.projects
+            .capture_project_stop_registration(project_id)
+            .await
+    }
+
+    /// Clear only the stopped registration; a later chat keeps its SSE claims.
+    pub async fn clear_sessions_if_current_durable(
+        &self,
+        frame: &rcoder_storage::ProjectStopFrame,
+    ) -> anyhow::Result<shared_types::persistence::PersistenceWriteOutcome> {
+        complete_project_stop_registration(
+            &self.session_stream_registry,
+            frame,
+            self.projects.clear_sessions_if_current_durable(frame),
+        )
+        .await
+    }
+
     /// 清除会话信息（同步版：非 stop 路径/测试用；stop 链路走 durable 版）
     pub fn clear_session(&self, project_id: &str) {
         let sids: Vec<String> = self
@@ -611,6 +634,34 @@ impl AppState {
         self.projects.update_session_activity(session_id);
     }
 }
+
+async fn complete_project_stop_registration(
+    streams: &crate::grpc::SessionStreamRegistry,
+    frame: &rcoder_storage::ProjectStopFrame,
+    completion: impl Future<Output = anyhow::Result<shared_types::persistence::PersistenceWriteOutcome>>,
+) -> anyhow::Result<shared_types::persistence::PersistenceWriteOutcome> {
+    let captured_claims: Vec<_> = frame
+        .project()
+        .sessions()
+        .into_iter()
+        .filter_map(|sid| {
+            streams
+                .capture_first_client_claim(&sid)
+                .map(|claim| (sid, claim))
+        })
+        .collect();
+    let outcome = completion.await?;
+    if outcome == shared_types::persistence::PersistenceWriteOutcome::Committed {
+        for (sid, claim) in captured_claims {
+            streams.release_first_client_claim_if_current(&sid, &claim);
+        }
+    }
+    Ok(outcome)
+}
+
+#[cfg(all(test, any(feature = "kubernetes", feature = "rcoder-pg")))]
+#[path = "app_state/stop_tests.rs"]
+mod stop_tests;
 
 /// 契约二（地址代次失效）守卫判定：失效动作只在"发起时观察到的旧实例
 /// 身份与注册表当前绑定一致，或注册表已无该 workload 绑定"时放行。

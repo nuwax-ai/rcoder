@@ -50,6 +50,17 @@ const TOUCH_THROTTLE_TTI: Duration = Duration::from_secs(3600);
 pub struct PgStore {
     /// Serializes local mirror mutation and immutable operation registration; never spans await.
     registration: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Unconfirmed local clear-all projections; only cache convergence, never
+    /// startup admission or durable recovery proof. SQL owns the Stop fence.
+    project_stops: std::sync::Mutex<
+        std::collections::HashMap<String, Arc<project_store::project_stop::ProjectStop>>,
+    >,
+    rejected_container_intents: std::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            Arc<project_store::container_intent::RejectedContainerIntent>,
+        >,
+    >,
     container_registration: std::sync::Mutex<
         std::collections::HashMap<String, shared_types::persistence::ContainerPersistenceIdentity>,
     >,
@@ -132,6 +143,8 @@ impl PgStore {
 
         let store = Self {
             registration: std::sync::Mutex::new(std::collections::HashMap::new()),
+            project_stops: std::sync::Mutex::new(std::collections::HashMap::new()),
+            rejected_container_intents: std::sync::Mutex::new(std::collections::HashMap::new()),
             container_registration: std::sync::Mutex::new(container_registration),
             closing: std::sync::atomic::AtomicBool::new(false),
             active_writes: std::sync::atomic::AtomicUsize::new(0),
@@ -221,6 +234,14 @@ impl PgStore {
         mut info: Arc<ProjectAndContainerInfo>,
         retired: &std::collections::HashMap<String, String>,
     ) -> anyhow::Result<Arc<ProjectAndContainerInfo>> {
+        anyhow::ensure!(
+            !self
+                .project_stops
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(info.project_id()),
+            "Project Stop registration is pending authoritative confirmation"
+        );
         let supplied = info.persistence_identity().clone();
         // 契约三行3/§1.2 换代门输入：当前注册的 workload UID（同名替换判定）。
         let mut registered_workload_uid: Option<String> = None;
