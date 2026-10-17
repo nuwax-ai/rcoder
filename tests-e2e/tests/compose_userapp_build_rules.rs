@@ -134,7 +134,7 @@ async fn init_zip_workspace(
     entries: &[(&str, &str)],
 ) -> bool {
     let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    let opts: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
     for (name, content) in entries {
         zw.start_file(*name, opts).unwrap();
         std::io::Write::write_all(&mut zw, content.as_bytes()).unwrap();

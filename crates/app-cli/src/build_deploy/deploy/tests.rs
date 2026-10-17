@@ -825,3 +825,47 @@ fn advisory_pending_and_corrupt_migrations_allow_previous_generation_restore() {
         );
     }
 }
+
+/// 固定旧 zip 8.6.0 writer 制品；旧库不进入生产或开发依赖锁。
+/// fixture SHA256: 7dc3bc12fbe9afc34f4239013d58f865a9f33a9c51c71fabeb712ebf22c4a3a3.
+#[cfg(unix)]
+#[test]
+fn deploy_reads_retained_zip8_artifact_with_links_permissions_and_unicode_names() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let package = root.path().join("legacy.zip");
+    std::fs::write(&package, include_bytes!("fixtures/legacy_zip8.zip")).unwrap();
+    let output = root.path().join("extracted");
+    extract_zip_sync(&package, &output).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(output.join("web/index.html")).unwrap(),
+        "legacy-zip8-content\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(output.join("web/菜单.txt")).unwrap(),
+        "旧制品保留\n"
+    );
+    let mode = std::fs::metadata(output.join("web/run.sh"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o755);
+    assert_eq!(mode & 0o6000, 0);
+    let link = output.join("node_modules/entry");
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        std::fs::canonicalize(&link)
+            .unwrap()
+            .starts_with(std::fs::canonicalize(&output).unwrap())
+    );
+    assert_eq!(
+        std::fs::read_to_string(link.join("index.html")).unwrap(),
+        "legacy-zip8-content\n"
+    );
+}

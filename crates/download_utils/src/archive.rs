@@ -175,7 +175,10 @@ pub fn extract_zip(
         let mut entry = archive
             .by_index(i)
             .map_err(|e| ArchiveError::InvalidArchive(format!("read zip entry {i}: {e}")))?;
-        let entry_name = entry.name().to_string();
+        let entry_name = entry
+            .name()
+            .map_err(|e| ArchiveError::InvalidArchive(format!("read zip entry {i} name: {e}")))?
+            .into_owned();
         let entry_path = PathBuf::from(&entry_name);
 
         let sanitized = sanitize_entry_path(&entry_path)?;
@@ -760,7 +763,7 @@ mod tests {
         {
             let file = File::create(&archive).unwrap();
             let mut zip = zip::ZipWriter::new(file);
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            let opts: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
             zip.start_file("../../../etc/evil", opts).unwrap();
             zip.write_all(b"pwned").unwrap();
             zip.finish().unwrap();
@@ -804,7 +807,7 @@ mod tests {
         {
             let file = File::create(&archive).unwrap();
             let mut zip = zip::ZipWriter::new(file);
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            let opts: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
             zip.start_file("big.bin", opts).unwrap();
             zip.write_all(&vec![b'y'; 4096]).unwrap();
             zip.finish().unwrap();

@@ -1265,3 +1265,32 @@ fn enum_fields_document_all_serialized_values() {
     }
     assert!(checked >= 15, "枚举引用字段覆盖数异常偏少: {checked}");
 }
+
+/// 内嵌 Swagger 资源必须经过实际 Router 提供；同时覆盖构建期 ZIP 依赖升级。
+#[tokio::test]
+async fn swagger_ui_serves_vendored_assets() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let app = Router::new().merge(create_swagger_ui());
+    for (path, expected) in [
+        ("/api/docs/", "swagger-ui.css"),
+        ("/api/docs/swagger-ui.css", ".swagger-ui"),
+        ("/api/docs/swagger-ui-bundle.js", "SwaggerUIBundle"),
+        ("/api/docs/swagger-initializer.js", "/api/docs/openapi.json"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "GET {path} 非 200");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(!body.is_empty(), "GET {path} 返回空资源");
+        assert!(
+            String::from_utf8_lossy(&body).contains(expected),
+            "GET {path} 缺少资源语义锚点 {expected}"
+        );
+    }
+}

@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/*", "tests-e2e"]
-exclude = ["tmp/*", "crates/app-cli"]
+exclude = ["tmp/*", "crates/app-cli", "vendor/utoipa-swagger-ui"]
 resolver = "2"
 
 default-members = [
@@ -268,7 +268,7 @@ dirs = "7.0"
 # Archive utilities
 flate2 = "1.1"
 tar = "0.4"
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 
 utoipa = { version = "6", features = ["axum_extras", "uuid", "chrono"] }
 utoipa-axum = "0.3"
@@ -379,3 +379,7 @@ debug = false
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# 使用已核对发布包的窄构建依赖补丁，直到上游正式支持 zip 9。
+[patch.crates-io]
+utoipa-swagger-ui = { path = "vendor/utoipa-swagger-ui" }

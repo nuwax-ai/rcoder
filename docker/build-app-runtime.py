@@ -25,7 +25,7 @@ def prepare_context(root, destination):
         return [name for name in names if name in {'target', 'target-console', 'target-unstable', 'node_modules', '.git', 'reports', '__pycache__'} or name.startswith('.env')]
     for filename in ['Cargo.toml', 'Cargo.lock']:
         shutil.copy2(root / filename, destination / filename)
-    for directory in ['crates', 'tests-e2e']:
+    for directory in ['crates', 'tests-e2e', 'vendor']:
         shutil.copytree(root / directory, destination / directory, ignore=ignored)
     # Include official asset verification and identity helpers, never secrets.
     build_tools = destination / 'tools/build'

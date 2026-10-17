@@ -115,13 +115,13 @@ fn assert_unique_entries(path: &Path, expected_path: &str) {
     let mut expected_count = 0;
     for index in 0..archive.len() {
         let entry = archive.by_index(index).expect("ZIP entry");
-        if entry.name() == expected_path {
+        if entry.name().unwrap() == expected_path {
             expected_count += 1;
         }
         assert!(
-            names.insert(entry.name().to_owned()),
+            names.insert(entry.name().unwrap().into_owned()),
             "duplicate package entry: {}",
-            entry.name()
+            entry.name().unwrap()
         );
     }
     assert_eq!(

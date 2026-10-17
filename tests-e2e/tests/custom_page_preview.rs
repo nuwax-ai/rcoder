@@ -32,7 +32,7 @@ fn build_vite_project_zip() -> Vec<u8> {
     let mut buf = std::io::Cursor::new(Vec::new());
     {
         let mut zip = zip::ZipWriter::new(&mut buf);
-        let options: zip::write::FileOptions<'_, ()> =
+        let options: zip::write::SimpleFileOptions =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         let package_json = r#"{
   "name": "e2e-custom-page-preview",

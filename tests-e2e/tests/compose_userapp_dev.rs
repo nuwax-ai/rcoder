@@ -1483,7 +1483,7 @@ async fn userapp_dev_skills_push() {
 
     // 构造 skill zip（e2e-skill-probe/SKILL.md）
     let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    let opts: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
     zw.start_file("skills/e2e-skill-probe/SKILL.md", opts)
         .unwrap();
     std::io::Write::write_all(&mut zw, b"---\nname: e2e-skill-probe\n---\nprobe\n").unwrap();
@@ -1574,7 +1574,7 @@ async fn userapp_dev_template_zip_and_projects() {
     // "already has a confirmed manifest"；只放特征让 detect 生成 draft
     let ws_manifest = "schema_version = 1\n\n[workspace]\nname = \"e2e-tpl\"\n";
     let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    let opts: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
     zw.start_file("workspace.manifest.toml", opts).unwrap();
     std::io::Write::write_all(&mut zw, ws_manifest.as_bytes()).unwrap();
     zw.start_file("backend-go/go.mod", opts).unwrap();
@@ -1845,7 +1845,7 @@ async fn userapp_dev_server_lifecycle() {
     let ws_manifest = "schema_version = 1\n\n[workspace]\nname = \"e2e-srv\"\n";
     let proj_manifest = "schema_version = 1\n\n[project]\nservice_id = \"backend-go\"\nname = \"Go Backend\"\ntype = \"go\"\nkind = \"web\"\nenabled = true\n\n[build]\ncommand = [\"sh\", \"-c\", \"zip -q artifact.zip start.sh\"]\nartifact = \"artifact.zip\"\n\n[run]\ncommand = [\"sh\", \"-c\", \"touch ready && exec python3 -m http.server $PORT --bind 0.0.0.0\"]\n\n[health]\nreadiness_path = \"/ready\"\n\n[proxy]\npath = \"/api/go/\"\nstrip_prefix = true\n";
     let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    let opts: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
     zw.start_file("workspace.manifest.toml", opts).unwrap();
     std::io::Write::write_all(&mut zw, ws_manifest.as_bytes()).unwrap();
     zw.start_file("backend-go/project.manifest.toml", opts)
@@ -3125,7 +3125,7 @@ async fn userapp_dev_terminal_cwd_via_ttyd_ws() {
 /// P0 场景共享：内存 zip → init-project-template（entries: (zip 内路径, 内容)）。
 async fn upload_ws_zip(env: &Env, app: &str, user: &str, entries: &[(&str, &str)]) -> bool {
     let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    let opts: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
     for (path, content) in entries {
         zw.start_file(*path, opts).unwrap();
         std::io::Write::write_all(&mut zw, content.as_bytes()).unwrap();

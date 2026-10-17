@@ -77,7 +77,7 @@ roxmltree = "0.21"
 sha2 = "0.11"
 hex = "0.4"
 # 部署段解压制品包（与 rcoder workspace zip 同版本；deflate 足够覆盖平台制品）
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 # 部署段制品 zip 魔数校验（拦 HTTP 200 + 错误信封 body 被当 zip 落盘）；
 # 关 default 裁掉 cfb 传递依赖——只用 archive::is_zip 纯函数
 infer = { version = "0.22", default-features = false }
@@ -106,3 +106,7 @@ http-body-util = "0.1"
 #（set_var/remove_var 在 edition 2024 为 unsafe）经 lib.rs 的 cfg(test)
 # allow 豁免——仅测试代码、仅 env 变异，不含其他 unsafe 操作。
 rust.unsafe_code = "deny"
+
+# app-cli 是独立解析根，需与主 workspace 指向同一受控上游副本。
+[patch.crates-io]
+utoipa-swagger-ui = { path = "../../vendor/utoipa-swagger-ui" }

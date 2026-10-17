@@ -174,7 +174,7 @@ mod tests {
         {
             let file = std::fs::File::create(&archive_path).unwrap();
             let mut zip = zip::ZipWriter::new(file);
-            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            let opts: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
             zip.start_file("../../../etc/evil", opts).unwrap();
             zip.write_all(b"pwned").unwrap();
             zip.finish().unwrap();

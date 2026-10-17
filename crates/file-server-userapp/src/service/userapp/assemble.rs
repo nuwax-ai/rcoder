@@ -147,7 +147,10 @@ fn merge_artifact_with_prefix(
         if entry.is_dir() {
             continue; // 目录条目跳过：文件条目带路径，解压时自动建目录
         }
-        let orig_name = entry.name().to_string();
+        let orig_name = entry
+            .name()
+            .map_err(|e| AppError::file(format!("read entry {i} name: {e}")))?
+            .into_owned();
         // Zip Slip 防御：跳过含 `..` / 绝对路径 / 反斜杠 的源条目（子项目产物本应干净，保险）
         if orig_name.contains("..") || orig_name.starts_with('/') || orig_name.contains('\\') {
             tracing::warn!(entry = %orig_name, "skip unsafe zip entry in artifact");

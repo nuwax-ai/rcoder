@@ -380,7 +380,10 @@ pub(crate) fn zip_semantic_entries(bytes: &[u8]) -> Result<Value> {
         let mut entry = archive
             .by_index(index)
             .with_context(|| format!("read ZIP entry {index}"))?;
-        let name = entry.name().replace('\\', "/");
+        let name = entry
+            .name()
+            .with_context(|| format!("decode ZIP entry {index} name"))?
+            .replace('\\', "/");
         let declared_size = entry.size();
         if declared_size > ZIP_ENTRY_SIZE_LIMIT {
             bail!("ZIP entry {name:?} exceeds the per-entry comparison limit");
