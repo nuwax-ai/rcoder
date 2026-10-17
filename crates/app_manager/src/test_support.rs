@@ -43,11 +43,21 @@ pub(crate) struct MockRuntime {
     pub configuration_targets: std::sync::Mutex<Vec<shared_types::RuntimeConfigurationTarget>>,
     pub mutation_uid_override: std::sync::Mutex<Option<String>>,
     pub scale_calls: AtomicUsize,
+    pub wake_start_reply_unknown: AtomicBool,
     pub management_start_calls: AtomicUsize,
     /// restart_app_target 调用计数与每次收到的镜像（image-roll 断言用）。
     pub restart_calls: AtomicUsize,
     pub restart_images: std::sync::Mutex<Vec<Option<String>>>,
     pub lease_held: Arc<AtomicBool>,
+    /// Event-only read observation for independent wake fixtures; no polling.
+    pub wake_mutex_observation_enabled: AtomicBool,
+    pub wake_mutex_observation_calls: AtomicUsize,
+    pub wake_mutex_expired: AtomicBool,
+    pub wake_mutex_holder_lifecycle: std::sync::Mutex<Option<Option<String>>>,
+    pub wake_mutex_expired_takeovers: AtomicUsize,
+    pub wake_mutex_wait_entered: tokio::sync::Notify,
+    pub wake_mutex_changed: Arc<tokio::sync::Notify>,
+    pub wake_mutex_revision: Arc<AtomicUsize>,
     pub lease_acquire_calls: AtomicUsize,
     pub lease_validation_fails: AtomicBool,
     pub lease_validation_calls: AtomicUsize,
@@ -263,8 +273,122 @@ impl shared_types::AppOperationLease for MockOperationLease {
     }
 }
 
+struct ObservedWakeLease {
+    inner: Box<dyn shared_types::AppOperationLease>,
+    changed: Arc<tokio::sync::Notify>,
+    revision: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl shared_types::AppOperationLease for ObservedWakeLease {
+    fn receipt(&self) -> Option<shared_types::UserAppOperationLeaseReceipt> {
+        self.inner.receipt()
+    }
+    async fn release(self: Box<Self>) -> Result<(), String> {
+        self.inner.release().await?;
+        self.revision.fetch_add(1, Ordering::SeqCst);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl UserAppDeploymentRuntime for MockRuntime {
+    async fn acquire_vacant_app_operation(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
+        // This fixture's CAS acquisition never has a takeover branch.
+        self.acquire_app_operation(app_id).await
+    }
+    async fn observe_app_operation_mutex(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+    ) -> ContainerRuntimeResult<container_runtime_api::AppOperationMutexObservation> {
+        use container_runtime_api::{AppOperationMutexIdentity, AppOperationMutexObservation};
+        self.wake_mutex_observation_calls
+            .fetch_add(1, Ordering::SeqCst);
+        if !self.lease_held.load(Ordering::SeqCst) {
+            return Ok(AppOperationMutexObservation::Absent);
+        }
+        if !self.wake_mutex_observation_enabled.load(Ordering::SeqCst) {
+            return Ok(AppOperationMutexObservation::Unconfirmed);
+        }
+        let identity = AppOperationMutexIdentity {
+            namespace: "test".into(),
+            name: format!("rcoder-operation-prod-{app_id}"),
+            uid: format!("lease-{app_id}"),
+            token: "test-operation".into(),
+            resource_version: self.wake_mutex_revision.load(Ordering::SeqCst).to_string(),
+            lifecycle_id: self
+                .wake_mutex_holder_lifecycle
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| Some(lifecycle_id.into())),
+        };
+        Ok(if self.wake_mutex_expired.load(Ordering::SeqCst) {
+            AppOperationMutexObservation::Expired(identity)
+        } else {
+            AppOperationMutexObservation::Occupied(identity)
+        })
+    }
+    async fn acquire_observed_expired_app_operation(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+        observed: &container_runtime_api::AppOperationMutexIdentity,
+    ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
+        let latest = self
+            .observe_app_operation_mutex(app_id, lifecycle_id)
+            .await?;
+        if latest != container_runtime_api::AppOperationMutexObservation::Expired(observed.clone())
+            || self
+                .wake_mutex_expired
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(ContainerRuntimeError::OperationInProgress(Box::new(
+                shared_types::UserAppOperationInProgress {
+                    app_id: app_id.into(),
+                    service_type: ServiceType::Userapp,
+                    resource_name: format!("rcoder-operation-prod-{app_id}"),
+                    operation_id: None,
+                },
+            )));
+        }
+        self.wake_mutex_expired_takeovers
+            .fetch_add(1, Ordering::SeqCst);
+        self.wake_mutex_holder_lifecycle.lock().unwrap().take();
+        self.lease_held.store(false, Ordering::SeqCst);
+        self.wake_mutex_revision.fetch_add(1, Ordering::SeqCst);
+        self.acquire_app_operation(app_id).await
+    }
+    async fn wait_app_operation_mutex_change(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+        observed: &container_runtime_api::AppOperationMutexIdentity,
+        budget: Duration,
+    ) -> ContainerRuntimeResult<container_runtime_api::AppOperationMutexObservation> {
+        use container_runtime_api::AppOperationMutexObservation;
+        let deadline = tokio::time::Instant::now() + budget;
+        let changed = self.wake_mutex_changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let latest = self
+            .observe_app_operation_mutex(app_id, lifecycle_id)
+            .await?;
+        if latest != AppOperationMutexObservation::Occupied(observed.clone()) {
+            return Ok(latest);
+        }
+        self.wake_mutex_wait_entered.notify_one();
+        match tokio::time::timeout_at(deadline, changed).await {
+            Ok(()) => self.observe_app_operation_mutex(app_id, lifecycle_id).await,
+            Err(_) => Ok(AppOperationMutexObservation::Unconfirmed),
+        }
+    }
+
     async fn app_runtime_configuration_uid(
         &self,
         app_id: &str,
@@ -588,11 +712,20 @@ impl UserAppDeploymentRuntime for MockRuntime {
         if let Some(release) = release {
             release.wait().await;
         }
-        Ok(Some(Box::new(MockOperationLease(
+        let lease: Box<dyn shared_types::AppOperationLease> = Box::new(MockOperationLease(
             self.lease_held.clone(),
             _app_id.into(),
             ServiceType::Userapp,
-        ))))
+        ));
+        if self.wake_mutex_observation_enabled.load(Ordering::SeqCst) {
+            Ok(Some(Box::new(ObservedWakeLease {
+                inner: lease,
+                changed: self.wake_mutex_changed.clone(),
+                revision: self.wake_mutex_revision.clone(),
+            })))
+        } else {
+            Ok(Some(lease))
+        }
     }
 
     async fn validate_app_operation_receipt(
@@ -802,6 +935,11 @@ impl UserAppDeploymentRuntime for MockRuntime {
                     self.post_activation_status_fails.load(Ordering::SeqCst),
                     Ordering::SeqCst,
                 );
+                if self.wake_start_reply_unknown.load(Ordering::SeqCst) {
+                    return Err(ContainerRuntimeError::Timeout(
+                        "original Start reply was lost after runtime acceptance".into(),
+                    ));
+                }
                 Ok(())
             }
             dashmap::mapref::entry::Entry::Vacant(_) => Err(ContainerRuntimeError::Conflict(

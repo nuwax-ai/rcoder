@@ -377,6 +377,25 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
             .await
     }
 
+    async fn observe_app_operation_mutex(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+    ) -> ContainerRuntimeResult<container_runtime_api::AppOperationMutexObservation> {
+        self.observe_application_mutex(app_id, lifecycle_id).await
+    }
+
+    async fn wait_app_operation_mutex_change(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+        observed: &container_runtime_api::AppOperationMutexIdentity,
+        budget: std::time::Duration,
+    ) -> ContainerRuntimeResult<container_runtime_api::AppOperationMutexObservation> {
+        self.wait_application_mutex_change(app_id, lifecycle_id, observed, budget)
+            .await
+    }
+
     async fn inspect_app_deletion(
         &self,
         context: &shared_types::UserAppExecutionContext,
@@ -428,11 +447,31 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
             .await
     }
 
+    async fn acquire_vacant_app_operation(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
+        self.acquire_vacant_application_operation(app_id)
+            .await
+            .map(Some)
+    }
+
     async fn acquire_app_operation(
         &self,
         app_id: &str,
     ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
         self.acquire_application_operation(app_id, &ServiceType::Userapp)
+            .await
+            .map(Some)
+    }
+
+    async fn acquire_observed_expired_app_operation(
+        &self,
+        app_id: &str,
+        current_lifecycle_id: &str,
+        observed: &container_runtime_api::AppOperationMutexIdentity,
+    ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
+        self.acquire_observed_expired_application_operation(app_id, current_lifecycle_id, observed)
             .await
             .map(Some)
     }

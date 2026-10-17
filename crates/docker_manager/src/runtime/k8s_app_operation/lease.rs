@@ -404,3 +404,59 @@ pub(super) async fn take_over_expired(
         ))),
     }
 }
+
+/// Serving has separately checked the current durable admission and owned
+/// target. Bind its conditional mutex acquisition to the exact read candidate;
+/// never extend that decision to a new holder, renewed revision or empty name.
+pub(super) async fn take_over_observed_expired(
+    api: &Api<Lease>,
+    namespace: &str,
+    name: &str,
+    app_id: &str,
+    current_lifecycle_id: &str,
+    observed: &container_runtime_api::AppOperationMutexIdentity,
+    desired: &Lease,
+) -> ContainerRuntimeResult<TakeOver> {
+    let Some(current) = api.get_opt(name).await.map_err(|error| {
+        ContainerRuntimeError::K8sError(format!("Read observed-expired application mutex: {error}"))
+    })?
+    else {
+        return Ok(TakeOver::InProgress(None));
+    };
+    let identity =
+        observation::mutex_identity(&current, namespace, name, app_id, current_lifecycle_id)?;
+    if current.metadata.deletion_timestamp.is_some() {
+        return Err(ContainerRuntimeError::Conflict(
+            "Observed-expired application mutex is deleting".into(),
+        ));
+    }
+    if &identity != observed || !lease_expired_at(k8s_openapi::jiff::Timestamp::now(), &current) {
+        return Ok(TakeOver::InProgress(reported_operation(&current)));
+    }
+    let transitions = current
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.lease_transitions)
+        .unwrap_or(0);
+    let mut patch = takeover_patch(desired, &observed.resource_version, transitions)?;
+    // RV is the CAS boundary; retaining the UID also lets the API reject any
+    // accidental same-name replacement instead of silently rebasing it.
+    patch["metadata"]["uid"] = observed.uid.clone().into();
+    match api
+        .patch(name, &PatchParams::default(), &Patch::Merge(patch))
+        .await
+    {
+        Ok(taken) => Ok(TakeOver::Acquired(Box::new(taken))),
+        Err(kube::Error::Api(status)) if status.code == 404 => Ok(TakeOver::InProgress(None)),
+        Err(kube::Error::Api(status)) if status.code == 409 => {
+            let winner = match api.get_opt(name).await {
+                Ok(Some(current)) => reported_operation(&current),
+                Ok(None) | Err(_) => None,
+            };
+            Ok(TakeOver::InProgress(winner))
+        }
+        Err(error) => Err(ContainerRuntimeError::K8sError(format!(
+            "Conditionally acquire observed-expired application mutex: {error}"
+        ))),
+    }
+}

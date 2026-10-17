@@ -484,6 +484,57 @@ impl KubernetesRuntime {
         context: Option<&shared_types::UserAppExecutionContext>,
         compute: bool,
     ) -> ContainerRuntimeResult<Box<dyn AppOperationLease>> {
+        self.acquire_operation_lease_mode(app_id, service_type, context, compute, true, None)
+            .await
+    }
+
+    pub(crate) async fn acquire_vacant_application_operation(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Box<dyn AppOperationLease>> {
+        self.acquire_operation_lease_mode(app_id, &ServiceType::Userapp, None, false, false, None)
+            .await
+    }
+
+    pub(crate) async fn acquire_observed_expired_application_operation(
+        &self,
+        app_id: &str,
+        current_lifecycle_id: &str,
+        observed: &container_runtime_api::AppOperationMutexIdentity,
+    ) -> ContainerRuntimeResult<Box<dyn AppOperationLease>> {
+        if app_id.is_empty() || current_lifecycle_id.is_empty() {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Observed-expired acquisition requires application and current lifecycle IDs"
+                    .into(),
+            ));
+        }
+        let name = operation_name(app_id, &ServiceType::Userapp)?;
+        observation::validate_observed_scope(
+            observed,
+            &self.namespace,
+            &name,
+            current_lifecycle_id,
+        )?;
+        self.acquire_operation_lease_mode(
+            app_id,
+            &ServiceType::Userapp,
+            None,
+            false,
+            false,
+            Some((current_lifecycle_id, observed)),
+        )
+        .await
+    }
+
+    async fn acquire_operation_lease_mode(
+        &self,
+        app_id: &str,
+        service_type: &ServiceType,
+        context: Option<&shared_types::UserAppExecutionContext>,
+        compute: bool,
+        allow_takeover: bool,
+        observed_expired: Option<(&str, &container_runtime_api::AppOperationMutexIdentity)>,
+    ) -> ContainerRuntimeResult<Box<dyn AppOperationLease>> {
         if !matches!(
             service_type,
             ServiceType::Userapp | ServiceType::UserappBuilder
@@ -518,6 +569,9 @@ impl KubernetesRuntime {
             let legacy_id = uuid::Uuid::new_v4().to_string();
             annotations.insert("rcoder.io/legacy-operation-id".into(), legacy_id.clone());
             holder_identity = format!("legacy:{legacy_id}");
+        }
+        if let Some((current_lifecycle_id, _)) = observed_expired {
+            annotations.insert("rcoder.io/lifecycle-id".into(), current_lifecycle_id.into());
         }
         if compute {
             let context = context.ok_or_else(|| {
@@ -560,14 +614,45 @@ impl KubernetesRuntime {
                 ..Default::default()
             }),
         };
-        let acquired = match api.create(&PostParams::default(), &object).await {
-            Ok(created) => created,
-            Err(kube::Error::Api(status)) if status.code == 409 => {
-                match take_over_expired(&api, &name, &object).await? {
-                    TakeOver::Acquired(taken) => *taken,
-                    TakeOver::InProgress(operation_id) => {
-                        // Report the live holder's identity, never this losing
-                        // request's UUID; None means an unidentifiable holder.
+        let acquired = if let Some((current_lifecycle_id, observed)) = observed_expired {
+            // Never POST from an expired observation: disappearance, renewal or
+            // a successor requires a new read and normal admission decision.
+            match take_over_observed_expired(
+                &api,
+                &self.namespace,
+                &name,
+                app_id,
+                current_lifecycle_id,
+                observed,
+                &object,
+            )
+            .await?
+            {
+                TakeOver::Acquired(taken) => *taken,
+                TakeOver::InProgress(operation_id) => {
+                    return Err(ContainerRuntimeError::OperationInProgress(Box::new(
+                        shared_types::UserAppOperationInProgress {
+                            app_id: app_id.into(),
+                            service_type: *service_type,
+                            resource_name: name,
+                            operation_id,
+                        },
+                    )));
+                }
+            }
+        } else {
+            match api.create(&PostParams::default(), &object).await {
+                Ok(created) => created,
+                Err(kube::Error::Api(status)) if status.code == 409 => {
+                    if !allow_takeover {
+                        // The losing create is definitively rejected. Observe only;
+                        // expiry and preflight absence never authorize a patch.
+                        let current = api.get_opt(&name).await.map_err(|error| {
+                            ContainerRuntimeError::K8sError(format!(
+                                "Read occupied application mutex after rejected create: {error}"
+                            ))
+                        })?;
+                        let operation_id = current.as_ref().and_then(holder_token);
                         return Err(ContainerRuntimeError::OperationInProgress(Box::new(
                             shared_types::UserAppOperationInProgress {
                                 app_id: app_id.into(),
@@ -577,12 +662,27 @@ impl KubernetesRuntime {
                             },
                         )));
                     }
+                    match take_over_expired(&api, &name, &object).await? {
+                        TakeOver::Acquired(taken) => *taken,
+                        TakeOver::InProgress(operation_id) => {
+                            // Report the live holder's identity, never this losing
+                            // request's UUID; None means an unidentifiable holder.
+                            return Err(ContainerRuntimeError::OperationInProgress(Box::new(
+                                shared_types::UserAppOperationInProgress {
+                                    app_id: app_id.into(),
+                                    service_type: *service_type,
+                                    resource_name: name,
+                                    operation_id,
+                                },
+                            )));
+                        }
+                    }
                 }
-            }
-            Err(error) => {
-                return Err(ContainerRuntimeError::K8sError(format!(
-                    "acquire application operation {name}: {error}"
-                )));
+                Err(error) => {
+                    return Err(ContainerRuntimeError::K8sError(format!(
+                        "acquire application operation {name}: {error}"
+                    )));
+                }
             }
         };
         let uid = acquired

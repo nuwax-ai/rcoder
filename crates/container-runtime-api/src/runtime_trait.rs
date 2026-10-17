@@ -1398,6 +1398,30 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         Ok(super::types::AppOperationLeaseObservation::Unconfirmed)
     }
 
+    /// Read only the production application's physical mutex. This is a wake
+    /// hint, separate from operation admission, holder-death proof and writes.
+    async fn observe_app_operation_mutex(
+        &self,
+        _app_id: &str,
+        _lifecycle_id: &str,
+    ) -> ContainerRuntimeResult<super::types::AppOperationMutexObservation> {
+        Ok(super::types::AppOperationMutexObservation::Unconfirmed)
+    }
+
+    /// Wait for a change from this exact observation under one total budget.
+    /// A renewal is another `Occupied` observation, never a release. Timeout
+    /// and unsupported runtimes remain `Unconfirmed`; callers must re-enter
+    /// normal admission after any wake, including a confirmed absence.
+    async fn wait_app_operation_mutex_change(
+        &self,
+        _app_id: &str,
+        _lifecycle_id: &str,
+        _observed: &super::types::AppOperationMutexIdentity,
+        _budget: std::time::Duration,
+    ) -> ContainerRuntimeResult<super::types::AppOperationMutexObservation> {
+        Ok(super::types::AppOperationMutexObservation::Unconfirmed)
+    }
+
     /// Holder-death proof for fenced-operation settlement: `Ok(true)` only
     /// when the receipt's holder is provably gone (released, expired, or
     /// superseded by takeover); `Ok(false)` while a holder may still be
@@ -1429,6 +1453,35 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     ) -> ContainerRuntimeResult<()> {
         Err(ContainerRuntimeError::ConfigurationError(
             "Conditional operation release is unsupported".into(),
+        ))
+    }
+
+    /// Serving admission only: atomically create a vacant application mutex.
+    /// A 409 must never patch, take over, renew, or release the occupied object,
+    /// even when it appears expired. A preceding GET is not write authority.
+    /// Unsupported backends fail explicitly; never forward to a takeover API.
+    async fn acquire_vacant_app_operation(
+        &self,
+        _app_id: &str,
+    ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Vacant-only application mutex acquisition is unsupported".into(),
+        ))
+    }
+
+    /// Acquire only the exact observed, still-expired native mutex. The caller
+    /// must first verify current lifecycle, priority ledger and target ownership,
+    /// then repeat normal durable admission before any business mutation. A
+    /// changed/renewed/missing object is a definitive occupied result, never
+    /// permission to create, rebase the observation, or take over its successor.
+    async fn acquire_observed_expired_app_operation(
+        &self,
+        _app_id: &str,
+        _current_lifecycle_id: &str,
+        _observed: &super::types::AppOperationMutexIdentity,
+    ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Observed-expired application mutex acquisition is unsupported".into(),
         ))
     }
 

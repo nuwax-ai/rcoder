@@ -45,32 +45,89 @@ impl AppService {
                 .store
                 .check_compute_access(app_id, shared_types::UserAppOperationScope::Prod, false)
                 .await?;
-            // An existing operation (including one awaiting recovery) is not a
-            // readiness wait. Do not consume the wake budget polling its lease:
-            // return the conflict so the caller can observe/recover that operation.
-            let guard = self.try_acquire_process_release_lock(app_id).await?;
-            let identity = self
-                .metadata
-                .store
-                .get_application(app_id)
-                .await?
-                .ok_or_else(|| {
-                    AppOperationError::NotFound(format!("Application identity not found: {app_id}"))
-                })?;
-            self.metadata
-                .validate_request_lifecycle(app_id, Some(&identity.lifecycle_id))
-                .await?;
-            let status = if restoration_owner.is_some()
-                && self.config.access_mode == crate::config::AppAccessMode::Docker
+            #[cfg(test)]
+            crate::service::traffic_wake_wait::pause_at(
+                crate::service::traffic_wake_wait::WakePausePoint::AccessChecked,
+            )
+            .await;
+            let serving_lifecycle = if restoration_owner.is_some()
+                && self.config.access_mode == crate::config::AppAccessMode::Kubernetes
             {
-                self.runtime
-                    .get_deployment_status(app_id)
-                    .await
-                    .map_err(|error| {
-                        crate::utils::map_runtime_error("Read application serving runtime", error)
-                    })?
+                let identity = self
+                    .metadata
+                    .store
+                    .get_application(app_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AppOperationError::NotFound(format!(
+                            "Application identity not found: {app_id}"
+                        ))
+                    })?;
+                Some(identity.lifecycle_id)
             } else {
-                Some(self.fetch_runtime_status_or_err(app_id).await?)
+                None
+            };
+            let guard = match serving_lifecycle.as_deref() {
+                Some(lifecycle_id) => {
+                    self.acquire_serving_wake_guard(app_id, lifecycle_id, deadline)
+                        .await?
+                }
+                None => self.try_acquire_process_release_lock(app_id).await?,
+            };
+            #[cfg(test)]
+            crate::service::traffic_wake_wait::pause_at(
+                crate::service::traffic_wake_wait::WakePausePoint::LeaseAcquired,
+            )
+            .await;
+            let observed = async {
+                let identity = self
+                    .metadata
+                    .store
+                    .get_application(app_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AppOperationError::NotFound(format!(
+                            "Application identity not found: {app_id}"
+                        ))
+                    })?;
+                self.metadata
+                    .validate_request_lifecycle(
+                        app_id,
+                        serving_lifecycle
+                            .as_deref()
+                            .or(Some(&identity.lifecycle_id)),
+                    )
+                    .await?;
+                if let Some(lifecycle_id) = serving_lifecycle.as_deref() {
+                    self.validate_serving_wake_identity(app_id, lifecycle_id)
+                        .await?;
+                }
+                let status = if restoration_owner.is_some()
+                    && self.config.access_mode == crate::config::AppAccessMode::Docker
+                {
+                    self.runtime
+                        .get_deployment_status(app_id)
+                        .await
+                        .map_err(|error| {
+                            crate::utils::map_runtime_error(
+                                "Read application serving runtime",
+                                error,
+                            )
+                        })?
+                } else {
+                    Some(self.fetch_runtime_status_or_err(app_id).await?)
+                };
+                Ok::<_, AppOperationError>((identity, status))
+            }
+            .await;
+            let (identity, status) = match observed {
+                Ok(observed) => observed,
+                Err(error) => {
+                    if serving_lifecycle.is_some() {
+                        guard.finish_unadmitted(deadline).await?;
+                    }
+                    return Err(error);
+                }
             };
             Ok::<_, AppOperationError>((guard, identity, status))
         };
@@ -178,6 +235,11 @@ impl AppService {
             }
         };
         let operation_id = operation.execution_context().operation_id;
+        #[cfg(test)]
+        crate::service::traffic_wake_wait::pause_at(
+            crate::service::traffic_wake_wait::WakePausePoint::AdmittedUnbound,
+        )
+        .await;
         let activation = async {
             operation.bind_lease(&guard).await?;
             let context = operation.execution_context();

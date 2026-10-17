@@ -21,6 +21,48 @@ pub enum AppOperationLeaseObservation {
     Unconfirmed,
 }
 
+/// Ephemeral observation of the production application mutex, never a receipt
+/// or permission to acquire, renew, release, or mutate an application. A missing
+/// lifecycle annotation is observable, but cannot authorize any write.
+/// Deliberately has no serialization or HTTP schema representation.
+#[derive(Clone, Eq, PartialEq)]
+pub struct AppOperationMutexIdentity {
+    pub namespace: String,
+    pub name: String,
+    pub uid: String,
+    pub token: String,
+    pub resource_version: String,
+    pub lifecycle_id: Option<String>,
+}
+
+impl std::fmt::Debug for AppOperationMutexIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AppOperationMutexIdentity")
+            .field("namespace", &self.namespace)
+            .field("name", &self.name)
+            .field("uid", &self.uid)
+            .field("token", &"[redacted]")
+            .field("resource_version", &self.resource_version)
+            .field("lifecycle_id", &self.lifecycle_id)
+            .finish()
+    }
+}
+
+/// Read-only native Lease state, not proof that legacy lock metadata is absent.
+/// Even `Absent` requires vacant-only acquisition and normal durable admission
+/// before writes; it says nothing about completion of old in-flight work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AppOperationMutexObservation {
+    Absent,
+    Occupied(AppOperationMutexIdentity),
+    /// The native mutex is present but its renewal expired. This is only a
+    /// candidate for exact conditional acquisition after current admission
+    /// checks; it never establishes completion of the old business writes.
+    Expired(AppOperationMutexIdentity),
+    Unconfirmed,
+}
+
 /// Container runtime errors
 #[derive(Error, Debug)]
 pub enum ContainerRuntimeError {

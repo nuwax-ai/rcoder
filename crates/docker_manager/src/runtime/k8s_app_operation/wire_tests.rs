@@ -5,6 +5,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[path = "previous_owner_wire_tests.rs"]
 mod previous_owner_wire_tests;
 
+#[path = "observed_expired_tests.rs"]
+mod observed_expired_tests;
+
 fn runtime_for(client: kube::Client) -> KubernetesRuntime {
     use crate::runtime::kubernetes_runtime::{KubernetesRuntime, KubernetesRuntimeConfig};
     KubernetesRuntime {
@@ -782,4 +785,44 @@ async fn deletion_retirement_after_lease_takeover_never_deletes_successor_lease(
         runtime.release_captured_application_operation(&context, &original).await.expect("release old authority without touching successor");
         server.await.expect("wire assertions");
     }).await.expect("bounded lease takeover reconciliation");
+}
+
+#[tokio::test]
+async fn vacant_serving_acquisition_never_takes_over_an_expired_or_foreign_mutex() {
+    drop(rustls::crypto::ring::default_provider().install_default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (head, _) = read_request(&mut stream).await;
+        requests.push(head.lines().next().unwrap().to_owned());
+        write_reply(&mut stream, 409, &status(409, "occupied")).await;
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (head, _) = read_request(&mut stream).await;
+        requests.push(head.lines().next().unwrap().to_owned());
+        let mut occupied = lease_json("foreign-uid", "41", Some("foreign-holder"), 3600, 0);
+        occupied["metadata"]["labels"]["rcoder.io/operation-app"] = "another-app".into();
+        write_reply(&mut stream, 200, &occupied).await;
+        requests
+    });
+    let client = kube::Client::try_from(kube::Config::new(
+        format!("http://{address}").parse().unwrap(),
+    ))
+    .unwrap();
+    let runtime = runtime_for(client);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        runtime.acquire_vacant_application_operation("takeover"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(result, Err(ContainerRuntimeError::OperationInProgress(_))),
+        "No create409 path may proceed to a takeover/renew/release"
+    );
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("POST "));
+    assert!(requests[1].starts_with("GET "));
 }

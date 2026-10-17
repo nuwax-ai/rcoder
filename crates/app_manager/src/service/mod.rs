@@ -14,6 +14,7 @@ mod file_credentials;
 mod operation_lock;
 mod operation_progress;
 pub(crate) mod restart_wait;
+pub(crate) mod traffic_wake_wait;
 pub(crate) use control::OwnedOperation;
 pub(crate) use operation_lock::AppOperationGuard;
 
