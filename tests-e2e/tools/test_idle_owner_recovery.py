@@ -2,10 +2,14 @@
 """闲置恢复工具的目录与收据契约单测；不执行 Docker/Compose 验收。"""
 
 import importlib.util
+import copy
+import io
 import json
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest.mock import patch
 
 
 SPEC = importlib.util.spec_from_file_location(
@@ -21,6 +25,82 @@ GENERATION = '39aa560f-5aba-43b6-a504-b13928e79f54'
 
 
 class IdleOwnerRecoveryToolTests(unittest.TestCase):
+    def test_proxy_port_is_only_the_private_config_listener(self):
+        original = (TOOL.REPO / 'docker/config.yml').read_text()
+        self.assertEqual(TOOL.proxy_listener_port(original), 8088)
+        for invalid in ('', 'proxy_config:\n  listen_port: 8090\n',
+                        'proxy_config:\n  listen_port: 0\n',
+                        'proxy_config:\n  listen_port: 65536\n', original + '\n' + original):
+            with self.assertRaises(ValueError):
+                TOOL.proxy_listener_port(invalid)
+
+    def test_business_request_uses_exact_own_dev_route_and_loopback(self):
+        url = TOOL.business_proxy_url('http://127.0.0.1:32109', APP)
+        self.assertEqual(url, f'http://127.0.0.1:32109/api/v1/userapp/proxy/app/dev/{APP}/{APP}/health')
+        for base in ('http://node.example:8088', 'http://127.0.0.1',
+                     'http://user@127.0.0.1:8088', 'http://127.0.0.1:8088/foreign',
+                     'http://127.0.0.1:8088?foreign=1', 'https://127.0.0.1:8088'):
+            with self.assertRaises(ValueError):
+                TOOL.business_proxy_url(base, APP)
+
+    def test_first_request_is_one_get_with_no_redirect_or_retry(self):
+        error = urllib.error.HTTPError('http://127.0.0.1:32109/own', 503, 'Unavailable',
+                    {'Content-Type': 'application/json'}, io.BytesIO(b'{"error": {}}'))
+        with patch.object(TOOL.urllib.request, 'build_opener') as build:
+            build.return_value.open.side_effect = error
+            reply = TOOL.first_proxy_request('http://127.0.0.1:32109/own')
+        self.assertEqual(build.return_value.open.call_count, 1)
+        request = build.return_value.open.call_args.args[0]
+        self.assertEqual(request.get_method(), 'GET')
+        self.assertEqual(request.get_header('Accept'), 'application/json')
+        self.assertEqual(reply['status'], 503)
+        self.assertEqual(reply['client_attempts'], 1)
+        redirect = TOOL.NoProxyRedirect()
+        self.assertIsNone(redirect.redirect_request(None, None, 302, 'redirect', {}, 'http://foreign'))
+
+    def test_503_requires_precise_proxy_failure_and_actual_unstarted_service(self):
+        failure = {'code': 'USERAPP_PROXY_FAILURE', 'status': 503,
+                   'reason': 'upstream unavailable during connection recovery',
+                   'diagnostic_id': 'owned-diagnostic'}
+        reply = {'method': 'GET', 'status': 503, 'client_attempts': 1,
+                 'body': json.dumps({'error': failure}),
+                 'headers': {'content-type': 'application/json', 'retry-after': '15',
+                             'x-rcoder-diagnostic-id': 'owned-diagnostic'}}
+        state = {'owner_pids': [], 'service_pids': [], 'entry_listening': False,
+                 'build_count': 1, 'observation_errors': []}
+        self.assertTrue(TOOL.first_proxy_response_matches(reply, state, 'version', 1))
+        for field, value in [('status', 500), ('client_attempts', 2),
+                             ('body', 'arbitrary upstream failure'), ('method', 'POST')]:
+            broken = dict(reply, **{field: value})
+            with self.subTest(field=field):
+                self.assertFalse(TOOL.first_proxy_response_matches(broken, state, 'version', 1))
+        for field, value in [('code', 'OTHER_FAILURE'), ('reason', 'unknown'),
+                             ('status', 500), ('diagnostic_id', '')]:
+            broken = dict(reply, body=json.dumps({'error': dict(failure, **{field: value})}))
+            self.assertFalse(TOOL.first_proxy_response_matches(broken, state, 'version', 1))
+        for field, value in [('entry_listening', True), ('service_pids', [3]),
+                             ('owner_pids', [1, 2]), ('build_count', 2),
+                             ('observation_errors', ['PermissionError'])]:
+            self.assertFalse(TOOL.first_proxy_response_matches(reply, dict(state, **{field: value}), 'version', 1))
+        broken = copy.deepcopy(reply); broken['headers']['x-rcoder-diagnostic-id'] = 'foreign'
+        self.assertFalse(TOOL.first_proxy_response_matches(broken, state, 'version', 1))
+
+    def test_http200_requires_real_content_and_one_owner_and_service(self):
+        reply = {'method': 'GET', 'status': 200, 'body': 'before-recycle', 'client_attempts': 1}
+        state = {'owner_pids': [10], 'service_pids': [11], 'entry_listening': True,
+                 'build_count': 1, 'observation_errors': []}
+        self.assertTrue(TOOL.first_proxy_response_matches(reply, state, 'before-recycle', 1))
+        self.assertFalse(TOOL.first_proxy_response_matches(reply, state, 'different-source', 1))
+        self.assertFalse(TOOL.first_proxy_response_matches(reply, dict(state, owner_pids=[]), 'before-recycle', 1))
+        self.assertFalse(TOOL.first_proxy_response_matches(reply, dict(state, service_pids=[11, 12]), 'before-recycle', 1))
+
+    def test_physical_observer_has_no_http_or_runtime_control(self):
+        compile(TOOL.PROXY_STATE_SCRIPT, '<proxy-state>', 'exec')
+        self.assertNotIn('urlopen', TOOL.PROXY_STATE_SCRIPT)
+        self.assertNotIn('curl', TOOL.PROXY_STATE_SCRIPT)
+        self.assertNotIn('socket', TOOL.PROXY_STATE_SCRIPT)
+        self.assertIn("pathlib.Path('/proc/net',name)", TOOL.PROXY_STATE_SCRIPT)
+
     def test_real_fixture_config_uses_native_managed_state_and_three_second_stop(self):
         original = (TOOL.REPO / 'docker/config.yml').read_text()
         configured = TOOL.idle_config(original, 'sha256:fixture-image', APP, SOURCE)

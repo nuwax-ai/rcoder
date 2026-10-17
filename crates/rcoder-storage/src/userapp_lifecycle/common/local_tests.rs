@@ -571,3 +571,157 @@ async fn offline_observer_never_creates_missing_database() {
             .exists()
     );
 }
+
+#[tokio::test]
+async fn offline_compute_observer_preserves_private_fields_and_running_records() {
+    use shared_types::{
+        ComputeControlAction, ComputeControlRequest, ComputeExecutorIdentity, ServiceType,
+        UserAppOperationLeaseReceipt, UserAppOperationScope,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("compute-observer.turso.db");
+    let store = TursoUserAppStore::open_exclusive(&path).await.unwrap();
+    let business = running(&store, "ordinaryobserver", "ordinary-running").await;
+    let app = store.ensure_identity("computeobserver").await.unwrap();
+    let request = ComputeControlRequest {
+        builder_startup_mode: Default::default(),
+        app_id: app.app_id.clone(),
+        lifecycle_id: app.lifecycle_id.clone(),
+        scope: UserAppOperationScope::Dev,
+        operation_id: "compute-observed-operation".into(),
+        request_id: "private-observer-request".into(),
+        request_fingerprint: "b".repeat(64),
+        action: ComputeControlAction::Restart,
+        restart_image_roll: false,
+    };
+    let admitted = store.admit_compute_control(&request).await.unwrap();
+    let executor = ComputeExecutorIdentity {
+        app_id: app.app_id.clone(),
+        lifecycle_id: app.lifecycle_id.clone(),
+        scope: request.scope,
+        operation_id: admitted.operation_id.clone(),
+        generation: admitted.generation,
+        executor_id: "offline-observed-executor".into(),
+    };
+    store
+        .claim_compute_control(&executor, admitted.revision)
+        .await
+        .unwrap();
+    let lease = UserAppOperationLeaseReceipt::Kubernetes {
+        service_type: ServiceType::UserappBuilder,
+        namespace: "observer-test".into(),
+        name: "observer-lease".into(),
+        uid: "observer-lease-uid".into(),
+        resource_version: "321".into(),
+        token: "private-observer-lease-token".into(),
+    };
+    let bound = store.bind_compute_lease(&executor, &lease).await.unwrap();
+    let public = serde_json::to_value(&bound).unwrap();
+    for private in ["request_id", "request_fingerprint", "lease"] {
+        assert!(
+            public.get(private).is_none(),
+            "public API must stay redacted"
+        );
+    }
+    let locked = super::offline_compute_snapshot(&path, &app.app_id, &bound.operation_id)
+        .await
+        .unwrap_err();
+    assert!(format!("{locked:#}").contains("already in use"));
+    store.shutdown().await.unwrap();
+
+    let before = super::offline_snapshot(&path).await.unwrap();
+    let first = super::offline_compute_snapshot(&path, &app.app_id, &bound.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let second = super::offline_compute_snapshot(&path, &app.app_id, &bound.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, second);
+    let observed: shared_types::ComputeControlRecord = serde_json::from_str(&first).unwrap();
+    assert_eq!(
+        observed, bound,
+        "offline reads must preserve running compute"
+    );
+    let private: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(private["request_id"], request.request_id);
+    assert_eq!(private["request_fingerprint"], request.request_fingerprint);
+    assert_eq!(private["lease"], serde_json::to_value(&lease).unwrap());
+    assert!(
+        super::offline_compute_snapshot(&path, "another-app", &bound.operation_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        super::offline_compute_snapshot(&path, &app.app_id, "missing-operation")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let after = super::offline_snapshot(&path).await.unwrap();
+    assert_eq!(
+        before, after,
+        "offline compute reads must not quarantine history"
+    );
+    assert!(
+        after.1.iter().any(|row| {
+            serde_json::from_str::<UserAppOperationRecord>(row).unwrap() == business
+        })
+    );
+}
+
+#[tokio::test]
+async fn offline_compute_observer_serializes_absent_lease_as_null() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("pending-compute.turso.db");
+    let store = TursoUserAppStore::open_exclusive(&path).await.unwrap();
+    let app = store.ensure_identity("pendingobserver").await.unwrap();
+    let pending = store
+        .admit_compute_control(&shared_types::ComputeControlRequest {
+            builder_startup_mode: Default::default(),
+            app_id: app.app_id.clone(),
+            lifecycle_id: app.lifecycle_id.clone(),
+            scope: shared_types::UserAppOperationScope::Dev,
+            operation_id: "pending-observer-operation".into(),
+            request_id: "pending-observer-request".into(),
+            request_fingerprint: "c".repeat(64),
+            action: shared_types::ComputeControlAction::Stop,
+            restart_image_roll: false,
+        })
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+    let json = super::offline_compute_snapshot(&path, &app.app_id, &pending.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value.get("lease"), Some(&serde_json::Value::Null));
+    assert_eq!(
+        serde_json::from_value::<shared_types::ComputeControlRecord>(value).unwrap(),
+        pending
+    );
+}
+
+#[tokio::test]
+async fn offline_compute_observer_missing_database_never_initializes_schema_or_marker() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("missing-compute.turso.db");
+    assert!(
+        super::offline_compute_snapshot(&path, "app", "operation")
+            .await
+            .is_err()
+    );
+    assert!(!path.exists());
+    assert!(
+        !directory
+            .path()
+            .join("missing-compute.turso.db.rcoder-format")
+            .exists()
+    );
+    let (_, lock) = crate::userapp_lifecycle::exclusive_directory::acquire(&path).unwrap();
+    drop(lock);
+}

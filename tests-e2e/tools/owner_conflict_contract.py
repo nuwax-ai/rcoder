@@ -12,7 +12,9 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
+import tempfile
 import time
+from types import SimpleNamespace
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,10 +24,36 @@ SERVICE = 'computer-agent-runner'
 CODE = 'ERR_COMPUTER_OWNER_CONFLICT'
 REASON = 'COMPUTER_OWNER_USER_MISMATCH'
 STAGE = 'computer.registration.before_dispatch'
+STEPS = {
+    'owner original ensure registered captured compute',
+    'owner default English chat typed409 preserves A',
+    'owner default English ensure typed409 preserves A',
+    'owner explicit Chinese chat typed409 preserves A',
+    'owner explicit Chinese ensure typed409 preserves A',
+    'owner original project reensure preserves A',
+    'owner four trace owner proof without Chat dispatch',
+    'owner own compute cleanup retains data',
+    'owner preexisting resources preserved',
+}
+EXPECTED_TEXT = {
+    None: (
+        'The runtime account linked to this conversation does not match this request. No message was sent.',
+        'Ask an administrator to check the conversation runtime account against the request account before sending again. Do not retry automatically.',
+    ),
+    'zh-CN': (
+        '当前会话关联的运行账号与本次请求不一致，消息未发送。',
+        '请联系管理员核对会话关联的运行账号与本次请求账号，修正后再发送；不要自动重试。',
+    ),
+}
 
 
 def identities():
-    run = uuid.uuid4().hex
+    return identities_for_run(uuid.uuid4().hex)
+
+
+def identities_for_run(run):
+    if not re.fullmatch(r'[0-9a-f]{32}', run):
+        raise ValueError('Owner fixture run identity is invalid')
     return {'run_id': run, 'user_a': 'oc' + run[:14] + 'a',
             'user_b': 'oc' + run[:14] + 'b', 'project': 'oc' + run[14:],
             'cleanup_project_b': 'oc' + run[14:] + 'b'}
@@ -55,6 +83,24 @@ def save(path, data):
         stream.write('\n')
 
 
+def save_ownership(root, receipt):
+    """Keep the previous creation proof intact if the child is interrupted mid-write."""
+    root = Path(root)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile('w', dir=root, prefix='.ownership-', delete=False) as stream:
+            temporary = Path(stream.name)
+            os.chmod(temporary, 0o600)
+            json.dump(receipt, stream, indent=2, ensure_ascii=False)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(root / 'ownership.json')
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def command(argv):
     result = subprocess.run(argv, capture_output=True, text=True, timeout=90)
     if result.returncode:
@@ -69,15 +115,18 @@ def success(reply):
     return reply['body'].get('data')
 
 
-def conflict(reply, user_a, user_b):
+def conflict(reply, user_a, user_b, accept_language=None):
     body = reply['body']
     detail = body.get('error_detail') or {}
     assert reply['status'] == 409 and body.get('code') == CODE, 'Not a typed HTTP409 owner conflict'
     assert body.get('success') is False and body.get('data') is None, 'Conflict must not accept a task'
     assert detail.get('reason_code') == REASON and detail.get('stage') == STAGE
     assert detail.get('retryable') is False, 'Owner conflicts must never authorize automatic retry'
-    assert isinstance(body.get('message'), str) and '账号' in body['message'] and '消息未发送' in body['message']
-    assert detail.get('detail') == body['message'] and isinstance(detail.get('hint'), str) and detail['hint']
+    assert 'request_accept_language' in reply and reply['request_accept_language'] == accept_language, 'Request language evidence mismatch'
+    expected_message, expected_hint = EXPECTED_TEXT[accept_language]
+    assert body.get('message') == expected_message, 'Owner message language/text mismatch'
+    assert detail.get('hint') == expected_hint, 'Owner hint language/text mismatch'
+    assert detail.get('detail') == body['message']
     assert body.get('tid') == reply['trace_id'], 'Actual trace ID must survive the HTTP envelope'
     assert not body.get('operation_id')
     encoded = json.dumps(body, ensure_ascii=False)
@@ -92,13 +141,15 @@ class Http:
         self.base = url.rstrip('/')
         self.root, self.deadline, self.calls = Path(root), time.monotonic() + timeout, []
 
-    def call(self, method, route, body=None, cleanup=False):
+    def call(self, method, route, body=None, cleanup=False, accept_language=None):
         remaining = 120 if cleanup else min(120, self.deadline - time.monotonic())
         if remaining <= 0:
             raise TimeoutError('Owner contract total request budget expired')
         trace = uuid.uuid4().hex
-        headers = {'Content-Type': 'application/json', 'Accept-Language': 'zh-CN',
+        headers = {'Content-Type': 'application/json',
                    'traceparent': '00-' + trace + '-' + uuid.uuid4().hex[:16] + '-01'}
+        if accept_language is not None:
+            headers['Accept-Language'] = accept_language
         if os.environ.get('RCODER_API_KEY'):
             headers['X-API-Key'] = os.environ['RCODER_API_KEY']
         request = urllib.request.Request(self.base + route, method=method, headers=headers,
@@ -114,12 +165,14 @@ class Http:
             envelope = json.loads(raw)
             if not isinstance(envelope, dict):
                 raise ValueError('Expected JSON object envelope')
-            reply = {'status': response.status, 'trace_id': trace, 'body': envelope}
+            reply = {'status': response.status, 'trace_id': trace, 'body': envelope,
+                     'request_accept_language': request.get_header('Accept-language')}
         name = '%02d-%s.json' % (len(self.calls), route.split('?')[0].strip('/').replace('/', '-'))
         # Actual response bytes/values remain local0600, for Java consumption.
         save(self.root / 'responses' / name, reply)
         self.calls.append({'method': method, 'route': route, 'trace_id': trace,
-                           'response': str(self.root / 'responses' / name), 'status': reply['status']})
+                           'response': str(self.root / 'responses' / name), 'status': reply['status'],
+                           'request_accept_language': reply['request_accept_language']})
         return reply
 
     def status(self, user, cleanup=False):
@@ -317,46 +370,134 @@ def cleanup(api, observer, ids, captured, claims_before):
     return result
 
 
-def exercise(api, observer, ids, root):
+def cleanup_fixture(root, run_id, case_id, existing_ids=()):
+    """Resume only a strict case's original API cleanup after child interruption."""
+    root = Path(root).resolve()
+    receipt = json.loads((root / 'ownership.json').read_text())
+    fixture_ids = receipt.get('ids')
+    if not isinstance(fixture_ids, dict):
+        raise ValueError('Owner cleanup fixture identities are missing')
+    if (receipt.get('version') != 1 or receipt.get('root') != str(root)
+            or receipt.get('run_id') != run_id or receipt.get('case_id') != case_id
+            or not re.fullmatch(r'[0-9a-f]{32}', run_id)
+            or not re.fullmatch(r'[0-9a-f]{32}', case_id)
+            or fixture_ids != identities_for_run(fixture_ids.get('run_id', ''))
+            or receipt.get('observer', {}).get('namespace') is not None):
+        raise ValueError('Owner cleanup receipt does not belong to this Compose case')
+    if not receipt.get('touched'):
+        return {'success': True, 'not_started': True, 'volumes_removed': False}
+    ids = receipt['ids']
+    if receipt.get('initial_absence') != {ids['user_a']: True, ids['user_b']: True}:
+        raise ValueError('Owner cleanup lacks both initial physical and API absence proofs')
+    controllers = receipt.get('controllers')
+    if (not isinstance(controllers, dict) or len(controllers) != 1
+            or not all(re.fullmatch(r'[0-9a-f]{64}', uid) for uid in controllers)):
+        raise ValueError('Owner cleanup lacks a captured physical controller')
+    captured = receipt.get('captured', {})
+    if (not isinstance(captured, dict) or set(captured) - {ids['user_a'], ids['user_b']}
+            or not all(isinstance(rows, list) for rows in captured.values())):
+        raise ValueError('Owner cleanup contains an unrelated account')
+    baseline = receipt.get('baseline')
+    if not isinstance(baseline, dict) or not set(controllers).issubset(baseline):
+        raise ValueError('Owner cleanup lacks its original controller baseline')
+    protected = set(existing_ids) | set(baseline)
+    observer = Observer(SimpleNamespace(controller_id=next(iter(controllers)), namespace=None,
+                                         ssh=None, context=None, server=None))
+    if observer.controllers != controllers:
+        raise ValueError('Owner cleanup controller incarnation changed')
+    # Lost ensure responses may have created resources. Initial absence plus
+    # exact random-user runtime labels permits discovery; baseline UIDs never do.
+    for user in (ids['user_a'], ids['user_b']):
+        current = observer.capture(user)
+        if any(row['uid'] in protected for row in current + captured.get(user, [])):
+            raise ValueError('Owner cleanup found a preexisting physical resource')
+    api = Http(receipt['url'], root / 'fallback-responses', 180)
+    result = cleanup(api, observer, ids, captured, receipt.get('claims', {}))
+    # A killed HTTP client cannot prove the server finished its accepted ensure.
+    # Reclaim observed own compute, but retain an explicit failed cleanup verdict
+    # until that possible late creation is settled; empty inventory is insufficient.
+    if receipt.get('inflight') is not None:
+        result['success'] = False
+        result['unsettled_request'] = receipt['inflight']
+    after = observer.existing()
+    result['preexisting_resources_preserved'] = all(after.get(uid) == value for uid, value in baseline.items())
+    result['success'] = result['success'] and result['preexisting_resources_preserved']
+    receipt.update(captured=captured, cleanup=result)
+    save_ownership(root, receipt)
+    return result
+
+
+def exercise(api, observer, ids, root, receipt=None):
     report = {'version': 1, 'run_id': ids['run_id'], 'identities': ids, 'success': False,
               'llm_credentials_supplied': False, 'model_endpoint': 'local closed port only',
-              'all_rpc_zero_claimed': False, 'checks': [], 'responses': [], 'cleanup': None}
+              'all_rpc_zero_claimed': False, 'checks': [], 'responses': [], 'cleanup': None,
+              'required_steps': sorted(STEPS),
+              'language_contract': {'default_no_accept_language': 'en-US',
+                                   'explicit_accept_language': 'zh-CN',
+                                   'required_conflict_responses': 4}}
     captured = {}
     baseline = observer.existing()
     claims = observer.claims()
     touched = False
+    initial_absence = {}
+    inflight = None
+    def persist():
+        if receipt is not None:
+            receipt.update(baseline=baseline, claims=claims, captured=captured,
+                           touched=touched, initial_absence=initial_absence, inflight=inflight)
+            save_ownership(root, receipt)
+    def post(route, body, accept_language=None):
+        nonlocal inflight
+        inflight = {'route': route, 'user_id': body['user_id'], 'project_id': body['project_id']}
+        persist()
+        response = api.call('POST', route, body, accept_language=accept_language)
+        inflight = None
+        persist()
+        return response
+    persist()
     try:
         for key in ('user_a', 'user_b'):
             assert not observer.capture(ids[key]), 'Random test identity already owns compute'
             assert success(api.call('GET', '/computer/pod/status?' + urllib.parse.urlencode({'user_id': ids[key], 'service_type': SERVICE}))).get('status') == 'not_found'
+            initial_absence[ids[key]] = True
+            persist()
         touched = True
-        a = success(api.call('POST', '/computer/pod/ensure', payload(ids['user_a'], ids['project'])))
+        persist()  # Creation intent must survive a lost response or killed child.
+        a = success(post('/computer/pod/ensure', payload(ids['user_a'], ids['project'])))
         a_id = a['container_info']['container_id']
         captured[ids['user_a']] = observer.capture(ids['user_a'])
+        persist()
         save(Path(root) / 'captured-compute.json', captured)
         assert physical(captured[ids['user_a']]) == [a_id], 'A ensure does not match captured runtime instance'
         assert api.status(ids['user_a']).get('container_id') == a_id
-        report['checks'].append('A original ensure registered real captured compute')
+        report['checks'].append('owner original ensure registered captured compute')
         traces = []
-        for route, request in [('/computer/chat', chat_payload(ids['user_b'], ids['project'])),
-                               ('/computer/pod/ensure', payload(ids['user_b'], ids['project']))]:
-            reply = api.call('POST', route, request)
+        for route, language, step in [
+                ('/computer/chat', None, 'owner default English chat typed409 preserves A'),
+                ('/computer/pod/ensure', None, 'owner default English ensure typed409 preserves A'),
+                ('/computer/chat', 'zh-CN', 'owner explicit Chinese chat typed409 preserves A'),
+                ('/computer/pod/ensure', 'zh-CN', 'owner explicit Chinese ensure typed409 preserves A')]:
+            request = (chat_payload(ids['user_b'], ids['project']) if route == '/computer/chat'
+                       else payload(ids['user_b'], ids['project']))
+            reply = post(route, request, accept_language=language)
             traces.append(reply['trace_id'])
-            conflict(reply, ids['user_a'], ids['user_b'])
+            conflict(reply, ids['user_a'], ids['user_b'], language)
             resources = observer.capture(ids['user_b'])
             if resources:
                 previous = captured.setdefault(ids['user_b'], resources)
                 assert previous == resources, 'B compute identity changed across rejected requests'
+                persist()
                 save(Path(root) / 'captured-compute.json', captured)
             assert observer.capture(ids['user_a']) == captured[ids['user_a']]
             assert api.status(ids['user_a']).get('container_id') == a_id
-            report['checks'].append(route + ' typed user conflict; A physical identity unchanged')
+            report['checks'].append(step)
         # This successful original API revalidation complements actual registered
         # A/B values in the structured conflict events; it is not a fake marker.
-        a_again = success(api.call('POST', '/computer/pod/ensure', payload(ids['user_a'], ids['project'])))
+        a_again = success(post('/computer/pod/ensure', payload(ids['user_a'], ids['project'])))
         assert a_again['container_info']['container_id'] == a_id
         assert observer.capture(ids['user_a']) == captured[ids['user_a']]
-        report['checks'].append('A same project ensure still succeeds with original physical identity')
+        report['checks'].append('owner original project reensure preserves A')
+        assert len(traces) == len(set(traces)) == 4, 'Four distinct rejected request traces are required'
         deadline = time.monotonic() + 10
         while True:
             rows = observer.logs(traces)
@@ -368,7 +509,7 @@ def exercise(api, observer, ids, root):
                     raise
                 time.sleep(.5)
         save(Path(root) / 'owner-trace-evidence.json', rows)
-        report['checks'].append('Both trace-scoped real owner=A/requester=B events; no Chat forward')
+        report['checks'].append('owner four trace owner proof without Chat dispatch')
         report['success'] = True
     except Exception as error:
         report['error'] = type(error).__name__ + ': ' + str(error)
@@ -376,15 +517,23 @@ def exercise(api, observer, ids, root):
         try:
             report['cleanup'] = cleanup(api, observer, ids, captured, claims) if touched else {'success': True, 'not_started': True}
             assert report['cleanup']['success'], 'Owned platform cleanup incomplete'
+            if touched:
+                report['checks'].append('owner own compute cleanup retains data')
             after = observer.existing()
             assert all(after.get(uid) == value for uid, value in baseline.items()), 'Preexisting container changed'
             report['preexisting_resources_preserved'] = True
+            report['checks'].append('owner preexisting resources preserved')
+            if report['success']:
+                assert len(report['checks']) == len(STEPS) and set(report['checks']) == STEPS, 'Owner required steps are incomplete'
         except Exception as error:
             report['success'] = False
             report['cleanup_error'] = type(error).__name__ + ': ' + str(error)
         report['responses'] = api.calls
         report['captured_compute'] = captured
         report['completed_utc'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        if receipt is not None:
+            receipt['cleanup'] = report.get('cleanup')
+            persist()
         save(Path(root) / 'report.json', report)
     return report
 
@@ -405,9 +554,8 @@ def main():
         parser.error('--timeout must be positive')
     ids = identities()
     if not args.execute:
-        print(json.dumps({'execute': False, 'identities': ids, 'steps': ['A ensure', 'B chat typed409',
-            'B ensure typed409', 'A same-project ensure and exact physical identity',
-            'trace owner/no-Chat proof', 'platform stop B with independent project; platform stop A; retain data']}))
+        print(json.dumps({'execute': False, 'identities': ids, 'steps': sorted(STEPS),
+                          'languages': {'absent_accept_language': 'en-US', 'explicit_accept_language': 'zh-CN'}}))
         return 0
     os.umask(0o077)
     root = Path(args.report_dir).resolve()
@@ -419,7 +567,16 @@ def main():
                                       payload(ids['user_a'], ids['project'])])
     print(json.dumps({'status': 'OWNED_FIXTURE_START', 'identities': ids,
                       'scope': 'only these new random users; no customer resource reuse'}), flush=True)
-    report = exercise(api, observer, ids, root)
+    run_id, case_id = os.environ.get('E2E_RUN_ID'), os.environ.get('E2E_CASE_ID')
+    if bool(run_id) != bool(case_id):
+        raise ValueError('Strict owner fixture requires both E2E_RUN_ID and E2E_CASE_ID')
+    if run_id and (not re.fullmatch(r'[0-9a-f]{32}', run_id) or not re.fullmatch(r'[0-9a-f]{32}', case_id)):
+        raise ValueError('Strict owner fixture run/case identities must be UUID hex values')
+    receipt = {'version': 1, 'root': str(root), 'run_id': run_id, 'case_id': case_id,
+               'ids': ids, 'url': api.base, 'controllers': observer.controllers,
+               'observer': {'namespace': args.namespace, 'ssh': args.ssh,
+                            'context': args.context, 'server': args.server}}
+    report = exercise(api, observer, ids, root, receipt)
     print(json.dumps({'report': str(root / 'report.json'), 'success': report['success']}))
     return 0 if report['success'] else 1
 

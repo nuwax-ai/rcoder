@@ -592,5 +592,17 @@
       "scenario": "userapp_compute_stopped_failure_recovery_contract",
       "backend": "compose"
     }
+  ],
+  "computer_owner_conflict_contract": [
+    {
+      "scenario": "computer_owner_conflict_contract",
+      "backend": "compose"
+    }
+  ],
+  "userapp_compute_stop_timeout_recovery_contract": [
+    {
+      "scenario": "userapp_compute_stop_timeout_recovery_contract",
+      "backend": "compose"
+    }
   ]
 }

@@ -2,6 +2,82 @@
 use rcoder_e2e::common::scenario::assert_hard_all;
 use rcoder_e2e::common::{Env, TestUserGuard};
 
+/// Typed owner conflicts reject before Chat dispatch and retain the original runtime.
+#[tokio::test]
+async fn computer_owner_conflict_contract() {
+    let Some((env, report)) =
+        Env::compose_or_skip("computer_owner_conflict_contract", "compose").await
+    else {
+        return;
+    };
+    let result = (|| -> Result<(), String> {
+        let directory = std::env::var_os("E2E_REPORT_DIR")
+            .map(std::path::PathBuf::from)
+            .ok_or("run via the strict E2E launcher")?
+            .join("owner-conflict-contract");
+        let controller = std::env::var("E2E_OWNER_CONTROLLER_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("E2E_OWNER_CONTROLLER_ID must identify the captured Compose main container")?;
+        let status = std::process::Command::new("python3")
+            .arg(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tools/owner_conflict_contract.py"),
+            )
+            .arg("--execute")
+            .arg("--url")
+            .arg(&env.rcoder)
+            .arg("--controller-id")
+            .arg(controller)
+            .arg("--report-dir")
+            .arg(&directory)
+            .status()
+            .map_err(|error| format!("cannot launch owner contract: {error}"))?;
+        report.assert_hard(
+            "owner contract process completed",
+            status.success(),
+            status.to_string(),
+        );
+        let path = directory.join("report.json");
+        let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        let checks = value["checks"].as_array().ok_or("owner checks missing")?;
+        let mut names = std::collections::BTreeSet::new();
+        for check in checks {
+            let name = check.as_str().ok_or("owner check name missing")?;
+            names.insert(name);
+            report.assert_hard(name, true, "observed by real owner contract".into());
+        }
+        let required = value["required_steps"]
+            .as_array()
+            .ok_or("owner required steps missing")?
+            .iter()
+            .map(|step| step.as_str().ok_or("owner required step name missing"))
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+        report.assert_hard(
+            "owner contract required steps complete",
+            checks.len() == 9 && names.len() == 9 && names == required,
+            format!("observed {} distinct steps", names.len()),
+        );
+        report.assert_hard(
+            "owner contract reports full success",
+            value["success"] == true && value["preexisting_resources_preserved"] == true,
+            value["error"].to_string(),
+        );
+        report.assert_hard(
+            "owner cleanup confirms retained data",
+            value["cleanup"]["success"] == true && value["cleanup"]["volumes_removed"] == false,
+            value["cleanup"].to_string(),
+        );
+        Ok(())
+    })();
+    if let Err(error) = result {
+        report.assert_hard("owner contract evidence readable", false, error);
+    }
+    assert!(report.finish(), "Computer owner conflict contract failed");
+}
+
 #[tokio::test]
 async fn docker_deletion_identity_contract() {
     let scenario = "docker_deletion_identity_contract";

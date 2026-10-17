@@ -2,13 +2,29 @@
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
 import unittest
+import urllib.error
 from unittest.mock import Mock, patch
+from types import SimpleNamespace
 
 import k8s_userapp as acceptance
+
+
+class ClusterTransportTests(unittest.TestCase):
+    def test_explicit_server_keeps_normal_tls_verification(self):
+        run = acceptance.Run.__new__(acceptance.Run)
+        run.args = SimpleNamespace(context='test-context', kube_server='https://cluster.example:6443',
+                                   namespace='rcoder-e2e-example', ssh='test-host')
+        run.local = Mock(return_value='{}')
+        run.kube('get', 'pods', '-o', 'json')
+        command = run.local.call_args.args[-1]
+        self.assertIn('--server https://cluster.example:6443', command)
+        self.assertIn('--context test-context', command)
+        self.assertNotIn('insecure-skip-tls-verify', command)
 
 
 def holder_view(state='Running'):
@@ -102,6 +118,359 @@ class BusyContractTests(unittest.TestCase):
         self.assertEqual(clock[0], 40)
         run.request.assert_called_once()
         self.assertEqual(run.request.call_args.kwargs['timeout'], 40)
+
+
+class RecreatedLifecycleTests(unittest.TestCase):
+    def claim(self, **changes):
+        return {'kind': 'PersistentVolumeClaim', 'name': 'rcoder-app-builder-app-workspace',
+                'uid': 'new-claim', 'labels': {'app.kubernetes.io/managed-by': 'rcoder-runtime',
+                                              'service_type': 'user-app-builder'},
+                'annotations': {'rcoder.io/application-id': 'app', 'rcoder.io/lifecycle-id': 'life-two'},
+                **changes}
+
+    def operation(self, action='stop', lifecycle='life-one', operation_id=None):
+        return {'operation_id': operation_id or 'original-' + action, 'app_id': 'app',
+                'lifecycle_id': lifecycle, 'scope': 'Dev', 'action': action,
+                'state': 'succeeded', 'stage': 'completed', 'revision': 10,
+                'error_code': 'ORIGINAL_DIAGNOSTIC', 'error_message': 'preserve original diagnostic'}
+
+    def test_pvc_capture_requires_exact_new_userapp_lifecycle_and_family(self):
+        run_claim = self.claim()
+        self.assertEqual(acceptance.owned_userapp_pvc_identities([run_claim], 'app', 'life-two', {'baseline'}),
+                         [('rcoder-app-builder-app-workspace', 'new-claim')])
+        for row in [self.claim(name='agent-app-workspace'), self.claim(uid='baseline'), self.claim(uid=''),
+                    self.claim(annotations={'rcoder.io/application-id': 'other', 'rcoder.io/lifecycle-id': 'life-two'}),
+                    self.claim(annotations={'rcoder.io/application-id': 'app', 'rcoder.io/lifecycle-id': 'life-one'}),
+                    self.claim(labels={'app.kubernetes.io/managed-by': 'rcoder-runtime',
+                                       'service_type': 'computer-agent-runner'})]:
+            with self.subTest(row=row), self.assertRaises(AssertionError):
+                acceptance.owned_userapp_pvc_identities([row], 'app', 'life-two', {'baseline'})
+        with self.assertRaises(AssertionError):
+            acceptance.owned_userapp_pvc_identities([run_claim, run_claim], 'app', 'life-two', set())
+
+    def test_history_reads_original_ids_and_requires_entire_receipt_unchanged(self):
+        run = acceptance.Run.__new__(acceptance.Run)
+        run.app, run.entries = 'app', ['http://first', 'http://second']
+        receipts = [self.operation(), self.operation('restart')]
+        run.api = Mock(side_effect=receipts)
+        self.assertEqual(run.compute_history(receipts, 'life-one'), receipts)
+        self.assertEqual(run.api.call_args_list[0].args[0], '/computer/pod/operations/app/original-stop')
+        self.assertEqual(run.api.call_args_list[0].kwargs['base'], 'http://second')
+        # A normal terminal lease-bookkeeping write may advance only revision.
+        advanced = {**receipts[0], 'revision': receipts[0]['revision'] + 1}
+        run.api = Mock(return_value=advanced)
+        self.assertEqual(run.compute_history(receipts[:1], 'life-one'), [advanced])
+        self.assertEqual(receipts[0]['revision'], 10, 'keep the original raw response intact')
+        for field, value in [('lifecycle_id', 'life-two'), ('operation_id', 'replacement'),
+                             ('revision', 9), ('revision', True), ('error_message', None),
+                             ('error_code', None), ('app_id', 'foreign'), ('action', 'restart'),
+                             ('state', 'superseded'), ('stage', 'stopped')]:
+            run.api = Mock(return_value={**receipts[0], field: value})
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                run.compute_history(receipts[:1], 'life-one')
+
+    def test_history_revision_bookkeeping_preserves_all_other_public_fields(self):
+        original = self.operation()
+        advanced = {**original, 'revision': original['revision'] + 1}
+        self.assertTrue(acceptance.historical_compute_view_preserved(original, advanced))
+        self.assertFalse(acceptance.historical_compute_view_preserved(advanced, original))
+        self.assertFalse(acceptance.historical_compute_view_preserved(original, {**advanced, 'new_field': 'changed'}))
+        missing = dict(advanced)
+        missing.pop('error_message')
+        self.assertFalse(acceptance.historical_compute_view_preserved(original, missing))
+        self.assertEqual(original['revision'], 10)
+
+    def test_foreign_or_unsettled_history_is_rejected_before_query(self):
+        run = acceptance.Run.__new__(acceptance.Run)
+        run.app, run.entries, run.api = 'app', ['http://first', 'http://second'], Mock()
+        for field, value in [('app_id', 'foreign'), ('lifecycle_id', 'life-two'), ('operation_id', None),
+                             ('scope', 'Prod'), ('action', 'unknown'), ('state', 'running')]:
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                run.compute_history([{**self.operation(), field: value}], 'life-one')
+        run.api.assert_not_called()
+
+    def test_l2_compute_uses_distinct_request_and_evidence_prefix(self):
+        run = acceptance.Run.__new__(acceptance.Run)
+        run.app, run.lifecycle_id, run.id = 'app', 'life-two', 'run'
+        run.entries, run.save = ['http://first', 'http://second'], Mock()
+        view = self.operation(lifecycle='life-two', operation_id='l2-stop')
+        run.request = Mock(return_value=(202, {'code': '0000', 'success': True,
+                                               'operation_id': 'l2-stop', 'data': view}))
+        result = run.dev_compute('stop', 120, request_id='recreate-stop-run', evidence_prefix='recreate-dev')
+        self.assertEqual(result, view)
+        self.assertEqual(run.request.call_args.args[1]['lifecycle_id'], 'life-two')
+        self.assertEqual(run.request.call_args.args[1]['request_id'], 'recreate-stop-run')
+        self.assertEqual(run.save.call_args.args[0], 'recreate-dev-stop-operation.json')
+        self.assertEqual(run.compute_receipts, [view])
+        run.request.return_value[1]['data']['revision'] = 99
+        self.assertEqual(run.compute_receipts[0]['revision'], 10)
+
+    def test_stale_requests_require_conflict_and_no_accepted_operation(self):
+        response = {'code': 'ERR_CONFLICT', 'success': False}
+        self.assertTrue(acceptance.stale_lifecycle_rejected(409, response, compute=True))
+        self.assertTrue(acceptance.stale_lifecycle_rejected(200, response))
+        for status, change in [(200, {}), (500, {}), (409, {'success': True}),
+                               (409, {'code': 'ERR_OPERATION_IN_PROGRESS'}), (409, {'operation_id': 'accepted'})]:
+            with self.subTest(status=status, change=change):
+                self.assertFalse(acceptance.stale_lifecycle_rejected(status, {**response, **change}, compute=True))
+
+    def business_fixture(self):
+        run = acceptance.Run.__new__(acceptance.Run)
+        run.app, run.lifecycle_id, run.user, run.id = 'app', 'life-two', 'user', 'run'
+        run.entries = ['http://first', 'http://second']
+        def check(name, ok, detail=None):
+            if not ok:
+                raise AssertionError(name)
+        run.save, run.check = Mock(), Mock(side_effect=check)
+        pod = {'kind': 'Pod', 'name': 'rcoder-app-builder-app-0', 'uid': 'l2-builder'}
+        claims = [('rcoder-app-builder-app-workspace', 'new-claim')]
+        run.capture_recreated_resources = Mock(return_value=([pod, self.claim()], claims))
+        run.dev_controller = Mock(return_value={'metadata': {'uid': 'l2-controller'}, 'spec': {'replicas': 1}})
+        run.api = Mock(return_value={'operation_id': 'l2-deploy'})
+        def request(path, *args, **kwargs):
+            if path.startswith('/computer/pod/'):
+                return 409, {'code': 'ERR_CONFLICT', 'success': False}
+            if path.endswith('/start'):
+                return 200, {'code': 'ERR_CONFLICT', 'success': False}
+            return 200, {'success': True}
+        run.request = Mock(side_effect=request)
+        run.dev_git = Mock(return_value={'commit': 'c' * 40})
+        run.dev_data_proof = Mock(return_value={'sentinel': 'retained'})
+        run.build = Mock(return_value=({'url': 'http://artifact', 'sha256': 'a' * 64}, 'release-L2'))
+        run.operation_view = Mock(return_value={'operation_id': 'l2-deploy', 'kind': 'StartDeployment',
+                                                'scope': 'Prod', 'state': 'Succeeded'})
+        run.content = Mock(return_value=True)
+        run.recreated_runtime_identity = Mock(return_value={'resources': 'same L2 resource identities'})
+        run.inventory = Mock(return_value=[self.claim()])
+        run.dev_compute = Mock(side_effect=[self.operation(lifecycle='life-two', operation_id='l2-stop'),
+                                             self.operation('restart', 'life-two', 'l2-restart')])
+        run.stopped_dev_view = Mock(return_value={'claims': claims})
+        run.observe_restarted_dev = Mock(return_value=(None, [{**pod, 'uid': 'l2-restarted-builder'}]))
+        run.lifecycle = Mock(return_value={'lifecycle_id': 'life-two', 'state': 'Active'})
+        history = [self.operation(), self.operation('restart')]
+        run.compute_history = Mock(return_value=history)
+        return run, history
+
+    def test_recreated_business_reaches_build_http_compute_and_history(self):
+        run, history = self.business_fixture()
+        run.recreated_business('life-one', history, [('old-workspace', 'old-pvc')])
+        run.build.assert_called_once_with('L2')
+        self.assertEqual(run.api.call_args.args[1]['lifecycle_id'], 'life-two')
+        self.assertEqual([call.args[1]['lifecycle_id'] for call in run.request.call_args_list
+                          if call.args[0].startswith('/computer/pod/')], ['life-one', 'life-one'])
+        self.assertEqual([call.kwargs['request_id'] for call in run.dev_compute.call_args_list],
+                         ['recreate-stop-run', 'recreate-restart-run'])
+        run.compute_history.assert_called_once_with(history, 'life-one')
+        self.assertEqual(run.builder_uid, 'l2-restarted-builder')
+        self.assertIn('recreate_history_preserved', [call.args[0] for call in run.check.call_args_list])
+
+    def test_stale_l1_acceptance_or_physical_change_fails_before_l2_compute(self):
+        for physical_change in (False, True):
+            run, history = self.business_fixture()
+            if physical_change:
+                run.recreated_runtime_identity.side_effect = ['before', 'changed']
+            else:
+                original_request = run.request.side_effect
+                run.request.side_effect = lambda path, *args, **kwargs: ((202, {
+                    'code': '0000', 'success': True, 'operation_id': 'wrongly-admitted'})
+                    if path.startswith('/computer/pod/') else original_request(path, *args, **kwargs))
+            with self.subTest(physical_change=physical_change), self.assertRaises(AssertionError):
+                run.recreated_business('life-one', history, [])
+            run.dev_compute.assert_not_called()
+
+    def test_recreated_public_history_must_exist_for_both_completed_actions(self):
+        for history in ([], [self.operation()]):
+            run, _original = self.business_fixture()
+            run.compute_history.return_value = history
+            with self.subTest(history=history), self.assertRaisesRegex(AssertionError, 'recreate_history_preserved'):
+                run.recreated_business('life-one', history, [])
+
+    def cleanup_fixture(self):
+        run = acceptance.Run.__new__(acceptance.Run)
+        run.app, run.lifecycle_id, run.user, run.id = 'app', 'life-one', 'user', 'run'
+        run.created, run.baseline, run.compute_receipts = True, [], [self.operation(), self.operation('restart')]
+        run.inventory = Mock(return_value=[])
+        run.save, run.check, run.api_retry_operation_busy = Mock(), Mock(), Mock()
+        run.lifecycle = Mock(return_value={'lifecycle_id': 'life-one', 'lifecycle_epoch': 1, 'state': 'Deleted'})
+        run.request = Mock(return_value=(200, {'code': 'ERR_CONFLICT', 'success': False}))
+        run.api = Mock(return_value={'lifecycle_id': 'life-two', 'lifecycle_epoch': 2, 'state': 'Active'})
+        run.recreated_business, run.cleanup_recreated, run.preserve_baseline = Mock(), Mock(), Mock()
+        return run
+
+    def test_recreated_business_failure_still_cleans_l2_through_original_api(self):
+        run = self.cleanup_fixture()
+        observed = []
+        run.recreated_business.side_effect = AssertionError('L2 build failed')
+        run.cleanup_recreated.side_effect = lambda: observed.append(run.lifecycle_id)
+        with self.assertRaisesRegex(AssertionError, 'L2 build failed'):
+            run.recreate_lifecycle()
+        run.cleanup()
+        self.assertEqual(observed, ['life-two'])
+        run.preserve_baseline.assert_called_once()
+        self.assertEqual(run.recreated_business.call_args.args[0], 'life-one')
+        self.assertEqual([row['operation_id'] for row in run.recreated_business.call_args.args[1]],
+                         ['original-stop', 'original-restart'])
+
+    def test_finally_cleanup_never_executes_recreate_business(self):
+        run = self.cleanup_fixture()
+        run.recreated, run.lifecycle_id = True, 'life-two'
+        run.cleanup_recreated.side_effect = OSError('original API cleanup failed')
+        with self.assertRaisesRegex(OSError, 'original API cleanup failed'):
+            run.cleanup()
+        run.recreated_business.assert_not_called()
+        run.api.assert_not_called()
+        run.preserve_baseline.assert_called_once()
+
+    def test_recreated_cleanup_receipt_precedes_purge_and_binds_current_lifecycle(self):
+        run = acceptance.Run.__new__(acceptance.Run)
+        run.app, run.lifecycle_id, run.user, run.id = 'app', 'life-two', 'user', 'run'
+        events = []
+        run.capture_recreated_resources = Mock(side_effect=lambda filename: (
+            events.append(('capture', filename)) or [{'kind': 'Deployment', 'name': 'rcoder-app-app'}], []))
+        run.api_retry_operation_busy = Mock(side_effect=lambda path, body: events.append((path, body)))
+        run.lifecycle = Mock(return_value={'state': 'Deleted', 'lifecycle_id': 'life-two'})
+        run.poll, run.check = Mock(return_value=[]), Mock()
+        run.cleanup_recreated()
+        self.assertEqual(events[0], ('capture', 'recreate-before-cleanup.json'))
+        self.assertEqual(events[1][0], '/api/v1/userapp/app/prod/delete')
+        self.assertEqual(events[2][0], '/api/v1/userapp/app/delete/app')
+        self.assertEqual({k: v for k, v in events[1][1].items() if k != 'request_id'},
+                         {'user_id': 'user', 'lifecycle_id': 'life-two', 'purge': True})
+        self.assertEqual({k: v for k, v in events[2][1].items() if k != 'request_id'},
+                         {'user_id': 'user', 'lifecycle_id': 'life-two'})
+        self.assertNotEqual(events[1][1]['request_id'], events[2][1]['request_id'])
+
+    def test_delete_business_and_finally_reuse_requests_without_cross_lifecycle_alias(self):
+        run = self.cleanup_fixture()
+        rows = [{'kind': 'Deployment', 'name': 'rcoder-app-app'}]
+        run.delete_owned_resources(rows)
+        first = run.api_retry_operation_busy.call_args_list[-2:]
+        run.delete_owned_resources(rows)
+        self.assertEqual(first, run.api_retry_operation_busy.call_args_list[-2:])
+        run.lifecycle_id = 'life-two'
+        run.delete_owned_resources(rows)
+        for old, current in zip(first, run.api_retry_operation_busy.call_args_list[-2:]):
+            self.assertNotEqual(old.args[1]['request_id'], current.args[1]['request_id'])
+
+    def test_unowned_recreated_pvc_prevents_destructive_cleanup(self):
+        run = acceptance.Run.__new__(acceptance.Run)
+        run.app, run.lifecycle_id, run.user, run.baseline = 'app', 'life-two', 'user', []
+        run.inventory = Mock(return_value=[self.claim(annotations={'rcoder.io/lifecycle-id': 'life-one'})])
+        run.save, run.api_retry_operation_busy = Mock(), Mock()
+        with self.assertRaises(AssertionError):
+            run.cleanup_recreated()
+        run.api_retry_operation_busy.assert_not_called()
+        run.save.assert_called_once()
+
+    def test_recreated_cleanup_refuses_baseline_workload_uid_not_only_pvc(self):
+        run = acceptance.Run.__new__(acceptance.Run)
+        run.app, run.lifecycle_id, run.user = 'app', 'life-two', 'user'
+        run.baseline = [{'uid': 'preexisting-controller'}]
+        run.inventory = Mock(return_value=[{'kind': 'Deployment', 'name': 'rcoder-app-app',
+                                           'uid': 'preexisting-controller'}])
+        run.save, run.api_retry_operation_busy = Mock(), Mock()
+        with self.assertRaisesRegex(AssertionError, 'preexisting resource'):
+            run.cleanup_recreated()
+        run.api_retry_operation_busy.assert_not_called()
+
+
+class TrafficWakeTests(unittest.TestCase):
+    def run_fixture(self):
+        run = acceptance.Run.__new__(acceptance.Run)
+        run.app, run.lifecycle_id, run.user, run.id = 'app', 'life-one', 'user', 'run'
+        run.args, run.baseline = Mock(proxy_url='http://proxy'), []
+        run.proxy_entries = ['http://replica-a', 'http://replica-b']
+        run.dev_sentinel = ('sentinel', 'commit', {'sentinel': 'retained'})
+        run.dev_data_proof = Mock(return_value={'sentinel': 'retained'})
+        run.save, run.check, run.content = Mock(), Mock(), Mock(return_value=True)
+        run.prod_pod = Mock(return_value={'uid': 'new-pod', 'phase': 'Running',
+                                          'conditions': [{'type': 'Ready', 'status': 'True'}]})
+        claim = RecreatedLifecycleTests().claim(annotations={
+            'rcoder.io/application-id': 'app', 'rcoder.io/lifecycle-id': 'life-one'})
+        run.inventory = Mock(return_value=[claim])
+        return run, [(claim['name'], claim['uid'])]
+
+    def strict_check(self, name, ok, detail=None):
+        if not ok:
+            raise AssertionError(name)
+
+    def test_first_two_requests_are_business_traffic_before_explicit_start(self):
+        run, claims = self.run_fixture()
+        events, lock = [], threading.Lock()
+        def request(path, entry, deadline):
+            with lock:
+                events.append(('traffic', path, entry))
+            return 200, b'run-B'
+        run.first_proxy_get = Mock(side_effect=request)
+        run.api = Mock(side_effect=lambda path, body, **kwargs: events.append(('start', path, body)))
+        result = run.traffic_wake({'uid': 'old-pod'}, claims, {'sentinel': 'retained'})
+        self.assertEqual(result['uid'], 'new-pod')
+        self.assertEqual([row[0] for row in events], ['traffic', 'traffic', 'start'])
+        self.assertTrue(all(row[1] == '/api/v1/userapp/proxy/app/prod/user/app/' for row in events[:2]))
+        self.assertEqual({row[2] for row in events[:2]}, {'http://replica-a', 'http://replica-b'})
+
+    def test_first_request_failure_does_not_hidden_start_or_poll_until_green(self):
+        run, claims = self.run_fixture()
+        run.check = self.strict_check
+        run.first_proxy_get = Mock(return_value=(503, b'not ready'))
+        run.api = Mock()
+        with self.assertRaisesRegex(AssertionError, 'traffic_wake_without_start'):
+            run.traffic_wake({'uid': 'old-pod'}, claims, {'sentinel': 'retained'})
+        self.assertEqual(run.first_proxy_get.call_count, 2)
+        run.api.assert_not_called()
+
+    def test_changed_pvc_or_source_data_fails_before_explicit_start(self):
+        for changed_claims, changed_data in [(True, False), (False, True)]:
+            run, claims = self.run_fixture()
+            run.check = self.strict_check
+            run.first_proxy_get = Mock(return_value=(200, b'run-B'))
+            run.api = Mock()
+            if changed_claims:
+                claims = [(claims[0][0], 'old-pvc')]
+            if changed_data:
+                run.dev_data_proof.return_value = {'sentinel': 'changed'}
+            with self.subTest(changed_claims=changed_claims), \
+                    self.assertRaisesRegex(AssertionError, 'traffic_wake_pvc_data_preserved'):
+                run.traffic_wake({'uid': 'old-pod'}, claims, {'sentinel': 'retained'})
+            run.api.assert_not_called()
+
+    def test_same_pod_or_explicit_start_replacement_cannot_pass(self):
+        for traffic_uid, explicit_uid in [('old-pod', 'old-pod'), ('new-pod', 'replacement-pod')]:
+            run, claims = self.run_fixture()
+            run.check, run.api = self.strict_check, Mock()
+            run.first_proxy_get = Mock(return_value=(200, b'run-B'))
+            row = {'uid': traffic_uid, 'phase': 'Running', 'conditions': [{'type': 'Ready', 'status': 'True'}]}
+            run.prod_pod.side_effect = [row, {**row, 'uid': explicit_uid}]
+            expected = 'traffic_wake_single_instance' if traffic_uid == 'old-pod' else 'wake_explicit_start_idempotent'
+            with self.subTest(traffic_uid=traffic_uid), self.assertRaisesRegex(AssertionError, expected):
+                run.traffic_wake({'uid': 'old-pod'}, claims, {'sentinel': 'retained'})
+
+    def test_missing_or_repeated_replica_entries_fail_before_traffic(self):
+        for entries in ([], ['http://only'], ['http://same', 'http://same']):
+            run, claims = self.run_fixture()
+            run.proxy_entries, run.first_proxy_get, run.api = entries, Mock(), Mock()
+            with self.subTest(entries=entries), self.assertRaisesRegex(AssertionError, 'distinct captured'):
+                run.traffic_wake({'uid': 'old-pod'}, claims, {'sentinel': 'retained'})
+            run.first_proxy_get.assert_not_called()
+            run.api.assert_not_called()
+
+    def test_first_get_preserves_redirect_status_without_proxy_follow_or_retry(self):
+        run, _claims = self.run_fixture()
+        run.trace, run.requests = 'a' * 32, []
+        response = urllib.error.HTTPError('http://replica-a/path', 302, 'redirect',
+                                          {'Location': 'http://elsewhere'}, io.BytesIO(b'redirect'))
+        opener = Mock()
+        opener.open.side_effect = response
+        with patch.object(acceptance.urllib.request, 'build_opener', return_value=opener) as build:
+            self.assertEqual(run.first_proxy_get('/path', 'http://replica-a', acceptance.time.monotonic() + 10),
+                             (302, b'redirect'))
+        self.assertEqual(build.call_args.args[0].proxies, {})
+        self.assertIsInstance(build.call_args.args[1], acceptance.NoProxyRedirect)
+        self.assertIsNone(build.call_args.args[1].redirect_request(None, None, 302, '', {}, 'http://elsewhere'))
+        opener.open.assert_called_once()
+        self.assertEqual(run.requests[0]['attempts'], 1)
+        self.assertFalse(run.requests[0]['redirects_followed'])
+        self.assertFalse(run.requests[0]['environment_proxy'])
 
 
 class RestartAdmissionTests(unittest.TestCase):
@@ -267,6 +636,7 @@ class RestObservationTests(unittest.TestCase):
     def test_ssh_deadline_propagates_without_changing_arguments(self):
         run = self.run_fixture()
         run.args.context, run.args.namespace, run.args.ssh = 'default', 'nuwax-k8s-test', 'test-user@192.0.2.10'
+        run.args.kube_server = None
         run.local = Mock(return_value='inventory')
         self.assertEqual(run.kube('get', 'pods', deadline=10), 'inventory')
         self.assertEqual(run.local.call_args.args, ('ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
@@ -279,6 +649,12 @@ class RestObservationTests(unittest.TestCase):
 
 
 class DevReadonlyLocatorTests(unittest.TestCase):
+    def claim(self, **changes):
+        return {'kind': 'PersistentVolumeClaim', 'name': 'rcoder-app-builder-app-workspace',
+                'uid': 'claim', 'labels': {'app.kubernetes.io/managed-by': 'rcoder-runtime',
+                                          'service_type': 'user-app-builder'},
+                'annotations': {'rcoder.io/application-id': 'app', 'rcoder.io/lifecycle-id': 'life'},
+                **changes}
     """Harness guards with fake clients, never evidence of real K8s success."""
 
     def run_fixture(self):
@@ -420,8 +796,8 @@ class DevReadonlyLocatorTests(unittest.TestCase):
     def test_stopped_view_rejects_any_replica_or_remaining_pod(self):
         run = self.run_fixture()
         run.dev_controller = Mock(return_value=self.controller())
-        run.inventory = Mock(return_value=[{'kind': 'PersistentVolumeClaim', 'name': 'workspace', 'uid': 'claim'}])
-        self.assertEqual(run.stopped_dev_view('controller', None)['claims'], [('workspace', 'claim')])
+        run.inventory = Mock(return_value=[self.claim()])
+        self.assertEqual(run.stopped_dev_view('controller', None)['claims'], [('rcoder-app-builder-app-workspace', 'claim')])
         row = self.controller()
         row['spec']['replicas'] = 1
         run.dev_controller.return_value = row
@@ -431,6 +807,25 @@ class DevReadonlyLocatorTests(unittest.TestCase):
         run.inventory.return_value += [{'kind': 'Pod', 'name': 'rcoder-app-builder-app-0', 'uid': 'replacement'}]
         with self.assertRaises(AssertionError):
             run.stopped_dev_view('controller', None)
+
+    def test_other_app_new_pvc_is_allowed_but_baseline_uid_and_pv_stay_protected(self):
+        run = self.restart_observer_fixture()
+        existing = {'kind': 'PersistentVolumeClaim', 'name': 'existing-workspace',
+                    'uid': 'baseline-pvc', 'volumeName': 'pv-original'}
+        run.baseline = [existing]
+        new_other = {'kind': 'PersistentVolumeClaim', 'name': 'another-workspace',
+                     'uid': 'other-new-pvc', 'volumeName': 'other-new-pv'}
+        rows = [self.claim(), existing, new_other, self.restarting_pod(True)]
+        run.inventory = Mock(return_value=rows)
+        _controller, pods = run.observe_restarted_dev('controller',
+            [('rcoder-app-builder-app-workspace', 'claim')], acceptance.time.monotonic() + 10)
+        self.assertEqual(pods[0]['uid'], 'new-pod')
+        for before in ([], [{**existing, 'uid': 'replacement'}],
+                       [{**existing, 'volumeName': 'pv-rebound'}], [{**existing, 'deletionTimestamp': 'now'}]):
+            run.inventory = Mock(return_value=[self.claim(), *before, new_other, self.restarting_pod(True)])
+            with self.subTest(before=before), self.assertRaisesRegex(AssertionError, 'baseline PVC'):
+                run.observe_restarted_dev('controller', [('rcoder-app-builder-app-workspace', 'claim')],
+                                          acceptance.time.monotonic() + 10)
 
     def test_stopped_pair_requires_filtered_nonorphan_and_actual_log_diagnostic(self):
         run = self.run_fixture()
@@ -455,9 +850,9 @@ class DevReadonlyLocatorTests(unittest.TestCase):
         run.dev_git = Mock(return_value={'commit': 'b' * 40})
         run.dev_data_proof = Mock(return_value={'sentinel': 'actual-test-client-proof'})
         run.dev_controller = Mock(return_value=self.controller())
-        run.inventory = Mock(return_value=[{'kind': 'PersistentVolumeClaim', 'name': 'workspace', 'uid': 'claim'}])
+        run.inventory = Mock(return_value=[self.claim()])
         run.check, run.dev_compute = Mock(), Mock(return_value=self.operation())
-        run.stopped_dev_view = Mock(return_value={'claims': [('workspace', 'claim')]})
+        run.stopped_dev_view = Mock(return_value={'claims': [('rcoder-app-builder-app-workspace', 'claim')]})
         run.patch_readonly_annotation = Mock(return_value='2')
         run.remove_readonly_annotation = Mock()
         run.readonly_dev_pair = Mock(side_effect=OSError('read failed'))
@@ -482,7 +877,7 @@ class DevReadonlyLocatorTests(unittest.TestCase):
 
     def test_succeeded_restart_waits_for_new_pod_ready_before_asserting_identity(self):
         run = self.restart_scenario_fixture()
-        claim = {'kind': 'PersistentVolumeClaim', 'name': 'workspace', 'uid': 'claim'}
+        claim = self.claim()
         snapshots = iter([[claim], [claim, self.restarting_pod()], [claim, self.restarting_pod(True)]])
         run.inventory.side_effect = lambda **kwargs: next(snapshots, [claim, self.restarting_pod(True)])
         with patch.object(acceptance.time, 'sleep'):
@@ -518,7 +913,7 @@ class DevReadonlyLocatorTests(unittest.TestCase):
 
     def test_restart_ready_observations_and_compute_share_one_scenario_deadline(self):
         run = self.restart_scenario_fixture()
-        claim = {'kind': 'PersistentVolumeClaim', 'name': 'workspace', 'uid': 'claim'}
+        claim = self.claim()
         snapshots = iter([[claim], [claim, self.restarting_pod(True)]])
         run.inventory.side_effect = lambda **kwargs: next(snapshots, [claim, self.restarting_pod(True)])
         with patch.object(acceptance.time, 'monotonic', return_value=10):
@@ -530,12 +925,12 @@ class DevReadonlyLocatorTests(unittest.TestCase):
 
     def test_restart_observer_waits_only_for_missing_pending_or_not_ready_pod(self):
         run = self.restart_observer_fixture()
-        claim = {'kind': 'PersistentVolumeClaim', 'name': 'workspace', 'uid': 'claim'}
+        claim = self.claim()
         pending = {**self.restarting_pod(), 'phase': 'Pending'}
         run.inventory = Mock(side_effect=[[claim], [claim, pending],
                              [claim, self.restarting_pod()], [claim, self.restarting_pod(True)]])
         with patch.object(acceptance.time, 'sleep') as sleep:
-            controller, pods = run.observe_restarted_dev('controller', [('workspace', 'claim')],
+            controller, pods = run.observe_restarted_dev('controller', [('rcoder-app-builder-app-workspace', 'claim')],
                                                          acceptance.time.monotonic() + 10)
         self.assertEqual((controller['metadata']['uid'], pods[0]['uid']), ('controller', 'new-pod'))
         self.assertEqual(sleep.call_count, 3)
@@ -543,7 +938,7 @@ class DevReadonlyLocatorTests(unittest.TestCase):
 
     def test_restart_observer_rejects_late_ready_after_query_returns(self):
         run = self.restart_observer_fixture()
-        claim = {'kind': 'PersistentVolumeClaim', 'name': 'workspace', 'uid': 'claim'}
+        claim = self.claim()
         clock = [0.0]
         views = iter([(0.6, False), (1.1, True)])
         def inventory(**kwargs):
@@ -553,7 +948,7 @@ class DevReadonlyLocatorTests(unittest.TestCase):
         with patch.object(acceptance.time, 'monotonic', side_effect=lambda: clock[0]), \
              patch.object(acceptance.time, 'sleep', side_effect=lambda duration: clock.__setitem__(0, clock[0] + duration)), \
              self.assertRaisesRegex(TimeoutError, 'last observation'):
-            run.observe_restarted_dev('controller', [('workspace', 'claim')], 1)
+            run.observe_restarted_dev('controller', [('rcoder-app-builder-app-workspace', 'claim')], 1)
         self.assertEqual(run.inventory.call_count, 2)
         self.assertEqual(run.save.call_args.args[1]['pods'][0]['conditions'][0]['status'], 'True')
 
@@ -561,12 +956,12 @@ class DevReadonlyLocatorTests(unittest.TestCase):
         run = self.restart_observer_fixture()
         run.inventory = Mock()
         with patch.object(acceptance.time, 'monotonic', return_value=10), self.assertRaises(TimeoutError):
-            run.observe_restarted_dev('controller', [('workspace', 'claim')], 10)
+            run.observe_restarted_dev('controller', [('rcoder-app-builder-app-workspace', 'claim')], 10)
         run.kube.assert_not_called()
         run.inventory.assert_not_called()
 
     def test_restart_observer_fails_on_controller_pod_or_volume_identity_changes(self):
-        claim = {'kind': 'PersistentVolumeClaim', 'name': 'workspace', 'uid': 'claim'}
+        claim = self.claim()
         cases = {
             'old-pod': [[claim, self.restarting_pod(True, 'old-pod')]],
             'multiple-pods': [[claim, self.restarting_pod(), self.restarting_pod(True, 'other')]],
@@ -580,7 +975,7 @@ class DevReadonlyLocatorTests(unittest.TestCase):
             run = self.restart_observer_fixture()
             run.inventory = Mock(side_effect=observations)
             with self.subTest(name=name), patch.object(acceptance.time, 'sleep'), self.assertRaises(AssertionError):
-                run.observe_restarted_dev('controller', [('workspace', 'claim')], acceptance.time.monotonic() + 10)
+                run.observe_restarted_dev('controller', [('rcoder-app-builder-app-workspace', 'claim')], acceptance.time.monotonic() + 10)
         for field in ('uid', 'lifecycle', 'replicas'):
             run = self.restart_observer_fixture()
             row = self.controller()
@@ -592,7 +987,7 @@ class DevReadonlyLocatorTests(unittest.TestCase):
             run.kube.return_value = json.dumps(row)
             run.inventory = Mock(return_value=[claim, self.restarting_pod(True)])
             with self.subTest(field=field), self.assertRaises(AssertionError):
-                run.observe_restarted_dev('controller', [('workspace', 'claim')], acceptance.time.monotonic() + 10)
+                run.observe_restarted_dev('controller', [('rcoder-app-builder-app-workspace', 'claim')], acceptance.time.monotonic() + 10)
 
     def test_read_failure_cleans_annotation_before_outer_cleanup_and_never_restarts(self):
         run = self.scenario_fixture()
@@ -689,6 +1084,137 @@ class ReportTests(unittest.TestCase):
             summary = json.loads(next(Path(root).glob('reports/*/summary.json')).read_text())
             self.assertEqual(summary['verdict'], 'fail')
             self.assertIn('cold_deploy', summary['missing'])
+
+
+class IndependentRecreateScenarioTests(unittest.TestCase):
+    def test_l1_uses_real_business_sequence_and_original_compute_history(self):
+        fixture = RecreatedLifecycleTests()
+        run, _history = fixture.business_fixture()
+        operations = [fixture.operation(lifecycle='life-two', operation_id='l1-stop'),
+                      fixture.operation('restart', 'life-two', 'l1-restart')]
+        run.dev_compute.side_effect = operations
+        run.compute_history.return_value = operations
+        run.recreate_l1_business()
+        run.build.assert_called_once_with('L1')
+        self.assertEqual(run.api.call_args.args[1]['lifecycle_id'], 'life-two')
+        self.assertEqual([call.kwargs['request_id'] for call in run.dev_compute.call_args_list],
+                         ['recreate-l1-stop-run', 'recreate-l1-restart-run'])
+        run.compute_history.assert_called_once_with(operations, 'life-two')
+        run.content.assert_any_call('run-L1')
+        self.assertIn('recreate_l1_data_preserved', [call.args[0] for call in run.check.call_args_list])
+
+    def test_l1_missing_git_or_changed_data_cannot_reach_recreate(self):
+        for changed_data in (False, True):
+            fixture = RecreatedLifecycleTests()
+            run, _history = fixture.business_fixture()
+            operations = [fixture.operation(lifecycle='life-two', operation_id='l1-stop'),
+                          fixture.operation('restart', 'life-two', 'l1-restart')]
+            run.dev_compute.side_effect = operations
+            run.compute_history.return_value = operations
+            if changed_data:
+                run.dev_data_proof.side_effect = [{'sentinel': 'before'}, {'sentinel': 'changed'}]
+            else:
+                run.dev_git.return_value = {'commit': 'not-an-actual-Git-hash'}
+            run.recreate_lifecycle = Mock()
+            with self.subTest(changed_data=changed_data), self.assertRaises(AssertionError):
+                run.recreate_l1_business()
+                run.recreate_lifecycle()
+            run.recreate_lifecycle.assert_not_called()
+            if not changed_data:
+                run.build.assert_not_called()
+                run.dev_compute.assert_not_called()
+
+    def test_default_all_retains_81_required_steps(self):
+        self.assertEqual(len(acceptance.REQUIRED), 81)
+        self.assertEqual(acceptance.SCENARIO_REQUIRED['all'], acceptance.REQUIRED)
+        self.assertIn('traffic_wake_without_start', acceptance.REQUIRED)
+        self.assertIn('recreate_history_preserved', acceptance.REQUIRED)
+        self.assertNotIn('traffic_wake_without_start', acceptance.RECREATE_REQUIRED)
+        self.assertTrue({'build_L1', 'artifact_L1', 'recreate_l1_files_git',
+                         'recreate_l1_deploy_operation', 'recreate_l1_content',
+                         'recreate_l1_compute_history', 'recreate_l1_data_preserved',
+                         'build_L2', 'recreate_compute_stop', 'recreate_compute_restart',
+                         'recreate_old_lifecycle_rejected', 'recreate_history_preserved',
+                         'recreate_deleted', 'cleanup', 'baseline_preserved'}
+                        <= acceptance.RECREATE_REQUIRED)
+
+    def scenario_fixture(self, scenario):
+        run = acceptance.Run.__new__(acceptance.Run)
+        run.scenario = scenario
+        calls = []
+        for name in ('prepare', 'workspace', 'recreate_l1_business', 'dev_readonly_locator',
+                     'recreate_lifecycle', 'traffic_wake', 'deploy'):
+            setattr(run, name, Mock(side_effect=lambda *_args, name=name: calls.append(name)))
+        run.build = Mock(side_effect=lambda version: (calls.append('build-' + version) or ({}, version)))
+        return run, calls
+
+    def test_recreate_is_independent_of_traffic_lock_and_readonly_scenarios(self):
+        run, calls = self.scenario_fixture('recreate')
+        run.exercise()
+        self.assertEqual(calls, ['prepare', 'workspace', 'recreate_l1_business', 'recreate_lifecycle'])
+        run.deploy.assert_not_called()
+        run.build.assert_not_called()
+        run.traffic_wake.assert_not_called()
+        run.dev_readonly_locator.assert_not_called()
+
+    def test_all_keeps_original_scenarios_before_explicit_recreate(self):
+        run, calls = self.scenario_fixture('all')
+        run.exercise()
+        self.assertEqual(calls, ['prepare', 'workspace', 'dev_readonly_locator', 'build-A',
+                                 'build-B', 'deploy', 'recreate_lifecycle'])
+        run.recreate_l1_business.assert_not_called()
+
+    def test_all_original_business_failure_does_not_get_bypassed(self):
+        run, _calls = self.scenario_fixture('all')
+        run.deploy.side_effect = AssertionError('traffic_wake_without_start')
+        with self.assertRaisesRegex(AssertionError, 'traffic_wake_without_start'):
+            run.exercise()
+        run.recreate_lifecycle.assert_not_called()
+
+    def test_report_identity_and_plan_are_scenario_specific(self):
+        class OfflineRun(acceptance.Run):
+            def local(self, *_args):
+                return 'test-head'
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {'E2E_RUN_ROOT': directory}), \
+                patch('run.source_fingerprint', return_value='frozen-source'), \
+                contextlib.redirect_stdout(io.StringIO()):
+            for scenario in acceptance.SCENARIO_REQUIRED:
+                args = SimpleNamespace(scenario=scenario, url='http://test', namespace='rcoder-e2e-unit', ssh='test')
+                run = OfflineRun(args)
+                self.assertEqual(run.summary['scenario'], scenario)
+                self.assertEqual(run.summary['report_identity'], {
+                    'scenario': acceptance.SCENARIO_IDENTITIES[scenario], 'backend': 'k8s'})
+                self.assertEqual(run.summary['planned'], sorted(acceptance.SCENARIO_REQUIRED[scenario]))
+                self.assertEqual(run.summary['required'], run.summary['planned'])
+                self.assertTrue(run.app.startswith('e2e-k8s-'))
+                self.assertEqual(len(run.app), 22)
+
+    def test_l2_business_and_cleanup_errors_remain_separate_in_terminal_report(self):
+        class FailedRun(acceptance.Run):
+            def local(self, *_args):
+                return 'test-head'
+            def exercise(self):
+                raise AssertionError('original L2 workspace failed')
+            def cleanup_owned(self):
+                raise OSError('original API cleanup failed')
+            def preserve_baseline(self):
+                self.check('baseline_preserved', True)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {'E2E_RUN_ROOT': directory}), \
+                patch.object(acceptance, 'Run', FailedRun), \
+                patch('run.source_fingerprint', return_value='frozen-source'), \
+                patch('signal.signal'), \
+                patch('sys.argv', ['k8s_userapp.py', '--ssh', 'test', '--url', 'http://test',
+                                   '--proxy-url', 'http://test', '--scenario', 'recreate']), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(acceptance.main(), 1)
+            summary = json.loads(next(Path(directory).glob('*/summary.json')).read_text())
+            self.assertIn('original L2 workspace failed', summary['error'])
+            self.assertIn('original API cleanup failed', summary['cleanup_error'])
+            self.assertNotIn('traffic_wake_without_start', summary['missing'])
+            self.assertIn('recreate_workspace_usable', summary['missing'])
+            self.assertEqual(summary['verdict'], 'fail')
 
 
 if __name__ == '__main__':

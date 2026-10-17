@@ -7,18 +7,23 @@ import tempfile
 import unittest
 import urllib.error
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import owner_conflict_contract as contract
 
 
-def envelope(trace='a' * 32):
-    return {'status': 409, 'trace_id': trace, 'body': {
+def envelope(trace='a' * 32, accept_language=None):
+    message, hint = (
+        ('当前会话关联的运行账号与本次请求不一致，消息未发送。',
+         '请联系管理员核对会话关联的运行账号与本次请求账号，修正后再发送；不要自动重试。')
+        if accept_language == 'zh-CN' else
+        ('The runtime account linked to this conversation does not match this request. No message was sent.',
+         'Ask an administrator to check the conversation runtime account against the request account before sending again. Do not retry automatically.'))
+    return {'status': 409, 'trace_id': trace, 'request_accept_language': accept_language, 'body': {
         'code': contract.CODE, 'success': False, 'data': None, 'tid': trace,
-        'message': '当前会话关联的运行账号与本次请求不一致，消息未发送。',
+        'message': message,
         'error_detail': {'reason_code': contract.REASON, 'stage': contract.STAGE,
-                         'retryable': False, 'detail': '当前会话关联的运行账号与本次请求不一致，消息未发送。',
-                         'hint': '请核对运行账号；不要自动重试。'}}}
+                         'retryable': False, 'detail': message, 'hint': hint}}}
 
 
 def owner_row(trace, ids):
@@ -32,6 +37,30 @@ def owner_row(trace, ids):
 class WireTests(unittest.TestCase):
     def test_valid_typed_error_and_exact_trace(self):
         contract.conflict(envelope(), 'unique-owner-a', 'unique-owner-b')
+
+    def test_both_approved_languages_require_their_message_and_hint(self):
+        for language in (None, 'zh-CN'):
+            with self.subTest(language=language):
+                contract.conflict(envelope(accept_language=language), 'unique-a', 'unique-b', language)
+                other = envelope(accept_language='zh-CN' if language is None else None)
+                for field in ('message', 'hint'):
+                    wrong = envelope(accept_language=language)
+                    if field == 'message':
+                        wrong['body']['message'] = other['body']['message']
+                        wrong['body']['error_detail']['detail'] = other['body']['message']
+                    else:
+                        wrong['body']['error_detail']['hint'] = other['body']['error_detail']['hint']
+                    with self.subTest(field=field), self.assertRaises(AssertionError):
+                        contract.conflict(wrong, 'unique-a', 'unique-b', language)
+
+    def test_absent_language_evidence_must_not_be_explicit_english_or_empty(self):
+        for language in ('en-US', '', 'zh-CN'):
+            wire = envelope(); wire['request_accept_language'] = language
+            with self.subTest(language=language), self.assertRaises(AssertionError):
+                contract.conflict(wire, 'unique-a', 'unique-b')
+        wire = envelope(); wire.pop('request_accept_language')
+        with self.assertRaises(AssertionError):
+            contract.conflict(wire, 'unique-a', 'unique-b')
 
     def test_http200_business_error_is_not_passed_as_409(self):
         value = envelope(); value['status'] = 200
@@ -82,6 +111,29 @@ class WireTests(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text()), got)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
+    def test_actual_request_omits_default_header_and_records_explicit_chinese(self):
+        observed = []
+        def response(request, **kwargs):
+            observed.append(request)
+            trace = request.get_header('Traceparent').split('-')[1]
+            body = envelope(trace, request.get_header('Accept-language'))['body']
+            raise urllib.error.HTTPError(request.full_url, 409, 'Conflict', {},
+                                         io.BytesIO(json.dumps(body).encode()))
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(contract.urllib.request, 'urlopen', side_effect=response):
+            api = contract.Http('http://localhost:8090', directory, 30)
+            for language in (None, 'zh-CN'):
+                for route in ('/computer/chat', '/computer/pod/ensure'):
+                    got = api.call('POST', route, {}, accept_language=language)
+                    contract.conflict(got, 'unique-a', 'unique-b', language)
+            self.assertEqual([r['request_accept_language'] for r in api.calls], [None, None, 'zh-CN', 'zh-CN'])
+            self.assertEqual(len({r['trace_id'] for r in api.calls}), 4)
+            for index in (0, 1):
+                self.assertNotIn('accept-language', {key.lower() for key, _ in observed[index].header_items()})
+            for index in (2, 3):
+                self.assertEqual(observed[index].get_header('Accept-language'), 'zh-CN')
+            self.assertEqual(len(list((Path(directory) / 'responses').glob('*.json'))), 4)
+
 
 class ProofTests(unittest.TestCase):
     def test_k8s_controller_selection_uses_only_current_main_and_namespace_instance(self):
@@ -118,6 +170,17 @@ class ProofTests(unittest.TestCase):
             contract.log_proof([row, {'trace_id': 'trace', 'owner_conflict': False,
                                      'chat_forward': True}], ['trace'], ids)
 
+    def test_four_language_requests_each_need_positive_owner_and_no_forward(self):
+        ids = contract.identities()
+        traces = ['default-chat', 'default-ensure', 'chinese-chat', 'chinese-ensure']
+        rows = [owner_row(trace, ids) for trace in traces]
+        contract.log_proof(rows, traces, ids)
+        with self.assertRaises(AssertionError):
+            contract.log_proof(rows[:-1], traces, ids)
+        with self.assertRaises(AssertionError):
+            contract.log_proof(rows + [{'trace_id': traces[-1], 'owner_conflict': False,
+                                       'chat_forward': True}], traces, ids)
+
 
 class FakeObserver:
     """Only an offline call-order fixture; no real container claims."""
@@ -141,6 +204,7 @@ class FakeObserver:
         self.retained_rows.extend(rows)
 
     def logs(self, traces):
+        self.traces = list(traces)
         return [owner_row(trace, self.ids) for trace in traces]
 
 
@@ -152,9 +216,10 @@ class FakeHttp:
         rows = self.observer.capture(user)
         return {'status': 'running' if rows else 'not_found', 'container_id': rows[0]['uid'] if rows else None}
 
-    def call(self, method, route, body=None, cleanup=False):
+    def call(self, method, route, body=None, cleanup=False, accept_language=None):
         trace = str(len(self.calls))
-        self.calls.append({'method': method, 'route': route, 'trace_id': trace})
+        self.calls.append({'method': method, 'route': route, 'trace_id': trace,
+                           'request_accept_language': accept_language})
         if method == 'GET':
             from urllib.parse import parse_qs, urlsplit
             user = parse_qs(urlsplit(route).query)['user_id'][0]
@@ -166,7 +231,7 @@ class FakeHttp:
             return {'status': 200, 'body': {'code': '0000', 'success': True, 'data': {'was_existing': True}}}
         self.observer.resources.setdefault(user, [{'kind': 'Container', 'name': 'test-' + user, 'uid': user + '-cid', 'mounts': []}])
         if user == self.observer.ids['user_b']:
-            value = envelope(trace)
+            value = envelope(trace, accept_language)
             if route == '/computer/chat' and self.fail_chat:
                 value['status'] = 500
             return value
@@ -175,6 +240,119 @@ class FakeHttp:
 
 
 class CleanupTests(unittest.TestCase):
+    def strict_fixture(self, root):
+        observer = FakeObserver()
+        ids = contract.identities()
+        observer.ids = ids
+        controller = 'a' * 64
+        observer.controllers = {controller: '/original-controller'}
+        baseline = {controller: {'image': 'image', 'running': True}}
+        observer.existing = Mock(return_value=baseline)
+        receipt = {'version': 1, 'root': str(Path(root).resolve()), 'run_id': 'b' * 32,
+                   'case_id': 'c' * 32, 'ids': ids, 'url': 'http://127.0.0.1:8090',
+                   'controllers': observer.controllers, 'observer': {'namespace': None},
+                   'initial_absence': {ids['user_a']: True, ids['user_b']: True},
+                   'baseline': baseline, 'claims': observer.claims(), 'captured': {},
+                   'touched': True, 'inflight': None}
+        return observer, FakeHttp(observer), receipt
+
+    def test_strict_receipt_is_persisted_before_creation_and_preserves_no_secret(self):
+        observer = FakeObserver(); ids = contract.identities(); observer.ids = ids
+        api = FakeHttp(observer)
+        with tempfile.TemporaryDirectory() as directory:
+            receipt = {'version': 1, 'root': directory, 'run_id': 'b' * 32, 'case_id': 'c' * 32}
+            original = api.call
+            def observe(method, route, body=None, **kwargs):
+                if method == 'POST' and route != '/computer/pod/stop':
+                    saved = json.loads((Path(directory) / 'ownership.json').read_text())
+                    self.assertTrue(saved['touched'])
+                    self.assertEqual(saved['initial_absence'], {ids['user_a']: True, ids['user_b']: True})
+                    self.assertEqual(saved['inflight'], {'route': route, 'user_id': body['user_id'],
+                                                        'project_id': body['project_id']})
+                    self.assertNotIn('api_key', json.dumps(saved))
+                return original(method, route, body, **kwargs)
+            api.call = observe
+            result = contract.exercise(api, observer, ids, directory, receipt)
+            saved = json.loads((Path(directory) / 'ownership.json').read_text())
+            self.assertEqual((Path(directory) / 'ownership.json').stat().st_mode & 0o777, 0o600)
+            self.assertIsNone(saved['inflight'])
+            self.assertTrue(result['success'])
+            self.assertTrue(saved['cleanup']['success'])
+
+    def test_interrupted_receipt_write_keeps_previous_complete_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            contract.save_ownership(directory, {'touched': False})
+            with patch.object(contract.json, 'dump', side_effect=OSError('interrupted write')), self.assertRaises(OSError):
+                contract.save_ownership(directory, {'touched': True})
+            self.assertEqual(json.loads((Path(directory) / 'ownership.json').read_text()), {'touched': False})
+            self.assertEqual(list(Path(directory).glob('.ownership-*')), [])
+
+    def test_fallback_uses_original_controller_and_only_two_proven_random_accounts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            observer, api, receipt = self.strict_fixture(directory)
+            for user in (receipt['ids']['user_a'], receipt['ids']['user_b']):
+                observer.resources[user] = [{'kind': 'Container', 'name': user, 'uid': user + '-cid', 'mounts': []}]
+            # This simulates an ensure response lost before capture was persisted.
+            contract.save_ownership(directory, receipt)
+            with patch.object(contract, 'Observer', return_value=observer), \
+                    patch.object(contract, 'Http', return_value=api):
+                result = contract.cleanup_fixture(directory, 'b' * 32, 'c' * 32)
+            self.assertTrue(result['success'])
+            self.assertEqual({row['user_id'] for row in api.stops},
+                             {receipt['ids']['user_a'], receipt['ids']['user_b']})
+            self.assertFalse(result['volumes_removed'])
+            self.assertTrue(result['preexisting_resources_preserved'])
+
+    def test_fallback_rejects_foreign_run_initial_absence_controller_and_baseline_uid(self):
+        for mutation in ('run', 'ids', 'absence', 'controller', 'baseline_uid'):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                observer, api, receipt = self.strict_fixture(directory)
+                if mutation == 'run':
+                    receipt['run_id'] = 'd' * 32
+                elif mutation == 'ids':
+                    receipt['ids']['user_a'] = 'existing-user'
+                elif mutation == 'absence':
+                    receipt['initial_absence'].pop(receipt['ids']['user_a'])
+                elif mutation == 'controller':
+                    observer.controllers = {'d' * 64: '/replacement-controller'}
+                else:
+                    observer.resources[receipt['ids']['user_a']] = [{'kind': 'Container', 'name': 'owned-name',
+                        'uid': 'a' * 64, 'mounts': []}]
+                contract.save_ownership(directory, receipt)
+                with patch.object(contract, 'Observer', return_value=observer), \
+                        patch.object(contract, 'Http', return_value=api), self.assertRaises(ValueError):
+                    contract.cleanup_fixture(directory, 'b' * 32, 'c' * 32)
+                self.assertEqual(api.stops, [])
+
+    def test_empty_inventory_does_not_settle_interrupted_post(self):
+        with tempfile.TemporaryDirectory() as directory:
+            observer, api, receipt = self.strict_fixture(directory)
+            receipt['inflight'] = {'route': '/computer/pod/ensure', 'user_id': receipt['ids']['user_a'],
+                                    'project_id': receipt['ids']['project']}
+            contract.save_ownership(directory, receipt)
+            with patch.object(contract, 'Observer', return_value=observer), \
+                    patch.object(contract, 'Http', return_value=api):
+                result = contract.cleanup_fixture(directory, 'b' * 32, 'c' * 32)
+            self.assertFalse(result['success'])
+            self.assertEqual(result['unsettled_request'], receipt['inflight'])
+
+    def test_strict_cleanup_routes_owned_directory_without_generic_docker_removal(self):
+        import cleanup as outer_cleanup
+        with tempfile.TemporaryDirectory() as directory:
+            case = Path(directory)
+            root = case / 'owner-conflict-contract'
+            root.mkdir()
+            (root / 'ownership.json').write_text(json.dumps({'captured': {
+                'random-user': [{'name': '/owned-agent', 'uid': 'captured'}]}}))
+            remaining = {'Id': 'captured', 'Name': '/owned-agent',
+                         'Config': {'Labels': {'rcoder.e2e.run': 'run'}}}
+            with patch.object(contract, 'cleanup_fixture', return_value={'success': False}) as reclaim, \
+                    patch.object(outer_cleanup, 'command', side_effect=['captured', json.dumps([remaining])]) as docker:
+                errors = outer_cleanup.cleanup_case('case', 'run', case)
+            reclaim.assert_called_once_with(root, 'run', 'case', ())
+            self.assertTrue(any('Owner conflict fixture cleanup incomplete' in error for error in errors))
+            self.assertEqual(docker.call_count, 2, 'no generic bare Docker removal after creation-aware failure')
+
     def test_cleanup_uses_independent_b_project_and_preserves_a_until_its_stop(self):
         observer = FakeObserver(); ids = contract.identities(); observer.ids = ids
         api = FakeHttp(observer)
@@ -224,7 +402,17 @@ class CleanupTests(unittest.TestCase):
             report = contract.exercise(api, observer, ids, directory)
             evidence = json.loads((Path(directory) / 'owner-trace-evidence.json').read_text())
         self.assertTrue(report['success'])
-        self.assertEqual(len(evidence), 2)
+        self.assertEqual(len(evidence), 4)
+        self.assertEqual(len(set(observer.traces)), 4)
+        self.assertEqual(set(report['checks']), contract.STEPS)
+        self.assertEqual(len(report['checks']), len(contract.STEPS))
+        self.assertEqual(report['required_steps'], sorted(contract.STEPS))
+        self.assertEqual(report['language_contract'], {'default_no_accept_language': 'en-US',
+                         'explicit_accept_language': 'zh-CN', 'required_conflict_responses': 4})
+        conflicts = [r for r in api.calls if r['trace_id'] in observer.traces]
+        self.assertEqual([(r['route'], r['request_accept_language']) for r in conflicts],
+                         [('/computer/chat', None), ('/computer/pod/ensure', None),
+                          ('/computer/chat', 'zh-CN'), ('/computer/pod/ensure', 'zh-CN')])
         self.assertTrue(report['preexisting_resources_preserved'])
         self.assertFalse(report['all_rpc_zero_claimed'])
 

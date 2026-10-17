@@ -1310,12 +1310,8 @@ impl UserAppRuntimeConfigurationStore for ToastyUserAppStore {
     }
 }
 
-/// Offline E2E observation never initializes schemas or quarantines live records.
-/// The directory lease is held through owner shutdown, preventing concurrent RCoder access.
 #[cfg(feature = "userapp-turso")]
-pub async fn offline_snapshot(
-    path: &std::path::Path,
-) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+async fn offline_owner(path: &std::path::Path) -> anyhow::Result<DatabaseOwner> {
     use crate::db::{
         driver::{ConnectionPolicy, PolicyDriver},
         models,
@@ -1326,7 +1322,7 @@ pub async fn offline_snapshot(
         tokio::task::spawn_blocking(move || super::exclusive_directory::acquire(&requested))
             .await??;
     local_format::require_ready(&path)?;
-    let owner = DatabaseOwner::open(1, 1, lock, move || async move {
+    DatabaseOwner::open(1, 1, lock, move || async move {
         let mut db = toasty::Db::builder()
             .models(models::storage_models())
             .max_pool_size(1)
@@ -1338,7 +1334,18 @@ pub async fn offline_snapshot(
         schema::verify_existing(&mut db, Backend::Turso, Component::Userapp).await?;
         Ok(db)
     })
-    .await?;
+    .await
+}
+
+/// Offline E2E observation never initializes schemas or quarantines live records.
+/// The directory lease is held through owner shutdown, preventing concurrent RCoder access.
+#[cfg(feature = "userapp-turso")]
+pub async fn offline_snapshot(
+    path: &std::path::Path,
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    use crate::db::models;
+
+    let owner = offline_owner(path).await?;
     let result = owner
         .execute(|mut db| async move {
             let mut tx = db.transaction().await?;
@@ -1357,6 +1364,51 @@ pub async fn offline_snapshot(
             applications.sort();
             operations.sort();
             Ok((applications, operations))
+        })
+        .await;
+    owner.shutdown().await?;
+    result
+}
+
+/// Offline-only private operation view. Public HTTP serialization stays unchanged.
+#[cfg(feature = "userapp-turso")]
+#[derive(serde::Serialize)]
+struct OfflineComputeRecord<'a> {
+    #[serde(flatten)]
+    record: &'a ComputeControlRecord,
+    request_id: &'a str,
+    request_fingerprint: &'a str,
+    lease: &'a Option<UserAppOperationLeaseReceipt>,
+}
+
+/// Read one typed compute record while holding the same offline directory lease.
+/// Private admission and physical lease fields are exposed only to this observer.
+#[cfg(feature = "userapp-turso")]
+pub async fn offline_compute_snapshot(
+    path: &std::path::Path,
+    app_id: &str,
+    operation_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let owner = offline_owner(path).await?;
+    let app_id = app_id.to_owned();
+    let operation_id = operation_id.to_owned();
+    let result = owner
+        .execute(move |mut db| async move {
+            let mut tx = db.transaction().await?;
+            let record = compute::get(&mut tx, &app_id, &operation_id).await?;
+            let json = record
+                .as_ref()
+                .map(|record| {
+                    serde_json::to_string(&OfflineComputeRecord {
+                        record,
+                        request_id: &record.request_id,
+                        request_fingerprint: &record.request_fingerprint,
+                        lease: &record.lease,
+                    })
+                })
+                .transpose()?;
+            tx.commit().await?;
+            Ok(json)
         })
         .await;
     owner.shutdown().await?;

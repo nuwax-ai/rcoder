@@ -8,6 +8,7 @@ from pathlib import Path
 import tempfile
 import socket
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -370,6 +371,132 @@ class ImmutableFaultPublicationTests(unittest.TestCase):
             self.assertTrue(all(value == expected for value in values))
 
 
+class StopTimeoutContractTests(unittest.TestCase):
+    def test_mode_and_immutable_offline_observer_are_required_before_fixture_work(self):
+        self.assertEqual(contract.failure_mode({}), 'stopped_read')
+        self.assertEqual(contract.failure_mode({'E2E_COMPUTE_FAILURE_MODE': 'stop_reply_timeout'}), 'stop_reply_timeout')
+        self.assertIsNone(contract.required_checkpoint_observer({}, 'stopped_read'))
+        for mode in ('', 'compute_stopped', 'future_mode'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                contract.failure_mode({'E2E_COMPUTE_FAILURE_MODE': mode})
+        for value in (None, '', 'relative-reader', 'a' * 63, 'g' * 64):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                contract.required_checkpoint_observer({'rcoder': {'observer_sha256': value}}, 'stop_reply_timeout')
+        self.assertEqual(contract.required_checkpoint_observer({'rcoder': {'observer_sha256': 'a' * 64}},
+                                                               'stop_reply_timeout'), 'a' * 64)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / 'reports'
+            receipt = Path(temporary) / 'build.json'
+            source = {'origin_head': 'frozen', 'worktree_sha256': 'a' * 64}
+            build = {'version': 1, 'source': source,
+                     'rcoder': {'image_id': 'sha256:' + 'b' * 64, 'binary_sha256': 'c' * 64},
+                     'builder': {'image_id': 'sha256:' + 'd' * 64,
+                                 'agent_runner_sha256': 'e' * 64, 'app_cli_sha256': 'f' * 64}}
+            receipt.write_text(json.dumps(build))
+            environment = {'E2E_REPORT_DIR': str(directory), 'E2E_COMPUTE_BUILD_RECEIPT': str(receipt),
+                           'E2E_COMPUTE_APP_ENTRY_PORT': '31234', 'E2E_COMPUTE_FAILURE_MODE': 'stop_reply_timeout'}
+            with patch.dict('os.environ', environment, clear=True), \
+                    patch.object(contract, 'source_identity', return_value=source), \
+                    patch.object(contract, 'command') as docker:
+                with self.assertRaisesRegex(ValueError, 'observer_sha256'):
+                    contract.main()
+                docker.assert_not_called()
+                self.assertFalse(directory.exists())
+
+    def test_mutation_audit_counts_stop_and_forbidden_starts_not_exec_or_network(self):
+        rows = [
+            {'method': 'POST', 'path': '/v1.47/containers/owned/stop?t=30'},
+            {'method': 'POST', 'path': '/exec/owned-exec/start'},
+            {'method': 'POST', 'path': '/networks/create'},
+            {'method': 'GET', 'path': '/containers/owned/json'},
+        ]
+        self.assertEqual(contract.compute_write_counts(rows), (1, 0))
+        for suffix in ('/start', '/restart'):
+            self.assertEqual(contract.compute_write_counts(rows + [{'method': 'POST', 'path': '/containers/owned' + suffix}]), (1, 1))
+        self.assertEqual(contract.compute_write_counts(rows + [{'method': 'POST', 'path': '/v1.47/containers/create?name=owned'}]), (1, 1))
+
+    def test_offline_checkpoint_requires_original_operation_target_executor_and_lease(self):
+        record = {'app_id': 'app', 'lifecycle_id': 'life', 'operation_id': 'op',
+                  'request_id': 'request', 'scope': 'Dev', 'action': 'restart',
+                  'state': 'recovery_required', 'stage': 'stopping', 'executor_id': 'executor',
+                  'request_fingerprint': 'a' * 64, 'error_code': 'ERR_BACKEND_ERROR',
+                  'error_message': 'Docker request timed out',
+                  'checkpoint': {'context': {'app_id': 'app', 'lifecycle_id': 'life',
+                      'operation_id': 'op', 'executor_id': 'executor', 'request_fingerprint': 'a' * 64},
+                      'workload': {'uid': 'captured-id'}},
+                  'lease': {'runtime': 'docker', 'inode': 123, 'token': 'executor'}}
+        snapshot = {'version': 1, 'read_only': True, 'controller_stopped': True, 'record': record}
+        kwargs = {'app': 'app', 'lifecycle': 'life', 'operation': 'op', 'request': 'request', 'captured_id': 'captured-id'}
+        before = copy.deepcopy(snapshot)
+        self.assertEqual(contract.validate_timeout_checkpoint(snapshot, **kwargs), record)
+        self.assertEqual(snapshot, before, 'observation must not repair the durable checkpoint')
+        mutations = [
+            ('app_id', 'foreign'), ('lifecycle_id', 'foreign'), ('operation_id', 'foreign'),
+            ('request_id', 'new-request'), ('scope', 'Prod'), ('action', 'stop'),
+            ('state', 'succeeded'), ('stage', 'stopped'), ('checkpoint', None),
+            ('checkpoint', []), ('lease', {}), ('lease', {'runtime': 'docker', 'inode': True, 'token': 'executor'}),
+        ]
+        for key, value in mutations:
+            changed = copy.deepcopy(snapshot); changed['record'][key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                contract.validate_timeout_checkpoint(changed, **kwargs)
+        for key in ('app_id', 'lifecycle_id', 'operation_id', 'executor_id', 'request_fingerprint'):
+            changed = copy.deepcopy(snapshot); changed['record']['checkpoint']['context'][key] = 'foreign'
+            with self.subTest(context=key), self.assertRaises(ValueError):
+                contract.validate_timeout_checkpoint(changed, **kwargs)
+        changed = copy.deepcopy(snapshot); changed['record']['checkpoint']['workload']['uid'] = 'replacement'
+        with self.assertRaises(ValueError):
+            contract.validate_timeout_checkpoint(changed, **kwargs)
+        for key in ('read_only', 'controller_stopped'):
+            changed = copy.deepcopy(snapshot); changed[key] = False
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                contract.validate_timeout_checkpoint(changed, **kwargs)
+
+    def test_reply_cleanup_does_not_overwrite_an_already_published_release(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.assertIsNone(contract.settle_stop_reply(root, 'discard', contract.PhaseDeadline(1, 'unused')))
+            self.assertEqual(list(root.iterdir()), [])
+            (root / 'compute-stop-held.json').write_text('{}')
+            contract.publish_fault_config(root / 'compute-stop-release.json', {'action': 'continue'})
+            (root / 'compute-stop-settled.json').write_text('{"response_released":true}')
+            before = (root / 'compute-stop-release.json').read_bytes()
+            self.assertEqual(contract.settle_stop_reply(root, 'discard', contract.PhaseDeadline(1, 'settled')), {'response_released': True})
+            self.assertEqual((root / 'compute-stop-release.json').read_bytes(), before)
+
+    def test_cleanup_confirms_executor_stopped_before_releasing_its_held_reply(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve();run, case = 'run', 'a' * 32
+            project = 'rcoder-cfailure-' + 'b' * 16
+            labels = {'com.docker.compose.project': project, 'rcoder.e2e.run': run,
+                      'rcoder.e2e.case': case, 'com.docker.compose.service': 'rcoder'}
+            row = {'Id': 'controller', 'Name': '/' + project + '-rcoder-1',
+                   'Config': {'Labels': labels}, 'State': {'Running': False}}
+            receipt = {'root': str(root), 'run_id': run, 'case_id': case, 'project': project,
+                       'app_id': 'cf' + case[:10] + 'c' * 10, 'creation_started': True,
+                       'fault_mode': 'stop_reply_timeout', 'volume_names': []}
+            (root / 'ownership.json').write_text(json.dumps(receipt));calls = []
+            def command(*args, **kwargs):
+                calls.append(args)
+                if args[:3] == ('docker', 'ps', '-aq'):return 'controller'
+                if args[:2] == ('docker', 'inspect'):return json.dumps([row])
+                return ''
+            def settle(*args):
+                self.assertTrue(any(call[-2:] == ('stop', 'rcoder') for call in calls))
+                self.assertEqual(args[:2], (root / 'control', 'discard'))
+            with patch.object(contract, 'command', side_effect=command), \
+                    patch.object(contract, 'builder_rows', return_value=[]), \
+                    patch.object(contract, 'settle_stop_reply', side_effect=settle) as drained:
+                self.assertTrue(contract.cleanup(root, run, case)['ok'])
+                drained.assert_called_once()
+            row['State']['Running'] = True
+            with patch.object(contract, 'command', side_effect=command), \
+                    patch.object(contract, 'builder_rows', return_value=[]), \
+                    patch.object(contract, 'settle_stop_reply') as drained:
+                with self.assertRaises(RuntimeError):contract.cleanup(root, run, case)
+                drained.assert_not_called()
+
+
 class ComputeStoppedFaultTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -626,6 +753,279 @@ class ComputeStoppedFaultTests(unittest.TestCase):
             finally:
                 server.shutdown()
                 worker.join(timeout=3)
+
+
+class ComputeStopReplyTimeoutTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.arm = {'container_id': 'captured-id', 'lifecycle_id': 'life'}
+        contract.publish_fault_config(self.root / 'compute-arm.json', self.arm)
+        contract.publish_fault_config(self.root / 'compute-operation.json', {'operation_id': 'op'})
+        self.operation = {'app_id': 'app', 'lifecycle_id': 'life', 'operation_id': 'op',
+                          'state': 'running', 'stage': 'stopping'}
+        self.patch = patch.multiple(proxy, ROOT=self.root, APP='app', MODE='compute_stop_timeout',
+            OWNED_CONTAINERS={'captured-id': 'life'}, STOPPED_CONTAINERS={'captured-id'})
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        self.temporary.cleanup()
+
+    def operation_response(self, *_args, **_kwargs):
+        from io import BytesIO
+        return BytesIO(json.dumps({'code': '0000', 'data': self.operation}).encode())
+
+    def test_wrong_phase_or_identity_cannot_borrow_the_stop_reply_barrier(self):
+        for key, value in [('app_id', 'foreign'), ('lifecycle_id', 'foreign'),
+                           ('operation_id', 'foreign'), ('stage', 'stopped'),
+                           ('state', 'recovery_required')]:
+            previous = self.operation[key];self.operation[key] = value
+            with self.subTest(field=key), patch.object(proxy.urllib.request, 'urlopen', self.operation_response), \
+                    self.assertRaises(ValueError):
+                proxy.hold_compute_stop_reply('POST', '/v1.47/containers/captured-id/stop?t=30', 204)
+            self.operation[key] = previous
+        self.assertFalse((self.root / 'compute-stop-held.json').exists())
+
+    def test_only_the_exact_successful_forwarded_stop_can_hold_a_reply(self):
+        with patch.object(proxy.urllib.request, 'urlopen') as observed:
+            for method, path in [('GET', '/containers/captured-id/json'),
+                                 ('POST', '/containers/captured-id/start')]:
+                self.assertIsNone(proxy.hold_compute_stop_reply(method, path, 204))
+            observed.assert_not_called()
+        arm = (self.root / 'compute-arm.json').read_bytes()
+        (self.root / 'compute-arm.json').unlink()
+        with patch.object(proxy.urllib.request, 'urlopen') as observed:
+            self.assertIsNone(proxy.hold_compute_stop_reply('POST', '/containers/captured-id/stop', 204))
+            observed.assert_not_called()
+        (self.root / 'compute-arm.json').write_bytes(arm)
+        for status in (200, 404, 500):
+            with self.subTest(status=status), self.assertRaises(ValueError):
+                proxy.hold_compute_stop_reply('POST', '/containers/captured-id/stop', status)
+        with patch.object(proxy, 'STOPPED_CONTAINERS', set()), self.assertRaises(ValueError):
+            proxy.hold_compute_stop_reply('POST', '/containers/captured-id/stop', 204)
+        with patch.object(proxy, 'OWNED_CONTAINERS', {'captured-id': 'replacement-life'}), self.assertRaises(ValueError):
+            proxy.hold_compute_stop_reply('POST', '/containers/captured-id/stop', 204)
+
+    def test_second_stop_cannot_overwrite_the_original_held_operation(self):
+        held = self.root / 'compute-stop-held.json';held.write_text('{"original":"retained"}')
+        before = held.read_bytes()
+        with patch.object(proxy.urllib.request, 'urlopen', self.operation_response), self.assertRaises(ValueError):
+            proxy.hold_compute_stop_reply('POST', '/containers/captured-id/stop', 204)
+        self.assertEqual(held.read_bytes(), before)
+        self.assertFalse((self.root / 'compute-stop-settled.json').exists())
+
+    def test_expired_hold_retains_the_upstream_receipt_without_fabricating_release(self):
+        with patch.object(proxy.urllib.request, 'urlopen', self.operation_response), \
+                patch.object(proxy.time, 'monotonic', side_effect=[0, 1, 2, 183, 184]), \
+                self.assertRaises(TimeoutError):
+            proxy.hold_compute_stop_reply('POST', '/containers/captured-id/stop', 204)
+        held = json.loads((self.root / 'compute-stop-held.json').read_text())
+        settled = json.loads((self.root / 'compute-stop-settled.json').read_text())
+        self.assertTrue(held['upstream_completed'])
+        self.assertFalse(settled['response_released'])
+        self.assertNotIn('release_action', settled)
+        self.assertFalse((self.root / 'compute-stop-release.json').exists())
+
+    def test_wire_forwards_stop_then_withholds_all_headers_until_explicit_release(self):
+        self.wire_release('continue')
+
+    def test_wire_cleanup_discards_only_the_completed_reply_without_sending_success(self):
+        self.wire_release('discard')
+
+    def test_denied_start_is_still_audited_so_proxy_guards_cannot_hide_dispatches(self):
+        endpoint = self.root / 'denied.sock'
+        with proxy.Server(str(endpoint), proxy.Handler) as server, \
+                patch.object(proxy, 'allowed', return_value=False), \
+                patch.object(proxy, 'exchange') as upstream:
+            worker = threading.Thread(target=server.serve_forever, daemon=True);worker.start()
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+                    channel.settimeout(3);channel.connect(str(endpoint))
+                    channel.sendall(b'POST /containers/foreign/start?token=private HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+                    chunks = []
+                    while chunk := channel.recv(4096):chunks.append(chunk)
+                    self.assertTrue(b''.join(chunks).startswith(b'HTTP/1.1 403 '))
+                upstream.assert_not_called()
+                audit = self.root / 'compute-writes.jsonl'
+                records = [json.loads(s) for s in audit.read_text().splitlines()]
+                self.assertEqual(len(records), 1)
+                self.assertEqual({key: value for key, value in records[0].items() if key != 'request_id'},
+                    {'method': 'POST', 'path': '/containers/foreign/start', 'query': {}})
+                self.assertRegex(records[0]['request_id'], r'^[0-9a-f]{32}$')
+                result = json.loads((self.root / 'compute-write-results.jsonl').read_text())
+                self.assertEqual(result, {'request_id': records[0]['request_id'], 'outcome': 'denied', 'status': 403})
+                self.assertEqual(contract.compute_write_counts(records), (0, 1))
+                self.assertNotIn('private', audit.read_text())
+                self.assertEqual(audit.stat().st_mode & 0o777, 0o600)
+            finally:
+                server.shutdown();worker.join(timeout=3)
+
+    def wire_release(self, action):
+        captured = {'Id': 'captured-id', 'Config': {'Labels': {
+            'rcoder.io/application-id': 'app', 'rcoder.io/lifecycle-id': 'life',
+            'service-type': 'user-app-builder'}}, 'State': {'Running': True}}
+        writes = []
+        class Upstream(http.server.BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+            def log_message(self, *_args):
+                pass
+            def do_GET(self):
+                payload = json.dumps(captured).encode();self.send_response(200)
+                self.send_header('Content-Length', str(len(payload)));self.end_headers();self.wfile.write(payload)
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get('Content-Length', '0')))
+                writes.append(self.path);captured['State']['Running'] = False
+                self.send_response(204);self.send_header('Content-Length', '0');self.end_headers()
+        upstream, endpoint = self.root / 'upstream.sock', self.root / 'proxy.sock'
+        with proxy.Server(str(upstream), Upstream) as docker, \
+                proxy.Server(str(endpoint), proxy.Handler) as server, \
+                patch.object(proxy, 'UPSTREAM', str(upstream)), \
+                patch.object(proxy.urllib.request, 'urlopen', self.operation_response):
+            workers = [threading.Thread(target=value.serve_forever, daemon=True) for value in (docker, server)]
+            for worker in workers:worker.start()
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+                    channel.settimeout(.1);channel.connect(str(endpoint))
+                    channel.sendall(b'POST /v1.47/containers/captured-id/stop?t=30 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+                    with self.assertRaises(socket.timeout):
+                        channel.recv(4096)
+                    deadline = time.monotonic() + 3
+                    while not (self.root / 'compute-stop-held.json').exists():
+                        self.assertLess(time.monotonic(), deadline);time.sleep(.01)
+                    self.assertEqual(writes, ['/v1.47/containers/captured-id/stop?t=30'])
+                    self.assertFalse(captured['State']['Running'])
+                    held = json.loads((self.root / 'compute-stop-held.json').read_text())
+                    self.assertEqual(held['upstream_status'], 204)
+                    self.assertEqual(held['operation']['stage'], 'stopping')
+                    self.assertFalse(held['response_released'])
+                    contract.publish_fault_config(self.root / 'compute-stop-release.json', {'action': action})
+                    channel.settimeout(3);chunks = []
+                    while chunk := channel.recv(4096):chunks.append(chunk)
+                    raw = b''.join(chunks)
+                    if action == 'continue':
+                        self.assertTrue(raw.startswith(b'HTTP/1.1 204 '))
+                        self.assertEqual(raw.split(b'\r\n\r\n', 1)[1], b'')
+                    else:self.assertEqual(raw, b'', 'discard must not fabricate any HTTP success')
+                settled = json.loads((self.root / 'compute-stop-settled.json').read_text())
+                self.assertEqual(settled['release_action'], action)
+                self.assertEqual(settled['response_released'], action == 'continue')
+                self.assertEqual((self.root / 'compute-stop-held.json').stat().st_mode & 0o777, 0o600)
+                self.assertEqual((self.root / 'compute-stop-settled.json').stat().st_mode & 0o777, 0o600)
+                mutations = [json.loads(s) for s in (self.root / 'compute-writes.jsonl').read_text().splitlines()]
+                self.assertEqual(contract.compute_write_counts(mutations), (1, 0))
+            finally:
+                if not (self.root / 'compute-stop-release.json').exists():
+                    contract.publish_fault_config(self.root / 'compute-stop-release.json', {'action': 'discard'})
+                docker.shutdown();server.shutdown()
+                for worker in workers:worker.join(timeout=3)
+
+
+class FullTimeoutWriteAuditTests(unittest.TestCase):
+    old, new, app, life = 'a' * 64, 'b' * 64, 'owned-app', 'owned-life'
+
+    def sequence(self, *, replacement=True, remove=True):
+        writes, results = [], []
+        target = self.new if replacement else self.old
+        def add(method, path, status, **fields):
+            key = str(len(writes))
+            query = fields.pop('query', {})
+            writes.append({'request_id': key, 'method': method, 'path': path, 'query': query})
+            results.append({'request_id': key, 'outcome': 'upstream', 'status': status, **fields})
+        add('POST', '/v1.47/containers/' + self.old + '/stop', 204, container_id=self.old)
+        if replacement:
+            if remove:
+                add('DELETE', '/containers/' + self.old, 204, container_id=self.old, query={'v': ['false']})
+            add('POST', '/containers/create', 201, created_container_id=self.new,
+                query={'name': ['rcoder-app-builder-' + self.app]},
+                creation={'rcoder.io/application-id': self.app, 'rcoder.io/lifecycle-id': self.life,
+                          'service-type': 'user-app-builder'})
+        add('POST', '/containers/' + target + '/start', 204, container_id=target)
+        add('POST', '/containers/rcoder-app-builder-' + self.app + '/exec', 201,
+            container_id=target, created_exec_id='owned-exec')
+        add('POST', '/exec/owned-exec/start', 101, container_id=target)
+        return writes, results
+
+    def validate(self, writes, results, replacement=True):
+        return contract.validate_timeout_write_window(writes, results, old_id=self.old,
+            new_id=self.new if replacement else self.old, app=self.app, lifecycle=self.life)
+
+    def test_complete_window_accepts_one_exact_remove_fence_and_bound_exec(self):
+        writes, results = self.sequence()
+        audit = self.validate(writes, results)
+        self.assertEqual(audit['counts'], {'stop': 1, 'create': 1, 'start': 1, 'remove': 1,
+            'exec_create': 1, 'exec_start': 1})
+        self.assertTrue(audit['old_cid_remove_fence'])
+        self.assertEqual(audit['sdk_retry_allowances'], [])
+
+    def test_retained_container_and_acknowledged_autoremove_paths_remain_distinct(self):
+        for replacement, remove in ((False, False), (True, False)):
+            with self.subTest(replacement=replacement):
+                writes, results = self.sequence(replacement=replacement, remove=remove)
+                self.assertFalse(self.validate(writes, results, replacement)['old_cid_remove_fence'])
+
+    def test_late_stop_replay_or_duplicate_create_start_is_not_a_sdk_exemption(self):
+        for suffix in ('/stop', '/start', '/create'):
+            writes, results = self.sequence()
+            index = next(i for i, row in enumerate(writes) if row['path'].endswith(suffix))
+            replay, reply = copy.deepcopy(writes[index]), copy.deepcopy(results[index])
+            replay['request_id'] = reply['request_id'] = 'replayed'
+            writes.append(replay);results.append(reply)
+            with self.subTest(suffix=suffix), self.assertRaises(ValueError):
+                self.validate(writes, results)
+
+    def test_remove_must_use_full_old_id_and_explicit_false_volume_flag(self):
+        for changes in ({'path': '/containers/rcoder-app-builder-' + self.app},
+                        {'path': '/containers/' + self.new}, {'query': {'v': ['true']}},
+                        {'query': {}}, {'query': {'v': ['false', 'true']}}):
+            writes, results = self.sequence()
+            writes[1].update(changes)
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.validate(writes, results)
+
+    def test_foreign_create_start_stop_and_exec_targets_are_rejected(self):
+        for index, field, value in ((0, 'container_id', self.new), (2, 'created_container_id', 'c' * 64),
+                                    (3, 'container_id', self.old), (4, 'container_id', 'c' * 64),
+                                    (5, 'container_id', self.old)):
+            writes, results = self.sequence()
+            results[index][field] = value
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                self.validate(writes, results)
+
+    def test_missing_denied_unknown_and_duplicate_result_cannot_pass(self):
+        for outcome in ('missing', 'denied', 'transport_error', 'duplicate'):
+            writes, results = self.sequence()
+            if outcome == 'missing':results.pop()
+            elif outcome == 'duplicate':results.append(copy.deepcopy(results[0]))
+            else:results[-1]['outcome'] = outcome
+            with self.subTest(outcome=outcome), self.assertRaises(ValueError):
+                self.validate(writes, results)
+
+    def test_restart_network_or_other_mutation_is_not_part_of_original_recovery(self):
+        for method, path in (('POST', '/containers/' + self.new + '/restart'),
+                             ('POST', '/networks/create'), ('DELETE', '/volumes/customer-data')):
+            writes, results = self.sequence()
+            writes.append({'request_id': 'foreign', 'method': method, 'path': path, 'query': {}})
+            results.append({'request_id': 'foreign', 'outcome': 'upstream', 'status': 204})
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                self.validate(writes, results)
+
+    def test_exec_without_receipt_or_replayed_exec_start_is_rejected(self):
+        for mode in ('unknown-exec', 'replay'):
+            writes, results = self.sequence()
+            if mode == 'unknown-exec':writes[-1]['path'] = '/exec/unknown/start'
+            else:
+                replay, reply = copy.deepcopy(writes[-1]), copy.deepcopy(results[-1])
+                replay['request_id'] = reply['request_id'] = 'replayed-exec'
+                writes.append(replay);results.append(reply)
+            with self.subTest(mode=mode), self.assertRaises(ValueError):self.validate(writes, results)
+
+    def test_replacement_labels_and_reserved_name_must_match_original_lifecycle(self):
+        for mode in ('app', 'life', 'name'):
+            writes, results = self.sequence()
+            if mode == 'name':writes[2]['query']['name'] = ['foreign']
+            else:results[2]['creation']['rcoder.io/' + ('application-id' if mode == 'app' else 'lifecycle-id')] = 'foreign'
+            with self.subTest(mode=mode), self.assertRaises(ValueError):self.validate(writes, results)
 
 
 if __name__ == '__main__':

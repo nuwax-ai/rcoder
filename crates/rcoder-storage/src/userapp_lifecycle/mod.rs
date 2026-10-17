@@ -11,7 +11,7 @@ mod exclusive_directory;
 #[cfg(feature = "userapp-turso")]
 pub use common::ToastyUserAppStore as TursoUserAppStore;
 #[cfg(feature = "userapp-turso")]
-pub use common::offline_snapshot;
+pub use common::{offline_compute_snapshot, offline_snapshot};
 
 pub use control::{OpenedUserAppStore, UserAppStoreControl};
 

@@ -241,6 +241,45 @@ REQUIRED['userapp_compute_stopped_failure_recovery_contract'] = {
     'compute failure owned cleanup retains volumes',
 }
 
+REQUIRED['computer_owner_conflict_contract'] = {
+    'owner contract process completed', 'owner contract required steps complete',
+    'owner contract reports full success', 'owner cleanup confirms retained data',
+    'owner original ensure registered captured compute',
+    'owner default English chat typed409 preserves A',
+    'owner default English ensure typed409 preserves A',
+    'owner explicit Chinese chat typed409 preserves A',
+    'owner explicit Chinese ensure typed409 preserves A',
+    'owner original project reensure preserves A',
+    'owner four trace owner proof without Chat dispatch',
+    'owner own compute cleanup retains data',
+    'owner preexisting resources preserved',
+}
+
+REQUIRED['userapp_compute_stop_timeout_recovery_contract'] = {
+    'compute failure contract process completed', 'compute failure contract reports full success',
+    'compute stop timeout corrected source rebuild serves HTTP',
+    'compute stop timeout durable checkpoint retains original physical intent',
+    'compute stop timeout expired reply preserves original recovery diagnostic',
+    'compute stop timeout frozen inputs verified',
+    'compute stop timeout isolated controller and real builder prepared',
+    'compute stop timeout one builder retains original data mounts',
+    'compute stop timeout original operation remains Stopping while reply unknown',
+    'compute stop timeout original source serves HTTP',
+    'compute stop timeout owned cleanup retains volumes',
+    'compute stop timeout real Stop completed before held reply',
+    'compute stop timeout released reply resumes original operation',
+    'compute stop timeout source stayed frozen',
+    'compute stop timeout unknown period has no Start or Create',
+}
+
+REQUIRED['userapp_dev_idle_recycle_owner_recovery'].update({
+    'dev business proxy reaches original source before idle',
+    'first recycle: explicit Start restores one owner and proxy HTTP',
+    'first recycle: first business proxy request has no preparatory control',
+    'first recycle: first business proxy request recreated one builder',
+    'first recycle: first business proxy response matches dev builder-only contract',
+})
+
 REQUIRED['userapp_dev_app_proxy_lazy_start'].update({
     'lazy recreation removes only captured builder',
     'lazy recreation records same-lifecycle replacement',
