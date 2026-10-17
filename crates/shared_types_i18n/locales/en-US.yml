@@ -265,3 +265,13 @@ error.dev_container_unreachable: "The dev container is temporarily unreachable. 
 
 userapp_error_page.restarting.title: "Application service is restarting"
 userapp_error_page.restarting.message: "The application service is starting or restarting. Please try again shortly."
+
+# Ordinary Computer ownership conflict
+error.computer_owner_conflict: "The project compute ownership does not match this request. No message was sent."
+hint.computer_owner_conflict: "Ask an administrator to check the project ownership and request identity before sending again. Do not retry automatically."
+error.computer_owner_user_mismatch: "The runtime account linked to this conversation does not match this request. No message was sent."
+error.computer_owner_pod_mismatch: "The runtime instance linked to this conversation does not match this request. No message was sent."
+error.computer_owner_service_family_mismatch: "The service type linked to this conversation does not match this request. No message was sent."
+hint.computer_owner_user_mismatch: "Ask an administrator to check the conversation runtime account against the request account before sending again. Do not retry automatically."
+hint.computer_owner_pod_mismatch: "Ask an administrator to check the conversation runtime instance against the request instance before sending again. Do not retry automatically."
+hint.computer_owner_service_family_mismatch: "Ask an administrator to check the conversation service type against the request type before sending again. Do not retry automatically."

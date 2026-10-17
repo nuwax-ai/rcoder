@@ -1,6 +1,21 @@
 //! OpenAPI 聚合文档守卫测试（从 router_docs.rs 内联模块拆出）。
 
 #[test]
+fn computer_owner_conflict_is_documented_on_both_registration_entry_points() {
+    let document = serde_json::to_value(primary_document()).unwrap();
+    for path in ["/computer/chat", "/computer/pod/ensure"] {
+        let response = &document["paths"][path]["post"]["responses"]["409"];
+        let description = response["description"].as_str().expect("409 response");
+        assert!(
+            description.contains("ERR_COMPUTER_OWNER_CONFLICT"),
+            "{path}"
+        );
+        assert!(description.contains("retryable=false"), "{path}");
+        assert!(!response["content"]["application/json"]["schema"].is_null());
+    }
+}
+
+#[test]
 fn workspace_runtime_diagnostic_schema_survives_formal_document_merges() {
     for (label, document) in [
         ("primary", primary_document()),

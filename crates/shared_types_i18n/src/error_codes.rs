@@ -196,6 +196,12 @@ pub const ERR_NOT_FOUND: &str = "ERR_NOT_FOUND";
 
 /// 资源冲突（已存在）
 pub const ERR_CONFLICT: &str = "ERR_CONFLICT";
+/// Ordinary Computer ownership conflict, rejected before task dispatch.
+pub const ERR_COMPUTER_OWNER_CONFLICT: &str = "ERR_COMPUTER_OWNER_CONFLICT";
+/// Diagnostic reasons; these do not expose the registered or requested values.
+pub const COMPUTER_OWNER_USER_MISMATCH: &str = "COMPUTER_OWNER_USER_MISMATCH";
+pub const COMPUTER_OWNER_POD_MISMATCH: &str = "COMPUTER_OWNER_POD_MISMATCH";
+pub const COMPUTER_OWNER_SERVICE_FAMILY_MISMATCH: &str = "COMPUTER_OWNER_SERVICE_FAMILY_MISMATCH";
 /// Another application operation owns the admission slot or physical lease.
 /// Retry safety is carried in OperationInProgressData, not implied by this code.
 pub const ERR_OPERATION_IN_PROGRESS: &str = "ERR_OPERATION_IN_PROGRESS";
@@ -332,6 +338,7 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_MODEL_UNAVAILABLE => "error.model_unavailable",
         ERR_NOT_FOUND => "error.not_found",
         ERR_CONFLICT => "error.conflict",
+        ERR_COMPUTER_OWNER_CONFLICT => "error.computer_owner_conflict",
         ERR_OPERATION_IN_PROGRESS => "error.operation_in_progress",
         ERR_USERAPP_WAIT_TIMEOUT => "error.userapp_wait_timeout",
         ERR_APP_NOT_FOUND => "error.app_not_found",
@@ -373,6 +380,10 @@ pub fn get_error_hint(reason_code: &str, locale: &str) -> String {
         ERR_CONTAINER_ADDRESS_NOT_READY | ERR_DATABASE_NOT_READY => "hint.readiness",
         ERR_OPERATION_OUTCOME_UNKNOWN => "hint.operation_outcome_unknown",
         ERR_OPERATION_IN_PROGRESS => "hint.operation_in_progress",
+        ERR_COMPUTER_OWNER_CONFLICT => "hint.computer_owner_conflict",
+        COMPUTER_OWNER_USER_MISMATCH => "hint.computer_owner_user_mismatch",
+        COMPUTER_OWNER_POD_MISMATCH => "hint.computer_owner_pod_mismatch",
+        COMPUTER_OWNER_SERVICE_FAMILY_MISMATCH => "hint.computer_owner_service_family_mismatch",
         _ => "hint.runtime_failure",
     };
     t(key, locale)
@@ -448,6 +459,9 @@ pub fn get_error_description(code: &str) -> &'static str {
         ERR_USERAPP_WAKE_FAILED => "Application wake failed",
         ERR_OPERATION_OUTCOME_UNKNOWN => "Operation completion was not confirmed",
         ERR_OPERATION_IN_PROGRESS => "Another application operation is in progress",
+        ERR_COMPUTER_OWNER_CONFLICT => {
+            "Computer project ownership does not match the request; no task was dispatched"
+        }
         ERR_WORKSPACE_ERROR => "Workspace error",
         ERR_GRPC_ADDR_ERROR => "gRPC address resolution failed",
         ERR_GRPC_ERROR => "gRPC call failed",
@@ -516,6 +530,27 @@ pub fn get_error_description(code: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn computer_owner_conflict_catalog_preserves_nonretryable_safe_guidance() {
+        assert_eq!(ERR_COMPUTER_OWNER_CONFLICT, "ERR_COMPUTER_OWNER_CONFLICT");
+        assert!(!is_retryable_code(ERR_COMPUTER_OWNER_CONFLICT));
+        for locale in crate::SUPPORTED_LOCALES {
+            let message = get_error_message(ERR_COMPUTER_OWNER_CONFLICT, locale);
+            assert!(!message.is_empty() && !message.starts_with("error."));
+            for reason in [
+                COMPUTER_OWNER_USER_MISMATCH,
+                COMPUTER_OWNER_POD_MISMATCH,
+                COMPUTER_OWNER_SERVICE_FAMILY_MISMATCH,
+            ] {
+                let hint = get_error_hint(reason, locale);
+                assert_ne!(hint, get_error_hint(ERR_COMPUTER_OWNER_CONFLICT, locale));
+                assert!(!hint.is_empty() && !hint.starts_with("hint."));
+                assert!(!is_retryable_code(reason));
+            }
+        }
+        assert!(get_error_message(ERR_COMPUTER_OWNER_CONFLICT, "zh-CN").contains("消息未发送"));
+    }
 
     #[test]
     fn runtime_error_codes_and_guidance_have_all_supported_catalogs() {

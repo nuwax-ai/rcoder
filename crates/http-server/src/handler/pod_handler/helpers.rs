@@ -489,7 +489,7 @@ pub(super) async fn persist_and_respond(
             .await
             .map_err(|error| {
                 tracing::error!(project_id = %request.project_id, %error, "Computer project registration failed");
-                error.downcast::<AppError>().unwrap_or_else(|error| AppError::internal_server_error(&format!("Computer project registration: {error:#}")))
+                shared_types::computer_registration_app_error(error)
             })?
     } else {
         let project_info = Arc::new(project_info);

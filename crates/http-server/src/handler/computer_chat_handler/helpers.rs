@@ -132,8 +132,6 @@ pub(super) async fn ensure_project_mapping_in_state(
                 project_id,
                 "[STORAGE] Computer registration failed before dispatch: {error:#}"
             );
-            error.downcast::<AppError>().unwrap_or_else(|error| {
-                AppError::internal_server_error(&format!("Register Computer container: {error:#}"))
-            })
+            shared_types::computer_registration_app_error(error)
         })
 }

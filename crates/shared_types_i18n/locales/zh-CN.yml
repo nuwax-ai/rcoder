@@ -265,3 +265,13 @@ error.dev_container_unreachable: "开发容器暂时不可达，请稍后重试"
 
 userapp_error_page.restarting.title: "应用服务正在切换"
 userapp_error_page.restarting.message: "应用服务正在启动或重启，请稍后重试。"
+
+# Ordinary Computer ownership conflict
+error.computer_owner_conflict: "当前项目的计算资源归属与请求身份不一致，消息未发送。"
+hint.computer_owner_conflict: "请联系管理员核对项目归属与请求身份，修正后再发送；不要自动重试。"
+error.computer_owner_user_mismatch: "当前会话关联的运行账号与本次请求不一致，消息未发送。"
+error.computer_owner_pod_mismatch: "当前会话关联的运行实例与本次请求不一致，消息未发送。"
+error.computer_owner_service_family_mismatch: "当前会话的服务类型与本次请求不一致，消息未发送。"
+hint.computer_owner_user_mismatch: "请联系管理员核对会话关联的运行账号与本次请求账号，修正后再发送；不要自动重试。"
+hint.computer_owner_pod_mismatch: "请联系管理员核对会话关联的运行实例与本次请求实例，修正后再发送；不要自动重试。"
+hint.computer_owner_service_family_mismatch: "请联系管理员核对会话服务类型与本次请求类型，修正后再发送；不要自动重试。"

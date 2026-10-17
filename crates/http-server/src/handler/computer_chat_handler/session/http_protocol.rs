@@ -178,6 +178,83 @@ fn chats(fixture: &Fixture) -> usize {
 }
 
 #[tokio::test]
+async fn http_chat_owner_conflicts_return_typed_409_before_any_agent_dispatch() {
+    for mismatch in [
+        shared_types::ComputerOwnerMismatch::User,
+        shared_types::ComputerOwnerMismatch::Pod,
+        shared_types::ComputerOwnerMismatch::ServiceFamily,
+    ] {
+        let fixture = Fixture::new().await;
+        let (state, runtime) = state(&fixture);
+        let mut registered = super::project();
+        match mismatch {
+            shared_types::ComputerOwnerMismatch::User => {
+                registered.set_user_id(Some("private-registered-user".into()));
+            }
+            shared_types::ComputerOwnerMismatch::Pod => {
+                registered.set_pod_id(Some("private-registered-pod".into()));
+            }
+            shared_types::ComputerOwnerMismatch::ServiceFamily => {
+                registered.set_service_type(Some(ServiceType::WebAgentRunner));
+            }
+        }
+        state
+            .insert_project_with_session(
+                PROJECT.into(),
+                Arc::new(registered),
+                "existing-owner-session",
+            )
+            .unwrap();
+        let before = state.get_project(PROJECT).unwrap();
+        let identity = before.persistence_identity().clone();
+        let physical = before.container_info().unwrap();
+        let (status, body) = chat(router(state.clone())).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], shared_types::ERR_COMPUTER_OWNER_CONFLICT);
+        assert_eq!(body["error_detail"]["reason_code"], mismatch.reason_code());
+        assert_eq!(
+            body["error_detail"]["stage"],
+            "computer.registration.before_dispatch"
+        );
+        assert_eq!(body["error_detail"]["retryable"], false);
+        assert_eq!(body["success"], false);
+        assert!(body["data"].is_null());
+        assert!(body.get("operation_id").is_none());
+        assert!(body.get("tid").is_some());
+        assert_eq!(chats(&fixture), 0);
+        assert!(
+            fixture.agent.calls.lock().unwrap().is_empty(),
+            "ownership rejection precedes all agent RPCs"
+        );
+        assert_eq!(runtime.writes.load(Ordering::SeqCst), 0);
+        let after = state.get_project(PROJECT).unwrap();
+        assert_eq!(after.user_id(), before.user_id());
+        assert_eq!(after.pod_id(), before.pod_id());
+        assert_eq!(after.service_type(), before.service_type());
+        let current_identity = after.persistence_identity();
+        assert_eq!(current_identity.generation, identity.generation);
+        assert_eq!(current_identity.revision, identity.revision);
+        assert_eq!(current_identity.predecessor, identity.predecessor);
+        assert_eq!(current_identity.container, identity.container);
+        assert_eq!(current_identity.sessions, identity.sessions);
+        assert_eq!(current_identity.retired_sessions, identity.retired_sessions);
+        assert_eq!(after.container_info().unwrap(), physical);
+        assert_eq!(after.sessions(), before.sessions());
+        assert_eq!(after.request_id(), before.request_id());
+        let text = body.to_string();
+        for private in [
+            "private-registered-user",
+            "private-registered-pod",
+            "existing-owner-session",
+            "captured-pod",
+            "captured-workload",
+        ] {
+            assert!(!text.contains(private), "owner details leaked: {text}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn http_chat_inside_cache_ttl_dispatches_once_with_current_physical_pod() {
     let fixture = Fixture::new().await;
     let (state, runtime) = state(&fixture);

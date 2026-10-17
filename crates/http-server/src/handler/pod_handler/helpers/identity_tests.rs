@@ -52,6 +52,41 @@ async fn rejects_mismatched_request(user: &str, pod: Option<&str>, original: Ser
         result.is_err(),
         "ensure reused historical owner fields and accepted another request identity"
     );
+    let response = axum::response::IntoResponse::into_response(result.unwrap_err());
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let reason = if user != "original-owner" {
+        shared_types::error_codes::COMPUTER_OWNER_USER_MISMATCH
+    } else if pod != Some("original-pod") {
+        shared_types::error_codes::COMPUTER_OWNER_POD_MISMATCH
+    } else {
+        shared_types::error_codes::COMPUTER_OWNER_SERVICE_FAMILY_MISMATCH
+    };
+    assert_eq!(body["code"], shared_types::ERR_COMPUTER_OWNER_CONFLICT);
+    assert_eq!(body["success"], false);
+    assert_eq!(body["error_detail"]["reason_code"], reason);
+    assert_eq!(
+        body["error_detail"]["stage"],
+        "computer.registration.before_dispatch"
+    );
+    assert_eq!(body["error_detail"]["retryable"], false);
+    assert!(body["data"].is_null());
+    assert!(body.get("operation_id").is_none());
+    assert!(fixture.agent.calls.lock().unwrap().is_empty());
+    let wire = body.to_string();
+    for private in [
+        "original-owner",
+        "original-pod",
+        "original-container",
+        "original-workload",
+    ] {
+        assert!(!wire.contains(private), "owner values must remain internal");
+    }
     let current = fixture.state.get_project(PROJECT).unwrap();
     assert_eq!(
         current.container_info().unwrap().container_id,

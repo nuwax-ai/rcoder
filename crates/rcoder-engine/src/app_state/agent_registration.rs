@@ -7,8 +7,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail, ensure};
 use container_runtime_api::ContainerCreateParams;
 use shared_types::{
-    AgentRegistrationChange, AppError, ContainerBasicInfo, ErrorDetail, ProjectAndContainerInfo,
-    ProjectStore as _, persistence::PersistenceWriteOutcome,
+    AgentRegistrationChange, AppError, ComputerOwnerMismatch, ContainerBasicInfo, ErrorDetail,
+    ProjectAndContainerInfo, ProjectStore as _, persistence::PersistenceWriteOutcome,
 };
 
 use super::AppState;
@@ -365,21 +365,143 @@ fn inconsistent_physical_registration(project: &ProjectAndContainerInfo) -> bool
 fn ensure_request_owner(
     registered: &ProjectAndContainerInfo,
     incoming: &ProjectAndContainerInfo,
-) -> Result<()> {
-    ensure!(
-        registered
-            .user_id()
-            .is_none_or(|owner| Some(owner) == incoming.user_id())
-            && registered
-                .pod_id()
-                .is_none_or(|owner| Some(owner) == incoming.pod_id())
-            && registered.service_type().is_none_or(|kind| {
-                Some(kind.family_representative())
-                    == incoming
-                        .service_type()
-                        .map(|kind| kind.family_representative())
-            }),
-        "Computer project belongs to another registered owner"
-    );
+) -> std::result::Result<(), ComputerOwnerMismatch> {
+    let mismatch = if registered
+        .user_id()
+        .is_some_and(|owner| Some(owner) != incoming.user_id())
+    {
+        Some(ComputerOwnerMismatch::User)
+    } else if registered
+        .pod_id()
+        .is_some_and(|owner| Some(owner) != incoming.pod_id())
+    {
+        Some(ComputerOwnerMismatch::Pod)
+    } else if registered.service_type().is_some_and(|kind| {
+        Some(kind.family_representative())
+            != incoming
+                .service_type()
+                .map(|kind| kind.family_representative())
+    }) {
+        Some(ComputerOwnerMismatch::ServiceFamily)
+    } else {
+        None
+    };
+    if let Some(mismatch) = mismatch {
+        tracing::warn!(
+            project_id = %incoming.project_id(),
+            request_id = ?incoming.request_id(),
+            dimension = mismatch.dimension(),
+            reason_code = mismatch.reason_code(),
+            requested_user_id = ?incoming.user_id(),
+            registered_user_id = ?registered.user_id(),
+            requested_pod_id = ?incoming.pod_id(),
+            registered_pod_id = ?registered.pod_id(),
+            requested_service_family = ?incoming.service_type().map(|kind| kind.family_representative()),
+            registered_service_family = ?registered.service_type().map(|kind| kind.family_representative()),
+            dispatched = false,
+            "Computer registration owner conflict before dispatch"
+        );
+        return Err(mismatch);
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+    use shared_types::ServiceType;
+
+    fn owner() -> ProjectAndContainerInfo {
+        let mut info = ProjectAndContainerInfo::new("owner-contract".into());
+        info.set_user_id(Some("registered-user".into()));
+        info.set_pod_id(Some("registered-pod".into()));
+        info.set_service_type(Some(ServiceType::ComputerAgentRunner));
+        info
+    }
+
+    #[test]
+    fn computer_registration_owner_conflicts_keep_distinct_typed_dimensions() {
+        let registered = owner();
+        let mut incoming = owner();
+        incoming.set_user_id(Some("different-user".into()));
+        assert_eq!(
+            ensure_request_owner(&registered, &incoming),
+            Err(ComputerOwnerMismatch::User)
+        );
+        incoming = owner();
+        incoming.set_pod_id(Some("different-pod".into()));
+        assert_eq!(
+            ensure_request_owner(&registered, &incoming),
+            Err(ComputerOwnerMismatch::Pod)
+        );
+        incoming = owner();
+        incoming.set_service_type(Some(ServiceType::WebAgentRunner));
+        assert_eq!(
+            ensure_request_owner(&registered, &incoming),
+            Err(ComputerOwnerMismatch::ServiceFamily)
+        );
+    }
+
+    #[test]
+    fn computer_registration_owner_admission_preserves_optional_fields_and_family_equivalence() {
+        let mut registered = owner();
+        let mut incoming = owner();
+        incoming.set_service_type(Some(ServiceType::ComputerNormalProject));
+        assert_eq!(ensure_request_owner(&registered, &incoming), Ok(()));
+        registered.set_pod_id(None);
+        assert_eq!(ensure_request_owner(&registered, &incoming), Ok(()));
+        // A fresh projection really has no registered family; passing None to
+        // the setter intentionally preserves a previously known family.
+        registered = ProjectAndContainerInfo::new("owner-contract".into());
+        assert_eq!(registered.user_id(), None);
+        assert_eq!(registered.pod_id(), None);
+        assert_eq!(registered.service_type(), None);
+        incoming.set_user_id(Some("new-user".into()));
+        incoming.set_pod_id(Some("new-pod".into()));
+        assert_eq!(ensure_request_owner(&registered, &incoming), Ok(()));
+    }
+
+    #[test]
+    fn computer_registration_owner_missing_incoming_field_still_conflicts() {
+        let registered = owner();
+        let mut incoming = owner();
+        incoming.set_user_id(None);
+        assert_eq!(
+            ensure_request_owner(&registered, &incoming),
+            Err(ComputerOwnerMismatch::User)
+        );
+        incoming = owner();
+        incoming.set_pod_id(None);
+        assert_eq!(
+            ensure_request_owner(&registered, &incoming),
+            Err(ComputerOwnerMismatch::Pod)
+        );
+        incoming = ProjectAndContainerInfo::new("owner-contract".into());
+        incoming.set_user_id(registered.user_id().map(str::to_owned));
+        incoming.set_pod_id(registered.pod_id().map(str::to_owned));
+        assert_eq!(incoming.service_type(), None);
+        assert_eq!(
+            ensure_request_owner(&registered, &incoming),
+            Err(ComputerOwnerMismatch::ServiceFamily)
+        );
+    }
+
+    #[test]
+    fn computer_registration_owner_none_setter_preserves_an_existing_family() {
+        let registered = owner();
+        let mut incoming = owner();
+        incoming.set_service_type(None);
+        assert_eq!(
+            incoming.service_type(),
+            Some(ServiceType::ComputerAgentRunner)
+        );
+        assert_eq!(ensure_request_owner(&registered, &incoming), Ok(()));
+        incoming.set_service_type(Some(ServiceType::WebAgentRunner));
+        incoming.set_service_type(None);
+        assert_eq!(incoming.service_type(), Some(ServiceType::WebAgentRunner));
+        assert_eq!(
+            ensure_request_owner(&registered, &incoming),
+            Err(ComputerOwnerMismatch::ServiceFamily)
+        );
+    }
 }

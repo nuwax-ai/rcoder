@@ -92,7 +92,7 @@ use super::utils::{
         ),
         (
             status = 409,
-            description = "派发前登记已退休或换代；已受理任务的登记错误沿 HTTP 200 失败信封保留 session_id",
+            description = "派发前归属冲突返回 ERR_COMPUTER_OWNER_CONFLICT，reason 区分 user/pod/service_family，retryable=false，消息未发送；登记退休或换代也返回 409。已受理任务的登记错误沿 HTTP 200 失败信封保留 session_id",
             body = HttpResult<ChatResponse>
         ),
         (

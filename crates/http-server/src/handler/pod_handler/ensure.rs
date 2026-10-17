@@ -16,6 +16,8 @@ use axum::response::IntoResponse;
         (status = 202, description = "已有 UserApp 计算资源需要物理启动；返回持久操作 ID 和查询地址，不等待业务服务 Ready。受理后有界等待（≤15s）物理工作负载对象出现：creation_observed=true 表示创建已观察；false 表示仍在创建中（已受理，非失败），凭 operation_id 查询/重试", body = HttpResult<crate::userapp_builder::compute_control::ComputeOperationView>),
         (status = 400, description = "请求参数无效", body = HttpResult<String>),
         (status = 401, description = "API Key 鉴权失败", body = HttpResult<String>),
+        (status = 409, description = "普通 Computer 项目归属冲突：ERR_COMPUTER_OWNER_CONFLICT；reason 区分 user/pod/service_family，retryable=false；未派发聊天任务且不更换原登记归属", body = HttpResult<String>),
+        (status = 503, description = "普通 Computer 登记暂未确认，未派发聊天任务", body = HttpResult<String>),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
     ),
     tag = "pod",
