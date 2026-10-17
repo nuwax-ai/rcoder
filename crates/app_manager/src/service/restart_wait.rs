@@ -427,6 +427,23 @@ pub(super) async fn bounded_read<T>(
     }
 }
 
+// Both a completed read and a rejected admission share the original budget.
+// The next loop revalidates identity and occupancy before any lease dispatch.
+async fn wait_restart_poll(deadline: tokio::time::Instant) -> AppResult<()> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(deadline_exhausted());
+    }
+    let cancel = cancellation();
+    tokio::select! {
+        () = tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + POLL)) => {}
+        () = cancel.cancelled() => return Err(abandoned()),
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return Err(deadline_exhausted());
+    }
+    Ok(())
+}
+
 impl AppService {
     pub(crate) fn restart_admission_deadline(&self) -> AppResult<tokio::time::Instant> {
         let deadline = tokio::time::Instant::now()
@@ -515,18 +532,7 @@ impl AppService {
             }
             return Err(holder.into_error());
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(deadline_exhausted());
-        }
-        let cancel = cancellation();
-        tokio::select! {
-            () = tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + POLL)) => {}
-            () = cancel.cancelled() => return Err(abandoned()),
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(deadline_exhausted());
-        }
-        Ok(())
+        wait_restart_poll(deadline).await
     }
 
     pub(crate) async fn acquire_restart_admission_guard(
@@ -580,6 +586,26 @@ impl AppService {
                 }
                 observe_compute_intent(&status)?;
             }
+            // Wait on the completed authoritative read before dispatching a
+            // physical lease write. Do not enrich this observation again: a
+            // holder can finish between reads without an admission rejection.
+            let holder = bounded_read(
+                deadline,
+                self.observe_operation_holder(app_id, UserAppOperationScope::Prod, None, None),
+            )
+            .await?;
+            if holder.blocker.is_some() {
+                if !holder.may_wait {
+                    return Err(holder.into_error());
+                }
+                wait_restart_poll(deadline).await?;
+                continue;
+            }
+            #[cfg(test)]
+            super::traffic_wake_wait::pause_at(
+                super::traffic_wake_wait::WakePausePoint::RestartLeaseReady,
+            )
+            .await;
             let lock = self
                 .release_locks
                 .entry((app_id.to_owned(), UserAppOperationScope::Prod))

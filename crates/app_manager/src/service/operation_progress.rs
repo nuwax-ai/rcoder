@@ -554,6 +554,13 @@ impl AppService {
                 .observe_operation_holder_inner(app_id, scope, expected, physical)
                 .await;
             super::restart_wait::remember_holder(&result)?;
+            #[cfg(test)]
+            if result.as_ref().is_ok_and(|holder| holder.blocker.is_some()) {
+                super::traffic_wake_wait::pause_at(
+                    super::traffic_wake_wait::WakePausePoint::RestartHolderObserved,
+                )
+                .await;
+            }
             result
         }
     }

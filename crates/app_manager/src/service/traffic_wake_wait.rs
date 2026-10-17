@@ -329,6 +329,8 @@ impl AppService {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WakePausePoint {
     AccessChecked,
+    RestartHolderObserved,
+    RestartLeaseReady,
     LeaseAcquired,
     AdmittedUnbound,
 }
@@ -340,7 +342,7 @@ pub(crate) struct WakePause {
     pub release: tokio::sync::Barrier,
     fired: std::sync::atomic::AtomicBool,
 }
-#[cfg(all(test, feature = "pg-tests"))]
+#[cfg(test)]
 impl WakePause {
     pub fn new(point: WakePausePoint) -> Arc<Self> {
         Arc::new(Self {

@@ -23,6 +23,12 @@ struct ReplicaRuntime(Arc<MockRuntime>);
 impl WorkspaceRuntime for ReplicaRuntime {}
 #[async_trait::async_trait]
 impl UserAppDeploymentRuntime for ReplicaRuntime {
+    async fn discover_application_identity(
+        &self,
+        app: &str,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppDiscoveredIdentity>> {
+        self.0.discover_application_identity(app).await
+    }
     async fn list_deployments(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
         self.0.list_deployments().await
     }
@@ -51,6 +57,13 @@ impl UserAppDeploymentRuntime for ReplicaRuntime {
     }
     async fn start_app_target(&self, target: &UserAppMutationTarget) -> ContainerRuntimeResult<()> {
         self.0.start_app_target(target).await
+    }
+    async fn restart_app_target(
+        &self,
+        target: &UserAppMutationTarget,
+        image: Option<&str>,
+    ) -> ContainerRuntimeResult<()> {
+        self.0.restart_app_target(target, image).await
     }
     async fn acquire_vacant_app_operation(
         &self,
@@ -699,3 +712,6 @@ async fn traffic_wake_expired_mutex_does_not_authorize_a_foreign_target() {
     assert!(fixture.daemon.lease_held.load(Ordering::SeqCst));
     fixture.shutdown().await;
 }
+
+#[path = "restart_wait_read_first_tests.rs"]
+mod restart_read_first_tests;
