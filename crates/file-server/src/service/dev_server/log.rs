@@ -1,6 +1,7 @@
 //! Dev server 日志 (对齐 nuwax `logUtils.js` + `getDevLogUtils.js`)。
 //!
-//! - 双流: 主日志 `dev-{YYYY-MM-DD}.log` (按日期轮转) + 临时日志 `dev-temp-{ms}.log`
+//! - 双流: 主日志 `dev-{YYYY-MM-DD}.log` (按日期轮转) + 按 launch 唯一的临时日志。
+//!   新启动使用 `dev-temp-{ms}-{launch_id}.log`，构建与历史日志保留原 `{ms}` 格式。
 //! - 每行 prepend 时间戳前缀 `[YYYY/MM/DD HH:MM:SS] `
 //! - log dir: 普通 projectId → `{LOG_BASE_DIR}/{projectId}/`; `computer:userId:cId` → `{COMPUTER_LOG_DIR}/{userId}/{cId}/`
 
@@ -46,6 +47,13 @@ pub fn main_log_name() -> String {
 /// 临时日志文件名 `dev-temp-{ms}.log`。
 pub fn temp_log_name(now_ms: i64) -> String {
     format!("dev-temp-{now_ms}.log")
+}
+
+/// Capture once per launch, then share the same name with logging and registration.
+/// The launch ID keeps a late Stop from removing another launch's log even when
+/// their wall-clock timestamps are equal or the clock moves backwards.
+pub(super) fn launch_temp_log_name(now_ms: i64, launch_id: &str) -> String {
+    format!("dev-temp-{now_ms}-{launch_id}.log")
 }
 
 /// 时间戳前缀 `[YYYY/MM/DD HH:MM:SS] `。
@@ -301,21 +309,29 @@ async fn latest_temp_log(dir: &Path) -> AppResult<Option<String>> {
             )));
         }
     };
-    let mut temps: Vec<(i64, String)> = Vec::new();
+    let mut temps: Vec<((i64, u128), String)> = Vec::new();
     while let Some(e) = entries.next_entry().await.map_err(|error| {
         AppError::system(format!("scan dev log directory {}: {error}", dir.display()))
     })? {
         let name = e.file_name().to_string_lossy().into_owned();
-        if let Some(ms) = name
-            .strip_prefix("dev-temp-")
-            .and_then(|s| s.strip_suffix(".log"))
-            .and_then(|s| s.parse::<i64>().ok())
-        {
-            temps.push((ms, name));
+        if let Some(order) = temp_log_order(&name) {
+            temps.push((order, name));
         }
     }
-    temps.sort_by_key(|&(ms, _)| std::cmp::Reverse(ms));
+    temps.sort_by_key(|&(order, _)| std::cmp::Reverse(order));
     Ok(temps.into_iter().next().map(|(_, n)| n))
+}
+
+/// New launch names and old timestamp-only names remain readable together.
+/// Use split operations rather than byte slicing for arbitrary directory entries.
+fn temp_log_order(name: &str) -> Option<(i64, u128)> {
+    let stem = name.strip_prefix("dev-temp-")?.strip_suffix(".log")?;
+    if let Ok(timestamp) = stem.parse::<i64>() {
+        return Some((timestamp, 0));
+    }
+    let (timestamp, launch_id) = stem.rsplit_once('-')?;
+    let launch = uuid::Uuid::parse_str(launch_id).ok()?;
+    Some((timestamp.parse::<i64>().ok()?, launch.as_u128()))
 }
 
 /// 脱敏敏感路径 (对齐 nuwax sanitizeSensitivePaths): 把绝对工作区路径替换为相对。
@@ -325,19 +341,14 @@ pub fn sanitize_sensitive_paths(s: &str) -> String {
         .replace("/app/computer-project-workspace/", "")
 }
 
-/// 清理目录下所有 `dev-temp-*.log` (stop 时调用)。
-pub async fn cleanup_temp_logs(dir: &Path) {
-    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
-        return;
-    };
-    while let Ok(Some(e)) = entries.next_entry().await {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with("dev-temp-")
-            && name.ends_with(".log")
-            && let Err(e) = tokio::fs::remove_file(e.path()).await
-        {
-            tracing::warn!(error = %e, "remove temp log file failed (skipping)");
-        }
+/// Remove only the captured launch's temporary log after registration retirement.
+/// A successor may already be writing in the same project directory.
+pub(super) async fn cleanup_temp_log(dir: &Path, name: &str) {
+    if !name.is_empty()
+        && let Err(error) = tokio::fs::remove_file(dir.join(name)).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(%error, "remove stopped launch temporary log");
     }
 }
 
@@ -345,6 +356,51 @@ pub async fn cleanup_temp_logs(dir: &Path) {
 mod evt_tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn temp_log_order_accepts_old_and_unique_launch_names_without_slicing() {
+        let launch = "0199861c786770008000000000000002";
+        assert_eq!(temp_log_order("dev-temp-100.log"), Some((100, 0)));
+        assert_eq!(temp_log_order("dev-temp--100.log"), Some((-100, 0)));
+        assert_eq!(
+            temp_log_order(&launch_temp_log_name(100, launch)),
+            Some((100, uuid::Uuid::parse_str(launch).unwrap().as_u128()))
+        );
+        for invalid in [
+            "dev-temp-100-不完整.log",
+            "dev-temp-100-not-a-launch.log",
+            "dev-temp-.log",
+            "dev-temp-9223372036854775808.log",
+            "开发日志.log",
+        ] {
+            assert_eq!(temp_log_order(invalid), None, "{invalid}");
+        }
+    }
+
+    #[tokio::test]
+    async fn latest_temp_log_reads_legacy_and_unique_launch_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = "dev-temp-100.log";
+        let original = launch_temp_log_name(100, "0199861c786770008000000000000001");
+        let successor = launch_temp_log_name(100, "0199861c786770008000000000000002");
+        append_line(&dir.path().join(old), "old").await.unwrap();
+        assert_eq!(latest_temp_log(dir.path()).await.unwrap(), Some(old.into()));
+        append_line(&dir.path().join(&original), "original")
+            .await
+            .unwrap();
+        append_line(&dir.path().join(&successor), "successor")
+            .await
+            .unwrap();
+        append_line(&dir.path().join("dev-temp-999-无效.log"), "unrelated")
+            .await
+            .unwrap();
+        assert_eq!(latest_temp_log(dir.path()).await.unwrap(), Some(successor));
+        assert_eq!(
+            temp_log_name(100),
+            old,
+            "build log naming remains unchanged"
+        );
+    }
 
     /// EVT 行（行首前缀匹配）→ 去前缀 JSON 回调；普通行不回调；两类行都落日志。
     #[tokio::test]

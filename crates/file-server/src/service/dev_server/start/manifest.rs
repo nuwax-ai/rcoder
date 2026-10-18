@@ -45,6 +45,19 @@ impl DevServerManager {
             hooks.launch_deadline = Some(deadline);
             deadline
         };
+        // StopWork may already be durable while cancellation leaves the exact
+        // launcher registered as Cleaning. Resume that original stop before
+        // owner handover; its continuation shares this launch's total budget.
+        tokio::time::timeout_at(
+            deadline,
+            self.resume_pending_manifest_stop(project_id, project_path),
+        )
+        .await
+        .map_err(|_| {
+            AppError::business(
+                "local startup launch deadline exceeded while resuming original stop; no new execution submitted",
+            )
+        })??;
         // 单一来源 shared_types::APP_ENTRY_PORT（release 流程、Pingora 免端口代理同值）
         const PINGAP_ENTRY_PORT: u16 = shared_types::APP_ENTRY_PORT;
         // HTTP readiness can precede the one-shot run's successful exit.
@@ -153,8 +166,10 @@ impl DevServerManager {
             .await.map_err(|_| AppError::business("local startup launch deadline expired while preparing logs; no new execution submitted"))?
             .map_err(|e| AppError::system(format!("create app-cli log dir: {e}")))?;
         let now = process::now_ms();
+        let launch_id = uuid::Uuid::now_v7().simple().to_string();
+        let temp_log_name = log::launch_temp_log_name(now, &launch_id);
         let main_log = ldir.join(log::main_log_name());
-        let temp_log = ldrtemp(&ldir, now);
+        let temp_log = ldrtemp(&ldir, &temp_log_name);
 
         // 管理 API 绑 0.0.0.0:3010——logs/query 的 orchestrator 内置源
         //（app_manager log_api_base dev 分支）按 {容器 IP}:3010 连 app-cli
@@ -257,7 +272,6 @@ impl DevServerManager {
         // 同步临界区（固定锁序 launches→processes→supervised，不持锁跨
         // await）原子发表；并发 Stop 不得在此窗口看到"有 launch 无
         // supervised"的半登记。失败路径按同一身份自清，不补登记成运行成功。
-        let launch_id = uuid::Uuid::now_v7().simple().to_string();
         {
             let mut launches = lock(&self.launches)?;
             let mut processes = lock(&self.processes)?;
@@ -272,7 +286,7 @@ impl DevServerManager {
                     base_path: None,
                     started_at: now,
                     log_dir: ldir.clone(),
-                    temp_log_name: log::temp_log_name(now),
+                    temp_log_name,
                     external_owner: None,
                 },
             );

@@ -20,6 +20,68 @@ use crate::error::{AppError, AppResult};
 use crate::models::KilledPid;
 
 impl DevServerManager {
+    /// A retained manifest launch may have completed StopWork while its
+    /// launcher was still exiting. Only the exact interrupted cleanup can
+    /// authorize continuation; an unrelated failed run keeps its normal guard.
+    pub(super) async fn resume_pending_manifest_stop(
+        &self,
+        project_id: &str,
+        workspace: &Path,
+    ) -> AppResult<()> {
+        let Some((captured, launch)) = self.pending_registered_cleanup(project_id)? else {
+            return Ok(());
+        };
+        let stop_lock = self.userapp_stop_lock(project_id)?;
+        let _serialized = stop_lock.lock().await;
+        if !self
+            .pending_registered_cleanup(project_id)?
+            .is_some_and(|(current, _)| captured.same_incarnation(&current))
+        {
+            // Waiting for the original Stop lock grants no authority over a
+            // successor published meanwhile, including a new external owner.
+            return Ok(());
+        }
+        // Continue only retained native StopWork requests, and observe current
+        // owners without stopping a newly discovered live run. This differs
+        // deliberately from a new explicit project Stop.
+        self.ensure_no_local_execution(project_id, workspace)
+            .await?;
+        self.close_local_registration(project_id, launch.as_deref())
+            .await?;
+        Ok(())
+    }
+
+    fn pending_registered_cleanup(
+        &self,
+        project_id: &str,
+    ) -> AppResult<Option<(super::cleanup_record::CleanupRecord, Option<String>)>> {
+        let launches = lock(&self.launches)?;
+        let processes = lock(&self.processes)?;
+        let children = lock(&self.supervised)?;
+        if processes
+            .get(project_id)
+            .is_some_and(|process| process.external_owner.is_some())
+        {
+            return Ok(None);
+        }
+        let launch = launches
+            .get(project_id)
+            .map(|launch| launch.launch_id.clone());
+        let current = super::cleanup_record::CleanupRecord::capture(
+            super::types::CleanupStatus::Cleaning,
+            launch.as_deref(),
+            processes.get(project_id),
+            children.get(project_id),
+        );
+        let pending = lock(&self.cleanup_state)?
+            .get(project_id)
+            .is_some_and(|record| match record.status {
+                super::types::CleanupStatus::Cleaning => record.same_incarnation(&current),
+                super::types::CleanupStatus::Cleaned => false,
+            });
+        Ok(pending.then_some((current, launch)))
+    }
+
     /// Continue captured cleanup or retire the actual exited current child
     /// before a Start reuses its registration. A cached dead PID is not Ready.
     /// The marker cannot authorize work against a replacement, and historical
@@ -667,12 +729,8 @@ impl DevServerManager {
         };
         // Remove only this launch's temporary log: a successor may already be
         // writing another log in the same directory after registration retirement.
-        if let Some(p) = &retired_proc
-            && !p.temp_log_name.is_empty()
-            && let Err(error) = tokio::fs::remove_file(p.log_dir.join(&p.temp_log_name)).await
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(%error, project_id, "remove stopped launch temporary log");
+        if let Some(p) = &retired_proc {
+            super::log::cleanup_temp_log(&p.log_dir, &p.temp_log_name).await;
         }
         Ok(killed)
     }

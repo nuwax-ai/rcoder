@@ -40,6 +40,21 @@ impl DevServerManager {
     }
 
     async fn stop_legacy_observed(&self, project_id: &str) -> AppResult<StoppedDev> {
+        self.stop_legacy_observed_with_log_cleanup(project_id, |process| async move {
+            log::cleanup_temp_log(&process.log_dir, &process.temp_log_name).await;
+        })
+        .await
+    }
+
+    pub(super) async fn stop_legacy_observed_with_log_cleanup<F, Fut>(
+        &self,
+        project_id: &str,
+        cleanup_log: F,
+    ) -> AppResult<StoppedDev>
+    where
+        F: FnOnce(crate::models::DevProcess) -> Fut,
+        Fut: Future<Output = ()>,
+    {
         let serial = {
             let mut locks = lock(&self.coordinated_stop_locks)?;
             locks
@@ -206,7 +221,7 @@ impl DevServerManager {
             cleanup.insert(project_id.to_owned(), capture.completed());
         }
         if let Some(process) = proc {
-            log::cleanup_temp_logs(&process.log_dir).await;
+            cleanup_log(process).await;
         }
         Ok(StoppedDev {
             owner_stopped: false,

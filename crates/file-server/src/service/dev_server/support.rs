@@ -3,11 +3,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use super::{StderrRing, ViteStartupError, error_classify, log};
+use super::{StderrRing, ViteStartupError, error_classify};
 use crate::error::{AppError, AppResult};
 
-pub(super) fn ldrtemp(log_dir: &Path, now: i64) -> PathBuf {
-    log_dir.join(log::temp_log_name(now))
+pub(super) fn ldrtemp(log_dir: &Path, temp_log_name: &str) -> PathBuf {
+    log_dir.join(temp_log_name)
 }
 
 pub(super) fn early_exit_err(pid: u32, port: u16, ring: &Arc<StderrRing>) -> AppError {

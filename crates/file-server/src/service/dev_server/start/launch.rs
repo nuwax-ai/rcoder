@@ -138,8 +138,10 @@ impl DevServerManager {
             .await
             .map_err(|e| AppError::system(format!("create dev log dir: {e}")))?;
         let now = process::now_ms();
+        let launch_id = uuid::Uuid::now_v7().simple().to_string();
+        let temp_log_name = log::launch_temp_log_name(now, &launch_id);
         let main_log = ldir.join(log::main_log_name());
-        let temp_log = ldrtemp(&ldir, now);
+        let temp_log = ldrtemp(&ldir, &temp_log_name);
 
         self.write_npmrc(project_path).await?;
 
@@ -247,7 +249,6 @@ impl DevServerManager {
         let effective_base = base_path
             .map(process::normalize_base_path)
             .unwrap_or_else(|| format!("/proxy/{port}/"));
-        let launch_id = uuid::Uuid::now_v7().simple().to_string();
         {
             let mut launches = lock(&self.launches)?;
             let mut processes = lock(&self.processes)?;
@@ -269,7 +270,7 @@ impl DevServerManager {
                     instance_id: instance_id.map(str::to_owned),
                     base_path: Some(effective_base),
                     log_dir: ldir,
-                    temp_log_name: log::temp_log_name(now),
+                    temp_log_name,
                     external_owner: None,
                 },
             );

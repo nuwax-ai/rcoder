@@ -532,3 +532,143 @@ async fn original_start_recovers_pending_owned_cleanup_and_serves_new_http() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[tokio::test]
+async fn legacy_stop_cleanup_preserves_successor_temp_log_after_retirement_barrier() {
+    legacy_temp_log_cleanup_case(false, None).await;
+}
+
+#[tokio::test]
+async fn legacy_stop_without_captured_log_name_preserves_all_temporary_logs() {
+    legacy_temp_log_cleanup_case(true, None).await;
+}
+
+#[tokio::test]
+async fn legacy_stop_cleanup_preserves_same_millisecond_successor_log() {
+    legacy_temp_log_cleanup_case(false, Some([100, 100, 100])).await;
+}
+
+#[tokio::test]
+async fn legacy_stop_cleanup_preserves_clock_rollback_successor_log() {
+    // The original name sampled 100; by Stop the clock was 200, and the next
+    // launch samples 100 again. No host clock is changed by this fixture.
+    legacy_temp_log_cleanup_case(false, Some([100, 200, 100])).await;
+}
+
+async fn legacy_temp_log_cleanup_case(unknown_name: bool, clock: Option<[i64; 3]>) {
+    let root = tempfile::tempdir().unwrap();
+    let manager = manager(root.path());
+    let key = "legacy-log-successor";
+    let child = spawn(SIGNAL_BARRIER, root.path());
+    register(&manager, key, &child, root.path(), None);
+    barrier(&root.path().join("ready")).await;
+    let logs = root.path().join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let original_launch = "0199861c786770008000000000000001";
+    let successor_launch = "0199861c786770008000000000000002";
+    let (old_name, next_name) = match clock {
+        Some([original, observed_at_stop, next]) => {
+            assert!(observed_at_stop >= original && observed_at_stop >= next);
+            (
+                super::log::launch_temp_log_name(original, original_launch),
+                super::log::launch_temp_log_name(next, successor_launch),
+            )
+        }
+        None => ("dev-temp-100.log".into(), "dev-temp-200.log".into()),
+    };
+    std::fs::write(logs.join(&old_name), b"original log").unwrap();
+    lock(&manager.launches)
+        .unwrap()
+        .get_mut(key)
+        .unwrap()
+        .launch_id = original_launch.into();
+    std::fs::write(logs.join("dev-temp-50.log"), b"unrelated retained log").unwrap();
+    std::fs::write(logs.join("dev-current.log"), b"main log").unwrap();
+    lock(&manager.processes)
+        .unwrap()
+        .get_mut(key)
+        .unwrap()
+        .temp_log_name = if unknown_name {
+        String::new()
+    } else {
+        old_name.clone()
+    };
+    std::fs::write(root.path().join("release"), b"original child exits on Stop").unwrap();
+    let (retired, retirement) = tokio::sync::oneshot::channel();
+    let release_cleanup = Arc::new(tokio::sync::Notify::new());
+    let released = release_cleanup.clone();
+    let stopping = manager.clone();
+    // The entire real legacy observation/retirement path runs unchanged. Only
+    // its final log I/O waits at this deterministic scheduling barrier.
+    let stop = tokio::spawn(async move {
+        stopping
+            .stop_legacy_observed_with_log_cleanup(key, move |captured| async move {
+                retired.send(()).unwrap();
+                released.notified().await;
+                super::log::cleanup_temp_log(&captured.log_dir, &captured.temp_log_name).await;
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), retirement)
+        .await
+        .expect("real Stop must retire its original registration before log cleanup")
+        .unwrap();
+    assert!(matches!(
+        child.wait_exit(Duration::from_secs(2)).await,
+        Some(ChildExit::Exited(_))
+    ));
+    assert!(!lock(&manager.processes).unwrap().contains_key(key));
+    assert_eq!(manager.port_pool.status().unwrap().total_allocated, 0);
+    // A real successor Child and registration are a controlled publication
+    // fixture here; this test does not claim a second full package-manager run.
+    let successor_root = root.path().join("successor");
+    std::fs::create_dir(&successor_root).unwrap();
+    let successor = spawn(SIGNAL_BARRIER, &successor_root);
+    barrier(&successor_root.join("ready")).await;
+    register(&manager, key, &successor, &successor_root, None);
+    {
+        lock(&manager.launches)
+            .unwrap()
+            .get_mut(key)
+            .unwrap()
+            .launch_id = successor_launch.into();
+        let mut processes = lock(&manager.processes).unwrap();
+        let process = processes.get_mut(key).unwrap();
+        process.started_at = 2;
+        process.log_dir = logs.clone();
+        process.temp_log_name = next_name.clone();
+    }
+    std::fs::write(logs.join(&next_name), b"successor startup log").unwrap();
+    release_cleanup.notify_one();
+    let stopped = stop.await.unwrap().unwrap();
+    assert!(
+        stopped
+            .killed_pids
+            .iter()
+            .any(|value| value.pid == child.pid() && value.killed)
+    );
+    // Capture I/O now but assert after reaping the real successor, so even the
+    // pre-fix RED leaves neither a Child nor an allocated port behind.
+    let successor_log = std::fs::read(logs.join(&next_name));
+    assert_eq!(
+        std::fs::read(logs.join("dev-temp-50.log")).unwrap(),
+        b"unrelated retained log"
+    );
+    assert_eq!(
+        std::fs::read(logs.join("dev-current.log")).unwrap(),
+        b"main log"
+    );
+    let original_log_exists = logs.join(&old_name).exists();
+    assert!(successor.exited().is_none());
+    assert!(!successor_root.join("term-entered").exists());
+    assert!(Arc::ptr_eq(
+        &successor,
+        &manager.supervised_child(key).unwrap()
+    ));
+    assert_eq!(manager.port_pool.status().unwrap().total_allocated, 1);
+    std::fs::write(successor_root.join("release"), b"successor cleanup").unwrap();
+    manager.stop_dev(key).await.unwrap();
+    assert_reaped_and_retired(&manager, key, &successor).await;
+    assert_eq!(successor_log.unwrap(), b"successor startup log");
+    assert_eq!(original_log_exists, unknown_name);
+}

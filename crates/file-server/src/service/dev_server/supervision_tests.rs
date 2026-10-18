@@ -475,6 +475,281 @@ fn persisted_local_stops_at(log_dir: &Path) -> serde_json::Value {
     }
 }
 
+/// StopWork has a durable terminal result before the launcher reaches its
+/// exit barrier. Its SIGTERM handler proves close_local_registration reached
+/// the real Child; cancellation then leaves the exact Cleaning incarnation.
+fn late_exit_orchestrator() -> String {
+    ORCHESTRATOR_FIXTURE
+        .replace("import fcntl, json, os, socket, subprocess, sys, time, uuid", "import fcntl, json, os, signal, socket, subprocess, sys, time, uuid")
+        .replace("child = subprocess.Popen", "def hold_term(signum, frame):\n    with open(os.path.join(ws, 'term-entered'), 'w') as f: f.write('actual signal')\nsignal.signal(signal.SIGTERM, hold_term)\n\nchild = subprocess.Popen")
+        .replace("            os._exit(0)", "            if mode in ('late-exit-17', 'late-exit-signal'):\n                while not os.path.exists(os.path.join(ws, 'release-exit')): time.sleep(.005)\n                if mode == 'late-exit-17': os._exit(17)\n                signal.signal(signal.SIGTERM, signal.SIG_DFL)\n                os.kill(os.getpid(), signal.SIGTERM)\n            os._exit(0)")
+}
+
+async fn wait_fixture_file(path: &Path) {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !path.try_exists().unwrap() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("real fixture barrier did not arrive: {}", path.display()));
+}
+
+fn fixture_launch() -> super::DevLaunch<'static> {
+    super::DevLaunch {
+        base_path: None,
+        hooks: None,
+        pg: None,
+        request_context: None,
+        artifact_release_id: None,
+    }
+}
+
+async fn cancelled_manifest_stop(env: &FixtureEnv, key: &'static str, mode: &str) {
+    std::fs::write(env.workspace.join("fixture-mode.txt"), mode).unwrap();
+    let manager = env.manager.clone();
+    let workspace = env.workspace.clone();
+    let stop = tokio::spawn(async move { manager.stop_userapp_dev(key, &workspace).await });
+    wait_fixture_file(&env.workspace.join("term-entered")).await;
+    assert!(env.manager.has_uncleaned_cleanup(key).unwrap());
+    let original = env.manager.supervised_child(key).unwrap();
+    assert!(
+        original.exited().is_none(),
+        "launcher is held at the real exit barrier"
+    );
+    assert_eq!(stop_log_of(&env.workspace).len(), 1, "one actual StopWork");
+    assert!(
+        env.manager.pending_local_stops(key).unwrap().is_empty(),
+        "StopWork already reached its durable terminal result"
+    );
+    stop.abort();
+    assert!(stop.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn manifest_start_resumes_cancelled_stop_after_late_exit_17_with_original_budget() {
+    manifest_start_after_late_stop("late-exit-17", true).await;
+}
+
+#[tokio::test]
+async fn manifest_start_resumes_cancelled_stop_after_late_signal_exit() {
+    manifest_start_after_late_stop("late-exit-signal", false).await;
+}
+
+async fn manifest_start_after_late_stop(mode: &str, check_budget: bool) {
+    use std::time::Duration;
+    let env = fixture_env(&late_exit_orchestrator()).await;
+    let key = "userapp:manifest-late-stop";
+    std::fs::write(env.workspace.join("retained-data"), b"original user data").unwrap();
+    let first = env
+        .manager
+        .start_dev(key, &env.workspace, fixture_launch())
+        .await
+        .unwrap();
+    let original = env.manager.supervised_child(key).unwrap();
+    let original_launch = lock(&env.manager.launches).unwrap()[key].launch_id.clone();
+    cancelled_manifest_stop(&env, key, mode).await;
+    if check_budget {
+        let mut launch = fixture_launch();
+        let mut hooks = super::DevEventHooks::noop();
+        hooks.launch_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(80));
+        launch.hooks = Some(hooks);
+        let error = tokio::time::timeout(
+            Duration::from_millis(500),
+            env.manager.start_dev(key, &env.workspace, launch),
+        )
+        .await
+        .expect("the original parent deadline must bound cleanup")
+        .expect_err("live original child cannot authorize a new launch");
+        assert!(error.to_string().contains("deadline"), "{error}");
+        assert!(env.manager.has_uncleaned_cleanup(key).unwrap());
+        assert!(Arc::ptr_eq(
+            &original,
+            &env.manager.supervised_child(key).unwrap()
+        ));
+        assert_eq!(
+            lock(&env.manager.launches).unwrap()[key].launch_id,
+            original_launch
+        );
+        assert!(!lock(&env.manager.starting).unwrap().contains(key));
+    }
+    std::fs::write(
+        env.workspace.join("release-exit"),
+        b"original child can exit",
+    )
+    .unwrap();
+    let exit = original
+        .wait_exit(Duration::from_secs(2))
+        .await
+        .expect("original Child must really exit");
+    match exit {
+        super::ChildExit::Exited(status) => {
+            if mode == "late-exit-17" {
+                assert_eq!(status.code(), Some(17));
+            } else {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(status.signal(), Some(15));
+            }
+        }
+        super::ChildExit::WaitFailed(error) => panic!("real child wait failed: {error}"),
+    }
+    std::fs::write(env.workspace.join("fixture-mode.txt"), "normal").unwrap();
+    std::fs::write(env.workspace.join("marker.txt"), "B").unwrap();
+    let restarted = env
+        .manager
+        .start_dev(key, &env.workspace, fixture_launch())
+        .await;
+    // Explicit Stop is only failure cleanup; it does not enable the assertion.
+    // This also prevents the pre-fix RED from retaining a real fixture process.
+    if restarted.is_err() {
+        env.manager
+            .stop_userapp_dev(key, &env.workspace)
+            .await
+            .unwrap();
+    }
+    let second = restarted.expect("ordinary manifest Start must finish the exact interrupted Stop and launch the current source");
+    assert_ne!(first.pid, second.pid);
+    assert_ne!(
+        lock(&env.manager.launches).unwrap()[key].launch_id,
+        original_launch
+    );
+    assert!(!Arc::ptr_eq(
+        &original,
+        &env.manager.supervised_child(key).unwrap()
+    ));
+    wait_for_content(&env.workspace, "B");
+    assert_eq!(
+        stop_log_of(&env.workspace).len(),
+        1,
+        "completed StopWork must not be replayed"
+    );
+    assert_eq!(lock(&env.manager.processes).unwrap().len(), 1);
+    assert_eq!(lock(&env.manager.launches).unwrap().len(), 1);
+    assert_eq!(lock(&env.manager.supervised).unwrap().len(), 1);
+    assert!(!env.manager.has_uncleaned_cleanup(key).unwrap());
+    assert_eq!(
+        std::fs::read(env.workspace.join("retained-data")).unwrap(),
+        b"original user data"
+    );
+    env.manager
+        .stop_userapp_dev(key, &env.workspace)
+        .await
+        .unwrap();
+    std::fs::write(env.workspace.join("marker.txt"), "C").unwrap();
+    env.manager
+        .start_dev(key, &env.workspace, fixture_launch())
+        .await
+        .unwrap();
+    wait_for_content(&env.workspace, "C");
+    env.manager
+        .stop_userapp_dev(key, &env.workspace)
+        .await
+        .unwrap();
+    assert!(lock(&env.manager.processes).unwrap().is_empty());
+    assert!(!env.manager.has_uncleaned_cleanup(key).unwrap());
+    assert_eq!(
+        std::fs::read(env.workspace.join("retained-data")).unwrap(),
+        b"original user data"
+    );
+}
+
+#[tokio::test]
+async fn manifest_pending_stop_waiting_for_lock_never_targets_a_replacement_launch() {
+    manifest_pending_stop_replacement_case(false).await;
+}
+
+#[tokio::test]
+async fn manifest_pending_stop_waiting_for_lock_preserves_a_new_external_owner() {
+    manifest_pending_stop_replacement_case(true).await;
+}
+
+async fn manifest_pending_stop_replacement_case(external_owner: bool) {
+    use std::time::Duration;
+    let env = fixture_env(&late_exit_orchestrator()).await;
+    let key = "userapp:manifest-stop-replaced";
+    env.manager
+        .start_dev(key, &env.workspace, fixture_launch())
+        .await
+        .unwrap();
+    let original = env.manager.supervised_child(key).unwrap();
+    cancelled_manifest_stop(&env, key, "late-exit-17").await;
+    let continuation_lock = Arc::new(tokio::sync::Mutex::new(()));
+    lock(&env.manager.coordinated_stop_locks)
+        .unwrap()
+        .insert(key.into(), continuation_lock.clone());
+    let held = continuation_lock.lock().await;
+    let resume = env
+        .manager
+        .resume_pending_manifest_stop(key, &env.workspace);
+    tokio::pin!(resume);
+    tokio::select! {
+        result = &mut resume => panic!("resume must wait for the original continuation lock: {result:?}"),
+        () = tokio::time::sleep(Duration::from_millis(20)) => {}
+    }
+    let replacement = super::SupervisedChild::adopt(
+        tokio::process::Command::new("python3")
+            .args(["-c", "import time; time.sleep(60)"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+        Arc::new(Default::default()),
+    );
+    {
+        let mut launches = lock(&env.manager.launches).unwrap();
+        let mut processes = lock(&env.manager.processes).unwrap();
+        let mut children = lock(&env.manager.supervised).unwrap();
+        launches.get_mut(key).unwrap().launch_id = "replacement-launch".into();
+        let process = processes.get_mut(key).unwrap();
+        process.pid = replacement.pid();
+        process.started_at += 1;
+        if external_owner {
+            process.external_owner = Some(crate::models::ExternalOwner {
+                address: "http://127.0.0.1:1".into(),
+                token: "replacement-owner-token".into(),
+                runtime_instance_id: "replacement-runtime".into(),
+            });
+        }
+        children.insert(key.into(), replacement.clone());
+    }
+    drop(held);
+    resume.await.unwrap();
+    assert!(replacement.exited().is_none());
+    assert!(is_alive(replacement.pid()));
+    assert_eq!(
+        lock(&env.manager.launches).unwrap()[key].launch_id,
+        "replacement-launch"
+    );
+    assert!(Arc::ptr_eq(
+        &replacement,
+        &env.manager.supervised_child(key).unwrap()
+    ));
+    assert_eq!(
+        stop_log_of(&env.workspace).len(),
+        1,
+        "no fresh StopWork against replacement"
+    );
+    assert!(
+        !env.manager.has_uncleaned_cleanup(key).unwrap(),
+        "the original Cleaning is history for a different launch"
+    );
+    std::fs::write(env.workspace.join("release-exit"), b"old exits").unwrap();
+    assert!(
+        matches!(original.wait_exit(Duration::from_secs(2)).await, Some(super::ChildExit::Exited(status)) if status.code() == Some(17))
+    );
+    lock(&env.manager.processes)
+        .unwrap()
+        .get_mut(key)
+        .unwrap()
+        .external_owner = None;
+    env.manager.stop_dev(key).await.unwrap();
+    assert!(matches!(
+        replacement.wait_exit(Duration::from_secs(2)).await,
+        Some(super::ChildExit::Exited(_))
+    ));
+}
+
 /// R2（Starting 被 Stop 插入）：spawn 已发生、探活未过的窗口内，三张表
 ///（processes/launches/supervised）已原子发表——Stop 能看到完整登记并
 /// 真实终止进程组；Start 最终失败（进程被停）且不残留登记。
