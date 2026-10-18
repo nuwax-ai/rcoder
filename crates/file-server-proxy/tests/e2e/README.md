@@ -9,6 +9,9 @@
 ```sh
 python3 tests-e2e/tools/userapp_root_logs.py --write-build-source /tmp/quality-build-source.json
 # 此处构建待测二进制；Docker脚本必须使用与镜像架构匹配的Linux ELF。
+python3 tests-e2e/tools/userapp_root_logs.py --register-binaries \
+  --build-source /tmp/quality-build-source.json \
+  --app-cli /实际路径/app-cli --file-server-proxy /实际路径/file-server-proxy
 ```
 
 回执格式沿用上述工具生成的 `source_inputs_sha256`、`commit` 等字段，增加：
@@ -39,7 +42,7 @@ node crates/file-server-proxy/tests/e2e/source-credential-recovery.test.js \
   /实际Linux路径/app-cli /实际Linux路径/file-server-proxy dev-rcoder-agent-runner:latest
 ```
 
-- native-link：临时状态根，真实 npm→Rust→HTTP；仅确认捕获 owner 退出后删状态根。清理失败保留根并失败。
+- native-link：临时状态根，真实 npm→Rust→HTTP，核对鉴权、重复启动复用及精确身份停止。`native-files.cjs` 在该根内创建中文和空格工作区，经实际 HTTP 验证文件增删改名、目录操作、Git 提交/状态/diff/历史正文，以及 ZIP 的 UTF-8 路径、CRC 和完整内容；停止后沿原 CLI 重开，重新核对原文件、Git HEAD 和 ZIP。仅确认捕获 owner 退出后删本测试状态根；清理失败保留根并失败。这是原生客户端链路，不替代 Compose、K8s 或真实模型测试。
 - F4：真正编译和 HTTP→强制回收本测试容器→原卷新容器重新编译／HTTP→Stop→Start。只验证本地运行链，不宣称 RCoder 闲置扫描器或 K8s 控制面通过。
 - F6：合法、脱敏的旧版 Discovery/Generation fixture；owner启动前导入，经只读平台绑定文件恢复、真实编译／HTTP、Stop/Start；旧未知运行结果不改成成功。该 fixture 使用合成数据，不是线上完整目录原件，也不能替代旧二进制升级对照。
 - Source 凭据恢复 v2：内部 operations/部署记录保留真实 PG，核对 0600 和原操作身份；HTTP、操作/任务 SSE 与鉴权拒绝响应不输出密码。同卷替换 owner 实际没有继承 PG 用户/密码，业务仍用持久输入完成真实 TCP 查询并自动恢复；另导入旧脱敏输入，验证有效当前环境可恢复、历史空串不被补成猜测密码。新错误显式输入仍失败且无 SQL 写入；新版本、Stop/Start、pkill 恢复保留身份、数据和已确认 SQL 去重。私有 PG 仅在首次初始化设置随机凭据，不轮换已有账号，报告不保存密码。

@@ -10,6 +10,7 @@ const { tmpdir } = require("node:os");
 const assert = require("node:assert/strict");
 const net = require("node:net");
 const { verifyBuild } = require("./userapp-container-fixture.cjs");
+const { exerciseFiles } = require("./native-files.cjs");
 
 const BIN = process.env.FILE_SERVER_PROXY_E2E_BINARY;
 const NPM_BIN = join(__dirname, "..", "..", "npm", "bin", "file-server-proxy.js");
@@ -97,6 +98,7 @@ async function main() {
     assert.equal(ok.status, 200);
     const unauthorized = await fetch(`http://${first.address}/health`);
     assert.equal(unauthorized.status, 401);
+    const files = await exerciseFiles(first.address, token, stateDir);
 
     // 3) status 不泄 token
     const statusText = npm(["status", "--port", "0"], env);
@@ -118,6 +120,18 @@ async function main() {
     assert.notEqual(wrongId.status, 0, "foreign instance id must be rejected");
     const stopped = JSON.parse(npm(["stop", "--port", "0", "--instance-id", owned.instance_id, "--supervisor-id", owned.supervisor_id], env));
     assert.equal(stopped.phase, "Stopped");
+    await confirmExited(stateDir, owned, env);
+
+    // Native desktop clients must reopen the original data through the same CLI.
+    const previousInstance = owned.instance_id;
+    const resumed = JSON.parse(npm(["start", "--port", "0", "--native", "--policy", "all_rust", "--detached"], env));
+    assert.ok(resumed.instance_id && resumed.supervisor_id, "capture reopened owner identity");
+    owned = { instance_id: resumed.instance_id, supervisor_id: resumed.supervisor_id };
+    assert.equal(resumed.launch, "created");
+    assert.notEqual(resumed.instance_id, previousInstance);
+    const resumedToken = JSON.parse(readFileSync(credFile, "utf8")).file_api_token;
+    await files.verify(resumed.address, resumedToken);
+    console.log("E2E_NATIVE_FILES_REOPEN_OK");
   } finally {
     await cleanupState(stateDir, owned, target => {
       const stopped = JSON.parse(npm(["stop", "--port", "0", "--instance-id", target.instance_id, "--supervisor-id", target.supervisor_id], env));

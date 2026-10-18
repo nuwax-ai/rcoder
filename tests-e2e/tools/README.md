@@ -382,3 +382,49 @@ python3 tests-e2e/tools/isolated_ci.py \
 ```
 
 入口冻结源码并实际编译 RCoder、Agent Runner、独立 app-cli 和离线观察器，再启动本次专属控制面与动态随机应用。它核对二进制、严格逐用例报告、源码不漂移和既有容器保留；只清理本轮确认归属的计算资源，保留数据卷与失败证据。当前覆盖 owner 冲突、文件/Git、重复启停、多服务、预览 HTTP/HMR、闲置/owner 强杀及真实 Stop 回复超时和迟到 Stop。此 job 不代替 K8s 81 步与跨副本聊天/SSE 验收，也不代替独立 app-cli 的组件检查。
+
+### 独立 K8s 热部署恢复故障回归
+
+向 `k8s_userapp.py` 传入相同连接参数及 `--scenario hot_recovery`，执行独立的
+`k8s_userapp_hot_recovery` 场景。该故障入口仅接受 `nuwax-k8s-test`，有固定必测
+集合；默认 `--scenario all` 的完整 81 项和独立 recreate 契约保持原样，其通过
+不能互相替代。先按构建部署流程冻结源码和镜像，再运行该场景；单纯 Python 单元
+测试不代表集群故障验收通过。
+
+它通过原 Workspace/Build/Deploy API 构建 A/B/C/D 四个真实 ZIP，冷启动 A，
+在本轮独立 ConfigMap/Service/Pod 中使用已运行 app-runtime 镜像和 Python 标准库
+提供 B/D 原始制品字节。下载请求停在有 180 秒上限的文件 barrier；控制仅经精确
+fixture Pod 的 `kubectl exec`，没有 HTTP 写控制接口。fixture 不启动 app-cli 或 PG，
+不挂 PVC、宿主目录或 Docker socket；元数据携带本 run、case、app/lifecycle 身份。
+
+- B 下载被真实 owner 受理后，使用原 Lease 的 UID 和当前 resourceVersion 条件
+  patch `renewTime` 为过去，TTL 保持 60 秒。原协调任务仍运行；先观察扫描器将原
+  `hot_execution` 围栏为 `RecoveryRequired`，再释放下载。验证真实 B 可达、原操作
+  自动终态及槽位/租约释放，随后普通热部署 C 成功；环境配置仍为旧值时不允许
+  把 B 的部分成功报告为平台完整成功，迟到原协调结果不能覆盖后续操作或诊断。
+  这属于精确过期 Lease 注入，**不是主机崩溃/停止续租的端到端模拟**。
+- D 下载期间，只对本应用实际 env ConfigMap 的 UID/RV 条件写一条本轮 annotation，
+  不改变业务环境。释放 D 后，原条件 env commit 必须明确拒绝；真实 D 运行、
+  ConfigMap 仍保留 C 及新增 annotation。自动恢复应保留原失败、释放操作槽和租约，
+  新普通热部署请求能恢复 C 并提交匹配的完整配置。冲突可能在客户端 RV 预检发现，
+  **没有 API 原始证据时不把它称为已观察到 HTTP 409**。
+
+同时核对原 Pod UID、真实构建制品身份、B/D 的实际下载次数、开发工作区文件/Git、
+生产数据 PVC 上的本轮文件见证及现有基线卷。下载次数证明没有通过重放原制品请求
+伪造恢复；此场景没有数据库迁移命令，不能据此声称完成数据库 SQL 审计或迁移重放
+全场景验证。完整原应用清理仍沿原 API；临时 fixture 只按本轮标签/作用域/UID 与
+当前 RV 删除精确 Pod/Service/ConfigMap，记录零 PVC 删除请求。创建响应丢失时也
+须重新核验本轮身份和基线排除，不能按名称盲删。finally 独立释放 barrier、有限等待
+原 HTTP 观察者并清理 fixture，分别保存原业务错误和清理错误。
+
+热恢复工具先真实构建并立即冷部署 A，再构建 B/C/D，避免正常的“默认保留最新
+3 份制品”策略使 A 的旧静态 URL 在部署前失效。fixture 同时提供已校验 C ZIP 的
+非阻塞只读 URL，供两个全新正常热部署请求使用；B/D 仍保留原 barrier 和各一次
+下载的严格断言，另核对 C 恰好被这两个新请求下载。它保留真实原制品字节，不
+调整平台保留策略。fixture 镜像取原运行 Pod status 中实际可拉取的 immutable
+`imageID`，不会把预载的裸 config ID 当作仓库名重新拉取。
+
+`native-link` 已包含 `native-files.cjs`：用真实 `workspacePath` 验证中文/空格路径的
+文件 CRUD、Git、ZIP CRC，并在 Stop 后通过原 native Start 重开，核对原数据与
+Git HEAD 保留。正式验收必须关联本轮注册的源码和实际二进制回执；未归因的本机
+二进制 API 前置探测不算最终验收，native-only 不能替代 K8s、Compose 或真实 AI 回归。

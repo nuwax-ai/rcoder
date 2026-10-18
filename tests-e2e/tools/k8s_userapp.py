@@ -74,8 +74,12 @@ RECREATE_REQUIRED = {
     'recreate_owned_pvc_identity', 'recreate_deleted', 'cleanup', 'baseline_preserved',
     'worker_artifact_contract',
 }
-SCENARIO_REQUIRED = {'all': frozenset(REQUIRED), 'recreate': frozenset(RECREATE_REQUIRED)}
-SCENARIO_IDENTITIES = {'all': 'k8s_userapp', 'recreate': 'k8s_userapp_recreate'}
+from k8s_hot_recovery import REQUIRED as HOT_RECOVERY_REQUIRED
+
+SCENARIO_REQUIRED = {'all': frozenset(REQUIRED), 'recreate': frozenset(RECREATE_REQUIRED),
+                     'hot_recovery': HOT_RECOVERY_REQUIRED}
+SCENARIO_IDENTITIES = {'all': 'k8s_userapp', 'recreate': 'k8s_userapp_recreate',
+                       'hot_recovery': 'k8s_userapp_hot_recovery'}
 
 RESTART_ADMISSION_WAIT_SECONDS = 30
 RESTART_EXECUTION_TIMEOUT_SECONDS = 300
@@ -1711,6 +1715,10 @@ print(json.dumps(out))'''
         self.workspace()
         if self.scenario == 'recreate':
             self.recreate_l1_business()
+        elif self.scenario == 'hot_recovery':
+            from k8s_hot_recovery import exercise
+            exercise(self)
+            return
         elif self.scenario == 'all':
             self.dev_readonly_locator()
             a, ra = self.build('A')
@@ -1778,7 +1786,7 @@ def main():
                         help='RCoder proxy listen port inside each captured main Pod')
     parser.add_argument('--internal-url', default='http://nuwax-k8s-test-rcoder:8086')
     parser.add_argument('--scenario', choices=SCENARIO_REQUIRED, default='all',
-                        help='all keeps the full contract; recreate runs an independent L1-to-L2 lifecycle')
+                        help='all keeps the full 81-step contract; recreate and hot_recovery are independent scenarios')
     args = parser.parse_args()
     run = Run(args)
     def interrupt(*_):
