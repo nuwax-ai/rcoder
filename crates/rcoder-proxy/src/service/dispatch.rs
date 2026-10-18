@@ -268,11 +268,16 @@ impl PortProxy {
                 self.metrics.inc_active();
 
                 // 返回 Axum 服务的 peer
-                let peer = Box::new(HttpPeer::new(
-                    (shared_types::local_probe_host(), target_port),
-                    false,
-                    "".to_string(),
-                ));
+                let peer = Box::new(
+                    super::upstream::ConnectBudget::unbounded()
+                        .direct_peer(
+                            &shared_types::local_probe_host(),
+                            target_port,
+                            false,
+                            String::new(),
+                        )
+                        .await?,
+                );
 
                 Ok(peer)
             }

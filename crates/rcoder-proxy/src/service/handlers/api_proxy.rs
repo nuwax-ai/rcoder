@@ -198,15 +198,17 @@ pub async fn handle_api_proxy_upstream(
     })?;
 
     // 2. 从 ApiKeyManager 查询 API 配置
-    let api_config = api_key_manager.get(service_name).ok_or_else(|| {
-        warn!("{} not in API config", service_name);
-        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(format!(
-            "API key config for service {} not found",
-            service_name
-        ))
-    })?;
+    let api_config = api_key_manager
+        .get(service_name)
+        .map(|config| config.value().clone())
+        .ok_or_else(|| {
+            warn!("{} not in API config", service_name);
+            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(
+                format!("API key config for service {} not found", service_name),
+            )
+        })?;
 
-    let config = api_config.value();
+    let config = &api_config;
     let base_url = &config.base_url;
 
     // URL parsing must distinguish an IPv6 literal from a host:port pair.
@@ -248,7 +250,7 @@ pub async fn handle_api_proxy_upstream(
 
     // 4.1 记录上游信息到 ctx（用于 response_filter 打印协议）
     // ctx 仅日志/追踪记录：外部 API 域名不经注册表解析（dial_addr 只用于
-    // 注册表键），实际 peer 构造在下方直拼——原样记录避免误解析+噪声 warn
+    // 注册表键）；保留原域名日志，实际 peer 在下方异步解析为 SocketAddr
     ctx.upstream_host = Some(format!(
         "{}:{port}",
         &endpoint[url::Position::BeforeHost..url::Position::AfterHost]
@@ -258,11 +260,9 @@ pub async fn handle_api_proxy_upstream(
     // 5. 创建真实 API 端点的 HttpPeer
     // 注意：SNI 必须设置为目标主机名，否则 TLS 握手会失败
     // 同时需要启用 HTTP/2 支持，因为很多 API 服务（如 open.bigmodel.cn）强制使用 HTTP/2
-    let mut peer = HttpPeer::new(
-        (host.as_str(), port),
-        use_tls,          // 根据协议决定是否使用 TLS
-        host.to_string(), // SNI 必须设置为目标主机名
-    );
+    let mut peer = super::super::upstream::ConnectBudget::model_api()
+        .direct_peer(&host, port, use_tls, host.clone())
+        .await?;
     // 启用 HTTP/2 支持，优先 H2，兼容 H1
     peer.options.alpn = ALPN::H2H1;
 
@@ -294,8 +294,7 @@ pub async fn handle_api_proxy_upstream(
         user_timeout: Duration::from_secs(85), // Linux: 数据未确认的最大时间
     });
     // 连接超时配置
-    peer.options.connection_timeout = Some(Duration::from_secs(10)); // 连接建立超时
-    peer.options.total_connection_timeout = Some(Duration::from_secs(30)); // 含 TLS 握手的总超时
+    // DNS and TCP/TLS share the original 10s/30s connection budgets above.
     // read_timeout: 不设置，默认 None，适合 AI API 长时间推理
     peer.options.idle_timeout = Some(Duration::from_secs(90)); // 连接池空闲超时
 
@@ -345,6 +344,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolved_model_hostname_keeps_sni_tls_http2_and_original_timeouts() {
+        let mut router = matchit::Router::new();
+        router.insert("/api/{service_name}/{*path}", ()).unwrap();
+        let matched = router.at("/api/model/v1/messages").unwrap();
+        let peer = handle_api_proxy_upstream(
+            &mut TrackingCtx::default(),
+            matched.params,
+            &configuration("https://localhost:4321/v1"),
+            &Arc::new(ProxyMetrics::default()),
+        )
+        .await
+        .unwrap();
+        assert!(peer._address.as_inet().unwrap().ip().is_loopback());
+        assert_eq!(peer._address.as_inet().unwrap().port(), 4321);
+        assert_eq!(peer.sni, "localhost");
+        assert!(peer.is_tls());
+        assert_eq!(peer.options.alpn, ALPN::H2H1);
+        assert!(peer.options.connection_timeout.unwrap() <= Duration::from_secs(10));
+        assert!(peer.options.total_connection_timeout.unwrap() <= Duration::from_secs(30));
+        assert!(peer.options.read_timeout.is_none());
+        assert_eq!(peer.options.idle_timeout, Some(Duration::from_secs(90)));
+        assert_eq!(peer.options.h2_ping_interval, Some(Duration::from_secs(30)));
+        assert!(peer.options.tcp_keepalive.is_some());
+    }
+
+    #[tokio::test]
     async fn invalid_model_endpoint_ports_remain_errors() {
         let mut router = matchit::Router::new();
         router.insert("/api/{service_name}/{*path}", ()).unwrap();
@@ -385,6 +410,7 @@ mod tests {
         for (base_url, authority) in [
             ("http://127.0.0.1:4321/v1", "127.0.0.1:4321"),
             ("https://[::1]:4321/v1", "[::1]:4321"),
+            ("https://localhost:4321/v1", "localhost:4321"),
         ] {
             let mut request =
                 RequestHeader::build("POST", original.to_string().as_bytes(), None).unwrap();

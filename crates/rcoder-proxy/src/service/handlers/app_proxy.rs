@@ -89,71 +89,86 @@ pub async fn handle_prod_app_upstream(
     // 解析为具体地址（IPv4 优先、IPv6 兜底）——Docker 网络容器名解析常返回
     // v6 优先（fd07::），而应用容器普遍仅监听 0.0.0.0（v4），v6 目标连不上
     // v4 监听；名字解析失败则落入注册表回退链。
+    let budget = super::super::upstream::ConnectBudget::streaming();
+    let registered: Vec<_> = app_backends
+        .iter()
+        .filter(|entry| entry.key().0 == app_id)
+        .map(|entry| (entry.key().1, entry.value().clone()))
+        .collect();
+    let mut last_resolution_error = None;
     let resolved_addr = 'addr: {
-        // 回退分支用的注册值历史上是 IP 字面量（IPv4），按字面量同步解析即可
-        let try_parse = |host: &str, port: u16| -> PingoraResult<Option<std::net::SocketAddr>> {
-            use std::net::ToSocketAddrs;
-            let (host, port) = super::super::upstream::dial_peer(host, port)?;
-            Ok((host.as_str(), port)
-                .to_socket_addrs()
-                .ok()
-                .and_then(|mut addrs| addrs.next()))
-        };
         if let Some(host) = container_lookup
             .as_ref()
             .and_then(|lookup| lookup.find_app_runtime_addr(app_id))
-            .filter(|h| !h.is_empty())
+            .filter(|host| !host.is_empty())
         {
-            let port = app_backends
-                .iter()
-                .find(|e| e.key().0 == app_id)
-                .map(|e| e.key().1)
+            let port = registered
+                .first()
+                .map(|entry| entry.0)
                 .unwrap_or(shared_types::APP_ENTRY_PORT);
             #[cfg(feature = "deploy-host")]
             if shared_types::is_deploy_host() {
-                let addr = super::super::upstream::dial_addr(&host, port)?;
-                let addr = addr.parse::<std::net::SocketAddr>().map_err(|error| {
-                    pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(503))
-                        .more_context(format!("Invalid registered app address: {error}"))
-                })?;
-                break 'addr addr;
+                break 'addr budget
+                    .registered_address(
+                        &host,
+                        port,
+                        super::super::upstream::AddressSelection::PreferIpv4,
+                    )
+                    .await?;
             }
-            if let Some(addr) = resolve_preferring_ipv4(&host, Some(port)).await
-                && !is_dns_fake_ip(&addr)
+            match budget
+                .resolve_host(
+                    &host,
+                    port,
+                    super::super::upstream::AddressSelection::PreferIpv4,
+                )
+                .await
             {
-                break 'addr addr;
+                Ok(address) if !is_dns_fake_ip(&address) => break 'addr address,
+                Ok(_) => {}
+                Err(error) => last_resolution_error = Some(error),
             }
             debug!(
                 "prod app dynamic naming unresolved or unreachable, falling back to registry: app_id={}, host={host}",
                 app_id
             );
         }
-        if let Some(host) = app_backends.get(&(app_id.to_string(), shared_types::APP_ENTRY_PORT)) {
-            // 回退一：lookup 未注入/动态名解析失败——注册表直查（受理副本内存态，
-            // 注册值历史上是 IPv4 字面量，直接拼端口解析）
-            if let Some(addr) = try_parse(host.value(), shared_types::APP_ENTRY_PORT)? {
-                break 'addr addr;
+        // Snapshot owned values before DNS await: no DashMap Ref is retained.
+        let mut fallback = Vec::new();
+        if let Some(entry) = registered
+            .iter()
+            .find(|entry| entry.0 == shared_types::APP_ENTRY_PORT)
+        {
+            fallback.push(entry);
+        }
+        if registered.len() == 1 {
+            fallback.push(&registered[0]);
+        }
+        for (port, host) in fallback {
+            match budget
+                .registered_address(
+                    host,
+                    *port,
+                    super::super::upstream::AddressSelection::FirstResolved,
+                )
+                .await
+            {
+                Ok(address) => break 'addr address,
+                Err(error) => {
+                    // A missing published-port mapping retains its existing 503
+                    // contract; DNS failures may try the original next fallback.
+                    if error.etype() == &pingora_core::ErrorType::HTTPStatus(503) {
+                        return Err(error);
+                    }
+                    last_resolution_error = Some(error);
+                }
             }
         }
-        // 回退二：该 app 恰只有一个已注册端口（自定义端口防御分支）
-        let mut candidates = app_backends.iter().filter(|e| e.key().0 == app_id);
-        if let (Some(e), None) = (candidates.next(), candidates.next()) {
-            let port = e.key().1;
-            debug!(
-                "prod app fallback to sole registered port: app_id={}, port={}",
-                app_id, port
-            );
-            if let Some(addr) = try_parse(e.value(), port)? {
-                break 'addr addr;
-            }
-        }
-        error!(
-            "prod app backend unresolvable: app_id={} (dynamic naming unresolved, not registered)",
-            app_id
-        );
-        return Err(pingora_core::Error::new(
-            pingora_core::ErrorType::HTTPStatus(502),
-        ));
+        error!("prod app backend unresolvable: app_id={}", app_id);
+        return Err(last_resolution_error.unwrap_or_else(|| {
+            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(502))
+                .more_context(format!("prod app backend unresolvable: app_id={app_id}"))
+        }));
     };
 
     ctx.target_port = Some(resolved_addr.port());
@@ -166,39 +181,10 @@ pub async fn handle_prod_app_upstream(
     debug!("prod app route: app_id={}, {}", app_id, resolved_addr);
 
     // 创建 HTTP Peer（长连接配置，支持 WebSocket / HMR；idle 1 小时）
-    let mut peer = HttpPeer::new(resolved_addr, false, "".to_string());
+    let mut peer = budget.peer(resolved_addr, false, String::new())?;
     super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
 
     Ok(Box::new(peer))
-}
-
-/// 主机名/IP 解析为具体 SocketAddr，**IPv4 优先、IPv6 兜底**（双栈支持）。
-///
-/// Docker 网络（OrbStack 等）的容器名 DNS 解析常返回 v6 优先（fd07:: ULA），
-/// 而应用容器普遍仅监听 `0.0.0.0`（v4）——v6 目标连不上 v4 监听；v4 优先
-/// 规避该错配，v6-only 环境仍可用。IP 字面量（v4/v6）parse 直接构造零 DNS。
-/// `port` 为 None 时仅解析地址（端口置 0，由调用方改写）。
-async fn resolve_preferring_ipv4(host: &str, port: Option<u16>) -> Option<std::net::SocketAddr> {
-    // IP 字面量（含 v6）：parse 判定，零 DNS 开销
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return Some(std::net::SocketAddr::new(ip, port.unwrap_or(0)));
-    }
-    // 名字：异步解析（hot path 不阻塞 worker），结果集 IPv4 优先
-    let addrs: Vec<_> = tokio::net::lookup_host((host, port.unwrap_or(0)))
-        .await
-        .ok()?
-        .collect();
-    addrs
-        .iter()
-        .find(|a| a.is_ipv4())
-        .or_else(|| addrs.first())
-        .map(|a| {
-            let mut addr = *a;
-            if let Some(p) = port {
-                addr.set_port(p);
-            }
-            addr
-        })
 }
 
 /// 是否 DNS 合成假 IP（RFC 2544 benchmark 段 198.18.0.0/15）。
@@ -245,12 +231,27 @@ mod tests {
     /// 字面量直返（v4/v6 家族保留、端口透传/缺省 0），不依赖 DNS。
     #[tokio::test]
     async fn resolve_preferring_ipv4_literal_passthrough() {
-        let a = resolve_preferring_ipv4("192.168.97.9", Some(9080)).await;
+        let budget = super::super::super::upstream::ConnectBudget::streaming();
+        let a = budget
+            .resolve_host(
+                "192.168.97.9",
+                9080,
+                super::super::super::upstream::AddressSelection::PreferIpv4,
+            )
+            .await
+            .ok();
         assert_eq!(
             a,
             Some("192.168.97.9:9080".parse::<std::net::SocketAddr>().unwrap())
         );
-        let b = resolve_preferring_ipv4("fd07::1", None).await;
+        let b = budget
+            .resolve_host(
+                "fd07::1",
+                0,
+                super::super::super::upstream::AddressSelection::PreferIpv4,
+            )
+            .await
+            .ok();
         assert_eq!(b.map(|x| x.port()), Some(0));
     }
 }

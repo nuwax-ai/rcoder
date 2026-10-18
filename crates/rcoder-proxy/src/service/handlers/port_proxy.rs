@@ -132,7 +132,8 @@ pub async fn handle_port_proxy_upstream(
     // 即 ConnectRefused，Forward 重写永无执行机会）。命中远端宿主 → 记
     // preview_peer/preview_rewrite 并返回宿主 Pingora 面 peer；本机/未命中/
     // 存储不可用 → 落到下方既有本机路径（行为与现状一致）。
-    if let Some(deps) = preview_slot.load().as_ref()
+    let preview_dependencies = preview_slot.load_full();
+    if let Some(deps) = preview_dependencies.as_ref()
         && let PreviewRouteResolution::Forward {
             instance_id,
             port: preview_port,
@@ -151,7 +152,9 @@ pub async fn handle_port_proxy_upstream(
         // host_ip 是协调器解析出的对等副本 Pod IP（IP 字面量，非 agent 注册
         // 表键）——直连不经 dial_peer（误接会把 Pod IP 当键查表回退
         // 127.0.0.1，preview_forward_tests 实测暴露）
-        let mut peer = HttpPeer::new((host_ip.as_str(), peer_port), false, "".to_string());
+        let mut peer = super::super::upstream::ConnectBudget::streaming()
+            .direct_peer(&host_ip, peer_port, false, String::new())
+            .await?;
         super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
         ctx.upstream_host = Some(host_ip);
         // 与 legacy 分支同款指标——response 阶段无条件 dec_active，此处不补
@@ -178,11 +181,7 @@ pub async fn handle_port_proxy_upstream(
     debug!("route: {}:{}", resolved_host, target_port);
 
     // 创建 HTTP Peer
-    let mut peer = HttpPeer::new(
-        super::super::upstream::dial_peer(&resolved_host, target_port)?,
-        false,          // 不使用 TLS
-        "".to_string(), // SNI
-    );
+    let mut peer = super::super::upstream::dial_peer(&resolved_host, target_port).await?;
 
     // 端口代理长连接优化配置（支持 WebSocket、Vite HMR 等）
     // 与音频/IME WebSocket 场景保持一致（idle 1 小时）

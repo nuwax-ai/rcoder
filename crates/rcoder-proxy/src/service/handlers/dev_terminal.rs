@@ -260,11 +260,8 @@ pub async fn handle_dev_ttyd_upstream(
     );
 
     // 与 computer 族同款 peer（WebSocket 长连接优化）
-    let mut peer = HttpPeer::new(
-        super::super::upstream::dial_peer(&container_ip, shared_types::WS_TERMINAL_PORT)?,
-        false,
-        "".to_string(),
-    );
+    let mut peer =
+        super::super::upstream::dial_peer(&container_ip, shared_types::WS_TERMINAL_PORT).await?;
     super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
     Ok(Box::new(peer))
 }
@@ -318,11 +315,8 @@ pub async fn handle_dev_vnc_upstream(
         shared_types::NOVNC_PORT
     );
 
-    let mut peer = HttpPeer::new(
-        super::super::upstream::dial_peer(&container_ip, shared_types::NOVNC_PORT)?,
-        false,
-        "".to_string(),
-    );
+    let mut peer =
+        super::super::upstream::dial_peer(&container_ip, shared_types::NOVNC_PORT).await?;
     super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
     Ok(Box::new(peer))
 }
@@ -384,16 +378,14 @@ pub async fn handle_dev_audio_upstream(
         error!("[DEV_AUDIO] upstream_host missing (request phase failed?)");
         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(502))
     })?;
-    let addr = host.parse::<std::net::SocketAddr>().map_err(|e| {
-        error!("[DEV_AUDIO] parse upstream_host {host}: {e}");
-        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(502))
-    })?;
     if !ctx.dev_metrics_counted {
         metrics.inc_active();
         ctx.dev_metrics_counted = true;
     }
 
-    let mut peer = HttpPeer::new(addr, false, "".to_string());
+    let mut peer = super::super::upstream::ConnectBudget::streaming()
+        .peer_from_addr(&host)
+        .await?;
     super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
     Ok(Box::new(peer))
 }
@@ -445,16 +437,14 @@ pub async fn handle_dev_ime_upstream(
         error!("[DEV_IME] upstream_host missing (request phase failed?)");
         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(502))
     })?;
-    let addr = host.parse::<std::net::SocketAddr>().map_err(|e| {
-        error!("[DEV_IME] parse upstream_host {host}: {e}");
-        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(502))
-    })?;
     if !ctx.dev_metrics_counted {
         metrics.inc_active();
         ctx.dev_metrics_counted = true;
     }
 
-    let mut peer = HttpPeer::new(addr, false, "".to_string());
+    let mut peer = super::super::upstream::ConnectBudget::streaming()
+        .peer_from_addr(&host)
+        .await?;
     super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
     Ok(Box::new(peer))
 }
@@ -559,11 +549,8 @@ pub async fn handle_runtime_ttyd_upstream(
         shared_types::TTYD_PORT
     );
 
-    let mut peer = HttpPeer::new(
-        super::super::upstream::dial_peer(&container_addr, shared_types::TTYD_PORT)?,
-        false,
-        "".to_string(),
-    );
+    let mut peer =
+        super::super::upstream::dial_peer(&container_addr, shared_types::TTYD_PORT).await?;
     // 终端会话可长开；与开发域 ttyd 同档（idle 1 小时）
     super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
     Ok(Box::new(peer))

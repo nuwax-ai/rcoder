@@ -113,7 +113,7 @@ pub async fn handle_ime_upstream(
     ctx.vnc_target_ip = Some(container_ip.clone());
 
     let peer_addr = super::super::upstream::dial_addr(&container_ip, IME_PORT)?;
-    let mut peer = Box::new(HttpPeer::new(peer_addr.clone(), false, "".to_string()));
+    let mut peer = Box::new(super::super::upstream::dial_peer(&container_ip, IME_PORT).await?);
 
     // IME WebSocket 长连接优化配置（idle 1 小时）
     super::streaming_peer_options(&mut peer, Duration::from_secs(3600));

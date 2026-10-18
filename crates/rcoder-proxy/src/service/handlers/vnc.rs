@@ -134,11 +134,7 @@ pub async fn handle_vnc_upstream(
 
     // 创建 HTTP Peer 到容器的 noVNC 端口
     // Pingora 会自动处理 WebSocket upgrade
-    let mut peer = HttpPeer::new(
-        super::super::upstream::dial_peer(&container_ip, NOVNC_PORT)?,
-        false,          // 不使用 TLS
-        "".to_string(), // SNI
-    );
+    let mut peer = super::super::upstream::dial_peer(&container_ip, NOVNC_PORT).await?;
 
     // VNC WebSocket 长连接优化配置（idle 1 小时）
     super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
