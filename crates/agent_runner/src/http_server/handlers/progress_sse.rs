@@ -24,10 +24,10 @@ use chrono::Utc;
 use futures_util::stream::Stream;
 use tracing::{error, info, warn};
 
-use crate::service::{AGENT_REGISTRY, SESSION_CACHE};
+use crate::service::{AGENT_REGISTRY, SESSION_CACHE, require_cache_session_id};
 use shared_types::{
     AgentStatus, HttpResult, SessionMessageType, UnifiedSessionMessage,
-    error_codes::{ERR_INTERNAL_SERVER_ERROR, ERR_SESSION_NOT_FOUND},
+    error_codes::{ERR_INTERNAL_SERVER_ERROR, ERR_SESSION_NOT_FOUND, ERR_VALIDATION},
     get_i18n_message,
 };
 
@@ -134,6 +134,15 @@ pub(crate) async fn progress_sse(
     log_prefix: &'static str,
 ) -> ProgressResponse {
     let locale = locale_from_headers(&headers);
+    if let Err(error) = require_cache_session_id(&session_id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(Box::new(HttpResult::error(
+                ERR_VALIDATION,
+                &error.to_string(),
+            ))),
+        ));
+    }
 
     // 0. 检查 Agent 状态（必须在 SESSION_CACHE 查找之前检查）
     // 只有当 Agent 确实存在且处于 Idle 状态时，才发送 SessionPromptEnd

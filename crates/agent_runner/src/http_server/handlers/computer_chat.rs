@@ -9,8 +9,7 @@ use tracing::{error, info};
 use crate::http_server::router::AppState;
 use crate::service::AGENT_REGISTRY;
 use crate::service::chat_handler::{ChatHandlerContext, ChatHandlerInput, handle_chat_core};
-use crate::service::{SESSION_CACHE, SessionData};
-use dashmap::mapref::entry::Entry;
+use crate::service::get_or_create_session_data;
 use shared_types::{
     ChatResponse, ComputerChatRequest, HttpResult, I18nJsonOrQuery, ServiceType,
     error_codes::ERR_INTERNAL_SERVER_ERROR, error_codes::ERR_VALIDATION, get_i18n_message,
@@ -174,22 +173,15 @@ pub(crate) async fn handle_computer_chat_internal(
     // 8. 调用核心 Chat 处理逻辑
     let output = handle_chat_core(input, &context).await;
 
-    // 🔧 关键修复：将 session 写入 SESSION_CACHE（SSE 进度流需要从这里读取）
-    // 🛡️ 关键修复：不在 DashMap entry() 持锁范围内调用 .await
-    // 仅成功且有有效 session_id 时才写入,避免预检失败/prepare 失败时创建 SESSION_CACHE[""]
-    let session_id_str = output.session_id.clone();
-    if output.success && !session_id_str.is_empty() && !SESSION_CACHE.contains_key(&session_id_str)
-    {
-        let data = SessionData::new(crate::service::RING_BUFFER_SIZE).await;
-        match SESSION_CACHE.entry(session_id_str.clone()) {
-            Entry::Occupied(_entry) => {
-                // 其他任务已创建，丢弃我们创建的 data
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(data);
-            }
-        }
-    };
+    // The task was already accepted: preserve its outcome, never replay the prompt.
+    if output.success {
+        get_or_create_session_data(&output.session_id).await.map_err(|error| {
+            shared_types::AppError::with_message(
+                shared_types::error_codes::ERR_AGENT_ERROR,
+                format!("Session cache registration failed after task acceptance: {error}; do not automatically replay the prompt"),
+            )
+        })?;
+    }
 
     // 9. 构建响应
     let response = ChatResponse {

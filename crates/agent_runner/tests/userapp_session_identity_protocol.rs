@@ -286,6 +286,220 @@ async fn invalid_acp_session_id_is_rejected_before_prompt_and_reaped_before_retr
 }
 
 #[tokio::test]
+async fn early_acp_notification_cannot_publish_state_labels_before_a_real_session_exists() {
+    for invalid in ["pending", ""] {
+        let root = tempfile::tempdir().unwrap();
+        let service = Arc::new(service(root.path(), 10).await);
+        let project = format!("protocol-early-state-{}", uuid::Uuid::new_v4());
+        std::fs::write(
+            root.path().join(format!("{project}.early-notification-id")),
+            invalid,
+        )
+        .unwrap();
+        let released = root
+            .path()
+            .join(format!("{project}.early-notification-release"));
+        let _release_on_failure = FixtureExitBarrier(released.clone());
+        let request = chat(root.path(), &project, "", false, "hold-valid-session");
+        let running = service.clone();
+        let response = tokio::spawn(async move {
+            running
+                .chat(Request::new(request))
+                .await
+                .unwrap()
+                .into_inner()
+        });
+        wait_row(root.path(), "early_notifications_sent", &project, 1).await;
+        let expected_sid = rows(root.path())
+            .iter()
+            .find(|row| row["event"] == "spawn")
+            .unwrap()["session"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // The real SDK awaits notification handlers in wire order. Observing
+        // the second, valid notification proves the earlier invalid one was
+        // processed while session/new is still held at its response barrier.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(data) =
+                    agent_runner::service::SESSION_CACHE.view(&expected_sid, |_, data| data.clone())
+                    && data.message_count().await > 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let bad_cache_published = agent_runner::service::SESSION_CACHE.contains_key(invalid);
+        let premature_route = AGENT_REGISTRY.get_session_by_project(&project);
+        let replied_before_identity = response.is_finished();
+        std::fs::write(released, "release").unwrap();
+        let result = response.await.unwrap();
+        assert!(
+            result.success,
+            "a bad early notification must not block a real session: {result:?}"
+        );
+        wait_row(root.path(), "prompt", &project, 1).await;
+        stop(&service, &project, &result.session_id).await;
+        let bad_cache_after_stop = agent_runner::service::SESSION_CACHE.contains_key(invalid);
+        // Failure cleanup for the deliberately unfixed RED baseline only.
+        agent_runner::service::SESSION_CACHE.remove(invalid);
+        assert!(
+            !bad_cache_published && !bad_cache_after_stop,
+            "early ACP state label entered session cache"
+        );
+        assert_eq!(
+            premature_route, None,
+            "a notification is not a committed session identity"
+        );
+        assert!(
+            !replied_before_identity,
+            "chat cannot succeed before ACP session/new replies"
+        );
+        assert_eq!(result.session_id, expected_sid);
+        assert_eq!(
+            rows(root.path())
+                .iter()
+                .filter(|row| row["event"] == "prompt")
+                .count(),
+            1
+        );
+        assert!(owned_live_fixture_children().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn progress_subscription_rejects_unassigned_identity_without_touching_legacy_cache() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(root.path(), 10).await;
+    for invalid in ["", "pending"] {
+        let legacy = agent_runner::service::SessionData::new(16).await;
+        agent_runner::service::SESSION_CACHE.insert(invalid.to_owned(), legacy.clone());
+        let result = service
+            .subscribe_progress(Request::new(ProgressRequest {
+                session_id: invalid.to_owned(),
+                ..Default::default()
+            }))
+            .await;
+        let code = match result {
+            Err(error) => Some(error.code()),
+            Ok(response) => {
+                drop(response);
+                None
+            }
+        };
+        assert_eq!(code, Some(tonic::Code::InvalidArgument));
+        assert!(
+            agent_runner::service::SESSION_CACHE
+                .view(invalid, |_, current| Arc::ptr_eq(current, &legacy))
+                .unwrap_or(false)
+        );
+        assert_eq!(legacy.message_count().await, 0);
+        agent_runner::service::SESSION_CACHE
+            .remove_if(invalid, |_, current| Arc::ptr_eq(current, &legacy));
+    }
+}
+
+#[tokio::test]
+async fn early_foreign_notification_cannot_mutate_another_live_project() {
+    let root = tempfile::tempdir().unwrap();
+    let service = Arc::new(service(root.path(), 10).await);
+    let first_project = format!("protocol-notification-owner-{}", uuid::Uuid::new_v4());
+    let first = service
+        .chat(Request::new(chat(
+            root.path(),
+            &first_project,
+            "",
+            false,
+            "hold",
+        )))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(first.success, "original owner: {first:?}");
+    wait_row(root.path(), "prompt", &first_project, 1).await;
+    let original = AGENT_REGISTRY
+        .view_agent_info(&first_project, Clone::clone)
+        .unwrap();
+    let cache = agent_runner::service::SESSION_CACHE
+        .view(&first.session_id, |_, data| data.clone())
+        .unwrap();
+    let before = cache.message_count().await;
+    assert!(before > 0);
+    let second_project = format!("protocol-notification-other-{}", uuid::Uuid::new_v4());
+    std::fs::write(
+        root.path()
+            .join(format!("{second_project}.early-notification-id")),
+        &first.session_id,
+    )
+    .unwrap();
+    let release = root
+        .path()
+        .join(format!("{second_project}.early-notification-release"));
+    let _release_on_failure = FixtureExitBarrier(release.clone());
+    let running = service.clone();
+    let request = chat(root.path(), &second_project, "", false, "hold-second-owner");
+    let pending = tokio::spawn(async move {
+        running
+            .chat(Request::new(request))
+            .await
+            .unwrap()
+            .into_inner()
+    });
+    wait_row(root.path(), "early_notifications_sent", &second_project, 1).await;
+    let second_sid = rows(root.path())
+        .iter()
+        .find(|row| row["event"] == "spawn" && row["project"] == second_project)
+        .unwrap()["session"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(data) =
+                agent_runner::service::SESSION_CACHE.view(&second_sid, |_, data| data.clone())
+                && data.message_count().await > 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let after_foreign_notification = cache.message_count().await;
+    let still_original = AGENT_REGISTRY
+        .view_agent_info(&first_project, |current| {
+            current.cancel_tx.same_channel(&original.cancel_tx)
+                && current.prompt_tx.same_channel(&original.prompt_tx)
+        })
+        .unwrap_or(false);
+    std::fs::write(release, "release").unwrap();
+    let second = pending.await.unwrap();
+    assert!(
+        second.success,
+        "rejecting an unrelated notification must not block the valid new session: {second:?}"
+    );
+    wait_row(root.path(), "prompt", &second_project, 1).await;
+    stop(&service, &second_project, &second.session_id).await;
+    let first_still_live = !original.stop_handle.as_ref().unwrap().is_stopped();
+    let live_after_second_stop = owned_live_fixture_children().len();
+    stop(&service, &first_project, &first.session_id).await;
+    assert_eq!(
+        after_foreign_notification, before,
+        "SDK notification from another project entered a proven live owner's cache"
+    );
+    assert!(still_original && first_still_live);
+    assert_eq!(live_after_second_stop, 1);
+    assert_ne!(second.session_id, first.session_id);
+    assert_eq!(second.session_id, second_sid);
+    assert!(owned_live_fixture_children().is_empty());
+}
+
+#[tokio::test]
 async fn legacy_unroutable_execution_remains_stoppable_and_recovers_without_loading_state_labels() {
     for mode in ["stop", "run", "auto-reload"] {
         let root = tempfile::tempdir().unwrap();

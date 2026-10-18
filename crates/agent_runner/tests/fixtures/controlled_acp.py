@@ -108,6 +108,15 @@ for line in sys.stdin:
             session = message['params']['sessionId']
         elif (root / (project + '.new-session-id')).exists():
             session = (root / (project + '.new-session-id')).read_text()
+        early = root / (project + '.early-notification-id')
+        if method == 'session/new' and early.exists():
+            for sid in [early.read_text(), session]:
+                send({'jsonrpc': '2.0', 'method': 'session/update', 'params': {
+                    'sessionId': sid, 'update': {
+                        'sessionUpdate': 'available_commands_update', 'availableCommands': []}}})
+            log('early_notifications_sent')
+            while not (root / (project + '.early-notification-release')).exists():
+                time.sleep(0.01)
         log('load' if method == 'session/load' else 'new', params=message['params'])
         send({'jsonrpc': '2.0', 'id': message['id'], 'result': {'sessionId': session}})
     elif method == 'session/prompt':

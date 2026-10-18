@@ -13,8 +13,10 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, info, instrument, warn};
 
 use crate::router::AppState;
+#[cfg(test)]
 use crate::service::SESSION_CACHE;
 use crate::service::agent_registry::AGENT_REGISTRY;
+use crate::service::{get_or_create_session_data, require_cache_session_id};
 
 use super::locale::locale_from_grpc_request;
 
@@ -77,6 +79,11 @@ pub async fn subscribe_progress(
     shared_types::scope_request_locale(locale, async move {
         let req = request.into_inner();
         let session_id = req.session_id.clone();
+        require_cache_session_id(&session_id)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let session_data = get_or_create_session_data(&session_id)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
         // 订阅方的消费游标：只回放 seq > from_seq 的消息（增量补齐）。
         // 缺省（None / 0）= 全量回放（向后兼容）。
         let from_seq = req.from_seq.unwrap_or(0);
@@ -93,45 +100,6 @@ pub async fn subscribe_progress(
         // 关=直通 tokio::spawn）。locale 已显式捕获进闭包、连接清理
         // （close_connection）与取消 token 逻辑不变。
         rcoder_obs::spawn(async move {
-            use dashmap::mapref::entry::Entry;
-
-            info!(
-                "[gRPC] Looking up session in SESSION_CACHE: session_id={}",
-                session_id_clone
-            );
-            // 🛡️ 关键修复：不在 DashMap entry() 持锁范围内调用 .await
-            // view() 在闭包返回后立即释放锁，无 Ref 暴露
-            let session_data = if let Some(existing) = SESSION_CACHE.view(&session_id_clone, |_, d| d.clone()) {
-                info!(
-                    "[gRPC] SESSION_CACHE found, reusing: session_id={}",
-                    session_id_clone
-                );
-                existing
-            } else {
-                info!(
-                    "[gRPC] SESSION_CACHE not found, creating new SessionData: session_id={}",
-                    session_id_clone
-                );
-                let session_data = crate::service::SessionData::new(crate::service::RING_BUFFER_SIZE).await;
-                match SESSION_CACHE.entry(session_id_clone.clone()) {
-                    Entry::Occupied(entry) => {
-                        info!(
-                            "[gRPC] SESSION_CACHE exists after creation, reusing: session_id={}",
-                            session_id_clone
-                        );
-                        entry.get().clone()
-                    }
-                    Entry::Vacant(entry) => {
-                        info!(
-                            "[gRPC] SESSION_CACHE created successfully: session_id={}",
-                            session_id_clone
-                        );
-                        entry.insert(session_data.clone());
-                        session_data
-                    }
-                }
-            };
-
             info!(
                 "[gRPC] Creating new SSE connection: session_id={}",
                 session_id_clone

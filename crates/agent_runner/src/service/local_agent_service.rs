@@ -19,9 +19,9 @@ use tracing::{info, warn};
 
 use crate::grpc::remove_agent_and_cleanup;
 use crate::service::{
-    AGENT_REGISTRY, AgentSessionService, SESSION_CACHE, SessionData,
+    AGENT_REGISTRY, AgentSessionService, SESSION_CACHE,
     chat_handler::{ChatHandlerContext, ChatHandlerInput},
-    handle_chat_core,
+    get_or_create_session_data, handle_chat_core,
 };
 
 /// Agent Runner 本地服务实现
@@ -184,25 +184,16 @@ impl AgentHttpService for LocalAgentHttpService {
             );
         }
 
-        // 8. 将 session 写入 SESSION_CACHE（SSE 进度流需要）
-        // 🛡️ 关键修复：不在 DashMap entry() 持锁范围内调用 .await
-        // 仅成功且有有效 session_id 时才写入,避免预检失败/prepare 失败时创建 SESSION_CACHE[""]
-        let session_id_str = output.session_id.clone();
+        // Cache creation uses the same identity boundary as notifications and gRPC.
         if output.success
-            && SessionHint::classify(Some(&session_id_str))
-                .as_session_id()
-                .is_some()
-            && !SESSION_CACHE.contains_key(&session_id_str)
+            && let Err(error) = get_or_create_session_data(&output.session_id).await
         {
-            let session_data = SessionData::new(super::RING_BUFFER_SIZE).await;
-            match SESSION_CACHE.entry(session_id_str) {
-                dashmap::mapref::entry::Entry::Occupied(_) => {
-                    // 其他任务已创建，丢弃我们创建的 session_data
-                }
-                dashmap::mapref::entry::Entry::Vacant(entry) => {
-                    entry.insert(session_data);
-                }
-            }
+            return HttpResult::error(
+                shared_types::error_codes::ERR_AGENT_ERROR,
+                &format!(
+                    "Session cache registration failed after task acceptance: {error}; do not automatically replay the prompt"
+                ),
+            );
         }
 
         // 9. 构建响应
@@ -397,6 +388,7 @@ impl AgentHttpService for LocalAgentHttpService {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::service::SessionData;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::sync::{Notify, mpsc};

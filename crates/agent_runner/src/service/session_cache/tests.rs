@@ -438,3 +438,144 @@ async fn cancellation_interrupts_a_backpressured_enqueue() {
             .all(|(_, message)| message.sub_type == "queued")
     );
 }
+
+fn identity_boundary_notify(sid: &str) -> SessionNotify {
+    SessionNotify::SessionPromptStart(shared_types::SessionPromptStart {
+        session_id: sid.to_owned(),
+        request_id: Some("cache-identity-protocol".into()),
+    })
+}
+
+#[tokio::test]
+async fn historical_owner_indexes_and_closed_entries_do_not_block_notification_buffering() {
+    for retain_closed_entry in [false, true] {
+        let owner = format!("historical-buffer-owner-{}", uuid::Uuid::new_v4());
+        let source = format!("historical-buffer-source-{}", uuid::Uuid::new_v4());
+        let sid = format!("historical-buffer-session-{}", uuid::Uuid::new_v4());
+        AGENT_REGISTRY.register(&owner, &sid, make_agent_info(&owner, &sid));
+        if !retain_closed_entry {
+            AGENT_REGISTRY.inner_mut().remove(&owner);
+        }
+        push_session_update_with_project(&source, &sid, identity_boundary_notify(&sid))
+            .await
+            .unwrap();
+        let cache = SESSION_CACHE.view(&sid, |_, cache| cache.clone()).unwrap();
+        assert_eq!(cache.message_count().await, 1);
+        assert_eq!(
+            AGENT_REGISTRY.get_project_by_session(&sid).as_deref(),
+            Some(owner.as_str())
+        );
+        assert_eq!(AGENT_REGISTRY.get_session_by_project(&source), None);
+        SESSION_CACHE.remove(&sid);
+        AGENT_REGISTRY.remove_by_project(&owner);
+    }
+}
+
+#[tokio::test]
+async fn no_session_identity_cannot_create_a_notification_cache() {
+    for sid in ["", "pending"] {
+        assert!(!SESSION_CACHE.contains_key(sid));
+        let direct = push_session_update(sid, identity_boundary_notify(sid)).await;
+        let projected = push_session_update_with_project(
+            "cache-identity-unregistered-project",
+            sid,
+            identity_boundary_notify(sid),
+        )
+        .await;
+        let observed = SESSION_CACHE.view(sid, |_, data| data.clone());
+        // Failure cleanup only removes the cache created by this isolated test.
+        // Capture all evidence first; cleanup cannot make the assertion pass.
+        if let Some(data) = &observed {
+            data.close_all_connections();
+            SESSION_CACHE.remove_if(sid, |_, current| Arc::ptr_eq(current, data));
+        }
+        assert!(
+            direct.is_err(),
+            "direct writer accepted absent identity {sid:?}"
+        );
+        assert!(
+            projected.is_err(),
+            "project writer accepted absent identity {sid:?}"
+        );
+        assert!(observed.is_none(), "writer allocated cache for {sid:?}");
+    }
+
+    for payload_sid in ["", "pending", "another-real-session"] {
+        let target_sid = format!("cache-checked-target-{}", uuid::Uuid::new_v4());
+        let result = push_session_update_with_project(
+            "cache-identity-payload-project",
+            &target_sid,
+            identity_boundary_notify(payload_sid),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "payload identity bypassed target validation"
+        );
+        assert!(!SESSION_CACHE.contains_key(&target_sid));
+    }
+    let sink = SessionData::new(8).await;
+    for sid in ["", "pending"] {
+        let message = identity_boundary_notify(sid).to_unified_message();
+        assert!(sink.push_message(message.clone()).await.is_err());
+        assert!(sink.push_captured_terminal(message, &[]).await.is_err());
+    }
+    assert_eq!(sink.message_count().await, 0);
+}
+
+#[tokio::test]
+async fn invalid_new_notification_preserves_legacy_cache_without_writing_or_deleting_it() {
+    for sid in ["", "pending"] {
+        assert!(!SESSION_CACHE.contains_key(sid));
+        let historical = SessionData::new(8).await;
+        // Reconstruct old bytes beneath the public writer, as an old process
+        // could have already done. New production admission must not erase them.
+        historical
+            .command_tx
+            .send(SessionCommand::Push {
+                message: identity_boundary_notify(sid).to_unified_message(),
+                connection_ids: None,
+            })
+            .await
+            .unwrap();
+        let before = historical.replay_since(0).await;
+        SESSION_CACHE.insert(sid.into(), historical.clone());
+        let result = push_session_update_with_project(
+            "cache-identity-legacy-project",
+            sid,
+            identity_boundary_notify(sid),
+        )
+        .await;
+        let same = SESSION_CACHE.view(sid, |_, data| Arc::ptr_eq(data, &historical));
+        let after = historical.replay_since(0).await;
+        SESSION_CACHE.remove_if(sid, |_, data| Arc::ptr_eq(data, &historical));
+        assert!(
+            result.is_err(),
+            "new write reused legacy absent identity {sid:?}"
+        );
+        assert_eq!(same, Some(true), "legacy cache was removed or replaced");
+        assert_eq!(
+            serde_json::to_value(&after).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn notification_cache_preserves_valid_opaque_session_identity_exactly() {
+    for prefix in ["pending-session", "Pending", " pending", "opaque/会话:7"] {
+        let sid = format!("{prefix}-{}", uuid::Uuid::new_v4());
+        push_session_update_with_project(
+            "cache-identity-opaque-project",
+            &sid,
+            identity_boundary_notify(&sid),
+        )
+        .await
+        .unwrap();
+        let data = SESSION_CACHE.view(&sid, |_, data| data.clone()).unwrap();
+        let messages = data.replay_since(0).await;
+        SESSION_CACHE.remove_if(&sid, |_, current| Arc::ptr_eq(current, &data));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].1.session_id, sid);
+    }
+}
