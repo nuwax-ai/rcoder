@@ -5,6 +5,7 @@ use crate::userapp_builder::creation::fence_settler_tests::{
 use shared_types::*;
 use std::sync::{Arc, atomic::Ordering};
 
+mod handoff_attempt_tests;
 mod previous_owner_tests;
 
 async fn seed(state: &AppState, name: &str, bound: bool, unknown: bool) -> ComputeControlRecord {
@@ -167,7 +168,28 @@ async fn early_recovery_retains_held_foreign_and_unobserved_receipts_then_retrie
         .compute_release_succeeds
         .store(true, Ordering::SeqCst);
     let state = runtime_state(runtime.clone(), store.clone(), None).await;
-    let original = seed(&state, "inspection", true, false).await;
+    let seeded = seed(&state, "inspection", true, false).await;
+    // This case exercises an already-fenced, failed owner. A normal Running
+    // holder is instead preserved by the real-FD concurrency regressions.
+    let original = store
+        .advance_compute_control(&ComputeControlProgress {
+            identity: ComputeExecutorIdentity {
+                app_id: seeded.app_id.clone(),
+                lifecycle_id: seeded.lifecycle_id.clone(),
+                scope: seeded.scope,
+                operation_id: seeded.operation_id.clone(),
+                generation: seeded.generation,
+                executor_id: seeded.executor_id.clone().unwrap(),
+            },
+            expected_revision: seeded.revision,
+            state: ComputeControlState::RecoveryRequired,
+            stage: ComputeControlStage::DrainingPrevious,
+            checkpoint: seeded.checkpoint.clone(),
+            error_code: Some("INTERRUPTED_PREPARE".into()),
+            error_message: Some("Original owner failed before binding completed".into()),
+        })
+        .await
+        .unwrap();
     let mut snapshot = original.clone();
     for (verdict, transport, code) in [
         (ComputeLeaseInspection::Held, false, "COMPUTE_LEASE_HELD"),

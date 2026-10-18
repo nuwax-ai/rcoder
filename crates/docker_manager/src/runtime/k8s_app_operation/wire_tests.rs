@@ -11,6 +11,9 @@ mod hot_lease_tests;
 #[path = "observed_expired_tests.rs"]
 mod observed_expired_tests;
 
+#[path = "handoff_wire_tests.rs"]
+mod handoff_wire_tests;
+
 fn runtime_for(client: kube::Client) -> KubernetesRuntime {
     use crate::runtime::kubernetes_runtime::{KubernetesRuntime, KubernetesRuntimeConfig};
     KubernetesRuntime {

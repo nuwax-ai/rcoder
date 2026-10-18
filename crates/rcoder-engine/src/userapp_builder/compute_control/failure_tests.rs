@@ -41,6 +41,9 @@ struct Runtime {
     lose_prepare_reply: AtomicBool,
     lost_prepare_context: Mutex<Option<UserAppExecutionContext>>,
     lease_inspections: AtomicUsize,
+    prepare_gate: Mutex<Option<Arc<active_executor::PrepareGate>>>,
+    handoff_error: AtomicBool,
+    handoff_supersede: Mutex<Option<(Arc<dyn UserAppLifecycleStore>, ComputeControlRequest)>>,
     retry_allowed: AtomicBool,
     retry_observed: tokio::sync::Notify,
     capture_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Semaphore>)>>,
@@ -88,6 +91,7 @@ fn receipt(context: &UserAppExecutionContext) -> UserAppOperationLeaseReceipt {
 struct Lease {
     calls: Arc<Calls>,
     receipt: UserAppOperationLeaseReceipt,
+    physical: Option<std::fs::File>,
 }
 
 #[async_trait::async_trait]
@@ -97,13 +101,18 @@ impl AppOperationLease for Lease {
     }
 
     async fn release(self: Box<Self>) -> Result<(), String> {
-        assert_eq!(
-            *self.calls.receipt.lock().unwrap(),
-            Some(self.receipt.clone())
-        );
+        if self.physical.is_none() {
+            assert_eq!(
+                *self.calls.receipt.lock().unwrap(),
+                Some(self.receipt.clone())
+            );
+        }
         self.calls.release_attempts.fetch_add(1, Ordering::SeqCst);
         if self.calls.fail_release.load(Ordering::SeqCst) {
             return Err(RELEASE_FAILURE.into());
+        }
+        if let Some(file) = &self.physical {
+            file.unlock().map_err(|error| error.to_string())?;
         }
         self.calls
             .released_receipts
@@ -171,6 +180,15 @@ impl WorkspaceRuntime for Runtime {}
 
 #[async_trait::async_trait]
 impl UserAppDeploymentRuntime for Runtime {
+    async fn discover_application_identity(
+        &self,
+        _: &str,
+    ) -> ContainerRuntimeResult<Option<UserAppDiscoveredIdentity>> {
+        // This controlled runtime has no external discovery inventory. The
+        // actual lifecycle store in fresh_state owns the fixture application.
+        Ok(None)
+    }
+
     async fn list_deployments(
         &self,
     ) -> ContainerRuntimeResult<Vec<container_runtime_api::DeploymentStatus>> {
@@ -213,9 +231,15 @@ impl UserAppDeploymentRuntime for Runtime {
             *self.lost_prepare_context.lock().unwrap() = Some(context.clone());
             return Err(ContainerRuntimeError::K8sError(LOST_PREPARE.into()));
         }
+        let prepare_gate = self.prepare_gate.lock().unwrap().clone();
+        let physical = match prepare_gate {
+            Some(gate) => Some(gate.acquire(context).await?),
+            None => None,
+        };
         Ok(Box::new(Lease {
             calls: self.calls.clone(),
             receipt,
+            physical,
         }))
     }
 
@@ -236,6 +260,9 @@ impl UserAppDeploymentRuntime for Runtime {
     ) -> ContainerRuntimeResult<ComputeLeaseInspection> {
         self.lease_inspections.fetch_add(1, Ordering::SeqCst);
         assert_eq!(scope, UserAppOperationScope::Dev);
+        if let Some(gate) = self.prepare_gate.lock().unwrap().clone() {
+            return gate.inspect();
+        }
         assert!(
             registered.is_none(),
             "the lost reply must not invent a local binding"
@@ -253,6 +280,66 @@ impl UserAppDeploymentRuntime for Runtime {
             receipt: receipt(&attempt),
             attempt,
         })
+    }
+
+    async fn prepare_compute_handoff(
+        &self,
+        context: &UserAppExecutionContext,
+        scope: UserAppOperationScope,
+        registered: Option<&UserAppOperationLeaseReceipt>,
+    ) -> ContainerRuntimeResult<container_runtime_api::ComputeHandoff> {
+        use container_runtime_api::ComputeHandoff;
+        if self.handoff_error.load(Ordering::SeqCst) {
+            return Err(ContainerRuntimeError::ConnectionError(
+                "injected unknown handoff response".into(),
+            ));
+        }
+        if self.calls.held.load(Ordering::SeqCst) {
+            return Ok(ComputeHandoff::Held);
+        }
+        let gate = self.prepare_gate.lock().unwrap().clone();
+        let prepared = if let Some(gate) = gate {
+            gate.handoff()?
+        } else {
+            match self
+                .inspect_compute_drain_lease(context, scope, registered)
+                .await?
+            {
+                ComputeLeaseInspection::Held => {
+                    Ok::<_, ContainerRuntimeError>(ComputeHandoff::Held)
+                }
+                ComputeLeaseInspection::IdentityChanged(reason) => Ok(ComputeHandoff::deferred(
+                    ComputeLeaseInspection::IdentityChanged(reason),
+                )),
+                ComputeLeaseInspection::PreviousOwner { receipt, owner } => {
+                    Ok(ComputeHandoff::deferred(
+                        ComputeLeaseInspection::PreviousOwner { receipt, owner },
+                    ))
+                }
+                ComputeLeaseInspection::PreviousOperation {
+                    receipt,
+                    operation_id,
+                } => Ok(ComputeHandoff::deferred(
+                    ComputeLeaseInspection::PreviousOperation {
+                        receipt,
+                        operation_id,
+                    },
+                )),
+                ComputeLeaseInspection::Absent
+                | ComputeLeaseInspection::Releasable(_)
+                | ComputeLeaseInspection::Discovered { .. } => Ok(ComputeHandoff::Acquired {
+                    guard: Box::new(
+                        crate::userapp_builder::compute_drain_recovery::UnheldComputeFixture,
+                    ),
+                    original_absent: false,
+                }),
+            }?
+        };
+        let superseding = self.handoff_supersede.lock().unwrap().take();
+        if let Some((store, request)) = superseding {
+            store.admit_compute_control(&request).await.unwrap();
+        }
+        Ok(prepared)
     }
 
     async fn release_app_operation_receipt(
@@ -462,6 +549,7 @@ impl AgentContainerRuntime for Runtime {
     }
 }
 
+mod active_executor;
 mod docker_autoremove;
 
 async fn fresh_state() -> (Arc<AppState>, Arc<Runtime>, tempfile::TempDir) {

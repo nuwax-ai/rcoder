@@ -4,7 +4,7 @@ use shared_types::{
     UserAppOperationLeaseReceipt, UserAppOperationScope,
 };
 
-fn lease_name(
+pub(super) fn lease_name(
     context: &UserAppExecutionContext,
     scope: UserAppOperationScope,
 ) -> Result<(ServiceType, String)> {

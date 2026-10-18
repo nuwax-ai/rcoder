@@ -21,6 +21,37 @@ pub enum AppOperationLeaseObservation {
     Unconfirmed,
 }
 
+/// Pre-fence physical exclusion for an early compute coordinator. This is not
+/// a stop receipt and never grants permission to submit a runtime mutation.
+pub trait ComputeHandoffGuard: Send + Sync {}
+
+/// Result of physically observing an early coordinator before durable fencing.
+pub enum ComputeHandoff {
+    /// A real FD holder or an exact Lease with current renewal still executes.
+    Held,
+    /// The current native mutex was actually observed absent. No object is
+    /// created merely to observe it; durable CAS fences any late prepare.
+    Vacant { original_absent: bool },
+    /// Keep the physical exclusion until the durable reservation has committed.
+    Acquired {
+        guard: Box<dyn ComputeHandoffGuard>,
+        /// The captured physical identity is absent or no longer owns this
+        /// mutex. A same-original prepared attempt may now occupy it; this
+        /// observation must not replace the stored historical receipt.
+        original_absent: bool,
+    },
+    /// An observed predecessor or changed identity requires its existing proof
+    /// path. Historical metadata alone cannot authorize taking that mutex.
+    Deferred(Box<shared_types::ComputeLeaseInspection>),
+}
+
+impl ComputeHandoff {
+    /// Retain detailed physical evidence without inflating the common result.
+    pub fn deferred(inspection: shared_types::ComputeLeaseInspection) -> Self {
+        Self::Deferred(Box::new(inspection))
+    }
+}
+
 /// Ephemeral observation of the production application mutex, never a receipt
 /// or permission to acquire, renew, release, or mutate an application. A missing
 /// lifecycle annotation is observable, but cannot authorize any write.

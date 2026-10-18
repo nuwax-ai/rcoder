@@ -51,6 +51,18 @@ struct RecoveryTasks {
     pending: FuturesUnordered<BoxFuture<'static, RecoveryResult>>,
 }
 
+#[cfg(test)]
+pub(super) async fn run_compute_scan_for_test(
+    state: &std::sync::Arc<AppState>,
+) -> anyhow::Result<()> {
+    let mut tasks = RecoveryTasks::default();
+    compute::discover_pending(state, &mut tasks, &mut None).await?;
+    while let Some((_, result)) = tasks.next().await {
+        result?;
+    }
+    Ok(())
+}
+
 impl RecoveryTasks {
     fn is_full(&self) -> bool {
         self.active.len() >= MAX_RECOVERIES

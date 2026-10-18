@@ -1517,6 +1517,20 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         ))
     }
 
+    /// Retain physical exclusion BEFORE revoking an early compute executor.
+    /// A live holder must leave the original durable Running record unchanged.
+    /// Dropping an acquired guard must not clear markers or delete Leases.
+    async fn prepare_compute_handoff(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _scope: shared_types::UserAppOperationScope,
+        _receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
+    ) -> ContainerRuntimeResult<super::types::ComputeHandoff> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Early compute handoff observation is unsupported".into(),
+        ))
+    }
+
     /// Inspect only an executor already revoked by an early-stage store CAS.
     /// No fallback from an observation error to an absent or released lease.
     async fn inspect_compute_drain_lease(

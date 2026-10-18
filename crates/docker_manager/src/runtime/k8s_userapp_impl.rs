@@ -436,6 +436,16 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
             .await
     }
 
+    async fn prepare_compute_handoff(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        scope: shared_types::UserAppOperationScope,
+        receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
+    ) -> ContainerRuntimeResult<container_runtime_api::ComputeHandoff> {
+        self.prepare_compute_k8s_handoff(context, scope, receipt)
+            .await
+    }
+
     async fn release_previous_compute_lease(
         &self,
         current: &shared_types::UserAppExecutionContext,

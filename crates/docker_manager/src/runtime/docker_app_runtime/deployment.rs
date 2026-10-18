@@ -418,6 +418,16 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             .await
     }
 
+    async fn prepare_compute_handoff(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        scope: shared_types::UserAppOperationScope,
+        receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
+    ) -> ContainerRuntimeResult<container_runtime_api::ComputeHandoff> {
+        self.prepare_compute_file_handoff(context, scope, receipt)
+            .await
+    }
+
     async fn release_previous_compute_lease(
         &self,
         current: &shared_types::UserAppExecutionContext,

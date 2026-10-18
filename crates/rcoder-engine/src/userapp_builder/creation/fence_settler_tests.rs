@@ -344,6 +344,48 @@ impl UserAppDeploymentRuntime for FenceRuntime {
                 })
             }))
     }
+
+    async fn prepare_compute_handoff(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        scope: shared_types::UserAppOperationScope,
+        receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
+    ) -> ContainerRuntimeResult<container_runtime_api::ComputeHandoff> {
+        use container_runtime_api::ComputeHandoff;
+        use shared_types::ComputeLeaseInspection;
+        let physical = self.physical_compute_runtime.lock().expect("lock").clone();
+        if let Some(physical) = physical {
+            return physical
+                .prepare_compute_handoff(context, scope, receipt)
+                .await;
+        }
+        match self
+            .inspect_compute_drain_lease(context, scope, receipt)
+            .await?
+        {
+            ComputeLeaseInspection::Held => Ok(ComputeHandoff::Held),
+            observed @ (ComputeLeaseInspection::IdentityChanged(_)
+            | ComputeLeaseInspection::PreviousOwner { .. }
+            | ComputeLeaseInspection::PreviousOperation { .. }) => {
+                Ok(ComputeHandoff::deferred(observed))
+            }
+            ComputeLeaseInspection::Discovered { receipt, attempt }
+                if attempt.executor_id != context.executor_id =>
+            {
+                Ok(ComputeHandoff::deferred(
+                    ComputeLeaseInspection::Discovered { receipt, attempt },
+                ))
+            }
+            ComputeLeaseInspection::Absent
+            | ComputeLeaseInspection::Releasable(_)
+            | ComputeLeaseInspection::Discovered { .. } => Ok(ComputeHandoff::Acquired {
+                guard: Box::new(
+                    crate::userapp_builder::compute_drain_recovery::UnheldComputeFixture,
+                ),
+                original_absent: false,
+            }),
+        }
+    }
     async fn release_app_operation_receipt(
         &self,
         context: &shared_types::UserAppExecutionContext,
@@ -390,7 +432,34 @@ impl UserAppDeploymentRuntime for FenceRuntime {
             .compute_release_succeeds
             .load(std::sync::atomic::Ordering::SeqCst)
         {
-            Ok(())
+            let mut inspection = self.compute_inspection.lock().unwrap();
+            let exact = match inspection.as_ref() {
+                Some(shared_types::ComputeLeaseInspection::PreviousOwner {
+                    owner: observed,
+                    receipt: captured,
+                }) => observed == owner && captured == receipt,
+                Some(shared_types::ComputeLeaseInspection::PreviousOperation {
+                    operation_id,
+                    receipt: captured,
+                }) => operation_id == &owner.operation_id && captured == receipt,
+                None | Some(shared_types::ComputeLeaseInspection::Absent) => true,
+                Some(
+                    shared_types::ComputeLeaseInspection::Held
+                    | shared_types::ComputeLeaseInspection::IdentityChanged(_)
+                    | shared_types::ComputeLeaseInspection::Releasable(_)
+                    | shared_types::ComputeLeaseInspection::Discovered { .. },
+                ) => false,
+            };
+            if exact {
+                // A successful exact release really removes the old mutex;
+                // subsequent pre-fence observation must not see stale residue.
+                *inspection = None;
+                Ok(())
+            } else {
+                Err(ContainerRuntimeError::Conflict(
+                    "previous mutex changed before release".into(),
+                ))
+            }
         } else {
             Err(ContainerRuntimeError::Conflict(
                 "previous lease changed during conditional release".into(),
