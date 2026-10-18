@@ -271,7 +271,11 @@ mod tests {
             .err()
             .expect("syntax must fail");
         assert_eq!(error.kind, DiagnosticKind::Parse);
-        assert_eq!(error.issue.file.as_deref(), Some("pingap/10-bad.toml"));
+        let expected_file = Path::new("pingap").join("10-bad.toml");
+        assert_eq!(
+            error.issue.file.as_deref().map(Path::new),
+            Some(expected_file.as_path())
+        );
         let rendered = error.to_string();
         assert!(rendered.contains("line 2, column"));
         assert!(!rendered.contains("DO_NOT_DISCLOSE_SECRET"));
@@ -286,7 +290,10 @@ mod tests {
             .await
             .unwrap();
         let error = source.parse().unwrap_err();
-        assert_eq!(error.issue.file.as_deref(), Some("pingap/10-bad.toml"));
+        assert_eq!(
+            error.issue.file.as_deref().map(Path::new),
+            Some(expected_file.as_path())
+        );
         assert!(error.issue.message.contains("line 1, column"));
         assert!(!error.to_string().contains("DO_NOT_DISCLOSE_SECRET"));
     }

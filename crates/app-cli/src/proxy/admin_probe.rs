@@ -550,17 +550,20 @@ mod tests {
         let _guard = crate::svc_spec::SPEC_ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("APP_CLI_SPEC_DIR", dir.path()) };
+        let root = std::fs::canonicalize(dir.path()).unwrap();
         // 无常驻 spec：恢复 None（走生成路径）
         assert!(endpoint_from_resident_spec().unwrap().is_none());
 
         let spec = crate::svc_spec::ServiceSpecFile {
             release_id: crate::svc_spec::RESIDENT_SPEC_ID.into(),
             service_id: "pingap".into(),
-            cwd: "/".into(),
+            cwd: root.to_string_lossy().into_owned(),
             argv: vec![
-                "/usr/local/bin/pingap".into(),
+                root.join("bin/pingap").to_string_lossy().into_owned(),
                 "-c".into(),
-                "/app/logs/pingap/active/pingap.toml".into(),
+                root.join("active/pingap.toml")
+                    .to_string_lossy()
+                    .into_owned(),
                 "--autoreload".into(),
             ],
             env: [

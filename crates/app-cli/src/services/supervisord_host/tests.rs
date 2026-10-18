@@ -488,18 +488,23 @@ mod transition_tests {
             resident_release_from_fragment("[program:app-pingap]\ncommand=other --anything\n")
                 .is_err()
         );
+        let directory = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        let config = root.join("old/pingap.toml");
         let argv = vec![
-            "/usr/bin/pingap".into(),
+            root.join("bin/pingap").to_string_lossy().into_owned(),
             "-c".into(),
-            "/runtime/old/pingap.toml".into(),
+            config.to_string_lossy().into_owned(),
             "--autoreload".into(),
         ];
-        assert_eq!(
-            entry_config_from_argv(&argv).unwrap(),
-            PathBuf::from("/runtime/old/pingap.toml")
-        );
+        assert_eq!(entry_config_from_argv(&argv).unwrap(), config);
         let mut ambiguous = argv.clone();
-        ambiguous.extend(["-c".into(), "/runtime/active/pingap.toml".into()]);
+        ambiguous.extend([
+            "-c".into(),
+            root.join("active/pingap.toml")
+                .to_string_lossy()
+                .into_owned(),
+        ]);
         assert!(entry_config_from_argv(&ambiguous).is_err());
     }
 }

@@ -15,7 +15,7 @@ from isolated_docker import require_local_docker_endpoint
 def source_snapshot(repo):
     def git(*argv):
         return subprocess.run(['git', '-C', str(repo), *argv], check=True,
-                              capture_output=True, text=True).stdout
+                              capture_output=True, text=True, encoding='utf-8').stdout
     paths = set(git('ls-files').splitlines() + git('ls-files', '--others', '--exclude-standard').splitlines())
     digest = hashlib.sha256()
     for path in sorted(paths):
