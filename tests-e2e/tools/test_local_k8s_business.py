@@ -166,7 +166,7 @@ class BusinessProtocolTests(unittest.TestCase):
 
     def test_resume_has_a_new_report_and_never_overwrites_original_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root=Path(temporary);config=root/'kubeconfig';config.write_text('opaque test credential')
+            root=Path(temporary).resolve();config=root/'kubeconfig';config.write_text('opaque test credential')
             (root/'identity.json').write_text(json.dumps({'root':str(root),'run_id':'a'*32,'namespace':'rcoder-owned',
                 'context':'orbstack','cluster_api':'https://127.0.0.1:26443','kubeconfig':str(config),'apps':['ownedapp']}))
             old=root/'local-k8s-business-ownedapp.json';old.write_text(json.dumps(self.old_report()))
@@ -229,7 +229,7 @@ class BusinessProtocolTests(unittest.TestCase):
 
     def test_gated_resume_uses_new_task_and_report_without_overwriting_prior_source_evidence(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root=Path(temporary);config=root/'kubeconfig';config.write_text('opaque credential fixture')
+            root=Path(temporary).resolve();config=root/'kubeconfig';config.write_text('opaque credential fixture')
             (root/'identity.json').write_text(json.dumps({'root':str(root),'run_id':'a'*32,'namespace':'rcoder-owned','context':'orbstack',
                 'cluster_api':'https://127.0.0.1:26443','kubeconfig':str(config),'apps':['ownedapp']}))
             old,proof=self.gated_report();original=root/'local-k8s-business-ownedapp-resumed.json';original.write_text(json.dumps(old))

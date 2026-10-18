@@ -24,7 +24,7 @@ class AdmissionTests(unittest.TestCase):
 
     def test_wrong_targets_fail_before_any_http_or_kubectl(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             identity = self.fixture(root)
             with patch.object(core.subprocess, 'run', side_effect=AssertionError('no process permitted')):
                 self.assertEqual(core.validate_inputs(root, 'http://127.0.0.1:18297', 'corebbbbbbbb')[1]['namespace'], identity['namespace'])

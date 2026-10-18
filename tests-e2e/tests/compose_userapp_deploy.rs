@@ -203,11 +203,14 @@ fn cleanup_builder(app_id: &str) {
 /// 前置探测：app-runtime 镜像存在 + agent-runner 镜像含 template-cli。
 /// 返回 None = 前置不满足（调用方 skip）。
 async fn preflight(report: &JsonlReporter) -> Option<()> {
+    let builder = env_or("E2E_BUILDER_IMAGE", "dev-rcoder-agent-runner:latest");
+    let runtime = env_or("E2E_RUNTIME_IMAGE", "dev-app-runtime:latest");
     let toolchains = std::process::Command::new("python3")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../docker/verify-userapp-toolchains.py"
         ))
+        .args(["--builder", builder.as_str(), "--runtime", runtime.as_str()])
         .output();
     let (compatible, detail) = match toolchains {
         Ok(output) => (
@@ -230,12 +233,12 @@ async fn preflight(report: &JsonlReporter) -> Option<()> {
     }
 
     let runtime_ok = std::process::Command::new("docker")
-        .args(["image", "inspect", "dev-app-runtime:latest"])
+        .args(["image", "inspect", runtime.as_str()])
         .output()
         .is_ok_and(|o| o.status.success());
     if !runtime_ok {
         report.diagnostic(
-            "preflight dev-app-runtime:latest",
+            "preflight selected app-runtime",
             "missing",
             "app 运行时镜像不存在：make docker-build-app-runtime",
         );
@@ -247,7 +250,7 @@ async fn preflight(report: &JsonlReporter) -> Option<()> {
             "--rm",
             "--entrypoint",
             "sh",
-            "dev-rcoder-agent-runner:latest",
+            builder.as_str(),
             "-c",
             "command -v template-cli",
         ])

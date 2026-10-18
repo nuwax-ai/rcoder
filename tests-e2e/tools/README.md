@@ -194,6 +194,14 @@ A/B 制品由本机 HTTP 服务器提供；受控阻塞制造并发窗口，断�
 
 完整部署前会探测实际镜像的 Python SOABI、架构和 Java 版本，拒绝旧 builder 基础镜像与 runtime 配对。构建可通过 `AGENT_BASE_IMAGE` 指定本地已验证的基础镜像；也可先运行 `make docker-build-agent-base` 重建默认基础镜像。用 `python3 docker/verify-userapp-toolchains.py --builder <image> --runtime <image>` 单独检查，输出包含不可变镜像 ID。
 
+完整部署套件可通过 `E2E_BUILDER_IMAGE`、`E2E_RUNTIME_IMAGE` 选择独立构建的
+builder/runtime；前置探测与工具链检查使用相同输入，不必覆盖共享的 dev 镜像标签。
+Turso/crash 用例仍支持原有 `E2E_TURSO_RUNTIME_IMAGE` 与
+`E2E_TURSO_BINARY_SHA256` 输入；显式 builder 同样用于其私有运行配置。
+若额外提供上方计算构建回执 `E2E_COMPUTE_BUILD_RECEIPT`，会核对当前源码及
+controller/builder 身份；若提供 `E2E_PROD_BUILD_RECEIPT`，会核对 runtime 身份。
+缺少这些可选回执时不宣称来源已被回执验证，原有用例自己的镜像与真实二进制核验继续执行。
+
 ## 显式真实 K8s userApp 验收
 
 用户授权个人测试集群后，可运行不依赖 Docker/LLM 的专用入口：

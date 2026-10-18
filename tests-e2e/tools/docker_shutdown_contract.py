@@ -19,7 +19,7 @@ import urllib.request
 import urllib.error
 import uuid
 from docker_crash_contract import cleanup, db_operation, owned_builder_rows, wait_file
-from turso_runtime_contract import REPO, command, http, isolated_config, service_config, wait_ready, parse_observer_output
+from turso_runtime_contract import REPO, command, http, paired_isolated_config, service_config, wait_ready, parse_observer_output
 
 
 def running(cid):
@@ -75,7 +75,7 @@ def main():
 
     try:
         private = Path(tempfile.mkdtemp(prefix=receipt['project'] + '-config-')) / 'config.yml'
-        private.write_text(isolated_config((REPO / 'docker/config.yml').read_text()))
+        private.write_text(paired_isolated_config((REPO / 'docker/config.yml').read_text()))
         private.chmod(0o600)
         receipt['private_config'] = str(private)
         (root / 'ownership.json').write_text(json.dumps(receipt, indent=2))

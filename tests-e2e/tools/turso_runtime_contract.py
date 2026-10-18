@@ -122,6 +122,15 @@ def service_config(root, image, run_id, case_id, socket, config_path=None):
         # 隔离栈与 dev compose 同源（默认 dev 令牌）
         'RCODER_PREVIEW_INTERNAL_TOKEN': 'local-dev-preview-token-0123456789',
     }
+    runtime = os.environ.get('E2E_RUNTIME_IMAGE')
+    if runtime:
+        runtime_receipt = os.environ.get('E2E_PROD_BUILD_RECEIPT')
+        if runtime_receipt:
+            from prod_readiness_contract import source_identity, validate_receipt
+            build = validate_receipt(json.loads(Path(runtime_receipt).read_text()), source_identity(REPO))
+            if runtime != build['runtime']['image_id']:
+                raise ValueError('E2E_RUNTIME_IMAGE disagrees with the paired runtime build receipt')
+        environment['RCODER_RUNTIME_IMAGE_DIGEST'] = runtime
     mounts = [{'type': 'bind', 'source': str(root / folder), 'target': '/app/' + folder}
               for folder in ('data', 'logs', 'project_workspace', 'computer-project-workspace',
                              'userapp-workspace', 'app-workspace')]
@@ -143,6 +152,39 @@ def isolated_config(source):
                             'cleanup_config:\n  enabled: false\n\n', source)
     if count != 1:
         raise ValueError('expected exactly one cleanup configuration section')
+    return result
+
+
+def paired_isolated_config(source):
+    """Keep fixture-created workloads on the current frozen build, not shared tags."""
+    path = os.environ.get('E2E_COMPUTE_BUILD_RECEIPT')
+    if not path:
+        # Preserve the original explicit image/hash contracts. Without a build
+        # receipt this only selects inputs; it does not prove source identity.
+        images = {'rcoder': os.environ.get('E2E_TURSO_RUNTIME_IMAGE'),
+                  'builder': os.environ.get('E2E_BUILDER_IMAGE')}
+    else:
+        # Local import avoids the existing compute/turso module dependency cycle.
+        from compute_failure_contract import validate_build
+        from prod_readiness_contract import source_identity
+        build = validate_build(json.loads(Path(path).read_text()), source_identity(REPO))
+        for name, expected in (
+                ('E2E_TURSO_RUNTIME_IMAGE', build['rcoder']['image_id']),
+                ('E2E_TURSO_BINARY_SHA256', build['rcoder']['binary_sha256']),
+                ('E2E_BUILDER_IMAGE', build['builder']['image_id'])):
+            supplied = os.environ.get(name)
+            if supplied and supplied != expected:
+                raise ValueError(name + ' disagrees with the paired build receipt')
+        images = {role: build[role]['image_id'] for role in ('rcoder', 'builder')}
+    result = isolated_config(source)
+    for tag, role in (('dev-master-rcoder:latest', 'rcoder'),
+                      ('dev-rcoder-agent-runner:latest', 'builder')):
+        if not images[role]:
+            continue
+        token = json.dumps(tag)
+        if token not in result:
+            raise ValueError('fixture image anchor missing: ' + tag)
+        result = result.replace(token, json.dumps(images[role]))
     return result
 
 
@@ -268,7 +310,7 @@ def main():
             # of the report tree; the report only records its temporary path.
             private = Path(tempfile.mkdtemp(prefix=receipt['project'] + '-config-'))
             config_file = private / 'config.yml'
-            config_file.write_text(isolated_config((REPO / 'docker/config.yml').read_text()))
+            config_file.write_text(paired_isolated_config((REPO / 'docker/config.yml').read_text()))
             config_file.chmod(0o600)
             receipt['private_config'] = str(config_file)
             receipt_path.write_text(json.dumps(receipt, indent=2))

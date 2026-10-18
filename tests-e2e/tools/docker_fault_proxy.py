@@ -281,18 +281,25 @@ def hold_timeout_checkpoint_read(method, path):
     that failure is durable can a background recovery GET reach this barrier.
     No Docker result is fabricated, and no mutation is delayed by this gate.
     """
-    arm_path = ROOT / 'compute-arm.json'
-    if MODE != 'compute_stop_timeout' or method != 'GET' or not arm_path.exists():
+    if MODE != 'compute_stop_timeout' or method != 'GET':
         return
-    arm = json.loads(arm_path.read_text())
+    # Only the captured container's inspect can reach this barrier. Startup
+    # pings and other Docker reads never depend on a changing fault arm file.
+    parts = urllib.parse.urlsplit(path).path.strip('/').split('/')
+    if parts and parts[0].startswith('v1.'):
+        parts = parts[1:]
+    if len(parts) != 3 or parts[0] != 'containers' or parts[2] != 'json':
+        return
+    arm_path = ROOT / 'compute-arm.json'
+    try:
+        arm = json.loads(arm_path.read_text())
+    except FileNotFoundError:
+        return  # The owner withdrew this read fault; no side effect was submitted.
     if arm.get('observe_timeout_checkpoint') is not True:
         return
     if (ROOT / 'compute-timeout-observation-release.json').exists():
         return  # The offline observation is over; fresh recovery reads are real.
     cid, life = arm['container_id'], arm['lifecycle_id']
-    parts = urllib.parse.urlsplit(path).path.strip('/').split('/')
-    if parts and parts[0].startswith('v1.'):
-        parts = parts[1:]
     if parts != ['containers', cid, 'json']:
         return
     operation_path = ROOT / 'compute-operation.json'

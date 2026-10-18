@@ -10,7 +10,7 @@ import tempfile
 import time
 import urllib.request
 import uuid
-from turso_runtime_contract import REPO, command, http, wait_ready, service_config, isolated_config, remove_private_config
+from turso_runtime_contract import REPO, command, http, wait_ready, service_config, paired_isolated_config, remove_private_config
 
 MODES = ('before_create', 'after_start')
 
@@ -116,7 +116,7 @@ def main():
             expected = os.environ['E2E_TURSO_BINARY_SHA256']
             image_id = command('docker', 'image', 'inspect', '--format', '{{.Id}}', os.environ.get('E2E_TURSO_RUNTIME_IMAGE', 'dev-master-rcoder:latest'))
             private = Path(tempfile.mkdtemp(prefix=receipt['project'] + '-config-')) / 'config.yml'
-            private.write_text(isolated_config((REPO / 'docker/config.yml').read_text()))
+            private.write_text(paired_isolated_config((REPO / 'docker/config.yml').read_text()))
             private.chmod(0o600)
             receipt['private_config'] = str(private)
             (root / 'ownership.json').write_text(json.dumps(receipt, indent=2))
