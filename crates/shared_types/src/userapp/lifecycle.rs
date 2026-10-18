@@ -939,6 +939,16 @@ pub trait UserAppLifecycleStore: Send + Sync {
         app_id: &str,
         lifecycle_id: &str,
     ) -> Result<Option<crate::UserAppDiscoveredIdentity>, UserAppStoreError>;
+    /// Read-only verification projection. A completed original deletion may
+    /// retire its exact captured PVCs; the immutable witness remains readable
+    /// through `get_recovery_witness`. Missing history never invents retirement.
+    async fn get_recovery_storage_witness(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+    ) -> Result<Option<crate::UserAppDiscoveredIdentity>, UserAppStoreError> {
+        self.get_recovery_witness(app_id, lifecycle_id).await
+    }
     /// Restore only a missing root. An existing different lifecycle or tombstone
     /// is never overwritten; resource discovery is revalidated by the caller.
     async fn restore_discovered_identity(

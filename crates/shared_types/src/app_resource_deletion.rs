@@ -236,6 +236,9 @@ pub struct UserAppStorageClear {
 }
 
 impl UserAppStorageClear {
+    /// Written only after the captured contents/volume clear has completed.
+    pub const COMPLETE_STEP: &'static str = "storage_contents_cleared";
+
     pub fn validate(&self) -> Result<(), String> {
         self.context.validate_identity(&self.context.app_id)?;
         match &self.target {
@@ -315,6 +318,9 @@ pub enum UserAppStorageClearTarget {
 }
 
 impl UserAppStorageDestruction {
+    /// Written only after captured production (if present) and dev removal.
+    pub const COMPLETE_STEP: &'static str = "development_storage_removed";
+
     pub fn validate(&self) -> Result<(), String> {
         self.context.validate_identity(&self.context.app_id)?;
         if let Some(production) = &self.production {

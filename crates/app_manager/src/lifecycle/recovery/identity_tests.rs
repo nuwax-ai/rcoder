@@ -3,6 +3,9 @@ use container_runtime_api::ContainerRuntimeError;
 use shared_types::*;
 use std::sync::{Arc, atomic::Ordering};
 
+#[path = "identity_tests/purged_witness.rs"]
+mod purged_witness;
+
 fn discovered(app_id: &str, lifecycle_id: &str) -> UserAppDiscoveredIdentity {
     UserAppDiscoveredIdentity {
         app_id: app_id.into(),

@@ -14,3 +14,12 @@ max-threads = 1
 [[profile.default.overrides]]
 filter = 'package(rcoder-engine) & test(userapp_forward::upstream::probe_pipeline_tests::)'
 test-group = 'userapp-file-peer-60000'
+
+# The owner probe and recovered-PVC deployment fixture use app-cli's real
+# administration port; keep only these protocol processes from colliding.
+[test-groups.app-cli-admin-3010]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = '(package(file-server) & test(owner_probe_branches)) | (package(app_manager) & test(lifecycle::recovery::identity_tests::purged_witness::))'
+test-group = 'app-cli-admin-3010'

@@ -34,6 +34,7 @@ mod ops;
 mod pg_commit_reply_tests;
 #[cfg(test)]
 mod recovery_scan_tests;
+mod recovery_witness;
 mod repo;
 #[cfg(test)]
 mod transaction_fault_tests;
@@ -121,29 +122,19 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         let app_id = app_id.to_owned();
         let lifecycle_id = lifecycle_id.to_owned();
         self.run(true, move |tx, _backend| {
-            Box::pin(async move {
-                let Some(row) =
-                    crate::db::models::RecoveryWitness::filter_by_app_id_and_lifecycle_id(
-                        &app_id,
-                        &lifecycle_id,
-                    )
-                    .first()
-                    .exec(tx)
-                    .await
-                    .map_err(storage)?
-                else {
-                    return Ok(None);
-                };
-                let witness: UserAppDiscoveredIdentity =
-                    serde_json::from_str(&row.witness_json).map_err(storage)?;
-                witness
-                    .validate()
-                    .map_err(UserAppStoreError::InvalidOperation)?;
-                if witness.app_id != app_id || witness.lifecycle_id != lifecycle_id {
-                    return Err(UserAppStoreError::LifecycleConflict);
-                }
-                Ok(Some(witness))
-            })
+            Box::pin(async move { recovery_witness::original(tx, &app_id, &lifecycle_id).await })
+        })
+        .await
+    }
+    async fn get_recovery_storage_witness(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+    ) -> Result<Option<UserAppDiscoveredIdentity>, UserAppStoreError> {
+        let app_id = app_id.to_owned();
+        let lifecycle_id = lifecycle_id.to_owned();
+        self.run(true, move |tx, _backend| {
+            Box::pin(async move { recovery_witness::remaining(tx, &app_id, &lifecycle_id).await })
         })
         .await
     }

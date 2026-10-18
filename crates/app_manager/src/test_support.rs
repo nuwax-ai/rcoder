@@ -29,6 +29,10 @@ use crate::service::AppService;
 /// 历史用途 wait_app_ready 已退役，现有消费者见 purge 链不缺席测试）。
 #[derive(Default)]
 pub(crate) struct MockRuntime {
+    /// Opt-in stateful PVC resources backed by real fixture data directories.
+    pub recovered_pvc_volumes:
+        DashMap<String, Vec<(shared_types::AppResourceIdentity, std::path::PathBuf)>>,
+    pub physical_pvc_uids: DashMap<String, String>,
     pub discovery_calls: AtomicUsize,
     pub discovery_replies: std::sync::Mutex<
         std::collections::VecDeque<
@@ -145,11 +149,27 @@ pub(crate) struct MockRuntime {
 impl WorkspaceRuntime for MockRuntime {
     async fn ensure_workspace(
         &self,
-        _identifier: &str,
+        identifier: &str,
         _service_type: &ServiceType,
         _storage_size: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
         self.ensure_workspace_calls.fetch_add(1, Ordering::SeqCst);
+        let volumes = self
+            .recovered_pvc_volumes
+            .get(identifier)
+            .map(|v| v.clone());
+        if let Some(volumes) = volumes {
+            for (volume, path) in volumes {
+                self.physical_pvc_uids
+                    .entry(volume.name)
+                    .or_insert_with(|| uuid::Uuid::new_v4().to_string());
+                tokio::fs::create_dir_all(path).await.map_err(|error| {
+                    ContainerRuntimeError::ConfigurationError(format!(
+                        "fixture create PVC data: {error}"
+                    ))
+                })?;
+            }
+        }
         Ok(())
     }
 
@@ -157,7 +177,29 @@ impl WorkspaceRuntime for MockRuntime {
         &self,
         snapshot: &shared_types::AppDeletionSnapshot,
     ) -> ContainerRuntimeResult<()> {
-        self.destroy_app_pvc(&snapshot.app_id).await
+        self.destroy_app_pvc(&snapshot.app_id).await?;
+        let volumes = self
+            .recovered_pvc_volumes
+            .get(&snapshot.app_id)
+            .map(|v| v.clone());
+        if let Some(volumes) = volumes {
+            for (volume, path) in volumes {
+                if !snapshot.resources.contains(&volume)
+                    || self.physical_pvc_uids.get(&volume.name).as_deref() != Some(&volume.uid)
+                {
+                    return Err(ContainerRuntimeError::Conflict(
+                        "fixture captured PVC was replaced".into(),
+                    ));
+                }
+                self.physical_pvc_uids.remove(&volume.name);
+                tokio::fs::remove_dir_all(path).await.map_err(|error| {
+                    ContainerRuntimeError::ConfigurationError(format!(
+                        "fixture destroy captured PVC data: {error}"
+                    ))
+                })?;
+            }
+        }
+        Ok(())
     }
     // 其余 workspace 族方法走默认实现（resolve_workspace_path → Ok(None)，
     // get_container_app_dir 因此落到 `workspace_root/{app_id}`，测试用 tempdir 承接）；
@@ -293,6 +335,32 @@ impl shared_types::AppOperationLease for ObservedWakeLease {
 
 #[async_trait]
 impl UserAppDeploymentRuntime for MockRuntime {
+    async fn verify_recovered_volumes(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _scope: shared_types::UserAppOperationScope,
+        volumes: &[shared_types::AppResourceIdentity],
+    ) -> ContainerRuntimeResult<()> {
+        for volume in volumes {
+            if volume.kind != shared_types::AppResourceKind::PersistentVolumeClaim {
+                return Err(ContainerRuntimeError::ConfigurationError(
+                    "fixture requires a PVC witness".into(),
+                ));
+            }
+            let Some(current) = self.physical_pvc_uids.get(&volume.name) else {
+                return Err(ContainerRuntimeError::K8sError(format!(
+                    "Verify recovered volume {}: 404 Not Found",
+                    volume.name
+                )));
+            };
+            if *current != volume.uid {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Recovered workspace volume was replaced or is deleting".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
     async fn acquire_vacant_app_operation(
         &self,
         app_id: &str,
@@ -768,7 +836,11 @@ impl UserAppDeploymentRuntime for MockRuntime {
         Ok(shared_types::AppDeletionSnapshot {
             app_id: app_id.into(),
             operation_id: "test-operation".into(),
-            resources: vec![],
+            resources: self
+                .recovered_pvc_volumes
+                .get(app_id)
+                .map(|v| v.iter().map(|(resource, _)| resource.clone()).collect())
+                .unwrap_or_default(),
             directories: None,
         })
     }
@@ -1074,6 +1146,44 @@ impl UserAppDeploymentRuntime for MockRuntime {
             ));
         }
         let project_id = params.project_id.clone().unwrap_or_default();
+        let recovered_volumes = self
+            .recovered_pvc_volumes
+            .get(&project_id)
+            .map(|v| v.clone());
+        if let Some(volumes) = recovered_volumes {
+            for (volume, path) in volumes {
+                self.physical_pvc_uids
+                    .entry(volume.name)
+                    .or_insert_with(|| uuid::Uuid::new_v4().to_string());
+                tokio::fs::create_dir_all(path).await.map_err(|error| {
+                    ContainerRuntimeError::ConfigurationError(format!(
+                        "fixture create PVC data: {error}"
+                    ))
+                })?;
+            }
+            self.specs.insert(
+                project_id.clone(),
+                ContainerSpecSnapshot {
+                    env: params.env.clone(),
+                    ..Default::default()
+                },
+            );
+            self.deployments.insert(
+                project_id.clone(),
+                DeploymentStatus {
+                    app_id: project_id.clone(),
+                    lifecycle_id: params
+                        .execution_context
+                        .as_ref()
+                        .map(|c| c.lifecycle_id.clone()),
+                    replicas: 1,
+                    ready_replicas: 1,
+                    phase: "Running".into(),
+                    pod_ip: Some("127.0.0.1".into()),
+                    ..Default::default()
+                },
+            );
+        }
         // 捕获参数调用历史（首次创建的 ports/env 断言用）
         self.create_params_history
             .entry(project_id.clone())

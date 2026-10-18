@@ -186,7 +186,10 @@ impl crate::service::AppService {
             AppOperationError::Backend(format!("Destroy captured development storage: {error}"))
         })?;
         operation
-            .checkpoint("development_storage_removed", checkpoint)
+            .checkpoint(
+                shared_types::UserAppStorageDestruction::COMPLETE_STEP,
+                checkpoint,
+            )
             .await?;
         Ok(())
     }

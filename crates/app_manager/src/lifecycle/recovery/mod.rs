@@ -97,7 +97,7 @@ impl AppService {
         let Some(witness) = self
             .metadata
             .store
-            .get_recovery_witness(app_id, &app.lifecycle_id)
+            .get_recovery_storage_witness(app_id, &app.lifecycle_id)
             .await?
         else {
             return Ok(());

@@ -526,12 +526,15 @@ fn validate_storage_destruction_progress(
     }
     let ordered = match (operation.step.as_str(), progress.step.as_str()) {
         ("storage_captured", "production_storage_removed") => production,
-        ("storage_captured", "development_storage_removed") => !production,
-        ("production_storage_removed", "development_storage_removed") => production,
+        ("storage_captured", shared_types::UserAppStorageDestruction::COMPLETE_STEP) => !production,
+        ("production_storage_removed", shared_types::UserAppStorageDestruction::COMPLETE_STEP) => {
+            production
+        }
         _ => false,
     };
     if (progress.state == OpState::Running && ordered)
-        || (progress.state == OpState::Succeeded && operation.step == "development_storage_removed")
+        || (progress.state == OpState::Succeeded
+            && operation.step == shared_types::UserAppStorageDestruction::COMPLETE_STEP)
     {
         Ok(())
     } else {
@@ -620,8 +623,9 @@ fn validate_storage_clear_progress(
     }
     if (progress.state == OpState::Running
         && operation.step == "clear_target_captured"
-        && progress.step == "storage_contents_cleared")
-        || (progress.state == OpState::Succeeded && operation.step == "storage_contents_cleared")
+        && progress.step == shared_types::UserAppStorageClear::COMPLETE_STEP)
+        || (progress.state == OpState::Succeeded
+            && operation.step == shared_types::UserAppStorageClear::COMPLETE_STEP)
     {
         Ok(())
     } else {

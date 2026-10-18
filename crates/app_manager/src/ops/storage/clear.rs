@@ -243,7 +243,7 @@ impl crate::service::AppService {
             }
         }
         operation
-            .checkpoint("storage_contents_cleared", checkpoint)
+            .checkpoint(shared_types::UserAppStorageClear::COMPLETE_STEP, checkpoint)
             .await?;
         Ok::<(), AppOperationError>(())
     }
