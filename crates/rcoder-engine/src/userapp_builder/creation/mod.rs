@@ -15,6 +15,9 @@ use tokio::{
     time::Instant,
 };
 
+// Read-only runtime observations retain the existing per-call recovery budget.
+const RUNTIME_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
+
 // An optimization only. Database operation state remains authoritative across replicas.
 // hotpath 锁观测（T2.3 仅此登记表选点）：mutex! 关闭时原样返回原生 std::sync::Mutex，
 // 开启时包装记录锁等待（wait）与持锁（acquire）时长；lock/poison 语义与调用点不变，

@@ -3,6 +3,8 @@ mod compute;
 mod discovery;
 #[cfg(test)]
 mod hot_tests;
+#[cfg(test)]
+mod predecessor_timeout_tests;
 use crate::app_state::AppState;
 use futures::{FutureExt as _, StreamExt as _, future::BoxFuture, stream::FuturesUnordered};
 use shared_types::{AppWakeControl as _, UserAppOperationKind, UserAppOperationState};
@@ -26,6 +28,17 @@ async fn with_stall_budget<F: Future>(label: &str, fut: F) -> anyhow::Result<F::
     tokio::time::timeout(STALL_BUDGET, fut)
         .await
         .map_err(|_| anyhow::anyhow!("{label} timed out (stalled runtime call)"))
+}
+
+async fn sweep_legacy_locks(
+    runtime: &dyn container_runtime_api::UserAppDeploymentRuntime,
+) -> anyhow::Result<Vec<String>> {
+    with_stall_budget(
+        "Sweep legacy operation locks",
+        runtime.sweep_legacy_operation_locks(Duration::from_secs(24 * 3600)),
+    )
+    .await?
+    .map_err(anyhow::Error::from)
 }
 
 type RecoveryResult = (String, anyhow::Result<()>);
@@ -140,11 +153,7 @@ pub(crate) fn start_recovery(
                     // 24h 龄期（覆盖滚动升级窗口）+ uid precondition 删除。
                     // 只释放陈旧互斥，不授权任何变更。
                     if sweep_ticks.is_multiple_of(720) {
-                        match state
-                            .runtime
-                            .sweep_legacy_operation_locks(Duration::from_secs(24 * 3600))
-                            .await
-                        {
+                        match sweep_legacy_locks(state.runtime.as_ref()).await {
                             Ok(names) if !names.is_empty() => {
                                 tracing::info!(count = names.len(), ?names,
                                     "Legacy ConfigMap operation locks swept");
@@ -231,11 +240,14 @@ async fn discover_terminal_leases(
         let store = store.clone();
         let runtime = runtime.clone();
         tasks.push(binding.context.operation_id.clone(), async move {
-            runtime
-                .release_app_operation_receipt(&binding.context, &binding.receipt)
-                .await?;
-            store.forget_operation_lease(&binding).await?;
-            Ok(())
+            with_stall_budget("Release terminal operation lease", async move {
+                runtime
+                    .release_app_operation_receipt(&binding.context, &binding.receipt)
+                    .await?;
+                store.forget_operation_lease(&binding).await?;
+                Ok(())
+            })
+            .await?
         });
     }
     if consumed_all {

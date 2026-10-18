@@ -77,7 +77,7 @@ pub(crate) fn spawn_operation(
                 if Instant::now() >= ready_deadline {
                     // Only readonly observation after expiry; never register
                     // the instance or replay creation from this old executor.
-                    match tokio::time::timeout(Duration::from_secs(30),
+                    match tokio::time::timeout(RUNTIME_OBSERVATION_TIMEOUT,
                         record_late_creation_result(&owned, &claimed, &result)).await
                     {
                         Ok(Ok(())) => {},
@@ -400,7 +400,7 @@ pub(crate) async fn reconcile_runtime_receipt(
         request_fingerprint: snapshot.request_fingerprint.clone(),
     };
     let recovered = tokio::time::timeout(
-        Duration::from_secs(30),
+        RUNTIME_OBSERVATION_TIMEOUT,
         state.runtime().recover_builder_creation(&context),
     )
     .await
@@ -450,7 +450,7 @@ pub(crate) async fn reconcile_created(
         .validate_operation(snapshot)
         .map_err(anyhow::Error::msg)?;
     let Some(info) = tokio::time::timeout(
-        Duration::from_secs(30),
+        RUNTIME_OBSERVATION_TIMEOUT,
         observe_created_ready(state, &evidence),
     )
     .await

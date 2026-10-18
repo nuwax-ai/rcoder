@@ -73,42 +73,45 @@ pub(super) async fn discover_compute_leases(
         let store = store.clone();
         let runtime = runtime.clone();
         tasks.push(format!("compute:{}", record.operation_id), async move {
-            let context = record.execution_context().map_err(anyhow::Error::msg)?;
-            if let Some(receipt) = &record.lease {
-                runtime
-                    .release_app_operation_receipt(&context, receipt)
-                    .await?;
-                store
-                    .forget_compute_lease(
-                        &shared_types::ComputeExecutorIdentity {
-                            app_id: record.app_id.clone(),
-                            lifecycle_id: record.lifecycle_id.clone(),
-                            scope: record.scope,
-                            operation_id: record.operation_id.clone(),
-                            generation: record.generation,
-                            executor_id: context.executor_id.clone(),
-                        },
-                        receipt,
-                    )
-                    .await?;
-            }
-            if let Some(template) = template {
-                runtime.cleanup_builder_restart_archive(&template).await?;
-                let current = store
-                    .get_compute_control(&record.app_id, &record.operation_id)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("Archive cleanup operation disappeared"))?;
-                anyhow::ensure!(
-                    current.checkpoint.get("builder_restart_template")
-                        == record.checkpoint.get("builder_restart_template"),
-                    "Archive cleanup checkpoint changed"
-                );
-                store.mark_restart_archive_cleaned(&current).await?;
-            }
-            // These per-operation receipts no longer grant execution authority.
-            // A malformed archive above was not edited, deleted or marked clean.
-            runtime.cleanup_compute_receipt_files(&context).await?;
-            Ok(())
+            with_stall_budget("Clean terminal compute receipts", async move {
+                let context = record.execution_context().map_err(anyhow::Error::msg)?;
+                if let Some(receipt) = &record.lease {
+                    runtime
+                        .release_app_operation_receipt(&context, receipt)
+                        .await?;
+                    store
+                        .forget_compute_lease(
+                            &shared_types::ComputeExecutorIdentity {
+                                app_id: record.app_id.clone(),
+                                lifecycle_id: record.lifecycle_id.clone(),
+                                scope: record.scope,
+                                operation_id: record.operation_id.clone(),
+                                generation: record.generation,
+                                executor_id: context.executor_id.clone(),
+                            },
+                            receipt,
+                        )
+                        .await?;
+                }
+                if let Some(template) = template {
+                    runtime.cleanup_builder_restart_archive(&template).await?;
+                    let current = store
+                        .get_compute_control(&record.app_id, &record.operation_id)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("Archive cleanup operation disappeared"))?;
+                    anyhow::ensure!(
+                        current.checkpoint.get("builder_restart_template")
+                            == record.checkpoint.get("builder_restart_template"),
+                        "Archive cleanup checkpoint changed"
+                    );
+                    store.mark_restart_archive_cleaned(&current).await?;
+                }
+                // These per-operation receipts no longer grant execution authority.
+                // A malformed archive above was not edited, deleted or marked clean.
+                runtime.cleanup_compute_receipt_files(&context).await?;
+                Ok(())
+            })
+            .await?
         });
     }
     Ok(())
@@ -125,14 +128,22 @@ pub(super) async fn sweep_builder_creation_receipts(
     if tasks.is_full() {
         return Ok(());
     }
-    let contexts = runtime.list_builder_creation_receipt_contexts().await?;
+    let contexts = tokio::time::timeout(
+        SCAN_READ_TIMEOUT,
+        runtime.list_builder_creation_receipt_contexts(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Builder creation receipt inventory timed out"))??;
     for context in contexts {
         if tasks.is_full() {
             break;
         }
-        let Some(record) = store
-            .get_operation(&context.app_id, &context.operation_id)
-            .await?
+        let Some(record) = tokio::time::timeout(
+            SCAN_READ_TIMEOUT,
+            store.get_operation(&context.app_id, &context.operation_id),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Builder creation receipt operation read timed out"))??
         else {
             // No record to confirm a terminal outcome — retain the receipts.
             continue;
@@ -144,8 +155,11 @@ pub(super) async fn sweep_builder_creation_receipts(
         tasks.push(
             format!("creation-receipts:{}", context.operation_id),
             async move {
-                runtime.cleanup_builder_creation_receipts(&context).await?;
-                anyhow::Ok(())
+                with_stall_budget("Clean terminal builder creation receipts", async move {
+                    runtime.cleanup_builder_creation_receipts(&context).await?;
+                    anyhow::Ok(())
+                })
+                .await?
             },
         );
     }
