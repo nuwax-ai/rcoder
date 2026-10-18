@@ -167,9 +167,11 @@ impl UserAppDeletionCheckpoint {
                 &development.runtime.operation_id,
                 &development.runtime.resources,
             )?;
-            if development.registry.as_ref().is_some_and(|identity| {
-                identity.generation.is_empty() || identity.container_id.is_empty()
-            }) {
+            if development
+                .registry
+                .as_ref()
+                .is_some_and(|identity| identity.container_id.is_empty())
+            {
                 return Err("Development registry identity is incomplete".into());
             }
         }
@@ -291,9 +293,11 @@ impl UserAppStorageClear {
                 {
                     return Err("Storage clear Kubernetes workload receipt is missing".into());
                 }
-                if receipt.registry.as_ref().is_some_and(|identity| {
-                    identity.generation.is_empty() || identity.container_id.is_empty()
-                }) {
+                if receipt
+                    .registry
+                    .as_ref()
+                    .is_some_and(|identity| identity.container_id.is_empty())
+                {
                     return Err("Storage clear registry identity is incomplete".into());
                 }
                 Ok(())
@@ -336,9 +340,12 @@ impl UserAppStorageDestruction {
             &self.development.runtime.operation_id,
             &self.development.runtime.resources,
         )?;
-        if self.development.registry.as_ref().is_some_and(|identity| {
-            identity.generation.is_empty() || identity.container_id.is_empty()
-        }) {
+        if self
+            .development
+            .registry
+            .as_ref()
+            .is_some_and(|identity| identity.container_id.is_empty())
+        {
             return Err("Storage destruction registry identity is incomplete".into());
         }
         Ok(())

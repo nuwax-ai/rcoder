@@ -15,6 +15,9 @@ use std::{
 };
 use tokio::sync::Notify;
 
+#[cfg(feature = "rcoder-pg")]
+mod empty_mirror_tests;
+
 struct Lease(Arc<AtomicUsize>);
 
 #[async_trait::async_trait]
@@ -650,5 +653,42 @@ async fn captured_cleanup_empty_runtime_preserves_registration_appearing_after_c
             .container_id,
         format!("new-pod-p3-{}", runtime.app)
     );
+    assert_eq!(runtime.physical_deletes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn captured_cleanup_empty_runtime_preserves_empty_history_generation_and_finishes() {
+    let (runtime, projects, store, _dir) = memory_fixture().await;
+    runtime.empty.store(true, Ordering::SeqCst);
+    let mut project = runtime.project("old-pod-p1");
+    let mut identity = project.persistence_identity().clone();
+    identity.generation.clear();
+    project.set_persistence_identity(identity);
+    projects
+        .insert(runtime.app.clone(), Arc::new(project))
+        .unwrap();
+    let ticket = capture_cleanup(&runtime, &projects, store.clone()).await;
+    let captured = ticket.receipt().registry.unwrap();
+    assert_eq!(
+        captured.generation, "",
+        "capture must preserve old diagnostic generation verbatim"
+    );
+    assert_eq!(
+        captured.container_id,
+        runtime.basic("old-pod-p1").container_id
+    );
+    let original = store
+        .get_operation(&runtime.app, &format!("retire-{}", runtime.app))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        original.checkpoint["development"]["registry"]["generation"],
+        ""
+    );
+    finish_cleanup(&runtime, tokio::spawn(ticket.cleanup()))
+        .await
+        .unwrap();
+    assert!(projects.get(&runtime.app).is_none());
     assert_eq!(runtime.physical_deletes.load(Ordering::SeqCst), 0);
 }

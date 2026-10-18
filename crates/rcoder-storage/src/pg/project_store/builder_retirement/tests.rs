@@ -51,6 +51,14 @@ impl Fixture {
     }
 
     async fn new_capture(destruction: Destruction, empty: bool) -> Option<Self> {
+        Self::new_capture_with_history(destruction, empty, false).await
+    }
+
+    async fn new_capture_with_history(
+        destruction: Destruction,
+        empty: bool,
+        empty_history_generation: bool,
+    ) -> Option<Self> {
         let dsn = test_support::test_dsn().await?;
         // Every PgStore boot hydrates the whole schema. A temporary malformed
         // history witness must not poison another concurrently booting fixture.
@@ -186,7 +194,7 @@ impl Fixture {
             restart_runtime_workspace: None,
             builder_startup_mode: Default::default(),
         };
-        let development = UserappDevDeletionReceipt {
+        let mut development = UserappDevDeletionReceipt {
             runtime: BuilderDeletionSnapshot {
                 resource_binding: None,
                 app_id: app.clone(),
@@ -207,6 +215,14 @@ impl Fixture {
             collaborators: vec![],
             directories: None,
         };
+        if empty_history_generation {
+            development
+                .registry
+                .as_mut()
+                .expect("historical Empty registry capture")
+                .generation
+                .clear();
+        }
         let production = shared_types::AppDeletionSnapshot {
             app_id: app.clone(),
             operation_id: format!("production-{app}"),
@@ -701,4 +717,74 @@ async fn pg_builder_retirement_empty_capture_preserves_later_p3_registration() {
         Some(format!("new-pod-p3-{}", f.target.context.app_id))
     );
     f.finish().await;
+}
+
+#[tokio::test]
+async fn pg_builder_retirement_empty_history_generation_retains_current_authority_and_p3_fence() {
+    for kind in [Destruction::DevStorage, Destruction::Purge] {
+        for replacement in [false, true] {
+            let Some(f) = Fixture::new_capture_with_history(kind, true, true).await else {
+                return;
+            };
+            let control = PgUserAppStore::connect(&PostgresConfig {
+                url: Some(f.dsn.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let original = control
+                .get_operation(&f.target.context.app_id, &f.target.context.operation_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                original.checkpoint["development"]["registry"]["generation"], "",
+                "the persisted historical receipt must retain its original empty diagnostic field"
+            );
+            control.shutdown().await.unwrap();
+            let app = f.target.context.app_id.clone();
+            let generation = database::read(&f.peer.database, move |tx| {
+                Box::pin(async move {
+                    Ok(models::Project::filter_by_project_id(&app)
+                        .first()
+                        .exec(tx)
+                        .await?
+                        .expect("current canonical project")
+                        .generation)
+                })
+            })
+            .await
+            .unwrap();
+            assert!(
+                !generation.is_empty(),
+                "current canonical generation remains valid and authoritative"
+            );
+            if replacement {
+                let p3 = format!("new-pod-p3-{}", f.target.context.app_id);
+                f.sql("UPDATE containers SET container_id=$2,row_revision=row_revision+1 WHERE logical_id=$1", p3.clone()).await;
+                assert_eq!(
+                    f.physical().await,
+                    Some(p3.clone()),
+                    "the exact canonical P3 must really exist before retirement"
+                );
+                let error = f
+                    .first
+                    .retire_captured_builder_registration(&f.target)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("appeared after the empty deletion capture"),
+                    "historical generation must not weaken actual P3 protection: {error:#}"
+                );
+                assert_eq!(f.physical().await, Some(p3));
+            } else {
+                f.first
+                    .retire_captured_builder_registration(&f.target)
+                    .await
+                    .unwrap();
+                assert!(f.physical().await.is_none());
+            }
+            f.finish().await;
+        }
+    }
 }

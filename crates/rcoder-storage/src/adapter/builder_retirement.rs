@@ -99,6 +99,29 @@ fn validate_builder_retirement(
 }
 
 impl ProjectAdapter {
+    pub(crate) fn capture_builder_registry_identity(
+        &self,
+        app_id: &str,
+    ) -> Result<Option<shared_types::BuilderRegistryIdentity>> {
+        let _project_guard = self.project_locks.entry_by_ref(app_id);
+        let Some(project) = self.get(app_id) else {
+            return Ok(None);
+        };
+        ensure!(
+            project
+                .service_type()
+                .is_none_or(|family| family == ServiceType::UserappBuilder),
+            "Builder registration belongs to another service family"
+        );
+        Ok(project
+            .container_info()
+            .filter(|container| !container.container_id.is_empty())
+            .map(|container| shared_types::BuilderRegistryIdentity {
+                generation: project.persistence_identity().generation.clone(),
+                container_id: container.container_id,
+            }))
+    }
+
     pub(crate) fn check_captured_builder_registration(
         &self,
         target: &BuilderControlTarget,

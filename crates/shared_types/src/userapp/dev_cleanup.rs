@@ -15,6 +15,8 @@ pub struct BuilderDeletionSnapshot {
 /// Registration identity captured alongside physical builder resources.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuilderRegistryIdentity {
+    /// Historical registry epoch, preserved verbatim for diagnostics. It does
+    /// not authorize retirement; legacy receipts may contain an empty value.
     pub generation: String,
     pub container_id: String,
 }

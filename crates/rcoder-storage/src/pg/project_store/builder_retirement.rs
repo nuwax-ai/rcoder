@@ -48,6 +48,56 @@ fn receipt_identity(target: &BuilderControlTarget) -> Result<(String, String)> {
 }
 
 impl PgStore {
+    pub async fn capture_builder_registry_identity(
+        &self,
+        app_id: &str,
+    ) -> Result<Option<shared_types::BuilderRegistryIdentity>> {
+        let app_id = app_id.to_owned();
+        let observation = database::read(&self.database, move |tx| {
+            Box::pin(async move {
+                let Some(project) = models::Project::filter_by_project_id(&app_id)
+                    .first()
+                    .exec(tx)
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                ensure!(
+                    historical_family(project.service_type.as_deref())
+                        .is_none_or(|family| family == shared_types::ServiceType::UserappBuilder),
+                    "Builder registration belongs to another service family"
+                );
+                let Some(name) = project.container_name else {
+                    return Ok(None);
+                };
+                let container = models::Container::filter_by_container_name(name)
+                    .first()
+                    .exec(tx)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Current builder container registration cannot be read")
+                    })?;
+                ensure!(
+                    historical_family(Some(&container.service_type))
+                        .is_none_or(|family| family == shared_types::ServiceType::UserappBuilder),
+                    "Builder container belongs to another service family"
+                );
+                // These ORM fields are current identity evidence. Do not
+                // hydrate unrelated model/status JSON or publish the mirror.
+                Ok(container
+                    .container_id
+                    .filter(|uid| !uid.is_empty())
+                    .map(|container_id| shared_types::BuilderRegistryIdentity {
+                        generation: project.generation,
+                        container_id,
+                    }))
+            })
+        });
+        tokio::time::timeout(Self::DURABLE_COMMIT_TIMEOUT, observation).await
+            .map_err(|_| anyhow::anyhow!("Canonical builder identity observation exceeded its original durable deadline; no physical deletion was submitted"))?
+            .context("Capture canonical builder registry identity")
+    }
+
     pub async fn check_captured_builder_registration(
         &self,
         target: &BuilderControlTarget,

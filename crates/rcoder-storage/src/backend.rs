@@ -28,6 +28,19 @@ pub enum ProjectStoreBackend {
 }
 
 impl ProjectStoreBackend {
+    /// Freeze a registration hint from its authoritative backend without
+    /// publishing a routing mirror or authorizing a physical deletion.
+    pub async fn capture_builder_registry_identity(
+        &self,
+        app_id: &str,
+    ) -> anyhow::Result<Option<shared_types::BuilderRegistryIdentity>> {
+        match self {
+            Self::Memory(inner) => inner.capture_builder_registry_identity(app_id),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => store.capture_builder_registry_identity(app_id).await,
+        }
+    }
+
     /// Verify current ownership and references before the original physical deletion.
     pub async fn check_captured_builder_registration(
         &self,

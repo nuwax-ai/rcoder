@@ -347,31 +347,14 @@ impl UserappDevResourcesCleanup {
             extra_leases.push(lease);
             extra_instances.push((instance, extra_snapshot));
         }
-        // A readable explicit foreign family is meaningful. Missing historical
-        // routing fields are not evidence of another live execution.
+        // Freeze the authoritative registry hint while the original physical
+        // guard is held. A peer's old row can be absent from this replica's
+        // mirror; that cache miss must not become a new physical identity.
         let registry_identity = self
             .projects
-            .get(&owner_instance)
-            .map(|project| {
-                if project
-                    .service_type()
-                    .is_some_and(|family| family != shared_types::ServiceType::UserappBuilder)
-                {
-                    return Err("registration belongs to another service family".to_string());
-                }
-                Ok(project
-                    .container_info()
-                    .filter(|container| !container.container_id.is_empty())
-                    .filter(|_| !project.persistence_identity().generation.is_empty())
-                    .map(|container| {
-                        (
-                            project.persistence_identity().generation.clone(),
-                            container.container_id,
-                        )
-                    }))
-            })
-            .transpose()?
-            .flatten();
+            .capture_builder_registry_identity(&owner_instance)
+            .await
+            .map_err(|error| format!("Capture builder registry identity: {error:#}"))?;
         let directories = if snapshot.docker_bind_cleanup {
             capture_bind_directories(app_id).await?
         } else {
@@ -379,12 +362,7 @@ impl UserappDevResourcesCleanup {
         };
         let receipt = shared_types::UserappDevDeletionReceipt {
             runtime: snapshot.clone(),
-            registry: registry_identity.map(|(generation, container_id)| {
-                shared_types::BuilderRegistryIdentity {
-                    generation,
-                    container_id,
-                }
-            }),
+            registry: registry_identity,
             lease: operation.lease.as_ref().and_then(|lease| lease.receipt()),
             collaborators: extra_instances
                 .iter()
