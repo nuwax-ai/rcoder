@@ -1798,7 +1798,14 @@ mod lifecycle_tests {
             return;
         };
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        std::fs::write(path, listener.local_addr().unwrap().to_string()).unwrap();
+        let path = std::path::PathBuf::from(path);
+        // Publish the complete address at once: write() creates the marker
+        // before its bytes are visible to the parent's readiness reader.
+        let mut marker = tempfile::NamedTempFile::new_in(path.parent().unwrap()).unwrap();
+        marker
+            .write_all(listener.local_addr().unwrap().to_string().as_bytes())
+            .unwrap();
+        marker.persist(path).unwrap();
         for stream in listener.incoming() {
             let mut stream = stream.unwrap();
             let mut request = [0; 4096];
