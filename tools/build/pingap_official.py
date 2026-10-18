@@ -114,7 +114,12 @@ def unchanged_source(source, version, commit):
     if checked(['git', 'status', '--porcelain', '--untracked-files=no'], source, True).stdout.strip():
         raise ValueError('official source has tracked modifications')
     cargo = tomllib.loads((source / 'Cargo.toml').read_text(encoding='utf-8'))
-    if cargo['package']['version'] != version:
+    package_version = cargo['package'].get('version')
+    if (isinstance(package_version, dict)
+            and set(package_version) == {'workspace'}
+            and package_version['workspace'] is True):
+        package_version = cargo.get('workspace', {}).get('package', {}).get('version')
+    if package_version != version:
         raise ValueError('official source package version mismatch')
 
 
