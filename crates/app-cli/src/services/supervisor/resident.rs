@@ -1342,7 +1342,9 @@ impl ResidentProxy {
         let mut command = tokio::process::Command::new(&self.args.pingap_bin);
         command
             .arg("-c")
-            .arg(&outcome.config_path)
+            .arg(crate::proxy::command_path::external_config_path(
+                &outcome.config_path,
+            )?)
             .env("PINGAP_ADMIN_ADDR", &endpoint.addr)
             .env("PINGAP_ADMIN_USER", &endpoint.user)
             .env("PINGAP_ADMIN_PASSWORD", &endpoint.password);

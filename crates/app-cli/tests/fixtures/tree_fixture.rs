@@ -20,6 +20,18 @@ mod protocol_pingap;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if std::env::current_exe()
+        .expect("fixture executable")
+        .file_stem()
+        .and_then(|name| name.to_str())
+        == Some("pingap-fixture")
+    {
+        if let Err(error) = protocol_pingap::binary_entry(&args[1..]) {
+            eprintln!("protocol proxy fixture: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     match args.get(1).map(String::as_str) {
         Some("protocol-pingap") => {
             if let Err(error) = protocol_pingap::run(&args[2..]) {

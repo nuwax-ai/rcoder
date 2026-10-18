@@ -269,7 +269,7 @@ async fn probe_owned(binary: &Path, deadline: Instant) -> Result<BTreeSet<String
     super::official_env::sanitize(&mut command);
     command
         .arg("-c")
-        .arg(&config_path)
+        .arg(super::command_path::external_config_path(&config_path)?)
         // No --cp: that upstream path cannot furnish this process observation.
         .env("PINGAP_ADMIN_ADDR", address.to_string())
         .env("PINGAP_ADMIN_USER", &user)

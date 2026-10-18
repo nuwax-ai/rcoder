@@ -18,7 +18,9 @@ pub(super) async fn spawn_pingap_into_session_tree(
     // R01：pingap 受管进程树 spawn（与业务服务同一停止/收束链）。
     let mut cmd = Command::new(pingap_bin);
     cmd.arg("-c")
-        .arg(&outcome.config_path)
+        .arg(crate::proxy::command_path::external_config_path(
+            &outcome.config_path,
+        )?)
         // pingap 的 env override 规则：`get_from_env(key)` 读 `PINGAP_{key}` 全大写
         //（pingap src/main.rs parse_arguments 的闭包），故必须用 PINGAP_ADMIN_* 而非 admin_*。
         // 凭证经 env 注入（不进命令行避免 ps 泄露、不落盘不进日志），admin 仅 loopback 只读。

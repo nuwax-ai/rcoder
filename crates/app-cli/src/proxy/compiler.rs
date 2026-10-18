@@ -1044,7 +1044,10 @@ pub(crate) async fn validate_candidate_until(
     .context("write native proxy validation configuration")?;
     let mut command = Command::new(pingap_bin);
     super::official_env::sanitize(&mut command);
-    command.arg("-t").arg("-c").arg(&target);
+    command
+        .arg("-t")
+        .arg("-c")
+        .arg(super::command_path::external_config_path(&target)?);
     let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
     anyhow::ensure!(
         !budget.is_zero(),

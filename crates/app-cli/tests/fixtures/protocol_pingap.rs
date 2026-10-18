@@ -12,6 +12,22 @@ use std::{
     time::Duration,
 };
 
+const VERSION: &str = "0.15.0";
+const COMMIT: &str = "8270a1ebb7a238ea86fa220215714613410378bb";
+
+/// Single-executable protocol fixture: the reported PID remains the real root.
+pub fn binary_entry(args: &[String]) -> Result<()> {
+    if args.len() == 1 && args[0] == "-V" {
+        println!("pingap {VERSION}");
+        return Ok(());
+    }
+    if args.len() == 1 && args[0] == "--version" {
+        println!("pingap {VERSION} ({COMMIT}, tls=rustls)");
+        return Ok(());
+    }
+    run(args)
+}
+
 struct Configuration {
     config: PingapConfig,
     hash: String,
@@ -185,8 +201,8 @@ fn respond(
         }
         let body = serde_json::to_string(&BasicWire {
             pid: std::process::id().to_string(),
-            version: "0.15.0",
-            git_hash: "8270a1ebb7a238ea86fa220215714613410378bb",
+            version: VERSION,
+            git_hash: COMMIT,
             config_hash: if rejected_hash {
                 "fixture-rejected-config"
             } else {
