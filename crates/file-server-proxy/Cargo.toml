@@ -6,7 +6,7 @@ name = "file-server-proxy"
 # （破坏性：public_bind_declared 默认 true）+ owner 控制加固；0.2.x 见 git 历史
 # 0.2.2: 独立双文件日志+日志目录本机回退（用户指正：proxy 要有独立日志方便排查）
 # 0.2.1 子项见 git 历史
-version = "0.3.0"
+version = "0.3.1"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

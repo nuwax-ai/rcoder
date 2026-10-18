@@ -1,7 +1,7 @@
 {
   "name": "@nuwax-ai/file-server-proxy",
   "version": "0.0.0",
-  "description": "Native file-server-proxy (Rust) as the single entry on :60000 — embeds the Rust file-server, routes between Rust and the TypeScript nuwax-file-server, and manages nuwax-file-server (installed as a pinned dependency); prebuilt binary from Alibaba Cloud OSS.",
+  "description": "Native file-server-proxy (Rust) on :60000 with an embedded Rust file-server by default; optional explicitly installed or external TypeScript upstream, with verified prebuilt binaries from Alibaba Cloud OSS.",
   "license": "Apache-2.0",
   "author": "soddygo <soddygo@qq.com>",
   "homepage": "https://github.com/nuwax-ai/rcoder/tree/main/crates/file-server-proxy",

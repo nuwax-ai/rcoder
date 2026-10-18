@@ -1,7 +1,7 @@
 name: release-file-server-proxy
 
 # 发布 file-server-proxy 二进制（default feature=embed-file-server 直连集成内嵌 rust file-server）
-# 到阿里云 OSS + 发布 @nuwax-ai/file-server-proxy npm 包装包（依赖 nuwax-file-server 精确 pin）。
+# 到阿里云 OSS + 发布 @nuwax-ai/file-server-proxy npm 包装包；TS 上游由用户显式提供。
 # 触发：推 tag `file-server-proxy-v*`（稳定 / 预发布）或手动 workflow_dispatch。
 # 与 release-file-server.yml / rcoder release.yml 互不干扰——靠 tag 前缀隔离。
 #
@@ -34,16 +34,23 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       prerelease: ${{ steps.v.outputs.prerelease }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
       - id: v
         shell: bash
+        env:
+          REQUESTED_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF#refs/tags/}"
-          if [ "${GITHUB_REF}" = "${TAG}" ]; then
-            # 非 tag 触发（workflow_dispatch），用输入
-            TAG="${{ github.event.inputs.tag }}"
-          fi
+          TAG="$REQUESTED_TAG"
+          [[ "$TAG" == file-server-proxy-v* ]] || { echo "expected a file-server-proxy-v* tag"; exit 1; }
+          [ "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$TAG^{commit}")" ] || {
+            echo "checkout does not match release tag $TAG"; exit 1; }
           VERSION="${TAG#file-server-proxy-v}"
+          grep -Fxq "version = \"${VERSION}\"" crates/file-server-proxy/Cargo.toml || {
+            echo "release tag and file-server-proxy Cargo version disagree"; exit 1; }
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           if [[ "$VERSION" == *-* ]]; then
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
@@ -69,6 +76,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       # 显式更新 stable，并记录本轮工具链；不依赖 runner 的默认版本。
       - name: Update and record Rust stable + target
@@ -91,6 +100,7 @@ jobs:
 
       - name: Install protoc + nasm (Windows)
         if: runner.os == 'Windows'
+        shell: bash
         run: |
           choco install protoc -y --no-progress
           # aws-lc-rs（reqwest rustls 的 crypto provider）在 msvc 下需要 nasm 做汇编
@@ -111,9 +121,9 @@ jobs:
           USE_ZIG: ${{ matrix.zig }}
         run: |
           if [ "$USE_ZIG" = "true" ]; then
-            cargo zigbuild --release --target "$TARGET" -p file-server-proxy --bin file-server-proxy
+            cargo zigbuild --locked --release --target "$TARGET" -p file-server-proxy --bin file-server-proxy
           else
-            cargo build --release --target "$TARGET" -p file-server-proxy --bin file-server-proxy
+            cargo build --locked --release --target "$TARGET" -p file-server-proxy --bin file-server-proxy
           fi
 
       - name: Package archive
@@ -255,11 +265,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
+
+      - name: Check wrapper packaging
+        working-directory: crates/file-server-proxy/npm
+        run: node --test
 
       - name: Stamp version into package.json
         working-directory: crates/file-server-proxy/npm

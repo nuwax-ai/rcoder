@@ -1,6 +1,6 @@
 # @nuwax-ai/file-server-proxy
 
-Rust 原生 `file-server-proxy`——**60000 单一入口**的文件服务代理，单二进制自带内嵌 Rust file-server，并按路由策略在 Rust 与 TypeScript 版 [nuwax-file-server](https://www.npmjs.com/package/nuwax-file-server)（作为依赖自动安装）之间分流。
+Rust 原生 `file-server-proxy`——**60000 单一入口**的文件服务代理，单二进制自带内嵌 Rust file-server。默认 `all_rust`，无需 TypeScript 服务；显式选择兼容策略时，可转发到另行安装或外部运行的 TypeScript 版 [nuwax-file-server](https://www.npmjs.com/package/nuwax-file-server)。
 
 面向 nuwax Electron 客户端与本地开发环境的 sidecar 分发形态（平台二进制从阿里云 OSS 下载；rcoder 主 pod / agent-runner 容器内嵌形态不走本包）。
 
@@ -10,12 +10,9 @@ Rust 原生 `file-server-proxy`——**60000 单一入口**的文件服务代理
 npm install @nuwax-ai/file-server-proxy
 ```
 
-安装时自动：
+安装时从 OSS 准备当前平台的 proxy 二进制并校验发布回执。下载或校验失败时安装准备步骤返回失败，首次启动不补下载（`FILE_SERVER_PROXY_SKIP_DOWNLOAD=1` 可显式跳过，打包或启动前仍需完成准备）。本包不自动安装 `nuwax-file-server`，TS 兼容方式见下文。
 
-1. 从 OSS 准备当前平台的 proxy 二进制并校验发布回执；下载或校验失败时安装准备步骤返回失败，首次启动不补下载（`FILE_SERVER_PROXY_SKIP_DOWNLOAD=1` 可显式跳过，打包或启动前仍需完成准备）；
-2. 安装 `nuwax-file-server`（**精确版本 pin**，与 proxy 版本同步测试，`npm update` 不会拉动它）。
-
-要求 Node ≥ 22（nuwax-file-server 的硬门槛）。
+要求 Node ≥ 22。
 
 ## 架构
 
@@ -24,7 +21,7 @@ npm install @nuwax-ai/file-server-proxy
                  ├─ 分流代理（本二进制）
                  ├─ 内嵌 Rust file-server（以 lib 集成，rust 域请求进程内 oneshot
                  │  直调——无内部监听端口、零 loopback 跳）
-                 └─ TS nuwax-file-server（唯一额外进程，随机端口，由 CLI 拉起托管）
+                 └─ 可选 TS 上游（显式安装后托管，或只转发至外部服务）
 ```
 
 三档路由策略（`--policy`；同一词汇表贯穿 helm/config.yml/CLI/env 三层）：
@@ -55,23 +52,26 @@ npm install @nuwax-ai/file-server-proxy
 file-server-proxy start [--policy <ts_first|all_rust|all_ts>]
                         [--port <60000>] [--rust-port <8086>]
                         [--ts-port <N>] [--detached]
-file-server-proxy stop [--all]
+file-server-proxy stop
 file-server-proxy status
 file-server-proxy restart [start flags]
 file-server-proxy --version
 ```
 
-- `start` 默认**前台**运行（Ctrl-C 退出时清理：杀代理；由本 CLI 拉起的 TS 一并停止）。`--detached` 后台运行，日志写 `os.tmpdir()/file-server-proxy/proxy.log`；
-- TS 端口默认**随机分配未占用端口**（`--ts-port` 可固定；见下方单实例说明）；
-- `stop` 停代理与**由本 CLI 拉起的** TS；`--all` 强制停 TS（即使它先于本 CLI 存在）；
-- `status` 报告代理/TS 各组件状态；`restart` 携带的 flags 原样透传给 `start`。
+- `start` 默认**前台**运行，`--detached` 后台运行。重复启动可复用同一作用域内已确认的 owner；Ctrl-C 仅停止本次新建且已确认归属的 owner 及其托管 TS，复用的 owner 保持运行；
+- 托管 TS 使用随机可用端口；`--ts-port` 指定的是已在运行的外部 TS 上游，不会在该端口创建或接管服务；
+- `stop` 通过原生控制停止本作用域的 owner 及其托管组件，不停止外部 TS。`--all` 不受支持；
+- `status` 返回原生 owner 状态；`restart` 先停止本作用域，再按所传启动参数启动。
 
-## nuwax-file-server 托管语义
+## TypeScript 兼容方式
 
-- TS 自身是**全局单实例**设计（PID 文件 + 启动锁在 `os.tmpdir()/nuwax-file-server/`）；
-- `start` 时若探测到**已有健康 TS 实例**（任意端口），直接复用该端口转发（`status` 显示 `reused/external`，`stop` 不会动它）；
-- 没有实例时以随机端口拉起（`status` 显示 `managed`，`stop`/前台退出时连带停止）；
-- 若上次异常退出留下陈旧启动锁，TS 自带 120 秒自动清理窗口——期间 `start` 报错属预期，稍候重试即可。
+显式使用 `ts_first` 或 `all_ts` 时，选择一种方式：
+
+- 在应用中另行安装经过验证版本的 `nuwax-file-server`，使本包能解析 `nuwax-file-server/dist/server.js`，再运行 `file-server-proxy start --policy ts_first`。包装器只负责解析入口；Rust owner 使用当前 Node 在随机端口启动并托管这一进程，不搜索或接管其他 TS 实例。
+- 已有外部 TS 服务时，运行 `file-server-proxy start --policy ts_first --ts-port 60001`，端口替换为该服务实际的本机端口。该方式仅转发，外部服务的启动和停止由调用方负责。
+- 自带工具链时，同时设置 `FILE_SERVER_PROXY_TS_NODE` 和 `FILE_SERVER_PROXY_TS_ENTRY`，分别指向现有的 Node 可执行文件及 TS 服务入口的绝对路径。Electron 中采用托管 TS 时必须显式提供独立 Node 和入口，不能把 Electron 可执行文件当作 Node。
+
+显式工具链不能与 `--ts-port` 混用；`all_rust` 不接受 TS 工具链。TS 版本由调用方显式选择，升级后应验证所使用的兼容路径。
 
 ## 日志
 
@@ -83,8 +83,7 @@ file-server-proxy --version
 | `file-server-proxy.log` | 代理自身：分流决策/上游错误/生命周期 | 请求走错边、502、启停问题 |
 | `file-server.log` | 内嵌 file-server：请求日志/业务错误 | 文件操作本身（上传/列表/删除） |
 
-后台模式的 console 输出另存 `os.tmpdir()/file-server-proxy/proxy.log`（npm CLI 的
-stdout 重定向）；`file-server-proxy status` 不读日志，排障直接看上表文件。
+`--detached` 不保留包装器的 console 输出；运行日志查看上表文件。
 
 ## 端口总览
 
@@ -92,7 +91,7 @@ stdout 重定向）；`file-server-proxy status` 不读日志，排障直接看�
 |---|---|---|
 | 60000 | file-server-proxy | 对外唯一入口（`--port` 可改） |
 | —（无内部端口） | 内嵌 Rust file-server | 以 lib 集成进程内直连；`--rust-port` 仅纯转发形态（`--no-embed`/`EMBED_FILE_SERVER=0`，上游为外部进程）时生效 |
-| 随机 | nuwax-file-server | 仅 loopback（`--ts-port` 固定） |
+| 随机或显式端口 | nuwax-file-server | 托管模式随机分配 loopback 端口；`--ts-port` 仅转发已有外部服务 |
 
 ## 内嵌 Rust file-server 的环境变量
 
@@ -115,6 +114,7 @@ stdout 重定向）；`file-server-proxy status` 不读日志，排障直接看�
 | `FILE_SERVER_PROXY_BINARY` | 使用本地开发二进制；启动执行原生 `--version` 探针，不下载，不宣称官方包摘要已验证 |
 | `FILE_SERVER_PROXY_TARGET` | 覆盖 Rust target triple（交叉打包用） |
 | `FILE_SERVER_PROXY_SKIP_DOWNLOAD=1` | postinstall 跳过预下载 |
+| `FILE_SERVER_PROXY_TS_NODE` / `FILE_SERVER_PROXY_TS_ENTRY` | 同时指定托管 TS 使用的独立 Node 和服务入口的绝对路径 |
 
 ## 平台支持
 
@@ -128,14 +128,14 @@ stdout 重定向）；`file-server-proxy status` 不读日志，排障直接看�
 ## 排错
 
 - **postinstall 下载失败**：安装准备步骤明确失败，首次 `start` 不补下载。可重新执行 `node scripts/postinstall.js`，或显式使用本地开发二进制覆盖；
-- **`start` 报 already running**：先 `stop`；`status` 看 pid；
+- **启动状态未知**：查看 `status` 和运行日志，修正前置后重试原命令；不要根据 PID 文件擅自终止其他进程；
 - **60000 端口被占**：本机 rcoder 本地开发也可能占 60000——用 `--port` 换口，或先停占用方；
-- **TS start 报 stale lock**：见上文 120 秒自愈窗口；
-- **代理 502**：上游（TS 随机口 / 直连内嵌 rust 异常）未就绪或已死——`status` 检查，必要时 `restart`；后台模式日志在 `os.tmpdir()/file-server-proxy/proxy.log`。
+- **TS 兼容启动提示缺少入口**：显式安装可解析的 `nuwax-file-server`，提供独立工具链，或用 `--ts-port` 指向已有服务；
+- **代理 502**：检查所选策略需要的上游及运行日志；外部 TS 需由其管理方恢复，托管组件可通过本作用域的 `restart` 恢复。
 
 ## 版本与发版
 
-- npm 包版本由 rcoder 仓库 git tag `file-server-proxy-v*` 驱动 CI 注入；`nuwax-file-server` 精确 pin，升级 TS 时随本包发版手动 bump 并回归；
+- npm 包版本由 rcoder 仓库 git tag `file-server-proxy-v*` 驱动 CI 注入；本包不包含 TS 依赖 pin；
 - 二进制内嵌 Rust file-server（cargo feature `embed-file-server`），与 `@nuwax-ai/file-server` npm 包产物同源。
 
 
