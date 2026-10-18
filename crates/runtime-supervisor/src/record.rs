@@ -1257,9 +1257,24 @@ mod tests {
             child.wait().unwrap();
             save(&root.join("generation.json"), &value).unwrap();
         }
+        #[cfg(windows)]
+        let _exited_worker = {
+            let root = work_root(_temp.path(), &id).unwrap();
+            let mut value = generation(&root).unwrap();
+            let mut child = std::process::Command::new("cmd")
+                .args(["/C", "exit", "0"])
+                .spawn()
+                .unwrap();
+            value.worker_pid = Some(child.id());
+            assert!(child.wait().unwrap().success());
+            save(&root.join("generation.json"), &value).unwrap();
+            // Retain the real signaled handle so its PID cannot be reused
+            // before the read-only Windows observation below.
+            child
+        };
         // A dead worker is now eligible for cleanup, but its unknown command
         // outcome still prevents publishing quiescence or launching new work.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             let candidate = reconcile(_temp.path()).unwrap().unwrap();
             assert!(
@@ -1272,7 +1287,7 @@ mod tests {
             );
             drop(candidate);
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         assert!(reconcile(_temp.path()).is_err());
         assert!(verify_quiescent(_temp.path(), &id).is_err());
         drop(_guard);
