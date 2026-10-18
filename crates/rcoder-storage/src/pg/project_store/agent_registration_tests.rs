@@ -3,6 +3,7 @@ use crate::{
     config::PostgresConfig,
     pg::{PgStore, test_support},
 };
+use chrono::SubsecRound;
 use shared_types::{
     AgentWorkspaceIdentity, ContainerBasicInfo, ProjectAndContainerInfo, ProjectStore, ServiceType,
     VerifiedAgentReplacement, persistence::PersistenceWriteOutcome,
@@ -55,6 +56,15 @@ fn frozen(project: &ProjectAndContainerInfo) -> ProjectAndContainerInfo {
     let mut frozen = project.clone();
     frozen.set_container(project.container_info());
     frozen
+}
+
+fn at_postgres_precision(basic: Option<ContainerBasicInfo>) -> Option<ContainerBasicInfo> {
+    basic.map(|mut basic| {
+        // PostgreSQL stores microseconds; keep the complete DTO comparison,
+        // including the timestamp at its actual persisted precision.
+        basic.created_at = basic.created_at.trunc_subsecs(6);
+        basic
+    })
 }
 fn evidence(previous: &ContainerBasicInfo) -> VerifiedAgentReplacement {
     let mut replacement = previous.clone();
@@ -1151,7 +1161,9 @@ async fn new_shared_project_cannot_replace_a_canonical_workload_without_verified
     let a = format!("canonical-old-project-{suffix}");
     let b = format!("canonical-new-project-{suffix}");
     let sid_a = format!("canonical-old-session-{suffix}");
-    let original = basic(&owner);
+    let mut original = basic(&owner);
+    original.created_at =
+        chrono::Timelike::with_nanosecond(&original.created_at, 123_456_789).unwrap();
     let store = store(&dsn).await;
     store
         .insert_with_session_durable(a.clone(), project(&a, &owner, &original), &sid_a)
@@ -1169,7 +1181,10 @@ async fn new_shared_project_cannot_replace_a_canonical_workload_without_verified
         outcome.is_err(),
         "a new project's absence is not permission to replace another project's shared workload"
     );
-    assert_eq!(persisted_a.container_info(), expected_a.container_info());
+    assert_eq!(
+        persisted_a.container_info(),
+        at_postgres_precision(expected_a.container_info())
+    );
     assert!(
         store.get(&b).is_none(),
         "refused registration cannot leave a mixed new identity / old Basic record"
@@ -1185,7 +1200,8 @@ async fn database_rejects_an_unverified_canonical_replacement_from_a_stale_repli
     let owner = format!("stale-canonical-owner-{suffix}");
     let a = format!("stale-canonical-a-{suffix}");
     let b = format!("stale-canonical-b-{suffix}");
-    let old = basic(&owner);
+    let mut old = basic(&owner);
+    old.created_at = chrono::Timelike::with_nanosecond(&old.created_at, 123_456_789).unwrap();
     let store = store(&dsn).await;
     store
         .insert_with_session_durable(
@@ -1221,7 +1237,7 @@ async fn database_rejects_an_unverified_canonical_replacement_from_a_stale_repli
     let reader = self::store(&dsn).await;
     assert_eq!(
         reader.get(&a).unwrap().container_info(),
-        original.container_info()
+        at_postgres_precision(original.container_info())
     );
     assert!(reader.get(&b).is_none());
     assert!(reader.writer().flush_and_stop(Duration::from_secs(5)).await);
