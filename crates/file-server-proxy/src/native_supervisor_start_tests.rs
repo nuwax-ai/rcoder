@@ -440,6 +440,19 @@ mod legacy_start_tests {
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         };
+        // Windows reports a refused loopback connect after roughly two seconds.
+        // Keep the same live protocol and assertions; only the fixture deadlines
+        // must allow the OS to return its actual typed result.
+        let observation_budget = if cfg!(windows) {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(1)
+        };
+        let control_budget = if cfg!(windows) {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(2)
+        };
         let directory = tempfile::tempdir().unwrap();
         let owner = Arc::new(Mutex::new(Some(lock_scope(directory.path()))));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -450,7 +463,7 @@ mod legacy_start_tests {
         let dead_address = previous.local_addr().unwrap();
         drop(previous);
         let refused = tokio::time::timeout(
-            Duration::from_secs(1),
+            observation_budget,
             tokio::net::TcpStream::connect(dead_address),
         )
         .await
@@ -506,7 +519,7 @@ mod legacy_start_tests {
             match select_start_owner(
                 directory.path(),
                 &Policy {
-                    initialization_timeout: Duration::from_secs(1),
+                    initialization_timeout: observation_budget,
                     ..Default::default()
                 },
             )
@@ -518,7 +531,7 @@ mod legacy_start_tests {
             }
         } else {
             tokio::time::timeout(
-                Duration::from_secs(2),
+                control_budget,
                 crate::native_control::control_with_request(
                     directory.path(),
                     action,
