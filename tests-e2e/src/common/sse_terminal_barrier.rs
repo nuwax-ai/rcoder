@@ -1,7 +1,7 @@
 //! Observe the original turn's real terminal before testing a later connection.
 use std::{cell::RefCell, time::Instant};
 
-use rcoder_e2e::common::sse::{self, SseEvent};
+use super::sse::{self, SseEvent};
 use tokio::sync::watch;
 
 pub struct Observation {

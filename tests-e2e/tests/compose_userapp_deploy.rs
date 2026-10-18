@@ -22,8 +22,7 @@ use rcoder_e2e::common::report::JsonlReporter;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-#[path = "support/dev_restart_settlement.rs"]
-mod dev_restart_settlement;
+use rcoder_e2e::common::dev_restart_settlement;
 #[path = "support/purge_recovery.rs"]
 mod purge_recovery;
 

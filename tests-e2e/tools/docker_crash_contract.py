@@ -244,7 +244,9 @@ def main():
                     raise RuntimeError('normal ensure did not restore one builder with retained data')
                 request = urllib.request.Request(base + '/api/v1/userapp/execute-command',
                     data=json.dumps({'app_id': receipt['app_id'], 'user_id': receipt['user_id'],
-                                     'command': 'cat crash-data-marker'}).encode(),
+                                     # The dev execution API starts at the application
+                                     # workspace root; the retained marker is under code/.
+                                     'command': 'cat code/crash-data-marker'}).encode(),
                     headers={'Content-Type': 'application/json', 'X-App-Id': receipt['app_id']})
                 with urllib.request.urlopen(request, timeout=30) as response:
                     readable = json.load(response)

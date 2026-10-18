@@ -8,8 +8,7 @@
 
 use std::time::{Duration, Instant};
 
-#[path = "support/sse_terminal_barrier.rs"]
-mod sse_terminal_barrier;
+use rcoder_e2e::common::sse_terminal_barrier;
 
 use rcoder_e2e::common::scenario::{
     CollectSpec, assert_hard_all, collect_reported, count_event, record_bg_chat, spawn_chat,

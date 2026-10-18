@@ -3,10 +3,12 @@
 //! 与 Python 套件（tests/sse_e2e/common.py）语义对齐；配置读取同为
 //! "环境变量优先，仓库根 .env.local 兜底"（API key 等不进 git）。
 
+pub mod dev_restart_settlement;
 pub mod metrics;
 pub mod report;
 pub mod scenario;
 pub mod sse;
+pub mod sse_terminal_barrier;
 
 pub mod fixtures;
 pub mod resources;
