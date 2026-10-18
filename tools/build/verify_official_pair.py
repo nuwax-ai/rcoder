@@ -33,9 +33,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
  def do_GET(self):
   body=b'official-pair-business';self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
 phase('http-bind')
-# This fixture only serves fixed responses on loopback; it has no hostname
-# contract. TCPServer binds without HTTPServer's reverse-DNS startup lookup.
-server=socketserver.TCPServer(('127.0.0.1',int(os.environ['PORT'])),Handler)
+# Preserve HTTPServer's port-reuse and request behavior without a reverse-DNS
+# lookup for a listener whose address is already the explicit loopback literal.
+class LoopbackServer(http.server.HTTPServer):
+ def server_bind(self):
+  socketserver.TCPServer.server_bind(self)
+  self.server_name='localhost';self.server_port=self.server_address[1]
+server=LoopbackServer(('127.0.0.1',int(os.environ['PORT'])),Handler)
 faulthandler.cancel_dump_traceback_later()
 phase('http-listening')
 server.serve_forever()
