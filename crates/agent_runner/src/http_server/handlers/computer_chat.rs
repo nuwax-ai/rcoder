@@ -209,18 +209,13 @@ pub(crate) async fn handle_computer_chat_internal(
         );
         // 返回成功的 HTTP 状态码，但 HttpResult 包含错误信息
         // 这与 rcoder 的行为一致：HTTP 200 + HttpResult.error
-        return Ok(Json(HttpResult::error(
+        return Ok(Json(chat_failure_result(
             output
                 .error_code
                 .as_deref()
                 .unwrap_or(ERR_INTERNAL_SERVER_ERROR),
-            &shared_types::get_error_message(
-                output
-                    .error_code
-                    .as_deref()
-                    .unwrap_or(ERR_INTERNAL_SERVER_ERROR),
-                locale,
-            ),
+            output.error.as_deref(),
+            locale,
         )));
     }
 
@@ -236,4 +231,131 @@ pub(crate) async fn handle_computer_chat_internal(
     );
 
     Ok(Json(HttpResult::success(response)))
+}
+
+fn chat_failure_result(code: &str, cause: Option<&str>, locale: &str) -> HttpResult<ChatResponse> {
+    // HttpResult applies the shared diagnostic sanitizer. Keep the actual
+    // request's cause; a code-only description is only a missing-cause fallback.
+    match cause.filter(|message| !message.trim().is_empty()) {
+        Some(message) => HttpResult::error(code, message),
+        None => HttpResult::error(code, &shared_types::get_error_message(code, locale)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+        response::IntoResponse,
+        routing::post,
+    };
+    use dashmap::DashMap;
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+
+    async fn body(result: HttpResult<ChatResponse>) -> Value {
+        let response = Json(result).into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn computer_and_devcomputer_http_preserve_the_actual_default_english_cause() {
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState::new(
+            crate::config::AppConfig {
+                projects_dir: root.path().to_owned(),
+                ..Default::default()
+            },
+            Arc::new(crate::service::AgentSessionService::new(
+                agent_abstraction::launcher::direct_model_runtime_env_resolver(),
+                10,
+            )),
+            Arc::new(DashMap::new()),
+            None,
+        ));
+        let router = Router::new()
+            .route("/computer/chat", post(handle_computer_chat))
+            .route(
+                "/devcomputer/chat",
+                post(crate::http_server::handlers::devcomputer_chat::handle_devcomputer_chat),
+            )
+            .with_state(state.clone());
+        for path in ["/computer/chat", "/devcomputer/chat"] {
+            let project = format!("http-cause-{}", uuid::Uuid::new_v4());
+            let command = format!("missing-http-agent-{}", uuid::Uuid::new_v4());
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "user_id":"http-cause-user", "project_id":project,
+                                "prompt":"must not reach an agent",
+                                "agent_config":{"agent_server":{"command":command}}
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let value: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(value["success"], false, "{path}: {value}");
+            assert_eq!(value["code"], shared_types::ERR_AGENT_MGMT_NOT_FOUND);
+            assert!(value["data"].is_null());
+            let message = value["message"].as_str().unwrap();
+            assert!(message.contains(&command), "actual cause was lost: {value}");
+            assert!(message.contains("not found in PATH"), "{value}");
+            assert_ne!(
+                message,
+                shared_types::get_error_message(shared_types::ERR_AGENT_MGMT_NOT_FOUND, "en-US")
+            );
+            assert!(AGENT_REGISTRY.get_agent_info(&project).is_none());
+        }
+        assert!(state.shared_api_key_manager.is_empty());
+        assert!(state.project_uuid_map.is_empty());
+    }
+
+    #[tokio::test]
+    async fn internal_failure_projection_keeps_acp_cause_and_existing_http_envelope() {
+        let cause = "Request processing failed: ACP agent returned no real session identity";
+        let result = body(chat_failure_result(
+            ERR_INTERNAL_SERVER_ERROR,
+            Some(cause),
+            "en-US",
+        ))
+        .await;
+        assert_eq!(result["success"], false);
+        assert_eq!(result["code"], ERR_INTERNAL_SERVER_ERROR);
+        assert_eq!(result["message"], cause);
+        assert!(result["data"].is_null());
+        assert!(result.get("session_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_or_empty_failure_cause_uses_the_existing_localized_fallback() {
+        for cause in [None, Some(""), Some(" \t\n")] {
+            let result = body(chat_failure_result(
+                ERR_INTERNAL_SERVER_ERROR,
+                cause,
+                "en-US",
+            ))
+            .await;
+            assert_eq!(result["success"], false);
+            assert_eq!(result["code"], ERR_INTERNAL_SERVER_ERROR);
+            assert_eq!(
+                result["message"],
+                shared_types::get_error_message(ERR_INTERNAL_SERVER_ERROR, "en-US")
+            );
+            assert!(result["data"].is_null());
+        }
+    }
 }
