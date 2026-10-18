@@ -622,5 +622,17 @@
       "scenario": "userapp_compute_late_stop_cid_absence_recovery_contract",
       "backend": "compose"
     }
+  ],
+  "devcomputer_main_protocol_contract": [
+    {
+      "scenario": "devcomputer_main_protocol_contract",
+      "backend": "compose"
+    }
+  ],
+  "devcomputer_main_real_model_smoke": [
+    {
+      "scenario": "devcomputer_main_real_model_smoke",
+      "backend": "openai"
+    }
   ]
 }

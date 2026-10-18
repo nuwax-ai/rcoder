@@ -408,3 +408,15 @@ AUTO_RELOAD_SESSION_IDENTITY = {
 }
 for _backend in ('anthropic', 'openai'):
     REQUIRED[f'auto_reload_session_identity_{_backend}'] = AUTO_RELOAD_SESSION_IDENTITY.copy()
+
+from devcomputer_protocol_contract import STEPS as DEVCOMPUTER_PROTOCOL_STEPS
+
+REQUIRED['devcomputer_main_protocol_contract'] = DEVCOMPUTER_PROTOCOL_STEPS | {
+    'devcomputer protocol child completed', 'devcomputer original result explicit',
+}
+
+REQUIRED['devcomputer_main_real_model_smoke'] = {
+    'devcomputer real model omits explicit reload', 'devcomputer direct real model accepted',
+    'devcomputer direct real model actual SID', 'devcomputer direct real model exact terminal',
+    'devcomputer direct real model unique marker', 'devcomputer direct real model sequenced events',
+}

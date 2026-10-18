@@ -1,0 +1,5 @@
+# Test-only decoder/client. Install in a private Python 3.11+ venv, then set
+# E2E_PROTOCOL_PYTHON=<venv>/bin/python for the strict Rust suite wrapper.
+# Missing tools/dependencies fail the contract; they never mark it skipped/pass.
+httpx==0.28.1
+httpx-sse==0.4.3

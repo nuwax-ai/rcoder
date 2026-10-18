@@ -396,6 +396,21 @@ python3 tests-e2e/tools/isolated_ci.py \
 
 入口冻结源码并实际编译 RCoder、Agent Runner、独立 app-cli 和离线观察器，再启动本次专属控制面与动态随机应用。它核对二进制、严格逐用例报告、源码不漂移和既有容器保留；只清理本轮确认归属的计算资源，保留数据卷与失败证据。当前覆盖 owner 冲突、文件/Git、重复启停、多服务、预览 HTTP/HMR、闲置/owner 强杀及真实 Stop 回复超时和迟到 Stop。此 job 不代替 K8s 81 步与跨副本聊天/SSE 验收，也不代替独立 app-cli 的组件检查。
 
+### Main DevComputer 定向回归
+
+`compose_devcomputer` 包含受控真实 ACP 子进程的 `devcomputer_main_protocol_contract`
+和一次真实模型的 `devcomputer_main_real_model_smoke`。使用
+`E2E_SUITE=compose_devcomputer E2E_FILTER=devcomputer_main_protocol_contract make test-e2e-compose`
+定向选择；真实模型另选其完整用例名，并提供常规 E2E 模型配置。受控协议结果不能
+代替真实 AI 验证；正常订阅屏障也不证明首订阅前快速完成的事件保留。
+
+先在 Python 3.11+ 私有 venv 安装
+`pip install -r tests-e2e/tools/requirements-devcomputer.txt`，设置
+`E2E_PROTOCOL_PYTHON` 为其解释器。受控用例还要求本轮专属、可核对完整容器 ID 的
+控制面（`E2E_OWNER_CONTROLLER_ID`）及同次冻结构建回执
+（`E2E_COMPUTE_BUILD_RECEIPT`），不得指向共享或生产服务。隔离恢复 CI 自动安装
+依赖并只运行受控用例；缺少前置会失败，不会跳过。
+
 ### 独立 K8s 热部署恢复故障回归
 
 向 `k8s_userapp.py` 传入相同连接参数及 `--scenario hot_recovery`，执行独立的

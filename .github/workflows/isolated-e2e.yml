@@ -37,6 +37,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake pkg-config libssl-dev libclang-dev protobuf-compiler
+      - name: Install controlled HTTP protocol test client
+        run: python3 -m pip install --requirement tests-e2e/tools/requirements-devcomputer.txt
       - name: Verify local Docker prerequisites
         run: |
           docker info

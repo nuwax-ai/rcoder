@@ -23,6 +23,7 @@ from turso_runtime_contract import command, isolated_config, service_config, val
 
 ROOT = Path(__file__).resolve().parents[2]
 CASES = (
+    ("compose_devcomputer", "devcomputer_main_protocol_contract"),
     ("compose_lifecycle", "computer_owner_conflict_contract"),
     ("compose_userapp_dev", "userapp_dev_files_two_entry_points"),
     ("compose_userapp_dev", "userapp_dev_git_full_outbound_shape"),

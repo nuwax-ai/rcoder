@@ -142,5 +142,9 @@
   "host_k8s_lifecycle": [
     "host_k8s_agent_lifecycle_no_llm",
     "host_k8s_userapp_dev_compute_no_llm"
+  ],
+  "compose_devcomputer": [
+    "devcomputer_main_protocol_contract",
+    "devcomputer_main_real_model_smoke"
   ]
 }
