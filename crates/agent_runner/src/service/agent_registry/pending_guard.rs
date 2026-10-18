@@ -300,8 +300,8 @@ mod tests {
             "pending",
             super::super::tests::create_test_agent_info("legacy", "pending"),
         );
-        assert!(registry.get_agent_info("legacy").is_none());
-        assert!(registry.view_agent_info("legacy", Clone::clone).is_none());
+        assert!(registry.get_agent_info("legacy").is_some());
+        assert!(registry.view_agent_info("legacy", Clone::clone).is_some());
         assert!(registry.get_session_by_project("legacy").is_none());
         assert!(registry.get_agent_info_by_session("pending").is_none());
         assert!(
@@ -310,10 +310,10 @@ mod tests {
                 .is_none()
         );
         assert!(registry.get_project_by_session("pending").is_none());
-        assert!(SessionRegistry::get(&registry, "legacy").is_none());
-        assert!(!SessionRegistry::contains(&registry, "legacy"));
+        assert!(SessionRegistry::get(&registry, "legacy").is_some());
+        assert!(SessionRegistry::contains(&registry, "legacy"));
         assert!(!registry.contains_session("pending"));
-        assert!(registry.all_project_ids().is_empty());
+        assert_eq!(registry.all_project_ids(), vec!["legacy"]);
         // Historical raw record is retained, not deleted as a recovery shortcut.
         assert!(registry.inner_mut().contains_key("legacy"));
         for sid in ["opaque-not-uuid", "pending-session", "Pending"] {

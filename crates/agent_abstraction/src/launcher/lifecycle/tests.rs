@@ -4,6 +4,12 @@ use std::process::Stdio;
 use std::time::Duration;
 
 async fn held_process() -> (AgentLifecycleGuard, tempfile::TempDir, u32) {
+    held_process_with_session(SessionId::from("held-session")).await
+}
+
+async fn held_process_with_session(
+    session_id: SessionId,
+) -> (AgentLifecycleGuard, tempfile::TempDir, u32) {
     let directory = tempfile::tempdir().unwrap();
     let ready = directory.path().join("ready");
     let mut command = CommandWrap::with_new("sh", |command| {
@@ -22,7 +28,7 @@ async fn held_process() -> (AgentLifecycleGuard, tempfile::TempDir, u32) {
     let pid = child.id().unwrap();
     let guard = AgentLifecycleGuard::new_claude(
         "held".into(),
-        SessionId::from("held-session"),
+        session_id,
         child,
         tokio::spawn(async {}),
         CancellationToken::new(),
@@ -36,6 +42,25 @@ async fn held_process() -> (AgentLifecycleGuard, tempfile::TempDir, u32) {
     .await
     .unwrap();
     (guard, directory, pid)
+}
+
+#[tokio::test]
+async fn unassigned_process_has_no_session_identity_and_only_accepts_a_real_handshake() {
+    let (mut guard, _directory, _pid) =
+        held_process_with_session(SessionId::new(Arc::from(""))).await;
+    assert!(guard.inner.session_id.is_none());
+    for sid in ["", "pending"] {
+        assert!(guard.set_session_id(SessionId::from(sid)).is_err());
+        assert!(guard.inner.session_id.is_none());
+    }
+    guard
+        .set_session_id(SessionId::from("opaque/session:7"))
+        .unwrap();
+    assert_eq!(
+        guard.inner.session_id.as_ref().map(|sid| sid.0.as_ref()),
+        Some("opaque/session:7")
+    );
+    guard.graceful_stop().await.unwrap();
 }
 
 #[tokio::test]

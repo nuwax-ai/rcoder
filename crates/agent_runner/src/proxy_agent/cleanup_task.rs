@@ -86,7 +86,11 @@ impl AgentCleaner {
         // 使用统一 Registry 收集所有活跃的 session_id
         let active_session_ids: std::collections::HashSet<String> = AGENT_REGISTRY
             .iter_agents()
-            .map(|entry| entry.value().session_id.to_string())
+            .filter_map(|entry| {
+                shared_types::SessionHint::classify(Some(entry.value().session_id.0.as_ref()))
+                    .as_session_id()
+                    .map(str::to_owned)
+            })
             .collect();
 
         // 检查SESSION_CACHE中的所有session
@@ -285,8 +289,14 @@ impl AgentCleaner {
             && current.session_id.to_string() == session_id
             && current.cancel_tx.same_channel(&captured.cancel_tx)
         {
-            PERMISSION_MANAGER.cancel_session_permissions(&session_id);
-            PERMISSION_MANAGER.clear_session_state(&session_id);
+            if AGENT_REGISTRY
+                .get_project_by_session(&session_id)
+                .as_deref()
+                == Some(project_id)
+            {
+                PERMISSION_MANAGER.cancel_session_permissions(&session_id);
+                PERMISSION_MANAGER.clear_session_state(&session_id);
+            }
             if let Some(request_id) = captured.request_id.as_deref() {
                 crate::proxy_agent::SESSION_REQUEST_CONTEXT
                     .remove_if(project_id, |_, current| current == request_id);

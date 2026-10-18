@@ -10,11 +10,12 @@ use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use crate::CancelNotificationRequestWrapper;
+use crate::grpc::remove_agent_and_cleanup;
 use crate::http_server::router::AppState;
 use crate::service::{AGENT_REGISTRY, PERMISSION_MANAGER};
 use shared_types::{
     AppError, ComputerAgentCancelRequest, ComputerAgentCancelResponse, HttpResult, I18nJsonOrQuery,
-    error_codes::ERR_VALIDATION, get_i18n_message,
+    SessionHint, error_codes::ERR_VALIDATION, get_i18n_message,
 };
 
 use super::locale_from_headers;
@@ -73,6 +74,45 @@ pub async fn handle_computer_cancel(
     };
 
     let _transition = agent_abstraction::session::lock_execution_transition(project_id).await;
+    if let Some(target) = AGENT_REGISTRY.view_agent_info(project_id, Clone::clone) {
+        let actual_session_id = target.session_id.to_string();
+        if SessionHint::classify(Some(&actual_session_id))
+            .as_session_id()
+            .is_none()
+        {
+            if request
+                .session_id
+                .as_deref()
+                .filter(|sid| !sid.is_empty())
+                .is_some_and(|sid| sid != actual_session_id)
+            {
+                return Err(AppError::with_message(
+                    ERR_VALIDATION,
+                    "session_id belongs to a different execution",
+                ));
+            }
+            // An invalid SID cannot address ACP cancellation. Retire this
+            // project's real child; never act on global "pending" state.
+            let removed = remove_agent_and_cleanup(project_id, &target)
+                .await
+                .map_err(|error| {
+                    AppError::with_message(
+                        shared_types::error_codes::ERR_AGENT_ERROR,
+                        format!("Agent exit is unconfirmed: {error}"),
+                    )
+                })?;
+            if !removed {
+                return Err(AppError::with_message(
+                    shared_types::error_codes::ERR_AGENT_ERROR,
+                    "Project execution changed before cancellation completed",
+                ));
+            }
+            return Ok(Json(HttpResult::success(ComputerAgentCancelResponse {
+                success: true,
+                session_id: String::new(),
+            })));
+        }
+    }
     // 查找 session_id (如果未提供,从 AGENT_REGISTRY 获取)
     let session_id = if let Some(sid) = request.session_id {
         sid
@@ -183,4 +223,85 @@ pub async fn handle_computer_cancel(
     };
 
     Ok(Json(HttpResult::success(response)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::local_agent_service::tests::{Execution, service};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    fn state() -> State<Arc<AppState>> {
+        let local = service();
+        State(Arc::new(AppState::new(
+            crate::config::AppConfig::default(),
+            local.agent_session_service.clone(),
+            local.shared_api_key_manager.clone(),
+            Some(local.project_uuid_map.clone()),
+        )))
+    }
+
+    fn request(project: &str, session: &str) -> I18nJsonOrQuery<ComputerAgentCancelRequest> {
+        I18nJsonOrQuery(
+            serde_json::from_value(serde_json::json!({
+                "user_id": "control-test", "project_id": project, "session_id": session,
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn invalid_sid_http_cancel_waits_for_exit_and_never_returns_placeholder() {
+        let mut execution = Execution::seed("pending");
+        let project = execution.project.clone();
+        let cancel = tokio::spawn(async move {
+            handle_computer_cancel(state(), HeaderMap::new(), request(&project, "pending")).await
+        });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            execution.lifecycle.entered.notified(),
+        )
+        .await
+        .unwrap();
+        assert!(!cancel.is_finished());
+        assert!(AGENT_REGISTRY.inner_mut().contains_key(&execution.project));
+        execution.lifecycle.release.notify_one();
+        let result = cancel.await.unwrap().unwrap().0;
+        assert!(result.success);
+        assert!(result.data.unwrap().session_id.is_empty());
+        assert!(execution.lifecycle.exited.load(Ordering::SeqCst));
+        assert!(!AGENT_REGISTRY.inner_mut().contains_key(&execution.project));
+        assert!(execution.cancel.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_sid_http_cancel_preserves_live_entry_when_exit_is_unconfirmed() {
+        let execution = Execution::seed("pending");
+        execution.lifecycle.fail.store(true, Ordering::SeqCst);
+        execution.lifecycle.release.notify_one();
+        let result = handle_computer_cancel(
+            state(),
+            HeaderMap::new(),
+            request(&execution.project, "pending"),
+        )
+        .await;
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("controlled exit not confirmed"));
+        assert!(AGENT_REGISTRY.inner_mut().contains_key(&execution.project));
+    }
+
+    #[tokio::test]
+    async fn invalid_sid_http_cancel_still_rejects_a_foreign_expected_session() {
+        let mut execution = Execution::seed("pending");
+        let result = handle_computer_cancel(
+            state(),
+            HeaderMap::new(),
+            request(&execution.project, "foreign-session"),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(execution.cancel.try_recv().is_err());
+        assert!(!execution.lifecycle.exited.load(Ordering::SeqCst));
+    }
 }

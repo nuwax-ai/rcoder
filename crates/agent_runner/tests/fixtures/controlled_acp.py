@@ -27,12 +27,29 @@ def send(message):
         print(json.dumps(message), flush=True)
 
 
-def term(_signal, _frame):
-    if (root / (project + '.term-delay')).exists():
-        log('term_received')
-        time.sleep(float((root / (project + '.term-delay')).read_text()))
-    log('exit')
+exit_cause = None
+
+
+def exit_process(cause):
+    global exit_cause
+    # TERM may arrive while the main thread is already holding its EOF exit.
+    # Keep the first real cause and one barrier; SIGKILL remains uncatchable.
+    if exit_cause is not None:
+        return
+    exit_cause = cause
+    log('exit_started', cause=cause)
+    if (root / (project + '.exit-barrier')).exists():
+        while not (root / (project + '.exit-release')).exists():
+            time.sleep(0.01)
+    if (root / (project + '.exit-delay')).exists():
+        time.sleep(float((root / (project + '.exit-delay')).read_text()))
+    log('exit', cause=cause)
     raise SystemExit(0)
+
+
+def term(_signal, _frame):
+    log('term_received')
+    exit_process('sigterm')
 
 
 signal.signal(signal.SIGTERM, term)
@@ -89,6 +106,8 @@ for line in sys.stdin:
             continue
         if method == 'session/load':
             session = message['params']['sessionId']
+        elif (root / (project + '.new-session-id')).exists():
+            session = (root / (project + '.new-session-id')).read_text()
         log('load' if method == 'session/load' else 'new', params=message['params'])
         send({'jsonrpc': '2.0', 'id': message['id'], 'result': {'sessionId': session}})
     elif method == 'session/prompt':
@@ -107,3 +126,6 @@ for line in sys.stdin:
     elif 'id' in message:
         send({'jsonrpc': '2.0', 'id': message['id'], 'error': {
             'code': -32601, 'message': 'fixture method unsupported'}})
+
+# Closing ACP stdin is a normal production cancellation path too.
+exit_process('eof')

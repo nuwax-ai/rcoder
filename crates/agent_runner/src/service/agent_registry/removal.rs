@@ -32,7 +32,8 @@ impl AgentSessionRegistry {
         // 移除反向映射
         if let Some(ref sid) = session_id {
             debug!("[Registry] Removing session_to_project mapping");
-            self.session_to_project.remove(sid);
+            self.session_to_project
+                .remove_if(sid, |_, owner| owner == project_id);
             debug!("[Registry] session_to_project mapping removed");
         }
 

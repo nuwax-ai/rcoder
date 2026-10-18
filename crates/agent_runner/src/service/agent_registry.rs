@@ -77,6 +77,21 @@ impl AgentSessionRegistry {
     pub fn register(&self, project_id: &str, session_id: &str, agent_info: ProjectAndAgentInfo) {
         use dashmap::mapref::entry::Entry;
 
+        if SessionHint::classify(Some(session_id))
+            .as_session_id()
+            .is_none()
+        {
+            // Retain an actual legacy execution for project-scoped lifecycle
+            // management, but never publish a state label as a routing key.
+            self.agent_info_map
+                .insert(project_id.to_owned(), agent_info);
+            if let Some((_, previous)) = self.project_to_session.remove(project_id) {
+                self.session_to_project
+                    .remove_if(&previous, |_, owner| owner == project_id);
+            }
+            return;
+        }
+
         // 🎯 原子性地更新 project_to_session 并获取旧 session_id
         let old_session_id = match self.project_to_session.entry(project_id.to_string()) {
             Entry::Occupied(mut entry) => {
@@ -157,6 +172,8 @@ impl AgentSessionRegistry {
     /// 使用 DashMap entry API 的原子操作，与 register() 方法保持一致
     pub fn update_session(&self, project_id: &str, new_session_id: &str) -> Option<String> {
         use dashmap::mapref::entry::Entry;
+
+        SessionHint::classify(Some(new_session_id)).as_session_id()?;
 
         // 🎯 原子性地更新 project_to_session
         let old_session_id = match self.project_to_session.entry(project_id.to_string()) {
@@ -306,21 +323,21 @@ impl AgentSessionRegistry {
 
     /// 通过 project_id 获取 session_id
     pub fn get_session_by_project(&self, project_id: &str) -> Option<String> {
-        self.project_to_session
-            .get(project_id)
-            .filter(|sid| {
-                SessionHint::classify(Some(sid.as_str()))
-                    .as_session_id()
-                    .is_some()
-            })
-            .map(|r| r.value().clone())
+        // Release each map guard before reading another: physical cleanup
+        // holds the execution entry while conditionally retiring its indexes.
+        let sid = self
+            .project_to_session
+            .view(project_id, |_, sid| sid.clone())?;
+        if self.get_project_by_session(&sid).as_deref() != Some(project_id) {
+            return None;
+        }
+        Some(sid)
     }
 
-    /// 通过 project_id 获取 agent_info 引用
+    /// 按项目读取真实执行，包括尚不能用于会话路由的历史身份。
+    /// 会话身份不合法不代表进程不存在；停止、替换和闲置清理必须仍能管理它。
     pub fn get_agent_info(&self, project_id: &str) -> Option<Ref<'_, String, ProjectAndAgentInfo>> {
-        self.agent_info_map
-            .get(project_id)
-            .filter(|info| Self::has_session_identity(info))
+        self.agent_info_map.get(project_id)
     }
 
     fn has_session_identity(info: &ProjectAndAgentInfo) -> bool {
@@ -367,6 +384,7 @@ impl AgentSessionRegistry {
         &self,
         session_id: &str,
     ) -> Option<Ref<'_, String, ProjectAndAgentInfo>> {
+        SessionHint::classify(Some(session_id)).as_session_id()?;
         // view() 在闭包返回后立即释放锁，无 Ref 暴露
         let project_id_str = self.session_to_project.view(session_id, |_, v| v.clone())?;
 
@@ -382,11 +400,7 @@ impl AgentSessionRegistry {
         project_id: &str,
         f: impl FnOnce(&ProjectAndAgentInfo) -> R,
     ) -> Option<R> {
-        self.agent_info_map
-            .view(project_id, |_, info| {
-                Self::has_session_identity(info).then(|| f(info))
-            })
-            .flatten()
+        self.agent_info_map.view(project_id, |_, info| f(info))
     }
 
     /// 通过 session_id 在闭包内访问 agent_info(全程不暴露 Ref)。两 map 间仍有 ~100ns
@@ -396,6 +410,7 @@ impl AgentSessionRegistry {
         session_id: &str,
         f: impl FnOnce(&ProjectAndAgentInfo) -> R,
     ) -> Option<R> {
+        SessionHint::classify(Some(session_id)).as_session_id()?;
         let project_id_str = self.session_to_project.view(session_id, |_, v| v.clone())?;
         self.agent_info_map
             .view(&project_id_str, |_, info| {
@@ -421,9 +436,7 @@ impl AgentSessionRegistry {
 
     /// 遍历所有 agent_info（用于清理任务等）
     pub fn iter_agents(&self) -> impl Iterator<Item = RefMulti<'_, String, ProjectAndAgentInfo>> {
-        self.agent_info_map
-            .iter()
-            .filter(|info| Self::has_session_identity(info))
+        self.agent_info_map.iter()
     }
 
     /// 获取所有 project_id 列表

@@ -21,7 +21,7 @@ use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Responder};
 use anyhow::Result;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::acp::CancelNotificationRequestWrapper;
 use crate::diagnostics::DiagnosticsListener;
@@ -198,7 +198,7 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
                 .await?;
 
                 // 2+3. 构建会话 meta 并创建/加载会话
-                let outcome = setup::create_or_load_session(
+                let outcome = match setup::create_or_load_session(
                     &cx,
                     &project_id,
                     project_path,
@@ -206,7 +206,20 @@ pub(crate) async fn run_sacp_connection<N: SessionNotifier + 'static>(
                     &start_config,
                     &resuming,
                 )
-                .await?;
+                .await {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        // Publish the real cause before this closure drops the
+                        // unassigned session sender. Its caller can otherwise
+                        // observe that close before the outer error cache is set.
+                        if let Some(tx) = connection_failed_tx.take()
+                            && let Err(send_error) = tx.send(error.to_string())
+                        {
+                            warn!(%send_error, "ACP session setup failure receiver dropped");
+                        }
+                        return Err(error);
+                    }
+                };
                 let session_id = outcome.session_id;
 
                 info!(

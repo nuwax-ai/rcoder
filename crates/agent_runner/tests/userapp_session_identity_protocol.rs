@@ -50,6 +50,70 @@ async fn wait_row(root: &Path, event: &str, project: &str, count: usize) {
     });
 }
 
+async fn wait_row_for_pid(root: &Path, event: &str, project: &str, pid: u32) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if rows(root)
+                .iter()
+                .any(|row| row["event"] == event && row["project"] == project && row["pid"] == pid)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "fixture event {event}/{project}/{pid} missing: {:?}",
+            rows(root)
+        )
+    });
+}
+
+// Observe only this test's actual ACP fixture children: Chat preparation also
+// launches a short-lived `python -v` version probe, which is not an ACP owner.
+// Reject zombies rather than treating kill(0) as proof of a live execution.
+fn owned_live_fixture_children() -> Vec<u32> {
+    let observer = std::process::Command::new("ps")
+        .args(["-ww", "-axo", "pid=,ppid=,stat=,args="])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let observer_pid = observer.id();
+    let output = observer.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let fixture = format!(
+        "{}/tests/fixtures/controlled_acp.py",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let mut children = Vec::new();
+    for line in std::str::from_utf8(&output.stdout).unwrap().lines() {
+        let mut fields = line.split_whitespace();
+        let pid: u32 = fields.next().unwrap().parse().unwrap();
+        let parent: u32 = fields.next().unwrap().parse().unwrap();
+        let state = fields.next().unwrap();
+        if parent == std::process::id() && pid != observer_pid && line.contains(&fixture) {
+            assert!(
+                !state.starts_with('Z'),
+                "owned fixture child {pid} is a zombie"
+            );
+            children.push(pid);
+        }
+    }
+    children.sort_unstable();
+    children
+}
+
+struct FixtureExitBarrier(std::path::PathBuf);
+
+impl Drop for FixtureExitBarrier {
+    fn drop(&mut self) {
+        // Failure cleanup only releases this test fixture. It is not exit proof.
+        drop(std::fs::write(&self.0, "release"));
+    }
+}
+
 fn chat(root: &Path, project: &str, sid: &str, fresh: bool, prompt: &str) -> ChatRequest {
     ChatRequest {
         project_id: project.into(),
@@ -118,6 +182,220 @@ async fn service(root: &Path, create_budget: u64) -> AgentServiceImpl {
         agent_mgmt_registry,
         agent_mgmt_path_manager: path_manager,
     }))
+}
+
+#[tokio::test]
+async fn invalid_acp_session_id_is_rejected_before_prompt_and_reaped_before_retry() {
+    for (invalid_id, resume) in [
+        ("pending", ""),
+        ("", ""),
+        ("pending", "historical-opaque-session"),
+        ("", "historical-opaque-session"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let service = service(root.path(), 10).await;
+        let project = format!("protocol-invalid-acp-{}", uuid::Uuid::new_v4());
+        let selector = root.path().join(format!("{project}.new-session-id"));
+        std::fs::write(&selector, invalid_id).unwrap();
+        if !resume.is_empty() {
+            std::fs::write(
+                root.path().join(format!("{project}.load-error")),
+                "reject load",
+            )
+            .unwrap();
+        }
+        let mut request = chat(root.path(), &project, resume, false, "must-not-be-sent");
+        request.agent_config.as_mut().unwrap().auto_reload =
+            Some(shared_types::grpc::AutoReloadConfig { enabled: true });
+        let response = service
+            .chat(Request::new(request))
+            .await
+            .unwrap()
+            .into_inner();
+        wait_row(root.path(), "new", &project, 1).await;
+        let accepted_before_cleanup = response.success;
+        let live_before_cleanup = owned_live_fixture_children();
+        let prompt_before_cleanup = rows(root.path()).iter().any(|row| row["event"] == "prompt");
+        let published_sid = AGENT_REGISTRY.get_session_by_project(&project);
+        // On an unfixed baseline Stop hides this actual execution. Capture its
+        // lifecycle directly for failure cleanup so the RED test cannot leak it.
+        let leaked = AGENT_REGISTRY
+            .inner_mut()
+            .get(&project)
+            .map(|info| info.clone());
+        if let Some(info) = leaked {
+            if let Some(handle) = info.stop_handle {
+                handle.graceful_stop().await.unwrap();
+                handle.wait_for_exit().await.unwrap();
+            }
+            AGENT_REGISTRY.remove_by_project(&project);
+        }
+        std::fs::remove_file(selector).unwrap();
+        let retried = service
+            .chat(Request::new(chat(
+                root.path(),
+                &project,
+                "",
+                true,
+                "retry-after-fix",
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(retried.success, "normal retry must recover: {retried:?}");
+        wait_row(root.path(), "prompt", &project, 1).await;
+        let live_after_retry = owned_live_fixture_children();
+        stop(&service, &project, &retried.session_id).await;
+        assert!(
+            !accepted_before_cleanup,
+            "invalid ACP identity accepted: {response:?}"
+        );
+        assert!(
+            !prompt_before_cleanup,
+            "invalid ACP session received the user prompt"
+        );
+        assert!(
+            live_before_cleanup.is_empty(),
+            "invalid ACP child survived response: {live_before_cleanup:?}"
+        );
+        assert_eq!(published_sid, None);
+        assert_eq!(
+            rows(root.path())
+                .iter()
+                .filter(|row| row["event"] == "load_error")
+                .count(),
+            usize::from(!resume.is_empty()),
+            "the invalid fallback path must actually execute Load then New"
+        );
+        assert_eq!(
+            live_after_retry.len(),
+            1,
+            "retry must have exactly one actual execution"
+        );
+        assert!(owned_live_fixture_children().is_empty());
+        assert!(
+            response
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains("session"),
+            "retain useful protocol failure: {response:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn legacy_unroutable_execution_remains_stoppable_and_recovers_without_loading_state_labels() {
+    for mode in ["stop", "run", "auto-reload"] {
+        let root = tempfile::tempdir().unwrap();
+        let service = service(root.path(), 10).await;
+        let project = format!("protocol-legacy-live-{}", uuid::Uuid::new_v4());
+        let first = service
+            .chat(Request::new(chat(root.path(), &project, "", true, "hold")))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(first.success, "initial execution: {first:?}");
+        wait_row(root.path(), "prompt", &project, 1).await;
+        let mut legacy = AGENT_REGISTRY
+            .view_agent_info(&project, Clone::clone)
+            .unwrap();
+        let original_handle = legacy.stop_handle.clone().unwrap();
+        legacy.session_id = agent_client_protocol::schema::v1::SessionId::from("pending");
+        AGENT_REGISTRY.register(&project, "pending", legacy);
+        let shared_legacy_cache = agent_runner::service::SessionData::new(16).await;
+        agent_runner::service::SESSION_CACHE.insert("pending".into(), shared_legacy_cache.clone());
+        let status = service
+            .get_status(Request::new(GetStatusRequest {
+                project_id: project.clone(),
+                session_id: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let legacy_route = service
+            .get_status(Request::new(GetStatusRequest {
+                project_id: project.clone(),
+                session_id: "pending".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        if mode == "stop" {
+            let result = service
+                .stop_agent(Request::new(StopAgentRequest {
+                    project_id: project.clone(),
+                    expected_session_id: None,
+                    force: false,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(result.success, "project stop: {result:?}");
+            assert!(
+                original_handle.is_stopped(),
+                "Stop hid a live unrouteable execution"
+            );
+        }
+        let mut request = chat(root.path(), &project, "", false, "hold-after-legacy");
+        if mode == "auto-reload" {
+            request.agent_config.as_mut().unwrap().auto_reload =
+                Some(shared_types::grpc::AutoReloadConfig { enabled: true });
+        }
+        let recovered = service
+            .chat(Request::new(request))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(recovered.success, "legacy {mode} recovery: {recovered:?}");
+        wait_row(root.path(), "prompt", &project, 2).await;
+        let live = owned_live_fixture_children();
+        stop(&service, &project, &recovered.session_id).await;
+        assert!(
+            agent_runner::service::SESSION_CACHE
+                .view("pending", |_, current| Arc::ptr_eq(
+                    current,
+                    &shared_legacy_cache
+                ))
+                .unwrap_or(false),
+            "project recovery cannot clear a shared historical state key"
+        );
+        agent_runner::service::SESSION_CACHE.remove_if("pending", |_, current| {
+            Arc::ptr_eq(current, &shared_legacy_cache)
+        });
+        assert!(
+            status.is_found,
+            "project status cannot hide a real execution"
+        );
+        assert_eq!(status.status, "busy");
+        assert!(
+            !legacy_route.is_found,
+            "a state label cannot route a session"
+        );
+        assert_eq!(AGENT_REGISTRY.get_project_by_session("pending"), None);
+        assert_eq!(live.len(), 1, "{mode} created duplicate executions");
+        assert!(
+            original_handle.is_stopped(),
+            "old execution must exit before replacement"
+        );
+        assert!(!recovered.session_id.is_empty());
+        assert_ne!(recovered.session_id, "pending");
+        assert!(
+            !rows(root.path()).iter().any(|row| row["event"] == "load"),
+            "legacy state cannot be passed to session/load"
+        );
+        assert_eq!(
+            rows(root.path())
+                .iter()
+                .filter(|row| row["event"] == "prompt")
+                .count(),
+            2,
+            "accepted prompts must not be replayed"
+        );
+        assert!(owned_live_fixture_children().is_empty());
+    }
 }
 
 #[tokio::test]
@@ -680,45 +958,122 @@ async fn new_session_timeout_reports_failure_only_after_child_is_reaped() {
     stop(&service, project, &retry.session_id).await;
 }
 
-#[tokio::test]
-async fn stopping_same_sid_replacement_waits_for_old_child_and_keeps_new_execution() {
+#[derive(Clone, Copy)]
+enum ControlledExitCause {
+    Eof,
+    Sigterm,
+}
+
+async fn stop_and_same_sid_replacement(exit: ControlledExitCause) {
     let root = tempfile::tempdir().unwrap();
     let service = service(root.path(), 3).await;
-    let project = "protocol-stop-reload-race";
+    let cause = match exit {
+        ControlledExitCause::Eof => "eof",
+        ControlledExitCause::Sigterm => "sigterm",
+    };
+    let project = format!("protocol-stop-reload-{cause}");
     let first = service
-        .chat(Request::new(chat(root.path(), project, "", false, "hold")))
+        .chat(Request::new(chat(root.path(), &project, "", false, "hold")))
         .await
         .unwrap()
         .into_inner();
     assert!(first.success);
-    wait_row(root.path(), "prompt", project, 1).await;
-    std::fs::write(root.path().join(format!("{project}.term-delay")), "0.3").unwrap();
+    wait_row(root.path(), "prompt", &project, 1).await;
+    let original = AGENT_REGISTRY
+        .view_agent_info(&project, Clone::clone)
+        .unwrap();
+    let lifecycle = original.stop_handle.clone().unwrap();
+    let old_pid = rows(root.path())
+        .iter()
+        .find(|row| row["event"] == "spawn")
+        .unwrap()["pid"]
+        .as_u64()
+        .unwrap() as u32;
+    // Complete the existing startup transition before exercising Stop's own
+    // lease. No test-held lock stands in for the production Stop boundary.
+    drop(agent_abstraction::session::lock_execution_transition(&project).await);
+    std::fs::write(root.path().join(format!("{project}.exit-barrier")), "").unwrap();
+    let release = FixtureExitBarrier(root.path().join(format!("{project}.exit-release")));
+    assert_eq!(owned_live_fixture_children(), vec![old_pid]);
+    match exit {
+        ControlledExitCause::Eof => lifecycle.cancel(),
+        ControlledExitCause::Sigterm => nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(i32::try_from(old_pid).unwrap()),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .unwrap(),
+    }
+    wait_row_for_pid(root.path(), "exit_started", &project, old_pid).await;
+    let started = rows(root.path())
+        .into_iter()
+        .find(|row| row["event"] == "exit_started" && row["pid"] == old_pid)
+        .unwrap();
+    assert_eq!(started["cause"], cause);
+    assert!(!lifecycle.is_stopped());
+    assert_eq!(
+        owned_live_fixture_children(),
+        vec![old_pid],
+        "the original must remain physically alive at the exit barrier"
+    );
+
     let stopping = service.stop_agent(Request::new(StopAgentRequest {
-        project_id: project.into(),
+        project_id: project.clone(),
         expected_session_id: Some(first.session_id.clone()),
         force: true,
         ..Default::default()
     }));
-    let replacing = async {
-        wait_row(root.path(), "term_received", project, 1).await;
-        service
-            .chat(Request::new(chat(
-                root.path(),
-                project,
-                &first.session_id,
-                false,
-                "hold",
-            )))
-            .await
-    };
+    tokio::pin!(stopping);
+    assert!(
+        futures_util::poll!(stopping.as_mut()).is_pending(),
+        "Stop cannot succeed before the controlled child exits"
+    );
+    assert_eq!(
+        AGENT_REGISTRY.view_agent_info(&project, |entry| entry.status),
+        Some(shared_types::AgentStatus::Terminating)
+    );
+    let replacing = service.chat(Request::new(chat(
+        root.path(),
+        &project,
+        &first.session_id,
+        false,
+        "hold",
+    )));
+    tokio::pin!(replacing);
+    assert!(
+        futures_util::poll!(replacing.as_mut()).is_pending(),
+        "replacement cannot complete before the old execution exits"
+    );
+    assert_eq!(
+        owned_live_fixture_children(),
+        vec![old_pid],
+        "an unfinished Stop cannot be overtaken by a new child spawn"
+    );
+    assert!(!lifecycle.is_stopped());
+    assert_eq!(
+        rows(root.path())
+            .iter()
+            .filter(|row| row["event"] == "spawn")
+            .count(),
+        1
+    );
+    // Release synchronously before yielding to the existing TERM->KILL worker;
+    // the production 500ms escalation budget is unchanged.
+    std::fs::write(&release.0, "release").unwrap();
     let (stopped, replacement) = tokio::join!(stopping, replacing);
     assert!(stopped.unwrap().into_inner().success);
     let replacement = replacement.unwrap().into_inner();
     assert!(replacement.success, "same sid reload: {replacement:?}");
     assert_eq!(replacement.session_id, first.session_id);
-    wait_row(root.path(), "prompt", project, 2).await;
+    assert!(
+        lifecycle.is_stopped(),
+        "Stop success requires the original reaper result"
+    );
+    wait_row(root.path(), "prompt", &project, 2).await;
     let log = rows(root.path());
-    let old_exit = log.iter().position(|row| row["event"] == "exit").unwrap();
+    let old_exit = log
+        .iter()
+        .position(|row| row["event"] == "exit" && row["pid"] == old_pid)
+        .unwrap();
     let new_spawn = log
         .iter()
         .enumerate()
@@ -730,16 +1085,32 @@ async fn stopping_same_sid_replacement_waits_for_old_child_and_keeps_new_executi
         old_exit < new_spawn,
         "replacement spawned before old execution exited: {log:?}"
     );
+    assert_eq!(log[old_exit]["cause"], cause);
+    assert_ne!(log[new_spawn]["pid"], old_pid);
     let target = AGENT_REGISTRY
-        .view_agent_info(project, Clone::clone)
+        .view_agent_info(&project, Clone::clone)
         .unwrap();
     assert_eq!(target.session_id.to_string(), first.session_id);
     assert!(
         !target.cancel_tx.is_closed(),
         "old Stop cleanup must keep replacement channel"
     );
-    std::fs::remove_file(root.path().join(format!("{project}.term-delay"))).unwrap();
-    stop(&service, project, &replacement.session_id).await;
+    assert!(
+        !target.cancel_tx.same_channel(&original.cancel_tx),
+        "same SID must belong to the new physical execution"
+    );
+    std::fs::remove_file(root.path().join(format!("{project}.exit-barrier"))).unwrap();
+    stop(&service, &project, &replacement.session_id).await;
+}
+
+#[tokio::test]
+async fn stopping_same_sid_replacement_waits_for_old_child_and_keeps_new_execution() {
+    stop_and_same_sid_replacement(ControlledExitCause::Eof).await;
+}
+
+#[tokio::test]
+async fn stopping_same_sid_replacement_after_sigterm_keeps_exit_order_and_new_execution() {
+    stop_and_same_sid_replacement(ControlledExitCause::Sigterm).await;
 }
 
 async fn closed_active_runtime_recovers_history(project: &str, fail_load: bool) {
@@ -875,11 +1246,17 @@ async fn actual_acp_cancel_and_stop_stream_terminals_keep_accepted_request_ident
         .await
         .unwrap();
         let marker = if stopping {
-            "term-delay"
+            "exit-delay"
         } else {
             "cancel-delay"
         };
         std::fs::write(root.path().join(format!("{project}.{marker}")), "0.2").unwrap();
+        let current_pid = rows(root.path())
+            .iter()
+            .find(|row| row["event"] == "prompt" && row["request_id"] == original_rid)
+            .unwrap()["pid"]
+            .as_u64()
+            .unwrap() as u32;
         let control = async {
             if stopping {
                 let result = service
@@ -907,15 +1284,15 @@ async fn actual_acp_cancel_and_stop_stream_terminals_keep_accepted_request_ident
             }
         };
         let mutate_latest = async {
-            wait_row(
+            wait_row_for_pid(
                 root.path(),
                 if stopping {
-                    "term_received"
+                    "exit_started"
                 } else {
                     "cancel_received"
                 },
                 project,
-                1,
+                current_pid,
             )
             .await;
             assert!(AGENT_REGISTRY.try_update_agent_info(project, |info| {

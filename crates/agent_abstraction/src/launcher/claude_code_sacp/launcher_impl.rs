@@ -85,6 +85,10 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
     where
         R::Entry: Into<ProjectAndAgentInfo> + From<ProjectAndAgentInfo>,
     {
+        start_config.resume_session_id =
+            shared_types::SessionHint::classify(start_config.resume_session_id.as_deref())
+                .as_session_id()
+                .map(str::to_owned);
         let session_create_timeout_secs = start_config
             .acp_session_create_timeout_secs
             .unwrap_or(shared_types::DEFAULT_ACP_SESSION_CREATE_TIMEOUT_SECS);
@@ -333,7 +337,7 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         let mut lifecycle_guard = AgentLifecycleGuard::new_claude_full(
             crate::launcher::lifecycle::ClaudeProcessParams {
                 project_id: project_id.clone(),
-                session_id: SessionId::from("initializing"),
+                session_id: None,
                 child_process: spawned.child,
                 stderr_task: stderr_task_handle,
                 cancel_token: cancel_token.clone(),

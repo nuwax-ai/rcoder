@@ -196,6 +196,9 @@ pub(super) async fn prepare_session(
     if !input.force_new_session
         && let Some((status, cancel_tx, agent_session_id)) = agent_busy
         && (status == AgentStatus::Active || status == AgentStatus::Pending)
+        && shared_types::SessionHint::classify(Some(&agent_session_id))
+            .as_session_id()
+            .is_some()
     {
         info!(
             "[ChatHandler] Agent Busy, cancelling current task: project_id={}, status={:?}, session_id={:?}",
@@ -307,14 +310,21 @@ pub(super) async fn prepare_session(
 
         if let Some(agent_info) = agent_info_for_reload {
             // Extract needed data, then IMMEDIATELY drop Ref before .await
-            let stop_handle = agent_info.stop_handle.clone();
             let old_session_id = agent_info.session_id.to_string();
+            let target = agent_info.clone();
             drop(agent_info); // Release DashMap read lock BEFORE .await
+            let routing_owner = AGENT_REGISTRY.get_project_by_session(&old_session_id);
+            let owns_route = routing_owner.as_deref() == Some(project_id);
 
             // 保存旧 session_id 用于 resume
-            if !old_session_id.is_empty() {
-                old_session_id_for_resume = Some(old_session_id.clone());
-            }
+            old_session_id_for_resume = shared_types::SessionHint::classify(Some(&old_session_id))
+                .as_session_id()
+                .filter(|_| {
+                    routing_owner
+                        .as_deref()
+                        .is_none_or(|owner| owner == project_id)
+                })
+                .map(str::to_owned);
 
             info!(
                 "[ChatHandler] Auto-reload: forcing restart, project_id={}, old_session_id={}",
@@ -322,22 +332,17 @@ pub(super) async fn prepare_session(
             );
 
             // 1. Stop old agent subprocess
-            if let Some(handle) = &stop_handle
-                && let Err(e) = handle.graceful_stop().await
-            {
+            if let Err(e) = crate::grpc::remove_agent_and_cleanup(project_id, &target).await {
                 return Err(Box::new(ChatHandlerOutput::error(
                     project_id.to_string(),
-                    old_session_id.clone(),
+                    old_session_id_for_resume.clone().unwrap_or_default(),
                     format!("agent exit unconfirmed during reload: {e}"),
                     error_codes::ERR_AGENT_ERROR.to_string(),
                 )));
             }
 
-            // 2. Remove from AGENT_REGISTRY
-            AGENT_REGISTRY.remove_by_project_if_session_matches(project_id, &old_session_id);
-
             // 3. Notify SSE stream + clean SESSION_CACHE
-            if !old_session_id.is_empty() {
+            if owns_route {
                 use crate::service::push_session_update_with_project;
                 use agent_client_protocol::schema::v1::StopReason;
                 use shared_types::{SessionNotify, SessionPromptEnd};

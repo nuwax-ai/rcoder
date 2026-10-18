@@ -67,6 +67,21 @@ use crate::traits::{
     YoloPermissionRequestHandler,
 };
 
+/// Preparation state and an absent ID are never ACP routing identities.
+pub(crate) fn require_session_identity(session_id: &SessionId) -> Result<()> {
+    match shared_types::SessionHint::classify(Some(session_id.0.as_ref())) {
+        shared_types::SessionHint::Established(_) => Ok(()),
+        shared_types::SessionHint::Absent => {
+            anyhow::bail!("ACP session response did not contain a session ID")
+        }
+        shared_types::SessionHint::LegacyPending => {
+            anyhow::bail!(
+                "ACP session response contained a preparation state instead of a session ID"
+            )
+        }
+    }
+}
+
 /// 会话创建使用的运行配置。模型与其 UUID、agent 启动配置及 Fresh 策略一起传递。
 #[derive(Clone)]
 pub struct SessionCreationConfig {
@@ -238,6 +253,7 @@ where
         prompt: &PromptMessage,
         session_id: SessionId,
     ) -> Result<PromptRequest> {
+        require_session_identity(&session_id)?;
         // 构建纯用户提示词
         let final_prompt = if prompt.data_source_attachments.is_empty() {
             PromptBuilder::build_user_prompt(&prompt.content)
@@ -277,6 +293,7 @@ where
         session_id: SessionId,
         attachment_blocks: Vec<ContentBlock>,
     ) -> Result<PromptRequest> {
+        require_session_identity(&session_id)?;
         // 构建纯用户提示词
         let final_prompt = if prompt.data_source_attachments.is_empty() {
             PromptBuilder::build_user_prompt(&prompt.content)
@@ -318,17 +335,7 @@ where
 
         let prompt_request = Self::build_text_prompt_request(prompt, session.session_id().clone())?;
 
-        session
-            .prompt_tx()
-            .send(prompt_request)
-            .await
-            .map_err(|e| {
-                error!("send Prompt requestfailed: {:?}", e);
-                anyhow::anyhow!("Failed to send Prompt request: {:?}", e)
-            })?;
-
-        info!("Prompt request already sent, project ID: {}", project_id);
-        Ok(())
+        self.send_prompt_request(project_id, prompt_request).await
     }
 
     /// 发送 Prompt 请求到指定会话
@@ -343,6 +350,22 @@ where
             .get_session(project_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", project_id))?;
 
+        require_session_identity(session.session_id())?;
+        require_session_identity(&prompt_request.session_id)?;
+        anyhow::ensure!(
+            *session.status() != shared_types::AgentStatus::Terminating,
+            "Agent execution is stopping; session recovery must confirm its exit before dispatch"
+        );
+        anyhow::ensure!(
+            *session.session_id() == prompt_request.session_id,
+            "Prompt session ID does not match the current project execution"
+        );
+        anyhow::ensure!(
+            self.registry
+                .get_project_by_session(session.session_id().0.as_ref())
+                .is_none_or(|owner| owner == project_id),
+            "Session belongs to a different project"
+        );
         send_prompt_to_entry(&session, prompt_request)
             .await
             .map_err(|e| {

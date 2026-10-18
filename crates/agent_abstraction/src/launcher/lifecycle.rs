@@ -107,17 +107,18 @@ impl AgentLifecycleGuard {
 
     /// handshake 前守卫尚未共享；完成后再记录真实 ACP session 身份。
     pub(crate) fn set_session_id(&mut self, session_id: SessionId) -> Result<()> {
+        crate::session::require_session_identity(&session_id)?;
         let inner = Arc::get_mut(&mut self.inner).ok_or_else(|| {
             anyhow::anyhow!("agent lifecycle was shared before session initialization")
         })?;
-        inner.session_id = session_id;
+        inner.session_id = Some(session_id);
         Ok(())
     }
 }
 
 pub(crate) struct AgentLifecycleInner {
     pub(crate) project_id: String,
-    pub(crate) session_id: SessionId,
+    pub(crate) session_id: Option<SessionId>,
     /// 🔥 进程组 ID（当前实现：使用 child.pid 作为伪进程组）
     ///
     /// 注意：当前实现使用子进程的 PID 作为 PGID。

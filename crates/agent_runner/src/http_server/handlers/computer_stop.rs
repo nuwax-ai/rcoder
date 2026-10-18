@@ -73,6 +73,10 @@ pub async fn handle_computer_stop(
     let _transition = agent_abstraction::session::lock_execution_transition(project_id).await;
     let (success, message) = if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(project_id) {
         let session_id = agent_info.session_id.to_string();
+        let routable = AGENT_REGISTRY
+            .get_project_by_session(&session_id)
+            .as_deref()
+            == Some(project_id.as_str());
         if request
             .session_id
             .as_deref()
@@ -85,10 +89,11 @@ pub async fn handle_computer_stop(
             ));
         }
         let cancel_tx = agent_info.cancel_tx.clone();
+        let target = agent_info.clone();
         drop(agent_info);
 
         // 发送取消信号并等待结果
-        if !cancel_tx.is_closed() {
+        if routable && !cancel_tx.is_closed() {
             let session_id_obj = SessionId::new(Arc::from(session_id.as_str()));
             let cancel_notification = CancelNotification::new(session_id_obj);
 
@@ -134,12 +139,14 @@ pub async fn handle_computer_stop(
         }
 
         // 清理 session permissions
-        PERMISSION_MANAGER.cancel_session_permissions(&session_id);
-        PERMISSION_MANAGER.clear_session_state(&session_id);
+        if routable {
+            PERMISSION_MANAGER.cancel_session_permissions(&session_id);
+            PERMISSION_MANAGER.clear_session_state(&session_id);
+        }
 
         // 🧹 清空 ring buffer，防止停止后 SSE 流回放过期的历史消息
         // agent stop 会销毁 agent，不需要保留 SSE 连接发送 SessionPromptEnd
-        if let Some(sd) = SESSION_CACHE.view(&session_id, |_, d| d.clone()) {
+        if routable && let Some(sd) = SESSION_CACHE.view(&session_id, |_, d| d.clone()) {
             let cleared = sd.clear_message_buffer().await;
             if cleared > 0 {
                 info!(
@@ -151,7 +158,7 @@ pub async fn handle_computer_stop(
 
         // 从 AGENT_REGISTRY 移除并优雅停止子进程（对齐 gRPC 路径：
         // remove_agent_and_cleanup 内部 remove_by_project + 后台 graceful_stop SIGTERM+wait）
-        remove_agent_and_cleanup(project_id, &session_id)
+        remove_agent_and_cleanup(project_id, &target)
             .await
             .map_err(|error| {
                 shared_types::AppError::with_message(

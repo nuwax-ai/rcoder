@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::StopReason;
+use shared_types::SessionHint;
 use shared_types::grpc::{CancelRequest, CancelResponse, CancelResultType};
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, instrument, warn};
@@ -12,7 +13,8 @@ use crate::router::AppState;
 use crate::service::{AGENT_REGISTRY, PERMISSION_MANAGER};
 
 use super::cleanup::{
-    CancelAndWaitResult, CapturedSessionCleanup, cleanup_session_full, send_cancel_and_wait,
+    CancelAndWaitResult, CapturedSessionCleanup, cleanup_session_full, remove_agent_and_cleanup,
+    send_cancel_and_wait,
 };
 use super::locale::locale_from_grpc_request;
 
@@ -26,6 +28,11 @@ pub async fn cancel_session(
         let req = request.into_inner();
         // legacy sid-only 请求先解析 owner，再在锁内重新做全部身份校验。
         let lock_project = if req.project_id.is_empty() {
+            if SessionHint::classify(Some(&req.session_id)) == SessionHint::LegacyPending {
+                return Err(Status::invalid_argument(
+                    "project_id is required to cancel an execution without a valid session identity",
+                ));
+            }
             let Some(owner) = AGENT_REGISTRY.get_project_by_session(&req.session_id) else {
                 return Ok(Response::new(CancelResponse {
                     success: true,
@@ -43,73 +50,47 @@ pub async fn cancel_session(
             req.session_id, req.project_id, req.reason
         );
 
-        let actual_session_id = if req.session_id.is_empty() {
-            info!(
-                "📝 [gRPC] session_id is empty, looking up by project_id={}",
-                req.project_id
-            );
-
-            match AGENT_REGISTRY.get_agent_info(&req.project_id) {
-                Some(info) => {
-                    let sid = info.session_id.to_string();
-                    info!(
-                        "✅ [gRPC] got session_id={} from project_id={}",
-                        req.project_id, sid
-                    );
-                    sid
-                }
-                None => {
-                    info!(
-                        "ℹ️ [gRPC] project_id={} has no active session, cancel target achieved",
-                        req.project_id
-                    );
-                    return Ok(Response::new(CancelResponse {
-                        success: true,
-                        result: CancelResultType::CancelResultSuccess as i32,
-                        message: Some(shared_types_i18n::get_i18n_message("grpc.cancel.no_active_session", locale)),
-                    }));
-                }
-            }
-        } else {
-            req.session_id.clone()
-        };
-
-        let Some(project_id) = AGENT_REGISTRY.get_project_by_session(&actual_session_id) else {
-            // 未找到执行时不修改权限状态；请求目标已经不存在。
+        // A project owns its physical execution even when no session can be
+        // routed. Capture it before interpreting the optional session hint.
+        let Some(target) = AGENT_REGISTRY.view_agent_info(&lock_project, Clone::clone) else {
             return Ok(Response::new(CancelResponse {
                 success: true,
                 result: CancelResultType::CancelResultSuccess as i32,
-                message: Some(shared_types_i18n::get_i18n_message("grpc.cancel.session_not_found", locale)),
+                message: Some(shared_types_i18n::get_i18n_message("grpc.cancel.no_active_session", locale)),
             }));
         };
-        if project_id != lock_project {
+        let project_id = lock_project;
+        let actual_session_id = target.session_id.to_string();
+        if !req.session_id.is_empty() && req.session_id != actual_session_id {
+            return Err(Status::failed_precondition(
+                "session_id no longer matches this project execution",
+            ));
+        }
+        if SessionHint::classify(Some(&actual_session_id)).as_session_id().is_none() {
+            // ACP cancel requires a real SID. Retire only this captured project's
+            // execution; never touch global caches/permissions under "pending".
+            let removed = remove_agent_and_cleanup(&project_id, &target)
+                .await
+                .map_err(|error| Status::internal(format!("Agent exit is unconfirmed: {error}")))?;
+            if !removed {
+                return Err(Status::failed_precondition(
+                    "Project execution changed before cancellation completed",
+                ));
+            }
+            return Ok(Response::new(CancelResponse {
+                success: true,
+                result: CancelResultType::CancelResultSuccess as i32,
+                message: Some("Execution with an invalid session identity exited and was reaped".into()),
+            }));
+        }
+        if AGENT_REGISTRY
+            .get_project_by_session(&actual_session_id)
+            .is_some_and(|owner| owner != project_id)
+        {
             return Err(Status::failed_precondition("session_id belongs to a different project"));
         }
-        let (status, cancel_tx, request_id) = {
-            let agent_info = match AGENT_REGISTRY.get_agent_info(&project_id) {
-                Some(info) => info,
-                None => {
-                    info!(
-                        "ℹ️ [gRPC] project_id={} has no active session, cancel target achieved (idempotent)",
-                        project_id
-                    );
-                    return Ok(Response::new(CancelResponse {
-                        success: true,
-                        result: CancelResultType::CancelResultSuccess as i32,
-                        message: Some(shared_types_i18n::get_i18n_message("grpc.cancel.no_active_session", locale)),
-                    }));
-                }
-            };
-
-            if agent_info.session_id.to_string() != actual_session_id {
-                return Err(Status::failed_precondition("session_id no longer matches this project execution"));
-            }
-            let status = agent_info.status;
-            let cancel_tx = agent_info.cancel_tx.clone();
-            let request_id = agent_info.request_id.clone();
-            drop(agent_info);
-            (status, cancel_tx, request_id)
-        };
+        let (status, cancel_tx, request_id) =
+            (target.status, target.cancel_tx, target.request_id);
         // SDK cancel await 前同时捕获终态回合和 SSE 实例，后续分支不读当前 request。
         let cleanup = CapturedSessionCleanup::capture(&actual_session_id, request_id);
         let cancelled_permissions =
@@ -270,4 +251,106 @@ pub async fn cancel_session(
         }))
     })
     .await
+}
+
+#[cfg(all(test, feature = "http-server"))]
+mod tests {
+    use super::*;
+    use crate::service::local_agent_service::tests::{Execution, service};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    fn state() -> Arc<AppState> {
+        let local = service();
+        Arc::new(AppState {
+            sessions: Arc::new(dashmap::DashMap::new()),
+            config: crate::config::AppConfig::default(),
+            agent_session_service: local.agent_session_service.clone(),
+            api_key_manager: Arc::new(crate::api_key_manager::ApiKeyManager::from_shared(
+                local.shared_api_key_manager.clone(),
+            )),
+            shared_api_key_manager: local.shared_api_key_manager.clone(),
+            project_uuid_map: local.project_uuid_map.clone(),
+            agent_mgmt_registry: Arc::new(crate::agent_mgmt::AgentRegistry::empty(
+                Default::default(),
+            )),
+            agent_mgmt_path_manager: Default::default(),
+            #[cfg(feature = "proxy")]
+            pingora_service: None,
+        })
+    }
+
+    fn request(project: String, session: &str) -> Request<CancelRequest> {
+        Request::new(CancelRequest {
+            project_id: project,
+            session_id: session.into(),
+            reason: "test".into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn project_scoped_invalid_sid_cancel_waits_for_physical_exit() {
+        let mut execution = Execution::seed("pending");
+        let project = execution.project.clone();
+        let cancel =
+            tokio::spawn(async move { cancel_session(&state(), request(project, "")).await });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            execution.lifecycle.entered.notified(),
+        )
+        .await
+        .unwrap();
+        assert!(!cancel.is_finished());
+        assert!(AGENT_REGISTRY.inner_mut().contains_key(&execution.project));
+        execution.lifecycle.release.notify_one();
+        let response = cancel.await.unwrap().unwrap().into_inner();
+        assert!(response.success);
+        assert_eq!(
+            response.result,
+            CancelResultType::CancelResultSuccess as i32
+        );
+        assert!(response.message.unwrap().contains("exited and was reaped"));
+        assert_eq!(execution.lifecycle.waits.load(Ordering::SeqCst), 1);
+        assert!(!AGENT_REGISTRY.inner_mut().contains_key(&execution.project));
+        assert!(execution.cancel.try_recv().is_err());
+        assert!(AGENT_REGISTRY.get_project_by_session("pending").is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_sid_only_cancel_does_not_guess_a_project_or_stop_its_child() {
+        let execution = Execution::seed("pending");
+        let error = cancel_session(&state(), request(String::new(), "pending"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(AGENT_REGISTRY.inner_mut().contains_key(&execution.project));
+        assert!(!execution.lifecycle.exited.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn invalid_sid_cancel_keeps_unconfirmed_execution_and_propagates_failure() {
+        let execution = Execution::seed("pending");
+        execution.lifecycle.fail.store(true, Ordering::SeqCst);
+        execution.lifecycle.release.notify_one();
+        let error = cancel_session(&state(), request(execution.project.clone(), "pending"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(error.message().contains("controlled exit not confirmed"));
+        assert!(AGENT_REGISTRY.inner_mut().contains_key(&execution.project));
+    }
+
+    #[tokio::test]
+    async fn explicit_project_cancel_keeps_foreign_session_mismatch_protection() {
+        let mut execution = Execution::seed("opaque-session");
+        let error = cancel_session(
+            &state(),
+            request(execution.project.clone(), "foreign-session"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(execution.cancel.try_recv().is_err());
+        assert!(!execution.lifecycle.exited.load(Ordering::SeqCst));
+    }
 }

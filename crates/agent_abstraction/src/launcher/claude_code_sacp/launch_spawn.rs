@@ -154,7 +154,7 @@ pub(super) async fn wait_for_session_id(
     project_id: &str,
     session_create_timeout_secs: u64,
     session_id_rx: tokio::sync::oneshot::Receiver<SessionId>,
-    connection_failed_rx: tokio::sync::oneshot::Receiver<String>,
+    mut connection_failed_rx: tokio::sync::oneshot::Receiver<String>,
     connection_task_handle: &tokio::task::JoinHandle<()>,
     stderr_output_shared: &Arc<std::sync::Mutex<Vec<String>>>,
     connection_error_shared: &Arc<std::sync::Mutex<Option<String>>>,
@@ -176,7 +176,7 @@ pub(super) async fn wait_for_session_id(
                         Err(e) => Ok(Err(anyhow::anyhow!("channel dropped: {}", e))),
                     }
                 }
-                failed = connection_failed_rx => {
+                failed = &mut connection_failed_rx => {
                     match failed {
                         Ok(err_msg) => Err(anyhow::anyhow!("{}", err_msg)),
                         Err(_) => Ok(Err(anyhow::anyhow!("connection ended without session_id or error"))),
@@ -238,9 +238,9 @@ pub(super) async fn wait_for_session_id(
         }
         Ok(Ok(Err(e))) => {
             // channel dropped — 读取连接任务的实际错误原因
-            let connection_error = connection_error_shared.lock().ok()
-                .and_then(|guard| guard.clone())
-                .unwrap_or_else(|| "unknown error".to_string());
+            let connection_error = connection_failed_rx.try_recv().ok().or_else(|| {
+                connection_error_shared.lock().ok().and_then(|guard| guard.clone())
+            }).unwrap_or_else(|| "unknown error".to_string());
             // 读取 stderr 输出
             let stderr_info = stderr_output_shared.lock().ok()
                 .map(|buf| buf.join("\n"))
@@ -267,4 +267,39 @@ pub(super) async fn wait_for_session_id(
     );
 
     Ok(session_id)
+}
+
+#[cfg(test)]
+mod startup_error_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn queued_setup_error_survives_the_unassigned_identity_sender_closing() {
+        let connection = tokio::spawn(async {});
+        for _ in 0..64 {
+            let (sid_tx, sid_rx) = tokio::sync::oneshot::channel();
+            let (failed_tx, failed_rx) = tokio::sync::oneshot::channel();
+            let cause =
+                "ACP session response contained a preparation state instead of a session ID";
+            failed_tx.send(cause.to_owned()).unwrap();
+            drop(sid_tx);
+            let error = wait_for_session_id(
+                "owned-project",
+                10,
+                sid_rx,
+                failed_rx,
+                &connection,
+                &Arc::new(std::sync::Mutex::new(Vec::new())),
+                &Arc::new(std::sync::Mutex::new(None)),
+                "controlled-acp",
+                42,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains(cause), "{error}");
+            assert!(!error.to_string().contains("unknown error"));
+        }
+        connection.await.unwrap();
+    }
 }
