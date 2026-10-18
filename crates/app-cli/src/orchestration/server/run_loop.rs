@@ -1390,7 +1390,27 @@ pub(super) async fn server_loop(
             };
             drop(startup_control);
             if let Some(signal) = startup_signal {
-                if let Err(error) = host.stop_all(Some(&standby_root)).await {
+                let stopped = async {
+                    match &signal {
+                        ControlSignal::StopBusiness { operation_id } => {
+                            let deadline = settle_configuration_before_stop(state, &signal)
+                                .await?
+                                .context("startup Stop did not provide its cleanup deadline")?;
+                            host.drain_entry_for_operation_until(
+                                &standby_root,
+                                deadline,
+                                Some(operation_id.clone()),
+                            )
+                            .await?;
+                            host.stop_business().await
+                        }
+                        ControlSignal::OrchestrateSource { .. } => {
+                            host.stop_all(Some(&standby_root)).await
+                        }
+                    }
+                }
+                .await;
+                if let Err(error) = stopped {
                     record_uncertain_control(state, &signal, &format!("startup stop: {error:#}"))
                         .await;
                     hold_unconfirmed(state, format!("startup stop: {error:#}")).await;
@@ -1414,7 +1434,14 @@ pub(super) async fn server_loop(
                     .err()
                     .map(|error| format!("startup interrupted: {error:#}"))
                     .unwrap_or_else(|| "startup interrupted by runtime control".into());
-                pending = Some(settle_stopped_startup(args, state, signal, reason).await);
+                // This live startup driver joined its original orchestration,
+                // settled admitted writers, drained the entry and confirmed
+                // business cleanup. Retain that fresh proof for this Stop only;
+                // its outer loop still performs static teardown and commits the
+                // original Stop's own terminal record.
+                pending = Some(confirmed_business_stop(
+                    settle_stopped_startup(args, state, signal, reason).await,
+                ));
                 continue;
             }
             if state.is_cancelled() {
