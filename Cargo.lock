@@ -10221,6 +10221,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "which 8.0.6",
  "windows-sys 0.61.2",
 ]
 

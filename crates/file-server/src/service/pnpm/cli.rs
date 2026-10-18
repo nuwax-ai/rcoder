@@ -130,7 +130,7 @@ async fn approve_builds(
     packages: &[String],
     timeout_secs: u64,
 ) -> Result<(), InstallError> {
-    let mut command = Command::new("pnpm");
+    let mut command = Command::new(process_utils::resolve_spawn_program("pnpm"));
     command
         .arg("approve-builds")
         .args(packages)
@@ -164,7 +164,7 @@ async fn install_once(
 ) -> Result<InstallOutcome, InstallError> {
     let args = install_args(options);
 
-    let mut command = Command::new("pnpm");
+    let mut command = Command::new(process_utils::resolve_spawn_program("pnpm"));
     command.args(&args).current_dir(cwd);
     if let Ok(path) = std::env::var("PATH") {
         command.env("PATH", path);

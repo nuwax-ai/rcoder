@@ -240,7 +240,7 @@ fn dev_command(
     cwd: &Path,
     env_extra: &[(String, String)],
 ) -> Command {
-    let mut cmd = Command::new(program);
+    let mut cmd = Command::new(process_utils::resolve_spawn_program(program));
     cmd.args(args);
     cmd.current_dir(cwd);
     cmd.env_clear();
@@ -348,7 +348,7 @@ pub async fn run_command_to_log(
     timeout_secs: u64,
     observers: CommandObservers<'_>,
 ) -> AppResult<()> {
-    let mut cmd = Command::new(program);
+    let mut cmd = Command::new(process_utils::resolve_spawn_program(program));
     cmd.args(args);
     cmd.current_dir(cwd);
     // 一次性 Node 命令继承 PATH/HOME，仅删会改变依赖/脚本行为的环境变量。
