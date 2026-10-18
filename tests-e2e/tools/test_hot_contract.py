@@ -9,10 +9,41 @@ import subprocess
 import tempfile
 import traceback
 import unittest
+import http.server
+import threading
+import urllib.error
+import urllib.request
 from unittest.mock import patch
 
 
 class DockerDiagnosticTests(unittest.TestCase):
+    def test_real_artifact_upstream_fails_twice_then_serves_original_B(self):
+        with tempfile.TemporaryDirectory() as report:
+            with patch.dict(os.environ, {'E2E_REPORT_DIR': report, 'E2E_RUN_ID': 'real-retry-upstream'}):
+                module = runpy.run_path(str(Path(__file__).with_name('hot_contract.py')))
+            module['RELEASE'].set()
+            server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), module['Handler'])
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            statuses, bodies = [], []
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            try:
+                for _ in range(3):
+                    try:
+                        with opener.open(f'http://127.0.0.1:{server.server_port}/slow', timeout=2) as response:
+                            statuses.append(response.status)
+                            bodies.append(response.read())
+                    except urllib.error.HTTPError as error:
+                        statuses.append(error.code)
+                        error.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+            self.assertEqual(statuses, [503, 503, 200])
+            self.assertEqual(bodies, [module['B']])
+            self.assertEqual([event['status'] for event in module['RETRY_HTTP_EVENTS']], statuses)
+
     def test_command_failure_and_timeout_do_not_expose_deploy_token(self):
         with tempfile.TemporaryDirectory() as report:
             with patch.dict(os.environ, {'E2E_REPORT_DIR': report, 'E2E_RUN_ID': 'diagnostic-test'}):

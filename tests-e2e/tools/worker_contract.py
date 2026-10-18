@@ -18,7 +18,7 @@ os.environ['E2E_CONTRACT_DIR'] = 'worker-contract'
 import hot_contract as h
 
 
-def artifact(release, probe, worker='import time; time.sleep(3600)', dev=False):
+def artifact(release, probe, worker='import time; time.sleep(3600)'):
     original = zipfile.ZipFile(io.BytesIO(h.artifact(release, release)))
     lock = original.read('release.lock.toml').decode()
     lock = lock.replace('minimum_app_cli_version = "0.1.3"', 'minimum_app_cli_version = "0.3.9"')
@@ -44,8 +44,6 @@ startup_timeout_seconds = 12
 '''
     if probe:
         lock += f'startup_probe = "{probe}"\n'
-    if dev:
-        lock += '[services.devrun]\ncommand = ["python3", "main.py"]\n'
     data = io.BytesIO()
     with zipfile.ZipFile(data, 'w', zipfile.ZIP_DEFLATED) as output:
         for info in original.infolist():
@@ -61,6 +59,57 @@ def view(base, path):
     if status != 200:
         raise AssertionError(f'{path}: HTTP {status}')
     return json.loads(data)['data']
+
+
+def source_files():
+    """Source Start reloads current manifests, rather than a deployed lock."""
+    return {
+        'workspace.manifest.toml': '''schema_version = 1
+[workspace]
+name = "worker-source"
+''',
+        'web/project.manifest.toml': '''schema_version = 1
+[project]
+service_id = "web"
+name = "Web"
+type = "node"
+[build]
+command = ["node", "--check", "server.js"]
+artifact = "artifact.zip"
+[run]
+command = ["node", "server.js"]
+shutdown_timeout_seconds = 3
+[devrun]
+command = ["node", "server.js"]
+[health]
+startup_probe = "http"
+startup_timeout_seconds = 20
+[proxy]
+path = "/"
+''',
+        'worker/project.manifest.toml': '''schema_version = 1
+[project]
+service_id = "worker"
+name = "Worker"
+type = "python"
+kind = "worker"
+[build]
+command = ["python3", "-m", "py_compile", "main.py"]
+artifact = "artifact.zip"
+[run]
+command = ["python3", "main.py"]
+shutdown_timeout_seconds = 2
+[devrun]
+command = ["python3", "main.py"]
+[health]
+startup_probe = "process"
+startup_timeout_seconds = 12
+''',
+        # Source ports are allocated by the actual manifest compiler; only
+        # artifact fixtures carry their explicit locked 4200/4201 ports.
+        'web/server.js': "require('http').createServer((q,s)=>s.end(require('./dependency.js'))).listen(Number(process.env.PORT),'0.0.0.0');\n",
+        'worker/main.py': 'import time; time.sleep(3600)\n',
+    }
 
 
 def main():
@@ -143,8 +192,12 @@ print(json.dumps(roots))'''
 
         def healthy():
             h.check('one live worker root', len(worker_roots()) == 1, str(worker_roots()))
-            code = 'import socket; s=socket.socket(); s.settimeout(1); print(s.connect_ex(("127.0.0.1",4201))); s.close()'
-            h.check('worker has no listener', h.docker('exec', cid, 'python3', '-c', code) != '0', 'worker port 4201')
+            code = '''import pathlib,socket,tomllib
+lock=tomllib.loads(pathlib.Path('/review/code/release.lock.toml').read_text())
+port=next(service['port'] for service in lock['services'] if service['service_id']=='worker')
+s=socket.socket(); s.settimeout(1)
+print(s.connect_ex(('127.0.0.1',port))); s.close()'''
+            h.check('worker has no listener', h.docker('exec', cid, 'python3', '-c', code) != '0', 'actual locked worker port')
             h.check('web actual HTTP', h.poll(lambda: h.request_http(app, '/')[0] == 200), 'Pingap HTTP')
 
         # A real HTTP probe must reject this no-listener process on both engines.
@@ -159,15 +212,17 @@ print(json.dumps(roots))'''
         terminal('stop-worker', 'succeeded')
         h.check('stop cleans worker', not worker_roots(), 'actual process inventory')
         # The source profile selects devrun; it must honor process instead of legacy TCP.
-        source_data = artifact('worker-source', 'process', dev=True)
-        import base64
         # Keep the deployed web artifact (including its real symlink) intact.
-        # Python ZipFile.extractall would turn the symlink into an ordinary JS file.
-        unpack = '''import base64,io,pathlib,sys,zipfile
-with zipfile.ZipFile(io.BytesIO(base64.b64decode(sys.argv[1]))) as archive:
- for name in ('release.lock.toml', 'worker/main.py'):
-  pathlib.Path('/review/code',name).write_bytes(archive.read(name))'''
-        h.docker('exec', cid, 'python3', '-c', unpack, base64.b64encode(source_data).decode())
+        # Write real source/manifests only; never use an old release.lock as the
+        # authority for a current Source request or extract over the symlink.
+        install = '''import json,pathlib,sys
+for name,content in json.loads(sys.argv[1]).items():
+ path=pathlib.Path('/review/code',name)
+ path.parent.mkdir(parents=True,exist_ok=True)
+ path.write_text(content)'''
+        files = source_files()
+        (h.REPORT / 'source-files.json').write_text(json.dumps(files, indent=2))
+        h.docker('exec', cid, 'python3', '-c', install, json.dumps(files))
         submit('start', 'process-source')
         terminal('process-source', 'succeeded')
         healthy()

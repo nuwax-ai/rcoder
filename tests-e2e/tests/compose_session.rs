@@ -702,6 +702,152 @@ async fn scenario_absolute_work_dir(backend: Backend) {
     assert_hard_all(report).await;
 }
 
+// Preparation state must never become an ACP session identity. Exercise the
+// actual model/Runner/storage/SSE chain, including shared-user projects and an
+// old client that still sends the historical placeholder.
+async fn scenario_auto_reload_session_identity(backend: Backend) {
+    let Some((env, report)) =
+        Env::compose_or_skip("auto_reload_session_identity", backend.as_str()).await
+    else {
+        return;
+    };
+    let user_a = env.scoped_user(&format!("reload-a-{}", backend.as_str()));
+    let user_b = env.scoped_user(&format!("reload-b-{}", backend.as_str()));
+    let _guard_a = TestUserGuard::new(&env, &user_a);
+    let _guard_b = TestUserGuard::new(&env, &user_b);
+    let mut established = Vec::new();
+    for (index, user) in [&user_a, &user_a, &user_b].into_iter().enumerate() {
+        let project = format!("{}-reload-{}-{index}", env.run_tag, backend.as_str());
+        let marker = format!("RELOAD_{}_{}", uuid::Uuid::new_v4().simple(), index);
+        let mut request = env.base_payload(
+            backend,
+            &format!("第一行原样输出 {marker}，然后逐行输出数字1到20。不要调用工具或解释。"),
+            &format!("{}-reload-new-{index}", env.run_tag),
+            user,
+        );
+        request.project_id = Some(project.clone());
+        request.agent_config.as_mut().unwrap().auto_reload =
+            Some(shared_types::AutoReloadConfig::default_enabled());
+        let phase = format!("new_project_{index}");
+        let Ok(data) = chat_reported(&env, &report, &phase, &env.rcoder, &request).await else {
+            report.assert_hard(
+                &format!("{phase} accepted"),
+                false,
+                "see chat_request".into(),
+            );
+            assert_hard_all(report).await;
+            return;
+        };
+        report.assert_hard(
+            &format!("{phase} project identity"),
+            data.project_id == project,
+            data.project_id.clone(),
+        );
+        report.assert_hard(
+            &format!("{phase} real session"),
+            !data.session_id.is_empty() && data.session_id != "pending",
+            data.session_id.clone(),
+        );
+        report.assert_hard(
+            &format!("{phase} no fictional reload"),
+            data.reloaded != Some(true),
+            format!("{:?}", data.reloaded),
+        );
+        report.assert_hard(
+            &format!("{phase} independent session"),
+            established
+                .iter()
+                .all(|(_, sid): &(String, String)| sid != &data.session_id),
+            data.session_id.clone(),
+        );
+        let (events, _) = collect_reported(
+            &env,
+            &report,
+            CollectSpec {
+                phase: &phase,
+                entry: &env.rcoder,
+                sid: &data.session_id,
+                duration_s: 60.0,
+                last_event_id: None,
+                idle_stop: true,
+            },
+        )
+        .await;
+        report.assert_hard(
+            &format!("{phase} real response"),
+            sse::chunks_text(&events).contains(&marker),
+            format!("event types: {}", sse::type_counts(&events)),
+        );
+        report.assert_hard(
+            &format!("{phase} complete turn"),
+            count_event(&events, "end_turn") == 1 && count_event(&events, "error") == 0,
+            format!("event types: {}", sse::type_counts(&events)),
+        );
+        established.push((project, data.session_id));
+    }
+
+    let (project, sid) = &established[0];
+    for (phase, hint) in [
+        ("resume_real", sid.as_str()),
+        ("legacy_client_hint", "pending"),
+    ] {
+        let marker = format!("RELOAD_{}", uuid::Uuid::new_v4().simple());
+        let mut request = env.base_payload(
+            backend,
+            &format!("第一行原样输出 {marker}，然后逐行输出数字1到20。不要调用工具或解释。"),
+            &format!("{}-reload-{phase}", env.run_tag),
+            &user_a,
+        );
+        request.project_id = Some(project.clone());
+        request.session_id = Some(hint.to_owned());
+        request.agent_config.as_mut().unwrap().auto_reload =
+            Some(shared_types::AutoReloadConfig::default_enabled());
+        let Ok(data) = chat_reported(&env, &report, phase, &env.rcoder, &request).await else {
+            report.assert_hard(
+                &format!("{phase} accepted"),
+                false,
+                "see chat_request".into(),
+            );
+            assert_hard_all(report).await;
+            return;
+        };
+        report.assert_hard(
+            &format!("{phase} retains real session"),
+            &data.session_id == sid,
+            data.session_id.clone(),
+        );
+        report.assert_hard(
+            &format!("{phase} actual reload"),
+            data.reloaded == Some(true),
+            format!("{:?}", data.reloaded),
+        );
+        let (events, _) = collect_reported(
+            &env,
+            &report,
+            CollectSpec {
+                phase,
+                entry: &env.rcoder,
+                sid: &data.session_id,
+                duration_s: 60.0,
+                last_event_id: None,
+                idle_stop: true,
+            },
+        )
+        .await;
+        report.assert_hard(
+            &format!("{phase} real response"),
+            sse::chunks_text(&events).contains(&marker),
+            format!("event types: {}", sse::type_counts(&events)),
+        );
+        report.assert_hard(
+            &format!("{phase} complete turn"),
+            count_event(&events, "end_turn") == 1 && count_event(&events, "error") == 0,
+            format!("event types: {}", sse::type_counts(&events)),
+        );
+    }
+    assert_hard_all(report).await;
+}
+
 // ============================================================
 // 测试入口
 // ============================================================
@@ -774,4 +920,14 @@ async fn absolute_agent_work_dir_openai() {
 #[tokio::test]
 async fn absolute_agent_work_dir_anthropic() {
     scenario_absolute_work_dir(Backend::Anthropic).await;
+}
+
+#[tokio::test]
+async fn auto_reload_session_identity_openai() {
+    scenario_auto_reload_session_identity(Backend::Openai).await;
+}
+
+#[tokio::test]
+async fn auto_reload_session_identity_anthropic() {
+    scenario_auto_reload_session_identity(Backend::Anthropic).await;
 }

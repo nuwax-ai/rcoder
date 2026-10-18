@@ -29,6 +29,11 @@ TOKEN = uuid.uuid4().hex
 GENERATION = str(uuid.uuid4())
 RUNTIME_IMAGE = os.environ.get('E2E_RUNTIME_IMAGE', 'dev-app-runtime:latest')
 RESULTS = []
+# Two 3s production backoffs fit inside this fault-fixture-only budget. The
+# product default remains 180s; the original 90s observation budget is unchanged.
+DOWNLOAD_RETRY_SECONDS = 8
+RETRY_HTTP_EVENTS = []
+RETRY_HTTP_LOCK = threading.Lock()
 
 
 def check(name, ok, detail):
@@ -178,6 +183,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if payload is None:
             self.send_error(404)
             return
+        if self.path == '/slow':
+            with RETRY_HTTP_LOCK:
+                status = 503 if len(RETRY_HTTP_EVENTS) < 2 else 200
+                RETRY_HTTP_EVENTS.append({'status': status, 'monotonic': time.monotonic()})
+            if status == 503:
+                self.send_error(503, 'controlled temporary artifact upstream outage')
+                return
         self.send_response(200)
         self.send_header('Content-Length', str(len(payload)))
         self.end_headers()
@@ -272,6 +284,7 @@ def main():
                            '-e', 'APP_DEPLOY_MAX_EXTRACTED_BYTES=6144',
                            '-e', 'APP_DEPLOY_MAX_ENTRIES=8',
                            '-e', 'APP_DEPLOY_READ_IDLE_SECONDS=5',
+                           '-e', 'APP_DEPLOY_UNAVAILABLE_RETRY_SECONDS=' + str(DOWNLOAD_RETRY_SECONDS),
                            *entry], 'builtin' if builtin else 'supervisord', docker_fn=docker)
         identity = json.loads(docker('inspect', '--format', '{{json .}}', container))
         (REPORT / 'identity.json').write_text(json.dumps({k: identity[k] for k in ['Id', 'Image', 'Name']}))
@@ -307,7 +320,7 @@ def main():
             return subprocess.run(['docker', 'exec', container, 'node', '-e', script], timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
         configured_env = dict(entry.split('=', 1) for entry in identity['Config']['Env'] if '=' in entry)
-        check('cold A operation configured', configured_env.get('APP_DEPLOY_OPERATION_ID') == 'initial-A' and configured_env.get('APP_DEPLOY_GENERATION_ID') == GENERATION and configured_env.get('APP_RELEASE_ID') == 'request-initial-A', 'verified actual container operation and generation env')
+        check('cold A operation configured', configured_env.get('APP_DEPLOY_OPERATION_ID') == 'initial-A' and configured_env.get('APP_DEPLOY_GENERATION_ID') == GENERATION and configured_env.get('APP_RELEASE_ID') == 'request-initial-A' and configured_env.get('APP_DEPLOY_UNAVAILABLE_RETRY_SECONDS') == str(DOWNLOAD_RETRY_SECONDS), 'verified actual container operation, generation and fixture-only retry env')
         result = poll(lambda: terminal('initial-A'))
         check('A identity', successful_identity(result, 'initial-A', 'manifest-A'), str(result))
         check('A serves content', poll(lambda: request_http(app, '/')[1] == b'content-A'), 'actual response body')
@@ -334,12 +347,22 @@ def main():
         check('manual redeploy restores A', successful_identity(result, 'manual-A', 'manifest-A') and poll(lambda: request_http(app, '/')[1] == b'content-A'), str(result))
         status, _ = submit('/slow', 'winner-B')
         check('slow B accepted', status == 202, str(status))
+        # Wait until the real third GET is held by the original slow-stream
+        # barrier. No mutation is replayed by this harness.
+        poll(lambda: len(RETRY_HTTP_EVENTS) >= 3)
         status, _ = submit('/A', 'loser-A')
         check('concurrent deployment rejected', status == 409, str(status))
         check('A serves during prepare', request_http(app, '/')[1] == b'content-A', 'actual response body')
         RELEASE.set()
         result = poll(lambda: terminal('winner-B'))
         check('B identity', successful_identity(result, 'winner-B', 'manifest-B'), str(result))
+        with RETRY_HTTP_LOCK:
+            retry_events = list(RETRY_HTTP_EVENTS)
+        (REPORT / 'upstream-retry-events.json').write_text(json.dumps(retry_events, indent=2))
+        check('temporary upstream outage retries the original B operation',
+              [event['status'] for event in retry_events] == [503, 503, 200]
+              and retry_events[-1]['monotonic'] - retry_events[0]['monotonic'] < DOWNLOAD_RETRY_SECONDS
+              and successful_identity(result, 'winner-B', 'manifest-B'), str(retry_events))
         check('former capacity and entry settings do not reject B', result['phase'] == 'running', 'B exceeds former download, total, file and entry settings')
         check('B serves content', poll(lambda: request_http(app, '/')[1] == b'content-B'), 'actual response body')
         docker('restart', container)

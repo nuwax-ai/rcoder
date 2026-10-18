@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 import socket
+import subprocess
 import threading
 import time
 from types import SimpleNamespace
@@ -15,6 +16,39 @@ from unittest.mock import patch
 
 import compute_failure_contract as contract
 import docker_fault_proxy as proxy
+
+
+class BuilderObservationTests(unittest.TestCase):
+    def test_exact_auto_removed_container_is_absent_after_ps(self):
+        container_id = 'a' * 64
+        for diagnostic in ('error: no such object: ', 'Error response from daemon: No such container: '):
+            error = subprocess.CalledProcessError(1, ['docker', 'inspect', container_id],
+                                                 output='[]\n', stderr=diagnostic + container_id + '\n')
+            with self.subTest(diagnostic=diagnostic), patch.object(
+                    contract, 'command', side_effect=[container_id, error]):
+                self.assertEqual(contract.builder_rows({'app_id': 'owned'}), [])
+
+    def test_unreadable_transport_other_identity_and_partial_ids_are_not_absence(self):
+        container_id = 'a' * 64
+        for listed, diagnostic, code in (
+                (container_id, 'permission denied', 1),
+                (container_id, 'Cannot connect to the Docker daemon', 1),
+                (container_id, 'error: no such object: ' + 'b' * 64, 1),
+                (container_id, 'error: no such object: ' + container_id, 125),
+                (container_id[:12], 'error: no such object: ' + container_id[:12], 1)):
+            error = subprocess.CalledProcessError(code, ['docker', 'inspect', listed], stderr=diagnostic)
+            with self.subTest(listed=listed, diagnostic=diagnostic), patch.object(
+                    contract, 'command', side_effect=[listed, error]):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    contract.builder_rows({'app_id': 'owned'})
+
+    def test_empty_or_replaced_successful_inspect_is_not_absence(self):
+        container_id = 'a' * 64
+        for observed in ([], [{'Id': 'b' * 64}]):
+            with self.subTest(observed=observed), patch.object(
+                    contract, 'command', side_effect=[container_id, json.dumps(observed)]):
+                with self.assertRaisesRegex(ValueError, 'physical identity'):
+                    contract.builder_rows({'app_id': 'owned'})
 
 
 class PhasePollingTests(unittest.TestCase):

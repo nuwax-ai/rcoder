@@ -360,7 +360,23 @@ def publish_fault_config(path, value):
 def builder_rows(receipt):
     ids = command('docker', 'ps', '-aq', '--no-trunc', '--filter',
                   'label=rcoder.io/application-id=' + receipt['app_id']).split()
-    rows = json.loads(command('docker', 'inspect', *ids)) if ids else []
+    rows = []
+    for container_id in ids:
+        try:
+            observed = json.loads(command('docker', 'inspect', container_id))
+        except subprocess.CalledProcessError as error:
+            # AutoRemove may retire this exact physical container between ps
+            # and inspect. Only Docker's explicit absence is an observation;
+            # daemon, permission and transport failures must still fail.
+            absent = re.fullmatch(
+                r'(?:error: |error response from daemon: )?no such (?:object|container): '
+                + re.escape(container_id), (error.stderr or '').strip(), re.IGNORECASE)
+            if error.returncode == 1 and re.fullmatch(r'[0-9a-f]{64}', container_id) and absent:
+                continue
+            raise
+        if len(observed) != 1 or observed[0].get('Id') != container_id:
+            raise ValueError('compute fixture builder physical identity changed')
+        rows.extend(observed)
     for row in rows:
         labels = row['Config'].get('Labels') or {}
         source = next((m for m in row['Mounts']

@@ -12,6 +12,7 @@ HOT = {
     'restart retains B operation identity', 'restart retains B content despite cold A env',
     'restart preserves container identity', 'slow B accepted',
     'concurrent deployment rejected', 'A serves during prepare',
+    'temporary upstream outage retries the original B operation',
     'former capacity and entry settings do not reject B', 'B identity', 'B serves content', 'container unchanged', 'owned resource cleanup',
 } | {name + suffix for name in FAULTS for suffix in (' accepted', ' fails correct operation', ' old content healthy', ' no temporary residue')}
 WORKER = {
@@ -90,8 +91,21 @@ REQUIRED['userapp_scope_isolation_during_deploy'] = {
     'prod image and container identity recorded before cleanup',
     'prod diagnostics captured before deletion',
     'prod delete purge 回收',
-    '删除后流量转 502（backend 已注销）',
 }
+
+PURGE_RECOVERY = {
+    'purge captures exact runtime and original four data mounts',
+    'purged old traffic never recreates runtime or four data directories',
+    'purge recovery fresh verified URL is prepared',
+    'purge explicit fresh URL deployment is accepted',
+    'fresh purge deployment identity is recorded without losing old evidence',
+    'fresh purge deployment final diagnostics retained',
+    'purge fresh deployment serves HTTP with one runtime and new data',
+    'fresh purge recovery deployment is explicitly cleaned',
+    'fresh deployment purge remains absent under old traffic',
+}
+for scenario in ('userapp_deploy_full_chain', 'userapp_scope_isolation_during_deploy'):
+    REQUIRED[scenario] |= PURGE_RECOVERY
 
 REQUIRED['userapp_deploy_full_chain'] |= {
     f'流量七路[{name}]就绪' for name in (
@@ -221,9 +235,11 @@ REQUIRED['native_terminal_release_crash_contract'] = {
 
 REQUIRED['docker_runtime_crash_recovery_contract'] = {'Docker crash contract process completed'} | {
     'Docker ' + mode + ' ' + step for mode in ('before_create', 'after_start') for step in (
-        'exact barrier established', 'SIGKILL observed', 'restart quarantines without replay', 'owned cleanup',
+        'exact barrier established', 'SIGKILL observed', 'restart retains original outcome without replay', 'owned cleanup',
     )
 }
+REQUIRED['docker_runtime_crash_recovery_contract'].add(
+    'Docker after_start normal ensure restores one usable builder and retains original receipt')
 
 REQUIRED['userapp_compute_stopped_failure_recovery_contract'] = {
     'compute failure contract process completed',
@@ -375,3 +391,16 @@ REQUIRED['host_k8s_userapp_dev_compute_no_llm'] = USERAPP_COMPUTE | {
     'host K8s RCoder reachable',
     'userapp K8s test resources absent after purge',
 }
+
+AUTO_RELOAD_SESSION_IDENTITY = {
+    f'new_project_{index} {step}' for index in range(3) for step in (
+        'project identity', 'real session', 'no fictional reload',
+        'independent session', 'real response', 'complete turn',
+    )
+} | {
+    f'{phase} {step}' for phase in ('resume_real', 'legacy_client_hint') for step in (
+        'retains real session', 'actual reload', 'real response', 'complete turn',
+    )
+}
+for _backend in ('anthropic', 'openai'):
+    REQUIRED[f'auto_reload_session_identity_{_backend}'] = AUTO_RELOAD_SESSION_IDENTITY.copy()

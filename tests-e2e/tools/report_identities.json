@@ -23,6 +23,18 @@
       "backend": "openai"
     }
   ],
+  "auto_reload_session_identity_anthropic": [
+    {
+      "scenario": "auto_reload_session_identity",
+      "backend": "anthropic"
+    }
+  ],
+  "auto_reload_session_identity_openai": [
+    {
+      "scenario": "auto_reload_session_identity",
+      "backend": "openai"
+    }
+  ],
   "concurrent_subscribers_anthropic": [
     {
       "scenario": "concurrent_subscribers",

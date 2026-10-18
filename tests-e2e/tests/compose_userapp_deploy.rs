@@ -22,6 +22,9 @@ use rcoder_e2e::common::report::JsonlReporter;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+#[path = "support/purge_recovery.rs"]
+mod purge_recovery;
+
 /// 套件级串行锁（对齐 compose_userapp_dev：单机资源天花板下防 builder 挤兑）。
 static SCENARIO_GATE: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
 
@@ -2201,16 +2204,32 @@ async fn verify_stop_and_explicit_start(env: &Env, report: &JsonlReporter, app: 
     }
 }
 
-/// 回收：prod delete purge → 流量转 502。
-async fn cleanup_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str) {
+/// Purge cannot be undone by traffic; a caller's fresh URL can deploy again.
+async fn cleanup_prod(
+    env: &Env,
+    report: &JsonlReporter,
+    app: &str,
+    user: &str,
+    artifact: Option<(&str, &str)>,
+) {
     let identity =
         rcoder_e2e::common::resources::register_created_container(&format!("rcoder-app-{app}"));
+    let registered = identity.is_ok();
     report.assert_hard(
         "prod image and container identity recorded before cleanup",
         identity.is_ok(),
         identity
             .err()
             .unwrap_or_else(|| "resource receipt recorded".into()),
+    );
+    if !registered {
+        return;
+    }
+    let captured = purge_recovery::capture(app);
+    report.assert_hard(
+        "purge captures exact runtime and original four data mounts",
+        captured.is_ok(),
+        captured.as_ref().err().cloned().unwrap_or_default(),
     );
     let capture = rcoder_e2e::common::resources::capture_container(&format!("rcoder-app-{app}"));
     report.assert_hard(
@@ -2229,31 +2248,12 @@ async fn cleanup_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str) 
         s.is_success() && http_ok(&b),
         format!("HTTP {s}, body 截断: {}", trunc(&b, 150)),
     );
-    // 删除后流量应转 502（backend 注销）；宽限重试几秒防注销竞态
-    let mut code = None;
-    for _ in 0..6 {
-        if let Ok(resp) = env
-            .http
-            .get(format!(
-                "{}/api/v1/userapp/proxy/app/prod/{user}/{app}/react/",
-                pingora_base()
-            ))
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await
-        {
-            code = Some(resp.status().as_u16());
-            if code == Some(502) {
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+    if s.is_success()
+        && http_ok(&b)
+        && let Ok(captured) = captured
+    {
+        purge_recovery::verify(env, report, app, user, captured, artifact).await;
     }
-    report.assert_hard(
-        "删除后流量转 502（backend 已注销）",
-        code == Some(502),
-        format!("last status = {code:?}"),
-    );
 }
 
 #[tokio::test]
@@ -2310,7 +2310,7 @@ async fn userapp_deploy_full_chain() {
     {
         // ⑤ 部署 + 七路流量 ⑤b prod 观测族 ⑥ 回收
         if !deploy_and_verify_traffic(&env, &report, &app, user, &release_id, &sha256).await {
-            cleanup_prod(&env, &report, &app, user).await;
+            cleanup_prod(&env, &report, &app, user, None).await;
             cleanup_builder(&app);
             let path = report.path.display().to_string();
             assert!(report.finish(), "cold deployment failed: {path}");
@@ -2340,7 +2340,7 @@ async fn userapp_deploy_full_chain() {
             verify_immediate_runtime_password(&env, &report, &app, user).await;
             verify_password_governance_after_change(&env, &report, &app, user).await;
         }
-        cleanup_prod(&env, &report, &app, user).await;
+        cleanup_prod(&env, &report, &app, user, Some((&release_id, &sha256))).await;
     }
     // No production request was sent when build/artifact preparation failed.
     // Keep the original failure and clean the builder; do not invent a missing
@@ -2697,7 +2697,7 @@ async fn userapp_scope_isolation_during_deploy() {
     //（OpenAPI 已声明 "no internal queue"），不与 UserApp 200 信封混用。
     let conflict_envelope = |s: reqwest::StatusCode, b: &Value| {
         (s.as_u16() == 409 || s.is_success())
-            && b["code"].as_str() == Some("ERR_CONFLICT")
+            && b["code"].as_str() == Some(shared_types::ERR_OPERATION_IN_PROGRESS)
             && b["blocker"]["scope"].as_str() == Some("Dev")
     };
     let b_conflict = conflict_envelope(drb_s, &drb_b);
@@ -2724,17 +2724,17 @@ async fn userapp_scope_isolation_during_deploy() {
     );
 
     // ⑤e 同域并发反例：窗口内第二个 prod start（不同 request_id）→
-    // 信封 ERR_CONFLICT + 结构化 blocker.scope=Prod。修复前：冲突但无 blocker 字段。
+    // 信封 ERR_OPERATION_IN_PROGRESS + blocker.scope=Prod；符合公开的操作槽互斥契约。
     let (cs, cb) = second_task.await.expect("second start task join");
     let same_scope_conflict = cs.is_success()
-        && cb["code"].as_str() == Some("ERR_CONFLICT")
+        && cb["code"].as_str() == Some(shared_types::ERR_OPERATION_IN_PROGRESS)
         && cb["blocker"]["scope"].as_str() == Some("Prod")
         && cb["blocker"]["kind"].as_str() == Some("StartDeployment")
         && cb["blocker"]["operation_id"]
             .as_str()
             .is_some_and(|id| !id.is_empty());
     report.assert_hard(
-        "同域并发 prod start → 信封 ERR_CONFLICT + blocker.scope=Prod",
+        "同域并发 prod start → 信封 ERR_OPERATION_IN_PROGRESS + blocker.scope=Prod",
         same_scope_conflict,
         format!("HTTP {cs}, body 截断: {}", trunc(&cb, 240)),
     );
@@ -2781,7 +2781,7 @@ async fn userapp_scope_isolation_during_deploy() {
     );
 
     // ⑥ 回收（复用 full_chain 清理链）
-    cleanup_prod(&env, &report, &app, user).await;
+    cleanup_prod(&env, &report, &app, user, Some((&release_id, &sha256))).await;
     cleanup_builder(&app);
 
     let path = report.path.display().to_string();

@@ -179,8 +179,13 @@ A/B 制品由本机 HTTP 服务器提供；受控阻塞制造并发窗口，断�
 冷启动通过 env 下发 A 的独立操作与代次；热部署 B 后重启同一容器，必须保留 B 的操作、制品与真实响应，不能被不可变的 A 启动 env 覆盖。成功断言同时要求协议 4、匹配的操作/请求/制品/代次及已持久化的部署成功状态。
 准备失败保持 A；切换后失败保持失败，测试通过显式重新部署 A 完成手动回滚，不要求自动恢复旧版本。
 故障覆盖 404、截断、SHA、坏 ZIP、缺 lock、读取空闲超时及不安全链接。
+故障 fixture 显式把已有下载重试预算设为 8 秒，原产品默认 180 秒和外层 90 秒观察预算保持不变；慢 B 路由先实际返回两次 503，再返回 200，仍需证明原操作完成且准备期间 A 可用。worker 场景的 Source 启动提供真实 workspace/project manifests，使用当前编译器分配的端口，不把历史 release.lock 当成源码输入。
 按用户要求，app-cli 不再设置下载／解压容量及条目限额；B 制品超过测试中保留的旧 APP_DEPLOY_MAX_* 配置，必须成功部署。路径和符号链接安全检查仍保留。
 它不调用或替代 AI，不能作为真实 LLM 测试证据。
+
+完整制品部署和 scope 隔离场景还验证 purge：旧流量不得重建已删除的四个目录或运行容器；随后使用新 URL 显式部署已校验的同一 ZIP，必须出现单个新实例、真实 HTTP 和可写的新数据，再次 purge 后也不能被旧流量复活。临时制品服务只提供该 ZIP 的随机路径，使用完即关闭；macOS/Windows 默认经 `host.docker.internal` 访问，Linux 隔离运行从 `E2E_OWNER_CONTROLLER_ID` 的 Docker 网络取得宿主网关。其他网络布局可显式设置容器能访问的 `E2E_ARTIFACT_HOST`，不需要开放固定公网端口。
+
+Docker crash 场景按原 operation ID 查询历史，不用 `operations/current` 代替终态记录。创建前的未知写继续保持保护；实际启动后的围栏若已由同一物理实例证据收束为 Failed，必须保存停机同引擎 checkpoint、原诊断及 CID，再通过正常 ensure 验证数据、单实例和文件功能，原失败回执不得改写。
 
 运行前必须先构建 builder/runtime，并确认 Compose 的 `RCODER_RUNTIME_IMAGE_DIGEST=dev-app-runtime:latest`。
 生产集群与远程开发集群不属于默认入口；K8s API 契约测试使用本机适配器。

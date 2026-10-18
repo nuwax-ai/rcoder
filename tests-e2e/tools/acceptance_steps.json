@@ -271,7 +271,6 @@
     "userapp-next/project.manifest.toml 落盘",
     "verified artifact retained for reproducible deployment",
     "workspace 根含 workspace.manifest.toml + 7 个子项目目录",
-    "删除后流量转 502（backend 已注销）",
     "流量七路[go /api/go/ready]就绪",
     "流量七路[java readiness]就绪",
     "流量七路[next /]就绪",

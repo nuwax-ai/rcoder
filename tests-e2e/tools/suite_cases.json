@@ -7,6 +7,8 @@
   "compose_session": [
     "absolute_agent_work_dir_anthropic",
     "absolute_agent_work_dir_openai",
+    "auto_reload_session_identity_anthropic",
+    "auto_reload_session_identity_openai",
     "concurrent_subscribers_anthropic",
     "concurrent_subscribers_openai",
     "cross_turn_reconnect_anthropic",

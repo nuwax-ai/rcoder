@@ -14,7 +14,14 @@ class BuildContextOwnership(unittest.TestCase):
 
     def test_production_stage_is_preserved_verbatim(self):
         stage = 'FROM scratch AS artifacts\nCOPY --from=builder /binary /binary\nCMD ["/binary"]\n'
-        self.assertEqual(artifact_stage('FROM debian:12 AS builder\nRUN cargo build --release\n' + stage), stage)
+        for base in ('debian:12', 'rust:bookworm', '${RUST_IMAGE}', '--platform=$BUILDPLATFORM rust:bookworm'):
+            with self.subTest(base=base):
+                self.assertEqual(artifact_stage('FROM ' + base + ' AS builder\nRUN cargo build --release\n' + stage), stage)
+
+    def test_missing_or_different_builder_name_is_rejected(self):
+        for declaration in ('FROM rust:bookworm', 'FROM rust:bookworm AS other', '# FROM rust:bookworm AS builder'):
+            with self.subTest(declaration=declaration), self.assertRaisesRegex(ValueError, 'named builder'):
+                artifact_stage(declaration + '\nFROM scratch AS artifacts\nCOPY --from=builder /binary /binary\n')
 
     def receipt(self, root):
         token = 'a' * 32
