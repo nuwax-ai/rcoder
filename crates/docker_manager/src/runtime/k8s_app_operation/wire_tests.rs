@@ -5,6 +5,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[path = "previous_owner_wire_tests.rs"]
 mod previous_owner_wire_tests;
 
+#[path = "hot_lease_tests.rs"]
+mod hot_lease_tests;
+
 #[path = "observed_expired_tests.rs"]
 mod observed_expired_tests;
 

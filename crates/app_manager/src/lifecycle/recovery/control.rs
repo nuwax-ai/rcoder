@@ -595,15 +595,8 @@ impl AppService {
         {
             return Ok(true);
         }
-        if snapshot.state == UserAppOperationState::RecoveryRequired
-            && snapshot.step == "hot_execution"
-        {
-            return Ok(self.reconcile_hot_failure(snapshot).await?.is_some());
-        }
-        if snapshot.state == UserAppOperationState::RecoveryRequired
-            && snapshot.step == "hot_converging"
-        {
-            return Ok(self.reconcile_hot_convergence(snapshot).await?.is_some());
+        if matches!(snapshot.step.as_str(), "hot_execution" | "hot_converging") {
+            return self.resume_hot_control(snapshot).await;
         }
         if self.reconcile_completed_control(snapshot).await? {
             return Ok(true);

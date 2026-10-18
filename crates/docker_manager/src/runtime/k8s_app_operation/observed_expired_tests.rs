@@ -35,7 +35,7 @@ fn lifecycle_case_observed(empty_lifecycle: bool) -> AppOperationMutexIdentity {
     identity
 }
 
-async fn reject_additional_request(listener: &tokio::net::TcpListener) {
+pub(super) async fn reject_additional_request(listener: &tokio::net::TcpListener) {
     if let Ok(Ok((mut stream, _))) =
         tokio::time::timeout(std::time::Duration::from_millis(40), listener.accept()).await
     {

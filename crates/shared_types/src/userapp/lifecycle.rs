@@ -399,6 +399,32 @@ pub enum UserAppOperationKind {
     DeleteApplication,
 }
 impl UserAppOperationKind {
+    pub fn supports_hot_deployment(self) -> bool {
+        match self {
+            Self::HotDeploy | Self::StartDeployment | Self::RestartDeployment => true,
+            Self::Create
+            | Self::Update
+            | Self::Start
+            | Self::Restart
+            | Self::Stop
+            | Self::SetRecyclePolicy
+            | Self::EnsureBuilder
+            | Self::StopBuilder
+            | Self::RestartBuilder
+            | Self::AdoptBuilder
+            | Self::AdoptApplication
+            | Self::DeleteCompute
+            | Self::PurgeResources
+            | Self::DeleteApplication
+            | Self::DestroyDevStorage
+            | Self::DestroyProdStorage
+            | Self::ClearDevStorage
+            | Self::ClearProdStorage
+            | Self::PrepareProdDatabase
+            | Self::ResetDevDatabasePassword
+            | Self::ResetProdDatabasePassword => false,
+        }
+    }
     pub fn ends_lifecycle(self) -> bool {
         matches!(self, Self::DeleteApplication)
     }
@@ -1409,6 +1435,19 @@ pub trait UserAppLifecycleStore: Send + Sync {
     ) -> Result<UserAppOperationRecord, UserAppStoreError> {
         Err(UserAppStoreError::InvalidOperation(
             "Interrupted deletion recovery is unsupported".into(),
+        ))
+    }
+    /// Revoke a stopped-renewing hot coordinator before read-only recovery.
+    /// The caller must observe the exact retained Lease as expired; the store
+    /// compares the full original snapshot and binding in one transaction.
+    /// This grants no runtime write or proof that an already issued write ended.
+    async fn reserve_interrupted_hot(
+        &self,
+        _snapshot: &UserAppOperationRecord,
+        _binding: &crate::UserAppOperationLeaseBinding,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Interrupted hot deployment recovery is unsupported".into(),
         ))
     }
     /// Record a bounded inspection failure without reopening execution authority.

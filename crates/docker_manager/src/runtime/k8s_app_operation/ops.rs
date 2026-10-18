@@ -187,33 +187,59 @@ impl KubernetesRuntime {
                 "Original operation lease execution metadata missing".into(),
             )
         })?;
-        // Lease creation stores app identity in its operation-app label. The
-        // remaining execution fields are annotations; this normalizes only an
-        // omitted duplicate, retaining any contradictory existing annotation.
-        let mut execution_metadata = annotations.clone();
-        if !execution_metadata.contains_key("rcoder.io/application-id")
-            && let Some(app) = current
-                .metadata
-                .labels
-                .as_ref()
-                .and_then(|labels| labels.get("rcoder.io/operation-app"))
-        {
-            execution_metadata.insert("rcoder.io/application-id".into(), app.clone());
-        }
-        context
-            .validate_operation_metadata(&execution_metadata)
-            .map_err(ContainerRuntimeError::Conflict)?;
-        if annotations
-            .get("rcoder.io/compute-lease")
-            .map(String::as_str)
-            == Some("true")
-            && (token != &context.executor_id
-                || annotations.get("rcoder.io/lease-token") != Some(token))
-        {
-            return Err(ContainerRuntimeError::Conflict(
-                "Original compute lease attempt token changed".into(),
-            ));
-        }
+        let expected_holder = if annotations.get("rcoder.io/legacy-operation-id") == Some(token) {
+            // Ordinary application operations acquire this exact mutex before
+            // SQL admission assigns an executor. Its durable binding associates
+            // the random token with that later operation; missing execution
+            // annotations are expected, not evidence of a different owner.
+            // Existing contradictory fields still identify a different attempt.
+            if annotations
+                .get("rcoder.io/compute-lease")
+                .map(String::as_str)
+                == Some("true")
+                || annotations
+                    .get("rcoder.io/lease-token")
+                    .is_some_and(|value| !value.is_empty())
+                || context.resource_metadata().iter().any(|(key, expected)| {
+                    annotations
+                        .get(key)
+                        .is_some_and(|actual| !actual.is_empty() && actual != expected)
+                })
+            {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Original legacy operation lease execution identity changed".into(),
+                ));
+            }
+            format!("legacy:{token}")
+        } else {
+            // Context-bound operations stamp every execution field. Only the
+            // redundant application annotation can be supplied by its label.
+            let mut execution_metadata = annotations.clone();
+            if !execution_metadata.contains_key("rcoder.io/application-id")
+                && let Some(app) = current
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get("rcoder.io/operation-app"))
+            {
+                execution_metadata.insert("rcoder.io/application-id".into(), app.clone());
+            }
+            context
+                .validate_operation_metadata(&execution_metadata)
+                .map_err(ContainerRuntimeError::Conflict)?;
+            if annotations
+                .get("rcoder.io/compute-lease")
+                .map(String::as_str)
+                == Some("true")
+                && (token != &context.executor_id
+                    || annotations.get("rcoder.io/lease-token") != Some(token))
+            {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Original compute lease attempt token changed".into(),
+                ));
+            }
+            format!("{}:{}", context.executor_id, context.operation_id)
+        };
         let identity_matches = current.metadata.uid.as_deref() == Some(uid.as_str())
             && holder_token(&current).as_deref() == Some(token.as_str())
             && current
@@ -232,7 +258,7 @@ impl KubernetesRuntime {
                 .spec
                 .as_ref()
                 .and_then(|spec| spec.holder_identity.as_deref())
-                == Some(format!("{}:{}", context.executor_id, context.operation_id).as_str())
+                == Some(expected_holder.as_str())
             && current.metadata.deletion_timestamp.is_none();
         if !identity_matches {
             return Err(ContainerRuntimeError::Conflict(

@@ -1011,6 +1011,20 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         })
         .await
     }
+    async fn reserve_interrupted_hot(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        binding: &UserAppOperationLeaseBinding,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let binding = binding.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(
+                async move { ops::reserve_interrupted_hot(tx, backend, &snapshot, &binding).await },
+            )
+        })
+        .await
+    }
     async fn finalize_observed_hot_failure(
         &self,
         snapshot: &UserAppOperationRecord,

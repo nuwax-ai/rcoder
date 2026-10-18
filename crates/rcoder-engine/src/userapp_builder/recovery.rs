@@ -1,6 +1,8 @@
 //! Restart discovery. Automatic replay is limited to unclaimed, matching inputs.
 mod compute;
 mod discovery;
+#[cfg(test)]
+mod hot_tests;
 use crate::app_state::AppState;
 use futures::{FutureExt as _, StreamExt as _, future::BoxFuture, stream::FuturesUnordered};
 use shared_types::{AppWakeControl as _, UserAppOperationKind, UserAppOperationState};
@@ -309,8 +311,16 @@ async fn discover(
                 });
                 continue;
             }
-            if operation.state == UserAppOperationState::RecoveryRequired
-                && operation.step == "hot_execution"
+            let hot_recovery_state = match operation.state {
+                UserAppOperationState::Running | UserAppOperationState::RecoveryRequired => true,
+                UserAppOperationState::Pending
+                | UserAppOperationState::WaitingRetry
+                | UserAppOperationState::Succeeded
+                | UserAppOperationState::Failed => false,
+            };
+            if hot_recovery_state
+                && operation.kind.supports_hot_deployment()
+                && matches!(operation.step.as_str(), "hot_execution" | "hot_converging")
                 && operation
                     .checkpoint
                     .pointer("/hot_execution/receipt_protocol")
@@ -319,7 +329,11 @@ async fn discover(
             {
                 let state = state.clone();
                 tasks.push(operation.operation_id.clone(), async move {
-                    state.app_service.resume_pending_control(&operation).await?;
+                    with_stall_budget(
+                        "observe interrupted hot deployment",
+                        state.app_service.resume_pending_control(&operation),
+                    )
+                    .await??;
                     Ok(())
                 });
                 continue;

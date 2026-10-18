@@ -39,6 +39,25 @@ impl HotDeploymentTask {
             })
     }
 
+    pub(crate) fn recovery_environment(&self) -> std::collections::HashMap<String, String> {
+        let mut env = self.env_snapshot.env.clone();
+        crate::release_flow::identity::strip_release_identity(&mut env);
+        env.insert("APP_DEPLOY_URL".into(), self.url.clone());
+        env.insert("APP_RELEASE_ID".into(), self.release_id.clone());
+        env.insert("APP_DEPLOY_SHA256".into(), self.sha256.clone());
+        env.insert(
+            shared_types::APP_DEPLOY_OPERATION_ID.into(),
+            self.operation_id.clone(),
+        );
+        env
+    }
+
+    pub(crate) fn env_write_precondition(
+        &self,
+    ) -> Option<shared_types::HotDeploymentEnvPrecondition> {
+        shared_types::HotDeploymentEnvPrecondition::from_snapshot(&self.env_snapshot)
+    }
+
     pub(crate) async fn execute_captured(
         &self,
         context: &shared_types::UserAppExecutionContext,
@@ -201,17 +220,9 @@ impl HotDeploymentTask {
         // 收敛 env 三元组进 ConfigMap（不触发 Recreate）：Pod 重建恢复最新版本。
         // 目标先入检查点：begin_hot_convergence 与 ConfigMap 写之间崩溃时，
         // 恢复观察者有可比对的期望值。
-        let mut env = env_snapshot.env.clone();
-        crate::release_flow::identity::strip_release_identity(&mut env);
-        env.insert("APP_DEPLOY_URL".into(), url.clone());
-        env.insert("APP_RELEASE_ID".into(), release_id.clone());
-        env.insert("APP_DEPLOY_SHA256".into(), sha256.clone());
-        env.insert(
-            shared_types::APP_DEPLOY_OPERATION_ID.into(),
-            operation_id.clone(),
-        );
+        let env = self.recovery_environment();
         if let Some(owned) = owned {
-            owned.begin_hot_convergence(&env).await?;
+            owned.begin_hot_convergence(&env, env_snapshot).await?;
             owned.authorize_mutation().await?;
         }
         converge_deploy_env_after_hot(

@@ -712,6 +712,8 @@ impl AppService {
                                 "receipt_protocol": 1,
                                 "target": target,
                                 "release_id": request.release_id,
+                                "converge_env": task.recovery_environment(),
+                                "converge_precondition": task.env_write_precondition(),
                                 "previous_evidence": previous_evidence
                             }
                         }),

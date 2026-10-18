@@ -549,6 +549,7 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
             deployment_uid: deployment.metadata.uid,
             deployment_version: deployment.metadata.resource_version,
             resource_name: Some(name),
+            resource_uid: cm.metadata.uid,
             resource_version: cm.metadata.resource_version,
         })
     }
@@ -579,6 +580,7 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
         // such a write (2026-09-27 personal-K8s userapp r5/r6).
         if current.deployment_uid != snapshot.deployment_uid
             || current.resource_name != snapshot.resource_name
+            || snapshot.resource_uid.is_some() && current.resource_uid != snapshot.resource_uid
             || current.resource_version != snapshot.resource_version
         {
             return Err(ContainerRuntimeError::Conflict(
@@ -627,6 +629,7 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
         // are verified here.
         if committed.deployment_uid != snapshot.deployment_uid
             || committed.resource_name != snapshot.resource_name
+            || snapshot.resource_uid.is_some() && committed.resource_uid != snapshot.resource_uid
             || committed.env != *env
         {
             return Err(ContainerRuntimeError::Conflict(

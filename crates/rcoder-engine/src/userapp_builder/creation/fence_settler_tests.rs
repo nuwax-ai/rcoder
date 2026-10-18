@@ -74,6 +74,17 @@ pub(crate) struct FenceRuntime {
     pub(crate) physical_compute_runtime: Mutex<Option<Arc<dyn UserAppDeploymentRuntime>>>,
     pub(crate) compute_prepares: std::sync::atomic::AtomicUsize,
     pub(crate) compute_releases: std::sync::atomic::AtomicUsize,
+    pub(crate) hot_observation: Mutex<Option<container_runtime_api::AppOperationLeaseObservation>>,
+    pub(crate) hot_observation_replies: Mutex<
+        std::collections::VecDeque<
+            ContainerRuntimeResult<container_runtime_api::AppOperationLeaseObservation>,
+        >,
+    >,
+    pub(crate) hot_target: Mutex<Option<shared_types::RuntimeConfigurationTarget>>,
+    pub(crate) hot_owner: Mutex<Option<serde_json::Value>>,
+    pub(crate) hot_env: Mutex<Option<shared_types::AppEnvSnapshot>>,
+    pub(crate) hot_reads: std::sync::atomic::AtomicUsize,
+    pub(crate) hot_writes: std::sync::atomic::AtomicUsize,
     status: Mutex<Option<Option<DeploymentStatus>>>,
     generation: Mutex<Option<String>>,
     pub(crate) builder_workload: Mutex<Option<String>>,
@@ -97,6 +108,13 @@ impl FenceRuntime {
             physical_compute_runtime: Default::default(),
             compute_prepares: Default::default(),
             compute_releases: Default::default(),
+            hot_observation: Default::default(),
+            hot_observation_replies: Default::default(),
+            hot_target: Default::default(),
+            hot_owner: Default::default(),
+            hot_env: Default::default(),
+            hot_reads: Default::default(),
+            hot_writes: Default::default(),
             status: Mutex::new(Some(status)),
             generation: Mutex::new(generation.map(str::to_string)),
             builder_workload: Mutex::new(None),
@@ -209,6 +227,68 @@ impl WorkspaceRuntime for FenceRuntime {}
 
 #[async_trait::async_trait]
 impl UserAppDeploymentRuntime for FenceRuntime {
+    async fn observe_app_operation_lease(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<container_runtime_api::AppOperationLeaseObservation> {
+        if let Some(reply) = self.hot_observation_replies.lock().unwrap().pop_front() {
+            return reply;
+        }
+        Ok(self
+            .hot_observation
+            .lock()
+            .unwrap()
+            .unwrap_or(container_runtime_api::AppOperationLeaseObservation::Unconfirmed))
+    }
+    async fn exec_app_configuration_target(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        target: &shared_types::RuntimeConfigurationTarget,
+        command: Vec<String>,
+    ) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
+        if self.hot_target.lock().unwrap().as_ref() != Some(target) {
+            return Err(ContainerRuntimeError::Conflict(
+                "Original hot target changed".into(),
+            ));
+        }
+        assert_eq!(command.len(), 3);
+        assert_eq!(&command[..2], &["sh", "-c"]);
+        assert!(command[2].contains("http://127.0.0.1:3010/v1/deploy/status"));
+        assert!(!command[2].contains("--data"));
+        self.hot_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let reply = self.hot_owner.lock().unwrap().clone().ok_or_else(|| {
+            ContainerRuntimeError::ConnectionError("Original owner read unavailable".into())
+        })?;
+        Ok(container_runtime_api::ExecResult {
+            exit_code: 0,
+            stdout: reply.to_string(),
+            stderr: String::new(),
+        })
+    }
+    async fn app_env_snapshot(
+        &self,
+        _app_id: &str,
+    ) -> ContainerRuntimeResult<shared_types::AppEnvSnapshot> {
+        self.hot_env.lock().unwrap().clone().ok_or_else(|| {
+            ContainerRuntimeError::ConnectionError(
+                "Original hot environment read unavailable".into(),
+            )
+        })
+    }
+    async fn update_env_configmap_if_version(
+        &self,
+        _app_id: &str,
+        _env: &HashMap<String, String>,
+        _snapshot: &shared_types::AppEnvSnapshot,
+    ) -> ContainerRuntimeResult<()> {
+        self.hot_writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(ContainerRuntimeError::Conflict(
+            "hot env compare-and-swap rejected".into(),
+        ))
+    }
     async fn discover_application_identity(
         &self,
         _: &str,
@@ -1357,13 +1437,28 @@ pub(crate) async fn runtime_state(
     store: Arc<rcoder_storage::userapp_lifecycle::TursoUserAppStore>,
     fence_settle_grace_secs: Option<u64>,
 ) -> Arc<AppState> {
+    runtime_state_with_mode(
+        runtime,
+        store,
+        fence_settle_grace_secs,
+        app_manager::config::AppAccessMode::Docker,
+    )
+    .await
+}
+
+pub(crate) async fn runtime_state_with_mode(
+    runtime: Arc<dyn container_runtime_api::ContainerRuntime>,
+    store: Arc<rcoder_storage::userapp_lifecycle::TursoUserAppStore>,
+    fence_settle_grace_secs: Option<u64>,
+    access_mode: app_manager::config::AppAccessMode,
+) -> Arc<AppState> {
     let (adapter, _cleanup_rx) =
         crate::storage::ProjectAdapter::new("test-ns".to_string(), "cluster.local".to_string());
     let activity = Arc::new(app_manager::AppActivityRegistry::new(Duration::from_secs(
         300,
     )));
     let manager_config = app_manager::config::AppManagerConfig {
-        access_mode: app_manager::config::AppAccessMode::Docker,
+        access_mode,
         ..app_manager::config::AppManagerConfig::default()
     };
     let app_service: Arc<dyn app_manager::AppServiceTrait> = Arc::new(
