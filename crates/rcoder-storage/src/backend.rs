@@ -28,6 +28,33 @@ pub enum ProjectStoreBackend {
 }
 
 impl ProjectStoreBackend {
+    /// Verify current ownership and references before the original physical deletion.
+    pub async fn check_captured_builder_registration(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+        original: Option<&shared_types::BuilderRegistryIdentity>,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Memory(inner) => inner.check_captured_builder_registration(target, original),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => store.check_captured_builder_registration(target).await,
+        }
+    }
+
+    /// Retire only the registration of the independently captured builder.
+    /// Ordinary project epochs are not physical identities.
+    pub async fn retire_captured_builder_registration(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+        original: Option<&shared_types::BuilderRegistryIdentity>,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Memory(inner) => inner.retire_captured_builder_registration(target, original),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => store.retire_captured_builder_registration(target).await,
+        }
+    }
+
     pub async fn capture_project_stop_registration(
         &self,
         project_id: &str,

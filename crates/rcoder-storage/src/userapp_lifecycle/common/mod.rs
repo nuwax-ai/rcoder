@@ -2,6 +2,10 @@
 //! execute here; the storage owner drains complete admitted transactions.
 mod activity;
 #[cfg(feature = "pg")]
+mod builder_retirement;
+#[cfg(feature = "pg")]
+pub(crate) use builder_retirement::authorize_builder_registration_retirement;
+#[cfg(feature = "pg")]
 mod builder_registration;
 #[cfg(feature = "pg")]
 pub(crate) use builder_registration::{

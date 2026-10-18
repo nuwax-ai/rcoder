@@ -673,17 +673,59 @@ mod discover_settle_tests {
             .ok()
             .filter(|value| !value.is_empty())
         else {
+            assert_ne!(
+                std::env::var("RCODER_PG_TEST_STRICT").as_deref(),
+                Ok("1"),
+                "Strict PG discovery tests require an explicit disposable DSN"
+            );
             eprintln!("[skip] RCODER_PG_TEST_DSN not set");
             return;
         };
+        // discover intentionally scans every unfinished operation. A private
+        // schema isolates this fixture's controlled runtime without filtering
+        // the real scanner or deleting unrelated historical test records.
+        let schema = format!("fence_discovery_{}", uuid::Uuid::new_v4().simple());
+        eprintln!("Real PG discovery fixture schema: {schema}");
+        let mut admin = toasty::Db::builder().connect(&dsn).await.expect("PG admin");
+        toasty::sql::statement(format!("CREATE SCHEMA {schema}"))
+            .exec(&mut admin)
+            .await
+            .expect("create owned discovery schema");
+        let mut scoped = url::Url::parse(&dsn).expect("PG DSN URL");
+        let parameters = scoped
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+        let options = parameters
+            .iter()
+            .filter(|(key, _)| key == "options")
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        {
+            let mut query = scoped.query_pairs_mut();
+            query.clear();
+            query.extend_pairs(
+                parameters
+                    .iter()
+                    .filter(|(key, _)| key != "options")
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            );
+            query.append_pair("options", &format!("{options} -csearch_path={schema}"));
+        }
+        // PostgreSQL URI options require percent-encoded spaces. Restrict this
+        // conversion to the generated query; never alter userinfo/password '+'.
+        let postgres_query = scoped.query().map(|query| query.replace('+', "%20"));
+        scoped.set_query(postgres_query.as_deref());
+        let scoped_dsn: String = scoped.into();
         let operation_id = format!("op-pg-{}", uuid::Uuid::new_v4().simple());
         let runtime = FenceRuntime::scenario(None, None);
         *runtime.builder_workload.lock().expect("lock") = Some("rcoder-app-builder-fenced".into());
-        let state = fence_state_pg(
+        let (state, store) = fence_state_pg(
             runtime,
             UserAppOperationKind::EnsureBuilder,
             &operation_id,
-            &dsn,
+            &scoped_dsn,
         )
         .await;
         let mut tasks = RecoveryTasks::default();
@@ -703,6 +745,15 @@ mod discover_settle_tests {
             record.step,
             record.error_message
         );
+        store
+            .shutdown()
+            .await
+            .expect("stop discovery fixture writer");
+        drop(state);
+        toasty::sql::statement(format!("DROP SCHEMA {schema} CASCADE"))
+            .exec(&mut admin)
+            .await
+            .expect("drop owned discovery schema");
     }
 
     #[tokio::test]

@@ -53,6 +53,7 @@ futures = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]
+url = { workspace = true }
 tempfile = { workspace = true }
 # PG 契约测试复用 preview-coordinator 的存储契约断言全集
 preview-coordinator = { workspace = true }

@@ -42,6 +42,74 @@ pub struct BuilderCollaboratorDeletionReceipt {
     pub registry: Option<BuilderRegistryIdentity>,
 }
 
+/// Read the original destructive capture under its exact execution identity.
+/// This validates an admitted write, never the completeness of unrelated history.
+pub fn captured_builder_deletion_for_execution(
+    operation: &crate::UserAppOperationRecord,
+    context: &crate::UserAppExecutionContext,
+) -> Result<UserappDevDeletionReceipt, String> {
+    context.validate_identity(&context.app_id)?;
+    if operation.app_id != context.app_id
+        || operation.lifecycle_id != context.lifecycle_id
+        || operation.operation_id != context.operation_id
+        || operation.executor_id.as_deref() != Some(context.executor_id.as_str())
+        || operation.request_fingerprint != context.request_fingerprint
+        || operation.state != crate::UserAppOperationState::Running
+        || operation.scope != operation.kind.scope()
+    {
+        return Err("Builder deletion execution identity changed".into());
+    }
+    use crate::UserAppOperationKind as Kind;
+    match operation.kind {
+        Kind::PurgeResources | Kind::DeleteApplication => {
+            let checkpoint: crate::UserAppDeletionCheckpoint =
+                serde_json::from_value(operation.checkpoint.clone())
+                    .map_err(|error| error.to_string())?;
+            checkpoint.validate_operation(operation)?;
+            if checkpoint.context != *context {
+                return Err("Original deletion capture executor changed".into());
+            }
+            checkpoint
+                .development
+                .ok_or_else(|| "Original deletion has no builder capture".into())
+        }
+        Kind::DestroyDevStorage | Kind::DestroyProdStorage => {
+            let checkpoint: crate::UserAppStorageDestruction =
+                serde_json::from_value(operation.checkpoint.clone())
+                    .map_err(|error| error.to_string())?;
+            checkpoint.validate()?;
+            if checkpoint.context != *context
+                || checkpoint.production.is_some() != (operation.kind == Kind::DestroyProdStorage)
+            {
+                return Err("Original storage destruction capture scope changed".into());
+            }
+            Ok(checkpoint.development)
+        }
+        Kind::EnsureBuilder
+        | Kind::AdoptBuilder
+        | Kind::AdoptApplication
+        | Kind::StopBuilder
+        | Kind::RestartBuilder
+        | Kind::Create
+        | Kind::StartDeployment
+        | Kind::RestartDeployment
+        | Kind::Update
+        | Kind::Start
+        | Kind::Restart
+        | Kind::Stop
+        | Kind::SetRecyclePolicy
+        | Kind::HotDeploy
+        | Kind::DeleteCompute
+        | Kind::ClearDevStorage
+        | Kind::ClearProdStorage
+        | Kind::ResetDevDatabasePassword
+        | Kind::ResetProdDatabasePassword
+        | Kind::PrepareProdDatabase => {
+            Err("Current operation does not authorize builder deletion".into())
+        }
+    }
+}
+
 /// Recovery observations never authorize replay of a destructive operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeletionInspection {
@@ -79,6 +147,24 @@ pub trait UserappDevDeletion: Send {
 
 #[async_trait]
 pub trait UserappDevCleanup: Send + Sync {
+    /// Capture under the caller's admitted operation. Older adapters keep their
+    /// existing capture implementation; concrete destructive adapters validate
+    /// the supplied execution before changing resources or retiring registry rows.
+    async fn capture_for_execution(
+        &self,
+        context: &crate::UserAppExecutionContext,
+    ) -> Result<Box<dyn UserappDevDeletion>, String> {
+        self.capture(&context.app_id).await
+    }
+
+    async fn capture_with_lease_for_execution(
+        &self,
+        context: &crate::UserAppExecutionContext,
+        lease: Box<dyn crate::AppOperationLease>,
+    ) -> Result<Box<dyn UserappDevDeletion>, String> {
+        self.capture_with_lease(&context.app_id, lease).await
+    }
+
     /// Called only after durable execution revocation. Inspect original targets;
     /// never capture a new same-named builder or replay storage deletion.
     async fn inspect_captured(

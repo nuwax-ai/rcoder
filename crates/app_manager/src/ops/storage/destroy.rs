@@ -140,6 +140,7 @@ impl crate::service::AppService {
         let development = self
             .capture_dev_deletion_with_lease(
                 app_id,
+                &operation.execution_context(),
                 if production {
                     None
                 } else {
@@ -197,13 +198,16 @@ impl crate::service::AppService {
     pub(crate) async fn capture_dev_deletion(
         &self,
         app_id: &str,
+        context: &shared_types::UserAppExecutionContext,
     ) -> AppResult<Box<dyn shared_types::UserappDevDeletion>> {
-        self.capture_dev_deletion_with_lease(app_id, None).await
+        self.capture_dev_deletion_with_lease(app_id, context, None)
+            .await
     }
 
     async fn capture_dev_deletion_with_lease(
         &self,
         app_id: &str,
+        context: &shared_types::UserAppExecutionContext,
         lease: Option<Box<dyn shared_types::AppOperationLease>>,
     ) -> AppResult<Box<dyn shared_types::UserappDevDeletion>> {
         let cleanup = self
@@ -213,8 +217,12 @@ impl crate::service::AppService {
             .clone()
             .ok_or_else(|| AppOperationError::Backend("userapp dev cleanup not injected".into()))?;
         let deletion = match lease {
-            Some(lease) => cleanup.capture_with_lease(app_id, lease).await,
-            None => cleanup.capture(app_id).await,
+            Some(lease) => {
+                cleanup
+                    .capture_with_lease_for_execution(context, lease)
+                    .await
+            }
+            None => cleanup.capture_for_execution(context).await,
         }
         .map_err(|error| {
             AppOperationError::Backend(format!("capture userapp dev deletion: {error}"))
@@ -353,7 +361,9 @@ impl crate::service::AppService {
         operation.bind_lease(release_lock).await?;
         // 与发布链（prepare/activate/confirm/delete-release）及 create/update/delete
         // 串行：purge 全程删计算+存储，不能与写版本包/切 code 并发。
-        let dev_deletion = self.capture_dev_deletion(app_id).await?;
+        let dev_deletion = self
+            .capture_dev_deletion(app_id, &operation.execution_context())
+            .await?;
         let snapshot = self
             .runtime
             .capture_app_deletion(app_id, None)

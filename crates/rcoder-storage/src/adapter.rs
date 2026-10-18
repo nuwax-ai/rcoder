@@ -19,12 +19,17 @@
 //! - `store_impl`: ProjectStore 契约实现
 
 mod agent_replacement;
+mod builder_retirement;
 mod container_ops;
 mod lookup;
 mod session_ops;
 mod store_impl;
 #[cfg(feature = "pg")]
 pub(crate) use agent_replacement::validate_agent_replacement;
+#[cfg(feature = "pg")]
+pub(crate) use builder_retirement::{
+    BuilderPhysicalRegistration, validate_builder_registration_retirement,
+};
 pub(crate) use session_ops::session_container_matches;
 #[cfg(feature = "pg")]
 pub(crate) use session_ops::stop_frame_matches;

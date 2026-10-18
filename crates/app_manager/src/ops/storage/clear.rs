@@ -61,7 +61,9 @@ impl crate::service::AppService {
                 AppOperationError::Backend(format!("Create direct workspace client: {error}"))
             })?;
         let target = if !production {
-            let mut ticket = self.capture_dev_deletion(app_id).await?;
+            let mut ticket = self
+                .capture_dev_deletion(app_id, &operation.execution_context())
+                .await?;
             let receipt = ticket.receipt();
             let context = operation.execution_context();
             let endpoint = ticket

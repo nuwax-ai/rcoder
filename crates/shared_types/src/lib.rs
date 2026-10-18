@@ -67,6 +67,7 @@ pub use userapp::dbx_readiness::{
 pub use userapp::dev_cleanup::{
     BuilderCollaboratorDeletionReceipt, BuilderDeletionSnapshot, BuilderRegistryIdentity,
     DeletionInspection, UserappDevCleanup, UserappDevDeletion, UserappDevDeletionReceipt,
+    captured_builder_deletion_for_execution,
 };
 pub use userapp::dev_locator::{
     DevBuilderInstance, DevEnsureError, UserappDevEnsure, UserappDevLocator,

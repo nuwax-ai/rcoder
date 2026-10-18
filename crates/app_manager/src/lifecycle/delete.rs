@@ -173,7 +173,10 @@ impl AppService {
             .await
             .map_err(|error| map_runtime_error("capture app deletion", error))?;
         let dev_deletion = if purge {
-            Some(self.capture_dev_deletion(app_id).await?)
+            Some(
+                self.capture_dev_deletion(app_id, &durable.execution_context())
+                    .await?,
+            )
         } else {
             None
         };

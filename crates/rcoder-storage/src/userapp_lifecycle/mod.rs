@@ -5,6 +5,9 @@ mod domain;
 pub mod control;
 
 #[cfg(feature = "pg")]
+pub(crate) use common::authorize_builder_registration_retirement;
+
+#[cfg(feature = "pg")]
 pub use common::ToastyUserAppStore as PgUserAppStore;
 #[cfg(feature = "userapp-turso")]
 mod exclusive_directory;

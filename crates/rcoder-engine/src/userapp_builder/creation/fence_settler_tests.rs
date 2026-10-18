@@ -640,7 +640,10 @@ pub(crate) async fn fence_state_pg(
     kind: UserAppOperationKind,
     operation_id: &str,
     dsn: &str,
-) -> Arc<AppState> {
+) -> (
+    Arc<AppState>,
+    Arc<rcoder_storage::userapp_lifecycle::TursoUserAppStore>,
+) {
     let store = Arc::new(
         rcoder_storage::userapp_lifecycle::TursoUserAppStore::connect(
             &rcoder_storage::config::PostgresConfig {
@@ -651,7 +654,7 @@ pub(crate) async fn fence_state_pg(
         .await
         .expect("PG store"),
     );
-    let (state, _keep) = fence_state_on_store(
+    fence_state_on_store(
         runtime,
         kind,
         operation_id,
@@ -660,9 +663,7 @@ pub(crate) async fn fence_state_pg(
         None,
         TerminalSeed::fence(UserAppOperationState::RecoveryRequired),
     )
-    .await;
-    std::mem::forget(_keep);
-    state
+    .await
 }
 
 async fn fence_state_on_store(
