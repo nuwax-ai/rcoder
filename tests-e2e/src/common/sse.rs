@@ -111,10 +111,7 @@ where
     let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(duration_s.max(1.0));
     let mut events = Vec::new();
     let mut stream = resp.bytes_stream();
-    let mut buf: Vec<u8> = Vec::new();
-    // 当前帧的解析状态（对齐 axum SSE 帧序 event→id→data）
-    let mut cur_event: Option<String> = None;
-    let mut cur_seq: Option<u64> = None;
+    let mut parser = SseParser::default();
     // idle_stop：end_turn 后 1s 即退出。退出期限并入 select 竞争（而非
     // 循环尾检查）——否则服务端不关流时会阻塞在 stream.next() 挂满整窗。
     let mut idle_deadline: Option<tokio::time::Instant> = None;
@@ -143,44 +140,98 @@ where
             },
         };
 
-        buf.extend_from_slice(&chunk);
-        // 按 \n 切行（残留 tail 留在 buf 等下一个 chunk）
-        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-            let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(&line_bytes);
-            let line = line.trim(); // 去 \n 与 \r
-
-            if let Some(name) = line.strip_prefix("event:") {
-                cur_event = Some(name.trim().to_owned());
-            } else if let Some(id) = line.strip_prefix("id:") {
-                cur_seq = id.trim().parse::<u64>().ok();
-            } else if let Some(data) = line.strip_prefix("data:") {
-                let data = data.trim();
-                if let Some(event) = cur_event.clone() {
-                    let parsed = serde_json::from_str::<Value>(data)
-                        .unwrap_or_else(|_| Value::String(data.to_owned()));
-                    let ev = SseEvent {
-                        seq: cur_seq,
-                        event: event.clone(),
-                        data: parsed,
-                        t_ms: started.elapsed().as_millis(),
-                    };
-                    on_event(&ev);
-                    let is_end_turn = event == "end_turn";
-                    events.push(ev);
-                    cur_event = None;
-                    cur_seq = None;
-                    if is_end_turn && idle_stop {
-                        idle_deadline.get_or_insert_with(|| {
-                            tokio::time::Instant::now() + Duration::from_secs(1)
-                        });
-                    }
-                }
+        for ev in parser.push(&chunk, started.elapsed().as_millis()) {
+            on_event(&ev);
+            let is_end_turn = ev.event == "end_turn";
+            events.push(ev);
+            if is_end_turn && idle_stop {
+                idle_deadline
+                    .get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(1));
             }
-            // 注释行（: keep-alive）与空行：忽略
         }
     }
 }
+
+// SSE fields may arrive in any order and span transport chunks. Only an empty
+// line dispatches a frame; EOF discards an unfinished frame. `seq` records this
+// frame's explicit numeric ID, so an ID-less heartbeat never becomes evidence
+// of another conversation event (the reconnect cursor is handled by callers).
+#[derive(Default)]
+struct SseParser {
+    line: Vec<u8>,
+    after_cr: bool,
+    saw_line: bool,
+    frame: SseFrame,
+}
+
+#[derive(Default)]
+struct SseFrame {
+    event: Option<String>,
+    seq: Option<u64>,
+    data: Vec<String>,
+}
+
+impl SseParser {
+    fn push(&mut self, bytes: &[u8], t_ms: u128) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        for &byte in bytes {
+            if std::mem::take(&mut self.after_cr) && byte == b'\n' {
+                continue;
+            }
+            if byte == b'\r' || byte == b'\n' {
+                self.after_cr = byte == b'\r';
+                let line = std::mem::take(&mut self.line);
+                let line = String::from_utf8_lossy(&line);
+                if let Some(event) = self.line(&line, t_ms) {
+                    events.push(event);
+                }
+            } else {
+                self.line.push(byte);
+            }
+        }
+        events
+    }
+
+    fn line(&mut self, line: &str, t_ms: u128) -> Option<SseEvent> {
+        let line = if std::mem::replace(&mut self.saw_line, true) {
+            line
+        } else {
+            line.strip_prefix('\u{feff}').unwrap_or(line)
+        };
+        if line.is_empty() {
+            let frame = std::mem::take(&mut self.frame);
+            if frame.data.is_empty() {
+                return None;
+            }
+            let data = frame.data.join("\n");
+            return Some(SseEvent {
+                seq: frame.seq,
+                event: frame
+                    .event
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| "message".into()),
+                data: serde_json::from_str(&data).unwrap_or(Value::String(data)),
+                t_ms,
+            });
+        }
+        if line.starts_with(':') {
+            return None;
+        }
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match field {
+            "event" => self.frame.event = Some(value.to_owned()),
+            "id" if !value.contains('\0') => self.frame.seq = value.parse().ok(),
+            "data" => self.frame.data.push(value.to_owned()),
+            _ => {}
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+#[path = "sse_parser_tests.rs"]
+mod parser_tests;
 
 // ---------- 事件集分析 helper（移植 Python common.py 同名函数） ----------
 
