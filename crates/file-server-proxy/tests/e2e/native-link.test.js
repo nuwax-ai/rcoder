@@ -24,12 +24,12 @@ function npm(args, env) {
   return out.stdout.trim();
 }
 
-async function cleanupState(stateDir, owned, stop, confirmExited) {
+async function cleanupState(stateDir, owned, stop, confirmExited, { preserveEvidence = false } = {}) {
   if (!owned) throw new Error(`cleanup unknown: no captured owner identity; state preserved at ${stateDir}`);
   try {
     await stop(owned);
     await confirmExited(owned);
-    rmSync(stateDir, { recursive: true });
+    if (!preserveEvidence) rmSync(stateDir, { recursive: true });
   } catch (error) {
     throw new Error(`cleanup unknown: ${error.message}; state preserved at ${stateDir}`, { cause: error });
   }
@@ -75,6 +75,7 @@ async function main() {
   const stateDir = mkdtempSync(join(tmpdir(), "fs-proxy-e2e-"));
   const env = { FILE_SERVER_PROXY_STATE_DIR: stateDir, FILE_SERVER_PROXY_HOST: "127.0.0.1", FILE_SERVER_PROXY_TOKEN: "", FILE_SERVER_PROXY_PUBLIC_BIND: "" };
   let owned = null;
+  let completed = false;
   try {
     // 1) 首次 start: native profile + 动态端口
     const first = JSON.parse(npm(["start", "--port", "0", "--native", "--policy", "all_rust", "--detached"], env));
@@ -132,11 +133,13 @@ async function main() {
     const resumedToken = JSON.parse(readFileSync(credFile, "utf8")).file_api_token;
     await files.verify(resumed.address, resumedToken);
     console.log("E2E_NATIVE_FILES_REOPEN_OK");
+    completed = true;
   } finally {
+    if (!completed) console.error("E2E_NATIVE_STATE_PRESERVED:", stateDir);
     await cleanupState(stateDir, owned, target => {
       const stopped = JSON.parse(npm(["stop", "--port", "0", "--instance-id", target.instance_id, "--supervisor-id", target.supervisor_id], env));
       assert.equal(stopped.phase, "Stopped");
-    }, target => confirmExited(stateDir, target, env));
+    }, target => confirmExited(stateDir, target, env), { preserveEvidence: !completed });
   }
   console.log("E2E_NATIVE_LINK_OK");
 }
