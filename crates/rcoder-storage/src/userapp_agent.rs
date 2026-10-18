@@ -275,6 +275,12 @@ impl ProjectStoreBackend {
         &self,
         session_id: &str,
     ) -> Result<Option<(Binding, Session)>> {
+        if shared_types::SessionHint::classify(Some(session_id))
+            .as_session_id()
+            .is_none()
+        {
+            return Ok(None);
+        }
         match self {
             Self::Memory(inner) => {
                 let state = inner
@@ -337,6 +343,12 @@ impl ProjectStoreBackend {
         deadline: tokio::time::Instant,
         expected_app_project_generation: &str,
     ) -> Result<Binding> {
+        ensure!(
+            shared_types::SessionHint::classify(Some(session_id))
+                .as_session_id()
+                .is_some(),
+            "An established session identity is required"
+        );
         ensure!(
             !session_id.trim().is_empty() && !request_id.trim().is_empty(),
             "UserApp session and registration request identity are required"

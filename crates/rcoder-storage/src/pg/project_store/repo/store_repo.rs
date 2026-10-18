@@ -2,7 +2,7 @@
 //! Callers hold the writer's canonical advisory locks before any row access.
 use crate::{db::models::Project, pg::project_store::persist_ops::ProjectSnapshot};
 use anyhow::{Result, ensure};
-use shared_types::persistence::PersistenceOperationOutcome;
+use shared_types::{SessionHint, persistence::PersistenceOperationOutcome};
 use toasty::Executor;
 use toasty_core::schema::db::Type;
 
@@ -71,6 +71,13 @@ pub(in crate::pg) async fn upsert_project(
     } else if p.expected_revision != 0 {
         return Ok(PersistenceOperationOutcome::Superseded);
     }
+    // A legacy placeholder is evidence, not a selected active session. Preserve
+    // an existing SQL pointer, including a newer real completion; never create
+    // a placeholder membership/pointer when inserting a fresh snapshot.
+    let preserve_latest = p.preserve_latest_session
+        || p.latest_session
+            .as_deref()
+            .is_some_and(|id| SessionHint::classify(Some(id)).as_session_id().is_none());
     let changed = toasty::sql::statement(
         "INSERT INTO projects(project_id,generation,user_id,pod_id,tenant_id,space_id,isolation_type,container_name,container_generation,latest_session,model_provider_json,request_id,agent_status_json,service_type,payload_version,last_activity_at_us,created_at_us,row_revision)
          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL,$10,$11,$12,$13,1,$14,$15,$16)
@@ -90,7 +97,7 @@ pub(in crate::pg) async fn upsert_project(
         .bind_typed(p.agent_status.as_ref().map(serde_json::to_string).transpose()?, Type::Text)
         .bind_typed(p.service_type.as_deref(), Type::Text)
         .bind(p.last_activity.timestamp_micros()).bind(p.created_at.timestamp_micros()).bind(revision).bind(p.expected_revision)
-        .bind(p.preserve_latest_session)
+        .bind(preserve_latest)
         .exec(tx).await?;
     if changed == 0 {
         return Ok(PersistenceOperationOutcome::Superseded);
@@ -98,6 +105,9 @@ pub(in crate::pg) async fn upsert_project(
     // Membership and the selected pointer become visible together. Tombstones
     // prevent a stale whole-project snapshot from resurrecting removed sessions.
     for (id, generation) in &p.sessions {
+        if SessionHint::classify(Some(id)).as_session_id().is_none() {
+            continue;
+        }
         let added = super::add_session(
             tx,
             &p.project_id,
@@ -111,9 +121,7 @@ pub(in crate::pg) async fn upsert_project(
             return Ok(PersistenceOperationOutcome::Superseded);
         }
     }
-    if !p.preserve_latest_session
-        && let Some(id) = &p.latest_session
-    {
+    if !preserve_latest && let Some(id) = &p.latest_session {
         let generation = p
             .sessions
             .get(id)

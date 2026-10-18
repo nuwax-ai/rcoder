@@ -12,6 +12,91 @@ fn owned_project(id: &str, owner: &str) -> ProjectAndContainerInfo {
 }
 
 #[test]
+fn legacy_pending_history_is_retained_but_never_published_as_session_routing() {
+    let adapter = make_adapter();
+    let mut old = owned_project("legacy-state", "legacy-user");
+    old.restore_session("pending");
+    let original = old.persistence_identity().clone();
+    adapter
+        .insert("legacy-state".into(), Arc::new(old))
+        .unwrap();
+    let captured = adapter.get("legacy-state").unwrap();
+    let retained = captured.persistence_identity();
+    assert_eq!(retained.generation, original.generation);
+    assert_eq!(retained.revision, original.revision);
+    assert_eq!(retained.predecessor, original.predecessor);
+    assert_eq!(retained.container, original.container);
+    assert_eq!(retained.sessions, original.sessions);
+    assert_eq!(retained.retired_sessions, original.retired_sessions);
+    assert_eq!(captured.session_id(), Some("pending"));
+    assert!(adapter.get_by_session_id("pending").is_none());
+    assert!(adapter.get_container_name_by_session("pending").is_none());
+    assert!(adapter.restore_session_to_project("legacy-state", "pending"));
+    assert!(adapter.get_by_session_id("pending").is_none());
+    assert!(adapter.session_index.get("pending").is_none());
+    assert!(
+        adapter
+            .append_session_for_container(&captured, "fresh-real-session")
+            .unwrap()
+    );
+    let current = adapter.get("legacy-state").unwrap();
+    assert!(
+        current.sessions().contains("pending"),
+        "retain original history"
+    );
+    assert_eq!(current.latest_session(), Some("fresh-real-session"));
+    assert!(adapter.get_by_session_id("fresh-real-session").is_some());
+}
+
+#[test]
+fn new_pending_registration_does_not_publish_state_or_weaken_foreign_session_guards() {
+    let adapter = make_adapter();
+    let old = owned_project("new-chat", "chat-user");
+    adapter.insert("new-chat".into(), Arc::new(old)).unwrap();
+    let captured = adapter.get("new-chat").unwrap();
+    assert!(
+        adapter
+            .append_session_for_container(&captured, "pending")
+            .is_err()
+    );
+    assert!(!adapter.add_session_to_project("new-chat", "pending"));
+    assert!(adapter.get("new-chat").unwrap().sessions().is_empty());
+    assert!(adapter.get_by_session_id("pending").is_none());
+    assert!(adapter.add_session_to_project("new-chat", "opaque/real-session"));
+    adapter
+        .insert(
+            "other-chat".into(),
+            Arc::new(owned_project("other-chat", "other-user")),
+        )
+        .unwrap();
+    let other = adapter.get("other-chat").unwrap();
+    assert!(
+        adapter
+            .append_session_for_container(&other, "opaque/real-session")
+            .is_err()
+    );
+    assert!(
+        adapter
+            .append_session_for_container(&other, "pending-prefix-is-opaque")
+            .unwrap()
+    );
+    let rejected = owned_project("rejected-pending", "new-owner");
+    assert!(
+        adapter
+            .insert_with_session(
+                "rejected-pending".into(),
+                Arc::new(rejected),
+                Some("pending")
+            )
+            .is_err()
+    );
+    assert!(
+        adapter.get("rejected-pending").is_none(),
+        "reject before publishing project/container state"
+    );
+}
+
+#[test]
 fn memory_completion_preserves_current_metadata_and_rejects_retirement() {
     let adapter = make_adapter();
     let initial = owned_project("chat-project", "shared-user");

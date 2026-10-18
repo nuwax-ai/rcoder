@@ -12,6 +12,51 @@ fn request(project: Option<&str>, sid: Option<&str>) -> ComputerChatRequest {
 }
 
 #[tokio::test]
+async fn legacy_preparation_hint_reuses_this_conversations_real_session_or_stays_unassigned() {
+    let fixture = Fixture::new().await;
+    let original = fixture
+        .bind("legacy-hint-owner", "opaque-real-session")
+        .await;
+    let mut input = request(Some("legacy-hint-owner"), Some("pending"));
+    let (binding, project, fresh) =
+        prepare_conversation(&fixture.state, APP_ID, &original.lifecycle_id, &mut input)
+            .await
+            .unwrap();
+    assert_eq!(project, original.project_id);
+    assert_eq!(binding, original);
+    assert!(!fresh, "a preparation label is not a foreign session");
+    assert_eq!(input.session_id.as_deref(), Some("opaque-real-session"));
+
+    let mut new_input = request(Some("legacy-hint-new"), Some("pending"));
+    let (new_binding, _, fresh) = prepare_conversation(
+        &fixture.state,
+        APP_ID,
+        &original.lifecycle_id,
+        &mut new_input,
+    )
+    .await
+    .unwrap();
+    assert!(new_binding.current_session_id.is_none());
+    assert!(new_input.session_id.is_none());
+    assert!(!fresh, "there is no previous ACP session to replace");
+    assert!(
+        fixture.agent.calls.lock().unwrap().is_empty(),
+        "preparation never submits a prompt"
+    );
+    assert_eq!(
+        fixture
+            .state
+            .projects
+            .get_userapp_agent_session("opaque-real-session")
+            .await
+            .unwrap()
+            .unwrap()
+            .0,
+        original
+    );
+}
+
+#[tokio::test]
 async fn foreign_and_legacy_session_hints_create_this_project_without_mutating_foreign_binding() {
     let fixture = Fixture::new().await;
     let original = fixture.bind("cid-a", "sid-a").await;

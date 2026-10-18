@@ -126,6 +126,14 @@ pub(in crate::pg) async fn add_session(
     generation: &str,
     predecessor: Option<&str>,
 ) -> Result<PersistenceOperationOutcome> {
+    // Old queued snapshots can contain preparation placeholders. Resolve them
+    // without mutation or an error that would permanently retry the writer.
+    if shared_types::SessionHint::classify(Some(session_id))
+        .as_session_id()
+        .is_none()
+    {
+        return Ok(PersistenceOperationOutcome::Superseded);
+    }
     anyhow::ensure!(
         predecessor != Some(generation),
         "Session cannot replace its own generation"

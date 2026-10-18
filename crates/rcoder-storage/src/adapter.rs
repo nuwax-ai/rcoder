@@ -35,7 +35,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use dashmap::DashSet;
 use dashmap::mapref::entry::Entry;
-use shared_types::ProjectAndContainerInfo;
+use shared_types::{ProjectAndContainerInfo, SessionHint};
 use tracing::{debug, info};
 
 use lockmap::LockMap;
@@ -280,8 +280,12 @@ impl ProjectAdapter {
             }
         }
         for sid in info.sessions() {
-            self.session_index
-                .insert(sid, (key.clone(), project_id.clone()));
+            // Historical membership is retained verbatim, but preparation state
+            // never becomes a routable identity during hydration or sync.
+            if SessionHint::classify(Some(&sid)).as_session_id().is_some() {
+                self.session_index
+                    .insert(sid, (key.clone(), project_id.clone()));
+            }
         }
 
         // 维护反向索引：container_id → 容器键

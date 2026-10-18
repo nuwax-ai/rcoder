@@ -341,12 +341,21 @@ mod identity_tests {
     #[tokio::test]
     async fn stale_idle_scan_preserves_a_replacement_with_the_same_sid() {
         let project = format!("idle-scan-{}", uuid::Uuid::new_v4());
-        AGENT_REGISTRY.set_pending(&project);
-        let mut first = AGENT_REGISTRY
-            .view_agent_info(&project, Clone::clone)
-            .unwrap();
-        first.status = AgentStatus::Idle;
-        first.session_id = SessionId::from("idle-scan-session");
+        let (prompt_tx, _prompt_receiver) = tokio::sync::mpsc::channel(1);
+        let (cancel_tx, _cancel_receiver) = tokio::sync::mpsc::channel(1);
+        let mut first = shared_types::ProjectAndAgentInfo {
+            project_id: project.clone(),
+            session_id: SessionId::from("idle-scan-session"),
+            prompt_tx,
+            cancel_tx,
+            model_provider: None,
+            request_id: None,
+            status: AgentStatus::Idle,
+            last_activity: Utc::now(),
+            created_at: Utc::now(),
+            stop_handle: None,
+            agent_binary_snapshot: None,
+        };
         let (old_cancel, _old_receiver) = tokio::sync::mpsc::channel(1);
         first.cancel_tx = old_cancel;
         AGENT_REGISTRY.register(&project, "idle-scan-session", first.clone());

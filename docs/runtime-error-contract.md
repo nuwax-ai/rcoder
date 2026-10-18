@@ -130,6 +130,8 @@ HTTP 状态并不代替业务结果：原有 `HttpResult` 入口和正式 UserAp
 
 任务已经受理但会话登记未确认时，响应保留原 `data.session_id`：登记结果未知返回 `ERR_SERVICE_UNAVAILABLE`，执行身份已被替换返回 `ERR_CONFLICT`；沿既有 `HttpResult` 契约使用 HTTP 200 + `success=false`，保留会话数据。派发前的标准 `AppError` 则分别使用 503/409。`error_detail.stage` 为 `chat.session_registration`，`task_id` 为原会话标识，`retryable=false` 指原消息不能自动重发。调用方应保留会话标识，仅重连 `GET /computer/progress/{session_id}`；本地待提交缓存不构成持久化确认。已有 Agent Runner 业务失败继续保留原失败码和数据。
 
+准备中的请求尚无 ACP 会话标识，准备状态与真实会话登记分开保存。旧版本遗留的 `pending` 仅按缺失恢复提示处理，不参与会话恢复、反查或新登记；历史原文保留，不要求用户清库。若旧 Runner 成功响应却返回占位值或空标识，主控返回英文 `ERR_AGENT_ERROR`，使用 `chat.session_identity` 阶段、`data=null`，不生成虚假 `task_id`，也不自动重发消息。错误响应中的占位标识同样不发布，原业务错误码和原因保留。此时应查看项目状态和日志，不能使用占位值重连进度。真实会话仍保留跨项目归属保护。
+
 普通 Computer 会话的进度查询在存储读取失败时返回可重试的 503，只有确认找不到会话时才返回 404。进度入口仍优先解析 UserApp 会话，按该领域原有错误契约传播失败；不能将查询异常伪装成会话不存在。连接建立后，仍通过既有 SSE 事件报告后续错误。
 
 `error_detail.retryable` 表示在当前证据下，使用原身份和相同输入重试是否安全。不能仅因 HTTP 502–504、出现“timeout/starting”或中文提示就重试。

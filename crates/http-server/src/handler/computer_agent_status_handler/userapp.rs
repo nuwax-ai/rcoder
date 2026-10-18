@@ -62,10 +62,13 @@ pub(super) async fn status_userapp_dev(
         user_id: request.user_id.clone(),
         project_id: external_project_id,
         is_alive: true,
-        session_id: request
-            .session_id
-            .clone()
-            .or(target.binding.current_session_id),
+        session_id: shared_types::SessionHint::classify(request.session_id.as_deref())
+            .as_session_id()
+            .or_else(|| {
+                shared_types::SessionHint::classify(target.binding.current_session_id.as_deref())
+                    .as_session_id()
+            })
+            .map(str::to_owned),
         status: Some(grpc_response.status),
         last_activity: Some(target.binding.updated_at),
         created_at: Some(target.binding.created_at),

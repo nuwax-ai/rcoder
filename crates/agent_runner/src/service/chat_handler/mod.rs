@@ -33,6 +33,11 @@ pub async fn handle_chat_core(
     mut input: ChatHandlerInput,
     context: &ChatHandlerContext,
 ) -> ChatHandlerOutput {
+    // Legacy preparation records carried no real ACP session. Normalize this
+    // input once, before probing, recovery, or SessionCache creation.
+    input.session_id = shared_types::SessionHint::classify(input.session_id.as_deref())
+        .as_session_id()
+        .map(str::to_owned);
     if let Some(sid) = input.session_id.as_deref()
         && let Some(owner) = crate::service::AGENT_REGISTRY.get_project_by_session(sid)
         && owner != input.project_id

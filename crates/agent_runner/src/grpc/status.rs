@@ -52,6 +52,10 @@ pub async fn get_status(
                     AgentStatus::Terminating => "busy",
                 };
                 (status_str, true)
+            } else if req.session_id.is_empty() && AGENT_REGISTRY.is_pending(pid) {
+                // Project preparation is busy even before ACP assigns a real
+                // session. Never publish a session identity or stream epoch for it.
+                ("busy", true)
             } else {
                 // project_id 存在但 agent_info 不存在
                 info!(

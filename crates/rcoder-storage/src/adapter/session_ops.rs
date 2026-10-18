@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use dashmap::mapref::entry::Entry;
-use shared_types::ProjectAndContainerInfo;
+use shared_types::{ProjectAndContainerInfo, SessionHint};
 
 use super::{ProjectAdapter, container_entry_key};
 use tracing::debug;
@@ -96,7 +96,12 @@ impl ProjectAdapter {
         expected: &ProjectAndContainerInfo,
         session_id: &str,
     ) -> anyhow::Result<bool> {
-        anyhow::ensure!(!session_id.is_empty(), "Session identity is empty");
+        anyhow::ensure!(
+            SessionHint::classify(Some(session_id))
+                .as_session_id()
+                .is_some(),
+            "An established session identity is required"
+        );
         let project_id = expected.project_id();
         let _project_guard = self.project_locks.entry_by_ref(project_id);
         let Some(current) = self.get(project_id) else {
@@ -144,6 +149,7 @@ impl ProjectAdapter {
     /// 读时清理孤儿条目：如果 session_index 指向的 project 不存在，自动清理。
     /// 同时验证 session 是否仍在 project 的 sessions 集合中，防止已清除的 session 被误访问。
     pub fn get_by_session_id(&self, session_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
+        SessionHint::classify(Some(session_id)).as_session_id()?;
         let pid = self.session_index.view(session_id, |_, v| v.1.clone())?;
 
         match self.projects.view(&pid, |_, v| v.clone()) {
@@ -186,6 +192,12 @@ impl ProjectAdapter {
     ///
     /// 返回 false 表示 project 不存在（调用方需要走 insert_with_session 完整路径）。
     pub fn add_session_to_project(&self, project_id: &str, session_id: &str) -> bool {
+        if SessionHint::classify(Some(session_id))
+            .as_session_id()
+            .is_none()
+        {
+            return false;
+        }
         // entry API: 先检查 project 是否存在，存在时原子地把 sid 加入 sessions 集合
         let mut existed = false;
         let mut ck_opt: Option<String> = None;
@@ -229,6 +241,12 @@ impl ProjectAdapter {
         session_id: &str,
         session_generation: &str,
     ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            SessionHint::classify(Some(session_id))
+                .as_session_id()
+                .is_some(),
+            "An established session identity is required"
+        );
         let key = match self.projects.entry(app_id.to_owned()) {
             Entry::Occupied(mut entry) => {
                 let current = entry.get();
@@ -280,8 +298,13 @@ impl ProjectAdapter {
                 .view(project_id, |_, v| v.clone())
                 .unwrap_or_default()
         });
-        self.session_index
-            .insert(session_id.to_string(), (ck, project_id.to_string()));
+        if SessionHint::classify(Some(session_id))
+            .as_session_id()
+            .is_some()
+        {
+            self.session_index
+                .insert(session_id.to_string(), (ck, project_id.to_string()));
+        }
         true
     }
 
@@ -298,6 +321,10 @@ impl ProjectAdapter {
         info: Arc<ProjectAndContainerInfo>,
         session_id: Option<&str>,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            session_id.is_none_or(|sid| SessionHint::classify(Some(sid)).as_session_id().is_some()),
+            "An established session identity is required"
+        );
         // 执行 insert（维护容器引用计数）
         self.insert(project_id.clone(), info)?;
 
@@ -411,6 +438,7 @@ impl ProjectAdapter {
 
     /// 通过 session_id 获取容器名称（view: 两次锁获取均立即释放）
     pub fn get_container_name_by_session(&self, session_id: &str) -> Option<String> {
+        SessionHint::classify(Some(session_id)).as_session_id()?;
         let ck = self.session_index.view(session_id, |_, v| v.0.clone())?;
         self.containers
             .view(&ck, |_, ce| ce.info().container_name.clone())

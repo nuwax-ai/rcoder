@@ -121,6 +121,239 @@ async fn service(root: &Path, create_budget: u64) -> AgentServiceImpl {
 }
 
 #[tokio::test]
+async fn preparation_project_status_is_busy_without_a_session_and_sid_queries_stay_exact() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(root.path(), 10).await;
+    let project = format!("protocol-preparation-status-{}", uuid::Uuid::new_v4());
+    let foreign = format!("protocol-real-status-{}", uuid::Uuid::new_v4());
+    let service_ref = &service;
+    let query = move |project: String, sid: String| async move {
+        service_ref
+            .get_status(Request::new(GetStatusRequest {
+                project_id: project,
+                session_id: sid,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+    };
+    let guard = agent_runner::service::PendingGuard::new(&AGENT_REGISTRY, &project);
+    let initial = query(project.clone(), String::new()).await;
+    let has_real_info = AGENT_REGISTRY.get_agent_info(&project).is_some();
+    let published_sid = AGENT_REGISTRY.get_session_by_project(&project);
+    let legacy = query(project.clone(), "pending".into()).await;
+    let missing = query(project.clone(), "missing-real-id".into()).await;
+
+    let real = service
+        .chat(Request::new(chat(root.path(), &foreign, "", true, "hold")))
+        .await
+        .unwrap()
+        .into_inner();
+    if real.success {
+        wait_row(root.path(), "prompt", &foreign, 1).await;
+    }
+    let wrong_owner = query(project.clone(), real.session_id.clone()).await;
+    let real_active = query(foreign.clone(), real.session_id.clone()).await;
+    AGENT_REGISTRY.try_update_agent_info(&foreign, |info| {
+        info.status = shared_types::AgentStatus::Idle;
+        true
+    });
+    let real_idle = query(foreign.clone(), String::new()).await;
+    AGENT_REGISTRY.try_update_agent_info(&foreign, |info| {
+        info.status = shared_types::AgentStatus::Active;
+        true
+    });
+    if real.success {
+        stop(&service, &foreign, &real.session_id).await;
+    }
+    drop(guard);
+    let released = query(project.clone(), String::new()).await;
+    AGENT_REGISTRY.set_pending(&project);
+    let manual = query(project.clone(), String::new()).await;
+    AGENT_REGISTRY.clear_pending_if_exists(&project);
+    let cleared = query(project, String::new()).await;
+
+    assert!(initial.is_found);
+    assert_eq!(initial.status, "busy");
+    assert_eq!(initial.stream_epoch, None);
+    assert!(!has_real_info);
+    assert_eq!(published_sid, None);
+    for absent in [legacy, missing, wrong_owner, released, cleared] {
+        assert!(
+            !absent.is_found,
+            "session and released-project queries must remain exact: {absent:?}"
+        );
+        assert_eq!(absent.status, "not_found");
+        assert_eq!(absent.stream_epoch, None);
+    }
+    assert!(manual.is_found);
+    assert_eq!(manual.status, "busy");
+    assert_eq!(manual.stream_epoch, None);
+    assert!(real.success, "real session failed: {real:?}");
+    assert!(real_active.is_found);
+    assert_eq!(real_active.status, "busy");
+    assert!(real_idle.is_found);
+    assert_eq!(real_idle.status, "idle");
+}
+
+#[tokio::test]
+async fn auto_reload_without_registered_session_creates_new_sessions_for_each_project() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(root.path(), 10).await;
+    let mut responses = Vec::new();
+    for project in ["protocol-auto-reload-new-a", "protocol-auto-reload-new-b"] {
+        let mut request = chat(root.path(), project, "", false, "hold");
+        request.agent_config.as_mut().unwrap().auto_reload =
+            Some(shared_types::grpc::AutoReloadConfig { enabled: true });
+        let response = service
+            .chat(Request::new(request))
+            .await
+            .unwrap()
+            .into_inner();
+        if response.success {
+            wait_row(root.path(), "prompt", project, 1).await;
+            stop(&service, project, &response.session_id).await;
+        }
+        responses.push((project, response));
+    }
+    let protocol = rows(root.path());
+    for (project, response) in &responses {
+        assert!(response.success, "new project chat failed: {response:?}");
+        let created: Vec<_> = protocol
+            .iter()
+            .filter(|row| row["event"] == "new" && row["project"] == *project)
+            .collect();
+        assert_eq!(
+            created.len(),
+            1,
+            "a preparation reservation is not a historical ACP session: {protocol:?}"
+        );
+        assert_eq!(created[0]["session"], response.session_id);
+        assert!(
+            !protocol
+                .iter()
+                .any(|row| row["event"] == "load" && row["project"] == *project)
+        );
+        assert_eq!(
+            protocol
+                .iter()
+                .filter(|row| row["event"] == "prompt" && row["project"] == *project)
+                .count(),
+            1
+        );
+    }
+    assert_ne!(responses[0].1.session_id, responses[1].1.session_id);
+}
+
+#[tokio::test]
+async fn auto_reload_resumes_a_real_pending_session_and_force_new_still_creates() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(root.path(), 10).await;
+    let project = "protocol-auto-reload-real-pending";
+    let first = service
+        .chat(Request::new(chat(root.path(), project, "", true, "hold")))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(first.success, "first: {first:?}");
+    wait_row(root.path(), "prompt", project, 1).await;
+    let original = AGENT_REGISTRY
+        .view_agent_info(project, |info| info.stop_handle.clone().unwrap())
+        .unwrap();
+    AGENT_REGISTRY.try_update_agent_info(project, |info| {
+        info.status = shared_types::AgentStatus::Pending;
+        true
+    });
+    let mut resume = chat(root.path(), project, "", false, "hold");
+    resume.agent_config.as_mut().unwrap().auto_reload =
+        Some(shared_types::grpc::AutoReloadConfig { enabled: true });
+    let resumed = service
+        .chat(Request::new(resume))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resumed.success, "resume: {resumed:?}");
+    wait_row(root.path(), "prompt", project, 2).await;
+    let mut fresh = chat(root.path(), project, &resumed.session_id, true, "hold");
+    fresh.agent_config.as_mut().unwrap().auto_reload =
+        Some(shared_types::grpc::AutoReloadConfig { enabled: true });
+    let replaced = service
+        .chat(Request::new(fresh))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(replaced.success, "fresh: {replaced:?}");
+    wait_row(root.path(), "prompt", project, 3).await;
+    stop(&service, project, &replaced.session_id).await;
+    assert_eq!(
+        resumed.session_id, first.session_id,
+        "a real session remains resumable while Pending"
+    );
+    assert!(
+        original.is_stopped(),
+        "reload confirms the original execution exited"
+    );
+    assert_ne!(replaced.session_id, resumed.session_id);
+    let protocol = rows(root.path());
+    assert_eq!(
+        protocol.iter().filter(|row| row["event"] == "new").count(),
+        2
+    );
+    assert_eq!(
+        protocol.iter().filter(|row| row["event"] == "load").count(),
+        1
+    );
+    assert_eq!(
+        protocol
+            .iter()
+            .filter(|row| row["event"] == "prompt")
+            .count(),
+        3,
+        "accepted prompts are never replayed"
+    );
+    assert!(!AGENT_REGISTRY.is_pending(project));
+}
+
+#[tokio::test]
+async fn legacy_pending_input_is_unspecified_and_never_sent_to_session_load() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(root.path(), 10).await;
+    let project = "protocol-legacy-pending-input";
+    let response = service
+        .chat(Request::new(chat(
+            root.path(),
+            project,
+            "pending",
+            false,
+            "hold",
+        )))
+        .await
+        .unwrap()
+        .into_inner();
+    if response.success {
+        wait_row(root.path(), "prompt", project, 1).await;
+        stop(&service, project, &response.session_id).await;
+    }
+    assert!(response.success, "legacy input: {response:?}");
+    let protocol = rows(root.path());
+    let created: Vec<_> = protocol
+        .iter()
+        .filter(|row| row["event"] == "new")
+        .collect();
+    assert_eq!(created.len(), 1);
+    assert_eq!(created[0]["session"], response.session_id);
+    assert!(!protocol.iter().any(|row| row["event"] == "load"));
+    assert_eq!(
+        protocol
+            .iter()
+            .filter(|row| row["event"] == "prompt")
+            .count(),
+        1
+    );
+    assert!(!AGENT_REGISTRY.is_pending(project));
+}
+
+#[tokio::test]
 async fn separate_projects_shared_cwd_foreign_hint_fresh_and_confirmed_stop() {
     let root = tempfile::tempdir().unwrap();
     let service = service(root.path(), 10).await;
@@ -283,6 +516,10 @@ async fn separate_projects_shared_cwd_foreign_hint_fresh_and_confirmed_stop() {
             .unwrap_or_default()
             .contains("controlled create failure")
     );
+    assert!(
+        !AGENT_REGISTRY.is_pending(a),
+        "failed preparation releases only its reservation"
+    );
     let expected_cwd = root.path().canonicalize().unwrap();
     assert!(
         rows(root.path())
@@ -417,6 +654,10 @@ async fn new_session_timeout_reports_failure_only_after_child_is_reaped() {
         AGENT_REGISTRY
             .view_agent_info(project, Clone::clone)
             .is_none()
+    );
+    assert!(
+        !AGENT_REGISTRY.is_pending(project),
+        "failed startup cannot retain a preparation lease"
     );
     assert_eq!(log.iter().filter(|row| row["event"] == "spawn").count(), 1);
     std::fs::remove_file(root.path().join(format!("{project}.new-timeout"))).unwrap();

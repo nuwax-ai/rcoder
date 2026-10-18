@@ -27,6 +27,9 @@ mod stop_generation;
 #[path = "agent_registration_tests/container_intent.rs"]
 mod container_intent;
 
+#[path = "agent_registration_tests/legacy_pending.rs"]
+mod legacy_pending;
+
 fn basic(owner: &str) -> ContainerBasicInfo {
     ContainerBasicInfo {
         container_id: format!("old-pod-{owner}"),

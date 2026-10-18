@@ -16,6 +16,8 @@ mod model;
 mod runtime_config;
 mod userapp;
 pub use model::{ApiBody, OperationInProgressData, OperationOutcomeUnknown};
+mod session_hint;
+pub use session_hint::SessionHint;
 
 // 容器域类型（高内聚收拢于 container/ 模块）—— 条目/查找/清理/统计 + 服务与隔离枚举
 pub use container::{

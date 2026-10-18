@@ -149,18 +149,39 @@ fn router(state: Arc<crate::app_state::AppState>) -> Router {
             "/computer/progress/{session_id}",
             get(crate::handler::agent_session_notification::computer_agent_progress_notification),
         )
+        .route("/status", post(crate::handler::computer_agent_status))
+        .route(
+            "/agent/status/{project_id}",
+            get(crate::handler::agent_status_handler::agent_status),
+        )
         .with_state(state)
 }
 async fn chat(router: Router) -> (StatusCode, serde_json::Value) {
     chat_for_project(router, PROJECT).await
 }
 async fn chat_for_project(router: Router, project: &str) -> (StatusCode, serde_json::Value) {
-    let response = router.oneshot(Request::post("/computer/chat")
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::json!({
+    chat_with_payload(
+        router,
+        serde_json::json!({
             "user_id": USER, "project_id": project, "prompt": "protocol-only acceptance",
             "agent_work_dir": "/tmp/protocol-only", "request_id": "first-request",
-        }).to_string())).unwrap()).await.unwrap();
+        }),
+    )
+    .await
+}
+async fn chat_with_payload(
+    router: Router,
+    payload: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let response = router
+        .oneshot(
+            Request::post("/computer/chat")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     let status = response.status();
     let body =
         serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
@@ -175,6 +196,136 @@ fn chats(fixture: &Fixture) -> usize {
         .iter()
         .filter(|call| matches!(call, AgentCall::Chat(_)))
         .count()
+}
+
+#[tokio::test]
+async fn http_legacy_runner_placeholder_is_not_registered_or_replayed_and_next_request_recovers() {
+    let fixture = Fixture::new().await;
+    let (state, runtime) = state(&fixture);
+    // Simulate an older Runner that already accepted one prompt and returned
+    // its legacy reservation label instead of an ACP session identity.
+    fixture
+        .agent
+        .sessions
+        .lock()
+        .unwrap()
+        .insert(PROJECT.into(), "pending".into());
+    let app = router(state.clone());
+    let (status, result) = chat(app.clone()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "existing HTTP error-envelope contract"
+    );
+    assert_eq!(result["success"], false, "{result}");
+    assert_eq!(result["code"], shared_types::ERR_AGENT_ERROR);
+    assert!(
+        result["data"].is_null(),
+        "a placeholder is not a reconnectable task: {result}"
+    );
+    assert!(result["error_detail"]["task_id"].is_null());
+    assert_eq!(result["error_detail"]["stage"], "chat.session_identity");
+    assert_eq!(result["error_detail"]["retryable"], false);
+    assert!(result["message"].as_str().unwrap().contains("accepted"));
+    assert!(
+        result["error_detail"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("do not resend")
+    );
+    assert!(state.get_by_session("pending").is_none());
+    assert!(
+        !state
+            .get_project(PROJECT)
+            .unwrap()
+            .sessions()
+            .contains("pending")
+    );
+    assert_eq!(
+        chats(&fixture),
+        1,
+        "an accepted prompt must never be replayed automatically"
+    );
+    assert_eq!(runtime.writes.load(Ordering::SeqCst), 0);
+
+    fixture.agent.sessions.lock().unwrap().remove(PROJECT);
+    let (status, next) = chat_with_payload(
+        app.clone(),
+        serde_json::json!({
+            "user_id": USER, "project_id": PROJECT, "prompt": "an explicit later request",
+            "agent_work_dir": "/tmp/protocol-only", "request_id": "later-request",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(next["success"], true, "{next}");
+    let sid = next["data"]["session_id"].as_str().unwrap();
+    assert!(!sid.is_empty());
+    assert_ne!(sid, "pending");
+    assert_eq!(chats(&fixture), 2, "one dispatch per explicit request");
+    assert!(state.get_by_session(sid).is_some());
+    let response = app
+        .oneshot(
+            Request::get(format!("/computer/progress/{sid}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream")
+    );
+    drop(response);
+}
+
+#[tokio::test]
+async fn status_does_not_publish_a_legacy_session_or_treat_it_as_a_live_query_identity() {
+    let fixture = Fixture::new().await;
+    let (state, runtime) = state(&fixture);
+    let mut legacy = super::project();
+    legacy.restore_session("pending");
+    state
+        .insert_project(PROJECT.into(), Arc::new(legacy))
+        .unwrap();
+    fixture
+        .agent
+        .sessions
+        .lock()
+        .unwrap()
+        .insert(PROJECT.into(), "real-runner-session".into());
+    let app = router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/agent/status/{PROJECT}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(body["success"], true);
+    assert!(body["data"]["session_id"].is_null(), "{body}");
+    let response = app.oneshot(Request::post("/status").header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"user_id": USER, "project_id": PROJECT, "session_id": "pending"}).to_string())).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(body["data"]["is_alive"], true, "{body}");
+    assert!(body["data"]["session_id"].is_null(), "{body}");
+    assert!(fixture.agent.calls.lock().unwrap().iter().any(|call| matches!(call, AgentCall::Status(request) if request.project_id == PROJECT && request.session_id.is_empty())));
+    assert_eq!(
+        state.get_project(PROJECT).unwrap().session_id(),
+        Some("pending"),
+        "preserve original history"
+    );
+    assert_eq!(runtime.writes.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

@@ -14,6 +14,7 @@ use tracing::info;
 
 use shared_types::{
     AgentStatus, ContainerBasicInfo, ModelProviderConfig, ProjectAndContainerInfo, ServiceType,
+    SessionHint,
 };
 
 use super::repo::{self, ContainerRow, ProjectRow, SessionRow};
@@ -439,6 +440,12 @@ impl crate::pg::PgStore {
         &self,
         session_id: &str,
     ) -> anyhow::Result<Option<Arc<ProjectAndContainerInfo>>> {
+        if SessionHint::classify(Some(session_id))
+            .as_session_id()
+            .is_none()
+        {
+            return Ok(None);
+        }
         if let Some(hit) = self.inner.get_by_session_id(session_id) {
             return Ok(Some(hit));
         }

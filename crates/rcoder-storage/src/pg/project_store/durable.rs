@@ -4,7 +4,7 @@ use super::persist_ops::{ContainerSessionAppend, PersistOp, structural_ops_for_i
 use super::writer::execute_registered;
 use crate::adapter::container_entry_key;
 use crate::pg::PgStore;
-use shared_types::{ProjectAndContainerInfo, persistence::PersistenceWriteOutcome};
+use shared_types::{ProjectAndContainerInfo, SessionHint, persistence::PersistenceWriteOutcome};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -334,6 +334,12 @@ impl PgStore {
         info: Arc<ProjectAndContainerInfo>,
         session_id: &str,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            SessionHint::classify(Some(session_id))
+                .as_session_id()
+                .is_some(),
+            "An established session identity is required"
+        );
         let ops = {
             let registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
             anyhow::ensure!(

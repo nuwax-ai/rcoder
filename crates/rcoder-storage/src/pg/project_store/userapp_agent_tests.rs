@@ -61,6 +61,72 @@ async fn fixture() -> Option<(
 }
 
 #[tokio::test]
+async fn userapp_pending_direct_pg_registration_is_rejected_without_poisoning_next_session() {
+    let Some((_dsn, app, life, store, owner)) = fixture().await else {
+        return;
+    };
+    let backend = ProjectStoreBackend::Postgres(store.clone());
+    let binding = backend
+        .accept_userapp_agent_binding(&app, &life, &format!("chat-{app}"), "test-user")
+        .await
+        .unwrap();
+    let generation = store
+        .get(&app)
+        .unwrap()
+        .persistence_identity()
+        .generation
+        .clone();
+    assert!(
+        store
+            .register_userapp_agent_session_for_route(
+                &binding,
+                "pending",
+                &format!("invalid-{app}"),
+                deadline(),
+                &generation,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        backend
+            .get_userapp_agent_binding(&app, &life, &binding.project_id)
+            .await
+            .unwrap(),
+        Some(binding.clone())
+    );
+    assert!(
+        store
+            .get_userapp_agent_session("pending")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.get(&app).unwrap().sessions().is_empty());
+    let sid = format!("pending-prefix-{app}");
+    let current = store
+        .register_userapp_agent_session_for_route(
+            &binding,
+            &sid,
+            &format!("valid-{app}"),
+            deadline(),
+            &generation,
+        )
+        .await
+        .unwrap();
+    assert_eq!(current.current_session_id, Some(sid.clone()));
+    assert!(
+        store
+            .get_userapp_agent_session(&sid)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(store.writer().flush_and_stop(Duration::from_secs(5)).await);
+    owner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn userapp_bindings_parallel_registration_and_cross_replica_read_keep_one_app_project() {
     let Some((dsn, app, life, store, _owner)) = fixture().await else {
         return;

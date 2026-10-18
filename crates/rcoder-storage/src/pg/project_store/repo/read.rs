@@ -61,6 +61,12 @@ pub(in crate::pg) async fn fetch_project_by_session(
     tx: &mut dyn Executor,
     session_id: &str,
 ) -> Result<Option<(ProjectRow, Option<ContainerRow>)>> {
+    if shared_types::SessionHint::classify(Some(session_id))
+        .as_session_id()
+        .is_none()
+    {
+        return Ok(None);
+    }
     let Some(session) = Session::filter_by_session_id(session_id)
         .first()
         .exec(tx)

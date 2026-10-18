@@ -6,7 +6,8 @@
 use std::sync::Arc;
 
 use shared_types::{
-    ContainerBasicInfo, ProjectAndContainerInfo, ProjectStore, ServiceType, StorageStats,
+    ContainerBasicInfo, ProjectAndContainerInfo, ProjectStore, ServiceType, SessionHint,
+    StorageStats,
 };
 
 use super::persist_ops::PersistOp;
@@ -94,6 +95,10 @@ impl ProjectStore for PgStore {
         info: Arc<ProjectAndContainerInfo>,
         session_id: Option<&str>,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            session_id.is_none_or(|sid| SessionHint::classify(Some(sid)).as_session_id().is_some()),
+            "An established session identity is required"
+        );
         let registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
         anyhow::ensure!(
             !self.closing.load(std::sync::atomic::Ordering::Acquire),

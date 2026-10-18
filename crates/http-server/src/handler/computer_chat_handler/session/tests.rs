@@ -29,6 +29,114 @@ fn accepted(sid: &str) -> HttpResult<ChatResponse> {
         .unwrap(),
     )
 }
+
+#[test]
+fn legacy_pending_history_is_not_forwarded_as_a_resume_identity() {
+    let request: ComputerChatRequest = serde_json::from_value(serde_json::json!({
+        "user_id": "completion-user", "project_id": "completion-project", "prompt": "a new request",
+    }))
+    .unwrap();
+    let mut captured = project();
+    captured.restore_session("pending");
+    let original = captured.persistence_identity().clone();
+    let forwarded = resolve_forward_request(&request, &captured);
+    assert!(forwarded.session_id.is_none());
+    assert_eq!(
+        captured.session_id(),
+        Some("pending"),
+        "retain historical source data"
+    );
+    let current = captured.persistence_identity();
+    assert_eq!(current.generation, original.generation);
+    assert_eq!(current.revision, original.revision);
+    assert_eq!(current.predecessor, original.predecessor);
+    assert_eq!(current.container, original.container);
+    assert_eq!(current.sessions, original.sessions);
+    assert_eq!(current.retired_sessions, original.retired_sessions);
+}
+
+#[test]
+fn legacy_client_hint_reuses_a_real_project_session_without_a_fake_id() {
+    let request: ComputerChatRequest = serde_json::from_value(serde_json::json!({
+        "user_id": "completion-user", "project_id": "completion-project", "prompt": "a later request", "session_id": "pending",
+    })).unwrap();
+    let mut captured = project();
+    captured.add_session("real-project-session");
+    assert_eq!(
+        resolve_forward_request(&request, &captured)
+            .session_id
+            .as_deref(),
+        Some("real-project-session")
+    );
+    let no_session = project();
+    assert!(
+        resolve_forward_request(&request, &no_session)
+            .session_id
+            .is_none()
+    );
+}
+#[test]
+fn explicit_real_session_hint_remains_opaque_and_takes_precedence() {
+    let mut captured = project();
+    captured.add_session("selected-project-session");
+    for sid in ["opaque/session:7", "pending-session", "Pending", " pending"] {
+        let request: ComputerChatRequest = serde_json::from_value(serde_json::json!({
+            "user_id": "completion-user", "project_id": "completion-project",
+            "prompt": "an explicit request", "session_id": sid,
+        }))
+        .unwrap();
+        assert_eq!(
+            resolve_forward_request(&request, &captured)
+                .session_id
+                .as_deref(),
+            Some(sid)
+        );
+    }
+}
+
+#[test]
+fn accepted_missing_identity_has_no_fake_task_or_automatic_retry() {
+    let mut result = accepted("");
+    reject_unusable_session_response(&mut result, project().project_id());
+    assert!(!result.is_success());
+    assert_eq!(result.code, shared_types::ERR_AGENT_ERROR);
+    assert!(result.data.is_none());
+    assert!(result.message.starts_with("The task was accepted"));
+    let detail = result.error_detail.unwrap();
+    assert_eq!(detail.stage, "chat.session_identity");
+    assert!(detail.task_id.is_none());
+    assert!(!detail.retryable);
+    assert!(detail.hint.contains("do not resend"));
+}
+
+#[test]
+fn invalid_identity_supplements_a_real_runner_failure_without_replacing_its_cause() {
+    let mut result = accepted("pending");
+    result.code = shared_types::ERR_SERVICE_UNAVAILABLE.into();
+    result.success = false;
+    result.message = "Controlled model service failure".into();
+    result.data.as_mut().unwrap().error = Some("original runner failure".into());
+    result.error_detail = Some(
+        shared_types::ErrorDetail::new(
+            shared_types::ERR_SERVICE_UNAVAILABLE,
+            "original.runner.stage",
+            "original cause",
+        )
+        .with_task_id("pending")
+        .with_retryable(true),
+    );
+    reject_unusable_session_response(&mut result, project().project_id());
+    assert_eq!(result.code, shared_types::ERR_SERVICE_UNAVAILABLE);
+    assert_eq!(result.message, "Controlled model service failure");
+    assert!(result.data.is_none());
+    let detail = result.error_detail.unwrap();
+    assert_eq!(detail.stage, "original.runner.stage");
+    assert_eq!(detail.detail, "original cause");
+    assert!(detail.task_id.is_none());
+    assert!(!detail.retryable);
+    assert!(detail.hint.contains("do not resend"));
+}
+
 async fn wire(result: HttpResult<ChatResponse>, status: axum::http::StatusCode, sid: &str) {
     // HttpResult retains the established HTTP-200 error envelope contract.
     // The expected failure classification remains asserted independently.

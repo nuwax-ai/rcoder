@@ -191,16 +191,10 @@ pub(super) fn resolve_forward_request(
     captured: &ProjectAndContainerInfo,
 ) -> ComputerChatRequest {
     let mut forwarded = request.clone();
-    if forwarded
-        .session_id
-        .as_ref()
-        .is_none_or(|sid| sid.is_empty())
-    {
-        forwarded.session_id = captured
-            .session_id()
-            .map(str::to_owned)
-            .filter(|sid| !sid.is_empty());
-    }
+    forwarded.session_id = shared_types::SessionHint::classify(request.session_id.as_deref())
+        .as_session_id()
+        .or_else(|| shared_types::SessionHint::classify(captured.session_id()).as_session_id())
+        .map(str::to_owned);
     forwarded
 }
 
@@ -226,12 +220,7 @@ pub(super) async fn update_session_mappings_after_response(
     captured: &ProjectAndContainerInfo,
     locale: &'static str,
 ) {
-    let Some(sid) = result
-        .data
-        .as_ref()
-        .map(|response| response.session_id.clone())
-        .filter(|sid| !sid.is_empty())
-    else {
+    let Some(sid) = response_session_id(result, captured.project_id()) else {
         return;
     };
     let outcome = state
@@ -246,6 +235,70 @@ pub(super) async fn update_session_mappings_after_response(
         locale,
     )
     .await;
+}
+
+/// Shared Computer/UserApp boundary: only an established ACP ID may be routed.
+pub(super) fn response_session_id(
+    result: &mut HttpResult<ChatResponse>,
+    project_id: &str,
+) -> Option<String> {
+    let response = result.data.as_ref()?;
+    match shared_types::SessionHint::classify(Some(&response.session_id)) {
+        shared_types::SessionHint::Established(sid) => Some(sid.to_owned()),
+        shared_types::SessionHint::LegacyPending => {
+            reject_unusable_session_response(result, project_id);
+            None
+        }
+        shared_types::SessionHint::Absent => {
+            // Ordinary failures before acceptance may legitimately have no
+            // session. A successful RPC must return an actual ACP identity.
+            if result.is_success() {
+                reject_unusable_session_response(result, project_id);
+            }
+            None
+        }
+    }
+}
+
+/// An older Runner may have already submitted the prompt before returning its
+/// preparation label. Never register it or replay that accepted prompt. Drop
+/// the invalid identity from the existing optional error data, not the history.
+fn reject_unusable_session_response(result: &mut HttpResult<ChatResponse>, project_id: &str) {
+    let accepted = result.is_success();
+    let Some(response) = result.data.take() else {
+        return;
+    };
+    let diagnostic = if accepted {
+        "The task was accepted, but the Agent did not return a valid session ID. The execution outcome is unknown."
+            .to_owned()
+    } else {
+        format!(
+            "The Agent returned no usable session ID. Original error: {}",
+            response.error.as_deref().unwrap_or(&result.message)
+        )
+    };
+    error!(project_id,
+        session_id = %response.session_id, request_id = ?response.request_id,
+        accepted, original_code = %result.code,
+        detail = %shared_types::sanitize_error_text(&diagnostic),
+        "[COMPUTER_CHAT] Invalid Runner session identity; prompt must not be replayed");
+    if accepted {
+        result.code = shared_types::ERR_AGENT_ERROR.to_owned();
+        result.success = false;
+        result.message = diagnostic.clone();
+    }
+    let detail = result.error_detail.get_or_insert_with(|| {
+        shared_types::ErrorDetail::new(&result.code, "chat.session_identity", diagnostic)
+    });
+    if shared_types::SessionHint::classify(detail.task_id.as_deref())
+        .as_session_id()
+        .is_none()
+    {
+        detail.task_id = None;
+    }
+    detail.retryable = false;
+    detail.hint = "Inspect project status and logs; do not resend this prompt automatically. A preparation state is not a session ID."
+        .to_owned();
 }
 
 async fn complete_session_registration(
