@@ -17,16 +17,19 @@ TAG_NAME = '${{ github.event.inputs.tag || github.ref_name }}'
 
 
 class ProxyReleaseIdentityTests(unittest.TestCase):
+    workflow = WORKFLOW
+    package = "file-server-proxy"
+
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix='proxy release identity ')
+        temporary = tempfile.TemporaryDirectory(prefix='native release identity ')
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.manifest = self.root / 'crates/file-server-proxy/Cargo.toml'
+        self.manifest = self.root / 'crates' / self.package / 'Cargo.toml'
         self.manifest.parent.mkdir(parents=True)
-        self.manifest.write_text('[package]\nname="file-server-proxy"\nversion = "1.2.3"\n', encoding='utf-8')
+        self.manifest.write_text(f'[package]\nname="{self.package}"\nversion = "1.2.3"\n', encoding='utf-8')
         self.git('init', '-q')
         self.commit('initial release source')
-        self.git('tag', 'file-server-proxy-v1.2.3')
+        self.git('tag', self.package + '-v1.2.3')
 
     def git(self, *args):
         return subprocess.run(
@@ -39,8 +42,9 @@ class ProxyReleaseIdentityTests(unittest.TestCase):
         self.git('-c', 'user.name=Release fixture', '-c', 'user.email=release@example.invalid',
                  'commit', '-qm', message)
 
-    def meta(self, tag='file-server-proxy-v1.2.3', ref=None):
-        step = next(item for item in WORKFLOW['jobs']['meta']['steps'] if item.get('id') == 'v')
+    def meta(self, tag=None, ref=None):
+        tag = tag or self.package + '-v1.2.3'
+        step = next(item for item in self.workflow['jobs']['meta']['steps'] if item.get('id') == 'v')
         output = self.root / 'github-output'
         env = dict(os.environ, REQUESTED_TAG=tag,
                    GITHUB_REF=ref or 'refs/tags/' + tag,
@@ -64,16 +68,16 @@ class ProxyReleaseIdentityTests(unittest.TestCase):
         self.assertEqual(values, {'version': '1.2.3', 'prerelease': 'false'})
 
     def test_matching_prerelease_tag_selects_beta_channel(self):
-        self.manifest.write_text('[package]\nname="file-server-proxy"\nversion = "1.2.3-rc.1"\n', encoding='utf-8')
+        self.manifest.write_text(f'[package]\nname="{self.package}"\nversion = "1.2.3-rc.1"\n', encoding='utf-8')
         self.commit('prerelease source')
-        self.git('tag', 'file-server-proxy-v1.2.3-rc.1')
-        result, values = self.meta(tag='file-server-proxy-v1.2.3-rc.1')
+        self.git('tag', self.package + '-v1.2.3-rc.1')
+        result, values = self.meta(tag=self.package + '-v1.2.3-rc.1')
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertEqual(values, {'version': '1.2.3-rc.1', 'prerelease': 'true'})
 
     def test_version_disagreement_is_rejected_before_publishing_outputs(self):
-        self.git('tag', 'file-server-proxy-v1.2.4')
-        result, values = self.meta(tag='file-server-proxy-v1.2.4')
+        self.git('tag', self.package + '-v1.2.4')
+        result, values = self.meta(tag=self.package + '-v1.2.4')
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('version', values)
 
@@ -87,6 +91,21 @@ class ProxyReleaseIdentityTests(unittest.TestCase):
     def test_wrong_tag_prefix_is_rejected_before_publishing_outputs(self):
         self.git('tag', 'unrelated-v1.2.3')
         result, values = self.meta(tag='unrelated-v1.2.3')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('version', values)
+
+
+class AppReleaseIdentityTests(ProxyReleaseIdentityTests):
+    workflow = yaml.safe_load((ROOT / '.github/workflows/release-app-cli.yml').read_text(encoding='utf-8'))
+    package = "app-cli"
+
+    def test_regex_characters_in_tag_cannot_match_a_different_cargo_version(self):
+        self.manifest.write_text('[package]\nname="app-cli"\nversion = "1.2.3-rc.1"\n', encoding='utf-8')
+        self.commit('prerelease manifest')
+        # This Git-valid tag contains a dot where the actual version has a dash.
+        tag = 'app-cli-v1.2.3.rc.1'
+        self.git('tag', tag)
+        result, values = self.meta(tag=tag)
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('version', values)
 

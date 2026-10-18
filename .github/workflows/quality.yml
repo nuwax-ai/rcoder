@@ -26,6 +26,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Workflow syntax check
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.11 -color
+
+      - name: Native release fixture contracts
+        run: python3 -m unittest tools/tests/test_official_pair_fixture.py
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -62,6 +68,22 @@ jobs:
             features: --all-features
     env:
       FEATURE_ARGS: ${{ matrix.features }}
+      # PG contracts create private schemas; never point CI at a shared database.
+      RCODER_PG_TEST_DSN: postgres://rcoder_test:rcoder_test@127.0.0.1:5432/rcoder_test
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: rcoder_test
+          POSTGRES_PASSWORD: rcoder_test
+          POSTGRES_DB: rcoder_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rcoder_test -d rcoder_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v4
 

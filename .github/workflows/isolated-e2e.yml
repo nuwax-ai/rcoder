@@ -27,7 +27,6 @@ jobs:
     env:
       CONTROLLER_BASE: ${{ inputs.controller_base }}
       BUILDER_BASE: ${{ inputs.builder_base }}
-      E2E_RUN_ROOT: ${{ runner.temp }}/rcoder-isolated-e2e
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -47,7 +46,7 @@ jobs:
           python3 tests-e2e/tools/isolated_ci.py \
             --controller-base "$CONTROLLER_BASE" \
             --builder-base "$BUILDER_BASE" \
-            --report-root "$E2E_RUN_ROOT"
+            --report-root "$RUNNER_TEMP/rcoder-isolated-e2e"
       - name: Preserve evidence including failed prerequisites and cleanup
         if: always()
         uses: actions/upload-artifact@v4

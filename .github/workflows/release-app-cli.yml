@@ -66,7 +66,7 @@ jobs:
             echo "✗ checkout does not match release tag $TAG"; exit 1; }
           VERSION="${TAG#app-cli-v}"
           # 版本一致性守卫：tag 必须与 crates/app-cli/Cargo.toml 的 version 一致
-          grep -q "^version = \"${VERSION}\"" crates/app-cli/Cargo.toml || {
+          grep -Fxq "version = \"${VERSION}\"" crates/app-cli/Cargo.toml || {
             echo "✗ tag(${TAG}) 与 crates/app-cli/Cargo.toml version 不一致："
             grep '^version' crates/app-cli/Cargo.toml
             exit 1
@@ -449,6 +449,7 @@ jobs:
           name: official-pair-windows-evidence
           path: |
             official-pair-gate/receipt.json
+            official-pair-gate/failure-diagnostics.json
             official-pair-gate/*.log
             official-pair-gate/logs/
 
@@ -513,6 +514,7 @@ jobs:
           name: official-pair-${{ matrix.target }}-evidence
           path: |
             official-pair-gate/receipt.json
+            official-pair-gate/failure-diagnostics.json
             official-pair-gate/*.log
             official-pair-gate/logs/
 
