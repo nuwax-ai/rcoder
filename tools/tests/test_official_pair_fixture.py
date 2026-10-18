@@ -63,7 +63,12 @@ class OfficialPairFixtureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             script = root / 'server.py'
-            script.write_text(pair.BUSINESS_SOURCE, encoding='utf-8')
+            # A missing/hung reverse-DNS service must not prevent the real
+            # loopback business listener from starting on a native CI host.
+            script.write_text('import socket\n'
+                'def forbidden_reverse_dns(*args, **kwargs):\n'
+                ' raise RuntimeError("reverse DNS is unavailable in this fixture")\n'
+                'socket.getfqdn=forbidden_reverse_dns\n' + pair.BUSINESS_SOURCE, encoding='utf-8')
             with socket.socket() as listener:
                 listener.bind(('127.0.0.1', 0))
                 port = listener.getsockname()[1]

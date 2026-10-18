@@ -207,7 +207,7 @@ jobs:
           targets='{}'
           for f in *.tar.gz *.zip; do
             [ -e "$f" ] || continue
-            rest=${f#${VERPREFIX}}
+            rest=${f#"$VERPREFIX"}
             triple=${rest%.tar.gz}
             triple=${triple%.zip}
             case "$triple" in

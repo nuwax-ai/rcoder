@@ -28,12 +28,14 @@ phase('python-entered')
 print('PAIR_FIXTURE_PYTHON', sys.executable, sys.version, flush=True)
 faulthandler.dump_traceback_later(8, repeat=True)
 phase('http-import')
-import http.server
+import http.server, socketserver
 class Handler(http.server.BaseHTTPRequestHandler):
  def do_GET(self):
   body=b'official-pair-business';self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
 phase('http-bind')
-server=http.server.HTTPServer(('127.0.0.1',int(os.environ['PORT'])),Handler)
+# This fixture only serves fixed responses on loopback; it has no hostname
+# contract. TCPServer binds without HTTPServer's reverse-DNS startup lookup.
+server=socketserver.TCPServer(('127.0.0.1',int(os.environ['PORT'])),Handler)
 faulthandler.cancel_dump_traceback_later()
 phase('http-listening')
 server.serve_forever()
