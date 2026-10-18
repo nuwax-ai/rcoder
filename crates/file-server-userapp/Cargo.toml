@@ -66,7 +66,8 @@ futures-util = { workspace = true }
 bytes = { workspace = true }
 
 # Zip 打包 (workspace 打包链)
-zip = { workspace = true }
+# Preserve opaque producer extra fields during ZIP raw-copy; extraction safety is unchanged.
+zip = { workspace = true, features = ["unreserved"] }
 uuid = { workspace = true }
 
 # 异步流构造 (build 进度 SSE)

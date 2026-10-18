@@ -438,3 +438,115 @@ fn assemble_overlap_alternating_raw_copy_and_duplicates_preserve_payloads() {
         std::fs::metadata(expected).unwrap().len()
     );
 }
+
+fn infozip_extra_payloads(bytes: &[u8]) -> std::collections::HashMap<u16, Vec<u8>> {
+    let mut result = std::collections::HashMap::new();
+    let mut position = 0;
+    while position < bytes.len() {
+        assert!(position + 4 <= bytes.len(), "complete extra-field header");
+        let id = u16::from_le_bytes([bytes[position], bytes[position + 1]]);
+        let size = u16::from_le_bytes([bytes[position + 2], bytes[position + 3]]) as usize;
+        position += 4;
+        assert!(
+            position + size <= bytes.len(),
+            "complete extra-field payload"
+        );
+        assert!(
+            result
+                .insert(id, bytes[position..position + size].to_vec())
+                .is_none()
+        );
+        position += size;
+    }
+    result
+}
+
+#[test]
+fn assemble_infozip_raw_copy_preserves_metadata_compressed_bytes_and_duplicates() {
+    use super::package_writer::PackageWriter;
+
+    let root = tempfile::tempdir().expect("Info-ZIP regression directory");
+    let source = root.path().join("producer.zip");
+    std::fs::write(
+        &source,
+        include_bytes!("assemble/fixtures/infozip-unix-metadata.zip"),
+    )
+    .expect("retained actual Linux Info-ZIP fixture");
+    let packed = root.path().join("packed.zip");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&packed)
+        .expect("new package output");
+    let mut writer = PackageWriter::new(file);
+    let mut archive = ::zip::ZipArchive::new(std::fs::File::open(&source).unwrap()).unwrap();
+    for name in ["start-one.sh", "start-two.sh"] {
+        let source_snapshot = snapshot(&source, name);
+        assert_eq!(
+            source_snapshot.compression,
+            ::zip::CompressionMethod::Deflated
+        );
+        let raw_attributes = archive.by_name(name).unwrap().external_attributes();
+        assert_eq!((raw_attributes >> 16) & 0o7777, 0o6755);
+        assert_eq!(
+            source_snapshot.unix_mode.map(|mode| mode & 0o7777),
+            Some(0o755)
+        );
+        let destination = format!("infozip/{name}");
+        writer
+            .copy_artifact_entry(
+                archive.by_name(name).unwrap(),
+                &destination,
+                "Linux Info-ZIP".into(),
+            )
+            .expect("ordinary producer UID/GID extra fields must permit raw-copy");
+        writer
+            .add_bytes(
+                &destination,
+                &source_snapshot.bytes,
+                "same-content duplicate",
+            )
+            .expect("duplicate payload remains accepted");
+    }
+    writer.finish().expect("finish real Info-ZIP package");
+    let mut packed_archive = ::zip::ZipArchive::new(std::fs::File::open(&packed).unwrap()).unwrap();
+    assert_eq!(packed_archive.len(), 2, "duplicates do not add ZIP entries");
+    for name in ["start-one.sh", "start-two.sh"] {
+        let destination = format!("infozip/{name}");
+        assert_eq!(snapshot(&packed, &destination), snapshot(&source, name));
+        let original = archive.by_name(name).unwrap();
+        let copied = packed_archive.by_name(&destination).unwrap();
+        assert_eq!(copied.last_modified(), original.last_modified());
+        let original_extra =
+            infozip_extra_payloads(&original.extra_data().expect("producer extra fields"));
+        let copied_extra =
+            infozip_extra_payloads(&copied.extra_data().expect("copied extra fields"));
+        assert!(
+            original.extra_data_fields().any(|field| {
+                matches!(field, ::zip::extra_fields::ExtraField::ExtendedTimestamp(timestamp)
+                if timestamp.mod_time() == Some(1_704_164_646))
+            }),
+            "real producer extended timestamp is parsed"
+        );
+        // Zip's typed UT serializer intentionally emits no custom field. The
+        // DOS modification timestamp above remains part of the raw-copy contract.
+        assert_eq!(copied_extra.get(&0x7875), original_extra.get(&0x7875));
+        assert!(
+            copied_extra.contains_key(&0x7875),
+            "real producer UID/GID retained as metadata"
+        );
+    }
+
+    // An explicit test-only export lets the independent app-cli crate exercise
+    // these actual PackageWriter bytes without adding a product dependency.
+    if let Some(destination) = std::env::var_os("RCODER_INFOZIP_TEST_OUTPUT") {
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .expect("new explicitly selected regression artifact");
+        std::io::copy(&mut std::fs::File::open(&packed).unwrap(), &mut output)
+            .expect("export actual assembled artifact");
+    }
+}

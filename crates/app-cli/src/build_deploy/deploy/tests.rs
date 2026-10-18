@@ -869,3 +869,107 @@ fn deploy_reads_retained_zip8_artifact_with_links_permissions_and_unicode_names(
         "legacy-zip8-content\n"
     );
 }
+
+/// Actual Linux Info-ZIP output passed through PackageWriter's raw-copy path.
+/// Producer ownership is opaque ZIP metadata, never an extraction instruction.
+#[cfg(unix)]
+#[test]
+fn deploy_extracts_assembled_infozip_without_applying_owner_or_special_bits() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    fn producer_owner(extra: &[u8]) -> (u64, u64) {
+        let mut position = 0;
+        while position + 4 <= extra.len() {
+            let id = u16::from_le_bytes([extra[position], extra[position + 1]]);
+            let length = u16::from_le_bytes([extra[position + 2], extra[position + 3]]) as usize;
+            position += 4;
+            assert!(
+                position + length <= extra.len(),
+                "complete producer metadata"
+            );
+            if id == 0x7875 {
+                let payload = &extra[position..position + length];
+                assert_eq!(payload[0], 1, "Info-ZIP Unix UID/GID version");
+                let uid_bytes = payload[1] as usize;
+                assert!((1..=8).contains(&uid_bytes));
+                let gid_bytes = payload[2 + uid_bytes] as usize;
+                assert!((1..=8).contains(&gid_bytes));
+                assert_eq!(payload.len(), 3 + uid_bytes + gid_bytes);
+                let id = |bytes: &[u8]| {
+                    bytes.iter().enumerate().fold(0u64, |value, (index, byte)| {
+                        value | (u64::from(*byte) << (8 * index))
+                    })
+                };
+                return (
+                    id(&payload[2..2 + uid_bytes]),
+                    id(&payload[3 + uid_bytes..]),
+                );
+            }
+            position += length;
+        }
+        panic!("retained producer UID/GID field missing");
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let package = root.path().join("assembled.zip");
+    std::fs::write(&package, include_bytes!("fixtures/infozip-packed.zip")).unwrap();
+    let output = root.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+    let creator = std::fs::metadata(&output).unwrap();
+    let creator_owner = (u64::from(creator.uid()), u64::from(creator.gid()));
+    let mut source = zip::ZipArchive::new(std::fs::File::open(&package).unwrap()).unwrap();
+    let mut expected = Vec::new();
+    let mut distinct_owner = false;
+    for (name, expected_owner) in [
+        ("infozip/start-one.sh", (12345, 12346)),
+        ("infozip/start-two.sh", (54321, 54322)),
+    ] {
+        let mut entry = source.by_name(name).unwrap();
+        assert_eq!((entry.external_attributes() >> 16) & 0o6000, 0o6000);
+        assert_eq!(entry.unix_mode().unwrap() & 0o6000, 0);
+        let owner = producer_owner(&entry.extra_data().unwrap());
+        assert_eq!(owner, expected_owner);
+        distinct_owner |= owner != creator_owner;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes).unwrap();
+        expected.push((name, bytes));
+    }
+    assert!(
+        distinct_owner,
+        "at least one producer differs from the actual current user"
+    );
+    extract_zip_sync(&package, &output).unwrap();
+    for (name, payload) in expected {
+        let path = output.join(name);
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
+        let metadata = std::fs::metadata(path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o755);
+        assert_eq!(metadata.permissions().mode() & 0o6000, 0);
+        assert_eq!(
+            (u64::from(metadata.uid()), u64::from(metadata.gid())),
+            creator_owner
+        );
+    }
+}
+
+#[test]
+fn deploy_extract_rejects_corrupt_crc_in_assembled_infozip() {
+    let root = tempfile::tempdir().unwrap();
+    let mut bytes = include_bytes!("fixtures/infozip-packed.zip").to_vec();
+    let central = bytes
+        .windows(4)
+        .position(|value| value == b"PK\x01\x02")
+        .expect("retained artifact central directory");
+    // Preserve valid compression and the opaque producer metadata, but require
+    // the ordinary extraction reader to detect a wrong recorded payload CRC.
+    bytes[central + 16] ^= 1;
+    let archive = root.path().join("corrupt-crc.zip");
+    std::fs::write(&archive, bytes).unwrap();
+    let error = extract_zip_sync(&archive, &root.path().join("output"))
+        .expect_err("opaque producer fields must not bypass payload CRC validation");
+    let diagnostic = format!("{error:#}").to_ascii_lowercase();
+    assert!(
+        diagnostic.contains("checksum") || diagnostic.contains("crc"),
+        "{diagnostic}"
+    );
+}
