@@ -1,4 +1,5 @@
 import copy
+import json
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -50,6 +51,92 @@ class StrictCiReportTests(unittest.TestCase):
 
 
 class FinalizationTests(unittest.TestCase):
+    def finish_without_captured_controller(self, rows, *, before=None, discovery_error=None,
+                                           baseline_confirmed=True, inspected_rows=None):
+        source = {"origin_head": "test", "worktree_sha256": "frozen"}
+        record = {"project": "owned-test", "run_id": "run", "case_id": "case",
+                  "controller_creation_started": True, "baseline_confirmed": baseline_confirmed,
+                  "error": "compose-up failed after Docker accepted Create"}
+        before = {} if before is None else before
+        calls, saved = [], []
+        def command(*argv):
+            if "inspect" in argv:
+                return json.dumps(rows if inspected_rows is None else inspected_rows)
+            if discovery_error:
+                raise discovery_error
+            if "compose-down" in calls:
+                return ""
+            self.assertIn("label=com.docker.compose.project=owned-test", argv)
+            self.assertIn("--no-trunc", argv)
+            return "\n".join(row["Id"] for row in rows)
+        def execute(argv, name):
+            self.assertNotIn("--volumes", argv)
+            self.assertNotIn("-v", argv)
+            calls.append(name)
+        with patch.object(isolated_ci, "command", side_effect=command), \
+             patch.object(isolated_ci, "private_children", return_value=[]), \
+             patch.object(isolated_ci, "containers", return_value=before), \
+             patch.object(isolated_ci, "source_identity", return_value=source):
+            isolated_ci.finish_owned_run(record, Path("/owned"), ["docker", "compose"],
+                                        None, before, source,
+                                        execute,
+                                        lambda: saved.append(copy.deepcopy(record)))
+        self.assertEqual(record["error"], "compose-up failed after Docker accepted Create")
+        self.assertFalse(record["success"])
+        self.assertEqual(record["preexisting_containers_preserved"], baseline_confirmed)
+        self.assertEqual(saved[-1], record)
+        return record, calls
+
+    @staticmethod
+    def controller_row(cid="a" * 64):
+        return {"Id": cid, "Config": {"Labels": {
+            "com.docker.compose.project": "owned-test", "com.docker.compose.service": "rcoder",
+            "rcoder.e2e.run": "run", "rcoder.e2e.case": "case"}},
+            "State": {"Running": False, "Restarting": False, "Pid": 0}}
+
+    def test_up_or_ps_failure_discovers_exact_owned_controller_and_finishes_cleanup(self):
+        record, calls = self.finish_without_captured_controller([self.controller_row()])
+        self.assertEqual(record.get("controller_id"), "a" * 64)
+        self.assertIn("controller-stdout", calls)
+        self.assertIn("compose-stop", calls)
+        self.assertIn("compose-down", calls)
+        self.assertTrue(record["cleanup_confirmed"])
+
+    def test_discovery_needs_original_baseline_and_exact_inspected_id(self):
+        for options in ({"baseline_confirmed": False},
+                        {"inspected_rows": [self.controller_row("b" * 64)]}):
+            with self.subTest(options=options):
+                record, calls = self.finish_without_captured_controller([self.controller_row()], **options)
+                self.assertEqual(calls, [])
+                self.assertFalse(record["cleanup_confirmed"])
+                self.assertTrue(record["cleanup_errors"])
+
+    def test_discovery_never_stops_foreign_baseline_or_ambiguous_controllers(self):
+        for label in ("com.docker.compose.project", "com.docker.compose.service",
+                      "rcoder.e2e.run", "rcoder.e2e.case"):
+            row = self.controller_row()
+            row["Config"]["Labels"][label] = "foreign"
+            with self.subTest(label=label):
+                record, calls = self.finish_without_captured_controller([row])
+                self.assertEqual(calls, [])
+                self.assertFalse(record["cleanup_confirmed"])
+                self.assertTrue(record["cleanup_errors"])
+        for rows, before in (([self.controller_row()], {"a" * 64: {"running": False}}),
+                             ([self.controller_row(), self.controller_row("b" * 64)], {})):
+            with self.subTest(rows=len(rows), before=before):
+                record, calls = self.finish_without_captured_controller(rows, before=before)
+                self.assertEqual(calls, [])
+                self.assertFalse(record["cleanup_confirmed"])
+                self.assertTrue(record["cleanup_errors"])
+
+    def test_absent_controller_or_failed_discovery_never_authorizes_blind_down(self):
+        for error in (None, RuntimeError("Docker observations unavailable")):
+            with self.subTest(error=error):
+                record, calls = self.finish_without_captured_controller([], discovery_error=error)
+                self.assertEqual(calls, [])
+                self.assertFalse(record["cleanup_confirmed"])
+                self.assertTrue(record["cleanup_errors"])
+
     def run_finalization(self, failure, primary_failure="original business failure"):
         source = {"origin_head": "test", "worktree_sha256": "frozen"}
         record = {"project": "owned-test", "cases_passed": True,

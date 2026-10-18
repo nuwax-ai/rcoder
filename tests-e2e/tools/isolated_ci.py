@@ -81,10 +81,35 @@ def successful_case(exit_code, summary, case):
             and not rows[0].get("errors"))
 
 
+def discover_owned_controller(record, before):
+    """Observe an accepted Create whose caller did not receive its container ID."""
+    if not record.get("baseline_confirmed"):
+        raise ValueError("controller discovery requires the original resource baseline")
+    ids = command("docker", "ps", "-aq", "--no-trunc", "--filter",
+                  "label=com.docker.compose.project=" + record["project"]).split()
+    if len(ids) != 1 or not re.fullmatch(r"[0-9a-f]{64}", ids[0]):
+        raise ValueError("controller discovery requires exactly one full container ID")
+    controller = ids[0]
+    if controller in before:
+        raise ValueError("controller discovery must not adopt a preexisting container")
+    rows = json.loads(command("docker", "inspect", controller))
+    if len(rows) != 1 or rows[0].get("Id") != controller:
+        raise ValueError("controller discovery inspection identity mismatch")
+    validate_owned(rows[0], record)
+    return controller
+
+
 def finish_owned_run(record, folder, compose, controller, before, source, execute, save):
     """Preserve the primary failure even when diagnostics or cleanup fail."""
     errors = []
     record["cleanup_confirmed"] = False
+    if not controller and record.get("controller_creation_started"):
+        try:
+            controller = discover_owned_controller(record, before)
+            record["controller_id"] = controller
+            record["controller_id_recovered_during_cleanup"] = True
+        except Exception as error:
+            errors.append("discover controller after incomplete startup: " + str(error))
     if controller:
         owned = False
         try:
@@ -272,6 +297,8 @@ def main():
             if mount["type"] == "bind" and not mount.get("read_only") and mount["target"] != "/var/run/docker.sock":
                 Path(mount["source"]).mkdir(parents=True, exist_ok=True)
         (folder / "compose.json").write_text(json.dumps(cfg, indent=2))
+        record["controller_creation_started"] = True
+        save()
         execute(compose + ["up", "-d", "--no-build", "--pull", "never"], "compose-up")
         controller = command(*compose, "ps", "-q", "rcoder")
         record["controller_id"] = controller
