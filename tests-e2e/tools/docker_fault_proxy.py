@@ -33,6 +33,7 @@ OWNED_ALIASES = {}
 OWNED_AUTO_REMOVE = {}
 STOPPED_CONTAINERS = set()
 COMPUTE_MODES = frozenset({'compute_stopped', 'compute_stop_timeout'})
+EXEC_RELAY_MODES = COMPUTE_MODES | {'after_start'}
 STOP_REPLY_HOLD_SECONDS = 180
 
 
@@ -79,6 +80,14 @@ def container_owned(identifier, *, allow_known_absent=False):
         connection.close()
 
 
+def noninteractive_exec(body, *, starting=False):
+    config = json.loads(body or b'{}')
+    return (isinstance(config, dict)
+            and config.get('AttachStdin', False) is False
+            and config.get('Tty', False) is False
+            and (not starting or config.get('Detach', False) is False))
+
+
 def allowed(method, path, body):
     segments = urllib.parse.urlsplit(path).path.strip('/').split('/')
     if segments and segments[0].startswith('v1.'):
@@ -91,23 +100,26 @@ def allowed(method, path, body):
                 and bool(labels.get('rcoder.io/lifecycle-id')) and labels.get('rcoder.io/application-id') == APP
                 and labels.get('service-type') == 'user-app-builder')
     if len(segments) >= 2 and segments[0] == 'containers':
-        if (MODE in COMPUTE_MODES and segments[-1] == 'exec'
-                and json.loads(body).get('AttachStdin') is True):
-            return False  # this fixture relays only noninteractive exec output
+        if 'exec' in segments[2:]:
+            return (MODE in EXEC_RELAY_MODES and method == 'POST'
+                    and len(segments) == 3 and segments[2] == 'exec'
+                    and noninteractive_exec(body) and container_owned(segments[1]))
         if MODE == 'compute_stop_timeout' and method == 'DELETE':
             if (len(segments) != 2 or len(segments[1]) != 64
                     or urllib.parse.parse_qs(urllib.parse.urlsplit(path).query).get('v') != ['false']):
                 return False
             return container_owned(segments[1], allow_known_absent=True)
         return container_owned(segments[1])
-    if MODE in COMPUTE_MODES and len(segments) == 3 and segments[0] == 'exec':
+    if MODE in EXEC_RELAY_MODES and len(segments) == 3 and segments[0] == 'exec':
+        if method != 'POST' or segments[2] != 'start' or not noninteractive_exec(body, starting=True):
+            return False
         with GATE_LOCK:
             container = OWNED_EXECS.get(segments[1])
         return container is not None and container_owned(container)
     if segments == ['networks', 'create']:
         return json.loads(body).get('Name', '').startswith(PROJECT + '_')
-    # Exec mutation is never needed to acknowledge a newly started builder;
-    # rejecting an unexpected mutator makes fixture assumptions explicit.
+    # Only the recorded noninteractive exec start joins the existing relay.
+    # Every other exec mutation remains outside this fixture's authority.
     return False
 
 
@@ -589,7 +601,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 gate('before_create', self.path)
             headers = {key: value for key, value in self.headers.items()
                        if key.lower() not in ('connection', 'host', 'transfer-encoding')}
-            owned_exec_start = (MODE in COMPUTE_MODES and self.command == 'POST'
+            owned_exec_start = (MODE in EXEC_RELAY_MODES and self.command == 'POST'
                                 and '/exec/' in path and path.endswith('/start'))
             if owned_exec_start and self.headers.get('Connection'):
                 headers['Connection'] = self.headers['Connection']
@@ -605,11 +617,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 with GATE_LOCK:
                     OWNED_CONTAINERS[created_id] = lifecycle
                     OWNED_ALIASES[created_id] = created_id
+            if (MODE in EXEC_RELAY_MODES and self.command == 'POST'
+                    and '/containers/' in path and path.endswith('/exec') and response.status == 201):
+                payload = response.read()
+                with GATE_LOCK:
+                    OWNED_EXECS[json.loads(payload)['Id']] = OWNED_ALIASES.get(path.split('/')[-2])
             if MODE in COMPUTE_MODES and self.command == 'POST' and '/containers/' in path:
-                if path.endswith('/exec') and response.status == 201:
-                    payload = response.read()
-                    with GATE_LOCK:
-                        OWNED_EXECS[json.loads(payload)['Id']] = OWNED_ALIASES.get(path.split('/')[-2])
                 if path.endswith('/stop') and response.status in (204, 304):
                     with GATE_LOCK:
                         STOPPED_CONTAINERS.add(path.split('/')[-2])

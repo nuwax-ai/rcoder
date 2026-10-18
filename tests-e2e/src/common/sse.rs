@@ -76,6 +76,60 @@ pub async fn collect_at<F>(
     duration_s: f64,
     last_event_id: Option<u64>,
     idle_stop: bool,
+    on_event: F,
+) -> (Vec<SseEvent>, EndedReason)
+where
+    F: FnMut(&SseEvent),
+{
+    collect_at_window(
+        http,
+        url,
+        Window::AfterConnect(Duration::from_secs_f64(duration_s.max(1.0))),
+        last_event_id,
+        idle_stop,
+        on_event,
+    )
+    .await
+}
+
+/// Absolute test deadline, including the HTTP handshake. A connection timeout
+/// is an error; only a successfully connected stream can finish its sample window.
+pub async fn collect_until<F>(
+    http: &reqwest::Client,
+    base_url: &str,
+    session_id: &str,
+    deadline: Instant,
+    last_event_id: Option<u64>,
+    idle_stop: bool,
+    on_event: F,
+) -> (Vec<SseEvent>, EndedReason)
+where
+    F: FnMut(&SseEvent),
+{
+    let url = format!("{base_url}/computer/progress/{session_id}");
+    collect_at_window(
+        http,
+        &url,
+        Window::Absolute(deadline),
+        last_event_id,
+        idle_stop,
+        on_event,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum Window {
+    AfterConnect(Duration),
+    Absolute(Instant),
+}
+
+async fn collect_at_window<F>(
+    http: &reqwest::Client,
+    url: &str,
+    window: Window,
+    last_event_id: Option<u64>,
+    idle_stop: bool,
     mut on_event: F,
 ) -> (Vec<SseEvent>, EndedReason)
 where
@@ -91,7 +145,21 @@ where
     if let Some(id) = last_event_id {
         req = req.header("Last-Event-ID", id.to_string());
     }
-    let resp = match req.send().await {
+    let response = match window {
+        Window::AfterConnect(_) => req.send().await,
+        Window::Absolute(deadline) => {
+            match tokio::time::timeout_at(deadline.into(), req.send()).await {
+                Ok(response) => response,
+                Err(_) => {
+                    return (
+                        Vec::new(),
+                        EndedReason::Error("connect: absolute deadline expired".into()),
+                    );
+                }
+            }
+        }
+    };
+    let resp = match response {
         Ok(r) => r,
         Err(e) => {
             return (Vec::new(), EndedReason::Error(format!("connect: {e}")));
@@ -99,7 +167,14 @@ where
     };
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = match window {
+            Window::AfterConnect(_) => resp.text().await.unwrap_or_default(),
+            Window::Absolute(deadline) => tokio::time::timeout_at(deadline.into(), resp.text())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default(),
+        };
         let preview: String = body.chars().take(200).collect();
         return (
             Vec::new(),
@@ -108,7 +183,10 @@ where
     }
 
     let started = Instant::now();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(duration_s.max(1.0));
+    let deadline = match window {
+        Window::AfterConnect(duration) => tokio::time::Instant::now() + duration,
+        Window::Absolute(deadline) => deadline.into(),
+    };
     let mut events = Vec::new();
     let mut stream = resp.bytes_stream();
     let mut parser = SseParser::default();

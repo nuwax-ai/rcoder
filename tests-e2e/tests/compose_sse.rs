@@ -6,7 +6,10 @@
 //! 场景语义与 Python 套件（tests/sse_e2e/scenarios_*.py）逐一对齐；
 //! 断言明细与事件流留痕见 tests-e2e/reports/<run>/<scenario>__<backend>.jsonl。
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[path = "support/sse_terminal_barrier.rs"]
+mod sse_terminal_barrier;
 
 use rcoder_e2e::common::scenario::{
     CollectSpec, assert_hard_all, collect_reported, count_event, record_bg_chat, spawn_chat,
@@ -93,7 +96,7 @@ async fn scenario_full_turn(backend: Backend) {
 }
 
 // ============================================================
-// 场景 2：turn 结束后连 SSE——0 消息事件（终端即清）
+// 场景 2：观察原请求终态后重连 SSE——0 消息事件（终端即清）
 // ============================================================
 async fn scenario_after_terminal(backend: Backend) {
     let scenario = "after_terminal_empty";
@@ -103,38 +106,92 @@ async fn scenario_after_terminal(backend: Backend) {
     let user = env.scoped_user(&format!("s2-{}", backend.as_str()));
     let _guard = TestUserGuard::new(&env, &user);
 
-    let req = env.base_payload(
-        backend,
-        "回答一个字：好",
-        &format!("{}-s2", env.run_tag),
-        &user,
-    );
+    let request_id = format!("{}-s2", env.run_tag);
+    let req = env.base_payload(backend, "回答一个字：好", &request_id, &user);
     let Ok(data) = chat_reported(&env, &report, "turn1", &env.rcoder, &req).await else {
         report.assert_hard("chat 成功", false, "chat 失败（见 chat_request 行）".into());
         assert_hard_all(report).await;
         return;
     };
-    // 等 turn 完成（终端即清已执行）
-    tokio::time::sleep(Duration::from_secs(12)).await;
-    let (events, _) = collect_reported(
-        &env,
-        &report,
-        CollectSpec {
-            phase: "collect_after_terminal",
-            entry: &env.rcoder,
-            sid: &data.session_id,
-            duration_s: 6.0,
-            last_event_id: None,
-            idle_stop: true,
+    // Preserve the former 12s wait + 6s sample budget. A real, sequenced
+    // terminal for this exact request replaces the assumption that sleep=done.
+    let started = Instant::now();
+    let overall_deadline = started + Duration::from_secs(18);
+    let barrier_phase = "observe_original_terminal";
+    report.subscribe_begin(barrier_phase, &env.rcoder, None);
+    let observation = sse_terminal_barrier::observe(
+        &env.sse_http,
+        &env.rcoder,
+        &data.session_id,
+        &request_id,
+        started + Duration::from_secs(12),
+        |event| {
+            report.sse_event(
+                barrier_phase,
+                event.seq,
+                &event.event,
+                &event.data,
+                event.t_ms,
+            );
         },
     )
     .await;
+    let sample_deadline = (Instant::now() + Duration::from_secs(6)).min(overall_deadline);
+    report.subscribe_end(
+        barrier_phase,
+        &observation.ended_reason,
+        observation.events.len(),
+        &sse::ids_of(&observation.events),
+        sse::type_counts(&observation.events),
+        &sse::chunks_text(&observation.events),
+    );
+    if !report.assert_hard(
+        "原请求真实终态前置（同 SID/RID/seq）",
+        observation.terminal_seq.is_some(),
+        format!(
+            "sid={} request_id={request_id} terminal_seq={:?} ended={}; 未观察到原请求成功终态时不能验证终态后重连",
+            data.session_id, observation.terminal_seq, observation.ended_reason,
+        ),
+    ) {
+        assert_hard_all(report).await;
+        return;
+    }
+
+    // This is explicitly a reconnect after consuming the original terminal.
+    // The real SessionWorker tests retain the no-subscriber clear contract.
+    let phase = "collect_after_terminal";
+    report.subscribe_begin(phase, &env.rcoder, None);
+    let (events, ended) = sse::collect_until(
+        &env.sse_http,
+        &env.rcoder,
+        &data.session_id,
+        sample_deadline,
+        None,
+        true,
+        |event| report.sse_event(phase, event.seq, &event.event, &event.data, event.t_ms),
+    )
+    .await;
+    let ended_reason = match &ended {
+        sse::EndedReason::Error(detail) => format!("error: {detail}"),
+        other => other.as_str().to_owned(),
+    };
+    report.subscribe_end(
+        phase,
+        &ended_reason,
+        events.len(),
+        &sse::ids_of(&events),
+        sse::type_counts(&events),
+        &sse::chunks_text(&events),
+    );
     let msgs = sse::message_events(&events);
     let msg_types: Vec<&str> = msgs.iter().map(|e| e.event.as_str()).collect();
     report.assert_hard(
         "0 消息事件（终端即清）",
-        msgs.is_empty(),
-        format!("实际 {} 条：{msg_types:?}；元事件不计入", msgs.len()),
+        !matches!(ended, sse::EndedReason::Error(_)) && msgs.is_empty(),
+        format!(
+            "终态后重连实际 {} 条：{msg_types:?}；ended={ended_reason}；元事件不计入，连接失败不能算空采样成功",
+            msgs.len(),
+        ),
     );
     assert_hard_all(report).await;
 }

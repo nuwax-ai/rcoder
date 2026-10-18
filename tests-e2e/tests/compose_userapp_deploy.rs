@@ -22,6 +22,8 @@ use rcoder_e2e::common::report::JsonlReporter;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+#[path = "support/dev_restart_settlement.rs"]
+mod dev_restart_settlement;
 #[path = "support/purge_recovery.rs"]
 mod purge_recovery;
 
@@ -2607,30 +2609,16 @@ async fn userapp_scope_isolation_during_deploy() {
     // 观测）可持续 ~80s。⑤f 测的是"两路并发 restart 互斥"，不是"撞上第三
     // 路的执行窗口"——先等 ⑤b 的操作到终态（有界），再发两路，语义才成立
     //（2026-09-27 三次复现：不等则两路必然双 409 被 ⑤b 挡住）。
-    let restart_op = rb["data"]["operation_id"].as_str().unwrap_or("").to_owned();
     let t0 = Instant::now();
-    let mut restart_settled = restart_op.is_empty();
-    while !restart_settled && t0.elapsed() < Duration::from_secs(150) {
-        let (s, b) = get_json(
-            &env,
-            &format!("/api/v1/userapp/{app}/operations/current?user_id={user}"),
-        )
-        .await;
-        let blocking = s.is_success()
-            && http_ok(&b)
-            && b["data"].as_array().is_some_and(|ops| {
-                ops.iter().any(|op| {
-                    op["operation_id"].as_str() == Some(restart_op.as_str())
-                        && op["state"].as_str().is_some_and(|st| {
-                            st == "Running" || st == "Pending" || st == "RecoveryRequired"
-                        })
-                })
-            });
-        restart_settled = !blocking;
-        if !restart_settled {
-            tokio::time::sleep(Duration::from_millis(1000)).await;
-        }
-    }
+    let restart_settlement = dev_restart_settlement::wait(
+        &env.http,
+        &env.rcoder,
+        &app,
+        std::slice::from_ref(&rb),
+        t0 + dev_restart_settlement::BUDGET,
+    )
+    .await;
+    let restart_settled = restart_settlement.is_ok();
     report.diagnostic(
         "⑤f 前置：⑤b restart 终态等待",
         &format!("{:.1}s", t0.elapsed().as_secs_f32()),
@@ -2640,10 +2628,23 @@ async fn userapp_scope_isolation_during_deploy() {
             "still running (timeout)"
         },
     );
+    report.assert_hard(
+        "⑤f 前置：⑤b restart 原操作成功终态",
+        restart_settled,
+        format!("{restart_settlement:?}"),
+    );
+    if !restart_settled {
+        // Do not issue new controls or destructive cleanup over an execution
+        // whose original terminal result remains unresolved.
+        let path = report.path.display().to_string();
+        assert!(report.finish(), "场景失败：断言明细见 {path}");
+        return;
+    }
 
     // ⑤f 同域并发 dev restart 反例（required 契约步）：两路不同 request 的
     // dev restart 并发 → 恰一胜者受理，败者 409 信封携带结构化
     // blocker.scope=Dev（M3 透传；不解析消息文本）。
+    let dev_restart_deadline = Instant::now() + dev_restart_settlement::BUDGET;
     let dr_http = env.http.clone();
     let dr_base = env.rcoder.clone();
     let dr_app = app.clone();
@@ -2723,6 +2724,29 @@ async fn userapp_scope_isolation_during_deploy() {
         ),
     );
 
+    // Admission is not completion. Observe every distinct original Dev intent
+    // while the existing Prod assertions continue; all share one deadline.
+    // JoinSet cancels this read-only observer if the outer fixture exits early.
+    let admitted_dev_restarts: Vec<Value> = [(dra_s, &dra_b), (drb_s, &drb_b)]
+        .into_iter()
+        .filter(|(status, body)| status.is_success() && body["success"] == true)
+        .map(|(_, body)| Value::clone(body))
+        .collect();
+    let observe_http = env.http.clone();
+    let observe_base = env.rcoder.clone();
+    let observe_app = app.clone();
+    let mut dev_restart_observers = tokio::task::JoinSet::new();
+    dev_restart_observers.spawn(async move {
+        dev_restart_settlement::wait(
+            &observe_http,
+            &observe_base,
+            &observe_app,
+            &admitted_dev_restarts,
+            dev_restart_deadline,
+        )
+        .await
+    });
+
     // ⑤e 同域并发反例：窗口内第二个 prod start（不同 request_id）→
     // 信封 ERR_OPERATION_IN_PROGRESS + blocker.scope=Prod；符合公开的操作槽互斥契约。
     let (cs, cb) = second_task.await.expect("second start task join");
@@ -2779,6 +2803,23 @@ async fn userapp_scope_isolation_during_deploy() {
             trunc(&final_operation, 400)
         ),
     );
+
+    let dev_restart_settlement = match dev_restart_observers.join_next().await {
+        Some(Ok(result)) => result,
+        Some(Err(error)) => Err(format!("original Dev restart observer failed: {error}")),
+        None => Err("original Dev restart observer was not started".to_owned()),
+    };
+    let dev_restarts_settled = dev_restart_settlement.is_ok();
+    report.assert_hard(
+        "strict purge 前并发 dev restart 原操作成功终态",
+        dev_restarts_settled,
+        format!("{dev_restart_settlement:?}"),
+    );
+    if !dev_restarts_settled {
+        let path = report.path.display().to_string();
+        assert!(report.finish(), "场景失败：断言明细见 {path}");
+        return;
+    }
 
     // ⑥ 回收（复用 full_chain 清理链）
     cleanup_prod(&env, &report, &app, user, Some((&release_id, &sha256))).await;

@@ -34,6 +34,7 @@ RESULTS = []
 DOWNLOAD_RETRY_SECONDS = 8
 RETRY_HTTP_EVENTS = []
 RETRY_HTTP_LOCK = threading.Lock()
+REQUEST_TIMEOUT_SECONDS = 10
 
 
 def check(name, ok, detail):
@@ -206,14 +207,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.close_connection = True
 
 
-def request_http(base, path, body=None):
+def request_http(base, path, body=None, *, timeout=REQUEST_TIMEOUT_SECONDS):
     req = urllib.request.Request(base + path, data=json.dumps(body).encode() if body is not None else None,
                                  headers={'X-Deploy-Token': TOKEN, 'Content-Type': 'application/json'})
     try:
-        with urllib.request.urlopen(req, timeout=10) as response:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             return response.status, response.read()
     except urllib.error.HTTPError as error:
-        return error.code, error.read()
+        with error:
+            return error.code, error.read()
 
 
 def initializing_response(status, body):

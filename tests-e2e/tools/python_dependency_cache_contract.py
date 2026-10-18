@@ -312,6 +312,46 @@ class Contract:
             time.sleep(0.5)
         raise RuntimeError(label + " deadline exceeded")
 
+    def wait_stopped_builder_removed(self, before, operation_id, expected_path, deadline):
+        """Observe the one accepted Stop and its exact AutoRemove retirement."""
+        cid = before["id"]
+        if not re.fullmatch(r"[0-9a-f]{64}", cid):
+            raise ValueError("Stop retirement requires the original full container ID")
+
+        def remaining():
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise RuntimeError("platform Stop and exact builder removal deadline exceeded")
+            return min(180, value)
+
+        while True:
+            _, response = self.api(expected_path, timeout=remaining())
+            remaining()
+            value = response["data"]
+            if value.get("operation_id") != operation_id or value.get("app_id") != self.app or (
+                    value.get("lifecycle_id") != before["lifecycle_id"] or value.get("scope") != "Dev"
+                    or value.get("action") != "stop"):
+                raise RuntimeError("Stop operation identity changed")
+            state = value.get("state")
+            if state in ("failed", "superseded", "recovery_required"):
+                raise RuntimeError("Stop failed or requires recovery")
+            if state == "succeeded" and value.get("stage") == "completed":
+                inspected = docker("inspect", cid, check=False, timeout=remaining())
+                remaining()
+                if inspected.returncode == 0:
+                    rows = json.loads(inspected.stdout)
+                    if not isinstance(rows, list) or len(rows) != 1 or rows[0].get("Id") != cid:
+                        raise ValueError("Stop retirement inspection changed physical identity")
+                elif inspected.returncode == 1 and inspected.stdout.strip() in ("", "[]") and re.fullmatch(
+                        r"(?:error: |error response from daemon: )?no such (?:object|container): " + re.escape(cid),
+                        inspected.stderr.strip(), re.IGNORECASE):
+                    return value, True
+                else:
+                    raise RuntimeError("Cannot confirm the original builder's absence: Docker inspect failed")
+            elif state not in ("pending", "running"):
+                raise RuntimeError("Stop has no recognized successful terminal receipt")
+            time.sleep(min(0.5, remaining()))
+
     def task(self, action):
         _, response = self.api("/api/v1/userapp/" + action, {"app_id": self.app, "user_id": self.args.user_id})
         task_id = response["data"].get("task_id")
@@ -431,18 +471,8 @@ print(json.dumps({'stamp':json.loads(stamp),'stamp_sha256':hashlib.sha256(stamp)
                 operation.get("app_id") != self.app or operation.get("scope") != "Dev"
                 or operation.get("lifecycle_id") != before["lifecycle_id"] or operation.get("action") != "stop"):
             raise RuntimeError("platform Stop did not return exact operation identity")
-        def observe_stop():
-            _, response = self.api(expected_path)
-            value = response["data"]
-            if value.get("operation_id") != operation_id or value.get("app_id") != self.app or (
-                    value.get("lifecycle_id") != before["lifecycle_id"] or value.get("scope") != "Dev"
-                    or value.get("action") != "stop"):
-                raise RuntimeError("Stop operation identity changed")
-            if value.get("state") in ("failed", "superseded", "recovery_required"):
-                raise RuntimeError("Stop failed or requires recovery")
-            return value
-        stopped = self.wait("platform Stop", observe_stop, lambda value: value.get("state") == "succeeded")
-        absent = docker("ps", "-aq", "--no-trunc", "--filter", "id=" + before["id"]).stdout.strip() == ""
+        stopped, absent = self.wait_stopped_builder_removed(
+            before, operation_id, expected_path, time.monotonic() + 240)
         self.check("Python cache platform stop completes original operation", absent and stopped["operation_id"] == operation_id, stopped)
         self.receipt["builder_creation_state"] = "creating"
         self.save()

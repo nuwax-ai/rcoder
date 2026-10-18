@@ -88,6 +88,8 @@ REQUIRED['userapp_scope_isolation_during_deploy'] = {
     'current 数组双 scope 同现（Dev RestartBuilder + Prod 部署族）',
     '隔离场景部署终态 running（并发不破坏部署）',
     '同域并发 restart → 恰一胜者 + 败者 409 带 blocker.scope=Dev',
+    '⑤f 前置：⑤b restart 原操作成功终态',
+    'strict purge 前并发 dev restart 原操作成功终态',
     'prod image and container identity recorded before cleanup',
     'prod diagnostics captured before deletion',
     'prod delete purge 回收',
@@ -117,6 +119,8 @@ REQUIRED['userapp_deploy_full_chain'] |= {
 # Frozen acceptance steps from reviewed baseline runs; never inferred at runtime.
 for _scenario, _steps in json.loads(Path(__file__).with_name('acceptance_steps.json').read_text()).items():
     REQUIRED.setdefault(_scenario, set()).update(_steps)
+for _backend in ('anthropic', 'openai'):
+    REQUIRED[f'after_terminal_{_backend}'].add('原请求真实终态前置（同 SID/RID/seq）')
 HOT.update({
     name + suffix for name in ('static-A', 'static-B', 'static-C')
     for suffix in (' accepted', ' identity', ' actual content')

@@ -12,6 +12,7 @@ import os
 import platform
 import threading
 import time
+import urllib.parse
 import zipfile
 
 os.environ['E2E_CONTRACT_DIR'] = 'worker-contract'
@@ -59,6 +60,89 @@ def view(base, path):
     if status != 200:
         raise AssertionError(f'{path}: HTTP {status}')
     return json.loads(data)['data']
+
+
+def submit_operation(base, request, deadline):
+    """Retry only a live zero-write startup rejection, using one original budget."""
+    # Freeze once. A retry must never refresh the revision, owner, operation ID
+    # or profile from a newer status observation.
+    frozen = json.loads(json.dumps(request))
+    operation = frozen['operation_id']
+    operation_path = '/v1/runtime/operations/' + urllib.parse.quote(operation, safe='')
+    owner = frozen['expected_runtime_instance_id']
+    request_digest = hashlib.sha256(json.dumps(frozen).encode()).hexdigest()
+
+    def remaining():
+        seconds = deadline - time.monotonic()
+        if seconds <= 0:
+            raise TimeoutError(f'original worker admission deadline expired: {operation}')
+        return min(h.REQUEST_TIMEOUT_SECONDS, seconds)
+
+    def observe(path, body=None):
+        status, raw = h.request_http(base, path, body, timeout=remaining())
+        if body is None:
+            h.record_readonly_response(operation, path, status, raw)
+        else:
+            text = raw.decode('utf-8', errors='replace').replace(h.TOKEN, '<redacted>')
+            try:
+                response = json.loads(text)
+            except ValueError:
+                response = {'raw_body': text}
+            with (h.REPORT / 'submission-responses.jsonl').open('a') as stream:
+                stream.write(json.dumps({'operation_id': operation, 'path': path,
+                    'status': status, 'request_sha256': request_digest,
+                    'response': response}) + '\n')
+        remaining()  # A late reply cannot reset the deadline or count as success.
+        return status, raw
+
+    def pause():
+        time.sleep(min(.2, remaining()))
+
+    def not_found():
+        status, raw = observe(operation_path)
+        if status != 404:
+            # An existing record may be an earlier accepted write. This fresh
+            # worker scenario must stop, rather than resubmit or adopt it.
+            raise AssertionError(f'original worker operation is not proven absent: HTTP {status}: '
+                                 + raw.decode(errors='replace'))
+
+    status, raw = observe('/v1/runtime/operations', frozen)
+    while True:
+        try:
+            envelope = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            envelope = None
+        rejected = (status == 409 and isinstance(envelope, dict)
+                    and envelope.get('success') is False
+                    and envelope.get('code') == 'ERR_INITIALIZING'
+                    and envelope.get('data') is None
+                    and envelope.get('operation_id') is None)
+        if not rejected:
+            if status == 202:
+                accepted = envelope.get('data') if isinstance(envelope, dict) else None
+                if (not isinstance(accepted, dict) or envelope.get('success') is not True
+                        or accepted.get('operation_id') != operation
+                        or accepted.get('poll') != operation_path):
+                    raise AssertionError('worker admission returned an ambiguous operation receipt')
+            return status, raw
+        while True:
+            not_found()
+            recovery_status, recovery_body = observe('/v1/runtime/recovery')
+            if h.initializing_response(recovery_status, recovery_body):
+                pause()
+                continue
+            recovery = json.loads(recovery_body)
+            if (recovery_status != 200 or not isinstance(recovery, dict)
+                    or recovery.get('success') is not True
+                    or not isinstance(recovery.get('data'), dict)
+                    or recovery['data'].get('runtime_instance_id') != owner):
+                raise AssertionError('original worker owner changed or recovery observation failed')
+            # Ready can race another same-ID dispatch. A second exact-ID 404
+            # must follow the same-owner observation before identical resubmit.
+            not_found()
+            break
+        pause()
+        status, raw = observe('/v1/runtime/operations', frozen)
 
 
 def source_files():
@@ -142,8 +226,8 @@ def main():
                 raise AssertionError(f'owner identity initialization: HTTP {status}: {body.decode(errors="replace")}')
             identity = json.loads(body)['data']
             # Identity is intentionally served before startup recovery finishes.
-            # This read shares the write-admission initialization gate; never
-            # retry a deployment mutation to paper over a premature submission.
+            # This is a current observation, not a future admission lease. The
+            # submit helper handles only a subsequent explicit zero-write gate.
             status, body = h.request_http(base, '/v1/runtime/recovery')
             h.record_readonly_response('worker-startup', '/v1/runtime/recovery', status, body)
             if h.initializing_response(status, body):
@@ -162,10 +246,12 @@ def main():
                 profile = {'profile': 'artifact', 'input': {'artifact': {'source': 'url', 'value': {
                     'url': f'http://host.docker.internal:{server.server_port}' + payload,
                     'sha256': hashlib.sha256(h.PAYLOADS[payload]).hexdigest()}}}}
-            status, data = h.request_http(base, '/v1/runtime/operations', {
+            request = {
                 'operation_id': op, 'expected_runtime_instance_id': identity['runtime_instance_id'],
                 'expected_revision': view(base, '/v1/runtime/status')['revision'],
-                'workspace_id': identity['workspace_id'], 'kind': kind, 'profile': profile})
+                'workspace_id': identity['workspace_id'], 'kind': kind, 'profile': profile}
+            status, data = submit_operation(
+                base, request, time.monotonic() + h.REQUEST_TIMEOUT_SECONDS)
             h.check(op + ' accepted', status == 202, data.decode())
 
         def terminal(op, wanted):
