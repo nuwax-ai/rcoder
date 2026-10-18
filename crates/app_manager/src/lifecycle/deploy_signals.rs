@@ -76,6 +76,14 @@ pub(crate) fn classify_failure(
     if !observation.matches_target_template || !never_ready {
         return None;
     }
+    // A pull failure can precede the first start; only restart-related signals
+    // require evidence that a container has actually restarted.
+    if observation.container_waiting_reason.as_deref() == Some("ImagePullBackOff")
+        && let Some(message) = observation.container_waiting_message.as_deref()
+        && permanent_pull_failure(message)
+    {
+        return Some(FailureClassification::PermanentImagePull);
+    }
     if observation.restart_count == 0 {
         return None;
     }
@@ -85,12 +93,6 @@ pub(crate) fn classify_failure(
         return Some(FailureClassification::CrashLoopBackOff {
             restarts: observation.restart_count,
         });
-    }
-    if observation.container_waiting_reason.as_deref() == Some("ImagePullBackOff")
-        && let Some(message) = observation.container_waiting_message.as_deref()
-        && permanent_pull_failure(message)
-    {
-        return Some(FailureClassification::PermanentImagePull);
     }
     if observation.restart_count >= thresholds.oom_restart
         && observation
@@ -319,6 +321,71 @@ mod tests {
         assert_eq!(
             classify_failure(&not_found, true, &thresholds()),
             Some(FailureClassification::PermanentImagePull)
+        );
+    }
+
+    #[test]
+    fn first_image_pull_failure_needs_no_previous_container_restart() {
+        let failed_pull = observation(
+            Some("ImagePullBackOff"),
+            Some("pull access denied, repository does not exist or may require authorization"),
+            None,
+            0,
+            false,
+        );
+        assert_eq!(
+            classify_failure(&failed_pull, true, &thresholds()),
+            Some(FailureClassification::PermanentImagePull),
+            "an image that never started has no container restarts"
+        );
+        let mut tracker = FailureSignalTracker::default();
+        let observed = [PodObservation::Observed(failed_pull)];
+        assert_eq!(tracker.observe(&observed, &thresholds()), None);
+        assert_eq!(
+            tracker.observe(&observed, &thresholds()),
+            Some(FailureClassification::PermanentImagePull),
+            "the same owned Pod must still satisfy the existing debounce"
+        );
+    }
+
+    #[test]
+    fn first_image_pull_failure_keeps_transient_and_ownership_guards() {
+        for message in [
+            "dial tcp: i/o timeout",
+            "toomanyrequests: You have reached your pull rate limit",
+        ] {
+            let transient = observation(Some("ImagePullBackOff"), Some(message), None, 0, false);
+            assert_eq!(classify_failure(&transient, true, &thresholds()), None);
+        }
+        let mut foreign = observation(
+            Some("ImagePullBackOff"),
+            Some("unauthorized"),
+            None,
+            0,
+            false,
+        );
+        foreign.matches_target_template = false;
+        assert_eq!(classify_failure(&foreign, true, &thresholds()), None);
+        foreign.matches_target_template = true;
+        assert_eq!(classify_failure(&foreign, false, &thresholds()), None);
+        let zero_thresholds = FailureSignalThresholds {
+            crash_restart: 0,
+            oom_restart: 0,
+        };
+        let never_restarted = observation(
+            Some("CrashLoopBackOff"),
+            None,
+            Some(ContainerExit {
+                code: 137,
+                reason: Some("OOMKilled".into()),
+            }),
+            0,
+            false,
+        );
+        assert_eq!(
+            classify_failure(&never_restarted, true, &zero_thresholds),
+            None,
+            "zero thresholds still require a real restart for restart-related signals"
         );
     }
 
