@@ -160,7 +160,8 @@
     <div class="node bad" id="node-app"
          data-i18n-starting="{{RCODER_UI_STARTING}}"
          data-i18n-stopped="{{RCODER_UI_STOPPED}}"
-         data-i18n-failed="{{RCODER_UI_FAILED}}">
+         data-i18n-failed="{{RCODER_UI_FAILED}}"
+         data-i18n-preparing="{{RCODER_UI_PREPARING}}">
       <span class="ring" id="node-app-glyph" aria-hidden="true">✕</span>
       <span class="name">{{RCODER_UI_APP}}</span><span class="state" id="node-app-state">{{RCODER_UI_UNAVAILABLE}}</span>
     </div>
@@ -179,7 +180,9 @@
 <script>
 // 链路第三节点按结构化失败档位呈现（R6：档位由服务端注入 data-cause，
 // 不解析翻译后的标题文案——三语言下状态判断一致）：
-// starting → 琥珀色加载环；stopped → 灰色暂停条；failed → 红✕ + 失败文案；
+// starting/restarting/provisioning → 琥珀色加载环（provisioning 用「准备中」
+// 标签：平台在准备运行资源，不宣称应用自身在启动）；
+// stopped → 灰色暂停条；failed → 红✕ + 失败文案；
 // 其余档位/未知/无 JS 保持默认红✕不可用（通用兜底）。状态文案从节点
 // data-i18n-* 属性读取（服务端按 locale 渲染）。
 (function () {
@@ -190,10 +193,12 @@
   var state = document.getElementById('node-app-state');
   var link = document.getElementById('link-app');
   if (!node || !glyph || !state) { return; }
-  if ((cause === 'starting' || cause === 'restarting')) {
+  if (cause === 'starting' || cause === 'restarting' || cause === 'provisioning') {
     node.className = 'node warn';
     glyph.innerHTML = '<span class="spin"></span>';
-    state.textContent = node.getAttribute('data-i18n-starting') || '';
+    state.textContent = node.getAttribute(
+      cause === 'provisioning' ? 'data-i18n-preparing' : 'data-i18n-starting'
+    ) || '';
     if (link) { link.className = 'link warn'; }
   } else if (cause === 'stopped') {
     node.className = 'node idle';

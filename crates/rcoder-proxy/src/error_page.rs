@@ -52,6 +52,7 @@ pub const VAR_UI_UNAVAILABLE: &str = "{{RCODER_UI_UNAVAILABLE}}";
 pub const VAR_UI_STARTING: &str = "{{RCODER_UI_STARTING}}";
 pub const VAR_UI_STOPPED: &str = "{{RCODER_UI_STOPPED}}";
 pub const VAR_UI_FAILED: &str = "{{RCODER_UI_FAILED}}";
+pub const VAR_UI_PREPARING: &str = "{{RCODER_UI_PREPARING}}";
 pub const VAR_UI_RELOAD: &str = "{{RCODER_UI_RELOAD}}";
 pub const VAR_UI_HINT: &str = "{{RCODER_UI_HINT}}";
 pub const VAR_UI_COPY: &str = "{{RCODER_UI_COPY}}";
@@ -60,7 +61,7 @@ pub const VAR_UI_ARIA: &str = "{{RCODER_UI_ARIA}}";
 
 /// UI 标签占位符 → i18n key（userapp_error_page.ui.<key>；渲染期按 locale
 /// 注入——固定文案跟随页面语言，脚本状态文案不再依赖标题子串）。
-const UI_LABELS: [(&str, &str); 14] = [
+const UI_LABELS: [(&str, &str); 15] = [
     (VAR_UI_BROWSER, "browser"),
     (VAR_UI_CONNECTED, "connected"),
     (VAR_UI_GATEWAY, "gateway"),
@@ -70,6 +71,7 @@ const UI_LABELS: [(&str, &str); 14] = [
     (VAR_UI_STARTING, "starting"),
     (VAR_UI_STOPPED, "stopped"),
     (VAR_UI_FAILED, "failed"),
+    (VAR_UI_PREPARING, "preparing"),
     (VAR_UI_RELOAD, "reload"),
     (VAR_UI_HINT, "hint"),
     (VAR_UI_COPY, "copy"),
@@ -160,6 +162,8 @@ pub enum ErrorPageCause {
     Starting,
     /// 当前 owner 确认官方代理正在启动或替换。
     Restarting,
+    /// 开发环境运行资源正在准备，应用自身尚未参与（业务快照尚未产生）。
+    Provisioning,
     /// 已确认停止
     Stopped,
     /// 有明确启动失败证据
@@ -189,6 +193,7 @@ impl ErrorPageCause {
         match self {
             Self::Starting => "starting",
             Self::Restarting => "restarting",
+            Self::Provisioning => "provisioning",
             Self::Stopped => "stopped",
             Self::Failed => "failed",
             Self::Missing => "missing",
@@ -302,6 +307,10 @@ impl UserAppProxyFailureHint {
         }
         match self.readiness_status {
             Some(Status::Starting) => ErrorPageCause::Starting,
+            // 平台合并层产出 provisioning 时业务自身尚未参与，文案不归因于应用。
+            // 就绪顾问只消费原始观察、拿不到在途操作槽位，因此该分支目前按构造
+            // 不可达；顾问接入合并态后即刻生效（见 userapp_failure_advisor）。
+            Some(Status::Provisioning) => ErrorPageCause::Provisioning,
             Some(Status::Stopped) => ErrorPageCause::Stopped,
             Some(Status::Failed) => ErrorPageCause::Failed,
             Some(Status::NotDeployed) => ErrorPageCause::Missing,
@@ -698,10 +707,11 @@ mod tests {
         ErrorPageRenderer::new(None)
     }
 
-    fn all_causes() -> [ErrorPageCause; 10] {
+    fn all_causes() -> [ErrorPageCause; 11] {
         [
             ErrorPageCause::Starting,
             ErrorPageCause::Restarting,
+            ErrorPageCause::Provisioning,
             ErrorPageCause::Stopped,
             ErrorPageCause::Failed,
             ErrorPageCause::Missing,
@@ -777,6 +787,11 @@ mod tests {
                 ErrorPageCause::Starting,
                 "应用正在启动",
                 "应用正在启动，耗时较长，请稍后重新访问。",
+            ),
+            (
+                ErrorPageCause::Provisioning,
+                "开发环境正在准备",
+                "应用的开发环境正在准备运行资源，请稍后重新访问。",
             ),
             (
                 ErrorPageCause::Stopped,
@@ -990,6 +1005,18 @@ mod tests {
             error_origin_confirmed: false,
         };
         assert_eq!(unknown.page_cause(), ErrorPageCause::Generic);
+    }
+
+    #[test]
+    fn page_cause_gives_provisioning_its_own_cause() {
+        let hint = UserAppProxyFailureHint {
+            proxy_confirmation: None,
+            readiness_status: Some(shared_types::UserAppReadinessStatus::Provisioning),
+            error_origin_confirmed: false,
+        };
+        let cause = hint.page_cause();
+        assert_eq!(cause, ErrorPageCause::Provisioning);
+        assert_eq!(cause.i18n_slug(), "provisioning");
     }
 
     #[test]

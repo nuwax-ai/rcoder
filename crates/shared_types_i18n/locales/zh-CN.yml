@@ -256,6 +256,7 @@ userapp_error_page.ui.unavailable: "不可用"
 userapp_error_page.ui.starting: "启动中"
 userapp_error_page.ui.stopped: "已停止"
 userapp_error_page.ui.failed: "启动失败"
+userapp_error_page.ui.preparing: "准备中"
 userapp_error_page.ui.reload: "重新访问"
 userapp_error_page.ui.hint: "反馈问题时请附上此编号，便于定位本次请求"
 userapp_error_page.ui.copy: "复制"
@@ -265,6 +266,9 @@ error.dev_container_unreachable: "开发容器暂时不可达，请稍后重试"
 
 userapp_error_page.restarting.title: "应用服务正在切换"
 userapp_error_page.restarting.message: "应用服务正在启动或重启，请稍后重试。"
+
+userapp_error_page.provisioning.title: "开发环境正在准备"
+userapp_error_page.provisioning.message: "应用的开发环境正在准备运行资源，请稍后重新访问。"
 
 # Ordinary Computer ownership conflict
 error.computer_owner_conflict: "当前项目的计算资源归属与请求身份不一致，消息未发送。"

@@ -41,11 +41,19 @@ pub const X_PINGAP_ETYPE_HEADER: &str = "x-pingap-etype";
 ///
 /// 判定顺序（app-cli 侧纯函数集中派生，见 Plan §4.3）：stopping/stopped/
 /// not_deployed → ready → starting → failed → degraded → unknown/unsupported。
+///
+/// `provisioning` 是唯一的例外值：它不由 app-cli 派生，只由平台合并层在
+/// 「开发 builder 在途 + 观察不到业务快照」时产出，因此不出现在
+/// [`UserAppBusinessReadiness`] 与各服务结果里。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UserAppReadinessStatus {
     /// 已有应用，目标环境尚未部署/运行应用版本
     NotDeployed,
+    /// 仅计算资源（开发 builder）正在申请或接管，业务快照尚未产生，业务态
+    /// 未知。只由平台合并层产出：app-cli 永不返回该值，因此只可能出现在
+    /// `app_stage=dev`。
+    Provisioning,
     /// 当前计算资源或业务编排正在启动（有对应状态证据）
     Starting,
     /// 停止意图已受理且尚未收束
@@ -109,13 +117,15 @@ pub enum UserAppReadinessReason {
     /// Pingap 实际生效 config hash 与本实例期望不一致
     ProxyConfigMismatch,
 
-    // ---- 阶段性证据（配合 starting/stopping/stopped/failed/degraded 顶层态）----
+    // ---- 阶段性证据（配合 starting/stopping/stopped/failed/degraded/provisioning 顶层态）----
     /// 停止意图已受理（顶层 stopping）
     StopAccepted,
     /// 健康运行后退化（顶层 degraded）
     HealthDegraded,
     /// 当前版本编排有明确失败证据（顶层 failed）
     OrchestrationFailed,
+    /// 仅开发 builder 在途、业务快照尚未产生（顶层 provisioning）
+    ComputeProvisioning,
 }
 
 /// 单个参与汇总服务的观察结果。
@@ -125,9 +135,11 @@ pub struct UserAppServiceReadiness {
     pub service_id: String,
     /// 该服务是否满足声明的 HTTP 健康契约（含静态入口与 upstream 可用性）
     pub ready: bool,
-    /// 服务级状态：not_deployed / starting / stopping / stopped / ready / degraded / failed / unknown / unsupported
+    /// 服务级状态：not_deployed / provisioning / starting / stopping / stopped /
+    /// ready / degraded / failed / unknown / unsupported（`provisioning` 为平台
+    /// 合并层专用值，app-cli 侧派生永不产出）
     pub status: UserAppReadinessStatus,
-    /// 结构化原因：ADMIN_UNREACHABLE / ADMIN_PROTOCOL_INVALID / INSTANCE_CHANGED / RUNTIME_UPGRADE_REQUIRED / NO_PROXIED_WEB_SERVICES / CUSTOM_ROUTE_UNVERIFIED / OBSERVE_INCOMPLETE / SERVICE_STARTING / HEALTH_HTTP_FAILURE / STATIC_ENTRY_UNAVAILABLE / PROBE_TIMEOUT / UPSTREAM_UNHEALTHY / PROXY_NOT_STARTED / PROXY_CONFIG_MISMATCH / STOP_ACCEPTED / HEALTH_DEGRADED / ORCHESTRATION_FAILED
+    /// 结构化原因：ADMIN_UNREACHABLE / ADMIN_PROTOCOL_INVALID / INSTANCE_CHANGED / RUNTIME_UPGRADE_REQUIRED / NO_PROXIED_WEB_SERVICES / CUSTOM_ROUTE_UNVERIFIED / OBSERVE_INCOMPLETE / SERVICE_STARTING / HEALTH_HTTP_FAILURE / STATIC_ENTRY_UNAVAILABLE / PROBE_TIMEOUT / UPSTREAM_UNHEALTHY / PROXY_NOT_STARTED / PROXY_CONFIG_MISMATCH / STOP_ACCEPTED / HEALTH_DEGRADED / ORCHESTRATION_FAILED / COMPUTE_PROVISIONING（后者仅平台合并层产出）
     pub reason_code: Option<UserAppReadinessReason>,
 }
 
@@ -137,9 +149,12 @@ pub struct UserAppServiceReadiness {
 pub struct UserAppProxyReadiness {
     /// 入口监听 + 生效配置 hash 匹配
     pub ready: bool,
-    /// 代理入口状态：not_deployed / starting / stopping / stopped / ready / degraded / failed / unknown / unsupported
+    /// 代理入口状态：not_deployed / provisioning / starting / stopping / stopped /
+    /// ready / degraded / failed / unknown / unsupported。app-cli 快照侧永不产出
+    /// `provisioning`；平台合并层的合成分支下该字段与顶层 `status`/`reason_code`
+    /// 同值（顶层为 `provisioning` 时此处同步）。
     pub status: UserAppReadinessStatus,
-    /// 结构化原因：ADMIN_UNREACHABLE / ADMIN_PROTOCOL_INVALID / INSTANCE_CHANGED / RUNTIME_UPGRADE_REQUIRED / NO_PROXIED_WEB_SERVICES / CUSTOM_ROUTE_UNVERIFIED / OBSERVE_INCOMPLETE / SERVICE_STARTING / HEALTH_HTTP_FAILURE / STATIC_ENTRY_UNAVAILABLE / PROBE_TIMEOUT / UPSTREAM_UNHEALTHY / PROXY_NOT_STARTED / PROXY_CONFIG_MISMATCH / STOP_ACCEPTED / HEALTH_DEGRADED / ORCHESTRATION_FAILED
+    /// 结构化原因：ADMIN_UNREACHABLE / ADMIN_PROTOCOL_INVALID / INSTANCE_CHANGED / RUNTIME_UPGRADE_REQUIRED / NO_PROXIED_WEB_SERVICES / CUSTOM_ROUTE_UNVERIFIED / OBSERVE_INCOMPLETE / SERVICE_STARTING / HEALTH_HTTP_FAILURE / STATIC_ENTRY_UNAVAILABLE / PROBE_TIMEOUT / UPSTREAM_UNHEALTHY / PROXY_NOT_STARTED / PROXY_CONFIG_MISMATCH / STOP_ACCEPTED / HEALTH_DEGRADED / ORCHESTRATION_FAILED / COMPUTE_PROVISIONING（后者仅平台合并层产出，随顶层同步）
     pub reason_code: Option<UserAppReadinessReason>,
     /// 自产错误来源契约（首版 `pingap_etype_v1`）；custom/旧运行配置/hash
     /// 未确认时为 None（故障页据此决定是否信任 `X-Pingap-EType` 标记）。
@@ -155,13 +170,16 @@ pub struct UserAppProxyReadiness {
 pub struct UserAppBusinessReadiness {
     /// 顶层汇总 = 非空参与集合全部通过 AND proxy.ready
     pub ready: bool,
-    /// 顶层业务状态：not_deployed / starting / stopping / stopped / ready / degraded / failed / unknown / unsupported
+    /// 顶层业务状态：not_deployed / provisioning / starting / stopping / stopped /
+    /// ready / degraded / failed / unknown / unsupported（`provisioning` 为平台
+    /// 合并层专用值，app-cli 派生永不产出，因此本快照实际取值不含它）
     pub status: UserAppReadinessStatus,
     /// 结构化原因（全集：ADMIN_UNREACHABLE / ADMIN_PROTOCOL_INVALID / INSTANCE_CHANGED /
     /// RUNTIME_UPGRADE_REQUIRED / NO_PROXIED_WEB_SERVICES / CUSTOM_ROUTE_UNVERIFIED /
     /// OBSERVE_INCOMPLETE / SERVICE_STARTING / HEALTH_HTTP_FAILURE / STATIC_ENTRY_UNAVAILABLE /
     /// PROBE_TIMEOUT / UPSTREAM_UNHEALTHY / PROXY_NOT_STARTED / PROXY_CONFIG_MISMATCH /
-    /// STOP_ACCEPTED / HEALTH_DEGRADED / ORCHESTRATION_FAILED）
+    /// STOP_ACCEPTED / HEALTH_DEGRADED / ORCHESTRATION_FAILED / COMPUTE_PROVISIONING——
+    /// 后者仅平台合并层产出，本快照实际取值不含它）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_code: Option<UserAppReadinessReason>,
     /// 实际观察时间（RFC3339 UTC；不是缓存重新包装的时间）
@@ -248,7 +266,10 @@ pub struct UserAppReadinessResponse {
     /// `dev` / `prod`
     pub app_stage: String,
     pub ready: bool,
-    /// 顶层业务状态：not_deployed / starting / stopping / stopped / ready / degraded / failed / unknown / unsupported
+    /// 顶层业务状态：not_deployed / provisioning / starting / stopping / stopped /
+    /// ready / degraded / failed / unknown / unsupported。`provisioning` 只由平台
+    /// 合并层产出（dev builder 资源申请中、业务快照未产生），只可能出现在
+    /// `app_stage=dev`；其余 9 值与 [`UserAppBusinessReadiness`] 同源。
     pub status: UserAppReadinessStatus,
     /// Container state/control progress, separate from business ready/status.
     /// Older responses without this field mean unknown, never not deployed.
@@ -258,7 +279,8 @@ pub struct UserAppReadinessResponse {
     /// RUNTIME_UPGRADE_REQUIRED / NO_PROXIED_WEB_SERVICES / CUSTOM_ROUTE_UNVERIFIED /
     /// OBSERVE_INCOMPLETE / SERVICE_STARTING / HEALTH_HTTP_FAILURE / STATIC_ENTRY_UNAVAILABLE /
     /// PROBE_TIMEOUT / UPSTREAM_UNHEALTHY / PROXY_NOT_STARTED / PROXY_CONFIG_MISMATCH /
-    /// STOP_ACCEPTED / HEALTH_DEGRADED / ORCHESTRATION_FAILED）
+    /// STOP_ACCEPTED / HEALTH_DEGRADED / ORCHESTRATION_FAILED / COMPUTE_PROVISIONING；
+    /// COMPUTE_PROVISIONING 同样只由平台合并层产出）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_code: Option<UserAppReadinessReason>,
     pub checked_at: String,
@@ -369,12 +391,20 @@ mod tests {
             "\"not_deployed\""
         );
         assert_eq!(
+            serde_json::to_string(&UserAppReadinessStatus::Provisioning).unwrap(),
+            "\"provisioning\""
+        );
+        assert_eq!(
             serde_json::to_string(&UserAppReadinessStatus::Unknown).unwrap(),
             "\"unknown\""
         );
         assert_eq!(
             serde_json::to_string(&UserAppReadinessReason::AdminUnreachable).unwrap(),
             "\"ADMIN_UNREACHABLE\""
+        );
+        assert_eq!(
+            serde_json::to_string(&UserAppReadinessReason::ComputeProvisioning).unwrap(),
+            "\"COMPUTE_PROVISIONING\""
         );
         assert_eq!(
             serde_json::to_string(&UserAppReadinessReason::RuntimeUpgradeRequired).unwrap(),

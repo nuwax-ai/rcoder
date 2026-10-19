@@ -19,6 +19,31 @@ pub(super) enum ControlIntent {
     StopAccepted,
     Starting,
     Restarting,
+    /// 仅申请/接管开发 builder 计算资源，业务版本尚未参与。
+    Provisioning,
+}
+
+/// [`ControlIntent`] 归一出的等待类证据：决定「观察不到业务事实」时能否承诺
+/// 一个等待态。穷尽匹配，新增意图变体必须在此显式表态，不得由 `matches!`
+/// 隐式承接。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WaitEvidence {
+    /// 不承诺等待：无在途操作或停止已受理，观察失败如实透出为故障。
+    NoWait,
+    /// 业务编排正在启动或重启，可以据控制意图宣称 `starting`。
+    BusinessBoot,
+    /// 只有平台在准备计算资源，业务快照尚未产生，宣称 `provisioning`。
+    ComputeProvisioning,
+}
+
+impl ControlIntent {
+    fn wait(self) -> WaitEvidence {
+        match self {
+            Self::None | Self::StopAccepted => WaitEvidence::NoWait,
+            Self::Starting | Self::Restarting => WaitEvidence::BusinessBoot,
+            Self::Provisioning => WaitEvidence::ComputeProvisioning,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +57,7 @@ pub(super) struct ReadinessControl {
 impl ReadinessControl {
     pub(super) fn ordinary(operation: Option<&UserAppOperationRecord>) -> Self {
         let intent = match operation.map(|operation| operation.kind) {
+            None => ControlIntent::None,
             Some(
                 UserAppOperationKind::Stop
                 | UserAppOperationKind::StopBuilder
@@ -46,11 +72,30 @@ impl ReadinessControl {
                 UserAppOperationKind::Create
                 | UserAppOperationKind::StartDeployment
                 | UserAppOperationKind::Start
-                | UserAppOperationKind::EnsureBuilder
                 | UserAppOperationKind::Update
                 | UserAppOperationKind::HotDeploy,
             ) => ControlIntent::Starting,
-            _ => ControlIntent::None,
+            // EnsureBuilder/AdoptBuilder 只准备或接管开发 builder 的计算资源，
+            // 不启动任何业务版本：这个窗口的等待证据是资源准备，不能占用
+            // 业务启动语义。
+            Some(UserAppOperationKind::EnsureBuilder | UserAppOperationKind::AdoptBuilder) => {
+                ControlIntent::Provisioning
+            }
+            // 元数据、存储、数据库凭据与实例收养类操作不改变业务态：观察失败
+            // 时如实透出故障，不编造等待态。
+            Some(
+                UserAppOperationKind::SetRecyclePolicy
+                | UserAppOperationKind::AdoptApplication
+                | UserAppOperationKind::PurgeResources
+                | UserAppOperationKind::DestroyDevStorage
+                | UserAppOperationKind::DestroyProdStorage
+                | UserAppOperationKind::ClearDevStorage
+                | UserAppOperationKind::ClearProdStorage
+                | UserAppOperationKind::ResetDevDatabasePassword
+                | UserAppOperationKind::ResetProdDatabasePassword
+                | UserAppOperationKind::PrepareProdDatabase
+                | UserAppOperationKind::DeleteApplication,
+            ) => ControlIntent::None,
         };
         Self {
             lifecycle_id: String::new(),
@@ -98,10 +143,7 @@ pub(super) fn merge_observation(
         },
         services: Vec::new(),
     };
-    let starting = matches!(
-        control.intent,
-        ControlIntent::Starting | ControlIntent::Restarting
-    );
+    let wait = control.intent.wait();
     let mut response = match observation {
         UserAppReadinessObservation::InstanceChanged => {
             base(Status::Unknown, Some(Reason::InstanceChanged))
@@ -112,38 +154,81 @@ pub(super) fn merge_observation(
         UserAppReadinessObservation::UnsupportedRuntime { .. } => {
             base(Status::Unsupported, Some(Reason::RuntimeUpgradeRequired))
         }
-        UserAppReadinessObservation::AdminUnreachable { .. } => {
-            if starting {
-                base(Status::Starting, Some(Reason::ServiceStarting))
-            } else {
-                base(Status::Unknown, Some(Reason::AdminUnreachable))
+        UserAppReadinessObservation::AdminUnreachable { .. } => match wait {
+            WaitEvidence::NoWait => base(Status::Unknown, Some(Reason::AdminUnreachable)),
+            WaitEvidence::BusinessBoot => base(Status::Starting, Some(Reason::ServiceStarting)),
+            // builder 进程还在拉起时管理端口本就不应答，这是等待而非故障。
+            // 此格刻意不再透出 ADMIN_UNREACHABLE：否则一次资源申请会输出
+            // provisioning → unknown → not_deployed，比现状更难解释。无在途
+            // 资源操作时（NoWait 那格）仍如实报 ADMIN_UNREACHABLE。
+            WaitEvidence::ComputeProvisioning => {
+                base(Status::Provisioning, Some(Reason::ComputeProvisioning))
             }
-        }
+        },
         UserAppReadinessObservation::NoCompute { state } => {
-            let status = match state {
-                UserAppNoComputeState::Starting => Status::Starting,
-                UserAppNoComputeState::Stopping => Status::Stopping,
-                UserAppNoComputeState::Unknown => Status::Unknown,
-                UserAppNoComputeState::Missing
-                | UserAppNoComputeState::Stopped
-                | UserAppNoComputeState::Failed
-                    if control.compute.desired_stopped =>
-                {
-                    Status::Stopped
+            // 每个格子显式表态：等待分类不得吞掉物理事实，物理事实也不能
+            // 反过来吞掉等待分类。
+            let (status, reason) = match (state, wait, control.compute.desired_stopped) {
+                // 计算控制头的停止意图先于等待分类：故意停止后容器可能以
+                // 非零状态收束，那仍是 stopped，不能被等待态洗成启动中。
+                (
+                    UserAppNoComputeState::Missing
+                    | UserAppNoComputeState::Stopped
+                    | UserAppNoComputeState::Failed,
+                    WaitEvidence::NoWait
+                    | WaitEvidence::BusinessBoot
+                    | WaitEvidence::ComputeProvisioning,
+                    true,
+                ) => (Status::Stopped, None),
+                // 资源申请等待覆盖 Missing/Stopped/Starting：整个窗口只出一个
+                // provisioning，业务快照一旦出现即由 Snapshot 分支交还 app-cli。
+                (
+                    UserAppNoComputeState::Missing
+                    | UserAppNoComputeState::Stopped
+                    | UserAppNoComputeState::Starting,
+                    WaitEvidence::ComputeProvisioning,
+                    false | true,
+                ) => (Status::Provisioning, Some(Reason::ComputeProvisioning)),
+                // 容器正在拉起是物理事实，无在途操作也会成立（流量唤醒、
+                // Clear/Reset 之后自愈），因此保持 starting，不由意图决定。
+                (
+                    UserAppNoComputeState::Starting,
+                    WaitEvidence::NoWait | WaitEvidence::BusinessBoot,
+                    false | true,
+                ) => (Status::Starting, Some(Reason::ServiceStarting)),
+                (
+                    UserAppNoComputeState::Missing | UserAppNoComputeState::Stopped,
+                    WaitEvidence::BusinessBoot,
+                    false,
+                ) => (Status::Starting, Some(Reason::ServiceStarting)),
+                (UserAppNoComputeState::Missing, WaitEvidence::NoWait, false) => {
+                    (Status::NotDeployed, None)
                 }
-                UserAppNoComputeState::Missing | UserAppNoComputeState::Stopped if starting => {
-                    Status::Starting
+                (UserAppNoComputeState::Stopped, WaitEvidence::NoWait, false) => {
+                    (Status::Stopped, None)
                 }
-                UserAppNoComputeState::Missing => Status::NotDeployed,
-                UserAppNoComputeState::Stopped => Status::Stopped,
-                UserAppNoComputeState::Failed => Status::Failed,
-            };
-            let reason = match status {
-                Status::Starting => Some(Reason::ServiceStarting),
-                Status::Stopping => Some(Reason::StopAccepted),
-                Status::Failed => Some(Reason::OrchestrationFailed),
-                Status::Unknown => Some(Reason::ObserveIncomplete),
-                _ => None,
+                // 编排失败是确定故障，任何等待分类都不覆盖它。
+                (
+                    UserAppNoComputeState::Failed,
+                    WaitEvidence::NoWait
+                    | WaitEvidence::BusinessBoot
+                    | WaitEvidence::ComputeProvisioning,
+                    false,
+                ) => (Status::Failed, Some(Reason::OrchestrationFailed)),
+                (
+                    UserAppNoComputeState::Stopping,
+                    WaitEvidence::NoWait
+                    | WaitEvidence::BusinessBoot
+                    | WaitEvidence::ComputeProvisioning,
+                    false | true,
+                ) => (Status::Stopping, Some(Reason::StopAccepted)),
+                (
+                    UserAppNoComputeState::Unknown,
+                    WaitEvidence::NoWait
+                    | WaitEvidence::BusinessBoot
+                    | WaitEvidence::ComputeProvisioning,
+                    false | true,
+                ) => (Status::Unknown, Some(Reason::ObserveIncomplete)),
             };
             base(status, reason)
         }
@@ -168,6 +253,8 @@ pub(super) fn merge_observation(
     // Only an in-flight Stop overrides a live snapshot. A historical desired
     // state helps classify a removed container, but must not mask a later
     // manually started owner or pretend a completed/failed Stop is still active.
+    // `Provisioning` 明确没有后置覆盖：它的权威来源永远是 app-cli 快照，
+    // 一旦有快照就原样透出，不因为操作仍占着槽位而继续宣称等待。
     if control.intent == ControlIntent::StopAccepted {
         response.ready = false;
         response.status = Status::Stopping;
@@ -675,5 +762,334 @@ mod tests {
         assert_eq!(response.status, UserAppReadinessStatus::Starting);
         assert_eq!(response.container.status, UserAppContainerStatus::Running);
         assert!(response.container.operation.is_none());
+    }
+
+    fn admin_unreachable() -> UserAppReadinessObservation {
+        UserAppReadinessObservation::AdminUnreachable {
+            physical: UserAppReadinessPhysical {
+                instance_id: Some("pod-uid".into()),
+                address: Some("10.0.0.1:3010".into()),
+                channel: UserAppReadinessChannel::Exec,
+            },
+        }
+    }
+
+    /// 资源申请窗口不得冒充业务启动：`EnsureBuilder` 在途时，「问不到业务」
+    /// 的等待证据是 `provisioning`（平台正在准备计算资源），不是 `starting`
+    /// （应用业务正在启动）。前端据此区分「还没开始启动」与「启动中」。
+    #[test]
+    fn builder_provisioning_is_not_reported_as_business_start() {
+        let control =
+            ReadinessControl::ordinary(Some(&operation(UserAppOperationKind::EnsureBuilder)));
+        for observation in [
+            admin_unreachable(),
+            UserAppReadinessObservation::NoCompute {
+                state: UserAppNoComputeState::Missing,
+            },
+            UserAppReadinessObservation::NoCompute {
+                state: UserAppNoComputeState::Starting,
+            },
+            UserAppReadinessObservation::NoCompute {
+                state: UserAppNoComputeState::Stopped,
+            },
+        ] {
+            let response = merge_observation("194", UserappStage::Dev, &control, observation);
+            assert_eq!(
+                response.status,
+                UserAppReadinessStatus::Provisioning,
+                "builder wait must not be reported as business boot"
+            );
+            assert_eq!(
+                response.reason_code,
+                Some(UserAppReadinessReason::ComputeProvisioning)
+            );
+            assert!(!response.ready);
+            assert_eq!(response.operation_id.as_deref(), Some("op-1"));
+            assert_eq!(
+                response.proxy.status,
+                UserAppReadinessStatus::Provisioning,
+                "合成分支下 proxy 与顶层同值"
+            );
+            assert_eq!(response.proxy.reason_code, response.reason_code);
+        }
+    }
+
+    /// 业务编排类操作保持 `starting`：本次拆分只把纯资源操作移出该档位，
+    /// 不扩大等待态的适用范围。
+    #[test]
+    fn business_operations_keep_starting() {
+        for kind in [
+            UserAppOperationKind::Create,
+            UserAppOperationKind::StartDeployment,
+            UserAppOperationKind::Start,
+            UserAppOperationKind::Update,
+            UserAppOperationKind::HotDeploy,
+        ] {
+            let control = ReadinessControl::ordinary(Some(&operation(kind)));
+            for observation in [
+                admin_unreachable(),
+                UserAppReadinessObservation::NoCompute {
+                    state: UserAppNoComputeState::Missing,
+                },
+                UserAppReadinessObservation::NoCompute {
+                    state: UserAppNoComputeState::Stopped,
+                },
+            ] {
+                let response = merge_observation("194", UserappStage::Prod, &control, observation);
+                assert_eq!(
+                    response.status,
+                    UserAppReadinessStatus::Starting,
+                    "{kind:?}"
+                );
+                assert_eq!(
+                    response.reason_code,
+                    Some(UserAppReadinessReason::ServiceStarting),
+                    "{kind:?}"
+                );
+                assert_ne!(
+                    response.status,
+                    UserAppReadinessStatus::Provisioning,
+                    "{kind:?} is a business boot, not compute provisioning"
+                );
+            }
+        }
+    }
+
+    fn builder_control() -> ReadinessControl {
+        ReadinessControl::ordinary(Some(&operation(UserAppOperationKind::EnsureBuilder)))
+    }
+
+    fn no_compute(state: UserAppNoComputeState) -> UserAppReadinessObservation {
+        UserAppReadinessObservation::NoCompute { state }
+    }
+
+    fn snapshot() -> UserAppReadinessObservation {
+        UserAppReadinessObservation::Snapshot {
+            physical: UserAppReadinessPhysical {
+                instance_id: Some("pod-uid".into()),
+                address: None,
+                channel: UserAppReadinessChannel::Exec,
+            },
+            snapshot: Box::new(ready_snapshot()),
+        }
+    }
+
+    /// 资源申请等待只替换「观察不到业务事实」的档位：确定故障、停止中、
+    /// 观察不完整与旧运行时如实透出，不能被洗成 provisioning。
+    #[test]
+    fn provisioning_keeps_failure_and_stop_evidence() {
+        let physical = UserAppReadinessPhysical {
+            instance_id: Some("pod-uid".into()),
+            address: Some("127.0.0.1:3010".into()),
+            channel: UserAppReadinessChannel::Exec,
+        };
+        for (observation, status, reason) in [
+            (
+                no_compute(UserAppNoComputeState::Failed),
+                UserAppReadinessStatus::Failed,
+                Some(UserAppReadinessReason::OrchestrationFailed),
+            ),
+            (
+                no_compute(UserAppNoComputeState::Stopping),
+                UserAppReadinessStatus::Stopping,
+                Some(UserAppReadinessReason::StopAccepted),
+            ),
+            (
+                no_compute(UserAppNoComputeState::Unknown),
+                UserAppReadinessStatus::Unknown,
+                Some(UserAppReadinessReason::ObserveIncomplete),
+            ),
+            (
+                UserAppReadinessObservation::UnsupportedRuntime {
+                    physical: physical.clone(),
+                },
+                UserAppReadinessStatus::Unsupported,
+                Some(UserAppReadinessReason::RuntimeUpgradeRequired),
+            ),
+            (
+                UserAppReadinessObservation::InstanceChanged,
+                UserAppReadinessStatus::Unknown,
+                Some(UserAppReadinessReason::InstanceChanged),
+            ),
+            (
+                UserAppReadinessObservation::TimedOut,
+                UserAppReadinessStatus::Unknown,
+                Some(UserAppReadinessReason::ObserveIncomplete),
+            ),
+        ] {
+            let response =
+                merge_observation("194", UserappStage::Dev, &builder_control(), observation);
+            assert_eq!(
+                response.status, status,
+                "{status:?} must survive the wait intent"
+            );
+            assert_ne!(response.status, UserAppReadinessStatus::Provisioning);
+            assert_eq!(response.reason_code, reason);
+        }
+    }
+
+    /// builder 收养（AdoptBuilder）是资源接管，不是业务启动，也不是故障：
+    /// 观察失败/实例缺失期间同样是 `provisioning`。
+    #[test]
+    fn builder_adoption_is_not_a_fault() {
+        let control =
+            ReadinessControl::ordinary(Some(&operation(UserAppOperationKind::AdoptBuilder)));
+        for observation in [
+            admin_unreachable(),
+            no_compute(UserAppNoComputeState::Missing),
+        ] {
+            let response = merge_observation("194", UserappStage::Dev, &control, observation);
+            assert_eq!(response.status, UserAppReadinessStatus::Provisioning);
+            assert_eq!(
+                response.reason_code,
+                Some(UserAppReadinessReason::ComputeProvisioning)
+            );
+        }
+    }
+
+    /// 计算控制头的停止意图先于等待分类：故意停止后的缺失/停止/非零退出
+    /// 都停在 `stopped`，不得被 provisioning 覆盖。
+    #[test]
+    fn desired_stopped_outranks_provisioning_wait() {
+        let mut control = builder_control();
+        control.compute.desired_stopped = true;
+        for state in [
+            UserAppNoComputeState::Missing,
+            UserAppNoComputeState::Stopped,
+            UserAppNoComputeState::Failed,
+        ] {
+            let response = merge_observation("194", UserappStage::Dev, &control, no_compute(state));
+            assert_eq!(
+                response.status,
+                UserAppReadinessStatus::Stopped,
+                "{state:?}"
+            );
+            assert_ne!(
+                response.status,
+                UserAppReadinessStatus::Provisioning,
+                "{state:?} under an accepted stop must not claim provisioning"
+            );
+        }
+    }
+
+    /// app-cli 快照是业务态权威：窗口一结束就原样透出，`Provisioning` 没有
+    /// 任何后置覆盖。
+    #[test]
+    fn snapshot_ends_the_provisioning_window() {
+        let response = merge_observation("194", UserappStage::Dev, &builder_control(), snapshot());
+        assert!(response.ready);
+        assert_eq!(response.status, UserAppReadinessStatus::Ready);
+        assert_eq!(response.observation_revision, 5);
+        assert_eq!(response.runtime_instance_id.as_deref(), Some("instance-1"));
+        assert_eq!(response.operation_id.as_deref(), Some("op-1"));
+        assert_eq!(
+            response.runtime_operation_id.as_deref(),
+            Some("runtime-op-1")
+        );
+    }
+
+    /// 容器正在拉起是无在途操作也会成立的物理事实（流量唤醒、Clear/Reset
+    /// 之后自愈），因此保持 `starting`，不改成意图驱动。
+    #[test]
+    fn no_compute_starting_without_operation_stays_starting() {
+        let response = merge_observation(
+            "194",
+            UserappStage::Dev,
+            &ReadinessControl::ordinary(None),
+            no_compute(UserAppNoComputeState::Starting),
+        );
+        assert_eq!(response.status, UserAppReadinessStatus::Starting);
+        assert_eq!(
+            response.reason_code,
+            Some(UserAppReadinessReason::ServiceStarting)
+        );
+    }
+
+    /// kind→意图映射的单一事实源逐格钉住：新增操作 kind 必须在此表态，
+    /// 不能由默认分支落到 `starting`（那会把资源等待重新混进业务启动）。
+    #[test]
+    fn operation_kind_intent_table_is_explicit() {
+        const EXPECTED: [(UserAppOperationKind, ControlIntent); 24] = [
+            (UserAppOperationKind::Stop, ControlIntent::StopAccepted),
+            (
+                UserAppOperationKind::StopBuilder,
+                ControlIntent::StopAccepted,
+            ),
+            (
+                UserAppOperationKind::DeleteCompute,
+                ControlIntent::StopAccepted,
+            ),
+            (UserAppOperationKind::Restart, ControlIntent::Restarting),
+            (
+                UserAppOperationKind::RestartDeployment,
+                ControlIntent::Restarting,
+            ),
+            (
+                UserAppOperationKind::RestartBuilder,
+                ControlIntent::Restarting,
+            ),
+            (UserAppOperationKind::Create, ControlIntent::Starting),
+            (
+                UserAppOperationKind::StartDeployment,
+                ControlIntent::Starting,
+            ),
+            (UserAppOperationKind::Start, ControlIntent::Starting),
+            (UserAppOperationKind::Update, ControlIntent::Starting),
+            (UserAppOperationKind::HotDeploy, ControlIntent::Starting),
+            (
+                UserAppOperationKind::EnsureBuilder,
+                ControlIntent::Provisioning,
+            ),
+            (
+                UserAppOperationKind::AdoptBuilder,
+                ControlIntent::Provisioning,
+            ),
+            (UserAppOperationKind::SetRecyclePolicy, ControlIntent::None),
+            (UserAppOperationKind::AdoptApplication, ControlIntent::None),
+            (UserAppOperationKind::PurgeResources, ControlIntent::None),
+            (UserAppOperationKind::DestroyDevStorage, ControlIntent::None),
+            (
+                UserAppOperationKind::DestroyProdStorage,
+                ControlIntent::None,
+            ),
+            (UserAppOperationKind::ClearDevStorage, ControlIntent::None),
+            (UserAppOperationKind::ClearProdStorage, ControlIntent::None),
+            (
+                UserAppOperationKind::ResetDevDatabasePassword,
+                ControlIntent::None,
+            ),
+            (
+                UserAppOperationKind::ResetProdDatabasePassword,
+                ControlIntent::None,
+            ),
+            (
+                UserAppOperationKind::PrepareProdDatabase,
+                ControlIntent::None,
+            ),
+            (UserAppOperationKind::DeleteApplication, ControlIntent::None),
+        ];
+        for (kind, intent) in EXPECTED {
+            let control = ReadinessControl::ordinary(Some(&operation(kind)));
+            assert_eq!(control.intent, intent, "{kind:?}");
+            assert_eq!(control.operation_id.as_deref(), Some("op-1"), "{kind:?}");
+        }
+        assert_eq!(ReadinessControl::ordinary(None).intent, ControlIntent::None);
+        assert_eq!(
+            ReadinessControl::ordinary(None).operation_id,
+            None,
+            "无在途操作不得带出 operation_id"
+        );
+        assert_eq!(
+            EXPECTED
+                .iter()
+                .filter(|(_, intent)| *intent == ControlIntent::Provisioning)
+                .map(|(kind, _)| *kind)
+                .collect::<Vec<_>>(),
+            vec![
+                UserAppOperationKind::EnsureBuilder,
+                UserAppOperationKind::AdoptBuilder
+            ],
+            "资源申请等待态目前只由 builder 资源操作产出（申请 + 收养）"
+        );
     }
 }

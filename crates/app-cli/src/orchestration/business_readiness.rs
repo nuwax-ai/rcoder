@@ -340,6 +340,7 @@ impl BusinessReadinessObserver {
                 UserAppReadinessStatus::Starting => UserAppReadinessReason::ServiceStarting,
                 UserAppReadinessStatus::Failed => UserAppReadinessReason::OrchestrationFailed,
                 UserAppReadinessStatus::NotDeployed
+                | UserAppReadinessStatus::Provisioning
                 | UserAppReadinessStatus::Stopping
                 | UserAppReadinessStatus::Stopped
                 | UserAppReadinessStatus::Ready
@@ -900,6 +901,7 @@ fn top_level_reason(
         UserAppReadinessStatus::Failed => return Some(UserAppReadinessReason::OrchestrationFailed),
         UserAppReadinessStatus::Degraded => Some(UserAppReadinessReason::HealthDegraded),
         UserAppReadinessStatus::NotDeployed
+        | UserAppReadinessStatus::Provisioning
         | UserAppReadinessStatus::Starting
         | UserAppReadinessStatus::Stopping
         | UserAppReadinessStatus::Stopped

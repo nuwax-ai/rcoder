@@ -256,6 +256,7 @@ userapp_error_page.ui.unavailable: "Unavailable"
 userapp_error_page.ui.starting: "Starting"
 userapp_error_page.ui.stopped: "Stopped"
 userapp_error_page.ui.failed: "Failed to start"
+userapp_error_page.ui.preparing: "Preparing"
 userapp_error_page.ui.reload: "Reload"
 userapp_error_page.ui.hint: "Include this ID when reporting the issue to help locate this request"
 userapp_error_page.ui.copy: "Copy"
@@ -265,6 +266,9 @@ error.dev_container_unreachable: "The dev container is temporarily unreachable. 
 
 userapp_error_page.restarting.title: "Application service is restarting"
 userapp_error_page.restarting.message: "The application service is starting or restarting. Please try again shortly."
+
+userapp_error_page.provisioning.title: "Development environment is being prepared"
+userapp_error_page.provisioning.message: "The development environment for this app is still preparing its runtime resources. Please revisit shortly."
 
 # Ordinary Computer ownership conflict
 error.computer_owner_conflict: "The project compute ownership does not match this request. No message was sent."

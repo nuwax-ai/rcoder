@@ -77,10 +77,10 @@ readiness、状态和资源查询只观察，不启动或重建容器，也不�
 `GET /api/v1/userapp/{app_id}/{app_stage}/readiness?user_id={user_id}` 回答"当前实例声明的服务集合 + Pingap 入口是否满足健康契约"——与容器探针（`/health`、`/ready`）分离。要点：
 
 - `user_id` 为当前接口必填的调用方参数；实例仍按 `app_id` 与 `app_stage` 定位，不按用户 ID 隔离或选择实例。调用方需显式传参。
-- 查询成功恒 200，**`data.ready` 才表示业务可用**；`status` 覆盖 `not_deployed/starting/stopping/stopped/ready/degraded/failed/unknown/unsupported`，`reason_code` 为结构化原因，`services[]` 为各服务明细、`proxy` 为入口与生效配置观察。
-- dev/prod 按当前实际容器或 Pod 分别观察，查询前后复核实例及控制意图；已停止返回 `stopped`，创建中返回 `starting`，真正缺少部署才返回 `not_deployed`。整个查询限时 8 秒，预算耗尽返回 `unknown/OBSERVE_INCOMPLETE`，可稍后重查。
+- 查询成功恒 200，**`data.ready` 才表示业务可用**；`status` 覆盖 `not_deployed/provisioning/starting/stopping/stopped/ready/degraded/failed/unknown/unsupported`，`reason_code` 为结构化原因，`services[]` 为各服务明细、`proxy` 为入口与生效配置观察。
+- dev/prod 按当前实际容器或 Pod 分别观察，查询前后复核实例及控制意图；已停止返回 `stopped`，dev 计算资源申请/接管中返回 `provisioning`（只出现在 dev：平台在准备 builder，业务快照尚未产生），业务编排启动中返回 `starting`，真正缺少部署才返回 `not_deployed`。整个查询限时 8 秒，预算耗尽返回 `unknown/OBSERVE_INCOMPLETE`，可稍后重查。
 - **只读保证**：查询不启动/唤醒/停止任何服务、不刷新闲置计时、不阻塞 Stop/Restart；停止中的实例返回 `stopping`，旧运行时无新接口返回 `unsupported`。
-- 调用方（界面/Java）建议：显式启动后轮询（间隔 ≥2s、不重叠）；`starting` 显示等待、`ready` 打开预览、`failed` 给出日志入口；`ready=false` 不是接口调用失败；离开页面停止轮询（轮询不会取消实际部署）。完整字段以运行时 OpenAPI（`/api/docs`）为准。
+- 调用方（界面/Java）建议：显式启动后轮询（间隔 ≥2s、不重叠）；`provisioning` 与 `starting` 同属等待态，继续轮询即可（业务快照一旦出现，`provisioning` 即让位给 `not_deployed`/`ready` 等真实状态）；`ready` 打开预览、`failed` 给出日志入口；`ready=false` 不是接口调用失败；离开页面停止轮询（轮询不会取消实际部署）。完整字段以运行时 OpenAPI（`/api/docs`）为准。
 
 ### DBX 界面就绪查询（只读）
 
