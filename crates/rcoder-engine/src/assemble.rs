@@ -247,9 +247,15 @@ pub async fn assemble(
     // 60000 file-server 分流反代（Java/外部入口，独立 crate file-server-proxy）：
     // x-service-type: userapp → 本主服务（8086），其余 → TS nuwax-file-server（60001）。
     // 配置无条件注册（段缺失时兜底默认端口但 rust 上游对准本服务实际端口，
-    // 供运行时 `rcoder file-server start` 拉起）；段存在或 host 部署时自动启动。
-    // host 无显式段时使用 loopback:60000 / AllRust。运行时启停经
-    // /api/system/file-server/*（`rcoder file-server {start,stop,restart,status}`）。
+    // 供运行时 `rcoder file-server start` 拉起）；注册成功即自动启动。
+    // 段缺失的兜底：容器形态 0.0.0.0:60000 / ts_first（镜像内 start-services.sh
+    // 恒把 TS 起在 60001——老配置用户仅 `docker compose pull` 升镜像，60000 文件
+    // 入口（Java fileServerPort 对接面）也保持可用；2026-10-20 docker-computer
+    // 交付目录漏配段致 Connection refused 的治本）；host 形态仍收敛
+    // loopback:60000 / AllRust。收紧通道：config 显式段、
+    // FILE_SERVER_PROXY_PUBLIC_BIND=false 或 FILE_SERVER_PROXY_TOKEN。
+    // 运行时启停经 /api/system/file-server/*
+    // （`rcoder file-server {start,stop,restart,status}`）。
     // 预览协调启用时：dev 生命周期 7 端点在所有策略下改路 Rust 上游（coordinated_dev_lifecycle）。
     // env 显式值优先于 config。拒绝结果也注册到代理，确保之后的管理
     // start/restart 返回同一配置错误，不旁路成默认公开监听。
@@ -268,10 +274,9 @@ pub async fn assemble(
             false
         }
     };
-    if proxy_registered
-        && (bootstrap_result.config.file_server_proxy.is_some() || shared_types::is_deploy_host())
-    {
-        // 同步 bind 语义：启动失败（如端口被占）此刻即报，不留到首个请求
+    if proxy_registered {
+        // 同步 bind 语义：启动失败（如端口被占）此刻即报，不留到首个请求；
+        // 失败不阻断主服务（文件入口降级可见于本日志与 /proxy/status）
         if let Err(e) = file_server_proxy::try_start().await {
             error!("file-server 分流代理启动失败: {e}");
         }
