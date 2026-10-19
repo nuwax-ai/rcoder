@@ -301,11 +301,8 @@ async fn source_cancelled_after_preflight(state: &ServerState, signal: &ControlS
 fn restore_running_predecessor(state: &ServerState, ready: bool) {
     let protected = state.runtime_recovery_hold_active()
         || state
-            .deploy_status()
-            .operation
-            .as_ref()
-            .and_then(|operation| operation.recovery.as_ref())
-            .is_some_and(|recovery| recovery.status == "pending");
+            .shutdown_unconfirmed
+            .load(std::sync::atomic::Ordering::Acquire);
     if !protected && !state.is_cancelled() {
         state.set_phase(ServerPhase::Running);
         state.ready.set_ready(ready);
@@ -2069,5 +2066,80 @@ mod lifecycle_tests {
         let _ = task.await;
         business.kill().await.unwrap();
         business.wait().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod predecessor_restoration_tests {
+    use super::*;
+
+    fn predecessor() -> ServerState {
+        let state = ServerState::new(RuntimeStatusService::default());
+        state
+            .try_accept_deploy_with_id(
+                DeployRequest {
+                    runtime_operation_id: None,
+                    url: "https://example.invalid/previous.zip".into(),
+                    release_id: "previous-request".into(),
+                    sha256: None,
+                    local_path: None,
+                    execution_target: None,
+                    run_pg: None,
+                },
+                "previous-operation".into(),
+            )
+            .unwrap();
+        state.begin_failure("retained previous startup diagnostic".into(), false);
+        state
+            .deploy_status
+            .write()
+            .unwrap()
+            .operation
+            .as_mut()
+            .unwrap()
+            .recovery = Some(shared_types::AppDeploymentRecovery {
+            status: "pending".into(),
+            error: Some("old diagnostic, not current execution".into()),
+            database_migrations_reversed: false,
+        });
+        state.set_phase(ServerPhase::Orchestrating);
+        state
+    }
+
+    #[test]
+    fn old_recovery_diagnostic_does_not_hide_a_healthy_predecessor() {
+        let state = predecessor();
+        let original = serde_json::to_value(state.deploy_status().operation).unwrap();
+        restore_running_predecessor(&state, true);
+        assert!(matches!(state.phase(), ServerPhase::Running));
+        assert!(state.ready.is_ready());
+        assert!(state.readiness_ok());
+        assert_eq!(
+            serde_json::to_value(state.deploy_status().operation).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn current_hold_shutdown_and_cancel_still_protect_the_predecessor() {
+        for protected in ["outcome-hold", "shutdown-unconfirmed", "cancelled"] {
+            let state = predecessor();
+            match protected {
+                "outcome-hold" => state.begin_runtime_recovery_hold(),
+                "shutdown-unconfirmed" => {
+                    state.begin_failure("current shutdown is unconfirmed".into(), true);
+                }
+                "cancelled" => state.trigger_cancel(),
+                _ => unreachable!("fixture variant"),
+            }
+            let original = serde_json::to_value(state.deploy_status().operation).unwrap();
+            restore_running_predecessor(&state, true);
+            assert!(matches!(state.phase(), ServerPhase::Orchestrating));
+            assert!(!state.ready.is_ready());
+            assert_eq!(
+                serde_json::to_value(state.deploy_status().operation).unwrap(),
+                original
+            );
+        }
     }
 }

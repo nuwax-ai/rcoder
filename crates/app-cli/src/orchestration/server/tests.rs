@@ -2462,4 +2462,278 @@ format = "jsonl"
             "owner must be re-acquirable after the previous session exits"
         );
     }
+    mod startup_failed_restoration {
+        use super::*;
+
+        struct Fixture {
+            _directory: tempfile::TempDir,
+            workspace: std::path::PathBuf,
+            record_path: std::path::PathBuf,
+        }
+
+        impl Fixture {
+            fn new(quiescent: bool) -> Self {
+                let directory = tempfile::tempdir().unwrap();
+                let workspace = directory.path().join("code");
+                std::fs::create_dir(&workspace).unwrap();
+                let artifact = release("confirmed-artifact");
+                std::fs::write(
+                    workspace.join("release.lock.toml"),
+                    toml::to_string(&artifact).unwrap(),
+                )
+                .unwrap();
+                let first = state();
+                first.set_generation("original-deployment".into());
+                let journal = Journal::open(&workspace).unwrap();
+                assert!(std::env::var_os("APP_CLI_STATE_ROOT").is_none());
+                let record_path = directory.path().join(".deploy-operation.json");
+                *first.journal.lock().unwrap() = Some(journal);
+                first
+                    .try_accept_deploy_with_id(request(), "original-operation".into())
+                    .unwrap();
+                first
+                    .record_prepared_artifact(artifact.release_id.clone())
+                    .unwrap();
+                first.set_release(artifact);
+                first.complete_stage().unwrap();
+                first
+                    .fail_operation(
+                        "original startup was interrupted".into(),
+                        Boundary::StartupFailed,
+                    )
+                    .unwrap();
+                {
+                    let mut guard = first.journal.lock().unwrap();
+                    let journal = guard.as_mut().unwrap();
+                    journal.commit_coordinator().unwrap();
+                    if quiescent {
+                        journal.commit_quiescent().unwrap();
+                    }
+                }
+                drop(first);
+                let mut raw: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+                raw["future_history_extension"] = serde_json::json!({"keep": "original bytes"});
+                std::fs::write(&record_path, serde_json::to_vec(&raw).unwrap()).unwrap();
+                Self {
+                    _directory: directory,
+                    workspace,
+                    record_path,
+                }
+            }
+
+            fn reopen(&self) -> ServerState {
+                let restarted = state();
+                restarted.set_generation("original-deployment".into());
+                *restarted.journal.lock().unwrap() = Some(Journal::open(&self.workspace).unwrap());
+                restarted
+            }
+
+            fn args(&self) -> RuntimeArgs {
+                RuntimeArgs {
+                    workspace: self.workspace.clone(),
+                    ..Default::default()
+                }
+            }
+
+            fn record(&self) -> serde_json::Value {
+                serde_json::from_slice(&std::fs::read(&self.record_path).unwrap()).unwrap()
+            }
+
+            async fn initialize(&self, restarted: &ServerState) {
+                assert!(matches!(
+                    initialize_startup(&self.args(), restarted).await.unwrap(),
+                    Some(InitialAction::Existing { .. })
+                ));
+                assert_eq!(
+                    restarted.release().unwrap().release_id,
+                    "confirmed-artifact"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn healthy_existing_artifact_restores_without_rewriting_failed_attempt() {
+            use tower::ServiceExt as _;
+
+            for (recovery_field_present, recovery) in [
+                (true, None),
+                (false, None),
+                (true, Some("pending")),
+                (true, Some("legacy-unknown-diagnostic")),
+                (true, Some("failed")),
+                (true, Some("restored")),
+            ] {
+                let fixture = Fixture::new(true);
+                let mut original = fixture.record();
+                if !recovery_field_present {
+                    original["operation"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("recovery");
+                }
+                if let Some(status) = recovery {
+                    original["operation"]["recovery"] = serde_json::json!({
+                        "status": status,
+                        "error": "retained previous recovery diagnostic",
+                        "database_migrations_reversed": false,
+                        "future_recovery_extension": "keep original diagnostic"
+                    });
+                }
+                original["deploy_replays"]["original-operation"]["operation"] =
+                    original["operation"].clone();
+                std::fs::write(&fixture.record_path, serde_json::to_vec(&original).unwrap())
+                    .unwrap();
+                let mut expected = original.clone();
+                if !recovery_field_present {
+                    // The existing typed schema represents an absent optional
+                    // diagnostic as null when committing the updated boundary.
+                    expected["operation"]["recovery"] = serde_json::Value::Null;
+                    expected["deploy_replays"]["original-operation"]["operation"]["recovery"] =
+                        serde_json::Value::Null;
+                }
+                for iteration in 0..2 {
+                    let restarted = Arc::new(fixture.reopen());
+                    fixture.initialize(&restarted).await;
+                    // Both orchestration engines publish this current health
+                    // observation before notifying the server's commit path.
+                    restarted.ready.set_ready(true);
+                    restarted.complete_running().unwrap();
+                    assert!(matches!(restarted.phase(), ServerPhase::Running));
+                    assert!(restarted.ready.is_ready());
+                    restarted.mark_initialized();
+                    let router = crate::api::bound_router(
+                        fixture.workspace.clone(),
+                        fixture.workspace.join("logs"),
+                        "unused-fixture-pingap".into(),
+                        restarted.clone(),
+                    );
+                    let ready = router
+                        .oneshot(
+                            axum::http::Request::builder()
+                                .uri("/ready")
+                                .body(axum::body::Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(ready.status(), axum::http::StatusCode::OK);
+                    let response: serde_json::Value = serde_json::from_slice(
+                        &axum::body::to_bytes(ready.into_body(), 4096).await.unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(response["phase"], ServerPhase::Running.as_str());
+                    assert_eq!(response["status"], "ready");
+                    let restored = fixture.record();
+                    assert_eq!(restored["boundary"], "restored_active");
+                    assert_eq!(restored["operation"], expected["operation"]);
+                    assert_eq!(restored["deploy_replays"], expected["deploy_replays"]);
+                    assert_eq!(restored["active"], original["active"]);
+                    assert_eq!(
+                        restored["future_history_extension"],
+                        original["future_history_extension"]
+                    );
+                    if iteration == 1 {
+                        assert!(matches!(
+                            restarted
+                                .try_accept_deploy_with_id(
+                                    request(),
+                                    "new-explicit-deployment".into(),
+                                )
+                                .unwrap(),
+                            DeployAdmission::Accepted
+                        ));
+                        assert_eq!(
+                            fixture.record()["deploy_replays"]["original-operation"],
+                            expected["deploy_replays"]["original-operation"]
+                        );
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn current_unhealthy_startup_and_unknown_writes_do_not_restore() {
+            for protected in ["not-ready", "outcome-hold", "shutdown-unconfirmed"] {
+                let fixture = Fixture::new(true);
+                let restarted = fixture.reopen();
+                fixture.initialize(&restarted).await;
+                if protected != "not-ready" {
+                    restarted.ready.set_ready(true);
+                }
+                if protected == "outcome-hold" {
+                    restarted.begin_runtime_recovery_hold();
+                    // A stale health publication cannot release an unknown write.
+                    restarted.ready.set_ready(true);
+                }
+                if protected == "shutdown-unconfirmed" {
+                    restarted.begin_failure("current stop has no completion evidence".into(), true);
+                    restarted.ready.set_ready(true);
+                }
+                let before = std::fs::read(&fixture.record_path).unwrap();
+                assert!(restarted.complete_running().is_err(), "{protected}");
+                assert_eq!(std::fs::read(&fixture.record_path).unwrap(), before);
+                assert!(!matches!(restarted.phase(), ServerPhase::Running));
+            }
+        }
+
+        #[tokio::test]
+        async fn same_scope_without_confirmed_cleanup_cannot_resume() {
+            let fixture = Fixture::new(false);
+            let before = std::fs::read(&fixture.record_path).unwrap();
+            let restarted = fixture.reopen();
+            assert!(
+                initialize_startup(&fixture.args(), &restarted)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(matches!(restarted.phase(), ServerPhase::Failed(_)));
+            assert!(!restarted.ready.is_ready());
+            assert_eq!(std::fs::read(&fixture.record_path).unwrap(), before);
+        }
+
+        #[tokio::test]
+        async fn different_artifact_cannot_become_the_confirmed_active_version() {
+            let fixture = Fixture::new(true);
+            std::fs::write(
+                fixture.workspace.join("release.lock.toml"),
+                toml::to_string(&release("different-artifact")).unwrap(),
+            )
+            .unwrap();
+            let before = std::fs::read(&fixture.record_path).unwrap();
+            let restarted = fixture.reopen();
+            assert!(
+                initialize_startup(&fixture.args(), &restarted)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&fixture.record_path).unwrap(), before);
+        }
+
+        #[tokio::test]
+        async fn changed_generation_or_operation_cannot_commit_a_stale_restoration() {
+            for changed in ["generation", "operation"] {
+                let fixture = Fixture::new(true);
+                let restarted = fixture.reopen();
+                fixture.initialize(&restarted).await;
+                restarted.ready.set_ready(true);
+                if changed == "generation" {
+                    restarted.set_generation("different-deployment".into());
+                } else {
+                    restarted
+                        .deploy_status
+                        .write()
+                        .unwrap()
+                        .operation
+                        .as_mut()
+                        .unwrap()
+                        .operation_id = "different-operation".into();
+                }
+                let before = std::fs::read(&fixture.record_path).unwrap();
+                assert!(restarted.complete_running().is_err(), "{changed}");
+                assert_eq!(std::fs::read(&fixture.record_path).unwrap(), before);
+            }
+        }
+    }
 }

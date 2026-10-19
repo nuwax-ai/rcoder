@@ -827,12 +827,11 @@ impl ServerState {
     pub(super) fn set_phase_locked(&self, phase: ServerPhase) {
         // Ordinary runtime transitions cannot prove that an unconfirmed writer
         // stopped. Keep admission closed until explicit shutdown reconciliation.
+        // A resumed journal retains the old recovery diagnostic verbatim.
+        // Only this execution's unconfirmed shutdown freezes its transitions.
         if self
-            .deploy_status()
-            .operation
-            .as_ref()
-            .and_then(|operation| operation.recovery.as_ref())
-            .is_some_and(|status| status.status == "pending")
+            .shutdown_unconfirmed
+            .load(std::sync::atomic::Ordering::Acquire)
         {
             return;
         }
@@ -1549,15 +1548,28 @@ impl ServerState {
                 .active
                 .as_ref()
                 .context("restored artifact missing")?;
+            let eligible = match receipt.boundary {
+                Boundary::Preparing | Boundary::Switching | Boundary::RestoredActive => true,
+                Boundary::StartupFailed => {
+                    // initialize_startup admits this existing artifact only
+                    // after confirming its identity and prior execution cleanup.
+                    // Both engines publish current readiness before this commit;
+                    // that recovery restores availability, not the failed result.
+                    self.ready.is_ready()
+                        && !self.runtime_recovery_hold_active()
+                        && !self
+                            .shutdown_unconfirmed
+                            .load(std::sync::atomic::Ordering::Acquire)
+                }
+                Boundary::Activated | Boundary::Active | Boundary::Failed => false,
+            };
             anyhow::ensure!(
-                matches!(
-                    receipt.boundary,
-                    Boundary::Preparing | Boundary::Switching | Boundary::RestoredActive
-                ) && operation.phase == AppCliDeployPhase::Failed
+                eligible
+                    && operation.phase == AppCliDeployPhase::Failed
                     && self
                         .release()
                         .is_some_and(|release| release.release_id == active.artifact_release_id),
-                "restoration requires the confirmed previous artifact and failed preparation"
+                "restoration requires a confirmed active artifact, a failed attempt and a settled healthy startup"
             );
         }
         receipt.boundary = boundary.clone();
