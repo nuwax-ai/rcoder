@@ -321,6 +321,58 @@ async fn public_workspace_creation_waits_for_another_process_directory_lock() {
 }
 
 #[tokio::test]
+async fn sync_agents_respects_external_directory_lock() {
+    // OS 锁被外部持有 (未经本进程 registry 的原始 flock, 模拟另一 Main 副本):
+    // sync_agents_with_wait 必须 busy 跳过而非并发执行; 释放后完成并收敛。
+    // 跨进程锁文件与 create_workspace 共用同一把 (`.agents/.skill-preservation.lock`),
+    // 其跨进程正确性由上方 child fixture 用例证明, 这里验证 sync 路径遵守同一把锁。
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("workspace");
+    let skill = root.join(".agents/skills/skill-a");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(skill.join("SKILL.md"), b"a").unwrap();
+    let lock = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(".agents/.skill-preservation.lock"))
+        .unwrap();
+    lock.try_lock().expect("seed external lock holder");
+
+    let busy = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::service::skills::sync_agents_with_wait(&root, Duration::from_millis(150)),
+    )
+    .await
+    .expect("busy path bounded by wait window")
+    .unwrap();
+    assert_eq!(
+        busy,
+        crate::service::skills::SyncAgentsOutcome::BusySkipped,
+        "external holder must force BusySkipped"
+    );
+    assert!(
+        !root.join(".claude").exists(),
+        "busy skip must not touch fan-out targets"
+    );
+
+    drop(lock);
+    let done = tokio::time::timeout(
+        Duration::from_secs(10),
+        crate::service::skills::sync_agents_with_wait(&root, Duration::from_secs(5)),
+    )
+    .await
+    .expect("completes after release")
+    .unwrap();
+    assert_eq!(done, crate::service::skills::SyncAgentsOutcome::Completed);
+    assert_eq!(
+        std::fs::read(root.join(".claude/skills/skill-a/SKILL.md")).unwrap(),
+        b"a"
+    );
+}
+
+#[tokio::test]
 async fn public_workspace_creation_completes_with_one_tokio_blocking_slot() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("workspace");

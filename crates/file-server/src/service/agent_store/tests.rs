@@ -990,4 +990,136 @@ mod cases {
         );
         assert!(!user_root.join(".agent-store").exists(), "store 不得被创建");
     }
+
+    #[tokio::test]
+    async fn view_managed_workspace_targets_survive_legacy_sync_agents() {
+        // 生产回归反例 (2026-10-19): 启动 reconciler 的 legacy fan-out 曾把视图
+        // 内链 `.claude/skills` unlink 后实体化覆盖 (remove_dir_all 对 symlink 只删
+        // 链本身)。修复后 fan-out 必须跳过链接目标, 视图布局原样保留。
+        let tmp = tempfile::tempdir().unwrap();
+        let user_root = tmp.path().join("u1");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).await.unwrap();
+        seed_agent_skill(&user_root, "agent-a", "alpha", false).await;
+        sync_shared_skill_view(
+            &user_root,
+            &workspace,
+            "agent-a",
+            "proj",
+            SharedSkillLists {
+                skills: Some(vec!["alpha".into()]),
+                subagents: Some(vec![]),
+            },
+        )
+        .await
+        .unwrap();
+        // 视图布局签名: .agents/skills 实体主目录 + 各 ACP 目录为内链
+        assert!(
+            !fs::symlink_metadata(workspace.join(".agents/skills"))
+                .await
+                .unwrap()
+                .is_symlink()
+        );
+        assert!(
+            fs::symlink_metadata(workspace.join(".claude/skills"))
+                .await
+                .unwrap()
+                .is_symlink()
+        );
+
+        crate::service::skills::sync_agents(&workspace)
+            .await
+            .unwrap();
+
+        for dir in [".claude", ".opencode", ".codex"] {
+            assert!(
+                fs::symlink_metadata(workspace.join(dir).join("skills"))
+                    .await
+                    .unwrap()
+                    .is_symlink(),
+                "view inner link {dir}/skills must survive legacy fan-out"
+            );
+        }
+        assert_eq!(
+            view_entry_names(&workspace, "skills").await,
+            vec!["alpha".to_string()],
+            "view master entries unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_workspace_with_agent_store_no_deadlock_and_mutual_exclusion() {
+        // create_workspace_with_agent_store 持工作区锁运行全程 (含 materialize 兜底
+        // 的持锁 fan-out), 与并发 sync_agents 必须都完成且无重入死锁, 链接布局不被
+        // fan-out 毁坏
+        let tmp = tempfile::tempdir().unwrap();
+        let user_root = tmp.path().join("u1");
+        let ws = user_root.join("c1");
+        seed_agent_skill(&user_root, "agent-1", "alpha", false).await;
+
+        let create = {
+            let user_root = user_root.clone();
+            let ws = ws.clone();
+            tokio::spawn(async move {
+                crate::service::computer_ws::create_workspace_with_agent_store(
+                    crate::service::computer_ws::CreateAgentStoreParams {
+                        user_root: &user_root,
+                        session_workspace: &ws,
+                        agent_id: "agent-1",
+                        skill_zip: None,
+                        skill_urls: Vec::new(),
+                        skill_url_map: None,
+                        skill_names: None,
+                        update_skill_names: None,
+                        hook_config: None,
+                        downloader: None,
+                        shared_project_id: None,
+                    },
+                )
+                .await
+            })
+        };
+        let sync = {
+            let ws = ws.clone();
+            tokio::spawn(async move {
+                crate::service::skills::sync_agents_with_wait(
+                    &ws,
+                    std::time::Duration::from_secs(10),
+                )
+                .await
+            })
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), create)
+            .await
+            .expect("create completes without deadlock")
+            .unwrap()
+            .unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), sync)
+            .await
+            .expect("sync completes without deadlock")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outcome,
+            crate::service::skills::SyncAgentsOutcome::Completed
+        );
+
+        // 链接布局完好 (create 的装配不被 fan-out 毁坏)
+        assert!(
+            fs::symlink_metadata(ws.join(".agents/skills"))
+                .await
+                .unwrap()
+                .is_symlink()
+        );
+        for dir in [".claude", ".opencode", ".codex"] {
+            assert!(
+                fs::symlink_metadata(ws.join(dir).join("skills"))
+                    .await
+                    .unwrap()
+                    .is_symlink(),
+                "{dir}/skills link layout must survive"
+            );
+        }
+    }
 }

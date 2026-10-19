@@ -471,7 +471,9 @@ async fn materialize_agent_store_by_copy(
     }
 
     // sync_agents fan-out (.agents → 各家 ACP 目录, 实体复制与 TS legacy 行为一致)
-    crate::service::skills::sync_agents(workspace).await?;
+    // 调用方 (link_workspace_to_agent_store) 的工作区链接装配均在 workspace_lock
+    // 内进行，这里走持锁执行体避免重复获取
+    crate::service::skills::sync_agents_locked(workspace).await?;
     Ok(())
 }
 
