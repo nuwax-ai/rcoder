@@ -5,23 +5,22 @@ pcmflux Audio Server for noVNC Remote Desktop
 This script captures audio from PulseAudio virtual sink and streams it
 to web browsers via WebSocket using Opus encoding.
 
-Based on: https://github.com/linuxserver/pcmflux
+Based on: https://github.com/linuxserver/pcmflux (2.x PyO3 API)
 """
 
 import asyncio
-import ctypes
 import mimetypes
 import os
 import websockets
 import websockets.asyncio.server as ws_async
 
-from pcmflux import AudioCapture, AudioCaptureSettings, AudioChunkCallback
+from pcmflux import AudioCapture, AudioCaptureSettings
 
 # --- Global Context for managing shared state across async tasks and threads. ---
 g_loop = None           # The main asyncio event loop.
 g_settings = None       # The audio capture configuration.
-g_callback = None       # The C-compatible callback function pointer.
 g_module = None         # The pcmflux.AudioCapture module instance.
+g_capture_lock = None   # Serializes capture start/stop transitions.
 g_clients = set()       # A set of currently connected WebSocket clients.
 g_is_capturing = False  # A flag to track the audio capture state.
 g_audio_queue = None    # An asyncio.Queue for passing audio data between threads.
@@ -79,23 +78,48 @@ async def health_check(connection, request):
         return connection.respond(204, headers=[], body=b"")
     return None
 
-async def ws_handler(websocket, path=None):
+def on_audio_chunk(frame):
     """
-    Handles the lifecycle of each WebSocket client connection.
+    pcmflux 2.x capture callback (plain Python callable, invoked from the
+    native capture thread with an AudioFrame supporting the buffer protocol).
+
+    The frame carries raw Opus (see `omit_audio_header = True` in
+    main_async); the browser-facing 0x01 header is added by the broadcasting
+    task, keeping the wire protocol identical to the previous release.
     """
-    global g_clients, g_is_capturing, g_audio_queue, g_module, g_send_task
-    global g_settings, g_callback
+    global g_is_capturing, g_audio_queue, g_loop
 
-    # Register the new client.
-    g_clients.add(websocket)
-    print(f"Client connected: {websocket.remote_address}. "
-          f"Total clients: {len(g_clients)}")
+    if g_is_capturing and g_audio_queue is not None:
+        data = bytes(frame)
+        if data and g_loop and not g_loop.is_closed():
+            asyncio.run_coroutine_threadsafe(g_audio_queue.put(data), g_loop)
 
-    # If this is the first client, start the audio capture process.
-    if not g_is_capturing and g_module:
+async def ensure_capture_running():
+    """Start capture if clients exist and it is not running yet.
+
+    Serialized by g_capture_lock and re-checked after acquisition, so
+    concurrent first clients cannot double-start (the second pcmflux
+    start_capture while one is starting raises RuntimeError).
+    start_capture blocks up to ~2s waiting for the native capture thread
+    handshake, so it runs off the event loop.
+    """
+    global g_is_capturing, g_audio_queue, g_send_task
+
+    if g_is_capturing or not g_module or g_capture_lock is None:
+        return
+    async with g_capture_lock:
+        if g_is_capturing or not g_module:
+            return
         print("First client connected. Starting audio capture...")
         g_audio_queue = asyncio.Queue()
-        g_module.start_capture(g_settings, g_callback)
+        try:
+            await asyncio.to_thread(g_module.start_capture, g_settings, on_audio_chunk)
+        except Exception as e:
+            print(f"Audio capture failed to start: {e}")
+            if g_module.last_error:
+                print(f"pcmflux last_error: {g_module.last_error}")
+            g_audio_queue = None
+            raise
         g_is_capturing = True
 
         # Ensure the broadcasting task is running.
@@ -103,7 +127,52 @@ async def ws_handler(websocket, path=None):
             g_send_task = asyncio.create_task(send_audio_chunks())
         print("Audio capture process initiated.")
 
+
+async def maybe_stop_capture():
+    """Stop capture once the last client is gone.
+
+    Serialized by g_capture_lock and re-checked after acquisition: a client
+    that arrived while the stop was waiting on the lock keeps capture alive.
+    """
+    global g_is_capturing, g_audio_queue, g_send_task
+
+    if not g_is_capturing or not g_module or g_capture_lock is None:
+        return
+    async with g_capture_lock:
+        if not g_is_capturing or g_clients:
+            return
+        print("Last client disconnected. Stopping audio capture...")
+        # stop_capture joins the native thread; keep it off the event loop.
+        await asyncio.to_thread(g_module.stop_capture)
+        g_is_capturing = False
+        if g_send_task:
+            g_send_task.cancel()
+            g_send_task = None
+        g_audio_queue = None
+        print("Audio capture process stopped.")
+
+
+async def ws_handler(websocket, path=None):
+    """
+    Handles the lifecycle of each WebSocket client connection.
+    """
+    global g_clients
+
+    # Register the new client.
+    g_clients.add(websocket)
+    print(f"Client connected: {websocket.remote_address}. "
+          f"Total clients: {len(g_clients)}")
+
     try:
+        try:
+            await ensure_capture_running()
+        except Exception:
+            # Capture failed to start: drop this client with 1011; the
+            # browser reconnect logic will retry and later clients retry too.
+            g_clients.discard(websocket)
+            await websocket.close(code=1011, reason="audio capture failed")
+            return
+
         # Wait for messages from the client.
         async for _ in websocket:
             pass
@@ -116,32 +185,7 @@ async def ws_handler(websocket, path=None):
         print(f"Client disconnected. Remaining clients: {len(g_clients)}")
 
         # If this was the last client, stop the audio capture to save resources.
-        if g_is_capturing and not g_clients and g_module:
-            print("Last client disconnected. Stopping audio capture...")
-            g_module.stop_capture()
-            g_is_capturing = False
-            if g_send_task:
-                g_send_task.cancel()
-                g_send_task = None
-            g_audio_queue = None
-            print("Audio capture process stopped.")
-
-def py_audio_callback(result_ptr, user_data):
-    """
-    A C-style callback function that bridges the C++ and Python worlds.
-    """
-    global g_is_capturing, g_audio_queue, g_loop
-
-    if g_is_capturing and result_ptr and g_audio_queue is not None:
-        result = result_ptr.contents
-        if result.data and result.size > 0:
-            data_bytes = bytes(ctypes.cast(
-                result.data, ctypes.POINTER(ctypes.c_ubyte * result.size)
-            ).contents)
-
-            if g_loop and not g_loop.is_closed():
-                asyncio.run_coroutine_threadsafe(
-                    g_audio_queue.put(data_bytes), g_loop)
+        await maybe_stop_capture()
 
 async def handle_http_request(reader, writer):
     """Handle HTTP requests by serving static files."""
@@ -196,9 +240,10 @@ async def handle_http_request(reader, writer):
 
 async def main_async():
     """The main routine to initialize and run the servers."""
-    global g_loop, g_settings, g_callback, g_module
+    global g_loop, g_settings, g_module, g_capture_lock
 
     g_loop = asyncio.get_running_loop()
+    g_capture_lock = asyncio.Lock()
 
     # --- Configure Audio Capture Parameters ---
     g_settings = AudioCaptureSettings()
@@ -211,10 +256,15 @@ async def main_async():
     g_settings.use_vbr = True
     g_settings.use_silence_gate = True  # Skip silent audio to save bandwidth
     g_settings.debug_logging = False
+    # Wire-protocol compatibility: pcmflux 2.x frames carry a 2-byte
+    # [0x01, flags] header by default; both browser players
+    # (audio_static/index.html and the noVNC audio.js) strip exactly ONE
+    # leading 0x01 byte before handing the payload to the Opus decoder.
+    # Request raw Opus chunks and keep adding the 1-byte header in
+    # send_audio_chunks, so the protocol stays byte-identical.
+    g_settings.omit_audio_header = True
     # --- End Configuration ---
 
-    # Create the C-compatible callback object.
-    g_callback = AudioChunkCallback(py_audio_callback)
     g_module = AudioCapture()
     print("pcmflux audio capture module initialized.")
     print(f"Audio device: {AUDIO_DEVICE}")
@@ -244,7 +294,7 @@ async def main_async():
         # Perform a graceful shutdown.
         print("\nShutting down...")
         if g_is_capturing and g_module:
-            g_module.stop_capture()
+            await asyncio.to_thread(g_module.stop_capture)
         if g_send_task:
             g_send_task.cancel()
         if ws_server:
