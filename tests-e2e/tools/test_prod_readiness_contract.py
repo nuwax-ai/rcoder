@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import tempfile
 from types import SimpleNamespace
 import tomllib
@@ -114,6 +115,127 @@ class InputContracts(unittest.TestCase):
         self.assertFalse(contract.declaration_matches(['APP_DEPLOY_OPERATION_ID=cold-A',
                          'APP_DEPLOY_GENERATION_ID=native-session'], expected))
         self.assertFalse(contract.declaration_matches(['APP_DEPLOY_OPERATION_ID=cold-A'], expected))
+
+
+class ReviewedDriverContracts(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.producer, self.driver = self.root / 'producer', self.root / 'driver'
+        self.names = sorted([*contract.REVIEWED_DRIVER_PATHS, 'Cargo.lock', 'crates/example.rs',
+                             'docker/config.yml', 'tests-e2e/tools/another.py'])
+        for name in self.names:
+            path = self.producer / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('original ' + name)
+            path.chmod(0o644)
+        shutil.copytree(self.producer, self.driver)
+        self.producer_manifest, self.driver_manifest = self.root / 'producer.json', self.root / 'driver.json'
+        for manifest in (self.producer_manifest, self.driver_manifest):
+            manifest.write_text(json.dumps(dict.fromkeys(self.names, {})))
+        environment = patch.dict(os.environ, {'E2E_INPUT_MANIFEST': str(self.driver_manifest),
+                                             'E2E_ORIGIN_HEAD': 'new-driver-head'})
+        environment.start()
+        self.addCleanup(environment.stop)
+        source = contract.source_identity(self.producer, self.producer_manifest, origin_head='product-head')
+        self.build = {'version': 1, 'source': source,
+                      'rcoder': {'image_id': 'sha256:' + 'a' * 64, 'binary_sha256': 'b' * 64},
+                      'runtime': {'image_id': 'sha256:' + 'c' * 64, 'app_cli_sha256': 'd' * 64}}
+
+    def validate(self):
+        return contract.validate_build_for_driver(self.build, contract.source_identity(self.driver), self.driver,
+                                                  self.producer, self.producer_manifest)
+
+    def test_original_v1_stays_strict_and_reviewed_test_only_changes_have_two_real_identities(self):
+        original = copy.deepcopy(self.build)
+        self.assertEqual(contract.validate_build_for_driver(self.build, self.build['source'], self.producer)['kind'], 'same-source')
+        with self.assertRaisesRegex(ValueError, 'frozen source'):
+            contract.validate_build_for_driver(self.build, contract.source_identity(self.driver), self.driver)
+        for name in contract.REVIEWED_DRIVER_PATHS:
+            (self.driver / name).write_text('reviewed test correction ' + name)
+        proof = self.validate()
+        self.assertEqual(proof['producer_source'], self.build['source'])
+        self.assertEqual(proof['producer_source']['origin_head'], 'product-head')
+        self.assertEqual(proof['driver_source']['origin_head'], 'new-driver-head')
+        self.assertNotEqual(proof['producer_source'], proof['driver_source'])
+        self.assertEqual(set(proof['changed_paths']), contract.REVIEWED_DRIVER_PATHS)
+        self.assertTrue(proof['all_other_input_bytes_types_modes_equal'])
+        self.assertEqual(self.build, original)
+
+    def test_incomplete_parameters_and_wrong_producer_are_rejected(self):
+        driver = contract.source_identity(self.driver)
+        for directory, manifest in ((self.producer, None), (None, self.producer_manifest)):
+            with self.assertRaisesRegex(ValueError, 'together'):
+                contract.validate_build_for_driver(self.build, driver, self.driver, directory, manifest)
+        with patch.dict(os.environ, {'E2E_INPUT_MANIFEST': ''}):
+            with self.assertRaisesRegex(ValueError, 'frozen driver'):
+                contract.validate_build_for_driver(self.build, driver, self.driver,
+                                                   self.producer, self.producer_manifest)
+        self.build['source']['origin_head'] = ''
+        with self.assertRaisesRegex(ValueError, 'origin head'):
+            self.validate()
+
+    def test_producer_tamper_missing_inputs_and_binary_receipts_cannot_pass(self):
+        path = self.producer / 'Cargo.lock'
+        original = path.read_bytes()
+        path.write_text('changed producer')
+        with self.assertRaisesRegex(ValueError, 'frozen source'):
+            self.validate()
+        path.unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.validate()
+        path.write_bytes(original)
+        self.build['runtime']['app_cli_sha256'] = 'not-a-hash'
+        with self.assertRaisesRegex(ValueError, 'binary identity'):
+            self.validate()
+
+    def test_unreviewed_product_or_third_test_changes_and_path_set_changes_fail(self):
+        for name in ('Cargo.lock', 'crates/example.rs', 'docker/config.yml', 'tests-e2e/tools/another.py'):
+            with self.subTest(name=name):
+                path = self.driver / name
+                original = path.read_bytes()
+                path.write_text('unreviewed change')
+                with self.assertRaisesRegex(ValueError, 'unreviewed'):
+                    self.validate()
+                path.write_bytes(original)
+        for names in (self.names[:-1], [*self.names, 'extra.py']):
+            self.driver_manifest.write_text(json.dumps(dict.fromkeys(names, {})))
+            (self.driver / 'extra.py').write_text('extra')
+            with self.assertRaisesRegex(ValueError, 'path sets differ'):
+                self.validate()
+
+    def test_mode_type_and_escaping_parent_cannot_be_reviewed_away(self):
+        path = self.driver / 'tests-e2e/tools/prod_readiness_contract.py'
+        path.chmod(0o755)
+        with self.assertRaisesRegex(ValueError, 'type or mode'):
+            self.validate()
+        path.chmod(0o644)
+        path.unlink()
+        path.symlink_to(self.producer / 'tests-e2e/tools/prod_readiness_contract.py')
+        with self.assertRaisesRegex(ValueError, 'type or mode'):
+            self.validate()
+        path.unlink()
+        path.write_text('restored')
+        shutil.rmtree(self.driver / 'crates')
+        (self.driver / 'crates').symlink_to(self.producer / 'crates', target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, 'real source directory'):
+            self.validate()
+        self.driver_manifest.write_text(json.dumps({'../outside': {}}))
+        with self.assertRaisesRegex(ValueError, 'escapes'):
+            self.validate()
+
+    def test_prepare_rechecks_after_preflight_before_any_side_effect(self):
+        self.validate()
+        source = contract.source_identity(self.driver)
+        (self.driver / 'docker/config.yml').write_text('changed after preflight')
+        destination = self.root / 'must-not-be-created'
+        with patch.object(contract, 'run') as docker:
+            with self.assertRaisesRegex(ValueError, 'driver source changed'):
+                contract.prepare_controller(destination, self.driver, self.build, source,
+                    'run', 'case', 'app', 'private-key', self.producer, self.producer_manifest)
+            docker.assert_not_called()
+        self.assertFalse(destination.exists())
 
 
 class FormalReadOnlyQueryContracts(unittest.TestCase):
@@ -437,6 +559,33 @@ class StartupFailedRestoreContracts(unittest.TestCase):
             mutate(changed)
             self.assertFalse(contract.startup_history_preserved(before, changed))
 
+    def test_natural_failure_requires_exact_failed_receipt_exited_worker_and_no_current_hold(self):
+        before = self.receipt()
+        status = {'observed': 'stopped', 'recovery_protection': False, 'active_operation_id': None}
+        exited = {'original_process_exited': True}
+        self.assertTrue(contract.startup_failure_settled(before, status, exited, 'deploy-A', 'artifact-A'))
+        for changed in (dict(status, observed='ready'), dict(status, recovery_protection=True),
+                        dict(status, active_operation_id='current-op'), {}):
+            self.assertFalse(contract.startup_failure_settled(before, changed, exited, 'deploy-A', 'artifact-A'))
+        self.assertFalse(contract.startup_failure_settled(before, status, {}, 'deploy-A', 'artifact-A'))
+        self.assertFalse(contract.startup_failure_settled(before, status, exited, 'other', 'artifact-A'))
+        self.assertTrue(contract.startup_history_preserved(before, copy.deepcopy(before), boundary='startup_failed'))
+
+    def test_only_explicit_initializing_is_a_pending_status_observation(self):
+        fixture = contract.Contract(SimpleNamespace(), {'checks': []}, 'ownedfixture')
+        for envelope, pending in (({'success': False, 'code': 'ERR_INITIALIZING'}, True),
+                                  ({'success': False, 'code': 'ERR_BACKEND_ERROR'}, False),
+                                  ({'success': True, 'code': 'ERR_INITIALIZING'}, False)):
+            with patch.object(fixture, 'execute', return_value=json.dumps(envelope)):
+                if pending:
+                    self.assertIsNone(fixture.runtime_json('owned', '/v1/runtime/status', initializing_is_pending=True))
+                else:
+                    with self.assertRaises(RuntimeError):
+                        fixture.runtime_json('owned', '/v1/runtime/status', initializing_is_pending=True)
+        with patch.object(fixture, 'execute', side_effect=OSError('unreadable')):
+            with self.assertRaises(OSError):
+                fixture.runtime_json('owned', '/v1/runtime/status', initializing_is_pending=True)
+
     def test_waiting_barrier_needs_exact_original_operation_and_live_worker_503(self):
         operation = copy.deepcopy(self.receipt()['operation'])
         operation.update(phase='orchestrating', error=None)
@@ -479,6 +628,9 @@ class StartupFailedRestoreContracts(unittest.TestCase):
                 worker = next(row for row in lock['services'] if row['service_id'] == 'hold-worker')
                 self.assertEqual(worker['kind'], 'worker')
                 self.assertEqual(worker['health']['startup_probe'], 'http')
+                self.assertEqual(worker['health']['startup_timeout_seconds'], 30)
+                project = tomllib.loads(archive.read('hold-worker/project.manifest.toml').decode())
+                self.assertEqual(project['health']['startup_timeout_seconds'], 30)
                 self.assertEqual(worker['env']['READY_FILE'], gate)
                 self.assertTrue(gate.startswith('/home/user/data/'))
                 compile(archive.read('hold-worker/main.py'), 'hold-worker/main.py', 'exec')

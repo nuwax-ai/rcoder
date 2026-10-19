@@ -24,6 +24,7 @@ import http.server
 import json
 import os
 import re
+import stat
 from pathlib import Path
 import subprocess
 import tempfile
@@ -105,12 +106,20 @@ def startup_failure_receipt(receipt, operation, release):
             and replay.get('operation') == view and bool(replay.get('fingerprint')))
 
 
-def startup_history_preserved(before, after):
+def startup_history_preserved(before, after, boundary='restored_active'):
     operation = (before.get('operation') or {}).get('operation_id')
-    return (bool(operation) and after.get('boundary') == 'restored_active'
+    return (bool(operation) and after.get('boundary') == boundary
             and all(before.get(key) == after.get(key) for key in ('generation', 'operation', 'request', 'active'))
             and (before.get('deploy_replays') or {}).get(operation)
                 == (after.get('deploy_replays') or {}).get(operation))
+
+
+def startup_failure_settled(receipt, status, worker_exit, operation, release):
+    return (startup_failure_receipt(receipt, operation, release)
+            and status.get('observed') == 'stopped'
+            and status.get('recovery_protection') is False
+            and not status.get('active_operation_id')
+            and worker_exit.get('original_process_exited') is True)
 
 
 def startup_waiting_observed(deploy, worker, operation, release, marker):
@@ -137,7 +146,7 @@ def retained_runtime_environment(raw_environment):
             for key, value in [entry.split('=', 1)] if key not in ONE_TIME_DEPLOY_ENV_KEYS}
 
 
-def source_identity(repo, input_manifest=None):
+def source_identity(repo, input_manifest=None, origin_head=None):
     """Match strict launcher input hashing, including snapshots without .git."""
     manifest = input_manifest or os.environ.get('E2E_INPUT_MANIFEST')
     if manifest:
@@ -145,7 +154,7 @@ def source_identity(repo, input_manifest=None):
         if not isinstance(entries, dict) or not entries:
             raise ValueError('frozen input manifest must be a nonempty mapping')
         names = sorted(entries)
-        head = os.environ.get('E2E_ORIGIN_HEAD')
+        head = origin_head or os.environ.get('E2E_ORIGIN_HEAD')
         if not head:
             raise ValueError('frozen snapshot requires E2E_ORIGIN_HEAD')
     else:
@@ -199,6 +208,82 @@ def validate_receipt(receipt, source):
     return receipt
 
 
+REVIEWED_DRIVER_PATHS = frozenset({
+    'tests-e2e/tools/prod_readiness_contract.py',
+    'tests-e2e/tools/test_prod_readiness_contract.py',
+})
+
+
+def validate_build_for_driver(build, driver_source, repo, build_source_dir=None, build_input_manifest=None):
+    """Recompute a frozen producer and permit only the two reviewed test changes.
+
+    This never changes the v1 build receipt or accepts a caller-supplied proof.
+    Both entry points repeat this preflight before creating a control plane.
+    """
+    if not build_source_dir and not build_input_manifest:
+        validate_receipt(build, driver_source)
+        return {'kind': 'same-source', 'producer_source': build['source'], 'driver_source': driver_source}
+    if not build_source_dir or not build_input_manifest:
+        raise ValueError('build source directory and input manifest must be supplied together')
+    driver_manifest = os.environ.get('E2E_INPUT_MANIFEST')
+    if not driver_manifest:
+        raise ValueError('reviewed driver differences require a frozen driver input manifest')
+    producer = Path(build_source_dir).resolve()
+    repo = Path(repo).resolve()
+    head = (build.get('source') or {}).get('origin_head')
+    if not head:
+        raise ValueError('original build receipt requires its producer origin head')
+    def inputs(root, manifest):
+        entries = json.loads(Path(manifest).read_text())
+        if not isinstance(entries, dict) or not entries:
+            raise ValueError('frozen input manifest must be a nonempty mapping')
+        result = {}
+        for name in entries:
+            relative = Path(name)
+            if relative.is_absolute() or '..' in relative.parts or relative.as_posix() != name:
+                raise ValueError('input manifest path escapes source root or is not canonical')
+            path = root
+            for component in relative.parts[:-1]:
+                path = path / component
+                if not stat.S_ISDIR(path.lstat().st_mode):
+                    raise ValueError('input parent must be a real source directory')
+            path = root / relative
+            mode = path.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                kind, payload = 'symlink', os.fsencode(os.readlink(path))
+            elif stat.S_ISREG(mode):
+                kind, payload = 'file', path.read_bytes()
+            else:
+                raise ValueError('frozen input must be a file or symlink')
+            result[name] = (kind, stat.S_IMODE(mode), hashlib.sha256(payload).hexdigest())
+        return result
+
+    before, after = inputs(producer, build_input_manifest), inputs(repo, driver_manifest)
+    if before.keys() != after.keys():
+        raise ValueError('producer and driver input path sets differ')
+    producer_source = source_identity(producer, build_input_manifest, origin_head=head)
+    validate_receipt(build, producer_source)
+    if source_identity(repo, driver_manifest) != driver_source:
+        raise ValueError('driver source changed since preflight')
+    changes = []
+    for name in sorted(before):
+        previous, current = before[name], after[name]
+        if previous[:2] != current[:2]:
+            raise ValueError('producer and driver input type or mode differs: ' + name)
+        if previous[2] != current[2]:
+            if name not in REVIEWED_DRIVER_PATHS or current[0] != 'file':
+                raise ValueError('unreviewed producer and driver input differs: ' + name)
+            changes.append({'path': name, 'before_sha256': previous[2], 'after_sha256': current[2],
+                            'mode': current[1], 'type': current[0]})
+    return {'kind': 'reviewed-test-driver-difference', 'version': 1,
+            'producer_source': producer_source, 'driver_source': driver_source,
+            'producer_manifest_sha256': hashlib.sha256(Path(build_input_manifest).read_bytes()).hexdigest(),
+            'driver_manifest_sha256': hashlib.sha256(Path(driver_manifest).read_bytes()).hexdigest(),
+            'changed_paths': [change['path'] for change in changes], 'changes': changes,
+            'unchanged_input_count': len(before) - len(changes),
+            'all_other_input_bytes_types_modes_equal': True}
+
+
 
 def persist_ownership(root, receipt):
     path = Path(root) / 'ownership.json'
@@ -241,10 +326,11 @@ def controller_loopback_endpoints(row):
     return tuple(endpoints)
 
 
-def prepare_controller(root, repo, build, source, run_id, case_id, app_id, api_key=None):
+def prepare_controller(root, repo, build, source, run_id, case_id, app_id, api_key=None,
+                       build_source_dir=None, build_input_manifest=None):
     """Only a frozen, validated build may create a private control plane."""
     from turso_runtime_contract import isolated_config, service_config, wait_ready
-    validate_receipt(build, source)  # Before directory/ownership or Docker side effects.
+    proof = validate_build_for_driver(build, source, repo, build_source_dir, build_input_manifest)
     root = Path(root).resolve()
     if (root / 'ownership.json').exists():
         raise ValueError('owned fixture already exists; preserve the previous run')
@@ -253,7 +339,8 @@ def prepare_controller(root, repo, build, source, run_id, case_id, app_id, api_k
                'project': 'rcoder-prod-' + uuid.uuid4().hex[:16], 'app_id': app_id,
                'rcoder_image_id': build['rcoder']['image_id'], 'runtime_image_id': build['runtime']['image_id'],
                'controller_state': 'not_started', 'application_state': 'not_started',
-               'controller_id': None, 'application_containers': {}, 'source': source}
+               'controller_id': None, 'application_containers': {}, 'source': build['source'],
+               'driver_source': source, 'build_source_proof': proof}
     source_config = isolated_config((repo / 'docker/config.yml').read_text())
     if not api_key:
         raise ValueError('owned prod fixture requires its private authentication key')
@@ -506,7 +593,7 @@ shutdown_timeout_seconds = 2
 [services.health]
 startup_probe = "http"
 startup_path = "/health"
-startup_timeout_seconds = 120
+startup_timeout_seconds = 30
 [services.env]
 READY_FILE = {json.dumps(gate)}
 CONTRACT_MARKER = {json.dumps(marker)}
@@ -522,7 +609,7 @@ command=["python3","main.py"]
 [health]
 startup_probe="http"
 startup_path="/health"
-startup_timeout_seconds=120
+startup_timeout_seconds=30
 '''
     files['hold-worker/main.py'] = b'''import json,os
 from pathlib import Path
@@ -651,9 +738,13 @@ class Contract:
         self.inspect(cid)
         return run(['docker', 'exec', cid, *argv])
 
-    def runtime_json(self, cid, path):
-        raw = self.execute(cid, 'curl', '-fsS', '--max-time', '8', 'http://127.0.0.1:3010' + path)
+    def runtime_json(self, cid, path, initializing_is_pending=False):
+        raw = self.execute(cid, 'curl', '-sS' if initializing_is_pending else '-fsS',
+                           '--max-time', '8', 'http://127.0.0.1:3010' + path)
         response = json.loads(raw)
+        if (initializing_is_pending and path == '/v1/runtime/status'
+                and response.get('success') is False and response.get('code') == 'ERR_INITIALIZING'):
+            return None
         # RuntimeKernel has its own v5 envelope; deployment/readiness retain
         # the shared HttpResult envelope. Do not conflate their success codes.
         expected_code = 'OK' if path.startswith('/v1/runtime/') else '0000'
@@ -1026,6 +1117,16 @@ data=json.load(response);data.update(status=response.status,processes=roots);pri
 '''
         return json.loads(self.execute(cid, 'python3', '-c', code, f'/home/user/{self.app}/code'))
 
+    def worker_exit(self, cid, captured):
+        code = '''import json,pathlib,sys
+pid=int(sys.argv[1]);start=sys.argv[2];assert pid>1;path=pathlib.Path('/proc')/str(pid)/'stat'
+try:fields=path.read_text().rsplit(')',1)[1].split()
+except FileNotFoundError:print(json.dumps({'pid':pid,'start_ticks':start,'original_process_exited':True,'observation':'absent'}))
+else:print(json.dumps({'pid':pid,'start_ticks':start,'original_process_exited':fields[19]!=start,'current_start_ticks':fields[19],'process_state':fields[0]}))
+'''
+        return json.loads(self.execute(cid, 'python3', '-c', code,
+                                       str(captured['pid']), captured['start_ticks']))
+
     def one_ready_owner(self, cid):
         status = self.runtime_json(cid, '/v1/runtime/status')
         identity = self.runtime_json(cid, '/v1/runtime/identity')
@@ -1233,6 +1334,29 @@ print(json.dumps({'commit':git('rev-parse','HEAD'),'content_sha256':__import__('
         if effects != {'migrations': [release], 'sql_executions': 1}:
             raise ValueError('original activated artifact does not have exactly one real migration and SQL execution')
         report['startup_effects_before'] = effects
+        journal_relative = f'.app-cli-state/{contract.app}/.deploy-operation.json'
+        def naturally_failed():
+            if time.monotonic() >= barrier_deadline:
+                raise TimeoutError('original startup observation deadline exhausted')
+            raw = contract.retained_read(mounts, f'/home/user/{contract.app}', journal_relative)
+            receipt = json.loads(raw)
+            status = contract.runtime_json(cid, '/v1/runtime/status', initializing_is_pending=True)
+            if status is None:
+                return None
+            exited = contract.worker_exit(cid, barrier['worker']['processes'][0])
+            if time.monotonic() >= barrier_deadline:
+                raise TimeoutError('natural failure observation arrived after its deadline')
+            if not startup_failure_settled(receipt, status, exited, operation, release):
+                return None
+            return {'raw': raw, 'receipt': receipt, 'status': status, 'worker_exit': exited}
+        natural = contract.wait('startup restore naturally retains StartupFailed and the confirmed artifact',
+            naturally_failed, lambda value: value is not None,
+            seconds=max(0, barrier_deadline - time.monotonic()))
+        before = natural['receipt']
+        original = args.report.parent / 'startup-failed-journal.before.raw.json'
+        original.write_text(natural['raw'])
+        original.chmod(0o600)
+        report['startup_natural_failure'] = {key: value for key, value in natural.items() if key != 'raw'}
         contract.public_control('stop', 'interrupt-' + uuid.uuid4().hex)
         def physically_stopped():
             inventory = run(['docker', 'ps', '-aq', '--no-trunc']).split()
@@ -1244,16 +1368,13 @@ print(json.dumps({'commit':git('rev-parse','HEAD'),'content_sha256':__import__('
             return None
         contract.wait('startup restore original runtime is physically stopped',
                       physically_stopped, lambda value: value is not None, seconds=60)
-        journal_relative = f'.app-cli-state/{contract.app}/.deploy-operation.json'
         raw = contract.retained_read(mounts, f'/home/user/{contract.app}', journal_relative)
-        before = json.loads(raw)
-        original = args.report.parent / 'startup-failed-journal.before.raw.json'
-        original.write_text(raw)
-        original.chmod(0o600)
-        contract.check('startup restore naturally retains StartupFailed and the confirmed artifact',
-                       startup_failure_receipt(before, operation, release),
-                       {'boundary': before.get('boundary'), 'operation': before.get('operation'),
-                        'raw_sha256': hashlib.sha256(raw.encode()).hexdigest()})
+        post_stop = json.loads(raw)
+        saved_stop = args.report.parent / 'startup-failed-journal.after-stop.raw.json'
+        saved_stop.write_text(raw)
+        saved_stop.chmod(0o600)
+        if raw != natural['raw'] or not startup_history_preserved(before, post_stop, boundary='startup_failed'):
+            raise ValueError('physical Stop changed the original naturally failed activation')
         # Release only the application fixture's health probe after the real
         # physical Stop. The journal, Failed receipt and replay remain untouched.
         gate_path = contract.retained_path(mounts, '/home/user/data', Path(gate).name)
@@ -1350,6 +1471,9 @@ def main():
     parser.add_argument('--report', required=True, type=Path)
     parser.add_argument('--source-dir', default=Path(os.environ.get('E2E_SOURCE_ROOT') or Path(__file__).resolve().parents[2]), type=Path)
     parser.add_argument('--build-receipt', required=True, type=Path)
+    parser.add_argument('--build-source-dir', type=Path, default=os.environ.get('E2E_PROD_BUILD_SOURCE_DIR'),
+                        help='original frozen producer for explicitly reviewed test-only driver changes')
+    parser.add_argument('--build-input-manifest', type=Path, default=os.environ.get('E2E_PROD_BUILD_INPUT_MANIFEST'))
     parser.add_argument('--controller-container', help='captured isolated RCoder full container ID')
     parser.add_argument('--user-id', default='prod-contract-user')
     parser.add_argument('--api-key', default=os.environ.get('RCODER_E2E_API_KEY'))
@@ -1378,13 +1502,19 @@ def main():
     contract = Contract(args, report, app)
     server = None
     try:
-        contract.build_receipt = validate_receipt(json.loads(args.build_receipt.read_text()), report['source'])
+        receipt_bytes = args.build_receipt.read_bytes()
+        contract.build_receipt = json.loads(receipt_bytes)
+        report['build_source_proof'] = validate_build_for_driver(contract.build_receipt, report['source'], repo,
+                                                               args.build_source_dir, args.build_input_manifest)
+        report['original_build_receipt_sha256'] = hashlib.sha256(receipt_bytes).hexdigest()
+        report['producer_source'] = contract.build_receipt['source']
         if not args.controller_container:
             contract.fixture_root = args.report.parent.resolve()
             run_id = os.environ.get('E2E_RUN_ID') or uuid.uuid4().hex
             case_id = os.environ.get('E2E_CASE_ID') or uuid.uuid4().hex
             contract.owned_controller = prepare_controller(contract.fixture_root, repo, contract.build_receipt,
-                                                           report['source'], run_id, case_id, app, args.api_key)
+                report['source'], run_id, case_id, app, args.api_key,
+                build_source_dir=args.build_source_dir, build_input_manifest=args.build_input_manifest)
             args.controller_container = contract.owned_controller['controller_id']
             args.url = contract.owned_controller['base']
         args.runtime_image = args.runtime_image or contract.build_receipt['runtime']['image_id']
