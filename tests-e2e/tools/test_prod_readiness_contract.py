@@ -519,6 +519,70 @@ class OwnedPreparationContracts(unittest.TestCase):
                     contract.cleanup(root, 'run', 'case', existing_ids={'preexisting'})
 
 
+class RuntimeOwnerProbeContracts(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.workspace = self.root / 'workspace'
+        self.workspace.mkdir()
+        self.proc = self.root / 'proc'
+        self.proc.mkdir()
+        namespace = {'__name__': 'contract_owner_probe'}
+        exec(compile(contract.OWNER_PROBE_CODE, '<actual remote owner probe>', 'exec'), namespace)
+        self.observe = namespace['owner_processes']
+
+    def process(self, pid=23, args=('/usr/local/bin/app-cli', 'serve'), environment=None, state='S'):
+        proc = self.proc / str(pid)
+        proc.mkdir()
+        (proc / 'cmdline').write_bytes(b'\0'.join(arg.encode() for arg in args) + b'\0')
+        (proc / 'environ').write_bytes(b'\0'.join(entry.encode() for entry in (environment or [])) + b'\0')
+        (proc / 'cwd').symlink_to(self.workspace, target_is_directory=True)
+        (proc / 'stat').write_text(f'{pid} (app-cli) ' + ' '.join([state, *['0'] * 18, '1234']))
+        return proc
+
+    def test_actual_runtime_two_argument_serve_uses_workspace_environment(self):
+        self.process(environment=['APP_CLI_WORKSPACE=' + str(self.workspace)])
+        result = self.observe(self.workspace, self.proc)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]['argv'], ['/usr/local/bin/app-cli', 'serve'])
+        self.assertEqual(result[0]['workspace_source'], 'environment')
+        self.assertEqual((result[0]['pid'], result[0]['start_ticks'], result[0]['process_state']), (23, '1234', 'S'))
+
+    def test_explicit_workspace_both_forms_override_foreign_environment(self):
+        for pid, flags in ((23, ['--control-only', '--workspace', str(self.workspace), '--admin-addr', '127.0.0.1:3010']),
+                           (24, ['--workspace=' + str(self.workspace)])):
+            self.process(pid, ['/usr/local/bin/app-cli', 'serve', *flags], ['APP_CLI_WORKSPACE=/foreign'])
+        result = self.observe(self.workspace, self.proc)
+        self.assertEqual({row['pid'] for row in result}, {23, 24})
+        self.assertTrue(all(row['workspace_source'] == 'argument' for row in result))
+
+    def test_absent_option_and_environment_use_the_actual_cwd(self):
+        self.process()
+        result = self.observe(self.workspace, self.proc)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]['workspace_source'], 'cwd')
+        self.assertEqual(result[0]['cwd'], str(self.workspace.resolve()))
+
+    def test_foreign_workspace_zombie_and_exited_processes_are_not_live_owners(self):
+        self.process(23, environment=['APP_CLI_WORKSPACE=/foreign'])
+        self.process(24, state='Z')
+        (self.proc / '25').mkdir()  # Exited between the /proc listing and cmdline read.
+        self.process(26, ['/usr/local/bin/app-cli', 'owner', 'status'])
+        self.assertEqual(self.observe(self.workspace, self.proc), [])
+
+    def test_unreadable_candidate_observation_is_not_absence_or_success(self):
+        proc = self.process(environment=['APP_CLI_WORKSPACE=' + str(self.workspace)])
+        original = Path.read_bytes
+        def read(path):
+            if path == proc / 'environ':
+                raise PermissionError('candidate workspace observation failed')
+            return original(path)
+        with patch.object(Path, 'read_bytes', read):
+            with self.assertRaisesRegex(PermissionError, 'candidate workspace'):
+                self.observe(self.workspace, self.proc)
+
+
 class StartupFailedRestoreContracts(unittest.TestCase):
     def receipt(self):
         operation = {'operation_id': 'deploy-A', 'deployment_generation_id': 'deploy-A',

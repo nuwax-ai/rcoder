@@ -122,6 +122,36 @@ def startup_failure_settled(receipt, status, worker_exit, operation, release):
             and worker_exit.get('original_process_exited') is True)
 
 
+OWNER_PROBE_CODE = '''import argparse,json,pathlib,sys
+def owner_processes(source_root, process_root='/proc'):
+ root=pathlib.Path(source_root).resolve();owners=[]
+ parser=argparse.ArgumentParser(add_help=False,exit_on_error=False,allow_abbrev=False)
+ parser.add_argument('--workspace')
+ for proc in pathlib.Path(process_root).iterdir():
+  if not proc.name.isdecimal():continue
+  try:
+   args=[p.decode()for p in (proc/'cmdline').read_bytes().split(b'\\0')if p]
+   if len(args)<2 or pathlib.Path(args[0]).name!='app-cli' or args[1]!='serve':continue
+   options,_=parser.parse_known_args(args[2:]);environment=None
+   if options.workspace is None:
+    values=[entry.split(b'=',1)[1].decode()for entry in (proc/'environ').read_bytes().split(b'\\0')if entry.startswith(b'APP_CLI_WORKSPACE=')]
+    if len(values)>1:raise ValueError('ambiguous owner workspace environment')
+    environment=values[0]if values else None
+   selected=options.workspace if options.workspace is not None else environment
+   origin='argument'if options.workspace is not None else 'environment'if environment is not None else 'cwd'
+   workspace=pathlib.Path(selected)if selected is not None else pathlib.Path('.')
+   if not workspace.is_absolute():workspace=(proc/'cwd').resolve(strict=True)/workspace
+   if workspace.resolve()!=root:continue
+   cwd=(proc/'cwd').resolve(strict=True)
+   fields=(proc/'stat').read_text().rsplit(')',1)[1].split()
+   if fields[0]!='Z':owners.append({'pid':int(proc.name),'start_ticks':fields[19],'process_state':fields[0],
+    'argv':args,'workspace_source':origin,'workspace':str(workspace.resolve()),'cwd':str(cwd)})
+  except (FileNotFoundError,ProcessLookupError):pass
+ return owners
+if __name__=='__main__':print(json.dumps(owner_processes(sys.argv[1])))
+'''
+
+
 def startup_waiting_observed(deploy, worker, operation, release, marker):
     view = deploy.get('operation') or {}
     roots = worker.get('processes') or []
@@ -1132,20 +1162,7 @@ else:print(json.dumps({'pid':pid,'start_ticks':start,'original_process_exited':f
         identity = self.runtime_json(cid, '/v1/runtime/identity')
         workspace = identity['source_root']
         native = json.loads(self.execute(cid, 'app-cli', 'owner', 'status', '--workspace', workspace))
-        code = '''import pathlib,json,sys
-root=pathlib.Path(sys.argv[1]).resolve();owners=[]
-for proc in pathlib.Path('/proc').iterdir():
- if not proc.name.isdecimal():continue
- try:
-  args=[p.decode()for p in (proc/'cmdline').read_bytes().split(b'\\0')if p]
-  if len(args)<3 or pathlib.Path(args[0]).name!='app-cli' or args[1]!='serve' or '--workspace'not in args:continue
-  if pathlib.Path(args[args.index('--workspace')+1]).resolve()!=root:continue
-  fields=(proc/'stat').read_text().rsplit(')',1)[1].split()
-  if fields[0]!='Z':owners.append({'pid':int(proc.name),'start_ticks':fields[19]})
- except (FileNotFoundError,ProcessLookupError):pass
-print(json.dumps(owners))
-'''
-        owners = json.loads(self.execute(cid, 'python3', '-c', code, workspace))
+        owners = json.loads(self.execute(cid, 'python3', '-c', OWNER_PROBE_CODE, workspace))
         return {'status': status, 'identity': identity, 'native': native, 'processes': owners}
 
     def verify_invalid_artifact_failure(self, status, failed, downloads):
