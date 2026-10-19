@@ -634,5 +634,11 @@
       "scenario": "devcomputer_main_real_model_smoke",
       "backend": "openai"
     }
+  ],
+  "userapp_prod_startup_failed_restore_contract": [
+    {
+      "scenario": "userapp_prod_startup_failed_restore_contract",
+      "backend": "compose"
+    }
   ]
 }

@@ -397,6 +397,103 @@ class OwnedPreparationContracts(unittest.TestCase):
                     contract.cleanup(root, 'run', 'case', existing_ids={'preexisting'})
 
 
+class StartupFailedRestoreContracts(unittest.TestCase):
+    def receipt(self):
+        operation = {'operation_id': 'deploy-A', 'deployment_generation_id': 'deploy-A',
+                     'phase': 'failed', 'error': 'startup interrupted while activating',
+                     'deploy_stage': 'succeeded', 'persisted': True, 'artifact_release_id': 'artifact-A'}
+        return {'generation': 'deploy-A', 'boundary': 'startup_failed', 'operation': operation,
+                'request': {'release_id': 'request-A'},
+                'active': {'artifact_release_id': 'artifact-A'},
+                'deploy_replays': {'deploy-A': {'fingerprint': 'original-input', 'operation': copy.deepcopy(operation)}}}
+
+    def test_seed_requires_real_failed_activation_of_the_confirmed_artifact(self):
+        before = self.receipt()
+        self.assertTrue(contract.startup_failure_receipt(before, 'deploy-A', 'artifact-A'))
+        for mutate in (
+                lambda row: row.update(boundary='active'),
+                lambda row: row['operation'].update(phase='running'),
+                lambda row: row['operation'].update(error=None),
+                lambda row: row['operation'].update(deploy_stage='pending'),
+                lambda row: row['active'].update(artifact_release_id='another-artifact'),
+                lambda row: row['deploy_replays'].clear()):
+            row = copy.deepcopy(before)
+            mutate(row)
+            self.assertFalse(contract.startup_failure_receipt(row, 'deploy-A', 'artifact-A'))
+        self.assertFalse(contract.startup_failure_receipt(before, 'foreign-operation', 'artifact-A'))
+
+    def test_recovery_cannot_rewrite_failed_error_or_request_replay(self):
+        before = self.receipt()
+        after = copy.deepcopy(before)
+        after['boundary'] = 'restored_active'
+        self.assertTrue(contract.startup_history_preserved(before, after))
+        for mutate in (
+                lambda row: row['operation'].update(phase='running'),
+                lambda row: row['operation'].update(error=None),
+                lambda row: row['request'].update(release_id='new-request'),
+                lambda row: row['deploy_replays']['deploy-A'].update(fingerprint='new-input'),
+                lambda row: row['active'].update(artifact_release_id='other')):
+            changed = copy.deepcopy(after)
+            mutate(changed)
+            self.assertFalse(contract.startup_history_preserved(before, changed))
+
+    def test_waiting_barrier_needs_exact_original_operation_and_live_worker_503(self):
+        operation = copy.deepcopy(self.receipt()['operation'])
+        operation.update(phase='orchestrating', error=None)
+        worker = {'status': 503, 'state': 'waiting', 'marker': 'NONCE',
+                  'processes': [{'pid': 23, 'start_ticks': '1234', 'process_state': 'S'}]}
+        self.assertTrue(contract.startup_waiting_observed({'operation': operation}, worker, 'deploy-A', 'artifact-A', 'NONCE'))
+        for field, value in (('phase', 'running'), ('persisted', False), ('operation_id', 'another')):
+            changed = dict(operation, **{field: value})
+            self.assertFalse(contract.startup_waiting_observed({'operation': changed}, worker, 'deploy-A', 'artifact-A', 'NONCE'))
+        for mutate in (lambda row: row.update(status=200), lambda row: row.update(marker='other'),
+                       lambda row: row.update(processes=[]),
+                       lambda row: row['processes'][0].update(process_state='Z')):
+            changed = copy.deepcopy(worker)
+            mutate(changed)
+            self.assertFalse(contract.startup_waiting_observed({'operation': operation}, changed, 'deploy-A', 'artifact-A', 'NONCE'))
+
+    def test_control_uses_public_start_deployment_and_never_replays_unknown_write(self):
+        with tempfile.TemporaryDirectory() as directory, patch('builtins.print'):
+            fixture = contract.Contract(SimpleNamespace(user_id='fixture-user', report=Path(directory) / 'report.json'), {'checks': []}, 'ownedapp')
+            fixture.lifecycle = 'lifecycle-A'
+            view = {'operation_id': 'accepted', 'app_id': 'ownedapp', 'lifecycle_id': 'lifecycle-A',
+                    'request_id': 'resume-original', 'scope': 'Prod', 'kind': 'StartDeployment', 'state': 'Succeeded'}
+            with patch.object(fixture, 'api', side_effect=[(200, {'operation_id': 'accepted'}), (200, {'data': view})]) as api:
+                self.assertEqual(fixture.public_control('start', 'resume-original'), view)
+                self.assertEqual(len([call for call in api.call_args_list if len(call.args) > 1]), 1)
+                self.assertNotIn('url', api.call_args_list[0].args[1])
+            with patch.object(fixture, 'api', side_effect=TimeoutError('reply lost')) as api:
+                with self.assertRaisesRegex(TimeoutError, 'reply lost'):
+                    fixture.public_control('start', 'unknown-once')
+                self.assertEqual(api.call_count, 1)
+                self.assertEqual(fixture.report['control_intents'][-1]['body']['request_id'], 'unknown-once')
+
+    def test_worker_gate_is_a_real_application_health_probe(self):
+        repo = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            artifact, gate = contract.make_startup_restore_artifact(repo, Path(directory), 'fixture-release', 'MARKER', 'ownedapp')
+            with zipfile.ZipFile(artifact) as archive:
+                self.assertIsNone(archive.testzip())
+                lock = tomllib.loads(archive.read('release.lock.toml').decode())
+                worker = next(row for row in lock['services'] if row['service_id'] == 'hold-worker')
+                self.assertEqual(worker['kind'], 'worker')
+                self.assertEqual(worker['health']['startup_probe'], 'http')
+                self.assertEqual(worker['env']['READY_FILE'], gate)
+                self.assertTrue(gate.startswith('/home/user/data/'))
+                compile(archive.read('hold-worker/main.py'), 'hold-worker/main.py', 'exec')
+
+    def test_missing_precondition_or_current_ready_evidence_cannot_pass_report(self):
+        good = {'checks': [{'name': name, 'ok': True} for name in contract.STARTUP_RESTORE_STEPS],
+                'cleanup': {'captured_containers_removed': True, 'volumes_removed': False}}
+        contract.require_report_complete(good, required_steps=contract.STARTUP_RESTORE_STEPS)
+        for name in contract.STARTUP_RESTORE_STEPS:
+            report = copy.deepcopy(good)
+            report['checks'] = [row for row in report['checks'] if row['name'] != name]
+            with self.assertRaisesRegex(ValueError, 'missing required steps'):
+                contract.require_report_complete(report, required_steps=contract.STARTUP_RESTORE_STEPS)
+
+
 class CompletionContracts(unittest.TestCase):
     def good(self):
         return {'checks': [{'name': name, 'ok': True} for name in contract.REQUIRED_STEPS],

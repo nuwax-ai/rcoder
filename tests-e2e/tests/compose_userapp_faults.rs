@@ -89,11 +89,26 @@ fn run_contract(report: &JsonlReporter, engine: &str, script: &str, artifacts: &
 /// The isolated controller and paired build receipt are explicit prerequisites.
 #[tokio::test]
 async fn userapp_prod_readiness_contract() {
+    prod_scenario("userapp_prod_readiness_contract", "all").await;
+}
+
+/// Requires a frozen paired Main/Runtime receipt, not the CI controller/builder pair.
+/// Stop happens after real activation while the worker health gate is still closed.
+#[tokio::test]
+async fn userapp_prod_startup_failed_restore_contract() {
+    prod_scenario(
+        "userapp_prod_startup_failed_restore_contract",
+        "startup-failed-restore",
+    )
+    .await;
+}
+
+async fn prod_scenario(scenario: &str, mode: &str) {
     if !rcoder_e2e::common::require_context_or_skip() {
         return;
     }
     let report = JsonlReporter::begin(
-        "userapp_prod_readiness_contract",
+        scenario,
         "compose",
         serde_json::json!({"fixture": "isolated-loopback-prod", "llm": false}),
     );
@@ -115,6 +130,8 @@ async fn userapp_prod_readiness_contract() {
             )
             .arg("--build-receipt")
             .arg(required("E2E_PROD_BUILD_RECEIPT")?)
+            .arg("--scenario")
+            .arg(mode)
             .arg("--report")
             .arg(&path)
             .status()

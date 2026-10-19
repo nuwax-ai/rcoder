@@ -26,10 +26,19 @@ CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_dev E2E_FILTER=userap
 E2E_PROD_BUILD_RECEIPT=/absolute/frozen-paired-build.json \
   CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_faults E2E_FILTER=userapp_prod_readiness_contract
 
+# 真实激活后、worker 尚未健康时 Stop → StartupFailed 原记录保留 → 新 Start 恢复。
+E2E_PROD_BUILD_RECEIPT=/absolute/frozen-paired-build.json \
+  CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_faults E2E_FILTER=userapp_prod_startup_failed_restore_contract
+
 # 实际模板脚本+真实pip：连续构建、平台停容器后原卷重建、缓存与两层ZIP。
 E2E_TEMPLATE_SOURCE_DIR=/absolute/frozen-userapp-workspace-template \
   CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_build_rules E2E_FILTER=userapp_python_dependency_cache_survives_builder_recycle
 ```
+
+两个 prod 定向场景都需要同一冻结源码的 Main/Runtime 配对镜像及实际二进制回执；
+controller/builder 的 CI 回执不能代替 Runtime 前置。新恢复场景自行创建隔离主控与随机应用，
+用真实 worker HTTP 503 和原操作/PID 作启动屏障；未自然观察到 `StartupFailed` 就失败，
+不篡改 journal、不把第一次已激活宣称为已健康，也不会自动重放未知写请求。
 
 `computer_owner_conflict_contract` 显式使用该 HTTP 地址及 `E2E_OWNER_CONTROLLER_ID`，
 不猜测日常容器名。它通过原 ensure/chat/stop API 操作两个本轮随机账号，使用 Docker

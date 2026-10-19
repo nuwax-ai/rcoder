@@ -884,5 +884,25 @@
     "compute stop timeout released reply resumes original operation",
     "compute stop timeout source stayed frozen",
     "compute stop timeout unknown period has no Start or Create"
+  ],
+  "userapp_prod_startup_failed_restore_contract": [
+    "isolated controller and project network removed with data retained",
+    "owned containers removed and volumes retained",
+    "owned isolated controller prepared",
+    "paired build inputs verified",
+    "prod cleanup confirms retained volumes",
+    "prod contract process completed",
+    "prod contract reports full success",
+    "source stayed stable throughout the run",
+    "startup restore current runtime is Ready and serves the original artifact",
+    "startup restore does not replay committed deployment migration or SQL writes",
+    "startup restore has exactly one physical owner",
+    "startup restore naturally retains StartupFailed and the confirmed artifact",
+    "startup restore new public Start has its exact succeeded receipt",
+    "startup restore original Stop has its exact succeeded receipt",
+    "startup restore original runtime is physically stopped",
+    "startup restore preserves original mounts data and Git",
+    "startup restore real activated worker is waiting before physical Stop",
+    "startup restore retains the original failed operation and replay"
   ]
 }

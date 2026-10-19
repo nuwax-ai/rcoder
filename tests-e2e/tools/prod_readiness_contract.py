@@ -72,6 +72,61 @@ REQUIRED_STEPS = frozenset({
     'owned containers removed and volumes retained',
 })
 
+STARTUP_RESTORE_STEPS = frozenset({
+    'paired build inputs verified', 'owned isolated controller prepared',
+    'startup restore real activated worker is waiting before physical Stop',
+    'startup restore original Stop has its exact succeeded receipt',
+    'startup restore original runtime is physically stopped',
+    'startup restore naturally retains StartupFailed and the confirmed artifact',
+    'startup restore new public Start has its exact succeeded receipt',
+    'startup restore current runtime is Ready and serves the original artifact',
+    'startup restore retains the original failed operation and replay',
+    'startup restore has exactly one physical owner',
+    'startup restore preserves original mounts data and Git',
+    'startup restore does not replay committed deployment migration or SQL writes',
+    'source stayed stable throughout the run',
+    'owned containers removed and volumes retained',
+    'isolated controller and project network removed with data retained',
+})
+
+
+def startup_failure_receipt(receipt, operation, release):
+    """A real failed activation is required; never synthesize the seed history."""
+    view, active = receipt.get('operation') or {}, receipt.get('active') or {}
+    replay = (receipt.get('deploy_replays') or {}).get(operation) or {}
+    return (receipt.get('boundary') == 'startup_failed'
+            and receipt.get('generation') == operation
+            and view.get('operation_id') == operation
+            and view.get('deployment_generation_id') == operation
+            and view.get('phase') == 'failed' and bool(view.get('error'))
+            and view.get('deploy_stage') == 'succeeded' and view.get('persisted') is True
+            and view.get('artifact_release_id') == release
+            and active.get('artifact_release_id') == release
+            and replay.get('operation') == view and bool(replay.get('fingerprint')))
+
+
+def startup_history_preserved(before, after):
+    operation = (before.get('operation') or {}).get('operation_id')
+    return (bool(operation) and after.get('boundary') == 'restored_active'
+            and all(before.get(key) == after.get(key) for key in ('generation', 'operation', 'request', 'active'))
+            and (before.get('deploy_replays') or {}).get(operation)
+                == (after.get('deploy_replays') or {}).get(operation))
+
+
+def startup_waiting_observed(deploy, worker, operation, release, marker):
+    view = deploy.get('operation') or {}
+    roots = worker.get('processes') or []
+    return (view.get('operation_id') == operation
+            and view.get('deployment_generation_id') == operation
+            and view.get('artifact_release_id') == release
+            and view.get('deploy_stage') == 'succeeded' and view.get('persisted') is True
+            and view.get('phase') == 'orchestrating'
+            and worker.get('status') == 503 and worker.get('marker') == marker
+            and worker.get('state') == 'waiting' and len(roots) == 1
+            and type(roots[0].get('pid')) is int and roots[0]['pid'] > 1
+            and str(roots[0].get('start_ticks', '')).isdigit()
+            and roots[0].get('process_state') not in (None, 'Z'))
+
 ONE_TIME_DEPLOY_ENV_KEYS = frozenset({'APP_DEPLOY_URL', 'APP_RELEASE_ID', 'APP_DEPLOY_SHA256',
                                     'APP_DEPLOY_OPERATION_ID'})
 
@@ -114,10 +169,10 @@ def source_identity(repo, input_manifest=None):
     return {'origin_head': head, 'worktree_sha256': digest.hexdigest()}
 
 
-def require_report_complete(report, owned_controller=True):
+def require_report_complete(report, owned_controller=True, required_steps=REQUIRED_STEPS):
     checks = report.get('checks', [])
     names = {row.get('name') for row in checks if row.get('ok') is True}
-    required = REQUIRED_STEPS if owned_controller else REQUIRED_STEPS - {
+    required = required_steps if owned_controller else required_steps - {
         'owned isolated controller prepared',
         'isolated controller and project network removed with data retained',
     }
@@ -428,6 +483,66 @@ upstream_includes = []
     return artifact
 
 
+def make_startup_restore_artifact(repo, directory, release, marker, app):
+    """A real HTTP-health worker holds business startup, not a product hook."""
+    original = make_artifact(repo, directory, release, marker)
+    gate = f'/home/user/data/.startup-ready-{app}'
+    with zipfile.ZipFile(original) as archive:
+        files = {name: archive.read(name) for name in archive.namelist()}
+    files['release.lock.toml'] += f'''
+
+[[services]]
+service_id = "hold-worker"
+name = "Controlled startup worker"
+dir = "hold-worker"
+type = "python"
+kind = "worker"
+enabled = true
+port = 4211
+logs = []
+[services.run]
+command = ["python3", "main.py"]
+shutdown_timeout_seconds = 2
+[services.health]
+startup_probe = "http"
+startup_path = "/health"
+startup_timeout_seconds = 120
+[services.env]
+READY_FILE = {json.dumps(gate)}
+CONTRACT_MARKER = {json.dumps(marker)}
+'''.encode()
+    files['hold-worker/project.manifest.toml'] = b'''schema_version=1
+[project]
+service_id="hold-worker"
+name="Controlled startup worker"
+type="python"
+kind="worker"
+[run]
+command=["python3","main.py"]
+[health]
+startup_probe="http"
+startup_path="/health"
+startup_timeout_seconds=120
+'''
+    files['hold-worker/main.py'] = b'''import json,os
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler,HTTPServer
+class H(BaseHTTPRequestHandler):
+ def do_GET(self):
+  ready=Path(os.environ['READY_FILE']).exists()
+  body=json.dumps({'marker':os.environ['CONTRACT_MARKER'],'state':'ready' if ready else 'waiting'}).encode()
+  self.send_response(200 if ready else 503);self.send_header('Content-Length',str(len(body)))
+  self.end_headers();self.wfile.write(body)
+ def log_message(self,*args):pass
+HTTPServer(('127.0.0.1',int(os.environ['PORT'])),H).serve_forever()
+'''
+    result = directory / f'workspace-startup-restore-{release}.zip'
+    with zipfile.ZipFile(result, 'w', zipfile.ZIP_DEFLATED) as archive:
+        for name, content in files.items():
+            archive.writestr(name, content)
+    return result, gate
+
+
 class Contract:
     def __init__(self, args, report, app):
         self.args, self.report, self.app = args, report, app
@@ -609,12 +724,12 @@ exec psql -h "${PGHOST:-localhost}" -p "${PGPORT:-5432}" \
         return run(['docker', 'ps', '-aq', '--no-trunc', '--filter', f'label=app-id={self.app}',
                     '--filter', 'label=managed-by=rcoder-app-manager', '--filter', 'label=service-type=user-app']).split()
 
-    def proxy(self, path='/', authenticated=True, marker=None):
+    def proxy(self, path='/', authenticated=True, marker=None, timeout=90):
         headers = {'x-api-key': self.args.api_key} if authenticated else {}
         route = '/api/v1/userapp/proxy/app/prod/' + urllib.parse.quote(self.args.user_id, safe='') + '/' + self.app
         request = urllib.request.Request(self.proxy_base + route + path, headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=90) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 status, body = response.status, response.read()
         except urllib.error.HTTPError as error:
             status, body = error.code, error.read()
@@ -828,6 +943,110 @@ exec psql -h "${PGHOST:-localhost}" -p "${PGPORT:-5432}" \
         self.wait(action + ': original operation succeeded', terminal, lambda value: value.get('state') == 'succeeded')
         return operation_id
 
+    def public_control(self, action, request_id, extra=None, label=None):
+        """One public write, then observe only its original request/operation."""
+        if action not in ('start', 'stop'):
+            raise ValueError('this fixture only submits public Start or Stop')
+        body = {'user_id': self.args.user_id, 'lifecycle_id': self.lifecycle, 'request_id': request_id}
+        body.update(extra or {})
+        path = f'/api/v1/userapp/{self.app}/{action}'
+        if action == 'stop':
+            path += '?' + urllib.parse.urlencode(body)
+            body = {}
+        self.report.setdefault('control_intents', []).append({'path': path, 'body': body})
+        self.args.report.write_text(json.dumps(self.report, indent=2) + '\n')
+        deadline = time.monotonic() + 180
+        _, response = self.api(path, body, timeout=180)
+        operation = response.get('operation_id')
+        if not operation:
+            raise ValueError('public control did not return its accepted operation')
+        def observe():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('original public control deadline exhausted')
+            _, envelope = self.api(f'/api/v1/userapp/{self.app}/operations/by-request?'
+                + urllib.parse.urlencode({'user_id': self.args.user_id, 'request_id': request_id}), timeout=min(20, remaining))
+            if time.monotonic() >= deadline:
+                raise TimeoutError('original public control reply arrived after its deadline')
+            view = envelope.get('data')
+            if view is None:
+                return None
+            if any(view.get(key) != value for key, value in {
+                    'operation_id': operation, 'app_id': self.app, 'lifecycle_id': self.lifecycle,
+                    'request_id': request_id, 'scope': 'Prod',
+                    'kind': 'Stop' if action == 'stop' else 'StartDeployment'}.items()):
+                raise ValueError('public operation identity changed')
+            if view.get('state') in ('Failed', 'RecoveryRequired', 'Cancelled', 'Superseded'):
+                raise ValueError('original public operation did not succeed: ' + str(view))
+            return view
+        result = self.wait('startup restore ' + (label or ('original Stop' if action == 'stop' else 'new public Start'))
+            + ' has its exact succeeded receipt', observe,
+            lambda view: view is not None and view.get('state') == 'Succeeded',
+            seconds=max(0, deadline - time.monotonic()))
+        return result
+
+    def retained_path(self, mounts, destination, relative):
+        """Map only a captured own-app bind through the exact private controller."""
+        relative = Path(relative)
+        if relative.is_absolute() or '..' in relative.parts:
+            raise ValueError('retained fixture path escapes its captured mount')
+        source = next(mount['Source'] for mount in mounts
+                      if mount['Destination'] == destination and mount['Type'] == 'bind')
+        controller = json.loads(run(['docker', 'inspect', self.args.controller_container]))[0]
+        if controller['Id'] != self.args.controller_container or not controller['State']['Running']:
+            raise ValueError('captured controller is unavailable')
+        if self.owned_controller:
+            validate_controller(controller, self.owned_controller)
+        covers = [mount for mount in controller['Mounts'] if mount['Type'] == 'bind'
+                  and (source == mount['Source'] or source.startswith(mount['Source'].rstrip('/') + '/'))]
+        cover = max(covers, key=lambda mount: len(mount['Source']))
+        return str(Path(cover['Destination'] + source[len(cover['Source']):]) / relative)
+
+    def retained_read(self, mounts, destination, relative):
+        path = self.retained_path(mounts, destination, relative)
+        return run(['docker', 'exec', self.args.controller_container, 'cat', path])
+
+    def worker_waiting(self, cid):
+        code = '''import json,pathlib,urllib.request,urllib.error,sys
+expected=(pathlib.Path(sys.argv[1])/'hold-worker').resolve();roots=[]
+for proc in pathlib.Path('/proc').iterdir():
+ if not proc.name.isdecimal():continue
+ try:
+  args=(proc/'cmdline').read_bytes().split(b'\\0')
+  if len(args)>1 and pathlib.Path(args[0].decode()).name.startswith('python') and args[1]==b'main.py' and (proc/'cwd').resolve()==expected:
+   fields=(proc/'stat').read_text().rsplit(')',1)[1].split()
+   roots.append({'pid':int(proc.name),'start_ticks':fields[19],'process_state':fields[0]})
+ except (FileNotFoundError,ProcessLookupError):pass
+try:response=urllib.request.urlopen('http://127.0.0.1:4211/health',timeout=2)
+except urllib.error.HTTPError as error:response=error
+except urllib.error.URLError as error:
+ if not isinstance(error.reason,(ConnectionRefusedError,TimeoutError)):raise
+ print(json.dumps({'status':0,'processes':roots}));sys.exit(0)
+data=json.load(response);data.update(status=response.status,processes=roots);print(json.dumps(data))
+'''
+        return json.loads(self.execute(cid, 'python3', '-c', code, f'/home/user/{self.app}/code'))
+
+    def one_ready_owner(self, cid):
+        status = self.runtime_json(cid, '/v1/runtime/status')
+        identity = self.runtime_json(cid, '/v1/runtime/identity')
+        workspace = identity['source_root']
+        native = json.loads(self.execute(cid, 'app-cli', 'owner', 'status', '--workspace', workspace))
+        code = '''import pathlib,json,sys
+root=pathlib.Path(sys.argv[1]).resolve();owners=[]
+for proc in pathlib.Path('/proc').iterdir():
+ if not proc.name.isdecimal():continue
+ try:
+  args=[p.decode()for p in (proc/'cmdline').read_bytes().split(b'\\0')if p]
+  if len(args)<3 or pathlib.Path(args[0]).name!='app-cli' or args[1]!='serve' or '--workspace'not in args:continue
+  if pathlib.Path(args[args.index('--workspace')+1]).resolve()!=root:continue
+  fields=(proc/'stat').read_text().rsplit(')',1)[1].split()
+  if fields[0]!='Z':owners.append({'pid':int(proc.name),'start_ticks':fields[19]})
+ except (FileNotFoundError,ProcessLookupError):pass
+print(json.dumps(owners))
+'''
+        owners = json.loads(self.execute(cid, 'python3', '-c', code, workspace))
+        return {'status': status, 'identity': identity, 'native': native, 'processes': owners}
+
     def verify_invalid_artifact_failure(self, status, failed, downloads):
         failed_id = failed.get('operation_id')
         fetched = any(row.get('path') == '/invalid.zip' for row in downloads)
@@ -952,6 +1171,176 @@ finally:
         self.check('owned containers removed and volumes retained', True, self.report['cleanup'])
 
 
+def run_startup_restore(contract, repo):
+    """Real Activated-but-unhealthy Stop; no manufactured journal or timed sleep."""
+    report, args = contract.report, contract.args
+    directory = args.report.parent / 'startup-restore-artifact'
+    directory.mkdir(exist_ok=False)
+    release = uuid.uuid4().hex
+    artifact, gate = make_startup_restore_artifact(repo, directory, release, contract.marker, contract.app)
+    payload, downloads = artifact.read_bytes(), []
+    route = '/' + artifact.name
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != route:
+                self.send_error(404)
+                return
+            downloads.append({'path': self.path, 'at': time.time()})
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        def log_message(self, *_):
+            pass
+    server = http.server.ThreadingHTTPServer(('0.0.0.0', 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        declared = contract.public_control('start', 'activate-' + uuid.uuid4().hex,
+            {'url': f'http://{args.artifact_advertise_host}:{server.server_port}{route}',
+             'sha256': hashlib.sha256(payload).hexdigest(), 'release_id': release,
+             'auto_execute_sql': True}, label='initial activation')
+        operation = declared['operation_id']
+        cid, mounts = contract.current()
+        contract.verify_mounts(cid, mounts, 'startup-waiting')
+        workspace = f'/home/user/{contract.app}/code'
+        seed = '''import pathlib,subprocess,sys,json
+root=pathlib.Path(sys.argv[1]);marker=sys.argv[2];(root/'recovery-sentinel.txt').write_text(marker)
+def git(*args):
+ return subprocess.check_output(['git','-c','safe.directory='+str(root),'-c','user.name=E2E','-c','user.email=e2e@example.invalid','-C',str(root),*args],text=True).strip()
+git('init','-q');git('add','recovery-sentinel.txt');git('commit','-q','-m','startup recovery sentinel')
+print(json.dumps({'commit':git('rev-parse','HEAD'),'content_sha256':__import__('hashlib').sha256(marker.encode()).hexdigest()}))
+'''
+        git_before = json.loads(contract.execute(cid, 'python3', '-c', seed, workspace, contract.marker))
+        if not re.fullmatch(r'[0-9a-f]{40}', git_before['commit']):
+            raise ValueError('sentinel did not create a real Git commit')
+        barrier_deadline = time.monotonic() + 60
+        def waiting():
+            if time.monotonic() >= barrier_deadline:
+                raise TimeoutError('original startup observation deadline exhausted')
+            worker = contract.worker_waiting(cid)
+            deploy = contract.runtime_json(cid, '/v1/deploy/status')
+            if time.monotonic() >= barrier_deadline:
+                raise TimeoutError('startup observation arrived after its deadline')
+            if not startup_waiting_observed(deploy, worker, operation, release, contract.marker):
+                return None
+            return {'container_id': cid, 'deployment': deploy, 'worker': worker}
+        barrier = contract.wait('startup restore real activated worker is waiting before physical Stop',
+                                waiting, lambda value: value is not None,
+                                seconds=max(0, barrier_deadline - time.monotonic()))
+        report['startup_barrier'] = barrier
+        report['startup_git'] = git_before
+        effects = contract.recovery_counters(cid)
+        if effects != {'migrations': [release], 'sql_executions': 1}:
+            raise ValueError('original activated artifact does not have exactly one real migration and SQL execution')
+        report['startup_effects_before'] = effects
+        contract.public_control('stop', 'interrupt-' + uuid.uuid4().hex)
+        def physically_stopped():
+            inventory = run(['docker', 'ps', '-aq', '--no-trunc']).split()
+            if cid not in inventory:
+                return {'container_id': cid, 'absent': True, 'successful_inventory': True}
+            value = contract.inspect(cid)
+            if not value['State']['Running'] and value['State']['Pid'] == 0:
+                return {'container_id': cid, 'absent': False, 'state': value['State']}
+            return None
+        contract.wait('startup restore original runtime is physically stopped',
+                      physically_stopped, lambda value: value is not None, seconds=60)
+        journal_relative = f'.app-cli-state/{contract.app}/.deploy-operation.json'
+        raw = contract.retained_read(mounts, f'/home/user/{contract.app}', journal_relative)
+        before = json.loads(raw)
+        original = args.report.parent / 'startup-failed-journal.before.raw.json'
+        original.write_text(raw)
+        original.chmod(0o600)
+        contract.check('startup restore naturally retains StartupFailed and the confirmed artifact',
+                       startup_failure_receipt(before, operation, release),
+                       {'boundary': before.get('boundary'), 'operation': before.get('operation'),
+                        'raw_sha256': hashlib.sha256(raw.encode()).hexdigest()})
+        # Release only the application fixture's health probe after the real
+        # physical Stop. The journal, Failed receipt and replay remain untouched.
+        gate_path = contract.retained_path(mounts, '/home/user/data', Path(gate).name)
+        report.setdefault('fixture_intents', []).append({'kind': 'release business health gate', 'path': gate_path})
+        args.report.write_text(json.dumps(report, indent=2) + '\n')
+        run(['docker', 'exec', args.controller_container, 'python3', '-c',
+             'from pathlib import Path;import sys;Path(sys.argv[1]).write_text("ready")', gate_path])
+        fetched = len(downloads)
+        resumed = contract.public_control('start', 'resume-' + uuid.uuid4().hex)
+        report['startup_resume_operation'] = resumed
+        deadline = time.monotonic() + 180
+        def ready():
+            current, _ = contract.current()
+            result = subprocess.run(['docker', 'exec', current, 'curl', '-sS', '--max-time', '3',
+                'http://127.0.0.1:3010/v1/runtime/status'], capture_output=True, text=True,
+                timeout=max(.001, min(10, deadline - time.monotonic())))
+            if result.returncode:
+                if result.returncode in (7, 28, 52, 56):
+                    return None
+                raise RuntimeError('runtime recovery observation failed: ' + result.stderr)
+            response = json.loads(result.stdout)
+            if response.get('code') == 'ERR_INITIALIZING':
+                return None
+            if response.get('code') != 'OK' or response.get('success') is not True:
+                raise RuntimeError('runtime recovery returned a business error: ' + str(response))
+            status = response['data']
+            if status.get('observed') != 'ready' or status.get('recovery_protection') is not False:
+                return None
+            content = contract.proxy(marker=contract.marker, timeout=max(.001, min(20, deadline - time.monotonic())))
+            if time.monotonic() >= deadline:
+                raise TimeoutError('original recovery observation deadline exhausted')
+            return {'container_id': current, 'status': status, 'http': content}
+        recovered = contract.wait('startup restore current runtime is Ready and serves the original artifact',
+            ready, lambda value: value is not None and value['http']['status'] == 200 and value['http']['matches'],
+            seconds=max(0, deadline - time.monotonic()))
+        current, current_mounts = contract.current()
+        after_raw = contract.retained_read(current_mounts, f'/home/user/{contract.app}', journal_relative)
+        after = json.loads(after_raw)
+        saved = args.report.parent / 'startup-failed-journal.after.raw.json'
+        saved.write_text(after_raw)
+        saved.chmod(0o600)
+        contract.check('startup restore retains the original failed operation and replay',
+                       startup_history_preserved(before, after),
+                       {'operation': after.get('operation'), 'raw_sha256': hashlib.sha256(after_raw.encode()).hexdigest()})
+        owner = contract.one_ready_owner(current)
+        worker_after = contract.worker_waiting(current)
+        contract.check('startup restore has exactly one physical owner',
+            len(owner['processes']) == 1 and owner['native'].get('phase') == 'ready'
+            and owner['status'].get('observed') == 'ready'
+            and owner['status'].get('recovery_protection') is False
+            and not owner['status'].get('active_operation_id')
+            and owner['identity'].get('application_id') == contract.app
+            and worker_after.get('status') == 200 and worker_after.get('marker') == contract.marker
+            and worker_after.get('state') == 'ready' and len(worker_after.get('processes', [])) == 1,
+            {'owner': owner, 'worker': worker_after})
+        contract.verify_mounts(current, current_mounts, 'startup-restored')
+        blob = contract.execute(current, 'git', '-c', 'safe.directory=' + workspace, '-C', workspace,
+                                'show', git_before['commit'] + ':recovery-sentinel.txt')
+        worktree = contract.execute(current, 'cat', workspace + '/recovery-sentinel.txt')
+        contract.check('startup restore preserves original mounts data and Git',
+            blob == worktree == contract.marker
+            and hashlib.sha256(blob.encode()).hexdigest() == git_before['content_sha256'])
+        after_effects = contract.recovery_counters(current)
+        contract.check('startup restore does not replay committed deployment migration or SQL writes',
+                       after_effects == effects, {'before': effects, 'after': after_effects})
+        report['startup_artifact_downloads_diagnostic'] = {
+            'before_resume': fetched, 'after_resume': len(downloads), 'requests': downloads}
+        report['startup_recovered'] = recovered
+        contract.public_control('stop', 'cleanup-' + uuid.uuid4().hex, label='cleanup Stop')
+        contract.check('source stayed stable throughout the run', source_identity(repo) == report['source'])
+        if contract.owned_controller is None:
+            raise ValueError('startup restore requires its own isolated controller')
+        outcome = cleanup(contract.fixture_root, contract.owned_controller['run_id'], contract.owned_controller['case_id'])
+        report['controller_cleanup'] = report['cleanup'] = outcome
+        contract.check('owned containers removed and volumes retained',
+                       outcome.get('ok') is True and outcome.get('captured_containers_removed') is True
+                       and outcome.get('volumes_removed') is False, outcome)
+        contract.check('isolated controller and project network removed with data retained',
+                       outcome.get('ok') is True and outcome.get('network_removed') is True
+                       and outcome.get('volumes_removed') is False, outcome)
+        require_report_complete(report, required_steps=STARTUP_RESTORE_STEPS)
+        report.update(full_owned_acceptance=True, success=True)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--url', help='optional existing isolated loopback controller; requires --controller-container')
@@ -964,11 +1353,15 @@ def main():
     parser.add_argument('--controller-container', help='captured isolated RCoder full container ID')
     parser.add_argument('--user-id', default='prod-contract-user')
     parser.add_argument('--api-key', default=os.environ.get('RCODER_E2E_API_KEY'))
+    parser.add_argument('--scenario', choices=('all', 'startup-failed-restore'), default='all',
+                        help='Both require paired Main/Runtime build identities; the new fault scenario owns a fresh controller')
     args = parser.parse_args()
     if bool(args.url) != bool(args.controller_container):
         parser.error('--url and --controller-container must be supplied together')
     if args.controller_container and not args.api_key:
         parser.error('external isolated controller requires its existing --api-key')
+    if args.scenario == 'startup-failed-restore' and args.controller_container:
+        parser.error('startup-failed-restore creates its own isolated control plane')
     args.api_key = args.api_key or 'sk-' + uuid.uuid4().hex
     if args.url:
         parsed = urllib.parse.urlsplit(args.url)
@@ -1048,6 +1441,9 @@ def main():
         contract.sql(base_cid, 'CREATE TABLE public.codex_contract_sentinel (id integer PRIMARY KEY, marker text NOT NULL)')
         contract.sql(base_cid, f"INSERT INTO public.codex_contract_sentinel VALUES (1, '{contract.marker}')")
         contract.verify_mounts(base_cid, base_mounts, 'base')
+        if args.scenario == 'startup-failed-restore':
+            run_startup_restore(contract, repo)
+            return 0
         directory = Path(tempfile.mkdtemp(prefix='prod-readiness-contract-'))
         artifact = make_artifact(repo, directory, release, contract.marker)
         payload = artifact.read_bytes()

@@ -91,6 +91,7 @@
     "userapp_hot_deployment_builtin_contract",
     "userapp_hot_deployment_supervisord_contract",
     "userapp_prod_readiness_contract",
+    "userapp_prod_startup_failed_restore_contract",
     "userapp_worker_builtin_contract",
     "userapp_worker_supervisord_contract"
   ],
