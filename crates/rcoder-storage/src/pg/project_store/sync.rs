@@ -135,6 +135,53 @@ pub(crate) async fn sync_once(
         }
     }
 
+    // 1b) 容器删除对账：本地注册表有而 PG containers 快照无 → 二次确认后
+    //     移除注册表与镜像条目。peer 副本 cleaner/stop 的 durable 删除只清
+    //     自己的内存镜像（DB 行 + tombstone 是唯一事实源），本 pass 是其跨
+    //     副本失效通道；否则镜像残留的旧 workload UID 会把后续注册误判为
+    //     外部替换。护栏：二次确认（屏障后直查）+ baseline 身份相等 +
+    //     无本地 project 引用，任一不满足保守保留待下轮。
+    let pg_container_names: std::collections::HashSet<&str> = containers
+        .iter()
+        .map(|row| row.container_name.as_str())
+        .collect();
+    let registered_names: Vec<String> = store
+        .container_registration
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .keys()
+        .cloned()
+        .collect();
+    for name in registered_names {
+        if pg_container_names.contains(name.as_str())
+            || self_confirm_container_alive(store, pool, &name).await
+        {
+            continue;
+        }
+        let expected = baseline_containers
+            .get(&name)
+            .and_then(|identity| identity.physical_uid.clone());
+        {
+            let _registration = store.registration.lock().unwrap_or_else(|p| p.into_inner());
+            let mut registrations = store
+                .container_registration
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if registrations.get(&name) != baseline_containers.get(&name) {
+                continue;
+            }
+            registrations.remove(&name);
+        }
+        if store
+            .inner()
+            .prune_container_mirror(&name, expected.as_deref())
+        {
+            info!(
+                "[STORAGE_PG] sync remove container registration {name} (deleted on peer replica)"
+            );
+        }
+    }
+
     // 2) 新增/变更：PG 有而镜像无 → 补入；都有 → 签名比对后按需重建
     let container_by_name = container_rows_to_map(containers);
     let mut changed = 0usize;
@@ -239,6 +286,32 @@ async fn self_confirm_session_alive(
             Ok(alive) => alive,
             Err(e) => {
                 debug!("[STORAGE_PG] sync remove-confirm query failed (keeping): {e}");
+                true
+            }
+        }
+    } else {
+        true
+    }
+}
+
+/// 容器注册表二次确认：短排空后按 name 直查 containers 行（屏障后本地
+/// 新注册的容器必已落库，不会被误判为远端删除）。PG 故障时返回 true
+/// （宁可不删也不误删——下轮 sync 再收敛）。
+async fn self_confirm_container_alive(store: &PgStore, pool: &DatabaseOwner, name: &str) -> bool {
+    if store.wait_drained(Duration::from_millis(200)).await {
+        let name = name.to_owned();
+        match super::database::read(pool, move |tx| {
+            Box::pin(async move {
+                repo::fetch_container_registration(tx, &name)
+                    .await
+                    .map(|row| row.is_some())
+            })
+        })
+        .await
+        {
+            Ok(alive) => alive,
+            Err(e) => {
+                debug!("[STORAGE_PG] sync container remove-confirm failed (keeping): {e}");
                 true
             }
         }

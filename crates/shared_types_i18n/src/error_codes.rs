@@ -202,6 +202,9 @@ pub const ERR_COMPUTER_OWNER_CONFLICT: &str = "ERR_COMPUTER_OWNER_CONFLICT";
 pub const COMPUTER_OWNER_USER_MISMATCH: &str = "COMPUTER_OWNER_USER_MISMATCH";
 pub const COMPUTER_OWNER_POD_MISMATCH: &str = "COMPUTER_OWNER_POD_MISMATCH";
 pub const COMPUTER_OWNER_SERVICE_FAMILY_MISMATCH: &str = "COMPUTER_OWNER_SERVICE_FAMILY_MISMATCH";
+/// The durable binding still names another live workload under the same
+/// container name; recovery requires an explicit project stop, not a retry.
+pub const CONTAINER_WORKLOAD_REPLACED: &str = "CONTAINER_WORKLOAD_REPLACED";
 /// Another application operation owns the admission slot or physical lease.
 /// Retry safety is carried in OperationInProgressData, not implied by this code.
 pub const ERR_OPERATION_IN_PROGRESS: &str = "ERR_OPERATION_IN_PROGRESS";
@@ -390,6 +393,7 @@ pub fn get_error_hint(reason_code: &str, locale: &str) -> String {
         COMPUTER_OWNER_USER_MISMATCH => "hint.computer_owner_user_mismatch",
         COMPUTER_OWNER_POD_MISMATCH => "hint.computer_owner_pod_mismatch",
         COMPUTER_OWNER_SERVICE_FAMILY_MISMATCH => "hint.computer_owner_service_family_mismatch",
+        CONTAINER_WORKLOAD_REPLACED => "hint.container_workload_replaced",
         _ => "hint.runtime_failure",
     };
     t(key, locale)

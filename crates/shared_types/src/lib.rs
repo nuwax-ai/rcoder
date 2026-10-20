@@ -1,6 +1,8 @@
 mod agent;
 mod computer_registration_error;
-pub use computer_registration_error::{ComputerOwnerMismatch, computer_registration_app_error};
+pub use computer_registration_error::{
+    ComputerOwnerMismatch, ContainerWorkloadReplaced, computer_registration_app_error,
+};
 mod agent_registration;
 pub use agent_registration::{
     AgentRegistrationChange, AgentWorkspaceIdentity, VerifiedAgentReplacement,

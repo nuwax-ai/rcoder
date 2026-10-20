@@ -57,12 +57,44 @@ impl From<ComputerOwnerMismatch> for AppError {
     }
 }
 
+/// The durable container binding still names a different live workload under
+/// the same container name. Values stay in internal logs; the HTTP diagnostic
+/// only exposes the mismatch dimension.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "Container workload was replaced ({registered_workload_uid} -> {observed_workload_uid}); \
+     stop the project to retire the stale binding before re-ensuring"
+)]
+pub struct ContainerWorkloadReplaced {
+    pub container_name: String,
+    pub registered_workload_uid: String,
+    pub observed_workload_uid: String,
+}
+
+impl From<ContainerWorkloadReplaced> for AppError {
+    fn from(_replaced: ContainerWorkloadReplaced) -> Self {
+        let message_key = "error.container_workload_replaced";
+        Self::with_i18n_key(error_codes::ERR_COMPUTER_OWNER_CONFLICT, message_key)
+            .with_error_detail(
+                ErrorDetail::new(
+                    error_codes::CONTAINER_WORKLOAD_REPLACED,
+                    "computer.registration.before_dispatch",
+                    crate::get_i18n_message(message_key, crate::current_request_locale()),
+                )
+                .with_retryable(false),
+            )
+    }
+}
+
 /// Preserve typed registration errors through anyhow context. Infrastructure
 /// failures keep their original 500/503 classification; text is never parsed.
 pub fn computer_registration_app_error(error: anyhow::Error) -> AppError {
     match error.downcast::<ComputerOwnerMismatch>() {
         Ok(mismatch) => mismatch.into(),
-        Err(error) => error.downcast::<AppError>().unwrap_or_else(AppError::from),
+        Err(error) => match error.downcast::<ContainerWorkloadReplaced>() {
+            Ok(replaced) => replaced.into(),
+            Err(error) => error.downcast::<AppError>().unwrap_or_else(AppError::from),
+        },
     }
 }
 
@@ -115,6 +147,50 @@ mod tests {
                 })
                 .await;
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn workload_replaced_http_contract_is_conflict_and_never_authorizes_retry() {
+        for locale in crate::i18n::SUPPORTED_LOCALES {
+            crate::scope_request_locale(locale, async {
+                let replaced = ContainerWorkloadReplaced {
+                    container_name: "rcoder-computer-agent-runner-9".to_string(),
+                    registered_workload_uid: "registered-uid".to_string(),
+                    observed_workload_uid: "observed-uid".to_string(),
+                };
+                let error = anyhow::Error::new(replaced)
+                    .context("private_registered_uid private_observed_uid");
+                let response = computer_registration_app_error(error).into_response();
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                let bytes = to_bytes(response.into_body(), 8192).await.unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["code"], error_codes::ERR_COMPUTER_OWNER_CONFLICT);
+                assert_eq!(body["success"], false);
+                assert_eq!(
+                    body["error_detail"]["reason_code"],
+                    error_codes::CONTAINER_WORKLOAD_REPLACED
+                );
+                assert_eq!(
+                    body["error_detail"]["stage"],
+                    "computer.registration.before_dispatch"
+                );
+                assert_eq!(body["error_detail"]["retryable"], false);
+                assert_eq!(
+                    body["message"],
+                    crate::get_i18n_message("error.container_workload_replaced", locale)
+                );
+                assert_eq!(
+                    body["error_detail"]["hint"],
+                    crate::get_error_hint(error_codes::CONTAINER_WORKLOAD_REPLACED, locale)
+                );
+                let text = String::from_utf8(bytes.to_vec()).unwrap();
+                assert!(!text.contains("private_registered_uid"));
+                assert!(!text.contains("private_observed_uid"));
+                assert!(!text.contains("registered-uid"));
+                assert!(!text.contains("observed-uid"));
+            })
+            .await;
         }
     }
 

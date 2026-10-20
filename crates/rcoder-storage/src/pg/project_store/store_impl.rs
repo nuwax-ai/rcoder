@@ -84,7 +84,13 @@ impl ProjectStore for PgStore {
             !self.closing.load(std::sync::atomic::Ordering::Acquire),
             "Persistence is shutting down"
         );
-        let info = self.prepare_info(info, &registration)?;
+        // 同步 trait 入口无法 await 权威读：门禁沿用镜像比对（MirrorOnly），
+        // 镜像由 sync 容器删除对账收敛。
+        let info = self.prepare_info(
+            info,
+            &registration,
+            &super::authoritative::GateAuthority::MirrorOnly,
+        )?;
         self.inner.insert(project_id, Arc::clone(&info))?;
         self.persist_upsert(&info)
     }
@@ -104,7 +110,11 @@ impl ProjectStore for PgStore {
             !self.closing.load(std::sync::atomic::Ordering::Acquire),
             "Persistence is shutting down"
         );
-        let mut info = self.prepare_info(info, &registration)?;
+        let mut info = self.prepare_info(
+            info,
+            &registration,
+            &super::authoritative::GateAuthority::MirrorOnly,
+        )?;
         if let Some(sid) = session_id {
             Arc::make_mut(&mut info).add_session(sid);
         }

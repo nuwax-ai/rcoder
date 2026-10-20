@@ -765,3 +765,345 @@ async fn workload_generation_gate_allows_rebind_only_for_same_workload() {
     // -W let-underscore-drop 告警，语义相同、意图更明确）。
     drop(pool);
 }
+
+/// 事故反例（2026-10-20 多副本 stale 绑定）：peer 副本 cleaner/stop 的
+/// durable 删除（STS + PG 行 + tombstone）只清自己的内存；本副本镜像残留
+/// 旧 workload UID，chat 落到本副本重建容器并 durable 注册时，权威门必须
+/// 按 DB（行已删 + tombstone 在案）放行自我换代——修复前被残留镜像误判为
+/// 外部替换，`/computer/chat` 永久 500。
+#[tokio::test]
+async fn authoritative_gate_allows_replacement_after_peer_delete() {
+    let Some(dsn) = test_dsn().await else {
+        eprintln!("[skip] {DSN_ENV} not set");
+        return;
+    };
+    let project_id = format!("wrep-peer-{}", uuid_suffix());
+    let container_name = format!("rcoder-car-{project_id}");
+    let mk = |physical: &str, workload: &str| ContainerBasicInfo {
+        container_id: format!("{physical}-{project_id}"),
+        container_name: container_name.clone(),
+        container_ip: "10.42.0.9".into(),
+        internal_port: 50051,
+        external_port: 0,
+        project_id: project_id.clone(),
+        status: "running".into(),
+        created_at: chrono::Utc::now(),
+        service_url: format!("http://{container_name}"),
+        workload_uid: Some(workload.into()),
+    };
+    let project_for = |container: ContainerBasicInfo| {
+        let mut info = ProjectAndContainerInfo::new(project_id.clone());
+        info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+        info.set_user_id(Some(format!("user-{project_id}")));
+        info.set_container(Some(container));
+        Arc::new(info)
+    };
+
+    let (store_a, _rx_a) =
+        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+            .await
+            .expect("connect A");
+    store_a
+        .insert_project_registration_durable(
+            project_id.clone(),
+            project_for(mk("pod-a", "sts-uid-old")),
+        )
+        .await
+        .expect("A registers the original binding");
+    assert!(
+        store_a.wait_drained(Duration::from_secs(5)).await,
+        "A register drain"
+    );
+
+    // 副本 B 后连（镜像含旧 UID），随后 A durable 删除（写 tombstone）。
+    let (store_b, _rx_b) =
+        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+            .await
+            .expect("connect B");
+    let (deleted, projects) = store_a
+        .delete_container_with_projects_durable(&format!("pod-a-{project_id}"))
+        .await;
+    assert!(
+        (deleted, projects) == (true, 1),
+        "A durable delete: {deleted}/{projects}"
+    );
+    assert!(
+        store_a.wait_drained(Duration::from_secs(5)).await,
+        "A delete drain"
+    );
+
+    // B 不 sync、不重启，直接以重建后的新 workload durable 注册（事故路径）。
+    let rebound = store_b
+        .insert_project_registration_durable(
+            project_id.clone(),
+            project_for(mk("pod-b", "sts-uid-new")),
+        )
+        .await;
+    assert!(
+        rebound.is_ok(),
+        "peer-deleted binding must re-register via the authoritative gate: {rebound:?}"
+    );
+
+    // DB 为事实源：新行重建、旧代次 tombstone 在案。
+    let pool_b = store_b.database.clone();
+    assert!(
+        wait_for(
+            &pool_b,
+            &format!(
+                "SELECT count(*) FROM containers WHERE container_name='{container_name}' AND container_id='pod-b-{project_id}'"
+            ),
+            1
+        )
+        .await,
+        "new container row must be rebuilt"
+    );
+    assert!(
+        wait_for(
+            &pool_b,
+            &format!(
+                "SELECT count(*) FROM container_tombstones WHERE container_name='{container_name}'"
+            ),
+            1
+        )
+        .await,
+        "the retired generation must keep its tombstone"
+    );
+
+    let _ = store_b
+        .writer()
+        .flush_and_stop(Duration::from_secs(5))
+        .await;
+    let _ = store_a
+        .writer()
+        .flush_and_stop(Duration::from_secs(5))
+        .await;
+}
+
+/// Fix 2：peer 删除后 sync 必须失效本地容器注册表与镜像（DB 是唯一事实源），
+/// 收敛后新 workload 注册成功。
+#[tokio::test]
+async fn cross_replica_sync_removes_stale_container_mirror() {
+    let Some(dsn) = test_dsn().await else {
+        eprintln!("[skip] {DSN_ENV} not set");
+        return;
+    };
+    let project_id = format!("wrep-sync-{}", uuid_suffix());
+    let container_name = format!("rcoder-car-{project_id}");
+    let mk = |physical: &str, workload: &str| ContainerBasicInfo {
+        container_id: format!("{physical}-{project_id}"),
+        container_name: container_name.clone(),
+        container_ip: "10.42.0.9".into(),
+        internal_port: 50051,
+        external_port: 0,
+        project_id: project_id.clone(),
+        status: "running".into(),
+        created_at: chrono::Utc::now(),
+        service_url: format!("http://{container_name}"),
+        workload_uid: Some(workload.into()),
+    };
+    let project_for = |container: ContainerBasicInfo| {
+        let mut info = ProjectAndContainerInfo::new(project_id.clone());
+        info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+        info.set_user_id(Some(format!("user-{project_id}")));
+        info.set_container(Some(container));
+        Arc::new(info)
+    };
+
+    let (store_a, _rx_a) =
+        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+            .await
+            .expect("connect A");
+    store_a
+        .insert_project_registration_durable(
+            project_id.clone(),
+            project_for(mk("pod-a", "sts-uid-old")),
+        )
+        .await
+        .expect("A registers the original binding");
+    assert!(
+        store_a.wait_drained(Duration::from_secs(5)).await,
+        "A register drain"
+    );
+
+    let (store_b, _rx_b) =
+        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+            .await
+            .expect("connect B");
+    let (deleted, projects) = store_a
+        .delete_container_with_projects_durable(&format!("pod-a-{project_id}"))
+        .await;
+    assert!(
+        (deleted, projects) == (true, 1),
+        "A durable delete: {deleted}/{projects}"
+    );
+    assert!(
+        store_a.wait_drained(Duration::from_secs(5)).await,
+        "A delete drain"
+    );
+
+    assert!(
+        store_b
+            .container_registration
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&container_name),
+        "precondition: B mirror still holds the stale binding"
+    );
+    sync::sync_once(&store_b, store_b.inner(), &store_b.database)
+        .await
+        .expect("sync once");
+    assert!(
+        !store_b
+            .container_registration
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&container_name),
+        "peer-deleted container must leave B's registration map"
+    );
+    assert!(
+        !store_b
+            .inner()
+            .get_all_container_records()
+            .iter()
+            .any(|c| c.container_name == container_name),
+        "peer-deleted container must leave B's adapter mirror"
+    );
+
+    let rebound = store_b
+        .insert_project_registration_durable(
+            project_id.clone(),
+            project_for(mk("pod-b", "sts-uid-new")),
+        )
+        .await;
+    assert!(
+        rebound.is_ok(),
+        "converged replica must accept the rebuilt workload: {rebound:?}"
+    );
+
+    let _ = store_b
+        .writer()
+        .flush_and_stop(Duration::from_secs(5))
+        .await;
+    let _ = store_a
+        .writer()
+        .flush_and_stop(Duration::from_secs(5))
+        .await;
+}
+
+/// 守卫用例：DB 绑定仍在的 workload 替换（真外部替换）保持拒绝且类型化为
+/// 409 冲突；行与 tombstone 俱无（绕过 durable 的手工删行）同样拒绝。
+#[tokio::test]
+async fn external_workload_replacement_still_refused_as_conflict() {
+    let Some(dsn) = test_dsn().await else {
+        eprintln!("[skip] {DSN_ENV} not set");
+        return;
+    };
+    let project_id = format!("wrep-ext-{}", uuid_suffix());
+    let container_name = format!("rcoder-car-{project_id}");
+    let mk = |physical: &str, workload: &str| ContainerBasicInfo {
+        container_id: format!("{physical}-{project_id}"),
+        container_name: container_name.clone(),
+        container_ip: "10.42.0.9".into(),
+        internal_port: 50051,
+        external_port: 0,
+        project_id: project_id.clone(),
+        status: "running".into(),
+        created_at: chrono::Utc::now(),
+        service_url: format!("http://{container_name}"),
+        workload_uid: Some(workload.into()),
+    };
+    let project_for = |container: ContainerBasicInfo| {
+        let mut info = ProjectAndContainerInfo::new(project_id.clone());
+        info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+        info.set_user_id(Some(format!("user-{project_id}")));
+        info.set_container(Some(container));
+        Arc::new(info)
+    };
+
+    let (store_a, _rx_a) =
+        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+            .await
+            .expect("connect A");
+    store_a
+        .insert_project_registration_durable(
+            project_id.clone(),
+            project_for(mk("pod-a", "sts-uid-old")),
+        )
+        .await
+        .expect("A registers the original binding");
+    assert!(
+        store_a.wait_drained(Duration::from_secs(5)).await,
+        "A register drain"
+    );
+
+    let (store_b, _rx_b) =
+        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+            .await
+            .expect("connect B");
+
+    // 真外部替换：DB 行仍在（sts-uid-old），B 观察到 sts-uid-new → 拒绝。
+    let refused = store_b
+        .insert_project_registration_durable(
+            project_id.clone(),
+            project_for(mk("pod-b", "sts-uid-new")),
+        )
+        .await
+        .expect_err("an externally replaced workload must never be auto-rebound");
+    let typed = refused
+        .downcast_ref::<shared_types::ContainerWorkloadReplaced>()
+        .expect("the refusal is the typed 409 conflict");
+    assert_eq!(typed.container_name, container_name);
+    assert_eq!(typed.registered_workload_uid, "sts-uid-old");
+    assert_eq!(typed.observed_workload_uid, "sts-uid-new");
+    assert_eq!(
+        store_b
+            .container_registration
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&container_name)
+            .and_then(|identity| identity.physical_uid.as_deref()),
+        Some(format!("pod-a-{project_id}").as_str()),
+        "refusal must not mutate the local registration"
+    );
+
+    // 异常态：绕过 durable 直接删行（无 tombstone）→ 同样拒绝，不静默放行。
+    let owner = store_a.database.clone();
+    let raw_name = container_name.clone();
+    owner
+        .execute(move |mut db| async move {
+            // 模拟手工动库：绕过 durable 路径直接删行（无 tombstone）。
+            toasty::sql::query("DELETE FROM projects WHERE container_name=$1")
+                .bind(raw_name.as_str())
+                .exec(&mut db)
+                .await?;
+            toasty::sql::query("DELETE FROM containers WHERE container_name=$1")
+                .bind(raw_name)
+                .exec(&mut db)
+                .await?;
+            Ok(Vec::<toasty_core::stmt::Value>::new())
+        })
+        .await
+        .expect("raw row delete");
+    let anomalous = store_b
+        .insert_project_registration_durable(
+            project_id.clone(),
+            project_for(mk("pod-c", "sts-uid-newer")),
+        )
+        .await
+        .expect_err("a vanished binding without a tombstone must stay refused");
+    assert!(
+        anomalous
+            .to_string()
+            .contains("vanished without a retirement record"),
+        "anomalous absence keeps an explicit refusal, got: {anomalous:#}"
+    );
+
+    let _ = store_b
+        .writer()
+        .flush_and_stop(Duration::from_secs(5))
+        .await;
+    let _ = store_a
+        .writer()
+        .flush_and_stop(Duration::from_secs(5))
+        .await;
+}

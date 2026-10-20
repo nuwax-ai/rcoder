@@ -89,6 +89,40 @@ impl ProjectAdapter {
         Ok(())
     }
 
+    /// 移除本地容器镜像条目（peer 副本已 durable 删除后的镜像收敛）。
+    ///
+    /// 与 [`Self::delete_container_with_projects`] 的差异：不发送
+    /// CleanupRequest（物理对象已由执行删除的副本清理），且要求该容器无
+    /// 本地 project 引用。`expected_physical_uid` 与条目实际身份不符时返回
+    /// false（快照之后本地已有新写入，保守留待下一轮对账）。
+    #[cfg(feature = "pg")]
+    pub(crate) fn prune_container_mirror(
+        &self,
+        name: &str,
+        expected_physical_uid: Option<&str>,
+    ) -> bool {
+        let _container_guard = self.container_locks.entry_by_ref(name);
+        if self
+            .project_to_container
+            .iter()
+            .any(|entry| entry.value() == name)
+        {
+            return false;
+        }
+        let Entry::Occupied(entry) = self.containers.entry(name.to_string()) else {
+            return false;
+        };
+        let info = entry.get().info();
+        let actual = (!info.container_id.is_empty()).then_some(info.container_id.as_str());
+        if actual != expected_physical_uid {
+            return false;
+        }
+        let (_name, removed) = entry.remove_entry();
+        let info = removed.info();
+        self.container_id_to_key.remove(&info.container_id);
+        true
+    }
+
     /// 删除容器及其关联的所有项目（RAII 触发物理销毁）
     ///
     /// 返回 (容器是否存在, 删除的项目数)

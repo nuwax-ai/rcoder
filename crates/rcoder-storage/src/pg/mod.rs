@@ -36,6 +36,9 @@ use tracing::info;
 
 use shared_types::{ContainerLookup, ProjectAndContainerInfo, ServiceType};
 
+use self::project_store::authoritative::{
+    AuthoritativeContainerBinding, AuthoritativeVerificationRequired, GateAuthority,
+};
 use self::project_store::persist_ops::PersistOp;
 use crate::adapter::{ProjectAdapter, container_entry_key};
 use crate::config::PostgresConfig;
@@ -233,6 +236,7 @@ impl PgStore {
         &self,
         mut info: Arc<ProjectAndContainerInfo>,
         retired: &std::collections::HashMap<String, String>,
+        authority: &GateAuthority,
     ) -> anyhow::Result<Arc<ProjectAndContainerInfo>> {
         anyhow::ensure!(
             !self
@@ -275,8 +279,14 @@ impl PgStore {
             let key = container_entry_key(&info);
             // A new project still shares the canonical physical container with
             // existing projects. Its own missing row does not authorize a
-            // workload change through ordinary registration.
-            if registered_workload_uid.is_none() {
+            // workload change through ordinary registration. 权威快照在场时
+            // 门禁只认 DB 值；镜像回退供 Deferred/MirrorOnly 路径判定。
+            if registered_workload_uid.is_none()
+                && matches!(
+                    authority,
+                    GateAuthority::Deferred | GateAuthority::MirrorOnly
+                )
+            {
                 registered_workload_uid = self
                     .inner
                     .registered_container_by_key(&key)
@@ -320,21 +330,64 @@ impl PgStore {
                         physical_uid.is_some(),
                         "A placeholder cannot clear a bound container identity"
                     );
-                    // 契约三行3/§1.2：同名 workload 对象已被替换（注册与观察的
-                    // workload UID 均在且不同）→ 禁止自动换代重绑——自动接管
-                    // 会把 projects/sessions 绑到别人的 workload 上；需显式
-                    // 恢复路径处置旧绑定。任一方缺 workload UID（Docker/
-                    // bare-pod/Deployment 族）不在此门内，按既有换代事务走。
-                    if let (Some(registered), Some(observed)) = (
-                        registered_workload_uid.as_deref(),
-                        basic.workload_uid.as_deref(),
-                    ) {
-                        anyhow::ensure!(
-                            registered == observed,
-                            "Container workload was replaced ({registered} -> {observed}); \
-                             stop the project to retire the stale binding before re-ensuring"
-                        );
+                    // 契约三行3/§1.2：同名 workload 对象已被替换 → 禁止自动换代
+                    // 重绑——自动接管会把 projects/sessions 绑到别人的 workload 上。
+                    // 裁决依据是权威快照（containers 行 + tombstone），内存镜像
+                    // 只是缓存：本系统已退役（tombstone 在案）的自我换代放行；
+                    // DB 绑定仍指向在案的旧 workload 属真外部替换，拒绝（409）；
+                    // 行与 tombstone 俱无属手工动库等异常状态，同样拒绝。
+                    // 任一方缺 workload UID（Docker/bare-pod/Deployment 族）不进
+                    // 此门，按既有换代事务走。
+                    let observed = basic.workload_uid.as_deref();
+                    let mirror_mismatch = match (registered_workload_uid.as_deref(), observed) {
+                        (Some(registered), Some(observed)) => registered != observed,
+                        _ => false,
+                    };
+                    match authority {
+                        GateAuthority::Snapshot(read) => match &read.binding {
+                            // 本系统已退役（tombstone 在案）的自我换代：放行换代事务。
+                            AuthoritativeContainerBinding::RetiredByUs => {}
+                            AuthoritativeContainerBinding::AnomalousAbsent => {
+                                tracing::warn!(
+                                    container = %key,
+                                    "authoritative container binding missing without a tombstone"
+                                );
+                                anyhow::bail!(
+                                    "Container binding vanished without a retirement record; \
+                                     stop the project to retire the stale binding before re-ensuring"
+                                );
+                            }
+                            AuthoritativeContainerBinding::Bound {
+                                workload_uid: registered,
+                            } => {
+                                if let (Some(registered), Some(observed)) =
+                                    (registered.as_deref(), observed)
+                                    && registered != observed
+                                {
+                                    return Err(anyhow::Error::new(
+                                        shared_types::ContainerWorkloadReplaced {
+                                            container_name: key.clone(),
+                                            registered_workload_uid: registered.to_string(),
+                                            observed_workload_uid: observed.to_string(),
+                                        },
+                                    ));
+                                }
+                            }
+                        },
+                        GateAuthority::Deferred if mirror_mismatch => {
+                            return Err(anyhow::Error::new(AuthoritativeVerificationRequired {
+                                name: key.clone(),
+                            }));
+                        }
+                        GateAuthority::MirrorOnly if mirror_mismatch => {
+                            anyhow::bail!(
+                                "Container workload was replaced ({registered_workload_uid:?} -> {observed:?}); \
+                                 stop the project to retire the stale binding before re-ensuring"
+                            );
+                        }
+                        GateAuthority::Deferred | GateAuthority::MirrorOnly => {}
                     }
+                    // 走既有换代事务（新 generation + predecessor 捕获）。
                     shared_types::persistence::ContainerPersistenceIdentity {
                         generation: uuid_generation(),
                         revision: 1,

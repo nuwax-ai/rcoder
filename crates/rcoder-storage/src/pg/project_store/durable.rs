@@ -85,20 +85,60 @@ impl PgStore {
             }
             Ok(Err(error)) => return Err(error),
         }
-        let (pending, captured) = {
-            let registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
-            anyhow::ensure!(
-                !self.closing.load(std::sync::atomic::Ordering::Acquire),
-                "Persistence is shutting down"
-            );
-            let info = self.prepare_info(info, &registration)?;
-            let op = super::persist_ops::registration_for_metadata(&info)?;
-            self.inner.insert(project_id.clone(), Arc::clone(&info))?;
-            let captured = self
-                .inner
-                .get(&project_id)
-                .ok_or_else(|| anyhow::anyhow!("Registered project disappeared"))?;
-            (self.register_durable(vec![op]), captured)
+        // 门禁惰性权威验证：常规路径零额外 DB 读（挂起点与既有语义不变）；
+        // 仅当镜像判定同名 workload 被替换时，出锁读权威快照（DB 行 +
+        // tombstone）裁决一次——peer 已退役则先失效本地旧代次镜像、以全新
+        // 身份重试，保证事故路径（peer 删除 + 本副本镜像残留）首次注册即可
+        // 落库。准入（prepare/op/镜像写入/op 登记）与权威读严格分段持锁。
+        let mut authority = super::authoritative::GateAuthority::Deferred;
+        let (pending, captured) = 'admission: {
+            loop {
+                // Some = 准入完成（op 已在锁内登记）；None = 需要权威裁决。
+                let step = {
+                    let registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+                    if self.closing.load(std::sync::atomic::Ordering::Acquire) {
+                        return Err(anyhow::anyhow!("Persistence is shutting down"));
+                    }
+                    match self.prepare_info(Arc::clone(&info), &registration, &authority) {
+                        Ok(prepared) => {
+                            let op = super::persist_ops::registration_for_metadata(&prepared)?;
+                            self.inner
+                                .insert(project_id.clone(), Arc::clone(&prepared))?;
+                            let captured = self
+                                .inner
+                                .get(&project_id)
+                                .ok_or_else(|| anyhow::anyhow!("Registered project disappeared"))?;
+                            Some((self.register_durable(vec![op]), captured))
+                        }
+                        Err(error) => {
+                            let needs_authority = matches!(
+                                authority,
+                                super::authoritative::GateAuthority::Deferred
+                            ) && error
+                                .downcast_ref::<super::authoritative::AuthoritativeVerificationRequired>()
+                                .is_some();
+                            if needs_authority {
+                                None
+                            } else {
+                                return Err(error);
+                            }
+                        }
+                    }
+                };
+                match step {
+                    Some(admitted) => break 'admission admitted,
+                    None => {
+                        let name = container_entry_key(&info);
+                        let read = self.read_authoritative_container_binding(&name).await?;
+                        if read.binding
+                            == super::authoritative::AuthoritativeContainerBinding::RetiredByUs
+                        {
+                            self.retire_peer_deleted_binding(&read);
+                        }
+                        authority = super::authoritative::GateAuthority::Snapshot(read);
+                    }
+                }
+            }
         };
         let outcome = self
             .execute_durable_before(pending, "register_project", deadline)
@@ -340,18 +380,56 @@ impl PgStore {
                 .is_some(),
             "An established session identity is required"
         );
-        let ops = {
-            let registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
-            anyhow::ensure!(
-                !self.closing.load(std::sync::atomic::Ordering::Acquire),
-                "Persistence is shutting down"
-            );
-            let mut info = self.prepare_info(info, &registration)?;
-            Arc::make_mut(&mut info).add_session(session_id);
-            let ops = structural_ops_for_insert(&info, session_id)?;
-            self.inner
-                .insert_with_session(project_id, info, Some(session_id))?;
-            self.register_durable(ops)
+        // 同 insert_project_registration_durable：镜像 workload 替换时出锁
+        // 读权威快照裁决，peer 已退役则失效本地残留后重试一次。
+        let mut authority = super::authoritative::GateAuthority::Deferred;
+        let ops = 'admission: {
+            loop {
+                let step = {
+                    let registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+                    if self.closing.load(std::sync::atomic::Ordering::Acquire) {
+                        return Err(anyhow::anyhow!("Persistence is shutting down"));
+                    }
+                    match self.prepare_info(Arc::clone(&info), &registration, &authority) {
+                        Ok(mut prepared) => {
+                            Arc::make_mut(&mut prepared).add_session(session_id);
+                            let ops = structural_ops_for_insert(&prepared, session_id)?;
+                            self.inner.insert_with_session(
+                                project_id.clone(),
+                                Arc::clone(&prepared),
+                                Some(session_id),
+                            )?;
+                            Some(self.register_durable(ops))
+                        }
+                        Err(error) => {
+                            let needs_authority = matches!(
+                                authority,
+                                super::authoritative::GateAuthority::Deferred
+                            ) && error
+                                .downcast_ref::<super::authoritative::AuthoritativeVerificationRequired>()
+                                .is_some();
+                            if needs_authority {
+                                None
+                            } else {
+                                return Err(error);
+                            }
+                        }
+                    }
+                };
+                match step {
+                    Some(ops) => break 'admission ops,
+                    None => {
+                        let name = container_entry_key(&info);
+                        let read = self.read_authoritative_container_binding(&name).await?;
+                        if read.binding
+                            == super::authoritative::AuthoritativeContainerBinding::RetiredByUs
+                        {
+                            self.retire_peer_deleted_binding(&read);
+                        }
+                        authority = super::authoritative::GateAuthority::Snapshot(read);
+                    }
+                }
+            }
         };
         self.execute_durable(ops, "insert_session").await;
         Ok(())

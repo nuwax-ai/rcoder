@@ -273,6 +273,8 @@ hint.computer_owner_conflict: "請聯絡管理員核對專案歸屬與請求身�
 error.computer_owner_user_mismatch: "目前會話關聯的執行帳號與本次請求不一致，訊息未傳送。"
 error.computer_owner_pod_mismatch: "目前會話關聯的執行個體與本次請求不一致，訊息未傳送。"
 error.computer_owner_service_family_mismatch: "目前會話的服務類型與本次請求不一致，訊息未傳送。"
+error.container_workload_replaced: "目前會話關聯的容器實例已被同名新工作負載替換且歸屬未登記，訊息未傳送。"
+hint.container_workload_replaced: "同名容器被外部重建且持久綁定仍指向舊工作負載，請先停止該專案釋放舊綁定後再重試；不要自動重試。"
 hint.computer_owner_user_mismatch: "請聯絡管理員核對會話關聯的執行帳號與本次請求帳號，修正後再傳送；不要自動重試。"
 hint.computer_owner_pod_mismatch: "請聯絡管理員核對會話關聯的執行個體與本次請求個體，修正後再傳送；不要自動重試。"
 hint.computer_owner_service_family_mismatch: "請聯絡管理員核對會話服務類型與本次請求類型，修正後再傳送；不要自動重試。"

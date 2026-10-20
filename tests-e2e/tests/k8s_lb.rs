@@ -673,6 +673,135 @@ async fn lb_stop_resume_same_sid_cross_entry() {
     assert_hard_all(report).await;
 }
 
+/// 2026-10-20 事故反例：pod/stop（durable 删除 + tombstone）经入口 A 后，
+/// 其他副本的容器注册表镜像残留旧 workload UID，后续 chat 落到这些副本会
+/// 被防接管门误拒（修复前 HTTP 500 "workload was replaced"）。修复后门禁
+/// 直读 DB 权威行（行已删 + tombstone 在案 = 本系统已退役的自我换代），
+/// 任一副本都必须直接受理重建后的 chat。
+#[tokio::test]
+#[ignore = "explicit K8s real-AI environment"]
+async fn lb_pod_stop_then_chat_cross_entry() {
+    let scenario = "lb_pod_stop_then_chat_cross_entry";
+    let Some((env, report, entries)) = k8s_or_skip(scenario).await else {
+        return;
+    };
+    let user = env.scoped_user("sblb");
+    let marker = format!("sb_ready_{}", uuid::Uuid::new_v4().simple());
+    let mut project_id = None;
+    let outcome: anyhow::Result<()> = async {
+        anyhow::ensure!(
+            entries.len() > 1 && entries[0] != entries[1],
+            "Cross-replica verification requires distinct K8s entries"
+        );
+        let first_request = env.base_payload(
+            Backend::Openai,
+            &format!("本轮只回复 {marker}，不要调用工具。"),
+            &format!("{}-before-pod-stop", env.run_tag),
+            &user,
+        );
+        let first = chat_reported(
+            &env,
+            &report,
+            "before_pod_stop",
+            &entries[0],
+            &first_request,
+        )
+        .await?;
+        project_id = Some(first.project_id.clone());
+        anyhow::ensure!(
+            first.error.is_none() && first.need_fallback != Some(true),
+            "Initial chat did not establish a usable session"
+        );
+
+        // 经入口 A 执行物理停止：等价于 cleaner 的 durable 删除路径（删 STS +
+        // PG 行 + tombstone），对其他副本构成 peer 删除。
+        let response = env
+            .http
+            .post(format!("{}/computer/pod/stop", entries[0]))
+            .timeout(Duration::from_secs(120))
+            .json(&json!({"user_id":user,"project_id":first.project_id,
+                "service_type":"computer-agent-runner"}))
+            .send()
+            .await?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await?;
+        anyhow::ensure!(
+            status.is_success() && body["code"] == "0000",
+            "Pod stop failed: HTTP {status}, response: {body}"
+        );
+
+        // 停止收敛：轮询状态直到不再存活（容器与注册记录一起消失）。
+        let mut converged = false;
+        for _ in 0..45 {
+            let status_response = env
+                .http
+                .get(format!("{}/computer/pod/status", entries[0]))
+                .timeout(Duration::from_secs(20))
+                .query(&[
+                    ("user_id", user.as_str()),
+                    ("project_id", first.project_id.as_str()),
+                    ("service_type", "computer-agent-runner"),
+                ])
+                .send()
+                .await;
+            if let Ok(response) = status_response {
+                let body: serde_json::Value =
+                    response.json().await.unwrap_or(serde_json::Value::Null);
+                let alive = body["data"]["alive"].as_bool();
+                if alive != Some(true) {
+                    converged = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        anyhow::ensure!(
+            converged,
+            "pod/status never left the alive state after pod/stop"
+        );
+
+        // 多轮经不同入口重建对话：每一轮都必须直接受理（修复前落在非执行
+        // 停止的副本会 500；5 轮全过的概率 <1%）。
+        for round in 0..5 {
+            let entry = &entries[round % entries.len()];
+            let mut request = env.base_payload(
+                Backend::Openai,
+                &format!("第 {} 轮：只回复 OK_{round}，不要调用工具。", round + 1),
+                &format!("{}-after-pod-stop-{round}", env.run_tag),
+                &user,
+            );
+            request.project_id = Some(first.project_id.clone());
+            let chat = chat_reported(
+                &env,
+                &report,
+                &format!("after_pod_stop_round_{round}"),
+                entry,
+                &request,
+            )
+            .await?;
+            report.assert_hard(
+                format!("停止后第 {} 轮跨副本 chat 直接受理", round + 1).as_str(),
+                chat.error.is_none() && chat.need_fallback != Some(true),
+                format!(
+                    "entry {entry}, error: {:?}, fallback: {:?}",
+                    chat.error, chat.need_fallback
+                ),
+            );
+        }
+        Ok(())
+    }
+    .await;
+    report.assert_hard(
+        "pod/stop 后跨副本 chat 全部自动恢复（无 workload replaced 500）",
+        outcome.is_ok(),
+        outcome
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "5 rounds of cross-entry chats accepted".into()),
+    );
+    assert_hard_all(report).await;
+}
+
 // gate 冒烟：无 TEST_K8S_SSH 时 skip 路径可走通（本地 compose 机器验证用）。
 #[tokio::test]
 async fn gate_k8s_or_skip_smoke() {

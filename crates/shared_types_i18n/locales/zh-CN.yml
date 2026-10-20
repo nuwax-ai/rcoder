@@ -277,6 +277,8 @@ hint.computer_owner_conflict: "请联系管理员核对项目归属与请求身�
 error.computer_owner_user_mismatch: "当前会话关联的运行账号与本次请求不一致，消息未发送。"
 error.computer_owner_pod_mismatch: "当前会话关联的运行实例与本次请求不一致，消息未发送。"
 error.computer_owner_service_family_mismatch: "当前会话的服务类型与本次请求不一致，消息未发送。"
+error.container_workload_replaced: "当前会话关联的容器实例已被同名新工作负载替换且归属未登记，消息未发送。"
+hint.container_workload_replaced: "同名容器被外部重建且持久绑定仍指向旧工作负载，请先停止该项目释放旧绑定后再重试；不要自动重试。"
 hint.computer_owner_user_mismatch: "请联系管理员核对会话关联的运行账号与本次请求账号，修正后再发送；不要自动重试。"
 hint.computer_owner_pod_mismatch: "请联系管理员核对会话关联的运行实例与本次请求实例，修正后再发送；不要自动重试。"
 hint.computer_owner_service_family_mismatch: "请联系管理员核对会话服务类型与本次请求类型，修正后再发送；不要自动重试。"

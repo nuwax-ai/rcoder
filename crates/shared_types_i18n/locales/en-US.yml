@@ -277,6 +277,8 @@ hint.computer_owner_conflict: "Ask an administrator to check the project ownersh
 error.computer_owner_user_mismatch: "The runtime account linked to this conversation does not match this request. No message was sent."
 error.computer_owner_pod_mismatch: "The runtime instance linked to this conversation does not match this request. No message was sent."
 error.computer_owner_service_family_mismatch: "The service type linked to this conversation does not match this request. No message was sent."
+error.container_workload_replaced: "The container linked to this conversation was replaced by a new same-name workload with no registered handover. No message was sent."
+hint.container_workload_replaced: "The same-name container was rebuilt externally while the durable binding still points to the old workload. Stop the project to release the stale binding before sending again. Do not retry automatically."
 hint.computer_owner_user_mismatch: "Ask an administrator to check the conversation runtime account against the request account before sending again. Do not retry automatically."
 hint.computer_owner_pod_mismatch: "Ask an administrator to check the conversation runtime instance against the request instance before sending again. Do not retry automatically."
 hint.computer_owner_service_family_mismatch: "Ask an administrator to check the conversation service type against the request type before sending again. Do not retry automatically."

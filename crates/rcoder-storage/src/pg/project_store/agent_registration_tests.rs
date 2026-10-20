@@ -610,7 +610,11 @@ async fn replacement_preserves_an_accepted_registration_before_database_dispatch
         let mut updated = (*store.get(&id).unwrap()).clone();
         updated.set_request_id(Some("accepted-newer-request".into()));
         let mut updated = store
-            .prepare_info(Arc::new(updated), &registration)
+            .prepare_info(
+                Arc::new(updated),
+                &registration,
+                &super::authoritative::GateAuthority::MirrorOnly,
+            )
             .unwrap();
         // Match insert_with_session_durable's admission order: prepare the
         // project identity first, then allocate the accepted session identity.

@@ -9,9 +9,9 @@ pub(in crate::pg) struct ContainerRow {
     pub container_generation: String,
     pub row_revision: i64,
     pub container_id: Option<String>,
-    /// §1.1 持久 workload 身份——schema 已冻结；读取方随契约四解析器
-    /// 分层批次接入（对账判"同 workload"），届时移除本豁免。
-    #[allow(dead_code)]
+    /// §1.1 持久 workload 身份——schema 已冻结；注册门禁的权威快照
+    /// （`authoritative::read_authoritative_container_binding`）读取本字段
+    /// 判定同名替换。
     pub workload_uid: Option<String>,
     pub logical_id: String,
     pub service_type: String,

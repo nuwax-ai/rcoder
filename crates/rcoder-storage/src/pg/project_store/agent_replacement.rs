@@ -164,7 +164,14 @@ impl PgStore {
                         generation,
                     });
                 }
-                published = (*self.prepare_info(Arc::new(published), &registration)?).clone();
+                // 本路径上游 verify_agent_replacement 已用 SQL 快照证明换代，
+                // 门禁无需再读权威快照（MirrorOnly = 镜像比对）。
+                published = (*self.prepare_info(
+                    Arc::new(published),
+                    &registration,
+                    &super::authoritative::GateAuthority::MirrorOnly,
+                )?)
+                .clone();
                 self.inner.insert(
                     published.project_id().to_owned(),
                     Arc::new(published.clone()),
