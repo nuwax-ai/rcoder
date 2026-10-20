@@ -43,6 +43,8 @@ pub(crate) use access::BuilderAccessIntent;
 pub(crate) use access::tests::{
     fixture as builder_access_test_state, stopped as builder_stop_fixture,
 };
+#[cfg(all(test, feature = "rcoder-pg", feature = "userapp-turso"))]
+pub(crate) use creation::fence_settler_tests::FenceRuntime;
 #[cfg(test)]
 pub(crate) use creation::fence_settler_tests::runtime_state as builder_runtime_test_state;
 mod dev_cleanup;

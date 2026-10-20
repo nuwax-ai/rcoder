@@ -209,10 +209,11 @@ impl crate::pg::PgStore {
         &self,
         project_id: &str,
     ) -> anyhow::Result<Option<Arc<ProjectAndContainerInfo>>> {
+        let deadline = tokio::time::Instant::now() + Self::DURABLE_COMMIT_TIMEOUT;
         if let Some(current) = self.inner.get(project_id) {
             self.reconcile_rejected_container_intent(
                 &crate::adapter::container_entry_key(&current),
-                tokio::time::Instant::now() + Self::DURABLE_COMMIT_TIMEOUT,
+                deadline,
             )
             .await?;
         }
@@ -220,7 +221,7 @@ impl crate::pg::PgStore {
             self.resolve_project_stop(project_id).await?,
             "Project Stop is awaiting durable confirmation"
         );
-        let (baseline, baseline_containers) = {
+        let (mut baseline, mut baseline_containers) = {
             let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
             (
                 self.inner
@@ -235,11 +236,40 @@ impl crate::pg::PgStore {
         };
         let id = project_id.to_owned();
         let previous_registration = baseline.get(project_id).cloned();
-        let Some((fetched, retired_generation)) =
+        let (fetched, retired_generation, missing_retired) =
             super::database::read(&self.database, move |tx| {
                 Box::pin(async move {
                     let Some(fetched) = repo::fetch_project_registration(tx, &id).await? else {
-                        return Ok(None);
+                        // 缺行本身不授权清缓存。旧 project 与精确物理 container
+                        // 都已被本系统退休，才证明这是 peer 删除后的旧投影。
+                        let retired = if let Some(previous) = previous_registration {
+                            let project_retired = repo::project_generation_is_retired(
+                                tx,
+                                &id,
+                                &previous.persistence_identity().generation,
+                            )
+                            .await?;
+                            let container_retired =
+                                match previous.persistence_identity().container.as_ref() {
+                                    Some(identity) => match identity.physical_uid.as_deref() {
+                                        Some(uid) => {
+                                            repo::container_generation_is_retired(
+                                                tx,
+                                                &crate::adapter::container_entry_key(&previous),
+                                                &identity.generation,
+                                                uid,
+                                            )
+                                            .await?
+                                        }
+                                        None => false,
+                                    },
+                                    None => false,
+                                };
+                            project_retired && container_retired
+                        } else {
+                            false
+                        };
+                        return Ok((None, None, retired));
                     };
                     let retired_generation = if let Some(previous) = previous_registration
                         && previous.persistence_identity().generation != fetched.0.generation
@@ -285,14 +315,91 @@ impl crate::pg::PgStore {
                     } else {
                         None
                     };
-                    Ok(Some((fetched, retired_generation)))
+                    Ok((Some(fetched), retired_generation, false))
                 })
             })
             .await
-            .context("Refresh persistent project registration")?
-        else {
+            .context("Refresh persistent project registration")?;
+        let Some(fetched) = fetched else {
+            if missing_retired && let Some(previous) = baseline.get(project_id) {
+                let mut registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+                if self
+                    .inner
+                    .get(project_id)
+                    .is_some_and(|current| Arc::ptr_eq(previous, &current))
+                {
+                    let name = crate::adapter::container_entry_key(previous);
+                    let mut containers = self
+                        .container_registration
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    if containers.get(&name) == baseline_containers.get(&name) {
+                        self.inner.remove_if_generation(
+                            project_id,
+                            &previous.persistence_identity().generation,
+                        );
+                        registration.insert(
+                            project_id.to_owned(),
+                            previous.persistence_identity().generation.clone(),
+                        );
+                        let expected_uid = previous
+                            .persistence_identity()
+                            .container
+                            .as_ref()
+                            .and_then(|identity| identity.physical_uid.as_deref());
+                        if self.inner.prune_container_mirror(&name, expected_uid)
+                            || self.inner.registered_container_by_key(&name).is_none()
+                        {
+                            containers.remove(&name);
+                        }
+                    }
+                }
+            }
             return Ok(None);
         };
+        if let Some(row) = fetched.1.as_ref()
+            && baseline_containers
+                .get(&row.container_name)
+                .is_some_and(|old| {
+                    old.generation != row.container_generation
+                        || old.physical_uid != row.container_id
+                })
+        {
+            // The deleting replica intentionally retains its old cursor until
+            // SQL settles. It must still join a proven peer-built successor
+            // immediately, without waiting for periodic mirror sync.
+            let read = self
+                .read_authoritative_container_binding(&row.container_name, project_id, deadline)
+                .await?;
+            if read
+                .canonical_container
+                .as_ref()
+                .map(|row| row.persistence_identity())
+                != Some(row.persistence_identity())
+            {
+                return Ok(self.inner.get(project_id));
+            }
+            let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+            if let Err(error) = self.reconcile_authoritative_binding(&read) {
+                if error
+                    .downcast_ref::<super::authoritative::AuthoritativeVerificationRequired>()
+                    .is_some()
+                {
+                    return Ok(self.inner.get(project_id));
+                }
+                return Err(error);
+            }
+            baseline = self
+                .inner
+                .get(project_id)
+                .map(|info| HashMap::from([(project_id.to_owned(), info)]))
+                .unwrap_or_default();
+            baseline_containers = self
+                .container_registration
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+        }
         self.hydrate_project_read(
             ProjectRead::Registration {
                 retired_generation: retired_generation.as_deref(),

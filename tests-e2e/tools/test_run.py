@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from pathlib import Path
 import tempfile
 import subprocess
@@ -52,6 +53,17 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(set(catalog), set(sum(run.GROUPS.values(), [])))
         for suite, cases in catalog.items():
             self.assertEqual(run.select_registered_cases(suite, cases), sorted(cases))
+
+    def test_k8s_source_cases_are_registered_before_executable_discovery(self):
+        # Static catalog consistency alone cannot detect a new Rust case omitted
+        # from all three registrations. The strict launcher rejects the entire
+        # suite when the executable later discovers such a case.
+        source = (Path(run.__file__).parents[1] / 'tests/k8s_lb.rs').read_text()
+        discovered = re.findall(
+            r'#\[tokio::test\](?:\s*#\[[^\n]*\])*\s*async fn (\w+)\(', source)
+        self.assertTrue(discovered)
+        self.assertEqual(run.select_registered_cases('k8s_lb', discovered),
+                         sorted(name for name in discovered if not name.startswith('gate_')))
 
 
 class ReportTests(unittest.TestCase):

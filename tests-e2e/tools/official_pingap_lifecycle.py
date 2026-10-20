@@ -522,7 +522,12 @@ class Acceptance:
             starts_after = log.read_text().count("spawned: 'app-pingap' with pid")
             self.check("HTTP Stop performs exactly one supervisord standby spawn", starts_after - starts_before == 1,
                        starts_before=starts_before, starts_after=starts_after)
-        status, readiness = self.request("/v1/app/readiness")
+        # The durable terminal can precede Idle publication, and the observer
+        # can retain its stopping snapshot for one second. Require convergence.
+        status, readiness = self.wait(lambda: self.request("/v1/app/readiness"),
+            lambda response: response[0] == 200
+            and (response[1] or {}).get("data", {}).get("status") == "stopped"
+            and response[1]["data"].get("ready") is False, seconds=5)
         self.check("settled Stop reports stopped", status == 200 and
                    readiness["data"]["status"] == "stopped" and readiness["data"]["ready"] is False,
                    response=readiness)

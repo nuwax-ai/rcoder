@@ -5,10 +5,11 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
-use container_runtime_api::ContainerCreateParams;
+use container_runtime_api::{ContainerCreateParams, ContainerRuntimeError};
 use shared_types::{
-    AgentRegistrationChange, AppError, ComputerOwnerMismatch, ContainerBasicInfo, ErrorDetail,
-    ProjectAndContainerInfo, ProjectStore as _, persistence::PersistenceWriteOutcome,
+    AgentRegistrationChange, AppError, ComputerOwnerMismatch, ContainerBasicInfo,
+    ContainerWorkloadReplaced, ErrorDetail, ProjectAndContainerInfo, ProjectStore as _,
+    persistence::PersistenceWriteOutcome,
 };
 
 use super::AppState;
@@ -40,7 +41,9 @@ impl AppState {
         let (current_registration, refreshed) = self
             .refresh_inconsistent_computer_registration(project_id)
             .await?;
-        if refreshed && current_registration.is_none() {
+        let mut retired_request_registration =
+            refreshed && current_registration.is_none() && self.projects.get(project_id).is_none();
+        if refreshed && current_registration.is_none() && self.projects.get(project_id).is_some() {
             return Err(
                 AppError::conflict("Computer registration was retired during refresh").into(),
             );
@@ -87,24 +90,30 @@ impl AppState {
                                     })))
                 })
         }) {
+            let expected_id = expected.project_id().to_owned();
             let expected = if inconsistent_physical_registration(&expected) {
-                self.refresh_inconsistent_computer_registration(expected.project_id())
+                let refreshed = self
+                    .refresh_inconsistent_computer_registration(&expected_id)
                     .await?
-                    .0
-                    .ok_or_else(|| {
-                        AppError::conflict(
-                            "Canonical Computer registration was retired during refresh",
-                        )
-                    })?
+                    .0;
+                if refreshed.is_none() && self.projects.get(&expected_id).is_some() {
+                    return Err(AppError::conflict(
+                        "Canonical Computer registration was retired during refresh",
+                    )
+                    .into());
+                }
+                refreshed
             } else {
-                expected
+                Some(expected)
             };
-            if AgentRegistrationChange::between(expected.container_info().as_ref(), &observed)
-                .is_some()
+            if let Some(expected) = expected
+                && AgentRegistrationChange::between(expected.container_info().as_ref(), &observed)
+                    .is_some()
             {
                 observed = self
                     .recover_computer_project_registration(params, &expected, &observed)
-                    .await?;
+                    .await?
+                    .0;
             }
         }
 
@@ -119,9 +128,11 @@ impl AppState {
             let previous_container = previous.container_info();
             if AgentRegistrationChange::between(previous_container.as_ref(), &observed).is_some() {
                 ensure_request_owner(&previous, &incoming)?;
-                observed = self
+                let (replacement, retired) = self
                     .recover_computer_project_registration(params, &previous, &observed)
                     .await?;
+                observed = replacement;
+                retired_request_registration |= retired;
             }
         }
 
@@ -133,7 +144,17 @@ impl AppState {
             let mut updated = before
                 .as_ref()
                 .map(|current| (**current).clone())
-                .unwrap_or_else(|| (*incoming).clone());
+                .unwrap_or_else(|| {
+                    let mut requested = (*incoming).clone();
+                    if retired_request_registration {
+                        // Pod ensure may carry a clone of the old registration.
+                        // The new request must not resurrect its retired epoch or
+                        // sessions after the store proves peer deletion.
+                        requested.clear_all_sessions();
+                        requested.set_persistence_identity(Default::default());
+                    }
+                    requested
+                });
             if let Some(current) = before.as_ref() {
                 ensure_request_owner(current, &incoming)?;
             }
@@ -276,12 +297,49 @@ impl AppState {
         params: &ContainerCreateParams,
         expected: &ProjectAndContainerInfo,
         observed: &ContainerBasicInfo,
-    ) -> Result<ContainerBasicInfo> {
+    ) -> Result<(ContainerBasicInfo, bool)> {
+        // A peer's durable stop can retire BOTH project and container while this
+        // replica still holds the complete old projection. The replacement SQL
+        // transaction cannot recover a project row that no longer exists. Refresh
+        // its authority first; only the store's exact tombstone-backed retirement
+        // may clear the stale mirror and let the caller register the fresh request.
+        let refreshed;
+        let expected =
+            match AgentRegistrationChange::between(expected.container_info().as_ref(), observed) {
+                Some(AgentRegistrationChange::WorkloadReplaced) => {
+                    refreshed = self
+                        .projects
+                        .refresh_project_registration(expected.project_id())
+                        .await
+                        .context("Refresh Computer registration before workload replacement")?;
+                    match refreshed.as_ref() {
+                        Some(current) => {
+                            ensure_request_owner(current, expected)?;
+                            if current.container_info().is_some_and(|basic| {
+                                basic.container_id == observed.container_id
+                                    && basic.workload_uid == observed.workload_uid
+                            }) {
+                                return Ok((observed.clone(), false));
+                            }
+                            current.as_ref()
+                        }
+                        None if self.projects.get(expected.project_id()).is_none() => {
+                            return Ok((observed.clone(), true));
+                        }
+                        None => expected,
+                    }
+                }
+                Some(AgentRegistrationChange::Attached | AgentRegistrationChange::PodRecreated)
+                | None => expected,
+            };
         let previous = expected.container_info();
         let evidence = self
             .runtime()
             .verify_agent_replacement(params, previous.as_ref(), observed)
             .await
+            .map_err(|error| {
+                replacement_verification_error(error, previous.as_ref(), observed)
+            })
             .context("Observe Computer workload replacement")?;
         let observed = evidence.replacement.clone();
         match self
@@ -318,7 +376,7 @@ impl AppState {
                 bail!("Computer replacement registration is not yet committed; retry ensure");
             }
         }
-        Ok(observed)
+        Ok((observed, false))
     }
 
     pub async fn append_session_for_container_durable(
@@ -348,6 +406,56 @@ impl AppState {
         self.projects
             .is_session_registration_committed(expected, session_id)
             .await
+    }
+}
+
+/// Keep transport/configuration failures intact. A runtime rejection of an
+/// observed controller replacement shares the durable registration gate's
+/// typed conflict contract; Pod recreation and attachment keep their semantics.
+fn replacement_verification_error(
+    error: ContainerRuntimeError,
+    previous: Option<&ContainerBasicInfo>,
+    observed: &ContainerBasicInfo,
+) -> anyhow::Error {
+    let conflict = match &error {
+        ContainerRuntimeError::Conflict(_) => true,
+        ContainerRuntimeError::CreationCancelled
+        | ContainerRuntimeError::OperationInProgress(_)
+        | ContainerRuntimeError::RequestRejected(_)
+        | ContainerRuntimeError::PreparationFailed(_)
+        | ContainerRuntimeError::ConnectionError(_)
+        | ContainerRuntimeError::ContainerCreationError(_)
+        | ContainerRuntimeError::ContainerStartError(_)
+        | ContainerRuntimeError::ContainerStopError(_)
+        | ContainerRuntimeError::ManagementNotRunning
+        | ContainerRuntimeError::ContainerNotFound(_)
+        | ContainerRuntimeError::ConfigurationError(_)
+        | ContainerRuntimeError::Timeout(_)
+        | ContainerRuntimeError::K8sError(_)
+        | ContainerRuntimeError::DockerError(_)
+        | ContainerRuntimeError::ContainerExecError(_)
+        | ContainerRuntimeError::CreationAborted { .. } => false,
+    };
+    let workload_replacement = match AgentRegistrationChange::between(previous, observed) {
+        Some(AgentRegistrationChange::WorkloadReplaced) => previous
+            .and_then(|previous| previous.workload_uid.as_ref())
+            .zip(observed.workload_uid.as_ref())
+            .map(|(registered, observed_uid)| ContainerWorkloadReplaced {
+                container_name: observed.container_name.clone(),
+                registered_workload_uid: registered.clone(),
+                observed_workload_uid: observed_uid.clone(),
+            }),
+        Some(AgentRegistrationChange::Attached | AgentRegistrationChange::PodRecreated) | None => {
+            None
+        }
+    };
+    let error = anyhow::Error::new(error);
+    if conflict && let Some(replacement) = workload_replacement {
+        // Typed context remains downcastable at the HTTP boundary while the
+        // original runtime error and its cause remain available to diagnostics.
+        error.context(replacement)
+    } else {
+        error
     }
 }
 
@@ -505,3 +613,7 @@ mod owner_tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "rcoder-pg", feature = "userapp-turso"))]
+#[path = "agent_registration/peer_retirement_tests.rs"]
+mod peer_retirement_tests;

@@ -374,7 +374,10 @@ impl PgStore {
                                 }
                             }
                         },
-                        GateAuthority::Deferred if mirror_mismatch => {
+                        GateAuthority::Deferred
+                            if mirror_mismatch
+                                || (registered_workload_uid.is_none() && observed.is_some()) =>
+                        {
                             return Err(anyhow::Error::new(AuthoritativeVerificationRequired {
                                 name: key.clone(),
                             }));

@@ -95,11 +95,16 @@ impl PgStore {
             loop {
                 // Some = 准入完成（op 已在锁内登记）；None = 需要权威裁决。
                 let step = {
-                    let registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut registration =
+                        self.registration.lock().unwrap_or_else(|p| p.into_inner());
                     if self.closing.load(std::sync::atomic::Ordering::Acquire) {
                         return Err(anyhow::anyhow!("Persistence is shutting down"));
                     }
-                    match self.prepare_info(Arc::clone(&info), &registration, &authority) {
+                    match self.prepare_authoritative_info(
+                        Arc::clone(&info),
+                        &mut registration,
+                        &authority,
+                    ) {
                         Ok(prepared) => {
                             let op = super::persist_ops::registration_for_metadata(&prepared)?;
                             self.inner
@@ -111,10 +116,7 @@ impl PgStore {
                             Some((self.register_durable(vec![op]), captured))
                         }
                         Err(error) => {
-                            let needs_authority = matches!(
-                                authority,
-                                super::authoritative::GateAuthority::Deferred
-                            ) && error
+                            let needs_authority = error
                                 .downcast_ref::<super::authoritative::AuthoritativeVerificationRequired>()
                                 .is_some();
                             if needs_authority {
@@ -129,12 +131,9 @@ impl PgStore {
                     Some(admitted) => break 'admission admitted,
                     None => {
                         let name = container_entry_key(&info);
-                        let read = self.read_authoritative_container_binding(&name).await?;
-                        if read.binding
-                            == super::authoritative::AuthoritativeContainerBinding::RetiredByUs
-                        {
-                            self.retire_peer_deleted_binding(&read);
-                        }
+                        let read = self
+                            .read_authoritative_container_binding(&name, &project_id, deadline)
+                            .await?;
                         authority = super::authoritative::GateAuthority::Snapshot(read);
                     }
                 }
@@ -374,6 +373,7 @@ impl PgStore {
         info: Arc<ProjectAndContainerInfo>,
         session_id: &str,
     ) -> anyhow::Result<()> {
+        let deadline = Instant::now() + Self::DURABLE_COMMIT_TIMEOUT;
         anyhow::ensure!(
             SessionHint::classify(Some(session_id))
                 .as_session_id()
@@ -386,11 +386,16 @@ impl PgStore {
         let ops = 'admission: {
             loop {
                 let step = {
-                    let registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut registration =
+                        self.registration.lock().unwrap_or_else(|p| p.into_inner());
                     if self.closing.load(std::sync::atomic::Ordering::Acquire) {
                         return Err(anyhow::anyhow!("Persistence is shutting down"));
                     }
-                    match self.prepare_info(Arc::clone(&info), &registration, &authority) {
+                    match self.prepare_authoritative_info(
+                        Arc::clone(&info),
+                        &mut registration,
+                        &authority,
+                    ) {
                         Ok(mut prepared) => {
                             Arc::make_mut(&mut prepared).add_session(session_id);
                             let ops = structural_ops_for_insert(&prepared, session_id)?;
@@ -402,10 +407,7 @@ impl PgStore {
                             Some(self.register_durable(ops))
                         }
                         Err(error) => {
-                            let needs_authority = matches!(
-                                authority,
-                                super::authoritative::GateAuthority::Deferred
-                            ) && error
+                            let needs_authority = error
                                 .downcast_ref::<super::authoritative::AuthoritativeVerificationRequired>()
                                 .is_some();
                             if needs_authority {
@@ -420,18 +422,16 @@ impl PgStore {
                     Some(ops) => break 'admission ops,
                     None => {
                         let name = container_entry_key(&info);
-                        let read = self.read_authoritative_container_binding(&name).await?;
-                        if read.binding
-                            == super::authoritative::AuthoritativeContainerBinding::RetiredByUs
-                        {
-                            self.retire_peer_deleted_binding(&read);
-                        }
+                        let read = self
+                            .read_authoritative_container_binding(&name, &project_id, deadline)
+                            .await?;
                         authority = super::authoritative::GateAuthority::Snapshot(read);
                     }
                 }
             }
         };
-        self.execute_durable(ops, "insert_session").await;
+        self.execute_durable_before(ops, "insert_session", deadline)
+            .await;
         Ok(())
     }
 

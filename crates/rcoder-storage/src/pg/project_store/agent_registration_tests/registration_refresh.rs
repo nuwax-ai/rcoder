@@ -189,23 +189,29 @@ async fn poisoned_bound_registration_refresh_admits_while_unrelated_work_is_pend
 }
 
 #[tokio::test]
-async fn bound_successor_with_pending_work_can_continue_from_the_honest_local_predecessor() {
+async fn bound_successor_with_unrelated_pending_work_joins_the_proven_database_epoch() {
     let Some(dsn) = test_support::test_dsn().await else {
         return;
     };
     let suffix = test_support::uuid_suffix();
     let id = format!("pending-successor-{suffix}");
+    let sid = format!("sid-{id}");
     let original = basic(&id);
     let writer = store(&dsn).await;
     writer
-        .insert_with_session_durable(
-            id.clone(),
-            project(&id, &id, &original),
-            &format!("sid-{id}"),
-        )
+        .insert_with_session_durable(id.clone(), project(&id, &id, &original), &sid)
         .await
         .unwrap();
     let peer = store(&dsn).await;
+    let unrelated_id = format!("unrelated-successor-{suffix}");
+    peer.insert_project_registration_durable(
+        unrelated_id.clone(),
+        project(&unrelated_id, &unrelated_id, &basic(&unrelated_id)),
+    )
+    .await
+    .unwrap();
+    let unrelated_before = peer.get(&unrelated_id).unwrap();
+    let touched_at = unrelated_before.last_activity() + chrono::Duration::seconds(2);
     let captured = frozen(&writer.get(&id).unwrap());
     let mut proof = evidence(&original);
     proof.replacement.workload_uid = original.workload_uid.clone();
@@ -218,11 +224,12 @@ async fn bound_successor_with_pending_work_can_continue_from_the_honest_local_pr
     );
     let unrelated = peer.register_durable(vec![
         crate::pg::project_store::persist_ops::PersistOp::TouchProject {
-            project_id: format!("unrelated-successor-{suffix}"),
-            generation: "unrelated-generation".into(),
-            last_activity: chrono::Utc::now(),
+            project_id: unrelated_id.clone(),
+            generation: unrelated_before.persistence_identity().generation.clone(),
+            last_activity: touched_at,
         },
     ]);
+    let pending_before = peer.pending_ops.load(std::sync::atomic::Ordering::Acquire);
     let refreshed = peer
         .refresh_project_registration(&id)
         .await
@@ -230,8 +237,8 @@ async fn bound_successor_with_pending_work_can_continue_from_the_honest_local_pr
         .unwrap();
     assert_eq!(
         refreshed.container_info().unwrap().container_id,
-        original.container_id,
-        "unsafe-to-admit SQL is not returned as an already registered local view"
+        proof.replacement.container_id,
+        "a proven database epoch is safe when the pending write affects another project"
     );
     assert_eq!(
         refreshed
@@ -241,13 +248,29 @@ async fn bound_successor_with_pending_work_can_continue_from_the_honest_local_pr
             .unwrap()
             .physical_uid
             .as_deref(),
-        Some(original.container_id.as_str())
+        Some(proof.replacement.container_id.as_str())
     );
     assert_eq!(
-        peer.replace_agent_container_registration_durable(&refreshed, &proof)
+        peer.pending_ops.load(std::sync::atomic::Ordering::Acquire),
+        pending_before,
+        "refresh must not release or replace the original pending operation"
+    );
+    assert_eq!(
+        refreshed.persistence_identity().sessions,
+        writer.get(&id).unwrap().persistence_identity().sessions
+    );
+    assert_eq!(
+        peer.insert_project_registration_durable(id.clone(), refreshed)
             .await
             .unwrap(),
         PersistenceWriteOutcome::Committed
+    );
+    assert_eq!(
+        peer.append_session_for_container_durable(&captured, &sid)
+            .await
+            .unwrap(),
+        PersistenceWriteOutcome::Superseded,
+        "a late old completion cannot enter the new project epoch"
     );
     assert_eq!(
         peer.get(&id)
@@ -258,8 +281,128 @@ async fn bound_successor_with_pending_work_can_continue_from_the_honest_local_pr
         proof.replacement.container_id
     );
     drop(unrelated);
+    assert!(peer.wait_drained(Duration::from_secs(5)).await);
+    let touched = peer
+        .refresh_project_registration(&unrelated_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        touched.last_activity().timestamp_micros(),
+        touched_at.timestamp_micros(),
+        "the exact unrelated pending write must still reach SQL"
+    );
     assert!(peer.writer().flush_and_stop(Duration::from_secs(5)).await);
     assert!(writer.writer().flush_and_stop(Duration::from_secs(5)).await);
+}
+
+#[tokio::test]
+async fn authoritative_refresh_preserves_pending_source_session_and_project_removals() {
+    let Some(dsn) = test_support::test_dsn().await else {
+        return;
+    };
+    for remove_project in [false, true] {
+        let id = format!("pending-authority-removal-{}", test_support::uuid_suffix());
+        let sid = format!("sid-{id}");
+        let original = basic(&id);
+        let writer = store(&dsn).await;
+        writer
+            .insert_with_session_durable(id.clone(), project(&id, &id, &original), &sid)
+            .await
+            .unwrap();
+        let peer = store(&dsn).await;
+        let captured = frozen(&writer.get(&id).unwrap());
+        let proof = evidence(&original);
+        assert_eq!(
+            writer
+                .replace_agent_container_registration_durable(&captured, &proof)
+                .await
+                .unwrap(),
+            PersistenceWriteOutcome::Committed
+        );
+        let successor = frozen(&writer.get(&id).unwrap());
+        assert_ne!(
+            successor.persistence_identity().sessions[&sid],
+            captured.persistence_identity().sessions[&sid]
+        );
+
+        // The source clear is accepted before the authoritative read. Keep its
+        // actual SQL transaction unresolved using the writer's advisory lock;
+        // a baseline captured after acceptance must still retain this intent.
+        let lock = if remove_project {
+            format!("project:{id}")
+        } else {
+            format!("session:{sid}")
+        };
+        let (release, held) = hold_advisory_lock(&dsn, lock).await;
+        let mut removing = Box::pin(async {
+            if remove_project {
+                peer.remove_durable(&id).await.is_some()
+            } else {
+                peer.clear_session_one_durable(&id, &sid).await
+            }
+        });
+        assert!(futures::poll!(removing.as_mut()).is_pending());
+        let accepted = peer.get(&id);
+        let pending_before = peer.pending_ops.load(std::sync::atomic::Ordering::Acquire);
+        assert!(pending_before > 0);
+        let refreshed = peer.refresh_project_registration(&id).await.unwrap();
+        if remove_project {
+            assert!(accepted.is_none());
+            assert!(
+                refreshed.is_none(),
+                "an accepted unresolved source removal must not reappear from SQL"
+            );
+            assert!(peer.get(&id).is_none());
+        } else {
+            let accepted = accepted.unwrap();
+            let refreshed = refreshed.expect("the honest cleared source remains available");
+            assert!(Arc::ptr_eq(&accepted, &refreshed));
+            assert_eq!(
+                refreshed.container_info().unwrap().container_id,
+                original.container_id
+            );
+            assert!(
+                !refreshed.sessions().contains(&sid),
+                "refresh cannot resurrect the locally accepted clear"
+            );
+            assert_eq!(
+                refreshed.persistence_identity().retired_sessions[&sid],
+                captured.persistence_identity().sessions[&sid]
+            );
+        }
+        assert_eq!(
+            peer.pending_ops.load(std::sync::atomic::Ordering::Acquire),
+            pending_before
+        );
+        release.send(()).unwrap();
+        held.await.unwrap();
+        assert!(removing.await);
+        assert!(peer.wait_drained(Duration::from_secs(5)).await);
+        // The immutable clear targets its captured old generation. It must not
+        // be silently replayed against an independently committed successor.
+        let persisted = writer
+            .refresh_project_registration(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted.persistence_identity().generation,
+            successor.persistence_identity().generation
+        );
+        assert_eq!(
+            persisted.persistence_identity().sessions,
+            successor.persistence_identity().sessions
+        );
+        assert_eq!(
+            peer.append_session_for_container_durable(&captured, "late-source-completion")
+                .await
+                .unwrap(),
+            PersistenceWriteOutcome::Superseded
+        );
+        assert!(peer.writer().flush_and_stop(Duration::from_secs(5)).await);
+        assert!(writer.writer().flush_and_stop(Duration::from_secs(5)).await);
+    }
 }
 
 #[tokio::test]

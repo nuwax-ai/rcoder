@@ -17,8 +17,23 @@ PG_EXTRA_TARGETS = {
         'durable_commit_returns_after_pg_visible',
         'session_miss_backfills_from_pg_into_mirror',
         'shutdown_failure_is_not_success_on_first_or_repeated_call',
+        'authoritative_gate_allows_replacement_after_peer_delete',
+        'cross_replica_sync_removes_stale_container_mirror',
+        'external_workload_replacement_still_refused_as_conflict',
     )
 } | {
+    'PG retired captured registration uses a fresh identity without retired sessions':
+        'pg::project_store::tests::authoritative_tests::retired_captured_registration_creates_fresh_identity_without_old_sessions',
+    'PG retired captured session registration keeps only the new session':
+        'pg::project_store::tests::authoritative_tests::retired_captured_session_registration_keeps_only_the_new_session',
+    'PG stale authoritative read preserves a newer local registration':
+        'pg::project_store::tests::authoritative_tests::authoritative_snapshot_cannot_retire_a_newer_local_registration',
+    'PG authoritative lookup shares the durable registration deadline':
+        'pg::project_store::tests::authoritative_tests::authoritative_lookup_respects_the_registration_deadline',
+    'PG deleting replica immediately joins the peer-rebuilt successor':
+        'pg::project_store::tests::authoritative_tests::peer_rebuilt_successor_is_visible_to_the_deleting_replica_without_sync',
+    'PG old sync snapshot cannot resurrect an admitted local retirement':
+        'pg::project_store::tests::sync_retirement_tests::sync_snapshot_does_not_resurrect_locally_accepted_project_retirement',
     'PG dedicated leader session closes under cancellation and transport faults':
         'pg::project_store::leader::fault_tests::dedicated_leader_session_closes_after_shutdown_cancel_disconnect_and_timeout',
     'PG committed admission reply loss preserves original request and fence':

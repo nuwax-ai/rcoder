@@ -678,6 +678,35 @@ async fn lb_stop_resume_same_sid_cross_entry() {
 /// 被防接管门误拒（修复前 HTTP 500 "workload was replaced"）。修复后门禁
 /// 直读 DB 权威行（行已删 + tombstone 在案 = 本系统已退役的自我换代），
 /// 任一副本都必须直接受理重建后的 chat。
+async fn observe_pod_stop_turn(
+    env: &Env,
+    report: &JsonlReporter,
+    phase: &str,
+    entry: &str,
+    sid: &str,
+    request_id: &str,
+) -> rcoder_e2e::common::sse_terminal_barrier::Observation {
+    report.subscribe_begin(phase, entry, None);
+    let observed = rcoder_e2e::common::sse_terminal_barrier::observe(
+        &env.sse_http,
+        entry,
+        sid,
+        request_id,
+        std::time::Instant::now() + Duration::from_secs(60),
+        |event| report.sse_event(phase, event.seq, &event.event, &event.data, event.t_ms),
+    )
+    .await;
+    report.subscribe_end(
+        phase,
+        &observed.ended_reason,
+        observed.events.len(),
+        &sse::ids_of(&observed.events),
+        sse::type_counts(&observed.events),
+        &sse::chunks_text(&observed.events),
+    );
+    observed
+}
+
 #[tokio::test]
 #[ignore = "explicit K8s real-AI environment"]
 async fn lb_pod_stop_then_chat_cross_entry() {
@@ -693,10 +722,11 @@ async fn lb_pod_stop_then_chat_cross_entry() {
             entries.len() > 1 && entries[0] != entries[1],
             "Cross-replica verification requires distinct K8s entries"
         );
+        let initial_request_id = format!("{}-before-pod-stop", env.run_tag);
         let first_request = env.base_payload(
             Backend::Openai,
             &format!("本轮只回复 {marker}，不要调用工具。"),
-            &format!("{}-before-pod-stop", env.run_tag),
+            &initial_request_id,
             &user,
         );
         let first = chat_reported(
@@ -712,6 +742,26 @@ async fn lb_pod_stop_then_chat_cross_entry() {
             first.error.is_none() && first.need_fallback != Some(true),
             "Initial chat did not establish a usable session"
         );
+
+        let observed = observe_pod_stop_turn(
+            &env,
+            &report,
+            "before_pod_stop_complete",
+            &entries[1],
+            &first.session_id,
+            &initial_request_id,
+        )
+        .await;
+        let events = observed.events;
+        let complete = observed.terminal_seq.is_some()
+            && !events.iter().any(|event| event.event == "error")
+            && sse::chunks_text(&events).contains(&marker);
+        report.assert_hard(
+            "pod/stop 前真实对话完整执行",
+            complete,
+            format!("{} events", events.len()),
+        );
+        anyhow::ensure!(complete, "Initial chat did not finish before pod/stop");
 
         // 经入口 A 执行物理停止：等价于 cleaner 的 durable 删除路径（删 STS +
         // PG 行 + tombstone），对其他副本构成 peer 删除。
@@ -730,13 +780,19 @@ async fn lb_pod_stop_then_chat_cross_entry() {
             "Pod stop failed: HTTP {status}, response: {body}"
         );
 
-        // 停止收敛：轮询状态直到不再存活（容器与注册记录一起消失）。
+        // 只有成功的实时状态查询明确证明 not_found 才算物理停止已收束；
+        // 错误信封、无效 JSON 或 stopped 都不能证明旧控制器已经删除。
         let mut converged = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
         for _ in 0..45 {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
             let status_response = env
                 .http
                 .get(format!("{}/computer/pod/status", entries[0]))
-                .timeout(Duration::from_secs(20))
+                .timeout(remaining.min(Duration::from_secs(20)))
                 .query(&[
                     ("user_id", user.as_str()),
                     ("project_id", first.project_id.as_str()),
@@ -745,29 +801,38 @@ async fn lb_pod_stop_then_chat_cross_entry() {
                 .send()
                 .await;
             if let Ok(response) = status_response {
-                let body: serde_json::Value =
-                    response.json().await.unwrap_or(serde_json::Value::Null);
-                let alive = body["data"]["alive"].as_bool();
-                if alive != Some(true) {
+                let status = response.status();
+                if let Ok(body) = response.json::<serde_json::Value>().await
+                    && status.is_success()
+                    && body["code"] == "0000"
+                    && body["data"]["alive"] == false
+                    && body["data"]["status"] == "not_found"
+                {
                     converged = true;
                     break;
                 }
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(
+                deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .min(Duration::from_secs(2)),
+            )
+            .await;
         }
         anyhow::ensure!(
             converged,
-            "pod/status never left the alive state after pod/stop"
+            "pod/status never confirmed not_found after pod/stop"
         );
 
-        // 多轮经不同入口重建对话：每一轮都必须直接受理（修复前落在非执行
-        // 停止的副本会 500；5 轮全过的概率 <1%）。
+        // 首次重建走另一入口；NodePort 仍会随机选副本，多轮只能证明跨入口
+        // 可用性。未同步旧镜像的确定性反例由 PG 多实例测试另行验证。
         for round in 0..5 {
-            let entry = &entries[round % entries.len()];
+            let entry = &entries[(round + 1) % entries.len()];
+            let request_id = format!("{}-after-pod-stop-{round}", env.run_tag);
             let mut request = env.base_payload(
                 Backend::Openai,
                 &format!("第 {} 轮：只回复 OK_{round}，不要调用工具。", round + 1),
-                &format!("{}-after-pod-stop-{round}", env.run_tag),
+                &request_id,
                 &user,
             );
             request.project_id = Some(first.project_id.clone());
@@ -787,6 +852,23 @@ async fn lb_pod_stop_then_chat_cross_entry() {
                     chat.error, chat.need_fallback
                 ),
             );
+            let observed = observe_pod_stop_turn(
+                &env,
+                &report,
+                &format!("after_pod_stop_round_{round}_complete"),
+                &entries[round % entries.len()],
+                &chat.session_id,
+                &request_id,
+            )
+            .await;
+            let events = observed.events;
+            report.assert_hard(
+                &format!("停止后第 {} 轮真实对话完整执行", round + 1),
+                observed.terminal_seq.is_some()
+                    && !events.iter().any(|event| event.event == "error")
+                    && sse::chunks_text(&events).contains(&format!("OK_{round}")),
+                format!("{} events", events.len()),
+            );
         }
         Ok(())
     }
@@ -798,6 +880,33 @@ async fn lb_pod_stop_then_chat_cross_entry() {
             .err()
             .map(|error| error.to_string())
             .unwrap_or_else(|| "5 rounds of cross-entry chats accepted".into()),
+    );
+    let cleanup: anyhow::Result<()> = async {
+        let response = env
+            .http
+            .post(format!("{}/computer/pod/stop", entries[0]))
+            .timeout(Duration::from_secs(120))
+            .json(&json!({"user_id":user,
+                "project_id":project_id.as_deref().unwrap_or(&user),
+                "service_type":"computer-agent-runner"}))
+            .send()
+            .await?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await?;
+        anyhow::ensure!(
+            status.is_success() && body["code"] == "0000",
+            "Owned Computer cleanup failed: HTTP {status}, response: {body}"
+        );
+        Ok(())
+    }
+    .await;
+    report.assert_hard(
+        "pod/stop case 计算资源受控停止",
+        cleanup.is_ok(),
+        cleanup
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "platform compute Stop confirmed; data volumes retained".into()),
     );
     assert_hard_all(report).await;
 }

@@ -5,18 +5,20 @@
 //! 只清自己的内存镜像；本副本镜像残留旧 workload UID，曾把"本系统已退役的
 //! 自我换代"误判为外部替换，导致 `/computer/chat` 永久 500。durable 注册
 //! 入口采用惰性验证（[`GateAuthority`]）：常规路径零额外 DB 读，仅当镜像
-//! 判定 workload 替换时读权威快照裁决一次。ProjectStore 同步 trait 入口
+//! 判定 workload 替换或绑定游标缺少镜像时读取权威快照；本地游标在读取期间
+//! 改变则在原 deadline 内重读。ProjectStore 同步 trait 入口
 //! （write-behind）无法 await，沿用镜像比对并由 [`super::sync`] 的容器
 //! 删除对账在同步周期内收敛。
 //!
-//! 快照为 [`AuthoritativeContainerBinding::RetiredByUs`] 时，durable 入口
-//! 先调 [`PgStore::retire_peer_deleted_binding`] 把本地残留（容器注册表、
-//! 适配器镜像、该容器的 project 镜像）一并失效——否则旧代次身份会让 PG 侧
-//! 换代 CAS（行已删 + expected_revision≠0）整单 Superseded，首次注册仍
-//! 无法落库。
+//! 旧精确代次已退休时，durable 入口通过
+//! [`PgStore::reconcile_authoritative_binding`] 同锁失效旧投影并恢复 DB 中
+//! 仍存活的项目、会话和已由 peer 重建的容器，防止旧持久身份或残留游标让
+//! 新源码请求永久 Superseded。退休项目的会话不复制到新项目代次。
 
 use crate::pg::PgStore;
-use shared_types::persistence::ContainerPersistenceIdentity;
+use shared_types::{ProjectAndContainerInfo, persistence::ContainerPersistenceIdentity};
+use std::{collections::HashMap, sync::Arc};
+use tokio::time::Instant;
 
 /// 一次注册时刻的权威容器绑定状态。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,16 +34,20 @@ pub(in crate::pg) enum AuthoritativeContainerBinding {
 }
 
 /// 权威读取结果：绑定状态 + 读取所依据的本地旧身份（供失效时一致性校验）。
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(in crate::pg) struct AuthoritativeRead {
     pub(in crate::pg) name: String,
     pub(in crate::pg) binding: AuthoritativeContainerBinding,
     based_on: Option<ContainerPersistenceIdentity>,
+    retired_projects: HashMap<String, String>,
+    refreshed_projects: HashMap<String, Arc<ProjectAndContainerInfo>>,
+    project_baselines: HashMap<String, Arc<ProjectAndContainerInfo>>,
+    pub(in crate::pg) canonical_container: Option<super::repo::ContainerRow>,
+    previous_retired: bool,
 }
 
 /// 门禁裁决依据。常规注册路径零额外 DB 读；只有镜像判定 workload 替换时，
-/// durable 入口才升级到权威快照裁决一次。
-#[derive(Debug)]
+/// durable 入口才升级到权威快照裁决。
 pub(in crate::pg) enum GateAuthority {
     /// durable 入口首轮：镜像 workload mismatch 时返回
     /// [`AuthoritativeVerificationRequired`]，由调用方读权威快照后重试。
@@ -63,108 +69,318 @@ pub(in crate::pg) struct AuthoritativeVerificationRequired {
 
 impl PgStore {
     /// 单只读事务取权威绑定。必须在持有 registration 锁之前调用（内部含
-    /// await）。不做排空屏障：同副本在途写不会被误判——本副本自己的删除会
-    /// 先同步清理本地注册表（门禁分支不再触达），自己的注册以本地镜像为准、
-    /// PG 侧 CAS 与 rejected-intent 对账兜底；tombstone 只裁决 peer 副本的
-    /// durable 删除这一外部事实，它不可能被本副本在途写伪造或掩盖。
+    /// await）。不做排空屏障：只有 DB 中精确旧代次的 tombstone 才证明退休；
+    /// 读取期间本地游标或项目 Arc 变化时不应用旧快照。自己的删除保留的游标
+    /// 与 peer 删除留下的投影遵守同一验证规则，PG CAS 继续保护读后竞争。
     pub(in crate::pg) async fn read_authoritative_container_binding(
         &self,
         container_name: &str,
+        project_id: &str,
+        deadline: Instant,
     ) -> anyhow::Result<AuthoritativeRead> {
-        let based_on = self
-            .container_registration
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(container_name)
-            .cloned();
-        let name = container_name.to_string();
-        let name_for_query = name.clone();
-        let based_on_for_query = based_on.clone();
-        let binding = super::database::read(&self.database, move |tx| {
-            Box::pin(async move {
-                if let Some(row) =
-                    super::repo::fetch_container_registration(tx, &name_for_query).await?
-                {
-                    return Ok(AuthoritativeContainerBinding::Bound {
-                        workload_uid: row.workload_uid,
-                    });
-                }
-                // 行不存在：用本地旧代次查 tombstone 区分本系统退役与异常缺失。
-                // mismatch 门分支必然有本地旧条目（`current = Some(previous)`），
-                // 全新注册走 fresh 路径不读本快照，故 `based_on` 缺失按异常处理。
-                let retired = match based_on_for_query.as_ref() {
-                    Some(identity) => {
-                        let (generation, physical_uid) = match (
-                            identity.generation.as_str(),
-                            identity.physical_uid.as_deref(),
-                        ) {
-                            (generation, Some(physical_uid))
-                                if !generation.is_empty() && !physical_uid.is_empty() =>
-                            {
-                                (generation, physical_uid)
-                            }
-                            _ => {
-                                return Ok(AuthoritativeContainerBinding::AnomalousAbsent);
-                            }
-                        };
-                        super::repo::container_generation_is_retired(
-                            tx,
-                            &name_for_query,
-                            generation,
-                            physical_uid,
-                        )
-                        .await?
-                    }
-                    None => false,
-                };
-                if retired {
-                    Ok(AuthoritativeContainerBinding::RetiredByUs)
-                } else {
-                    Ok(AuthoritativeContainerBinding::AnomalousAbsent)
-                }
+        let (based_on, project_baselines, retired_generation) = {
+            let registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+            let based_on = self
+                .container_registration
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(container_name)
+                .cloned();
+            let projects = self
+                .inner
+                .iter()
+                .into_iter()
+                .filter(|(_, info)| crate::adapter::container_entry_key(info) == container_name)
+                .collect::<HashMap<_, _>>();
+            (based_on, projects, registration.get(project_id).cloned())
+        };
+        let name = container_name.to_owned();
+        let query_name = name.clone();
+        let query_based_on = based_on.clone();
+        let mut projects: Vec<_> = project_baselines
+            .iter()
+            .map(|(id, info)| {
+                (
+                    id.clone(),
+                    Some(info.persistence_identity().generation.clone()),
+                )
             })
-        })
-        .await?;
+            .collect();
+        if !project_baselines.contains_key(project_id) {
+            projects.push((project_id.to_owned(), retired_generation));
+        }
+        let (binding, retired_projects, refreshed_projects, canonical_container, previous_retired) =
+            tokio::time::timeout_at(
+                deadline,
+                super::database::read(&self.database, move |tx| {
+                    Box::pin(async move {
+                        let row =
+                            super::repo::fetch_container_registration(tx, &query_name).await?;
+                        let previous_retired = match query_based_on.as_ref() {
+                            Some(identity)
+                                if row.as_ref().is_none_or(|row| {
+                                    row.container_generation != identity.generation
+                                        || row.container_id != identity.physical_uid
+                                }) =>
+                            {
+                                match identity.physical_uid.as_deref() {
+                                    Some(uid)
+                                        if !identity.generation.is_empty() && !uid.is_empty() =>
+                                    {
+                                        super::repo::container_generation_is_retired(
+                                            tx,
+                                            &query_name,
+                                            &identity.generation,
+                                            uid,
+                                        )
+                                        .await?
+                                    }
+                                    Some(_) | None => false,
+                                }
+                            }
+                            Some(_) | None => false,
+                        };
+                        let binding = match row.as_ref() {
+                            Some(row) => AuthoritativeContainerBinding::Bound {
+                                workload_uid: row.workload_uid.clone(),
+                            },
+                            None if previous_retired => AuthoritativeContainerBinding::RetiredByUs,
+                            None => AuthoritativeContainerBinding::AnomalousAbsent,
+                        };
+                        let mut retired_projects = HashMap::new();
+                        let mut refreshed_projects = HashMap::new();
+                        if previous_retired {
+                            for (id, generation) in projects {
+                                if let Some(generation) = generation
+                                    && super::repo::project_generation_is_retired(
+                                        tx,
+                                        &id,
+                                        &generation,
+                                    )
+                                    .await?
+                                {
+                                    retired_projects.insert(id.clone(), generation);
+                                }
+                                if let Some((project, container)) =
+                                    super::repo::fetch_project_registration(tx, &id).await?
+                                {
+                                    let containers = container
+                                        .map(|row| {
+                                            HashMap::from([(row.container_name.clone(), row)])
+                                        })
+                                        .unwrap_or_default();
+                                    refreshed_projects.insert(
+                                        id,
+                                        Arc::new(super::load::hydrate_project(
+                                            &project,
+                                            &containers,
+                                        )?),
+                                    );
+                                }
+                            }
+                        }
+                        Ok((
+                            binding,
+                            retired_projects,
+                            refreshed_projects,
+                            row,
+                            previous_retired,
+                        ))
+                    })
+                }),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Authoritative container binding read exceeded the durable deadline"
+                )
+            })??;
         Ok(AuthoritativeRead {
             name,
             binding,
             based_on,
+            retired_projects,
+            refreshed_projects,
+            project_baselines,
+            canonical_container,
+            previous_retired,
         })
     }
 
-    /// 权威快照证明旧绑定已由 peer 副本退役时，失效本地残留的注册表条目、
-    /// 适配器镜像与该容器的全部 project 镜像（均为 peer 已删除的旧代次）。
-    /// 一致性护栏：本地注册表条目仍是快照依据的旧身份才执行；快照之后本地
-    /// 已发生换代/新写入则不动，交由 PG 侧 CAS 与下轮 sync 收敛。
-    pub(in crate::pg) fn retire_peer_deleted_binding(&self, read: &AuthoritativeRead) {
+    /// 调用方持有 registration 锁：快照验证、旧镜像失效与新请求准入必须是
+    /// 同一临界区。读取期间本地有新写入时重新读权威状态，不能沿用旧裁决。
+    pub(in crate::pg) fn prepare_authoritative_info(
+        &self,
+        mut info: Arc<ProjectAndContainerInfo>,
+        registration: &mut HashMap<String, String>,
+        authority: &GateAuthority,
+    ) -> anyhow::Result<Arc<ProjectAndContainerInfo>> {
+        match authority {
+            GateAuthority::Deferred | GateAuthority::MirrorOnly => {}
+            GateAuthority::Snapshot(read) => {
+                let name = crate::adapter::container_entry_key(&info);
+                if read.name != name
+                    || self
+                        .container_registration
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&name)
+                        != read.based_on.as_ref()
+                {
+                    return Err(anyhow::Error::new(AuthoritativeVerificationRequired {
+                        name,
+                    }));
+                }
+                self.reconcile_authoritative_binding(read)?;
+                if read.previous_retired {
+                    if let Some(persisted) = read.refreshed_projects.get(info.project_id()) {
+                        let supplied = info.persistence_identity();
+                        let proven_source = read.retired_projects.get(info.project_id())
+                            == Some(&supplied.generation);
+                        anyhow::ensure!(
+                            supplied.revision == 0
+                                || proven_source
+                                || supplied.generation
+                                    == persisted.persistence_identity().generation,
+                            "Project registration changed; stale snapshot cannot be rebased"
+                        );
+                        let refreshed = Arc::make_mut(&mut info);
+                        refreshed.clear_all_sessions();
+                        for (sid, generation) in &persisted.persistence_identity().sessions {
+                            refreshed.restore_session_identity(sid, generation.clone());
+                        }
+                        anyhow::ensure!(
+                            refreshed.restore_latest_session(persisted.latest_session()),
+                            "Authoritative latest session is not present"
+                        );
+                        refreshed
+                            .set_persistence_identity(persisted.persistence_identity().clone());
+                    } else if read.retired_projects.get(info.project_id())
+                        == Some(&info.persistence_identity().generation)
+                    {
+                        // 真实调用方通常从旧镜像 clone 请求，携带已退休的 project/
+                        // session 身份。只凭新容器身份不能重用这些已被墓碑封住的值。
+                        let previous = info.persistence_identity().generation.clone();
+                        let refreshed = Arc::make_mut(&mut info);
+                        refreshed.clear_all_sessions();
+                        let retired_sessions =
+                            refreshed.persistence_identity().retired_sessions.clone();
+                        refreshed.set_persistence_identity(
+                            shared_types::persistence::ProjectPersistenceIdentity {
+                                predecessor: Some(previous),
+                                retired_sessions,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    for (id, generation) in &read.retired_projects {
+                        registration.insert(id.clone(), generation.clone());
+                    }
+                }
+            }
+        }
+        self.prepare_info(info, registration, authority)
+    }
+
+    /// Caller holds registration. A proven retired predecessor may join the
+    /// exact DB snapshot, including a successor already rebuilt on a peer.
+    pub(in crate::pg) fn reconcile_authoritative_binding(
+        &self,
+        read: &AuthoritativeRead,
+    ) -> anyhow::Result<()> {
         let container_id = read.based_on.as_ref().and_then(|i| i.physical_uid.clone());
         {
-            let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
             let mut registrations = self
                 .container_registration
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            match (&read.based_on, registrations.get(&read.name)) {
-                (Some(expected), Some(current)) if current == expected => {}
-                _ => return,
+            if registrations.get(&read.name) != read.based_on.as_ref() {
+                return Err(anyhow::Error::new(AuthoritativeVerificationRequired {
+                    name: read.name.clone(),
+                }));
             }
-            registrations.remove(&read.name);
+            if !read.previous_retired {
+                return Ok(());
+            }
             // project 镜像移除必须与注册表失效同锁：否则与并发注册存在
             // 竞态（收集后、移除前的新写入会被误删）。
-            let stale_projects: Vec<String> = match &container_id {
-                Some(id) => self
-                    .inner
-                    .get_projects_by_container_id(id)
-                    .iter()
-                    .map(|info| info.project_id().to_string())
-                    .collect(),
-                None => Vec::new(),
-            };
-            for project_id in stale_projects {
-                self.inner.remove(&project_id);
+            let stale_projects: HashMap<_, _> = self
+                .inner
+                .iter()
+                .into_iter()
+                .filter(|(_, info)| crate::adapter::container_entry_key(info) == read.name)
+                .collect();
+            if stale_projects.len() != read.project_baselines.len()
+                || stale_projects.iter().any(|(id, info)| {
+                    read.project_baselines
+                        .get(id)
+                        .is_none_or(|baseline| !Arc::ptr_eq(baseline, info))
+                })
+            {
+                return Err(anyhow::Error::new(AuthoritativeVerificationRequired {
+                    name: read.name.clone(),
+                }));
+            }
+            if self.pending_ops.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                for (id, persisted) in &read.refreshed_projects {
+                    let unsettled_local_change = match read.project_baselines.get(id) {
+                        Some(local) => {
+                            let local_sessions = local.sessions();
+                            let persisted_sessions = persisted.sessions();
+                            let retired_live_session = local
+                                .persistence_identity()
+                                .retired_sessions
+                                .keys()
+                                .any(|sid| persisted_sessions.contains(sid));
+                            local_sessions != persisted_sessions
+                                || local.latest_session() != persisted.latest_session()
+                                || local.request_id() != persisted.request_id()
+                                || serde_json::to_value((local.model_provider(), local.status()))?
+                                    != serde_json::to_value((
+                                        persisted.model_provider(),
+                                        persisted.status(),
+                                    ))?
+                                || retired_live_session
+                        }
+                        None => read.retired_projects.contains_key(id),
+                    };
+                    if unsettled_local_change {
+                        // A known retired predecessor permits cache recovery,
+                        // but cannot discard an accepted clear/removal or new
+                        // request while its immutable write is still unsettled.
+                        // Unrelated pending work with the same payload is safe;
+                        // migrated session UUIDs alone are not a local mutation.
+                        return Err(anyhow::Error::new(AuthoritativeVerificationRequired {
+                            name: read.name.clone(),
+                        }));
+                    }
+                }
+            }
+            for (project_id, info) in stale_projects {
+                self.inner
+                    .remove_if_generation(&project_id, &info.persistence_identity().generation);
+            }
+            anyhow::ensure!(
+                self.inner
+                    .prune_container_mirror(&read.name, container_id.as_deref()),
+                "Retired container still has a live local project reference; no replacement was admitted"
+            );
+            registrations.remove(&read.name);
+            if let Some(row) = read.canonical_container.as_ref() {
+                let service_type = row
+                    .service_type
+                    .parse::<shared_types::ServiceType>()
+                    .map_err(anyhow::Error::msg)?;
+                self.inner.restore_unreferenced_container(
+                    super::load::container_row_to_basic(row),
+                    service_type,
+                )?;
+                registrations.insert(read.name.clone(), row.persistence_identity());
+            }
+            for (id, info) in &read.refreshed_projects {
+                self.inner.insert(id.clone(), Arc::clone(info))?;
             }
         }
-        self.inner
-            .prune_container_mirror(&read.name, container_id.as_deref());
+        Ok(())
     }
 }

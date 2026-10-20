@@ -58,11 +58,53 @@ pub(crate) async fn sync_once(
     inner: &crate::adapter::ProjectAdapter,
     pool: &DatabaseOwner,
 ) -> anyhow::Result<()> {
+    sync_once_inner(
+        store,
+        inner,
+        pool,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+/// Fault injection only: stop the real sync chain after its drain barrier,
+/// before taking the local baseline. Production has no hook or waiting branch.
+#[cfg(test)]
+pub(super) async fn sync_once_paused_after_drain(
+    store: &PgStore,
+    inner: &crate::adapter::ProjectAdapter,
+    pool: &DatabaseOwner,
+    reached: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+) -> anyhow::Result<()> {
+    sync_once_inner(store, inner, pool, Some((reached, resume))).await
+}
+
+async fn sync_once_inner(
+    store: &PgStore,
+    inner: &crate::adapter::ProjectAdapter,
+    pool: &DatabaseOwner,
+    #[cfg(test)] after_drain: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+) -> anyhow::Result<()> {
     // 排空屏障：本副本写全部落库后，PG 快照才可作为 diff 基准。
     // 超时（PG 故障重试中）跳过本轮，避免用旧快照误删镜像条目。
     if !store.wait_drained(DRAIN_TIMEOUT).await {
         debug!("[STORAGE_PG] sync skipped: drain barrier timeout (writer backlogged?)");
         return Ok(());
+    }
+
+    #[cfg(test)]
+    if let Some((reached, resume)) = after_drain {
+        reached
+            .send(())
+            .map_err(|_| anyhow::anyhow!("Sync after-drain observer dropped"))?;
+        resume
+            .await
+            .map_err(|_| anyhow::anyhow!("Sync after-drain release dropped"))?;
     }
 
     let (baseline, baseline_containers): (HashMap<_, _>, _) = {
@@ -154,14 +196,15 @@ pub(crate) async fn sync_once(
         .collect();
     for name in registered_names {
         if pg_container_names.contains(name.as_str())
-            || self_confirm_container_alive(store, pool, &name).await
+            || self_confirm_container_alive(store, pool, &name, baseline_containers.get(&name))
+                .await
         {
             continue;
         }
         let expected = baseline_containers
             .get(&name)
             .and_then(|identity| identity.physical_uid.clone());
-        {
+        let pruned = {
             let _registration = store.registration.lock().unwrap_or_else(|p| p.into_inner());
             let mut registrations = store
                 .container_registration
@@ -170,12 +213,16 @@ pub(crate) async fn sync_once(
             if registrations.get(&name) != baseline_containers.get(&name) {
                 continue;
             }
-            registrations.remove(&name);
-        }
-        if store
-            .inner()
-            .prune_container_mirror(&name, expected.as_deref())
-        {
+            // 注册表和容器镜像同锁移除；否则新注册可能在间隙中回指旧 Arc。
+            let pruned = store
+                .inner()
+                .prune_container_mirror(&name, expected.as_deref());
+            if pruned {
+                registrations.remove(&name);
+            }
+            pruned
+        };
+        if pruned {
             info!(
                 "[STORAGE_PG] sync remove container registration {name} (deleted on peer replica)"
             );
@@ -187,7 +234,13 @@ pub(crate) async fn sync_once(
     let mut changed = 0usize;
     let mut added = 0usize;
     for row in projects {
-        let _registration = store.registration.lock().unwrap_or_else(|p| p.into_inner());
+        let registration = store.registration.lock().unwrap_or_else(|p| p.into_inner());
+        // A local retirement can be admitted after the drain barrier but before
+        // baseline capture. Its SQL may still be pending, so an absent baseline
+        // does not authorize restoring that exact retired generation or its SIDs.
+        if registration.get(&row.project_id) == Some(&row.generation) {
+            continue;
+        }
         let existing = inner.get(&row.project_id);
         if let Some(current) = &existing {
             if baseline
@@ -297,14 +350,38 @@ async fn self_confirm_session_alive(
 /// 容器注册表二次确认：短排空后按 name 直查 containers 行（屏障后本地
 /// 新注册的容器必已落库，不会被误判为远端删除）。PG 故障时返回 true
 /// （宁可不删也不误删——下轮 sync 再收敛）。
-async fn self_confirm_container_alive(store: &PgStore, pool: &DatabaseOwner, name: &str) -> bool {
+async fn self_confirm_container_alive(
+    store: &PgStore,
+    pool: &DatabaseOwner,
+    name: &str,
+    expected: Option<&shared_types::persistence::ContainerPersistenceIdentity>,
+) -> bool {
     if store.wait_drained(Duration::from_millis(200)).await {
         let name = name.to_owned();
+        let expected = expected.cloned();
         match super::database::read(pool, move |tx| {
             Box::pin(async move {
-                repo::fetch_container_registration(tx, &name)
-                    .await
-                    .map(|row| row.is_some())
+                if repo::fetch_container_registration(tx, &name)
+                    .await?
+                    .is_some()
+                {
+                    return Ok(true);
+                }
+                // Absence without the exact generation's tombstone remains
+                // anomalous; clearing the cache must not bypass that guard.
+                match expected {
+                    Some(identity) => match identity.physical_uid {
+                        Some(uid) => Ok(!repo::container_generation_is_retired(
+                            tx,
+                            &name,
+                            &identity.generation,
+                            &uid,
+                        )
+                        .await?),
+                        None => Ok(true),
+                    },
+                    None => Ok(true),
+                }
             })
         })
         .await

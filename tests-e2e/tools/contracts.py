@@ -205,6 +205,14 @@ REQUIRED['lb_stop_resume_same_sid_cross_entry'] = {
     '普通 Computer Stop 后原入口自动恢复',
     '本 case 计算资源受控停止',
 }
+REQUIRED['lb_pod_stop_then_chat_cross_entry'] = {
+    'pod/stop 前真实对话完整执行',
+    'pod/stop 后跨副本 chat 全部自动恢复（无 workload replaced 500）',
+    'pod/stop case 计算资源受控停止',
+} | {
+    f'停止后第 {round} 轮{step}' for round in range(1, 6)
+    for step in ('跨副本 chat 直接受理', '真实对话完整执行')
+}
 
 REQUIRED['docker_deletion_identity_contract'] |= {
     'Docker lifecycle process completed', 'Q01 real Docker test executed',

@@ -59,6 +59,9 @@ impl TerminalSeed {
 /// 物理租约 validate 判定 + 可选死亡探针覆写。
 #[derive(Default)]
 pub(crate) struct FenceRuntime {
+    pub(crate) agent_replacement: Mutex<Option<shared_types::VerifiedAgentReplacement>>,
+    pub(crate) agent_replacement_verifications: std::sync::atomic::AtomicUsize,
+    pub(crate) agent_replacement_transport_fails: std::sync::atomic::AtomicBool,
     pub(crate) previous_compute_releases: std::sync::atomic::AtomicUsize,
     pub(crate) previous_compute_arguments: Mutex<
         Vec<(
@@ -89,9 +92,10 @@ pub(crate) struct FenceRuntime {
     generation: Mutex<Option<String>>,
     pub(crate) builder_workload: Mutex<Option<String>>,
     pub(crate) receipt_verdict: Mutex<ReceiptVerdict>,
-    /// capture_app_mutation_target 探测开关: true 时按 ContainerNotFound 应答,
-    /// 模拟 image-roll 目标(Deployment/容器)已被删除的恢复场景。
+    /// app_compute_absent 探测开关，正向证实 image-roll 目标已不存在。
     pub(crate) app_target_absent: std::sync::atomic::AtomicBool,
+    pub(crate) app_absence_error: Mutex<Option<String>>,
+    pub(crate) app_absence_probes: std::sync::atomic::AtomicUsize,
     /// 显式 holder 死亡探针判定（模型 Docker flock 覆写）；
     /// None = 默认推导（K8s 极性）。
     pub(crate) receipt_holder_dead: Mutex<Option<bool>>,
@@ -103,6 +107,9 @@ impl FenceRuntime {
         generation: Option<&str>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            agent_replacement: Default::default(),
+            agent_replacement_verifications: Default::default(),
+            agent_replacement_transport_fails: Default::default(),
             previous_compute_releases: Default::default(),
             previous_compute_arguments: Mutex::new(Vec::new()),
             compute_release_succeeds: Default::default(),
@@ -123,6 +130,8 @@ impl FenceRuntime {
             builder_workload: Mutex::new(None),
             receipt_verdict: Mutex::new(ReceiptVerdict::NotHeld),
             app_target_absent: Default::default(),
+            app_absence_error: Default::default(),
+            app_absence_probes: Default::default(),
             receipt_holder_dead: Mutex::new(None),
         })
     }
@@ -153,6 +162,31 @@ fn status_of(phase: &str, replicas: i32) -> DeploymentStatus {
 
 #[async_trait::async_trait]
 impl AgentContainerRuntime for FenceRuntime {
+    async fn verify_agent_replacement(
+        &self,
+        _params: &container_runtime_api::ContainerCreateParams,
+        _previous: Option<&ContainerBasicInfo>,
+        _replacement: &ContainerBasicInfo,
+    ) -> ContainerRuntimeResult<shared_types::VerifiedAgentReplacement> {
+        self.agent_replacement_verifications
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .agent_replacement_transport_fails
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ContainerRuntimeError::K8sError(
+                "injected verification transport failure".into(),
+            ));
+        }
+        self.agent_replacement
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| {
+                ContainerRuntimeError::Conflict("injected runtime workspace owner mismatch".into())
+            })
+    }
+
     async fn create_container(
         &self,
         _params: container_runtime_api::ContainerCreateParams,
@@ -315,6 +349,11 @@ impl UserAppDeploymentRuntime for FenceRuntime {
         &self,
         _context: &shared_types::UserAppExecutionContext,
     ) -> ContainerRuntimeResult<bool> {
+        self.app_absence_probes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(message) = self.app_absence_error.lock().unwrap().clone() {
+            return Err(ContainerRuntimeError::K8sError(message));
+        }
         // 开关打开时正向证实缺席, 模拟 image-roll 目标(Deployment/容器)已被删除。
         Ok(self
             .app_target_absent

@@ -62,6 +62,8 @@ RCoder 的错误响应保留 `code`、`message`、`data`、`tid`、`operation_id
 
 一旦请求已经受理，改为查询自己的原 `operation_id`；`holder_operation_id` 只说明谁阻塞本次请求，不表示新的重启已经受理。调用方应将结构化 `data` 完整透传到最终响应，保留操作身份与重试证据。
 
+Prod 镜像滚动重启进入恢复后，若运行时正向确认目标及残留计算资源均已不存在，原操作以 `Failed`、`error_code=ERR_RUNTIME_ABSENT` 终态收束并释放操作槽。探测失败或仍有残留时继续恢复，不按缺席收束；Dev builder 不使用 Prod 运行时的缺席结果。查询该失败操作仍返回正常的操作状态信封，重放原请求保留原失败结果；重新启动须通过新的 Start 请求，使用当前发布配置重建运行时。
+
 `POST /api/v1/userapp/{app_id}/restart` 在业务受理前遇到有明确进度证据的正常流量唤醒、部署或重启占用时，每 200ms 重核生命周期、持久 intent 和物理租约。两层及所有受理前只读准备共用同一个单调时钟 deadline，默认 30 秒；可用 YAML `app_manager.restart_admission_wait_secs` 或环境 `RCODER_USERAPP_RESTART_ADMISSION_WAIT_SECS` 配置，显式 YAML 值优先，选中的非法输入直接报配置错误。等待耗尽保留原 blocker/data，不受理另一项业务操作。物理 Stop/Restart 控制、未知 holder、`recovery_required` 与陈旧 `running` 立即拒绝；外部 Stop 仍快失败，Start 与内部回收器保持原排队语义。
 
 等待期间 HTTP 断开会取消未受理请求。派发租约获取或持久受理写入后若结果未知，由原协调器继续核实，不能因为客户端已断开就重新派发；取得但未受理的租约只释放本次精确身份，并持续记录未确认清理。已成功 request ID 的重放返回原结果。30 秒等待预算不改变业务 Stop 的宽限或部署执行预算，客户端超时应覆盖等待与实际执行时间。

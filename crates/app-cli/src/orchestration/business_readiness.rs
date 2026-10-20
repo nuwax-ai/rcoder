@@ -309,8 +309,59 @@ impl BusinessReadinessObserver {
             };
         };
 
-        // 确认停止：相位回 Idle 且业务 ready 标志已撤销（StopBusiness 收束路径
-        // 恒经此组合）。stopped 不需要任何网络探测。
+        // 停止意图已受理且尚未收束（内核中存在 admitted、非终态的 Stop 运行
+        // 操作）：整个停机窗口（standby 发布 → 业务停止 → 终态持久化）顶层
+        // 一律 stopping/STOP_ACCEPTED。先于 Idle 和代理换代判断：Idle 可能
+        // 只是恢复驱动者停驻，不能证明未终态 Stop 已完成清理；standby 发布
+        // 本身也是一次 official 换代事务。Restart/热部署没有 Stop 受理，
+        // 不受影响。扫描失败则无法确认是否有未收束停止，显式返回 unknown，
+        // 不借用旧 ready/stopped 结果；观察本身不恢复或改写记录。
+        let stop_observation =
+            server
+                .runtime_kernel()
+                .and_then(|kernel| match kernel.outstanding_stop_operations() {
+                    Ok(stops) => stops.into_iter().min().map(|id| {
+                        (
+                            UserAppReadinessStatus::Stopping,
+                            UserAppReadinessReason::StopAccepted,
+                            Some(id),
+                        )
+                    }),
+                    Err(error) => {
+                        tracing::debug!(
+                            "business readiness: outstanding stop scan failed: {error:#}"
+                        );
+                        Some((
+                            UserAppReadinessStatus::Unknown,
+                            UserAppReadinessReason::ObserveIncomplete,
+                            operation_id.clone(),
+                        ))
+                    }
+                });
+        if let Some((status, reason, operation_id)) = stop_observation {
+            return UserAppBusinessReadiness {
+                ready: false,
+                status,
+                reason_code: Some(reason),
+                checked_at,
+                runtime_instance_id: instance_id,
+                serving_release_id: None,
+                target_release_id: None,
+                operation_id,
+                observation_revision: 0,
+                proxy: UserAppProxyReadiness {
+                    ready: false,
+                    status,
+                    reason_code: Some(reason),
+                    error_origin_contract: None,
+                    confirmation: proxy_confirmation,
+                },
+                services: Vec::new(),
+            };
+        }
+
+        // 无未收束 Stop 后，Idle + ready=false 才能视为确认停止。
+        // 正常 StopBusiness 先持久化终态，再回 Idle；此处无需网络探测。
         if matches!(phase, ServerPhase::Idle) && !server.runtime_status().is_ready() {
             return UserAppBusinessReadiness {
                 ready: false,
@@ -328,48 +379,6 @@ impl BusinessReadinessObserver {
                     reason_code: None,
                     error_origin_contract: None,
                     confirmation: None,
-                },
-                services: Vec::new(),
-            };
-        }
-
-        // 停止意图已受理且尚未收束（内核中存在 admitted、非终态的 Stop 运行
-        // 操作）：整个停机窗口（standby 发布 → 业务停止 → 终态持久化）顶层
-        // 一律 stopping/STOP_ACCEPTED。它必须先于代理换代短路——本窗口的
-        // standby 发布本身就是一次 official 换代事务，否则会被换代分支改判
-        // starting；Restart/热部署窗口没有 Stop 受理，不受影响。收束路径先
-        // 持久化终态再回 Idle（run_loop），故上方「确认停止」分支仍优先；
-        // 无 release 的实例维持 not_deployed（分支在其后）。扫描失败只降级
-        // 为继续旧推导（只读观察不做恢复动作，同 fetch_admin_snapshot 容错）。
-        let outstanding_stop =
-            server
-                .runtime_kernel()
-                .and_then(|kernel| match kernel.outstanding_stop_operations() {
-                    Ok(stops) => stops.into_iter().min(),
-                    Err(error) => {
-                        tracing::debug!(
-                            "business readiness: outstanding stop scan failed: {error:#}"
-                        );
-                        None
-                    }
-                });
-        if let Some(stop_operation_id) = outstanding_stop {
-            return UserAppBusinessReadiness {
-                ready: false,
-                status: UserAppReadinessStatus::Stopping,
-                reason_code: Some(UserAppReadinessReason::StopAccepted),
-                checked_at,
-                runtime_instance_id: instance_id,
-                serving_release_id: None,
-                target_release_id: None,
-                operation_id: Some(stop_operation_id),
-                observation_revision: 0,
-                proxy: UserAppProxyReadiness {
-                    ready: false,
-                    status: UserAppReadinessStatus::Stopping,
-                    reason_code: Some(UserAppReadinessReason::StopAccepted),
-                    error_origin_contract: None,
-                    confirmation: proxy_confirmation,
                 },
                 services: Vec::new(),
             };
@@ -1149,6 +1158,89 @@ mod tests {
         assert_eq!(settled.reason_code, None);
         assert_eq!(settled.operation_id, None);
         assert!(kernel.outstanding_stop_operations().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_phase_does_not_confirm_an_unsettled_stop() {
+        let root = tempfile::tempdir().unwrap();
+        let kernel = kernel_with_admitted_stop(root.path(), "idle-stop").await;
+        let state = Arc::new(ServerState::new(
+            crate::runtime_status::RuntimeStatusService::default(),
+        ));
+        state.mark_initialized();
+        state.set_release(combo_lock(19495));
+        state.set_phase(ServerPhase::Idle);
+        assert!(state.set_runtime_kernel(kernel.clone()));
+
+        let observed = BusinessReadinessObserver::new(state.clone())
+            .observe()
+            .await;
+        assert_eq!(observed.status, UserAppReadinessStatus::Stopping);
+        assert_eq!(observed.operation_id.as_deref(), Some("idle-stop"));
+
+        // A parked recovery driver can be Idle while cleanup remains unknown.
+        // RecoveryRequired is deliberately nonterminal; phase alone proves no exit.
+        state
+            .finish_runtime_operation_by_id(
+                "idle-stop",
+                shared_types::RuntimeOperationState::RecoveryRequired,
+                Some((
+                    shared_types::ERR_BACKEND_ERROR.into(),
+                    "cleanup unknown".into(),
+                )),
+            )
+            .await
+            .unwrap();
+        let observed = BusinessReadinessObserver::new(state.clone())
+            .observe()
+            .await;
+        assert_eq!(observed.status, UserAppReadinessStatus::Stopping);
+        assert_eq!(
+            observed.reason_code,
+            Some(UserAppReadinessReason::StopAccepted)
+        );
+        assert!(!observed.ready);
+        assert_eq!(
+            kernel.outstanding_stop_operations().unwrap(),
+            vec!["idle-stop"]
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_stop_records_do_not_confirm_stopped() {
+        let root = tempfile::tempdir().unwrap();
+        let kernel = kernel_with_admitted_stop(root.path(), "unreadable-stop").await;
+        let record = root.path().join("control/operations/unreadable-stop.json");
+        let original = std::fs::read(&record).unwrap();
+        std::fs::write(&record, b"incomplete record").unwrap();
+        let state = Arc::new(ServerState::new(
+            crate::runtime_status::RuntimeStatusService::default(),
+        ));
+        state.mark_initialized();
+        state.set_release(combo_lock(19496));
+        assert!(state.set_runtime_kernel(kernel));
+
+        for phase in [ServerPhase::Idle, ServerPhase::Running] {
+            state.set_phase(phase);
+            let observed = BusinessReadinessObserver::new(state.clone())
+                .observe()
+                .await;
+            assert_eq!(observed.status, UserAppReadinessStatus::Unknown);
+            assert_eq!(
+                observed.reason_code,
+                Some(UserAppReadinessReason::ObserveIncomplete)
+            );
+            assert!(!observed.ready);
+            assert!(observed.serving_release_id.is_none());
+            assert_eq!(observed.proxy.status, UserAppReadinessStatus::Unknown);
+        }
+        // Observation neither repairs nor discards durable evidence. A later
+        // successful read must recover naturally through the same observer path.
+        assert_eq!(std::fs::read(&record).unwrap(), b"incomplete record");
+        std::fs::write(&record, original).unwrap();
+        let observed = BusinessReadinessObserver::new(state).observe().await;
+        assert_eq!(observed.status, UserAppReadinessStatus::Stopping);
+        assert_eq!(observed.operation_id.as_deref(), Some("unreadable-stop"));
     }
 
     /// 停止意图优先于代理过渡短路；无停止意图时过渡窗口（restart 语义）

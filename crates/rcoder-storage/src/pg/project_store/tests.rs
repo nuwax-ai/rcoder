@@ -13,6 +13,12 @@ use crate::config::PostgresConfig;
 use crate::pg::test_support::{DSN_ENV, test_dsn, uuid_suffix, wait_for};
 use crate::pg::{PgStore, sync};
 
+#[path = "authoritative_tests.rs"]
+mod authoritative_tests;
+
+#[path = "sync_retirement_tests.rs"]
+mod sync_retirement_tests;
+
 fn info_for(
     project_id: &str,
     container: Option<ContainerBasicInfo>,
@@ -839,9 +845,10 @@ async fn authoritative_gate_allows_replacement_after_peer_delete() {
             project_for(mk("pod-b", "sts-uid-new")),
         )
         .await;
-    assert!(
-        rebound.is_ok(),
-        "peer-deleted binding must re-register via the authoritative gate: {rebound:?}"
+    assert_eq!(
+        rebound.expect("peer-deleted binding must re-register via the authoritative gate"),
+        shared_types::persistence::PersistenceWriteOutcome::Committed,
+        "the first registration must be confirmed before dispatch"
     );
 
     // DB 为事实源：新行重建、旧代次 tombstone 在案。
@@ -975,9 +982,9 @@ async fn cross_replica_sync_removes_stale_container_mirror() {
             project_for(mk("pod-b", "sts-uid-new")),
         )
         .await;
-    assert!(
-        rebound.is_ok(),
-        "converged replica must accept the rebuilt workload: {rebound:?}"
+    assert_eq!(
+        rebound.expect("converged replica must accept the rebuilt workload"),
+        shared_types::persistence::PersistenceWriteOutcome::Committed
     );
 
     let _ = store_b
@@ -1084,6 +1091,17 @@ async fn external_workload_replacement_still_refused_as_conflict() {
         })
         .await
         .expect("raw row delete");
+    sync::sync_once(&store_b, store_b.inner(), &store_b.database)
+        .await
+        .expect("sync preserves an anomalous container cursor");
+    assert!(
+        store_b
+            .container_registration
+            .lock()
+            .unwrap()
+            .contains_key(&container_name),
+        "sync must not erase a missing binding without its retirement tombstone"
+    );
     let anomalous = store_b
         .insert_project_registration_durable(
             project_id.clone(),

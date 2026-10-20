@@ -54,7 +54,10 @@ Restart 协调器，因此也按该真实控制动作展示。应用热部署、
 `/api/v1/userapp/dev/stop` 停机窗口，含 standby 摘流发布期），顶层
 `status=stopping`、`reason_code=STOP_ACCEPTED` 由 app-cli 快照直接产出；
 平台侧 Stop 操作记录对顶层状态的改写（合并层兜底）与此一致，收束后回到
-`stopped`。
+`stopped`。未终态 Stop（含 `recovery_required`）优先于容器内 Idle 相位和
+代理换代状态；仅在不存在未收束 Stop 时，Idle 才可表示 `stopped`。停止
+记录读取或解码失败时返回 `unknown/OBSERVE_INCOMPLETE`，不以旧的就绪或
+停止状态代替本轮核验；查询不会修改原记录。
 
 Docker 强制结束进程可能留下非零退出码（例如 137）。当前 Stop 已确认成功、
 停止意图仍有效且实例确实未运行时，返回 `stopped`；失败或待核验的 Stop

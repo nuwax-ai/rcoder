@@ -22,6 +22,35 @@ impl ProjectAdapter {
         self.containers.view(key, |_, entry| entry.info())
     }
 
+    /// Restore an authoritative container after pruning its retired predecessor.
+    #[cfg(feature = "pg")]
+    pub(crate) fn restore_unreferenced_container(
+        &self,
+        basic: ContainerBasicInfo,
+        service_type: ServiceType,
+    ) -> anyhow::Result<()> {
+        let _container = self.container_locks.entry_by_ref(&basic.container_name);
+        anyhow::ensure!(
+            !self
+                .project_to_container
+                .iter()
+                .any(|entry| entry.value() == &basic.container_name),
+            "Cannot restore a container mirror over live project references"
+        );
+        let Entry::Vacant(entry) = self.containers.entry(basic.container_name.clone()) else {
+            anyhow::bail!("Container mirror changed during authoritative restoration");
+        };
+        entry.insert(Arc::new(ContainerEntry::with_ref_count(
+            basic.clone(),
+            service_type.family_representative(),
+            basic.project_id.clone(),
+            0,
+        )));
+        self.container_id_to_key
+            .insert(basic.container_id, basic.container_name);
+        Ok(())
+    }
+
     /// 保存容器信息（更新或创建）
     ///
     /// 通过 view() 获取 `Arc<ContainerEntry>`，利用内部可变性（RwLock）更新。
@@ -94,7 +123,8 @@ impl ProjectAdapter {
     /// 与 [`Self::delete_container_with_projects`] 的差异：不发送
     /// CleanupRequest（物理对象已由执行删除的副本清理），且要求该容器无
     /// 本地 project 引用。`expected_physical_uid` 与条目实际身份不符时返回
-    /// false（快照之后本地已有新写入，保守留待下一轮对账）。
+    /// false（快照之后本地已有新写入，保守留待下一轮对账）。条目已经不存在
+    /// 且无 project 引用时返回 true，允许调用方一并清理孤立注册游标。
     #[cfg(feature = "pg")]
     pub(crate) fn prune_container_mirror(
         &self,
@@ -110,7 +140,7 @@ impl ProjectAdapter {
             return false;
         }
         let Entry::Occupied(entry) = self.containers.entry(name.to_string()) else {
-            return false;
+            return true;
         };
         let info = entry.get().info();
         let actual = (!info.container_id.is_empty()).then_some(info.container_id.as_str());
