@@ -50,6 +50,12 @@ Restart 协调器，因此也按该真实控制动作展示。应用热部署、
 `provisioning` 期间 `container.status` 仍如实反映物理事实（`missing`、
 `starting`、`running` 都可能出现），不随业务等待态改名。
 
+容器在跑且容器内 Stop 运行操作已受理未收束时（如 dev 的
+`/api/v1/userapp/dev/stop` 停机窗口，含 standby 摘流发布期），顶层
+`status=stopping`、`reason_code=STOP_ACCEPTED` 由 app-cli 快照直接产出；
+平台侧 Stop 操作记录对顶层状态的改写（合并层兜底）与此一致，收束后回到
+`stopped`。
+
 Docker 强制结束进程可能留下非零退出码（例如 137）。当前 Stop 已确认成功、
 停止意图仍有效且实例确实未运行时，返回 `stopped`；失败或待核验的 Stop
 不能用这条规则掩盖故障，后来实际运行的实例也不会被历史 Stop 显示为停止。

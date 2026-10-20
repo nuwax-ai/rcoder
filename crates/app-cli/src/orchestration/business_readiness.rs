@@ -333,6 +333,48 @@ impl BusinessReadinessObserver {
             };
         }
 
+        // 停止意图已受理且尚未收束（内核中存在 admitted、非终态的 Stop 运行
+        // 操作）：整个停机窗口（standby 发布 → 业务停止 → 终态持久化）顶层
+        // 一律 stopping/STOP_ACCEPTED。它必须先于代理换代短路——本窗口的
+        // standby 发布本身就是一次 official 换代事务，否则会被换代分支改判
+        // starting；Restart/热部署窗口没有 Stop 受理，不受影响。收束路径先
+        // 持久化终态再回 Idle（run_loop），故上方「确认停止」分支仍优先；
+        // 无 release 的实例维持 not_deployed（分支在其后）。扫描失败只降级
+        // 为继续旧推导（只读观察不做恢复动作，同 fetch_admin_snapshot 容错）。
+        let outstanding_stop =
+            server
+                .runtime_kernel()
+                .and_then(|kernel| match kernel.outstanding_stop_operations() {
+                    Ok(stops) => stops.into_iter().min(),
+                    Err(error) => {
+                        tracing::debug!(
+                            "business readiness: outstanding stop scan failed: {error:#}"
+                        );
+                        None
+                    }
+                });
+        if let Some(stop_operation_id) = outstanding_stop {
+            return UserAppBusinessReadiness {
+                ready: false,
+                status: UserAppReadinessStatus::Stopping,
+                reason_code: Some(UserAppReadinessReason::StopAccepted),
+                checked_at,
+                runtime_instance_id: instance_id,
+                serving_release_id: None,
+                target_release_id: None,
+                operation_id: Some(stop_operation_id),
+                observation_revision: 0,
+                proxy: UserAppProxyReadiness {
+                    ready: false,
+                    status: UserAppReadinessStatus::Stopping,
+                    reason_code: Some(UserAppReadinessReason::StopAccepted),
+                    error_origin_contract: None,
+                    confirmation: proxy_confirmation,
+                },
+                services: Vec::new(),
+            };
+        }
+
         // A frozen official replacement cannot borrow the previous serving
         // observation while its owned process is stopping or being verified.
         if let Some(status) = proxy_transition_status(proxy_confirmation.as_ref()) {
@@ -1001,6 +1043,166 @@ mod tests {
         );
         confirmation.phase = shared_types::ProxyPhase::Serving;
         assert_eq!(proxy_transition_status(Some(&confirmation)), None);
+    }
+
+    /// 构造带一条已受理未收束 Stop 操作的内核（harness 对齐
+    /// server::kernel_startup_tests 的 kernel()/request() 形态）。
+    async fn kernel_with_admitted_stop(
+        root: &std::path::Path,
+        operation_id: &str,
+    ) -> Arc<crate::runtime_kernel::RuntimeKernel> {
+        use crate::runtime_kernel::{RuntimeKernel, RuntimeStore};
+        let source = root.join("workspace");
+        std::fs::create_dir_all(&source).unwrap();
+        let store = RuntimeStore::open_with_root(root.join("control"), &source).unwrap();
+        let identity = store
+            .load_or_init_identity(
+                "readiness-app".into(),
+                "userapp-dev".into(),
+                "workspace".into(),
+                source.to_string_lossy().into_owned(),
+                "readiness-generation".into(),
+            )
+            .unwrap();
+        let kernel = Arc::new(RuntimeKernel::new(store, identity, Box::new(|_| {})));
+        let request = shared_types::RuntimeOperationRequest {
+            operation_id: operation_id.into(),
+            expected_runtime_instance_id: kernel.identity().runtime_instance_id.clone(),
+            expected_revision: 0,
+            workspace_id: "workspace".into(),
+            kind: shared_types::RuntimeOperationKind::Stop,
+            profile: shared_types::RunProfileInput::Source {
+                workspace_id: "workspace".into(),
+            },
+            run_config: None,
+            request_context: None,
+        };
+        match kernel.admit(request).await {
+            Ok(crate::runtime_kernel::AdmissionOutcome::Accepted(_)) => kernel,
+            other => panic!("stop admission must be accepted, got {other:?}"),
+        }
+    }
+
+    /// 反例（修复前失败）：Stop 已受理未收束的整个窗口（含 standby 发布的
+    /// 代理过渡期）顶层必须是 stopping/STOP_ACCEPTED，收束后回到 stopped。
+    #[tokio::test]
+    async fn admitted_stop_reports_stopping_until_settled() {
+        let root = tempfile::tempdir().unwrap();
+        let kernel = kernel_with_admitted_stop(root.path(), "stop-window").await;
+        assert_eq!(
+            kernel.outstanding_stop_operations().unwrap(),
+            vec!["stop-window"]
+        );
+
+        let state = Arc::new(ServerState::new(
+            crate::runtime_status::RuntimeStatusService::default(),
+        ));
+        state.mark_initialized();
+        state.set_release(combo_lock(19493));
+        state.set_phase(ServerPhase::Running);
+        assert!(state.set_runtime_kernel(kernel.clone()));
+
+        let observer = BusinessReadinessObserver::new(state.clone());
+        let observed = await_status(&observer, UserAppReadinessStatus::Stopping).await;
+        assert!(!observed.ready);
+        assert_eq!(
+            observed.reason_code,
+            Some(UserAppReadinessReason::StopAccepted)
+        );
+        assert_eq!(observed.operation_id.as_deref(), Some("stop-window"));
+        assert!(observed.serving_release_id.is_none());
+        assert!(observed.target_release_id.is_none());
+        assert!(observed.services.is_empty());
+        assert_eq!(observed.proxy.status, UserAppReadinessStatus::Stopping);
+        assert_eq!(
+            observed.proxy.reason_code,
+            Some(UserAppReadinessReason::StopAccepted)
+        );
+        assert!(observed.proxy.confirmation.is_none());
+        assert_eq!(
+            observed.runtime_instance_id.as_deref(),
+            Some(kernel.identity().runtime_instance_id.as_str())
+        );
+
+        // 只读纪律：观察既不推进也不收束内核状态。
+        assert_eq!(
+            kernel.outstanding_stop_operations().unwrap(),
+            vec!["stop-window"]
+        );
+        assert_eq!(
+            kernel.status().await.unwrap().desired,
+            shared_types::DesiredState::Stopped
+        );
+
+        // 按 run_loop 收束顺序：先终态持久化，再回 Idle。
+        state
+            .finish_runtime_operation_by_id(
+                "stop-window",
+                shared_types::RuntimeOperationState::Succeeded,
+                None,
+            )
+            .await
+            .unwrap();
+        state.set_phase(ServerPhase::Idle);
+
+        let settled = await_status(&observer, UserAppReadinessStatus::Stopped).await;
+        assert_eq!(settled.reason_code, None);
+        assert_eq!(settled.operation_id, None);
+        assert!(kernel.outstanding_stop_operations().unwrap().is_empty());
+    }
+
+    /// 停止意图优先于代理过渡短路；无停止意图时过渡窗口（restart 语义）
+    /// 保持 starting 不回归。
+    #[tokio::test]
+    async fn stop_intent_outranks_proxy_transition_but_restart_window_keeps_starting() {
+        let state = Arc::new(ServerState::new(
+            crate::runtime_status::RuntimeStatusService::default(),
+        ));
+        state.mark_initialized();
+        state.set_release(combo_lock(19494));
+        state.set_phase(ServerPhase::Running);
+
+        // Part A：无停止意图 → 在途代理过渡（Stopping 相位）仍报 starting。
+        let outcome = crate::proxy::compiler::CompileOutcome {
+            serving_release_id: Some("rel-transition".into()),
+            operation_id: Some("fs-restart-window".into()),
+            config_path: "unused-transition-candidate.toml".into(),
+            expected_hash: "TRANSITIONHASH1".into(),
+            publication_id: uuid::Uuid::new_v4().to_string(),
+            config_digest: "b".repeat(64),
+            entry_probes: vec![],
+            business_probes: vec![],
+        };
+        crate::proxy::compiler::record_official_phase(
+            &outcome,
+            shared_types::ProxyPhase::Stopping,
+            None,
+        )
+        .unwrap();
+        let observer = BusinessReadinessObserver::new(state.clone());
+        let observed = observer.observe().await;
+        assert_eq!(observed.status, UserAppReadinessStatus::Starting);
+        assert_eq!(
+            observed.reason_code,
+            Some(UserAppReadinessReason::ServiceStarting)
+        );
+
+        // Part B：同一 state 注入已受理未收束的 Stop 内核 → stopping 覆盖过渡。
+        let root = tempfile::tempdir().unwrap();
+        let kernel = kernel_with_admitted_stop(root.path(), "stop-outrank").await;
+        assert!(state.set_runtime_kernel(kernel.clone()));
+        let observed = await_status(&observer, UserAppReadinessStatus::Stopping).await;
+        assert_eq!(
+            observed.reason_code,
+            Some(UserAppReadinessReason::StopAccepted)
+        );
+        assert_eq!(observed.operation_id.as_deref(), Some("stop-outrank"));
+        assert_ne!(observed.operation_id.as_deref(), Some("fs-restart-window"));
+        let confirmation = observed
+            .proxy
+            .confirmation
+            .expect("transition confirmation stays visible");
+        assert_eq!(confirmation.phase, shared_types::ProxyPhase::Stopping);
     }
 
     fn service(
