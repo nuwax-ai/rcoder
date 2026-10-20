@@ -360,6 +360,18 @@ async fn inspect_and_resume(
             ));
         }
         ComputeLeaseInspection::IdentityChanged(reason) => {
+            // 异构/旧命名回执永远无法被当前后端调和(生产 227/229/239: kubernetes
+            // 回执但 captured_name 与当前命名不符), 也不代表本操作的存活行为者。
+            // 此时 image-roll 目标缺席即收敛, 不让 Deferred 变成永久卡死;
+            // 陈旧租约由下一操作的 drain 清理兜底。Held(我方租约仍被持有)
+            // 仍严格 Deferred, 不探测不收敛。
+            if current.scope == UserAppOperationScope::Prod
+                && is_image_roll_restart(current)
+                && state.runtime().app_compute_absent(&context).await?
+            {
+                converge_absent_image_roll(state, current).await?;
+                return Ok(Resume::Converged(ERR_RUNTIME_ABSENT));
+            }
             return Ok(Resume::Deferred("COMPUTE_LEASE_IDENTITY_CHANGED", reason));
         }
         ComputeLeaseInspection::Discovered { receipt, attempt } => {
@@ -755,6 +767,28 @@ mod image_roll_absent_tests {
         let after2 = current(&state2, &record2).await;
         assert_ne!(after2.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
         assert_eq!(runtime2.app_absence_probes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn identity_changed_lease_receipt_does_not_block_absent_convergence() {
+        // 旧命名/异构回执会让租约检查返回 IdentityChanged(生产 227/229/239 实测:
+        // kubernetes 回执但 captured_name 不匹配当前命名)。预检在租约检查之前,
+        // 目标缺席即收敛, 不被 IdentityChanged 的 Deferred 阻断。
+        let (state, record, runtime, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll": true}),
+            true,
+            UserAppOperationScope::Prod,
+        )
+        .await;
+        *runtime.compute_inspection.lock().unwrap() = Some(
+            ComputeLeaseInspection::IdentityChanged("Compute lease scope differs".into()),
+        );
+        recover_and_execute(&state, &record)
+            .await
+            .expect("absent target converges despite identity-changed receipt");
+        let after = current(&state, &record).await;
+        assert_eq!(after.state, ComputeControlState::Failed);
+        assert_eq!(after.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
     }
 
     #[tokio::test]
