@@ -1083,6 +1083,21 @@ pub trait UserAppLifecycleStore: Send + Sync {
         ))
     }
 
+    /// Recoverer-settled terminal failure for a recovery_required compute
+    /// control that cannot be resumed (for example an image roll whose target
+    /// runtime no longer exists). Keeps the original checkpoint evidence and
+    /// records terminal_at.
+    async fn fail_unrecoverable_compute_control(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+        _code: &str,
+        _message: &str,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Unrecoverable compute settlement is unsupported".into(),
+        ))
+    }
+
     /// Finalize a compute control whose durable stage proves that all physical
     /// writes have returned. The caller verifies any outstanding readiness read;
     /// this method never authorizes replay of the runtime mutation.

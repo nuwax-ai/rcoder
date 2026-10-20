@@ -27,6 +27,7 @@ error.invalid_resource_limits: "Invalid resource limits configuration"
 # Container
 error.container_error: "Container operation failed"
 error.container_not_found: "Container not found"
+error.runtime_absent: "The image-roll target runtime no longer exists; the interrupted roll was closed as failed. Start the application again to recreate it."
 error.runtime_configuration: "Platform runtime configuration is invalid"
 error.runtime_unavailable: "Container runtime is unavailable"
 error.runtime_timeout: "Runtime operation timed out"

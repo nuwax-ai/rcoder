@@ -89,6 +89,9 @@ pub(crate) struct FenceRuntime {
     generation: Mutex<Option<String>>,
     pub(crate) builder_workload: Mutex<Option<String>>,
     pub(crate) receipt_verdict: Mutex<ReceiptVerdict>,
+    /// capture_app_mutation_target 探测开关: true 时按 ContainerNotFound 应答,
+    /// 模拟 image-roll 目标(Deployment/容器)已被删除的恢复场景。
+    pub(crate) app_target_absent: std::sync::atomic::AtomicBool,
     /// 显式 holder 死亡探针判定（模型 Docker flock 覆写）；
     /// None = 默认推导（K8s 极性）。
     pub(crate) receipt_holder_dead: Mutex<Option<bool>>,
@@ -119,6 +122,7 @@ impl FenceRuntime {
             generation: Mutex::new(generation.map(str::to_string)),
             builder_workload: Mutex::new(None),
             receipt_verdict: Mutex::new(ReceiptVerdict::NotHeld),
+            app_target_absent: Default::default(),
             receipt_holder_dead: Mutex::new(None),
         })
     }
@@ -296,6 +300,25 @@ impl UserAppDeploymentRuntime for FenceRuntime {
         // This protocol fixture has no native metadata discovery witnesses;
         // the caller's real lifecycle store remains the existing identity.
         Ok(None)
+    }
+    async fn capture_app_mutation_target(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _expected_resource_version: Option<&str>,
+    ) -> ContainerRuntimeResult<shared_types::UserAppMutationTarget> {
+        // 与 trait 默认一致: 本 fixture 不支持 identity-bound capture。
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Identity-bound application stop is not supported by this runtime".into(),
+        ))
+    }
+    async fn app_compute_absent(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<bool> {
+        // 开关打开时正向证实缺席, 模拟 image-roll 目标(Deployment/容器)已被删除。
+        Ok(self
+            .app_target_absent
+            .load(std::sync::atomic::Ordering::SeqCst))
     }
     async fn prepare_compute_operation(
         &self,

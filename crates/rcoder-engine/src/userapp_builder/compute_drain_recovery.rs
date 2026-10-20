@@ -146,6 +146,15 @@ pub(super) async fn prepare_resume_with_budget(
     .await;
     let (code, message) = match result {
         Ok(Ok(Resume::Ready(pending))) => return Ok(Some(*pending)),
+        Ok(Ok(Resume::Converged(code))) => {
+            tracing::info!(
+                code,
+                operation_id = %current.operation_id,
+                app_id = %current.app_id,
+                "Recovered orphan compute operation converged to terminal"
+            );
+            return Ok(None);
+        }
         Ok(Ok(Resume::Deferred(code, message))) => (code, message),
         Ok(Err(error))
             if matches!(
@@ -303,6 +312,9 @@ async fn prepare_fenced_attempt_handoff(
 enum Resume {
     Ready(Box<ComputeControlRecord>),
     Deferred(&'static str, String),
+    /// 恢复器已把原操作按终态收口（image-roll 目标缺席 → Failed/ERR_RUNTIME_ABSENT）：
+    /// 不再续跑、不记 problem，围栏随终态自然释放，由业务 start 重建运行时。
+    Converged(&'static str),
 }
 
 async fn inspect_and_resume(
@@ -405,6 +417,20 @@ async fn inspect_and_resume(
                 .context("Release original early compute lease")?;
         }
     }
+    // Image-roll restart 的后半段假设"滚动目标仍在"。若前代容器/Deployment 已被
+    // 删除（排干已事实完成、无目标可滚），续跑只会永远撞 ContainerNotFound 并把
+    // 操作卡在 recovery_required。续跑前用类型化的 app_compute_absent 探测
+    // （缺席必须被正向证实；探测错误原样冒泡，绝不当缺席处理）：缺席即按
+    // Failed/ERR_RUNTIME_ABSENT 终态收口，围栏释放，由业务 start 重建运行时。
+    // 仅 Prod 域: app_compute_absent 探测的是 rcoder-app-{id} 运行时, 对 Dev(builder)
+    // 重启无意义且会误伤(Dev 应用常无 prod 运行时 → 恒真)。
+    if current.scope == UserAppOperationScope::Prod
+        && is_image_roll_restart(current)
+        && state.runtime().app_compute_absent(&context).await?
+    {
+        converge_absent_image_roll(state, current).await?;
+        return Ok(Resume::Converged(ERR_RUNTIME_ABSENT));
+    }
     let pending = state
         .userapp_store
         .resume_released_compute_drain(current, current.lease.as_ref())
@@ -449,4 +475,254 @@ pub(super) async fn observe_unsubmitted_predecessor(
         }
     }
     superseded::release_prepared_mutex(state, previous).await
+}
+
+/// 孤儿 image-roll restart 判定：restart 且 checkpoint 记录了 restart_image_roll。
+pub(super) fn is_image_roll_restart(record: &ComputeControlRecord) -> bool {
+    record.action == ComputeControlAction::Restart
+        && record
+            .checkpoint
+            .get("restart_image_roll")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+}
+
+/// 把"滚动目标已缺席"的 recovery_required 原操作按 Failed 终态收口。CAS 失败
+/// （VersionConflict）表示另一 replica 已处理，静默即可。前代容器已删 = 排干已
+/// 事实完成且镜像滚动无目标可滚；不伪造成功，围栏随终态释放，由业务 start
+/// 携带新配置重建运行时。保留 checkpoint 证据并写 terminal_at（存储原语
+/// fail_unrecoverable_compute_control）。
+pub(super) async fn converge_absent_image_roll(
+    state: &AppState,
+    record: &ComputeControlRecord,
+) -> Result<()> {
+    const MESSAGE: &str = concat!(
+        "image-roll target runtime is absent; previous generation was already drained; ",
+        "resubmit start to recreate the runtime"
+    );
+    anyhow::ensure!(
+        record.state == ComputeControlState::RecoveryRequired,
+        "absent-target convergence only settles recovery_required records, got {}",
+        record
+            .state
+            .as_progress_storage_value()
+            .unwrap_or("unknown")
+    );
+    let result = state
+        .userapp_store
+        .fail_unrecoverable_compute_control(record, ERR_RUNTIME_ABSENT, MESSAGE)
+        .await
+        .map(|_| ());
+    match result {
+        Ok(()) | Err(UserAppStoreError::VersionConflict) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod image_roll_absent_tests {
+    use super::*;
+    use crate::userapp_builder::creation::fence_settler_tests::{FenceRuntime, runtime_state};
+    use std::sync::Arc;
+
+    /// 复现生产孤儿形态: prod 域 restart, recovery_required/draining_previous,
+    /// checkpoint 仅含 restart_image_roll, 无 interrupted_operations, 无租约。
+    async fn stuck_record(
+        checkpoint: serde_json::Value,
+        target_absent: bool,
+        scope: UserAppOperationScope,
+    ) -> (Arc<AppState>, ComputeControlRecord, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+                &directory.path().join("absent-roll.db"),
+            )
+            .await
+            .unwrap(),
+        );
+        let app = store.ensure_identity("absentroll").await.unwrap();
+        let pending = store
+            .admit_compute_control(&ComputeControlRequest {
+                app_id: app.app_id.clone(),
+                lifecycle_id: app.lifecycle_id.clone(),
+                scope,
+                operation_id: "orphanroll".into(),
+                request_id: "orphanrequest".into(),
+                request_fingerprint: "f".repeat(64),
+                action: ComputeControlAction::Restart,
+                restart_image_roll: true,
+                builder_startup_mode: BuilderStartupMode::PreserveBusinessIntent,
+            })
+            .await
+            .unwrap();
+        let identity = ComputeExecutorIdentity {
+            app_id: app.app_id.clone(),
+            lifecycle_id: app.lifecycle_id.clone(),
+            scope: pending.scope,
+            operation_id: pending.operation_id.clone(),
+            generation: pending.generation,
+            executor_id: "lostexecutor".into(),
+        };
+        store
+            .claim_compute_control(&identity, pending.revision)
+            .await
+            .unwrap();
+        // 与生产卡死形态一致: 绑定一个 Docker FD 租约(drain 恢复分类依赖租约证据)。
+        let lock_path = directory.path().join("original.lock");
+        let fd = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        fd.try_lock().unwrap();
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = fd.metadata().unwrap();
+        let receipt = UserAppOperationLeaseReceipt::Docker {
+            service_type: compute_lease_family(scope).unwrap(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            token: identity.executor_id.clone(),
+        };
+        let claimed = store.bind_compute_lease(&identity, &receipt).await.unwrap();
+        drop(fd);
+        let record = store
+            .advance_compute_control(&ComputeControlProgress {
+                identity,
+                expected_revision: claimed.revision,
+                state: ComputeControlState::RecoveryRequired,
+                stage: ComputeControlStage::DrainingPrevious,
+                checkpoint,
+                error_code: Some(ERR_BACKEND_ERROR.into()),
+                error_message: Some("simulated interrupted drain".into()),
+            })
+            .await
+            .unwrap();
+        let runtime = FenceRuntime::default();
+        runtime
+            .app_target_absent
+            .store(target_absent, std::sync::atomic::Ordering::SeqCst);
+        // 生产实况: 记录带租约回执, 但集群里的 Lease 对象已不存在 → 探测为 Absent。
+        *runtime.compute_inspection.lock().unwrap() = Some(ComputeLeaseInspection::Absent);
+        let state = runtime_state(Arc::new(runtime), store, None).await;
+        (state, record, directory)
+    }
+
+    async fn current(state: &AppState, record: &ComputeControlRecord) -> ComputeControlRecord {
+        state
+            .userapp_store
+            .get_compute_control(&record.app_id, &record.operation_id)
+            .await
+            .unwrap()
+            .expect("record persists")
+    }
+
+    #[test]
+    fn image_roll_restart_predicate_only_matches_roll_checkpoint() {
+        let roll = serde_json::json!({"restart_image_roll": true});
+        let plain = serde_json::json!({"restart_image_roll": false});
+        let mut record = stuck_record_shaped(&roll);
+        assert!(is_image_roll_restart(&record));
+        record.checkpoint = plain;
+        assert!(!is_image_roll_restart(&record));
+        record.action = ComputeControlAction::Stop;
+        record.checkpoint = roll;
+        assert!(!is_image_roll_restart(&record));
+    }
+
+    fn stuck_record_shaped(checkpoint: &serde_json::Value) -> ComputeControlRecord {
+        ComputeControlRecord {
+            created_at: chrono::Utc::now(),
+            app_id: "absentroll".into(),
+            lifecycle_id: "lifecycle".into(),
+            request_id: "request".into(),
+            scope: UserAppOperationScope::Prod,
+            operation_id: "orphanroll".into(),
+            request_fingerprint: "f".repeat(64),
+            generation: 1,
+            revision: 1,
+            action: ComputeControlAction::Restart,
+            state: ComputeControlState::RecoveryRequired,
+            executor_id: Some("lostexecutor".into()),
+            stage: ComputeControlStage::DrainingPrevious.as_str().into(),
+            checkpoint: checkpoint.clone(),
+            error_code: None,
+            error_message: None,
+            lease: None,
+            interrupted_operations: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_roll_target_converges_to_terminal_failed() {
+        let (state, record, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll": true}),
+            true,
+            UserAppOperationScope::Prod,
+        )
+        .await;
+        recover_and_execute(&state, &record)
+            .await
+            .expect("absent-target recovery converges without error");
+        let after = current(&state, &record).await;
+        assert_eq!(after.state, ComputeControlState::Failed);
+        assert_eq!(after.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+        assert!(
+            after
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("absent"))
+        );
+        // 幂等: 终态后再跑一次恢复不报错、不改写。
+        recover_and_execute(&state, &after)
+            .await
+            .expect("terminal record stays inert");
+        let again = current(&state, &record).await;
+        assert_eq!(again.state, ComputeControlState::Failed);
+        assert_eq!(again.revision, after.revision);
+    }
+
+    #[tokio::test]
+    async fn dev_scope_builder_roll_ignores_app_absence_probe() {
+        // app_compute_absent 探测的是 rcoder-app-{id} 运行时; Dev(builder) 重启即便
+        // 带 restart_image_roll 也绝不能据此收敛(Dev 应用常无 prod 运行时 → 恒真)。
+        let (state, record, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll": true}),
+            true,
+            UserAppOperationScope::Dev,
+        )
+        .await;
+        let _outcome = recover_and_execute(&state, &record).await;
+        let after = current(&state, &record).await;
+        assert_ne!(
+            after.error_code.as_deref(),
+            Some(ERR_RUNTIME_ABSENT),
+            "Dev(builder) roll must not settle via the prod-runtime absence probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_unavailable_or_plain_restart_never_converges_to_absent() {
+        // 目标探测不可用(运行时未实现 identity-bound capture) + image-roll:
+        // 预检必须跳过而非收敛 —— 与目标在场时行为一致。
+        let (state, record, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll": true}),
+            false,
+            UserAppOperationScope::Prod,
+        )
+        .await;
+        let _first = recover_and_execute(&state, &record).await;
+        let after = current(&state, &record).await;
+        assert_ne!(after.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+        // 非 image-roll 的 restart 即便目标缺席也不走该收敛(行为保持旧语义)。
+        let (state2, record2, _keep2) = stuck_record(
+            serde_json::json!({"restart_image_roll": false}),
+            true,
+            UserAppOperationScope::Prod,
+        )
+        .await;
+        let _second = recover_and_execute(&state2, &record2).await;
+        let after2 = current(&state2, &record2).await;
+        assert_ne!(after2.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+    }
 }

@@ -124,6 +124,28 @@ pub(super) async fn problem(
     updated(tx, snapshot, changed).await
 }
 
+/// 恢复器判定操作不可恢复（如 image-roll 的滚动目标缺席）：recovery_required →
+/// failed 终态收口。与 problem() 同款 CAS（快照身份 + revision），不改
+/// checkpoint（保留原始证据），写 terminal_at_us。只接受 recovery_required
+/// 来源；Running 记录的终态走 compute_execution::advance 的执行器路径。
+pub(super) async fn fail_unrecoverable(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    snapshot: &ComputeControlRecord,
+    code: &str,
+    message: &str,
+) -> Result<ComputeControlRecord, UserAppStoreError> {
+    let actual = current(tx, backend, snapshot).await?;
+    if actual.state.is_terminal() {
+        return Err(UserAppStoreError::VersionConflict);
+    }
+    let now = chrono::Utc::now().timestamp_micros();
+    let changed = toasty::sql::statement(repo::sql(backend,
+        "UPDATE userapp_compute_controls SET state='failed',error_code=$3,error_message=$4,revision=revision+1,updated_at_us=$5,terminal_at_us=$5 WHERE operation_id=$1 AND revision=$2 AND state='recovery_required'"))
+        .bind(&snapshot.operation_id).bind(snapshot.revision).bind(code).bind(message).bind(now).exec(tx).await.map_err(storage)?;
+    updated(tx, snapshot, changed).await
+}
+
 async fn updated(
     tx: &mut dyn Executor,
     snapshot: &ComputeControlRecord,

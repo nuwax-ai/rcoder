@@ -231,6 +231,11 @@ pub const ERR_FILE_NOT_FOUND: &str = "ERR_FILE_NOT_FOUND";
 /// 后端 API 调用失败（K8s/Docker API 透传，瞬时故障）。可重试 → 500
 pub const ERR_BACKEND_ERROR: &str = "ERR_BACKEND_ERROR";
 
+/// 滚动目标运行时已不存在（孤儿 image-roll restart 的恢复收敛：前代已被删除、
+/// 无目标可滚，操作按失败终态收口）。终态；重试该操作无意义，正确恢复动作是
+/// 重新提交 start 创建运行时。
+pub const ERR_RUNTIME_ABSENT: &str = "ERR_RUNTIME_ABSENT";
+
 /// 镜像拉取失败（ImagePullBackOff/ErrImagePull，常为临时 registry 故障）。可重试 → 502
 pub const ERR_IMAGE_PULL_FAILED: &str = "ERR_IMAGE_PULL_FAILED";
 
@@ -346,6 +351,7 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_INVALID_STATE => "error.invalid_state",
         ERR_OPERATION_NOT_SUPPORTED => "error.operation_not_supported",
         ERR_FILE_NOT_FOUND => "error.file_not_found",
+        ERR_RUNTIME_ABSENT => "error.runtime_absent",
         ERR_BACKEND_ERROR => "error.backend_error",
         ERR_IMAGE_PULL_FAILED => "error.image_pull_failed",
         ERR_RESOURCE_EXHAUSTED => "error.resource_exhausted",

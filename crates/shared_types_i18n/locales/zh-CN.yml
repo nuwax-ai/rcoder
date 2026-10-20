@@ -27,6 +27,7 @@ error.invalid_resource_limits: "资源限制配置无效"
 # 容器相关
 error.container_error: "容器操作失败"
 error.container_not_found: "容器不存在"
+error.runtime_absent: "镜像滚动的目标运行时已不存在；中断的滚动操作已按失败收口。请重新启动应用以重建运行时。"
 error.runtime_configuration: "平台运行时配置无效"
 error.runtime_unavailable: "无法连接或查询容器运行时"
 error.runtime_timeout: "运行时操作超时"

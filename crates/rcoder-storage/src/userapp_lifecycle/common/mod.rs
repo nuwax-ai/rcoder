@@ -349,6 +349,25 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         .await
     }
 
+    /// 恢复器把不可恢复（如 image-roll 滚动目标缺席）的 recovery_required
+    /// compute 操作按 failed 终态收口：保留 checkpoint 证据并写 terminal_at_us。
+    async fn fail_unrecoverable_compute_control(
+        &self,
+        snapshot: &ComputeControlRecord,
+        code: &str,
+        message: &str,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let code = code.to_owned();
+        let message = message.to_owned();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_recovery::fail_unrecoverable(tx, backend, &snapshot, &code, &message).await
+            })
+        })
+        .await
+    }
+
     async fn finalize_confirmed_compute(
         &self,
         snapshot: &ComputeControlRecord,

@@ -27,6 +27,7 @@ error.invalid_resource_limits: "資源限制配置無效"
 # 容器相關
 error.container_error: "容器操作失敗"
 error.container_not_found: "容器不存在"
+error.runtime_absent: "鏡像滾動的目標執行時已不存在；中斷的滾動操作已按失敗收口。請重新啟動應用以重建執行時。"
 error.runtime_configuration: "平台執行階段設定無效"
 error.runtime_unavailable: "無法連線或查詢容器執行階段"
 error.runtime_timeout: "執行階段操作逾時"
