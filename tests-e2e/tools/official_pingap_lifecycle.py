@@ -245,9 +245,12 @@ class Acceptance:
                         and operation_status == 200
                         and (operation or {}).get("data", {}).get("state") not in TERMINAL)
             (readiness, operation) = self.wait(open_stop_snapshot, stopping_while_open)
+            (readiness_status, readiness) = readiness
+            (operation_status, operation) = operation
             data = readiness["data"]
             self.check("stop window reports stopping while the operation is unsettled",
-                       data["status"] == "stopping" and data["reason_code"] == "STOP_ACCEPTED"
+                       readiness_status == 200 and operation_status == 200
+                       and data["status"] == "stopping" and data["reason_code"] == "STOP_ACCEPTED"
                        and data["ready"] is False and data.get("operation_id") == operation_id,
                        snapshot=data, operation=operation["data"])
         _, result = self.wait(lambda: self.request(f"/v1/runtime/operations/{operation_id}"),

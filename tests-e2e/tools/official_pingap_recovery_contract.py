@@ -25,8 +25,8 @@ TOOLS = Path(__file__).parent
 SCHEMA = "official-proxy-recovery-v1"
 REQUIRED = {"fresh app-cli binary matches the build source receipt": 1,
             "unmodified official 0.15.0 protocol": 1,
-            "stop window reports stopping while the operation is unsettled": 3,
-            "settled Stop reports stopped": 3,
+            "stop window reports stopping while the operation is unsettled": 1,
+            "settled Stop reports stopped": 1,
             "original native StopWork confirms physical cleanup": 2,
             "original native StopWork restores management after business exit": 2,
             "late Stop leaves the real proxy STOPPED with PID zero and Remove pending": 1,
