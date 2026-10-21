@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::k8s_pod::K8sPodOps;
 
 #[cfg(feature = "kubernetes")]
 #[async_trait]
@@ -201,6 +202,31 @@ impl AgentContainerRuntime for KubernetesRuntime {
         context: &shared_types::UserAppExecutionContext,
     ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
         self.capture_builder_compute(context).await
+    }
+
+    async fn builder_compute_absent(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<bool> {
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let name = self.pod_name(&context.app_id, &ServiceType::UserappBuilder)?;
+        if self
+            .statefulsets()
+            .get_opt(&name)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::K8sError(format!(
+                    "Observe absent builder controller: {error}"
+                ))
+            })?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        self.confirm_builder_compute_absent(context).await?;
+        Ok(true)
     }
 
     async fn exec_builder_control_target(

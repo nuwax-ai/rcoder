@@ -295,6 +295,70 @@ impl AgentContainerRuntime for DockerRuntime {
         self.capture_builder_compute(context).await
     }
 
+    async fn builder_compute_absent(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<bool> {
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let name = crate::utils::DockerUtils::generate_container_name(
+            ServiceType::UserappBuilder.container_prefix(),
+            &context.app_id,
+        )
+        .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let client = self.inner.get_docker_client();
+        match client.inspect_container(&name, None).await {
+            Ok(_) => return Ok(false),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {}
+            Err(error) => {
+                return Err(ContainerRuntimeError::DockerError(format!(
+                    "Observe absent builder compute: {error}"
+                )));
+            }
+        }
+        // A renamed builder retains its physical execution and ownership
+        // labels. Missing the canonical name does not prove it was removed.
+        let filters = HashMap::from([(
+            "label".to_string(),
+            vec![
+                format!(
+                    "service-type={}",
+                    ServiceType::UserappBuilder.container_family_key()
+                ),
+                format!("identifier={}", context.app_id),
+            ],
+        )]);
+        let options = bollard::query_parameters::ListContainersOptionsBuilder::new()
+            .all(true)
+            .filters(&filters)
+            .build();
+        let residual = client
+            .list_containers(Some(options))
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::DockerError(format!(
+                    "List remaining builder compute: {error}"
+                ))
+            })?;
+        if !residual.is_empty() {
+            return Ok(false);
+        }
+        // Creation may have acquired the canonical name while the list was
+        // being read. Observe it again before publishing absence.
+        match client.inspect_container(&name, None).await {
+            Ok(_) => Ok(false),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(true),
+            Err(error) => Err(ContainerRuntimeError::DockerError(format!(
+                "Recheck absent builder compute: {error}"
+            ))),
+        }
+    }
+
     async fn exec_builder_control_target(
         &self,
         target: &shared_types::BuilderControlTarget,

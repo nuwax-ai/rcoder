@@ -237,6 +237,17 @@ pub trait AgentContainerRuntime: Send + Sync {
         ))
     }
 
+    /// Prove that the builder controller and all executable instances are
+    /// absent after the caller has fenced and drained the original operation.
+    /// Discovery without a Pod, or a target eligible for replacement, is not
+    /// physical absence. Unsupported backends retain the fence by returning false.
+    async fn builder_compute_absent(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
     /// Execute only in the captured builder. Callers retain the durable operation
     /// and runtime lease; no name-based fallback is permitted on target mismatch.
     async fn exec_builder_control_target(

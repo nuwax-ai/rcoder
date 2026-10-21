@@ -23,7 +23,7 @@ pub(super) struct ApiState {
     pod_seed: serde_json::Value,
     pub(super) extra_pods: Vec<serde_json::Value>,
     resume_replicas_on_second_sts_read: bool,
-    fail_pod_list: bool,
+    pub(super) fail_pod_list: bool,
     replace_uid_on_sts_read: Option<usize>,
     pub(super) replace_pvc_on_read: Option<usize>,
     pvc_reads: usize,

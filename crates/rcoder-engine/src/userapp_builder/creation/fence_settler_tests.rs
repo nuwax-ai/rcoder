@@ -94,9 +94,11 @@ pub(crate) struct FenceRuntime {
     pub(crate) receipt_verdict: Mutex<ReceiptVerdict>,
     /// app_compute_absent 探测开关，正向证实 image-roll 目标已不存在。
     pub(crate) app_target_absent: std::sync::atomic::AtomicBool,
-    /// find_container(UserappBuilder) 探测开关: true 返回 Some(容器存在),
-    /// false(默认) 返回 None(builder 缺席)。控制 Dev 域 builder 缺席收敛测试。
-    pub(crate) builder_present: std::sync::atomic::AtomicBool,
+    /// Only an explicit backend absence witness authorizes Dev convergence.
+    /// The default false never turns ordinary discovery None into proof.
+    pub(crate) builder_absent_proven: std::sync::atomic::AtomicBool,
+    pub(crate) builder_absence_error: Mutex<Option<String>>,
+    pub(crate) builder_absence_probes: std::sync::atomic::AtomicUsize,
     pub(crate) app_absence_error: Mutex<Option<String>>,
     pub(crate) app_absence_probes: std::sync::atomic::AtomicUsize,
     /// 显式 holder 死亡探针判定（模型 Docker flock 覆写）；
@@ -133,7 +135,9 @@ impl FenceRuntime {
             builder_workload: Mutex::new(None),
             receipt_verdict: Mutex::new(ReceiptVerdict::NotHeld),
             app_target_absent: Default::default(),
-            builder_present: Default::default(),
+            builder_absent_proven: Default::default(),
+            builder_absence_error: Default::default(),
+            builder_absence_probes: Default::default(),
             app_absence_error: Default::default(),
             app_absence_probes: Default::default(),
             receipt_holder_dead: Mutex::new(None),
@@ -205,29 +209,26 @@ impl AgentContainerRuntime for FenceRuntime {
     }
     async fn find_container(
         &self,
-        identifier: &str,
-        service_type: &ServiceType,
+        _identifier: &str,
+        _service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Option<container_runtime_api::RuntimeContainerInfo>> {
-        if *service_type == ServiceType::UserappBuilder {
-            return Ok(self
-                .builder_present
-                .load(std::sync::atomic::Ordering::SeqCst)
-                .then(|| container_runtime_api::RuntimeContainerInfo {
-                    container_id: format!("builder-{identifier}"),
-                    container_name: format!("rcoder-app-builder-{identifier}"),
-                    container_ip: "10.0.0.1".into(),
-                    status: container_runtime_api::ContainerRuntimeStatus::Running,
-                    created_at: chrono::Utc::now(),
-                    env_vars: None,
-                    service_type: Some(ServiceType::UserappBuilder),
-                    project_id: Some(identifier.to_owned()),
-                    user_id: None,
-                    pod_id: None,
-                    app_id: Some(identifier.to_owned()),
-                    workload_uid: None,
-                }));
-        }
         Ok(None)
+    }
+    async fn builder_compute_absent(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<bool> {
+        context
+            .validate_identity(&context.app_id)
+            .expect("valid captured context");
+        self.builder_absence_probes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(message) = self.builder_absence_error.lock().unwrap().clone() {
+            return Err(ContainerRuntimeError::K8sError(message));
+        }
+        Ok(self
+            .builder_absent_proven
+            .load(std::sync::atomic::Ordering::SeqCst))
     }
     async fn stop_container(&self, _project_id: &str) -> ContainerRuntimeResult<()> {
         Ok(())

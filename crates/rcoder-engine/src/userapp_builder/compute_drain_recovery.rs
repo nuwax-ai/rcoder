@@ -365,10 +365,7 @@ async fn inspect_and_resume(
             // 此时 image-roll 目标缺席即收敛, 不让 Deferred 变成永久卡死;
             // 陈旧租约由下一操作的 drain 清理兜底。Held(我方租约仍被持有)
             // 仍严格 Deferred, 不探测不收敛。
-            if current.scope == UserAppOperationScope::Prod
-                && is_image_roll_restart(current)
-                && state.runtime().app_compute_absent(&context).await?
-            {
+            if image_roll_target_absent(state, current, &context).await? {
                 converge_absent_image_roll(state, current).await?;
                 return Ok(Resume::Converged(ERR_RUNTIME_ABSENT));
             }
@@ -431,34 +428,34 @@ async fn inspect_and_resume(
     }
     // Image-roll restart 的后半段假设"滚动目标仍在"。若前代容器/Deployment 已被
     // 删除（排干已事实完成、无目标可滚），续跑只会永远撞 ContainerNotFound 并把
-    // 操作卡在 recovery_required。续跑前用类型化的 app_compute_absent 探测
+    // 操作卡在 recovery_required。续跑前用类型化的物理缺席探测
     // （缺席必须被正向证实；探测错误原样冒泡，绝不当缺席处理）：缺席即按
     // Failed/ERR_RUNTIME_ABSENT 终态收口，围栏释放，由业务 start 重建运行时。
-    // 目标缺席收敛(仅 image-roll restart): Prod 探测 rcoder-app-{id} 运行时
-    // (app_compute_absent); Dev 探测 builder 容器(find_container 为 None——
-    // 管理员 docker rm / 沙箱升级清容器后的标准恢复场景)。两者均为类型化
-    // 布尔探测(缺席必须被正向证实), 探测错误原样冒泡绝不当缺席处理。
-    // Dev 域的 app_compute_absent 无意义且会误伤(Dev 应用常无 prod 运行时)。
-    if is_image_roll_restart(current) {
-        let target_absent = match current.scope {
-            UserAppOperationScope::Prod => state.runtime().app_compute_absent(&context).await?,
-            UserAppOperationScope::Dev => state
-                .runtime()
-                .find_container(&current.app_id, &ServiceType::UserappBuilder)
-                .await?
-                .is_none(),
-            UserAppOperationScope::Application => false,
-        };
-        if target_absent {
-            converge_absent_image_roll(state, current).await?;
-            return Ok(Resume::Converged(ERR_RUNTIME_ABSENT));
-        }
+    // find_container(None) 也可能只是 STS 存在而 Pod 暂缺，不能用于结束围栏。
+    if image_roll_target_absent(state, current, &context).await? {
+        converge_absent_image_roll(state, current).await?;
+        return Ok(Resume::Converged(ERR_RUNTIME_ABSENT));
     }
     let pending = state
         .userapp_store
         .resume_released_compute_drain(current, current.lease.as_ref())
         .await?;
     Ok(Resume::Ready(Box::new(pending)))
+}
+
+async fn image_roll_target_absent(
+    state: &AppState,
+    current: &ComputeControlRecord,
+    context: &UserAppExecutionContext,
+) -> Result<bool> {
+    if !is_image_roll_restart(current) {
+        return Ok(false);
+    }
+    match current.scope {
+        UserAppOperationScope::Prod => Ok(state.runtime().app_compute_absent(context).await?),
+        UserAppOperationScope::Dev => Ok(state.runtime().builder_compute_absent(context).await?),
+        UserAppOperationScope::Application => Ok(false),
+    }
 }
 
 /// Observe a superseded early controller without admitting a new operation.
@@ -562,6 +559,26 @@ mod image_roll_absent_tests {
         Arc<FenceRuntime>,
         tempfile::TempDir,
     ) {
+        stuck_record_with_state(
+            checkpoint,
+            target_absent,
+            scope,
+            ComputeControlState::RecoveryRequired,
+        )
+        .await
+    }
+
+    async fn stuck_record_with_state(
+        checkpoint: serde_json::Value,
+        target_absent: bool,
+        scope: UserAppOperationScope,
+        initial_state: ComputeControlState,
+    ) -> (
+        Arc<AppState>,
+        ComputeControlRecord,
+        Arc<FenceRuntime>,
+        tempfile::TempDir,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(
             rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
@@ -616,15 +633,16 @@ mod image_roll_absent_tests {
         };
         let claimed = store.bind_compute_lease(&identity, &receipt).await.unwrap();
         drop(fd);
+        let failed_observation = initial_state == ComputeControlState::RecoveryRequired;
         let record = store
             .advance_compute_control(&ComputeControlProgress {
                 identity,
                 expected_revision: claimed.revision,
-                state: ComputeControlState::RecoveryRequired,
+                state: initial_state,
                 stage: ComputeControlStage::DrainingPrevious,
                 checkpoint,
-                error_code: Some(ERR_BACKEND_ERROR.into()),
-                error_message: Some("simulated interrupted drain".into()),
+                error_code: failed_observation.then(|| ERR_BACKEND_ERROR.into()),
+                error_message: failed_observation.then(|| "simulated interrupted drain".into()),
             })
             .await
             .unwrap();
@@ -632,6 +650,12 @@ mod image_roll_absent_tests {
         runtime
             .app_target_absent
             .store(target_absent, Ordering::SeqCst);
+        // Explicit backend witness; a generic find_container(None) is not proof.
+        runtime
+            .builder_absent_proven
+            .store(target_absent, Ordering::SeqCst);
+        *runtime.builder_workload.lock().unwrap() =
+            (!target_absent).then(|| "rcoder-app-builder-absentroll".into());
         // 生产实况: 记录带租约回执, 但集群里的 Lease 对象已不存在 → 探测为 Absent。
         *runtime.compute_inspection.lock().unwrap() = Some(ComputeLeaseInspection::Absent);
         let state = runtime_state(runtime.clone(), store, None).await;
@@ -737,48 +761,344 @@ mod image_roll_absent_tests {
 
     #[tokio::test]
     async fn dev_scope_builder_present_does_not_converge() {
-        // Dev 域不走 prod 运行时探测(app_compute_absent); builder 容器存在时
-        // (find_container 返回 Some)绝不收敛——即使 app_compute_absent 为真。
+        // A false backend witness cannot settle the operation, even when the
+        // unrelated production runtime is absent and generic discovery is None.
         let (state, record, runtime, _keep) = stuck_record(
             serde_json::json!({"restart_image_roll": true}),
             true,
             UserAppOperationScope::Dev,
         )
         .await;
-        runtime.builder_present.store(true, Ordering::SeqCst);
-        let _outcome = recover_and_execute(&state, &record).await;
+        runtime.builder_absent_proven.store(false, Ordering::SeqCst);
+        let resumed = prepare_resume(&state, &record).await.unwrap();
+        assert!(
+            resumed.is_some(),
+            "unproven absence must retain the ordinary continuation"
+        );
         let after = current(&state, &record).await;
         assert_ne!(
             after.error_code.as_deref(),
             Some(ERR_RUNTIME_ABSENT),
             "Dev(builder) with live builder must not converge as absent"
         );
+        assert_eq!(after.state, ComputeControlState::Pending);
+        assert!(runtime.builder_absence_probes.load(Ordering::SeqCst) > 0);
         assert_eq!(runtime.app_absence_probes.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn dev_scope_builder_absent_converges_like_prod() {
-        // 管理员 docker rm / 沙箱升级清掉 builder 容器 → find_container 为 None
-        // → Dev 域 image-roll restart 同样收敛为 Failed/ERR_RUNTIME_ABSENT,
-        // 围栏释放后 ensure 重建 builder, 无需人工 stop 解锁。
-        let (state, record, _runtime, _keep) = stuck_record(
+        // Backend-proven builder absence settles the old operation and lets
+        // the same ordinary EnsureBuilder admission recreate compute.
+        let (state, record, runtime, _keep) = stuck_record(
             serde_json::json!({"restart_image_roll": true}),
             true,
             UserAppOperationScope::Dev,
         )
         .await;
+        let ensure = dev_ensure_request(&record);
+        assert!(matches!(
+            state.userapp_store.admit(&ensure).await,
+            Err(UserAppStoreError::OperationInProgress(_))
+        ));
         recover_and_execute(&state, &record)
             .await
             .expect("absent builder converges without error");
         let after = current(&state, &record).await;
         assert_eq!(after.state, ComputeControlState::Failed);
         assert_eq!(after.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+        assert_eq!(after.checkpoint, record.checkpoint);
+        assert_eq!(after.lease, record.lease);
+        assert_eq!(runtime.compute_prepares.load(Ordering::SeqCst), 0);
         // 幂等: 终态后不再改写
         recover_and_execute(&state, &after)
             .await
             .expect("terminal record stays inert");
         let again = current(&state, &record).await;
         assert_eq!(again.revision, after.revision);
+        assert!(matches!(
+            state.userapp_store.admit(&ensure).await.unwrap(),
+            UserAppAdmissionOutcome::Accepted(_)
+        ));
+    }
+
+    fn dev_ensure_request(record: &ComputeControlRecord) -> UserAppAdmission {
+        UserAppAdmission {
+            app_id: record.app_id.clone(),
+            lifecycle_id: Some(record.lifecycle_id.clone()),
+            operation_id: "new-dev-ensure".into(),
+            request_id: Some("new-dev-ensure-request".into()),
+            request_fingerprint: "d".repeat(64),
+            kind: UserAppOperationKind::EnsureBuilder,
+            command: None,
+            metadata: None,
+            runtime_policy_on_success: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dev_absent_builder_with_old_identity_receipt_unblocks_original_ensure() {
+        let (state, record, runtime, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll": true}),
+            true,
+            UserAppOperationScope::Dev,
+        )
+        .await;
+        let ensure = dev_ensure_request(&record);
+        assert!(matches!(
+            state.userapp_store.admit(&ensure).await,
+            Err(UserAppStoreError::OperationInProgress(_))
+        ));
+        *runtime.compute_inspection.lock().unwrap() =
+            Some(ComputeLeaseInspection::IdentityChanged(
+                "old backend receipt does not match current naming".into(),
+            ));
+        recover_and_execute(&state, &record).await.unwrap();
+        let after = current(&state, &record).await;
+        assert_eq!(after.state, ComputeControlState::Failed);
+        assert_eq!(after.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+        assert_eq!(after.checkpoint, record.checkpoint);
+        assert_eq!(after.lease, record.lease);
+        assert!(runtime.builder_absence_probes.load(Ordering::SeqCst) > 0);
+        assert_eq!(runtime.app_absence_probes.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            state.userapp_store.admit(&ensure).await.unwrap(),
+            UserAppAdmissionOutcome::Accepted(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dev_workload_without_pod_does_not_converge_as_absent() {
+        let (state, record, runtime, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll": true}),
+            true,
+            UserAppOperationScope::Dev,
+        )
+        .await;
+        *runtime.builder_workload.lock().unwrap() = Some("still-existing-builder-sts".into());
+        // The runtime's authoritative probe must report the retained workload
+        // as unproven absence; backend tests verify its STS/Pod observation.
+        runtime.builder_absent_proven.store(false, Ordering::SeqCst);
+        let pending = prepare_resume(&state, &record).await.unwrap();
+        assert!(
+            pending.is_some(),
+            "existing STS must resume its ordinary continuation, not settle as absent"
+        );
+        let after = current(&state, &record).await;
+        assert_eq!(after.state, ComputeControlState::Pending);
+        assert_ne!(after.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+        assert!(runtime.builder_absence_probes.load(Ordering::SeqCst) > 0);
+        assert!(matches!(
+            state
+                .userapp_store
+                .admit(&dev_ensure_request(&record))
+                .await,
+            Err(UserAppStoreError::OperationInProgress(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn dev_absence_probe_failure_retries_original_without_erasing_evidence() {
+        for inspection in [
+            ComputeLeaseInspection::Absent,
+            ComputeLeaseInspection::IdentityChanged("legacy receipt".into()),
+        ] {
+            let (state, record, runtime, _keep) = stuck_record(
+                serde_json::json!({"restart_image_roll":true}),
+                true,
+                UserAppOperationScope::Dev,
+            )
+            .await;
+            *runtime.compute_inspection.lock().unwrap() = Some(inspection);
+            *runtime.builder_absence_error.lock().unwrap() =
+                Some("injected builder observation error".into());
+            recover_and_execute(&state, &record).await.unwrap();
+            let observed = current(&state, &record).await;
+            assert_eq!(observed.state, ComputeControlState::RecoveryRequired);
+            assert_eq!(
+                observed.error_code.as_deref(),
+                Some("COMPUTE_OBSERVATION_FAILED")
+            );
+            assert!(
+                observed
+                    .error_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("injected builder observation error")
+            );
+            assert_eq!(observed.checkpoint, record.checkpoint);
+            assert_eq!(observed.lease, record.lease);
+            assert_eq!(observed.executor_id, record.executor_id);
+            assert_eq!(runtime.compute_prepares.load(Ordering::SeqCst), 0);
+            assert_eq!(runtime.compute_releases.load(Ordering::SeqCst), 0);
+            let ensure = dev_ensure_request(&record);
+            assert!(matches!(
+                state.userapp_store.admit(&ensure).await,
+                Err(UserAppStoreError::OperationInProgress(_))
+            ));
+            *runtime.builder_absence_error.lock().unwrap() = None;
+            recover_and_execute(&state, &observed).await.unwrap();
+            let done = current(&state, &record).await;
+            assert_eq!(done.state, ComputeControlState::Failed);
+            assert_eq!(done.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+            assert_eq!(done.checkpoint, record.checkpoint);
+            assert_eq!(done.lease, record.lease);
+            assert_eq!(runtime.builder_absence_probes.load(Ordering::SeqCst), 2);
+            assert_eq!(runtime.app_absence_probes.load(Ordering::SeqCst), 0);
+            assert!(matches!(
+                state.userapp_store.admit(&ensure).await.unwrap(),
+                UserAppAdmissionOutcome::Accepted(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn dev_held_lease_prevents_absence_probe_and_fence_release() {
+        let (state, record, runtime, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll":true}),
+            true,
+            UserAppOperationScope::Dev,
+        )
+        .await;
+        *runtime.compute_inspection.lock().unwrap() = Some(ComputeLeaseInspection::Held);
+        recover_and_execute(&state, &record).await.unwrap();
+        let after = current(&state, &record).await;
+        assert_eq!(after.state, ComputeControlState::RecoveryRequired);
+        assert_eq!(after.error_code.as_deref(), Some("COMPUTE_LEASE_HELD"));
+        assert_eq!(after.checkpoint, record.checkpoint);
+        assert_eq!(after.lease, record.lease);
+        assert_eq!(runtime.builder_absence_probes.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.app_absence_probes.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            state
+                .userapp_store
+                .admit(&dev_ensure_request(&record))
+                .await,
+            Err(UserAppStoreError::OperationInProgress(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn running_dev_held_executor_is_not_reserved_or_probed() {
+        let (state, record, runtime, _keep) = stuck_record_with_state(
+            serde_json::json!({"restart_image_roll":true}),
+            true,
+            UserAppOperationScope::Dev,
+            ComputeControlState::Running,
+        )
+        .await;
+        *runtime.compute_inspection.lock().unwrap() = Some(ComputeLeaseInspection::Held);
+        assert!(prepare_resume(&state, &record).await.unwrap().is_none());
+        assert_eq!(current(&state, &record).await, record);
+        assert_eq!(runtime.builder_absence_probes.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.app_absence_probes.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.compute_prepares.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.compute_releases.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn running_dev_absent_target_converges_after_physical_handoff() {
+        let (state, record, runtime, _keep) = stuck_record_with_state(
+            serde_json::json!({"restart_image_roll":true}),
+            true,
+            UserAppOperationScope::Dev,
+            ComputeControlState::Running,
+        )
+        .await;
+        recover_and_execute(&state, &record).await.unwrap();
+        let after = current(&state, &record).await;
+        assert_eq!(after.state, ComputeControlState::Failed);
+        assert_eq!(after.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+        assert_eq!(after.lease, record.lease);
+        assert_eq!(after.checkpoint, record.checkpoint);
+        assert_eq!(runtime.builder_absence_probes.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.compute_prepares.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            state
+                .userapp_store
+                .admit(&dev_ensure_request(&record))
+                .await
+                .unwrap(),
+            UserAppAdmissionOutcome::Accepted(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn application_scope_and_nonroll_intents_do_not_probe_any_runtime() {
+        let (state, record, runtime, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll":true}),
+            true,
+            UserAppOperationScope::Dev,
+        )
+        .await;
+        let context = record.execution_context().unwrap();
+        // Application is not a valid persisted compute scope, so exercise the
+        // private dispatch decision without fabricating a store row for it.
+        let mut application = record.clone();
+        application.scope = UserAppOperationScope::Application;
+        assert!(
+            !image_roll_target_absent(&state, &application, &context)
+                .await
+                .unwrap()
+        );
+        let mut plain = record.clone();
+        plain.checkpoint["restart_image_roll"] = false.into();
+        assert!(
+            !image_roll_target_absent(&state, &plain, &context)
+                .await
+                .unwrap()
+        );
+        let mut stop = record.clone();
+        stop.action = ComputeControlAction::Stop;
+        assert!(
+            !image_roll_target_absent(&state, &stop, &context)
+                .await
+                .unwrap()
+        );
+        assert_eq!(runtime.builder_absence_probes.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.app_absence_probes.load(Ordering::SeqCst), 0);
+        assert_eq!(current(&state, &record).await, record);
+    }
+
+    #[tokio::test]
+    async fn dev_stale_absence_terminalizer_cannot_overwrite_current_revision() {
+        let (state, record, runtime, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll":true}),
+            true,
+            UserAppOperationScope::Dev,
+        )
+        .await;
+        let reserved = state
+            .userapp_store
+            .reserve_compute_drain_recovery(&record)
+            .await
+            .unwrap();
+        let advanced = state
+            .userapp_store
+            .record_compute_drain_problem(
+                &reserved,
+                "NEW_OBSERVATION",
+                "another replica already advanced",
+            )
+            .await
+            .unwrap();
+        converge_absent_image_roll(&state, &reserved).await.unwrap();
+        assert_eq!(current(&state, &record).await, advanced);
+        assert_eq!(runtime.builder_absence_probes.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            state
+                .userapp_store
+                .admit(&dev_ensure_request(&record))
+                .await,
+            Err(UserAppStoreError::OperationInProgress(_))
+        ));
+        recover_and_execute(&state, &advanced).await.unwrap();
+        let done = current(&state, &record).await;
+        assert_eq!(done.state, ComputeControlState::Failed);
+        assert_eq!(done.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+        let revision = done.revision;
+        recover_and_execute(&state, &reserved).await.unwrap();
+        assert_eq!(current(&state, &record).await.revision, revision);
     }
 
     #[tokio::test]
