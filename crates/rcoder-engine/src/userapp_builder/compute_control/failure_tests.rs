@@ -379,9 +379,27 @@ impl AgentContainerRuntime for Runtime {
     }
     async fn find_container(
         &self,
-        _: &str,
-        _: &ServiceType,
+        identifier: &str,
+        service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Option<container_runtime_api::RuntimeContainerInfo>> {
+        // Dev 域 image-roll 恢复预检会探测 builder 存在性; 返回 Some 表示
+        // builder 在场, 让预检跳过收敛, 测试继续走 fencing/handoff 路径。
+        if *service_type == ServiceType::UserappBuilder {
+            return Ok(Some(container_runtime_api::RuntimeContainerInfo {
+                container_id: format!("failure-builder-{identifier}"),
+                container_name: format!("rcoder-app-builder-{identifier}"),
+                container_ip: "127.0.0.1".into(),
+                status: container_runtime_api::ContainerRuntimeStatus::Running,
+                created_at: chrono::Utc::now(),
+                env_vars: None,
+                service_type: Some(ServiceType::UserappBuilder),
+                project_id: Some(identifier.to_owned()),
+                user_id: None,
+                pod_id: None,
+                app_id: Some(identifier.to_owned()),
+                workload_uid: None,
+            }));
+        }
         panic!("unexpected discovery")
     }
     async fn stop_container(&self, _: &str) -> ContainerRuntimeResult<()> {

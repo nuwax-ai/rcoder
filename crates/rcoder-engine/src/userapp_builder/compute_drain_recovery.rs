@@ -434,14 +434,25 @@ async fn inspect_and_resume(
     // 操作卡在 recovery_required。续跑前用类型化的 app_compute_absent 探测
     // （缺席必须被正向证实；探测错误原样冒泡，绝不当缺席处理）：缺席即按
     // Failed/ERR_RUNTIME_ABSENT 终态收口，围栏释放，由业务 start 重建运行时。
-    // 仅 Prod 域: app_compute_absent 探测的是 rcoder-app-{id} 运行时, 对 Dev(builder)
-    // 重启无意义且会误伤(Dev 应用常无 prod 运行时 → 恒真)。
-    if current.scope == UserAppOperationScope::Prod
-        && is_image_roll_restart(current)
-        && state.runtime().app_compute_absent(&context).await?
-    {
-        converge_absent_image_roll(state, current).await?;
-        return Ok(Resume::Converged(ERR_RUNTIME_ABSENT));
+    // 目标缺席收敛(仅 image-roll restart): Prod 探测 rcoder-app-{id} 运行时
+    // (app_compute_absent); Dev 探测 builder 容器(find_container 为 None——
+    // 管理员 docker rm / 沙箱升级清容器后的标准恢复场景)。两者均为类型化
+    // 布尔探测(缺席必须被正向证实), 探测错误原样冒泡绝不当缺席处理。
+    // Dev 域的 app_compute_absent 无意义且会误伤(Dev 应用常无 prod 运行时)。
+    if is_image_roll_restart(current) {
+        let target_absent = match current.scope {
+            UserAppOperationScope::Prod => state.runtime().app_compute_absent(&context).await?,
+            UserAppOperationScope::Dev => state
+                .runtime()
+                .find_container(&current.app_id, &ServiceType::UserappBuilder)
+                .await?
+                .is_none(),
+            UserAppOperationScope::Application => false,
+        };
+        if target_absent {
+            converge_absent_image_roll(state, current).await?;
+            return Ok(Resume::Converged(ERR_RUNTIME_ABSENT));
+        }
     }
     let pending = state
         .userapp_store
@@ -725,23 +736,49 @@ mod image_roll_absent_tests {
     }
 
     #[tokio::test]
-    async fn dev_scope_builder_roll_ignores_app_absence_probe() {
-        // app_compute_absent 探测的是 rcoder-app-{id} 运行时; Dev(builder) 重启即便
-        // 带 restart_image_roll 也绝不能据此收敛(Dev 应用常无 prod 运行时 → 恒真)。
+    async fn dev_scope_builder_present_does_not_converge() {
+        // Dev 域不走 prod 运行时探测(app_compute_absent); builder 容器存在时
+        // (find_container 返回 Some)绝不收敛——即使 app_compute_absent 为真。
         let (state, record, runtime, _keep) = stuck_record(
             serde_json::json!({"restart_image_roll": true}),
             true,
             UserAppOperationScope::Dev,
         )
         .await;
+        runtime.builder_present.store(true, Ordering::SeqCst);
         let _outcome = recover_and_execute(&state, &record).await;
         let after = current(&state, &record).await;
         assert_ne!(
             after.error_code.as_deref(),
             Some(ERR_RUNTIME_ABSENT),
-            "Dev(builder) roll must not settle via the prod-runtime absence probe"
+            "Dev(builder) with live builder must not converge as absent"
         );
         assert_eq!(runtime.app_absence_probes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dev_scope_builder_absent_converges_like_prod() {
+        // 管理员 docker rm / 沙箱升级清掉 builder 容器 → find_container 为 None
+        // → Dev 域 image-roll restart 同样收敛为 Failed/ERR_RUNTIME_ABSENT,
+        // 围栏释放后 ensure 重建 builder, 无需人工 stop 解锁。
+        let (state, record, _runtime, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll": true}),
+            true,
+            UserAppOperationScope::Dev,
+        )
+        .await;
+        recover_and_execute(&state, &record)
+            .await
+            .expect("absent builder converges without error");
+        let after = current(&state, &record).await;
+        assert_eq!(after.state, ComputeControlState::Failed);
+        assert_eq!(after.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+        // 幂等: 终态后不再改写
+        recover_and_execute(&state, &after)
+            .await
+            .expect("terminal record stays inert");
+        let again = current(&state, &record).await;
+        assert_eq!(again.revision, after.revision);
     }
 
     #[tokio::test]

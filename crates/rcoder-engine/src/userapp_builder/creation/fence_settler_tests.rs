@@ -94,6 +94,9 @@ pub(crate) struct FenceRuntime {
     pub(crate) receipt_verdict: Mutex<ReceiptVerdict>,
     /// app_compute_absent 探测开关，正向证实 image-roll 目标已不存在。
     pub(crate) app_target_absent: std::sync::atomic::AtomicBool,
+    /// find_container(UserappBuilder) 探测开关: true 返回 Some(容器存在),
+    /// false(默认) 返回 None(builder 缺席)。控制 Dev 域 builder 缺席收敛测试。
+    pub(crate) builder_present: std::sync::atomic::AtomicBool,
     pub(crate) app_absence_error: Mutex<Option<String>>,
     pub(crate) app_absence_probes: std::sync::atomic::AtomicUsize,
     /// 显式 holder 死亡探针判定（模型 Docker flock 覆写）；
@@ -130,6 +133,7 @@ impl FenceRuntime {
             builder_workload: Mutex::new(None),
             receipt_verdict: Mutex::new(ReceiptVerdict::NotHeld),
             app_target_absent: Default::default(),
+            builder_present: Default::default(),
             app_absence_error: Default::default(),
             app_absence_probes: Default::default(),
             receipt_holder_dead: Mutex::new(None),
@@ -201,9 +205,28 @@ impl AgentContainerRuntime for FenceRuntime {
     }
     async fn find_container(
         &self,
-        _identifier: &str,
-        _service_type: &ServiceType,
+        identifier: &str,
+        service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Option<container_runtime_api::RuntimeContainerInfo>> {
+        if *service_type == ServiceType::UserappBuilder {
+            return Ok(self
+                .builder_present
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .then(|| container_runtime_api::RuntimeContainerInfo {
+                    container_id: format!("builder-{identifier}"),
+                    container_name: format!("rcoder-app-builder-{identifier}"),
+                    container_ip: "10.0.0.1".into(),
+                    status: container_runtime_api::ContainerRuntimeStatus::Running,
+                    created_at: chrono::Utc::now(),
+                    env_vars: None,
+                    service_type: Some(ServiceType::UserappBuilder),
+                    project_id: Some(identifier.to_owned()),
+                    user_id: None,
+                    pod_id: None,
+                    app_id: Some(identifier.to_owned()),
+                    workload_uid: None,
+                }));
+        }
         Ok(None)
     }
     async fn stop_container(&self, _project_id: &str) -> ContainerRuntimeResult<()> {
