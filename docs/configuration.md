@@ -46,11 +46,21 @@ Agent 的 `memory` 不代表 UserApp 也使用内存。Agent PostgreSQL 后端�
 |---|---|
 | `RCODER_STORAGE_BACKEND` | Agent 存储后端：`memory` / `postgres` |
 | `RCODER_PG_URL` | Agent PostgreSQL 连接串；也支持 `RCODER_PG_HOST/PORT/USERNAME/PASSWORD/DATABASE` 分项配置 |
+| `RCODER_PG_DURABLE_COMMIT_TIMEOUT_MS` | Agent PostgreSQL 注册、会话和受控清理的确认总预算，默认 `15000` 毫秒 |
+| `RCODER_PG_STATEMENT_TIMEOUT_SECS` | PostgreSQL 单条 SQL 的服务端超时，默认 `15` 秒 |
 | `RCODER_USERAPP_STORAGE_BACKEND` | UserApp 控制存储：`auto` / `turso` / `postgres` |
 | `RCODER_USERAPP_TURSO_PATH` | UserApp 本地数据库文件路径 |
 | `RCODER_USERAPP_PG_URL` | UserApp PostgreSQL 连接串 |
 
 普通本地默认 Turso 路径为 `data/rcoder/userapp.turso.db`。Compose 将数据库放在 `/app/data/userapp.turso.db`，`make dev-*` 使用的 named volume、备份和数据保留方式见 [Docker 指南](deployment/docker.md)。同一个本地数据目录只运行一个 RCoder 实例。
+
+### PostgreSQL 提交确认预算
+
+`storage.postgres.durable_commit_timeout_ms` 可由 `RCODER_PG_DURABLE_COMMIT_TIMEOUT_MS` 覆盖，默认 `15000`；有效范围为 `1..=2147483647` 毫秒。显式非法、零值或超范围输入在使用前报配置错误，不静默回退。旧 YAML 缺少该字段时采用默认值；设为 `600` 可恢复原先的确认预算。
+
+该预算覆盖单次 durable 入口的对账、停止门禁、权威读取及 SQL 提交确认，共用一个 deadline。超时后可能返回 `Deferred` 或结果未知，原操作仍可能由数据库 owner 或后台 writer 完成；超时不代表 SQL 已取消，也不能据此重新派发业务请求。派发新任务须等原注册提交得到确认。
+
+`statement_timeout_secs` 是每条 SQL 的服务端上限，与上述总预算分别生效；多条 SQL、排队和重试使二者没有通用的大小约束。新的内置默认值为 `15` 秒，已有 YAML 或环境显式配置的较短值保持有效，升级时需要核对它是否提前限制了预期的慢提交容忍窗口。`lock_timeout` 仍按语句预算取 `1..=2000` 毫秒，正常默认值下为 `2` 秒；增加提交确认预算不会延长等锁上限。配置不会修复底层存储延迟，也不改变未知结果的保护和对账语义。
 
 ## Agent 与模型配置
 

@@ -57,6 +57,18 @@ PG_EXTRA_TARGETS = {
     'PG Preview contract': 'preview_lifecycle::pg_tests::pg_preview_store_satisfies_contract',
 }
 
+PG_EXTRA_TARGETS.update({
+    'PG durable timeout ' + name:
+        'pg::project_store::agent_registration_tests::durable_timeout::' + name
+    for name in (
+        'invalid_durable_budget_is_rejected_before_database_connection',
+        'refresh_initial_sql_read_obeys_the_configured_total_deadline',
+        'default_budget_waits_for_real_commit_beyond_the_old_600ms_budget',
+        'commit_timeout_reconciles_the_original_receipt_without_reapplying',
+        'caller_cancellation_during_commit_keeps_the_same_registered_operation',
+    )
+})
+
 # These are component contracts on an actual temporary Turso database. They do
 # not prove Docker volume mounting or rcoder process-recreation persistence.
 TURSO_CASES = (

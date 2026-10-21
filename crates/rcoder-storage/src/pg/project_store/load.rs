@@ -210,6 +210,21 @@ impl crate::pg::PgStore {
         project_id: &str,
     ) -> anyhow::Result<Option<Arc<ProjectAndContainerInfo>>> {
         let deadline = tokio::time::Instant::now() + self.durable_commit_budget();
+        tokio::time::timeout_at(
+            deadline,
+            self.refresh_project_registration_before(project_id, deadline),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("Project registration refresh exceeded the durable deadline")
+        })?
+    }
+
+    async fn refresh_project_registration_before(
+        &self,
+        project_id: &str,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<Option<Arc<ProjectAndContainerInfo>>> {
         if let Some(current) = self.inner.get(project_id) {
             self.reconcile_rejected_container_intent(
                 &crate::adapter::container_entry_key(&current),

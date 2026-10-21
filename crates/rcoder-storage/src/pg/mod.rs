@@ -134,6 +134,9 @@ impl PgStore {
         namespace: String,
         cluster_domain: String,
     ) -> anyhow::Result<(Self, mpsc::Receiver<shared_types::CleanupRequest>)> {
+        config
+            .validate_durable_commit_timeout()
+            .map_err(anyhow::Error::msg)?;
         let database =
             crate::db::postgres::open(config, vec![crate::db::schema::Component::Project]).await?;
 

@@ -54,7 +54,7 @@ pub(in crate::pg) enum GateAuthority {
     Deferred,
     /// 权威快照在场：门禁按 DB 值四象限裁决（本系统已退役放行 / 真外部
     /// 替换拒绝 / 异常缺失拒绝 / 绑定一致放行）。
-    Snapshot(AuthoritativeRead),
+    Snapshot(Box<AuthoritativeRead>),
     /// 同步 trait 入口（write-behind，无法 await）与上游已验证的换代路径：
     /// 镜像 mismatch 直接拒绝（历史行为），镜像由 sync 对账收敛。
     MirrorOnly,

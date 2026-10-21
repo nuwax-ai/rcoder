@@ -367,16 +367,6 @@ async fn remove_if_exists(path: &Path) -> AppResult<()> {
     }
 }
 
-/// 是否 junction（Windows 目录型链接）。
-///
-/// 不能用 `junction::exists` 判定：它内部走 `Path::exists()`，**会跟随链接**，
-/// 悬空 junction（实体已被外部删除）返回 false。`get_target` 只读重解析标签、
-/// 不解析目标，故悬空同样可判。
-#[cfg(windows)]
-fn is_junction(path: &Path) -> bool {
-    junction::get_target(path).is_ok()
-}
-
 /// 删除任意形态路径（实体目录/文件/符号链接/junction），NotFound 安全。
 /// 视图条目混合目录（skills）与文件（subagents .md），`remove_dir_all` 对
 /// 文件会 ENOTDIR——按 symlink_metadata 分派；symlink 只删链不触目标。
@@ -386,12 +376,16 @@ pub(super) async fn remove_any_if_exists(path: &Path) -> AppResult<()> {
         Err(e) => Err(e.into()),
         Ok(meta) => {
             #[cfg(windows)]
-            if meta.is_symlink() && is_junction(path) {
-                // junction 用 RemoveDirectory 摘除**目录项本身**（悬空亦可）。
-                // 不能用 `junction::delete`——它只做 FSCTL_DELETE_REPARSE_POINT 剥掉
-                // 重解析标签，会留下一个空目录，视图条目因此清不掉；也不能用
-                // `fs::remove_file`——DeleteFile 对重解析点返回拒绝访问 (os error 5)。
-                return fs::remove_dir(path).await.map_err(Into::into);
+            {
+                use std::os::windows::fs::FileTypeExt;
+                if meta.file_type().is_symlink_dir() {
+                    // 目录 symlink 和 junction 均用 RemoveDirectory 摘除条目，
+                    // 悬空时亦可；类型来自 no-follow 元数据，不探测/依赖目标。
+                    // 不能用 `junction::delete`——它只做 FSCTL_DELETE_REPARSE_POINT 剥掉
+                    // 重解析标签，会留下一个空目录，视图条目因此清不掉；也不能用
+                    // `fs::remove_file`——DeleteFile 对重解析点返回拒绝访问 (os error 5)。
+                    return fs::remove_dir(path).await.map_err(Into::into);
+                }
             }
             if meta.is_dir() && !meta.is_symlink() {
                 fs::remove_dir_all(path).await.map_err(Into::into)

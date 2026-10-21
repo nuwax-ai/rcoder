@@ -216,6 +216,55 @@ mod cases {
         );
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn remove_any_if_exists_removes_directory_symlink_without_touching_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("store");
+        fs::create_dir_all(&target).await.unwrap();
+        fs::write(target.join("SKILL.md"), "precious")
+            .await
+            .unwrap();
+        let link = tmp.path().join("view");
+        std::os::windows::fs::symlink_dir(&target, &link)
+            .expect("Windows directory-symlink fixture requires symlink permission");
+
+        remove_any_if_exists(&link)
+            .await
+            .expect("directory symlink must be removable");
+
+        assert_eq!(
+            fs::symlink_metadata(&link).await.unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("SKILL.md")).await.unwrap(),
+            "precious"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn remove_any_if_exists_removes_dangling_directory_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("store");
+        fs::create_dir_all(&target).await.unwrap();
+        let link = tmp.path().join("view");
+        std::os::windows::fs::symlink_dir(&target, &link)
+            .expect("Windows directory-symlink fixture requires symlink permission");
+        fs::remove_dir(&target).await.unwrap();
+        assert!(fs::symlink_metadata(&link).await.is_ok());
+
+        remove_any_if_exists(&link)
+            .await
+            .expect("dangling directory symlink must be removable");
+
+        assert_eq!(
+            fs::symlink_metadata(&link).await.unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn link_workspace_creates_all_agent_symlinks() {

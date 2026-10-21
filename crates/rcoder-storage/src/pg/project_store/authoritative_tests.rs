@@ -178,7 +178,7 @@ async fn authoritative_snapshot_cannot_retire_a_newer_local_registration() {
             .prepare_authoritative_info(
                 info_for(&f.id, Some(f.replacement.clone())),
                 &mut registration,
-                &GateAuthority::Snapshot(read),
+                &GateAuthority::Snapshot(Box::new(read)),
             )
             .err()
             .unwrap();

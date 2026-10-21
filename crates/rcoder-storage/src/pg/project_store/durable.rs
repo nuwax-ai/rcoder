@@ -131,7 +131,7 @@ impl PgStore {
                         let read = self
                             .read_authoritative_container_binding(&name, &project_id, deadline)
                             .await?;
-                        authority = super::authoritative::GateAuthority::Snapshot(read);
+                        authority = super::authoritative::GateAuthority::Snapshot(Box::new(read));
                     }
                 }
             }
@@ -422,7 +422,7 @@ impl PgStore {
                         let read = self
                             .read_authoritative_container_binding(&name, &project_id, deadline)
                             .await?;
-                        authority = super::authoritative::GateAuthority::Snapshot(read);
+                        authority = super::authoritative::GateAuthority::Snapshot(Box::new(read));
                     }
                 }
             }
