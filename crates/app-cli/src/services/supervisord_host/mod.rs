@@ -333,11 +333,50 @@ impl SupervisordHost {
         anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
         // A first bootstrap supplies the launch contract. Existing immutable
         // resident ownership is left untouched until exact proxy replacement.
-        if configured_entry_spec(&self.conf_path)?.is_none() {
-            let pingap_spec = pingap_service_spec(args, endpoint);
-            pingap_spec
-                .write()
-                .context("write official proxy launch contract")?;
+        // 遗留相对路径 spec（本地独立 serve 以 `--log-dir .local-logs` 写入，
+        // 其路径基准是已消亡旧进程的 cwd）不可猜测归属：仅在旧执行已退出
+        // （entry_serving=false）时备份原件并用**当前 owner 的绝对参数**受控
+        // 重建；旧 pingap 仍在服务则保持 Fail Fast，绝不热改运行中契约。
+        match configured_entry_spec(&self.conf_path)? {
+            None => {
+                let pingap_spec = pingap_service_spec(args, endpoint);
+                pingap_spec
+                    .write()
+                    .context("write official proxy launch contract")?;
+            }
+            Some(existing) if admin_probe::proxy_spec_contract_ok(&existing) => {}
+            Some(existing) if admin_probe::proxy_spec_relative_config_legacy(&existing) => {
+                anyhow::ensure!(
+                    !entry_serving,
+                    "resident proxy holds a relative-path launch contract while serving; \
+                     stop the resident program before rebuilding the contract"
+                );
+                let stale_path = crate::svc_spec::spec_root()
+                    .join(&existing.release_id)
+                    .join(format!("{}.toml", existing.service_id));
+                let backup_path = stale_path.with_extension(format!(
+                    "toml.stale-relative-{}",
+                    chrono::Utc::now().timestamp()
+                ));
+                tokio::fs::rename(&stale_path, &backup_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "preserve legacy relative proxy spec {}",
+                            stale_path.display()
+                        )
+                    })?;
+                tracing::warn!(
+                    stale = %backup_path.display(),
+                    "rebuilt legacy relative proxy launch contract from current owner args"
+                );
+                let pingap_spec = pingap_service_spec(args, endpoint);
+                pingap_spec
+                    .write()
+                    .context("rebuild official proxy launch contract")?;
+            }
+            // 其他契约违规不在重建范围：既有校验路径 Fail Fast 保持不变。
+            Some(_) => {}
         }
 
         // 4. 生成并重载 program conf（supervisord 不建日志目录——服务日志目录预建）

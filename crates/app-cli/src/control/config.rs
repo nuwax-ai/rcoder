@@ -233,6 +233,42 @@ impl RuntimeArgs {
             ..self.clone()
         })
     }
+
+    /// 启动契约（spec/journal/supervisor 配置）是跨进程、跨时刻的持久记录，
+    /// 读取方（supervisord/pingap，cwd=/）的工作目录写方无法控制——相对路径
+    /// 的含义随读者漂移。所有进入编排的 `workspace`/`log_dir` 在此边界统一
+    /// 绝对化（词法拼接当前 cwd，保留调用者意图，不触盘不解析符号链接）。
+    /// 解析失败（如空串）保留原值并记错误日志：下游启动契约校验
+    /// （verify_proxy_spec 的绝对路径要求）会以明确报错 Fail Fast。
+    pub fn absolutized_paths(self) -> Self {
+        let absolutize = |path: PathBuf| -> PathBuf {
+            if path.is_absolute() {
+                return path;
+            }
+            match std::path::absolute(&path) {
+                Ok(resolved) => {
+                    tracing::info!(
+                        requested = %path.display(), resolved = %resolved.display(),
+                        "absolutized relative runtime path at the RuntimeArgs boundary"
+                    );
+                    resolved
+                }
+                Err(error) => {
+                    tracing::error!(
+                        requested = %path.display(), %error,
+                        "relative runtime path could not be absolutized; \
+                         the launch contract check will reject it"
+                    );
+                    path
+                }
+            }
+        };
+        Self {
+            workspace: absolutize(self.workspace),
+            log_dir: absolutize(self.log_dir),
+            ..self
+        }
+    }
 }
 
 impl From<RunArgs> for RuntimeArgs {
@@ -246,6 +282,7 @@ impl From<RunArgs> for RuntimeArgs {
             attach: false,
             control_only: false,
         }
+        .absolutized_paths()
     }
 }
 
@@ -262,6 +299,51 @@ impl From<ServeArgs> for RuntimeArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_runtime_paths_are_absolutized_at_the_args_boundary() {
+        let cwd = std::env::current_dir().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        let base = std::env::temp_dir().join("app-cli-absolutize-boundary");
+        std::fs::create_dir_all(&base).unwrap();
+        std::env::set_current_dir(&base).unwrap();
+        let args = RuntimeArgs {
+            operation_id: None,
+            workspace: PathBuf::from(".local-deploy"),
+            log_dir: PathBuf::from(".local-logs"),
+            admin_addr: String::new(),
+            pingap_bin: PathBuf::from("pingap"),
+            attach: false,
+            control_only: false,
+        }
+        .absolutized_paths();
+        std::env::set_current_dir(previous).unwrap();
+        assert!(args.workspace.is_absolute());
+        assert!(args.log_dir.is_absolute());
+        // macOS temp 的 /var→/private/var 符号链接: absolute() 走 getcwd(已解析),
+        // 基准需 canonicalize 对齐。
+        let normalized_base = std::fs::canonicalize(&base).unwrap();
+        assert_eq!(args.workspace, normalized_base.join(".local-deploy"));
+        assert_eq!(args.log_dir, normalized_base.join(".local-logs"));
+        let _ = cwd;
+    }
+
+    #[test]
+    fn absolute_runtime_paths_are_untouched_by_the_boundary() {
+        let absolute = std::env::temp_dir().join("already-absolute");
+        let args = RuntimeArgs {
+            operation_id: None,
+            workspace: absolute.clone(),
+            log_dir: absolute.clone(),
+            admin_addr: String::new(),
+            pingap_bin: PathBuf::from("pingap"),
+            attach: false,
+            control_only: false,
+        }
+        .absolutized_paths();
+        assert_eq!(args.workspace, absolute);
+        assert_eq!(args.log_dir, absolute);
+    }
 
     #[test]
     fn retired_seal_command_is_rejected_while_normal_run_remains_available() {
@@ -320,8 +402,10 @@ mod tests {
             panic!("expected serve")
         };
         let runtime = RuntimeArgs::from(serve);
-        assert_eq!(runtime.workspace, PathBuf::from("project with spaces"));
-        assert_eq!(runtime.log_dir, PathBuf::from("logs"));
+        // 相对 workspace/log-dir 在边界被绝对化（基准 = 测试进程 cwd）。
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(runtime.workspace, cwd.join("project with spaces"));
+        assert_eq!(runtime.log_dir, cwd.join("logs"));
         assert_eq!(runtime.admin_addr, "127.0.0.1:3999");
         assert_eq!(runtime.pingap_bin, PathBuf::from("tools/pingap"));
         assert!(runtime.attach);
