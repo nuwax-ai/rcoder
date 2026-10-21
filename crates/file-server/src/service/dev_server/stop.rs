@@ -719,7 +719,9 @@ impl Drop for DevServerManager {
     }
 }
 
-#[cfg(test)]
+// 本模块全部用例依赖 /bin/sh fixture + POSIX 进程组/退出观测语义，Windows 上
+// 无法成立，故整模块 cfg(all(test, unix))——避免逐个 cfg(unix) 后 import 悬空。
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::service::dev_server::{StderrRing, supervise::SupervisedChild};
@@ -735,9 +737,6 @@ mod tests {
     }
 
     /// fixture 用 `/bin/sh` 执行 POSIX shell 命令；Windows 无该路径。
-    /// 唯一使用者 `stop_cleanup_state_transitions_to_cleaned_for_immediate_exit`
-    /// 随本 helper 一并 `cfg(unix)`。
-    #[cfg(unix)]
     fn spawn_child(cmd: &str) -> tokio::process::Child {
         tokio::process::Command::new("/bin/sh")
             .args(["-c", cmd])
@@ -753,7 +752,6 @@ mod tests {
         SupervisedChild::adopt(child, ring)
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn stop_cleanup_state_transitions_to_cleaned_for_immediate_exit() {
         let mgr = manager();
@@ -773,7 +771,6 @@ mod tests {
         assert!(!mgr.has_uncleaned_cleanup(project).unwrap());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn stop_cleanup_retains_original_child_until_real_barrier_exit_and_retry() {
         use tokio::io::AsyncWriteExt;

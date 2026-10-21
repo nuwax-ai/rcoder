@@ -369,6 +369,9 @@ impl PreviewExecutor for DevServerExecutor {
 #[cfg(test)]
 mod r11_tests {
     use super::*;
+    // DevProcess 唯一使用者是下方 cfg(unix) 的协调用例；随之门控以免 Windows
+    // 上报 unused import。
+    #[cfg(unix)]
     use crate::models::DevProcess;
 
     /// R11：PortInUse 分类经类型化变体——修改提示文案（含删除
