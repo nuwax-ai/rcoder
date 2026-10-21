@@ -734,6 +734,10 @@ mod tests {
         DevServerManager::new(Arc::new(config))
     }
 
+    /// fixture 用 `/bin/sh` 执行 POSIX shell 命令；Windows 无该路径。
+    /// 唯一使用者 `stop_cleanup_state_transitions_to_cleaned_for_immediate_exit`
+    /// 随本 helper 一并 `cfg(unix)`。
+    #[cfg(unix)]
     fn spawn_child(cmd: &str) -> tokio::process::Child {
         tokio::process::Command::new("/bin/sh")
             .args(["-c", cmd])
@@ -749,6 +753,7 @@ mod tests {
         SupervisedChild::adopt(child, ring)
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stop_cleanup_state_transitions_to_cleaned_for_immediate_exit() {
         let mgr = manager();

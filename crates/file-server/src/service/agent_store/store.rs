@@ -291,8 +291,9 @@ pub fn agent_skill_exists(skills_dir: &Path, skill_name: &str) -> bool {
 
 /// 检查路径是否是目录链接 (Unix symlink / Windows junction)。
 /// 对齐 TS `isWorkspaceSkillsSymlinked`: push 仅在「有 agentId 且已是链接」时走 store。
-/// 注意: `Path::is_symlink()` 在 Windows 上对 junction 返回 false (reparse tag 不同),
-/// 需额外用 `junction::exists` 检测。
+/// 注意: junction 与普通符号链接在 `symlink_metadata` 上同形（都是
+/// `is_symlink=true`/`is_dir=false`），`Path::is_symlink()` 分不出二者（reparse tag
+/// 不同），需额外用 `junction::exists` 检测 junction。
 pub fn is_dir_link(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -366,6 +367,16 @@ async fn remove_if_exists(path: &Path) -> AppResult<()> {
     }
 }
 
+/// 是否 junction（Windows 目录型链接）。
+///
+/// 不能用 `junction::exists` 判定：它内部走 `Path::exists()`，**会跟随链接**，
+/// 悬空 junction（实体已被外部删除）返回 false。`get_target` 只读重解析标签、
+/// 不解析目标，故悬空同样可判。
+#[cfg(windows)]
+fn is_junction(path: &Path) -> bool {
+    junction::get_target(path).is_ok()
+}
+
 /// 删除任意形态路径（实体目录/文件/符号链接/junction），NotFound 安全。
 /// 视图条目混合目录（skills）与文件（subagents .md），`remove_dir_all` 对
 /// 文件会 ENOTDIR——按 symlink_metadata 分派；symlink 只删链不触目标。
@@ -374,6 +385,14 @@ pub(super) async fn remove_any_if_exists(path: &Path) -> AppResult<()> {
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
         Ok(meta) => {
+            #[cfg(windows)]
+            if meta.is_symlink() && is_junction(path) {
+                // junction 用 RemoveDirectory 摘除**目录项本身**（悬空亦可）。
+                // 不能用 `junction::delete`——它只做 FSCTL_DELETE_REPARSE_POINT 剥掉
+                // 重解析标签，会留下一个空目录，视图条目因此清不掉；也不能用
+                // `fs::remove_file`——DeleteFile 对重解析点返回拒绝访问 (os error 5)。
+                return fs::remove_dir(path).await.map_err(Into::into);
+            }
             if meta.is_dir() && !meta.is_symlink() {
                 fs::remove_dir_all(path).await.map_err(Into::into)
             } else {

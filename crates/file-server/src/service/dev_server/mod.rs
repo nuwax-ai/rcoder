@@ -474,10 +474,12 @@ mod tests {
             .await;
         let elapsed = start.elapsed();
         assert!(res.is_ok(), "ready 时 poll_alive 应成功");
-        // 即时探活 + 10ms 间隔，首轮即返回，应远 < 200ms（原固定 1s sleep > 1s）。
+        // 断言意图是「首轮探活即返回、没有固定盲等」，不是延迟预算：故阈值取旧实现
+        // 固定 1s sleep 的一半——足以拦回「重新引入盲等」的回归，又容忍 Windows /
+        // 高负载 CI 上的调度抖动（原 200ms 在 Windows 上会假红）。
         assert!(
-            elapsed.as_millis() < 200,
-            "poll_alive 耗时 {elapsed:?}, 期望 < 200ms (即时探活 stub, 首轮即返回)"
+            elapsed < std::time::Duration::from_millis(500),
+            "poll_alive 耗时 {elapsed:?}, 期望 < 500ms (即时探活 stub, 首轮即返回)"
         );
     }
 }

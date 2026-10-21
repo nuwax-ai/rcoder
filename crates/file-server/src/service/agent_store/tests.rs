@@ -144,6 +144,78 @@ mod cases {
         );
     }
 
+    /// Windows 反例（修复前失败）：junction 删除必须只摘链本身，且不能用
+    /// `remove_file`——junction 的 symlink_metadata 是 is_symlink=true/is_dir=false，
+    /// 会被 is_dir 分派放过而落进 remove_file，DeleteFile 对重解析点返回拒绝访问
+    /// (os error 5)，整个 sync_shared_skill_view 随之失败。
+    ///
+    /// 数据保护断言：共享实体及其内容必须原样保留（remove_dir 的 RemoveDirectory
+    /// 不递归进目标）。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn remove_any_if_exists_removes_junction_without_touching_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("store").join("skills");
+        fs::create_dir_all(&target).await.unwrap();
+        fs::write(target.join("SKILL.md"), "precious")
+            .await
+            .unwrap();
+
+        let link = tmp.path().join("ws").join(".agents").join("skills");
+        force_dir_symlink(&link, &target).await.unwrap();
+
+        remove_any_if_exists(&link)
+            .await
+            .expect("junction must be removable");
+
+        // 用 symlink_metadata 判链接自身：try_exists 会跟随链接，目标仍存在时
+        // 恒为 true，检测不到链接已被摘除。
+        assert!(fs::symlink_metadata(&link).await.is_err(), "链接应已摘除");
+        assert!(
+            fs::try_exists(&target).await.unwrap(),
+            "共享实体目录必须保留"
+        );
+        assert!(
+            fs::try_exists(target.join("SKILL.md")).await.unwrap(),
+            "共享实体内容必须保留（不得递归进目标删除）"
+        );
+    }
+
+    /// Windows 反例：实体已被外部删除 → junction 悬空，仍须能摘除。
+    ///
+    /// 悬空 junction 上 `junction::exists` 跟随链接返回 false、`try_exists` 亦报
+    /// 不存在，仅 `symlink_metadata` 可见；若按 exists 判据分派会落进
+    /// `remove_file`，DeleteFile 对重解析点返回拒绝访问 (os error 5)，
+    /// `sync_shared_skill_view` 随之失败（孤儿链清不掉）。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn remove_any_if_exists_removes_dangling_junction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("store").join("skills");
+        fs::create_dir_all(&target).await.unwrap();
+        fs::write(target.join("SKILL.md"), "precious")
+            .await
+            .unwrap();
+
+        let link = tmp.path().join("ws").join(".agents").join("skills");
+        force_dir_symlink(&link, &target).await.unwrap();
+        // 实体被外部删除（各 agent prune 已清）→ 链接悬空
+        fs::remove_dir_all(&target).await.unwrap();
+        assert!(
+            fs::symlink_metadata(&link).await.is_ok(),
+            "悬空 junction 仍应被 symlink_metadata 看见"
+        );
+
+        remove_any_if_exists(&link)
+            .await
+            .expect("dangling junction must be removable");
+
+        assert!(
+            fs::symlink_metadata(&link).await.is_err(),
+            "悬空链接应已摘除"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn link_workspace_creates_all_agent_symlinks() {

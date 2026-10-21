@@ -656,9 +656,21 @@ mod tests {
             .expect_err("missing source");
         assert!(err.to_string().contains("does not exist"));
 
-        // 根目录拒绝（POSIX `/` 与 win32 盘符根的 parent() 均为 None）
-        let err = rename_fs_directory("/", "x").await.expect_err("root");
-        assert!(err.to_string().contains("root directory"));
+        // 根目录拒绝（POSIX `/` 与 win32 盘符根的 parent() 均为 None）。
+        // 探针须是**宿主绝对路径**：`Path::is_absolute` 是平台语义，Windows 上
+        // `/` 不带盘符前缀、不算绝对路径，会先被「must be absolute」校验拦下，
+        // 走不到「root directory」分支。
+        #[cfg(unix)]
+        let root_probe = "/";
+        #[cfg(windows)]
+        let root_probe = "C:\\";
+        let err = rename_fs_directory(root_probe, "x")
+            .await
+            .expect_err("root");
+        assert!(
+            err.to_string().contains("root directory"),
+            "宿主根 {root_probe} 必须报 root directory, 实际: {err}"
+        );
 
         // newName 含分隔符 → 拒绝（不支持跨目录移动）
         let err = rename_fs_directory(&parent.join("新名字").to_string_lossy(), "../escape")

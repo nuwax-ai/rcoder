@@ -21,8 +21,18 @@ use crate::error::{AppError, AppResult};
 use super::map_git_err;
 use super::read::get_status;
 
+/// 工作区相对路径 → git index/tree 条目名。
+///
+/// git 树条目名**必须用 `/`**：gix 的 tree editor 会拒绝含 `\` 的文件名
+/// （"has an invalid filename: 'src\added.txt'"）。Windows 上遍历得到的宿主
+/// 相对路径带 `\`，故在此按 FS-08 同一口径归一
+/// （`path_safety::host_relative_to_wire`；POSIX 下恒等，反斜杠文件名不受影响）。
+///
+/// 仅用于 index/tree 名，**不做文件系统访问**——文件系统侧仍用原始路径
+/// （Win32 两种分隔符都接受）。
 fn index_bstr_path(worktree_path: &str) -> BString {
-    into_bstr(std::path::PathBuf::from(worktree_path)).into_owned()
+    let normalized = crate::path_safety::host_relative_to_wire(worktree_path);
+    into_bstr(std::path::PathBuf::from(normalized)).into_owned()
 }
 
 /// stage 单个路径: 文件存在 → 更新/新增 index entry; 不存在 → stage 删除 (对齐 nuwax stageFiles)。

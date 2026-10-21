@@ -373,23 +373,48 @@ fn search_blocking(ctx: &BlockingCtx) -> (Vec<FileEntry>, bool, usize) {
 ///
 /// 性能: 每个访问条目都会调用 (命中前), 用"parent 切片 + format 拼接"一次分配,
 /// 取代 Path::join + strip_prefix + replace 的三次分配; Windows 分隔符条件替换。
-fn make_relative_posix(root: &Path, entry: &dua_core::Entry) -> String {
-    let parent = entry.parent_path.to_string_lossy();
-    let root_str = root.to_string_lossy();
-    let root_trimmed = root_str.trim_end_matches('/');
+/// 宿主路径分隔符集合：剥离 root 前缀后余留的分隔符、以及 root 尾部分隔符用。
+///
+/// **只认宿主分隔符**：Windows 上 `/` 与 `\` 都是分隔符；POSIX 上只有 `/`——
+/// `\` 在 POSIX 是合法文件名字符，当分隔符裁会把名为 `\sub` 的目录改成 `sub`
+/// （口径同 `path_safety::host_relative_to_wire` 的 FS-08 注释与 resolve 的
+/// `resolve_preserves_posix_backslash_filename` 反例）。
+#[cfg(windows)]
+const HOST_SEPARATORS: [char; 2] = ['/', '\\'];
+#[cfg(not(windows))]
+const HOST_SEPARATORS: [char; 1] = ['/'];
+
+/// root 前缀裁剪 + 前导分隔符剥离 + 段拼接 + wire 归一（纯字符串；平台语义由
+/// `HOST_SEPARATORS` 承载，`\`→`/` 归一是 FS-08 唯一转换点
+/// `path_safety::host_relative_to_wire`）。返回即最终 wire 名。
+///
+/// 与 [`make_relative_posix`] 分开：本函数不依赖 `dua_core::Entry`（其
+/// `FileType` 字段私有、测试无法构造），分隔符口径因而可跨平台单测。
+fn relative_wire_path(root: &str, parent: &str, name: &str) -> String {
+    let root_trimmed = root.trim_end_matches(HOST_SEPARATORS);
     // parent==root（根级条目）→ rel 空; parent=root/sub → "sub"; 非 root 前缀
     // （customTargetDir 等场景）→ 退化为绝对路径去前导斜杠。
+    // 按宿主分隔符剥前导：Windows 上 strip_prefix 余下的是 `\sub`，只裁 `/`
+    // 会留下前导分隔符，经 host_relative_to_wire 归一后变成 `/sub`——前导斜杠
+    // 会让消费方把相对路径当绝对路径。
     let rel = match parent.strip_prefix(root_trimmed) {
-        Some(rest) => rest.trim_start_matches('/'),
-        None => parent.trim_start_matches('/'),
+        Some(rest) => rest.trim_start_matches(HOST_SEPARATORS),
+        None => parent.trim_start_matches(HOST_SEPARATORS),
     };
-    let name = entry.file_name.to_string_lossy();
     let joined = if rel.is_empty() {
-        name.into_owned()
+        name.to_string()
     } else {
         format!("{rel}/{name}")
     };
     crate::path_safety::host_relative_to_wire(&joined)
+}
+
+fn make_relative_posix(root: &Path, entry: &dua_core::Entry) -> String {
+    relative_wire_path(
+        &root.to_string_lossy(),
+        &entry.parent_path.to_string_lossy(),
+        &entry.file_name.to_string_lossy(),
+    )
 }
 
 /// 大小写不敏感子串匹配 (kw 须已转小写, 由调用方保证; 空串恒 false)。
@@ -429,6 +454,70 @@ mod tests {
 
     fn default_test_config() -> Config {
         Config::default()
+    }
+
+    /// 各平台都成立的 POSIX 形状契约：剥掉 root 前缀后不留前导分隔符。
+    #[test]
+    fn relative_wire_path_strips_posix_leading_separator() {
+        // 根级条目：parent == root → 裸文件名
+        assert_eq!(relative_wire_path("/app/ws", "/app/ws", "a.txt"), "a.txt");
+        // 前缀余下 `/sub` → `sub`
+        assert_eq!(
+            relative_wire_path("/app/ws", "/app/ws/sub", "c.txt"),
+            "sub/c.txt"
+        );
+        // 嵌套
+        assert_eq!(
+            relative_wire_path("/app/ws", "/app/ws/sub/nested", "e.txt"),
+            "sub/nested/e.txt"
+        );
+        // 根带尾部分隔符：前缀比对仍须命中，不得退化成绝对路径分支
+        assert_eq!(
+            relative_wire_path("/app/ws/", "/app/ws/sub", "c.txt"),
+            "sub/c.txt"
+        );
+        // 非 root 前缀（customTargetDir 等）→ 退化去前导斜杠
+        assert_eq!(
+            relative_wire_path("/app/ws", "/elsewhere/sub", "c.txt"),
+            "elsewhere/sub/c.txt"
+        );
+    }
+
+    /// Windows 反例（修复前失败）：`strip_prefix` 余下的是 `\sub`，只裁 `/`
+    /// 会留下前导分隔符，经 host_relative_to_wire 归一成 `/sub`——前导斜杠让
+    /// 消费方把相对路径当绝对路径。
+    #[cfg(windows)]
+    #[test]
+    fn relative_wire_path_strips_windows_leading_separator() {
+        assert_eq!(
+            relative_wire_path(r"C:\ws", r"C:\ws\sub", "c.txt"),
+            "sub/c.txt"
+        );
+        assert_eq!(
+            relative_wire_path(r"C:\ws", r"C:\ws\sub\nested", "e.txt"),
+            "sub/nested/e.txt"
+        );
+        // 根带 `\` 尾部分隔符
+        assert_eq!(
+            relative_wire_path(r"C:\ws\", r"C:\ws\sub", "c.txt"),
+            "sub/c.txt"
+        );
+        // 非 root 前缀 → 退化为绝对路径，去前导分隔符后交 wire 归一
+        assert_eq!(
+            relative_wire_path(r"C:\ws", r"D:\elsewhere\sub", "c.txt"),
+            "D:/elsewhere/sub/c.txt"
+        );
+    }
+
+    /// POSIX 反例：`\` 是合法文件名字符，绝不能当分隔符剥。无条件按
+    /// `['/', '\\']` 裁会把名为 `\sub` 的目录改成 `sub`（同 FS-08 口径）。
+    #[cfg(not(windows))]
+    #[test]
+    fn relative_wire_path_keeps_posix_backslash_filename() {
+        assert_eq!(
+            relative_wire_path("/app/ws", r"/app/ws/\sub", "c.txt"),
+            r"\sub/c.txt"
+        );
     }
 
     /// 构造测试目录结构 (与 mod.rs tests 同构):

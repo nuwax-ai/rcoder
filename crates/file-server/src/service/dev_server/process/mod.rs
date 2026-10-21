@@ -873,6 +873,8 @@ mod tests {
 
     /// 失败错误必须携带真实报错现场：退出码 + 本次运行输出尾部（stdout/stderr
     /// 均管道写入 temp_log）——"command exited non-zero" 笼统错误无法排障。
+    /// fixture 经 `sh -c` 执行 shell 重定向/退出码语义，Windows 无 `sh`。
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_command_to_log_error_carries_output_tail() {
         let tmp = tempfile::tempdir().expect("tempdir");
