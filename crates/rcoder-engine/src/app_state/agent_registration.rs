@@ -337,9 +337,7 @@ impl AppState {
             .runtime()
             .verify_agent_replacement(params, previous.as_ref(), observed)
             .await
-            .map_err(|error| {
-                replacement_verification_error(error, previous.as_ref(), observed)
-            })
+            .map_err(|error| replacement_verification_error(error, previous.as_ref(), observed))
             .context("Observe Computer workload replacement")?;
         let observed = evidence.replacement.clone();
         match self
