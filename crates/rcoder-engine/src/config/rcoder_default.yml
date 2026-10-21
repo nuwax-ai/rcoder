@@ -284,3 +284,6 @@ storage:
     max_connections: 10
     connect_timeout_secs: 10
     statement_timeout_secs: 5
+    # durable 提交链路总预算(ms)：注册/会话落库确认的共享 deadline 总窗口。
+    # 覆盖慢存储(如 Ceph RBD 写 IO 高延迟)的 fsync 抖动；应 ≤ statement_timeout_secs*1000。
+    durable_commit_timeout_ms: 15000

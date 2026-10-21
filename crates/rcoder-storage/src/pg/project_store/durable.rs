@@ -6,7 +6,6 @@ use crate::adapter::container_entry_key;
 use crate::pg::PgStore;
 use shared_types::{ProjectAndContainerInfo, SessionHint, persistence::PersistenceWriteOutcome};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::time::Instant;
 
 /// Dropping a cancelled durable request queues its immutable registered operations.
@@ -54,8 +53,6 @@ impl PgStore {
         }
     }
 
-    pub(super) const DURABLE_COMMIT_TIMEOUT: Duration = Duration::from_millis(600);
-
     /// Establish the exact accepted project/container registration before a
     /// caller dispatches work. A background writer is not a commit barrier.
     pub async fn insert_project_registration_durable(
@@ -63,7 +60,7 @@ impl PgStore {
         project_id: String,
         mut info: Arc<ProjectAndContainerInfo>,
     ) -> anyhow::Result<PersistenceWriteOutcome> {
-        let deadline = Instant::now() + Self::DURABLE_COMMIT_TIMEOUT;
+        let deadline = Instant::now() + self.durable_commit_budget();
         anyhow::ensure!(
             project_id == info.project_id(),
             "Project registration key differs from its payload"
@@ -173,7 +170,7 @@ impl PgStore {
         expected: &ProjectAndContainerInfo,
         session_id: &str,
     ) -> anyhow::Result<PersistenceWriteOutcome> {
-        let deadline = Instant::now() + Self::DURABLE_COMMIT_TIMEOUT;
+        let deadline = Instant::now() + self.durable_commit_budget();
         let (mut pending, mut append, was_present) = {
             let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
             anyhow::ensure!(
@@ -373,7 +370,7 @@ impl PgStore {
         info: Arc<ProjectAndContainerInfo>,
         session_id: &str,
     ) -> anyhow::Result<()> {
-        let deadline = Instant::now() + Self::DURABLE_COMMIT_TIMEOUT;
+        let deadline = Instant::now() + self.durable_commit_budget();
         anyhow::ensure!(
             SessionHint::classify(Some(session_id))
                 .as_session_id()
@@ -675,7 +672,7 @@ impl PgStore {
         self.execute_durable_before(
             registered,
             name,
-            Instant::now() + Self::DURABLE_COMMIT_TIMEOUT,
+            Instant::now() + self.durable_commit_budget(),
         )
         .await
     }

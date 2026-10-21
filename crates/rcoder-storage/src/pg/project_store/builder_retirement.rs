@@ -93,7 +93,7 @@ impl PgStore {
                     }))
             })
         });
-        tokio::time::timeout(Self::DURABLE_COMMIT_TIMEOUT, observation).await
+        tokio::time::timeout(self.durable_commit_budget(), observation).await
             .map_err(|_| anyhow::anyhow!("Canonical builder identity observation exceeded its original durable deadline; no physical deletion was submitted"))?
             .context("Capture canonical builder registry identity")
     }
@@ -115,7 +115,7 @@ impl PgStore {
                 Ok(())
             })
         });
-        tokio::time::timeout(Self::DURABLE_COMMIT_TIMEOUT, transaction).await
+        tokio::time::timeout(self.durable_commit_budget(), transaction).await
             .map_err(|_| anyhow::anyhow!("Captured builder registration observation exceeded its original durable deadline; no physical deletion was submitted"))?
     }
 
@@ -143,7 +143,7 @@ impl PgStore {
             let fingerprint = fingerprint.clone();
             Box::pin(async move { retire(tx, &target, &request, &fingerprint).await })
         });
-        let retired = tokio::time::timeout(Self::DURABLE_COMMIT_TIMEOUT, transaction).await
+        let retired = tokio::time::timeout(self.durable_commit_budget(), transaction).await
             .map_err(|_| shared_types::OperationOutcomeUnknown::new("builder_registry_retirement", "Builder registry retirement outcome is unknown; inspect the original operation receipt"))?
             .context("Retire captured builder registration")?;
         // A committed SQL result is authoritative. Only its exact row may be

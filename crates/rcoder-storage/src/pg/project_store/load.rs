@@ -209,7 +209,7 @@ impl crate::pg::PgStore {
         &self,
         project_id: &str,
     ) -> anyhow::Result<Option<Arc<ProjectAndContainerInfo>>> {
-        let deadline = tokio::time::Instant::now() + Self::DURABLE_COMMIT_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + self.durable_commit_budget();
         if let Some(current) = self.inner.get(project_id) {
             self.reconcile_rejected_container_intent(
                 &crate::adapter::container_entry_key(&current),

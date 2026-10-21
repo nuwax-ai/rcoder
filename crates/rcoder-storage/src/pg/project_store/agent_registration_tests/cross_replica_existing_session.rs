@@ -391,6 +391,9 @@ pub(super) async fn single_connection_peer(dsn: &str) -> PgStore {
             url: Some(dsn.to_owned()),
             max_connections: Some(1),
             min_connections: Some(1),
+            // 钉住 600ms 预算：本文件多个测试断言"共享 deadline"语义，
+            // 与运行期默认值(15000ms)解耦，避免默认值调整改变这些用例的时序。
+            durable_commit_timeout_ms: Some(600),
             ..Default::default()
         },
         "isolated-test".into(),

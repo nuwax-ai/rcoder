@@ -99,6 +99,9 @@ impl Fixture {
         let dsn: String = scoped.into();
         let config = PostgresConfig {
             url: Some(dsn.clone()),
+            // 钉住 600ms：本文件超时语义测试(如 unknown_commit)依赖 durable
+            // deadline < lock_timeout(2s)，与运行期默认值(15000ms)解耦。
+            durable_commit_timeout_ms: Some(600),
             ..Default::default()
         };
         let control = PgUserAppStore::connect(&config).await.unwrap();

@@ -182,6 +182,11 @@ impl PgStore {
         &self.postgres_config
     }
 
+    /// durable 提交链路总预算（运行期可配置，替代原 600ms 常量）。
+    pub(crate) fn durable_commit_budget(&self) -> Duration {
+        self.postgres_config.durable_commit_timeout()
+    }
+
     /// 等待在途 op 全部落库（sync 任务的排空屏障；二次确认防批处理间隙误判）
     pub async fn wait_drained(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;

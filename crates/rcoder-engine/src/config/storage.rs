@@ -108,6 +108,12 @@ pub(crate) fn apply_storage_env_overrides(config: &mut AppConfig) -> anyhow::Res
         pg.statement_timeout_secs = Some(v);
         info!(" RCODER_PG_STATEMENT_TIMEOUT_SECS: {v}");
     }
+    if let Ok(val) = std::env::var("RCODER_PG_DURABLE_COMMIT_TIMEOUT_MS")
+        && let Ok(v) = val.parse::<u64>()
+    {
+        pg.durable_commit_timeout_ms = Some(v);
+        info!(" RCODER_PG_DURABLE_COMMIT_TIMEOUT_MS: {v}");
+    }
     // fail fast：backend=postgres 但连接字段缺失（DSN 组装会列出缺失项）
     if config.storage.backend == StorageBackend::Postgres
         && let Err(missing) = config.storage.postgres.to_dsn()

@@ -260,7 +260,7 @@ impl PgStore {
         &self,
         project_id: &str,
     ) -> anyhow::Result<Option<Arc<ProjectAndContainerInfo>>> {
-        tokio::time::timeout(Self::DURABLE_COMMIT_TIMEOUT, async {
+        tokio::time::timeout(self.durable_commit_budget(), async {
             anyhow::ensure!(
                 self.resolve_project_stop(project_id).await?,
                 "Project Stop is awaiting durable confirmation"
@@ -330,7 +330,7 @@ impl PgStore {
         &self,
         expected: &ProjectAndContainerInfo,
     ) -> anyhow::Result<PersistenceWriteOutcome> {
-        let deadline = Instant::now() + Self::DURABLE_COMMIT_TIMEOUT;
+        let deadline = Instant::now() + self.durable_commit_budget();
         let stop = Arc::new(ProjectStop::capture(expected)?);
         let pending = {
             let mut registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());

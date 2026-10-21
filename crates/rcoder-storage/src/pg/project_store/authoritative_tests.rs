@@ -38,6 +38,9 @@ async fn fixture() -> Option<Fixture> {
         &PostgresConfig {
             max_connections: Some(1),
             min_connections: Some(1),
+            // 钉住 600ms：权威读超时测试断言"exceeded the durable deadline"，
+            // 需权威读在 2s 外层内因 durable deadline 超时返回，与运行期默认值解耦。
+            durable_commit_timeout_ms: Some(600),
             ..pg_config(&dsn)
         },
         "test-ns".into(),

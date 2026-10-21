@@ -89,6 +89,8 @@ async fn store(dsn: &str) -> PgStore {
     PgStore::connect(
         &PostgresConfig {
             url: Some(dsn.to_owned()),
+            // 钉住 600ms 预算：保持与历史默认值一致的时序语义，与运行期默认值解耦。
+            durable_commit_timeout_ms: Some(600),
             ..Default::default()
         },
         "isolated-test".into(),
@@ -97,6 +99,92 @@ async fn store(dsn: &str) -> PgStore {
     .await
     .unwrap()
     .0
+}
+
+/// 用显式 durable 链路预算构造 store（与默认值解耦，测试快且确定）。
+async fn store_with_budget(dsn: &str, chain_ms: u64) -> PgStore {
+    PgStore::connect(
+        &PostgresConfig {
+            url: Some(dsn.to_owned()),
+            durable_commit_timeout_ms: Some(chain_ms),
+            ..Default::default()
+        },
+        "isolated-test".into(),
+        "cluster.local".into(),
+    )
+    .await
+    .unwrap()
+    .0
+}
+
+/// 放大 durable 预算到 15s 后，register_project 的 lock_ops 等待 advisory lock
+/// 释放即可在预算内落库成功——即"等 pg 落库再返回"，而非旧 600ms 下的 Deferred/503。
+#[tokio::test]
+async fn slow_lock_registration_confirms_within_relaxed_budget() {
+    let Some(dsn) = test_support::test_dsn().await else {
+        return;
+    };
+    let id = format!("slow-lock-{}", test_support::uuid_suffix());
+    let store = store_with_budget(&dsn, 15_000).await;
+    store
+        .insert(id.clone(), project(&id, &id, &basic(&id)))
+        .unwrap();
+    assert!(store.wait_drained(Duration::from_secs(5)).await);
+    // 占住 project:{id} 的 advisory lock，register_project 的 lock_ops 将等待它。
+    let (release, _barrier) = hold_advisory_lock(&dsn, format!("project:{id}")).await;
+    let incoming = store.get(&id).unwrap();
+    // 持锁 1s（> 旧 600ms 阈值、< lock_timeout 2s）后释放：验证放大 durable
+    // deadline 后，短锁竞争也能等锁释放落库成功。注意 lock_timeout(2s) 独立于
+    // durable deadline——持锁超过 2s 会先被 lock_timeout 取消（见 T2/交付说明）。
+    let releaser = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        release.send(()).unwrap();
+    });
+    let outcome = store
+        .insert_project_registration_durable(id.clone(), incoming)
+        .await
+        .unwrap();
+    releaser.await.unwrap();
+    assert_eq!(
+        outcome,
+        PersistenceWriteOutcome::Committed,
+        "放大 deadline 到 15s 后，短锁竞争(1s<lock_timeout)能等锁释放落库成功"
+    );
+    assert!(store.writer().flush_and_stop(Duration::from_secs(5)).await);
+}
+
+/// 预算内锁未释放 → Fail Fast 返回 Deferred；但 PendingWrite drop 会把 op 入队
+/// 后台 writer，释放锁后最终落库（最终一致性兜底未被破坏）。
+#[tokio::test]
+async fn exhausted_budget_defers_but_writer_eventually_lands() {
+    let Some(dsn) = test_support::test_dsn().await else {
+        return;
+    };
+    let id = format!("exhaust-{}", test_support::uuid_suffix());
+    let store = store_with_budget(&dsn, 300).await;
+    store
+        .insert(id.clone(), project(&id, &id, &basic(&id)))
+        .unwrap();
+    assert!(store.wait_drained(Duration::from_secs(5)).await);
+    let (release, _barrier) = hold_advisory_lock(&dsn, format!("project:{id}")).await;
+    let incoming = store.get(&id).unwrap();
+    // 持锁 2s（> 300ms 预算）后释放。
+    let releaser = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(2_000)).await;
+        release.send(()).unwrap();
+    });
+    let outcome = store
+        .insert_project_registration_durable(id.clone(), incoming)
+        .await
+        .unwrap();
+    releaser.await.unwrap();
+    assert!(
+        matches!(outcome, PersistenceWriteOutcome::Deferred { .. }),
+        "300ms 预算内锁未释放 → Deferred（Fail Fast 保留）"
+    );
+    // 释放后后台 writer 最终落库（最终一致性兜底）。
+    assert!(store.wait_drained(Duration::from_secs(5)).await);
+    assert!(store.writer().flush_and_stop(Duration::from_secs(5)).await);
 }
 
 #[tokio::test]
