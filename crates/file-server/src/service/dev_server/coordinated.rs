@@ -391,6 +391,13 @@ mod r11_tests {
         }
     }
 
+    // 仅 POSIX：本用例用合成 PID + 无 supervised 记录，走「无受管子兄弟、靠 PID
+    // 观测退出」的路径，验证第一个 stop 在退出观测确认前挂起、第二个 stop 等锁。
+    // Windows 上 stop_exit_observed 是 cfg(windows) 的专用实现——脱离原始受管
+    // 句柄无法观测进程树退出，直接返回 Err（"requires its original managed child
+    // handle"），第一个 stop 会提前报错返回、根本进不到 terminate 挂起那一步，
+    // 整个用例前提（release 前一直挂起）不成立。
+    #[cfg(unix)]
     #[tokio::test]
     async fn overlapping_stops_wait_for_process_exit_before_reporting_not_registered() {
         let logs = tempfile::tempdir().expect("test logs");
