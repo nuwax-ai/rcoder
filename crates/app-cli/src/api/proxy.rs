@@ -204,7 +204,10 @@ pub(super) async fn reload(
             );
         }
     };
-    let journal = super::proxy_reload::root(&state);
+    let journal = match super::proxy_reload::root(&state) {
+        Ok(journal) => journal,
+        Err(error) => return proxy_error(error),
+    };
     match super::proxy_reload::read(&journal, &id) {
         Ok(Some(record)) => {
             if let Err(error) = record.check_metadata(&metadata) {
@@ -332,8 +335,8 @@ async fn execute_reload(
             // A head-write failure may already have a truthful Failed record;
             // replay that exact result instead of inventing unknown physics.
             writer.confirm();
-            if let Ok(Some(record)) =
-                super::proxy_reload::read(&super::proxy_reload::root(&state), &id)
+            if let Ok(Some(record)) = super::proxy_reload::root(&state)
+                .and_then(|root| super::proxy_reload::read(&root, &id))
                 && record.check_metadata(&metadata).is_ok()
                 && record.operation.state == ProxyReloadState::Failed
             {
@@ -347,8 +350,8 @@ async fn execute_reload(
             );
         }
     };
-    let target = effective_path(&state);
     let result = async {
+        let target = effective_path(&state)?;
         let mut outcome = compile(&state).await?;
         anyhow::ensure!(
             !writer.cancellation().is_cancelled(),
@@ -379,7 +382,7 @@ async fn execute_reload(
             crate::supervisord_host::SupervisordHost::from_env_until(deadline).await?
         {
             host.replace_official_with_cancel(
-                &crate::proxy::compiler::runtime_root(&state.log_dir),
+                &crate::proxy::compiler::runtime_root(&state.log_dir)?,
                 &outcome,
                 deadline,
                 Some(&writer.cancellation()),
@@ -462,7 +465,10 @@ pub(super) async fn status(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let path = effective_path(&state);
+    let path = match effective_path(&state) {
+        Ok(path) => path,
+        Err(error) => return proxy_error(error),
+    };
     let configured = match tokio::fs::metadata(&path).await {
         Ok(metadata) => metadata.is_file(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -489,7 +495,9 @@ pub(super) async fn status(
         Err(error) => return proxy_error(error),
     };
     let operation = match requested_id {
-        Some(id) => match super::proxy_reload::read(&super::proxy_reload::root(&state), &id) {
+        Some(id) => match super::proxy_reload::root(&state)
+            .and_then(|root| super::proxy_reload::read(&root, &id))
+        {
             Ok(record) => record.map(|record| record.observed_operation(&state)),
             Err(error) => {
                 return reload_rejection(
@@ -542,7 +550,15 @@ pub(super) async fn status(
 pub(super) async fn effective_config(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let path = effective_path(&state);
+    let path = effective_path(&state).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": "PINGAP_CONFIG_INVALID",
+                "message": format!("resolve effective Pingap config: {error:#}"),
+            })),
+        )
+    })?;
     tokio::fs::read_to_string(&path)
         .await
         .map(|content| Json(json!({"release_id": state.server.boot_id(), "toml": content})))
@@ -592,7 +608,7 @@ async fn compile(state: &AppState) -> anyhow::Result<CompileOutcome> {
     })?;
     compile_and_validate(
         &context.workspace,
-        &crate::proxy::compiler::runtime_root(&state.log_dir),
+        &crate::proxy::compiler::runtime_root(&state.log_dir)?,
         &state.pingap_bin,
         &release,
         crate::startup_probe::StartupContext {
@@ -603,9 +619,9 @@ async fn compile(state: &AppState) -> anyhow::Result<CompileOutcome> {
     .await
 }
 
-fn effective_path(state: &AppState) -> PathBuf {
-    crate::proxy::compiler::active_config_path(&crate::proxy::compiler::runtime_root(
-        &state.log_dir,
+fn effective_path(state: &AppState) -> anyhow::Result<PathBuf> {
+    Ok(crate::proxy::compiler::active_config_path(
+        &crate::proxy::compiler::runtime_root(&state.log_dir)?,
     ))
 }
 

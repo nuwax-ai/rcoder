@@ -79,7 +79,7 @@ impl ProcessHost for OfficialSupervisorHost<'_> {
         self.host
             .record_entry_domain_until(self.runtime_root, &candidate.config_path, None, deadline)
             .await?;
-        spec.write()?;
+        relative_bootstrap::write_proxy_spec_until(&spec, deadline).await?;
         let log_root = self
             .runtime_root
             .parent()

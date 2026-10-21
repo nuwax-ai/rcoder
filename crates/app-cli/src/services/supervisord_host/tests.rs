@@ -613,7 +613,7 @@ mod inactive_entry_ownership_tests {
                 ..Default::default()
             };
             supervisor::resident::bind_owner(scope, &args).unwrap();
-            let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+            let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir).unwrap();
             let active = crate::proxy::compiler::active_config_path(&runtime_root);
             std::fs::create_dir_all(active.parent().unwrap()).unwrap();
             let original_active = b"[servers.app]\naddr = \"127.0.0.1:19081\"\n";
@@ -981,7 +981,7 @@ mod publication_receipt_tests {
                 log_dir: root.join("logs"),
                 ..Default::default()
             };
-            let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+            let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir).unwrap();
             let (lease, scope) = owner_test_context::scope(&root, &workspace);
             let identity = scope.identity().clone();
             supervisor::resident::bind_owner(scope, &args).unwrap();
@@ -1033,7 +1033,7 @@ mod publication_receipt_tests {
             let mut process_host = super::resident::OfficialSupervisorHost {
                 host: &host,
                 runtime_root: &runtime_root,
-                spec: pingap_service_spec(&args, &endpoint),
+                spec: pingap_service_spec(&args, &endpoint).unwrap(),
                 current: Some((instance, running.clone())),
                 cancel: None,
                 epoch: supervisor::resident::control_epoch().unwrap(),
@@ -1083,6 +1083,21 @@ mod official_orchestration_protocol_tests {
     #[cfg(unix)]
     #[test]
     fn successful_orchestration_confirms_all_listeners_and_business_without_private_applied() {
+        successful_orchestration_case(false);
+    }
+
+    /// Reproduces the failed-bootstrap shape from the original incident: an
+    /// orphaned resident spec survives, but no supervisor fragment/program does.
+    /// This is a controlled protocol regression with real static HTTP, not a
+    /// real supervisord/Pingap deployment.
+    #[cfg(unix)]
+    #[test]
+    fn orchestration_recovers_orphaned_relative_proxy_spec_without_erasing_history() {
+        successful_orchestration_case(true);
+    }
+
+    #[cfg(unix)]
+    fn successful_orchestration_case(seed_relative_spec: bool) {
         let _guard = crate::svc_spec::SPEC_ENV_LOCK.lock().unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1135,12 +1150,25 @@ mod official_orchestration_protocol_tests {
             // from one generic port check.
             release.bridge_service=None;
             let args=RuntimeArgs{workspace:workspace.clone(),log_dir:root.join("logs"),pingap_bin:root.join("pingap"),..Default::default()};
-            let runtime_root=crate::proxy::compiler::runtime_root(&args.log_dir);
+            let runtime_root=crate::proxy::compiler::runtime_root(&args.log_dir).unwrap();
             let saved_spec=std::env::var_os("APP_CLI_SPEC_DIR");
             let saved_pg=std::env::var_os("APP_CLI_REQUIRE_PG");
-            unsafe {std::env::set_var("APP_CLI_SPEC_DIR",root.join("specs"));std::env::remove_var("APP_CLI_REQUIRE_PG");}
+            let saved_socket=std::env::var_os("APP_CLI_SUPERVISOR_SOCKET");
+            let socket=root.join("supervisor.sock");
+            unsafe {std::env::set_var("APP_CLI_SPEC_DIR",root.join("specs"));std::env::remove_var("APP_CLI_REQUIRE_PG");std::env::set_var("APP_CLI_SUPERVISOR_SOCKET",&socket);}
             let endpoint=admin_probe::AdminEndpoint{addr:admin_addr.to_string(),user:"protocol".into(),password:"protocol".into()};
-            pingap_service_spec(&args,&endpoint).write().unwrap();
+            let mut initial_spec=pingap_service_spec(&args,&endpoint).unwrap();
+            if seed_relative_spec {
+                initial_spec.argv[2]=".local-logs/pingap/active/pingap.toml".into();
+                assert_eq!(initial_spec.cwd,"/");
+            }
+            let original_spec_path=initial_spec.write().unwrap();
+            if seed_relative_spec {
+                let mut document=toml::Value::try_from(&initial_spec).unwrap();
+                document.as_table_mut().unwrap().insert("future_extension".into(),toml::Value::String("retained after orchestration".into()));
+                std::fs::write(&original_spec_path,toml::to_string_pretty(&document).unwrap()).unwrap();
+            }
+            let original_spec_bytes=std::fs::read(&original_spec_path).unwrap();
             let (lease,scope)=owner_test_context::scope(&root,&workspace);
             let identity=scope.identity().clone();supervisor::resident::bind_owner(scope,&args).unwrap();
             let mut graph=pingap_config::PingapConfig::default();
@@ -1165,9 +1193,10 @@ mod official_orchestration_protocol_tests {
                     stream.write_all(format!("HTTP/1.1 200 OK\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
                 }}));
             }
-            let socket=root.join("supervisor.sock");let listener=tokio::net::UnixListener::bind(&socket).unwrap();
+            let listener=tokio::net::UnixListener::bind(&socket).unwrap();
             let calls=std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));let seen=calls.clone();
             let process_start=std::sync::Arc::new(std::sync::atomic::AtomicI64::new(123));let rpc_start=process_start.clone();
+            let owner_pid=std::process::id();
             let rpc=tokio::spawn(async move {let mut state="NONE";loop {
                 let(mut stream,_)=listener.accept().await.unwrap();let mut header=Vec::new();while !header.ends_with(b"\r\n\r\n"){header.push(stream.read_u8().await.unwrap());}
                 let header=String::from_utf8(header).unwrap();let size:usize=header.lines().find_map(|line|line.strip_prefix("Content-Length: ")).unwrap().parse().unwrap();
@@ -1175,9 +1204,13 @@ mod official_orchestration_protocol_tests {
                 let method=request.split("<methodName>supervisor.").nth(1).unwrap().split("</methodName>").next().unwrap().to_string();seen.lock().unwrap().push(method.clone());
                 let observed_start=rpc_start.load(std::sync::atomic::Ordering::SeqCst);
                 let row=format!(r#"<struct><member><name>group</name><value><string>app-pingap</string></value></member><member><name>name</name><value><string>app-pingap</string></value></member><member><name>statename</name><value><string>{state}</string></value></member><member><name>state</name><value><int>{}</int></value></member><member><name>pid</name><value><int>{}</int></value></member><member><name>start</name><value><int>{observed_start}</int></value></member></struct>"#,if state=="RUNNING"{20}else{0},if state=="RUNNING"{42}else{0});
+                let owner_row=format!(r#"<struct><member><name>group</name><value><string>app-cli</string></value></member><member><name>name</name><value><string>app-cli</string></value></member><member><name>statename</name><value><string>RUNNING</string></value></member><member><name>state</name><value><int>20</int></value></member><member><name>pid</name><value><int>{owner_pid}</int></value></member><member><name>start</name><value><int>1</int></value></member></struct>"#);
+                let owner_entry=if seed_relative_spec {format!("<value>{owner_row}</value>")}else{String::new()};
                 let value=match method.as_str(){
-                    "getAllProcessInfo" if state=="NONE"=>"<array><data></data></array>".to_string(),
-                    "getAllProcessInfo"=>format!("<array><data><value>{row}</value></data></array>"),
+                    "getVersion"=>"<string>3.0</string>".to_string(),
+                    "getAllProcessInfo" if state=="NONE"=>format!("<array><data>{owner_entry}</data></array>"),
+                    "getAllProcessInfo"=>format!("<array><data>{owner_entry}<value>{row}</value></data></array>"),
+                    "getProcessInfo" if request.contains("<string>app-cli</string>")=>owner_row,
                     "getProcessInfo"=>row,
                     "reloadConfig"=>"<array><data><value><array><data><value><array><data></data></array></value><value><array><data></data></array></value><value><array><data></data></array></value></data></array></value></data></array>".to_string(),
                     "addProcessGroup"=>{state="STOPPED";"<boolean>1</boolean>".into()},
@@ -1194,6 +1227,24 @@ mod official_orchestration_protocol_tests {
             host.fixture_argv=Some(std::sync::Arc::new(move|pid|{anyhow::ensure!(pid==42,"controlled foreign PID");Ok(launch_argv.clone())}));
             let status=RuntimeStatusService::default();
             host.orchestrate(&args,&release,&status,supervisor::RunProfile{run_migrations:false,dev_profile:false,pg:None,prepared_proxy:Some(supervisor::PreparedProxy{workspace:workspace.clone(),release:release.clone(),dev_profile:false,outcome:outcome.clone()})},&tokio_util::sync::CancellationToken::new()).await.unwrap();
+            if seed_relative_spec {
+                fn exact_copies(root:&Path,expected:&[u8],found:&mut Vec<PathBuf>) {
+                    for entry in std::fs::read_dir(root).unwrap() {
+                        let entry=entry.unwrap();
+                        if entry.file_type().unwrap().is_dir(){exact_copies(&entry.path(),expected,found);}
+                        else if entry.file_type().unwrap().is_file()&&std::fs::read(entry.path()).unwrap()==expected{found.push(entry.path());}
+                    }
+                }
+                let mut preserved=Vec::new();exact_copies(&root,&original_spec_bytes,&mut preserved);
+                assert_eq!(preserved.len(),1,"old spec bytes must survive exactly once: {preserved:?}");
+                assert_ne!(preserved[0],original_spec_path,"the original contract must be replaced, not reused");
+                let current=ServiceSpecFile::load(crate::svc_spec::RESIDENT_SPEC_ID,"pingap").unwrap();
+                assert!(Path::new(&current.argv[2]).is_absolute());
+                assert_ne!(current.argv[2],initial_spec.argv[2]);
+                let current_document=toml::from_str::<toml::Value>(&std::fs::read_to_string(&original_spec_path).unwrap()).unwrap();
+                assert_eq!(current_document["future_extension"].as_str(),Some("retained after orchestration"));
+                assert_eq!(std::fs::read(workspace.join("web/dist/index.html")).unwrap(),b"real static backend");
+            }
             assert!(status.is_ready());assert!(listener_hits.load(std::sync::atomic::Ordering::SeqCst)>=2);
             let operations=calls.lock().unwrap().clone();assert_eq!(operations.iter().filter(|method|*method=="startProcess").count(),1);
             assert!(!operations.iter().any(|method|method.contains("app-svc-")));
@@ -1213,7 +1264,7 @@ mod official_orchestration_protocol_tests {
             let body=reqwest::get(format!("http://127.0.0.1:{backend_port}/")).await.unwrap().text().await.unwrap();assert_eq!(body,"real static backend");
             crate::static_hosting::reconcile(&[],&workspace,false).await.unwrap();supervisor::resident::shutdown().await.unwrap();drop(lease);
             for server in servers{server.abort();}rpc.abort();owner_test_context::restore_spec_env(saved_spec);
-            unsafe {match saved_pg{Some(value)=>std::env::set_var("APP_CLI_REQUIRE_PG",value),None=>std::env::remove_var("APP_CLI_REQUIRE_PG")};}
+            unsafe {match saved_pg{Some(value)=>std::env::set_var("APP_CLI_REQUIRE_PG",value),None=>std::env::remove_var("APP_CLI_REQUIRE_PG")};match saved_socket{Some(value)=>std::env::set_var("APP_CLI_SUPERVISOR_SOCKET",value),None=>std::env::remove_var("APP_CLI_SUPERVISOR_SOCKET")};}
         });
     }
 }

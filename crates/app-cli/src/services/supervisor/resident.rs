@@ -130,7 +130,7 @@ pub(crate) fn bind_owner(scope: ResidentScope, args: &RuntimeArgs) -> Result<()>
             == workspace,
         "resident owner belongs to another workspace"
     );
-    let runtime_root = compiler::runtime_root(&args.log_dir);
+    let runtime_root = compiler::runtime_root(&args.log_dir)?;
     let (tx, rx) = mpsc::channel(16);
     let owner = Arc::new(Controller {
         scope,
@@ -328,7 +328,7 @@ pub(super) async fn ensure_resident(args: &RuntimeArgs, outcome: &CompileOutcome
     let normalized = args.for_management()?;
     ensure!(
         runtime_state_layout::resolve_project_origin(&normalized.workspace)? == owner.workspace
-            && compiler::runtime_root(&args.log_dir) == owner.runtime_root,
+            && compiler::runtime_root(&args.log_dir)? == owner.runtime_root,
         "resident request belongs to another workspace or runtime range"
     );
     reload(outcome).await.map(|_| ())

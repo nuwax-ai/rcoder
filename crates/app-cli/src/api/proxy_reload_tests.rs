@@ -127,7 +127,7 @@ async fn explicit_head_keeps_preflight_and_failed_request_visible_without_header
 async fn head_directory_failure_records_failure_before_any_proxy_dispatch() {
     let directory = tempfile::tempdir().unwrap();
     let state = state(directory.path());
-    let journal = root(&state);
+    let journal = root(&state).unwrap();
     std::fs::create_dir_all(journal.join("head.json")).unwrap();
     let (status, body) = call(&state, "POST", "/v1/proxy/reload", "head-fails").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -283,7 +283,9 @@ async fn unfinished_old_reload_is_queryable_but_does_not_block_a_new_identity() 
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["data"]["state"], "recovery_required");
     // Check owner-bound observation directly and preserve the original record.
-    let old = read(&root(&state), "interrupted-request").unwrap().unwrap();
+    let old = read(&root(&state).unwrap(), "interrupted-request")
+        .unwrap()
+        .unwrap();
     assert_eq!(
         old.observed_operation(&state).state,
         ProxyReloadState::RecoveryRequired
@@ -292,7 +294,7 @@ async fn unfinished_old_reload_is_queryable_but_does_not_block_a_new_identity() 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["data"]["operation_id"], "new-request");
     assert_eq!(
-        read(&root(&state), "new-request")
+        read(&root(&state).unwrap(), "new-request")
             .unwrap()
             .unwrap()
             .operation
@@ -312,7 +314,9 @@ fn interrupted_admission_records_unknown_without_faking_success() {
     )
     .unwrap();
     drop(claim);
-    let record = read(&root(&state), "cancelled-request").unwrap().unwrap();
+    let record = read(&root(&state).unwrap(), "cancelled-request")
+        .unwrap()
+        .unwrap();
     assert_eq!(record.operation.state, ProxyReloadState::RecoveryRequired);
     assert!(record.result.is_none());
     assert!(
@@ -372,7 +376,11 @@ async fn same_pending_request_is_observed_while_another_identity_is_busy() {
     let (status, body) = call(&state, "POST", "/v1/proxy/reload", "other-request").await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["code"], "ERR_OPERATION_IN_PROGRESS");
-    assert!(read(&root(&state), "other-request").unwrap().is_none());
+    assert!(
+        read(&root(&state).unwrap(), "other-request")
+            .unwrap()
+            .is_none()
+    );
     claim
         .failed(&anyhow::anyhow!("fixture cancelled before mutation"), false)
         .unwrap();
@@ -436,7 +444,9 @@ http.server.HTTPServer((address[0],int(address[1])), Handler).serve_forever()
     assert!(caller.await.unwrap_err().is_cancelled());
     let record = tokio::time::timeout(std::time::Duration::from_secs(15), async {
         loop {
-            let record = read(&root(&state), "detached-request").unwrap().unwrap();
+            let record = read(&root(&state).unwrap(), "detached-request")
+                .unwrap()
+                .unwrap();
             if record.operation.state == ProxyReloadState::Failed {
                 break record;
             }

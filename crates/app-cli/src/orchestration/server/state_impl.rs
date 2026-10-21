@@ -493,7 +493,7 @@ impl ServerState {
         Ok(Arc::new(super::state::GenerationControl {
             state: self.clone(),
             generation: generation.to_owned(),
-            standby_root: crate::proxy::compiler::runtime_root(log_dir),
+            standby_root: crate::proxy::compiler::runtime_root(log_dir)?,
             scope: runtime_supervisor::current_scope(),
         }))
     }

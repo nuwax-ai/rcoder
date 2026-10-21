@@ -124,8 +124,8 @@ struct ReloadHead {
     metadata: RequestMetadata,
 }
 
-pub(super) fn root(state: &AppState) -> PathBuf {
-    crate::proxy::compiler::runtime_root(&state.log_dir).join("reload-operations")
+pub(super) fn root(state: &AppState) -> Result<PathBuf> {
+    Ok(crate::proxy::compiler::runtime_root(&state.log_dir)?.join("reload-operations"))
 }
 
 fn record_path(root: &Path, id: &str) -> PathBuf {
@@ -167,7 +167,7 @@ pub(super) fn read(root: &Path, id: &str) -> Result<Option<ReloadRecord>> {
 }
 
 pub(super) fn current_id(state: &AppState) -> Result<Option<String>> {
-    let directory = root(state);
+    let directory = root(state)?;
     let bytes = match std::fs::read(directory.join("head.json")) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -351,7 +351,7 @@ pub(super) struct Claim {
 
 impl Claim {
     pub(super) fn admit(state: &AppState, id: String, metadata: RequestMetadata) -> Result<Self> {
-        let root = root(state);
+        let root = root(state)?;
         let record = ReloadRecord {
             schema_version: 1,
             request_id: id.clone(),

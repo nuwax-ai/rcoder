@@ -128,7 +128,7 @@ pub(super) async fn preflight_hot_reload_compat(
 ) -> anyhow::Result<crate::supervisor::PreparedProxy> {
     let release = crate::manifest::read_release_lock(&args.workspace)
         .context("read release lock for hot-reload preflight")?;
-    let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+    let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir)?;
     let outcome = crate::proxy::compiler::compile_and_validate(
         &args.workspace,
         &runtime_root,
@@ -578,7 +578,7 @@ async fn prepare_artifact_proxy(
     host: crate::startup_probe::StartupHost,
 ) -> anyhow::Result<crate::supervisor::PreparedProxy> {
     let release = crate::manifest::read_release_lock(read_workspace)?;
-    let root = crate::proxy::compiler::runtime_root(&owner_args.log_dir);
+    let root = crate::proxy::compiler::runtime_root(&owner_args.log_dir)?;
     let outcome = crate::proxy::compiler::compile_prepared(
         read_workspace,
         execution_workspace,
@@ -948,7 +948,7 @@ pub(super) async fn server_loop(
     foreground: bool,
 ) -> Result<()> {
     // P1：所有业务停止路径统一先发布 standby 摘流（runtime_root 固定）。
-    let standby_root = crate::proxy::compiler::runtime_root(&owner_args.log_dir);
+    let standby_root = crate::proxy::compiler::runtime_root(&owner_args.log_dir)?;
     if let Some(host) = host.as_ref() {
         host.prepare_entry_baseline(&standby_root).await?;
     }
@@ -1915,7 +1915,7 @@ mod lifecycle_tests {
         std::fs::write(source.join("proxy.toml"), "[servers.entry\n").unwrap();
         std::fs::write(current.join("proxy.toml"), config(19081)).unwrap();
         let log_dir = root.path().join("logs");
-        let runtime_root = crate::proxy::compiler::runtime_root(&log_dir);
+        let runtime_root = crate::proxy::compiler::runtime_root(&log_dir).unwrap();
         let active = crate::proxy::compiler::active_config_path(&runtime_root);
         std::fs::create_dir_all(active.parent().unwrap()).unwrap();
         std::fs::write(&active, config(19081)).unwrap();

@@ -86,14 +86,41 @@ pub fn ensure_admin_endpoint() -> Result<&'static AdminEndpoint> {
             );
             endpoint
         }
-        None => {
-            let user = uuid::Uuid::new_v4().simple().to_string();
-            let password = uuid::Uuid::new_v4().simple().to_string();
-            AdminEndpoint {
-                addr: format!("127.0.0.1:{}", admin_port()?),
-                user,
-                password,
-            }
+        None => fresh_admin_endpoint()?,
+    };
+    validate_endpoint(&endpoint)?;
+    Ok(ADMIN_ENDPOINT.get_or_init(|| endpoint))
+}
+
+fn fresh_admin_endpoint() -> Result<AdminEndpoint> {
+    Ok(AdminEndpoint {
+        addr: format!("127.0.0.1:{}", admin_port()?),
+        user: uuid::Uuid::new_v4().simple().to_string(),
+        password: uuid::Uuid::new_v4().simple().to_string(),
+    })
+}
+
+/// Only the supervisor host may call this after current-owner authorization,
+/// pending-write settlement and a fresh no-execution observation. Historical
+/// command spelling grants no authority to a path or a live proxy.
+pub(crate) fn register_retired_bootstrap_endpoint(
+    spec: &crate::svc_spec::ServiceSpecFile,
+) -> Result<&'static AdminEndpoint> {
+    anyhow::ensure!(
+        proxy_spec_relative_config_legacy(spec),
+        "retired proxy bootstrap is not the recognized relative-path record"
+    );
+    if let Some(endpoint) = ADMIN_ENDPOINT.get() {
+        validate_endpoint(endpoint)?;
+        return Ok(endpoint);
+    }
+    let endpoint = match endpoint_from_spec_env(&spec.env) {
+        Ok(endpoint) => endpoint,
+        Err(_) => {
+            // No execution retains these credentials. Do not turn corrupt
+            // historical metadata into a permanent gate for a fresh launch.
+            tracing::warn!("replaced unusable credentials from a retired proxy bootstrap");
+            fresh_admin_endpoint()?
         }
     };
     validate_endpoint(&endpoint)?;

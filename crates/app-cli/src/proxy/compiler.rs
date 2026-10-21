@@ -348,10 +348,62 @@ pub(crate) struct RuntimeProxyContext {
     pub dev_profile: bool,
 }
 
-pub(crate) fn runtime_root(log_root: &Path) -> PathBuf {
-    std::env::var_os("APP_CLI_PINGAP_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| log_root.join("pingap"))
+pub(crate) fn runtime_root(log_root: &Path) -> Result<PathBuf> {
+    runtime_root_from_override(
+        log_root,
+        std::env::var_os("APP_CLI_PINGAP_RUNTIME_DIR").as_deref(),
+    )
+}
+
+fn runtime_root_from_override(
+    log_root: &Path,
+    explicit: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf> {
+    let requested = match explicit {
+        Some(path) => {
+            anyhow::ensure!(
+                !path.is_empty(),
+                "APP_CLI_PINGAP_RUNTIME_DIR must not be empty"
+            );
+            PathBuf::from(path)
+        }
+        None => log_root.join("pingap"),
+    };
+    let absolute = std::path::absolute(&requested)
+        .context("resolve proxy runtime directory against invocation directory")?;
+    canonical_path_with_missing_tail(&absolute)
+}
+
+/// Resolve the existing ancestor through the filesystem before retaining a
+/// missing suffix. In particular, `link/..` must follow the link before `..`.
+pub(crate) fn canonical_path_with_missing_tail(path: &Path) -> Result<PathBuf> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                let mut resolved = std::fs::canonicalize(ancestor).with_context(|| {
+                    format!("resolve proxy runtime ancestor {}", ancestor.display())
+                })?;
+                for component in missing.into_iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(
+                    ancestor
+                        .file_name()
+                        .context("proxy runtime directory has no resolvable existing ancestor")?
+                        .to_os_string(),
+                );
+                ancestor = ancestor
+                    .parent()
+                    .context("proxy runtime directory has no existing parent")?;
+            }
+            Err(error) => return Err(error).context("observe proxy runtime directory"),
+        }
+    }
 }
 
 /// owner 生命周期固定的 active 配置路径（P1 常驻代理的 `-c` 目标）。
@@ -1990,3 +2042,112 @@ mod startup_contract_tests;
 #[cfg(test)]
 #[path = "compiler_deadline_tests.rs"]
 mod file_deadline_tests;
+
+#[cfg(test)]
+mod runtime_root_tests {
+    use super::runtime_root_from_override;
+    use std::{ffi::OsStr, path::Path};
+
+    #[test]
+    fn default_root_retains_missing_log_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let log = temporary.path().join("future-logs");
+        let resolved = runtime_root_from_override(&log, None).unwrap();
+        assert_eq!(
+            resolved,
+            temporary
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("future-logs/pingap")
+        );
+        assert!(
+            !log.exists(),
+            "resolving a root must not create directories"
+        );
+    }
+
+    #[test]
+    fn relative_override_uses_invocation_directory_not_log_root() {
+        let name = format!("proxy-runtime-{}", uuid::Uuid::new_v4());
+        let expected = std::env::current_dir()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .join(&name);
+        let resolved =
+            runtime_root_from_override(Path::new("unrelated-logs"), Some(OsStr::new(&name)))
+                .unwrap();
+        assert_eq!(resolved, expected);
+        assert!(!resolved.exists());
+    }
+
+    #[test]
+    fn empty_override_is_an_error_without_default_fallback() {
+        let error =
+            runtime_root_from_override(Path::new("logs"), Some(OsStr::new(""))).unwrap_err();
+        assert!(error.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn normal_existing_parent_traversal_resolves_before_missing_tail() {
+        let temporary = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temporary.path().join("existing")).unwrap();
+        let requested = temporary.path().join("existing/../future/runtime");
+        assert_eq!(
+            runtime_root_from_override(Path::new("unused"), Some(requested.as_os_str())).unwrap(),
+            temporary
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("future/runtime")
+        );
+    }
+
+    #[test]
+    fn non_directory_ancestor_error_is_not_replaced_by_another_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        let requested = file.join("runtime");
+        assert!(runtime_root_from_override(temporary.path(), Some(requested.as_os_str())).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_parent_traversal_uses_physical_target() {
+        let temporary = tempfile::tempdir().unwrap();
+        let physical = temporary.path().join("physical");
+        std::fs::create_dir_all(physical.join("nested")).unwrap();
+        std::os::unix::fs::symlink(physical.join("nested"), temporary.path().join("alias"))
+            .unwrap();
+        let requested = temporary.path().join("alias/../future/runtime");
+        assert_eq!(
+            runtime_root_from_override(Path::new("unused"), Some(requested.as_os_str())).unwrap(),
+            physical.canonicalize().unwrap().join("future/runtime")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_link_is_an_observation_error_not_a_missing_suffix() {
+        let temporary = tempfile::tempdir().unwrap();
+        let link = temporary.path().join("broken");
+        std::os::unix::fs::symlink(temporary.path().join("missing"), &link).unwrap();
+        let requested = link.join("runtime");
+        assert!(runtime_root_from_override(temporary.path(), Some(requested.as_os_str())).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_override_preserves_path_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let name = std::ffi::OsString::from_vec(b"runtime-\xff".to_vec());
+        let requested = temporary.path().join(&name);
+        assert_eq!(
+            runtime_root_from_override(Path::new("unused"), Some(requested.as_os_str())).unwrap(),
+            temporary.path().canonicalize().unwrap().join(name)
+        );
+    }
+}

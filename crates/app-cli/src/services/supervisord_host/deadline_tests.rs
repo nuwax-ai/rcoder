@@ -80,7 +80,7 @@ fn start_phase_deadline(slow: &'static str) {
             let saved = std::env::var_os("APP_CLI_SPEC_DIR");
             owner_test_context::restore_spec_env(Some(root.join("specs").into_os_string()));
             let args = RuntimeArgs { workspace: workspace.clone(), log_dir: root.join("logs"), ..Default::default() };
-            let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+            let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir).unwrap();
             std::fs::create_dir_all(&runtime_root).unwrap();
             let (lease, scope) = owner_test_context::scope(&root, &workspace);
             supervisor::resident::bind_owner(scope, &args).unwrap();
@@ -115,7 +115,7 @@ fn start_phase_deadline(slow: &'static str) {
             let host = SupervisordHost::protocol_fixture(socket, root.join("dynamic.conf"));
             let endpoint = admin_probe::AdminEndpoint { addr: "127.0.0.1:19086".into(), user: "fixture".into(), password: "fixture".into() };
             let candidate = CompileOutcome { config_path: runtime_root.join("candidate.toml"), expected_hash: "fixture".into(), publication_id: uuid::Uuid::new_v4().to_string(), operation_id: Some("original-operation".into()), serving_release_id: None, config_digest: "fixture".into(), entry_probes: vec![], business_probes: vec![] };
-            let mut process_host = resident::OfficialSupervisorHost { host: &host, runtime_root: &runtime_root, spec: pingap_service_spec(&args, &endpoint), current: None, cancel: None, epoch: supervisor::resident::control_epoch().unwrap() };
+            let mut process_host = resident::OfficialSupervisorHost { host: &host, runtime_root: &runtime_root, spec: pingap_service_spec(&args, &endpoint).unwrap(), current: None, cancel: None, epoch: supervisor::resident::control_epoch().unwrap() };
             let start = tokio::time::Instant::now();
             let error = process_host.start_exact(&candidate, start + std::time::Duration::from_millis(500)).await.unwrap_err();
             assert!(start.elapsed() < std::time::Duration::from_millis(1000), "{slow}: {error:#}");

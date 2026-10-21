@@ -443,7 +443,7 @@ impl runtime_supervisor::OwnerCleanup for OwnerResidentCleanup {
         if let Some(host) = SupervisordHost::from_env_until(deadline).await? {
             let scope = crate::services::supervisor::resident::owner_scope()?
                 .context("supervisord owner cleanup capability missing")?;
-            let runtime_root = crate::proxy::compiler::runtime_root(&self.args.log_dir);
+            let runtime_root = crate::proxy::compiler::runtime_root(&self.args.log_dir)?;
             host.shutdown_owner_entry_until(&runtime_root, &scope, deadline)
                 .await?;
         }
@@ -610,7 +610,7 @@ async fn business_session_inner(
             if let Some(host) = host.as_ref() {
                 // 同容器换 owner 的启动收束：残留业务组先经 standby 摘流再停
                 //（同容器常驻 pingap 仍在服务旧路由——裸停会留裸 502 窗口）。
-                let standby_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+                let standby_root = crate::proxy::compiler::runtime_root(&args.log_dir)?;
                 host.stop_all(Some(&standby_root)).await?;
             }
             crate::static_hosting::reconcile(&[], &args.workspace, false).await
@@ -1183,7 +1183,7 @@ async fn serve_supervised_worker(
             if let Some(host) = host.as_ref() {
                 // 同容器换 owner 的启动收束：残留业务组先经 standby 摘流再停
                 //（同容器常驻 pingap 仍在服务旧路由——裸停会留裸 502 窗口）。
-                let standby_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+                let standby_root = crate::proxy::compiler::runtime_root(&args.log_dir)?;
                 host.stop_all(Some(&standby_root)).await?;
             }
             crate::static_hosting::reconcile(&[], &args.workspace, false).await

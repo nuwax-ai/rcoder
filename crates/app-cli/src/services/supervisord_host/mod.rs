@@ -34,6 +34,9 @@ mod deadline_tests;
 mod legacy;
 mod official_host;
 mod receipt;
+mod relative_bootstrap;
+#[cfg(all(test, unix))]
+mod relative_bootstrap_tests;
 mod resident;
 mod withdrawn;
 
@@ -239,7 +242,13 @@ impl SupervisordHost {
                 })?,
         };
         pingap_outcome.operation_id = args.operation_id.clone();
-        let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+        let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir)?;
+        self.recover_relative_bootstrap_until(
+            args,
+            cancel,
+            tokio::time::Instant::now() + admin_probe::CONFIRM_BUDGET,
+        )
+        .await?;
         let endpoint = admin_probe::ensure_admin_endpoint()?;
         // Restart 摘流：常驻入口正在服务旧路由时，先校验热载兼容（server
         // 拓扑变化 Fail Fast 保旧服务），再切 standby 并确认热载生效
@@ -333,50 +342,14 @@ impl SupervisordHost {
         anyhow::ensure!(!cancel.is_cancelled(), "Orchestration cancelled");
         // A first bootstrap supplies the launch contract. Existing immutable
         // resident ownership is left untouched until exact proxy replacement.
-        // 遗留相对路径 spec（本地独立 serve 以 `--log-dir .local-logs` 写入，
-        // 其路径基准是已消亡旧进程的 cwd）不可猜测归属：仅在旧执行已退出
-        // （entry_serving=false）时备份原件并用**当前 owner 的绝对参数**受控
-        // 重建；旧 pingap 仍在服务则保持 Fail Fast，绝不热改运行中契约。
-        match configured_entry_spec(&self.conf_path)? {
-            None => {
-                let pingap_spec = pingap_service_spec(args, endpoint);
-                pingap_spec
-                    .write()
-                    .context("write official proxy launch contract")?;
-            }
-            Some(existing) if admin_probe::proxy_spec_contract_ok(&existing) => {}
-            Some(existing) if admin_probe::proxy_spec_relative_config_legacy(&existing) => {
-                anyhow::ensure!(
-                    !entry_serving,
-                    "resident proxy holds a relative-path launch contract while serving; \
-                     stop the resident program before rebuilding the contract"
-                );
-                let stale_path = crate::svc_spec::spec_root()
-                    .join(&existing.release_id)
-                    .join(format!("{}.toml", existing.service_id));
-                let backup_path = stale_path.with_extension(format!(
-                    "toml.stale-relative-{}",
-                    chrono::Utc::now().timestamp()
-                ));
-                tokio::fs::rename(&stale_path, &backup_path)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "preserve legacy relative proxy spec {}",
-                            stale_path.display()
-                        )
-                    })?;
-                tracing::warn!(
-                    stale = %backup_path.display(),
-                    "rebuilt legacy relative proxy launch contract from current owner args"
-                );
-                let pingap_spec = pingap_service_spec(args, endpoint);
-                pingap_spec
-                    .write()
-                    .context("rebuild official proxy launch contract")?;
-            }
-            // 其他契约违规不在重建范围：既有校验路径 Fail Fast 保持不变。
-            Some(_) => {}
+        if configured_entry_spec(&self.conf_path)?.is_none() {
+            self.write_current_bootstrap_until(
+                args,
+                endpoint,
+                tokio::time::Instant::now() + admin_probe::CONFIRM_BUDGET,
+            )
+            .await
+            .context("write official proxy launch contract")?;
         }
 
         // 4. 生成并重载 program conf（supervisord 不建日志目录——服务日志目录预建）
@@ -634,7 +607,7 @@ async fn compile_pingap(
     release: &ReleaseLock,
     dev_profile: bool,
 ) -> Result<CompileOutcome> {
-    let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+    let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir)?;
     compile_and_validate(
         &args.workspace,
         &runtime_root,
@@ -650,13 +623,13 @@ async fn compile_pingap(
 fn pingap_service_spec(
     args: &RuntimeArgs,
     endpoint: &admin_probe::AdminEndpoint,
-) -> ServiceSpecFile {
+) -> Result<ServiceSpecFile> {
     // The first bootstrap contract is installed before a process exists; the
     // host replaces -c with an immutable owner snapshot before every launch.
     let active = crate::proxy::compiler::active_config_path(&crate::proxy::compiler::runtime_root(
         &args.log_dir,
-    ));
-    ServiceSpecFile {
+    )?);
+    Ok(ServiceSpecFile {
         release_id: crate::svc_spec::RESIDENT_SPEC_ID.into(),
         service_id: "pingap".into(),
         cwd: "/".into(),
@@ -678,7 +651,7 @@ fn pingap_service_spec(
             env
         },
         port: None,
-    }
+    })
 }
 
 /// 写 conf 分片（原子：tmp + rename；supervisord reloadConfig 前落盘）。

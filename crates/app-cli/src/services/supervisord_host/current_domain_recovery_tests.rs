@@ -135,7 +135,7 @@ pub(super) fn recovery_case_with_context(
             _ => {},
         }}
 
-        let runtime = crate::proxy::compiler::runtime_root(&args.log_dir);
+        let runtime = crate::proxy::compiler::runtime_root(&args.log_dir).unwrap();
         std::fs::create_dir_all(&runtime).unwrap();
         let current = runtime.join(RESIDENT_ENGINE_RECEIPT);
         let foreign_config = base.join("foreign-app/config.toml");

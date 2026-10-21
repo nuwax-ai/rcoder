@@ -90,7 +90,7 @@ async fn run(command: app_cli::config::Command) -> anyhow::Result<()> {
             return Ok(());
         }
         app_cli::config::Command::Serve(args) => {
-            let runtime = app_cli::RuntimeArgs::from(args);
+            let runtime = app_cli::RuntimeArgs::from(args).for_management()?;
             // tracing 先于监督（recovery v2 plan §9）：owner 進入恢复围栏时仍
             // 要有 stderr/文件日志——围栏判定发生在监督内部，事后初始化的
             // 日志链什么都看不到（app 11 零日志排障代价的教训）。

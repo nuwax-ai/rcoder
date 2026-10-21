@@ -1,7 +1,8 @@
 //! Explicit subcommands own their options. Runtime configuration is independent
 //! of clap so the orchestration kernel does not depend on CLI dispatch.
+use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -223,51 +224,52 @@ impl RuntimeArgs {
     /// Management bootstrap shares the platform source contract. Build and
     /// validation use their explicitly requested directory without rewriting.
     pub fn for_management(&self) -> anyhow::Result<Self> {
-        let workspace = runtime_state_layout::normalize_management_workspace(&self.workspace)?;
-        if workspace != self.workspace {
-            tracing::info!(requested = %self.workspace.display(), source = %workspace.display(),
+        let absolute = self.absolutized_paths()?;
+        let workspace = runtime_state_layout::normalize_management_workspace(&absolute.workspace)?;
+        if workspace != absolute.workspace {
+            tracing::info!(requested = %absolute.workspace.display(), source = %workspace.display(),
                 "normalized platform management workspace before acquiring ownership");
         }
         Ok(Self {
             workspace,
-            ..self.clone()
+            ..absolute
         })
     }
 
-    /// 启动契约（spec/journal/supervisor 配置）是跨进程、跨时刻的持久记录，
-    /// 读取方（supervisord/pingap，cwd=/）的工作目录写方无法控制——相对路径
-    /// 的含义随读者漂移。所有进入编排的 `workspace`/`log_dir` 在此边界统一
-    /// 绝对化（词法拼接当前 cwd，保留调用者意图，不触盘不解析符号链接）。
-    /// 解析失败（如空串）保留原值并记错误日志：下游启动契约校验
-    /// （verify_proxy_spec 的绝对路径要求）会以明确报错 Fail Fast。
-    pub fn absolutized_paths(self) -> Self {
-        let absolutize = |path: PathBuf| -> PathBuf {
-            if path.is_absolute() {
-                return path;
-            }
-            match std::path::absolute(&path) {
-                Ok(resolved) => {
-                    tracing::info!(
-                        requested = %path.display(), resolved = %resolved.display(),
-                        "absolutized relative runtime path at the RuntimeArgs boundary"
-                    );
-                    resolved
-                }
-                Err(error) => {
-                    tracing::error!(
-                        requested = %path.display(), %error,
-                        "relative runtime path could not be absolutized; \
-                         the launch contract check will reject it"
-                    );
-                    path
-                }
-            }
-        };
-        Self {
-            workspace: absolutize(self.workspace),
-            log_dir: absolutize(self.log_dir),
-            ..self
+    /// Capture relative paths against one invocation directory before writing
+    /// cross-process contracts. Executable names retain their PATH semantics.
+    pub fn absolutized_paths(&self) -> anyhow::Result<Self> {
+        if self.workspace.is_absolute() && self.log_dir.is_absolute() {
+            return Ok(self.clone());
         }
+        let cwd = std::env::current_dir().context("resolve runtime invocation directory")?;
+        self.absolutized_paths_from(&cwd)
+    }
+
+    fn absolutized_paths_from(&self, cwd: &Path) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            cwd.is_absolute(),
+            "runtime invocation directory must be absolute"
+        );
+        let absolutize = |path: &Path, field: &str| -> anyhow::Result<PathBuf> {
+            anyhow::ensure!(
+                !path.as_os_str().is_empty(),
+                "runtime {field} must not be empty"
+            );
+            if path.is_absolute() {
+                return Ok(path.to_path_buf());
+            }
+            let resolved = std::path::absolute(cwd.join(path))
+                .with_context(|| format!("resolve runtime {field} against invocation directory"))?;
+            tracing::info!(requested = %path.display(), resolved = %resolved.display(),
+                "absolutized relative runtime path at the management boundary");
+            Ok(resolved)
+        };
+        Ok(Self {
+            workspace: absolutize(&self.workspace, "workspace")?,
+            log_dir: absolutize(&self.log_dir, "log directory")?,
+            ..self.clone()
+        })
     }
 }
 
@@ -282,7 +284,6 @@ impl From<RunArgs> for RuntimeArgs {
             attach: false,
             control_only: false,
         }
-        .absolutized_paths()
     }
 }
 
@@ -302,11 +303,8 @@ mod tests {
 
     #[test]
     fn relative_runtime_paths_are_absolutized_at_the_args_boundary() {
-        let cwd = std::env::current_dir().unwrap();
-        let previous = std::env::current_dir().unwrap();
-        let base = std::env::temp_dir().join("app-cli-absolutize-boundary");
-        std::fs::create_dir_all(&base).unwrap();
-        std::env::set_current_dir(&base).unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let invocation = base.path().join("invocation with spaces");
         let args = RuntimeArgs {
             operation_id: None,
             workspace: PathBuf::from(".local-deploy"),
@@ -316,16 +314,13 @@ mod tests {
             attach: false,
             control_only: false,
         }
-        .absolutized_paths();
-        std::env::set_current_dir(previous).unwrap();
+        .absolutized_paths_from(&invocation)
+        .unwrap();
         assert!(args.workspace.is_absolute());
         assert!(args.log_dir.is_absolute());
-        // macOS temp 的 /var→/private/var 符号链接: absolute() 走 getcwd(已解析),
-        // 基准需 canonicalize 对齐。
-        let normalized_base = std::fs::canonicalize(&base).unwrap();
-        assert_eq!(args.workspace, normalized_base.join(".local-deploy"));
-        assert_eq!(args.log_dir, normalized_base.join(".local-logs"));
-        let _ = cwd;
+        assert_eq!(args.workspace, invocation.join(".local-deploy"));
+        assert_eq!(args.log_dir, invocation.join(".local-logs"));
+        assert_eq!(args.pingap_bin, PathBuf::from("pingap"));
     }
 
     #[test]
@@ -340,9 +335,56 @@ mod tests {
             attach: false,
             control_only: false,
         }
-        .absolutized_paths();
+        .absolutized_paths()
+        .unwrap();
         assert_eq!(args.workspace, absolute);
         assert_eq!(args.log_dir, absolute);
+    }
+
+    #[test]
+    fn direct_runtime_args_use_the_same_management_path_boundary() {
+        let cwd = std::env::current_dir().unwrap();
+        let args = RuntimeArgs {
+            workspace: ".".into(),
+            log_dir: "management-logs".into(),
+            pingap_bin: "pingap".into(),
+            ..RuntimeArgs::default()
+        };
+        let normalized = args.for_management().unwrap();
+        assert_eq!(normalized.workspace, cwd);
+        assert_eq!(normalized.log_dir, cwd.join("management-logs"));
+        assert_eq!(normalized.pingap_bin, PathBuf::from("pingap"));
+        let operation = normalized.clone();
+        assert_eq!(
+            operation.for_management().unwrap().log_dir,
+            normalized.log_dir
+        );
+    }
+
+    #[test]
+    fn empty_runtime_paths_fail_before_management() {
+        let cwd = std::env::current_dir().unwrap();
+        for (workspace, log_dir, expected) in [
+            (
+                PathBuf::new(),
+                cwd.clone(),
+                "runtime workspace must not be empty",
+            ),
+            (
+                cwd.clone(),
+                PathBuf::new(),
+                "runtime log directory must not be empty",
+            ),
+        ] {
+            let error = RuntimeArgs {
+                workspace,
+                log_dir,
+                ..RuntimeArgs::default()
+            }
+            .for_management()
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
     }
 
     #[test]
@@ -402,7 +444,9 @@ mod tests {
             panic!("expected serve")
         };
         let runtime = RuntimeArgs::from(serve);
-        // 相对 workspace/log-dir 在边界被绝对化（基准 = 测试进程 cwd）。
+        assert_eq!(runtime.workspace, PathBuf::from("project with spaces"));
+        assert_eq!(runtime.log_dir, PathBuf::from("logs"));
+        let runtime = runtime.for_management().unwrap();
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(runtime.workspace, cwd.join("project with spaces"));
         assert_eq!(runtime.log_dir, cwd.join("logs"));

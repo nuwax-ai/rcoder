@@ -2407,6 +2407,7 @@ format = "jsonl"
         std::fs::create_dir_all(&ws).unwrap();
         let args = crate::config::RuntimeArgs {
             workspace: ws,
+            log_dir: dir.path().join("logs-race"),
             attach: false,
             ..Default::default()
         };
