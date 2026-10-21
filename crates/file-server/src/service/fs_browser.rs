@@ -11,6 +11,7 @@
 
 use crate::error::{AppError, AppResult};
 use crate::models::response::{FsEntry, FsRootEntry};
+use std::time::Duration;
 
 /// mkdir/rename 的结果载荷（不含 `success` 信封，handler 组装 wire 响应；
 /// `isDir`/`isSymlink` 为端点语义常量，由 handler 按端点填入）。
@@ -110,7 +111,7 @@ pub(crate) fn drive_candidates() -> Vec<String> {
 
 /// 浏览起点：根目录列表 + 用户 home。
 ///
-/// - win32：逐一探测盘符存在性（对齐 TS `fs.promises.stat`）
+/// - win32：并发探测盘符存在性（对齐 TS 1.6.1 `fs.promises.stat` 并行探测）
 /// - 其余平台：`/`
 ///
 /// home 单独返回（前端快捷入口），`dirs::home_dir` 失败 → None（罕见）。
@@ -131,23 +132,67 @@ pub(crate) async fn list_fs_roots() -> AppResult<(Vec<FsRootEntry>, Option<Strin
 /// Windows 盘符探测（不存在的盘符跳过）。函数本体全平台定义（调用点
 /// `cfg!(windows)` 运行时分支），仅探测循环 cfg(windows)——非 Windows 编译
 /// 含空函数，路径不可达。
+///
+/// **并发而非串行**：不可达的网络映射盘、读卡器这类设备单次 `metadata` 可阻塞
+/// 秒级，串行累加 26 次会把整个 `/fs/roots` 请求拖到平台侧读超时（对齐 TS 1.6.1
+/// `Promise.allSettled` 并行探测）。`join_all` 在首次 poll 即发出全部 `stat`、
+/// 随后才等待首个完成，故 26 次探测真实并发（`metadata` 走 spawn_blocking，
+/// 26 个并发远小于默认 512 阻塞线程上限）。
 async fn probe_drive_roots() -> Vec<FsRootEntry> {
     #[cfg(windows)]
     {
-        let mut roots = Vec::new();
-        for drive in drive_candidates() {
-            if tokio::fs::metadata(&drive).await.is_ok() {
-                roots.push(FsRootEntry {
-                    name: drive.clone(),
-                    path: drive,
-                    is_dir: true,
-                });
-            }
-        }
+        use std::time::Instant;
+
+        let started_at = Instant::now();
+        let probes = futures_util::future::join_all(drive_candidates().into_iter().map(
+            |drive| async move {
+                let probe_start = Instant::now();
+                // stat 失败（盘符不存在）不 reject：直接标为不可达，
+                // 由 collect_drive_probes 跳过，等价 TS 侧 allSettled 吞掉 reject
+                let reachable = tokio::fs::metadata(&drive).await.is_ok();
+                (drive, reachable, probe_start.elapsed())
+            },
+        ))
+        .await;
+        let (roots, drive_timings) = collect_drive_probes(probes);
+        // 定位慢盘用：总耗时 + 每个存在盘符的探测耗时（不存在的盘符不记，避免噪声）
+        tracing::info!(
+            op = "fs_roots_probe",
+            elapsed_ms = started_at.elapsed().as_millis(),
+            drives = ?drive_timings,
+            "fs roots probed"
+        );
         roots
     }
     #[cfg(not(windows))]
     Vec::new()
+}
+
+/// 回收并发探测结果：盘序保持候选序 `A:/`→`Z:/`（`join_all` 保序回收，与
+/// 串行实现输出完全一致），不可达盘符跳过，耗时只记存在盘符（纯函数，
+/// 跨平台可测——真正的并发发起在 `probe_drive_roots` 的 cfg(windows) 分支）。
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "仅 Windows 盘符探测使用; 单测跨平台验证其回收逻辑"
+    )
+)]
+fn collect_drive_probes(probes: Vec<(String, bool, Duration)>) -> (Vec<FsRootEntry>, Vec<String>) {
+    let mut roots = Vec::new();
+    let mut drive_timings = Vec::new();
+    for (drive, reachable, elapsed) in probes {
+        if !reachable {
+            continue;
+        }
+        drive_timings.push(format!("{drive}{}ms", elapsed.as_millis()));
+        roots.push(FsRootEntry {
+            name: drive.clone(),
+            path: drive,
+            is_dir: true,
+        });
+    }
+    (roots, drive_timings)
 }
 
 /// 绝对路径入参校验（浏览/新建/重命名共用）：非空、无 NUL、宿主语义绝对路径。
@@ -369,6 +414,32 @@ mod tests {
         assert_eq!(drives.len(), 26);
         assert_eq!(drives.first().map(String::as_str), Some("A:/"));
         assert_eq!(drives.last().map(String::as_str), Some("Z:/"));
+    }
+
+    #[test]
+    fn drive_probes_keep_candidate_order_and_skip_unreachable() {
+        // join_all 保序回收：乱序/跳过的探测结果仍按 A→Z 输出，与串行实现一致
+        let probes = vec![
+            ("A:/".to_string(), false, Duration::from_millis(9)),
+            ("C:/".to_string(), true, Duration::from_millis(3)),
+            ("D:/".to_string(), true, Duration::from_millis(12)),
+            ("Z:/".to_string(), false, Duration::from_millis(7)),
+        ];
+        let (roots, timings) = collect_drive_probes(probes);
+        let paths: Vec<&str> = roots.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, vec!["C:/", "D:/"]);
+        assert!(roots.iter().all(|r| r.is_dir));
+        assert_eq!(roots[0].name.as_str(), "C:/");
+        // 耗时只记存在盘符，格式 `盘符+毫秒ms`
+        assert_eq!(timings, vec!["C:/3ms", "D:/12ms"]);
+    }
+
+    #[test]
+    fn drive_probes_without_reachable_drive_yield_empty_roots() {
+        let probes = vec![("B:/".to_string(), false, Duration::from_millis(1))];
+        let (roots, timings) = collect_drive_probes(probes);
+        assert!(roots.is_empty());
+        assert!(timings.is_empty());
     }
 
     #[tokio::test]
