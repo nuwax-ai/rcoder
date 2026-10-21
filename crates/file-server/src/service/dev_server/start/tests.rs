@@ -571,7 +571,7 @@ mod owner_reuse_tests {
             serde_json::to_string(&registry).unwrap(),
         )
         .unwrap();
-        let discovery = crate::service::dev_server::supervision_tests::WireDiscoveryFile {
+        let discovery = crate::service::dev_server::wire_fixture::WireDiscoveryFile {
             version: 2,
             instance: "serve-supervisor".into(),
             address: "127.0.0.1:1".into(),
@@ -2009,6 +2009,9 @@ mod owner_reuse_tests {
         manifest_handover_registration_case(false, true).await;
     }
 
+    // 三个调用方均为 cfg(unix)：fixture 是 `#!/bin/sh` 脚本 + POSIX 可执行位，
+    // Windows 无可执行位语义，helper 随之门控（否则 helper 本体在 Windows 编译失败）。
+    #[cfg(unix)]
     async fn manifest_handover_registration_case(
         retire_before_handover: bool,
         delayed_cleanup: bool,

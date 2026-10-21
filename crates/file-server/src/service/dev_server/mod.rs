@@ -39,6 +39,10 @@ pub mod supervise;
 mod supervision_tests;
 mod support;
 mod types;
+// 监督 wire discovery 文件镜像：被 unix 专属的真实进程套件与跨平台的
+// start::tests 共用，故独立于 supervision_tests 的 cfg(all(test, unix))。
+#[cfg(test)]
+mod wire_fixture;
 
 pub use coordinated::DevServerExecutor;
 pub use error_classify::{STDERR_RING_CAP, StderrRing, ViteStartupError};

@@ -16,10 +16,12 @@ use runtime_supervisor::{Binding, Phase, Request, Snapshot};
 
 use super::support::lock;
 use super::types::{DevServerManager, StartedDev};
+use super::wire_fixture::WireDiscoveryFile;
 use crate::Config;
 
 // ── wire 镜像（runtime-supervisor 侧为 pub(crate)，此处按 wire 格式镜像；
-// 字段名/serde 形态与 control.rs 的类型一致，两端测试锁同一格式）──────────
+// 字段名/serde 形态与 control.rs 的类型一致，两端测试锁同一格式；
+// discovery 文件镜像在跨平台模块 `wire_fixture`）────────────────────────
 
 #[derive(serde::Serialize)]
 struct WireEnvelope<'a> {
@@ -27,16 +29,6 @@ struct WireEnvelope<'a> {
     instance: &'a str,
     token: &'a str,
     request: &'a Request,
-}
-
-#[derive(serde::Serialize)]
-pub(super) struct WireDiscoveryFile {
-    pub(super) version: u32,
-    pub(super) instance: String,
-    pub(super) address: String,
-    pub(super) token: String,
-    pub(super) snapshot: Snapshot,
-    pub(super) requests: Vec<(Request, Snapshot)>,
 }
 
 /// fixture 编排器（真实进程）。
