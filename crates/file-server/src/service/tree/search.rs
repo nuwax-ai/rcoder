@@ -23,6 +23,11 @@ use super::{FileEntry, build_file_proxy_url, resolve_subdir};
 /// 并行遍历线程上限: 取 CPU 并行度但封顶, 避免小目录过度开线程的调度开销。
 const MAX_SEARCH_THREADS: usize = 8;
 
+/// Keep the pre-5.0 bounded result queue: at most two batches per worker.
+/// Raising this trades memory for producer throughput without improving the
+/// search endpoint's visit/result budgets.
+const SEARCH_QUEUED_BATCHES_PER_WORKER: usize = 2;
+
 /// 搜索遍历的目录黑名单: 仅纯噪音目录 (VCS 元数据/依赖/解释器缓存)。
 /// 刻意放行产品运行时目录 (.claude/.agents/.codex/.opencode/.local-deploy 等) ——
 /// 其下的技能 (SKILL.md) 与配置文件正是搜索要找的目标; 与浏览列表的隐藏口径
@@ -265,9 +270,10 @@ fn search_blocking(ctx: &BlockingCtx) -> (Vec<FileEntry>, bool, usize) {
         &ctx.search_root,
         threads,
         dua_core::Order::ParentFirst,
-        // dua-core 3.3 新增的平台元数据开关（macOS APFS clone）默认关闭，
-        // 与 3.1 行为一致——search-files 只消费路径与文件类型
-        dua_core::Options::default(),
+        // dua-core 5 makes Options non-exhaustive: use its public builder.
+        // Retain metadata/APFS defaults and the original bounded buffering;
+        // changing metadata collection is outside this compatibility upgrade.
+        dua_core::Options::default().queued_batches_per_worker(SEARCH_QUEUED_BATCHES_PER_WORKER),
         descend,
     );
 
@@ -1110,5 +1116,153 @@ mod tests {
         assert!(contains_ignore_case("数据/报表.csv", "报表"));
         assert!(contains_ignore_case("Ähnlich.txt", "ähnlich")); // Unicode 折叠
         assert!(!contains_ignore_case("数据/x.csv", "报表a"));
+    }
+
+    #[tokio::test]
+    async fn search_files_visit_budget_stops_a_backlogged_parallel_walk() {
+        let root = tempfile::tempdir().unwrap();
+        for directory in 0..32 {
+            let path = root.path().join(format!("batch-{directory}"));
+            std::fs::create_dir(&path).unwrap();
+            for file in 0..16 {
+                std::fs::write(path.join(format!("match-{file}.txt")), "retained").unwrap();
+            }
+        }
+        let config = default_test_config();
+        // Dropping a walker whose bounded output channel is full must still
+        // wake and join its workers; the endpoint's visit cap remains exact.
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            search_files(SearchParams {
+                root: root.path(),
+                config: &config,
+                proxy_path: None,
+                kw: "match",
+                relative_path: None,
+                limit: 100,
+                max_visit: 3,
+                timeout_ms: 5000,
+                kind_filter: Some(SearchKindFilter::File),
+            }),
+        )
+        .await
+        .expect("bounded walker must shut down after early termination")
+        .unwrap();
+        assert_eq!(result.visited, 3);
+        assert!(result.truncated);
+        assert!(result.files.len() <= 3);
+        assert!(
+            result
+                .files
+                .iter()
+                .all(|entry| !Path::new(&entry.name).is_absolute())
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("batch-0/match-0.txt")).unwrap(),
+            b"retained"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_files_does_not_follow_external_cyclic_or_broken_links() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("inside-match.txt"), "inside").unwrap();
+        std::fs::write(outside.path().join("secret-match.txt"), "outside").unwrap();
+        symlink(outside.path(), root.path().join("match-directory-link")).unwrap();
+        symlink(".", root.path().join("match-loop")).unwrap();
+        symlink(
+            outside.path().join("secret-match.txt"),
+            root.path().join("match-file-link"),
+        )
+        .unwrap();
+        symlink("missing-target", root.path().join("match-broken-link")).unwrap();
+        let config = default_test_config();
+        let result = search_files(SearchParams {
+            root: root.path(),
+            config: &config,
+            proxy_path: Some("/proxy"),
+            kw: "match",
+            relative_path: None,
+            limit: 100,
+            max_visit: 100,
+            timeout_ms: 5000,
+            kind_filter: None,
+        })
+        .await
+        .unwrap();
+        assert!(!result.truncated);
+        assert_eq!(result.files.len(), 5);
+        assert!(
+            result.files.iter().all(|entry| !entry.name.contains('/')),
+            "symlinked directory contents must not enter search results"
+        );
+        for name in [
+            "match-directory-link",
+            "match-loop",
+            "match-file-link",
+            "match-broken-link",
+        ] {
+            let link = result
+                .files
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap();
+            assert_eq!(link.is_link, Some(true));
+            assert!(
+                !link.is_dir,
+                "link type is retained without following its target"
+            );
+            assert_eq!(
+                link.file_proxy_url.as_deref(),
+                Some(format!("/proxy/{name}").as_str())
+            );
+        }
+        assert!(
+            !result
+                .files
+                .iter()
+                .any(|entry| entry.name == "secret-match.txt")
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn search_files_verbatim_windows_root_preserves_relative_results() {
+        let root = tempfile::tempdir().unwrap();
+        make_test_tree(root.path()).await;
+        // canonicalize supplies a Win32 verbatim root without changing the
+        // process cwd or requiring symbolic-link privileges.
+        let canonical = root.path().canonicalize().unwrap();
+        let config = default_test_config();
+        let result = search_files(SearchParams {
+            root: &canonical,
+            config: &config,
+            proxy_path: Some("/proxy"),
+            kw: ".txt",
+            relative_path: Some("sub"),
+            limit: 100,
+            max_visit: 1000,
+            timeout_ms: 5000,
+            kind_filter: Some(SearchKindFilter::File),
+        })
+        .await
+        .unwrap();
+        let names: Vec<_> = result
+            .files
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["sub/c.txt", "sub/nested/e.txt"]);
+        assert!(!result.truncated);
+        assert!(
+            result
+                .files
+                .iter()
+                .all(|entry| entry.file_proxy_url.as_deref()
+                    == Some(format!("/proxy/{}", entry.name).as_str()))
+        );
     }
 }

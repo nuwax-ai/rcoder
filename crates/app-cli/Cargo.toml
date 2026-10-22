@@ -49,9 +49,10 @@ notify = "8"
 tokio-stream = "0.1"
 futures = "0.3"
 async-stream = "0.3"
-tokio = { version = "1", features = ["full"] }
+# Match the root's Pingora 0.9 / Tokio zero-capacity compatibility constraint.
+tokio = { version = "=1.53.3", features = ["full"] }
 # server 主循环的编排取消令牌（热部署切换/容器停服级联）
-tokio-util = "0.7"
+tokio-util = "0.7.20"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 axum = "0.8"
@@ -106,7 +107,3 @@ http-body-util = "0.1"
 #（set_var/remove_var 在 edition 2024 为 unsafe）经 lib.rs 的 cfg(test)
 # allow 豁免——仅测试代码、仅 env 变异，不含其他 unsafe 操作。
 rust.unsafe_code = "deny"
-
-# app-cli 是独立解析根，需与主 workspace 指向同一受控上游副本。
-[patch.crates-io]
-utoipa-swagger-ui = { path = "../../vendor/utoipa-swagger-ui" }

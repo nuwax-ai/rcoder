@@ -186,6 +186,9 @@ fn ensure_index_file_with_probe(
         &index_path,
         gix::lock::acquire::Fail::Immediately,
         None,
+        // Match gix-index's own write(): retain the existing 0o666-before-
+        // umask policy, without reading or rewriting permission metadata.
+        0,
     )
     .map_err(|error| map_git_err(error, "git lock initial index"))?;
     if exists(probe(&index_path))? {
@@ -275,6 +278,37 @@ mod tests {
 
         assert!(matches!(error, AppError::Resource(_)));
         assert!(!project_root.join("missing").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_index_keeps_the_upstream_umask_permission_policy() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let directory = tempfile::tempdir().expect("repository directory");
+        let repo = init(directory.path()).expect("unborn repository");
+        let reference = directory.path().join(".git/permission-reference");
+        let reference = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o666)
+            .open(reference)
+            .expect("same-parent permission reference");
+        let expected = reference
+            .metadata()
+            .expect("reference metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        ensure_index_file(&repo).expect("create initial index with upstream lock policy");
+        let actual = std::fs::metadata(repo.index_path())
+            .expect("index metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            actual, expected,
+            "the migration must retain umask instead of imposing a new mode"
+        );
     }
 
     fn fresh_repo_dir(kind: &str) -> PathBuf {

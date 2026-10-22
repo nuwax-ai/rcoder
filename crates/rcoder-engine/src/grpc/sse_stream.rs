@@ -68,8 +68,12 @@ pub async fn create_grpc_sse_stream(
     // 容量 100 不变；hotpath channel! 关闭时原样返回原生通道（零插桩），
     // 开启时包装 Sender/Receiver 端点（send/recv 记排队延迟 delay）。
     // wrapper 重建内部通道，表达式必须内联构造（clone 先于包装的端点会脱管）。
-    let (tx, mut rx): (obs_mpsc::Sender<_>, obs_mpsc::Receiver<_>) =
-        hotpath::channel!(tokio::sync::mpsc::channel(100), label = "sse_client_events");
+    // Expression labels retain profiling without exporting an unsafe
+    // compile-time uniqueness symbol from hotpath's literal-label arm.
+    let (tx, mut rx): (obs_mpsc::Sender<_>, obs_mpsc::Receiver<_>) = hotpath::channel!(
+        tokio::sync::mpsc::channel(100),
+        label = { "sse_client_events" }
+    );
 
     // SSE 在线订阅 gauge（RAII：spawn 的任务被 abort / 任何 return 路径都会 -1）
     struct SubscriptionGuard;

@@ -207,9 +207,11 @@ impl SessionData {
         let channel_start = std::time::Instant::now();
         // 容量 1000（COMMAND_CHANNEL_BUFFER_SIZE）不变；hotpath channel! 关闭时
         // 原样返回原生通道，开启时包装端点记录排队延迟（/channels label）。
+        // Use the supported expression-label arm: literal labels in 0.28.7
+        // export a uniqueness symbol, which conflicts with unsafe_code=deny.
         let (command_tx, command_rx): (obs_mpsc::Sender<_>, obs_mpsc::Receiver<_>) = hotpath::channel!(
             mpsc::channel(COMMAND_CHANNEL_BUFFER_SIZE),
-            label = "session_worker_commands"
+            label = { "session_worker_commands" }
         );
         debug!(
             "[SessionData::new] Channel creation took: {:?}",

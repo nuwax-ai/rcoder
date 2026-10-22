@@ -30,9 +30,11 @@ use super::read::get_status;
 ///
 /// 仅用于 index/tree 名，**不做文件系统访问**——文件系统侧仍用原始路径
 /// （Win32 两种分隔符都接受）。
-fn index_bstr_path(worktree_path: &str) -> BString {
+fn index_bstr_path(worktree_path: &str) -> AppResult<BString> {
     let normalized = crate::path_safety::host_relative_to_wire(worktree_path);
-    into_bstr(std::path::PathBuf::from(normalized)).into_owned()
+    into_bstr(std::path::PathBuf::from(normalized))
+        .map(|path| path.into_owned())
+        .map_err(|error| map_git_err(error, "git encode worktree index path"))
 }
 
 /// stage 单个路径: 文件存在 → 更新/新增 index entry; 不存在 → stage 删除 (对齐 nuwax stageFiles)。
@@ -87,7 +89,7 @@ fn stage_file_with_metadata(
         .workdir()
         .ok_or_else(|| AppError::system("git repo has no workdir"))?;
     let abs = crate::path_safety::ensure_within(workdir, worktree_path)?;
-    let bstr_owned = index_bstr_path(worktree_path);
+    let bstr_owned = index_bstr_path(worktree_path)?;
     let bstr_path: &BStr = bstr_owned.as_ref();
     // NotFound = 文件确已删除 → 从 index 移除（对齐 git add 删档语义）；
     // 其他 IO 错误（EACCES/ESTALE——CephFS 瞬时 stat 失败是现实场景）必须传播：
@@ -105,7 +107,9 @@ fn stage_file_with_metadata(
     if let Some(metadata) = metadata {
         let (blob_id, mode) = if metadata.file_type().is_symlink() {
             let target = std::fs::read_link(&abs)?;
-            let data = into_bstr(target).into_owned();
+            let data = into_bstr(target)
+                .map_err(|error| map_git_err(error, "git encode symlink target"))?
+                .into_owned();
             let id = repo
                 .write_blob(data.as_slice())
                 .map_err(|e| map_git_err(e, "git write symlink blob"))?
@@ -321,7 +325,10 @@ pub fn unstage_files(repo: &Repository, files: &[String]) -> AppResult<()> {
         .index_from_tree(&head_tree)
         .map_err(|e| map_git_err(e, "git index_from_tree (unstage)"))?;
     let head_backing = head_index.path_backing();
-    let paths: Vec<BString> = files.iter().map(|f| index_bstr_path(f)).collect();
+    let paths: Vec<BString> = files
+        .iter()
+        .map(|f| index_bstr_path(f))
+        .collect::<AppResult<_>>()?;
     for p in &paths {
         let bp: &BStr = p.as_ref();
         index.remove_entries(|_, x, _| x == bp);
@@ -705,5 +712,31 @@ mod tests {
             "unborn 仓库上的 init_repo 必须补出初始提交"
         );
         drop(std::fs::remove_dir_all(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_symlink_preserves_non_utf8_target_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let directory = tempfile::tempdir().expect("repository directory");
+        let repo = super::super::ensure_repo(directory.path()).expect("repository");
+        let target = b"target-\xff";
+        std::os::unix::fs::symlink(
+            std::ffi::OsString::from_vec(target.to_vec()),
+            directory.path().join("link"),
+        )
+        .expect("raw-byte symlink target");
+        stage_path(&repo, "link").expect("lossless symlink staging");
+        let index = repo.open_index().expect("index");
+        let entry = index
+            .entry_by_path_and_stage(BStr::new(b"link"), Stage::Unconflicted)
+            .expect("staged link");
+        assert_eq!(entry.mode, IndexMode::SYMLINK);
+        let blob = repo.find_blob(entry.id).expect("target blob");
+        assert_eq!(
+            blob.data.as_slice(),
+            target,
+            "path conversion cannot replace bytes with Unicode replacement characters"
+        );
     }
 }

@@ -26,7 +26,8 @@ use hotpath::wrap::std::sync::Mutex as ObsMutex;
 static SIGNALS: LazyLock<ObsMutex<HashMap<String, watch::Sender<u64>>>> = LazyLock::new(|| {
     hotpath::mutex!(
         Mutex::new(HashMap::new()),
-        label = "userapp_builder_signals"
+        // Keep the safe expression-label API; literal labels export symbols.
+        label = { "userapp_builder_signals" }
     )
 });
 

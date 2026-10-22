@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/*", "tests-e2e"]
-exclude = ["tmp/*", "crates/app-cli", "vendor/utoipa-swagger-ui"]
+exclude = ["tmp/*", "crates/app-cli", "vendor/toasty-driver-postgresql"]
 resolver = "2"
 
 default-members = [
@@ -69,8 +69,11 @@ piper = "0.2"
 clap = { version = "4.6", features = ["derive", "env"] }
 
 # Async runtime
-tokio = { version = "1.53", features = ["full"] }
-tokio-util = { version = "0.7", features = ["compat", "time"] }
+# Pingora 0.9 initializes streams with a zero-capacity reader. Tokio 1.54
+# panics on that constructor; keep the compatible patch until Pingora adapts.
+tokio = { version = "=1.53.3", features = ["full"] }
+# CancellationToken lock/wake and stream EOF fixes are required by task drain.
+tokio-util = { version = "0.7.20", features = ["compat", "time"] }
 tokio-stream = "0.1"
 async-stream = "0.3"
 async-trait = "0.1"
@@ -125,14 +128,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
 # OpenTelemetry
-opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32", features = [
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", features = [
     "grpc-tonic",
     "http-proto",
 ] }
-tracing-opentelemetry = "0.33"
-axum-tracing-opentelemetry = "0.38"
+tracing-opentelemetry = "0.34"
+axum-tracing-opentelemetry = "0.42"
 
 # Prometheus Metrics
 metrics = "0.24"
@@ -170,7 +173,7 @@ rustls = { version = "0.23", features = ["ring"] }
 
 # Additional utilities
 indoc = "2.0"
-parking_lot = "0.12"
+parking_lot = "0.13"
 lockmap = "0.2.3"
 convert_case = "0.12"
 # Persistent data structures for CoW-friendly multi-session tracking (C2/M3 fix)
@@ -208,7 +211,7 @@ hex = "0.4"
 walkdir = "2.5"
 # 并行目录遍历 (work-stealing 线程池), 用于 file-server search-files。
 # 取代手写 BFS: 零 syscall d_type + 多线程并行, dua-cli (gitoxide 作者 Byron 维护) 的核心库。
-dua-core = "4.1"
+dua-core = "5.0"
 # HTTP client。reqwest 0.13 的 default-tls 本就是 rustls(aws-lc-rs + rustls-platform-verifier 读 OS 根证书)，
 # 并无 openssl/native-tls。这里 default-features=false + 显式 rustls 固化“全 workspace 用 rustls”，
 # 防止未来 reqwest 改默认后悄悄回退；charset/http2/system-proxy 补回原默认特性。
@@ -249,7 +252,7 @@ userapp-log-reader = { path = "crates/userapp-log-reader" }
 shlex = "2.0"
 smallvec = "1.16"
 
-toml = "1.1.6"
+toml = "1.1.8"
 which = "8.0"
 
 
@@ -272,10 +275,11 @@ zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 
 utoipa = { version = "6", features = ["axum_extras", "uuid", "chrono"] }
 utoipa-axum = "0.3"
+# 官方 10.0.2 已支持 zip 9，无需本地源码补丁。
 # vendored：swagger-ui 资源随 utoipa-swagger-ui-vendored crate 内嵌（include_bytes），
 # 构建期零 GitHub 依赖——build.rs 默认会用 curl 从 github.com 下载 swagger-ui zip，
 # Docker 构建/离线环境概率性失败；四个 workspace 成员经 workspace = true 统一继承
-utoipa-swagger-ui = { version = "10.0.1", features = ["axum", "vendored"] }
+utoipa-swagger-ui = { version = "10.0.2", features = ["axum", "vendored"] }
 utoipa-scalar = { version = "0.4", features = ["axum"] }
 
 
@@ -314,7 +318,7 @@ mime_guess = "2"
 # 0.87 起 tree-editor feature 名被上游移除（API 本体无条件可用——MSRV 超过 1.75 后
 # 不再需要 gate，见 gitoxide 3a4350cd），声明里不得再带该 feature；
 # 升级同时带走 gix-protocol 0.65.1（其依赖已无 bisync yanked）
-gix = "0.88"
+gix = "0.89"
 
 # i18n (国际化)
 rust-i18n = "4"
@@ -322,6 +326,7 @@ rust-i18n = "4"
 # Control storage ORM and official drivers. Backend features are selected by rcoder-storage.
 toasty = { version = "=0.11", default-features = false }
 toasty-core = "=0.11"
+toasty-driver-postgresql = "=0.11"
 # Toasty 0.11 不再默认开启 Turso features；保留既有 FTS 能力，使用系统分配器。
 toasty-driver-turso = { version = "=0.11", features = ["fts"] }
 
@@ -380,6 +385,6 @@ debug = false
 inherits = "release"
 lto = "thin"
 
-# 使用已核对发布包的窄构建依赖补丁，直到上游正式支持 zip 9。
+# Official PG TLS configuration with an owned, abortable session driver.
 [patch.crates-io]
-utoipa-swagger-ui = { path = "vendor/utoipa-swagger-ui" }
+toasty-driver-postgresql = { path = "vendor/toasty-driver-postgresql" }
