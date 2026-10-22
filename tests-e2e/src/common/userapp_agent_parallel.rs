@@ -7,6 +7,9 @@ use tokio::sync::watch;
 
 use super::{Backend, Env, chat_reported, report::JsonlReporter, scenario::CollectSpec, sse};
 
+mod gate;
+use gate::{GateFile, read_file, wait_for_gate};
+
 struct GateStream<'a> {
     entry: &'a str,
     sid: &'a str,
@@ -69,84 +72,6 @@ async fn collect_signalled(
         &sse::chunks_text(&events),
     );
     events
-}
-
-async fn read_file(
-    env: &Env,
-    entry: &str,
-    app: &str,
-    user: &str,
-    project: &str,
-    file: &str,
-) -> Result<String> {
-    let response = env
-        .http
-        .post(format!("{entry}/api/git/file-content"))
-        .header("X-Service-Type", "userapp")
-        .header("X-App-Id", app)
-        .json(
-            &json!({"workspaceType":"userApp","serviceType":"userapp","appId":app,
-            "userId":user,"cId":project,"projectId":project,"ref":"worktree","filePath":file}),
-        )
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await?;
-    ensure!(
-        response.status().is_success(),
-        "read {file}: HTTP {}",
-        response.status()
-    );
-    let value: Value = response.json().await?;
-    ensure!(
-        value["success"] == true,
-        "read {file}: {}",
-        value["message"]
-    );
-    value["content"]
-        .as_str()
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow!("missing content for {file}"))
-}
-
-struct GateFile<'a> {
-    entry: &'a str,
-    app: &'a str,
-    user: &'a str,
-    project: &'a str,
-    file: &'a str,
-}
-
-async fn wait_for_gate(
-    env: &Env,
-    file: GateFile<'_>,
-    receiver: &mut watch::Receiver<bool>,
-) -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(90), async {
-        loop {
-            if read_file(
-                env,
-                file.entry,
-                file.app,
-                file.user,
-                file.project,
-                file.file,
-            )
-            .await?
-                == "started"
-                && *receiver.borrow()
-            {
-                return Ok::<_, anyhow::Error>(());
-            }
-            ensure!(
-                receiver.has_changed().is_ok(),
-                "agent stream ended before executing {}",
-                file.file
-            );
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-    })
-    .await??;
-    Ok(())
 }
 
 async fn post(env: &Env, entry: &str, path: &str, body: Value) -> Result<Value> {
@@ -257,6 +182,7 @@ pub async fn verify(
     let orchestrate = async {
         wait_for_gate(
             env,
+            report,
             GateFile {
                 entry: entry_b,
                 app,
@@ -303,6 +229,7 @@ pub async fn verify(
         let cancel_b = async {
             wait_for_gate(
                 env,
+                report,
                 GateFile {
                     entry: entry_a,
                     app,
@@ -453,6 +380,7 @@ pub async fn verify(
         let stop_control = async {
             wait_for_gate(
                 env,
+                report,
                 GateFile {
                     entry: entry_a,
                     app,
