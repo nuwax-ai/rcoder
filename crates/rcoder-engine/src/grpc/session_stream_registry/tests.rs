@@ -174,6 +174,10 @@ async fn terminal_error_event_payload_is_valid_json() {
         "original connect failure",
         "grpc_connect",
         None,
+        FailureWindow {
+            started_at: None,
+            failed_at: chrono::Utc::now(),
+        },
     )
     .await;
     assert_eq!(ev.message_type, "SessionPromptEnd");
@@ -193,10 +197,14 @@ fn sse_error_retains_original_transport_cause() {
     let event = make_stream_error_event(Code::Unavailable, "subscription_original_failure");
     let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
     assert!(
-        payload["message"]
+        payload["error_detail"]["detail"]
             .as_str()
             .unwrap()
             .contains("subscription_original_failure")
+    );
+    assert_eq!(
+        payload["message"],
+        shared_types::get_error_message(shared_types::ERR_AGENT_CONTAINER_UNAVAILABLE, "en-US")
     );
     assert_eq!(payload["error_detail"]["retryable"], false);
 }
@@ -254,4 +262,21 @@ async fn delayed_retirement_closes_only_captured_connections_with_reused_sid_and
         .drain(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
         .await
         .unwrap();
+}
+
+#[test]
+fn synchronous_transport_fallback_is_friendly_without_losing_h2_cause() {
+    let event = make_stream_error_event(tonic::Code::Internal, "h2 stream reset");
+    let p: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+    assert_eq!(
+        p["message"],
+        shared_types::get_error_message(shared_types::ERR_AGENT_CONTAINER_UNAVAILABLE, "en-US")
+    );
+    assert_eq!(p["code"], "GRPC_INTERNAL");
+    assert!(
+        p["error_detail"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("h2 stream reset")
+    );
 }

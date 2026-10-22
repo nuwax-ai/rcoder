@@ -501,3 +501,27 @@ async fn other_agent_families_keep_the_existing_cached_find_path() {
     assert_eq!(observed.container_ip, "192.0.2.10");
     assert!(f.requests.lock().unwrap().is_empty());
 }
+
+#[test]
+fn docker_diagnostic_evidence_uses_actual_cid_and_library_time() {
+    let mut inspect: bollard::models::ContainerInspectResponse = serde_json::from_value(json!({
+        "Id":"actual-cid", "State":{"Running":false,"FinishedAt":"2026-10-22T14:00:00.123456789Z"}
+    }))
+    .unwrap();
+    let e = docker_diagnostic_evidence(&inspect).unwrap();
+    assert_eq!(e.physical_id, "actual-cid");
+    assert!(e.current_termination);
+    assert_eq!(
+        e.termination_finished_at.unwrap().timestamp_subsec_nanos(),
+        123456789
+    );
+    inspect.state.as_mut().unwrap().finished_at = Some("not-a-time".into());
+    assert!(
+        docker_diagnostic_evidence(&inspect)
+            .unwrap()
+            .termination_finished_at
+            .is_none()
+    );
+    inspect.id = None;
+    assert!(docker_diagnostic_evidence(&inspect).is_none());
+}

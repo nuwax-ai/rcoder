@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 
 use super::session_stream_registry::{
-    MAX_RETRIES, is_stream_closing, is_turn_terminal, make_cursor_reset_event,
+    FailureWindow, MAX_RETRIES, is_stream_closing, is_turn_terminal, make_cursor_reset_event,
     make_prompt_end_event, make_stream_error_event, make_terminal_error_event,
     maybe_update_activity,
 };
@@ -26,6 +26,7 @@ struct CapturedFailure {
     cause: String,
     stage: &'static str,
     request_id: Option<String>,
+    window: FailureWindow,
 }
 
 /// 创建基于 gRPC 的 SSE 代理流
@@ -89,6 +90,7 @@ pub async fn create_grpc_sse_stream(
         }
     }
 
+    let admitted_at = Utc::now();
     // Register before spawning, so shutdown also owns a task not yet polled.
     if let Some(task_guard) = registry.admit_stream(&grpc_addr, &session_id) {
         let cancel = task_guard.token();
@@ -126,6 +128,7 @@ pub async fn create_grpc_sse_stream(
                 // This identity belongs to the event observed on this stream;
                 // cancellation ends it, and no unrelated latest chat is queried.
                 let mut active_request_id = None;
+                let mut active_window_start = Some(admitted_at);
                 let mut captured_failure: Option<CapturedFailure> = None;
                 for attempt in 1..=MAX_RETRIES {
                     let mut client = match cancellable_read!(pool.get_client(&grpc_addr)) {
@@ -136,12 +139,13 @@ pub async fn create_grpc_sse_stream(
                             let captured = captured_failure.get_or_insert_with(|| CapturedFailure {
                                 code: tonic::Code::Unavailable, cause, stage: "grpc_connect",
                                 request_id: active_request_id.clone(),
+                                window: FailureWindow { started_at: active_window_start, failed_at: Utc::now() },
                             });
                             cancellable_read!(pool.remove(&grpc_addr));
                             if attempt < MAX_RETRIES { continue; }
                             let event = cancellable_read!(make_terminal_error_event(
                                 diag_ctx.as_ref(), locale, captured.code, &captured.cause,
-                                captured.stage, captured.request_id.clone(),
+                                captured.stage, captured.request_id.clone(), captured.window,
                             ));
                             let _ = forward_to_client(&tx, &event, &session_id, &mut client_last_seq).await;
                             registry.release_first_client_claim(&session_id);
@@ -161,6 +165,7 @@ pub async fn create_grpc_sse_stream(
                             let captured = captured_failure.get_or_insert_with(|| CapturedFailure {
                                 code: error.code(), cause, stage: "grpc_subscribe",
                                 request_id: active_request_id.clone(),
+                                window: FailureWindow { started_at: active_window_start, failed_at: Utc::now() },
                             });
                             if attempt < MAX_RETRIES {
                                 cancellable_read!(pool.remove(&grpc_addr));
@@ -168,7 +173,7 @@ pub async fn create_grpc_sse_stream(
                             }
                             let event = cancellable_read!(make_terminal_error_event(
                                 diag_ctx.as_ref(), locale, captured.code, &captured.cause,
-                                captured.stage, captured.request_id.clone(),
+                                captured.stage, captured.request_id.clone(), captured.window,
                             ));
                             let _ = forward_to_client(&tx, &event, &session_id, &mut client_last_seq).await;
                             registry.release_first_client_claim(&session_id);
@@ -181,7 +186,18 @@ pub async fn create_grpc_sse_stream(
                         match cancellable_read!(stream.message()) {
                             Ok(Some(event)) => {
                                 maybe_update_activity(&activity_updater, &session_id, &activity_secs);
-                                if let Some(request_id) = &event.request_id {
+                                if event.message_type == "SessionPromptStart" {
+                                    active_request_id = event.request_id.clone();
+                                    // Replay may start before this SSE subscription. Keep the
+                                    // original event time, not the replay arrival time.
+                                    active_window_start = (event.timestamp > 0)
+                                        .then(|| DateTime::<Utc>::from_timestamp_millis(event.timestamp))
+                                        .flatten()
+                                        .filter(|started| *started <= Utc::now());
+                                } else if let Some(request_id) = &event.request_id {
+                                    if active_request_id.as_ref() != Some(request_id) {
+                                        active_window_start = None;
+                                    }
                                     active_request_id = Some(request_id.clone());
                                 }
                                 if event.seq != 0 && event.seq <= client_last_seq {
@@ -192,6 +208,7 @@ pub async fn create_grpc_sse_stream(
                                 let keep_open = forward_to_client(&tx, &event, &session_id, &mut client_last_seq).await;
                                 if event.message_type == "SessionPromptEnd" && event.sub_type == "cancelled" {
                                     active_request_id = None;
+                                    active_window_start = None;
                                 }
                                 if !keep_open {
                                     if is_turn_terminal(&event.message_type, &event.sub_type) {
@@ -213,6 +230,7 @@ pub async fn create_grpc_sse_stream(
                                 let captured = captured_failure.get_or_insert_with(|| CapturedFailure {
                                     code: error.code(), cause, stage: "grpc_stream",
                                     request_id: active_request_id.clone(),
+                                    window: FailureWindow { started_at: active_window_start, failed_at: Utc::now() },
                                 });
                                 if attempt < MAX_RETRIES {
                                     cancellable_read!(pool.remove(&grpc_addr));
@@ -221,7 +239,7 @@ pub async fn create_grpc_sse_stream(
                                 }
                                 let event = cancellable_read!(make_terminal_error_event(
                                     diag_ctx.as_ref(), locale, captured.code, &captured.cause,
-                                    captured.stage, captured.request_id.clone(),
+                                    captured.stage, captured.request_id.clone(), captured.window,
                                 ));
                                 let _ = forward_to_client(&tx, &event, &session_id, &mut client_last_seq).await;
                                 registry.release_first_client_claim(&session_id);

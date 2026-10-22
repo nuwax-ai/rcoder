@@ -21,7 +21,7 @@ use super::create_session_error;
 pub(super) async fn validate_and_get_session_context(
     state: Arc<crate::router::AppState>,
     session_id: &str,
-) -> Result<(String, String, String), AppError> {
+) -> Result<(String, String, String, Option<String>), AppError> {
     if let Some(target) =
         super::super::userapp_agent_target::resolve_userapp_session_target(&state, session_id)
             .await?
@@ -40,6 +40,7 @@ pub(super) async fn validate_and_get_session_context(
             target.binding.project_id,
             container.container_name,
             container.container_ip,
+            (!container.container_id.is_empty()).then_some(container.container_id),
         ));
     }
     // ========== 阶段 1: 获取项目信息（所有分支都需要） ==========
@@ -91,7 +92,11 @@ pub(super) async fn validate_and_get_session_context(
         "[SSE_PROXY] All validations passed: session_id={}, project_id={}, container_name={}, container_ip={}",
         session_id, project_id, container_name, container_ip
     );
-    Ok((project_id, container_name, container_ip))
+    let origin = project_info
+        .container_info()
+        .map(|c| c.container_id.clone())
+        .filter(|id| !id.is_empty());
+    Ok((project_id, container_name, container_ip, origin))
 }
 
 /// 阶段 1：按 session_id 查找项目信息

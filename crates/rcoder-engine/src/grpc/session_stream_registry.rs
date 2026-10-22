@@ -386,9 +386,14 @@ pub(crate) fn make_stream_error_event_with_identity(
     let error_code = map_tonic_code(code);
     let detail = shared_types::ErrorDetail::new(error_code, stage, message).localized(locale);
     let base = shared_types::get_error_message(shared_types::ERR_GRPC_ERROR, locale);
+    let presentation = if transport_failure(code) {
+        shared_types::get_error_message(shared_types::ERR_AGENT_CONTAINER_UNAVAILABLE, locale)
+    } else {
+        format!("{base}: {}", detail.detail)
+    };
     let payload = serde_json::json!({
         "code": error_code,
-        "message": shared_types::sanitize_error_text(&format!("{base}: {}", detail.detail)),
+        "message": shared_types::sanitize_error_text(&presentation),
         "error_detail": detail,
     })
     .to_string();
@@ -402,8 +407,46 @@ pub(crate) fn make_stream_error_event_with_identity(
     }
 }
 
-/// Supplemental diagnosis never replaces the original transport failure. It is
-/// read only, bounded, and cancellation at the caller can interrupt it.
+/// Captured from the original request/stream, never from a later latest chat.
+#[derive(Clone, Copy)]
+pub(crate) struct FailureWindow {
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub failed_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn transport_failure(code: Code) -> bool {
+    matches!(
+        code,
+        Code::Unavailable | Code::Internal | Code::Unknown | Code::DeadlineExceeded
+    )
+}
+
+fn attributed_oom(
+    ctx: &crate::utils::DiagCtx,
+    observed: &container_runtime_api::AgentPodDiagnostic,
+    window: FailureWindow,
+    observed_at: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let (Some(expected), Some(evidence), Some(started)) = (
+        ctx.expected_container_id.as_deref(),
+        observed.evidence.as_ref(),
+        window.started_at,
+    ) else {
+        return false;
+    };
+    !expected.trim().is_empty()
+        && expected == evidence.physical_id
+        && observed.is_oom()
+        && evidence.termination_finished_at.is_some_and(|finished| {
+            started <= window.failed_at
+                && started <= finished
+                && finished <= observed_at
+                && window.failed_at <= observed_at
+        })
+}
+
+/// Present a friendly transport error while retaining its original structured
+/// cause. Only same-instance, in-window OOM evidence may explain the main message.
 pub(crate) async fn make_terminal_error_event(
     diag: Option<&Arc<crate::utils::DiagCtx>>,
     locale: &str,
@@ -411,8 +454,12 @@ pub(crate) async fn make_terminal_error_event(
     message: &str,
     stage: &str,
     request_id: Option<String>,
+    window: FailureWindow,
 ) -> ProgressEvent {
     let mut event = make_stream_error_event_with_identity(code, message, locale, stage, request_id);
+    if !transport_failure(code) {
+        return event;
+    }
     if let Some(ctx) = diag {
         let observation = tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -424,11 +471,14 @@ pub(crate) async fn make_terminal_error_event(
             && (observed.has_root_cause() || observed.is_starting_up())
         {
             let observed_reason = crate::utils::root_cause_message(&observed, locale);
-            // The original code/message and request identity remain unchanged.
-            // Observations describe current container state, not the failed job.
+            // Preserve the code, cause/stage and original request identity.
+            // Logical-name or historical observations are not the failed task.
             if let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&event.payload) {
                 payload["observed_container_state"] =
                     serde_json::Value::String(shared_types::sanitize_error_text(&observed_reason));
+                if attributed_oom(ctx, &observed, window, chrono::Utc::now()) {
+                    payload["message"] = shared_types::sanitize_error_text(&observed_reason).into();
+                }
                 event.payload = payload.to_string();
             }
         }

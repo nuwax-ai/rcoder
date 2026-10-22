@@ -207,33 +207,36 @@ pub async fn agent_session_notification(
         state,
         &params,
         &headers,
-        Box::new(|state, project_id| match state.get_project(project_id) {
-            Some(project) => {
-                let service_type = project
-                    .service_type()
-                    .unwrap_or(shared_types::ServiceType::WebAgentRunner);
-                let identifier = match &service_type {
-                    shared_types::ServiceType::ComputerAgentRunner => {
-                        project.user_id().map(|u| u.to_string())
+        Box::new(
+            |state, project_id, origin| match state.get_project(project_id) {
+                Some(project) => {
+                    let service_type = project
+                        .service_type()
+                        .unwrap_or(shared_types::ServiceType::WebAgentRunner);
+                    let identifier = match &service_type {
+                        shared_types::ServiceType::ComputerAgentRunner => {
+                            project.user_id().map(|u| u.to_string())
+                        }
+                        _ => Some(project_id.to_string()),
+                    };
+                    SseRouteContext {
+                        service_type,
+                        diag_ctx: identifier.map(|identifier| {
+                            Arc::new(crate::handler::utils::DiagCtx {
+                                expected_container_id: origin,
+                                runtime: state.runtime().clone(),
+                                identifier,
+                                service_type,
+                            })
+                        }),
                     }
-                    _ => Some(project_id.to_string()),
-                };
-                SseRouteContext {
-                    service_type,
-                    diag_ctx: identifier.map(|identifier| {
-                        Arc::new(crate::handler::utils::DiagCtx {
-                            runtime: state.runtime().clone(),
-                            identifier,
-                            service_type,
-                        })
-                    }),
                 }
-            }
-            None => SseRouteContext {
-                service_type: shared_types::ServiceType::WebAgentRunner,
-                diag_ctx: None,
+                None => SseRouteContext {
+                    service_type: shared_types::ServiceType::WebAgentRunner,
+                    diag_ctx: None,
+                },
             },
-        }),
+        ),
     )
     .await
 }
@@ -340,33 +343,36 @@ pub async fn computer_agent_progress_notification(
         state,
         &params,
         &headers,
-        Box::new(|state, project_id| match state.get_project(project_id) {
-            Some(project) => {
-                let service_type = project
-                    .service_type()
-                    .unwrap_or(shared_types::ServiceType::ComputerAgentRunner);
-                let identifier = match &service_type {
-                    shared_types::ServiceType::ComputerAgentRunner => {
-                        project.user_id().map(|u| u.to_string())
+        Box::new(
+            |state, project_id, origin| match state.get_project(project_id) {
+                Some(project) => {
+                    let service_type = project
+                        .service_type()
+                        .unwrap_or(shared_types::ServiceType::ComputerAgentRunner);
+                    let identifier = match &service_type {
+                        shared_types::ServiceType::ComputerAgentRunner => {
+                            project.user_id().map(|u| u.to_string())
+                        }
+                        _ => Some(project_id.to_string()),
+                    };
+                    SseRouteContext {
+                        service_type,
+                        diag_ctx: identifier.map(|identifier| {
+                            Arc::new(crate::handler::utils::DiagCtx {
+                                expected_container_id: origin,
+                                runtime: state.runtime().clone(),
+                                identifier,
+                                service_type,
+                            })
+                        }),
                     }
-                    _ => Some(project_id.to_string()),
-                };
-                SseRouteContext {
-                    service_type,
-                    diag_ctx: identifier.map(|identifier| {
-                        Arc::new(crate::handler::utils::DiagCtx {
-                            runtime: state.runtime().clone(),
-                            identifier,
-                            service_type,
-                        })
-                    }),
                 }
-            }
-            None => SseRouteContext {
-                service_type: shared_types::ServiceType::ComputerAgentRunner,
-                diag_ctx: None,
+                None => SseRouteContext {
+                    service_type: shared_types::ServiceType::ComputerAgentRunner,
+                    diag_ctx: None,
+                },
             },
-        }),
+        ),
     )
     .await
 }
@@ -381,7 +387,8 @@ struct SseRouteContext {
 }
 
 /// 路由定制闭包类型（validate 后以 project_id 调用，产出流标签与诊断标识）。
-type RouteCtxFn = Box<dyn FnOnce(&Arc<crate::router::AppState>, &str) -> SseRouteContext + Send>;
+type RouteCtxFn =
+    Box<dyn FnOnce(&Arc<crate::router::AppState>, &str, Option<String>) -> SseRouteContext + Send>;
 
 async fn sse_notification_impl(
     state: Arc<crate::router::AppState>,
@@ -392,7 +399,7 @@ async fn sse_notification_impl(
     let locale = shared_types::current_request_locale();
     let session_id = &params.session_id;
 
-    let (project_id, container_name, container_ip) =
+    let (project_id, container_name, container_ip, origin) =
         validate_and_get_session_context(state.clone(), session_id).await?;
 
     // 活跃时间更新闭包（捕获 state 引用）；SSE 流收到非心跳事件时节流调用。
@@ -420,12 +427,13 @@ async fn sse_notification_impl(
         Some((binding, _)) => SseRouteContext {
             service_type: shared_types::ServiceType::UserappBuilder,
             diag_ctx: Some(Arc::new(crate::handler::utils::DiagCtx {
+                expected_container_id: origin,
                 runtime: state.runtime().clone(),
                 identifier: binding.app_id,
                 service_type: shared_types::ServiceType::UserappBuilder,
             })),
         },
-        None => route_ctx(&state, &project_id),
+        None => route_ctx(&state, &project_id, origin),
     };
     let stream_params = SseStreamParams {
         container_name,

@@ -281,6 +281,15 @@ pub struct ExecResult {
     pub exit_code: i64,
 }
 
+/// Non-persisted evidence for attributing a diagnostic to one observed stream.
+/// A logical name alone cannot identify a replaced Pod or Docker container.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentPodDiagnosticEvidence {
+    pub physical_id: String,
+    pub termination_finished_at: Option<DateTime<Utc>>,
+    pub current_termination: bool,
+}
+
 /// agent pod 容器诊断结果(用于 gRPC 连接失败时定位真实根因:OOM/CrashLoop/缺失等)。
 ///
 /// `transport error` 往往只是"连不上"的表象,真实根因可能是容器被 OOMKilled、
@@ -288,6 +297,8 @@ pub struct ExecResult {
 /// 据此决定错误信息(根因为主,transport 原文降级为日志/附注)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentPodDiagnostic {
+    /// Missing evidence only limits error attribution; never compute admission.
+    pub evidence: Option<AgentPodDiagnosticEvidence>,
     /// pod/容器是否存在(不存在本身就是一种根因)
     pub exists: bool,
     /// 容器是否 ready(ready=false 可能是启动中或异常)
@@ -339,6 +350,8 @@ impl AgentPodDiagnostic {
 /// lib + bin 编译时"同一类型出现两个 crate 实例"导致的类型分裂 —— 放这里 lib/bin 引用的是
 /// **同一个** `DiagCtx`。`Option<Arc<DiagCtx>>` 语义:Some 才诊断,O None 回退通用文案。
 pub struct DiagCtx {
+    /// Physical origin resolved for this SSE, not a later logical-name lookup.
+    pub expected_container_id: Option<String>,
     /// 容器运行时抽象(Docker / K8s),来自 AppState.runtime()
     pub runtime: Arc<dyn ContainerRuntime>,
     /// 容器逻辑标识:ComputerAgentRunner=user_id,WebAgentRunner=project_id
@@ -355,6 +368,7 @@ pub struct DiagCtx {
 impl Default for AgentPodDiagnostic {
     fn default() -> Self {
         Self {
+            evidence: None,
             exists: true,
             ready: true,
             restart_count: 0,
@@ -460,6 +474,7 @@ mod agent_pod_diagnostic_tests {
     /// "存在且 ready、无任何根因" 的基准诊断
     fn healthy() -> AgentPodDiagnostic {
         AgentPodDiagnostic {
+            evidence: None,
             exists: true,
             ready: true,
             restart_count: 0,

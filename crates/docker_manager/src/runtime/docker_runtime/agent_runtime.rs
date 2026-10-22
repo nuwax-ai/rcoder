@@ -914,6 +914,7 @@ impl AgentContainerRuntime for DockerRuntime {
         let status_str = state.and_then(|s| s.status.as_ref().map(|st| format!("{st:?}")));
 
         Ok(container_runtime_api::AgentPodDiagnostic {
+            evidence: docker_diagnostic_evidence(&inspect),
             exists: true,
             ready: running,
             restart_count,
@@ -1042,6 +1043,21 @@ impl AgentContainerRuntime for DockerRuntime {
         })?;
         Ok(())
     }
+}
+
+fn docker_diagnostic_evidence(
+    inspect: &bollard::models::ContainerInspectResponse,
+) -> Option<container_runtime_api::AgentPodDiagnosticEvidence> {
+    let physical_id = inspect.id.clone().filter(|id| !id.trim().is_empty())?;
+    let state = inspect.state.as_ref();
+    Some(container_runtime_api::AgentPodDiagnosticEvidence {
+        physical_id,
+        termination_finished_at: state
+            .and_then(|s| s.finished_at.as_deref())
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&chrono::Utc)),
+        current_termination: !state.and_then(|s| s.running).unwrap_or(false),
+    })
 }
 
 #[cfg(test)]
