@@ -123,6 +123,8 @@ class Config:
                 raise ValueError(key + ' must be positive')
         if self.get('REGISTRY_AUTH', 'none') not in ['none', 'docker']:
             raise ValueError('REGISTRY_AUTH must be none or docker')
+        if self.get('PROFILE', 'full') not in ['full', 'orphan']:
+            raise ValueError('PROFILE must be full or orphan')
         if not re.fullmatch(r'https?://[a-zA-Z0-9.:-]+', self.get('APT_MIRROR', 'http://deb.debian.org')):
             raise ValueError('APT_MIRROR must be an HTTP(S) base URL')
         if not re.fullmatch(r'[a-z0-9][a-z0-9_.-]*', self.get('IMAGE_PREFIX', self.ns + '-')):

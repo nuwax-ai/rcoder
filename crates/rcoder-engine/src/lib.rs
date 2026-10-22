@@ -23,6 +23,7 @@ pub mod file_server_admin;
 pub mod file_server_embed;
 pub mod grpc;
 pub mod http_client;
+pub mod orphan_reconciliation;
 pub mod preview_assembly;
 pub mod proxy_init;
 pub mod service;

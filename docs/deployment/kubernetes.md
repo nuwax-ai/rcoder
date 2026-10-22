@@ -42,17 +42,34 @@ make remote-k8s-logs
 
 ### 套件与证据
 
+需要生产工作区根的 Linux 精确回归可单独执行 `validation` 构建目标。它从同一冻结源码运行正式 HTTP Restart 用例，`/app` 使用临时内存挂载，复用该专用 builder 的 SDK/Cargo 缓存；成功必须实际执行且恰好通过一个测试。Mac 未执行该 Linux 用例不能记为通过。此目标不发布镜像，也不是普通三个角色镜像的构建依赖。
+
+```bash
+# 在获准的远端构建主机执行；变量来自本轮冻结源码与 builder 回执。
+docker buildx build --builder "$OWNED_BUILDER" --platform linux/amd64 \
+  --file "$FROZEN_SOURCE/docker/remote-k8s/Dockerfile" \
+  --target validation --output type=cacheonly --progress plain \
+  --build-arg "RUST_IMAGE=$RUST_IMAGE_DIGEST" --build-arg CARGO_JOBS=2 \
+  --build-arg "RCODER_BASE=$RCODER_BASE_DIGEST" \
+  --build-arg "COMPUTER_BASE=$COMPUTER_BASE_DIGEST" \
+  --build-arg "RUNTIME_BASE=$RUNTIME_BASE_DIGEST" \
+  "$FROZEN_SOURCE"
+```
+
 | 套件 | 验证范围 |
 |---|---|
 | `smoke` | 当前部署身份、双副本就绪、PVC Bound 和直连健康接口 |
 | `userapp` | UserApp 工作区、构建与部署；检查完整场景报告 |
 | `chat` | 真实 AI、会话与续传；缺模型配置不能视为通过 |
 | `gateway` | Gateway/HTTPRoute 条件与实际 HTTP 路径 |
+| `orphan` | 独立 `PROFILE=orphan`：双 Main + PG 下，验证 Service-only/停止的空控制器自动回收、运行或 Pending 实例及 canonical/lifecycle 引用保护、动态 CephFS/RBD PVC 与数据保留；不调用模型 |
 | `all` | 组合验证；完整范围以启动器场景目录为准 |
 
 直连与 Gateway 是不同路径。实际地址从本地部署回执的 `url`、`gateway_url` 读取，IP + NodePort 可作为直连入口。Gateway 不可用时可以运行不依赖它的直连场景，但不能替换路径后宣称 Gateway 通过。smoke 不证明完整生命周期、跨副本业务或动态应用路由正确。
 
 源码摘要、镜像 digest、namespace、部署与测试回执写入本地 `.remote-k8s/`；E2E 明细写入 `tests-e2e/reports/`，均不提交。实际问题与每轮结果另记入本地工作文档，不将历史报告当作当前通过。严格验收规则见 [E2E 说明](../../tests-e2e/tools/README.md)。
+
+`orphan` 是独立完整套件，不是 `chat` 的筛选项，也不纳入默认 `all`。在获准的专用 `rcoder-e2e-*` namespace，将本地环境配置设为 `REMOTE_K8S_PROFILE=orphan` 后执行 `make remote-k8s-verify SUITE=orphan`；同一部署追加可用 `make remote-k8s-test SUITE=orphan`。该 fixture 不挂载 CephFS 根，只创建自身动态 PVC；保留基础及本轮数据卷。为构造真实 replicas=1/no-Pod 窗口，套件会短暂限制该专用 namespace 的 Pod 数，不影响已有双 Main/PG。部分畸形登记通过本 fixture 的 PostgreSQL 定向注入，模拟不能 hydrate 的历史数据；不修改共享数据库。报告逐项记录 required assertions、未执行项、原失败、精确 UID 清理及保留卷，工具组件测试不代表该真实集群套件通过。
 
 ### 诊断与资源保护
 

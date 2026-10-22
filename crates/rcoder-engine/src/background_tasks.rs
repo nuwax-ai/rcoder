@@ -11,6 +11,7 @@ type SingleInstanceTaskHandles = (
     tokio::task::JoinHandle<()>,
     tokio::task::JoinHandle<()>,
     TaskHandle,
+    TaskHandle,
 );
 
 #[cfg(test)]
@@ -33,12 +34,15 @@ use crate::service::{
 use crate::userapp_recycle;
 
 pub struct BackgroundTaskHandles {
-    /// 以下四个单实例语义句柄：memory 模式为本层直接拉起的任务；
+    /// 以下五个单实例语义句柄：memory 模式为本层直接拉起的任务；
     /// PG 模式恒为 None，实际句柄由 leader 监督任务按 leadership 代际持有（见 pg_leader_handle）。
     pub cleanup_handle: TaskHandle,
     pub status_checker_handle: TaskHandle,
     pub container_sync_handle: TaskHandle,
     pub userapp_recycle_handle: TaskHandle,
+    /// Reverse inventory and empty-resource reconciliation, owned by the same
+    /// leader generation as the other single-instance tasks.
+    pub orphan_reconciliation_handle: TaskHandle,
     /// M5：PG 模式的 activity 影子 flusher + publish TTL 清理（合并单 task）
     pub pg_shadow_handle: Option<tokio::task::JoinHandle<()>>,
     /// P2-M1：跨副本镜像同步任务
@@ -57,6 +61,7 @@ impl BackgroundTaskHandles {
             ("status checker", self.status_checker_handle),
             ("container sync", self.container_sync_handle),
             ("userapp recycle", self.userapp_recycle_handle),
+            ("orphan reconciliation", self.orphan_reconciliation_handle),
             ("activity flush", self.pg_shadow_handle),
             ("PG sync", self.pg_sync_handle),
         ] {
@@ -145,6 +150,7 @@ async fn spawn_single_instance_tasks(
                         status_checker_handle,
                         container_sync_handle,
                         None,
+                        None,
                     ),
                 )
                 .stop_and_drain()
@@ -156,11 +162,19 @@ async fn spawn_single_instance_tasks(
         info!("[USERAPP_RECYCLE] disabled (userapp_recycle.enabled=false)");
         None
     };
+    let orphan_reconciliation_handle = config.cleanup_config.enabled.then(|| {
+        crate::orphan_reconciliation::start(
+            state.clone(),
+            config.cleanup_config.clone(),
+            shutdown_tx.subscribe(),
+        )
+    });
     Ok((
         cleanup_handle,
         status_checker_handle,
         container_sync_handle,
         userapp_recycle_handle,
+        orphan_reconciliation_handle,
     ))
 }
 
@@ -188,8 +202,10 @@ pub async fn start_all_background_tasks(
         status_checker_handle,
         container_sync_handle,
         userapp_recycle_handle,
+        orphan_reconciliation_handle,
         pg_leader_handle,
     ): (
+        TaskHandle,
         TaskHandle,
         TaskHandle,
         TaskHandle,
@@ -218,16 +234,16 @@ pub async fn start_all_background_tasks(
             });
             // 监督任务异步拉起子任务，直接句柄由 supervisor 持有；
             // 本层对应槽位置 None（不是占位 pending task，避免误导与白占 executor 槽）
-            (None, None, None, None, Some(leader_handle))
+            (None, None, None, None, None, Some(leader_handle))
         }
         #[cfg(not(feature = "rcoder-pg"))]
         {
             unreachable!("is_postgres 为真但未编译 rcoder-pg")
         }
     } else {
-        let (c, s1, s2, u) =
+        let (c, s1, s2, u, o) =
             spawn_single_instance_tasks(config, cleanup_config, &state, &shutdown_tx).await?;
-        (c, Some(s1), Some(s2), u, None)
+        (c, Some(s1), Some(s2), u, o, None)
     };
 
     // VNC 后端解析:pingora handle_vnc_upstream 优先查 ContainerLookupService(动态查项目
@@ -290,6 +306,7 @@ pub async fn start_all_background_tasks(
         status_checker_handle,
         container_sync_handle,
         userapp_recycle_handle,
+        orphan_reconciliation_handle,
         pg_shadow_handle,
         pg_sync_handle,
         pg_leader_handle,

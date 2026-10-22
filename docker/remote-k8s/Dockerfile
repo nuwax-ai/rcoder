@@ -10,6 +10,21 @@ RUN sed -i "s#http://deb.debian.org#${APT_MIRROR}#g" /etc/apt/sources.list.d/deb
 RUN apt-get update && apt-get install -y --no-install-recommends cmake pkg-config protobuf-compiler libprotobuf-dev libclang-dev python3 git libssl-dev && rm -rf /var/lib/apt/lists/*
 ARG CARGO_MIRROR=
 RUN if [ -n "$CARGO_MIRROR" ]; then mkdir -p /usr/local/cargo && printf '[source.crates-io]\nreplace-with = "remote-mirror"\n[source.remote-mirror]\nregistry = "%s"\n' "$CARGO_MIRROR" > /usr/local/cargo/config.toml; fi
+
+# Explicit component validation only; published image targets do not depend on
+# this stage. The production workspace preparation runs in a private tmpfs.
+FROM toolchain AS validation
+WORKDIR /src
+COPY . .
+ARG CARGO_JOBS=2
+ENV CARGO_TARGET_DIR=/cache/target CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true
+RUN --mount=type=cache,id=rcoder-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=rcoder-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=rcoder-cargo-target,target=/cache/target,sharing=locked \
+    --mount=type=tmpfs,target=/app \
+    find /src/crates -name '*.rs' -exec touch {} + && \
+    python3 tools/remote_k8s/linux_validation.py --jobs "${CARGO_JOBS}"
+
 FROM toolchain AS build
 WORKDIR /src
 COPY . .

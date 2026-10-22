@@ -17,6 +17,9 @@ cleanup_config:
   # - true: 启用（默认，自动清理闲置容器）
   # - false: 禁用
   enabled: true
+  # Reverse inventory: observe records candidates; reclaim also removes only
+  # empty unreferenced managed controllers/Services. Live orphan Pods are retained.
+  orphan_reconcile_mode: reclaim
   # 闲置超时时间（秒），超过此时间未活动的容器将被清理
   # 默认值: 600 (10分钟)
   idle_timeout_seconds: 600

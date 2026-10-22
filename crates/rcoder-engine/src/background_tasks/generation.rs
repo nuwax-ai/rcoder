@@ -38,12 +38,13 @@ pub(super) struct Generation {
 impl Generation {
     pub(super) fn new(shutdown: broadcast::Sender<()>, handles: SingleInstanceTaskHandles) -> Self {
         let tasks = FuturesUnordered::new();
-        let (cleanup, status, sync, recycle) = handles;
+        let (cleanup, status, sync, recycle, orphan) = handles;
         for (name, handle) in [
             ("cleanup", cleanup),
             ("status checker", Some(status)),
             ("container sync", Some(sync)),
             ("userapp recycle", recycle),
+            ("orphan reconciliation", orphan),
         ] {
             if let Some(handle) = handle {
                 tasks.push(join_task(name, handle));

@@ -195,5 +195,6 @@ pub use loader::{
     load_config_with_args, parse_api_key_config,
 };
 pub use sections::{
-    CleanupConfigSettings, DeployHostConfig, DockerConfig, ProxyConfig, UserAppRecycleConfig,
+    CleanupConfigSettings, DeployHostConfig, DockerConfig, OrphanReconcileMode, ProxyConfig,
+    UserAppRecycleConfig,
 };

@@ -28,13 +28,16 @@ impl Starts {
     }
 
     fn record(&self, handles: &SingleInstanceTaskHandles) {
-        let (cleanup, status, sync, recycle) = handles;
-        let actual = vec![
+        let (cleanup, status, sync, recycle, orphan) = handles;
+        let mut actual = vec![
             cleanup.as_ref().expect("cleanup enabled").abort_handle(),
             status.abort_handle(),
             sync.abort_handle(),
             recycle.as_ref().expect("recycle enabled").abort_handle(),
         ];
+        if let Some(orphan) = orphan {
+            actual.push(orphan.abort_handle());
+        }
         let mut groups = self.groups.lock().unwrap();
         if let Some(previous) = groups.last() {
             assert!(
@@ -95,7 +98,7 @@ impl Fixture {
 }
 
 #[tokio::test]
-async fn same_app_state_restarts_all_four_real_periodic_tasks() {
+async fn same_app_state_restarts_all_five_real_periodic_tasks() {
     let fixture = Fixture::new().await;
     for _ in 0..2 {
         let (shutdown, _) = tokio::sync::broadcast::channel(1);
@@ -209,7 +212,8 @@ async fn blocked_drain_case(root_shutdown: bool) {
             let entered = observed_entered.clone();
             let release = observed_release.clone();
             async move {
-                let (cleanup, status, sync, recycle) = fixture.spawn(generation_shutdown).await?;
+                let (cleanup, status, sync, recycle, orphan) =
+                    fixture.spawn(generation_shutdown).await?;
                 let sync = if starts.count() == 0 {
                     // Await the real sync task, then retain one explicit drain
                     // barrier. The supervisor must not mistake a signal for join.
@@ -221,7 +225,7 @@ async fn blocked_drain_case(root_shutdown: bool) {
                 } else {
                     sync
                 };
-                let handles = (cleanup, status, sync, recycle);
+                let handles = (cleanup, status, sync, recycle, orphan);
                 starts.record(&handles);
                 Ok(handles)
             }
@@ -331,6 +335,7 @@ async fn background_drain_propagates_leader_shutdown_failure() {
         status_checker_handle: None,
         container_sync_handle: None,
         userapp_recycle_handle: None,
+        orphan_reconciliation_handle: None,
         pg_shadow_handle: None,
         pg_sync_handle: None,
         pg_leader_handle: Some(tokio::spawn(async {
