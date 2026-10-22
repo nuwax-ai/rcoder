@@ -179,7 +179,8 @@ async fn terminal_error_event_payload_is_valid_json() {
             failed_at: chrono::Utc::now(),
         },
     )
-    .await;
+    .await
+    .unwrap();
     assert_eq!(ev.message_type, "SessionPromptEnd");
     assert_eq!(ev.sub_type, "error");
     assert!(serde_json::from_str::<serde_json::Value>(&ev.payload).is_ok());
@@ -187,14 +188,15 @@ async fn terminal_error_event_payload_is_valid_json() {
 
 #[test]
 fn stream_error_payload_is_valid_json() {
-    let ev = make_stream_error_event(Code::Unavailable, "boom");
+    let ev = make_stream_error_event(Code::Unavailable, "boom").unwrap();
     assert_eq!(ev.sub_type, "error");
     assert!(serde_json::from_str::<serde_json::Value>(&ev.payload).is_ok());
 }
 
 #[test]
 fn sse_error_retains_original_transport_cause() {
-    let event = make_stream_error_event(Code::Unavailable, "subscription_original_failure");
+    let event =
+        make_stream_error_event(Code::Unavailable, "subscription_original_failure").unwrap();
     let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
     assert!(
         payload["error_detail"]["detail"]
@@ -212,7 +214,7 @@ fn sse_error_retains_original_transport_cause() {
 /// cursor-reset 哨兵：非终态（不关流），seq=0（不污染游标）
 #[test]
 fn cursor_reset_event_is_non_terminal_zero_seq() {
-    let ev = make_cursor_reset_event();
+    let ev = make_cursor_reset_event().unwrap();
     assert_eq!(ev.message_type, "StreamReset");
     assert_eq!(ev.seq, 0);
     assert!(!is_stream_closing(&ev.message_type, &ev.sub_type));
@@ -266,7 +268,7 @@ async fn delayed_retirement_closes_only_captured_connections_with_reused_sid_and
 
 #[test]
 fn synchronous_transport_fallback_is_friendly_without_losing_h2_cause() {
-    let event = make_stream_error_event(tonic::Code::Internal, "h2 stream reset");
+    let event = make_stream_error_event(tonic::Code::Internal, "h2 stream reset").unwrap();
     let p: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
     assert_eq!(
         p["message"],
@@ -279,4 +281,104 @@ fn synchronous_transport_fallback_is_friendly_without_losing_h2_cause() {
             .unwrap()
             .contains("h2 stream reset")
     );
+}
+
+#[test]
+fn typed_sse_error_payload_preserves_wire_shape_and_omits_unknown_observation() {
+    let payload = StreamErrorPayload::new(
+        Code::Unavailable,
+        "original \"cause\"\npassword=hidden-marker",
+        "en-US",
+        "grpc_stream",
+    );
+    let encoded = serde_json::to_string(&payload).unwrap();
+    let wire: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(
+        wire.as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["code", "message", "error_detail"].into_iter().collect()
+    );
+    assert_eq!(wire["code"], "GRPC_SERVICE_UNAVAILABLE");
+    assert_eq!(wire["error_detail"]["stage"], "grpc_stream");
+    assert_eq!(
+        wire["error_detail"]["reason_code"],
+        "GRPC_SERVICE_UNAVAILABLE"
+    );
+    assert!(wire["error_detail"].get("task_id").is_none());
+    assert!(wire["error_detail"].get("service_id").is_none());
+    assert!(wire.get("observed_container_state").is_none());
+    assert!(!encoded.contains("hidden-marker"));
+    assert!(
+        wire["error_detail"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("\"cause\"\n")
+    );
+}
+
+#[test]
+fn typed_sse_observation_preserves_original_error_fields() {
+    let mut payload = StreamErrorPayload::new(
+        Code::Internal,
+        "original h2 \"failure\"\napi_key=hidden-marker",
+        "en-US",
+        "grpc_connect",
+    );
+    payload.error_detail.task_id = Some("captured-task".into());
+    payload.error_detail.service_id = Some("captured-service".into());
+    payload.observed_container_state =
+        Some("existing OOM observation \"quoted\"\nsecond line".into());
+    let normal: serde_json::Value = serde_json::to_value(&payload).unwrap();
+    assert_eq!(
+        normal["observed_container_state"],
+        "existing OOM observation \"quoted\"\nsecond line"
+    );
+    assert_eq!(normal["error_detail"]["task_id"], "captured-task");
+    assert_eq!(normal["error_detail"]["service_id"], "captured-service");
+    let event = payload
+        .into_event(Some("original-request".into()), 1234)
+        .unwrap();
+    assert_eq!(event.message_type, "SessionPromptEnd");
+    assert_eq!(event.sub_type, "error");
+    assert_eq!(event.seq, 0);
+    assert_eq!(event.request_id.as_deref(), Some("original-request"));
+    assert_eq!(event.timestamp, 1234);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&event.payload).unwrap(),
+        normal
+    );
+    assert!(!event.payload.contains("hidden-marker"));
+}
+
+#[test]
+fn typed_synthetic_status_messages_keep_existing_wire_contract() {
+    for (event, message_type, sub_type, reason, description) in [
+        (
+            make_prompt_end_event().unwrap(),
+            "SessionPromptEnd",
+            "end_turn",
+            "EndTurn",
+            "Agent has no task in execution",
+        ),
+        (
+            make_cursor_reset_event().unwrap(),
+            "StreamReset",
+            "epoch_changed",
+            "EpochChanged",
+            "Agent stream epoch changed; reset your dedup cursor",
+        ),
+    ] {
+        assert_eq!(event.message_type, message_type);
+        assert_eq!(event.sub_type, sub_type);
+        assert_eq!(event.seq, 0);
+        assert!(event.request_id.is_none());
+        let wire: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({"reason":reason,"description":description})
+        );
+    }
 }

@@ -605,7 +605,8 @@ async fn oom_message_requires_same_physical_origin_and_current_failure_window() 
                 ..window
             },
         )
-        .await;
+        .await
+        .unwrap();
         let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
         assert_eq!(
             payload["message"]
@@ -664,7 +665,8 @@ async fn authoritative_grpc_errors_are_not_overridden_or_diagnosed_as_oom() {
                 failed_at: now,
             },
         )
-        .await;
+        .await
+        .unwrap();
         let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
         assert!(
             payload["message"]
@@ -707,7 +709,8 @@ async fn unavailable_diagnosis_and_timeout_keep_friendly_message_and_original_ca
                 failed_at: now,
             },
         )
-        .await;
+        .await
+        .unwrap();
         assert!(started.elapsed() < Duration::from_millis(2500));
         let p: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
         assert_eq!(
@@ -752,7 +755,8 @@ async fn bounded_diagnosis_can_confirm_oom_just_after_transport_failure() {
             failed_at: failed,
         },
     )
-    .await;
+    .await
+    .unwrap();
     let p: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
     assert!(p["message"].as_str().unwrap().contains("out-of-memory"));
     assert!(
@@ -923,7 +927,8 @@ async fn inconsistent_failure_window_only_degrades_presentation() {
             failed_at: failed,
         },
     )
-    .await;
+    .await
+    .unwrap();
     let p: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
     assert_eq!(
         p["message"],

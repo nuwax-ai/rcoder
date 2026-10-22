@@ -358,22 +358,95 @@ fn now_millis() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-/// agent_runner 正常关流但未推终端时的兜底 SessionPromptEnd（seq=0 合成消息）
-pub(crate) fn make_prompt_end_event() -> ProgressEvent {
-    ProgressEvent {
-        message_type: "SessionPromptEnd".to_string(),
-        sub_type: "end_turn".to_string(),
-        payload: r#"{"reason":"EndTurn","description":"Agent has no task in execution"}"#
-            .to_string(),
-        request_id: None,
+#[derive(serde::Serialize)]
+enum SyntheticStatusReason {
+    EndTurn,
+    EpochChanged,
+}
+
+#[derive(serde::Serialize)]
+struct SyntheticStatusPayload {
+    reason: SyntheticStatusReason,
+    description: &'static str,
+}
+
+/// One Serde boundary for internal synthetic events. A failed serialization is
+/// returned to the stream owner; it must not fabricate a successful terminal.
+pub(super) fn serialize_synthetic_event<T: serde::Serialize>(
+    payload: &T,
+    message_type: &str,
+    sub_type: &str,
+    request_id: Option<String>,
+    timestamp: i64,
+) -> Result<ProgressEvent, serde_json::Error> {
+    Ok(ProgressEvent {
+        message_type: message_type.into(),
+        sub_type: sub_type.into(),
+        payload: serde_json::to_string(payload)?,
+        request_id,
         seq: 0,
-        timestamp: now_millis(),
-    }
+        timestamp,
+    })
+}
+
+/// agent_runner 正常关流但未推终端时的兜底 SessionPromptEnd（seq=0 合成消息）
+pub(crate) fn make_prompt_end_event() -> Result<ProgressEvent, serde_json::Error> {
+    serialize_synthetic_event(
+        &SyntheticStatusPayload {
+            reason: SyntheticStatusReason::EndTurn,
+            description: "Agent has no task in execution",
+        },
+        "SessionPromptEnd",
+        "end_turn",
+        None,
+        now_millis(),
+    )
 }
 
 /// agent_runner stream failed; keep the captured failure and request identity.
-pub(crate) fn make_stream_error_event(code: Code, message: &str) -> ProgressEvent {
+pub(crate) fn make_stream_error_event(
+    code: Code,
+    message: &str,
+) -> Result<ProgressEvent, serde_json::Error> {
     make_stream_error_event_with_identity(code, message, "en-US", "grpc_stream", None)
+}
+
+/// Private wire payload: required fields have no defaults, so producer changes
+/// must preserve the complete error contract at compile time.
+#[derive(serde::Serialize)]
+struct StreamErrorPayload {
+    code: &'static str,
+    message: String,
+    error_detail: shared_types::ErrorDetail,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_container_state: Option<String>,
+}
+
+impl StreamErrorPayload {
+    fn new(code: Code, cause: &str, locale: &str, stage: &str) -> Self {
+        let error_code = map_tonic_code(code);
+        let detail = shared_types::ErrorDetail::new(error_code, stage, cause).localized(locale);
+        let presentation = if transport_failure(code) {
+            shared_types::get_error_message(shared_types::ERR_AGENT_CONTAINER_UNAVAILABLE, locale)
+        } else {
+            let base = shared_types::get_error_message(shared_types::ERR_GRPC_ERROR, locale);
+            format!("{base}: {}", detail.detail)
+        };
+        Self {
+            code: error_code,
+            message: shared_types::sanitize_error_text(&presentation),
+            error_detail: detail,
+            observed_container_state: None,
+        }
+    }
+
+    fn into_event(
+        self,
+        request_id: Option<String>,
+        timestamp: i64,
+    ) -> Result<ProgressEvent, serde_json::Error> {
+        serialize_synthetic_event(&self, "SessionPromptEnd", "error", request_id, timestamp)
+    }
 }
 
 pub(crate) fn make_stream_error_event_with_identity(
@@ -382,29 +455,8 @@ pub(crate) fn make_stream_error_event_with_identity(
     locale: &str,
     stage: &str,
     request_id: Option<String>,
-) -> ProgressEvent {
-    let error_code = map_tonic_code(code);
-    let detail = shared_types::ErrorDetail::new(error_code, stage, message).localized(locale);
-    let base = shared_types::get_error_message(shared_types::ERR_GRPC_ERROR, locale);
-    let presentation = if transport_failure(code) {
-        shared_types::get_error_message(shared_types::ERR_AGENT_CONTAINER_UNAVAILABLE, locale)
-    } else {
-        format!("{base}: {}", detail.detail)
-    };
-    let payload = serde_json::json!({
-        "code": error_code,
-        "message": shared_types::sanitize_error_text(&presentation),
-        "error_detail": detail,
-    })
-    .to_string();
-    ProgressEvent {
-        message_type: "SessionPromptEnd".to_string(),
-        sub_type: "error".to_string(),
-        payload,
-        request_id,
-        seq: 0,
-        timestamp: now_millis(),
-    }
+) -> Result<ProgressEvent, serde_json::Error> {
+    StreamErrorPayload::new(code, message, locale, stage).into_event(request_id, now_millis())
 }
 
 /// Captured from the original request/stream, never from a later latest chat.
@@ -455,10 +507,12 @@ pub(crate) async fn make_terminal_error_event(
     stage: &str,
     request_id: Option<String>,
     window: FailureWindow,
-) -> ProgressEvent {
-    let mut event = make_stream_error_event_with_identity(code, message, locale, stage, request_id);
+) -> Result<ProgressEvent, serde_json::Error> {
+    // Preserve the original synthetic failure time while diagnosis is pending.
+    let timestamp = now_millis();
+    let mut payload = StreamErrorPayload::new(code, message, locale, stage);
     if !transport_failure(code) {
-        return event;
+        return payload.into_event(request_id, timestamp);
     }
     if let Some(ctx) = diag {
         let observation = tokio::time::timeout(
@@ -473,35 +527,30 @@ pub(crate) async fn make_terminal_error_event(
             let observed_reason = crate::utils::root_cause_message(&observed, locale);
             // Preserve the code, cause/stage and original request identity.
             // Logical-name or historical observations are not the failed task.
-            if let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&event.payload) {
-                payload["observed_container_state"] =
-                    serde_json::Value::String(shared_types::sanitize_error_text(&observed_reason));
-                if attributed_oom(ctx, &observed, window, chrono::Utc::now()) {
-                    payload["message"] = shared_types::sanitize_error_text(&observed_reason).into();
-                }
-                event.payload = payload.to_string();
+            payload.observed_container_state =
+                Some(shared_types::sanitize_error_text(&observed_reason));
+            if attributed_oom(ctx, &observed, window, chrono::Utc::now()) {
+                payload.message = shared_types::sanitize_error_text(&observed_reason);
             }
         }
     }
-    event
+    payload.into_event(request_id, timestamp)
 }
 
 /// seq 回退（agent_runner 重启后新 epoch 从 1 重新计数）时的 cursor-reset 哨兵
 /// (seq=0):告知客户端重置去重游标,让新 epoch 的低 seq 事件不被静默丢弃。
 /// 非终态(message_type≠SessionPromptEnd,不关流)。
-pub(crate) fn make_cursor_reset_event() -> ProgressEvent {
-    ProgressEvent {
-        message_type: "StreamReset".to_string(),
-        sub_type: "epoch_changed".to_string(),
-        payload: serde_json::json!({
-            "reason": "EpochChanged",
-            "description": "Agent stream epoch changed; reset your dedup cursor"
-        })
-        .to_string(),
-        request_id: None,
-        seq: 0,
-        timestamp: now_millis(),
-    }
+pub(crate) fn make_cursor_reset_event() -> Result<ProgressEvent, serde_json::Error> {
+    serialize_synthetic_event(
+        &SyntheticStatusPayload {
+            reason: SyntheticStatusReason::EpochChanged,
+            description: "Agent stream epoch changed; reset your dedup cursor",
+        },
+        "StreamReset",
+        "epoch_changed",
+        None,
+        now_millis(),
+    )
 }
 
 pub(crate) fn map_tonic_code(code: Code) -> &'static str {
