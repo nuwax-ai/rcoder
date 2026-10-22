@@ -774,7 +774,7 @@ mod tests {
     /// 内存实现等价（M3 加入 Postgres 变体后，同一测试面将覆盖两变体一致性）。
     #[test]
     fn memory_backend_dispatches_through_trait() {
-        let (adapter, _rx) = ProjectAdapter::new("test-ns".into(), "cluster.local".into());
+        let adapter = ProjectAdapter::new("test-ns".into(), "cluster.local".into());
         let backend = ProjectStoreBackend::Memory(Arc::new(adapter));
 
         let mut info = ProjectAndContainerInfo::new("proj-1".into());
@@ -809,7 +809,7 @@ mod tests {
     /// ContainerLookup 经枚举转发（Pingora 注入路径）。
     #[test]
     fn memory_backend_implements_container_lookup() {
-        let (adapter, _rx) = ProjectAdapter::new("test-ns".into(), "cluster.local".into());
+        let adapter = ProjectAdapter::new("test-ns".into(), "cluster.local".into());
         let backend = ProjectStoreBackend::Memory(Arc::new(adapter));
 
         let mut info = ProjectAndContainerInfo::new("proj-2".into());
@@ -837,7 +837,7 @@ mod tests {
     /// 此处仅验证 mirror 访问器返回同一实现的统计语义。
     #[test]
     fn memory_mirror_accessor() {
-        let (adapter, _rx) = ProjectAdapter::new("test-ns".into(), "cluster.local".into());
+        let adapter = ProjectAdapter::new("test-ns".into(), "cluster.local".into());
         let backend = ProjectStoreBackend::Memory(Arc::new(adapter));
         assert_eq!(backend.memory_mirror().get_stats().total_projects, 0);
     }

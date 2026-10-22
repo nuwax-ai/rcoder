@@ -496,7 +496,7 @@ mod compute_error_route_tests {
                 .await
                 .expect("real AppService"),
             );
-            let (adapter, _cleanup_rx) =
+            let adapter =
                 crate::storage::ProjectAdapter::new("test-ns".into(), "cluster.local".into());
             let (pod_created_tx, _) = tokio::sync::broadcast::channel(8);
             let state = Arc::new(crate::app_state::AppState {
@@ -520,7 +520,7 @@ mod compute_error_route_tests {
                 container_prefix_rcoder: "fixture-web".into(),
                 container_prefix_computer: "fixture-computer".into(),
                 runtime: runtime.clone(),
-                cleanup_rx: Arc::new(std::sync::Mutex::new(None)),
+
                 agent_download_manager: Arc::new(
                     agent_provisioning::AgentDownloadManager::new(root.path()).expect("downloads"),
                 ),

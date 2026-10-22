@@ -401,7 +401,6 @@ pub(super) async fn single_connection_peer(dsn: &str) -> PgStore {
     )
     .await
     .unwrap()
-    .0
 }
 
 pub(super) async fn hold_store_connection(

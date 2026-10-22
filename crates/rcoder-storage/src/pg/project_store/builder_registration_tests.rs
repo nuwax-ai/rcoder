@@ -136,7 +136,7 @@ impl Fixture {
             .ensure_identity(&format!("receipt{}", uuid::Uuid::new_v4().simple()))
             .await
             .unwrap();
-        let (store, _) = PgStore::connect(&config, "receipt-test".into(), "cluster.local".into())
+        let store = PgStore::connect(&config, "receipt-test".into(), "cluster.local".into())
             .await
             .unwrap();
         Some(Self {
@@ -332,7 +332,6 @@ impl Fixture {
         )
         .await
         .unwrap()
-        .0
     }
 
     async fn insert_foreign_binding(&self, uid: &str) -> UserAppResourceBinding {
@@ -2659,7 +2658,7 @@ async fn builder_registration_unknown_commit_does_not_publish_or_replay() {
         config.to_dsn().unwrap(),
         uuid::Uuid::new_v4().simple()
     ));
-    let (uncertain, _) = PgStore::connect(
+    let uncertain = PgStore::connect(
         &config,
         "registration-commit-loss".into(),
         "cluster.local".into(),

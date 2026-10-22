@@ -218,7 +218,7 @@ async fn memory_fixture() -> (
         &uuid::Uuid::new_v4().simple().to_string()[..12]
     ));
     store.ensure_identity(&runtime.app).await.unwrap();
-    let (adapter, _rx) = rcoder_storage::ProjectAdapter::new("test".into(), "cluster.local".into());
+    let adapter = rcoder_storage::ProjectAdapter::new("test".into(), "cluster.local".into());
     let projects = Arc::new(crate::storage::ProjectStoreBackend::Memory(Arc::new(
         adapter,
     )));
@@ -430,7 +430,7 @@ async fn pg_captured_cleanup_peer_stop_epoch_does_not_block_same_physical_retire
         &uuid::Uuid::new_v4().simple().to_string()[..12]
     ));
     store.ensure_identity(&runtime.app).await.unwrap();
-    let (first, _rx) = rcoder_storage::pg::PgStore::connect(
+    let first = rcoder_storage::pg::PgStore::connect(
         &config,
         "cleanup-test".into(),
         "cluster.local".into(),
@@ -448,7 +448,7 @@ async fn pg_captured_cleanup_peer_stop_epoch_does_not_block_same_physical_retire
             .unwrap(),
         shared_types::persistence::PersistenceWriteOutcome::Committed
     );
-    let (peer, _peer_rx) = rcoder_storage::pg::PgStore::connect(
+    let peer = rcoder_storage::pg::PgStore::connect(
         &config,
         "cleanup-peer".into(),
         "cluster.local".into(),

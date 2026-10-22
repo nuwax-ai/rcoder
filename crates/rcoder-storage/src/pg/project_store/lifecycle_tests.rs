@@ -260,7 +260,7 @@ async fn lifecycle_contract_reload_and_cross_replica_sync_preserve_identity() {
         url: Some(dsn),
         ..Default::default()
     };
-    let (a, _) = crate::pg::PgStore::connect(&config, "contract".into(), "cluster.local".into())
+    let a = crate::pg::PgStore::connect(&config, "contract".into(), "cluster.local".into())
         .await
         .unwrap();
     let id = format!("reload-{}", crate::pg::test_support::uuid_suffix());
@@ -269,7 +269,7 @@ async fn lifecycle_contract_reload_and_cross_replica_sync_preserve_identity() {
         .await
         .unwrap();
     let original = a.get(&id).unwrap();
-    let (b, _) = crate::pg::PgStore::connect(&config, "contract".into(), "cluster.local".into())
+    let b = crate::pg::PgStore::connect(&config, "contract".into(), "cluster.local".into())
         .await
         .unwrap();
     let loaded = b.get(&id).unwrap();
@@ -379,7 +379,7 @@ async fn lifecycle_contract_container_delete_preserves_changed_association() {
         url: Some(std::env::var("RCODER_PG_TEST_DSN").unwrap()),
         ..Default::default()
     };
-    let (peer, _) = crate::pg::PgStore::connect(&config, "contract".into(), "cluster.local".into())
+    let peer = crate::pg::PgStore::connect(&config, "contract".into(), "cluster.local".into())
         .await
         .unwrap();
     assert_eq!(
@@ -642,10 +642,9 @@ async fn lifecycle_contract_cancelled_durable_write_is_queued_and_shutdown_waits
         url: Some(std::env::var("RCODER_PG_TEST_DSN").unwrap()),
         ..Default::default()
     };
-    let (store, _) =
-        crate::pg::PgStore::connect(&config, "contract".into(), "cluster.local".into())
-            .await
-            .unwrap();
+    let store = crate::pg::PgStore::connect(&config, "contract".into(), "cluster.local".into())
+        .await
+        .unwrap();
     let store = Arc::new(store);
     let id = format!("cancel-write-{}", crate::pg::test_support::uuid_suffix());
     let sid = format!("{id}-sid");

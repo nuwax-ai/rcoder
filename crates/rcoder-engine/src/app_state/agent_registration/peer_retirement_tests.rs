@@ -42,8 +42,7 @@ impl Fixture {
                 "cluster.local".into(),
             )
             .await
-            .unwrap()
-            .0,
+            .unwrap(),
         );
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let project_id = format!("engine-retirement-{suffix}");
@@ -81,8 +80,7 @@ impl Fixture {
                 "cluster.local".into(),
             )
             .await
-            .unwrap()
-            .0,
+            .unwrap(),
         );
         let mut observed = old.clone();
         observed.container_id = format!("new-pod-{suffix}");

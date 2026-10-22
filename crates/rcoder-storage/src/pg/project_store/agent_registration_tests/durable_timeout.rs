@@ -55,8 +55,7 @@ impl CommitFixture {
         }
         let store = PgStore::connect(&config, "commit-budget-test".into(), "cluster.local".into())
             .await
-            .unwrap()
-            .0;
+            .unwrap();
         let observer = test_support::database(&dsn).await;
         let project_id = format!("commit-{}", uuid::Uuid::new_v4().simple());
         let lock_key = format!("commit-probe-{project_id}");

@@ -23,8 +23,7 @@ async fn fixture() -> Option<Fixture> {
     replacement.workload_uid = Some(format!("new-workload-{id}"));
     let first = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
         .await
-        .unwrap()
-        .0;
+        .unwrap();
     first
         .insert_with_session_durable(
             id.clone(),
@@ -47,8 +46,7 @@ async fn fixture() -> Option<Fixture> {
         "cluster.local".into(),
     )
     .await
-    .unwrap()
-    .0;
+    .unwrap();
     Some(Fixture {
         first,
         peer,

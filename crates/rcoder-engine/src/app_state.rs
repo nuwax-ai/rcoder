@@ -50,7 +50,7 @@ pub struct AppState {
     pub userapp_recovery_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// 应用配置
     pub config: AppConfig,
-    /// 项目适配器 - 纯 DashMap 内存存储 + RAII 自动资源回收
+    /// 项目适配器与持久化注册表；物理资源由显式控制入口回收。
     ///
     /// 使用 `Arc<ProjectStoreBackend>` 共享同一实例：
     /// - AppState 业务逻辑通过 `state.projects.method()` 访问（Arc 自动 deref，
@@ -83,9 +83,6 @@ pub struct AppState {
     pub container_prefix_computer: String,
     /// 容器运行时（通过 DI 注入，替代全局 RuntimeManager::get()）
     pub runtime: Arc<dyn ContainerRuntime>,
-    /// RAII 资源回收器接收端（在 start_cleanup_task 中取出并启动 ResourceReaper）
-    pub cleanup_rx:
-        Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<crate::storage::CleanupRequest>>>>,
     /// Agent 下载管理器（统一缓存）
     pub agent_download_manager: Arc<AgentDownloadManager>,
     /// 应用管理服务
@@ -106,7 +103,6 @@ impl AppState {
         container_prefix_computer: String,
         runtime: Arc<dyn ContainerRuntime>,
         projects: Arc<ProjectStoreBackend>,
-        cleanup_rx: tokio::sync::mpsc::Receiver<crate::storage::CleanupRequest>,
         activity: Arc<app_manager::AppActivityRegistry>,
         shutdown_tx: broadcast::Sender<()>,
     ) -> anyhow::Result<Arc<Self>> {
@@ -211,7 +207,6 @@ impl AppState {
             container_prefix_rcoder,
             container_prefix_computer,
             runtime,
-            cleanup_rx: Arc::new(std::sync::Mutex::new(Some(cleanup_rx))),
             agent_download_manager,
             app_service,
             activity,
@@ -467,7 +462,7 @@ impl AppState {
 
     /// 按 grpc_addr 关闭关联的所有 SSE 共享流。
     ///
-    /// 适用于记录可能已被清空的销毁路径（reaper/restart/ensure/destroyer）：这些路径中
+    /// 适用于记录可能已被清空的销毁路径（restart/ensure/destroyer）：这些路径中
     /// project/session 记录可能在关闭前已被移除，无法再走 [`Self::shutdown_sse_streams_for_project`]，
     /// 但它们都能构造出 grpc_addr（与 `grpc_pool.remove` 同源）。幂等：重复调用安全。
     pub fn shutdown_sse_streams_by_addr(&self, grpc_addr: &str) {

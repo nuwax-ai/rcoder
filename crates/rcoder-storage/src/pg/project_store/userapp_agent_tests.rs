@@ -36,7 +36,7 @@ async fn fixture() -> Option<(
             .bind(app).bind(life).exec(&mut db).await?;
         Ok(())
     }).await.unwrap();
-    let (store, _rx) = PgStore::connect(&config, "binding-test".into(), "cluster.local".into())
+    let store = PgStore::connect(&config, "binding-test".into(), "cluster.local".into())
         .await
         .unwrap();
     let store = Arc::new(store);
@@ -163,7 +163,7 @@ async fn userapp_bindings_parallel_registration_and_cross_replica_read_keep_one_
         url: Some(dsn),
         ..Default::default()
     };
-    let (other, _rx) = PgStore::connect(&config, "binding-test".into(), "cluster.local".into())
+    let other = PgStore::connect(&config, "binding-test".into(), "cluster.local".into())
         .await
         .unwrap();
     let b = ProjectStoreBackend::Postgres(Arc::new(other));
@@ -785,7 +785,7 @@ async fn project_v1_upgrade_preserves_old_physical_routes_without_importing_lega
     let query = "SELECT checksum,schema_fingerprint FROM rcoder_schema_migrations WHERE component='project' AND version=1";
     let row = client.query_one(query, &[]).await.unwrap();
     let before: (String, String) = (row.get(0), row.get(1));
-    let (store, _rx) = PgStore::connect(&config, "upgrade-test".into(), "cluster.local".into())
+    let store = PgStore::connect(&config, "upgrade-test".into(), "cluster.local".into())
         .await
         .unwrap();
     let backend = ProjectStoreBackend::Postgres(Arc::new(store));

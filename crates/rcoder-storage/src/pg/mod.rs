@@ -23,7 +23,7 @@ pub(crate) mod test_support;
 pub use project_store::sync;
 pub use project_store::writer::PersistWriter;
 pub mod leader_selection {
-    pub use super::project_store::leader::PgLeaderElection;
+    pub use super::project_store::leader::{LEADER_LOCK_KEY, PgLeaderElection};
 }
 
 use std::sync::Arc;
@@ -124,8 +124,7 @@ impl PgStore {
 
     /// 连接 + 迁移 + 全量加载，构造 PG 后端。
     ///
-    /// 返回 `(store, cleanup_rx)`：与 ProjectAdapter::new 同形，CleanupRequest
-    /// 队列语义完全复用（ResourceReaper 无感知切换）。
+    /// 返回元数据存储；物理容器退休由运行时调用方独立完成。
     ///
     /// # Errors
     /// 连接失败/迁移失败/加载解码失败均 fail fast（PG 模式下绝不静默降级内存）。
@@ -133,14 +132,14 @@ impl PgStore {
         config: &PostgresConfig,
         namespace: String,
         cluster_domain: String,
-    ) -> anyhow::Result<(Self, mpsc::Receiver<shared_types::CleanupRequest>)> {
+    ) -> anyhow::Result<Self> {
         config
             .validate_durable_commit_timeout()
             .map_err(anyhow::Error::msg)?;
         let database =
             crate::db::postgres::open(config, vec![crate::db::schema::Component::Project]).await?;
 
-        let (inner, cleanup_rx) = ProjectAdapter::new(namespace, cluster_domain);
+        let inner = ProjectAdapter::new(namespace, cluster_domain);
         let container_registration = project_store::load::load_all(&database, &inner).await?;
         project_store::userapp_agent::validate_snapshot(&database).await?;
         let (ops_tx, ops_rx) = mpsc::unbounded_channel();
@@ -168,7 +167,7 @@ impl PgStore {
             "[STORAGE_PG] boot load complete: projects={} containers={} sessions={}",
             stats.total_projects, stats.total_containers, stats.active_sessions
         );
-        Ok((store, cleanup_rx))
+        Ok(store)
     }
 
     /// 内存镜像访问（backend 装配/快照构造等特有能力）

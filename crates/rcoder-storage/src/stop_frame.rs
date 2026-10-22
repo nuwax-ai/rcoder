@@ -53,7 +53,7 @@ mod tests {
 
     #[tokio::test]
     async fn memory_captured_stop_preserves_a_new_chat_with_none_request_and_zero_revision() {
-        let (adapter, _rx) = ProjectAdapter::new("test".into(), "cluster.local".into());
+        let adapter = ProjectAdapter::new("test".into(), "cluster.local".into());
         let backend = ProjectStoreBackend::Memory(Arc::new(adapter));
         let original = info();
         backend
@@ -106,7 +106,7 @@ mod tests {
 
     #[tokio::test]
     async fn memory_stop_frame_keeps_its_detached_original_physical_identity() {
-        let (adapter, _rx) = ProjectAdapter::new("test".into(), "cluster.local".into());
+        let adapter = ProjectAdapter::new("test".into(), "cluster.local".into());
         let backend = ProjectStoreBackend::Memory(Arc::new(adapter));
         let original = info();
         backend

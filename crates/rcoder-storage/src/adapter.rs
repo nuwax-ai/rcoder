@@ -1,9 +1,9 @@
-//! 项目适配器：纯 DashMap 内存存储 + RAII 自动资源回收
+//! 项目适配器：纯 DashMap 内存存储与容器引用跟踪
 //!
 //! 替代 DuckDB 内存模式：
 //! - 热路径 O(1) 无锁读（DashMap 分片）
 //! - 引用计数容器管理（共享容器安全）
-//! - RAII 清理（移除 project 时自动销毁无引用的容器）
+//! - 元数据删除不执行物理容器、连接或路由清理；由调用方受控退休
 //!
 //! ## DashMap 使用规范
 //!
@@ -44,14 +44,13 @@ use shared_types::{ProjectAndContainerInfo, SessionHint};
 use tracing::{debug, info};
 
 use lockmap::LockMap;
-use shared_types::CleanupRequest;
 use shared_types::ContainerEntry;
 use shared_types::StorageStats;
 
 /// 项目适配器
 ///
 /// 纯内存存储，使用 DashMap 分片实现高并发。
-/// 容器引用计数归零时通过 channel 触发异步物理销毁（RAII）。
+/// 容器引用计数归零时保留条目，物理生命周期由运行时调用方管理。
 ///
 /// ## 反向索引
 ///
@@ -75,8 +74,6 @@ pub struct ProjectAdapter {
     pub(super) session_index: DashMap<String, (String, String)>,
     /// project_id → container_key（反向索引）
     pub(super) project_to_container: DashMap<String, String>,
-    /// RAII 清理通道（bounded，try_send 非阻塞，满时丢弃并告警）
-    pub(super) cleanup_tx: tokio::sync::mpsc::Sender<CleanupRequest>,
     /// K8s namespace（用于构建 K8s Service FQDN）
     pub(super) namespace: String,
     /// K8s 集群域名
@@ -108,13 +105,7 @@ pub struct ProjectAdapter {
 impl ProjectAdapter {
     /// 创建新的项目适配器
     ///
-    /// 返回 (adapter, cleanup_receiver)。
-    /// cleanup_receiver 需要传给 ResourceReaper 以处理容器销毁。
-    pub fn new(
-        namespace: String,
-        cluster_domain: String,
-    ) -> (Self, tokio::sync::mpsc::Receiver<CleanupRequest>) {
-        let (tx, rx) = tokio::sync::mpsc::channel(shared_types::CLEANUP_CHANNEL_CAPACITY);
+    pub fn new(namespace: String, cluster_domain: String) -> Self {
         let adapter = Self {
             projects: DashMap::new(),
             namespace,
@@ -122,7 +113,6 @@ impl ProjectAdapter {
             containers: DashMap::new(),
             session_index: DashMap::new(),
             project_to_container: DashMap::new(),
-            cleanup_tx: tx,
             container_id_to_key: DashMap::new(),
             user_id_to_project_ids: DashMap::new(),
             pod_id_to_project_id: DashMap::new(),
@@ -130,8 +120,8 @@ impl ProjectAdapter {
             container_locks: Arc::new(LockMap::new()),
             userapp_agents: Arc::new(std::sync::Mutex::new(Default::default())),
         };
-        info!("[STORAGE] ProjectAdapter initialized (DashMap, RAII enabled)");
-        (adapter, rx)
+        info!("[STORAGE] ProjectAdapter initialized (DashMap, metadata-only retirement)");
+        adapter
     }
 
     // ========== Project CRUD ==========
@@ -490,7 +480,7 @@ impl ProjectAdapter {
             .remove(project_id)
             .map(|(_, ck)| ck);
 
-        // 4. 容器引用计数减 1，归零时触发 RAII 清理
+        // 4. 容器引用计数减 1，归零后保留记录供闲置扫描观察
         if let Some(ck) = container_key {
             self.dec_container_ref(&ck);
         } else {
@@ -661,7 +651,7 @@ pub(crate) fn code_to_agent_status(code: i32, _name: &str) -> shared_types::Agen
 /// 不会与裸 id 相撞）。
 ///
 /// 注意：此键仅用于 DashMap 分组/refcount，**不等于** `ProjectAndContainerInfo::container_key()`
-/// （后者返回裸 logical id，供 RAII 清理 identifier 与外部消费者用）。
+/// （后者返回裸 logical id，供容器查找与显式控制入口用）。
 pub(crate) fn container_entry_key(info: &ProjectAndContainerInfo) -> String {
     match info.container_info() {
         Some(c) => c.container_name.clone(),

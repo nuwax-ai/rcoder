@@ -24,8 +24,7 @@ async fn late_stop_completion(initial_claim: bool) {
     let store = Arc::new(
         PgStore::connect(&config, "stop-claim-test".into(), "cluster.local".into())
             .await
-            .unwrap()
-            .0,
+            .unwrap(),
     );
     let backend = Arc::new(ProjectStoreBackend::Postgres(store.clone()));
     let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -140,8 +139,7 @@ async fn late_stop_completion(initial_claim: bool) {
     let reader = Arc::new(
         PgStore::connect(&config, "stop-claim-test".into(), "cluster.local".into())
             .await
-            .unwrap()
-            .0,
+            .unwrap(),
     );
     let routed = reader
         .get_by_session_id_with_fetch_result(&sid)

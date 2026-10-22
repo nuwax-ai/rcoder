@@ -182,7 +182,7 @@ async fn seed(state: &AppState, physical: ContainerBasicInfo, project: &str, sid
     );
 }
 fn memory() -> Arc<crate::storage::ProjectStoreBackend> {
-    let (adapter, _) =
+    let adapter =
         crate::storage::ProjectAdapter::new("stop-http-test".into(), "cluster.local".into());
     Arc::new(crate::storage::ProjectStoreBackend::Memory(Arc::new(
         adapter,
@@ -405,8 +405,7 @@ async fn postgres() -> Option<Arc<rcoder_storage::pg::PgStore>> {
             "cluster.local".into(),
         )
         .await
-        .unwrap()
-        .0,
+        .unwrap(),
     ))
 }
 #[cfg(any(feature = "kubernetes", feature = "rcoder-pg"))]

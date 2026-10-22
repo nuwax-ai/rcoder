@@ -10,8 +10,8 @@ mod agent_registration_tests;
 mod concurrency_tests;
 mod crud_session_tests;
 mod index_lookup_tests;
+mod metadata_only_retirement_tests;
 
-use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -50,9 +50,7 @@ fn create_test_info_with_container(
 }
 
 fn make_adapter() -> ProjectAdapter {
-    let (adapter, _) =
-        ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
-    adapter
+    ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string())
 }
 
 fn join_with_timeout<T>(handle: thread::JoinHandle<T>, timeout_secs: u64) -> Option<T> {
@@ -64,17 +62,6 @@ fn join_with_timeout<T>(handle: thread::JoinHandle<T>, timeout_secs: u64) -> Opt
         thread::sleep(Duration::from_millis(10));
     }
     handle.join().ok()
-}
-
-fn drain_cleanup_requests(
-    rx: &Mutex<tokio::sync::mpsc::Receiver<CleanupRequest>>,
-) -> Vec<CleanupRequest> {
-    let mut guard = rx.lock().unwrap();
-    let mut requests = vec![];
-    while let Ok(req) = guard.try_recv() {
-        requests.push(req);
-    }
-    requests
 }
 
 fn create_shared_project(

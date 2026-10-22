@@ -11,7 +11,6 @@ use shared_types::{ContainerBasicInfo, ContainerEntry, ProjectAndContainerInfo, 
 use tracing::info;
 
 use super::ProjectAdapter;
-use shared_types::CleanupRequest;
 use shared_types::IdleContainerInfo;
 
 impl ProjectAdapter {
@@ -120,8 +119,7 @@ impl ProjectAdapter {
 
     /// 移除本地容器镜像条目（peer 副本已 durable 删除后的镜像收敛）。
     ///
-    /// 与 [`Self::delete_container_with_projects`] 的差异：不发送
-    /// CleanupRequest（物理对象已由执行删除的副本清理），且要求该容器无
+    /// 与 [`Self::delete_container_with_projects`] 的差异：要求该容器无
     /// 本地 project 引用。`expected_physical_uid` 与条目实际身份不符时返回
     /// false（快照之后本地已有新写入，保守留待下一轮对账）。条目已经不存在
     /// 且无 project 引用时返回 true，允许调用方一并清理孤立注册游标。
@@ -153,7 +151,8 @@ impl ProjectAdapter {
         true
     }
 
-    /// 删除容器及其关联的所有项目（RAII 触发物理销毁）
+    /// 删除容器及其关联项目的元数据，不提交物理删除或连接/路由清理。
+    /// 调用方负责通过原受控入口完成对应物理实例的退休。
     ///
     /// 返回 (容器是否存在, 删除的项目数)
     pub fn delete_container_with_projects(&self, container_id: &str) -> (bool, usize) {
@@ -201,23 +200,6 @@ impl ProjectAdapter {
             // 清理反向索引
             let info = entry.info();
             self.container_id_to_key.remove(&info.container_id);
-            // identifier 用裸 logical_id（清理链路按 logical id）
-            if let Err(e) = self.cleanup_tx.try_send(CleanupRequest {
-                identifier: entry.logical_id().to_string(),
-                container_name: info.container_name,
-                service_type: entry.service_type(),
-                container_ip: info.container_ip,
-                namespace: self.namespace.clone(),
-                cluster_domain: self.cluster_domain.clone(),
-                project_ids,
-                retry_count: 0,
-            }) {
-                tracing::error!(
-                    "[STORAGE] cleanup channel try_send failed (full or ResourceReaper down?), container leak risk: identifier={}, {}",
-                    entry.logical_id(),
-                    e
-                );
-            }
         }
 
         (container_existed, count)
@@ -386,7 +368,7 @@ impl ProjectAdapter {
 
     // ========== 内部方法 ==========
 
-    /// 减少容器引用计数，归零时触发 RAII 清理
+    /// 减少容器引用计数，归零后保留记录供闲置扫描观察
     ///
     /// 使用 entry() API 实现 dec_ref + remove 的原子操作，
     /// 消除 view() + remove() 之间的 TOCTOU 竞态。

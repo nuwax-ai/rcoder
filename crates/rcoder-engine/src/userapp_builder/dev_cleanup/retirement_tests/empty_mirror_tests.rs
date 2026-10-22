@@ -72,7 +72,7 @@ impl Fixture {
         control.ensure_identity(&runtime.app).await.unwrap();
         // Connect the executing replica first. A peer then commits the row;
         // neither startup hydration nor a synthetic local insert can supply it.
-        let (first, _rx) = rcoder_storage::pg::PgStore::connect(
+        let first = rcoder_storage::pg::PgStore::connect(
             &config,
             "empty-first".into(),
             "cluster.local".into(),
@@ -81,7 +81,7 @@ impl Fixture {
         .unwrap();
         let first = Arc::new(first);
         assert!(first.get(&runtime.app).is_none());
-        let (peer, _rx) = rcoder_storage::pg::PgStore::connect(
+        let peer = rcoder_storage::pg::PgStore::connect(
             &config,
             "empty-peer".into(),
             "cluster.local".into(),

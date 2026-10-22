@@ -5,6 +5,21 @@ use std::time::Duration;
 
 /// 后台任务句柄（PG 模式占位/监督任务的统一类型）
 type TaskHandle = Option<tokio::task::JoinHandle<()>>;
+type LeaderTaskHandle = Option<tokio::task::JoinHandle<anyhow::Result<()>>>;
+type SingleInstanceTaskHandles = (
+    TaskHandle,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+    TaskHandle,
+);
+
+#[cfg(test)]
+mod docker_metadata_tests;
+mod generation;
+#[cfg(all(test, feature = "rcoder-pg", feature = "userapp-turso"))]
+mod pg_fault_tests;
+#[cfg(test)]
+mod tests;
 
 use tracing::info;
 
@@ -30,7 +45,7 @@ pub struct BackgroundTaskHandles {
     pub pg_sync_handle: Option<tokio::task::JoinHandle<()>>,
     /// P2-M3：单实例后台任务的 leader 监督任务（PG 模式；
     /// cleanup/status_checker/container_sync/userapp_recycle 由它按 leadership 拉起/停止）
-    pub pg_leader_handle: Option<tokio::task::JoinHandle<()>>,
+    pub pg_leader_handle: LeaderTaskHandle,
 }
 
 impl BackgroundTaskHandles {
@@ -44,7 +59,6 @@ impl BackgroundTaskHandles {
             ("userapp recycle", self.userapp_recycle_handle),
             ("activity flush", self.pg_shadow_handle),
             ("PG sync", self.pg_sync_handle),
-            ("PG leader supervisor", self.pg_leader_handle),
         ] {
             if let Some(handle) = handle {
                 tokio::time::timeout_at(deadline, handle)
@@ -53,6 +67,13 @@ impl BackgroundTaskHandles {
                         anyhow::anyhow!("{name} drain timed out; storage remains owned")
                     })??;
             }
+        }
+        if let Some(handle) = self.pg_leader_handle {
+            tokio::time::timeout_at(deadline, handle)
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("PG leader supervisor drain timed out; storage remains owned")
+                })???;
         }
         Ok(())
     }
@@ -63,12 +84,7 @@ async fn spawn_single_instance_tasks(
     cleanup_config: cleanup_task::CleanupConfig,
     state: &Arc<AppState>,
     shutdown_tx: &tokio::sync::broadcast::Sender<()>,
-) -> anyhow::Result<(
-    Option<tokio::task::JoinHandle<()>>,
-    tokio::task::JoinHandle<()>,
-    tokio::task::JoinHandle<()>,
-    Option<tokio::task::JoinHandle<()>>,
-)> {
+) -> anyhow::Result<SingleInstanceTaskHandles> {
     let cleanup_handle = if config.cleanup_config.enabled {
         Some(
             cleanup_task::start_cleanup_task(cleanup_config, state.clone(), shutdown_tx.clone())
@@ -113,14 +129,29 @@ async fn spawn_single_instance_tasks(
             config.userapp_recycle.scan_interval_seconds,
             config.userapp_recycle.protection_seconds,
         );
-        Some(
-            userapp_recycle::start_userapp_recycle_task(
-                recycle_cfg,
-                state.clone(),
-                shutdown_tx.clone(),
-            )
-            .await?,
+        match userapp_recycle::start_userapp_recycle_task(
+            recycle_cfg,
+            state.clone(),
+            shutdown_tx.clone(),
         )
+        .await
+        {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                generation::Generation::new(
+                    shutdown_tx.clone(),
+                    (
+                        cleanup_handle,
+                        status_checker_handle,
+                        container_sync_handle,
+                        None,
+                    ),
+                )
+                .stop_and_drain()
+                .await;
+                return Err(error);
+            }
+        }
     } else {
         info!("[USERAPP_RECYCLE] disabled (userapp_recycle.enabled=false)");
         None
@@ -138,20 +169,7 @@ pub async fn start_all_background_tasks(
     state: Arc<AppState>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> anyhow::Result<BackgroundTaskHandles> {
-    let cleanup_config = cleanup_task::CleanupConfig {
-        idle_timeout: Duration::from_secs(config.cleanup_config.idle_timeout_seconds),
-        cleanup_interval: Duration::from_secs(config.cleanup_config.cleanup_interval_seconds),
-        docker_stop_timeout: Duration::from_secs(config.cleanup_config.docker_stop_timeout_seconds),
-        container_protection_duration: Duration::from_secs(
-            config.cleanup_config.container_protection_seconds,
-        ),
-        long_idle_timeout: Duration::from_secs(config.cleanup_config.long_idle_timeout_seconds),
-        active_window: Duration::from_secs(5 * 60),
-        log_dir: config.cleanup_config.log_cleanup.log_dir.clone(),
-        log_retention_duration: Duration::from_secs(
-            config.cleanup_config.log_cleanup.log_retention_days * 24 * 60 * 60,
-        ),
-    };
+    let cleanup_config = cleanup_runtime_config(config);
     info!(
         "🧹 Cleanup config: idle_timeout={}s, cleanup_interval={}s, docker_stop_timeout={}s, container_protection={}s, log_dir={}, log_retention={}days",
         config.cleanup_config.idle_timeout_seconds,
@@ -171,41 +189,46 @@ pub async fn start_all_background_tasks(
         container_sync_handle,
         userapp_recycle_handle,
         pg_leader_handle,
-    ): (TaskHandle, TaskHandle, TaskHandle, TaskHandle, TaskHandle) =
-        if state.projects.is_postgres() {
-            #[cfg(feature = "rcoder-pg")]
-            {
-                // is_postgres() 为真时 postgres() 必有值；防御性错误传播而非
-                // expect（此处 panic 会击穿整个后台任务装配）。
-                let leader_store = state
-                    .projects
-                    .postgres()
-                    .ok_or_else(|| anyhow::anyhow!("postgres backend expected but absent"))?;
-                let election = Arc::new(
-                    rcoder_storage::pg::leader_selection::PgLeaderElection::spawn(
-                        leader_store.postgres_config().clone(),
-                        shutdown_tx.subscribe(),
-                    ),
-                );
-                let config = config.clone();
-                let state = Arc::clone(&state);
-                let shutdown_tx = shutdown_tx.clone();
-                let leader_handle = tokio::spawn(async move {
-                    run_leader_supervisor(election, config, state, shutdown_tx).await;
-                });
-                // 监督任务异步拉起子任务，直接句柄由 supervisor 持有；
-                // 本层对应槽位置 None（不是占位 pending task，避免误导与白占 executor 槽）
-                (None, None, None, None, Some(leader_handle))
-            }
-            #[cfg(not(feature = "rcoder-pg"))]
-            {
-                unreachable!("is_postgres 为真但未编译 rcoder-pg")
-            }
-        } else {
-            let (c, s1, s2, u) =
-                spawn_single_instance_tasks(config, cleanup_config, &state, &shutdown_tx).await?;
-            (c, Some(s1), Some(s2), u, None)
-        };
+    ): (
+        TaskHandle,
+        TaskHandle,
+        TaskHandle,
+        TaskHandle,
+        LeaderTaskHandle,
+    ) = if state.projects.is_postgres() {
+        #[cfg(feature = "rcoder-pg")]
+        {
+            // is_postgres() 为真时 postgres() 必有值；防御性错误传播而非
+            // expect（此处 panic 会击穿整个后台任务装配）。
+            let leader_store = state
+                .projects
+                .postgres()
+                .ok_or_else(|| anyhow::anyhow!("postgres backend expected but absent"))?;
+            let election = Arc::new(
+                rcoder_storage::pg::leader_selection::PgLeaderElection::spawn(
+                    leader_store.postgres_config().clone(),
+                    shutdown_tx.subscribe(),
+                ),
+            );
+            let config = config.clone();
+            let state = Arc::clone(&state);
+            let shutdown_tx = shutdown_tx.clone();
+            let leader_handle = tokio::spawn(async move {
+                run_leader_supervisor(election, config, state, shutdown_tx).await
+            });
+            // 监督任务异步拉起子任务，直接句柄由 supervisor 持有；
+            // 本层对应槽位置 None（不是占位 pending task，避免误导与白占 executor 槽）
+            (None, None, None, None, Some(leader_handle))
+        }
+        #[cfg(not(feature = "rcoder-pg"))]
+        {
+            unreachable!("is_postgres 为真但未编译 rcoder-pg")
+        }
+    } else {
+        let (c, s1, s2, u) =
+            spawn_single_instance_tasks(config, cleanup_config, &state, &shutdown_tx).await?;
+        (c, Some(s1), Some(s2), u, None)
+    };
 
     // VNC 后端解析:pingora handle_vnc_upstream 优先查 ContainerLookupService(动态查项目
     // 存储,与 ttyd 一致、runtime 无关),回退 vnc_backends 显式注册(chat / pod_ensure /
@@ -273,88 +296,60 @@ pub async fn start_all_background_tasks(
     })
 }
 
-/// P2-M3：leader 监督——持有 leadership 期间拉起 4 个单实例任务，让位即停。
-///
-/// 代际 channel：每次获主创建独立 broadcast，失主时 drop 该代 sender → 子任务
-/// 的 shutdown_rx.recv() 返回 Err → 循环退出（与优雅关停同一条退出路径）。
-/// 重新获主重新拉起，无需重启进程。
+fn cleanup_runtime_config(config: &AppConfig) -> cleanup_task::CleanupConfig {
+    cleanup_task::CleanupConfig {
+        idle_timeout: Duration::from_secs(config.cleanup_config.idle_timeout_seconds),
+        cleanup_interval: Duration::from_secs(config.cleanup_config.cleanup_interval_seconds),
+        docker_stop_timeout: Duration::from_secs(config.cleanup_config.docker_stop_timeout_seconds),
+        container_protection_duration: Duration::from_secs(
+            config.cleanup_config.container_protection_seconds,
+        ),
+        long_idle_timeout: Duration::from_secs(config.cleanup_config.long_idle_timeout_seconds),
+        active_window: Duration::from_secs(5 * 60),
+        log_dir: config.cleanup_config.log_cleanup.log_dir.clone(),
+        log_retention_duration: Duration::from_secs(
+            config.cleanup_config.log_cleanup.log_retention_days * 24 * 60 * 60,
+        ),
+    }
+}
+
+/// Supervise actual generation tasks; replacement waits until all old tasks join.
 #[cfg(feature = "rcoder-pg")]
 async fn run_leader_supervisor(
     election: Arc<rcoder_storage::pg::leader_selection::PgLeaderElection>,
     config: AppConfig,
     state: Arc<AppState>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
-) {
-    let mut root_shutdown = shutdown_tx.subscribe();
-    let mut current_gen: Option<tokio::sync::broadcast::Sender<()>> = None;
-    let mut generations = tokio::task::JoinSet::new();
-    let mut tick = tokio::time::interval(Duration::from_secs(5));
-    tick.tick().await; // 首个立即返回
-    loop {
-        tokio::select! {
-            biased;
-            _ = root_shutdown.recv() => break,
-            Some(result) = generations.join_next(), if !generations.is_empty() => {
-                if let Err(error) = result {
-                    tracing::error!(%error, "leader generation task failed");
-                }
+) -> anyhow::Result<()> {
+    let result = generation::supervise(
+        || election.is_leader(),
+        |generation_shutdown| {
+            let config = config.clone();
+            let state = Arc::clone(&state);
+            async move {
+                spawn_single_instance_tasks(
+                    &config,
+                    cleanup_runtime_config(&config),
+                    &state,
+                    &generation_shutdown,
+                )
+                .await
             }
-            _ = tick.tick() => {
-                let is_leader = election.is_leader();
-                if is_leader && current_gen.is_none() && generations.is_empty() {
-                    // 获主：拉起代际
-                    let (gen_tx, _) = tokio::sync::broadcast::channel(1);
-                    let cleanup_config = cleanup_task::CleanupConfig {
-                        idle_timeout: Duration::from_secs(config.cleanup_config.idle_timeout_seconds),
-                        cleanup_interval: Duration::from_secs(config.cleanup_config.cleanup_interval_seconds),
-                        docker_stop_timeout: Duration::from_secs(config.cleanup_config.docker_stop_timeout_seconds),
-                        container_protection_duration: Duration::from_secs(
-                            config.cleanup_config.container_protection_seconds,
-                        ),
-                        long_idle_timeout: Duration::from_secs(config.cleanup_config.long_idle_timeout_seconds),
-                        active_window: Duration::from_secs(5 * 60),
-                        log_dir: config.cleanup_config.log_cleanup.log_dir.clone(),
-                        log_retention_duration: Duration::from_secs(
-                            config.cleanup_config.log_cleanup.log_retention_days * 24 * 60 * 60,
-                        ),
-                    };
-                    match spawn_single_instance_tasks(&config, cleanup_config, &state, &gen_tx).await {
-                        Ok(handles) => {
-                            let (c, s1, s2, u) = handles;
-                            // 保活句柄防止任务被提前回收（JoinHandle 被 drop 不取消
-                            // task，但保持引用便于调试器/控制台观察）
-                            generations.spawn(async move {
-                                // 显式消费 JoinHandle（带 Drop 语义，避免 let _ 静默丢弃）
-                                if let Some(h) = c { let _r = h.await; }
-                                let _r1 = s1.await;
-                                let _r2 = s2.await;
-                                if let Some(h) = u { let _r3 = h.await; }
-                            });
-                            current_gen = Some(gen_tx);
-                            info!("[STORAGE_PG] leader: single-instance background tasks started");
-                        }
-                        Err(e) => {
-                            tracing::error!("[STORAGE_PG] leader task spawn failed: {e:#}");
-                        }
-                    }
-                } else if !is_leader && let Some(gen_tx) = current_gen.take() {
-                    // 让位：drop 代际 sender → 子任务退出
-                    drop(gen_tx);
-                    info!("[STORAGE_PG] leader stepped down: single-instance background tasks stopped");
-                }
-            }
+        },
+        shutdown_tx.subscribe(),
+        Duration::from_secs(5),
+    )
+    .await;
+    let election_result = election.shutdown().await;
+    match (result, election_result) {
+        (Ok(()), Ok(())) => {
+            info!("[STORAGE_PG] leader supervisor stopped");
+            Ok(())
         }
+        (Err(error), Ok(())) => Err(error.context("leader generation supervision failed")),
+        (Ok(()), Err(error)) => Err(error.context("leader election shutdown failed")),
+        (Err(supervision), Err(shutdown)) => Err(anyhow::anyhow!(
+            "leader generation supervision failed: {supervision:#}; leader election shutdown failed: {shutdown:#}"
+        )),
     }
-    if let Some(gen_tx) = current_gen.take() {
-        drop(gen_tx);
-    }
-    while let Some(result) = generations.join_next().await {
-        if let Err(error) = result {
-            tracing::error!(%error, "leader generation drain failed");
-        }
-    }
-    if let Err(error) = election.shutdown().await {
-        tracing::error!(%error, "leader election shutdown failed");
-    }
-    info!("[STORAGE_PG] leader supervisor stopped");
 }

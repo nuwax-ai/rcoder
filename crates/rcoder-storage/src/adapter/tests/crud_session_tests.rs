@@ -269,8 +269,7 @@ fn test_latest_session_fallback_after_remove() {
 /// 并发压测：8 线程 × 200 轮 add_session + clear_session_one，无 panic/deadlock
 #[test]
 fn test_concurrent_multi_session_add_and_clear() {
-    let (adapter, _rx) =
-        ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
+    let adapter = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
     let adapter = Arc::new(adapter);
 
     const THREADS: usize = 8;
@@ -515,7 +514,7 @@ use std::thread;
 
 #[test]
 fn conditional_remove_preserves_changed_container_identity() {
-    let (adapter, _rx) = ProjectAdapter::new(TEST_NAMESPACE.into(), TEST_CLUSTER_DOMAIN.into());
+    let adapter = ProjectAdapter::new(TEST_NAMESPACE.into(), TEST_CLUSTER_DOMAIN.into());
     let mut original = create_test_info_with_container("conditional-project", "old-container");
     let generation = original.persistence_identity().generation.clone();
     let old_id = original.container_info().unwrap().container_id;

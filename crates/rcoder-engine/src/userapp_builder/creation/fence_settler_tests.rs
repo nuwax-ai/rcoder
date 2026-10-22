@@ -1608,7 +1608,7 @@ pub(crate) async fn runtime_state_with_mode(
     fence_settle_grace_secs: Option<u64>,
     access_mode: app_manager::config::AppAccessMode,
 ) -> Arc<AppState> {
-    let (adapter, _cleanup_rx) =
+    let adapter =
         crate::storage::ProjectAdapter::new("test-ns".to_string(), "cluster.local".to_string());
     let activity = Arc::new(app_manager::AppActivityRegistry::new(Duration::from_secs(
         300,
@@ -1656,7 +1656,7 @@ pub(crate) async fn runtime_state_with_mode(
         container_prefix_rcoder: "dev-rcoder".to_string(),
         container_prefix_computer: "computer-agent-runner".to_string(),
         runtime,
-        cleanup_rx: Arc::new(Mutex::new(None)),
+
         agent_download_manager: Arc::new(
             agent_provisioning::AgentDownloadManager::new(download_dir.path())
                 .expect("download manager"),

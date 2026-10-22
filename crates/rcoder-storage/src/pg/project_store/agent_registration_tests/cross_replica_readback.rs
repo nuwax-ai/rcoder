@@ -33,8 +33,7 @@ async fn cancelled_lookup_fixture(dsn: &str) -> CancelledLookupFixture {
         "cluster.local".into(),
     )
     .await
-    .unwrap()
-    .0;
+    .unwrap();
     let initial = frozen(&first.get(&id).unwrap());
     assert_eq!(
         first

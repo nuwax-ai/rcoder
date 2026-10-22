@@ -3,10 +3,10 @@
 //! 自 rcoder/src/storage 迁出（M1）。提供：
 //! - O(1) 热路径访问（DashMap 分片内存镜像）
 //! - 引用计数容器管理（共享容器安全）
-//! - RAII 清理请求（CleanupRequest 经 mpsc 交给 rcoder 侧 ResourceReaper）
+//! - 元数据退休与物理计算、连接/路由清理解耦
 //! - `pg` feature：PostgreSQL write-behind 持久化 + 启动全量加载（Phase 1 M3）
 //!
-//! 数据契约（CleanupRequest / StorageStats / IdleContainerInfo / ProjectStore）统一定义在
+//! 数据契约（StorageStats / IdleContainerInfo / ProjectStore）统一定义在
 //! shared_types（跨 crate 契约单一事实源），本 crate 仅转发导出。
 //!
 //! 模块组织：
@@ -32,9 +32,7 @@ pub mod pg;
 
 pub use adapter::ProjectAdapter;
 pub use backend::ProjectStoreBackend;
-pub use shared_types::{
-    CLEANUP_CHANNEL_CAPACITY, CleanupRequest, ContainerEntry, IdleContainerInfo, StorageStats,
-};
+pub use shared_types::{ContainerEntry, IdleContainerInfo, StorageStats};
 pub use stop_frame::ProjectStopFrame;
 
 #[cfg(any(feature = "pg", feature = "userapp-turso"))]

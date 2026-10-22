@@ -624,7 +624,7 @@ async fn pg_same_statefulset_new_pod_without_completion_returns_to_admitted_conf
     assert!(app_id.len() <= shared_types::USERAPP_APP_ID_MAX_LEN);
     let (mut state, runtime, _directory) =
         fixture_on_store(store, tempfile::tempdir().unwrap(), &app_id).await;
-    let (projects, _cleanup) = rcoder_storage::pg::PgStore::connect(
+    let projects = rcoder_storage::pg::PgStore::connect(
         &config,
         "registration-test".into(),
         "cluster.local".into(),
@@ -731,7 +731,7 @@ async fn pg_same_statefulset_new_pod_without_completion_returns_to_admitted_conf
         .unwrap()
         .unwrap();
     assert_eq!(binding.adopted_by_operation, original_operation);
-    let (peer, _cleanup) = rcoder_storage::pg::PgStore::connect(
+    let peer = rcoder_storage::pg::PgStore::connect(
         &config,
         "registration-peer".into(),
         "cluster.local".into(),

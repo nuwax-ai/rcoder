@@ -118,9 +118,9 @@ pub trait ProjectStore: Send + Sync {
 
     // ========== 删除清理 ==========
 
-    /// 删除容器及其全部关联 project，并发送物理销毁请求（唯一物理销毁触发点）。
+    /// 仅删除容器及其全部关联 project 的元数据。
     ///
-    /// 返回 (容器是否存在, 连带删除的 project 数)。物理销毁经 CleanupRequest
-    /// 队列交给 ResourceReaper 异步执行；队满时实现侧丢弃并告警。
+    /// 返回 (容器是否存在, 连带删除的 project 数)。运行时调用方负责原物理实例
+    /// 的受控停止及连接退休；本方法不会提交额外物理删除、SSE或路由清理。
     fn delete_container_with_projects(&self, container_id: &str) -> (bool, usize);
 }

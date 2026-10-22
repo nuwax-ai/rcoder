@@ -107,10 +107,9 @@ impl Fixture {
         let control = PgUserAppStore::connect(&config).await.unwrap();
         let app = format!("rt{}", test_support::uuid_suffix());
         let lifecycle = control.ensure_identity(&app).await.unwrap();
-        let (first, _rx) =
-            PgStore::connect(&config, "retirement-test".into(), "cluster.local".into())
-                .await
-                .unwrap();
+        let first = PgStore::connect(&config, "retirement-test".into(), "cluster.local".into())
+            .await
+            .unwrap();
         let basic = ContainerBasicInfo {
             project_id: app.clone(),
             container_id: format!("pod-{app}"),
@@ -133,10 +132,9 @@ impl Fixture {
                 .unwrap(),
             shared_types::persistence::PersistenceWriteOutcome::Committed
         );
-        let (peer, _rx) =
-            PgStore::connect(&config, "retirement-peer".into(), "cluster.local".into())
-                .await
-                .unwrap();
+        let peer = PgStore::connect(&config, "retirement-peer".into(), "cluster.local".into())
+            .await
+            .unwrap();
         let operation = match control
             .admit(&UserAppAdmission {
                 app_id: app.clone(),
@@ -521,7 +519,7 @@ async fn pg_builder_retirement_unknown_commit_reads_original_receipt_without_ret
         url: Some(f.dsn.clone()),
         ..Default::default()
     };
-    let (replacement_store, _rx) = PgStore::connect(
+    let replacement_store = PgStore::connect(
         &config,
         "retirement-replacement".into(),
         "cluster.local".into(),

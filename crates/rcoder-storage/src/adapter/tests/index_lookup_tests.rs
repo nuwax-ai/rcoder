@@ -876,8 +876,7 @@ fn test_index_cleanup_on_delete_container_with_projects() {
 #[test]
 fn test_index_consistency_under_raii() {
     // 验证 RAII 清理后索引一致性：多个 project 共享容器
-    let (adapter, _rx) =
-        ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
+    let adapter = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
 
     let container = ContainerBasicInfo {
         container_id: "cid-shared".to_string(),

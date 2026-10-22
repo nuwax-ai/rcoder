@@ -79,20 +79,20 @@ pub async fn assemble(
     // 以便同一 Arc 实例同时作为 Arc<dyn ContainerLookup> 注入 Pingora 代理层
     // （统一容器 IP 数据源）和作为 AppState.projects 共享给业务逻辑。
     let cluster_domain = shared_types::get_k8s_cluster_domain();
-    let (projects_backend, cleanup_rx) = match bootstrap_result.config.storage.backend {
+    let projects_backend = match bootstrap_result.config.storage.backend {
         config::StorageBackend::Memory => {
-            let (adapter, cleanup_rx) = ProjectAdapter::new(
+            let adapter = ProjectAdapter::new(
                 bootstrap_result.config.app_manager.namespace.clone(),
                 cluster_domain.clone(),
             );
-            (ProjectStoreBackend::Memory(Arc::new(adapter)), cleanup_rx)
+            ProjectStoreBackend::Memory(Arc::new(adapter))
         }
         // PG 模式 fail fast：未编译 feature / 连接失败 / 迁移失败均直接退出，
         // 绝不静默降级内存（会造成 PG 与镜像分叉）
         #[cfg(feature = "rcoder-pg")]
         config::StorageBackend::Postgres => {
             let pg_config = &bootstrap_result.config.storage.postgres;
-            let (store, cleanup_rx) = rcoder_storage::pg::PgStore::connect(
+            let store = rcoder_storage::pg::PgStore::connect(
                 pg_config,
                 bootstrap_result.config.app_manager.namespace.clone(),
                 cluster_domain.clone(),
@@ -102,7 +102,7 @@ pub async fn assemble(
                 eprintln!("[STORAGE_PG] postgres backend init failed: {e:#}");
                 std::process::exit(1);
             });
-            (ProjectStoreBackend::Postgres(Arc::new(store)), cleanup_rx)
+            ProjectStoreBackend::Postgres(Arc::new(store))
         }
         #[cfg(not(feature = "rcoder-pg"))]
         config::StorageBackend::Postgres => {
@@ -291,7 +291,6 @@ pub async fn assemble(
         container_prefix_computer,
         runtime,
         projects,
-        cleanup_rx,
         activity_registry.clone(),
         shutdown_tx.clone(),
     )

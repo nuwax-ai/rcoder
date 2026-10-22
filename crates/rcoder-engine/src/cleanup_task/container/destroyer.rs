@@ -112,8 +112,7 @@ impl ContainerDestroyer {
     /// * `reason` - 销毁原因
     /// * `project_id` - 项目 ID（用于清理 project_backends，可选）
     /// * `container_ip` - 容器 IP（来自 state 的 `container_info`，用于 gRPC addr 清理；
-    ///   重建后可能陈旧，但 `grpc_pool.remove` 一个陈旧 addr 是无害 no-op, 且 ResourceReaper
-    ///   对 gRPC/pingora 清理有冗余兜底 —— best-effort）
+    ///   来自本次销毁观察，不依赖存储删除再触发另一轮物理清理）
     pub async fn destroy_with_reason(
         &self,
         container_name: &str,

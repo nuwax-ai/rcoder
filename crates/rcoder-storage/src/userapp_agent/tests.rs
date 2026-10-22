@@ -5,7 +5,7 @@ fn deadline() -> tokio::time::Instant {
     tokio::time::Instant::now() + std::time::Duration::from_secs(5)
 }
 fn fixture() -> ProjectStoreBackend {
-    let (inner, _cleanup) = crate::ProjectAdapter::new("test".into(), "cluster.local".into());
+    let inner = crate::ProjectAdapter::new("test".into(), "cluster.local".into());
     let mut app = ProjectAndContainerInfo::new("app-1".into());
     app.set_service_type(Some(ServiceType::UserappBuilder));
     app.set_request_id(Some("builder-metadata".into()));

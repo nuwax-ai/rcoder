@@ -7,7 +7,7 @@ async fn sync_snapshot_does_not_resurrect_locally_accepted_project_retirement() 
     let Some(dsn) = test_dsn().await else { return };
     let project_id = format!("sync-local-retirement-{}", uuid_suffix());
     let session_id = format!("session-{project_id}");
-    let (store, _cleanup) = PgStore::connect(
+    let store = PgStore::connect(
         &PostgresConfig {
             max_connections: Some(4),
             min_connections: Some(1),

@@ -557,8 +557,7 @@ async fn two_postgres_http_instances_register_concurrent_projects_and_immediate_
     let primary = Arc::new(
         PgStore::connect(&config, "isolated-http-test".into(), "cluster.local".into())
             .await
-            .unwrap()
-            .0,
+            .unwrap(),
     );
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let seed_id = format!("http-shared-seed-{suffix}");
@@ -578,8 +577,7 @@ async fn two_postgres_http_instances_register_concurrent_projects_and_immediate_
     let peer = Arc::new(
         PgStore::connect(&config, "isolated-http-test".into(), "cluster.local".into())
             .await
-            .unwrap()
-            .0,
+            .unwrap(),
     );
     let with_store = |store: Arc<PgStore>| {
         let mut state = (*base).clone();

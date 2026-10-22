@@ -657,8 +657,7 @@ mod tests {
             outcome,
             lease_state: lease_state.clone(),
         });
-        let (adapter, _cleanup_rx) =
-            ProjectAdapter::new("test-ns".to_string(), "cluster.local".to_string());
+        let adapter = ProjectAdapter::new("test-ns".to_string(), "cluster.local".to_string());
         let activity = Arc::new(AppActivityRegistry::new(std::time::Duration::from_secs(
             300,
         )));
@@ -710,7 +709,7 @@ mod tests {
             container_prefix_rcoder: "dev-rcoder".to_string(),
             container_prefix_computer: "computer-agent-runner".to_string(),
             runtime,
-            cleanup_rx: Arc::new(Mutex::new(None)),
+
             agent_download_manager,
             app_service,
             activity,

@@ -140,8 +140,7 @@ Tokio API（零插桩），开=带 instrumented 标记记录 wake 因果（ready
 
 **未覆盖（有意保留，勿混淆）**：Hyper H2 executor 内部任务（可选路径为本地
 `hyper::rt::Executor` impl 替换 `TokioExecutor`，按需再接）；Axum
-WebSocket/on_upgrade 自行 spawn 的应用任务两者都不经上述门面。后台 reaper
-循环刻意不接（无 wake 因果排查需求）。
+WebSocket/on_upgrade 自行 spawn 的应用任务两者都不经上述门面。
 
 ### 挂线核对（有没有数据，三轴分开看）
 

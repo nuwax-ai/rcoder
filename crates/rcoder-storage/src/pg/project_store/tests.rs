@@ -68,7 +68,7 @@ async fn shared_container_revision_does_not_reject_session_registration() {
     let second_session = format!("shared-session-second-{suffix}");
     let mut container = container_for(&user_id);
     container.workload_uid = Some(format!("shared-workload-{suffix}"));
-    let (store, _rx) = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+    let store = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
         .await
         .expect("connect disposable PG");
     let project = |id: &str| {
@@ -106,7 +106,7 @@ async fn shared_container_revision_does_not_reject_session_registration() {
         second_id
     );
     assert!(store.wait_drained(Duration::from_secs(5)).await);
-    let (peer, _rx) = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+    let peer = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
         .await
         .unwrap();
     assert_eq!(
@@ -144,7 +144,7 @@ async fn peer_shared_container_revision_keeps_session_registration_durable() {
         info.set_container(Some(container.clone()));
         Arc::new(info)
     };
-    let (first, _rx) = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+    let first = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
         .await
         .unwrap();
     first.insert(first_id.clone(), project(&first_id)).unwrap();
@@ -152,10 +152,9 @@ async fn peer_shared_container_revision_keeps_session_registration_durable() {
     let first_snapshot = first.get(&first_id).unwrap();
     // The second replica has its own cursor. Its commit is deliberately not
     // synchronized into the first replica before chat A's completion arrives.
-    let (second, _rx) =
-        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
-            .await
-            .unwrap();
+    let second = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .unwrap();
     let mut peer_project = (*project(&second_id)).clone();
     let mut latest_container = container.clone();
     latest_container.service_url = format!("http://updated-shared-{suffix}");
@@ -170,10 +169,9 @@ async fn peer_shared_container_revision_keeps_session_registration_durable() {
         .await
         .unwrap();
     assert!(first.wait_drained(Duration::from_secs(5)).await);
-    let (reader, _rx) =
-        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
-            .await
-            .unwrap();
+    let reader = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .unwrap();
     assert_eq!(
         reader
             .get_by_session_id(&first_session)
@@ -216,10 +214,9 @@ async fn roundtrip_persists_and_reload_recovers() {
 
     // 第一段：写入 → write-behind 落 PG
     {
-        let (store, _rx) =
-            PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
-                .await
-                .expect("connect");
+        let store = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+            .await
+            .expect("connect");
         store
             .insert_with_session(
                 project_id.clone(),
@@ -271,10 +268,9 @@ async fn roundtrip_persists_and_reload_recovers() {
 
     // 第二段：模拟重启——drop 旧 store（连接释放），重连全量加载
     {
-        let (store2, _rx) =
-            PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
-                .await
-                .expect("reconnect");
+        let store2 = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+            .await
+            .expect("reconnect");
         let resolved = store2
             .get_by_session_id(&session_id)
             .expect("session resolve from loaded mirror");
@@ -285,10 +281,9 @@ async fn roundtrip_persists_and_reload_recovers() {
 
     // 清理：删除 project（级联 session）
     {
-        let (store3, _rx) =
-            PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
-                .await
-                .expect("connect for cleanup");
+        let store3 = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+            .await
+            .expect("connect for cleanup");
         assert!(store3.remove(&project_id).is_some());
         assert!(
             wait_for(
@@ -321,7 +316,7 @@ async fn clear_sessions_and_delete_container() {
     let pool = crate::pg::test_support::database(&dsn).await;
     let project_id = format!("pgdel-{}", uuid_suffix());
 
-    let (store, _rx) = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+    let store = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
         .await
         .expect("connect");
     store
@@ -384,19 +379,17 @@ async fn cross_replica_sync_visibility_and_removal() {
     };
 
     // 副本 B 先连（空库快照），模拟已运行的旧副本
-    let (store_b, _rx_b) =
-        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
-            .await
-            .expect("connect B");
+    let store_b = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .expect("connect B");
     let pool_b = store_b.database.clone();
 
     // 副本 A 连接并写入
     let project_id = format!("xrep-{}", uuid_suffix());
     let session_id = format!("sess-{project_id}");
-    let (store_a, _rx_a) =
-        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
-            .await
-            .expect("connect A");
+    let store_a = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .expect("connect A");
     store_a
         .insert_with_session(
             project_id.clone(),
@@ -460,7 +453,7 @@ async fn cross_replica_sync_is_idempotent_for_own_entries() {
         eprintln!("[skip] {DSN_ENV} not set");
         return;
     };
-    let (store, _rx) = PgStore::connect(
+    let store = PgStore::connect(
         &PostgresConfig {
             url: Some(dsn),
             ..PostgresConfig::default()
@@ -564,7 +557,7 @@ async fn durable_commit_returns_after_pg_visible() {
 
     let project_id = format!("pgdur-{}", uuid_suffix());
     let session_id = format!("sess-{project_id}");
-    let (store, _rx) = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+    let store = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
         .await
         .expect("connect");
 
@@ -605,16 +598,14 @@ async fn session_miss_backfills_from_pg_into_mirror() {
 
     // B must load before A commits: startup now restores persisted session identity.
     // This creates a real cross-replica miss without weakening the miss assertion.
-    let (store_b, _rx_b) =
-        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
-            .await
-            .expect("connect B");
+    let store_b = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .expect("connect B");
 
     // 副本 A durable 写入（模拟 chat 落 A）
-    let (store_a, _rx_a) =
-        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
-            .await
-            .expect("connect A");
+    let store_a = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .expect("connect A");
     store_a
         .insert_with_session_durable(
             project_id.clone(),
@@ -678,7 +669,7 @@ async fn workload_generation_gate_allows_rebind_only_for_same_workload() {
     };
     let pool = crate::pg::test_support::database(&dsn).await;
     let project_id = format!("wrep-{}", uuid_suffix());
-    let (store, _rx) = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+    let store = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
         .await
         .expect("connect");
 
@@ -805,10 +796,9 @@ async fn authoritative_gate_allows_replacement_after_peer_delete() {
         Arc::new(info)
     };
 
-    let (store_a, _rx_a) =
-        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
-            .await
-            .expect("connect A");
+    let store_a = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .expect("connect A");
     store_a
         .insert_project_registration_durable(
             project_id.clone(),
@@ -822,10 +812,9 @@ async fn authoritative_gate_allows_replacement_after_peer_delete() {
     );
 
     // 副本 B 后连（镜像含旧 UID），随后 A durable 删除（写 tombstone）。
-    let (store_b, _rx_b) =
-        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
-            .await
-            .expect("connect B");
+    let store_b = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .expect("connect B");
     let (deleted, projects) = store_a
         .delete_container_with_projects_durable(&format!("pod-a-{project_id}"))
         .await;
@@ -916,10 +905,9 @@ async fn cross_replica_sync_removes_stale_container_mirror() {
         Arc::new(info)
     };
 
-    let (store_a, _rx_a) =
-        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
-            .await
-            .expect("connect A");
+    let store_a = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .expect("connect A");
     store_a
         .insert_project_registration_durable(
             project_id.clone(),
@@ -932,10 +920,9 @@ async fn cross_replica_sync_removes_stale_container_mirror() {
         "A register drain"
     );
 
-    let (store_b, _rx_b) =
-        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
-            .await
-            .expect("connect B");
+    let store_b = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .expect("connect B");
     let (deleted, projects) = store_a
         .delete_container_with_projects_durable(&format!("pod-a-{project_id}"))
         .await;
@@ -1027,10 +1014,9 @@ async fn external_workload_replacement_still_refused_as_conflict() {
         Arc::new(info)
     };
 
-    let (store_a, _rx_a) =
-        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
-            .await
-            .expect("connect A");
+    let store_a = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .expect("connect A");
     store_a
         .insert_project_registration_durable(
             project_id.clone(),
@@ -1043,10 +1029,9 @@ async fn external_workload_replacement_still_refused_as_conflict() {
         "A register drain"
     );
 
-    let (store_b, _rx_b) =
-        PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
-            .await
-            .expect("connect B");
+    let store_b = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .expect("connect B");
 
     // 真外部替换：DB 行仍在（sts-uid-old），B 观察到 sts-uid-new → 拒绝。
     let refused = store_b

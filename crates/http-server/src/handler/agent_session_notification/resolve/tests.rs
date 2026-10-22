@@ -29,8 +29,7 @@ async fn closed_database_state(fixture: &Fixture) -> Option<Arc<crate::app_state
         "cluster.local".into(),
     )
     .await
-    .unwrap()
-    .0;
+    .unwrap();
     assert!(
         store
             .shutdown_flush_outcome(Duration::from_secs(5))

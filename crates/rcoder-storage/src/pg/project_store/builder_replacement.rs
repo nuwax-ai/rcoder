@@ -935,7 +935,7 @@ mod tests {
                 service_url: "http://10.42.0.9:60000".into(),
                 workload_uid: Some(workload_uid.into()),
             };
-            let (store, _cleanup) = PgStore::connect(
+            let store = PgStore::connect(
                 &crate::config::PostgresConfig {
                     url: Some(dsn.clone()),
                     ..Default::default()

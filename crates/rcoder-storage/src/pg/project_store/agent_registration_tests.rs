@@ -101,7 +101,6 @@ async fn store(dsn: &str) -> PgStore {
     )
     .await
     .unwrap()
-    .0
 }
 
 /// 用显式 durable 链路预算构造 store（与默认值解耦，测试快且确定）。
@@ -117,7 +116,6 @@ async fn store_with_budget(dsn: &str, chain_ms: u64) -> PgStore {
     )
     .await
     .unwrap()
-    .0
 }
 
 /// 放大 durable 预算到 15s 后，register_project 的 lock_ops 等待 advisory lock

@@ -465,3 +465,31 @@ fixture Pod 的 `kubectl exec`，没有 HTTP 写控制接口。fixture 不启动
 文件 CRUD、Git、ZIP CRC，并在 Stop 后通过原 native Start 重开，核对原数据与
 Git HEAD 保留。正式验收必须关联本轮注册的源码和实际二进制回执；未归因的本机
 二进制 API 前置探测不算最终验收，native-only 不能替代 K8s、Compose 或真实 AI 回归。
+
+
+## 本地 PG leader 与迟到元数据故障回归
+
+这两个定向用例不调用模型。PG 用例通过真实 Docker PostgreSQL、同一个 AppState 和生产后台装配，终止本轮精确持锁连接，保持失主窗口，再验证四个周期任务重新执行。Docker 用例启动真实后台装配，以受控运行时执行本轮容器操作，验证旧元数据晚于同名新 CID 退休时，新容器、会话索引与卷标记保留。它们不替代完整 HTTP/业务部署 E2E。
+
+先准备本地 `postgres:17` 镜像并单独编译测试二进制；工具冻结实际镜像 ID，不会替换日常 RCoder。测试二进制取 Cargo JSON 中 `target.name=rcoder_engine`、`reason=compiler-artifact` 对应的 `executable`，不能填写主服务二进制。
+
+```bash
+cargo test -p rcoder-engine --features rcoder-pg --lib --no-run --message-format=json \
+  > /tmp/rcoder-leader-tests.jsonl
+
+python3 tests-e2e/tools/leader_pg_fixture.py prepare \
+  --directory "tests-e2e/reports/leader-local-<run>"
+
+python3 tests-e2e/tools/leader_pg_fixture.py run \
+  --directory "tests-e2e/reports/leader-local-<run>" \
+  --test-binary "<engine-libtest-executable>"
+
+python3 tests-e2e/tools/leader_pg_fixture.py run \
+  --directory "tests-e2e/reports/leader-local-<run>" \
+  --test-binary "<engine-libtest-executable>" --case docker-metadata
+
+python3 tests-e2e/tools/leader_pg_fixture.py cleanup \
+  --directory "tests-e2e/reports/leader-local-<run>"
+```
+
+每轮使用新目录。私有凭据仅保存在权限为 0600 的环境文件中；工具检查本轮完整容器 ID、归属标签和 loopback 端口。`run` 必须实际执行恰好一个用例并生成成功回执，空筛选或缺回执会失败。清理只删除本轮捕获的 PG 容器，保留命名卷和故障日志；Docker 用例也只清本轮捕获的 CID，不删除数据卷。根关机或旧任务排空失败不算恢复成功。

@@ -141,8 +141,7 @@ impl UserAppDeploymentRuntime for ProbeRuntime {
 /// 轻量 AppState 字面量构造（绕过 AppState::new 的 AppService 装配副作用）。
 /// 状态检查器只消费 runtime / grpc_pool / projects 三个字段。
 async fn test_state(runtime: Arc<ProbeRuntime>) -> (Arc<AppState>, tempfile::TempDir) {
-    let (adapter, _cleanup_rx) =
-        ProjectAdapter::new("test-ns".to_string(), "cluster.local".to_string());
+    let adapter = ProjectAdapter::new("test-ns".to_string(), "cluster.local".to_string());
     let activity = Arc::new(app_manager::AppActivityRegistry::new(Duration::from_secs(
         300,
     )));
@@ -192,7 +191,7 @@ async fn test_state(runtime: Arc<ProbeRuntime>) -> (Arc<AppState>, tempfile::Tem
         container_prefix_rcoder: "dev-rcoder".to_string(),
         container_prefix_computer: "computer-agent-runner".to_string(),
         runtime,
-        cleanup_rx: Arc::new(Mutex::new(None)),
+
         agent_download_manager,
         app_service,
         activity,

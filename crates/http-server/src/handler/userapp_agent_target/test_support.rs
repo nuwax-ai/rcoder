@@ -426,8 +426,7 @@ impl Fixture {
             .await
             .unwrap(),
         );
-        let (adapter, _) =
-            crate::storage::ProjectAdapter::new("test-ns".into(), "cluster.local".into());
+        let adapter = crate::storage::ProjectAdapter::new("test-ns".into(), "cluster.local".into());
         let projects = Arc::new(crate::storage::ProjectStoreBackend::Memory(Arc::new(
             adapter,
         )));
@@ -456,7 +455,7 @@ impl Fixture {
             container_prefix_rcoder: "fixture-web".into(),
             container_prefix_computer: "fixture-computer".into(),
             runtime: runtime.clone(),
-            cleanup_rx: Arc::new(Mutex::new(None)),
+
             agent_download_manager: Arc::new(
                 agent_provisioning::AgentDownloadManager::new(root.path()).unwrap(),
             ),

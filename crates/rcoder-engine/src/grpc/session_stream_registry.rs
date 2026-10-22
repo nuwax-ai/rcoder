@@ -10,7 +10,7 @@
 //! 1. **首连资格**（served_sessions）：无游标客户端"首连兜 chat→SSE 时间差
 //!    （from_seq=0 全量回放）vs 中间连接纯实时（不重放，防重复红线）"的裁决；
 //!    turn 终态（end_turn/error）时归还资格——新一轮 turn 的首连重新可兜。
-//! 2. **活跃流登记**（active）：容器销毁路径（reaper/restart/destroyer）按
+//! 2. **活跃流登记**（active）：容器销毁路径（restart/destroyer）按
 //!    grpc_addr / session_id 取消该容器上的所有客户端转发 task。
 
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use tonic::Code;
 use tracing::info;
 
 /// SSE 共享流关闭回调类型（参数为 grpc_addr）。
-/// 容器销毁路径（reaper/restart/ensure/destroyer）按地址关闭前端进度流。
+/// 容器销毁路径（restart/ensure/destroyer）按地址关闭前端进度流。
 pub type ShutdownSseFn = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// 流错误重试上限（连接失败/流错误的重试次数）
@@ -252,7 +252,7 @@ impl SessionStreamRegistry {
         closed > 0
     }
 
-    /// 按 grpc_addr 批量关闭客户端转发流（容器销毁路径：reaper/restart/ensure/
+    /// 按 grpc_addr 批量关闭客户端转发流（容器销毁路径：restart/ensure/
     /// destroyer 调用——"project/session 记录可能已被清空、只剩 grpc_addr 可用"）。
     /// 幂等：重复调用返回 0。
     pub fn shutdown_streams_by_addr(&self, grpc_addr: &str) -> usize {
