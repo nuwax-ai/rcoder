@@ -22,6 +22,7 @@ use agent_provisioning::AgentDownloadManager;
 
 mod agent_registration;
 pub use agent_registration::RegistrationMetadata;
+mod agent_retirement;
 
 // 存储契约 trait 引入作用域：AppState.projects 为枚举 ProjectStoreBackend，
 // 其上的 get/insert/... 方法均经 shared_types::ProjectStore 解析。
@@ -318,13 +319,21 @@ impl AppState {
         &self,
         project_id: &str,
     ) -> Option<Arc<ProjectAndContainerInfo>> {
-        let removed = self.projects.remove_durable(project_id).await;
-        // session 终结：归还 served_sessions 首连资格条目（防无界累积；调用方
-        // 已先行 shutdown_sse_streams_for_project 关流，此处只清资格登记）
-        if let Some(info) = &removed {
-            for sid in info.sessions() {
+        let claims: Vec<_> = self
+            .get_project(project_id)
+            .into_iter()
+            .flat_map(|info| info.sessions().into_iter())
+            .filter_map(|sid| {
                 self.session_stream_registry
-                    .release_first_client_claim(&sid);
+                    .capture_first_client_claim(&sid)
+                    .map(|claim| (sid, claim))
+            })
+            .collect();
+        let removed = self.projects.remove_durable(project_id).await;
+        if removed.is_some() {
+            for (sid, claim) in claims {
+                self.session_stream_registry
+                    .release_first_client_claim_if_current(&sid, &claim);
             }
         }
         removed
@@ -352,13 +361,23 @@ impl AppState {
             })
             .flat_map(|(_, info)| info.sessions().into_iter())
             .collect();
+        let claims: Vec<_> = sids
+            .into_iter()
+            .filter_map(|sid| {
+                self.session_stream_registry
+                    .capture_first_client_claim(&sid)
+                    .map(|claim| (sid, claim))
+            })
+            .collect();
         let result = self
             .projects
             .delete_container_with_projects_durable(container_id)
             .await;
-        for sid in sids {
-            self.session_stream_registry
-                .release_first_client_claim(&sid);
+        if result.0 || result.1 > 0 {
+            for (sid, claim) in claims {
+                self.session_stream_registry
+                    .release_first_client_claim_if_current(&sid, &claim);
+            }
         }
         result
     }

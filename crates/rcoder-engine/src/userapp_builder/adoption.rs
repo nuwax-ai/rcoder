@@ -39,6 +39,9 @@ pub(crate) async fn execute(
     let state = state.clone();
     let app_id = app_id.to_owned();
     tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(state.config.userapp_storage.ensure_timeout_seconds);
+        let _workload = super::builder_workload_admission(&state, &app_id, deadline).await?;
         let _local = super::lifecycle::acquire(&app_id).await;
         let input = shared_types::UserAppExecutionInput::new(serde_json::to_string(&request)?);
         let record = match state

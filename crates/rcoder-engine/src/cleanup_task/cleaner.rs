@@ -2,7 +2,7 @@
 //!
 //! 协调各模块完成清理任务
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use dashmap::DashSet;
 // 存储契约 trait：state.projects（ProjectStoreBackend 枚举）上的方法经此解析
@@ -31,7 +31,7 @@ pub struct AgentCleaner {
     /// 下一轮扫描仍闲置（第二次连续命中）才真正销毁。key = container_name。
     /// 本轮不再闲置（用户回归）的条目由 `cleanup_once` 的 retain 清除，保证「连续」语义。
     /// 详见 `cleanup_agent` 的二次确认闸门。延迟 ≈ 一个 cleanup_interval（连续两轮）。
-    pending_destroy: DashSet<String>,
+    pending_destroy: DashSet<(String, String, Option<String>)>,
 }
 
 impl AgentCleaner {
@@ -49,14 +49,6 @@ impl AgentCleaner {
 
         // 判断是否是 K8s 运行时（通过 features flag）
         let is_kubernetes = shared_types::is_kubernetes_runtime();
-
-        // SSE 关闭回调：destroyer 物理销毁后按 grpc_addr 关闭前端进度流。
-        // 与下方 cleanup_once 中既有的 shutdown_sse_streams_for_project 调用冗余但幂等
-        // （前者按地址、后者按 project sessions 枚举），双保险覆盖记录已清空场景。
-        let shutdown_sse: crate::grpc::ShutdownSseFn = {
-            let state = state.clone();
-            Arc::new(move |addr: &str| state.shutdown_sse_streams_by_addr(addr))
-        };
 
         // 创建日志清理器（使用配置）
         let log_cleaner = super::logs::LogCleaner::new(
@@ -77,8 +69,7 @@ impl AgentCleaner {
                 namespace,
                 state.cluster_domain.clone(),
                 is_kubernetes,
-            )
-            .with_shutdown_sse(shutdown_sse),
+            ),
             agent_scanner: {
                 use crate::cleanup_task::agent::AgentScanner;
                 AgentScanner::new(state.clone(), config_clone)
@@ -115,14 +106,21 @@ impl AgentCleaner {
         //    清掉其「已见过一次 idle」标记，下个闲置周期重新计数；本轮仍闲置的容器保留标记。
         //    这保证了「连续两轮 idle 才销毁」的连续性——中间任一轮恢复，计数清零重来。
         {
-            let idle_keys: std::collections::HashSet<String> = idle_agents
-                .iter()
-                .filter_map(|pid| {
-                    self.state
-                        .get_project(pid)
-                        .and_then(|i| i.container_info().map(|c| c.container_name.clone()))
-                })
-                .collect();
+            let idle_keys: std::collections::HashSet<(String, String, Option<String>)> =
+                idle_agents
+                    .iter()
+                    .filter_map(|pid| {
+                        self.state.get_project(pid).and_then(|i| {
+                            i.container_info().map(|c| {
+                                (
+                                    c.container_name.clone(),
+                                    c.container_id.clone(),
+                                    c.workload_uid.clone(),
+                                )
+                            })
+                        })
+                    })
+                    .collect();
             self.pending_destroy.retain(|k| idle_keys.contains(k));
         }
 
@@ -154,8 +152,9 @@ impl AgentCleaner {
             if let Some(ref name) = container_name
                 && destroyed_containers.contains(name)
             {
-                // 容器已被销毁，只需删除项目记录
-                self.state.remove_project_durable(&project_id).await;
+                // The first stop retired only its captured canonical frame.
+                // A surviving row may be a later registration; never delete it
+                // merely because this scan previously stopped the same name.
                 current_stats.total_cleaned += 1;
                 current_stats.success_cleaned += 1;
                 info!(
@@ -305,153 +304,179 @@ impl AgentCleaner {
         //    不被误杀；无容器的孤立 project 记录直接走下方清理（否则用 project_id 当 key 会被
         //    cleanup_once 的 retain 每轮清掉、永不连击、孤立记录清不掉）。
         if destroy_reason.is_some()
-            && let Some(grace_key) = agent_info
-                .container_info()
-                .map(|c| c.container_name.clone())
+            && let Some(grace_key) = agent_info.container_info().map(|c| {
+                (
+                    c.container_name.clone(),
+                    c.container_id.clone(),
+                    c.workload_uid.clone(),
+                )
+            })
         {
             // insert 返回 true = 此前不在集合 = 本轮是第一次命中 → 先记下、放一马
             // insert 返回 false = 已在集合 = 连续第二次命中 → 真正销毁
             let first_hit = self.pending_destroy.insert(grace_key.clone());
             if first_hit {
                 info!(
-                    "[cleaner] 🔁 idle first seen, will reconfirm next scan before destroy: project_id={}, container={}",
-                    project_id, grace_key
+                    project_id,
+                    ?grace_key,
+                    "[cleaner] idle first seen; reconfirm before destruction"
                 );
                 return Ok(false); // 容器还活着：不销毁、不删 project 记录
             }
             // 连续第二次命中：本轮 scanner 仍判闲置 + 上面 idle_secs 复核仍超时 → 继续销毁
             info!(
-                "[cleaner] 🔁 idle confirmed (2nd consecutive scan), proceeding to destroy: project_id={}, container={}",
-                project_id, grace_key
+                project_id,
+                ?grace_key,
+                "[cleaner] idle confirmed on consecutive scans"
             );
             self.pending_destroy.remove(&grace_key);
             // 落入下方销毁逻辑
         }
 
-        // 4. 如果需要销毁容器
-        let mut container_destroyed = false;
-        if let Some(reason) = destroy_reason
-            && let Some(container_info) = captured_container.as_ref()
-        {
-            let _builder_retirement = if service_type == ServiceType::UserappBuilder {
-                let Some(guard) =
-                    crate::userapp_builder::try_idle_builder_retirement(project_id).await
-                else {
-                    return Ok(false);
-                };
-                // The earlier scan is only a snapshot. Recheck real target
-                // work immediately before retiring the captured compute.
-                let address = match crate::utils::extract_grpc_addr_with_port(
-                    &container_info.service_url,
-                    shared_types::GRPC_DEFAULT_PORT,
-                ) {
-                    Ok(address) => address,
-                    Err(error) => {
-                        warn!(project_id, %error, "skip builder retirement: activity endpoint unavailable");
-                        return Ok(false);
-                    }
-                };
-                match self
-                    .agent_scanner
-                    .status_checker
-                    .is_container_active(
-                        &address,
-                        agent_info.user_id().unwrap_or(project_id),
-                        project_id,
-                    )
-                    .await
-                {
-                    Ok(false) => {}
-                    Ok(true) => return Ok(false),
-                    Err(error) => {
-                        warn!(project_id, %error, "skip builder retirement: current work is unknown");
-                        return Ok(false);
-                    }
-                }
-                let Some(current) = self.state.get_project(project_id) else {
-                    return Ok(false);
-                };
-                if current.container_info().as_ref().is_none_or(|current| {
-                    current.container_id != container_info.container_id
-                        || current.workload_uid != container_info.workload_uid
-                }) || (Utc::now() - current.last_activity()).num_seconds()
-                    < self.config.idle_timeout.as_secs() as i64
-                    || builder_fenced_by_active_operations(
-                        self.state.userapp_store.as_ref(),
-                        project_id,
-                    )
-                    .await
-                {
-                    return Ok(false);
-                }
-                Some(guard)
-            } else {
-                None
-            };
-            let project_info = super::strategies::ProjectInfo {
-                project_id: agent_info.project_id().to_string(),
-                user_id: agent_info.user_id().map(|s| s.to_string()),
-                pod_id: agent_info.pod_id().map(|s| s.to_string()),
-                last_activity: agent_info.last_activity(),
-            };
-
-            let container_identifier = strategy.get_container_identifier(&project_info)?;
-
-            if service_type == ServiceType::UserappBuilder {
-                self.container_destroyer
-                    .destroy_idle_builder_compute(&container_identifier, container_info, &reason)
-                    .await?;
-            } else {
-                self.container_destroyer
-                    .destroy_with_reason(
-                        &container_info.container_name,
-                        &service_type,
-                        &container_identifier,
-                        &reason,
-                        Some(project_id),
-                        &container_info.container_ip,
-                    )
-                    .await?;
+        if destroy_reason.is_none() {
+            if let Some(container) = captured_container.as_ref() {
+                self.pending_destroy.remove(&(
+                    container.container_name.clone(),
+                    container.container_id.clone(),
+                    container.workload_uid.clone(),
+                ));
             }
-
-            container_destroyed = true;
+            return Ok(false);
         }
-
-        // 5. 从存储中移除记录
-        if container_destroyed {
-            // 容器已销毁：删除容器记录及其关联的所有项目记录（避免孤立容器记录）
-            let container_id = captured_container
-                .as_ref()
-                .map(|c| c.container_id.clone())
-                .unwrap_or_default();
-            // 先关闭该容器所有 project 的 SSE 共享流（delete_container_with_projects 会移除 project 记录）
-            for p in self
-                .state
-                .projects
-                .get_projects_by_container_id(&container_id)
-            {
-                self.state.shutdown_sse_streams_for_project(p.project_id());
-            }
-            let (deleted, project_count) = self
-                .state
-                .delete_container_with_projects_durable(&container_id)
-                .await;
-            info!(
-                "[cleaner] Deleted container and {} associated projects from storage: container_id={}, container_deleted={}",
-                project_count, container_id, deleted
-            );
+        // A strategy declining destruction is not permission to erase a
+        // current registration. Retain it for shared-workload reuse/read APIs.
+        let (Some(reason), Some(container_info)) = (destroy_reason, captured_container.as_ref())
+        else {
+            return Ok(false);
+        };
+        let identifier = service_type
+            .container_identifier(agent_info.pod_id(), agent_info.user_id(), Some(project_id))?
+            .to_owned();
+        let admission = self
+            .state
+            .acquire_agent_workload(
+                &identifier,
+                &service_type,
+                rcoder_storage::WorkloadAdmissionMode::Exclusive,
+            )
+            .await?;
+        // Builder retains its existing lifecycle/operation admission. The
+        // additional catalog guard protects the registration CAS, not a bypass.
+        // Keep the creation order: workload admission precedes local lifecycle.
+        let _builder_retirement = if service_type == ServiceType::UserappBuilder {
+            let Some(guard) = crate::userapp_builder::try_idle_builder_retirement(project_id).await
+            else {
+                return Ok(false);
+            };
+            Some(guard)
         } else {
-            // 容器未销毁（仅超时等原因）：只删除当前项目记录
-            // 先关闭该 project 的 SSE 共享流（remove_project 会清空 sessions 集合）
-            self.state.shutdown_sse_streams_for_project(project_id);
-            self.state.remove_project_durable(project_id).await;
-            info!(
-                "[cleaner] Removed project record only (container not destroyed): project_id={}",
-                project_id
-            );
+            None
+        };
+        let frame = self
+            .state
+            .projects
+            .capture_workload_registration(&admission, admission.key().logical_name())
+            .await?;
+        if !frame.project_ids().contains(&project_id) {
+            // A stale local mirror cannot turn a registry-absent live Pod into
+            // a registered idle deletion candidate. Orphan GC observes it.
+            return Ok(false);
         }
-
-        Ok(container_destroyed)
+        // Read every canonical reference, including rows not yet in this
+        // replica's mirror. Unknown or recently refreshed activity skips this
+        // round; it is not evidence that compute has become idle.
+        for id in frame.project_ids() {
+            let Some(current) = self.state.projects.refresh_project_registration(id).await? else {
+                return Ok(false);
+            };
+            if (Utc::now() - current.last_activity()).num_seconds()
+                < self.config.idle_timeout.as_secs() as i64
+                || current.container_info().as_ref().is_none_or(|actual| {
+                    actual.container_id != container_info.container_id
+                        || actual.workload_uid != container_info.workload_uid
+                })
+            {
+                return Ok(false);
+            }
+        }
+        let address = match crate::utils::extract_grpc_addr_with_port(
+            &container_info.service_url,
+            shared_types::GRPC_DEFAULT_PORT,
+        ) {
+            Ok(address) => address,
+            Err(error) => {
+                warn!(project_id, %error, "skip idle retirement: activity endpoint is unreadable");
+                return Ok(false);
+            }
+        };
+        // Capture before the final live observation. A same-name successor
+        // appearing during that RPC can never become this cleanup's target.
+        let runtime_snapshot = if service_type == ServiceType::UserappBuilder {
+            None
+        } else {
+            let snapshot = self
+                .state
+                .runtime()
+                .capture_agent_stop(&identifier, &service_type)
+                .await?;
+            let observed = snapshot
+                .container
+                .as_ref()
+                .or_else(|| snapshot.pods.first());
+            if observed.is_none_or(|observed| observed.uid != container_info.container_id) {
+                return Ok(false);
+            }
+            Some(snapshot)
+        };
+        match self
+            .agent_scanner
+            .status_checker
+            .is_container_active(
+                &address,
+                agent_info.user_id().unwrap_or(project_id),
+                project_id,
+            )
+            .await
+        {
+            Ok(false) => {}
+            Ok(true) => return Ok(false),
+            Err(error) => {
+                warn!(project_id, %error, "skip idle retirement: current execution is unknown");
+                return Ok(false);
+            }
+        }
+        admission.verify_current().await?;
+        info!(project_id, identifier = %identifier, container_name = %container_info.container_name,
+            container_id = %container_info.container_id, reason = reason.as_str(), reason_detail = %reason.description(),
+            "Retiring idle compute after current activity and canonical reference checks");
+        if service_type == ServiceType::UserappBuilder {
+            if builder_fenced_by_active_operations(self.state.userapp_store.as_ref(), project_id)
+                .await
+            {
+                return Ok(false);
+            }
+            self.container_destroyer
+                .destroy_idle_builder_compute(&identifier, container_info, &reason)
+                .await?;
+            let outcome = self
+                .state
+                .retire_stopped_agent_registration(&admission, &frame)
+                .await?;
+            anyhow::ensure!(
+                outcome == shared_types::persistence::PersistenceWriteOutcome::Committed,
+                "Builder stopped but registration retirement is not confirmed: {outcome:?}"
+            );
+            self.state.grpc_pool.remove(&address).await;
+        } else if let Some(snapshot) = runtime_snapshot.as_ref() {
+            self.state
+                .stop_captured_ordinary_agent_workload(&admission, snapshot)
+                .await
+                .with_context(|| format!("Idle compute retirement: project_id={project_id}, identifier={identifier}, container_id={}, reason={}",
+                    container_info.container_id, reason.description()))?;
+        }
+        info!(project_id, container_id = %container_info.container_id, reason = reason.as_str(), reason_detail = %reason.description(),
+            "Idle compute and its captured canonical registration retired");
+        Ok(true)
     }
 
     /// 滚动升级判据：agent 容器镜像是否落后于当前进程期望。

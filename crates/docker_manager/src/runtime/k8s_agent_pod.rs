@@ -13,7 +13,7 @@ use container_runtime_api::{
 use k8s_openapi::api::core::v1::{Pod, Service};
 use kube::api::{Api, DeleteParams, ListParams};
 use shared_types::{ContainerBasicInfo, ServiceType};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use super::k8s_pod::K8sPodOps;
 use super::k8s_service::K8sServiceOps;
@@ -25,77 +25,32 @@ impl KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<()> {
-        let total_start = std::time::Instant::now();
-        let pod_name = self.pod_name(identifier, service_type)?;
-
-        // STS 实际 pod 名（等待终止用）；pod_name 即 sts_name。
-        let agent_pod = self.agent_pod_name(identifier, service_type)?;
-
-        info!(
-            "[K8S] Destroying agent StatefulSet {} (identifier={}, service_type={})",
-            pod_name, identifier, service_type
-        );
-
-        if *service_type == ServiceType::UserappBuilder {
-            return self
-                .stop_idle_builder(identifier, &pod_name, &agent_pod, None, None)
-                .await;
+        match service_type {
+            ServiceType::WebAgentRunner
+            | ServiceType::ComputerAgentRunner
+            | ServiceType::ComputerNormalProject => {
+                let snapshot = self
+                    .capture_agent_retirement(identifier, service_type)
+                    .await?;
+                match self.retire_agent_snapshot(&snapshot, false).await? {
+                    container_runtime_api::AgentStopOutcome::Complete => Ok(()),
+                    container_runtime_api::AgentStopOutcome::ComputeGoneServicesPending {
+                        pending,
+                    } => Err(ContainerRuntimeError::ContainerStopError(format!(
+                        "Agent compute exited but captured Service cleanup remains pending: {pending:?}"
+                    ))),
+                }
+            }
+            ServiceType::UserappBuilder => {
+                let workload = self.pod_name(identifier, service_type)?;
+                let pod = self.agent_pod_name(identifier, service_type)?;
+                self.stop_idle_builder(identifier, &workload, &pod, None, None)
+                    .await
+            }
+            ServiceType::Userapp => Err(ContainerRuntimeError::ConfigurationError(
+                "Production UserApp stop must use its Deployment lifecycle".into(),
+            )),
         }
-
-        // Step 0: 删除 ClusterIP Service（先摘流量 / 移除 DNS，再销毁 pod）
-        if let Err(e) = self.delete_agent_service(identifier, service_type).await {
-            warn!(
-                "[K8S] Failed to delete ClusterIP Service for {}: {} (continuing)",
-                identifier, e
-            );
-        }
-
-        // Step 1: 删除 StatefulSet（Foreground cascade → pod 随之终止）。回收 = 彻底销毁 STS
-        // （非 scale 0；scale 0 会留 STS 永不清理）。PVC 保留（数据复用，下次 ensure 重建挂回）。
-        //
-        // STS 删除失败必须上抛：delete_agent_statefulset 已把 404→Ok，返回 Err 必为真失败。
-        // 若仍清 pod_cache 并返回 Ok，会出现 "STS 还在（控制器会重建 pod）但 rcoder 缓存已空"
-        // 的分裂 → 孤儿 STS + 下次 ensure 同名冲突/误建副本。Service 删除（Step 0/3）可 best-effort。
-        if let Err(e) = self
-            .delete_agent_statefulset(identifier, service_type)
-            .await
-        {
-            error!(
-                "[K8S] Failed to delete StatefulSet {}: {}; aborting destroy (pod_cache retained)",
-                pod_name, e
-            );
-            return Err(e);
-        }
-
-        // Step 2: 等 pod {sts}-0 完全终止（Foreground cascade 异步；等其 404 再继续，
-        // 避免与立即重建的新 pod 抢 RWO PVC）。
-        if let Err(e) = self.wait_for_pod_terminated(&agent_pod).await {
-            warn!(
-                "[K8S] wait_for_pod_terminated for {} failed: {} (continuing)",
-                agent_pod, e
-            );
-        }
-
-        // Step 3: 删除 headless Service（与 STS/ClusterIP 一并彻底回收）
-        if let Err(e) = self
-            .delete_agent_headless_service(identifier, service_type)
-            .await
-        {
-            warn!(
-                "[K8S] Failed to delete headless Service for {}: {} (continuing)",
-                identifier, e
-            );
-        }
-
-        self.pod_cache.write().await.remove(identifier);
-
-        info!(
-            "[K8S] agent {} destroyed (STS + ClusterIP/headless svc deleted; PVC preserved for reuse), total time: {:.1}s",
-            pod_name,
-            total_start.elapsed().as_secs_f64()
-        );
-
-        Ok(())
     }
 
     /// Idle retirement captures every deletion target before the bounded owner

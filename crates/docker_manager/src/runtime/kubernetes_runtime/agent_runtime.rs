@@ -4,6 +4,54 @@ use crate::runtime::k8s_pod::K8sPodOps;
 #[cfg(feature = "kubernetes")]
 #[async_trait]
 impl AgentContainerRuntime for KubernetesRuntime {
+    fn agent_workload_namespace(&self) -> String {
+        self.namespace.clone()
+    }
+    fn agent_workload_name(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<String> {
+        self.pod_name(identifier, service_type)
+    }
+    async fn agent_resource_inventory(
+        &self,
+    ) -> ContainerRuntimeResult<Vec<container_runtime_api::AgentStopSnapshot>> {
+        self.agent_retirement_inventory().await
+    }
+    async fn capture_agent_stop(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentStopSnapshot> {
+        self.capture_agent_retirement(identifier, service_type)
+            .await
+    }
+    async fn stop_captured_agent(
+        &self,
+        snapshot: &container_runtime_api::AgentStopSnapshot,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentStopOutcome> {
+        self.retire_agent_snapshot(snapshot, false).await
+    }
+    async fn retire_agent_remnants(
+        &self,
+        snapshot: &container_runtime_api::AgentStopSnapshot,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentStopOutcome> {
+        self.retire_agent_snapshot(snapshot, true).await
+    }
+    async fn refresh_agent_retirement_fence(
+        &self,
+        snapshot: &container_runtime_api::AgentStopSnapshot,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentStopSnapshot> {
+        self.fence_agent_snapshot(snapshot).await
+    }
+    async fn agent_resource_events(
+        &self,
+        shutdown: tokio_util::sync::CancellationToken,
+        interval: std::time::Duration,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentResourceEvents> {
+        Ok(self.watch_agent_resources(shutdown, interval))
+    }
     async fn stop_agent_container_if_matches(
         &self,
         identifier: &str,
@@ -437,6 +485,19 @@ impl AgentContainerRuntime for KubernetesRuntime {
                         return crate::runtime::builder_completion::finish(lease,
                             Err(ContainerRuntimeError::ConfigurationError("builder reuse capture missing".into()))).await;
                     };
+                    // Reuse bypasses create_agent_container_with_creation_receipt.
+                    // Fence every retained stable resource under this original
+                    // builder lease before an old orphan DELETE can reach it.
+                    let fencing = async {
+                        let previous = runtime.capture_agent_retirement(
+                            &captured.target.context.app_id, &ServiceType::UserappBuilder,
+                        ).await?;
+                        runtime.fence_agent_snapshot(&previous).await?;
+                        Ok::<_, ContainerRuntimeError>(())
+                    }.await;
+                    if let Err(error) = fencing {
+                        return crate::runtime::builder_completion::finish(lease, Err(error)).await;
+                    }
                     runtime
                         .resume_captured_builder(&params, captured.clone())
                         .await

@@ -84,15 +84,50 @@ pub struct PgStore {
     pending_ops: Arc<AtomicI64>,
     database: crate::db::owner::DatabaseOwner,
     postgres_config: PostgresConfig,
+    pub(crate) workload_admission: Arc<crate::workload_admission::pg::AdmissionPool>,
 }
 
 impl PgStore {
+    /// SQL has already committed; a local mirror is only conditionally pruned.
+    pub(crate) fn prune_committed_workload_frame(&self, frame: &crate::WorkloadRegistrationFrame) {
+        let _registration = self
+            .registration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut containers = self
+            .container_registration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cursor_matches = frame.container.as_ref().is_some_and(|expected| {
+            containers
+                .get(frame.container_name())
+                .is_some_and(|current| {
+                    current.generation == expected.generation
+                        && current.revision == expected.revision
+                        && current.physical_uid == expected.physical_uid
+                })
+        });
+        if self
+            .inner
+            .prune_committed_workload_frame(frame, cursor_matches)
+            && cursor_matches
+        {
+            containers.remove(frame.container_name());
+        }
+    }
+
     /// Stop admission before draining accepted direct writes and the fallback queue.
     pub async fn shutdown_flush_outcome(&self, timeout: Duration) -> shared_types::FlushOutcome {
         let deadline = tokio::time::Instant::now() + timeout;
         {
             let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
             self.closing.store(true, Ordering::Release);
+        }
+        if let Err(error) = self.workload_admission.shutdown(deadline).await {
+            return shared_types::FlushOutcome::Incomplete {
+                pending: self.pending_ops.load(Ordering::Acquire).max(0) as usize,
+                reason: error.to_string(),
+            };
         }
         loop {
             let done = self.write_finished.notified();
@@ -161,6 +196,7 @@ impl PgStore {
             pending_ops,
             database,
             postgres_config: config.clone(),
+            workload_admission: crate::workload_admission::pg::AdmissionPool::new(config)?,
         };
         let stats = store.inner.get_stats();
         info!(

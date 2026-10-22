@@ -72,6 +72,19 @@ impl KubernetesRuntime {
         // Pod 名称：统一使用 pod_name() helper（含 RFC 1123 下划线清理）
         let pod_name = self.pod_name(identifier, &service_type)?;
 
+        // A new admitted ensure invalidates old, captured DELETE versions before
+        // it reuses a controller, Pod or stable Service. Only top-level metadata
+        // changes; this must never roll the running Pod template.
+        let previous = self
+            .capture_agent_retirement(identifier, &service_type)
+            .await?;
+        if previous.controller.is_some()
+            || !previous.pods.is_empty()
+            || !previous.services.is_empty()
+        {
+            self.fence_agent_snapshot(&previous).await?;
+        }
+
         // 阶段2 per-agent PVC (CephFS subvolume, ceph-csi 服务端配额, 绕开 client setfattr):
         // 仅隔离容器 (pod_id=None, project/user 级) 且 per_agent_pvc_enabled=true 走 per-agent PVC。
         // 共享容器 (pod_id=Some) 或回滚开关 false → 共享 PVC (选项A 行为)。

@@ -59,6 +59,25 @@ pub(crate) async fn try_idle_builder_retirement(
 ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
     lifecycle::try_acquire(app_id).await
 }
+
+async fn builder_workload_admission(
+    state: &AppState,
+    app_id: &str,
+    deadline: tokio::time::Instant,
+) -> Result<rcoder_storage::WorkloadAdmissionGuard> {
+    use rcoder_storage::{WorkloadAdmissionMode, WorkloadKey};
+    let runtime = state.runtime();
+    let name = runtime.agent_workload_name(app_id, &ServiceType::UserappBuilder)?;
+    let key = WorkloadKey::new(
+        &runtime.agent_workload_namespace(),
+        ServiceType::UserappBuilder,
+        &name,
+    )?;
+    state
+        .projects
+        .acquire_workload_admission(key, WorkloadAdmissionMode::Shared, deadline)
+        .await
+}
 mod recovery;
 pub(crate) mod retry;
 pub mod shutdown_gate;
@@ -167,6 +186,9 @@ async fn ensure_builder_target_until(
     deadline: tokio::time::Instant,
     intent: BuilderAccessIntent,
 ) -> Result<ContainerBasicInfo> {
+    // Order: workload admission -> local lifecycle -> durable operation/runtime
+    // lease. An orphan scan seeing no root must exclude first-time creation.
+    let _workload = builder_workload_admission(state, app_id, deadline).await?;
     let recovered = adoption::discover_missing_identity(state, app_id).await?;
     let identity = match recovered {
         Some(identity) => identity,
@@ -264,6 +286,7 @@ async fn ensure_userapp_builder_probed_until(
     app_id: &str,
     deadline: tokio::time::Instant,
 ) -> Result<(ContainerBasicInfo, bool)> {
+    let _workload = builder_workload_admission(state, app_id, deadline).await?;
     let recovered = adoption::discover_missing_identity(state, app_id).await?;
     let identity = match recovered {
         Some(identity) => identity,

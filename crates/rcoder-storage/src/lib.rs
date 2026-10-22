@@ -26,6 +26,7 @@ mod backend;
 pub mod config;
 mod stop_frame;
 mod userapp_agent;
+mod workload_admission;
 
 #[cfg(feature = "pg")]
 pub mod pg;
@@ -34,6 +35,9 @@ pub use adapter::ProjectAdapter;
 pub use backend::ProjectStoreBackend;
 pub use shared_types::{ContainerEntry, IdleContainerInfo, StorageStats};
 pub use stop_frame::ProjectStopFrame;
+pub use workload_admission::{
+    WorkloadAdmissionGuard, WorkloadAdmissionMode, WorkloadKey, WorkloadRegistrationFrame,
+};
 
 #[cfg(any(feature = "pg", feature = "userapp-turso"))]
 pub mod userapp_lifecycle;

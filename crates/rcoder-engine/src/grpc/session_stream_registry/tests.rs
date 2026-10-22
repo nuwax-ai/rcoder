@@ -225,3 +225,33 @@ fn terminal_classification_semantics() {
         "agent_message_chunk"
     ));
 }
+#[tokio::test]
+async fn delayed_retirement_closes_only_captured_connections_with_reused_sid_and_address() {
+    let registry = Arc::new(SessionStreamRegistry::new());
+    let original = registry.admit_stream("same-endpoint", "same-sid").unwrap();
+    let old_token = original.token();
+    let captured = registry.capture_session_streams("same-sid");
+    // Establish a later real forwarding registration after the old retirement
+    // took its snapshot, including the same address and same session ID.
+    let newer = registry.admit_stream("same-endpoint", "same-sid").unwrap();
+    let newer_token = newer.token();
+    let unrelated = registry
+        .admit_stream("same-endpoint", "different-sid")
+        .unwrap();
+    let unrelated_token = unrelated.token();
+    registry.shutdown_captured_streams(captured);
+    assert!(old_token.is_cancelled());
+    assert!(!newer_token.is_cancelled());
+    assert!(!unrelated_token.is_cancelled());
+    drop(original);
+    assert!(
+        !newer_token.is_cancelled(),
+        "old task Drop must preserve the successor registration"
+    );
+    drop(newer);
+    drop(unrelated);
+    registry
+        .drain(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+}

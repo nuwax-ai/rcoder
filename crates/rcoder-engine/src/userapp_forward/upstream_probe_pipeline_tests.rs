@@ -78,6 +78,21 @@ impl PipelineRuntime {
 
 #[async_trait::async_trait]
 impl AgentContainerRuntime for PipelineRuntime {
+    fn agent_workload_namespace(&self) -> String {
+        "test-ns".into()
+    }
+
+    fn agent_workload_name(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<String> {
+        let info = self.info();
+        assert_eq!(identifier, info.project_id);
+        assert_eq!(*service_type, ServiceType::UserappBuilder);
+        Ok(info.container_name)
+    }
+
     async fn create_container(
         &self,
         _: ContainerCreateParams,

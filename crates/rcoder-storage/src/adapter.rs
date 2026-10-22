@@ -24,6 +24,7 @@ mod container_ops;
 mod lookup;
 mod session_ops;
 mod store_impl;
+mod workload_registration;
 #[cfg(feature = "pg")]
 pub(crate) use agent_replacement::validate_agent_replacement;
 #[cfg(feature = "pg")]
@@ -100,6 +101,7 @@ pub struct ProjectAdapter {
     /// Always acquire after a project lock; no guard crosses an await.
     container_locks: Arc<LockMap<String, ()>>,
     pub(crate) userapp_agents: Arc<std::sync::Mutex<crate::userapp_agent::MemoryBindings>>,
+    pub(crate) workload_admission: Arc<crate::workload_admission::memory::AdmissionMap>,
 }
 
 impl ProjectAdapter {
@@ -119,6 +121,7 @@ impl ProjectAdapter {
             project_locks: Arc::new(LockMap::new()),
             container_locks: Arc::new(LockMap::new()),
             userapp_agents: Arc::new(std::sync::Mutex::new(Default::default())),
+            workload_admission: Arc::new(Default::default()),
         };
         info!("[STORAGE] ProjectAdapter initialized (DashMap, metadata-only retirement)");
         adapter

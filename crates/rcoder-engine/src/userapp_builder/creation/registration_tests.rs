@@ -46,6 +46,23 @@ impl ConfirmationRuntime {
 
 #[async_trait::async_trait]
 impl AgentContainerRuntime for ConfirmationRuntime {
+    fn agent_workload_namespace(&self) -> String {
+        "registration-fixture".into()
+    }
+
+    fn agent_workload_name(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<String> {
+        if identifier != self.info.project_id || *service_type != ServiceType::UserappBuilder {
+            return Err(ContainerRuntimeError::Conflict(
+                "fixture workload scope differs".into(),
+            ));
+        }
+        Ok(self.info.container_name.clone())
+    }
+
     async fn get_bound_builder_file_credentials(
         &self,
         target: &BuilderControlTarget,

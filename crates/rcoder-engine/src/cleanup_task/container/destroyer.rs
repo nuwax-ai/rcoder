@@ -1,18 +1,17 @@
 //! 容器销毁器
 //!
-//! 销毁容器并清理相关资源（gRPC 连接池、Pingora VNC 后端）
+//! 仅物理销毁。稳定地址、SSE 和登记由持有 canonical frame 的调用方条件退休。
 //!
-//! 运行时无关: 物理销毁走 `ContainerRuntime` trait 的 `stop_container_by_identifier`,
+//! 运行时无关: 物理销毁走 `ContainerRuntime` 的 captured stop 契约,
 //! Docker / K8s 各自实现正确语义 (Docker 整删; K8s 删 Pod+Service 并保留 PVC)。
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use container_runtime_api::ContainerRuntime;
 use shared_types::ServiceType;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{error, info, warn};
 
 use crate::cleanup_task::strategies::DestroyReason;
-use crate::grpc::ShutdownSseFn;
 
 /// 容器销毁器
 pub struct ContainerDestroyer {
@@ -26,9 +25,6 @@ pub struct ContainerDestroyer {
     pub cluster_domain: String,
     /// 是否是 K8s 运行时
     pub is_kubernetes: bool,
-    /// 可选的 SSE 共享流关闭回调（参数为 grpc_addr）。
-    /// 容器销毁后按地址关闭前端 SSE 进度流；未注入时保持旧行为（向后兼容）。
-    shutdown_sse: Option<ShutdownSseFn>,
 }
 
 impl ContainerDestroyer {
@@ -40,33 +36,20 @@ impl ContainerDestroyer {
         captured: &shared_types::ContainerBasicInfo,
         reason: &DestroyReason,
     ) -> Result<()> {
+        info!(identifier, container_name = %captured.container_name, container_id = %captured.container_id,
+            project_id = %captured.project_id, container_ip = %captured.container_ip,
+            reason = reason.as_str(), reason_detail = %reason.description(), "Retiring captured idle builder compute");
         self.runtime
             .stop_idle_builder_compute(identifier, captured)
             .await
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "retire captured builder {} ({}): {error}",
-                    captured.container_id,
-                    reason.as_str()
-                )
-            })?;
-        let address = shared_types::build_grpc_addr(
-            &captured.container_name,
-            &captured.container_ip,
-            &self.namespace,
-            &self.cluster_domain,
-        );
-        match address {
-            Ok(address) => {
-                self.grpc_pool.remove(&address).await;
-                if let Some(shutdown_sse) = &self.shutdown_sse {
-                    shutdown_sse(&address);
-                }
-            }
-            Err(error) => {
-                warn!(identifier, %error, "captured builder retired; old gRPC route unavailable")
-            }
-        }
+            .with_context(|| format!("Retire captured builder: identifier={identifier}, container_name={}, container_id={}, project_id={}, container_ip={}, reason={}",
+                captured.container_name, captured.container_id, captured.project_id, captured.container_ip, reason.description()))
+            .inspect_err(|error| error!(identifier, container_id = %captured.container_id,
+                reason = reason.as_str(), error = %format!("{error:#}"), "Captured builder retirement failed"))?;
+        // Route/session cleanup belongs to the caller after its canonical
+        // registration CAS; this physical receipt cannot authorize clearing a
+        // later execution sharing the same Service address.
+        info!(identifier, container_id = %captured.container_id, reason = reason.as_str(), "Captured builder compute retired; registration retirement remains caller-owned");
         Ok(())
     }
 
@@ -85,34 +68,11 @@ impl ContainerDestroyer {
             namespace,
             cluster_domain,
             is_kubernetes,
-            shutdown_sse: None,
         }
     }
 
-    /// 注入 SSE 共享流关闭回调（builder 风格，保持 `new` 签名向后兼容）。
-    ///
-    /// 回调参数为 grpc_addr；销毁流程在 `grpc_pool.remove` 同处调用，
-    /// 确保容器死亡后前端 SSE 进度流被主动关闭（幂等，重复调用安全）。
-    pub fn with_shutdown_sse(mut self, shutdown_sse: ShutdownSseFn) -> Self {
-        self.shutdown_sse = Some(shutdown_sse);
-        self
-    }
-
-    /// 销毁容器并清理相关资源（带原因）
-    ///
-    /// 物理销毁走 `ContainerRuntime::stop_container_by_identifier` —— 按 identifier/name
-    /// 销毁 (容器 name 稳定, 不受重建影响)。不再 `find_container_realtime` 实时查最新
-    /// container_id: trait 内部已封装查找 (Docker: `find_user_container`→`stop_by_id` /
-    /// `stop_container(name)`; K8s: `pod_name(identifier)`→删 Pod)。
-    ///
-    /// # 参数
-    /// * `container_name` - 容器名称（稳定不变；用于 gRPC addr 构建与日志）
-    /// * `service_type` - 服务类型（用于决定是否清理 VNC 后端）
-    /// * `container_identifier` - 容器标识符（project_id 或 user_id；传给 trait stop）
-    /// * `reason` - 销毁原因
-    /// * `project_id` - 项目 ID（用于清理 project_backends，可选）
-    /// * `container_ip` - 容器 IP（来自 state 的 `container_info`，用于 gRPC addr 清理；
-    ///   来自本次销毁观察，不依赖存储删除再触发另一轮物理清理）
+    /// Physical-only compatibility entry. Catalog-aware callers use AppState's
+    /// captured stop/CAS path; this receipt never clears stable routes or SSE.
     pub async fn destroy_with_reason(
         &self,
         container_name: &str,
@@ -122,95 +82,36 @@ impl ContainerDestroyer {
         project_id: Option<&str>,
         container_ip: &str,
     ) -> Result<()> {
-        info!(
-            "[destroyer] Starting container destruction: container_name={}, service_type={:?}, identifier={}, reason={}",
-            container_name,
-            service_type,
-            container_identifier,
-            reason.as_str()
-        );
-
-        // 输出详细原因
-        debug!("[destroyer] destroy reason: {}", reason.description());
-
-        // 1. 物理销毁: 走 ContainerRuntime trait
-        //    按 identifier 销毁 (name 稳定); 两后端对"容器已不存在"都幂等返回 Ok。
-        //    (Docker: ComputerAgentRunner 走 find_user_container→stop_by_id, WebAgentRunner 走
-        //     stop_container(name); K8s: pod_name(identifier)→删 Pod+Service, 保留 PVC)
-        self.runtime
-            .stop_container_by_identifier(container_identifier, service_type)
+        info!(container_name, %service_type, container_identifier, ?project_id, container_ip,
+            reason = reason.as_str(), reason_detail = %reason.description(), "Starting captured container retirement");
+        let context = || {
+            format!(
+                "container_name={container_name}, service_type={service_type}, identifier={container_identifier}, project_id={project_id:?}, container_ip={container_ip}, reason={}",
+                reason.description()
+            )
+        };
+        let snapshot = self
+            .runtime
+            .capture_agent_stop(container_identifier, service_type)
             .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to stop container: identifier={}, error={}",
-                    container_identifier,
-                    e
-                )
-            })?;
-
-        // 2. 清理关联资源 (gRPC 连接池旧连接 + Pingora 后端)
-        // 清理 gRPC 连接池中的旧连接（避免复用已失效的 TCP 连接）。
-        // 容器形态：Docker 的 container_ip 为空则无法构造 grpc_addr，跳过。
-        // deploy-host：build_grpc_addr 经注册表按 container_name 查表，不依赖
-        // IP——空 IP 也要继续清理（守卫豁免），否则 grpc pool/SSE 残留。
-        #[cfg(feature = "deploy-host")]
-        let empty_ip_unusable =
-            !self.is_kubernetes && container_ip.is_empty() && !shared_types::is_deploy_host();
-        #[cfg(not(feature = "deploy-host"))]
-        let empty_ip_unusable = !self.is_kubernetes && container_ip.is_empty();
-        if empty_ip_unusable {
-            debug!("[destroyer] Container IP is empty, skipping gRPC cleanup");
-        } else {
-            match shared_types::build_grpc_addr(
-                container_name,
-                container_ip,
-                &self.namespace,
-                &self.cluster_domain,
-            ) {
-                Ok(grpc_addr) => {
-                    self.grpc_pool.remove(&grpc_addr).await;
-                    // 关闭指向该地址的 SSE 共享流（与 grpc_pool.remove 同源同处；幂等）。
-                    if let Some(ref shutdown_sse) = self.shutdown_sse {
-                        shutdown_sse(&grpc_addr);
-                    }
-                }
-                Err(error) => {
-                    // The physical stop has already completed. A missing old
-                    // route cannot prevent the independent proxy cleanup.
-                    warn!(container_name, %error, "Skip unavailable gRPC address during cleanup");
-                }
+            .with_context(|| format!("Capture container retirement target: {}", context()))
+            .inspect_err(|error| error!(container_name, container_identifier, ?project_id, container_ip,
+                reason = reason.as_str(), error = %format!("{error:#}"), "Container retirement capture failed"))?;
+        match self.runtime.stop_captured_agent(&snapshot).await
+            .with_context(|| format!("Stop captured container: {}", context()))
+            .inspect_err(|error| error!(container_name, container_identifier, ?project_id, container_ip,
+                reason = reason.as_str(), error = %format!("{error:#}"), "Captured container stop failed"))? {
+            container_runtime_api::AgentStopOutcome::Complete => {
+                info!(container_name, container_identifier, ?project_id, container_ip,
+                    reason = reason.as_str(), "Captured compute and services retired; registration retirement remains caller-owned");
+                Ok(())
+            },
+            container_runtime_api::AgentStopOutcome::ComputeGoneServicesPending { pending } => {
+                warn!(container_name, container_identifier, ?project_id, container_ip,
+                    reason = reason.as_str(), ?pending, "Compute stopped but captured Service cleanup remains pending");
+                anyhow::bail!("Compute stopped but service cleanup remains pending: {}; failures={pending:?}", context())
             }
         }
-
-        if let Some(ref pingora_service) = self.pingora_service {
-            // 家族归一：NormalProject 与 ComputerAgentRunner 共容器同 VNC 形态
-            // （注册侧不分家，清理侧须对称，否则 VNC 路由残留）
-            if service_type.is_computer_family() {
-                // 清理 Pingora VNC 后端
-                let _unused: Option<String> =
-                    pingora_service.remove_vnc_backend(container_identifier);
-            }
-
-            // 清理 Pingora Project 后端（WebAgentRunner 容器）
-            // 使用 project_id 而不是 container_identifier，因为 container_identifier 可能是 pod_id
-            if *service_type == ServiceType::WebAgentRunner
-                && let Some(pid) = project_id
-            {
-                let _unused: Option<String> = pingora_service.remove_project_backend(pid);
-                debug!(
-                    "[destroyer] Cleaned up project_backends: project_id={}",
-                    pid
-                );
-            }
-        }
-
-        info!(
-            "[destroyer] Container destruction completed: container_name={}, identifier={}, reason={}",
-            container_name,
-            container_identifier,
-            reason.as_str()
-        );
-        Ok(())
     }
 }
 
@@ -310,10 +211,44 @@ mod tests {
     /// 其余方法返回空/Ok (满足 trait 形状, 参考 agent_mgmt_forward_test::StubRuntime)。
     struct RecordingRuntime {
         stops: Mutex<Vec<(String, ServiceType)>>,
+        fail_stop: bool,
     }
 
     #[async_trait]
     impl AgentContainerRuntime for RecordingRuntime {
+        async fn capture_agent_stop(
+            &self,
+            identifier: &str,
+            service_type: &ServiceType,
+        ) -> ContainerRuntimeResult<container_runtime_api::AgentStopSnapshot> {
+            Ok(container_runtime_api::AgentStopSnapshot {
+                app_id_hint: None,
+                namespace: Some("fixture-scope".into()),
+                identifier: identifier.into(),
+                service_type: *service_type,
+                controller: None,
+                pods: vec![],
+                container: None,
+                services: vec![],
+                replicas: None,
+                endpoint: None,
+            })
+        }
+        async fn stop_captured_agent(
+            &self,
+            snapshot: &container_runtime_api::AgentStopSnapshot,
+        ) -> ContainerRuntimeResult<container_runtime_api::AgentStopOutcome> {
+            self.stops
+                .lock()
+                .unwrap()
+                .push((snapshot.identifier.clone(), snapshot.service_type));
+            if self.fail_stop {
+                return Err(ContainerRuntimeError::ContainerStopError(
+                    "controlled backend stop failure".into(),
+                ));
+            }
+            Ok(container_runtime_api::AgentStopOutcome::Complete)
+        }
         async fn create_container(
             &self,
             _params: ContainerCreateParams,
@@ -342,11 +277,9 @@ mod tests {
             identifier: &str,
             service_type: &ServiceType,
         ) -> ContainerRuntimeResult<()> {
-            self.stops
-                .lock()
-                .unwrap()
-                .push((identifier.to_string(), *service_type));
-            Ok(())
+            panic!(
+                "logical name stop must not replace the captured identity: {identifier} {service_type}"
+            )
         }
         async fn is_container_running(&self, _project_id: &str) -> ContainerRuntimeResult<bool> {
             Ok(false)
@@ -369,11 +302,12 @@ mod tests {
     impl UserAppDeploymentRuntime for RecordingRuntime {}
 
     #[tokio::test]
-    async fn destroyer_routes_stop_through_runtime_trait_and_cleans_vnc() {
+    async fn destroyer_uses_captured_stop_and_preserves_routes_until_registration_cas() {
         use crate::grpc::GrpcChannelPool;
 
         let runtime = Arc::new(RecordingRuntime {
             stops: Mutex::new(Vec::new()),
+            fail_stop: false,
         });
         let grpc_pool = Arc::new(GrpcChannelPool::new());
         let pingora = Arc::new(PingoraProxyService::new(ProxyConfig::default()));
@@ -420,8 +354,57 @@ mod tests {
         // 2. ComputerAgentRunner 销毁后 VNC 后端被清理
         assert_eq!(
             pingora.vnc_backend_count(),
-            0,
-            "ComputerAgentRunner 销毁后 VNC 后端应被清理"
+            1,
+            "a physical stop without canonical retirement cannot clear a stable VNC route"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_stop_preserves_reason_scope_and_original_runtime_cause() {
+        let runtime = Arc::new(RecordingRuntime {
+            stops: Mutex::new(Vec::new()),
+            fail_stop: true,
+        });
+        let destroyer = ContainerDestroyer::new(
+            runtime,
+            Arc::new(crate::grpc::GrpcChannelPool::new()),
+            None,
+            "fixture".into(),
+            "cluster.local".into(),
+            false,
+        );
+        let reason = DestroyReason::IdleTimeout {
+            idle_duration_secs: 900,
+            timeout_secs: 600,
+        };
+        let error = destroyer
+            .destroy_with_reason(
+                "captured-name",
+                &ServiceType::ComputerAgentRunner,
+                "captured-owner",
+                &reason,
+                Some("captured-project"),
+                "192.0.2.1",
+            )
+            .await
+            .unwrap_err();
+        let detail = format!("{error:#}");
+        for expected in [
+            "captured-name",
+            "captured-owner",
+            "captured-project",
+            "192.0.2.1",
+            "Idle timeout (idle 900s / timeout 600s)",
+            "controlled backend stop failure",
+        ] {
+            assert!(
+                detail.contains(expected),
+                "missing context: {expected}: {detail}"
+            );
+        }
+        assert!(
+            error.downcast_ref::<ContainerRuntimeError>().is_some(),
+            "the original typed cause must survive context"
         );
     }
 }

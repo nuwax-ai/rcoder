@@ -20,6 +20,8 @@ struct ProtocolFixture {
     hold_subscription: bool,
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
+    fail_each_stream: bool,
+    cursors: Arc<std::sync::Mutex<Vec<u64>>>,
 }
 
 #[tonic::async_trait]
@@ -30,15 +32,19 @@ impl AgentService for ProtocolFixture {
 
     async fn subscribe_progress(
         &self,
-        _: Request<grpc::ProgressRequest>,
+        request: Request<grpc::ProgressRequest>,
     ) -> Result<Response<Self::SubscribeProgressStream>, Status> {
         let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.cursors
+            .lock()
+            .unwrap()
+            .push(request.into_inner().from_seq.unwrap_or_default());
         self.entered.notify_one();
         if self.hold_subscription {
             self.release.notified().await;
             return Err(Status::cancelled("controlled subscription released"));
         }
-        if attempt > 0 {
+        if attempt > 0 && !self.fail_each_stream {
             return Err(Status::not_found("later_subscription_failure"));
         }
         let original = grpc::ProgressEvent {
@@ -46,7 +52,7 @@ impl AgentService for ProtocolFixture {
             sub_type: "prompt_start".into(),
             payload: "{}".into(),
             request_id: Some("request-original".into()),
-            seq: 1,
+            seq: attempt as u64 + 1,
             timestamp: chrono::Utc::now().timestamp_millis(),
         };
         Ok(Response::new(Box::pin(futures_util::stream::iter(vec![
@@ -110,11 +116,25 @@ async fn fixture(
     tokio_util::sync::CancellationToken,
     tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
 ) {
+    fixture_mode(hold_subscription, false).await
+}
+
+async fn fixture_mode(
+    hold_subscription: bool,
+    fail_each_stream: bool,
+) -> (
+    String,
+    ProtocolFixture,
+    tokio_util::sync::CancellationToken,
+    tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+) {
     let service = ProtocolFixture {
         calls: Arc::new(AtomicUsize::new(0)),
         hold_subscription,
         entered: Arc::new(tokio::sync::Notify::new()),
         release: Arc::new(tokio::sync::Notify::new()),
+        fail_each_stream,
+        cursors: Arc::new(std::sync::Mutex::new(Vec::new())),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
@@ -132,6 +152,170 @@ async fn fixture(
             .await
     });
     (address, service, stop, server)
+}
+
+struct OomRuntime {
+    diagnoses: AtomicUsize,
+}
+
+#[tonic::async_trait]
+impl container_runtime_api::AgentContainerRuntime for OomRuntime {
+    async fn diagnose_agent_pod(
+        &self,
+        identifier: &str,
+        family: &shared_types::ServiceType,
+    ) -> container_runtime_api::ContainerRuntimeResult<container_runtime_api::AgentPodDiagnostic>
+    {
+        assert_eq!(identifier, "captured-owner");
+        assert_eq!(*family, shared_types::ServiceType::ComputerAgentRunner);
+        self.diagnoses.fetch_add(1, Ordering::SeqCst);
+        Ok(container_runtime_api::AgentPodDiagnostic {
+            exists: true,
+            ready: false,
+            restart_count: 1,
+            last_terminate_reason: Some("OOMKilled".into()),
+            last_exit_code: Some(137),
+            waiting_reason: Some("CrashLoopBackOff".into()),
+            detail: None,
+        })
+    }
+    async fn create_container(
+        &self,
+        _: container_runtime_api::ContainerCreateParams,
+    ) -> container_runtime_api::ContainerRuntimeResult<shared_types::ContainerBasicInfo> {
+        Err(
+            container_runtime_api::ContainerRuntimeError::ConfigurationError(
+                "diagnostic-only fixture".into(),
+            ),
+        )
+    }
+    async fn get_container_info(
+        &self,
+        _: &str,
+    ) -> container_runtime_api::ContainerRuntimeResult<Option<shared_types::ContainerBasicInfo>>
+    {
+        Ok(None)
+    }
+    async fn find_container(
+        &self,
+        _: &str,
+        _: &shared_types::ServiceType,
+    ) -> container_runtime_api::ContainerRuntimeResult<
+        Option<container_runtime_api::RuntimeContainerInfo>,
+    > {
+        Ok(None)
+    }
+    async fn stop_container(&self, _: &str) -> container_runtime_api::ContainerRuntimeResult<()> {
+        panic!("SSE diagnosis must not stop compute")
+    }
+    async fn is_container_running(
+        &self,
+        _: &str,
+    ) -> container_runtime_api::ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+    async fn list_containers(
+        &self,
+    ) -> container_runtime_api::ContainerRuntimeResult<
+        Vec<container_runtime_api::RuntimeContainerInfo>,
+    > {
+        Ok(vec![])
+    }
+    async fn cleanup_all(&self) -> container_runtime_api::ContainerRuntimeResult<()> {
+        panic!("SSE diagnosis must not clean resources")
+    }
+    async fn health_check(&self) -> container_runtime_api::ContainerRuntimeResult<()> {
+        Ok(())
+    }
+}
+#[tonic::async_trait]
+impl container_runtime_api::WorkspaceRuntime for OomRuntime {}
+#[tonic::async_trait]
+impl container_runtime_api::UserAppDeploymentRuntime for OomRuntime {}
+
+#[tokio::test]
+async fn final_stream_error_adds_oom_observation_without_replacing_cause_or_request() {
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+    let (address, service, stop, server) = fixture_mode(false, true).await;
+    let runtime = Arc::new(OomRuntime {
+        diagnoses: AtomicUsize::new(0),
+    });
+    let registry = Arc::new(crate::grpc::SessionStreamRegistry::new());
+    let diagnostic = Arc::new(crate::utils::DiagCtx {
+        runtime: runtime.clone(),
+        identifier: "captured-owner".into(),
+        service_type: shared_types::ServiceType::ComputerAgentRunner,
+    });
+    let stream = create_grpc_sse_stream(
+        registry.clone(),
+        address,
+        "session-original".into(),
+        Arc::new(crate::grpc::GrpcChannelPool::new()),
+        "en-US",
+        Arc::new(|_| {}),
+        Some(diagnostic),
+        0,
+    )
+    .await;
+    let body = tokio::time::timeout(
+        Duration::from_secs(3),
+        axum::response::Sse::new(stream)
+            .into_response()
+            .into_body()
+            .collect(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .to_bytes();
+    let wire = String::from_utf8(body.to_vec()).unwrap();
+    let events: Vec<serde_json::Value> = wire
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(|line| serde_json::from_str(line.trim()).unwrap())
+        .collect();
+    let failure = events.last().unwrap();
+    assert_eq!(failure["subType"], "error");
+    assert_eq!(failure["data"]["code"], "GRPC_SERVICE_UNAVAILABLE");
+    assert_eq!(failure["data"]["request_id"], "request-original");
+    assert_eq!(failure["data"]["error_detail"]["stage"], "grpc_stream");
+    assert!(
+        failure["data"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("original_stream_failure")
+    );
+    assert!(
+        failure["data"]["error_detail"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("original_stream_failure")
+    );
+    let observed = failure["data"]["observed_container_state"]
+        .as_str()
+        .expect("final stream errors must use supplemental runtime diagnosis");
+    assert!(
+        observed.to_ascii_lowercase().contains("memory") || observed.contains("OOM"),
+        "missing OOM observation: {observed}"
+    );
+    assert!(!wire.contains("do-not-leak"));
+    assert_eq!(runtime.diagnoses.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *service.cursors.lock().unwrap(),
+        vec![0, 1],
+        "original replay cursor contract must remain intact"
+    );
+    registry
+        .drain(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]

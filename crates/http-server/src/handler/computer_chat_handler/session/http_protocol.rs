@@ -37,6 +37,44 @@ impl Runtime {
 }
 #[async_trait]
 impl AgentContainerRuntime for Runtime {
+    fn agent_workload_namespace(&self) -> String {
+        "controlled-protocol-runtime".into()
+    }
+    fn agent_workload_name(&self, _: &str, _: &ServiceType) -> ContainerRuntimeResult<String> {
+        Ok(self.basic.clone().container_name)
+    }
+    async fn capture_agent_stop(
+        &self,
+        identifier: &str,
+        kind: &ServiceType,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentStopSnapshot> {
+        let basic = self.basic.clone();
+        Ok(container_runtime_api::AgentStopSnapshot {
+            app_id_hint: None,
+            namespace: Some("controlled-protocol-runtime".into()),
+            identifier: identifier.into(),
+            service_type: *kind,
+            controller: None,
+            pods: vec![],
+            services: vec![],
+            replicas: None,
+            endpoint: None,
+            container: Some(container_runtime_api::AgentResourceIdentity {
+                kind: container_runtime_api::AgentResourceKind::Container,
+                name: basic.container_name,
+                uid: basic.container_id,
+                resource_version: None,
+                created_at: Some(basic.created_at),
+                owner_uid: None,
+            }),
+        })
+    }
+    async fn refresh_agent_retirement_fence(
+        &self,
+        snapshot: &container_runtime_api::AgentStopSnapshot,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentStopSnapshot> {
+        Ok(snapshot.clone())
+    }
     async fn create_container(
         &self,
         _: ContainerCreateParams,

@@ -101,7 +101,13 @@ pub async fn handle_chat(
     headers: HeaderMap,
     I18nJsonOrQuery(mut request): I18nJsonOrQuery<AgentChatRequest>,
 ) -> Result<HttpResult<ChatResponse>, AppError> {
-    match run_chat_flow(state, headers, &mut request).await {
+    let flight = handler::utils::owned_operation_flight(&state)?;
+    let outcome = handler::utils::spawn_owned_operation(flight, async move {
+        run_chat_flow(state, headers, &mut request).await
+    })
+    .await
+    .map_err(|error| AppError::internal_server_error(&format!("Chat task failed: {error}")))?;
+    match outcome {
         Ok(result) => Ok(result),
         Err(ChatFlowExit::Response(boxed)) => Ok(*boxed),
         Err(ChatFlowExit::Fatal(e)) => Err(e),
@@ -126,6 +132,22 @@ async fn run_chat_flow(
 
     // 第二段：容器目标解析（获取/创建容器 + 项目记录维护）
     let service_type = shared_types::ServiceType::WebAgentRunner;
+    let identifier = service_type
+        .container_identifier(request.pod_id.as_deref(), None, Some(&project_id))
+        .map_err(|error| AppError::validation_error(&error.to_string()))?;
+    let admission = state
+        .acquire_agent_workload(
+            identifier,
+            &service_type,
+            rcoder_storage::WorkloadAdmissionMode::Shared,
+        )
+        .await
+        .map_err(|error| {
+            AppError::with_message(
+                shared_types::error_codes::ERR_CONFLICT,
+                format!("Workload admission unavailable; retry later: {error}"),
+            )
+        })?;
     let container_info = resolve_container_target(
         &state,
         request,
@@ -134,6 +156,16 @@ async fn run_chat_flow(
         &service_type,
     )
     .await?;
+
+    state
+        .refresh_agent_workload_fence(&admission, identifier, &service_type)
+        .await
+        .map_err(|error| {
+            AppError::with_message(
+                shared_types::error_codes::ERR_BACKEND_ERROR,
+                format!("Workload reuse could not be confirmed; retry later: {error}"),
+            )
+        })?;
 
     // 第三段：转发编排（安装检查 → session 解析 → 就绪探活 → 转发 → 响应后状态更新）
     // 自动安装检查：如果 agent_server 携带 platforms，必须同时提供 agent_id、command、version

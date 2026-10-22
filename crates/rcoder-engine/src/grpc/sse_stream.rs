@@ -219,9 +219,10 @@ pub async fn create_grpc_sse_stream(
                                     from_seq = client_last_seq;
                                     break;
                                 }
-                                let event = super::session_stream_registry::make_stream_error_event_with_identity(
-                                    captured.code, &captured.cause, locale, captured.stage, captured.request_id.clone(),
-                                );
+                                let event = cancellable_read!(make_terminal_error_event(
+                                    diag_ctx.as_ref(), locale, captured.code, &captured.cause,
+                                    captured.stage, captured.request_id.clone(),
+                                ));
                                 let _ = forward_to_client(&tx, &event, &session_id, &mut client_last_seq).await;
                                 registry.release_first_client_claim(&session_id);
                                 return;

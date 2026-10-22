@@ -170,6 +170,19 @@ fn status_of(phase: &str, replicas: i32) -> DeploymentStatus {
 
 #[async_trait::async_trait]
 impl AgentContainerRuntime for FenceRuntime {
+    fn agent_workload_namespace(&self) -> String {
+        "test-ns".into()
+    }
+
+    fn agent_workload_name(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<String> {
+        assert_eq!(*service_type, ServiceType::UserappBuilder);
+        Ok(format!("rcoder-app-builder-{identifier}"))
+    }
+
     async fn verify_agent_replacement(
         &self,
         _params: &container_runtime_api::ContainerCreateParams,

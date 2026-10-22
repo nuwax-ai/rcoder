@@ -35,6 +35,72 @@ pub use tokio::sync::mpsc;
 /// 不含 Userapp Deployment 或 workspace PVC 解析能力。
 #[async_trait]
 pub trait AgentContainerRuntime: Send + Sync {
+    fn agent_workload_namespace(&self) -> String {
+        "unsupported".into()
+    }
+    fn agent_workload_name(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<String> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Agent workload naming is unsupported".into(),
+        ))
+    }
+    /// Read actual managed resources, including controllers/Services without Pods.
+    async fn agent_resource_inventory(
+        &self,
+    ) -> ContainerRuntimeResult<Vec<crate::AgentStopSnapshot>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Agent resource inventory is unsupported".into(),
+        ))
+    }
+    async fn capture_agent_stop(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<crate::AgentStopSnapshot> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Captured Agent retirement is unsupported".into(),
+        ))
+    }
+    /// Delete only original identities and versions; never refresh a failed target.
+    async fn stop_captured_agent(
+        &self,
+        _snapshot: &crate::AgentStopSnapshot,
+    ) -> ContainerRuntimeResult<crate::AgentStopOutcome> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Captured Agent retirement is unsupported".into(),
+        ))
+    }
+    /// Automatic writes are restricted to Service-only or scaled-zero/no-Pod remnants.
+    async fn retire_agent_remnants(
+        &self,
+        _snapshot: &crate::AgentStopSnapshot,
+    ) -> ContainerRuntimeResult<crate::AgentStopOutcome> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Agent remnant retirement is unsupported".into(),
+        ))
+    }
+    /// Fence a delayed old DELETE before reusing actual resources. The caller
+    /// holds its current admission guard. This never changes a Pod template.
+    async fn refresh_agent_retirement_fence(
+        &self,
+        _snapshot: &crate::AgentStopSnapshot,
+    ) -> ContainerRuntimeResult<crate::AgentStopSnapshot> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Agent retirement fencing is unsupported".into(),
+        ))
+    }
+    async fn agent_resource_events(
+        &self,
+        _shutdown: tokio_util::sync::CancellationToken,
+        _interval: std::time::Duration,
+    ) -> ContainerRuntimeResult<crate::AgentResourceEvents> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Agent resource events are unsupported".into(),
+        ))
+    }
     /// Create and start a container
     async fn create_container(
         &self,

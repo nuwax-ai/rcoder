@@ -85,6 +85,10 @@ impl Drop for StreamTaskGuard {
 #[derive(Clone)]
 pub(crate) struct FirstClientClaimToken(Arc<()>);
 
+/// Individual forwarding tasks captured before a registration CAS. Keeping
+/// their tokens does not capture later tasks sharing a SID or stable address.
+pub(crate) struct CapturedSessionStreams(Vec<Arc<CancellationToken>>);
+
 /// SSE 流注册表（rcoder 进程级单例，挂在 `AppState`）。
 pub struct SessionStreamRegistry {
     /// 已服务过客户端的 session（首连资格）：跨转发 task 生命周期——
@@ -250,6 +254,30 @@ impl SessionStreamRegistry {
             );
         }
         closed > 0
+    }
+
+    pub(crate) fn capture_session_streams(&self, session_id: &str) -> CapturedSessionStreams {
+        let tokens = self
+            .active
+            .iter()
+            .flat_map(|entry| {
+                entry
+                    .value()
+                    .iter()
+                    .filter(|stream| stream.session_id == session_id)
+                    .filter_map(|stream| stream.token.upgrade())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        CapturedSessionStreams(tokens)
+    }
+
+    /// Cancellation does not require removing an entry by SID/address. Each
+    /// task's existing guard removes its own exact token when it really exits.
+    pub(crate) fn shutdown_captured_streams(&self, captured: CapturedSessionStreams) {
+        for token in captured.0 {
+            token.cancel();
+        }
     }
 
     /// 按 grpc_addr 批量关闭客户端转发流（容器销毁路径：restart/ensure/

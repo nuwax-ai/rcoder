@@ -2,6 +2,53 @@ use super::*;
 
 #[async_trait]
 impl AgentContainerRuntime for DockerRuntime {
+    fn agent_workload_namespace(&self) -> String {
+        self.agent_retirement_namespace()
+    }
+    fn agent_workload_name(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<String> {
+        self.agent_retirement_name(identifier, service_type)
+    }
+    async fn agent_resource_inventory(
+        &self,
+    ) -> ContainerRuntimeResult<Vec<container_runtime_api::AgentStopSnapshot>> {
+        self.docker_agent_inventory().await
+    }
+    async fn capture_agent_stop(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentStopSnapshot> {
+        self.capture_docker_agent_retirement(identifier, service_type)
+            .await
+    }
+    async fn stop_captured_agent(
+        &self,
+        snapshot: &container_runtime_api::AgentStopSnapshot,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentStopOutcome> {
+        self.retire_docker_agent_snapshot(snapshot).await
+    }
+    async fn refresh_agent_retirement_fence(
+        &self,
+        snapshot: &container_runtime_api::AgentStopSnapshot,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentStopSnapshot> {
+        // Docker has no resource-version fence. This is observation only and
+        // never authorizes reopening a CID with an unknown removal in flight.
+        let current = self
+            .capture_docker_agent_retirement(&snapshot.identifier, &snapshot.service_type)
+            .await?;
+        if current.container.as_ref().map(|value| &value.uid)
+            != snapshot.container.as_ref().map(|value| &value.uid)
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "Docker Agent changed during admission".into(),
+            ));
+        }
+        Ok(current)
+    }
     async fn stop_agent_container_if_matches(
         &self,
         identifier: &str,

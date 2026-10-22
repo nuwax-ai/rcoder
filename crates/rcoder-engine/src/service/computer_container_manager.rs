@@ -28,6 +28,9 @@ use std::time::Instant;
 use tracing::{debug, error, info};
 
 mod creation;
+
+/// Shared wait budget for creation and cross-replica workload admission.
+pub const WORKLOAD_ADMISSION_WAIT: std::time::Duration = creation::WAITER_BUDGET;
 #[cfg(test)]
 mod tests;
 

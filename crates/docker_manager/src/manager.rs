@@ -200,7 +200,9 @@ impl DockerManager {
         // 这样可以避免 "removal already in progress" 的竞态问题
         let remove_options = Some(RemoveContainerOptions {
             force: true,
-            v: true,
+            // Compute stop does not authorize deleting anonymous data volumes.
+            // Explicit storage-management operations own storage deletion.
+            v: false,
             link: false,
         });
 

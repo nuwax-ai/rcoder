@@ -3,6 +3,7 @@
 //! This crate provides the `ContainerRuntime` trait abstraction for different
 //! container runtimes (Docker, Kubernetes, etc.).
 
+pub mod agent_retirement;
 pub mod container_params;
 pub mod error_diagnostic;
 pub mod readiness;
@@ -11,6 +12,7 @@ pub mod types;
 pub mod utils;
 
 // re-export（保持外部引用不变：`container_runtime_api::DeploymentStatus` 等）
+pub use agent_retirement::*;
 pub use container_params::*;
 pub use error_diagnostic::*;
 pub use readiness::*;

@@ -129,7 +129,15 @@ pub(crate) async fn handle_computer_chat_internal(
     I18nJsonOrQuery(request): I18nJsonOrQuery<ComputerChatRequest>,
     is_devcomputer: bool,
 ) -> Result<HttpResult<ChatResponse>, AppError> {
-    match run_computer_chat_flow(state, headers, request, is_devcomputer).await {
+    // A disconnected HTTP client does not cancel an accepted Chat or release
+    // its workload guard before the task/session registration has settled.
+    let flight = crate::handler::utils::owned_operation_flight(&state)?;
+    let outcome = crate::handler::utils::spawn_owned_operation(flight, async move {
+        run_computer_chat_flow(state, headers, request, is_devcomputer).await
+    })
+    .await
+    .map_err(|error| AppError::internal_server_error(&format!("Chat task failed: {error}")))?;
+    match outcome {
         Ok(result) => Ok(result),
         Err(ChatFlowExit::Response(boxed)) => Ok(*boxed),
         Err(ChatFlowExit::Fatal(e)) => Err(e),
@@ -200,9 +208,38 @@ async fn run_computer_chat_flow(
     let (project_id, work_dir_id) = validation::validate_and_prepare_request(&mut request, locale)?;
     let user_id = request.user_id.clone();
 
+    let service_type = request
+        .service_type
+        .unwrap_or(shared_types::ServiceType::ComputerAgentRunner);
+    let identifier = service_type
+        .container_identifier(request.pod_id.as_deref(), Some(&user_id), Some(&project_id))
+        .map_err(|error| AppError::validation_error(&error.to_string()))?;
+    let admission = state
+        .acquire_agent_workload(
+            identifier,
+            &service_type,
+            rcoder_storage::WorkloadAdmissionMode::Shared,
+        )
+        .await
+        .map_err(|error| {
+            AppError::with_message(
+                shared_types::error_codes::ERR_CONFLICT,
+                format!("Workload admission unavailable; retry later: {error}"),
+            )
+        })?;
+
     // 4~5. 容器就绪/唤醒（并发等待、按需创建、空 IP 修复、映射写入、活动时间更新）
     let registered =
         container::ensure_container_ready(&state, &request, &user_id, &project_id, locale).await?;
+    state
+        .refresh_agent_workload_fence(&admission, identifier, &service_type)
+        .await
+        .map_err(|error| {
+            AppError::with_message(
+                shared_types::error_codes::ERR_BACKEND_ERROR,
+                format!("Workload reuse could not be confirmed; retry later: {error}"),
+            )
+        })?;
     // Project clones normally share ContainerEntry. Detach the exact physical
     // snapshot before awaiting RPC work so a replacement cannot rewrite the
     // executor identity used to append this request's session later.

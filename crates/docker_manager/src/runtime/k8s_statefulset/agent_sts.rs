@@ -120,28 +120,6 @@ impl KubernetesRuntime {
         Ok(())
     }
 
-    /// 删除 headless Service（destroy/回收时与 STS、ClusterIP svc 一起清；ensure 幂等，
-    /// 残留也无害，但彻底回收应一并删）。404 视作已删。
-    pub(crate) async fn delete_agent_headless_service(
-        &self,
-        identifier: &str,
-        service_type: &ServiceType,
-    ) -> ContainerRuntimeResult<()> {
-        let svc_name = self.agent_headless_svc_name(identifier, service_type)?;
-        let services: Api<Service> = Api::namespaced(self.client.clone(), &self.namespace);
-        match services.delete(&svc_name, &DeleteParams::default()).await {
-            Ok(_) => {
-                debug!("[K8S-STS] headless Service deleted: {}", svc_name);
-                Ok(())
-            }
-            Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
-            Err(e) => Err(crate::runtime::builder_completion::k8s_error(
-                format!("delete headless svc {}: {}", svc_name, e),
-                e,
-            )),
-        }
-    }
-
     /// 构造 StatefulSet（replicas + pod 模板 = 现有 PodSpec；serviceName 指向 headless svc）。
     /// 顶层注解记录模板指纹——ensure 时对比感知漂移（镜像/env/command 等升级
     /// 后，存量 STS 不会自动更新模板，指纹差异是唯一可见信号）。

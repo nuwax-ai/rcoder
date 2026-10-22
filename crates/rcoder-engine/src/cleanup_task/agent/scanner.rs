@@ -161,7 +161,10 @@ impl AgentScanner {
                         agent.project_id(),
                         e
                     );
-                    return true; // 解析失败，允许清理
+                    // An unreadable endpoint is not evidence that execution
+                    // has stopped. A later scan retries after configuration or
+                    // network recovery without retiring this registration.
+                    return false;
                 }
             };
 

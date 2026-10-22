@@ -61,6 +61,23 @@ pub(crate) async fn ensure_ordinary_pod(
     request: &EnsurePodRequest,
     locale: &'static str,
 ) -> Result<HttpResult<EnsurePodResponse>, AppError> {
+    let state = state.clone();
+    let request = request.clone();
+    // Runtime creation may outlive a disconnected HTTP caller. Its task owns
+    // admission until the accepted write and registration have both settled.
+    let flight = crate::handler::utils::owned_operation_flight(&state)?;
+    crate::handler::utils::spawn_owned_operation(flight, async move {
+        ensure_ordinary_pod_inner(&state, &request, locale).await
+    })
+    .await
+    .map_err(|error| AppError::internal_server_error(&format!("Ensure task failed: {error}")))?
+}
+
+async fn ensure_ordinary_pod_inner(
+    state: &Arc<AppState>,
+    request: &EnsurePodRequest,
+    locale: &'static str,
+) -> Result<HttpResult<EnsurePodResponse>, AppError> {
     // 1. 验证参数
     if let Some(resp) = validate_pod_ids::<EnsurePodResponse>(
         &request.user_id,
@@ -109,11 +126,61 @@ pub(crate) async fn ensure_ordinary_pod(
         request.user_id, request.project_id, service_type, container_identifier
     );
 
+    let admission = state
+        .acquire_agent_workload(
+            &container_identifier,
+            &service_type,
+            rcoder_storage::WorkloadAdmissionMode::Shared,
+        )
+        .await
+        .map_err(|error| {
+            AppError::with_message(
+                shared_types::error_codes::ERR_CONFLICT,
+                format!("Workload admission unavailable; retry later: {error}"),
+            )
+        })?;
+
+    ensure_ordinary_pod_with_admission(
+        state,
+        request,
+        locale,
+        &admission,
+        &container_identifier,
+        &service_type,
+    )
+    .await
+}
+
+/// Restart passes its exclusive guard through Ensure instead of reacquiring a
+/// shared lock behind itself. This preserves one admission lifetime per request.
+pub(super) async fn ensure_ordinary_pod_with_admission(
+    state: &Arc<AppState>,
+    request: &EnsurePodRequest,
+    _locale: &'static str,
+    admission: &rcoder_storage::WorkloadAdmissionGuard,
+    container_identifier: &str,
+    service_type: &ServiceType,
+) -> Result<HttpResult<EnsurePodResponse>, AppError> {
+    admission.verify_current().await.map_err(|error| {
+        AppError::with_message(
+            shared_types::error_codes::ERR_CONFLICT,
+            format!("Workload admission was lost; retry later: {error}"),
+        )
+    })?;
     // Ensure and chat share one lifetime-bound creation admission. A waiter
     // timeout or Pending observation never grants permission to replace compute.
     let (container_info, created) =
-        ensure_flow::ensure_with_retry(state, request, &service_type, &container_identifier)
-            .await?;
+        ensure_flow::ensure_with_retry(state, request, service_type, container_identifier).await?;
+
+    state
+        .refresh_agent_workload_fence(admission, container_identifier, service_type)
+        .await
+        .map_err(|error| {
+            AppError::with_message(
+                shared_types::error_codes::ERR_BACKEND_ERROR,
+                format!("Workload reuse could not be confirmed; retry later: {error}"),
+            )
+        })?;
 
     // 4/5/6. 注册 VNC backend + 更新存储记录 + 构建响应
     let message = if created {
@@ -124,7 +191,7 @@ pub(crate) async fn ensure_ordinary_pod(
     persist_and_respond(
         state,
         request,
-        &service_type,
+        service_type,
         &container_info,
         created,
         message,

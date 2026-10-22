@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the production Toasty/DatabaseOwner TLS contract against disposable PG17.
+"""Run the ORM and actual pinned workload-admission TLS contracts against PG17.
 
 Requires a locally available official postgres:17 image, Docker, OpenSSL and
 cargo-nextest. No global trust installation, existing database or Compose change.
@@ -96,7 +96,7 @@ def main():
             result = subprocess.run([
                 'cargo', 'nextest', 'run', '-p', 'rcoder-storage', '--features', 'pg',
                 '--no-fail-fast', '--run-ignored', 'all', '--test-threads', '1',
-                '-E', 'test(db::pg_tls_tests::postgres_verify_full_uses_tls_and_rejects_wrong_ca_and_hostname)',
+                '-E', 'test(db::pg_tls_tests::postgres_verify_full_uses_tls_and_rejects_wrong_ca_and_hostname) | test(pg_workload_verify_full_pins_tls_guard_and_rejects_wrong_ca_and_hostname)',
             ], cwd=root, env=environment)
             return result.returncode
     finally:
