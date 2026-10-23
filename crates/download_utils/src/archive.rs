@@ -313,7 +313,7 @@ pub fn detect_file_type_from_path(path: &Path) -> Result<&'static str, ArchiveEr
 /// 搬运阶段的**所有**失败出口(子项枚举/迭代/改名)统一先进回滚: 已搬走的子项与
 /// wrapper 本体恢复原位后才返回错误; 回滚自身失败时返回
 /// [`ArchiveError::NormalizeRollbackIncomplete`], 保留原错误、回滚诊断与可能
-/// 滞留数据的残留路径。
+/// 滞留数据的残留路径。临时目录名唯一，避免回滚失败的旧残留阻塞后续重试。
 pub fn normalize_extracted_dir(agent_dir: &Path) -> Result<bool, ArchiveError> {
     let entries = read_wrapper_candidates(agent_dir)?;
 
@@ -334,8 +334,9 @@ pub fn normalize_extracted_dir(agent_dir: &Path) -> Result<bool, ArchiveError> {
 
     let wrapper = only.path();
     let tmp_name = format!(
-        "{}__wrapper_tmp",
-        agent_dir.file_name().unwrap_or_default().to_string_lossy()
+        "{}__wrapper_tmp.{}",
+        agent_dir.file_name().unwrap_or_default().to_string_lossy(),
+        uuid::Uuid::new_v4()
     );
     let tmp_rename = agent_dir.parent().unwrap_or(agent_dir).join(tmp_name);
 
@@ -394,7 +395,21 @@ fn move_wrapper_children(
     for entry in std::fs::read_dir(tmp)? {
         let entry = entry?;
         let name = entry.file_name();
-        std::fs::rename(entry.path(), agent_dir.join(&name))?;
+        let destination = agent_dir.join(&name);
+        match std::fs::symlink_metadata(&destination) {
+            Ok(_) => {
+                return Err(ArchiveError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "wrapper child destination already exists: {}",
+                        destination.display()
+                    ),
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        std::fs::rename(entry.path(), destination)?;
         moved.push(name);
     }
     Ok(())
@@ -419,14 +434,14 @@ fn rollback_wrapper_move(
         let src = agent_dir.join(name);
         match std::fs::rename(&src, tmp.join(name)) {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // 子项已不在 agent_dir(无数据可恢复), 只记诊断不列残留
-                steps.push((src, format!("move child back: {e}")));
-            }
             Err(e) => {
                 error!("Rollback failed to move back {}: {}", src.display(), e);
                 steps.push((src.clone(), format!("move child back: {e}")));
-                residual.push(src);
+                // ENOENT 也可能是目的 tmp 目录已消失，不能据此断言源数据不存在。
+                if !matches!(std::fs::symlink_metadata(&src), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+                {
+                    residual.push(src);
+                }
             }
         }
     }
@@ -784,10 +799,20 @@ mod tests {
         let result = normalize_extracted_dir(&agent_dir);
 
         // 测试卫生: 无论断言结果如何, 先恢复两处可能位置的权限便于清理
-        let stranded = tmp.path().join("agent__wrapper_tmp");
-        if stranded.is_dir() {
+        let stranded: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("agent__wrapper_tmp.")
+            })
+            .map(|entry| entry.path())
+            .collect();
+        for path in &stranded {
             drop(std::fs::set_permissions(
-                &stranded,
+                path,
                 std::fs::Permissions::from_mode(0o755),
             ));
         }
@@ -799,11 +824,14 @@ mod tests {
         assert!(result.is_err(), "unreadable wrapper must surface an error");
         assert!(
             wrapper.is_dir(),
-            "wrapper must be rolled back to {} instead of stranded at {}",
+            "wrapper must be rolled back to {} instead of stranded at {:?}",
             wrapper.display(),
-            stranded.display()
+            stranded
         );
-        assert!(!stranded.exists(), "no stray wrapper temp dir may remain");
+        assert!(
+            stranded.is_empty(),
+            "no stray wrapper temp dir may remain: {stranded:?}"
+        );
         assert_eq!(
             std::fs::read_to_string(wrapper.join("file.txt")).unwrap(),
             "content",
@@ -848,8 +876,60 @@ mod tests {
                 .is_file()
         );
         assert!(
-            !tmp.path().join("agent__wrapper_tmp").exists(),
+            std::fs::read_dir(tmp.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("agent__wrapper_tmp.")),
             "no stray wrapper temp dir may remain"
+        );
+    }
+
+    #[test]
+    fn normalize_does_not_overwrite_existing_ignored_file() {
+        let tmp = tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let wrapper = agent_dir.join("wrapper");
+        std::fs::create_dir_all(&wrapper).unwrap();
+        std::fs::write(agent_dir.join(".DS_Store"), "existing data").unwrap();
+        std::fs::write(wrapper.join(".DS_Store"), "archive data").unwrap();
+        std::fs::write(wrapper.join("other.txt"), "other").unwrap();
+
+        assert!(normalize_extracted_dir(&agent_dir).is_err());
+
+        assert_eq!(
+            std::fs::read_to_string(agent_dir.join(".DS_Store")).unwrap(),
+            "existing data"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wrapper.join(".DS_Store")).unwrap(),
+            "archive data"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wrapper.join("other.txt")).unwrap(),
+            "other"
+        );
+    }
+
+    #[test]
+    fn normalize_retry_preserves_old_wrapper_residue() {
+        let tmp = tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let old_wrapper = tmp.path().join("agent__wrapper_tmp");
+        std::fs::create_dir_all(agent_dir.join("new-wrapper")).unwrap();
+        std::fs::create_dir_all(&old_wrapper).unwrap();
+        std::fs::write(old_wrapper.join("old.txt"), "old").unwrap();
+        std::fs::write(agent_dir.join("new-wrapper/new.txt"), "new").unwrap();
+
+        assert!(normalize_extracted_dir(&agent_dir).unwrap());
+
+        assert_eq!(
+            std::fs::read_to_string(old_wrapper.join("old.txt")).unwrap(),
+            "old"
+        );
+        assert_eq!(
+            std::fs::read_to_string(agent_dir.join("new.txt")).unwrap(),
+            "new"
         );
     }
 
@@ -892,6 +972,27 @@ mod tests {
             "ENOENT steps carry no data, residual={:?}",
             failure.residual
         );
+    }
+
+    #[test]
+    fn rollback_missing_destination_still_reports_existing_source_data() {
+        let tmp = tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let tmp_wrapper = tmp.path().join("missing-wrapper");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let child = agent_dir.join("moved.txt");
+        std::fs::write(&child, "keep").unwrap();
+
+        let failure = rollback_wrapper_move(
+            &agent_dir,
+            &tmp_wrapper,
+            &agent_dir.join("wrapper"),
+            &["moved.txt".into()],
+        )
+        .unwrap_err();
+
+        assert_eq!(std::fs::read_to_string(&child).unwrap(), "keep");
+        assert!(failure.residual.contains(&child), "{:?}", failure.residual);
     }
 
     /// R07: 错误显示保留原错误与残留路径(现场可定位)。

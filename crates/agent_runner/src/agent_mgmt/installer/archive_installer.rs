@@ -73,11 +73,8 @@ pub fn normalize_extracted_dir(agent_dir: &Path) -> AgentMgmtResult<bool> {
             "normalize extracted dir {}: {io}",
             agent_dir.display()
         )),
-        // 回滚未完全恢复的剥壳失败同判 InstallFailed; 消息含残留路径(经 Display)
-        ArchiveError::NormalizeRollbackIncomplete { .. } => AgentMgmtError::InstallFailed(format!(
-            "normalize extracted dir {}: {e}",
-            agent_dir.display()
-        )),
+        // 错误码仍为安装失败，类型须传到失败清理，避免删除未恢复的数据。
+        ArchiveError::NormalizeRollbackIncomplete { .. } => e.into(),
         other => other.into(),
     })
 }
