@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use tracing::{info, instrument, warn};
 
-use serde::Deserialize;
 use shared_types::{AppWakeControl, UserappStage};
 
 use crate::models::*;
@@ -47,31 +46,9 @@ static FILE_FORWARD_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .unwrap_or_else(|_| reqwest::Client::new())
 });
 
-/// file-server app-files 族响应 DTO（形状对齐 app_manager DTO，snake 键；
-/// 请求侧同为 snake——本族为 userApp 专属新契约，未上线不做旧键兼容）。
-#[derive(Debug, Deserialize)]
-struct UploadResp {
-    file_path: String,
-    file_size: u64,
-    uploaded_at: String,
-    #[serde(default)]
-    extracted_count: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-struct FileEntry {
-    path: String,
-    size: u64,
-    is_dir: bool,
-    modified_at: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ListResp {
-    #[serde(default)]
-    files: Vec<FileEntry>,
-}
-
+use shared_types::{
+    UserappAppFilesListResult as ListResp, UserappAppFilesUploadResult as UploadResp,
+};
 impl AppService {
     /// 唤醒/定位 + 解析目标容器 file-server 基址（`http://{host}:60000`）。
     ///

@@ -39,6 +39,9 @@ pub use userapp::activity::{
     ActivityPersistence, ActivityRow, AppAccessTracker, AppWakeControl, RemoteWakeState,
     WakeFailure, WakeOutcome,
 };
+pub use userapp::app_files::{
+    UserappAppFilesEntry, UserappAppFilesListResult, UserappAppFilesUploadResult,
+};
 pub use userapp::app_stage::{UserappStage, invalid_app_stage_error};
 pub use userapp::build_event::BuildProgressEvent;
 pub use userapp::business_readiness::{

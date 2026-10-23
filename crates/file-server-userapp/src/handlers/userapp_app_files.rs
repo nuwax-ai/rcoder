@@ -37,11 +37,11 @@ use crate::models::{
 /// 上传文件
 ///
 /// zip/tar.gz 自动解压；单文件直写。
-#[utoipa::path(post, path = "/app-files/upload", request_body(content = AppFilesUploadForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "Userapp · 双态 · 文件与存储")]
+#[utoipa::path(post, path = "/app-files/upload", request_body(content = AppFilesUploadForm, content_type = "multipart/form-data"), responses((status=200, description="Upload result (archive extraction or plain single-file write), or a business error envelope", body=shared_types::UserappAppFilesUploadResult), file_server::openapi::JsonApiResponses), tag = "Userapp · 双态 · 文件与存储")]
 pub(crate) async fn upload(
     State(state): State<UserAppState>,
     mut multipart: Multipart,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<shared_types::UserappAppFilesUploadResult>, AppError> {
     let mut app_id = None;
     let mut target = None;
     let mut flatten = false;
@@ -83,13 +83,13 @@ pub(crate) async fn upload(
     let root = resolve_userapp_dev(&app_id, None, &state.fs.config)?;
     let result = upload_impl(&root, &target, flatten, data.path(), data.size()).await?;
     info!(app_id = %app_id, target = %target, "app-files upload done");
-    Ok(Json(json!({
-        "success": true,
-        "file_path": result.file_path,
-        "file_size": result.file_size,
-        "uploaded_at": result.uploaded_at,
-        "extracted_count": result.extracted_count,
-    })))
+    Ok(Json(shared_types::UserappAppFilesUploadResult {
+        success: true,
+        file_path: result.file_path,
+        file_size: result.file_size,
+        uploaded_at: result.uploaded_at,
+        extracted_count: result.extracted_count,
+    }))
 }
 
 #[derive(Debug)]
@@ -212,13 +212,13 @@ async fn upload_impl(
 → 压缩包按魔数自动解压（zip/tar.gz）、单文件直写。语义同 `upload`：
 `target` 为 app 根相对落盘位置、`flatten` 控制剥单层 wrapper 目录。
 "#,
-    responses(file_server::openapi::JsonApiResponses),
+    responses((status=200, description="Downloaded and stored upload result, or a business error envelope", body=shared_types::UserappAppFilesUploadResult), file_server::openapi::JsonApiResponses),
     tag = "Userapp · 双态 · 文件与存储",
 )]
 pub(crate) async fn upload_from_url(
     State(state): State<UserAppState>,
     Json(body): Json<AppFilesUploadFromUrlBody>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<shared_types::UserappAppFilesUploadResult>, AppError> {
     let _workspace_activity = state
         .build_tasks
         .workspace_activity(&body.app_id)
@@ -243,13 +243,13 @@ pub(crate) async fn upload_from_url(
         .map_err(|e| AppError::system(format!("stat downloaded file: {e}")))?;
     let result = upload_impl(&root, &body.target, body.flatten, tmp.path(), size).await?;
     info!(app_id = %body.app_id, url = %body.url, "app-files upload-from-url done");
-    Ok(Json(json!({
-        "success": true,
-        "file_path": result.file_path,
-        "file_size": result.file_size,
-        "uploaded_at": result.uploaded_at,
-        "extracted_count": result.extracted_count,
-    })))
+    Ok(Json(shared_types::UserappAppFilesUploadResult {
+        success: true,
+        file_path: result.file_path,
+        file_size: result.file_size,
+        uploaded_at: result.uploaded_at,
+        extracted_count: result.extracted_count,
+    }))
 }
 
 // ── 列表（GET ?path=）───────────────────────────────────────────────────────────
@@ -264,13 +264,13 @@ pub(crate) async fn upload_from_url(
 rcoder app_manager DTO（本族为 rcoder↔file-server 内部契约，字段直传不经
 Java）；生产运行容器 = 单 app 模式（卷根即 app 根）。
 "#,
-    responses(file_server::openapi::JsonApiResponses),
+    responses((status=200, description="Directory listing, or a business error envelope", body=shared_types::UserappAppFilesListResult), file_server::openapi::JsonApiResponses),
     tag = "Userapp · 双态 · 文件与存储"
 )]
 pub(crate) async fn list(
     State(state): State<UserAppState>,
     Query(params): Query<AppFilesListParams>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<shared_types::UserappAppFilesListResult>, AppError> {
     tracing::debug!(app_id = %params.app_id, "app-files list");
     let _workspace_activity = state
         .build_tasks
@@ -281,7 +281,10 @@ pub(crate) async fn list(
     let root = resolve_userapp_dev(&params.app_id, None, &state.fs.config)?;
     // 存在性探测的 IO 错误传播——否则会把真实错误伪装成"空清单"。
     if !file_server::service::fs_util::path_exists(&root).await? {
-        return Ok(Json(json!({"success": true, "files": []})));
+        return Ok(Json(shared_types::UserappAppFilesListResult {
+            success: true,
+            files: Vec::new(),
+        }));
     }
     let canonical_root = tokio::fs::canonicalize(&root)
         .await
@@ -295,7 +298,10 @@ pub(crate) async fn list(
         Some(p) => {
             let full = root.join(p);
             if !file_server::service::fs_util::path_exists(&full).await? {
-                return Ok(Json(json!({"success": true, "files": []})));
+                return Ok(Json(shared_types::UserappAppFilesListResult {
+                    success: true,
+                    files: Vec::new(),
+                }));
             }
             ensure_within_root(&full, &canonical_root).await?
         }
@@ -315,11 +321,11 @@ pub(crate) async fn list(
             .metadata()
             .await
             .map_err(|e| AppError::system(format!("read metadata: {e}")))?;
-        files.push(json!({
-            "path": format!("{rel_prefix}{}", entry.file_name().to_string_lossy()),
-            "size": metadata.len(),
-            "is_dir": metadata.is_dir(),
-            "modified_at": metadata
+        files.push(shared_types::UserappAppFilesEntry {
+            path: format!("{rel_prefix}{}", entry.file_name().to_string_lossy()),
+            size: metadata.len(),
+            is_dir: metadata.is_dir(),
+            modified_at: metadata
                 .modified()
                 .ok()
                 .map(|t| {
@@ -327,9 +333,12 @@ pub(crate) async fn list(
                     datetime.to_rfc3339()
                 })
                 .unwrap_or_default(),
-        }));
+        });
     }
-    Ok(Json(json!({"success": true, "files": files})))
+    Ok(Json(shared_types::UserappAppFilesListResult {
+        success: true,
+        files,
+    }))
 }
 
 // ── 删除（json {path}）──────────────────────────────────────────────────────────
