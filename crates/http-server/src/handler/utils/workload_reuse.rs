@@ -30,7 +30,10 @@ pub(crate) fn refresh_fence_error_to_app_error(error: AgentWorkloadFenceError) -
     }
 }
 
-fn admission_unconfirmed_app_error(stage: &str, source: AdmissionVerifyError) -> AppError {
+pub(crate) fn admission_unconfirmed_app_error(
+    stage: &str,
+    source: AdmissionVerifyError,
+) -> AppError {
     match source {
         // 会话已丢失/关闭：与 ensure 入口的既有语义对齐（ERR_CONFLICT，重试重取准入）
         AdmissionVerifyError::SessionLost | AdmissionVerifyError::SessionClosed => {

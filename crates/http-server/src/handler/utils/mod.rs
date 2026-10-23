@@ -33,7 +33,7 @@ pub use locale::get_locale_from_headers;
 pub use rcoder_engine::utils::{
     container_identity_from_name, extract_grpc_addr, extract_grpc_addr_with_port,
 };
-pub(crate) use workload_reuse::refresh_workload_fence;
+pub(crate) use workload_reuse::{admission_unconfirmed_app_error, refresh_workload_fence};
 
 // 内部使用：路径验证（通过路径函数自动调用，无需外部直接使用）
 #[allow(unused_imports)]

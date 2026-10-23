@@ -37,6 +37,53 @@ pub enum AgentWorkloadFenceError {
     Runtime(#[from] container_runtime_api::ContainerRuntimeError),
 }
 
+/// `stop_ordinary_agent_workload` 的阶段全分类。物理退出→条件退休的既有顺序
+/// 不变；未确认的物理结果绝不授权退休登记或替换创建。
+#[derive(Debug, thiserror::Error)]
+pub enum AgentWorkloadStopError {
+    #[error(transparent)]
+    Target(#[from] AgentAdmissionTargetError),
+    #[error("Stopping Agent compute requires exclusive workload admission")]
+    NotExclusive,
+    #[error("Workload admission could not be confirmed before capturing the workload")]
+    AdmissionBeforeCapture {
+        #[source]
+        source: AdmissionVerifyError,
+    },
+    /// 读取待停止快照（read-only 观测）失败。
+    #[error(transparent)]
+    Capture(#[from] container_runtime_api::ContainerRuntimeError),
+    #[error("Agent registration read failed")]
+    RegistrationRead(#[source] anyhow::Error),
+    /// runtime 停止失败：计算退出未确认，登记原样保留。
+    #[error("Agent compute exit remains unconfirmed; registration retained")]
+    StopUnconfirmed(#[source] container_runtime_api::ContainerRuntimeError),
+    #[error("Agent compute exit confirmed but registration retirement failed")]
+    RetirementFailed {
+        #[source]
+        source: anyhow::Error,
+        pending: Option<Vec<container_runtime_api::AgentServiceCleanupFailure>>,
+    },
+    #[error("Agent registration changed after compute exit; current registration was retained")]
+    RegistrationSuperseded {
+        pending: Option<Vec<container_runtime_api::AgentServiceCleanupFailure>>,
+    },
+    /// 计算已退出，但退休登记的 SQL 结果未知：重试原操作，不得重放 prompt。
+    #[error(
+        "Agent registration retirement remains unconfirmed; retry the original operation: {reason}"
+    )]
+    RetirementDeferred {
+        reason: String,
+        pending: Option<Vec<container_runtime_api::AgentServiceCleanupFailure>>,
+    },
+    #[error(
+        "Agent compute stopped and its captured registration retired; Service cleanup remains pending and will be retried: {pending:?}"
+    )]
+    ServicesPending {
+        pending: Vec<container_runtime_api::AgentServiceCleanupFailure>,
+    },
+}
+
 impl AppState {
     fn verify_agent_admission_target(
         &self,
@@ -65,9 +112,8 @@ impl AppState {
         guard: &WorkloadAdmissionGuard,
         identifier: &str,
         service_type: &ServiceType,
-    ) -> anyhow::Result<bool> {
-        self.verify_agent_admission_target(guard, identifier, service_type)
-            .map_err(anyhow::Error::new)?;
+    ) -> Result<bool, AgentWorkloadStopError> {
+        self.verify_agent_admission_target(guard, identifier, service_type)?;
         let snapshot = self
             .runtime()
             .capture_agent_stop(identifier, service_type)
@@ -82,18 +128,20 @@ impl AppState {
         &self,
         guard: &WorkloadAdmissionGuard,
         snapshot: &container_runtime_api::AgentStopSnapshot,
-    ) -> anyhow::Result<bool> {
-        self.verify_agent_admission_target(guard, &snapshot.identifier, &snapshot.service_type)
-            .map_err(anyhow::Error::new)?;
-        anyhow::ensure!(
-            guard.mode() == WorkloadAdmissionMode::Exclusive,
-            "Stopping Agent compute requires exclusive workload admission"
-        );
-        guard.verify_current().await?;
+    ) -> Result<bool, AgentWorkloadStopError> {
+        self.verify_agent_admission_target(guard, &snapshot.identifier, &snapshot.service_type)?;
+        if guard.mode() != WorkloadAdmissionMode::Exclusive {
+            return Err(AgentWorkloadStopError::NotExclusive);
+        }
+        guard
+            .verify_current_typed()
+            .await
+            .map_err(|source| AgentWorkloadStopError::AdmissionBeforeCapture { source })?;
         let frame = self
             .projects
             .capture_workload_registration(guard, guard.key().logical_name())
-            .await?;
+            .await
+            .map_err(AgentWorkloadStopError::RegistrationRead)?;
         // Explicit stop addresses freshly verified owned runtime resources.
         // Historical registration UIDs are CAS input, never a startup gate.
         let was_existing = snapshot.controller.is_some()
@@ -106,28 +154,33 @@ impl AppState {
             Ok(container_runtime_api::AgentStopOutcome::ComputeGoneServicesPending { pending }) => {
                 Some(pending)
             }
-            Err(error) => anyhow::bail!(
-                "Agent compute exit remains unconfirmed; registration retained: {error}"
-            ),
+            Err(error) => return Err(AgentWorkloadStopError::StopUnconfirmed(error)),
         };
         // Both typed success outcomes prove compute is gone. Retire its exact
         // registration even when Services remain, otherwise inventory would
         // keep seeing canonical references and could never retry those routes.
         // The partial result is still returned as an error after safe cleanup,
         // so this Restart never proceeds to a second compute creation.
-        match self
+        let retirement = self
             .retire_stopped_agent_registration(guard, &frame)
-            .await.map_err(|error| anyhow::anyhow!(
-                "Agent compute exit confirmed but registration retirement failed: {error}; pending Service cleanup: {pending_services:?}"
-            ))?
-        {
+            .await
+            .map_err(|source| AgentWorkloadStopError::RetirementFailed {
+                source,
+                pending: pending_services.clone(),
+            })?;
+        match retirement {
             PersistenceWriteOutcome::Committed => {}
-            PersistenceWriteOutcome::Superseded => anyhow::bail!(
-                "Agent registration changed after compute exit; current registration was retained; pending Service cleanup: {pending_services:?}"
-            ),
-            PersistenceWriteOutcome::Deferred { reason } => anyhow::bail!(
-                "Agent registration retirement remains unconfirmed; retry the original operation: {reason}; pending Service cleanup: {pending_services:?}"
-            ),
+            PersistenceWriteOutcome::Superseded => {
+                return Err(AgentWorkloadStopError::RegistrationSuperseded {
+                    pending: pending_services,
+                });
+            }
+            PersistenceWriteOutcome::Deferred { reason } => {
+                return Err(AgentWorkloadStopError::RetirementDeferred {
+                    reason,
+                    pending: pending_services,
+                });
+            }
         }
         if let Some(address) = snapshot.endpoint.as_deref() {
             // Admission still excludes a successor using the stable endpoint.
@@ -135,9 +188,7 @@ impl AppState {
             self.grpc_pool.remove(address).await;
         }
         if let Some(pending) = pending_services {
-            anyhow::bail!(
-                "Agent compute stopped and its captured registration retired; Service cleanup remains pending and will be retried: {pending:?}"
-            );
+            return Err(AgentWorkloadStopError::ServicesPending { pending });
         }
         Ok(was_existing)
     }

@@ -20,6 +20,7 @@ const SESSION: &str = "retirement-real-session";
 struct RetirementRuntime {
     current: Mutex<Option<ContainerBasicInfo>>,
     stop_error: AtomicBool,
+    stop_conflict: AtomicBool,
     partial_stop: AtomicBool,
     capture_error: AtomicBool,
     creates: AtomicUsize,
@@ -110,6 +111,11 @@ impl AgentContainerRuntime for RetirementRuntime {
                 "stop write result is unknown".into(),
             ));
         }
+        if self.stop_conflict.load(Ordering::SeqCst) {
+            return Err(ContainerRuntimeError::Conflict(
+                "controlled conflicting stop operation".into(),
+            ));
+        }
         {
             let mut current = self.current.lock().unwrap();
             assert_eq!(
@@ -194,6 +200,7 @@ async fn fixture(
     let runtime = Arc::new(RetirementRuntime {
         current: Mutex::new(Some(basic("actual-physical"))),
         stop_error: AtomicBool::new(false),
+        stop_conflict: AtomicBool::new(false),
         partial_stop: AtomicBool::new(false),
         capture_error: AtomicBool::new(false),
         creates: AtomicUsize::new(0),
@@ -277,9 +284,10 @@ async fn restart_historical_uid_does_not_block_current_owned_compute_recovery() 
 async fn stop_observation_error_does_not_become_gone_or_retire_registration() {
     let (_fixture, state, runtime) = fixture("actual-physical").await;
     runtime.capture_error.store(true, Ordering::SeqCst);
+    // R02: 读观测失败按只读 runtime 错误映射为 ERR_RUNTIME_UNAVAILABLE(503)
     assert_eq!(
         request(state.clone(), "/stop").await.status(),
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
     );
     assert_eq!(runtime.stops.load(Ordering::SeqCst), 0);
     assert!(
@@ -309,10 +317,8 @@ async fn stopped_old_frame_does_not_clear_successor_registration_or_claims() {
         );
     }));
     let response = request(state.clone(), "/restart").await;
-    assert_eq!(
-        response.status(),
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
-    );
+    // R02: compute 退出后登记已被替换 -> RegistrationSuperseded → ERR_CONFLICT(409)
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
     assert_eq!(runtime.creates.load(Ordering::SeqCst), 0);
     assert!(
         state
@@ -516,10 +522,8 @@ async fn compute_gone_partial_reply_cannot_retire_a_new_registration_generation(
         );
     }));
     let response = request(state.clone(), "/restart").await;
-    assert_eq!(
-        response.status(),
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
-    );
+    // R02: 部分停止后登记已被替换 -> RegistrationSuperseded → ERR_CONFLICT(409)
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
     let raw = axum::body::to_bytes(response.into_body(), 65536)
         .await
         .unwrap();
@@ -555,5 +559,134 @@ async fn compute_gone_partial_reply_cannot_retire_a_new_registration_generation(
         !state
             .session_stream_registry
             .claim_first_client("successor-session")
+    );
+}
+
+/// 取响应状态与业务信封（R02 用）。
+async fn envelope(state: Arc<AppState>, path: &str) -> (axum::http::StatusCode, serde_json::Value) {
+    let response = request(state, path).await;
+    let status = response.status();
+    let raw = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&raw).unwrap_or_else(|_| serde_json::Value::Null),
+    )
+}
+
+/// R02 反例: 停止各阶段失败被统一重建为 ERR_BACKEND_ERROR, Conflict/未知写/
+/// 读失败根因与阶段丢失。修复后各阶段保留原 code 与诊断, 且原登记、session
+/// 保留、Restart 不创建第二个 compute 的保护不变。
+#[tokio::test]
+async fn stop_stage_failures_keep_their_cause_codes_and_details() {
+    // capture 读失败(ConnectionError) → ERR_RUNTIME_UNAVAILABLE(503)
+    {
+        let (_fixture, state, runtime) = fixture("actual-physical").await;
+        runtime.capture_error.store(true, Ordering::SeqCst);
+        let (status, body) = envelope(state.clone(), "/stop").await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{body}"
+        );
+        assert_eq!(body["code"], "ERR_RUNTIME_UNAVAILABLE", "{body}");
+        assert_eq!(runtime.stops.load(Ordering::SeqCst), 0);
+        assert!(
+            state
+                .get_project(PROJECT)
+                .unwrap()
+                .sessions()
+                .contains(SESSION)
+        );
+        assert_eq!(
+            state
+                .get_project(PROJECT)
+                .unwrap()
+                .container_info()
+                .unwrap()
+                .container_id,
+            "actual-physical"
+        );
+    }
+    // stop 写结果未知(ConnectionError) → ERR_OPERATION_OUTCOME_UNKNOWN, 不重建
+    {
+        let (_fixture, state, runtime) = fixture("actual-physical").await;
+        runtime.stop_error.store(true, Ordering::SeqCst);
+        let (status, body) = envelope(state.clone(), "/restart").await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "{body}"
+        );
+        assert_eq!(body["code"], "ERR_OPERATION_OUTCOME_UNKNOWN", "{body}");
+        assert_eq!(runtime.creates.load(Ordering::SeqCst), 0);
+        assert!(
+            state
+                .get_project(PROJECT)
+                .unwrap()
+                .sessions()
+                .contains(SESSION)
+        );
+        assert_eq!(
+            state
+                .get_project(PROJECT)
+                .unwrap()
+                .container_info()
+                .unwrap()
+                .container_id,
+            "actual-physical"
+        );
+    }
+    // stop 冲突(Conflict) → ERR_CONFLICT, 登记保留
+    {
+        let (_fixture, state, runtime) = fixture("actual-physical").await;
+        runtime.stop_conflict.store(true, Ordering::SeqCst);
+        let (status, body) = envelope(state.clone(), "/stop").await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "ERR_CONFLICT", "{body}");
+        assert!(
+            state
+                .get_project(PROJECT)
+                .unwrap()
+                .sessions()
+                .contains(SESSION)
+        );
+        assert_eq!(
+            state
+                .get_project(PROJECT)
+                .unwrap()
+                .container_info()
+                .unwrap()
+                .container_id,
+            "actual-physical"
+        );
+    }
+}
+
+/// R02: compute 已退出、登记退休但 Service 清理未决 → 明确 pending 诊断,
+/// Restart 不创建第二个 compute。
+#[tokio::test]
+async fn partial_stop_reports_pending_services_without_second_compute() {
+    let (_fixture, state, runtime) = fixture("actual-physical").await;
+    runtime.partial_stop.store(true, Ordering::SeqCst);
+    let (status, body) = envelope(state.clone(), "/restart").await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "{body}"
+    );
+    assert_eq!(body["code"], "ERR_BACKEND_ERROR", "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("retained-service"),
+        "{body}"
+    );
+    assert_eq!(
+        runtime.creates.load(Ordering::SeqCst),
+        0,
+        "Restart must not create a second compute while Service cleanup is pending"
     );
 }

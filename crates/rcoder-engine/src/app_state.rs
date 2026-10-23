@@ -24,7 +24,9 @@ mod agent_registration;
 pub use agent_registration::RegistrationMetadata;
 mod agent_observation;
 mod agent_retirement;
-pub use agent_retirement::{AgentAdmissionTargetError, AgentWorkloadFenceError};
+pub use agent_retirement::{
+    AgentAdmissionTargetError, AgentWorkloadFenceError, AgentWorkloadStopError,
+};
 
 // 存储契约 trait 引入作用域：AppState.projects 为枚举 ProjectStoreBackend，
 // 其上的 get/insert/... 方法均经 shared_types::ProjectStore 解析。

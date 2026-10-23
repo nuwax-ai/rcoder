@@ -11,12 +11,95 @@ pub(super) async fn stop_ordinary_workload(
     state
         .stop_ordinary_agent_workload(admission, identifier, service_type)
         .await
-        .map_err(|error| {
-            AppError::with_message(
-                shared_types::error_codes::ERR_BACKEND_ERROR,
-                format!("Agent stop did not fully complete: {error}"),
+        .map_err(stop_error_to_app_error)
+}
+
+/// Stop/Restart 失败阶段的穷尽映射：不再把 Conflict、停止结果未知、退休未决
+/// 等统一重建为通用后端错误；新增阶段变体会迫使本 match 补齐。
+/// 物理退出→条件退休顺序与登记/claim 保护语义不变。
+fn stop_error_to_app_error(error: rcoder_engine::app_state::AgentWorkloadStopError) -> AppError {
+    use rcoder_engine::app_state::AgentWorkloadStopError as Stop;
+    use shared_types::error_codes as ec;
+
+    let pending_note =
+        |pending: &Option<Vec<container_runtime_api::AgentServiceCleanupFailure>>| {
+            pending
+                .as_ref()
+                .map(|list| format!("; pending Service cleanup: {list:?}"))
+                .unwrap_or_default()
+        };
+
+    match error {
+        // 读观测失败：只读上下文（不可达/超时可重试）
+        Stop::Capture(cause) => container_runtime_api::runtime_app_error(
+            &cause,
+            "agent.stop.capture",
+            container_runtime_api::RuntimeErrorContext::ReadOnly,
+        ),
+        // 停止写失败：Conflict 保持冲突码；结果未知升级为操作结果未知
+        Stop::StopUnconfirmed(cause) => container_runtime_api::runtime_app_error(
+            &cause,
+            "agent.stop",
+            container_runtime_api::RuntimeErrorContext::Mutation,
+        ),
+        Stop::Target(rcoder_engine::app_state::AgentAdmissionTargetError::Runtime(cause)) => {
+            container_runtime_api::runtime_app_error(
+                &cause,
+                "agent.stop.admission_target",
+                container_runtime_api::RuntimeErrorContext::ReadOnly,
             )
-        })
+        }
+        Stop::Target(rcoder_engine::app_state::AgentAdmissionTargetError::Mismatch) => {
+            AppError::with_message(
+                ec::ERR_CONFLICT,
+                "Workload admission does not cover the captured Agent target; retry the request",
+            )
+        }
+        Stop::NotExclusive => AppError::with_message(
+            ec::ERR_CONFLICT,
+            "Stopping Agent compute requires exclusive workload admission",
+        ),
+        Stop::AdmissionBeforeCapture { source } => {
+            crate::handler::utils::admission_unconfirmed_app_error("while stopping", source)
+        }
+        Stop::RegistrationRead(source) => AppError::with_message(
+            ec::ERR_BACKEND_ERROR,
+            format!(
+                "Agent stop could not read the registration to retire: {}",
+                shared_types::sanitize_error_text(&source.to_string())
+            ),
+        ),
+        Stop::RetirementFailed { source, pending } => AppError::with_message(
+            ec::ERR_BACKEND_ERROR,
+            format!(
+                "Agent compute exit confirmed but registration retirement failed{}: {}",
+                pending_note(&pending),
+                shared_types::sanitize_error_text(&source.to_string())
+            ),
+        ),
+        Stop::RegistrationSuperseded { pending } => AppError::with_message(
+            ec::ERR_CONFLICT,
+            format!(
+                "Agent registration changed after compute exit; current registration was retained{}",
+                pending_note(&pending)
+            ),
+        ),
+        // 退休登记 SQL 结果未知：保持未知结果保护，重试原操作；不重放 prompt
+        Stop::RetirementDeferred { reason, pending } => AppError::with_message(
+            ec::ERR_OPERATION_OUTCOME_UNKNOWN,
+            format!(
+                "Agent registration retirement remains unconfirmed; retry the original operation: {}{}",
+                shared_types::sanitize_error_text(&reason),
+                pending_note(&pending)
+            ),
+        ),
+        Stop::ServicesPending { pending } => AppError::with_message(
+            ec::ERR_BACKEND_ERROR,
+            format!(
+                "Agent compute stopped and its captured registration retired; Service cleanup remains pending and will be retried: {pending:?}"
+            ),
+        ),
+    }
 }
 
 /// 验证 Pod 资源限制配置
@@ -586,3 +669,78 @@ pub(crate) fn validate_pod_ids<T>(
 
 #[cfg(all(test, feature = "userapp-turso"))]
 mod identity_tests;
+
+#[cfg(test)]
+mod stop_error_mapping_tests {
+    use super::*;
+    use rcoder_engine::app_state::{AgentAdmissionTargetError, AgentWorkloadStopError};
+    use rcoder_storage::AdmissionVerifyError;
+    use shared_types::error_codes as ec;
+
+    fn code_of(error: AgentWorkloadStopError) -> (String, String) {
+        let result = stop_error_to_app_error(error).into_http_result::<()>("en-US");
+        (result.code, result.message)
+    }
+
+    /// R02: 各阶段变体的穷尽映射契约（与 retirement_tests 的真实 HTTP 路径互补）。
+    #[test]
+    fn stop_stage_variants_map_to_distinct_codes() {
+        // 非独占准入 → 冲突
+        let (code, message) = code_of(AgentWorkloadStopError::NotExclusive);
+        assert_eq!(code, ec::ERR_CONFLICT);
+        assert!(message.contains("exclusive workload admission"));
+
+        // 目标不符 → 冲突；目标核验中的 runtime 错误走只读 runtime 映射
+        let (code, _) = code_of(AgentWorkloadStopError::Target(
+            AgentAdmissionTargetError::Mismatch,
+        ));
+        assert_eq!(code, ec::ERR_CONFLICT);
+        let (code, _) = code_of(AgentWorkloadStopError::Target(
+            AgentAdmissionTargetError::Runtime(
+                container_runtime_api::ContainerRuntimeError::Timeout("read timed out".into()),
+            ),
+        ));
+        assert_eq!(code, ec::ERR_RUNTIME_TIMEOUT);
+
+        // 准入会话丢失 → 冲突（与 fence 刷新共享语义）
+        let (code, message) = code_of(AgentWorkloadStopError::AdmissionBeforeCapture {
+            source: AdmissionVerifyError::SessionLost,
+        });
+        assert_eq!(code, ec::ERR_CONFLICT);
+        assert!(message.contains("while stopping"), "{message}");
+
+        // 登记读取失败 → 后端错误（净化）
+        let (code, message) = code_of(AgentWorkloadStopError::RegistrationRead(anyhow::anyhow!(
+            "read failed with postgres://u:secret@h/d"
+        )));
+        assert_eq!(code, ec::ERR_BACKEND_ERROR);
+        assert!(!message.contains("secret"), "{message}");
+
+        // 退休执行失败 → 后端错误, 保留 pending 诊断
+        let (code, message) = code_of(AgentWorkloadStopError::RetirementFailed {
+            source: anyhow::anyhow!("sql failure"),
+            pending: Some(vec![container_runtime_api::AgentServiceCleanupFailure {
+                name: "svc-a".into(),
+                uid: "uid-a".into(),
+                error: "denied".into(),
+            }]),
+        });
+        assert_eq!(code, ec::ERR_BACKEND_ERROR);
+        assert!(message.contains("svc-a"), "{message}");
+
+        // 登记已被替换 → 冲突
+        let (code, _) = code_of(AgentWorkloadStopError::RegistrationSuperseded { pending: None });
+        assert_eq!(code, ec::ERR_CONFLICT);
+
+        // 退休 SQL 结果未知 → 操作结果未知（保持未知保护, 不重放 prompt）
+        let (code, message) = code_of(AgentWorkloadStopError::RetirementDeferred {
+            reason: "write outcome unconfirmed".into(),
+            pending: None,
+        });
+        assert_eq!(code, ec::ERR_OPERATION_OUTCOME_UNKNOWN);
+        assert!(
+            message.contains("retry the original operation"),
+            "{message}"
+        );
+    }
+}
