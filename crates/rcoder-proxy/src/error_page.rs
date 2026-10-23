@@ -493,22 +493,83 @@ fn failure_span(session: &Session, status: u16, context: &str) -> tracing::Span 
     span
 }
 
-fn attach_wake_diagnostic(
-    payload: &mut serde_json::Value,
-    failure: &shared_types::WakeFailure,
-    locale: &str,
-) {
-    payload["error"]["operation_id"] = serde_json::json!(failure.operation_id);
-    payload["error"]["blocker"] = serde_json::json!(failure.blocker);
-    payload["error"]["error_detail"] = serde_json::json!(
-        shared_types::ErrorDetail::new(
-            failure.cause_code.as_ref(),
-            failure.stage.as_ref(),
-            failure.message.clone(),
-        )
-        .with_retryable(failure.retryable)
-        .localized(locale)
-    );
+/// UserApp 代理机器错误响应的固定契约（两条出口共用：[`write_error_response`]
+/// 直写与 proxy_http 的 Pingap 自产错误替换）。顶层仅 `error` 对象；
+/// 唤醒诊断三键（operation_id/blocker/error_detail）始终成组出现（值可为
+/// null），无唤醒信息时完全缺省——与既有 wire 形状逐键一致。
+use serde::Serialize;
+
+#[derive(Serialize)]
+pub(crate) struct MachineErrorPayload {
+    error: MachineErrorBody,
+}
+
+#[derive(Serialize)]
+struct MachineErrorBody {
+    code: &'static str,
+    status: u16,
+    reason: String,
+    message: String,
+    diagnostic_id: String,
+    /// `Some(Value::Null)` 表示键存在、值为 null（唤醒诊断与 Pingap 出口语义）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation_id: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocker: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_detail: Option<serde_json::Value>,
+}
+
+impl MachineErrorPayload {
+    pub(crate) fn new(
+        status: u16,
+        reason: impl Into<String>,
+        message: impl Into<String>,
+        diagnostic_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            error: MachineErrorBody {
+                code: "USERAPP_PROXY_FAILURE",
+                status,
+                reason: reason.into(),
+                message: message.into(),
+                diagnostic_id: diagnostic_id.into(),
+                operation_id: None,
+                blocker: None,
+                error_detail: None,
+            },
+        }
+    }
+
+    /// 附带唤醒失败诊断：operation_id/blocker/error_detail 三键成组出现。
+    pub(crate) fn with_wake_failure(
+        mut self,
+        failure: &shared_types::WakeFailure,
+        locale: &str,
+    ) -> Self {
+        self.error.operation_id = Some(serde_json::json!(failure.operation_id));
+        self.error.blocker = Some(serde_json::json!(failure.blocker));
+        self.error.error_detail = Some(serde_json::json!(
+            shared_types::ErrorDetail::new(
+                failure.cause_code.as_ref(),
+                failure.stage.as_ref(),
+                failure.message.clone(),
+            )
+            .with_retryable(failure.retryable)
+            .localized(locale)
+        ));
+        self
+    }
+
+    /// Pingap 自产错误出口：operation_id 键始终存在（值可为 null）。
+    pub(crate) fn with_operation_id(mut self, operation_id: Option<String>) -> Self {
+        self.error.operation_id = Some(serde_json::json!(operation_id));
+        self
+    }
+
+    pub(crate) fn to_body(&self) -> Vec<u8> {
+        serde_json::to_string(self).unwrap_or_default().into_bytes()
+    }
 }
 
 /// 写出 UserApp 代理失败响应（在下游最终响应尚未开始时调用一次）。
@@ -606,19 +667,12 @@ async fn write_error_response_inner(
             ("text/html; charset=utf-8", renderer.render(&vars, locale))
         }
         ErrorRepresentation::Machine => {
-            let mut payload = serde_json::json!({
-                "error": {
-                    "code": "USERAPP_PROXY_FAILURE",
-                    "status": status,
-                    "reason": reason,
-                    "message": message,
-                    "diagnostic_id": diagnostic_id,
-                }
-            });
+            let mut payload =
+                MachineErrorPayload::new(status, reason, message, diagnostic_id.clone());
             if let Some(failure) = wake_failure {
-                attach_wake_diagnostic(&mut payload, failure, locale);
+                payload = payload.with_wake_failure(failure, locale);
             }
-            ("application/json", payload.to_string().into_bytes())
+            ("application/json", payload.to_body())
         }
     };
 
@@ -1033,7 +1087,6 @@ mod tests {
 mod wake_diagnostic_tests {
     #[test]
     fn wake_page_keeps_original_operation_stage_and_safe_detail() {
-        let mut payload = serde_json::json!({"error":{"code":"USERAPP_PROXY_FAILURE"}});
         let blocker = shared_types::UserAppOperationBlocker {
             scope: shared_types::UserAppOperationScope::Prod,
             operation_id: "original-blocking-stop".into(),
@@ -1050,7 +1103,9 @@ mod wake_diagnostic_tests {
                 "POSTGRES_PASSWORD=private_marker",
             )
         };
-        super::attach_wake_diagnostic(&mut payload, &failure, "en-US");
+        let payload = super::MachineErrorPayload::new(503, "wake", "waking", "D-w")
+            .with_wake_failure(&failure, "en-US");
+        let payload = serde_json::to_value(&payload).unwrap();
         assert_eq!(payload["error"]["code"], "USERAPP_PROXY_FAILURE");
         assert_eq!(payload["error"]["operation_id"], "original-wake");
         assert_eq!(payload["error"]["blocker"], serde_json::json!(blocker));
@@ -1099,5 +1154,79 @@ mod wake_diagnostic_tests {
             }),
         };
         assert!(hint.transition_operation_id().is_none());
+    }
+}
+
+#[cfg(test)]
+mod machine_payload_wire_tests {
+    use super::*;
+
+    /// R11: 机器错误响应 wire 快照——与替换前 json! 形状逐键一致。
+    #[test]
+    fn plain_payload_has_no_diagnostic_keys() {
+        let payload = MachineErrorPayload::new(502, "upstream_reset", "bad gateway", "D-1");
+        assert_eq!(
+            serde_json::to_value(&payload).unwrap(),
+            serde_json::json!({
+                "error": {
+                    "code": "USERAPP_PROXY_FAILURE",
+                    "status": 502,
+                    "reason": "upstream_reset",
+                    "message": "bad gateway",
+                    "diagnostic_id": "D-1",
+                }
+            })
+        );
+    }
+
+    /// 唤醒诊断三键成组出现（值可为 null），error_detail 携带
+    /// cause_code/stage/retryable 与本地化消息。
+    #[test]
+    fn wake_failure_payload_keeps_grouped_diagnostic_keys() {
+        let mut failure = shared_types::WakeFailure::new(
+            shared_types::ERR_RUNTIME_UNAVAILABLE,
+            "wake",
+            "container is waking",
+        );
+        failure.operation_id = Some("op-7".into());
+        failure.retryable = true;
+        let payload = MachineErrorPayload::new(503, "wake_timeout", "waking", "D-2")
+            .with_wake_failure(&failure, "en-US");
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["error"]["operation_id"], serde_json::json!("op-7"));
+        assert_eq!(value["error"]["blocker"], serde_json::Value::Null);
+        assert_eq!(
+            value["error"]["error_detail"]["reason_code"],
+            serde_json::json!(shared_types::ERR_RUNTIME_UNAVAILABLE)
+        );
+        assert_eq!(value["error"]["error_detail"]["stage"], "wake");
+        assert_eq!(value["error"]["error_detail"]["retryable"], true);
+        // 无 operation_id 时键仍在、值为 null（与旧 attach 行为一致）
+        failure.operation_id = None;
+        let payload = MachineErrorPayload::new(503, "wake_timeout", "waking", "D-3")
+            .with_wake_failure(&failure, "en-US");
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["error"]["operation_id"], serde_json::Value::Null);
+    }
+
+    /// Pingap 自产错误出口：operation_id 键始终存在（值可为 null）。
+    #[test]
+    fn pingap_payload_always_carries_operation_id() {
+        for (input, expected) in [
+            (
+                Some("transition-9".to_string()),
+                serde_json::json!("transition-9"),
+            ),
+            (None, serde_json::Value::Null),
+        ] {
+            let payload =
+                MachineErrorPayload::new(502, "pingap_self_produced_error", "message", "D-4")
+                    .with_operation_id(input);
+            let value = serde_json::to_value(&payload).unwrap();
+            assert_eq!(value["error"]["operation_id"], expected);
+            assert_eq!(value["error"]["reason"], "pingap_self_produced_error");
+            assert!(value["error"].get("blocker").is_none());
+            assert!(value["error"].get("error_detail").is_none());
+        }
     }
 }

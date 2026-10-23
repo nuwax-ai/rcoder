@@ -1074,17 +1074,14 @@ impl PortProxy {
                 }
                 crate::error_page::ErrorRepresentation::Machine => {
                     let (_title, message) = hint.page_cause().copywriting(locale);
-                    let payload = serde_json::json!({
-                        "error": {
-                            "code": "USERAPP_PROXY_FAILURE",
-                            "status": status,
-                            "reason": "pingap_self_produced_error",
-                            "message": message,
-                            "diagnostic_id": diagnostic_id,
-                            "operation_id": hint.transition_operation_id(),
-                        }
-                    });
-                    ("application/json", payload.to_string().into())
+                    let payload = crate::error_page::MachineErrorPayload::new(
+                        status,
+                        "pingap_self_produced_error",
+                        message,
+                        diagnostic_id.clone(),
+                    )
+                    .with_operation_id(hint.transition_operation_id().map(str::to_string));
+                    ("application/json", payload.to_body().into())
                 }
             };
         // 按新表示重建头：移除编码/实体校验/缓存建议，替换 Content-Type/Length。

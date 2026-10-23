@@ -11174,6 +11174,7 @@ dependencies = [
  "pingora-http",
  "pingora-load-balancing",
  "pingora-proxy",
+ "serde",
  "serde_json",
  "shared_types",
  "thiserror 2.0.21",
