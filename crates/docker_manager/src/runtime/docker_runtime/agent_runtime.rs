@@ -25,6 +25,41 @@ impl AgentContainerRuntime for DockerRuntime {
         self.capture_docker_agent_retirement(identifier, service_type)
             .await
     }
+    async fn agent_compute_absent(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        registered: &ContainerBasicInfo,
+    ) -> ContainerRuntimeResult<bool> {
+        if self
+            .capture_docker_agent_retirement(identifier, service_type)
+            .await?
+            .has_compute()
+        {
+            return Ok(false);
+        }
+        if registered.container_id.is_empty() {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Registered Agent has no physical container identity".into(),
+            ));
+        }
+        // A renamed container may have lost the canonical name/labels but is
+        // still execution. Only the original exact CID's 404 proves absence.
+        match self
+            .inner
+            .get_docker_client()
+            .inspect_container(&registered.container_id, None)
+            .await
+        {
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(true),
+            Ok(_) => Ok(false),
+            Err(error) => Err(ContainerRuntimeError::DockerError(format!(
+                "Inspect captured Agent absence: {error}"
+            ))),
+        }
+    }
     async fn stop_captured_agent(
         &self,
         snapshot: &container_runtime_api::AgentStopSnapshot,

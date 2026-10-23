@@ -40,7 +40,24 @@ pub struct AgentStopSnapshot {
     pub endpoint: Option<String>,
 }
 
+impl AgentResourceIdentity {
+    /// A fresh capture may observe a status/fence RV update of the same object.
+    /// This never relaxes the exact UID/RV comparison of a returned stop witness.
+    pub fn same_resource(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.name == other.name
+            && self.uid == other.uid
+            && self.owner_uid == other.owner_uid
+            && self.created_at == other.created_at
+    }
+}
+
 impl AgentStopSnapshot {
+    /// A controller without a Pod may still be rebuilding execution.
+    pub fn has_compute(&self) -> bool {
+        self.controller.is_some() || self.container.is_some() || !self.pods.is_empty()
+    }
+
     pub fn oldest_created_at(&self) -> Option<DateTime<Utc>> {
         self.controller
             .iter()

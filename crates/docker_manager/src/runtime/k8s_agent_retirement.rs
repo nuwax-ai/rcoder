@@ -365,6 +365,54 @@ impl KubernetesRuntime {
         Ok(groups.into_values().collect())
     }
 
+    pub(super) async fn observe_agent_compute_absence(
+        &self,
+        identifier: &str,
+        family: &ServiceType,
+        registered: &shared_types::ContainerBasicInfo,
+    ) -> Result<bool> {
+        let name = super::k8s_pod::K8sPodOps::pod_name(self, identifier, family)?;
+        if name != registered.container_name {
+            return Err(conflict(
+                "Registered Agent name differs from its runtime scope",
+            ));
+        }
+        if self
+            .capture_agent_retirement(identifier, family)
+            .await?
+            .has_compute()
+        {
+            return Ok(false);
+        }
+        // Also inspect unlabeled/bare Pods and old controller-owned Pods. A
+        // damaged label must not turn surviving execution into missing metadata.
+        let pods = self
+            .pods()
+            .list(&ListParams::default())
+            .await
+            .map_err(api_error)?;
+        require_complete_list(&pods.metadata, "Pod")?;
+        if pods.items.iter().any(|pod| {
+            pod.metadata.uid.as_deref() == Some(registered.container_id.as_str())
+                || pod.metadata.name.as_deref() == Some(name.as_str())
+                || pod.metadata.name.as_deref() == Some(format!("{name}-0").as_str())
+                || pod.metadata.owner_references.iter().flatten().any(|owner| {
+                    (owner.kind == "StatefulSet" && owner.name == name)
+                        || registered.workload_uid.as_deref() == Some(owner.uid.as_str())
+                })
+        }) {
+            return Ok(false);
+        }
+        // Recheck after the complete Pod list: a rebuilding controller is not
+        // absent even if no Pod was visible during that list.
+        Ok(self
+            .statefulsets()
+            .get_opt(&name)
+            .await
+            .map_err(api_error)?
+            .is_none())
+    }
+
     pub(super) async fn capture_agent_retirement(
         &self,
         identifier: &str,
@@ -404,7 +452,7 @@ impl KubernetesRuntime {
             if snapshot
                 .controller
                 .as_ref()
-                .is_some_and(|previous| previous != &captured)
+                .is_some_and(|previous| !previous.same_resource(&captured))
             {
                 return Err(conflict("Agent controller changed during capture"));
             }
@@ -424,12 +472,13 @@ impl KubernetesRuntime {
                 let captured = identity(Kind::Pod, &pod.metadata)?;
                 if let Some(previous) = snapshot
                     .pods
-                    .iter()
+                    .iter_mut()
                     .find(|previous| previous.name == pod_name)
                 {
-                    if previous != &captured {
+                    if !previous.same_resource(&captured) {
                         return Err(conflict("Agent Pod changed during capture"));
                     }
+                    *previous = captured;
                 } else {
                     snapshot.pods.push(captured);
                 }
@@ -449,12 +498,13 @@ impl KubernetesRuntime {
                 let captured = identity(Kind::Service, &service.metadata)?;
                 if let Some(previous) = snapshot
                     .services
-                    .iter()
+                    .iter_mut()
                     .find(|previous| previous.name == captured.name)
                 {
-                    if previous != &captured {
+                    if !previous.same_resource(&captured) {
                         return Err(conflict("Agent Service changed during capture"));
                     }
+                    *previous = captured;
                 } else {
                     snapshot.services.push(captured);
                 }
@@ -834,7 +884,11 @@ impl KubernetesRuntime {
                     *target = identity(target.kind, patched.meta())?;
                     return Ok(());
                 }
-                Err(kube::Error::Api(error)) if error.code == 409 && attempt < 2 => {}
+                Err(kube::Error::Api(error)) if error.code == 409 => {
+                    if attempt == 2 {
+                        return Err(conflict("Agent admission fence changed repeatedly"));
+                    }
+                }
                 Err(error) => return Err(api_error(error)),
             }
         }

@@ -64,6 +64,18 @@ pub trait AgentContainerRuntime: Send + Sync {
             "Captured Agent retirement is unsupported".into(),
         ))
     }
+    /// Positively prove no compute remains at the canonical name or captured
+    /// physical identity. Lookup None, unready Pods and API errors are not proof.
+    async fn agent_compute_absent(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+        _registered: &ContainerBasicInfo,
+    ) -> ContainerRuntimeResult<bool> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Authoritative Agent absence observation is unsupported".into(),
+        ))
+    }
     /// Delete only original identities and versions; never refresh a failed target.
     async fn stop_captured_agent(
         &self,

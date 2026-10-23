@@ -26,6 +26,8 @@ cleanup_config:
   # Docker 容器停止超时时间（秒）
   # 默认值: 30
   docker_stop_timeout_seconds: 30
+  # 反向资源对账整轮预算；独立于 Stop，超预算后下轮从未完成的位置继续。
+  orphan_scan_budget_seconds: 30
   # 容器最小保护时间（秒），刚启动的容器在此时间内不会被清理
   # 默认值: 300 (5分钟)
   container_protection_seconds: 300

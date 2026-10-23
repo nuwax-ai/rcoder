@@ -145,6 +145,9 @@ pub struct CleanupConfigSettings {
     /// retires only empty managed controllers and Services after observation.
     #[serde(default)]
     pub orphan_reconcile_mode: OrphanReconcileMode,
+    /// Total reverse-inventory scan budget, independent of physical Stop.
+    #[serde(default = "default_orphan_scan_budget_seconds")]
+    pub orphan_scan_budget_seconds: u64,
     /// 闲置超时时间（秒），默认600秒（10分钟）
     #[serde(default = "default_idle_timeout_seconds")]
     pub idle_timeout_seconds: u64,
@@ -164,6 +167,10 @@ pub struct CleanupConfigSettings {
     /// 日志清理配置
     #[serde(default)]
     pub log_cleanup: LogCleanupConfig,
+}
+
+fn default_orphan_scan_budget_seconds() -> u64 {
+    30
 }
 
 fn default_cleanup_enabled() -> bool {
@@ -195,6 +202,7 @@ impl Default for CleanupConfigSettings {
         Self {
             enabled: default_cleanup_enabled(),
             orphan_reconcile_mode: OrphanReconcileMode::default(),
+            orphan_scan_budget_seconds: default_orphan_scan_budget_seconds(),
             idle_timeout_seconds: default_idle_timeout_seconds(),
             cleanup_interval_seconds: default_cleanup_interval_seconds(),
             docker_stop_timeout_seconds: default_docker_stop_timeout_seconds(),

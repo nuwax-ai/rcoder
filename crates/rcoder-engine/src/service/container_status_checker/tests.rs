@@ -339,7 +339,7 @@ async fn check_container_exists_dispatches_lookup_key_by_service_type() {
 
     // ComputerAgentRunner：用 user_id 查
     let info = container_info("proj-1", Some("user-1"), ServiceType::ComputerAgentRunner);
-    assert!(c.check_container_exists(&info, "addr").await);
+    assert!(c.check_container_exists(&info, "addr").await.unwrap());
     assert_eq!(
         probe.queried_identifiers(),
         vec!["user-1".to_string()],
@@ -348,7 +348,7 @@ async fn check_container_exists_dispatches_lookup_key_by_service_type() {
 
     // WebAgentRunner：用 project_id 查
     let info = container_info("proj-2", Some("user-2"), ServiceType::WebAgentRunner);
-    assert!(c.check_container_exists(&info, "addr").await);
+    assert!(c.check_container_exists(&info, "addr").await.unwrap());
     assert_eq!(
         probe.queried_identifiers().last().unwrap(),
         "proj-2",
@@ -357,7 +357,7 @@ async fn check_container_exists_dispatches_lookup_key_by_service_type() {
 
     // UserappBuilder：复用 project_id 路径
     let info = container_info("proj-3", Some("user-3"), ServiceType::UserappBuilder);
-    assert!(c.check_container_exists(&info, "addr").await);
+    assert!(c.check_container_exists(&info, "addr").await.unwrap());
     assert_eq!(
         probe.queried_identifiers().last().unwrap(),
         "proj-3",
@@ -368,8 +368,8 @@ async fn check_container_exists_dispatches_lookup_key_by_service_type() {
     let before = probe.queried_identifiers().len();
     let info = container_info("proj-4", Some("user-4"), ServiceType::Userapp);
     assert!(
-        !c.check_container_exists(&info, "addr").await,
-        "Userapp 恒视为不存在"
+        c.check_container_exists(&info, "addr").await.is_err(),
+        "Userapp must not be mistaken for absent Agent compute"
     );
     assert_eq!(
         probe.queried_identifiers().len(),
@@ -379,19 +379,17 @@ async fn check_container_exists_dispatches_lookup_key_by_service_type() {
 }
 
 #[tokio::test]
-async fn check_container_exists_treats_error_and_missing_user_id_as_absent() {
-    // 查询 Err：保守视为不存在（触发连接清理路径）
+async fn check_container_lookup_preserves_errors_and_missing_identity() {
     let (state, _metadata_dir) = test_state(Arc::new(ProbeRuntime::new(FindBehavior::Fail))).await;
     let c = checker(ContainerStatusCheckerConfig::default(), state);
     let info = container_info("proj", Some("user"), ServiceType::ComputerAgentRunner);
-    assert!(!c.check_container_exists(&info, "addr").await);
+    assert!(c.check_container_exists(&info, "addr").await.is_err());
 
-    // ComputerAgentRunner 缺 user_id：视为不存在且不查
     let probe = Arc::new(ProbeRuntime::new(FindBehavior::Found));
     let (state, _metadata_dir) = test_state(probe.clone()).await;
     let c = checker(ContainerStatusCheckerConfig::default(), state);
     let info = container_info("proj", None, ServiceType::ComputerAgentRunner);
-    assert!(!c.check_container_exists(&info, "addr").await);
+    assert!(c.check_container_exists(&info, "addr").await.is_err());
     assert!(probe.queried_identifiers().is_empty());
 }
 

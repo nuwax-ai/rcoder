@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tonic::{Request, Response, Status};
 
+mod absence_recovery;
+mod builder_pod_recovery;
 mod physical_docker;
 
 #[derive(Clone, Default)]
@@ -101,7 +103,18 @@ impl AgentService for Activity {
 
 struct Runtime {
     stops: AtomicUsize,
+    workload_name: std::sync::Mutex<String>,
     fail_stop: AtomicBool,
+    builder: std::sync::Mutex<Option<RuntimeContainerInfo>>,
+    builder_find_calls: AtomicUsize,
+    pause_builder_at: AtomicUsize,
+    missing: AtomicBool,
+    absence_unreadable: AtomicBool,
+    absence_checks: AtomicUsize,
+    presence_at_check: AtomicUsize,
+    pause_absence: AtomicBool,
+    absence_entered: tokio::sync::Notify,
+    absence_release: tokio::sync::Notify,
     physical: std::sync::Mutex<String>,
     docker: std::sync::Mutex<Option<physical_docker::Target>>,
 }
@@ -110,7 +123,18 @@ impl Default for Runtime {
     fn default() -> Self {
         Self {
             stops: AtomicUsize::new(0),
+            workload_name: std::sync::Mutex::new("shared-idle-fixture".into()),
             fail_stop: AtomicBool::new(false),
+            builder: std::sync::Mutex::new(None),
+            builder_find_calls: AtomicUsize::new(0),
+            pause_builder_at: AtomicUsize::new(0),
+            missing: AtomicBool::new(false),
+            absence_unreadable: AtomicBool::new(false),
+            absence_checks: AtomicUsize::new(0),
+            presence_at_check: AtomicUsize::new(0),
+            pause_absence: AtomicBool::new(false),
+            absence_entered: tokio::sync::Notify::new(),
+            absence_release: tokio::sync::Notify::new(),
             physical: std::sync::Mutex::new("physical-original".into()),
             docker: std::sync::Mutex::new(None),
         }
@@ -124,7 +148,7 @@ impl AgentContainerRuntime for Runtime {
     }
     fn agent_workload_name(&self, _: &str, _: &ServiceType) -> ContainerRuntimeResult<String> {
         Ok(self.docker.lock().unwrap().as_ref().map_or_else(
-            || "shared-idle-fixture".into(),
+            || self.workload_name.lock().unwrap().clone(),
             |target| target.name.clone(),
         ))
     }
@@ -152,6 +176,28 @@ impl AgentContainerRuntime for Runtime {
             replicas: None,
             endpoint: None,
         })
+    }
+    async fn agent_compute_absent(
+        &self,
+        _: &str,
+        _: &ServiceType,
+        _: &ContainerBasicInfo,
+    ) -> ContainerRuntimeResult<bool> {
+        if self.absence_unreadable.load(Ordering::SeqCst) {
+            return Err(ContainerRuntimeError::ConnectionError(
+                "controlled API observation error".into(),
+            ));
+        }
+        if self.pause_absence.load(Ordering::SeqCst) {
+            let released = self.absence_release.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            self.absence_entered.notify_one();
+            released.await;
+        }
+        let count = self.absence_checks.fetch_add(1, Ordering::SeqCst) + 1;
+        let present_at = self.presence_at_check.load(Ordering::SeqCst);
+        Ok(self.missing.load(Ordering::SeqCst) && (present_at == 0 || count < present_at))
     }
     async fn stop_captured_agent(
         &self,
@@ -188,9 +234,62 @@ impl AgentContainerRuntime for Runtime {
     async fn find_container(
         &self,
         _: &str,
-        _: &ServiceType,
+        family: &ServiceType,
     ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
+        if *family == ServiceType::UserappBuilder {
+            let call = self.builder_find_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.pause_builder_at.load(Ordering::SeqCst) == call {
+                let released = self.absence_release.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
+                self.absence_entered.notify_one();
+                released.await;
+            }
+            return Ok(self.builder.lock().unwrap().clone());
+        }
         Ok(None)
+    }
+    async fn inspect_builder_candidate(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        self.capture_builder_control(context).await
+    }
+    async fn capture_builder_control(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        let actual = self.builder.lock().unwrap().clone().unwrap();
+        Ok(shared_types::BuilderControlTarget {
+            context: context.clone(),
+            resource_binding: None,
+            workload: Some(shared_types::AppResourceIdentity {
+                kind: shared_types::AppResourceKind::StatefulSet,
+                name: actual.container_name.clone(),
+                uid: actual.workload_uid.unwrap(),
+                resource_version: Some("1".into()),
+            }),
+            pod: Some(shared_types::BuilderPodIdentity {
+                name: format!("{}-0", actual.container_name),
+                uid: actual.container_id,
+                resource_version: "2".into(),
+            }),
+            restart_image: None,
+            restart_runtime_workspace: None,
+            builder_startup_mode: Default::default(),
+        })
+    }
+    async fn stop_idle_builder_compute(
+        &self,
+        _: &str,
+        captured: &ContainerBasicInfo,
+    ) -> ContainerRuntimeResult<()> {
+        assert_eq!(
+            self.builder.lock().unwrap().as_ref().unwrap().container_id,
+            captured.container_id
+        );
+        self.stops.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
     async fn stop_container(&self, _: &str) -> ContainerRuntimeResult<()> {
         panic!("cleanup must use captured retirement")
@@ -230,6 +329,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new(projects: usize) -> Self {
+        Self::new_with_family(projects, ServiceType::ComputerAgentRunner).await
+    }
+
+    async fn new_with_family(projects: usize, family: ServiceType) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(
             rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
@@ -304,7 +407,11 @@ impl Fixture {
             ),
         });
         for index in 0..projects {
-            let id = format!("idle-project-{index}");
+            let id = if family == ServiceType::UserappBuilder {
+                format!("builder-idle-{}", uuid::Uuid::new_v4().simple())
+            } else {
+                format!("idle-project-{index}")
+            };
             let created_at = Utc::now() - chrono::Duration::hours(2);
             let container = ContainerBasicInfo {
                 container_id: "physical-original".into(),
@@ -312,20 +419,25 @@ impl Fixture {
                 container_ip: "127.0.0.1".into(),
                 internal_port: address.port(),
                 external_port: 0,
-                project_id: "idle-owner".into(),
+                project_id: if family == ServiceType::UserappBuilder {
+                    id.clone()
+                } else {
+                    "idle-owner".into()
+                },
                 status: "running".into(),
                 created_at,
                 service_url: format!("http://{address}"),
-                workload_uid: None,
+                workload_uid: (family == ServiceType::UserappBuilder)
+                    .then(|| "same-controller".into()),
             };
             let project = ProjectAndContainerInfo::from_parts(
                 id.clone(),
-                Some("idle-owner".into()),
+                (family != ServiceType::UserappBuilder).then(|| "idle-owner".into()),
                 None,
                 None,
                 Some(container),
                 ProjectExtendedFields {
-                    service_type: Some(ServiceType::ComputerAgentRunner),
+                    service_type: Some(family),
                     created_at: Some(created_at),
                     last_activity: Some(Utc::now() - chrono::Duration::minutes(30)),
                     ..Default::default()

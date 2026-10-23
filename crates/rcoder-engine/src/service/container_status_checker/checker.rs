@@ -245,29 +245,20 @@ impl ContainerStatusChecker {
                 }
             }
             Err(e) => {
-                // ❌ 失败：主动查询 Docker 容器是否存在（关键优化）
-                let container_exists = self
-                    .check_container_exists(container_info, &grpc_addr)
-                    .await;
-
-                if !container_exists {
-                    // 容器不存在：清理健康状态并计入失败（进入 skip 名单）。
-                    // 此前直接 return 不计数 → 消失容器的 project 每 30s 轮询都重查
-                    // （网络往返 + agent_runner 查询），历史残留 project 随时间线性
-                    // 放大轮询负载（compose 测试环境实测：20+ 死条目 × 2 轮/分钟）。
-                    // 计入失败后 skip_duration（默认 5 分钟）内跳过，容器若被
-                    // pod_ensure 重建，skip 窗口过后自然恢复检查。
-                    // 项目记录本身仍由清理任务（闲置回收，默认 10 分钟超时）统一移除。
-                    info!(
-                        "[STATUS_CHECKER] Container has been destroyed, cleaning up health state: {}",
-                        lookup_key
-                    );
-                    self.health_states.remove(lookup_key);
-                    self.state.grpc_pool.remove(&grpc_addr).await;
-                    self.record_failure(lookup_key, &grpc_addr, &e);
-                    return Err(e);
+                match self.check_container_exists(container_info, &grpc_addr).await {
+                    Ok(true) => {},
+                    Ok(false) => {
+                        info!(container_key = lookup_key,
+                            "[STATUS_CHECKER] No runtime candidate observed; registration retained for authoritative reconciliation");
+                        self.state.grpc_pool.remove(&grpc_addr).await;
+                    }
+                    Err(error) => {
+                        debug!(container_key = lookup_key, %error,
+                            "[STATUS_CHECKER] Runtime observation failed; no absence inferred");
+                    }
                 }
-
+                // Do not clear health state here: doing so would reset the
+                // consecutive-failure counter on every missing lookup.
                 // 容器存在但连接失败，记录失败（可能是网络问题）
                 self.record_failure(lookup_key, &grpc_addr, &e);
                 Err(e)
@@ -275,73 +266,35 @@ impl ContainerStatusChecker {
         }
     }
 
-    /// 检查 runtime 容器是否存在
+    /// Lookup presence is diagnostic, never a physical-exit receipt.
     pub(super) async fn check_container_exists(
         &self,
         container_info: &Arc<shared_types::ProjectAndContainerInfo>,
-        grpc_addr: &str,
-    ) -> bool {
-        let runtime = self.state.runtime();
-        let service_type = container_info
+        _grpc_addr: &str,
+    ) -> anyhow::Result<bool> {
+        let family = container_info
             .service_type()
-            .unwrap_or(shared_types::ServiceType::ComputerAgentRunner);
-
-        // 根据 service_type 使用不同的查找方法
-        // - RCoder 模式：使用 project_id 查找
-        // - ComputerAgentRunner 模式：使用 user_id 查找
-        let exists = match service_type {
-            // Computer 族共享容器：常规项目同按 user_id 查找
-            shared_types::ServiceType::ComputerAgentRunner
-            | shared_types::ServiceType::ComputerNormalProject => {
-                // ComputerAgentRunner 模式：使用 user_id 查找容器
-                if let Some(user_id) = container_info.user_id() {
-                    match runtime.find_container(user_id, &service_type).await {
-                        Ok(Some(_)) => true,
-                        Ok(None) => false,
-                        Err(e) => {
-                            debug!("[STATUS_CHECKER] Failed to query container: {}", e);
-                            false
-                        }
-                    }
-                } else {
-                    debug!("[STATUS_CHECKER] ComputerAgentRunner missing user_id");
-                    false
-                }
-            }
-            // UserappBuilder 是 agent-runner(复用 dev-rcoder-agent-runner,有 gRPC),
-            // 复用 WebAgentRunner 的 project_id 查找路径
+            .ok_or_else(|| anyhow::anyhow!("Agent service family is missing"))?;
+        match family {
             shared_types::ServiceType::WebAgentRunner
-            | shared_types::ServiceType::UserappBuilder => {
-                // RCoder / UserappBuilder 模式：使用 project_id(app_id)查找容器
-                match runtime
-                    .find_container(container_info.project_id(), &service_type)
-                    .await
-                {
-                    Ok(Some(_)) => true,
-                    Ok(None) => false,
-                    Err(e) => {
-                        debug!("[STATUS_CHECKER] Failed to query container: {}", e);
-                        false
-                    }
-                }
+            | shared_types::ServiceType::ComputerAgentRunner
+            | shared_types::ServiceType::ComputerNormalProject
+            | shared_types::ServiceType::UserappBuilder => {}
+            shared_types::ServiceType::Userapp => {
+                anyhow::bail!("Production UserApp does not participate in Agent status lookup")
             }
-            // Userapp 不参与 agent 健康检查（由 app_manager 独立管理），视为不存在
-            shared_types::ServiceType::Userapp => false,
-        };
-
-        if exists {
-            debug!(
-                "[STATUS_CHECKER] Runtime container exists, likely network issue: {} (service_type={:?})",
-                grpc_addr, service_type
-            );
-        } else {
-            info!(
-                "[STATUS_CHECKER] Runtime container does not exist (already destroyed): {} (service_type={:?})",
-                grpc_addr, service_type
-            );
         }
-
-        exists
+        let identifier = family.container_identifier(
+            container_info.pod_id(),
+            container_info.user_id(),
+            Some(container_info.project_id()),
+        )?;
+        Ok(self
+            .state
+            .runtime()
+            .find_container(identifier, &family)
+            .await?
+            .is_some())
     }
 }
 

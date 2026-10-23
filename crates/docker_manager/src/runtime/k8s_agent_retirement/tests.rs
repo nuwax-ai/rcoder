@@ -32,6 +32,7 @@ fn runtime(client: kube::Client) -> KubernetesRuntime {
 #[derive(Clone, Copy)]
 enum Case {
     ControllerOnly,
+    StatusVersionChanged,
     RunningController,
     BarePod,
     ServiceOnly,
@@ -91,6 +92,7 @@ async fn fixture(case: Case) -> Fixture {
     if matches!(
         case,
         Case::ControllerOnly
+            | Case::StatusVersionChanged
             | Case::RunningController
             | Case::ServiceFailure
             | Case::ObserveFailure
@@ -288,9 +290,12 @@ async fn fixture(case: Case) -> Fixture {
                         object["metadata"]["annotations"] = body["metadata"]["annotations"].clone();
                         object.clone()
                     } else if let Some(name) = name {
-                        if let Some(object) = live.iter().find(|object| {
+                        if let Some(object) = live.iter_mut().find(|object| {
                             object["kind"] == kind && object["metadata"]["name"] == name
                         }) {
+                            if matches!(case, Case::StatusVersionChanged) {
+                                object["metadata"]["resourceVersion"] = "8".into();
+                            }
                             object.clone()
                         } else {
                             code = 404;
@@ -1187,4 +1192,118 @@ async fn terminating_resources_never_bypass_pvc_or_foreign_identity_protection()
                 request.starts_with("DELETE ") || request.starts_with("PATCH "))
         );
     }
+}
+
+#[tokio::test]
+async fn initial_capture_accepts_same_uid_status_rv_changes_and_returns_fresh_versions() {
+    let f = fixture(Case::StatusVersionChanged).await;
+    let captured = f
+        .runtime
+        .capture_agent_retirement("owner", &ServiceType::ComputerAgentRunner)
+        .await
+        .unwrap();
+    assert_eq!(captured.controller.as_ref().unwrap().uid, "old-sts");
+    assert_eq!(
+        captured
+            .controller
+            .as_ref()
+            .unwrap()
+            .resource_version
+            .as_deref(),
+        Some("8")
+    );
+    assert_eq!(captured.services[0].resource_version.as_deref(), Some("8"));
+    assert!(
+        f.recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(request, _)| request.starts_with("GET "))
+    );
+}
+
+#[tokio::test]
+async fn final_delete_does_not_refresh_a_captured_resource_version() {
+    let f = fixture(Case::ControllerOnly).await;
+    let captured = f
+        .runtime
+        .capture_agent_retirement("owner", &ServiceType::ComputerAgentRunner)
+        .await
+        .unwrap();
+    for object in f.objects.lock().unwrap().iter_mut() {
+        object["metadata"]["resourceVersion"] = "8".into();
+    }
+    assert!(
+        f.runtime
+            .retire_agent_snapshot(&captured, true)
+            .await
+            .is_err()
+    );
+    assert!(
+        f.recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(request, _)| !request.starts_with("DELETE "))
+    );
+}
+
+#[tokio::test]
+async fn absence_observation_preserves_controller_and_unlabeled_old_owned_pod() {
+    let f = fixture(Case::RunningController).await;
+    let name = f
+        .runtime
+        .agent_workload_name("owner", &ServiceType::ComputerAgentRunner)
+        .unwrap();
+    let registered = shared_types::ContainerBasicInfo {
+        container_id: "old-pod".into(),
+        container_name: name.clone(),
+        container_ip: "127.0.0.1".into(),
+        project_id: "owner".into(),
+        internal_port: 50051,
+        external_port: 0,
+        status: "running".into(),
+        created_at: chrono::Utc::now(),
+        service_url: "http://127.0.0.1:50051".into(),
+        workload_uid: Some("old-sts".into()),
+    };
+    assert!(
+        !f.runtime
+            .observe_agent_compute_absence("owner", &ServiceType::ComputerAgentRunner, &registered)
+            .await
+            .unwrap()
+    );
+    f.objects
+        .lock()
+        .unwrap()
+        .retain(|object| object["kind"] != "StatefulSet");
+    f.objects.lock().unwrap().push(serde_json::json!({
+        "apiVersion":"v1", "kind":"Pod", "metadata":{
+            "namespace":"retirement-test", "name":"noncanonical-unlabeled-pod", "uid":"other-pod",
+            "ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":name,"uid":"old-sts","controller":true}]
+        }, "spec":{"containers":[{"name":"agent","image":"test"}]}
+    }));
+    assert!(
+        !f.runtime
+            .observe_agent_compute_absence("owner", &ServiceType::ComputerAgentRunner, &registered)
+            .await
+            .unwrap()
+    );
+    f.objects
+        .lock()
+        .unwrap()
+        .retain(|object| object["kind"] != "Pod");
+    assert!(
+        f.runtime
+            .observe_agent_compute_absence("owner", &ServiceType::ComputerAgentRunner, &registered)
+            .await
+            .unwrap()
+    );
+    assert!(
+        f.recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(request, _)| !request.starts_with("DELETE "))
+    );
 }

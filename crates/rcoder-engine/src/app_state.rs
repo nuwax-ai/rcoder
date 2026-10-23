@@ -22,6 +22,7 @@ use agent_provisioning::AgentDownloadManager;
 
 mod agent_registration;
 pub use agent_registration::RegistrationMetadata;
+mod agent_observation;
 mod agent_retirement;
 
 // 存储契约 trait 引入作用域：AppState.projects 为枚举 ProjectStoreBackend，

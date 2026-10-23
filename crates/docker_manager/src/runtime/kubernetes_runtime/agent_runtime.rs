@@ -27,6 +27,15 @@ impl AgentContainerRuntime for KubernetesRuntime {
         self.capture_agent_retirement(identifier, service_type)
             .await
     }
+    async fn agent_compute_absent(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        registered: &ContainerBasicInfo,
+    ) -> ContainerRuntimeResult<bool> {
+        self.observe_agent_compute_absence(identifier, service_type, registered)
+            .await
+    }
     async fn stop_captured_agent(
         &self,
         snapshot: &container_runtime_api::AgentStopSnapshot,

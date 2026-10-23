@@ -71,6 +71,10 @@ where
             },
         };
         if let Err(error) = result {
+            if matches!(error, kube::runtime::controller::Error::ObjectNotFound(_)) {
+                tracing::debug!(%error, "Agent Controller queue target already removed");
+                continue;
+            }
             tokio::select! {
                 _ = context.stop.cancelled() => {},
                 result = context.sender.send(AgentResourceEvent::ObservationFailed(error.to_string())) => {

@@ -163,6 +163,7 @@ fn configuration_defaults_to_reclaim_and_rejects_unknown_modes() {
 
 struct Runtime {
     snapshot: Mutex<AgentStopSnapshot>,
+    extra_snapshots: Mutex<Vec<AgentStopSnapshot>>,
     failed: AtomicBool,
     deletes: AtomicUsize,
     capture_entered: tokio::sync::Notify,
@@ -188,27 +189,41 @@ impl AgentContainerRuntime for Runtime {
                 "injected partial list failure".into(),
             ));
         }
-        Ok(vec![self.snapshot.lock().unwrap().clone()])
+        let mut all = vec![self.snapshot.lock().unwrap().clone()];
+        all.extend(self.extra_snapshots.lock().unwrap().clone());
+        Ok(all)
     }
     async fn capture_agent_stop(
         &self,
-        _: &str,
+        identifier: &str,
         _: &ServiceType,
     ) -> ContainerRuntimeResult<AgentStopSnapshot> {
         if self.capture_blocked.load(Ordering::Acquire) {
             self.capture_entered.notify_one();
             self.capture_release.notified().await;
         }
-        Ok(self.snapshot.lock().unwrap().clone())
+        let first = self.snapshot.lock().unwrap().clone();
+        if first.identifier == identifier {
+            return Ok(first);
+        }
+        Ok(self
+            .extra_snapshots
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|entry| entry.identifier == identifier)
+            .unwrap()
+            .clone())
     }
     async fn retire_agent_remnants(
         &self,
         snapshot: &AgentStopSnapshot,
     ) -> ContainerRuntimeResult<AgentStopOutcome> {
-        assert_eq!(
-            *snapshot,
-            *self.snapshot.lock().unwrap(),
-            "deletion must use the original frozen target"
+        assert!(
+            std::iter::once(self.snapshot.lock().unwrap().clone())
+                .chain(self.extra_snapshots.lock().unwrap().clone())
+                .any(|current| current == *snapshot),
+            "deletion must use an original frozen target"
         );
         self.deletes.fetch_add(1, Ordering::AcqRel);
         Ok(AgentStopOutcome::Complete)
@@ -274,6 +289,7 @@ async fn fixture() -> (Scanner, Arc<Runtime>, tempfile::TempDir) {
     );
     let runtime = Arc::new(Runtime {
         snapshot: Mutex::new(service()),
+        extra_snapshots: Mutex::new(Vec::new()),
         failed: AtomicBool::new(false),
         deletes: AtomicUsize::new(0),
         capture_entered: tokio::sync::Notify::new(),
@@ -293,6 +309,7 @@ async fn fixture() -> (Scanner, Arc<Runtime>, tempfile::TempDir) {
             state,
             config,
             seen: HashMap::new(),
+            next_workload: None,
         },
         runtime,
         directory,
@@ -401,4 +418,46 @@ async fn canonical_registration_arriving_after_capture_prevents_retirement() {
     scan.await.unwrap().unwrap();
     assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
     assert!(state.projects.get("new-project").is_some());
+}
+
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn scan_budget_advances_past_blocked_workload_without_resetting_other_candidates() {
+    let (mut scanner, runtime, _directory) = fixture().await;
+    scanner.config.orphan_scan_budget_seconds = 1;
+    scanner.config.docker_stop_timeout_seconds = 90;
+    let mut later = service();
+    later.identifier = "later".into();
+    later.services[0].name = "later-service".into();
+    runtime.extra_snapshots.lock().unwrap().push(later);
+    let blocked =
+        WorkloadKey::new("isolated", ServiceType::ComputerAgentRunner, "example").unwrap();
+    let guard = scanner
+        .state
+        .projects
+        .acquire_workload_admission(
+            blocked,
+            WorkloadAdmissionMode::Exclusive,
+            Instant::now() + Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+    scanner.scan().await.unwrap();
+    assert_eq!(scanner.next_workload.as_deref(), Some("later"));
+    scanner.scan().await.unwrap();
+    let later_key =
+        WorkloadKey::new("isolated", ServiceType::ComputerAgentRunner, "later").unwrap();
+    assert_eq!(
+        scanner.seen.get(&later_key).unwrap().observations,
+        1,
+        "timeout of the first workload must not erase another workload's completed observation"
+    );
+    drop(guard);
+    age_candidates(&mut scanner);
+    scanner.scan().await.unwrap();
+    assert_eq!(
+        runtime.deletes.load(Ordering::Acquire),
+        1,
+        "the later workload must eventually complete two canonical observations and retire"
+    );
 }

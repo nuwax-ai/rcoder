@@ -132,7 +132,7 @@ impl AgentCleaner {
                 }
                 Err(e) => {
                     current_stats.failed_cleaned += 1;
-                    warn!("[cleaner] Agent cleanup failed: {} - {}", project_id, e);
+                    warn!("[cleaner] Agent cleanup failed: {} - {e:#}", project_id);
                 }
             }
         }

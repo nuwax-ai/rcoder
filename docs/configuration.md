@@ -103,3 +103,21 @@ curl http://127.0.0.1:8090/api/docs/openapi.json \
 | `RCODER_USERAPP_DEV_FORWARD_CONNECT_WAIT_SECONDS` | 转发请求发送前等待开发容器 TCP 可连接的预算 |
 
 不同等待阶段各自有预算，调用方应结合原操作状态处理超时。错误与重试语义见[运行时错误契约](runtime-error-contract.md)。
+
+## 反向资源对账预算
+
+`cleanup_config.orphan_scan_budget_seconds` 默认 `30` 秒，独立于容器 Stop 超时。
+预算包含完整资源发现及本轮权威检查；到期结束本轮，下一轮从后续负载继续，
+避免固定顺序使尾部负载长期无法被检查。登记缺席收敛和 Builder Pod 换代观察也使用
+此预算，超时释放本次准入，不留下阻止原入口恢复的持久标记。日志 `scan coverage` 包含发现、访问、
+分类、失败、延后数量及耗时；`Registered` 的逐对象日志仍为 debug。
+
+完整 inventory 失败或 leader 换代会清除连续观察。分页延后的候选只有在新完整
+inventory 中物理快照完全相同时才保留，未进行权威检查不累计确认次数；当前
+观察失败只重置对应候选。删除前仍持独占准入重新核对 API、登记及生命周期。
+自动回收范围仍限于无 Pod 的 Service 或 replicas=0 的空控制器；运行中、重建中
+及无法确认活动的孤儿只观察，不因登记缺失而直接删除，也不删除数据卷。
+
+启动/复用时，初始捕获允许同一 UID 对象的正常 RV 更新；捕获后的删除见证仍严格
+匹配 UID/RV，真实替换或归属冲突保持拒绝。Builder 同控制器下的 Pod 换代可以修复
+登记并重新开始闲置观察，不使用旧 Pod 的闲置证据停止继任者。

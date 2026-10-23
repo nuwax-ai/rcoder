@@ -161,10 +161,17 @@ async fn run_chat_flow(
         .refresh_agent_workload_fence(&admission, identifier, &service_type)
         .await
         .map_err(|error| {
-            AppError::with_message(
-                shared_types::error_codes::ERR_BACKEND_ERROR,
-                format!("Workload reuse could not be confirmed; retry later: {error}"),
-            )
+            match error.downcast_ref::<container_runtime_api::ContainerRuntimeError>() {
+                Some(cause) => container_runtime_api::runtime_app_error(
+                    cause,
+                    "workload.reuse",
+                    container_runtime_api::RuntimeErrorContext::ReadOnly,
+                ),
+                None => AppError::with_message(
+                    shared_types::error_codes::ERR_BACKEND_ERROR,
+                    format!("Workload reuse could not be confirmed; retry later: {error}"),
+                ),
+            }
         })?;
 
     // 第三段：转发编排（安装检查 → session 解析 → 就绪探活 → 转发 → 响应后状态更新）

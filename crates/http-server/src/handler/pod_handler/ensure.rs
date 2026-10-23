@@ -176,10 +176,17 @@ pub(super) async fn ensure_ordinary_pod_with_admission(
         .refresh_agent_workload_fence(admission, container_identifier, service_type)
         .await
         .map_err(|error| {
-            AppError::with_message(
-                shared_types::error_codes::ERR_BACKEND_ERROR,
-                format!("Workload reuse could not be confirmed; retry later: {error}"),
-            )
+            match error.downcast_ref::<container_runtime_api::ContainerRuntimeError>() {
+                Some(cause) => container_runtime_api::runtime_app_error(
+                    cause,
+                    "workload.reuse",
+                    container_runtime_api::RuntimeErrorContext::ReadOnly,
+                ),
+                None => AppError::with_message(
+                    shared_types::error_codes::ERR_BACKEND_ERROR,
+                    format!("Workload reuse could not be confirmed; retry later: {error}"),
+                ),
+            }
         })?;
 
     // 4/5/6. 注册 VNC backend + 更新存储记录 + 构建响应

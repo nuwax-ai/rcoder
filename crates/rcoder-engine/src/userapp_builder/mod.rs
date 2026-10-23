@@ -49,7 +49,9 @@ pub(crate) use creation::fence_settler_tests::FenceRuntime;
 pub(crate) use creation::fence_settler_tests::runtime_state as builder_runtime_test_state;
 mod dev_cleanup;
 mod dev_locator;
+mod idle_registration;
 mod lifecycle;
+pub(crate) use idle_registration::refresh_idle_builder_pod;
 
 /// Idle retirement shares the existing local creation boundary. Target-side
 /// activity and physical UID checks provide the cross-replica observations;
