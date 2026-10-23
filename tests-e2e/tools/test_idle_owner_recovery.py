@@ -215,3 +215,18 @@ class IdleOwnerRecoveryToolTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class IdleRetirementEvidenceTests(unittest.TestCase):
+    def test_exact_structured_confirmation_and_retirement_are_required(self):
+        from idle_owner_recovery import idle_retirement_evidence
+        def row(message,cid='old-cid',app='owned-app'):
+            return json.dumps({'fields':{'message':message,'project_id':app,'container_id':cid}})
+        confirm=row('[cleaner] idle confirmed in distinct consecutive cleanup sweeps')
+        retire=row('Retiring captured idle builder compute')
+        self.assertEqual(len(idle_retirement_evidence(confirm+'\n'+retire,set(),'owned-app','old-cid')),2)
+        for logs in [retire+'\n'+retire,confirm+'\n'+row('Retiring captured idle builder compute','successor-cid'),
+                     confirm+'\n'+row('Retiring captured idle builder compute',app='foreign-app'),
+                     'idle confirmed (2nd consecutive scan)\nStarting container destruction']:
+            self.assertEqual(idle_retirement_evidence(logs,set(),'owned-app','old-cid'),[])
+        self.assertEqual(idle_retirement_evidence(confirm+'\n'+retire,{confirm},'owned-app','old-cid'),[])

@@ -79,6 +79,31 @@ def container_witness(row):
             'mounts': sorted(row['Mounts'], key=lambda mount: json.dumps(mount, sort_keys=True))}
 
 
+def invalid_sid_exit_order(logs, project, pid, trace_id):
+    """The actual Runner's wait/reap receipt must precede this RPC completion.
+
+    A TERM barrier cannot block SIGKILL. Client observation latency must not
+    turn an already reaped child into an expected-live-process assertion.
+    """
+    clean = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', logs)
+    project_match = re.compile(r'\bproject_id="?' + re.escape(project) + r'"?(?:[,\s]|$)')
+    pid_match = re.compile(r'\bpid=' + str(pid) + r'(?:[,\s]|$)')
+    trace_match = re.compile(r'\btrace_id="?' + re.escape(trace_id) + r'"?(?:[,\s}]|$)')
+    reaped = []
+    completed = []
+    for index, line in enumerate(clean.splitlines()):
+        if ('[ProcessReaper]' in line and 'exit_code=' in line
+                and project_match.search(line) and pid_match.search(line)):
+            reaped.append(index)
+        if ('agent_runner::grpc::chat' in line and '[gRPC] Chat completed: success=false' in line
+                and trace_match.search(line)):
+            completed.append(index)
+    require(len(reaped) == 1 and len(completed) == 1,
+            'Invalid SID needs the exact child reap and original RPC completion witnesses')
+    require(reaped[0] < completed[0], 'Invalid SID RPC completed before child reap')
+    return {'pid': pid, 'trace_id': trace_id, 'reap_line': reaped[0], 'completion_line': completed[0]}
+
+
 class Contract:
     def __init__(self, args):
         self.args = args
@@ -435,17 +460,26 @@ print(json.dumps({'commit':git('rev-parse','HEAD'),'blob':git('show','HEAD:senti
         self.check('devcomputer reload A preserves B actual owner', self.processes(b)==[owner_b])
         self.file('fixture/'+c+'.new-session-id','pending')
         self.file('fixture/'+c+'.exit-barrier','hold')
+        self.file('fixture/'+c+'.early-notification-id',self.user+'-invalid-init-probe')
         rid=self.user+'-invalid-'+uuid.uuid4().hex
         self.report['intents'][rid]={'project_id':c,'invalid_response_test':True}
         self.persist()
         request=asyncio.create_task(self.api(self.args.chat_path,self.payload(c,rid,None)))
         self.pending_http.append(request)
+        await self.wait(lambda:any(r['event']=='early_notifications_sent'and r['project']==c for r in self.journal()),
+                        time.monotonic()+10,'Invalid SID initialization response barrier')
+        invalid_owners=self.processes(c)
+        require(len(invalid_owners)==1 and not request.done(), 'Invalid SID initialization barrier was bypassed')
+        # Capture PID+start while the real child cannot yet emit the invalid SID.
+        # SIGKILL may complete its later TERM barrier before Docker exec returns.
+        self.file('fixture/'+c+'.early-notification-release','release')
         await self.wait(lambda:any(r['event']=='exit_started'and r['project']==c for r in self.journal()),
                         time.monotonic()+10,'Invalid SID real exit barrier')
-        invalid_owners=self.processes(c)
-        require(len(invalid_owners)==1 and not request.done(), 'Invalid SID replied before physical exit')
         self.file('fixture/'+c+'.exit-release','release')
         status,error=await request
+        require(self.original_absent(invalid_owners[0]), 'Invalid SID child was not physically reaped')
+        reap_order=invalid_sid_exit_order(self.docker('logs',self.cid),c,invalid_owners[0]['pid'],error['tid'])
+        self.save('invalid-sid-reap-order.json',reap_order)
         self.check('devcomputer default English invalid ACP cause and real cleanup',
                    error.get('success')is False and 'ACP session response contained a preparation state instead of a session ID'
                    in error.get('message','') and self.original_absent(invalid_owners[0]),

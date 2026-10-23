@@ -275,6 +275,33 @@ def inspect(cid):
     return json.loads(result.stdout)[0]
 
 
+
+def idle_retirement_evidence(logs, previous_lines, app_id, container_id):
+    """Current structured records for this exact workload; stdout duplicates
+    and a different CID never count as another independent confirmation.
+    """
+    required = {'[cleaner] idle confirmed in distinct consecutive cleanup sweeps',
+                'Retiring captured idle builder compute'}
+    records = {}
+    for line in logs.splitlines():
+        if line in previous_lines:
+            continue
+        try:
+            row = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(row, dict):
+            continue
+        fields = row.get('fields', {})
+        if not isinstance(fields, dict):
+            continue
+        message = fields.get('message')
+        if (message in required and fields.get('container_id') == container_id
+                and fields.get('project_id', fields.get('identifier')) == app_id):
+            records.setdefault(message, row)
+    return list(records.values()) if set(records) == required else []
+
+
 def fixture_layout(app_id, source_root):
     """固定本实验的平台源码根，不接受 code/ 或跨应用路径作为别名。"""
     if not isinstance(app_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', app_id):
@@ -601,8 +628,7 @@ def main():
         deadline = time.monotonic() + IDLE_SECONDS + SCAN_SECONDS * 4 + 90
         while inspect(old_id) is not None and time.monotonic() < deadline:
             time.sleep(2)
-        lines = [line for line in controller_logs().splitlines() if line not in previous_lines and app in line and
-                 ('idle confirmed (2nd consecutive scan)' in line or 'Starting container destruction' in line)]
+        lines = idle_retirement_evidence(controller_logs(), previous_lines, app, old_id)
         check(cycle + ': real idle reaper removed captured builder', inspect(old_id) is None and len(lines) >= 2, lines)
         cid = None
         log_mount = next(m for m in before['mounts'] if m['destination'] == '/home/user/logs')

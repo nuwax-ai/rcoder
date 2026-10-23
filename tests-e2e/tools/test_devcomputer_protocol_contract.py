@@ -150,3 +150,26 @@ class ControlledFixtureContracts(unittest.TestCase):
 
 
 if __name__=='__main__':unittest.main()
+
+
+class InvalidSidReapOrderTests(unittest.TestCase):
+    def records(self):
+        return [
+            'INFO agent_abstraction::launcher::lifecycle::spawn: [ProcessReaper] exited project_id=owned-c, pid=123, pgid=123, exit_code=None, signal=Some(9)',
+            'INFO chat{trace_id=original-trace}: agent_runner::grpc::chat: [gRPC] Chat completed: success=false',
+        ]
+
+    def test_forced_kill_before_rpc_is_valid_even_when_term_barrier_was_not_released(self):
+        from devcomputer_protocol_contract import invalid_sid_exit_order
+        result=invalid_sid_exit_order('\n'.join(self.records()),'owned-c',123,'original-trace')
+        self.assertLess(result['reap_line'],result['completion_line'])
+
+    def test_premature_reply_missing_reap_and_foreign_pid_or_trace_are_rejected(self):
+        from devcomputer_protocol_contract import invalid_sid_exit_order
+        good=self.records()
+        for lines, pid, trace in [(list(reversed(good)),123,'original-trace'),
+                                  (good[1:],123,'original-trace'),
+                                  (good,124,'original-trace'),
+                                  (good,123,'other-trace')]:
+            with self.subTest(lines=lines,pid=pid,trace=trace),self.assertRaises(AssertionError):
+                invalid_sid_exit_order('\n'.join(lines),'owned-c',pid,trace)
