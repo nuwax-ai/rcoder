@@ -31,6 +31,13 @@ pub enum ArchiveError {
     InvalidArchive(String),
     /// Cumulative uncompressed size exceeded the caller-supplied quota
     TooLarge { size: u64, max: u64 },
+    /// 目录归一化失败且回滚未完全恢复现场: 保留触发回滚的原始错误、回滚中
+    /// 失败的步骤(`路径`, 诊断)及可能仍滞留数据的残留路径。
+    NormalizeRollbackIncomplete {
+        original: Box<ArchiveError>,
+        rollback: Vec<(PathBuf, String)>,
+        residual: Vec<PathBuf>,
+    },
 }
 
 impl std::fmt::Display for ArchiveError {
@@ -44,6 +51,26 @@ impl std::fmt::Display for ArchiveError {
                 "Archive bomb: uncompressed size {} exceeds limit {}",
                 size, max
             ),
+            ArchiveError::NormalizeRollbackIncomplete {
+                original,
+                rollback,
+                residual,
+            } => {
+                let steps = rollback
+                    .iter()
+                    .map(|(path, msg)| format!("{}: {}", path.display(), msg))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let paths = residual
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "normalize rollback incomplete (original error: {original}; failed rollback steps: {steps}; residual paths with possible data: {paths})"
+                )
+            }
         }
     }
 }
@@ -282,21 +309,26 @@ pub fn detect_file_type_from_path(path: &Path) -> Result<&'static str, ArchiveEr
 /// move its contents up to `agent_dir` directly.
 ///
 /// Returns `true` if a wrapper was stripped, `false` otherwise.
+///
+/// 搬运阶段的**所有**失败出口(子项枚举/迭代/改名)统一先进回滚: 已搬走的子项与
+/// wrapper 本体恢复原位后才返回错误; 回滚自身失败时返回
+/// [`ArchiveError::NormalizeRollbackIncomplete`], 保留原错误、回滚诊断与可能
+/// 滞留数据的残留路径。
 pub fn normalize_extracted_dir(agent_dir: &Path) -> Result<bool, ArchiveError> {
-    let entries: Vec<std::fs::DirEntry> = std::fs::read_dir(agent_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let name = e.file_name();
-            name != ".DS_Store" && !name.to_string_lossy().starts_with("staging.")
-        })
-        .collect();
+    let entries = read_wrapper_candidates(agent_dir)?;
 
     // Check: exactly one directory entry (the wrapper)
     if entries.len() != 1 {
         return Ok(false);
     }
     let only = &entries[0];
-    if !only.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+    let file_type = only.file_type().map_err(|e| {
+        ArchiveError::Io(std::io::Error::other(format!(
+            "stat {}: {e}",
+            only.path().display()
+        )))
+    })?;
+    if !file_type.is_dir() {
         return Ok(false);
     }
 
@@ -312,37 +344,19 @@ pub fn normalize_extracted_dir(agent_dir: &Path) -> Result<bool, ArchiveError> {
         ArchiveError::Io(std::io::Error::other(format!("rename wrapper dir: {}", e)))
     })?;
 
-    // Move wrapper's children into agent_dir
+    // Move wrapper's children into agent_dir; moved 记录已成功搬走的子项供回滚
     let mut moved_names: Vec<std::ffi::OsString> = Vec::new();
-    let mut move_err: Option<std::io::Error> = None;
-    for entry in std::fs::read_dir(&tmp_rename)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let dest = agent_dir.join(&name);
-        if let Err(e) = std::fs::rename(entry.path(), &dest) {
-            move_err = Some(e);
-            break;
-        }
-        moved_names.push(name);
-    }
-
-    if let Some(e) = move_err {
-        // Rollback
-        for name in &moved_names {
-            let src = agent_dir.join(name);
-            let dst = tmp_rename.join(name);
-            if let Err(re) = std::fs::rename(&src, &dst) {
-                error!("Rollback failed to move back {}: {}", src.display(), re);
-            }
-        }
-        if let Err(re) = std::fs::rename(&tmp_rename, &wrapper) {
-            error!(
-                "Rollback failed to restore wrapper dir {}: {}",
-                wrapper.display(),
-                re
-            );
-        }
-        return Err(ArchiveError::Io(e));
+    if let Err(original) = move_wrapper_children(&tmp_rename, agent_dir, &mut moved_names) {
+        return Err(
+            match rollback_wrapper_move(agent_dir, &tmp_rename, &wrapper, &moved_names) {
+                Ok(()) => original,
+                Err(failure) => ArchiveError::NormalizeRollbackIncomplete {
+                    original: Box::new(original),
+                    rollback: failure.steps,
+                    residual: failure.residual,
+                },
+            },
+        );
     }
 
     // Cleanup the now-empty wrapper directory; 失败无害 (目录非空或已删), 记 debug 日志留痕
@@ -355,6 +369,84 @@ pub fn normalize_extracted_dir(agent_dir: &Path) -> Result<bool, ArchiveError> {
     }
 
     Ok(true)
+}
+
+/// 枚举 agent_dir 下的候选条目(忽略 `.DS_Store`/`staging.*`)。
+/// 迭代中的 IO 错误传播而非丢弃——静默丢错会把"无法枚举"误判为"无 wrapper"。
+fn read_wrapper_candidates(dir: &Path) -> Result<Vec<std::fs::DirEntry>, ArchiveError> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name != ".DS_Store" && !name.to_string_lossy().starts_with("staging.") {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+/// 把 wrapper 临时目录的子项逐个搬入 agent_dir; 每次成功改名后登记到 `moved`。
+fn move_wrapper_children(
+    tmp: &Path,
+    agent_dir: &Path,
+    moved: &mut Vec<std::ffi::OsString>,
+) -> Result<(), ArchiveError> {
+    for entry in std::fs::read_dir(tmp)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        std::fs::rename(entry.path(), agent_dir.join(&name))?;
+        moved.push(name);
+    }
+    Ok(())
+}
+
+/// 回滚搬运: 已搬入 agent_dir 的子项搬回 wrapper 临时目录, 再把临时目录恢复为
+/// wrapper 原名。单个步骤失败不中断其余步骤; 任一失败返回诊断与残留路径。
+struct NormalizeRollbackFailure {
+    steps: Vec<(PathBuf, String)>,
+    residual: Vec<PathBuf>,
+}
+
+fn rollback_wrapper_move(
+    agent_dir: &Path,
+    tmp: &Path,
+    wrapper: &Path,
+    moved: &[std::ffi::OsString],
+) -> Result<(), NormalizeRollbackFailure> {
+    let mut steps: Vec<(PathBuf, String)> = Vec::new();
+    let mut residual: Vec<PathBuf> = Vec::new();
+    for name in moved {
+        let src = agent_dir.join(name);
+        match std::fs::rename(&src, tmp.join(name)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 子项已不在 agent_dir(无数据可恢复), 只记诊断不列残留
+                steps.push((src, format!("move child back: {e}")));
+            }
+            Err(e) => {
+                error!("Rollback failed to move back {}: {}", src.display(), e);
+                steps.push((src.clone(), format!("move child back: {e}")));
+                residual.push(src);
+            }
+        }
+    }
+    match std::fs::rename(tmp, wrapper) {
+        Ok(()) => {}
+        Err(e) => {
+            error!(
+                "Rollback failed to restore wrapper dir {}: {}",
+                wrapper.display(),
+                e
+            );
+            steps.push((tmp.to_path_buf(), format!("restore wrapper dir: {e}")));
+            residual.push(tmp.to_path_buf());
+        }
+    }
+    if steps.is_empty() {
+        Ok(())
+    } else {
+        Err(NormalizeRollbackFailure { steps, residual })
+    }
 }
 
 /// Locate the entry executable in `extract_dir`.
@@ -670,6 +762,153 @@ mod tests {
 
         let stripped = normalize_extracted_dir(&agent_dir).unwrap();
         assert!(!stripped);
+    }
+
+    /// R07 反例: wrapper 已移出 agent_dir 后, 子项枚举失败(read_dir(tmp) 的 `?`)
+    /// 直接返回错误、跳过回滚——wrapper 被滞留在目标目录外。用仅写(0o200)权限的
+    /// wrapper 确定性注入: rename 出去只需写权限(macOS/Linux 均如此), 而后续
+    /// read_dir(tmp) 需要读权限而失败; 初始 read_dir(agent_dir) 与 DirEntry 的
+    /// file_type 只依赖 agent_dir 自身权限, 不受影响。修复后必须先回滚再返回错误。
+    #[cfg(unix)]
+    #[test]
+    fn normalize_children_enumeration_failure_restores_wrapper() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let wrapper = agent_dir.join("wrapper-1.0.0");
+        std::fs::create_dir_all(&wrapper).unwrap();
+        std::fs::write(wrapper.join("file.txt"), "content").unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o200)).unwrap();
+
+        let result = normalize_extracted_dir(&agent_dir);
+
+        // 测试卫生: 无论断言结果如何, 先恢复两处可能位置的权限便于清理
+        let stranded = tmp.path().join("agent__wrapper_tmp");
+        if stranded.is_dir() {
+            drop(std::fs::set_permissions(
+                &stranded,
+                std::fs::Permissions::from_mode(0o755),
+            ));
+        }
+        drop(std::fs::set_permissions(
+            &wrapper,
+            std::fs::Permissions::from_mode(0o755),
+        ));
+
+        assert!(result.is_err(), "unreadable wrapper must surface an error");
+        assert!(
+            wrapper.is_dir(),
+            "wrapper must be rolled back to {} instead of stranded at {}",
+            wrapper.display(),
+            stranded.display()
+        );
+        assert!(!stranded.exists(), "no stray wrapper temp dir may remain");
+        assert_eq!(
+            std::fs::read_to_string(wrapper.join("file.txt")).unwrap(),
+            "content",
+            "rolled-back wrapper must keep its contents"
+        );
+    }
+
+    /// R07: 子项搬移中途冲突失败时, 原树必须完整恢复(现有回滚分支的守护)。
+    /// agent_dir 中被过滤的 `.DS_Store` 是非空目录, 与 wrapper 内同名文件冲突。
+    #[test]
+    fn normalize_mid_move_conflict_restores_original_tree() {
+        let tmp = tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(agent_dir.join(".DS_Store").join("inner")).unwrap();
+        std::fs::write(
+            agent_dir.join(".DS_Store").join("inner").join("keep.txt"),
+            "x",
+        )
+        .unwrap();
+        let wrapper = agent_dir.join("wrapper-1.0.0");
+        std::fs::create_dir_all(&wrapper).unwrap();
+        // wrapper 子项: 同名文件(搬移必然冲突) + 正常文件(可能已被搬走)
+        std::fs::write(wrapper.join(".DS_Store"), "wrapper mac file").unwrap();
+        std::fs::write(wrapper.join("real.txt"), "real").unwrap();
+
+        let result = normalize_extracted_dir(&agent_dir);
+
+        assert!(result.is_err(), "conflicting child move must fail");
+        assert!(
+            wrapper.join(".DS_Store").is_file(),
+            "wrapper must be restored with all children"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wrapper.join("real.txt")).unwrap(),
+            "real"
+        );
+        assert!(
+            agent_dir
+                .join(".DS_Store")
+                .join("inner")
+                .join("keep.txt")
+                .is_file()
+        );
+        assert!(
+            !tmp.path().join("agent__wrapper_tmp").exists(),
+            "no stray wrapper temp dir may remain"
+        );
+    }
+
+    /// R07: 初始枚举失败(目录不存在)原样传播, 无副作用。
+    #[test]
+    fn normalize_missing_dir_error_propagates_without_side_effects() {
+        let tmp = tempdir().unwrap();
+        assert!(normalize_extracted_dir(&tmp.path().join("nope")).is_err());
+    }
+
+    /// R07: 回滚中个别子项已不可恢复(如被外部移走)时, 其余步骤继续、wrapper
+    /// 仍恢复, 失败步骤与残留路径进入诊断。直接在手工构造的"搬入一半"现场上
+    /// 调用回滚(该状态无法用纯文件系统权限在完整链路中确定性注入)。
+    #[test]
+    fn rollback_reports_unrecoverable_steps_and_residuals() {
+        let tmp = tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        let tmp_wrapper = tmp.path().join("agent__wrapper_tmp");
+        let wrapper = agent_dir.join("wrapper-1.0.0");
+        for dir in [&agent_dir, &tmp_wrapper] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        // 模拟: a.txt 已搬入 agent_dir; b.txt 在 moved 清单里但已被外部移走
+        std::fs::write(agent_dir.join("a.txt"), "a").unwrap();
+        std::fs::write(tmp_wrapper.join("b.txt"), "b").unwrap();
+        let moved = vec!["a.txt".into(), "b.txt".into()];
+
+        let failure =
+            rollback_wrapper_move(&agent_dir, &tmp_wrapper, &wrapper, &moved).unwrap_err();
+
+        // 可恢复子项搬回 + wrapper 恢复原名
+        assert!(wrapper.join("a.txt").is_file());
+        assert!(wrapper.join("b.txt").is_file());
+        assert!(!tmp_wrapper.exists());
+        // 不可恢复的 b.txt 记为失败步骤; ENOENT 无数据残留, 不列入 residual
+        assert_eq!(failure.steps.len(), 1, "{:?}", failure.steps);
+        assert_eq!(failure.steps[0].0, agent_dir.join("b.txt"));
+        assert!(
+            failure.residual.is_empty(),
+            "ENOENT steps carry no data, residual={:?}",
+            failure.residual
+        );
+    }
+
+    /// R07: 错误显示保留原错误与残留路径(现场可定位)。
+    #[test]
+    fn rollback_incomplete_error_display_carries_diagnostics() {
+        let error = ArchiveError::NormalizeRollbackIncomplete {
+            original: Box::new(ArchiveError::Io(std::io::Error::other("boom"))),
+            rollback: vec![(
+                PathBuf::from("/tmp/agent__wrapper_tmp"),
+                "restore wrapper dir: permission denied".to_string(),
+            )],
+            residual: vec![PathBuf::from("/tmp/agent__wrapper_tmp")],
+        };
+        let text = error.to_string();
+        assert!(text.contains("boom"), "{text}");
+        assert!(text.contains("restore wrapper dir"), "{text}");
+        assert!(text.contains("agent__wrapper_tmp"), "{text}");
     }
 
     #[test]

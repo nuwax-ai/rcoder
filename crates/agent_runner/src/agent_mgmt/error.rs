@@ -94,6 +94,11 @@ impl From<download_utils::ArchiveError> for AgentMgmtError {
             download_utils::ArchiveError::PathTraversal(msg) => Self::PathTraversal(msg),
             download_utils::ArchiveError::InvalidArchive(msg) => Self::Archive(msg),
             download_utils::ArchiveError::TooLarge { size, max } => Self::ArchiveBomb { size, max },
+            // normalize 回滚未完全恢复: 仍是"安装中剥壳失败", 与 Io 路径同判
+            // InstallFailed, 消息携带残留路径便于现场恢复
+            download_utils::ArchiveError::NormalizeRollbackIncomplete { .. } => {
+                Self::InstallFailed(e.to_string())
+            }
         }
     }
 }
