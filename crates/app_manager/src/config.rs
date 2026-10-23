@@ -64,6 +64,9 @@ impl Default for AppAccessMode {
 pub struct AppManagerConfig {
     /// 是否启用
     pub enabled: bool,
+    /// Set by the engine from userapp_storage.default_recovery_enabled.
+    #[serde(skip)]
+    pub default_recovery_enabled: bool,
 
     /// 工作空间根目录（Docker 模式 = 宿主机路径；K8s 模式 = rcoder Pod 内 PVC 挂载点）
     pub workspace_root: Option<String>,
@@ -116,6 +119,7 @@ impl Default for AppManagerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            default_recovery_enabled: true,
             workspace_root: std::env::var("RCODER_WORKSPACE_ROOT").ok(),
             operation_lock_root: default_operation_lock_root(),
             namespace: std::env::var("RCODER_K8S_NAMESPACE")

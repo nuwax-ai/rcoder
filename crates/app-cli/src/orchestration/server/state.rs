@@ -204,7 +204,15 @@ pub(crate) enum ControlSignal {
         pg: Option<shared_types::StartPgCredential>,
     },
     /// 停止业务服务（保持管理面）。
-    StopBusiness { operation_id: String },
+    RecoverArtifact {
+        operation_id: String,
+        workspace: std::path::PathBuf,
+        release_id: String,
+        pg: Option<shared_types::StartPgCredential>,
+    },
+    StopBusiness {
+        operation_id: String,
+    },
 }
 
 #[async_trait::async_trait]

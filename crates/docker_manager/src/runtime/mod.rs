@@ -100,3 +100,6 @@ mod docker_builder_deletion;
 mod k8s_builder_deletion;
 
 mod lifecycle_discovery;
+
+#[cfg(feature = "kubernetes")]
+mod k8s_default_recovery;

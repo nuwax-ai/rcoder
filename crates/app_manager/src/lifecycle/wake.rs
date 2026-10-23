@@ -41,6 +41,12 @@ impl AppService {
         validate_app_id(app_id)?;
         let deadline = Instant::now() + budget;
         let preflight = async {
+            if self.config.default_recovery_enabled
+                && restoration_owner.is_some()
+                && self.metadata.store.get_application(app_id).await?.is_none()
+            {
+                self.discover_missing_identity(app_id).await?;
+            }
             self.metadata
                 .store
                 .check_compute_access(app_id, shared_types::UserAppOperationScope::Prod, false)
@@ -103,7 +109,8 @@ impl AppService {
                         .await?;
                 }
                 let status = if restoration_owner.is_some()
-                    && self.config.access_mode == crate::config::AppAccessMode::Docker
+                    && (self.config.access_mode == crate::config::AppAccessMode::Docker
+                        || self.config.default_recovery_enabled)
                 {
                     self.runtime
                         .get_deployment_status(app_id)
@@ -165,7 +172,7 @@ impl AppService {
             let restore = tokio::spawn(async move {
                 owner_admission.scope(async move {
                     let result = service.restore_runtime_on_traffic(
-                        &worker_app_id, &lifecycle_id, worker_observer,
+                        &worker_app_id, &lifecycle_id, worker_observer, deadline,
                     ).await;
                     if let Err(error) = &result {
                         tracing::warn!(app_id = %worker_app_id, %error, "Owned application runtime restoration failed");

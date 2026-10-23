@@ -637,8 +637,18 @@ impl KubernetesRuntime {
         //    subPath 目录由 kubelet 自动创建，故只 ensure 单块 PVC
         //    （历史第二块 `-data` PVC 已随单卷化退役；destroy 侧兜底回收存量）。
         //    销毁走 destroy_app_pvc。
+        if let Some(storage) = &params.retained_storage {
+            let context = params.execution_context.as_ref().ok_or_else(|| {
+                ContainerRuntimeError::ConfigurationError(
+                    "Storage recovery requires an admitted operation".into(),
+                )
+            })?;
+            self.recover_retained_storage(context, storage).await?;
+        }
         let ensured_pvc = self.workspace_pvc_name(app_id, &ServiceType::Userapp)?;
-        let ensure_result = if let Some(context) = &params.execution_context {
+        let ensure_result = if params.retained_storage.is_some() {
+            Ok(())
+        } else if let Some(context) = &params.execution_context {
             self.ensure_owned_workspace_pvc(
                 context,
                 &ServiceType::Userapp,

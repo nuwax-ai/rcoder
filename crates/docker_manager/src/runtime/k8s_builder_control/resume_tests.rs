@@ -769,7 +769,13 @@ async fn create_entry_rejects_foreign_or_replaced_existing_compute_before_data_w
         }
         let result = runtime.create_container(params).await;
         assert!(
-            matches!(result, Err(Error::RequestRejected(_))),
+            match &result {
+                Err(Error::RequestRejected(_)) => true,
+                Err(Error::CreationAborted { progress, source }) =>
+                    progress.safe_finish_ok()
+                        && matches!(source.as_ref(), Error::RequestRejected(_)),
+                _ => false,
+            },
             "{mutation}: {result:?}"
         );
         let state = state.lock().expect("state");

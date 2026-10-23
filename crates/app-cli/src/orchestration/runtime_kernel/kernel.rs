@@ -76,9 +76,18 @@ pub(crate) enum DispatchAction {
         pg: Option<shared_types::StartPgCredential>,
     },
     /// 停止业务服务（保持管理面可用）。
-    StopBusiness { operation_id: String },
+    RecoverArtifact {
+        operation_id: String,
+        release_id: String,
+        pg: Option<shared_types::StartPgCredential>,
+    },
+    StopBusiness {
+        operation_id: String,
+    },
     /// Cancel a captured Source's child execution, without admitting Stop.
-    CancelSource { operation_id: String },
+    CancelSource {
+        operation_id: String,
+    },
 }
 
 #[derive(Default)]
@@ -1698,6 +1707,20 @@ impl RuntimeKernel {
                 operation_id: stored.view.operation_id.clone(),
                 artifact_id: artifact_id.clone(),
                 sha256: None,
+                pg: stored
+                    .request
+                    .run_config
+                    .as_ref()
+                    .and_then(|config| config.pg.clone()),
+            },
+            (
+                RuntimeOperationKind::Deploy,
+                shared_types::RunProfileInput::Artifact {
+                    artifact: shared_types::ArtifactInput::RetainedWorkspace { release_id },
+                },
+            ) => DispatchAction::RecoverArtifact {
+                operation_id: stored.view.operation_id.clone(),
+                release_id: release_id.clone(),
                 pg: stored
                     .request
                     .run_config

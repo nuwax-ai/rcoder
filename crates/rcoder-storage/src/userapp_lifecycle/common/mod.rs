@@ -40,6 +40,7 @@ mod pg_commit_reply_tests;
 mod recovery_scan_tests;
 mod recovery_witness;
 mod repo;
+mod retained_input;
 #[cfg(test)]
 mod transaction_fault_tests;
 #[cfg(test)]
@@ -142,6 +143,35 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         })
         .await
     }
+    async fn restore_storage_identity(
+        &self,
+        storage: &UserAppRetainedStorage,
+    ) -> Result<UserAppLifecycleRecord, UserAppStoreError> {
+        storage
+            .validate()
+            .map_err(UserAppStoreError::InvalidOperation)?;
+        let storage = storage.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                let mut proposed = super::domain::identity(&storage.app_id)?;
+                if let Some(id) = &storage.lifecycle_id {
+                    proposed.lifecycle_id = id.clone();
+                }
+                let app = repo::ensure(tx, backend, &proposed).await?;
+                super::domain::validate_active(&app)?;
+                if storage
+                    .lifecycle_id
+                    .as_ref()
+                    .is_some_and(|id| id != &app.lifecycle_id)
+                {
+                    return Err(UserAppStoreError::LifecycleConflict);
+                }
+                Ok(app)
+            })
+        })
+        .await
+    }
+
     async fn restore_discovered_identity(
         &self,
         discovered: &UserAppDiscoveredIdentity,
@@ -771,6 +801,19 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         })
         .await
     }
+    async fn read_retained_runtime_input(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+    ) -> Result<Option<UserAppExecutionInput>, UserAppStoreError> {
+        let app_id = app_id.to_owned();
+        let lifecycle_id = lifecycle_id.to_owned();
+        self.run(true, move |tx, backend| {
+            Box::pin(async move { retained_input::read(tx, backend, &app_id, &lifecycle_id).await })
+        })
+        .await
+    }
+
     async fn read_execution_input(
         &self,
         context: &UserAppExecutionContext,

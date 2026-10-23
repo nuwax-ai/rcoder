@@ -110,6 +110,7 @@ def render(c, images, password, registry_auth=None, pingap_identity=None):
     env = {'CONTAINER_RUNTIME': 'kubernetes', 'RCODER_PORT': '8086', 'RCODER_K8S_NAMESPACE': c.ns,
            'RCODER_K8S_STORAGE_CLASS': c.get('STORAGE_CLASS', 'cephfs'), 'RCODER_K8S_PVC_ACCESS_MODE': 'ReadWriteMany',
            'RCODER_USERAPP_STORAGE_CLASS': c.get('USERAPP_STORAGE_CLASS', 'ceph-rbd'),
+           'RCODER_USERAPP_DEFAULT_RECOVERY_ENABLED': c.get('USERAPP_DEFAULT_RECOVERY_ENABLED', 'true'),
            'RCODER_API_KEY_ENABLED': 'false', 'RCODER_STORAGE_BACKEND': 'postgres', 'RCODER_USERAPP_STORAGE_BACKEND': 'postgres',
            'RCODER_PG_HOST': 'postgres', 'RCODER_PG_USERNAME': 'rcoder', 'RCODER_PG_DATABASE': 'rcoder',
            'RCODER_WORKSPACE_PVC_NAME': 'workspace', 'RCODER_WORKSPACE_SUBPATH': 'workspace',

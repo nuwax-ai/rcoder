@@ -401,6 +401,15 @@ pub trait AgentContainerRuntime: Send + Sync {
         Ok(None)
     }
 
+    /// Confirm missing builder compute and no live native creation holder.
+    /// Used only to reconcile an acknowledged pre-creation failure.
+    async fn verify_absent_builder_recovery(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
     /// Capture private original configuration before a compute-only restart.
     async fn archive_builder_restart(
         &self,
@@ -931,6 +940,15 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     /// Read a retained production specification for this exact lifecycle.
     /// None means there is no recoverable specification; callers must never
     /// substitute an empty/default deployment for a missing configured app.
+    /// Observe retained managed PVCs without creating, adopting or starting anything.
+    async fn discover_retained_app_storage(
+        &self,
+        _app_id: &str,
+        _scope: shared_types::UserAppOperationScope,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppRetainedStorage>> {
+        Ok(None)
+    }
+
     async fn retained_app_runtime_configuration(
         &self,
         _app_id: &str,

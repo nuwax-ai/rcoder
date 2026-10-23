@@ -725,3 +725,55 @@ async fn offline_compute_observer_missing_database_never_initializes_schema_or_m
     let (_, lock) = crate::userapp_lifecycle::exclusive_directory::acquire(&path).unwrap();
     drop(lock);
 }
+
+#[tokio::test]
+async fn retained_storage_identity_preserves_lifecycle_and_rejects_foreign_or_deleted_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = TursoUserAppStore::open_exclusive(&dir.path().join("retained.db"))
+        .await
+        .unwrap();
+    let mut storage = shared_types::UserAppRetainedStorage {
+        services: Vec::new(),
+        app_id: "retained".into(),
+        scope: shared_types::UserAppOperationScope::Dev,
+        lifecycle_id: Some("original-life".into()),
+        volumes: vec![shared_types::AppResourceIdentity {
+            kind: shared_types::AppResourceKind::PersistentVolumeClaim,
+            name: "rcoder-app-builder-retained-workspace".into(),
+            uid: "original-volume".into(),
+            resource_version: Some("1".into()),
+        }],
+    };
+    let first = store.restore_storage_identity(&storage).await.unwrap();
+    assert_eq!(first.lifecycle_id, "original-life");
+    let again = store.restore_storage_identity(&storage).await.unwrap();
+    assert_eq!(first.lifecycle_id, again.lifecycle_id);
+    storage.lifecycle_id = Some("foreign-life".into());
+    assert!(matches!(
+        store.restore_storage_identity(&storage).await,
+        Err(Error::LifecycleConflict)
+    ));
+    storage.lifecycle_id = None;
+    assert_eq!(
+        store
+            .restore_storage_identity(&storage)
+            .await
+            .unwrap()
+            .lifecycle_id,
+        first.lifecycle_id
+    );
+    store
+        .owner
+        .execute(|mut db| async move {
+            toasty::sql::statement(
+                "UPDATE userapps SET lifecycle_state='deleted' WHERE app_id='retained'",
+            )
+            .exec(&mut db)
+            .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(store.restore_storage_identity(&storage).await.is_err());
+    store.shutdown().await.unwrap();
+}

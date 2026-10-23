@@ -379,6 +379,7 @@ mod tests {
             command: Some(UserAppControlCommand::Deploy {
                 restart: false,
                 input_digest: "b".repeat(64),
+                serving_recovery: false,
             }),
             operation_id: "deployoperation".into(),
             app_id: "deployapp".into(),

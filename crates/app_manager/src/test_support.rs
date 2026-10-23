@@ -29,6 +29,7 @@ use crate::service::AppService;
 /// 历史用途 wait_app_ready 已退役，现有消费者见 purge 链不缺席测试）。
 #[derive(Default)]
 pub(crate) struct MockRuntime {
+    pub retained_storage: DashMap<String, shared_types::UserAppRetainedStorage>,
     /// Opt-in stateful PVC resources backed by real fixture data directories.
     pub recovered_pvc_volumes:
         DashMap<String, Vec<(shared_types::AppResourceIdentity, std::path::PathBuf)>>,
@@ -553,6 +554,18 @@ impl UserAppDeploymentRuntime for MockRuntime {
             service_url: String::new(),
             workload_uid: None,
         }))
+    }
+
+    async fn discover_retained_app_storage(
+        &self,
+        app_id: &str,
+        scope: shared_types::UserAppOperationScope,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppRetainedStorage>> {
+        Ok(self
+            .retained_storage
+            .get(app_id)
+            .filter(|value| value.scope == scope)
+            .map(|value| value.clone()))
     }
 
     async fn retained_app_runtime_configuration(

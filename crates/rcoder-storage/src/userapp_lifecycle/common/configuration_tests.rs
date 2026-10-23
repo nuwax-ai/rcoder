@@ -108,6 +108,7 @@ async fn claim_inline(
         UserAppControlCommand::Deploy {
             restart: false,
             input_digest: input.digest(),
+            serving_recovery: false,
         },
     );
     let op = match store
@@ -1073,6 +1074,7 @@ async fn deploy_pg_recovery_finalization_is_cas_identity_and_outcome_bound() {
             UserAppControlCommand::Deploy {
                 restart: false,
                 input_digest: input.digest(),
+                serving_recovery: false,
             },
         );
         let (mut op, context) = claim_admitted(
@@ -1168,6 +1170,7 @@ async fn deploy_pg_recovery_finalization_is_cas_identity_and_outcome_bound() {
                     UserAppControlCommand::Deploy {
                         restart: false,
                         input_digest: "c".repeat(64),
+                        serving_recovery: false,
                     },
                 ))
                 .await
@@ -1231,6 +1234,7 @@ async fn inline_deployment_credentials_are_atomic_captured_and_replay_stable() {
         UserAppControlCommand::Deploy {
             restart: false,
             input_digest: input.digest(),
+            serving_recovery: false,
         },
     );
     let accepted = store
@@ -1334,6 +1338,7 @@ async fn inline_deployment_credential_conflict_rolls_back_admission() {
         UserAppControlCommand::Deploy {
             restart: false,
             input_digest: input.digest(),
+            serving_recovery: false,
         },
     );
     assert!(
@@ -1472,4 +1477,67 @@ async fn preparation_recovery_requires_exact_snapshot_and_retains_original_lease
     let current = store.get_application(&app.app_id).await.unwrap().unwrap();
     assert_eq!(current.active_operations.prod, Some(op.operation_id));
     assert_eq!(current.runtime_policy, app.runtime_policy);
+}
+
+#[tokio::test]
+async fn retained_runtime_input_reads_only_completed_verified_configuration_without_replay() {
+    let (_directory, store, app) = database().await;
+    let input = UserAppExecutionInput::new(
+        serde_json::json!({
+            "version": 1, "params": {"env":{"BUSINESS_SETTING":"preserved"}}
+        })
+        .to_string(),
+    );
+    let request = admission(
+        &app,
+        "retainedconfig",
+        UserAppControlCommand::Create {
+            input_digest: input.digest(),
+        },
+    );
+    store
+        .admit_with_configuration(&request, &input, None)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .read_retained_runtime_input(&app.app_id, &app.lifecycle_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "pending configuration must not authorize restoration"
+    );
+    // Inject a historical completed row; this test never executes its side effects.
+    store.owner.execute(|mut db| async move {
+        toasty::sql::statement("UPDATE userapp_operations SET state='succeeded', terminal_at_us=updated_at_us WHERE operation_id='retainedconfig'").exec(&mut db).await?;
+        Ok(())
+    }).await.unwrap();
+    assert_eq!(
+        store
+            .read_retained_runtime_input(&app.app_id, &app.lifecycle_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .encoded(),
+        input.encoded()
+    );
+    assert!(matches!(
+        store
+            .read_retained_runtime_input(&app.app_id, "foreignlife")
+            .await,
+        Err(UserAppStoreError::LifecycleConflict)
+    ));
+    store.owner.execute(|mut db| async move {
+        toasty::sql::statement("UPDATE userapp_operation_inputs SET payload='{}' WHERE operation_id='retainedconfig'").exec(&mut db).await?;
+        Ok(())
+    }).await.unwrap();
+    assert!(
+        store
+            .read_retained_runtime_input(&app.app_id, &app.lifecycle_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "changed historical bytes must not become runtime configuration"
+    );
+    store.shutdown().await.unwrap();
 }

@@ -6,6 +6,7 @@ Pod environment variables. Existing resources are inventoried before acceptance.
 """
 import argparse
 import concurrent.futures
+import ipaddress
 import hashlib
 import io
 import json
@@ -75,11 +76,12 @@ RECREATE_REQUIRED = {
     'worker_artifact_contract',
 }
 from k8s_hot_recovery import REQUIRED as HOT_RECOVERY_REQUIRED
+from k8s_default_recovery import REQUIRED as DEFAULT_RECOVERY_REQUIRED
 
 SCENARIO_REQUIRED = {'all': frozenset(REQUIRED), 'recreate': frozenset(RECREATE_REQUIRED),
-                     'hot_recovery': HOT_RECOVERY_REQUIRED}
+                     'hot_recovery': HOT_RECOVERY_REQUIRED, 'default_recovery': DEFAULT_RECOVERY_REQUIRED}
 SCENARIO_IDENTITIES = {'all': 'k8s_userapp', 'recreate': 'k8s_userapp_recreate',
-                       'hot_recovery': 'k8s_userapp_hot_recovery'}
+                       'hot_recovery': 'k8s_userapp_hot_recovery', 'default_recovery': 'k8s_userapp_default_recovery'}
 
 RESTART_ADMISSION_WAIT_SECONDS = 30
 RESTART_EXECUTION_TIMEOUT_SECONDS = 300
@@ -309,6 +311,15 @@ def compact_resource(row):
                        for c in row.get('status', {}).get('containerStatuses', [])]}
 
 
+def node_entry_addresses(advertised, interfaces):
+    local = {a['local'] for interface in interfaces for a in interface.get('addr_info', [])
+             if a.get('family') == 'inet' and isinstance(a.get('local'),str)
+             and not ipaddress.ip_address(a['local']).is_loopback}
+    # Build hosts can be outside the cluster. Extra interfaces are valid only
+    # when the SSH host itself owns an advertised test-node address.
+    return set(advertised) | local if set(advertised) & local else set(advertised)
+
+
 class Run:
     def __init__(self, args):
         self.args = args
@@ -486,6 +497,9 @@ class Run:
                 raise ValueError('Remote E2E namespace ownership mismatch')
         nodes = json.loads(self.kube('get', 'nodes', '-o', 'json'))['items']
         addresses = {a['address'] for n in nodes for a in n['status']['addresses']}
+        if not all(urllib.parse.urlparse(url).hostname in addresses for url in (self.args.url,self.args.proxy_url)):
+            interfaces = json.loads(self.local('ssh','-o','BatchMode=yes','-o','ConnectTimeout=10',self.args.ssh,'ip -j address show'))
+            addresses = node_entry_addresses(addresses,interfaces)
         self.check('entry_targets_test_nodes', all(urllib.parse.urlparse(url).hostname in addresses for url in (self.args.url, self.args.proxy_url)))
         self.baseline = self.inventory()
         self.save('baseline.json', self.baseline)
@@ -1719,6 +1733,10 @@ print(json.dumps(out))'''
             from k8s_hot_recovery import exercise
             exercise(self)
             return
+        elif self.scenario == 'default_recovery':
+            from k8s_default_recovery import exercise
+            exercise(self)
+            return
         elif self.scenario == 'all':
             self.dev_readonly_locator()
             a, ra = self.build('A')
@@ -1745,6 +1763,10 @@ print(json.dumps(out))'''
             raise failure
 
     def cleanup_owned(self):
+        if self.created and getattr(self, 'scenario', 'all') == 'default_recovery':
+            from k8s_default_recovery import cleanup
+            cleanup(self)
+            return
         if self.created:
             if getattr(self, 'recreated', False):
                 self.cleanup_recreated()

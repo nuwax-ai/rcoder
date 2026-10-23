@@ -193,6 +193,32 @@ impl AppService {
         })
         .await?;
         let Some(found) = found else {
+            if existing.is_none()
+                && self.config.default_recovery_enabled
+                && self.config.access_mode == crate::config::AppAccessMode::Kubernetes
+            {
+                for scope in [
+                    shared_types::UserAppOperationScope::Dev,
+                    shared_types::UserAppOperationScope::Prod,
+                ] {
+                    if let Some(storage) = self
+                        .runtime
+                        .discover_retained_app_storage(app_id, scope)
+                        .await
+                        .map_err(|e| {
+                            map_runtime_error("Discover retained application storage", e)
+                        })?
+                    {
+                        return self
+                            .metadata
+                            .store
+                            .restore_storage_identity(&storage)
+                            .await
+                            .map(Some)
+                            .map_err(Into::into);
+                    }
+                }
+            }
             return Ok(existing);
         };
         if existing

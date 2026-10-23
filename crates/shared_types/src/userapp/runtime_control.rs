@@ -82,6 +82,8 @@ pub enum RunProfileInput {
 pub enum ArtifactInput {
     /// 登记的本地构建输出标识（不暴露任意路径激活）。
     ArtifactId { artifact_id: String },
+    /// Recover the owner's fixed production workspace without downloading or rebuilding source.
+    RetainedWorkspace { release_id: String },
     /// 生产发布 URL（下载后 sha256 校验，复用既有部署准备链）。
     Url { url: String, sha256: Option<String> },
 }
@@ -352,6 +354,12 @@ pub fn validate_runtime_operation_request(request: &RuntimeOperationRequest) -> 
     } = &request.profile
     {
         crate::validate_identifier(artifact_id, "artifact_id")?;
+    }
+    if let RunProfileInput::Artifact {
+        artifact: ArtifactInput::RetainedWorkspace { release_id },
+    } = &request.profile
+    {
+        crate::validate_identifier(release_id, "release_id")?;
     }
     Ok(())
 }

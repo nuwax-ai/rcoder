@@ -195,6 +195,13 @@ impl AgentContainerRuntime for KubernetesRuntime {
             .await
     }
 
+    async fn verify_absent_builder_recovery(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<bool> {
+        self.verify_absent_retained_builder(context).await
+    }
+
     async fn recover_builder_creation(
         &self,
         context: &shared_types::UserAppExecutionContext,
@@ -430,7 +437,25 @@ impl AgentContainerRuntime for KubernetesRuntime {
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
         params.validate_execution_context()?;
         let captured = if params.service_type == ServiceType::UserappBuilder {
-            self.capture_builder_reuse_snapshot(&params).await?
+            match self.capture_builder_reuse_snapshot(&params).await {
+                Ok(captured) => captured,
+                Err(error)
+                    if params.retained_storage.is_some()
+                        && matches!(error, ContainerRuntimeError::Conflict(_)) =>
+                {
+                    None
+                }
+                Err(error) => {
+                    return Err(ContainerRuntimeError::CreationAborted {
+                        progress: container_runtime_api::CreationProgress {
+                            failed_at: container_runtime_api::CreationStage::Capture,
+                            definitive_rejection: error.is_definitive_rejection(),
+                            retained_idempotent_resources: Vec::new(),
+                        },
+                        source: Box::new(error),
+                    });
+                }
+            }
         } else {
             None
         };
@@ -472,6 +497,17 @@ impl AgentContainerRuntime for KubernetesRuntime {
             let context = params.execution_context.clone();
             let binding = params.resource_binding.clone();
             return tokio::spawn(async move {
+                if let Some(storage) = &params.retained_storage {
+                    let context = params.execution_context.as_ref().ok_or_else(|| ContainerRuntimeError::ConfigurationError("Storage recovery operation missing".into()))?;
+                    if let Err(error) = runtime.recover_retained_storage(context, storage).await {
+                        let progress = container_runtime_api::CreationProgress {
+                            failed_at: container_runtime_api::CreationStage::StorageClaim,
+                            definitive_rejection: error.is_definitive_rejection(),
+                            retained_idempotent_resources: storage.volumes.iter().map(|v|format!("retained PVC {} uid={}",v.name,v.uid)).collect(),
+                        };
+                        return crate::runtime::builder_completion::finish(lease, Err(ContainerRuntimeError::CreationAborted {progress,source:Box::new(error)})).await;
+                    }
+                }
                 let observed = match runtime.capture_builder_reuse_snapshot(&params).await {
                     Ok(observed) => observed,
                     Err(error) => return crate::runtime::builder_completion::finish(lease, Err(error)).await,

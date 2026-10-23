@@ -647,6 +647,9 @@ pub enum UserAppControlCommand {
     Deploy {
         restart: bool,
         input_digest: String,
+        /// Internal serving recovery; omitted on historical and explicit deployments.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        serving_recovery: bool,
     },
     StopBuilder,
     RestartBuilder,
@@ -690,6 +693,31 @@ pub enum UserAppControlCommand {
 }
 
 impl UserAppControlCommand {
+    pub fn is_traffic_wake(&self) -> bool {
+        match self {
+            Self::Start { traffic } => *traffic,
+            Self::Deploy {
+                restart: false,
+                serving_recovery,
+                ..
+            } => *serving_recovery,
+            Self::Deploy { restart: true, .. }
+            | Self::StopBuilder
+            | Self::RestartBuilder
+            | Self::Create { .. }
+            | Self::Update { .. }
+            | Self::Restart
+            | Self::PrepareProdDatabase
+            | Self::Stop { .. }
+            | Self::SetRecyclePolicy { .. }
+            | Self::DeleteResources { .. }
+            | Self::DeleteApplication
+            | Self::DestroyStorage { .. }
+            | Self::ResetDatabasePassword { .. }
+            | Self::ClearStorage { .. } => false,
+        }
+    }
+
     pub fn kind(&self) -> UserAppOperationKind {
         match self {
             Self::StopBuilder => UserAppOperationKind::StopBuilder,
@@ -951,6 +979,17 @@ pub trait UserAppLifecycleStore: Send + Sync {
     }
     /// Restore only a missing root. An existing different lifecycle or tombstone
     /// is never overwritten; resource discovery is revalidated by the caller.
+    /// Restore an absent root from retained managed storage, without inventing
+    /// compute identity or replaying historical operations.
+    async fn restore_storage_identity(
+        &self,
+        _storage: &crate::UserAppRetainedStorage,
+    ) -> Result<UserAppLifecycleRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Retained storage identity recovery is unsupported".into(),
+        ))
+    }
+
     async fn restore_discovered_identity(
         &self,
         discovered: &crate::UserAppDiscoveredIdentity,
@@ -1365,6 +1404,16 @@ pub trait UserAppLifecycleStore: Send + Sync {
         }
         self.admit_with_input(request, Some(input)).await
     }
+    /// Private configuration salvage for this exact lifecycle. Returned bytes
+    /// are completed inputs, never permission to replay their old side effects.
+    async fn read_retained_runtime_input(
+        &self,
+        _app_id: &str,
+        _lifecycle_id: &str,
+    ) -> Result<Option<UserAppExecutionInput>, UserAppStoreError> {
+        Ok(None)
+    }
+
     /// Available only to the executor that owns the current lifecycle operation;
     /// never exposed through public HTTP surfaces.
     async fn read_execution_input(

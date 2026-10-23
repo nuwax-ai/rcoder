@@ -392,10 +392,10 @@ async fn enrich_store_blocker_inner(
                 latest.revision,
             )?;
         }
-        let traffic = matches!(
-            record.command,
-            Some(shared_types::UserAppControlCommand::Start { traffic: true })
-        );
+        let traffic = record
+            .command
+            .as_ref()
+            .is_some_and(|command| command.kind() == record.kind && command.is_traffic_wake());
         let blocker = record.blocker();
         return Ok(HolderObservation::verified(
             app_id,
@@ -481,10 +481,10 @@ impl AppService {
             return Ok(None);
         };
         let waitable = (record.kind == Kind::Start
-            && matches!(
-                record.command,
-                Some(shared_types::UserAppControlCommand::Start { traffic: true })
-            ))
+            && record
+                .command
+                .as_ref()
+                .is_some_and(|command| command.kind() == record.kind && command.is_traffic_wake()))
             || matches!(
                 record.kind,
                 Kind::StartDeployment | Kind::RestartDeployment | Kind::HotDeploy | Kind::Restart
@@ -683,10 +683,10 @@ impl AppService {
                 )?;
             }
             let blocker = record.blocker();
-            let traffic = matches!(
-                record.command,
-                Some(shared_types::UserAppControlCommand::Start { traffic: true })
-            );
+            let traffic = record
+                .command
+                .as_ref()
+                .is_some_and(|command| command.kind() == record.kind && command.is_traffic_wake());
             let may_wait = traffic
                 || matches!(
                     record.kind,

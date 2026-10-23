@@ -291,3 +291,7 @@ storage:
     # durable 提交链路总预算(ms)：注册/会话落库确认的共享 deadline 总窗口。
     # 与单条SQL的statement_timeout独立；短预算耗尽不表示后台原操作已取消。
     durable_commit_timeout_ms: 15000
+
+# Retained UserApp recovery (K8s); database read/write failures are never absence.
+userapp_storage:
+  default_recovery_enabled: true

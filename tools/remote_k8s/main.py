@@ -533,6 +533,8 @@ def run_userapp_suite(c, receipt, context):
             '--internal-url', 'http://rcoder.' + c.ns + '.svc:8086']
     output = run(args, timeout=2400, env=env, log=context['report_dir'] / 'userapp.log', guard=lambda: alive(c))
     (context['report_dir'] / 'userapp.log').write_text(output)
+    run(args + ['--scenario', 'default_recovery'], timeout=2400, env=env,
+        log=context['report_dir'] / 'userapp-default-recovery.log', guard=lambda: alive(c))
 
 
 def prepare_test_snapshot(c, manifest_override=None):
