@@ -100,6 +100,39 @@ impl AppService {
         Ok(())
     }
 
+    /// Restore retained compute using the backend's actual coordination.
+    /// Docker's unsupported Kubernetes mutex observer is not an unknown write.
+    pub(crate) async fn acquire_retained_runtime_wake_guard(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+        deadline: Instant,
+    ) -> AppResult<AppOperationGuard> {
+        use crate::config::AppAccessMode;
+        match self.config.access_mode {
+            AppAccessMode::Docker => {
+                restart_wait::check_waiting()?;
+                let guard = self.try_acquire_process_release_lock(app_id).await?;
+                // A completed Stop and a replacement lifecycle must still win
+                // before restoration is admitted, under the real process lock.
+                if let Err(error) = restart_wait::bounded_read(
+                    deadline,
+                    self.validate_serving_wake_identity(app_id, lifecycle_id),
+                )
+                .await
+                {
+                    guard.finish_unadmitted(deadline).await?;
+                    return Err(error);
+                }
+                Ok(guard)
+            }
+            AppAccessMode::Kubernetes => {
+                self.acquire_serving_wake_guard(app_id, lifecycle_id, deadline)
+                    .await
+            }
+        }
+    }
+
     pub(crate) async fn acquire_serving_wake_guard(
         &self,
         app_id: &str,

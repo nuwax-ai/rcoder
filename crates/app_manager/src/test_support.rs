@@ -19,6 +19,12 @@ use crate::activity_registry::AppActivityRegistry;
 use crate::config::{AppAccessMode, AppManagerConfig};
 use crate::service::AppService;
 
+// Inherit the actual unsupported-backend observation, as DockerRuntime does.
+// The normal stateful mock's absent lease is stronger evidence than that default.
+struct DefaultAppMutexRuntime;
+#[async_trait]
+impl UserAppDeploymentRuntime for DefaultAppMutexRuntime {}
+
 /// 可控假运行时：记录 delete/create 调用次数，可开关失败注入。
 ///
 /// WorkspaceRuntime 全走默认实现（resolve_workspace_path → Ok(None)，
@@ -54,6 +60,8 @@ pub(crate) struct MockRuntime {
     pub restart_calls: AtomicUsize,
     pub restart_images: std::sync::Mutex<Vec<Option<String>>>,
     pub lease_held: Arc<AtomicBool>,
+    /// Use the trait's real unsupported observation even when no lease is held.
+    pub wake_mutex_use_default_observer: AtomicBool,
     /// Event-only read observation for independent wake fixtures; no polling.
     pub wake_mutex_observation_enabled: AtomicBool,
     pub wake_mutex_observation_calls: AtomicUsize,
@@ -377,6 +385,11 @@ impl UserAppDeploymentRuntime for MockRuntime {
         use container_runtime_api::{AppOperationMutexIdentity, AppOperationMutexObservation};
         self.wake_mutex_observation_calls
             .fetch_add(1, Ordering::SeqCst);
+        if self.wake_mutex_use_default_observer.load(Ordering::SeqCst) {
+            return DefaultAppMutexRuntime
+                .observe_app_operation_mutex(app_id, lifecycle_id)
+                .await;
+        }
         if !self.lease_held.load(Ordering::SeqCst) {
             return Ok(AppOperationMutexObservation::Absent);
         }

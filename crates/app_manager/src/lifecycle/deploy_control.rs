@@ -216,7 +216,7 @@ impl AppService {
                     let lifecycle = captured_lifecycle.as_deref().ok_or_else(|| {
                         AppOperationError::NotFound("Serving recovery identity disappeared".into())
                     })?;
-                    self.acquire_serving_wake_guard(app_id, lifecycle, *deadline)
+                    self.acquire_retained_runtime_wake_guard(app_id, lifecycle, *deadline)
                         .await?
                 } else if let Some(deadline) = wait_deadline {
                     self.acquire_restart_admission_guard(

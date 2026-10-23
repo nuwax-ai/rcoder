@@ -6122,6 +6122,21 @@ mod retained_traffic_runtime_tests {
         let app_id = "serving-restoration";
         let (service, runtime) = configured_service(directory.path(), app_id).await;
         let before = service.get_lifecycle(app_id).await.unwrap();
+        runtime
+            .wake_mutex_use_default_observer
+            .store(true, Ordering::SeqCst);
+        assert_eq!(
+            container_runtime_api::UserAppDeploymentRuntime::observe_app_operation_mutex(
+                runtime.as_ref(),
+                app_id,
+                &before.lifecycle_id,
+            )
+            .await
+            .unwrap(),
+            container_runtime_api::AppOperationMutexObservation::Unconfirmed,
+            "Docker inherits the unsupported runtime observer, not the mock's Absent result"
+        );
+        let mutex_reads = runtime.wake_mutex_observation_calls.load(Ordering::SeqCst);
         let original = runtime.create_params_history.get(app_id).unwrap()[0].clone();
         runtime.deployments.remove(app_id);
 
@@ -6131,6 +6146,11 @@ mod retained_traffic_runtime_tests {
             "{outcome:?}"
         );
         assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            runtime.wake_mutex_observation_calls.load(Ordering::SeqCst),
+            mutex_reads,
+            "Docker reconstruction uses its real file/process guard"
+        );
         assert_eq!(runtime.deployments.len(), 1);
         let after = service.get_lifecycle(app_id).await.unwrap();
         assert_eq!(after.lifecycle_id, before.lifecycle_id);
@@ -6186,6 +6206,9 @@ mod retained_traffic_runtime_tests {
         let directory = tempfile::tempdir().unwrap();
         let app_id = "serving-concurrent";
         let (service, runtime) = configured_service(directory.path(), app_id).await;
+        runtime
+            .wake_mutex_use_default_observer
+            .store(true, Ordering::SeqCst);
         runtime.deployments.remove(app_id);
         let started = Arc::new(tokio::sync::Barrier::new(2));
         let release = Arc::new(tokio::sync::Barrier::new(2));
@@ -6221,6 +6244,46 @@ mod retained_traffic_runtime_tests {
         assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 2);
         assert_eq!(runtime.create_params_history.get(app_id).unwrap().len(), 2);
         assert_eq!(runtime.deployments.len(), 1);
+        assert_eq!(
+            runtime.wake_mutex_observation_calls.load(Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn kubernetes_serving_keeps_unconfirmed_runtime_mutex_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let app_id = "serving-unconfirmed";
+        let (mut service, runtime) = created_app_service(directory.path(), app_id).await;
+        let before = service.get_lifecycle(app_id).await.unwrap();
+        service.config.access_mode = AppAccessMode::Kubernetes;
+        runtime
+            .wake_mutex_use_default_observer
+            .store(true, Ordering::SeqCst);
+        runtime.deployments.remove(app_id);
+        let service = Arc::new(service);
+
+        let error = service
+            .wake_app_for_serving(app_id, std::time::Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), shared_types::ERR_OPERATION_IN_PROGRESS);
+        assert!(error.operation_id().is_none());
+        assert_eq!(
+            runtime.wake_mutex_observation_calls.load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
+        assert!(!runtime.deployments.contains_key(app_id));
+        assert_eq!(service.get_lifecycle(app_id).await.unwrap(), before);
+        assert!(
+            service
+                .get_current_operations(app_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     struct MissingReadiness;
