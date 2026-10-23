@@ -4,6 +4,232 @@
 
 #[tokio::test]
 #[ignore = "requires RCODER_PG_TEST_DSN for a disposable PostgreSQL instance"]
+async fn pg_port_retry_preserves_request_history_and_serializes_strict_candidates() {
+    use shared_types::{
+        AcceptStartInput, AcceptStartOutcome, PreviewHostIdentity, PreviewLifecycleStore,
+        PreviewStartPortRetry, PreviewStoreError,
+    };
+    let dsn = std::env::var("RCODER_PG_TEST_DSN").expect("explicit PostgreSQL test DSN required");
+    let mut admin = toasty::Db::builder().connect(&dsn).await.unwrap();
+    let schema = format!("preview_retry_{}", uuid::Uuid::new_v4().simple());
+    toasty::sql::statement(format!("CREATE SCHEMA {schema}"))
+        .exec(&mut admin)
+        .await
+        .unwrap();
+    let separator = if dsn.contains('?') { '&' } else { '?' };
+    let scoped = format!("{dsn}{separator}options=-csearch_path%3D{schema}");
+    let config = crate::config::PostgresConfig {
+        url: Some(scoped.clone()),
+        ..Default::default()
+    };
+    let left = std::sync::Arc::new(super::PgPreviewStore::connect(&config).await.unwrap());
+    let right = std::sync::Arc::new(super::PgPreviewStore::connect(&config).await.unwrap());
+    let (a, b) = (left.clone(), right.clone());
+    let result = tokio::spawn(async move {
+        let mut observer = toasty::Db::builder().connect(&scoped).await.unwrap();
+        let make = |key: &str, id: &str, requested_port| AcceptStartInput {
+            preview_key: key.into(),
+            project_id: "retry-project".into(),
+            project_path: "/workspace/retry-project".into(),
+            host: PreviewHostIdentity {
+                host_id: "retry-host:boot".into(),
+                pod_name: None,
+                pod_ip: None,
+            },
+            operation_id: format!("retry-op-{id}"),
+            instance_id: format!("retry-instance-{id}"),
+            requested_port,
+            base_path: Some("/retry/".into()),
+            recover_unknown_evidence: None,
+        };
+        let AcceptStartOutcome::Admitted(original) = a
+            .accept_start(make("retry-key", "original", Some(41020)))
+            .await
+            .unwrap()
+        else {
+            panic!("fresh original admission")
+        };
+        let before = operation_snapshot(&mut observer, &original.operation_id).await;
+        let retry = PreviewStartPortRetry {
+            preview_key: original.preview_key.clone(),
+            operation_id: original.operation_id.clone(),
+            instance_id: original.instance_id.clone(),
+            revision: original.revision,
+            previous_port: 41020,
+            next_port: 41021,
+        };
+        let AcceptStartOutcome::Admitted(blocker) = b
+            .accept_start(make("blocker-key", "blocker", Some(41021)))
+            .await
+            .unwrap()
+        else {
+            panic!("reserve strict retry candidate")
+        };
+        assert!(matches!(
+            a.retry_start_port(retry.clone()).await,
+            Err(PreviewStoreError::Invalid(_))
+        ));
+        assert_eq!(
+            a.get(&original.preview_key).await.unwrap().unwrap(),
+            original
+        );
+        assert_eq!(
+            operation_snapshot(&mut observer, &original.operation_id).await,
+            before
+        );
+        let stopping = b
+            .accept_stop(&blocker.preview_key, "blocker-stop")
+            .await
+            .unwrap();
+        b.mark_stopped(
+            &blocker.preview_key,
+            &stopping.operation_id,
+            stopping.revision,
+        )
+        .await
+        .unwrap();
+        let (first, replay) = tokio::join!(
+            a.retry_start_port(retry.clone()),
+            b.retry_start_port(retry.clone())
+        );
+        let moved = first.unwrap();
+        assert_eq!(
+            replay.unwrap(),
+            moved,
+            "two owners must confirm one committed retry result"
+        );
+        assert_eq!(moved.revision, original.revision + 1);
+        assert_eq!(moved.port, Some(41021));
+        let mut expected_receipt = before;
+        expected_receipt["allocated_port"] = serde_json::json!(41021);
+        expected_receipt["updated_at_us"] = serde_json::json!(moved.updated_at.timestamp_micros());
+        assert_eq!(
+            operation_snapshot(&mut observer, &original.operation_id).await,
+            expected_receipt
+        );
+        assert_eq!(a.retry_start_port(retry.clone()).await.unwrap(), moved);
+        assert_eq!(
+            operation_snapshot(&mut observer, &original.operation_id).await,
+            expected_receipt,
+            "lost ACK cannot rewrite the original request, fingerprint, result or timestamps"
+        );
+
+        let second = PreviewStartPortRetry {
+            revision: moved.revision,
+            previous_port: 41021,
+            next_port: 41020,
+            ..retry
+        };
+        let (changed, competing) = tokio::join!(
+            a.retry_start_port(second),
+            b.accept_start(make("competing-key", "competing", Some(41020)))
+        );
+        assert_eq!(
+            usize::from(changed.is_ok()) + usize::from(competing.is_ok()),
+            1,
+            "strict retry and fresh admission must serialize their shared candidate"
+        );
+        assert_eq!(
+            a.active_ports()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|port| **port == 41020)
+                .count(),
+            1
+        );
+        let current = a.get(&original.preview_key).await.unwrap().unwrap();
+        let receipt = operation_snapshot(&mut observer, &original.operation_id).await;
+        expected_receipt["allocated_port"] = serde_json::json!(current.port.unwrap());
+        expected_receipt["updated_at_us"] =
+            serde_json::json!(current.updated_at.timestamp_micros());
+        assert_eq!(receipt, expected_receipt);
+        let occupied = a.active_ports().await.unwrap();
+        let free = (shared_types::PREVIEW_PORT_MIN..=shared_types::PREVIEW_PORT_MAX)
+            .find(|port| shared_types::is_preview_port(*port) && !occupied.contains(port))
+            .unwrap();
+        let pending = PreviewStartPortRetry {
+            preview_key: current.preview_key.clone(),
+            operation_id: current.operation_id.clone(),
+            instance_id: current.instance_id.clone(),
+            revision: current.revision,
+            previous_port: current.port.unwrap(),
+            next_port: free,
+        };
+        let (publication, stopping) = tokio::join!(
+            a.retry_start_port(pending.clone()),
+            b.accept_stop(&current.preview_key, "retry-stop")
+        );
+        if let Err(error) = publication {
+            assert!(matches!(error, PreviewStoreError::Conflict(_)));
+        }
+        let stopping = stopping.unwrap();
+        assert_eq!(
+            a.get(&current.preview_key).await.unwrap().unwrap(),
+            stopping
+        );
+        assert!(matches!(
+            a.retry_start_port(pending).await,
+            Err(PreviewStoreError::Conflict(_))
+        ));
+        assert_eq!(
+            a.get(&current.preview_key).await.unwrap().unwrap(),
+            stopping
+        );
+
+        let AcceptStartOutcome::Admitted(terminal) = a
+            .accept_start(make("terminal-key", "terminal", None))
+            .await
+            .unwrap()
+        else {
+            panic!("fresh terminal guard fixture")
+        };
+        toasty::sql::statement(
+            "UPDATE preview_operations SET state='succeeded' WHERE operation_id=$1",
+        )
+        .bind(&terminal.operation_id)
+        .exec(&mut observer)
+        .await
+        .unwrap();
+        let terminal_receipt = operation_snapshot(&mut observer, &terminal.operation_id).await;
+        let occupied = a.active_ports().await.unwrap();
+        let next_port = (shared_types::PREVIEW_PORT_MIN..=shared_types::PREVIEW_PORT_MAX)
+            .find(|port| shared_types::is_preview_port(*port) && !occupied.contains(port))
+            .unwrap();
+        assert!(matches!(
+            a.retry_start_port(PreviewStartPortRetry {
+                preview_key: terminal.preview_key.clone(),
+                operation_id: terminal.operation_id.clone(),
+                instance_id: terminal.instance_id.clone(),
+                revision: terminal.revision,
+                previous_port: terminal.port.unwrap(),
+                next_port
+            })
+            .await,
+            Err(PreviewStoreError::Conflict(_))
+        ));
+        assert_eq!(
+            a.get(&terminal.preview_key).await.unwrap().unwrap(),
+            terminal
+        );
+        assert_eq!(
+            operation_snapshot(&mut observer, &terminal.operation_id).await,
+            terminal_receipt,
+            "terminal receipt and instance must remain untouched"
+        );
+    })
+    .await;
+    left.close().await.expect("drain left preview owner");
+    right.close().await.expect("drain right preview owner");
+    toasty::sql::statement(format!("DROP SCHEMA {schema} CASCADE"))
+        .exec(&mut admin)
+        .await
+        .unwrap();
+    result.expect("PostgreSQL port retry receipt and allocator contract failed");
+}
+
+#[tokio::test]
+#[ignore = "requires RCODER_PG_TEST_DSN for a disposable PostgreSQL instance"]
 async fn pg_ready_base_completion_preserves_original_operation_receipt_and_activity() {
     use sha2::Digest as _;
     use shared_types::{

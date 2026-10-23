@@ -149,6 +149,66 @@ pub struct PreviewInstanceRecord {
 }
 
 impl PreviewInstanceRecord {
+    /// Advance only the original, still unspawned admission after a confirmed
+    /// PortInUse. False means the requested revision/port result already exists;
+    /// that confirmation must not rewrite the instance or operation receipt.
+    pub fn apply_start_port_retry(
+        &mut self,
+        input: &PreviewStartPortRetry,
+        at: DateTime<Utc>,
+    ) -> Result<bool, PreviewStoreError> {
+        if input.preview_key.is_empty()
+            || input.operation_id.is_empty()
+            || input.instance_id.is_empty()
+            || input.revision < 1
+            || !is_preview_port(input.previous_port)
+            || !is_preview_port(input.next_port)
+            || input.previous_port == input.next_port
+        {
+            return Err(PreviewStoreError::Invalid(
+                "Invalid preview port retry input".into(),
+            ));
+        }
+        let next_revision = input.revision.checked_add(1).ok_or_else(|| {
+            PreviewStoreError::Invalid("Preview port retry revision exhausted".into())
+        })?;
+        if self.preview_key != input.preview_key
+            || self.operation_id != input.operation_id
+            || self.instance_id != input.instance_id
+            || self.pid.is_some()
+        {
+            return Err(PreviewStoreError::Conflict(
+                "Port retry belongs to another preview execution".into(),
+            ));
+        }
+        match self.state {
+            PreviewInstanceState::Starting => {}
+            PreviewInstanceState::Ready
+            | PreviewInstanceState::Stopping
+            | PreviewInstanceState::Stopped
+            | PreviewInstanceState::Failed
+            | PreviewInstanceState::Unknown => {
+                return Err(PreviewStoreError::Conflict(
+                    "Port retry requires the original starting admission".into(),
+                ));
+            }
+        }
+        // The earlier previous_port is no longer recorded. This is confirmation
+        // of the already committed result, not a new retry-intent journal.
+        if self.revision == next_revision && self.port == Some(input.next_port) {
+            return Ok(false);
+        }
+        if self.revision != input.revision || self.port != Some(input.previous_port) {
+            return Err(PreviewStoreError::Conflict(
+                "Port retry lost its original revision or allocated port".into(),
+            ));
+        }
+        self.revision = next_revision;
+        self.port = Some(input.next_port);
+        self.updated_at = at;
+        Ok(true)
+    }
+
     /// Apply one publication for the admitted operation and allocated port.
     /// Returns true only for Starting → Ready, whose operation receipt must be
     /// completed. A matching Ready confirmation never refreshes activity or
@@ -243,6 +303,19 @@ pub struct AcceptStartInput {
     pub recover_unknown_evidence: Option<PreviewRecoveryEvidence>,
 }
 
+/// Internal conditional port change after the owner confirmed PortInUse.
+/// Operation/instance remain stable and Starting across the whole retry chain.
+#[derive(Debug, Clone)]
+pub struct PreviewStartPortRetry {
+    pub preview_key: String,
+    pub operation_id: String,
+    pub instance_id: String,
+    pub revision: i64,
+    pub previous_port: u16,
+    /// Strict candidate: an occupied or invalid port is rejected, not replaced.
+    pub next_port: u16,
+}
+
 /// Evidence applies only to the exact Unknown instance observed before the
 /// host lookup. A newer instance under the same preview key cannot inherit it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +364,15 @@ pub trait PreviewLifecycleStore: Send + Sync {
         &self,
         input: AcceptStartInput,
     ) -> Result<AcceptStartOutcome, PreviewStoreError>;
+
+    /// CAS the same Starting operation/instance from revision/previous_port to
+    /// revision+1/next_port while pid is absent. Only inflight start allocation
+    /// metadata changes; immutable request and terminal history are preserved.
+    /// A matching committed result is returned without another mutation.
+    async fn retry_start_port(
+        &self,
+        input: PreviewStartPortRetry,
+    ) -> Result<PreviewInstanceRecord, PreviewStoreError>;
 
     /// 启动成功发布：CAS(starting, operation_id, revision) → Ready + pid/port/base_path，
     /// 同时把操作置 Succeeded。同 operation/revision/PID/port 的 Ready 发布幂等

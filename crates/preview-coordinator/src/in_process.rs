@@ -10,94 +10,13 @@ use shared_types::{
     AcceptStartInput, AcceptStartOutcome, PREVIEW_PORT_MAX, PREVIEW_PORT_MIN,
     PREVIEW_PORT_RESERVED_MAX, PREVIEW_PORT_RESERVED_MIN, PreviewInstanceRecord,
     PreviewInstanceState, PreviewLifecycleStore, PreviewOperationKind, PreviewOperationRecord,
-    PreviewOperationState, PreviewStoreError as Error, is_preview_port,
+    PreviewOperationState, PreviewStartPortRetry, PreviewStoreError as Error, is_preview_port,
 };
 
 #[derive(Default)]
 struct State {
     instances: BTreeMap<String, PreviewInstanceRecord>,
     operations: BTreeMap<String, PreviewOperationRecord>,
-}
-
-#[cfg(test)]
-mod publication_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn ready_base_completion_preserves_original_operation_receipt_and_activity() {
-        let store = InProcessPreviewStore::new();
-        let AcceptStartOutcome::Admitted(starting) = store
-            .accept_start(AcceptStartInput {
-                preview_key: "receipt-preview".into(),
-                project_id: "receipt-project".into(),
-                project_path: "/workspace/receipt-project".into(),
-                host: shared_types::PreviewHostIdentity {
-                    host_id: "receipt-host:boot".into(),
-                    pod_name: None,
-                    pod_ip: None,
-                },
-                operation_id: "receipt-start".into(),
-                instance_id: "receipt-instance".into(),
-                requested_port: None,
-                base_path: None,
-                recover_unknown_evidence: None,
-            })
-            .await
-            .unwrap()
-        else {
-            panic!("fresh start must be admitted")
-        };
-        let port = starting.port.unwrap();
-        let ready = store
-            .publish_running(
-                &starting.preview_key,
-                &starting.operation_id,
-                starting.revision,
-                1234,
-                port,
-                None,
-            )
-            .await
-            .unwrap();
-        let receipt = store.state.lock().await.operations[&starting.operation_id].clone();
-        let completed = store
-            .publish_running(
-                &starting.preview_key,
-                &starting.operation_id,
-                starting.revision,
-                1234,
-                port,
-                Some("/custom/"),
-            )
-            .await
-            .expect("complete base after heartbeat publication");
-        assert_eq!(completed.base_path.as_deref(), Some("/custom/"));
-        assert_eq!(completed.last_activity_at, ready.last_activity_at);
-        assert_eq!(completed.last_heartbeat_at, ready.last_heartbeat_at);
-        assert_eq!(
-            store.state.lock().await.operations[&starting.operation_id],
-            receipt,
-            "base completion cannot rewrite the original receipt"
-        );
-        assert_eq!(
-            store
-                .publish_running(
-                    &starting.preview_key,
-                    &starting.operation_id,
-                    starting.revision,
-                    1234,
-                    port,
-                    None
-                )
-                .await
-                .unwrap(),
-            completed
-        );
-        assert_eq!(
-            store.state.lock().await.operations[&starting.operation_id],
-            receipt
-        );
-    }
 }
 
 /// 进程内权威存储。
@@ -264,6 +183,59 @@ impl PreviewLifecycleStore for InProcessPreviewStore {
         );
         state.instances.insert(input.preview_key, record.clone());
         Ok(AcceptStartOutcome::Admitted(record))
+    }
+
+    async fn retry_start_port(
+        &self,
+        input: PreviewStartPortRetry,
+    ) -> Result<PreviewInstanceRecord, Error> {
+        let mut state = self.state.lock().await;
+        let before = state
+            .instances
+            .get(&input.preview_key)
+            .cloned()
+            .ok_or_else(|| Error::Invalid("Preview has no current instance".into()))?;
+        let mut row = before.clone();
+        let changed = row.apply_start_port_retry(&input, now())?;
+        let mut operation = state
+            .operations
+            .get(&input.operation_id)
+            .cloned()
+            .ok_or_else(|| Error::Invalid("Preview start operation is missing".into()))?;
+        let inflight = match operation.state {
+            PreviewOperationState::Accepted
+            | PreviewOperationState::Running
+            | PreviewOperationState::Uncertain => true,
+            PreviewOperationState::Succeeded | PreviewOperationState::Failed => false,
+        };
+        if operation.kind != PreviewOperationKind::Start
+            || operation.preview_key != input.preview_key
+            || operation.operation_id != input.operation_id
+            || operation.allocated_port != before.port
+            || !inflight
+        {
+            return Err(conflict(
+                "Port retry requires the matching inflight start operation",
+                &before,
+            ));
+        }
+        if !changed {
+            return Ok(before);
+        }
+        if state
+            .instances
+            .values()
+            .any(|record| record.state.is_active() && record.port == Some(input.next_port))
+        {
+            return Err(Error::Invalid(
+                "Requested preview retry port is occupied".into(),
+            ));
+        }
+        operation.allocated_port = row.port;
+        operation.updated_at = row.updated_at;
+        state.operations.insert(input.operation_id, operation);
+        state.instances.insert(input.preview_key, row.clone());
+        Ok(row)
     }
 
     async fn publish_running(
@@ -591,5 +563,161 @@ impl PreviewLifecycleStore for InProcessPreviewStore {
             }
         }
         Ok(reconciled)
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn port_retry_only_updates_inflight_allocation_and_preserves_replay_receipt() {
+        let store = InProcessPreviewStore::new();
+        let AcceptStartOutcome::Admitted(original) = store
+            .accept_start(AcceptStartInput {
+                preview_key: "retry-receipt".into(),
+                project_id: "retry-project".into(),
+                project_path: "/workspace/retry-project".into(),
+                host: shared_types::PreviewHostIdentity {
+                    host_id: "retry-host:boot".into(),
+                    pod_name: None,
+                    pod_ip: None,
+                },
+                operation_id: "retry-start".into(),
+                instance_id: "retry-instance".into(),
+                requested_port: Some(41020),
+                base_path: Some("/retry/".into()),
+                recover_unknown_evidence: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("fresh retry admission")
+        };
+        let before = store.state.lock().await.operations[&original.operation_id].clone();
+        let retry = PreviewStartPortRetry {
+            preview_key: original.preview_key.clone(),
+            operation_id: original.operation_id.clone(),
+            instance_id: original.instance_id.clone(),
+            revision: original.revision,
+            previous_port: 41020,
+            next_port: 41021,
+        };
+        let moved = store.retry_start_port(retry.clone()).await.unwrap();
+        let mut expected = before;
+        expected.allocated_port = Some(41021);
+        expected.updated_at = moved.updated_at;
+        assert_eq!(
+            store.state.lock().await.operations[&original.operation_id],
+            expected
+        );
+        assert_eq!(store.retry_start_port(retry).await.unwrap(), moved);
+        assert_eq!(
+            store.state.lock().await.operations[&original.operation_id],
+            expected
+        );
+        let terminal = {
+            let mut state = store.state.lock().await;
+            let operation = state.operations.get_mut(&original.operation_id).unwrap();
+            operation.state = PreviewOperationState::Succeeded;
+            operation.clone()
+        };
+        assert!(matches!(
+            store
+                .retry_start_port(PreviewStartPortRetry {
+                    preview_key: moved.preview_key.clone(),
+                    operation_id: moved.operation_id.clone(),
+                    instance_id: moved.instance_id.clone(),
+                    revision: moved.revision,
+                    previous_port: 41021,
+                    next_port: 41022,
+                })
+                .await,
+            Err(Error::Conflict(_))
+        ));
+        assert_eq!(
+            store.get(&original.preview_key).await.unwrap().unwrap(),
+            moved
+        );
+        assert_eq!(
+            store.state.lock().await.operations[&original.operation_id],
+            terminal
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_base_completion_preserves_original_operation_receipt_and_activity() {
+        let store = InProcessPreviewStore::new();
+        let AcceptStartOutcome::Admitted(starting) = store
+            .accept_start(AcceptStartInput {
+                preview_key: "receipt-preview".into(),
+                project_id: "receipt-project".into(),
+                project_path: "/workspace/receipt-project".into(),
+                host: shared_types::PreviewHostIdentity {
+                    host_id: "receipt-host:boot".into(),
+                    pod_name: None,
+                    pod_ip: None,
+                },
+                operation_id: "receipt-start".into(),
+                instance_id: "receipt-instance".into(),
+                requested_port: None,
+                base_path: None,
+                recover_unknown_evidence: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("fresh start must be admitted")
+        };
+        let port = starting.port.unwrap();
+        let ready = store
+            .publish_running(
+                &starting.preview_key,
+                &starting.operation_id,
+                starting.revision,
+                1234,
+                port,
+                None,
+            )
+            .await
+            .unwrap();
+        let receipt = store.state.lock().await.operations[&starting.operation_id].clone();
+        let completed = store
+            .publish_running(
+                &starting.preview_key,
+                &starting.operation_id,
+                starting.revision,
+                1234,
+                port,
+                Some("/custom/"),
+            )
+            .await
+            .expect("complete base after heartbeat publication");
+        assert_eq!(completed.base_path.as_deref(), Some("/custom/"));
+        assert_eq!(completed.last_activity_at, ready.last_activity_at);
+        assert_eq!(completed.last_heartbeat_at, ready.last_heartbeat_at);
+        assert_eq!(
+            store.state.lock().await.operations[&starting.operation_id],
+            receipt,
+            "base completion cannot rewrite the original receipt"
+        );
+        assert_eq!(
+            store
+                .publish_running(
+                    &starting.preview_key,
+                    &starting.operation_id,
+                    starting.revision,
+                    1234,
+                    port,
+                    None
+                )
+                .await
+                .unwrap(),
+            completed
+        );
+        assert_eq!(
+            store.state.lock().await.operations[&starting.operation_id],
+            receipt
+        );
     }
 }

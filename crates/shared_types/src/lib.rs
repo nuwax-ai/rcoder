@@ -127,8 +127,8 @@ pub use preview::{
     PreviewKeepAliveRequest, PreviewKeyInput, PreviewLifecycleStore, PreviewListEntry,
     PreviewOperationKind, PreviewOperationRecord, PreviewOperationState, PreviewProjectIdentity,
     PreviewRecoveryEvidence, PreviewRestartEnvelope, PreviewRestartRequest, PreviewRouteResolution,
-    PreviewStartEnvelope, PreviewStartRequest, PreviewStopEnvelope, PreviewStopRequest,
-    PreviewStoreError, is_preview_port, preview_key,
+    PreviewStartEnvelope, PreviewStartPortRetry, PreviewStartRequest, PreviewStopEnvelope,
+    PreviewStopRequest, PreviewStoreError, is_preview_port, preview_key,
 };
 pub use preview::{PreviewPortAllocation, PreviewPortPoolStatus};
 

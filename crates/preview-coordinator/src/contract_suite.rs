@@ -7,7 +7,7 @@
 //! 以 dev-dependency 引入本函数复跑。
 use shared_types::{
     AcceptStartInput, AcceptStartOutcome, PreviewHostIdentity, PreviewInstanceState,
-    PreviewLifecycleStore, PreviewStoreError,
+    PreviewLifecycleStore, PreviewStartPortRetry, PreviewStoreError,
 };
 
 fn host(uid: &str, boot: &str) -> PreviewHostIdentity {
@@ -45,6 +45,7 @@ pub async fn run(store: &dyn PreviewLifecycleStore) {
     admitted_and_publish(store).await;
     admitted_base_cannot_be_replaced_by_publication(store).await;
     ready_publication_replay(store).await;
+    port_retry_keeps_original_start_and_rejects_stale_writers(store).await;
     idempotent_ready_start(store).await;
     blocked_while_starting(store).await;
     stop_flow_and_reaccept(store).await;
@@ -56,6 +57,190 @@ pub async fn run(store: &dyn PreviewLifecycleStore) {
     failure_then_reaccept(store).await;
     lookup_views(store).await;
     generation_bound_recovery_and_stop(store).await;
+}
+
+async fn port_retry_keeps_original_start_and_rejects_stale_writers(
+    store: &dyn PreviewLifecycleStore,
+) {
+    let key = "port-retry-preview";
+    let mut input = start_input(key, "retry-project", "retry-operation", "retry-instance");
+    input.base_path = Some("/retry/".into());
+    let AcceptStartOutcome::Admitted(original) = store.accept_start(input).await.unwrap() else {
+        panic!("fresh retry contract must be admitted");
+    };
+    let previous_port = original.port.unwrap();
+    let occupied = store.active_ports().await.unwrap();
+    let next_port = (shared_types::PREVIEW_PORT_MIN..=shared_types::PREVIEW_PORT_MAX)
+        .find(|port| shared_types::is_preview_port(*port) && !occupied.contains(port))
+        .unwrap();
+    let retry = PreviewStartPortRetry {
+        preview_key: key.into(),
+        operation_id: original.operation_id.clone(),
+        instance_id: original.instance_id.clone(),
+        revision: original.revision,
+        previous_port,
+        next_port,
+    };
+    for bad in [
+        PreviewStartPortRetry {
+            operation_id: "foreign-op".into(),
+            ..retry.clone()
+        },
+        PreviewStartPortRetry {
+            instance_id: "foreign-instance".into(),
+            ..retry.clone()
+        },
+        PreviewStartPortRetry {
+            revision: original.revision + 1,
+            ..retry.clone()
+        },
+        PreviewStartPortRetry {
+            previous_port: next_port + 1,
+            ..retry.clone()
+        },
+        PreviewStartPortRetry {
+            next_port: 0,
+            ..retry.clone()
+        },
+        PreviewStartPortRetry {
+            next_port: shared_types::PREVIEW_PORT_RESERVED_MIN,
+            ..retry.clone()
+        },
+        PreviewStartPortRetry {
+            next_port: previous_port,
+            ..retry.clone()
+        },
+    ] {
+        assert!(store.retry_start_port(bad).await.is_err());
+        assert_eq!(store.get(key).await.unwrap().unwrap(), original);
+    }
+    let mut blocker = start_input(
+        "retry-port-blocker",
+        "blocker-project",
+        "blocker-op",
+        "blocker-instance",
+    );
+    blocker.requested_port = Some(next_port);
+    let AcceptStartOutcome::Admitted(blocker) = store.accept_start(blocker).await.unwrap() else {
+        panic!("reserve strict retry candidate")
+    };
+    assert!(matches!(
+        store.retry_start_port(retry.clone()).await,
+        Err(PreviewStoreError::Invalid(_))
+    ));
+    assert_eq!(store.get(key).await.unwrap().unwrap(), original);
+    assert_eq!(
+        store.get(&blocker.preview_key).await.unwrap().unwrap(),
+        blocker
+    );
+    let stopping_blocker = store
+        .accept_stop(&blocker.preview_key, "blocker-stop")
+        .await
+        .unwrap();
+    store
+        .mark_stopped(
+            &blocker.preview_key,
+            &stopping_blocker.operation_id,
+            stopping_blocker.revision,
+        )
+        .await
+        .unwrap();
+
+    let moved = store.retry_start_port(retry.clone()).await.unwrap();
+    let mut expected = original.clone();
+    expected.revision += 1;
+    expected.port = Some(next_port);
+    expected.updated_at = moved.updated_at;
+    assert_eq!(
+        moved, expected,
+        "port retry changes only revision, port and update time"
+    );
+    assert_eq!(
+        store.retry_start_port(retry.clone()).await.unwrap(),
+        moved,
+        "lost acknowledgement replay must not mutate again"
+    );
+    assert_conflict(
+        &store
+            .publish_running(
+                key,
+                &original.operation_id,
+                original.revision,
+                3131,
+                previous_port,
+                Some("/retry/"),
+            )
+            .await,
+    );
+    assert_eq!(store.get(key).await.unwrap().unwrap(), moved);
+
+    let second_retry = PreviewStartPortRetry {
+        revision: moved.revision,
+        previous_port: next_port,
+        next_port: previous_port,
+        ..retry.clone()
+    };
+    let moved_again = store.retry_start_port(second_retry.clone()).await.unwrap();
+    assert_eq!(moved_again.revision, original.revision + 2);
+    assert_eq!(moved_again.operation_id, original.operation_id);
+    assert_eq!(moved_again.instance_id, original.instance_id);
+    assert_eq!(moved_again.state, PreviewInstanceState::Starting);
+    assert_conflict(&store.retry_start_port(retry).await);
+    let stopping = store.accept_stop(key, "retry-stop").await.unwrap();
+    assert_conflict(&store.retry_start_port(second_retry.clone()).await);
+    assert_eq!(store.get(key).await.unwrap().unwrap(), stopping);
+    let stopped = store
+        .mark_stopped(key, &stopping.operation_id, stopping.revision)
+        .await
+        .unwrap();
+    assert_conflict(&store.retry_start_port(second_retry.clone()).await);
+    assert_eq!(store.get(key).await.unwrap().unwrap(), stopped);
+
+    let AcceptStartOutcome::Admitted(replacement) = store
+        .accept_start(start_input(
+            key,
+            "retry-project",
+            "retry-replacement-op",
+            "retry-replacement-instance",
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!("reaccept after original stop")
+    };
+    assert_conflict(&store.retry_start_port(second_retry).await);
+    assert_eq!(store.get(key).await.unwrap().unwrap(), replacement);
+    let current_retry = PreviewStartPortRetry {
+        preview_key: key.into(),
+        operation_id: replacement.operation_id.clone(),
+        instance_id: replacement.instance_id.clone(),
+        revision: replacement.revision,
+        previous_port: replacement.port.unwrap(),
+        next_port,
+    };
+    let ready = store
+        .publish_running(
+            key,
+            &replacement.operation_id,
+            replacement.revision,
+            4141,
+            replacement.port.unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_conflict(&store.retry_start_port(current_retry.clone()).await);
+    assert_eq!(store.get(key).await.unwrap().unwrap(), ready);
+    let unknown = store
+        .mark_unknown(key, &replacement.instance_id, "current host unavailable")
+        .await
+        .unwrap();
+    assert_conflict(&store.retry_start_port(current_retry).await);
+    assert_eq!(store.get(key).await.unwrap().unwrap(), unknown);
+    store
+        .resolve_unknown_stopped(key, &replacement.instance_id, "exact host stopped")
+        .await
+        .unwrap();
 }
 
 async fn admitted_base_cannot_be_replaced_by_publication(store: &dyn PreviewLifecycleStore) {

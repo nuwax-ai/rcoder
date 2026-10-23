@@ -14,6 +14,9 @@ use toasty::Executor;
 use toasty_core::schema::db::Type;
 type Error = PreviewStoreError;
 
+// Stable allocator namespace shared by initial admission and port retries.
+const PREVIEW_ALLOCATION_LOCK_SQL: &str = "SELECT 1 FROM pg_advisory_xact_lock(72430591234122)";
+
 pub struct PgPreviewStore {
     owner: DatabaseOwner,
 }
@@ -224,7 +227,7 @@ async fn accept_start(
     }
     // Independent namespace from schema and leader locks; transaction-scoped,
     // released before returning and never held while spawning or probing a host.
-    toasty::sql::query("SELECT 1 FROM pg_advisory_xact_lock(72430591234122)")
+    toasty::sql::query(PREVIEW_ALLOCATION_LOCK_SQL)
         .exec(tx)
         .await
         .map_err(unavailable)?;
@@ -361,6 +364,45 @@ impl PreviewLifecycleStore for PgPreviewStore {
     async fn accept_start(&self, input: AcceptStartInput) -> Result<AcceptStartOutcome, Error> {
         self.run(move |tx| Box::pin(accept_start(tx, input))).await
     }
+    async fn retry_start_port(
+        &self,
+        input: PreviewStartPortRetry,
+    ) -> Result<PreviewInstanceRecord, Error> {
+        self.run(move |tx| Box::pin(async move {
+            // Match accept_start's allocator -> instance lock order, including
+            // contention with other keys claiming the strict next candidate.
+            toasty::sql::query(PREVIEW_ALLOCATION_LOCK_SQL)
+                .exec(tx).await.map_err(unavailable)?;
+            let before = current(tx, &input.preview_key).await?;
+            let mut row = before.clone();
+            let changed = row.apply_start_port_retry(&input, now())?;
+            let operation = operation(tx, &input.operation_id).await?
+                .ok_or_else(|| conflict("Preview start operation is missing"))?;
+            if operation.kind != "start"
+                || operation.preview_key != input.preview_key
+                || operation.instance_id != input.instance_id
+                || operation.allocated_port != before.port.map(i64::from)
+                || operation.payload_version != 1
+                || !matches!(operation.state.as_str(), "accepted" | "running" | "uncertain")
+            {
+                return Err(conflict("Port retry requires the matching inflight start operation"));
+            }
+            if !changed {
+                return Ok(before);
+            }
+            allocate(&ports(tx).await?, Some(input.next_port))?;
+            save(tx, &before, &row).await?;
+            let count = toasty::sql::statement("UPDATE preview_operations SET allocated_port=$1,updated_at_us=$2 WHERE operation_id=$3 AND preview_key=$4 AND instance_id=$5 AND kind='start' AND state=$6 AND allocated_port=$7 AND payload_version=1")
+                .bind(i64::from(input.next_port)).bind(row.updated_at.timestamp_micros())
+                .bind(&input.operation_id).bind(&input.preview_key).bind(&input.instance_id)
+                .bind(&operation.state).bind(i64::from(input.previous_port)).exec(tx).await.map_err(unavailable)?;
+            if count != 1 {
+                return Err(conflict("Preview port retry operation CAS failed"));
+            }
+            Ok(row)
+        })).await
+    }
+
     async fn publish_running(
         &self,
         key: &str,
