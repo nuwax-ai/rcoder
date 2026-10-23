@@ -295,6 +295,7 @@ async fn unconfirmed_factory_stop_retains_exact_execution_and_blocks_new_factory
             &None,
             &config,
             false,
+            false,
             || {
                 creates.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Ok(rejected.clone()))
@@ -331,6 +332,7 @@ async fn unconfirmed_factory_stop_retains_exact_execution_and_blocks_new_factory
             &None,
             &config,
             false,
+            false,
             || {
                 creates.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Ok(replacement.clone()))
@@ -352,6 +354,7 @@ async fn unconfirmed_factory_stop_retains_exact_execution_and_blocks_new_factory
             "owned-project",
             &None,
             &config,
+            false,
             false,
             || {
                 retry_creates.fetch_add(1, Ordering::SeqCst);
@@ -399,12 +402,19 @@ async fn rejected_foreign_factory_with_failed_reaping_retains_only_raw_entry_and
     let (rejected, _old_prompts) = entry("foreign-session", Some(lifecycle.clone()));
     let creates = AtomicUsize::new(0);
     let config = creation_config();
-    let first =
-        create_after_reconciliation(&registry, "owned-project", &None, &config, false, || {
+    let first = create_after_reconciliation(
+        &registry,
+        "owned-project",
+        &None,
+        &config,
+        false,
+        false,
+        || {
             creates.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Ok(rejected.clone()))
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(creation_error(first).contains("controlled reaper failure"));
     assert_eq!(
         registry.get("owned-project").unwrap().status,
@@ -419,21 +429,35 @@ async fn rejected_foreign_factory_with_failed_reaping_retains_only_raw_entry_and
     assert_eq!(registry.publications.load(Ordering::SeqCst), 0);
 
     let (replacement, _new_prompts) = entry("replacement-opaque", None);
-    let blocked =
-        create_after_reconciliation(&registry, "owned-project", &None, &config, false, || {
+    let blocked = create_after_reconciliation(
+        &registry,
+        "owned-project",
+        &None,
+        &config,
+        false,
+        false,
+        || {
             creates.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Ok(replacement.clone()))
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(blocked.is_err());
     assert_eq!(creates.load(Ordering::SeqCst), 1);
     lifecycle.fail_wait.store(false, Ordering::SeqCst);
-    let recovered =
-        create_after_reconciliation(&registry, "owned-project", &None, &config, false, || {
+    let recovered = create_after_reconciliation(
+        &registry,
+        "owned-project",
+        &None,
+        &config,
+        false,
+        false,
+        || {
             creates.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Ok(replacement))
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(recovered.is_ok());
     assert!(lifecycle.is_stopped());
     assert_eq!(creates.load(Ordering::SeqCst), 2);
@@ -455,29 +479,50 @@ async fn missing_factory_lifecycle_blocks_only_live_execution_and_closed_history
         let (rejected, old_prompts) = entry(sid, None);
         let creates = AtomicUsize::new(0);
         let config = creation_config();
-        let first =
-            create_after_reconciliation(&registry, "owned-project", &None, &config, false, || {
+        let first = create_after_reconciliation(
+            &registry,
+            "owned-project",
+            &None,
+            &config,
+            false,
+            false,
+            || {
                 creates.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Ok(rejected.clone()))
-            })
-            .await;
+            },
+        )
+        .await;
         assert!(creation_error(first).contains("lifecycle handle is missing"));
         let (replacement, _new_prompts) = entry("replacement", None);
-        let blocked =
-            create_after_reconciliation(&registry, "owned-project", &None, &config, false, || {
+        let blocked = create_after_reconciliation(
+            &registry,
+            "owned-project",
+            &None,
+            &config,
+            false,
+            false,
+            || {
                 creates.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Ok(replacement.clone()))
-            })
-            .await;
+            },
+        )
+        .await;
         assert!(creation_error(blocked).contains("lifecycle handle is missing"));
         assert_eq!(creates.load(Ordering::SeqCst), 1);
         drop(old_prompts);
-        let recovered =
-            create_after_reconciliation(&registry, "owned-project", &None, &config, false, || {
+        let recovered = create_after_reconciliation(
+            &registry,
+            "owned-project",
+            &None,
+            &config,
+            false,
+            false,
+            || {
                 creates.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Ok(replacement))
-            })
-            .await;
+            },
+        )
+        .await;
         assert!(
             recovered.is_ok(),
             "closed historical channels do not prove a live execution"
@@ -498,20 +543,31 @@ async fn rejected_factory_with_confirmed_exit_does_not_leave_a_startup_gate() {
     let lifecycle = ControlledLifecycle::new(false, false);
     let (rejected, _old_prompts) = entry("pending", Some(lifecycle.clone()));
     let config = creation_config();
-    let result =
-        create_after_reconciliation(&registry, "owned-project", &None, &config, false, || {
-            std::future::ready(Ok(rejected))
-        })
-        .await;
+    let result = create_after_reconciliation(
+        &registry,
+        "owned-project",
+        &None,
+        &config,
+        false,
+        false,
+        || std::future::ready(Ok(rejected)),
+    )
+    .await;
     assert!(result.is_err());
     assert!(lifecycle.is_stopped());
     assert!(!registry.contains("owned-project"));
     assert_eq!(registry.publications.load(Ordering::SeqCst), 0);
     let (replacement, _new_prompts) = entry("next-real-session", None);
     assert!(
-        create_after_reconciliation(&registry, "owned-project", &None, &config, false, || {
-            std::future::ready(Ok(replacement))
-        })
+        create_after_reconciliation(
+            &registry,
+            "owned-project",
+            &None,
+            &config,
+            false,
+            false,
+            || { std::future::ready(Ok(replacement)) }
+        )
         .await
         .is_ok()
     );
@@ -548,6 +604,7 @@ async fn cancelled_factory_rejection_remains_manageable_and_retry_waits_for_orig
                         "owned-project",
                         &None,
                         &creation_config(),
+                        false,
                         false,
                         || {
                             creates.fetch_add(1, Ordering::SeqCst);
@@ -606,6 +663,7 @@ async fn cancelled_factory_rejection_remains_manageable_and_retry_waits_for_orig
                         "owned-project",
                         &None,
                         &creation_config(),
+                        false,
                         false,
                         || {
                             creates.fetch_add(1, Ordering::SeqCst);
@@ -862,4 +920,151 @@ fn unused_request_config_guard_semantics() {
     };
     drop(owned);
     assert!(map.contains_key("u2"), "dismissed guard keeps the config");
+}
+
+// ── R05：有效模型配置（identity ≠ 内容）───────────────────────────────────
+
+fn live_reuse_manager(
+    provider: &ModelProviderConfig,
+) -> (
+    Arc<FactoryRegistry>,
+    AcpSessionManager<NoopNotifier, FactoryRegistry>,
+    mpsc::Receiver<agent_client_protocol::schema::v1::PromptRequest>,
+) {
+    let registry = Arc::new(FactoryRegistry::default());
+    let manager = AcpSessionManager::new(Arc::new(NoopNotifier), registry.clone());
+    // 接收端必须保活：drop 会使 prompt_tx.is_closed() 为真，复用被误拒
+    let (mut live, prompts) = entry("opaque/session:r05", None);
+    live.model_provider = Some(provider.clone());
+    live.status = AgentStatus::Idle;
+    registry.insert("owned-project", "opaque/session:r05", live);
+    (registry, manager, prompts)
+}
+
+async fn request_reuse(
+    manager: &AcpSessionManager<NoopNotifier, FactoryRegistry>,
+    provider: ModelProviderConfig,
+) -> Result<(ProjectAndAgentInfo, bool), anyhow::Error> {
+    manager
+        .get_or_create_session(
+            "owned-project",
+            std::env::temp_dir(),
+            Some("opaque/session:r05".into()),
+            SessionCreationConfig {
+                model_provider: Some(provider),
+                start_config: creation_config(),
+                service_uuid: None,
+                force_new_session: false,
+                api_key_manager: None,
+            },
+        )
+        .await
+}
+
+/// R05 反例: 相同 provider id 但 default_model 变化——存活进程环境里的模型
+/// 已过期，静默复用会让实际调用仍走旧模型。修复前只比较 id，直接复用。
+#[tokio::test]
+async fn same_id_new_default_model_must_not_reuse_the_stale_process() {
+    let (_, manager, _live_prompts) = live_reuse_manager(&provider_config("p1"));
+    let mut changed = provider_config("p1");
+    changed.default_model = "m-new".into();
+    let result = request_reuse(&manager, changed).await;
+    let silently_reused = matches!(&result, Ok((entry, false)) if entry.session_id.0.as_ref() == "opaque/session:r05");
+    assert!(
+        !silently_reused,
+        "a changed effective model must not silently reuse the stale process"
+    );
+}
+
+/// R05 反例: direct 模式下 endpoint/凭据固化在子进程环境——同 id 变化不得复用。
+#[tokio::test]
+async fn direct_mode_endpoint_change_must_not_reuse() {
+    for (field, value) in [
+        ("base_url", "https://new-endpoint.example"),
+        ("api_key", "rotated-secret"),
+    ] {
+        let (_, manager, _live_prompts) = live_reuse_manager(&provider_config("p1"));
+        let mut changed = provider_config("p1");
+        match field {
+            "base_url" => changed.base_url = value.into(),
+            _ => changed.api_key = value.into(),
+        }
+        let result = request_reuse(&manager, changed).await;
+        let silently_reused = matches!(&result, Ok((entry, false)) if entry.session_id.0.as_ref() == "opaque/session:r05");
+        assert!(!silently_reused, "{field} change must not reuse");
+    }
+}
+
+/// R05: proxy 模式凭据由代理按请求生效——同 id 轮换 base_url/api_key 仍复用；
+/// default_model 变化仍不复用。
+#[tokio::test]
+async fn proxy_mode_credential_rotation_reuses_but_model_change_does_not() {
+    let registry = Arc::new(FactoryRegistry::default());
+    let manager = AcpSessionManager::with_model_env_resolver(
+        Arc::new(NoopNotifier),
+        registry.clone(),
+        Arc::new(
+            crate::launcher::model_env::ProxyModelRuntimeEnvResolver::new(
+                "http://127.0.0.1:1/api/{SERVICE_UUID}",
+            ),
+        ),
+    );
+    let (mut live, _prompts) = entry("opaque/session:r05p", None);
+    live.model_provider = Some(provider_config("p1"));
+    live.status = AgentStatus::Idle;
+    registry.insert("owned-project", "opaque/session:r05p", live);
+
+    let mut rotated = provider_config("p1");
+    rotated.base_url = "https://rotated.example".into();
+    rotated.api_key = "rotated".into();
+    let (reused, created) = request_reuse(&manager, rotated)
+        .await
+        .expect("proxy credential rotation reuses");
+    assert!(!created);
+    assert_eq!(reused.session_id.0.as_ref(), "opaque/session:r05p");
+
+    let mut model_changed = provider_config("p1");
+    model_changed.default_model = "m-new".into();
+    let result = request_reuse(&manager, model_changed).await;
+    let silently_reused = matches!(&result, Ok((entry, false)) if entry.session_id.0.as_ref() == "opaque/session:r05p");
+    assert!(!silently_reused, "proxy model change must not reuse");
+}
+
+/// R05: 完全等价配置（含 id 变化但内容相同）保持复用——id 是身份不是内容版本。
+#[test]
+fn effective_comparison_treats_identity_as_not_content() {
+    let base = provider_config("p1");
+    let same_content_new_id = ModelProviderConfig {
+        id: "p2".into(),
+        ..base.clone()
+    };
+    assert!(!effective_model_config_changed(
+        false,
+        Some(&base),
+        Some(&same_content_new_id)
+    ));
+    assert!(!effective_model_config_changed(
+        false,
+        Some(&base),
+        Some(&base)
+    ));
+    let mut model = base.clone();
+    model.default_model = "m2".into();
+    assert!(effective_model_config_changed(
+        false,
+        Some(&base),
+        Some(&model)
+    ));
+    let mut key = base.clone();
+    key.api_key = "k2".into();
+    assert!(
+        effective_model_config_changed(false, Some(&base), Some(&key)),
+        "direct bakes credentials"
+    );
+    assert!(
+        !effective_model_config_changed(true, Some(&base), Some(&key)),
+        "proxy does not bake credentials"
+    );
+    assert!(effective_model_config_changed(false, Some(&base), None));
+    assert!(!effective_model_config_changed(false, None, None));
 }

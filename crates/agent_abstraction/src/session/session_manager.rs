@@ -82,6 +82,44 @@ pub(crate) fn require_session_identity(session_id: &SessionId) -> Result<()> {
     }
 }
 
+/// 有效模型配置比较（R05）：provider 身份（id）相同不代表进程有效配置相同。
+///
+/// 只比较确实影响**存活进程执行**的字段：模型选择（default_model）、协议
+/// （api_protocol/wire_api）、provider_name 与认证形态（requires_openai_auth）
+/// 恒定参与；direct 模式凭据/端点固化在子进程环境（api_key/base_url）也参与；
+/// proxy 模式凭据由代理按请求生效、不进子进程环境，不参与——避免凭据轮换
+/// 触发无谓重启。`id` 是身份不是内容版本，不参与比较。None/Some 组合仍视为
+/// 变化（与既有语义一致）。
+pub(crate) fn effective_model_config_changed(
+    resolver_uses_proxy: bool,
+    existing: Option<&ModelProviderConfig>,
+    new: Option<&ModelProviderConfig>,
+) -> bool {
+    let (Some(existing), Some(new)) = (existing, new) else {
+        return existing.is_some() != new.is_some();
+    };
+    let common = (
+        &existing.default_model,
+        &existing.name,
+        existing.requires_openai_auth,
+        &existing.api_protocol,
+        &existing.wire_api,
+    ) == (
+        &new.default_model,
+        &new.name,
+        new.requires_openai_auth,
+        &new.api_protocol,
+        &new.wire_api,
+    );
+    if !common {
+        return true;
+    }
+    if resolver_uses_proxy {
+        return false;
+    }
+    (&existing.base_url, &existing.api_key) != (&new.base_url, &new.api_key)
+}
+
 /// 会话创建使用的运行配置。模型与其 UUID、agent 启动配置及 Fresh 策略一起传递。
 #[derive(Clone)]
 pub struct SessionCreationConfig {

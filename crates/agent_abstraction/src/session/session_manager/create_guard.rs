@@ -5,7 +5,10 @@
 //! 构造本模块私有 struct 字面量，随私有类型同档（prompt_channel_tests 已归
 //! session_manager.rs——其测试对象 send_prompt_to_entry 属 session 域）。
 
-use super::{AcpSessionManager, SessionCreationConfig, require_session_identity};
+use super::{
+    AcpSessionManager, SessionCreationConfig, effective_model_config_changed,
+    require_session_identity,
+};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -178,6 +181,20 @@ where
     /// 快速复用后，创建请求按 project_id 合流为 leader/follower；leader 在
     /// 执行转换锁内完成停旧、退出确认、启动和登记。DashMap guard 不跨 await，
     /// 不同 project 独立；控制请求在相同锁内完成旧实例清理。
+    /// 有效模型配置比较（见 [`effective_model_config_changed`]）：
+    /// 依据当前 resolver（direct/proxy）比较影响存活进程的字段。
+    fn effective_model_changed(
+        &self,
+        existing: Option<&ModelProviderConfig>,
+        new: Option<&ModelProviderConfig>,
+    ) -> bool {
+        effective_model_config_changed(
+            self.model_env_resolver.uses_proxy_credentials(),
+            existing,
+            new,
+        )
+    }
+
     pub async fn get_or_create_session(
         &self,
         project_id: &str,
@@ -226,7 +243,8 @@ where
             && require_session_identity(existing.session_id()).is_ok()
             && *existing.status() != AgentStatus::Terminating
             && !existing.is_channel_closed()
-            && !existing.is_model_config_changed(&config.model_provider)
+            && !self
+                .effective_model_changed(existing.model_provider(), config.model_provider.as_ref())
             && session_id_hint
                 .as_deref()
                 .is_none_or(|hint| existing.session_id().to_string() == hint)
@@ -246,7 +264,8 @@ where
             && *existing.status() != AgentStatus::Pending
             && *existing.status() != AgentStatus::Terminating
             && !existing.is_channel_closed()
-            && !existing.is_model_config_changed(&config.model_provider)
+            && !self
+                .effective_model_changed(existing.model_provider(), config.model_provider.as_ref())
             && session_id_hint
                 .as_deref()
                 .is_none_or(|hint| existing.session_id().to_string() == hint)
@@ -367,6 +386,7 @@ where
             &model_provider,
             &reconciliation,
             force_new_session,
+            self.model_env_resolver.uses_proxy_credentials(),
             || {
                 self.create_session_internal(
                     project_id.to_owned(),
@@ -423,7 +443,7 @@ where
                 // 复检：Leader 刚建好即死 / 并发请求模型配置不同（并发切模型）
                 if require_session_identity(entry.session_id()).is_err()
                     || entry.is_channel_closed()
-                    || entry.is_model_config_changed(model_provider)
+                    || self.effective_model_changed(entry.model_provider(), model_provider.as_ref())
                 {
                     return Err(anyhow::anyhow!(
                         "in-flight session outcome stale (unusable identity, dead channel or model mismatch), caller retry will lead: project_id={}",
@@ -443,6 +463,7 @@ async fn create_after_reconciliation<R, F, Fut>(
     model_provider: &Option<ModelProviderConfig>,
     start_config: &AgentStartConfig,
     force_new_session: bool,
+    resolver_uses_proxy: bool,
     create: F,
 ) -> Result<(R::Entry, bool), String>
 where
@@ -459,7 +480,11 @@ where
         let session_id_str = existing.session_id().to_string();
         let established = require_session_identity(existing.session_id()).is_ok();
         let channel_closed = existing.is_channel_closed();
-        let model_changed = existing.is_model_config_changed(model_provider);
+        let model_changed = effective_model_config_changed(
+            resolver_uses_proxy,
+            existing.model_provider(),
+            model_provider.as_ref(),
+        );
         let resume_changed = start_config
             .resume_session_id
             .as_deref()

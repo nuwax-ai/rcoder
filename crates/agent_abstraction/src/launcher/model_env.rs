@@ -23,6 +23,13 @@ pub trait ModelRuntimeEnvResolver: Send + Sync {
         provider: &ModelProviderConfig,
         service_uuid: Option<&str>,
     ) -> Result<ResolvedModelEnv>;
+
+    /// 是否代理凭据模式（子进程不持有真实 base_url/api_key）。有效模型配置
+    /// 比较据此区分：direct 模式凭据/端点固化在进程环境，变化须换进程；
+    /// proxy 模式凭据在代理侧按请求生效，变化不影响存活进程。
+    fn uses_proxy_credentials(&self) -> bool {
+        false
+    }
 }
 
 /// Direct mode: pass through the provider values unchanged.
@@ -61,6 +68,10 @@ impl ProxyModelRuntimeEnvResolver {
 }
 
 impl ModelRuntimeEnvResolver for ProxyModelRuntimeEnvResolver {
+    fn uses_proxy_credentials(&self) -> bool {
+        true
+    }
+
     fn resolve(
         &self,
         provider: &ModelProviderConfig,
