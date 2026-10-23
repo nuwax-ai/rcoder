@@ -280,12 +280,17 @@ impl Drop for AgentLifecycleGuard {
             // 发送取消信号
             self.inner.cancel_token.cancel();
 
-            // 注意：API 密钥配置的清理由 agent_runner 层的 stop_agent 方法统一负责
-            // 包括：
-            // - shared_api_key_manager 中的配置
-            // - project_uuid_map 中的映射
-            //
-            // 这样避免双重清理，确保资源只被清理一次
+            // 本代次进程退出：清理它独有的代理 API 配置与映射（R04——配置绑定
+            // 进程代次，而非"最新一次请求"）。映射按 CAS 只清仍指向自己的一格；
+            // 与 agent_runner stop_agent 的清理幂等共存（remove 对缺席键为 no-op）。
+            if let Some(uuid) = &self.inner.service_uuid {
+                if let Some(map) = &self.inner.project_uuid_map {
+                    map.remove_if(&self.inner.project_id, |_, current| current == uuid);
+                }
+                if let Some(manager) = &self.inner.shared_api_key_manager {
+                    manager.remove(uuid);
+                }
+            }
 
             // 🔥 同步终止进程组
             #[cfg(unix)]

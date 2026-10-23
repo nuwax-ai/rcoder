@@ -299,6 +299,12 @@ impl AgentLifecycleGuard {
             working_dir,
         });
 
+        // 映射反映**存活进程**的绑定（R04）：新进程以此 uuid 启动，成功后发布；
+        // 复用路径不触碰映射，旧进程退出时由生命周期守卫按 CAS 收回。
+        if let (Some(uuid), Some(map)) = (&inner.service_uuid, &inner.project_uuid_map) {
+            map.insert(inner.project_id.clone(), uuid.clone());
+        }
+
         info!(
             "[LifecycleGuard] 创建 Claude Agent 守卫: project_id={}, pgid={}, session_id={:?}",
             project_id, pgid, session_id_str

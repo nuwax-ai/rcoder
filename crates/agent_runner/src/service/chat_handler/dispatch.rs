@@ -115,22 +115,14 @@ pub(super) async fn dispatch_task(
             service_uuid_ref
         );
 
-        // 存储 ModelProviderConfig 到共享 DashMap（使用 UUID 作为 key）
+        // 存储 ModelProviderConfig 到共享 DashMap（使用 UUID 作为 key）。
+        // 不在此处清除上一轮 uuid 的配置（R04）：快速复用路径不重启进程，
+        // 存活进程的启动环境仍指向旧 uuid，抢占式清除会让它的代理请求 404。
+        // 归属改为进程代次——复用/失败路径由会话管理移除本次未使用的配置，
+        // 新进程发布映射并在退出时由生命周期守卫按代次清理（含凭据不泄漏）。
         context
             .shared_api_key_manager
             .insert(service_uuid_ref.to_string(), provider.clone());
-
-        // 存储 project_id -> UUID 映射（用于后续清理时查找）。多轮 chat 每轮
-        // 生成新 uuid 覆盖旧映射——insert 拿回旧 uuid（DashMap 返回旧 value）
-        // 并连带清理其 api_key 条目，否则旧 uuid 的 ModelProviderConfig（含
-        // 明文 api_key）成为永不清理的孤儿（stop 路径只清"当前映射指向的 uuid"）
-        if let Some(old_uuid) = context
-            .project_uuid_map
-            .insert(project_id.to_string(), service_uuid_ref.to_string())
-        {
-            context.shared_api_key_manager.remove(&old_uuid);
-            debug!("[ChatHandler] Replaced API config mapping, evicted old uuid={old_uuid}");
-        }
 
         info!(
             "[ChatHandler] Stored API config: service_uuid={}, provider_name={}, base_url={}",

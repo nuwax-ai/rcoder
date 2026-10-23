@@ -1,4 +1,5 @@
 use super::*;
+use crate::traits::SessionNotifier;
 use agent_client_protocol::schema::v1::SessionId;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -720,4 +721,145 @@ async fn confirmed_rejected_exit_does_not_remove_same_sid_replacement_or_foreign
         Some("foreign-project")
     );
     assert_eq!(registry.publications.load(Ordering::SeqCst), 0);
+}
+
+// ── R04：代理 API 配置绑定实际进程代次 ─────────────────────────────────────
+
+struct NoopNotifier;
+#[async_trait::async_trait]
+impl SessionNotifier for NoopNotifier {
+    async fn notify_prompt_start(
+        &self,
+        _: &str,
+        _: &str,
+        _: Option<String>,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+    async fn notify_prompt_end(
+        &self,
+        _: &str,
+        _: &str,
+        _: agent_client_protocol::schema::v1::StopReason,
+        _: Option<String>,
+        _: Option<String>,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+    async fn notify_prompt_error(
+        &self,
+        _: &str,
+        _: &str,
+        _: agent_client_protocol::schema::v1::Error,
+        _: Option<String>,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+    async fn notify_session_update(
+        &self,
+        _: &str,
+        _: &str,
+        _: agent_client_protocol::schema::v1::SessionUpdate,
+        _: Option<String>,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+    async fn notify(
+        &self,
+        _: &str,
+        _: &str,
+        _: shared_types::SessionNotify,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+}
+
+fn provider_config(id: &str) -> ModelProviderConfig {
+    ModelProviderConfig {
+        id: id.into(),
+        name: "controlled".into(),
+        base_url: "https://upstream.example".into(),
+        api_key: "secret-live".into(),
+        requires_openai_auth: true,
+        default_model: "m-1".into(),
+        api_protocol: Some("openai".into()),
+        wire_api: None,
+    }
+}
+
+/// R04 反例: 第二轮同 SID 复用存活进程时, 本轮请求的 service_uuid 配置
+/// 未被任何进程使用——必须移除, 而存活进程绑定的旧 uuid 配置必须保留
+/// (否则该进程发出的代理请求 404)。修复前(仅有 dispatch 抢占式清除)
+/// 复用路径无任何清理, 且 agent_runner 侧已把旧配置删掉。
+#[tokio::test]
+async fn reuse_removes_unused_request_config_and_keeps_live_binding() {
+    let registry = Arc::new(FactoryRegistry::default());
+    let manager = AcpSessionManager::new(Arc::new(NoopNotifier), registry.clone());
+    let provider = provider_config("p1");
+    let (mut live, _prompts) = entry("opaque/session:9", None);
+    live.model_provider = Some(provider.clone());
+    live.status = AgentStatus::Idle;
+    registry.insert("owned-project", "opaque/session:9", live);
+
+    let manager_map: Arc<DashMap<String, ModelProviderConfig>> = Arc::new(DashMap::new());
+    manager_map.insert("live-uuid".into(), provider.clone());
+    manager_map.insert("request-uuid-2".into(), provider.clone());
+
+    let (reused, created) = manager
+        .get_or_create_session(
+            "owned-project",
+            std::env::temp_dir(),
+            Some("opaque/session:9".into()),
+            SessionCreationConfig {
+                model_provider: Some(provider),
+                start_config: creation_config(),
+                service_uuid: Some("request-uuid-2".into()),
+                force_new_session: false,
+                api_key_manager: Some(manager_map.clone()),
+            },
+        )
+        .await
+        .expect("reuse path must not spawn");
+
+    assert!(!created, "identical model config reuses the live session");
+    assert_eq!(
+        reused.session_id().0.as_ref(),
+        "opaque/session:9",
+        "the live process's session is reused"
+    );
+    assert!(
+        manager_map.contains_key("live-uuid"),
+        "the live process's proxy binding must survive a reuse round"
+    );
+    assert!(
+        !manager_map.contains_key("request-uuid-2"),
+        "this round's unused config must be removed (credential hygiene)"
+    );
+}
+
+/// R04: 请求级守卫本身——dismiss 后不清理(新进程接管), 未 dismiss 移除。
+#[test]
+fn unused_request_config_guard_semantics() {
+    let map: Arc<DashMap<String, ModelProviderConfig>> = Arc::new(DashMap::new());
+    map.insert("u".into(), provider_config("p"));
+    let mut guard = UnusedRequestConfig {
+        service_uuid: Some("u".into()),
+        api_key_manager: Some(map.clone()),
+        dismissed: true,
+    };
+    guard.dismissed = false;
+    drop(guard);
+    assert!(
+        !map.contains_key("u"),
+        "undismissed guard removes the config"
+    );
+
+    map.insert("u2".into(), provider_config("p"));
+    let owned = UnusedRequestConfig {
+        service_uuid: Some("u2".into()),
+        api_key_manager: Some(map.clone()),
+        dismissed: true,
+    };
+    drop(owned);
+    assert!(map.contains_key("u2"), "dismissed guard keeps the config");
 }

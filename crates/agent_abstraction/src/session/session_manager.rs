@@ -56,7 +56,7 @@ use agent_client_protocol::schema::v1::{ContentBlock, PromptRequest, SessionId, 
 use agent_config::PromptBuilder;
 use anyhow::Result;
 use dashmap::DashMap;
-use shared_types::{ProjectAndAgentInfo, SessionEntry};
+use shared_types::{ModelProviderConfig, ProjectAndAgentInfo, SessionEntry};
 use tracing::{debug, error, info};
 
 use crate::PromptMessage;
@@ -85,10 +85,13 @@ pub(crate) fn require_session_identity(session_id: &SessionId) -> Result<()> {
 /// 会话创建使用的运行配置。模型与其 UUID、agent 启动配置及 Fresh 策略一起传递。
 #[derive(Clone)]
 pub struct SessionCreationConfig {
-    pub model_provider: Option<shared_types::ModelProviderConfig>,
+    pub model_provider: Option<ModelProviderConfig>,
     pub start_config: AgentStartConfig,
     pub service_uuid: Option<String>,
     pub force_new_session: bool,
+    /// 共享 API 配置表。复用/失败路径据此移除**本次请求未使用**的配置；
+    /// 新进程启动成功后由生命周期守卫按代次接管清理（见 create_guard）。
+    pub api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
 }
 
 /// ACP 会话管理器 (SACP 版本)

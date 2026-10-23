@@ -185,6 +185,13 @@ where
         session_id_hint: Option<String>,
         mut config: SessionCreationConfig,
     ) -> Result<(R::Entry, bool)> {
+        // 本次请求的 API 配置默认视为"未使用"：复用/follower/创建失败路径在
+        // drop 时移除，只有 leader 真正以它启动新进程后才解除（dismiss）。
+        let mut unused_config = UnusedRequestConfig {
+            service_uuid: config.service_uuid.clone(),
+            api_key_manager: config.api_key_manager.clone(),
+            dismissed: false,
+        };
         let session_id_hint = shared_types::SessionHint::classify(session_id_hint.as_deref())
             .as_session_id()
             .map(str::to_owned);
@@ -268,7 +275,7 @@ where
                 .acp_session_create_timeout_secs
                 .unwrap_or(shared_types::DEFAULT_ACP_SESSION_CREATE_TIMEOUT_SECS),
         );
-        match role {
+        let outcome = match role {
             SessionCreateRole::Leader(handle) => {
                 self.create_as_leader(handle, &project_id_key, project_path, config)
                     .await
@@ -277,7 +284,15 @@ where
                 self.join_as_follower(handle, &project_id_key, timeout, &config.model_provider)
                     .await
             }
+        };
+        if let Ok((_, created)) = &outcome
+            && *created
+        {
+            // 新进程以本次请求的 service_uuid 启动：配置由该进程的生命周期
+            // 守卫接管，不再按"未使用"清理。
+            unused_config.dismissed = true;
         }
+        outcome
     }
 
     /// Leader 路径：CreateGuard 保证退出时（含 panic）必广播 outcome 并移除条目。
@@ -601,6 +616,34 @@ where
         current.remove();
     }
     Err(CreatedSessionRejection::Retired(rejection))
+}
+
+/// 请求级 API 配置清理守卫（R04）：代理配置绑定实际进程代次——
+/// - 复用存活会话：本轮 service_uuid 未被任何进程使用，drop 时移除；
+/// - follower：同上（共享 leader 建立的进程，用的是 leader 那轮的 uuid）；
+/// - 创建失败：同上；
+/// - 新建成功：`dismissed` 置位，配置由新进程的生命周期守卫在退出时清理。
+pub(crate) struct UnusedRequestConfig {
+    service_uuid: Option<String>,
+    #[allow(dead_code)]
+    api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
+    dismissed: bool,
+}
+
+impl Drop for UnusedRequestConfig {
+    fn drop(&mut self) {
+        if self.dismissed {
+            return;
+        }
+        let (Some(uuid), Some(manager)) = (&self.service_uuid, &self.api_key_manager) else {
+            return;
+        };
+        manager.remove(uuid);
+        tracing::debug!(
+            service_uuid = %uuid,
+            "removed per-request API config unused by any live process"
+        );
+    }
 }
 
 #[cfg(test)]

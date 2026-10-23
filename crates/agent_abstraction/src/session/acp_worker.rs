@@ -221,6 +221,7 @@ where
                         start_config: start_config.clone(),
                         service_uuid: request.service_uuid.clone(),
                         force_new_session: prompt_message.force_new_session,
+                        api_key_manager: request.shared_api_key_manager.clone(),
                     },
                 )
                 .await
