@@ -60,9 +60,9 @@ publish = false
 agent-client-protocol = { version = "2" }
 
 # MCP 协议 - rmcp 官方库
-rmcp = { version = "3.4"}
+rmcp = { version = "3.6"}
 # mcp-proxy convert fallback 参数解析与文件重写。
-mcp-proxy-args = { version = "=0.2.3" }
+mcp-proxy-args = { version = "0.2.10" }
 
 piper = "0.2"
 

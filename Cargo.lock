@@ -7899,12 +7899,13 @@ dependencies = [
 
 [[package]]
 name = "mcp-proxy-args"
-version = "0.2.3"
+version = "0.2.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccd64659d26b2b5f0b53d2b8ab4ebd9a2981d6afef8f6e5bb93f9ab472541d20"
+checksum = "db94af6e461ef68c774ba6834941beef363595001ff33ac7f806d05e1fd5487c"
 dependencies = [
+ "hex",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "tempfile",
  "thiserror 2.0.21",
 ]
