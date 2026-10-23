@@ -149,8 +149,6 @@ class ControlledFixtureContracts(unittest.TestCase):
         self.exercise(True)
 
 
-if __name__=='__main__':unittest.main()
-
 
 class InvalidSidReapOrderTests(unittest.TestCase):
     def records(self):
@@ -173,3 +171,7 @@ class InvalidSidReapOrderTests(unittest.TestCase):
                                   (good,123,'other-trace')]:
             with self.subTest(lines=lines,pid=pid,trace=trace),self.assertRaises(AssertionError):
                 invalid_sid_exit_order('\n'.join(lines),'owned-c',pid,trace)
+
+
+if __name__ == '__main__':
+    unittest.main()

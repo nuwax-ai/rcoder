@@ -213,9 +213,6 @@ class IdleOwnerRecoveryToolTests(unittest.TestCase):
         self.assertNotIn('/home/user/logs/.app-cli-state', TOOL.OWNER_FAULT_SCRIPT)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
 
 class IdleRetirementEvidenceTests(unittest.TestCase):
     def test_exact_structured_confirmation_and_retirement_are_required(self):
@@ -230,3 +227,7 @@ class IdleRetirementEvidenceTests(unittest.TestCase):
                      'idle confirmed (2nd consecutive scan)\nStarting container destruction']:
             self.assertEqual(idle_retirement_evidence(logs,set(),'owned-app','old-cid'),[])
         self.assertEqual(idle_retirement_evidence(confirm+'\n'+retire,{confirm},'owned-app','old-cid'),[])
+
+
+if __name__ == '__main__':
+    unittest.main()
