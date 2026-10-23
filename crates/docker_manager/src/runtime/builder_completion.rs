@@ -13,20 +13,98 @@ pub(crate) fn k8s_error(message: String, error: kube::Error) -> Error {
     Error::K8sError(message)
 }
 
+/// Docker→runtime 错误的集中转换（普通 Agent 创建与 Builder 创建共用）。
+///
+/// 按提交阶段分四类，不整体压平：
+/// - 发写前配置/构建失败（ConfigurationError 等）→ 确定失败；
+/// - Docker 明确 4xx 拒绝（408/499 除外）→ RequestRejected，确定失败；
+/// - 传输断连/超时（请求已发出、无回复）→ ConnectionError/Timeout，
+///   `runtime_mutation_outcome_unknown` 判真（mutation 结果未知）；
+/// - create 已确认 CID 后续阶段失败（ContainerCreationIncomplete）→
+///   保留 CID 与阶段证据，按 source 同样四分；source 无法归类时保守判未知。
 pub(crate) fn docker_error(error: crate::DockerError) -> Error {
-    if matches!(error, crate::DockerError::BuilderCreationCancelled) {
-        return Error::CreationCancelled;
+    use crate::DockerError as D;
+    match error {
+        D::BuilderCreationCancelled => Error::CreationCancelled,
+        D::ConfigurationError(message) => Error::ConfigurationError(message),
+        D::ConnectionError(message) => Error::ConnectionError(message),
+        D::Timeout(message) => Error::Timeout(message),
+        D::ContainerCreationIncomplete {
+            container_id,
+            phase,
+            source,
+        } => incomplete_creation_error(container_id, phase, *source),
+        D::ContainerCreationError(message) => Error::ContainerCreationError(message),
+        D::ContainerStartError(message) => Error::ContainerStartError(message),
+        D::ContainerStopError(message) => Error::ContainerStopError(message),
+        // 以下变体不在创建提交链路上；穷尽列出并语义等价映射，不静默兜底。
+        D::ContainerRemoveError(message) => {
+            Error::ContainerCreationError(format!("container removal failed: {message}"))
+        }
+        D::ImagePullError(message) => Error::ContainerCreationError(message),
+        D::ImageInspectError(message) => Error::ContainerCreationError(message),
+        D::IoError(source) => Error::ContainerCreationError(source.to_string()),
+        D::SerializationError(source) => {
+            Error::ContainerCreationError(format!("serialization failed: {source}"))
+        }
+        D::InvalidTimestamp(message) => Error::ContainerCreationError(message),
+        D::BollardError(source) => bollard_error(source),
     }
-    if let crate::DockerError::BollardError(bollard::errors::Error::DockerResponseServerError {
-        status_code,
-        ..
-    }) = &error
-        && let Some(rejection) =
-            RuntimeRequestRejection::from_status(*status_code, error.to_string())
-    {
-        return Error::RequestRejected(rejection);
+}
+
+/// 已确认 create CID 后的失败：CID 与阶段保留在消息中，结果按 source 分类。
+fn incomplete_creation_error(
+    container_id: String,
+    phase: crate::ContainerCreationPhase,
+    source: crate::DockerError,
+) -> Error {
+    use crate::DockerError as D;
+    let note = format!("container {container_id} created but {phase}");
+    match source {
+        D::ConnectionError(message) => Error::ConnectionError(format!("{note}: {message}")),
+        D::Timeout(message) => Error::Timeout(format!("{note}: {message}")),
+        D::BollardError(inner) => {
+            if let bollard::errors::Error::DockerResponseServerError {
+                status_code,
+                message,
+            } = &inner
+                && let Some(rejection) =
+                    RuntimeRequestRejection::from_status(*status_code, format!("{note}: {message}"))
+            {
+                return Error::RequestRejected(rejection);
+            }
+            // 传输断连或响应不可解码：容器已创建而后续阶段结果未知 → 保守判未知
+            Error::ConnectionError(format!("{note}: {}", bollard_error(inner)))
+        }
+        D::ContainerStartError(message) => Error::ContainerStartError(format!("{note}: {message}")),
+        other => Error::ConnectionError(format!("{note}: {other}")),
     }
-    Error::ContainerCreationError(error.to_string())
+}
+
+fn bollard_error(source: bollard::errors::Error) -> Error {
+    match source {
+        bollard::errors::Error::DockerResponseServerError {
+            status_code,
+            message,
+        } => {
+            if let Some(rejection) =
+                RuntimeRequestRejection::from_status(status_code, message.clone())
+            {
+                Error::RequestRejected(rejection)
+            } else {
+                // 5xx/408/499：响应已收到（服务端失败或不可证明静止），创建未完成，确定失败
+                Error::ContainerCreationError(format!(
+                    "docker server response {status_code}: {message}"
+                ))
+            }
+        }
+        bollard::errors::Error::HttpClientError { err } => {
+            // 请求已发出、HTTP 客户端传输失败（含超时）：mutation 结果未知
+            Error::ConnectionError(format!("docker transport failure: {err}"))
+        }
+        // 响应已收到但不可解码等：无法证明写未发生，保守判未知
+        other => Error::DockerError(other.to_string()),
+    }
 }
 
 pub(crate) async fn finish<T>(
@@ -176,5 +254,93 @@ mod tests {
                 code < 500 && !matches!(code, 408 | 499)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod docker_error_classification_tests {
+    use super::docker_error;
+    use crate::ContainerCreationPhase;
+    use container_runtime_api::ContainerRuntimeError as Error;
+
+    /// R03 反例: create 发出后传输断连/超时属于 mutation 结果未知, 压平成
+    /// ContainerCreationError 会被 runtime_mutation_outcome_unknown 判为确定失败。
+    #[test]
+    fn transport_loss_during_create_keeps_unknown_outcome() {
+        for error in [
+            crate::DockerError::ConnectionError("create reply lost".into()),
+            crate::DockerError::Timeout("create timed out".into()),
+        ] {
+            let runtime_error = docker_error(error);
+            assert!(
+                container_runtime_api::runtime_mutation_outcome_unknown(&runtime_error),
+                "{runtime_error}"
+            );
+        }
+    }
+
+    /// R03 反例: create 已确认 CID 后 start/observe 断连——结果未知, 且 CID
+    /// 证据不得在 to_string 压平中丢失。
+    #[test]
+    fn incomplete_creation_keeps_cid_evidence_and_unknown_outcome() {
+        for (phase, source) in [
+            (
+                ContainerCreationPhase::Start,
+                crate::DockerError::ConnectionError("start reply lost".into()),
+            ),
+            (
+                ContainerCreationPhase::Observe,
+                crate::DockerError::Timeout("observe timed out".into()),
+            ),
+        ] {
+            let runtime_error = docker_error(crate::DockerError::ContainerCreationIncomplete {
+                container_id: "cid-evidence-9".into(),
+                phase,
+                source: Box::new(source),
+            });
+            assert!(
+                container_runtime_api::runtime_mutation_outcome_unknown(&runtime_error),
+                "{runtime_error}"
+            );
+            assert!(
+                runtime_error.to_string().contains("cid-evidence-9"),
+                "confirmed container id must survive conversion: {runtime_error}"
+            );
+        }
+    }
+
+    /// R03: 明确 4xx 拒绝与发写前配置错误保持确定失败, 不得整体判 unknown。
+    #[test]
+    fn definite_rejections_and_pre_write_failures_stay_definite() {
+        for status in [403u16, 409] {
+            let runtime_error = docker_error(crate::DockerError::BollardError(
+                bollard::errors::Error::DockerResponseServerError {
+                    status_code: status,
+                    message: "conflict".into(),
+                },
+            ));
+            assert!(
+                matches!(runtime_error, Error::RequestRejected(_)),
+                "{status}: {runtime_error}"
+            );
+            assert!(!container_runtime_api::runtime_mutation_outcome_unknown(
+                &runtime_error
+            ));
+        }
+        let runtime_error = docker_error(crate::DockerError::ConfigurationError(
+            "invalid mount config".into(),
+        ));
+        assert!(matches!(runtime_error, Error::ConfigurationError(_)));
+        assert!(!container_runtime_api::runtime_mutation_outcome_unknown(
+            &runtime_error
+        ));
+        // start 阶段已被 starter 分类的确定失败: 保持确定
+        let runtime_error = docker_error(crate::DockerError::ContainerStartError(
+            "health check failed".into(),
+        ));
+        assert!(matches!(runtime_error, Error::ContainerStartError(_)));
+        assert!(!container_runtime_api::runtime_mutation_outcome_unknown(
+            &runtime_error
+        ));
     }
 }

@@ -785,7 +785,9 @@ impl AgentContainerRuntime for DockerRuntime {
         self.inner
             .start_agent_container(params)
             .await
-            .map_err(|e| ContainerRuntimeError::ContainerCreationError(e.to_string()))
+            // 集中转换保留提交阶段（发写前失败/明确拒绝/传输未知/已确认 CID），
+            // 不再整体压平成 ContainerCreationError
+            .map_err(crate::runtime::builder_completion::docker_error)
     }
 
     async fn get_container_info(
