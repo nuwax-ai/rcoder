@@ -291,6 +291,7 @@ pub use model::{
     VncStatusResponse,
     current_otel_trace_id,
     error_status_from_code,
+    is_prompt_terminal_sub_type,
     redact_error_text,
     sanitize_error_text,
 };

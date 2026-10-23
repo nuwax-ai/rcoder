@@ -235,6 +235,20 @@ fn terminal_classification_semantics() {
         "agent_message_chunk"
     ));
 }
+
+/// R06 反例: 真实 notifier 会产生 max_tokens/max_turn_requests/refusal 终态,
+/// 终端判定不得只认 end_turn/error——否则真实 Prompt 已结束、状态 Idle,
+/// SSE 流仍保持到 NoActiveTask 兜底, 且末事件被替换成合成 end_turn。
+/// 未知停止原因("unknown")不得伪造成终态。
+#[test]
+fn quota_and_refusal_stop_reasons_are_terminal() {
+    for sub in ["max_tokens", "max_turn_requests", "refusal"] {
+        assert!(is_turn_terminal("SessionPromptEnd", sub), "{sub}");
+        assert!(is_stream_closing("SessionPromptEnd", sub), "{sub}");
+    }
+    assert!(!is_turn_terminal("SessionPromptEnd", "unknown"));
+    assert!(!is_stream_closing("SessionPromptEnd", "unknown"));
+}
 #[tokio::test]
 async fn delayed_retirement_closes_only_captured_connections_with_reused_sid_and_address() {
     let registry = Arc::new(SessionStreamRegistry::new());

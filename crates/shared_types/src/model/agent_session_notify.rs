@@ -229,6 +229,19 @@ fn stop_reason_to_string(reason: &StopReason) -> String {
     }
 }
 
+/// 已知 Prompt 终态 sub_type：本轮任务真实结束（正常完成、错误，或限额/拒绝终止）。
+/// 这是 runner gRPC 订阅与 engine SSE 关流共用的单一契约。
+///
+/// `cancelled` 有意不在其中——它是"用户连发消息自动取消当前任务"的常态事件，
+/// 流需保持供下一轮实时投递；`unknown`（未来新增停止原因）同样不据此关流，
+/// 由既有空闲兜底收流，且不得伪造成 end_turn。
+pub fn is_prompt_terminal_sub_type(sub_type: &str) -> bool {
+    matches!(
+        sub_type,
+        "end_turn" | "error" | "max_tokens" | "max_turn_requests" | "refusal"
+    )
+}
+
 /// 获取 StopReason 的描述
 fn stop_reason_to_description(reason: &StopReason) -> &'static str {
     match reason {
@@ -310,6 +323,40 @@ fn session_update_to_parts(update: SessionUpdate) -> (String, serde_json::Value)
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{ContentChunk, SessionInfoUpdate, UsageUpdate};
+
+    /// R06: 已知 Prompt 终态分类契约——与 stop_reason_to_string 产生的 wire
+    /// sub_type 一致; cancelled/unknown 不属于终态。
+    #[test]
+    fn prompt_terminal_sub_types_match_wire_names() {
+        for reason in [
+            StopReason::EndTurn,
+            StopReason::MaxTokens,
+            StopReason::MaxTurnRequests,
+            StopReason::Refusal,
+        ] {
+            let unified = SessionNotify::SessionPromptEnd(SessionPromptEnd {
+                session_id: "s".to_string(),
+                stop_reason: reason,
+                error_message: None,
+                request_id: None,
+            })
+            .to_unified_message();
+            assert!(matches!(
+                unified.message_type,
+                SessionMessageType::SessionPromptEnd
+            ));
+            assert!(
+                is_prompt_terminal_sub_type(&unified.sub_type),
+                "{} must be terminal",
+                unified.sub_type
+            );
+        }
+        for non_terminal in ["cancelled", "unknown", "prompt_start", "ping"] {
+            assert!(!is_prompt_terminal_sub_type(non_terminal), "{non_terminal}");
+        }
+        // 错误终态(notifier 的 error 分支)
+        assert!(is_prompt_terminal_sub_type("error"));
+    }
 
     #[test]
     fn test_session_prompt_start_to_unified() {

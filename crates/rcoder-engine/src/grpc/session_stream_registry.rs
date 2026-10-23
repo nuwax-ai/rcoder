@@ -321,18 +321,20 @@ impl Default for SessionStreamRegistry {
     }
 }
 
-/// turn 边界终端：本轮任务真实结束（正常完成或错误终止）。
+/// turn 边界终端：本轮任务真实结束（共享契约见
+/// `shared_types::is_prompt_terminal_sub_type`）。
 /// `cancelled` 不算——它是"用户连发消息自动取消当前任务"的常态事件，agent 随后
 /// 继续执行新任务；此刻归还首连资格会破坏下一轮的 replay 语义。
 pub(crate) fn is_turn_terminal(message_type: &str, sub_type: &str) -> bool {
-    message_type == "SessionPromptEnd" && matches!(sub_type, "end_turn" | "error")
+    message_type == "SessionPromptEnd" && shared_types::is_prompt_terminal_sub_type(sub_type)
 }
 
-/// SSE 流关闭信号：turn 终态（end_turn/error）+ rcoder 内部合成的 `stream_ended`。
+/// SSE 流关闭信号：turn 终态（共享契约）+ rcoder 内部合成的 `stream_ended`。
 /// cancelled 不关流——它是"用户连发消息自动取消"的常态事件，流保持供下一轮
 /// 实时投递（与 agent_runner 侧订阅判定对齐）。
 pub(crate) fn is_stream_closing(message_type: &str, sub_type: &str) -> bool {
-    message_type == "SessionPromptEnd" && matches!(sub_type, "end_turn" | "error" | "stream_ended")
+    message_type == "SessionPromptEnd"
+        && (shared_types::is_prompt_terminal_sub_type(sub_type) || sub_type == "stream_ended")
 }
 
 pub(crate) fn maybe_update_activity(

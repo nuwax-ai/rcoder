@@ -218,18 +218,16 @@ async fn run_stream_loop(
                         // 重置空闲超时计时器
                         last_message_time = tokio::time::Instant::now();
 
-                        // 终端关流只认 end_turn/error：cancelled 仅是本轮中断，
-                        // agent 随后可能继续执行（切模型场景：迟到的取消余波
-                        // PromptEnd(Cancelled) 曾把活跃订阅误杀，事件全部退化为
-                        // ring buffer 积压，客户端空流）。cancelled 后由下一个
-                        // end_turn 或空闲超时自然收流。
+                        // 终端关流判定用共享契约（shared_types）：end_turn/error/
+                        // max_tokens/max_turn_requests/refusal 都是本轮真实终态;
+                        // cancelled 仅是本轮中断，agent 随后可能继续执行（切模型
+                        // 场景：迟到的取消余波 PromptEnd(Cancelled) 曾把活跃订阅
+                        // 误杀，事件全部退化为 ring buffer 积压，客户端空流）。
+                        // cancelled 后由下一个终态或空闲超时自然收流。
                         let is_terminal_message = matches!(
                             unified_message.message_type,
                             crate::model::SessionMessageType::SessionPromptEnd
-                        ) && matches!(
-                            unified_message.sub_type.as_str(),
-                            "end_turn" | "error"
-                        );
+                        ) && shared_types::is_prompt_terminal_sub_type(&unified_message.sub_type);
 
                         let event = unified_message_to_progress_event(seq, &unified_message);
                         debug!(
@@ -492,6 +490,120 @@ mod tests {
         let event = rx.recv().await.unwrap().unwrap();
         assert_eq!(event.sub_type, "cancelled");
         assert_eq!(event.request_id.as_deref(), Some("captured-channel-rid"));
+    }
+
+    /// R06 反例: 真实 notifier 会产生 max_tokens/max_turn_requests/refusal 终态;
+    /// 只认 end_turn/error 时, 真实 Prompt 已结束流仍悬挂, 通道关闭后还会合成
+    /// 第二个 end_turn。修复后应及时以 TerminalMessage 收流、末事件保持原 sub_type。
+    #[tokio::test]
+    async fn quota_and_refusal_stop_reasons_close_the_subscription_stream() {
+        use agent_client_protocol::schema::v1::StopReason;
+
+        fn prompt_end(reason: StopReason) -> shared_types::UnifiedSessionMessage {
+            shared_types::SessionNotify::SessionPromptEnd(shared_types::SessionPromptEnd {
+                session_id: "ses-r06".into(),
+                stop_reason: reason,
+                error_message: None,
+                request_id: Some("rid-r06".into()),
+            })
+            .to_unified_message()
+        }
+
+        for (reason, expected_sub) in [
+            (StopReason::MaxTokens, "max_tokens"),
+            (StopReason::MaxTurnRequests, "max_turn_requests"),
+            (StopReason::Refusal, "refusal"),
+            (StopReason::EndTurn, "end_turn"),
+        ] {
+            let (msg_tx, msg_rx) = mpsc::channel(4);
+            let (ev_tx, mut ev_rx) = mpsc::channel(32);
+            let end = prompt_end(reason);
+            msg_tx.send((7, end)).await.unwrap();
+            drop(msg_tx);
+            let outcome = run_stream_loop(
+                "ses-r06",
+                msg_rx,
+                tokio_util::sync::CancellationToken::new(),
+                None,
+                &ev_tx,
+                "en-US",
+            )
+            .await;
+            drop(ev_tx); // 排空前释放发送端, recv 才会终止
+            assert_eq!(outcome, ExitReason::TerminalMessage, "{expected_sub}");
+            let mut events = Vec::new();
+            while let Some(ev) = ev_rx.recv().await {
+                events.push(ev.unwrap());
+            }
+            assert_eq!(
+                events.len(),
+                1,
+                "{expected_sub}: no synthetic second terminal may follow"
+            );
+            assert_eq!(events[0].seq, 7, "{expected_sub}");
+            assert_eq!(events[0].message_type, "SessionPromptEnd", "{expected_sub}");
+            assert_eq!(events[0].sub_type, expected_sub);
+        }
+    }
+
+    /// R06 边界: cancelled 不关流——cancelled 后新的 PromptStart 仍能到达,
+    /// 由后续 end_turn 正常收流。
+    #[tokio::test]
+    async fn cancelled_keeps_stream_open_for_next_prompt_start() {
+        use agent_client_protocol::schema::v1::StopReason;
+
+        let sid = "ses-r06-cancelled";
+        let (msg_tx, msg_rx) = mpsc::channel(8);
+        let (ev_tx, mut ev_rx) = mpsc::channel(32);
+        let messages = [
+            shared_types::SessionNotify::SessionPromptStart(shared_types::SessionPromptStart {
+                session_id: sid.into(),
+                request_id: Some("r1".into()),
+            })
+            .to_unified_message(),
+            shared_types::SessionNotify::SessionPromptEnd(shared_types::SessionPromptEnd {
+                session_id: sid.into(),
+                stop_reason: StopReason::Cancelled,
+                error_message: None,
+                request_id: Some("r1".into()),
+            })
+            .to_unified_message(),
+            shared_types::SessionNotify::SessionPromptStart(shared_types::SessionPromptStart {
+                session_id: sid.into(),
+                request_id: Some("r2".into()),
+            })
+            .to_unified_message(),
+            shared_types::SessionNotify::SessionPromptEnd(shared_types::SessionPromptEnd {
+                session_id: sid.into(),
+                stop_reason: StopReason::EndTurn,
+                error_message: None,
+                request_id: Some("r2".into()),
+            })
+            .to_unified_message(),
+        ];
+        for (seq, message) in messages.into_iter().enumerate() {
+            msg_tx.send((seq as u64 + 1, message)).await.unwrap();
+        }
+        drop(msg_tx);
+        let outcome = run_stream_loop(
+            sid,
+            msg_rx,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            &ev_tx,
+            "en-US",
+        )
+        .await;
+        drop(ev_tx); // 排空前释放发送端, recv 才会终止
+        assert_eq!(outcome, ExitReason::TerminalMessage);
+        let mut subs = Vec::new();
+        while let Some(ev) = ev_rx.recv().await {
+            subs.push(ev.unwrap().sub_type);
+        }
+        assert_eq!(
+            subs,
+            vec!["prompt_start", "cancelled", "prompt_start", "end_turn"]
+        );
     }
     use std::sync::Arc;
 
