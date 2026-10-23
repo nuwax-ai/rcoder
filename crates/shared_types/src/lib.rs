@@ -377,7 +377,7 @@ pub use userapp::compute_control::*;
 pub use userapp::compute_recovery::*;
 pub use userapp::recovery_scan::UserAppRecoveryScanPage;
 
-pub use userapp::discovery::UserAppDiscoveredIdentity;
+pub use userapp::discovery::{UserAppDiscoveredIdentity, UserAppRetainedStorage};
 
 pub use app_resource_deletion::UserAppComputeStartTarget;
 

@@ -18,7 +18,7 @@ use super::*;
     tag = "pod",
     operation_id = "pod_restart",
     summary = "重启计算资源并保留数据",
-    description = "UserApp dev/prod requests use app_id and app_stage, with optional lifecycle_id and request_id. Normally returns HTTP 202 with operation_id and status_url. In Kubernetes mode the restarted dev StatefulSet and prod Deployment use the current configured platform image while retaining the workspace PVC. Docker dev builders removed by AutoRemove after a completed Stop are recreated on the same mounts and return HTTP 200. A retry of the same durable intent in RecoveryRequired resumes verification under the original operation_id; an explicitly different request_id remains a conflict. Stop has priority over Restart; new Start/Restart during Stop is rejected without queuing. Ordinary business slots do not block admission to the durable compute coordinator. Unknown writes remain visible as recovery_required. Ordinary agent restart behavior is unchanged."
+    description = "UserApp dev/prod requests use app_id and app_stage, with optional lifecycle_id and request_id. Normally returns HTTP 202 with operation_id and status_url. In Kubernetes mode the restarted dev StatefulSet and prod Deployment use the current configured platform image while retaining the workspace PVC. Docker dev builders removed by AutoRemove after a completed Stop are recreated on the same mounts and return HTTP 200. With default recovery enabled, missing K8s dev/prod workloads with verified retained PVCs are reconstructed through the existing ensure/deployment coordinator and return HTTP 200 with RestartPodResponse and the admitted operation identity when available. A retry of the same durable intent in RecoveryRequired resumes verification under the original operation_id; an explicitly different request_id remains a conflict. Stop has priority over Restart; new Start/Restart during Stop is rejected without queuing. Ordinary business slots do not block admission to the durable compute coordinator. Unknown writes remain visible as recovery_required. Ordinary agent restart behavior is unchanged."
 )]
 #[instrument(skip(state), fields(user_id = %request.user_id, project_id = %request.project_id))]
 pub async fn pod_restart(
@@ -46,17 +46,39 @@ pub async fn pod_restart(
             ));
         }
     };
-    if scope == shared_types::UserAppOperationScope::Dev
-        && matches!(
-            crate::userapp_builder::inspect_builder_compute(&state, &app_id)
+    use crate::userapp_builder::BuilderComputeState;
+    let recreate_dev = match scope {
+        shared_types::UserAppOperationScope::Dev => {
+            match crate::userapp_builder::inspect_builder_compute(&state, &app_id)
                 .await
-                .map_err(|error| crate::userapp_builder::control_error(&error))?,
-            crate::userapp_builder::BuilderComputeState::StoppedRemoved
-        )
-    {
-        // Docker builders are removed by AutoRemove after Stop. There is
-        // no physical UID left to restart; explicit control recreates the
-        // container on the same workspace after the completed Stop fence.
+                .map_err(|error| crate::userapp_builder::control_error(&error))?
+            {
+                BuilderComputeState::StoppedRemoved => true,
+                BuilderComputeState::Missing => {
+                    state.config.userapp_storage.default_recovery_enabled
+                        && state
+                            .runtime()
+                            .discover_retained_app_storage(
+                                &app_id,
+                                shared_types::UserAppOperationScope::Dev,
+                            )
+                            .await
+                            .map_err(|error| crate::userapp_builder::control_error(&error.into()))?
+                            .is_some()
+                }
+                BuilderComputeState::Running(_) | BuilderComputeState::StoppedRetained => false,
+            }
+        }
+        shared_types::UserAppOperationScope::Prod => false,
+        shared_types::UserAppOperationScope::Application => {
+            return Err(AppError::bad_request(
+                "Compute restart requires dev or prod",
+            ));
+        }
+    };
+    if recreate_dev {
+        // A completed Docker Stop or an enabled retained-PVC K8s recovery has
+        // no compute UID to restart. The existing ensure owns reconstruction.
         if let Some(expected) = request.lifecycle_id.as_deref() {
             let current = state
                 .userapp_store
@@ -86,6 +108,48 @@ pub async fn pod_restart(
             message: "UserApp dev 计算容器已使用原工作区重建".into(),
         })
         .into_response());
+    }
+    if scope == shared_types::UserAppOperationScope::Prod
+        && state.config.userapp_storage.default_recovery_enabled
+        && state
+            .runtime()
+            .discover_retained_app_storage(&app_id, scope)
+            .await
+            .map_err(|error| crate::userapp_builder::control_error(&error.into()))?
+            .is_some()
+        && state
+            .runtime()
+            .get_deployment_status(&app_id)
+            .await
+            .map_err(|error| crate::userapp_builder::control_error(&error.into()))?
+            .is_none()
+    {
+        let result = state
+            .app_service
+            .restart_app_enhanced(
+                &app_id,
+                app_manager::models::StartAppRequest {
+                    lifecycle_id: request.lifecycle_id,
+                    request_id: request.request_id,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(AppError::from)?;
+        // Preserve the existing 200 response shape and original operation identity.
+        let mut response = HttpResult::success(RestartPodResponse {
+            was_existing: false,
+            restarted: true,
+            container_info: PodContainerInfo {
+                container_id: app_id,
+                status: result.runtime.phase,
+            },
+            message: "UserApp production compute restored from its retained workspace".into(),
+        });
+        if let Some(operation_id) = result.operation_id {
+            response = response.with_operation_id(operation_id);
+        }
+        return Ok(response.into_response());
     }
     let operation = crate::userapp_builder::compute_control::submit(
         &state,

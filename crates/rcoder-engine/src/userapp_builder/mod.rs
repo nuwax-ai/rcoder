@@ -196,6 +196,7 @@ async fn ensure_builder_target_until(
         Some(identity) => identity,
         None => state.userapp_store.ensure_identity(app_id).await?,
     };
+    creation::reconcile_default_recovery_before_ensure(state, &identity).await?;
     state
         .app_service
         .verify_recovered_storage(app_id, shared_types::UserAppOperationScope::Dev)
@@ -294,6 +295,7 @@ async fn ensure_userapp_builder_probed_until(
         Some(identity) => identity,
         None => state.userapp_store.ensure_identity(app_id).await?,
     };
+    creation::reconcile_default_recovery_before_ensure(state, &identity).await?;
     state
         .app_service
         .verify_recovered_storage(app_id, shared_types::UserAppOperationScope::Dev)
@@ -849,6 +851,7 @@ async fn create_builder_inner(
 
     params.resource_binding = bound_target.resource_binding;
     params.builder_startup_mode = startup_mode;
+    params.retained_storage = creation::captured_storage(state, &execution_context).await?;
 
     let cancelled = params.creation_cancelled.clone();
     let creation = state.runtime().create_container(params);

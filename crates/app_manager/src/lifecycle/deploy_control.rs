@@ -12,12 +12,15 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub(super) enum DeploymentPreparation {
     Requested,
-    RetainedRuntime(Arc<std::sync::OnceLock<String>>),
+    RetainedRuntime(Arc<std::sync::OnceLock<String>>, tokio::time::Instant),
 }
 
 impl DeploymentPreparation {
     fn is_retained(&self) -> bool {
-        matches!(self, Self::RetainedRuntime(_))
+        match self {
+            Self::Requested => false,
+            Self::RetainedRuntime(..) => true,
+        }
     }
 }
 
@@ -132,6 +135,7 @@ impl AppService {
         app_id: &str,
         lifecycle_id: &str,
         operation_id: Arc<std::sync::OnceLock<String>>,
+        deadline: tokio::time::Instant,
     ) -> AppResult<StartAppResult> {
         self.deploy_controlled_prepared(
             app_id,
@@ -140,7 +144,7 @@ impl AppService {
                 ..Default::default()
             },
             false,
-            DeploymentPreparation::RetainedRuntime(operation_id),
+            DeploymentPreparation::RetainedRuntime(operation_id, deadline),
         )
         .await
     }
@@ -207,16 +211,24 @@ impl AppService {
             return decode_stored_deploy_result(&previous);
         }
         loop {
-            let guard = Arc::new(if let Some(deadline) = wait_deadline {
-                self.acquire_restart_admission_guard(
-                    app_id,
-                    captured_lifecycle.as_deref(),
-                    deadline,
-                )
-                .await?
-            } else {
-                self.try_acquire_process_release_lock(app_id).await?
-            });
+            let guard = Arc::new(
+                if let DeploymentPreparation::RetainedRuntime(_, deadline) = &preparation {
+                    let lifecycle = captured_lifecycle.as_deref().ok_or_else(|| {
+                        AppOperationError::NotFound("Serving recovery identity disappeared".into())
+                    })?;
+                    self.acquire_serving_wake_guard(app_id, lifecycle, *deadline)
+                        .await?
+                } else if let Some(deadline) = wait_deadline {
+                    self.acquire_restart_admission_guard(
+                        app_id,
+                        captured_lifecycle.as_deref(),
+                        deadline,
+                    )
+                    .await?
+                } else {
+                    self.try_acquire_process_release_lock(app_id).await?
+                },
+            );
             let result = self
                 .deploy_admitted(
                     app_id,
@@ -353,7 +365,7 @@ impl AppService {
             Some(identity) => identity,
             None => self.metadata.store.ensure_identity(app_id).await?,
         };
-        if let DeploymentPreparation::RetainedRuntime(observer) = &preparation {
+        if let DeploymentPreparation::RetainedRuntime(observer, _) = &preparation {
             drop(observer.set(operation_id.clone()));
         }
         let mut operation = OwnedOperation::admit_with_input(
@@ -373,6 +385,7 @@ impl AppService {
                 command: Some(UserAppControlCommand::Deploy {
                     restart,
                     input_digest: encoded.digest(),
+                    serving_recovery: preparation.is_retained(),
                 }),
                 app_id: app_id.into(),
                 lifecycle_id: Some(identity.lifecycle_id),
@@ -458,7 +471,13 @@ impl AppService {
             .url
             .as_deref()
             .is_some_and(|url| !url.trim().is_empty());
-        if preparation.is_retained() {
+        if preparation.is_retained()
+            || (restart
+                && !has_url
+                && previous.is_none()
+                && self.config.default_recovery_enabled
+                && self.config.access_mode == crate::config::AppAccessMode::Kubernetes)
+        {
             let identity = self
                 .metadata
                 .store
@@ -473,15 +492,87 @@ impl AppService {
                 )));
             }
             let params = if previous.is_none() {
-                let mut params = self.runtime
+                let retained = self
+                    .runtime
                     .retained_app_runtime_configuration(app_id, &identity.lifecycle_id)
                     .await
-                    .map_err(|error| map_runtime_error("Read retained application runtime configuration", error))?
-                    .ok_or_else(|| AppOperationError::InvalidState(
-                        "The application has no retained runtime configuration; its existing deployment must restore the configuration before traffic can recreate compute".into()
-                    ))?;
-                params.recycle_enabled = identity.runtime_policy.recycle_enabled;
-                params.idle_timeout_seconds = identity.runtime_policy.idle_timeout_seconds;
+                    .map_err(|error| {
+                        map_runtime_error("Read retained application runtime configuration", error)
+                    })?;
+                let mut params = match retained {
+                    Some(params) => params,
+                    None if self.config.default_recovery_enabled
+                        && self.config.access_mode == crate::config::AppAccessMode::Kubernetes =>
+                    {
+                        let storage = self
+                            .runtime
+                            .discover_retained_app_storage(
+                                app_id,
+                                shared_types::UserAppOperationScope::Prod,
+                            )
+                            .await
+                            .map_err(|error| {
+                                map_runtime_error("Inspect retained production workspace", error)
+                            })?
+                            .ok_or_else(|| {
+                                AppOperationError::NotFound(
+                                    "No retained production workspace is available".into(),
+                                )
+                            })?;
+                        let saved = self
+                            .metadata
+                            .store
+                            .read_retained_runtime_input(app_id, &identity.lifecycle_id)
+                            .await?;
+                        let previous_params = saved.as_ref().and_then(|input| {
+                            #[derive(serde::Deserialize)]
+                            struct Projection { params: container_runtime_api::ContainerCreateParams }
+                            match serde_json::from_str::<Projection>(input.encoded()) {
+                                Ok(value) if value.params.service_type == shared_types::ServiceType::Userapp
+                                    && value.params.execution_context.is_none() && value.params.mutation_target.is_none() => Some(value.params),
+                                Ok(_) | Err(_) => {tracing::warn!(app_id,"Stored runtime parameters cannot be reused; defaults and retained workspace remain available");None}
+                            }
+                        });
+                        let env = request
+                            .env
+                            .clone()
+                            .or_else(|| previous_params.as_ref().and_then(|p| p.env.clone()))
+                            .map(crate::release_flow::identity::business_env);
+                        let mut create = self.empty_runtime_request(
+                            app_id,
+                            app_id,
+                            env,
+                            Some(&identity.lifecycle_id),
+                        )?;
+                        // The volume journal owns the deployment generation, not this new Pod.
+                        if let Some(env) = &mut create.env {
+                            env.remove(shared_types::APP_DEPLOY_GENERATION_ID);
+                            env.insert("APP_CLI_RECOVER_RETAINED".into(), operation_id.into());
+                        }
+                        let mut params = self.build_container_params(app_id, &create).await?;
+                        if let Some(saved) = previous_params {
+                            params.secrets = saved.secrets;
+                            params.app_resources = saved.app_resources;
+                            params.resource_limits = saved.resource_limits;
+                            params.tenant_id = identity.tenant_id.clone().or(saved.tenant_id);
+                            params.space_id = identity.space_id.clone().or(saved.space_id);
+                        }
+                        params.retained_storage = Some(storage);
+                        params
+                    }
+                    None => {
+                        return Err(AppOperationError::InvalidState(
+                            "The application has no retained runtime configuration".into(),
+                        ));
+                    }
+                };
+                params.recycle_enabled = request
+                    .idle_timeout_seconds
+                    .map(|value| value > 0)
+                    .or(identity.runtime_policy.recycle_enabled);
+                params.idle_timeout_seconds = request
+                    .idle_timeout_seconds
+                    .or(identity.runtime_policy.idle_timeout_seconds);
                 Some(params)
             } else {
                 // Another admitted control may have restored compute while the
@@ -528,6 +619,7 @@ impl AppService {
                 Default::default()
             };
             if has_url {
+                env.remove("APP_CLI_RECOVER_RETAINED");
                 crate::release_flow::identity::strip_release_identity(&mut env);
                 crate::release_flow::identity::ensure_no_reserved_env(&env)?;
                 env.insert(
@@ -904,3 +996,85 @@ impl AppService {
 #[cfg(test)]
 #[path = "deploy_control/terminal_stop_tests.rs"]
 mod terminal_stop_tests;
+
+#[cfg(test)]
+mod default_recovery_tests {
+    use super::*;
+    use crate::test_support::{MockRuntime, restart_image_env, test_service};
+    #[tokio::test]
+    async fn retained_prod_defaults_capture_original_volume_and_do_not_deploy_source() {
+        restart_image_env();
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MockRuntime::default());
+        let mut service = test_service(root.path(), runtime.clone()).await;
+        service.config.access_mode = crate::config::AppAccessMode::Kubernetes;
+        let app = service
+            .metadata
+            .store
+            .ensure_identity("retainedprod")
+            .await
+            .unwrap();
+        let storage = shared_types::UserAppRetainedStorage {
+            services: Vec::new(),
+            app_id: app.app_id.clone(),
+            scope: shared_types::UserAppOperationScope::Prod,
+            lifecycle_id: Some(app.lifecycle_id.clone()),
+            volumes: vec![shared_types::AppResourceIdentity {
+                kind: shared_types::AppResourceKind::PersistentVolumeClaim,
+                name: "prod-pvc".into(),
+                uid: "original-volume".into(),
+                resource_version: Some("1".into()),
+            }],
+        };
+        runtime
+            .retained_storage
+            .insert(app.app_id.clone(), storage.clone());
+        let request = StartAppRequest {
+            env: Some(std::collections::HashMap::from([(
+                "BUSINESS_SETTING".into(),
+                "current-request".into(),
+            )])),
+            idle_timeout_seconds: Some(731),
+            lifecycle_id: Some(app.lifecycle_id),
+            ..Default::default()
+        };
+        let input = service
+            .prepare_deploy_input(
+                &app.app_id,
+                request.clone(),
+                false,
+                DeploymentPreparation::RetainedRuntime(
+                    Arc::new(Default::default()),
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                ),
+                "recover-prod",
+            )
+            .await
+            .unwrap();
+        let params = input.params.unwrap();
+        assert_eq!(params.retained_storage, Some(storage));
+        assert_eq!(params.idle_timeout_seconds, Some(731));
+        assert_eq!(params.recycle_enabled, Some(true));
+        let env = params.env.unwrap();
+        assert_eq!(env["BUSINESS_SETTING"], "current-request");
+        assert!(!env.contains_key("APP_DEPLOY_URL"));
+        assert!(!env.contains_key(shared_types::APP_DEPLOY_GENERATION_ID));
+        assert_eq!(env["APP_CLI_RECOVER_RETAINED"], "recover-prod");
+        service.config.default_recovery_enabled = false;
+        assert!(
+            service
+                .prepare_deploy_input(
+                    &app.app_id,
+                    request,
+                    false,
+                    DeploymentPreparation::RetainedRuntime(
+                        Arc::new(Default::default()),
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(30)
+                    ),
+                    "disabled"
+                )
+                .await
+                .is_err()
+        );
+    }
+}

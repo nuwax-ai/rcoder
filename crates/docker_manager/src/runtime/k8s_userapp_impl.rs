@@ -211,6 +211,14 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
             .await?;
         Ok(())
     }
+    async fn discover_retained_app_storage(
+        &self,
+        app_id: &str,
+        scope: shared_types::UserAppOperationScope,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppRetainedStorage>> {
+        self.missing_compute_storage_inventory(app_id, scope).await
+    }
+
     async fn discover_application_identity(
         &self,
         app_id: &str,

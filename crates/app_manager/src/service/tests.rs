@@ -4286,6 +4286,7 @@ async fn pending_composite_deployment_recovers_original_control_and_completion()
         command: Some(shared_types::UserAppControlCommand::Deploy {
             restart: false,
             input_digest: input.digest(),
+            serving_recovery: false,
         }),
         app_id: identity.app_id,
         lifecycle_id: Some(identity.lifecycle_id),
@@ -6336,4 +6337,157 @@ mod retained_traffic_runtime_tests {
             deleted
         );
     }
+}
+
+#[tokio::test]
+async fn default_recovery_discovers_identity_only_when_enabled_and_managed_storage_exists() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(MockRuntime::default());
+    let mut service = test_service(root.path(), runtime.clone()).await;
+    service.config.access_mode = AppAccessMode::Kubernetes;
+    runtime.retained_storage.insert(
+        "legacy51".into(),
+        shared_types::UserAppRetainedStorage {
+            services: Vec::new(),
+            app_id: "legacy51".into(),
+            scope: shared_types::UserAppOperationScope::Dev,
+            lifecycle_id: None,
+            volumes: vec![shared_types::AppResourceIdentity {
+                kind: shared_types::AppResourceKind::PersistentVolumeClaim,
+                name: "rcoder-app-builder-legacy51-workspace".into(),
+                uid: "legacy-pvc".into(),
+                resource_version: Some("1".into()),
+            }],
+        },
+    );
+    service.config.default_recovery_enabled = false;
+    assert!(
+        service
+            .discover_missing_identity("legacy51")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        service
+            .metadata
+            .store
+            .get_application("legacy51")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    service.config.default_recovery_enabled = true;
+    let restored = service
+        .discover_missing_identity("legacy51")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.app_id, "legacy51");
+    assert_eq!(restored.state, shared_types::UserAppLifecycleState::Active);
+    assert_eq!(
+        service
+            .discover_missing_identity("legacy51")
+            .await
+            .unwrap()
+            .unwrap()
+            .lifecycle_id,
+        restored.lifecycle_id
+    );
+    assert!(
+        service
+            .discover_missing_identity("unknown51")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        runtime.create_calls.load(Ordering::SeqCst),
+        0,
+        "discovery does not create compute"
+    );
+}
+
+#[tokio::test]
+async fn default_recovery_two_replicas_wait_for_one_original_production_creation() {
+    use crate::test_support::test_service_with_store;
+    use shared_types::UserAppLifecycleStore as _;
+    restart_image_env();
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let first_root = tempfile::tempdir().unwrap();
+        let second_root = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MockRuntime::default());
+        runtime
+            .wake_mutex_observation_enabled
+            .store(true, Ordering::SeqCst);
+        let (mut first, store) = test_service_with_store(first_root.path(), runtime.clone()).await;
+        let mut second = test_service(second_root.path(), runtime.clone()).await;
+        first.config.access_mode = AppAccessMode::Kubernetes;
+        second.config.access_mode = AppAccessMode::Kubernetes;
+        second.metadata.store = store.clone();
+        let app = store.ensure_identity("concurrent-recovery").await.unwrap();
+        runtime.retained_storage.insert(
+            app.app_id.clone(),
+            shared_types::UserAppRetainedStorage {
+                app_id: app.app_id.clone(),
+                scope: shared_types::UserAppOperationScope::Prod,
+                lifecycle_id: Some(app.lifecycle_id),
+                services: vec![],
+                volumes: vec![shared_types::AppResourceIdentity {
+                    kind: shared_types::AppResourceKind::PersistentVolumeClaim,
+                    name: "original-pvc".into(),
+                    uid: "original-volume".into(),
+                    resource_version: None,
+                }],
+            },
+        );
+        let started = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        *runtime.create_started.lock().unwrap() = Some(started.clone());
+        *runtime.create_release.lock().unwrap() = Some(release.clone());
+        let first = Arc::new(first);
+        let second = Arc::new(second);
+        let worker = tokio::spawn(async move {
+            first
+                .wake_app_for_serving("concurrent-recovery", std::time::Duration::from_secs(12))
+                .await
+        });
+        started.wait().await;
+        let follower = tokio::spawn(async move {
+            second
+                .wake_app_for_serving("concurrent-recovery", std::time::Duration::from_secs(12))
+                .await
+        });
+        runtime.wake_mutex_wait_entered.notified().await;
+        assert!(
+            !follower.is_finished(),
+            "another replica must wait for the same recovery instead of returning a conflict"
+        );
+        release.wait().await;
+        assert!(matches!(
+            worker.await.unwrap().unwrap(),
+            shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning
+        ));
+        assert!(matches!(
+            follower.await.unwrap().unwrap(),
+            shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning
+        ));
+        assert_eq!(
+            runtime.create_calls.load(Ordering::SeqCst),
+            1,
+            "one physical runtime is created"
+        );
+        assert!(
+            store
+                .get_application("concurrent-recovery")
+                .await
+                .unwrap()
+                .unwrap()
+                .active_operations
+                .prod
+                .is_none()
+        );
+    })
+    .await
+    .unwrap();
 }

@@ -45,6 +45,7 @@ pub(crate) const PLATFORM_ENV_KEYS: &[&str] = &[
     "APP_RELEASE_ID",
     "APP_DEPLOY_SHA256",
     "APP_CLI_DEPLOY_TOKEN",
+    "APP_CLI_RECOVER_RETAINED",
     shared_types::APP_DEPLOY_OPERATION_ID,
     shared_types::APP_DEPLOY_GENERATION_ID,
     shared_types::APP_RUNTIME_CONFIGURATION_VERSION,

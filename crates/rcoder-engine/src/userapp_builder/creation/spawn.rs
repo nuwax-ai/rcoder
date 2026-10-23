@@ -59,6 +59,27 @@ pub(crate) fn spawn_operation(
                     UserAppOperationState::Running, "creation_source_captured",
                     serde_json::json!({"builder_creation_predecessor": predecessor}), None).await?;
             }
+            if owned.config.userapp_storage.default_recovery_enabled {
+                let storage = match tokio::time::timeout_at(ready_deadline, owned.runtime().discover_retained_app_storage(
+                    &claimed.app_id, shared_types::UserAppOperationScope::Dev,
+                )).await {
+                    Ok(Ok(storage)) => storage,
+                    result => {
+                        progress(&owned.userapp_store, &claimed, &claimed_id,
+                            UserAppOperationState::Failed, "creation_preflight", claimed.checkpoint.clone(),
+                            Some(format!("Inspect retained builder workspace before any runtime write: {result:?}"))).await?;
+                        return Ok(());
+                    }
+                };
+                if let Some(storage) = storage {
+                    let mut checkpoint = claimed.checkpoint.clone();
+                    if checkpoint.is_null() { checkpoint = serde_json::json!({}); }
+                    checkpoint.as_object_mut().ok_or_else(|| anyhow!("Builder checkpoint is not an object"))?
+                        .insert("retained_storage".into(), serde_json::to_value(storage)?);
+                    claimed = progress(&owned.userapp_store, &claimed, &claimed_id,
+                        UserAppOperationState::Running, "creation_storage_captured", checkpoint, None).await?;
+                }
+            }
             let creation = crate::userapp_builder::create_builder_inner(
                 &owned,
                 &claimed.app_id,
@@ -155,7 +176,7 @@ pub(crate) fn spawn_operation(
                     let rejected = error
                         .downcast_ref::<container_runtime_api::ContainerRuntimeError>()
                         .is_some_and(|e| {
-                            matches!(
+                            e.creation_safe_finish() || matches!(
                                 e,
                                 container_runtime_api::ContainerRuntimeError::RequestRejected(_)
                             )
@@ -166,7 +187,15 @@ pub(crate) fn spawn_operation(
                         } else {
                             UserAppOperationState::RecoveryRequired
                         },
-                        if cancelled { serde_json::json!({"creation_cancelled": true}) } else { claimed.checkpoint.clone() },
+                        if cancelled { serde_json::json!({"creation_cancelled": true}) } else {
+                            let mut checkpoint = claimed.checkpoint.clone();
+                            if let Some(container_runtime_api::ContainerRuntimeError::CreationAborted {progress,..}) = error.downcast_ref::<container_runtime_api::ContainerRuntimeError>() {
+                                if checkpoint.is_null() { checkpoint = serde_json::json!({}); }
+                                checkpoint.as_object_mut().ok_or_else(||anyhow!("Builder checkpoint is not an object"))?
+                                    .insert("creation_abort".into(),serde_json::to_value(progress)?);
+                            }
+                            checkpoint
+                        },
                         Some(format!("{error:#}")),
                     )
                 }

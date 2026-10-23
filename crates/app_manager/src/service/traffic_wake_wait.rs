@@ -2,7 +2,7 @@
 use super::{AppOperationGuard, AppService, operation_progress::HolderObservation, restart_wait};
 use crate::models::{AppOperationError, AppResult};
 use container_runtime_api::AppOperationMutexObservation;
-use shared_types::{UserAppOperationKind, UserAppOperationScope, UserAppOperationState};
+use shared_types::{UserAppOperationScope, UserAppOperationState};
 use std::sync::Arc;
 use tokio::time::{Instant, timeout_at};
 
@@ -25,7 +25,6 @@ fn ordinary_traffic(holder: &HolderObservation, app_id: &str, lifecycle_id: &str
     verified.app_id == app_id
         && verified.lifecycle_id == lifecycle_id
         && blocker.scope == UserAppOperationScope::Prod
-        && blocker.kind == UserAppOperationKind::Start
         && active
         && holder.data.holder_traffic_wake
         && holder.data.retryable

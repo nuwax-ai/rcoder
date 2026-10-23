@@ -36,6 +36,7 @@ struct TerminalSeed {
     state: UserAppOperationState,
     step: &'static str,
     checkpoint: Option<serde_json::Value>,
+    error_message: Option<&'static str>,
 }
 
 impl TerminalSeed {
@@ -44,6 +45,7 @@ impl TerminalSeed {
             state,
             step: "runtime_updated",
             checkpoint: None,
+            error_message: None,
         }
     }
     fn completed_evidence(checkpoint: serde_json::Value) -> Self {
@@ -51,6 +53,7 @@ impl TerminalSeed {
             state: UserAppOperationState::RecoveryRequired,
             step: "compute_confirmed",
             checkpoint: Some(checkpoint),
+            error_message: None,
         }
     }
 }
@@ -59,6 +62,8 @@ impl TerminalSeed {
 /// 物理租约 validate 判定 + 可选死亡探针覆写。
 #[derive(Default)]
 pub(crate) struct FenceRuntime {
+    pub(crate) retained_creation_absent: std::sync::atomic::AtomicBool,
+    pub(crate) retained_storage: Mutex<Option<shared_types::UserAppRetainedStorage>>,
     pub(crate) agent_replacement: Mutex<Option<shared_types::VerifiedAgentReplacement>>,
     pub(crate) agent_replacement_verifications: std::sync::atomic::AtomicUsize,
     pub(crate) agent_replacement_transport_fails: std::sync::atomic::AtomicBool,
@@ -112,6 +117,8 @@ impl FenceRuntime {
         generation: Option<&str>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            retained_creation_absent: Default::default(),
+            retained_storage: Default::default(),
             agent_replacement: Default::default(),
             agent_replacement_verifications: Default::default(),
             agent_replacement_transport_fails: Default::default(),
@@ -170,6 +177,15 @@ fn status_of(phase: &str, replicas: i32) -> DeploymentStatus {
 
 #[async_trait::async_trait]
 impl AgentContainerRuntime for FenceRuntime {
+    async fn verify_absent_builder_recovery(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(self
+            .retained_creation_absent
+            .load(std::sync::atomic::Ordering::SeqCst))
+    }
+
     fn agent_workload_namespace(&self) -> String {
         "test-ns".into()
     }
@@ -302,6 +318,14 @@ impl WorkspaceRuntime for FenceRuntime {}
 
 #[async_trait::async_trait]
 impl UserAppDeploymentRuntime for FenceRuntime {
+    async fn discover_retained_app_storage(
+        &self,
+        _app_id: &str,
+        _scope: shared_types::UserAppOperationScope,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppRetainedStorage>> {
+        Ok(self.retained_storage.lock().unwrap().clone())
+    }
+
     async fn observe_app_operation_lease(
         &self,
         _context: &shared_types::UserAppExecutionContext,
@@ -798,6 +822,7 @@ async fn fence_state_on_store(
             Some(UserAppControlCommand::Deploy {
                 restart: false,
                 input_digest: digest,
+                serving_recovery: false,
             }),
             true,
         ),
@@ -805,6 +830,7 @@ async fn fence_state_on_store(
             Some(UserAppControlCommand::Deploy {
                 restart: true,
                 input_digest: digest,
+                serving_recovery: false,
             }),
             true,
         ),
@@ -954,7 +980,15 @@ async fn fence_state_on_store(
     let checkpoint = seed
         .checkpoint
         .unwrap_or_else(|| running.checkpoint.clone());
-    seed_terminal_fence(&store, &running, seed.state, seed.step, checkpoint).await;
+    seed_terminal_fence(
+        &store,
+        &running,
+        seed.state,
+        seed.step,
+        checkpoint,
+        seed.error_message,
+    )
+    .await;
     (state, store)
 }
 
@@ -967,6 +1001,7 @@ async fn seed_terminal_fence(
     terminal: UserAppOperationState,
     step: &str,
     checkpoint: serde_json::Value,
+    message: Option<&str>,
 ) {
     store
         .advance(&UserAppOperationProgress {
@@ -980,8 +1015,7 @@ async fn seed_terminal_fence(
             checkpoint,
             error_code: Some("ERR_BACKEND_ERROR".into()),
             error_message: Some(
-                "Capture explicit database target: Owned management container is not running"
-                    .into(),
+                message.unwrap_or("Capture explicit database target: Owned management container is not running").into(),
             ),
         })
         .await
@@ -1694,5 +1728,110 @@ impl shared_types::AppOperationLease for PreparedComputeFixture {
 impl shared_types::PreparedComputeLease for PreparedComputeFixture {
     async fn activate(&mut self) -> Result<(), String> {
         Ok(())
+    }
+}
+
+#[tokio::test]
+async fn default_recovery_settles_acknowledged_legacy_identity_rejection_only_with_absent_execution()
+ {
+    for confirmed_absent in [false, true] {
+        let runtime = FenceRuntime::scenario(None, None);
+        runtime
+            .retained_creation_absent
+            .store(confirmed_absent, std::sync::atomic::Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+                &dir.path().join("legacy-fence.db"),
+            )
+            .await
+            .unwrap(),
+        );
+        let (state,_) = fence_state_on_store(runtime,UserAppOperationKind::EnsureBuilder,"legacy-preflight",store,None,None,
+            TerminalSeed {state:UserAppOperationState::RecoveryRequired,step:"creation_result",checkpoint:Some(serde_json::Value::Null),
+                error_message:Some("ensure UserappBuilder failed: Concurrent resource update: Application resource identity mismatch: rcoder.io/application-id")}).await;
+        let snapshot = settled(&state, "legacy-preflight").await;
+        reconcile_default_recovery_before_ensure(
+            &state,
+            &state
+                .userapp_store
+                .get_application("fenced")
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let after = settled(&state, "legacy-preflight").await;
+        if confirmed_absent {
+            assert_eq!(after.state, UserAppOperationState::Failed);
+            assert_eq!(after.operation_id, snapshot.operation_id);
+            assert!(
+                state
+                    .userapp_store
+                    .get_application("fenced")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .active_operations
+                    .dev
+                    .is_none()
+            );
+            assert_eq!(
+                after.checkpoint["fence_released_evidence"]["kind"],
+                "legacy_creation_preflight_rejected_compute_absent"
+            );
+        } else {
+            assert_eq!(after.state, UserAppOperationState::RecoveryRequired);
+        }
+    }
+}
+
+#[tokio::test]
+async fn default_recovery_metadata_claim_reconciles_but_unknown_generation_write_remains_fenced() {
+    for stage in [
+        container_runtime_api::CreationStage::StorageClaim,
+        container_runtime_api::CreationStage::WriteGeneration,
+    ] {
+        let runtime = FenceRuntime::scenario(None, None);
+        runtime
+            .retained_creation_absent
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+                &dir.path().join("claim.db"),
+            )
+            .await
+            .unwrap(),
+        );
+        let app = store.ensure_identity("fenced").await.unwrap();
+        let captured = shared_types::UserAppRetainedStorage {
+            app_id: "fenced".into(),
+            scope: shared_types::UserAppOperationScope::Dev,
+            lifecycle_id: Some(app.lifecycle_id),
+            services: vec![],
+            volumes: vec![AppResourceIdentity {
+                kind: AppResourceKind::PersistentVolumeClaim,
+                name: "original".into(),
+                uid: "original-uid".into(),
+                resource_version: None,
+            }],
+        };
+        *runtime.retained_storage.lock().unwrap() = Some(captured.clone());
+        let (state,_)=fence_state_on_store(runtime,UserAppOperationKind::EnsureBuilder,"metadata-claim",store,None,None,
+            TerminalSeed {state:UserAppOperationState::RecoveryRequired,step:"creation_result",error_message:Some("metadata reply lost"),
+                checkpoint:Some(serde_json::json!({"retained_storage":captured,"creation_abort":container_runtime_api::CreationProgress {failed_at:stage,definitive_rejection:false,retained_idempotent_resources:vec!["original volume".into()]}}))}).await;
+        let record = settled(&state, "metadata-claim").await;
+        reconcile_fenced_ensure(&state, &record).await.unwrap();
+        let after = settled(&state, "metadata-claim").await;
+        assert_eq!(
+            after.state,
+            if stage == container_runtime_api::CreationStage::StorageClaim {
+                UserAppOperationState::Failed
+            } else {
+                UserAppOperationState::RecoveryRequired
+            }
+        );
     }
 }

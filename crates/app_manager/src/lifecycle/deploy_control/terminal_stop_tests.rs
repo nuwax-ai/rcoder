@@ -6,7 +6,7 @@ use container_runtime_api::UserAppDeploymentRuntime as _;
 use shared_types::{
     ComputeControlAction, ComputeControlProgress, ComputeControlRequest, ComputeControlStage,
     ComputeControlState, ComputeExecutorIdentity, UserAppOperationLeaseReceipt,
-    UserAppOperationScope, UserAppOperationState,
+    UserAppOperationScope,
 };
 use std::sync::{OnceLock, atomic::Ordering};
 
@@ -129,7 +129,12 @@ async fn late_traffic_reconstruction_preserves_stop_completed_after_its_prefligh
     let scales = runtime.scale_calls.load(Ordering::SeqCst);
     let observer = Arc::new(OnceLock::new());
     let result = service
-        .restore_runtime_on_traffic(app_id, &app.lifecycle_id, observer.clone())
+        .restore_runtime_on_traffic(
+            app_id,
+            &app.lifecycle_id,
+            observer.clone(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
         .await;
     assert!(
         result.is_err(),
@@ -145,22 +150,9 @@ async fn late_traffic_reconstruction_preserves_stop_completed_after_its_prefligh
             .unwrap(),
         stopped
     );
-    let recovery_id = observer
-        .get()
-        .expect("the delayed worker admitted its own operation");
-    let recovery = store
-        .get_operation(app_id, recovery_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(recovery.state, UserAppOperationState::Failed);
-    assert_eq!(recovery.step, "rejected_without_mutation");
     assert!(
-        store
-            .get_operation_lease(app_id, recovery_id)
-            .await
-            .unwrap()
-            .is_none()
+        observer.get().is_none(),
+        "completed Stop is rejected before a recovery is admitted"
     );
     assert!(
         service

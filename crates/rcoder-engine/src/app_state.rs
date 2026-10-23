@@ -166,9 +166,12 @@ impl AppState {
         }
         let userapp_store = opened.store;
         let userapp_store_control = opened.control;
+        let mut app_manager_config = config.app_manager.clone();
+        app_manager_config.default_recovery_enabled =
+            config.userapp_storage.default_recovery_enabled;
         let app_service_arc: Arc<app_manager::service::AppService> = Arc::new(
             app_manager::service::AppService::new(
-                config.app_manager.clone(),
+                app_manager_config,
                 runtime.clone(),
                 activity.clone(),
                 pingora.clone(),

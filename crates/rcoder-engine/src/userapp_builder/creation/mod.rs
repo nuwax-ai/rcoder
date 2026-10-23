@@ -40,7 +40,10 @@ pub(super) async fn ensure(
     startup_mode: shared_types::BuilderStartupMode,
 ) -> Result<ContainerBasicInfo> {
     let flight = state.userapp_op_flight.guard()?;
-    let app = state.userapp_store.ensure_identity(app_id).await?;
+    let app = match super::adoption::discover_missing_identity(state, app_id).await? {
+        Some(app) => app,
+        None => state.userapp_store.ensure_identity(app_id).await?,
+    };
     let input = creation_input(state, app_id, startup_mode)?;
     let admission = state
         .userapp_store
@@ -174,6 +177,24 @@ async fn claimed_startup_mode(
         ));
     }
     Ok(input.startup_mode)
+}
+
+pub(super) async fn captured_storage(
+    state: &AppState,
+    context: &shared_types::UserAppExecutionContext,
+) -> Result<Option<shared_types::UserAppRetainedStorage>> {
+    let operation = state
+        .userapp_store
+        .get_operation(&context.app_id, &context.operation_id)
+        .await?
+        .ok_or_else(|| anyhow!("Builder operation missing"))?;
+    operation
+        .checkpoint
+        .get("retained_storage")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(Into::into)
 }
 
 // 拆分（file-server 大文件范式）：`spawn` 受理派发与迟到结果 /

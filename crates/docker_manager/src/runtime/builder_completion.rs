@@ -34,6 +34,10 @@ pub(crate) async fn finish<T>(
     result: ContainerRuntimeResult<T>,
 ) -> ContainerRuntimeResult<T> {
     if result.is_ok()
+        || result
+            .as_ref()
+            .err()
+            .is_some_and(Error::creation_safe_finish)
         || matches!(
             &result,
             Err(Error::RequestRejected(_) | Error::CreationCancelled)
@@ -110,6 +114,28 @@ mod tests {
             .await;
             assert_eq!(releases.load(Ordering::SeqCst), expected);
         }
+    }
+    #[tokio::test]
+    async fn readonly_capture_abort_releases_lease_and_keeps_the_original_error() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let result: ContainerRuntimeResult<()> = finish(
+            Box::new(Lease {
+                releases: releases.clone(),
+                fail: false,
+            }),
+            Err(Error::CreationAborted {
+                progress: container_runtime_api::CreationProgress {
+                    failed_at: container_runtime_api::CreationStage::Capture,
+                    definitive_rejection: false,
+                    retained_idempotent_resources: vec![],
+                },
+                source: Box::new(Error::Timeout("read deadline".into())),
+            }),
+        )
+        .await;
+        assert!(result.as_ref().unwrap_err().creation_safe_finish());
+        assert!(result.unwrap_err().to_string().contains("read deadline"));
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
     }
     #[tokio::test]
     async fn release_failure_reports_unconfirmed_connection_error_with_context() {

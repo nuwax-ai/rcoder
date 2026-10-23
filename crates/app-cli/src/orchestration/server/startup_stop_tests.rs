@@ -266,6 +266,7 @@ async fn run(scenario: Scenario) {
             crate::runtime_kernel::DispatchAction::OrchestrateSource { .. }
             | crate::runtime_kernel::DispatchAction::DeployLocalArtifact { .. }
             | crate::runtime_kernel::DispatchAction::DeployArtifact { .. }
+            | crate::runtime_kernel::DispatchAction::RecoverArtifact { .. }
             | crate::runtime_kernel::DispatchAction::CancelSource { .. } => {}
         }),
     ));

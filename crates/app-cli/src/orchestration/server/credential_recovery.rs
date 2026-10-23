@@ -6,6 +6,7 @@ pub(crate) enum CredentialRecoveryPurpose {
     StartCurrentSource,
     DeployCurrentArtifact,
     RestoreConfirmedArtifact,
+    RestoreRetainedWorkspace,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +190,17 @@ impl ServerState {
             // still validates its own download/hash/CLI/migrations and actual
             // old-process cleanup; unavailable old recipes are diagnostic.
             CredentialRecoveryPurpose::DeployCurrentArtifact => {
+                Ok(CredentialRecovery::SupplyCurrentInput { hold })
+            }
+            CredentialRecoveryPurpose::RestoreRetainedWorkspace => {
+                let workspace = self
+                    .owner_execution_workspace
+                    .get()
+                    .context("retained production workspace is unbound")?;
+                crate::manifest::read_release_lock(workspace)
+                    .context("retained production manifest is unavailable")?;
+                // A newly admitted request uses the current fixed workspace;
+                // missing old recipe metadata alone cannot permanently block it.
                 Ok(CredentialRecovery::SupplyCurrentInput { hold })
             }
             CredentialRecoveryPurpose::RestoreConfirmedArtifact => {

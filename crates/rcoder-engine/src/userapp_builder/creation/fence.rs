@@ -69,6 +69,94 @@ pub(crate) async fn observe_fence_evidence(
                     .unwrap_or_else(|| "fenced-settler".into()),
                 request_fingerprint: record.request_fingerprint.clone(),
             };
+            // Historical versions fenced a definite read-side PVC identity
+            // rejection. Only that acknowledged result, absent compute, and a
+            // dead/absent native holder permit closing it as Failed.
+            let legacy_preflight = record.kind == UserAppOperationKind::EnsureBuilder
+                && record.step == "creation_result" && record.checkpoint.is_null()
+                && record.error_message.as_deref().is_some_and(|message| message.starts_with(
+                    "ensure UserappBuilder failed: Concurrent resource update: Application resource identity mismatch:"));
+            if state.config.userapp_storage.default_recovery_enabled
+                && legacy_preflight
+                && matches!(
+                    state
+                        .userapp_store
+                        .get_operation_lease(&record.app_id, &record.operation_id)
+                        .await,
+                    Ok(None)
+                )
+                && matches!(
+                    state
+                        .runtime()
+                        .verify_absent_builder_recovery(&context)
+                        .await,
+                    Ok(true)
+                )
+            {
+                return FenceEvidence::Observed(
+                    serde_json::json!({"kind":"legacy_creation_preflight_rejected_compute_absent", "observed_at_us":chrono::Utc::now().timestamp_micros()}),
+                );
+            }
+            if state.config.userapp_storage.default_recovery_enabled
+                && record.kind == UserAppOperationKind::EnsureBuilder
+                && record.step == "creation_result"
+            {
+                let progress = record
+                    .checkpoint
+                    .get("creation_abort")
+                    .cloned()
+                    .map(serde_json::from_value::<container_runtime_api::CreationProgress>)
+                    .transpose();
+                let captured = record
+                    .checkpoint
+                    .get("retained_storage")
+                    .cloned()
+                    .map(serde_json::from_value::<shared_types::UserAppRetainedStorage>)
+                    .transpose();
+                if let (Ok(Some(progress)), Ok(Some(captured))) = (progress, captured)
+                    && progress.failed_at == container_runtime_api::CreationStage::StorageClaim
+                    && let Ok(Some(current)) = state
+                        .runtime()
+                        .discover_retained_app_storage(
+                            &record.app_id,
+                            shared_types::UserAppOperationScope::Dev,
+                        )
+                        .await
+                {
+                    let same = current.app_id == captured.app_id
+                        && current.scope == captured.scope
+                        && current
+                            .lifecycle_id
+                            .as_ref()
+                            .is_none_or(|life| life == &record.lifecycle_id)
+                        && current.volumes.len() == captured.volumes.len()
+                        && current.services.len() == captured.services.len()
+                        && current
+                            .volumes
+                            .iter()
+                            .zip(&captured.volumes)
+                            .all(|(a, b)| a.kind == b.kind && a.name == b.name && a.uid == b.uid)
+                        && current
+                            .services
+                            .iter()
+                            .zip(&captured.services)
+                            .all(|(a, b)| a.kind == b.kind && a.name == b.name && a.uid == b.uid);
+                    if same
+                        && matches!(
+                            state
+                                .runtime()
+                                .verify_absent_builder_recovery(&context)
+                                .await,
+                            Ok(true)
+                        )
+                    {
+                        return FenceEvidence::Observed(
+                            serde_json::json!({"kind":"retained_metadata_claim_no_compute", "volumes":current.volumes,
+                                    "observed_at_us":chrono::Utc::now().timestamp_micros()}),
+                        );
+                    }
+                }
+            }
             match crate::userapp_builder::adoption::capture_bound_target(state, &context).await {
                 // 活体工作负载是唯一可接受证据：identity 不符（Err）或
                 // workload 缺失（Ok(None)）都保持围栏。
@@ -386,5 +474,22 @@ pub(crate) async fn reconcile_fenced_ensure(
         kind = ?record.kind,
         "Fenced operation settled as Failed: physical state verified definite"
     );
+    Ok(())
+}
+
+pub(crate) async fn reconcile_default_recovery_before_ensure(
+    state: &AppState,
+    app: &shared_types::UserAppLifecycleRecord,
+) -> Result<()> {
+    if !state.config.userapp_storage.default_recovery_enabled {
+        return Ok(());
+    }
+    if let Some(id) = &app.active_operations.dev
+        && let Some(operation) = state.userapp_store.get_operation(&app.app_id, id).await?
+        && operation.kind == UserAppOperationKind::EnsureBuilder
+        && operation.state == UserAppOperationState::RecoveryRequired
+    {
+        reconcile_fenced_ensure(state, &operation).await?;
+    }
     Ok(())
 }

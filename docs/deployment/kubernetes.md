@@ -102,3 +102,7 @@ curl http://127.0.0.1:8290/health
 - [Docker Compose 形态](docker.md)：本地开发推荐
 - [宿主机形态（deploy-host）](host.md)：本地 Docker/K8s 管动态容器的单机形态（含 K8s 形态三前置）
 - [UserApp 应用管理](../concepts/userapp.md)：K8s 下的 UserApp 生命周期语义
+
+### UserApp 保留存储恢复
+
+身份或计算资源缺失时的默认兜底、开关和验收边界见 [UserApp 保留存储恢复](../userapp-default-recovery.md)。

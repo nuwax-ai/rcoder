@@ -151,6 +151,23 @@ async fn prepare_source_control(
     state: &ServerState,
     signal: &ControlSignal,
 ) -> anyhow::Result<Option<crate::supervisor::PreparedProxy>> {
+    if let ControlSignal::RecoverArtifact {
+        workspace,
+        release_id,
+        ..
+    } = signal
+    {
+        let mut restored = owner_args.clone();
+        restored.workspace = workspace.clone();
+        let release = crate::manifest::read_release_lock(workspace)?;
+        anyhow::ensure!(
+            &release.release_id == release_id,
+            "Retained artifact identity changed before startup"
+        );
+        return preflight_hot_reload_compat(&restored, false, state.log_layout().into())
+            .await
+            .map(Some);
+    }
     let ControlSignal::OrchestrateSource { dev_profile, .. } = signal else {
         return Ok(None);
     };
@@ -167,7 +184,7 @@ async fn settle_configuration_before_stop(
     signal: &ControlSignal,
 ) -> anyhow::Result<Option<tokio::time::Instant>> {
     match signal {
-        ControlSignal::OrchestrateSource { .. } => Ok(None),
+        ControlSignal::OrchestrateSource { .. } | ControlSignal::RecoverArtifact { .. } => Ok(None),
         ControlSignal::StopBusiness { .. } => {
             let deadline = tokio::time::Instant::now() + crate::proxy::admin_probe::CONFIRM_BUDGET;
             state.cancel_auxiliary_writes()?;
@@ -197,6 +214,7 @@ fn confirmed_business_stop(action: InitialAction) -> InitialAction {
 fn control_operation_id(signal: &ControlSignal) -> &str {
     match signal {
         ControlSignal::OrchestrateSource { operation_id, .. }
+        | ControlSignal::RecoverArtifact { operation_id, .. }
         | ControlSignal::StopBusiness { operation_id } => operation_id,
     }
 }
@@ -204,6 +222,7 @@ fn control_operation_id(signal: &ControlSignal) -> &str {
 async fn reject_live_control(state: &ServerState, signal: &ControlSignal, error: &anyhow::Error) {
     let operation_id = match signal {
         ControlSignal::OrchestrateSource { operation_id, .. }
+        | ControlSignal::RecoverArtifact { operation_id, .. }
         | ControlSignal::StopBusiness { operation_id } => operation_id,
     };
     let unknown = error
@@ -272,7 +291,8 @@ async fn reject_live_deployment(
 
 async fn claim_live_source_control(state: &ServerState, signal: &ControlSignal) -> bool {
     match signal {
-        ControlSignal::OrchestrateSource { operation_id, .. } => {
+        ControlSignal::OrchestrateSource { operation_id, .. }
+        | ControlSignal::RecoverArtifact { operation_id, .. } => {
             !state.settle_cancelled_before_execution(operation_id).await
                 && !signal_operation_already_settled(state, operation_id).await
         }
@@ -317,6 +337,9 @@ async fn settled_prepared_control(
     let action = settle_control_signal_inner(state, signal, true).await;
     match (action, prepared) {
         (InitialAction::Source, Some(proxy)) => InitialAction::SourcePrepared(proxy),
+        (InitialAction::Existing { workspace }, Some(proxy)) if workspace == proxy.workspace => {
+            InitialAction::ExistingPrepared(proxy)
+        }
         (action, _) => action,
     }
 }
@@ -370,6 +393,47 @@ async fn settle_control_signal_inner(
             state.set_pending_run_config(pg);
             InitialAction::Source
         }
+        ControlSignal::RecoverArtifact {
+            operation_id,
+            workspace,
+            release_id,
+            pg,
+        } => {
+            if state.settle_cancelled_before_execution(&operation_id).await
+                || signal_operation_already_settled(state, &operation_id).await
+            {
+                return InitialAction::Settled;
+            }
+            state.set_current_runtime_operation(Some(operation_id.clone()));
+            let request = DeployRequest {
+                runtime_operation_id: Some(operation_id.clone()),
+                url: "retained://workspace".into(),
+                release_id: release_id.clone(),
+                sha256: None,
+                local_path: None,
+                execution_target: None,
+                run_pg: pg.clone(),
+            };
+            if let Err(error) = state.record_runtime_deployment(&request) {
+                hold_unconfirmed(
+                    state,
+                    format!("persist retained artifact recovery: {error:#}"),
+                )
+                .await;
+                return InitialAction::Settled;
+            }
+            if let Err(error) = state.record_prepared_artifact(release_id) {
+                hold_unconfirmed(
+                    state,
+                    format!("record retained artifact identity: {error:#}"),
+                )
+                .await;
+                return InitialAction::Settled;
+            }
+            state.set_pending_dev_profile(false);
+            state.set_pending_run_config(pg);
+            InitialAction::Existing { workspace }
+        }
         ControlSignal::StopBusiness { operation_id } => {
             InitialAction::StopBusiness { operation_id }
         }
@@ -399,6 +463,7 @@ pub(super) async fn record_uncertain_control(
 ) {
     let operation_id = match signal {
         ControlSignal::OrchestrateSource { operation_id, .. }
+        | ControlSignal::RecoverArtifact { operation_id, .. }
         | ControlSignal::StopBusiness { operation_id } => operation_id,
     };
     // A successfully running predecessor has already cleared current_runtime_operation.
@@ -1006,6 +1071,7 @@ pub(super) async fn server_loop(
                                 ControlSignal::OrchestrateSource { operation_id, dev_profile, pg },
                             ).await)
                         }
+                        Some(signal @ ControlSignal::RecoverArtifact { .. }) => Some(settle_control_signal(state, signal).await),
                         Some(ControlSignal::StopBusiness { operation_id }) => {
                             Some(InitialAction::StopBusiness { operation_id })
                         }
@@ -1401,7 +1467,8 @@ pub(super) async fn server_loop(
                             .await?;
                             host.stop_business().await
                         }
-                        ControlSignal::OrchestrateSource { .. } => {
+                        ControlSignal::OrchestrateSource { .. }
+                        | ControlSignal::RecoverArtifact { .. } => {
                             host.stop_all(Some(&standby_root)).await
                         }
                     }

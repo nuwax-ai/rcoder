@@ -17,6 +17,9 @@ pub struct ContainerCreateParams {
     pub creation_cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Durable userApp operation identity; absent for Agent operations.
     pub execution_context: Option<shared_types::UserAppExecutionContext>,
+    /// Original PVC identities captured by an admitted recovery operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_storage: Option<shared_types::UserAppRetainedStorage>,
     /// Physical update target captured before any application mutation.
     pub mutation_target: Option<shared_types::UserAppMutationTarget>,
     /// Explicit durable proof for an adopted legacy builder resource.
@@ -302,6 +305,7 @@ impl ContainerCreateParamsBuilder {
         ContainerCreateParams {
             creation_cancelled: Default::default(),
             execution_context: self.execution_context,
+            retained_storage: None,
             mutation_target: None,
             resource_binding: self.resource_binding,
             project_id: self.project_id,

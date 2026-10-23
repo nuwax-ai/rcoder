@@ -93,7 +93,9 @@ impl KubernetesRuntime {
             && (shared_types::per_agent_pvc_enabled()
                 || matches!(service_type, ServiceType::UserappBuilder))
         {
-            if let Some(context) = &params.execution_context {
+            if params.retained_storage.is_some() {
+                // recover_retained_storage already verified exact UID and ownership.
+            } else if let Some(context) = &params.execution_context {
                 self.ensure_owned_workspace_pvc(
                     context,
                     &service_type,
