@@ -512,6 +512,72 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn percent_encoded_existing_files_keep_get_and_head_behavior() {
+        let root = temp_root();
+        for (name, body) in [
+            ("a b.txt", "space"),
+            ("中.txt", "unicode"),
+            ("%中.txt", "literal percent"),
+            ("%G0.txt", "invalid escape"),
+        ] {
+            std::fs::write(root.join(name), body).expect("fixture file");
+        }
+        let app = router(root);
+        for (path, expected) in [
+            ("/a%20b.txt", "space"),
+            ("/%E4%B8%AD.txt", "unicode"),
+            ("/%25%E4%B8%AD.txt", "literal percent"),
+            ("/%G0.txt", "invalid escape"),
+        ] {
+            for method in ["GET", "HEAD"] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method(method)
+                            .uri(path)
+                            .body(axum::body::Body::empty())
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("response");
+                assert_eq!(response.status(), StatusCode::OK, "{method} {path}");
+                assert!(
+                    response
+                        .headers()
+                        .get(header::CONTENT_TYPE)
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .starts_with("text/plain")
+                );
+                if method == "HEAD" {
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get(header::CONTENT_LENGTH)
+                            .unwrap()
+                            .to_str()
+                            .unwrap(),
+                        expected.len().to_string()
+                    );
+                }
+                let body = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("body")
+                    .to_bytes();
+                if method == "GET" {
+                    assert_eq!(body.as_ref(), expected.as_bytes(), "{path}");
+                } else {
+                    assert!(body.is_empty(), "HEAD {path} must have no body");
+                }
+            }
+        }
+    }
+
     /// R09 矩阵: 解码语义保持；编码穿越拒绝且**不走** SPA fallback（区别于普通未匹配）。
     #[tokio::test]
     async fn percent_decoding_matrix_keeps_spa_and_traversal_boundaries() {
