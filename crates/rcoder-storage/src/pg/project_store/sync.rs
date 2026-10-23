@@ -253,14 +253,6 @@ async fn sync_once_inner(
             continue;
         }
         let info = hydrate_project(&row, &container_by_name)?;
-        // R13 无变化快路径：全部竞态/退休保护通过后，比较当前同步负责恢复的
-        // 完整类型化投影；完全相等 = 权威已收敛——复用现有 Arc、不重写反向
-        // 索引、不计 changed。不比较历史 JSON 原文或随机 token。
-        if let Some(current) = &existing
-            && recovery_projection(current) == recovery_projection(&info)
-        {
-            continue;
-        }
         // A peer replacement must update registration and hydrated project
         // together. A local container intent after snapshot admission prevents
         // applying the entire associated project, not just its registry entry.
@@ -279,19 +271,36 @@ async fn sync_once_inner(
             }
             // Equality with target permits another project in this same snapshot
             // to hydrate after the first project already refreshed this registry.
-            Some((name.clone(), target))
+            if current == Some(&target) {
+                None
+            } else {
+                Some((name.clone(), target))
+            }
         } else {
             None
         };
-        inner.insert(row.project_id.clone(), Arc::new(info))?;
-        // Publish only after mirror insertion succeeds. The outer registration
-        // guard still excludes local writes and other snapshot application.
+        // The container cursor is independent of the project projection: a
+        // rejected registration for another shared member can leave it ahead
+        // of SQL even when this project's fields already match. Keep its race
+        // guard and reconciliation on the no-op path as well.
+        let unchanged = existing
+            .as_ref()
+            .is_some_and(|current| recovery_projection(current) == recovery_projection(&info));
+        if !unchanged {
+            inner.insert(row.project_id.clone(), Arc::new(info))?;
+        }
+        // Publish after mirror insertion succeeds or its projection is already
+        // equal. The registration guard still excludes local writes and other
+        // snapshot application.
         if let Some((name, target)) = registration_update {
             store
                 .container_registration
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .insert(name, target);
+        }
+        if unchanged {
+            continue;
         }
         if existing.is_some() {
             changed += 1;

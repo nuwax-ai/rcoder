@@ -690,7 +690,8 @@ async fn guard_request_classifies_verify_failure_sources() {
     tokio::spawn(async move {
         while let Some(command) = rx.recv().await {
             if let Command::Verify(send) = command {
-                let _ = send.send(Err(anyhow::anyhow!("select 1 probe failed")));
+                send.send(Err(anyhow::anyhow!("select 1 probe failed")))
+                    .expect("probe failure reply reaches verifier");
             }
         }
     });
