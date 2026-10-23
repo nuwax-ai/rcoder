@@ -4,13 +4,15 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use dashmap::DashSet;
 // 存储契约 trait：state.projects（ProjectStoreBackend 枚举）上的方法经此解析
 use shared_types::ProjectStore as _;
 use shared_types::ServiceType;
 use std::sync::Arc;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
+
+mod idle_sweep;
+use idle_sweep::{IdleConfirmation, IdleSweep, IdleWorkload};
 
 /// 主清理器（协调各模块）
 pub struct AgentCleaner {
@@ -27,11 +29,9 @@ pub struct AgentCleaner {
     agent_scanner: super::agent::AgentScanner,
     log_cleaner: super::logs::LogCleaner,
 
-    /// 二次确认销毁：命中闲置回收规则的容器先入此集合（=「已见过一次 idle」），
-    /// 下一轮扫描仍闲置（第二次连续命中）才真正销毁。key = container_name。
-    /// 本轮不再闲置（用户回归）的条目由 `cleanup_once` 的 retain 清除，保证「连续」语义。
-    /// 详见 `cleanup_agent` 的二次确认闸门。延迟 ≈ 一个 cleanup_interval（连续两轮）。
-    pending_destroy: DashSet<(String, String, Option<String>)>,
+    /// Qualified idle observations from the last completed sweep only.
+    /// Shared projects cannot advance a physical workload twice in one sweep.
+    pending_destroy: std::collections::HashSet<IdleWorkload>,
 }
 
 impl AgentCleaner {
@@ -75,13 +75,16 @@ impl AgentCleaner {
                 AgentScanner::new(state.clone(), config_clone)
             },
             log_cleaner,
-            pending_destroy: DashSet::new(),
+            pending_destroy: std::collections::HashSet::new(),
         }
     }
 
     /// 执行一次清理
     pub async fn cleanup_once(&mut self) -> Result<super::config::CleanupStats> {
         let start_time = std::time::Instant::now();
+        // A failed/cancelled sweep breaks continuity. Only a completed sweep
+        // publishes its qualified observations for the next independent scan.
+        let mut idle_sweep = IdleSweep::new(std::mem::take(&mut self.pending_destroy));
 
         // 重置本次清理的统计
         let mut current_stats = super::config::CleanupStats::default();
@@ -102,44 +105,12 @@ impl AgentCleaner {
         let idle_agents = self.agent_scanner.scan_idle_agents().await?;
         info!("[cleaner] Found {} idle agents to clean", idle_agents.len());
 
-        // 🔁 二次确认清扫：本轮不再闲置（用户回归 / VNC 接入刷新 last_activity）的容器，
-        //    清掉其「已见过一次 idle」标记，下个闲置周期重新计数；本轮仍闲置的容器保留标记。
-        //    这保证了「连续两轮 idle 才销毁」的连续性——中间任一轮恢复，计数清零重来。
-        {
-            let idle_keys: std::collections::HashSet<(String, String, Option<String>)> =
-                idle_agents
-                    .iter()
-                    .filter_map(|pid| {
-                        self.state.get_project(pid).and_then(|i| {
-                            i.container_info().map(|c| {
-                                (
-                                    c.container_name.clone(),
-                                    c.container_id.clone(),
-                                    c.workload_uid.clone(),
-                                )
-                            })
-                        })
-                    })
-                    .collect();
-            self.pending_destroy.retain(|k| idle_keys.contains(k));
-        }
-
         // 3. 清理每个 agent
-        // 记录已销毁的容器名称，避免共享容器被重复销毁（ComputerAgentRunner 场景）
-        let mut destroyed_containers: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-
         for project_id in idle_agents {
-            // 检查该项目的容器是否已被本轮销毁（共享容器场景）
-            let container_name: Option<String> = self
-                .state
-                .get_project(&project_id)
-                .and_then(|info| info.container_info().map(|c| c.container_name.clone()));
-
-            // 🛡️ 关键修复：项目可能已被本轮清理的共享容器连带删除
-            // 例如：cleanup_agent("P1") 销毁共享容器后，delete_container_with_projects
-            // 会同时删除 P1 和 P2 的 DB 记录。当循环到 P2 时，项目已不存在。
-            if container_name.is_none() && !self.state.contains_project(&project_id) {
+            // Retiring a captured workload can remove all its old references.
+            // Never erase a surviving/new registration just because a sibling
+            // from the scanner's snapshot has already been retired.
+            if !self.state.contains_project(&project_id) {
                 info!(
                     "[cleaner] Project already removed (likely by shared container cleanup): project_id={}",
                     project_id
@@ -149,32 +120,13 @@ impl AgentCleaner {
                 continue;
             }
 
-            if let Some(ref name) = container_name
-                && destroyed_containers.contains(name)
-            {
-                // The first stop retired only its captured canonical frame.
-                // A surviving row may be a later registration; never delete it
-                // merely because this scan previously stopped the same name.
-                current_stats.total_cleaned += 1;
-                current_stats.success_cleaned += 1;
-                info!(
-                    "[cleaner] Container already destroyed, removed project record only: project_id={}",
-                    project_id
-                );
-                continue;
-            }
-
             current_stats.total_cleaned += 1;
 
-            match self.cleanup_agent(&project_id).await {
+            match self.cleanup_agent(&project_id, &mut idle_sweep).await {
                 Ok(destroyed) => {
                     current_stats.success_cleaned += 1;
                     if destroyed {
                         current_stats.containers_destroyed += 1;
-                        // 记录已销毁的容器名称，跳过后续同容器的销毁
-                        if let Some(name) = container_name {
-                            destroyed_containers.insert(name);
-                        }
                     }
                     info!("[cleaner] Agent cleanup succeeded: {}", project_id);
                 }
@@ -184,6 +136,7 @@ impl AgentCleaner {
                 }
             }
         }
+        self.pending_destroy = idle_sweep.into_pending();
 
         // 4. 更新累计统计
         current_stats.last_cleanup = Some(Utc::now());
@@ -205,8 +158,8 @@ impl AgentCleaner {
     }
 
     /// 清理单个 agent
-    /// 返回 Ok(true) 表示销毁了容器，Ok(false) 表示只删除了记录、或跳过清理（竞态保护时项目仍活跃）
-    async fn cleanup_agent(&self, project_id: &str) -> Result<bool> {
+    /// Ok(true) confirms compute retirement; Ok(false) retains/skips it.
+    async fn cleanup_agent(&self, project_id: &str, idle_sweep: &mut IdleSweep) -> Result<bool> {
         info!("[cleaner] Starting cleanup agent: {}", project_id);
 
         // 1. 获取项目信息
@@ -215,6 +168,13 @@ impl AgentCleaner {
             .get_project(project_id)
             .ok_or_else(|| anyhow::anyhow!("Agent does not exist: {}", project_id))?;
         let captured_container = agent_info.container_info();
+        if let Some(container) = captured_container.as_ref()
+            && !idle_sweep.observe_once(container)
+        {
+            debug!(project_id, container_id = %container.container_id,
+                "[cleaner] Physical workload already observed in this sweep");
+            return Ok(false);
+        }
 
         // 🛡️ 竞态保护：scanner 扫描到 cleaner 处理之间有时间差（gRPC 二次确认等），
         // 期间 project 可能收到 keepalive/chat 刷新了 last_activity。
@@ -295,52 +255,26 @@ impl AgentCleaner {
             return Ok(false); // 不销毁容器、不删 project
         }
 
-        // 🔁 二次确认：策略判定该销毁时不立即销毁 —— 首次命中只记个标记，下一轮**连续**仍
-        //    闲置才真正销毁。中间任一轮用户回归（last_activity 推进 / VNC 接入）会让容器不再
-        //    被 scanner 判为闲置 → cleanup_once 的 retain 清掉标记，计数清零，取消销毁，
-        //    规避"恰好撞车"误杀（01:07 那种：销毁瞬间用户回归、晚 1 秒）。
-        //
-        //    仅当确有容器可销毁（container_info 存在）时才二次确认 —— 它是为保护「活容器」
-        //    不被误杀；无容器的孤立 project 记录直接走下方清理（否则用 project_id 当 key 会被
-        //    cleanup_once 的 retain 每轮清掉、永不连击、孤立记录清不掉）。
+        // Confirm only observations published by the previous completed sweep.
+        // Current activity, canonical references and exact runtime identity are
+        // still rechecked below before any physical stop.
         if destroy_reason.is_some()
-            && let Some(grace_key) = agent_info.container_info().map(|c| {
-                (
-                    c.container_name.clone(),
-                    c.container_id.clone(),
-                    c.workload_uid.clone(),
-                )
-            })
+            && let Some(container) = captured_container.as_ref()
         {
-            // insert 返回 true = 此前不在集合 = 本轮是第一次命中 → 先记下、放一马
-            // insert 返回 false = 已在集合 = 连续第二次命中 → 真正销毁
-            let first_hit = self.pending_destroy.insert(grace_key.clone());
-            if first_hit {
-                info!(
-                    project_id,
-                    ?grace_key,
-                    "[cleaner] idle first seen; reconfirm before destruction"
-                );
-                return Ok(false); // 容器还活着：不销毁、不删 project 记录
+            match idle_sweep.confirm(container) {
+                IdleConfirmation::Pending => {
+                    info!(project_id, container_id = %container.container_id,
+                        "[cleaner] idle first seen; reconfirm in a later cleanup sweep");
+                    return Ok(false);
+                }
+                IdleConfirmation::Confirmed => {
+                    info!(project_id, container_id = %container.container_id,
+                        "[cleaner] idle confirmed in distinct consecutive cleanup sweeps");
+                }
             }
-            // 连续第二次命中：本轮 scanner 仍判闲置 + 上面 idle_secs 复核仍超时 → 继续销毁
-            info!(
-                project_id,
-                ?grace_key,
-                "[cleaner] idle confirmed on consecutive scans"
-            );
-            self.pending_destroy.remove(&grace_key);
-            // 落入下方销毁逻辑
         }
 
         if destroy_reason.is_none() {
-            if let Some(container) = captured_container.as_ref() {
-                self.pending_destroy.remove(&(
-                    container.container_name.clone(),
-                    container.container_id.clone(),
-                    container.workload_uid.clone(),
-                ));
-            }
             return Ok(false);
         }
         // A strategy declining destruction is not permission to erase a
@@ -587,6 +521,9 @@ pub(crate) async fn builder_fenced_by_active_operations(
         }
     }
 }
+
+#[cfg(test)]
+mod idle_tests;
 
 #[cfg(test)]
 mod scope_fence_tests {
