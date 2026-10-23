@@ -752,6 +752,15 @@ fn register_builder(state: &AppState, instance: &str, info: &ContainerBasicInfo)
         .get_project(instance)
         .map(|old| (*old).clone())
         .unwrap_or_else(|| ProjectAndContainerInfo::new(instance.to_owned()));
+    // A confirmed successor starts its own idle window even if the logical
+    // project survived retirement. Re-observing the same CID (including an IP
+    // correction) preserves historical activity instead of renewing it on reads.
+    let new_physical_instance = project
+        .container_info()
+        .is_none_or(|previous| previous.container_id != info.container_id);
+    if new_physical_instance {
+        project.update_activity();
+    }
     project.set_service_type(Some(ServiceType::UserappBuilder));
     project.set_container(Some(info.clone()));
     state
@@ -961,6 +970,166 @@ mod remediation_tests {
     fn refreshed_registration_updates_on_id_change() {
         let existing = registered("192.168.97.8", "id-old");
         assert!(refreshed_registration(&existing, &inspected("192.168.97.8", "id-new")).is_some());
+    }
+}
+
+#[cfg(test)]
+mod registration_activity_tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+    use shared_types::ProjectExtendedFields;
+
+    fn physical(app_id: &str, cid: &str) -> ContainerBasicInfo {
+        ContainerBasicInfo {
+            container_id: cid.into(),
+            container_name: format!("rcoder-app-builder-{app_id}"),
+            container_ip: "127.0.0.1".into(),
+            internal_port: AGENT_FILE_SERVER_PORT,
+            external_port: 0,
+            project_id: app_id.into(),
+            status: "running".into(),
+            created_at: Utc::now(),
+            service_url: format!("http://127.0.0.1:{AGENT_FILE_SERVER_PORT}"),
+            workload_uid: None,
+        }
+    }
+
+    fn historical_project(
+        app_id: &str,
+        container: Option<ContainerBasicInfo>,
+    ) -> ProjectAndContainerInfo {
+        let old_activity = Utc::now() - Duration::minutes(5);
+        let mut project = ProjectAndContainerInfo::from_parts(
+            app_id.into(),
+            None,
+            None,
+            None,
+            container,
+            ProjectExtendedFields {
+                last_activity: Some(old_activity),
+                created_at: Some(old_activity - Duration::days(1)),
+                request_id: Some("historical-request".into()),
+                service_type: Some(ServiceType::UserappBuilder),
+                ..Default::default()
+            },
+        );
+        project
+            .restore_session_identity("historical-session", "historical-session-generation".into());
+        assert!(project.restore_latest_session(None));
+        let mut identity = project.persistence_identity().clone();
+        identity.generation = "historical-project-generation".into();
+        identity.revision = 17;
+        identity.predecessor = Some("historical-project-predecessor".into());
+        project.set_persistence_identity(identity);
+        project
+    }
+
+    fn assert_history_preserved(
+        expected: &ProjectAndContainerInfo,
+        actual: &ProjectAndContainerInfo,
+    ) {
+        assert_eq!(actual.created_at(), expected.created_at());
+        assert_eq!(
+            actual.persistence_identity(),
+            expected.persistence_identity()
+        );
+        assert_eq!(actual.sessions(), expected.sessions());
+        assert_eq!(actual.session_id(), None);
+        assert_eq!(actual.request_id(), expected.request_id());
+    }
+
+    /// Real Docker successor registration must not inherit the predecessor's
+    /// already-expired idle clock, even when its old project survived retirement.
+    #[tokio::test]
+    async fn new_physical_registration_refreshes_activity_and_preserves_history() {
+        let (state, app, _directory) = builder_access_test_state().await;
+        let previous = historical_project(&app.app_id, Some(physical(&app.app_id, "old-cid")));
+        state
+            .insert_project(app.app_id.clone(), Arc::new(previous.clone()))
+            .unwrap();
+        let replacement = physical(&app.app_id, "new-cid");
+        let lower_bound = Utc::now();
+
+        register_builder(&state, &app.app_id, &replacement).unwrap();
+
+        let upper_bound = Utc::now();
+        let registered = state.get_project(&app.app_id).unwrap();
+        assert_eq!(registered.container_info().unwrap().container_id, "new-cid");
+        assert_history_preserved(&previous, &registered);
+        assert!(
+            registered.last_activity() >= lower_bound && registered.last_activity() <= upper_bound,
+            "new physical instance retained expired activity: old={}, registered={}, registration began={lower_bound}",
+            previous.last_activity(),
+            registered.last_activity(),
+        );
+        let lifecycle = state
+            .userapp_store
+            .get_application(&app.app_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(lifecycle).unwrap(),
+            serde_json::to_value(app).unwrap()
+        );
+        state.userapp_store_control.shutdown().await.unwrap();
+    }
+
+    /// A retained logical placeholder has no prior execution to lend a valid
+    /// activity window to the first attached physical instance.
+    #[tokio::test]
+    async fn first_physical_attachment_refreshes_old_placeholder_activity() {
+        let (state, app, _directory) = builder_access_test_state().await;
+        let previous = historical_project(&app.app_id, None);
+        state
+            .insert_project(app.app_id.clone(), Arc::new(previous.clone()))
+            .unwrap();
+        let first = physical(&app.app_id, "first-cid");
+        let lower_bound = Utc::now();
+
+        register_builder(&state, &app.app_id, &first).unwrap();
+
+        let registered = state.get_project(&app.app_id).unwrap();
+        assert_history_preserved(&previous, &registered);
+        assert!(
+            registered.last_activity() >= lower_bound,
+            "first attached execution retained the placeholder's expired activity"
+        );
+        state.userapp_store_control.shutdown().await.unwrap();
+    }
+
+    /// Repeated same-instance registration, address correction and registry
+    /// reads must preserve idle history instead of indefinitely renewing it.
+    #[tokio::test]
+    async fn same_physical_registration_and_reads_keep_expired_activity() {
+        let (state, app, _directory) = builder_access_test_state().await;
+        let basic = physical(&app.app_id, "same-cid");
+        let previous = historical_project(&app.app_id, Some(basic.clone()));
+        state
+            .insert_project(app.app_id.clone(), Arc::new(previous.clone()))
+            .unwrap();
+        let mut corrected = basic.clone();
+        corrected.container_ip = "127.0.0.2".into();
+        corrected.service_url = format!("http://127.0.0.2:{AGENT_FILE_SERVER_PORT}");
+        for observation in [&basic, &basic, &corrected] {
+            register_builder(&state, &app.app_id, observation).unwrap();
+            assert_eq!(
+                registered_builder(&state, &app.app_id)
+                    .unwrap()
+                    .container_id,
+                "same-cid"
+            );
+            let registered = state.get_project(&app.app_id).unwrap();
+            assert_eq!(registered.last_activity(), previous.last_activity());
+            assert_history_preserved(&previous, &registered);
+        }
+        assert_eq!(
+            registered_builder(&state, &app.app_id)
+                .unwrap()
+                .container_ip,
+            "127.0.0.2"
+        );
+        state.userapp_store_control.shutdown().await.unwrap();
     }
 }
 
