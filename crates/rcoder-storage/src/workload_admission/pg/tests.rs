@@ -635,3 +635,69 @@ async fn pg_workload_retirement_commit_timeout_is_deferred_and_fences_its_sessio
     );
     fixture.finish().await;
 }
+
+/// R01: PgGuard 请求通道按来源分类核验失败——会话丢失(valid=false)、会话
+/// 关闭(command 通道断)、回复未知(oneshot 被丢弃)与探针本身失败(回复携带
+/// 错误)。纯通道单测, 不依赖 PG/TLS fixture。
+#[tokio::test]
+async fn guard_request_classifies_verify_failure_sources() {
+    use std::sync::atomic::AtomicBool;
+
+    // SessionLost: guard 已失效
+    let (tx, rx) = mpsc::channel::<Command>(1);
+    let valid = Arc::new(AtomicBool::new(false));
+    let guard = PgGuard {
+        commands: tx,
+        valid: valid.clone(),
+    };
+    drop(rx);
+    assert!(matches!(
+        guard.verify().await,
+        Err(AdmissionVerifyError::SessionLost)
+    ));
+
+    // SessionClosed: valid=true 但 command 接收端已断
+    valid.store(true, Ordering::Release);
+    assert!(matches!(
+        guard.verify().await,
+        Err(AdmissionVerifyError::SessionClosed)
+    ));
+
+    // OutcomeUnknown: 命令送达但 oneshot 回执被丢弃
+    let (tx, mut rx) = mpsc::channel::<Command>(1);
+    let guard = PgGuard {
+        commands: tx,
+        valid: Arc::new(AtomicBool::new(true)),
+    };
+    tokio::spawn(async move {
+        while let Some(command) = rx.recv().await {
+            if let Command::Verify(send) = command {
+                drop(send);
+            }
+        }
+    });
+    assert!(matches!(
+        guard.verify().await,
+        Err(AdmissionVerifyError::OutcomeUnknown)
+    ));
+
+    // ProbeFailed: 回执携带探针错误
+    let (tx, mut rx) = mpsc::channel::<Command>(1);
+    let guard = PgGuard {
+        commands: tx,
+        valid: Arc::new(AtomicBool::new(true)),
+    };
+    tokio::spawn(async move {
+        while let Some(command) = rx.recv().await {
+            if let Command::Verify(send) = command {
+                let _ = send.send(Err(anyhow::anyhow!("select 1 probe failed")));
+            }
+        }
+    });
+    match guard.verify().await {
+        Err(AdmissionVerifyError::ProbeFailed(source)) => {
+            assert!(source.to_string().contains("select 1 probe failed"));
+        }
+        other => panic!("expected ProbeFailed, got {other:?}"),
+    }
+}

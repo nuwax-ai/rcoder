@@ -36,7 +36,8 @@ pub use backend::ProjectStoreBackend;
 pub use shared_types::{ContainerEntry, IdleContainerInfo, StorageStats};
 pub use stop_frame::ProjectStopFrame;
 pub use workload_admission::{
-    WorkloadAdmissionGuard, WorkloadAdmissionMode, WorkloadKey, WorkloadRegistrationFrame,
+    AdmissionVerifyError, WorkloadAdmissionGuard, WorkloadAdmissionMode, WorkloadKey,
+    WorkloadRegistrationFrame,
 };
 
 #[cfg(any(feature = "pg", feature = "userapp-turso"))]

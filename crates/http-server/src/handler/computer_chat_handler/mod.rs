@@ -231,22 +231,8 @@ async fn run_computer_chat_flow(
     // 4~5. 容器就绪/唤醒（并发等待、按需创建、空 IP 修复、映射写入、活动时间更新）
     let registered =
         container::ensure_container_ready(&state, &request, &user_id, &project_id, locale).await?;
-    state
-        .refresh_agent_workload_fence(&admission, identifier, &service_type)
-        .await
-        .map_err(|error| {
-            match error.downcast_ref::<container_runtime_api::ContainerRuntimeError>() {
-                Some(cause) => container_runtime_api::runtime_app_error(
-                    cause,
-                    "workload.reuse",
-                    container_runtime_api::RuntimeErrorContext::ReadOnly,
-                ),
-                None => AppError::with_message(
-                    shared_types::error_codes::ERR_BACKEND_ERROR,
-                    format!("Workload reuse could not be confirmed; retry later: {error}"),
-                ),
-            }
-        })?;
+    crate::handler::utils::refresh_workload_fence(&state, &admission, identifier, &service_type)
+        .await?;
     // Project clones normally share ContainerEntry. Detach the exact physical
     // snapshot before awaiting RPC work so a replacement cannot rewrite the
     // executor identity used to append this request's session later.

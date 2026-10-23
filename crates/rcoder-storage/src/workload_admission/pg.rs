@@ -144,28 +144,32 @@ impl PgGuard {
     async fn request<T>(
         &self,
         make: impl FnOnce(oneshot::Sender<Result<T>>) -> Command,
-    ) -> Result<T> {
-        ensure!(
-            self.valid.load(Ordering::Acquire),
-            "Workload admission session lost"
-        );
+    ) -> Result<T, AdmissionVerifyError> {
+        if !self.valid.load(Ordering::Acquire) {
+            return Err(AdmissionVerifyError::SessionLost);
+        }
         let (send, receive) = oneshot::channel();
         self.commands
             .send(make(send))
             .await
-            .map_err(|_| anyhow::anyhow!("Workload admission session closed"))?;
+            .map_err(|_| AdmissionVerifyError::SessionClosed)?;
         receive
             .await
-            .map_err(|_| anyhow::anyhow!("Workload admission outcome is unknown"))?
+            .map_err(|_| AdmissionVerifyError::OutcomeUnknown)?
+            .map_err(AdmissionVerifyError::ProbeFailed)
     }
-    pub(super) async fn verify(&self) -> Result<()> {
+    pub(super) async fn verify(&self) -> Result<(), AdmissionVerifyError> {
         self.request(Command::Verify).await
     }
     pub(super) async fn has_references(&self) -> Result<bool> {
-        self.request(Command::References).await
+        self.request(Command::References)
+            .await
+            .map_err(anyhow::Error::new)
     }
     pub(super) async fn capture(&self) -> Result<WorkloadRegistrationFrame> {
-        self.request(Command::Capture).await
+        self.request(Command::Capture)
+            .await
+            .map_err(anyhow::Error::new)
     }
     pub(super) async fn retire(
         &self,

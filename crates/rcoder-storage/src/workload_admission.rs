@@ -60,6 +60,22 @@ pub enum WorkloadAdmissionMode {
     Exclusive,
 }
 
+/// 准入会话核验失败的具体来源。
+///
+/// `OutcomeUnknown` 是只读 SELECT 探针的回复未知（oneshot 通道被丢弃），
+/// 不是 SQL 写入结果未知；类型明确不等于可重试，也不据此放行未知执行。
+#[derive(Debug, thiserror::Error)]
+pub enum AdmissionVerifyError {
+    #[error("Workload admission session lost")]
+    SessionLost,
+    #[error("Workload admission session closed")]
+    SessionClosed,
+    #[error("Workload admission verify outcome is unknown")]
+    OutcomeUnknown,
+    #[error("Workload admission verify probe failed")]
+    ProbeFailed(#[source] anyhow::Error),
+}
+
 pub struct WorkloadAdmissionGuard {
     key: WorkloadKey,
     mode: WorkloadAdmissionMode,
@@ -78,7 +94,14 @@ impl WorkloadAdmissionGuard {
     pub fn mode(&self) -> WorkloadAdmissionMode {
         self.mode
     }
+    /// 扁平 anyhow 视图（既有调用方）；需要区分来源的路径用 [`Self::verify_current_typed`]。
     pub async fn verify_current(&self) -> Result<()> {
+        self.verify_current_typed()
+            .await
+            .map_err(anyhow::Error::new)
+    }
+    /// 类型化核验：区分会话丢失/关闭、回复未知与探针本身失败。
+    pub async fn verify_current_typed(&self) -> Result<(), AdmissionVerifyError> {
         match &self.inner {
             Guard::Memory(_) => Ok(()),
             #[cfg(feature = "pg")]

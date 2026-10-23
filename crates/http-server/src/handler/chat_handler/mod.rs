@@ -157,22 +157,7 @@ async fn run_chat_flow(
     )
     .await?;
 
-    state
-        .refresh_agent_workload_fence(&admission, identifier, &service_type)
-        .await
-        .map_err(|error| {
-            match error.downcast_ref::<container_runtime_api::ContainerRuntimeError>() {
-                Some(cause) => container_runtime_api::runtime_app_error(
-                    cause,
-                    "workload.reuse",
-                    container_runtime_api::RuntimeErrorContext::ReadOnly,
-                ),
-                None => AppError::with_message(
-                    shared_types::error_codes::ERR_BACKEND_ERROR,
-                    format!("Workload reuse could not be confirmed; retry later: {error}"),
-                ),
-            }
-        })?;
+    handler::utils::refresh_workload_fence(&state, &admission, identifier, &service_type).await?;
 
     // 第三段：转发编排（安装检查 → session 解析 → 就绪探活 → 转发 → 响应后状态更新）
     // 自动安装检查：如果 agent_server 携带 platforms，必须同时提供 agent_id、command、version

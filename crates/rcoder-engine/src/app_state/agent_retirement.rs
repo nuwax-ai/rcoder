@@ -3,9 +3,39 @@
 
 use super::AppState;
 use rcoder_storage::{
-    WorkloadAdmissionGuard, WorkloadAdmissionMode, WorkloadKey, WorkloadRegistrationFrame,
+    AdmissionVerifyError, WorkloadAdmissionGuard, WorkloadAdmissionMode, WorkloadKey,
+    WorkloadRegistrationFrame,
 };
 use shared_types::{ServiceType, persistence::PersistenceWriteOutcome};
+
+/// 准入目标核验失败：runtime 名字解析失败或 admission 未覆盖目标。
+#[derive(Debug, thiserror::Error)]
+pub enum AgentAdmissionTargetError {
+    #[error(transparent)]
+    Runtime(#[from] container_runtime_api::ContainerRuntimeError),
+    #[error("Workload admission does not cover the captured Agent target")]
+    Mismatch,
+}
+
+/// `refresh_agent_workload_fence` 的失败来源全分类。签名即契约：新增来源会
+/// 迫使 HTTP 映射（http-server workload_reuse）补齐，不再静默落入通用后端错误。
+#[derive(Debug, thiserror::Error)]
+pub enum AgentWorkloadFenceError {
+    #[error(transparent)]
+    Target(#[from] AgentAdmissionTargetError),
+    #[error("Workload admission could not be confirmed before the runtime fence refresh")]
+    AdmissionBeforeRuntime {
+        #[source]
+        source: AdmissionVerifyError,
+    },
+    #[error("Workload admission could not be confirmed after the runtime fence refresh")]
+    AdmissionAfterRuntime {
+        #[source]
+        source: AdmissionVerifyError,
+    },
+    #[error(transparent)]
+    Runtime(#[from] container_runtime_api::ContainerRuntimeError),
+}
 
 impl AppState {
     fn verify_agent_admission_target(
@@ -13,17 +43,18 @@ impl AppState {
         guard: &WorkloadAdmissionGuard,
         identifier: &str,
         service_type: &ServiceType,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            guard.key().namespace() == self.runtime().agent_workload_namespace()
-                && guard.key().logical_name()
-                    == self
-                        .runtime()
-                        .agent_workload_name(identifier, service_type)?
-                && guard.key().family().same_container_family(*service_type),
-            "Workload admission does not cover the captured Agent target"
-        );
-        Ok(())
+    ) -> Result<(), AgentAdmissionTargetError> {
+        let expected = self
+            .runtime()
+            .agent_workload_name(identifier, service_type)?;
+        if guard.key().namespace() == self.runtime().agent_workload_namespace()
+            && guard.key().logical_name() == expected
+            && guard.key().family().same_container_family(*service_type)
+        {
+            Ok(())
+        } else {
+            Err(AgentAdmissionTargetError::Mismatch)
+        }
     }
 
     /// Explicit Stop/Restart and registered idle cleanup use the same ordering.
@@ -35,7 +66,8 @@ impl AppState {
         identifier: &str,
         service_type: &ServiceType,
     ) -> anyhow::Result<bool> {
-        self.verify_agent_admission_target(guard, identifier, service_type)?;
+        self.verify_agent_admission_target(guard, identifier, service_type)
+            .map_err(anyhow::Error::new)?;
         let snapshot = self
             .runtime()
             .capture_agent_stop(identifier, service_type)
@@ -51,7 +83,8 @@ impl AppState {
         guard: &WorkloadAdmissionGuard,
         snapshot: &container_runtime_api::AgentStopSnapshot,
     ) -> anyhow::Result<bool> {
-        self.verify_agent_admission_target(guard, &snapshot.identifier, &snapshot.service_type)?;
+        self.verify_agent_admission_target(guard, &snapshot.identifier, &snapshot.service_type)
+            .map_err(anyhow::Error::new)?;
         anyhow::ensure!(
             guard.mode() == WorkloadAdmissionMode::Exclusive,
             "Stopping Agent compute requires exclusive workload admission"
@@ -142,9 +175,12 @@ impl AppState {
         guard: &WorkloadAdmissionGuard,
         identifier: &str,
         service_type: &ServiceType,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AgentWorkloadFenceError> {
         self.verify_agent_admission_target(guard, identifier, service_type)?;
-        guard.verify_current().await?;
+        guard
+            .verify_current_typed()
+            .await
+            .map_err(|source| AgentWorkloadFenceError::AdmissionBeforeRuntime { source })?;
         let snapshot = self
             .runtime()
             .capture_agent_stop(identifier, service_type)
@@ -152,7 +188,10 @@ impl AppState {
         self.runtime()
             .refresh_agent_retirement_fence(&snapshot)
             .await?;
-        guard.verify_current().await
+        guard
+            .verify_current_typed()
+            .await
+            .map_err(|source| AgentWorkloadFenceError::AdmissionAfterRuntime { source })
     }
 
     /// Retire only the canonical frame captured before the acknowledged stop.
