@@ -3,7 +3,7 @@
 use crate::db::models;
 use anyhow::{Context, Result, ensure};
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(in crate::pg) struct ContainerRow {
     pub container_name: String,
     pub container_generation: String,
@@ -23,6 +23,7 @@ pub(in crate::pg) struct ContainerRow {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Debug, Clone)]
 pub(in crate::pg) struct ProjectRow {
     pub generation: String,
     pub row_revision: i64,
@@ -44,6 +45,7 @@ pub(in crate::pg) struct ProjectRow {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Debug, Clone)]
 pub(in crate::pg) struct SessionRow {
     pub generation: String,
     pub project_generation: String,

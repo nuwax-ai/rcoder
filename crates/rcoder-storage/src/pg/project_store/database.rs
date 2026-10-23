@@ -90,11 +90,12 @@ pub(super) async fn snapshot(
 ) -> Result<(Vec<ContainerRow>, Vec<ProjectRow>, Vec<SessionRow>)> {
     read(owner, |tx| {
         Box::pin(async move {
-            Ok((
-                repo::fetch_all_containers(tx).await?,
-                repo::fetch_all_projects(tx).await?,
-                repo::fetch_all_sessions(tx).await?,
-            ))
+            // R12: sessions 只读一次——同一批类型化行供项目分组/校验与 sync 使用,
+            // 不在 fetch_all_projects 内重复整表读取
+            let sessions = repo::fetch_all_sessions(tx).await?;
+            let containers = repo::fetch_all_containers(tx).await?;
+            let projects = repo::fetch_all_projects_with_sessions(tx, sessions.clone()).await?;
+            Ok((containers, projects, sessions))
         })
     })
     .await

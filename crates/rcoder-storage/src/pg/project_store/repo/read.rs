@@ -36,8 +36,18 @@ pub(in crate::pg) async fn fetch_all_sessions(tx: &mut dyn Executor) -> Result<V
         .collect()
 }
 pub(in crate::pg) async fn fetch_all_projects(tx: &mut dyn Executor) -> Result<Vec<ProjectRow>> {
+    let sessions = fetch_all_sessions(tx).await?;
+    fetch_all_projects_with_sessions(tx, sessions).await
+}
+
+/// 以调用方已读取的同一批 session 行做项目分组/孤儿校验（R12：snapshot
+/// 单次读取后复用；`fetch_all_projects` 仍自带读取供独立调用方使用）。
+pub(in crate::pg) async fn fetch_all_projects_with_sessions(
+    tx: &mut dyn Executor,
+    sessions: Vec<SessionRow>,
+) -> Result<Vec<ProjectRow>> {
     let mut groups = std::collections::HashMap::<(String, String), Vec<SessionRow>>::new();
-    for row in fetch_all_sessions(tx).await? {
+    for row in sessions {
         groups
             .entry((row.project_id.clone(), row.project_generation.clone()))
             .or_default()
