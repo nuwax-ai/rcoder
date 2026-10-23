@@ -21,7 +21,7 @@ impl DevServerManager {
             .await
     }
 
-    pub(super) async fn start_dev_manifest_with_readiness_probe(
+    pub(in crate::service::dev_server) async fn start_dev_manifest_with_readiness_probe(
         &self,
         project_id: &str,
         project_path: &Path,

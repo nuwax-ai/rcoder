@@ -206,6 +206,28 @@ fn original_process_identity(pid: u32) -> String {
 async fn local_manifest_observation_uses_parent_deadline_without_cancelling_original_child() {
     let env = fixture_env(SLEEP_ORCHESTRATOR).await;
     let key = "userapp:local-observation-budget";
+    // This child never serves HTTP. Own its non-ready observation instead of
+    // probing the host's fixed 9080, which another test may legitimately serve.
+    let readiness_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let readiness_addr = readiness_listener.local_addr().unwrap();
+    let readiness_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let recorded_hits = readiness_hits.clone();
+    let readiness_router = axum::Router::new().route(
+        "/",
+        axum::routing::get(move || {
+            let hits = recorded_hits.clone();
+            async move {
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            }
+        }),
+    );
+    let readiness_server = tokio::spawn(async move {
+        axum::serve(readiness_listener, readiness_router)
+            .await
+            .unwrap();
+    });
+    let readiness_client = reqwest::Client::builder().no_proxy().build().unwrap();
     let mut hooks = crate::service::dev_server::DevEventHooks::noop();
     hooks.launch_deadline =
         Some(tokio::time::Instant::now() + std::time::Duration::from_millis(400));
@@ -214,7 +236,7 @@ async fn local_manifest_observation_uses_parent_deadline_without_cancelling_orig
         let workspace = env.workspace.clone();
         async move {
             manager
-                .start_dev(
+                .start_dev_manifest_with_readiness_probe(
                     key,
                     &workspace,
                     crate::service::dev_server::DevLaunch {
@@ -224,6 +246,17 @@ async fn local_manifest_observation_uses_parent_deadline_without_cancelling_orig
                         request_context: Some("original-local-task"),
                         artifact_release_id: None,
                     },
+                    Some(&|_, _, timeout_ms| {
+                        let client = readiness_client.clone();
+                        Box::pin(async move {
+                            client
+                                .get(format!("http://{readiness_addr}/"))
+                                .timeout(std::time::Duration::from_millis(timeout_ms))
+                                .send()
+                                .await
+                                .is_ok_and(|response| response.status().is_success())
+                        })
+                    }),
                 )
                 .await
         }
@@ -259,6 +292,12 @@ async fn local_manifest_observation_uses_parent_deadline_without_cancelling_orig
         .await
         .expect("explicit Stop collects the original child");
     wait_until_dead(pid, "original local deadline child").await;
+    readiness_server.abort();
+    assert!(readiness_server.await.unwrap_err().is_cancelled());
+    assert!(
+        readiness_hits.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "deadline observation must reach the owned HTTP 503 fixture"
+    );
     assert!(stopped.killed_pids.iter().any(|k| k.pid == pid && k.killed));
     let error = observed.expect("local readiness observation must consume the parent budget rather than start another full poll window")
         .expect("local start worker").expect_err("deadline cannot be reported as readiness success");
