@@ -463,6 +463,8 @@ impl Fixture {
             activity,
             cluster_domain: "cluster.local".into(),
         });
+        let builder = runtime.builder.lock().unwrap().as_ref().unwrap().clone();
+        bind_protocol_target(&state, &builder).await;
         Self {
             state,
             store,
@@ -499,4 +501,36 @@ impl Fixture {
             .insert(project_id.into(), sid.into());
         binding
     }
+}
+
+/// Keep the production Service-FQDN key while connecting the real loopback
+/// tonic fixture. This isolates DNS from metadata/acceptance/SSE unit tests;
+/// deployed K8s E2E still exercises real Service discovery and routing.
+pub(crate) async fn bind_protocol_target(
+    state: &crate::app_state::AppState,
+    container: &ContainerBasicInfo,
+) {
+    #[cfg(all(feature = "kubernetes", not(feature = "deploy-host")))]
+    {
+        let authority = shared_types::build_grpc_addr(
+            &container.container_name,
+            &container.container_ip,
+            &state.config.app_manager.namespace,
+            &state.cluster_domain,
+        )
+        .expect("fixture production authority");
+        let endpoint = format!("http://127.0.0.1:{}", shared_types::GRPC_DEFAULT_PORT);
+        let channel = tonic::transport::Channel::from_shared(endpoint)
+            .unwrap()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .connect()
+            .await
+            .expect("real fixture tonic connection");
+        state
+            .grpc_pool
+            .bind_protocol_fixture_channel(authority, channel)
+            .await;
+    }
+    #[cfg(not(all(feature = "kubernetes", not(feature = "deploy-host"))))]
+    let _ = (state, container);
 }

@@ -38,6 +38,7 @@ deploy-host = ["rcoder-engine/deploy-host"]
 dial9 = ["rcoder-obs/dial9"]
 
 [dev-dependencies]
+rcoder-engine = { workspace = true, features = ["protocol-fixture"] }
 tokio = { workspace = true, features = ["test-util"] }
 filetime = { workspace = true }
 http-body-util = { workspace = true }

@@ -378,6 +378,11 @@ async fn accepted_tonic_chat_is_not_dispatched_again_after_registration_failure(
         &basic.container_name,
         std::net::Ipv4Addr::LOCALHOST.into(),
     );
+    crate::handler::userapp_agent_target::test_support::bind_protocol_target(
+        &fixture.state,
+        &basic,
+    )
+    .await;
     let mut result = forward_computer_request_to_container(ComputerForwardParams {
         request: &request,
         project_id: captured.project_id(),

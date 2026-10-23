@@ -144,7 +144,7 @@ impl WorkspaceRuntime for Runtime {}
 #[async_trait]
 impl UserAppDeploymentRuntime for Runtime {}
 
-fn state(
+async fn state(
     fixture: &Fixture,
     backend: Arc<crate::storage::ProjectStoreBackend>,
     owner: &str,
@@ -172,7 +172,13 @@ fn state(
     let mut state = (*fixture.state).clone();
     state.projects = backend;
     state.runtime = runtime.clone();
-    (Arc::new(state), runtime)
+    let state = Arc::new(state);
+    crate::handler::userapp_agent_target::test_support::bind_protocol_target(
+        &state,
+        &runtime.physical(),
+    )
+    .await;
+    (state, runtime)
 }
 fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -241,7 +247,7 @@ async fn stop_while_new_chat_is_accepted(
     } else {
         format!("new-sid-{suffix}")
     };
-    let (state, runtime) = state(&fixture, backend, &owner);
+    let (state, runtime) = state(&fixture, backend, &owner).await;
     seed(&state, runtime.physical(), &project, &old_sid).await;
     fixture
         .agent
@@ -361,7 +367,7 @@ async fn committed_memory_stop_releases_only_its_captured_session_claim() {
     let owner = format!("committed-user-{}", uuid::Uuid::new_v4().simple());
     let project = "committed-stop-project";
     let sid = "committed-stop-session";
-    let (state, runtime) = state(&fixture, memory(), &owner);
+    let (state, runtime) = state(&fixture, memory(), &owner).await;
     seed(&state, runtime.physical(), project, sid).await;
     fixture
         .agent
@@ -390,7 +396,7 @@ async fn stop_without_catalog_frame_does_not_clear_any_session_claim() {
     let owner = format!("uncatalogued-user-{}", uuid::Uuid::new_v4().simple());
     let project = "uncatalogued-stop-project";
     let sid = "uncatalogued-stop-session";
-    let (state, runtime) = state(&fixture, memory(), &owner);
+    let (state, runtime) = state(&fixture, memory(), &owner).await;
     fixture
         .agent
         .sessions
@@ -498,7 +504,7 @@ async fn postgres_capture_error_still_stops_owned_runtime_and_reports_catalog_un
     let project = format!("capture-project-{suffix}");
     let sid = format!("capture-sid-{suffix}");
     let backend = Arc::new(crate::storage::ProjectStoreBackend::Postgres(store.clone()));
-    let (state, runtime) = state(&fixture, backend, &owner);
+    let (state, runtime) = state(&fixture, backend, &owner).await;
     seed(&state, runtime.physical(), &project, &sid).await;
     fixture
         .agent

@@ -65,12 +65,9 @@ impl Fixture {
                 owner_pid: None,
             };
             fixture.manifests("first");
-            match std::net::TcpListener::bind(("0.0.0.0", fixture.planned_business_port())) {
-                Ok(listener) => {
-                    drop(listener);
-                    return fixture;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            match protocol_support::business_port_available(fixture.planned_business_port()) {
+                Ok(true) => return fixture,
+                Ok(false) => continue,
                 Err(error) => panic!("inspect actual fixture business port: {error}"),
             }
         }

@@ -161,7 +161,7 @@ impl WorkspaceRuntime for Runtime {}
 #[async_trait]
 impl UserAppDeploymentRuntime for Runtime {}
 
-fn state(fixture: &Fixture) -> (Arc<crate::app_state::AppState>, Arc<Runtime>) {
+async fn state(fixture: &Fixture) -> (Arc<crate::app_state::AppState>, Arc<Runtime>) {
     let mut state = (*fixture.state).clone();
     let runtime = Arc::new(Runtime {
         basic: super::project().container_info().unwrap(),
@@ -175,7 +175,13 @@ fn state(fixture: &Fixture) -> (Arc<crate::app_state::AppState>, Arc<Runtime>) {
         std::net::Ipv4Addr::LOCALHOST.into(),
     );
     state.runtime = runtime.clone();
-    (Arc::new(state), runtime)
+    let state = Arc::new(state);
+    crate::handler::userapp_agent_target::test_support::bind_protocol_target(
+        &state,
+        &runtime.basic,
+    )
+    .await;
+    (state, runtime)
 }
 fn router(state: Arc<crate::app_state::AppState>) -> Router {
     Router::new()
@@ -239,7 +245,7 @@ fn chats(fixture: &Fixture) -> usize {
 #[tokio::test]
 async fn http_legacy_runner_placeholder_is_not_registered_or_replayed_and_next_request_recovers() {
     let fixture = Fixture::new().await;
-    let (state, runtime) = state(&fixture);
+    let (state, runtime) = state(&fixture).await;
     // Simulate an older Runner that already accepted one prompt and returned
     // its legacy reservation label instead of an ACP session identity.
     fixture
@@ -323,7 +329,7 @@ async fn http_legacy_runner_placeholder_is_not_registered_or_replayed_and_next_r
 #[tokio::test]
 async fn status_does_not_publish_a_legacy_session_or_treat_it_as_a_live_query_identity() {
     let fixture = Fixture::new().await;
-    let (state, runtime) = state(&fixture);
+    let (state, runtime) = state(&fixture).await;
     let mut legacy = super::project();
     legacy.restore_session("pending");
     state
@@ -374,7 +380,7 @@ async fn http_chat_owner_conflicts_return_typed_409_before_any_agent_dispatch() 
         shared_types::ComputerOwnerMismatch::ServiceFamily,
     ] {
         let fixture = Fixture::new().await;
-        let (state, runtime) = state(&fixture);
+        let (state, runtime) = state(&fixture).await;
         let mut registered = super::project();
         match mismatch {
             shared_types::ComputerOwnerMismatch::User => {
@@ -446,7 +452,7 @@ async fn http_chat_owner_conflicts_return_typed_409_before_any_agent_dispatch() 
 #[tokio::test]
 async fn http_chat_inside_cache_ttl_dispatches_once_with_current_physical_pod() {
     let fixture = Fixture::new().await;
-    let (state, runtime) = state(&fixture);
+    let (state, runtime) = state(&fixture).await;
     let mut dead = runtime.basic.clone();
     dead.container_id = "externally-deleted-pod".into();
     *runtime.cached.lock().unwrap() = Some(dead);
@@ -485,7 +491,7 @@ async fn http_chat_inside_cache_ttl_dispatches_once_with_current_physical_pod() 
 #[tokio::test]
 async fn http_chat_completion_merges_concurrent_metadata_and_immediate_sse_finds_session() {
     let fixture = Fixture::new().await;
-    let (state, runtime) = state(&fixture);
+    let (state, runtime) = state(&fixture).await;
     *fixture.agent.after_chat.lock().unwrap() = Some(Box::new({
         let state = state.clone();
         move || {
@@ -539,7 +545,7 @@ async fn http_chat_completion_merges_concurrent_metadata_and_immediate_sse_finds
 #[tokio::test]
 async fn http_chat_retired_during_accepted_rpc_returns_conflict_and_keeps_session_without_replay() {
     let fixture = Fixture::new().await;
-    let (state, runtime) = state(&fixture);
+    let (state, runtime) = state(&fixture).await;
     *fixture.agent.after_chat.lock().unwrap() = Some(Box::new({
         let state = state.clone();
         move || {
@@ -587,7 +593,7 @@ async fn two_postgres_http_instances_register_concurrent_projects_and_immediate_
         return;
     };
     let fixture = Fixture::new().await;
-    let (base, runtime) = state(&fixture);
+    let (base, runtime) = state(&fixture).await;
     let config = PostgresConfig {
         url: Some(dsn),
         ..Default::default()

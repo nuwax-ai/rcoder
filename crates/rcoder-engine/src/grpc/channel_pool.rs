@@ -255,3 +255,8 @@ mod tests {
         assert!(debug_str.contains("GrpcChannelPool"));
     }
 }
+
+// The controlled protocol harness can supply a real connected channel under
+// the exact production authority. Normal construction and dialing are unchanged.
+#[cfg(feature = "protocol-fixture")]
+mod protocol_fixture;
