@@ -690,26 +690,23 @@ impl AgentContainerRuntime for DockerRuntime {
                     let result = crate::agent_container_starter::AgentContainerStarter::new(&inner)
                         .start_prepared(params.clone(), prepared)
                         .await;
-                    if let (Err(error), Some(context)) = (&result, context.as_ref())
-                        && let Some(physical_id) = acknowledged_partial_creation(error)
+                    let partial_id = result.as_ref().err()
+                        .and_then(acknowledged_partial_creation)
+                        .map(str::to_owned);
+                    let result = result.map_err(crate::runtime::builder_completion::docker_error);
+                    if let (Some(context), Some(physical_id)) = (context.as_ref(), partial_id.as_deref())
                     {
                         // Save known-complete writes before returning the original
                         // failure. Recovery can drain this exact created resource;
                         // it must still separately observe management readiness.
-                        if let Err(record_error) = Self::new(inner.clone())
-                            .record_partial_creation(context, physical_id, lease.receipt())
-                            .await
-                        {
-                            return crate::runtime::builder_completion::finish(
-                                lease,
-                                Err(ContainerRuntimeError::ContainerCreationError(format!(
-                                    "{error}; persist partial creation evidence: {record_error}"
-                                ))),
-                            )
-                            .await;
-                        }
+                        let runtime = Self::new(inner.clone());
+                        crate::runtime::builder_completion::record_partial_creation(
+                            result,
+                            runtime.record_partial_creation(context, physical_id, lease.receipt()),
+                        ).await
+                    } else {
+                        result
                     }
-                    result.map_err(crate::runtime::builder_completion::docker_error)
                 };
                 let result = match (result, context.as_ref()) {
                     (Ok(info), Some(context)) => {

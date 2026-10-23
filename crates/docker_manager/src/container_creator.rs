@@ -887,6 +887,11 @@ mod lifecycle_cache_tests {
                     ),
                     status == Some(403)
                 );
+                assert_eq!(
+                    container_runtime_api::runtime_mutation_outcome_unknown(&classified),
+                    status != Some(403),
+                    "a daemon response or lost reply cannot prove create was not committed"
+                );
             }
         })
         .await

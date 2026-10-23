@@ -169,6 +169,7 @@ pub(super) fn is_runtime_absence(error: &container_runtime_api::ContainerRuntime
         | Error::Conflict(_)
         | Error::ConnectionError(_)
         | Error::ContainerCreationError(_)
+        | Error::DockerCreationIncomplete { .. }
         | Error::ContainerStartError(_)
         | Error::ContainerStopError(_)
         | Error::ManagementNotRunning

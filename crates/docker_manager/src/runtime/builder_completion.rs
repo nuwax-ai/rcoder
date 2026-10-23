@@ -21,7 +21,7 @@ pub(crate) fn k8s_error(message: String, error: kube::Error) -> Error {
 /// - 传输断连/超时（请求已发出、无回复）→ ConnectionError/Timeout，
 ///   `runtime_mutation_outcome_unknown` 判真（mutation 结果未知）；
 /// - create 已确认 CID 后续阶段失败（ContainerCreationIncomplete）→
-///   保留 CID 与阶段证据，按 source 同样四分；source 无法归类时保守判未知。
+///   保留 CID、Docker 阶段与类型化 source，整次创建保留恢复围栏。
 pub(crate) fn docker_error(error: crate::DockerError) -> Error {
     use crate::DockerError as D;
     match error {
@@ -52,32 +52,17 @@ pub(crate) fn docker_error(error: crate::DockerError) -> Error {
     }
 }
 
-/// 已确认 create CID 后的失败：CID 与阶段保留在消息中，结果按 source 分类。
+/// 已确认 create CID 后的失败：当次 API 拒绝不能抹掉前面成功的 create。
 fn incomplete_creation_error(
     container_id: String,
     phase: crate::ContainerCreationPhase,
     source: crate::DockerError,
 ) -> Error {
-    use crate::DockerError as D;
-    let note = format!("container {container_id} created but {phase}");
-    match source {
-        D::ConnectionError(message) => Error::ConnectionError(format!("{note}: {message}")),
-        D::Timeout(message) => Error::Timeout(format!("{note}: {message}")),
-        D::BollardError(inner) => {
-            if let bollard::errors::Error::DockerResponseServerError {
-                status_code,
-                message,
-            } = &inner
-                && let Some(rejection) =
-                    RuntimeRequestRejection::from_status(*status_code, format!("{note}: {message}"))
-            {
-                return Error::RequestRejected(rejection);
-            }
-            // 传输断连或响应不可解码：容器已创建而后续阶段结果未知 → 保守判未知
-            Error::ConnectionError(format!("{note}: {}", bollard_error(inner)))
-        }
-        D::ContainerStartError(message) => Error::ContainerStartError(format!("{note}: {message}")),
-        other => Error::ConnectionError(format!("{note}: {other}")),
+    Error::DockerCreationIncomplete {
+        container_id,
+        phase,
+        source: Box::new(docker_error(source)),
+        recording_failure: None,
     }
 }
 
@@ -92,10 +77,8 @@ fn bollard_error(source: bollard::errors::Error) -> Error {
             {
                 Error::RequestRejected(rejection)
             } else {
-                // 5xx/408/499：响应已收到（服务端失败或不可证明静止），创建未完成，确定失败
-                Error::ContainerCreationError(format!(
-                    "docker server response {status_code}: {message}"
-                ))
+                // 408/499/5xx 并不证明 mutation 未提交；保持结果未知。
+                Error::DockerError(format!("docker server response {status_code}: {message}"))
             }
         }
         bollard::errors::Error::HttpClientError { err } => {
@@ -105,6 +88,22 @@ fn bollard_error(source: bollard::errors::Error) -> Error {
         // 响应已收到但不可解码等：无法证明写未发生，保守判未知
         other => Error::DockerError(other.to_string()),
     }
+}
+
+/// Receipt failure is secondary to the acknowledged create and original phase
+/// error. It cannot erase that evidence or release the creation recovery fence.
+pub(crate) async fn record_partial_creation<T>(
+    mut result: ContainerRuntimeResult<T>,
+    recording: impl Future<Output = ContainerRuntimeResult<()>>,
+) -> ContainerRuntimeResult<T> {
+    if let Err(Error::DockerCreationIncomplete {
+        recording_failure, ..
+    }) = &mut result
+        && let Err(error) = recording.await
+    {
+        *recording_failure = Some(Box::new(error));
+    }
+    result
 }
 
 pub(crate) async fn finish<T>(
@@ -279,6 +278,24 @@ mod docker_error_classification_tests {
         }
     }
 
+    #[test]
+    fn ambiguous_server_response_during_create_keeps_unknown_outcome() {
+        for status in [408, 499, 500, 503, 504] {
+            let runtime_error = docker_error(crate::DockerError::BollardError(
+                bollard::errors::Error::DockerResponseServerError {
+                    status_code: status,
+                    message: "daemon failed after accepting request".into(),
+                },
+            ));
+            assert!(!matches!(runtime_error, Error::RequestRejected(_)));
+            assert!(
+                container_runtime_api::runtime_mutation_outcome_unknown(&runtime_error),
+                "{status}: {runtime_error}"
+            );
+            assert!(runtime_error.to_string().contains(&status.to_string()));
+        }
+    }
+
     /// R03 反例: create 已确认 CID 后 start/observe 断连——结果未知, 且 CID
     /// 证据不得在 to_string 压平中丢失。
     #[test]
@@ -306,6 +323,60 @@ mod docker_error_classification_tests {
                 runtime_error.to_string().contains("cid-evidence-9"),
                 "confirmed container id must survive conversion: {runtime_error}"
             );
+            let Error::DockerCreationIncomplete {
+                container_id,
+                phase: actual_phase,
+                source,
+                ..
+            } = runtime_error
+            else {
+                panic!("confirmed creation must retain typed evidence");
+            };
+            assert_eq!(container_id, "cid-evidence-9");
+            assert_eq!(actual_phase, phase);
+            match phase {
+                ContainerCreationPhase::Start => {
+                    assert!(matches!(*source, Error::ConnectionError(_)));
+                }
+                ContainerCreationPhase::Observe => {
+                    assert!(matches!(*source, Error::Timeout(_)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_start_preserves_confirmed_creation_and_request_rejection() {
+        for status in [403, 409] {
+            let error = docker_error(crate::DockerError::ContainerCreationIncomplete {
+                container_id: "created-before-start".into(),
+                phase: ContainerCreationPhase::Start,
+                source: Box::new(crate::DockerError::BollardError(
+                    bollard::errors::Error::DockerResponseServerError {
+                        status_code: status,
+                        message: "start denied".into(),
+                    },
+                )),
+            });
+            assert!(!error.is_definitive_rejection());
+            assert!(container_runtime_api::runtime_mutation_outcome_unknown(
+                &error
+            ));
+            let Error::DockerCreationIncomplete {
+                container_id,
+                phase,
+                source,
+                ..
+            } = error
+            else {
+                panic!("start rejection cannot erase acknowledged create");
+            };
+            assert_eq!(container_id, "created-before-start");
+            assert_eq!(phase, ContainerCreationPhase::Start);
+            let Error::RequestRejected(rejection) = *source else {
+                panic!("the individual request rejection must remain typed");
+            };
+            assert_eq!(rejection.status, status);
         }
     }
 

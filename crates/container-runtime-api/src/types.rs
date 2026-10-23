@@ -115,6 +115,23 @@ pub enum ContainerRuntimeError {
     #[error("Container creation failed: {0}")]
     ContainerCreationError(String),
 
+    /// Docker create already acknowledged this physical container. A later
+    /// request's rejection does not reject or roll back the whole creation.
+    /// Retain its recovery fence until the confirmed partial resource settles.
+    #[error(
+        "Docker container {container_id} exists but {phase} failed: {source}{recording_note}",
+        recording_note = docker_recording_failure_note(.recording_failure.as_deref())
+    )]
+    DockerCreationIncomplete {
+        container_id: String,
+        phase: DockerCreationPhase,
+        #[source]
+        source: Box<ContainerRuntimeError>,
+        /// Secondary diagnostic; never replaces the original phase failure or
+        /// turns the acknowledged create into a whole-operation rejection.
+        recording_failure: Option<Box<ContainerRuntimeError>>,
+    },
+
     #[error("Container start failed: {0}")]
     ContainerStartError(String),
 
@@ -155,6 +172,29 @@ pub enum ContainerRuntimeError {
         progress: CreationProgress,
         source: Box<ContainerRuntimeError>,
     },
+}
+
+fn docker_recording_failure_note(error: Option<&ContainerRuntimeError>) -> String {
+    error
+        .map(|error| format!("; partial creation evidence could not be recorded: {error}"))
+        .unwrap_or_default()
+}
+
+/// Docker stages after create has returned a physical container ID. These are
+/// separate from the Kubernetes application orchestration stages below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockerCreationPhase {
+    Start,
+    Observe,
+}
+
+impl std::fmt::Display for DockerCreationPhase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Start => "start",
+            Self::Observe => "observe started container",
+        })
+    }
 }
 
 /// One stage of the K8s application creation chain, in execution order.

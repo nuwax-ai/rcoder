@@ -423,6 +423,7 @@ fn replacement_verification_error(
         | ContainerRuntimeError::PreparationFailed(_)
         | ContainerRuntimeError::ConnectionError(_)
         | ContainerRuntimeError::ContainerCreationError(_)
+        | ContainerRuntimeError::DockerCreationIncomplete { .. }
         | ContainerRuntimeError::ContainerStartError(_)
         | ContainerRuntimeError::ContainerStopError(_)
         | ContainerRuntimeError::ManagementNotRunning

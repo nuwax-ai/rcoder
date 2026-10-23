@@ -52,7 +52,10 @@ pub fn runtime_error_code(error: &ContainerRuntimeError) -> (&'static str, &'sta
         ContainerRuntimeError::RequestRejected(_) => {
             (ERR_BACKEND_ERROR, "Runtime rejected the request")
         }
-        ContainerRuntimeError::CreationAborted { source, .. } => runtime_error_code(source),
+        ContainerRuntimeError::CreationAborted { source, .. }
+        | ContainerRuntimeError::DockerCreationIncomplete { source, .. } => {
+            runtime_error_code(source)
+        }
         ContainerRuntimeError::K8sError(_) | ContainerRuntimeError::DockerError(_) => {
             (ERR_CONTAINER_ERROR, "Unclassified runtime failure")
         }
@@ -64,6 +67,9 @@ pub fn runtime_error_code(error: &ContainerRuntimeError) -> (&'static str, &'sta
 pub fn runtime_mutation_outcome_unknown(error: &ContainerRuntimeError) -> bool {
     match error {
         ContainerRuntimeError::CreationAborted { progress, .. } => !progress.safe_finish_ok(),
+        // The failing sub-request can be definitive while the whole creation
+        // still needs recovery of its acknowledged physical container.
+        ContainerRuntimeError::DockerCreationIncomplete { .. } => true,
         ContainerRuntimeError::ConnectionError(_)
         | ContainerRuntimeError::Timeout(_)
         | ContainerRuntimeError::K8sError(_)
@@ -71,7 +77,17 @@ pub fn runtime_mutation_outcome_unknown(error: &ContainerRuntimeError) -> bool {
         ContainerRuntimeError::RequestRejected(rejection) => {
             !(400..500).contains(&rejection.status) || matches!(rejection.status, 408 | 499)
         }
-        _ => false,
+        ContainerRuntimeError::CreationCancelled
+        | ContainerRuntimeError::OperationInProgress(_)
+        | ContainerRuntimeError::PreparationFailed(_)
+        | ContainerRuntimeError::Conflict(_)
+        | ContainerRuntimeError::ContainerCreationError(_)
+        | ContainerRuntimeError::ContainerStartError(_)
+        | ContainerRuntimeError::ContainerStopError(_)
+        | ContainerRuntimeError::ManagementNotRunning
+        | ContainerRuntimeError::ContainerNotFound(_)
+        | ContainerRuntimeError::ConfigurationError(_)
+        | ContainerRuntimeError::ContainerExecError(_) => false,
     }
 }
 
@@ -95,7 +111,9 @@ pub fn runtime_app_error(
         .with_error_detail(ErrorDetail::new(cause_code, stage, message).with_retryable(retryable));
     // A registration or a later observation must never fabricate an operation.
     let mut origin = error;
-    while let ContainerRuntimeError::CreationAborted { source, .. } = origin {
+    while let ContainerRuntimeError::CreationAborted { source, .. }
+    | ContainerRuntimeError::DockerCreationIncomplete { source, .. } = origin
+    {
         origin = source;
     }
     if let ContainerRuntimeError::OperationInProgress(operation) = origin
@@ -133,7 +151,9 @@ pub fn runtime_pg_command_error(
     };
     let mut result = PgCommandError::new(code, summary, evidence).with_cause_code(cause_code);
     let mut origin = error;
-    while let ContainerRuntimeError::CreationAborted { source, .. } = origin {
+    while let ContainerRuntimeError::CreationAborted { source, .. }
+    | ContainerRuntimeError::DockerCreationIncomplete { source, .. } = origin
+    {
         origin = source;
     }
     if let ContainerRuntimeError::OperationInProgress(operation) = origin
@@ -187,6 +207,41 @@ mod tests {
                 .into_http_result::<()>("en-US");
             assert_eq!(response.code, expected);
             assert!(!response.error_detail.unwrap().retryable);
+        }
+    }
+
+    #[test]
+    fn docker_partial_creation_keeps_whole_operation_unknown_and_typed_cause() {
+        for status in [403, 409] {
+            let source = ContainerRuntimeError::RequestRejected(
+                shared_types::RuntimeRequestRejection::from_status(status, "start denied".into())
+                    .unwrap(),
+            );
+            assert!(source.is_definitive_rejection());
+            let error = ContainerRuntimeError::DockerCreationIncomplete {
+                container_id: "confirmed-cid".into(),
+                phase: crate::DockerCreationPhase::Start,
+                source: Box::new(source),
+                recording_failure: None,
+            };
+            assert!(!error.is_definitive_rejection());
+            assert!(!error.creation_safe_finish());
+            assert!(runtime_mutation_outcome_unknown(&error));
+            assert!(std::error::Error::source(&error).is_some());
+            let response = runtime_app_error(&error, "create", RuntimeErrorContext::Mutation)
+                .into_http_result::<()>("en-US");
+            assert_eq!(response.code, ERR_OPERATION_OUTCOME_UNKNOWN);
+            let detail = response.error_detail.unwrap();
+            assert_eq!(
+                detail.reason_code,
+                if status == 409 {
+                    ERR_CONFLICT
+                } else {
+                    ERR_BACKEND_ERROR
+                }
+            );
+            assert!(!detail.retryable);
+            assert!(response.message.contains("confirmed-cid"));
         }
     }
 
