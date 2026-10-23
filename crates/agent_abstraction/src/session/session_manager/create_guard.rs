@@ -78,10 +78,14 @@ where
         self.create_session_leader_path(
             &project_id,
             project_path,
-            model_provider,
-            start_config,
-            service_uuid,
-            true,
+            SessionCreationConfig {
+                model_provider,
+                start_config,
+                service_uuid,
+                force_new_session: true,
+                api_key_manager: None,
+                project_uuid_map: None,
+            },
         )
         .await
         .map(|(entry, _)| entry)
@@ -95,10 +99,16 @@ where
         &self,
         project_id: String,
         project_path: PathBuf,
-        model_provider: Option<ModelProviderConfig>,
-        start_config: AgentStartConfig,
-        service_uuid: Option<String>,
+        config: SessionCreationConfig,
     ) -> Result<R::Entry> {
+        let SessionCreationConfig {
+            model_provider,
+            start_config,
+            service_uuid,
+            api_key_manager,
+            project_uuid_map,
+            ..
+        } = config;
         info!("Creating Agent session, project ID: {}", project_id);
 
         // 创建 SACP 启动器
@@ -107,7 +117,8 @@ where
             self.model_env_resolver.clone(),
             self.permission_handler.clone(),
             self.diagnostics_listener.clone(),
-        );
+        )
+        .with_api_config_maps(api_key_manager, project_uuid_map);
 
         // 记录是否使用了 resume（仅用于日志）
         let has_resume = start_config.resume_session_id.is_some();
@@ -181,18 +192,13 @@ where
     /// 快速复用后，创建请求按 project_id 合流为 leader/follower；leader 在
     /// 执行转换锁内完成停旧、退出确认、启动和登记。DashMap guard 不跨 await，
     /// 不同 project 独立；控制请求在相同锁内完成旧实例清理。
-    /// 有效模型配置比较（见 [`effective_model_config_changed`]）：
-    /// 依据当前 resolver（direct/proxy）比较影响存活进程的字段。
+    /// 比较影响实际进程及其代理绑定的有效模型配置。
     fn effective_model_changed(
         &self,
         existing: Option<&ModelProviderConfig>,
         new: Option<&ModelProviderConfig>,
     ) -> bool {
-        effective_model_config_changed(
-            self.model_env_resolver.uses_proxy_credentials(),
-            existing,
-            new,
-        )
+        effective_model_config_changed(existing, new)
     }
 
     pub async fn get_or_create_session(
@@ -202,13 +208,6 @@ where
         session_id_hint: Option<String>,
         mut config: SessionCreationConfig,
     ) -> Result<(R::Entry, bool)> {
-        // 本次请求的 API 配置默认视为"未使用"：复用/follower/创建失败路径在
-        // drop 时移除，只有 leader 真正以它启动新进程后才解除（dismiss）。
-        let mut unused_config = UnusedRequestConfig {
-            service_uuid: config.service_uuid.clone(),
-            api_key_manager: config.api_key_manager.clone(),
-            dismissed: false,
-        };
         let session_id_hint = shared_types::SessionHint::classify(session_id_hint.as_deref())
             .as_session_id()
             .map(str::to_owned);
@@ -294,7 +293,7 @@ where
                 .acp_session_create_timeout_secs
                 .unwrap_or(shared_types::DEFAULT_ACP_SESSION_CREATE_TIMEOUT_SECS),
         );
-        let outcome = match role {
+        match role {
             SessionCreateRole::Leader(handle) => {
                 self.create_as_leader(handle, &project_id_key, project_path, config)
                     .await
@@ -303,15 +302,7 @@ where
                 self.join_as_follower(handle, &project_id_key, timeout, &config.model_provider)
                     .await
             }
-        };
-        if let Ok((_, created)) = &outcome
-            && *created
-        {
-            // 新进程以本次请求的 service_uuid 启动：配置由该进程的生命周期
-            // 守卫接管，不再按"未使用"清理。
-            unused_config.dismissed = true;
         }
-        outcome
     }
 
     /// Leader 路径：CreateGuard 保证退出时（含 panic）必广播 outcome 并移除条目。
@@ -352,14 +343,7 @@ where
         // launcher 自己处理 handshake deadline 并等待失败子进程退出。
         // 这里不再用同一 deadline 抢先 drop launcher，single-flight 保持到清理完成。
         let result = self
-            .create_session_leader_path(
-                project_id,
-                project_path,
-                config.model_provider,
-                config.start_config,
-                config.service_uuid,
-                config.force_new_session,
-            )
+            .create_session_leader_path(project_id, project_path, config)
             .await;
         guard.outcome = Some(result.clone());
         result.map_err(anyhow::Error::msg)
@@ -374,28 +358,17 @@ where
         &self,
         project_id: &str,
         project_path: PathBuf,
-        model_provider: Option<ModelProviderConfig>,
-        start_config: AgentStartConfig,
-        service_uuid: Option<String>,
-        force_new_session: bool,
+        config: SessionCreationConfig,
     ) -> Result<(R::Entry, bool), String> {
-        let reconciliation = start_config.clone();
+        let reconciliation = config.start_config.clone();
+        let model_provider = config.model_provider.clone();
         create_after_reconciliation(
             self.registry.as_ref(),
             project_id,
             &model_provider,
             &reconciliation,
-            force_new_session,
-            self.model_env_resolver.uses_proxy_credentials(),
-            || {
-                self.create_session_internal(
-                    project_id.to_owned(),
-                    project_path,
-                    model_provider.clone(),
-                    start_config,
-                    service_uuid,
-                )
-            },
+            config.force_new_session,
+            || self.create_session_internal(project_id.to_owned(), project_path, config),
         )
         .await
     }
@@ -463,7 +436,6 @@ async fn create_after_reconciliation<R, F, Fut>(
     model_provider: &Option<ModelProviderConfig>,
     start_config: &AgentStartConfig,
     force_new_session: bool,
-    resolver_uses_proxy: bool,
     create: F,
 ) -> Result<(R::Entry, bool), String>
 where
@@ -480,11 +452,8 @@ where
         let session_id_str = existing.session_id().to_string();
         let established = require_session_identity(existing.session_id()).is_ok();
         let channel_closed = existing.is_channel_closed();
-        let model_changed = effective_model_config_changed(
-            resolver_uses_proxy,
-            existing.model_provider(),
-            model_provider.as_ref(),
-        );
+        let model_changed =
+            effective_model_config_changed(existing.model_provider(), model_provider.as_ref());
         let resume_changed = start_config
             .resume_session_id
             .as_deref()
@@ -641,34 +610,6 @@ where
         current.remove();
     }
     Err(CreatedSessionRejection::Retired(rejection))
-}
-
-/// 请求级 API 配置清理守卫（R04）：代理配置绑定实际进程代次——
-/// - 复用存活会话：本轮 service_uuid 未被任何进程使用，drop 时移除；
-/// - follower：同上（共享 leader 建立的进程，用的是 leader 那轮的 uuid）；
-/// - 创建失败：同上；
-/// - 新建成功：`dismissed` 置位，配置由新进程的生命周期守卫在退出时清理。
-pub(crate) struct UnusedRequestConfig {
-    service_uuid: Option<String>,
-    #[allow(dead_code)]
-    api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
-    dismissed: bool,
-}
-
-impl Drop for UnusedRequestConfig {
-    fn drop(&mut self) {
-        if self.dismissed {
-            return;
-        }
-        let (Some(uuid), Some(manager)) = (&self.service_uuid, &self.api_key_manager) else {
-            return;
-        };
-        manager.remove(uuid);
-        tracing::debug!(
-            service_uuid = %uuid,
-            "removed per-request API config unused by any live process"
-        );
-    }
 }
 
 #[cfg(test)]

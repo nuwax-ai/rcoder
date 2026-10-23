@@ -82,16 +82,10 @@ pub(crate) fn require_session_identity(session_id: &SessionId) -> Result<()> {
     }
 }
 
-/// 有效模型配置比较（R05）：provider 身份（id）相同不代表进程有效配置相同。
-///
-/// 只比较确实影响**存活进程执行**的字段：模型选择（default_model）、协议
-/// （api_protocol/wire_api）、provider_name 与认证形态（requires_openai_auth）
-/// 恒定参与；direct 模式凭据/端点固化在子进程环境（api_key/base_url）也参与；
-/// proxy 模式凭据由代理按请求生效、不进子进程环境，不参与——避免凭据轮换
-/// 触发无谓重启。`id` 是身份不是内容版本，不参与比较。None/Some 组合仍视为
-/// 变化（与既有语义一致）。
+/// 比较实际执行使用的模型配置；provider id 是身份，不是内容版本。
+/// direct 环境及代理 UUID 绑定都会保留本代次的 endpoint/凭据，因此两种模式
+/// 的轮换都需要沿既有受控停旧、确认退出、再建流程生效。
 pub(crate) fn effective_model_config_changed(
-    resolver_uses_proxy: bool,
     existing: Option<&ModelProviderConfig>,
     new: Option<&ModelProviderConfig>,
 ) -> bool {
@@ -114,9 +108,6 @@ pub(crate) fn effective_model_config_changed(
     if !common {
         return true;
     }
-    if resolver_uses_proxy {
-        return false;
-    }
     (&existing.base_url, &existing.api_key) != (&new.base_url, &new.api_key)
 }
 
@@ -127,9 +118,9 @@ pub struct SessionCreationConfig {
     pub start_config: AgentStartConfig,
     pub service_uuid: Option<String>,
     pub force_new_session: bool,
-    /// 共享 API 配置表。复用/失败路径据此移除**本次请求未使用**的配置；
-    /// 新进程启动成功后由生命周期守卫按代次接管清理（见 create_guard）。
+    /// 只有实际代理进程启动才向共享表写入配置，由 reaper 确认退出后清理。
     pub api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
+    pub project_uuid_map: Option<Arc<DashMap<String, String>>>,
 }
 
 /// ACP 会话管理器 (SACP 版本)

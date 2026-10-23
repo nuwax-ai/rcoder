@@ -29,6 +29,8 @@ pub struct AgentRequest {
     pub model_provider: Option<ModelProviderConfig>,
     pub service_uuid: Option<String>,
     pub shared_api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
+    /// 存活代理进程的 project_id → service_uuid 绑定。
+    pub project_uuid_map: Option<Arc<DashMap<String, String>>>,
 }
 
 impl AgentRequest {
@@ -41,11 +43,17 @@ impl AgentRequest {
             model_provider,
             service_uuid: None,
             shared_api_key_manager: None,
+            project_uuid_map: None,
         }
     }
 
     pub fn with_service_uuid(mut self, service_uuid: Option<String>) -> Self {
         self.service_uuid = service_uuid;
+        self
+    }
+
+    pub fn with_project_uuid_map(mut self, map: Arc<DashMap<String, String>>) -> Self {
+        self.project_uuid_map = Some(map);
         self
     }
 
@@ -146,6 +154,7 @@ impl AgentSessionService {
             attachment_blocks,
             service_uuid: request.service_uuid.clone(),
             shared_api_key_manager: request.shared_api_key_manager.clone(),
+            project_uuid_map: request.project_uuid_map.clone(),
         };
 
         let worker_response = self.worker.process_request(worker_request).await?;

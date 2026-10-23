@@ -295,7 +295,6 @@ async fn unconfirmed_factory_stop_retains_exact_execution_and_blocks_new_factory
             &None,
             &config,
             false,
-            false,
             || {
                 creates.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Ok(rejected.clone()))
@@ -332,7 +331,6 @@ async fn unconfirmed_factory_stop_retains_exact_execution_and_blocks_new_factory
             &None,
             &config,
             false,
-            false,
             || {
                 creates.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Ok(replacement.clone()))
@@ -354,7 +352,6 @@ async fn unconfirmed_factory_stop_retains_exact_execution_and_blocks_new_factory
             "owned-project",
             &None,
             &config,
-            false,
             false,
             || {
                 retry_creates.fetch_add(1, Ordering::SeqCst);
@@ -402,19 +399,12 @@ async fn rejected_foreign_factory_with_failed_reaping_retains_only_raw_entry_and
     let (rejected, _old_prompts) = entry("foreign-session", Some(lifecycle.clone()));
     let creates = AtomicUsize::new(0);
     let config = creation_config();
-    let first = create_after_reconciliation(
-        &registry,
-        "owned-project",
-        &None,
-        &config,
-        false,
-        false,
-        || {
+    let first =
+        create_after_reconciliation(&registry, "owned-project", &None, &config, false, || {
             creates.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Ok(rejected.clone()))
-        },
-    )
-    .await;
+        })
+        .await;
     assert!(creation_error(first).contains("controlled reaper failure"));
     assert_eq!(
         registry.get("owned-project").unwrap().status,
@@ -429,35 +419,21 @@ async fn rejected_foreign_factory_with_failed_reaping_retains_only_raw_entry_and
     assert_eq!(registry.publications.load(Ordering::SeqCst), 0);
 
     let (replacement, _new_prompts) = entry("replacement-opaque", None);
-    let blocked = create_after_reconciliation(
-        &registry,
-        "owned-project",
-        &None,
-        &config,
-        false,
-        false,
-        || {
+    let blocked =
+        create_after_reconciliation(&registry, "owned-project", &None, &config, false, || {
             creates.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Ok(replacement.clone()))
-        },
-    )
-    .await;
+        })
+        .await;
     assert!(blocked.is_err());
     assert_eq!(creates.load(Ordering::SeqCst), 1);
     lifecycle.fail_wait.store(false, Ordering::SeqCst);
-    let recovered = create_after_reconciliation(
-        &registry,
-        "owned-project",
-        &None,
-        &config,
-        false,
-        false,
-        || {
+    let recovered =
+        create_after_reconciliation(&registry, "owned-project", &None, &config, false, || {
             creates.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Ok(replacement))
-        },
-    )
-    .await;
+        })
+        .await;
     assert!(recovered.is_ok());
     assert!(lifecycle.is_stopped());
     assert_eq!(creates.load(Ordering::SeqCst), 2);
@@ -479,50 +455,29 @@ async fn missing_factory_lifecycle_blocks_only_live_execution_and_closed_history
         let (rejected, old_prompts) = entry(sid, None);
         let creates = AtomicUsize::new(0);
         let config = creation_config();
-        let first = create_after_reconciliation(
-            &registry,
-            "owned-project",
-            &None,
-            &config,
-            false,
-            false,
-            || {
+        let first =
+            create_after_reconciliation(&registry, "owned-project", &None, &config, false, || {
                 creates.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Ok(rejected.clone()))
-            },
-        )
-        .await;
+            })
+            .await;
         assert!(creation_error(first).contains("lifecycle handle is missing"));
         let (replacement, _new_prompts) = entry("replacement", None);
-        let blocked = create_after_reconciliation(
-            &registry,
-            "owned-project",
-            &None,
-            &config,
-            false,
-            false,
-            || {
+        let blocked =
+            create_after_reconciliation(&registry, "owned-project", &None, &config, false, || {
                 creates.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Ok(replacement.clone()))
-            },
-        )
-        .await;
+            })
+            .await;
         assert!(creation_error(blocked).contains("lifecycle handle is missing"));
         assert_eq!(creates.load(Ordering::SeqCst), 1);
         drop(old_prompts);
-        let recovered = create_after_reconciliation(
-            &registry,
-            "owned-project",
-            &None,
-            &config,
-            false,
-            false,
-            || {
+        let recovered =
+            create_after_reconciliation(&registry, "owned-project", &None, &config, false, || {
                 creates.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Ok(replacement))
-            },
-        )
-        .await;
+            })
+            .await;
         assert!(
             recovered.is_ok(),
             "closed historical channels do not prove a live execution"
@@ -543,31 +498,20 @@ async fn rejected_factory_with_confirmed_exit_does_not_leave_a_startup_gate() {
     let lifecycle = ControlledLifecycle::new(false, false);
     let (rejected, _old_prompts) = entry("pending", Some(lifecycle.clone()));
     let config = creation_config();
-    let result = create_after_reconciliation(
-        &registry,
-        "owned-project",
-        &None,
-        &config,
-        false,
-        false,
-        || std::future::ready(Ok(rejected)),
-    )
-    .await;
+    let result =
+        create_after_reconciliation(&registry, "owned-project", &None, &config, false, || {
+            std::future::ready(Ok(rejected))
+        })
+        .await;
     assert!(result.is_err());
     assert!(lifecycle.is_stopped());
     assert!(!registry.contains("owned-project"));
     assert_eq!(registry.publications.load(Ordering::SeqCst), 0);
     let (replacement, _new_prompts) = entry("next-real-session", None);
     assert!(
-        create_after_reconciliation(
-            &registry,
-            "owned-project",
-            &None,
-            &config,
-            false,
-            false,
-            || { std::future::ready(Ok(replacement)) }
-        )
+        create_after_reconciliation(&registry, "owned-project", &None, &config, false, || {
+            std::future::ready(Ok(replacement))
+        })
         .await
         .is_ok()
     );
@@ -604,7 +548,6 @@ async fn cancelled_factory_rejection_remains_manageable_and_retry_waits_for_orig
                         "owned-project",
                         &None,
                         &creation_config(),
-                        false,
                         false,
                         || {
                             creates.fetch_add(1, Ordering::SeqCst);
@@ -663,7 +606,6 @@ async fn cancelled_factory_rejection_remains_manageable_and_retry_waits_for_orig
                         "owned-project",
                         &None,
                         &creation_config(),
-                        false,
                         false,
                         || {
                             creates.fetch_add(1, Ordering::SeqCst);
@@ -845,12 +787,9 @@ fn provider_config(id: &str) -> ModelProviderConfig {
     }
 }
 
-/// R04 反例: 第二轮同 SID 复用存活进程时, 本轮请求的 service_uuid 配置
-/// 未被任何进程使用——必须移除, 而存活进程绑定的旧 uuid 配置必须保留
-/// (否则该进程发出的代理请求 404)。修复前(仅有 dispatch 抢占式清除)
-/// 复用路径无任何清理, 且 agent_runner 侧已把旧配置删掉。
+/// 第二轮复用不得删除存活进程绑定，也不应登记未被任何进程使用的新 UUID。
 #[tokio::test]
-async fn reuse_removes_unused_request_config_and_keeps_live_binding() {
+async fn reuse_keeps_live_binding_and_does_not_register_request_config() {
     let registry = Arc::new(FactoryRegistry::default());
     let manager = AcpSessionManager::new(Arc::new(NoopNotifier), registry.clone());
     let provider = provider_config("p1");
@@ -861,7 +800,6 @@ async fn reuse_removes_unused_request_config_and_keeps_live_binding() {
 
     let manager_map: Arc<DashMap<String, ModelProviderConfig>> = Arc::new(DashMap::new());
     manager_map.insert("live-uuid".into(), provider.clone());
-    manager_map.insert("request-uuid-2".into(), provider.clone());
 
     let (reused, created) = manager
         .get_or_create_session(
@@ -874,6 +812,7 @@ async fn reuse_removes_unused_request_config_and_keeps_live_binding() {
                 service_uuid: Some("request-uuid-2".into()),
                 force_new_session: false,
                 api_key_manager: Some(manager_map.clone()),
+                project_uuid_map: None,
             },
         )
         .await
@@ -893,33 +832,6 @@ async fn reuse_removes_unused_request_config_and_keeps_live_binding() {
         !manager_map.contains_key("request-uuid-2"),
         "this round's unused config must be removed (credential hygiene)"
     );
-}
-
-/// R04: 请求级守卫本身——dismiss 后不清理(新进程接管), 未 dismiss 移除。
-#[test]
-fn unused_request_config_guard_semantics() {
-    let map: Arc<DashMap<String, ModelProviderConfig>> = Arc::new(DashMap::new());
-    map.insert("u".into(), provider_config("p"));
-    let mut guard = UnusedRequestConfig {
-        service_uuid: Some("u".into()),
-        api_key_manager: Some(map.clone()),
-        dismissed: true,
-    };
-    guard.dismissed = false;
-    drop(guard);
-    assert!(
-        !map.contains_key("u"),
-        "undismissed guard removes the config"
-    );
-
-    map.insert("u2".into(), provider_config("p"));
-    let owned = UnusedRequestConfig {
-        service_uuid: Some("u2".into()),
-        api_key_manager: Some(map.clone()),
-        dismissed: true,
-    };
-    drop(owned);
-    assert!(map.contains_key("u2"), "dismissed guard keeps the config");
 }
 
 // ── R05：有效模型配置（identity ≠ 内容）───────────────────────────────────
@@ -956,6 +868,7 @@ async fn request_reuse(
                 service_uuid: None,
                 force_new_session: false,
                 api_key_manager: None,
+                project_uuid_map: None,
             },
         )
         .await
@@ -995,39 +908,39 @@ async fn direct_mode_endpoint_change_must_not_reuse() {
     }
 }
 
-/// R05: proxy 模式凭据由代理按请求生效——同 id 轮换 base_url/api_key 仍复用；
-/// default_model 变化仍不复用。
+/// proxy UUID 的配置同样绑定进程代次；同 id 轮换 endpoint/key 不能静默复用。
 #[tokio::test]
-async fn proxy_mode_credential_rotation_reuses_but_model_change_does_not() {
-    let registry = Arc::new(FactoryRegistry::default());
-    let manager = AcpSessionManager::with_model_env_resolver(
-        Arc::new(NoopNotifier),
-        registry.clone(),
-        Arc::new(
-            crate::launcher::model_env::ProxyModelRuntimeEnvResolver::new(
-                "http://127.0.0.1:1/api/{SERVICE_UUID}",
+async fn proxy_mode_credential_rotation_must_not_reuse_stale_binding() {
+    for changed in [
+        ModelProviderConfig {
+            base_url: "https://rotated.example".into(),
+            ..provider_config("p1")
+        },
+        ModelProviderConfig {
+            api_key: "rotated".into(),
+            ..provider_config("p1")
+        },
+    ] {
+        let registry = Arc::new(FactoryRegistry::default());
+        let manager = AcpSessionManager::with_model_env_resolver(
+            Arc::new(NoopNotifier),
+            registry.clone(),
+            Arc::new(
+                crate::launcher::model_env::ProxyModelRuntimeEnvResolver::new(
+                    "http://127.0.0.1:1/api/{SERVICE_UUID}",
+                ),
             ),
-        ),
-    );
-    let (mut live, _prompts) = entry("opaque/session:r05p", None);
-    live.model_provider = Some(provider_config("p1"));
-    live.status = AgentStatus::Idle;
-    registry.insert("owned-project", "opaque/session:r05p", live);
-
-    let mut rotated = provider_config("p1");
-    rotated.base_url = "https://rotated.example".into();
-    rotated.api_key = "rotated".into();
-    let (reused, created) = request_reuse(&manager, rotated)
-        .await
-        .expect("proxy credential rotation reuses");
-    assert!(!created);
-    assert_eq!(reused.session_id.0.as_ref(), "opaque/session:r05p");
-
-    let mut model_changed = provider_config("p1");
-    model_changed.default_model = "m-new".into();
-    let result = request_reuse(&manager, model_changed).await;
-    let silently_reused = matches!(&result, Ok((entry, false)) if entry.session_id.0.as_ref() == "opaque/session:r05p");
-    assert!(!silently_reused, "proxy model change must not reuse");
+        );
+        let (mut live, _prompts) = entry("opaque/session:r05", None);
+        live.model_provider = Some(provider_config("p1"));
+        live.status = AgentStatus::Idle;
+        registry.insert("owned-project", "opaque/session:r05", live);
+        let result = request_reuse(&manager, changed).await;
+        assert!(
+            result.is_err(),
+            "a live process without an exit handle must not be silently reused after credential rotation"
+        );
+    }
 }
 
 /// R05: 完全等价配置（含 id 变化但内容相同）保持复用——id 是身份不是内容版本。
@@ -1039,32 +952,357 @@ fn effective_comparison_treats_identity_as_not_content() {
         ..base.clone()
     };
     assert!(!effective_model_config_changed(
-        false,
         Some(&base),
         Some(&same_content_new_id)
     ));
-    assert!(!effective_model_config_changed(
-        false,
-        Some(&base),
-        Some(&base)
-    ));
+    assert!(!effective_model_config_changed(Some(&base), Some(&base)));
     let mut model = base.clone();
     model.default_model = "m2".into();
-    assert!(effective_model_config_changed(
-        false,
-        Some(&base),
-        Some(&model)
-    ));
+    assert!(effective_model_config_changed(Some(&base), Some(&model)));
     let mut key = base.clone();
     key.api_key = "k2".into();
     assert!(
-        effective_model_config_changed(false, Some(&base), Some(&key)),
+        effective_model_config_changed(Some(&base), Some(&key)),
         "direct bakes credentials"
     );
-    assert!(
-        !effective_model_config_changed(true, Some(&base), Some(&key)),
-        "proxy does not bake credentials"
+    assert!(effective_model_config_changed(Some(&base), None));
+    assert!(!effective_model_config_changed(None, None));
+}
+
+fn proxy_fixture_config(
+    root: &std::path::Path,
+    provider: Option<ModelProviderConfig>,
+    uuid: Option<&str>,
+    keys: &Arc<DashMap<String, ModelProviderConfig>>,
+    mappings: &Arc<DashMap<String, String>>,
+) -> SessionCreationConfig {
+    SessionCreationConfig {
+        model_provider: provider,
+        service_uuid: uuid.map(str::to_owned),
+        force_new_session: false,
+        api_key_manager: Some(keys.clone()),
+        project_uuid_map: Some(mappings.clone()),
+        start_config: AgentStartConfig::new(shared_types::ServiceType::ComputerAgentRunner)
+            .with_acp_session_create_timeout(10)
+            .with_agent_server_override(shared_types::ChatAgentServerConfig {
+                command: Some(
+                    which::which("python3")
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                args: Some(vec![format!(
+                    "{}/tests/fixtures/proxy_binding_acp.py",
+                    env!("CARGO_MANIFEST_DIR")
+                )]),
+                env: Some(std::collections::HashMap::from([(
+                    "ACP_PROXY_FIXTURE_DIR".into(),
+                    root.to_string_lossy().into_owned(),
+                )])),
+                ..Default::default()
+            }),
+    }
+}
+
+async fn wait_for_fixture_events(root: &std::path::Path, event: &str, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let rows = std::fs::read_to_string(root.join("events.jsonl")).unwrap_or_default();
+            let count = rows
+                .lines()
+                .filter(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()["event"] == event
+                })
+                .count();
+            if count == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fixture event deadline exceeded");
+}
+
+/// 真实 ACP 子进程验证整个 manager → launcher → reaper 链：spawn 持有配置，
+/// 同配置复用不写请求 UUID，轮换先回收旧绑定再登记新绑定，None 不制造配置。
+#[tokio::test]
+async fn proxy_process_binding_tracks_spawn_reuse_rotation_and_no_provider() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = Arc::new(FactoryRegistry::default());
+    let manager = AcpSessionManager::with_model_env_resolver(
+        Arc::new(NoopNotifier),
+        registry,
+        Arc::new(
+            crate::launcher::model_env::ProxyModelRuntimeEnvResolver::new(
+                "http://127.0.0.1:1/api/{SERVICE_UUID}",
+            ),
+        ),
     );
-    assert!(effective_model_config_changed(false, Some(&base), None));
-    assert!(!effective_model_config_changed(false, None, None));
+    let keys = Arc::new(DashMap::new());
+    let mappings = Arc::new(DashMap::new());
+    let provider = provider_config("binding-provider");
+    let (first, created) = manager
+        .get_or_create_session(
+            "proxy-binding-project",
+            root.path().into(),
+            None,
+            proxy_fixture_config(
+                root.path(),
+                Some(provider.clone()),
+                Some("binding-one"),
+                &keys,
+                &mappings,
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(created);
+    assert_eq!(keys.get("binding-one").unwrap().api_key, provider.api_key);
+    assert_eq!(
+        mappings.get("proxy-binding-project").unwrap().value(),
+        "binding-one"
+    );
+    let (reused, created) = manager
+        .get_or_create_session(
+            "proxy-binding-project",
+            root.path().into(),
+            Some(first.session_id.to_string()),
+            proxy_fixture_config(
+                root.path(),
+                Some(provider.clone()),
+                Some("unused-reuse"),
+                &keys,
+                &mappings,
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(!created);
+    assert_eq!(reused.session_id, first.session_id);
+    assert_eq!(keys.len(), 1);
+    assert!(!keys.contains_key("unused-reuse"));
+
+    let rotated = ModelProviderConfig {
+        base_url: "https://rotated.example".into(),
+        api_key: "rotated-test-key".into(),
+        ..provider
+    };
+    let (replacement, created) = manager
+        .get_or_create_session(
+            "proxy-binding-project",
+            root.path().into(),
+            Some(first.session_id.to_string()),
+            proxy_fixture_config(
+                root.path(),
+                Some(rotated.clone()),
+                Some("binding-two"),
+                &keys,
+                &mappings,
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        created,
+        "rotation must not silently retain the stale binding"
+    );
+    assert!(first.lifecycle_handle().unwrap().is_stopped());
+    assert!(!keys.contains_key("binding-one"));
+    assert_eq!(*keys.get("binding-two").unwrap(), rotated);
+    assert_eq!(
+        mappings.get("proxy-binding-project").unwrap().value(),
+        "binding-two"
+    );
+
+    let (without_provider, created) = manager
+        .get_or_create_session(
+            "proxy-binding-project",
+            root.path().into(),
+            None,
+            proxy_fixture_config(root.path(), None, None, &keys, &mappings),
+        )
+        .await
+        .unwrap();
+    assert!(created);
+    assert!(replacement.lifecycle_handle().unwrap().is_stopped());
+    assert!(keys.is_empty());
+    assert!(mappings.is_empty());
+    without_provider
+        .lifecycle_handle()
+        .unwrap()
+        .graceful_stop()
+        .await
+        .unwrap();
+    wait_for_fixture_events(root.path(), "spawn", 3).await;
+}
+
+/// leader handshake 尚未完成时 follower 共享同一真实进程；其请求 UUID 不登记，
+/// 不得删 leader 绑定，也不得因共享创建结果重复 spawn。
+#[tokio::test]
+async fn proxy_binding_follower_uses_only_leader_process_config() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("hold-new"), "hold").unwrap();
+    let manager = Arc::new(AcpSessionManager::with_model_env_resolver(
+        Arc::new(NoopNotifier),
+        Arc::new(FactoryRegistry::default()),
+        Arc::new(
+            crate::launcher::model_env::ProxyModelRuntimeEnvResolver::new(
+                "http://127.0.0.1:1/api/{SERVICE_UUID}",
+            ),
+        ),
+    ));
+    let keys = Arc::new(DashMap::new());
+    let mappings = Arc::new(DashMap::new());
+    let first_config = proxy_fixture_config(
+        root.path(),
+        Some(provider_config("p")),
+        Some("leader-uuid"),
+        &keys,
+        &mappings,
+    );
+    let follower_config = proxy_fixture_config(
+        root.path(),
+        Some(provider_config("p")),
+        Some("follower-uuid"),
+        &keys,
+        &mappings,
+    );
+    let leader = tokio::spawn({
+        let manager = manager.clone();
+        let path = root.path().to_owned();
+        async move {
+            manager
+                .get_or_create_session("proxy-follower-project", path, None, first_config)
+                .await
+        }
+    });
+    wait_for_fixture_events(root.path(), "session_request", 1).await;
+    assert!(
+        keys.contains_key("leader-uuid"),
+        "config must exist before ACP handshake completes"
+    );
+    let baseline_receivers = manager
+        .in_flight
+        .get("proxy-follower-project")
+        .expect("leader must remain in flight behind the handshake barrier")
+        .tx
+        .receiver_count();
+    let follower = tokio::spawn({
+        let manager = manager.clone();
+        let path = root.path().to_owned();
+        async move {
+            manager
+                .get_or_create_session("proxy-follower-project", path, None, follower_config)
+                .await
+        }
+    });
+    // Observe an additional real watch subscriber before releasing handshake;
+    // an eventual fast reuse cannot stand in for this join-path assertion.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let follower_joined = manager
+                .in_flight
+                .get("proxy-follower-project")
+                .is_some_and(|handle| handle.tx.receiver_count() > baseline_receivers);
+            if follower_joined {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("follower must subscribe to the leader outcome before release");
+    std::fs::write(root.path().join("release-new"), "release").unwrap();
+    let (leader_entry, leader_created) = leader.await.unwrap().unwrap();
+    let (follower_entry, follower_created) = follower.await.unwrap().unwrap();
+    assert!(leader_created);
+    assert!(!follower_created);
+    assert_eq!(leader_entry.session_id, follower_entry.session_id);
+    assert_eq!(keys.len(), 1);
+    assert!(!keys.contains_key("follower-uuid"));
+    assert_eq!(
+        mappings.get("proxy-follower-project").unwrap().value(),
+        "leader-uuid"
+    );
+    leader_entry
+        .lifecycle_handle()
+        .unwrap()
+        .graceful_stop()
+        .await
+        .unwrap();
+    assert!(keys.is_empty());
+    assert!(mappings.is_empty());
+    wait_for_fixture_events(root.path(), "spawn", 1).await;
+}
+
+/// direct/禁 proxy 的真实进程永不登记代理配置；spawn 失败也不得残留配置。
+#[tokio::test]
+async fn direct_process_and_failed_proxy_spawn_leave_no_proxy_binding() {
+    let root = tempfile::tempdir().unwrap();
+    let keys = Arc::new(DashMap::new());
+    let mappings = Arc::new(DashMap::new());
+    let manager =
+        AcpSessionManager::new(Arc::new(NoopNotifier), Arc::new(FactoryRegistry::default()));
+    let (direct, created) = manager
+        .get_or_create_session(
+            "direct-binding-project",
+            root.path().into(),
+            None,
+            proxy_fixture_config(
+                root.path(),
+                Some(provider_config("p")),
+                Some("unused-direct"),
+                &keys,
+                &mappings,
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(created);
+    assert!(keys.is_empty());
+    assert!(mappings.is_empty());
+    direct
+        .lifecycle_handle()
+        .unwrap()
+        .graceful_stop()
+        .await
+        .unwrap();
+
+    let manager = AcpSessionManager::with_model_env_resolver(
+        Arc::new(NoopNotifier),
+        Arc::new(FactoryRegistry::default()),
+        Arc::new(
+            crate::launcher::model_env::ProxyModelRuntimeEnvResolver::new(
+                "http://127.0.0.1:1/api/{SERVICE_UUID}",
+            ),
+        ),
+    );
+    let mut config = proxy_fixture_config(
+        root.path(),
+        Some(provider_config("p")),
+        Some("failed-spawn"),
+        &keys,
+        &mappings,
+    );
+    config
+        .start_config
+        .agent_server_override
+        .as_mut()
+        .unwrap()
+        .command = Some(
+        root.path()
+            .join("missing-agent")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let failure = manager
+        .get_or_create_session("failed-binding-project", root.path().into(), None, config)
+        .await;
+    assert!(failure.is_err());
+    assert!(
+        keys.is_empty(),
+        "spawn failure must roll back pre-spawn configuration"
+    );
+    assert!(mappings.is_empty());
 }

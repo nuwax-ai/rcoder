@@ -1,7 +1,7 @@
 //! 阶段3: 结果组装
 //!
 //! 等待 agent 响应（5 分钟超时），成功时提交 PendingGuard，
-//! 失败/超时时回滚 API key 配置；准备租约释放不等于取消已受理的执行。
+//! 准备租约释放不等于取消已受理的执行；API 配置由真实进程生命周期管理。
 
 use shared_types::error_codes;
 use tokio::time::Duration;
@@ -28,7 +28,6 @@ pub(super) async fn finalize_response(
         was_reloaded,
         ..
     } = preparation;
-    let expected_uuid = agent_request.service_uuid.clone();
     // ========== 步骤9: 等待响应（5 分钟超时）==========
     match tokio::time::timeout(
         Duration::from_secs(300),
@@ -69,15 +68,8 @@ pub(super) async fn finalize_response(
         Ok(Err(e)) => {
             // PendingGuard 自动清理（在 drop 时）
             error!("[ChatHandler] Agent session processing failed: {}", e);
-            // 回滚 step7 写入的 API key 配置，避免失败累积泄漏（DashMap::remove 幂等）
-            if let Some(uuid) = expected_uuid.as_ref()
-                && context
-                    .project_uuid_map
-                    .remove_if(&project_id, |_, current| current == uuid)
-                    .is_some()
-            {
-                context.shared_api_key_manager.remove(uuid);
-            }
+            // API 配置归实际代理进程持有；请求失败或等待超时不能证明进程退出。
+            // 启动失败由 launcher 回滚，成功启动后只由 reaper 在确认退出后清理。
             ChatHandlerOutput::error(
                 project_id,
                 session_id.unwrap_or_default(),
@@ -96,15 +88,8 @@ pub(super) async fn finalize_response(
                 "[ChatHandler] ⏰ Chat request timeout (300s): project_id={}",
                 project_id
             );
-            // 回滚 step7 写入的 API key 配置，避免失败累积泄漏（DashMap::remove 幂等）
-            if let Some(uuid) = expected_uuid.as_ref()
-                && context
-                    .project_uuid_map
-                    .remove_if(&project_id, |_, current| current == uuid)
-                    .is_some()
-            {
-                context.shared_api_key_manager.remove(uuid);
-            }
+            // API 配置归实际代理进程持有；请求失败或等待超时不能证明进程退出。
+            // 启动失败由 launcher 回滚，成功启动后只由 reaper 在确认退出后清理。
             ChatHandlerOutput::error(
                 project_id,
                 session_id.unwrap_or_default(),

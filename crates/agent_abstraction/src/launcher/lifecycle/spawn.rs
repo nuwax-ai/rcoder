@@ -137,6 +137,12 @@ impl AgentLifecycleGuard {
         let command_for_reaper = process_command.clone();
         let args_for_reaper = process_args.clone();
         let working_dir_for_reaper = working_dir.clone();
+        if let (Some(uuid), Some(map)) = (&service_uuid, &project_uuid_map) {
+            map.insert(project_id.clone(), uuid.clone());
+        }
+        let manager_for_reaper = shared_api_key_manager.clone();
+        let uuid_map_for_reaper = project_uuid_map.clone();
+        let uuid_for_reaper = service_uuid.clone();
         let (exit_tx, exit_result) = tokio::sync::watch::channel(None);
         let reaper_task = tokio::spawn(async move {
             info!(
@@ -162,6 +168,20 @@ impl AgentLifecycleGuard {
                 .as_ref()
                 .map(|_| ())
                 .map_err(ToString::to_string);
+
+            // 仅真实 wait 成功才能收回该代次的配置。取消受理、Drop 或未知
+            // wait 结果都不能先删仍可能被活进程使用的绑定。先清理再发布退出，
+            // 保证重试复用同一个请求 UUID 时，新进程配置不会被旧 reaper 删除。
+            if exit_outcome.is_ok()
+                && let Some(uuid) = &uuid_for_reaper
+            {
+                if let Some(map) = &uuid_map_for_reaper {
+                    map.remove_if(&project_id_for_reaper, |_, current| current == uuid);
+                }
+                if let Some(manager) = &manager_for_reaper {
+                    manager.remove(uuid);
+                }
+            }
 
             // 检查是否是外部取消（用户主动 stop）
             let was_cancelled = cancel_token_for_reaper.is_cancelled();
@@ -298,12 +318,6 @@ impl AgentLifecycleGuard {
             process_args,
             working_dir,
         });
-
-        // 映射反映**存活进程**的绑定（R04）：新进程以此 uuid 启动，成功后发布；
-        // 复用路径不触碰映射，旧进程退出时由生命周期守卫按 CAS 收回。
-        if let (Some(uuid), Some(map)) = (&inner.service_uuid, &inner.project_uuid_map) {
-            map.insert(inner.project_id.clone(), uuid.clone());
-        }
 
         info!(
             "[LifecycleGuard] 创建 Claude Agent 守卫: project_id={}, pgid={}, session_id={:?}",

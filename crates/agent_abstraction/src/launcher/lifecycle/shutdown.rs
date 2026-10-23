@@ -280,17 +280,7 @@ impl Drop for AgentLifecycleGuard {
             // 发送取消信号
             self.inner.cancel_token.cancel();
 
-            // 本代次进程退出：清理它独有的代理 API 配置与映射（R04——配置绑定
-            // 进程代次，而非"最新一次请求"）。映射按 CAS 只清仍指向自己的一格；
-            // 与 agent_runner stop_agent 的清理幂等共存（remove 对缺席键为 no-op）。
-            if let Some(uuid) = &self.inner.service_uuid {
-                if let Some(map) = &self.inner.project_uuid_map {
-                    map.remove_if(&self.inner.project_id, |_, current| current == uuid);
-                }
-                if let Some(manager) = &self.inner.shared_api_key_manager {
-                    manager.remove(uuid);
-                }
-            }
+            // API 配置保持到 reaper 确认 child.wait 成功，Drop 仅请求终止。
 
             // 🔥 同步终止进程组
             #[cfg(unix)]

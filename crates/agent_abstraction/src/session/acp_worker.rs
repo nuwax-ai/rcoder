@@ -222,6 +222,7 @@ where
                         service_uuid: request.service_uuid.clone(),
                         force_new_session: prompt_message.force_new_session,
                         api_key_manager: request.shared_api_key_manager.clone(),
+                        project_uuid_map: request.project_uuid_map.clone(),
                     },
                 )
                 .await

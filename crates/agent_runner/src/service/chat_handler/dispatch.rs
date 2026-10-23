@@ -7,7 +7,7 @@
 //! - 步骤 8: 创建 AgentRequest
 
 use shared_types::{ChatPromptBuilder, error_codes};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info};
 
 use super::types::{ChatHandlerContext, ChatHandlerInput, ChatHandlerOutput, SessionPreparation};
 use crate::service::AgentRequest;
@@ -101,42 +101,13 @@ pub(super) async fn dispatch_task(
         None
     };
 
-    // 存储 API 配置到共享 DashMap
-    if let (Some(provider), Some(ref service_uuid_ref)) =
-        (model_provider.as_ref(), service_uuid.as_ref())
-    {
-        debug!(
-            "[ChatHandler] 使用模型配置: provider={}, model={}, base_url={}, api_protocol={:?}, requires_openai_auth={}, service_uuid={}",
-            provider.name,
-            provider.default_model,
-            provider.base_url,
-            provider.api_protocol,
-            provider.requires_openai_auth,
-            service_uuid_ref
-        );
-
-        // 存储 ModelProviderConfig 到共享 DashMap（使用 UUID 作为 key）。
-        // 不在此处清除上一轮 uuid 的配置（R04）：快速复用路径不重启进程，
-        // 存活进程的启动环境仍指向旧 uuid，抢占式清除会让它的代理请求 404。
-        // 归属改为进程代次——复用/失败路径由会话管理移除本次未使用的配置，
-        // 新进程发布映射并在退出时由生命周期守卫按代次清理（含凭据不泄漏）。
-        context
-            .shared_api_key_manager
-            .insert(service_uuid_ref.to_string(), provider.clone());
-
-        info!(
-            "[ChatHandler] Stored API config: service_uuid={}, provider_name={}, base_url={}",
-            service_uuid_ref,
-            provider.name,
-            shared_types::mask_url(&provider.base_url)
-        );
-    } else {
-        warn!("[ChatHandler] No model config provided; falling back to env vars or defaults");
-    }
+    // 配置只在 launcher 确定实际代理进程并即将 spawn 时登记。
+    // 复用、follower、direct 模式及启动前失败均不产生未使用的凭据记录。
 
     // ========== 步骤8: 直接调用 Agent 会话服务 ==========
     // 创建请求并设置 UUID 和密钥管理器
     Ok(AgentRequest::new(prompt_message, model_provider)
         .with_service_uuid(service_uuid)
-        .with_key_manager(Some(context.shared_api_key_manager.clone())))
+        .with_key_manager(Some(context.shared_api_key_manager.clone()))
+        .with_project_uuid_map(context.project_uuid_map.clone()))
 }
