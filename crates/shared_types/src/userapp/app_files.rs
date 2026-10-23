@@ -4,9 +4,9 @@
 //! with private DTO copies.
 //!
 //! Wire shape is frozen to the current contract: snake_case keys, flat
-//! `success`, `extracted_count: null` for plain single-file uploads. Missing
-//! required fields are a hard deserialization error - a silently defaulted
-//! empty listing would mask a contract break.
+//! `success`, `extracted_count: null` for plain single-file uploads. The listing reader keeps the legacy omitted-`files` default; DTO
+//! extraction must not tighten the established forwarding contract. Other
+//! required fields, including the existing success confirmation, stay required.
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -45,6 +45,8 @@ pub struct UserappAppFilesListResult {
     /// Always true on HTTP 200; error paths use the business error envelope.
     pub success: bool,
     /// Entries directly inside the requested directory (non-recursive).
+    /// Older successful peers may omit an empty listing.
+    #[serde(default)]
     pub files: Vec<UserappAppFilesEntry>,
 }
 
@@ -88,7 +90,7 @@ mod tests {
     }
 
     #[test]
-    fn list_wire_snapshot_and_missing_files_is_an_error() {
+    fn list_wire_snapshot_preserves_omitted_empty_listing() {
         let value = UserappAppFilesListResult {
             success: true,
             files: vec![UserappAppFilesEntry {
@@ -108,12 +110,29 @@ mod tests {
                 ],
             })
         );
-        // 缺 files 不得默认成空清单（契约破坏要暴露，不是静默成功）
+        // Keep the legacy reader default while always serializing `files`.
+        let empty: UserappAppFilesListResult =
+            serde_json::from_value(serde_json::json!({"success": true})).unwrap();
+        assert!(empty.files.is_empty());
+        assert_eq!(
+            serde_json::to_value(empty).unwrap(),
+            serde_json::json!({"success": true, "files": []})
+        );
+    }
+    /// The forwarding reader accepted a successful legacy listing without
+    /// `files`; introducing a shared DTO must not tighten that contract.
+    #[test]
+    fn legacy_listing_without_files_still_deserializes() {
+        let parsed: UserappAppFilesListResult = serde_json::from_value(
+            serde_json::json!({"success": true, "legacy_extension": "ignored"}),
+        )
+        .expect("legacy omitted files is an empty listing");
+        assert!(parsed.success);
+        assert!(parsed.files.is_empty());
         assert!(
-            serde_json::from_value::<UserappAppFilesListResult>(serde_json::json!({
-                "success": true
-            }))
-            .is_err()
+            serde_json::from_value::<UserappAppFilesListResult>(serde_json::json!({"files": []}))
+                .is_err(),
+            "success remains mandatory as in the forwarding envelope check"
         );
     }
 }

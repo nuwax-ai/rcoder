@@ -511,13 +511,13 @@ struct MachineErrorBody {
     reason: String,
     message: String,
     diagnostic_id: String,
-    /// `Some(Value::Null)` 表示键存在、值为 null（唤醒诊断与 Pingap 出口语义）。
+    /// Outer `None` omits the key; `Some(None)` preserves explicit JSON null.
     #[serde(skip_serializing_if = "Option::is_none")]
-    operation_id: Option<serde_json::Value>,
+    operation_id: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    blocker: Option<serde_json::Value>,
+    blocker: Option<Option<Box<shared_types::UserAppOperationBlocker>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error_detail: Option<serde_json::Value>,
+    error_detail: Option<shared_types::ErrorDetail>,
 }
 
 impl MachineErrorPayload {
@@ -547,23 +547,23 @@ impl MachineErrorPayload {
         failure: &shared_types::WakeFailure,
         locale: &str,
     ) -> Self {
-        self.error.operation_id = Some(serde_json::json!(failure.operation_id));
-        self.error.blocker = Some(serde_json::json!(failure.blocker));
-        self.error.error_detail = Some(serde_json::json!(
+        self.error.operation_id = Some(failure.operation_id.clone());
+        self.error.blocker = Some(failure.blocker.clone());
+        self.error.error_detail = Some(
             shared_types::ErrorDetail::new(
                 failure.cause_code.as_ref(),
                 failure.stage.as_ref(),
                 failure.message.clone(),
             )
             .with_retryable(failure.retryable)
-            .localized(locale)
-        ));
+            .localized(locale),
+        );
         self
     }
 
     /// Pingap 自产错误出口：operation_id 键始终存在（值可为 null）。
     pub(crate) fn with_operation_id(mut self, operation_id: Option<String>) -> Self {
-        self.error.operation_id = Some(serde_json::json!(operation_id));
+        self.error.operation_id = Some(operation_id);
         self
     }
 
