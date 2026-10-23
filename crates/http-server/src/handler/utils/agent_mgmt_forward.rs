@@ -14,13 +14,12 @@ use futures_util::stream;
 use shared_types::ProjectAndContainerInfo;
 use shared_types::grpc::agent_mgmt_service_client::AgentMgmtServiceClient;
 use shared_types::grpc::{
-    AgentDetailInfo as ProtoAgentDetailInfo, AgentInfo as ProtoAgentInfo,
-    AgentInstallStatus as ProtoAgentInstallStatus, CheckAgentRequest,
+    AgentDetailInfo as ProtoAgentDetailInfo, AgentInfo as ProtoAgentInfo, CheckAgentRequest,
     CheckAgentResponse as ProtoCheckAgentResponse, GetAgentRequest, GetAgentResponse,
     InstallAgentRequest, InstallAgentResponse as ProtoInstallAgentResponse,
-    InstallType as ProtoInstallType, ListAgentsRequest as ProtoListAgentsRequest,
-    ListAgentsResponse as ProtoListAgentsResponse, SystemInfo as ProtoSystemInfo,
-    UninstallAgentRequest, UninstallAgentResponse as ProtoUninstallResponse,
+    ListAgentsRequest as ProtoListAgentsRequest, ListAgentsResponse as ProtoListAgentsResponse,
+    SystemInfo as ProtoSystemInfo, UninstallAgentRequest,
+    UninstallAgentResponse as ProtoUninstallResponse,
     install_agent_request::Metadata as InstallMetadata,
 };
 use shared_types::{
@@ -190,14 +189,9 @@ fn is_known_agent_mgmt_code(code: &str) -> bool {
 
 /// shared InstallType → proto i32
 fn install_type_to_proto_i32(t: InstallType) -> i32 {
-    match t {
-        InstallType::Builtin => ProtoInstallType::Builtin as i32,
-        InstallType::Binary => ProtoInstallType::Binary as i32,
-        InstallType::Npm => ProtoInstallType::Npm as i32,
-        InstallType::Url => ProtoInstallType::Url as i32,
-        // Unknown 是 shared 端 fail-safe(不会主动发给 agent_runner)
-        InstallType::Unknown => ProtoInstallType::Binary as i32,
-    }
+    // 集中转换(shared_types): Unknown → proto Unspecified(0); runner 侧对
+    // 安装输入的 Unknown 拒绝因此对转发路径同样生效
+    t.to_proto_i32()
 }
 
 // === Forward functions ===
@@ -437,30 +431,22 @@ fn agent_detail_to_shared(p: ProtoAgentDetailInfo) -> AgentDetailInfo {
 }
 
 fn install_type_from_proto_i32(v: i32) -> InstallType {
-    match ProtoInstallType::try_from(v).ok() {
-        Some(ProtoInstallType::Builtin) => InstallType::Builtin,
-        Some(ProtoInstallType::Binary) => InstallType::Binary,
-        Some(ProtoInstallType::Npm) => InstallType::Npm,
-        Some(ProtoInstallType::Url) => InstallType::Url,
-        // Unspecified(0) 或未知值 → 退回 Binary
-        _ => InstallType::Binary,
-    }
+    // 集中转换(shared_types): Unspecified/未知值 → Unknown, 不伪装成 Binary
+    InstallType::from_proto_i32(v)
 }
 
 fn agent_install_status_from_proto_i32(v: i32) -> AgentInstallStatus {
-    match ProtoAgentInstallStatus::try_from(v).ok() {
-        Some(ProtoAgentInstallStatus::Available) => AgentInstallStatus::Available,
-        Some(ProtoAgentInstallStatus::Broken) => AgentInstallStatus::Broken,
-        Some(ProtoAgentInstallStatus::NotInstalled) => AgentInstallStatus::NotInstalled,
-        // 未知值(包括 proto 新版本新增的)
-        _ => AgentInstallStatus::NotInstalled,
-    }
+    // 集中转换(shared_types): Unspecified/未知值 → Unknown, 不伪装成 NotInstalled
+    AgentInstallStatus::from_proto_i32(v)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use shared_types::error_codes as ec;
+    use shared_types::grpc::{
+        AgentInstallStatus as ProtoAgentInstallStatus, InstallType as ProtoInstallType,
+    };
 
     /// status_to_app_error:agent-runner 在 message 前缀放了业务错误码,
     /// 我们要能正确还原。这样前端拿到的错误码与直接调 agent-runner HTTP 一致。
@@ -558,7 +544,36 @@ mod tests {
         }
     }
 
-    /// agent_install_status 转换:每个 status 都正确对应
+    /// R10 反例: proto Unspecified(0) 与未识别整数不得伪装成具体安装方式
+    /// (Binary)或"未安装"; shared 已有 Unknown 变体, 应如实映射。
+    #[test]
+    fn unknown_proto_enums_map_to_shared_unknown() {
+        for v in [0, -1, 999] {
+            assert_eq!(
+                install_type_from_proto_i32(v),
+                InstallType::Unknown,
+                "install_type {v}"
+            );
+            assert_eq!(
+                agent_install_status_from_proto_i32(v),
+                AgentInstallStatus::Unknown,
+                "status {v}"
+            );
+        }
+    }
+
+    /// R10: shared Unknown 回 proto Unspecified(0), 不伪装成 Binary。
+    #[test]
+    fn shared_unknown_install_type_maps_to_proto_unspecified() {
+        assert_eq!(
+            install_type_to_proto_i32(InstallType::Unknown),
+            ProtoInstallType::Unspecified as i32
+        );
+    }
+
+    /// agent_install_status 转换:每个已知 status 都正确对应。
+    /// (修正历史错值: NotInstalled 的 proto 值是 3, 旧断言的 0 实为 Unspecified,
+    /// 旧实现把它误映射成 NotInstalled 才通过; Unspecified 现应映射 Unknown。)
     #[test]
     fn agent_install_status_roundtrip() {
         for s in [
@@ -569,7 +584,7 @@ mod tests {
             let v = match s {
                 AgentInstallStatus::Available => 1, // AgentInstallStatus::Available
                 AgentInstallStatus::Broken => 2,
-                AgentInstallStatus::NotInstalled => 0,
+                AgentInstallStatus::NotInstalled => 3,
                 _ => unreachable!(),
             };
             let back = agent_install_status_from_proto_i32(v);

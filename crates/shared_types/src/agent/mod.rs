@@ -17,6 +17,7 @@ pub mod chat_config;
 pub mod computer_types;
 pub mod http_handlers;
 pub mod http_service;
+pub mod mgmt_proto;
 pub mod mgmt_types;
 pub mod rcoder_types;
 pub mod types;
