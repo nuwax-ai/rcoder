@@ -259,11 +259,20 @@ pub fn detect_file_type(bytes: &[u8]) -> &'static str {
     "unknown"
 }
 
-/// Detect file type from a file path by reading magic bytes.
+/// Detect file type from a file path by reading up to 4 magic prefix bytes.
+///
+/// 1~3 字节普通文件按实际前缀分类为 unknown（正常 EOF 不是错误）；空文件保持
+/// 既有拒绝策略；真实 IO 错误仍传播。
 pub fn detect_file_type_from_path(path: &Path) -> Result<&'static str, ArchiveError> {
-    let mut header = [0u8; 4];
     let mut f = File::open(path)?;
-    f.read_exact(&mut header)?;
+    let mut header = Vec::with_capacity(4);
+    Read::by_ref(&mut f).take(4).read_to_end(&mut header)?;
+    if header.is_empty() {
+        return Err(ArchiveError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "file is empty; cannot classify archive type",
+        )));
+    }
     Ok(detect_file_type(&header))
 }
 
@@ -515,6 +524,40 @@ mod tests {
     #[test]
     fn test_detect_unknown() {
         assert_eq!(detect_file_type(b"\x7FELF\x02\x01"), "unknown");
+    }
+
+    /// R08 反例: read_exact 假定填满 4 字节, 1~3 字节普通文件会因 UnexpectedEof
+    /// 被整体拒绝。修复后正常 EOF 按实际前缀分类为 unknown; 空文件策略保持拒绝;
+    /// 真实 IO 错误(文件不存在)仍传播。
+    #[test]
+    fn detect_file_type_from_path_reads_short_prefixes() {
+        let tmp = tempdir().unwrap();
+        for len in 1..=3 {
+            let path = tmp.path().join(format!("short_{len}"));
+            std::fs::write(&path, vec![b'x'; len]).unwrap();
+            assert_eq!(
+                detect_file_type_from_path(&path).unwrap(),
+                "unknown",
+                "{len}-byte plain file must classify as unknown, not fail"
+            );
+        }
+        // 4 字节仍走完整魔数识别
+        let path = tmp.path().join("zip4");
+        std::fs::write(&path, b"PK\x03\x04").unwrap();
+        assert_eq!(detect_file_type_from_path(&path).unwrap(), "zip");
+        let path = tmp.path().join("gz4");
+        std::fs::write(&path, b"\x1F\x8B\x08\x00").unwrap();
+        assert_eq!(detect_file_type_from_path(&path).unwrap(), "tar.gz");
+
+        // 空文件策略保持现状(拒绝), 不在 R08 中改变
+        let path = tmp.path().join("empty");
+        std::fs::write(&path, b"").unwrap();
+        assert!(
+            detect_file_type_from_path(&path).is_err(),
+            "empty-file policy must stay rejected"
+        );
+        // 文件不存在等真实 IO 错误仍传播
+        assert!(detect_file_type_from_path(&tmp.path().join("missing")).is_err());
     }
 
     #[test]
