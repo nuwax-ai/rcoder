@@ -304,6 +304,9 @@ struct StartBarrierExecutor {
     entered: tokio::sync::Notify,
     acknowledge: tokio::sync::Notify,
     starts: std::sync::atomic::AtomicUsize,
+    port_conflicts: std::sync::atomic::AtomicUsize,
+    port_conflict_cleanups: std::sync::atomic::AtomicUsize,
+    start_tickets: std::sync::Mutex<Vec<ExecutorStartTicket>>,
     stops: std::sync::atomic::AtomicUsize,
 }
 
@@ -315,9 +318,28 @@ impl PreviewExecutor for StartBarrierExecutor {
     ) -> Result<(i64, u16), PreviewExecutorError> {
         self.starts
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.start_tickets.lock().unwrap().push(ticket.clone());
         *self.ticket.lock().await = Some(ticket.clone());
         self.entered.notify_one();
         self.acknowledge.notified().await;
+        if self
+            .port_conflicts
+            .try_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |count| count.checked_sub(1),
+            )
+            .is_ok()
+        {
+            // The real executor can discover a readiness/strict-port conflict
+            // after registration. PortInUse is returned only after cleanup.
+            *self.ticket.lock().await = None;
+            self.port_conflict_cleanups
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(PreviewExecutorError::PortInUse(
+                "registered attempt cleaned after controlled port conflict".into(),
+            ));
+        }
         Ok((42, ticket.port))
     }
 
@@ -393,7 +415,7 @@ fn barrier_coordinator(
 }
 
 #[tokio::test]
-async fn heartbeat_publication_before_start_acknowledgement_does_not_kill_the_same_process() {
+async fn heartbeat_defers_publication_to_the_live_start_owner_until_acknowledgement() {
     for base in [None, Some(" custom-preview/// ".to_string())] {
         let store = Arc::new(InProcessPreviewStore::new());
         let executor = Arc::new(StartBarrierExecutor::default());
@@ -418,14 +440,22 @@ async fn heartbeat_publication_before_start_acknowledgement_does_not_kill_the_sa
             .unwrap();
         coordinator.run_heartbeat_sweep().await;
         let healed = store.get(&key).await.unwrap().unwrap();
-        assert_eq!(healed.state, PreviewInstanceState::Ready);
+        let state_before_ack = healed.state;
+        let pid_before_ack = healed.pid;
         executor.acknowledge.notify_one();
         let result = start
             .await
             .unwrap()
-            .expect("same execution already published by heartbeat must succeed");
+            .expect("the original owner must publish only after its native acknowledgement");
         assert!(result.success);
+        assert_eq!(pid_before_ack, None);
+        assert_eq!(
+            state_before_ack,
+            PreviewInstanceState::Starting,
+            "heartbeat must leave publication to a live exact startup owner"
+        );
         let current = store.get(&key).await.unwrap().unwrap();
+        assert_eq!(current.state, PreviewInstanceState::Ready);
         assert_eq!(current.instance_id, healed.instance_id);
         assert_eq!(current.pid, Some(42));
         assert_eq!(
@@ -449,6 +479,7 @@ async fn heartbeat_publication_before_start_acknowledgement_does_not_kill_the_sa
                 .success
         );
         assert_eq!(executor.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        coordinator.coordinated_stop(&current).await.unwrap();
     }
 }
 
@@ -489,23 +520,64 @@ async fn start_timeout_keeps_original_admission_for_late_heartbeat_without_repla
     );
     assert_eq!(pending.operation_id, admitted.operation_id);
     coordinator.run_heartbeat_sweep().await;
-    let healed = store.get(&key).await.unwrap().unwrap();
-    assert_eq!(healed.state, PreviewInstanceState::Ready);
-    assert_eq!(healed.instance_id, admitted.instance_id);
-    assert_eq!(healed.operation_id, admitted.operation_id);
-    assert_eq!(healed.base_path.as_deref(), Some("/late-base/"));
-    assert!(
-        coordinator
-            .start_dev(PreviewStartRequest {
-                identity,
-                base_path: None
-            })
+    let observed = store.get(&key).await.unwrap().unwrap();
+    let state_before_ack = observed.state;
+    assert_eq!(observed.instance_id, admitted.instance_id);
+    assert_eq!(observed.operation_id, admitted.operation_id);
+    assert_eq!(observed.base_path.as_deref(), Some("/late-base/"));
+    let owner = coordinator
+        .startup_owners
+        .get(&key, &admitted.instance_id)
+        .unwrap()
+        .unwrap();
+    let initial_waiters = owner.observer_count();
+    let follower = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move {
+            coordinator
+                .start_dev(PreviewStartRequest {
+                    identity,
+                    base_path: None,
+                })
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while owner.observer_count() < initial_waiters + 1 {
+            // Before the fix the Ready fast path returns immediately; retain
+            // that concrete result and drain the original ACK before failing.
+            if follower.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let joined_before_ack = owner.observer_count() > initial_waiters;
+    executor.acknowledge.notify_one();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), owner.wait_result())
             .await
             .unwrap()
-            .success
+            .unwrap(),
+        startup::StartupResult::Ready(_)
+    ));
+    assert!(follower.await.unwrap().unwrap().success);
+    let current = store.get(&key).await.unwrap().unwrap();
+    coordinator.coordinated_stop(&current).await.unwrap();
+    assert_eq!(
+        state_before_ack,
+        PreviewInstanceState::Starting,
+        "request timeout must retain publication ownership"
     );
+    assert!(
+        joined_before_ack,
+        "the repeated caller must wait on the exact owner, not a premature Ready fast path"
+    );
+    assert_eq!(current.state, PreviewInstanceState::Ready);
     assert_eq!(executor.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert_eq!(executor.stops.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(executor.stops.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -530,11 +602,36 @@ async fn accepted_stop_wins_over_late_start_acknowledgement_after_heartbeat() {
         .await
         .unwrap();
     coordinator.run_heartbeat_sweep().await;
-    let ready = store.get(&key).await.unwrap().unwrap();
-    coordinator.coordinated_stop(&ready).await.unwrap();
+    let pending = store.get(&key).await.unwrap().unwrap();
+    let state_before_stop = pending.state;
+    let stop = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move { coordinator.coordinated_stop(&pending).await }
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if store.get(&key).await.unwrap().unwrap().state == PreviewInstanceState::Stopping {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if executor.stops.load(std::sync::atomic::Ordering::SeqCst) == 1 { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("an already registered process must be stopped before waiting for the late start acknowledgement");
+    assert!(
+        !stop.is_finished(),
+        "Stop cannot acknowledge while the original start can still complete"
+    );
+    executor.acknowledge.notify_one();
+    stop.await.unwrap().unwrap();
     let stopped = store.get(&key).await.unwrap().unwrap();
     assert_eq!(stopped.state, PreviewInstanceState::Stopped);
-    executor.acknowledge.notify_one();
     assert!(
         start.await.unwrap().is_err(),
         "late acknowledgement must not undo an accepted Stop"
@@ -542,4 +639,198 @@ async fn accepted_stop_wins_over_late_start_acknowledgement_after_heartbeat() {
     assert_eq!(store.get(&key).await.unwrap().unwrap(), stopped);
     assert_eq!(executor.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(executor.stops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(state_before_stop, PreviewInstanceState::Starting);
 }
+
+/// This fixture blocks before any native registration exists. A timed-out
+/// caller cannot make the remaining preparation/start/publish sequence run.
+#[derive(Default)]
+struct PreparationBarrierExecutor {
+    // 0: success; 1: confirmed source rejection; 2: unknown cleanup; 3: port in use.
+    failure: std::sync::atomic::AtomicUsize,
+    port_conflicts: std::sync::atomic::AtomicUsize,
+    start_tickets: std::sync::Mutex<Vec<ExecutorStartTicket>>,
+    deny_stop: std::sync::atomic::AtomicBool,
+    stop_inputs: std::sync::Mutex<Vec<(String, String)>>,
+    registered: tokio::sync::Mutex<Option<ExecutorStartTicket>>,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    starts: std::sync::atomic::AtomicUsize,
+    stops: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl PreviewExecutor for PreparationBarrierExecutor {
+    async fn start_local(
+        &self,
+        ticket: &ExecutorStartTicket,
+    ) -> Result<(i64, u16), PreviewExecutorError> {
+        self.starts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.start_tickets.lock().unwrap().push(ticket.clone());
+        self.entered.notify_one();
+        self.release.notified().await;
+        if self
+            .port_conflicts
+            .try_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |count| count.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(PreviewExecutorError::PortInUse(
+                "controlled repeated strict-port conflict".into(),
+            ));
+        }
+        match self.failure.swap(0, std::sync::atomic::Ordering::SeqCst) {
+            0 => {}
+            1 => {
+                return Err(PreviewExecutorError::Business {
+                    code: "TYPECHECK_FAILED".into(),
+                    message: "confirmed preparation source failure".into(),
+                });
+            }
+            2 => {
+                return Err(PreviewExecutorError::Failed(
+                    "cleanup result unknown".into(),
+                ));
+            }
+            3 => {
+                return Err(PreviewExecutorError::PortInUse(
+                    "controlled strict-port conflict".into(),
+                ));
+            }
+            value => panic!("unknown fixture outcome {value}"),
+        }
+        *self.registered.lock().await = Some(ticket.clone());
+        Ok((42, ticket.port))
+    }
+
+    async fn stop_local(
+        &self,
+        key: &str,
+        instance: &str,
+    ) -> Result<ExecutorStopOutcome, PreviewExecutorError> {
+        self.stop_inputs
+            .lock()
+            .unwrap()
+            .push((key.into(), instance.into()));
+        if self.deny_stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(PreviewExecutorError::Failed(
+                "original cleanup currently unavailable".into(),
+            ));
+        }
+        let mut registered = self.registered.lock().await;
+        match registered.as_ref() {
+            Some(ticket) if ticket.preview_key == key && ticket.instance_id == instance => {
+                self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                *registered = None;
+                Ok(ExecutorStopOutcome::Stopped)
+            }
+            Some(_) => Ok(ExecutorStopOutcome::IdentityMismatch),
+            None => Ok(ExecutorStopOutcome::NotRegistered),
+        }
+    }
+
+    async fn verify_local(
+        &self,
+        key: &str,
+        instance: &str,
+    ) -> Result<ExecutorVerifyReport, PreviewExecutorError> {
+        let registered = self.registered.lock().await;
+        let matching = registered
+            .as_ref()
+            .filter(|ticket| ticket.preview_key == key && ticket.instance_id == instance);
+        Ok(ExecutorVerifyReport {
+            identity_match: matching.is_some(),
+            alive: matching.is_some(),
+            pid: matching.map(|_| 42),
+            port: matching.map(|ticket| ticket.port),
+        })
+    }
+
+    async fn registration_matches(
+        &self,
+        key: &str,
+        instance: &str,
+    ) -> Result<bool, PreviewExecutorError> {
+        Ok(self.verify_local(key, instance).await?.identity_match)
+    }
+
+    async fn read_log_local(
+        &self,
+        log: &str,
+        kind: &str,
+        start: usize,
+    ) -> Result<ExecutorLogChunk, PreviewExecutorError> {
+        TestExecutor::new(false)
+            .read_log_local(log, kind, start)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn pre_registration_timeout_keeps_the_original_start_running_until_ready() {
+    let store = Arc::new(InProcessPreviewStore::new());
+    let executor = Arc::new(PreparationBarrierExecutor::default());
+    let coordinator = Arc::new(PreviewCoordinator::new(
+        store.clone(),
+        executor.clone(),
+        Arc::new(SingleInstanceEvidence),
+        "test-preview-token".into(),
+        CoordinatorConfig {
+            start_budget_secs: 1,
+            ..CoordinatorConfig::default()
+        },
+    ));
+    let identity = identity("pre-registration-timeout");
+    let key = compute_key(&identity);
+    let start = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move {
+            coordinator
+                .start_dev(PreviewStartRequest {
+                    identity,
+                    base_path: Some("prepared-base".into()),
+                })
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(3), executor.entered.notified())
+        .await
+        .unwrap();
+    let admitted = store.get(&key).await.unwrap().unwrap();
+    assert_eq!(admitted.state, PreviewInstanceState::Starting);
+    assert!(
+        executor.registered.lock().await.is_none(),
+        "fixture must still be before registration"
+    );
+    let error = tokio::time::timeout(Duration::from_secs(3), start)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("budget exceeded"));
+    executor.release.notify_one();
+    let ready = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let current = store.get(&key).await.unwrap().unwrap();
+            if current.state == PreviewInstanceState::Ready {
+                break current;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("accepted preparation must continue to publish Ready after the caller times out");
+    assert_eq!(ready.instance_id, admitted.instance_id);
+    assert_eq!(ready.operation_id, admitted.operation_id);
+    assert_eq!(ready.base_path.as_deref(), Some("/prepared-base/"));
+    assert_eq!(executor.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(executor.stops.load(std::sync::atomic::Ordering::SeqCst), 0);
+    coordinator.coordinated_stop(&ready).await.unwrap();
+}
+
+#[path = "startup_tests.rs"]
+mod startup_owner_tests;

@@ -105,6 +105,7 @@ fn note_store_result(result: Result<impl Send, PreviewStoreError>) {
 mod coordination;
 mod coordinator;
 mod start_stop;
+mod startup;
 #[cfg(test)]
 mod tests;
 

@@ -13,6 +13,7 @@ impl PreviewCoordination for PreviewCoordinator {
         &self,
         req: &PreviewStopRequest,
     ) -> Result<PreviewStopEnvelope, PreviewCoordinationError> {
+        self.stop_project_startups(&req.project_id).await?;
         let active = self.store.list_active().await.map_err(store_error)?;
         let targets: Vec<PreviewInstanceRecord> = active
             .into_iter()
@@ -52,6 +53,7 @@ impl PreviewCoordination for PreviewCoordinator {
         &self,
         req: PreviewRestartRequest,
     ) -> Result<PreviewRestartEnvelope, PreviewCoordinationError> {
+        self.stop_project_startups(&req.identity.project_id).await?;
         let active = self.store.list_active().await.map_err(store_error)?;
         let targets: Vec<PreviewInstanceRecord> = active
             .into_iter()
@@ -357,20 +359,26 @@ impl PreviewCoordination for PreviewCoordinator {
         revision: i64,
     ) -> Result<ExecutorStopOutcome, PreviewCoordinationError> {
         let row = self.store.get(preview_key).await.map_err(store_error)?;
-        let authorized = row.is_some_and(|row| {
-            row.instance_id == instance_id
-                && row.operation_id == operation_id
-                && row.revision == revision
-                && row.state == PreviewInstanceState::Stopping
-                && row.host_id == self.host.host_id
-        });
-        if !authorized {
+        let Some(row) = row else {
+            return Ok(ExecutorStopOutcome::IdentityMismatch);
+        };
+        if row.instance_id != instance_id
+            || row.operation_id != operation_id
+            || row.revision != revision
+            || row.host_id != self.host.host_id
+        {
             return Ok(ExecutorStopOutcome::IdentityMismatch);
         }
-        self.executor
-            .stop_local(preview_key, instance_id)
-            .await
-            .map_err(|e| unavailable(e.to_string()))
+        match row.state {
+            PreviewInstanceState::Stopped => return Ok(ExecutorStopOutcome::Stopped),
+            PreviewInstanceState::Stopping => {}
+            PreviewInstanceState::Starting
+            | PreviewInstanceState::Ready
+            | PreviewInstanceState::Unknown
+            | PreviewInstanceState::Failed => return Ok(ExecutorStopOutcome::IdentityMismatch),
+        }
+
+        self.stop_local_startup(preview_key, instance_id).await
     }
 
     async fn internal_verify(

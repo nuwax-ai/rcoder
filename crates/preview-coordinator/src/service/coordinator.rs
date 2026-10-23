@@ -9,7 +9,8 @@ pub struct PreviewCoordinator {
     pub(crate) token: String,
     pub(super) host: PreviewHostIdentity,
     pub(super) config: CoordinatorConfig,
-    pub(super) route_cache: RouteCache,
+    pub(super) route_cache: Arc<RouteCache>,
+    pub(super) startup_owners: startup::StartupOwners,
     pub(super) activity: ActivityAccumulator,
 }
 
@@ -27,10 +28,10 @@ impl PreviewCoordinator {
             config.peer_api_port,
             config.remote_dispatch_timeout_secs,
         );
-        let route_cache = RouteCache::new(
+        let route_cache = Arc::new(RouteCache::new(
             config.route_cache_positive_secs,
             config.route_cache_negative_secs,
-        );
+        ));
         Self {
             store,
             executor,
@@ -40,6 +41,7 @@ impl PreviewCoordinator {
             host,
             config,
             route_cache,
+            startup_owners: startup::StartupOwners::default(),
             activity: ActivityAccumulator::default(),
         }
     }
