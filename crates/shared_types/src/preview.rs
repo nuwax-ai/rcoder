@@ -148,6 +148,66 @@ pub struct PreviewInstanceRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+impl PreviewInstanceRecord {
+    /// Apply one publication for the admitted operation and allocated port.
+    /// Returns true only for Starting → Ready, whose operation receipt must be
+    /// completed. A matching Ready confirmation never refreshes activity or
+    /// heartbeat; it can only fill a missing base without rewriting the receipt.
+    pub fn apply_running_publication(
+        &mut self,
+        operation_id: &str,
+        revision: i64,
+        pid: i64,
+        port: u16,
+        base_path: Option<&str>,
+        at: DateTime<Utc>,
+    ) -> Result<bool, PreviewStoreError> {
+        if self.operation_id != operation_id
+            || self.revision != revision
+            || self.port != Some(port)
+            || pid <= 0
+        {
+            return Err(PreviewStoreError::Conflict(
+                "Publish running requires the admitted operation, revision, PID and port".into(),
+            ));
+        }
+        let first_publication = match self.state {
+            PreviewInstanceState::Starting => true,
+            PreviewInstanceState::Ready if self.pid == Some(pid) => false,
+            PreviewInstanceState::Ready
+            | PreviewInstanceState::Stopping
+            | PreviewInstanceState::Stopped
+            | PreviewInstanceState::Failed
+            | PreviewInstanceState::Unknown => {
+                return Err(PreviewStoreError::Conflict(
+                    "Publish running belongs to another process or lifecycle state".into(),
+                ));
+            }
+        };
+        if let (Some(current), Some(incoming)) = (self.base_path.as_deref(), base_path)
+            && current != incoming
+        {
+            return Err(PreviewStoreError::Conflict(
+                "Publish running cannot replace the admitted base path".into(),
+            ));
+        }
+        let complete_base = self.base_path.is_none() && base_path.is_some();
+        if first_publication {
+            self.state = PreviewInstanceState::Ready;
+            self.pid = Some(pid);
+            self.last_heartbeat_at = Some(at);
+            self.last_activity_at = self.last_activity_at.max(at);
+        }
+        if complete_base {
+            self.base_path = base_path.map(str::to_owned);
+        }
+        if first_publication || complete_base {
+            self.updated_at = at;
+        }
+        Ok(first_publication)
+    }
+}
+
 /// 操作审计记录。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreviewOperationRecord {
@@ -174,6 +234,9 @@ pub struct AcceptStartInput {
     pub operation_id: String,
     pub instance_id: String,
     pub requested_port: Option<u16>,
+    /// Effective custom base retained before executor dispatch. None preserves
+    /// the existing default-port base semantics and legacy request fingerprint.
+    pub base_path: Option<String>,
     /// Unknown 行恢复证据说明。None = 协调器未核实证据，存储遇 Unknown 行必须
     /// 返回 [`AcceptStartOutcome::Blocked`]；Some = 已核实（K8s 查 Pod UID 不存在/
     /// 单机非本 host 即前代进程），事务内先落 Stopped 再受理。
@@ -230,7 +293,8 @@ pub trait PreviewLifecycleStore: Send + Sync {
     ) -> Result<AcceptStartOutcome, PreviewStoreError>;
 
     /// 启动成功发布：CAS(starting, operation_id, revision) → Ready + pid/port/base_path，
-    /// 同时把操作置 Succeeded。
+    /// 同时把操作置 Succeeded。同 operation/revision/PID/port 的 Ready 发布幂等
+    /// 确认，仅允许补缺失 base；不能覆盖已有 base 或重写完成回执/活动时间。
     async fn publish_running(
         &self,
         preview_key: &str,

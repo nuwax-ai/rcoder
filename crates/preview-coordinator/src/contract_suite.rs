@@ -27,6 +27,7 @@ fn start_input(key: &str, project: &str, op: &str, instance: &str) -> AcceptStar
         operation_id: op.to_string(),
         instance_id: instance.to_string(),
         requested_port: None,
+        base_path: None,
         recover_unknown_evidence: None,
     }
 }
@@ -42,6 +43,8 @@ fn assert_conflict<T>(result: &Result<T, PreviewStoreError>) {
 /// 契约全集。store 须为空库（测试自行清理或用独立数据库）。
 pub async fn run(store: &dyn PreviewLifecycleStore) {
     admitted_and_publish(store).await;
+    admitted_base_cannot_be_replaced_by_publication(store).await;
+    ready_publication_replay(store).await;
     idempotent_ready_start(store).await;
     blocked_while_starting(store).await;
     stop_flow_and_reaccept(store).await;
@@ -53,6 +56,233 @@ pub async fn run(store: &dyn PreviewLifecycleStore) {
     failure_then_reaccept(store).await;
     lookup_views(store).await;
     generation_bound_recovery_and_stop(store).await;
+}
+
+async fn admitted_base_cannot_be_replaced_by_publication(store: &dyn PreviewLifecycleStore) {
+    let key = "admitted-base-preview";
+    for (op, instance, base, stop) in [
+        (
+            "base-start-one",
+            "base-instance-one",
+            "/first/",
+            "base-stop-one",
+        ),
+        (
+            "base-start-two",
+            "base-instance-two",
+            "/second/",
+            "base-stop-two",
+        ),
+    ] {
+        let mut input = start_input(key, "base-project", op, instance);
+        input.base_path = Some(base.into());
+        let AcceptStartOutcome::Admitted(starting) = store.accept_start(input).await.unwrap()
+        else {
+            panic!("fresh or stopped preview must admit its custom base");
+        };
+        assert_eq!(starting.base_path.as_deref(), Some(base));
+        let port = starting.port.unwrap();
+        assert_conflict(
+            &store
+                .publish_running(key, op, starting.revision, 7373, port, Some("/different/"))
+                .await,
+        );
+        assert_eq!(store.get(key).await.unwrap().unwrap(), starting);
+        let ready = store
+            .publish_running(key, op, starting.revision, 7373, port, None)
+            .await
+            .expect("missing publication metadata must preserve admitted base");
+        assert_eq!(ready.base_path.as_deref(), Some(base));
+        assert_eq!(
+            store
+                .publish_running(key, op, starting.revision, 7373, port, Some(base))
+                .await
+                .unwrap(),
+            ready
+        );
+        assert_conflict(
+            &store
+                .publish_running(key, op, starting.revision, 7373, port, Some("/different/"))
+                .await,
+        );
+        assert_eq!(store.get(key).await.unwrap().unwrap(), ready);
+        let stopping = store.accept_stop(key, stop).await.unwrap();
+        store
+            .mark_stopped(key, stop, stopping.revision)
+            .await
+            .unwrap();
+    }
+}
+
+async fn ready_publication_replay(store: &dyn PreviewLifecycleStore) {
+    let key = "publish-replay";
+    let op = "publish-replay-start";
+    let AcceptStartOutcome::Admitted(starting) = store
+        .accept_start(start_input(key, "publish-project", op, "publish-instance"))
+        .await
+        .expect("admit replay fixture")
+    else {
+        panic!("fresh replay fixture must be admitted");
+    };
+    let port = starting.port.unwrap();
+    let ready = store
+        .publish_running(key, op, starting.revision, 4242, port, None)
+        .await
+        .expect("initial publication");
+
+    for (operation, revision, pid, published_port) in [
+        ("other-operation", ready.revision, 4242, port),
+        (op, ready.revision + 1, 4242, port),
+        (op, ready.revision, 4243, port),
+        (op, ready.revision, 0, port),
+        (op, ready.revision, -1, port),
+        (op, ready.revision, 4242, port + 1),
+    ] {
+        assert_conflict(
+            &store
+                .publish_running(key, operation, revision, pid, published_port, None)
+                .await,
+        );
+        assert_eq!(store.get(key).await.unwrap().unwrap(), ready);
+    }
+
+    let replayed = store
+        .publish_running(key, op, ready.revision, 4242, port, None)
+        .await
+        .expect("heartbeat and original response may publish the same process");
+    assert_eq!(
+        replayed, ready,
+        "confirmation must not refresh activity or heartbeat"
+    );
+    let completed = store
+        .publish_running(key, op, ready.revision, 4242, port, Some("/custom/"))
+        .await
+        .expect("same process may complete a missing base path");
+    let mut expected = ready.clone();
+    expected.base_path = Some("/custom/".into());
+    expected.updated_at = completed.updated_at;
+    assert_eq!(
+        completed, expected,
+        "base completion cannot change execution or activity"
+    );
+    for base in [None, Some("/custom/")] {
+        assert_eq!(
+            store
+                .publish_running(key, op, ready.revision, 4242, port, base)
+                .await
+                .expect("same base or absent information must preserve current base"),
+            completed
+        );
+    }
+    assert_conflict(
+        &store
+            .publish_running(key, op, ready.revision, 4242, port, Some("/different/"))
+            .await,
+    );
+    assert_eq!(store.get(key).await.unwrap().unwrap(), completed);
+
+    let stopping = store.accept_stop(key, "publish-replay-stop").await.unwrap();
+    assert_conflict(
+        &store
+            .publish_running(key, op, ready.revision, 4242, port, None)
+            .await,
+    );
+    assert_eq!(store.get(key).await.unwrap().unwrap(), stopping);
+    let stopped = store
+        .mark_stopped(key, &stopping.operation_id, stopping.revision)
+        .await
+        .unwrap();
+    assert_conflict(
+        &store
+            .publish_running(key, op, ready.revision, 4242, port, None)
+            .await,
+    );
+    assert_eq!(store.get(key).await.unwrap().unwrap(), stopped);
+
+    let AcceptStartOutcome::Admitted(replacement) = store
+        .accept_start(start_input(
+            key,
+            "publish-project",
+            "replacement-op",
+            "replacement-instance",
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!("stopped preview must admit a replacement");
+    };
+    assert_conflict(
+        &store
+            .publish_running(key, op, ready.revision, 4242, port, None)
+            .await,
+    );
+    assert_eq!(store.get(key).await.unwrap().unwrap(), replacement);
+    let replaced = store
+        .publish_running(
+            key,
+            &replacement.operation_id,
+            replacement.revision,
+            5252,
+            replacement.port.unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+    let unknown = store
+        .mark_unknown(key, &replaced.instance_id, "host observation lost")
+        .await
+        .unwrap();
+    assert_conflict(
+        &store
+            .publish_running(
+                key,
+                &unknown.operation_id,
+                unknown.revision,
+                5252,
+                unknown.port.unwrap(),
+                None,
+            )
+            .await,
+    );
+    assert_eq!(store.get(key).await.unwrap().unwrap(), unknown);
+    store
+        .resolve_unknown_stopped(key, &unknown.instance_id, "exact host terminated")
+        .await
+        .unwrap();
+    let AcceptStartOutcome::Admitted(failed_start) = store
+        .accept_start(start_input(
+            key,
+            "publish-project",
+            "failed-op",
+            "failed-instance",
+        ))
+        .await
+        .unwrap()
+    else {
+        panic!("resolved preview must admit another start");
+    };
+    let failed = store
+        .mark_failed(
+            key,
+            &failed_start.instance_id,
+            failed_start.revision,
+            "confirmed start failure",
+        )
+        .await
+        .unwrap();
+    assert_conflict(
+        &store
+            .publish_running(
+                key,
+                &failed.operation_id,
+                failed.revision,
+                6262,
+                failed.port.unwrap(),
+                None,
+            )
+            .await,
+    );
+    assert_eq!(store.get(key).await.unwrap().unwrap(), failed);
 }
 
 async fn admitted_and_publish(store: &dyn PreviewLifecycleStore) {

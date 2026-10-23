@@ -49,6 +49,7 @@ impl PreviewCoordinator {
             }
         }
 
+        let base_path = base_path.as_deref().map(normalize_base_path);
         let mut candidate: Option<u16> = None;
         for _ in 0..START_PORT_ATTEMPTS {
             let input = AcceptStartInput {
@@ -59,14 +60,12 @@ impl PreviewCoordinator {
                 operation_id: new_id(),
                 instance_id: new_id(),
                 requested_port: candidate,
+                base_path: base_path.clone(),
                 recover_unknown_evidence: recovery.clone(),
             };
             match self.store.accept_start(input).await {
                 Ok(AcceptStartOutcome::Admitted(record)) => {
-                    match self
-                        .execute_start(&key, base_path.as_deref(), &record)
-                        .await
-                    {
+                    match self.execute_start(&key, &record).await {
                         Ok(envelope) => return Ok(envelope),
                         Err(StartExecError::PortInUse(port)) => {
                             note_store_result(
@@ -82,6 +81,7 @@ impl PreviewCoordinator {
                             candidate = Some(Self::next_candidate(port));
                             continue;
                         }
+                        Err(StartExecError::OutcomeUnknown(error)) => return Err(error),
                         Err(StartExecError::Fatal(error)) => {
                             note_store_result(
                                 self.store
@@ -128,7 +128,6 @@ impl PreviewCoordinator {
     async fn execute_start(
         &self,
         key: &str,
-        base_path: Option<&str>,
         record: &PreviewInstanceRecord,
     ) -> Result<PreviewStartEnvelope, StartExecError> {
         let Some(port) = record.port else {
@@ -139,7 +138,7 @@ impl PreviewCoordinator {
             log_key: record.project_id.clone(),
             project_path: record.project_path.clone(),
             port,
-            base_path: base_path.map(str::to_string),
+            base_path: record.base_path.clone(),
             instance_id: record.instance_id.clone(),
         };
         let budget = Duration::from_secs(self.config.start_budget_secs);
@@ -162,12 +161,14 @@ impl PreviewCoordinator {
             Err(_elapsed) => {
                 // 预算超时：行保持 starting、执行器可能仍在安装——不自动重放；
                 // 本机心跳扫描若发现已就绪将自愈 publish_running。
-                return Err(StartExecError::Fatal(unavailable(
+                return Err(StartExecError::OutcomeUnknown(unavailable(
                     "preview start budget exceeded; instance left starting for heartbeat self-heal",
                 )));
             }
         };
-        let effective_base = base_path
+        let effective_base = record
+            .base_path
+            .as_deref()
             .map(normalize_base_path)
             .unwrap_or_else(|| default_base(actual_port));
         match self
@@ -195,7 +196,14 @@ impl PreviewCoordinator {
                     "start admission superseded: {detail}"
                 ))))
             }
-            Err(error) => Err(StartExecError::Fatal(store_error(error))),
+            // A database timeout may have committed. Keep the original admission
+            // for heartbeat reconciliation instead of declaring the execution failed.
+            Err(error @ PreviewStoreError::Unavailable(_)) => {
+                Err(StartExecError::OutcomeUnknown(store_error(error)))
+            }
+            Err(error @ PreviewStoreError::Invalid(_)) => {
+                Err(StartExecError::Fatal(store_error(error)))
+            }
         }
     }
 
@@ -384,4 +392,5 @@ impl PreviewCoordinator {
 enum StartExecError {
     PortInUse(u16),
     Fatal(PreviewCoordinationError),
+    OutcomeUnknown(PreviewCoordinationError),
 }

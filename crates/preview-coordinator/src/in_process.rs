@@ -19,6 +19,87 @@ struct State {
     operations: BTreeMap<String, PreviewOperationRecord>,
 }
 
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ready_base_completion_preserves_original_operation_receipt_and_activity() {
+        let store = InProcessPreviewStore::new();
+        let AcceptStartOutcome::Admitted(starting) = store
+            .accept_start(AcceptStartInput {
+                preview_key: "receipt-preview".into(),
+                project_id: "receipt-project".into(),
+                project_path: "/workspace/receipt-project".into(),
+                host: shared_types::PreviewHostIdentity {
+                    host_id: "receipt-host:boot".into(),
+                    pod_name: None,
+                    pod_ip: None,
+                },
+                operation_id: "receipt-start".into(),
+                instance_id: "receipt-instance".into(),
+                requested_port: None,
+                base_path: None,
+                recover_unknown_evidence: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("fresh start must be admitted")
+        };
+        let port = starting.port.unwrap();
+        let ready = store
+            .publish_running(
+                &starting.preview_key,
+                &starting.operation_id,
+                starting.revision,
+                1234,
+                port,
+                None,
+            )
+            .await
+            .unwrap();
+        let receipt = store.state.lock().await.operations[&starting.operation_id].clone();
+        let completed = store
+            .publish_running(
+                &starting.preview_key,
+                &starting.operation_id,
+                starting.revision,
+                1234,
+                port,
+                Some("/custom/"),
+            )
+            .await
+            .expect("complete base after heartbeat publication");
+        assert_eq!(completed.base_path.as_deref(), Some("/custom/"));
+        assert_eq!(completed.last_activity_at, ready.last_activity_at);
+        assert_eq!(completed.last_heartbeat_at, ready.last_heartbeat_at);
+        assert_eq!(
+            store.state.lock().await.operations[&starting.operation_id],
+            receipt,
+            "base completion cannot rewrite the original receipt"
+        );
+        assert_eq!(
+            store
+                .publish_running(
+                    &starting.preview_key,
+                    &starting.operation_id,
+                    starting.revision,
+                    1234,
+                    port,
+                    None
+                )
+                .await
+                .unwrap(),
+            completed
+        );
+        assert_eq!(
+            store.state.lock().await.operations[&starting.operation_id],
+            receipt
+        );
+    }
+}
+
 /// 进程内权威存储。
 pub struct InProcessPreviewStore {
     state: tokio::sync::Mutex<State>,
@@ -156,7 +237,7 @@ impl PreviewLifecycleStore for InProcessPreviewStore {
             pod_ip: input.host.pod_ip.clone(),
             pid: None,
             port: Some(port),
-            base_path: None,
+            base_path: input.base_path.clone(),
             state: PreviewInstanceState::Starting,
             last_heartbeat_at: None,
             last_activity_at: timestamp,
@@ -195,28 +276,21 @@ impl PreviewLifecycleStore for InProcessPreviewStore {
         base_path: Option<&str>,
     ) -> Result<PreviewInstanceRecord, Error> {
         let mut state = self.state.lock().await;
-        let updated = {
+        let (updated, first_publication) = {
             let Some(record) = state.instances.get_mut(preview_key) else {
                 return Err(Error::Invalid(format!("preview {preview_key} not found")));
             };
-            if record.operation_id != operation_id
-                || record.revision != revision
-                || record.state != PreviewInstanceState::Starting
-                || record.port != Some(port)
-                || pid <= 0
-            {
-                return Err(conflict("publish_running lost the race", record));
-            }
-            record.state = PreviewInstanceState::Ready;
-            record.pid = Some(pid);
-            record.port = Some(port);
-            record.base_path = base_path.map(str::to_string);
-            record.last_heartbeat_at = Some(now());
-            record.last_activity_at = now();
-            record.updated_at = now();
-            record.clone()
+            let first_publication = record.apply_running_publication(
+                operation_id,
+                revision,
+                pid,
+                port,
+                base_path,
+                now(),
+            )?;
+            (record.clone(), first_publication)
         };
-        if let Some(op) = state.operations.get_mut(operation_id) {
+        if first_publication && let Some(op) = state.operations.get_mut(operation_id) {
             op.state = PreviewOperationState::Succeeded;
             op.result = Some(format!("pid={pid} port={port}"));
             op.updated_at = now();

@@ -115,6 +115,7 @@ async fn seed_ready(
             operation_id: operation_id.to_string(),
             instance_id: instance_id.to_string(),
             requested_port: None,
+            base_path: None,
             recover_unknown_evidence: None,
         })
         .await
@@ -293,4 +294,252 @@ async fn stop_dispatch_failure_does_not_leave_instance_stopping() {
             .as_deref()
             .is_some_and(|detail| detail.contains("injected stop failure"))
     );
+}
+
+/// Holds the start acknowledgement after the executor has registered its process.
+/// Heartbeat can therefore observe the actual admission before the caller publishes.
+#[derive(Default)]
+struct StartBarrierExecutor {
+    ticket: tokio::sync::Mutex<Option<ExecutorStartTicket>>,
+    entered: tokio::sync::Notify,
+    acknowledge: tokio::sync::Notify,
+    starts: std::sync::atomic::AtomicUsize,
+    stops: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl PreviewExecutor for StartBarrierExecutor {
+    async fn start_local(
+        &self,
+        ticket: &ExecutorStartTicket,
+    ) -> Result<(i64, u16), PreviewExecutorError> {
+        self.starts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.ticket.lock().await = Some(ticket.clone());
+        self.entered.notify_one();
+        self.acknowledge.notified().await;
+        Ok((42, ticket.port))
+    }
+
+    async fn stop_local(
+        &self,
+        key: &str,
+        instance: &str,
+    ) -> Result<ExecutorStopOutcome, PreviewExecutorError> {
+        let mut ticket = self.ticket.lock().await;
+        if ticket
+            .as_ref()
+            .is_some_and(|t| t.preview_key == key && t.instance_id == instance)
+        {
+            self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *ticket = None;
+            Ok(ExecutorStopOutcome::Stopped)
+        } else {
+            Ok(ExecutorStopOutcome::NotRegistered)
+        }
+    }
+
+    async fn verify_local(
+        &self,
+        key: &str,
+        instance: &str,
+    ) -> Result<ExecutorVerifyReport, PreviewExecutorError> {
+        let ticket = self.ticket.lock().await;
+        let matching = ticket
+            .as_ref()
+            .filter(|t| t.preview_key == key && t.instance_id == instance);
+        Ok(ExecutorVerifyReport {
+            identity_match: matching.is_some(),
+            alive: matching.is_some(),
+            pid: matching.map(|_| 42),
+            port: matching.map(|t| t.port),
+        })
+    }
+
+    async fn registration_matches(
+        &self,
+        key: &str,
+        instance: &str,
+    ) -> Result<bool, PreviewExecutorError> {
+        Ok(self.verify_local(key, instance).await?.identity_match)
+    }
+
+    async fn read_log_local(
+        &self,
+        log: &str,
+        kind: &str,
+        start: usize,
+    ) -> Result<ExecutorLogChunk, PreviewExecutorError> {
+        TestExecutor::new(false)
+            .read_log_local(log, kind, start)
+            .await
+    }
+}
+
+fn barrier_coordinator(
+    store: Arc<InProcessPreviewStore>,
+    executor: Arc<StartBarrierExecutor>,
+) -> Arc<PreviewCoordinator> {
+    Arc::new(PreviewCoordinator::new(
+        store,
+        executor,
+        Arc::new(SingleInstanceEvidence),
+        "test-preview-token".into(),
+        CoordinatorConfig {
+            start_budget_secs: 1,
+            ..CoordinatorConfig::default()
+        },
+    ))
+}
+
+#[tokio::test]
+async fn heartbeat_publication_before_start_acknowledgement_does_not_kill_the_same_process() {
+    for base in [None, Some(" custom-preview/// ".to_string())] {
+        let store = Arc::new(InProcessPreviewStore::new());
+        let executor = Arc::new(StartBarrierExecutor::default());
+        let coordinator = barrier_coordinator(store.clone(), executor.clone());
+        let identity = identity("heartbeat-before-ack");
+        let key = compute_key(&identity);
+        let start = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let identity = identity.clone();
+            let base = base.clone();
+            async move {
+                coordinator
+                    .start_dev(PreviewStartRequest {
+                        identity,
+                        base_path: base,
+                    })
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), executor.entered.notified())
+            .await
+            .unwrap();
+        coordinator.run_heartbeat_sweep().await;
+        let healed = store.get(&key).await.unwrap().unwrap();
+        assert_eq!(healed.state, PreviewInstanceState::Ready);
+        executor.acknowledge.notify_one();
+        let result = start
+            .await
+            .unwrap()
+            .expect("same execution already published by heartbeat must succeed");
+        assert!(result.success);
+        let current = store.get(&key).await.unwrap().unwrap();
+        assert_eq!(current.instance_id, healed.instance_id);
+        assert_eq!(current.pid, Some(42));
+        assert_eq!(
+            current.base_path,
+            Some(
+                base.as_deref()
+                    .map(normalize_base_path)
+                    .unwrap_or_else(|| default_base(result.port))
+            )
+        );
+        assert_eq!(executor.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(executor.stops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            coordinator
+                .start_dev(PreviewStartRequest {
+                    identity,
+                    base_path: base
+                })
+                .await
+                .unwrap()
+                .success
+        );
+        assert_eq!(executor.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn start_timeout_keeps_original_admission_for_late_heartbeat_without_replaying_start() {
+    let store = Arc::new(InProcessPreviewStore::new());
+    let executor = Arc::new(StartBarrierExecutor::default());
+    let coordinator = barrier_coordinator(store.clone(), executor.clone());
+    let identity = identity("late-start-after-timeout");
+    let key = compute_key(&identity);
+    let start = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let identity = identity.clone();
+        async move {
+            coordinator
+                .start_dev(PreviewStartRequest {
+                    identity,
+                    base_path: Some("late-base".into()),
+                })
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(3), executor.entered.notified())
+        .await
+        .unwrap();
+    let admitted = store.get(&key).await.unwrap().unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(3), start)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("budget exceeded"));
+    let pending = store.get(&key).await.unwrap().unwrap();
+    assert_eq!(
+        pending.state,
+        PreviewInstanceState::Starting,
+        "unknown acknowledgement is not proof of failed execution"
+    );
+    assert_eq!(pending.operation_id, admitted.operation_id);
+    coordinator.run_heartbeat_sweep().await;
+    let healed = store.get(&key).await.unwrap().unwrap();
+    assert_eq!(healed.state, PreviewInstanceState::Ready);
+    assert_eq!(healed.instance_id, admitted.instance_id);
+    assert_eq!(healed.operation_id, admitted.operation_id);
+    assert_eq!(healed.base_path.as_deref(), Some("/late-base/"));
+    assert!(
+        coordinator
+            .start_dev(PreviewStartRequest {
+                identity,
+                base_path: None
+            })
+            .await
+            .unwrap()
+            .success
+    );
+    assert_eq!(executor.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(executor.stops.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn accepted_stop_wins_over_late_start_acknowledgement_after_heartbeat() {
+    let store = Arc::new(InProcessPreviewStore::new());
+    let executor = Arc::new(StartBarrierExecutor::default());
+    let coordinator = barrier_coordinator(store.clone(), executor.clone());
+    let identity = identity("stop-before-start-ack");
+    let key = compute_key(&identity);
+    let start = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move {
+            coordinator
+                .start_dev(PreviewStartRequest {
+                    identity,
+                    base_path: None,
+                })
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(3), executor.entered.notified())
+        .await
+        .unwrap();
+    coordinator.run_heartbeat_sweep().await;
+    let ready = store.get(&key).await.unwrap().unwrap();
+    coordinator.coordinated_stop(&ready).await.unwrap();
+    let stopped = store.get(&key).await.unwrap().unwrap();
+    assert_eq!(stopped.state, PreviewInstanceState::Stopped);
+    executor.acknowledge.notify_one();
+    assert!(
+        start.await.unwrap().is_err(),
+        "late acknowledgement must not undo an accepted Stop"
+    );
+    assert_eq!(store.get(&key).await.unwrap().unwrap(), stopped);
+    assert_eq!(executor.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(executor.stops.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
