@@ -107,7 +107,7 @@ async fn serve(State(workspace): State<PathBuf>, method: axum::http::Method, uri
     let rel = if path == "/" {
         PathBuf::from(INDEX_FILE)
     } else {
-        let decoded = percent_decode(path);
+        let decoded = super::percent_decode_path(path);
         let mut segments = Path::new(&decoded).components();
         let mut rel = PathBuf::new();
         for component in segments.by_ref() {
@@ -158,28 +158,6 @@ async fn serve(State(workspace): State<PathBuf>, method: axum::http::Method, uri
         }
         Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
-}
-
-/// 百分号解码（path 里的 %20 等）；解码失败原样返回（后续文件读取 404 兜底）。
-fn percent_decode(path: &str) -> String {
-    let bytes = path.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        // %XX 形式且两个 hex 字符都在界内（i+2 < len 保证 path[i+1..i+3] 合法）；
-        // 非 %XX 或非法 hex 原样保留（后续文件读取 404 兜底）
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Ok(byte) = u8::from_str_radix(&path[i + 1..i + 3], 16)
-        {
-            out.push(byte);
-            i += 3;
-            continue;
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// 常见静态扩展名的 Content-Type（未知扩展名省略头，HTTP 默认 octet-stream）。
@@ -369,5 +347,74 @@ mod tests {
         );
         let empty = tempfile::tempdir().expect("tempdir").keep();
         assert_eq!(index_port_if_eligible(&empty, &[spec(false)]), None);
+    }
+
+    /// R09 反例: 原始(未编码)多字节 request-target `/%中` 使手写百分号解码器在
+    /// 多字节字符内部按字节切片而 panic。用真实 TCP 原始请求（GET/HEAD）断言
+    /// 不 panic、返回合法 HTTP 状态行；解码后字面 `%中` 非文件 → 404。
+    #[tokio::test]
+    async fn raw_utf8_request_target_gets_http_response_without_panic() {
+        let app = router(temp_ws_with_index());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        for method in ["GET", "HEAD"] {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            stream
+                .write_all(
+                    format!(
+                        "{method} /%中 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write raw request");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.expect("read");
+            assert!(
+                response.starts_with("HTTP/1.1 404"),
+                "{method} /%中 must answer 404 without panic, got: {response:?}"
+            );
+        }
+        server.abort();
+    }
+
+    /// R09 矩阵: 各类编码形态的解码语义与边界（仅根一级、穿越拒绝）保持。
+    #[tokio::test]
+    async fn percent_decoding_matrix_keeps_boundaries() {
+        let ws = temp_ws_with_index();
+        std::fs::write(ws.join("a+b.txt"), "plus").expect("plus file");
+        let router = router(ws);
+        // 编码中文 → 字面 "中"，非文件 → 404
+        let (status, _, _) = get_body(&router, "/%E4%B8%AD").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // /%25%E4%B8%AD 只单次解码 → 字面 "%中" → 404
+        let (status, _, _) = get_body(&router, "/%25%E4%B8%AD").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // 非法 %G0、孤立 % 原样保留 → 404
+        for path in ["/%G0", "/%"] {
+            let (status, _, _) = get_body(&router, path).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        }
+        // %FF 解出非法 UTF-8 → lossy 替换后非文件 → 404
+        let (status, _, _) = get_body(&router, "/%FF").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // + 不当空格解码：字面 "a+b.txt" 命中
+        let (status, _, body) = get_body(&router, "/a+b.txt").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "plus");
+        // 编码穿越与编码分隔符在解码后组件层仍被拒
+        for path in ["/%2e%2e/x", "/%2Fetc%2Fpasswd"] {
+            let (status, _, _) = get_body(&router, path).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        }
+        // 首页仅根一级：子目录仍 404
+        let (status, _, _) = get_body(&router, "/backend-go/server").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

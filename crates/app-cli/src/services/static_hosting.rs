@@ -366,7 +366,7 @@ fn resolve_target(root: &Path, request_path: &str) -> Option<PathBuf> {
     if request_path.contains("..") {
         return None;
     }
-    let decoded = percent_decode(request_path);
+    let decoded = super::percent_decode_path(request_path);
     let mut rel = PathBuf::new();
     for component in Path::new(&decoded).components() {
         match component {
@@ -380,26 +380,6 @@ fn resolve_target(root: &Path, request_path: &str) -> Option<PathBuf> {
         rel.push("index.html");
     }
     Some(root.join(rel))
-}
-
-/// 百分号解码（%20 等）；非法序列原样保留（后续读取 404/fallback 兜底）。
-fn percent_decode(path: &str) -> String {
-    let bytes = path.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Ok(byte) = u8::from_str_radix(&path[i + 1..i + 3], 16)
-        {
-            out.push(byte);
-            i += 3;
-            continue;
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn content_type(path: &Path) -> Option<&'static str> {
@@ -492,6 +472,70 @@ mod tests {
         // 穿越拒绝
         let (status, _, _) = get(&router, "/..%2f..%2fetc%2fpasswd").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// R09 反例: 原始(未编码)多字节 request-target `/%中` 使手写百分号解码器在
+    /// 多字节字符内部按字节切片而 panic。用真实 TCP 原始请求（GET/HEAD）断言
+    /// 不 panic、返回合法 HTTP 状态行；未匹配路径走 SPA fallback → 200。
+    #[tokio::test]
+    async fn raw_utf8_request_target_gets_http_response_without_panic() {
+        let app = router(temp_root());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        for method in ["GET", "HEAD"] {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            stream
+                .write_all(
+                    format!(
+                        "{method} /%中 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write raw request");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.expect("read");
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "{method} /%中 must fall back to SPA without panic, got: {response:?}"
+            );
+            if method == "GET" {
+                assert!(response.ends_with("<html>spa</html>"), "{response:?}");
+            }
+        }
+        server.abort();
+    }
+
+    /// R09 矩阵: 解码语义保持；编码穿越拒绝且**不走** SPA fallback（区别于普通未匹配）。
+    #[tokio::test]
+    async fn percent_decoding_matrix_keeps_spa_and_traversal_boundaries() {
+        let root = temp_root();
+        std::fs::write(root.join("a+b.txt"), "plus").expect("plus file");
+        let router = router(root);
+        // 编码中文 / 单次解码 %25 / 非法 %G0 / 孤立 % / %FF lossy：均未匹配 → SPA fallback 200
+        for path in ["/%E4%B8%AD", "/%25%E4%B8%AD", "/%G0", "/%", "/%FF"] {
+            let (status, content_type, body) = get(&router, path).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert!(content_type.starts_with("text/html"), "{path}");
+            assert_eq!(body, "<html>spa</html>", "{path}");
+        }
+        // + 不当空格解码：字面 "a+b.txt" 命中
+        let (status, _, body) = get(&router, "/a+b.txt").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "plus");
+        // 编码穿越解码出 ParentDir → 拒绝且不走 fallback
+        let (status, _, _) = get(&router, "/%2e%2e/x").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // 递归静态文件仍可访问
+        let (status, _, body) = get(&router, "/assets/app.js").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "console.log(1)");
     }
 
     #[tokio::test]

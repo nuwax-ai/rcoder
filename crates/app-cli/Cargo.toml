@@ -56,6 +56,9 @@ tokio-util = "0.7.20"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 axum = "0.8"
+# 请求路径百分号解码：按字节解析的成熟实现（手写下标切片在原始多字节
+# request-target 上会 panic，见 services::percent_decode_path）
+percent-encoding = "2.3"
 utoipa = { version = "6", features = ["axum_extras"] }
 glob = "0.3"
 globset = "0.4"
