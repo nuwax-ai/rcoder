@@ -15,7 +15,7 @@ impl FlushOutcome {
 }
 
 /// Opaque lifecycle identities survive hydration and never derive from timestamps.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProjectPersistenceIdentity {
     pub generation: String,
     /// Latest registered structural write revision (zero before first write).

@@ -57,7 +57,7 @@ pub(crate) async fn sync_once(
     store: &PgStore,
     inner: &crate::adapter::ProjectAdapter,
     pool: &DatabaseOwner,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(usize, usize)> {
     sync_once_inner(
         store,
         inner,
@@ -77,7 +77,7 @@ pub(super) async fn sync_once_paused_after_drain(
     pool: &DatabaseOwner,
     reached: tokio::sync::oneshot::Sender<()>,
     resume: tokio::sync::oneshot::Receiver<()>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(usize, usize)> {
     sync_once_inner(store, inner, pool, Some((reached, resume))).await
 }
 
@@ -89,12 +89,12 @@ async fn sync_once_inner(
         tokio::sync::oneshot::Sender<()>,
         tokio::sync::oneshot::Receiver<()>,
     )>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(usize, usize)> {
     // 排空屏障：本副本写全部落库后，PG 快照才可作为 diff 基准。
     // 超时（PG 故障重试中）跳过本轮，避免用旧快照误删镜像条目。
     if !store.wait_drained(DRAIN_TIMEOUT).await {
         debug!("[STORAGE_PG] sync skipped: drain barrier timeout (writer backlogged?)");
-        return Ok(());
+        return Ok((0, 0));
     }
 
     #[cfg(test)]
@@ -253,6 +253,14 @@ async fn sync_once_inner(
             continue;
         }
         let info = hydrate_project(&row, &container_by_name)?;
+        // R13 无变化快路径：全部竞态/退休保护通过后，比较当前同步负责恢复的
+        // 完整类型化投影；完全相等 = 权威已收敛——复用现有 Arc、不重写反向
+        // 索引、不计 changed。不比较历史 JSON 原文或随机 token。
+        if let Some(current) = &existing
+            && recovery_projection(current) == recovery_projection(&info)
+        {
+            continue;
+        }
         // A peer replacement must update registration and hydrated project
         // together. A local container intent after snapshot admission prevents
         // applying the entire associated project, not just its registry entry.
@@ -295,7 +303,7 @@ async fn sync_once_inner(
     if added + changed > 0 {
         info!("[STORAGE_PG] cross-replica sync applied: +{added} projects, {changed} changed");
     }
-    Ok(())
+    Ok((added, changed))
 }
 
 /// remove 候选的二次确认：短排空后直查该行是否已落库（屏障后新写防误删）。
@@ -395,4 +403,46 @@ async fn self_confirm_container_alive(
     } else {
         true
     }
+}
+
+/// R13：当前同步负责恢复的完整类型化投影。
+///
+/// 仅含 `hydrate_project` 从数据库行确定性恢复的字段（身份/代次/会话清单/
+/// 容器投影/归属与作用域/时间戳/模型与状态/最近会话）；不含任何运行期随机
+/// 值。两轮快照对该投影完全相等即视为权威已收敛，无需重建 Arc 与索引。
+fn recovery_projection(info: &shared_types::ProjectAndContainerInfo) -> RecoveryProjection {
+    RecoveryProjection {
+        identity: info.persistence_identity().clone(),
+        service_type: info.service_type(),
+        user_id: info.user_id().map(str::to_owned),
+        pod_id: info.pod_id().map(str::to_owned),
+        tenant_id: info.tenant_id().map(str::to_owned),
+        space_id: info.space_id().map(str::to_owned),
+        isolation_type: info.isolation_type().map(str::to_owned),
+        request_id: info.request_id().map(str::to_owned),
+        created_at: info.created_at(),
+        last_activity: info.last_activity(),
+        latest_session: info.latest_session().map(str::to_owned),
+        model_provider: info.model_provider().cloned(),
+        status: info.status().copied(),
+        container: info.container_info(),
+    }
+}
+
+#[derive(PartialEq)]
+struct RecoveryProjection {
+    identity: shared_types::persistence::ProjectPersistenceIdentity,
+    service_type: Option<shared_types::ServiceType>,
+    user_id: Option<String>,
+    pod_id: Option<String>,
+    tenant_id: Option<String>,
+    space_id: Option<String>,
+    isolation_type: Option<String>,
+    request_id: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    last_activity: chrono::DateTime<chrono::Utc>,
+    latest_session: Option<String>,
+    model_provider: Option<shared_types::ModelProviderConfig>,
+    status: Option<shared_types::AgentStatus>,
+    container: Option<shared_types::ContainerBasicInfo>,
 }
