@@ -29,6 +29,12 @@ enum Classification {
     LifecycleReferenced,
     LiveOrUnknown,
     DockerObserveOnly,
+    /// Managed data is not proven to survive container removal (no persistent
+    /// mount evidence); automatic retirement must never run for it.
+    DataProtectionRequired,
+    /// The agent reported real activity this round; observation continuity
+    /// resets and the idle window restarts from the next confirmed idle.
+    ActivityBusy,
     WithinProtection,
     ObservationIncomplete,
     Observing,
@@ -78,9 +84,58 @@ impl Candidate {
     }
 }
 
+/// Live-compute activity truth for a discovered Docker container. `Err` means
+/// the state is unknown — never evidence of idleness — and must reset the
+/// candidate's observation continuity.
+enum Activity {
+    Busy,
+    Idle,
+}
+
+#[async_trait::async_trait]
+trait ContainerActivityProbe: Send + Sync {
+    async fn probe(&self, snapshot: &AgentStopSnapshot) -> Result<Activity>;
+}
+
+/// Production probe reuses the shared GetContainerStatus chain used by the
+/// cleaner's secondary confirmation: the agent reports
+/// `is_active || active_tasks > 0` regardless of caller identity, and the
+/// query itself does not refresh activity, so probing cannot fake idleness
+/// nor keep a container alive by observing it.
+struct GrpcContainerActivityProbe {
+    checker: crate::cleanup_task::agent::AgentStatusChecker,
+}
+
+#[async_trait::async_trait]
+impl ContainerActivityProbe for GrpcContainerActivityProbe {
+    async fn probe(&self, snapshot: &AgentStopSnapshot) -> Result<Activity> {
+        let endpoint = snapshot
+            .endpoint
+            .as_deref()
+            .context("Activity probe requires an endpoint")?;
+        let grpc_addr =
+            crate::utils::extract_grpc_addr_with_port(endpoint, shared_types::GRPC_DEFAULT_PORT)
+                .context("Activity probe endpoint is unreadable")?;
+        // The agent-side response ignores caller identity; the identifier is
+        // passed for request diagnostics only.
+        let identifier = snapshot.identifier.as_str();
+        let active = self
+            .checker
+            .is_container_active(&grpc_addr, identifier, identifier)
+            .await
+            .context("Container activity probe failed")?;
+        if active {
+            Ok(Activity::Busy)
+        } else {
+            Ok(Activity::Idle)
+        }
+    }
+}
+
 struct Scanner {
     state: Arc<AppState>,
     config: CleanupConfigSettings,
+    activity_probe: Arc<dyn ContainerActivityProbe>,
     seen: HashMap<WorkloadKey, Candidate>,
     next_workload: Option<String>,
 }
@@ -113,8 +168,47 @@ fn protected_shape(
         | ServiceType::ComputerNormalProject => {}
         ServiceType::Userapp => return Some(Classification::LiveOrUnknown),
     }
-    if snapshot.container.is_some() {
-        return Some(Classification::DockerObserveOnly);
+    if let Some(container) = snapshot.container.as_ref() {
+        // Live Docker compute. Ordinary agent families may retire compute after
+        // activity observation; Builder and UserApp keep their own lifecycle
+        // authorities and stay observe-only here.
+        match snapshot.service_type {
+            ServiceType::UserappBuilder | ServiceType::Userapp => {
+                return Some(Classification::DockerObserveOnly);
+            }
+            ServiceType::WebAgentRunner
+            | ServiceType::ComputerAgentRunner
+            | ServiceType::ComputerNormalProject => {
+                // Without an endpoint activity cannot be probed; without
+                // StartedAt evidence a same-CID restart is undetectable.
+                if snapshot.endpoint.is_none()
+                    || container.uid.is_empty()
+                    || container
+                        .resource_version
+                        .as_deref()
+                        .is_none_or(str::is_empty)
+                {
+                    return Some(Classification::ObservationIncomplete);
+                }
+                if !snapshot
+                    .compute_data_protection
+                    .as_ref()
+                    .is_some_and(|protection| protection.persistent_mounts)
+                {
+                    // `v: false` removal never restores writable-layer content;
+                    // without a persistent mount the managed data dies with the
+                    // container, so automatic retirement is forbidden.
+                    return Some(Classification::DataProtectionRequired);
+                }
+                return match container.created_at {
+                    None => Some(Classification::ObservationIncomplete),
+                    Some(created) => match now.signed_duration_since(created).to_std() {
+                        Ok(age) if age >= protection => None,
+                        Ok(_) | Err(_) => Some(Classification::WithinProtection),
+                    },
+                };
+            }
+        }
     }
     if snapshot.namespace.is_none() {
         return Some(Classification::ObservationIncomplete);
@@ -239,6 +333,14 @@ impl Scanner {
         if let Some(reason) = shape {
             return Ok(reason);
         }
+        // Live Docker compute must prove idleness from the agent itself every
+        // round; observation continuity only accrues on confirmed idle.
+        if snapshot.container.is_some() {
+            match self.activity_probe.probe(snapshot).await? {
+                Activity::Busy => return Ok(Classification::ActivityBusy),
+                Activity::Idle => {}
+            }
+        }
         if !ready {
             return Ok(Classification::Observing);
         }
@@ -264,6 +366,14 @@ impl Scanner {
         .is_some()
         {
             return Ok(Classification::Superseded);
+        }
+        // Exclusive recheck re-reads current activity so a request that began
+        // after the shared observation can still cancel this retirement.
+        if snapshot.container.is_some() {
+            match self.activity_probe.probe(snapshot).await? {
+                Activity::Busy => return Ok(Classification::ActivityBusy),
+                Activity::Idle => {}
+            }
         }
         // Last canonical query uses the pinned session owning the exact lock.
         if let Some(reason) = self.unreferenced(&guard, snapshot).await? {
@@ -360,6 +470,8 @@ impl Scanner {
                         | Classification::LifecycleReferenced
                         | Classification::LiveOrUnknown
                         | Classification::DockerObserveOnly
+                        | Classification::DataProtectionRequired
+                        | Classification::ActivityBusy
                         | Classification::WithinProtection
                         | Classification::ObservationIncomplete
                         | Classification::Superseded
@@ -376,6 +488,8 @@ impl Scanner {
                         Classification::LifecycleReferenced
                         | Classification::LiveOrUnknown
                         | Classification::DockerObserveOnly
+                        | Classification::DataProtectionRequired
+                        | Classification::ActivityBusy
                         | Classification::WithinProtection
                         | Classification::ObservationIncomplete
                         | Classification::Observing
@@ -438,9 +552,13 @@ pub(crate) fn start(
                 (None, None)
             }
         };
+        let activity_probe = Arc::new(GrpcContainerActivityProbe {
+            checker: crate::cleanup_task::agent::AgentStatusChecker::new(state.grpc_pool.clone()),
+        });
         let mut scanner = Scanner {
             state,
             config,
+            activity_probe,
             seen: HashMap::new(),
             next_workload: None,
         };

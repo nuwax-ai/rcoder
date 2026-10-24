@@ -231,6 +231,7 @@ mod tests {
                 container: None,
                 services: vec![],
                 replicas: None,
+                compute_data_protection: None,
                 endpoint: None,
             })
         }

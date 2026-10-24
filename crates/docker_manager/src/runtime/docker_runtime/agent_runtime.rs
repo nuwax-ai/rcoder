@@ -66,6 +66,16 @@ impl AgentContainerRuntime for DockerRuntime {
     ) -> ContainerRuntimeResult<container_runtime_api::AgentStopOutcome> {
         self.retire_docker_agent_snapshot(snapshot).await
     }
+    async fn retire_agent_remnants(
+        &self,
+        snapshot: &container_runtime_api::AgentStopSnapshot,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentStopOutcome> {
+        // Docker's remnant analog: once the engine has confirmed idleness,
+        // references, and persistent-mount data protection, retirement is the
+        // exact-CID removal. The shared executor re-verifies scope, UID, and
+        // ownership labels, and treats a missing container as Complete.
+        self.retire_docker_agent_snapshot(snapshot).await
+    }
     async fn refresh_agent_retirement_fence(
         &self,
         snapshot: &container_runtime_api::AgentStopSnapshot,

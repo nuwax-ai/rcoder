@@ -174,6 +174,7 @@ impl AgentContainerRuntime for Runtime {
             }),
             services: vec![],
             replicas: None,
+            compute_data_protection: None,
             endpoint: None,
         })
     }

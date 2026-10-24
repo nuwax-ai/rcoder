@@ -38,6 +38,25 @@ pub struct AgentStopSnapshot {
     pub services: Vec<AgentResourceIdentity>,
     pub replicas: Option<i32>,
     pub endpoint: Option<String>,
+    /// Evidence collected from the Docker engine for live compute: whether
+    /// managed data sits on persistent mounts outside the writable layer.
+    /// Absent on Kubernetes snapshots (PVC retention is structural there);
+    /// policy decisions stay in the engine, never in the runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compute_data_protection: Option<ComputeDataProtection>,
+}
+
+/// Writable-layer survival evidence for a live Docker container. `v: false`
+/// removal never restores writable-layer content, so retirement must only run
+/// when managed data is carried by mounts that outlive the container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComputeDataProtection {
+    /// At least one writable mount (bind with a source, or a named volume)
+    /// covers managed data outside the container writable layer.
+    pub persistent_mounts: bool,
+    /// Host-configured AutoRemove; container data on persistent mounts is
+    /// unaffected, but it forecloses any writable-layer recovery flow.
+    pub auto_remove: bool,
 }
 
 impl AgentResourceIdentity {

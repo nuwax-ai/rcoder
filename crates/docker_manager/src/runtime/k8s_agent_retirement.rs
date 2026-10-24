@@ -230,6 +230,7 @@ fn empty(namespace: &str, identifier: &str, service_type: ServiceType) -> AgentS
         container: None,
         services: Vec::new(),
         replicas: None,
+        compute_data_protection: None,
         endpoint: None,
     }
 }

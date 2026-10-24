@@ -79,6 +79,7 @@ impl AgentContainerRuntime for RetirementRuntime {
                 vec![]
             },
             replicas: None,
+            compute_data_protection: None,
             endpoint: None,
             container: self
                 .current

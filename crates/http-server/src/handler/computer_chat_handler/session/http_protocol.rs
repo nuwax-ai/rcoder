@@ -58,6 +58,7 @@ impl AgentContainerRuntime for Runtime {
             pods: vec![],
             services: vec![],
             replicas: None,
+            compute_data_protection: None,
             endpoint: None,
             container: Some(container_runtime_api::AgentResourceIdentity {
                 kind: container_runtime_api::AgentResourceKind::Container,

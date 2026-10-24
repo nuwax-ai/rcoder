@@ -88,11 +88,9 @@ async fn run(case: Case) -> (Result<AgentStopOutcome>, Vec<String>) {
         snapshot.namespace.as_deref(),
         Some(runtime.agent_workload_namespace().as_str())
     );
-    assert!(
-        runtime.retire_agent_remnants(&snapshot).await.is_err(),
-        "Docker automatic writes remain unsupported"
-    );
-    let result = AgentContainerRuntime::stop_captured_agent(&runtime, &snapshot).await;
+    // Automatic remnant retirement shares the exact-CID executor with the
+    // explicit captured stop; idleness and data protection are engine gates.
+    let result = runtime.retire_agent_remnants(&snapshot).await;
     server.abort();
     drop(server.await);
     let requests = recorded.lock().unwrap().clone();

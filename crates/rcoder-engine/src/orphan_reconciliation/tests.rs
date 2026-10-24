@@ -1,8 +1,8 @@
 use super::*;
 use container_runtime_api::{
-    AgentContainerRuntime, AgentResourceKind, ContainerCreateParams, ContainerRuntimeError,
-    ContainerRuntimeResult, RemovedContainerInfo, RuntimeContainerInfo, UserAppDeploymentRuntime,
-    WorkspaceRuntime,
+    AgentContainerRuntime, AgentResourceKind, ComputeDataProtection, ContainerCreateParams,
+    ContainerRuntimeError, ContainerRuntimeResult, RemovedContainerInfo, RuntimeContainerInfo,
+    UserAppDeploymentRuntime, WorkspaceRuntime,
 };
 use shared_types::{ContainerBasicInfo, ProjectAndContainerInfo, ProjectStore};
 use std::sync::{
@@ -28,6 +28,7 @@ fn service() -> AgentStopSnapshot {
             owner_uid: None,
         }],
         replicas: None,
+        compute_data_protection: None,
         endpoint: None,
     }
 }
@@ -91,7 +92,26 @@ fn only_empty_zero_replica_controllers_and_services_are_eligible() {
     docker.container = Some(docker.services[0].clone());
     assert_eq!(
         protected_shape(&docker, Utc::now(), protection),
-        Some(Classification::DockerObserveOnly)
+        // No endpoint and no Docker evidence: idleness can never be probed.
+        Some(Classification::ObservationIncomplete)
+    );
+    docker.endpoint = Some("http://127.0.0.1:50051".into());
+    docker.compute_data_protection = Some(ComputeDataProtection {
+        persistent_mounts: true,
+        auto_remove: false,
+    });
+    assert_eq!(
+        protected_shape(&docker, Utc::now(), protection),
+        None,
+        "live Docker compute with full evidence is shape-eligible for observation"
+    );
+    docker.compute_data_protection = Some(ComputeDataProtection {
+        persistent_mounts: false,
+        auto_remove: false,
+    });
+    assert_eq!(
+        protected_shape(&docker, Utc::now(), protection),
+        Some(Classification::DataProtectionRequired)
     );
 }
 
@@ -278,7 +298,7 @@ impl UserAppDeploymentRuntime for Runtime {
 }
 
 #[cfg(feature = "userapp-turso")]
-async fn fixture() -> (Scanner, Arc<Runtime>, tempfile::TempDir) {
+async fn fixture() -> (Scanner, Arc<Runtime>, Arc<ScriptedProbe>, tempfile::TempDir) {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(
         rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
@@ -304,14 +324,17 @@ async fn fixture() -> (Scanner, Arc<Runtime>, tempfile::TempDir) {
         container_protection_seconds: 0,
         ..Default::default()
     };
+    let probe = Arc::new(ScriptedProbe::default());
     (
         Scanner {
             state,
             config,
+            activity_probe: probe.clone(),
             seen: HashMap::new(),
             next_workload: None,
         },
         runtime,
+        probe,
         directory,
     )
 }
@@ -328,7 +351,7 @@ fn age_candidates(scanner: &mut Scanner) {
 #[cfg(feature = "userapp-turso")]
 #[tokio::test]
 async fn unreferenced_service_is_reclaimed_after_real_continuous_observation() {
-    let (mut scanner, runtime, _directory) = fixture().await;
+    let (mut scanner, runtime, _probe, _directory) = fixture().await;
     scanner.scan().await.unwrap();
     assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
     age_candidates(&mut scanner);
@@ -339,7 +362,7 @@ async fn unreferenced_service_is_reclaimed_after_real_continuous_observation() {
 #[cfg(feature = "userapp-turso")]
 #[tokio::test]
 async fn observation_error_breaks_continuity_and_original_scan_recovers() {
-    let (mut scanner, runtime, _directory) = fixture().await;
+    let (mut scanner, runtime, _probe, _directory) = fixture().await;
     scanner.scan().await.unwrap();
     age_candidates(&mut scanner);
     runtime.failed.store(true, Ordering::Release);
@@ -356,7 +379,7 @@ async fn observation_error_breaks_continuity_and_original_scan_recovers() {
 #[cfg(feature = "userapp-turso")]
 #[tokio::test]
 async fn observe_mode_and_referenced_builder_never_retire_compute() {
-    let (mut scanner, runtime, _directory) = fixture().await;
+    let (mut scanner, runtime, _probe, _directory) = fixture().await;
     scanner.config.orphan_reconcile_mode = OrphanReconcileMode::Observe;
     scanner.scan().await.unwrap();
     age_candidates(&mut scanner);
@@ -381,7 +404,7 @@ async fn observe_mode_and_referenced_builder_never_retire_compute() {
 #[cfg(feature = "userapp-turso")]
 #[tokio::test]
 async fn canonical_registration_arriving_after_capture_prevents_retirement() {
-    let (mut scanner, runtime, _directory) = fixture().await;
+    let (mut scanner, runtime, _probe, _directory) = fixture().await;
     scanner.config.long_idle_timeout_seconds = 0;
     scanner.config.cleanup_interval_seconds = 0;
     scanner.scan().await.unwrap();
@@ -423,7 +446,7 @@ async fn canonical_registration_arriving_after_capture_prevents_retirement() {
 #[cfg(feature = "userapp-turso")]
 #[tokio::test]
 async fn scan_budget_advances_past_blocked_workload_without_resetting_other_candidates() {
-    let (mut scanner, runtime, _directory) = fixture().await;
+    let (mut scanner, runtime, _probe, _directory) = fixture().await;
     scanner.config.orphan_scan_budget_seconds = 1;
     scanner.config.docker_stop_timeout_seconds = 90;
     let mut later = service();
@@ -459,5 +482,252 @@ async fn scan_budget_advances_past_blocked_workload_without_resetting_other_cand
         runtime.deletes.load(Ordering::Acquire),
         1,
         "the later workload must eventually complete two canonical observations and retire"
+    );
+}
+
+/// Deterministic activity probe for discovered live compute.
+struct ScriptedProbe {
+    busy: AtomicBool,
+    fail: AtomicBool,
+    calls: AtomicUsize,
+}
+
+impl Default for ScriptedProbe {
+    fn default() -> Self {
+        Self {
+            busy: AtomicBool::new(false),
+            fail: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ContainerActivityProbe for ScriptedProbe {
+    async fn probe(&self, _snapshot: &AgentStopSnapshot) -> Result<Activity> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        if self.fail.load(Ordering::Acquire) {
+            return Err(anyhow::anyhow!("probe endpoint unavailable"));
+        }
+        if self.busy.load(Ordering::Acquire) {
+            Ok(Activity::Busy)
+        } else {
+            Ok(Activity::Idle)
+        }
+    }
+}
+
+/// A live Docker web-agent container that lost its registration (for example
+/// after a memory-backend restart): full CID, StartedAt evidence, persistent
+/// workspace mounts, and a probe endpoint.
+#[cfg(feature = "userapp-turso")]
+fn docker_web_agent() -> AgentStopSnapshot {
+    AgentStopSnapshot {
+        app_id_hint: None,
+        namespace: Some("isolated".into()),
+        identifier: "web-legacy".into(),
+        service_type: ServiceType::WebAgentRunner,
+        controller: None,
+        pods: vec![],
+        container: Some(AgentResourceIdentity {
+            kind: AgentResourceKind::Container,
+            name: "rcoder-web-agent-web-legacy".into(),
+            uid: "cid-legacy-0001".into(),
+            resource_version: Some("2026-10-24T00:00:00Z".into()),
+            created_at: Some(Utc::now() - chrono::Duration::hours(48)),
+            owner_uid: None,
+        }),
+        services: vec![],
+        replicas: None,
+        endpoint: Some("http://127.0.0.1:50051".into()),
+        compute_data_protection: Some(ComputeDataProtection {
+            persistent_mounts: true,
+            auto_remove: false,
+        }),
+    }
+}
+
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn docker_web_agent_without_registration_is_reclaimed_after_continuous_idle() {
+    let (mut scanner, runtime, probe, _directory) = fixture().await;
+    *runtime.snapshot.lock().unwrap() = docker_web_agent();
+    scanner.scan().await.unwrap();
+    assert_eq!(
+        runtime.deletes.load(Ordering::Acquire),
+        0,
+        "first observation must never retire"
+    );
+    assert!(
+        scanner
+            .seen
+            .values()
+            .all(|candidate| candidate.observations >= 1),
+        "confirmed-idle candidate must accumulate observation continuity"
+    );
+    age_candidates(&mut scanner);
+    scanner.scan().await.unwrap();
+    assert_eq!(
+        runtime.deletes.load(Ordering::Acquire),
+        1,
+        "unregistered live web agent must be reclaimed once the idle window closes"
+    );
+    assert!(
+        probe.calls.load(Ordering::Acquire) >= 2,
+        "idle must be re-confirmed under exclusive admission before retirement"
+    );
+}
+
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn docker_busy_activity_resets_the_idle_window() {
+    let (mut scanner, runtime, probe, _directory) = fixture().await;
+    *runtime.snapshot.lock().unwrap() = docker_web_agent();
+    probe.busy.store(true, Ordering::Release);
+    for _ in 0..2 {
+        scanner.scan().await.unwrap();
+        age_candidates(&mut scanner);
+    }
+    assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
+    assert!(
+        scanner.seen.is_empty(),
+        "a busy agent must not keep idle observation continuity"
+    );
+    probe.busy.store(false, Ordering::Release);
+    scanner.scan().await.unwrap();
+    age_candidates(&mut scanner);
+    scanner.scan().await.unwrap();
+    assert_eq!(
+        runtime.deletes.load(Ordering::Acquire),
+        1,
+        "the idle window must restart from the first confirmed idle observation"
+    );
+}
+
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn docker_probe_failure_preserves_compute_and_resets_continuity() {
+    let (mut scanner, runtime, probe, _directory) = fixture().await;
+    *runtime.snapshot.lock().unwrap() = docker_web_agent();
+    probe.fail.store(true, Ordering::Release);
+    for _ in 0..2 {
+        scanner.scan().await.unwrap();
+        age_candidates(&mut scanner);
+    }
+    assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
+    assert!(scanner.seen.is_empty());
+    probe.fail.store(false, Ordering::Release);
+    scanner.scan().await.unwrap();
+    age_candidates(&mut scanner);
+    scanner.scan().await.unwrap();
+    assert_eq!(runtime.deletes.load(Ordering::Acquire), 1);
+}
+
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn docker_same_cid_restart_resets_observation_continuity() {
+    let (mut scanner, runtime, _probe, _directory) = fixture().await;
+    *runtime.snapshot.lock().unwrap() = docker_web_agent();
+    scanner.scan().await.unwrap();
+    age_candidates(&mut scanner);
+    runtime
+        .snapshot
+        .lock()
+        .unwrap()
+        .container
+        .as_mut()
+        .unwrap()
+        .resource_version = Some("2026-10-24T12:00:00Z".into());
+    scanner.scan().await.unwrap();
+    assert_eq!(
+        runtime.deletes.load(Ordering::Acquire),
+        0,
+        "a same-CID restart must invalidate pre-restart idle evidence"
+    );
+    let key = WorkloadKey::new("isolated", ServiceType::WebAgentRunner, "web-legacy").unwrap();
+    assert_eq!(
+        scanner.seen.get(&key).unwrap().observations,
+        1,
+        "observation must restart from scratch after the StartedAt change"
+    );
+    age_candidates(&mut scanner);
+    scanner.scan().await.unwrap();
+    assert_eq!(runtime.deletes.load(Ordering::Acquire), 1);
+}
+
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn docker_workspace_without_persistent_mounts_is_never_retired() {
+    let (mut scanner, runtime, _probe, _directory) = fixture().await;
+    let mut snapshot = docker_web_agent();
+    snapshot.compute_data_protection = Some(ComputeDataProtection {
+        persistent_mounts: false,
+        auto_remove: true,
+    });
+    *runtime.snapshot.lock().unwrap() = snapshot;
+    for _ in 0..3 {
+        scanner.scan().await.unwrap();
+        age_candidates(&mut scanner);
+    }
+    assert_eq!(
+        runtime.deletes.load(Ordering::Acquire),
+        0,
+        "writable-layer data must block automatic retirement"
+    );
+    assert!(scanner.seen.is_empty());
+}
+
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn docker_userapp_builder_stays_observe_only() {
+    let (mut scanner, runtime, _probe, _directory) = fixture().await;
+    let mut snapshot = docker_web_agent();
+    snapshot.service_type = ServiceType::UserappBuilder;
+    snapshot.app_id_hint = Some(snapshot.identifier.clone());
+    *runtime.snapshot.lock().unwrap() = snapshot;
+    for _ in 0..3 {
+        scanner.scan().await.unwrap();
+        age_candidates(&mut scanner);
+    }
+    assert_eq!(
+        runtime.deletes.load(Ordering::Acquire),
+        0,
+        "builder compute keeps its own lifecycle authority"
+    );
+}
+
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn docker_web_agent_with_canonical_registration_stays_with_the_cleaner() {
+    let (mut scanner, runtime, _probe, _directory) = fixture().await;
+    *runtime.snapshot.lock().unwrap() = docker_web_agent();
+    let mut project = ProjectAndContainerInfo::new("registered-holder".into());
+    project.set_user_id(Some("web-legacy".into()));
+    project.set_service_type(Some(ServiceType::WebAgentRunner));
+    project.set_container(Some(ContainerBasicInfo {
+        container_id: "cid-legacy-0001".into(),
+        container_name: "web-legacy".into(),
+        container_ip: "127.0.0.1".into(),
+        internal_port: 50051,
+        external_port: 0,
+        project_id: "registered-holder".into(),
+        status: "Running".into(),
+        created_at: Utc::now(),
+        service_url: "http://127.0.0.1:8086".into(),
+        workload_uid: None,
+    }));
+    scanner
+        .state
+        .projects
+        .insert("registered-holder".into(), Arc::new(project))
+        .unwrap();
+    for _ in 0..3 {
+        scanner.scan().await.unwrap();
+        age_candidates(&mut scanner);
+    }
+    assert_eq!(
+        runtime.deletes.load(Ordering::Acquire),
+        0,
+        "registered compute must remain under the cleaner's authority"
     );
 }

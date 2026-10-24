@@ -2,10 +2,11 @@
 use super::DockerRuntime;
 use container_runtime_api::{
     AgentResourceIdentity, AgentResourceKind, AgentStopOutcome, AgentStopSnapshot,
-    ContainerRuntimeError as Error, ContainerRuntimeResult as Result,
+    ComputeDataProtection, ContainerRuntimeError as Error, ContainerRuntimeResult as Result,
 };
 use shared_types::ServiceType;
 use std::collections::HashMap;
+use tracing::debug;
 
 #[cfg(test)]
 mod tests;
@@ -88,11 +89,67 @@ impl DockerRuntime {
                 .and_then(|names| names.first())
                 .map(|value| value.trim_start_matches('/').to_owned())
                 .ok_or_else(|| Error::DockerError("Managed Agent has no container name".into()))?;
+            // Live evidence needs one inspect per candidate: StartedAt resets
+            // observation on same-CID restarts, and mounts decide whether managed
+            // data survives container removal. An unreadable candidate is absent
+            // this round, so observation continuity never accrues on stale data.
+            let inspected = match tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                self.inner.get_docker_client().inspect_container(&uid, None),
+            )
+            .await
+            {
+                Ok(Ok(inspected)) => inspected,
+                Ok(Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                })) => continue,
+                outcome => {
+                    debug!(uid = %uid, ?outcome, "Managed Agent inspect is unavailable; skipping this round");
+                    continue;
+                }
+            };
+            let started_at = inspected
+                .state
+                .as_ref()
+                .and_then(|state| state.started_at.as_deref())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let persistent_mounts =
+                inspected
+                    .mounts
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|mount| {
+                        let writable = mount.rw.unwrap_or(true);
+                        let persistent = match mount.typ.as_deref() {
+                            // Inspect reports mount types as plain Docker strings.
+                            Some("bind") => mount
+                                .source
+                                .as_deref()
+                                .is_some_and(|source| !source.is_empty()),
+                            Some("volume") => {
+                                mount.name.as_deref().is_some_and(|name| !name.is_empty())
+                                    || mount
+                                        .source
+                                        .as_deref()
+                                        .is_some_and(|source| !source.is_empty())
+                            }
+                            _ => false,
+                        };
+                        writable && persistent
+                    });
+            let auto_remove = inspected
+                .host_config
+                .as_ref()
+                .and_then(|config| config.auto_remove)
+                .unwrap_or(false);
             let identity = AgentResourceIdentity {
                 kind: AgentResourceKind::Container,
                 name,
                 uid,
-                resource_version: None,
+                resource_version: started_at,
                 owner_uid: None,
                 created_at: container
                     .created
@@ -119,6 +176,10 @@ impl DockerRuntime {
                 services: Vec::new(),
                 replicas: None,
                 endpoint,
+                compute_data_protection: Some(ComputeDataProtection {
+                    persistent_mounts,
+                    auto_remove,
+                }),
             });
         }
         Ok(result)
@@ -177,6 +238,7 @@ impl DockerRuntime {
             services: Vec::new(),
             replicas: None,
             endpoint: None,
+            compute_data_protection: None,
         }))
     }
 
