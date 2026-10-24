@@ -508,34 +508,54 @@ async fn verify_registration(
     registered: &ContainerBasicInfo,
     publish: bool,
 ) -> Result<Option<ContainerBasicInfo>> {
+    verify_registration_observed(state, app_id, instance, registered, publish, None).await
+}
+
+async fn verify_registration_observed(
+    state: &AppState,
+    app_id: &str,
+    instance: &str,
+    registered: &ContainerBasicInfo,
+    publish: bool,
+    mut observation: Option<&mut BuilderReadinessObservation<'_>>,
+) -> Result<Option<ContainerBasicInfo>> {
+    readiness_begin(&mut observation, "find_container");
     let Some(rc) = state
         .runtime()
         .find_container(instance, &ServiceType::UserappBuilder)
         .await
         .context("inspect builder registration")?
     else {
+        readiness_result(&mut observation, "find_container", "absent");
         return Ok(None);
     };
     validate_builder_identity(instance, &rc)?;
     // 非 Running（含已删除容器的注册缓存残影）先归 None——调用方按需重建；
     // 此时 verify 的 capture 查无物理负载，会误报"身份变更"。
     if rc.status != container_runtime_api::ContainerRuntimeStatus::Running {
+        readiness_result(&mut observation, "find_container", "not_running");
         return Ok(None);
     }
+    readiness_result(&mut observation, "find_container", "running");
     // 物理身份校验由 verify_live_builder 的运行时 capture 执行（应用共享，
     // 无归属注解可比对）。
+    readiness_begin(&mut observation, "verify_live_builder");
     adoption::verify_live_builder(state, app_id, instance, &rc.container_id).await?;
+    readiness_result(&mut observation, "verify_live_builder", "verified");
     // A live Pod alone is insufficient when its management Service is absent.
     // Read-side discovery never repairs it; return to admitted creation/resume
     // so repair shares the same durable operation and runtime lease as Stop.
+    readiness_begin(&mut observation, "get_container_info");
     if state
         .runtime()
         .get_container_info_by_identifier(instance, &ServiceType::UserappBuilder)
         .await?
         .is_none()
     {
+        readiness_result(&mut observation, "get_container_info", "absent");
         return Ok(None);
     }
+    readiness_result(&mut observation, "get_container_info", "found");
     let Some(updated) = refreshed_registration(registered, &rc) else {
         return Ok(Some(registered.clone()));
     };
@@ -778,6 +798,68 @@ async fn confirm_builder_ready(
     confirm_builder_ready_inner(state, app_id, instance, info, None, deadline).await
 }
 
+/// Fixed stage names and result classes only: never credentials or URLs.
+/// Repeated polling logs once per stage/result change, not every 200ms.
+struct BuilderReadinessObservation<'a> {
+    app_id: &'a str,
+    operation_id: Option<&'a str>,
+    started: std::time::Instant,
+    stage_started: std::collections::BTreeMap<&'static str, std::time::Instant>,
+    stage: &'static str,
+    in_flight: bool,
+    results: std::collections::BTreeMap<&'static str, &'static str>,
+}
+
+impl BuilderReadinessObservation<'_> {
+    fn begin(&mut self, stage: &'static str) {
+        self.stage = stage;
+        self.in_flight = true;
+        self.stage_started.insert(stage, std::time::Instant::now());
+        if !self.results.contains_key(stage) {
+            self.result(stage, "started");
+        }
+    }
+
+    fn result(&mut self, stage: &'static str, result: &'static str) {
+        if self.stage == stage && result != "started" {
+            self.in_flight = false;
+        }
+        if self.results.insert(stage, result) != Some(result) {
+            info!(
+                app_id = self.app_id,
+                operation_id = self.operation_id,
+                stage,
+                result,
+                stage_elapsed_ms = self
+                    .stage_started
+                    .get(stage)
+                    .map(|started| started.elapsed().as_millis() as u64),
+                elapsed_ms = self.started.elapsed().as_millis() as u64,
+                "Builder readiness observation"
+            );
+        }
+    }
+}
+
+fn readiness_begin(
+    observation: &mut Option<&mut BuilderReadinessObservation<'_>>,
+    stage: &'static str,
+) {
+    if let Some(observation) = observation.as_deref_mut() {
+        observation.begin(stage);
+    }
+}
+
+fn readiness_result(
+    observation: &mut Option<&mut BuilderReadinessObservation<'_>>,
+    stage: &'static str,
+    result: &'static str,
+) {
+    if let Some(observation) = observation.as_deref_mut() {
+        observation.result(stage, result);
+    }
+}
+
 async fn confirm_builder_ready_inner(
     state: &AppState,
     app_id: &str,
@@ -786,8 +868,19 @@ async fn confirm_builder_ready_inner(
     operation: Option<&shared_types::UserAppOperationRecord>,
     deadline: tokio::time::Instant,
 ) -> Result<ContainerBasicInfo> {
-    tokio::time::timeout_at(deadline, async {
+    let started = std::time::Instant::now();
+    let mut observation = BuilderReadinessObservation {
+        app_id,
+        operation_id: operation.map(|operation| operation.operation_id.as_str()),
+        started,
+        stage_started: std::collections::BTreeMap::new(),
+        stage: "confirmation",
+        in_flight: false,
+        results: std::collections::BTreeMap::new(),
+    };
+    let result = tokio::time::timeout_at(deadline, async {
         loop {
+            observation.begin("check_cancellation");
             if let Some(operation) = operation
                 && let Err(shared_types::UserAppStoreError::OperationInProgress(blocker)) = state
                     .userapp_store
@@ -806,11 +899,30 @@ async fn confirm_builder_ready_inner(
                 // This loop performs only reads, so no mutation is abandoned.
                 return Err(container_runtime_api::ContainerRuntimeError::CreationCancelled.into());
             }
-            if let Some(actual) = verify_registration(state, app_id, instance, &info, false).await?
-            {
+            observation.result("check_cancellation", "current");
+            observation.begin("verify_registration");
+            let verified = verify_registration_observed(
+                state,
+                app_id,
+                instance,
+                &info,
+                false,
+                Some(&mut observation),
+            )
+            .await?;
+            observation.result(
+                "verify_registration",
+                if verified.is_some() {
+                    "verified"
+                } else {
+                    "unready"
+                },
+            );
+            if let Some(actual) = verified {
                 if actual.container_id != info.container_id {
                     return Err(anyhow!("Builder resource replaced before readiness"));
                 }
+                observation.begin("credentials");
                 let credentials = crate::userapp_forward::file_credentials::credentials(
                     state,
                     shared_types::UserappStage::Dev,
@@ -819,15 +931,35 @@ async fn confirm_builder_ready_inner(
                 )
                 .await
                 .map_err(shared_types::WakeFailure::into_app_error)?;
-                if probe_file_server(&dev_file_server_addr(state, &actual)?, &credentials).await {
+                observation.result("credentials", "available");
+                observation.begin("probe_file_server");
+                let ready =
+                    probe_file_server(&dev_file_server_addr(state, &actual)?, &credentials).await;
+                observation.result("probe_file_server", if ready { "ready" } else { "unready" });
+                if ready {
                     return Ok(actual);
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     })
-    .await
-    .context("Builder readiness deadline exceeded")?
+    .await;
+    let outcome = match &result {
+        Ok(Ok(_)) => "ready",
+        Ok(Err(_)) => "error",
+        Err(_) => "deadline_exceeded",
+    };
+    info!(
+        app_id,
+        operation_id = observation.operation_id,
+        stage = observation.stage,
+        stage_in_flight = observation.in_flight,
+        outcome,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        stage_results = ?observation.results,
+        "Builder readiness confirmation finished"
+    );
+    result.context("Builder readiness deadline exceeded")?
 }
 
 /// Create a builder without publishing its registration before the confirmation deadline.

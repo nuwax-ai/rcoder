@@ -62,6 +62,7 @@ impl TerminalSeed {
 /// 物理租约 validate 判定 + 可选死亡探针覆写。
 #[derive(Default)]
 pub(crate) struct FenceRuntime {
+    pub(crate) builder_create_calls: std::sync::atomic::AtomicUsize,
     pub(crate) retained_creation_absent: std::sync::atomic::AtomicBool,
     pub(crate) retained_storage: Mutex<Option<shared_types::UserAppRetainedStorage>>,
     pub(crate) agent_replacement: Mutex<Option<shared_types::VerifiedAgentReplacement>>,
@@ -117,6 +118,7 @@ impl FenceRuntime {
         generation: Option<&str>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            builder_create_calls: Default::default(),
             retained_creation_absent: Default::default(),
             retained_storage: Default::default(),
             agent_replacement: Default::default(),
@@ -228,6 +230,8 @@ impl AgentContainerRuntime for FenceRuntime {
         &self,
         _params: container_runtime_api::ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+        self.builder_create_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Err(ContainerRuntimeError::ContainerNotFound("fence".into()))
     }
     async fn get_container_info(

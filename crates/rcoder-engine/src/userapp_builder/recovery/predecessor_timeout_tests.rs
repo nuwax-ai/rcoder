@@ -216,6 +216,30 @@ async fn seed_receipt_recovery(
     original
 }
 
+async fn seed_interrupted_receipt_recovery(
+    store: &dyn UserAppLifecycleStore,
+    app_id: &str,
+    operation_id: &str,
+    with_predecessor: bool,
+) -> UserAppOperationRecord {
+    let running = seed_receipt_recovery(store, app_id, operation_id, with_predecessor).await;
+    store
+        .advance(&UserAppOperationProgress {
+            app_id: running.app_id.clone(),
+            lifecycle_id: running.lifecycle_id.clone(),
+            operation_id: running.operation_id.clone(),
+            expected_revision: running.revision,
+            executor_id: running.executor_id.clone().unwrap(),
+            state: UserAppOperationState::RecoveryRequired,
+            step: "worker_interrupted".into(),
+            checkpoint: running.checkpoint.clone(),
+            error_code: Some("ERR_BACKEND_ERROR".into()),
+            error_message: Some("original receipt-recovery worker ended".into()),
+        })
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 async fn predecessor_volume_observation_cannot_hold_all_scanner_slots_forever() {
     let directory = tempfile::tempdir().unwrap();
@@ -232,7 +256,7 @@ async fn predecessor_volume_observation_cannot_hold_all_scanner_slots_forever() 
     let mut originals = Vec::new();
     for index in 0..MAX_RECOVERIES {
         originals.push(
-            seed_receipt_recovery(
+            seed_interrupted_receipt_recovery(
                 store.as_ref(),
                 &format!("blocked-predecessor-{index}"),
                 &format!("receipt-{index:02}"),
@@ -241,7 +265,9 @@ async fn predecessor_volume_observation_cannot_hold_all_scanner_slots_forever() 
             .await,
         );
     }
-    let healthy = seed_receipt_recovery(store.as_ref(), HEALTHY_APP, "receipt-healthy", true).await;
+    let healthy =
+        seed_interrupted_receipt_recovery(store.as_ref(), HEALTHY_APP, "receipt-healthy", true)
+            .await;
     let mut tasks = RecoveryTasks::default();
     let mut cursor = None;
     discover(&state, &mut tasks, &mut cursor).await.unwrap();
@@ -341,7 +367,8 @@ async fn receipt_without_predecessor_does_not_require_a_volume_probe() {
     runtime.block_volumes.store(true, Ordering::SeqCst);
     let state = runtime_state(runtime.clone(), store.clone(), None).await;
     let original =
-        seed_receipt_recovery(store.as_ref(), "no-predecessor", "receipt-plain", false).await;
+        seed_interrupted_receipt_recovery(store.as_ref(), "no-predecessor", "receipt-plain", false)
+            .await;
     let mut tasks = RecoveryTasks::default();
     discover(&state, &mut tasks, &mut None).await.unwrap();
     let (_, result) = tasks.next().await.unwrap();
@@ -357,4 +384,192 @@ async fn receipt_without_predecessor_does_not_require_a_volume_probe() {
             .step,
         "builder_created_observed"
     );
+}
+
+// The lifecycle lock is process-static. Do not use two AppStates in this
+// process as evidence of cross-process exclusion. Instead, retain a real
+// Running revision as the remote actor's completion token, expose its exact
+// runtime receipt, and execute the production scanner and store CAS directly.
+async fn assert_receipt_scan_preserves_live_completion(bind_deadline: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+            &directory.path().join("live-confirmation.db"),
+        )
+        .await
+        .unwrap(),
+    );
+    let runtime = Arc::new(ReceiptRuntime::default());
+    let mut state = runtime_state(runtime.clone(), store.clone(), None).await;
+    if bind_deadline {
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .userapp_storage
+            .ensure_timeout_seconds = 1;
+    }
+    let original = seed_receipt_recovery(
+        store.as_ref(),
+        "live-confirmation",
+        "live-confirmation-op",
+        false,
+    )
+    .await;
+    if bind_deadline {
+        store
+            .bind_operation_deadline(
+                &original.app_id,
+                &original.operation_id,
+                &original.lifecycle_id,
+                chrono::Utc::now().timestamp_millis() + 90_000,
+            )
+            .await
+            .unwrap();
+    }
+    let context = UserAppExecutionContext {
+        app_id: original.app_id.clone(),
+        lifecycle_id: original.lifecycle_id.clone(),
+        operation_id: original.operation_id.clone(),
+        executor_id: original.executor_id.clone().unwrap(),
+        request_fingerprint: original.request_fingerprint.clone(),
+    };
+    let evidence = runtime
+        .recover_builder_creation(&context)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut tasks = RecoveryTasks::default();
+    discover(&state, &mut tasks, &mut None).await.unwrap();
+    while let Some((_, result)) = tasks.next().await {
+        result.unwrap();
+    }
+    let after_scan = store
+        .get_operation(&original.app_id, &original.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // This is the original actor's real completion CAS, not a fresh read of
+    // whatever revision the scanner chose to leave behind.
+    let completion = store
+        .advance(&UserAppOperationProgress {
+            app_id: original.app_id.clone(),
+            lifecycle_id: original.lifecycle_id.clone(),
+            operation_id: original.operation_id.clone(),
+            expected_revision: original.revision,
+            executor_id: context.executor_id.clone(),
+            state: UserAppOperationState::Running,
+            step: "builder_ready_confirmed".into(),
+            checkpoint: serde_json::to_value(&evidence).unwrap(),
+            error_code: None,
+            error_message: None,
+        })
+        .await;
+    assert_eq!(
+        after_scan, original,
+        "a released runtime creation lease is not a completed confirmation worker; original completion CAS: {completion:?}"
+    );
+    let confirmed = completion.expect("the still-live original actor must retain its revision");
+    let completed = store
+        .advance(&UserAppOperationProgress {
+            app_id: original.app_id.clone(),
+            lifecycle_id: original.lifecycle_id.clone(),
+            operation_id: original.operation_id.clone(),
+            expected_revision: confirmed.revision,
+            executor_id: context.executor_id,
+            state: UserAppOperationState::Succeeded,
+            step: "creation_result".into(),
+            checkpoint: serde_json::to_value(evidence.container).unwrap(),
+            error_code: None,
+            error_message: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(completed.operation_id, original.operation_id);
+    assert!(
+        store
+            .get_application(&original.app_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .active_operations
+            .dev
+            .is_none()
+    );
+    assert_eq!(runtime.mutations.load(Ordering::SeqCst), 0);
+    state.userapp_store_control.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn receipt_scan_does_not_steal_running_workers_original_confirmation_deadline() {
+    assert_receipt_scan_preserves_live_completion(true).await;
+}
+
+#[tokio::test]
+async fn receipt_scan_preserves_recent_legacy_running_workers_completion_revision() {
+    assert_receipt_scan_preserves_live_completion(false).await;
+}
+
+#[tokio::test]
+async fn receipt_scan_recovers_expired_running_and_explicitly_interrupted_workers() {
+    for interrupted in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+                &directory.path().join("interrupted-confirmation.db"),
+            )
+            .await
+            .unwrap(),
+        );
+        let runtime = Arc::new(ReceiptRuntime::default());
+        let state = runtime_state(runtime.clone(), store.clone(), None).await;
+        let mut original = seed_receipt_recovery(
+            store.as_ref(),
+            "expired-confirmation",
+            "expired-confirmation-op",
+            false,
+        )
+        .await;
+        store
+            .bind_operation_deadline(
+                &original.app_id,
+                &original.operation_id,
+                &original.lifecycle_id,
+                chrono::Utc::now().timestamp_millis() + if interrupted { 90_000 } else { -1_000 },
+            )
+            .await
+            .unwrap();
+        if interrupted {
+            original = store
+                .advance(&UserAppOperationProgress {
+                    app_id: original.app_id.clone(),
+                    lifecycle_id: original.lifecycle_id.clone(),
+                    operation_id: original.operation_id.clone(),
+                    expected_revision: original.revision,
+                    executor_id: original.executor_id.clone().unwrap(),
+                    state: UserAppOperationState::RecoveryRequired,
+                    step: "worker_interrupted".into(),
+                    checkpoint: original.checkpoint.clone(),
+                    error_code: Some("ERR_BACKEND_ERROR".into()),
+                    error_message: Some("original worker actually ended".into()),
+                })
+                .await
+                .unwrap();
+        }
+        let mut tasks = RecoveryTasks::default();
+        discover(&state, &mut tasks, &mut None).await.unwrap();
+        while let Some((_, result)) = tasks.next().await {
+            result.unwrap();
+        }
+        let recovered = store
+            .get_operation(&original.app_id, &original.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.state, UserAppOperationState::RecoveryRequired);
+        assert_eq!(recovered.step, "builder_created_observed");
+        assert_eq!(recovered.revision, original.revision + 1);
+        assert_eq!(runtime.receipt_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.mutations.load(Ordering::SeqCst), 0);
+        state.userapp_store_control.shutdown().await.unwrap();
+    }
 }
