@@ -46,3 +46,34 @@ pub(in crate::pg) async fn update_agent_status(
     Ok(outcome(toasty::sql::statement("UPDATE projects SET agent_status_json=$1 WHERE project_id=$2 AND generation=$3 AND row_revision=$4")
         .bind(serde_json::to_string(status)?).bind(id).bind(generation).bind(expected_revision).exec(tx).await?))
 }
+
+/// Called with project + container-name advisory locks in the writer's
+/// transaction. Check the complete captured registration BEFORE any clock.
+pub(in crate::pg) async fn apply_agent_status_observation(
+    tx: &mut dyn Executor,
+    id: &str,
+    observation: &shared_types::AgentStatusObservation,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<PersistenceOperationOutcome> {
+    let (Some(container_generation), Some(container_revision)) = (
+        observation.container_generation.as_ref(),
+        observation.container_revision,
+    ) else {
+        return Ok(PersistenceOperationOutcome::Superseded);
+    };
+    let status = if observation.active {
+        shared_types::AgentStatus::Active
+    } else {
+        shared_types::AgentStatus::Idle
+    };
+    let applied = outcome(toasty::sql::statement(
+        "UPDATE projects AS p SET agent_status_json=$1, last_activity_at_us=CASE WHEN $2 THEN GREATEST(p.last_activity_at_us,$3) ELSE p.last_activity_at_us END WHERE p.project_id=$4 AND p.generation=$5 AND p.row_revision=$6 AND p.container_name=$7 AND p.container_generation=$8 AND EXISTS (SELECT 1 FROM containers c WHERE c.container_name=p.container_name AND c.container_generation=p.container_generation AND c.row_revision=$9 AND c.container_id=$10 AND c.workload_uid IS NOT DISTINCT FROM $11)"
+    ).bind(serde_json::to_string(&status)?).bind(observation.active).bind(at.timestamp_micros())
+      .bind(id).bind(&observation.project_generation).bind(observation.project_revision)
+      .bind(&observation.container_name).bind(container_generation).bind(container_revision)
+      .bind(&observation.container_id).bind(observation.workload_uid.clone()).exec(tx).await?);
+    if applied == PersistenceOperationOutcome::Committed && observation.active {
+        touch_container(tx, &observation.container_name, container_generation, at).await?;
+    }
+    Ok(applied)
+}

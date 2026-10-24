@@ -591,18 +591,18 @@ impl ProjectAdapter {
         project_id: &str,
         observation: &shared_types::AgentStatusObservation,
     ) -> bool {
-        let mut container_key = None;
+        // Same project -> container lock order as registration/replacement.
+        // Keep exclusion through BOTH clocks, including shared ContainerEntry.
+        let _project_guard = self.project_locks.entry_by_ref(&project_id.to_string());
+        let _container_guard = self
+            .container_locks
+            .entry_by_ref(&observation.container_name);
         let applied = 'apply: {
             let Entry::Occupied(mut e) = self.projects.entry(project_id.to_string()) else {
                 break 'apply false;
             };
             let info = Arc::make_mut(e.get_mut());
-            let Some(basic) = info.container_info() else {
-                break 'apply false;
-            };
-            if basic.container_id != observation.container_id
-                || basic.workload_uid != observation.workload_uid
-            {
+            if !observation.matches(info) {
                 break 'apply false;
             }
             info.set_status(Some(if observation.active {
@@ -612,13 +612,13 @@ impl ProjectAdapter {
             }));
             if observation.active {
                 info.update_activity();
-                container_key = Some(container_entry_key(info));
             }
             true
         };
         // entry 已释放，安全访问 containers map（与 update_activity 同锁序）
-        if let Some(ck) = container_key {
-            self.containers.view(&ck, |_, ce| ce.update_activity());
+        if applied && observation.active {
+            self.containers
+                .view(&observation.container_name, |_, ce| ce.update_activity());
         }
         applied
     }

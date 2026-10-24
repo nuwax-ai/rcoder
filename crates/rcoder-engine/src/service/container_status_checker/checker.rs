@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::time;
 use tracing::{Instrument, debug, info, warn};
 
@@ -28,39 +29,28 @@ enum StatusTarget {
 /// 一次探针的观察身份：物理 UID/workload + 注册代次/revision，全部在
 /// 解析时以 owned 值捕获。内存后端的 ContainerEntry 与注册共享同一 Arc、
 /// 同名换代会原地刷新，因此 RPC 返回后再读快照会读到新代次——必须捕获。
-struct CapturedObservation {
-    container_id: String,
-    workload_uid: Option<String>,
-    project_generation: String,
-    project_revision: i64,
-}
+struct CapturedObservation(AgentStatusObservation);
 
 impl CapturedObservation {
     fn capture(info: &ProjectAndContainerInfo) -> Option<Self> {
-        let basic = info.container_info()?;
-        let identity = info.persistence_identity();
-        Some(Self {
-            container_id: basic.container_id,
-            workload_uid: basic.workload_uid,
-            project_generation: identity.generation.clone(),
-            project_revision: identity.revision,
-        })
+        AgentStatusObservation::capture(info, false).map(Self)
+    }
+    fn matches_basic(&self, basic: &ContainerBasicInfo) -> bool {
+        self.0.container_id == basic.container_id
+            && self.0.workload_uid == basic.workload_uid
+            && self.0.container_name == basic.container_name
     }
 
     fn scope(&self) -> HealthScope {
         HealthScope {
-            container_id: self.container_id.clone(),
-            workload_uid: self.workload_uid.clone(),
+            container_id: self.0.container_id.clone(),
+            workload_uid: self.0.workload_uid.clone(),
         }
     }
-
     fn observation(&self, active: bool) -> AgentStatusObservation {
         AgentStatusObservation {
-            container_id: self.container_id.clone(),
-            workload_uid: self.workload_uid.clone(),
-            project_generation: self.project_generation.clone(),
-            project_revision: self.project_revision,
             active,
+            ..self.0.clone()
         }
     }
 }
@@ -116,7 +106,7 @@ pub(super) struct ContainerStatusChecker {
     pub(super) config: ContainerStatusCheckerConfig,
     pub(super) state: Arc<AppState>,
     /// 容器健康状态映射 (lookup_key -> health_state)
-    pub(super) health_states: Arc<DashMap<String, ContainerHealthState>>,
+    pub(super) health_states: Arc<DashMap<(String, HealthScope), ContainerHealthState>>,
     /// 测试注入的探针端口（真实 Tonic 服务绑动态 loopback 端口时使用）；
     /// 生产路径恒用默认 gRPC 端口。
     #[cfg(test)]
@@ -235,6 +225,23 @@ impl ContainerStatusChecker {
     /// 流程：解析可核实目标（必要时受控重登记）→ 探针 → 按观察代次条件应用。
     /// 返回是否更新了活动时间；未核实身份前不向注册旧地址发 RPC。
     pub(super) async fn check_single_container(
+        &self,
+        lookup_key: &str,
+        container_info: &Arc<ProjectAndContainerInfo>,
+    ) -> anyhow::Result<bool> {
+        let budget = self
+            .config
+            .query_timeout
+            .saturating_add(Duration::from_secs(shared_types::GRPC_CONNECT_TIMEOUT_SECS));
+        time::timeout(
+            budget,
+            self.check_single_container_inner(lookup_key, container_info),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Agent status observation exceeded its total budget"))?
+    }
+
+    async fn check_single_container_inner(
         &self,
         lookup_key: &str,
         container_info: &Arc<ProjectAndContainerInfo>,
@@ -367,6 +374,11 @@ impl ContainerStatusChecker {
         // 保持注册地址直探测；其余族先核实当前物理身份。
         let captured = CapturedObservation::capture(registration)
             .ok_or_else(|| anyhow::anyhow!("registration has no container info"))?;
+        if !captured.matches_basic(&registered) {
+            return Ok(StatusTarget::Keep {
+                reason: "registration changed during identity capture".into(),
+            });
+        }
         match family {
             shared_types::ServiceType::Userapp => {
                 let addr = self.probe_addr(&registered.container_ip, &registered.container_name);
@@ -418,7 +430,10 @@ impl ContainerStatusChecker {
                 reason: "no live runtime candidate for the registered identity".into(),
             });
         };
-        if found.container_id == registered.container_id {
+        if found.container_id == registered.container_id
+            && found.workload_uid == registered.workload_uid
+            && found.container_name == registered.container_name
+        {
             // 同物理实例：地址以 runtime 观测为准（IP 可能漂移），身份与代次
             // 仍以解析时捕获的注册快照为准。
             return match self.probe_addr(&found.container_ip, &registered.container_name) {
@@ -449,6 +464,12 @@ impl ContainerStatusChecker {
                             let basic = fresh.container_info().ok_or_else(|| {
                                 anyhow::anyhow!("recovered registration has no container info")
                             })?;
+                            if !captured.matches_basic(&basic) {
+                                return Ok(StatusTarget::Keep {
+                                    reason: "recovered registration changed before probe dispatch"
+                                        .into(),
+                                });
+                            }
                             let addr = self.probe_addr(&basic.container_ip, &basic.container_name);
                             match addr {
                                 Ok(addr) => Ok(StatusTarget::Probe { addr, captured }),
@@ -588,11 +609,11 @@ pub fn start_container_status_checker(
             tokio::select! {
                 _ = interval.tick() => {
                     // 执行容器状态检查（bg_status_check span：周期任务可观测）
-                    if let Err(e) = checker
-                        .check_all_containers()
-                        .instrument(tracing::info_span!("bg_status_check"))
-                        .await
-                    {
+                    let result = tokio::select! {
+                        _ = shutdown_rx.recv() => break,
+                        result = checker.check_all_containers().instrument(tracing::info_span!("bg_status_check")) => result,
+                    };
+                    if let Err(e) = result {
                         warn!("[STATUS_CHECKER] Container status check failed: {}", e);
                     }
 

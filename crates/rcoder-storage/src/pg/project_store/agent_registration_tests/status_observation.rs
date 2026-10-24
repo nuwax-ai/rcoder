@@ -60,6 +60,15 @@ async fn stale_generation_observation_is_superseded_in_pg() {
     // peer 镜像仍持旧 UID（滞后副本的正常形态）：镜像层按 UID 放行；
     // 正确性由持久化层的捕获代次 CAS 承担
     let stale_observation = shared_types::AgentStatusObservation {
+        container_name: captured_basic.container_name.clone(),
+        container_generation: captured_identity
+            .container
+            .as_ref()
+            .map(|value| value.generation.clone()),
+        container_revision: captured_identity
+            .container
+            .as_ref()
+            .map(|value| value.revision),
         container_id: captured_basic.container_id.clone(),
         workload_uid: captured_basic.workload_uid.clone(),
         project_generation: captured_identity.generation.clone(),
@@ -100,6 +109,15 @@ async fn current_generation_observation_persists_and_old_generation_never_overwr
     let current_basic = current.container_info().unwrap();
     let current_identity = current.persistence_identity().clone();
     let fresh_observation = shared_types::AgentStatusObservation {
+        container_name: current_basic.container_name.clone(),
+        container_generation: current_identity
+            .container
+            .as_ref()
+            .map(|value| value.generation.clone()),
+        container_revision: current_identity
+            .container
+            .as_ref()
+            .map(|value| value.revision),
         container_id: current_basic.container_id.clone(),
         workload_uid: current_basic.workload_uid.clone(),
         project_generation: current_identity.generation.clone(),
@@ -119,13 +137,22 @@ async fn current_generation_observation_persists_and_old_generation_never_overwr
     // 换代后重放旧代次观察（物理 UID 相同、代次过期）：镜像放行，
     // SQL CAS 拒绝——PG 行保持新代次写入的 Active
     let stale_generation_observation = shared_types::AgentStatusObservation {
+        container_name: current_basic.container_name.clone(),
+        container_generation: current_identity
+            .container
+            .as_ref()
+            .map(|value| value.generation.clone()),
+        container_revision: current_identity
+            .container
+            .as_ref()
+            .map(|value| value.revision),
         container_id: current_basic.container_id.clone(),
         workload_uid: current_basic.workload_uid.clone(),
         project_generation: format!("superseded-generation-{suffix}"),
         project_revision: 0,
         active: false,
     };
-    assert!(store_handle.apply_agent_status_observation(&id, &stale_generation_observation));
+    assert!(!store_handle.apply_agent_status_observation(&id, &stale_generation_observation));
     assert!(store_handle.wait_drained(Duration::from_secs(5)).await);
     let status = agent_status_text(&observer, &id).await;
     assert!(
@@ -133,5 +160,61 @@ async fn current_generation_observation_persists_and_old_generation_never_overwr
             .as_deref()
             .is_some_and(|value| value.contains("Active")),
         "旧代次迟到观察不得覆盖新代次状态：{status:?}"
+    );
+}
+
+#[tokio::test]
+async fn stale_revision_active_observation_cannot_touch_either_activity_clock() {
+    let Some(dsn) = test_support::test_dsn().await else {
+        return;
+    };
+    let id = format!(
+        "status-observation-revision-{}",
+        test_support::uuid_suffix()
+    );
+    let writer = store(&dsn).await;
+    let physical = basic(&id);
+    writer
+        .insert_project_registration_durable(id.clone(), project(&id, &id, &physical))
+        .await
+        .unwrap();
+    assert!(writer.wait_drained(Duration::from_secs(5)).await);
+    let peer = store(&dsn).await;
+    let current = peer.get(&id).unwrap();
+    let captured = current.persistence_identity();
+    let observation = shared_types::AgentStatusObservation {
+        container_name: physical.container_name,
+        container_generation: captured
+            .container
+            .as_ref()
+            .map(|value| value.generation.clone()),
+        container_revision: captured.container.as_ref().map(|value| value.revision),
+        container_id: physical.container_id,
+        workload_uid: physical.workload_uid,
+        project_generation: captured.generation.clone(),
+        project_revision: captured.revision,
+        active: true,
+    };
+    let observer = test_support::database(&dsn).await;
+    let before = test_support::optional_text(&observer, "SELECT p.last_activity_at_us::text || ':' || c.last_activity_at_us::text FROM projects p JOIN containers c ON c.container_name=p.container_name WHERE p.project_id=$1", &id).await;
+    let changed_id = id.clone();
+    observer
+        .execute(move |mut db| async move {
+            toasty::sql::statement(
+                "UPDATE projects SET row_revision=row_revision+1 WHERE project_id=$1",
+            )
+            .bind(changed_id)
+            .exec(&mut db)
+            .await?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(peer.apply_agent_status_observation(&id, &observation));
+    assert!(peer.wait_drained(Duration::from_secs(5)).await);
+    let after = test_support::optional_text(&observer, "SELECT p.last_activity_at_us::text || ':' || c.last_activity_at_us::text FROM projects p JOIN containers c ON c.container_name=p.container_name WHERE p.project_id=$1", &id).await;
+    assert_eq!(
+        after, before,
+        "a rejected status observation still updated activity clocks"
     );
 }

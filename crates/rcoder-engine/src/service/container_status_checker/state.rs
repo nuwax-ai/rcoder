@@ -3,6 +3,7 @@
 //! （与 checker.rs 的流程方法分离，纯状态转移集中于此）。
 
 use chrono::{DateTime, Utc};
+use shared_types::ProjectStore as _;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -10,7 +11,7 @@ use super::checker::ContainerStatusChecker;
 
 /// 一次健康观察所属的物理身份（退避按物理代次隔离：逻辑键相同但
 /// Pod/容器已换代时，新实例不继承前任的失败窗口）。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct HealthScope {
     /// 注册快照捕获的物理 UID（K8s Pod UID / Docker 容器 ID）。
     pub(super) container_id: String,
@@ -24,6 +25,10 @@ impl HealthScope {
             container_id: basic.container_id.clone(),
             workload_uid: basic.workload_uid.clone(),
         }
+    }
+
+    pub(super) fn key(&self, lookup_key: &str) -> (String, Self) {
+        (lookup_key.to_owned(), self.clone())
     }
 
     fn matches(&self, health: &ContainerHealthState) -> bool {
@@ -104,7 +109,7 @@ impl ContainerStatusChecker {
     pub(super) fn should_skip_check(&self, lookup_key: &str, scope: &HealthScope) -> bool {
         let now = Utc::now();
         self.health_states
-            .view(lookup_key, |_, health| {
+            .view(&scope.key(lookup_key), |_, health| {
                 if !scope.matches(health) {
                     return false;
                 }
@@ -125,7 +130,7 @@ impl ContainerStatusChecker {
 
         use dashmap::mapref::entry::Entry;
 
-        match self.health_states.entry(lookup_key.to_string()) {
+        match self.health_states.entry(scope.key(lookup_key)) {
             Entry::Occupied(mut entry) => {
                 let health = entry.get_mut();
                 if !scope.matches(health) {
@@ -163,7 +168,7 @@ impl ContainerStatusChecker {
 
         use dashmap::mapref::entry::Entry;
 
-        let consecutive_failures = match self.health_states.entry(lookup_key.to_string()) {
+        let consecutive_failures = match self.health_states.entry(scope.key(lookup_key)) {
             Entry::Occupied(mut entry) => {
                 let health = entry.get_mut();
                 if !scope.matches(health) {
@@ -239,35 +244,26 @@ impl ContainerStatusChecker {
 
         let mut removed_count = 0;
 
-        // 第一步：从 health_states 收集数据（iter 读锁在 collect 后释放）
-        let candidates: Vec<(String, bool)> = self
-            .health_states
+        // Snapshot live physical keys outside the health map's locks. Logical
+        // user keys are not project IDs, and shared containers have many rows.
+        let live: std::collections::HashSet<_> = self
+            .state
+            .projects
             .iter()
-            .map(|entry| {
-                let lookup_key = entry.key().clone();
-                let elapsed = now.signed_duration_since(entry.value().last_check_time);
-                let is_stale = elapsed > retention_duration;
-                (lookup_key, is_stale)
-            })
-            .collect();
-
-        // 第二步：跨 map 查询（health_states 锁已释放，无死锁风险）
-        let keys_to_remove: Vec<String> = candidates
             .into_iter()
-            .filter(|(lookup_key, is_stale)| {
-                let not_in_storage = !self.state.contains_project(lookup_key);
-                not_in_storage || *is_stale
+            .filter_map(|(_, info)| {
+                info.container_info()
+                    .map(|basic| HealthScope::of(&basic).key(info.container_key()))
             })
-            .map(|(k, _)| k)
             .collect();
-
-        // 第三步：批量移除
-        for key in keys_to_remove {
-            if self.health_states.remove(&key).is_some() {
+        self.health_states.retain(|key, health| {
+            let keep = live.contains(key)
+                && now.signed_duration_since(health.last_check_time) <= retention_duration;
+            if !keep {
                 removed_count += 1;
-                debug!("[STATUS_CHECKER] Cleaned up stale health state: {}", key);
             }
-        }
+            keep
+        });
 
         if removed_count > 0 {
             info!(

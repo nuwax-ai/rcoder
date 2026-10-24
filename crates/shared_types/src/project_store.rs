@@ -29,18 +29,56 @@ use crate::{ContainerBasicInfo, ProjectAndContainerInfo, ServiceType, StorageSta
 /// registration must never inherit a predecessor's activity clock or status.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentStatusObservation {
+    /// Physical registry key captured together with the incarnation.
+    pub container_name: String,
     /// Physical UID of the probed instance (K8s Pod UID / Docker container ID).
     pub container_id: String,
     /// Controller identity captured with the probe (Docker: None).
     pub workload_uid: Option<String>,
-    /// Registry generation captured when the probe was dispatched. Durable
-    /// backends persist the observation only against this generation; memory
-    /// backends rely on the physical identity pair above.
+    /// Project incarnation captured before dispatch, checked by both backends.
     pub project_generation: String,
     /// Structural revision captured with the generation.
     pub project_revision: i64,
+    /// Memory-only projections may not have a durable container registration.
+    pub container_generation: Option<String>,
+    /// Captured container structural revision, never reread from a successor.
+    pub container_revision: Option<i64>,
     /// Whether the probed instance reported active work.
     pub active: bool,
+}
+
+impl AgentStatusObservation {
+    /// Capture owned identities before any runtime/RPC wait. A shared physical
+    /// projection already inconsistent with its durable binding is not a probe.
+    pub fn capture(info: &ProjectAndContainerInfo, active: bool) -> Option<Self> {
+        let basic = info.container_info()?;
+        let identity = info.persistence_identity();
+        if identity
+            .container
+            .as_ref()
+            .and_then(|value| value.physical_uid.as_ref())
+            .is_some_and(|uid| uid != &basic.container_id)
+        {
+            return None;
+        }
+        Some(Self {
+            container_name: basic.container_name,
+            container_id: basic.container_id,
+            workload_uid: basic.workload_uid,
+            project_generation: identity.generation.clone(),
+            project_revision: identity.revision,
+            container_generation: identity
+                .container
+                .as_ref()
+                .map(|value| value.generation.clone()),
+            container_revision: identity.container.as_ref().map(|value| value.revision),
+            active,
+        })
+    }
+
+    pub fn matches(&self, info: &ProjectAndContainerInfo) -> bool {
+        Self::capture(info, self.active).as_ref() == Some(self)
+    }
 }
 
 /// project/session/container 映射存储契约（内存与 PG 双后端统一接口）

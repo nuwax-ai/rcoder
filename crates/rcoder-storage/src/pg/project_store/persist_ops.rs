@@ -341,6 +341,13 @@ pub enum PersistOp {
         expected_revision: i64,
         agent_status: Value,
     },
+    /// One indivisible observation: status and both clocks share the same
+    /// captured project/container predicate. A rejected status cannot touch.
+    ApplyAgentStatusObservation {
+        project_id: String,
+        observation: shared_types::AgentStatusObservation,
+        at: DateTime<Utc>,
+    },
 }
 
 impl PersistOp {
@@ -352,6 +359,7 @@ impl PersistOp {
                 | Self::TouchContainer { .. }
                 | Self::TouchSession { .. }
                 | Self::UpdateAgentStatus { .. }
+                | Self::ApplyAgentStatusObservation { .. }
         )
     }
 
@@ -374,6 +382,7 @@ impl PersistOp {
             Self::TouchContainer { .. } => "touch_container",
             Self::TouchSession { .. } => "touch_session",
             Self::UpdateAgentStatus { .. } => "update_agent_status",
+            Self::ApplyAgentStatusObservation { .. } => "apply_agent_status_observation",
         }
     }
 }

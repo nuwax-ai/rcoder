@@ -47,6 +47,7 @@ use tonic::{Request, Response, Status};
 struct IdentityRuntime {
     found: Option<RuntimeContainerInfo>,
     replacement: Option<VerifiedAgentReplacement>,
+    stalled_lookup: std::sync::atomic::AtomicBool,
     queries: Mutex<Vec<(String, ServiceType)>>,
     verify_calls: Mutex<Vec<String>>,
 }
@@ -56,6 +57,7 @@ impl IdentityRuntime {
         Arc::new(Self {
             found,
             replacement: None,
+            stalled_lookup: std::sync::atomic::AtomicBool::new(false),
             queries: Mutex::new(Vec::new()),
             verify_calls: Mutex::new(Vec::new()),
         })
@@ -116,6 +118,9 @@ impl AgentContainerRuntime for IdentityRuntime {
             .lock()
             .unwrap()
             .push((identifier.to_string(), *service_type));
+        if self.stalled_lookup.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         Ok(self.found.clone())
     }
     async fn verify_agent_replacement(
@@ -315,12 +320,46 @@ async fn identity_state(runtime: Arc<IdentityRuntime>) -> (Arc<AppState>, tempfi
     (state, metadata_dir)
 }
 
-fn checker(state: Arc<AppState>, probe_port: u16) -> ContainerStatusChecker {
+/// A real deploy-host target also needs its Published entry. Do not bypass
+/// production address resolution merely to make the dynamic-port tests pass.
+struct ProbePublishedGuard {
+    #[cfg(feature = "deploy-host")]
+    names: Vec<String>,
+}
+impl Drop for ProbePublishedGuard {
+    fn drop(&mut self) {
+        #[cfg(feature = "deploy-host")]
+        for name in &self.names {
+            shared_types::published::unregister(name);
+        }
+    }
+}
+fn checker(state: Arc<AppState>, probe_port: u16) -> (ContainerStatusChecker, ProbePublishedGuard) {
+    #[cfg(feature = "deploy-host")]
+    let names: Vec<_> = state
+        .projects
+        .iter()
+        .into_iter()
+        .filter_map(|(_, info)| info.container_info().map(|basic| basic.container_name))
+        .collect();
+    #[cfg(feature = "deploy-host")]
+    for name in &names {
+        shared_types::published::register(
+            name,
+            std::collections::HashMap::from([(probe_port, probe_port)]),
+        );
+    }
     let config = ContainerStatusCheckerConfig {
         query_timeout: Duration::from_secs(2),
-        ..ContainerStatusCheckerConfig::default()
+        ..Default::default()
     };
-    ContainerStatusChecker::new(config, state).with_probe_port(probe_port)
+    (
+        ContainerStatusChecker::new(config, state).with_probe_port(probe_port),
+        ProbePublishedGuard {
+            #[cfg(feature = "deploy-host")]
+            names,
+        },
+    )
 }
 
 /// 测试载体：完全指定物理身份与地址的注册记录。
@@ -382,9 +421,8 @@ async fn replaced_identity_is_not_probed_on_old_address() {
         .insert_project("p1".to_string(), info.clone())
         .expect("注册旧实例");
 
-    let _outcome = checker(state.clone(), port)
-        .check_single_container("p1", &info)
-        .await;
+    let (checker, _published) = checker(state.clone(), port);
+    let _outcome = checker.check_single_container("p1", &info).await;
 
     assert_eq!(
         hits.load(Ordering::SeqCst),
@@ -422,9 +460,8 @@ async fn absent_candidate_is_not_probed_and_registration_retained() {
         .insert_project("p2".to_string(), info.clone())
         .expect("注册");
 
-    let _outcome = checker(state.clone(), port)
-        .check_single_container("p2", &info)
-        .await;
+    let (checker, _published) = checker(state.clone(), port);
+    let _outcome = checker.check_single_container("p2", &info).await;
 
     assert_eq!(hits.load(Ordering::SeqCst), 0, "缺席时不得探测旧地址");
     assert!(
@@ -452,9 +489,8 @@ async fn identity_lookup_failure_keeps_registration_without_probe() {
         .insert_project("p5".to_string(), info.clone())
         .expect("注册");
 
-    let _outcome = checker(state.clone(), port)
-        .check_single_container("p5", &info)
-        .await;
+    let (checker, _published) = checker(state.clone(), port);
+    let _outcome = checker.check_single_container("p5", &info).await;
 
     assert_eq!(
         hits.load(Ordering::SeqCst),
@@ -508,9 +544,8 @@ async fn late_response_cannot_overwrite_replaced_registration() {
     });
     let (port, (hits, server)) = spawn_probe_at(false, Some(before)).await;
 
-    let _outcome = checker(state.clone(), port)
-        .check_single_container("p3", &info)
-        .await;
+    let (checker, _published) = checker(state.clone(), port);
+    let _outcome = checker.check_single_container("p3", &info).await;
 
     let current = state.projects.get("p3").expect("注册仍在");
     let basic = current.container_info().expect("容器信息仍在");
@@ -580,9 +615,8 @@ async fn computer_replacement_recovers_registration_and_probes_new_address() {
         .insert_project("proj-r".to_string(), info.clone())
         .expect("注册旧实例");
 
-    let outcome = checker(state.clone(), port)
-        .check_single_container(identifier, &info)
-        .await;
+    let (checker, _published) = checker(state.clone(), port);
+    let outcome = checker.check_single_container(identifier, &info).await;
 
     assert_eq!(
         hits.load(Ordering::SeqCst),
@@ -622,9 +656,8 @@ async fn rejected_computer_replacement_keeps_registration_without_probe() {
         .insert_project("proj-r2".to_string(), info.clone())
         .expect("注册旧实例");
 
-    let _outcome = checker(state.clone(), port)
-        .check_single_container("u-r2", &info)
-        .await;
+    let (checker, _published) = checker(state.clone(), port);
+    let _outcome = checker.check_single_container("u-r2", &info).await;
 
     assert_eq!(
         hits.load(Ordering::SeqCst),
@@ -660,9 +693,8 @@ async fn userapp_family_probes_registered_address_without_runtime_lookup() {
         .insert_project("app-9".to_string(), info.clone())
         .expect("注册");
 
-    let _outcome = checker(state.clone(), port)
-        .check_single_container("app-9", &info)
-        .await;
+    let (checker, _published) = checker(state.clone(), port);
+    let _outcome = checker.check_single_container("app-9", &info).await;
 
     assert_eq!(hits.load(Ordering::SeqCst), 1, "Userapp 保持注册地址直探测");
     assert_eq!(runtime.queried(), 0, "Userapp 不得触碰 runtime 身份查找");
@@ -725,9 +757,8 @@ async fn background_computer_recovery_does_not_refresh_activity_by_itself() {
         .insert_project("proj-r3".to_string(), info.clone())
         .expect("注册旧实例");
 
-    let _outcome = checker(state.clone(), port)
-        .check_single_container(identifier, &info)
-        .await;
+    let (checker, _published) = checker(state.clone(), port);
+    let _outcome = checker.check_single_container(identifier, &info).await;
 
     let current = state.projects.get("proj-r3").expect("注册仍在");
     assert_eq!(
@@ -876,4 +907,72 @@ async fn identity_state_arc(
         cluster_domain: "cluster.local".to_string(),
     });
     (state, metadata_dir)
+}
+
+#[tokio::test]
+async fn stalled_identity_lookup_has_total_budget() {
+    let runtime = IdentityRuntime::new(None);
+    runtime.stalled_lookup.store(true, Ordering::SeqCst);
+    let (state, _dir) = identity_state(runtime).await;
+    let info = registered(
+        "budget-project",
+        Some("budget-user"),
+        ServiceType::ComputerAgentRunner,
+        "old-pod",
+        Some("old-workload"),
+        "127.0.0.1",
+    );
+    let checker = ContainerStatusChecker::new(
+        ContainerStatusCheckerConfig {
+            query_timeout: Duration::from_millis(10),
+            ..Default::default()
+        },
+        state,
+    );
+    let result = tokio::time::timeout(
+        Duration::from_secs(4),
+        checker.check_single_container("budget-user", &info),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "a hung runtime lookup bypassed every connection/RPC timeout"
+    );
+    assert!(result.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn shutdown_cancels_a_stalled_identity_observation() {
+    let runtime = IdentityRuntime::new(None);
+    runtime.stalled_lookup.store(true, Ordering::SeqCst);
+    let (state, _dir) = identity_state(runtime.clone()).await;
+    let info = registered(
+        "shutdown-project",
+        Some("shutdown-user"),
+        ServiceType::ComputerAgentRunner,
+        "old-pod",
+        Some("old-workload"),
+        "127.0.0.1",
+    );
+    state
+        .insert_project("shutdown-project".into(), info)
+        .unwrap();
+    let (shutdown, _receiver) = broadcast::channel(4);
+    let worker = super::checker::start_container_status_checker(
+        ContainerStatusCheckerConfig::default(),
+        state,
+        shutdown.clone(),
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while runtime.queried() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("lookup must have started");
+    shutdown.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), worker)
+        .await
+        .expect("shutdown must not wait for the I/O budget")
+        .unwrap();
 }

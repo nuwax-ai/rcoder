@@ -346,57 +346,21 @@ impl ProjectStore for PgStore {
         {
             return false;
         }
-        let agent_status = if observation.active {
-            code_to_agent_status(1, "active")
-        } else {
-            code_to_agent_status(0, "idle")
-        };
-        if observation.active {
-            // 活动时钟 touch 用捕获的 project 代次；容器名/容器代次取自镜像
-            // （物理身份已匹配，容器条目属于同一注册代次）。
-            let at = chrono::Utc::now();
-            self.enqueue_throttled(
-                &format!("p:{project_id}"),
-                PersistOp::TouchProject {
-                    project_id: project_id.to_string(),
-                    generation: observation.project_generation.clone(),
-                    last_activity: at,
-                },
-            );
-            if let Some(info) = self.inner.get(project_id)
-                && let Some(container) = &info.persistence_identity().container
-            {
-                let name = container_entry_key(&info);
-                self.enqueue_throttled(
-                    &format!("c:{name}"),
-                    PersistOp::TouchContainer {
-                        container_name: name,
-                        generation: container.generation.clone(),
-                        last_activity: at,
-                    },
-                );
-            }
-        }
-        match serde_json::to_value(agent_status) {
-            Ok(value) => {
-                self.enqueue_throttled(
-                    &format!("a:{project_id}"),
-                    PersistOp::UpdateAgentStatus {
-                        project_id: project_id.to_string(),
-                        generation: observation.project_generation.clone(),
-                        expected_revision: observation.project_revision,
-                        agent_status: value,
-                    },
-                );
-            }
-            // 序列化几乎不会失败，一旦发生必须可见：内存已更新而 PG 永久丢失
-            Err(e) => {
-                tracing::warn!(
-                    "[STORAGE_PG] agent_status serialize failed (not persisted): project_id={}, error={e}",
-                    project_id
-                );
-            }
-        }
+        // Keep status and clocks indivisible under the ORIGINAL observation's
+        // predicates; never resolve a current container generation after a wait.
+        self.enqueue_throttled(
+            &format!(
+                "observation:{project_id}:{}:{}:{}",
+                observation.project_generation,
+                observation.project_revision,
+                observation.container_id
+            ),
+            PersistOp::ApplyAgentStatusObservation {
+                project_id: project_id.to_owned(),
+                observation: observation.clone(),
+                at: chrono::Utc::now(),
+            },
+        );
         true
     }
 

@@ -267,14 +267,22 @@ async fn record_failure_escalates_and_pins_first_failure_time() {
     c.record_failure("k", &scope, "addr", &anyhow::anyhow!("boom"));
     c.record_failure("k", &scope, "addr", &anyhow::anyhow!("boom"));
 
-    let health = c.health_states.get("k").expect("状态条目存在").clone();
+    let health = c
+        .health_states
+        .get(&scope.key("k"))
+        .expect("状态条目存在")
+        .clone();
     assert_eq!(health.consecutive_failures, 3, "连续失败应累计到阈值");
     let pinned = health.first_failure_time.expect("首次失败时间应被记录");
     // 再失败一次：first_failure_time 不得漂移（skip 窗口锚定首次失败，
     // 若改为每次更新，容器会因间歇失败被永久跳过检查）
     std::thread::sleep(Duration::from_millis(5));
     c.record_failure("k", &scope, "addr", &anyhow::anyhow!("boom"));
-    let health = c.health_states.get("k").expect("状态条目存在").clone();
+    let health = c
+        .health_states
+        .get(&scope.key("k"))
+        .expect("状态条目存在")
+        .clone();
     assert_eq!(health.consecutive_failures, 4);
     assert_eq!(
         health.first_failure_time.expect("仍有首次时间"),
@@ -295,7 +303,11 @@ async fn record_success_resets_failure_state_completely() {
     c.record_failure("k", &scope, "addr", &anyhow::anyhow!("boom"));
     c.record_success("k", &scope);
 
-    let health = c.health_states.get("k").expect("状态条目存在").clone();
+    let health = c
+        .health_states
+        .get(&scope.key("k"))
+        .expect("状态条目存在")
+        .clone();
     assert_eq!(health.consecutive_failures, 0, "成功必须清零失败计数");
     assert!(
         health.first_failure_time.is_none(),
@@ -319,7 +331,7 @@ async fn should_skip_requires_threshold_and_unexpired_window() {
 
     // 未达阈值：不跳过
     c.health_states.insert(
-        "below".to_string(),
+        scope.key("below"),
         ContainerHealthState {
             scope: Some(scope.clone()),
             consecutive_failures: 2,
@@ -332,7 +344,7 @@ async fn should_skip_requires_threshold_and_unexpired_window() {
 
     // 达阈值且在窗口内：跳过
     c.health_states.insert(
-        "inside".to_string(),
+        scope.key("inside"),
         ContainerHealthState {
             scope: Some(scope.clone()),
             consecutive_failures: 3,
@@ -348,7 +360,7 @@ async fn should_skip_requires_threshold_and_unexpired_window() {
 
     // 窗口已过：恢复检查（容器若被重建，正是靠这条路径自愈）
     c.health_states.insert(
-        "expired".to_string(),
+        scope.key("expired"),
         ContainerHealthState {
             scope: Some(scope.clone()),
             consecutive_failures: 5,
@@ -392,7 +404,11 @@ async fn new_physical_instance_does_not_inherit_failure_backoff() {
 
     // 换代后旧代次的迟到失败回调也不得叠加到新代次计数上
     c.record_failure("p", &old_scope, "addr", &anyhow::anyhow!("late"));
-    let health = c.health_states.get("p").expect("状态条目存在").clone();
+    let health = c
+        .health_states
+        .get(&old_scope.key("p"))
+        .expect("状态条目存在")
+        .clone();
     assert_eq!(
         health.scope,
         Some(old_scope),
@@ -498,8 +514,12 @@ async fn cleanup_stale_health_states_removes_unknown_or_expired_only() {
     let c = checker(config, state.clone());
 
     // 条目 A：不在 projects 存储 → 移除
+    let unknown_scope = HealthScope {
+        container_id: "x".into(),
+        workload_uid: None,
+    };
     c.health_states.insert(
-        "unknown".to_string(),
+        unknown_scope.key("unknown"),
         ContainerHealthState::new(HealthScope {
             container_id: "x".into(),
             workload_uid: None,
@@ -511,7 +531,7 @@ async fn cleanup_stale_health_states_removes_unknown_or_expired_only() {
         .insert_project("known".to_string(), known.clone())
         .expect("插入 known");
     c.health_states.insert(
-        "known".to_string(),
+        scope_of(&known).key(known.container_key()),
         ContainerHealthState::new(scope_of(&known)),
     );
     // 条目 C：在存储但 last_check 超 reset 周期 → 移除
@@ -520,7 +540,7 @@ async fn cleanup_stale_health_states_removes_unknown_or_expired_only() {
         .insert_project("stale".to_string(), stale.clone())
         .expect("插入 stale");
     c.health_states.insert(
-        "stale".to_string(),
+        scope_of(&stale).key(stale.container_key()),
         ContainerHealthState {
             scope: Some(scope_of(&stale)),
             consecutive_failures: 1,
@@ -533,14 +553,21 @@ async fn cleanup_stale_health_states_removes_unknown_or_expired_only() {
     c.cleanup_stale_health_states();
 
     assert!(
-        c.health_states.get("unknown").is_none(),
+        c.health_states.get(&unknown_scope.key("unknown")).is_none(),
         "不在存储的条目应被清理"
     );
     assert!(
-        c.health_states.get("known").is_some(),
+        c.health_states
+            .get(&scope_of(&known).key(known.container_key()))
+            .is_some(),
         "在存储且未过期的条目必须保留"
     );
-    assert!(c.health_states.get("stale").is_none(), "超期条目应被清理");
+    assert!(
+        c.health_states
+            .get(&scope_of(&stale).key(stale.container_key()))
+            .is_none(),
+        "超期条目应被清理"
+    );
 }
 
 /// Exercise the actual primary routing table and forwarding handler, not just its path whitelist.
@@ -594,4 +621,77 @@ async fn dev_operation_recovery_route_uses_body_app_and_never_provisions_or_rout
             .contains("matching X-App-Id")
     );
     assert_eq!(runtime.queries.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn late_failure_does_not_replace_current_generation_backoff() {
+    let (state, _dir) = test_state(Arc::new(ProbeRuntime::new(FindBehavior::Found))).await;
+    let c = checker(ContainerStatusCheckerConfig::default(), state);
+    let old = scope_of(&container_info(
+        "old",
+        None,
+        ServiceType::ComputerAgentRunner,
+    ));
+    let new = scope_of(&container_info(
+        "new",
+        None,
+        ServiceType::ComputerAgentRunner,
+    ));
+    for _ in 0..3 {
+        c.record_failure(
+            "shared",
+            &new,
+            "new-address",
+            &anyhow::anyhow!("new failure"),
+        );
+    }
+    assert!(c.should_skip_check("shared", &new));
+    c.record_failure(
+        "shared",
+        &old,
+        "old-address",
+        &anyhow::anyhow!("late predecessor failure"),
+    );
+    assert!(
+        c.should_skip_check("shared", &new),
+        "a late predecessor failure erased the current generation's backoff"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_keeps_health_for_shared_user_without_a_same_named_project() {
+    let (state, _dir) = test_state(Arc::new(ProbeRuntime::new(FindBehavior::Found))).await;
+    let checker = checker(ContainerStatusCheckerConfig::default(), state.clone());
+    let first = container_info(
+        "shared-project-a",
+        Some("shared-user"),
+        ServiceType::ComputerAgentRunner,
+    );
+    let mut second = (*container_info(
+        "shared-project-b",
+        Some("shared-user"),
+        ServiceType::ComputerAgentRunner,
+    ))
+    .clone();
+    second.set_container(first.container_info());
+    state
+        .insert_project("shared-project-a".into(), first.clone())
+        .unwrap();
+    state
+        .insert_project("shared-project-b".into(), Arc::new(second))
+        .unwrap();
+    let scope = scope_of(&first);
+    checker.record_failure(
+        "shared-user",
+        &scope,
+        "address",
+        &anyhow::anyhow!("failure"),
+    );
+    checker.cleanup_stale_health_states();
+    assert!(
+        checker
+            .health_states
+            .contains_key(&scope.key("shared-user")),
+        "logical user key was mistaken for a missing project ID"
+    );
 }

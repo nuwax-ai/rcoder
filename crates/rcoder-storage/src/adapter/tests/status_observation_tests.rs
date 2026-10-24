@@ -9,17 +9,22 @@ use super::*;
 use chrono::{Duration, Utc};
 
 fn observation(
+    adapter: &ProjectAdapter,
+    project: &str,
     uid: &str,
     workload: Option<&str>,
     active: bool,
 ) -> shared_types::AgentStatusObservation {
-    shared_types::AgentStatusObservation {
-        container_id: uid.to_string(),
-        workload_uid: workload.map(str::to_string),
-        project_generation: "gen-irrelevant-for-memory".to_string(),
-        project_revision: 0,
+    let mut value = shared_types::AgentStatusObservation::capture(
+        &adapter
+            .get(project)
+            .unwrap_or_else(|| Arc::new(create_test_info_with_container(project, "absent"))),
         active,
-    }
+    )
+    .unwrap();
+    value.container_id = uid.into();
+    value.workload_uid = workload.map(str::to_owned);
+    value
 }
 
 #[test]
@@ -32,7 +37,12 @@ fn same_physical_active_observation_updates_status_and_activity() {
         .insert("p1".to_string(), Arc::new(info))
         .expect("插入");
 
-    assert!(adapter.apply_agent_status_observation("p1", &observation("c1-id", None, true)));
+    assert!(
+        adapter.apply_agent_status_observation(
+            "p1",
+            &observation(&adapter, "p1", "c1-id", None, true)
+        )
+    );
 
     let current = adapter.get("p1").expect("注册仍在");
     assert_eq!(current.status(), Some(&shared_types::AgentStatus::Active));
@@ -52,7 +62,12 @@ fn same_physical_idle_observation_updates_status_only() {
         .insert("p2".to_string(), Arc::new(info))
         .expect("插入");
 
-    assert!(adapter.apply_agent_status_observation("p2", &observation("c2-id", None, false)));
+    assert!(
+        adapter.apply_agent_status_observation(
+            "p2",
+            &observation(&adapter, "p2", "c2-id", None, false)
+        )
+    );
 
     let current = adapter.get("p2").expect("注册仍在");
     assert_eq!(current.status(), Some(&shared_types::AgentStatus::Idle));
@@ -75,10 +90,13 @@ fn replaced_physical_identity_discards_observation_entirely() {
         .expect("插入");
 
     // 换代后的新 UID（或同 UID 不同 workload）迟到观察：全部丢弃
-    assert!(!adapter.apply_agent_status_observation("p3", &observation("other-uid", None, false)));
     assert!(!adapter.apply_agent_status_observation(
         "p3",
-        &observation("c3-id", Some("other-workload"), false)
+        &observation(&adapter, "p3", "other-uid", None, false)
+    ));
+    assert!(!adapter.apply_agent_status_observation(
+        "p3",
+        &observation(&adapter, "p3", "c3-id", Some("other-workload"), false)
     ));
 
     let current = adapter.get("p3").expect("注册仍在");
@@ -97,5 +115,51 @@ fn replaced_physical_identity_discards_observation_entirely() {
 #[test]
 fn absent_project_rejects_observation() {
     let adapter = make_adapter();
-    assert!(!adapter.apply_agent_status_observation("missing", &observation("uid", None, true)));
+    assert!(!adapter.apply_agent_status_observation(
+        "missing",
+        &observation(&adapter, "missing", "uid", None, true)
+    ));
+}
+
+#[test]
+fn stale_project_epoch_on_same_physical_container_is_rejected() {
+    let adapter = make_adapter();
+    let original = create_test_info_with_container("same-physical-project", "same-container");
+    let original_identity = original.persistence_identity().clone();
+    let basic = original.container_info().unwrap();
+    adapter
+        .insert(original.project_id().into(), Arc::new(original.clone()))
+        .unwrap();
+    let mut successor = original;
+    let mut identity = successor.persistence_identity().clone();
+    identity.generation = "successor-project-epoch".into();
+    successor.set_persistence_identity(identity);
+    successor.set_status(Some(shared_types::AgentStatus::Active));
+    adapter
+        .insert(successor.project_id().into(), Arc::new(successor))
+        .unwrap();
+    let stale = shared_types::AgentStatusObservation {
+        container_name: basic.container_name,
+        container_generation: original_identity
+            .container
+            .as_ref()
+            .map(|value| value.generation.clone()),
+        container_revision: original_identity
+            .container
+            .as_ref()
+            .map(|value| value.revision),
+        container_id: basic.container_id,
+        workload_uid: basic.workload_uid,
+        project_generation: original_identity.generation,
+        project_revision: original_identity.revision,
+        active: false,
+    };
+    assert!(
+        !adapter.apply_agent_status_observation("same-physical-project", &stale),
+        "an unchanged Pod UID is not authority over a recreated project"
+    );
+    assert_eq!(
+        adapter.get("same-physical-project").unwrap().status(),
+        Some(&shared_types::AgentStatus::Active)
+    );
 }
