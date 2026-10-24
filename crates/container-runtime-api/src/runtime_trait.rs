@@ -264,6 +264,19 @@ pub trait AgentContainerRuntime: Send + Sync {
         Ok(None)
     }
 
+    /// Read-only authority observation for a historical EnsureBuilder whose
+    /// creation receipt was never persisted (stale `Running` record, dead
+    /// executor). Discovers the native operation mutex by durable identity
+    /// only; `ExpiredOriginal`/`Absent` say the original execution holds no
+    /// live authority — never a write permission and never a success proof.
+    /// Transport errors propagate and must leave the record unsettled.
+    async fn observe_unbound_builder_creation_authority(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<super::types::UnboundBuilderCreationAuthority> {
+        Ok(super::types::UnboundBuilderCreationAuthority::Unsupported)
+    }
+
     /// Inspect an identity-bound orphan Pod for compute-only Stop. No adoption,
     /// storage mutation or controller creation is authorized by this witness.
     async fn capture_builder_orphan_stop(

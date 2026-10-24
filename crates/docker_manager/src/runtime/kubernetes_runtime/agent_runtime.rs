@@ -229,6 +229,14 @@ impl AgentContainerRuntime for KubernetesRuntime {
         }))
     }
 
+    async fn observe_unbound_builder_creation_authority(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<container_runtime_api::UnboundBuilderCreationAuthority> {
+        self.observe_unbound_builder_creation_authority(context)
+            .await
+    }
+
     async fn capture_builder_orphan_stop(
         &self,
         context: &shared_types::UserAppExecutionContext,

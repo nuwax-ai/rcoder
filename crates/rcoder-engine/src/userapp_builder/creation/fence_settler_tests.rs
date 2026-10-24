@@ -110,6 +110,12 @@ pub(crate) struct FenceRuntime {
     /// 显式 holder 死亡探针判定（模型 Docker flock 覆写）；
     /// None = 默认推导（K8s 极性）。
     pub(crate) receipt_holder_dead: Mutex<Option<bool>>,
+    /// 免回执的原创建运行时权威观测（陈旧 Running 对账用）；
+    /// None = trait 默认 Unsupported（保守保持）。
+    pub(crate) unbound_creation_authority:
+        Mutex<Option<container_runtime_api::UnboundBuilderCreationAuthority>>,
+    /// 注入免回执权威观测传输失败（fail-safe 反例）。
+    pub(crate) unbound_authority_transport_fails: std::sync::atomic::AtomicBool,
 }
 
 impl FenceRuntime {
@@ -150,6 +156,8 @@ impl FenceRuntime {
             app_absence_error: Default::default(),
             app_absence_probes: Default::default(),
             receipt_holder_dead: Mutex::new(None),
+            unbound_creation_authority: Mutex::new(None),
+            unbound_authority_transport_fails: Default::default(),
         })
     }
 }
@@ -179,6 +187,26 @@ fn status_of(phase: &str, replicas: i32) -> DeploymentStatus {
 
 #[async_trait::async_trait]
 impl AgentContainerRuntime for FenceRuntime {
+    async fn observe_unbound_builder_creation_authority(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<container_runtime_api::UnboundBuilderCreationAuthority> {
+        if self
+            .unbound_authority_transport_fails
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ContainerRuntimeError::K8sError(
+                "injected unbound authority observation failure".into(),
+            ));
+        }
+        Ok(self
+            .unbound_creation_authority
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(container_runtime_api::UnboundBuilderCreationAuthority::Unsupported))
+    }
+
     async fn verify_absent_builder_recovery(
         &self,
         _context: &shared_types::UserAppExecutionContext,
@@ -1659,6 +1687,26 @@ pub(crate) async fn runtime_state_with_mode(
     fence_settle_grace_secs: Option<u64>,
     access_mode: app_manager::config::AppAccessMode,
 ) -> Arc<AppState> {
+    runtime_state_with_config(
+        runtime,
+        store,
+        crate::config::AppConfig {
+            fence_settle_grace_secs,
+            ..Default::default()
+        },
+        access_mode,
+    )
+    .await
+}
+
+/// 带完整 [`crate::config::AppConfig`] 覆盖的 AppState 夹具：陈旧 Running
+/// 对账的确认年龄门需要覆盖 `ensure_timeout_seconds`。
+pub(crate) async fn runtime_state_with_config(
+    runtime: Arc<dyn container_runtime_api::ContainerRuntime>,
+    store: Arc<rcoder_storage::userapp_lifecycle::TursoUserAppStore>,
+    config: crate::config::AppConfig,
+    access_mode: app_manager::config::AppAccessMode,
+) -> Arc<AppState> {
     let adapter =
         crate::storage::ProjectAdapter::new("test-ns".to_string(), "cluster.local".to_string());
     let activity = Arc::new(app_manager::AppActivityRegistry::new(Duration::from_secs(
@@ -1688,10 +1736,7 @@ pub(crate) async fn runtime_state_with_mode(
             crate::userapp_builder::shutdown_gate::OperationFlightGate::default(),
         ),
         userapp_recovery_handle: Arc::new(Mutex::new(None)),
-        config: crate::config::AppConfig {
-            fence_settle_grace_secs,
-            ..Default::default()
-        },
+        config,
         projects: Arc::new(crate::storage::ProjectStoreBackend::Memory(Arc::new(
             adapter,
         ))),
@@ -1716,6 +1761,73 @@ pub(crate) async fn runtime_state_with_mode(
         activity,
         cluster_domain: "cluster.local".to_string(),
     })
+}
+
+/// 陈旧 Running/claimed 夹具（生产 app 50/128 形态）：claim 后不落任何
+/// 终态/中断记录——无 deadline、无租约绑定、无完成回执，执行者死亡后
+/// 无人再转换状态。`ensure_timeout_secs` 覆盖确认年龄门。
+pub(crate) async fn stale_running_state(
+    runtime: Arc<FenceRuntime>,
+    operation_id: &str,
+    ensure_timeout_secs: u64,
+) -> (Arc<AppState>, tempfile::TempDir) {
+    let metadata_dir = tempfile::tempdir().expect("metadata directory");
+    let store = Arc::new(
+        rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+            &metadata_dir.path().join("userapp.turso.db"),
+        )
+        .await
+        .expect("store"),
+    );
+    let mut config = crate::config::AppConfig::default();
+    config.userapp_storage.ensure_timeout_seconds = ensure_timeout_secs;
+    let state = runtime_state_with_config(
+        runtime.clone(),
+        store.clone(),
+        config,
+        app_manager::config::AppAccessMode::Docker,
+    )
+    .await;
+    let lifecycle = store.ensure_identity("fenced").await.expect("identity");
+    let admitted = store
+        .admit_with_input(
+            &UserAppAdmission {
+                app_id: "fenced".into(),
+                lifecycle_id: Some(lifecycle.lifecycle_id.clone()),
+                operation_id: operation_id.into(),
+                request_id: Some(format!("req-{operation_id}")),
+                request_fingerprint: "ab".repeat(32),
+                kind: UserAppOperationKind::EnsureBuilder,
+                command: None,
+                metadata: None,
+                runtime_policy_on_success: None,
+            },
+            None,
+        )
+        .await
+        .expect("admit");
+    let record = match admitted {
+        UserAppAdmissionOutcome::Accepted(record) => record,
+        other => panic!("unexpected admission: {other:?}"),
+    };
+    store
+        .advance(&UserAppOperationProgress {
+            app_id: record.app_id.clone(),
+            lifecycle_id: record.lifecycle_id.clone(),
+            operation_id: record.operation_id.clone(),
+            expected_revision: record.revision,
+            executor_id: "executor-fenced".into(),
+            state: UserAppOperationState::Running,
+            step: "claimed".into(),
+            checkpoint: serde_json::Value::Null,
+            error_code: None,
+            error_message: None,
+        })
+        .await
+        .expect("claim");
+    // TempDir 必须活过测试：把目录泄露（测试进程级可接受）。
+    std::mem::forget(metadata_dir);
+    (state, tempfile::tempdir().expect("placeholder dir"))
 }
 
 struct PreparedComputeFixture(shared_types::UserAppOperationLeaseReceipt);

@@ -94,6 +94,32 @@ pub enum AppOperationMutexObservation {
     Unconfirmed,
 }
 
+/// Read-only discovery of a historical builder creation's native operation
+/// authority for a stale `Running` EnsureBuilder that never persisted a
+/// lease receipt binding. Located by durable identity only (name from the
+/// app/family, holder from the record's executor/operation) — never from a
+/// fabricated receipt. `ExpiredOriginal` is the only positive "the original
+/// executor provably stopped renewing" witness; no variant grants write
+/// authority or proves the original business writes completed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UnboundBuilderCreationAuthority {
+    /// Held by exactly this execution identity (holder `executor:operation`,
+    /// identity annotations matching whenever present) and the native
+    /// renewal is expired. Carries the observed holder for audit.
+    ExpiredOriginal { holder: String },
+    /// Held by this identity and still being renewed: a live executor may
+    /// still be executing or confirming. The record must stay untouched.
+    ActiveOriginal,
+    /// Present but owned by another execution (successor takeover or a
+    /// different operation): not ours to judge or release.
+    Foreign { holder: Option<String> },
+    /// No native mutex exists: nothing retains live authority for this
+    /// execution on this backend.
+    Absent,
+    /// This backend cannot discover authority without a persisted receipt.
+    Unsupported,
+}
+
 /// Container runtime errors
 #[derive(Error, Debug)]
 pub enum ContainerRuntimeError {

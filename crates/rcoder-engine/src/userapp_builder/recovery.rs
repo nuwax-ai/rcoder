@@ -417,12 +417,19 @@ async fn discover(
             if shared_types::userapp_builder_creation_needs_runtime_receipt(&operation) {
                 let state = state.clone();
                 tasks.push(operation.operation_id.clone(), async move {
-                    // receipt 恢复不可行（Ok(false)：runtime 无恢复证据）时
-                    // 穿落到证据化兜底，而不是每扫描周期空转重试——否则
-                    // checkpoint 为空的 EnsureBuilder 围栏被本分支永久截走，
-                    // 兜底 settler 永远轮不到（测试环境 20 个站立围栏的
-                    // 直接成因之一）。
+                    // receipt 恢复不可行（Ok(false)：runtime 无恢复证据）时，
+                    // 先走陈旧 Running 的证据化对账（生产 app 50/128 形态：
+                    // 无回执、无 deadline、无 binding，执行者死亡后 Running
+                    // 无人转换），再穿落到围栏兜底——RecoveryRequired 记录
+                    // 的原语义与状态门保持不变。否则 checkpoint 为空的
+                    // EnsureBuilder 围栏被本分支永久截走，兜底 settler 永远
+                    // 轮不到（测试环境 20 个站立围栏的直接成因之一）。
                     if !super::creation::reconcile_runtime_receipt(&state, &operation).await? {
+                        with_stall_budget(
+                            "reconcile_stale_running_creation",
+                            super::creation::reconcile_stale_running_creation(&state, &operation),
+                        )
+                        .await??;
                         with_stall_budget(
                             "reconcile_fenced_ensure",
                             super::creation::reconcile_fenced_ensure(&state, &operation),
@@ -655,6 +662,7 @@ mod terminal_tests;
 #[cfg(test)]
 mod discover_settle_tests {
     use super::*;
+    use crate::userapp_builder::creation::fence_settler_tests::stale_running_state;
     #[cfg(feature = "rcoder-pg")]
     use crate::userapp_builder::creation::fence_settler_tests::{
         FenceRuntime, fence_state, fence_state_pg, settled,
@@ -781,6 +789,74 @@ mod discover_settle_tests {
             record.state,
             record.step,
             record.error_message
+        );
+    }
+
+    /// 陈旧 Running/claimed 反例（生产 app 50/128 形态：无回执、无 deadline、
+    /// 无租约绑定，执行者死亡且未写任何中断记录）。修复前：回执恢复返回
+    /// false 后围栏 settler 因状态门跳过 Running，记录永久停留、dev slot
+    /// 永久占用。修复后：discover 必须把该记录证据化收束为 Failed 并释放
+    /// slot，随后同 scope 的新请求可正常受理。
+    #[tokio::test]
+    async fn discover_settles_stale_running_builder_without_receipt() {
+        let operation_id = "op-stale-running";
+        let runtime = FenceRuntime::scenario(None, None);
+        *runtime.builder_workload.lock().expect("lock") = Some("rcoder-app-builder-fenced".into());
+        *runtime.unbound_creation_authority.lock().expect("lock") = Some(
+            container_runtime_api::UnboundBuilderCreationAuthority::ExpiredOriginal {
+                holder: "executor-fenced:op-stale-running".into(),
+            },
+        );
+        let (state, _dir) = stale_running_state(runtime, operation_id, 1).await;
+        // 确认年龄门：claimed revision 的更新时间需 ≥ ensure_timeout（1s）。
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let mut tasks = RecoveryTasks::default();
+        let mut cursor = None;
+        discover(&state, &mut tasks, &mut cursor)
+            .await
+            .expect("discover");
+        while let Some((id, result)) = tasks.next().await {
+            result.unwrap_or_else(|error| panic!("recovery task {id} failed: {error}"));
+        }
+        let record = settled(&state, operation_id).await;
+        assert_eq!(
+            record.state,
+            UserAppOperationState::Failed,
+            "stale Running must settle via evidence; state={:?} step={} err={:?}",
+            record.state,
+            record.step,
+            record.error_message
+        );
+        assert!(
+            record
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("stale running")),
+            "release note must classify the settlement: {:?}",
+            record.error_message
+        );
+        // 端到端：dev slot 已释放——同 app 同 scope 新受理必须 Accepted。
+        let admitted = state
+            .userapp_store
+            .admit_with_input(
+                &shared_types::UserAppAdmission {
+                    app_id: "fenced".into(),
+                    lifecycle_id: Some(record.lifecycle_id.clone()),
+                    operation_id: format!("{operation_id}-retry"),
+                    request_id: Some(format!("req-{operation_id}-retry")),
+                    request_fingerprint: "cd".repeat(32),
+                    kind: UserAppOperationKind::EnsureBuilder,
+                    command: None,
+                    metadata: None,
+                    runtime_policy_on_success: None,
+                },
+                None,
+            )
+            .await
+            .expect("admit after settle");
+        assert!(
+            matches!(admitted, shared_types::UserAppAdmissionOutcome::Accepted(_)),
+            "slot must be freed after settlement: {admitted:?}"
         );
     }
 }

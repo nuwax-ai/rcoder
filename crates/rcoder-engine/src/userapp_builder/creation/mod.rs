@@ -208,6 +208,9 @@ pub(crate) mod fence_settler_tests;
 mod observe;
 mod registration;
 mod spawn;
+mod stale_running;
+#[cfg(test)]
+mod stale_running_tests;
 #[cfg(test)]
 mod tests;
 
@@ -215,3 +218,4 @@ pub(super) use fence::*;
 pub(super) use observe::*;
 pub(super) use registration::{BuilderRegistrationConfirmationRequired, repair_live_registration};
 pub(super) use spawn::*;
+pub(super) use stale_running::*;

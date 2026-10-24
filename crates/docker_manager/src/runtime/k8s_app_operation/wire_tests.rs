@@ -832,3 +832,145 @@ async fn vacant_serving_acquisition_never_takes_over_an_expired_or_foreign_mutex
     assert!(requests[0].starts_with("POST "));
     assert!(requests[1].starts_with("GET "));
 }
+
+/// 陈旧 Running EnsureBuilder 的免回执权威观测：holder/注解身份区分 + 过期
+/// 判定 + 缺席/传输失败。身份不符一律 Foreign（不可判断、不可释放），活续
+/// 约 = ActiveOriginal，只有"本执行身份 + 已过期"才给 ExpiredOriginal。
+#[tokio::test]
+async fn unbound_builder_authority_observation_distinguishes_identity_and_expiry() {
+    use container_runtime_api::UnboundBuilderCreationAuthority;
+    let base_context = || shared_types::UserAppExecutionContext {
+        app_id: "unbound-app".into(),
+        lifecycle_id: "lifecycle-unbound".into(),
+        operation_id: "op-unbound".into(),
+        executor_id: "executor-unbound".into(),
+        request_fingerprint: "ab".repeat(32),
+    };
+    let builder_lease = |renew_age_secs: i64| {
+        let renew = (k8s_openapi::jiff::Timestamp::now()
+            - k8s_openapi::jiff::SignedDuration::from_secs(renew_age_secs))
+        .to_string();
+        let context = base_context();
+        serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
+            "metadata": {
+                "name": "rcoder-operation-builder-unbound-app",
+                "namespace": "lease-test",
+                "uid": "lease-uid-1", "resourceVersion": "12",
+                "labels": {
+                    "rcoder.io/operation-app": "unbound-app",
+                    "rcoder.io/operation-family": ServiceType::UserappBuilder.to_string(),
+                },
+                "annotations": {
+                    "rcoder.io/operation-id": context.operation_id,
+                    "rcoder.io/lifecycle-id": context.lifecycle_id,
+                    "rcoder.io/executor-id": context.executor_id,
+                    "rcoder.io/request-fingerprint": context.request_fingerprint,
+                    "rcoder.io/lease-token": context.executor_id,
+                    "rcoder.io/compute-lease": "true",
+                },
+            },
+            "spec": {
+                "holderIdentity": format!("{}:{}", context.executor_id, context.operation_id),
+                "leaseDurationSeconds": LEASE_TTL_SECONDS,
+                "acquireTime": renew,
+                "renewTime": renew,
+                "leaseTransitions": 0,
+            },
+        })
+    };
+    for variant in 0..8 {
+        let context = base_context();
+        let mut lease = builder_lease(3600);
+        let mut code = 200;
+        match variant {
+            0 => {}
+            1 => {
+                lease["spec"]["renewTime"] = k8s_openapi::jiff::Timestamp::now().to_string().into()
+            }
+            2 => lease["spec"]["holderIdentity"] = "successor:op-later".into(),
+            3 => {
+                code = 404;
+                lease = status(404, "absent");
+            }
+            4 => {
+                lease["metadata"]["annotations"]["rcoder.io/executor-id"] =
+                    "foreign-executor".into()
+            }
+            5 => {
+                // 历史部分戳记：只剩 holder 字符串绑定身份。
+                lease["metadata"]["annotations"] = serde_json::json!({});
+            }
+            6 => {
+                lease["metadata"]["annotations"]["rcoder.io/lease-token"] = "successor-token".into()
+            }
+            7 => {
+                lease["metadata"]["deletionTimestamp"] =
+                    k8s_openapi::jiff::Timestamp::now().to_string().into()
+            }
+            _ => unreachable!(),
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (head, body) = read_request(&mut stream).await;
+            assert!(
+                head.starts_with("GET ")
+                    && head.contains("/leases/rcoder-operation-builder-unbound-app"),
+                "{head}"
+            );
+            assert!(body.is_empty(), "authority observation is read-only");
+            write_reply(&mut stream, code, &lease).await;
+        });
+        let runtime = runtime_for(client_for(address).await);
+        let result = runtime
+            .observe_unbound_builder_creation_authority(&context)
+            .await;
+        server.abort();
+        drop(server.await);
+        match variant {
+            0 => assert_eq!(
+                result.unwrap(),
+                UnboundBuilderCreationAuthority::ExpiredOriginal {
+                    holder: "executor-unbound:op-unbound".into()
+                }
+            ),
+            1 => assert_eq!(
+                result.unwrap(),
+                UnboundBuilderCreationAuthority::ActiveOriginal
+            ),
+            2 | 4 | 6 | 7 => assert!(
+                matches!(
+                    result.unwrap(),
+                    UnboundBuilderCreationAuthority::Foreign { .. }
+                ),
+                "variant {variant}: identity mismatch must stay foreign"
+            ),
+            3 => assert_eq!(result.unwrap(), UnboundBuilderCreationAuthority::Absent),
+            5 => assert_eq!(
+                result.unwrap(),
+                UnboundBuilderCreationAuthority::ExpiredOriginal {
+                    holder: "executor-unbound:op-unbound".into()
+                },
+                "holder string alone binds the historical execution identity"
+            ),
+            _ => unreachable!(),
+        }
+    }
+    // 传输失败传播为 Err（保持不判死）。
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (_head, _body) = read_request(&mut stream).await;
+        write_reply(&mut stream, 500, &status(500, "transport unavailable")).await;
+    });
+    let runtime = runtime_for(client_for(address).await);
+    let result = runtime
+        .observe_unbound_builder_creation_authority(&base_context())
+        .await;
+    server.abort();
+    drop(server.await);
+    assert!(result.is_err(), "transport failures must propagate");
+}

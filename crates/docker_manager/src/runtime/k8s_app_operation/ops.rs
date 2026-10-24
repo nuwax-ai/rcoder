@@ -318,6 +318,82 @@ impl KubernetesRuntime {
         Ok(true)
     }
 
+    /// Read-only discovery of a historical builder creation's native
+    /// authority for a stale `Running` EnsureBuilder without a persisted
+    /// receipt. Identity is located by durable fields only (name from
+    /// app/family, holder from the record's executor/operation); annotations
+    /// are validated whenever present, so an older partial stamp cannot spoof
+    /// another execution. Legacy ConfigMap stock is not consulted: it is
+    /// swept after 24h and never fences a Lease-era record.
+    pub(crate) async fn observe_unbound_builder_creation_authority(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<container_runtime_api::UnboundBuilderCreationAuthority> {
+        use container_runtime_api::UnboundBuilderCreationAuthority;
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let service_type = ServiceType::UserappBuilder;
+        let name = operation_name(&context.app_id, &service_type)?;
+        let api: Api<Lease> = Api::namespaced(self.client.clone(), &self.namespace);
+        let Some(current) = api.get_opt(&name).await.map_err(|error| {
+            ContainerRuntimeError::K8sError(format!("Observe unbound builder authority: {error}"))
+        })?
+        else {
+            return Ok(UnboundBuilderCreationAuthority::Absent);
+        };
+        let labels = current.metadata.labels.as_ref();
+        let foreign = |holder: Option<String>| UnboundBuilderCreationAuthority::Foreign { holder };
+        let holder = current
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.holder_identity.clone());
+        if labels.and_then(|labels| labels.get("rcoder.io/operation-app")) != Some(&context.app_id)
+            || labels
+                .and_then(|labels| labels.get("rcoder.io/operation-family"))
+                .map(String::as_str)
+                != Some(service_type.to_string().as_str())
+            || current.metadata.deletion_timestamp.is_some()
+        {
+            return Ok(foreign(holder));
+        }
+        let annotations = current.metadata.annotations.as_ref();
+        // Present identity annotations must match exactly; absent ones (older
+        // stamps) leave the holder string as the binding identity.
+        if let Some(annotations) = annotations {
+            for (key, expected) in context.resource_metadata() {
+                if annotations
+                    .get(&key)
+                    .is_some_and(|actual| !actual.is_empty() && actual != &expected)
+                {
+                    return Ok(foreign(holder));
+                }
+            }
+            if annotations
+                .get("rcoder.io/compute-lease")
+                .map(String::as_str)
+                == Some("true")
+                && annotations.get("rcoder.io/lease-token") != Some(&context.executor_id)
+            {
+                return Ok(foreign(holder));
+            }
+        }
+        let expected_holder = format!("{}:{}", context.executor_id, context.operation_id);
+        let Some(holder) = holder else {
+            return Ok(foreign(None));
+        };
+        if holder != expected_holder {
+            return Ok(foreign(Some(holder)));
+        }
+        Ok(
+            if lease_expired_at(k8s_openapi::jiff::Timestamp::now(), &current) {
+                UnboundBuilderCreationAuthority::ExpiredOriginal { holder }
+            } else {
+                UnboundBuilderCreationAuthority::ActiveOriginal
+            },
+        )
+    }
+
     pub(crate) async fn release_captured_application_operation(
         &self,
         context: &shared_types::UserAppExecutionContext,

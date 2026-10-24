@@ -313,7 +313,7 @@ async fn reject_expired_creation_before_write(
 /// A released physical creation lease says nothing about an active controller
 /// worker's remaining read-only confirmation. Preserve its original revision
 /// until its own deadline, or until it explicitly records an interruption.
-async fn running_confirmation_may_be_recovered(
+pub(super) async fn running_confirmation_may_be_recovered(
     state: &AppState,
     snapshot: &UserAppOperationRecord,
 ) -> Result<bool> {

@@ -380,6 +380,22 @@ impl AgentContainerRuntime for DockerRuntime {
         }))
     }
 
+    async fn observe_unbound_builder_creation_authority(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<container_runtime_api::UnboundBuilderCreationAuthority> {
+        #[cfg(unix)]
+        {
+            self.observe_unbound_builder_creation_authority(context)
+                .await
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = context;
+            Ok(container_runtime_api::UnboundBuilderCreationAuthority::Unsupported)
+        }
+    }
+
     async fn capture_builder_control(
         &self,
         context: &shared_types::UserAppExecutionContext,

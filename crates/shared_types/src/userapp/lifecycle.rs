@@ -1618,6 +1618,24 @@ pub trait UserAppLifecycleStore: Send + Sync {
         release_note: &str,
     ) -> Result<UserAppOperationRecord, UserAppStoreError>;
 
+    /// Settle a stale `Running` EnsureBuilder as Failed with the scanner's
+    /// runtime-authority observation evidence (dead executor, no persisted
+    /// receipt/binding, confirmation window elapsed). Narrow gate: kind
+    /// EnsureBuilder + state Running + recorded executor + full snapshot CAS.
+    /// Pure bookkeeping: frees the admission slot, never grants runtime work
+    /// and never fabricates Succeeded. Same honesty rules as
+    /// [`Self::settle_fenced_operation`].
+    async fn settle_stale_running_builder(
+        &self,
+        _snapshot: &UserAppOperationRecord,
+        _evidence: &serde_json::Value,
+        _release_note: &str,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Stale Running builder settlement is unsupported by this store".into(),
+        ))
+    }
+
     async fn finalize_observed_wake(
         &self,
         _snapshot: &UserAppOperationRecord,
