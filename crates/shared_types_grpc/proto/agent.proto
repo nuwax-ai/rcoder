@@ -434,6 +434,9 @@ message GetContainerStatusResponse {
   optional double cpu_percent = 5;
   // 可选：内存使用（MB）
   optional int64 memory_mb = 6;
+  // Version 1 includes pending preparations and established user-facing TCP
+  // connections. Missing/zero is insufficient evidence for orphan retirement.
+  uint32 idle_observation_version = 7;
 }
 
 // === Get VNC Status ===

@@ -81,6 +81,7 @@ pub async fn run() -> anyhow::Result<()> {
         userapp_op_flight,
         userapp_recovery,
         _config_watcher,
+        _controller_scope_locks,
     } = engine;
 
     let sse_registry = Arc::clone(&state.session_stream_registry);

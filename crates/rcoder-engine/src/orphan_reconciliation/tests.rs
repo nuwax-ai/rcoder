@@ -731,3 +731,37 @@ async fn docker_web_agent_with_canonical_registration_stays_with_the_cleaner() {
         "registered compute must remain under the cleaner's authority"
     );
 }
+
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn deferred_live_docker_workload_cannot_credit_unobserved_idle_time() {
+    let (mut scanner, runtime, _probe, _directory) = fixture().await;
+    *runtime.snapshot.lock().unwrap() = docker_web_agent();
+    scanner.scan().await.unwrap();
+    age_candidates(&mut scanner);
+    let old = scanner.seen.values().next().unwrap().clone();
+    // A complete inventory is unchanged but admission consumed the scan budget.
+    scanner.config.orphan_scan_budget_seconds = 1;
+    let key = WorkloadKey::new("isolated", ServiceType::WebAgentRunner, "web-legacy").unwrap();
+    let exclusive = scanner
+        .state
+        .projects
+        .acquire_workload_admission(
+            key,
+            WorkloadAdmissionMode::Exclusive,
+            Instant::now() + Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+    scanner.scan().await.unwrap();
+    drop(exclusive);
+    assert!(scanner.seen.is_empty());
+    scanner.scan().await.unwrap();
+    let fresh = scanner.seen.values().next().unwrap();
+    assert!(fresh.since > old.since);
+    assert_eq!(fresh.observations, 1);
+    assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
+}
+
+#[cfg(feature = "userapp-turso")]
+mod probe;

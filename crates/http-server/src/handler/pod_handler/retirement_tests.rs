@@ -691,3 +691,52 @@ async fn partial_stop_reports_pending_services_without_second_compute() {
         "Restart must not create a second compute while Service cleanup is pending"
     );
 }
+
+#[tokio::test]
+async fn keepalive_waits_for_retirement_and_never_publishes_a_removed_container() {
+    let (_fixture, state, runtime) = fixture("actual-physical").await;
+    state.remove_project(PROJECT);
+    let exclusive = state
+        .acquire_agent_workload(
+            PROJECT,
+            &ServiceType::WebAgentRunner,
+            rcoder_storage::WorkloadAdmissionMode::Exclusive,
+        )
+        .await
+        .unwrap();
+    let app = Router::new()
+        .route("/keepalive", post(pod_keepalive))
+        .with_state(state.clone());
+    let mut request = tokio::spawn(
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/keepalive")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"user_id":"retirement-user", "project_id":PROJECT,
+            "service_type":"web-agent-runner"})
+                    .to_string(),
+                ))
+                .unwrap(),
+        ),
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut request)
+            .await
+            .is_err(),
+        "keepalive must wait for the same exclusive workload admission"
+    );
+    *runtime.current.lock().unwrap() = None;
+    drop(exclusive);
+    let response = request.await.unwrap().unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        text.contains(shared_types::error_codes::ERR_CONTAINER_NOT_FOUND),
+        "{text}"
+    );
+    assert!(state.get_project(PROJECT).is_none());
+}

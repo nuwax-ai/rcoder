@@ -85,7 +85,8 @@ pub trait AgentContainerRuntime: Send + Sync {
             "Captured Agent retirement is unsupported".into(),
         ))
     }
-    /// Automatic writes are restricted to Service-only or scaled-zero/no-Pod remnants.
+    /// Automatic callers qualify empty remnants or idle Docker agents through
+    /// activity, canonical-reference and deployment-owned workspace checks.
     async fn retire_agent_remnants(
         &self,
         _snapshot: &crate::AgentStopSnapshot,

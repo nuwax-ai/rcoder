@@ -1,5 +1,5 @@
-//! Reverse runtime inventory. Discovery never adopts or deletes live compute.
-//! Only empty, unreferenced resources can enter automatic retirement. Candidate
+//! Reverse inventory for empty remnants and confirmed-idle Docker agents.
+//! Discovery never adopts business identity. Candidate
 //! continuity is local to one leader generation and is never a startup gate.
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -103,7 +103,7 @@ trait ContainerActivityProbe: Send + Sync {
 /// query itself does not refresh activity, so probing cannot fake idleness
 /// nor keep a container alive by observing it.
 struct GrpcContainerActivityProbe {
-    checker: crate::cleanup_task::agent::AgentStatusChecker,
+    pool: Arc<crate::grpc::GrpcChannelPool>,
 }
 
 #[async_trait::async_trait]
@@ -113,17 +113,31 @@ impl ContainerActivityProbe for GrpcContainerActivityProbe {
             .endpoint
             .as_deref()
             .context("Activity probe requires an endpoint")?;
-        let grpc_addr =
-            crate::utils::extract_grpc_addr_with_port(endpoint, shared_types::GRPC_DEFAULT_PORT)
-                .context("Activity probe endpoint is unreadable")?;
+        let port = url::Url::parse(endpoint)?
+            .port()
+            .context("Activity endpoint has no RPC port")?;
+        let grpc_addr = crate::utils::extract_grpc_addr_with_port(endpoint, port)
+            .context("Activity probe endpoint is unreadable")?;
         // The agent-side response ignores caller identity; the identifier is
         // passed for request diagnostics only.
         let identifier = snapshot.identifier.as_str();
-        let active = self
-            .checker
-            .is_container_active(&grpc_addr, identifier, identifier)
-            .await
-            .context("Container activity probe failed")?;
+        let status = tokio::time::timeout(
+            Duration::from_secs(3),
+            crate::grpc::status_query::query_container_status(
+                &self.pool,
+                &grpc_addr,
+                identifier,
+                identifier,
+                Duration::from_secs(3),
+            ),
+        )
+        .await
+        .context("Container activity deadline exceeded")??;
+        ensure!(
+            status.idle_observation_version >= 1,
+            "Agent lacks preview/pending activity evidence; upgrade agent before automatic orphan retirement"
+        );
+        let active = crate::grpc::status_query::is_agent_active(&status);
         if active {
             Ok(Activity::Busy)
         } else {
@@ -427,7 +441,10 @@ impl Scanner {
             inventory.rotate_left(offset);
         }
         for (_, key, snapshot) in &inventory {
-            if let Some(candidate) = previous.get(key).filter(|old| old.snapshot == *snapshot) {
+            if let Some(candidate) = previous
+                .get(key)
+                .filter(|old| old.snapshot == *snapshot && snapshot.container.is_none())
+            {
                 self.seen.insert(key.clone(), candidate.clone());
             }
         }
@@ -553,7 +570,7 @@ pub(crate) fn start(
             }
         };
         let activity_probe = Arc::new(GrpcContainerActivityProbe {
-            checker: crate::cleanup_task::agent::AgentStatusChecker::new(state.grpc_pool.clone()),
+            pool: state.grpc_pool.clone(),
         });
         let mut scanner = Scanner {
             state,

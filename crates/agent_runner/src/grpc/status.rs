@@ -108,7 +108,12 @@ pub async fn get_container_status(
             req.user_id, req.project_id
         );
 
-        let active_tasks = get_active_tasks_count();
+        let connections = user_connection_count().map_err(|error| {
+            Status::unavailable(format!("Container connection activity unavailable: {error}"))
+        })?;
+        let active_tasks = get_active_tasks_count().saturating_add(
+            i32::try_from(connections).unwrap_or(i32::MAX),
+        );
         let uptime_seconds = get_uptime_seconds();
         let is_active = active_tasks > 0;
 
@@ -125,6 +130,7 @@ pub async fn get_container_status(
             status: status.clone(),
             cpu_percent: None,
             memory_mb: None,
+            idle_observation_version: u32::from(cfg!(target_os = "linux")),
         };
 
         debug!(
@@ -190,7 +196,10 @@ pub async fn get_vnc_status(
 fn get_active_tasks_count() -> i32 {
     let agent_count = AGENT_REGISTRY
         .iter_agents()
-        .filter(|entry| entry.value().status == AgentStatus::Active)
+        .filter(|entry| match entry.value().status {
+            AgentStatus::Idle => false,
+            AgentStatus::Pending | AgentStatus::Active | AgentStatus::Terminating => true,
+        })
         .count() as i32;
 
     // 终端 WS 连接也算「容器在用」：终端流量本身不计入 agent active task，
@@ -218,10 +227,44 @@ fn get_active_tasks_count() -> i32 {
     );
 
     agent_count
+        .saturating_add(i32::try_from(AGENT_REGISTRY.pending_preparations()).unwrap_or(i32::MAX))
         .saturating_add(terminal_count)
         .saturating_add(vnc_count)
         .saturating_add(local_workers)
         .saturating_add(http_requests)
+}
+
+/// Preview/HTTP/WebSocket traffic bypasses the agent registry. Count inbound
+/// established sockets on listening user ports, excluding the probing RPC itself.
+#[cfg(target_os = "linux")]
+fn user_connection_count() -> anyhow::Result<usize> {
+    use procfs::net::{TcpState, tcp, tcp6};
+    let entries = tcp()?.into_iter().chain(tcp6()?).collect::<Vec<_>>();
+    let listening = entries
+        .iter()
+        .filter(|entry| entry.state == TcpState::Listen)
+        .map(|entry| entry.local_address.port())
+        .collect::<std::collections::HashSet<_>>();
+    Ok(entries
+        .iter()
+        .filter(|entry| {
+            user_connection(
+                entry.local_address.port(),
+                entry.state == TcpState::Established,
+                listening.contains(&entry.local_address.port()),
+            )
+        })
+        .count())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn user_connection_count() -> anyhow::Result<usize> {
+    Ok(0)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn user_connection(port: u16, established: bool, listening: bool) -> bool {
+    established && listening && port != shared_types::GRPC_DEFAULT_PORT
 }
 
 fn get_uptime_seconds() -> i64 {
@@ -235,6 +278,29 @@ fn get_uptime_seconds() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparing_without_a_session_keeps_container_active() {
+        let project = "container-status-preparation";
+        assert_eq!(get_active_tasks_count(), 0);
+        AGENT_REGISTRY.set_pending(project);
+        assert!(get_active_tasks_count() > 0);
+        AGENT_REGISTRY.clear_pending_if_exists(project);
+        assert_eq!(get_active_tasks_count(), 0);
+    }
+
+    #[test]
+    fn preview_connections_protect_compute_but_grpc_probes_and_closed_sockets_do_not() {
+        assert!(user_connection(80, true, true));
+        assert!(user_connection(4000, true, true));
+        assert!(!user_connection(
+            shared_types::GRPC_DEFAULT_PORT,
+            true,
+            true
+        ));
+        assert!(!user_connection(4000, false, true));
+        assert!(!user_connection(49152, true, false));
+    }
 
     #[tokio::test]
     async fn embedded_worker_keeps_container_active_until_cancelled_execution_exits() {

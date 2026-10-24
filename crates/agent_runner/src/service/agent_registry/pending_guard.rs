@@ -79,6 +79,10 @@ impl AgentSessionRegistry {
         self.reserve_preparation(project_id, PreparationLease::Manual);
     }
 
+    pub fn pending_preparations(&self) -> usize {
+        self.preparations.len()
+    }
+
     pub fn is_pending(&self, project_id: &str) -> bool {
         self.preparations.contains_key(project_id)
     }

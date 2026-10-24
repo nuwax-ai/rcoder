@@ -1,4 +1,5 @@
-//! Docker discovery is observational; automatic remnant deletion is unsupported.
+//! Docker inventory and exact-CID retirement. Automatic callers must prove
+//! deployment ownership, persistent workspace coverage and current idleness.
 use super::DockerRuntime;
 use container_runtime_api::{
     AgentResourceIdentity, AgentResourceKind, AgentStopOutcome, AgentStopSnapshot,
@@ -55,134 +56,130 @@ impl DockerRuntime {
             .map_err(|error| {
                 Error::DockerError(format!("List managed Agent containers: {error}"))
             })?;
-        let mut result = Vec::new();
-        for container in containers {
-            let Some(labels) = container.labels.as_ref() else {
-                continue;
-            };
-            let Some(family) = labels
-                .get("service-type")
-                .and_then(|value| value.parse::<ServiceType>().ok())
-            else {
-                continue;
-            };
-            match family {
-                ServiceType::Userapp => continue,
-                ServiceType::WebAgentRunner
-                | ServiceType::ComputerAgentRunner
-                | ServiceType::ComputerNormalProject
-                | ServiceType::UserappBuilder => {}
-            }
-            let Some(identifier) = labels.get("identifier").filter(|value| !value.is_empty())
-            else {
-                continue;
-            };
-            let uid = container
-                .id
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    Error::DockerError("Managed Agent has no full container ID".into())
-                })?;
-            let name = container
-                .names
-                .as_ref()
-                .and_then(|names| names.first())
-                .map(|value| value.trim_start_matches('/').to_owned())
-                .ok_or_else(|| Error::DockerError("Managed Agent has no container name".into()))?;
-            // Live evidence needs one inspect per candidate: StartedAt resets
-            // observation on same-CID restarts, and mounts decide whether managed
-            // data survives container removal. An unreadable candidate is absent
-            // this round, so observation continuity never accrues on stale data.
-            let inspected = match tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                self.inner.get_docker_client().inspect_container(&uid, None),
-            )
+        use futures_util::{StreamExt, TryStreamExt, stream};
+        stream::iter(containers)
+            .map(|container| self.inspect_agent_candidate(container))
+            .buffer_unordered(8)
+            .try_filter_map(|snapshot| async move { Ok(snapshot) })
+            .try_collect()
             .await
-            {
-                Ok(Ok(inspected)) => inspected,
-                Ok(Err(bollard::errors::Error::DockerResponseServerError {
-                    status_code: 404,
-                    ..
-                })) => continue,
-                outcome => {
-                    debug!(uid = %uid, ?outcome, "Managed Agent inspect is unavailable; skipping this round");
-                    continue;
-                }
-            };
-            let started_at = inspected
-                .state
-                .as_ref()
-                .and_then(|state| state.started_at.as_deref())
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
-            let persistent_mounts =
-                inspected
-                    .mounts
-                    .as_deref()
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|mount| {
-                        let writable = mount.rw.unwrap_or(true);
-                        let persistent = match mount.typ.as_deref() {
-                            // Inspect reports mount types as plain Docker strings.
-                            Some("bind") => mount
-                                .source
-                                .as_deref()
-                                .is_some_and(|source| !source.is_empty()),
-                            Some("volume") => {
-                                mount.name.as_deref().is_some_and(|name| !name.is_empty())
-                                    || mount
-                                        .source
-                                        .as_deref()
-                                        .is_some_and(|source| !source.is_empty())
-                            }
-                            _ => false,
-                        };
-                        writable && persistent
-                    });
-            let auto_remove = inspected
-                .host_config
-                .as_ref()
-                .and_then(|config| config.auto_remove)
-                .unwrap_or(false);
-            let identity = AgentResourceIdentity {
-                kind: AgentResourceKind::Container,
-                name,
-                uid,
-                resource_version: started_at,
-                owner_uid: None,
-                created_at: container
-                    .created
-                    .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0)),
-            };
-            let endpoint = container
-                .network_settings
-                .as_ref()
-                .and_then(|settings| settings.networks.as_ref())
-                .and_then(|networks| {
-                    networks
-                        .values()
-                        .find_map(|network| network.ip_address.as_ref().filter(|ip| !ip.is_empty()))
-                })
-                .map(|ip| format!("http://{ip}:{}", shared_types::GRPC_DEFAULT_PORT));
-            result.push(AgentStopSnapshot {
-                app_id_hint: None,
-                namespace: Some(self.agent_retirement_namespace()),
-                identifier: identifier.clone(),
-                service_type: family.family_representative(),
-                controller: None,
-                pods: Vec::new(),
-                container: Some(identity),
-                services: Vec::new(),
-                replicas: None,
-                endpoint,
-                compute_data_protection: Some(ComputeDataProtection {
-                    persistent_mounts,
-                    auto_remove,
-                }),
-            });
+    }
+
+    async fn inspect_agent_candidate(
+        &self,
+        container: bollard::models::ContainerSummary,
+    ) -> Result<Option<AgentStopSnapshot>> {
+        let Some(labels) = container.labels.as_ref() else {
+            return Ok(None);
+        };
+        let Some(family) = labels
+            .get("service-type")
+            .and_then(|value| value.parse::<ServiceType>().ok())
+        else {
+            return Ok(None);
+        };
+        match family {
+            ServiceType::Userapp => return Ok(None),
+            ServiceType::WebAgentRunner
+            | ServiceType::ComputerAgentRunner
+            | ServiceType::ComputerNormalProject
+            | ServiceType::UserappBuilder => {}
         }
-        Ok(result)
+        let Some(identifier) = labels.get("identifier").filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        let uid = container
+            .id
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Error::DockerError("Managed Agent has no full container ID".into()))?;
+        let name = container
+            .names
+            .as_ref()
+            .and_then(|names| names.first())
+            .map(|value| value.trim_start_matches('/').to_owned())
+            .ok_or_else(|| Error::DockerError("Managed Agent has no container name".into()))?;
+        // Live evidence needs one inspect per candidate: StartedAt resets
+        // observation on same-CID restarts, and mounts decide whether managed
+        // data survives container removal. An unreadable candidate is absent
+        // this round, so observation continuity never accrues on stale data.
+        let inspected = match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.inner.get_docker_client().inspect_container(&uid, None),
+        )
+        .await
+        {
+            Ok(Ok(inspected)) => inspected,
+            Ok(Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            })) => return Ok(None),
+            outcome => {
+                debug!(uid = %uid, ?outcome, "Managed Agent inspect is unavailable; skipping this round");
+                return Ok(None);
+            }
+        };
+        let started_at = inspected
+            .state
+            .as_ref()
+            .and_then(|state| state.started_at.as_deref())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let persistent_mounts = self
+            .persistent_agent_workspace(&inspected, family, identifier)
+            .await;
+        let auto_remove = inspected
+            .host_config
+            .as_ref()
+            .and_then(|config| config.auto_remove)
+            .unwrap_or(false);
+        // Inspect is the single identity/network truth, not the older
+        // list response or an arbitrary HashMap network belonging to peers.
+        let observed_labels = inspected.config.as_ref().and_then(|c| c.labels.as_ref());
+        if inspected.id.as_deref() != Some(uid.as_str())
+            || observed_labels.and_then(|l| l.get("identifier")) != Some(identifier)
+            || observed_labels
+                .and_then(|l| l.get("service-type"))
+                .and_then(|s| s.parse::<ServiceType>().ok())
+                != Some(family)
+        {
+            return Err(Error::Conflict(
+                "Docker Agent identity changed during inventory".into(),
+            ));
+        }
+        let network = self.inner.get_main_network_name().await;
+        let endpoint = inspected
+            .network_settings
+            .as_ref()
+            .and_then(|s| s.networks.as_ref())
+            .and_then(|n| n.get(&network))
+            .and_then(|n| n.ip_address.as_deref())
+            .filter(|ip| !ip.is_empty())
+            .map(|ip| format!("http://{ip}:{}", shared_types::GRPC_DEFAULT_PORT));
+        let identity = AgentResourceIdentity {
+            kind: AgentResourceKind::Container,
+            name,
+            uid,
+            resource_version: started_at,
+            owner_uid: None,
+            created_at: container
+                .created
+                .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0)),
+        };
+        Ok(Some(AgentStopSnapshot {
+            app_id_hint: None,
+            namespace: Some(self.agent_retirement_namespace()),
+            identifier: identifier.clone(),
+            service_type: family.family_representative(),
+            controller: None,
+            pods: Vec::new(),
+            container: Some(identity),
+            services: Vec::new(),
+            replicas: None,
+            endpoint,
+            compute_data_protection: Some(ComputeDataProtection {
+                persistent_mounts,
+                auto_remove,
+            }),
+        }))
     }
 
     pub(super) async fn capture_docker_agent_retirement(
@@ -245,6 +242,7 @@ impl DockerRuntime {
     pub(super) async fn retire_docker_agent_snapshot(
         &self,
         snapshot: &AgentStopSnapshot,
+        automatic: bool,
     ) -> Result<AgentStopOutcome> {
         if snapshot.namespace.as_deref() != Some(self.agent_retirement_namespace().as_str())
             || snapshot.controller.is_some()
@@ -305,8 +303,18 @@ impl DockerRuntime {
                 "Captured Docker Agent ownership changed".into(),
             ));
         }
-        // Explicit compute retirement only. It is not a writable-layer backup;
-        // automatic Docker reclamation remains observation-only.
+        if automatic {
+            validate_automatic_evidence(snapshot, &observed)?;
+            if !self
+                .persistent_agent_workspace(&observed, snapshot.service_type, &snapshot.identifier)
+                .await
+            {
+                return Err(Error::Conflict(
+                    "Docker workspace no longer has deployment-owned persistent coverage".into(),
+                ));
+            }
+        }
+        // Never remove volumes or resolve this captured CID again by name.
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
             client.remove_container(
@@ -345,4 +353,191 @@ impl DockerRuntime {
             ))),
         }
     }
+}
+
+/// The creation-side workspace mount is also our deployment boundary. A socket,
+/// config mount or another deployment's directory never authorizes removal.
+impl DockerRuntime {
+    async fn persistent_agent_workspace(
+        &self,
+        inspected: &bollard::models::ContainerInspectResponse,
+        family: ServiceType,
+        identifier: &str,
+    ) -> bool {
+        let Some(config) = self
+            .inner
+            .config
+            .multi_image_config
+            .get_service_config(&family)
+        else {
+            return false;
+        };
+        let resolution = config.effective_workspace_resolution_path();
+        let Ok(host_root) =
+            crate::path::resolve_container_path_to_host(std::path::Path::new(&resolution)).await
+        else {
+            return false;
+        };
+        persistent_agent_workspace_in_scope(inspected, family, identifier, config, &host_root)
+    }
+}
+
+fn persistent_agent_workspace_in_scope(
+    inspected: &bollard::models::ContainerInspectResponse,
+    family: ServiceType,
+    identifier: &str,
+    config: &shared_types::ServiceImageConfig,
+    host_root: &std::path::Path,
+) -> bool {
+    let Some(labels) = inspected.config.as_ref().and_then(|c| c.labels.as_ref()) else {
+        return false;
+    };
+    if labels.contains_key("managed-by")
+        || labels.contains_key(shared_types::USERAPP_DOCKER_APP_ID_LABEL)
+        || shared_types::USERAPP_RESOURCE_IDENTITY_KEYS
+            .iter()
+            .any(|key| labels.contains_key(*key))
+    {
+        return false;
+    }
+    let Some(env) = inspected.config.as_ref().and_then(|c| c.env.as_ref()) else {
+        return false;
+    };
+    let value = |key: &str| env.iter().find_map(|s| s.strip_prefix(&format!("{key}=")));
+    let component = |key: &str| {
+        value(key).filter(|v| {
+            !v.is_empty()
+                && std::path::Path::new(v).components().count() == 1
+                && matches!(
+                    std::path::Path::new(v).components().next(),
+                    Some(std::path::Component::Normal(_))
+                )
+        })
+    };
+    let target_root = config.workspace_container_path();
+    if value("PROJECT_WORKSPACE_BASE").is_some_and(|root| root != target_root) {
+        return false;
+    }
+    let relative = match family {
+        ServiceType::WebAgentRunner => {
+            let Some(project) = component("PROJECT_ID") else {
+                return false;
+            };
+            if project == identifier {
+                std::path::PathBuf::from(project)
+            } else {
+                // Shared Web workloads use the isolation layout from the
+                // original request, never identifier-as-project guessing.
+                let Some(tenant) = component("TENANT_ID") else {
+                    return false;
+                };
+                match value("ISOLATION_TYPE") {
+                    Some("tenant") => std::path::PathBuf::from(tenant),
+                    Some("space") => {
+                        let Some(space) = component("SPACE_ID") else {
+                            return false;
+                        };
+                        std::path::Path::new(tenant).join(space)
+                    }
+                    Some("project") => {
+                        let Some(space) = component("SPACE_ID") else {
+                            return false;
+                        };
+                        std::path::Path::new(tenant).join(space).join(project)
+                    }
+                    _ => return false,
+                }
+            }
+        }
+        ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject => {
+            let Some(user) = component("USER_ID").filter(|user| *user == identifier) else {
+                return false;
+            };
+            return workspace_is_persistent(
+                inspected,
+                &host_root.join(user).to_string_lossy(),
+                &target_root,
+            );
+        }
+        ServiceType::Userapp | ServiceType::UserappBuilder => return false,
+    };
+    workspace_is_persistent(
+        inspected,
+        &host_root.join(&relative).to_string_lossy(),
+        &std::path::Path::new(&target_root)
+            .join(relative)
+            .to_string_lossy(),
+    )
+}
+
+fn workspace_is_persistent(
+    inspected: &bollard::models::ContainerInspectResponse,
+    host: &str,
+    target: &str,
+) -> bool {
+    use std::path::{Component, Path};
+    let clean = |p: &str| {
+        Path::new(p).is_absolute()
+            && !Path::new(p)
+                .components()
+                .any(|c| matches!(c, Component::ParentDir))
+    };
+    if !clean(host) || !clean(target) {
+        return false;
+    }
+    let mounts = inspected.mounts.as_deref().unwrap_or_default();
+    mounts.iter().any(|mount| {
+        let (Some(source), Some(destination)) =
+            (mount.source.as_deref(), mount.destination.as_deref())
+        else {
+            return false;
+        };
+        // Exact creation-side source and destination; a parent mount is not
+        // sufficient proof when a child may shadow the actual workspace.
+        clean(source)
+            && clean(destination)
+            && source == host
+            && destination == target
+            && mount.rw == Some(true)
+            && matches!(mount.typ.as_deref(), Some("bind") | Some("volume"))
+            && !mounts.iter().any(|other| {
+                other
+                    .destination
+                    .as_deref()
+                    .is_some_and(|d| d != target && Path::new(d).starts_with(target))
+            })
+    })
+}
+
+fn validate_automatic_evidence(
+    snapshot: &AgentStopSnapshot,
+    current: &bollard::models::ContainerInspectResponse,
+) -> Result<()> {
+    match snapshot.service_type {
+        ServiceType::WebAgentRunner
+        | ServiceType::ComputerAgentRunner
+        | ServiceType::ComputerNormalProject => {}
+        ServiceType::Userapp | ServiceType::UserappBuilder => {
+            return Err(Error::Conflict(
+                "Application compute requires its lifecycle authority".into(),
+            ));
+        }
+    }
+    let expected = snapshot
+        .container
+        .as_ref()
+        .and_then(|c| c.resource_version.as_deref());
+    let current = current.state.as_ref().and_then(|s| s.started_at.as_deref());
+    if expected.is_none_or(str::is_empty)
+        || expected != current
+        || !snapshot
+            .compute_data_protection
+            .as_ref()
+            .is_some_and(|p| p.persistent_mounts)
+    {
+        return Err(Error::Conflict(
+            "Docker execution or data protection changed before automatic retirement".into(),
+        ));
+    }
+    Ok(())
 }

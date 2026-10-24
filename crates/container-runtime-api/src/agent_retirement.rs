@@ -51,8 +51,8 @@ pub struct AgentStopSnapshot {
 /// when managed data is carried by mounts that outlive the container.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComputeDataProtection {
-    /// At least one writable mount (bind with a source, or a named volume)
-    /// covers managed data outside the container writable layer.
+    /// The configured workspace is covered by its deployment-owned writable
+    /// source/destination mount, without unproven nested shadow mounts.
     pub persistent_mounts: bool,
     /// Host-configured AutoRemove; container data on persistent mounts is
     /// unaffected, but it forecloses any writable-layer recovery flow.

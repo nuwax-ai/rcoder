@@ -28,6 +28,8 @@ use crate::bootstrap;
 use crate::*;
 use docker_manager::runtime_selection::RuntimeType;
 
+mod controller_scope;
+
 /// 引擎装配产物：服务组合（http-server bin / desktop）继续装配 HTTP 面与
 /// 关停编排所需的全部句柄。`_config_watcher` 下划线字段名保持 watcher 存活。
 pub struct AssembledEngine {
@@ -50,6 +52,7 @@ pub struct AssembledEngine {
     pub userapp_op_flight: Arc<userapp_builder::shutdown_gate::OperationFlightGate>,
     pub userapp_recovery: Option<tokio::task::JoinHandle<()>>,
     pub _config_watcher: Option<config_watcher::ConfigWatcher>,
+    pub _controller_scope_locks: Vec<std::fs::File>,
 }
 
 /// 引擎装配序（详见模块文档）。bootstrap 之后、HTTP 面之前的全部启动逻辑。
@@ -74,6 +77,11 @@ pub async fn assemble(
     docker_init::init_path_resolver(runtime_type).await?;
     docker_init::init_docker_manager(&bootstrap_result.config).await?;
     docker_init::startup_cleanup(&bootstrap_result.config).await;
+    let _controller_scope_locks = if is_kubernetes {
+        Vec::new()
+    } else {
+        controller_scope::lock(&bootstrap_result.config)?
+    };
 
     // 提前创建存储后端（M4：按 config.storage 分叉 Memory/Postgres 枚举），
     // 以便同一 Arc 实例同时作为 Arc<dyn ContainerLookup> 注入 Pingora 代理层
@@ -369,5 +377,6 @@ pub async fn assemble(
         userapp_op_flight,
         userapp_recovery,
         _config_watcher,
+        _controller_scope_locks,
     })
 }

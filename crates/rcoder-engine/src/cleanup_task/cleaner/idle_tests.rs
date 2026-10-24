@@ -54,6 +54,7 @@ impl AgentService for Activity {
         }
         Ok(Response::new(grpc::GetContainerStatusResponse {
             is_active: self.active.load(Ordering::SeqCst),
+            idle_observation_version: 1,
             ..Default::default()
         }))
     }
