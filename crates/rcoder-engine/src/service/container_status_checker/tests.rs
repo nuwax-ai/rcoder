@@ -6,7 +6,7 @@
 //! - 健康状态的清理双轴（不在存储 / 超期）
 
 use super::checker::ContainerStatusChecker;
-use super::state::{ContainerHealthState, ContainerStatusCheckerConfig};
+use super::state::{ContainerHealthState, ContainerStatusCheckerConfig, HealthScope};
 use crate::app_state::AppState;
 use crate::config::AppConfig;
 use crate::grpc::{GrpcChannelPool, SessionStreamRegistry};
@@ -210,9 +210,24 @@ fn container_info(
     user_id: Option<&str>,
     service_type: ServiceType,
 ) -> Arc<ProjectAndContainerInfo> {
+    container_info_with_uid(
+        project_id,
+        user_id,
+        service_type,
+        &format!("container_{project_id}"),
+    )
+}
+
+/// 测试载体：显式物理 UID 的容器信息（退避代次隔离用）
+fn container_info_with_uid(
+    project_id: &str,
+    user_id: Option<&str>,
+    service_type: ServiceType,
+    uid: &str,
+) -> Arc<ProjectAndContainerInfo> {
     let container = ContainerBasicInfo {
-        container_id: format!("container_{project_id}"),
-        container_name: format!("container_{project_id}"),
+        container_id: uid.to_string(),
+        container_name: uid.to_string(),
         container_ip: "127.0.0.1".to_string(),
         internal_port: 8086,
         external_port: 0,
@@ -235,15 +250,22 @@ fn container_info(
     ))
 }
 
+/// 健康代次（物理身份）辅助
+fn scope_of(info: &ProjectAndContainerInfo) -> HealthScope {
+    HealthScope::of(&info.container_info().expect("容器信息"))
+}
+
 #[tokio::test]
 async fn record_failure_escalates_and_pins_first_failure_time() {
     let (state, _metadata_dir) =
         test_state(Arc::new(ProbeRuntime::new(FindBehavior::Missing))).await;
     let c = checker(ContainerStatusCheckerConfig::default(), state);
+    let info = container_info("proj", None, ServiceType::WebAgentRunner);
+    let scope = scope_of(&info);
 
-    c.record_failure("k", "addr", &anyhow::anyhow!("boom"));
-    c.record_failure("k", "addr", &anyhow::anyhow!("boom"));
-    c.record_failure("k", "addr", &anyhow::anyhow!("boom"));
+    c.record_failure("k", &scope, "addr", &anyhow::anyhow!("boom"));
+    c.record_failure("k", &scope, "addr", &anyhow::anyhow!("boom"));
+    c.record_failure("k", &scope, "addr", &anyhow::anyhow!("boom"));
 
     let health = c.health_states.get("k").expect("状态条目存在").clone();
     assert_eq!(health.consecutive_failures, 3, "连续失败应累计到阈值");
@@ -251,7 +273,7 @@ async fn record_failure_escalates_and_pins_first_failure_time() {
     // 再失败一次：first_failure_time 不得漂移（skip 窗口锚定首次失败，
     // 若改为每次更新，容器会因间歇失败被永久跳过检查）
     std::thread::sleep(Duration::from_millis(5));
-    c.record_failure("k", "addr", &anyhow::anyhow!("boom"));
+    c.record_failure("k", &scope, "addr", &anyhow::anyhow!("boom"));
     let health = c.health_states.get("k").expect("状态条目存在").clone();
     assert_eq!(health.consecutive_failures, 4);
     assert_eq!(
@@ -266,10 +288,12 @@ async fn record_success_resets_failure_state_completely() {
     let (state, _metadata_dir) =
         test_state(Arc::new(ProbeRuntime::new(FindBehavior::Missing))).await;
     let c = checker(ContainerStatusCheckerConfig::default(), state);
+    let info = container_info("proj", None, ServiceType::WebAgentRunner);
+    let scope = scope_of(&info);
 
-    c.record_failure("k", "addr", &anyhow::anyhow!("boom"));
-    c.record_failure("k", "addr", &anyhow::anyhow!("boom"));
-    c.record_success("k");
+    c.record_failure("k", &scope, "addr", &anyhow::anyhow!("boom"));
+    c.record_failure("k", &scope, "addr", &anyhow::anyhow!("boom"));
+    c.record_success("k", &scope);
 
     let health = c.health_states.get("k").expect("状态条目存在").clone();
     assert_eq!(health.consecutive_failures, 0, "成功必须清零失败计数");
@@ -290,45 +314,115 @@ async fn should_skip_requires_threshold_and_unexpired_window() {
         ..Default::default()
     };
     let c = checker(config, state);
+    let info = container_info("proj", None, ServiceType::WebAgentRunner);
+    let scope = scope_of(&info);
 
     // 未达阈值：不跳过
     c.health_states.insert(
         "below".to_string(),
         ContainerHealthState {
+            scope: Some(scope.clone()),
             consecutive_failures: 2,
             first_failure_time: Some(Utc::now()),
             last_check_time: Utc::now(),
             last_success_time: None,
         },
     );
-    assert!(!c.should_skip_check("below"), "未达阈值不应跳过");
+    assert!(!c.should_skip_check("below", &scope), "未达阈值不应跳过");
 
     // 达阈值且在窗口内：跳过
     c.health_states.insert(
         "inside".to_string(),
         ContainerHealthState {
+            scope: Some(scope.clone()),
             consecutive_failures: 3,
             first_failure_time: Some(Utc::now() - chrono::Duration::seconds(60)),
             last_check_time: Utc::now(),
             last_success_time: None,
         },
     );
-    assert!(c.should_skip_check("inside"), "达阈值且窗口内应跳过");
+    assert!(
+        c.should_skip_check("inside", &scope),
+        "达阈值且窗口内应跳过"
+    );
 
     // 窗口已过：恢复检查（容器若被重建，正是靠这条路径自愈）
     c.health_states.insert(
         "expired".to_string(),
         ContainerHealthState {
+            scope: Some(scope.clone()),
             consecutive_failures: 5,
             first_failure_time: Some(Utc::now() - chrono::Duration::seconds(301)),
             last_check_time: Utc::now(),
             last_success_time: None,
         },
     );
-    assert!(!c.should_skip_check("expired"), "窗口过期必须恢复检查");
+    assert!(
+        !c.should_skip_check("expired", &scope),
+        "窗口过期必须恢复检查"
+    );
 
     // 无条目：不跳过
-    assert!(!c.should_skip_check("absent"));
+    assert!(!c.should_skip_check("absent", &scope));
+}
+
+/// D3：同逻辑键的新物理实例不继承前任失败窗口；旧代次自身仍被跳过。
+#[tokio::test]
+async fn new_physical_instance_does_not_inherit_failure_backoff() {
+    let (state, _metadata_dir) =
+        test_state(Arc::new(ProbeRuntime::new(FindBehavior::Missing))).await;
+    let c = checker(ContainerStatusCheckerConfig::default(), state);
+
+    let old = container_info_with_uid("p", None, ServiceType::WebAgentRunner, "pod-old");
+    let old_scope = scope_of(&old);
+    let new = container_info_with_uid("p", None, ServiceType::WebAgentRunner, "pod-new");
+    let new_scope = scope_of(&new);
+
+    for _ in 0..3 {
+        c.record_failure("p", &old_scope, "addr", &anyhow::anyhow!("boom"));
+    }
+    assert!(
+        c.should_skip_check("p", &old_scope),
+        "同代次持续故障仍应被退避跳过"
+    );
+    assert!(
+        !c.should_skip_check("p", &new_scope),
+        "新物理实例必须立即恢复探测，不继承前任失败窗口"
+    );
+
+    // 换代后旧代次的迟到失败回调也不得叠加到新代次计数上
+    c.record_failure("p", &old_scope, "addr", &anyhow::anyhow!("late"));
+    let health = c.health_states.get("p").expect("状态条目存在").clone();
+    assert_eq!(
+        health.scope,
+        Some(old_scope),
+        "旧回调保持旧代次归属，不污染新实例"
+    );
+    assert!(!c.should_skip_check("p", &new_scope));
+}
+
+/// D3：旧代次的迟到成功不得清掉新代次的退避窗口。
+#[tokio::test]
+async fn stale_success_callback_does_not_reset_new_scope_backoff() {
+    let (state, _metadata_dir) =
+        test_state(Arc::new(ProbeRuntime::new(FindBehavior::Missing))).await;
+    let c = checker(ContainerStatusCheckerConfig::default(), state);
+
+    let old = container_info_with_uid("p", None, ServiceType::WebAgentRunner, "pod-old");
+    let new = container_info_with_uid("p", None, ServiceType::WebAgentRunner, "pod-new");
+    let old_scope = scope_of(&old);
+    let new_scope = scope_of(&new);
+
+    for _ in 0..3 {
+        c.record_failure("p", &new_scope, "addr", &anyhow::anyhow!("boom"));
+    }
+    assert!(c.should_skip_check("p", &new_scope));
+    // 旧实例的迟到成功回调
+    c.record_success("p", &old_scope);
+    assert!(
+        c.should_skip_check("p", &new_scope),
+        "旧回调不得清掉新代次的失败退避"
+    );
 }
 
 #[tokio::test]
@@ -404,27 +498,31 @@ async fn cleanup_stale_health_states_removes_unknown_or_expired_only() {
     let c = checker(config, state.clone());
 
     // 条目 A：不在 projects 存储 → 移除
-    c.health_states
-        .insert("unknown".to_string(), ContainerHealthState::new());
+    c.health_states.insert(
+        "unknown".to_string(),
+        ContainerHealthState::new(HealthScope {
+            container_id: "x".into(),
+            workload_uid: None,
+        }),
+    );
     // 条目 B：在存储且新近检查 → 保留
+    let known = container_info("known", Some("u"), ServiceType::WebAgentRunner);
     state
-        .insert_project(
-            "known".to_string(),
-            container_info("known", Some("u"), ServiceType::WebAgentRunner),
-        )
+        .insert_project("known".to_string(), known.clone())
         .expect("插入 known");
-    c.health_states
-        .insert("known".to_string(), ContainerHealthState::new());
+    c.health_states.insert(
+        "known".to_string(),
+        ContainerHealthState::new(scope_of(&known)),
+    );
     // 条目 C：在存储但 last_check 超 reset 周期 → 移除
+    let stale = container_info("stale", Some("u"), ServiceType::WebAgentRunner);
     state
-        .insert_project(
-            "stale".to_string(),
-            container_info("stale", Some("u"), ServiceType::WebAgentRunner),
-        )
+        .insert_project("stale".to_string(), stale.clone())
         .expect("插入 stale");
     c.health_states.insert(
         "stale".to_string(),
         ContainerHealthState {
+            scope: Some(scope_of(&stale)),
             consecutive_failures: 1,
             first_failure_time: None,
             last_check_time: Utc::now() - chrono::Duration::seconds(1801),

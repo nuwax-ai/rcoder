@@ -14,6 +14,8 @@ use shared_types::{
 
 use super::AppState;
 
+use shared_types::ServiceType;
+
 /// Distinguish compute-only ensure from an actual chat metadata request.
 /// None remains an explicit chat value; it never doubles as a preserve flag.
 #[derive(Clone, Copy, Debug)]
@@ -375,6 +377,66 @@ impl AppState {
             }
         }
         Ok((observed, false))
+    }
+
+    /// 后台状态检查的 Computer 受控重登记：复用前台的运行时证明与 durable
+    /// 换代 CAS（[`Self::recover_computer_project_registration`]），但不带
+    /// 用户活动/聊天元数据副作用——不刷新 last_activity、不派发模型任务、
+    /// 不改请求元数据。`observed` 为 runtime 观测到的当前物理实例。
+    /// 返回提交后的新注册快照；`Ok(None)` 表示 durable 未提交（保持并重试）。
+    pub async fn recover_computer_registration_observed(
+        &self,
+        registered: &ProjectAndContainerInfo,
+        observed: &ContainerBasicInfo,
+    ) -> Result<Option<Arc<ProjectAndContainerInfo>>> {
+        let family = registered
+            .service_type()
+            .context("Computer registration is missing its service family")?;
+        ensure!(
+            family.same_container_family(ServiceType::ComputerAgentRunner),
+            "Controlled Agent replacement recovery requires the Computer service family"
+        );
+        // 身份参数全部取自持久注册投影（与运行时 verify 的输入约定一致）；
+        // 后台来源没有请求执行上下文，保持显式 None。
+        let params = ContainerCreateParams {
+            creation_cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            execution_context: None,
+            retained_storage: None,
+            mutation_target: None,
+            resource_binding: None,
+            project_id: Some(registered.project_id().to_owned()),
+            builder_app_id: None,
+            builder_startup_mode: shared_types::BuilderStartupMode::default(),
+            user_id: registered.user_id().map(str::to_owned),
+            service_type: family,
+            resource_limits: None,
+            pod_id: registered.pod_id().map(str::to_owned),
+            isolation_type: registered.isolation_type().map(str::to_owned),
+            tenant_id: registered.tenant_id().map(str::to_owned),
+            space_id: registered.space_id().map(str::to_owned),
+            storage_size: None,
+            image_override: None,
+            command: None,
+            args: None,
+            env: None,
+            secrets: None,
+            ports: None,
+            health_check: None,
+            app_resources: None,
+            recycle_enabled: None,
+            idle_timeout_seconds: None,
+        };
+        let (replacement, _retired) = self
+            .recover_computer_project_registration(&params, registered, observed)
+            .await?;
+        Ok(self
+            .projects
+            .get(registered.project_id())
+            .filter(|current| {
+                current
+                    .container_info()
+                    .is_some_and(|basic| basic.container_id == replacement.container_id)
+            }))
     }
 
     pub async fn append_session_for_container_durable(

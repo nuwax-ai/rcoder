@@ -8,9 +8,34 @@ use tracing::{debug, info, warn};
 
 use super::checker::ContainerStatusChecker;
 
+/// 一次健康观察所属的物理身份（退避按物理代次隔离：逻辑键相同但
+/// Pod/容器已换代时，新实例不继承前任的失败窗口）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct HealthScope {
+    /// 注册快照捕获的物理 UID（K8s Pod UID / Docker 容器 ID）。
+    pub(super) container_id: String,
+    /// 注册快照捕获的 workload UID（Docker 为 None）。
+    pub(super) workload_uid: Option<String>,
+}
+
+impl HealthScope {
+    pub(super) fn of(basic: &shared_types::ContainerBasicInfo) -> Self {
+        Self {
+            container_id: basic.container_id.clone(),
+            workload_uid: basic.workload_uid.clone(),
+        }
+    }
+
+    fn matches(&self, health: &ContainerHealthState) -> bool {
+        health.scope.as_ref() == Some(self)
+    }
+}
+
 /// 容器健康状态
 #[derive(Debug, Clone)]
 pub(super) struct ContainerHealthState {
+    /// 该状态所属的物理代次；None 为历史条目（按旧数据保留，比较时永不匹配）。
+    pub(super) scope: Option<HealthScope>,
     /// 连续失败次数
     pub(super) consecutive_failures: u32,
     /// 首次失败时间
@@ -23,8 +48,9 @@ pub(super) struct ContainerHealthState {
 
 impl ContainerHealthState {
     /// 创建新的健康状态
-    pub(super) fn new() -> Self {
+    pub(super) fn new(scope: HealthScope) -> Self {
         Self {
+            scope: Some(scope),
             consecutive_failures: 0,
             first_failure_time: None,
             last_check_time: Utc::now(),
@@ -33,9 +59,10 @@ impl ContainerHealthState {
     }
 
     /// 创建失败状态
-    pub(super) fn new_failed() -> Self {
+    pub(super) fn new_failed(scope: HealthScope) -> Self {
         let now = Utc::now();
         Self {
+            scope: Some(scope),
             consecutive_failures: 1,
             first_failure_time: Some(now),
             last_check_time: now,
@@ -72,11 +99,15 @@ impl Default for ContainerStatusCheckerConfig {
 }
 
 impl ContainerStatusChecker {
-    /// 判断是否应该跳过检查（view: 闭包结束读锁立即释放）
-    pub(super) fn should_skip_check(&self, lookup_key: &str) -> bool {
+    /// 判断是否应该跳过检查（view: 闭包结束读锁立即释放）。
+    /// 仅同一物理代次的失败窗口生效：换代后的新实例立即恢复探测。
+    pub(super) fn should_skip_check(&self, lookup_key: &str, scope: &HealthScope) -> bool {
         let now = Utc::now();
         self.health_states
             .view(lookup_key, |_, health| {
+                if !scope.matches(health) {
+                    return false;
+                }
                 if health.consecutive_failures >= self.config.failure_threshold
                     && let Some(first_failure) = health.first_failure_time
                     && let Ok(skip_duration) = chrono::Duration::from_std(self.config.skip_duration)
@@ -88,17 +119,22 @@ impl ContainerStatusChecker {
             .unwrap_or(false)
     }
 
-    /// 记录成功并重置失败计数器
-    pub(super) fn record_success(&self, lookup_key: &str) {
+    /// 记录成功并重置失败计数器（旧代次的迟到成功不得清掉新代次的退避）
+    pub(super) fn record_success(&self, lookup_key: &str, scope: &HealthScope) {
         let now = Utc::now();
 
         use dashmap::mapref::entry::Entry;
 
         match self.health_states.entry(lookup_key.to_string()) {
             Entry::Occupied(mut entry) => {
-                // 使用 get_mut 直接修改，避免克隆
-                let was_failing = entry.get().consecutive_failures > 0;
                 let health = entry.get_mut();
+                if !scope.matches(health) {
+                    // 旧代次的迟到成功回调：不得清掉任何在管代次的退避窗口。
+                    // 新代次的首个成功无需条目（无条目=无退避），其后续失败
+                    // 会按自身代次重新起算。
+                    return;
+                }
+                let was_failing = health.consecutive_failures > 0;
                 health.consecutive_failures = 0;
                 health.first_failure_time = None;
                 health.last_check_time = now;
@@ -110,31 +146,42 @@ impl ContainerStatusChecker {
                 }
             }
             Entry::Vacant(entry) => {
-                entry.insert(ContainerHealthState::new());
+                entry.insert(ContainerHealthState::new(scope.clone()));
             }
         }
     }
 
-    /// 记录失败并清理连接
-    pub(super) fn record_failure(&self, lookup_key: &str, grpc_addr: &str, error: &anyhow::Error) {
+    /// 记录失败并清理连接（新物理代次的失败不叠加到前任计数上）
+    pub(super) fn record_failure(
+        &self,
+        lookup_key: &str,
+        scope: &HealthScope,
+        grpc_addr: &str,
+        error: &anyhow::Error,
+    ) {
         let now = Utc::now();
 
         use dashmap::mapref::entry::Entry;
 
         let consecutive_failures = match self.health_states.entry(lookup_key.to_string()) {
             Entry::Occupied(mut entry) => {
-                // 使用 get_mut 直接修改，避免克隆
                 let health = entry.get_mut();
-                health.consecutive_failures += 1;
-                health.last_check_time = now;
-                if health.first_failure_time.is_none() {
-                    health.first_failure_time = Some(now);
+                if !scope.matches(health) {
+                    // 换代：新代次从 1 起算，不继承前任失败窗口
+                    *health = ContainerHealthState::new_failed(scope.clone());
+                    1
+                } else {
+                    health.consecutive_failures += 1;
+                    health.last_check_time = now;
+                    if health.first_failure_time.is_none() {
+                        health.first_failure_time = Some(now);
+                    }
+                    // 无需 insert，修改已生效
+                    health.consecutive_failures
                 }
-                // 无需 insert，修改已生效
-                health.consecutive_failures
             }
             Entry::Vacant(entry) => {
-                entry.insert(ContainerHealthState::new_failed());
+                entry.insert(ContainerHealthState::new_failed(scope.clone()));
                 1
             }
         };

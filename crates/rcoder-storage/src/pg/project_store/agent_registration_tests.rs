@@ -34,6 +34,9 @@ mod legacy_pending;
 #[path = "agent_registration_tests/durable_timeout.rs"]
 mod durable_timeout;
 
+#[path = "agent_registration_tests/status_observation.rs"]
+mod status_observation;
+
 fn basic(owner: &str) -> ContainerBasicInfo {
     ContainerBasicInfo {
         container_id: format!("old-pod-{owner}"),

@@ -30,7 +30,7 @@ pub use container::{
 
 // project/session/container 映射存储契约（内存与 PG 双后端统一接口）
 pub mod project_store;
-pub use project_store::ProjectStore;
+pub use project_store::{AgentStatusObservation, ProjectStore};
 pub mod userapp_agent;
 pub use userapp_agent::{UserAppAgentBinding, UserAppAgentSession};
 

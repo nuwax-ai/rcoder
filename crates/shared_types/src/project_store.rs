@@ -23,6 +23,26 @@ use chrono::{DateTime, Utc};
 
 use crate::{ContainerBasicInfo, ProjectAndContainerInfo, ServiceType, StorageStats};
 
+/// One background status observation bound to the physical incarnation it
+/// probed. A probe result may only be written back while the registration
+/// still holds exactly this physical identity; a replaced or retired
+/// registration must never inherit a predecessor's activity clock or status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentStatusObservation {
+    /// Physical UID of the probed instance (K8s Pod UID / Docker container ID).
+    pub container_id: String,
+    /// Controller identity captured with the probe (Docker: None).
+    pub workload_uid: Option<String>,
+    /// Registry generation captured when the probe was dispatched. Durable
+    /// backends persist the observation only against this generation; memory
+    /// backends rely on the physical identity pair above.
+    pub project_generation: String,
+    /// Structural revision captured with the generation.
+    pub project_revision: i64,
+    /// Whether the probed instance reported active work.
+    pub active: bool,
+}
+
 /// project/session/container 映射存储契约（内存与 PG 双后端统一接口）
 pub trait ProjectStore: Send + Sync {
     // ========== 查询（纯读，无副作用） ==========
@@ -115,6 +135,15 @@ pub trait ProjectStore: Send + Sync {
 
     /// 更新 agent 运行状态（status_checker / idle 标记）
     fn update_agent_status(&self, project_id: &str, status: i32, message: &str) -> bool;
+
+    /// 按观察代次应用后台状态结论：仅当注册仍持有该物理实例（UID/workload
+    /// 一致）时更新 agent 状态，且仅在 `active` 时刷新活动时钟；换代/缺席
+    /// 返回 false，观察结果整体丢弃，绝不写给后继代次。
+    fn apply_agent_status_observation(
+        &self,
+        project_id: &str,
+        observation: &AgentStatusObservation,
+    ) -> bool;
 
     // ========== 删除清理 ==========
 

@@ -11,6 +11,7 @@ mod concurrency_tests;
 mod crud_session_tests;
 mod index_lookup_tests;
 mod metadata_only_retirement_tests;
+mod status_observation_tests;
 
 use std::thread;
 use std::time::{Duration, Instant};

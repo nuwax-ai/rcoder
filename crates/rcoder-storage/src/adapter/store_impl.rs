@@ -115,6 +115,14 @@ impl shared_types::ProjectStore for ProjectAdapter {
         self.update_agent_status(project_id, status, message)
     }
 
+    fn apply_agent_status_observation(
+        &self,
+        project_id: &str,
+        observation: &shared_types::AgentStatusObservation,
+    ) -> bool {
+        self.apply_agent_status_observation(project_id, observation)
+    }
+
     fn delete_container_with_projects(&self, container_id: &str) -> (bool, usize) {
         self.delete_container_with_projects(container_id)
     }

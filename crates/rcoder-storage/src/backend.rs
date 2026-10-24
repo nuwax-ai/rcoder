@@ -11,8 +11,8 @@
 use std::sync::Arc;
 
 use shared_types::{
-    ContainerBasicInfo, ContainerLookup, ProjectAndContainerInfo, ProjectStore, ServiceType,
-    StorageStats,
+    AgentStatusObservation, ContainerBasicInfo, ContainerLookup, ProjectAndContainerInfo,
+    ProjectStore, ServiceType, StorageStats,
 };
 
 use crate::adapter::ProjectAdapter;
@@ -708,6 +708,18 @@ impl ProjectStore for ProjectStoreBackend {
             Self::Memory(inner) => inner.update_agent_status(project_id, status, message),
             #[cfg(feature = "pg")]
             Self::Postgres(inner) => inner.update_agent_status(project_id, status, message),
+        }
+    }
+
+    fn apply_agent_status_observation(
+        &self,
+        project_id: &str,
+        observation: &AgentStatusObservation,
+    ) -> bool {
+        match self {
+            Self::Memory(inner) => inner.apply_agent_status_observation(project_id, observation),
+            #[cfg(feature = "pg")]
+            Self::Postgres(inner) => inner.apply_agent_status_observation(project_id, observation),
         }
     }
 

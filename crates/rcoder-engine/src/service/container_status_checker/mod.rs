@@ -16,4 +16,6 @@ pub use checker::start_container_status_checker;
 pub use state::ContainerStatusCheckerConfig;
 
 #[cfg(test)]
+mod identity_tests;
+#[cfg(test)]
 mod tests;

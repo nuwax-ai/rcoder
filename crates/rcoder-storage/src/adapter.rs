@@ -583,6 +583,46 @@ impl ProjectAdapter {
         }
     }
 
+    /// 按观察代次应用后台状态结论（物理身份不一致即丢弃，不写给后继代次）。
+    /// 状态写入与活动时钟同在单条 entry 锁内完成；容器条目的活动刷新在
+    /// entry 释放后进行（与 update_activity 相同的锁序）。
+    pub fn apply_agent_status_observation(
+        &self,
+        project_id: &str,
+        observation: &shared_types::AgentStatusObservation,
+    ) -> bool {
+        let mut container_key = None;
+        let applied = 'apply: {
+            let Entry::Occupied(mut e) = self.projects.entry(project_id.to_string()) else {
+                break 'apply false;
+            };
+            let info = Arc::make_mut(e.get_mut());
+            let Some(basic) = info.container_info() else {
+                break 'apply false;
+            };
+            if basic.container_id != observation.container_id
+                || basic.workload_uid != observation.workload_uid
+            {
+                break 'apply false;
+            }
+            info.set_status(Some(if observation.active {
+                shared_types::AgentStatus::Active
+            } else {
+                shared_types::AgentStatus::Idle
+            }));
+            if observation.active {
+                info.update_activity();
+                container_key = Some(container_entry_key(info));
+            }
+            true
+        };
+        // entry 已释放，安全访问 containers map（与 update_activity 同锁序）
+        if let Some(ck) = container_key {
+            self.containers.view(&ck, |_, ce| ce.update_activity());
+        }
+        applied
+    }
+
     // ========== 清理相关 ==========
 
     /// 获取存储统计信息

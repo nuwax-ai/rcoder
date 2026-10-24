@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use shared_types::{
-    ContainerBasicInfo, ProjectAndContainerInfo, ProjectStore, ServiceType, SessionHint,
-    StorageStats,
+    AgentStatusObservation, ContainerBasicInfo, ProjectAndContainerInfo, ProjectStore, ServiceType,
+    SessionHint, StorageStats,
 };
 
 use super::persist_ops::PersistOp;
@@ -326,6 +326,78 @@ impl ProjectStore for PgStore {
         } else {
             false
         }
+    }
+
+    /// 按观察代次应用后台状态结论。镜像按物理身份条件更新；持久化 op 携带
+    /// **观察捕获**的 generation/revision（而非写入时的当前值），SQL CAS
+    /// （generation + row_revision）保证迟到的旧观察不落到后继代次行上。
+    fn apply_agent_status_observation(
+        &self,
+        project_id: &str,
+        observation: &AgentStatusObservation,
+    ) -> bool {
+        let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+        if self.closing.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        if !self
+            .inner
+            .apply_agent_status_observation(project_id, observation)
+        {
+            return false;
+        }
+        let agent_status = if observation.active {
+            code_to_agent_status(1, "active")
+        } else {
+            code_to_agent_status(0, "idle")
+        };
+        if observation.active {
+            // 活动时钟 touch 用捕获的 project 代次；容器名/容器代次取自镜像
+            // （物理身份已匹配，容器条目属于同一注册代次）。
+            let at = chrono::Utc::now();
+            self.enqueue_throttled(
+                &format!("p:{project_id}"),
+                PersistOp::TouchProject {
+                    project_id: project_id.to_string(),
+                    generation: observation.project_generation.clone(),
+                    last_activity: at,
+                },
+            );
+            if let Some(info) = self.inner.get(project_id)
+                && let Some(container) = &info.persistence_identity().container
+            {
+                let name = container_entry_key(&info);
+                self.enqueue_throttled(
+                    &format!("c:{name}"),
+                    PersistOp::TouchContainer {
+                        container_name: name,
+                        generation: container.generation.clone(),
+                        last_activity: at,
+                    },
+                );
+            }
+        }
+        match serde_json::to_value(agent_status) {
+            Ok(value) => {
+                self.enqueue_throttled(
+                    &format!("a:{project_id}"),
+                    PersistOp::UpdateAgentStatus {
+                        project_id: project_id.to_string(),
+                        generation: observation.project_generation.clone(),
+                        expected_revision: observation.project_revision,
+                        agent_status: value,
+                    },
+                );
+            }
+            // 序列化几乎不会失败，一旦发生必须可见：内存已更新而 PG 永久丢失
+            Err(e) => {
+                tracing::warn!(
+                    "[STORAGE_PG] agent_status serialize failed (not persisted): project_id={}, error={e}",
+                    project_id
+                );
+            }
+        }
+        true
     }
 
     fn delete_container_with_projects(&self, container_id: &str) -> (bool, usize) {
