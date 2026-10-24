@@ -307,6 +307,26 @@ async fn stale_running_builder_settlement_contract(store: &dyn UserAppLifecycleS
             .is_err(),
         "a stale snapshot must never settle twice"
     );
+    // Even EnsureBuilder must remain in an unresolved creation stage.
+    // A later Running readiness checkpoint belongs to its completion protocol.
+    let mut later = progress(&successor, State::Running);
+    later.step = "builder_ready_confirmed".into();
+    later.checkpoint = serde_json::json!({"ready":true});
+    let later = store.advance(&later).await.unwrap();
+    assert!(
+        store
+            .settle_stale_running_builder(&later, &evidence, "wrong stage")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .get_operation(&app_id, &later.operation_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        later
+    );
     // 非 EnsureBuilder 的 Running 不开放给本动作（窄门）。
     let other_app = format!("stale-running-other-{}", uuid::Uuid::new_v4().simple());
     let input = shared_types::UserAppExecutionInput::new("{}".into());

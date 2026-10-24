@@ -792,6 +792,73 @@ mod discover_settle_tests {
         );
     }
 
+    #[tokio::test]
+    async fn stale_running_cleanup_failure_is_retried_by_terminal_scanner() {
+        let runtime = FenceRuntime::scenario(None, None);
+        *runtime.builder_workload.lock().unwrap() = Some("builder".into());
+        *runtime.unbound_creation_authority.lock().unwrap() = Some(
+            container_runtime_api::UnboundBuilderCreationAuthority::ExpiredOriginal {
+                holder: "executor-fenced:op-stale-cleanup".into(),
+                receipt: shared_types::UserAppOperationLeaseReceipt::Docker {
+                    service_type: shared_types::ServiceType::UserappBuilder,
+                    device: 1,
+                    inode: 1,
+                    token: "executor-fenced".into(),
+                },
+            },
+        );
+        let (state, _dir) = stale_running_state(runtime.clone(), "op-stale-cleanup", 1).await;
+        runtime
+            .compute_release_succeeds
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let before = settled(&state, "op-stale-cleanup").await;
+        assert!(
+            super::super::creation::reconcile_stale_running_creation(&state, &before)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            settled(&state, "op-stale-cleanup").await.state,
+            UserAppOperationState::Failed
+        );
+        assert!(
+            state
+                .userapp_store
+                .get_operation_lease("fenced", "op-stale-cleanup")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        runtime
+            .compute_release_succeeds
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut tasks = RecoveryTasks::default();
+        discover_terminal_leases(
+            state.userapp_store.clone(),
+            state.runtime.clone(),
+            &mut tasks,
+            &mut None,
+        )
+        .await
+        .unwrap();
+        while let Some((_, result)) = tasks.next().await {
+            result.unwrap();
+        }
+        assert!(
+            state
+                .userapp_store
+                .get_operation_lease("fenced", "op-stale-cleanup")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            settled(&state, "op-stale-cleanup").await.state,
+            UserAppOperationState::Failed
+        );
+    }
+
     /// 陈旧 Running/claimed 反例（生产 app 50/128 形态：无回执、无 deadline、
     /// 无租约绑定，执行者死亡且未写任何中断记录）。修复前：回执恢复返回
     /// false 后围栏 settler 因状态门跳过 Running，记录永久停留、dev slot
@@ -805,6 +872,12 @@ mod discover_settle_tests {
         *runtime.unbound_creation_authority.lock().expect("lock") = Some(
             container_runtime_api::UnboundBuilderCreationAuthority::ExpiredOriginal {
                 holder: "executor-fenced:op-stale-running".into(),
+                receipt: shared_types::UserAppOperationLeaseReceipt::Docker {
+                    service_type: shared_types::ServiceType::UserappBuilder,
+                    device: 1,
+                    inode: 1,
+                    token: "executor-fenced".into(),
+                },
             },
         );
         let (state, _dir) = stale_running_state(runtime, operation_id, 1).await;

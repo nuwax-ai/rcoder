@@ -1771,6 +1771,9 @@ pub(crate) async fn stale_running_state(
     operation_id: &str,
     ensure_timeout_secs: u64,
 ) -> (Arc<AppState>, tempfile::TempDir) {
+    runtime
+        .compute_release_succeeds
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let metadata_dir = tempfile::tempdir().expect("metadata directory");
     let store = Arc::new(
         rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(

@@ -322,9 +322,9 @@ impl KubernetesRuntime {
     /// authority for a stale `Running` EnsureBuilder without a persisted
     /// receipt. Identity is located by durable fields only (name from
     /// app/family, holder from the record's executor/operation); annotations
-    /// are validated whenever present, so an older partial stamp cannot spoof
-    /// another execution. Legacy ConfigMap stock is not consulted: it is
-    /// swept after 24h and never fences a Lease-era record.
+    /// must match the recorded execution. Missing renewal/identity fields are
+    /// unknown, rather than proof of a dead holder. Legacy ConfigMap stock is
+    /// still a possible authority during a rolling upgrade.
     pub(crate) async fn observe_unbound_builder_creation_authority(
         &self,
         context: &shared_types::UserAppExecutionContext,
@@ -335,6 +335,19 @@ impl KubernetesRuntime {
             .map_err(ContainerRuntimeError::ConfigurationError)?;
         let service_type = ServiceType::UserappBuilder;
         let name = operation_name(&context.app_id, &service_type)?;
+        let legacy: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.namespace);
+        if legacy
+            .get_opt(&name)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::K8sError(format!(
+                    "Observe unbound legacy builder authority: {error}"
+                ))
+            })?
+            .is_some()
+        {
+            return Ok(UnboundBuilderCreationAuthority::Foreign { holder: None });
+        }
         let api: Api<Lease> = Api::namespaced(self.client.clone(), &self.namespace);
         let Some(current) = api.get_opt(&name).await.map_err(|error| {
             ContainerRuntimeError::K8sError(format!("Observe unbound builder authority: {error}"))
@@ -358,8 +371,15 @@ impl KubernetesRuntime {
             return Ok(foreign(holder));
         }
         let annotations = current.metadata.annotations.as_ref();
-        // Present identity annotations must match exactly; absent ones (older
-        // stamps) leave the holder string as the binding identity.
+        // All execution fields are stamped by context-bound acquisitions.
+        // Only the redundant app annotation may be supplied by the app label.
+        let mut identity = annotations.cloned().unwrap_or_default();
+        identity
+            .entry("rcoder.io/application-id".into())
+            .or_insert_with(|| context.app_id.clone());
+        if context.validate_operation_metadata(&identity).is_err() {
+            return Ok(foreign(holder));
+        }
         if let Some(annotations) = annotations {
             for (key, expected) in context.resource_metadata() {
                 if annotations
@@ -385,9 +405,36 @@ impl KubernetesRuntime {
         if holder != expected_holder {
             return Ok(foreign(Some(holder)));
         }
+        let Some(spec) = current.spec.as_ref() else {
+            return Ok(foreign(Some(holder)));
+        };
+        if spec.renew_time.is_none() || spec.lease_duration_seconds.is_none_or(|ttl| ttl <= 0) {
+            return Ok(foreign(Some(holder)));
+        }
+        let (Some(uid), Some(resource_version), Some(token)) = (
+            current.metadata.uid.clone().filter(|v| !v.is_empty()),
+            current
+                .metadata
+                .resource_version
+                .clone()
+                .filter(|v| !v.is_empty()),
+            holder_token(&current),
+        ) else {
+            return Ok(foreign(Some(holder)));
+        };
         Ok(
             if lease_expired_at(k8s_openapi::jiff::Timestamp::now(), &current) {
-                UnboundBuilderCreationAuthority::ExpiredOriginal { holder }
+                UnboundBuilderCreationAuthority::ExpiredOriginal {
+                    holder,
+                    receipt: shared_types::UserAppOperationLeaseReceipt::Kubernetes {
+                        service_type,
+                        namespace: self.namespace.clone(),
+                        name,
+                        uid,
+                        resource_version,
+                        token,
+                    },
+                }
             } else {
                 UnboundBuilderCreationAuthority::ActiveOriginal
             },

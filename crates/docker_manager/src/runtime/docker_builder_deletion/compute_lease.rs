@@ -343,18 +343,30 @@ fn unbound_builder_authority_from_inspection(
         // A live flock is held by some execution; it cannot be the dead
         // original executor, and its identity stays unreadable while held.
         ComputeLeaseInspection::Held => UnboundBuilderCreationAuthority::Foreign { holder: None },
-        ComputeLeaseInspection::Releasable(UserAppOperationLeaseReceipt::Docker {
-            token, ..
-        }) => UnboundBuilderCreationAuthority::ExpiredOriginal { holder: token },
+        ComputeLeaseInspection::Releasable(receipt) => match &receipt {
+            UserAppOperationLeaseReceipt::Docker { token, .. } => {
+                UnboundBuilderCreationAuthority::ExpiredOriginal {
+                    holder: token.clone(),
+                    receipt,
+                }
+            }
+            UserAppOperationLeaseReceipt::Kubernetes { .. } => {
+                UnboundBuilderCreationAuthority::Foreign { holder: None }
+            }
+        },
         ComputeLeaseInspection::PreviousOperation {
             operation_id,
             receipt,
         } if operation_id == context.operation_id => {
-            let holder = match receipt {
-                UserAppOperationLeaseReceipt::Docker { token, .. } => token,
-                _ => operation_id,
+            let holder = match &receipt {
+                UserAppOperationLeaseReceipt::Docker { token, .. } => token.clone(),
+                UserAppOperationLeaseReceipt::Kubernetes { .. } => {
+                    return UnboundBuilderCreationAuthority::Foreign {
+                        holder: Some(operation_id),
+                    };
+                }
             };
-            UnboundBuilderCreationAuthority::ExpiredOriginal { holder }
+            UnboundBuilderCreationAuthority::ExpiredOriginal { holder, receipt }
         }
         ComputeLeaseInspection::PreviousOperation { operation_id, .. } => {
             UnboundBuilderCreationAuthority::Foreign {
@@ -363,8 +375,7 @@ fn unbound_builder_authority_from_inspection(
         }
         // A previous owner's full metadata or a discovered attempt needs its
         // existing proof path; an uninterpretable marker is unknown, not dead.
-        ComputeLeaseInspection::Releasable(_)
-        | ComputeLeaseInspection::PreviousOwner { .. }
+        ComputeLeaseInspection::PreviousOwner { .. }
         | ComputeLeaseInspection::Discovered { .. }
         | ComputeLeaseInspection::IdentityChanged(_) => {
             UnboundBuilderCreationAuthority::Foreign { holder: None }
@@ -404,7 +415,8 @@ mod unbound_authority_mapping_tests {
                 &context(),
             ),
             container_runtime_api::UnboundBuilderCreationAuthority::ExpiredOriginal {
-                holder: "executor-original".into()
+                holder: "executor-original".into(),
+                receipt: docker_receipt("executor-original"),
             }
         );
     }
@@ -431,7 +443,8 @@ mod unbound_authority_mapping_tests {
                 &context,
             ),
             container_runtime_api::UnboundBuilderCreationAuthority::ExpiredOriginal {
-                holder: "op-original".into()
+                holder: "op-original".into(),
+                receipt: docker_receipt("op-original"),
             }
         );
         assert_eq!(

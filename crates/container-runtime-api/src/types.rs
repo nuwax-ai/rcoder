@@ -104,17 +104,23 @@ pub enum AppOperationMutexObservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UnboundBuilderCreationAuthority {
     /// Held by exactly this execution identity (holder `executor:operation`,
-    /// identity annotations matching whenever present) and the native
+    /// required execution annotations matching) and the native
     /// renewal is expired. Carries the observed holder for audit.
-    ExpiredOriginal { holder: String },
+    ExpiredOriginal {
+        holder: String,
+        /// Actual native UID/version or device/inode, never a synthetic
+        /// completion receipt. Persist before settlement so terminal cleanup
+        /// can retry across crashes, including historical unbound markers.
+        receipt: shared_types::UserAppOperationLeaseReceipt,
+    },
     /// Held by this identity and still being renewed: a live executor may
     /// still be executing or confirming. The record must stay untouched.
     ActiveOriginal,
     /// Present but owned by another execution (successor takeover or a
     /// different operation): not ours to judge or release.
     Foreign { holder: Option<String> },
-    /// No native mutex exists: nothing retains live authority for this
-    /// execution on this backend.
+    /// No native mutex was observed. This is a hint for conditional physical
+    /// handoff, not proof that a delayed execution cannot acquire it later.
     Absent,
     /// This backend cannot discover authority without a persisted receipt.
     Unsupported,

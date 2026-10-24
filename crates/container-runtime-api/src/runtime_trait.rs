@@ -267,8 +267,8 @@ pub trait AgentContainerRuntime: Send + Sync {
     /// Read-only authority observation for a historical EnsureBuilder whose
     /// creation receipt was never persisted (stale `Running` record, dead
     /// executor). Discovers the native operation mutex by durable identity
-    /// only; `ExpiredOriginal`/`Absent` say the original execution holds no
-    /// live authority — never a write permission and never a success proof.
+    /// only; `ExpiredOriginal`/`Absent` are candidates for a retained physical
+    /// handoff before durable settlement, never a success or death proof alone.
     /// Transport errors propagate and must leave the record unsettled.
     async fn observe_unbound_builder_creation_authority(
         &self,

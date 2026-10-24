@@ -879,7 +879,7 @@ async fn unbound_builder_authority_observation_distinguishes_identity_and_expiry
             },
         })
     };
-    for variant in 0..8 {
+    for variant in 0..14 {
         let context = base_context();
         let mut lease = builder_lease(3600);
         let mut code = 200;
@@ -908,11 +908,42 @@ async fn unbound_builder_authority_observation_distinguishes_identity_and_expiry
                 lease["metadata"]["deletionTimestamp"] =
                     k8s_openapi::jiff::Timestamp::now().to_string().into()
             }
+            8 => {
+                lease["spec"].as_object_mut().unwrap().remove("renewTime");
+            }
+            9 => lease["spec"]["leaseDurationSeconds"] = 0.into(),
+            10 => {
+                lease["metadata"].as_object_mut().unwrap().remove("uid");
+            }
+            11 => lease["metadata"]["annotations"]["rcoder.io/lifecycle-id"] = "".into(),
+            12 | 13 => {}
             _ => unreachable!(),
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (head, _) = read_request(&mut stream).await;
+            assert!(
+                head.starts_with("GET ")
+                    && head.contains("/configmaps/rcoder-operation-builder-unbound-app"),
+                "{head}"
+            );
+            if variant == 12 {
+                write_reply(&mut stream, 200, &serde_json::json!({"apiVersion":"v1", "kind":"ConfigMap", "metadata":{"name":"rcoder-operation-builder-unbound-app"}})).await;
+                return;
+            }
+            if variant == 13 {
+                write_reply(
+                    &mut stream,
+                    403,
+                    &status(403, "legacy observation forbidden"),
+                )
+                .await;
+                return;
+            }
+            write_reply(&mut stream, 404, &status(404, "legacy absent")).await;
+            stream.shutdown().await.unwrap();
             let (mut stream, _) = listener.accept().await.unwrap();
             let (head, body) = read_request(&mut stream).await;
             assert!(
@@ -927,20 +958,27 @@ async fn unbound_builder_authority_observation_distinguishes_identity_and_expiry
         let result = runtime
             .observe_unbound_builder_creation_authority(&context)
             .await;
-        server.abort();
-        drop(server.await);
+        server.await.expect("wire assertions");
         match variant {
             0 => assert_eq!(
                 result.unwrap(),
                 UnboundBuilderCreationAuthority::ExpiredOriginal {
-                    holder: "executor-unbound:op-unbound".into()
+                    holder: "executor-unbound:op-unbound".into(),
+                    receipt: shared_types::UserAppOperationLeaseReceipt::Kubernetes {
+                        service_type: ServiceType::UserappBuilder,
+                        namespace: "lease-test".into(),
+                        name: "rcoder-operation-builder-unbound-app".into(),
+                        uid: "lease-uid-1".into(),
+                        resource_version: "12".into(),
+                        token: "executor-unbound".into()
+                    },
                 }
             ),
             1 => assert_eq!(
                 result.unwrap(),
                 UnboundBuilderCreationAuthority::ActiveOriginal
             ),
-            2 | 4 | 6 | 7 => assert!(
+            2 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 => assert!(
                 matches!(
                     result.unwrap(),
                     UnboundBuilderCreationAuthority::Foreign { .. }
@@ -948,12 +986,9 @@ async fn unbound_builder_authority_observation_distinguishes_identity_and_expiry
                 "variant {variant}: identity mismatch must stay foreign"
             ),
             3 => assert_eq!(result.unwrap(), UnboundBuilderCreationAuthority::Absent),
-            5 => assert_eq!(
-                result.unwrap(),
-                UnboundBuilderCreationAuthority::ExpiredOriginal {
-                    holder: "executor-unbound:op-unbound".into()
-                },
-                "holder string alone binds the historical execution identity"
+            13 => assert!(
+                result.is_err(),
+                "legacy observation errors must stay unknown"
             ),
             _ => unreachable!(),
         }

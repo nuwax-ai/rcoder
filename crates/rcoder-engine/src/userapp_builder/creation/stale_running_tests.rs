@@ -27,6 +27,12 @@ async fn stale_running_settles_with_expired_authority_and_live_builder() {
         &runtime,
         UnboundBuilderCreationAuthority::ExpiredOriginal {
             holder: "executor-fenced:op-stale-live".into(),
+            receipt: shared_types::UserAppOperationLeaseReceipt::Docker {
+                service_type: shared_types::ServiceType::UserappBuilder,
+                device: 1,
+                inode: 1,
+                token: "executor-fenced".into(),
+            },
         },
     );
     let (state, _dir) = stale_running_state(runtime, operation_id, 1).await;
@@ -213,6 +219,12 @@ async fn stale_running_kept_within_confirmation_window() {
         &runtime,
         UnboundBuilderCreationAuthority::ExpiredOriginal {
             holder: "executor-fenced:op-stale-fresh".into(),
+            receipt: shared_types::UserAppOperationLeaseReceipt::Docker {
+                service_type: shared_types::ServiceType::UserappBuilder,
+                device: 1,
+                inode: 1,
+                token: "executor-fenced".into(),
+            },
         },
     );
     // ensure_timeout=90s，记录刚 claim（年龄 ~0）→ 窗口内。
@@ -237,6 +249,12 @@ async fn stale_running_path_ignores_recovery_required_records() {
         &runtime,
         UnboundBuilderCreationAuthority::ExpiredOriginal {
             holder: "executor-fenced:op-stale-fenced".into(),
+            receipt: shared_types::UserAppOperationLeaseReceipt::Docker {
+                service_type: shared_types::ServiceType::UserappBuilder,
+                device: 1,
+                inode: 1,
+                token: "executor-fenced".into(),
+            },
         },
     );
     let (state, _dir) =
@@ -264,6 +282,12 @@ async fn stale_running_settle_skipped_when_record_advanced_concurrently() {
         &runtime,
         UnboundBuilderCreationAuthority::ExpiredOriginal {
             holder: "executor-fenced:op-stale-advanced".into(),
+            receipt: shared_types::UserAppOperationLeaseReceipt::Docker {
+                service_type: shared_types::ServiceType::UserappBuilder,
+                device: 1,
+                inode: 1,
+                token: "executor-fenced".into(),
+            },
         },
     );
     let (state, _dir) = stale_running_state(runtime, operation_id, 1).await;
@@ -322,4 +346,116 @@ async fn runtime_state_with_config_allows_ensure_timeout_override() {
     )
     .await;
     assert_eq!(state.config.userapp_storage.ensure_timeout_seconds, 7);
+}
+
+/// Authority may renew or be replaced AFTER the first read. Native handoff
+/// must recheck it before any terminal CAS, even with definite builder state.
+#[tokio::test]
+async fn stale_running_preserves_slot_when_holder_reactivates_before_handoff() {
+    let runtime = FenceRuntime::scenario(None, None);
+    *runtime.builder_workload.lock().unwrap() = Some("builder".into());
+    authority(
+        &runtime,
+        UnboundBuilderCreationAuthority::ExpiredOriginal {
+            holder: "executor-fenced:op-reactivated".into(),
+            receipt: shared_types::UserAppOperationLeaseReceipt::Docker {
+                service_type: shared_types::ServiceType::UserappBuilder,
+                device: 1,
+                inode: 1,
+                token: "executor-fenced".into(),
+            },
+        },
+    );
+    *runtime.compute_inspection.lock().unwrap() = Some(shared_types::ComputeLeaseInspection::Held);
+    let (state, _dir) = stale_running_state(runtime, "op-reactivated", 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let before = settled(&state, "op-reactivated").await;
+    reconcile_stale_running_creation(&state, &before)
+        .await
+        .unwrap();
+    assert_eq!(settled(&state, "op-reactivated").await, before);
+    assert_eq!(
+        state
+            .userapp_store
+            .get_application("fenced")
+            .await
+            .unwrap()
+            .unwrap()
+            .active_operations
+            .dev
+            .as_deref(),
+        Some("op-reactivated")
+    );
+}
+
+/// A first scan can bind the original native identity then defer on uncertain
+/// builder state. K8s handoff renewals advance RV; this must not poison retries.
+#[tokio::test]
+async fn stale_running_retry_keeps_native_identity_across_renewal_versions() {
+    for replaced in [false, true] {
+        let runtime = FenceRuntime::scenario(None, None);
+        let receipt = shared_types::UserAppOperationLeaseReceipt::Kubernetes {
+            service_type: shared_types::ServiceType::UserappBuilder,
+            namespace: "isolated-test".into(),
+            name: "original-builder-lease".into(),
+            uid: "original-uid".into(),
+            resource_version: "1".into(),
+            token: "executor-fenced".into(),
+        };
+        authority(
+            &runtime,
+            UnboundBuilderCreationAuthority::ExpiredOriginal {
+                holder: "executor-fenced:op-renewal-retry".into(),
+                receipt: receipt.clone(),
+            },
+        );
+        let (state, _dir) = stale_running_state(runtime.clone(), "op-renewal-retry", 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let snapshot = settled(&state, "op-renewal-retry").await;
+        reconcile_stale_running_creation(&state, &snapshot)
+            .await
+            .unwrap();
+        assert_eq!(settled(&state, "op-renewal-retry").await, snapshot);
+        assert_eq!(
+            state
+                .userapp_store
+                .get_operation_lease("fenced", "op-renewal-retry")
+                .await
+                .unwrap()
+                .unwrap()
+                .receipt,
+            receipt
+        );
+        let mut renewed = receipt;
+        if let shared_types::UserAppOperationLeaseReceipt::Kubernetes {
+            resource_version, ..
+        } = &mut renewed
+        {
+            *resource_version = "2".into();
+        }
+        if replaced
+            && let shared_types::UserAppOperationLeaseReceipt::Kubernetes { uid, .. } = &mut renewed
+        {
+            *uid = "successor-uid".into();
+        }
+        authority(
+            &runtime,
+            UnboundBuilderCreationAuthority::ExpiredOriginal {
+                holder: "executor-fenced:op-renewal-retry".into(),
+                receipt: renewed,
+            },
+        );
+        *runtime.builder_workload.lock().unwrap() = Some("builder".into());
+        reconcile_stale_running_creation(&state, &snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            settled(&state, "op-renewal-retry").await.state,
+            if replaced {
+                shared_types::UserAppOperationState::Running
+            } else {
+                shared_types::UserAppOperationState::Failed
+            }
+        );
+    }
 }

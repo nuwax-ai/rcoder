@@ -30,6 +30,7 @@ pub(crate) async fn reconcile_stale_running_creation(
     // Running 操作的通用收束。
     if snapshot.kind != UserAppOperationKind::EnsureBuilder
         || snapshot.state != UserAppOperationState::Running
+        || !shared_types::userapp_builder_creation_needs_runtime_receipt(snapshot)
     {
         return Ok(());
     }
@@ -82,13 +83,13 @@ pub(crate) async fn reconcile_stale_running_creation(
         executor_id,
         request_fingerprint: record.request_fingerprint.clone(),
     };
-    let evidence = match tokio::time::timeout(
+    let observation = match tokio::time::timeout(
         STALE_OBSERVATION_TIMEOUT,
         observe_stale_creation_evidence(state, &context),
     )
     .await
     {
-        Ok(Ok(evidence)) => evidence,
+        Ok(Ok(observation)) => observation,
         Ok(Err(reason)) => {
             tracing::warn!(
                 operation_id = %record.operation_id,
@@ -111,8 +112,22 @@ pub(crate) async fn reconcile_stale_running_creation(
     };
     state
         .userapp_store
-        .settle_stale_running_builder(&record, &evidence, STALE_AUTHORITY_RELEASE_NOTE)
+        .settle_stale_running_builder(&record, &observation.evidence, STALE_AUTHORITY_RELEASE_NOTE)
         .await?;
+    // Drop the retained physical exclusion before retryable terminal cleanup.
+    // The binding was saved while Running, so a crash here remains discoverable.
+    drop(observation.guard);
+    if let Some(binding) = state
+        .userapp_store
+        .get_operation_lease(&record.app_id, &record.operation_id)
+        .await?
+    {
+        state
+            .runtime()
+            .release_app_operation_receipt(&binding.context, &binding.receipt)
+            .await?;
+        state.userapp_store.forget_operation_lease(&binding).await?;
+    }
     tracing::warn!(
         operation_id = %record.operation_id,
         app_id = %record.app_id,
@@ -125,24 +140,31 @@ pub(crate) async fn reconcile_stale_running_creation(
     Ok(())
 }
 
+struct SettlementObservation {
+    evidence: serde_json::Value,
+    // Held across the storage CAS, not just the runtime observation.
+    guard: Option<Box<dyn container_runtime_api::ComputeHandoffGuard>>,
+}
+
 /// 权威 + 副作用取证。`Err(reason)` 携带明确的保持原因（未知不当缺席）。
 async fn observe_stale_creation_evidence(
     state: &AppState,
     context: &shared_types::UserAppExecutionContext,
-) -> Result<serde_json::Value> {
+) -> Result<SettlementObservation> {
     // 原执行权威：免回执地按持久身份发现原生互斥对象（K8s Lease /
     // Docker flock marker）。仅 ExpiredOriginal/Absent 证明该执行不再有
     // 活性持有；传输失败按未知处理。
-    let (authority, holder) = match state
+    let (authority, holder, receipt) = match state
         .runtime()
         .observe_unbound_builder_creation_authority(context)
         .await
     {
-        Ok(container_runtime_api::UnboundBuilderCreationAuthority::ExpiredOriginal { holder }) => {
-            ("expired_original", holder)
-        }
+        Ok(container_runtime_api::UnboundBuilderCreationAuthority::ExpiredOriginal {
+            holder,
+            receipt,
+        }) => ("expired_original", holder, Some(receipt)),
         Ok(container_runtime_api::UnboundBuilderCreationAuthority::Absent) => {
-            ("absent", String::new())
+            ("absent", String::new(), None)
         }
         Ok(container_runtime_api::UnboundBuilderCreationAuthority::ActiveOriginal) => {
             return Err(anyhow!("original creation authority is still active"));
@@ -160,6 +182,60 @@ async fn observe_stale_creation_evidence(
         }
         Err(error) => {
             return Err(anyhow!("authority observation failed: {error:#}"));
+        }
+    };
+    // Save the actual native identity BEFORE the terminal transaction. Docker
+    // creation refuses orphan markers, so cleanup is required for reuse, and
+    // it must remain discoverable after a crash between SQL and cleanup.
+    let existing = state
+        .userapp_store
+        .get_operation_lease(&context.app_id, &context.operation_id)
+        .await?;
+    if let Some(existing) = &existing {
+        if existing.context != *context
+            || receipt.as_ref().is_some_and(|receipt| {
+                !crate::userapp_builder::compute_drain_recovery::same_lease_identity(
+                    &existing.receipt,
+                    receipt,
+                )
+            })
+        {
+            return Err(anyhow!(
+                "persisted native authority differs from the observed original"
+            ));
+        }
+        // Keep the original cleanup receipt. K8s renewals change RV, not its
+        // UID/token authority, and must not make the next scan fail rebinding.
+    } else if let Some(receipt) = &receipt {
+        state
+            .userapp_store
+            .bind_operation_lease(context, receipt)
+            .await?;
+    }
+    let binding = state
+        .userapp_store
+        .get_operation_lease(&context.app_id, &context.operation_id)
+        .await?;
+    let retained = state
+        .runtime()
+        .prepare_compute_handoff(
+            context,
+            shared_types::UserAppOperationScope::Dev,
+            binding.as_ref().map(|binding| &binding.receipt),
+        )
+        .await?;
+    // Revalidate the native holder under physical exclusion. A renewal or a
+    // replacement between the first GET and here must not release the slot.
+    let guard = match retained {
+        container_runtime_api::ComputeHandoff::Acquired { guard, .. } => Some(guard),
+        container_runtime_api::ComputeHandoff::Vacant { .. } => None,
+        container_runtime_api::ComputeHandoff::Held => {
+            return Err(anyhow!("native holder became active before settlement"));
+        }
+        container_runtime_api::ComputeHandoff::Deferred(inspection) => {
+            return Err(anyhow!(
+                "native identity changed before settlement: {inspection:?}"
+            ));
         }
     };
     // 副作用确定性：同生命周期存活 builder（与围栏谓词同一观察），或后端
@@ -183,7 +259,7 @@ async fn observe_stale_creation_evidence(
             return Err(anyhow!("builder capture failed: {error:#}"));
         }
     };
-    Ok(serde_json::json!({
+    let evidence = serde_json::json!({
         "kind": "stale_running_authority_lost",
         "authority": {
             "state": authority,
@@ -191,5 +267,6 @@ async fn observe_stale_creation_evidence(
         },
         "builder": builder,
         "observed_at_us": chrono::Utc::now().timestamp_micros(),
-    }))
+    });
+    Ok(SettlementObservation { evidence, guard })
 }

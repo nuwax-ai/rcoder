@@ -117,7 +117,12 @@ fn retain(
         .take(4096)
         .read_to_string(&mut marker)
         .map_err(failed)?;
-    if !marker.is_empty() && marker != context.executor_id {
+    // Historical builder creation used an ordinary operation marker. Accept
+    // it only with its exact observed inode/token receipt; the retained FD
+    // excludes any writer until the durable settlement CAS has completed.
+    let bound_ordinary = marker == context.operation_id
+        && matches!(receipt, Some(UserAppOperationLeaseReceipt::Docker { token, .. }) if token == &marker);
+    if !marker.is_empty() && marker != context.executor_id && !bound_ordinary {
         shared_types::validate_identifier(&marker, "operation_id")
             .map_err(Error::ConfigurationError)?;
         return Ok(ComputeHandoff::deferred(
@@ -161,6 +166,55 @@ mod tests {
             executor_id: "executor".into(),
             request_fingerprint: "a".repeat(64),
         }
+    }
+
+    #[test]
+    fn stale_ordinary_builder_marker_is_retained_then_cleaned_before_next_acquire() {
+        let directory = tempfile::tempdir().unwrap();
+        let name = "builder-handoff.lock";
+        let path = directory.path().join(name);
+        let context = context();
+        let original = lock_builder_file_with_marker(
+            directory.path(),
+            name,
+            shared_types::AppFileMutationMarker::for_operation(&context.operation_id).unwrap(),
+        )
+        .unwrap();
+        use shared_types::AppOperationLease as _;
+        let receipt = original.receipt().unwrap();
+        drop(original); // Process exit leaves a dirty marker, not a held flock.
+        assert!(
+            lock_builder_file(directory.path(), name).is_err(),
+            "slot release alone does not recover Docker creation"
+        );
+        let ComputeHandoff::Acquired { guard, .. } = retain(
+            directory.path(),
+            name,
+            ServiceType::UserappBuilder,
+            &context,
+            Some(&receipt),
+        )
+        .unwrap() else {
+            panic!("the exact old ordinary marker must be retainable");
+        };
+        assert!(
+            open_inactive_file_receipt(&path, &receipt).is_err(),
+            "physical exclusion must remain held through the storage CAS"
+        );
+        drop(guard);
+        release_file_receipt(&path, &receipt).unwrap();
+        let next = lock_builder_file(directory.path(), name).unwrap();
+        let successor_receipt = next.receipt().unwrap();
+        drop(next);
+        // An old cleanup retry must not clear a successor's marker.
+        assert!(release_file_receipt(&path, &receipt).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            match successor_receipt {
+                UserAppOperationLeaseReceipt::Docker { token, .. } => token,
+                _ => unreachable!(),
+            }
+        );
     }
 
     #[test]

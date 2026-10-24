@@ -6,6 +6,7 @@ use shared_types::*;
 use std::time::Duration;
 
 mod previous_owner;
+pub(crate) use previous_owner::same_lease_identity;
 mod superseded;
 
 #[cfg(test)]

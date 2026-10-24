@@ -165,6 +165,7 @@ pub(crate) async fn settle_stale_running_builder(
         || op.kind != UserAppOperationKind::EnsureBuilder
         || op.state != UserAppOperationState::Running
         || op.executor_id.is_none()
+        || !userapp_builder_creation_needs_runtime_receipt(&op)
     {
         return Err(Error::VersionConflict);
     }
