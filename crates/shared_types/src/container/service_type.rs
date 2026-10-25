@@ -264,6 +264,52 @@ impl ServiceType {
     }
 }
 
+/// Resolve a runtime container name to its business identifier and service
+/// type from the deployment's configured prefixes (longest prefix first, so a
+/// legacy `rcoder` web prefix cannot steal `rcoder-app-*` or
+/// `rcoder-app-builder-*` names). Userapp 族前缀与创建侧同源（部署名硬编码
+/// [`ServiceType::container_prefix`]，不走镜像配置），同样参与最长前缀
+/// 匹配——`rcoder-app-builder-` 先于 `rcoder-app-` 命中。
+///
+/// 这是**名字反解兜底**（输入为裸容器名：SSE 会话注册名、存储记录名、
+/// 存量无标签容器的纳管识别）；拿到结构化身份字段的消费方优先读结构化
+/// 字段，勿走此路径。
+pub fn container_identity_from_name<'a>(
+    container_name: &'a str,
+    rcoder_prefix: &str,
+    computer_prefix: &str,
+) -> Option<(&'a str, ServiceType)> {
+    let mut candidates = vec![
+        (
+            computer_prefix.to_string(),
+            ServiceType::ComputerAgentRunner,
+        ),
+        (rcoder_prefix.to_string(), ServiceType::WebAgentRunner),
+        (
+            ServiceType::UserappBuilder.container_prefix().to_string(),
+            ServiceType::UserappBuilder,
+        ),
+        (
+            ServiceType::Userapp.container_prefix().to_string(),
+            ServiceType::Userapp,
+        ),
+    ];
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0.len()));
+    candidates.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+
+    for (prefix, service_type) in candidates {
+        if prefix.is_empty() {
+            continue;
+        }
+        let full_prefix = format!("{prefix}-");
+        if let Some(identifier) = container_name.strip_prefix(&full_prefix) {
+            return Some((identifier, service_type));
+        }
+    }
+
+    None
+}
+
 /// Service type validation error
 #[derive(Debug, Error)]
 pub enum ServiceTypeError {

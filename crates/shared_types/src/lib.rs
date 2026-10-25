@@ -25,7 +25,8 @@ pub use session_hint::SessionHint;
 pub use container::{
     AppRuntimeIpResolver, ContainerEntry, ContainerLookup, IdleContainerInfo, IsolationType,
     IsolationTypeError, MissingIdentifier, ProjectScope, ServiceType, ServiceTypeError,
-    StorageStats, get_enabled_service_types, get_supported_service_types,
+    StorageStats, container_identity_from_name, get_enabled_service_types,
+    get_supported_service_types,
 };
 
 // project/session/container 映射存储契约（内存与 PG 双后端统一接口）

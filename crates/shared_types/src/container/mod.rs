@@ -20,7 +20,7 @@ pub use entry::ContainerEntry;
 pub use isolation_type::{IsolationType, IsolationTypeError};
 pub use lookup::{AppRuntimeIpResolver, ContainerLookup, ProjectScope};
 pub use service_type::{
-    MissingIdentifier, ServiceType, ServiceTypeError, get_enabled_service_types,
-    get_supported_service_types,
+    MissingIdentifier, ServiceType, ServiceTypeError, container_identity_from_name,
+    get_enabled_service_types, get_supported_service_types,
 };
 pub use storage_stats::{IdleContainerInfo, StorageStats};

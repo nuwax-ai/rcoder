@@ -6,7 +6,6 @@ use crate::AppError;
 use shared_types::GRPC_DEFAULT_PORT;
 use shared_types::ServiceType;
 use shared_types::error_codes::ERR_GRPC_ADDR_ERROR;
-use std::cmp::Reverse;
 
 /// 从 service_url 提取 gRPC 地址（使用指定端口）
 ///
@@ -54,48 +53,15 @@ pub fn extract_grpc_addr(service_url: &str) -> Result<String, AppError> {
 
 /// Resolve a runtime container/pod name to its business identifier and service type.
 ///
-/// The configured prefix is the source of truth. Keep the longest configured
-/// prefix first so a prefix like `rcoder` does not steal
-/// `rcoder-computer-agent-runner-*` names. Userapp 族前缀与创建侧同源
-/// （部署名/STS 名硬编码 `container_prefix()`，不走镜像配置），同样参与
-/// 最长前缀匹配——`rcoder-app-builder-` 先于 `rcoder-app-` 命中。
-/// 此函数是**名字反解兜底**（输入为裸容器名的场景：SSE 会话注册名、
-/// 存储记录名）；拿到 `RuntimeContainerInfo` 的消费方优先读结构化身份
-/// 字段，勿走此路径。
+/// 权威实现在 [`shared_types::container_identity_from_name`]（跨 crate 单一
+/// 事实源：SSE 会话注册名、存储记录名、存量无标签容器的纳管识别共用）；
+/// 本包装保留引擎侧调用点不变。
 pub fn container_identity_from_name<'a>(
     container_name: &'a str,
     rcoder_prefix: &str,
     computer_prefix: &str,
 ) -> Option<(&'a str, ServiceType)> {
-    let mut candidates = vec![
-        (
-            computer_prefix.to_string(),
-            ServiceType::ComputerAgentRunner,
-        ),
-        (rcoder_prefix.to_string(), ServiceType::WebAgentRunner),
-        (
-            ServiceType::UserappBuilder.container_prefix().to_string(),
-            ServiceType::UserappBuilder,
-        ),
-        (
-            ServiceType::Userapp.container_prefix().to_string(),
-            ServiceType::Userapp,
-        ),
-    ];
-    candidates.sort_by_key(|candidate| Reverse(candidate.0.len()));
-    candidates.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
-
-    for (prefix, service_type) in candidates {
-        if prefix.is_empty() {
-            continue;
-        }
-        let full_prefix = format!("{}-", prefix);
-        if let Some(identifier) = container_name.strip_prefix(&full_prefix) {
-            return Some((identifier, service_type));
-        }
-    }
-
-    None
+    shared_types::container_identity_from_name(container_name, rcoder_prefix, computer_prefix)
 }
 
 /// 从 Docker API 实时获取容器 IP
