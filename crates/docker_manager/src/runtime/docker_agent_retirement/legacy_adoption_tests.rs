@@ -383,3 +383,122 @@ async fn labeled_retirement_keeps_label_verification() {
     assert_eq!(delete_count(&recorded, "DELETE "), 0, "拒绝时零删除");
     server.abort();
 }
+
+/// 部分身份标签也属于归属证据，不能被名字兜底覆盖。
+#[tokio::test]
+async fn legacy_conflicting_partial_labels_are_never_adopted_or_deleted() {
+    for labels in [
+        serde_json::json!({"identifier": "foreign"}),
+        serde_json::json!({"service-type": "computer-agent-runner"}),
+        serde_json::json!({"service-type": "invalid"}),
+        serde_json::json!({"managed-by": "foreign-controller"}),
+    ] {
+        let mut inspected = running_inspect("partial-cid", "rcoder-42", "2026-10-01T00:00:00Z");
+        inspected["Config"]["Labels"] = labels.clone();
+        let (runtime, recorded, server) = legacy_runtime(
+            FakeDocker {
+                label_list: serde_json::json!([]),
+                name_list: serde_json::json!([{
+                    "Id": "partial-cid", "Names": ["/rcoder-42"], "Created": 1,
+                    "Labels": labels
+                }]),
+                inspects: inspects_of(vec![("partial-cid".into(), inspected)]),
+                requests: requests_recorder(),
+            },
+            Some("rcoder"),
+        )
+        .await;
+        let inventory = runtime.docker_agent_inventory().await.unwrap();
+        assert!(
+            inventory.is_empty(),
+            "conflicting partial labels must not be adopted: {labels}"
+        );
+        // 直接传入历史快照也必须复核，不能仅依赖发现层。
+        let snapshot = AgentStopSnapshot {
+            app_id_hint: None,
+            namespace: Some(runtime.agent_retirement_namespace()),
+            identifier: "42".into(),
+            service_type: ServiceType::WebAgentRunner,
+            controller: None,
+            pods: vec![],
+            container: Some(AgentResourceIdentity {
+                kind: AgentResourceKind::Container,
+                name: "rcoder-42".into(),
+                uid: "partial-cid".into(),
+                resource_version: Some("2026-10-01T00:00:00Z".into()),
+                created_at: None,
+                owner_uid: None,
+            }),
+            services: vec![],
+            replicas: None,
+            endpoint: None,
+            compute_data_protection: None,
+        };
+        assert!(
+            AgentContainerRuntime::stop_captured_agent(&runtime, &snapshot)
+                .await
+                .is_err()
+        );
+        assert_eq!(delete_count(&recorded, "DELETE "), 0);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn legacy_ambiguous_web_and_userapp_prefix_is_not_adopted() {
+    let (runtime, _, server) = legacy_runtime(FakeDocker {
+        label_list: serde_json::json!([]),
+        name_list: serde_json::json!([{"Id":"ambiguous-cid", "Names":["/rcoder-app-42"], "Created":1}]),
+        inspects: inspects_of(vec![("ambiguous-cid".into(), running_inspect("ambiguous-cid", "rcoder-app-42", "2026-10-01T00:00:00Z"))]),
+        requests: requests_recorder(),
+    }, Some("rcoder-app")).await;
+    assert!(
+        runtime.docker_agent_inventory().await.unwrap().is_empty(),
+        "a name cannot resolve conflicting service families"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn legacy_inspect_labels_are_authoritative_and_matching_partial_labels_work() {
+    for (listed, observed, accepted) in [
+        (
+            serde_json::json!({}),
+            serde_json::json!({"identifier":"foreign"}),
+            false,
+        ),
+        (
+            serde_json::json!({"identifier":"42"}),
+            serde_json::json!({"identifier":"42"}),
+            true,
+        ),
+        (
+            serde_json::json!({"service-type":"web-agent-runner"}),
+            serde_json::json!({"service-type":"web-agent-runner"}),
+            true,
+        ),
+    ] {
+        let mut inspected = running_inspect("partial-cid", "rcoder-42", "2026-10-01T00:00:00Z");
+        inspected["Config"]["Labels"] = observed;
+        let (runtime, recorded, server) = legacy_runtime(FakeDocker {
+            label_list: serde_json::json!([]),
+            name_list: serde_json::json!([{"Id":"partial-cid", "Names":["/rcoder-42"], "Created":1, "Labels":listed}]),
+            inspects: inspects_of(vec![("partial-cid".into(), inspected)]),
+            requests: requests_recorder(),
+        }, Some("rcoder")).await;
+        let mut inventory = runtime.docker_agent_inventory().await.unwrap();
+        assert_eq!(inventory.len(), usize::from(accepted));
+        if accepted {
+            assert_eq!(
+                AgentContainerRuntime::stop_captured_agent(&runtime, &inventory.remove(0))
+                    .await
+                    .unwrap(),
+                AgentStopOutcome::Complete
+            );
+            assert_eq!(delete_count(&recorded, "DELETE /containers/partial-cid"), 1);
+        } else {
+            assert_eq!(delete_count(&recorded, "DELETE "), 0);
+        }
+        server.abort();
+    }
+}

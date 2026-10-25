@@ -297,17 +297,30 @@ pub fn container_identity_from_name<'a>(
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0.len()));
     candidates.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
 
+    let mut resolved = None;
     for (prefix, service_type) in candidates {
         if prefix.is_empty() {
             continue;
         }
         let full_prefix = format!("{prefix}-");
         if let Some(identifier) = container_name.strip_prefix(&full_prefix) {
-            return Some((identifier, service_type));
+            if identifier.is_empty() {
+                return None;
+            }
+            match resolved {
+                None => resolved = Some((identifier, service_type)),
+                Some((previous, family)) => {
+                    // Equal longest prefixes with different families are ambiguous.
+                    // Never let configuration order authorize another family's resource.
+                    if previous.len() == identifier.len() && family != service_type {
+                        return None;
+                    }
+                }
+            }
         }
     }
 
-    None
+    resolved
 }
 
 /// Service type validation error
@@ -725,5 +738,34 @@ mod tests {
         ServiceType::ComputerAgentRunner.hash(&mut hasher2);
 
         assert_ne!(hasher1.finish(), hasher2.finish());
+    }
+}
+
+#[cfg(test)]
+mod identity_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn ambiguous_longest_prefix_cannot_choose_a_service_family() {
+        for (name, web, computer) in [
+            ("rcoder-app-42", "rcoder-app", "computer"),
+            ("rcoder-app-builder-42", "rcoder-app-builder", "computer"),
+            ("shared-42", "shared", "shared"),
+        ] {
+            assert_eq!(container_identity_from_name(name, web, computer), None);
+        }
+        assert_eq!(
+            container_identity_from_name("web-", "web", "computer"),
+            None
+        );
+        // Only equally long matches are ambiguous; normal overlap remains valid.
+        assert_eq!(
+            container_identity_from_name("rcoder-app-builder-42", "rcoder", "computer"),
+            Some(("42", ServiceType::UserappBuilder))
+        );
+        assert_eq!(
+            container_identity_from_name("web-42", "web", "computer"),
+            Some(("42", ServiceType::WebAgentRunner))
+        );
     }
 }

@@ -94,6 +94,43 @@ impl DockerRuntime {
             .to_string()
     }
 
+    /// 名字兜底不能覆盖已有的归属证据；三个入口共用同一守卫。
+    fn legacy_web_agent_identifier<'a>(
+        &self,
+        name: &'a str,
+        labels: Option<&HashMap<String, String>>,
+    ) -> Option<&'a str> {
+        let web_prefix = self.configured_web_agent_prefix();
+        if web_prefix.is_empty() {
+            return None;
+        }
+        let identifier = name.strip_prefix(&format!("{web_prefix}-"))?;
+        if crate::utils::DockerUtils::generate_container_name(&web_prefix, identifier)
+            != Ok(name.to_string())
+            || shared_types::container_identity_from_name(
+                name,
+                &web_prefix,
+                &self.configured_computer_agent_prefix(),
+            ) != Some((identifier, ServiceType::WebAgentRunner))
+        {
+            return None;
+        }
+        if labels.is_some_and(|labels| {
+            labels.get("identifier").is_some_and(|id| id != identifier)
+                || labels.get("service-type").is_some_and(|value| {
+                    value.parse::<ServiceType>().ok() != Some(ServiceType::WebAgentRunner)
+                })
+                || labels.contains_key("managed-by")
+                || labels.contains_key(shared_types::USERAPP_DOCKER_APP_ID_LABEL)
+                || shared_types::USERAPP_RESOURCE_IDENTITY_KEYS
+                    .iter()
+                    .any(|key| labels.contains_key(*key))
+        }) {
+            return None;
+        }
+        Some(identifier)
+    }
+
     /// 名字反解纳管存量无标签 Web agent 容器（Docker 模式专属路径）。
     ///
     /// 守卫：名字在配置 Web 前缀下**精确回构**、最长前缀反解族 == Web（防
@@ -107,7 +144,6 @@ impl DockerRuntime {
         if web_prefix.is_empty() {
             return Ok(());
         }
-        let computer_prefix = self.configured_computer_agent_prefix();
         let legacy = self
             .inner
             .get_docker_client()
@@ -147,24 +183,12 @@ impl DockerRuntime {
             else {
                 continue;
             };
-            // 精确回构：名字必须由配置前缀 + 合法 identifier 生成（复用
-            // 生产校验器，拒绝残留结构与外来命名）。
-            let Some(identifier) = name.strip_prefix(&format!("{web_prefix}-")) else {
+            // 名字精确回构、族解析及已有标签必须一致。
+            let Some(identifier) =
+                self.legacy_web_agent_identifier(name, container.labels.as_ref())
+            else {
                 continue;
             };
-            if identifier.is_empty()
-                || crate::utils::DockerUtils::generate_container_name(&web_prefix, identifier)
-                    != Ok(name.to_string())
-            {
-                continue;
-            }
-            // 最长前缀反解必须落在 Web 族（legacy `rcoder` 前缀下，
-            // `rcoder-app-*`/`rcoder-app-builder-*` 反解为 Userapp/Builder）。
-            if shared_types::container_identity_from_name(name, &web_prefix, &computer_prefix)
-                != Some((identifier, ServiceType::WebAgentRunner))
-            {
-                continue;
-            }
             // 有管理双标签者属标签路径域（列表过滤按键存在不校验值；
             // 值错乱由标签路径的 Conflict 语义处置）。
             if container.labels.as_ref().is_some_and(|labels| {
@@ -302,11 +326,12 @@ impl DockerRuntime {
             ));
         }
         if legacy {
-            if inspected
-                .name
-                .as_deref()
-                .map(|value| value.trim_start_matches('/'))
-                != Some(name.as_str())
+            if self.legacy_web_agent_identifier(&name, observed_labels) != Some(identifier.as_str())
+                || inspected
+                    .name
+                    .as_deref()
+                    .map(|value| value.trim_start_matches('/'))
+                    != Some(name.as_str())
             {
                 debug!(uid = %uid, name = %name,
                     "Legacy Agent candidate was renamed during inventory; skipping this round");
@@ -496,14 +521,10 @@ impl DockerRuntime {
                     .as_deref()
                     .map(|value| value.trim_start_matches('/'))
                     .unwrap_or_default();
-                let web_prefix = self.configured_web_agent_prefix();
-                let computer_prefix = self.configured_computer_agent_prefix();
-                if observed_name != target.name
-                    || shared_types::container_identity_from_name(
-                        observed_name,
-                        &web_prefix,
-                        &computer_prefix,
-                    ) != Some((snapshot.identifier.as_str(), snapshot.service_type))
+                if snapshot.service_type != ServiceType::WebAgentRunner
+                    || observed_name != target.name
+                    || self.legacy_web_agent_identifier(observed_name, labels)
+                        != Some(snapshot.identifier.as_str())
                 {
                     return Err(Error::Conflict(
                         "Captured legacy Agent ownership changed".into(),
