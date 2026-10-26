@@ -252,9 +252,13 @@ pub(super) async fn discover_pending(
             );
             continue;
         }
-        // Total-deadline settlement runs before every work-dispatching branch:
-        // an expired operation receives no further continuation work, and the
-        // settlement itself re-verifies expiry and lease liveness durably.
+        // Total-deadline settlement is dispatched as a CONCURRENT observer,
+        // never an exclusive scheduler: a record whose lease is still renewed
+        // (a takeover continuation mid-flight, or an executor that legitimately
+        // outran the budget) keeps receiving its normal recovery branches below,
+        // while the settlement itself defers until the lease provably stops
+        // renewing. Any CAS race between the two resolves by revision — the
+        // settlement maps its loss to a benign deferral.
         if matches!(
             record.state,
             shared_types::ComputeControlState::Running
@@ -263,13 +267,14 @@ pub(super) async fn discover_pending(
             .await
         {
             let state = state.clone();
+            let settled = record.clone();
             tasks.push(
                 format!("compute-deadline:{}", record.operation_id),
                 async move {
                     tokio::time::timeout(
                         Duration::from_secs(30),
                         crate::userapp_builder::compute_control::settle_expired_compute_control(
-                            &state, &record,
+                            &state, &settled,
                         ),
                     )
                     .await
@@ -277,7 +282,6 @@ pub(super) async fn discover_pending(
                     Ok(())
                 },
             );
-            continue;
         }
         if crate::userapp_builder::compute_control::can_recover_original_docker_stop(&record) {
             let flight = state.userapp_op_flight.guard()?;

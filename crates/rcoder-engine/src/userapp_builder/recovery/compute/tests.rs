@@ -284,3 +284,119 @@ async fn early_recovery_retains_held_foreign_and_unobserved_receipts_then_retrie
 }
 
 mod restart_stop_tests;
+
+/// 修复前反例（F2 自查发现的饥饿缺陷）：扫描的 deadline 结算分支曾以
+/// `continue` 独占调度——deadline 已过但租约仍被续期（执行者合法超预算或
+/// 接管续接中）的记录，其 compute-complete 等工作分支被永久跳过，本可
+/// Succeeded 的记录最终只能被 Failed 收口。修复后结算作为并发观察者与
+/// 工作分支并存：本用例断言两个任务同时派发且记录经完成分支 Succeeded。
+#[tokio::test]
+async fn expired_deadline_with_held_lease_still_dispatches_completion_branches() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+            &dir.path().join("deadline-scan.db"),
+        )
+        .await
+        .unwrap(),
+    );
+    let runtime = Arc::new(FenceRuntime::default());
+    // Held: the physical lease is still renewed, so the settlement defers.
+    *runtime.receipt_verdict.lock().unwrap() = ReceiptVerdict::Held;
+    let state = runtime_state(runtime.clone(), store.clone(), None).await;
+    let app = state
+        .userapp_store
+        .ensure_identity("deadlineheld")
+        .await
+        .unwrap();
+    let pending = state
+        .userapp_store
+        .admit_compute_control(&ComputeControlRequest {
+            builder_startup_mode: Default::default(),
+            app_id: "deadlineheld".into(),
+            lifecycle_id: app.lifecycle_id,
+            scope: UserAppOperationScope::Dev,
+            request_id: "requestdeadlineheld".into(),
+            request_fingerprint: "a".repeat(64),
+            operation_id: "restartdeadlineheld".into(),
+            action: ComputeControlAction::Restart,
+            restart_image_roll: false,
+        })
+        .await
+        .unwrap();
+    let identity = ComputeExecutorIdentity {
+        app_id: "deadlineheld".into(),
+        lifecycle_id: pending.lifecycle_id.clone(),
+        scope: pending.scope,
+        operation_id: pending.operation_id.clone(),
+        generation: pending.generation,
+        executor_id: "stuckexecutor".into(),
+    };
+    state
+        .userapp_store
+        .claim_compute_control(&identity, pending.revision)
+        .await
+        .unwrap();
+    let lease = UserAppOperationLeaseReceipt::Kubernetes {
+        service_type: ServiceType::UserappBuilder,
+        namespace: "rcoder-builder".into(),
+        name: "rcoder-app-builder-deadlineheld".into(),
+        uid: "b".repeat(36),
+        resource_version: "3".into(),
+        token: identity.executor_id.clone(),
+    };
+    let mut record = state
+        .userapp_store
+        .bind_compute_lease(&identity, &lease)
+        .await
+        .unwrap();
+    for stage in [
+        ComputeControlStage::Stopping,
+        ComputeControlStage::Stopped,
+        ComputeControlStage::Starting,
+        ComputeControlStage::Verifying,
+    ] {
+        record = state
+            .userapp_store
+            .advance_compute_control(&ComputeControlProgress {
+                identity: identity.clone(),
+                expected_revision: record.revision,
+                state: ComputeControlState::Running,
+                stage,
+                checkpoint: serde_json::json!({"witness": true}),
+                error_code: None,
+                error_message: None,
+            })
+            .await
+            .unwrap();
+    }
+    // The operation's total deadline has long expired while its lease is held.
+    state
+        .userapp_store
+        .bind_compute_control_deadline(&record, chrono::Utc::now().timestamp_millis() - 1)
+        .await
+        .unwrap();
+    let mut tasks = RecoveryTasks::default();
+    discover_pending(&state, &mut tasks, &mut None)
+        .await
+        .unwrap();
+    assert_eq!(
+        tasks.active.len(),
+        2,
+        "the settlement observer and the completion branch must both be dispatched"
+    );
+    while let Some((_, result)) = tasks.next().await {
+        result.unwrap();
+    }
+    let current = store
+        .get_compute_control(&record.app_id, &record.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        current.state,
+        ComputeControlState::Succeeded,
+        "the held-lease record completes through its normal branch, never starved into failure"
+    );
+    store.shutdown().await.unwrap();
+}

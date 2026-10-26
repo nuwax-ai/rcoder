@@ -238,6 +238,12 @@ pub(super) async fn read_deadline(
 /// unexpired row never settles), and the terminal CAS keeps the last durable
 /// stage, checkpoint, lease and executor so the failure stays diagnosable and
 /// the terminal lease-cleanup scan still owns the physical receipt.
+///
+/// Deliberately NOT compute::current: settlement is the last-resort unblock,
+/// so it must not inherit continuation preconditions (the intent head still
+/// pointing at this control, an active application, a present executor). A
+/// record whose head drifted or whose app went inactive is exactly the
+/// permanently-fenced shape the deadline exists to settle.
 pub(super) async fn expire(
     tx: &mut dyn Executor,
     backend: Backend,
@@ -247,18 +253,10 @@ pub(super) async fn expire(
 ) -> Result<ComputeControlRecord, UserAppStoreError> {
     use crate::db::models;
     repo::claim_app(tx, backend, &snapshot.app_id).await?;
-    let identity = ComputeExecutorIdentity {
-        app_id: snapshot.app_id.clone(),
-        lifecycle_id: snapshot.lifecycle_id.clone(),
-        scope: snapshot.scope,
-        operation_id: snapshot.operation_id.clone(),
-        generation: snapshot.generation,
-        executor_id: snapshot
-            .executor_id
-            .clone()
-            .ok_or(UserAppStoreError::VersionConflict)?,
-    };
-    if compute::current(tx, &identity).await? != *snapshot {
+    let actual = compute::get(tx, &snapshot.app_id, &snapshot.operation_id)
+        .await?
+        .ok_or(UserAppStoreError::NotFound)?;
+    if actual != *snapshot || actual.state.is_terminal() {
         return Err(UserAppStoreError::VersionConflict);
     }
     let expired = models::ComputeControlDeadline::filter_by_operation_id(&snapshot.operation_id)

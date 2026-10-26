@@ -2089,7 +2089,9 @@ pub(crate) async fn settle_expired_compute_control(
             .await
         {
             Ok(true) => {
-                tracing::warn!(
+                // Repeats every scan while the holder keeps renewing; debug
+                // keeps the cadence from becoming log noise.
+                tracing::debug!(
                     operation_id = %current.operation_id,
                     app_id = %current.app_id,
                     "Compute control exceeded its deadline but its lease is still renewed; deferring settlement"
@@ -2098,7 +2100,7 @@ pub(crate) async fn settle_expired_compute_control(
             }
             Ok(false) => {}
             Err(error) => {
-                tracing::warn!(
+                tracing::debug!(
                     %error,
                     operation_id = %current.operation_id,
                     app_id = %current.app_id,
