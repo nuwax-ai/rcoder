@@ -167,12 +167,6 @@ pub struct CleanupConfigSettings {
     /// 日志清理配置
     #[serde(default)]
     pub log_cleanup: LogCleanupConfig,
-    /// 运维核对的一次性精确 CID 准入清单：存量无标签容器（旧 agent 不具备
-    /// `idle_observation_version>=1` 的活动真源）经人工核对后，可按完整容器
-    /// ID 准入闲置观察。回收仍走完整裁决（未登记/双轮探活闲置/观察窗口/
-    /// 数据保护/独占复核）；CID 变更（同名重建）即失效，不是删除白名单。
-    #[serde(default)]
-    pub legacy_cid_admission: Vec<String>,
 }
 
 fn default_orphan_scan_budget_seconds() -> u64 {
@@ -215,7 +209,6 @@ impl Default for CleanupConfigSettings {
             container_protection_seconds: default_container_protection_seconds(),
             long_idle_timeout_seconds: default_long_idle_timeout_seconds(),
             log_cleanup: LogCleanupConfig::default(),
-            legacy_cid_admission: Vec::new(),
         }
     }
 }

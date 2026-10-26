@@ -104,9 +104,6 @@ trait ContainerActivityProbe: Send + Sync {
 /// nor keep a container alive by observing it.
 struct GrpcContainerActivityProbe {
     pool: Arc<crate::grpc::GrpcChannelPool>,
-    /// 运维核对准入的精确 CID：仅豁免新证据版本要求（旧 agent 无法自证
-    /// 活动真源）；探活、未登记、数据保护、观察窗口与独占复核不变。
-    legacy_cid_admission: std::collections::HashSet<String>,
 }
 
 #[async_trait::async_trait]
@@ -136,14 +133,15 @@ impl ContainerActivityProbe for GrpcContainerActivityProbe {
         )
         .await
         .context("Container activity deadline exceeded")??;
-        let admitted = snapshot
-            .container
-            .as_ref()
-            .is_some_and(|container| self.legacy_cid_admission.contains(&container.uid));
-        ensure!(
-            status.idle_observation_version >= 1 || admitted,
-            "Agent lacks preview/pending activity evidence; upgrade agent before automatic orphan retirement or admit its exact CID after operator review"
-        );
+        // 旧 agent（证据版本 0）按产品决策与新 agent 同等自动回收：单节点
+        // Docker 部署中用户流量均经主服务中转，观察窗内无活动即可判闲置，
+        // 误回收由按需重建兜底。版本号不再作为拦截条件。
+        if status.idle_observation_version == 0 {
+            debug!(
+                identifier,
+                "Legacy agent activity evidence (idle_observation_version=0); auto-reclaim accepts is_active/active_tasks"
+            );
+        }
         let active = crate::grpc::status_query::is_agent_active(&status);
         if active {
             Ok(Activity::Busy)
@@ -578,12 +576,6 @@ pub(crate) fn start(
         };
         let activity_probe = Arc::new(GrpcContainerActivityProbe {
             pool: state.grpc_pool.clone(),
-            legacy_cid_admission: config
-                .legacy_cid_admission
-                .iter()
-                .filter(|cid| !cid.is_empty())
-                .cloned()
-                .collect(),
         });
         let mut scanner = Scanner {
             state,
