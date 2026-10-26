@@ -50,11 +50,11 @@ pub(super) struct ExpireAnchorProbe {
     resume: tokio::sync::Notify,
 }
 impl ExpireAnchorProbe {
-    #[cfg(all(feature = "pg", feature = "userapp-turso"))]
+    #[cfg(feature = "pg")]
     pub(super) async fn reached(&self) {
         self.reached.notified().await;
     }
-    #[cfg(all(feature = "pg", feature = "userapp-turso"))]
+    #[cfg(feature = "pg")]
     pub(super) fn release(&self) {
         self.resume.notify_one();
     }
@@ -62,14 +62,14 @@ impl ExpireAnchorProbe {
 tokio::task_local! {
     static EXPIRE_ANCHOR_PROBE: std::sync::Arc<ExpireAnchorProbe>;
 }
-#[cfg(all(feature = "pg", feature = "userapp-turso"))]
+#[cfg(feature = "pg")]
 pub(super) async fn with_expire_anchor_probe<F: Future>(
     probe: std::sync::Arc<ExpireAnchorProbe>,
     future: F,
 ) -> F::Output {
     EXPIRE_ANCHOR_PROBE.scope(probe, future).await
 }
-#[cfg(all(feature = "pg", feature = "userapp-turso"))]
+#[cfg(feature = "pg")]
 pub(super) async fn after_expire_anchor_lock() {
     let probe = EXPIRE_ANCHOR_PROBE.try_with(Clone::clone).ok();
     if let Some(probe) = probe {

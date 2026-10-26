@@ -292,7 +292,7 @@ pub(super) async fn expire(
     if verified != 1 {
         return Err(UserAppStoreError::VersionConflict);
     }
-    #[cfg(all(test, feature = "pg", feature = "userapp-turso"))]
+    #[cfg(all(test, feature = "pg"))]
     {
         super::transaction_fault_tests::after_expire_anchor_lock().await;
     }
