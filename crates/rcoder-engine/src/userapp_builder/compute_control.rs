@@ -2280,26 +2280,14 @@ async fn settlement_surface_note(
                             false
                         }
                     };
-                    let running = if receipt_running {
-                        true
-                    } else {
-                        match state
-                            .runtime()
-                            .observe_builder_compute_running(&target)
-                            .await
-                        {
-                            Ok(running) => running,
-                            Err(error) => {
-                                tracing::debug!(
-                                    %error,
-                                    operation_id = %current.operation_id,
-                                    "Deadline settlement running-observation failed; continuing classification"
-                                );
-                                false
-                            }
-                        }
-                    };
-                    if running {
+                    // Only RECEIPT-CONFIRMED readiness short-circuits to the
+                    // completion branch. The receipt-free running observation
+                    // (desired replicas + owned pod) deliberately does NOT
+                    // gate the start side: a Pending or CrashLooping pod
+                    // observes as running there, and letting it defer would
+                    // re-block the committed-but-never-ready shape the
+                    // deadline exists to settle.
+                    if receipt_running {
                         tracing::debug!(
                             operation_id = %current.operation_id,
                             "Deadline-expired restart is running; preferring normal completion over settlement"

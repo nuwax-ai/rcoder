@@ -2019,6 +2019,9 @@ async fn running_observation_requires_live_replicas_on_the_captured_controller()
                 "running" => {}
                 "zero-replicas" => state.sts["spec"]["replicas"] = 0.into(),
                 "absent-controller" => state.sts = serde_json::Value::Null,
+                // Desired replicas without execution (owned Pod): not
+                // positive running evidence.
+                "desired-without-owned-pod" => state.pod = serde_json::Value::Null,
                 "scaled-down-during-observation" => {
                     state.zero_replicas_on_second_sts_read = true;
                 }

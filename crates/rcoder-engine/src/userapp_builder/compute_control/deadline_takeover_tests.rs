@@ -689,4 +689,81 @@ async fn settled_running_residue_hands_off_to_the_next_admission() {
         .await
         .unwrap();
     assert_eq!(admitted.state, ComputeControlState::Pending);
+    // The handoff is physical, not administrative: the successor EXECUTES to
+    // a terminal state against the same world, its capture-fresh stop phase
+    // owning whatever residue the settled predecessor left.
+    let successor = admitted.clone();
+    execute_pending(&state, admitted).await.unwrap();
+    let finished = state
+        .userapp_store
+        .get_compute_control(&successor.app_id, &successor.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        finished.state,
+        ComputeControlState::Succeeded,
+        "the successor control executes to completion after the settlement"
+    );
+}
+
+/// Codex round-5 issue 1 regression: the receipt-free running observation
+/// (desired replicas + owned pod — a Pending or CrashLooping shape) must NOT
+/// gate the start side; only receipt-confirmed readiness defers to the
+/// completion branch. Otherwise the committed-but-never-ready form (app81)
+/// would be re-blocked forever.
+#[tokio::test]
+async fn never_ready_start_surface_is_not_blocked_by_running_observation() {
+    let (state, runtime) = test_state().await;
+    *runtime.receipt_verdict.lock().unwrap() = ReceiptVerdict::NotHeld;
+    // Desired replicas with an owned pod that never becomes ready.
+    runtime
+        .builder_running_observed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    // The start is committed and can only be observed (the app81 evidence).
+    runtime
+        .builder_retry_committed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let record = stalled_restart_at_stages(
+        &state,
+        "neverready",
+        &[
+            ComputeControlStage::Stopping,
+            ComputeControlStage::Stopped,
+            ComputeControlStage::Starting,
+        ],
+    )
+    .await;
+    state
+        .userapp_store
+        .bind_compute_control_deadline(&record, chrono::Utc::now().timestamp_millis() - 1)
+        .await
+        .unwrap();
+    state
+        .userapp_store
+        .mark_compute_control_unheld(
+            &record,
+            chrono::Utc::now().timestamp_millis() - COMPUTE_SETTLEMENT_QUIET_MS - 1,
+        )
+        .await
+        .unwrap();
+    settle_expired_compute_control(&state, &record)
+        .await
+        .unwrap();
+    let settled = state
+        .userapp_store
+        .get_compute_control(&record.app_id, &record.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        settled.state,
+        ComputeControlState::Failed,
+        "a never-ready committed start settles instead of being deferred forever"
+    );
+    let message = settled.error_message.unwrap();
+    assert!(
+        message.contains("committed but never reached readiness"),
+        "{message}"
+    );
 }
