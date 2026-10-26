@@ -9,6 +9,7 @@ use tonic::{Request, Response, Status};
 struct Agent {
     version: u32,
     active: bool,
+    tasks: i32,
 }
 #[tonic::async_trait]
 impl AgentService for Agent {
@@ -22,6 +23,7 @@ impl AgentService for Agent {
         Ok(Response::new(grpc::GetContainerStatusResponse {
             idle_observation_version: self.version,
             is_active: self.active,
+            active_tasks: self.tasks,
             ..Default::default()
         }))
     }
@@ -72,21 +74,30 @@ impl AgentService for Agent {
 /// 产品决策（2026-10-26）：旧 agent（证据版本 0）与新 agent 同等参与自动
 /// 回收——判定只依赖探活返回的 is_active/active_tasks。修复前 version=0
 /// 一律返回 Err，存量旧容器即使长期闲置也永不回收。
+/// is_active=false 且 active_tasks>0 的组合覆盖 OR 判定的任务数分支
+/// （旧 agent 的终端/VNC 计数、新 agent 的 Pending/Terminating 计数都
+/// 只体现在 active_tasks 上）。
 #[cfg(feature = "userapp-turso")]
 #[tokio::test]
 async fn activity_probe_accepts_legacy_activity_reports() {
     use tokio_stream::wrappers::TcpListenerStream;
-    for (version, active, expect) in [
-        (0, false, "idle"),
-        (0, true, "busy"),
-        (1, false, "idle"),
-        (1, true, "busy"),
+    for (version, active, tasks, expect) in [
+        (0, false, 0, "idle"),
+        (0, true, 0, "busy"),
+        (0, false, 2, "busy"),
+        (1, false, 0, "idle"),
+        (1, true, 0, "busy"),
+        (1, false, 2, "busy"),
     ] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(AgentServiceServer::new(Agent { version, active }))
+                .add_service(AgentServiceServer::new(Agent {
+                    version,
+                    active,
+                    tasks,
+                }))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
         let (scanner, _, _, _directory) = super::fixture().await;

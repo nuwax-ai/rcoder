@@ -181,6 +181,18 @@ fn configuration_defaults_to_reclaim_and_rejects_unknown_modes() {
     );
 }
 
+/// 2026-10-26 移除的准入键在已部署配置中可能残留；serde 必须忽略未知键
+/// 而不是拒绝整份配置，否则升级后清理任务直接失效。
+#[test]
+fn configuration_ignores_removed_legacy_cid_admission_key() {
+    let config: CleanupConfigSettings = serde_json::from_value(serde_json::json!({
+        "legacy_cid_admission": ["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]
+    }))
+    .unwrap();
+    assert_eq!(config.orphan_reconcile_mode, OrphanReconcileMode::Reclaim);
+    assert_eq!(config.cleanup_interval_seconds, 300);
+}
+
 struct Runtime {
     snapshot: Mutex<AgentStopSnapshot>,
     extra_snapshots: Mutex<Vec<AgentStopSnapshot>>,
