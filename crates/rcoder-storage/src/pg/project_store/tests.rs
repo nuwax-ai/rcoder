@@ -1166,11 +1166,76 @@ async fn user_lookup_miss_recovers_through_pg_read_through() {
     );
 
     // 回源：活跃行 hydrate + 孤儿行不遮蔽 → 重试命中活跃容器。
-    reader.refresh_user_container(&user_id).await.unwrap();
+    reader
+        .refresh_user_container(&user_id, &shared_types::ServiceType::ComputerAgentRunner)
+        .await
+        .unwrap();
     let found = reader.find_by_user_id(&user_id, &shared_types::ServiceType::ComputerAgentRunner);
     assert_eq!(
         found.as_deref(),
         Some("10.42.0.9"),
         "the read-through resolves the user's live container past orphan rows"
+    );
+}
+
+/// Codex 复审反例（P1）：候选查询不筛容器族时，同 user 的八个**更新的其他族**
+/// 行会占满 LIMIT，Computer 行进不了候选集——回源"成功"却只恢复别的族，
+/// VNC 查找仍 miss。修复后按族筛选，其他族行再多也不挤占候选。
+#[tokio::test]
+async fn user_refresh_candidates_are_scoped_to_the_requested_family() {
+    let Some(dsn) = test_dsn().await else {
+        eprintln!("[skip] {DSN_ENV} not set");
+        return;
+    };
+    let id = format!("family-refresh-{}", uuid_suffix());
+    let user_id = format!("user-{id}");
+
+    let writer = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .unwrap();
+    // 一个 Computer 活跃行（目标）。
+    let mut computer = ProjectAndContainerInfo::new(id.clone());
+    computer.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+    computer.set_user_id(Some(user_id.clone()));
+    computer.set_container(Some(container_for(&id)));
+    writer
+        .insert_with_session_durable(id.clone(), Arc::new(computer), &format!("sess-{id}"))
+        .await
+        .unwrap();
+    // 八个更新的 Web 活跃行（created_at 更晚——注册顺序在后即可）。
+    for index in 0..8 {
+        let web_id = format!("{id}-web-{index}");
+        let mut web = ProjectAndContainerInfo::new(web_id.clone());
+        web.set_service_type(Some(shared_types::ServiceType::WebAgentRunner));
+        web.set_user_id(Some(user_id.clone()));
+        web.set_container(Some(container_for(&web_id)));
+        writer
+            .insert_with_session_durable(web_id.clone(), Arc::new(web), &format!("sess-{web_id}"))
+            .await
+            .unwrap();
+    }
+    assert!(writer.wait_drained(Duration::from_secs(5)).await);
+
+    let reader = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .unwrap();
+    use shared_types::ContainerLookup as _;
+    // 撕掉 Computer 条目，保留 Web（模拟事故形态：仅目标族条目丢失）。
+    reader.inner().remove(&id);
+    assert!(
+        reader
+            .find_by_user_id(&user_id, &shared_types::ServiceType::ComputerAgentRunner)
+            .is_none()
+    );
+
+    reader
+        .refresh_user_container(&user_id, &shared_types::ServiceType::ComputerAgentRunner)
+        .await
+        .unwrap();
+    let found = reader.find_by_user_id(&user_id, &shared_types::ServiceType::ComputerAgentRunner);
+    assert_eq!(
+        found.as_deref(),
+        Some("10.42.0.9"),
+        "newer other-family rows must not crowd out the family candidate set"
     );
 }

@@ -52,10 +52,16 @@ pub trait AppRuntimeIpResolver: Send + Sync {
 /// the miss stays a miss.
 #[async_trait::async_trait]
 pub trait ContainerUserRefresh: Send + Sync {
-    /// Re-read the user's live project/container rows from the database and
-    /// hydrate the local mirror. Returns Ok even when the user has no rows;
-    /// errors mean the refresh itself failed (caller keeps the miss).
-    async fn refresh_user_container(&self, user_id: &str) -> anyhow::Result<()>;
+    /// Re-read the user's live project/container rows of the requested
+    /// container family from the database and hydrate the local mirror, under
+    /// one shared durable-commit budget. Returns Ok even when the user has no
+    /// rows of the family; errors mean the refresh itself failed (caller
+    /// keeps the miss).
+    async fn refresh_user_container(
+        &self,
+        user_id: &str,
+        service_type: &ServiceType,
+    ) -> anyhow::Result<()>;
 }
 
 pub trait ContainerLookup: Send + Sync {

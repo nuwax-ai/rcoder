@@ -116,7 +116,9 @@ pub async fn handle_vnc_upstream(
     // miss and fall through to the diagnosable 404.
     if container_ip.is_none()
         && let Some(refresh) = user_refresh
-        && let Err(error) = refresh.refresh_user_container(user_id).await
+        && let Err(error) = refresh
+            .refresh_user_container(user_id, &shared_types::ServiceType::ComputerAgentRunner)
+            .await
     {
         debug!(
             %error,

@@ -549,7 +549,11 @@ fn uuid_generation() -> String {
 #[cfg(feature = "pg")]
 #[async_trait::async_trait]
 impl shared_types::ContainerUserRefresh for PgStore {
-    async fn refresh_user_container(&self, user_id: &str) -> anyhow::Result<()> {
-        self.refresh_user_container(user_id).await
+    async fn refresh_user_container(
+        &self,
+        user_id: &str,
+        service_type: &ServiceType,
+    ) -> anyhow::Result<()> {
+        self.refresh_user_container(user_id, service_type).await
     }
 }

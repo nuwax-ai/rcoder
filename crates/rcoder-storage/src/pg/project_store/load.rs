@@ -210,6 +210,18 @@ impl crate::pg::PgStore {
         project_id: &str,
     ) -> anyhow::Result<Option<Arc<ProjectAndContainerInfo>>> {
         let deadline = tokio::time::Instant::now() + self.durable_commit_budget();
+        self.refresh_project_registration_until(project_id, deadline)
+            .await
+    }
+
+    /// Deadline-carrying variant for callers that own a SHARED budget (the
+    /// user-scope read-through refreshes several candidates and must not let
+    /// each one restart the clock).
+    pub(crate) async fn refresh_project_registration_until(
+        &self,
+        project_id: &str,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<Option<Arc<ProjectAndContainerInfo>>> {
         tokio::time::timeout_at(
             deadline,
             self.refresh_project_registration_before(project_id, deadline),
@@ -831,46 +843,75 @@ impl crate::pg::PgStore {
 
 impl crate::pg::PgStore {
     /// On-miss refresh for the user-scoped container lookup: re-read the
-    /// user's LIVE project rows (container bound) from PG and run each through
-    /// the guarded project read-through — the same reconciliation the SSE
-    /// path uses — then the caller retries the mirror lookup. A user with no
-    /// live rows is a successful no-op (the miss is then a true miss).
-    pub async fn refresh_user_container(&self, user_id: &str) -> anyhow::Result<()> {
+    /// user's LIVE project rows of the requested container FAMILY from PG and
+    /// run each through the guarded project read-through — the same
+    /// reconciliation the SSE path uses — under ONE shared durable-commit
+    /// budget covering the candidate query and every refresh; the caller then
+    /// retries the mirror lookup. A user with no live rows of the family is a
+    /// successful no-op (the miss is then a true miss).
+    pub async fn refresh_user_container(
+        &self,
+        user_id: &str,
+        service_type: &ServiceType,
+    ) -> anyhow::Result<()> {
         shared_types::validate_identifier(user_id, "user_id")
             .map_err(|error| anyhow::anyhow!("{error}"))?;
-        let ids: Vec<String> = super::database::read(&self.database, {
-            let user_id = user_id.to_owned();
-            move |tx| {
-                Box::pin(async move {
-                    let rows = toasty::sql::query(
-                        "SELECT project_id FROM projects WHERE user_id=$1 AND container_name IS NOT NULL ORDER BY created_at_us DESC LIMIT 8",
-                    )
-                    .bind(user_id)
-                    .exec(tx)
-                    .await?;
-                    let mut ids = Vec::with_capacity(rows.len());
-                    for row in rows {
-                        if let toasty_core::stmt::Value::Record(mut record)
-                            = row
-                            && record.fields.len() == 1
-                            && let toasty_core::stmt::Value::String(id) =
-                                record.fields.pop().unwrap_or_else(|| unreachable!("len checked"))
-                        {
-                            ids.push(id);
+        let family = service_type.family_representative().to_string();
+        // ONE budget for the candidate query and all candidate refreshes: the
+        // per-refresh deadline must not restart the clock (review finding:
+        // 8 x 100ms against a locked table far exceeded the configured
+        // budget). Budget exhaustion stops the loop — already-hydrated
+        // candidates stay and the caller still retries the lookup.
+        let deadline = tokio::time::Instant::now() + self.durable_commit_budget();
+        let ids: Vec<String> = tokio::time::timeout_at(
+            deadline,
+            super::database::read(&self.database, {
+                let user_id = user_id.to_owned();
+                let family = family.clone();
+                move |tx| {
+                    Box::pin(async move {
+                        let rows = toasty::sql::query(
+                            "SELECT project_id FROM projects WHERE user_id=$1 AND container_name IS NOT NULL AND service_type=$2 ORDER BY created_at_us DESC LIMIT 8",
+                        )
+                        .bind(user_id)
+                        .bind(family)
+                        .exec(tx)
+                        .await?;
+                        let mut ids = Vec::with_capacity(rows.len());
+                        for row in rows {
+                            if let toasty_core::stmt::Value::Record(mut record) = row
+                                && record.fields.len() == 1
+                                && let toasty_core::stmt::Value::String(id) =
+                                    record.fields.pop().unwrap_or_else(|| unreachable!("len checked"))
+                            {
+                                ids.push(id);
+                            }
                         }
-                    }
-                    Ok(ids)
-                })
-            }
-        })
-        .await?;
+                        Ok(ids)
+                    })
+                }
+            }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("user container refresh exceeded the durable deadline"))??;
         if ids.is_empty() {
-            // No live rows: nothing to hydrate. Retired projects intentionally
-            // stay un-hydrated for this path — they never resolve a container.
+            // No live rows of the family: nothing to hydrate. Retired projects
+            // and other families' projects intentionally stay out of this
+            // path — neither resolves this lookup.
             return Ok(());
         }
         for project_id in ids {
-            if let Err(error) = self.refresh_project_registration(&project_id).await {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::debug!(
+                    user_id = user_id,
+                    "User container refresh: durable budget exhausted; hydrated candidates remain"
+                );
+                break;
+            }
+            if let Err(error) = self
+                .refresh_project_registration_until(&project_id, deadline)
+                .await
+            {
                 // One bad row must not block the remaining candidates; the
                 // periodic full sync remains the fallback reconciler.
                 tracing::debug!(
