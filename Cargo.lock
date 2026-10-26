@@ -195,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "agent_abstraction"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "agent-client-protocol",
  "agent_config",
@@ -226,7 +226,7 @@ dependencies = [
 
 [[package]]
 name = "agent_config"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -244,7 +244,7 @@ dependencies = [
 
 [[package]]
 name = "agent_provisioning"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "chrono",
  "dashmap 6.2.1",
@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "agent_runner"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "agent-client-protocol",
  "agent_abstraction",
@@ -2056,7 +2056,7 @@ dependencies = [
 
 [[package]]
 name = "container-runtime-api"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2797,7 +2797,7 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -3051,7 +3051,7 @@ dependencies = [
 
 [[package]]
 name = "docker_manager"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3104,7 +3104,7 @@ checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 
 [[package]]
 name = "download_utils"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "axum",
  "bytes",
@@ -3595,7 +3595,7 @@ dependencies = [
 
 [[package]]
 name = "file-server-ab"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6341,7 +6341,7 @@ checksum = "9171a2ea8a68358193d15dd5d70c1c10a2afc3e7e4c5bc92bc9f025cebd7359c"
 
 [[package]]
 name = "http-server"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "agent_provisioning",
  "anyhow",
@@ -8227,7 +8227,7 @@ dependencies = [
 
 [[package]]
 name = "model_probe"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "genai",
  "moka",
@@ -10204,7 +10204,7 @@ dependencies = [
 
 [[package]]
 name = "preview-coordinator"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "axum",
@@ -10916,7 +10916,7 @@ dependencies = [
 
 [[package]]
 name = "rcoder"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "agent_provisioning",
  "anyhow",
@@ -11041,7 +11041,7 @@ dependencies = [
 
 [[package]]
 name = "rcoder-engine"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "agent_provisioning",
  "anyhow",
@@ -11125,7 +11125,7 @@ dependencies = [
 
 [[package]]
 name = "rcoder-gateway"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11147,7 +11147,7 @@ dependencies = [
 
 [[package]]
 name = "rcoder-obs"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "dial9",
  "tokio",
@@ -11155,7 +11155,7 @@ dependencies = [
 
 [[package]]
 name = "rcoder-proxy"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -11187,7 +11187,7 @@ dependencies = [
 
 [[package]]
 name = "rcoder-storage"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11219,7 +11219,7 @@ dependencies = [
 
 [[package]]
 name = "rcoder-telemetry"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -12429,7 +12429,7 @@ dependencies = [
 
 [[package]]
 name = "shared_types"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -12481,7 +12481,7 @@ dependencies = [
 
 [[package]]
 name = "shared_types_grpc"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "prost",
  "prost-types",
@@ -12494,7 +12494,7 @@ dependencies = [
 
 [[package]]
 name = "shared_types_i18n"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "rust-i18n",
 ]

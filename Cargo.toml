@@ -46,7 +46,7 @@ rust.let_underscore_drop = "warn"
 await_holding_lock = "deny"
 
 [workspace.package]
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 authors = ["soddy <soddygo@qq.com>"]
 license = "Apache-2.0"
