@@ -789,3 +789,63 @@ impl KubernetesRuntime {
         }
     }
 }
+
+impl KubernetesRuntime {
+    /// Receipt-free positive running observation of the captured Deployment:
+    /// spec.replicas >= 1 (desired) AND status.replicas > 0 (executing per
+    /// the controller's own report). Readiness is not judged; a crashing pod
+    /// still observes as running because the question is whether the captured
+    /// write surface kept its desired replicas (a stop write would have
+    /// zeroed the spec). Read-only with a recheck.
+    pub(crate) async fn observe_captured_app_running(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        target
+            .context
+            .validate_identity(&target.context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        if target.resource.kind != shared_types::AppResourceKind::Deployment
+            || target.resource.uid.is_empty()
+            || target.resource.name != self.app_deployment_name(&target.context.app_id)
+        {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Invalid running observation target".into(),
+            ));
+        }
+        let desired_and_executing = |deployment: &k8s_openapi::api::apps::v1::Deployment| {
+            deployment.metadata.uid.as_deref() == Some(target.resource.uid.as_str())
+                && deployment
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.replicas)
+                    .is_some_and(|replicas| replicas >= 1)
+                && deployment
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.replicas)
+                    .is_some_and(|replicas| replicas > 0)
+        };
+        let current = self
+            .deployments_api()
+            .get_opt(&target.resource.name)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::K8sError(format!("Read running application: {error}"))
+            })?;
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        if !desired_and_executing(&current) {
+            return Ok(false);
+        }
+        let after = self
+            .deployments_api()
+            .get_opt(&target.resource.name)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::K8sError(format!("Recheck running application: {error}"))
+            })?;
+        Ok(after.is_some_and(|after| desired_and_executing(&after)))
+    }
+}

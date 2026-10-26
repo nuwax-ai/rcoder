@@ -923,6 +923,13 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
         self.reconcile_captured_compute_start(target).await
     }
 
+    async fn observe_app_compute_running(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        self.observe_captured_app_running(target).await
+    }
+
     async fn reconcile_app_compute_stop(
         &self,
         target: &shared_types::UserAppMutationTarget,

@@ -1416,6 +1416,20 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     }
 
     /// Verify the exact atomic start receipt after a lost restart response.
+    /// Positive RUNNING observation of the captured application workload:
+    /// desired replicas in the spec AND replicas the controller actually
+    /// reports executing. No operation receipt is consulted, and readiness is
+    /// deliberately not judged (the question is whether the captured write
+    /// surface kept its desired replicas). Read-only with a recheck.
+    async fn observe_app_compute_running(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Application running observation is unsupported".into(),
+        ))
+    }
+
     async fn reconcile_app_compute_start(
         &self,
         _target: &shared_types::UserAppMutationTarget,

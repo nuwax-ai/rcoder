@@ -2335,16 +2335,37 @@ async fn settlement_surface_note(
                             return Ok(None);
                         }
                     };
-                    let running = match state.runtime().reconcile_app_compute_start(&expected).await
+                    // Receipt errors are evidence-missing, never a reason to
+                    // skip classification; the receipt-free probe decides the
+                    // running branch without a per-operation receipt.
+                    let receipt_running = match state
+                        .runtime()
+                        .reconcile_app_compute_start(&expected)
+                        .await
                     {
                         Ok(running) => running,
                         Err(error) => {
                             tracing::debug!(
                                 %error,
                                 operation_id = %current.operation_id,
-                                "Deadline settlement application running-observation failed; deferring"
+                                "Deadline settlement application start-receipt query failed; continuing classification"
                             );
-                            return Ok(None);
+                            false
+                        }
+                    };
+                    let running = if receipt_running {
+                        true
+                    } else {
+                        match state.runtime().observe_app_compute_running(&expected).await {
+                            Ok(running) => running,
+                            Err(error) => {
+                                tracing::debug!(
+                                    %error,
+                                    operation_id = %current.operation_id,
+                                    "Deadline settlement application running-observation failed; continuing classification"
+                                );
+                                false
+                            }
                         }
                     };
                     if running {

@@ -366,11 +366,13 @@ pub(super) async fn clear_unheld(
     snapshot: &ComputeControlRecord,
 ) -> Result<(), UserAppStoreError> {
     repo::claim_app(tx, backend, &snapshot.app_id).await?;
+    // Only touch the row when an anchor exists: a still-renewed record hits
+    // this every scan round and must not churn the table.
     let changed = toasty::sql::statement(repo::sql(backend,
-        "UPDATE userapp_compute_control_deadlines SET unheld_observed_ms=NULL WHERE operation_id=$1"))
+        "UPDATE userapp_compute_control_deadlines SET unheld_observed_ms=NULL WHERE operation_id=$1 AND unheld_observed_ms IS NOT NULL"))
         .bind(&snapshot.operation_id).exec(tx).await.map_err(storage)?;
     if changed != 1 {
-        return Err(UserAppStoreError::NotFound);
+        return Ok(());
     }
     Ok(())
 }
