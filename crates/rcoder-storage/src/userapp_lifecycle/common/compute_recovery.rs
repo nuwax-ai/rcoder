@@ -280,8 +280,21 @@ pub(super) async fn expire(
             "Compute control deadline has not expired".into(),
         ));
     }
-    if row.as_ref().and_then(|row| row.unheld_observed_ms) != Some(expected_unheld_observed_ms) {
+    // Hold the anchor row's lock from the re-verification until this
+    // transaction commits: a concurrent clear (the lease renewed again) or
+    // re-anchor either commits BEFORE this check — matching zero rows and
+    // refusing the settler — or waits on the row lock until after the
+    // terminal CAS, where clearing is a harmless post-terminal cleanup. The
+    // value-preserving self-update keeps the anchor evidence intact.
+    let verified = toasty::sql::statement(repo::sql(backend,
+        "UPDATE userapp_compute_control_deadlines SET unheld_observed_ms=unheld_observed_ms WHERE operation_id=$1 AND unheld_observed_ms=$2"))
+        .bind(&snapshot.operation_id).bind(expected_unheld_observed_ms).exec(tx).await.map_err(storage)?;
+    if verified != 1 {
         return Err(UserAppStoreError::VersionConflict);
+    }
+    #[cfg(all(test, feature = "pg", feature = "userapp-turso"))]
+    {
+        super::transaction_fault_tests::after_expire_anchor_lock().await;
     }
     let now = chrono::Utc::now().timestamp_micros();
     let changed = toasty::sql::statement(repo::sql(backend,

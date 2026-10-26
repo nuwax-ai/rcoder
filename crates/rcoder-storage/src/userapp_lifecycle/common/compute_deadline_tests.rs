@@ -309,3 +309,153 @@ async fn pg_compute_control_deadline_binding_and_expiry_settlement() {
     contract(&store).await;
     store.shutdown().await.unwrap();
 }
+
+/// Codex-reproduced concurrency regression (fixed): with the app-row lock
+/// removed from the anchor bookkeeping, a concurrent clear could commit
+/// BETWEEN the settler's anchor verification and its terminal CAS, yielding
+/// `failed, anchor=NULL` — a terminalized control whose lease had come back
+/// to life after the settler's observation. The settler now holds the anchor
+/// row lock from its locked re-verification until commit, so the clear
+/// either commits first (settler refuses) or blocks until after the terminal
+/// CAS (harmless post-terminal cleanup). This test proves the gap is closed
+/// with explicit permits — no timing-based assumption.
+#[cfg(feature = "pg")]
+#[tokio::test]
+#[ignore = "requires explicitly disposable PostgreSQL DSN; run alongside the PG contract"]
+async fn pg_expire_anchor_lock_blocks_a_concurrent_clear_inside_the_gap() {
+    use super::transaction_fault_tests::{ExpireAnchorProbe, with_expire_anchor_probe};
+    use std::{sync::Arc, time::Duration};
+
+    let config = crate::config::PostgresConfig {
+        url: Some(std::env::var("RCODER_USERAPP_PG_TEST_DSN").expect("disposable PG DSN required")),
+        max_connections: Some(1),
+        min_connections: Some(1),
+        statement_timeout_secs: Some(30),
+        ..Default::default()
+    };
+    // Independent owners: the paused settler never blocks the clearer.
+    let settler = Arc::new(ToastyUserAppStore::connect(&config).await.unwrap());
+    let clearer = ToastyUserAppStore::connect(&config).await.unwrap();
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let mut record = claimed_control(
+        &settler,
+        &format!("expirelock{run}"),
+        ComputeControlAction::Restart,
+    )
+    .await;
+    let identity = ComputeExecutorIdentity {
+        app_id: record.app_id.clone(),
+        lifecycle_id: record.lifecycle_id.clone(),
+        scope: record.scope,
+        operation_id: record.operation_id.clone(),
+        generation: record.generation,
+        executor_id: record.executor_id.clone().unwrap(),
+    };
+    record = settler
+        .bind_compute_lease(
+            &identity,
+            &UserAppOperationLeaseReceipt::Kubernetes {
+                service_type: ServiceType::UserappBuilder,
+                namespace: "rcoder-builder".into(),
+                name: format!("rcoder-app-builder-expirelock{run}"),
+                uid: "f".repeat(36),
+                resource_version: "9".into(),
+                token: record.executor_id.clone().unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    record = settler
+        .advance_compute_control(&ComputeControlProgress {
+            identity: identity.clone(),
+            expected_revision: record.revision,
+            state: ComputeControlState::RecoveryRequired,
+            stage: ComputeControlStage::Stopping,
+            checkpoint: serde_json::json!({"witness": true}),
+            error_code: Some("ERR_STOP_REPLY_TIMEOUT".into()),
+            error_message: Some("fixture".into()),
+        })
+        .await
+        .unwrap();
+    settler
+        .bind_compute_control_deadline(&record, now - 1)
+        .await
+        .unwrap();
+    let anchor = now - 400_000;
+    settler
+        .mark_compute_control_unheld(&record, anchor)
+        .await
+        .unwrap();
+
+    // The settler holds the anchor row lock and pauses between its locked
+    // re-verification and the terminal CAS.
+    let probe = Arc::new(ExpireAnchorProbe::default());
+    let settling = {
+        let settler = Arc::clone(&settler);
+        let snapshot = record.clone();
+        let probe = Arc::clone(&probe);
+        tokio::spawn(async move {
+            settler
+                .run(false, move |tx, backend| {
+                    let (snapshot, probe) = (snapshot.clone(), Arc::clone(&probe));
+                    Box::pin(with_expire_anchor_probe(probe, async move {
+                        super::compute_recovery::expire(
+                            tx,
+                            backend,
+                            &snapshot,
+                            "ERR_DEADLINE_EXCEEDED",
+                            "concurrency gap fixture",
+                            anchor,
+                        )
+                        .await
+                    }))
+                })
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), probe.reached())
+        .await
+        .expect("settler must reach the deterministic post-lock boundary");
+
+    // Inside the gap, the concurrent clear must NOT be able to commit: the
+    // settler's row lock blocks it until the terminal CAS commits. The
+    // blocking itself is deterministic — the lock holder is explicitly
+    // paused — so a short timeout proves the lock, not a race heuristic.
+    // Pre-fix, this clear committed immediately and the settler still
+    // terminalized, yielding failed+anchor=NULL.
+    let blocked = tokio::time::timeout(
+        Duration::from_millis(300),
+        clearer.clear_compute_control_unheld(&record),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "the clear must block on the anchor row lock"
+    );
+
+    // Release the settler: the terminal CAS commits under the held lock.
+    probe.release();
+    let settled = tokio::time::timeout(Duration::from_secs(10), settling)
+        .await
+        .expect("settler task must finish")
+        .expect("settler task must not panic")
+        .expect("the settler terminalizes while holding the anchor lock");
+    assert_eq!(settled.state, ComputeControlState::Failed);
+
+    // The blocked clear retries after commit: clearing a terminal record's
+    // anchor is a harmless post-terminal cleanup.
+    clearer
+        .clear_compute_control_unheld(&settled)
+        .await
+        .unwrap();
+    let after = clearer
+        .get_compute_control(&settled.app_id, &settled.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.state, ComputeControlState::Failed);
+    settler.shutdown().await.unwrap();
+    clearer.shutdown().await.unwrap();
+}

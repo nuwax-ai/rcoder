@@ -40,6 +40,44 @@ pub(super) async fn with_compute_access_claim_probe<F: Future>(
 ) -> F::Output {
     COMPUTE_ACCESS_CLAIM_PROBE.scope(probe, future).await
 }
+/// Only the owning test transaction can pause here: the expire path holds
+/// the anchor row lock and pauses between the lock acquisition and the
+/// terminal CAS, letting a concurrency test prove a concurrent clear cannot
+/// slip into that gap.
+#[derive(Default)]
+pub(super) struct ExpireAnchorProbe {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+impl ExpireAnchorProbe {
+    #[cfg(all(feature = "pg", feature = "userapp-turso"))]
+    pub(super) async fn reached(&self) {
+        self.reached.notified().await;
+    }
+    #[cfg(all(feature = "pg", feature = "userapp-turso"))]
+    pub(super) fn release(&self) {
+        self.resume.notify_one();
+    }
+}
+tokio::task_local! {
+    static EXPIRE_ANCHOR_PROBE: std::sync::Arc<ExpireAnchorProbe>;
+}
+#[cfg(all(feature = "pg", feature = "userapp-turso"))]
+pub(super) async fn with_expire_anchor_probe<F: Future>(
+    probe: std::sync::Arc<ExpireAnchorProbe>,
+    future: F,
+) -> F::Output {
+    EXPIRE_ANCHOR_PROBE.scope(probe, future).await
+}
+#[cfg(all(feature = "pg", feature = "userapp-turso"))]
+pub(super) async fn after_expire_anchor_lock() {
+    let probe = EXPIRE_ANCHOR_PROBE.try_with(Clone::clone).ok();
+    if let Some(probe) = probe {
+        probe.reached.notify_one();
+        probe.resume.notified().await;
+    }
+}
+
 pub(super) async fn before_compute_access_root_claim() {
     let probe = COMPUTE_ACCESS_CLAIM_PROBE.try_with(Clone::clone).ok();
     if let Some(probe) = probe {
