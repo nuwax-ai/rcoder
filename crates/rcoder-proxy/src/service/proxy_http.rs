@@ -1749,6 +1749,22 @@ mod official_restart_failure_tests {
             crate::error_page::ErrorPageCause::Restarting,
             "standby without refinement evidence falls back to restarting copy"
         );
+        // 停止窗口（2026-10-27 缺陷单）：advisor 观察到 Stopping 时保留停止
+        // 档文案，不被 standby 的 Restarting 兜底升格。
+        let stopping_readiness = crate::error_page::UserAppProxyFailureHint {
+            readiness_status: Some(shared_types::UserAppReadinessStatus::Stopping),
+            error_origin_confirmed: true,
+            proxy_confirmation: None,
+        };
+        assert_eq!(
+            replacement_cause(Some(&stopping_readiness), true),
+            crate::error_page::ErrorPageCause::Stopping,
+            "observed stopping evidence must keep the stopping copy in standby windows"
+        );
+        assert_eq!(
+            replacement_cause(Some(&stopping_readiness), false),
+            crate::error_page::ErrorPageCause::Stopping,
+        );
     }
 
     #[test]

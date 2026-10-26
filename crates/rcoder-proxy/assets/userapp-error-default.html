@@ -163,6 +163,7 @@
     <div class="node bad" id="node-app"
          data-i18n-starting="{{RCODER_UI_STARTING}}"
          data-i18n-stopped="{{RCODER_UI_STOPPED}}"
+         data-i18n-stopping="{{RCODER_UI_STOPPING}}"
          data-i18n-failed="{{RCODER_UI_FAILED}}"
          data-i18n-preparing="{{RCODER_UI_PREPARING}}">
       <span class="ring" id="node-app-glyph" aria-hidden="true">✕</span>
@@ -203,6 +204,11 @@
       cause === 'provisioning' ? 'data-i18n-preparing' : 'data-i18n-starting'
     ) || '';
     if (link) { link.className = 'link warn'; }
+  } else if (cause === 'stopping') {
+    node.className = 'node idle';
+    glyph.innerHTML = '<span class="bar"></span>';
+    state.textContent = node.getAttribute('data-i18n-stopping') || '';
+    if (link) { link.className = 'link'; }
   } else if (cause === 'stopped') {
     node.className = 'node idle';
     glyph.innerHTML = '<span class="bar"></span>';

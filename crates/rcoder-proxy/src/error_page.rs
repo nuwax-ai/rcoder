@@ -51,6 +51,7 @@ pub const VAR_UI_APP: &str = "{{RCODER_UI_APP}}";
 pub const VAR_UI_UNAVAILABLE: &str = "{{RCODER_UI_UNAVAILABLE}}";
 pub const VAR_UI_STARTING: &str = "{{RCODER_UI_STARTING}}";
 pub const VAR_UI_STOPPED: &str = "{{RCODER_UI_STOPPED}}";
+pub const VAR_UI_STOPPING: &str = "{{RCODER_UI_STOPPING}}";
 pub const VAR_UI_FAILED: &str = "{{RCODER_UI_FAILED}}";
 pub const VAR_UI_PREPARING: &str = "{{RCODER_UI_PREPARING}}";
 pub const VAR_UI_RELOAD: &str = "{{RCODER_UI_RELOAD}}";
@@ -61,7 +62,7 @@ pub const VAR_UI_ARIA: &str = "{{RCODER_UI_ARIA}}";
 
 /// UI 标签占位符 → i18n key（userapp_error_page.ui.<key>；渲染期按 locale
 /// 注入——固定文案跟随页面语言，脚本状态文案不再依赖标题子串）。
-const UI_LABELS: [(&str, &str); 15] = [
+const UI_LABELS: [(&str, &str); 16] = [
     (VAR_UI_BROWSER, "browser"),
     (VAR_UI_CONNECTED, "connected"),
     (VAR_UI_GATEWAY, "gateway"),
@@ -70,6 +71,7 @@ const UI_LABELS: [(&str, &str); 15] = [
     (VAR_UI_UNAVAILABLE, "unavailable"),
     (VAR_UI_STARTING, "starting"),
     (VAR_UI_STOPPED, "stopped"),
+    (VAR_UI_STOPPING, "stopping"),
     (VAR_UI_FAILED, "failed"),
     (VAR_UI_PREPARING, "preparing"),
     (VAR_UI_RELOAD, "reload"),
@@ -164,6 +166,8 @@ pub enum ErrorPageCause {
     Restarting,
     /// 开发环境运行资源正在准备，应用自身尚未参与（业务快照尚未产生）。
     Provisioning,
+    /// 停止意图已受理、业务停止进行中（stop 窗口的 standby/失败出口）
+    Stopping,
     /// 已确认停止
     Stopped,
     /// 有明确启动失败证据
@@ -194,6 +198,7 @@ impl ErrorPageCause {
             Self::Starting => "starting",
             Self::Restarting => "restarting",
             Self::Provisioning => "provisioning",
+            Self::Stopping => "stopping",
             Self::Stopped => "stopped",
             Self::Failed => "failed",
             Self::Missing => "missing",
@@ -311,13 +316,13 @@ impl UserAppProxyFailureHint {
             // 就绪顾问只消费原始观察、拿不到在途操作槽位，因此该分支目前按构造
             // 不可达；顾问接入合并态后即刻生效（见 userapp_failure_advisor）。
             Some(Status::Provisioning) => ErrorPageCause::Provisioning,
+            Some(Status::Stopping) => ErrorPageCause::Stopping,
             Some(Status::Stopped) => ErrorPageCause::Stopped,
             Some(Status::Failed) => ErrorPageCause::Failed,
             Some(Status::NotDeployed) => ErrorPageCause::Missing,
             // Ready/Degraded 出现在失败出口说明健康证据与本次失败并存，
-            // Stopping/Unknown/Unsupported 无确定文案证据——一律通用
+            // Unknown/Unsupported 无确定文案证据——一律通用
             None
-            | Some(Status::Stopping)
             | Some(Status::Ready)
             | Some(Status::Degraded)
             | Some(Status::Unknown)
@@ -782,11 +787,12 @@ mod tests {
         ErrorPageRenderer::new(None)
     }
 
-    fn all_causes() -> [ErrorPageCause; 11] {
+    fn all_causes() -> [ErrorPageCause; 12] {
         [
             ErrorPageCause::Starting,
             ErrorPageCause::Restarting,
             ErrorPageCause::Provisioning,
+            ErrorPageCause::Stopping,
             ErrorPageCause::Stopped,
             ErrorPageCause::Failed,
             ErrorPageCause::Missing,
