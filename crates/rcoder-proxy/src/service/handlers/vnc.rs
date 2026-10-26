@@ -10,7 +10,7 @@ use pingora_http::RequestHeader;
 use shared_types::NOVNC_PORT;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::service::types::{ProxyMetrics, TrackingCtx};
 use crate::service::utils;
@@ -108,7 +108,16 @@ pub async fn handle_vnc_upstream(
     let container_ip = match container_ip {
         Some(ip) => ip,
         None => {
-            info!("routing {} to VNC", user_id);
+            // 404 必须可诊断（2026-10-27 生产排障最缺的就是这条）：记录 user/
+            // project、解析路径（存储 lookup vs 内存注册表）、以及 fallback 是否
+            // 也未命中，供区分"用户确无容器"与"副本镜像缺陷"。
+            warn!(
+                user_id = user_id,
+                project_id = project_id,
+                storage_lookup = container_lookup.is_some(),
+                registry_fallback_hit = false,
+                "VNC upstream not resolved: no container in the lookup path and the registry fallback did not fire"
+            );
             return Err(
                 pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(
                     format!(

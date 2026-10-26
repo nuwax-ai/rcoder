@@ -242,12 +242,18 @@ impl ProjectAdapter {
         user_id: &str,
         service_type: &ServiceType,
     ) -> Option<ContainerBasicInfo> {
-        let p = self
-            .find_projects_by_user_id(user_id, service_type)
-            .into_iter()
-            .next()?;
-        // 统一走 containers[name] 权威源（service_type 已由 find_projects_by_user_id 过滤）
-        self.container_info_by_project(p.project_id())
+        // 同 user 的同 ServiceType 活跃项目共享同一容器，但候选取首个**可解析出
+        // 容器**的：高频"回收→重建"用户会累积大量已退休 project（service_type
+        // 保留、无容器），而多值索引是无序 DashSet——首个候选可能是退休行，
+        // `project_to_container` 无此键。只取首个会在此时整体返回 None（生产
+        // 2026-10-27：三副本仅个别副本 404、重启不恢复的直接根因），遍历跳过
+        // 无容器候选即可。
+        for project in self.find_projects_by_user_id(user_id, service_type) {
+            if let Some(info) = self.container_info_by_project(project.project_id()) {
+                return Some(info);
+            }
+        }
+        None
     }
 
     /// 通过 pod_id 获取容器信息（O(1) 索引查找）

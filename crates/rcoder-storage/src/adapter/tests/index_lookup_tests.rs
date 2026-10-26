@@ -1226,3 +1226,69 @@ fn test_computer_family_lookup_shared_container() {
         "Web 记录不因家族归一被放宽收录"
     );
 }
+
+/// 回归测试（生产 2026-10-27 P0）：高频"回收→重建"用户会累积已退休 project
+/// （service_type 保留、无容器），多值索引是无序 DashSet——`get_container_by_user_id`
+/// 只取首个候选时，若首个恰是退休行（`project_to_container` 无此键）则整体
+/// 返回 None，VNC/权限/取消链路在该副本永久 404。修复后遍历候选，返回首个
+/// **可解析出容器**的活跃 project。
+#[test]
+fn test_get_container_by_user_id_skips_retired_projects() {
+    let adapter = make_adapter();
+
+    // 同 user 的两个 Computer project：一个无容器（退休形态），一个有活跃容器。
+    let retired = ProjectAndContainerInfo::from_parts(
+        "proj-retired".to_string(),
+        Some("user-retire".to_string()),
+        None,
+        None,
+        None,
+        ProjectExtendedFields {
+            service_type: Some(ServiceType::ComputerAgentRunner),
+            ..Default::default()
+        },
+    );
+    adapter
+        .insert("proj-retired".to_string(), Arc::new(retired))
+        .unwrap();
+
+    let container = ContainerBasicInfo {
+        container_id: "cid-active".to_string(),
+        container_name: "user-retire-container".to_string(),
+        container_ip: "10.0.0.9".to_string(),
+        internal_port: 8086,
+        external_port: 0,
+        project_id: "proj-active".to_string(),
+        status: "running".to_string(),
+        created_at: Utc::now(),
+        service_url: "http://test".to_string(),
+        workload_uid: None,
+    };
+    let active = ProjectAndContainerInfo::from_parts(
+        "proj-active".to_string(),
+        Some("user-retire".to_string()),
+        None,
+        None,
+        Some(container),
+        ProjectExtendedFields {
+            service_type: Some(ServiceType::ComputerAgentRunner),
+            ..Default::default()
+        },
+    );
+    adapter
+        .insert("proj-active".to_string(), Arc::new(active))
+        .unwrap();
+
+    // 无论无序索引把哪个排在首位，都必须命中活跃容器而不是整体 None。
+    let found = adapter.get_container_by_user_id("user-retire", &ServiceType::ComputerAgentRunner);
+    let found = found.expect("a retired project must not mask the user's active container");
+    assert_eq!(found.container_id, "cid-active");
+
+    // ContainerLookup trait 链（VNC 代理的实际路径）同修。
+    use shared_types::ContainerLookup as _;
+    let via_trait = adapter.find_by_user_id("user-retire", &ServiceType::ComputerAgentRunner);
+    assert_eq!(
+        via_trait.as_ref().map(|ip| ip.as_str()),
+        Some(adapter.resolve_backend_addr(&found).as_str())
+    );
+}
