@@ -130,6 +130,11 @@ impl<'de> Deserialize<'de> for BuilderControlTarget {
             #[serde(default)]
             #[allow(dead_code)]
             builder_restart_stop_observation: Option<serde_json::Value>,
+            #[serde(default)]
+            #[allow(dead_code)]
+            // Read-only Kubernetes stop-boundary confirmation evidence; like
+            // the Docker observation key it grants no write authority.
+            kubernetes_restart_stop_confirmation: Option<serde_json::Value>,
         }
         let wire = Wire::deserialize(deserializer)?;
         Ok(Self {

@@ -1366,6 +1366,14 @@ pub(super) async fn resume_builder_restart(
     {
         checkpoint[BUILDER_RESTART_STOP_OBSERVATION_KEY] = value.clone();
     }
+    // The durable Kubernetes stop-boundary confirmation (with its preserved
+    // original diagnostics) survives the same-identity start continuation.
+    if let Some(value) = snapshot
+        .checkpoint
+        .get(KUBERNETES_RESTART_STOP_CONFIRMATION_KEY)
+    {
+        checkpoint[KUBERNETES_RESTART_STOP_CONFIRMATION_KEY] = value.clone();
+    }
     let changed = toasty::sql::statement(repo::sql(backend,
         "UPDATE userapp_compute_controls SET state='running',stage='starting',checkpoint_json=$4,error_code=NULL,error_message=NULL,revision=$3 WHERE operation_id=$1 AND revision=$2"))
         .bind(&snapshot.operation_id).bind(snapshot.revision).bind(revision)

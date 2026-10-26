@@ -1838,6 +1838,19 @@ pub(crate) async fn reconcile_superseded(
         .map_err(Into::into)
 }
 
+/// A durable Kubernetes stop-boundary confirmation proves the original stop
+/// completed even without this operation's platform stop receipt (e.g. an
+/// exact UID-matched external stop). Continuation honors the recorded fact;
+/// physical write authority still flows from the lease/CAS chain.
+fn kubernetes_stop_boundary_confirmed(snapshot: &ComputeControlRecord) -> bool {
+    snapshot
+        .checkpoint
+        .get(KUBERNETES_RESTART_STOP_CONFIRMATION_KEY)
+        .is_some_and(|value| {
+            serde_json::from_value::<KubernetesRestartStopConfirmation>(value.clone()).is_ok()
+        })
+}
+
 async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord) -> Result<()> {
     resume_builder_start_with_guard(state, snapshot, None).await
 }
@@ -2012,7 +2025,8 @@ async fn resume_builder_start_with_guard(
             restored
         } else {
             ensure!(
-                state.runtime().reconcile_builder_compute_stop(&old).await?,
+                state.runtime().reconcile_builder_compute_stop(&old).await?
+                    || kubernetes_stop_boundary_confirmed(snapshot),
                 "Original builder stop receipt is not confirmed"
             );
             fresh

@@ -330,3 +330,56 @@ fn kubernetes_stopping_boundary_eligibility_is_exact() {
         "a missing-compute stopping shape has no stop-side evidence to reconcile"
     );
 }
+
+#[test]
+fn confirmed_checkpoint_survives_strict_continuation_parse() {
+    let mut record = kubernetes_stopping_record();
+    record.checkpoint[KUBERNETES_RESTART_STOP_CONFIRMATION_KEY] =
+        serde_json::to_value(KubernetesRestartStopConfirmation {
+            evidence: KubernetesRestartStopEvidence::ObservedStopped,
+            original_state: ComputeControlState::Running,
+            original_error_code: None,
+            original_error_message: None,
+            previous_confirmation: None,
+        })
+        .unwrap();
+    // The strict full-target parse behind the start continuation must accept
+    // the confirmation key exactly like the Docker observation key.
+    let parsed: BuilderControlTarget = serde_json::from_value(record.checkpoint.clone()).unwrap();
+    assert_eq!(
+        parsed,
+        BuilderControlTarget::from_observation_checkpoint(&record.checkpoint).unwrap()
+    );
+    // Without the whitelist entry this fails with "unknown field".
+    let mut unwhitelisted = record.checkpoint.clone();
+    unwhitelisted["stray_future_key"] = serde_json::Value::Bool(true);
+    assert!(serde_json::from_value::<BuilderControlTarget>(unwhitelisted).is_err());
+}
+
+#[test]
+fn durable_kubernetes_stop_boundary_confirmation_honored_by_continuation() {
+    let mut record = kubernetes_stopping_record();
+    assert!(
+        !kubernetes_stop_boundary_confirmed(&record),
+        "no confirmation key keeps the receipt requirement"
+    );
+    record.checkpoint[KUBERNETES_RESTART_STOP_CONFIRMATION_KEY] =
+        serde_json::json!("not-an-object");
+    assert!(
+        !kubernetes_stop_boundary_confirmed(&record),
+        "malformed evidence is not a durable fact"
+    );
+    record.checkpoint[KUBERNETES_RESTART_STOP_CONFIRMATION_KEY] =
+        serde_json::to_value(KubernetesRestartStopConfirmation {
+            evidence: KubernetesRestartStopEvidence::ObservedStopped,
+            original_state: ComputeControlState::RecoveryRequired,
+            original_error_code: Some("ERR_STOP_REPLY_TIMEOUT".into()),
+            original_error_message: Some("original scale-down response timed out".into()),
+            previous_confirmation: None,
+        })
+        .unwrap();
+    assert!(
+        kubernetes_stop_boundary_confirmed(&record),
+        "a recorded external-stop boundary replaces the live receipt requirement"
+    );
+}

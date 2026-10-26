@@ -67,7 +67,7 @@ async fn captured_stopping(
             kind: AppResourceKind::StatefulSet,
             name: format!("rcoder-app-builder-{}", app.app_id),
             uid: "d".repeat(36),
-            resource_version: None,
+            resource_version: Some("42".into()),
         }),
         pod: None,
         resource_binding: None,
@@ -252,6 +252,35 @@ async fn contract(store: &ToastyUserAppStore) {
             .await,
         Err(UserAppStoreError::InvalidOperation(_))
     ));
+
+    // The confirm→continue chain: the start continuation must accept the
+    // confirmed checkpoint through the strict full-target parse and preserve
+    // the confirmation evidence (with its original diagnostics) in the
+    // rebuilt starting checkpoint.
+    let target = BuilderControlTarget::from_observation_checkpoint(&confirmed.checkpoint).unwrap();
+    let resumed = store
+        .resume_builder_restart_start(&confirmed, &target)
+        .await
+        .unwrap();
+    assert_eq!(resumed.stage, "starting");
+    assert_eq!(resumed.state, ComputeControlState::Running);
+    assert_eq!(resumed.revision, confirmed.revision + 1);
+    let evidence: KubernetesRestartStopConfirmation = serde_json::from_value(
+        resumed
+            .checkpoint
+            .get(KUBERNETES_RESTART_STOP_CONFIRMATION_KEY)
+            .cloned()
+            .expect("confirmation evidence must survive the continuation CAS"),
+    )
+    .unwrap();
+    assert_eq!(
+        evidence.original_state,
+        ComputeControlState::RecoveryRequired
+    );
+    assert_eq!(
+        evidence.original_error_code.as_deref(),
+        Some("ERR_STOP_REPLY_TIMEOUT")
+    );
 }
 
 #[cfg(feature = "userapp-turso")]
