@@ -118,3 +118,137 @@ async fn retained_storage_wire_preserves_original_uid_and_rejects_consumers_or_r
         }
     }).await.unwrap();
 }
+
+/// Receipt-free running observation of the captured application Deployment
+/// (deadline-settlement probe): positive only when the spec keeps at least one
+/// desired replica AND the controller reports executing replicas on the exact
+/// captured UID, double-read. Scaled-down, non-executing, absent and replaced
+/// controllers never observe as running; every case stays read-only.
+#[tokio::test]
+async fn app_running_observation_requires_desired_and_executing_replicas() {
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        for scenario in [
+            "running",
+            "scaled-down",
+            "not-executing",
+            "absent",
+            "replaced-uid",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            drop(rustls::crypto::ring::default_provider().install_default());
+            let runtime = runtime(
+                kube::Client::try_from(kube::Config::new(format!("http://{address}").parse().unwrap())).unwrap(),
+            );
+            let reads = Arc::new(AtomicUsize::new(0));
+            let server_reads = reads.clone();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let (head, offset, length) = loop {
+                        let count = stream.read(&mut chunk).await.unwrap();
+                        assert!(count > 0);
+                        bytes.extend_from_slice(&chunk[..count]);
+                        if let Some(end) = bytes.windows(4).position(|b| b == b"\r\n\r\n") {
+                            let head =
+                                String::from_utf8_lossy(&bytes[..end]).into_owned();
+                            let length = head
+                                .lines()
+                                .find_map(|line| {
+                                    let (k, v) = line.split_once(':')?;
+                                    k.eq_ignore_ascii_case("content-length")
+                                        .then(|| v.trim().parse::<usize>().unwrap())
+                                })
+                                .unwrap_or(0);
+                            break (head, end + 4, length);
+                        }
+                    };
+                    while bytes.len() < offset + length {
+                        let count = stream.read(&mut chunk).await.unwrap();
+                        assert!(count > 0);
+                        bytes.extend_from_slice(&chunk[..count]);
+                    }
+                    let method = head.split_whitespace().next().unwrap();
+                    let path = head.split_whitespace().nth(1).unwrap().split('?').next().unwrap();
+                    assert_eq!(method, "GET", "running observation is read-only");
+                    let served = server_reads.fetch_add(1, Ordering::SeqCst) + 1;
+                    let (code, value) = if path.ends_with("/deployments/rcoder-app-51") {
+                        match scenario {
+                            "absent" => (
+                                404,
+                                serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","code":404}),
+                            ),
+                            "replaced-uid" if served >= 2 => (
+                                200,
+                                serde_json::json!({"apiVersion":"apps/v1","kind":"Deployment",
+                                    "metadata":{"name":"rcoder-app-51","uid":"replacement-controller"},
+                                    "spec":{"replicas":1},"status":{"replicas":1}}),
+                            ),
+                            "scaled-down" => (
+                                200,
+                                serde_json::json!({"apiVersion":"apps/v1","kind":"Deployment",
+                                    "metadata":{"name":"rcoder-app-51","uid":"app-uid-original"},
+                                    "spec":{"replicas":0},"status":{"replicas":0}}),
+                            ),
+                            "not-executing" => (
+                                200,
+                                serde_json::json!({"apiVersion":"apps/v1","kind":"Deployment",
+                                    "metadata":{"name":"rcoder-app-51","uid":"app-uid-original"},
+                                    "spec":{"replicas":1},"status":{"replicas":0}}),
+                            ),
+                            _ => (
+                                200,
+                                serde_json::json!({"apiVersion":"apps/v1","kind":"Deployment",
+                                    "metadata":{"name":"rcoder-app-51","uid":"app-uid-original"},
+                                    "spec":{"replicas":1},"status":{"replicas":1}}),
+                            ),
+                        }
+                    } else {
+                        (
+                            404,
+                            serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","code":404}),
+                        )
+                    };
+                    let body = value.to_string();
+                    let response = format!(
+                        "HTTP/1.1 {code} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let target = shared_types::UserAppMutationTarget {
+                context: UserAppExecutionContext {
+                    app_id: "51".into(),
+                    lifecycle_id: "original-life".into(),
+                    operation_id: "settle".into(),
+                    executor_id: "settler".into(),
+                    request_fingerprint: "a".repeat(64),
+                },
+                resource: AppResourceIdentity {
+                    kind: AppResourceKind::Deployment,
+                    name: "rcoder-app-51".into(),
+                    uid: "app-uid-original".into(),
+                    resource_version: Some("7".into()),
+                },
+            };
+            let observed = container_runtime_api::UserAppDeploymentRuntime::observe_app_compute_running(&runtime, &target).await;
+            match scenario {
+                "running" => assert!(observed.expect("desired and executing replicas observe as running")),
+                "replaced-uid" => assert!(
+                    matches!(observed, Err(container_runtime_api::ContainerRuntimeError::Conflict(_))),
+                    "a replacement controller is never the captured target: {observed:?}"
+                ),
+                _ => assert!(
+                    !observed.expect("scaled-down, non-executing and absent shapes are not running"),
+                    "{scenario}"
+                ),
+            }
+            server.abort();
+        }
+    })
+    .await
+    .unwrap();
+}

@@ -11,7 +11,77 @@ pub(super) struct BuilderReuseSnapshot {
     pub(super) volumes: Vec<shared_types::AppResourceIdentity>,
 }
 
+/// Inspect the captured CID: None on 404 (absent), errors on transport.
+async fn inspect_captured_running(
+    client: bollard::Docker,
+    cid: &str,
+) -> Result<Option<bollard::models::ContainerInspectResponse>> {
+    match client.inspect_container(cid, None).await {
+        Ok(current) => Ok(Some(current)),
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => Ok(None),
+        Err(error) => Err(Error::DockerError(format!(
+            "Observe captured running builder: {error}"
+        ))),
+    }
+}
+
+/// The exact captured identity is executing (running and not restarting).
+fn captured_builder_executing(
+    inspect: &bollard::models::ContainerInspectResponse,
+    target: &BuilderControlTarget,
+) -> Result<bool> {
+    let Some(resource) = target.workload.as_ref() else {
+        return Ok(false);
+    };
+    if control_identity_with_binding(
+        inspect,
+        &resource.name,
+        &target.context,
+        target.resource_binding.as_ref(),
+        false,
+    )? != *resource
+    {
+        return Err(Error::Conflict(
+            "Captured Docker builder changed during running observation".into(),
+        ));
+    }
+    Ok(inspect
+        .state
+        .as_ref()
+        .is_some_and(|state| state.running == Some(true) && state.restarting != Some(true)))
+}
+
 impl DockerRuntime {
+    /// Positive running observation of the captured Docker builder: the
+    /// exact captured CID still exists (identity-checked) and Docker reports
+    /// it executing (state.running, not restarting). No operation receipt is
+    /// consulted; readiness is not judged. Read-only with a recheck.
+    pub(super) async fn observe_retained_builder_running(
+        &self,
+        target: &BuilderControlTarget,
+    ) -> Result<bool> {
+        target.validate().map_err(Error::ConfigurationError)?;
+        let Some(resource) = target.workload.as_ref() else {
+            return Ok(false);
+        };
+        if resource.kind != shared_types::AppResourceKind::Container {
+            return Ok(false);
+        }
+        let client = self.inner.get_docker_client();
+        let Some(first) = inspect_captured_running(client.clone(), &resource.uid).await? else {
+            return Ok(false);
+        };
+        if !captured_builder_executing(&first, target)? {
+            return Ok(false);
+        }
+        match inspect_captured_running(client.clone(), &resource.uid).await? {
+            Some(second) => captured_builder_executing(&second, target),
+            None => Ok(false),
+        }
+    }
+
     pub(super) async fn observe_retained_builder_stopped(
         &self,
         target: &BuilderControlTarget,

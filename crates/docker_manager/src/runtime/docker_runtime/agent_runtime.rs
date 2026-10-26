@@ -541,6 +541,13 @@ impl AgentContainerRuntime for DockerRuntime {
         self.observe_retained_builder_stopped(target).await
     }
 
+    async fn observe_builder_compute_running(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        self.observe_retained_builder_running(target).await
+    }
+
     async fn archive_builder_restart(
         &self,
         target: &shared_types::BuilderControlTarget,

@@ -755,6 +755,64 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         crate::runtime::docker_compute_receipt::save_app_start(&target.target).await
     }
 
+    /// Receipt-free positive running observation of the captured application
+    /// container: the exact captured UID still exists and Docker reports it
+    /// executing. Readiness is not judged; read-only with a recheck.
+    async fn observe_app_compute_running(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        shared_types::validate_identifier(&target.context.app_id, "app_id")
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        if target.resource.kind != shared_types::AppResourceKind::Container
+            || target.resource.uid.is_empty()
+            || target.resource.name != app_deployment_name(&target.context.app_id)
+        {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Invalid application running observation target".into(),
+            ));
+        }
+        let client = self.inner.get_docker_client();
+        let name = target.resource.name.clone();
+        let inspect_once = || {
+            let client = client.clone();
+            let name = name.clone();
+            async move {
+                match client.inspect_container(&name, None).await {
+                    Ok(current) => Ok(Some(current)),
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    }) => Ok(None),
+                    Err(error) => Err(ContainerRuntimeError::DockerError(format!(
+                        "Observe captured running application: {error}"
+                    ))),
+                }
+            }
+        };
+        let identity_executing = |inspect: &bollard::models::ContainerInspectResponse| {
+            if inspect.id.as_deref() != Some(target.resource.uid.as_str()) {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Captured application container changed during running observation".into(),
+                ));
+            }
+            Ok(inspect
+                .state
+                .as_ref()
+                .is_some_and(|state| state.running == Some(true) && state.restarting != Some(true)))
+        };
+        let Some(first) = inspect_once().await? else {
+            return Ok(false);
+        };
+        if !identity_executing(&first)? {
+            return Ok(false);
+        }
+        match inspect_once().await? {
+            Some(second) => identity_executing(&second),
+            None => Ok(false),
+        }
+    }
+
     async fn reconcile_app_compute_start(
         &self,
         target: &shared_types::UserAppMutationTarget,

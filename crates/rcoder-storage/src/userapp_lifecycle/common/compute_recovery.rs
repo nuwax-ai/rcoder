@@ -315,7 +315,10 @@ pub(super) async fn mark_unheld(
     observed_ms: i64,
 ) -> Result<i64, UserAppStoreError> {
     use crate::db::models;
-    repo::claim_app(tx, backend, &snapshot.app_id).await?;
+    // No claim_app: this runs every scan round while the quiet window elapses
+    // and must not churn the application row. The anchor row's own
+    // set-if-NULL CAS is the serialization point; the control-side staleness
+    // guard is the settle CAS's record equality.
     let Some(row) = models::ComputeControlDeadline::filter_by_operation_id(&snapshot.operation_id)
         .first()
         .exec(tx)
@@ -365,9 +368,9 @@ pub(super) async fn clear_unheld(
     backend: Backend,
     snapshot: &ComputeControlRecord,
 ) -> Result<(), UserAppStoreError> {
-    repo::claim_app(tx, backend, &snapshot.app_id).await?;
-    // Only touch the row when an anchor exists: a still-renewed record hits
-    // this every scan round and must not churn the table.
+    // No claim_app (same per-round rationale as mark_unheld); only touch the
+    // row when an anchor exists: a still-renewed record hits this every scan
+    // round and must not churn the table.
     let changed = toasty::sql::statement(repo::sql(backend,
         "UPDATE userapp_compute_control_deadlines SET unheld_observed_ms=NULL WHERE operation_id=$1 AND unheld_observed_ms IS NOT NULL"))
         .bind(&snapshot.operation_id).exec(tx).await.map_err(storage)?;

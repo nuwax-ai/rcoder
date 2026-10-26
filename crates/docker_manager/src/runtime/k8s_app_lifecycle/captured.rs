@@ -813,13 +813,21 @@ impl KubernetesRuntime {
                 "Invalid running observation target".into(),
             ));
         }
+        let exact_uid =
+            |deployment: &k8s_openapi::api::apps::v1::Deployment| -> ContainerRuntimeResult<bool> {
+                if deployment.metadata.uid.as_deref() != Some(target.resource.uid.as_str()) {
+                    return Err(ContainerRuntimeError::Conflict(
+                        "Captured application changed during running observation".into(),
+                    ));
+                }
+                Ok(true)
+            };
         let desired_and_executing = |deployment: &k8s_openapi::api::apps::v1::Deployment| {
-            deployment.metadata.uid.as_deref() == Some(target.resource.uid.as_str())
-                && deployment
-                    .spec
-                    .as_ref()
-                    .and_then(|spec| spec.replicas)
-                    .is_some_and(|replicas| replicas >= 1)
+            deployment
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.replicas)
+                .is_some_and(|replicas| replicas >= 1)
                 && deployment
                     .status
                     .as_ref()
@@ -836,6 +844,7 @@ impl KubernetesRuntime {
         let Some(current) = current else {
             return Ok(false);
         };
+        exact_uid(&current)?;
         if !desired_and_executing(&current) {
             return Ok(false);
         }
@@ -846,6 +855,10 @@ impl KubernetesRuntime {
             .map_err(|error| {
                 ContainerRuntimeError::K8sError(format!("Recheck running application: {error}"))
             })?;
-        Ok(after.is_some_and(|after| desired_and_executing(&after)))
+        let Some(after) = after else {
+            return Ok(false);
+        };
+        exact_uid(&after)?;
+        Ok(desired_and_executing(&after))
     }
 }

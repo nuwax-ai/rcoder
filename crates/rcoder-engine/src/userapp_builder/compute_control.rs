@@ -2211,7 +2211,10 @@ async fn settlement_surface_note(
                         false
                     }
                 };
-                let running = match state.runtime().reconcile_app_compute_start(&expected).await {
+                // Receipt-free running probe: an instance started by a
+                // PREVIOUS operation carries no receipt for this one, and the
+                // never-dispatched-stop shape must stay settleable.
+                let running = match state.runtime().observe_app_compute_running(&expected).await {
                     Ok(running) => running,
                     Err(error) => {
                         tracing::debug!(
@@ -2353,22 +2356,13 @@ async fn settlement_surface_note(
                             false
                         }
                     };
-                    let running = if receipt_running {
-                        true
-                    } else {
-                        match state.runtime().observe_app_compute_running(&expected).await {
-                            Ok(running) => running,
-                            Err(error) => {
-                                tracing::debug!(
-                                    %error,
-                                    operation_id = %current.operation_id,
-                                    "Deadline settlement application running-observation failed; continuing classification"
-                                );
-                                false
-                            }
-                        }
-                    };
-                    if running {
+                    // Only RECEIPT-CONFIRMED readiness (which includes the
+                    // running-pod check) defers to the completion branch. The
+                    // receipt-free probe observes desired+executing replicas,
+                    // which a permanently Pending or ImagePullBackOff pod also
+                    // satisfies — letting it gate here would defer the
+                    // never-ready form forever while completion also fails.
+                    if receipt_running {
                         tracing::debug!(
                             operation_id = %current.operation_id,
                             "Deadline-expired application restart is running; preferring normal completion over settlement"
