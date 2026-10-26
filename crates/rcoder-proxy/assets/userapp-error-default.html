@@ -4,6 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
+<!-- 大多数错误态是瞬态（服务启动中/standby 摘流窗口），整页每 5s 自动重载，
+     恢复后自然回到应用；仍在错误中则重新渲染本页。无 JS 依赖，脚本失败也能恢复。 -->
+<meta http-equiv="refresh" content="5">
 <title>{{RCODER_TITLE}} · {{RCODER_STATUS}}</title>
 <style>
   :root {
