@@ -1001,9 +1001,16 @@ impl PortProxy {
         ctx: &mut TrackingCtx,
         route: &crate::service::types::UserAppRouteCtx,
     ) {
-        let Some(advisor) = self.failure_advisor_slot.load_full() else {
-            return;
-        };
+        // EType 归类先行：standby 标记值即平台来源证据（managed 配置的 strip
+        // 规则保证应用无法伪造该值），替换不依赖 advisor；advisor 尽力而为，
+        // 仅用于文案细分（starting/stopped/failed）。
+        let etype_header = upstream_response
+            .headers
+            .get(shared_types::X_PINGAP_ETYPE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let standby_window = etype_header.as_deref().is_some_and(is_standby_etype_header);
+        let advisor = self.failure_advisor_slot.load_full();
         // 失败路径剩余预算（无唤醒上下文时用短上限——诊断绝不延长已耗尽的
         // 代理等待）
         let budget = ctx
@@ -1016,42 +1023,40 @@ impl PortProxy {
                     .min(Duration::from_millis(1500))
             })
             .unwrap_or_else(|| Duration::from_millis(1000));
-        let Some(hint) = advisor
-            .advise_current(&route.app_id, route.stage, budget)
-            .await
-        else {
-            return;
+        // advisor 预算经常小于 standby 窗口的完整观察时延（定位+拉取+复核），
+        // 其 None/超时只降级文案，不再放弃替换（2026-10-27 事故：标记到达
+        // 浏览器但正文原样透传）。
+        let hint = match advisor.as_ref() {
+            Some(advisor) => {
+                advisor
+                    .advise_current(&route.app_id, route.stage, budget)
+                    .await
+            }
+            None => None,
         };
-        if !hint.error_origin_confirmed {
-            return;
+        if !standby_window {
+            let confirmed = hint.as_ref().is_some_and(|h| h.error_origin_confirmed);
+            if !confirmed {
+                return;
+            }
         }
         let Some(renderer) = self.error_pages_slot.load_full() else {
             return;
         };
         // 替换决策读取页面前同样触发按需刷新（错误请求是收敛路径之一）
         renderer.request_refresh();
-        let connect_failure = upstream_response
-            .headers
-            .get(shared_types::X_PINGAP_ETYPE_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(is_connect_etype_header);
-        // standby 摘流窗口（mock 直出 503，见 app-cli compiler）：状态保留 503，
-        // 业务细分（starting/stopped/failed）由 hint 的就绪观察给出。
-        let standby_window = upstream_response
-            .headers
-            .get(shared_types::X_PINGAP_ETYPE_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(is_standby_etype_header);
+        let connect_failure = etype_header.as_deref().is_some_and(is_connect_etype_header);
         if connect_failure {
             if let Err(error) = upstream_response.set_status(503) {
                 tracing::warn!("normalize trusted proxy connection failure status failed: {error}");
                 return;
             }
-            ctx.failure_hint = Some(hint.clone());
+            ctx.failure_hint = hint.clone();
             ctx.failure_hint_at = Some(tokio::time::Instant::now());
             ctx.fresh_failure_evidence = true;
             Self::capture_proxy_transition(ctx);
         }
+        let cause = replacement_cause(hint.as_ref(), standby_window);
         let status = upstream_response.status.as_u16();
         let diagnostic_id = crate::error_page::new_diagnostic_id();
         // 语言协商与 write_error_response 同一函数（Accept-Language → locale）
@@ -1065,14 +1070,13 @@ impl PortProxy {
         let (content_type, body): (&'static str, bytes::Bytes) =
             match crate::error_page::negotiate(session) {
                 crate::error_page::ErrorRepresentation::Document => {
-                    let page_cause = hint.page_cause();
-                    let (title, message) = page_cause.copywriting(locale);
+                    let (title, message) = cause.copywriting(locale);
                     let vars = crate::error_page::ErrorPageVars {
                         title,
                         message,
                         diagnostic_id: diagnostic_id.clone(),
                         status: status.to_string(),
-                        cause_slug: crate::error_page::cause_slug(page_cause).to_string(),
+                        cause_slug: crate::error_page::cause_slug(cause).to_string(),
                     };
                     (
                         "text/html; charset=utf-8",
@@ -1080,7 +1084,7 @@ impl PortProxy {
                     )
                 }
                 crate::error_page::ErrorRepresentation::Machine => {
-                    let (_title, message) = hint.page_cause().copywriting(locale);
+                    let (_title, message) = cause.copywriting(locale);
                     let payload = crate::error_page::MachineErrorPayload::new(
                         status,
                         if standby_window {
@@ -1091,7 +1095,10 @@ impl PortProxy {
                         message,
                         diagnostic_id.clone(),
                     )
-                    .with_operation_id(hint.transition_operation_id().map(str::to_string));
+                    .with_operation_id(
+                        hint.as_ref()
+                            .and_then(|h| h.transition_operation_id().map(str::to_string)),
+                    );
                     ("application/json", payload.to_body().into())
                 }
             };
@@ -1141,9 +1148,11 @@ impl PortProxy {
             tracing::warn!("rewrite retry-after on replaced response failed: {error}");
         }
         if connect_failure
-            && let Some(operation_id) = hint.transition_operation_id()
+            && let Some(operation_id) = hint
+                .as_ref()
+                .and_then(|h| h.transition_operation_id().map(str::to_string))
             && let Err(error) =
-                upstream_response.insert_header("x-rcoder-operation-id", operation_id)
+                upstream_response.insert_header("x-rcoder-operation-id", &operation_id)
         {
             tracing::warn!("insert current proxy operation identity failed: {error}");
         }
@@ -1158,7 +1167,7 @@ impl PortProxy {
             stage = route.stage,
             %status,
             diagnostic_id = %diagnostic_id,
-            readiness = ?hint.readiness_status,
+            readiness = ?hint.as_ref().map(|h| h.readiness_status),
             standby = standby_window,
             "replaced confirmed pingap self-produced error body"
         );
@@ -1303,6 +1312,21 @@ fn is_connect_etype_header(value: &str) -> bool {
 /// 该窗口无 upstream 代理，应用不可能注入同名头）。
 fn is_standby_etype_header(value: &str) -> bool {
     value.eq_ignore_ascii_case(shared_types::PINGAP_STANDBY_ETYPE)
+}
+
+/// 替换文案档位：advisor 观察确认时用其细分（starting/stopped/failed/…）；
+/// standby 窗口观察缺失（advisor 超时/不可达——其 1s 预算常输给完整观察
+/// 时延）时兜底 Restarting（摘流正文本身即"重启中"语义）；非 standby 且未
+/// 确认的情况不会经过门控，返回 Generic 仅为穷尽。
+fn replacement_cause(
+    hint: Option<&crate::error_page::UserAppProxyFailureHint>,
+    standby_window: bool,
+) -> crate::error_page::ErrorPageCause {
+    match hint {
+        Some(h) if h.error_origin_confirmed => h.page_cause(),
+        _ if standby_window => crate::error_page::ErrorPageCause::Restarting,
+        _ => crate::error_page::ErrorPageCause::Generic,
+    }
 }
 
 /// 替换后的 Retry-After 决策：连接失败统一 15s（唤醒恢复节奏）；standby
@@ -1658,6 +1682,37 @@ mod official_restart_failure_tests {
         assert_eq!(replacement_retry_after(false, true, Some("  ")), None);
         assert_eq!(replacement_retry_after(false, true, None), None);
         assert_eq!(replacement_retry_after(false, false, Some("2")), None);
+    }
+
+    /// 替换文案档位：advisor 确认观察给细分文案；standby 观察缺失兜底
+    /// Restarting（不再因 advisor 超时放弃替换——2026-10-27 事故）。
+    #[test]
+    fn replacement_cause_survives_missing_advisor_for_standby() {
+        let confirmed = |readiness: shared_types::UserAppReadinessStatus| {
+            crate::error_page::UserAppProxyFailureHint {
+                readiness_status: Some(readiness),
+                error_origin_confirmed: true,
+                proxy_confirmation: None,
+            }
+        };
+        assert_eq!(
+            replacement_cause(
+                Some(&confirmed(shared_types::UserAppReadinessStatus::Stopped)),
+                true
+            ),
+            crate::error_page::ErrorPageCause::Stopped,
+            "advisor evidence still refines the standby copy"
+        );
+        assert_eq!(
+            replacement_cause(None, true),
+            crate::error_page::ErrorPageCause::Restarting,
+            "missing advisor must not forfeit the standby replacement"
+        );
+        assert_eq!(
+            replacement_cause(None, false),
+            crate::error_page::ErrorPageCause::Generic,
+            "non-standby without confirmation stays generic"
+        );
     }
 
     #[test]
