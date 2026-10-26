@@ -1239,3 +1239,84 @@ async fn user_refresh_candidates_are_scoped_to_the_requested_family() {
         "newer other-family rows must not crowd out the family candidate set"
     );
 }
+
+/// Codex 建议固化的表锁反例（统一预算）：候选查询被 `LOCK TABLE projects` 阻塞时，
+/// 回源必须在自身 durable 预算内返回超时错误，而不是等外层保护截断——修复前
+/// 初始查询不限时，实测 100ms 预算 + 表锁 350ms 仍未结束。
+#[tokio::test]
+async fn user_refresh_budget_covers_a_blocked_candidate_query() {
+    let Some(dsn) = test_dsn().await else {
+        eprintln!("[skip] {DSN_ENV} not set");
+        return;
+    };
+    let id = format!("budget-refresh-{}", uuid_suffix());
+    let user_id = format!("user-{id}");
+
+    let writer = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .unwrap();
+    let mut info = ProjectAndContainerInfo::new(id.clone());
+    info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+    info.set_user_id(Some(user_id.clone()));
+    info.set_container(Some(container_for(&id)));
+    writer
+        .insert_with_session_durable(id.clone(), Arc::new(info), &format!("sess-{id}"))
+        .await
+        .unwrap();
+    assert!(writer.wait_drained(Duration::from_secs(5)).await);
+
+    // 单连接 + 100ms durable 预算的受测副本。
+    let reader = PgStore::connect(
+        &PostgresConfig {
+            max_connections: Some(1),
+            min_connections: Some(1),
+            durable_commit_timeout_ms: Some(100),
+            ..pg_config(&dsn)
+        },
+        "test-ns".into(),
+        "cluster.local".into(),
+    )
+    .await
+    .unwrap();
+    let database = reader.database.clone();
+    let (started, ready) = tokio::sync::oneshot::channel::<()>();
+    let (release, waiting) = tokio::sync::oneshot::channel::<()>();
+    let held = tokio::spawn(async move {
+        database
+            .execute(move |mut db| async move {
+                let mut tx = db.transaction().await?;
+                toasty::sql::statement("LOCK TABLE projects IN ACCESS EXCLUSIVE MODE")
+                    .exec(&mut tx)
+                    .await?;
+                started.send(()).unwrap();
+                waiting.await.unwrap();
+                tx.rollback().await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    });
+    ready.await.unwrap();
+
+    let started_at = std::time::Instant::now();
+    let attempt = tokio::time::timeout(
+        Duration::from_secs(2),
+        reader.refresh_user_container(&user_id, &shared_types::ServiceType::ComputerAgentRunner),
+    )
+    .await;
+    release.send(()).unwrap();
+    held.await.unwrap();
+    let elapsed = started_at.elapsed();
+    let attempt = attempt.expect("the refresh must be covered by its own durable budget");
+    let error = attempt.expect_err("a blocked candidate query must surface the budget timeout");
+    assert!(
+        error.to_string().contains("exceeded the durable deadline"),
+        "{error:#}"
+    );
+    // 预算是 100ms：必须在预算量级内返回（宽松上界 600ms 覆盖调度与连接建立），
+    // 绝不是等 2s 外层或无限期。
+    assert!(
+        elapsed < Duration::from_millis(600),
+        "refresh returned in {elapsed:?}; the shared budget must bound it"
+    );
+}
