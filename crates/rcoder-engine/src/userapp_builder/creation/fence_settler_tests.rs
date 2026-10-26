@@ -11,8 +11,8 @@ use container_runtime_api::{
 };
 use dashmap::DashMap;
 use shared_types::{
-    AppResourceIdentity, AppResourceKind, BuilderControlTarget, ServiceType, UserAppAdmission,
-    UserAppAdmissionOutcome, UserAppControlCommand, UserAppOperationKind,
+    AppResourceIdentity, AppResourceKind, BuilderControlTarget, ContainerBasicInfo, ServiceType,
+    UserAppAdmission, UserAppAdmissionOutcome, UserAppControlCommand, UserAppOperationKind,
 };
 use std::collections::HashMap;
 
@@ -110,6 +110,11 @@ pub(crate) struct FenceRuntime {
     /// 显式 holder 死亡探针判定（模型 Docker flock 覆写）；
     /// None = 默认推导（K8s 极性）。
     pub(crate) receipt_holder_dead: Mutex<Option<bool>>,
+    /// 结算对账证据旋钮：true 时 reconcile_builder_compute_start 报告运行中。
+    pub(crate) builder_start_observed: std::sync::atomic::AtomicBool,
+    /// 结算对账证据旋钮：true 时 prepare_builder_compute_retry 报告
+    /// Ok(None)（启动已提交、只能观察——契约原文语义）。
+    pub(crate) builder_retry_committed: std::sync::atomic::AtomicBool,
     /// 免回执的原创建运行时权威观测（陈旧 Running 对账用）；
     /// None = trait 默认 Unsupported（保守保持）。
     pub(crate) unbound_creation_authority:
@@ -156,6 +161,8 @@ impl FenceRuntime {
             app_absence_error: Default::default(),
             app_absence_probes: Default::default(),
             receipt_holder_dead: Mutex::new(None),
+            builder_start_observed: Default::default(),
+            builder_retry_committed: Default::default(),
             unbound_creation_authority: Mutex::new(None),
             unbound_authority_transport_fails: Default::default(),
         })
@@ -187,6 +194,48 @@ fn status_of(phase: &str, replicas: i32) -> DeploymentStatus {
 
 #[async_trait::async_trait]
 impl AgentContainerRuntime for FenceRuntime {
+    // -- settlement-evidence knobs (deadline takeover tests) ------------------
+
+    async fn reconcile_builder_compute_start(
+        &self,
+        _target: &BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        if self
+            .builder_start_observed
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(Some(ContainerBasicInfo {
+                container_id: "settled-fixture-container".into(),
+                container_name: "settled-fixture".into(),
+                container_ip: "127.0.0.1".into(),
+                internal_port: 1,
+                external_port: 1,
+                project_id: _target.context.app_id.clone(),
+                status: "running".into(),
+                created_at: chrono::Utc::now(),
+                service_url: String::new(),
+                workload_uid: _target.workload.as_ref().map(|w| w.uid.clone()),
+            }));
+        }
+        Ok(None)
+    }
+
+    async fn prepare_builder_compute_retry(
+        &self,
+        _target: &BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<BuilderControlTarget>> {
+        if self
+            .builder_retry_committed
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // 契约语义：None = 原启动已提交、只能继续观察。
+            return Ok(None);
+        }
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Conditional builder retry is unsupported".into(),
+        ))
+    }
+
     async fn observe_unbound_builder_creation_authority(
         &self,
         _context: &shared_types::UserAppExecutionContext,

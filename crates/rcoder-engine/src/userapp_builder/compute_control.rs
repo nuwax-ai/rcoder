@@ -2107,22 +2107,76 @@ async fn settlement_surface_note(
                         return Ok(None);
                     }
                 };
-                if state
+                // Evidence errors are classified, never propagated: the stop
+                // receipt query itself conflicts while the workload still runs
+                // (replicas != 0), and that shape must stay settleable.
+                let receipt = match state
                     .runtime()
                     .reconcile_builder_compute_stop(&target)
-                    .await?
+                    .await
                 {
+                    Ok(confirmed) => confirmed,
+                    Err(error) => {
+                        tracing::debug!(
+                            %error,
+                            operation_id = %current.operation_id,
+                            "Deadline settlement stop-receipt query failed; falling back to observation"
+                        );
+                        false
+                    }
+                };
+                if receipt {
                     note("stop receipt confirmed after the deadline")
-                } else if state
-                    .runtime()
-                    .observe_builder_compute_stopped(&target)
-                    .await?
-                {
-                    note("workload observed stopped after the deadline")
                 } else {
-                    note(
-                        "workload still running after the quiet window; the stop write can no longer land",
-                    )
+                    let observed_stopped = match state
+                        .runtime()
+                        .observe_builder_compute_stopped(&target)
+                        .await
+                    {
+                        Ok(observed) => observed,
+                        Err(error) => {
+                            tracing::debug!(
+                                %error,
+                                operation_id = %current.operation_id,
+                                "Deadline settlement stopped-observation failed; deferring"
+                            );
+                            false
+                        }
+                    };
+                    // A positive RUNNING observation — not a double negative —
+                    // proves the stop write never landed (and after the quiet
+                    // window it can no longer land). Ambiguous shapes (scaled
+                    // to zero with pods still terminating, or unreadable)
+                    // defer: a double false proves nothing.
+                    let running = match state
+                        .runtime()
+                        .reconcile_builder_compute_start(&target)
+                        .await
+                    {
+                        Ok(Some(_)) => true,
+                        Ok(None) => false,
+                        Err(error) => {
+                            tracing::debug!(
+                                %error,
+                                operation_id = %current.operation_id,
+                                "Deadline settlement running-observation failed; deferring"
+                            );
+                            false
+                        }
+                    };
+                    if observed_stopped {
+                        note("workload observed stopped after the deadline")
+                    } else if running {
+                        note(
+                            "workload still running after the quiet window; the stop write can no longer land",
+                        )
+                    } else {
+                        tracing::debug!(
+                            operation_id = %current.operation_id,
+                            "Deadline settlement stop surface is ambiguous (likely mid-teardown); deferring"
+                        );
+                        return Ok(None);
+                    }
                 }
             }
             UserAppOperationScope::Prod | UserAppOperationScope::Application => {
@@ -2143,22 +2197,47 @@ async fn settlement_surface_note(
                         return Ok(None);
                     }
                 };
-                if state
-                    .runtime()
-                    .reconcile_app_compute_stop(&expected)
-                    .await?
-                {
+                let receipt = match state.runtime().reconcile_app_compute_stop(&expected).await {
+                    Ok(confirmed) => confirmed,
+                    Err(error) => {
+                        tracing::debug!(
+                            %error,
+                            operation_id = %current.operation_id,
+                            "Deadline settlement application stop-receipt query failed; falling back to observation"
+                        );
+                        false
+                    }
+                };
+                let running = match state.runtime().reconcile_app_compute_start(&expected).await {
+                    Ok(running) => running,
+                    Err(error) => {
+                        tracing::debug!(
+                            %error,
+                            operation_id = %current.operation_id,
+                            "Deadline settlement application running-observation failed; deferring"
+                        );
+                        false
+                    }
+                };
+                if receipt {
                     note("application stop receipt confirmed after the deadline")
-                } else {
+                } else if running {
                     note(
                         "application workload still running after the quiet window; the stop write can no longer land",
                     )
+                } else {
+                    tracing::debug!(
+                        operation_id = %current.operation_id,
+                        "Deadline settlement application stop surface is ambiguous; deferring"
+                    );
+                    return Ok(None);
                 }
             }
         },
         Some(Stage::Starting) | Some(Stage::Verifying) => {
             // Only Restart reaches these stages; a running surface prefers the
-            // normal completion branch over a deadline failure.
+            // normal completion branch over a deadline failure. Evidence
+            // errors defer rather than fail the scan.
             match current.scope {
                 UserAppOperationScope::Dev => {
                     let target = match BuilderControlTarget::from_observation_checkpoint(
@@ -2178,27 +2257,43 @@ async fn settlement_surface_note(
                             return Ok(None);
                         }
                     };
-                    if state
+                    let running = match state
                         .runtime()
                         .reconcile_builder_compute_start(&target)
-                        .await?
-                        .is_some()
+                        .await
                     {
+                        Ok(info) => info,
+                        Err(error) => {
+                            tracing::debug!(
+                                %error,
+                                operation_id = %current.operation_id,
+                                "Deadline settlement running-observation failed; deferring"
+                            );
+                            return Ok(None);
+                        }
+                    };
+                    if running.is_some() {
                         tracing::debug!(
                             operation_id = %current.operation_id,
                             "Deadline-expired restart is running; preferring normal completion over settlement"
                         );
                         return Ok(None);
                     }
+                    // Contract: Ok(None) = the original start COMMITTED and can
+                    // only be observed (the app81 form); Ok(Some) = a retryable
+                    // owned partial exists. Neither alone proves settlement;
+                    // combined with the elapsed quiet window they record which
+                    // settled shape the surface is in.
                     match state.runtime().prepare_builder_compute_retry(&target).await {
-                        Ok(Some(_)) => {
+                        Ok(None) => {
                             note("start committed but never reached readiness within the deadline")
                         }
-                        Ok(None) => note(
-                            "start not committed after the quiet window; the write can no longer land",
+                        Ok(Some(_)) => note(
+                            "start left an owned retryable partial after the quiet window; the write can no longer land",
                         ),
-                        Err(_) => {
+                        Err(error) => {
                             tracing::debug!(
+                                %error,
                                 operation_id = %current.operation_id,
                                 "Deadline settlement cannot classify the start surface; deferring"
                             );
@@ -2224,11 +2319,19 @@ async fn settlement_surface_note(
                             return Ok(None);
                         }
                     };
-                    if state
-                        .runtime()
-                        .reconcile_app_compute_start(&expected)
-                        .await?
+                    let running = match state.runtime().reconcile_app_compute_start(&expected).await
                     {
+                        Ok(running) => running,
+                        Err(error) => {
+                            tracing::debug!(
+                                %error,
+                                operation_id = %current.operation_id,
+                                "Deadline settlement application running-observation failed; deferring"
+                            );
+                            return Ok(None);
+                        }
+                    };
+                    if running {
                         tracing::debug!(
                             operation_id = %current.operation_id,
                             "Deadline-expired application restart is running; preferring normal completion over settlement"

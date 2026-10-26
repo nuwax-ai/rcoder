@@ -454,17 +454,57 @@ async fn takeover_guard_reobserves_the_physical_lease() {
     assert!(takeover.as_lease().validate_retained().await.unwrap());
 }
 
-/// Codex round-2 point 1: settlement reconciles the operation's result side
-/// instead of claiming the clock proves it. At the stopping boundary with no
-/// stop evidence (the fixture runtime observes nothing), the post-window
-/// observation records "still running / cannot land anymore" evidence and the
-/// settlement carries it in the diagnostic.
+/// Codex round-3 issue 1 regression: a double-false stop surface proves
+/// nothing — scaled-to-zero-with-terminating-pods is exactly that shape — so
+/// the settlement defers instead of claiming the workload still runs.
 #[tokio::test]
-async fn stopping_boundary_settlement_records_the_observed_surface() {
+async fn ambiguous_stop_surface_defers_settlement() {
     let (state, runtime) = test_state().await;
     *runtime.receipt_verdict.lock().unwrap() = ReceiptVerdict::NotHeld;
     let record =
         stalled_restart_at_stages(&state, "settlesurface", &[ComputeControlStage::Stopping]).await;
+    state
+        .userapp_store
+        .bind_compute_control_deadline(&record, chrono::Utc::now().timestamp_millis() - 1)
+        .await
+        .unwrap();
+    state
+        .userapp_store
+        .mark_compute_control_unheld(
+            &record,
+            chrono::Utc::now().timestamp_millis() - COMPUTE_SETTLEMENT_QUIET_MS - 1,
+        )
+        .await
+        .unwrap();
+    settle_expired_compute_control(&state, &record)
+        .await
+        .unwrap();
+    let current = state
+        .userapp_store
+        .get_compute_control(&record.app_id, &record.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        current.state,
+        ComputeControlState::Running,
+        "a double-false stop surface (mid-teardown or unreadable) defers settlement"
+    );
+}
+
+/// Codex round-3 issue 2 regression: a POSITIVE running observation — not a
+/// double negative — settles the never-dispatched-stop shape (the stop receipt
+/// query conflicts while replicas are non-zero; that error is classified,
+/// never propagated).
+#[tokio::test]
+async fn running_stop_surface_settles_with_evidence() {
+    let (state, runtime) = test_state().await;
+    *runtime.receipt_verdict.lock().unwrap() = ReceiptVerdict::NotHeld;
+    runtime
+        .builder_start_observed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let record =
+        stalled_restart_at_stages(&state, "runningstop", &[ComputeControlStage::Stopping]).await;
     state
         .userapp_store
         .bind_compute_control_deadline(&record, chrono::Utc::now().timestamp_millis() - 1)
@@ -491,7 +531,58 @@ async fn stopping_boundary_settlement_records_the_observed_surface() {
     let message = settled.error_message.unwrap();
     assert!(
         message.contains("stop write can no longer land"),
-        "the observed surface is part of the settlement evidence: {message}"
+        "the positive running observation backs the settlement: {message}"
+    );
+}
+
+/// Codex round-3 issue 3 regression with corrected contract semantics:
+/// Ok(None) from the retry preparation means the start COMMITTED and can only
+/// be observed (the app81 form) — that is the settleable committed-not-ready
+/// shape, recorded in the settlement diagnostic.
+#[tokio::test]
+async fn committed_start_surface_settles_as_never_ready() {
+    let (state, runtime) = test_state().await;
+    *runtime.receipt_verdict.lock().unwrap() = ReceiptVerdict::NotHeld;
+    runtime
+        .builder_retry_committed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let record = stalled_restart_at_stages(
+        &state,
+        "committedstart",
+        &[
+            ComputeControlStage::Stopping,
+            ComputeControlStage::Stopped,
+            ComputeControlStage::Starting,
+        ],
+    )
+    .await;
+    state
+        .userapp_store
+        .bind_compute_control_deadline(&record, chrono::Utc::now().timestamp_millis() - 1)
+        .await
+        .unwrap();
+    state
+        .userapp_store
+        .mark_compute_control_unheld(
+            &record,
+            chrono::Utc::now().timestamp_millis() - COMPUTE_SETTLEMENT_QUIET_MS - 1,
+        )
+        .await
+        .unwrap();
+    settle_expired_compute_control(&state, &record)
+        .await
+        .unwrap();
+    let settled = state
+        .userapp_store
+        .get_compute_control(&record.app_id, &record.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.state, ComputeControlState::Failed);
+    let message = settled.error_message.unwrap();
+    assert!(
+        message.contains("committed but never reached readiness"),
+        "Ok(None) is the committed-not-ready evidence: {message}"
     );
 }
 
