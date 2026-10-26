@@ -101,6 +101,11 @@ fn drain_retry_due(operation_id: &str) -> bool {
     let map = NEXT_DUE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = tokio::time::Instant::now();
+    // 容量上限：键随悬案累积不会自动清除，超限先清掉已到期条目（悬案自身
+    // 收敛后其键不再有意义），避免无界增长。
+    if map.len() >= 4096 {
+        map.retain(|_, due| *due > now);
+    }
     match map.get(operation_id) {
         Some(due) if now < *due => false,
         _ => {

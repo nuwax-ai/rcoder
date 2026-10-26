@@ -260,14 +260,21 @@ pub(super) fn merge_observation(
     // 仍然留存）：操作已终态（成功/失败/被替代）后，活快照是唯一权威——
     // 物理事实不能被历史意图洗掉（2026-10-27 事故：跨滚动升级的 restart 以
     // failed 终态收口后，readiness 永远 starting/SERVICE_STARTING）。
-    let operation_in_flight = container.operation.as_ref().is_none_or(|op| {
-        !matches!(
+    // 在途判定以「驱动当前意图的操作身份」对账（Codex P1）：container.operation
+    // 可能是另一条已终态的历史 compute 记录，直接采用会误报 Ready；身份不
+    // 匹配/缺失时保守视为在途（维持降级）。
+    let operation_in_flight = match (
+        control.operation_id.as_deref(),
+        container.operation.as_ref(),
+    ) {
+        (Some(driving), Some(op)) if op.operation_id == driving => !matches!(
             op.state,
             ComputeControlState::Succeeded
                 | ComputeControlState::Failed
                 | ComputeControlState::Superseded
-        )
-    });
+        ),
+        _ => true,
+    };
     if control.intent == ControlIntent::StopAccepted && operation_in_flight {
         response.ready = false;
         response.status = Status::Stopping;
@@ -382,15 +389,19 @@ pub(super) mod fixtures {
         UserAppProxyReadiness, UserAppReadinessStatus,
     };
 
-    /// compute 控制记录（readiness 合并的意图权威来源）。
-    pub(crate) fn compute_control_record(state: ComputeControlState) -> ComputeControlRecord {
+    /// compute 控制记录（readiness 合并的意图权威来源）。`operation_id` 须与
+    /// 驱动意图的业务操作 id 对齐（生产布线一致；Codex P1 对账依据）。
+    pub(crate) fn compute_control_record(
+        state: ComputeControlState,
+        operation_id: &str,
+    ) -> ComputeControlRecord {
         ComputeControlRecord {
             created_at: chrono::Utc::now(),
             app_id: "282".into(),
             lifecycle_id: "life".into(),
             request_id: "req".into(),
             scope: UserAppOperationScope::Prod,
-            operation_id: "ctrl-1".into(),
+            operation_id: operation_id.into(),
             request_fingerprint: "1".repeat(64),
             generation: 1,
             revision: 92,
@@ -530,6 +541,7 @@ mod tests {
         let mut control = ReadinessControl::ordinary(Some(&restart));
         control.compute.operation = Some(fixtures::compute_control_record(
             ComputeControlState::Failed,
+            "op-1",
         ));
         let response = merge_observation(
             "282",
@@ -560,6 +572,7 @@ mod tests {
         let mut control = ReadinessControl::ordinary(Some(&restart));
         control.compute.operation = Some(fixtures::compute_control_record(
             ComputeControlState::Running,
+            "op-1",
         ));
         let response = merge_observation(
             "282",
@@ -575,6 +588,37 @@ mod tests {
             },
         );
         assert!(!response.ready);
+        assert_eq!(response.status, UserAppReadinessStatus::Starting);
+        assert_eq!(
+            response.reason_code,
+            Some(UserAppReadinessReason::ServiceStarting)
+        );
+    }
+
+    /// 历史已终态 compute 记录 ≠ 当前在途意图（Codex P1）：身份不匹配时
+    /// 保守维持在途降级，不得因历史终态误报 Ready。
+    #[test]
+    fn mismatched_terminal_history_keeps_in_flight_intent_downgrade() {
+        let restart = operation(UserAppOperationKind::Restart);
+        let mut control = ReadinessControl::ordinary(Some(&restart));
+        control.compute.operation = Some(fixtures::compute_control_record(
+            ComputeControlState::Succeeded,
+            "ctrl-old-history",
+        ));
+        let response = merge_observation(
+            "282",
+            UserappStage::Prod,
+            &control,
+            UserAppReadinessObservation::Snapshot {
+                physical: UserAppReadinessPhysical {
+                    instance_id: Some("pod-uid".into()),
+                    address: None,
+                    channel: UserAppReadinessChannel::Direct,
+                },
+                snapshot: Box::new(ready_snapshot()),
+            },
+        );
+        assert!(!response.ready, "in-flight intent must not be unmasked");
         assert_eq!(response.status, UserAppReadinessStatus::Starting);
         assert_eq!(
             response.reason_code,
