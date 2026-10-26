@@ -29,6 +29,8 @@ mod concurrency_tests;
 mod configuration;
 #[cfg(all(test, feature = "userapp-turso"))]
 mod configuration_tests;
+#[cfg(all(test, any(feature = "userapp-turso", feature = "pg")))]
+mod kubernetes_restart_stop_confirmation_tests;
 #[cfg(feature = "userapp-turso")]
 mod local_format;
 #[cfg(all(test, feature = "userapp-turso"))]
@@ -486,6 +488,23 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
                     backend,
                     &snapshot,
                     &observation,
+                )
+                .await
+            })
+        })
+        .await
+    }
+
+    async fn confirm_kubernetes_restart_stopped(
+        &self,
+        snapshot: &ComputeControlRecord,
+        evidence: KubernetesRestartStopEvidence,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_execution::confirm_kubernetes_restart_stopped(
+                    tx, backend, &snapshot, evidence,
                 )
                 .await
             })

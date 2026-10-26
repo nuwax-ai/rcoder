@@ -1206,6 +1206,19 @@ pub trait UserAppLifecycleStore: Send + Sync {
         ))
     }
 
+    /// Record only the original Kubernetes Restart's confirmed stop boundary.
+    /// Evidence is the runtime's read-only stop reconciliation for the exact
+    /// captured StatefulSet; this CAS never restores/creates/starts compute.
+    async fn confirm_kubernetes_restart_stopped(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+        _evidence: crate::KubernetesRestartStopEvidence,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Kubernetes restart stop confirmation is unsupported".into(),
+        ))
+    }
+
     /// Settle an original Docker Restart whose exact old CID is absent and
     /// whose saved archive reference is missing/unreadable, or whose exact
     /// referenced private recipe was positively observed unavailable. This never

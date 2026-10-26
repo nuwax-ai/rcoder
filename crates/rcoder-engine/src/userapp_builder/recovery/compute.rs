@@ -271,6 +271,28 @@ pub(super) async fn discover_pending(
             );
             continue;
         }
+        if crate::userapp_builder::compute_control::can_confirm_kubernetes_restart_stop(&record) {
+            let state = state.clone();
+            tasks.push(
+                format!("compute-restart-stop-receipt:{}", record.operation_id),
+                async move {
+                    // Observation plus an exact stage CAS; no physical mutation
+                    // is re-issued, so no operation flight is held.
+                    tokio::time::timeout(
+                        Duration::from_secs(30),
+                        crate::userapp_builder::compute_control::confirm_kubernetes_restart_stop(
+                            &state, &record,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("Kubernetes restart stop confirmation timed out")
+                    })??;
+                    Ok(())
+                },
+            );
+            continue;
+        }
         if record.can_recover_compute_drain() {
             let flight = state.userapp_op_flight.guard()?;
             let state = state.clone();

@@ -385,6 +385,19 @@ pub(crate) async fn recover_original_docker_stop(
     restart_stop_recovery::recover(state, record).await
 }
 
+/// The Kubernetes counterpart of the boundary above: read-only stop evidence
+/// plus the exact stage CAS; scheduling is not execution authority.
+pub(crate) fn can_confirm_kubernetes_restart_stop(record: &ComputeControlRecord) -> bool {
+    restart_stop_recovery::kubernetes_eligible(record)
+}
+
+pub(crate) async fn confirm_kubernetes_restart_stop(
+    state: &AppState,
+    record: &ComputeControlRecord,
+) -> Result<()> {
+    restart_stop_recovery::confirm_kubernetes_stop(state, record).await
+}
+
 /// Recover a durable completion boundary or an exact atomic remote stop receipt.
 /// This path contains no start/stop/redeploy calls, even after a lost response.
 pub(crate) async fn recover_confirmed(

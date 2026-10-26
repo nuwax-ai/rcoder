@@ -47,6 +47,98 @@ pub(super) async fn validate_guard(
     Ok(())
 }
 
+/// The Kubernetes Restart stop boundary. The original Docker FD recovery above
+/// owns Container targets exclusively, so a StatefulSet target stuck at
+/// Stopping (executor died between the stage write and the Stopped write)
+/// previously had no recovery branch at all and blocked its scope forever.
+pub(super) fn kubernetes_eligible(record: &ComputeControlRecord) -> bool {
+    if record.scope != UserAppOperationScope::Dev || record.action != ComputeControlAction::Restart
+    {
+        return false;
+    }
+    match record.state {
+        ComputeControlState::Running | ComputeControlState::RecoveryRequired => {}
+        ComputeControlState::Pending
+        | ComputeControlState::Succeeded
+        | ComputeControlState::Failed
+        | ComputeControlState::Superseded => return false,
+    }
+    if record.stage != ComputeControlStage::Stopping.as_str() {
+        return false;
+    }
+    let Ok(context) = record.execution_context() else {
+        return false;
+    };
+    BuilderControlTarget::from_observation_checkpoint(&record.checkpoint)
+        .ok()
+        .is_some_and(|target| {
+            target.context == context
+                && target
+                    .workload
+                    .as_ref()
+                    .is_some_and(|workload| workload.kind == AppResourceKind::StatefulSet)
+        })
+}
+
+/// Confirm the original Kubernetes stop boundary through read-only runtime
+/// evidence, then hand the durable stopped stage to the existing restart
+/// continuation branch (resume_restart_start on the next scan). No mutation is
+/// re-issued and no lease is retaken here; the exact record CAS in storage
+/// protects against stale observers.
+pub(super) async fn confirm_kubernetes_stop(
+    state: &AppState,
+    snapshot: &ComputeControlRecord,
+) -> Result<()> {
+    ensure!(
+        kubernetes_eligible(snapshot),
+        "Restart is not at the Kubernetes stop boundary"
+    );
+    let context = snapshot.execution_context().map_err(anyhow::Error::msg)?;
+    snapshot
+        .lease
+        .as_ref()
+        .context("Original Kubernetes compute lease missing")?;
+    let target = BuilderControlTarget::from_observation_checkpoint(&snapshot.checkpoint)?;
+    ensure!(
+        target.context == context,
+        "Restart stop target context differs"
+    );
+    // Read-only evidence, strongest first: the platform stop receipt for this
+    // exact operation context, else an exact UID-matched externally stopped
+    // controller. Neither authorizes any new physical mutation.
+    let evidence = if state
+        .runtime()
+        .reconcile_builder_compute_stop(&target)
+        .await?
+    {
+        KubernetesRestartStopEvidence::StopReceiptAcknowledged
+    } else if state
+        .runtime()
+        .observe_builder_compute_stopped(&target)
+        .await?
+    {
+        KubernetesRestartStopEvidence::ObservedStopped
+    } else {
+        tracing::debug!(
+            operation_id = %snapshot.operation_id,
+            app_id = %snapshot.app_id,
+            "Kubernetes Restart stop side is not yet confirmable; retrying on the next scan"
+        );
+        return Ok(());
+    };
+    let record = state
+        .userapp_store
+        .confirm_kubernetes_restart_stopped(snapshot, evidence)
+        .await?;
+    tracing::info!(
+        operation_id = %record.operation_id,
+        app_id = %record.app_id,
+        evidence = ?evidence,
+        "Kubernetes Restart stop boundary confirmed; start continuation resumes on the next scan"
+    );
+    Ok(())
+}
+
 fn identity(record: &ComputeControlRecord) -> Result<ComputeExecutorIdentity> {
     let context = record.execution_context().map_err(anyhow::Error::msg)?;
     Ok(ComputeExecutorIdentity {

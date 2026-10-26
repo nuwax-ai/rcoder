@@ -13,6 +13,9 @@ pub const AUTOMATIC_REPAIR_REQUEST_PREFIX: &str = "auto-repair-";
 /// Private checkpoint evidence for the original Docker Restart stop boundary.
 pub const BUILDER_RESTART_STOP_OBSERVATION_KEY: &str = "builder_restart_stop_observation";
 
+/// Private checkpoint evidence for the original Kubernetes Restart stop boundary.
+pub const KUBERNETES_RESTART_STOP_CONFIRMATION_KEY: &str = "kubernetes_restart_stop_confirmation";
+
 /// The runtime must hold the original physical lease while producing this fact.
 /// A retained container reporting stopped without its original Stop receipt is
 /// deliberately not an observation kind.
@@ -88,6 +91,33 @@ pub struct BuilderRestartStopRecoveryEvidence {
     /// permits reclassification; historical decoding is not a write admission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_observation: Option<serde_json::Value>,
+}
+
+/// How the original Kubernetes Restart stop boundary was proven. Both kinds
+/// are read-only runtime facts about the exact captured StatefulSet; neither
+/// restores, creates or starts compute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KubernetesRestartStopEvidence {
+    /// The controller is stably at zero replicas carrying the platform stop
+    /// receipt annotation for this exact operation context, with no Pods left.
+    StopReceiptAcknowledged,
+    /// The exact UID-matched controller is observed stopped (including an
+    /// external stop) with no remaining owned or canonical Pods.
+    ObservedStopped,
+}
+
+/// Preserve the first Kubernetes stop-boundary confirmation and its original
+/// diagnostic in the existing checkpoint when continuation clears error fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KubernetesRestartStopConfirmation {
+    pub evidence: KubernetesRestartStopEvidence,
+    pub original_state: ComputeControlState,
+    pub original_error_code: Option<String>,
+    pub original_error_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_confirmation: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -797,6 +797,97 @@ pub(super) async fn confirm_builder_restart_stopped(
     compute::current(tx, &identity).await
 }
 
+/// Record the Kubernetes Restart's confirmed stop boundary. Evidence is the
+/// engine-side read-only runtime reconciliation of the exact captured
+/// StatefulSet; this CAS mirrors the Docker boundary: exact target, lease,
+/// revision and record equality protect against every stale observer, and it
+/// never restores/creates/starts compute.
+pub(super) async fn confirm_kubernetes_restart_stopped(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    snapshot: &ComputeControlRecord,
+    evidence: KubernetesRestartStopEvidence,
+) -> Result<ComputeControlRecord, Error> {
+    repo::claim_app(tx, backend, &snapshot.app_id).await?;
+    let context = snapshot
+        .execution_context()
+        .map_err(|error| invalid(&error))?;
+    let identity = ComputeExecutorIdentity {
+        app_id: snapshot.app_id.clone(),
+        lifecycle_id: snapshot.lifecycle_id.clone(),
+        scope: snapshot.scope,
+        operation_id: snapshot.operation_id.clone(),
+        generation: snapshot.generation,
+        executor_id: context.executor_id.clone(),
+    };
+    let lease = snapshot.lease.as_ref().ok_or(Error::VersionConflict)?;
+    validate_receipt(&identity, lease)?;
+    let kubernetes_lease = matches!(lease, UserAppOperationLeaseReceipt::Kubernetes { .. });
+    let original =
+        BuilderControlTarget::from_observation_checkpoint(&snapshot.checkpoint).map_err(storage)?;
+    let statefulset_target = original
+        .workload
+        .as_ref()
+        .is_some_and(|workload| workload.kind == AppResourceKind::StatefulSet)
+        && original.context == context;
+    let eligible_state = match snapshot.state {
+        ComputeControlState::Running | ComputeControlState::RecoveryRequired => true,
+        ComputeControlState::Pending
+        | ComputeControlState::Succeeded
+        | ComputeControlState::Failed
+        | ComputeControlState::Superseded => false,
+    };
+    if snapshot.scope != UserAppOperationScope::Dev
+        || snapshot.action != ComputeControlAction::Restart
+        || snapshot.stage != "stopping"
+        || !eligible_state
+        || !kubernetes_lease
+        || !statefulset_target
+    {
+        return Err(invalid(
+            "Invalid original Kubernetes Restart stop confirmation",
+        ));
+    }
+    // Exact equality protects the original target, archive reference, mounts,
+    // lease, diagnostics, executor and revision against every stale observer.
+    if compute::current(tx, &identity).await? != *snapshot {
+        return Err(Error::VersionConflict);
+    }
+    drained(tx, snapshot).await?;
+    let revision = snapshot
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| invalid("Compute revision exhausted"))?;
+    let mut checkpoint = snapshot.checkpoint.clone();
+    let object = checkpoint
+        .as_object_mut()
+        .ok_or_else(|| invalid("Builder checkpoint must be an object"))?;
+    let previous_confirmation = object
+        .get(KUBERNETES_RESTART_STOP_CONFIRMATION_KEY)
+        .cloned();
+    object.insert(
+        KUBERNETES_RESTART_STOP_CONFIRMATION_KEY.into(),
+        serde_json::to_value(KubernetesRestartStopConfirmation {
+            evidence,
+            original_state: snapshot.state,
+            original_error_code: snapshot.error_code.clone(),
+            original_error_message: snapshot.error_message.clone(),
+            previous_confirmation,
+        })
+        .map_err(storage)?,
+    );
+    let changed = toasty::sql::statement(repo::sql(backend,
+        "UPDATE userapp_compute_controls SET stage='stopped',checkpoint_json=$3,revision=$6,updated_at_us=$4 WHERE operation_id=$1 AND revision=$2 AND executor_id=$5 AND stage='stopping' AND state IN ('running','recovery_required')"))
+        .bind(&snapshot.operation_id).bind(snapshot.revision)
+        .bind(serde_json::to_string(&checkpoint).map_err(storage)?)
+        .bind(chrono::Utc::now().timestamp_micros()).bind(&context.executor_id).bind(revision)
+        .exec(tx).await.map_err(storage)?;
+    if changed != 1 {
+        return Err(Error::VersionConflict);
+    }
+    compute::current(tx, &identity).await
+}
+
 /// Exact old-CID absence closes an unrebuildable pre-restore Stopping execution.
 /// An already-Stopped row can hide an unknown Create and cannot be settled here.
 /// This submits no current Source work and preserves the opaque old recipe.
