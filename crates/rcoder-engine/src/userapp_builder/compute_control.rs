@@ -2071,6 +2071,195 @@ pub(crate) async fn compute_deadline_expired(
     }
 }
 
+/// Stage-appropriate result reconciliation for deadline settlement. The quiet
+/// window bounds any in-flight API write (a received mutating request is
+/// applied or aborted by the apiserver within its own request timeout, far
+/// inside the window), so this observation then records WHICH settled state
+/// the operation's write surface is in — evidence, not a clock claim, backs
+/// the settlement. `None` defers: the surface is running (normal completion
+/// is preferable to failure) or unreadable this round.
+async fn settlement_surface_note(
+    state: &AppState,
+    current: &ComputeControlRecord,
+) -> Result<Option<String>> {
+    use ComputeControlStage as Stage;
+    let stage = Stage::from_storage_value(&current.stage);
+    let note = |text: &str| Some(text.to_owned());
+    let surface = match stage {
+        Some(Stage::DrainingPrevious) => note("no compute write was ever authorized (drain phase)"),
+        Some(Stage::Stopped) => note("the durable stopped boundary already confirms the stop side"),
+        Some(Stage::Stopping) => match current.scope {
+            UserAppOperationScope::Dev => {
+                let target = match BuilderControlTarget::from_observation_checkpoint(
+                    &current.checkpoint,
+                ) {
+                    Ok(target)
+                        if target.context
+                            == current.execution_context().map_err(anyhow::Error::msg)? =>
+                    {
+                        target
+                    }
+                    _ => {
+                        tracing::warn!(
+                            operation_id = %current.operation_id,
+                            "Deadline settlement cannot reconcile an unparseable stop target; deferring"
+                        );
+                        return Ok(None);
+                    }
+                };
+                if state
+                    .runtime()
+                    .reconcile_builder_compute_stop(&target)
+                    .await?
+                {
+                    note("stop receipt confirmed after the deadline")
+                } else if state
+                    .runtime()
+                    .observe_builder_compute_stopped(&target)
+                    .await?
+                {
+                    note("workload observed stopped after the deadline")
+                } else {
+                    note(
+                        "workload still running after the quiet window; the stop write can no longer land",
+                    )
+                }
+            }
+            UserAppOperationScope::Prod | UserAppOperationScope::Application => {
+                let expected: Result<UserAppMutationTarget> =
+                    serde_json::from_value(current.checkpoint.clone()).map_err(Into::into);
+                let expected = match expected {
+                    Ok(expected)
+                        if expected.context
+                            == current.execution_context().map_err(anyhow::Error::msg)? =>
+                    {
+                        expected
+                    }
+                    _ => {
+                        tracing::warn!(
+                            operation_id = %current.operation_id,
+                            "Deadline settlement cannot reconcile an unparseable application stop target; deferring"
+                        );
+                        return Ok(None);
+                    }
+                };
+                if state
+                    .runtime()
+                    .reconcile_app_compute_stop(&expected)
+                    .await?
+                {
+                    note("application stop receipt confirmed after the deadline")
+                } else {
+                    note(
+                        "application workload still running after the quiet window; the stop write can no longer land",
+                    )
+                }
+            }
+        },
+        Some(Stage::Starting) | Some(Stage::Verifying) => {
+            // Only Restart reaches these stages; a running surface prefers the
+            // normal completion branch over a deadline failure.
+            match current.scope {
+                UserAppOperationScope::Dev => {
+                    let target = match BuilderControlTarget::from_observation_checkpoint(
+                        &current.checkpoint,
+                    ) {
+                        Ok(target)
+                            if target.context
+                                == current.execution_context().map_err(anyhow::Error::msg)? =>
+                        {
+                            target
+                        }
+                        _ => {
+                            tracing::warn!(
+                                operation_id = %current.operation_id,
+                                "Deadline settlement cannot reconcile an unparseable start target; deferring"
+                            );
+                            return Ok(None);
+                        }
+                    };
+                    if state
+                        .runtime()
+                        .reconcile_builder_compute_start(&target)
+                        .await?
+                        .is_some()
+                    {
+                        tracing::debug!(
+                            operation_id = %current.operation_id,
+                            "Deadline-expired restart is running; preferring normal completion over settlement"
+                        );
+                        return Ok(None);
+                    }
+                    match state.runtime().prepare_builder_compute_retry(&target).await {
+                        Ok(Some(_)) => {
+                            note("start committed but never reached readiness within the deadline")
+                        }
+                        Ok(None) => note(
+                            "start not committed after the quiet window; the write can no longer land",
+                        ),
+                        Err(_) => {
+                            tracing::debug!(
+                                operation_id = %current.operation_id,
+                                "Deadline settlement cannot classify the start surface; deferring"
+                            );
+                            return Ok(None);
+                        }
+                    }
+                }
+                UserAppOperationScope::Prod | UserAppOperationScope::Application => {
+                    let expected: Result<UserAppMutationTarget> =
+                        serde_json::from_value(current.checkpoint.clone()).map_err(Into::into);
+                    let expected = match expected {
+                        Ok(expected)
+                            if expected.context
+                                == current.execution_context().map_err(anyhow::Error::msg)? =>
+                        {
+                            expected
+                        }
+                        _ => {
+                            tracing::warn!(
+                                operation_id = %current.operation_id,
+                                "Deadline settlement cannot reconcile an unparseable application start target; deferring"
+                            );
+                            return Ok(None);
+                        }
+                    };
+                    if state
+                        .runtime()
+                        .reconcile_app_compute_start(&expected)
+                        .await?
+                    {
+                        tracing::debug!(
+                            operation_id = %current.operation_id,
+                            "Deadline-expired application restart is running; preferring normal completion over settlement"
+                        );
+                        return Ok(None);
+                    }
+                    note("application start not confirmed after the quiet window")
+                }
+            }
+        }
+        Some(Stage::Completed) => {
+            // Non-terminal at the completed stage is a corrupt shape; never
+            // settle what its own writer never terminalized.
+            tracing::warn!(
+                operation_id = %current.operation_id,
+                "Deadline settlement refuses a non-terminal completed stage; deferring"
+            );
+            return Ok(None);
+        }
+        None => {
+            tracing::warn!(
+                operation_id = %current.operation_id,
+                stage = %current.stage,
+                "Deadline settlement cannot reconcile an unknown stage; deferring"
+            );
+            return Ok(None);
+        }
+    };
+    Ok(surface)
+}
+
 /// Settle a non-terminal compute control whose total deadline expired. Two
 /// gates stand between expiry and the terminal CAS:
 ///
@@ -2163,15 +2352,19 @@ pub(crate) async fn settle_expired_compute_control(
         );
         return Ok(());
     }
+    let Some(surface) = settlement_surface_note(state, &current).await? else {
+        return Ok(());
+    };
     let message = format!(
-        "Compute control exceeded its total deadline of {} seconds at stage {}; the physical lease stopped renewing at least {} seconds before settlement",
+        "Compute control exceeded its total deadline of {} seconds at stage {}; the physical lease stopped renewing at least {} seconds before settlement ({})",
         COMPUTE_CONTROL_TOTAL_DEADLINE_SECS,
         current.stage,
-        COMPUTE_SETTLEMENT_QUIET_MS / 1000
+        COMPUTE_SETTLEMENT_QUIET_MS / 1000,
+        surface
     );
     match state
         .userapp_store
-        .fail_expired_compute_control(&current, ERR_DEADLINE_EXCEEDED, &message)
+        .fail_expired_compute_control(&current, ERR_DEADLINE_EXCEEDED, &message, anchor)
         .await
     {
         Ok(settled) => {

@@ -1165,15 +1165,18 @@ pub trait UserAppLifecycleStore: Send + Sync {
     }
 
     /// Settle a claimed compute control whose bound total deadline expired
-    /// while it was still non-terminal. The expiry is re-verified inside the
-    /// transaction; this terminal CAS keeps the last durable stage, checkpoint
-    /// and lease so the failure stays diagnosable and the lease cleanup scan
-    /// still owns the physical receipt.
+    /// while it was still non-terminal. The expiry AND the quiet-window anchor
+    /// are re-verified against the settler's expected anchor inside the same
+    /// transaction, so a concurrent clear or re-anchor revokes the settler.
+    /// This terminal CAS keeps the last durable stage, checkpoint and lease so
+    /// the failure stays diagnosable and the lease cleanup scan still owns the
+    /// physical receipt.
     async fn fail_expired_compute_control(
         &self,
         _snapshot: &crate::ComputeControlRecord,
         _code: &str,
         _message: &str,
+        _expected_unheld_observed_ms: i64,
     ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
         Err(UserAppStoreError::InvalidOperation(
             "Expired compute settlement is unsupported".into(),

@@ -41,10 +41,15 @@ async fn claimed_control(
 
 async fn contract(store: &ToastyUserAppStore) {
     let now = chrono::Utc::now().timestamp_millis();
+    // The PostgreSQL contract runs on a persistent disposable database; a
+    // per-run suffix keeps leftover non-terminal controls from a previous
+    // run from fencing this run's admissions.
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let n = |name: &str| format!("{name}{run}");
 
     // Binding is idempotent and never extends an operation's budget: the
     // second, larger bind returns the first row unchanged.
-    let bound = claimed_control(store, "deadlinebind", ComputeControlAction::Restart).await;
+    let bound = claimed_control(store, &n("deadlinebind"), ComputeControlAction::Restart).await;
     let first = store
         .bind_compute_control_deadline(&bound, now + 60_000)
         .await
@@ -63,7 +68,7 @@ async fn contract(store: &ToastyUserAppStore) {
     ));
 
     // A terminal record refuses binding (no budget for finished work).
-    let terminal = claimed_control(store, "deadlineterminal", ComputeControlAction::Stop).await;
+    let terminal = claimed_control(store, &n("deadlineterminal"), ComputeControlAction::Stop).await;
     let identity = ComputeExecutorIdentity {
         app_id: terminal.app_id.clone(),
         lifecycle_id: terminal.lifecycle_id.clone(),
@@ -93,7 +98,8 @@ async fn contract(store: &ToastyUserAppStore) {
 
     // Settlement: an expired deadline fails the non-terminal control while
     // preserving its last durable stage, checkpoint and lease for diagnosis.
-    let mut expired = claimed_control(store, "deadlinesettle", ComputeControlAction::Restart).await;
+    let mut expired =
+        claimed_control(store, &n("deadlinesettle"), ComputeControlAction::Restart).await;
     let lease = UserAppOperationLeaseReceipt::Kubernetes {
         service_type: ServiceType::UserappBuilder,
         namespace: "rcoder-builder".into(),
@@ -129,20 +135,44 @@ async fn contract(store: &ToastyUserAppStore) {
         .unwrap();
 
     // Without a deadline (or before expiry) settlement is refused.
-    let unexpired =
-        claimed_control(store, "deadlineunexpired", ComputeControlAction::Restart).await;
+    let unexpired = claimed_control(
+        store,
+        &n("deadlineunexpired"),
+        ComputeControlAction::Restart,
+    )
+    .await;
     assert!(matches!(
         store
-            .fail_expired_compute_control(&unexpired, "ERR_DEADLINE_EXCEEDED", "not expired yet")
+            .fail_expired_compute_control(&unexpired, "ERR_DEADLINE_EXCEEDED", "not expired yet", 0)
             .await,
         Err(UserAppStoreError::InvalidOperation(_))
     ));
+
+    // A settler without its anchor measured (the anchor row is still NULL)
+    // never settles: expiry alone is not settlement authority.
+    assert!(matches!(
+        store
+            .fail_expired_compute_control(
+                &expired,
+                "ERR_DEADLINE_EXCEEDED",
+                "no anchored quiet window",
+                0
+            )
+            .await,
+        Err(UserAppStoreError::VersionConflict)
+    ));
+    let anchor = now - 400_000;
+    store
+        .mark_compute_control_unheld(&expired, anchor)
+        .await
+        .unwrap();
 
     let settled = store
         .fail_expired_compute_control(
             &expired,
             "ERR_DEADLINE_EXCEEDED",
             "exceeded its total deadline",
+            anchor,
         )
         .await
         .unwrap();
@@ -159,7 +189,8 @@ async fn contract(store: &ToastyUserAppStore) {
 
     // The quiet-window anchor: idempotent, never sliding, cleared on a held
     // observation, and requiring a bound deadline.
-    let anchored = claimed_control(store, "deadlineanchor", ComputeControlAction::Restart).await;
+    let anchored =
+        claimed_control(store, &n("deadlineanchor"), ComputeControlAction::Restart).await;
     assert!(matches!(
         store
             .mark_compute_control_unheld(&anchored, now - 1000)
@@ -199,7 +230,54 @@ async fn contract(store: &ToastyUserAppStore) {
     // A stale snapshot (the record moved on) never settles twice.
     assert!(matches!(
         store
-            .fail_expired_compute_control(&expired, "ERR_DEADLINE_EXCEEDED", "stale settler replay")
+            .fail_expired_compute_control(
+                &expired,
+                "ERR_DEADLINE_EXCEEDED",
+                "stale settler replay",
+                anchor
+            )
+            .await,
+        Err(UserAppStoreError::VersionConflict)
+    ));
+
+    // The Codex-reproduced clear/settle race on a fresh record: the settler
+    // measured anchor T0, a concurrent held observation cleared it, so the
+    // settlement transaction must refuse (pre-fix this returned Ok(Failed)).
+    let raced = claimed_control(store, &n("deadlinerace"), ComputeControlAction::Restart).await;
+    store
+        .bind_compute_control_deadline(&raced, now - 1)
+        .await
+        .unwrap();
+    let t0 = now - 500_000;
+    store.mark_compute_control_unheld(&raced, t0).await.unwrap();
+    store.clear_compute_control_unheld(&raced).await.unwrap();
+    assert!(matches!(
+        store
+            .fail_expired_compute_control(
+                &raced,
+                "ERR_DEADLINE_EXCEEDED",
+                "settler racing a clear",
+                t0
+            )
+            .await,
+        Err(UserAppStoreError::VersionConflict)
+    ));
+    // A re-anchored window equally revokes observers of the older anchor.
+    store.clear_compute_control_unheld(&raced).await.unwrap();
+    store.mark_compute_control_unheld(&raced, t0).await.unwrap();
+    store.clear_compute_control_unheld(&raced).await.unwrap();
+    store
+        .mark_compute_control_unheld(&raced, t0 - 1)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .fail_expired_compute_control(
+                &raced,
+                "ERR_DEADLINE_EXCEEDED",
+                "settler racing a re-anchor",
+                t0
+            )
             .await,
         Err(UserAppStoreError::VersionConflict)
     ));

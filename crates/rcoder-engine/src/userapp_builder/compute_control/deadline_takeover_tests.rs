@@ -21,6 +21,20 @@ fn kubernetes_lease(executor_id: &str) -> UserAppOperationLeaseReceipt {
 /// A Dev Restart claimed by a dead executor, bound to a Kubernetes lease and
 /// stalled at the durable stopped boundary with a confirmation witness.
 async fn stalled_stopped_restart(state: &AppState, name: &str) -> ComputeControlRecord {
+    stalled_restart_at_stages(
+        state,
+        name,
+        &[ComputeControlStage::Stopping, ComputeControlStage::Stopped],
+    )
+    .await
+}
+
+/// The same claimed/bound fixture advanced through an explicit stage chain.
+async fn stalled_restart_at_stages(
+    state: &AppState,
+    name: &str,
+    stages: &[ComputeControlStage],
+) -> ComputeControlRecord {
     let app = state.userapp_store.ensure_identity(name).await.unwrap();
     let pending = state
         .userapp_store
@@ -71,37 +85,38 @@ async fn stalled_stopped_restart(state: &AppState, name: &str) -> ComputeControl
         },
         "builder_startup_mode": "management_only",
     });
-    let stopping = state
-        .userapp_store
-        .advance_compute_control(&ComputeControlProgress {
-            identity: identity.clone(),
-            expected_revision: bound.revision,
-            state: ComputeControlState::Running,
-            stage: ComputeControlStage::Stopping,
-            checkpoint: checkpoint.clone(),
-            error_code: None,
-            error_message: None,
-        })
-        .await
-        .unwrap();
-    let mut confirmed_checkpoint = checkpoint;
+    let mut confirmed_checkpoint = checkpoint.clone();
     confirmed_checkpoint[KUBERNETES_RESTART_STOP_CONFIRMATION_KEY] = serde_json::json!({
         "evidence": "observed_stopped",
         "original_state": "running",
     });
-    state
-        .userapp_store
-        .advance_compute_control(&ComputeControlProgress {
-            identity,
-            expected_revision: stopping.revision,
-            state: ComputeControlState::Running,
-            stage: ComputeControlStage::Stopped,
-            checkpoint: confirmed_checkpoint,
-            error_code: None,
-            error_message: None,
-        })
-        .await
-        .unwrap()
+    let mut record = bound;
+    for stage in stages {
+        let confirmed = matches!(
+            stage,
+            ComputeControlStage::Stopped
+                | ComputeControlStage::Starting
+                | ComputeControlStage::Verifying
+        );
+        record = state
+            .userapp_store
+            .advance_compute_control(&ComputeControlProgress {
+                identity: identity.clone(),
+                expected_revision: record.revision,
+                state: ComputeControlState::Running,
+                stage: *stage,
+                checkpoint: if confirmed {
+                    confirmed_checkpoint.clone()
+                } else {
+                    checkpoint.clone()
+                },
+                error_code: None,
+                error_message: None,
+            })
+            .await
+            .unwrap();
+    }
+    record
 }
 
 async fn test_state() -> (Arc<AppState>, Arc<FenceRuntime>) {
@@ -437,4 +452,92 @@ async fn takeover_guard_reobserves_the_physical_lease() {
     assert!(!takeover.as_lease().validate_retained().await.unwrap());
     *runtime.receipt_verdict.lock().unwrap() = ReceiptVerdict::Held;
     assert!(takeover.as_lease().validate_retained().await.unwrap());
+}
+
+/// Codex round-2 point 1: settlement reconciles the operation's result side
+/// instead of claiming the clock proves it. At the stopping boundary with no
+/// stop evidence (the fixture runtime observes nothing), the post-window
+/// observation records "still running / cannot land anymore" evidence and the
+/// settlement carries it in the diagnostic.
+#[tokio::test]
+async fn stopping_boundary_settlement_records_the_observed_surface() {
+    let (state, runtime) = test_state().await;
+    *runtime.receipt_verdict.lock().unwrap() = ReceiptVerdict::NotHeld;
+    let record =
+        stalled_restart_at_stages(&state, "settlesurface", &[ComputeControlStage::Stopping]).await;
+    state
+        .userapp_store
+        .bind_compute_control_deadline(&record, chrono::Utc::now().timestamp_millis() - 1)
+        .await
+        .unwrap();
+    state
+        .userapp_store
+        .mark_compute_control_unheld(
+            &record,
+            chrono::Utc::now().timestamp_millis() - COMPUTE_SETTLEMENT_QUIET_MS - 1,
+        )
+        .await
+        .unwrap();
+    settle_expired_compute_control(&state, &record)
+        .await
+        .unwrap();
+    let settled = state
+        .userapp_store
+        .get_compute_control(&record.app_id, &record.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.state, ComputeControlState::Failed);
+    let message = settled.error_message.unwrap();
+    assert!(
+        message.contains("stop write can no longer land"),
+        "the observed surface is part of the settlement evidence: {message}"
+    );
+}
+
+/// The start side prefers normal completion and defers when the surface is
+/// unclassifiable: with the fixture runtime unable to confirm the start
+/// (reconcile None, retry unsupported) a starting-stage record is not failed
+/// by the settlement.
+#[tokio::test]
+async fn starting_surface_without_evidence_defers_settlement() {
+    let (state, runtime) = test_state().await;
+    *runtime.receipt_verdict.lock().unwrap() = ReceiptVerdict::NotHeld;
+    let record = stalled_restart_at_stages(
+        &state,
+        "startsurface",
+        &[
+            ComputeControlStage::Stopping,
+            ComputeControlStage::Stopped,
+            ComputeControlStage::Starting,
+        ],
+    )
+    .await;
+    state
+        .userapp_store
+        .bind_compute_control_deadline(&record, chrono::Utc::now().timestamp_millis() - 1)
+        .await
+        .unwrap();
+    state
+        .userapp_store
+        .mark_compute_control_unheld(
+            &record,
+            chrono::Utc::now().timestamp_millis() - COMPUTE_SETTLEMENT_QUIET_MS - 1,
+        )
+        .await
+        .unwrap();
+    settle_expired_compute_control(&state, &record)
+        .await
+        .unwrap();
+    let current = state
+        .userapp_store
+        .get_compute_control(&record.app_id, &record.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        current.state,
+        ComputeControlState::Running,
+        "an unclassifiable start surface defers settlement to reconciliation-capable paths"
+    );
 }

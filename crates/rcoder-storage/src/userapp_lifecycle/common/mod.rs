@@ -436,13 +436,22 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         snapshot: &ComputeControlRecord,
         code: &str,
         message: &str,
+        expected_unheld_observed_ms: i64,
     ) -> Result<ComputeControlRecord, UserAppStoreError> {
         let snapshot = snapshot.clone();
         let code = code.to_owned();
         let message = message.to_owned();
         self.run(false, move |tx, backend| {
             Box::pin(async move {
-                compute_recovery::expire(tx, backend, &snapshot, &code, &message).await
+                compute_recovery::expire(
+                    tx,
+                    backend,
+                    &snapshot,
+                    &code,
+                    &message,
+                    expected_unheld_observed_ms,
+                )
+                .await
             })
         })
         .await

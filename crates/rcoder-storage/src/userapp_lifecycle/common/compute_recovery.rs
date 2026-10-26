@@ -239,6 +239,12 @@ pub(super) async fn read_deadline(
 /// stage, checkpoint, lease and executor so the failure stays diagnosable and
 /// the terminal lease-cleanup scan still owns the physical receipt.
 ///
+/// The quiet-window anchor is re-verified against the settler's expected value
+/// in the SAME transaction: a concurrent clear (the lease renewed again) or
+/// re-anchor (a later death) instantly revokes every older observer, so a
+/// stale settler can never terminalize a control whose lease came back to
+/// life after its observation.
+///
 /// Deliberately NOT compute::current: settlement is the last-resort unblock,
 /// so it must not inherit continuation preconditions (the intent head still
 /// pointing at this control, an active application, a present executor). A
@@ -250,6 +256,7 @@ pub(super) async fn expire(
     snapshot: &ComputeControlRecord,
     code: &str,
     message: &str,
+    expected_unheld_observed_ms: i64,
 ) -> Result<ComputeControlRecord, UserAppStoreError> {
     use crate::db::models;
     repo::claim_app(tx, backend, &snapshot.app_id).await?;
@@ -259,17 +266,22 @@ pub(super) async fn expire(
     if actual != *snapshot || actual.state.is_terminal() {
         return Err(UserAppStoreError::VersionConflict);
     }
-    let expired = models::ComputeControlDeadline::filter_by_operation_id(&snapshot.operation_id)
+    let row = models::ComputeControlDeadline::filter_by_operation_id(&snapshot.operation_id)
         .first()
         .exec(tx)
         .await
         .map_err(storage)?
-        .filter(|row| row.app_id == snapshot.app_id)
-        .is_some_and(|row| row.deadline_ms <= chrono::Utc::now().timestamp_millis());
-    if !expired {
+        .filter(|row| row.app_id == snapshot.app_id);
+    if !row
+        .as_ref()
+        .is_some_and(|row| row.deadline_ms <= chrono::Utc::now().timestamp_millis())
+    {
         return Err(UserAppStoreError::InvalidOperation(
             "Compute control deadline has not expired".into(),
         ));
+    }
+    if row.as_ref().and_then(|row| row.unheld_observed_ms) != Some(expected_unheld_observed_ms) {
+        return Err(UserAppStoreError::VersionConflict);
     }
     let now = chrono::Utc::now().timestamp_micros();
     let changed = toasty::sql::statement(repo::sql(backend,
