@@ -37,6 +37,11 @@ pub const PINGAP_ETYPE_ORIGIN_CONTRACT: &str = "pingap_etype_v1";
 /// 经生成配置的 response_headers 规则移除）。
 pub const X_PINGAP_ETYPE_HEADER: &str = "x-pingap-etype";
 
+/// standby 摘流窗口的 EType 取值：发布/停止期间 Pingap 以 mock 直出全部请求
+/// （无 upstream、无 fail_to_proxy 路径），由生成配置显式携带该标记，证明
+/// 响应为入口自产而非应用返回。业务状态细分由故障页管线的就绪观察给出。
+pub const PINGAP_STANDBY_ETYPE: &str = "rcoder-standby";
+
 /// 业务就绪状态（顶层与服务/代理共用同一词表）。
 ///
 /// 判定顺序（app-cli 侧纯函数集中派生，见 Plan §4.3）：stopping/stopped/
@@ -116,6 +121,8 @@ pub enum UserAppReadinessReason {
     ProxyNotStarted,
     /// Pingap 实际生效 config hash 与本实例期望不一致
     ProxyConfigMismatch,
+    /// 入口处于 standby 摘流兜底（发布/停止窗口 mock 直出，业务自身未参与）
+    ProxyStandby,
 
     // ---- 阶段性证据（配合 starting/stopping/stopped/failed/degraded/provisioning 顶层态）----
     /// 停止意图已受理（顶层 stopping）
@@ -139,7 +146,7 @@ pub struct UserAppServiceReadiness {
     /// ready / degraded / failed / unknown / unsupported（`provisioning` 为平台
     /// 合并层专用值，app-cli 侧派生永不产出）
     pub status: UserAppReadinessStatus,
-    /// 结构化原因：ADMIN_UNREACHABLE / ADMIN_PROTOCOL_INVALID / INSTANCE_CHANGED / RUNTIME_UPGRADE_REQUIRED / NO_PROXIED_WEB_SERVICES / CUSTOM_ROUTE_UNVERIFIED / OBSERVE_INCOMPLETE / SERVICE_STARTING / HEALTH_HTTP_FAILURE / STATIC_ENTRY_UNAVAILABLE / PROBE_TIMEOUT / UPSTREAM_UNHEALTHY / PROXY_NOT_STARTED / PROXY_CONFIG_MISMATCH / STOP_ACCEPTED / HEALTH_DEGRADED / ORCHESTRATION_FAILED / COMPUTE_PROVISIONING（后者仅平台合并层产出）
+    /// 结构化原因：ADMIN_UNREACHABLE / ADMIN_PROTOCOL_INVALID / INSTANCE_CHANGED / RUNTIME_UPGRADE_REQUIRED / NO_PROXIED_WEB_SERVICES / CUSTOM_ROUTE_UNVERIFIED / OBSERVE_INCOMPLETE / SERVICE_STARTING / HEALTH_HTTP_FAILURE / STATIC_ENTRY_UNAVAILABLE / PROBE_TIMEOUT / UPSTREAM_UNHEALTHY / PROXY_NOT_STARTED / PROXY_CONFIG_MISMATCH / PROXY_STANDBY / STOP_ACCEPTED / HEALTH_DEGRADED / ORCHESTRATION_FAILED / COMPUTE_PROVISIONING（后者仅平台合并层产出）
     pub reason_code: Option<UserAppReadinessReason>,
 }
 
@@ -154,10 +161,11 @@ pub struct UserAppProxyReadiness {
     /// `provisioning`；平台合并层的合成分支下该字段与顶层 `status`/`reason_code`
     /// 同值（顶层为 `provisioning` 时此处同步）。
     pub status: UserAppReadinessStatus,
-    /// 结构化原因：ADMIN_UNREACHABLE / ADMIN_PROTOCOL_INVALID / INSTANCE_CHANGED / RUNTIME_UPGRADE_REQUIRED / NO_PROXIED_WEB_SERVICES / CUSTOM_ROUTE_UNVERIFIED / OBSERVE_INCOMPLETE / SERVICE_STARTING / HEALTH_HTTP_FAILURE / STATIC_ENTRY_UNAVAILABLE / PROBE_TIMEOUT / UPSTREAM_UNHEALTHY / PROXY_NOT_STARTED / PROXY_CONFIG_MISMATCH / STOP_ACCEPTED / HEALTH_DEGRADED / ORCHESTRATION_FAILED / COMPUTE_PROVISIONING（后者仅平台合并层产出，随顶层同步）
+    /// 结构化原因：ADMIN_UNREACHABLE / ADMIN_PROTOCOL_INVALID / INSTANCE_CHANGED / RUNTIME_UPGRADE_REQUIRED / NO_PROXIED_WEB_SERVICES / CUSTOM_ROUTE_UNVERIFIED / OBSERVE_INCOMPLETE / SERVICE_STARTING / HEALTH_HTTP_FAILURE / STATIC_ENTRY_UNAVAILABLE / PROBE_TIMEOUT / UPSTREAM_UNHEALTHY / PROXY_NOT_STARTED / PROXY_CONFIG_MISMATCH / PROXY_STANDBY / STOP_ACCEPTED / HEALTH_DEGRADED / ORCHESTRATION_FAILED / COMPUTE_PROVISIONING（后者仅平台合并层产出，随顶层同步）
     pub reason_code: Option<UserAppReadinessReason>,
     /// 自产错误来源契约（首版 `pingap_etype_v1`）；custom/旧运行配置/hash
     /// 未确认时为 None（故障页据此决定是否信任 `X-Pingap-EType` 标记）。
+    /// standby 摘流窗口同样透出：该窗口内入口全部响应均为 Pingap 自产。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_origin_contract: Option<String>,
     /// app-cli owned proxy transition, independent of Pingap private APIs.
@@ -178,8 +186,8 @@ pub struct UserAppBusinessReadiness {
     /// RUNTIME_UPGRADE_REQUIRED / NO_PROXIED_WEB_SERVICES / CUSTOM_ROUTE_UNVERIFIED /
     /// OBSERVE_INCOMPLETE / SERVICE_STARTING / HEALTH_HTTP_FAILURE / STATIC_ENTRY_UNAVAILABLE /
     /// PROBE_TIMEOUT / UPSTREAM_UNHEALTHY / PROXY_NOT_STARTED / PROXY_CONFIG_MISMATCH /
-    /// STOP_ACCEPTED / HEALTH_DEGRADED / ORCHESTRATION_FAILED / COMPUTE_PROVISIONING——
-    /// 后者仅平台合并层产出，本快照实际取值不含它）
+    /// PROXY_STANDBY / STOP_ACCEPTED / HEALTH_DEGRADED / ORCHESTRATION_FAILED /
+    /// COMPUTE_PROVISIONING——后者仅平台合并层产出，本快照实际取值不含它）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_code: Option<UserAppReadinessReason>,
     /// 实际观察时间（RFC3339 UTC；不是缓存重新包装的时间）
@@ -279,8 +287,8 @@ pub struct UserAppReadinessResponse {
     /// RUNTIME_UPGRADE_REQUIRED / NO_PROXIED_WEB_SERVICES / CUSTOM_ROUTE_UNVERIFIED /
     /// OBSERVE_INCOMPLETE / SERVICE_STARTING / HEALTH_HTTP_FAILURE / STATIC_ENTRY_UNAVAILABLE /
     /// PROBE_TIMEOUT / UPSTREAM_UNHEALTHY / PROXY_NOT_STARTED / PROXY_CONFIG_MISMATCH /
-    /// STOP_ACCEPTED / HEALTH_DEGRADED / ORCHESTRATION_FAILED / COMPUTE_PROVISIONING；
-    /// COMPUTE_PROVISIONING 同样只由平台合并层产出）
+    /// PROXY_STANDBY / STOP_ACCEPTED / HEALTH_DEGRADED / ORCHESTRATION_FAILED /
+    /// COMPUTE_PROVISIONING；COMPUTE_PROVISIONING 同样只由平台合并层产出）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_code: Option<UserAppReadinessReason>,
     pub checked_at: String,
@@ -452,5 +460,12 @@ mod tests {
     fn proxy_error_origin_contract_constant_matches_plan() {
         assert_eq!(PINGAP_ETYPE_ORIGIN_CONTRACT, "pingap_etype_v1");
         assert_eq!(X_PINGAP_ETYPE_HEADER, "x-pingap-etype");
+        assert_eq!(PINGAP_STANDBY_ETYPE, "rcoder-standby");
+    }
+
+    #[test]
+    fn proxy_standby_reason_serializes_to_documented_value() {
+        let value = serde_json::to_value(UserAppReadinessReason::ProxyStandby).unwrap();
+        assert_eq!(value, serde_json::json!("PROXY_STANDBY"));
     }
 }

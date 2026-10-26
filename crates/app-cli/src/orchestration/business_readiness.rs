@@ -881,6 +881,19 @@ fn derive_proxy(
             None,
         );
     }
+    // standby 摘流窗口：入口 mock 直出全部请求（无 upstream 代理），响应来源
+    // 全部为 Pingap 自产——来源契约成立，透出给故障页管线做友好替换；业务
+    // 状态细分（starting/stopped/failed）由顶层推导与各服务观察给出。
+    if crate::proxy::compiler::official_confirmation().is_some_and(|confirmation| {
+        confirmation.confirmed && matches!(confirmation.phase, shared_types::ProxyPhase::Standby)
+    }) {
+        return (
+            false,
+            UserAppReadinessStatus::Unknown,
+            Some(UserAppReadinessReason::ProxyStandby),
+            Some(shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT.to_string()),
+        );
+    }
     if !publication_confirmed {
         return (
             false,
@@ -969,6 +982,101 @@ fn top_level_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// standby 摘流确认后：hash 匹配即透出来源契约（故障页管线据此信任
+    /// `X-Pingap-EType: rcoder-standby`），代理不宣称 ready，原因标 PROXY_STANDBY。
+    #[test]
+    fn standby_confirmation_exposes_error_origin_contract() {
+        let publication_id = "8204e27d-a7af-42f9-aa92-0b69964b8df2";
+        let expected_hash = "STANDBYHASH01".to_string();
+        let outcome = crate::proxy::compiler::CompileOutcome {
+            serving_release_id: None,
+            operation_id: Some("standby-operation".into()),
+            config_path: "unused-standby-candidate.toml".into(),
+            expected_hash: expected_hash.clone(),
+            publication_id: publication_id.into(),
+            config_digest: "b".repeat(64),
+            entry_probes: vec![crate::proxy::compiler::ProxyProbeTarget {
+                address: "127.0.0.1:9080".parse().unwrap(),
+                expected_status: 503,
+            }],
+            business_probes: vec![],
+        };
+        let confirmed = crate::proxy::apply_status::ConfirmedPublication {
+            process_id: std::process::id(),
+            instance_id: "instance-standby".into(),
+            publication_id: publication_id.into(),
+            config_hash: expected_hash.clone(),
+            config_digest: outcome.config_digest.clone(),
+            attempt_id: 1,
+            operation_id: Some("standby-operation".into()),
+        };
+        crate::proxy::compiler::record_confirmed_publication(&outcome, &confirmed).unwrap();
+        assert!(matches!(
+            crate::proxy::compiler::official_confirmation()
+                .expect("standby confirmation recorded")
+                .phase,
+            shared_types::ProxyPhase::Standby
+        ));
+
+        let admin = admin_probe::AdminBasicSnapshot {
+            process_id: Some(std::process::id()),
+            config_hash: Some(expected_hash),
+            upstreams: std::collections::HashMap::new(),
+        };
+        let (ready, status, reason, contract) =
+            derive_proxy(Some(&admin), true, ServerPhase::Running, false);
+        assert!(!ready, "standby must not claim proxy readiness");
+        assert_eq!(status, UserAppReadinessStatus::Unknown);
+        assert_eq!(reason, Some(UserAppReadinessReason::ProxyStandby));
+        assert_eq!(
+            contract.as_deref(),
+            Some(shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT),
+            "standby window responses are entirely proxy-self-produced"
+        );
+    }
+
+    /// 非 standby 的未确认发布（serving 确认缺失）不透出来源契约——原行为不变。
+    #[test]
+    fn unconfirmed_serving_publication_still_hides_origin_contract() {
+        let publication_id = "0b69964b-8df2-42f9-aa92-8204e27da7af";
+        let expected_hash = "SERVINGHASH01".to_string();
+        let outcome = crate::proxy::compiler::CompileOutcome {
+            serving_release_id: Some("rel-serving".into()),
+            operation_id: None,
+            config_path: "unused-serving-candidate.toml".into(),
+            expected_hash: expected_hash.clone(),
+            publication_id: publication_id.into(),
+            config_digest: "c".repeat(64),
+            entry_probes: vec![crate::proxy::compiler::ProxyProbeTarget {
+                address: "127.0.0.1:9080".parse().unwrap(),
+                expected_status: 200,
+            }],
+            business_probes: vec![],
+        };
+        let confirmed = crate::proxy::apply_status::ConfirmedPublication {
+            process_id: std::process::id(),
+            instance_id: "instance-serving".into(),
+            publication_id: publication_id.into(),
+            config_hash: expected_hash.clone(),
+            config_digest: outcome.config_digest.clone(),
+            attempt_id: 1,
+            operation_id: None,
+        };
+        crate::proxy::compiler::record_confirmed_publication(&outcome, &confirmed).unwrap();
+
+        let admin = admin_probe::AdminBasicSnapshot {
+            process_id: Some(std::process::id()),
+            config_hash: Some(expected_hash),
+            upstreams: std::collections::HashMap::new(),
+        };
+        let (ready, status, reason, contract) =
+            derive_proxy(Some(&admin), true, ServerPhase::Running, false);
+        assert!(!ready);
+        assert_eq!(status, UserAppReadinessStatus::Unknown);
+        assert_eq!(reason, Some(UserAppReadinessReason::ObserveIncomplete));
+        assert_eq!(contract, None);
+    }
 
     #[tokio::test]
     async fn cache_keeps_the_observed_identity_when_state_changes_before_store() {

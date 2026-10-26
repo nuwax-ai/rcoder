@@ -1035,6 +1035,13 @@ impl PortProxy {
             .get(shared_types::X_PINGAP_ETYPE_HEADER)
             .and_then(|value| value.to_str().ok())
             .is_some_and(is_connect_etype_header);
+        // standby 摘流窗口（mock 直出 503，见 app-cli compiler）：状态保留 503，
+        // 业务细分（starting/stopped/failed）由 hint 的就绪观察给出。
+        let standby_window = upstream_response
+            .headers
+            .get(shared_types::X_PINGAP_ETYPE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(is_standby_etype_header);
         if connect_failure {
             if let Err(error) = upstream_response.set_status(503) {
                 tracing::warn!("normalize trusted proxy connection failure status failed: {error}");
@@ -1076,7 +1083,11 @@ impl PortProxy {
                     let (_title, message) = hint.page_cause().copywriting(locale);
                     let payload = crate::error_page::MachineErrorPayload::new(
                         status,
-                        "pingap_self_produced_error",
+                        if standby_window {
+                            "proxy_standby"
+                        } else {
+                            "pingap_self_produced_error"
+                        },
                         message,
                         diagnostic_id.clone(),
                     )
@@ -1084,6 +1095,12 @@ impl PortProxy {
                     ("application/json", payload.to_body().into())
                 }
             };
+        // 摘流方宣告的重试节奏在替换前捕获（strip 循环会移除该头）
+        let announced_retry_after = upstream_response
+            .headers
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         // 按新表示重建头：移除编码/实体校验/缓存建议，替换 Content-Type/Length。
         // 个别头写失败仅记日志——不撤销替换（正文已按新表示重建）。
         for header in [
@@ -1115,9 +1132,13 @@ impl PortProxy {
         {
             tracing::warn!("rewrite diagnostic header on replaced response failed: {error}");
         }
-        if connect_failure && let Err(error) = upstream_response.insert_header("retry-after", "15")
+        if let Some(value) = replacement_retry_after(
+            connect_failure,
+            standby_window,
+            announced_retry_after.as_deref(),
+        ) && let Err(error) = upstream_response.insert_header("retry-after", value.as_str())
         {
-            tracing::warn!("rewrite retry-after on proxy connection failure failed: {error}");
+            tracing::warn!("rewrite retry-after on replaced response failed: {error}");
         }
         if connect_failure
             && let Some(operation_id) = hint.transition_operation_id()
@@ -1138,6 +1159,7 @@ impl PortProxy {
             %status,
             diagnostic_id = %diagnostic_id,
             readiness = ?hint.readiness_status,
+            standby = standby_window,
             "replaced confirmed pingap self-produced error body"
         );
     }
@@ -1276,6 +1298,30 @@ fn is_connect_etype_header(value: &str) -> bool {
         value,
         "ConnectRefused" | "ConnectNoRoute" | "ConnectTimedout"
     )
+}
+/// standby 摘流窗口标记（managed 生成配置显式携带，见 app-cli compiler；
+/// 该窗口无 upstream 代理，应用不可能注入同名头）。
+fn is_standby_etype_header(value: &str) -> bool {
+    value.eq_ignore_ascii_case(shared_types::PINGAP_STANDBY_ETYPE)
+}
+
+/// 替换后的 Retry-After 决策：连接失败统一 15s（唤醒恢复节奏）；standby
+/// 摘流保留入口宣告值（2s——发布确认预算节奏）；其余替换不宣告重试。
+fn replacement_retry_after(
+    connect_failure: bool,
+    standby_window: bool,
+    announced: Option<&str>,
+) -> Option<String> {
+    if connect_failure {
+        return Some("15".to_string());
+    }
+    if standby_window {
+        return announced
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+    }
+    None
 }
 
 /// Pingora 默认 fail_to_proxy 的状态映射（proxy_trait.rs 631-668 同款）——
@@ -1590,6 +1636,28 @@ mod official_restart_failure_tests {
         assert!(is_connect_etype_header("ConnectRefused"));
         assert!(!is_connect_etype_header("HTTPStatus"));
         assert!(!is_connect_etype_header("ReadTimedout"));
+        assert!(is_standby_etype_header("rcoder-standby"));
+        assert!(is_standby_etype_header("RCoder-Standby"));
+        assert!(!is_standby_etype_header("ConnectRefused"));
+        assert!(!is_standby_etype_header("custom-app-value"));
+    }
+
+    /// 替换后的 Retry-After：连接失败统一 15s；standby 保留摘流方宣告节奏；
+    /// 其余替换不宣告。
+    #[test]
+    fn replacement_retry_after_follows_failure_class() {
+        assert_eq!(
+            replacement_retry_after(true, false, Some("2")),
+            Some("15".to_string())
+        );
+        assert_eq!(
+            replacement_retry_after(false, true, Some("2")),
+            Some("2".to_string()),
+            "standby must preserve the advertised publication retry cadence"
+        );
+        assert_eq!(replacement_retry_after(false, true, Some("  ")), None);
+        assert_eq!(replacement_retry_after(false, true, None), None);
+        assert_eq!(replacement_retry_after(false, false, Some("2")), None);
     }
 
     #[test]

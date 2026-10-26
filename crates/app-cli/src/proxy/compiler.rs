@@ -751,7 +751,10 @@ pub fn build_standby_from_topology(
             ..Default::default()
         },
     );
-    // mock（Request 阶段直出，无 upstream）：status/headers/data
+    // mock（Request 阶段直出，无 upstream）：status/headers/data。
+    // `X-Pingap-EType: rcoder-standby` 证明响应为入口自产（该窗口无 upstream
+    // 代理，应用不可能注入），rcoder-proxy 故障页管线据此替换为友好表示；
+    // 业务状态细分（starting/stopped/failed）由就绪观察在错误时刻给出。
     let body =
         format!("service stopped or restarting (publication {publication_id}); retry shortly");
     let plugin: PluginConf = serde_json::from_str(
@@ -763,6 +766,7 @@ pub fn build_standby_from_topology(
                 "Content-Type: text/plain; charset=utf-8",
                 "Cache-Control: no-store",
                 "X-Rcoder-Publication: ".to_string() + publication_id,
+                "X-Pingap-EType: ".to_string() + shared_types::PINGAP_STANDBY_ETYPE,
             ],
             "data": body,
         })
@@ -1874,6 +1878,13 @@ addr = "0.0.0.0:9081"
         assert!(
             joined.contains("X-Rcoder-Publication"),
             "publication marker required: {joined}"
+        );
+        assert!(
+            joined.contains(&format!(
+                "X-Pingap-EType: {}",
+                shared_types::PINGAP_STANDBY_ETYPE
+            )),
+            "standby origin marker required for error-page replacement: {joined}"
         );
         // pin（0.15.0 文件模式）周期轮询默认 90s——必须收紧到确认预算内
         assert_eq!(
