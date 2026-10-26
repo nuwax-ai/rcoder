@@ -646,6 +646,9 @@ async fn settled_running_residue_hands_off_to_the_next_admission() {
     runtime
         .builder_running_observed
         .store(true, std::sync::atomic::Ordering::SeqCst);
+    // A REAL residue instance exists in the world: the successor's capture
+    // must find it and act on its exact identity.
+    *runtime.builder_workload.lock().unwrap() = Some("rcoder-app-builder-handoff".into());
     let record =
         stalled_restart_at_stages(&state, "handoff", &[ComputeControlStage::Stopping]).await;
     state
@@ -704,6 +707,18 @@ async fn settled_running_residue_hands_off_to_the_next_admission() {
         finished.state,
         ComputeControlState::Succeeded,
         "the successor control executes to completion after the settlement"
+    );
+    // The physical handoff: the successor captured the residue workload and
+    // issued exactly one stop against its EXACT captured identity.
+    let calls = runtime.builder_control_calls.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec![(
+            "builder-uid".into(),
+            "rcoder-app-builder-handoff".into(),
+            false
+        )],
+        "the successor's stop acts on the residue's exact captured uid"
     );
 }
 

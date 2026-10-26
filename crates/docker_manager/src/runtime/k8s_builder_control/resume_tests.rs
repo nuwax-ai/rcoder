@@ -2000,6 +2000,7 @@ async fn running_observation_requires_live_replicas_on_the_captured_controller()
         "running",
         "zero-replicas",
         "absent-controller",
+        "desired-without-owned-pod",
         "scaled-down-during-observation",
         "new-controller-uid",
     ] {

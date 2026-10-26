@@ -121,6 +121,9 @@ pub(crate) struct FenceRuntime {
     /// 结算对账证据旋钮：true 时 observe_builder_compute_running 报告
     /// Ok(true)（捕获控制器声明副本≥1，无需任何操作收据）。
     pub(crate) builder_running_observed: std::sync::atomic::AtomicBool,
+    /// apply_builder_control 调用记录（workload uid, name, restart 标志）：
+    /// 交接测试断言后继对正确 UID 的物理控制动作。
+    pub(crate) builder_control_calls: Mutex<Vec<(String, String, bool)>>,
     /// 免回执的原创建运行时权威观测（陈旧 Running 对账用）；
     /// None = trait 默认 Unsupported（保守保持）。
     pub(crate) unbound_creation_authority:
@@ -171,6 +174,7 @@ impl FenceRuntime {
             builder_retry_committed: Default::default(),
             builder_retry_partial: Default::default(),
             builder_running_observed: Default::default(),
+            builder_control_calls: Mutex::new(Vec::new()),
             unbound_creation_authority: Mutex::new(None),
             unbound_authority_transport_fails: Default::default(),
         })
@@ -258,6 +262,24 @@ impl AgentContainerRuntime for FenceRuntime {
         Ok(self
             .builder_running_observed
             .load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    async fn apply_builder_control(
+        &self,
+        target: &BuilderControlTarget,
+        restart: bool,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        // Record the physical control action against the captured workload
+        // identity: handoff tests assert the successor acts on the residue's
+        // EXACT uid, never a fabricated controller.
+        if let Some(workload) = target.workload.as_ref() {
+            self.builder_control_calls.lock().expect("lock").push((
+                workload.uid.clone(),
+                workload.name.clone(),
+                restart,
+            ));
+        }
+        Ok(None)
     }
 
     async fn observe_unbound_builder_creation_authority(
