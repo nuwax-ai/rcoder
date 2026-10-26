@@ -101,10 +101,23 @@ fn drain_retry_due(operation_id: &str) -> bool {
     let map = NEXT_DUE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = tokio::time::Instant::now();
-    // 容量上限：键随悬案累积不会自动清除，超限先清掉已到期条目（悬案自身
-    // 收敛后其键不再有意义），避免无界增长。
+    // 容量上限（硬上限）：先清已到期条目（悬案收敛后其键不再有意义）；
+    // 全部未过期仍满时逐出最早到期的键——保证插入后不超过 4096，防止键
+    // 随悬案累积无界增长（Codex 复审：仅 retain 不构成上限）。
     if map.len() >= 4096 {
         map.retain(|_, due| *due > now);
+        while map.len() >= 4096 {
+            let earliest = map
+                .iter()
+                .min_by_key(|(_, due)| *due)
+                .map(|(key, _)| key.clone());
+            match earliest {
+                Some(key) => {
+                    map.remove(&key);
+                }
+                None => break,
+            }
+        }
     }
     match map.get(operation_id) {
         Some(due) if now < *due => false,
