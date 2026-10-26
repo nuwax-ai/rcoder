@@ -1001,9 +1001,11 @@ impl PortProxy {
         ctx: &mut TrackingCtx,
         route: &crate::service::types::UserAppRouteCtx,
     ) {
-        // EType 归类先行：standby 标记值即平台来源证据（managed 配置的 strip
-        // 规则保证应用无法伪造该值），替换不依赖 advisor；advisor 尽力而为，
-        // 仅用于文案细分（starting/stopped/failed）。
+        // EType 归类先行。standby 标记值可被应用伪造（custom/旧配置不剥离
+        // 应用同名头），来源确认不可省略——但与昂贵的文案观察分离（Codex P2）：
+        // 来源走缓存路径（advise，30s TTL——error_origin_contract 是配置衍生
+        // 的慢变量），未确认仍透传；文案细分走新鲜观察尽力而为，缺失时
+        // standby 兜底 Restarting（摘流正文本身即"重启中"语义）。
         let etype_header = upstream_response
             .headers
             .get(shared_types::X_PINGAP_ETYPE_HEADER)
@@ -1023,22 +1025,38 @@ impl PortProxy {
                     .min(Duration::from_millis(1500))
             })
             .unwrap_or_else(|| Duration::from_millis(1000));
-        // advisor 预算经常小于 standby 窗口的完整观察时延（定位+拉取+复核），
-        // 其 None/超时只降级文案，不再放弃替换（2026-10-27 事故：标记到达
-        // 浏览器但正文原样透传）。
-        let hint = match advisor.as_ref() {
-            Some(advisor) => {
-                advisor
-                    .advise_current(&route.app_id, route.stage, budget)
-                    .await
-            }
-            None => None,
-        };
-        if !standby_window {
-            let confirmed = hint.as_ref().is_some_and(|h| h.error_origin_confirmed);
-            if !confirmed {
+        let hint = if standby_window {
+            // 来源：缓存路径（30s TTL 内即时替换；首轮付费观察——stop 短路
+            // 路径为毫秒级）。未确认 → 透传（应用伪造或观察不可得）。
+            let advised = match advisor.as_ref() {
+                Some(advisor) => advisor.advise(&route.app_id, route.stage, budget).await,
+                None => None,
+            };
+            if !advised.as_ref().is_some_and(|h| h.error_origin_confirmed) {
                 return;
             }
+            // 文案：新鲜观察尽力而为；超时由 Restarting 兜底。
+            match advisor.as_ref() {
+                Some(advisor) => advisor
+                    .advise_current(&route.app_id, route.stage, budget)
+                    .await
+                    .filter(|h| h.error_origin_confirmed),
+                None => None,
+            }
+        } else {
+            // 既有 T11 路径：新鲜观察一次承担来源与文案。
+            match advisor.as_ref() {
+                Some(advisor) => {
+                    advisor
+                        .advise_current(&route.app_id, route.stage, budget)
+                        .await
+                }
+                None => None,
+            }
+        };
+        // 非 standby：来源未确认（custom/旧配置）→ 原样透传（Codex P1/P2 回归门）。
+        if !standby_window && !hint.as_ref().is_some_and(|h| h.error_origin_confirmed) {
+            return;
         }
         let Some(renderer) = self.error_pages_slot.load_full() else {
             return;
@@ -1316,14 +1334,19 @@ fn is_standby_etype_header(value: &str) -> bool {
 
 /// 替换文案档位：advisor 观察确认时用其细分（starting/stopped/failed/…）；
 /// standby 窗口观察缺失（advisor 超时/不可达——其 1s 预算常输给完整观察
-/// 时延）时兜底 Restarting（摘流正文本身即"重启中"语义）；非 standby 且未
-/// 确认的情况不会经过门控，返回 Generic 仅为穷尽。
+/// 时延）或观察为 Generic 时兜底 Restarting（摘流正文本身即"重启中"语义）；
+/// 非 standby 且未确认的情况不会经过门控，返回 Generic 仅为穷尽。
 fn replacement_cause(
     hint: Option<&crate::error_page::UserAppProxyFailureHint>,
     standby_window: bool,
 ) -> crate::error_page::ErrorPageCause {
     match hint {
-        Some(h) if h.error_origin_confirmed => h.page_cause(),
+        Some(h) if h.error_origin_confirmed => match h.page_cause() {
+            crate::error_page::ErrorPageCause::Generic if standby_window => {
+                crate::error_page::ErrorPageCause::Restarting
+            }
+            other => other,
+        },
         _ if standby_window => crate::error_page::ErrorPageCause::Restarting,
         _ => crate::error_page::ErrorPageCause::Generic,
     }
@@ -1712,6 +1735,17 @@ mod official_restart_failure_tests {
             replacement_cause(None, false),
             crate::error_page::ErrorPageCause::Generic,
             "non-standby without confirmation stays generic"
+        );
+        // standby + 确认来源但观察为 Generic（无细分证据）：兜底 Restarting。
+        let generic_readiness = crate::error_page::UserAppProxyFailureHint {
+            readiness_status: None,
+            error_origin_confirmed: true,
+            proxy_confirmation: None,
+        };
+        assert_eq!(
+            replacement_cause(Some(&generic_readiness), true),
+            crate::error_page::ErrorPageCause::Restarting,
+            "standby without refinement evidence falls back to restarting copy"
         );
     }
 
