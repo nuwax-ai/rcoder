@@ -252,6 +252,33 @@ pub(super) async fn discover_pending(
             );
             continue;
         }
+        // Total-deadline settlement runs before every work-dispatching branch:
+        // an expired operation receives no further continuation work, and the
+        // settlement itself re-verifies expiry and lease liveness durably.
+        if matches!(
+            record.state,
+            shared_types::ComputeControlState::Running
+                | shared_types::ComputeControlState::RecoveryRequired
+        ) && crate::userapp_builder::compute_control::compute_deadline_expired(state, &record)
+            .await
+        {
+            let state = state.clone();
+            tasks.push(
+                format!("compute-deadline:{}", record.operation_id),
+                async move {
+                    tokio::time::timeout(
+                        Duration::from_secs(30),
+                        crate::userapp_builder::compute_control::settle_expired_compute_control(
+                            &state, &record,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Compute deadline settlement timed out"))??;
+                    Ok(())
+                },
+            );
+            continue;
+        }
         if crate::userapp_builder::compute_control::can_recover_original_docker_stop(&record) {
             let flight = state.userapp_op_flight.guard()?;
             let state = state.clone();

@@ -20,6 +20,8 @@ mod admission_cancellation_tests;
 mod builder_restart_stop_observation_tests;
 mod codec;
 mod compute;
+#[cfg(all(test, any(feature = "userapp-turso", feature = "pg")))]
+mod compute_deadline_tests;
 mod compute_execution;
 mod compute_recovery;
 #[cfg(all(test, feature = "userapp-turso"))]
@@ -395,6 +397,52 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         self.run(false, move |tx, backend| {
             Box::pin(async move {
                 compute_recovery::fail_unrecoverable(tx, backend, &snapshot, &code, &message).await
+            })
+        })
+        .await
+    }
+
+    async fn bind_compute_control_deadline(
+        &self,
+        snapshot: &ComputeControlRecord,
+        deadline_epoch_ms: i64,
+    ) -> Result<i64, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_recovery::bind_deadline(tx, backend, &snapshot, deadline_epoch_ms).await
+            })
+        })
+        .await
+    }
+
+    async fn compute_control_deadline(
+        &self,
+        app_id: &str,
+        operation_id: &str,
+    ) -> Result<Option<i64>, UserAppStoreError> {
+        let app_id = app_id.to_owned();
+        let operation_id = operation_id.to_owned();
+        self.run(true, move |tx, backend| {
+            Box::pin(async move {
+                compute_recovery::read_deadline(tx, backend, &app_id, &operation_id).await
+            })
+        })
+        .await
+    }
+
+    async fn fail_expired_compute_control(
+        &self,
+        snapshot: &ComputeControlRecord,
+        code: &str,
+        message: &str,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let code = code.to_owned();
+        let message = message.to_owned();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_recovery::expire(tx, backend, &snapshot, &code, &message).await
             })
         })
         .await

@@ -146,6 +146,140 @@ pub(super) async fn fail_unrecoverable(
     updated(tx, snapshot, changed).await
 }
 
+/// Bind the compute control's total-operation deadline into the shared
+/// operation deadline table (keyed by operation id). Idempotent: an existing
+/// row is returned unchanged, so retried claims and the recovery scan can
+/// never extend an operation's budget. Terminal or moved-on records refuse.
+pub(super) async fn bind_deadline(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    snapshot: &ComputeControlRecord,
+    deadline_epoch_ms: i64,
+) -> Result<i64, UserAppStoreError> {
+    use crate::db::models;
+    if deadline_epoch_ms <= 0 {
+        return Err(UserAppStoreError::InvalidOperation(
+            "Compute control deadline must be positive".into(),
+        ));
+    }
+    repo::claim_app(tx, backend, &snapshot.app_id).await?;
+    if let Some(row) =
+        models::ComputeControlDeadline::filter_by_operation_id(&snapshot.operation_id)
+            .first()
+            .exec(tx)
+            .await
+            .map_err(storage)?
+    {
+        if row.app_id != snapshot.app_id || row.lifecycle_id != snapshot.lifecycle_id {
+            return Err(UserAppStoreError::LifecycleConflict);
+        }
+        return Ok(row.deadline_ms);
+    }
+    let actual = compute::get(tx, &snapshot.app_id, &snapshot.operation_id)
+        .await?
+        .ok_or(UserAppStoreError::NotFound)?;
+    if actual.lifecycle_id != snapshot.lifecycle_id
+        || actual.generation != snapshot.generation
+        || actual.scope != snapshot.scope
+        || actual.state.is_terminal()
+    {
+        return Err(UserAppStoreError::VersionConflict);
+    }
+    if let Err(error) = models::ComputeControlDeadline::create()
+        .operation_id(&snapshot.operation_id)
+        .app_id(&snapshot.app_id)
+        .lifecycle_id(&snapshot.lifecycle_id)
+        .deadline_ms(deadline_epoch_ms)
+        .exec(tx)
+        .await
+    {
+        // A concurrent bind (another replica's scan) can win the operation-id
+        // key between the read above and this insert; its row is equivalent
+        // exactly when it names the same control.
+        if let Some(row) =
+            models::ComputeControlDeadline::filter_by_operation_id(&snapshot.operation_id)
+                .first()
+                .exec(tx)
+                .await
+                .map_err(storage)?
+            && row.app_id == snapshot.app_id
+            && row.lifecycle_id == snapshot.lifecycle_id
+        {
+            return Ok(row.deadline_ms);
+        }
+        return Err(storage(error));
+    }
+    Ok(deadline_epoch_ms)
+}
+
+/// Deadline observation for the compute control table: keyed by the control's
+/// operation id and filtered by app.
+pub(super) async fn read_deadline(
+    tx: &mut dyn Executor,
+    _: Backend,
+    app_id: &str,
+    operation_id: &str,
+) -> Result<Option<i64>, UserAppStoreError> {
+    use crate::db::models;
+    Ok(
+        models::ComputeControlDeadline::filter_by_operation_id(operation_id)
+            .first()
+            .exec(tx)
+            .await
+            .map_err(storage)?
+            .filter(|row| row.app_id == app_id)
+            .map(|row| row.deadline_ms),
+    )
+}
+
+/// Deadline settlement: the bound total deadline expired while the control was
+/// still non-terminal. Full record equality guards the settler against a stale
+/// page, the deadline row is re-verified inside this transaction (a missing or
+/// unexpired row never settles), and the terminal CAS keeps the last durable
+/// stage, checkpoint, lease and executor so the failure stays diagnosable and
+/// the terminal lease-cleanup scan still owns the physical receipt.
+pub(super) async fn expire(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    snapshot: &ComputeControlRecord,
+    code: &str,
+    message: &str,
+) -> Result<ComputeControlRecord, UserAppStoreError> {
+    use crate::db::models;
+    repo::claim_app(tx, backend, &snapshot.app_id).await?;
+    let identity = ComputeExecutorIdentity {
+        app_id: snapshot.app_id.clone(),
+        lifecycle_id: snapshot.lifecycle_id.clone(),
+        scope: snapshot.scope,
+        operation_id: snapshot.operation_id.clone(),
+        generation: snapshot.generation,
+        executor_id: snapshot
+            .executor_id
+            .clone()
+            .ok_or(UserAppStoreError::VersionConflict)?,
+    };
+    if compute::current(tx, &identity).await? != *snapshot {
+        return Err(UserAppStoreError::VersionConflict);
+    }
+    let expired = models::ComputeControlDeadline::filter_by_operation_id(&snapshot.operation_id)
+        .first()
+        .exec(tx)
+        .await
+        .map_err(storage)?
+        .filter(|row| row.app_id == snapshot.app_id)
+        .is_some_and(|row| row.deadline_ms <= chrono::Utc::now().timestamp_millis());
+    if !expired {
+        return Err(UserAppStoreError::InvalidOperation(
+            "Compute control deadline has not expired".into(),
+        ));
+    }
+    let now = chrono::Utc::now().timestamp_micros();
+    let changed = toasty::sql::statement(repo::sql(backend,
+        "UPDATE userapp_compute_controls SET state='failed',error_code=$3,error_message=$4,revision=revision+1,updated_at_us=$5,terminal_at_us=$5 WHERE operation_id=$1 AND revision=$2 AND state IN ('running','recovery_required')"))
+        .bind(&snapshot.operation_id).bind(snapshot.revision).bind(code).bind(message).bind(now).exec(tx).await.map_err(storage)?;
+    updated(tx, snapshot, changed).await
+}
+
 async fn updated(
     tx: &mut dyn Executor,
     snapshot: &ComputeControlRecord,

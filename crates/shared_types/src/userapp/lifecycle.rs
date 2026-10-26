@@ -1137,6 +1137,49 @@ pub trait UserAppLifecycleStore: Send + Sync {
         ))
     }
 
+    /// Bind (idempotently) the total-operation deadline of a claimed compute
+    /// control, keyed by its operation id in the compute deadline table. An
+    /// existing row is returned unchanged so retried claims and the recovery
+    /// scan can never extend an operation's budget.
+    async fn bind_compute_control_deadline(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+        _deadline_epoch_ms: i64,
+    ) -> Result<i64, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Compute control deadline binding is unsupported".into(),
+        ))
+    }
+
+    /// Read the bound total deadline of a compute control, if any. Like the
+    /// binding it is keyed by the control's operation id in the compute
+    /// deadline table (never the ordinary operation deadline table).
+    async fn compute_control_deadline(
+        &self,
+        _app_id: &str,
+        _operation_id: &str,
+    ) -> Result<Option<i64>, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Compute control deadline read is unsupported".into(),
+        ))
+    }
+
+    /// Settle a claimed compute control whose bound total deadline expired
+    /// while it was still non-terminal. The expiry is re-verified inside the
+    /// transaction; this terminal CAS keeps the last durable stage, checkpoint
+    /// and lease so the failure stays diagnosable and the lease cleanup scan
+    /// still owns the physical receipt.
+    async fn fail_expired_compute_control(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+        _code: &str,
+        _message: &str,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Expired compute settlement is unsupported".into(),
+        ))
+    }
+
     /// Finalize a compute control whose durable stage proves that all physical
     /// writes have returned. The caller verifies any outstanding readiness read;
     /// this method never authorizes replay of the runtime mutation.

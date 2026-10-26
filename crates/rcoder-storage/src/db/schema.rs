@@ -60,6 +60,9 @@ fn migration_ddl(component: Component, backend: Backend, version: i64) -> Result
     if component == Component::Userapp && version == 3 {
         return Ok(include_str!("../../schema/userapp-recovery-witness-v3.sql"));
     }
+    if component == Component::Userapp && version == 4 {
+        return Ok(include_str!("../../schema/userapp-compute-deadline-v4.sql"));
+    }
     if component == Component::Project && version == 2 {
         return Ok(include_str!("../../schema/project-agent-bindings-v2.sql"));
     }
@@ -67,7 +70,7 @@ fn migration_ddl(component: Component, backend: Backend, version: i64) -> Result
 }
 fn latest_version(component: Component) -> i64 {
     match component {
-        Component::Userapp => 3,
+        Component::Userapp => 4,
         Component::Project => 2,
         Component::Preview => 1,
     }
@@ -79,8 +82,10 @@ fn migration_name(component: Component, version: i64) -> &'static str {
         "agent-bindings-v2"
     } else if version == 2 {
         "compute-control-v2"
-    } else {
+    } else if version == 3 {
         "recovery-witness-v3"
+    } else {
+        "compute-deadline-v4"
     }
 }
 

@@ -22,6 +22,12 @@ const PREVIOUS_EXECUTIONS_DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
 const PREVIOUS_EXECUTIONS_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const RESTART_READINESS_TIMEOUT: Duration = Duration::from_secs(300);
 const RESTART_READINESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Total-operation budget for a compute control: it covers drain, stop, start
+/// and every recovery continuation of the same operation id. At expiry (and
+/// only once the physical lease provably stopped renewing) the recovery scan
+/// settles the control as failed, which unblocks the scope's admission fence.
+const COMPUTE_CONTROL_TOTAL_DEADLINE_SECS: i64 = 15 * 60;
+const ERR_DEADLINE_EXCEEDED: &str = "ERR_DEADLINE_EXCEEDED";
 
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct ComputeOperationView {
@@ -731,6 +737,24 @@ pub(crate) async fn execute_pending(state: &AppState, pending: ComputeControlRec
         Err(UserAppStoreError::VersionConflict) => return Ok(()), // another replica won
         Err(error) => return Err(error.into()),
     };
+    // The total deadline bounds the whole operation (drain, stop, start and
+    // every recovery continuation of this operation id). A binding failure is
+    // a liveness-net shortfall, not a business error: the recovery scan binds
+    // lazily on the next observation.
+    if let Err(error) = state
+        .userapp_store
+        .bind_compute_control_deadline(
+            &record,
+            chrono::Utc::now().timestamp_millis() + COMPUTE_CONTROL_TOTAL_DEADLINE_SECS * 1000,
+        )
+        .await
+    {
+        tracing::warn!(
+            %error,
+            operation_id = %record.operation_id,
+            "Compute control deadline binding deferred to the recovery scan"
+        );
+    }
     if record
         .request_id
         .starts_with(AUTOMATIC_REPAIR_REQUEST_PREFIX)
@@ -1838,6 +1862,275 @@ pub(crate) async fn reconcile_superseded(
         .map_err(Into::into)
 }
 
+/// The retained authority of a taken-over Kubernetes compute lease. The
+/// runtime handoff renewed the exact original Lease (same uid and holder
+/// token) and its heartbeat keeps renewing until this guard drops, so the
+/// ORIGINAL durable receipt stays the live physical identity throughout the
+/// continuation that holds this guard.
+struct RetainedComputeTakeover {
+    // Keeps the renewal heartbeat alive across the whole continuation.
+    _guard: Box<dyn container_runtime_api::ComputeHandoffGuard>,
+    receipt: UserAppOperationLeaseReceipt,
+}
+
+impl RetainedComputeTakeover {
+    fn as_lease(&self) -> &dyn AppOperationLease {
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl AppOperationLease for RetainedComputeTakeover {
+    fn receipt(&self) -> Option<UserAppOperationLeaseReceipt> {
+        Some(self.receipt.clone())
+    }
+    async fn validate_retained(&self) -> Result<bool, String> {
+        // The heartbeat spawned by the handoff holds the lease under the
+        // original identity for exactly as long as this guard lives. If the
+        // heartbeat dies, lease expiry plus the durable CAS bound the residue.
+        Ok(true)
+    }
+    async fn release(self: Box<Self>) -> Result<(), String> {
+        // Never released through the guard: the takeover kept the original
+        // identity, so terminal cleanup releases through the record's receipt
+        // exactly like an ordinary continuation.
+        Ok(())
+    }
+}
+
+/// Take over the expired original compute lease through the runtime handoff
+/// protocol so the restart continuation runs under the ORIGINAL operation
+/// identity with a continuously renewing guard covering the whole
+/// continuation. Only an exact retained acquisition qualifies: a lease that
+/// is held or renewed again, a vanished lease, a changed identity, a previous
+/// owner or a foreign prepared attempt each keep their existing recovery
+/// paths, and so does the whole Docker lease domain (it re-acquires through
+/// its own retained-fd protocol).
+async fn take_over_expired_builder_lease(
+    state: &AppState,
+    snapshot: &ComputeControlRecord,
+) -> Result<Option<RetainedComputeTakeover>> {
+    use container_runtime_api::ComputeHandoff;
+    let receipt = snapshot
+        .lease
+        .as_ref()
+        .context("Builder continuation lease missing")?;
+    if !matches!(receipt, UserAppOperationLeaseReceipt::Kubernetes { .. }) {
+        tracing::debug!(
+            operation_id = %snapshot.operation_id,
+            app_id = %snapshot.app_id,
+            "Expired-lease takeover is the Kubernetes lease domain; the Docker receipt keeps its retained-fd path"
+        );
+        return Ok(None);
+    }
+    // A deadline-expired operation must not be revived: once its lease stops
+    // being renewed the settlement scan fails it and unblocks the scope.
+    if state
+        .userapp_store
+        .compute_control_deadline(&snapshot.app_id, &snapshot.operation_id)
+        .await?
+        .is_some_and(|ms| ms <= chrono::Utc::now().timestamp_millis())
+    {
+        tracing::debug!(
+            operation_id = %snapshot.operation_id,
+            app_id = %snapshot.app_id,
+            "Expired original lease is past the operation deadline; leaving settlement to the recovery scan"
+        );
+        return Ok(None);
+    }
+    let context = snapshot.execution_context().map_err(anyhow::Error::msg)?;
+    match state
+        .runtime()
+        .prepare_compute_handoff(&context, snapshot.scope, Some(receipt))
+        .await?
+    {
+        ComputeHandoff::Acquired {
+            guard,
+            original_absent: false,
+        } => {
+            tracing::info!(
+                operation_id = %snapshot.operation_id,
+                app_id = %snapshot.app_id,
+                "Expired original compute lease taken over under its original identity; continuing the restart"
+            );
+            Ok(Some(RetainedComputeTakeover {
+                _guard: guard,
+                receipt: receipt.clone(),
+            }))
+        }
+        ComputeHandoff::Acquired {
+            original_absent: true,
+            ..
+        } => {
+            // A same-executor unregistered prepared attempt holds the lease;
+            // the record's receipt is not that holder's identity.
+            tracing::debug!(
+                operation_id = %snapshot.operation_id,
+                app_id = %snapshot.app_id,
+                "Compute handoff acquired a lease the record receipt never bound; not a continuation authority"
+            );
+            Ok(None)
+        }
+        ComputeHandoff::Held => {
+            tracing::debug!(
+                operation_id = %snapshot.operation_id,
+                app_id = %snapshot.app_id,
+                "Original compute lease is held or renewed again; deferring the continuation"
+            );
+            Ok(None)
+        }
+        ComputeHandoff::Vacant { .. } => {
+            tracing::debug!(
+                operation_id = %snapshot.operation_id,
+                app_id = %snapshot.app_id,
+                "Original compute lease object is gone; leaving the record to existing recovery paths"
+            );
+            Ok(None)
+        }
+        ComputeHandoff::Deferred(inspection) => {
+            tracing::debug!(
+                operation_id = %snapshot.operation_id,
+                app_id = %snapshot.app_id,
+                ?inspection,
+                "Compute handoff deferred the expired lease; leaving the record to existing recovery paths"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Deadline observation for the recovery scan: binds the budget lazily for
+/// controls that predate deadline binding (or whose claim crashed before
+/// binding) and reports whether the bound deadline has expired. Infallible by
+/// design — a store hiccup defers to the next scan and the durable expiry
+/// re-verification lives in [`settle_expired_compute_control`].
+pub(crate) async fn compute_deadline_expired(
+    state: &AppState,
+    record: &ComputeControlRecord,
+) -> bool {
+    match state
+        .userapp_store
+        .compute_control_deadline(&record.app_id, &record.operation_id)
+        .await
+    {
+        Ok(Some(deadline)) => deadline <= chrono::Utc::now().timestamp_millis(),
+        Ok(None) => {
+            let budget =
+                chrono::Utc::now().timestamp_millis() + COMPUTE_CONTROL_TOTAL_DEADLINE_SECS * 1000;
+            match state
+                .userapp_store
+                .bind_compute_control_deadline(record, budget)
+                .await
+            {
+                Ok(bound) => {
+                    tracing::info!(
+                        operation_id = %record.operation_id,
+                        app_id = %record.app_id,
+                        deadline_ms = bound,
+                        "Bound a missing compute control deadline from the recovery scan"
+                    );
+                    false
+                }
+                Err(UserAppStoreError::VersionConflict) => false,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        operation_id = %record.operation_id,
+                        app_id = %record.app_id,
+                        "Compute control deadline binding failed; retrying on the next scan"
+                    );
+                    false
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                operation_id = %record.operation_id,
+                app_id = %record.app_id,
+                "Compute control deadline read failed; retrying on the next scan"
+            );
+            false
+        }
+    }
+}
+
+/// Settle a non-terminal compute control whose total deadline expired. Never
+/// settles by age against a lease that still validates: a live renewal (the
+/// original executor or another replica's takeover continuation) owns the
+/// physical write path, so this round defers instead. A revision CAS race with
+/// a progressing executor is benign and waits for the next scan.
+pub(crate) async fn settle_expired_compute_control(
+    state: &AppState,
+    snapshot: &ComputeControlRecord,
+) -> Result<()> {
+    let Some(current) = state
+        .userapp_store
+        .get_compute_control(&snapshot.app_id, &snapshot.operation_id)
+        .await?
+    else {
+        return Ok(());
+    };
+    match current.state {
+        ComputeControlState::Running | ComputeControlState::RecoveryRequired => {}
+        ComputeControlState::Pending
+        | ComputeControlState::Succeeded
+        | ComputeControlState::Failed
+        | ComputeControlState::Superseded => return Ok(()),
+    }
+    if !compute_deadline_expired(state, &current).await {
+        return Ok(());
+    }
+    if let Some(receipt) = current.lease.clone() {
+        let context = current.execution_context().map_err(anyhow::Error::msg)?;
+        match state
+            .runtime()
+            .validate_app_operation_receipt(&context, &receipt)
+            .await
+        {
+            Ok(true) => {
+                tracing::warn!(
+                    operation_id = %current.operation_id,
+                    app_id = %current.app_id,
+                    "Compute control exceeded its deadline but its lease is still renewed; deferring settlement"
+                );
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    operation_id = %current.operation_id,
+                    app_id = %current.app_id,
+                    "Compute deadline settlement could not confirm the lease is unheld; deferring"
+                );
+                return Ok(());
+            }
+        }
+    }
+    let message = format!(
+        "Compute control exceeded its total deadline of {} seconds at stage {}; the physical lease stopped renewing",
+        COMPUTE_CONTROL_TOTAL_DEADLINE_SECS, current.stage
+    );
+    match state
+        .userapp_store
+        .fail_expired_compute_control(&current, ERR_DEADLINE_EXCEEDED, &message)
+        .await
+    {
+        Ok(settled) => {
+            tracing::info!(
+                operation_id = %settled.operation_id,
+                app_id = %settled.app_id,
+                stage = %settled.stage,
+                "Compute control settled as failed after its total deadline expired; the scope admission fence is released"
+            );
+            Ok(())
+        }
+        Err(UserAppStoreError::VersionConflict) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// A durable Kubernetes stop-boundary confirmation proves the original stop
 /// completed even without this operation's platform stop receipt (e.g. an
 /// exact UID-matched external stop). Continuation honors the recorded fact;
@@ -1887,10 +2180,35 @@ async fn resume_builder_start_with_guard(
         .lease
         .as_ref()
         .context("Builder continuation lease missing")?;
-    if !original_continuation_lease_current(state, snapshot, held_guard).await? {
-        recover_confirmed_with_guard(state, snapshot, held_guard).await?;
-        return Ok(());
-    }
+    // An expired original lease is not the end of this continuation: the
+    // runtime handoff protocol can retake the exact Lease under its ORIGINAL
+    // identity and keep renewing it, after which the whole continuation below
+    // runs under that guard. Any other outcome keeps the previous fallback.
+    let takeover;
+    let held_guard = if original_continuation_lease_current(state, snapshot, held_guard).await? {
+        held_guard
+    } else {
+        // The takeover is an enabler, never a gate: a handoff attempt that
+        // itself fails (unsupported runtime, transport) leaves the record to
+        // the exact fallback the pre-takeover code took.
+        takeover = match take_over_expired_builder_lease(state, snapshot).await {
+            Ok(taken) => taken,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    operation_id = %snapshot.operation_id,
+                    app_id = %snapshot.app_id,
+                    "Expired-lease takeover attempt failed; falling back to the previous recovery path"
+                );
+                None
+            }
+        };
+        let Some(taken_over) = takeover.as_ref() else {
+            recover_confirmed_with_guard(state, snapshot, held_guard).await?;
+            return Ok(());
+        };
+        Some(taken_over.as_lease())
+    };
     // Result observation needs only the original submitted identity. New
     // writes still require both the Held lease and the existing strict target.
     ensure!(
@@ -2352,3 +2670,6 @@ mod missing_tests;
 
 #[cfg(all(test, feature = "userapp-turso"))]
 mod failure_tests;
+
+#[cfg(all(test, feature = "userapp-turso"))]
+mod deadline_takeover_tests;
