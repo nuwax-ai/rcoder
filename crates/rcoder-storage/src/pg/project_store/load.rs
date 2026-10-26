@@ -828,3 +828,58 @@ impl crate::pg::PgStore {
         Ok(Some(info))
     }
 }
+
+impl crate::pg::PgStore {
+    /// On-miss refresh for the user-scoped container lookup: re-read the
+    /// user's LIVE project rows (container bound) from PG and run each through
+    /// the guarded project read-through — the same reconciliation the SSE
+    /// path uses — then the caller retries the mirror lookup. A user with no
+    /// live rows is a successful no-op (the miss is then a true miss).
+    pub async fn refresh_user_container(&self, user_id: &str) -> anyhow::Result<()> {
+        shared_types::validate_identifier(user_id, "user_id")
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let ids: Vec<String> = super::database::read(&self.database, {
+            let user_id = user_id.to_owned();
+            move |tx| {
+                Box::pin(async move {
+                    let rows = toasty::sql::query(
+                        "SELECT project_id FROM projects WHERE user_id=$1 AND container_name IS NOT NULL ORDER BY created_at_us DESC LIMIT 8",
+                    )
+                    .bind(user_id)
+                    .exec(tx)
+                    .await?;
+                    let mut ids = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        if let toasty_core::stmt::Value::Record(mut record)
+                            = row
+                            && record.fields.len() == 1
+                            && let toasty_core::stmt::Value::String(id) =
+                                record.fields.pop().unwrap_or_else(|| unreachable!("len checked"))
+                        {
+                            ids.push(id);
+                        }
+                    }
+                    Ok(ids)
+                })
+            }
+        })
+        .await?;
+        if ids.is_empty() {
+            // No live rows: nothing to hydrate. Retired projects intentionally
+            // stay un-hydrated for this path — they never resolve a container.
+            return Ok(());
+        }
+        for project_id in ids {
+            if let Err(error) = self.refresh_project_registration(&project_id).await {
+                // One bad row must not block the remaining candidates; the
+                // periodic full sync remains the fallback reconciler.
+                tracing::debug!(
+                    %error,
+                    project_id = %project_id,
+                    "User container refresh: candidate project read-through failed"
+                );
+            }
+        }
+        Ok(())
+    }
+}

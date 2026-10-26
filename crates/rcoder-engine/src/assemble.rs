@@ -130,6 +130,11 @@ pub async fn assemble(
     // 到 trait object，避免类型推断把 clone 的类型参数反向绑定为 dyn。
     let projects_for_lookup = Arc::clone(&projects);
     let container_lookup: Arc<dyn shared_types::ContainerLookup> = projects_for_lookup;
+    // 用户维度查找 miss 时的 PG 回源（仅 Postgres 后端有；memory 部署 None）
+    #[cfg(feature = "rcoder-pg")]
+    let user_refresh = projects.user_refresh();
+    #[cfg(not(feature = "rcoder-pg"))]
+    let user_refresh: Option<Arc<dyn shared_types::ContainerUserRefresh>> = None;
 
     // Userapp 活动状态注册表（闲置回收 + 流量唤醒的共享状态）。
     // 独立 Arc 在 Pingora 之前构造（注入代理层）；runtime 延迟到下方 RuntimeManager::get 后
@@ -147,6 +152,7 @@ pub async fn assemble(
         &bootstrap_result.config,
         Arc::clone(&bootstrap_result.api_key_config),
         container_lookup,
+        user_refresh,
         access_tracker,
         wake_control,
     )

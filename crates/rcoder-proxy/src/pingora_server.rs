@@ -93,6 +93,17 @@ impl PingoraServerManager {
         self
     }
 
+    /// 用户维度查找 miss 时的 PG 回源钩子（与 container_lookup 同源注入；
+    /// None = 内存部署，无回源）
+    pub fn with_user_refresh_opt(
+        mut self,
+        refresh: Option<Arc<dyn shared_types::ContainerUserRefresh>>,
+    ) -> Self {
+        let new_service = (*self.service).clone().with_user_refresh_opt(refresh);
+        self.service = Arc::new(new_service);
+        self
+    }
+
     /// 设置 Userapp 访问追踪（闲置回收的 HTTP 访问信号源，/api/v1/userapp/proxy/app/prod/* 路由用）
     pub fn with_access_tracker(mut self, tracker: Arc<dyn shared_types::AppAccessTracker>) -> Self {
         let new_service = (*self.service).clone().with_access_tracker(tracker);

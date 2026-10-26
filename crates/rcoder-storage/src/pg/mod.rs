@@ -545,3 +545,11 @@ impl ContainerLookup for PgStore {
 fn uuid_generation() -> String {
     shared_types::persistence::ProjectPersistenceIdentity::default().generation
 }
+
+#[cfg(feature = "pg")]
+#[async_trait::async_trait]
+impl shared_types::ContainerUserRefresh for PgStore {
+    async fn refresh_user_container(&self, user_id: &str) -> anyhow::Result<()> {
+        self.refresh_user_container(user_id).await
+    }
+}

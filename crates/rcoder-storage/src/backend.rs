@@ -481,6 +481,17 @@ impl ProjectStoreBackend {
         }
     }
 
+    /// The user-scoped on-miss refresh hook for the proxy: PG deployments
+    /// re-read the user's authoritative rows through the guarded project
+    /// read-through; memory-only deployments have nothing to fall back to.
+    #[cfg(feature = "pg")]
+    pub fn user_refresh(&self) -> Option<Arc<dyn shared_types::ContainerUserRefresh>> {
+        match self {
+            Self::Memory(_) => None,
+            Self::Postgres(store) => Some(store.clone()),
+        }
+    }
+
     /// PG 后端引用（P2：sync/leader 等后端特有任务的装配入口；Memory 为 None）。
     /// 返回 &Arc：调用方可 clone 独立句柄传给后台任务
     #[cfg(feature = "pg")]

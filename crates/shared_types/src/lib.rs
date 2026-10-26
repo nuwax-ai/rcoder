@@ -23,9 +23,9 @@ pub use session_hint::SessionHint;
 
 // 容器域类型（高内聚收拢于 container/ 模块）—— 条目/查找/清理/统计 + 服务与隔离枚举
 pub use container::{
-    AppRuntimeIpResolver, ContainerEntry, ContainerLookup, IdleContainerInfo, IsolationType,
-    IsolationTypeError, MissingIdentifier, ProjectScope, ServiceType, ServiceTypeError,
-    StorageStats, container_identity_from_name, get_enabled_service_types,
+    AppRuntimeIpResolver, ContainerEntry, ContainerLookup, ContainerUserRefresh, IdleContainerInfo,
+    IsolationType, IsolationTypeError, MissingIdentifier, ProjectScope, ServiceType,
+    ServiceTypeError, StorageStats, container_identity_from_name, get_enabled_service_types,
     get_supported_service_types,
 };
 

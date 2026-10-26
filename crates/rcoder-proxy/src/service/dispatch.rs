@@ -228,6 +228,7 @@ impl PortProxy {
                     &self.vnc_backends,
                     &self.metrics,
                     &self.container_lookup,
+                    &self.user_refresh,
                 )
                 .await
             }

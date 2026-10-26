@@ -1110,3 +1110,67 @@ async fn external_workload_replacement_still_refused_as_conflict() {
         .flush_and_stop(Duration::from_secs(5))
         .await;
 }
+
+/// 回源自愈链（生产 2026-10-27 P0 的第二层防线）：副本镜像缺失该 user（节点
+/// drain / 事件竞序）时，用户维度的查找 miss 经 `refresh_user_container` 回读
+/// 权威行 + 受护栏的 project read-through hydrate 后重试命中；无容器的孤儿
+/// project 行不遮蔽活跃容器。
+#[tokio::test]
+async fn user_lookup_miss_recovers_through_pg_read_through() {
+    let Some(dsn) = test_dsn().await else {
+        eprintln!("[skip] {DSN_ENV} not set");
+        return;
+    };
+    let id = format!("user-refresh-{}", uuid_suffix());
+    let user_id = format!("user-{id}");
+
+    let writer = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .unwrap();
+    let mut info = ProjectAndContainerInfo::new(id.clone());
+    info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+    info.set_user_id(Some(user_id.clone()));
+    info.set_container(Some(container_for(&id)));
+    writer
+        .insert_with_session_durable(id.clone(), Arc::new(info), &format!("sess-{id}"))
+        .await
+        .unwrap();
+    // 同 user 的无容器孤儿行（注册中途形态，遮蔽候选之一）。
+    let orphan = format!("{id}-orphan");
+    let mut orphan_info = ProjectAndContainerInfo::new(orphan.clone());
+    orphan_info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+    orphan_info.set_user_id(Some(user_id.clone()));
+    writer
+        .insert_with_session_durable(
+            orphan.clone(),
+            Arc::new(orphan_info),
+            &format!("sess-{orphan}"),
+        )
+        .await
+        .unwrap();
+    assert!(writer.wait_drained(Duration::from_secs(5)).await);
+
+    // 独立镜像副本（无同步循环）。boot load 天然全量，因此对齐真实事故形态
+    // （事件竞序把条目撕掉）：连接后显式移除该 user 的镜像条目再断言 miss。
+    let reader = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .unwrap();
+    reader.inner().remove(&id);
+    reader.inner().remove(&orphan);
+    use shared_types::ContainerLookup as _;
+    assert!(
+        reader
+            .find_by_user_id(&user_id, &shared_types::ServiceType::ComputerAgentRunner)
+            .is_none(),
+        "a replica whose mirror lost the user must miss"
+    );
+
+    // 回源：活跃行 hydrate + 孤儿行不遮蔽 → 重试命中活跃容器。
+    reader.refresh_user_container(&user_id).await.unwrap();
+    let found = reader.find_by_user_id(&user_id, &shared_types::ServiceType::ComputerAgentRunner);
+    assert_eq!(
+        found.as_deref(),
+        Some("10.42.0.9"),
+        "the read-through resolves the user's live container past orphan rows"
+    );
+}
