@@ -89,12 +89,39 @@ fn identity(record: &ComputeControlRecord) -> Result<ComputeExecutorIdentity> {
     })
 }
 
+/// COMPUTE_DRAIN_PENDING 重试节流（进程内）。problem() 对相同 code/message
+/// 幂等不写，但每轮恢复的 reserve CAS 仍会改写持久记录——2026-10-27 实测
+/// 热循环 ~13 次/分钟持续 ~1 小时。60s 下限抑制写放大；重试永不停止，收敛
+/// 条件（含部署修复）成熟后仍在下一轮自愈。
+fn drain_retry_due(operation_id: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static NEXT_DUE: std::sync::OnceLock<Mutex<HashMap<String, tokio::time::Instant>>> =
+        std::sync::OnceLock::new();
+    let map = NEXT_DUE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = tokio::time::Instant::now();
+    match map.get(operation_id) {
+        Some(due) if now < *due => false,
+        _ => {
+            map.insert(operation_id.to_owned(), now + Duration::from_secs(60));
+            true
+        }
+    }
+}
+
 /// A scanner schedules one bounded inspection; execution after a successful CAS
 /// uses the ordinary coordinator with its existing per-stage budgets.
 pub(super) async fn recover_and_execute(
     state: &AppState,
     snapshot: &ComputeControlRecord,
 ) -> Result<()> {
+    // 悬案重试退避（2026-10-27 事故：无退避热循环持续改写持久记录）。
+    if snapshot.error_code.as_deref() == Some("COMPUTE_DRAIN_PENDING")
+        && !drain_retry_due(&snapshot.operation_id)
+    {
+        return Ok(());
+    }
     if let Some(pending) = prepare_resume(state, snapshot).await? {
         compute_control::execute_pending(state, pending).await?;
     }
@@ -706,6 +733,42 @@ mod image_roll_absent_tests {
             lease: None,
             interrupted_operations: Vec::new(),
         }
+    }
+
+    /// COMPUTE_DRAIN_PENDING 悬案的重试节流：窗口内第二轮恢复直接跳过，
+    /// 不写持久记录、revision 不增长（2026-10-27 事故：无退避热循环
+    /// ~13 次/分钟持续改写）。
+    #[tokio::test]
+    async fn drain_pending_retry_is_throttled() {
+        let (state, record, _runtime, _keep) =
+            stuck_record(serde_json::json!({}), false, UserAppOperationScope::Prod).await;
+        let marked = state
+            .userapp_store
+            .record_compute_drain_problem(
+                &record,
+                "COMPUTE_DRAIN_PENDING",
+                "Interrupted operation has not produced final effects evidence",
+            )
+            .await
+            .unwrap();
+        assert_eq!(marked.error_code.as_deref(), Some("COMPUTE_DRAIN_PENDING"));
+        assert!(
+            drain_retry_due(&record.operation_id),
+            "first retry after the problem is recorded runs"
+        );
+        let before = current(&state, &marked).await.revision;
+        assert!(
+            !drain_retry_due(&record.operation_id),
+            "throttle window must skip the immediate retry"
+        );
+        recover_and_execute(&state, &marked)
+            .await
+            .expect("throttled recovery is a silent skip");
+        let after = current(&state, &marked).await;
+        assert_eq!(
+            after.revision, before,
+            "throttled retry must not touch the persisted record"
+        );
     }
 
     #[tokio::test]
