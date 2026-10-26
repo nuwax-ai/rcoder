@@ -307,6 +307,13 @@ impl UserAppProxyFailureHint {
     /// 即暴露此映射。
     pub fn page_cause(&self) -> ErrorPageCause {
         use shared_types::UserAppReadinessStatus as Status;
+        // 业务 Stopping 证据优先于代理过渡判定：stop 流程同样经过代理换代
+        // （Preparing/Stopping 相位），transition 优先会把真实停止窗口报成
+        // "正在重启"（Codex 六轮复现）；停止是当前真实状态，restart 驱动的
+        // 停旧窗口显示"停止中"同样准确（前端可用 operation.action 区分语境）。
+        if self.readiness_status == Some(Status::Stopping) {
+            return ErrorPageCause::Stopping;
+        }
         if self.transition_operation_id().is_some() {
             return ErrorPageCause::Restarting;
         }
@@ -1098,6 +1105,40 @@ mod tests {
         let cause = hint.page_cause();
         assert_eq!(cause, ErrorPageCause::Provisioning);
         assert_eq!(cause.i18n_slug(), "provisioning");
+    }
+
+    /// 业务 Stopping 优先于代理过渡：stop 流程同样经过代理换代（Preparing/
+    /// Stopping 相位），transition 优先会把真实停止窗口报成"正在重启"
+    /// （Codex 六轮复现的组合回归）。
+    #[test]
+    fn page_cause_stopping_outranks_in_flight_proxy_transition() {
+        let hint = UserAppProxyFailureHint {
+            proxy_confirmation: Some(shared_types::ProxyConfirmation {
+                contract: shared_types::ProxyConfirmationContract::OfficialRestartHttpV1,
+                confirmed: false,
+                phase: shared_types::ProxyPhase::Stopping,
+                operation_id: "stop-transition-op".into(),
+                proxy_instance_id: None,
+                config_digest: None,
+            }),
+            readiness_status: Some(shared_types::UserAppReadinessStatus::Stopping),
+            error_origin_confirmed: true,
+        };
+        assert_eq!(
+            hint.page_cause(),
+            ErrorPageCause::Stopping,
+            "observed business stopping must outrank the in-flight proxy transition"
+        );
+        // 过渡仍在途时的其他观察（如 Starting）保持 Restarting 优先（原语义）。
+        let starting_same_transition = UserAppProxyFailureHint {
+            proxy_confirmation: hint.proxy_confirmation.clone(),
+            readiness_status: Some(shared_types::UserAppReadinessStatus::Starting),
+            error_origin_confirmed: true,
+        };
+        assert_eq!(
+            starting_same_transition.page_cause(),
+            ErrorPageCause::Restarting
+        );
     }
 
     #[test]
