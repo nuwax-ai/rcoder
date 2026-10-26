@@ -400,3 +400,119 @@ async fn expired_deadline_with_held_lease_still_dispatches_completion_branches()
     );
     store.shutdown().await.unwrap();
 }
+
+/// 修复前反例（Codex 指出的满载边界）：只剩一个恢复槽位时，deadline 结算
+/// 任务若先占位，正常续接分支的 push 会静默失败，饱和扫描下记录被反复
+/// 饿死。修复后结算派发预留一个槽位：单槽剩余时结算让位，完成分支照常
+/// 派发。
+#[tokio::test]
+async fn last_recovery_slot_goes_to_work_branches_not_the_deadline_observer() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+            &dir.path().join("last-slot.db"),
+        )
+        .await
+        .unwrap(),
+    );
+    let runtime = Arc::new(FenceRuntime::default());
+    // Held keeps the settlement deferring, so the observer cannot finish the
+    // record itself; only the completion branch can.
+    *runtime.receipt_verdict.lock().unwrap() = ReceiptVerdict::Held;
+    let state = runtime_state(runtime.clone(), store.clone(), None).await;
+    let app = state
+        .userapp_store
+        .ensure_identity("lastslot")
+        .await
+        .unwrap();
+    let pending = state
+        .userapp_store
+        .admit_compute_control(&ComputeControlRequest {
+            builder_startup_mode: Default::default(),
+            app_id: "lastslot".into(),
+            lifecycle_id: app.lifecycle_id,
+            scope: UserAppOperationScope::Dev,
+            request_id: "requestlastslot".into(),
+            request_fingerprint: "a".repeat(64),
+            operation_id: "restartlastslot".into(),
+            action: ComputeControlAction::Restart,
+            restart_image_roll: false,
+        })
+        .await
+        .unwrap();
+    let identity = ComputeExecutorIdentity {
+        app_id: "lastslot".into(),
+        lifecycle_id: pending.lifecycle_id.clone(),
+        scope: pending.scope,
+        operation_id: pending.operation_id.clone(),
+        generation: pending.generation,
+        executor_id: "lastslotexecutor".into(),
+    };
+    state
+        .userapp_store
+        .claim_compute_control(&identity, pending.revision)
+        .await
+        .unwrap();
+    let lease = UserAppOperationLeaseReceipt::Kubernetes {
+        service_type: ServiceType::UserappBuilder,
+        namespace: "rcoder-builder".into(),
+        name: "rcoder-app-builder-lastslot".into(),
+        uid: "c".repeat(36),
+        resource_version: "5".into(),
+        token: identity.executor_id.clone(),
+    };
+    let mut record = state
+        .userapp_store
+        .bind_compute_lease(&identity, &lease)
+        .await
+        .unwrap();
+    for stage in [
+        ComputeControlStage::Stopping,
+        ComputeControlStage::Stopped,
+        ComputeControlStage::Starting,
+        ComputeControlStage::Verifying,
+    ] {
+        record = state
+            .userapp_store
+            .advance_compute_control(&ComputeControlProgress {
+                identity: identity.clone(),
+                expected_revision: record.revision,
+                state: ComputeControlState::Running,
+                stage,
+                checkpoint: serde_json::json!({"witness": true}),
+                error_code: None,
+                error_message: None,
+            })
+            .await
+            .unwrap();
+    }
+    state
+        .userapp_store
+        .bind_compute_control_deadline(&record, chrono::Utc::now().timestamp_millis() - 1)
+        .await
+        .unwrap();
+    // Saturate all but one recovery slot with never-resolving tasks.
+    let mut tasks = RecoveryTasks::default();
+    for slot in 0..7 {
+        assert!(tasks.push(
+            format!("saturation-{slot}"),
+            std::future::pending::<anyhow::Result<()>>()
+        ));
+    }
+    discover_pending(&state, &mut tasks, &mut None)
+        .await
+        .unwrap();
+    assert_eq!(
+        tasks.active.len(),
+        8,
+        "exactly the completion branch took the last slot"
+    );
+    assert!(
+        !tasks
+            .active
+            .iter()
+            .any(|name| name.starts_with("compute-deadline:")),
+        "the deadline observer reserved the last slot for real work"
+    );
+    store.shutdown().await.unwrap();
+}

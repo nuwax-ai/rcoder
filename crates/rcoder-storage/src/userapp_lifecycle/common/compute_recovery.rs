@@ -290,3 +290,75 @@ async fn updated(
         .await?
         .ok_or(UserAppStoreError::NotFound)
 }
+
+/// Anchor (idempotently) the settlement quiet window at the first durable
+/// observation that the physical lease stopped being renewed. An existing
+/// anchor is returned unchanged: the window always measures from the FIRST
+/// unheld observation, never slides with later ones. Terminal or moved-on
+/// records refuse, exactly like the binding.
+pub(super) async fn mark_unheld(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    snapshot: &ComputeControlRecord,
+    observed_ms: i64,
+) -> Result<i64, UserAppStoreError> {
+    use crate::db::models;
+    repo::claim_app(tx, backend, &snapshot.app_id).await?;
+    let Some(row) = models::ComputeControlDeadline::filter_by_operation_id(&snapshot.operation_id)
+        .first()
+        .exec(tx)
+        .await
+        .map_err(storage)?
+    else {
+        return Err(UserAppStoreError::InvalidOperation(
+            "Unheld observation requires a bound compute control deadline".into(),
+        ));
+    };
+    if row.app_id != snapshot.app_id || row.lifecycle_id != snapshot.lifecycle_id {
+        return Err(UserAppStoreError::LifecycleConflict);
+    }
+    if let Some(anchor) = row.unheld_observed_ms {
+        return Ok(anchor);
+    }
+    let actual = compute::get(tx, &snapshot.app_id, &snapshot.operation_id)
+        .await?
+        .ok_or(UserAppStoreError::NotFound)?;
+    if actual != *snapshot || actual.state.is_terminal() {
+        return Err(UserAppStoreError::VersionConflict);
+    }
+    let changed = toasty::sql::statement(repo::sql(backend,
+        "UPDATE userapp_compute_control_deadlines SET unheld_observed_ms=$2 WHERE operation_id=$1 AND unheld_observed_ms IS NULL"))
+        .bind(&snapshot.operation_id).bind(observed_ms).exec(tx).await.map_err(storage)?;
+    if changed != 1 {
+        // A concurrent scan anchored first; its earlier anchor is the one the
+        // quiet window must keep measuring from.
+        return Ok(
+            models::ComputeControlDeadline::filter_by_operation_id(&snapshot.operation_id)
+                .first()
+                .exec(tx)
+                .await
+                .map_err(storage)?
+                .ok_or(UserAppStoreError::NotFound)?
+                .unheld_observed_ms
+                .ok_or(UserAppStoreError::VersionConflict)?,
+        );
+    }
+    Ok(observed_ms)
+}
+
+/// Drop the quiet-window anchor: the lease is held (renewed) again, so a later
+/// unheld transition must re-anchor from its own first observation. Idempotent.
+pub(super) async fn clear_unheld(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    snapshot: &ComputeControlRecord,
+) -> Result<(), UserAppStoreError> {
+    repo::claim_app(tx, backend, &snapshot.app_id).await?;
+    let changed = toasty::sql::statement(repo::sql(backend,
+        "UPDATE userapp_compute_control_deadlines SET unheld_observed_ms=NULL WHERE operation_id=$1"))
+        .bind(&snapshot.operation_id).exec(tx).await.map_err(storage)?;
+    if changed != 1 {
+        return Err(UserAppStoreError::NotFound);
+    }
+    Ok(())
+}

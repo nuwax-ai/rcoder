@@ -118,6 +118,7 @@ pub(crate) struct ComputeControlDeadline {
     pub app_id: String,
     pub lifecycle_id: String,
     pub deadline_ms: i64,
+    pub unheld_observed_ms: Option<i64>,
 }
 
 #[derive(toasty::Model)]

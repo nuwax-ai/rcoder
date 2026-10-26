@@ -68,6 +68,14 @@ impl RecoveryTasks {
         self.active.len() >= MAX_RECOVERIES
     }
 
+    /// Free slots right now. The deadline settlement dispatch reserves at
+    /// least one further slot for the record's normal recovery branch: with
+    /// only one slot left, the (cheap, retrying) settlement observer steps
+    /// aside so a saturated scan never starves real continuation work.
+    fn remaining_capacity(&self) -> usize {
+        MAX_RECOVERIES.saturating_sub(self.active.len())
+    }
+
     /// 槽满 = 扫描器瘫痪面（本次事故 9 小时不可见的直接成因：挂死任务
     /// 占满后所有 discover 静默 return，零日志零收束）。返回 true 时打
     /// warn 并带上挂死任务清单——瘫痪必须可见。

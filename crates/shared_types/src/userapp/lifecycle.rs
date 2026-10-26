@@ -1180,6 +1180,31 @@ pub trait UserAppLifecycleStore: Send + Sync {
         ))
     }
 
+    /// Anchor (idempotently) the settlement quiet window at the first durable
+    /// observation that the control's physical lease stopped being renewed.
+    /// Returns the anchored timestamp; an existing anchor never slides.
+    async fn mark_compute_control_unheld(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+        _observed_ms: i64,
+    ) -> Result<i64, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Compute control unheld observation is unsupported".into(),
+        ))
+    }
+
+    /// Drop the quiet-window anchor because the lease is held (renewed) again;
+    /// a later unheld transition must re-anchor from its own first
+    /// observation. Idempotent.
+    async fn clear_compute_control_unheld(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+    ) -> Result<(), UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Compute control unheld anchor clearing is unsupported".into(),
+        ))
+    }
+
     /// Finalize a compute control whose durable stage proves that all physical
     /// writes have returned. The caller verifies any outstanding readiness read;
     /// this method never authorizes replay of the runtime mutation.

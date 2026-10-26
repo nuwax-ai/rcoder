@@ -157,6 +157,45 @@ async fn contract(store: &ToastyUserAppStore) {
     );
     assert_eq!(settled.revision, expired.revision + 1);
 
+    // The quiet-window anchor: idempotent, never sliding, cleared on a held
+    // observation, and requiring a bound deadline.
+    let anchored = claimed_control(store, "deadlineanchor", ComputeControlAction::Restart).await;
+    assert!(matches!(
+        store
+            .mark_compute_control_unheld(&anchored, now - 1000)
+            .await,
+        Err(UserAppStoreError::InvalidOperation(_))
+    ));
+    store
+        .bind_compute_control_deadline(&anchored, now + 60_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .mark_compute_control_unheld(&anchored, now - 1000)
+            .await
+            .unwrap(),
+        now - 1000
+    );
+    // A later observation never slides the anchored window.
+    assert_eq!(
+        store
+            .mark_compute_control_unheld(&anchored, now - 500)
+            .await
+            .unwrap(),
+        now - 1000
+    );
+    // Held again drops the anchor; the next unheld observation re-anchors.
+    store.clear_compute_control_unheld(&anchored).await.unwrap();
+    store.clear_compute_control_unheld(&anchored).await.unwrap();
+    assert_eq!(
+        store
+            .mark_compute_control_unheld(&anchored, now - 200)
+            .await
+            .unwrap(),
+        now - 200
+    );
+
     // A stale snapshot (the record moved on) never settles twice.
     assert!(matches!(
         store

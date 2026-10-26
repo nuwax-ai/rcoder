@@ -258,13 +258,17 @@ pub(super) async fn discover_pending(
         // outran the budget) keeps receiving its normal recovery branches below,
         // while the settlement itself defers until the lease provably stops
         // renewing. Any CAS race between the two resolves by revision — the
-        // settlement maps its loss to a benign deferral.
+        // settlement maps its loss to a benign deferral. The dispatch reserves
+        // one further slot: with a single slot left the cheap, retrying
+        // observer steps aside so a saturated scan never starves the record's
+        // real continuation branch.
         if matches!(
             record.state,
             shared_types::ComputeControlState::Running
                 | shared_types::ComputeControlState::RecoveryRequired
-        ) && crate::userapp_builder::compute_control::compute_deadline_expired(state, &record)
-            .await
+        ) && tasks.remaining_capacity() >= 2
+            && crate::userapp_builder::compute_control::compute_deadline_expired(state, &record)
+                .await
         {
             let state = state.clone();
             let settled = record.clone();

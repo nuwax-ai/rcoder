@@ -27,6 +27,13 @@ const RESTART_READINESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// only once the physical lease provably stopped renewing) the recovery scan
 /// settles the control as failed, which unblocks the scope's admission fence.
 const COMPUTE_CONTROL_TOTAL_DEADLINE_SECS: i64 = 15 * 60;
+/// Settlement quiet window after the first durable unheld observation. The
+/// kube client's default write timeout is 295s (connect is 30s, reads are
+/// unbounded), so a write the dead holder had already submitted can land up
+/// to ~5 minutes after its last renewal — well past the 60s lease TTL. The
+/// window must exceed that plus a re-observation margin before the terminal
+/// CAS releases the scope's admission fence.
+const COMPUTE_SETTLEMENT_QUIET_MS: i64 = 360 * 1000;
 const ERR_DEADLINE_EXCEEDED: &str = "ERR_DEADLINE_EXCEEDED";
 
 #[derive(serde::Serialize, utoipa::ToSchema)]
@@ -1871,6 +1878,8 @@ struct RetainedComputeTakeover {
     // Keeps the renewal heartbeat alive across the whole continuation.
     _guard: Box<dyn container_runtime_api::ComputeHandoffGuard>,
     receipt: UserAppOperationLeaseReceipt,
+    context: UserAppExecutionContext,
+    runtime: Arc<dyn container_runtime_api::ContainerRuntime>,
 }
 
 impl RetainedComputeTakeover {
@@ -1885,10 +1894,15 @@ impl AppOperationLease for RetainedComputeTakeover {
         Some(self.receipt.clone())
     }
     async fn validate_retained(&self) -> Result<bool, String> {
-        // The heartbeat spawned by the handoff holds the lease under the
-        // original identity for exactly as long as this guard lives. If the
-        // heartbeat dies, lease expiry plus the durable CAS bound the residue.
-        Ok(true)
+        // Holding the guard object does NOT prove the lease is still held:
+        // the heartbeat exits on a lost renewal (identity change, conflicting
+        // update) while this guard lives on. Every claim point therefore
+        // re-observes the physical lease through the runtime; an expired or
+        // reassigned lease refuses further old-identity writes.
+        self.runtime
+            .validate_app_operation_receipt(&self.context, &self.receipt)
+            .await
+            .map_err(|error| error.to_string())
     }
     async fn release(self: Box<Self>) -> Result<(), String> {
         // Never released through the guard: the takeover kept the original
@@ -1956,6 +1970,8 @@ async fn take_over_expired_builder_lease(
             Ok(Some(RetainedComputeTakeover {
                 _guard: guard,
                 receipt: receipt.clone(),
+                context,
+                runtime: state.runtime().clone(),
             }))
         }
         ComputeHandoff::Acquired {
@@ -2055,11 +2071,22 @@ pub(crate) async fn compute_deadline_expired(
     }
 }
 
-/// Settle a non-terminal compute control whose total deadline expired. Never
-/// settles by age against a lease that still validates: a live renewal (the
-/// original executor or another replica's takeover continuation) owns the
-/// physical write path, so this round defers instead. A revision CAS race with
-/// a progressing executor is benign and waits for the next scan.
+/// Settle a non-terminal compute control whose total deadline expired. Two
+/// gates stand between expiry and the terminal CAS:
+///
+/// 1. Lease liveness — never settle by age against a lease that still
+///    validates: a live renewal (the original executor or another replica's
+///    takeover continuation) owns the physical write path, and the quiet-window
+///    anchor is dropped so a later death re-anchors from its own observation.
+/// 2. Quiet window — the first unheld observation is anchored durably and the
+///    settlement waits longer than the runtime's maximum in-flight write
+///    window (the kube client's default write timeout is 295s, far beyond the
+///    60s lease TTL): a write the dead holder had already submitted when its
+///    renewal stopped cannot still land after the control is terminalized and
+///    the scope admits new work. Expiry alone never implies settled effects.
+///
+/// A revision CAS race with a progressing executor is benign and waits for the
+/// next scan.
 pub(crate) async fn settle_expired_compute_control(
     state: &AppState,
     snapshot: &ComputeControlRecord,
@@ -2089,8 +2116,20 @@ pub(crate) async fn settle_expired_compute_control(
             .await
         {
             Ok(true) => {
-                // Repeats every scan while the holder keeps renewing; debug
-                // keeps the cadence from becoming log noise.
+                // Renewed again: the anchor is stale, drop it so a later
+                // unheld transition measures its own quiet window. A clearing
+                // failure only re-defers to the next scan.
+                if let Err(error) = state
+                    .userapp_store
+                    .clear_compute_control_unheld(&current)
+                    .await
+                {
+                    tracing::warn!(
+                        %error,
+                        operation_id = %current.operation_id,
+                        "Compute control unheld anchor clearing failed; retrying on the next scan"
+                    );
+                }
                 tracing::debug!(
                     operation_id = %current.operation_id,
                     app_id = %current.app_id,
@@ -2110,9 +2149,25 @@ pub(crate) async fn settle_expired_compute_control(
             }
         }
     }
+    let now = chrono::Utc::now().timestamp_millis();
+    let anchor = state
+        .userapp_store
+        .mark_compute_control_unheld(&current, now)
+        .await?;
+    if now < anchor + COMPUTE_SETTLEMENT_QUIET_MS {
+        tracing::debug!(
+            operation_id = %current.operation_id,
+            app_id = %current.app_id,
+            anchor_ms = anchor,
+            "Compute control is unheld past its deadline; waiting out the write quiet window before settlement"
+        );
+        return Ok(());
+    }
     let message = format!(
-        "Compute control exceeded its total deadline of {} seconds at stage {}; the physical lease stopped renewing",
-        COMPUTE_CONTROL_TOTAL_DEADLINE_SECS, current.stage
+        "Compute control exceeded its total deadline of {} seconds at stage {}; the physical lease stopped renewing at least {} seconds before settlement",
+        COMPUTE_CONTROL_TOTAL_DEADLINE_SECS,
+        current.stage,
+        COMPUTE_SETTLEMENT_QUIET_MS / 1000
     );
     match state
         .userapp_store
@@ -2124,7 +2179,7 @@ pub(crate) async fn settle_expired_compute_control(
                 operation_id = %settled.operation_id,
                 app_id = %settled.app_id,
                 stage = %settled.stage,
-                "Compute control settled as failed after its total deadline expired; the scope admission fence is released"
+                "Compute control settled as failed after its total deadline and write quiet window; the scope admission fence is released"
             );
             Ok(())
         }

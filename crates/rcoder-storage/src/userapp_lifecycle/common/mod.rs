@@ -448,6 +448,31 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         .await
     }
 
+    async fn mark_compute_control_unheld(
+        &self,
+        snapshot: &ComputeControlRecord,
+        observed_ms: i64,
+    ) -> Result<i64, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_recovery::mark_unheld(tx, backend, &snapshot, observed_ms).await
+            })
+        })
+        .await
+    }
+
+    async fn clear_compute_control_unheld(
+        &self,
+        snapshot: &ComputeControlRecord,
+    ) -> Result<(), UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move { compute_recovery::clear_unheld(tx, backend, &snapshot).await })
+        })
+        .await
+    }
+
     async fn finalize_confirmed_compute(
         &self,
         snapshot: &ComputeControlRecord,

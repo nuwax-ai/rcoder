@@ -135,6 +135,9 @@ async fn expired_kubernetes_lease_is_taken_over_under_original_identity() {
     let takeover = takeover.expect("the handoff acquisition is a continuation authority");
     let guard = takeover.as_lease();
     assert_eq!(guard.receipt().as_ref(), record.lease.as_ref());
+    // The takeover's renewal heartbeat now holds the lease under the original
+    // identity; the fixture verdict models that renewed state.
+    *runtime.receipt_verdict.lock().unwrap() = ReceiptVerdict::Held;
     assert!(guard.validate_retained().await.unwrap());
 }
 
@@ -213,6 +216,16 @@ async fn expired_deadline_settles_unheld_control_as_failed() {
         .await
         .unwrap();
     assert!(compute_deadline_expired(&state, &record).await);
+    // Pre-anchor the quiet window in the past: a first settle anchors "now"
+    // and defers; the durable mark lets a later scan observe the window out.
+    state
+        .userapp_store
+        .mark_compute_control_unheld(
+            &record,
+            chrono::Utc::now().timestamp_millis() - COMPUTE_SETTLEMENT_QUIET_MS - 1,
+        )
+        .await
+        .unwrap();
     settle_expired_compute_control(&state, &record)
         .await
         .unwrap();
@@ -260,6 +273,17 @@ async fn held_lease_defers_deadline_settlement() {
         .bind_compute_control_deadline(&record, chrono::Utc::now().timestamp_millis() - 1)
         .await
         .unwrap();
+    // Pre-anchor a stale quiet window: the held observation must drop it, so a
+    // later unheld round re-anchors from its own observation and defers
+    // instead of settling on the stale anchor.
+    state
+        .userapp_store
+        .mark_compute_control_unheld(
+            &record,
+            chrono::Utc::now().timestamp_millis() - COMPUTE_SETTLEMENT_QUIET_MS - 1,
+        )
+        .await
+        .unwrap();
     settle_expired_compute_control(&state, &record)
         .await
         .unwrap();
@@ -270,6 +294,59 @@ async fn held_lease_defers_deadline_settlement() {
         .unwrap()
         .unwrap();
     assert_eq!(current.state, ComputeControlState::Running);
+    *runtime.receipt_verdict.lock().unwrap() = ReceiptVerdict::NotHeld;
+    settle_expired_compute_control(&state, &current)
+        .await
+        .unwrap();
+    let reanchored = state
+        .userapp_store
+        .get_compute_control(&record.app_id, &record.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reanchored.state,
+        ComputeControlState::Running,
+        "the re-anchored quiet window defers settlement"
+    );
+}
+
+/// The quiet window itself: expiry plus a first unheld observation defers;
+/// only an anchor older than the window settles.
+#[tokio::test]
+async fn fresh_unheld_observation_waits_out_the_quiet_window() {
+    let (state, runtime) = test_state().await;
+    *runtime.receipt_verdict.lock().unwrap() = ReceiptVerdict::NotHeld;
+    let record = stalled_stopped_restart(&state, "quietwindow").await;
+    state
+        .userapp_store
+        .bind_compute_control_deadline(&record, chrono::Utc::now().timestamp_millis() - 1)
+        .await
+        .unwrap();
+    settle_expired_compute_control(&state, &record)
+        .await
+        .unwrap();
+    let current = state
+        .userapp_store
+        .get_compute_control(&record.app_id, &record.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        current.state,
+        ComputeControlState::Running,
+        "a fresh unheld anchor is inside the quiet window"
+    );
+    settle_expired_compute_control(&state, &current)
+        .await
+        .unwrap();
+    let still = state
+        .userapp_store
+        .get_compute_control(&record.app_id, &record.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still.state, ComputeControlState::Running);
 }
 
 /// An unconfirmable lease defers settlement to a later scan instead of
@@ -308,6 +385,14 @@ async fn terminal_record_is_never_settled() {
         .bind_compute_control_deadline(&record, chrono::Utc::now().timestamp_millis() - 1)
         .await
         .unwrap();
+    state
+        .userapp_store
+        .mark_compute_control_unheld(
+            &record,
+            chrono::Utc::now().timestamp_millis() - COMPUTE_SETTLEMENT_QUIET_MS - 1,
+        )
+        .await
+        .unwrap();
     settle_expired_compute_control(&state, &record)
         .await
         .unwrap();
@@ -329,4 +414,27 @@ async fn terminal_record_is_never_settled() {
         .unwrap()
         .unwrap();
     assert_eq!(again.revision, settled.revision);
+}
+
+/// Fix 1 regression: the guard object alone never proves the lease is still
+/// held — the renewal heartbeat can exit (identity change, conflicting
+/// update) while the guard lives. validate_retained must re-observe the
+/// physical lease through the runtime on every call.
+#[tokio::test]
+async fn takeover_guard_reobserves_the_physical_lease() {
+    let (state, runtime) = test_state().await;
+    *runtime.receipt_verdict.lock().unwrap() = ReceiptVerdict::NotHeld;
+    *runtime.compute_inspection.lock().unwrap() = Some(ComputeLeaseInspection::Releasable(
+        kubernetes_lease("deadexecutor"),
+    ));
+    let record = stalled_stopped_restart(&state, "guardreobserve").await;
+    let takeover = take_over_expired_builder_lease(&state, &record)
+        .await
+        .unwrap()
+        .expect("the handoff acquisition is a continuation authority");
+    // The fixture verdict says the lease is not held: even though the guard
+    // object is alive, retention must observe as false.
+    assert!(!takeover.as_lease().validate_retained().await.unwrap());
+    *runtime.receipt_verdict.lock().unwrap() = ReceiptVerdict::Held;
+    assert!(takeover.as_lease().validate_retained().await.unwrap());
 }
