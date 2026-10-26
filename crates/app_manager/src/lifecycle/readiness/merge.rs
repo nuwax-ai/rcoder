@@ -255,11 +255,24 @@ pub(super) fn merge_observation(
     // manually started owner or pretend a completed/failed Stop is still active.
     // `Provisioning` 明确没有后置覆盖：它的权威来源永远是 app-cli 快照，
     // 一旦有快照就原样透出，不因为操作仍占着槽位而继续宣称等待。
-    if control.intent == ControlIntent::StopAccepted {
+    // 意图改判只在操作在途时成立（注释同款语义："Only an in-flight Stop
+    // overrides a live snapshot"——原实现只看 intent，而 intent 在操作终态后
+    // 仍然留存）：操作已终态（成功/失败/被替代）后，活快照是唯一权威——
+    // 物理事实不能被历史意图洗掉（2026-10-27 事故：跨滚动升级的 restart 以
+    // failed 终态收口后，readiness 永远 starting/SERVICE_STARTING）。
+    let operation_in_flight = container.operation.as_ref().is_none_or(|op| {
+        !matches!(
+            op.state,
+            ComputeControlState::Succeeded
+                | ComputeControlState::Failed
+                | ComputeControlState::Superseded
+        )
+    });
+    if control.intent == ControlIntent::StopAccepted && operation_in_flight {
         response.ready = false;
         response.status = Status::Stopping;
         response.reason_code = Some(Reason::StopAccepted);
-    } else if control.intent == ControlIntent::Restarting {
+    } else if control.intent == ControlIntent::Restarting && operation_in_flight {
         response.ready = false;
         response.status = Status::Starting;
         response.reason_code = Some(Reason::ServiceStarting);
@@ -364,10 +377,34 @@ pub(super) fn container_readiness(
 #[cfg(test)]
 pub(super) mod fixtures {
     use shared_types::{
-        UserAppBusinessReadiness, UserAppOperationKind, UserAppOperationRecord,
-        UserAppOperationScope, UserAppOperationState, UserAppProxyReadiness,
-        UserAppReadinessStatus,
+        ComputeControlAction, ComputeControlRecord, ComputeControlState, UserAppBusinessReadiness,
+        UserAppOperationKind, UserAppOperationRecord, UserAppOperationScope, UserAppOperationState,
+        UserAppProxyReadiness, UserAppReadinessStatus,
     };
+
+    /// compute 控制记录（readiness 合并的意图权威来源）。
+    pub(crate) fn compute_control_record(state: ComputeControlState) -> ComputeControlRecord {
+        ComputeControlRecord {
+            created_at: chrono::Utc::now(),
+            app_id: "282".into(),
+            lifecycle_id: "life".into(),
+            request_id: "req".into(),
+            scope: UserAppOperationScope::Prod,
+            operation_id: "ctrl-1".into(),
+            request_fingerprint: "1".repeat(64),
+            generation: 1,
+            revision: 92,
+            action: ComputeControlAction::Restart,
+            state,
+            executor_id: Some("exec".into()),
+            stage: "draining_previous".into(),
+            checkpoint: serde_json::Value::Null,
+            error_code: Some("ERR_DEADLINE_EXCEEDED".into()),
+            error_message: None,
+            lease: None,
+            interrupted_operations: Vec::new(),
+        }
+    }
 
     pub(crate) fn operation(kind: UserAppOperationKind) -> UserAppOperationRecord {
         UserAppOperationRecord {
@@ -420,7 +457,10 @@ mod tests {
     use super::fixtures::{operation, ready_snapshot};
     use super::*;
     use shared_types::UserAppLifecycleStore;
-    use shared_types::{UserAppOperationScope, UserAppReadinessChannel, UserAppReadinessPhysical};
+    use shared_types::{
+        UserAppOperationScope, UserAppOperationState, UserAppReadinessChannel,
+        UserAppReadinessPhysical,
+    };
     use std::sync::Arc;
 
     /// Stop 已受理但物理实例未退出：旧 ready 不可沿（§4.4 关键窗口）。
@@ -477,6 +517,68 @@ mod tests {
         assert_eq!(
             response.proxy.error_origin_contract.as_deref(),
             Some("pingap_etype_v1")
+        );
+    }
+
+    /// 已终态（failed）的 restart 不再遮蔽活快照：应用在正常服务时 readiness
+    /// 如实报 ready，平台操作失败仍单独透出（2026-10-27 事故回归）。
+    #[test]
+    fn settled_restart_intent_no_longer_masks_ready_snapshot() {
+        let mut restart = operation(UserAppOperationKind::Restart);
+        restart.state = UserAppOperationState::Failed;
+        restart.error_code = Some("ERR_DEADLINE_EXCEEDED".into());
+        let mut control = ReadinessControl::ordinary(Some(&restart));
+        control.compute.operation = Some(fixtures::compute_control_record(
+            ComputeControlState::Failed,
+        ));
+        let response = merge_observation(
+            "282",
+            UserappStage::Prod,
+            &control,
+            UserAppReadinessObservation::Snapshot {
+                physical: UserAppReadinessPhysical {
+                    instance_id: Some("pod-uid".into()),
+                    address: None,
+                    channel: UserAppReadinessChannel::Direct,
+                },
+                snapshot: Box::new(ready_snapshot()),
+            },
+        );
+        assert!(response.ready);
+        assert_eq!(response.status, UserAppReadinessStatus::Ready);
+        assert_eq!(
+            response.container.operation.as_ref().map(|op| op.state),
+            Some(ComputeControlState::Failed),
+            "平台操作失败单独透出，排障可见"
+        );
+    }
+
+    /// 在途 restart 意图仍遮蔽 ready 快照（starting/SERVICE_STARTING 不变）。
+    #[test]
+    fn in_flight_restart_intent_still_masks_ready_snapshot() {
+        let restart = operation(UserAppOperationKind::Restart);
+        let mut control = ReadinessControl::ordinary(Some(&restart));
+        control.compute.operation = Some(fixtures::compute_control_record(
+            ComputeControlState::Running,
+        ));
+        let response = merge_observation(
+            "282",
+            UserappStage::Prod,
+            &control,
+            UserAppReadinessObservation::Snapshot {
+                physical: UserAppReadinessPhysical {
+                    instance_id: Some("pod-uid".into()),
+                    address: None,
+                    channel: UserAppReadinessChannel::Direct,
+                },
+                snapshot: Box::new(ready_snapshot()),
+            },
+        );
+        assert!(!response.ready);
+        assert_eq!(response.status, UserAppReadinessStatus::Starting);
+        assert_eq!(
+            response.reason_code,
+            Some(UserAppReadinessReason::ServiceStarting)
         );
     }
 
