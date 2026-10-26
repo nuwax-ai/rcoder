@@ -1037,12 +1037,20 @@ impl PortProxy {
             if origin != crate::error_page::StandbyOrigin::Confirmed {
                 return;
             }
-            // 文案：新鲜观察尽力而为；超时/否定由 Restarting 兜底。
+            // 文案：新鲜观察尽力而为；超时（None）由 Restarting 兜底；**显式
+            // 否定**（Some 且未确认——门命中旧缓存后配置已换代，custom/伪造）
+            // 放弃本次替换：origin 缓存已被同次观察落账否定，下轮门即拒绝
+            // （Codex 五轮：暖门不得覆盖新鲜否定）。
             match advisor.as_ref() {
-                Some(advisor) => advisor
-                    .advise_current(&route.app_id, route.stage, budget)
-                    .await
-                    .filter(|h| h.error_origin_confirmed),
+                Some(advisor) => {
+                    let fresh = advisor
+                        .advise_current(&route.app_id, route.stage, budget)
+                        .await;
+                    if fresh.as_ref().is_some_and(|h| !h.error_origin_confirmed) {
+                        return;
+                    }
+                    fresh.filter(|h| h.error_origin_confirmed)
+                }
                 None => None,
             }
         } else {

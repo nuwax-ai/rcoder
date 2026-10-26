@@ -52,6 +52,64 @@ struct CachedHint {
 struct StandbyOriginEntry {
     confirmed: bool,
     at: Instant,
+    /// 代次令牌（Weak<AppState> 分配地址）：新代次（进程内 AppState 重建，
+    /// 如测试）不继承旧条目——许可绑定观察它的实例身份。
+    epoch: usize,
+}
+
+/// 同键预热去抖：冷调用风暴只发起一次后台观察（30s 窗口）。
+static STANDBY_PREWARM: std::sync::OnceLock<std::sync::Mutex<HashMap<StandbyOriginKey, Instant>>> =
+    std::sync::OnceLock::new();
+
+fn standby_prewarm_map() -> &'static std::sync::Mutex<HashMap<StandbyOriginKey, Instant>> {
+    STANDBY_PREWARM.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// origin 缓存插入的硬容量上限（过期清理后仍满则逐出最早条目）。
+const STANDBY_ORIGIN_CACHE_CAPACITY: usize = 4096;
+/// 同键预热的最小间隔。
+const STANDBY_PREWARM_INTERVAL: Duration = Duration::from_secs(30);
+
+fn epoch_of(state: &std::sync::Weak<AppState>) -> usize {
+    std::sync::Weak::as_ptr(state) as usize
+}
+
+/// 插入（带容量硬上限：先清过期，仍满则逐出最早）。
+fn insert_standby_origin_entry(key: StandbyOriginKey, confirmed: bool, epoch: usize) {
+    let mut cache = standby_origin_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.len() >= STANDBY_ORIGIN_CACHE_CAPACITY {
+        let now = Instant::now();
+        cache.retain(|_, entry| {
+            let ttl = if entry.confirmed {
+                STANDBY_ORIGIN_POSITIVE_TTL
+            } else {
+                STANDBY_ORIGIN_NEGATIVE_TTL
+            };
+            now.duration_since(entry.at) < ttl
+        });
+        while cache.len() >= STANDBY_ORIGIN_CACHE_CAPACITY {
+            let earliest = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.at)
+                .map(|(key, _)| key.clone());
+            match earliest {
+                Some(oldest) => {
+                    cache.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
+    cache.insert(
+        key,
+        StandbyOriginEntry {
+            confirmed,
+            at: Instant::now(),
+            epoch,
+        },
+    );
 }
 
 type StandbyOriginKey = (String, String);
@@ -96,16 +154,21 @@ impl UserAppProxyFailureAdvisorImpl {
     ) {
         let confirmed = snapshot.proxy.error_origin_contract.as_deref()
             == Some(shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT);
+        insert_standby_origin_entry(
+            (app_id.to_owned(), stage.to_owned()),
+            confirmed,
+            epoch_of(&self.state),
+        );
+    }
+
+    /// 容器已不在（NoCompute）：托管来源的物理载体消失——撤销该键的旧许可
+    /// （Codex 五轮：暖缓存遇 NoCompute 不得保持 Confirmed）。删除而非写
+    /// 否定：容器重建后（可能换配置形态）由下一次观察重新落账。
+    fn revoke_standby_origin(&self, app_id: &str, stage: &str) {
         let mut cache = standby_origin_cache()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cache.insert(
-            (app_id.to_owned(), stage.to_owned()),
-            StandbyOriginEntry {
-                confirmed,
-                at: Instant::now(),
-            },
-        );
+        cache.remove(&(app_id.to_owned(), stage.to_owned()));
     }
 
     /// standby 来源判定：命中缓存按新鲜度返回；未预热/过期触发后台预热
@@ -116,6 +179,7 @@ impl UserAppProxyFailureAdvisorImpl {
         stage: &str,
     ) -> StandbyOrigin {
         let key = (app_id.to_owned(), stage.to_owned());
+        let epoch = epoch_of(state);
         {
             let cache = standby_origin_cache()
                 .lock()
@@ -126,7 +190,7 @@ impl UserAppProxyFailureAdvisorImpl {
                 } else {
                     STANDBY_ORIGIN_NEGATIVE_TTL
                 };
-                if Instant::now().duration_since(entry.at) < ttl {
+                if entry.epoch == epoch && Instant::now().duration_since(entry.at) < ttl {
                     return if entry.confirmed {
                         StandbyOrigin::Confirmed
                     } else {
@@ -135,15 +199,27 @@ impl UserAppProxyFailureAdvisorImpl {
                 }
             }
         }
-        // 后台预热：detached 观察（5s 预算）完成后缓存即更新；本请求透传。
-        let state = state.clone();
-        let app_id = app_id.to_owned();
-        let stage_owned = stage.to_owned();
-        tokio::spawn(async move {
-            if let Some(state) = state.upgrade() {
-                let _ = Self::observe_once_for_origin(&state, &app_id, &stage_owned).await;
+        // 后台预热（去抖：同键 30s 内只发起一次——冷调用风暴不放大观察）：
+        // detached 观察（5s 预算）完成后缓存即更新；本请求透传。
+        {
+            let mut prewarm = standby_prewarm_map()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let due = prewarm
+                .get(&key)
+                .is_none_or(|at| Instant::now().duration_since(*at) >= STANDBY_PREWARM_INTERVAL);
+            if due {
+                prewarm.insert(key.clone(), Instant::now());
+                let state = state.clone();
+                let app_id = app_id.to_owned();
+                let stage_owned = stage.to_owned();
+                tokio::spawn(async move {
+                    if let Some(state) = state.upgrade() {
+                        let _ = Self::observe_once_for_origin(&state, &app_id, &stage_owned).await;
+                    }
+                });
             }
-        });
+        }
         StandbyOrigin::Unknown
     }
 
@@ -155,19 +231,15 @@ impl UserAppProxyFailureAdvisorImpl {
         let Some(reader) = state.app_service.readiness_reader() else {
             return;
         };
+        let epoch = Arc::as_ptr(state) as usize;
         if let Ok(UserAppReadinessObservation::Snapshot { snapshot, .. }) =
             reader.observe(app_id, stage, Duration::from_secs(5)).await
         {
-            let mut cache = standby_origin_cache()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            cache.insert(
+            insert_standby_origin_entry(
                 (app_id.to_owned(), stage.as_str().to_owned()),
-                StandbyOriginEntry {
-                    confirmed: snapshot.proxy.error_origin_contract.as_deref()
-                        == Some(shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT),
-                    at: Instant::now(),
-                },
+                snapshot.proxy.error_origin_contract.as_deref()
+                    == Some(shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT),
+                epoch,
             );
         }
     }
@@ -231,23 +303,28 @@ impl UserAppProxyFailureAdvisorImpl {
                 self.note_standby_origin(app_id, stage.as_str(), &snapshot);
                 current_snapshot_hint(physical, *snapshot)
             }
-            Ok(UserAppReadinessObservation::NoCompute { state }) => Some(UserAppProxyFailureHint {
-                readiness_status: match state {
-                    shared_types::UserAppNoComputeState::Stopped => {
-                        Some(shared_types::UserAppReadinessStatus::Stopped)
-                    }
-                    shared_types::UserAppNoComputeState::Missing if stage == UserappStage::Prod => {
-                        Some(shared_types::UserAppReadinessStatus::NotDeployed)
-                    }
-                    shared_types::UserAppNoComputeState::Missing
-                    | shared_types::UserAppNoComputeState::Starting
-                    | shared_types::UserAppNoComputeState::Stopping
-                    | shared_types::UserAppNoComputeState::Failed
-                    | shared_types::UserAppNoComputeState::Unknown => None,
-                },
-                error_origin_confirmed: false,
-                proxy_confirmation: None,
-            }),
+            Ok(UserAppReadinessObservation::NoCompute { state }) => {
+                self.revoke_standby_origin(app_id, stage.as_str());
+                Some(UserAppProxyFailureHint {
+                    readiness_status: match state {
+                        shared_types::UserAppNoComputeState::Stopped => {
+                            Some(shared_types::UserAppReadinessStatus::Stopped)
+                        }
+                        shared_types::UserAppNoComputeState::Missing
+                            if stage == UserappStage::Prod =>
+                        {
+                            Some(shared_types::UserAppReadinessStatus::NotDeployed)
+                        }
+                        shared_types::UserAppNoComputeState::Missing
+                        | shared_types::UserAppNoComputeState::Starting
+                        | shared_types::UserAppNoComputeState::Stopping
+                        | shared_types::UserAppNoComputeState::Failed
+                        | shared_types::UserAppNoComputeState::Unknown => None,
+                    },
+                    error_origin_confirmed: false,
+                    proxy_confirmation: None,
+                })
+            }
             Ok(UserAppReadinessObservation::AdminUnreachable { .. })
             | Ok(UserAppReadinessObservation::UnsupportedRuntime { .. })
             | Ok(UserAppReadinessObservation::InstanceChanged)
