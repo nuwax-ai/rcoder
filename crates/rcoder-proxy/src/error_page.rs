@@ -349,6 +349,27 @@ pub trait UserAppProxyFailureAdvisor: Send + Sync {
     ) -> Option<UserAppProxyFailureHint> {
         None
     }
+
+    /// standby 摘流窗口的轻量来源判定（与文案观察分离，Codex P2）。
+    ///
+    /// `Confirmed` = 托管来源已确认（可替换正文）；`Unconfirmed` = 明确未
+    /// 确认（custom/旧配置或显式否定——原样透传，应用伪造标记不换页）；
+    /// `Unknown` = 观察不可得/未预热（实现方应触发后台预热；本请求原样
+    /// 透传，浏览器按 Retry-After 重试后命中预热结果）。
+    async fn standby_origin(&self, _app_id: &str, _stage: &str) -> StandbyOrigin {
+        StandbyOrigin::Unknown
+    }
+}
+
+/// [`UserAppProxyFailureAdvisor::standby_origin`] 的三态判定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StandbyOrigin {
+    /// 托管来源已确认（含代次绑定），可替换正文。
+    Confirmed,
+    /// 明确未确认（custom/旧配置或显式否定）：原样透传。
+    Unconfirmed,
+    /// 观察不可得/未预热：本请求透传，预热由实现方后台触发。
+    Unknown,
 }
 
 /// 生成一次性诊断编号（uuid v4 简短形态；请求级，不与业务身份复用）。

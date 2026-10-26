@@ -1026,16 +1026,18 @@ impl PortProxy {
             })
             .unwrap_or_else(|| Duration::from_millis(1000));
         let hint = if standby_window {
-            // 来源：缓存路径（30s TTL 内即时替换；首轮付费观察——stop 短路
-            // 路径为毫秒级）。未确认 → 透传（应用伪造或观察不可得）。
-            let advised = match advisor.as_ref() {
-                Some(advisor) => advisor.advise(&route.app_id, route.stage, budget).await,
-                None => None,
+            // 来源：三态轻量判定（Codex P1/P2）——Confirmed=缓存命中（TTL 内
+            // 即时替换）；Unconfirmed=显式否定（custom/伪造，透传）；Unknown=
+            // 冷缓存（实现方后台预热，本请求透传，浏览器按 Retry-After 重试
+            // 命中——冷启动竞争由预热关闭而非等待 1s 观察竞速）。
+            let origin = match advisor.as_ref() {
+                Some(advisor) => advisor.standby_origin(&route.app_id, route.stage).await,
+                None => crate::error_page::StandbyOrigin::Unknown,
             };
-            if !advised.as_ref().is_some_and(|h| h.error_origin_confirmed) {
+            if origin != crate::error_page::StandbyOrigin::Confirmed {
                 return;
             }
-            // 文案：新鲜观察尽力而为；超时由 Restarting 兜底。
+            // 文案：新鲜观察尽力而为；超时/否定由 Restarting 兜底。
             match advisor.as_ref() {
                 Some(advisor) => advisor
                     .advise_current(&route.app_id, route.stage, budget)

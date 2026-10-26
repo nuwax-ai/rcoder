@@ -10,7 +10,9 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rcoder_proxy::error_page::{UserAppProxyFailureAdvisor, UserAppProxyFailureHint};
+use rcoder_proxy::error_page::{
+    StandbyOrigin, UserAppProxyFailureAdvisor, UserAppProxyFailureHint,
+};
 use shared_types::{UserAppReadinessObservation, UserappStage};
 
 use crate::app_state::AppState;
@@ -44,6 +46,29 @@ struct CachedHint {
     hint: Option<UserAppProxyFailureHint>,
 }
 
+/// standby 摘流窗口的轻量来源判定缓存（与文案观察分离，Codex P2）。
+/// 每次完成的观察都会覆盖本条目：显式否定立即撤销旧的确认许可。
+#[derive(Debug, Clone)]
+struct StandbyOriginEntry {
+    confirmed: bool,
+    at: Instant,
+}
+
+type StandbyOriginKey = (String, String);
+static STANDBY_ORIGIN_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<StandbyOriginKey, StandbyOriginEntry>>,
+> = std::sync::OnceLock::new();
+
+fn standby_origin_cache() -> &'static std::sync::Mutex<HashMap<StandbyOriginKey, StandbyOriginEntry>>
+{
+    STANDBY_ORIGIN_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// 正面判定的新鲜度上限（来源契约是配置衍生的慢变量）。
+const STANDBY_ORIGIN_POSITIVE_TTL: Duration = Duration::from_secs(600);
+/// 显式否定的复核间隔（custom 切回 managed 后在此时间内恢复替换）。
+const STANDBY_ORIGIN_NEGATIVE_TTL: Duration = Duration::from_secs(120);
+
 pub struct UserAppProxyFailureAdvisorImpl {
     state: std::sync::Weak<AppState>,
     cache: tokio::sync::Mutex<HashMap<HintKey, CachedHint>>,
@@ -59,10 +84,101 @@ impl UserAppProxyFailureAdvisorImpl {
             inflight: dashmap::DashMap::new(),
         }
     }
+
+    /// 完成观察后的来源结论落账：契约命中 → 正面（含代次绑定）；显式
+    /// 不同/缺失 → 否定（立即撤销旧许可，Codex P2）。非 Snapshot 结果
+    /// （超时/不可达）不改写缓存——未知不是否定。
+    fn note_standby_origin(
+        &self,
+        app_id: &str,
+        stage: &str,
+        snapshot: &shared_types::UserAppBusinessReadiness,
+    ) {
+        let confirmed = snapshot.proxy.error_origin_contract.as_deref()
+            == Some(shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT);
+        let mut cache = standby_origin_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.insert(
+            (app_id.to_owned(), stage.to_owned()),
+            StandbyOriginEntry {
+                confirmed,
+                at: Instant::now(),
+            },
+        );
+    }
+
+    /// standby 来源判定：命中缓存按新鲜度返回；未预热/过期触发后台预热
+    /// 观察并返回 Unknown（本请求透传，重试命中）。
+    async fn standby_origin_impl(
+        state: &std::sync::Weak<AppState>,
+        app_id: &str,
+        stage: &str,
+    ) -> StandbyOrigin {
+        let key = (app_id.to_owned(), stage.to_owned());
+        {
+            let cache = standby_origin_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(entry) = cache.get(&key) {
+                let ttl = if entry.confirmed {
+                    STANDBY_ORIGIN_POSITIVE_TTL
+                } else {
+                    STANDBY_ORIGIN_NEGATIVE_TTL
+                };
+                if Instant::now().duration_since(entry.at) < ttl {
+                    return if entry.confirmed {
+                        StandbyOrigin::Confirmed
+                    } else {
+                        StandbyOrigin::Unconfirmed
+                    };
+                }
+            }
+        }
+        // 后台预热：detached 观察（5s 预算）完成后缓存即更新；本请求透传。
+        let state = state.clone();
+        let app_id = app_id.to_owned();
+        let stage_owned = stage.to_owned();
+        tokio::spawn(async move {
+            if let Some(state) = state.upgrade() {
+                let _ = Self::observe_once_for_origin(&state, &app_id, &stage_owned).await;
+            }
+        });
+        StandbyOrigin::Unknown
+    }
+
+    /// 后台预热观察：完成即更新来源缓存（含显式否定撤销）。
+    async fn observe_once_for_origin(state: &Arc<AppState>, app_id: &str, stage: &str) {
+        let Some(stage) = UserappStage::parse(stage) else {
+            return;
+        };
+        let Some(reader) = state.app_service.readiness_reader() else {
+            return;
+        };
+        if let Ok(UserAppReadinessObservation::Snapshot { snapshot, .. }) =
+            reader.observe(app_id, stage, Duration::from_secs(5)).await
+        {
+            let mut cache = standby_origin_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.insert(
+                (app_id.to_owned(), stage.as_str().to_owned()),
+                StandbyOriginEntry {
+                    confirmed: snapshot.proxy.error_origin_contract.as_deref()
+                        == Some(shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT),
+                    at: Instant::now(),
+                },
+            );
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl UserAppProxyFailureAdvisor for UserAppProxyFailureAdvisorImpl {
+    async fn standby_origin(&self, app_id: &str, stage: &str) -> StandbyOrigin {
+        Self::standby_origin_impl(&self.state, app_id, stage).await
+    }
+
     async fn advise(
         &self,
         app_id: &str,
@@ -112,6 +228,7 @@ impl UserAppProxyFailureAdvisorImpl {
             .await
         {
             Ok(UserAppReadinessObservation::Snapshot { physical, snapshot }) => {
+                self.note_standby_origin(app_id, stage.as_str(), &snapshot);
                 current_snapshot_hint(physical, *snapshot)
             }
             Ok(UserAppReadinessObservation::NoCompute { state }) => Some(UserAppProxyFailureHint {
@@ -198,6 +315,7 @@ impl UserAppProxyFailureAdvisorImpl {
         let reader = state.app_service.readiness_reader()?;
         match reader.observe(app_id, stage, budget).await {
             Ok(UserAppReadinessObservation::Snapshot { snapshot, .. }) => {
+                self.note_standby_origin(app_id, stage.as_str(), &snapshot);
                 Some(UserAppProxyFailureHint {
                     proxy_confirmation: None,
                     readiness_status: Some(snapshot.status),

@@ -762,6 +762,17 @@ mod tests {
             // This controlled fixture has no TTL cache or changing deployment.
             self.advise(app_id, stage, budget).await
         }
+        async fn standby_origin(
+            &self,
+            _app_id: &str,
+            _stage: &str,
+        ) -> crate::error_page::StandbyOrigin {
+            if self.confirmed {
+                crate::error_page::StandbyOrigin::Confirmed
+            } else {
+                crate::error_page::StandbyOrigin::Unconfirmed
+            }
+        }
     }
 
     /// 模拟「pingap 活着但 Vite/backend 未就绪」的上游：pingap fail_to_proxy
