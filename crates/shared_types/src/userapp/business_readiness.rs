@@ -121,7 +121,12 @@ pub enum UserAppReadinessReason {
     ProxyNotStarted,
     /// Pingap 实际生效 config hash 与本实例期望不一致
     ProxyConfigMismatch,
-    /// 入口处于 standby 摘流兜底（发布/停止窗口 mock 直出，业务自身未参与）
+    /// 入口处于 standby 摘流兜底（发布/停止窗口 mock 直出，业务自身未参与）。
+    ///
+    /// 跨版本约束：原因码是闭合枚举，旧 RCoder 无法解析本值会导致整个就绪
+    /// 快照反序列化失败（ADMIN_PROTOCOL_INVALID）。本值随首次产出的发布一起
+    /// 上线，要求 RCoder 服务端与 UserApp 运行时镜像同步升级；不支持仅升级
+    /// app-cli 镜像的混布组合。
     ProxyStandby,
 
     // ---- 阶段性证据（配合 starting/stopping/stopped/failed/degraded/provisioning 顶层态）----

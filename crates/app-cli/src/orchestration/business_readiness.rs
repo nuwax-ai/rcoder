@@ -353,7 +353,9 @@ impl BusinessReadinessObserver {
                     ready: false,
                     status,
                     reason_code: Some(reason),
-                    error_origin_contract: None,
+                    // 停止窗口入口仍是 standby mock（先摘流后停业务）：附加
+                    // 已核验的来源契约，故障页管线才能替换停止中/已停止文案
+                    error_origin_contract: standby_origin_contract(proxy_confirmation.as_ref()),
                     confirmation: proxy_confirmation,
                 },
                 services: Vec::new(),
@@ -377,7 +379,7 @@ impl BusinessReadinessObserver {
                     ready: false,
                     status: UserAppReadinessStatus::Stopped,
                     reason_code: None,
-                    error_origin_contract: None,
+                    error_origin_contract: standby_origin_contract(proxy_confirmation.as_ref()),
                     confirmation: None,
                 },
                 services: Vec::new(),
@@ -812,6 +814,23 @@ async fn fetch_admin_snapshot(
     }
 }
 
+/// standby 摘流窗口的来源契约（停止短路路径专用）。
+///
+/// 证据链：[`crate::proxy::compiler::record_confirmed_publication`] 只在
+/// admin 回报 hash 与 standby 期望一致、全部入口探针按 503 通过后写入
+/// confirmed Standby 相位（同时 pin 实例与配置摘要）；停止受理/已停止
+/// 短路不重发网络探测，直接消费该已核验记录。相位被后续发布事务覆盖
+/// （Preparing/Starting/Serving）后本函数自然失效——那时的入口要么仍在
+/// 旧 standby（短窗口，走全量探测路径由 `derive_proxy` 核验），要么已换代。
+fn standby_origin_contract(
+    confirmation: Option<&shared_types::ProxyConfirmation>,
+) -> Option<String> {
+    let confirmed_standby = confirmation.is_some_and(|confirmation| {
+        confirmation.confirmed && matches!(confirmation.phase, shared_types::ProxyPhase::Standby)
+    });
+    confirmed_standby.then(|| shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT.to_string())
+}
+
 /// 代理就绪推导：入口监听 + 生效 hash 匹配；来源契约仅在 hash 确认时透出。
 #[allow(clippy::type_complexity)]
 fn derive_proxy(
@@ -1076,6 +1095,112 @@ mod tests {
         assert_eq!(status, UserAppReadinessStatus::Unknown);
         assert_eq!(reason, Some(UserAppReadinessReason::ObserveIncomplete));
         assert_eq!(contract, None);
+    }
+
+    /// 真实 observer 回归（Codex 复现）：已确认 Standby 后停止收束（Idle +
+    /// !ready），快照必须保留 Stopped 判定并附加来源契约——停止/已停止是
+    /// standby 摘流的预期业务路径，不能因短路丢契约导致代理不替换正文。
+    #[tokio::test]
+    async fn stopped_snapshot_keeps_standby_origin_contract() {
+        let publication_id = "60fdbd11-ad41-458e-9557-04a0cfba7fb3";
+        let expected_hash = "STOPSTANDBY01".to_string();
+        let outcome = crate::proxy::compiler::CompileOutcome {
+            serving_release_id: None,
+            operation_id: Some("stop-operation".into()),
+            config_path: "unused-stop-standby-candidate.toml".into(),
+            expected_hash: expected_hash.clone(),
+            publication_id: publication_id.into(),
+            config_digest: "d".repeat(64),
+            entry_probes: vec![crate::proxy::compiler::ProxyProbeTarget {
+                address: "127.0.0.1:9080".parse().unwrap(),
+                expected_status: 503,
+            }],
+            business_probes: vec![],
+        };
+        let confirmed = crate::proxy::apply_status::ConfirmedPublication {
+            process_id: std::process::id(),
+            instance_id: "instance-stop-standby".into(),
+            publication_id: publication_id.into(),
+            config_hash: expected_hash,
+            config_digest: outcome.config_digest.clone(),
+            attempt_id: 1,
+            operation_id: Some("stop-operation".into()),
+        };
+        crate::proxy::compiler::record_confirmed_publication(&outcome, &confirmed).unwrap();
+
+        // 已停止形态：Idle + runtime 未 ready（无需服务/网络探测的短路路径）。
+        let state = Arc::new(ServerState::new(
+            crate::runtime_status::RuntimeStatusService::default(),
+        ));
+        state.mark_initialized();
+        state.set_release(combo_lock(0));
+        state.set_phase(ServerPhase::Idle);
+        let observer = BusinessReadinessObserver::new(state.clone());
+        let observed = observer.observe().await;
+
+        assert_eq!(observed.status, UserAppReadinessStatus::Stopped);
+        assert_eq!(
+            observed.proxy.error_origin_contract.as_deref(),
+            Some(shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT),
+            "stopped window entry still serves the confirmed standby mock"
+        );
+    }
+
+    /// 无 Standby 确认记录的已停止快照不得透出来源契约（无证据不虚报）。
+    #[tokio::test]
+    async fn stopped_snapshot_without_standby_record_hides_origin_contract() {
+        let state = Arc::new(ServerState::new(
+            crate::runtime_status::RuntimeStatusService::default(),
+        ));
+        state.mark_initialized();
+        state.set_release(combo_lock(0));
+        state.set_phase(ServerPhase::Idle);
+        let observer = BusinessReadinessObserver::new(state.clone());
+        let observed = observer.observe().await;
+
+        assert_eq!(observed.status, UserAppReadinessStatus::Stopped);
+        assert_eq!(observed.proxy.error_origin_contract, None);
+    }
+
+    /// 来源契约只跟随已确认的 Standby 相位：未确认、其他相位、无记录均不透出。
+    #[test]
+    fn standby_origin_contract_follows_confirmed_standby_phase() {
+        let confirmation =
+            |confirmed: bool, phase: shared_types::ProxyPhase| shared_types::ProxyConfirmation {
+                contract: shared_types::ProxyConfirmationContract::OfficialRestartHttpV1,
+                confirmed,
+                phase,
+                operation_id: "op".into(),
+                proxy_instance_id: None,
+                config_digest: None,
+            };
+        assert_eq!(
+            standby_origin_contract(Some(&confirmation(true, shared_types::ProxyPhase::Standby)))
+                .as_deref(),
+            Some(shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT)
+        );
+        assert_eq!(
+            standby_origin_contract(Some(&confirmation(
+                false,
+                shared_types::ProxyPhase::Standby
+            ))),
+            None,
+            "unconfirmed standby must not prove the entry origin"
+        );
+        assert_eq!(
+            standby_origin_contract(Some(&confirmation(true, shared_types::ProxyPhase::Serving))),
+            None,
+            "only the standby phase proves the mock-window origin"
+        );
+        assert_eq!(
+            standby_origin_contract(Some(&confirmation(
+                true,
+                shared_types::ProxyPhase::Preparing
+            ))),
+            None,
+            "transitional publication phases must not inherit the standby contract"
+        );
+        assert_eq!(standby_origin_contract(None), None);
     }
 
     #[tokio::test]
