@@ -44,11 +44,13 @@ pub(super) async fn with_compute_access_claim_probe<F: Future>(
 /// the anchor row lock and pauses between the lock acquisition and the
 /// terminal CAS, letting a concurrency test prove a concurrent clear cannot
 /// slip into that gap.
+#[cfg(feature = "pg")]
 #[derive(Default)]
 pub(super) struct ExpireAnchorProbe {
     reached: tokio::sync::Notify,
     resume: tokio::sync::Notify,
 }
+#[cfg(feature = "pg")]
 impl ExpireAnchorProbe {
     #[cfg(feature = "pg")]
     pub(super) async fn reached(&self) {
@@ -59,6 +61,7 @@ impl ExpireAnchorProbe {
         self.resume.notify_one();
     }
 }
+#[cfg(feature = "pg")]
 tokio::task_local! {
     static EXPIRE_ANCHOR_PROBE: std::sync::Arc<ExpireAnchorProbe>;
 }
