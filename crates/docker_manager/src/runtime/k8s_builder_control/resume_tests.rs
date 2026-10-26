@@ -25,6 +25,7 @@ pub(super) struct ApiState {
     pod_seed: serde_json::Value,
     pub(super) extra_pods: Vec<serde_json::Value>,
     resume_replicas_on_second_sts_read: bool,
+    zero_replicas_on_second_sts_read: bool,
     pub(super) fail_pod_list: bool,
     replace_uid_on_sts_read: Option<usize>,
     pub(super) replace_pvc_on_read: Option<usize>,
@@ -340,6 +341,9 @@ async fn connection(mut stream: tokio::net::TcpStream, state: Arc<Mutex<ApiState
             if state.resume_replicas_on_second_sts_read && state.sts_reads >= 2 {
                 state.sts["spec"]["replicas"] = 1.into();
             }
+            if state.zero_replicas_on_second_sts_read && state.sts_reads >= 2 {
+                state.sts["spec"]["replicas"] = 0.into();
+            }
             if state.advance_status_rv {
                 let rv = state.sts["metadata"]["resourceVersion"]
                     .as_str()
@@ -630,6 +634,7 @@ pub(super) async fn fixture(
         pod_seed: pod.clone(),
         extra_pods: vec![],
         resume_replicas_on_second_sts_read: false,
+        zero_replicas_on_second_sts_read: false,
         fail_pod_list: false,
         replace_uid_on_sts_read: None,
         replace_pvc_on_read: None,
@@ -1982,4 +1987,66 @@ async fn actual_create_entry_fences_all_retained_services_when_resuming_zero_bui
             .any(|request| request.starts_with("DELETE ") && request.contains("/services/"))
     );
     server.abort();
+}
+
+/// Positive running evidence only (deadline-settlement probe): replicas >= 1
+/// on the EXACT captured controller, double-read, receipt-free. Zero replicas
+/// (terminating), an absent controller, a mid-observation scale-down and a
+/// replacement UID never observe as running; every case stays read-only.
+#[tokio::test]
+async fn running_observation_requires_live_replicas_on_the_captured_controller() {
+    use container_runtime_api::AgentContainerRuntime as _;
+    for case in [
+        "running",
+        "zero-replicas",
+        "absent-controller",
+        "scaled-down-during-observation",
+        "new-controller-uid",
+    ] {
+        let (runtime, params, state, server) = fixture(None).await;
+        let target = runtime
+            .capture_builder_compute_with_binding(
+                params.execution_context.as_ref().expect("context"),
+                params.resource_binding.as_ref(),
+                false,
+            )
+            .await
+            .expect("capture existing target");
+        {
+            let mut state = state.lock().expect("state");
+            state.sts_reads = 0;
+            match case {
+                "running" => {}
+                "zero-replicas" => state.sts["spec"]["replicas"] = 0.into(),
+                "absent-controller" => state.sts = serde_json::Value::Null,
+                "scaled-down-during-observation" => {
+                    state.zero_replicas_on_second_sts_read = true;
+                }
+                "new-controller-uid" => state.replace_uid_on_second_sts_read = true,
+                _ => unreachable!("enumerated case"),
+            }
+        }
+        let observed = runtime.observe_builder_compute_running(&target).await;
+        match case {
+            "running" => assert!(observed.expect("live replicas observe as running")),
+            "new-controller-uid" => assert!(
+                matches!(observed, Err(Error::Conflict(_))),
+                "a replacement controller is never the captured target: {observed:?}"
+            ),
+            _ => assert!(
+                !observed.expect("terminating or absent shapes observe as not running"),
+                "{case}"
+            ),
+        }
+        let state = state.lock().expect("state");
+        assert!(
+            state
+                .requests
+                .iter()
+                .all(|request| request.starts_with("GET ")),
+            "running observation is read-only: {case}"
+        );
+        assert!(state.puts.is_empty() && state.patches.is_empty(), "{case}");
+        server.abort();
+    }
 }

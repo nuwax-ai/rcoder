@@ -390,6 +390,22 @@ pub trait AgentContainerRuntime: Send + Sync {
         Ok(false)
     }
 
+    /// Positive RUNNING observation of the captured workload: the exact
+    /// captured controller currently declares at least one replica. Unlike
+    /// the start reconciliation this requires no per-operation receipt, so a
+    /// healthy instance started by a PREVIOUS operation still observes as
+    /// running. Read-only; never authorizes a write. `Ok(false)` covers
+    /// stopped, terminating and absent shapes — only a positive result is
+    /// evidence of running.
+    async fn observe_builder_compute_running(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Builder running observation is unsupported".into(),
+        ))
+    }
+
     fn supports_builder_compute_fencing(&self) -> bool {
         false
     }

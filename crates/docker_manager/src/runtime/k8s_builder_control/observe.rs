@@ -79,3 +79,60 @@ impl KubernetesRuntime {
         }
     }
 }
+
+impl KubernetesRuntime {
+    /// Positive running observation of the exact captured controller: the
+    /// spec still declares at least one replica (a terminating controller has
+    /// spec.replicas == 0 and observes as NOT running). No operation receipt
+    /// is consulted — an instance started by any previous operation still
+    /// observes as running. Read-only with a recheck.
+    pub(crate) async fn observe_retained_builder_running(
+        &self,
+        target: &BuilderControlTarget,
+    ) -> Result<bool> {
+        target.validate().map_err(Error::ConfigurationError)?;
+        let Some(expected) = target.workload.as_ref() else {
+            return Ok(false);
+        };
+        if expected.kind != AppResourceKind::StatefulSet {
+            return Ok(false);
+        }
+        let controllers: Api<StatefulSet> = Api::namespaced(self.client.clone(), &self.namespace);
+        let running_controller = |controller: &StatefulSet| -> Result<bool> {
+            let observed = workload_identity_with_binding(
+                controller,
+                &target.context,
+                target.resource_binding.as_ref(),
+                false,
+            )?;
+            if observed.uid != expected.uid || observed.name != expected.name {
+                return Err(Error::Conflict(
+                    "Captured builder controller changed during running observation".into(),
+                ));
+            }
+            Ok(controller
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.replicas)
+                .is_some_and(|replicas| replicas >= 1))
+        };
+        let current = controllers
+            .get_opt(&expected.name)
+            .await
+            .map_err(|error| api_error("Observe retained running builder controller", error))?;
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        if !running_controller(&current)? {
+            return Ok(false);
+        }
+        let after = controllers
+            .get_opt(&expected.name)
+            .await
+            .map_err(|error| api_error("Recheck retained running builder controller", error))?;
+        match after {
+            Some(after) => running_controller(&after),
+            None => Ok(false),
+        }
+    }
+}

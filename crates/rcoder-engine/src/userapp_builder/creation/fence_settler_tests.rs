@@ -115,6 +115,12 @@ pub(crate) struct FenceRuntime {
     /// 结算对账证据旋钮：true 时 prepare_builder_compute_retry 报告
     /// Ok(None)（启动已提交、只能观察——契约原文语义）。
     pub(crate) builder_retry_committed: std::sync::atomic::AtomicBool,
+    /// 结算对账证据旋钮：true 时 prepare_builder_compute_retry 报告
+    /// Ok(Some)（存在可重试目标——契约原文语义）；优先于 committed。
+    pub(crate) builder_retry_partial: std::sync::atomic::AtomicBool,
+    /// 结算对账证据旋钮：true 时 observe_builder_compute_running 报告
+    /// Ok(true)（捕获控制器声明副本≥1，无需任何操作收据）。
+    pub(crate) builder_running_observed: std::sync::atomic::AtomicBool,
     /// 免回执的原创建运行时权威观测（陈旧 Running 对账用）；
     /// None = trait 默认 Unsupported（保守保持）。
     pub(crate) unbound_creation_authority:
@@ -163,6 +169,8 @@ impl FenceRuntime {
             receipt_holder_dead: Mutex::new(None),
             builder_start_observed: Default::default(),
             builder_retry_committed: Default::default(),
+            builder_retry_partial: Default::default(),
+            builder_running_observed: Default::default(),
             unbound_creation_authority: Mutex::new(None),
             unbound_authority_transport_fails: Default::default(),
         })
@@ -225,6 +233,13 @@ impl AgentContainerRuntime for FenceRuntime {
         _target: &BuilderControlTarget,
     ) -> ContainerRuntimeResult<Option<BuilderControlTarget>> {
         if self
+            .builder_retry_partial
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // 契约语义：Some = 存在可重试目标。
+            return Ok(Some(_target.clone()));
+        }
+        if self
             .builder_retry_committed
             .load(std::sync::atomic::Ordering::SeqCst)
         {
@@ -234,6 +249,15 @@ impl AgentContainerRuntime for FenceRuntime {
         Err(ContainerRuntimeError::ConfigurationError(
             "Conditional builder retry is unsupported".into(),
         ))
+    }
+
+    async fn observe_builder_compute_running(
+        &self,
+        _target: &BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(self
+            .builder_running_observed
+            .load(std::sync::atomic::Ordering::SeqCst))
     }
 
     async fn observe_unbound_builder_creation_authority(

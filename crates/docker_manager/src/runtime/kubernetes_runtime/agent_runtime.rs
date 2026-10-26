@@ -395,6 +395,13 @@ impl AgentContainerRuntime for KubernetesRuntime {
         self.observe_retained_builder_stopped(target).await
     }
 
+    async fn observe_builder_compute_running(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        self.observe_retained_builder_running(target).await
+    }
+
     fn supports_builder_compute_fencing(&self) -> bool {
         true
     }

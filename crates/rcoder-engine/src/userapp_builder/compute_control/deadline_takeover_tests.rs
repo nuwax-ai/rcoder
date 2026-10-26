@@ -501,7 +501,7 @@ async fn running_stop_surface_settles_with_evidence() {
     let (state, runtime) = test_state().await;
     *runtime.receipt_verdict.lock().unwrap() = ReceiptVerdict::NotHeld;
     runtime
-        .builder_start_observed
+        .builder_running_observed
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let record =
         stalled_restart_at_stages(&state, "runningstop", &[ComputeControlStage::Stopping]).await;
@@ -631,4 +631,62 @@ async fn starting_surface_without_evidence_defers_settlement() {
         ComputeControlState::Running,
         "an unclassifiable start surface defers settlement to reconciliation-capable paths"
     );
+}
+
+/// Codex round-4 issue 2 wiring proof: a deadline settlement with a running
+/// residue RELEASES the scope's admission fence — the next control admits
+/// immediately (no OperationInProgress), and its own capture-fresh stop/start
+/// phases take over physical reconciliation of the residue. The handoff is
+/// the domain's established failed-with-residue pattern (fail_unrecoverable
+/// image-roll: "围栏随终态自然释放，由业务 start 重建运行时").
+#[tokio::test]
+async fn settled_running_residue_hands_off_to_the_next_admission() {
+    let (state, runtime) = test_state().await;
+    *runtime.receipt_verdict.lock().unwrap() = ReceiptVerdict::NotHeld;
+    runtime
+        .builder_running_observed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let record =
+        stalled_restart_at_stages(&state, "handoff", &[ComputeControlStage::Stopping]).await;
+    state
+        .userapp_store
+        .bind_compute_control_deadline(&record, chrono::Utc::now().timestamp_millis() - 1)
+        .await
+        .unwrap();
+    state
+        .userapp_store
+        .mark_compute_control_unheld(
+            &record,
+            chrono::Utc::now().timestamp_millis() - COMPUTE_SETTLEMENT_QUIET_MS - 1,
+        )
+        .await
+        .unwrap();
+    settle_expired_compute_control(&state, &record)
+        .await
+        .unwrap();
+    let settled = state
+        .userapp_store
+        .get_compute_control(&record.app_id, &record.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.state, ComputeControlState::Failed);
+    // The fence is released: the scope admits a fresh control whose
+    // capture-fresh phases now own the physical residue.
+    let admitted = state
+        .userapp_store
+        .admit_compute_control(&ComputeControlRequest {
+            builder_startup_mode: Default::default(),
+            app_id: settled.app_id.clone(),
+            lifecycle_id: settled.lifecycle_id.clone(),
+            scope: UserAppOperationScope::Dev,
+            operation_id: "handoffsuccessor".into(),
+            request_id: "handoffsuccessor-request".into(),
+            request_fingerprint: "b".repeat(64),
+            action: ComputeControlAction::Stop,
+            restart_image_roll: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(admitted.state, ComputeControlState::Pending);
 }

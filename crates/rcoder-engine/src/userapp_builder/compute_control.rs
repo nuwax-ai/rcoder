@@ -2145,16 +2145,19 @@ async fn settlement_surface_note(
                     };
                     // A positive RUNNING observation — not a double negative —
                     // proves the stop write never landed (and after the quiet
-                    // window it can no longer land). Ambiguous shapes (scaled
-                    // to zero with pods still terminating, or unreadable)
-                    // defer: a double false proves nothing.
+                    // window it can no longer land). The running probe is the
+                    // receipt-free controller observation: an instance started
+                    // by a PREVIOUS operation (the common healthy shape when a
+                    // Restart dies before dispatching its stop) still observes
+                    // as running. Ambiguous shapes (scaled to zero with pods
+                    // still terminating, or unreadable) defer: a double false
+                    // proves nothing.
                     let running = match state
                         .runtime()
-                        .reconcile_builder_compute_start(&target)
+                        .observe_builder_compute_running(&target)
                         .await
                     {
-                        Ok(Some(_)) => true,
-                        Ok(None) => false,
+                        Ok(running) => running,
                         Err(error) => {
                             tracing::debug!(
                                 %error,
@@ -2257,22 +2260,46 @@ async fn settlement_surface_note(
                             return Ok(None);
                         }
                     };
-                    let running = match state
+                    // A receipt-confirmed running surface prefers normal
+                    // completion. The receipt query conflicts while the
+                    // controller still sits at zero replicas (a start never
+                    // dispatched, or applied-then-scaled) — that error is
+                    // evidence-missing, not a reason to skip classification.
+                    let receipt_running = match state
                         .runtime()
                         .reconcile_builder_compute_start(&target)
                         .await
                     {
-                        Ok(info) => info,
+                        Ok(info) => info.is_some(),
                         Err(error) => {
                             tracing::debug!(
                                 %error,
                                 operation_id = %current.operation_id,
-                                "Deadline settlement running-observation failed; deferring"
+                                "Deadline settlement start-receipt query failed; continuing classification"
                             );
-                            return Ok(None);
+                            false
                         }
                     };
-                    if running.is_some() {
+                    let running = if receipt_running {
+                        true
+                    } else {
+                        match state
+                            .runtime()
+                            .observe_builder_compute_running(&target)
+                            .await
+                        {
+                            Ok(running) => running,
+                            Err(error) => {
+                                tracing::debug!(
+                                    %error,
+                                    operation_id = %current.operation_id,
+                                    "Deadline settlement running-observation failed; continuing classification"
+                                );
+                                false
+                            }
+                        }
+                    };
+                    if running {
                         tracing::debug!(
                             operation_id = %current.operation_id,
                             "Deadline-expired restart is running; preferring normal completion over settlement"
@@ -2282,14 +2309,15 @@ async fn settlement_surface_note(
                     // Contract: Ok(None) = the original start COMMITTED and can
                     // only be observed (the app81 form); Ok(Some) = a retryable
                     // owned partial exists. Neither alone proves settlement;
-                    // combined with the elapsed quiet window they record which
-                    // settled shape the surface is in.
+                    // the elapsed quiet window closes further writes and the
+                    // recorded shape hands physical reconciliation to the next
+                    // admission's capture-fresh phases.
                     match state.runtime().prepare_builder_compute_retry(&target).await {
                         Ok(None) => {
                             note("start committed but never reached readiness within the deadline")
                         }
                         Ok(Some(_)) => note(
-                            "start left an owned retryable partial after the quiet window; the write can no longer land",
+                            "start left an owned retryable partial; further writes are closed by the quiet window and reconciliation hands off to the next admission",
                         ),
                         Err(error) => {
                             tracing::debug!(
