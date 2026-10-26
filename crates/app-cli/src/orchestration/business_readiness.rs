@@ -1203,6 +1203,61 @@ mod tests {
         assert_eq!(standby_origin_contract(None), None);
     }
 
+    /// 停止受理窗口（未收束 Stop 短路）同样透出已核验的 standby 契约：
+    /// 摘流先于停业务，stopping 期间入口仍是 mock 直出。
+    #[tokio::test]
+    async fn stopping_snapshot_keeps_standby_origin_contract() {
+        let publication_id = "0b69964b-8df2-42f9-aa92-60fdbd11ad41";
+        let expected_hash = "STOPPINGSTANDBY01".to_string();
+        let outcome = crate::proxy::compiler::CompileOutcome {
+            serving_release_id: None,
+            operation_id: Some("stop-operation".into()),
+            config_path: "unused-stopping-standby-candidate.toml".into(),
+            expected_hash: expected_hash.clone(),
+            publication_id: publication_id.into(),
+            config_digest: "e".repeat(64),
+            entry_probes: vec![crate::proxy::compiler::ProxyProbeTarget {
+                address: "127.0.0.1:9080".parse().unwrap(),
+                expected_status: 503,
+            }],
+            business_probes: vec![],
+        };
+        let confirmed = crate::proxy::apply_status::ConfirmedPublication {
+            process_id: std::process::id(),
+            instance_id: "instance-stopping-standby".into(),
+            publication_id: publication_id.into(),
+            config_hash: expected_hash,
+            config_digest: outcome.config_digest.clone(),
+            attempt_id: 1,
+            operation_id: Some("stop-operation".into()),
+        };
+        crate::proxy::compiler::record_confirmed_publication(&outcome, &confirmed).unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let kernel = kernel_with_admitted_stop(root.path(), "stop-window-standby").await;
+        let state = Arc::new(ServerState::new(
+            crate::runtime_status::RuntimeStatusService::default(),
+        ));
+        state.mark_initialized();
+        state.set_release(combo_lock(19495));
+        state.set_phase(ServerPhase::Running);
+        assert!(state.set_runtime_kernel(kernel.clone()));
+
+        let observer = BusinessReadinessObserver::new(state.clone());
+        let observed = await_status(&observer, UserAppReadinessStatus::Stopping).await;
+        assert_eq!(
+            observed.reason_code,
+            Some(UserAppReadinessReason::StopAccepted),
+            "stop priority must stay untouched by the contract attachment"
+        );
+        assert_eq!(
+            observed.proxy.error_origin_contract.as_deref(),
+            Some(shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT),
+            "stopping window entry still serves the confirmed standby mock"
+        );
+        assert!(observed.proxy.confirmation.is_some());
+    }
+
     #[tokio::test]
     async fn cache_keeps_the_observed_identity_when_state_changes_before_store() {
         let state = Arc::new(ServerState::new(
