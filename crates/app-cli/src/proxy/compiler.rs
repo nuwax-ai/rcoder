@@ -853,7 +853,10 @@ mod standby_page_tests {
     #[test]
     fn standby_page_renders_without_placeholders() {
         let page = standby_error_page("pub-123");
-        assert!(page.contains("http-equiv=\"refresh\""), "missing meta refresh");
+        assert!(
+            page.contains("http-equiv=\"refresh\""),
+            "missing meta refresh"
+        );
         assert!(page.contains("pub-123"), "publication id not rendered");
         assert!(
             !page.contains("{{RCODER_"),
