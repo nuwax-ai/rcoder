@@ -1026,10 +1026,12 @@ impl PortProxy {
             })
             .unwrap_or_else(|| Duration::from_millis(1000));
         let hint = if standby_window {
-            // 来源：三态轻量判定（Codex P1/P2）——Confirmed=缓存命中（TTL 内
-            // 即时替换）；Unconfirmed=显式否定（custom/伪造，透传）；Unknown=
-            // 冷缓存（实现方后台预热，本请求透传，浏览器按 Retry-After 重试
-            // 命中——冷启动竞争由预热关闭而非等待 1s 观察竞速）。
+            // 来源路由（三态，Codex P1/P2/七轮）：Unconfirmed=显式否定（透传
+            // 省预算）；Unknown=冷缓存（后台预热，本请求透传）；Confirmed=
+            // 值得花预算做**当次新鲜确认**。授权只能来自新鲜观察的成功——
+            // 缓存 Confirmed 不直接授权（零旧许可窗口：managed→custom 切换
+            // 后，无论新鲜观察是否持续超时，旧确认都无法替换正文；超时=
+            // 证据不可得=透传，保守正确）。
             let origin = match advisor.as_ref() {
                 Some(advisor) => advisor.standby_origin(&route.app_id, route.stage).await,
                 None => crate::error_page::StandbyOrigin::Unknown,
@@ -1037,21 +1039,18 @@ impl PortProxy {
             if origin != crate::error_page::StandbyOrigin::Confirmed {
                 return;
             }
-            // 文案：新鲜观察尽力而为；超时（None）由 Restarting 兜底；**显式
-            // 否定**（Some 且未确认——门命中旧缓存后配置已换代，custom/伪造）
-            // 放弃本次替换：origin 缓存已被同次观察落账否定，下轮门即拒绝
-            // （Codex 五轮：暖门不得覆盖新鲜否定）。
+            // 授权观察：成功确认才替换；显式否定或超时（None）都透传。
             match advisor.as_ref() {
                 Some(advisor) => {
                     let fresh = advisor
                         .advise_current(&route.app_id, route.stage, budget)
                         .await;
-                    if fresh.as_ref().is_some_and(|h| !h.error_origin_confirmed) {
-                        return;
+                    match fresh {
+                        Some(h) if h.error_origin_confirmed => Some(h),
+                        _ => return,
                     }
-                    fresh.filter(|h| h.error_origin_confirmed)
                 }
-                None => None,
+                None => return,
             }
         } else {
             // 既有 T11 路径：新鲜观察一次承担来源与文案。

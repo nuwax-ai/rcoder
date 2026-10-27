@@ -142,29 +142,30 @@ fn prewarm_due(key: &StandbyOriginKey, epoch: usize) -> bool {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = Instant::now();
-    // 过期清理 + 容量硬上限（与 origin 缓存同款语义）。
-    prewarm.retain(|_, (at, _)| now.duration_since(*at) < STANDBY_PREWARM_INTERVAL);
-    if prewarm.len() >= STANDBY_PREWARM_CAPACITY {
-        while prewarm.len() >= STANDBY_PREWARM_CAPACITY {
-            let earliest = prewarm
-                .iter()
-                .min_by_key(|(_, (at, _))| *at)
-                .map(|(key, _)| key.clone());
-            match earliest {
-                Some(oldest) => {
-                    prewarm.remove(&oldest);
-                }
-                None => break,
-            }
-        }
-    }
+    // 先判当前键（Codex 七轮：先逐出会把未过期的当前键挤出 → 立即误判 due
+    // 重复发起观察）；确认要写入后才做过期清理与容量逐出——当前键即便在
+    // 逐出中最先被移除，紧随的 insert 也把它写回，语义不变。
     let due = prewarm.get(key).is_none_or(|(at, owner_epoch)| {
         *owner_epoch != epoch || now.duration_since(*at) >= STANDBY_PREWARM_INTERVAL
     });
-    if due {
-        prewarm.insert(key.clone(), (now, epoch));
+    if !due {
+        return false;
     }
-    due
+    prewarm.retain(|_, (at, _)| now.duration_since(*at) < STANDBY_PREWARM_INTERVAL);
+    while prewarm.len() >= STANDBY_PREWARM_CAPACITY {
+        let earliest = prewarm
+            .iter()
+            .min_by_key(|(_, (at, _))| *at)
+            .map(|(key, _)| key.clone());
+        match earliest {
+            Some(oldest) => {
+                prewarm.remove(&oldest);
+            }
+            None => break,
+        }
+    }
+    prewarm.insert(key.clone(), (now, epoch));
+    true
 }
 
 type StandbyOriginKey = (String, String);
