@@ -936,6 +936,152 @@ mod tests {
         proxy_task.await.unwrap().unwrap();
     }
 
+    /// 慢观察 advisor：来源判定 Confirmed；新鲜观察 1.2s 后返回确认
+    /// （Codex 八轮反例的健康慢 reader——定位+拉取+复核）。
+    struct SlowConfirmedAdvisor {
+        observe_delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::error_page::UserAppProxyFailureAdvisor for SlowConfirmedAdvisor {
+        async fn advise(
+            &self,
+            _app_id: &str,
+            _stage: &str,
+            _budget: Duration,
+        ) -> Option<crate::error_page::UserAppProxyFailureHint> {
+            Some(crate::error_page::UserAppProxyFailureHint {
+                proxy_confirmation: None,
+                readiness_status: Some(shared_types::UserAppReadinessStatus::Starting),
+                error_origin_confirmed: true,
+            })
+        }
+        async fn advise_current(
+            &self,
+            app_id: &str,
+            stage: &str,
+            budget: Duration,
+        ) -> Option<crate::error_page::UserAppProxyFailureHint> {
+            tokio::time::sleep(self.observe_delay).await;
+            self.advise(app_id, stage, budget).await
+        }
+        async fn standby_origin(
+            &self,
+            _app_id: &str,
+            _stage: &str,
+        ) -> crate::error_page::StandbyOrigin {
+            crate::error_page::StandbyOrigin::Confirmed
+        }
+    }
+
+    /// 模拟 standby 摘流入口：503 + rcoder-standby 标记 + publication 头。
+    async fn spawn_fake_standby_backend(listener: tokio::net::TcpListener) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 4096];
+                let Ok(read) = socket.read(&mut buffer).await else {
+                    return;
+                };
+                let _ = read;
+                let body = b"service stopped or restarting (publication test); retry shortly";
+                let response = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\nRetry-After: 2\r\nX-Rcoder-Publication: 11111111-1111-4111-8111-111111111111\r\nX-Pingap-EType: rcoder-standby\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.write_all(body).await;
+            });
+        }
+    }
+
+    /// Codex 九轮建议的持续回归：健康但慢（1.2s）的授权观察在 3s 预算下
+    /// 完成替换——真实 Pingora 栈，验证预算下限（945dd465）不被回退。
+    #[tokio::test]
+    async fn standby_slow_observation_still_replaces_within_auth_budget() {
+        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake standby backend");
+        let backend_addr = backend_listener.local_addr().expect("backend addr");
+        tokio::spawn(spawn_fake_standby_backend(backend_listener));
+        let proxy_reservation =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("reserve proxy port");
+        let proxy_port = proxy_reservation
+            .local_addr()
+            .expect("proxy address")
+            .port();
+        drop(proxy_reservation);
+
+        let mut manager = PingoraServerManager::new(ProxyConfig::with_listen_port(proxy_port))
+            .with_wake_control(Arc::new(RunningWakeControl));
+        manager
+            .service
+            .set_error_pages(Arc::new(crate::error_page::ErrorPageRenderer::new(None)));
+        #[cfg(feature = "deploy-host")]
+        let backend_host = {
+            let host = format!("slowcase-backend-{}", backend_addr.port());
+            shared_types::published::register_port(&host, backend_addr.port(), backend_addr.port());
+            host
+        };
+        #[cfg(not(feature = "deploy-host"))]
+        let backend_host = "127.0.0.1".to_string();
+        manager
+            .service
+            .add_app_backend("slowcase", backend_addr.port(), backend_host);
+        manager
+            .service
+            .set_failure_advisor(Arc::new(SlowConfirmedAdvisor {
+                observe_delay: Duration::from_millis(1200),
+            }));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let proxy_task = tokio::spawn(async move { manager.start(shutdown_rx).await });
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let path = "/api/v1/userapp/proxy/app/prod/u1/slowcase/";
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+            .await
+            .expect("connect proxy");
+        stream
+            .write_all(
+                format!(
+                    "GET {path} HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Dest: document\r\nAccept: text/html\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("send");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(15), stream.read_to_end(&mut response))
+            .await
+            .expect("deadline")
+            .expect("read");
+        let document = String::from_utf8_lossy(&response).to_string();
+        assert!(document.starts_with("HTTP/1.1 503"), "{document}");
+        assert!(
+            document
+                .to_ascii_lowercase()
+                .contains("content-type: text/html; charset=utf-8"),
+            "slow (1.2s) confirmed observation must still replace: {document}"
+        );
+        assert!(
+            !document.contains("service stopped or restarting"),
+            "original standby body must not leak: {document}"
+        );
+        shutdown_tx.send(()).unwrap();
+        proxy_task.await.unwrap().unwrap();
+    }
+
     /// 探测即失败的 wake control：remote_wake_pending_result 携带给定错误码
     /// 的 WakeFailure，触发 request_filter 的 respond_wake_failure 出口。
     struct ProbeFailingWakeControl(shared_types::WakeFailure);
