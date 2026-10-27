@@ -183,7 +183,8 @@ impl KubernetesRuntime {
             // Lease absent: the same receipt may still address a legacy
             // ConfigMap lease (validate/release both fall back), so absence
             // can only be declared after that fallback also finds nothing.
-            // A live identity-matching ConfigMap stays Held (no TTL to read).
+            // A retained identity-matching ConfigMap stays conservatively Held
+            // (no TTL to read); this does not prove its holder process is alive.
             return if self
                 .validate_captured_configmap(context, service_type, name, receipt)
                 .await?
@@ -191,8 +192,8 @@ impl KubernetesRuntime {
                 Ok(AppOperationLeaseObservation::Held)
             } else {
                 // Both object forms checked and absent: this backend DID
-                // check, so absence is a positive observation — no holder can
-                // renew what no longer exists. Unconfirmed stays reserved for
+                // check, so absence is a positive observation. It says nothing
+                // about already-issued writes. Unconfirmed stays reserved for
                 // backends that cannot check at all.
                 Ok(AppOperationLeaseObservation::AbsentOriginalIdentity)
             };

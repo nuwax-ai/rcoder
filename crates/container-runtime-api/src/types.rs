@@ -12,8 +12,9 @@ use crate::ContainerRuntime;
 pub use shared_types::{AgentWorkspaceIdentity, VerifiedAgentReplacement};
 
 /// Observation of an original coordinator lease, separate from write authority.
-/// No persisted or HTTP representation: unsupported/absent observations stay
-/// unconfirmed, while expiry alone never proves a completed runtime mutation.
+/// No persisted or HTTP representation. Unsupported backends stay unconfirmed;
+/// observed absence and expiry never prove a completed runtime mutation or
+/// authorize a write by themselves.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppOperationLeaseObservation {
     Held,

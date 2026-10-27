@@ -234,7 +234,7 @@ async fn original_lease_observation_is_read_only_and_distinguishes_expiry_from_i
                         "foreign-app".into()
                 }
                 // 14-16：Lease 缺席后的 legacy ConfigMap fallback 观察。
-                14 | 15 | 16 => {
+                14..=16 => {
                     code = 404;
                     lease = status(404, "absent");
                 }
@@ -278,24 +278,32 @@ async fn original_lease_observation_is_read_only_and_distinguishes_expiry_from_i
             }
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
-            let needs_configmap = matches!(variant, 10 | 14 | 15 | 16);
+            let needs_configmap = matches!(variant, 10 | 14..=16);
             let server = tokio::spawn(async move {
-                let mut replies = vec![(code, lease)];
+                let mut replies = vec![(
+                    "GET /apis/coordination.k8s.io/v1/namespaces/lease-test/leases/rcoder-operation-prod-takeover HTTP/1.1",
+                    code,
+                    lease,
+                )];
                 if needs_configmap {
-                    replies.push((configmap_code, configmap_body));
+                    replies.push((
+                        "GET /api/v1/namespaces/lease-test/configmaps/rcoder-operation-prod-takeover HTTP/1.1",
+                        configmap_code,
+                        configmap_body,
+                    ));
                 }
-                for (reply_code, reply_body) in replies {
+                for (expected_request, reply_code, reply_body) in replies {
                     let (mut stream, _) = listener.accept().await.unwrap();
                     let (head, body) = read_request(&mut stream).await;
-                    assert!(head.starts_with("GET "), "observation is read-only: {head}");
-                    assert!(
-                        head.contains("/leases/rcoder-operation-prod-takeover")
-                            || head.contains("/configmaps/rcoder-operation-prod-takeover"),
-                        "unexpected observation path: {head}"
+                    assert_eq!(
+                        head.lines().next(),
+                        Some(expected_request),
+                        "observation must read the expected object in order: {head}"
                     );
                     assert!(body.is_empty(), "observation cannot submit a mutation body");
                     write_reply(&mut stream, reply_code, &reply_body).await;
                 }
+                observed_expired_tests::reject_additional_request(&listener).await;
             });
             let runtime = runtime_for(client_for(address).await);
             let receipt = shared_types::UserAppOperationLeaseReceipt::Kubernetes {
