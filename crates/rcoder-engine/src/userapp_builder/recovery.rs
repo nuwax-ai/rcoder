@@ -3,6 +3,8 @@ mod compute;
 mod discovery;
 #[cfg(test)]
 mod hot_tests;
+#[cfg(all(test, feature = "userapp-turso"))]
+mod interrupted_update_tests;
 #[cfg(test)]
 mod predecessor_timeout_tests;
 use crate::app_state::AppState;
@@ -322,6 +324,41 @@ async fn discover(
                 return Ok(());
             }
             *cursor = Some(operation.operation_id.clone());
+            if shared_types::userapp_operation_has_deployment_update_receipt(&operation)
+                && tasks.remaining_capacity() >= 2
+            {
+                let state = state.clone();
+                let operation = operation.clone();
+                tasks.push(
+                    format!("deployment-update-expire:{}", operation.operation_id),
+                    async move {
+                        with_stall_budget("expire returned deployment update", async {
+                            // Normal rollout/preflight observations must not contend
+                            // for a write transaction before their original budget ends.
+                            let deadline = state
+                                .userapp_store
+                                .operation_deadline(&operation.app_id, &operation.operation_id)
+                                .await?;
+                            if deadline.is_none_or(|deadline| {
+                                deadline > chrono::Utc::now().timestamp_millis()
+                            }) {
+                                return Ok(());
+                            }
+                            match state
+                                .userapp_store
+                                .expire_deployment_update(&operation)
+                                .await
+                            {
+                                Ok(_) | Err(shared_types::UserAppStoreError::VersionConflict) => {
+                                    Ok(())
+                                }
+                                Err(error) => Err(error.into()),
+                            }
+                        })
+                        .await?
+                    },
+                );
+            }
             if operation.state == UserAppOperationState::RecoveryRequired
                 && operation.kind == UserAppOperationKind::StartDeployment
                 && operation.step == "creating_runtime"

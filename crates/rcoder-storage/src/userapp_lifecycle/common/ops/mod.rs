@@ -59,6 +59,7 @@ fn validate_input(
 
 mod application;
 mod deletion_recovery;
+mod deployment_update;
 mod hot_recovery;
 mod observed;
 mod operation;
@@ -66,6 +67,7 @@ mod recovery;
 
 pub(crate) use application::*;
 pub(crate) use deletion_recovery::*;
+pub(crate) use deployment_update::*;
 pub(crate) use hot_recovery::*;
 pub(crate) use observed::*;
 pub(crate) use operation::*;

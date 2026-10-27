@@ -23,6 +23,8 @@ mod compute;
 #[cfg(all(test, any(feature = "userapp-turso", feature = "pg")))]
 mod compute_deadline_tests;
 mod compute_execution;
+#[cfg(all(test, any(feature = "userapp-turso", feature = "pg")))]
+mod compute_interrupted_update_tests;
 mod compute_recovery;
 #[cfg(all(test, feature = "userapp-turso"))]
 mod compute_tests;
@@ -318,6 +320,17 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
             Box::pin(async move {
                 compute_execution::finalize_interrupted(tx, backend, &identity, &snapshot).await
             })
+        })
+        .await
+    }
+
+    async fn expire_deployment_update(
+        &self,
+        snapshot: &UserAppOperationRecord,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move { ops::expire_deployment_update(tx, backend, &snapshot).await })
         })
         .await
     }

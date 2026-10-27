@@ -108,6 +108,91 @@ pub fn userapp_operation_has_drain_evidence(operation: &crate::UserAppOperationR
             .is_ok_and(|evidence| evidence.validate_operation(operation).is_ok()))
 }
 
+/// A returned configuration update, not completion of the whole deployment.
+/// The expiry transaction must additionally verify the original private input
+/// with `userapp_deployment_update_precedes_credentials` before retiring it.
+pub fn userapp_operation_has_deployment_update_receipt(
+    operation: &crate::UserAppOperationRecord,
+) -> bool {
+    let Some(command @ crate::UserAppControlCommand::Deploy { .. }) = operation.command.as_ref()
+    else {
+        return false;
+    };
+    if command.kind() != operation.kind
+        || operation.scope != crate::UserAppOperationScope::Prod
+        || operation.step != "runtime_updated"
+        || operation.checkpoint.get("storage_target") != Some(&serde_json::Value::Null)
+        || operation.checkpoint.get("requested_storage_size") != Some(&serde_json::Value::Null)
+    {
+        return false;
+    }
+    let Some(target) = operation.checkpoint.get("target").and_then(|value| {
+        serde_json::from_value::<crate::UserAppMutationTarget>(value.clone()).ok()
+    }) else {
+        return false;
+    };
+    target.context.app_id == operation.app_id
+        && target.context.validate_identity(&operation.app_id).is_ok()
+        && target.context.lifecycle_id == operation.lifecycle_id
+        && target.context.operation_id == operation.operation_id
+        && Some(&target.context.executor_id) == operation.executor_id.as_ref()
+        && target.context.request_fingerprint == operation.request_fingerprint
+        && target.resource.kind == crate::AppResourceKind::Deployment
+        && !target.resource.name.is_empty()
+        && !target.resource.uid.is_empty()
+        && target
+            .resource
+            .resource_version
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        && operation
+            .checkpoint
+            .pointer("/resource/project_id")
+            .and_then(|value| value.as_str())
+            == Some(operation.app_id.as_str())
+        && operation
+            .checkpoint
+            .pointer("/resource/container_id")
+            .and_then(|value| value.as_str())
+            == Some(target.resource.name.as_str())
+}
+
+/// DeployInput v1 has always persisted `explicit_pg_applying` before issuing
+/// the explicit credential write. With pg present, no later deployment/SQL
+/// write can bypass that checkpoint. Retiring the exact runtime_updated
+/// revision therefore closes future writes without guessing executor liveness.
+/// This must never authorize a successful deployment or replay its input.
+pub fn userapp_deployment_update_precedes_credentials(
+    operation: &crate::UserAppOperationRecord,
+    input: &crate::UserAppExecutionInput,
+) -> bool {
+    if !userapp_operation_has_deployment_update_receipt(operation) {
+        return false;
+    }
+    let Some(crate::UserAppControlCommand::Deploy {
+        restart,
+        input_digest,
+        ..
+    }) = operation.command.as_ref()
+    else {
+        return false;
+    };
+    if *input_digest != input.digest() {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(input.encoded()) else {
+        return false;
+    };
+    value.get("version").and_then(|value| value.as_u64()) == Some(1)
+        && value.get("restart").and_then(|value| value.as_bool()) == Some(*restart)
+        && value.get("params").is_some_and(|value| value.is_object())
+        && value.get("previous").is_some_and(|value| value.is_object())
+        && value.pointer("/request/pg").is_some_and(|value| {
+            serde_json::from_value::<crate::StartPgCredential>(value.clone())
+                .is_ok_and(|pg| !pg.username.is_empty() && !pg.password.is_empty())
+        })
+}
+
 /// A final durable checkpoint is proof of completed effects, never a license to
 /// repeat earlier I/O. Recovery may only release its original mutex and commit.
 pub fn userapp_operation_has_final_evidence(operation: &crate::UserAppOperationRecord) -> bool {

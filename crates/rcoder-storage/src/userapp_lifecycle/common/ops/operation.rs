@@ -80,7 +80,7 @@ pub(crate) async fn read_recovery_execution_input(
     validated_execution_input(tx, &op).await
 }
 
-async fn validated_execution_input(
+pub(crate) async fn validated_execution_input(
     tx: &mut dyn Executor,
     op: &UserAppOperationRecord,
 ) -> Result<UserAppExecutionInput, Error> {

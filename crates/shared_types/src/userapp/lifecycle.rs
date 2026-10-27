@@ -1077,6 +1077,14 @@ pub trait UserAppLifecycleStore: Send + Sync {
         snapshot: &UserAppOperationRecord,
     ) -> Result<UserAppOperationRecord, UserAppStoreError>;
 
+    /// Fail an expired deployment only at its returned configuration-update
+    /// boundary, when original input proves the next write must first replace
+    /// this exact checkpoint. Never replays deployment or database writes.
+    async fn expire_deployment_update(
+        &self,
+        snapshot: &UserAppOperationRecord,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError>;
+
     /// Revoke an early executor by exact snapshot CAS, preserving its receipt.
     async fn reserve_compute_drain_recovery(
         &self,
