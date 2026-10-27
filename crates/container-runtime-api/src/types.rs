@@ -18,6 +18,14 @@ pub use shared_types::{AgentWorkspaceIdentity, VerifiedAgentReplacement};
 pub enum AppOperationLeaseObservation {
     Held,
     ExpiredOriginalIdentity,
+    /// The receipt's own runtime object is verifiably absent at observation
+    /// time (backend checked both the Lease and legacy ConfigMap forms and
+    /// found nothing under the recorded name/scope). Distinct from
+    /// `Unconfirmed`, which also covers backends that cannot check.
+    /// This proves ONLY the object's absence then: it does not prove the
+    /// holder process exited, does not prove already-issued writes have
+    /// settled, and never authorizes drain or takeover by itself.
+    AbsentOriginalIdentity,
     Unconfirmed,
 }
 

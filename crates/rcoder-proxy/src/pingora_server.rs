@@ -962,8 +962,13 @@ mod tests {
             stage: &str,
             budget: Duration,
         ) -> Option<crate::error_page::UserAppProxyFailureHint> {
-            tokio::time::sleep(self.observe_delay).await;
-            self.advise(app_id, stage, budget).await
+            // 遵守调用方预算：观察超过 budget 即返回 None（生产语义——预算
+            // 耗尽的 advisor 不产出确认）。否则预算被误改回 1s 时本桩仍会
+            // 在 1.2s 后返回确认，回归测试就失去了钉住预算的作用。
+            match tokio::time::timeout(budget, tokio::time::sleep(self.observe_delay)).await {
+                Ok(()) => self.advise(app_id, stage, budget).await,
+                Err(_) => None,
+            }
         }
         async fn standby_origin(
             &self,

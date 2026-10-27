@@ -154,7 +154,7 @@ async fn client_for(address: std::net::SocketAddr) -> kube::Client {
 async fn original_lease_observation_is_read_only_and_distinguishes_expiry_from_identity() {
     use container_runtime_api::AppOperationLeaseObservation;
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        for variant in 0..14 {
+        for variant in 0..17 {
             let context = context_for("takeover", "original-op");
             let mut lease = lease_json("original-uid", "99", Some(&context.operation_id), 3600, 0);
             let annotations = lease["metadata"]["annotations"].as_object_mut().unwrap();
@@ -233,20 +233,69 @@ async fn original_lease_observation_is_read_only_and_distinguishes_expiry_from_i
                     lease["metadata"]["annotations"]["rcoder.io/application-id"] =
                         "foreign-app".into()
                 }
+                // 14-16：Lease 缺席后的 legacy ConfigMap fallback 观察。
+                14 | 15 | 16 => {
+                    code = 404;
+                    lease = status(404, "absent");
+                }
                 _ => unreachable!(),
+            }
+            // ConfigMap fallback 应答（仅 Lease 404 的 variant 会触发第二个 GET）。
+            let configmap = serde_json::json!({
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": {
+                    "name": "rcoder-operation-prod-takeover",
+                    "namespace": "lease-test",
+                    "uid": "original-uid",
+                    "resourceVersion": "old-acquisition-rv",
+                    "labels": {
+                        "rcoder.io/operation-app": "takeover",
+                        "rcoder.io/operation-family": ServiceType::Userapp.to_string(),
+                    },
+                    "annotations": {
+                        "rcoder.io/legacy-operation-id": token,
+                    },
+                },
+            });
+            let mut configmap_code = 200;
+            let mut configmap_body = configmap.clone();
+            match variant {
+                10 | 15 => {
+                    if variant == 15 {
+                        configmap_code = 200;
+                        configmap_body["metadata"]["annotations"]["rcoder.io/legacy-operation-id"] =
+                            "successor-token".into();
+                    } else {
+                        configmap_code = 404;
+                        configmap_body = status(404, "absent");
+                    }
+                }
+                16 => {
+                    configmap_code = 500;
+                    configmap_body = status(500, "transport unavailable");
+                }
+                _ => {}
             }
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
+            let needs_configmap = matches!(variant, 10 | 14 | 15 | 16);
             let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let (head, body) = read_request(&mut stream).await;
-                assert!(
-                    head.starts_with("GET ")
-                        && head.contains("/leases/rcoder-operation-prod-takeover"),
-                    "{head}"
-                );
-                assert!(body.is_empty(), "observation cannot submit a mutation body");
-                write_reply(&mut stream, code, &lease).await;
+                let mut replies = vec![(code, lease)];
+                if needs_configmap {
+                    replies.push((configmap_code, configmap_body));
+                }
+                for (reply_code, reply_body) in replies {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let (head, body) = read_request(&mut stream).await;
+                    assert!(head.starts_with("GET "), "observation is read-only: {head}");
+                    assert!(
+                        head.contains("/leases/rcoder-operation-prod-takeover")
+                            || head.contains("/configmaps/rcoder-operation-prod-takeover"),
+                        "unexpected observation path: {head}"
+                    );
+                    assert!(body.is_empty(), "observation cannot submit a mutation body");
+                    write_reply(&mut stream, reply_code, &reply_body).await;
+                }
             });
             let runtime = runtime_for(client_for(address).await);
             let receipt = shared_types::UserAppOperationLeaseReceipt::Kubernetes {
@@ -265,8 +314,11 @@ async fn original_lease_observation_is_read_only_and_distinguishes_expiry_from_i
                     result.unwrap(),
                     AppOperationLeaseObservation::ExpiredOriginalIdentity
                 ),
-                1 => assert_eq!(result.unwrap(), AppOperationLeaseObservation::Held),
-                10 => assert_eq!(result.unwrap(), AppOperationLeaseObservation::Unconfirmed),
+                1 | 14 => assert_eq!(result.unwrap(), AppOperationLeaseObservation::Held),
+                10 => assert_eq!(
+                    result.unwrap(),
+                    AppOperationLeaseObservation::AbsentOriginalIdentity
+                ),
                 _ => assert!(
                     result.is_err(),
                     "variant {variant} unexpectedly granted observation: {result:?}"

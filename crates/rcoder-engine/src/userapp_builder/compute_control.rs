@@ -688,7 +688,8 @@ async fn require_original_lease_identity(
     {
         AppOperationLeaseObservation::Held
         | AppOperationLeaseObservation::ExpiredOriginalIdentity => true,
-        AppOperationLeaseObservation::Unconfirmed => false,
+        AppOperationLeaseObservation::AbsentOriginalIdentity
+        | AppOperationLeaseObservation::Unconfirmed => false,
     };
     ensure!(
         confirmed,

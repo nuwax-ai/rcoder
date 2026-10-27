@@ -127,7 +127,8 @@ impl KubernetesRuntime {
                     return Ok(ComputeHandoff::Held);
                 }
                 container_runtime_api::AppOperationLeaseObservation::ExpiredOriginalIdentity => {}
-                container_runtime_api::AppOperationLeaseObservation::Unconfirmed => {
+                container_runtime_api::AppOperationLeaseObservation::AbsentOriginalIdentity
+                | container_runtime_api::AppOperationLeaseObservation::Unconfirmed => {
                     return Ok(ComputeHandoff::deferred(IdentityChanged(
                         "Original compute handoff is unconfirmed".into(),
                     )));

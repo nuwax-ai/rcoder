@@ -108,6 +108,18 @@ async fn bound_legacy_hot_lease_observation_accepts_expiry_without_granting_a_wr
                     "transport" => write_reply(&mut stream, 500, &status(500, "unavailable")).await,
                     _ => write_reply(&mut stream, 200, &lease).await,
                 }
+                if variant == "absent" {
+                    // Lease 缺席后的 legacy ConfigMap fallback：仍为只读 GET。
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let (head, body) = read_request(&mut stream).await;
+                    assert!(
+                        head.starts_with("GET ")
+                            && head.contains("/configmaps/rcoder-operation-prod-takeover"),
+                        "fallback must stay read-only: {head}"
+                    );
+                    assert!(body.is_empty());
+                    write_reply(&mut stream, 404, &status(404, "gone")).await;
+                }
                 observed_expired_tests::reject_additional_request(&listener).await;
             });
             let receipt = shared_types::UserAppOperationLeaseReceipt::Kubernetes {
@@ -127,7 +139,10 @@ async fn bound_legacy_hot_lease_observation_accepts_expiry_without_granting_a_wr
                     AppOperationLeaseObservation::ExpiredOriginalIdentity
                 ),
                 "held" => assert_eq!(result.unwrap(), AppOperationLeaseObservation::Held),
-                "absent" => assert_eq!(result.unwrap(), AppOperationLeaseObservation::Unconfirmed),
+                "absent" => assert_eq!(
+                    result.unwrap(),
+                    AppOperationLeaseObservation::AbsentOriginalIdentity
+                ),
                 _ => assert!(result.is_err(), "{variant}: {result:?}"),
             }
             server.await.unwrap();

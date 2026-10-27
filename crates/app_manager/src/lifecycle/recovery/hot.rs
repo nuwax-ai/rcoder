@@ -34,6 +34,7 @@ impl AppService {
                 match self.observe_hot_lease(&operation, &binding).await? {
                     container_runtime_api::AppOperationLeaseObservation::ExpiredOriginalIdentity => {}
                     container_runtime_api::AppOperationLeaseObservation::Held
+                    | container_runtime_api::AppOperationLeaseObservation::AbsentOriginalIdentity
                     | container_runtime_api::AppOperationLeaseObservation::Unconfirmed => return Ok(false),
                 }
                 operation = self
@@ -83,7 +84,10 @@ impl AppService {
                 match observation {
                     container_runtime_api::AppOperationLeaseObservation::Held
                     | container_runtime_api::AppOperationLeaseObservation::ExpiredOriginalIdentity => Ok(observation),
-                    container_runtime_api::AppOperationLeaseObservation::Unconfirmed => {
+                    // Absent 与 Unconfirmed 同桶：缺席/不确定都不授予恢复继续权；
+                    // legacy validate 对不存在的对象返回 false，自然落入 Unconfirmed。
+                    container_runtime_api::AppOperationLeaseObservation::AbsentOriginalIdentity
+                    | container_runtime_api::AppOperationLeaseObservation::Unconfirmed => {
                         // Pre-Lease ConfigMap receipts have no TTL observation.
                         // Preserve their original exact validation; a native
                         // successor conflict above must never enter this path.
@@ -125,7 +129,8 @@ impl AppService {
             | container_runtime_api::AppOperationLeaseObservation::ExpiredOriginalIdentity => {
                 Ok(())
             }
-            container_runtime_api::AppOperationLeaseObservation::Unconfirmed => {
+            container_runtime_api::AppOperationLeaseObservation::AbsentOriginalIdentity
+            | container_runtime_api::AppOperationLeaseObservation::Unconfirmed => {
                 Err(AppOperationError::Conflict(
                     "Original hot recovery lease identity is unconfirmed".into(),
                 ))
