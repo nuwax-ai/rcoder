@@ -1040,10 +1040,16 @@ impl PortProxy {
                 return;
             }
             // 授权观察：成功确认才替换；显式否定或超时（None）都透传。
+            // 预算下限 3s（Codex 八轮）：standby 窗口的请求**已拿到上游响应**，
+            // 观察延迟的是错误页呈现而非代理等待——原 1s 上限是为"不延长
+            // 代理等待"设的，对本场景不适用；真实慢观察（定位+拉取+复核，
+            // 实测 1.2s）需要更大预算才能拿到授权。>3s 的观察环境持续透传
+            //（保守正确的显式产品取舍：正确性优先于友好页可用性）。
+            let auth_budget = budget.max(Duration::from_secs(3));
             match advisor.as_ref() {
                 Some(advisor) => {
                     let fresh = advisor
-                        .advise_current(&route.app_id, route.stage, budget)
+                        .advise_current(&route.app_id, route.stage, auth_budget)
                         .await;
                     match fresh {
                         Some(h) if h.error_origin_confirmed => Some(h),

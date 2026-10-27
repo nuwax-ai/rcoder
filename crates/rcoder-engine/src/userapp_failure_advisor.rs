@@ -19,8 +19,10 @@ use crate::app_state::AppState;
 
 /// 提示缓存 TTL（错误风暴下的观察穿透上限；非 SLA）。
 const HINT_TTL: Duration = Duration::from_secs(30);
-/// 单次观察预算上限（失败路径诊断绝不拖长代理等待）。
-const ADVISE_BUDGET_CAP: Duration = Duration::from_secs(2);
+/// 单次观察预算上限。普通失败路径由调用方 min 钳制（1~1.5s，不拖长代理
+/// 等待）；standby 授权观察例外经此上限（3s——上游响应已返回，观察延迟
+/// 的是错误页呈现，慢观察环境需要覆盖，Codex 八轮）。
+const ADVISE_BUDGET_CAP: Duration = Duration::from_secs(4);
 const HINT_CACHE_CAPACITY: usize = 512;
 
 type HintKey = (String, &'static str);
