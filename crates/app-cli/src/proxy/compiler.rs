@@ -755,29 +755,111 @@ pub fn build_standby_from_topology(
     // `X-Pingap-EType: rcoder-standby` 证明响应为入口自产（该窗口无 upstream
     // 代理，应用不可能注入），rcoder-proxy 故障页管线据此替换为友好表示；
     // 业务状态细分（starting/stopped/failed）由就绪观察在错误时刻给出。
-    let body =
-        format!("service stopped or restarting (publication {publication_id}); retry shortly");
-    let plugin: PluginConf = serde_json::from_str(
-        &serde_json::json!({
-            "category": "mock",
-            "status": 503,
-            "headers": [
-                "Retry-After: 2",
-                "Content-Type: text/plain; charset=utf-8",
-                "Cache-Control: no-store",
-                "X-Rcoder-Publication: ".to_string() + publication_id,
-                "X-Pingap-EType: ".to_string() + shared_types::PINGAP_STANDBY_ETYPE,
-            ],
-            "data": body,
-        })
-        .to_string(),
-    )?;
+    // 正文用与 rcoder-proxy 同一套自包含错误页（含 5s meta refresh，无 JS
+    // 依赖）：绕过 rcoder-proxy 替换层的路径（standby-origin 冷缓存首击透传、
+    // 直连预览域名）首击即见可自动恢复的页面，而非裸文本。语言固定 zh-CN
+    // （mock 是发布期静态产物，感知不了请求语言；代理路径由 rcoder-proxy 按
+    // 请求语言覆盖为本地化版本，两者共用同一资产互不冲突）。
+    // pingap 的 PluginConf 是自由键值袋（Map<String, Value>，模型层无插件
+    // 类型）：字段名经 StandbyMockPlugin 在编译期钉住，序列化后落回 PluginConf。
+    let body = standby_error_page(publication_id);
+    let plugin: PluginConf = serde_json::from_value(serde_json::to_value(StandbyMockPlugin {
+        category: "mock",
+        status: 503,
+        headers: vec![
+            "Retry-After: 2".to_string(),
+            "Content-Type: text/html; charset=utf-8".to_string(),
+            "Cache-Control: no-store".to_string(),
+            format!("X-Rcoder-Publication: {publication_id}"),
+            format!("X-Pingap-EType: {}", shared_types::PINGAP_STANDBY_ETYPE),
+        ],
+        data: body,
+    })?)?;
     cfg.plugins.insert("standby".into(), plugin);
     cfg = publication_config(cfg, publication_id, 503)?;
     cfg.validate().context("validate standby Pingap config")?;
     let expected_hash = cfg.hash().context("compute standby Pingap config hash")?;
     let content = toml::to_string_pretty(&cfg).context("serialize standby Pingap config")?;
     Ok((content, expected_hash))
+}
+
+/// standby 兜底页与 rcoder-proxy 的用户错误页共用同一资产；占位符按
+/// restarting 档（"启动或重启"）渲染，诊断编号直接用发布 ID（可定位具体
+/// 一次摘流发布）。UI 标签清单与 rcoder-proxy error_page::UI_LABELS 保持
+/// 同步；`standby_page_renders_without_placeholders` 测试兜底防漂移。
+const STANDBY_PAGE_TEMPLATE: &str =
+    include_str!("../../../rcoder-proxy/assets/userapp-error-default.html");
+
+const STANDBY_PAGE_LOCALE: &str = "zh-CN";
+
+/// standby 兜底 mock 插件的字段契约（pingap PluginConf 是 Map<String, Value>
+/// 自由键值袋，模型层无类型；本地结构体把字段名钉在编译期，键名拼写错误
+/// 直接编译失败而不是静默产出不生效的 mock）。
+#[derive(Debug, serde::Serialize)]
+struct StandbyMockPlugin<'a> {
+    category: &'a str,
+    status: u16,
+    headers: Vec<String>,
+    data: String,
+}
+
+fn standby_error_page(publication_id: &str) -> String {
+    let locale = STANDBY_PAGE_LOCALE;
+    let slug = "restarting";
+    let mut page = STANDBY_PAGE_TEMPLATE
+        .replace(
+            "{{RCODER_TITLE}}",
+            &shared_types::t(&format!("userapp_error_page.{slug}.title"), locale),
+        )
+        .replace(
+            "{{RCODER_MESSAGE}}",
+            &shared_types::t(&format!("userapp_error_page.{slug}.message"), locale),
+        )
+        .replace("{{RCODER_DIAGNOSTIC_ID}}", publication_id)
+        .replace("{{RCODER_STATUS}}", "503")
+        .replace("{{RCODER_LANG}}", locale)
+        .replace("{{RCODER_CAUSE}}", slug);
+    const UI_LABELS: [(&str, &str); 16] = [
+        ("{{RCODER_UI_BROWSER}}", "browser"),
+        ("{{RCODER_UI_CONNECTED}}", "connected"),
+        ("{{RCODER_UI_GATEWAY}}", "gateway"),
+        ("{{RCODER_UI_NORMAL}}", "normal"),
+        ("{{RCODER_UI_APP}}", "app_service"),
+        ("{{RCODER_UI_UNAVAILABLE}}", "unavailable"),
+        ("{{RCODER_UI_STARTING}}", "starting"),
+        ("{{RCODER_UI_STOPPED}}", "stopped"),
+        ("{{RCODER_UI_STOPPING}}", "stopping"),
+        ("{{RCODER_UI_FAILED}}", "failed"),
+        ("{{RCODER_UI_PREPARING}}", "preparing"),
+        ("{{RCODER_UI_RELOAD}}", "reload"),
+        ("{{RCODER_UI_HINT}}", "hint"),
+        ("{{RCODER_UI_COPY}}", "copy"),
+        ("{{RCODER_UI_COPIED}}", "copied"),
+        ("{{RCODER_UI_ARIA}}", "aria_chain"),
+    ];
+    for (placeholder, key) in UI_LABELS {
+        let text = shared_types::t(&format!("userapp_error_page.ui.{key}"), locale);
+        page = page.replace(placeholder, &text);
+    }
+    page
+}
+
+#[cfg(test)]
+mod standby_page_tests {
+    use super::standby_error_page;
+
+    /// 资产与 rcoder-proxy 共用：对方新增占位符而本清单未跟时，此处立即
+    /// 失败（裸 `{{RCODER_*}}` 直出浏览器）。
+    #[test]
+    fn standby_page_renders_without_placeholders() {
+        let page = standby_error_page("pub-123");
+        assert!(page.contains("http-equiv=\"refresh\""), "missing meta refresh");
+        assert!(page.contains("pub-123"), "publication id not rendered");
+        assert!(
+            !page.contains("{{RCODER_"),
+            "unresolved placeholder leaked into standby page"
+        );
+    }
 }
 
 /// 常驻热载兼容校验（P1 T15）：对比当前 active 与新候选的 server 拓扑。
