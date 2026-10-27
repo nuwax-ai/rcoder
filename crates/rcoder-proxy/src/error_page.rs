@@ -362,12 +362,13 @@ pub trait UserAppProxyFailureAdvisor: Send + Sync {
         None
     }
 
-    /// standby 摘流窗口的轻量来源判定（与文案观察分离，Codex P2）。
+    /// standby 摘流窗口的轻量来源判定（与文案观察分离，Codex P2/七轮）。
     ///
-    /// `Confirmed` = 托管来源已确认（可替换正文）；`Unconfirmed` = 明确未
-    /// 确认（custom/旧配置或显式否定——原样透传，应用伪造标记不换页）；
-    /// `Unknown` = 观察不可得/未预热（实现方应触发后台预热；本请求原样
-    /// 透传，浏览器按 Retry-After 重试后命中预热结果）。
+    /// 三态只做**路由**：`Confirmed` = 近期观察确认过托管来源（值得花预算
+    /// 做当次新鲜确认——不直接授权替换）；`Unconfirmed` = 明确未确认
+    /// （custom/旧配置或显式否定——透传省预算，应用伪造标记不换页）；
+    /// `Unknown` = 观察不可得/未预热（实现方应触发后台预热；本请求透传，
+    /// 后续请求命中）。替换授权只能来自当次新鲜观察的成功确认。
     async fn standby_origin(&self, _app_id: &str, _stage: &str) -> StandbyOrigin {
         StandbyOrigin::Unknown
     }
@@ -376,7 +377,8 @@ pub trait UserAppProxyFailureAdvisor: Send + Sync {
 /// [`UserAppProxyFailureAdvisor::standby_origin`] 的三态判定。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StandbyOrigin {
-    /// 托管来源已确认（含代次绑定），可替换正文。
+    /// 近期观察确认过托管来源（owner 绑定缓存命中）：值得花预算做当次
+    /// 新鲜确认——**不直接授权替换**（授权来自新鲜观察的成功）。
     Confirmed,
     /// 明确未确认（custom/旧配置或显式否定）：原样透传。
     Unconfirmed,
