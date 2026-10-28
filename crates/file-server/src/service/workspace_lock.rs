@@ -1,8 +1,16 @@
+//! 工作区级互斥锁（进程内 tokio Mutex 注册表 + OS 文件锁双层）。
+//!
+//! 锁文件固定为 `{workspace}/.agents/.skill-preservation.lock`：同一工作区的
+//! 保留恢复重建（`computer_ws::preservation`）、技能 fan-out（`service::skills`）
+//! 与启动 reconciler 共用一把锁，跨进程（多 Main 副本共享存储）靠 flock 串行。
+//! 锁文件保留 inode、永不 rename/remove；关闭句柄即释放，崩溃后由 OS 释放。
+
 use std::{
     collections::HashMap,
     fs::File,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex, Weak},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -199,42 +207,26 @@ impl PhysicalLock {
     }
 }
 
-pub(in crate::service::computer_ws) struct WorkspaceGuard {
+pub(super) struct WorkspaceGuard {
     physical: PhysicalLock,
     _local: OwnedMutexGuard<()>,
 }
 
 impl WorkspaceGuard {
-    pub(in crate::service::computer_ws) fn root(&self) -> &Path {
+    pub(super) fn root(&self) -> &Path {
         &self.physical.root
     }
 
-    pub(in crate::service::computer_ws) fn validate(&self) -> AppResult<()> {
+    pub(super) fn validate(&self) -> AppResult<()> {
         self.physical.validate()
     }
 }
 
-pub(in crate::service::computer_ws) async fn acquire(
-    workspace: &Path,
-) -> AppResult<WorkspaceGuard> {
+/// 无界获取：竞争时持续重试直到成功（保留恢复历史语义）。
+pub(super) async fn acquire(workspace: &Path) -> AppResult<WorkspaceGuard> {
     tokio::fs::create_dir_all(workspace).await?;
     let root = tokio::fs::canonicalize(workspace).await?;
-    static LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> =
-        LazyLock::new(|| Mutex::new(HashMap::new()));
-    let mutex = {
-        let mut locks = LOCKS
-            .lock()
-            .map_err(|_| AppError::system("workspace preservation lock registry is poisoned"))?;
-        locks.retain(|_, mutex| mutex.strong_count() > 0);
-        match locks.get(&root).and_then(Weak::upgrade) {
-            Some(mutex) => mutex,
-            None => {
-                let mutex = Arc::new(tokio::sync::Mutex::new(()));
-                locks.insert(root.clone(), Arc::downgrade(&mutex));
-                mutex
-            }
-        }
-    };
+    let mutex = local_mutex(&root)?;
     let local = mutex.lock_owned().await;
     loop {
         let path = root.clone();
@@ -249,6 +241,65 @@ pub(in crate::service::computer_ws) async fn acquire(
                 _local: local,
             });
         }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// 有界获取：`wait` 内未获得 → `Ok(None)`（busy）。本地互斥与物理文件锁
+/// **两层都必须有界**——tokio Mutex 不可重入，同进程另一任务持锁时
+/// `lock_owned().await` 会在 deadline 生效前就无限阻塞。
+pub(super) async fn acquire_for(
+    workspace: &Path,
+    wait: Duration,
+) -> AppResult<Option<WorkspaceGuard>> {
+    tokio::fs::create_dir_all(workspace).await?;
+    let root = tokio::fs::canonicalize(workspace).await?;
+    let mutex = local_mutex(&root)?;
+    let deadline = std::time::Instant::now().checked_add(wait);
+    let local = loop {
+        // try_lock_owned 消耗 Arc<Self>, 每次尝试用克隆
+        if let Ok(local) = mutex.clone().try_lock_owned() {
+            break local;
+        }
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    loop {
+        let path = root.clone();
+        let physical = tokio::task::spawn_blocking(move || try_physical_lock(&path))
+            .await
+            .map_err(|error| {
+                AppError::system(format!("preservation lock worker interrupted: {error}"))
+            })??;
+        if let Some(physical) = physical {
+            return Ok(Some(WorkspaceGuard {
+                physical,
+                _local: local,
+            }));
+        }
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// 进程内互斥注册表（按 canonical root 归一，Weak 清理失效项）。
+fn local_mutex(root: &Path) -> AppResult<Arc<tokio::sync::Mutex<()>>> {
+    static LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut locks = LOCKS
+        .lock()
+        .map_err(|_| AppError::system("workspace preservation lock registry is poisoned"))?;
+    locks.retain(|_, mutex| mutex.strong_count() > 0);
+    match locks.get(root).and_then(Weak::upgrade) {
+        Some(mutex) => Ok(mutex),
+        None => {
+            let mutex = Arc::new(tokio::sync::Mutex::new(()));
+            locks.insert(root.to_path_buf(), Arc::downgrade(&mutex));
+            Ok(mutex)
+        }
     }
 }

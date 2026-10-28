@@ -26,7 +26,7 @@ ORIGIN_HEAD = os.environ.get('E2E_ORIGIN_HEAD')
 RUN_ROOT = Path(os.environ['E2E_RUN_ROOT']) if os.environ.get('E2E_RUN_ROOT') else ROOT / 'reports'
 GROUPS = {
     'userapp': ['compose_userapp', 'compose_userapp_dev', 'compose_userapp_build_rules', 'compose_userapp_faults', 'compose_userapp_deploy', 'compose_lifecycle', 'pg_storage_faults', 'turso_storage_contract', 'turso_compose_runtime', 'userapp_concurrency_contract', 'native_lifecycle_crash', 'docker_lifecycle_crash'],
-    'compose': ['compose_sse', 'compose_session', 'compose_userapp', 'compose_userapp_dev', 'compose_userapp_build_rules', 'compose_webchat', 'custom_page_preview'],
+    'compose': ['compose_sse', 'compose_session', 'compose_userapp', 'compose_userapp_dev', 'compose_userapp_build_rules', 'compose_webchat', 'custom_page_preview', 'compose_devcomputer'],
     'deploy': ['compose_userapp_deploy'],
     'k8s': ['k8s_lb'],
     'host': ['host_docker_lifecycle'],
@@ -185,6 +185,8 @@ def validate_reports(directory, scenario=None, run_id=None, case_id=None):
             if run_id is not None and any(line.get('test_name') != scenario for line in lines):
                 errors.append(f'{path.name}: canonical test identity mismatch')
             for line in lines:
+                if line.get('kind') == 'chat_request' and line.get('ok') is not True:
+                    errors.append(f"{path.name}: unsuccessful chat request: {line.get('phase', '<missing>')}")
                 if line.get('kind') == 'scenario_begin':
                     identity = (line.get('scenario'), line.get('backend'))
                     if identity in observed_identities:

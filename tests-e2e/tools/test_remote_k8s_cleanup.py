@@ -14,8 +14,14 @@ class RemoteCleanupTests(unittest.TestCase):
                 cleanup.validate(env)
 
     def test_only_exact_case_workloads_deleted_and_pvcs_retained(self):
+        self.check_owned_cleanup('lb')
+
+    def test_stop_resume_case_workloads_deleted_and_pvcs_retained(self):
+        self.check_owned_cleanup('lsr')
+
+    def check_owned_cleanup(self, suffix):
         case, run = 'a' * 32, 'b' * 32
-        identifier = 'ue' + case[:12] + '-lb'
+        identifier = 'ue' + case[:12] + '-' + suffix
         name = 'computer-agent-runner-' + identifier
         labels = {'rcoder.io/identifier': identifier, 'rcoder.io/service-type': 'computer-agent-runner',
                   'app.kubernetes.io/managed-by': 'rcoder-runtime'}

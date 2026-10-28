@@ -13,6 +13,7 @@
 //! 下游不应依赖 `shared_types::userapp::` 路径。
 
 pub mod activity;
+pub mod app_files;
 pub mod app_stage;
 pub mod build_event;
 pub mod builder_instance;

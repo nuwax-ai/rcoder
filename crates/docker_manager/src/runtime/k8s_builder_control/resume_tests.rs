@@ -8,7 +8,9 @@ pub(super) struct ApiState {
     pub(super) sts: serde_json::Value,
     pub(super) pod: serde_json::Value,
     pub(super) service: serde_json::Value,
+    pub(super) headless_service: serde_json::Value,
     pub(super) requests: Vec<String>,
+    admission_fences: Vec<String>,
     replace_uid_on_second_sts_read: bool,
     sts_reads: usize,
     pub(super) advance_status_rv: bool,
@@ -23,11 +25,42 @@ pub(super) struct ApiState {
     pod_seed: serde_json::Value,
     pub(super) extra_pods: Vec<serde_json::Value>,
     resume_replicas_on_second_sts_read: bool,
-    fail_pod_list: bool,
+    zero_replicas_on_second_sts_read: bool,
+    pub(super) fail_pod_list: bool,
     replace_uid_on_sts_read: Option<usize>,
     pub(super) replace_pvc_on_read: Option<usize>,
     pvc_reads: usize,
     fail_next_creation_receipt: bool,
+}
+
+fn without_retirement_fence(mut object: serde_json::Value) -> serde_json::Value {
+    object["metadata"]
+        .as_object_mut()
+        .expect("metadata")
+        .remove("resourceVersion");
+    if let Some(annotations) = object["metadata"]["annotations"].as_object_mut() {
+        annotations.remove("rcoder.io/agent-admission-fence");
+    }
+    object
+}
+
+fn apply_metadata_fence(object: &mut serde_json::Value, patch: &serde_json::Value) {
+    assert_eq!(patch["metadata"]["uid"], object["metadata"]["uid"]);
+    if let Some(version) = patch["metadata"].get("resourceVersion") {
+        assert_eq!(version, &object["metadata"]["resourceVersion"]);
+    }
+    if let Some(annotations) = patch["metadata"]["annotations"].as_object() {
+        for (key, value) in annotations {
+            object["metadata"]["annotations"][key] = value.clone();
+        }
+    }
+    let rv = object["metadata"]["resourceVersion"]
+        .as_str()
+        .expect("RV")
+        .parse::<u64>()
+        .expect("numeric RV")
+        + 1;
+    object["metadata"]["resourceVersion"] = rv.to_string().into();
 }
 
 async fn connection(mut stream: tokio::net::TcpStream, state: Arc<Mutex<ApiState>>) {
@@ -74,6 +107,27 @@ async fn connection(mut stream: tokio::net::TcpStream, state: Arc<Mutex<ApiState
         );
         let mut status = 200;
         let mut lose_response = false;
+        if method == "PATCH" {
+            let patch: serde_json::Value =
+                serde_json::from_slice(request_body).expect("PATCH body");
+            if let Some(nonce) =
+                patch["metadata"]["annotations"]["rcoder.io/agent-admission-fence"].as_str()
+            {
+                assert_eq!(patch.as_object().expect("patch object").len(), 1);
+                assert_eq!(patch["metadata"].as_object().expect("metadata").len(), 3);
+                assert!(patch["metadata"]["uid"].as_str().is_some());
+                assert!(patch["metadata"]["resourceVersion"].as_str().is_some());
+                assert_eq!(
+                    patch["metadata"]["annotations"]
+                        .as_object()
+                        .expect("annotations")
+                        .len(),
+                    1
+                );
+                uuid::Uuid::parse_str(nonce).expect("actual admission nonce");
+                state.admission_fences.push(first.to_owned());
+            }
+        }
         let reply = if method == "POST" && resource_path.ends_with("/leases") {
             let mut lease: serde_json::Value = serde_json::from_slice(request_body).expect("lease");
             let name = lease["metadata"]["name"].as_str().expect("name").to_owned();
@@ -172,6 +226,10 @@ async fn connection(mut stream: tokio::net::TcpStream, state: Arc<Mutex<ApiState
             lose_response = state.lose_next_create_response;
             state.lose_next_create_response = false;
             object
+        } else if method == "GET" && resource_path.ends_with("/persistentvolumeclaims") {
+            serde_json::json!({"apiVersion":"v1","kind":"PersistentVolumeClaimList",
+                "metadata":{"resourceVersion":"5"},
+                "items":if state.pvc.is_null() { vec![] } else { vec![state.pvc.clone()] }})
         } else if resource_path.contains("/persistentvolumeclaims/") {
             state.pvc_reads += 1;
             if state
@@ -191,6 +249,17 @@ async fn connection(mut stream: tokio::net::TcpStream, state: Arc<Mutex<ApiState
                 }
             }
             state.pvc.clone()
+        } else if method == "PATCH"
+            && resource_path.contains("/statefulsets/")
+            && serde_json::from_slice::<serde_json::Value>(request_body)
+                .expect("patch")
+                .get("spec")
+                .is_none()
+        {
+            let patch: serde_json::Value =
+                serde_json::from_slice(request_body).expect("metadata fence");
+            apply_metadata_fence(&mut state.sts, &patch);
+            state.sts.clone()
         } else if method == "PATCH" && resource_path.contains("/statefulsets/") {
             let patch: serde_json::Value = serde_json::from_slice(request_body).expect("patch");
             assert_eq!(patch["metadata"]["uid"], state.sts["metadata"]["uid"]);
@@ -272,6 +341,9 @@ async fn connection(mut stream: tokio::net::TcpStream, state: Arc<Mutex<ApiState
             if state.resume_replicas_on_second_sts_read && state.sts_reads >= 2 {
                 state.sts["spec"]["replicas"] = 1.into();
             }
+            if state.zero_replicas_on_second_sts_read && state.sts_reads >= 2 {
+                state.sts["spec"]["replicas"] = 0.into();
+            }
             if state.advance_status_rv {
                 let rv = state.sts["metadata"]["resourceVersion"]
                     .as_str()
@@ -297,10 +369,17 @@ async fn connection(mut stream: tokio::net::TcpStream, state: Arc<Mutex<ApiState
                 serde_json::json!({"apiVersion":"apps/v1","kind":"StatefulSetList","metadata":{"resourceVersion":"8"},"items":if state.sts.is_null() { vec![] } else { vec![state.sts.clone()] }})
             }
         } else if resource_path.contains("/pods/") {
-            if state.pod.is_null() {
+            if state.pod.is_null()
+                || state.pod["metadata"]["name"]
+                    != resource_path.rsplit('/').next().expect("Pod name")
+            {
                 status = 404;
                 serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","message":"Pod not found","code":404})
             } else {
+                if method == "PATCH" {
+                    let patch = serde_json::from_slice(request_body).expect("Pod metadata fence");
+                    apply_metadata_fence(&mut state.pod, &patch);
+                }
                 state.pod.clone()
             }
         } else if resource_path.ends_with("/pods") {
@@ -318,28 +397,21 @@ async fn connection(mut stream: tokio::net::TcpStream, state: Arc<Mutex<ApiState
                 items.extend(state.extra_pods.clone());
                 serde_json::json!({"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"9"},"items":items})
             }
+        } else if resource_path.ends_with("/services") {
+            serde_json::json!({"apiVersion":"v1","kind":"ServiceList","metadata":{"resourceVersion":"7"},
+                "items":[state.service.clone(), state.headless_service.clone()]})
         } else if resource_path.contains("/services/") {
+            let service = if resource_path.ends_with("-headless") {
+                &mut state.headless_service
+            } else {
+                &mut state.service
+            };
             if method == "PATCH" {
                 let patch: serde_json::Value =
                     serde_json::from_slice(request_body).expect("Service patch");
-                assert_eq!(patch["metadata"]["uid"], state.service["metadata"]["uid"]);
-                for (key, value) in patch["metadata"]["annotations"]
-                    .as_object()
-                    .expect("annotations")
-                {
-                    state.service["metadata"]["annotations"][key] = value.clone();
-                }
+                apply_metadata_fence(service, &patch);
             }
-            let mut service = state.service.clone();
-            if resource_path.ends_with("-headless") {
-                service["metadata"]["name"] = resource_path
-                    .rsplit('/')
-                    .next()
-                    .expect("headless name")
-                    .into();
-                service["spec"]["clusterIP"] = "None".into();
-            }
-            service
+            service.clone()
         } else {
             panic!("unexpected API request: {first}");
         };
@@ -512,7 +584,7 @@ pub(super) async fn fixture(
         .expect("pod name");
     let name = sts.metadata.name.as_deref().expect("STS name");
     let pod = serde_json::json!({"apiVersion":"v1","kind":"Pod", "metadata":{
-        "name":pod_name,"uid":"pod-original","resourceVersion":"9","creationTimestamp":"2026-01-01T00:00:00Z",
+        "namespace":"resume-contract","name":pod_name,"uid":"pod-original","resourceVersion":"9","creationTimestamp":"2026-01-01T00:00:00Z",
         "labels":object["spec"]["template"]["metadata"]["labels"],"annotations":original.resource_metadata(),
         "ownerReferences":[{"apiVersion":"apps/v1","kind":"StatefulSet","name":name,"uid":"sts-original","controller":true}]},
         "spec":object["spec"]["template"]["spec"],
@@ -549,14 +621,20 @@ pub(super) async fn fixture(
             .as_str()
             .expect("PVC name");
     let pvc = serde_json::json!({"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{
-        "name":claim_name,"uid":"pvc-original","resourceVersion":"5","annotations":original.resource_metadata(),
+        "namespace":"resume-contract","name":claim_name,"uid":"pvc-original","resourceVersion":"5","annotations":original.resource_metadata(),
         "labels":{"service_type":ServiceType::UserappBuilder.to_string()}},
         "spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":"1Gi"}}},"status":{"phase":"Bound","capacity":{"storage":"1Gi"}}});
+    let mut headless_service = serde_json::to_value(&service).expect("headless Service");
+    headless_service["metadata"]["name"] =
+        format!("{}-headless", service_name.trim_end_matches("-svc")).into();
+    headless_service["metadata"]["uid"] = "headless-original".into();
+    headless_service["spec"]["clusterIP"] = "None".into();
     let state = Arc::new(Mutex::new(ApiState {
         sts: object,
         pod_seed: pod.clone(),
         extra_pods: vec![],
         resume_replicas_on_second_sts_read: false,
+        zero_replicas_on_second_sts_read: false,
         fail_pod_list: false,
         replace_uid_on_sts_read: None,
         replace_pvc_on_read: None,
@@ -572,7 +650,9 @@ pub(super) async fn fixture(
         puts: vec![],
         patches: vec![],
         service: serde_json::to_value(service).expect("service"),
+        headless_service,
         requests: vec![],
+        admission_fences: vec![],
         replace_uid_on_second_sts_read: mutation == Some("uid"),
         sts_reads: 0,
         advance_status_rv: false,
@@ -620,8 +700,9 @@ async fn existing_create_case(mode: shared_types::BuilderStartupMode) {
     {
         let actual = state.lock().expect("state");
         assert_eq!(
-            actual.sts, before,
-            "ensure must keep the actual template and original credential"
+            without_retirement_fence(actual.sts.clone()),
+            without_retirement_fence(before.clone()),
+            "only top-level admission RV/nonce may change; retain template, identity, original credential and execution metadata"
         );
         assert_eq!(actual.pvc, before_pvc, "ensure must keep the actual PVC");
         assert!(
@@ -634,6 +715,8 @@ async fn existing_create_case(mode: shared_types::BuilderStartupMode) {
                     || request.contains("/leases")
                     || request.contains("/configmaps")
                     || request.contains("/services/")
+                    || request.starts_with("PATCH ")
+                        && (request.contains("/statefulsets/") || request.contains("/pods/"))
             }),
             "existing compute and data must not be rewritten: {:?}",
             actual.requests
@@ -691,7 +774,13 @@ async fn create_entry_rejects_foreign_or_replaced_existing_compute_before_data_w
         }
         let result = runtime.create_container(params).await;
         assert!(
-            matches!(result, Err(Error::RequestRejected(_))),
+            match &result {
+                Err(Error::RequestRejected(_)) => true,
+                Err(Error::CreationAborted { progress, source }) =>
+                    progress.safe_finish_ok()
+                        && matches!(source.as_ref(), Error::RequestRejected(_)),
+                _ => false,
+            },
             "{mutation}: {result:?}"
         );
         let state = state.lock().expect("state");
@@ -749,7 +838,13 @@ async fn unbound_reuse_service_commit_recovers_the_original_operation_after_rece
             .all(|request| request.starts_with("GET ")
                 || request.contains("/leases")
                 || request.contains("/configmaps")
-                || request.contains("/services/"))
+                || request.contains("/services/")
+                || state.admission_fences.contains(request))
+    );
+    assert_eq!(
+        state.admission_fences.len(),
+        4,
+        "only the original controller, Pod and two Services receive metadata-only fences"
     );
     server.abort();
 }
@@ -825,7 +920,10 @@ async fn compute_restart_then_cold_unbound_ensure_preserves_updated_compute_and_
     assert_eq!(ready.workload_uid.as_deref(), Some("sts-original"));
     {
         let state = state.lock().expect("state");
-        assert_eq!(state.sts, updated);
+        assert_eq!(
+            without_retirement_fence(state.sts.clone()),
+            without_retirement_fence(updated.clone())
+        );
         assert_eq!(state.pvc, original_pvc);
         assert_eq!(
             state.puts.len(),
@@ -1795,4 +1893,164 @@ async fn absent_builder_partial_original_creation_finishes_once_and_ack_is_indep
         .unwrap();
     drop(lease);
     server.abort();
+}
+
+#[tokio::test]
+async fn actual_create_entry_fences_all_retained_services_when_resuming_zero_builder() {
+    use container_runtime_api::AgentContainerRuntime as _;
+    let (runtime, mut params, state, server) = fixture(Some("release")).await;
+    params.resource_binding = None;
+    params.builder_startup_mode = shared_types::BuilderStartupMode::PreserveBusinessIntent;
+    let original_pvc = {
+        let mut current = state.lock().unwrap();
+        current.allow_writes = true;
+        current.sts["spec"]["replicas"] = 0.into();
+        current.pod = serde_json::Value::Null;
+        current.pvc.clone()
+    };
+    let old = runtime
+        .capture_agent_stop("app", &ServiceType::UserappBuilder)
+        .await
+        .unwrap();
+    assert!(old.pods.is_empty());
+    assert_eq!(
+        old.services.len(),
+        2,
+        "both public and headless Service deletion witnesses exist"
+    );
+    assert!(
+        old.services
+            .iter()
+            .all(|service| service.resource_version.as_deref() == Some("7"))
+    );
+    let info = tokio::time::timeout(Duration::from_secs(10), runtime.create_container(params))
+        .await
+        .expect("original create entry must settle")
+        .expect("stopped owned builder resumes");
+    assert_eq!(info.workload_uid.as_deref(), Some("sts-original"));
+    {
+        let current = state.lock().unwrap();
+        assert_eq!(
+            current.pvc, original_pvc,
+            "fencing must preserve actual data PVC"
+        );
+        assert_eq!(current.sts["spec"]["replicas"], 1);
+        for service in [&current.service, &current.headless_service] {
+            assert_ne!(service["metadata"]["resourceVersion"], "7");
+            assert!(
+                service["metadata"]["annotations"]["rcoder.io/agent-admission-fence"]
+                    .as_str()
+                    .is_some()
+            );
+        }
+        assert!(
+            current
+                .requests
+                .iter()
+                .any(|request| request.starts_with("PATCH ") && request.contains("-svc"))
+        );
+        assert!(
+            current
+                .requests
+                .iter()
+                .any(|request| request.starts_with("PATCH ") && request.contains("-headless"))
+        );
+        assert!(current.leases.is_empty());
+    }
+    // Model a DELETE submitted from the old Service-only observation, arriving
+    // after the actual reuse entry returns. It must not delete either route.
+    let mut late_service_delete = old;
+    late_service_delete.controller = None;
+    late_service_delete.pods.clear();
+    let outcome = runtime
+        .stop_captured_agent(&late_service_delete)
+        .await
+        .expect("the captured snapshot contains no compute to stop");
+    let container_runtime_api::AgentStopOutcome::ComputeGoneServicesPending { pending } = outcome
+    else {
+        panic!("both stale Service witnesses must report incomplete cleanup");
+    };
+    assert_eq!(pending.len(), 2);
+    for captured in &late_service_delete.services {
+        assert!(pending.iter().any(|failure| {
+            failure.name == captured.name
+                && failure.uid == captured.uid
+                && failure.error.contains("version changed")
+        }));
+    }
+    assert!(
+        !state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|request| request.starts_with("DELETE ") && request.contains("/services/"))
+    );
+    server.abort();
+}
+
+/// Positive running evidence only (deadline-settlement probe): replicas >= 1
+/// on the EXACT captured controller, double-read, receipt-free. Zero replicas
+/// (terminating), an absent controller, a mid-observation scale-down and a
+/// replacement UID never observe as running; every case stays read-only.
+#[tokio::test]
+async fn running_observation_requires_live_replicas_on_the_captured_controller() {
+    use container_runtime_api::AgentContainerRuntime as _;
+    for case in [
+        "running",
+        "zero-replicas",
+        "absent-controller",
+        "desired-without-owned-pod",
+        "scaled-down-during-observation",
+        "new-controller-uid",
+    ] {
+        let (runtime, params, state, server) = fixture(None).await;
+        let target = runtime
+            .capture_builder_compute_with_binding(
+                params.execution_context.as_ref().expect("context"),
+                params.resource_binding.as_ref(),
+                false,
+            )
+            .await
+            .expect("capture existing target");
+        {
+            let mut state = state.lock().expect("state");
+            state.sts_reads = 0;
+            match case {
+                "running" => {}
+                "zero-replicas" => state.sts["spec"]["replicas"] = 0.into(),
+                "absent-controller" => state.sts = serde_json::Value::Null,
+                // Desired replicas without execution (owned Pod): not
+                // positive running evidence.
+                "desired-without-owned-pod" => state.pod = serde_json::Value::Null,
+                "scaled-down-during-observation" => {
+                    state.zero_replicas_on_second_sts_read = true;
+                }
+                "new-controller-uid" => state.replace_uid_on_second_sts_read = true,
+                _ => unreachable!("enumerated case"),
+            }
+        }
+        let observed = runtime.observe_builder_compute_running(&target).await;
+        match case {
+            "running" => assert!(observed.expect("live replicas observe as running")),
+            "new-controller-uid" => assert!(
+                matches!(observed, Err(Error::Conflict(_))),
+                "a replacement controller is never the captured target: {observed:?}"
+            ),
+            _ => assert!(
+                !observed.expect("terminating or absent shapes observe as not running"),
+                "{case}"
+            ),
+        }
+        let state = state.lock().expect("state");
+        assert!(
+            state
+                .requests
+                .iter()
+                .all(|request| request.starts_with("GET ")),
+            "running observation is read-only: {case}"
+        );
+        assert!(state.puts.is_empty() && state.patches.is_empty(), "{case}");
+        server.abort();
+    }
 }

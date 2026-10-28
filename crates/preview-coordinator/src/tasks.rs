@@ -83,6 +83,16 @@ impl PreviewCoordinator {
             if row.state == PreviewInstanceState::Stopping {
                 continue;
             }
+            if row.state == PreviewInstanceState::Starting {
+                match self.has_startup_owner(&row.preview_key, &row.instance_id) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(preview_key = %row.preview_key, "preview heartbeat startup ownership unavailable; publication deferred: {error}");
+                        continue;
+                    }
+                }
+            }
             let report = match self
                 .executor
                 .verify_local(&row.preview_key, &row.instance_id)
@@ -97,11 +107,9 @@ impl PreviewCoordinator {
                     continue;
                 }
             };
-            // Starting 行归启动预算管（execute_start 超时自会收敛），心跳不碰：
-            // 冷缓存 pnpm install 可达数分钟，期间执行器必然无本地登记——若在此
-            // 判定 registration lost 会误转 Unknown，随后 publish_running CAS 失败
-            // （E2E/K8s 冷装实测 state=unknown 根因）。已登记且存活的迟到完成
-            // 在此自愈补发布。
+            // 活跃原 owner 持有完整启动/端口结果；请求预算超时也不移交发布权。
+            // 冷安装期间没有登记不代表失败。只有无 owner 的历史 Starting，
+            // 才按精确登记且存活的观察补发布；不得抢先确认尚未返回的 readiness。
             if row.state == PreviewInstanceState::Starting {
                 if report.identity_match {
                     self.heal_late_start(&row, &report).await;
@@ -144,14 +152,14 @@ impl PreviewCoordinator {
         }
     }
 
-    /// Starting 迟到完成自愈：预算超时后进程才就绪 → 补发布为 Ready。
+    /// 无 owner 的历史 Starting 自愈：精确登记已就绪 → 补发布为 Ready。
     async fn heal_late_start(
         &self,
         row: &shared_types::PreviewInstanceRecord,
         report: &shared_types::ExecutorVerifyReport,
     ) {
         if !report.alive {
-            return; // 已登记但进程死：留给启动预算/下一轮处理，不在此判死
+            return; // 当前观察未就绪，不凭历史 Starting 在此判死
         }
         let (Some(pid), Some(port)) = (report.pid, report.port) else {
             return;

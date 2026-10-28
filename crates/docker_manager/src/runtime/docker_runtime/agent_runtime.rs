@@ -2,6 +2,108 @@ use super::*;
 
 #[async_trait]
 impl AgentContainerRuntime for DockerRuntime {
+    fn agent_workload_namespace(&self) -> String {
+        self.agent_retirement_namespace()
+    }
+    fn agent_workload_name(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<String> {
+        self.agent_retirement_name(identifier, service_type)
+    }
+    async fn agent_resource_inventory(
+        &self,
+    ) -> ContainerRuntimeResult<Vec<container_runtime_api::AgentStopSnapshot>> {
+        self.docker_agent_inventory().await
+    }
+    async fn capture_agent_stop(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentStopSnapshot> {
+        self.capture_docker_agent_retirement(identifier, service_type)
+            .await
+    }
+    async fn agent_compute_absent(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        registered: &ContainerBasicInfo,
+    ) -> ContainerRuntimeResult<bool> {
+        if self
+            .capture_docker_agent_retirement(identifier, service_type)
+            .await?
+            .has_compute()
+        {
+            return Ok(false);
+        }
+        if registered.container_id.is_empty() {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Registered Agent has no physical container identity".into(),
+            ));
+        }
+        // A renamed container may have lost the canonical name/labels but is
+        // still execution. Only the original exact CID's 404 proves absence.
+        match self
+            .inner
+            .get_docker_client()
+            .inspect_container(&registered.container_id, None)
+            .await
+        {
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(true),
+            Ok(_) => Ok(false),
+            Err(error) => Err(ContainerRuntimeError::DockerError(format!(
+                "Inspect captured Agent absence: {error}"
+            ))),
+        }
+    }
+    async fn stop_captured_agent(
+        &self,
+        snapshot: &container_runtime_api::AgentStopSnapshot,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentStopOutcome> {
+        self.retire_docker_agent_snapshot(snapshot, false).await
+    }
+    async fn retire_agent_remnants(
+        &self,
+        snapshot: &container_runtime_api::AgentStopSnapshot,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentStopOutcome> {
+        // Docker's remnant analog: once the engine has confirmed idleness,
+        // references, and persistent-mount data protection, retirement is the
+        // exact-CID removal. The shared executor re-verifies scope, UID, and
+        // ownership labels, and treats a missing container as Complete.
+        self.retire_docker_agent_snapshot(snapshot, true).await
+    }
+    async fn refresh_agent_retirement_fence(
+        &self,
+        snapshot: &container_runtime_api::AgentStopSnapshot,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentStopSnapshot> {
+        // Docker has no resource-version fence. This is observation only and
+        // never authorizes reopening a CID with an unknown removal in flight.
+        let current = self
+            .capture_docker_agent_retirement(&snapshot.identifier, &snapshot.service_type)
+            .await?;
+        if current.container.as_ref().map(|value| &value.uid)
+            != snapshot.container.as_ref().map(|value| &value.uid)
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "Docker Agent changed during admission".into(),
+            ));
+        }
+        Ok(current)
+    }
+    async fn stop_agent_container_if_matches(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        expected_container_id: &str,
+    ) -> ContainerRuntimeResult<()> {
+        self.stop_captured_agent(identifier, service_type, expected_container_id)
+            .await
+    }
+
     async fn stop_idle_builder_compute(
         &self,
         identifier: &str,
@@ -278,11 +380,91 @@ impl AgentContainerRuntime for DockerRuntime {
         }))
     }
 
+    async fn observe_unbound_builder_creation_authority(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<container_runtime_api::UnboundBuilderCreationAuthority> {
+        #[cfg(unix)]
+        {
+            self.observe_unbound_builder_creation_authority(context)
+                .await
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = context;
+            Ok(container_runtime_api::UnboundBuilderCreationAuthority::Unsupported)
+        }
+    }
+
     async fn capture_builder_control(
         &self,
         context: &shared_types::UserAppExecutionContext,
     ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
         self.capture_builder_compute(context).await
+    }
+
+    async fn builder_compute_absent(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<bool> {
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let name = crate::utils::DockerUtils::generate_container_name(
+            ServiceType::UserappBuilder.container_prefix(),
+            &context.app_id,
+        )
+        .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let client = self.inner.get_docker_client();
+        match client.inspect_container(&name, None).await {
+            Ok(_) => return Ok(false),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {}
+            Err(error) => {
+                return Err(ContainerRuntimeError::DockerError(format!(
+                    "Observe absent builder compute: {error}"
+                )));
+            }
+        }
+        // A renamed builder retains its physical execution and ownership
+        // labels. Missing the canonical name does not prove it was removed.
+        let filters = HashMap::from([(
+            "label".to_string(),
+            vec![
+                format!(
+                    "service-type={}",
+                    ServiceType::UserappBuilder.container_family_key()
+                ),
+                format!("identifier={}", context.app_id),
+            ],
+        )]);
+        let options = bollard::query_parameters::ListContainersOptionsBuilder::new()
+            .all(true)
+            .filters(&filters)
+            .build();
+        let residual = client
+            .list_containers(Some(options))
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::DockerError(format!(
+                    "List remaining builder compute: {error}"
+                ))
+            })?;
+        if !residual.is_empty() {
+            return Ok(false);
+        }
+        // Creation may have acquired the canonical name while the list was
+        // being read. Observe it again before publishing absence.
+        match client.inspect_container(&name, None).await {
+            Ok(_) => Ok(false),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(true),
+            Err(error) => Err(ContainerRuntimeError::DockerError(format!(
+                "Recheck absent builder compute: {error}"
+            ))),
+        }
     }
 
     async fn exec_builder_control_target(
@@ -305,6 +487,13 @@ impl AgentContainerRuntime for DockerRuntime {
         target: &shared_types::BuilderControlTarget,
     ) -> ContainerRuntimeResult<bool> {
         self.reconcile_builder_stop(target).await
+    }
+
+    async fn observe_builder_restart_stop(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderRestartStopKind>> {
+        self.observe_original_builder_restart_stop(target).await
     }
 
     async fn reconcile_builder_compute_start(
@@ -350,6 +539,13 @@ impl AgentContainerRuntime for DockerRuntime {
         target: &shared_types::BuilderControlTarget,
     ) -> ContainerRuntimeResult<bool> {
         self.observe_retained_builder_stopped(target).await
+    }
+
+    async fn observe_builder_compute_running(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        self.observe_retained_builder_running(target).await
     }
 
     async fn archive_builder_restart(
@@ -527,26 +723,23 @@ impl AgentContainerRuntime for DockerRuntime {
                     let result = crate::agent_container_starter::AgentContainerStarter::new(&inner)
                         .start_prepared(params.clone(), prepared)
                         .await;
-                    if let (Err(error), Some(context)) = (&result, context.as_ref())
-                        && let Some(physical_id) = acknowledged_partial_creation(error)
+                    let partial_id = result.as_ref().err()
+                        .and_then(acknowledged_partial_creation)
+                        .map(str::to_owned);
+                    let result = result.map_err(crate::runtime::builder_completion::docker_error);
+                    if let (Some(context), Some(physical_id)) = (context.as_ref(), partial_id.as_deref())
                     {
                         // Save known-complete writes before returning the original
                         // failure. Recovery can drain this exact created resource;
                         // it must still separately observe management readiness.
-                        if let Err(record_error) = Self::new(inner.clone())
-                            .record_partial_creation(context, physical_id, lease.receipt())
-                            .await
-                        {
-                            return crate::runtime::builder_completion::finish(
-                                lease,
-                                Err(ContainerRuntimeError::ContainerCreationError(format!(
-                                    "{error}; persist partial creation evidence: {record_error}"
-                                ))),
-                            )
-                            .await;
-                        }
+                        let runtime = Self::new(inner.clone());
+                        crate::runtime::builder_completion::record_partial_creation(
+                            result,
+                            runtime.record_partial_creation(context, physical_id, lease.receipt()),
+                        ).await
+                    } else {
+                        result
                     }
-                    result.map_err(crate::runtime::builder_completion::docker_error)
                 };
                 let result = match (result, context.as_ref()) {
                     (Ok(info), Some(context)) => {
@@ -622,7 +815,9 @@ impl AgentContainerRuntime for DockerRuntime {
         self.inner
             .start_agent_container(params)
             .await
-            .map_err(|e| ContainerRuntimeError::ContainerCreationError(e.to_string()))
+            // 集中转换保留提交阶段（发写前失败/明确拒绝/传输未知/已确认 CID），
+            // 不再整体压平成 ContainerCreationError
+            .map_err(crate::runtime::builder_completion::docker_error)
     }
 
     async fn get_container_info(
@@ -786,6 +981,7 @@ impl AgentContainerRuntime for DockerRuntime {
         let status_str = state.and_then(|s| s.status.as_ref().map(|st| format!("{st:?}")));
 
         Ok(container_runtime_api::AgentPodDiagnostic {
+            evidence: docker_diagnostic_evidence(&inspect),
             exists: true,
             ready: running,
             restart_count,
@@ -914,6 +1110,21 @@ impl AgentContainerRuntime for DockerRuntime {
         })?;
         Ok(())
     }
+}
+
+fn docker_diagnostic_evidence(
+    inspect: &bollard::models::ContainerInspectResponse,
+) -> Option<container_runtime_api::AgentPodDiagnosticEvidence> {
+    let physical_id = inspect.id.clone().filter(|id| !id.trim().is_empty())?;
+    let state = inspect.state.as_ref();
+    Some(container_runtime_api::AgentPodDiagnosticEvidence {
+        physical_id,
+        termination_finished_at: state
+            .and_then(|s| s.finished_at.as_deref())
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&chrono::Utc)),
+        current_termination: !state.and_then(|s| s.running).unwrap_or(false),
+    })
 }
 
 #[cfg(test)]

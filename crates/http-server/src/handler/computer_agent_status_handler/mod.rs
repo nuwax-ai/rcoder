@@ -87,10 +87,13 @@ use shared_types::{ComputerAgentStatusRequest, ComputerAgentStatusResponse};
 pub async fn computer_agent_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    I18nJsonOrQuery(request): I18nJsonOrQuery<ComputerAgentStatusRequest>,
+    I18nJsonOrQuery(mut request): I18nJsonOrQuery<ComputerAgentStatusRequest>,
 ) -> Result<HttpResult<ComputerAgentStatusResponse>, AppError> {
     // 获取语言设置
     let locale = get_locale_from_headers(&headers);
+    request.session_id = shared_types::SessionHint::classify(request.session_id.as_deref())
+        .as_session_id()
+        .map(str::to_owned);
 
     // 0. userApp 分派（service_type=userapp + app_id；agent 会话
     //    仅存在于 dev 的 UserappBuilder 开发容器）
@@ -266,7 +269,8 @@ pub async fn computer_agent_status(
         container_ip: &container_info.container_ip,
         namespace: &state.config.app_manager.namespace,
         project_id,
-        session_id: request.session_id.as_deref(),
+        session_id: shared_types::SessionHint::classify(request.session_id.as_deref())
+            .as_session_id(),
         max_retries: GRPC_MAX_RETRIES,
         locale,
         cluster_domain: &state.cluster_domain,
@@ -307,10 +311,12 @@ pub async fn computer_agent_status(
             user_id: request.user_id.clone(),
             project_id: project_id.to_string(),
             is_alive: true,
-            session_id: request
-                .session_id
-                .clone()
-                .or_else(|| project_info.session_id().map(|s| s.to_string())),
+            session_id: shared_types::SessionHint::classify(request.session_id.as_deref())
+                .as_session_id()
+                .or_else(|| {
+                    shared_types::SessionHint::classify(project_info.session_id()).as_session_id()
+                })
+                .map(str::to_owned),
             status: Some(grpc_response.status.clone()),
             last_activity: Some(project_info.last_activity()),
             created_at: Some(project_info.created_at()),

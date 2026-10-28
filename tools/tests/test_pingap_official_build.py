@@ -100,6 +100,42 @@ class OfficialBuildTests(unittest.TestCase):
                 official.build(args, VERSION, COMMIT)
         self.assertFalse(any(command[0] == 'cargo' for command in calls))
 
+    def test_official_workspace_inherited_package_version_is_accepted(self):
+        # The exact official v0.15.0 source inherits package.version. Validate
+        # that source without editing its Cargo.toml to make the gate pass.
+        (self.root / 'Cargo.toml').write_text(
+            '[package]\nname="pingap"\nversion.workspace=true\n'
+            '[workspace.package]\nversion="0.15.0"\n')
+        def git(command, source=None, capture=False):
+            self.assertEqual(command[0], 'git')
+            return subprocess.CompletedProcess(command, 0,
+                COMMIT + '\n' if command[1] == 'rev-parse' else '')
+        with patch.object(official, 'checked', side_effect=git):
+            official.unchanged_source(self.root, VERSION, COMMIT)
+
+    def test_inherited_version_does_not_bypass_exact_pin_or_version_checks(self):
+        cases = [
+            '[package]\nversion.workspace=true\n[workspace.package]\nversion="0.14.0"\n',
+            '[package]\nversion.workspace=true\n',
+            '[package]\nversion.workspace=false\n[workspace.package]\nversion="0.15.0"\n',
+            '[package]\nversion.workspace=1\n[workspace.package]\nversion="0.15.0"\n',
+        ]
+        for manifest in cases:
+            with self.subTest(manifest=manifest):
+                (self.root / 'Cargo.toml').write_text(manifest)
+                def git(command, source=None, capture=False):
+                    return subprocess.CompletedProcess(command, 0,
+                        COMMIT + '\n' if command[1] == 'rev-parse' else '')
+                with patch.object(official, 'checked', side_effect=git):
+                    with self.assertRaisesRegex(ValueError, 'package version mismatch'):
+                        official.unchanged_source(self.root, VERSION, COMMIT)
+        (self.root / 'Cargo.toml').write_text(
+            '[package]\nversion.workspace=true\n[workspace.package]\nversion="0.15.0"\n')
+        with patch.object(official, 'checked', return_value=subprocess.CompletedProcess(
+                ['git', 'rev-parse', 'HEAD'], 0, 'a' * 40 + '\n')):
+            with self.assertRaisesRegex(ValueError, 'exact pin'):
+                official.unchanged_source(self.root, VERSION, COMMIT)
+
     def test_source_build_is_locked_unpatched_and_records_cross_target_truthfully(self):
         (self.root / 'Cargo.toml').write_text('[package]\nversion="0.15.0"\n')
         target = 'x86_64-apple-darwin'

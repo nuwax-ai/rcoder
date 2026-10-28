@@ -209,7 +209,14 @@ pub(crate) async fn connect(address: &str) -> Result<TcpStream> {
         addr.ip().is_loopback(),
         "supervisor control must use loopback"
     );
-    Ok(tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr)).await??)
+    // Windows can take just over two seconds to report WSAECONNREFUSED for a
+    // closed loopback endpoint. Preserve that typed observation for protocol
+    // selection while callers retain their original absolute operation budget.
+    #[cfg(windows)]
+    let connect_timeout = Duration::from_secs(3);
+    #[cfg(not(windows))]
+    let connect_timeout = Duration::from_secs(2);
+    Ok(tokio::time::timeout(connect_timeout, TcpStream::connect(addr)).await??)
 }
 pub async fn control(root: &Path, request: Request) -> Result<Snapshot> {
     let discovery: Discovery = record::read(&root.join("supervisor.json"))?;
@@ -342,4 +349,31 @@ pub fn saved_request_snapshot(root: &Path, request: &Request) -> Result<Option<S
         snapshot.operation_id = Some(original.request_id.clone());
     }
     Ok(Some(snapshot))
+}
+
+#[cfg(all(test, windows))]
+mod windows_connect_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn refused_loopback_preserves_the_actual_os_error() {
+        for attempt in 0..3 {
+            let previous = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = previous.local_addr().unwrap();
+            drop(previous);
+            let started = std::time::Instant::now();
+            let error = connect(&address.to_string()).await.unwrap_err();
+            eprintln!(
+                "attempt={attempt} elapsed={:?} error={error:#}",
+                started.elapsed()
+            );
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .map(std::io::Error::kind),
+                Some(std::io::ErrorKind::ConnectionRefused),
+                "a closed local endpoint must retain its typed OS refusal, not become an unknown RPC timeout"
+            );
+        }
+    }
 }

@@ -255,6 +255,14 @@ impl PingoraProxyService {
         removed.map(|(_, ip)| ip)
     }
 
+    /// A delayed retirement must not remove a route published by another
+    /// workload sharing the same user key.
+    pub fn remove_vnc_backend_if_matches(&self, user_id: &str, expected: &str) -> Option<String> {
+        self.vnc_backends
+            .remove_if(user_id, |_, current| current == expected)
+            .map(|(_, value)| value)
+    }
+
     /// 添加 Project 后端映射
     ///
     /// 用于 WebAgentRunner 容器，project_id 作为 key
@@ -279,6 +287,16 @@ impl PingoraProxyService {
             );
         }
         removed.map(|(_, ip)| ip)
+    }
+
+    pub fn remove_project_backend_if_matches(
+        &self,
+        project_id: &str,
+        expected: &str,
+    ) -> Option<String> {
+        self.project_backends
+            .remove_if(project_id, |_, current| current == expected)
+            .map(|(_, value)| value)
     }
 
     /// 获取 VNC 后端 IP

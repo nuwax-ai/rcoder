@@ -15,6 +15,9 @@ use tokio::{
     time::Instant,
 };
 
+// Read-only runtime observations retain the existing per-call recovery budget.
+const RUNTIME_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
+
 // An optimization only. Database operation state remains authoritative across replicas.
 // hotpath 锁观测（T2.3 仅此登记表选点）：mutex! 关闭时原样返回原生 std::sync::Mutex，
 // 开启时包装记录锁等待（wait）与持锁（acquire）时长；lock/poison 语义与调用点不变，
@@ -23,7 +26,8 @@ use hotpath::wrap::std::sync::Mutex as ObsMutex;
 static SIGNALS: LazyLock<ObsMutex<HashMap<String, watch::Sender<u64>>>> = LazyLock::new(|| {
     hotpath::mutex!(
         Mutex::new(HashMap::new()),
-        label = "userapp_builder_signals"
+        // Keep the safe expression-label API; literal labels export symbols.
+        label = { "userapp_builder_signals" }
     )
 });
 
@@ -36,7 +40,10 @@ pub(super) async fn ensure(
     startup_mode: shared_types::BuilderStartupMode,
 ) -> Result<ContainerBasicInfo> {
     let flight = state.userapp_op_flight.guard()?;
-    let app = state.userapp_store.ensure_identity(app_id).await?;
+    let app = match super::adoption::discover_missing_identity(state, app_id).await? {
+        Some(app) => app,
+        None => state.userapp_store.ensure_identity(app_id).await?,
+    };
     let input = creation_input(state, app_id, startup_mode)?;
     let admission = state
         .userapp_store
@@ -172,6 +179,24 @@ async fn claimed_startup_mode(
     Ok(input.startup_mode)
 }
 
+pub(super) async fn captured_storage(
+    state: &AppState,
+    context: &shared_types::UserAppExecutionContext,
+) -> Result<Option<shared_types::UserAppRetainedStorage>> {
+    let operation = state
+        .userapp_store
+        .get_operation(&context.app_id, &context.operation_id)
+        .await?
+        .ok_or_else(|| anyhow!("Builder operation missing"))?;
+    operation
+        .checkpoint
+        .get("retained_storage")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(Into::into)
+}
+
 // 拆分（file-server 大文件范式）：`spawn` 受理派发与迟到结果 /
 // `fence` 围栏证据 / `observe` 就绪观察与等待收敛；两个测试模块独立成文件
 // （`fence_settler_tests` 被 recovery.rs 以 `creation::fence_settler_tests`
@@ -183,6 +208,9 @@ pub(crate) mod fence_settler_tests;
 mod observe;
 mod registration;
 mod spawn;
+mod stale_running;
+#[cfg(test)]
+mod stale_running_tests;
 #[cfg(test)]
 mod tests;
 
@@ -190,3 +218,4 @@ pub(super) use fence::*;
 pub(super) use observe::*;
 pub(super) use registration::{BuilderRegistrationConfirmationRequired, repair_live_registration};
 pub(super) use spawn::*;
+pub(super) use stale_running::*;

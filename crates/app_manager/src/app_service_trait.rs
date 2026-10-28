@@ -51,6 +51,14 @@ pub trait AppServiceTrait: Send + Sync {
         &self,
         operation: &shared_types::UserAppOperationRecord,
     ) -> AppResult<bool>;
+    /// Confirm an original compute-only creation and repair its private
+    /// configuration without replaying any application resource write.
+    async fn reconcile_created_runtime_configuration(
+        &self,
+        _operation: &shared_types::UserAppOperationRecord,
+    ) -> AppResult<bool> {
+        Ok(false)
+    }
     /// Inspect and retire only an interrupted deletion's captured write scopes.
     /// Returns false when a live holder/another recovery still owns the attempt;
     /// never replays an unknown purge or revives a lifecycle deletion tombstone.

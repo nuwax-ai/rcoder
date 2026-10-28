@@ -4,8 +4,15 @@
 //! 结构：本文件是存储身份恢复与恢复装配；热部署恢复协调在 [`hot`]，
 //! 控制操作恢复/重试/续跑在 [`control`]。
 
+#![deny(
+    clippy::wildcard_enum_match_arm,
+    clippy::match_wildcard_for_single_variants
+)]
+
 mod control;
 mod hot;
+#[cfg(test)]
+mod identity_tests;
 
 use crate::models::{AppOperationError, AppResult};
 use crate::service::AppService;
@@ -80,13 +87,17 @@ impl AppService {
         let Some(app) = self.metadata.store.get_application(app_id).await? else {
             return Ok(());
         };
-        if app.state != shared_types::UserAppLifecycleState::Active {
-            return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
+        match app.state {
+            shared_types::UserAppLifecycleState::Active => {}
+            shared_types::UserAppLifecycleState::Deleting
+            | shared_types::UserAppLifecycleState::Deleted => {
+                return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
+            }
         }
         let Some(witness) = self
             .metadata
             .store
-            .get_recovery_witness(app_id, &app.lifecycle_id)
+            .get_recovery_storage_witness(app_id, &app.lifecycle_id)
             .await?
         else {
             return Ok(());
@@ -125,14 +136,53 @@ impl AppService {
         })
         .await?;
         if let Some(existing) = &existing {
-            if existing.state != shared_types::UserAppLifecycleState::Active {
-                return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
+            match existing.state {
+                shared_types::UserAppLifecycleState::Active => {}
+                shared_types::UserAppLifecycleState::Deleting
+                | shared_types::UserAppLifecycleState::Deleted => {
+                    return Err(shared_types::UserAppStoreError::LifecycleConflict.into());
+                }
             }
             if existing.lifecycle_epoch != 1
                 || existing.metadata_revision != 1
                 || existing.active_operations != shared_types::UserAppActiveOperations::default()
             {
                 return Ok(Some(existing.clone()));
+            }
+            // Compute admission has a separate ledger: it does not advance the
+            // root revision or ordinary operation slots. During Stop/Restart
+            // the original physical container may legitimately disappear.
+            // Keep the admitted lifecycle; later writes still require their
+            // original operation, physical receipt and storage CAS.
+            for scope in shared_types::UserAppOperationScope::ALL {
+                match scope {
+                    shared_types::UserAppOperationScope::Dev
+                    | shared_types::UserAppOperationScope::Prod => {}
+                    shared_types::UserAppOperationScope::Application => continue,
+                }
+                let status = crate::service::restart_wait::prepare(async {
+                    Ok(self
+                        .metadata
+                        .store
+                        .read_compute_status(app_id, &existing.lifecycle_id, scope)
+                        .await?)
+                })
+                .await?;
+                if status.operation.is_some_and(|operation| {
+                    operation.app_id == existing.app_id
+                        && operation.lifecycle_id == existing.lifecycle_id
+                        && operation.scope == scope
+                        && match operation.state {
+                            shared_types::ComputeControlState::Pending
+                            | shared_types::ComputeControlState::Running
+                            | shared_types::ComputeControlState::RecoveryRequired => true,
+                            shared_types::ComputeControlState::Succeeded
+                            | shared_types::ComputeControlState::Failed
+                            | shared_types::ComputeControlState::Superseded => false,
+                        }
+                }) {
+                    return Ok(Some(existing.clone()));
+                }
             }
         }
         let found = crate::service::restart_wait::prepare(async {
@@ -143,6 +193,32 @@ impl AppService {
         })
         .await?;
         let Some(found) = found else {
+            if existing.is_none()
+                && self.config.default_recovery_enabled
+                && self.config.access_mode == crate::config::AppAccessMode::Kubernetes
+            {
+                for scope in [
+                    shared_types::UserAppOperationScope::Dev,
+                    shared_types::UserAppOperationScope::Prod,
+                ] {
+                    if let Some(storage) = self
+                        .runtime
+                        .discover_retained_app_storage(app_id, scope)
+                        .await
+                        .map_err(|e| {
+                            map_runtime_error("Discover retained application storage", e)
+                        })?
+                    {
+                        return self
+                            .metadata
+                            .store
+                            .restore_storage_identity(&storage)
+                            .await
+                            .map(Some)
+                            .map_err(Into::into);
+                    }
+                }
+            }
             return Ok(existing);
         };
         if existing

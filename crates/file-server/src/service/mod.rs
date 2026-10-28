@@ -23,4 +23,5 @@ pub mod temp_file;
 pub mod tree;
 pub mod upload;
 pub mod version;
+mod workspace_lock;
 pub mod zip;

@@ -43,6 +43,7 @@ impl DispatchState {
         }
     }
 
+    #[cfg(unix)]
     pub(super) fn begin_attempt(&self) -> Result<()> {
         match self
             .0

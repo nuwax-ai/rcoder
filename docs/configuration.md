@@ -46,11 +46,21 @@ Agent 的 `memory` 不代表 UserApp 也使用内存。Agent PostgreSQL 后端�
 |---|---|
 | `RCODER_STORAGE_BACKEND` | Agent 存储后端：`memory` / `postgres` |
 | `RCODER_PG_URL` | Agent PostgreSQL 连接串；也支持 `RCODER_PG_HOST/PORT/USERNAME/PASSWORD/DATABASE` 分项配置 |
+| `RCODER_PG_DURABLE_COMMIT_TIMEOUT_MS` | Agent PostgreSQL 注册、会话和受控清理的确认总预算，默认 `15000` 毫秒 |
+| `RCODER_PG_STATEMENT_TIMEOUT_SECS` | PostgreSQL 单条 SQL 的服务端超时，默认 `15` 秒 |
 | `RCODER_USERAPP_STORAGE_BACKEND` | UserApp 控制存储：`auto` / `turso` / `postgres` |
 | `RCODER_USERAPP_TURSO_PATH` | UserApp 本地数据库文件路径 |
 | `RCODER_USERAPP_PG_URL` | UserApp PostgreSQL 连接串 |
 
 普通本地默认 Turso 路径为 `data/rcoder/userapp.turso.db`。Compose 将数据库放在 `/app/data/userapp.turso.db`，`make dev-*` 使用的 named volume、备份和数据保留方式见 [Docker 指南](deployment/docker.md)。同一个本地数据目录只运行一个 RCoder 实例。
+
+### PostgreSQL 提交确认预算
+
+`storage.postgres.durable_commit_timeout_ms` 可由 `RCODER_PG_DURABLE_COMMIT_TIMEOUT_MS` 覆盖，默认 `15000`；有效范围为 `1..=2147483647` 毫秒。显式非法、零值或超范围输入在使用前报配置错误，不静默回退。旧 YAML 缺少该字段时采用默认值；设为 `600` 可恢复原先的确认预算。
+
+该预算覆盖单次 durable 入口的对账、停止门禁、权威读取及 SQL 提交确认，共用一个 deadline。超时后可能返回 `Deferred` 或结果未知，原操作仍可能由数据库 owner 或后台 writer 完成；超时不代表 SQL 已取消，也不能据此重新派发业务请求。派发新任务须等原注册提交得到确认。
+
+`statement_timeout_secs` 是每条 SQL 的服务端上限，与上述总预算分别生效；多条 SQL、排队和重试使二者没有通用的大小约束。新的内置默认值为 `15` 秒，已有 YAML 或环境显式配置的较短值保持有效，升级时需要核对它是否提前限制了预期的慢提交容忍窗口。`lock_timeout` 仍按语句预算取 `1..=2000` 毫秒，正常默认值下为 `2` 秒；增加提交确认预算不会延长等锁上限。配置不会修复底层存储延迟，也不改变未知结果的保护和对账语义。
 
 ## Agent 与模型配置
 
@@ -93,3 +103,21 @@ curl http://127.0.0.1:8090/api/docs/openapi.json \
 | `RCODER_USERAPP_DEV_FORWARD_CONNECT_WAIT_SECONDS` | 转发请求发送前等待开发容器 TCP 可连接的预算 |
 
 不同等待阶段各自有预算，调用方应结合原操作状态处理超时。错误与重试语义见[运行时错误契约](runtime-error-contract.md)。
+
+## 反向资源对账预算
+
+`cleanup_config.orphan_scan_budget_seconds` 默认 `30` 秒，独立于容器 Stop 超时。
+预算包含完整资源发现及本轮权威检查；到期结束本轮，下一轮从后续负载继续，
+避免固定顺序使尾部负载长期无法被检查。登记缺席收敛和 Builder Pod 换代观察也使用
+此预算，超时释放本次准入，不留下阻止原入口恢复的持久标记。日志 `scan coverage` 包含发现、访问、
+分类、失败、延后数量及耗时；`Registered` 的逐对象日志仍为 debug。
+
+完整 inventory 失败或 leader 换代会清除连续观察。分页延后的候选只有在新完整
+inventory 中物理快照完全相同时才保留，未进行权威检查不累计确认次数；当前
+观察失败只重置对应候选。删除前仍持独占准入重新核对 API、登记及生命周期。
+自动回收范围仍限于无 Pod 的 Service 或 replicas=0 的空控制器；运行中、重建中
+及无法确认活动的孤儿只观察，不因登记缺失而直接删除，也不删除数据卷。
+
+启动/复用时，初始捕获允许同一 UID 对象的正常 RV 更新；捕获后的删除见证仍严格
+匹配 UID/RV，真实替换或归属冲突保持拒绝。Builder 同控制器下的 Pod 换代可以修复
+登记并重新开始闲置观察，不使用旧 Pod 的闲置证据停止继任者。

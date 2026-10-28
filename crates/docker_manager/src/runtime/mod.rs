@@ -6,6 +6,9 @@
 pub(crate) mod builder_completion;
 mod builder_creation_receipt;
 mod builder_file_credentials;
+mod docker_agent_retirement;
+mod docker_agent_stop;
+mod docker_app_configuration;
 pub(crate) mod docker_app_create;
 pub(crate) mod docker_app_mounts;
 mod docker_app_restart;
@@ -37,6 +40,10 @@ pub(crate) mod k8s_agent_env;
 pub(crate) mod k8s_agent_pod;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_agent_query;
+#[cfg(feature = "kubernetes")]
+mod k8s_agent_replacement;
+#[cfg(feature = "kubernetes")]
+mod k8s_agent_retirement;
 #[cfg(feature = "kubernetes")]
 mod k8s_app_adoption;
 #[cfg(feature = "kubernetes")]
@@ -93,3 +100,6 @@ mod docker_builder_deletion;
 mod k8s_builder_deletion;
 
 mod lifecycle_discovery;
+
+#[cfg(feature = "kubernetes")]
+mod k8s_default_recovery;

@@ -83,7 +83,8 @@ pub(super) fn read_index_blob(
     path: &str,
     max_bytes: u64,
 ) -> AppResult<Side> {
-    let bstr_path = into_bstr(PathBuf::from(path));
+    let bstr_path = into_bstr(PathBuf::from(path))
+        .map_err(|error| map_git_err(error, "git encode index lookup path"))?;
     let Some(entry) = index.entry_by_path_and_stage(bstr_path.as_ref(), IndexStage::Unconflicted)
     else {
         return Ok(Side::missing());

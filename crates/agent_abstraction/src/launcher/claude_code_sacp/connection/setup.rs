@@ -333,6 +333,11 @@ pub(super) async fn create_or_load_session(
         }
     };
 
+    // Reject the Agent's unusable identity before mode/model requests, the
+    // startup completion signal, any registry publication, or prompt dispatch.
+    // The launcher owns the child and confirms its exit on this error path.
+    crate::session::require_session_identity(&outcome.session_id)
+        .map_err(|error| agent_client_protocol::Error::new(1000, error.to_string()))?;
     Ok(outcome)
 }
 

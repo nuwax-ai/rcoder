@@ -65,12 +65,9 @@ impl Fixture {
                 owner_pid: None,
             };
             fixture.manifests("first");
-            match std::net::TcpListener::bind(("0.0.0.0", fixture.planned_business_port())) {
-                Ok(listener) => {
-                    drop(listener);
-                    return fixture;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            match protocol_support::business_port_available(fixture.planned_business_port()) {
+                Ok(true) => return fixture,
+                Ok(false) => continue,
                 Err(error) => panic!("inspect actual fixture business port: {error}"),
             }
         }
@@ -361,6 +358,31 @@ impl Fixture {
             );
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
+    }
+
+    async fn operation_until(
+        &self,
+        client: &reqwest::Client,
+        base: &str,
+        identity: &Value,
+        kind: &str,
+        deadline: tokio::time::Instant,
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fresh Source admission budget ended before dispatch"
+        );
+        // Bound the unchanged submit/terminal helper with the caller's original
+        // deadline, including a POST whose result might become unknown. Never
+        // resend that POST when this timeout fires.
+        tokio::time::timeout_at(deadline, self.operation(client, base, identity, kind))
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "fresh Source operation exceeded its original deadline: {error}; {}",
+                    self.diagnostics()
+                )
+            });
     }
 
     async fn same_owner(

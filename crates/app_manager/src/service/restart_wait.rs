@@ -98,6 +98,17 @@ impl Drop for WaitingRestartClient {
     }
 }
 impl RestartAdmission {
+    pub(crate) fn with_deadline(deadline: tokio::time::Instant) -> Self {
+        Self {
+            deadline: std::sync::OnceLock::from(deadline),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn has_started(&self) -> bool {
+        self.phase.load(Ordering::SeqCst) == ADMITTING
+    }
+
     pub(crate) fn client(self: &Arc<Self>) -> WaitingRestartClient {
         WaitingRestartClient(self.clone())
     }
@@ -145,7 +156,7 @@ impl RestartAdmission {
         let mut diagnostic = self.diagnostic()?;
         // A completed unknown/foreign/change observation or real read error
         // supersedes every previous diagnostic, even if its timeout is imminent.
-        diagnostic.holder = match observation {
+        let mut holder = match observation {
             Ok(observation) => observation.verified.clone().filter(|holder| {
                 matches!(
                     holder.blocker.scope,
@@ -162,6 +173,10 @@ impl RestartAdmission {
             }),
             Err(_) => None,
         };
+        if let (Some(holder), Some(previous)) = (holder.as_mut(), diagnostic.holder.as_ref()) {
+            holder.retain_compatible_physical(previous);
+        }
+        diagnostic.holder = holder;
         Ok(())
     }
 
@@ -412,6 +427,23 @@ pub(super) async fn bounded_read<T>(
     }
 }
 
+// Both a completed read and a rejected admission share the original budget.
+// The next loop revalidates identity and occupancy before any lease dispatch.
+async fn wait_restart_poll(deadline: tokio::time::Instant) -> AppResult<()> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(deadline_exhausted());
+    }
+    let cancel = cancellation();
+    tokio::select! {
+        () = tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + POLL)) => {}
+        () = cancel.cancelled() => return Err(abandoned()),
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return Err(deadline_exhausted());
+    }
+    Ok(())
+}
+
 impl AppService {
     pub(crate) fn restart_admission_deadline(&self) -> AppResult<tokio::time::Instant> {
         let deadline = tokio::time::Instant::now()
@@ -452,7 +484,20 @@ impl AppService {
                 }
             }
             AppOperationError::ConflictBlocked { blocker, .. } => Some(blocker),
-            _ => {
+            AppOperationError::NotFound(_)
+            | AppOperationError::OperationNotFound(_)
+            | AppOperationError::AlreadyExists(_)
+            | AppOperationError::InvalidState(_)
+            | AppOperationError::FileNotFound(_)
+            | AppOperationError::Validation(_)
+            | AppOperationError::DevNotRunning(_)
+            | AppOperationError::Backend(_)
+            | AppOperationError::Diagnostic(_)
+            | AppOperationError::CredentialApplication { .. }
+            | AppOperationError::RuntimeRejected(_)
+            | AppOperationError::Conflict(_)
+            | AppOperationError::HotDeployEnvChange(_)
+            | AppOperationError::Operation { .. } => {
                 invalidate_diagnostic()?;
                 return Err(error);
             }
@@ -487,18 +532,7 @@ impl AppService {
             }
             return Err(holder.into_error());
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(deadline_exhausted());
-        }
-        let cancel = cancellation();
-        tokio::select! {
-            () = tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + POLL)) => {}
-            () = cancel.cancelled() => return Err(abandoned()),
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(deadline_exhausted());
-        }
-        Ok(())
+        wait_restart_poll(deadline).await
     }
 
     pub(crate) async fn acquire_restart_admission_guard(
@@ -552,6 +586,26 @@ impl AppService {
                 }
                 observe_compute_intent(&status)?;
             }
+            // Wait on the completed authoritative read before dispatching a
+            // physical lease write. Do not enrich this observation again: a
+            // holder can finish between reads without an admission rejection.
+            let holder = bounded_read(
+                deadline,
+                self.observe_operation_holder(app_id, UserAppOperationScope::Prod, None, None),
+            )
+            .await?;
+            if holder.blocker.is_some() {
+                if !holder.may_wait {
+                    return Err(holder.into_error());
+                }
+                wait_restart_poll(deadline).await?;
+                continue;
+            }
+            #[cfg(test)]
+            super::traffic_wake_wait::pause_at(
+                super::traffic_wake_wait::WakePausePoint::RestartLeaseReady,
+            )
+            .await;
             let lock = self
                 .release_locks
                 .entry((app_id.to_owned(), UserAppOperationScope::Prod))

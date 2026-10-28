@@ -40,38 +40,22 @@ pub fn manifest_to_shared_agent_info(m: &AgentManifest) -> AgentInfo {
 
 /// proto InstallType → shared InstallType
 ///
-/// Proto `Unspecified(0)` 映射为 `Unknown`,其余按值映射。
-/// 无效的 i32 值也映射为 `Unknown`(fail-safe)。
+/// 集中实现在 `shared_types::agent::mgmt_proto`（HTTP 转发层共用）：
+/// `Unspecified(0)` 与无效 i32 均为 `Unknown`（观察未知不伪装）。
 pub fn install_type_from_proto(p: i32) -> SharedInstallType {
-    match ProtoInstallType::try_from(p) {
-        Ok(ProtoInstallType::Builtin) => SharedInstallType::Builtin,
-        Ok(ProtoInstallType::Binary) => SharedInstallType::Binary,
-        Ok(ProtoInstallType::Npm) => SharedInstallType::Npm,
-        Ok(ProtoInstallType::Url) => SharedInstallType::Url,
-        _ => SharedInstallType::Unknown,
-    }
+    SharedInstallType::from_proto_i32(p)
 }
 
 /// shared InstallType → proto
+///
+/// 集中实现：`Unknown` → `Unspecified(0)`。安装输入入口对 Unknown 的显式拒绝
+/// 在 grpc.rs 保持不变。
 pub fn install_type_to_proto(t: SharedInstallType) -> ProtoInstallType {
-    match t {
-        SharedInstallType::Builtin => ProtoInstallType::Builtin,
-        SharedInstallType::Binary => ProtoInstallType::Binary,
-        SharedInstallType::Npm => ProtoInstallType::Npm,
-        SharedInstallType::Url => ProtoInstallType::Url,
-        // Unknown 是 shared 端 fail-safe 值,不会主动从 agent_runner 发出
-        SharedInstallType::Unknown => ProtoInstallType::Binary,
-    }
+    ProtoInstallType::try_from(t.to_proto_i32()).unwrap_or(ProtoInstallType::Unspecified)
 }
 
 fn install_status_to_proto(s: SharedStatus) -> ProtoStatus {
-    match s {
-        SharedStatus::Available => ProtoStatus::Available,
-        SharedStatus::Broken => ProtoStatus::Broken,
-        SharedStatus::NotInstalled => ProtoStatus::NotInstalled,
-        // Unknown 是 shared 端 fail-safe 值
-        SharedStatus::Unknown => ProtoStatus::NotInstalled,
-    }
+    ProtoStatus::try_from(s.to_proto_i32()).unwrap_or(ProtoStatus::Unspecified)
 }
 
 fn infer_status(m: &AgentManifest) -> SharedStatus {
@@ -120,12 +104,7 @@ pub fn install_response_to_shared(p: &ProtoInstallResp) -> SharedInstallResp {
 }
 
 fn install_status_from_proto(i: i32) -> AgentInstallStatus {
-    match ProtoStatus::try_from(i) {
-        Ok(ProtoStatus::Available) => AgentInstallStatus::Available,
-        Ok(ProtoStatus::Broken) => AgentInstallStatus::Broken,
-        Ok(ProtoStatus::NotInstalled) => AgentInstallStatus::NotInstalled,
-        _ => AgentInstallStatus::Unknown,
-    }
+    AgentInstallStatus::from_proto_i32(i)
 }
 
 #[cfg(test)]
@@ -145,6 +124,58 @@ mod tests {
             let back = install_type_from_proto(p as i32);
             assert_eq!(t, back);
         }
+    }
+
+    /// R10 反例: SharedUnknown → ProtoBinary 把"观察到的未知"伪装成具体安装
+    /// 方式; 应回 proto Unspecified(0), 双向未知保持未知。
+    #[test]
+    fn unknown_install_type_maps_to_proto_unspecified_both_ways() {
+        assert_eq!(
+            install_type_to_proto(InstallType::Unknown),
+            ProtoInstallType::Unspecified
+        );
+        for v in [0, -1, 999] {
+            assert_eq!(install_type_from_proto(v), InstallType::Unknown, "{v}");
+        }
+    }
+
+    /// R10 反例: SharedUnknown 状态 → ProtoNotInstalled 把未知伪装成"未安装"。
+    #[test]
+    fn unknown_status_maps_to_proto_unspecified_both_ways() {
+        assert_eq!(
+            install_status_to_proto(SharedStatus::Unknown),
+            ProtoStatus::Unspecified
+        );
+        for v in [0, -1, 999] {
+            assert_eq!(install_status_from_proto(v), SharedStatus::Unknown, "{v}");
+        }
+    }
+
+    /// R10: 持久 registry 的 install_type=unknown 经 gRPC 列表
+    /// (manifest→proto→HTTP 转发)与直接 shared 列表两条查询路径展示一致。
+    #[test]
+    fn persisted_unknown_install_type_displays_consistently() {
+        let m = AgentManifest::new(
+            "legacy".into(),
+            InstallType::Unknown,
+            "legacy".into(),
+            vec![],
+            "/nonexistent/legacy".into(),
+            0,
+            "executable".into(),
+        );
+        let proto = manifest_to_proto_agent_info(&m);
+        assert_eq!(proto.install_type, ProtoInstallType::Unspecified as i32);
+        assert_eq!(
+            install_type_from_proto(proto.install_type),
+            InstallType::Unknown,
+            "gRPC path must surface unknown, not a concrete install type"
+        );
+        assert_eq!(
+            manifest_to_shared_agent_info(&m).install_type,
+            InstallType::Unknown,
+            "direct list path must surface unknown"
+        );
     }
 
     #[test]

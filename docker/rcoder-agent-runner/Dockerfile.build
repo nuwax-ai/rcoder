@@ -40,6 +40,8 @@ RUN echo "Code hash: ${CRATES_HASH}"
 # 复制 Cargo.toml 和 Cargo.lock
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+# Root PG admission uses the reviewed official driver supervision patch.
+COPY vendor ./vendor
 # workspace 成员（tests-e2e 被 Cargo.toml members 引用，缺失则 manifest 加载失败）
 COPY tests-e2e ./tests-e2e
 # utoipa-swagger-ui build.rs 的 swagger-ui 资源：宿主预下载 vendor（构建容器直连

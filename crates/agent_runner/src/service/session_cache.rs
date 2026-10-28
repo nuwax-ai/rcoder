@@ -52,6 +52,56 @@ fn truncate_message_for_log(data: &serde_json::Value, max_len: usize) -> String 
 /// 全局Session缓存 - LazyLock初始化
 pub static SESSION_CACHE: LazyLock<DashMap<String, Arc<SessionData>>> = LazyLock::new(DashMap::new);
 
+/// Preparation state has no cache or stream identity. Established IDs remain opaque.
+pub(crate) fn require_cache_session_id(session_id: &str) -> Result<&str> {
+    shared_types::SessionHint::classify(Some(session_id))
+        .as_session_id()
+        .ok_or_else(|| {
+            anyhow::anyhow!("A real session identity is required for session messages and progress")
+        })
+}
+
+/// The only production cache allocator. Never inspect or mutate a historical
+/// absent-identity cache, and never replace a newer worker after an await.
+pub(crate) async fn get_or_create_session_data(session_id: &str) -> Result<Arc<SessionData>> {
+    use dashmap::mapref::entry::Entry;
+
+    require_cache_session_id(session_id)?;
+    if let Some(existing) = SESSION_CACHE.view(session_id, |_, data| data.clone()) {
+        if !existing.has_worker_panicked().await {
+            return Ok(existing);
+        }
+        warn!(
+            session_id,
+            "Session worker panicked; recovering the observed cache instance"
+        );
+        let replacement = SessionData::new(RING_BUFFER_SIZE).await;
+        return Ok(match SESSION_CACHE.entry(session_id.to_owned()) {
+            Entry::Occupied(mut entry) => {
+                if Arc::ptr_eq(entry.get(), &existing) {
+                    entry.insert(replacement.clone());
+                    replacement
+                } else {
+                    entry.get().clone()
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(replacement.clone());
+                replacement
+            }
+        });
+    }
+
+    let data = SessionData::new(RING_BUFFER_SIZE).await;
+    Ok(match SESSION_CACHE.entry(session_id.to_owned()) {
+        Entry::Occupied(entry) => entry.get().clone(),
+        Entry::Vacant(entry) => {
+            entry.insert(data.clone());
+            data
+        }
+    })
+}
+
 /// 会话 ring buffer（UnifiedSessionMessage 循环缓冲）的生产容量。
 ///
 /// 所有生产路径（session_cache / gRPC 订阅 / computer_chat / 本地 agent 服务）
@@ -157,9 +207,11 @@ impl SessionData {
         let channel_start = std::time::Instant::now();
         // 容量 1000（COMMAND_CHANNEL_BUFFER_SIZE）不变；hotpath channel! 关闭时
         // 原样返回原生通道，开启时包装端点记录排队延迟（/channels label）。
+        // Use the supported expression-label arm: literal labels in 0.28.7
+        // export a uniqueness symbol, which conflicts with unsafe_code=deny.
         let (command_tx, command_rx): (obs_mpsc::Sender<_>, obs_mpsc::Receiver<_>) = hotpath::channel!(
             mpsc::channel(COMMAND_CHANNEL_BUFFER_SIZE),
-            label = "session_worker_commands"
+            label = { "session_worker_commands" }
         );
         debug!(
             "[SessionData::new] Channel creation took: {:?}",
@@ -387,6 +439,7 @@ impl SessionData {
 
     /// Enqueue reliably. Dropping this future before admission cancels the send.
     pub async fn push_message(&self, message: UnifiedSessionMessage) -> Result<()> {
+        require_cache_session_id(&message.session_id)?;
         self.command_tx
             .send(SessionCommand::Push {
                 message,
@@ -402,6 +455,7 @@ impl SessionData {
         message: UnifiedSessionMessage,
         connection_ids: &[u64],
     ) -> Result<()> {
+        require_cache_session_id(&message.session_id)?;
         self.command_tx
             .send(SessionCommand::Push {
                 message,
@@ -477,6 +531,17 @@ pub async fn push_session_update_with_project(
     session_id: &str,
     notify: SessionNotify,
 ) -> Result<()> {
+    validate_session_notification(session_id, &notify)?;
+    // A current foreign execution with an open dispatch channel is an owned
+    // resource. Unregistered early notifications and closed historical entries
+    // still follow the existing buffer path; an old index alone is no barrier.
+    let foreign_live_execution = AGENT_REGISTRY
+        .get_agent_info_by_session(session_id)
+        .is_some_and(|info| info.key().as_str() != project_id && !info.prompt_tx.is_closed());
+    anyhow::ensure!(
+        !foreign_live_execution,
+        "Session notification belongs to another live project execution"
+    );
     // 确保project_id对应正确的session_id，如果变化则清理旧数据
     let cleared_count = ensure_project_session(project_id, session_id).await;
 
@@ -503,6 +568,9 @@ pub async fn push_session_update_with_project(
 ///
 /// 返回值: 如果清理了旧数据则返回清理的消息数量，否则返回0
 pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize {
+    if require_cache_session_id(session_id).is_err() {
+        return 0;
+    }
     // 使用统一 Registry 检查当前映射
     let mapped_session_id = AGENT_REGISTRY.get_session_by_project(project_id);
 
@@ -594,57 +662,27 @@ pub async fn ensure_project_session(project_id: &str, session_id: &str) -> usize
 /// 如果 SESSION_CACHE 中不存在该 session_id 的条目，会自动创建。
 /// 这解决了 Agent 开始推送消息时 SESSION_CACHE 条目尚未由 HTTP 处理器创建的竞态问题。
 pub async fn push_session_update(session_id: &str, notify: SessionNotify) -> Result<()> {
-    use dashmap::mapref::entry::Entry;
-
-    // 🛡️ 关键修复：不在 DashMap entry() 持锁范围内调用 .await
-    // 之前 .await 在 entry() 作用域内执行，持有 shard 写锁跨 yield point，
-    // 导致同 shard 的所有并发操作被阻塞（包括其他 session 的 push/get）。
-    //
-    // 修复策略：
-    // 1. 快速路径：get() + 检查（只持 shard 读锁，不在锁内 await）
-    // 2. 慢速路径：先在 entry() 外部 await 创建 SessionData，再原子插入
-
-    // 快速路径：session 存在 → 检查 worker 状态 → 推送
-    // view() 在闭包返回后立即释放锁，无 Ref 暴露
-    if let Some(existing) = SESSION_CACHE.view(session_id, |_, d| d.clone()) {
-        if existing.has_worker_panicked().await {
-            // Worker panic：在 entry() 外部创建新 SessionData
-            warn!(
-                "[push_session_update] SessionWorker panicked for session_id={}, recreating...",
-                session_id
-            );
-            let new_data = SessionData::new(RING_BUFFER_SIZE).await;
-            // entry API 原子替换（语义更明确）
-            SESSION_CACHE
-                .entry(session_id.to_string())
-                .and_modify(|d| *d = new_data.clone())
-                .or_insert_with(|| new_data.clone());
-            new_data.push_message(notify.to_unified_message()).await?;
-        } else {
-            existing.push_message(notify.to_unified_message()).await?;
-        }
-        return Ok(());
-    }
-
-    // 慢速路径：session 不存在 → 在 entry() 外部 await 创建
-    let data = SessionData::new(RING_BUFFER_SIZE).await;
-    info!(
-        "[push_session_update] SESSION_CACHE auto-created: session_id={}",
-        session_id
-    );
-
-    // 原子插入（如果其他任务先创建了，则使用现有的）
-    let session_data = match SESSION_CACHE.entry(session_id.to_string()) {
-        Entry::Occupied(entry) => entry.get().clone(),
-        Entry::Vacant(entry) => {
-            entry.insert(data.clone());
-            data
-        }
-    };
-
-    session_data
+    validate_session_notification(session_id, &notify)?;
+    get_or_create_session_data(session_id)
+        .await?
         .push_message(notify.to_unified_message())
-        .await?;
+        .await
+}
+
+fn validate_session_notification(session_id: &str, notify: &SessionNotify) -> Result<()> {
+    require_cache_session_id(session_id)?;
+    let notification_sid = match notify {
+        SessionNotify::AgentSessionUpdate(update) => update.session_id.as_str(),
+        SessionNotify::SessionPromptStart(start) => start.session_id.as_str(),
+        SessionNotify::SessionPromptEnd(end) => end.session_id.as_str(),
+        SessionNotify::SessionPromptError(error) => error.session_id.as_str(),
+        SessionNotify::AcpRequestPermission(permission) => permission.session_id.as_str(),
+    };
+    require_cache_session_id(notification_sid)?;
+    anyhow::ensure!(
+        notification_sid == session_id,
+        "Session message identity does not match its target cache"
+    );
     Ok(())
 }
 

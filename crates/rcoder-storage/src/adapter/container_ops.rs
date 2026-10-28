@@ -11,11 +11,44 @@ use shared_types::{ContainerBasicInfo, ContainerEntry, ProjectAndContainerInfo, 
 use tracing::info;
 
 use super::ProjectAdapter;
-use shared_types::CleanupRequest;
 use shared_types::IdleContainerInfo;
 
 impl ProjectAdapter {
     // ========== 容器操作 ==========
+
+    #[cfg(feature = "pg")]
+    pub(crate) fn registered_container_by_key(&self, key: &str) -> Option<ContainerBasicInfo> {
+        self.containers.view(key, |_, entry| entry.info())
+    }
+
+    /// Restore an authoritative container after pruning its retired predecessor.
+    #[cfg(feature = "pg")]
+    pub(crate) fn restore_unreferenced_container(
+        &self,
+        basic: ContainerBasicInfo,
+        service_type: ServiceType,
+    ) -> anyhow::Result<()> {
+        let _container = self.container_locks.entry_by_ref(&basic.container_name);
+        anyhow::ensure!(
+            !self
+                .project_to_container
+                .iter()
+                .any(|entry| entry.value() == &basic.container_name),
+            "Cannot restore a container mirror over live project references"
+        );
+        let Entry::Vacant(entry) = self.containers.entry(basic.container_name.clone()) else {
+            anyhow::bail!("Container mirror changed during authoritative restoration");
+        };
+        entry.insert(Arc::new(ContainerEntry::with_ref_count(
+            basic.clone(),
+            service_type.family_representative(),
+            basic.project_id.clone(),
+            0,
+        )));
+        self.container_id_to_key
+            .insert(basic.container_id, basic.container_name);
+        Ok(())
+    }
 
     /// 保存容器信息（更新或创建）
     ///
@@ -43,6 +76,8 @@ impl ProjectAdapter {
                 ));
             }
         };
+
+        let _container_guard = self.container_locks.entry_by_ref(&container.container_name);
 
         // view() 获取 Arc（DashMap 读锁立即释放），通过 RwLock 更新字段。
         // 键用 container_name（与 insert 的 container_entry_key 一致）。
@@ -82,7 +117,42 @@ impl ProjectAdapter {
         Ok(())
     }
 
-    /// 删除容器及其关联的所有项目（RAII 触发物理销毁）
+    /// 移除本地容器镜像条目（peer 副本已 durable 删除后的镜像收敛）。
+    ///
+    /// 与 [`Self::delete_container_with_projects`] 的差异：要求该容器无
+    /// 本地 project 引用。`expected_physical_uid` 与条目实际身份不符时返回
+    /// false（快照之后本地已有新写入，保守留待下一轮对账）。条目已经不存在
+    /// 且无 project 引用时返回 true，允许调用方一并清理孤立注册游标。
+    #[cfg(feature = "pg")]
+    pub(crate) fn prune_container_mirror(
+        &self,
+        name: &str,
+        expected_physical_uid: Option<&str>,
+    ) -> bool {
+        let _container_guard = self.container_locks.entry_by_ref(name);
+        if self
+            .project_to_container
+            .iter()
+            .any(|entry| entry.value() == name)
+        {
+            return false;
+        }
+        let Entry::Occupied(entry) = self.containers.entry(name.to_string()) else {
+            return true;
+        };
+        let info = entry.get().info();
+        let actual = (!info.container_id.is_empty()).then_some(info.container_id.as_str());
+        if actual != expected_physical_uid {
+            return false;
+        }
+        let (_name, removed) = entry.remove_entry();
+        let info = removed.info();
+        self.container_id_to_key.remove(&info.container_id);
+        true
+    }
+
+    /// 删除容器及其关联项目的元数据，不提交物理删除或连接/路由清理。
+    /// 调用方负责通过原受控入口完成对应物理实例的退休。
     ///
     /// 返回 (容器是否存在, 删除的项目数)
     pub fn delete_container_with_projects(&self, container_id: &str) -> (bool, usize) {
@@ -130,23 +200,6 @@ impl ProjectAdapter {
             // 清理反向索引
             let info = entry.info();
             self.container_id_to_key.remove(&info.container_id);
-            // identifier 用裸 logical_id（清理链路按 logical id）
-            if let Err(e) = self.cleanup_tx.try_send(CleanupRequest {
-                identifier: entry.logical_id().to_string(),
-                container_name: info.container_name,
-                service_type: entry.service_type(),
-                container_ip: info.container_ip,
-                namespace: self.namespace.clone(),
-                cluster_domain: self.cluster_domain.clone(),
-                project_ids,
-                retry_count: 0,
-            }) {
-                tracing::error!(
-                    "[STORAGE] cleanup channel try_send failed (full or ResourceReaper down?), container leak risk: identifier={}, {}",
-                    entry.logical_id(),
-                    e
-                );
-            }
         }
 
         (container_existed, count)
@@ -189,12 +242,18 @@ impl ProjectAdapter {
         user_id: &str,
         service_type: &ServiceType,
     ) -> Option<ContainerBasicInfo> {
-        let p = self
-            .find_projects_by_user_id(user_id, service_type)
-            .into_iter()
-            .next()?;
-        // 统一走 containers[name] 权威源（service_type 已由 find_projects_by_user_id 过滤）
-        self.container_info_by_project(p.project_id())
+        // 同 user 的同 ServiceType 活跃项目共享同一容器，但候选取首个**可解析出
+        // 容器**的：高频"回收→重建"用户会累积大量已退休 project（service_type
+        // 保留、无容器），而多值索引是无序 DashSet——首个候选可能是退休行，
+        // `project_to_container` 无此键。只取首个会在此时整体返回 None（生产
+        // 2026-10-27：三副本仅个别副本 404、重启不恢复的直接根因），遍历跳过
+        // 无容器候选即可。
+        for project in self.find_projects_by_user_id(user_id, service_type) {
+            if let Some(info) = self.container_info_by_project(project.project_id()) {
+                return Some(info);
+            }
+        }
+        None
     }
 
     /// 通过 pod_id 获取容器信息（O(1) 索引查找）
@@ -315,7 +374,7 @@ impl ProjectAdapter {
 
     // ========== 内部方法 ==========
 
-    /// 减少容器引用计数，归零时触发 RAII 清理
+    /// 减少容器引用计数，归零后保留记录供闲置扫描观察
     ///
     /// 使用 entry() API 实现 dec_ref + remove 的原子操作，
     /// 消除 view() + remove() 之间的 TOCTOU 竞态。

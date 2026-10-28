@@ -180,40 +180,82 @@ impl KubernetesRuntime {
             ContainerRuntimeError::K8sError(format!("Observe original operation lease: {error}"))
         })?
         else {
-            return Ok(AppOperationLeaseObservation::Unconfirmed);
+            // Lease absent: the same receipt may still address a legacy
+            // ConfigMap lease (validate/release both fall back), so absence
+            // can only be declared after that fallback also finds nothing.
+            // A retained identity-matching ConfigMap stays conservatively Held
+            // (no TTL to read); this does not prove its holder process is alive.
+            return if self
+                .validate_captured_configmap(context, service_type, name, receipt)
+                .await?
+            {
+                Ok(AppOperationLeaseObservation::Held)
+            } else {
+                // Both object forms checked and absent: this backend DID
+                // check, so absence is a positive observation. It says nothing
+                // about already-issued writes. Unconfirmed stays reserved for
+                // backends that cannot check at all.
+                Ok(AppOperationLeaseObservation::AbsentOriginalIdentity)
+            };
         };
         let annotations = current.metadata.annotations.as_ref().ok_or_else(|| {
             ContainerRuntimeError::Conflict(
                 "Original operation lease execution metadata missing".into(),
             )
         })?;
-        // Lease creation stores app identity in its operation-app label. The
-        // remaining execution fields are annotations; this normalizes only an
-        // omitted duplicate, retaining any contradictory existing annotation.
-        let mut execution_metadata = annotations.clone();
-        if !execution_metadata.contains_key("rcoder.io/application-id")
-            && let Some(app) = current
-                .metadata
-                .labels
-                .as_ref()
-                .and_then(|labels| labels.get("rcoder.io/operation-app"))
-        {
-            execution_metadata.insert("rcoder.io/application-id".into(), app.clone());
-        }
-        context
-            .validate_operation_metadata(&execution_metadata)
-            .map_err(ContainerRuntimeError::Conflict)?;
-        if annotations
-            .get("rcoder.io/compute-lease")
-            .map(String::as_str)
-            == Some("true")
-            && (token != &context.executor_id
-                || annotations.get("rcoder.io/lease-token") != Some(token))
-        {
-            return Err(ContainerRuntimeError::Conflict(
-                "Original compute lease attempt token changed".into(),
-            ));
-        }
+        let expected_holder = if annotations.get("rcoder.io/legacy-operation-id") == Some(token) {
+            // Ordinary application operations acquire this exact mutex before
+            // SQL admission assigns an executor. Its durable binding associates
+            // the random token with that later operation; missing execution
+            // annotations are expected, not evidence of a different owner.
+            // Existing contradictory fields still identify a different attempt.
+            if annotations
+                .get("rcoder.io/compute-lease")
+                .map(String::as_str)
+                == Some("true")
+                || annotations
+                    .get("rcoder.io/lease-token")
+                    .is_some_and(|value| !value.is_empty())
+                || context.resource_metadata().iter().any(|(key, expected)| {
+                    annotations
+                        .get(key)
+                        .is_some_and(|actual| !actual.is_empty() && actual != expected)
+                })
+            {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Original legacy operation lease execution identity changed".into(),
+                ));
+            }
+            format!("legacy:{token}")
+        } else {
+            // Context-bound operations stamp every execution field. Only the
+            // redundant application annotation can be supplied by its label.
+            let mut execution_metadata = annotations.clone();
+            if !execution_metadata.contains_key("rcoder.io/application-id")
+                && let Some(app) = current
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get("rcoder.io/operation-app"))
+            {
+                execution_metadata.insert("rcoder.io/application-id".into(), app.clone());
+            }
+            context
+                .validate_operation_metadata(&execution_metadata)
+                .map_err(ContainerRuntimeError::Conflict)?;
+            if annotations
+                .get("rcoder.io/compute-lease")
+                .map(String::as_str)
+                == Some("true")
+                && (token != &context.executor_id
+                    || annotations.get("rcoder.io/lease-token") != Some(token))
+            {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Original compute lease attempt token changed".into(),
+                ));
+            }
+            format!("{}:{}", context.executor_id, context.operation_id)
+        };
         let identity_matches = current.metadata.uid.as_deref() == Some(uid.as_str())
             && holder_token(&current).as_deref() == Some(token.as_str())
             && current
@@ -232,7 +274,7 @@ impl KubernetesRuntime {
                 .spec
                 .as_ref()
                 .and_then(|spec| spec.holder_identity.as_deref())
-                == Some(format!("{}:{}", context.executor_id, context.operation_id).as_str())
+                == Some(expected_holder.as_str())
             && current.metadata.deletion_timestamp.is_none();
         if !identity_matches {
             return Err(ContainerRuntimeError::Conflict(
@@ -290,6 +332,129 @@ impl KubernetesRuntime {
             ));
         }
         Ok(true)
+    }
+
+    /// Read-only discovery of a historical builder creation's native
+    /// authority for a stale `Running` EnsureBuilder without a persisted
+    /// receipt. Identity is located by durable fields only (name from
+    /// app/family, holder from the record's executor/operation); annotations
+    /// must match the recorded execution. Missing renewal/identity fields are
+    /// unknown, rather than proof of a dead holder. Legacy ConfigMap stock is
+    /// still a possible authority during a rolling upgrade.
+    pub(crate) async fn observe_unbound_builder_creation_authority(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<container_runtime_api::UnboundBuilderCreationAuthority> {
+        use container_runtime_api::UnboundBuilderCreationAuthority;
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let service_type = ServiceType::UserappBuilder;
+        let name = operation_name(&context.app_id, &service_type)?;
+        let legacy: Api<ConfigMap> = Api::namespaced(self.client.clone(), &self.namespace);
+        if legacy
+            .get_opt(&name)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::K8sError(format!(
+                    "Observe unbound legacy builder authority: {error}"
+                ))
+            })?
+            .is_some()
+        {
+            return Ok(UnboundBuilderCreationAuthority::Foreign { holder: None });
+        }
+        let api: Api<Lease> = Api::namespaced(self.client.clone(), &self.namespace);
+        let Some(current) = api.get_opt(&name).await.map_err(|error| {
+            ContainerRuntimeError::K8sError(format!("Observe unbound builder authority: {error}"))
+        })?
+        else {
+            return Ok(UnboundBuilderCreationAuthority::Absent);
+        };
+        let labels = current.metadata.labels.as_ref();
+        let foreign = |holder: Option<String>| UnboundBuilderCreationAuthority::Foreign { holder };
+        let holder = current
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.holder_identity.clone());
+        if labels.and_then(|labels| labels.get("rcoder.io/operation-app")) != Some(&context.app_id)
+            || labels
+                .and_then(|labels| labels.get("rcoder.io/operation-family"))
+                .map(String::as_str)
+                != Some(service_type.to_string().as_str())
+            || current.metadata.deletion_timestamp.is_some()
+        {
+            return Ok(foreign(holder));
+        }
+        let annotations = current.metadata.annotations.as_ref();
+        // All execution fields are stamped by context-bound acquisitions.
+        // Only the redundant app annotation may be supplied by the app label.
+        let mut identity = annotations.cloned().unwrap_or_default();
+        identity
+            .entry("rcoder.io/application-id".into())
+            .or_insert_with(|| context.app_id.clone());
+        if context.validate_operation_metadata(&identity).is_err() {
+            return Ok(foreign(holder));
+        }
+        if let Some(annotations) = annotations {
+            for (key, expected) in context.resource_metadata() {
+                if annotations
+                    .get(&key)
+                    .is_some_and(|actual| !actual.is_empty() && actual != &expected)
+                {
+                    return Ok(foreign(holder));
+                }
+            }
+            if annotations
+                .get("rcoder.io/compute-lease")
+                .map(String::as_str)
+                == Some("true")
+                && annotations.get("rcoder.io/lease-token") != Some(&context.executor_id)
+            {
+                return Ok(foreign(holder));
+            }
+        }
+        let expected_holder = format!("{}:{}", context.executor_id, context.operation_id);
+        let Some(holder) = holder else {
+            return Ok(foreign(None));
+        };
+        if holder != expected_holder {
+            return Ok(foreign(Some(holder)));
+        }
+        let Some(spec) = current.spec.as_ref() else {
+            return Ok(foreign(Some(holder)));
+        };
+        if spec.renew_time.is_none() || spec.lease_duration_seconds.is_none_or(|ttl| ttl <= 0) {
+            return Ok(foreign(Some(holder)));
+        }
+        let (Some(uid), Some(resource_version), Some(token)) = (
+            current.metadata.uid.clone().filter(|v| !v.is_empty()),
+            current
+                .metadata
+                .resource_version
+                .clone()
+                .filter(|v| !v.is_empty()),
+            holder_token(&current),
+        ) else {
+            return Ok(foreign(Some(holder)));
+        };
+        Ok(
+            if lease_expired_at(k8s_openapi::jiff::Timestamp::now(), &current) {
+                UnboundBuilderCreationAuthority::ExpiredOriginal {
+                    holder,
+                    receipt: shared_types::UserAppOperationLeaseReceipt::Kubernetes {
+                        service_type,
+                        namespace: self.namespace.clone(),
+                        name,
+                        uid,
+                        resource_version,
+                        token,
+                    },
+                }
+            } else {
+                UnboundBuilderCreationAuthority::ActiveOriginal
+            },
+        )
     }
 
     pub(crate) async fn release_captured_application_operation(
@@ -484,6 +649,57 @@ impl KubernetesRuntime {
         context: Option<&shared_types::UserAppExecutionContext>,
         compute: bool,
     ) -> ContainerRuntimeResult<Box<dyn AppOperationLease>> {
+        self.acquire_operation_lease_mode(app_id, service_type, context, compute, true, None)
+            .await
+    }
+
+    pub(crate) async fn acquire_vacant_application_operation(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Box<dyn AppOperationLease>> {
+        self.acquire_operation_lease_mode(app_id, &ServiceType::Userapp, None, false, false, None)
+            .await
+    }
+
+    pub(crate) async fn acquire_observed_expired_application_operation(
+        &self,
+        app_id: &str,
+        current_lifecycle_id: &str,
+        observed: &container_runtime_api::AppOperationMutexIdentity,
+    ) -> ContainerRuntimeResult<Box<dyn AppOperationLease>> {
+        if app_id.is_empty() || current_lifecycle_id.is_empty() {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Observed-expired acquisition requires application and current lifecycle IDs"
+                    .into(),
+            ));
+        }
+        let name = operation_name(app_id, &ServiceType::Userapp)?;
+        observation::validate_observed_scope(
+            observed,
+            &self.namespace,
+            &name,
+            current_lifecycle_id,
+        )?;
+        self.acquire_operation_lease_mode(
+            app_id,
+            &ServiceType::Userapp,
+            None,
+            false,
+            false,
+            Some((current_lifecycle_id, observed)),
+        )
+        .await
+    }
+
+    async fn acquire_operation_lease_mode(
+        &self,
+        app_id: &str,
+        service_type: &ServiceType,
+        context: Option<&shared_types::UserAppExecutionContext>,
+        compute: bool,
+        allow_takeover: bool,
+        observed_expired: Option<(&str, &container_runtime_api::AppOperationMutexIdentity)>,
+    ) -> ContainerRuntimeResult<Box<dyn AppOperationLease>> {
         if !matches!(
             service_type,
             ServiceType::Userapp | ServiceType::UserappBuilder
@@ -518,6 +734,9 @@ impl KubernetesRuntime {
             let legacy_id = uuid::Uuid::new_v4().to_string();
             annotations.insert("rcoder.io/legacy-operation-id".into(), legacy_id.clone());
             holder_identity = format!("legacy:{legacy_id}");
+        }
+        if let Some((current_lifecycle_id, _)) = observed_expired {
+            annotations.insert("rcoder.io/lifecycle-id".into(), current_lifecycle_id.into());
         }
         if compute {
             let context = context.ok_or_else(|| {
@@ -560,14 +779,45 @@ impl KubernetesRuntime {
                 ..Default::default()
             }),
         };
-        let acquired = match api.create(&PostParams::default(), &object).await {
-            Ok(created) => created,
-            Err(kube::Error::Api(status)) if status.code == 409 => {
-                match take_over_expired(&api, &name, &object).await? {
-                    TakeOver::Acquired(taken) => *taken,
-                    TakeOver::InProgress(operation_id) => {
-                        // Report the live holder's identity, never this losing
-                        // request's UUID; None means an unidentifiable holder.
+        let acquired = if let Some((current_lifecycle_id, observed)) = observed_expired {
+            // Never POST from an expired observation: disappearance, renewal or
+            // a successor requires a new read and normal admission decision.
+            match take_over_observed_expired(
+                &api,
+                &self.namespace,
+                &name,
+                app_id,
+                current_lifecycle_id,
+                observed,
+                &object,
+            )
+            .await?
+            {
+                TakeOver::Acquired(taken) => *taken,
+                TakeOver::InProgress(operation_id) => {
+                    return Err(ContainerRuntimeError::OperationInProgress(Box::new(
+                        shared_types::UserAppOperationInProgress {
+                            app_id: app_id.into(),
+                            service_type: *service_type,
+                            resource_name: name,
+                            operation_id,
+                        },
+                    )));
+                }
+            }
+        } else {
+            match api.create(&PostParams::default(), &object).await {
+                Ok(created) => created,
+                Err(kube::Error::Api(status)) if status.code == 409 => {
+                    if !allow_takeover {
+                        // The losing create is definitively rejected. Observe only;
+                        // expiry and preflight absence never authorize a patch.
+                        let current = api.get_opt(&name).await.map_err(|error| {
+                            ContainerRuntimeError::K8sError(format!(
+                                "Read occupied application mutex after rejected create: {error}"
+                            ))
+                        })?;
+                        let operation_id = current.as_ref().and_then(holder_token);
                         return Err(ContainerRuntimeError::OperationInProgress(Box::new(
                             shared_types::UserAppOperationInProgress {
                                 app_id: app_id.into(),
@@ -577,12 +827,27 @@ impl KubernetesRuntime {
                             },
                         )));
                     }
+                    match take_over_expired(&api, &name, &object).await? {
+                        TakeOver::Acquired(taken) => *taken,
+                        TakeOver::InProgress(operation_id) => {
+                            // Report the live holder's identity, never this losing
+                            // request's UUID; None means an unidentifiable holder.
+                            return Err(ContainerRuntimeError::OperationInProgress(Box::new(
+                                shared_types::UserAppOperationInProgress {
+                                    app_id: app_id.into(),
+                                    service_type: *service_type,
+                                    resource_name: name,
+                                    operation_id,
+                                },
+                            )));
+                        }
+                    }
                 }
-            }
-            Err(error) => {
-                return Err(ContainerRuntimeError::K8sError(format!(
-                    "acquire application operation {name}: {error}"
-                )));
+                Err(error) => {
+                    return Err(ContainerRuntimeError::K8sError(format!(
+                        "acquire application operation {name}: {error}"
+                    )));
+                }
             }
         };
         let uid = acquired

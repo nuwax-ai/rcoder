@@ -730,8 +730,22 @@ fn resolve_subdir_parent_dir_overflow_rejected() {
 
 #[test]
 fn strip_leading_root_components_uses_host_component_semantics() {
-    assert_eq!(strip_leading_root_components("src/a.md"), "src/a.md");
-    assert_eq!(strip_leading_root_components("/src/a.md"), "src/a.md");
+    // 组件层剥根，段间分隔符按宿主原样回填（本函数喂给 Path 操作用，
+    // 不做 wire 归一——归一是 path_safety::host_relative_to_wire 的职责）。
+    // 故分隔符预期随平台：Windows 回填 `\`，POSIX 回填 `/`。
+    #[cfg(windows)]
+    let slash = '\\';
+    #[cfg(not(windows))]
+    let slash = '/';
+
+    assert_eq!(
+        strip_leading_root_components("src/a.md"),
+        format!("src{slash}a.md")
+    );
+    assert_eq!(
+        strip_leading_root_components("/src/a.md"),
+        format!("src{slash}a.md")
+    );
     assert_eq!(strip_leading_root_components("//src"), "src");
     assert_eq!(strip_leading_root_components("/"), "");
     // 宿主语义（有意偏离 TS 的字符集剥法）：POSIX 上 `\` 是普通文件名字符，

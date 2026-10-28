@@ -1,7 +1,7 @@
 //! 容器条目：带引用计数和活跃时间跟踪
 //!
 //! 每个 ContainerEntry 对应一个物理容器（Docker container 或 K8s Pod）。
-//! ref_count 跟踪有多少 project 引用此容器，归零时触发 RAII 清理。
+//! ref_count 跟踪有多少 project 引用此容器，归零时保留条目供受控闲置回收。
 //!
 //! 使用 `Arc<ContainerEntry>` 共享，避免 Clone 导致原子状态分裂。
 //! `info` 和 `service_type` 使用 `RwLock` 实现内部可变性。
@@ -22,8 +22,7 @@ pub struct ContainerEntry {
     /// 服务类型（RwLock: 允许通过 Arc 更新）
     service_type: RwLock<ServiceType>,
     /// 逻辑标识（Computer→user_id/pod_id，Web→project_id/pod_id）。
-    /// 容器生命周期内稳定，供 RAII 清理作 `CleanupRequest.identifier`
-    /// （清理链路按 logical id，而非 DashMap 的 container_name 键）。
+    /// 容器生命周期内稳定，区别于 DashMap 的 container_name 键。
     logical_id: String,
     /// 引用计数：有多少 project 引用此容器
     ref_count: AtomicUsize,
@@ -71,7 +70,7 @@ impl ContainerEntry {
         *self.service_type.read()
     }
 
-    /// 获取逻辑标识（RAII 清理 identifier 用）
+    /// 获取逻辑标识（用于容器查找与显式控制）
     pub fn logical_id(&self) -> &str {
         &self.logical_id
     }

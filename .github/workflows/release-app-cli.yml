@@ -66,7 +66,7 @@ jobs:
             echo "✗ checkout does not match release tag $TAG"; exit 1; }
           VERSION="${TAG#app-cli-v}"
           # 版本一致性守卫：tag 必须与 crates/app-cli/Cargo.toml 的 version 一致
-          grep -q "^version = \"${VERSION}\"" crates/app-cli/Cargo.toml || {
+          grep -Fxq "version = \"${VERSION}\"" crates/app-cli/Cargo.toml || {
             echo "✗ tag(${TAG}) 与 crates/app-cli/Cargo.toml version 不一致："
             grep '^version' crates/app-cli/Cargo.toml
             exit 1
@@ -122,8 +122,8 @@ jobs:
         shell: bash
         run: |
           choco install protoc nasm -y --no-progress
-          echo 'C:\ProgramData\chocolatey\bin' >> "$GITHUB_PATH"
-          echo "C:\Program Files\NASM" >> "$GITHUB_PATH"
+          printf '%s\n' 'C:\ProgramData\chocolatey\bin' >> "$GITHUB_PATH"
+          printf '%s\n' 'C:\Program Files\NASM' >> "$GITHUB_PATH"
 
       # linux 双架构走 cargo-zigbuild（glibc 钉 2.17，见文件头注释）。
       - name: Install cargo-zigbuild
@@ -157,7 +157,7 @@ jobs:
           BIN=app-cli
           if [ "${{ runner.os }}" = "Windows" ]; then BIN=app-cli.exe; fi
           if [ "$TARGET_ARCH" = "${{ runner.arch }}" ]; then
-            ./target/${TARGET}/release/${BIN} --version
+            "./target/${TARGET}/release/${BIN}" --version
           else
             echo "交叉产物（宿主架构不匹配），跳过冒烟"
           fi
@@ -231,7 +231,7 @@ jobs:
         shell: bash
         run: |
           choco install protoc nasm cmake -y --no-progress
-          echo 'C:\ProgramData\chocolatey\bin' >> "$GITHUB_PATH"
+          printf '%s\n' 'C:\ProgramData\chocolatey\bin' >> "$GITHUB_PATH"
 
       # job 环境使上游 checkout 的 toolchain 配置不能覆盖本轮 stable。
       - name: Update and record Rust stable
@@ -449,6 +449,7 @@ jobs:
           name: official-pair-windows-evidence
           path: |
             official-pair-gate/receipt.json
+            official-pair-gate/failure-diagnostics.json
             official-pair-gate/*.log
             official-pair-gate/logs/
 
@@ -513,6 +514,7 @@ jobs:
           name: official-pair-${{ matrix.target }}-evidence
           path: |
             official-pair-gate/receipt.json
+            official-pair-gate/failure-diagnostics.json
             official-pair-gate/*.log
             official-pair-gate/logs/
 
@@ -557,7 +559,7 @@ jobs:
 
           # 守卫：主包 optionalDependencies 的 key 集 == 平台子包目录集（防加平台漏改）
           DEP_KEYS=$(jq -r '.optionalDependencies | keys[]' npm/app-cli/package.json | sed 's/@nuwax-ai\///' | sort)
-          DIR_KEYS=$(ls -d npm/app-cli-* | sed 's|npm/||' | sort)
+          DIR_KEYS=$(find npm -mindepth 1 -maxdepth 1 -name 'app-cli-*' | sed 's|npm/||' | sort)
           [ "$DEP_KEYS" = "$DIR_KEYS" ] || {
             echo "✗ 平台包目录与 optionalDependencies 不一致:"; echo "$DEP_KEYS"; echo "---"; echo "$DIR_KEYS"; exit 1; }
 
@@ -592,11 +594,11 @@ jobs:
           PRERELEASE: ${{ needs.meta.outputs.prerelease }}
         run: |
           set -euo pipefail
-          TAG_ARGS=""
-          if [ "$PRERELEASE" = "true" ]; then TAG_ARGS="--tag beta"; fi
+          tag_args=()
+          if [ "$PRERELEASE" = "true" ]; then tag_args=(--tag beta); fi
           failures=0
           for dir in app-cli-linux-x64 app-cli-linux-arm64 app-cli-darwin-x64 app-cli-darwin-arm64 app-cli-windows-x64; do
-            (cd "$dir" && npm publish --access public $TAG_ARGS --registry https://registry.npmjs.org) || failures=$((failures+1))
+            (cd "$dir" && npm publish --access public "${tag_args[@]}" --registry https://registry.npmjs.org) || failures=$((failures+1))
           done
           [ "$failures" -eq 0 ] || { echo "✗ $failures 个平台包发布失败"; exit 1; }
 

@@ -540,6 +540,13 @@ pub(crate) async fn recreate(
     {
         return Err(Error::LifecycleConflict);
     }
+    // Compute intents are current lifecycle pointers, not historical execution
+    // records. Retire them in this same root-CAS transaction after confirming
+    // their old executors are settled; controls and exact receipts are retained.
+    crate::userapp_lifecycle::common::compute::retire_lifecycle_heads(tx, backend, &app).await?;
+
+    #[cfg(test)]
+    crate::userapp_lifecycle::common::transaction_fault_tests::check("recreate_compute_intents")?;
     let old_revision = app.metadata_revision;
     app.lifecycle_id = uuid::Uuid::new_v4().to_string();
     app.lifecycle_epoch = app

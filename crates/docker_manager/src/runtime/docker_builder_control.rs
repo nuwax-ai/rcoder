@@ -11,7 +11,77 @@ pub(super) struct BuilderReuseSnapshot {
     pub(super) volumes: Vec<shared_types::AppResourceIdentity>,
 }
 
+/// Inspect the captured CID: None on 404 (absent), errors on transport.
+async fn inspect_captured_running(
+    client: bollard::Docker,
+    cid: &str,
+) -> Result<Option<bollard::models::ContainerInspectResponse>> {
+    match client.inspect_container(cid, None).await {
+        Ok(current) => Ok(Some(current)),
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => Ok(None),
+        Err(error) => Err(Error::DockerError(format!(
+            "Observe captured running builder: {error}"
+        ))),
+    }
+}
+
+/// The exact captured identity is executing (running and not restarting).
+fn captured_builder_executing(
+    inspect: &bollard::models::ContainerInspectResponse,
+    target: &BuilderControlTarget,
+) -> Result<bool> {
+    let Some(resource) = target.workload.as_ref() else {
+        return Ok(false);
+    };
+    if control_identity_with_binding(
+        inspect,
+        &resource.name,
+        &target.context,
+        target.resource_binding.as_ref(),
+        false,
+    )? != *resource
+    {
+        return Err(Error::Conflict(
+            "Captured Docker builder changed during running observation".into(),
+        ));
+    }
+    Ok(inspect
+        .state
+        .as_ref()
+        .is_some_and(|state| state.running == Some(true) && state.restarting != Some(true)))
+}
+
 impl DockerRuntime {
+    /// Positive running observation of the captured Docker builder: the
+    /// exact captured CID still exists (identity-checked) and Docker reports
+    /// it executing (state.running, not restarting). No operation receipt is
+    /// consulted; readiness is not judged. Read-only with a recheck.
+    pub(super) async fn observe_retained_builder_running(
+        &self,
+        target: &BuilderControlTarget,
+    ) -> Result<bool> {
+        target.validate().map_err(Error::ConfigurationError)?;
+        let Some(resource) = target.workload.as_ref() else {
+            return Ok(false);
+        };
+        if resource.kind != shared_types::AppResourceKind::Container {
+            return Ok(false);
+        }
+        let client = self.inner.get_docker_client();
+        let Some(first) = inspect_captured_running(client.clone(), &resource.uid).await? else {
+            return Ok(false);
+        };
+        if !captured_builder_executing(&first, target)? {
+            return Ok(false);
+        }
+        match inspect_captured_running(client.clone(), &resource.uid).await? {
+            Some(second) => captured_builder_executing(&second, target),
+            None => Ok(false),
+        }
+    }
+
     pub(super) async fn observe_retained_builder_stopped(
         &self,
         target: &BuilderControlTarget,
@@ -196,6 +266,67 @@ impl DockerRuntime {
             }) => Ok(true),
             Err(error) => Err(Error::DockerError(format!(
                 "Reconcile Docker builder stop: {error}"
+            ))),
+        }
+    }
+
+    pub(super) async fn observe_original_builder_restart_stop(
+        &self,
+        target: &BuilderControlTarget,
+    ) -> Result<Option<shared_types::BuilderRestartStopKind>> {
+        target.validate().map_err(Error::ConfigurationError)?;
+        let Some(original) = &target.workload else {
+            return Ok(None);
+        };
+        if original.kind != shared_types::AppResourceKind::Container
+            || target.pod.is_some()
+            || original.uid.len() != 64
+            || !original
+                .uid
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Ok(None);
+        }
+        // Actual exact-CID absence is independent of the private ACK file's
+        // existence/decodability. Never consult history first and turn its
+        // corruption into a permanent gate after the captured CID is gone.
+        match self
+            .inner
+            .get_docker_client()
+            .inspect_container(&original.uid, None)
+            .await
+        {
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(Some(
+                shared_types::BuilderRestartStopKind::CapturedContainerAbsent,
+            )),
+            Ok(info) => {
+                let actual = control_identity_with_binding(
+                    &info,
+                    &original.name,
+                    &target.context,
+                    target.resource_binding.as_ref(),
+                    false,
+                )?;
+                if actual != *original {
+                    return Err(Error::Conflict(
+                        "Original Docker stop observation identity changed".into(),
+                    ));
+                }
+                if super::docker_compute_receipt::matches_stop(target).await? {
+                    return Ok(self
+                        .reconcile_builder_stop(target)
+                        .await?
+                        .then_some(shared_types::BuilderRestartStopKind::StopReceiptAcknowledged));
+                }
+                // A stopped-looking retained CID without the original ACK is
+                // unknown, even though its labels and identity match.
+                Ok(None)
+            }
+            Err(error) => Err(Error::DockerError(format!(
+                "Observe original builder CID: {error}"
             ))),
         }
     }
@@ -1002,3 +1133,6 @@ mod recapture_tests;
 mod resume_tests;
 #[cfg(test)]
 mod stopped_tests;
+
+#[cfg(test)]
+mod restart_stop_observation_tests;

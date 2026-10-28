@@ -25,12 +25,12 @@ CASES = {
     # 引擎拆分（rcoder→rcoder-engine）后这些用例随模块迁入 rcoder_engine 的
     # lib 测试二进制；rcoder 自身 lib 仅 re-export（0 个测试），按 crate 拆键。
     'rcoder_engine': tuple('userapp_builder::' + name for name in (
-        'creation::tests::final_creation_evidence_survives_terminal_failure_and_rejects_wrong_identity',
-        'creation::tests::expired_creation_retains_observation_and_discards_late_success',
-        'creation::tests::expired_checkpoint_failure_still_observes_remote_completion',
-        'creation::tests::expired_budget_never_starts_unpolled_creation',
-        'creation::tests::late_subscriber_reads_committed_completion_even_after_signal_removal',
-        'creation::tests::timeout_does_not_cancel_or_resubmit_accepted_operation',
+        'creation::tests::cases::final_creation_evidence_survives_terminal_failure_and_rejects_wrong_identity',
+        'creation::tests::cases::expired_creation_retains_observation_and_discards_late_success',
+        'creation::tests::cases::expired_checkpoint_failure_still_observes_remote_completion',
+        'creation::tests::cases::expired_budget_never_starts_unpolled_creation',
+        'creation::tests::cases::late_subscriber_reads_committed_completion_even_after_signal_removal',
+        'creation::tests::cases::timeout_does_not_cancel_or_resubmit_accepted_operation',
         'deadline_tests::nested_waits_share_one_deadline',
         'deadline_tests::waiter_timeout_does_not_cancel_an_accepted_worker',
         'recovery::terminal_tests::terminal_scan_releases_exact_receipt_then_forgets_without_reexecution',

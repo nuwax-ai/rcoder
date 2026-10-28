@@ -12,13 +12,14 @@ import os
 import platform
 import threading
 import time
+import urllib.parse
 import zipfile
 
 os.environ['E2E_CONTRACT_DIR'] = 'worker-contract'
 import hot_contract as h
 
 
-def artifact(release, probe, worker='import time; time.sleep(3600)', dev=False):
+def artifact(release, probe, worker='import time; time.sleep(3600)'):
     original = zipfile.ZipFile(io.BytesIO(h.artifact(release, release)))
     lock = original.read('release.lock.toml').decode()
     lock = lock.replace('minimum_app_cli_version = "0.1.3"', 'minimum_app_cli_version = "0.3.9"')
@@ -44,8 +45,6 @@ startup_timeout_seconds = 12
 '''
     if probe:
         lock += f'startup_probe = "{probe}"\n'
-    if dev:
-        lock += '[services.devrun]\ncommand = ["python3", "main.py"]\n'
     data = io.BytesIO()
     with zipfile.ZipFile(data, 'w', zipfile.ZIP_DEFLATED) as output:
         for info in original.infolist():
@@ -61,6 +60,140 @@ def view(base, path):
     if status != 200:
         raise AssertionError(f'{path}: HTTP {status}')
     return json.loads(data)['data']
+
+
+def submit_operation(base, request, deadline):
+    """Retry only a live zero-write startup rejection, using one original budget."""
+    # Freeze once. A retry must never refresh the revision, owner, operation ID
+    # or profile from a newer status observation.
+    frozen = json.loads(json.dumps(request))
+    operation = frozen['operation_id']
+    operation_path = '/v1/runtime/operations/' + urllib.parse.quote(operation, safe='')
+    owner = frozen['expected_runtime_instance_id']
+    request_digest = hashlib.sha256(json.dumps(frozen).encode()).hexdigest()
+
+    def remaining():
+        seconds = deadline - time.monotonic()
+        if seconds <= 0:
+            raise TimeoutError(f'original worker admission deadline expired: {operation}')
+        return min(h.REQUEST_TIMEOUT_SECONDS, seconds)
+
+    def observe(path, body=None):
+        status, raw = h.request_http(base, path, body, timeout=remaining())
+        if body is None:
+            h.record_readonly_response(operation, path, status, raw)
+        else:
+            text = raw.decode('utf-8', errors='replace').replace(h.TOKEN, '<redacted>')
+            try:
+                response = json.loads(text)
+            except ValueError:
+                response = {'raw_body': text}
+            with (h.REPORT / 'submission-responses.jsonl').open('a') as stream:
+                stream.write(json.dumps({'operation_id': operation, 'path': path,
+                    'status': status, 'request_sha256': request_digest,
+                    'response': response}) + '\n')
+        remaining()  # A late reply cannot reset the deadline or count as success.
+        return status, raw
+
+    def pause():
+        time.sleep(min(.2, remaining()))
+
+    def not_found():
+        status, raw = observe(operation_path)
+        if status != 404:
+            # An existing record may be an earlier accepted write. This fresh
+            # worker scenario must stop, rather than resubmit or adopt it.
+            raise AssertionError(f'original worker operation is not proven absent: HTTP {status}: '
+                                 + raw.decode(errors='replace'))
+
+    status, raw = observe('/v1/runtime/operations', frozen)
+    while True:
+        try:
+            envelope = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            envelope = None
+        rejected = (status == 409 and isinstance(envelope, dict)
+                    and envelope.get('success') is False
+                    and envelope.get('code') == 'ERR_INITIALIZING'
+                    and envelope.get('data') is None
+                    and envelope.get('operation_id') is None)
+        if not rejected:
+            if status == 202:
+                accepted = envelope.get('data') if isinstance(envelope, dict) else None
+                if (not isinstance(accepted, dict) or envelope.get('success') is not True
+                        or accepted.get('operation_id') != operation
+                        or accepted.get('poll') != operation_path):
+                    raise AssertionError('worker admission returned an ambiguous operation receipt')
+            return status, raw
+        while True:
+            not_found()
+            recovery_status, recovery_body = observe('/v1/runtime/recovery')
+            if h.initializing_response(recovery_status, recovery_body):
+                pause()
+                continue
+            recovery = json.loads(recovery_body)
+            if (recovery_status != 200 or not isinstance(recovery, dict)
+                    or recovery.get('success') is not True
+                    or not isinstance(recovery.get('data'), dict)
+                    or recovery['data'].get('runtime_instance_id') != owner):
+                raise AssertionError('original worker owner changed or recovery observation failed')
+            # Ready can race another same-ID dispatch. A second exact-ID 404
+            # must follow the same-owner observation before identical resubmit.
+            not_found()
+            break
+        pause()
+        status, raw = observe('/v1/runtime/operations', frozen)
+
+
+def source_files():
+    """Source Start reloads current manifests, rather than a deployed lock."""
+    return {
+        'workspace.manifest.toml': '''schema_version = 1
+[workspace]
+name = "worker-source"
+''',
+        'web/project.manifest.toml': '''schema_version = 1
+[project]
+service_id = "web"
+name = "Web"
+type = "node"
+[build]
+command = ["node", "--check", "server.js"]
+artifact = "artifact.zip"
+[run]
+command = ["node", "server.js"]
+shutdown_timeout_seconds = 3
+[devrun]
+command = ["node", "server.js"]
+[health]
+startup_probe = "http"
+startup_timeout_seconds = 20
+[proxy]
+path = "/"
+''',
+        'worker/project.manifest.toml': '''schema_version = 1
+[project]
+service_id = "worker"
+name = "Worker"
+type = "python"
+kind = "worker"
+[build]
+command = ["python3", "-m", "py_compile", "main.py"]
+artifact = "artifact.zip"
+[run]
+command = ["python3", "main.py"]
+shutdown_timeout_seconds = 2
+[devrun]
+command = ["python3", "main.py"]
+[health]
+startup_probe = "process"
+startup_timeout_seconds = 12
+''',
+        # Source ports are allocated by the actual manifest compiler; only
+        # artifact fixtures carry their explicit locked 4200/4201 ports.
+        'web/server.js': "require('http').createServer((q,s)=>s.end(require('./dependency.js'))).listen(Number(process.env.PORT),'0.0.0.0');\n",
+        'worker/main.py': 'import time; time.sleep(3600)\n',
+    }
 
 
 def main():
@@ -93,8 +226,8 @@ def main():
                 raise AssertionError(f'owner identity initialization: HTTP {status}: {body.decode(errors="replace")}')
             identity = json.loads(body)['data']
             # Identity is intentionally served before startup recovery finishes.
-            # This read shares the write-admission initialization gate; never
-            # retry a deployment mutation to paper over a premature submission.
+            # This is a current observation, not a future admission lease. The
+            # submit helper handles only a subsequent explicit zero-write gate.
             status, body = h.request_http(base, '/v1/runtime/recovery')
             h.record_readonly_response('worker-startup', '/v1/runtime/recovery', status, body)
             if h.initializing_response(status, body):
@@ -113,10 +246,12 @@ def main():
                 profile = {'profile': 'artifact', 'input': {'artifact': {'source': 'url', 'value': {
                     'url': f'http://host.docker.internal:{server.server_port}' + payload,
                     'sha256': hashlib.sha256(h.PAYLOADS[payload]).hexdigest()}}}}
-            status, data = h.request_http(base, '/v1/runtime/operations', {
+            request = {
                 'operation_id': op, 'expected_runtime_instance_id': identity['runtime_instance_id'],
                 'expected_revision': view(base, '/v1/runtime/status')['revision'],
-                'workspace_id': identity['workspace_id'], 'kind': kind, 'profile': profile})
+                'workspace_id': identity['workspace_id'], 'kind': kind, 'profile': profile}
+            status, data = submit_operation(
+                base, request, time.monotonic() + h.REQUEST_TIMEOUT_SECONDS)
             h.check(op + ' accepted', status == 202, data.decode())
 
         def terminal(op, wanted):
@@ -143,8 +278,12 @@ print(json.dumps(roots))'''
 
         def healthy():
             h.check('one live worker root', len(worker_roots()) == 1, str(worker_roots()))
-            code = 'import socket; s=socket.socket(); s.settimeout(1); print(s.connect_ex(("127.0.0.1",4201))); s.close()'
-            h.check('worker has no listener', h.docker('exec', cid, 'python3', '-c', code) != '0', 'worker port 4201')
+            code = '''import pathlib,socket,tomllib
+lock=tomllib.loads(pathlib.Path('/review/code/release.lock.toml').read_text())
+port=next(service['port'] for service in lock['services'] if service['service_id']=='worker')
+s=socket.socket(); s.settimeout(1)
+print(s.connect_ex(('127.0.0.1',port))); s.close()'''
+            h.check('worker has no listener', h.docker('exec', cid, 'python3', '-c', code) != '0', 'actual locked worker port')
             h.check('web actual HTTP', h.poll(lambda: h.request_http(app, '/')[0] == 200), 'Pingap HTTP')
 
         # A real HTTP probe must reject this no-listener process on both engines.
@@ -159,15 +298,17 @@ print(json.dumps(roots))'''
         terminal('stop-worker', 'succeeded')
         h.check('stop cleans worker', not worker_roots(), 'actual process inventory')
         # The source profile selects devrun; it must honor process instead of legacy TCP.
-        source_data = artifact('worker-source', 'process', dev=True)
-        import base64
         # Keep the deployed web artifact (including its real symlink) intact.
-        # Python ZipFile.extractall would turn the symlink into an ordinary JS file.
-        unpack = '''import base64,io,pathlib,sys,zipfile
-with zipfile.ZipFile(io.BytesIO(base64.b64decode(sys.argv[1]))) as archive:
- for name in ('release.lock.toml', 'worker/main.py'):
-  pathlib.Path('/review/code',name).write_bytes(archive.read(name))'''
-        h.docker('exec', cid, 'python3', '-c', unpack, base64.b64encode(source_data).decode())
+        # Write real source/manifests only; never use an old release.lock as the
+        # authority for a current Source request or extract over the symlink.
+        install = '''import json,pathlib,sys
+for name,content in json.loads(sys.argv[1]).items():
+ path=pathlib.Path('/review/code',name)
+ path.parent.mkdir(parents=True,exist_ok=True)
+ path.write_text(content)'''
+        files = source_files()
+        (h.REPORT / 'source-files.json').write_text(json.dumps(files, indent=2))
+        h.docker('exec', cid, 'python3', '-c', install, json.dumps(files))
         submit('start', 'process-source')
         terminal('process-source', 'succeeded')
         healthy()

@@ -19,6 +19,12 @@ use crate::activity_registry::AppActivityRegistry;
 use crate::config::{AppAccessMode, AppManagerConfig};
 use crate::service::AppService;
 
+// Inherit the actual unsupported-backend observation, as DockerRuntime does.
+// The normal stateful mock's absent lease is stronger evidence than that default.
+struct DefaultAppMutexRuntime;
+#[async_trait]
+impl UserAppDeploymentRuntime for DefaultAppMutexRuntime {}
+
 /// 可控假运行时：记录 delete/create 调用次数，可开关失败注入。
 ///
 /// WorkspaceRuntime 全走默认实现（resolve_workspace_path → Ok(None)，
@@ -29,6 +35,17 @@ use crate::service::AppService;
 /// 历史用途 wait_app_ready 已退役，现有消费者见 purge 链不缺席测试）。
 #[derive(Default)]
 pub(crate) struct MockRuntime {
+    pub retained_storage: DashMap<String, shared_types::UserAppRetainedStorage>,
+    /// Opt-in stateful PVC resources backed by real fixture data directories.
+    pub recovered_pvc_volumes:
+        DashMap<String, Vec<(shared_types::AppResourceIdentity, std::path::PathBuf)>>,
+    pub physical_pvc_uids: DashMap<String, String>,
+    pub discovery_calls: AtomicUsize,
+    pub discovery_replies: std::sync::Mutex<
+        std::collections::VecDeque<
+            ContainerRuntimeResult<Option<shared_types::UserAppDiscoveredIdentity>>,
+        >,
+    >,
     pub deletion_inspection: std::sync::Mutex<Option<shared_types::DeletionInspection>>,
     pub deletion_inspection_calls: AtomicUsize,
     pub configuration_replies:
@@ -37,11 +54,23 @@ pub(crate) struct MockRuntime {
     pub configuration_targets: std::sync::Mutex<Vec<shared_types::RuntimeConfigurationTarget>>,
     pub mutation_uid_override: std::sync::Mutex<Option<String>>,
     pub scale_calls: AtomicUsize,
+    pub wake_start_reply_unknown: AtomicBool,
     pub management_start_calls: AtomicUsize,
     /// restart_app_target 调用计数与每次收到的镜像（image-roll 断言用）。
     pub restart_calls: AtomicUsize,
     pub restart_images: std::sync::Mutex<Vec<Option<String>>>,
     pub lease_held: Arc<AtomicBool>,
+    /// Use the trait's real unsupported observation even when no lease is held.
+    pub wake_mutex_use_default_observer: AtomicBool,
+    /// Event-only read observation for independent wake fixtures; no polling.
+    pub wake_mutex_observation_enabled: AtomicBool,
+    pub wake_mutex_observation_calls: AtomicUsize,
+    pub wake_mutex_expired: AtomicBool,
+    pub wake_mutex_holder_lifecycle: std::sync::Mutex<Option<Option<String>>>,
+    pub wake_mutex_expired_takeovers: AtomicUsize,
+    pub wake_mutex_wait_entered: tokio::sync::Notify,
+    pub wake_mutex_changed: Arc<tokio::sync::Notify>,
+    pub wake_mutex_revision: Arc<AtomicUsize>,
     pub lease_acquire_calls: AtomicUsize,
     pub lease_validation_fails: AtomicBool,
     pub lease_validation_calls: AtomicUsize,
@@ -58,6 +87,24 @@ pub(crate) struct MockRuntime {
     pub list_calls: AtomicUsize,
     pub create_calls: AtomicUsize,
     pub create_fails: AtomicBool,
+    /// Current applied Docker-like configuration survives physical compute loss.
+    pub retained_params: DashMap<String, (String, ContainerCreateParams)>,
+    /// Physical daemon configuration is separate from its private saved copy.
+    pub native_params: DashMap<String, ContainerCreateParams>,
+    /// Daemon inspect.Image is immutable even when Config.Image was a tag.
+    pub native_image_ids: DashMap<String, String>,
+    pub create_retention_fails: AtomicBool,
+    pub retained_load_calls: AtomicUsize,
+    pub retained_save_calls: AtomicUsize,
+    /// Startup snapshot migration can fail independently of a live workload.
+    pub retained_save_fails: AtomicBool,
+    /// Load returns None/error without changing the retained private bytes.
+    pub retained_unavailable: AtomicBool,
+    pub retained_load_fails: AtomicBool,
+    /// Pause a create after it was counted, before its physical commitment.
+    pub create_started: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    pub create_release: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    pub exec_commands: std::sync::Mutex<Vec<Vec<String>>>,
     pub status_fails: AtomicUsize,
     /// Inject a read failure only after a captured Stop has acknowledged its write.
     pub post_stop_status_fails: AtomicUsize,
@@ -111,11 +158,27 @@ pub(crate) struct MockRuntime {
 impl WorkspaceRuntime for MockRuntime {
     async fn ensure_workspace(
         &self,
-        _identifier: &str,
+        identifier: &str,
         _service_type: &ServiceType,
         _storage_size: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
         self.ensure_workspace_calls.fetch_add(1, Ordering::SeqCst);
+        let volumes = self
+            .recovered_pvc_volumes
+            .get(identifier)
+            .map(|v| v.clone());
+        if let Some(volumes) = volumes {
+            for (volume, path) in volumes {
+                self.physical_pvc_uids
+                    .entry(volume.name)
+                    .or_insert_with(|| uuid::Uuid::new_v4().to_string());
+                tokio::fs::create_dir_all(path).await.map_err(|error| {
+                    ContainerRuntimeError::ConfigurationError(format!(
+                        "fixture create PVC data: {error}"
+                    ))
+                })?;
+            }
+        }
         Ok(())
     }
 
@@ -123,7 +186,29 @@ impl WorkspaceRuntime for MockRuntime {
         &self,
         snapshot: &shared_types::AppDeletionSnapshot,
     ) -> ContainerRuntimeResult<()> {
-        self.destroy_app_pvc(&snapshot.app_id).await
+        self.destroy_app_pvc(&snapshot.app_id).await?;
+        let volumes = self
+            .recovered_pvc_volumes
+            .get(&snapshot.app_id)
+            .map(|v| v.clone());
+        if let Some(volumes) = volumes {
+            for (volume, path) in volumes {
+                if !snapshot.resources.contains(&volume)
+                    || self.physical_pvc_uids.get(&volume.name).as_deref() != Some(&volume.uid)
+                {
+                    return Err(ContainerRuntimeError::Conflict(
+                        "fixture captured PVC was replaced".into(),
+                    ));
+                }
+                self.physical_pvc_uids.remove(&volume.name);
+                tokio::fs::remove_dir_all(path).await.map_err(|error| {
+                    ContainerRuntimeError::ConfigurationError(format!(
+                        "fixture destroy captured PVC data: {error}"
+                    ))
+                })?;
+            }
+        }
+        Ok(())
     }
     // 其余 workspace 族方法走默认实现（resolve_workspace_path → Ok(None)，
     // get_container_app_dir 因此落到 `workspace_root/{app_id}`，测试用 tempdir 承接）；
@@ -239,8 +324,314 @@ impl shared_types::AppOperationLease for MockOperationLease {
     }
 }
 
+struct ObservedWakeLease {
+    inner: Box<dyn shared_types::AppOperationLease>,
+    changed: Arc<tokio::sync::Notify>,
+    revision: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl shared_types::AppOperationLease for ObservedWakeLease {
+    fn receipt(&self) -> Option<shared_types::UserAppOperationLeaseReceipt> {
+        self.inner.receipt()
+    }
+    async fn release(self: Box<Self>) -> Result<(), String> {
+        self.inner.release().await?;
+        self.revision.fetch_add(1, Ordering::SeqCst);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl UserAppDeploymentRuntime for MockRuntime {
+    async fn verify_recovered_volumes(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _scope: shared_types::UserAppOperationScope,
+        volumes: &[shared_types::AppResourceIdentity],
+    ) -> ContainerRuntimeResult<()> {
+        for volume in volumes {
+            if volume.kind != shared_types::AppResourceKind::PersistentVolumeClaim {
+                return Err(ContainerRuntimeError::ConfigurationError(
+                    "fixture requires a PVC witness".into(),
+                ));
+            }
+            let Some(current) = self.physical_pvc_uids.get(&volume.name) else {
+                return Err(ContainerRuntimeError::K8sError(format!(
+                    "Verify recovered volume {}: 404 Not Found",
+                    volume.name
+                )));
+            };
+            if *current != volume.uid {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Recovered workspace volume was replaced or is deleting".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+    async fn acquire_vacant_app_operation(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
+        // This fixture's CAS acquisition never has a takeover branch.
+        self.acquire_app_operation(app_id).await
+    }
+    async fn observe_app_operation_mutex(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+    ) -> ContainerRuntimeResult<container_runtime_api::AppOperationMutexObservation> {
+        use container_runtime_api::{AppOperationMutexIdentity, AppOperationMutexObservation};
+        self.wake_mutex_observation_calls
+            .fetch_add(1, Ordering::SeqCst);
+        if self.wake_mutex_use_default_observer.load(Ordering::SeqCst) {
+            return DefaultAppMutexRuntime
+                .observe_app_operation_mutex(app_id, lifecycle_id)
+                .await;
+        }
+        if !self.lease_held.load(Ordering::SeqCst) {
+            return Ok(AppOperationMutexObservation::Absent);
+        }
+        if !self.wake_mutex_observation_enabled.load(Ordering::SeqCst) {
+            return Ok(AppOperationMutexObservation::Unconfirmed);
+        }
+        let identity = AppOperationMutexIdentity {
+            namespace: "test".into(),
+            name: format!("rcoder-operation-prod-{app_id}"),
+            uid: format!("lease-{app_id}"),
+            token: "test-operation".into(),
+            resource_version: self.wake_mutex_revision.load(Ordering::SeqCst).to_string(),
+            lifecycle_id: self
+                .wake_mutex_holder_lifecycle
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| Some(lifecycle_id.into())),
+        };
+        Ok(if self.wake_mutex_expired.load(Ordering::SeqCst) {
+            AppOperationMutexObservation::Expired(identity)
+        } else {
+            AppOperationMutexObservation::Occupied(identity)
+        })
+    }
+    async fn acquire_observed_expired_app_operation(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+        observed: &container_runtime_api::AppOperationMutexIdentity,
+    ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
+        let latest = self
+            .observe_app_operation_mutex(app_id, lifecycle_id)
+            .await?;
+        if latest != container_runtime_api::AppOperationMutexObservation::Expired(observed.clone())
+            || self
+                .wake_mutex_expired
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(ContainerRuntimeError::OperationInProgress(Box::new(
+                shared_types::UserAppOperationInProgress {
+                    app_id: app_id.into(),
+                    service_type: ServiceType::Userapp,
+                    resource_name: format!("rcoder-operation-prod-{app_id}"),
+                    operation_id: None,
+                },
+            )));
+        }
+        self.wake_mutex_expired_takeovers
+            .fetch_add(1, Ordering::SeqCst);
+        self.wake_mutex_holder_lifecycle.lock().unwrap().take();
+        self.lease_held.store(false, Ordering::SeqCst);
+        self.wake_mutex_revision.fetch_add(1, Ordering::SeqCst);
+        self.acquire_app_operation(app_id).await
+    }
+    async fn wait_app_operation_mutex_change(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+        observed: &container_runtime_api::AppOperationMutexIdentity,
+        budget: Duration,
+    ) -> ContainerRuntimeResult<container_runtime_api::AppOperationMutexObservation> {
+        use container_runtime_api::AppOperationMutexObservation;
+        let deadline = tokio::time::Instant::now() + budget;
+        let changed = self.wake_mutex_changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let latest = self
+            .observe_app_operation_mutex(app_id, lifecycle_id)
+            .await?;
+        if latest != AppOperationMutexObservation::Occupied(observed.clone()) {
+            return Ok(latest);
+        }
+        self.wake_mutex_wait_entered.notify_one();
+        match tokio::time::timeout_at(deadline, changed).await {
+            Ok(()) => self.observe_app_operation_mutex(app_id, lifecycle_id).await,
+            Err(_) => Ok(AppOperationMutexObservation::Unconfirmed),
+        }
+    }
+
+    async fn app_runtime_configuration_uid(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Option<String>> {
+        let Some(_) = self.get_deployment_status(app_id).await? else {
+            return Ok(None);
+        };
+        Ok(self
+            .mutation_uid_override
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| {
+                self.native_params.get(app_id).and_then(|params| {
+                    params
+                        .execution_context
+                        .as_ref()
+                        .map(|context| format!("test-{}", context.lifecycle_id))
+                })
+            })
+            .or_else(|| {
+                self.retained_params
+                    .get(app_id)
+                    .map(|configuration| format!("test-{}", configuration.0))
+            }))
+    }
+
+    async fn retain_app_runtime_configuration(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+        _binding: Option<&shared_types::UserAppResourceBinding>,
+    ) -> ContainerRuntimeResult<()> {
+        self.retained_save_calls.fetch_add(1, Ordering::SeqCst);
+        if self.retained_save_fails.load(Ordering::SeqCst) {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Injected retained configuration publication failure".into(),
+            ));
+        }
+        if let Some(configuration) = self.retained_params.get(app_id)
+            && configuration.0 != lifecycle_id
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "Retained mock application lifecycle differs".into(),
+            ));
+        }
+        if let Some(native) = self.native_params.get(app_id) {
+            let mut params = native.value().clone();
+            drop(native);
+            if params
+                .execution_context
+                .as_ref()
+                .map(|context| context.lifecycle_id.as_str())
+                != Some(lifecycle_id)
+            {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Native mock application lifecycle differs".into(),
+                ));
+            }
+            if let Some(actual) = self.native_image_ids.get(app_id) {
+                params.image_override = Some(actual.clone());
+            }
+            self.retained_params
+                .insert(app_id.to_owned(), (lifecycle_id.to_owned(), params));
+        }
+        Ok(())
+    }
+
+    async fn verify_committed_creation(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+        if !self.deployments.contains_key(&context.app_id) {
+            return Ok(None);
+        }
+        let Some(native) = self.native_params.get(&context.app_id) else {
+            return Ok(None);
+        };
+        if native.execution_context.as_ref() != Some(context) {
+            return Ok(None);
+        }
+        drop(native);
+        self.retain_app_runtime_configuration(&context.app_id, &context.lifecycle_id, None)
+            .await?;
+        Ok(Some(ContainerBasicInfo {
+            container_id: format!("test-{}", context.lifecycle_id),
+            container_name: format!("userapp-{}", context.app_id),
+            container_ip: "10.0.0.1".into(),
+            project_id: context.app_id.clone(),
+            internal_port: 0,
+            external_port: 0,
+            status: "Running".into(),
+            created_at: chrono::Utc::now(),
+            service_url: String::new(),
+            workload_uid: None,
+        }))
+    }
+
+    async fn discover_retained_app_storage(
+        &self,
+        app_id: &str,
+        scope: shared_types::UserAppOperationScope,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppRetainedStorage>> {
+        Ok(self
+            .retained_storage
+            .get(app_id)
+            .filter(|value| value.scope == scope)
+            .map(|value| value.clone()))
+    }
+
+    async fn retained_app_runtime_configuration(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+    ) -> ContainerRuntimeResult<Option<ContainerCreateParams>> {
+        self.retained_load_calls.fetch_add(1, Ordering::SeqCst);
+        if self.retained_load_fails.load(Ordering::SeqCst) {
+            return Err(ContainerRuntimeError::ConnectionError(
+                "Injected retained configuration read failure".into(),
+            ));
+        }
+        if self.retained_unavailable.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let Some(configuration) = self.retained_params.get(app_id) else {
+            return Ok(None);
+        };
+        if configuration.0 != lifecycle_id {
+            return Err(ContainerRuntimeError::Conflict(
+                "Retained mock application lifecycle differs".into(),
+            ));
+        }
+        let mut params = configuration.1.clone();
+        drop(configuration);
+        params.execution_context = None;
+        params.mutation_target = None;
+        params.resource_binding = None;
+        for environment in [&mut params.env, &mut params.secrets].into_iter().flatten() {
+            for key in [
+                "APP_DEPLOY_URL",
+                "APP_RELEASE_ID",
+                "APP_DEPLOY_SHA256",
+                shared_types::APP_DEPLOY_OPERATION_ID,
+            ] {
+                environment.remove(key);
+            }
+        }
+        Ok(Some(params))
+    }
+
+    async fn exec(
+        &self,
+        _app_id: &str,
+        command: Vec<String>,
+    ) -> ContainerRuntimeResult<container_runtime_api::ExecResult> {
+        self.exec_commands.lock().unwrap().push(command);
+        Err(ContainerRuntimeError::ConfigurationError(
+            "exec not supported by this runtime".into(),
+        ))
+    }
+
     async fn capture_app_configuration_target(
         &self,
         context: &shared_types::UserAppExecutionContext,
@@ -415,11 +806,20 @@ impl UserAppDeploymentRuntime for MockRuntime {
         if let Some(release) = release {
             release.wait().await;
         }
-        Ok(Some(Box::new(MockOperationLease(
+        let lease: Box<dyn shared_types::AppOperationLease> = Box::new(MockOperationLease(
             self.lease_held.clone(),
             _app_id.into(),
             ServiceType::Userapp,
-        ))))
+        ));
+        if self.wake_mutex_observation_enabled.load(Ordering::SeqCst) {
+            Ok(Some(Box::new(ObservedWakeLease {
+                inner: lease,
+                changed: self.wake_mutex_changed.clone(),
+                revision: self.wake_mutex_revision.clone(),
+            })))
+        } else {
+            Ok(Some(lease))
+        }
     }
 
     async fn validate_app_operation_receipt(
@@ -462,7 +862,11 @@ impl UserAppDeploymentRuntime for MockRuntime {
         Ok(shared_types::AppDeletionSnapshot {
             app_id: app_id.into(),
             operation_id: "test-operation".into(),
-            resources: vec![],
+            resources: self
+                .recovered_pvc_volumes
+                .get(app_id)
+                .map(|v| v.iter().map(|(resource, _)| resource.clone()).collect())
+                .unwrap_or_default(),
             directories: None,
         })
     }
@@ -484,16 +888,19 @@ impl UserAppDeploymentRuntime for MockRuntime {
             .unwrap_or_default())
     }
 
-    /// 单测不模拟"PG 记录缺失但物理资源残留"的孤儿场景：discovery 恒无发现，
-    /// 对齐真实运行时（K8s/Docker）无匹配资源时的 Ok(None)；需要正向发现的
-    /// 测试（如孤儿接管）再扩展本桩。
+    /// 未预置时无匹配资源；身份恢复测试可按实际观察顺序设置结果。
     async fn discover_application_identity(
         &self,
         app_id: &str,
     ) -> ContainerRuntimeResult<Option<shared_types::UserAppDiscoveredIdentity>> {
         shared_types::validate_identifier(app_id, "app_id")
             .map_err(ContainerRuntimeError::ConfigurationError)?;
-        Ok(None)
+        self.discovery_calls.fetch_add(1, Ordering::SeqCst);
+        self.discovery_replies
+            .lock()
+            .expect("discovery script lock")
+            .pop_front()
+            .unwrap_or(Ok(None))
     }
 
     async fn list_deployments(&self) -> ContainerRuntimeResult<Vec<DeploymentStatus>> {
@@ -626,6 +1033,11 @@ impl UserAppDeploymentRuntime for MockRuntime {
                     self.post_activation_status_fails.load(Ordering::SeqCst),
                     Ordering::SeqCst,
                 );
+                if self.wake_start_reply_unknown.load(Ordering::SeqCst) {
+                    return Err(ContainerRuntimeError::Timeout(
+                        "original Start reply was lost after runtime acceptance".into(),
+                    ));
+                }
                 Ok(())
             }
             dashmap::mapref::entry::Entry::Vacant(_) => Err(ContainerRuntimeError::Conflict(
@@ -724,6 +1136,14 @@ impl UserAppDeploymentRuntime for MockRuntime {
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
         self.create_calls.fetch_add(1, Ordering::SeqCst);
+        let started = self.create_started.lock().unwrap().clone();
+        let release = self.create_release.lock().unwrap().clone();
+        if let Some(started) = started {
+            started.wait().await;
+        }
+        if let Some(release) = release {
+            release.wait().await;
+        }
         if let Some((stage, definitive)) = *self
             .create_abort
             .lock()
@@ -752,11 +1172,59 @@ impl UserAppDeploymentRuntime for MockRuntime {
             ));
         }
         let project_id = params.project_id.clone().unwrap_or_default();
+        let recovered_volumes = self
+            .recovered_pvc_volumes
+            .get(&project_id)
+            .map(|v| v.clone());
+        if let Some(volumes) = recovered_volumes {
+            for (volume, path) in volumes {
+                self.physical_pvc_uids
+                    .entry(volume.name)
+                    .or_insert_with(|| uuid::Uuid::new_v4().to_string());
+                tokio::fs::create_dir_all(path).await.map_err(|error| {
+                    ContainerRuntimeError::ConfigurationError(format!(
+                        "fixture create PVC data: {error}"
+                    ))
+                })?;
+            }
+            self.specs.insert(
+                project_id.clone(),
+                ContainerSpecSnapshot {
+                    env: params.env.clone(),
+                    ..Default::default()
+                },
+            );
+            self.deployments.insert(
+                project_id.clone(),
+                DeploymentStatus {
+                    app_id: project_id.clone(),
+                    lifecycle_id: params
+                        .execution_context
+                        .as_ref()
+                        .map(|c| c.lifecycle_id.clone()),
+                    replicas: 1,
+                    ready_replicas: 1,
+                    phase: "Running".into(),
+                    pod_ip: Some("127.0.0.1".into()),
+                    ..Default::default()
+                },
+            );
+        }
         // 捕获参数调用历史（首次创建的 ports/env 断言用）
         self.create_params_history
             .entry(project_id.clone())
             .or_default()
             .push(params.clone());
+        self.native_params
+            .insert(project_id.clone(), params.clone());
+        if let Some(context) = &params.execution_context
+            && !self.create_retention_fails.load(Ordering::SeqCst)
+        {
+            self.retained_params.insert(
+                project_id.clone(),
+                (context.lifecycle_id.clone(), params.clone()),
+            );
+        }
         // 登记 deployments（后续 get_app/update 流程的 fetch_runtime_status 需要）
         self.deployments
             .entry(project_id.clone())
@@ -767,6 +1235,11 @@ impl UserAppDeploymentRuntime for MockRuntime {
                 phase: "Running".into(),
                 ..Default::default()
             });
+        if self.create_retention_fails.load(Ordering::SeqCst) {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Injected post-start retained configuration publication failure".into(),
+            ));
+        }
         Ok(ContainerBasicInfo {
             container_id: "mock-container-id".into(),
             container_name: format!("userapp-{project_id}"),
@@ -1024,4 +1497,16 @@ pub(crate) async fn complete_empty_deletion_fixture(mut operation: crate::servic
         .succeed()
         .await
         .expect("fixture deletion completion");
+}
+
+// 豁免仅限测试 helper：edition-2024 env 变异是 unsafe；同值重复 set 对并行测试无害
+// （与 lifecycle/start.rs 的 with_runtime_image_env 同款约定）。
+#[allow(unsafe_code)]
+pub(crate) fn restart_image_env() {
+    unsafe {
+        std::env::set_var(
+            "RCODER_RUNTIME_IMAGE_DIGEST",
+            "registry.test/app-runtime:ut",
+        );
+    }
 }

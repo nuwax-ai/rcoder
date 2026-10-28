@@ -43,6 +43,27 @@ pub trait AppRuntimeIpResolver: Send + Sync {
     async fn resolve_runtime_container_ip(&self, app_id: &str) -> Option<String>;
 }
 
+/// On-miss refresh hook for the user-scoped container lookup (PG-backed
+/// deployments only). The synchronous [`ContainerLookup`] path reads the
+/// replica's in-memory mirror; when the mirror lacks the user entirely, the
+/// proxy awaits this hook to re-read the authoritative rows for that user
+/// (hydrating the mirror through the same guarded read-through the SSE path
+/// uses) and then retries the lookup. Memory-only deployments inject none and
+/// the miss stays a miss.
+#[async_trait::async_trait]
+pub trait ContainerUserRefresh: Send + Sync {
+    /// Re-read the user's live project/container rows of the requested
+    /// container family from the database and hydrate the local mirror, under
+    /// one shared durable-commit budget. Returns Ok even when the user has no
+    /// rows of the family; errors mean the refresh itself failed (caller
+    /// keeps the miss).
+    async fn refresh_user_container(
+        &self,
+        user_id: &str,
+        service_type: &ServiceType,
+    ) -> anyhow::Result<()>;
+}
+
 pub trait ContainerLookup: Send + Sync {
     /// 根据 user_id 查找容器 IP（ComputerAgentRunner 普通场景）
     ///

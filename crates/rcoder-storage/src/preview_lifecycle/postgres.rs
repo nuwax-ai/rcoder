@@ -14,6 +14,9 @@ use toasty::Executor;
 use toasty_core::schema::db::Type;
 type Error = PreviewStoreError;
 
+// Stable allocator namespace shared by initial admission and port retries.
+const PREVIEW_ALLOCATION_LOCK_SQL: &str = "SELECT 1 FROM pg_advisory_xact_lock(72430591234122)";
+
 pub struct PgPreviewStore {
     owner: DatabaseOwner,
 }
@@ -196,9 +199,15 @@ fn allocate(occupied: &[u16], requested: Option<u16>) -> Result<u16, Error> {
         .ok_or_else(|| Error::Invalid("Preview port pool exhausted".into()))
 }
 fn start_input(input: &AcceptStartInput) -> serde_json::Value {
-    serde_json::json!({"preview_key":input.preview_key,"project_id":input.project_id,"project_path":input.project_path,
+    let mut request = serde_json::json!({"preview_key":input.preview_key,"project_id":input.project_id,"project_path":input.project_path,
         "instance_id":input.instance_id,"host_id":input.host.host_id,"pod_name":input.host.pod_name,
-        "pod_ip":input.host.pod_ip,"requested_port":input.requested_port,"recovery":input.recover_unknown_evidence})
+        "pod_ip":input.host.pod_ip,"requested_port":input.requested_port,"recovery":input.recover_unknown_evidence});
+    // Omit None entirely: existing default-base receipts must retain their
+    // original request fingerprint across this internal input extension.
+    if let Some(base_path) = &input.base_path {
+        request["base_path"] = serde_json::Value::String(base_path.clone());
+    }
+    request
 }
 async fn accept_start(
     tx: &mut dyn Executor,
@@ -218,7 +227,7 @@ async fn accept_start(
     }
     // Independent namespace from schema and leader locks; transaction-scoped,
     // released before returning and never held while spawning or probing a host.
-    toasty::sql::query("SELECT 1 FROM pg_advisory_xact_lock(72430591234122)")
+    toasty::sql::query(PREVIEW_ALLOCATION_LOCK_SQL)
         .exec(tx)
         .await
         .map_err(unavailable)?;
@@ -307,11 +316,11 @@ async fn accept_start(
         {
             return Err(conflict("Preview changed during start admission"));
         }
-        let count = toasty::sql::statement("UPDATE preview_instances SET project_id=$1,project_path=$2,instance_id=$3,revision=$4,operation_id=$5,host_id=$6,pod_name=$7,pod_ip=$8,pid=NULL,port=$9,base_path=NULL,state='starting',last_heartbeat_at_us=NULL,last_activity_at_us=$10,detail=$11,updated_at_us=$10 WHERE preview_key=$12 AND instance_id=$13 AND revision=$14")
+        let count = toasty::sql::statement("UPDATE preview_instances SET project_id=$1,project_path=$2,instance_id=$3,revision=$4,operation_id=$5,host_id=$6,pod_name=$7,pod_ip=$8,pid=NULL,port=$9,base_path=$15,state='starting',last_heartbeat_at_us=NULL,last_activity_at_us=$10,detail=$11,updated_at_us=$10 WHERE preview_key=$12 AND instance_id=$13 AND revision=$14")
             .bind(&input.project_id).bind(&input.project_path).bind(&input.instance_id).bind(revision).bind(&input.operation_id).bind(&input.host.host_id)
             .bind_typed(input.host.pod_name.as_deref(), Type::Text).bind_typed(input.host.pod_ip.as_deref(), Type::Text).bind(i64::from(port))
             .bind(at.timestamp_micros()).bind_typed(input.recover_unknown_evidence.as_ref().map(|e| e.detail.clone()), Type::Text).bind(&input.preview_key)
-            .bind(&previous.instance_id).bind(previous.revision).exec(tx).await.map_err(unavailable)?;
+            .bind(&previous.instance_id).bind(previous.revision).bind_typed(input.base_path.as_deref(), Type::Text).exec(tx).await.map_err(unavailable)?;
         if count != 1 {
             return Err(conflict("Preview changed during start admission"));
         }
@@ -328,7 +337,7 @@ async fn accept_start(
             .pod_ip(input.host.pod_ip.clone())
             .pid(None::<i64>)
             .port(Some(i64::from(port)))
-            .base_path(None::<String>)
+            .base_path(input.base_path.clone())
             .state("starting")
             .last_heartbeat_at_us(None::<i64>)
             .last_activity_at_us(at.timestamp_micros())
@@ -355,6 +364,45 @@ impl PreviewLifecycleStore for PgPreviewStore {
     async fn accept_start(&self, input: AcceptStartInput) -> Result<AcceptStartOutcome, Error> {
         self.run(move |tx| Box::pin(accept_start(tx, input))).await
     }
+    async fn retry_start_port(
+        &self,
+        input: PreviewStartPortRetry,
+    ) -> Result<PreviewInstanceRecord, Error> {
+        self.run(move |tx| Box::pin(async move {
+            // Match accept_start's allocator -> instance lock order, including
+            // contention with other keys claiming the strict next candidate.
+            toasty::sql::query(PREVIEW_ALLOCATION_LOCK_SQL)
+                .exec(tx).await.map_err(unavailable)?;
+            let before = current(tx, &input.preview_key).await?;
+            let mut row = before.clone();
+            let changed = row.apply_start_port_retry(&input, now())?;
+            let operation = operation(tx, &input.operation_id).await?
+                .ok_or_else(|| conflict("Preview start operation is missing"))?;
+            if operation.kind != "start"
+                || operation.preview_key != input.preview_key
+                || operation.instance_id != input.instance_id
+                || operation.allocated_port != before.port.map(i64::from)
+                || operation.payload_version != 1
+                || !matches!(operation.state.as_str(), "accepted" | "running" | "uncertain")
+            {
+                return Err(conflict("Port retry requires the matching inflight start operation"));
+            }
+            if !changed {
+                return Ok(before);
+            }
+            allocate(&ports(tx).await?, Some(input.next_port))?;
+            save(tx, &before, &row).await?;
+            let count = toasty::sql::statement("UPDATE preview_operations SET allocated_port=$1,updated_at_us=$2 WHERE operation_id=$3 AND preview_key=$4 AND instance_id=$5 AND kind='start' AND state=$6 AND allocated_port=$7 AND payload_version=1")
+                .bind(i64::from(input.next_port)).bind(row.updated_at.timestamp_micros())
+                .bind(&input.operation_id).bind(&input.preview_key).bind(&input.instance_id)
+                .bind(&operation.state).bind(i64::from(input.previous_port)).exec(tx).await.map_err(unavailable)?;
+            if count != 1 {
+                return Err(conflict("Preview port retry operation CAS failed"));
+            }
+            Ok(row)
+        })).await
+    }
+
     async fn publish_running(
         &self,
         key: &str,
@@ -367,17 +415,34 @@ impl PreviewLifecycleStore for PgPreviewStore {
         let key = key.to_owned();
         let operation_id = operation_id.to_owned();
         let base_path = base_path.map(str::to_owned);
-        self.run(move |tx| Box::pin(async move {
-            let before = current(tx, &key).await?;
-            if pid <= 0 || before.operation_id != operation_id || before.revision != revision || before.state != PreviewInstanceState::Starting || before.port != Some(port) {
-                return Err(conflict("Publish running requires the original starting operation and allocated port"));
-            }
-            let mut row = before.clone(); row.state = PreviewInstanceState::Ready; row.pid = Some(pid); row.base_path = base_path;
-            row.updated_at = now(); row.last_heartbeat_at = Some(row.updated_at); row.last_activity_at = row.last_activity_at.max(row.updated_at);
-            save(tx, &before, &row).await?;
-            finish(tx, &row, "succeeded", serde_json::json!({"pid":pid,"port":port})).await?;
-            Ok(row)
-        })).await
+        self.run(move |tx| {
+            Box::pin(async move {
+                let before = current(tx, &key).await?;
+                let mut row = before.clone();
+                let first_publication = row.apply_running_publication(
+                    &operation_id,
+                    revision,
+                    pid,
+                    port,
+                    base_path.as_deref(),
+                    now(),
+                )?;
+                if row != before {
+                    save(tx, &before, &row).await?;
+                }
+                if first_publication {
+                    finish(
+                        tx,
+                        &row,
+                        "succeeded",
+                        serde_json::json!({"pid":pid,"port":port}),
+                    )
+                    .await?;
+                }
+                Ok(row)
+            })
+        })
+        .await
     }
     async fn accept_stop(
         &self,

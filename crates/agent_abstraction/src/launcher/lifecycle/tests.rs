@@ -4,6 +4,12 @@ use std::process::Stdio;
 use std::time::Duration;
 
 async fn held_process() -> (AgentLifecycleGuard, tempfile::TempDir, u32) {
+    held_process_with_session(SessionId::from("held-session")).await
+}
+
+async fn held_process_with_session(
+    session_id: SessionId,
+) -> (AgentLifecycleGuard, tempfile::TempDir, u32) {
     let directory = tempfile::tempdir().unwrap();
     let ready = directory.path().join("ready");
     let mut command = CommandWrap::with_new("sh", |command| {
@@ -22,7 +28,7 @@ async fn held_process() -> (AgentLifecycleGuard, tempfile::TempDir, u32) {
     let pid = child.id().unwrap();
     let guard = AgentLifecycleGuard::new_claude(
         "held".into(),
-        SessionId::from("held-session"),
+        session_id,
         child,
         tokio::spawn(async {}),
         CancellationToken::new(),
@@ -36,6 +42,25 @@ async fn held_process() -> (AgentLifecycleGuard, tempfile::TempDir, u32) {
     .await
     .unwrap();
     (guard, directory, pid)
+}
+
+#[tokio::test]
+async fn unassigned_process_has_no_session_identity_and_only_accepts_a_real_handshake() {
+    let (mut guard, _directory, _pid) =
+        held_process_with_session(SessionId::new(Arc::from(""))).await;
+    assert!(guard.inner.session_id.is_none());
+    for sid in ["", "pending"] {
+        assert!(guard.set_session_id(SessionId::from(sid)).is_err());
+        assert!(guard.inner.session_id.is_none());
+    }
+    guard
+        .set_session_id(SessionId::from("opaque/session:7"))
+        .unwrap();
+    assert_eq!(
+        guard.inner.session_id.as_ref().map(|sid| sid.0.as_ref()),
+        Some("opaque/session:7")
+    );
+    guard.graceful_stop().await.unwrap();
 }
 
 #[tokio::test]
@@ -133,4 +158,116 @@ async fn successful_startup_releases_transition_without_stopping_agent() {
     assert!(!guard.is_stopped());
     assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok());
     guard.graceful_stop().await.unwrap();
+}
+
+fn binding_provider() -> ModelProviderConfig {
+    ModelProviderConfig {
+        id: "binding-test".into(),
+        name: "binding-test".into(),
+        base_url: "https://example.test".into(),
+        api_key: "test-key".into(),
+        requires_openai_auth: false,
+        default_model: "test-model".into(),
+        api_protocol: None,
+        wire_api: None,
+    }
+}
+
+fn bound_process(
+    uuid: &str,
+    keys: &Arc<DashMap<String, ModelProviderConfig>>,
+    mappings: &Arc<DashMap<String, String>>,
+    script: &str,
+) -> AgentLifecycleGuard {
+    let mut command = CommandWrap::with_new("sh", |command| {
+        command
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    });
+    let child = command.wrap(ProcessGroup::leader()).spawn().unwrap();
+    keys.insert(uuid.into(), binding_provider());
+    AgentLifecycleGuard::new_claude_full(ClaudeProcessParams {
+        project_id: "bound-project".into(),
+        session_id: Some(SessionId::from("bound-session")),
+        child_process: child,
+        stderr_task: tokio::spawn(async {}),
+        cancel_token: CancellationToken::new(),
+        shared_api_key_manager: Some(keys.clone()),
+        project_uuid_map: Some(mappings.clone()),
+        service_uuid: Some(uuid.into()),
+        abnormal_exit_flag: None,
+        exit_detail: None,
+        diagnostics_listener: None,
+        process_command: "sh".into(),
+        process_args: Vec::new(),
+        working_dir: PathBuf::new(),
+    })
+    .unwrap()
+}
+
+/// 已受理取消不等于退出；确认正常停止后必须清该代次，同时保留后继映射。
+#[tokio::test]
+async fn proxy_binding_survives_cancel_and_is_reaped_without_removing_successor() {
+    let keys = Arc::new(DashMap::new());
+    let mappings = Arc::new(DashMap::new());
+    let guard = bound_process("old-generation", &keys, &mappings, "sleep 60");
+    guard.cancel();
+    assert!(keys.contains_key("old-generation"));
+    assert_eq!(
+        mappings.get("bound-project").unwrap().value(),
+        "old-generation"
+    );
+    keys.insert("successor-generation".into(), binding_provider());
+    mappings.insert("bound-project".into(), "successor-generation".into());
+    tokio::time::timeout(Duration::from_secs(5), guard.graceful_stop())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!keys.contains_key("old-generation"));
+    assert!(keys.contains_key("successor-generation"));
+    assert_eq!(
+        mappings.get("bound-project").unwrap().value(),
+        "successor-generation"
+    );
+}
+
+#[tokio::test]
+async fn proxy_binding_is_cleaned_on_natural_exit_even_while_guard_is_retained() {
+    let keys = Arc::new(DashMap::new());
+    let mappings = Arc::new(DashMap::new());
+    let guard = bound_process("natural-generation", &keys, &mappings, "exit 0");
+    tokio::time::timeout(Duration::from_secs(5), guard.wait_for_exit())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(guard.is_stopped());
+    assert!(keys.is_empty());
+    assert!(
+        mappings.is_empty(),
+        "fast child exit must not race mapping publication"
+    );
+}
+
+#[tokio::test]
+async fn proxy_binding_is_cleaned_after_drop_forces_and_reaps_exit() {
+    let keys = Arc::new(DashMap::new());
+    let mappings = Arc::new(DashMap::new());
+    let guard = bound_process("dropped-generation", &keys, &mappings, "sleep 60");
+    let mut exit = guard.inner.exit_result.clone();
+    drop(guard);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(result) = exit.borrow().clone() {
+                result.unwrap();
+                break;
+            }
+            exit.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(keys.is_empty());
+    assert!(mappings.is_empty());
 }

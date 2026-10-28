@@ -27,6 +27,18 @@ async fn restart_rechecks_exact_rejected_holder_when_it_finishes_during_diagnost
         let app_id = "diagnosticrelease";
         let request_id = "restart-release-original";
         let (service, runtime) = created_service(directory.path(), app_id, 2).await;
+        use super::super::traffic_wake_wait::{WakePause, WakePausePoint};
+        let lease_ready = WakePause::new(WakePausePoint::RestartLeaseReady);
+        let pause = super::super::operation_progress::DiagnosticReadPause::new();
+        let restart = Box::pin(service.restart_app_controlled(app_id, control_request(request_id)));
+        let restart = lease_ready.clone().scope(pause.clone().scope(restart));
+        tokio::pin!(restart);
+        tokio::select! {
+            _ = lease_ready.entered.wait() => {}
+            result = restart.as_mut() => panic!("restart ended before the empty pre-read: {result:?}"),
+        }
+        // Race a real admission after the new read-first gate. The original
+        // SQL rejection and captured/Released diagnostic path must still run.
         let mut holder = traffic_holder(&service, app_id).await;
         holder.release_physical_guard().await;
         let original = service
@@ -36,15 +48,12 @@ async fn restart_rechecks_exact_rejected_holder_when_it_finishes_during_diagnost
             .await
             .unwrap()
             .unwrap();
-        let pause = super::super::operation_progress::DiagnosticReadPause::new();
-        let restart = pause
-            .clone()
-            .scope(service.restart_app_controlled(app_id, control_request(request_id)));
-        tokio::pin!(restart);
-        tokio::select! {
-            _ = pause.entered.wait() => {}
-            result = restart.as_mut() => panic!("restart ended before diagnostic read: {result:?}"),
-        }
+        tokio::join!(lease_ready.release.wait(), async {
+            tokio::select! {
+                _ = pause.entered.wait() => {}
+                result = restart.as_mut() => panic!("restart ended before diagnostic read: {result:?}"),
+            }
+        });
         assert_not_admitted(&service, app_id, request_id).await;
         assert_no_restart_mutation(&runtime);
         if matches!(race, DiagnosticReleaseRace::RecoveryRequired) {
@@ -337,6 +346,17 @@ async fn waiting_restart_allows_original_business_restart_to_consume_old_stop_in
         .unwrap();
     assert!(before.desired_stopped);
     assert!(before.operation.as_ref().unwrap().state.is_terminal());
+    use super::super::traffic_wake_wait::{WakePause, WakePausePoint};
+    let lease_ready = WakePause::new(WakePausePoint::RestartLeaseReady);
+    let pause = super::super::operation_progress::DiagnosticReadPause::new();
+    let request = control_request(request_id);
+    let restart = Box::pin(service.restart_app_controlled(app_id, request.clone()));
+    let restart = lease_ready.clone().scope(pause.clone().scope(restart));
+    tokio::pin!(restart);
+    tokio::select! {
+        _ = lease_ready.entered.wait() => {}
+        result = restart.as_mut() => panic!("restart ended before the empty pre-read: {result:?}"),
+    }
     let mut holder = operation_holder(
         &service,
         app_id,
@@ -347,16 +367,12 @@ async fn waiting_restart_allows_original_business_restart_to_consume_old_stop_in
     .await;
     holder.release_physical_guard().await;
     let holder_id = holder.operation_id.clone();
-    let pause = super::super::operation_progress::DiagnosticReadPause::new();
-    let request = control_request(request_id);
-    let restart = pause
-        .clone()
-        .scope(service.restart_app_controlled(app_id, request.clone()));
-    tokio::pin!(restart);
-    tokio::select! {
-        _ = pause.entered.wait() => {}
-        result = restart.as_mut() => panic!("restart ended before diagnostic read: {result:?}"),
-    }
+    tokio::join!(lease_ready.release.wait(), async {
+        tokio::select! {
+            _ = pause.entered.wait() => {}
+            result = restart.as_mut() => panic!("restart ended before diagnostic read: {result:?}"),
+        }
+    });
     assert_not_admitted(&service, app_id, request_id).await;
     assert_no_restart_mutation(&runtime);
     // The original business Restart legitimately does this after its admission.
@@ -844,6 +860,13 @@ async fn restart_new_physical_identity_invalidates_history_before_a_budget_exhau
                         .as_deref(),
                     Some(holder.operation_id.as_str())
                 );
+                // The production admission loop rechecks the durable holder
+                // after a physical conflict before starting its next attempt.
+                // This observation must retain the compatible physical proof.
+                second
+                    .wait_restart_blocker(app_id, verified, deadline)
+                    .await
+                    .unwrap();
                 tokio::time::sleep_until(deadline).await;
                 let mut incoming = shared_types::UserAppOperationInProgress {
                     app_id: app_id.into(),

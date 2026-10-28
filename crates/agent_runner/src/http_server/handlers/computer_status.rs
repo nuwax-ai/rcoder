@@ -71,7 +71,12 @@ pub async fn handle_computer_status(
             .session_id
             .as_deref()
             .filter(|sid| !sid.is_empty())
-            .is_none_or(|sid| info.session_id.to_string() == sid)
+            .is_none_or(|sid| {
+                shared_types::SessionHint::classify(Some(sid))
+                    .as_session_id()
+                    .is_some()
+                    && info.session_id.0.as_ref() == sid
+            })
     });
 
     let response = match agent_info {
@@ -86,7 +91,9 @@ pub async fn handle_computer_status(
                 user_id: request.user_id.clone(),
                 project_id: project_id.to_string(),
                 is_alive: true,
-                session_id: Some(info.session_id.to_string()),
+                session_id: shared_types::SessionHint::classify(Some(info.session_id.0.as_ref()))
+                    .as_session_id()
+                    .map(str::to_owned),
                 status: Some(format!("{:?}", info.status)),
                 last_activity: Some(info.last_activity),
                 created_at: Some(info.created_at),

@@ -9,6 +9,135 @@ use crate::service::AppService;
 use crate::utils::{map_runtime_error, map_runtime_mutation_error};
 
 impl AppService {
+    /// A stopped-renewing coordinator may still have submitted work. Revoke
+    /// only its exact SQL snapshot before observing that work; never replay it.
+    pub(super) async fn resume_hot_control(
+        &self,
+        snapshot: &UserAppOperationRecord,
+    ) -> AppResult<bool> {
+        if !snapshot.kind.supports_hot_deployment()
+            || snapshot.scope != shared_types::UserAppOperationScope::Prod
+        {
+            return Ok(false);
+        }
+        let mut operation = snapshot.clone();
+        match operation.state {
+            UserAppOperationState::Running => {
+                let Some(binding) = self
+                    .metadata
+                    .store
+                    .get_operation_lease(&operation.app_id, &operation.operation_id)
+                    .await?
+                else {
+                    return Ok(false);
+                };
+                match self.observe_hot_lease(&operation, &binding).await? {
+                    container_runtime_api::AppOperationLeaseObservation::ExpiredOriginalIdentity => {}
+                    container_runtime_api::AppOperationLeaseObservation::Held
+                    | container_runtime_api::AppOperationLeaseObservation::AbsentOriginalIdentity
+                    | container_runtime_api::AppOperationLeaseObservation::Unconfirmed => return Ok(false),
+                }
+                operation = self
+                    .metadata
+                    .store
+                    .reserve_interrupted_hot(&operation, &binding)
+                    .await?;
+            }
+            UserAppOperationState::RecoveryRequired => {}
+            UserAppOperationState::Pending
+            | UserAppOperationState::Succeeded
+            | UserAppOperationState::Failed
+            | UserAppOperationState::WaitingRetry => return Ok(false),
+        }
+        match operation.step.as_str() {
+            "hot_execution" => Ok(self.reconcile_hot_failure(&operation).await?.is_some()),
+            "hot_converging" => Ok(self.reconcile_hot_convergence(&operation).await?.is_some()),
+            _ => Ok(false),
+        }
+    }
+
+    async fn observe_hot_lease(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        binding: &shared_types::UserAppOperationLeaseBinding,
+    ) -> AppResult<container_runtime_api::AppOperationLeaseObservation> {
+        if binding.context.app_id != snapshot.app_id
+            || binding.context.lifecycle_id != snapshot.lifecycle_id
+            || binding.context.operation_id != snapshot.operation_id
+            || Some(&binding.context.executor_id) != snapshot.executor_id.as_ref()
+            || binding.context.request_fingerprint != snapshot.request_fingerprint
+            || *binding.receipt.service_type() != shared_types::ServiceType::Userapp
+        {
+            return Err(AppOperationError::Conflict(
+                "Hot recovery lease identity changed".into(),
+            ));
+        }
+        match &binding.receipt {
+            shared_types::UserAppOperationLeaseReceipt::Kubernetes { .. } => {
+                let observation = self
+                    .runtime
+                    .observe_app_operation_lease(&binding.context, &binding.receipt)
+                    .await
+                    .map_err(|error| {
+                        map_runtime_error("Observe original hot recovery lease", error)
+                    })?;
+                match observation {
+                    container_runtime_api::AppOperationLeaseObservation::Held
+                    | container_runtime_api::AppOperationLeaseObservation::ExpiredOriginalIdentity => Ok(observation),
+                    // Absent 与 Unconfirmed 同桶：缺席/不确定都不授予恢复继续权；
+                    // legacy validate 对不存在的对象返回 false，自然落入 Unconfirmed。
+                    container_runtime_api::AppOperationLeaseObservation::AbsentOriginalIdentity
+                    | container_runtime_api::AppOperationLeaseObservation::Unconfirmed => {
+                        // Pre-Lease ConfigMap receipts have no TTL observation.
+                        // Preserve their original exact validation; a native
+                        // successor conflict above must never enter this path.
+                        let held = self.runtime.validate_app_operation_receipt(
+                            &binding.context, &binding.receipt
+                        ).await.map_err(|error| map_runtime_error("Validate retained hot recovery receipt", error))?;
+                        Ok(if held {
+                            container_runtime_api::AppOperationLeaseObservation::Held
+                        } else {
+                            container_runtime_api::AppOperationLeaseObservation::Unconfirmed
+                        })
+                    }
+                }
+            }
+            shared_types::UserAppOperationLeaseReceipt::Docker { .. } => {
+                // Docker has no expiring Lease. Keep its existing receipt
+                // validation; an absent file/unsupported observation grants nothing.
+                let held = self
+                    .runtime
+                    .validate_app_operation_receipt(&binding.context, &binding.receipt)
+                    .await
+                    .map_err(|error| map_runtime_error("Validate hot recovery lease", error))?;
+                Ok(if held {
+                    container_runtime_api::AppOperationLeaseObservation::Held
+                } else {
+                    container_runtime_api::AppOperationLeaseObservation::Unconfirmed
+                })
+            }
+        }
+    }
+
+    async fn require_hot_lease_identity(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        binding: &shared_types::UserAppOperationLeaseBinding,
+    ) -> AppResult<()> {
+        match self.observe_hot_lease(snapshot, binding).await? {
+            container_runtime_api::AppOperationLeaseObservation::Held
+            | container_runtime_api::AppOperationLeaseObservation::ExpiredOriginalIdentity => {
+                Ok(())
+            }
+            container_runtime_api::AppOperationLeaseObservation::AbsentOriginalIdentity
+            | container_runtime_api::AppOperationLeaseObservation::Unconfirmed => {
+                Err(AppOperationError::Conflict(
+                    "Original hot recovery lease identity is unconfirmed".into(),
+                ))
+            }
+        }
+    }
+
     /// Reconcile a hot failure by querying the exact owner recorded before the
     /// POST. No deployment replay, password write, or configuration convergence.
     pub(super) async fn reconcile_hot_failure(
@@ -53,12 +182,36 @@ impl AppService {
                     let encoded = serde_json::to_value(&evidence).map_err(|error| {
                         AppOperationError::Backend(format!("Encode hot success evidence: {error}"))
                     })?;
-                    self.metadata
-                        .store
-                        .finalize_observed_hot_success(snapshot, &encoded)
-                        .await?
+                    match self.config.access_mode {
+                        crate::config::AppAccessMode::Docker => {
+                            self.metadata
+                                .store
+                                .finalize_observed_hot_success(snapshot, &encoded)
+                                .await?
+                        }
+                        crate::config::AppAccessMode::Kubernetes => {
+                            if self.hot_environment_matches(snapshot).await? {
+                                self.require_hot_lease_identity(snapshot, binding).await?;
+                                self.metadata
+                                    .store
+                                    .finalize_observed_hot_success(snapshot, &encoded)
+                                    .await?
+                            } else {
+                                // The exact submit-stage snapshot was revoked.
+                                // The old coordinator must win a newer SQL CAS
+                                // before any env write; it can no longer do so.
+                                // Owner activation alone is only partial success.
+                                self.require_hot_lease_identity(snapshot, binding).await?;
+                                self.metadata.store.settle_fenced_operation(snapshot, &encoded,
+                                    "original hot owner completed before saved environment convergence; coordinator write authority was revoked; a fresh deployment may retry"
+                                ).await?
+                            }
+                        }
+                    }
                 }
-                _ => return Ok(None),
+                shared_types::AppCliDeployPhase::Idle
+                | shared_types::AppCliDeployPhase::Deploying
+                | shared_types::AppCliDeployPhase::Orchestrating => return Ok(None),
             }
         };
         if let Some(binding) = binding {
@@ -87,6 +240,60 @@ impl AppService {
         Ok(Some(terminal.into()))
     }
 
+    fn hot_environment_precondition(
+        snapshot: &UserAppOperationRecord,
+    ) -> Option<shared_types::HotDeploymentEnvPrecondition> {
+        snapshot.checkpoint.pointer("/hot_execution/converge_precondition")
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value::<shared_types::HotDeploymentEnvPrecondition>(value.clone()))
+            .and_then(|result| match result {
+                Ok(precondition) => match precondition.validate() {
+                    Ok(()) => Some(precondition),
+                    Err(error) => {
+                        tracing::warn!(%error, operation_id = %snapshot.operation_id,
+                            "Original hot env write precondition is incomplete; observe without granting write-retirement proof");
+                        None
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(%error, operation_id = %snapshot.operation_id,
+                        "Original hot env write precondition is unreadable; observe owner and current environment without granting write-retirement proof");
+                    None
+                }
+            })
+    }
+
+    async fn hot_environment_matches(&self, snapshot: &UserAppOperationRecord) -> AppResult<bool> {
+        let Some(value) = snapshot.checkpoint.pointer("/hot_execution/converge_env") else {
+            return Ok(false);
+        };
+        let expected: std::collections::HashMap<String, String> = match serde_json::from_value(
+            value.clone(),
+        ) {
+            Ok(expected) => expected,
+            Err(error) => {
+                tracing::warn!(%error, operation_id = %snapshot.operation_id,
+                    "Original hot environment target is unreadable; preserve partial failure without replay");
+                return Ok(false);
+            }
+        };
+        if expected.get(shared_types::APP_DEPLOY_OPERATION_ID) != Some(&snapshot.operation_id) {
+            return Ok(false);
+        }
+        let current = self
+            .runtime
+            .app_env_snapshot(&snapshot.app_id)
+            .await
+            .map_err(|error| {
+                map_runtime_error("Read original hot deployment environment", error)
+            })?;
+        let original = Self::hot_environment_precondition(snapshot);
+        Ok(current.env == expected
+            && original
+                .as_ref()
+                .is_none_or(|condition| condition.same_resource(&current)))
+    }
+
     /// Read the original hot owner's deployment status through the captured
     /// physical target. Returns validated evidence for a terminal owner
     /// outcome (Failed or Running); None while the owner is still deploying.
@@ -95,26 +302,7 @@ impl AppService {
         snapshot: &UserAppOperationRecord,
         binding: &shared_types::UserAppOperationLeaseBinding,
     ) -> AppResult<Option<shared_types::HotDeploymentFailureEvidence>> {
-        if binding.context.app_id != snapshot.app_id
-            || binding.context.lifecycle_id != snapshot.lifecycle_id
-            || binding.context.operation_id != snapshot.operation_id
-            || Some(&binding.context.executor_id) != snapshot.executor_id.as_ref()
-            || binding.context.request_fingerprint != snapshot.request_fingerprint
-        {
-            return Err(AppOperationError::Conflict(
-                "Hot recovery lease identity changed".into(),
-            ));
-        }
-        if !self
-            .runtime
-            .validate_app_operation_receipt(&binding.context, &binding.receipt)
-            .await
-            .map_err(|error| map_runtime_error("Validate hot recovery lease", error))?
-        {
-            return Err(AppOperationError::Conflict(
-                "Hot recovery lease is no longer held".into(),
-            ));
-        }
+        self.require_hot_lease_identity(snapshot, binding).await?;
         let hot = snapshot
             .checkpoint
             .get("hot_execution")
@@ -142,6 +330,9 @@ impl AppService {
         .await
         .map_err(|_| AppOperationError::Backend("Hot recovery observation timed out".into()))?
         .map_err(|error| map_runtime_error("Observe original hot owner", error))?;
+        // A successor arriving during the remote read cannot lend its mutex
+        // to the old result's final CAS or conditional lease cleanup.
+        self.require_hot_lease_identity(snapshot, binding).await?;
         if observed.exit_code != 0 {
             return Err(AppOperationError::Backend(
                 "Original hot owner status is unavailable".into(),
@@ -157,11 +348,11 @@ impl AppService {
                 AppOperationError::Conflict("Original hot operation status missing".into())
             })?)
             .map_err(|_| AppOperationError::Conflict("Invalid hot operation status".into()))?;
-        if !matches!(
-            operation.phase,
-            shared_types::AppCliDeployPhase::Failed | shared_types::AppCliDeployPhase::Running
-        ) {
-            return Ok(None);
+        match operation.phase {
+            shared_types::AppCliDeployPhase::Failed | shared_types::AppCliDeployPhase::Running => {}
+            shared_types::AppCliDeployPhase::Idle
+            | shared_types::AppCliDeployPhase::Deploying
+            | shared_types::AppCliDeployPhase::Orchestrating => return Ok(None),
         }
         let evidence =
             shared_types::HotDeploymentFailureEvidence {
@@ -197,25 +388,52 @@ impl AppService {
             .get_operation_lease(&snapshot.app_id, &snapshot.operation_id)
             .await?;
         let mut evidence = None;
-        if let Some(expected) = snapshot
-            .checkpoint
-            .pointer("/hot_execution/converge_env")
-            .cloned()
-        {
-            let expected: std::collections::HashMap<String, String> =
-                serde_json::from_value(expected).map_err(|error| {
-                    AppOperationError::Conflict(format!("Invalid hot convergence target: {error}"))
-                })?;
+        let mut current_env = None;
+        let mut configuration_conflict = false;
+        let precondition = Self::hot_environment_precondition(snapshot);
+        if let Some(binding) = &binding {
+            self.require_hot_lease_identity(snapshot, binding).await?;
+        }
+        let expected = snapshot.checkpoint.pointer("/hot_execution/converge_env")
+            .and_then(|value| match serde_json::from_value::<std::collections::HashMap<String, String>>(value.clone()) {
+                Ok(expected) => Some(expected),
+                Err(error) => {
+                    tracing::warn!(%error, operation_id = %snapshot.operation_id,
+                        "Original hot environment target is unreadable; observe native write retirement and owner without granting success");
+                    None
+                }
+            });
+        let observe_environment = match self.config.access_mode {
+            crate::config::AppAccessMode::Kubernetes => {
+                expected.is_some() || precondition.is_some()
+            }
+            crate::config::AppAccessMode::Docker => expected.is_some(),
+        };
+        if observe_environment {
             let current = self
                 .runtime
                 .app_env_snapshot(&snapshot.app_id)
                 .await
                 .map_err(|error| map_runtime_error("Read converged environment", error))?;
-            if current.env == expected {
-                evidence = Some(serde_json::to_value(&expected).map_err(|error| {
+            if precondition
+                .as_ref()
+                .is_some_and(|original| !original.same_resource(&current))
+            {
+                return Err(AppOperationError::Conflict(
+                    "Original hot environment resource was replaced; recovery will observe again"
+                        .into(),
+                ));
+            }
+            if let Some(expected) = &expected
+                && current.env == *expected
+                && expected.get(shared_types::APP_DEPLOY_OPERATION_ID)
+                    == Some(&snapshot.operation_id)
+            {
+                evidence = Some(serde_json::to_value(expected).map_err(|error| {
                     AppOperationError::Backend(format!("Encode convergence evidence: {error}"))
                 })?);
             }
+            current_env = Some(current);
         }
         if evidence.is_none() {
             let Some(binding) = binding.as_ref() else {
@@ -224,18 +442,43 @@ impl AppService {
                 ));
             };
             if let Some(owner) = self.observe_hot_owner(snapshot, binding).await? {
-                if owner.operation.phase == shared_types::AppCliDeployPhase::Running {
-                    owner
-                        .validate_success(snapshot)
-                        .map_err(AppOperationError::Conflict)?;
-                    evidence = Some(serde_json::to_value(&owner).map_err(|error| {
-                        AppOperationError::Backend(format!("Encode hot success evidence: {error}"))
-                    })?);
-                } else {
-                    return Err(AppOperationError::Conflict(
-                        "Hot owner reports failure after convergence began; manual reconciliation required"
-                            .into(),
-                    ));
+                match owner.operation.phase {
+                    shared_types::AppCliDeployPhase::Running => {
+                        owner
+                            .validate_success(snapshot)
+                            .map_err(AppOperationError::Conflict)?;
+                        match self.config.access_mode {
+                            crate::config::AppAccessMode::Docker => {}
+                            crate::config::AppAccessMode::Kubernetes => {
+                                if !precondition.as_ref().zip(current_env.as_ref()).is_some_and(
+                                    |(original, observed)| original.write_retired_by(observed),
+                                ) {
+                                    return Err(AppOperationError::Conflict(
+                                        "Hot owner completed, but the original conditional environment write is still unconfirmed; automatic observation will retry".into(),
+                                    ));
+                                }
+                                // The owner completed, and the original PATCH's
+                                // exact revision cannot write over this newer
+                                // ConfigMap. Preserve its newer values, report
+                                // partial failure, and permit a fresh request.
+                                configuration_conflict = true;
+                            }
+                        }
+                        evidence = Some(serde_json::to_value(&owner).map_err(|error| {
+                            AppOperationError::Backend(format!(
+                                "Encode hot success evidence: {error}"
+                            ))
+                        })?);
+                    }
+                    shared_types::AppCliDeployPhase::Failed
+                    | shared_types::AppCliDeployPhase::Idle
+                    | shared_types::AppCliDeployPhase::Deploying
+                    | shared_types::AppCliDeployPhase::Orchestrating => {
+                        return Err(AppOperationError::Conflict(
+                            "Original hot owner no longer confirms activation after convergence began; automatic observation will retry"
+                                .into(),
+                        ));
+                    }
                 }
             }
         }
@@ -244,11 +487,19 @@ impl AppService {
             // the original protection stays.
             return Ok(None);
         };
-        let terminal = self
-            .metadata
-            .store
-            .finalize_observed_hot_success(snapshot, &evidence)
-            .await?;
+        if let Some(binding) = &binding {
+            self.require_hot_lease_identity(snapshot, binding).await?;
+        }
+        let terminal = if configuration_conflict {
+            self.metadata.store.settle_fenced_operation(snapshot, &evidence,
+                "original hot owner completed; its conditional environment write was retired by a newer configuration; newer configuration retained"
+            ).await?
+        } else {
+            self.metadata
+                .store
+                .finalize_observed_hot_success(snapshot, &evidence)
+                .await?
+        };
         if let Some(binding) = binding {
             if binding.context.app_id != terminal.app_id
                 || binding.context.lifecycle_id != terminal.lifecycle_id

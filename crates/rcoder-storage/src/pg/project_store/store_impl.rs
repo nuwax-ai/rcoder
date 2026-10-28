@@ -6,7 +6,8 @@
 use std::sync::Arc;
 
 use shared_types::{
-    ContainerBasicInfo, ProjectAndContainerInfo, ProjectStore, ServiceType, StorageStats,
+    AgentStatusObservation, ContainerBasicInfo, ProjectAndContainerInfo, ProjectStore, ServiceType,
+    SessionHint, StorageStats,
 };
 
 use super::persist_ops::PersistOp;
@@ -83,7 +84,13 @@ impl ProjectStore for PgStore {
             !self.closing.load(std::sync::atomic::Ordering::Acquire),
             "Persistence is shutting down"
         );
-        let info = self.prepare_info(info, &registration)?;
+        // 同步 trait 入口无法 await 权威读：门禁沿用镜像比对（MirrorOnly），
+        // 镜像由 sync 容器删除对账收敛。
+        let info = self.prepare_info(
+            info,
+            &registration,
+            &super::authoritative::GateAuthority::MirrorOnly,
+        )?;
         self.inner.insert(project_id, Arc::clone(&info))?;
         self.persist_upsert(&info)
     }
@@ -94,12 +101,20 @@ impl ProjectStore for PgStore {
         info: Arc<ProjectAndContainerInfo>,
         session_id: Option<&str>,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            session_id.is_none_or(|sid| SessionHint::classify(Some(sid)).as_session_id().is_some()),
+            "An established session identity is required"
+        );
         let registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
         anyhow::ensure!(
             !self.closing.load(std::sync::atomic::Ordering::Acquire),
             "Persistence is shutting down"
         );
-        let mut info = self.prepare_info(info, &registration)?;
+        let mut info = self.prepare_info(
+            info,
+            &registration,
+            &super::authoritative::GateAuthority::MirrorOnly,
+        )?;
         if let Some(sid) = session_id {
             Arc::make_mut(&mut info).add_session(sid);
         }
@@ -311,6 +326,42 @@ impl ProjectStore for PgStore {
         } else {
             false
         }
+    }
+
+    /// 按观察代次应用后台状态结论。镜像按物理身份条件更新；持久化 op 携带
+    /// **观察捕获**的 generation/revision（而非写入时的当前值），SQL CAS
+    /// （generation + row_revision）保证迟到的旧观察不落到后继代次行上。
+    fn apply_agent_status_observation(
+        &self,
+        project_id: &str,
+        observation: &AgentStatusObservation,
+    ) -> bool {
+        let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
+        if self.closing.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        if !self
+            .inner
+            .apply_agent_status_observation(project_id, observation)
+        {
+            return false;
+        }
+        // Keep status and clocks indivisible under the ORIGINAL observation's
+        // predicates; never resolve a current container generation after a wait.
+        self.enqueue_throttled(
+            &format!(
+                "observation:{project_id}:{}:{}:{}",
+                observation.project_generation,
+                observation.project_revision,
+                observation.container_id
+            ),
+            PersistOp::ApplyAgentStatusObservation {
+                project_id: project_id.to_owned(),
+                observation: observation.clone(),
+                at: chrono::Utc::now(),
+            },
+        );
+        true
     }
 
     fn delete_container_with_projects(&self, container_id: &str) -> (bool, usize) {

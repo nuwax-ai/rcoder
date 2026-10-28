@@ -35,6 +35,8 @@ mod helpers;
 mod keepalive;
 mod queries;
 mod restart;
+#[cfg(all(test, feature = "userapp-turso"))]
+mod retirement_tests;
 mod status;
 mod stop;
 #[cfg(test)]

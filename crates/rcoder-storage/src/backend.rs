@@ -11,8 +11,8 @@
 use std::sync::Arc;
 
 use shared_types::{
-    ContainerBasicInfo, ContainerLookup, ProjectAndContainerInfo, ProjectStore, ServiceType,
-    StorageStats,
+    AgentStatusObservation, ContainerBasicInfo, ContainerLookup, ProjectAndContainerInfo,
+    ProjectStore, ServiceType, StorageStats,
 };
 
 use crate::adapter::ProjectAdapter;
@@ -28,6 +28,77 @@ pub enum ProjectStoreBackend {
 }
 
 impl ProjectStoreBackend {
+    /// Freeze a registration hint from its authoritative backend without
+    /// publishing a routing mirror or authorizing a physical deletion.
+    pub async fn capture_builder_registry_identity(
+        &self,
+        app_id: &str,
+    ) -> anyhow::Result<Option<shared_types::BuilderRegistryIdentity>> {
+        match self {
+            Self::Memory(inner) => inner.capture_builder_registry_identity(app_id),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => store.capture_builder_registry_identity(app_id).await,
+        }
+    }
+
+    /// Verify current ownership and references before the original physical deletion.
+    pub async fn check_captured_builder_registration(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+        original: Option<&shared_types::BuilderRegistryIdentity>,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Memory(inner) => inner.check_captured_builder_registration(target, original),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => store.check_captured_builder_registration(target).await,
+        }
+    }
+
+    /// Retire only the registration of the independently captured builder.
+    /// Ordinary project epochs are not physical identities.
+    pub async fn retire_captured_builder_registration(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+        original: Option<&shared_types::BuilderRegistryIdentity>,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Memory(inner) => inner.retire_captured_builder_registration(target, original),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => store.retire_captured_builder_registration(target).await,
+        }
+    }
+
+    pub async fn capture_project_stop_registration(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Option<crate::ProjectStopFrame>> {
+        let source = match self {
+            Self::Memory(inner) => inner.get(project_id),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => store.capture_project_stop_registration(project_id).await?,
+        };
+        Ok(source.map(crate::ProjectStopFrame::capture))
+    }
+
+    pub async fn clear_sessions_if_current_durable(
+        &self,
+        frame: &crate::ProjectStopFrame,
+    ) -> anyhow::Result<shared_types::persistence::PersistenceWriteOutcome> {
+        use shared_types::persistence::PersistenceWriteOutcome;
+        match self {
+            Self::Memory(inner) => Ok(if inner.clear_sessions_if_current_frame(frame) {
+                PersistenceWriteOutcome::Committed
+            } else {
+                PersistenceWriteOutcome::Superseded
+            }),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => {
+                store
+                    .clear_sessions_if_current_durable(frame.project())
+                    .await
+            }
+        }
+    }
     /// Complete an explicit, registration-only adoption under the same PG
     /// transaction as the lifecycle outcome. No historical creator is invented.
     pub async fn complete_builder_registration_adoption(
@@ -143,6 +214,119 @@ impl ProjectStoreBackend {
             Self::Postgres(store) => {
                 store
                     .insert_with_session_durable(project_id, info, session_id)
+                    .await
+            }
+        }
+    }
+
+    /// Confirm registration before dispatching the first task to a runner.
+    /// Deferred registration retains the original immutable fallback command.
+    pub async fn insert_project_registration_durable(
+        &self,
+        project_id: String,
+        info: Arc<ProjectAndContainerInfo>,
+    ) -> anyhow::Result<shared_types::persistence::PersistenceWriteOutcome> {
+        use shared_types::persistence::PersistenceWriteOutcome;
+        anyhow::ensure!(
+            project_id == info.project_id(),
+            "Project registration key differs from its payload"
+        );
+        match self {
+            Self::Memory(inner) => {
+                let captured = Arc::clone(&info);
+                inner.insert(project_id, info)?;
+                Ok(
+                    if inner.get(captured.project_id()).is_some_and(|current| {
+                        crate::adapter::session_container_matches(&captured, &current)
+                    }) {
+                        PersistenceWriteOutcome::Committed
+                    } else {
+                        PersistenceWriteOutcome::Superseded
+                    },
+                )
+            }
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => {
+                store
+                    .insert_project_registration_durable(project_id, info)
+                    .await
+            }
+        }
+    }
+
+    /// Complete a dispatched chat by appending only its routing identity to the
+    /// same captured runner. Metadata revisions do not invalidate completion.
+    pub async fn append_session_for_container_durable(
+        &self,
+        expected: &ProjectAndContainerInfo,
+        session_id: &str,
+    ) -> anyhow::Result<shared_types::persistence::PersistenceWriteOutcome> {
+        use shared_types::persistence::PersistenceWriteOutcome;
+        match self {
+            Self::Memory(inner) => Ok(
+                if inner.append_session_for_container(expected, session_id)? {
+                    PersistenceWriteOutcome::Committed
+                } else {
+                    PersistenceWriteOutcome::Superseded
+                },
+            ),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => {
+                store
+                    .append_session_for_container_durable(expected, session_id)
+                    .await
+            }
+        }
+    }
+
+    /// Confirm durability independently of the local accepted-write mirror.
+    /// PostgreSQL always reads the authoritative primary transaction here.
+    pub async fn is_session_registration_committed(
+        &self,
+        expected: &ProjectAndContainerInfo,
+        session_id: &str,
+    ) -> anyhow::Result<bool> {
+        match self {
+            Self::Memory(inner) => Ok(inner.get_by_session_id(session_id).is_some_and(|current| {
+                crate::adapter::session_container_matches(expected, &current)
+                    && expected
+                        .persistence_identity()
+                        .sessions
+                        .get(session_id)
+                        .is_none_or(|generation| {
+                            current.persistence_identity().sessions.get(session_id)
+                                == Some(generation)
+                        })
+            })),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => {
+                store
+                    .is_session_registration_committed(expected, session_id)
+                    .await
+            }
+        }
+    }
+
+    /// Rebind only a replacement whose physical ownership and workspace have
+    /// already been verified by the runtime. Keep historical session IDs.
+    pub async fn replace_agent_container_registration_durable(
+        &self,
+        expected: &ProjectAndContainerInfo,
+        evidence: &shared_types::VerifiedAgentReplacement,
+    ) -> anyhow::Result<shared_types::persistence::PersistenceWriteOutcome> {
+        use shared_types::persistence::PersistenceWriteOutcome;
+        match self {
+            Self::Memory(inner) => Ok(
+                if inner.replace_agent_container_registration(expected, evidence)? {
+                    PersistenceWriteOutcome::Committed
+                } else {
+                    PersistenceWriteOutcome::Superseded
+                },
+            ),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => {
+                store
+                    .replace_agent_container_registration_durable(expected, evidence)
                     .await
             }
         }
@@ -268,6 +452,43 @@ impl ProjectStoreBackend {
             Self::Memory(inner) => inner.get_by_session_id(session_id),
             #[cfg(feature = "pg")]
             Self::Postgres(store) => store.get_by_session_id_with_fetch(session_id).await,
+        }
+    }
+
+    /// Fallible SSE lookup: an unavailable or invalid database is not a missing
+    /// session. Callers translate that failure into a retriable server error.
+    pub async fn get_by_session_id_with_fetch_result(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Option<Arc<ProjectAndContainerInfo>>> {
+        match self {
+            Self::Memory(inner) => Ok(inner.get_by_session_id(session_id)),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => store.get_by_session_id_with_fetch_result(session_id).await,
+        }
+    }
+
+    /// Refresh one registration from its authoritative store before verifying a
+    /// runtime transition. This does not adopt a physical container or relax CAS.
+    pub async fn refresh_project_registration(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Option<Arc<ProjectAndContainerInfo>>> {
+        match self {
+            Self::Memory(inner) => Ok(inner.get(project_id)),
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => store.refresh_project_registration(project_id).await,
+        }
+    }
+
+    /// The user-scoped on-miss refresh hook for the proxy: PG deployments
+    /// re-read the user's authoritative rows through the guarded project
+    /// read-through; memory-only deployments have nothing to fall back to.
+    #[cfg(feature = "pg")]
+    pub fn user_refresh(&self) -> Option<Arc<dyn shared_types::ContainerUserRefresh>> {
+        match self {
+            Self::Memory(_) => None,
+            Self::Postgres(store) => Some(store.clone()),
         }
     }
 
@@ -501,6 +722,18 @@ impl ProjectStore for ProjectStoreBackend {
         }
     }
 
+    fn apply_agent_status_observation(
+        &self,
+        project_id: &str,
+        observation: &AgentStatusObservation,
+    ) -> bool {
+        match self {
+            Self::Memory(inner) => inner.apply_agent_status_observation(project_id, observation),
+            #[cfg(feature = "pg")]
+            Self::Postgres(inner) => inner.apply_agent_status_observation(project_id, observation),
+        }
+    }
+
     fn delete_container_with_projects(&self, container_id: &str) -> (bool, usize) {
         match self {
             Self::Memory(inner) => inner.delete_container_with_projects(container_id),
@@ -564,7 +797,7 @@ mod tests {
     /// 内存实现等价（M3 加入 Postgres 变体后，同一测试面将覆盖两变体一致性）。
     #[test]
     fn memory_backend_dispatches_through_trait() {
-        let (adapter, _rx) = ProjectAdapter::new("test-ns".into(), "cluster.local".into());
+        let adapter = ProjectAdapter::new("test-ns".into(), "cluster.local".into());
         let backend = ProjectStoreBackend::Memory(Arc::new(adapter));
 
         let mut info = ProjectAndContainerInfo::new("proj-1".into());
@@ -599,7 +832,7 @@ mod tests {
     /// ContainerLookup 经枚举转发（Pingora 注入路径）。
     #[test]
     fn memory_backend_implements_container_lookup() {
-        let (adapter, _rx) = ProjectAdapter::new("test-ns".into(), "cluster.local".into());
+        let adapter = ProjectAdapter::new("test-ns".into(), "cluster.local".into());
         let backend = ProjectStoreBackend::Memory(Arc::new(adapter));
 
         let mut info = ProjectAndContainerInfo::new("proj-2".into());
@@ -627,7 +860,7 @@ mod tests {
     /// 此处仅验证 mirror 访问器返回同一实现的统计语义。
     #[test]
     fn memory_mirror_accessor() {
-        let (adapter, _rx) = ProjectAdapter::new("test-ns".into(), "cluster.local".into());
+        let adapter = ProjectAdapter::new("test-ns".into(), "cluster.local".into());
         let backend = ProjectStoreBackend::Memory(Arc::new(adapter));
         assert_eq!(backend.memory_mirror().get_stats().total_projects, 0);
     }

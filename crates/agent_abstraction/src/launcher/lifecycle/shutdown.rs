@@ -280,12 +280,7 @@ impl Drop for AgentLifecycleGuard {
             // 发送取消信号
             self.inner.cancel_token.cancel();
 
-            // 注意：API 密钥配置的清理由 agent_runner 层的 stop_agent 方法统一负责
-            // 包括：
-            // - shared_api_key_manager 中的配置
-            // - project_uuid_map 中的映射
-            //
-            // 这样避免双重清理，确保资源只被清理一次
+            // API 配置保持到 reaper 确认 child.wait 成功，Drop 仅请求终止。
 
             // 🔥 同步终止进程组
             #[cfg(unix)]

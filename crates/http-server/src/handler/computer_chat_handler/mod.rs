@@ -67,7 +67,7 @@ use super::utils::{
     responses(
         (
             status = 200,
-            description = "成功处理聊天请求",
+            description = "聊天结果信封；已受理任务的会话登记失败返回 success=false，保留 data.session_id，仅重连进度，不重发原消息",
             body = HttpResult<ChatResponse>,
             example = json!({
                 "success": true,
@@ -89,6 +89,16 @@ use super::utils::{
             status = 401,
             description = "API Key 鉴权失败",
             body = HttpResult<String>
+        ),
+        (
+            status = 409,
+            description = "派发前归属冲突返回 ERR_COMPUTER_OWNER_CONFLICT，reason 区分 user/pod/service_family，retryable=false，消息未发送；登记退休或换代也返回 409。已受理任务的登记错误沿 HTTP 200 失败信封保留 session_id",
+            body = HttpResult<ChatResponse>
+        ),
+        (
+            status = 503,
+            description = "派发前登记暂未确认；已受理任务的登记错误沿 HTTP 200 失败信封保留 session_id，仅重连进度",
+            body = HttpResult<ChatResponse>
         ),
         (
             status = 500,
@@ -119,7 +129,15 @@ pub(crate) async fn handle_computer_chat_internal(
     I18nJsonOrQuery(request): I18nJsonOrQuery<ComputerChatRequest>,
     is_devcomputer: bool,
 ) -> Result<HttpResult<ChatResponse>, AppError> {
-    match run_computer_chat_flow(state, headers, request, is_devcomputer).await {
+    // A disconnected HTTP client does not cancel an accepted Chat or release
+    // its workload guard before the task/session registration has settled.
+    let flight = crate::handler::utils::owned_operation_flight(&state)?;
+    let outcome = crate::handler::utils::spawn_owned_operation(flight, async move {
+        run_computer_chat_flow(state, headers, request, is_devcomputer).await
+    })
+    .await
+    .map_err(|error| AppError::internal_server_error(&format!("Chat task failed: {error}")))?;
+    match outcome {
         Ok(result) => Ok(result),
         Err(ChatFlowExit::Response(boxed)) => Ok(*boxed),
         Err(ChatFlowExit::Fatal(e)) => Err(e),
@@ -190,9 +208,38 @@ async fn run_computer_chat_flow(
     let (project_id, work_dir_id) = validation::validate_and_prepare_request(&mut request, locale)?;
     let user_id = request.user_id.clone();
 
+    let service_type = request
+        .service_type
+        .unwrap_or(shared_types::ServiceType::ComputerAgentRunner);
+    let identifier = service_type
+        .container_identifier(request.pod_id.as_deref(), Some(&user_id), Some(&project_id))
+        .map_err(|error| AppError::validation_error(&error.to_string()))?;
+    let admission = state
+        .acquire_agent_workload(
+            identifier,
+            &service_type,
+            rcoder_storage::WorkloadAdmissionMode::Shared,
+        )
+        .await
+        .map_err(|error| {
+            AppError::with_message(
+                shared_types::error_codes::ERR_CONFLICT,
+                format!("Workload admission unavailable; retry later: {error}"),
+            )
+        })?;
+
     // 4~5. 容器就绪/唤醒（并发等待、按需创建、空 IP 修复、映射写入、活动时间更新）
-    let container_info =
+    let registered =
         container::ensure_container_ready(&state, &request, &user_id, &project_id, locale).await?;
+    crate::handler::utils::refresh_workload_fence(&state, &admission, identifier, &service_type)
+        .await?;
+    // Project clones normally share ContainerEntry. Detach the exact physical
+    // snapshot before awaiting RPC work so a replacement cannot rewrite the
+    // executor identity used to append this request's session later.
+    let dispatched_project = session::capture_dispatch_project(&registered)?;
+    let container_info = dispatched_project.container_info().ok_or_else(|| {
+        AppError::internal_server_error("Registered Computer container is missing")
+    })?;
 
     // 自动安装检查：如果 agent_server 携带 platforms，必须同时提供 agent_id、command、version
     session::ensure_agent_installed_if_needed(&state, &request, &project_id, locale).await?;
@@ -216,7 +263,7 @@ async fn run_computer_chat_flow(
     session::probe_agent_status(&state, &container_info, &project_id, locale).await;
 
     // 7. 🆕 自动查找 session_id 逻辑（克隆 request 并注入解析后的 session_id）
-    let request_for_forward = session::resolve_forward_request(&state, &request, &project_id);
+    let request_for_forward = session::resolve_forward_request(&request, &dispatched_project);
 
     // 8. 转发请求到容器服务（使用 gRPC）
     // 常规项目走同一 computer 流程（共享容器/ensure/VNC 全复用）；service_type
@@ -243,17 +290,14 @@ async fn run_computer_chat_flow(
         diagnostic_identifier: user_id.clone(),
         force_new_session: false,
     };
-    let result = forward::forward_computer_request_to_container(forward_params).await;
+    let mut result = forward::forward_computer_request_to_container(forward_params).await;
 
     // 8. 更新会话映射（填充所有三个映射表，保持一致性）
     session::update_session_mappings_after_response(
         &state,
-        &result,
-        &user_id,
-        &project_id,
-        &container_info,
-        &request,
-        &shared_types::ServiceType::ComputerAgentRunner,
+        &mut result,
+        &dispatched_project,
+        locale,
     )
     .await;
 

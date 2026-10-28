@@ -107,19 +107,7 @@ pub enum DockerError {
 /// Docker 管理器结果类型
 pub type DockerResult<T> = Result<T, DockerError>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContainerCreationPhase {
-    Start,
-    Observe,
-}
-impl std::fmt::Display for ContainerCreationPhase {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Start => "start",
-            Self::Observe => "observe started container",
-        })
-    }
-}
+pub use container_runtime_api::DockerCreationPhase as ContainerCreationPhase;
 
 /// 默认的 Docker 镜像配置常量
 pub mod default_images {

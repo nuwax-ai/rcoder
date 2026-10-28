@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -22,6 +23,108 @@ from turso_runtime_contract import service_config, validate_owned, wait_ready
 REPO = Path(__file__).resolve().parents[2]
 IDLE_SECONDS = 60
 SCAN_SECONDS = 5
+FIRST_PROXY_STEPS = {
+    'dev business proxy reaches original source before idle',
+    'first recycle: first business proxy request has no preparatory control',
+    'first recycle: first business proxy request recreated one builder',
+    'first recycle: first business proxy response matches dev builder-only contract',
+    'first recycle: explicit Start restores one owner and proxy HTTP',
+}
+
+
+def proxy_listener_port(config):
+    """Read the existing fixture listener; never borrow the daily proxy port."""
+    matches = re.findall(r'(?m)^proxy_config:\n  listen_port: ([0-9]+)\s*$', config)
+    if len(matches) != 1 or not 0 < int(matches[0]) <= 65535 or int(matches[0]) == 8090:
+        raise ValueError('expected one distinct fixture proxy listen_port')
+    return int(matches[0])
+
+
+def business_proxy_url(base, app_id):
+    fixture_layout(app_id, '/home/user/' + app_id)
+    parsed = urllib.parse.urlsplit(base)
+    if (parsed.scheme != 'http' or parsed.hostname != '127.0.0.1' or not parsed.port
+            or parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment):
+        raise ValueError('business proxy must use this fixture loopback listener')
+    return base + '/api/v1/userapp/proxy/app/dev/' + app_id + '/' + app_id + '/health'
+
+
+class NoProxyRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def first_proxy_request(url):
+    """One actual business GET; redirects and client retries cannot hide failure."""
+    request = urllib.request.Request(url, headers={'Accept': 'application/json'})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoProxyRedirect())
+    started = time.monotonic()
+    try:
+        response = opener.open(request, timeout=90)
+    except urllib.error.HTTPError as error:
+        response = error
+    with response:
+        raw = response.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise ValueError('unexpectedly large fixture business proxy response')
+        headers = {name.lower(): value for name, value in response.headers.items()
+                   if name.lower() in ('content-type', 'x-rcoder-diagnostic-id', 'retry-after')}
+        return {'url': url, 'method': 'GET', 'status': response.status, 'headers': headers,
+                'body': raw.decode('utf-8'), 'body_sha256': hashlib.sha256(raw).hexdigest(),
+                'elapsed_seconds': time.monotonic() - started, 'client_attempts': 1}
+
+
+def first_proxy_response_matches(reply, state, version, previous_build_count):
+    """A 503 needs both the exact proxy reason and physical no-service evidence."""
+    if (reply.get('client_attempts') != 1 or reply.get('method') != 'GET'
+            or state.get('observation_errors') != [] or not isinstance(state.get('owner_pids'), list)
+            or not isinstance(state.get('service_pids'), list)
+            or len(state['owner_pids']) > 1 or type(state.get('build_count')) is not int):
+        return False
+    if reply.get('status') == 200:
+        return (reply.get('body') == version and state.get('entry_listening') is True
+                and len(state.get('service_pids', [])) == len(state['owner_pids']) == 1
+                and state['build_count'] >= previous_build_count)
+    if (reply.get('status') != 503 or state.get('entry_listening') is not False
+            or state.get('service_pids') != [] or state['build_count'] != previous_build_count):
+        return False
+    try:
+        error = json.loads(reply['body'])['error']
+    except (KeyError, TypeError, ValueError):
+        return False
+    headers = reply.get('headers', {})
+    return (isinstance(error, dict) and isinstance(headers, dict)
+            and headers.get('content-type', '').startswith('application/json')
+            and error.get('code') == 'USERAPP_PROXY_FAILURE' and error.get('status') == 503
+            and error.get('reason') == 'upstream unavailable during connection recovery'
+            and isinstance(error.get('diagnostic_id'), str) and bool(error['diagnostic_id'])
+            and headers.get('x-rcoder-diagnostic-id') == error['diagnostic_id']
+            and headers.get('retry-after') == '15')
+
+
+# /proc/file observations only: no readiness, management, or business HTTP call.
+PROXY_STATE_SCRIPT = r'''
+import json,pathlib,sys
+workspace=pathlib.Path(sys.argv[1]);owners=[];services=[];errors=[]
+for proc in pathlib.Path('/proc').iterdir():
+ if not proc.name.isdigit():continue
+ try:
+  args=[x.decode() for x in (proc/'cmdline').read_bytes().split(b'\0') if x]
+  if not args:continue
+  if (proc/'stat').read_text().rsplit(')',1)[1].split()[0]=='Z':continue
+  if pathlib.PurePosixPath(args[0]).name=='app-cli' and 'serve' in args and any(x in args for x in (str(workspace),str(workspace/'.run'))):owners.append(int(proc.name))
+  if any(pathlib.PurePosixPath(x).name=='main.py' for x in args):
+   cwd=(proc/'cwd').resolve()
+   if cwd.is_relative_to(workspace):services.append(int(proc.name))
+ except FileNotFoundError:pass
+ except Exception as error:errors.append(type(error).__name__+':'+proc.name)
+listening=False
+for name in ('tcp','tcp6'):
+ for line in pathlib.Path('/proc/net',name).read_text().splitlines()[1:]:
+  fields=line.split()
+  listening|=fields[3]=='0A' and int(fields[1].rsplit(':',1)[1],16)==9080
+print(json.dumps({'owner_pids':sorted(owners),'service_pids':sorted(services),'entry_listening':listening,'build_count':int((workspace/'web/build-count').read_text()),'observation_errors':errors}))
+'''
 
 # Runs inside the captured Linux builder. In the unified Session topology the
 # generation's worker_pid is the owner itself, not a child of a root guardian.
@@ -170,6 +273,33 @@ def inspect(cid):
         raise RuntimeError(f'docker inspect failed ({result.returncode}): '
                            f'{result.stderr[-2000:]} {result.stdout[-2000:]}')
     return json.loads(result.stdout)[0]
+
+
+
+def idle_retirement_evidence(logs, previous_lines, app_id, container_id):
+    """Current structured records for this exact workload; stdout duplicates
+    and a different CID never count as another independent confirmation.
+    """
+    required = {'[cleaner] idle confirmed in distinct consecutive cleanup sweeps',
+                'Retiring captured idle builder compute'}
+    records = {}
+    for line in logs.splitlines():
+        if line in previous_lines:
+            continue
+        try:
+            row = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(row, dict):
+            continue
+        fields = row.get('fields', {})
+        if not isinstance(fields, dict):
+            continue
+        message = fields.get('message')
+        if (message in required and fields.get('container_id') == container_id
+                and fields.get('project_id', fields.get('identifier')) == app_id):
+            records.setdefault(message, row)
+    return list(records.values()) if set(records) == required else []
 
 
 def fixture_layout(app_id, source_root):
@@ -331,11 +461,14 @@ def main():
     run_id, case_id = os.environ.get('E2E_RUN_ID', project), os.environ.get('E2E_CASE_ID', app)
     evidence = {'app_id': app, 'checks': [], 'containers': [], 'tasks': [],
                 'cleanup': [], 'idle_seconds': IDLE_SECONDS, 'scan_seconds': SCAN_SECONDS,
-                'scope': 'isolated_compose_real_idle_reaper', 'retained_data': str(root)}
+                'scope': 'isolated_compose_real_idle_reaper', 'retained_data': str(root),
+                'http_calls': [], 'proxy_calls': [],
+                'first_proxy_required_steps': sorted(FIRST_PROXY_STEPS),
+                'first_proxy_contract': 'dev builder recreation only; business recovery checked after explicit Start'}
     receipt = {'project': project, 'run_id': run_id, 'case_id': case_id,
                'root': str(root), 'app_id': app}
     compose = ['docker', 'compose', '-p', project, '-f', str(root / 'compose.json')]
-    cid = controller = base = life = None
+    cid = controller = base = life = proxy_base = None
     private_config = None
     workspace = '/home/user/' + app
     state_root = fixture_layout(app, workspace)['state_root']
@@ -355,17 +488,32 @@ def main():
             raise RuntimeError(name)
 
     def http(path, body=None, timeout=150):
+        call = {'path': path, 'method': 'GET' if body is None else 'POST'}
+        evidence['http_calls'].append(call)
+        save()
         data = None if body is None else json.dumps(body).encode()
         request = urllib.request.Request(base + path, data=data,
                                          headers={'Content-Type': 'application/json', 'X-App-Id': app})
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
+                call['status'] = response.status
                 result = json.load(response)
         except urllib.error.HTTPError as error:
+            call['status'] = error.code
+            save()
             raise RuntimeError(f'{path}: HTTP {error.code}: {error.read().decode(errors="replace")[-4000:]}') from error
         if not (result.get('success') is True or result.get('code') == '0000'):
             raise RuntimeError(f'{path}: {result}')
         return result
+
+    def proxy_request():
+        reply = first_proxy_request(business_proxy_url(proxy_base, app))
+        evidence['proxy_calls'].append(reply)
+        save()
+        return reply
+
+    def proxy_state():
+        return json.loads(execute('python3', '-c', PROXY_STATE_SCRIPT, workspace).stdout)
 
     def execute(*args, check=True):
         return docker('exec', cid, *args, check=check)
@@ -467,9 +615,12 @@ def main():
         files = '\n'.join(p.read_text(errors='replace') for p in (root / 'logs').glob('*') if p.is_file())
         return stdout + '\n' + files
 
-    def recycle_and_ensure(before, original_owner, cycle):
+    def recycle_and_ensure(before, original_owner, cycle, first_business_request=False,
+                           previous_build_count=None):
         nonlocal cid
         old_id = cid
+        platform_calls = len(evidence['http_calls'])
+        proxy_calls = len(evidence['proxy_calls'])
         # No RCoder requests while idle: file/status traffic may touch activity.
         # Capture earlier lines so a later cycle cannot reuse earlier evidence
         # (stdout and file logs may grow independently or rotate).
@@ -477,8 +628,7 @@ def main():
         deadline = time.monotonic() + IDLE_SECONDS + SCAN_SECONDS * 4 + 90
         while inspect(old_id) is not None and time.monotonic() < deadline:
             time.sleep(2)
-        lines = [line for line in controller_logs().splitlines() if line not in previous_lines and app in line and
-                 ('idle confirmed (2nd consecutive scan)' in line or 'Starting container destruction' in line)]
+        lines = idle_retirement_evidence(controller_logs(), previous_lines, app, old_id)
         check(cycle + ': real idle reaper removed captured builder', inspect(old_id) is None and len(lines) >= 2, lines)
         cid = None
         log_mount = next(m for m in before['mounts'] if m['destination'] == '/home/user/logs')
@@ -489,12 +639,36 @@ def main():
         check(cycle + ': stale owner registration retained', persisted['owners'][dev_key]['owner']['runtime_instance_id'] == original_owner and coordinator.is_file(),
               {'state_sha256': hashlib.sha256(retained.read_bytes()).hexdigest(),
                'coordinator_retained': coordinator.is_file()})
-        http('/api/v1/userapp/workspace', {'app_id': app}, timeout=180)
+        if first_business_request:
+            reply = proxy_request()
+            check('first recycle: first business proxy request has no preparatory control',
+                  len(evidence['http_calls']) == platform_calls
+                  and len(evidence['proxy_calls']) == proxy_calls + 1, reply)
+            deadline = time.monotonic() + 30
+            while True:
+                ids = docker('ps', '-aq', '--no-trunc', '--filter', 'label=rcoder.io/application-id=' + app,
+                             '--filter', 'label=service-type=user-app-builder').stdout.split()
+                if len(ids) > 1 or ids or time.monotonic() >= deadline:
+                    break
+                time.sleep(.5)
+            check('first recycle: first business proxy request recreated one builder',
+                  len(ids) == 1 and ids[0] != old_id,
+                  {'old_id': old_id, 'new_ids': ids, 'proxy_status': reply['status']})
+        else:
+            http('/api/v1/userapp/workspace', {'app_id': app}, timeout=180)
         after = capture()
         check(cycle + ': replacement preserves lifecycle and workspace mounts', after['id'] != old_id and after['mounts'] == before['mounts'] and
               execute('cat', workspace + '/sentinel').stdout == app and
               http('/api/v1/userapp/' + app + '/lifecycle')['data']['lifecycle_id'] == life,
               {'old_id': old_id, 'new_id': cid})
+        if first_business_request:
+            observed = proxy_state()
+            evidence['first_proxy_physical_state'] = observed
+            check('first recycle: first business proxy response matches dev builder-only contract',
+                  first_proxy_response_matches(reply, observed, 'before-recycle', previous_build_count),
+                  {'response': reply, 'physical_state': observed,
+                   'business_first_response_200': reply['status'] == 200})
+            after['first_proxy_build_count'] = observed['build_count']
         return after
 
     try:
@@ -502,12 +676,15 @@ def main():
         evidence['builder_image'] = docker('image', 'inspect', '--format', '{{.Id}}', args.builder_image).stdout.strip()
         receipt['builder_image'] = evidence['builder_image']
         private_config = Path(tempfile.mkdtemp(prefix=project + '-')) / 'config.yml'
-        private_config.write_text(idle_config((REPO / 'docker/config.yml').read_text(),
-                                             evidence['builder_image'], app, workspace))
+        config_text = idle_config((REPO / 'docker/config.yml').read_text(),
+                                  evidence['builder_image'], app, workspace)
+        private_config.write_text(config_text)
+        proxy_port = proxy_listener_port(config_text)
         private_config.chmod(0o600)
         config = service_config(root, evidence['rcoder_image'], run_id, case_id,
                                 os.environ.get('DOCKER_SOCKET_PATH', '/var/run/docker.sock'), private_config)
         config['services']['rcoder']['environment'].pop('RCODER_AUTO_CLEANUP')
+        config['services']['rcoder']['ports'].append('127.0.0.1::' + str(proxy_port))
         for mount in config['services']['rcoder']['volumes']:
             if not mount.get('read_only') and mount['source'].startswith(str(root) + '/'):
                 Path(mount['source']).mkdir(parents=True, exist_ok=True)
@@ -521,6 +698,7 @@ def main():
         validate_owned(json.loads(docker('inspect', controller).stdout)[0], receipt)
         evidence['rcoder_binary_sha256'] = docker('exec', controller, 'sha256sum', '/app/bin/rcoder').stdout.split()[0]
         base = 'http://' + command(*compose, 'port', 'rcoder', '8090').stdout.strip()
+        proxy_base = 'http://' + command(*compose, 'port', 'rcoder', str(proxy_port)).stdout.strip()
         wait_ready(base)
         check('isolated idle reaper ready', True, {'controller': controller, 'base': base})
         http('/api/v1/userapp/workspace', {'app_id': app}, timeout=180)
@@ -582,6 +760,9 @@ strip_prefix=false
                '> /home/user/logs/idle-fixture-owner.log 2>&1', '--', workspace)
         wait_owner()
         count = start('start', 'before-recycle', 0)
+        initial_proxy = proxy_request()
+        check('dev business proxy reaches original source before idle',
+              initial_proxy['status'] == 200 and initial_proxy['body'] == 'before-recycle', initial_proxy)
         check('running build survives idle scans without keepalive', inspect(cid) is not None
               and cid == before['id'])
         original_owner = owner()
@@ -597,10 +778,19 @@ strip_prefix=false
         # this process cannot publish its own graceful cleanup receipt.
         frozen = execute('python3', '-c', OWNER_FAULT_SCRIPT, workspace, 'freeze', state_root, app)
         evidence['frozen_owner'] = json.loads(frozen.stdout)
-        after = recycle_and_ensure(before, original_owner, 'first recycle')
+        after = recycle_and_ensure(before, original_owner, 'first recycle',
+                                  first_business_request=True, previous_build_count=count)
+        count = after['first_proxy_build_count']
         # No preparatory Stop: Start itself must repair the unavailable owner.
         write({'web/version.txt': 'after-recycle'})
         count = start('start', 'after-recycle', count)
+        restored_proxy = proxy_request()
+        restored_state = proxy_state()
+        check('first recycle: explicit Start restores one owner and proxy HTTP',
+              restored_proxy['status'] == 200 and restored_proxy['body'] == 'after-recycle'
+              and restored_state['observation_errors'] == []
+              and len(restored_state['owner_pids']) == len(restored_state['service_pids']) == 1,
+              {'response': restored_proxy, 'physical_state': restored_state})
         frozen_owner = evidence['frozen_owner']
         retained_generation = read_json(generation_file(state_root, app, workspace,
                                        frozen_owner['generation'], 'generation.json'))
@@ -652,6 +842,8 @@ strip_prefix=false
         start('restart', 'after-second-recycle', count)
         control_stop('final stop keeps workspace data')
         check('workspace marker survives all operations', execute('cat', workspace + '/sentinel').stdout == app)
+        if not FIRST_PROXY_STEPS.issubset({row['name'] for row in evidence['checks'] if row['ok']}):
+            raise RuntimeError('required first-proxy recovery evidence is incomplete')
         evidence['success'] = True
     except (Exception, KeyboardInterrupt) as error:
         evidence.update(success=False, error=str(error))

@@ -131,7 +131,10 @@ fn merge_dbx_observation(
                 observation.status = DbxReadinessStatus::Starting;
                 observation.reason_code = Some(DbxReadinessReason::ComputeStarting);
             }
-            ControlIntent::None | ControlIntent::Starting => {}
+            // DBX 词表（ready/starting/stopped/unknown）刻意不扩：它是数据库
+            // 侧连接可达性契约，`Provisioning` 只属于业务顶层态。builder
+            // 资源申请期由 starting 一档承接即可，无消费方需要新值。
+            ControlIntent::None | ControlIntent::Starting | ControlIntent::Provisioning => {}
         }
     }
     observation.into_response(container)
@@ -442,6 +445,73 @@ mod tests {
         )
         .await;
         assert_eq!(response.container.status, UserAppContainerStatus::Unknown);
+    }
+
+    /// DBX 词表（ready/starting/stopped/unknown）刻意不扩：dev builder 资源
+    /// 申请在途时，dbx 探测事实原样透出，`provisioning` 只属于业务顶层态。
+    #[tokio::test]
+    async fn dbx_vocabulary_stays_closed_under_builder_provisioning() {
+        use crate::lifecycle::readiness::merge::fixtures;
+
+        struct Fixed(DbxReadinessObservation);
+        #[async_trait::async_trait]
+        impl shared_types::DbxReadinessProber for Fixed {
+            async fn probe(
+                &self,
+                _: &str,
+                _: UserappStage,
+                _: Duration,
+            ) -> Result<DbxReadinessObservation, String> {
+                Ok(self.0.clone())
+            }
+        }
+
+        let control = ReadinessControl::ordinary(Some(&fixtures::operation(
+            shared_types::UserAppOperationKind::EnsureBuilder,
+        )));
+        assert_eq!(control.intent, ControlIntent::Provisioning);
+        let query = |observation: DbxReadinessObservation| {
+            let control = control.clone();
+            query_dbx_with_budget(
+                "dbx1",
+                UserappStage::Dev,
+                Duration::from_secs(2),
+                move || {
+                    let control = control.clone();
+                    async move { Ok::<_, AppOperationError>(control) }
+                },
+                Some(Arc::new(Fixed(observation))),
+            )
+        };
+
+        // dbx 探测成功（Located + Ready）：资源申请意图不改写结果。
+        let response = query(
+            DbxReadinessObservation::new(DbxReadinessStatus::Ready, None)
+                .with_compute_fact(shared_types::DbxComputeFact::Located),
+        )
+        .await
+        .unwrap();
+        assert!(response.ready);
+        assert_eq!(response.status, DbxReadinessStatus::Ready);
+        assert_eq!(response.reason_code, None);
+        assert_eq!(response.container.status, UserAppContainerStatus::Running);
+
+        // builder 尚未应答 4224（探测降级）：仍是既有 starting 档位。
+        let response = query(
+            DbxReadinessObservation::new(
+                DbxReadinessStatus::Starting,
+                Some(DbxReadinessReason::DbxUnreachable),
+            )
+            .with_compute_fact(shared_types::DbxComputeFact::Located),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status, DbxReadinessStatus::Starting);
+        assert_eq!(
+            response.reason_code,
+            Some(DbxReadinessReason::DbxUnreachable)
+        );
+        assert_eq!(response.container.status, UserAppContainerStatus::Running);
     }
 
     #[tokio::test]

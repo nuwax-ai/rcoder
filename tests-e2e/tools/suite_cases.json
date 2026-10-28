@@ -1,11 +1,14 @@
 {
   "compose_lifecycle": [
-    "docker_deletion_identity_contract",
-    "computer_ttyd_cwd_query"
+    "computer_owner_conflict_contract",
+    "computer_ttyd_cwd_query",
+    "docker_deletion_identity_contract"
   ],
   "compose_session": [
     "absolute_agent_work_dir_anthropic",
     "absolute_agent_work_dir_openai",
+    "auto_reload_session_identity_anthropic",
+    "auto_reload_session_identity_openai",
     "concurrent_subscribers_anthropic",
     "concurrent_subscribers_openai",
     "cross_turn_reconnect_anthropic",
@@ -82,9 +85,13 @@
     "userapp_manual_owner_multi_process_control"
   ],
   "compose_userapp_faults": [
+    "userapp_compute_late_stop_cid_absence_recovery_contract",
+    "userapp_compute_stop_timeout_recovery_contract",
+    "userapp_compute_stopped_failure_recovery_contract",
     "userapp_hot_deployment_builtin_contract",
     "userapp_hot_deployment_supervisord_contract",
     "userapp_prod_readiness_contract",
+    "userapp_prod_startup_failed_restore_contract",
     "userapp_worker_builtin_contract",
     "userapp_worker_supervisord_contract"
   ],
@@ -102,6 +109,8 @@
     "lb_cross_entry_cursor_reconnect",
     "lb_entry_rotation",
     "lb_new_session_cross_entry",
+    "lb_pod_stop_then_chat_cross_entry",
+    "lb_stop_resume_same_sid_cross_entry",
     "lb_userapp_parallel_agents_anthropic",
     "lb_userapp_parallel_agents_openai"
   ],
@@ -135,5 +144,9 @@
   "host_k8s_lifecycle": [
     "host_k8s_agent_lifecycle_no_llm",
     "host_k8s_userapp_dev_compute_no_llm"
+  ],
+  "compose_devcomputer": [
+    "devcomputer_main_protocol_contract",
+    "devcomputer_main_real_model_smoke"
   ]
 }

@@ -44,7 +44,8 @@ pub async fn diagnose(
 /// 把诊断结果映射为面向用户的根因文案(OOM / CrashLoop / 容器缺失 / 启动中 / 通用)。
 ///
 /// chat 路径([`build_connection_error`])与 SSE 路径(流断开终态事件)共用此函数,
-/// 保证两路对同一根因给出**一致**的文案 —— 避免"chat 报 OOM、SSE 报通用"的割裂。
+/// SSE 仅在物理实例和当前失败窗口均有证据时将 OOM 文案用于主提示；
+/// 缺少归因证据的历史/当前观测只作补充，不改变原 gRPC 原因和身份。
 pub fn root_cause_message(d: &AgentPodDiagnostic, locale: &str) -> String {
     if !d.exists {
         get_i18n_message("error.agent_container_not_found", locale)

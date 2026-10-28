@@ -5,7 +5,7 @@ fn deadline() -> tokio::time::Instant {
     tokio::time::Instant::now() + std::time::Duration::from_secs(5)
 }
 fn fixture() -> ProjectStoreBackend {
-    let (inner, _cleanup) = crate::ProjectAdapter::new("test".into(), "cluster.local".into());
+    let inner = crate::ProjectAdapter::new("test".into(), "cluster.local".into());
     let mut app = ProjectAndContainerInfo::new("app-1".into());
     app.set_service_type(Some(ServiceType::UserappBuilder));
     app.set_request_id(Some("builder-metadata".into()));
@@ -23,6 +23,43 @@ fn fixture() -> ProjectStoreBackend {
     }));
     inner.insert("app-1".into(), Arc::new(app)).unwrap();
     ProjectStoreBackend::Memory(Arc::new(inner))
+}
+
+#[tokio::test]
+async fn userapp_pending_registration_preserves_binding_and_next_real_session_can_commit() {
+    let store = fixture();
+    let binding = store
+        .accept_userapp_agent_binding("app-1", "life-1", "project-a", "user-1")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .register_userapp_agent_session(&binding, "pending", "invalid", deadline())
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .get_userapp_agent_session("pending")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.get("app-1").unwrap().sessions().is_empty());
+    let current = store
+        .get_userapp_agent_binding("app-1", "life-1", "project-a")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current, binding);
+    let committed = store
+        .register_userapp_agent_session(&binding, "pending-prefix-real", "real", deadline())
+        .await
+        .unwrap();
+    assert_eq!(
+        committed.current_session_id.as_deref(),
+        Some("pending-prefix-real")
+    );
 }
 #[tokio::test]
 async fn parallel_conversations_share_only_the_builder_route() {

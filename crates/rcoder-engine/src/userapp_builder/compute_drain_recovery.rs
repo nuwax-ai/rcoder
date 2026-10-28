@@ -6,7 +6,13 @@ use shared_types::*;
 use std::time::Duration;
 
 mod previous_owner;
+pub(crate) use previous_owner::same_lease_identity;
 mod superseded;
+
+#[cfg(test)]
+pub(crate) struct UnheldComputeFixture;
+#[cfg(test)]
+impl container_runtime_api::ComputeHandoffGuard for UnheldComputeFixture {}
 
 // A prepared lease cannot authorize a container write. Cancellation here may
 // release it, including an uncertain DB bind: the next executor still checks CAS.
@@ -83,12 +89,57 @@ fn identity(record: &ComputeControlRecord) -> Result<ComputeExecutorIdentity> {
     })
 }
 
+/// COMPUTE_DRAIN_PENDING 重试节流（进程内）。problem() 对相同 code/message
+/// 幂等不写，但每轮恢复的 reserve CAS 仍会改写持久记录——2026-10-27 实测
+/// 热循环 ~13 次/分钟持续 ~1 小时。60s 下限抑制写放大；重试永不停止，收敛
+/// 条件（含部署修复）成熟后仍在下一轮自愈。
+fn drain_retry_due(operation_id: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static NEXT_DUE: std::sync::OnceLock<Mutex<HashMap<String, tokio::time::Instant>>> =
+        std::sync::OnceLock::new();
+    let map = NEXT_DUE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = tokio::time::Instant::now();
+    // 容量上限（硬上限）：先清已到期条目（悬案收敛后其键不再有意义）；
+    // 全部未过期仍满时逐出最早到期的键——保证插入后不超过 4096，防止键
+    // 随悬案累积无界增长（Codex 复审：仅 retain 不构成上限）。
+    if map.len() >= 4096 {
+        map.retain(|_, due| *due > now);
+        while map.len() >= 4096 {
+            let earliest = map
+                .iter()
+                .min_by_key(|(_, due)| *due)
+                .map(|(key, _)| key.clone());
+            match earliest {
+                Some(key) => {
+                    map.remove(&key);
+                }
+                None => break,
+            }
+        }
+    }
+    match map.get(operation_id) {
+        Some(due) if now < *due => false,
+        _ => {
+            map.insert(operation_id.to_owned(), now + Duration::from_secs(60));
+            true
+        }
+    }
+}
+
 /// A scanner schedules one bounded inspection; execution after a successful CAS
 /// uses the ordinary coordinator with its existing per-stage budgets.
 pub(super) async fn recover_and_execute(
     state: &AppState,
     snapshot: &ComputeControlRecord,
 ) -> Result<()> {
+    // 悬案重试退避（2026-10-27 事故：无退避热循环持续改写持久记录）。
+    if snapshot.error_code.as_deref() == Some("COMPUTE_DRAIN_PENDING")
+        && !drain_retry_due(&snapshot.operation_id)
+    {
+        return Ok(());
+    }
     if let Some(pending) = prepare_resume(state, snapshot).await? {
         compute_control::execute_pending(state, pending).await?;
     }
@@ -107,6 +158,21 @@ pub(super) async fn prepare_resume_with_budget(
     snapshot: &ComputeControlRecord,
     budget: Duration,
 ) -> Result<Option<ComputeControlRecord>> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let handoff = if snapshot.state == ComputeControlState::Running {
+        match tokio::time::timeout_at(deadline, prepare_handoff(state, snapshot)).await {
+            Ok(Ok(Some(prepared))) => Some(prepared),
+            Ok(Ok(None)) => return Ok(None),
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(anyhow!("Early compute handoff observation timed out")),
+        }
+    } else {
+        None
+    };
+    let original_absent = handoff
+        .as_ref()
+        .is_some_and(|prepared| prepared.original_absent);
+    let wait_for_late_prepare = snapshot.state == ComputeControlState::Running;
     let mut current = match state
         .userapp_store
         .reserve_compute_drain_recovery(snapshot)
@@ -116,9 +182,25 @@ pub(super) async fn prepare_resume_with_budget(
         Err(UserAppStoreError::VersionConflict) => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let result = tokio::time::timeout(budget, inspect_and_resume(state, &mut current)).await;
+    // Dropping only unlocks/stops renewal. It never clears a marker or deletes
+    // an object, including a CAS loser whose original executor advanced first.
+    drop(handoff);
+    let result = tokio::time::timeout_at(
+        deadline,
+        inspect_and_resume(state, &mut current, original_absent, wait_for_late_prepare),
+    )
+    .await;
     let (code, message) = match result {
         Ok(Ok(Resume::Ready(pending))) => return Ok(Some(*pending)),
+        Ok(Ok(Resume::Converged(code))) => {
+            tracing::info!(
+                code,
+                operation_id = %current.operation_id,
+                app_id = %current.app_id,
+                "Recovered orphan compute operation converged to terminal"
+            );
+            return Ok(None);
+        }
         Ok(Ok(Resume::Deferred(code, message))) => (code, message),
         Ok(Err(error))
             if matches!(
@@ -144,14 +226,148 @@ pub(super) async fn prepare_resume_with_budget(
     }
 }
 
+struct PreparedHandoff {
+    // Lifetime ownership retained across the durable reservation await.
+    _guard: Option<Box<dyn container_runtime_api::ComputeHandoffGuard>>,
+    original_absent: bool,
+}
+
+async fn prepare_handoff(
+    state: &AppState,
+    snapshot: &ComputeControlRecord,
+) -> Result<Option<PreparedHandoff>> {
+    use container_runtime_api::ComputeHandoff;
+    let context = snapshot.execution_context().map_err(anyhow::Error::msg)?;
+    loop {
+        // Runtime exclusion is not authority to replace another store revision.
+        if state
+            .userapp_store
+            .get_compute_control(&snapshot.app_id, &snapshot.operation_id)
+            .await?
+            .as_ref()
+            != Some(snapshot)
+        {
+            return Ok(None);
+        }
+        match state
+            .runtime()
+            .prepare_compute_handoff(&context, snapshot.scope, snapshot.lease.as_ref())
+            .await?
+        {
+            ComputeHandoff::Held => return Ok(None),
+            ComputeHandoff::Vacant { original_absent } => {
+                return Ok(Some(PreparedHandoff {
+                    _guard: None,
+                    original_absent,
+                }));
+            }
+            ComputeHandoff::Acquired {
+                guard,
+                original_absent,
+            } => {
+                return Ok(Some(PreparedHandoff {
+                    _guard: Some(guard),
+                    original_absent,
+                }));
+            }
+            ComputeHandoff::Deferred(inspection) => {
+                let released = match *inspection {
+                    ComputeLeaseInspection::Discovered { attempt, .. } => {
+                        return prepare_fenced_attempt_handoff(state, snapshot, &attempt).await;
+                    }
+                    ComputeLeaseInspection::PreviousOwner { receipt, owner } => {
+                        previous_owner::release(state, snapshot, &owner, &receipt).await?
+                    }
+                    ComputeLeaseInspection::PreviousOperation {
+                        receipt,
+                        operation_id,
+                    } => {
+                        previous_owner::release_operation(state, snapshot, &operation_id, &receipt)
+                            .await?
+                    }
+                    ComputeLeaseInspection::Absent
+                    | ComputeLeaseInspection::Held
+                    | ComputeLeaseInspection::Releasable(_)
+                    | ComputeLeaseInspection::IdentityChanged(_) => false,
+                };
+                if !released {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
+async fn prepare_fenced_attempt_handoff(
+    state: &AppState,
+    snapshot: &ComputeControlRecord,
+    attempt: &UserAppExecutionContext,
+) -> Result<Option<PreparedHandoff>> {
+    attempt
+        .validate_identity(&snapshot.app_id)
+        .map_err(anyhow::Error::msg)?;
+    if attempt.lifecycle_id != snapshot.lifecycle_id
+        || attempt.operation_id != snapshot.operation_id
+        || attempt.request_fingerprint != snapshot.request_fingerprint
+        || snapshot.executor_id.as_deref() == Some(attempt.executor_id.as_str())
+    {
+        return Ok(None);
+    }
+    let old = ComputeExecutorIdentity {
+        app_id: attempt.app_id.clone(),
+        lifecycle_id: attempt.lifecycle_id.clone(),
+        scope: snapshot.scope,
+        operation_id: attempt.operation_id.clone(),
+        generation: snapshot.generation,
+        executor_id: attempt.executor_id.clone(),
+    };
+    match state.userapp_store.check_compute_executor(&old).await {
+        Err(UserAppStoreError::VersionConflict) => {}
+        Ok(()) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    if state
+        .userapp_store
+        .get_compute_control(&snapshot.app_id, &snapshot.operation_id)
+        .await?
+        .as_ref()
+        != Some(snapshot)
+    {
+        return Ok(None);
+    }
+    match state
+        .runtime()
+        .prepare_compute_handoff(attempt, snapshot.scope, None)
+        .await?
+    {
+        container_runtime_api::ComputeHandoff::Held
+        | container_runtime_api::ComputeHandoff::Deferred(_) => Ok(None),
+        container_runtime_api::ComputeHandoff::Vacant { .. } => Ok(Some(PreparedHandoff {
+            _guard: None,
+            original_absent: true,
+        })),
+        container_runtime_api::ComputeHandoff::Acquired { guard, .. } => {
+            Ok(Some(PreparedHandoff {
+                _guard: Some(guard),
+                original_absent: true,
+            }))
+        }
+    }
+}
+
 enum Resume {
     Ready(Box<ComputeControlRecord>),
     Deferred(&'static str, String),
+    /// 恢复器已把原操作按终态收口（image-roll 目标缺席 → Failed/ERR_RUNTIME_ABSENT）：
+    /// 不再续跑、不记 problem，围栏随终态自然释放，由业务 start 重建运行时。
+    Converged(&'static str),
 }
 
 async fn inspect_and_resume(
     state: &AppState,
     current: &mut ComputeControlRecord,
+    original_absent: bool,
+    wait_for_late_prepare: bool,
 ) -> Result<Resume> {
     if !compute_control::drain_previous_once(state, current, &identity(current)?).await? {
         return Ok(Resume::Deferred(
@@ -160,11 +376,28 @@ async fn inspect_and_resume(
         ));
     }
     let context = current.execution_context().map_err(anyhow::Error::msg)?;
-    match state
-        .runtime()
-        .inspect_compute_drain_lease(&context, current.scope, current.lease.as_ref())
-        .await?
-    {
+    let inspection = loop {
+        let inspection = state
+            .runtime()
+            .inspect_compute_drain_lease(
+                &context,
+                current.scope,
+                if original_absent {
+                    None
+                } else {
+                    current.lease.as_ref()
+                },
+            )
+            .await?;
+        if inspection == ComputeLeaseInspection::Held && wait_for_late_prepare {
+            // A pre-CAS prepare RPC may arrive late, but its old bind is now
+            // fenced. Observe its real FD/handle leaving within the SAME budget.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        }
+        break inspection;
+    };
+    match inspection {
         ComputeLeaseInspection::Absent => {}
         ComputeLeaseInspection::Held => {
             return Ok(Resume::Deferred(
@@ -173,17 +406,28 @@ async fn inspect_and_resume(
             ));
         }
         ComputeLeaseInspection::IdentityChanged(reason) => {
+            // 异构/旧命名回执永远无法被当前后端调和(生产 227/229/239: kubernetes
+            // 回执但 captured_name 与当前命名不符), 也不代表本操作的存活行为者。
+            // 此时 image-roll 目标缺席即收敛, 不让 Deferred 变成永久卡死;
+            // 陈旧租约由下一操作的 drain 清理兜底。Held(我方租约仍被持有)
+            // 仍严格 Deferred, 不探测不收敛。
+            if image_roll_target_absent(state, current, &context).await? {
+                converge_absent_image_roll(state, current).await?;
+                return Ok(Resume::Converged(ERR_RUNTIME_ABSENT));
+            }
             return Ok(Resume::Deferred("COMPUTE_LEASE_IDENTITY_CHANGED", reason));
         }
         ComputeLeaseInspection::Discovered { receipt, attempt } => {
             anyhow::ensure!(
-                current.lease.is_none(),
+                current.lease.is_none() || original_absent,
                 "Discovered lease cannot replace a registered receipt"
             );
-            *current = state
-                .userapp_store
-                .capture_compute_drain_lease(current, &receipt, &attempt)
-                .await?;
+            if current.lease.is_none() {
+                *current = state
+                    .userapp_store
+                    .capture_compute_drain_lease(current, &receipt, &attempt)
+                    .await?;
+            }
             state
                 .runtime()
                 .release_app_operation_receipt(&attempt, &receipt)
@@ -217,7 +461,7 @@ async fn inspect_and_resume(
                     .await?;
             } else {
                 anyhow::ensure!(
-                    current.lease.as_ref() == Some(&receipt),
+                    current.lease.as_ref() == Some(&receipt) || original_absent,
                     "Runtime returned a different captured compute lease"
                 );
             }
@@ -228,11 +472,36 @@ async fn inspect_and_resume(
                 .context("Release original early compute lease")?;
         }
     }
+    // Image-roll restart 的后半段假设"滚动目标仍在"。若前代容器/Deployment 已被
+    // 删除（排干已事实完成、无目标可滚），续跑只会永远撞 ContainerNotFound 并把
+    // 操作卡在 recovery_required。续跑前用类型化的物理缺席探测
+    // （缺席必须被正向证实；探测错误原样冒泡，绝不当缺席处理）：缺席即按
+    // Failed/ERR_RUNTIME_ABSENT 终态收口，围栏释放，由业务 start 重建运行时。
+    // find_container(None) 也可能只是 STS 存在而 Pod 暂缺，不能用于结束围栏。
+    if image_roll_target_absent(state, current, &context).await? {
+        converge_absent_image_roll(state, current).await?;
+        return Ok(Resume::Converged(ERR_RUNTIME_ABSENT));
+    }
     let pending = state
         .userapp_store
         .resume_released_compute_drain(current, current.lease.as_ref())
         .await?;
     Ok(Resume::Ready(Box::new(pending)))
+}
+
+async fn image_roll_target_absent(
+    state: &AppState,
+    current: &ComputeControlRecord,
+    context: &UserAppExecutionContext,
+) -> Result<bool> {
+    if !is_image_roll_restart(current) {
+        return Ok(false);
+    }
+    match current.scope {
+        UserAppOperationScope::Prod => Ok(state.runtime().app_compute_absent(context).await?),
+        UserAppOperationScope::Dev => Ok(state.runtime().builder_compute_absent(context).await?),
+        UserAppOperationScope::Application => Ok(false),
+    }
 }
 
 /// Observe a superseded early controller without admitting a new operation.
@@ -272,4 +541,773 @@ pub(super) async fn observe_unsubmitted_predecessor(
         }
     }
     superseded::release_prepared_mutex(state, previous).await
+}
+
+/// 孤儿 image-roll restart 判定：restart 且 checkpoint 记录了 restart_image_roll。
+pub(super) fn is_image_roll_restart(record: &ComputeControlRecord) -> bool {
+    record.action == ComputeControlAction::Restart
+        && record
+            .checkpoint
+            .get("restart_image_roll")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+}
+
+/// 把"滚动目标已缺席"的 recovery_required 原操作按 Failed 终态收口。CAS 失败
+/// （VersionConflict）表示另一 replica 已处理，静默即可。前代容器已删 = 排干已
+/// 事实完成且镜像滚动无目标可滚；不伪造成功，围栏随终态释放，由业务 start
+/// 携带新配置重建运行时。保留 checkpoint 证据并写 terminal_at（存储原语
+/// fail_unrecoverable_compute_control）。
+pub(super) async fn converge_absent_image_roll(
+    state: &AppState,
+    record: &ComputeControlRecord,
+) -> Result<()> {
+    const MESSAGE: &str = concat!(
+        "image-roll target runtime is absent; previous generation was already drained; ",
+        "resubmit start to recreate the runtime"
+    );
+    anyhow::ensure!(
+        record.state == ComputeControlState::RecoveryRequired,
+        "absent-target convergence only settles recovery_required records, got {}",
+        record
+            .state
+            .as_progress_storage_value()
+            .unwrap_or("unknown")
+    );
+    let result = state
+        .userapp_store
+        .fail_unrecoverable_compute_control(record, ERR_RUNTIME_ABSENT, MESSAGE)
+        .await
+        .map(|_| ());
+    match result {
+        Ok(()) | Err(UserAppStoreError::VersionConflict) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod image_roll_absent_tests {
+    use super::*;
+    use crate::userapp_builder::creation::fence_settler_tests::{FenceRuntime, runtime_state};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    /// 复现生产孤儿形态: prod 域 restart, recovery_required/draining_previous,
+    /// checkpoint 仅含 restart_image_roll，无 interrupted_operations；保留租约
+    /// 回执，但运行时的原租约已缺席。
+    async fn stuck_record(
+        checkpoint: serde_json::Value,
+        target_absent: bool,
+        scope: UserAppOperationScope,
+    ) -> (
+        Arc<AppState>,
+        ComputeControlRecord,
+        Arc<FenceRuntime>,
+        tempfile::TempDir,
+    ) {
+        stuck_record_with_state(
+            checkpoint,
+            target_absent,
+            scope,
+            ComputeControlState::RecoveryRequired,
+        )
+        .await
+    }
+
+    async fn stuck_record_with_state(
+        checkpoint: serde_json::Value,
+        target_absent: bool,
+        scope: UserAppOperationScope,
+        initial_state: ComputeControlState,
+    ) -> (
+        Arc<AppState>,
+        ComputeControlRecord,
+        Arc<FenceRuntime>,
+        tempfile::TempDir,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+                &directory.path().join("absent-roll.db"),
+            )
+            .await
+            .unwrap(),
+        );
+        let app = store.ensure_identity("absentroll").await.unwrap();
+        let pending = store
+            .admit_compute_control(&ComputeControlRequest {
+                app_id: app.app_id.clone(),
+                lifecycle_id: app.lifecycle_id.clone(),
+                scope,
+                operation_id: "orphanroll".into(),
+                request_id: "orphanrequest".into(),
+                request_fingerprint: "f".repeat(64),
+                action: ComputeControlAction::Restart,
+                restart_image_roll: true,
+                builder_startup_mode: BuilderStartupMode::PreserveBusinessIntent,
+            })
+            .await
+            .unwrap();
+        let identity = ComputeExecutorIdentity {
+            app_id: app.app_id.clone(),
+            lifecycle_id: app.lifecycle_id.clone(),
+            scope: pending.scope,
+            operation_id: pending.operation_id.clone(),
+            generation: pending.generation,
+            executor_id: "lostexecutor".into(),
+        };
+        store
+            .claim_compute_control(&identity, pending.revision)
+            .await
+            .unwrap();
+        // 与生产卡死形态一致: 绑定一个 Docker FD 租约(drain 恢复分类依赖租约证据)。
+        let lock_path = directory.path().join("original.lock");
+        let fd = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        fd.try_lock().unwrap();
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = fd.metadata().unwrap();
+        let receipt = UserAppOperationLeaseReceipt::Docker {
+            service_type: compute_lease_family(scope).unwrap(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            token: identity.executor_id.clone(),
+        };
+        let claimed = store.bind_compute_lease(&identity, &receipt).await.unwrap();
+        drop(fd);
+        let failed_observation = initial_state == ComputeControlState::RecoveryRequired;
+        let record = store
+            .advance_compute_control(&ComputeControlProgress {
+                identity,
+                expected_revision: claimed.revision,
+                state: initial_state,
+                stage: ComputeControlStage::DrainingPrevious,
+                checkpoint,
+                error_code: failed_observation.then(|| ERR_BACKEND_ERROR.into()),
+                error_message: failed_observation.then(|| "simulated interrupted drain".into()),
+            })
+            .await
+            .unwrap();
+        let runtime = Arc::new(FenceRuntime::default());
+        runtime
+            .app_target_absent
+            .store(target_absent, Ordering::SeqCst);
+        // Explicit backend witness; a generic find_container(None) is not proof.
+        runtime
+            .builder_absent_proven
+            .store(target_absent, Ordering::SeqCst);
+        *runtime.builder_workload.lock().unwrap() =
+            (!target_absent).then(|| "rcoder-app-builder-absentroll".into());
+        // 生产实况: 记录带租约回执, 但集群里的 Lease 对象已不存在 → 探测为 Absent。
+        *runtime.compute_inspection.lock().unwrap() = Some(ComputeLeaseInspection::Absent);
+        let state = runtime_state(runtime.clone(), store, None).await;
+        (state, record, runtime, directory)
+    }
+
+    async fn current(state: &AppState, record: &ComputeControlRecord) -> ComputeControlRecord {
+        state
+            .userapp_store
+            .get_compute_control(&record.app_id, &record.operation_id)
+            .await
+            .unwrap()
+            .expect("record persists")
+    }
+
+    #[test]
+    fn image_roll_restart_predicate_only_matches_roll_checkpoint() {
+        let roll = serde_json::json!({"restart_image_roll": true});
+        let plain = serde_json::json!({"restart_image_roll": false});
+        let mut record = stuck_record_shaped(&roll);
+        assert!(is_image_roll_restart(&record));
+        record.checkpoint = plain;
+        assert!(!is_image_roll_restart(&record));
+        record.action = ComputeControlAction::Stop;
+        record.checkpoint = roll;
+        assert!(!is_image_roll_restart(&record));
+    }
+
+    fn stuck_record_shaped(checkpoint: &serde_json::Value) -> ComputeControlRecord {
+        ComputeControlRecord {
+            created_at: chrono::Utc::now(),
+            app_id: "absentroll".into(),
+            lifecycle_id: "lifecycle".into(),
+            request_id: "request".into(),
+            scope: UserAppOperationScope::Prod,
+            operation_id: "orphanroll".into(),
+            request_fingerprint: "f".repeat(64),
+            generation: 1,
+            revision: 1,
+            action: ComputeControlAction::Restart,
+            state: ComputeControlState::RecoveryRequired,
+            executor_id: Some("lostexecutor".into()),
+            stage: ComputeControlStage::DrainingPrevious.as_str().into(),
+            checkpoint: checkpoint.clone(),
+            error_code: None,
+            error_message: None,
+            lease: None,
+            interrupted_operations: Vec::new(),
+        }
+    }
+
+    /// COMPUTE_DRAIN_PENDING 悬案的重试节流：窗口内第二轮恢复直接跳过，
+    /// 不写持久记录、revision 不增长（2026-10-27 事故：无退避热循环
+    /// ~13 次/分钟持续改写）。
+    #[tokio::test]
+    async fn drain_pending_retry_is_throttled() {
+        let (state, record, _runtime, _keep) =
+            stuck_record(serde_json::json!({}), false, UserAppOperationScope::Prod).await;
+        let marked = state
+            .userapp_store
+            .record_compute_drain_problem(
+                &record,
+                "COMPUTE_DRAIN_PENDING",
+                "Interrupted operation has not produced final effects evidence",
+            )
+            .await
+            .unwrap();
+        assert_eq!(marked.error_code.as_deref(), Some("COMPUTE_DRAIN_PENDING"));
+        assert!(
+            drain_retry_due(&record.operation_id),
+            "first retry after the problem is recorded runs"
+        );
+        let before = current(&state, &marked).await.revision;
+        assert!(
+            !drain_retry_due(&record.operation_id),
+            "throttle window must skip the immediate retry"
+        );
+        recover_and_execute(&state, &marked)
+            .await
+            .expect("throttled recovery is a silent skip");
+        let after = current(&state, &marked).await;
+        assert_eq!(
+            after.revision, before,
+            "throttled retry must not touch the persisted record"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_roll_target_converges_to_terminal_failed() {
+        let (state, record, _runtime, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll": true}),
+            true,
+            UserAppOperationScope::Prod,
+        )
+        .await;
+        let start = UserAppAdmission {
+            app_id: record.app_id.clone(),
+            lifecycle_id: Some(record.lifecycle_id.clone()),
+            operation_id: "newstart".into(),
+            request_id: Some("newstartrequest".into()),
+            request_fingerprint: "a".repeat(64),
+            kind: UserAppOperationKind::Start,
+            command: Some(UserAppControlCommand::Start { traffic: false }),
+            metadata: None,
+            runtime_policy_on_success: None,
+        };
+        let Err(UserAppStoreError::OperationInProgress(blocker)) =
+            state.userapp_store.admit(&start).await
+        else {
+            panic!("orphan image roll must block the original prod/start admission");
+        };
+        assert_eq!(blocker.operation_id, record.operation_id);
+        recover_and_execute(&state, &record)
+            .await
+            .expect("absent-target recovery converges without error");
+        let after = current(&state, &record).await;
+        assert_eq!(after.state, ComputeControlState::Failed);
+        assert_eq!(after.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+        assert_eq!(after.checkpoint, record.checkpoint);
+        assert!(
+            after
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("absent"))
+        );
+        // 幂等: 终态后再跑一次恢复不报错、不改写。
+        recover_and_execute(&state, &after)
+            .await
+            .expect("terminal record stays inert");
+        let again = current(&state, &record).await;
+        assert_eq!(again.state, ComputeControlState::Failed);
+        assert_eq!(again.revision, after.revision);
+        let admitted = state.userapp_store.admit(&start).await.unwrap();
+        let UserAppAdmissionOutcome::Accepted(started) = admitted else {
+            panic!("terminal orphan must unblock the original prod/start admission");
+        };
+        assert_eq!(started.operation_id, start.operation_id);
+    }
+
+    #[tokio::test]
+    async fn dev_scope_builder_present_does_not_converge() {
+        // A false backend witness cannot settle the operation, even when the
+        // unrelated production runtime is absent and generic discovery is None.
+        let (state, record, runtime, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll": true}),
+            true,
+            UserAppOperationScope::Dev,
+        )
+        .await;
+        runtime.builder_absent_proven.store(false, Ordering::SeqCst);
+        let resumed = prepare_resume(&state, &record).await.unwrap();
+        assert!(
+            resumed.is_some(),
+            "unproven absence must retain the ordinary continuation"
+        );
+        let after = current(&state, &record).await;
+        assert_ne!(
+            after.error_code.as_deref(),
+            Some(ERR_RUNTIME_ABSENT),
+            "Dev(builder) with live builder must not converge as absent"
+        );
+        assert_eq!(after.state, ComputeControlState::Pending);
+        assert!(runtime.builder_absence_probes.load(Ordering::SeqCst) > 0);
+        assert_eq!(runtime.app_absence_probes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dev_scope_builder_absent_converges_like_prod() {
+        // Backend-proven builder absence settles the old operation and lets
+        // the same ordinary EnsureBuilder admission recreate compute.
+        let (state, record, runtime, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll": true}),
+            true,
+            UserAppOperationScope::Dev,
+        )
+        .await;
+        let ensure = dev_ensure_request(&record);
+        assert!(matches!(
+            state.userapp_store.admit(&ensure).await,
+            Err(UserAppStoreError::OperationInProgress(_))
+        ));
+        recover_and_execute(&state, &record)
+            .await
+            .expect("absent builder converges without error");
+        let after = current(&state, &record).await;
+        assert_eq!(after.state, ComputeControlState::Failed);
+        assert_eq!(after.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+        assert_eq!(after.checkpoint, record.checkpoint);
+        assert_eq!(after.lease, record.lease);
+        assert_eq!(runtime.compute_prepares.load(Ordering::SeqCst), 0);
+        // 幂等: 终态后不再改写
+        recover_and_execute(&state, &after)
+            .await
+            .expect("terminal record stays inert");
+        let again = current(&state, &record).await;
+        assert_eq!(again.revision, after.revision);
+        assert!(matches!(
+            state.userapp_store.admit(&ensure).await.unwrap(),
+            UserAppAdmissionOutcome::Accepted(_)
+        ));
+    }
+
+    fn dev_ensure_request(record: &ComputeControlRecord) -> UserAppAdmission {
+        UserAppAdmission {
+            app_id: record.app_id.clone(),
+            lifecycle_id: Some(record.lifecycle_id.clone()),
+            operation_id: "new-dev-ensure".into(),
+            request_id: Some("new-dev-ensure-request".into()),
+            request_fingerprint: "d".repeat(64),
+            kind: UserAppOperationKind::EnsureBuilder,
+            command: None,
+            metadata: None,
+            runtime_policy_on_success: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dev_absent_builder_with_old_identity_receipt_unblocks_original_ensure() {
+        let (state, record, runtime, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll": true}),
+            true,
+            UserAppOperationScope::Dev,
+        )
+        .await;
+        let ensure = dev_ensure_request(&record);
+        assert!(matches!(
+            state.userapp_store.admit(&ensure).await,
+            Err(UserAppStoreError::OperationInProgress(_))
+        ));
+        *runtime.compute_inspection.lock().unwrap() =
+            Some(ComputeLeaseInspection::IdentityChanged(
+                "old backend receipt does not match current naming".into(),
+            ));
+        recover_and_execute(&state, &record).await.unwrap();
+        let after = current(&state, &record).await;
+        assert_eq!(after.state, ComputeControlState::Failed);
+        assert_eq!(after.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+        assert_eq!(after.checkpoint, record.checkpoint);
+        assert_eq!(after.lease, record.lease);
+        assert!(runtime.builder_absence_probes.load(Ordering::SeqCst) > 0);
+        assert_eq!(runtime.app_absence_probes.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            state.userapp_store.admit(&ensure).await.unwrap(),
+            UserAppAdmissionOutcome::Accepted(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dev_workload_without_pod_does_not_converge_as_absent() {
+        let (state, record, runtime, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll": true}),
+            true,
+            UserAppOperationScope::Dev,
+        )
+        .await;
+        *runtime.builder_workload.lock().unwrap() = Some("still-existing-builder-sts".into());
+        // The runtime's authoritative probe must report the retained workload
+        // as unproven absence; backend tests verify its STS/Pod observation.
+        runtime.builder_absent_proven.store(false, Ordering::SeqCst);
+        let pending = prepare_resume(&state, &record).await.unwrap();
+        assert!(
+            pending.is_some(),
+            "existing STS must resume its ordinary continuation, not settle as absent"
+        );
+        let after = current(&state, &record).await;
+        assert_eq!(after.state, ComputeControlState::Pending);
+        assert_ne!(after.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+        assert!(runtime.builder_absence_probes.load(Ordering::SeqCst) > 0);
+        assert!(matches!(
+            state
+                .userapp_store
+                .admit(&dev_ensure_request(&record))
+                .await,
+            Err(UserAppStoreError::OperationInProgress(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn dev_absence_probe_failure_retries_original_without_erasing_evidence() {
+        for inspection in [
+            ComputeLeaseInspection::Absent,
+            ComputeLeaseInspection::IdentityChanged("legacy receipt".into()),
+        ] {
+            let (state, record, runtime, _keep) = stuck_record(
+                serde_json::json!({"restart_image_roll":true}),
+                true,
+                UserAppOperationScope::Dev,
+            )
+            .await;
+            *runtime.compute_inspection.lock().unwrap() = Some(inspection);
+            *runtime.builder_absence_error.lock().unwrap() =
+                Some("injected builder observation error".into());
+            recover_and_execute(&state, &record).await.unwrap();
+            let observed = current(&state, &record).await;
+            assert_eq!(observed.state, ComputeControlState::RecoveryRequired);
+            assert_eq!(
+                observed.error_code.as_deref(),
+                Some("COMPUTE_OBSERVATION_FAILED")
+            );
+            assert!(
+                observed
+                    .error_message
+                    .as_deref()
+                    .unwrap()
+                    .contains("injected builder observation error")
+            );
+            assert_eq!(observed.checkpoint, record.checkpoint);
+            assert_eq!(observed.lease, record.lease);
+            assert_eq!(observed.executor_id, record.executor_id);
+            assert_eq!(runtime.compute_prepares.load(Ordering::SeqCst), 0);
+            assert_eq!(runtime.compute_releases.load(Ordering::SeqCst), 0);
+            let ensure = dev_ensure_request(&record);
+            assert!(matches!(
+                state.userapp_store.admit(&ensure).await,
+                Err(UserAppStoreError::OperationInProgress(_))
+            ));
+            *runtime.builder_absence_error.lock().unwrap() = None;
+            recover_and_execute(&state, &observed).await.unwrap();
+            let done = current(&state, &record).await;
+            assert_eq!(done.state, ComputeControlState::Failed);
+            assert_eq!(done.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+            assert_eq!(done.checkpoint, record.checkpoint);
+            assert_eq!(done.lease, record.lease);
+            assert_eq!(runtime.builder_absence_probes.load(Ordering::SeqCst), 2);
+            assert_eq!(runtime.app_absence_probes.load(Ordering::SeqCst), 0);
+            assert!(matches!(
+                state.userapp_store.admit(&ensure).await.unwrap(),
+                UserAppAdmissionOutcome::Accepted(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn dev_held_lease_prevents_absence_probe_and_fence_release() {
+        let (state, record, runtime, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll":true}),
+            true,
+            UserAppOperationScope::Dev,
+        )
+        .await;
+        *runtime.compute_inspection.lock().unwrap() = Some(ComputeLeaseInspection::Held);
+        recover_and_execute(&state, &record).await.unwrap();
+        let after = current(&state, &record).await;
+        assert_eq!(after.state, ComputeControlState::RecoveryRequired);
+        assert_eq!(after.error_code.as_deref(), Some("COMPUTE_LEASE_HELD"));
+        assert_eq!(after.checkpoint, record.checkpoint);
+        assert_eq!(after.lease, record.lease);
+        assert_eq!(runtime.builder_absence_probes.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.app_absence_probes.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            state
+                .userapp_store
+                .admit(&dev_ensure_request(&record))
+                .await,
+            Err(UserAppStoreError::OperationInProgress(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn running_dev_held_executor_is_not_reserved_or_probed() {
+        let (state, record, runtime, _keep) = stuck_record_with_state(
+            serde_json::json!({"restart_image_roll":true}),
+            true,
+            UserAppOperationScope::Dev,
+            ComputeControlState::Running,
+        )
+        .await;
+        *runtime.compute_inspection.lock().unwrap() = Some(ComputeLeaseInspection::Held);
+        assert!(prepare_resume(&state, &record).await.unwrap().is_none());
+        assert_eq!(current(&state, &record).await, record);
+        assert_eq!(runtime.builder_absence_probes.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.app_absence_probes.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.compute_prepares.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.compute_releases.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn running_dev_absent_target_converges_after_physical_handoff() {
+        let (state, record, runtime, _keep) = stuck_record_with_state(
+            serde_json::json!({"restart_image_roll":true}),
+            true,
+            UserAppOperationScope::Dev,
+            ComputeControlState::Running,
+        )
+        .await;
+        recover_and_execute(&state, &record).await.unwrap();
+        let after = current(&state, &record).await;
+        assert_eq!(after.state, ComputeControlState::Failed);
+        assert_eq!(after.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+        assert_eq!(after.lease, record.lease);
+        assert_eq!(after.checkpoint, record.checkpoint);
+        assert_eq!(runtime.builder_absence_probes.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.compute_prepares.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            state
+                .userapp_store
+                .admit(&dev_ensure_request(&record))
+                .await
+                .unwrap(),
+            UserAppAdmissionOutcome::Accepted(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn application_scope_and_nonroll_intents_do_not_probe_any_runtime() {
+        let (state, record, runtime, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll":true}),
+            true,
+            UserAppOperationScope::Dev,
+        )
+        .await;
+        let context = record.execution_context().unwrap();
+        // Application is not a valid persisted compute scope, so exercise the
+        // private dispatch decision without fabricating a store row for it.
+        let mut application = record.clone();
+        application.scope = UserAppOperationScope::Application;
+        assert!(
+            !image_roll_target_absent(&state, &application, &context)
+                .await
+                .unwrap()
+        );
+        let mut plain = record.clone();
+        plain.checkpoint["restart_image_roll"] = false.into();
+        assert!(
+            !image_roll_target_absent(&state, &plain, &context)
+                .await
+                .unwrap()
+        );
+        let mut stop = record.clone();
+        stop.action = ComputeControlAction::Stop;
+        assert!(
+            !image_roll_target_absent(&state, &stop, &context)
+                .await
+                .unwrap()
+        );
+        assert_eq!(runtime.builder_absence_probes.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.app_absence_probes.load(Ordering::SeqCst), 0);
+        assert_eq!(current(&state, &record).await, record);
+    }
+
+    #[tokio::test]
+    async fn dev_stale_absence_terminalizer_cannot_overwrite_current_revision() {
+        let (state, record, runtime, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll":true}),
+            true,
+            UserAppOperationScope::Dev,
+        )
+        .await;
+        let reserved = state
+            .userapp_store
+            .reserve_compute_drain_recovery(&record)
+            .await
+            .unwrap();
+        let advanced = state
+            .userapp_store
+            .record_compute_drain_problem(
+                &reserved,
+                "NEW_OBSERVATION",
+                "another replica already advanced",
+            )
+            .await
+            .unwrap();
+        converge_absent_image_roll(&state, &reserved).await.unwrap();
+        assert_eq!(current(&state, &record).await, advanced);
+        assert_eq!(runtime.builder_absence_probes.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            state
+                .userapp_store
+                .admit(&dev_ensure_request(&record))
+                .await,
+            Err(UserAppStoreError::OperationInProgress(_))
+        ));
+        recover_and_execute(&state, &advanced).await.unwrap();
+        let done = current(&state, &record).await;
+        assert_eq!(done.state, ComputeControlState::Failed);
+        assert_eq!(done.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+        let revision = done.revision;
+        recover_and_execute(&state, &reserved).await.unwrap();
+        assert_eq!(current(&state, &record).await.revision, revision);
+    }
+
+    #[tokio::test]
+    async fn unproven_absence_or_plain_restart_never_converges_to_absent() {
+        // false 只表示缺席未证实；不能据此把 image-roll 收敛为目标缺失。
+        let (state, record, _runtime, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll": true}),
+            false,
+            UserAppOperationScope::Prod,
+        )
+        .await;
+        let _first = recover_and_execute(&state, &record).await;
+        let after = current(&state, &record).await;
+        assert_ne!(after.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+        // 非 image-roll 的 restart 即便目标缺席也不走该收敛(行为保持旧语义)。
+        let (state2, record2, runtime2, _keep2) = stuck_record(
+            serde_json::json!({"restart_image_roll": false}),
+            true,
+            UserAppOperationScope::Prod,
+        )
+        .await;
+        let _second = recover_and_execute(&state2, &record2).await;
+        let after2 = current(&state2, &record2).await;
+        assert_ne!(after2.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+        assert_eq!(runtime2.app_absence_probes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn identity_changed_lease_receipt_does_not_block_absent_convergence() {
+        // 旧命名/异构回执会让租约检查返回 IdentityChanged(生产 227/229/239 实测:
+        // kubernetes 回执但 captured_name 不匹配当前命名)。预检在租约检查之前,
+        // 目标缺席即收敛, 不被 IdentityChanged 的 Deferred 阻断。
+        let (state, record, runtime, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll": true}),
+            true,
+            UserAppOperationScope::Prod,
+        )
+        .await;
+        *runtime.compute_inspection.lock().unwrap() = Some(
+            ComputeLeaseInspection::IdentityChanged("Compute lease scope differs".into()),
+        );
+        recover_and_execute(&state, &record)
+            .await
+            .expect("absent target converges despite identity-changed receipt");
+        let after = current(&state, &record).await;
+        assert_eq!(after.state, ComputeControlState::Failed);
+        assert_eq!(after.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+    }
+
+    #[tokio::test]
+    async fn absence_probe_error_retains_original_recovery_until_retry_succeeds() {
+        let (state, record, runtime, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll": true}),
+            true,
+            UserAppOperationScope::Prod,
+        )
+        .await;
+        *runtime.app_absence_error.lock().unwrap() = Some("injected absence read failure".into());
+        recover_and_execute(&state, &record).await.unwrap();
+        let failed_probe = current(&state, &record).await;
+        assert_eq!(failed_probe.state, ComputeControlState::RecoveryRequired);
+        assert_eq!(
+            failed_probe.error_code.as_deref(),
+            Some("COMPUTE_OBSERVATION_FAILED")
+        );
+        assert!(
+            failed_probe
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("injected absence read failure"))
+        );
+        assert_eq!(failed_probe.checkpoint, record.checkpoint);
+        assert_eq!(failed_probe.lease, record.lease);
+        *runtime.app_absence_error.lock().unwrap() = None;
+        recover_and_execute(&state, &failed_probe).await.unwrap();
+        let recovered = current(&state, &record).await;
+        assert_eq!(recovered.state, ComputeControlState::Failed);
+        assert_eq!(recovered.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+    }
+
+    #[tokio::test]
+    async fn held_original_lease_prevents_absence_probe_and_terminal_settlement() {
+        let (state, record, runtime, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll": true}),
+            true,
+            UserAppOperationScope::Prod,
+        )
+        .await;
+        *runtime.compute_inspection.lock().unwrap() = Some(ComputeLeaseInspection::Held);
+        recover_and_execute(&state, &record).await.unwrap();
+        let after = current(&state, &record).await;
+        assert_eq!(after.state, ComputeControlState::RecoveryRequired);
+        assert_eq!(after.error_code.as_deref(), Some("COMPUTE_LEASE_HELD"));
+        assert_eq!(after.checkpoint, record.checkpoint);
+        assert_eq!(after.lease, record.lease);
+        assert_eq!(runtime.app_absence_probes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_absence_settlement_cannot_overwrite_new_recovery_revision() {
+        let (state, record, _runtime, _keep) = stuck_record(
+            serde_json::json!({"restart_image_roll": true}),
+            true,
+            UserAppOperationScope::Prod,
+        )
+        .await;
+        let reserved = state
+            .userapp_store
+            .reserve_compute_drain_recovery(&record)
+            .await
+            .unwrap();
+        let advanced = state
+            .userapp_store
+            .record_compute_drain_problem(&reserved, "NEW_OBSERVATION", "another replica observed")
+            .await
+            .unwrap();
+        assert!(matches!(
+            state
+                .userapp_store
+                .fail_unrecoverable_compute_control(&reserved, ERR_RUNTIME_ABSENT, "stale absent")
+                .await,
+            Err(UserAppStoreError::VersionConflict)
+        ));
+        assert_eq!(current(&state, &record).await, advanced);
+        recover_and_execute(&state, &advanced).await.unwrap();
+        let recovered = current(&state, &record).await;
+        assert_eq!(recovered.state, ComputeControlState::Failed);
+        assert_eq!(recovered.error_code.as_deref(), Some(ERR_RUNTIME_ABSENT));
+    }
 }

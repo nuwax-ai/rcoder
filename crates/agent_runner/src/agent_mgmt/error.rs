@@ -30,6 +30,10 @@ pub enum AgentMgmtError {
     #[error("install failed: {0}")]
     InstallFailed(String),
 
+    /// 归一化回滚失败时保留现场，失败清理不能删除其中尚待恢复的数据。
+    #[error("install failed: {0}")]
+    NormalizeRollbackIncomplete(#[source] download_utils::ArchiveError),
+
     #[error("binary too large ({size} bytes, max {max})")]
     BinaryTooLarge { size: u64, max: u64 },
 
@@ -94,6 +98,10 @@ impl From<download_utils::ArchiveError> for AgentMgmtError {
             download_utils::ArchiveError::PathTraversal(msg) => Self::PathTraversal(msg),
             download_utils::ArchiveError::InvalidArchive(msg) => Self::Archive(msg),
             download_utils::ArchiveError::TooLarge { size, max } => Self::ArchiveBomb { size, max },
+            // 错误码保持安装失败，但保留类型让安装器识别尚待恢复的现场。
+            download_utils::ArchiveError::NormalizeRollbackIncomplete { .. } => {
+                Self::NormalizeRollbackIncomplete(e)
+            }
         }
     }
 }
@@ -108,7 +116,9 @@ impl AgentMgmtError {
             Self::ArchiveBomb { .. } => ec::ERR_AGENT_MGMT_ARCHIVE_BOMB,
             Self::PathTraversal(_) => ec::ERR_AGENT_MGMT_PATH_TRAVERSAL,
             Self::CommandTimeout(_) => ec::ERR_AGENT_MGMT_COMMAND_TIMEOUT,
-            Self::InstallFailed(_) => ec::ERR_AGENT_MGMT_INSTALL_FAILED,
+            Self::InstallFailed(_) | Self::NormalizeRollbackIncomplete(_) => {
+                ec::ERR_AGENT_MGMT_INSTALL_FAILED
+            }
             Self::BinaryTooLarge { .. } => ec::ERR_AGENT_MGMT_BINARY_TOO_LARGE,
             Self::BuiltinProtected => ec::ERR_AGENT_MGMT_BUILTIN_PROTECTED,
             Self::StreamTruncated => ec::ERR_AGENT_MGMT_STREAM_TRUNCATED,

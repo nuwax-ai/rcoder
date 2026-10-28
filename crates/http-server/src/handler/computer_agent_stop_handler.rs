@@ -196,6 +196,27 @@ pub async fn computer_agent_stop(
         container_info.container_id, container_info.container_ip
     );
 
+    // A catalog outage must not skip an authorized stop of this known runtime.
+    // Keep the capture result until the RPC has actually confirmed its exit.
+    let stop_frame = state
+        .capture_project_stop_registration(project_id)
+        .await
+        .and_then(|frame| {
+            if let Some(frame) = &frame {
+                let physical = frame.project().container_info().ok_or_else(|| {
+                    anyhow::anyhow!("Captured Stop registration has no physical runtime")
+                })?;
+                anyhow::ensure!(
+                    physical.container_id == container_info.container_id
+                        && physical.container_name == container_info.container_name
+                        && physical.project_id == container_info.project_id
+                        && physical.workload_uid == container_info.workload_uid,
+                    "Captured Stop registration differs from the stopped runtime"
+                );
+            }
+            Ok(frame)
+        });
+
     // 3. 通过 gRPC 调用 StopAgent RPC
     info!(
         "🔄 [COMPUTER_STOP] Preparing to call StopAgent RPC: project_id={}",
@@ -225,8 +246,11 @@ pub async fn computer_agent_stop(
             );
 
             if response.success {
-                // 🆕 清除 rcoder 端的 session_id（即使成功停止，也清理会话状态）
-                state.clear_session_durable(project_id).await;
+                if let Err(response) =
+                    clear_captured_stop_registration(&state, &stop_frame, locale).await
+                {
+                    return Ok(*response);
+                }
 
                 let message = format!(
                     "Agent {} stopped successfully, container {} continues running",
@@ -261,8 +285,11 @@ pub async fn computer_agent_stop(
                             "ℹ️ [COMPUTER_STOP] Agent already in stopped state: project_id={}",
                             project_id
                         );
-                        // 🆕 清除 rcoder 端的 session_id（即使 Agent 已停止，也清理会话状态）
-                        state.clear_session_durable(project_id).await;
+                        if let Err(response) =
+                            clear_captured_stop_registration(&state, &stop_frame, locale).await
+                        {
+                            return Ok(*response);
+                        }
 
                         let message =
                             shared_types::get_i18n_message("success.agent_already_stopped", locale);
@@ -304,6 +331,51 @@ pub async fn computer_agent_stop(
                 shared_types::error_codes::ERR_GRPC_ERROR,
                 locale,
             ));
+        }
+    }
+}
+
+async fn clear_captured_stop_registration(
+    state: &AppState,
+    captured: &anyhow::Result<Option<rcoder_storage::ProjectStopFrame>>,
+    locale: &'static str,
+) -> Result<(), Box<HttpResult<ComputerAgentStopResponse>>> {
+    use shared_types::persistence::PersistenceWriteOutcome;
+
+    let frame = match captured {
+        Ok(Some(frame)) => frame,
+        Ok(None) => return Ok(()), // No catalog registration was captured to clear.
+        Err(_) => {
+            warn!("[COMPUTER_STOP] Runtime stopped but catalog capture was not confirmed");
+            return Err(Box::new(HttpResult::error_with_message(
+                shared_types::ERR_SERVICE_UNAVAILABLE,
+                locale,
+                "Agent execution stopped, but its session registration could not be confirmed",
+            )));
+        }
+    };
+    match state.clear_sessions_if_current_durable(frame).await {
+        Ok(PersistenceWriteOutcome::Committed) => Ok(()),
+        Ok(PersistenceWriteOutcome::Superseded) => {
+            info!(project_id = %frame.project().project_id(),
+                "[COMPUTER_STOP] Preserving a later chat registration after captured execution stopped");
+            Ok(())
+        }
+        Ok(PersistenceWriteOutcome::Deferred { .. }) => {
+            Err(Box::new(HttpResult::error_with_message(
+                shared_types::ERR_SERVICE_UNAVAILABLE,
+                locale,
+                "Agent execution stopped; its session registration cleanup is still pending",
+            )))
+        }
+        Err(_) => {
+            warn!(project_id = %frame.project().project_id(),
+                "[COMPUTER_STOP] Runtime stopped but captured catalog cleanup was not confirmed");
+            Err(Box::new(HttpResult::error_with_message(
+                shared_types::ERR_SERVICE_UNAVAILABLE,
+                locale,
+                "Agent execution stopped, but its captured session registration cleanup could not be confirmed",
+            )))
         }
     }
 }
@@ -399,3 +471,7 @@ async fn stop_userapp_dev(
         project_id: target.binding.project_id,
     }))
 }
+
+#[cfg(all(test, feature = "userapp-turso"))]
+#[path = "computer_agent_stop_handler/tests.rs"]
+mod tests;

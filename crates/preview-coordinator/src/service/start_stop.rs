@@ -1,7 +1,10 @@
 use super::*;
 
 impl PreviewCoordinator {
-    fn start_envelope(row: &PreviewInstanceRecord, message: &str) -> PreviewStartEnvelope {
+    pub(super) fn start_envelope(
+        row: &PreviewInstanceRecord,
+        message: &str,
+    ) -> PreviewStartEnvelope {
         PreviewStartEnvelope {
             success: true,
             message: message.to_string(),
@@ -18,12 +21,14 @@ impl PreviewCoordinator {
         base_path: Option<String>,
     ) -> Result<PreviewStartEnvelope, PreviewCoordinationError> {
         let key = compute_key(identity);
+        let base_path = base_path.as_deref().map(normalize_base_path);
         // 预读：幂等快路径 + Unknown 证据准备
         let mut recovery = None;
         if let Ok(Some(row)) = self.store.get(&key).await {
             match row.state {
                 PreviewInstanceState::Ready if self.heartbeat_fresh(&row) => {
                     if !self.settle_if_host_absent(&row).await? {
+                        Self::check_requested_base(&row, base_path.as_deref())?;
                         return Ok(Self::start_envelope(&row, "Development server started"));
                     }
                 }
@@ -49,71 +54,46 @@ impl PreviewCoordinator {
             }
         }
 
-        let mut candidate: Option<u16> = None;
-        for _ in 0..START_PORT_ATTEMPTS {
-            let input = AcceptStartInput {
-                preview_key: key.clone(),
-                project_id: identity.project_id.clone(),
-                project_path: identity.resolved_path.clone(),
-                host: self.host.clone(),
-                operation_id: new_id(),
-                instance_id: new_id(),
-                requested_port: candidate,
-                recover_unknown_evidence: recovery.clone(),
-            };
-            match self.store.accept_start(input).await {
-                Ok(AcceptStartOutcome::Admitted(record)) => {
-                    match self
-                        .execute_start(&key, base_path.as_deref(), &record)
-                        .await
-                    {
-                        Ok(envelope) => return Ok(envelope),
-                        Err(StartExecError::PortInUse(port)) => {
-                            note_store_result(
-                                self.store
-                                    .mark_failed(
-                                        &key,
-                                        &record.instance_id,
-                                        record.revision,
-                                        &format!("port {port} occupied locally, retrying"),
-                                    )
-                                    .await,
-                            );
-                            candidate = Some(Self::next_candidate(port));
-                            continue;
-                        }
-                        Err(StartExecError::Fatal(error)) => {
-                            note_store_result(
-                                self.store
-                                    .mark_failed(
-                                        &key,
-                                        &record.instance_id,
-                                        record.revision,
-                                        &error.to_string(),
-                                    )
-                                    .await,
-                            );
-                            return Err(error);
-                        }
-                    }
-                }
-                Ok(AcceptStartOutcome::ExistingReady(row)) => {
-                    return Ok(Self::start_envelope(&row, "Development server started"));
-                }
-                Ok(AcceptStartOutcome::Blocked(row)) => {
-                    return Err(conflict(format!(
-                        "preview operation in progress: state={:?}",
-                        row.state
-                    )));
-                }
-                Err(error) => return Err(store_error(error)),
+        let input = AcceptStartInput {
+            preview_key: key,
+            project_id: identity.project_id.clone(),
+            project_path: identity.resolved_path.clone(),
+            host: self.host.clone(),
+            operation_id: new_id(),
+            instance_id: new_id(),
+            requested_port: None,
+            base_path,
+            recover_unknown_evidence: recovery,
+        };
+        let owner = self.start_owned(input)?;
+        let observed = tokio::time::timeout(
+            Duration::from_secs(self.config.start_budget_secs), owner.wait_result(),
+        ).await.map_err(|_| unavailable(
+            "preview start budget exceeded; original admission/start owner continues without replay",
+        ))??;
+        match observed {
+            startup::StartupResult::Ready(envelope) => Ok(envelope),
+            startup::StartupResult::Error(error) => Err(startup::copy_error(&error)),
+        }
+    }
+
+    pub(super) fn check_requested_base(
+        row: &PreviewInstanceRecord,
+        requested: Option<&str>,
+    ) -> Result<(), PreviewCoordinationError> {
+        if let Some(requested) = requested {
+            let selected = row.base_path.clone().or_else(|| row.port.map(default_base));
+            if selected.as_deref() != Some(requested) {
+                return Err(conflict(
+                    "preview instance already uses a different base path",
+                ));
             }
         }
-        Err(unavailable("preview start exhausted port retry budget"))
+        Ok(())
     }
 
     /// 受理后已知的换端口候选（避开冲突口与保留区；分配器已排除全局占用）。
-    fn next_candidate(prev: u16) -> u16 {
+    pub(super) fn next_candidate(prev: u16) -> u16 {
         let mut next = if prev >= PREVIEW_PORT_MAX {
             PREVIEW_PORT_MIN
         } else {
@@ -123,80 +103,6 @@ impl PreviewCoordinator {
             next = PREVIEW_PORT_RESERVED_MAX + 1;
         }
         next
-    }
-
-    async fn execute_start(
-        &self,
-        key: &str,
-        base_path: Option<&str>,
-        record: &PreviewInstanceRecord,
-    ) -> Result<PreviewStartEnvelope, StartExecError> {
-        let Some(port) = record.port else {
-            return Err(StartExecError::Fatal(invalid("admitted record lacks port")));
-        };
-        let ticket = ExecutorStartTicket {
-            preview_key: key.to_string(),
-            log_key: record.project_id.clone(),
-            project_path: record.project_path.clone(),
-            port,
-            base_path: base_path.map(str::to_string),
-            instance_id: record.instance_id.clone(),
-        };
-        let budget = Duration::from_secs(self.config.start_budget_secs);
-        let started = tokio::time::timeout(budget, self.executor.start_local(&ticket)).await;
-        let (pid, actual_port) = match started {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(shared_types::PreviewExecutorError::PortInUse(detail))) => {
-                return Err(StartExecError::PortInUse(port))
-                    .inspect_err(|_| tracing::warn!(key, port, "preview port in use: {detail}"));
-            }
-            Ok(Err(shared_types::PreviewExecutorError::Business { code, message })) => {
-                return Err(StartExecError::Fatal(PreviewCoordinationError::Business {
-                    code,
-                    message,
-                }));
-            }
-            Ok(Err(error)) => {
-                return Err(StartExecError::Fatal(unavailable(error.to_string())));
-            }
-            Err(_elapsed) => {
-                // 预算超时：行保持 starting、执行器可能仍在安装——不自动重放；
-                // 本机心跳扫描若发现已就绪将自愈 publish_running。
-                return Err(StartExecError::Fatal(unavailable(
-                    "preview start budget exceeded; instance left starting for heartbeat self-heal",
-                )));
-            }
-        };
-        let effective_base = base_path
-            .map(normalize_base_path)
-            .unwrap_or_else(|| default_base(actual_port));
-        match self
-            .store
-            .publish_running(
-                key,
-                &record.operation_id,
-                record.revision,
-                pid,
-                actual_port,
-                Some(effective_base.as_str()),
-            )
-            .await
-        {
-            Ok(row) => {
-                self.route_cache.invalidate(actual_port);
-                Ok(Self::start_envelope(&row, "Development server started"))
-            }
-            Err(PreviewStoreError::Conflict(detail)) => {
-                // 受理被并发接管：收掉我们刚起的进程（登记身份匹配才杀）。
-                if let Err(kill_error) = self.executor.stop_local(key, &record.instance_id).await {
-                    tracing::warn!(key, "post-supersede cleanup kill failed: {kill_error}");
-                }
-                Err(StartExecError::Fatal(conflict(format!(
-                    "start admission superseded: {detail}"
-                ))))
-            }
-            Err(error) => Err(StartExecError::Fatal(store_error(error))),
-        }
     }
 
     /// 单实例协调停止（受理→派发→终态）。
@@ -252,14 +158,35 @@ impl PreviewCoordinator {
         };
         match outcome {
             ExecutorStopOutcome::Stopped | ExecutorStopOutcome::NotRegistered => {
-                self.store
+                match self
+                    .store
                     .mark_stopped(
                         &stopping.preview_key,
                         &stopping.operation_id,
                         stopping.revision,
                     )
                     .await
-                    .map_err(store_error)?;
+                {
+                    Ok(_) => {}
+                    Err(PreviewStoreError::Conflict(detail)) => {
+                        let current = self
+                            .store
+                            .get(&stopping.preview_key)
+                            .await
+                            .map_err(store_error)?;
+                        if !current.is_some_and(|row| {
+                            row.instance_id == stopping.instance_id
+                                && row.operation_id == stopping.operation_id
+                                && row.revision == stopping.revision
+                                && row.state == PreviewInstanceState::Stopped
+                        }) {
+                            return Err(conflict(detail));
+                        }
+                    }
+                    Err(
+                        error @ (PreviewStoreError::Unavailable(_) | PreviewStoreError::Invalid(_)),
+                    ) => return Err(store_error(error)),
+                }
                 if let Some(port) = stopping.port {
                     self.route_cache.invalidate(port);
                 }
@@ -288,10 +215,8 @@ impl PreviewCoordinator {
     ) -> Result<ExecutorStopOutcome, PreviewCoordinationError> {
         if stopping.host_id == self.host.host_id {
             return self
-                .executor
-                .stop_local(&stopping.preview_key, &stopping.instance_id)
-                .await
-                .map_err(|e| unavailable(e.to_string()));
+                .stop_local_startup(&stopping.preview_key, &stopping.instance_id)
+                .await;
         }
         let Some(pod_ip) = stopping.pod_ip.clone() else {
             return Err(unavailable(format!(
@@ -378,10 +303,4 @@ impl PreviewCoordinator {
             .await
             .map_err(store_error)
     }
-}
-
-/// 启动执行的内部错误分类（端口冲突可换端口重试）。
-enum StartExecError {
-    PortInUse(u16),
-    Fatal(PreviewCoordinationError),
 }

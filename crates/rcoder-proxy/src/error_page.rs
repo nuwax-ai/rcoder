@@ -51,7 +51,9 @@ pub const VAR_UI_APP: &str = "{{RCODER_UI_APP}}";
 pub const VAR_UI_UNAVAILABLE: &str = "{{RCODER_UI_UNAVAILABLE}}";
 pub const VAR_UI_STARTING: &str = "{{RCODER_UI_STARTING}}";
 pub const VAR_UI_STOPPED: &str = "{{RCODER_UI_STOPPED}}";
+pub const VAR_UI_STOPPING: &str = "{{RCODER_UI_STOPPING}}";
 pub const VAR_UI_FAILED: &str = "{{RCODER_UI_FAILED}}";
+pub const VAR_UI_PREPARING: &str = "{{RCODER_UI_PREPARING}}";
 pub const VAR_UI_RELOAD: &str = "{{RCODER_UI_RELOAD}}";
 pub const VAR_UI_HINT: &str = "{{RCODER_UI_HINT}}";
 pub const VAR_UI_COPY: &str = "{{RCODER_UI_COPY}}";
@@ -60,7 +62,7 @@ pub const VAR_UI_ARIA: &str = "{{RCODER_UI_ARIA}}";
 
 /// UI 标签占位符 → i18n key（userapp_error_page.ui.<key>；渲染期按 locale
 /// 注入——固定文案跟随页面语言，脚本状态文案不再依赖标题子串）。
-const UI_LABELS: [(&str, &str); 14] = [
+const UI_LABELS: [(&str, &str); 16] = [
     (VAR_UI_BROWSER, "browser"),
     (VAR_UI_CONNECTED, "connected"),
     (VAR_UI_GATEWAY, "gateway"),
@@ -69,7 +71,9 @@ const UI_LABELS: [(&str, &str); 14] = [
     (VAR_UI_UNAVAILABLE, "unavailable"),
     (VAR_UI_STARTING, "starting"),
     (VAR_UI_STOPPED, "stopped"),
+    (VAR_UI_STOPPING, "stopping"),
     (VAR_UI_FAILED, "failed"),
+    (VAR_UI_PREPARING, "preparing"),
     (VAR_UI_RELOAD, "reload"),
     (VAR_UI_HINT, "hint"),
     (VAR_UI_COPY, "copy"),
@@ -160,6 +164,10 @@ pub enum ErrorPageCause {
     Starting,
     /// 当前 owner 确认官方代理正在启动或替换。
     Restarting,
+    /// 开发环境运行资源正在准备，应用自身尚未参与（业务快照尚未产生）。
+    Provisioning,
+    /// 停止意图已受理、业务停止进行中（stop 窗口的 standby/失败出口）
+    Stopping,
     /// 已确认停止
     Stopped,
     /// 有明确启动失败证据
@@ -189,6 +197,8 @@ impl ErrorPageCause {
         match self {
             Self::Starting => "starting",
             Self::Restarting => "restarting",
+            Self::Provisioning => "provisioning",
+            Self::Stopping => "stopping",
             Self::Stopped => "stopped",
             Self::Failed => "failed",
             Self::Missing => "missing",
@@ -297,18 +307,29 @@ impl UserAppProxyFailureHint {
     /// 即暴露此映射。
     pub fn page_cause(&self) -> ErrorPageCause {
         use shared_types::UserAppReadinessStatus as Status;
+        // 业务 Stopping 证据优先于代理过渡判定：stop 流程同样经过代理换代
+        // （Preparing/Stopping 相位），transition 优先会把真实停止窗口报成
+        // "正在重启"（Codex 六轮复现）；停止是当前真实状态，restart 驱动的
+        // 停旧窗口显示"停止中"同样准确（前端可用 operation.action 区分语境）。
+        if self.readiness_status == Some(Status::Stopping) {
+            return ErrorPageCause::Stopping;
+        }
         if self.transition_operation_id().is_some() {
             return ErrorPageCause::Restarting;
         }
         match self.readiness_status {
             Some(Status::Starting) => ErrorPageCause::Starting,
+            // 平台合并层产出 provisioning 时业务自身尚未参与，文案不归因于应用。
+            // 就绪顾问只消费原始观察、拿不到在途操作槽位，因此该分支目前按构造
+            // 不可达；顾问接入合并态后即刻生效（见 userapp_failure_advisor）。
+            Some(Status::Provisioning) => ErrorPageCause::Provisioning,
+            Some(Status::Stopping) => ErrorPageCause::Stopping,
             Some(Status::Stopped) => ErrorPageCause::Stopped,
             Some(Status::Failed) => ErrorPageCause::Failed,
             Some(Status::NotDeployed) => ErrorPageCause::Missing,
             // Ready/Degraded 出现在失败出口说明健康证据与本次失败并存，
-            // Stopping/Unknown/Unsupported 无确定文案证据——一律通用
+            // Unknown/Unsupported 无确定文案证据——一律通用
             None
-            | Some(Status::Stopping)
             | Some(Status::Ready)
             | Some(Status::Degraded)
             | Some(Status::Unknown)
@@ -340,6 +361,29 @@ pub trait UserAppProxyFailureAdvisor: Send + Sync {
     ) -> Option<UserAppProxyFailureHint> {
         None
     }
+
+    /// standby 摘流窗口的轻量来源判定（与文案观察分离，Codex P2/七轮）。
+    ///
+    /// 三态只做**路由**：`Confirmed` = 近期观察确认过托管来源（值得花预算
+    /// 做当次新鲜确认——不直接授权替换）；`Unconfirmed` = 明确未确认
+    /// （custom/旧配置或显式否定——透传省预算，应用伪造标记不换页）；
+    /// `Unknown` = 观察不可得/未预热（实现方应触发后台预热；本请求透传，
+    /// 后续请求命中）。替换授权只能来自当次新鲜观察的成功确认。
+    async fn standby_origin(&self, _app_id: &str, _stage: &str) -> StandbyOrigin {
+        StandbyOrigin::Unknown
+    }
+}
+
+/// [`UserAppProxyFailureAdvisor::standby_origin`] 的三态判定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StandbyOrigin {
+    /// 近期观察确认过托管来源（owner 绑定缓存命中）：值得花预算做当次
+    /// 新鲜确认——**不直接授权替换**（授权来自新鲜观察的成功）。
+    Confirmed,
+    /// 明确未确认（custom/旧配置或显式否定）：原样透传。
+    Unconfirmed,
+    /// 观察不可得/未预热：本请求透传，预热由实现方后台触发。
+    Unknown,
 }
 
 /// 生成一次性诊断编号（uuid v4 简短形态；请求级，不与业务身份复用）。
@@ -484,22 +528,83 @@ fn failure_span(session: &Session, status: u16, context: &str) -> tracing::Span 
     span
 }
 
-fn attach_wake_diagnostic(
-    payload: &mut serde_json::Value,
-    failure: &shared_types::WakeFailure,
-    locale: &str,
-) {
-    payload["error"]["operation_id"] = serde_json::json!(failure.operation_id);
-    payload["error"]["blocker"] = serde_json::json!(failure.blocker);
-    payload["error"]["error_detail"] = serde_json::json!(
-        shared_types::ErrorDetail::new(
-            failure.cause_code.as_ref(),
-            failure.stage.as_ref(),
-            failure.message.clone(),
-        )
-        .with_retryable(failure.retryable)
-        .localized(locale)
-    );
+/// UserApp 代理机器错误响应的固定契约（两条出口共用：[`write_error_response`]
+/// 直写与 proxy_http 的 Pingap 自产错误替换）。顶层仅 `error` 对象；
+/// 唤醒诊断三键（operation_id/blocker/error_detail）始终成组出现（值可为
+/// null），无唤醒信息时完全缺省——与既有 wire 形状逐键一致。
+use serde::Serialize;
+
+#[derive(Serialize)]
+pub(crate) struct MachineErrorPayload {
+    error: MachineErrorBody,
+}
+
+#[derive(Serialize)]
+struct MachineErrorBody {
+    code: &'static str,
+    status: u16,
+    reason: String,
+    message: String,
+    diagnostic_id: String,
+    /// Outer `None` omits the key; `Some(None)` preserves explicit JSON null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation_id: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocker: Option<Option<Box<shared_types::UserAppOperationBlocker>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_detail: Option<shared_types::ErrorDetail>,
+}
+
+impl MachineErrorPayload {
+    pub(crate) fn new(
+        status: u16,
+        reason: impl Into<String>,
+        message: impl Into<String>,
+        diagnostic_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            error: MachineErrorBody {
+                code: "USERAPP_PROXY_FAILURE",
+                status,
+                reason: reason.into(),
+                message: message.into(),
+                diagnostic_id: diagnostic_id.into(),
+                operation_id: None,
+                blocker: None,
+                error_detail: None,
+            },
+        }
+    }
+
+    /// 附带唤醒失败诊断：operation_id/blocker/error_detail 三键成组出现。
+    pub(crate) fn with_wake_failure(
+        mut self,
+        failure: &shared_types::WakeFailure,
+        locale: &str,
+    ) -> Self {
+        self.error.operation_id = Some(failure.operation_id.clone());
+        self.error.blocker = Some(failure.blocker.clone());
+        self.error.error_detail = Some(
+            shared_types::ErrorDetail::new(
+                failure.cause_code.as_ref(),
+                failure.stage.as_ref(),
+                failure.message.clone(),
+            )
+            .with_retryable(failure.retryable)
+            .localized(locale),
+        );
+        self
+    }
+
+    /// Pingap 自产错误出口：operation_id 键始终存在（值可为 null）。
+    pub(crate) fn with_operation_id(mut self, operation_id: Option<String>) -> Self {
+        self.error.operation_id = Some(operation_id);
+        self
+    }
+
+    pub(crate) fn to_body(&self) -> Vec<u8> {
+        serde_json::to_string(self).unwrap_or_default().into_bytes()
+    }
 }
 
 /// 写出 UserApp 代理失败响应（在下游最终响应尚未开始时调用一次）。
@@ -597,19 +702,12 @@ async fn write_error_response_inner(
             ("text/html; charset=utf-8", renderer.render(&vars, locale))
         }
         ErrorRepresentation::Machine => {
-            let mut payload = serde_json::json!({
-                "error": {
-                    "code": "USERAPP_PROXY_FAILURE",
-                    "status": status,
-                    "reason": reason,
-                    "message": message,
-                    "diagnostic_id": diagnostic_id,
-                }
-            });
+            let mut payload =
+                MachineErrorPayload::new(status, reason, message, diagnostic_id.clone());
             if let Some(failure) = wake_failure {
-                attach_wake_diagnostic(&mut payload, failure, locale);
+                payload = payload.with_wake_failure(failure, locale);
             }
-            ("application/json", payload.to_string().into_bytes())
+            ("application/json", payload.to_body())
         }
     };
 
@@ -698,10 +796,12 @@ mod tests {
         ErrorPageRenderer::new(None)
     }
 
-    fn all_causes() -> [ErrorPageCause; 10] {
+    fn all_causes() -> [ErrorPageCause; 12] {
         [
             ErrorPageCause::Starting,
             ErrorPageCause::Restarting,
+            ErrorPageCause::Provisioning,
+            ErrorPageCause::Stopping,
             ErrorPageCause::Stopped,
             ErrorPageCause::Failed,
             ErrorPageCause::Missing,
@@ -777,6 +877,11 @@ mod tests {
                 ErrorPageCause::Starting,
                 "应用正在启动",
                 "应用正在启动，耗时较长，请稍后重新访问。",
+            ),
+            (
+                ErrorPageCause::Provisioning,
+                "开发环境正在准备",
+                "应用的开发环境正在准备运行资源，请稍后重新访问。",
             ),
             (
                 ErrorPageCause::Stopped,
@@ -993,6 +1098,52 @@ mod tests {
     }
 
     #[test]
+    fn page_cause_gives_provisioning_its_own_cause() {
+        let hint = UserAppProxyFailureHint {
+            proxy_confirmation: None,
+            readiness_status: Some(shared_types::UserAppReadinessStatus::Provisioning),
+            error_origin_confirmed: false,
+        };
+        let cause = hint.page_cause();
+        assert_eq!(cause, ErrorPageCause::Provisioning);
+        assert_eq!(cause.i18n_slug(), "provisioning");
+    }
+
+    /// 业务 Stopping 优先于代理过渡：stop 流程同样经过代理换代（Preparing/
+    /// Stopping 相位），transition 优先会把真实停止窗口报成"正在重启"
+    /// （Codex 六轮复现的组合回归）。
+    #[test]
+    fn page_cause_stopping_outranks_in_flight_proxy_transition() {
+        let hint = UserAppProxyFailureHint {
+            proxy_confirmation: Some(shared_types::ProxyConfirmation {
+                contract: shared_types::ProxyConfirmationContract::OfficialRestartHttpV1,
+                confirmed: false,
+                phase: shared_types::ProxyPhase::Stopping,
+                operation_id: "stop-transition-op".into(),
+                proxy_instance_id: None,
+                config_digest: None,
+            }),
+            readiness_status: Some(shared_types::UserAppReadinessStatus::Stopping),
+            error_origin_confirmed: true,
+        };
+        assert_eq!(
+            hint.page_cause(),
+            ErrorPageCause::Stopping,
+            "observed business stopping must outrank the in-flight proxy transition"
+        );
+        // 过渡仍在途时的其他观察（如 Starting）保持 Restarting 优先（原语义）。
+        let starting_same_transition = UserAppProxyFailureHint {
+            proxy_confirmation: hint.proxy_confirmation.clone(),
+            readiness_status: Some(shared_types::UserAppReadinessStatus::Starting),
+            error_origin_confirmed: true,
+        };
+        assert_eq!(
+            starting_same_transition.page_cause(),
+            ErrorPageCause::Restarting
+        );
+    }
+
+    #[test]
     fn cause_copywriting_covers_all_categories() {
         for cause in all_causes() {
             let (title, message) = cause.copywriting(shared_types::DEFAULT_LOCALE);
@@ -1006,7 +1157,6 @@ mod tests {
 mod wake_diagnostic_tests {
     #[test]
     fn wake_page_keeps_original_operation_stage_and_safe_detail() {
-        let mut payload = serde_json::json!({"error":{"code":"USERAPP_PROXY_FAILURE"}});
         let blocker = shared_types::UserAppOperationBlocker {
             scope: shared_types::UserAppOperationScope::Prod,
             operation_id: "original-blocking-stop".into(),
@@ -1023,7 +1173,9 @@ mod wake_diagnostic_tests {
                 "POSTGRES_PASSWORD=private_marker",
             )
         };
-        super::attach_wake_diagnostic(&mut payload, &failure, "en-US");
+        let payload = super::MachineErrorPayload::new(503, "wake", "waking", "D-w")
+            .with_wake_failure(&failure, "en-US");
+        let payload = serde_json::to_value(&payload).unwrap();
         assert_eq!(payload["error"]["code"], "USERAPP_PROXY_FAILURE");
         assert_eq!(payload["error"]["operation_id"], "original-wake");
         assert_eq!(payload["error"]["blocker"], serde_json::json!(blocker));
@@ -1072,5 +1224,79 @@ mod wake_diagnostic_tests {
             }),
         };
         assert!(hint.transition_operation_id().is_none());
+    }
+}
+
+#[cfg(test)]
+mod machine_payload_wire_tests {
+    use super::*;
+
+    /// R11: 机器错误响应 wire 快照——与替换前 json! 形状逐键一致。
+    #[test]
+    fn plain_payload_has_no_diagnostic_keys() {
+        let payload = MachineErrorPayload::new(502, "upstream_reset", "bad gateway", "D-1");
+        assert_eq!(
+            serde_json::to_value(&payload).unwrap(),
+            serde_json::json!({
+                "error": {
+                    "code": "USERAPP_PROXY_FAILURE",
+                    "status": 502,
+                    "reason": "upstream_reset",
+                    "message": "bad gateway",
+                    "diagnostic_id": "D-1",
+                }
+            })
+        );
+    }
+
+    /// 唤醒诊断三键成组出现（值可为 null），error_detail 携带
+    /// cause_code/stage/retryable 与本地化消息。
+    #[test]
+    fn wake_failure_payload_keeps_grouped_diagnostic_keys() {
+        let mut failure = shared_types::WakeFailure::new(
+            shared_types::ERR_RUNTIME_UNAVAILABLE,
+            "wake",
+            "container is waking",
+        );
+        failure.operation_id = Some("op-7".into());
+        failure.retryable = true;
+        let payload = MachineErrorPayload::new(503, "wake_timeout", "waking", "D-2")
+            .with_wake_failure(&failure, "en-US");
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["error"]["operation_id"], serde_json::json!("op-7"));
+        assert_eq!(value["error"]["blocker"], serde_json::Value::Null);
+        assert_eq!(
+            value["error"]["error_detail"]["reason_code"],
+            serde_json::json!(shared_types::ERR_RUNTIME_UNAVAILABLE)
+        );
+        assert_eq!(value["error"]["error_detail"]["stage"], "wake");
+        assert_eq!(value["error"]["error_detail"]["retryable"], true);
+        // 无 operation_id 时键仍在、值为 null（与旧 attach 行为一致）
+        failure.operation_id = None;
+        let payload = MachineErrorPayload::new(503, "wake_timeout", "waking", "D-3")
+            .with_wake_failure(&failure, "en-US");
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["error"]["operation_id"], serde_json::Value::Null);
+    }
+
+    /// Pingap 自产错误出口：operation_id 键始终存在（值可为 null）。
+    #[test]
+    fn pingap_payload_always_carries_operation_id() {
+        for (input, expected) in [
+            (
+                Some("transition-9".to_string()),
+                serde_json::json!("transition-9"),
+            ),
+            (None, serde_json::Value::Null),
+        ] {
+            let payload =
+                MachineErrorPayload::new(502, "pingap_self_produced_error", "message", "D-4")
+                    .with_operation_id(input);
+            let value = serde_json::to_value(&payload).unwrap();
+            assert_eq!(value["error"]["operation_id"], expected);
+            assert_eq!(value["error"]["reason"], "pingap_self_produced_error");
+            assert!(value["error"].get("blocker").is_none());
+            assert!(value["error"].get("error_detail").is_none());
+        }
     }
 }

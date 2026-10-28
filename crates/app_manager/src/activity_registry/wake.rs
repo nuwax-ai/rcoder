@@ -13,7 +13,7 @@ use std::time::Duration;
 use chrono::Utc;
 use dashmap::DashMap;
 use tokio::sync::watch;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tracing::{debug, warn};
 
 use shared_types::{AppWakeControl, RemoteWakeState, WakeOutcome};
@@ -36,6 +36,7 @@ pub(super) const REMOTE_STATE_MAX_ENTRIES: u64 = 10_000;
 pub(super) struct RemoteState {
     pub(super) stopped: bool,
     pub(super) starting: bool,
+    missing: bool,
 }
 
 impl RemoteState {
@@ -43,22 +44,44 @@ impl RemoteState {
     pub(super) const STOPPED: Self = Self {
         stopped: true,
         starting: false,
+        missing: false,
     };
     pub(super) const STARTING: Self = Self {
         stopped: false,
         starting: true,
+        missing: false,
     };
+    const MISSING: Self = Self {
+        stopped: false,
+        starting: false,
+        missing: true,
+    };
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum WakePurpose {
+    Existing,
+    Serving,
+}
+
+fn missing_runtime(app_id: &str) -> shared_types::WakeFailure {
+    shared_types::WakeFailure::new(
+        shared_types::ERR_CONTAINER_NOT_FOUND,
+        "wake_runtime_probe",
+        format!("Physical application runtime not found: {app_id}"),
+    )
 }
 
 /// 进行中的唤醒句柄(leader 持有 `tx`,follower `subscribe` 后等结果)
 pub(super) struct WakeHandle {
     pub(super) tx: watch::Sender<Option<WakeOutcome>>,
+    pub(super) purpose: WakePurpose,
 }
 
 /// RAII 守卫:leader 路径持有。drop 时(含 panic unwind)做两件事:
-/// 1. 向 follower 广播 outcome(leader 正常 → wake_leader 的结果;panic 未写入 → `Failed` 快速通知,
-///    避免 follower 干等 dead-man 超时);
-/// 2. 从 `waking` 移除条目(防泄漏)。
+/// 1. 按句柄身份从 `waking` 移除本代条目，不影响已换代的 flight；
+/// 2. 广播并保留 outcome（正常完成或 panic 的 `Failed`），让 follower
+///    读到结果后可以重新合流，不再捡到同一个已完成的句柄。
 pub(super) struct WakeGuard {
     pub(super) map: Arc<DashMap<String, Arc<WakeHandle>>>,
     pub(super) key: String,
@@ -73,14 +96,15 @@ impl Drop for WakeGuard {
             .outcome
             .take()
             .unwrap_or_else(|| WakeOutcome::Failed(WAKE_LEADER_ABORTED.into()));
-        // A follower may have cloned the handle without subscribing yet.
-        // Retain the terminal result even when there are currently no receivers.
-        self.handle.tx.send_replace(Some(outcome));
         if let dashmap::mapref::entry::Entry::Occupied(entry) = self.map.entry(self.key.clone())
             && Arc::ptr_eq(entry.get(), &self.handle)
         {
             entry.remove();
         }
+        // Retire this exact flight before publishing its result: a serving
+        // follower may need a new flight after an observation-only failure.
+        // Retain the result for followers that have not subscribed yet.
+        self.handle.tx.send_replace(Some(outcome));
     }
 }
 
@@ -115,14 +139,12 @@ impl AppActivityRegistry {
                         .wake_failure("wake_runtime_probe");
                 failure.stage = "wake_runtime_probe".into();
                 failure
-            })?
-            .ok_or_else(|| {
-                shared_types::WakeFailure::new(
-                    shared_types::ERR_CONTAINER_NOT_FOUND,
-                    "wake_runtime_probe",
-                    format!("Physical application runtime not found: {app_id}"),
-                )
             })?;
+        let Some(status) = status else {
+            // Physical absence is a successful observation. The caller decides
+            // whether this is an observation/tool entry or serving traffic.
+            return Ok(RemoteState::MISSING);
+        };
         let state = if status.phase == "Error" {
             RemoteState::default()
         } else if status.replicas <= 0 {
@@ -180,7 +202,12 @@ impl AppActivityRegistry {
 
     /// The registry only merges callers. Durable admission, runtime identity and
     /// wake policy are checked by the lifecycle coordinator under its operation lock.
-    async fn wake_leader(&self, app_id: &str) -> WakeOutcome {
+    async fn wake_leader(
+        &self,
+        app_id: &str,
+        purpose: WakePurpose,
+        budget: Duration,
+    ) -> WakeOutcome {
         let Some(service) = self.coordinator.get().and_then(std::sync::Weak::upgrade) else {
             return WakeOutcome::Failed(shared_types::WakeFailure::new(
                 shared_types::ERR_RUNTIME_UNAVAILABLE,
@@ -188,21 +215,30 @@ impl AppActivityRegistry {
                 "Activity lifecycle coordinator is unavailable",
             ));
         };
-        match service.wake_app_on_traffic(app_id, self.wake_timeout).await {
+        let outcome = match purpose {
+            WakePurpose::Existing => service.wake_app_on_traffic(app_id, budget).await,
+            WakePurpose::Serving => service.wake_app_for_serving(app_id, budget).await,
+        };
+        match outcome {
             Ok(outcome) => outcome,
             Err(error) => WakeOutcome::Failed(error.wake_failure("wake")),
         }
     }
 
     /// Leader 路径:result cell + WakeGuard 保证退出时(含 panic)必广播 outcome 并移除 waking 条目。
-    async fn become_leader(&self, app_id: &str, handle: Arc<WakeHandle>) -> WakeOutcome {
+    async fn become_leader(
+        &self,
+        app_id: &str,
+        handle: Arc<WakeHandle>,
+        budget: Duration,
+    ) -> WakeOutcome {
         let mut guard = WakeGuard {
             map: self.waking.clone(),
             key: app_id.to_string(),
             handle: handle.clone(),
             outcome: None,
         };
-        let r = self.wake_leader(app_id).await;
+        let r = self.wake_leader(app_id, handle.purpose, budget).await;
         // 写入 outcome；guard 在函数返回/panic unwind 时 drop → 广播给 follower + 移除 waking 条目。
         guard.outcome = Some(r.clone());
         r
@@ -255,9 +291,22 @@ impl AppWakeControl for AppActivityRegistry {
         &self,
         app_id: &str,
     ) -> Result<bool, shared_types::WakeFailure> {
-        self.probe_remote_state(app_id)
-            .await
-            .map(|state| self.backfill_remote_state(app_id, state) || state.starting)
+        self.probe_remote_state(app_id).await.and_then(|state| {
+            if state.missing {
+                Err(missing_runtime(app_id))
+            } else {
+                Ok(self.backfill_remote_state(app_id, state) || state.starting)
+            }
+        })
+    }
+
+    async fn remote_serving_pending_result(
+        &self,
+        app_id: &str,
+    ) -> Result<bool, shared_types::WakeFailure> {
+        self.probe_remote_state(app_id).await.map(|state| {
+            state.missing || self.backfill_remote_state(app_id, state) || state.starting
+        })
     }
 
     async fn remote_wake_state_fresh(&self, app_id: &str) -> RemoteWakeState {
@@ -282,7 +331,7 @@ impl AppWakeControl for AppActivityRegistry {
             }
             Ok(None) => {
                 self.remote_state.invalidate(app_id);
-                RemoteWakeState::Unavailable
+                RemoteWakeState::Missing
             }
             Err(error) => {
                 self.remote_state.invalidate(app_id);
@@ -297,14 +346,21 @@ impl AppWakeControl for AppActivityRegistry {
     }
 
     async fn ensure_running(&self, app_id: &str) -> WakeOutcome {
-        self.ensure_running_inner(app_id).await
+        self.ensure_running_inner(app_id, WakePurpose::Existing)
+            .await
+    }
+
+    async fn ensure_serving(&self, app_id: &str) -> WakeOutcome {
+        self.ensure_running_inner(app_id, WakePurpose::Serving)
+            .await
     }
 }
 
 impl AppActivityRegistry {
     /// 单一入口。拍板 2026-09-23：被动流量与显式动作（pod/ensure）语义统一
     /// ——有请求即唤醒，不再有手动停档区分。
-    async fn ensure_running_inner(&self, app_id: &str) -> WakeOutcome {
+    async fn ensure_running_inner(&self, app_id: &str, purpose: WakePurpose) -> WakeOutcome {
+        let deadline = Instant::now() + self.wake_timeout;
         // 回收过渡期的请求必须等 scale0 完成,再由唤醒 single-flight scale1。
         self.wait_for_recycle_transition(app_id).await;
         // Local stop flags may outlive an operation completed by another replica.
@@ -315,27 +371,82 @@ impl AppActivityRegistry {
             // 节流），查到 stopped 会回填内存标记，继续走下方唤醒流程。
             match self.probe_remote_state(app_id).await {
                 Ok(state) => {
+                    if state.missing && purpose == WakePurpose::Existing {
+                        return WakeOutcome::Failed(missing_runtime(app_id));
+                    }
                     self.backfill_remote_state(app_id, state);
                 }
                 Err(error) => return WakeOutcome::Failed(error),
             }
         }
-        // A cached replica count is only a routing hint. Even a running workload
-        // must pass durable lifecycle admission and physical identity validation
-        // before this control entry point reports success.
-        // 只在同步作用域内持有 DashMap entry guard，禁止 shard 锁跨越 await。
-        let role = match self.waking.entry(app_id.to_string()) {
-            dashmap::mapref::entry::Entry::Occupied(e) => WakeRole::Follower(e.get().clone()),
-            dashmap::mapref::entry::Entry::Vacant(e) => {
-                let (tx, _rx) = watch::channel(None::<WakeOutcome>);
-                let handle = Arc::new(WakeHandle { tx });
-                e.insert(handle.clone());
-                WakeRole::Leader(handle)
+        let mut retried_existing_observation = false;
+        loop {
+            let budget = if purpose == WakePurpose::Serving {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return WakeOutcome::Timeout(shared_types::WakeFailure::timeout(
+                        "wake_wait",
+                        None,
+                        false,
+                    ));
+                }
+                remaining
+            } else {
+                self.wake_timeout
+            };
+            // A cached count is only a hint. The leader revalidates identity and
+            // physical state under the application operation lock. No DashMap
+            // entry guard is retained across an await.
+            let role = match self.waking.entry(app_id.to_string()) {
+                dashmap::mapref::entry::Entry::Occupied(e) => WakeRole::Follower(e.get().clone()),
+                dashmap::mapref::entry::Entry::Vacant(e) => {
+                    let (tx, _rx) = watch::channel(None::<WakeOutcome>);
+                    let handle = Arc::new(WakeHandle { tx, purpose });
+                    e.insert(handle.clone());
+                    WakeRole::Leader(handle)
+                }
+            };
+            let (followed_purpose, outcome) = match role {
+                WakeRole::Leader(handle) => {
+                    return self.become_leader(app_id, handle, budget).await;
+                }
+                WakeRole::Follower(handle) => {
+                    let followed_purpose = handle.purpose;
+                    let outcome = if purpose == WakePurpose::Serving {
+                        match timeout_at(deadline, self.join_as_follower(handle)).await {
+                            Ok(outcome) => outcome,
+                            Err(_) => WakeOutcome::Timeout(shared_types::WakeFailure::timeout(
+                                "wake_follower_wait",
+                                None,
+                                false,
+                            )),
+                        }
+                    } else {
+                        self.join_as_follower(handle).await
+                    };
+                    (followed_purpose, outcome)
+                }
+            };
+            let observation_only_missing = matches!(
+                &outcome,
+                WakeOutcome::Failed(failure)
+                    if failure.code.as_ref() == shared_types::ERR_CONTAINER_NOT_FOUND
+                        && failure.cause_code.as_ref() == shared_types::ERR_CONTAINER_NOT_FOUND
+                        && failure.operation_id.is_none()
+                        && failure.blocker.is_none()
+                        && failure.command_diagnostic.is_none()
+            );
+            if purpose != WakePurpose::Serving
+                || followed_purpose != WakePurpose::Existing
+                || retried_existing_observation
+                || !observation_only_missing
+            {
+                return outcome;
             }
-        };
-        match role {
-            WakeRole::Follower(handle) => self.join_as_follower(handle).await,
-            WakeRole::Leader(handle) => self.become_leader(app_id, handle).await,
+            // A tool/observation leader could not create a missing workload.
+            // Its flight was retired before this result was published. Rejoin
+            // once with serving authority and only the original remaining budget.
+            retried_existing_observation = true;
         }
     }
 }

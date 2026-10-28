@@ -66,9 +66,26 @@ test-e2e-k8s:
 	python3 tests-e2e/tools/run.py --group k8s $(if $(RUN_LB),--ignored,)
 
 # Real K8s userApp acceptance; explicit NodePort URLs and SSH test target required.
-.PHONY: test-e2e-k8s-userapp
-test-e2e-k8s-userapp:
-	python3 tests-e2e/tools/k8s_userapp.py --ssh "$(TEST_K8S_SSH)" --url "$(RCODER_URL)" --proxy-url "$(E2E_PINGORA_URL)"
+TEST_K8S_NAMESPACE ?= nuwax-k8s-test
+TEST_K8S_WORKLOAD_KIND ?= deployment
+TEST_K8S_DEPLOYMENT ?= nuwax-k8s-test-rcoder
+TEST_K8S_CONTEXT ?=
+TEST_K8S_KUBE_SERVER ?=
+TEST_K8S_PROXY_PORT ?= 8088
+TEST_K8S_ENVIRONMENT_ID ?=
+TEST_K8S_INTERNAL_URL ?=
+.PHONY: test-e2e-k8s-userapp test-e2e-k8s-userapp-recreate
+test-e2e-k8s-userapp test-e2e-k8s-userapp-recreate:
+	python3 tests-e2e/tools/k8s_userapp.py --ssh "$(TEST_K8S_SSH)" \
+		--scenario $(if $(filter test-e2e-k8s-userapp-recreate,$@),recreate,all) \
+		--namespace "$(TEST_K8S_NAMESPACE)" --workload-kind "$(TEST_K8S_WORKLOAD_KIND)" \
+		--deployment "$(TEST_K8S_DEPLOYMENT)" \
+		--proxy-port "$(TEST_K8S_PROXY_PORT)" \
+		$(if $(TEST_K8S_CONTEXT),--context "$(TEST_K8S_CONTEXT)") \
+		$(if $(TEST_K8S_KUBE_SERVER),--kube-server "$(TEST_K8S_KUBE_SERVER)") \
+		$(if $(TEST_K8S_ENVIRONMENT_ID),--environment-id "$(TEST_K8S_ENVIRONMENT_ID)") \
+		$(if $(TEST_K8S_INTERNAL_URL),--internal-url "$(TEST_K8S_INTERNAL_URL)") \
+		--url "$(RCODER_URL)" --proxy-url "$(E2E_PINGORA_URL)"
 
 # deploy-host 宿主机 Published 形态严格 E2E（前置：make dev-host-published 已运行）
 .PHONY: test-e2e-host

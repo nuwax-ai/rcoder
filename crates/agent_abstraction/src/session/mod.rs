@@ -21,5 +21,6 @@ mod worker;
 pub use acp_worker::AcpAgentWorker;
 pub use execution_transition::{ExecutionTransitionGuard, lock_execution_transition};
 pub use session_file_scanner::check_session_file_exists;
+pub(crate) use session_manager::require_session_identity;
 pub use session_manager::{AcpSessionManager, SessionCreationConfig};
 pub use worker::{AgentWorker, SessionHandles, WorkerRequest, WorkerResponse};

@@ -204,6 +204,217 @@ async fn userapp_builder_find_observes_actual_retained_exit_without_waking_it() 
 }
 
 #[tokio::test]
+async fn builder_compute_absence_requires_two_404s_and_empty_label_list_despite_caches() {
+    let f = fixture(
+        ServiceType::UserappBuilder,
+        vec![
+            (404, json!({"message": "not found"})),
+            (200, json!([])),
+            (404, json!({"message": "not found"})),
+        ],
+    )
+    .await;
+    assert!(f.runtime.builder_compute_absent(&context()).await.unwrap());
+    let requests = f.requests.lock().unwrap().clone();
+    assert_eq!(
+        requests.len(),
+        3,
+        "absence requires both direct inspections and the complete label-filtered list"
+    );
+    assert!(requests[0].contains(&format!("/containers/rcoder-app-builder-{APP}/json")));
+    assert_builder_presence_list_query(&requests[1]);
+    assert!(requests[2].contains(&format!("/containers/rcoder-app-builder-{APP}/json")));
+    assert_eq!(
+        f.manager.containers.get(APP).await.unwrap().container_id,
+        OLD_ID
+    );
+}
+
+fn assert_builder_presence_list_query(request: &str) {
+    let target = request.split_whitespace().nth(1).unwrap();
+    let url = reqwest::Url::parse(&format!("http://docker{target}")).unwrap();
+    assert!(url.path().ends_with("/containers/json"));
+    let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(query.get("all").map(String::as_str), Some("true"));
+    let filters: HashMap<String, Vec<String>> =
+        serde_json::from_str(query.get("filters").unwrap()).unwrap();
+    let labels = filters.get("label").unwrap();
+    assert_eq!(labels.len(), 2);
+    assert!(labels.contains(&format!(
+        "service-type={}",
+        ServiceType::UserappBuilder.container_family_key()
+    )));
+    assert!(labels.contains(&format!("identifier={APP}")));
+}
+
+#[tokio::test]
+async fn builder_compute_absence_retains_renamed_same_app_containers_in_every_state() {
+    for state in [
+        "running",
+        "exited",
+        "paused",
+        "restarting",
+        "dead",
+        "removing",
+    ] {
+        let f = fixture(
+            ServiceType::UserappBuilder,
+            vec![
+                (404, json!({"message": "not found"})),
+                (
+                    200,
+                    json!([{
+                        "Id": OLD_ID,
+                        "Names": [format!("/retained-renamed-{APP}")],
+                        "State": state,
+                        "Labels": {
+                            "service-type": ServiceType::UserappBuilder.container_family_key(),
+                            "identifier": APP
+                        }
+                    }]),
+                ),
+            ],
+        )
+        .await;
+        assert!(
+            !f.runtime.builder_compute_absent(&context()).await.unwrap(),
+            "{state}: a renamed physical builder is not absent"
+        );
+        let requests = f.requests.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            2,
+            "a residual must prevent absence immediately"
+        );
+        assert_builder_presence_list_query(&requests[1]);
+    }
+}
+
+#[tokio::test]
+async fn builder_compute_absence_propagates_label_list_errors() {
+    for status in [403, 500] {
+        let f = fixture(
+            ServiceType::UserappBuilder,
+            vec![
+                (404, json!({"message": "not found"})),
+                (status, json!({"message": "list failed"})),
+            ],
+        )
+        .await;
+        let result = f.runtime.builder_compute_absent(&context()).await;
+        assert!(matches!(result, Err(ContainerRuntimeError::DockerError(_))));
+        let requests = f.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        assert_builder_presence_list_query(&requests[1]);
+    }
+}
+
+#[tokio::test]
+async fn builder_compute_absence_rechecks_canonical_name_after_empty_list() {
+    let f = fixture(
+        ServiceType::UserappBuilder,
+        vec![
+            (404, json!({"message": "not found"})),
+            (200, json!([])),
+            (200, inspect(&"b".repeat(64), "running")),
+        ],
+    )
+    .await;
+    assert!(!f.runtime.builder_compute_absent(&context()).await.unwrap());
+    let requests = f.requests.lock().unwrap().clone();
+    assert_eq!(
+        requests.len(),
+        3,
+        "no new CID IP lookup or compute mutation"
+    );
+    assert_builder_presence_list_query(&requests[1]);
+    assert!(requests[2].contains(&format!("/containers/rcoder-app-builder-{APP}/json")));
+}
+
+#[tokio::test]
+async fn builder_compute_absence_propagates_canonical_recheck_error() {
+    let f = fixture(
+        ServiceType::UserappBuilder,
+        vec![
+            (404, json!({"message": "not found"})),
+            (200, json!([])),
+            (500, json!({"message": "recheck failed"})),
+        ],
+    )
+    .await;
+    let result = f.runtime.builder_compute_absent(&context()).await;
+    assert!(matches!(result, Err(ContainerRuntimeError::DockerError(_))));
+    assert_eq!(f.requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn builder_compute_absence_keeps_every_existing_object_without_network_lookup() {
+    let mut cases: Vec<_> = [
+        "created",
+        "running",
+        "paused",
+        "restarting",
+        "exited",
+        "removing",
+        "dead",
+    ]
+    .into_iter()
+    .map(|status| (status, inspect(OLD_ID, status)))
+    .collect();
+    let mut dead_flag = inspect(OLD_ID, "exited");
+    dead_flag["State"]["Dead"] = true.into();
+    cases.push(("dead-flag", dead_flag));
+    // Existence is conservative: missing ownership or network metadata does not
+    // turn a present object into evidence that compute is physically absent.
+    cases.push(("missing-metadata", json!({})));
+    for (case, response) in cases {
+        let f = fixture(ServiceType::UserappBuilder, vec![(200, response)]).await;
+        assert!(
+            !f.runtime.builder_compute_absent(&context()).await.unwrap(),
+            "{case}: an existing object must retain the recovery fence"
+        );
+        let requests = f.requests.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            1,
+            "{case}: no IP enrichment or control writes"
+        );
+        assert!(requests[0].starts_with("GET "));
+        assert!(requests[0].contains(&format!("/containers/rcoder-app-builder-{APP}/json")));
+    }
+}
+
+#[tokio::test]
+async fn builder_compute_absence_preserves_real_http_observation_errors() {
+    for status in [403, 500] {
+        let f = fixture(
+            ServiceType::UserappBuilder,
+            vec![(status, json!({"message": "observation failed"}))],
+        )
+        .await;
+        let result = f.runtime.builder_compute_absent(&context()).await;
+        assert!(
+            matches!(result, Err(ContainerRuntimeError::DockerError(_))),
+            "HTTP{status} must not become absence or cached presence: {result:?}"
+        );
+        assert_eq!(f.requests.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn builder_compute_absence_rejects_invalid_context_before_http() {
+    let f = fixture(ServiceType::UserappBuilder, vec![]).await;
+    let mut invalid = context();
+    invalid.operation_id.clear();
+    let result = f.runtime.builder_compute_absent(&invalid).await;
+    assert!(matches!(
+        result,
+        Err(ContainerRuntimeError::ConfigurationError(_))
+    ));
+    assert!(f.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn userapp_builder_find_returns_current_physical_instance_not_actor_cached_id() {
     let current = inspect("current-builder-id", "running");
     let f = fixture(
@@ -289,4 +500,28 @@ async fn other_agent_families_keep_the_existing_cached_find_path() {
     assert_eq!(observed.container_id, OLD_ID);
     assert_eq!(observed.container_ip, "192.0.2.10");
     assert!(f.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn docker_diagnostic_evidence_uses_actual_cid_and_library_time() {
+    let mut inspect: bollard::models::ContainerInspectResponse = serde_json::from_value(json!({
+        "Id":"actual-cid", "State":{"Running":false,"FinishedAt":"2026-10-22T14:00:00.123456789Z"}
+    }))
+    .unwrap();
+    let e = docker_diagnostic_evidence(&inspect).unwrap();
+    assert_eq!(e.physical_id, "actual-cid");
+    assert!(e.current_termination);
+    assert_eq!(
+        e.termination_finished_at.unwrap().timestamp_subsec_nanos(),
+        123456789
+    );
+    inspect.state.as_mut().unwrap().finished_at = Some("not-a-time".into());
+    assert!(
+        docker_diagnostic_evidence(&inspect)
+            .unwrap()
+            .termination_finished_at
+            .is_none()
+    );
+    inspect.id = None;
+    assert!(docker_diagnostic_evidence(&inspect).is_none());
 }

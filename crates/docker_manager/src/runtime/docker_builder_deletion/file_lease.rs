@@ -38,6 +38,7 @@ pub(super) fn prepare_builder_file(
         .map_err(|e| Error::Conflict(format!("builder operation requires recovery: {e}")))?;
     Ok(BuilderFileLease {
         file,
+        path: root.join(name),
         marker,
         unlocked: false,
         service_type: ServiceType::UserappBuilder,
@@ -277,6 +278,7 @@ impl Drop for UnclaimedBuilderLease {
 pub(super) struct BuilderFileLease {
     pub(super) service_type: ServiceType,
     pub(super) file: std::fs::File,
+    path: std::path::PathBuf,
     marker: shared_types::AppFileMutationMarker,
     unlocked: bool,
 }
@@ -315,6 +317,37 @@ impl shared_types::AppOperationLease for BuilderFileLease {
         }
     }
 
+    async fn validate_retained(&self) -> std::result::Result<bool, String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+            if self.unlocked {
+                return Ok(false);
+            }
+            let opened = self.file.metadata().map_err(|error| error.to_string())?;
+            let current =
+                std::fs::symlink_metadata(&self.path).map_err(|error| error.to_string())?;
+            if !current.is_file() || current.dev() != opened.dev() || current.ino() != opened.ino()
+            {
+                return Ok(false);
+            }
+            // This is the already retained fd, not a second open description.
+            // A WouldBlock here is a real failure and never becomes success.
+            self.file.try_lock().map_err(|error| error.to_string())?;
+            let token = self.marker.operation_id().as_bytes();
+            let mut bytes = vec![0; token.len() + 1];
+            let count = self
+                .file
+                .read_at(&mut bytes, 0)
+                .map_err(|error| error.to_string())?;
+            Ok(&bytes[..count] == token)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(false)
+        }
+    }
+
     async fn release(mut self: Box<Self>) -> std::result::Result<(), String> {
         self.marker
             .complete(&self.file)
@@ -325,4 +358,57 @@ impl shared_types::AppOperationLease for BuilderFileLease {
         self.unlocked = true;
         Ok(())
     }
+}
+
+#[cfg(unix)]
+pub(super) fn resume_original_builder_file(
+    path: &std::path::Path,
+    receipt: &shared_types::UserAppOperationLeaseReceipt,
+    executor_id: &str,
+) -> Result<BuilderFileLease> {
+    use std::os::unix::fs::FileExt as _;
+    let shared_types::UserAppOperationLeaseReceipt::Docker {
+        service_type,
+        token,
+        ..
+    } = receipt
+    else {
+        return Err(Error::Conflict(
+            "Original compute receipt is not Docker".into(),
+        ));
+    };
+    if token != executor_id {
+        return Err(Error::Conflict(
+            "Original compute executor token differs".into(),
+        ));
+    }
+    let file = open_inactive_file_receipt(path, receipt)?;
+    let mut owner = vec![0; token.len() + 1];
+    let count = file
+        .read_at(&mut owner, 0)
+        .map_err(|error| Error::DockerError(error.to_string()))?;
+    if &owner[..count] != token.as_bytes() {
+        return Err(Error::Conflict(
+            "Original compute marker is not retained".into(),
+        ));
+    }
+    Ok(BuilderFileLease {
+        file,
+        path: path.to_owned(),
+        marker: shared_types::AppFileMutationMarker::for_operation(executor_id)
+            .map_err(|error| Error::ConfigurationError(error.to_string()))?,
+        service_type: *service_type,
+        unlocked: false,
+    })
+}
+
+#[cfg(not(unix))]
+pub(super) fn resume_original_builder_file(
+    _: &std::path::Path,
+    _: &shared_types::UserAppOperationLeaseReceipt,
+    _: &str,
+) -> Result<BuilderFileLease> {
+    Err(Error::ConfigurationError(
+        "Retained file guards require Unix".into(),
+    ))
 }

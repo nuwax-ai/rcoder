@@ -7,7 +7,8 @@
 //! - `exec` 前缀让 child.pid == vite/next 本体 pid (非 sh wrapper)
 //! - `process_group(0)` 新进程组, kill 时 `kill(-pid)` 杀整组
 //! - env 最小化 (PATH + HOME + NODE_ENV=development + extra), env_clear 后显式赋值
-//! - detached: 丢弃 Child 句柄 (kill_on_drop=false), 进程独立存活, 靠 pid 杀
+//! - preview spawn retains its owned process tree; manifest spawn hands its
+//!   one-shot Child to the existing supervised owner-handover observer.
 
 use std::path::Path;
 use std::time::Duration;
@@ -20,6 +21,8 @@ use crate::error::{AppError, AppResult};
 
 mod log_pipe;
 mod signal;
+mod stop_observation;
+pub(crate) use stop_observation::{TerminationObservation, stop_exit_observed};
 
 pub use signal::*;
 
@@ -185,6 +188,11 @@ pub fn spawn_override_shell(
     full_command: &str,
     cwd: &Path,
 ) -> AppResult<(Child, Option<ChildStdout>, Option<ChildStderr>)> {
+    let cmd = override_shell_command(full_command, cwd);
+    spawn_plain_command(cmd, "override dev server", cwd)
+}
+
+fn override_shell_command(full_command: &str, cwd: &Path) -> Command {
     // N08：不再硬编码 sh——Unix sh -c / Windows cmd /C（运维 override 命令
     // 按目标平台 shell 语法书写；Windows 无 sh）
     #[cfg(unix)]
@@ -207,18 +215,11 @@ pub fn spawn_override_shell(
     cmd.stderr(std::process::Stdio::piped());
     #[cfg(unix)]
     cmd.process_group(0);
-    let mut child = cmd.spawn().map_err(|e| {
-        AppError::system(format!(
-            "spawn override dev server failed (cwd={}): {e}",
-            cwd.display()
-        ))
-    })?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    Ok((child, stdout, stderr))
+    cmd
 }
 
-/// spawn detached dev server (arg 数组, 无 shell; 进程组 + 丢弃 Child 句柄)。
+/// Spawn a plain Child for the one-shot manifest launcher. The caller retains
+/// it in SupervisedChild; preview servers use spawn_managed_dev instead.
 /// 返回 (child, stdout, stderr); 调用方负责取走 stdout/stderr 起日志管道。
 pub fn spawn_dev(
     program: &str,
@@ -226,7 +227,20 @@ pub fn spawn_dev(
     cwd: &Path,
     env_extra: &[(String, String)],
 ) -> AppResult<(Child, Option<ChildStdout>, Option<ChildStderr>)> {
-    let mut cmd = Command::new(program);
+    spawn_plain_command(
+        dev_command(program, args, cwd, env_extra),
+        "dev server",
+        cwd,
+    )
+}
+
+fn dev_command(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    env_extra: &[(String, String)],
+) -> Command {
+    let mut cmd = Command::new(process_utils::resolve_spawn_program(program));
     cmd.args(args);
     cmd.current_dir(cwd);
     cmd.env_clear();
@@ -237,14 +251,60 @@ pub fn spawn_dev(
     // 新进程组 (unix): child.pid == pgid, 后续 kill(-pid) 杀整组 (含 vite 子进程)
     #[cfg(unix)]
     cmd.process_group(0);
-    let mut child = cmd.spawn().map_err(|e| {
+    cmd
+}
+
+fn spawn_plain_command(
+    mut cmd: Command,
+    stage: &str,
+    cwd: &Path,
+) -> AppResult<(Child, Option<ChildStdout>, Option<ChildStderr>)> {
+    let mut child = cmd.spawn().map_err(|error| {
         AppError::system(format!(
-            "spawn dev server failed (program={program}, cwd={}): {e}",
+            "spawn {stage} failed (cwd={}): {error}",
             cwd.display()
         ))
     })?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    Ok((child, stdout, stderr))
+}
+
+pub(super) fn spawn_managed_dev(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    env_extra: &[(String, String)],
+) -> AppResult<(
+    process_utils::managed_tree::ManagedChild,
+    Option<ChildStdout>,
+    Option<ChildStderr>,
+)> {
+    spawn_managed_command(dev_command(program, args, cwd, env_extra))
+}
+
+pub(super) fn spawn_managed_override_shell(
+    command: &str,
+    cwd: &Path,
+) -> AppResult<(
+    process_utils::managed_tree::ManagedChild,
+    Option<ChildStdout>,
+    Option<ChildStderr>,
+)> {
+    spawn_managed_command(override_shell_command(command, cwd))
+}
+
+fn spawn_managed_command(
+    command: Command,
+) -> AppResult<(
+    process_utils::managed_tree::ManagedChild,
+    Option<ChildStdout>,
+    Option<ChildStderr>,
+)> {
+    let mut child = process_utils::managed_tree::spawn_managed(command)
+        .map_err(|error| AppError::process(format!("spawn managed dev server: {error:#}")))?;
+    let stdout = child.take_stdout();
+    let stderr = child.take_stderr();
     Ok((child, stdout, stderr))
 }
 
@@ -288,7 +348,7 @@ pub async fn run_command_to_log(
     timeout_secs: u64,
     observers: CommandObservers<'_>,
 ) -> AppResult<()> {
-    let mut cmd = Command::new(program);
+    let mut cmd = Command::new(process_utils::resolve_spawn_program(program));
     cmd.args(args);
     cmd.current_dir(cwd);
     // 一次性 Node 命令继承 PATH/HOME，仅删会改变依赖/脚本行为的环境变量。
@@ -567,21 +627,34 @@ pub async fn wait_for_stop(pid: u32, interval_ms: u64, max_attempts: u32) {
 
 /// 系统级扫描某 project_id 的所有相关 pid (对齐 nuwax findPidsByProjectId)。
 /// `ps -Ao pid,command -ww` → 只匹配 `/{projectId}` 路径片段。
-/// N08：Unix 工具——Windows 无 ps，spawn 失败走空兜底（调用方内存 Map 兜底，
-/// 不假装扫到）。
+/// The scan is an observation, so unavailable/non-successful ps is an error,
+/// not proof that the project has no process. Windows needs the existing
+/// managed-tree ownership path rather than a fabricated empty scan.
 /// 不使用 nuwax 的宽松回退：本地调用时 curl/shell 命令行也含有
 /// `projectId=...`，宽松匹配会把请求发起进程误当成 Vite 并终止。
-/// ps 不存在/失败返回空 (调用方仍可用内存 Map 的 pid 兜底)。
-pub async fn find_pids_by_project_id(project_id: &str) -> Vec<u32> {
+pub async fn find_pids_by_project_id(project_id: &str) -> AppResult<Vec<u32>> {
     let out = Command::new("ps")
         .arg("-Ao")
         .arg("pid,command")
         .arg("-ww")
         .output()
         .await;
-    let Ok(out) = out else {
-        return Vec::new();
-    };
+    let out = out.map_err(|error| {
+        AppError::system(format!("observe project process candidates: {error}"))
+    })?;
+    project_pids_from_observation(project_id, &out)
+}
+
+fn project_pids_from_observation(
+    project_id: &str,
+    out: &std::process::Output,
+) -> AppResult<Vec<u32>> {
+    if !out.status.success() {
+        return Err(AppError::system(format!(
+            "project process observation failed: {}",
+            out.status
+        )));
+    }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut pids: Vec<u32> = Vec::new();
     // 精确匹配
@@ -594,7 +667,7 @@ pub async fn find_pids_by_project_id(project_id: &str) -> Vec<u32> {
     }
     pids.sort_unstable();
     pids.dedup();
-    pids
+    Ok(pids)
 }
 
 /// 匹配命令行中的完整项目路径段，避免项目 `abc` 误命中 `abc2`。
@@ -800,6 +873,8 @@ mod tests {
 
     /// 失败错误必须携带真实报错现场：退出码 + 本次运行输出尾部（stdout/stderr
     /// 均管道写入 temp_log）——"command exited non-zero" 笼统错误无法排障。
+    /// fixture 经 `sh -c` 执行 shell 重定向/退出码语义，Windows 无 `sh`。
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_command_to_log_error_carries_output_tail() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -880,5 +955,21 @@ mod tests {
             .await
             .expect("read temp");
         assert!(temp.contains("ok-line"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod stop_scan_regression {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn failed_process_listing_is_not_an_empty_project() {
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"observer failure".to_vec(),
+        };
+        assert!(project_pids_from_observation("project", &output).is_err());
     }
 }

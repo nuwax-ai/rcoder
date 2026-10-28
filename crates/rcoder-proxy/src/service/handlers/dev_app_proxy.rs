@@ -110,11 +110,8 @@ pub async fn handle_dev_app_upstream(
     );
 
     // 与 prod app 代理同款 peer（长连接，支持 WebSocket / HMR；idle 1 小时）
-    let mut peer = HttpPeer::new(
-        super::super::upstream::dial_peer(&dev_container_ip, shared_types::APP_ENTRY_PORT)?,
-        false,
-        "".to_string(),
-    );
+    let mut peer =
+        super::super::upstream::dial_peer(&dev_container_ip, shared_types::APP_ENTRY_PORT).await?;
     super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
 
     Ok(Box::new(peer))

@@ -128,7 +128,7 @@ pub(super) async fn preflight_hot_reload_compat(
 ) -> anyhow::Result<crate::supervisor::PreparedProxy> {
     let release = crate::manifest::read_release_lock(&args.workspace)
         .context("read release lock for hot-reload preflight")?;
-    let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+    let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir)?;
     let outcome = crate::proxy::compiler::compile_and_validate(
         &args.workspace,
         &runtime_root,
@@ -151,6 +151,23 @@ async fn prepare_source_control(
     state: &ServerState,
     signal: &ControlSignal,
 ) -> anyhow::Result<Option<crate::supervisor::PreparedProxy>> {
+    if let ControlSignal::RecoverArtifact {
+        workspace,
+        release_id,
+        ..
+    } = signal
+    {
+        let mut restored = owner_args.clone();
+        restored.workspace = workspace.clone();
+        let release = crate::manifest::read_release_lock(workspace)?;
+        anyhow::ensure!(
+            &release.release_id == release_id,
+            "Retained artifact identity changed before startup"
+        );
+        return preflight_hot_reload_compat(&restored, false, state.log_layout().into())
+            .await
+            .map(Some);
+    }
     let ControlSignal::OrchestrateSource { dev_profile, .. } = signal else {
         return Ok(None);
     };
@@ -167,7 +184,7 @@ async fn settle_configuration_before_stop(
     signal: &ControlSignal,
 ) -> anyhow::Result<Option<tokio::time::Instant>> {
     match signal {
-        ControlSignal::OrchestrateSource { .. } => Ok(None),
+        ControlSignal::OrchestrateSource { .. } | ControlSignal::RecoverArtifact { .. } => Ok(None),
         ControlSignal::StopBusiness { .. } => {
             let deadline = tokio::time::Instant::now() + crate::proxy::admin_probe::CONFIRM_BUDGET;
             state.cancel_auxiliary_writes()?;
@@ -197,6 +214,7 @@ fn confirmed_business_stop(action: InitialAction) -> InitialAction {
 fn control_operation_id(signal: &ControlSignal) -> &str {
     match signal {
         ControlSignal::OrchestrateSource { operation_id, .. }
+        | ControlSignal::RecoverArtifact { operation_id, .. }
         | ControlSignal::StopBusiness { operation_id } => operation_id,
     }
 }
@@ -204,6 +222,7 @@ fn control_operation_id(signal: &ControlSignal) -> &str {
 async fn reject_live_control(state: &ServerState, signal: &ControlSignal, error: &anyhow::Error) {
     let operation_id = match signal {
         ControlSignal::OrchestrateSource { operation_id, .. }
+        | ControlSignal::RecoverArtifact { operation_id, .. }
         | ControlSignal::StopBusiness { operation_id } => operation_id,
     };
     let unknown = error
@@ -272,7 +291,8 @@ async fn reject_live_deployment(
 
 async fn claim_live_source_control(state: &ServerState, signal: &ControlSignal) -> bool {
     match signal {
-        ControlSignal::OrchestrateSource { operation_id, .. } => {
+        ControlSignal::OrchestrateSource { operation_id, .. }
+        | ControlSignal::RecoverArtifact { operation_id, .. } => {
             !state.settle_cancelled_before_execution(operation_id).await
                 && !signal_operation_already_settled(state, operation_id).await
         }
@@ -301,11 +321,8 @@ async fn source_cancelled_after_preflight(state: &ServerState, signal: &ControlS
 fn restore_running_predecessor(state: &ServerState, ready: bool) {
     let protected = state.runtime_recovery_hold_active()
         || state
-            .deploy_status()
-            .operation
-            .as_ref()
-            .and_then(|operation| operation.recovery.as_ref())
-            .is_some_and(|recovery| recovery.status == "pending");
+            .shutdown_unconfirmed
+            .load(std::sync::atomic::Ordering::Acquire);
     if !protected && !state.is_cancelled() {
         state.set_phase(ServerPhase::Running);
         state.ready.set_ready(ready);
@@ -320,6 +337,9 @@ async fn settled_prepared_control(
     let action = settle_control_signal_inner(state, signal, true).await;
     match (action, prepared) {
         (InitialAction::Source, Some(proxy)) => InitialAction::SourcePrepared(proxy),
+        (InitialAction::Existing { workspace }, Some(proxy)) if workspace == proxy.workspace => {
+            InitialAction::ExistingPrepared(proxy)
+        }
         (action, _) => action,
     }
 }
@@ -373,6 +393,47 @@ async fn settle_control_signal_inner(
             state.set_pending_run_config(pg);
             InitialAction::Source
         }
+        ControlSignal::RecoverArtifact {
+            operation_id,
+            workspace,
+            release_id,
+            pg,
+        } => {
+            if state.settle_cancelled_before_execution(&operation_id).await
+                || signal_operation_already_settled(state, &operation_id).await
+            {
+                return InitialAction::Settled;
+            }
+            state.set_current_runtime_operation(Some(operation_id.clone()));
+            let request = DeployRequest {
+                runtime_operation_id: Some(operation_id.clone()),
+                url: "retained://workspace".into(),
+                release_id: release_id.clone(),
+                sha256: None,
+                local_path: None,
+                execution_target: None,
+                run_pg: pg.clone(),
+            };
+            if let Err(error) = state.record_runtime_deployment(&request) {
+                hold_unconfirmed(
+                    state,
+                    format!("persist retained artifact recovery: {error:#}"),
+                )
+                .await;
+                return InitialAction::Settled;
+            }
+            if let Err(error) = state.record_prepared_artifact(release_id) {
+                hold_unconfirmed(
+                    state,
+                    format!("record retained artifact identity: {error:#}"),
+                )
+                .await;
+                return InitialAction::Settled;
+            }
+            state.set_pending_dev_profile(false);
+            state.set_pending_run_config(pg);
+            InitialAction::Existing { workspace }
+        }
         ControlSignal::StopBusiness { operation_id } => {
             InitialAction::StopBusiness { operation_id }
         }
@@ -402,6 +463,7 @@ pub(super) async fn record_uncertain_control(
 ) {
     let operation_id = match signal {
         ControlSignal::OrchestrateSource { operation_id, .. }
+        | ControlSignal::RecoverArtifact { operation_id, .. }
         | ControlSignal::StopBusiness { operation_id } => operation_id,
     };
     // A successfully running predecessor has already cleared current_runtime_operation.
@@ -581,7 +643,7 @@ async fn prepare_artifact_proxy(
     host: crate::startup_probe::StartupHost,
 ) -> anyhow::Result<crate::supervisor::PreparedProxy> {
     let release = crate::manifest::read_release_lock(read_workspace)?;
-    let root = crate::proxy::compiler::runtime_root(&owner_args.log_dir);
+    let root = crate::proxy::compiler::runtime_root(&owner_args.log_dir)?;
     let outcome = crate::proxy::compiler::compile_prepared(
         read_workspace,
         execution_workspace,
@@ -951,7 +1013,7 @@ pub(super) async fn server_loop(
     foreground: bool,
 ) -> Result<()> {
     // P1：所有业务停止路径统一先发布 standby 摘流（runtime_root 固定）。
-    let standby_root = crate::proxy::compiler::runtime_root(&owner_args.log_dir);
+    let standby_root = crate::proxy::compiler::runtime_root(&owner_args.log_dir)?;
     if let Some(host) = host.as_ref() {
         host.prepare_entry_baseline(&standby_root).await?;
     }
@@ -1009,6 +1071,7 @@ pub(super) async fn server_loop(
                                 ControlSignal::OrchestrateSource { operation_id, dev_profile, pg },
                             ).await)
                         }
+                        Some(signal @ ControlSignal::RecoverArtifact { .. }) => Some(settle_control_signal(state, signal).await),
                         Some(ControlSignal::StopBusiness { operation_id }) => {
                             Some(InitialAction::StopBusiness { operation_id })
                         }
@@ -1390,7 +1453,28 @@ pub(super) async fn server_loop(
             };
             drop(startup_control);
             if let Some(signal) = startup_signal {
-                if let Err(error) = host.stop_all(Some(&standby_root)).await {
+                let stopped = async {
+                    match &signal {
+                        ControlSignal::StopBusiness { operation_id } => {
+                            let deadline = settle_configuration_before_stop(state, &signal)
+                                .await?
+                                .context("startup Stop did not provide its cleanup deadline")?;
+                            host.drain_entry_for_operation_until(
+                                &standby_root,
+                                deadline,
+                                Some(operation_id.clone()),
+                            )
+                            .await?;
+                            host.stop_business().await
+                        }
+                        ControlSignal::OrchestrateSource { .. }
+                        | ControlSignal::RecoverArtifact { .. } => {
+                            host.stop_all(Some(&standby_root)).await
+                        }
+                    }
+                }
+                .await;
+                if let Err(error) = stopped {
                     record_uncertain_control(state, &signal, &format!("startup stop: {error:#}"))
                         .await;
                     hold_unconfirmed(state, format!("startup stop: {error:#}")).await;
@@ -1414,7 +1498,14 @@ pub(super) async fn server_loop(
                     .err()
                     .map(|error| format!("startup interrupted: {error:#}"))
                     .unwrap_or_else(|| "startup interrupted by runtime control".into());
-                pending = Some(settle_stopped_startup(args, state, signal, reason).await);
+                // This live startup driver joined its original orchestration,
+                // settled admitted writers, drained the entry and confirmed
+                // business cleanup. Retain that fresh proof for this Stop only;
+                // its outer loop still performs static teardown and commits the
+                // original Stop's own terminal record.
+                pending = Some(confirmed_business_stop(
+                    settle_stopped_startup(args, state, signal, reason).await,
+                ));
                 continue;
             }
             if state.is_cancelled() {
@@ -1798,7 +1889,14 @@ mod lifecycle_tests {
             return;
         };
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        std::fs::write(path, listener.local_addr().unwrap().to_string()).unwrap();
+        let path = std::path::PathBuf::from(path);
+        // Publish the complete address at once: write() creates the marker
+        // before its bytes are visible to the parent's readiness reader.
+        let mut marker = tempfile::NamedTempFile::new_in(path.parent().unwrap()).unwrap();
+        marker
+            .write_all(listener.local_addr().unwrap().to_string().as_bytes())
+            .unwrap();
+        marker.persist(path).unwrap();
         for stream in listener.incoming() {
             let mut stream = stream.unwrap();
             let mut request = [0; 4096];
@@ -1884,7 +1982,7 @@ mod lifecycle_tests {
         std::fs::write(source.join("proxy.toml"), "[servers.entry\n").unwrap();
         std::fs::write(current.join("proxy.toml"), config(19081)).unwrap();
         let log_dir = root.path().join("logs");
-        let runtime_root = crate::proxy::compiler::runtime_root(&log_dir);
+        let runtime_root = crate::proxy::compiler::runtime_root(&log_dir).unwrap();
         let active = crate::proxy::compiler::active_config_path(&runtime_root);
         std::fs::create_dir_all(active.parent().unwrap()).unwrap();
         std::fs::write(&active, config(19081)).unwrap();
@@ -2035,5 +2133,80 @@ mod lifecycle_tests {
         let _ = task.await;
         business.kill().await.unwrap();
         business.wait().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod predecessor_restoration_tests {
+    use super::*;
+
+    fn predecessor() -> ServerState {
+        let state = ServerState::new(RuntimeStatusService::default());
+        state
+            .try_accept_deploy_with_id(
+                DeployRequest {
+                    runtime_operation_id: None,
+                    url: "https://example.invalid/previous.zip".into(),
+                    release_id: "previous-request".into(),
+                    sha256: None,
+                    local_path: None,
+                    execution_target: None,
+                    run_pg: None,
+                },
+                "previous-operation".into(),
+            )
+            .unwrap();
+        state.begin_failure("retained previous startup diagnostic".into(), false);
+        state
+            .deploy_status
+            .write()
+            .unwrap()
+            .operation
+            .as_mut()
+            .unwrap()
+            .recovery = Some(shared_types::AppDeploymentRecovery {
+            status: "pending".into(),
+            error: Some("old diagnostic, not current execution".into()),
+            database_migrations_reversed: false,
+        });
+        state.set_phase(ServerPhase::Orchestrating);
+        state
+    }
+
+    #[test]
+    fn old_recovery_diagnostic_does_not_hide_a_healthy_predecessor() {
+        let state = predecessor();
+        let original = serde_json::to_value(state.deploy_status().operation).unwrap();
+        restore_running_predecessor(&state, true);
+        assert!(matches!(state.phase(), ServerPhase::Running));
+        assert!(state.ready.is_ready());
+        assert!(state.readiness_ok());
+        assert_eq!(
+            serde_json::to_value(state.deploy_status().operation).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn current_hold_shutdown_and_cancel_still_protect_the_predecessor() {
+        for protected in ["outcome-hold", "shutdown-unconfirmed", "cancelled"] {
+            let state = predecessor();
+            match protected {
+                "outcome-hold" => state.begin_runtime_recovery_hold(),
+                "shutdown-unconfirmed" => {
+                    state.begin_failure("current shutdown is unconfirmed".into(), true);
+                }
+                "cancelled" => state.trigger_cancel(),
+                _ => unreachable!("fixture variant"),
+            }
+            let original = serde_json::to_value(state.deploy_status().operation).unwrap();
+            restore_running_predecessor(&state, true);
+            assert!(matches!(state.phase(), ServerPhase::Orchestrating));
+            assert!(!state.ready.is_ready());
+            assert_eq!(
+                serde_json::to_value(state.deploy_status().operation).unwrap(),
+                original
+            );
+        }
     }
 }

@@ -33,7 +33,45 @@ pub use locale::get_locale_from_headers;
 pub use rcoder_engine::utils::{
     container_identity_from_name, extract_grpc_addr, extract_grpc_addr_with_port,
 };
+pub(crate) use workload_reuse::{admission_unconfirmed_app_error, refresh_workload_fence};
 
 // 内部使用：路径验证（通过路径函数自动调用，无需外部直接使用）
 #[allow(unused_imports)]
 pub use rcoder_engine::utils::{PathValidationError, is_known_identifier, validate_identifier};
+
+/// Keep the existing shutdown flight gate with an accepted task after its HTTP
+/// caller disconnects. The shared counter covers ordinary Agent writes too.
+pub(crate) fn owned_operation_flight(
+    state: &crate::app_state::AppState,
+) -> Result<shared_types::FlightGuard, crate::AppError> {
+    state.userapp_op_flight.guard().map_err(|_| {
+        crate::AppError::with_message(
+            shared_types::error_codes::ERR_SERVICE_UNAVAILABLE,
+            "Service is shutting down",
+        )
+    })
+}
+
+/// Detach the accepted operation's lifetime without losing request context.
+/// Tokio spawn does not inherit task-locals or the currently entered span.
+pub(crate) fn spawn_owned_operation<T>(
+    flight: shared_types::FlightGuard,
+    operation: impl Future<Output = T> + Send + 'static,
+) -> tokio::task::JoinHandle<T>
+where
+    T: Send + 'static,
+{
+    use tracing::Instrument as _;
+    let locale = shared_types::current_request_locale();
+    tokio::spawn(
+        async move {
+            let _flight = flight;
+            shared_types::scope_request_locale(locale, operation).await
+        }
+        .in_current_span(),
+    )
+}
+
+#[cfg(test)]
+mod owned_operation_tests;
+mod workload_reuse;

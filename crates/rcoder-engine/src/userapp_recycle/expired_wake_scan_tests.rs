@@ -301,8 +301,7 @@ async fn fixture(recycle_enabled: bool, evidence: Evidence) -> Fixture {
         .await
         .expect("AppService"),
     );
-    let (adapter, _) =
-        crate::storage::ProjectAdapter::new("fixture".into(), "cluster.local".into());
+    let adapter = crate::storage::ProjectAdapter::new("fixture".into(), "cluster.local".into());
     let (pod_created_tx, _) = tokio::sync::broadcast::channel(8);
     let state = Arc::new(AppState {
         userapp_store: store.clone(),
@@ -323,7 +322,7 @@ async fn fixture(recycle_enabled: bool, evidence: Evidence) -> Fixture {
         container_prefix_rcoder: "fixture-agent".into(),
         container_prefix_computer: "fixture-computer".into(),
         runtime: runtime.clone(),
-        cleanup_rx: Arc::new(Mutex::new(None)),
+
         agent_download_manager: Arc::new(
             agent_provisioning::AgentDownloadManager::new(dir.path().join("downloads"))
                 .expect("private download manager"),

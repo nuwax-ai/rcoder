@@ -291,8 +291,9 @@ pub fn agent_skill_exists(skills_dir: &Path, skill_name: &str) -> bool {
 
 /// 检查路径是否是目录链接 (Unix symlink / Windows junction)。
 /// 对齐 TS `isWorkspaceSkillsSymlinked`: push 仅在「有 agentId 且已是链接」时走 store。
-/// 注意: `Path::is_symlink()` 在 Windows 上对 junction 返回 false (reparse tag 不同),
-/// 需额外用 `junction::exists` 检测。
+/// 注意: junction 与普通符号链接在 `symlink_metadata` 上同形（都是
+/// `is_symlink=true`/`is_dir=false`），`Path::is_symlink()` 分不出二者（reparse tag
+/// 不同），需额外用 `junction::exists` 检测 junction。
 pub fn is_dir_link(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -374,6 +375,18 @@ pub(super) async fn remove_any_if_exists(path: &Path) -> AppResult<()> {
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
         Ok(meta) => {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::FileTypeExt;
+                if meta.file_type().is_symlink_dir() {
+                    // 目录 symlink 和 junction 均用 RemoveDirectory 摘除条目，
+                    // 悬空时亦可；类型来自 no-follow 元数据，不探测/依赖目标。
+                    // 不能用 `junction::delete`——它只做 FSCTL_DELETE_REPARSE_POINT 剥掉
+                    // 重解析标签，会留下一个空目录，视图条目因此清不掉；也不能用
+                    // `fs::remove_file`——DeleteFile 对重解析点返回拒绝访问 (os error 5)。
+                    return fs::remove_dir(path).await.map_err(Into::into);
+                }
+            }
             if meta.is_dir() && !meta.is_symlink() {
                 fs::remove_dir_all(path).await.map_err(Into::into)
             } else {
@@ -471,7 +484,9 @@ async fn materialize_agent_store_by_copy(
     }
 
     // sync_agents fan-out (.agents → 各家 ACP 目录, 实体复制与 TS legacy 行为一致)
-    crate::service::skills::sync_agents(workspace).await?;
+    // 调用方 (link_workspace_to_agent_store) 的工作区链接装配均在 workspace_lock
+    // 内进行，这里走持锁执行体避免重复获取
+    crate::service::skills::sync_agents_locked(workspace).await?;
     Ok(())
 }
 

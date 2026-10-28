@@ -140,6 +140,79 @@ pub(crate) async fn settle_fenced_operation(
     Ok(op)
 }
 
+/// Settle a stale `Running` EnsureBuilder as Failed with the scanner's
+/// runtime-authority observation evidence. Narrow gate — kind EnsureBuilder,
+/// state Running, recorded executor, full snapshot CAS — so a generic Running
+/// operation is never exposed to scanner settlement. The terminal record is
+/// honest Failed with the original history preserved plus the observation
+/// evidence; the admission slot is freed atomically with the terminal write.
+pub(crate) async fn settle_stale_running_builder(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    snapshot: &UserAppOperationRecord,
+    evidence: &serde_json::Value,
+    release_note: &str,
+) -> Result<UserAppOperationRecord, Error> {
+    let (mut app, mut op) = current(
+        tx,
+        backend,
+        &snapshot.app_id,
+        &snapshot.operation_id,
+        &snapshot.lifecycle_id,
+    )
+    .await?;
+    if op != *snapshot
+        || op.kind != UserAppOperationKind::EnsureBuilder
+        || op.state != UserAppOperationState::Running
+        || op.executor_id.is_none()
+        || !userapp_builder_creation_needs_runtime_receipt(&op)
+    {
+        return Err(Error::VersionConflict);
+    }
+    let before_app = app.clone();
+    let mut checkpoint = op.checkpoint.clone();
+    checkpoint[domain::FENCE_RELEASED_EVIDENCE_KEY] = evidence.clone();
+    // The record already holds the exclusive executor claim (Running), so the
+    // progress retains that executor; this is pure bookkeeping, never runtime
+    // work.
+    let progress = UserAppOperationProgress {
+        app_id: op.app_id.clone(),
+        lifecycle_id: op.lifecycle_id.clone(),
+        operation_id: op.operation_id.clone(),
+        expected_revision: op.revision,
+        executor_id: op.executor_id.clone().ok_or(Error::VersionConflict)?,
+        state: UserAppOperationState::Failed,
+        step: op.step.clone(),
+        checkpoint,
+        error_code: op
+            .error_code
+            .clone()
+            .or_else(|| Some("ERR_OPERATION_RECOVERY".into())),
+        error_message: Some(format!(
+            "{}; stale running released: {}",
+            op.error_message
+                .as_deref()
+                .unwrap_or("builder creation executor stopped without a receipt"),
+            release_note
+        )),
+    };
+    domain::advance(&mut app, &mut op, &progress)?;
+    repo::save_operation(tx, backend, &op, snapshot).await?;
+    repo::save_app(
+        tx,
+        backend,
+        &app,
+        &before_app.lifecycle_id,
+        before_app.metadata_revision,
+    )
+    .await?;
+    repo::save_slots(tx, backend, &app, &before_app).await?;
+    models::OperationInput::delete_by_operation_id(tx, &op.operation_id)
+        .await
+        .map_err(storage)?;
+    Ok(op)
+}
+
 /// Close an observed hot-deployment SUCCESS by full snapshot CAS: the owner
 /// reported a terminal Running outcome for exactly this operation (or the
 /// converged environment matches the persisted target). Evidence validation

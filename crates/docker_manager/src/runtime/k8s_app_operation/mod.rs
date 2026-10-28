@@ -37,6 +37,7 @@ use shared_types::{AppOperationLease, ServiceType};
 mod compute;
 mod helpers;
 mod lease;
+mod observation;
 mod ops;
 #[cfg(test)]
 mod tests;

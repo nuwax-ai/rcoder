@@ -6,6 +6,8 @@ license.workspace = true
 
 [features]
 default = []
+# Explicit real-PG admission race tests, ignored unless the isolated fixture is selected.
+pg-tests = ["rcoder-storage/pg"]
 # Kubernetes 后端模式：启用后 AppAccessMode 默认值 = Kubernetes（仍可被 env 覆盖）
 # 由 rcoder 的 kubernetes feature 转发开启，保持双后端编译期同源。
 kubernetes = []

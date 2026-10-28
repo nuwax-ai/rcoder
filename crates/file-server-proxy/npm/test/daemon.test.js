@@ -274,3 +274,29 @@ test("native fixture cleanup preserves unknown or still-held owner state", async
     } finally { fixtureFs.rmSync(root, { recursive: true, force: true }); }
   }
 });
+
+test("native fixture retains failed-case evidence after confirmed owner cleanup", async () => {
+  const { cleanupState } = require("../../tests/e2e/native-link.test.js");
+  for (const preserveEvidence of [true, false]) {
+    const root = fixtureFs.mkdtempSync(fixturePath.join(fixtureOs.tmpdir(), "proxy-cleanup-evidence-"));
+    const witness = fixturePath.join(root, "owner.json");
+    fixtureFs.writeFileSync(witness, "original failed-case evidence");
+    const owned = { instance_id: "captured", supervisor_id: "captured-supervisor" };
+    const observed = [];
+    try {
+      await cleanupState(root, owned, async target => {
+        assert.equal(target, owned);
+        observed.push("stop");
+      }, async target => {
+        assert.equal(target, owned);
+        observed.push("confirmed exit");
+      }, { preserveEvidence });
+      assert.deepEqual(observed, ["stop", "confirmed exit"]);
+      if (preserveEvidence) {
+        assert.equal(fixtureFs.readFileSync(witness, "utf8"), "original failed-case evidence");
+      } else {
+        assert.equal(fixtureFs.existsSync(root), false);
+      }
+    } finally { fixtureFs.rmSync(root, { recursive: true, force: true }); }
+  }
+});

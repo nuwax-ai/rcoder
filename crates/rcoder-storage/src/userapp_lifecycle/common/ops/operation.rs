@@ -47,13 +47,47 @@ pub(crate) async fn read_execution_input(
         return Err(Error::VersionConflict);
     }
     crate::userapp_lifecycle::common::compute::check_business_authority(tx, &op).await?;
-    let row = models::OperationInput::get_by_operation_id(tx, &context.operation_id)
+    validated_execution_input(tx, &op).await
+}
+
+pub(crate) async fn read_recovery_execution_input(
+    tx: &mut dyn Executor,
+    backend: Backend,
+    snapshot: &UserAppOperationRecord,
+) -> Result<UserAppExecutionInput, Error> {
+    let (app, op) = current(
+        tx,
+        backend,
+        &snapshot.app_id,
+        &snapshot.operation_id,
+        &snapshot.lifecycle_id,
+    )
+    .await?;
+    domain::validate_active(&app)?;
+    if op != *snapshot
+        || op.state != UserAppOperationState::RecoveryRequired
+        || op.step != "creating_runtime"
+        || op.kind != UserAppOperationKind::StartDeployment
+        || op.executor_id.is_none()
+        || !matches!(
+            &op.command,
+            Some(UserAppControlCommand::Deploy { restart: false, .. })
+        )
+    {
+        return Err(Error::VersionConflict);
+    }
+    crate::userapp_lifecycle::common::compute::check_business_authority(tx, &op).await?;
+    validated_execution_input(tx, &op).await
+}
+
+pub(crate) async fn validated_execution_input(
+    tx: &mut dyn Executor,
+    op: &UserAppOperationRecord,
+) -> Result<UserAppExecutionInput, Error> {
+    let row = models::OperationInput::get_by_operation_id(tx, &op.operation_id)
         .await
         .map_err(storage)?;
-    if row.app_id != context.app_id
-        || row.lifecycle_id != context.lifecycle_id
-        || row.payload_version != 1
-    {
+    if row.app_id != op.app_id || row.lifecycle_id != op.lifecycle_id || row.payload_version != 1 {
         return Err(Error::LifecycleConflict);
     }
     let input = UserAppExecutionInput::new(row.payload);

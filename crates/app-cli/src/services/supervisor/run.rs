@@ -135,7 +135,7 @@ pub(super) async fn run_inner(
     let workspace_index_port =
         crate::workspace_index::index_port_if_eligible(&args.workspace, &specs);
 
-    let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+    let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir)?;
     let mut outcome = match prepared_proxy {
         Some(prepared) => prepared.outcome,
         None => {
@@ -329,7 +329,7 @@ pub(super) async fn run_inner(
         // - serve 形态（有 owner 会话作用域）：owner管理代理替换；
         // - 直跑形态：无 owner 作用域，常驻进程会在 run() 返回后成为孤儿——
         //   维持业务会话树托管（R01）。代理失败时 workspace 不得进入 ready。
-        let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+        let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir)?;
         crate::proxy::compiler::publish_active(&runtime_root, &outcome.config_path).await?;
         // serve 形态判定：run_loop 恒传 on_running（相位回执）；直跑形态
         //（main.rs 的 run 子命令与 run()）恒为 None——即便直跑进程处于原生

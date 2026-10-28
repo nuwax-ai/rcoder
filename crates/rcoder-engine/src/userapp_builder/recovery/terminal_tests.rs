@@ -136,6 +136,17 @@ async fn fixture() -> (
     Arc<FileLeaseAdapter>,
     UserAppOperationRecord,
 ) {
+    fixture_with_suffix("").await
+}
+
+async fn fixture_with_suffix(
+    suffix: &str,
+) -> (
+    tempfile::TempDir,
+    Arc<dyn UserAppLifecycleStore>,
+    Arc<FileLeaseAdapter>,
+    UserAppOperationRecord,
+) {
     let directory = tempfile::tempdir().unwrap();
     let store: Arc<dyn UserAppLifecycleStore> = Arc::new(
         rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
@@ -148,10 +159,10 @@ async fn fixture() -> (
         runtime_policy_on_success: None,
         command: None,
         metadata: None,
-        app_id: "terminal-app".into(),
+        app_id: format!("terminal-app{suffix}"),
         lifecycle_id: None,
-        operation_id: "terminal-operation".into(),
-        request_id: Some("terminal-request".into()),
+        operation_id: format!("terminal-operation{suffix}"),
+        request_id: Some(format!("terminal-request{suffix}")),
         request_fingerprint: "a".repeat(64),
         kind: UserAppOperationKind::StopBuilder,
     };
@@ -411,3 +422,4 @@ async fn compute_terminal_scan_preserves_uncertain_then_releases_confirmed_recei
 }
 
 mod historical_compute_tests;
+mod timeout_tests;

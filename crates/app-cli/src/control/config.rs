@@ -1,7 +1,8 @@
 //! Explicit subcommands own their options. Runtime configuration is independent
 //! of clap so the orchestration kernel does not depend on CLI dispatch.
+use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -223,13 +224,50 @@ impl RuntimeArgs {
     /// Management bootstrap shares the platform source contract. Build and
     /// validation use their explicitly requested directory without rewriting.
     pub fn for_management(&self) -> anyhow::Result<Self> {
-        let workspace = runtime_state_layout::normalize_management_workspace(&self.workspace)?;
-        if workspace != self.workspace {
-            tracing::info!(requested = %self.workspace.display(), source = %workspace.display(),
+        let absolute = self.absolutized_paths()?;
+        let workspace = runtime_state_layout::normalize_management_workspace(&absolute.workspace)?;
+        if workspace != absolute.workspace {
+            tracing::info!(requested = %absolute.workspace.display(), source = %workspace.display(),
                 "normalized platform management workspace before acquiring ownership");
         }
         Ok(Self {
             workspace,
+            ..absolute
+        })
+    }
+
+    /// Capture relative paths against one invocation directory before writing
+    /// cross-process contracts. Executable names retain their PATH semantics.
+    pub fn absolutized_paths(&self) -> anyhow::Result<Self> {
+        if self.workspace.is_absolute() && self.log_dir.is_absolute() {
+            return Ok(self.clone());
+        }
+        let cwd = std::env::current_dir().context("resolve runtime invocation directory")?;
+        self.absolutized_paths_from(&cwd)
+    }
+
+    fn absolutized_paths_from(&self, cwd: &Path) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            cwd.is_absolute(),
+            "runtime invocation directory must be absolute"
+        );
+        let absolutize = |path: &Path, field: &str| -> anyhow::Result<PathBuf> {
+            anyhow::ensure!(
+                !path.as_os_str().is_empty(),
+                "runtime {field} must not be empty"
+            );
+            if path.is_absolute() {
+                return Ok(path.to_path_buf());
+            }
+            let resolved = std::path::absolute(cwd.join(path))
+                .with_context(|| format!("resolve runtime {field} against invocation directory"))?;
+            tracing::info!(requested = %path.display(), resolved = %resolved.display(),
+                "absolutized relative runtime path at the management boundary");
+            Ok(resolved)
+        };
+        Ok(Self {
+            workspace: absolutize(&self.workspace, "workspace")?,
+            log_dir: absolutize(&self.log_dir, "log directory")?,
             ..self.clone()
         })
     }
@@ -262,6 +300,92 @@ impl From<ServeArgs> for RuntimeArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_runtime_paths_are_absolutized_at_the_args_boundary() {
+        let base = tempfile::tempdir().unwrap();
+        let invocation = base.path().join("invocation with spaces");
+        let args = RuntimeArgs {
+            operation_id: None,
+            workspace: PathBuf::from(".local-deploy"),
+            log_dir: PathBuf::from(".local-logs"),
+            admin_addr: String::new(),
+            pingap_bin: PathBuf::from("pingap"),
+            attach: false,
+            control_only: false,
+        }
+        .absolutized_paths_from(&invocation)
+        .unwrap();
+        assert!(args.workspace.is_absolute());
+        assert!(args.log_dir.is_absolute());
+        assert_eq!(args.workspace, invocation.join(".local-deploy"));
+        assert_eq!(args.log_dir, invocation.join(".local-logs"));
+        assert_eq!(args.pingap_bin, PathBuf::from("pingap"));
+    }
+
+    #[test]
+    fn absolute_runtime_paths_are_untouched_by_the_boundary() {
+        let absolute = std::env::temp_dir().join("already-absolute");
+        let args = RuntimeArgs {
+            operation_id: None,
+            workspace: absolute.clone(),
+            log_dir: absolute.clone(),
+            admin_addr: String::new(),
+            pingap_bin: PathBuf::from("pingap"),
+            attach: false,
+            control_only: false,
+        }
+        .absolutized_paths()
+        .unwrap();
+        assert_eq!(args.workspace, absolute);
+        assert_eq!(args.log_dir, absolute);
+    }
+
+    #[test]
+    fn direct_runtime_args_use_the_same_management_path_boundary() {
+        let cwd = std::env::current_dir().unwrap();
+        let args = RuntimeArgs {
+            workspace: ".".into(),
+            log_dir: "management-logs".into(),
+            pingap_bin: "pingap".into(),
+            ..RuntimeArgs::default()
+        };
+        let normalized = args.for_management().unwrap();
+        assert_eq!(normalized.workspace, cwd);
+        assert_eq!(normalized.log_dir, cwd.join("management-logs"));
+        assert_eq!(normalized.pingap_bin, PathBuf::from("pingap"));
+        let operation = normalized.clone();
+        assert_eq!(
+            operation.for_management().unwrap().log_dir,
+            normalized.log_dir
+        );
+    }
+
+    #[test]
+    fn empty_runtime_paths_fail_before_management() {
+        let cwd = std::env::current_dir().unwrap();
+        for (workspace, log_dir, expected) in [
+            (
+                PathBuf::new(),
+                cwd.clone(),
+                "runtime workspace must not be empty",
+            ),
+            (
+                cwd.clone(),
+                PathBuf::new(),
+                "runtime log directory must not be empty",
+            ),
+        ] {
+            let error = RuntimeArgs {
+                workspace,
+                log_dir,
+                ..RuntimeArgs::default()
+            }
+            .for_management()
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+    }
 
     #[test]
     fn retired_seal_command_is_rejected_while_normal_run_remains_available() {
@@ -322,6 +446,10 @@ mod tests {
         let runtime = RuntimeArgs::from(serve);
         assert_eq!(runtime.workspace, PathBuf::from("project with spaces"));
         assert_eq!(runtime.log_dir, PathBuf::from("logs"));
+        let runtime = runtime.for_management().unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(runtime.workspace, cwd.join("project with spaces"));
+        assert_eq!(runtime.log_dir, cwd.join("logs"));
         assert_eq!(runtime.admin_addr, "127.0.0.1:3999");
         assert_eq!(runtime.pingap_bin, PathBuf::from("tools/pingap"));
         assert!(runtime.attach);

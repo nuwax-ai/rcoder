@@ -477,6 +477,440 @@ async fn lb_new_session_cross_entry() {
     scenario_new_session_cross_entry().await;
 }
 
+/// A normal Computer Stop must allow the SDK to load the same persisted SID.
+#[tokio::test]
+#[ignore = "explicit K8s real-AI environment"]
+async fn lb_stop_resume_same_sid_cross_entry() {
+    let scenario = "lb_stop_resume_same_sid_cross_entry";
+    let Some((env, report, entries)) = k8s_or_skip(scenario).await else {
+        return;
+    };
+    let user = env.scoped_user("lsr");
+    let secret = format!("remember_{}", uuid::Uuid::new_v4().simple());
+    let after = format!("after_stop_{}", env.run_tag);
+    let mut project_id = None;
+    let outcome: anyhow::Result<()> = async {
+        anyhow::ensure!(
+            entries.len() > 1 && entries[0] != entries[1],
+            "Stop/resume requires distinct K8s entries"
+        );
+        let first_request = env.base_payload(
+            Backend::Openai,
+            &format!("记住口令 {secret}。本轮只回复 READY_{secret}，不要调用工具。"),
+            &format!("{}-before-stop", env.run_tag),
+            &user,
+        );
+        let first =
+            chat_reported(&env, &report, "before_stop", &entries[0], &first_request).await?;
+        project_id = Some(first.project_id.clone());
+        anyhow::ensure!(
+            first.error.is_none() && first.need_fallback != Some(true),
+            "Initial chat did not establish a usable session"
+        );
+        let (events, _) = collect_reported(
+            &env,
+            &report,
+            CollectSpec {
+                phase: "before_stop_cross_entry",
+                entry: &entries[1],
+                sid: &first.session_id,
+                duration_s: 60.0,
+                last_event_id: None,
+                idle_stop: true,
+            },
+        )
+        .await;
+        report.assert_hard(
+            "停止前真实对话完整执行",
+            events.iter().any(|e| e.event == "end_turn")
+                && sse::chunks_text(&events).contains(&format!("READY_{secret}")),
+            format!("{} events", events.len()),
+        );
+
+        let response = env
+            .http
+            .post(format!(
+                "{}/computer/agent/stop",
+                entries[entries.len() - 1]
+            ))
+            .timeout(Duration::from_secs(60))
+            .json(&json!({"user_id":user,"project_id":first.project_id,
+                "session_id":first.session_id}))
+            .send()
+            .await?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await?;
+        let stopped =
+            status.is_success() && body["code"] == "0000" && body["data"]["success"] == true;
+        report.assert_hard(
+            "普通 Computer Stop 明确成功",
+            stopped,
+            format!("HTTP {status}, response: {body}"),
+        );
+        anyhow::ensure!(stopped, "Computer Stop failed before resume");
+
+        // The remembered word is deliberately absent: a fresh unrelated
+        // session cannot satisfy this context assertion from the new prompt.
+        let mut resumed_request = env.base_payload(
+            Backend::Openai,
+            &format!("只输出 {after}::上一轮我让你记住的口令。用原口令替换中文说明，保留两个英文冒号，不要调用工具。"),
+            &format!("{}-after-stop", env.run_tag),
+            &user,
+        );
+        resumed_request.project_id = Some(first.project_id.clone());
+        resumed_request.session_id = Some(first.session_id.clone());
+        let resumed =
+            chat_reported(&env, &report, "after_stop", &entries[1], &resumed_request).await?;
+        report.assert_hard(
+            "停止后原 SID 一次受理且无降级",
+            resumed.error.is_none()
+                && resumed.need_fallback != Some(true)
+                && resumed.session_id == first.session_id
+                && resumed.project_id == first.project_id,
+            format!(
+                "same SID: {}, same project: {}, fallback: {:?}",
+                resumed.session_id == first.session_id,
+                resumed.project_id == first.project_id,
+                resumed.need_fallback
+            ),
+        );
+        let (events, _) = collect_reported(
+            &env,
+            &report,
+            CollectSpec {
+                phase: "after_stop_cross_entry",
+                entry: &entries[0],
+                sid: &resumed.session_id,
+                duration_s: 60.0,
+                last_event_id: None,
+                idle_stop: true,
+            },
+        )
+        .await;
+        let messages = sse::message_events(&events);
+        report.assert_hard(
+            "停止后跨入口 SSE 收到当前请求",
+            !messages.is_empty()
+                && messages.iter().all(|event| {
+                    event.data["data"]["request_id"]
+                        .as_str()
+                        .is_none_or(|id| Some(id) == resumed_request.request_id.as_deref())
+                })
+                && events.iter().any(|event| {
+                    event.event == "prompt_start"
+                        && event.data["data"]["request_id"].as_str()
+                            == resumed_request.request_id.as_deref()
+                })
+                && events.iter().any(|event| {
+                    event.event == "end_turn"
+                        && event.data["data"]["request_id"].as_str()
+                            == resumed_request.request_id.as_deref()
+                }),
+            format!(
+                "{} message events; start/end must match the resume request",
+                messages.len()
+            ),
+        );
+        report.assert_hard(
+            "停止后原会话上下文保留",
+            sse::chunks_text(&events).contains(&format!("{after}::{secret}")),
+            "new receipt joins a new marker and a word absent from the resume prompt".into(),
+        );
+        report.assert_hard(
+            "停止后新轮完整且没有错误事件",
+            sse::chunks_text(&events).contains(&after)
+                && events
+                    .iter()
+                    .filter(|event| event.event == "end_turn")
+                    .count()
+                    == 1
+                && !events.iter().any(|event| event.event == "error"),
+            format!("{} events", events.len()),
+        );
+        Ok(())
+    }
+    .await;
+    report.assert_hard(
+        "普通 Computer Stop 后原入口自动恢复",
+        outcome.is_ok(),
+        outcome
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "one resume POST, real model and cross-entry SSE completed".into()),
+    );
+    // Preserve data and use the platform's physical identity guards even when
+    // the chat outcome was uncertain. Do not delete controllers by name here.
+    let cleanup: anyhow::Result<()> = async {
+        let response = env
+            .http
+            .post(format!("{}/computer/pod/stop", entries[0]))
+            .timeout(Duration::from_secs(60))
+            .json(&json!({"user_id":user,
+                "project_id":project_id.as_deref().unwrap_or(&user),
+                "service_type":"computer-agent-runner"}))
+            .send()
+            .await?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await?;
+        anyhow::ensure!(
+            status.is_success() && body["code"] == "0000",
+            "Owned Computer cleanup failed: HTTP {status}, response: {body}"
+        );
+        Ok(())
+    }
+    .await;
+    report.assert_hard(
+        "本 case 计算资源受控停止",
+        cleanup.is_ok(),
+        cleanup
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| {
+                "platform compute Stop confirmed; volume identities checked by outer inventory"
+                    .into()
+            }),
+    );
+    assert_hard_all(report).await;
+}
+
+/// 2026-10-20 事故反例：pod/stop（durable 删除 + tombstone）经入口 A 后，
+/// 其他副本的容器注册表镜像残留旧 workload UID，后续 chat 落到这些副本会
+/// 被防接管门误拒（修复前 HTTP 500 "workload was replaced"）。修复后门禁
+/// 直读 DB 权威行（行已删 + tombstone 在案 = 本系统已退役的自我换代），
+/// 任一副本都必须直接受理重建后的 chat。
+async fn observe_pod_stop_turn(
+    env: &Env,
+    report: &JsonlReporter,
+    phase: &str,
+    entry: &str,
+    sid: &str,
+    request_id: &str,
+) -> rcoder_e2e::common::sse_terminal_barrier::Observation {
+    report.subscribe_begin(phase, entry, None);
+    let observed = rcoder_e2e::common::sse_terminal_barrier::observe(
+        &env.sse_http,
+        entry,
+        sid,
+        request_id,
+        std::time::Instant::now() + Duration::from_secs(60),
+        |event| report.sse_event(phase, event.seq, &event.event, &event.data, event.t_ms),
+    )
+    .await;
+    report.subscribe_end(
+        phase,
+        &observed.ended_reason,
+        observed.events.len(),
+        &sse::ids_of(&observed.events),
+        sse::type_counts(&observed.events),
+        &sse::chunks_text(&observed.events),
+    );
+    observed
+}
+
+#[tokio::test]
+#[ignore = "explicit K8s real-AI environment"]
+async fn lb_pod_stop_then_chat_cross_entry() {
+    let scenario = "lb_pod_stop_then_chat_cross_entry";
+    let Some((env, report, entries)) = k8s_or_skip(scenario).await else {
+        return;
+    };
+    let user = env.scoped_user("sblb");
+    let marker = format!("sb_ready_{}", uuid::Uuid::new_v4().simple());
+    let mut project_id = None;
+    let outcome: anyhow::Result<()> = async {
+        anyhow::ensure!(
+            entries.len() > 1 && entries[0] != entries[1],
+            "Cross-replica verification requires distinct K8s entries"
+        );
+        let initial_request_id = format!("{}-before-pod-stop", env.run_tag);
+        let first_request = env.base_payload(
+            Backend::Openai,
+            &format!("本轮只回复 {marker}，不要调用工具。"),
+            &initial_request_id,
+            &user,
+        );
+        let first = chat_reported(
+            &env,
+            &report,
+            "before_pod_stop",
+            &entries[0],
+            &first_request,
+        )
+        .await?;
+        project_id = Some(first.project_id.clone());
+        anyhow::ensure!(
+            first.error.is_none() && first.need_fallback != Some(true),
+            "Initial chat did not establish a usable session"
+        );
+
+        let observed = observe_pod_stop_turn(
+            &env,
+            &report,
+            "before_pod_stop_complete",
+            &entries[1],
+            &first.session_id,
+            &initial_request_id,
+        )
+        .await;
+        let events = observed.events;
+        let complete = observed.terminal_seq.is_some()
+            && !events.iter().any(|event| event.event == "error")
+            && sse::chunks_text(&events).contains(&marker);
+        report.assert_hard(
+            "pod/stop 前真实对话完整执行",
+            complete,
+            format!("{} events", events.len()),
+        );
+        anyhow::ensure!(complete, "Initial chat did not finish before pod/stop");
+
+        // 经入口 A 执行物理停止：等价于 cleaner 的 durable 删除路径（删 STS +
+        // PG 行 + tombstone），对其他副本构成 peer 删除。
+        let response = env
+            .http
+            .post(format!("{}/computer/pod/stop", entries[0]))
+            .timeout(Duration::from_secs(120))
+            .json(&json!({"user_id":user,"project_id":first.project_id,
+                "service_type":"computer-agent-runner"}))
+            .send()
+            .await?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await?;
+        anyhow::ensure!(
+            status.is_success() && body["code"] == "0000",
+            "Pod stop failed: HTTP {status}, response: {body}"
+        );
+
+        // 只有成功的实时状态查询明确证明 not_found 才算物理停止已收束；
+        // 错误信封、无效 JSON 或 stopped 都不能证明旧控制器已经删除。
+        let mut converged = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        for _ in 0..45 {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let status_response = env
+                .http
+                .get(format!("{}/computer/pod/status", entries[0]))
+                .timeout(remaining.min(Duration::from_secs(20)))
+                .query(&[
+                    ("user_id", user.as_str()),
+                    ("project_id", first.project_id.as_str()),
+                    ("service_type", "computer-agent-runner"),
+                ])
+                .send()
+                .await;
+            if let Ok(response) = status_response {
+                let status = response.status();
+                if let Ok(body) = response.json::<serde_json::Value>().await
+                    && status.is_success()
+                    && body["code"] == "0000"
+                    && body["data"]["alive"] == false
+                    && body["data"]["status"] == "not_found"
+                {
+                    converged = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(
+                deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .min(Duration::from_secs(2)),
+            )
+            .await;
+        }
+        anyhow::ensure!(
+            converged,
+            "pod/status never confirmed not_found after pod/stop"
+        );
+
+        // 首次重建走另一入口；NodePort 仍会随机选副本，多轮只能证明跨入口
+        // 可用性。未同步旧镜像的确定性反例由 PG 多实例测试另行验证。
+        for round in 0..5 {
+            let entry = &entries[(round + 1) % entries.len()];
+            let request_id = format!("{}-after-pod-stop-{round}", env.run_tag);
+            let mut request = env.base_payload(
+                Backend::Openai,
+                &format!("第 {} 轮：只回复 OK_{round}，不要调用工具。", round + 1),
+                &request_id,
+                &user,
+            );
+            request.project_id = Some(first.project_id.clone());
+            let chat = chat_reported(
+                &env,
+                &report,
+                &format!("after_pod_stop_round_{round}"),
+                entry,
+                &request,
+            )
+            .await?;
+            report.assert_hard(
+                format!("停止后第 {} 轮跨副本 chat 直接受理", round + 1).as_str(),
+                chat.error.is_none() && chat.need_fallback != Some(true),
+                format!(
+                    "entry {entry}, error: {:?}, fallback: {:?}",
+                    chat.error, chat.need_fallback
+                ),
+            );
+            let observed = observe_pod_stop_turn(
+                &env,
+                &report,
+                &format!("after_pod_stop_round_{round}_complete"),
+                &entries[round % entries.len()],
+                &chat.session_id,
+                &request_id,
+            )
+            .await;
+            let events = observed.events;
+            report.assert_hard(
+                &format!("停止后第 {} 轮真实对话完整执行", round + 1),
+                observed.terminal_seq.is_some()
+                    && !events.iter().any(|event| event.event == "error")
+                    && sse::chunks_text(&events).contains(&format!("OK_{round}")),
+                format!("{} events", events.len()),
+            );
+        }
+        Ok(())
+    }
+    .await;
+    report.assert_hard(
+        "pod/stop 后跨副本 chat 全部自动恢复（无 workload replaced 500）",
+        outcome.is_ok(),
+        outcome
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "5 rounds of cross-entry chats accepted".into()),
+    );
+    let cleanup: anyhow::Result<()> = async {
+        let response = env
+            .http
+            .post(format!("{}/computer/pod/stop", entries[0]))
+            .timeout(Duration::from_secs(120))
+            .json(&json!({"user_id":user,
+                "project_id":project_id.as_deref().unwrap_or(&user),
+                "service_type":"computer-agent-runner"}))
+            .send()
+            .await?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await?;
+        anyhow::ensure!(
+            status.is_success() && body["code"] == "0000",
+            "Owned Computer cleanup failed: HTTP {status}, response: {body}"
+        );
+        Ok(())
+    }
+    .await;
+    report.assert_hard(
+        "pod/stop case 计算资源受控停止",
+        cleanup.is_ok(),
+        cleanup
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "platform compute Stop confirmed; data volumes retained".into()),
+    );
+    assert_hard_all(report).await;
+}
+
 // gate 冒烟：无 TEST_K8S_SSH 时 skip 路径可走通（本地 compose 机器验证用）。
 #[tokio::test]
 async fn gate_k8s_or_skip_smoke() {

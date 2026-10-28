@@ -37,11 +37,11 @@ use crate::models::{
 /// 上传文件
 ///
 /// zip/tar.gz 自动解压；单文件直写。
-#[utoipa::path(post, path = "/app-files/upload", request_body(content = AppFilesUploadForm, content_type = "multipart/form-data"), responses(file_server::openapi::JsonApiResponses), tag = "Userapp · 双态 · 文件与存储")]
+#[utoipa::path(post, path = "/app-files/upload", request_body(content = AppFilesUploadForm, content_type = "multipart/form-data"), responses((status=200, description="Upload result (archive extraction or plain single-file write), or a business error envelope", body=shared_types::UserappAppFilesUploadResult), file_server::openapi::JsonApiResponses), tag = "Userapp · 双态 · 文件与存储")]
 pub(crate) async fn upload(
     State(state): State<UserAppState>,
     mut multipart: Multipart,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<shared_types::UserappAppFilesUploadResult>, AppError> {
     let mut app_id = None;
     let mut target = None;
     let mut flatten = false;
@@ -83,13 +83,13 @@ pub(crate) async fn upload(
     let root = resolve_userapp_dev(&app_id, None, &state.fs.config)?;
     let result = upload_impl(&root, &target, flatten, data.path(), data.size()).await?;
     info!(app_id = %app_id, target = %target, "app-files upload done");
-    Ok(Json(json!({
-        "success": true,
-        "file_path": result.file_path,
-        "file_size": result.file_size,
-        "uploaded_at": result.uploaded_at,
-        "extracted_count": result.extracted_count,
-    })))
+    Ok(Json(shared_types::UserappAppFilesUploadResult {
+        success: true,
+        file_path: result.file_path,
+        file_size: result.file_size,
+        uploaded_at: result.uploaded_at,
+        extracted_count: result.extracted_count,
+    }))
 }
 
 #[derive(Debug)]
@@ -212,13 +212,13 @@ async fn upload_impl(
 → 压缩包按魔数自动解压（zip/tar.gz）、单文件直写。语义同 `upload`：
 `target` 为 app 根相对落盘位置、`flatten` 控制剥单层 wrapper 目录。
 "#,
-    responses(file_server::openapi::JsonApiResponses),
+    responses((status=200, description="Downloaded and stored upload result, or a business error envelope", body=shared_types::UserappAppFilesUploadResult), file_server::openapi::JsonApiResponses),
     tag = "Userapp · 双态 · 文件与存储",
 )]
 pub(crate) async fn upload_from_url(
     State(state): State<UserAppState>,
     Json(body): Json<AppFilesUploadFromUrlBody>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<shared_types::UserappAppFilesUploadResult>, AppError> {
     let _workspace_activity = state
         .build_tasks
         .workspace_activity(&body.app_id)
@@ -243,13 +243,13 @@ pub(crate) async fn upload_from_url(
         .map_err(|e| AppError::system(format!("stat downloaded file: {e}")))?;
     let result = upload_impl(&root, &body.target, body.flatten, tmp.path(), size).await?;
     info!(app_id = %body.app_id, url = %body.url, "app-files upload-from-url done");
-    Ok(Json(json!({
-        "success": true,
-        "file_path": result.file_path,
-        "file_size": result.file_size,
-        "uploaded_at": result.uploaded_at,
-        "extracted_count": result.extracted_count,
-    })))
+    Ok(Json(shared_types::UserappAppFilesUploadResult {
+        success: true,
+        file_path: result.file_path,
+        file_size: result.file_size,
+        uploaded_at: result.uploaded_at,
+        extracted_count: result.extracted_count,
+    }))
 }
 
 // ── 列表（GET ?path=）───────────────────────────────────────────────────────────
@@ -264,13 +264,13 @@ pub(crate) async fn upload_from_url(
 rcoder app_manager DTO（本族为 rcoder↔file-server 内部契约，字段直传不经
 Java）；生产运行容器 = 单 app 模式（卷根即 app 根）。
 "#,
-    responses(file_server::openapi::JsonApiResponses),
+    responses((status=200, description="Directory listing, or a business error envelope", body=shared_types::UserappAppFilesListResult), file_server::openapi::JsonApiResponses),
     tag = "Userapp · 双态 · 文件与存储"
 )]
 pub(crate) async fn list(
     State(state): State<UserAppState>,
     Query(params): Query<AppFilesListParams>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<shared_types::UserappAppFilesListResult>, AppError> {
     tracing::debug!(app_id = %params.app_id, "app-files list");
     let _workspace_activity = state
         .build_tasks
@@ -281,7 +281,10 @@ pub(crate) async fn list(
     let root = resolve_userapp_dev(&params.app_id, None, &state.fs.config)?;
     // 存在性探测的 IO 错误传播——否则会把真实错误伪装成"空清单"。
     if !file_server::service::fs_util::path_exists(&root).await? {
-        return Ok(Json(json!({"success": true, "files": []})));
+        return Ok(Json(shared_types::UserappAppFilesListResult {
+            success: true,
+            files: Vec::new(),
+        }));
     }
     let canonical_root = tokio::fs::canonicalize(&root)
         .await
@@ -295,7 +298,10 @@ pub(crate) async fn list(
         Some(p) => {
             let full = root.join(p);
             if !file_server::service::fs_util::path_exists(&full).await? {
-                return Ok(Json(json!({"success": true, "files": []})));
+                return Ok(Json(shared_types::UserappAppFilesListResult {
+                    success: true,
+                    files: Vec::new(),
+                }));
             }
             ensure_within_root(&full, &canonical_root).await?
         }
@@ -315,11 +321,11 @@ pub(crate) async fn list(
             .metadata()
             .await
             .map_err(|e| AppError::system(format!("read metadata: {e}")))?;
-        files.push(json!({
-            "path": format!("{rel_prefix}{}", entry.file_name().to_string_lossy()),
-            "size": metadata.len(),
-            "is_dir": metadata.is_dir(),
-            "modified_at": metadata
+        files.push(shared_types::UserappAppFilesEntry {
+            path: format!("{rel_prefix}{}", entry.file_name().to_string_lossy()),
+            size: metadata.len(),
+            is_dir: metadata.is_dir(),
+            modified_at: metadata
                 .modified()
                 .ok()
                 .map(|t| {
@@ -327,9 +333,12 @@ pub(crate) async fn list(
                     datetime.to_rfc3339()
                 })
                 .unwrap_or_default(),
-        }));
+        });
     }
-    Ok(Json(json!({"success": true, "files": files})))
+    Ok(Json(shared_types::UserappAppFilesListResult {
+        success: true,
+        files,
+    }))
 }
 
 // ── 删除（json {path}）──────────────────────────────────────────────────────────
@@ -652,6 +661,213 @@ mod upload_link_guard_tests {
             "no extraction directory may be created outside the app root"
         );
         drop(tokio::fs::remove_file(&archive).await);
+    }
+}
+
+#[cfg(test)]
+mod upload_short_file_tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt as _;
+
+    fn temp_archive(content: &[u8]) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "ua_short_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().expect("clock")
+        ));
+        std::fs::write(&path, content).expect("short file fixture");
+        path
+    }
+
+    /// R08 反例(共用核心): 1~3 字节普通文件经魔数探测时被 UnexpectedEof 拒绝,
+    /// 修复后应按单文件直写落盘且字节完全一致。
+    #[tokio::test]
+    async fn upload_impl_accepts_short_single_files_with_exact_bytes() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let root = fixture.path().join("app-1");
+        tokio::fs::create_dir_all(&root).await.expect("root");
+        for size in 1..=4u8 {
+            let payload: Vec<u8> = (0..size).map(|i| b'a' + i).collect();
+            let archive = temp_archive(&payload);
+            let outcome = upload_impl(&root, "small.bin", false, &archive, payload.len() as u64)
+                .await
+                .unwrap_or_else(|e| panic!("{size}-byte upload must succeed: {e:?}"));
+            assert_eq!(outcome.extracted_count, None);
+            let written = tokio::fs::read(root.join("small.bin"))
+                .await
+                .expect("written file");
+            assert_eq!(written, payload, "{size}-byte payload must round-trip");
+            drop(tokio::fs::remove_file(&archive).await);
+        }
+    }
+
+    /// 空文件策略保持拒绝(R08 边界: 不改变空文件策略)。
+    #[tokio::test]
+    async fn upload_impl_still_rejects_empty_files() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let root = fixture.path().join("app-1");
+        tokio::fs::create_dir_all(&root).await.expect("root");
+        let archive = temp_archive(b"");
+        let error = upload_impl(&root, "empty.bin", false, &archive, 0)
+            .await
+            .expect_err("empty-file policy must stay rejected");
+        assert!(matches!(error, AppError::Validation(..)), "{error:?}");
+        drop(tokio::fs::remove_file(&archive).await);
+    }
+
+    fn multipart_body(app_id: &str, target: &str, flatten: &str, file_bytes: &[u8]) -> Vec<u8> {
+        const BOUNDARY: &str = "r08-short-file-boundary";
+        let mut body = Vec::new();
+        for (name, value) in [("app_id", app_id), ("target", target), ("flatten", flatten)] {
+            body.extend_from_slice(
+                format!(
+                    "--{BOUNDARY}\r\ncontent-disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        body.extend_from_slice(
+            format!(
+                "--{BOUNDARY}\r\ncontent-disposition: form-data; name=\"file\"; filename=\"payload.bin\"\r\ncontent-type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(file_bytes);
+        body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+        body
+    }
+
+    async fn post_json(
+        router: &axum::Router,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            router.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            ),
+        )
+        .await
+        .expect("deadline")
+        .expect("response");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        (status, serde_json::from_slice(&bytes).expect("envelope"))
+    }
+
+    fn test_router(directory: &std::path::Path) -> axum::Router {
+        let config = std::sync::Arc::new(file_server::Config {
+            userapp_workspace_dir: directory.to_path_buf(),
+            // 默认 /app/project_zips 在测试主机不可写
+            upload_project_dir: directory.join("uploads"),
+            ..file_server::Config::default()
+        });
+        let state = super::super::userapp_files::tests_support::make_state_with_config(config);
+        let (router, _) = crate::routes::userapp_top_router().split_for_parts();
+        router.with_state(state)
+    }
+
+    /// R08 反例(HTTP 入口 1/2): multipart 上传 1~4 字节普通文件成功落盘。
+    #[tokio::test]
+    async fn multipart_upload_accepts_short_single_files() {
+        let directory = tempfile::tempdir().expect("fixture");
+        tokio::fs::create_dir_all(directory.path().join("app-1"))
+            .await
+            .expect("workspace");
+        let router = test_router(directory.path());
+        for size in 1..=4u8 {
+            let payload: Vec<u8> = (0..size).map(|i| b'W' + i).collect();
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                router.clone().oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/userapp/app-files/upload")
+                        .header(
+                            "content-type",
+                            "multipart/form-data; boundary=r08-short-file-boundary",
+                        )
+                        .body(Body::from(multipart_body(
+                            "app-1",
+                            "small.bin",
+                            "false",
+                            &payload,
+                        )))
+                        .expect("upload request"),
+                ),
+            )
+            .await
+            .expect("upload deadline")
+            .expect("upload response");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("upload body");
+            let envelope: serde_json::Value = serde_json::from_slice(&bytes).expect("envelope");
+            assert_eq!(status, axum::http::StatusCode::OK, "size={size} {envelope}");
+            assert_eq!(envelope["success"], serde_json::json!(true), "size={size}");
+            let written = tokio::fs::read(directory.path().join("app-1").join("small.bin"))
+                .await
+                .expect("written file");
+            assert_eq!(written, payload, "{size}-byte payload must round-trip");
+        }
+    }
+
+    /// R08 反例(HTTP 入口 2/2): upload-from-url 下载 1~3 字节普通文件成功落盘。
+    /// 本地一次性的 HTTP 服务作为受控上游。
+    #[tokio::test]
+    async fn upload_from_url_accepts_short_single_files() {
+        let directory = tempfile::tempdir().expect("fixture");
+        tokio::fs::create_dir_all(directory.path().join("app-1"))
+            .await
+            .expect("workspace");
+        let router = test_router(directory.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local upstream");
+        let addr = listener.local_addr().expect("local addr");
+        let payload = b"xy"; // 2 字节: 1~3 字节区间的代表
+        let upstream = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 2048];
+            let _read = socket.read(&mut buf).await.expect("read request");
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            socket.write_all(head.as_bytes()).await.expect("head");
+            socket.write_all(payload).await.expect("body");
+        });
+
+        let (status, envelope) = post_json(
+            &router,
+            "/api/v1/userapp/app-files/upload-from-url",
+            serde_json::json!({
+                "app_id": "app-1",
+                "url": format!("http://{addr}/small.bin"),
+                "target": "small.bin",
+                "flatten": false,
+            }),
+        )
+        .await;
+        upstream.await.expect("local upstream finished");
+        assert_eq!(status, axum::http::StatusCode::OK, "{envelope}");
+        assert_eq!(envelope["success"], serde_json::json!(true));
+        let written = tokio::fs::read(directory.path().join("app-1").join("small.bin"))
+            .await
+            .expect("written file");
+        assert_eq!(written, payload);
     }
 }
 

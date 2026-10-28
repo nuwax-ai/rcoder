@@ -13,7 +13,10 @@
 //! （`stop_dev` 既有路径），不形成第二 kill 路径。
 
 use std::process::ExitStatus;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use tokio::process::Child;
@@ -110,6 +113,10 @@ pub struct SupervisedChild {
     exit: tokio::sync::watch::Receiver<Option<ChildExit>>,
     stdout_task: Mutex<Option<JoinHandle<()>>>,
     stderr_ring: Arc<StderrRing>,
+    root_exit_tx: tokio::sync::watch::Sender<Option<ChildExit>>,
+    managed_tree: Option<tokio::sync::Mutex<process_utils::managed_tree::ManagedChild>>,
+    tree_exit_confirmed: AtomicBool,
+    stop_observer: tokio::sync::Notify,
 }
 
 impl SupervisedChild {
@@ -118,6 +125,7 @@ impl SupervisedChild {
     pub fn adopt(mut child: Child, stderr_ring: Arc<StderrRing>) -> Arc<Self> {
         let pid = child.id().unwrap_or(0);
         let (exit_tx, exit_rx) = tokio::sync::watch::channel(None);
+        let root_exit_tx = exit_tx.clone();
         tokio::spawn(async move {
             // 唯一 wait/reap 点：真实 ExitStatus；wait 罕见 io 错误保留原文。
             let exit = match child.wait().await {
@@ -131,7 +139,104 @@ impl SupervisedChild {
             exit: exit_rx,
             stdout_task: Mutex::new(None),
             stderr_ring,
+            root_exit_tx,
+            managed_tree: None,
+            tree_exit_confirmed: AtomicBool::new(false),
+            stop_observer: tokio::sync::Notify::new(),
         })
+    }
+
+    /// Keep the original spawn-owned wrapper. Unix root exit observation
+    /// retains the original waitable Child/PID pin until Stop proves the group
+    /// inactive and reaps it; Windows retains the stable Job. A Rust wrapper
+    /// around a naked POSIX PGID alone is never treated as stable ownership.
+    pub fn adopt_managed(
+        child: process_utils::managed_tree::ManagedChild,
+        stderr_ring: Arc<StderrRing>,
+    ) -> crate::error::AppResult<Arc<Self>> {
+        let pid = child.id().ok_or_else(|| {
+            crate::error::AppError::process("managed child has no process identifier")
+        })?;
+        let (root_exit_tx, exit) = tokio::sync::watch::channel(None);
+        let supervised = Arc::new(Self {
+            pid,
+            exit,
+            stdout_task: Mutex::new(None),
+            stderr_ring,
+            root_exit_tx,
+            managed_tree: Some(tokio::sync::Mutex::new(child)),
+            tree_exit_confirmed: AtomicBool::new(false),
+            stop_observer: tokio::sync::Notify::new(),
+        });
+        let weak = Arc::downgrade(&supervised);
+        tokio::spawn(async move {
+            let Some(observed) = weak.upgrade() else {
+                return;
+            };
+            let Some(tree) = &observed.managed_tree else {
+                return;
+            };
+            let mut child = tree.lock().await;
+            // Tokio Child::wait is cancellation safe. Stop wakes this single
+            // root observer before acquiring the same original wrapper; no
+            // periodic ps/try_wait task or competing reap worker is needed.
+            tokio::select! {
+                biased;
+                () = observed.stop_observer.notified() => {}
+                result = child.wait_root() => {
+                    let exit = match result {
+                        Ok(status) => ChildExit::Exited(status),
+                        Err(error) => ChildExit::WaitFailed(error.to_string()),
+                    };
+                    observed.root_exit_tx.send_replace(Some(exit));
+                }
+            }
+        });
+        Ok(supervised)
+    }
+
+    pub(super) fn has_managed_tree(&self) -> bool {
+        self.managed_tree.is_some()
+    }
+
+    pub(super) fn tree_exit_confirmed(&self) -> bool {
+        self.tree_exit_confirmed.load(Ordering::Acquire)
+    }
+
+    pub(super) async fn stop_managed_until(
+        &self,
+        grace: Duration,
+        deadline: tokio::time::Instant,
+    ) -> crate::error::AppResult<bool> {
+        use crate::error::AppError;
+        use process_utils::managed_tree::StopOutcome;
+        if self.tree_exit_confirmed() {
+            return Ok(true);
+        }
+        let tree = self
+            .managed_tree
+            .as_ref()
+            .ok_or_else(|| AppError::process("original managed child handle is unavailable"))?;
+        self.stop_observer.notify_one();
+        let mut tree = tokio::time::timeout_at(deadline, tree.lock())
+            .await
+            .map_err(|_| AppError::process("original process-tree stop remains in progress"))?;
+        let outcome = tokio::time::timeout_at(deadline, tree.stop_until(grace, deadline))
+            .await
+            .map_err(|_| {
+                AppError::process(
+                    "original process-tree exit is not confirmed before stop deadline",
+                )
+            })?;
+        match outcome {
+            StopOutcome::Graceful(status) | StopOutcome::Forced(status) => {
+                self.root_exit_tx
+                    .send_replace(Some(ChildExit::Exited(status)));
+                self.tree_exit_confirmed.store(true, Ordering::Release);
+                Ok(true)
+            }
+            StopOutcome::Unconfirmed => Ok(false),
+        }
     }
 
     pub fn pid(&self) -> u32 {
@@ -299,12 +404,15 @@ mod tests {
             .unwrap();
         let pid = victim.id().unwrap();
         let (sender, receiver) = tokio::sync::watch::channel(Some(exit));
-        drop(sender);
         let supervised = Arc::new(SupervisedChild {
             pid,
             exit: receiver,
             stdout_task: Mutex::new(None),
             stderr_ring: ring(),
+            root_exit_tx: sender,
+            managed_tree: None,
+            tree_exit_confirmed: AtomicBool::new(false),
+            stop_observer: tokio::sync::Notify::new(),
         });
         let key = "userapp:reused-pid";
         manager.launches.lock().unwrap().insert(
@@ -363,7 +471,12 @@ mod tests {
             assert!(manager.launches.lock().unwrap().contains_key(key));
             assert!(manager.supervised.lock().unwrap().contains_key(key));
             assert!(matches!(
-                manager.cleanup_state.lock().unwrap().get(key),
+                manager
+                    .cleanup_state
+                    .lock()
+                    .unwrap()
+                    .get(key)
+                    .map(|record| record.status),
                 Some(super::super::types::CleanupStatus::Cleaning)
             ));
         }

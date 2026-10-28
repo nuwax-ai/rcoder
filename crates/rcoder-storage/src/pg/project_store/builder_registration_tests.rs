@@ -136,7 +136,7 @@ impl Fixture {
             .ensure_identity(&format!("receipt{}", uuid::Uuid::new_v4().simple()))
             .await
             .unwrap();
-        let (store, _) = PgStore::connect(&config, "receipt-test".into(), "cluster.local".into())
+        let store = PgStore::connect(&config, "receipt-test".into(), "cluster.local".into())
             .await
             .unwrap();
         Some(Self {
@@ -332,7 +332,6 @@ impl Fixture {
         )
         .await
         .unwrap()
-        .0
     }
 
     async fn insert_foreign_binding(&self, uid: &str) -> UserAppResourceBinding {
@@ -376,6 +375,219 @@ impl Fixture {
         )
         .await
         .unwrap()
+    }
+
+    async fn delete_and_recreate(&self, app: &UserAppLifecycleRecord) -> UserAppLifecycleRecord {
+        let accepted = self
+            .control
+            .admit(&UserAppAdmission {
+                app_id: app.app_id.clone(),
+                lifecycle_id: Some(app.lifecycle_id.clone()),
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
+                request_fingerprint: "d".repeat(64),
+                kind: UserAppOperationKind::DeleteApplication,
+                command: None,
+                metadata: None,
+                runtime_policy_on_success: None,
+            })
+            .await
+            .unwrap();
+        let mut operation = match accepted {
+            UserAppAdmissionOutcome::Accepted(operation) => operation,
+            UserAppAdmissionOutcome::Existing(_) => panic!("fresh deletion required"),
+        };
+        let progress =
+            |operation: &UserAppOperationRecord, state, checkpoint| UserAppOperationProgress {
+                app_id: app.app_id.clone(),
+                lifecycle_id: app.lifecycle_id.clone(),
+                operation_id: operation.operation_id.clone(),
+                expected_revision: operation.revision,
+                executor_id: "deletionworker".into(),
+                state,
+                step: "deletion_contract".into(),
+                checkpoint,
+                error_code: None,
+                error_message: None,
+            };
+        operation = self
+            .control
+            .advance(&progress(
+                &operation,
+                UserAppOperationState::Running,
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap();
+        // This is a real storage state-machine fixture, not a claimed runtime
+        // deletion. The K8s regression separately supplies physical evidence.
+        let mut checkpoint = UserAppDeletionCheckpoint {
+            schema_version: 1,
+            stage: UserAppDeletionStage::Captured,
+            kind: UserAppOperationKind::DeleteApplication,
+            context: UserAppExecutionContext {
+                app_id: app.app_id.clone(),
+                lifecycle_id: app.lifecycle_id.clone(),
+                operation_id: operation.operation_id.clone(),
+                executor_id: "deletionworker".into(),
+                request_fingerprint: operation.request_fingerprint.clone(),
+            },
+            production: AppDeletionSnapshot {
+                app_id: app.app_id.clone(),
+                operation_id: "captured-production".into(),
+                resources: vec![],
+                directories: None,
+            },
+            development: Some(UserappDevDeletionReceipt {
+                runtime: BuilderDeletionSnapshot {
+                    app_id: app.app_id.clone(),
+                    operation_id: "captured-development".into(),
+                    resources: vec![],
+                    resource_binding: None,
+                    docker_bind_cleanup: false,
+                },
+                registry: None,
+                lease: None,
+                collaborators: vec![],
+                directories: None,
+            }),
+        };
+        for stage in [
+            UserAppDeletionStage::Captured,
+            UserAppDeletionStage::ComputeRemoved,
+            UserAppDeletionStage::ProductionStorageRemoved,
+            UserAppDeletionStage::DevelopmentRemoved,
+        ] {
+            checkpoint.stage = stage;
+            operation = self
+                .control
+                .advance(&progress(
+                    &operation,
+                    UserAppOperationState::Running,
+                    serde_json::to_value(&checkpoint).unwrap(),
+                ))
+                .await
+                .unwrap();
+        }
+        self.control
+            .advance(&progress(
+                &operation,
+                UserAppOperationState::Succeeded,
+                operation.checkpoint.clone(),
+            ))
+            .await
+            .unwrap();
+        let deleted = self
+            .control
+            .get_application(&app.app_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deleted.state, UserAppLifecycleState::Deleted);
+        self.control
+            .recreate(
+                &app.app_id,
+                &app.lifecycle_id,
+                &uuid::Uuid::new_v4().to_string(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn completed_old_compute(&self) -> ComputeControlRecord {
+        let id = uuid::Uuid::new_v4().to_string();
+        let pending = self
+            .control
+            .admit_compute_control(&ComputeControlRequest {
+                builder_startup_mode: Default::default(),
+                app_id: self.app.app_id.clone(),
+                lifecycle_id: self.app.lifecycle_id.clone(),
+                scope: UserAppOperationScope::Dev,
+                operation_id: id.clone(),
+                request_id: id,
+                request_fingerprint: "c".repeat(64),
+                action: ComputeControlAction::Restart,
+                restart_image_roll: false,
+            })
+            .await
+            .unwrap();
+        let identity = ComputeExecutorIdentity {
+            app_id: pending.app_id.clone(),
+            lifecycle_id: pending.lifecycle_id.clone(),
+            scope: pending.scope,
+            operation_id: pending.operation_id.clone(),
+            generation: pending.generation,
+            executor_id: "computeworker".into(),
+        };
+        self.control
+            .claim_compute_control(&identity, pending.revision)
+            .await
+            .unwrap();
+        let receipt = UserAppOperationLeaseReceipt::Docker {
+            service_type: ServiceType::UserappBuilder,
+            device: 1,
+            inode: 42,
+            token: "original-compute-lease".into(),
+        };
+        let mut control = self
+            .control
+            .bind_compute_lease(&identity, &receipt)
+            .await
+            .unwrap();
+        for stage in [
+            ComputeControlStage::Stopping,
+            ComputeControlStage::Stopped,
+            ComputeControlStage::Starting,
+            ComputeControlStage::Verifying,
+            ComputeControlStage::Completed,
+        ] {
+            control = self
+                .control
+                .advance_compute_control(&ComputeControlProgress {
+                    identity: identity.clone(),
+                    expected_revision: control.revision,
+                    state: if stage == ComputeControlStage::Completed {
+                        ComputeControlState::Succeeded
+                    } else {
+                        ComputeControlState::Running
+                    },
+                    stage,
+                    checkpoint: serde_json::json!({"original":"compute-history"}),
+                    error_code: None,
+                    error_message: None,
+                })
+                .await
+                .unwrap();
+        }
+        self.control
+            .forget_compute_lease(&identity, &receipt)
+            .await
+            .unwrap();
+        self.control
+            .get_compute_control(&self.app.app_id, &control.operation_id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn recreate_mapping_removed(&self) {
+        let app = self.app.app_id.clone();
+        self.owner
+            .execute(move |mut db| async move {
+                let count = toasty::sql::statement(
+                    "DELETE FROM userapp_requests WHERE app_id=$1 AND target_kind='recreate'",
+                )
+                .bind(app)
+                .exec(&mut db)
+                .await?;
+                assert!(
+                    count > 0,
+                    "fixture removes only already committed recreate mappings"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 
     async fn replace_checkpoint(
@@ -586,6 +798,533 @@ async fn null_completion_repairs_unbound_legacy_registry_and_converges_both_repl
     );
 }
 
+async fn recreated_registration_contract(
+    old_binding: bool,
+    old_workload_uid: bool,
+    old_history: bool,
+    mapping: bool,
+    recreates: usize,
+) {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let old_basic = f.basic("recreateoldpod", "recreateoldsts");
+    let (historical, old_evidence) = f.completed(old_basic.clone(), false).await;
+    if old_binding && old_workload_uid {
+        f.store
+            .register_completed_builder_replacement(&historical, &old_evidence, &f.volumes())
+            .await
+            .unwrap();
+    } else {
+        if old_binding {
+            let (operation, evidence, volumes) =
+                (historical.clone(), old_evidence.clone(), f.volumes());
+            super::super::database::write_with_conflict_retry(&f.store.database, move |tx| {
+                let (operation, evidence, volumes) =
+                    (operation.clone(), evidence.clone(), volumes.clone());
+                Box::pin(async move {
+                    crate::userapp_lifecycle::bind_completed_builder_registration(
+                        tx, &operation, &evidence, &volumes,
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        }
+        let mut legacy = old_basic;
+        if !old_workload_uid {
+            legacy.workload_uid = None;
+        }
+        // Seed the actual legacy shape before any replica loads it. Turning a
+        // live known UID into NULL would test a forbidden identity downgrade
+        // and interfere with concurrent replicas' whole-database sync.
+        f.register_old(legacy).await;
+    }
+    let old_binding_before = f
+        .control
+        .get_resource_binding(&ServiceType::UserappBuilder, &f.uid("recreateoldsts"))
+        .await
+        .unwrap();
+    let historical = if old_history {
+        historical
+    } else {
+        // Simulate a retained pre-projection checkpoint. Keep its bytes rather
+        // than rewriting history to fit the current registration decoder.
+        f.replace_checkpoint(&historical, serde_json::json!({"historical":"opaque"}))
+            .await
+    };
+    let history_bytes = f.operation_bytes(&historical.operation_id).await;
+    let old_compute = f.completed_old_compute().await;
+    let compute_bytes = crate::pg::test_support::optional_text(
+        &f.owner,
+        "SELECT row_to_json(c)::text FROM userapp_compute_controls c WHERE operation_id=$1",
+        &old_compute.operation_id,
+    )
+    .await
+    .unwrap();
+    let stale = f.store.get(&f.app.app_id).unwrap();
+    // ContainerEntry is shared by cached projects. Freeze the immutable old
+    // write before publication updates that shared view to the new physical ID.
+    let old_container = stale.container_info().unwrap();
+    let stale_container = ContainerSnapshot::from_info(
+        &old_container.container_name,
+        &old_container,
+        &ServiceType::UserappBuilder,
+        stale.persistence_identity().container.as_ref().unwrap(),
+        old_container.workload_uid.as_deref(),
+    )
+    .unwrap();
+    let stale_project = ProjectSnapshot::from_info(&stale).unwrap();
+    let peer = f.peer().await;
+    let mut current = f.app.clone();
+    for _ in 0..recreates {
+        current = f.delete_and_recreate(&current).await;
+    }
+    assert_ne!(current.lifecycle_id, f.app.lifecycle_id);
+    if !mapping {
+        f.recreate_mapping_removed().await;
+    }
+    let (completed, evidence) = f
+        .completed_for_application(
+            &current,
+            f.basic("recreatenewpod", "recreatenewsts"),
+            false,
+            None,
+        )
+        .await;
+    let current_bytes = f.operation_bytes(&completed.operation_id).await;
+    f.store.register_completed_builder_replacement(&completed, &evidence, &f.volumes()).await
+        .unwrap_or_else(|error| panic!("current recreated builder must converge (binding={old_binding}, old_uid={old_workload_uid}, history={old_history}, mapping={mapping}, recreates={recreates}): {error:#}"));
+    let registered = f.store.get(&f.app.app_id).unwrap();
+    assert_eq!(
+        registered.container_info(),
+        Some(evidence.container.clone())
+    );
+    let generation = registered
+        .persistence_identity()
+        .container
+        .as_ref()
+        .unwrap()
+        .generation
+        .clone();
+    assert_ne!(
+        generation,
+        stale
+            .persistence_identity()
+            .container
+            .as_ref()
+            .unwrap()
+            .generation
+    );
+    let new_binding = f
+        .control
+        .get_resource_binding(&ServiceType::UserappBuilder, &f.uid("recreatenewsts"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(new_binding.lifecycle_id, current.lifecycle_id);
+    assert_eq!(new_binding.adopted_by_operation, completed.operation_id);
+    // The authoritative transaction committed; another replica can reconcile
+    // its old memory view without allocating another registry generation.
+    peer.register_completed_builder_replacement(&completed, &evidence, &f.volumes())
+        .await
+        .unwrap();
+    f.store
+        .register_completed_builder_replacement(&completed, &evidence, &f.volumes())
+        .await
+        .unwrap();
+    super::super::sync::sync_once(&peer, peer.inner(), &peer.database)
+        .await
+        .unwrap();
+    assert_eq!(
+        peer.get(&f.app.app_id).unwrap().container_info(),
+        Some(evidence.container.clone())
+    );
+    assert_eq!(
+        peer.get(&f.app.app_id)
+            .unwrap()
+            .persistence_identity()
+            .container
+            .as_ref()
+            .unwrap()
+            .generation,
+        generation,
+        "same completion is idempotent across replicas"
+    );
+
+    f.owner
+        .execute(move |mut db| async move {
+            assert_eq!(
+                repo::upsert_container(&mut db, &stale_container).await?,
+                PersistenceOperationOutcome::Superseded,
+                "old immutable container write stays retired"
+            );
+            assert_eq!(
+                repo::upsert_project(&mut db, &stale_project).await?,
+                PersistenceOperationOutcome::Superseded,
+                "old immutable project write cannot restore its route"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        f.control
+            .get_resource_binding(&ServiceType::UserappBuilder, &f.uid("recreateoldsts"))
+            .await
+            .unwrap(),
+        old_binding_before,
+        "old binding is immutable history"
+    );
+    assert_eq!(
+        f.control
+            .get_compute_control(&f.app.app_id, &old_compute.operation_id)
+            .await
+            .unwrap(),
+        Some(old_compute.clone())
+    );
+    assert_eq!(
+        crate::pg::test_support::optional_text(
+            &f.owner,
+            "SELECT row_to_json(c)::text FROM userapp_compute_controls c WHERE operation_id=$1",
+            &old_compute.operation_id
+        )
+        .await
+        .unwrap(),
+        compute_bytes
+    );
+    assert_eq!(
+        f.control
+            .get_operation(&f.app.app_id, &historical.operation_id)
+            .await
+            .unwrap(),
+        Some(historical.clone())
+    );
+    assert_eq!(
+        f.operation_bytes(&historical.operation_id).await,
+        history_bytes
+    );
+    assert_eq!(
+        f.operation_bytes(&completed.operation_id).await,
+        current_bytes
+    );
+    assert_eq!(
+        f.control
+            .get_application(&f.app.app_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .lifecycle_id,
+        current.lifecycle_id
+    );
+    assert!(peer.writer().flush_and_stop(Duration::from_secs(5)).await);
+    assert!(
+        f.store
+            .writer()
+            .flush_and_stop(Duration::from_secs(5))
+            .await
+    );
+    f.owner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn recreated_current_builder_rebinds_retained_old_lifecycle_registry() {
+    recreated_registration_contract(true, true, true, true, 1).await;
+}
+
+#[tokio::test]
+async fn recreated_current_builder_does_not_require_legacy_registration_history() {
+    for binding in [false, true] {
+        for uid in [false, true] {
+            for history in [false, true] {
+                for mapping in [false, true] {
+                    recreated_registration_contract(binding, uid, history, mapping, 1).await;
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn recreated_current_builder_skips_unused_intermediate_lifecycle_without_mapping() {
+    recreated_registration_contract(true, false, false, false, 2).await;
+}
+
+#[tokio::test]
+async fn current_completion_repairs_missing_project_family_but_rejects_foreign_family() {
+    for foreign in [false, true] {
+        let Some(f) = Fixture::new().await else {
+            return;
+        };
+        let old = f
+            .register_old(f.basic("familyoldpod", "familyoldsts"))
+            .await;
+        let (completed, evidence) = f
+            .completed(f.basic("familynewpod", "familynewsts"), false)
+            .await;
+        let (operation, confirmation, volumes, app_id) = (
+            completed.clone(),
+            evidence.clone(),
+            f.volumes(),
+            f.app.app_id.clone(),
+        );
+        // The legacy shape and production rebind share a real transaction, so
+        // concurrent fixtures' whole-database readers never see a transient
+        // invalid global snapshot. The production branch reads the actual row.
+        let result =
+            super::super::database::write_with_conflict_retry(&f.store.database, move |tx| {
+                let (operation, confirmation, volumes, app_id) = (
+                    operation.clone(),
+                    confirmation.clone(),
+                    volumes.clone(),
+                    app_id.clone(),
+                );
+                Box::pin(async move {
+                    if foreign {
+                        toasty::sql::statement(
+                            "UPDATE projects SET service_type=$1 WHERE project_id=$2",
+                        )
+                        .bind(ServiceType::ComputerAgentRunner.to_string())
+                        .bind(app_id)
+                        .exec(tx)
+                        .await?;
+                    } else {
+                        toasty::sql::statement(
+                            "UPDATE projects SET service_type=NULL WHERE project_id=$1",
+                        )
+                        .bind(app_id)
+                        .exec(tx)
+                        .await?;
+                    }
+                    rebind(tx, &operation, &confirmation, &volumes).await
+                })
+            })
+            .await;
+        if foreign {
+            assert!(
+                result.is_err(),
+                "an explicit other family is a real conflict"
+            );
+            f.assert_unchanged(
+                &old,
+                &completed,
+                &f.operation_bytes(&completed.operation_id).await,
+            )
+            .await;
+        } else {
+            let committed =
+                result.expect("missing legacy project family must not block a current completion");
+            f.store
+                .publish_rebound_builder(Some(old), committed)
+                .unwrap();
+            assert_eq!(
+                f.store.get(&f.app.app_id).unwrap().service_type(),
+                Some(ServiceType::UserappBuilder)
+            );
+            assert_eq!(
+                f.store.get(&f.app.app_id).unwrap().container_info(),
+                Some(evidence.container)
+            );
+        }
+        assert!(
+            f.store
+                .writer()
+                .flush_and_stop(Duration::from_secs(5))
+                .await
+        );
+        f.owner.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn same_physical_completion_persists_missing_project_family_before_publication() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let (completed, evidence) = f
+        .completed(f.basic("familysamepod", "familysamests"), false)
+        .await;
+    f.store
+        .register_completed_builder_replacement(&completed, &evidence, &f.volumes())
+        .await
+        .unwrap();
+    let before = f.store.get(&f.app.app_id).unwrap();
+    let bytes = f.operation_bytes(&completed.operation_id).await;
+    let binding = f
+        .control
+        .get_resource_binding(&ServiceType::UserappBuilder, &f.uid("familysamests"))
+        .await
+        .unwrap();
+    let (operation, confirmation, volumes, app_id) = (
+        completed.clone(),
+        evidence.clone(),
+        f.volumes(),
+        f.app.app_id.clone(),
+    );
+    let committed =
+        super::super::database::write_with_conflict_retry(&f.store.database, move |tx| {
+            let (operation, confirmation, volumes, app_id) = (
+                operation.clone(),
+                confirmation.clone(),
+                volumes.clone(),
+                app_id.clone(),
+            );
+            Box::pin(async move {
+                toasty::sql::statement("UPDATE projects SET service_type=NULL WHERE project_id=$1")
+                    .bind(app_id)
+                    .exec(tx)
+                    .await?;
+                rebind(tx, &operation, &confirmation, &volumes).await
+            })
+        })
+        .await
+        .unwrap();
+    // Observe durable state before publishing the returned model: a cached
+    // Some(UserappBuilder) must never hide a NULL still committed in SQL.
+    assert_eq!(
+        crate::pg::test_support::optional_text(
+            &f.owner,
+            "SELECT service_type FROM projects WHERE project_id=$1",
+            &f.app.app_id
+        )
+        .await,
+        Some(ServiceType::UserappBuilder.to_string())
+    );
+    let peer = f.peer().await;
+    assert_eq!(
+        peer.get(&f.app.app_id).unwrap().service_type(),
+        Some(ServiceType::UserappBuilder)
+    );
+    assert_eq!(
+        peer.get(&f.app.app_id).unwrap().container_info(),
+        Some(evidence.container.clone())
+    );
+    f.store
+        .publish_rebound_builder(Some(before), committed)
+        .unwrap();
+    assert_eq!(
+        f.store.get(&f.app.app_id).unwrap().container_info(),
+        Some(evidence.container)
+    );
+    assert_eq!(
+        f.control
+            .get_resource_binding(&ServiceType::UserappBuilder, &f.uid("familysamests"))
+            .await
+            .unwrap(),
+        binding
+    );
+    assert_eq!(f.operation_bytes(&completed.operation_id).await, bytes);
+    assert!(peer.writer().flush_and_stop(Duration::from_secs(5)).await);
+    assert!(
+        f.store
+            .writer()
+            .flush_and_stop(Duration::from_secs(5))
+            .await
+    );
+    f.owner.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn current_typed_predecessor_and_same_workload_pod_recovery_survive_missing_old_uid() {
+    for scenario in ["replacement", "wrong-pvc", "same-workload"] {
+        let Some(f) = Fixture::new().await else {
+            return;
+        };
+        let before = f.basic("typedoldpod", "typedoldsts");
+        let (original, source) = f.completed(before.clone(), false).await;
+        let (operation, confirmation, volumes) = (original.clone(), source.clone(), f.volumes());
+        super::super::database::write_with_conflict_retry(&f.store.database, move |tx| {
+            let (operation, confirmation, volumes) =
+                (operation.clone(), confirmation.clone(), volumes.clone());
+            Box::pin(async move {
+                crate::userapp_lifecycle::bind_completed_builder_registration(
+                    tx,
+                    &operation,
+                    &confirmation,
+                    &volumes,
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+        let original_binding = f
+            .control
+            .get_resource_binding(&ServiceType::UserappBuilder, &f.uid("typedoldsts"))
+            .await
+            .unwrap();
+        let mut legacy = before;
+        legacy.workload_uid = None;
+        let old = f.register_old(legacy).await;
+        let next = f.basic(
+            "typednewpod",
+            if scenario == "same-workload" {
+                "typedoldsts"
+            } else {
+                "typednewsts"
+            },
+        );
+        let (completed, evidence) = if scenario == "same-workload" {
+            f.completed(next, false).await
+        } else {
+            f.completed_with_source(
+                next,
+                true,
+                Some(BuilderCreationPredecessor {
+                    target: source.target,
+                    volumes: f.volumes(),
+                }),
+            )
+            .await
+        };
+        let bytes = f.operation_bytes(&completed.operation_id).await;
+        let mut volumes = f.volumes();
+        if scenario == "wrong-pvc" {
+            volumes[0].uid = "actually-different-current-pvc".into();
+        }
+        let result = f
+            .store
+            .register_completed_builder_replacement(&completed, &evidence, &volumes)
+            .await;
+        if scenario == "wrong-pvc" {
+            assert!(
+                result.is_err(),
+                "missing old UID cannot bypass the current typed PVC constraint"
+            );
+            f.assert_unchanged(&old, &completed, &bytes).await;
+            assert!(
+                f.control
+                    .get_resource_binding(&ServiceType::UserappBuilder, &f.uid("typednewsts"))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            result.unwrap();
+            assert_eq!(
+                f.store.get(&f.app.app_id).unwrap().container_info(),
+                Some(evidence.container)
+            );
+        }
+        assert_eq!(
+            f.control
+                .get_resource_binding(&ServiceType::UserappBuilder, &f.uid("typedoldsts"))
+                .await
+                .unwrap(),
+            original_binding
+        );
+        assert_eq!(f.operation_bytes(&completed.operation_id).await, bytes);
+        assert!(
+            f.store
+                .writer()
+                .flush_and_stop(Duration::from_secs(5))
+                .await
+        );
+        f.owner.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn first_completion_is_durable_and_later_success_keeps_canonical_binding() {
     let Some(f) = Fixture::new().await else {
@@ -696,7 +1435,7 @@ async fn first_completion_is_durable_and_later_success_keeps_canonical_binding()
 }
 
 #[tokio::test]
-async fn missing_old_history_and_conflicting_binding_roll_back_completed_registration() {
+async fn missing_old_history_is_diagnostic_but_foreign_binding_rolls_back_registration() {
     for foreign_binding in [false, true] {
         let Some(f) = Fixture::new().await else {
             return;
@@ -709,20 +1448,35 @@ async fn missing_old_history_and_conflicting_binding_roll_back_completed_registr
             f.insert_foreign_binding("unprovensts").await;
         }
         let bytes = f.operation_bytes(&new.operation_id).await;
-        assert!(
-            f.store
-                .register_completed_builder_replacement(&new, &evidence, &f.volumes())
-                .await
-                .is_err()
-        );
-        assert!(
-            f.control
-                .get_resource_binding(&ServiceType::UserappBuilder, &f.uid("newsts"))
-                .await
-                .unwrap()
-                .is_none()
-        );
-        f.assert_unchanged(&old, &new, &bytes).await;
+        let result = f
+            .store
+            .register_completed_builder_replacement(&new, &evidence, &f.volumes())
+            .await;
+        if foreign_binding {
+            assert!(result.is_err());
+            assert!(
+                f.control
+                    .get_resource_binding(&ServiceType::UserappBuilder, &f.uid("newsts"))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            f.assert_unchanged(&old, &new, &bytes).await;
+        } else {
+            result.expect("missing diagnostic history cannot veto the current completed proof");
+            assert_eq!(
+                f.store.get(&f.app.app_id).unwrap().container_info(),
+                Some(evidence.container)
+            );
+            assert!(
+                f.control
+                    .get_resource_binding(&ServiceType::UserappBuilder, &f.uid("newsts"))
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(f.operation_bytes(&new.operation_id).await, bytes);
+        }
         assert!(
             f.store
                 .writer()
@@ -1085,7 +1839,7 @@ async fn existing_physical_pod_without_workload_uid_is_normalized_without_retire
 }
 
 #[tokio::test]
-async fn missing_old_workload_uid_requires_unique_history_and_respects_foreign_binding() {
+async fn missing_old_workload_uid_uses_current_proof_and_respects_foreign_binding() {
     for scenario in 0..4 {
         let Some(f) = Fixture::new().await else {
             return;
@@ -1112,7 +1866,9 @@ async fn missing_old_workload_uid_requires_unique_history_and_respects_foreign_b
             .store
             .register_completed_builder_replacement(&done, &evidence, &f.volumes())
             .await;
-        if scenario == 0 {
+        if scenario != 2 {
+            // Missing or inconsistent old diagnostic UIDs do not authorize a
+            // physical write, and cannot veto this independently proven route.
             result.unwrap();
             assert_eq!(
                 f.store
@@ -1545,7 +2301,7 @@ async fn legacy_identity_projection_recovers_corrupt_diagnostics_without_rewriti
 }
 
 #[tokio::test]
-async fn legacy_identity_projection_keeps_foreign_conflicting_and_unproved_history_protected() {
+async fn legacy_diagnostic_projection_does_not_override_current_completed_proof() {
     for conflict in ["foreign-project", "workload", "only-unreadable"] {
         let Some(f) = Fixture::new().await else {
             return;
@@ -1556,27 +2312,24 @@ async fn legacy_identity_projection_keeps_foreign_conflicting_and_unproved_histo
         }
         let (historical, _) = f.completed(basic.clone(), false).await;
         let mut checkpoint = historical.checkpoint.clone();
-        let expected_error = match conflict {
+        match conflict {
             "foreign-project" => {
                 checkpoint["project_id"] = serde_json::json!("different-actual-application");
-                "Historical builder ownership result differs from the registry"
             }
             "workload" => {
                 checkpoint["workload_uid"] = serde_json::json!("different-actual-workload");
-                "no unique successful lifecycle history"
             }
             "only-unreadable" => {
                 checkpoint["workload_uid"] = serde_json::json!(["no proven old UID"]);
-                "no unique successful lifecycle history"
             }
             _ => unreachable!(),
-        };
+        }
         checkpoint["created_at"] = serde_json::Value::Null;
         let historical = f.replace_checkpoint(&historical, checkpoint).await;
         let historical_bytes = f.operation_bytes(&historical.operation_id).await;
         let mut unbound_old = basic;
         unbound_old.workload_uid = None;
-        let old = f.register_old(unbound_old).await;
+        f.register_old(unbound_old).await;
         let (completed, evidence) = f
             .completed(
                 f.basic("projectionguardnewpod", "projectionguardnewsts"),
@@ -1584,14 +2337,13 @@ async fn legacy_identity_projection_keeps_foreign_conflicting_and_unproved_histo
             )
             .await;
         let completed_bytes = f.operation_bytes(&completed.operation_id).await;
-        let error = f
-            .store
+        f.store
             .register_completed_builder_replacement(&completed, &evidence, &f.volumes())
             .await
-            .unwrap_err();
-        assert!(
-            format!("{error:#}").contains(expected_error),
-            "{conflict}: {error:#}"
+            .expect("old diagnostic fields are not the current physical or binding authority");
+        assert_eq!(
+            f.store.get(&f.app.app_id).unwrap().container_info(),
+            Some(evidence.container)
         );
         assert!(
             f.control
@@ -1601,9 +2353,12 @@ async fn legacy_identity_projection_keeps_foreign_conflicting_and_unproved_histo
                 )
                 .await
                 .unwrap()
-                .is_none()
+                .is_some()
         );
-        f.assert_unchanged(&old, &completed, &completed_bytes).await;
+        assert_eq!(
+            f.operation_bytes(&completed.operation_id).await,
+            completed_bytes
+        );
         assert_eq!(
             f.control
                 .get_operation(&f.app.app_id, &historical.operation_id)
@@ -1903,7 +2658,7 @@ async fn builder_registration_unknown_commit_does_not_publish_or_replay() {
         config.to_dsn().unwrap(),
         uuid::Uuid::new_v4().simple()
     ));
-    let (uncertain, _) = PgStore::connect(
+    let uncertain = PgStore::connect(
         &config,
         "registration-commit-loss".into(),
         "cluster.local".into(),

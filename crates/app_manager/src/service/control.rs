@@ -201,6 +201,7 @@ impl OwnedOperation {
     pub(crate) async fn begin_hot_convergence(
         &mut self,
         converge_env: &std::collections::HashMap<String, String>,
+        original_env: &shared_types::AppEnvSnapshot,
     ) -> AppResult<()> {
         if self.record.step != "hot_execution"
             || self
@@ -222,6 +223,16 @@ impl OwnedOperation {
             serde_json::to_value(converge_env).map_err(|error| {
                 AppOperationError::Backend(format!("Encode hot convergence target: {error}"))
             })?;
+        if let Some(precondition) =
+            shared_types::HotDeploymentEnvPrecondition::from_snapshot(original_env)
+        {
+            checkpoint["hot_execution"]["converge_precondition"] =
+                serde_json::to_value(precondition).map_err(|error| {
+                    AppOperationError::Backend(format!(
+                        "Encode hot env write precondition: {error}"
+                    ))
+                })?;
+        }
         // CAS must win before any ConfigMap write. A recovery observer that
         // already finalized this snapshot prevents a late coordinator write.
         self.checkpoint("hot_converging", checkpoint).await

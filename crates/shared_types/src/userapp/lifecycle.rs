@@ -399,6 +399,32 @@ pub enum UserAppOperationKind {
     DeleteApplication,
 }
 impl UserAppOperationKind {
+    pub fn supports_hot_deployment(self) -> bool {
+        match self {
+            Self::HotDeploy | Self::StartDeployment | Self::RestartDeployment => true,
+            Self::Create
+            | Self::Update
+            | Self::Start
+            | Self::Restart
+            | Self::Stop
+            | Self::SetRecyclePolicy
+            | Self::EnsureBuilder
+            | Self::StopBuilder
+            | Self::RestartBuilder
+            | Self::AdoptBuilder
+            | Self::AdoptApplication
+            | Self::DeleteCompute
+            | Self::PurgeResources
+            | Self::DeleteApplication
+            | Self::DestroyDevStorage
+            | Self::DestroyProdStorage
+            | Self::ClearDevStorage
+            | Self::ClearProdStorage
+            | Self::PrepareProdDatabase
+            | Self::ResetDevDatabasePassword
+            | Self::ResetProdDatabasePassword => false,
+        }
+    }
     pub fn ends_lifecycle(self) -> bool {
         matches!(self, Self::DeleteApplication)
     }
@@ -621,6 +647,9 @@ pub enum UserAppControlCommand {
     Deploy {
         restart: bool,
         input_digest: String,
+        /// Internal serving recovery; omitted on historical and explicit deployments.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        serving_recovery: bool,
     },
     StopBuilder,
     RestartBuilder,
@@ -664,6 +693,31 @@ pub enum UserAppControlCommand {
 }
 
 impl UserAppControlCommand {
+    pub fn is_traffic_wake(&self) -> bool {
+        match self {
+            Self::Start { traffic } => *traffic,
+            Self::Deploy {
+                restart: false,
+                serving_recovery,
+                ..
+            } => *serving_recovery,
+            Self::Deploy { restart: true, .. }
+            | Self::StopBuilder
+            | Self::RestartBuilder
+            | Self::Create { .. }
+            | Self::Update { .. }
+            | Self::Restart
+            | Self::PrepareProdDatabase
+            | Self::Stop { .. }
+            | Self::SetRecyclePolicy { .. }
+            | Self::DeleteResources { .. }
+            | Self::DeleteApplication
+            | Self::DestroyStorage { .. }
+            | Self::ResetDatabasePassword { .. }
+            | Self::ClearStorage { .. } => false,
+        }
+    }
+
     pub fn kind(&self) -> UserAppOperationKind {
         match self {
             Self::StopBuilder => UserAppOperationKind::StopBuilder,
@@ -913,8 +967,29 @@ pub trait UserAppLifecycleStore: Send + Sync {
         app_id: &str,
         lifecycle_id: &str,
     ) -> Result<Option<crate::UserAppDiscoveredIdentity>, UserAppStoreError>;
+    /// Read-only verification projection. A completed original deletion may
+    /// retire its exact captured PVCs; the immutable witness remains readable
+    /// through `get_recovery_witness`. Missing history never invents retirement.
+    async fn get_recovery_storage_witness(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+    ) -> Result<Option<crate::UserAppDiscoveredIdentity>, UserAppStoreError> {
+        self.get_recovery_witness(app_id, lifecycle_id).await
+    }
     /// Restore only a missing root. An existing different lifecycle or tombstone
     /// is never overwritten; resource discovery is revalidated by the caller.
+    /// Restore an absent root from retained managed storage, without inventing
+    /// compute identity or replaying historical operations.
+    async fn restore_storage_identity(
+        &self,
+        _storage: &crate::UserAppRetainedStorage,
+    ) -> Result<UserAppLifecycleRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Retained storage identity recovery is unsupported".into(),
+        ))
+    }
+
     async fn restore_discovered_identity(
         &self,
         discovered: &crate::UserAppDiscoveredIdentity,
@@ -1002,6 +1077,14 @@ pub trait UserAppLifecycleStore: Send + Sync {
         snapshot: &UserAppOperationRecord,
     ) -> Result<UserAppOperationRecord, UserAppStoreError>;
 
+    /// Fail an expired deployment only at its returned configuration-update
+    /// boundary, when original input proves the next write must first replace
+    /// this exact checkpoint. Never replays deployment or database writes.
+    async fn expire_deployment_update(
+        &self,
+        snapshot: &UserAppOperationRecord,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError>;
+
     /// Revoke an early executor by exact snapshot CAS, preserving its receipt.
     async fn reserve_compute_drain_recovery(
         &self,
@@ -1044,6 +1127,92 @@ pub trait UserAppLifecycleStore: Send + Sync {
     ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
         Err(UserAppStoreError::InvalidOperation(
             "Compute recovery diagnostics are unsupported".into(),
+        ))
+    }
+
+    /// Recoverer-settled terminal failure for a recovery_required compute
+    /// control that cannot be resumed (for example an image roll whose target
+    /// runtime no longer exists). Keeps the original checkpoint evidence and
+    /// records terminal_at.
+    async fn fail_unrecoverable_compute_control(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+        _code: &str,
+        _message: &str,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Unrecoverable compute settlement is unsupported".into(),
+        ))
+    }
+
+    /// Bind (idempotently) the total-operation deadline of a claimed compute
+    /// control, keyed by its operation id in the compute deadline table. An
+    /// existing row is returned unchanged so retried claims and the recovery
+    /// scan can never extend an operation's budget.
+    async fn bind_compute_control_deadline(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+        _deadline_epoch_ms: i64,
+    ) -> Result<i64, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Compute control deadline binding is unsupported".into(),
+        ))
+    }
+
+    /// Read the bound total deadline of a compute control, if any. Like the
+    /// binding it is keyed by the control's operation id in the compute
+    /// deadline table (never the ordinary operation deadline table).
+    async fn compute_control_deadline(
+        &self,
+        _app_id: &str,
+        _operation_id: &str,
+    ) -> Result<Option<i64>, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Compute control deadline read is unsupported".into(),
+        ))
+    }
+
+    /// Settle a claimed compute control whose bound total deadline expired
+    /// while it was still non-terminal. The expiry AND the quiet-window anchor
+    /// are re-verified against the settler's expected anchor inside the same
+    /// transaction, so a concurrent clear or re-anchor revokes the settler.
+    /// This terminal CAS keeps the last durable stage, checkpoint and lease so
+    /// the failure stays diagnosable and the lease cleanup scan still owns the
+    /// physical receipt.
+    async fn fail_expired_compute_control(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+        _code: &str,
+        _message: &str,
+        _expected_unheld_observed_ms: i64,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Expired compute settlement is unsupported".into(),
+        ))
+    }
+
+    /// Anchor (idempotently) the settlement quiet window at the first durable
+    /// observation that the control's physical lease stopped being renewed.
+    /// Returns the anchored timestamp; an existing anchor never slides.
+    async fn mark_compute_control_unheld(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+        _observed_ms: i64,
+    ) -> Result<i64, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Compute control unheld observation is unsupported".into(),
+        ))
+    }
+
+    /// Drop the quiet-window anchor because the lease is held (renewed) again;
+    /// a later unheld transition must re-anchor from its own first
+    /// observation. Idempotent.
+    async fn clear_compute_control_unheld(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+    ) -> Result<(), UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Compute control unheld anchor clearing is unsupported".into(),
         ))
     }
 
@@ -1100,6 +1269,47 @@ pub trait UserAppLifecycleStore: Send + Sync {
     ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
         Err(UserAppStoreError::InvalidOperation(
             "Restart continuation is unsupported".into(),
+        ))
+    }
+
+    /// Record only the original Docker Restart's confirmed stop boundary.
+    /// The runtime must observe the exact captured Container while retaining
+    /// its original FD lease; this CAS never restores/creates/starts compute.
+    async fn confirm_builder_restart_stopped(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+        _observation: &crate::BuilderRestartStopObservation,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Builder restart stop observation is unsupported".into(),
+        ))
+    }
+
+    /// Record only the original Kubernetes Restart's confirmed stop boundary.
+    /// Evidence is the runtime's read-only stop reconciliation for the exact
+    /// captured StatefulSet; this CAS never restores/creates/starts compute.
+    async fn confirm_kubernetes_restart_stopped(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+        _evidence: crate::KubernetesRestartStopEvidence,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Kubernetes restart stop confirmation is unsupported".into(),
+        ))
+    }
+
+    /// Settle an original Docker Restart whose exact old CID is absent and
+    /// whose saved archive reference is missing/unreadable, or whose exact
+    /// referenced private recipe was positively observed unavailable. This never
+    /// grants reconstruction or settles Starting/unknown creation.
+    async fn fail_unrebuildable_builder_restart(
+        &self,
+        _snapshot: &crate::ComputeControlRecord,
+        _observation: &crate::BuilderRestartStopObservation,
+        _unavailable: Option<&crate::BuilderRestartArchiveUnavailable>,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Unrebuildable builder restart settlement is unsupported".into(),
         ))
     }
 
@@ -1286,12 +1496,33 @@ pub trait UserAppLifecycleStore: Send + Sync {
         }
         self.admit_with_input(request, Some(input)).await
     }
+    /// Private configuration salvage for this exact lifecycle. Returned bytes
+    /// are completed inputs, never permission to replay their old side effects.
+    async fn read_retained_runtime_input(
+        &self,
+        _app_id: &str,
+        _lifecycle_id: &str,
+    ) -> Result<Option<UserAppExecutionInput>, UserAppStoreError> {
+        Ok(None)
+    }
+
     /// Available only to the executor that owns the current lifecycle operation;
     /// never exposed through public HTTP surfaces.
     async fn read_execution_input(
         &self,
         context: &UserAppExecutionContext,
     ) -> Result<UserAppExecutionInput, UserAppStoreError>;
+    /// Read an interrupted executor's original private input for observation
+    /// only. The full fenced snapshot and its lifecycle slot must still match.
+    /// This does not reopen execution authority or authorize replaying writes.
+    async fn read_recovery_execution_input(
+        &self,
+        _snapshot: &UserAppOperationRecord,
+    ) -> Result<UserAppExecutionInput, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Private recovery input observation is unsupported".into(),
+        ))
+    }
     /// 绑定操作执行 deadline（epoch ms，旁记录——不动 DeployInput；bind-once：
     /// 已存在时返回持久化值不覆盖，不同副本配置不同也不得各绑各的候选值）。
     /// 与受理原子写入（或至少在任何运行时副作用之前完成；失败 fail-closed）。
@@ -1370,6 +1601,19 @@ pub trait UserAppLifecycleStore: Send + Sync {
     ) -> Result<UserAppOperationRecord, UserAppStoreError> {
         Err(UserAppStoreError::InvalidOperation(
             "Interrupted deletion recovery is unsupported".into(),
+        ))
+    }
+    /// Revoke a stopped-renewing hot coordinator before read-only recovery.
+    /// The caller must observe the exact retained Lease as expired; the store
+    /// compares the full original snapshot and binding in one transaction.
+    /// This grants no runtime write or proof that an already issued write ended.
+    async fn reserve_interrupted_hot(
+        &self,
+        _snapshot: &UserAppOperationRecord,
+        _binding: &crate::UserAppOperationLeaseBinding,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Interrupted hot deployment recovery is unsupported".into(),
         ))
     }
     /// Record a bounded inspection failure without reopening execution authority.
@@ -1465,6 +1709,24 @@ pub trait UserAppLifecycleStore: Send + Sync {
         evidence: &serde_json::Value,
         release_note: &str,
     ) -> Result<UserAppOperationRecord, UserAppStoreError>;
+
+    /// Settle a stale `Running` EnsureBuilder as Failed with the scanner's
+    /// runtime-authority observation evidence (dead executor, no persisted
+    /// receipt/binding, confirmation window elapsed). Narrow gate: kind
+    /// EnsureBuilder + state Running + recorded executor + full snapshot CAS.
+    /// Pure bookkeeping: frees the admission slot, never grants runtime work
+    /// and never fabricates Succeeded. Same honesty rules as
+    /// [`Self::settle_fenced_operation`].
+    async fn settle_stale_running_builder(
+        &self,
+        _snapshot: &UserAppOperationRecord,
+        _evidence: &serde_json::Value,
+        _release_note: &str,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        Err(UserAppStoreError::InvalidOperation(
+            "Stale Running builder settlement is unsupported by this store".into(),
+        ))
+    }
 
     async fn finalize_observed_wake(
         &self,

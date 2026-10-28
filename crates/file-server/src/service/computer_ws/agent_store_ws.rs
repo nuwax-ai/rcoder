@@ -83,6 +83,12 @@ pub async fn create_workspace_with_agent_store(
         crate::service::agent_store::validate_store_segment("skill name", skill_name)?;
     }
 
+    // 工作区级互斥：本函数的链接装配/视图同步与 legacy fan-out、启动 reconciler
+    // 共用同一把 workspace_lock（acquire 自带 create_dir_all），多 Main 副本共享
+    // 存储上串行，防止并发删链/复制互踩。置于校验之后：非法输入不得落盘建目录。
+    // 锁序恒为 workspace → ViewGuard（sync_shared_skill_view 内部再取视图锁）。
+    let _ws_guard = crate::service::workspace_lock::acquire(session_workspace).await?;
+
     // 会话工作区 (显式传入: 默认布局 = user_root/{cid}, 绑定布局 = 绑定目录)
     let session_workspace = session_workspace.to_path_buf();
     fs::create_dir_all(&session_workspace).await?;

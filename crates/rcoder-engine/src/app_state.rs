@@ -20,6 +20,14 @@ use crate::{
 };
 use agent_provisioning::AgentDownloadManager;
 
+mod agent_registration;
+pub use agent_registration::RegistrationMetadata;
+mod agent_observation;
+mod agent_retirement;
+pub use agent_retirement::{
+    AgentAdmissionTargetError, AgentWorkloadFenceError, AgentWorkloadStopError,
+};
+
 // 存储契约 trait 引入作用域：AppState.projects 为枚举 ProjectStoreBackend，
 // 其上的 get/insert/... 方法均经 shared_types::ProjectStore 解析。
 use shared_types::ProjectStore as _;
@@ -47,7 +55,7 @@ pub struct AppState {
     pub userapp_recovery_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// 应用配置
     pub config: AppConfig,
-    /// 项目适配器 - 纯 DashMap 内存存储 + RAII 自动资源回收
+    /// 项目适配器与持久化注册表；物理资源由显式控制入口回收。
     ///
     /// 使用 `Arc<ProjectStoreBackend>` 共享同一实例：
     /// - AppState 业务逻辑通过 `state.projects.method()` 访问（Arc 自动 deref，
@@ -80,9 +88,6 @@ pub struct AppState {
     pub container_prefix_computer: String,
     /// 容器运行时（通过 DI 注入，替代全局 RuntimeManager::get()）
     pub runtime: Arc<dyn ContainerRuntime>,
-    /// RAII 资源回收器接收端（在 start_cleanup_task 中取出并启动 ResourceReaper）
-    pub cleanup_rx:
-        Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<crate::storage::CleanupRequest>>>>,
     /// Agent 下载管理器（统一缓存）
     pub agent_download_manager: Arc<AgentDownloadManager>,
     /// 应用管理服务
@@ -103,7 +108,6 @@ impl AppState {
         container_prefix_computer: String,
         runtime: Arc<dyn ContainerRuntime>,
         projects: Arc<ProjectStoreBackend>,
-        cleanup_rx: tokio::sync::mpsc::Receiver<crate::storage::CleanupRequest>,
         activity: Arc<app_manager::AppActivityRegistry>,
         shutdown_tx: broadcast::Sender<()>,
     ) -> anyhow::Result<Arc<Self>> {
@@ -165,9 +169,12 @@ impl AppState {
         }
         let userapp_store = opened.store;
         let userapp_store_control = opened.control;
+        let mut app_manager_config = config.app_manager.clone();
+        app_manager_config.default_recovery_enabled =
+            config.userapp_storage.default_recovery_enabled;
         let app_service_arc: Arc<app_manager::service::AppService> = Arc::new(
             app_manager::service::AppService::new(
-                config.app_manager.clone(),
+                app_manager_config,
                 runtime.clone(),
                 activity.clone(),
                 pingora.clone(),
@@ -208,7 +215,6 @@ impl AppState {
             container_prefix_rcoder,
             container_prefix_computer,
             runtime,
-            cleanup_rx: Arc::new(std::sync::Mutex::new(Some(cleanup_rx))),
             agent_download_manager,
             app_service,
             activity,
@@ -320,13 +326,21 @@ impl AppState {
         &self,
         project_id: &str,
     ) -> Option<Arc<ProjectAndContainerInfo>> {
-        let removed = self.projects.remove_durable(project_id).await;
-        // session 终结：归还 served_sessions 首连资格条目（防无界累积；调用方
-        // 已先行 shutdown_sse_streams_for_project 关流，此处只清资格登记）
-        if let Some(info) = &removed {
-            for sid in info.sessions() {
+        let claims: Vec<_> = self
+            .get_project(project_id)
+            .into_iter()
+            .flat_map(|info| info.sessions().into_iter())
+            .filter_map(|sid| {
                 self.session_stream_registry
-                    .release_first_client_claim(&sid);
+                    .capture_first_client_claim(&sid)
+                    .map(|claim| (sid, claim))
+            })
+            .collect();
+        let removed = self.projects.remove_durable(project_id).await;
+        if removed.is_some() {
+            for (sid, claim) in claims {
+                self.session_stream_registry
+                    .release_first_client_claim_if_current(&sid, &claim);
             }
         }
         removed
@@ -354,13 +368,23 @@ impl AppState {
             })
             .flat_map(|(_, info)| info.sessions().into_iter())
             .collect();
+        let claims: Vec<_> = sids
+            .into_iter()
+            .filter_map(|sid| {
+                self.session_stream_registry
+                    .capture_first_client_claim(&sid)
+                    .map(|claim| (sid, claim))
+            })
+            .collect();
         let result = self
             .projects
             .delete_container_with_projects_durable(container_id)
             .await;
-        for sid in sids {
-            self.session_stream_registry
-                .release_first_client_claim(&sid);
+        if result.0 || result.1 > 0 {
+            for (sid, claim) in claims {
+                self.session_stream_registry
+                    .release_first_client_claim_if_current(&sid, &claim);
+            }
         }
         result
     }
@@ -464,7 +488,7 @@ impl AppState {
 
     /// 按 grpc_addr 关闭关联的所有 SSE 共享流。
     ///
-    /// 适用于记录可能已被清空的销毁路径（reaper/restart/ensure/destroyer）：这些路径中
+    /// 适用于记录可能已被清空的销毁路径（restart/ensure/destroyer）：这些路径中
     /// project/session 记录可能在关闭前已被移除，无法再走 [`Self::shutdown_sse_streams_for_project`]，
     /// 但它们都能构造出 grpc_addr（与 `grpc_pool.remove` 同源）。幂等：重复调用安全。
     pub fn shutdown_sse_streams_by_addr(&self, grpc_addr: &str) {
@@ -560,6 +584,29 @@ impl AppState {
         }
     }
 
+    /// Capture the catalog/physical identity before stopping a Computer agent.
+    pub async fn capture_project_stop_registration(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<Option<rcoder_storage::ProjectStopFrame>> {
+        self.projects
+            .capture_project_stop_registration(project_id)
+            .await
+    }
+
+    /// Clear only the stopped registration; a later chat keeps its SSE claims.
+    pub async fn clear_sessions_if_current_durable(
+        &self,
+        frame: &rcoder_storage::ProjectStopFrame,
+    ) -> anyhow::Result<shared_types::persistence::PersistenceWriteOutcome> {
+        complete_project_stop_registration(
+            &self.session_stream_registry,
+            frame,
+            self.projects.clear_sessions_if_current_durable(frame),
+        )
+        .await
+    }
+
     /// 清除会话信息（同步版：非 stop 路径/测试用；stop 链路走 durable 版）
     pub fn clear_session(&self, project_id: &str) {
         let sids: Vec<String> = self
@@ -608,6 +655,34 @@ impl AppState {
         self.projects.update_session_activity(session_id);
     }
 }
+
+async fn complete_project_stop_registration(
+    streams: &crate::grpc::SessionStreamRegistry,
+    frame: &rcoder_storage::ProjectStopFrame,
+    completion: impl Future<Output = anyhow::Result<shared_types::persistence::PersistenceWriteOutcome>>,
+) -> anyhow::Result<shared_types::persistence::PersistenceWriteOutcome> {
+    let captured_claims: Vec<_> = frame
+        .project()
+        .sessions()
+        .into_iter()
+        .filter_map(|sid| {
+            streams
+                .capture_first_client_claim(&sid)
+                .map(|claim| (sid, claim))
+        })
+        .collect();
+    let outcome = completion.await?;
+    if outcome == shared_types::persistence::PersistenceWriteOutcome::Committed {
+        for (sid, claim) in captured_claims {
+            streams.release_first_client_claim_if_current(&sid, &claim);
+        }
+    }
+    Ok(outcome)
+}
+
+#[cfg(all(test, any(feature = "kubernetes", feature = "rcoder-pg")))]
+#[path = "app_state/stop_tests.rs"]
+mod stop_tests;
 
 /// 契约二（地址代次失效）守卫判定：失效动作只在"发起时观察到的旧实例
 /// 身份与注册表当前绑定一致，或注册表已无该 workload 绑定"时放行。

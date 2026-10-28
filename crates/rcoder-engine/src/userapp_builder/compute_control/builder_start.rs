@@ -36,7 +36,7 @@ pub(super) async fn prepare_start_options<R: AgentContainerRuntime + ?Sized>(
         None => None,
         Some(saved) => match serde_json::from_value::<BuilderRestartTemplate>(saved.clone()) {
             Ok(template) if template.source.context == target.context => Some(template),
-            _ => {
+            Ok(_) | Err(_) => {
                 // A damaged old reference cannot keep a confirmed retained
                 // controller stopped forever. The runtime still verifies its
                 // physical target and volumes before starting that controller.
@@ -81,13 +81,7 @@ pub(super) async fn start_with_options<R: AgentContainerRuntime + ?Sized>(
         "Missing builder startup has conflicting physical or restart intent"
     );
     ensure!(
-        matches!(
-            receipt,
-            shared_types::UserAppOperationLeaseReceipt::Kubernetes {
-                service_type: shared_types::ServiceType::UserappBuilder,
-                ..
-            }
-        ),
+        super::policy::is_kubernetes_builder_lease(receipt),
         "Missing retained-volume compute startup requires its Kubernetes builder lease"
     );
     receipt.validate().map_err(anyhow::Error::msg)?;
@@ -107,10 +101,11 @@ pub(super) fn retained_volumes(
         })?)?;
     ensure!(
         !volumes.is_empty()
-            && volumes.iter().all(|volume| volume.kind
-                == shared_types::AppResourceKind::PersistentVolumeClaim
-                && !volume.name.is_empty()
-                && !volume.uid.is_empty())
+            && volumes
+                .iter()
+                .all(|volume| super::policy::is_pvc(volume.kind)
+                    && !volume.name.is_empty()
+                    && !volume.uid.is_empty())
             && volumes
                 .iter()
                 .map(|volume| &volume.name)
@@ -177,7 +172,7 @@ pub(super) async fn prepare_missing_restart_target<
         original
             .workload
             .as_ref()
-            .is_some_and(|workload| workload.kind == shared_types::AppResourceKind::StatefulSet)
+            .is_some_and(|workload| super::policy::uses_retained_pvc(workload.kind))
             && observed.context == original.context
             && observed.workload.is_none()
             && observed.pod.is_none()
@@ -190,13 +185,7 @@ pub(super) async fn prepare_missing_restart_target<
         "Vanished builder cannot change its original application or source directory"
     );
     ensure!(
-        matches!(
-            receipt,
-            shared_types::UserAppOperationLeaseReceipt::Kubernetes {
-                service_type: shared_types::ServiceType::UserappBuilder,
-                ..
-            }
-        ),
+        super::policy::is_kubernetes_builder_lease(receipt),
         "Vanished builder recreation requires its original Kubernetes compute lease"
     );
     receipt.validate().map_err(anyhow::Error::msg)?;
@@ -250,15 +239,17 @@ pub(super) fn missing_creation(record: &shared_types::ComputeControlRecord) -> b
     else {
         return false;
     };
-    record.scope == shared_types::UserAppOperationScope::Dev
-        && record.action == shared_types::ComputeControlAction::Restart
-        && matches!(
-            &record.lease,
-            Some(shared_types::UserAppOperationLeaseReceipt::Kubernetes {
-                service_type: shared_types::ServiceType::UserappBuilder,
-                ..
-            })
-        )
+    let builder_scope = match record.scope {
+        shared_types::UserAppOperationScope::Dev => true,
+        shared_types::UserAppOperationScope::Prod
+        | shared_types::UserAppOperationScope::Application => false,
+    };
+    builder_scope
+        && super::policy::is_restart(record.action)
+        && record
+            .lease
+            .as_ref()
+            .is_some_and(super::policy::is_kubernetes_builder_lease)
         && record
             .lease
             .as_ref()

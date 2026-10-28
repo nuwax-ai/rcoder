@@ -152,12 +152,12 @@ pub(super) async fn _install_from_staging(
     // 如果解压/查找失败，清理残留的 agent_dir
     let (binary_path_str, file_count, resolved_args) = match spawn_result {
         Ok(Ok(v)) => v,
-        Ok(Err(e)) => {
-            tokio::fs::remove_dir_all(agent_dir).await.ok();
+        Ok(Err(mut e)) => {
+            cleanup_failed_install(agent_dir, registry.install_dir(), &mut e).await;
             return Err(e);
         }
-        Err(outer) => {
-            tokio::fs::remove_dir_all(agent_dir).await.ok();
+        Err(mut outer) => {
+            cleanup_failed_install(agent_dir, registry.install_dir(), &mut outer).await;
             return Err(outer);
         }
     };
@@ -206,6 +206,138 @@ pub(super) async fn _install_from_staging(
     })
 }
 
+/// 回滚未完成时目录内仍有待恢复的数据，不能按普通安装失败清理。
+async fn cleanup_failed_install(
+    agent_dir: &Path,
+    recovery_root: &Path,
+    error: &mut AgentMgmtError,
+) {
+    match error {
+        AgentMgmtError::NormalizeRollbackIncomplete(source) => {
+            preserve_failed_normalization(agent_dir, recovery_root, source).await;
+            warn!(path = %agent_dir.display(), %source, "preserving incomplete archive rollback");
+        }
+        AgentMgmtError::NotFound(_)
+        | AgentMgmtError::InvalidManifest(_)
+        | AgentMgmtError::ChecksumMismatch { .. }
+        | AgentMgmtError::ArchiveBomb { .. }
+        | AgentMgmtError::PathTraversal(_)
+        | AgentMgmtError::CommandTimeout(_)
+        | AgentMgmtError::InstallFailed(_)
+        | AgentMgmtError::BinaryTooLarge { .. }
+        | AgentMgmtError::BuiltinProtected
+        | AgentMgmtError::StreamTruncated
+        | AgentMgmtError::InvalidChunk(_)
+        | AgentMgmtError::PlatformNotFound(_)
+        | AgentMgmtError::InvalidVersion(_)
+        | AgentMgmtError::InstallCancelled
+        | AgentMgmtError::VersionAlreadyInstalled { .. }
+        | AgentMgmtError::Io(_)
+        | AgentMgmtError::Archive(_)
+        | AgentMgmtError::Json(_)
+        | AgentMgmtError::UnsupportedType(_) => {
+            if let Err(cleanup_error) = tokio::fs::remove_dir_all(agent_dir).await {
+                warn!(path = %agent_dir.display(), %cleanup_error, "failed to clean up incomplete agent install");
+            }
+        }
+    }
+}
+
+/// 仅安装器拥有完整的本轮解压目录，可把失败树隔离到安装根目录下的唯一恢复目录。
+/// 恢复目录与 agent_id 同级，后续有版本/无版本安装均不会清理旧恢复数据。
+/// 通用 archive 归一化也服务用户工作区，不能在那里移动整个 target。
+async fn preserve_failed_normalization(
+    agent_dir: &Path,
+    recovery_root: &Path,
+    error: &mut download_utils::ArchiveError,
+) {
+    use download_utils::ArchiveError;
+    let (rollback, residual) = match error {
+        ArchiveError::NormalizeRollbackIncomplete {
+            rollback, residual, ..
+        } => (rollback, residual),
+        ArchiveError::Io(_)
+        | ArchiveError::PathTraversal(_)
+        | ArchiveError::InvalidArchive(_)
+        | ArchiveError::TooLarge { .. } => return,
+    };
+    let recovery_dir = recovery_root.join(format!(".archive-recovery-{}", uuid::Uuid::new_v4()));
+    if let Err(error) = tokio::fs::create_dir(&recovery_dir).await {
+        rollback.push((
+            agent_dir.to_path_buf(),
+            format!(
+                "create recovery directory {}: {error}; rollback data left in place",
+                recovery_dir.display()
+            ),
+        ));
+        add_residual(residual, agent_dir.to_path_buf());
+        return;
+    }
+
+    // agent_dir 内的残留随整树一起移动；外部残留是归一化自己移出的 wrapper。
+    let mut sources = vec![agent_dir.to_path_buf()];
+    for path in residual.iter() {
+        if !path.starts_with(agent_dir) && !sources.contains(path) {
+            sources.push(path.clone());
+        }
+    }
+    let mut preserved = false;
+    for (index, source) in sources.into_iter().enumerate() {
+        match tokio::fs::symlink_metadata(&source).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                rollback.push((
+                    source.clone(),
+                    format!("inspect rollback data before recovery: {error}; data left in place"),
+                ));
+                add_residual(residual, source);
+                continue;
+            }
+        }
+        let destination = recovery_dir.join(if index == 0 {
+            "extracted".to_string()
+        } else {
+            format!("wrapper-{index}")
+        });
+        if let Err(error) = tokio::fs::rename(&source, &destination).await {
+            rollback.push((
+                source.clone(),
+                format!(
+                    "preserve rollback data at {}: {error}; data left in place",
+                    destination.display()
+                ),
+            ));
+            add_residual(residual, source);
+            continue;
+        }
+        preserved = true;
+        for (path, _) in rollback.iter_mut() {
+            relocate_diagnostic_path(path, &source, &destination);
+        }
+        for path in residual.iter_mut() {
+            relocate_diagnostic_path(path, &source, &destination);
+        }
+        add_residual(residual, destination.clone());
+        warn!(from = %source.display(), to = %destination.display(), "preserved incomplete archive rollback data");
+    }
+    if !preserved && let Err(error) = tokio::fs::remove_dir(&recovery_dir).await {
+        debug!(path = %recovery_dir.display(), %error, "failed to remove empty recovery directory");
+    }
+}
+
+fn add_residual(residual: &mut Vec<std::path::PathBuf>, path: std::path::PathBuf) {
+    if !residual.contains(&path) {
+        residual.push(path);
+    }
+}
+
+fn relocate_diagnostic_path(path: &mut std::path::PathBuf, source: &Path, destination: &Path) {
+    if let Ok(relative) = path.strip_prefix(source) {
+        *path = destination.join(relative);
+    }
+}
+
 /// Detect file type by magic bytes.
 /// Returns one of: "elf" | "pe" | "script" | "tar.gz" | "zip" | "executable"
 ///
@@ -238,4 +370,161 @@ pub fn detect_file_type(bytes: &[u8]) -> String {
         return "script".into();
     }
     "executable".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn incomplete_rollback_cleanup_preserves_data_and_allows_install_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pm =
+            crate::agent_mgmt::path_manager::PathManager::new_with_root(tmp.path().to_path_buf());
+        let registry = AgentRegistry::empty(pm.clone());
+        let agent_dir = pm.agent_version_dir("agent", "1.0.0").unwrap();
+        let wrapper_tmp = agent_dir.parent().unwrap().join("1.0.0__wrapper_tmp.old");
+        std::fs::create_dir_all(agent_dir.join("restored-wrapper")).unwrap();
+        std::fs::create_dir_all(&wrapper_tmp).unwrap();
+        let child = agent_dir.join("still-outside-wrapper.txt");
+        std::fs::write(&child, "moved child").unwrap();
+        std::fs::write(agent_dir.join("restored-wrapper/other.txt"), "other").unwrap();
+        std::fs::write(wrapper_tmp.join("unmoved.txt"), "wrapper child").unwrap();
+        let mut error =
+            AgentMgmtError::from(download_utils::ArchiveError::NormalizeRollbackIncomplete {
+                original: Box::new(download_utils::ArchiveError::Io(std::io::Error::other(
+                    "move failed",
+                ))),
+                rollback: vec![(child.clone(), "move child back: denied".into())],
+                residual: vec![child, wrapper_tmp.clone()],
+            });
+
+        cleanup_failed_install(&agent_dir, pm.install_dir(), &mut error).await;
+
+        assert!(!agent_dir.exists());
+        assert!(!wrapper_tmp.exists());
+        let AgentMgmtError::NormalizeRollbackIncomplete(
+            download_utils::ArchiveError::NormalizeRollbackIncomplete {
+                rollback, residual, ..
+            },
+        ) = &error
+        else {
+            panic!("rollback error type must survive: {error:?}");
+        };
+        let preserved_child = &rollback[0].0;
+        assert_eq!(
+            std::fs::read_to_string(preserved_child).unwrap(),
+            "moved child"
+        );
+        let recovery = preserved_child.parent().unwrap().parent().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(recovery.join("extracted/restored-wrapper/other.txt")).unwrap(),
+            "other"
+        );
+        assert_eq!(
+            std::fs::read_to_string(recovery.join("wrapper-1/unmoved.txt")).unwrap(),
+            "wrapper child"
+        );
+        assert!(residual.iter().all(|path| path.starts_with(recovery)));
+        assert_eq!(
+            error.error_code(),
+            shared_types::error_codes::ERR_AGENT_MGMT_INSTALL_FAILED
+        );
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("move failed"), "{diagnostic}");
+        assert!(
+            diagnostic.contains(&preserved_child.display().to_string()),
+            "{diagnostic}"
+        );
+
+        // 从旧版本失败重走真正的无版本 bytes 安装入口，清理整个 agent_id 后
+        // 重新解压、注册成功，恢复目录仍在 agent_id 外且数据保留。
+        let script = b"#!/bin/sh\necho retry\n";
+        let mut payload = Vec::new();
+        {
+            let gz = flate2::write::GzEncoder::new(&mut payload, flate2::Compression::fast());
+            let mut tar = tar::Builder::new(gz);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(script.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            tar.append_data(&mut header, "agent", &script[..]).unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        let response = super::super::install_from_bytes(
+            &registry,
+            &pm,
+            super::super::InstallBytesParams {
+                agent_id: "agent",
+                command: "agent",
+                args: &[],
+                expected_sha256: None,
+                install_type: InstallType::Binary,
+                bytes: ::bytes::Bytes::from(payload),
+                version: None,
+                source: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(response.installed);
+        assert_eq!(
+            std::fs::read(pm.agent_dir("agent").unwrap().join("agent")).unwrap(),
+            script
+        );
+        assert_eq!(
+            std::fs::read_to_string(preserved_child).unwrap(),
+            "moved child"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_creation_failure_keeps_original_data_and_reports_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent_file = tmp.path().join("not-a-directory");
+        std::fs::write(&parent_file, "keep").unwrap();
+        let agent_dir = parent_file.join("agent");
+        let wrapper_tmp = tmp.path().join("agent__wrapper_tmp.old");
+        std::fs::create_dir_all(&wrapper_tmp).unwrap();
+        std::fs::write(wrapper_tmp.join("unmoved.txt"), "unmoved").unwrap();
+        let mut error =
+            AgentMgmtError::from(download_utils::ArchiveError::NormalizeRollbackIncomplete {
+                original: Box::new(download_utils::ArchiveError::Io(std::io::Error::other(
+                    "move failed",
+                ))),
+                rollback: vec![],
+                residual: vec![wrapper_tmp.clone()],
+            });
+
+        cleanup_failed_install(&agent_dir, &parent_file, &mut error).await;
+
+        assert_eq!(
+            std::fs::read_to_string(wrapper_tmp.join("unmoved.txt")).unwrap(),
+            "unmoved"
+        );
+        assert_eq!(std::fs::read_to_string(parent_file).unwrap(), "keep");
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("data left in place"), "{diagnostic}");
+        assert!(
+            diagnostic.contains(&wrapper_tmp.display().to_string()),
+            "{diagnostic}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_failed_install_cleanup_still_removes_partial_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("partial.txt"), "partial").unwrap();
+
+        cleanup_failed_install(
+            &agent_dir,
+            tmp.path(),
+            &mut AgentMgmtError::InstallFailed("missing entrypoint".into()),
+        )
+        .await;
+
+        assert!(!agent_dir.exists());
+    }
 }

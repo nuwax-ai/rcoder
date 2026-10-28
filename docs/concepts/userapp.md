@@ -32,6 +32,22 @@ dev 与 prod 各有独立的存储：删除 prod 运行容器默认保留数据�
   3. **彻底删除**（`delete/app`）：删除 dev+prod 计算资源与两侧数据，保留 Deleted 生命周期和历史回执；删除的数据不可恢复。
 - 生命周期操作（受理、排队、执行到终态）有完整的操作身份传递；发布/删除类长任务经 SSE 任务事件暴露进度。
 
+### 管理服务重启与缺失容器恢复
+
+RCoder 启动和正常停机均保留已有 Agent、UserApp 与 Builder 容器，不按名称前缀批量删除。启动后从实际资源恢复映射，或在后续使用时按现有发现流程复用；`cleanup_config.enabled` 继续控制后台闲置回收，显式停止、删除和存储清理保持各自语义。
+
+Docker Compose 下，真实 prod 应用访问流量可以重建仍为 Active 的原应用所缺失的运行容器。恢复使用当前已应用的私有运行配置及原四个数据挂载，不创建新的应用身份，不重新提交制品下载、发布 SQL 或数据库改密。运行配置保存在 RCoder 私有持久数据目录的 `.runtime-config/prod/`，包含敏感环境变量，目录0700、文件0600；该目录不挂给应用容器。恢复使用原镜像的不可变内容身份；已被清理的镜像不会静默替换成 `latest`。
+
+已有运行容器会在管理服务启动时补齐恢复配置；某个应用补齐失败只记录该应用的诊断，不阻断其它应用或管理服务启动。旧版本容器及配置均已丢失时，无法推导任意业务环境变量，应通过原发布操作恢复其配置，不能用空默认值冒充无损重建。显式重新部署可覆盖损坏的旧配置。
+
+通过资源发现恢复的应用会保留原 PVC 身份见证。同一生命周期的受控清理已确认销毁对应 PVC 后，校验只读投影会退休该卷的旧 UID，后续显式部署可沿正常流程创建新卷；原见证、清理回执和诊断仍保留。尚未确认的删除、其它应用或不同 UID 的资源继续使用原保护规则，旧流量不会恢复已经销毁的数据。
+
+readiness、状态和资源查询只观察，不启动或重建容器，也不刷新闲置时间。文件、日志和工具访问保留原有停止容器唤醒语义，不因此获得缺失容器重建权限。所有会触发恢复的应用流量必须先通过原有鉴权；Deleted 应用不会被访问复活。
+
+容器级 Stop 的停止意图由显式 Start、Deploy 或 Restart 沿现有流程更新；旧 Stop 回执保留为历史，不再阻挡新启动后的流量恢复。后台流量不会自行反转尚有效的容器停止意图或正在执行的 Stop。
+
+并发业务访问合并为一次协调操作。请求超时或断开仅结束等待；已经开始受理的原重建任务继续收束，不因重试创建第二套业务。内部运行容器启动与业务就绪分开观察：恢复期间可能返回503及 `Retry-After`，该值是重试建议，不能代替业务 readiness 或实际 HTTP 验证。
+
 ### 删除后重新创建
 
 已彻底删除的应用不会因普通工作区 ensure 自动复活。需要继续使用同一 `app_id` 时，调用 `POST /api/v1/userapp/{app_id}/recreate`，提交原 `expected_lifecycle_id` 和本次稳定的 `request_id`。确认 dev/prod 计算资源均已缺失后，接口返回新的 Active 生命周期，`lifecycle_id` 改变、`lifecycle_epoch` 加一；后续操作使用新生命周期。
@@ -61,10 +77,10 @@ dev 与 prod 各有独立的存储：删除 prod 运行容器默认保留数据�
 `GET /api/v1/userapp/{app_id}/{app_stage}/readiness?user_id={user_id}` 回答"当前实例声明的服务集合 + Pingap 入口是否满足健康契约"——与容器探针（`/health`、`/ready`）分离。要点：
 
 - `user_id` 为当前接口必填的调用方参数；实例仍按 `app_id` 与 `app_stage` 定位，不按用户 ID 隔离或选择实例。调用方需显式传参。
-- 查询成功恒 200，**`data.ready` 才表示业务可用**；`status` 覆盖 `not_deployed/starting/stopping/stopped/ready/degraded/failed/unknown/unsupported`，`reason_code` 为结构化原因，`services[]` 为各服务明细、`proxy` 为入口与生效配置观察。
-- dev/prod 按当前实际容器或 Pod 分别观察，查询前后复核实例及控制意图；已停止返回 `stopped`，创建中返回 `starting`，真正缺少部署才返回 `not_deployed`。整个查询限时 8 秒，预算耗尽返回 `unknown/OBSERVE_INCOMPLETE`，可稍后重查。
+- 查询成功恒 200，**`data.ready` 才表示业务可用**；`status` 覆盖 `not_deployed/provisioning/starting/stopping/stopped/ready/degraded/failed/unknown/unsupported`，`reason_code` 为结构化原因，`services[]` 为各服务明细、`proxy` 为入口与生效配置观察。
+- dev/prod 按当前实际容器或 Pod 分别观察，查询前后复核实例及控制意图；已停止返回 `stopped`，dev 计算资源申请/接管中返回 `provisioning`（只出现在 dev：平台在准备 builder，业务快照尚未产生），业务编排启动中返回 `starting`，真正缺少部署才返回 `not_deployed`。整个查询限时 8 秒，预算耗尽返回 `unknown/OBSERVE_INCOMPLETE`，可稍后重查。
 - **只读保证**：查询不启动/唤醒/停止任何服务、不刷新闲置计时、不阻塞 Stop/Restart；停止中的实例返回 `stopping`，旧运行时无新接口返回 `unsupported`。
-- 调用方（界面/Java）建议：显式启动后轮询（间隔 ≥2s、不重叠）；`starting` 显示等待、`ready` 打开预览、`failed` 给出日志入口；`ready=false` 不是接口调用失败；离开页面停止轮询（轮询不会取消实际部署）。完整字段以运行时 OpenAPI（`/api/docs`）为准。
+- 调用方（界面/Java）建议：显式启动后轮询（间隔 ≥2s、不重叠）；`provisioning` 与 `starting` 同属等待态，继续轮询即可（业务快照一旦出现，`provisioning` 即让位给 `not_deployed`/`ready` 等真实状态）；`ready` 打开预览、`failed` 给出日志入口；`ready=false` 不是接口调用失败；离开页面停止轮询（轮询不会取消实际部署）。完整字段以运行时 OpenAPI（`/api/docs`）为准。
 
 ### DBX 界面就绪查询（只读）
 

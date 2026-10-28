@@ -110,6 +110,7 @@ def render(c, images, password, registry_auth=None, pingap_identity=None):
     env = {'CONTAINER_RUNTIME': 'kubernetes', 'RCODER_PORT': '8086', 'RCODER_K8S_NAMESPACE': c.ns,
            'RCODER_K8S_STORAGE_CLASS': c.get('STORAGE_CLASS', 'cephfs'), 'RCODER_K8S_PVC_ACCESS_MODE': 'ReadWriteMany',
            'RCODER_USERAPP_STORAGE_CLASS': c.get('USERAPP_STORAGE_CLASS', 'ceph-rbd'),
+           'RCODER_USERAPP_DEFAULT_RECOVERY_ENABLED': c.get('USERAPP_DEFAULT_RECOVERY_ENABLED', 'true'),
            'RCODER_API_KEY_ENABLED': 'false', 'RCODER_STORAGE_BACKEND': 'postgres', 'RCODER_USERAPP_STORAGE_BACKEND': 'postgres',
            'RCODER_PG_HOST': 'postgres', 'RCODER_PG_USERNAME': 'rcoder', 'RCODER_PG_DATABASE': 'rcoder',
            'RCODER_WORKSPACE_PVC_NAME': 'workspace', 'RCODER_WORKSPACE_SUBPATH': 'workspace',
@@ -169,4 +170,39 @@ def render(c, images, password, registry_auth=None, pingap_identity=None):
         {'matches': [{'path': {'type': 'PathPrefix', 'value': '/api/v1/userapp/proxy/'}}],
          'backendRefs': [{'name': 'rcoder', 'port': 8088}]},
         {'matches': [{'path': {'type': 'PathPrefix', 'value': '/'}}], 'backendRefs': [{'name': 'rcoder', 'port': 8086}]}]}, api='gateway.networking.k8s.io/v1')
+    if c.get('PROFILE', 'full') == 'orphan':
+        out = orphan_fixture(out, c)
     return out
+
+
+def orphan_fixture(rows, c):
+    """Own dynamic PVCs only: never expose the filesystem root in this fixture."""
+    rows = [row for row in rows
+            if row['kind'] != 'PersistentVolume'
+            and not (row['kind'] == 'PersistentVolumeClaim'
+                     and row['metadata']['name'] == 'cephfs-root')]
+    configmap = next(row for row in rows if row['kind'] == 'ConfigMap')
+    config = json.loads(configmap['data']['config.yml'])
+    config['cleanup_config'] = {
+        'enabled': True, 'orphan_reconcile_mode': 'reclaim',
+        'cleanup_interval_seconds': 1,
+        'container_protection_seconds': 2,
+        'long_idle_timeout_seconds': 4,
+        # Registered workloads retain their normal longer idle budget.
+        'idle_timeout_seconds': 3600, 'docker_stop_timeout_seconds': 30,
+    }
+    configmap['metadata']['name'] = 'rcoder-config-' + digest(config)[:12]
+    configmap['data']['config.yml'] = json.dumps(config)
+    for row in rows:
+        if row['kind'] != 'Deployment':
+            continue
+        spec = row['spec']['template']['spec']
+        spec['volumes'] = [volume for volume in spec['volumes'] if volume['name'] != 'cephfs-root']
+        for volume in spec['volumes']:
+            if volume['name'] == 'config':
+                volume['configMap']['name'] = configmap['metadata']['name']
+        for container in spec['containers']:
+            container['volumeMounts'] = [mount for mount in container['volumeMounts']
+                                        if mount['name'] != 'cephfs-root']
+            container['env'] = [value for value in container['env'] if value['name'] != 'RCODER_CEPHFS_ROOT']
+    return rows

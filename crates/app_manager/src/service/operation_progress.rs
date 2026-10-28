@@ -85,13 +85,54 @@ pub(super) struct VerifiedHolderDiagnostic {
     authority: HolderAuthority,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum HolderAuthority {
     Operation,
     ComputeControl,
 }
 
 impl VerifiedHolderDiagnostic {
+    /// A durable-only recheck does not retract a previously verified physical
+    /// observation when every durable fact is unchanged. This retains diagnostic
+    /// evidence only; it never grants lease or mutation authority.
+    pub(super) fn retain_compatible_physical(&mut self, previous: &Self) {
+        let Self {
+            app_id,
+            lifecycle_id,
+            revision,
+            blocker,
+            traffic,
+            updated_at,
+            observed_at: _,
+            physical,
+            authority,
+        } = self;
+        let Self {
+            app_id: previous_app_id,
+            lifecycle_id: previous_lifecycle_id,
+            revision: previous_revision,
+            blocker: previous_blocker,
+            traffic: previous_traffic,
+            updated_at: previous_updated_at,
+            observed_at: _,
+            physical: previous_physical,
+            authority: previous_authority,
+        } = previous;
+        // observed_at belongs to the completed new read. Retaining a receipt
+        // must not replace a new physical observation or cross a changed fact.
+        if physical.is_none()
+            && *app_id == *previous_app_id
+            && *lifecycle_id == *previous_lifecycle_id
+            && *revision == *previous_revision
+            && *blocker == *previous_blocker
+            && *traffic == *previous_traffic
+            && *updated_at == *previous_updated_at
+            && *authority == *previous_authority
+        {
+            *physical = previous_physical.clone();
+        }
+    }
+
     pub(super) fn matches_application(&self, app: &shared_types::UserAppLifecycleRecord) -> bool {
         self.app_id == app.app_id
             && self.lifecycle_id == app.lifecycle_id
@@ -226,13 +267,18 @@ pub(super) fn compute_blocker(
     let kind = match (control.scope, control.action) {
         (Scope::Dev, shared_types::ComputeControlAction::Stop) => Kind::StopBuilder,
         (Scope::Dev, shared_types::ComputeControlAction::Restart) => Kind::RestartBuilder,
-        (_, shared_types::ComputeControlAction::Stop) => Kind::Stop,
-        (_, shared_types::ComputeControlAction::Restart) => Kind::Restart,
+        (Scope::Prod | Scope::Application, shared_types::ComputeControlAction::Stop) => Kind::Stop,
+        (Scope::Prod | Scope::Application, shared_types::ComputeControlAction::Restart) => {
+            Kind::Restart
+        }
     };
     let state = match control.state {
         shared_types::ComputeControlState::Pending => State::Pending,
         shared_types::ComputeControlState::RecoveryRequired => State::RecoveryRequired,
-        _ => State::Running,
+        shared_types::ComputeControlState::Running
+        | shared_types::ComputeControlState::Succeeded
+        | shared_types::ComputeControlState::Failed
+        | shared_types::ComputeControlState::Superseded => State::Running,
     };
     UserAppOperationBlocker {
         scope: control.scope,
@@ -346,10 +392,10 @@ async fn enrich_store_blocker_inner(
                 latest.revision,
             )?;
         }
-        let traffic = matches!(
-            record.command,
-            Some(shared_types::UserAppControlCommand::Start { traffic: true })
-        );
+        let traffic = record
+            .command
+            .as_ref()
+            .is_some_and(|command| command.kind() == record.kind && command.is_traffic_wake());
         let blocker = record.blocker();
         return Ok(HolderObservation::verified(
             app_id,
@@ -435,10 +481,10 @@ impl AppService {
             return Ok(None);
         };
         let waitable = (record.kind == Kind::Start
-            && matches!(
-                record.command,
-                Some(shared_types::UserAppControlCommand::Start { traffic: true })
-            ))
+            && record
+                .command
+                .as_ref()
+                .is_some_and(|command| command.kind() == record.kind && command.is_traffic_wake()))
             || matches!(
                 record.kind,
                 Kind::StartDeployment | Kind::RestartDeployment | Kind::HotDeploy | Kind::Restart
@@ -508,6 +554,13 @@ impl AppService {
                 .observe_operation_holder_inner(app_id, scope, expected, physical)
                 .await;
             super::restart_wait::remember_holder(&result)?;
+            #[cfg(test)]
+            if result.as_ref().is_ok_and(|holder| holder.blocker.is_some()) {
+                super::traffic_wake_wait::pause_at(
+                    super::traffic_wake_wait::WakePausePoint::RestartHolderObserved,
+                )
+                .await;
+            }
             result
         }
     }
@@ -630,10 +683,10 @@ impl AppService {
                 )?;
             }
             let blocker = record.blocker();
-            let traffic = matches!(
-                record.command,
-                Some(shared_types::UserAppControlCommand::Start { traffic: true })
-            );
+            let traffic = record
+                .command
+                .as_ref()
+                .is_some_and(|command| command.kind() == record.kind && command.is_traffic_wake());
             let may_wait = traffic
                 || matches!(
                     record.kind,

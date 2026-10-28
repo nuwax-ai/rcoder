@@ -55,7 +55,11 @@ pub(crate) async fn handle_preview_forward_upstream(
             pingora_core::ErrorType::HTTPStatus(503),
         ));
     };
-    let mut peer = HttpPeer::new(("127.0.0.1", vite_port), false, "".to_string());
+    let mut peer = super::super::upstream::ConnectBudget::streaming().peer(
+        std::net::SocketAddr::from(([127, 0, 0, 1], vite_port)),
+        false,
+        String::new(),
+    )?;
     super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
     ctx.upstream_host = Some("127.0.0.1".to_string());
     Ok(Box::new(peer))

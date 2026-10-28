@@ -52,6 +52,10 @@ pub async fn get_status(
                     AgentStatus::Terminating => "busy",
                 };
                 (status_str, true)
+            } else if req.session_id.is_empty() && AGENT_REGISTRY.is_pending(pid) {
+                // Project preparation is busy even before ACP assigns a real
+                // session. Never publish a session identity or stream epoch for it.
+                ("busy", true)
             } else {
                 // project_id 存在但 agent_info 不存在
                 info!(
@@ -104,7 +108,12 @@ pub async fn get_container_status(
             req.user_id, req.project_id
         );
 
-        let active_tasks = get_active_tasks_count();
+        let connections = user_connection_count().map_err(|error| {
+            Status::unavailable(format!("Container connection activity unavailable: {error}"))
+        })?;
+        let active_tasks = get_active_tasks_count().saturating_add(
+            i32::try_from(connections).unwrap_or(i32::MAX),
+        );
         let uptime_seconds = get_uptime_seconds();
         let is_active = active_tasks > 0;
 
@@ -121,6 +130,7 @@ pub async fn get_container_status(
             status: status.clone(),
             cpu_percent: None,
             memory_mb: None,
+            idle_observation_version: u32::from(cfg!(target_os = "linux")),
         };
 
         debug!(
@@ -186,7 +196,10 @@ pub async fn get_vnc_status(
 fn get_active_tasks_count() -> i32 {
     let agent_count = AGENT_REGISTRY
         .iter_agents()
-        .filter(|entry| entry.value().status == AgentStatus::Active)
+        .filter(|entry| match entry.value().status {
+            AgentStatus::Idle => false,
+            AgentStatus::Pending | AgentStatus::Active | AgentStatus::Terminating => true,
+        })
         .count() as i32;
 
     // 终端 WS 连接也算「容器在用」：终端流量本身不计入 agent active task，
@@ -214,10 +227,64 @@ fn get_active_tasks_count() -> i32 {
     );
 
     agent_count
+        .saturating_add(i32::try_from(AGENT_REGISTRY.pending_preparations()).unwrap_or(i32::MAX))
         .saturating_add(terminal_count)
         .saturating_add(vnc_count)
         .saturating_add(local_workers)
         .saturating_add(http_requests)
+}
+
+/// Preview/HTTP/WebSocket traffic bypasses the agent registry. Count inbound
+/// established sockets on listening user ports, excluding the probing RPC itself.
+#[cfg(target_os = "linux")]
+fn user_connection_count() -> anyhow::Result<usize> {
+    use procfs::net::{TcpState, tcp, tcp6};
+    let entries = tcp()?.into_iter().chain(tcp6()?).collect::<Vec<_>>();
+    let listening = entries
+        .iter()
+        .filter(|entry| entry.state == TcpState::Listen)
+        .map(|entry| entry.local_address.port())
+        .collect::<std::collections::HashSet<_>>();
+    Ok(entries
+        .iter()
+        .filter(|entry| {
+            user_connection(
+                entry.local_address.port(),
+                entry.state == TcpState::Established,
+                listening.contains(&entry.local_address.port()),
+                peer_is_loopback(&entry.remote_address),
+            )
+        })
+        .count())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn user_connection_count() -> anyhow::Result<usize> {
+    Ok(0)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn user_connection(port: u16, established: bool, listening: bool, remote_loopback: bool) -> bool {
+    // Loopback peers are intra-container IPC (a resident tool's local
+    // socketpairs — opencode keeps several alive forever), not user traffic.
+    // Future agents running this code would otherwise hold new containers
+    // at active_tasks >= 3 whenever such a tool runs (the pre-70f30aab
+    // agents in legacy containers lacked this counter entirely).
+    established && listening && port != shared_types::GRPC_DEFAULT_PORT && !remote_loopback
+}
+
+/// Loopback check covering both native IPv6 (`::1`) and IPv4-mapped IPv6
+/// (`::ffff:127.0.0.1`) — `Ipv6Addr::is_loopback` alone misses the mapped
+/// form, which `/proc/net/tcp6` reports for IPv4 loopback sockets on
+/// dual-stack listeners.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn peer_is_loopback(addr: &std::net::SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
 }
 
 fn get_uptime_seconds() -> i64 {
@@ -231,6 +298,54 @@ fn get_uptime_seconds() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparing_without_a_session_keeps_container_active() {
+        let project = "container-status-preparation";
+        assert_eq!(get_active_tasks_count(), 0);
+        AGENT_REGISTRY.set_pending(project);
+        assert!(get_active_tasks_count() > 0);
+        AGENT_REGISTRY.clear_pending_if_exists(project);
+        assert_eq!(get_active_tasks_count(), 0);
+    }
+
+    #[test]
+    fn preview_connections_protect_compute_but_grpc_probes_closed_sockets_and_loopback_ipc_do_not()
+    {
+        assert!(user_connection(80, true, true, false));
+        assert!(user_connection(4000, true, true, false));
+        assert!(!user_connection(
+            shared_types::GRPC_DEFAULT_PORT,
+            true,
+            true,
+            false
+        ));
+        assert!(!user_connection(4000, false, true, false));
+        assert!(!user_connection(49152, true, false, false));
+        // A resident tool's intra-container loopback connection lands on a
+        // listening local port and is established — without the loopback
+        // exclusion it counts as user traffic forever.
+        assert!(!user_connection(34843, true, true, true));
+        assert!(!user_connection(80, true, true, true));
+    }
+
+    #[test]
+    fn loopback_detection_covers_mapped_ipv6_and_rejects_remote_addrs() {
+        use std::net::SocketAddr;
+        let v4: SocketAddr = "127.0.0.1:44580".parse().unwrap();
+        let v6: SocketAddr = "[::1]:44580".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:44580".parse().unwrap();
+        let remote: SocketAddr = "172.18.0.2:43980".parse().unwrap();
+        let remote_v6: SocketAddr = "[::ffff:172.18.0.2]:43980".parse().unwrap();
+        assert!(peer_is_loopback(&v4));
+        assert!(peer_is_loopback(&v6));
+        assert!(
+            peer_is_loopback(&mapped),
+            "Ipv6Addr::is_loopback alone misses the v4-mapped form /proc/net/tcp6 reports"
+        );
+        assert!(!peer_is_loopback(&remote));
+        assert!(!peer_is_loopback(&remote_v6));
+    }
 
     #[tokio::test]
     async fn embedded_worker_keeps_container_active_until_cancelled_execution_exits() {

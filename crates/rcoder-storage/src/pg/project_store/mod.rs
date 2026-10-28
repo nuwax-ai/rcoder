@@ -11,6 +11,7 @@
 //! 语句规范：全部参数绑定（SqlSafeStr 禁动态拼接），写路径幂等。
 //! 与 `pg/userapp/` 的目录级隔离见 `crate::pg` 模块文档。
 
+pub(crate) mod authoritative;
 pub(crate) mod durable;
 pub(crate) mod leader;
 pub(crate) mod load;
@@ -26,8 +27,14 @@ mod tests;
 #[cfg(test)]
 mod lifecycle_tests;
 
+#[cfg(test)]
+mod agent_registration_tests;
+mod agent_replacement;
 mod builder_replacement;
+mod builder_retirement;
+pub(crate) mod container_intent;
 mod database;
+pub(crate) mod project_stop;
 pub(in crate::pg) mod userapp_agent;
 
 #[cfg(test)]

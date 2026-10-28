@@ -21,13 +21,17 @@ use super::support::lock;
 use super::types::{DevServerManager, StartedDev};
 use crate::error::{AppError, AppResult};
 
+#[cfg(all(test, unix))]
+#[path = "io_probe_tests.rs"]
+mod io_probe_tests;
+
 impl DevServerManager {
     /// 票据启动（协调器签发端口与实例身份）。
     pub async fn start_coordinated(&self, ticket: &ExecutorStartTicket) -> AppResult<StartedDev> {
         let project_path = Path::new(&ticket.project_path);
         // workspace.manifest.toml = userapp 域（app-cli 引擎），不进 Custom Page 协调。
         let manifest = project_path.join("workspace.manifest.toml");
-        if tokio::fs::try_exists(&manifest).await.unwrap_or(false) {
+        if tokio::fs::try_exists(&manifest).await? {
             return Err(AppError::business(
                 "workspace manifest projects are userapp domain, not coordinated previews",
             ));
@@ -46,6 +50,13 @@ impl DevServerManager {
             starting: &self.starting,
             project_id: ticket.preview_key.clone(),
         };
+        let matching_instance = lock(&self.processes)?
+            .get(&ticket.preview_key)
+            .is_none_or(|record| record.instance_id.as_deref() == Some(&ticket.instance_id));
+        if matching_instance {
+            self.resume_pending_registered_stop(&ticket.preview_key)
+                .await?;
+        }
         // 幂等：同实例重放返回现有登记；异实例残留为异常态，fail-fast。
         if let Some(p) = lock(&self.processes)?.get(&ticket.preview_key).cloned() {
             if p.instance_id.as_deref() == Some(&ticket.instance_id) {
@@ -104,44 +115,40 @@ impl DevServerManager {
         };
         let _stop_guard = stop_lock.lock().await;
 
-        // Keep the registration until termination finishes. If this future is
-        // cancelled after SIGTERM, a later stop still finds the original PID
-        // and can finish the same instance instead of returning NotRegistered.
-        let proc = lock(&self.processes)?.get(preview_key).cloned();
+        // Capture under the same publication lock order. The shared closure
+        // retains the exact launch/Child, confirms root and tree exit, and only
+        // then retires the maps. A signal callback cannot authorize retirement.
+        let (proc, launch) = {
+            let launches = lock(&self.launches)?;
+            let processes = lock(&self.processes)?;
+            (
+                processes.get(preview_key).cloned(),
+                launches
+                    .get(preview_key)
+                    .map(|launch| launch.launch_id.clone()),
+            )
+        };
         let Some(p) = proc else {
             return Ok(ExecutorStopOutcome::NotRegistered);
         };
         if p.instance_id.as_deref() != Some(instance_id) {
             return Ok(ExecutorStopOutcome::IdentityMismatch);
         }
-        let killed = terminate(p.pid).await;
-        if !killed {
-            if process::is_process_running(p.pid) {
-                return Err(AppError::business(format!(
-                    "coordinated stop could not terminate recorded pid {}",
-                    p.pid
-                )));
+        // FnOnce is enough: the fallback has at most one registered PID. Owned
+        // modern children use their original managed tree instead of callback.
+        let terminate = tokio::sync::Mutex::new(Some(terminate));
+        self.close_local_registration_with_termination(preview_key, launch.as_deref(), |pid| {
+            let terminate = &terminate;
+            async move {
+                let call = terminate.lock().await.take();
+                match call {
+                    Some(call) => call(pid).await,
+                    None => false,
+                }
             }
-            // 进程组已不在（先期退出）也按 Stopped 收口。
-            tracing::warn!(
-                preview_key,
-                pid = p.pid,
-                "coordinated stop found process already gone"
-            );
-        }
-        super::log::cleanup_temp_logs(&p.log_dir).await;
-        let removed = {
-            let mut processes = lock(&self.processes)?;
-            if processes.get(preview_key).is_some_and(|current| {
-                current.instance_id.as_deref() == Some(instance_id) && current.pid == p.pid
-            }) {
-                processes.remove(preview_key);
-                true
-            } else {
-                false
-            }
-        };
-        if !removed {
+        })
+        .await?;
+        if lock(&self.processes)?.contains_key(preview_key) {
             return Ok(ExecutorStopOutcome::IdentityMismatch);
         }
         Ok(ExecutorStopOutcome::Stopped)
@@ -192,6 +199,67 @@ impl DevServerManager {
             pid: Some(i64::from(p.pid)),
             port: Some(p.port),
         })
+    }
+}
+
+#[cfg(all(test, unix))]
+mod signal_ack_regression {
+    use super::*;
+    use crate::models::DevProcess;
+    use std::process::Stdio;
+
+    /// The injected callback acknowledges dispatch but deliberately sends no
+    /// signal. The real child remains alive; this is not an "unkillable sleep".
+    /// Old stop_coordinated_with treats this bool as completion and goes RED.
+    #[tokio::test]
+    async fn signal_ack_without_observed_exit_keeps_original_registration() {
+        let logs = tempfile::tempdir().unwrap();
+        let manager = DevServerManager::new(Arc::new(crate::Config::default()));
+        let key = format!("signal-ack-{}", uuid::Uuid::new_v4().simple());
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        lock(&manager.processes).unwrap().insert(
+            key.clone(),
+            DevProcess {
+                pid,
+                port: 19002,
+                project_id: key.clone(),
+                started_at: 1,
+                instance_id: Some("original-instance".into()),
+                base_path: None,
+                log_dir: logs.path().to_path_buf(),
+                temp_log_name: String::new(),
+                external_owner: None,
+            },
+        );
+        let outcome = manager
+            .stop_coordinated_with(&key, "original-instance", |_pid| async { true })
+            .await;
+        let retained = lock(&manager.processes)
+            .unwrap()
+            .get(&key)
+            .is_some_and(|row| row.pid == pid);
+        let still_alive = child.try_wait().unwrap().is_none();
+        // Own-handle cleanup always precedes assertions, including an old RED.
+        lock(&manager.processes).unwrap().remove(&key);
+        child.kill().await.unwrap();
+        let _exit = child.wait().await.unwrap();
+        assert!(still_alive, "the counterexample must still be executing");
+        assert!(
+            outcome.is_err(),
+            "signal acknowledgement was misreported as stopped: {outcome:?}"
+        );
+        assert!(
+            retained,
+            "the exact registration was retired before exit observation"
+        );
     }
 }
 
@@ -301,6 +369,9 @@ impl PreviewExecutor for DevServerExecutor {
 #[cfg(test)]
 mod r11_tests {
     use super::*;
+    // DevProcess 唯一使用者是下方 cfg(unix) 的协调用例；随之门控以免 Windows
+    // 上报 unused import。
+    #[cfg(unix)]
     use crate::models::DevProcess;
 
     /// R11：PortInUse 分类经类型化变体——修改提示文案（含删除
@@ -323,6 +394,13 @@ mod r11_tests {
         }
     }
 
+    // 仅 POSIX：本用例用合成 PID + 无 supervised 记录，走「无受管子兄弟、靠 PID
+    // 观测退出」的路径，验证第一个 stop 在退出观测确认前挂起、第二个 stop 等锁。
+    // Windows 上 stop_exit_observed 是 cfg(windows) 的专用实现——脱离原始受管
+    // 句柄无法观测进程树退出，直接返回 Err（"requires its original managed child
+    // handle"），第一个 stop 会提前报错返回、根本进不到 terminate 挂起那一步，
+    // 整个用例前提（release 前一直挂起）不成立。
+    #[cfg(unix)]
     #[tokio::test]
     async fn overlapping_stops_wait_for_process_exit_before_reporting_not_registered() {
         let logs = tempfile::tempdir().expect("test logs");
@@ -332,7 +410,7 @@ mod r11_tests {
         lock(&manager.processes).expect("process registry").insert(
             key.to_string(),
             DevProcess {
-                pid: 42,
+                pid: 2_147_483_646,
                 port: 4001,
                 project_id: key.to_string(),
                 instance_id: Some(instance_id.to_string()),

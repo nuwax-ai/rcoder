@@ -1,4 +1,4 @@
-use super::wake::{WakeGuard, WakeHandle};
+use super::wake::{WakeGuard, WakeHandle, WakePurpose};
 use super::*;
 use Arc;
 use std::sync::Mutex as StdMutex;
@@ -747,7 +747,10 @@ fn loaded_activity_never_restores_wake_policy_or_regresses_epoch() {
 async fn guard_broadcasts_failed_on_drop_when_leader_did_not_finish() {
     let map: Arc<DashMap<String, Arc<WakeHandle>>> = Arc::new(DashMap::new());
     let (tx, _) = watch::channel(None::<WakeOutcome>);
-    let handle = Arc::new(WakeHandle { tx });
+    let handle = Arc::new(WakeHandle {
+        tx,
+        purpose: WakePurpose::Existing,
+    });
     map.insert("appg".to_string(), handle.clone());
 
     // follower 先 subscribe(模拟并发请求 join 到 leader)
@@ -806,7 +809,10 @@ fn completed_wake_is_retained_for_follower_that_has_not_subscribed_yet() {
         let map = Arc::new(DashMap::new());
         let (tx, initial_rx) = watch::channel(None::<WakeOutcome>);
         drop(initial_rx);
-        let handle = Arc::new(WakeHandle { tx });
+        let handle = Arc::new(WakeHandle {
+            tx,
+            purpose: WakePurpose::Existing,
+        });
         map.insert("latefollower".into(), handle.clone());
         // The follower selected its role but has not subscribed yet.
         let follower_handle = handle.clone();
@@ -829,7 +835,10 @@ fn deletion_outcome_is_retained_for_a_late_wake_subscriber() {
     let registry = AppActivityRegistry::new(Duration::from_secs(2));
     let (tx, receiver) = watch::channel(None);
     drop(receiver);
-    let handle = Arc::new(WakeHandle { tx });
+    let handle = Arc::new(WakeHandle {
+        tx,
+        purpose: WakePurpose::Existing,
+    });
     registry
         .waking
         .insert("deletedlatesubscriber".into(), handle.clone());
@@ -1183,4 +1192,213 @@ async fn typed_remote_probe_keeps_query_error_without_authorizing_wake() {
         2,
         "failed query must not become negative cache"
     );
+}
+
+async fn serving_follower_fixture(
+    app_id: &str,
+    budget: Duration,
+) -> (
+    Arc<AppActivityRegistry>,
+    Arc<crate::service::AppService>,
+    Arc<crate::test_support::MockRuntime>,
+    tempfile::TempDir,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(crate::test_support::MockRuntime::default());
+    let registry = Arc::new(AppActivityRegistry::new(budget));
+    registry.set_runtime(runtime.clone());
+    let mut service = crate::test_support::test_service(root.path(), runtime.clone()).await;
+    service.activity = registry.clone();
+    service
+        .create_app(crate::models::CreateAppRequest {
+            app_id: Some(app_id.into()),
+            lifecycle_id: None,
+            request_id: None,
+            name: "retained follower application".into(),
+            image: Some("registry.example/app-runtime:applied".into()),
+            command: None,
+            env: None,
+            secrets: None,
+            resources: None,
+            ports: None,
+            health_check: None,
+            tenant_id: None,
+            space_id: None,
+            recycle_enabled: None,
+            idle_timeout_seconds: None,
+        })
+        .await
+        .unwrap();
+    runtime.deployments.remove(app_id);
+    // Existing callers can already have observed stopped before compute was
+    // removed. They enter the flight but cannot reconstruct the missing runtime.
+    registry.mark_stopped(app_id);
+    let service = Arc::new(service);
+    service.attach_activity_coordinator().unwrap();
+    (registry, service, runtime, root)
+}
+
+fn observation_flight(
+    registry: &AppActivityRegistry,
+    app_id: &str,
+    purpose: WakePurpose,
+) -> WakeGuard {
+    let (tx, receiver) = watch::channel(None);
+    drop(receiver);
+    let handle = Arc::new(WakeHandle { tx, purpose });
+    registry.waking.insert(app_id.into(), handle.clone());
+    WakeGuard {
+        map: registry.waking.clone(),
+        key: app_id.into(),
+        handle,
+        outcome: None,
+    }
+}
+
+async fn wait_for_flight_followers(handle: &WakeHandle, count: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while handle.tx.receiver_count() < count {
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("callers subscribed to the original flight");
+}
+
+fn missing_observation() -> WakeOutcome {
+    WakeOutcome::Failed(shared_types::WakeFailure::new(
+        shared_types::ERR_CONTAINER_NOT_FOUND,
+        "wake_runtime_probe",
+        "existing workload is physically absent",
+    ))
+}
+
+#[tokio::test]
+async fn serving_followers_rejoin_after_an_existing_leader_observes_missing_compute() {
+    let app_id = "mixedfollowers";
+    let (registry, _service, runtime, _root) =
+        serving_follower_fixture(app_id, Duration::from_secs(5)).await;
+    let mut original = observation_flight(&registry, app_id, WakePurpose::Existing);
+    let mut callers = Vec::new();
+    for _ in 0..4 {
+        let registry = registry.clone();
+        callers.push(tokio::spawn(async move {
+            registry.ensure_serving(app_id).await
+        }));
+    }
+    wait_for_flight_followers(&original.handle, 4).await;
+    original.outcome = Some(missing_observation());
+    drop(original);
+    for caller in callers {
+        let outcome = tokio::time::timeout(Duration::from_secs(5), caller)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(outcome, WakeOutcome::Ready | WakeOutcome::AlreadyRunning),
+            "{outcome:?}"
+        );
+    }
+    assert_eq!(
+        runtime.create_calls.load(Ordering::SeqCst),
+        2,
+        "one original create and one serving reconstruction"
+    );
+    assert_eq!(runtime.create_params_history.get(app_id).unwrap().len(), 2);
+    assert_eq!(runtime.deployments.len(), 1);
+    assert!(registry.waking.is_empty());
+    assert!(runtime.exec_commands.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn serving_follower_does_not_retry_query_failure_unknown_write_or_timeout() {
+    let known_missing = shared_types::WakeFailure {
+        operation_id: Some("original-admitted-operation".into()),
+        ..shared_types::WakeFailure::new(
+            shared_types::ERR_CONTAINER_NOT_FOUND,
+            "wake",
+            "captured runtime disappeared during an admitted operation",
+        )
+    };
+    let cases = [
+        (
+            WakePurpose::Existing,
+            WakeOutcome::Failed(shared_types::WakeFailure::new(
+                shared_types::ERR_RUNTIME_UNAVAILABLE,
+                "wake_runtime_probe",
+                "runtime query unavailable",
+            )),
+        ),
+        (WakePurpose::Existing, WakeOutcome::Failed(known_missing)),
+        (
+            WakePurpose::Existing,
+            WakeOutcome::Timeout(shared_types::WakeFailure::timeout("wake_wait", None, false)),
+        ),
+        (WakePurpose::Serving, missing_observation()),
+    ];
+    for (index, (purpose, expected)) in cases.into_iter().enumerate() {
+        let app_id = format!("mixednegative{index}");
+        let (registry, _service, runtime, _root) =
+            serving_follower_fixture(&app_id, Duration::from_secs(5)).await;
+        let mut original = observation_flight(&registry, &app_id, purpose);
+        let caller = tokio::spawn({
+            let registry = registry.clone();
+            let app_id = app_id.clone();
+            async move { registry.ensure_serving(&app_id).await }
+        });
+        wait_for_flight_followers(&original.handle, 1).await;
+        original.outcome = Some(expected.clone());
+        drop(original);
+        assert_eq!(caller.await.unwrap(), expected);
+        assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 1);
+        assert!(!runtime.deployments.contains_key(&app_id));
+        assert!(registry.waking.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn serving_follower_rejoins_only_once_when_another_existing_leader_wins() {
+    let app_id = "mixedretrylimit";
+    let (registry, _service, runtime, _root) =
+        serving_follower_fixture(app_id, Duration::from_secs(5)).await;
+    let mut first = observation_flight(&registry, app_id, WakePurpose::Existing);
+    let caller = tokio::spawn({
+        let registry = registry.clone();
+        async move { registry.ensure_serving(app_id).await }
+    });
+    wait_for_flight_followers(&first.handle, 1).await;
+    // A new tool leader wins the map slot after the old flight retires, but
+    // before this serving follower consumes the old result.
+    registry.waking.remove(app_id);
+    let mut second = observation_flight(&registry, app_id, WakePurpose::Existing);
+    first.outcome = Some(missing_observation());
+    drop(first);
+    wait_for_flight_followers(&second.handle, 1).await;
+    second.outcome = Some(missing_observation());
+    drop(second);
+    assert_eq!(caller.await.unwrap(), missing_observation());
+    assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 1);
+    assert!(registry.waking.is_empty());
+}
+
+#[tokio::test]
+async fn serving_follower_wait_does_not_extend_the_original_wake_budget() {
+    let app_id = "mixeddeadline";
+    let (registry, _service, runtime, _root) =
+        serving_follower_fixture(app_id, Duration::from_millis(60)).await;
+    let mut original = observation_flight(&registry, app_id, WakePurpose::Existing);
+    let caller = tokio::spawn({
+        let registry = registry.clone();
+        async move { registry.ensure_serving(app_id).await }
+    });
+    wait_for_flight_followers(&original.handle, 1).await;
+    let outcome = tokio::time::timeout(Duration::from_millis(500), caller)
+        .await
+        .expect("serving wait must not acquire the existing follower grace budget")
+        .unwrap();
+    assert!(matches!(outcome, WakeOutcome::Timeout(_)), "{outcome:?}");
+    original.outcome = Some(missing_observation());
+    drop(original);
+    assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 1);
+    assert!(!runtime.deployments.contains_key(app_id));
 }

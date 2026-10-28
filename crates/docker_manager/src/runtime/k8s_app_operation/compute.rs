@@ -4,6 +4,8 @@ use shared_types::{
     UserAppOperationLeaseReceipt, UserAppOperationScope,
 };
 
+mod handoff;
+
 /// Ordinary operation metadata identifies a prior business owner, not this
 /// compute's prepared attempt. Discovery is read-only; durable settlement is
 /// still the coordinator's responsibility.

@@ -30,6 +30,10 @@ pub(crate) fn spawn_operation(
         let execution = tokio::spawn(async move {
             let _flight = execution_flight;
             let _lease = lease;
+            // Bind before publishing Running or issuing runtime writes. A
+            // completed runtime create receipt does not mean this worker has
+            // finished its management-readiness confirmation on another Main.
+            let ready_deadline = bind_creation_deadline(&owned, &initial).await?;
             let mut claimed = progress(
                 &owned.userapp_store,
                 &initial,
@@ -40,8 +44,9 @@ pub(crate) fn spawn_operation(
                 None,
             )
             .await?;
-            let ready_deadline = Instant::now()
-                + Duration::from_secs(owned.config.userapp_storage.ensure_timeout_seconds);
+            if reject_expired_creation_before_write(&owned, &claimed, &claimed_id, ready_deadline).await? {
+                return Ok(());
+            }
             let startup_mode = claimed_startup_mode(&owned, &claimed, &claimed_id).await?;
             let predecessor = match registration::capture_predecessor(&owned, &claimed).await {
                 Ok(predecessor) => predecessor,
@@ -58,6 +63,30 @@ pub(crate) fn spawn_operation(
                 claimed = progress(&owned.userapp_store, &claimed, &claimed_id,
                     UserAppOperationState::Running, "creation_source_captured",
                     serde_json::json!({"builder_creation_predecessor": predecessor}), None).await?;
+            }
+            if owned.config.userapp_storage.default_recovery_enabled {
+                let storage = match tokio::time::timeout_at(ready_deadline, owned.runtime().discover_retained_app_storage(
+                    &claimed.app_id, shared_types::UserAppOperationScope::Dev,
+                )).await {
+                    Ok(Ok(storage)) => storage,
+                    result => {
+                        progress(&owned.userapp_store, &claimed, &claimed_id,
+                            UserAppOperationState::Failed, "creation_preflight", claimed.checkpoint.clone(),
+                            Some(format!("Inspect retained builder workspace before any runtime write: {result:?}"))).await?;
+                        return Ok(());
+                    }
+                };
+                if let Some(storage) = storage {
+                    let mut checkpoint = claimed.checkpoint.clone();
+                    if checkpoint.is_null() { checkpoint = serde_json::json!({}); }
+                    checkpoint.as_object_mut().ok_or_else(|| anyhow!("Builder checkpoint is not an object"))?
+                        .insert("retained_storage".into(), serde_json::to_value(storage)?);
+                    claimed = progress(&owned.userapp_store, &claimed, &claimed_id,
+                        UserAppOperationState::Running, "creation_storage_captured", checkpoint, None).await?;
+                }
+            }
+            if reject_expired_creation_before_write(&owned, &claimed, &claimed_id, ready_deadline).await? {
+                return Ok(());
             }
             let creation = crate::userapp_builder::create_builder_inner(
                 &owned,
@@ -77,7 +106,7 @@ pub(crate) fn spawn_operation(
                 if Instant::now() >= ready_deadline {
                     // Only readonly observation after expiry; never register
                     // the instance or replay creation from this old executor.
-                    match tokio::time::timeout(Duration::from_secs(30),
+                    match tokio::time::timeout(RUNTIME_OBSERVATION_TIMEOUT,
                         record_late_creation_result(&owned, &claimed, &result)).await
                     {
                         Ok(Ok(())) => {},
@@ -155,7 +184,7 @@ pub(crate) fn spawn_operation(
                     let rejected = error
                         .downcast_ref::<container_runtime_api::ContainerRuntimeError>()
                         .is_some_and(|e| {
-                            matches!(
+                            e.creation_safe_finish() || matches!(
                                 e,
                                 container_runtime_api::ContainerRuntimeError::RequestRejected(_)
                             )
@@ -166,7 +195,15 @@ pub(crate) fn spawn_operation(
                         } else {
                             UserAppOperationState::RecoveryRequired
                         },
-                        if cancelled { serde_json::json!({"creation_cancelled": true}) } else { claimed.checkpoint.clone() },
+                        if cancelled { serde_json::json!({"creation_cancelled": true}) } else {
+                            let mut checkpoint = claimed.checkpoint.clone();
+                            if let Some(container_runtime_api::ContainerRuntimeError::CreationAborted {progress,..}) = error.downcast_ref::<container_runtime_api::ContainerRuntimeError>() {
+                                if checkpoint.is_null() { checkpoint = serde_json::json!({}); }
+                                checkpoint.as_object_mut().ok_or_else(||anyhow!("Builder checkpoint is not an object"))?
+                                    .insert("creation_abort".into(),serde_json::to_value(progress)?);
+                            }
+                            checkpoint
+                        },
                         Some(format!("{error:#}")),
                     )
                 }
@@ -221,6 +258,94 @@ pub(crate) fn spawn_operation(
         }
     });
     Ok(worker)
+}
+
+/// Reuse the existing durable deadline ledger, so another replica's local
+/// timeout configuration cannot shorten the original worker's confirmation.
+async fn bind_creation_deadline(
+    state: &AppState,
+    pending: &UserAppOperationRecord,
+) -> Result<Instant> {
+    let budget_ms = i64::try_from(state.config.userapp_storage.ensure_timeout_seconds)?
+        .checked_mul(1_000)
+        .ok_or_else(|| anyhow!("Builder confirmation budget overflow"))?;
+    let candidate = chrono::Utc::now()
+        .timestamp_millis()
+        .checked_add(budget_ms)
+        .ok_or_else(|| anyhow!("Builder confirmation deadline overflow"))?;
+    let deadline = state
+        .userapp_store
+        .bind_operation_deadline(
+            &pending.app_id,
+            &pending.operation_id,
+            &pending.lifecycle_id,
+            candidate,
+        )
+        .await?;
+    let remaining_ms = deadline.saturating_sub(chrono::Utc::now().timestamp_millis());
+    Ok(Instant::now() + Duration::from_millis(u64::try_from(remaining_ms).unwrap_or(0)))
+}
+
+/// Expiry before any runtime mutation is a known rejection, not an unknown
+/// create outcome. Keep its history while freeing the slot for a fresh request.
+async fn reject_expired_creation_before_write(
+    state: &AppState,
+    claimed: &UserAppOperationRecord,
+    executor: &str,
+    deadline: Instant,
+) -> Result<bool> {
+    if Instant::now() < deadline {
+        return Ok(false);
+    }
+    progress(
+        &state.userapp_store,
+        claimed,
+        executor,
+        UserAppOperationState::Failed,
+        "creation_preflight",
+        claimed.checkpoint.clone(),
+        Some("Original builder confirmation deadline expired before creation; no runtime writes were issued; retry with a fresh request".into()),
+    )
+    .await?;
+    Ok(true)
+}
+
+/// A released physical creation lease says nothing about an active controller
+/// worker's remaining read-only confirmation. Preserve its original revision
+/// until its own deadline, or until it explicitly records an interruption.
+pub(super) async fn running_confirmation_may_be_recovered(
+    state: &AppState,
+    snapshot: &UserAppOperationRecord,
+) -> Result<bool> {
+    match snapshot.state {
+        UserAppOperationState::Running => {}
+        UserAppOperationState::RecoveryRequired => return Ok(true),
+        UserAppOperationState::Pending
+        | UserAppOperationState::WaitingRetry
+        | UserAppOperationState::Succeeded
+        | UserAppOperationState::Failed => return Ok(false),
+    }
+    if let Some(deadline) = state
+        .userapp_store
+        .operation_deadline(&snapshot.app_id, &snapshot.operation_id)
+        .await?
+    {
+        return Ok(chrono::Utc::now().timestamp_millis() >= deadline);
+    }
+    // Existing records predate the bind above. Use the exact persisted claim
+    // revision's progress time, never admission time (Pending may have waited).
+    // A stale/missing revision is not authority to take over its completion.
+    let Some(updated) = state
+        .userapp_store
+        .get_operation_updated_at(&snapshot.app_id, &snapshot.operation_id, snapshot.revision)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let age = chrono::Utc::now().signed_duration_since(updated);
+    Ok(age.to_std().is_ok_and(|age| {
+        age >= Duration::from_secs(state.config.userapp_storage.ensure_timeout_seconds)
+    }))
 }
 
 /// Bound confirmation, not remote execution. Runtime implementations own a
@@ -373,7 +498,9 @@ pub(crate) async fn reconcile_runtime_receipt(
     state: &AppState,
     snapshot: &UserAppOperationRecord,
 ) -> Result<bool> {
-    if !shared_types::userapp_builder_creation_needs_runtime_receipt(snapshot) {
+    if !shared_types::userapp_builder_creation_needs_runtime_receipt(snapshot)
+        || !running_confirmation_may_be_recovered(state, snapshot).await?
+    {
         return Ok(false);
     }
     let Some(_local) = crate::userapp_builder::lifecycle::try_acquire(&snapshot.app_id).await
@@ -400,7 +527,7 @@ pub(crate) async fn reconcile_runtime_receipt(
         request_fingerprint: snapshot.request_fingerprint.clone(),
     };
     let recovered = tokio::time::timeout(
-        Duration::from_secs(30),
+        RUNTIME_OBSERVATION_TIMEOUT,
         state.runtime().recover_builder_creation(&context),
     )
     .await
@@ -450,7 +577,7 @@ pub(crate) async fn reconcile_created(
         .validate_operation(snapshot)
         .map_err(anyhow::Error::msg)?;
     let Some(info) = tokio::time::timeout(
-        Duration::from_secs(30),
+        RUNTIME_OBSERVATION_TIMEOUT,
         observe_created_ready(state, &evidence),
     )
     .await

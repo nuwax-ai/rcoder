@@ -277,3 +277,78 @@ async fn new_artifact_cannot_bypass_an_actual_auxiliary_writer() {
     assert!(state.deploy_rx.lock().await.try_recv().is_err());
     writer.confirm();
 }
+
+#[tokio::test]
+async fn retained_workspace_recovery_dispatches_existing_artifact_without_rebuilding_source_or_downloading()
+ {
+    let (_dir, args, state) = fixture(ExecutionTarget::ProjectRun).await;
+    state
+        .runtime_recovery_hold
+        .store(SOURCE_HISTORY_HOLD, Ordering::Release);
+    let before = std::fs::read(args.workspace.join("release.lock.toml")).unwrap();
+    let kernel = state.runtime_kernel().unwrap();
+    let identity = kernel.identity();
+    let request = shared_types::RuntimeOperationRequest {
+        operation_id: "recover-existing-prod".into(),
+        expected_runtime_instance_id: identity.runtime_instance_id.clone(),
+        expected_revision: 0,
+        workspace_id: identity.workspace_id.clone(),
+        kind: shared_types::RuntimeOperationKind::Deploy,
+        profile: shared_types::RunProfileInput::Artifact {
+            artifact: shared_types::ArtifactInput::RetainedWorkspace {
+                release_id: "new-source".into(),
+            },
+        },
+        run_config: None,
+        request_context: None,
+    };
+    let response = crate::api::bound_router(
+        args.workspace.clone(),
+        args.log_dir.clone(),
+        args.pingap_bin.clone(),
+        state.clone(),
+    )
+    .oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/v1/runtime/operations")
+            .header("content-type", "application/json")
+            .header("x-deploy-token", state.control_token().unwrap())
+            .body(Body::from(serde_json::to_vec(&request).unwrap()))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+    let signal = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.control_rx.lock().await.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        matches!(&signal,ControlSignal::RecoverArtifact {operation_id,workspace,release_id,..}
+        if operation_id=="recover-existing-prod" && workspace==&args.workspace && release_id=="new-source")
+    );
+    let action = settle_control_signal(&state, signal).await;
+    assert!(matches!(action,InitialAction::Existing {workspace} if workspace==args.workspace));
+    assert_eq!(
+        state
+            .deploy_status()
+            .operation
+            .unwrap()
+            .artifact_release_id
+            .as_deref(),
+        Some("new-source")
+    );
+    assert_eq!(
+        std::fs::read(args.workspace.join("release.lock.toml")).unwrap(),
+        before
+    );
+    assert!(
+        state.deploy_rx.lock().await.try_recv().is_err(),
+        "restoration must not queue a new artifact download"
+    );
+    assert_eq!(state.take_pending_dev_profile(), Some(false));
+}

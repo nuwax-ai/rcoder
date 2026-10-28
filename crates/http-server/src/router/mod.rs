@@ -169,7 +169,10 @@ fn apply_route_security(
 ) -> Router {
     layers::apply_security_headers(
         layers::apply_global_middleware(router.merge(internal).merge(files), api_key_config)
-            .merge(preview),
+            .merge(preview)
+            // Preview's guarded fallback must be merged before the single metrics
+            // layer, while Router::layer still has access to MatchedPath.
+            .layer(rcoder_telemetry::HttpMetricsLayer::new()),
     )
 }
 
@@ -217,6 +220,9 @@ mod assembly_guard {
         }
     }
 }
+
+#[cfg(test)]
+mod metrics_assembly_tests;
 
 #[cfg(test)]
 mod optional_key_tests {

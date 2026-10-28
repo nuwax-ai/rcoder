@@ -5,6 +5,16 @@ use crate::{
 };
 use std::fs::{File, TryLockError};
 
+#[derive(Clone)]
+enum ApplicationLeaseAcquisition {
+    Standard,
+    VacantOnly,
+    ObservedExpired {
+        lifecycle_id: String,
+        observed: container_runtime_api::AppOperationMutexIdentity,
+    },
+}
+
 /// File descriptor remains open for the complete create/delete/purge transaction.
 pub(crate) struct AppOperationGuard {
     _flight: Option<shared_types::FlightGuard>,
@@ -267,9 +277,36 @@ impl AppService {
             process,
             false,
             Some(deadline),
+            ApplicationLeaseAcquisition::Standard,
         )
         .await
     }
+    pub(crate) async fn serving_operation_guard_until(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+        process: tokio::sync::OwnedMutexGuard<()>,
+        deadline: tokio::time::Instant,
+        observed_expired: Option<container_runtime_api::AppOperationMutexIdentity>,
+    ) -> AppResult<AppOperationGuard> {
+        let acquisition = match observed_expired {
+            Some(observed) => ApplicationLeaseAcquisition::ObservedExpired {
+                lifecycle_id: lifecycle_id.to_owned(),
+                observed,
+            },
+            None => ApplicationLeaseAcquisition::VacantOnly,
+        };
+        self.operation_guard_scoped_inner(
+            app_id,
+            shared_types::UserAppOperationScope::Prod,
+            process,
+            false,
+            Some(deadline),
+            acquisition,
+        )
+        .await
+    }
+
     pub(crate) async fn operation_guard(
         &self,
         app_id: &str,
@@ -295,8 +332,15 @@ impl AppService {
         process: tokio::sync::OwnedMutexGuard<()>,
         wait: bool,
     ) -> AppResult<AppOperationGuard> {
-        self.operation_guard_scoped_inner(app_id, scope, process, wait, None)
-            .await
+        self.operation_guard_scoped_inner(
+            app_id,
+            scope,
+            process,
+            wait,
+            None,
+            ApplicationLeaseAcquisition::Standard,
+        )
+        .await
     }
 
     async fn operation_guard_scoped_inner(
@@ -306,6 +350,7 @@ impl AppService {
         process: tokio::sync::OwnedMutexGuard<()>,
         wait: bool,
         deadline: Option<tokio::time::Instant>,
+        acquisition: ApplicationLeaseAcquisition,
     ) -> AppResult<AppOperationGuard> {
         let mut flight = Some(
             self.operation_flight
@@ -334,10 +379,30 @@ impl AppService {
                             "Lease acquisition accounting is unavailable".into(),
                         )
                     })?;
+                    let acquisition = acquisition.clone();
                     let mut pending = PendingLeaseAcquisition {
                         app_id: app_id.to_owned(),
                         task: Some(tokio::spawn(async move {
-                            let result = runtime.acquire_app_operation(&worker_app).await;
+                            let result = match acquisition {
+                                ApplicationLeaseAcquisition::Standard => {
+                                    runtime.acquire_app_operation(&worker_app).await
+                                }
+                                ApplicationLeaseAcquisition::VacantOnly => {
+                                    runtime.acquire_vacant_app_operation(&worker_app).await
+                                }
+                                ApplicationLeaseAcquisition::ObservedExpired {
+                                    lifecycle_id,
+                                    observed,
+                                } => {
+                                    runtime
+                                        .acquire_observed_expired_app_operation(
+                                            &worker_app,
+                                            &lifecycle_id,
+                                            &observed,
+                                        )
+                                        .await
+                                }
+                            };
                             (result, owned_flight)
                         })),
                     };

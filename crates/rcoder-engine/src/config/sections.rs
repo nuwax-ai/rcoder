@@ -126,11 +126,28 @@ impl Default for LogCleanupConfig {
 }
 
 /// 容器清理配置（配置文件格式，使用秒作为单位）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrphanReconcileMode {
+    /// Record runtime resources without issuing cleanup writes.
+    Observe,
+    /// Retire only empty, unreferenced, precisely captured managed resources.
+    #[default]
+    Reclaim,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CleanupConfigSettings {
     /// 是否启用容器清理功能（默认禁用，更安全）
     #[serde(default = "default_cleanup_enabled")]
     pub enabled: bool,
+    /// Reverse inventory never deletes live orphan Pods. Reclaim additionally
+    /// retires only empty managed controllers and Services after observation.
+    #[serde(default)]
+    pub orphan_reconcile_mode: OrphanReconcileMode,
+    /// Total reverse-inventory scan budget, independent of physical Stop.
+    #[serde(default = "default_orphan_scan_budget_seconds")]
+    pub orphan_scan_budget_seconds: u64,
     /// 闲置超时时间（秒），默认600秒（10分钟）
     #[serde(default = "default_idle_timeout_seconds")]
     pub idle_timeout_seconds: u64,
@@ -143,13 +160,17 @@ pub struct CleanupConfigSettings {
     /// 容器最小保护时间（秒），默认300秒（5分钟）
     #[serde(default = "default_container_protection_seconds")]
     pub container_protection_seconds: u64,
-    /// 长期闲置超时时间（秒），超过此值才真正销毁容器 + 删 project（默认 86400 = 24 小时）。
+    /// 长期闲置超时时间（秒），超过此值才真正销毁容器 + 删 project（默认 3600 = 1 小时）。
     /// 短期闲置（idle_timeout ~ long_idle_timeout）只标记 Idle、保留容器复用。
     #[serde(default = "default_long_idle_timeout_seconds")]
     pub long_idle_timeout_seconds: u64,
     /// 日志清理配置
     #[serde(default)]
     pub log_cleanup: LogCleanupConfig,
+}
+
+fn default_orphan_scan_budget_seconds() -> u64 {
+    30
 }
 
 fn default_cleanup_enabled() -> bool {
@@ -180,6 +201,8 @@ impl Default for CleanupConfigSettings {
     fn default() -> Self {
         Self {
             enabled: default_cleanup_enabled(),
+            orphan_reconcile_mode: OrphanReconcileMode::default(),
+            orphan_scan_budget_seconds: default_orphan_scan_budget_seconds(),
             idle_timeout_seconds: default_idle_timeout_seconds(),
             cleanup_interval_seconds: default_cleanup_interval_seconds(),
             docker_stop_timeout_seconds: default_docker_stop_timeout_seconds(),

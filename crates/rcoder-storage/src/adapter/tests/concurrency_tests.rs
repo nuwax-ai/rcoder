@@ -9,10 +9,8 @@ use super::*;
 
 #[test]
 fn test_concurrent_insert_remove_no_deadlock() {
-    let (adapter, rx) =
-        ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
+    let adapter = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
     let adapter = Arc::new(adapter);
-    let rx = Arc::new(Mutex::new(rx));
 
     const THREADS: usize = 8;
     const ITERS: usize = 50;
@@ -51,21 +49,12 @@ fn test_concurrent_insert_remove_no_deadlock() {
         THREADS * ITERS,
         "ref_count=0 保留容器条目(不立即清,交 cleaner 回收)"
     );
-
-    // ref_count=0 不再发送 cleanup_tx(物理销毁由 cleaner idle 回收路径触发)。
-    let cleanups = drain_cleanup_requests(&rx);
-    assert_eq!(
-        cleanups.len(),
-        0,
-        "RAII(ref_count=0)不再发 cleanup,物理销毁交 cleaner"
-    );
 }
 
 // 并发同 project_id insert/remove：per-project 锁序列化操作，ref_count 精确正确。
 #[test]
 fn test_concurrent_same_project_insert_remove() {
-    let (adapter, _rx) =
-        ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
+    let adapter = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
     let adapter = Arc::new(adapter);
 
     const THREADS: usize = 8;
@@ -101,10 +90,8 @@ fn test_concurrent_same_project_insert_remove() {
 
 #[test]
 fn test_concurrent_shared_container_remove() {
-    let (adapter, rx) =
-        ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
+    let adapter = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
     let adapter = Arc::new(adapter);
-    let rx = Arc::new(Mutex::new(rx));
 
     let container = ContainerBasicInfo {
         container_id: "shared-id".to_string(),
@@ -158,20 +145,11 @@ fn test_concurrent_shared_container_remove() {
         1,
         "ref_count=0 保留容器条目(不立即清,交 cleaner 回收)"
     );
-
-    // ref_count=0 不再发 cleanup(物理销毁由 cleaner idle 回收路径触发)。
-    let cleanups = drain_cleanup_requests(&rx);
-    assert_eq!(
-        cleanups.len(),
-        0,
-        "RAII(ref_count=0)不再发 cleanup,物理销毁交 cleaner"
-    );
 }
 
 #[test]
 fn test_concurrent_session_update_and_remove() {
-    let (adapter, _rx) =
-        ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
+    let adapter = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
     let adapter = Arc::new(adapter);
 
     let pid = "concurrent-session-proj";
@@ -216,8 +194,7 @@ fn test_concurrent_session_update_and_remove() {
 // 与 test_concurrent_same_project_insert_remove 同款竞态，已用补偿事务修复。
 #[test]
 fn test_concurrent_insert_with_session_and_remove() {
-    let (adapter, _rx) =
-        ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
+    let adapter = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
     let adapter = Arc::new(adapter);
 
     const THREADS: usize = 4;
@@ -251,8 +228,7 @@ fn test_concurrent_insert_with_session_and_remove() {
 
 #[test]
 fn test_concurrent_remove_nonexistent() {
-    let (adapter, _rx) =
-        ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
+    let adapter = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
     let adapter = Arc::new(adapter);
 
     const THREADS: usize = 8;
@@ -282,8 +258,7 @@ fn test_concurrent_remove_nonexistent() {
 
 #[test]
 fn test_concurrent_stress_mixed_operations() {
-    let (adapter, _rx) =
-        ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
+    let adapter = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
     let adapter = Arc::new(adapter);
 
     for i in 0..10 {
@@ -337,28 +312,19 @@ fn test_concurrent_stress_mixed_operations() {
 }
 
 #[test]
-fn test_raii_cleanup_request_content() {
-    let (adapter, rx) =
-        ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
-    let rx = Arc::new(Mutex::new(rx));
+fn test_remove_returns_project() {
+    let adapter = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
 
     let info = Arc::new(create_test_info_with_container("proj-verify", "c-verify"));
     adapter.insert("proj-verify".to_string(), info).unwrap();
 
     let removed = adapter.remove("proj-verify");
     assert!(removed.is_some());
-
-    // 新行为:ref_count=0 不发 cleanup(物理销毁交 cleaner idle 回收),故无 cleanup 请求。
-    // cleanup 请求的"内容"由 delete_container_with_projects 路径(显式销毁)覆盖测试。
-    let cleanups = drain_cleanup_requests(&rx);
-    assert_eq!(cleanups.len(), 0, "RAII(ref_count=0)不再发 cleanup");
 }
 
 #[test]
 fn test_shared_container_ref_count_no_leak_under_reinsert() {
-    let (adapter, rx) =
-        ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
-    let rx = Arc::new(Mutex::new(rx));
+    let adapter = ProjectAdapter::new(TEST_NAMESPACE.to_string(), TEST_CLUSTER_DOMAIN.to_string());
 
     let container = ContainerBasicInfo {
         container_id: "leak-test-id".to_string(),
@@ -407,12 +373,4 @@ fn test_shared_container_ref_count_no_leak_under_reinsert() {
             round
         );
     }
-
-    // 新行为:ref_count=0 不发 cleanup(物理销毁交 cleaner),5 轮均无 cleanup 请求。
-    let cleanups = drain_cleanup_requests(&rx);
-    assert_eq!(
-        cleanups.len(),
-        0,
-        "RAII(ref_count=0)不再发 cleanup,5 轮均无请求"
-    );
 }

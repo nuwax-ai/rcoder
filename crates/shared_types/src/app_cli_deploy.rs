@@ -125,7 +125,58 @@ pub struct AppEnvSnapshot {
     pub deployment_uid: Option<String>,
     pub deployment_version: Option<String>,
     pub resource_name: Option<String>,
+    pub resource_uid: Option<String>,
     pub resource_version: Option<String>,
+}
+
+/// Original conditional environment write, retained inside the existing hot
+/// checkpoint. This is neither a new journal nor authority to replay the write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HotDeploymentEnvPrecondition {
+    pub deployment_uid: String,
+    pub resource_name: String,
+    pub resource_uid: String,
+    pub resource_version: String,
+}
+impl HotDeploymentEnvPrecondition {
+    pub fn from_snapshot(snapshot: &AppEnvSnapshot) -> Option<Self> {
+        let value = Self {
+            deployment_uid: snapshot.deployment_uid.clone()?,
+            resource_name: snapshot.resource_name.clone()?,
+            resource_uid: snapshot.resource_uid.clone()?,
+            resource_version: snapshot.resource_version.clone()?,
+        };
+        value.validate().ok()?;
+        Some(value)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.deployment_uid.is_empty()
+            || self.resource_name.is_empty()
+            || self.resource_uid.is_empty()
+            || self.resource_version.is_empty()
+        {
+            return Err("Incomplete original hot environment write precondition".into());
+        }
+        Ok(())
+    }
+
+    pub fn same_resource(&self, observed: &AppEnvSnapshot) -> bool {
+        self.validate().is_ok()
+            && observed.deployment_uid.as_deref() == Some(self.deployment_uid.as_str())
+            && observed.resource_name.as_deref() == Some(self.resource_name.as_str())
+            && observed.resource_uid.as_deref() == Some(self.resource_uid.as_str())
+    }
+
+    /// resourceVersion is opaque. A different live revision of the same object
+    /// rejects the original conditional PATCH, without guessing numeric order.
+    pub fn write_retired_by(&self, observed: &AppEnvSnapshot) -> bool {
+        self.same_resource(observed)
+            && observed
+                .resource_version
+                .as_deref()
+                .is_some_and(|version| !version.is_empty() && version != self.resource_version)
+    }
 }
 
 /// progress_v1 部署进度载荷（app-cli → rcoder 轮询消费）。
@@ -248,6 +299,85 @@ impl HotDeploymentFailureEvidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hot_env_write_retirement_requires_same_physical_resource_and_changed_revision() {
+        let original = AppEnvSnapshot {
+            deployment_uid: Some("deployment-uid".into()),
+            resource_name: Some("app-env".into()),
+            resource_uid: Some("configmap-uid".into()),
+            resource_version: Some("revision-before".into()),
+            ..Default::default()
+        };
+        let condition = HotDeploymentEnvPrecondition::from_snapshot(&original).unwrap();
+        let mut future = serde_json::to_value(&condition).unwrap();
+        future["writer_diagnostic"] = serde_json::json!({"attempt": "retained-extra-field"});
+        let decoded: HotDeploymentEnvPrecondition = serde_json::from_value(future.clone()).unwrap();
+        assert_eq!(
+            decoded, condition,
+            "additional diagnostics must not invalidate native write evidence"
+        );
+        for field in [
+            "deployment_uid",
+            "resource_name",
+            "resource_uid",
+            "resource_version",
+        ] {
+            let mut missing = future.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<HotDeploymentEnvPrecondition>(missing).is_err(),
+                "{field}"
+            );
+            let mut wrong_type = future.clone();
+            wrong_type[field] = serde_json::json!(17);
+            assert!(
+                serde_json::from_value::<HotDeploymentEnvPrecondition>(wrong_type).is_err(),
+                "{field}"
+            );
+            let mut empty = future.clone();
+            empty[field] = serde_json::json!("");
+            assert!(
+                serde_json::from_value::<HotDeploymentEnvPrecondition>(empty)
+                    .unwrap()
+                    .validate()
+                    .is_err(),
+                "{field}"
+            );
+        }
+        assert!(!condition.write_retired_by(&original));
+        let current = AppEnvSnapshot {
+            resource_version: Some("revision-after".into()),
+            ..original.clone()
+        };
+        assert!(condition.write_retired_by(&current));
+        for variant in [
+            "deployment",
+            "name",
+            "uid",
+            "missing-version",
+            "empty-version",
+        ] {
+            let mut changed = current.clone();
+            match variant {
+                "deployment" => changed.deployment_uid = Some("successor-deployment".into()),
+                "name" => changed.resource_name = Some("successor-env".into()),
+                "uid" => changed.resource_uid = Some("successor-configmap".into()),
+                "missing-version" => changed.resource_version = None,
+                "empty-version" => changed.resource_version = Some(String::new()),
+                _ => unreachable!(),
+            }
+            assert!(!condition.write_retired_by(&changed), "{variant}");
+        }
+        let old = AppEnvSnapshot {
+            resource_uid: None,
+            ..original
+        };
+        assert!(
+            HotDeploymentEnvPrecondition::from_snapshot(&old).is_none(),
+            "never invent a historical ConfigMap UID"
+        );
+    }
 
     /// wire 值快照：锁死 snake_case 序列化（Java/rcoder 消费契约）。
     #[test]

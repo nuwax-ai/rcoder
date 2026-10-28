@@ -12,7 +12,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 use shared_types::RemoteWakeState;
 use std::time::Duration;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 use crate::router::RouteType;
 
@@ -52,6 +52,65 @@ async fn wait_for_peer_connection(peer: &HttpPeer, deadline: tokio::time::Instan
 }
 
 impl PortProxy {
+    fn validate_request_api_key(&self, session: &Session, path: &str) -> PingoraResult<()> {
+        let Some(config) = self.api_key_config.as_ref() else {
+            return Ok(());
+        };
+        let key = session
+            .req_header()
+            .headers
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok());
+        shared_types::ApiKeyValidator::validate(config, path, key).map_err(|error| {
+            let (status, detail) = match error {
+                shared_types::ApiKeyAuthError::Invalid => (401, "Invalid API key"),
+                shared_types::ApiKeyAuthError::Missing => (401, "Missing x-api-key header"),
+                shared_types::ApiKeyAuthError::ConfigError => (500, "Internal configuration error"),
+            };
+            warn!(%path, status, "[PINGORA_AUTH] {detail}");
+            pingora_core::Error::new(ErrorType::HTTPStatus(status)).more_context(detail.to_string())
+        })
+    }
+
+    /// An address can disappear after the initial routing probe. Only a fresh,
+    /// successful absence observation may turn a failed application dispatch
+    /// into deployment recovery; DNS/API/transport failures are not absence.
+    async fn restore_missing_app_after_dispatch(
+        &self,
+        app_id: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, shared_types::WakeFailure> {
+        let Some(control) = self.wake_control.as_ref() else {
+            return Ok(false);
+        };
+        if !matches!(
+            tokio::time::timeout_at(deadline, control.remote_wake_state_fresh(app_id)).await,
+            Ok(RemoteWakeState::Missing)
+        ) {
+            return Ok(false);
+        }
+        match tokio::time::timeout_at(deadline, control.ensure_serving(app_id)).await {
+            Ok(shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning) => {
+                Ok(true)
+            }
+            Ok(
+                shared_types::WakeOutcome::Failed(failure)
+                | shared_types::WakeOutcome::Timeout(failure),
+            ) => Err(failure),
+            Ok(shared_types::WakeOutcome::Blocked { message, blocker }) => {
+                Err(shared_types::WakeFailure {
+                    blocker: Some(Box::new(blocker)),
+                    ..shared_types::WakeFailure::new(
+                        shared_types::ERR_CONFLICT,
+                        "wake_admission",
+                        message,
+                    )
+                })
+            }
+            Err(_) => Err(shared_types::WakeFailure::timeout("wake_wait", None, false)),
+        }
+    }
+
     /// Fresh diagnostics stay inside the original connection deadline. Each
     /// failed attempt replaces earlier evidence, including an absent observation.
     async fn collect_connection_evidence(
@@ -227,6 +286,10 @@ impl ProxyHttp for PortProxy {
             return Self::preview_forward_gate(session, ctx, &self.preview_slot).await;
         }
 
+        // Admission must precede touch, wake, dev ensure and prod reconstruction.
+        // Internal preview forwarding above keeps its separate token contract.
+        self.validate_request_api_key(session, session.req_header().uri.path())?;
+
         // dbx 入口尾斜杠规范化（先于唤醒判定——重定向后的二次请求才进入 wake，
         // stopped app 不在无子路径请求上空等一轮）。
         let raw_uri = session.req_header().uri.clone();
@@ -302,9 +365,14 @@ impl ProxyHttp for PortProxy {
                 let wake_pending = if wc.is_stopped(&app_id) {
                     true
                 } else {
-                    match tokio::time::timeout_at(deadline, wc.remote_wake_pending_result(&app_id))
-                        .await
-                    {
+                    let probe = async {
+                        if touch {
+                            wc.remote_serving_pending_result(&app_id).await
+                        } else {
+                            wc.remote_wake_pending_result(&app_id).await
+                        }
+                    };
+                    match tokio::time::timeout_at(deadline, probe).await {
                         Ok(Ok(pending)) => pending,
                         Ok(Err(failure)) => {
                             self.respond_wake_failure(session, ctx, failure).await;
@@ -333,7 +401,14 @@ impl ProxyHttp for PortProxy {
                     if touch { "app" } else { "tool" },
                     app_id
                 );
-                match tokio::time::timeout_at(deadline, wc.ensure_running(&app_id)).await {
+                let wake = async {
+                    if touch {
+                        wc.ensure_serving(&app_id).await
+                    } else {
+                        wc.ensure_running(&app_id).await
+                    }
+                };
+                match tokio::time::timeout_at(deadline, wake).await {
                     Ok(
                         shared_types::WakeOutcome::Ready
                         | shared_types::WakeOutcome::AlreadyRunning,
@@ -383,41 +458,7 @@ impl ProxyHttp for PortProxy {
             upstream_request.uri.path()
         );
 
-        // ========================================
-        // API Key 验证（在所有路由处理之前）
-        // ========================================
-        if let Some(ref api_key_config) = self.api_key_config {
-            let path = upstream_request.uri.path();
-
-            // 提取 x-api-key header
-            let api_key = session
-                .req_header()
-                .headers
-                .get("x-api-key")
-                .and_then(|v| v.to_str().ok());
-
-            // 验证 API Key（无锁同步验证）
-            match shared_types::ApiKeyValidator::validate(api_key_config, path, api_key) {
-                Ok(()) => {
-                    // 验证通过，继续处理
-                }
-                Err(shared_types::ApiKeyAuthError::Invalid) => {
-                    warn!("[PINGORA_AUTH] Invalid API key for path: {}", path);
-                    return Err(pingora_core::Error::new(ErrorType::HTTPStatus(401))
-                        .more_context("Invalid API key".to_string()));
-                }
-                Err(shared_types::ApiKeyAuthError::Missing) => {
-                    warn!("[PINGORA_AUTH] Missing x-api-key header for path: {}", path);
-                    return Err(pingora_core::Error::new(ErrorType::HTTPStatus(401))
-                        .more_context("Missing x-api-key header".to_string()));
-                }
-                Err(shared_types::ApiKeyAuthError::ConfigError) => {
-                    error!("[PINGORA_AUTH] Configuration error");
-                    return Err(pingora_core::Error::new(ErrorType::HTTPStatus(500))
-                        .more_context("Internal configuration error".to_string()));
-                }
-            }
-        }
+        self.validate_request_api_key(session, upstream_request.uri.path())?;
 
         let path = Self::normalize_path(upstream_request.uri.path()).to_string();
 
@@ -487,15 +528,47 @@ impl ProxyHttp for PortProxy {
                         tokio::time::timeout_at(*deadline, wc.remote_wake_state_fresh(app_id))
                             .await;
                     match state {
-                        Ok(RemoteWakeState::WakePending) => {
-                            match tokio::time::timeout_at(*deadline, wc.ensure_running(app_id))
-                                .await
-                            {
+                        Ok(state @ (RemoteWakeState::WakePending | RemoteWakeState::Missing)) => {
+                            let serving = *matched.value == RouteType::ProdAppProxy;
+                            if state == RemoteWakeState::Missing && !serving {
+                                return Err(pingora_core::Error::new(ErrorType::HTTPStatus(502)));
+                            }
+                            let wake = async {
+                                if serving {
+                                    wc.ensure_serving(app_id).await
+                                } else {
+                                    wc.ensure_running(app_id).await
+                                }
+                            };
+                            match tokio::time::timeout_at(*deadline, wake).await {
                                 Ok(
                                     shared_types::WakeOutcome::Ready
                                     | shared_types::WakeOutcome::AlreadyRunning,
                                 ) => {}
-                                _ => {
+                                outcome => {
+                                    ctx.wake_failure = match outcome {
+                                        Ok(
+                                            shared_types::WakeOutcome::Failed(failure)
+                                            | shared_types::WakeOutcome::Timeout(failure),
+                                        ) => Some(failure),
+                                        Ok(shared_types::WakeOutcome::Blocked {
+                                            message,
+                                            blocker,
+                                        }) => Some(shared_types::WakeFailure {
+                                            blocker: Some(Box::new(blocker)),
+                                            ..shared_types::WakeFailure::new(
+                                                shared_types::ERR_CONFLICT,
+                                                "wake_admission",
+                                                message,
+                                            )
+                                        }),
+                                        Err(_) => Some(shared_types::WakeFailure::timeout(
+                                            "wake_wait",
+                                            None,
+                                            false,
+                                        )),
+                                        Ok(_) => None,
+                                    };
                                     if let Some(ctx_state) = ctx.app_connect_recovery.as_mut() {
                                         ctx_state.unavailable_response = true;
                                     }
@@ -521,9 +594,40 @@ impl ProxyHttp for PortProxy {
         }
         // T4a：定位/ensure 纳入恢复总预算——超时不取消已受理的独立创建
         // 工作（builder 租约自有生命周期），本请求诚实失败、后续请求受益。
-        let mut peer = self
+        let mut peer = match self
             .dispatch_peer_with_recovery_deadline(*matched.value, matched.params.clone(), ctx)
-            .await?;
+            .await
+        {
+            Ok(peer) => peer,
+            Err(error) => {
+                let restore = ctx
+                    .app_connect_recovery
+                    .as_ref()
+                    .filter(|_| *matched.value == RouteType::ProdAppProxy)
+                    .map(|state| (state.app_id.clone(), state.deadline));
+                let Some((app_id, deadline)) = restore else {
+                    return Err(error);
+                };
+                match self
+                    .restore_missing_app_after_dispatch(&app_id, deadline)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => return Err(error),
+                    Err(failure) => {
+                        let status = failure.clone().into_app_error().status_code().as_u16();
+                        ctx.wake_failure = Some(failure);
+                        return Err(pingora_core::Error::new(ErrorType::HTTPStatus(status)));
+                    }
+                }
+                self.dispatch_peer_with_recovery_deadline(
+                    *matched.value,
+                    matched.params.clone(),
+                    ctx,
+                )
+                .await?
+            }
+        };
         if let Some(deadline) = ctx
             .app_connect_recovery
             .as_ref()
@@ -897,9 +1001,18 @@ impl PortProxy {
         ctx: &mut TrackingCtx,
         route: &crate::service::types::UserAppRouteCtx,
     ) {
-        let Some(advisor) = self.failure_advisor_slot.load_full() else {
-            return;
-        };
+        // EType 归类先行。standby 标记值可被应用伪造（custom/旧配置不剥离
+        // 应用同名头），来源确认不可省略——但与昂贵的文案观察分离（Codex P2）：
+        // 来源走缓存路径（advise，30s TTL——error_origin_contract 是配置衍生
+        // 的慢变量），未确认仍透传；文案细分走新鲜观察尽力而为，缺失时
+        // standby 兜底 Restarting（摘流正文本身即"重启中"语义）。
+        let etype_header = upstream_response
+            .headers
+            .get(shared_types::X_PINGAP_ETYPE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let standby_window = etype_header.as_deref().is_some_and(is_standby_etype_header);
+        let advisor = self.failure_advisor_slot.load_full();
         // 失败路径剩余预算（无唤醒上下文时用短上限——诊断绝不延长已耗尽的
         // 代理等待）
         let budget = ctx
@@ -912,13 +1025,52 @@ impl PortProxy {
                     .min(Duration::from_millis(1500))
             })
             .unwrap_or_else(|| Duration::from_millis(1000));
-        let Some(hint) = advisor
-            .advise_current(&route.app_id, route.stage, budget)
-            .await
-        else {
-            return;
+        let hint = if standby_window {
+            // 来源路由（三态，Codex P1/P2/七轮）：Unconfirmed=显式否定（透传
+            // 省预算）；Unknown=冷缓存（后台预热，本请求透传）；Confirmed=
+            // 值得花预算做**当次新鲜确认**。授权只能来自新鲜观察的成功——
+            // 缓存 Confirmed 不直接授权（零旧许可窗口：managed→custom 切换
+            // 后，无论新鲜观察是否持续超时，旧确认都无法替换正文；超时=
+            // 证据不可得=透传，保守正确）。
+            let origin = match advisor.as_ref() {
+                Some(advisor) => advisor.standby_origin(&route.app_id, route.stage).await,
+                None => crate::error_page::StandbyOrigin::Unknown,
+            };
+            if origin != crate::error_page::StandbyOrigin::Confirmed {
+                return;
+            }
+            // 授权观察：成功确认才替换；显式否定或超时（None）都透传。
+            // 预算下限 3s（Codex 八轮）：standby 窗口的请求**已拿到上游响应**，
+            // 观察延迟的是错误页呈现而非代理等待——原 1s 上限是为"不延长
+            // 代理等待"设的，对本场景不适用；真实慢观察（定位+拉取+复核，
+            // 实测 1.2s）需要更大预算才能拿到授权。>3s 的观察环境持续透传
+            //（保守正确的显式产品取舍：正确性优先于友好页可用性）。
+            let auth_budget = budget.max(Duration::from_secs(3));
+            match advisor.as_ref() {
+                Some(advisor) => {
+                    let fresh = advisor
+                        .advise_current(&route.app_id, route.stage, auth_budget)
+                        .await;
+                    match fresh {
+                        Some(h) if h.error_origin_confirmed => Some(h),
+                        _ => return,
+                    }
+                }
+                None => return,
+            }
+        } else {
+            // 既有 T11 路径：新鲜观察一次承担来源与文案。
+            match advisor.as_ref() {
+                Some(advisor) => {
+                    advisor
+                        .advise_current(&route.app_id, route.stage, budget)
+                        .await
+                }
+                None => None,
+            }
         };
-        if !hint.error_origin_confirmed {
+        // 非 standby：来源未确认（custom/旧配置）→ 原样透传（Codex P1/P2 回归门）。
+        if !standby_window && !hint.as_ref().is_some_and(|h| h.error_origin_confirmed) {
             return;
         }
         let Some(renderer) = self.error_pages_slot.load_full() else {
@@ -926,21 +1078,18 @@ impl PortProxy {
         };
         // 替换决策读取页面前同样触发按需刷新（错误请求是收敛路径之一）
         renderer.request_refresh();
-        let connect_failure = upstream_response
-            .headers
-            .get(shared_types::X_PINGAP_ETYPE_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(is_connect_etype_header);
+        let connect_failure = etype_header.as_deref().is_some_and(is_connect_etype_header);
         if connect_failure {
             if let Err(error) = upstream_response.set_status(503) {
                 tracing::warn!("normalize trusted proxy connection failure status failed: {error}");
                 return;
             }
-            ctx.failure_hint = Some(hint.clone());
+            ctx.failure_hint = hint.clone();
             ctx.failure_hint_at = Some(tokio::time::Instant::now());
             ctx.fresh_failure_evidence = true;
             Self::capture_proxy_transition(ctx);
         }
+        let cause = replacement_cause(hint.as_ref(), standby_window);
         let status = upstream_response.status.as_u16();
         let diagnostic_id = crate::error_page::new_diagnostic_id();
         // 语言协商与 write_error_response 同一函数（Accept-Language → locale）
@@ -954,14 +1103,13 @@ impl PortProxy {
         let (content_type, body): (&'static str, bytes::Bytes) =
             match crate::error_page::negotiate(session) {
                 crate::error_page::ErrorRepresentation::Document => {
-                    let page_cause = hint.page_cause();
-                    let (title, message) = page_cause.copywriting(locale);
+                    let (title, message) = cause.copywriting(locale);
                     let vars = crate::error_page::ErrorPageVars {
                         title,
                         message,
                         diagnostic_id: diagnostic_id.clone(),
                         status: status.to_string(),
-                        cause_slug: crate::error_page::cause_slug(page_cause).to_string(),
+                        cause_slug: crate::error_page::cause_slug(cause).to_string(),
                     };
                     (
                         "text/html; charset=utf-8",
@@ -969,20 +1117,30 @@ impl PortProxy {
                     )
                 }
                 crate::error_page::ErrorRepresentation::Machine => {
-                    let (_title, message) = hint.page_cause().copywriting(locale);
-                    let payload = serde_json::json!({
-                        "error": {
-                            "code": "USERAPP_PROXY_FAILURE",
-                            "status": status,
-                            "reason": "pingap_self_produced_error",
-                            "message": message,
-                            "diagnostic_id": diagnostic_id,
-                            "operation_id": hint.transition_operation_id(),
-                        }
-                    });
-                    ("application/json", payload.to_string().into())
+                    let (_title, message) = cause.copywriting(locale);
+                    let payload = crate::error_page::MachineErrorPayload::new(
+                        status,
+                        if standby_window {
+                            "proxy_standby"
+                        } else {
+                            "pingap_self_produced_error"
+                        },
+                        message,
+                        diagnostic_id.clone(),
+                    )
+                    .with_operation_id(
+                        hint.as_ref()
+                            .and_then(|h| h.transition_operation_id().map(str::to_string)),
+                    );
+                    ("application/json", payload.to_body().into())
                 }
             };
+        // 摘流方宣告的重试节奏在替换前捕获（strip 循环会移除该头）
+        let announced_retry_after = upstream_response
+            .headers
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         // 按新表示重建头：移除编码/实体校验/缓存建议，替换 Content-Type/Length。
         // 个别头写失败仅记日志——不撤销替换（正文已按新表示重建）。
         for header in [
@@ -1014,14 +1172,20 @@ impl PortProxy {
         {
             tracing::warn!("rewrite diagnostic header on replaced response failed: {error}");
         }
-        if connect_failure && let Err(error) = upstream_response.insert_header("retry-after", "15")
+        if let Some(value) = replacement_retry_after(
+            connect_failure,
+            standby_window,
+            announced_retry_after.as_deref(),
+        ) && let Err(error) = upstream_response.insert_header("retry-after", value.as_str())
         {
-            tracing::warn!("rewrite retry-after on proxy connection failure failed: {error}");
+            tracing::warn!("rewrite retry-after on replaced response failed: {error}");
         }
         if connect_failure
-            && let Some(operation_id) = hint.transition_operation_id()
+            && let Some(operation_id) = hint
+                .as_ref()
+                .and_then(|h| h.transition_operation_id().map(str::to_string))
             && let Err(error) =
-                upstream_response.insert_header("x-rcoder-operation-id", operation_id)
+                upstream_response.insert_header("x-rcoder-operation-id", &operation_id)
         {
             tracing::warn!("insert current proxy operation identity failed: {error}");
         }
@@ -1036,7 +1200,8 @@ impl PortProxy {
             stage = route.stage,
             %status,
             diagnostic_id = %diagnostic_id,
-            readiness = ?hint.readiness_status,
+            readiness = ?hint.as_ref().map(|h| h.readiness_status),
+            standby = standby_window,
             "replaced confirmed pingap self-produced error body"
         );
     }
@@ -1175,6 +1340,50 @@ fn is_connect_etype_header(value: &str) -> bool {
         value,
         "ConnectRefused" | "ConnectNoRoute" | "ConnectTimedout"
     )
+}
+/// standby 摘流窗口标记（managed 生成配置显式携带，见 app-cli compiler；
+/// 该窗口无 upstream 代理，应用不可能注入同名头）。
+fn is_standby_etype_header(value: &str) -> bool {
+    value.eq_ignore_ascii_case(shared_types::PINGAP_STANDBY_ETYPE)
+}
+
+/// 替换文案档位：advisor 观察确认时用其细分（starting/stopped/failed/…）；
+/// standby 窗口观察缺失（advisor 超时/不可达——其 1s 预算常输给完整观察
+/// 时延）或观察为 Generic 时兜底 Restarting（摘流正文本身即"重启中"语义）；
+/// 非 standby 且未确认的情况不会经过门控，返回 Generic 仅为穷尽。
+fn replacement_cause(
+    hint: Option<&crate::error_page::UserAppProxyFailureHint>,
+    standby_window: bool,
+) -> crate::error_page::ErrorPageCause {
+    match hint {
+        Some(h) if h.error_origin_confirmed => match h.page_cause() {
+            crate::error_page::ErrorPageCause::Generic if standby_window => {
+                crate::error_page::ErrorPageCause::Restarting
+            }
+            other => other,
+        },
+        _ if standby_window => crate::error_page::ErrorPageCause::Restarting,
+        _ => crate::error_page::ErrorPageCause::Generic,
+    }
+}
+
+/// 替换后的 Retry-After 决策：连接失败统一 15s（唤醒恢复节奏）；standby
+/// 摘流保留入口宣告值（2s——发布确认预算节奏）；其余替换不宣告重试。
+fn replacement_retry_after(
+    connect_failure: bool,
+    standby_window: bool,
+    announced: Option<&str>,
+) -> Option<String> {
+    if connect_failure {
+        return Some("15".to_string());
+    }
+    if standby_window {
+        return announced
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+    }
+    None
 }
 
 /// Pingora 默认 fail_to_proxy 的状态映射（proxy_trait.rs 631-668 同款）——
@@ -1489,6 +1698,86 @@ mod official_restart_failure_tests {
         assert!(is_connect_etype_header("ConnectRefused"));
         assert!(!is_connect_etype_header("HTTPStatus"));
         assert!(!is_connect_etype_header("ReadTimedout"));
+        assert!(is_standby_etype_header("rcoder-standby"));
+        assert!(is_standby_etype_header("RCoder-Standby"));
+        assert!(!is_standby_etype_header("ConnectRefused"));
+        assert!(!is_standby_etype_header("custom-app-value"));
+    }
+
+    /// 替换后的 Retry-After：连接失败统一 15s；standby 保留摘流方宣告节奏；
+    /// 其余替换不宣告。
+    #[test]
+    fn replacement_retry_after_follows_failure_class() {
+        assert_eq!(
+            replacement_retry_after(true, false, Some("2")),
+            Some("15".to_string())
+        );
+        assert_eq!(
+            replacement_retry_after(false, true, Some("2")),
+            Some("2".to_string()),
+            "standby must preserve the advertised publication retry cadence"
+        );
+        assert_eq!(replacement_retry_after(false, true, Some("  ")), None);
+        assert_eq!(replacement_retry_after(false, true, None), None);
+        assert_eq!(replacement_retry_after(false, false, Some("2")), None);
+    }
+
+    /// 替换文案档位：advisor 确认观察给细分文案；standby 观察缺失兜底
+    /// Restarting（不再因 advisor 超时放弃替换——2026-10-27 事故）。
+    #[test]
+    fn replacement_cause_survives_missing_advisor_for_standby() {
+        let confirmed = |readiness: shared_types::UserAppReadinessStatus| {
+            crate::error_page::UserAppProxyFailureHint {
+                readiness_status: Some(readiness),
+                error_origin_confirmed: true,
+                proxy_confirmation: None,
+            }
+        };
+        assert_eq!(
+            replacement_cause(
+                Some(&confirmed(shared_types::UserAppReadinessStatus::Stopped)),
+                true
+            ),
+            crate::error_page::ErrorPageCause::Stopped,
+            "advisor evidence still refines the standby copy"
+        );
+        assert_eq!(
+            replacement_cause(None, true),
+            crate::error_page::ErrorPageCause::Restarting,
+            "missing advisor must not forfeit the standby replacement"
+        );
+        assert_eq!(
+            replacement_cause(None, false),
+            crate::error_page::ErrorPageCause::Generic,
+            "non-standby without confirmation stays generic"
+        );
+        // standby + 确认来源但观察为 Generic（无细分证据）：兜底 Restarting。
+        let generic_readiness = crate::error_page::UserAppProxyFailureHint {
+            readiness_status: None,
+            error_origin_confirmed: true,
+            proxy_confirmation: None,
+        };
+        assert_eq!(
+            replacement_cause(Some(&generic_readiness), true),
+            crate::error_page::ErrorPageCause::Restarting,
+            "standby without refinement evidence falls back to restarting copy"
+        );
+        // 停止窗口（2026-10-27 缺陷单）：advisor 观察到 Stopping 时保留停止
+        // 档文案，不被 standby 的 Restarting 兜底升格。
+        let stopping_readiness = crate::error_page::UserAppProxyFailureHint {
+            readiness_status: Some(shared_types::UserAppReadinessStatus::Stopping),
+            error_origin_confirmed: true,
+            proxy_confirmation: None,
+        };
+        assert_eq!(
+            replacement_cause(Some(&stopping_readiness), true),
+            crate::error_page::ErrorPageCause::Stopping,
+            "observed stopping evidence must keep the stopping copy in standby windows"
+        );
+        assert_eq!(
+            replacement_cause(Some(&stopping_readiness), false),
+            crate::error_page::ErrorPageCause::Stopping,
+        );
     }
 
     #[test]

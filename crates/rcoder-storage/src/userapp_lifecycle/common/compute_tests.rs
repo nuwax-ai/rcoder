@@ -1703,3 +1703,6 @@ async fn early_compute_handoff_pg_independent_connections() {
     first.shutdown().await.unwrap();
     second.shutdown().await.unwrap();
 }
+
+#[path = "compute_lifecycle_tests.rs"]
+mod lifecycle;

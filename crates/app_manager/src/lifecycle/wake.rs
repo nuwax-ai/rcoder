@@ -20,29 +20,122 @@ impl AppService {
         app_id: &str,
         budget: Duration,
     ) -> AppResult<WakeOutcome> {
+        self.wake_existing_or_retained(app_id, budget, None).await
+    }
+
+    pub(crate) async fn wake_app_for_serving(
+        self: &std::sync::Arc<Self>,
+        app_id: &str,
+        budget: Duration,
+    ) -> AppResult<WakeOutcome> {
+        self.wake_existing_or_retained(app_id, budget, Some(self.clone()))
+            .await
+    }
+
+    async fn wake_existing_or_retained(
+        &self,
+        app_id: &str,
+        budget: Duration,
+        restoration_owner: Option<std::sync::Arc<Self>>,
+    ) -> AppResult<WakeOutcome> {
         validate_app_id(app_id)?;
         let deadline = Instant::now() + budget;
         let preflight = async {
+            if self.config.default_recovery_enabled
+                && restoration_owner.is_some()
+                && self.metadata.store.get_application(app_id).await?.is_none()
+            {
+                self.discover_missing_identity(app_id).await?;
+            }
             self.metadata
                 .store
                 .check_compute_access(app_id, shared_types::UserAppOperationScope::Prod, false)
                 .await?;
-            // An existing operation (including one awaiting recovery) is not a
-            // readiness wait. Do not consume the wake budget polling its lease:
-            // return the conflict so the caller can observe/recover that operation.
-            let guard = self.try_acquire_process_release_lock(app_id).await?;
-            let identity = self
-                .metadata
-                .store
-                .get_application(app_id)
-                .await?
-                .ok_or_else(|| {
-                    AppOperationError::NotFound(format!("Application identity not found: {app_id}"))
-                })?;
-            self.metadata
-                .validate_request_lifecycle(app_id, Some(&identity.lifecycle_id))
-                .await?;
-            let status = self.fetch_runtime_status_or_err(app_id).await?;
+            #[cfg(test)]
+            crate::service::traffic_wake_wait::pause_at(
+                crate::service::traffic_wake_wait::WakePausePoint::AccessChecked,
+            )
+            .await;
+            let serving_lifecycle = if restoration_owner.is_some()
+                && self.config.access_mode == crate::config::AppAccessMode::Kubernetes
+            {
+                let identity = self
+                    .metadata
+                    .store
+                    .get_application(app_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AppOperationError::NotFound(format!(
+                            "Application identity not found: {app_id}"
+                        ))
+                    })?;
+                Some(identity.lifecycle_id)
+            } else {
+                None
+            };
+            let guard = match serving_lifecycle.as_deref() {
+                Some(lifecycle_id) => {
+                    self.acquire_serving_wake_guard(app_id, lifecycle_id, deadline)
+                        .await?
+                }
+                None => self.try_acquire_process_release_lock(app_id).await?,
+            };
+            #[cfg(test)]
+            crate::service::traffic_wake_wait::pause_at(
+                crate::service::traffic_wake_wait::WakePausePoint::LeaseAcquired,
+            )
+            .await;
+            let observed = async {
+                let identity = self
+                    .metadata
+                    .store
+                    .get_application(app_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AppOperationError::NotFound(format!(
+                            "Application identity not found: {app_id}"
+                        ))
+                    })?;
+                self.metadata
+                    .validate_request_lifecycle(
+                        app_id,
+                        serving_lifecycle
+                            .as_deref()
+                            .or(Some(&identity.lifecycle_id)),
+                    )
+                    .await?;
+                if let Some(lifecycle_id) = serving_lifecycle.as_deref() {
+                    self.validate_serving_wake_identity(app_id, lifecycle_id)
+                        .await?;
+                }
+                let status = if restoration_owner.is_some()
+                    && (self.config.access_mode == crate::config::AppAccessMode::Docker
+                        || self.config.default_recovery_enabled)
+                {
+                    self.runtime
+                        .get_deployment_status(app_id)
+                        .await
+                        .map_err(|error| {
+                            crate::utils::map_runtime_error(
+                                "Read application serving runtime",
+                                error,
+                            )
+                        })?
+                } else {
+                    Some(self.fetch_runtime_status_or_err(app_id).await?)
+                };
+                Ok::<_, AppOperationError>((identity, status))
+            }
+            .await;
+            let (identity, status) = match observed {
+                Ok(observed) => observed,
+                Err(error) => {
+                    if serving_lifecycle.is_some() {
+                        guard.finish_unadmitted(deadline).await?;
+                    }
+                    return Err(error);
+                }
+            };
             Ok::<_, AppOperationError>((guard, identity, status))
         };
         let (guard, identity, previous) = match timeout_at(deadline, preflight).await {
@@ -54,6 +147,63 @@ impl AppService {
                     true,
                 )));
             }
+        };
+        let Some(previous) = previous else {
+            // A missing physical container is not a new application. Release the
+            // unmutated observation lease, then let the existing deployment
+            // coordinator reacquire it and revalidate the same lifecycle. Its
+            // durable private input and creation receipts own all create/start
+            // effects, including cancelled or unknown Docker responses.
+            guard.finish().await?;
+            let service = restoration_owner.ok_or_else(|| {
+                AppOperationError::InvalidState(
+                    "Only serving traffic may restore missing application compute".into(),
+                )
+            })?;
+            let admission = std::sync::Arc::new(
+                crate::service::restart_wait::RestartAdmission::with_deadline(deadline),
+            );
+            let _waiting_client = admission.client();
+            let observer = std::sync::Arc::new(std::sync::OnceLock::new());
+            let worker_observer = observer.clone();
+            let worker_app_id = app_id.to_owned();
+            let lifecycle_id = identity.lifecycle_id.clone();
+            let owner_admission = admission.clone();
+            let restore = tokio::spawn(async move {
+                owner_admission.scope(async move {
+                    let result = service.restore_runtime_on_traffic(
+                        &worker_app_id, &lifecycle_id, worker_observer, deadline,
+                    ).await;
+                    if let Err(error) = &result {
+                        tracing::warn!(app_id = %worker_app_id, %error, "Owned application runtime restoration failed");
+                    }
+                    result
+                }).await
+            });
+            return match timeout_at(deadline, restore).await {
+                Ok(Ok(Ok(_))) => Ok(WakeOutcome::Ready),
+                Ok(Ok(Err(error))) => Err(error),
+                Ok(Err(error)) => Err(AppOperationError::Backend(format!(
+                    "Application restoration worker failed: {error}"
+                ))),
+                Err(_) => {
+                    if !admission.has_started() {
+                        return Ok(WakeOutcome::Timeout(shared_types::WakeFailure::timeout(
+                            "wake_runtime_reconstruction_preflight",
+                            None,
+                            true,
+                        )));
+                    }
+                    let mut failure = shared_types::WakeFailure::new(
+                        shared_types::ERR_OPERATION_OUTCOME_UNKNOWN,
+                        "wake_runtime_reconstruction",
+                        "Application runtime reconstruction is still being reconciled by its original operation",
+                    );
+                    failure.cause_code = shared_types::ERR_RUNTIME_TIMEOUT.into();
+                    failure.operation_id = observer.get().cloned();
+                    Ok(WakeOutcome::Timeout(failure))
+                }
+            };
         };
         // Even an already-running workload must be bound to the current lifecycle.
         // The operation records that observation and prevents a stale cache from
@@ -92,6 +242,11 @@ impl AppService {
             }
         };
         let operation_id = operation.execution_context().operation_id;
+        #[cfg(test)]
+        crate::service::traffic_wake_wait::pause_at(
+            crate::service::traffic_wake_wait::WakePausePoint::AdmittedUnbound,
+        )
+        .await;
         let activation = async {
             operation.bind_lease(&guard).await?;
             let context = operation.execution_context();

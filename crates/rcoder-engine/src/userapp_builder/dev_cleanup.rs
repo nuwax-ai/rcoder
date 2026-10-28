@@ -3,6 +3,9 @@ use shared_types::storage_contents::{CapturedStorageDirectory, StorageDirectoryL
 use shared_types::{AppOperationLease, BuilderDeletionSnapshot, ProjectStore, UserappDevDeletion};
 use std::sync::Arc;
 
+#[cfg(test)]
+mod retirement_tests;
+
 pub struct UserappDevResourcesCleanup {
     runtime: Arc<dyn container_runtime_api::ContainerRuntime>,
     projects: Arc<crate::storage::ProjectStoreBackend>,
@@ -24,9 +27,12 @@ impl UserappDevResourcesCleanup {
 struct CapturedDeletion {
     runtime: Arc<dyn container_runtime_api::ContainerRuntime>,
     projects: Arc<crate::storage::ProjectStoreBackend>,
+    store: Arc<dyn shared_types::UserAppLifecycleStore>,
     snapshot: BuilderDeletionSnapshot,
     lifecycle_id: String,
-    registry_identity: Option<(String, String)>,
+    receipt: shared_types::UserappDevDeletionReceipt,
+    retirement_target: Option<shared_types::BuilderControlTarget>,
+    execution_context: Option<shared_types::UserAppExecutionContext>,
     operation: BuilderOperation,
     /// 协作者实例（owner 实例之外的全部 `{user_id}-{app_id}` 实例）：
     /// (复合 identifier, 捕获快照)。cleanup 时与主快照一并删除。
@@ -113,6 +119,33 @@ impl Drop for BuilderOperation {
 }
 #[async_trait::async_trait]
 impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
+    async fn capture_for_execution(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> Result<Box<dyn UserappDevDeletion>, String> {
+        self.store
+            .check_business_execution(context)
+            .await
+            .map_err(|error| error.to_string())?;
+        let local = super::lifecycle::acquire(&context.app_id).await;
+        let lease = self
+            .runtime
+            .acquire_builder_operation(&context.app_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.capture_owned(&context.app_id, lease, Some(local), Some(context.clone()))
+            .await
+    }
+
+    async fn capture_with_lease_for_execution(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        lease: Box<dyn AppOperationLease>,
+    ) -> Result<Box<dyn UserappDevDeletion>, String> {
+        self.capture_owned(&context.app_id, lease, None, Some(context.clone()))
+            .await
+    }
+
     async fn inspect_captured(
         &self,
         context: &shared_types::UserAppExecutionContext,
@@ -199,7 +232,7 @@ impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
             .acquire_builder_operation(app_id)
             .await
             .map_err(|error| format!("acquire builder deletion: {error}"))?;
-        self.capture_owned(app_id, lease, Some(local)).await
+        self.capture_owned(app_id, lease, Some(local), None).await
     }
     async fn capture_with_lease(
         &self,
@@ -208,7 +241,7 @@ impl shared_types::UserappDevCleanup for UserappDevResourcesCleanup {
     ) -> Result<Box<dyn UserappDevDeletion>, String> {
         // The caller already holds the lifecycle admission and physical lease.
         // Do not invert ensure's local -> physical lock order by taking local now.
-        self.capture_owned(app_id, lease, None).await
+        self.capture_owned(app_id, lease, None, None).await
     }
 }
 impl UserappDevResourcesCleanup {
@@ -217,6 +250,7 @@ impl UserappDevResourcesCleanup {
         app_id: &str,
         lease: Box<dyn AppOperationLease>,
         local: Option<tokio::sync::OwnedMutexGuard<()>>,
+        execution_context: Option<shared_types::UserAppExecutionContext>,
     ) -> Result<Box<dyn UserappDevDeletion>, String> {
         // Install read-only cleanup before any fallible observation so failed
         // capture releases its own lease; a borrowed lease leaves its owner intact.
@@ -230,6 +264,18 @@ impl UserappDevResourcesCleanup {
         // 应用共享：instance == 纯 app_id（正式 evidence 链覆盖 lifecycle
         // 持有的唯一 builder；协作者实例模型已随用户绑定移除）。
         let owner_instance = app_id.to_string();
+        if let Some(context) = &execution_context {
+            if context.app_id != app_id || context.lifecycle_id != app.lifecycle_id {
+                return Err(
+                    "Builder deletion execution belongs to another application lifecycle".into(),
+                );
+            }
+            self.store
+                .check_business_execution(context)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let mut retirement_target = None;
         let mut snapshot = self
             .runtime
             .capture_builder_deletion(&owner_instance)
@@ -247,13 +293,15 @@ impl UserappDevResourcesCleanup {
                 .get_resource_binding(&shared_types::ServiceType::UserappBuilder, &resource.uid)
                 .await
                 .map_err(|error| format!("Read builder resource binding: {error}"))?;
-            let context = shared_types::UserAppExecutionContext {
-                app_id: owner_instance.clone(),
-                lifecycle_id: app.lifecycle_id.clone(),
-                operation_id: "capture-deletion".into(),
-                executor_id: "reader".into(),
-                request_fingerprint: "0".repeat(64),
-            };
+            let context = execution_context.clone().unwrap_or_else(|| {
+                shared_types::UserAppExecutionContext {
+                    app_id: owner_instance.clone(),
+                    lifecycle_id: app.lifecycle_id.clone(),
+                    operation_id: "capture-deletion".into(),
+                    executor_id: "reader".into(),
+                    request_fingerprint: "0".repeat(64),
+                }
+            });
             let actual = self
                 .runtime
                 .capture_bound_builder_control(&context, snapshot.resource_binding.as_ref())
@@ -267,6 +315,10 @@ impl UserappDevResourcesCleanup {
             {
                 return Err("Builder changed during deletion capture".into());
             }
+            if actual.context != context || actual.resource_binding != snapshot.resource_binding {
+                return Err("Builder deletion control identity changed during capture".into());
+            }
+            retirement_target = Some(actual);
         }
         // 协作者实例清点（label/名字聚合；排除 owner 实例）：各实例持有
         // operation 锁（防清扫期间并发 ensure 重建）+ 捕获快照，cleanup 时删除。
@@ -295,36 +347,45 @@ impl UserappDevResourcesCleanup {
             extra_leases.push(lease);
             extra_instances.push((instance, extra_snapshot));
         }
+        // Freeze the authoritative registry hint while the original physical
+        // guard is held. A peer's old row can be absent from this replica's
+        // mirror; that cache miss must not become a new physical identity.
         let registry_identity = self
             .projects
-            .get(&owner_instance)
-            .map(|project| {
-                if project.service_type() != Some(shared_types::ServiceType::UserappBuilder) {
-                    return Err("registration belongs to another service family".to_string());
-                }
-                let container = project.container_info().ok_or_else(|| {
-                    "builder registration has no physical container identity".to_string()
-                })?;
-                if container.container_id.is_empty() {
-                    return Err("builder registration has empty container ID".into());
-                }
-                Ok((
-                    project.persistence_identity().generation.clone(),
-                    container.container_id,
-                ))
-            })
-            .transpose()?;
+            .capture_builder_registry_identity(&owner_instance)
+            .await
+            .map_err(|error| format!("Capture builder registry identity: {error:#}"))?;
         let directories = if snapshot.docker_bind_cleanup {
             capture_bind_directories(app_id).await?
         } else {
             Vec::new()
         };
+        let receipt = shared_types::UserappDevDeletionReceipt {
+            runtime: snapshot.clone(),
+            registry: registry_identity,
+            lease: operation.lease.as_ref().and_then(|lease| lease.receipt()),
+            collaborators: extra_instances
+                .iter()
+                .zip(&extra_leases)
+                .map(
+                    |((_, runtime), lease)| shared_types::BuilderCollaboratorDeletionReceipt {
+                        runtime: runtime.clone(),
+                        lease: lease.lease.as_ref().and_then(|lease| lease.receipt()),
+                        registry: None,
+                    },
+                )
+                .collect(),
+            directories: snapshot.docker_bind_cleanup.then(|| directories.clone()),
+        };
         Ok(Box::new(CapturedDeletion {
             runtime: self.runtime.clone(),
             projects: self.projects.clone(),
+            store: self.store.clone(),
             snapshot,
             lifecycle_id: app.lifecycle_id,
-            registry_identity,
+            receipt,
+            retirement_target,
+            execution_context,
             operation,
             extra_instances,
             extra_leases,
@@ -354,39 +415,7 @@ impl UserappDevDeletion for CapturedDeletion {
     }
 
     fn receipt(&self) -> shared_types::UserappDevDeletionReceipt {
-        shared_types::UserappDevDeletionReceipt {
-            runtime: self.snapshot.clone(),
-            registry: self
-                .registry_identity
-                .as_ref()
-                .map(
-                    |(generation, container_id)| shared_types::BuilderRegistryIdentity {
-                        generation: generation.clone(),
-                        container_id: container_id.clone(),
-                    },
-                ),
-            lease: self
-                .operation
-                .lease
-                .as_ref()
-                .and_then(|lease| lease.receipt()),
-            collaborators: self
-                .extra_instances
-                .iter()
-                .zip(&self.extra_leases)
-                .map(
-                    |((_, runtime), lease)| shared_types::BuilderCollaboratorDeletionReceipt {
-                        runtime: runtime.clone(),
-                        lease: lease.lease.as_ref().and_then(|lease| lease.receipt()),
-                        registry: None,
-                    },
-                )
-                .collect(),
-            directories: self
-                .snapshot
-                .docker_bind_cleanup
-                .then(|| self.directories.clone()),
-        }
+        self.receipt.clone()
     }
 
     async fn cleanup(self: Box<Self>) -> Result<(), String> {
@@ -398,7 +427,40 @@ impl UserappDevDeletion for CapturedDeletion {
     }
 }
 impl CapturedDeletion {
+    async fn store_execution_is_current(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> Result<(), String> {
+        self.store
+            .check_business_execution(context)
+            .await
+            .map_err(|error| format!("Builder deletion execution changed: {error}"))?;
+        let operation = self
+            .store
+            .get_operation(&context.app_id, &context.operation_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Original builder deletion operation is missing".to_string())?;
+        let original = shared_types::captured_builder_deletion_for_execution(&operation, context)?;
+        if original != self.receipt {
+            return Err("Original builder deletion capture changed".into());
+        }
+        Ok(())
+    }
+
     async fn execute(mut self: Box<Self>) -> Result<(), String> {
+        let context = self.execution_context.as_ref().ok_or_else(|| {
+            "Builder deletion requires its admitted execution context".to_string()
+        })?;
+        self.store_execution_is_current(context).await?;
+        if let Some(target) = &self.retirement_target {
+            self.projects
+                .check_captured_builder_registration(target, self.receipt.registry.as_ref())
+                .await
+                .map_err(|error| {
+                    format!("Observe captured builder registration before deletion: {error:#}")
+                })?;
+        }
         self.operation.mutating =
             !self.snapshot.resources.is_empty() || self.snapshot.docker_bind_cleanup;
         for operation in &mut self.extra_leases {
@@ -434,6 +496,7 @@ impl CapturedDeletion {
         }
         // Physical deletion has returned before logical SID ownership is
         // retired. A delayed old-lifecycle receipt never targets a replacement.
+        self.store_execution_is_current(context).await?;
         self.projects
             .invalidate_userapp_agent_bindings_durable(
                 &self.snapshot.app_id,
@@ -445,26 +508,28 @@ impl CapturedDeletion {
             )
             .await
             .map_err(|error| format!("Retire captured UserApp agent bindings: {error:#}"))?;
-        match &self.registry_identity {
-            Some((generation, container_id)) => {
-                if !self
-                    .projects
-                    .remove_durable_if_container_identity(
-                        &self.snapshot.app_id,
-                        generation,
-                        container_id,
-                    )
-                    .await
-                    .map_err(|e| format!("remove captured builder registration: {e}"))?
-                    && self.projects.get(&self.snapshot.app_id).is_some()
-                {
-                    return Err("builder registration changed during cleanup".into());
-                }
-            }
-            None if self.projects.get(&self.snapshot.app_id).is_some() => {
-                return Err("builder registration appeared after deletion capture".into());
-            }
-            None => {}
+        self.store_execution_is_current(context).await?;
+        if let Some(target) = &self.retirement_target {
+            self.projects
+                .retire_captured_builder_registration(target, self.receipt.registry.as_ref())
+                .await
+                .map_err(|error| format!("Retire captured builder registration: {error:#}"))?;
+        } else {
+            // An empty physical capture cannot authorize retirement of a later
+            // physical instance. An absent/unbound registration is idempotent.
+            let target = shared_types::BuilderControlTarget {
+                context: context.clone(),
+                resource_binding: None,
+                workload: None,
+                pod: None,
+                restart_image: None,
+                restart_runtime_workspace: None,
+                builder_startup_mode: Default::default(),
+            };
+            self.projects
+                .retire_captured_builder_registration(&target, self.receipt.registry.as_ref())
+                .await
+                .map_err(|error| format!("Retire absent builder registration: {error:#}"))?;
         }
         // 协作者实例注册表条目清理（key=复合 identifier；best-effort——注册是
         // 观测缓存，物理资源已删，残留条目经探活自愈路径自然失效）

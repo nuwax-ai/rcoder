@@ -391,4 +391,210 @@ mod tests {
         assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
         assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
     }
+
+    /// 服务层证明「单一窗口」：dev `ensure_builder` 受理后，无论容器缺失、
+    /// 拉起中还是 admin 未应答，顶层恒为 `provisioning`；app-cli 空 owner
+    /// 快照一旦出现立即接管为 `not_deployed`；dev 槽不影响 prod 槽；全程
+    /// 只读（不唤醒、不建容器）。
+    #[tokio::test]
+    async fn dev_builder_slot_reports_compute_provisioning() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        use shared_types::{
+            UserAppAdmissionOutcome, UserAppBusinessReadiness, UserAppNoComputeState,
+            UserAppOperationKind, UserAppProxyReadiness,
+        };
+
+        fn empty_owner_snapshot() -> UserAppBusinessReadiness {
+            UserAppBusinessReadiness {
+                ready: false,
+                status: UserAppReadinessStatus::NotDeployed,
+                reason_code: None,
+                checked_at: "2026-10-19T08:00:00Z".into(),
+                runtime_instance_id: None,
+                serving_release_id: None,
+                target_release_id: None,
+                operation_id: None,
+                observation_revision: 2,
+                proxy: UserAppProxyReadiness {
+                    confirmation: None,
+                    ready: false,
+                    status: UserAppReadinessStatus::NotDeployed,
+                    reason_code: None,
+                    error_origin_contract: None,
+                },
+                services: Vec::new(),
+            }
+        }
+
+        struct Reader(AtomicU8);
+        #[async_trait::async_trait]
+        impl shared_types::UserAppReadinessReader for Reader {
+            async fn observe(
+                &self,
+                _: &str,
+                stage: UserappStage,
+                _: Duration,
+            ) -> Result<UserAppReadinessObservation, String> {
+                if stage == UserappStage::Prod {
+                    return Ok(UserAppReadinessObservation::NoCompute {
+                        state: UserAppNoComputeState::Missing,
+                    });
+                }
+                match self.0.fetch_add(1, Ordering::SeqCst) {
+                    // 资源申请窗口的三跳物理事实：缺失 → 拉起中 → admin 未应答。
+                    0 | 1 => Ok(UserAppReadinessObservation::NoCompute {
+                        state: UserAppNoComputeState::Missing,
+                    }),
+                    2 => Ok(UserAppReadinessObservation::NoCompute {
+                        state: UserAppNoComputeState::Starting,
+                    }),
+                    3 => Ok(UserAppReadinessObservation::AdminUnreachable {
+                        physical: UserAppReadinessPhysical {
+                            instance_id: Some("builder-pod".into()),
+                            address: Some("127.0.0.1:3010".into()),
+                            channel: shared_types::UserAppReadinessChannel::Exec,
+                        },
+                    }),
+                    // 窗口结束：app-cli 空 owner 快照接管。
+                    _ => Ok(UserAppReadinessObservation::Snapshot {
+                        physical: UserAppReadinessPhysical {
+                            instance_id: None,
+                            address: None,
+                            channel: shared_types::UserAppReadinessChannel::Exec,
+                        },
+                        snapshot: Box::new(empty_owner_snapshot()),
+                    }),
+                }
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(crate::test_support::MockRuntime::default());
+        let (service, store) =
+            crate::test_support::test_service_with_store(root.path(), runtime.clone()).await;
+        let app = store.ensure_identity("49").await.unwrap();
+        service
+            .set_readiness_reader(Arc::new(Reader(AtomicU8::new(0))))
+            .unwrap();
+
+        // 基线：无在途操作，dev/prod 均如实 not_deployed。
+        for stage in [UserappStage::Dev, UserappStage::Prod] {
+            let response = service.get_app_readiness(stage, "49").await.unwrap();
+            assert_eq!(response.status, UserAppReadinessStatus::NotDeployed);
+        }
+
+        let admitted = match store
+            .admit(&shared_types::UserAppAdmission {
+                runtime_policy_on_success: None,
+                command: None,
+                metadata: None,
+                app_id: app.app_id.clone(),
+                lifecycle_id: Some(app.lifecycle_id.clone()),
+                operation_id: "ensurebuilder".into(),
+                request_id: Some("ensurebuilderreq".into()),
+                request_fingerprint: "c".repeat(64),
+                kind: UserAppOperationKind::EnsureBuilder,
+            })
+            .await
+            .unwrap()
+        {
+            UserAppAdmissionOutcome::Accepted(record) => record,
+            UserAppAdmissionOutcome::Existing(_) => panic!("fresh admission expected"),
+        };
+        assert_eq!(admitted.scope, UserAppOperationScope::Dev);
+
+        // 窗口第一帧：provisioning，计算事实如实（missing、无 compute 回执、
+        // 无业务服务、无实例身份）。
+        let response = service
+            .get_app_readiness(UserappStage::Dev, "49")
+            .await
+            .unwrap();
+        assert_eq!(response.status, UserAppReadinessStatus::Provisioning);
+        assert_eq!(
+            response.reason_code,
+            Some(UserAppReadinessReason::ComputeProvisioning)
+        );
+        assert!(!response.ready);
+        assert_eq!(response.operation_id.as_deref(), Some("ensurebuilder"));
+        assert_eq!(response.container.status, UserAppContainerStatus::Missing);
+        assert!(response.container.operation.is_none());
+        assert!(response.services.is_empty());
+        assert_eq!(response.runtime_instance_id, None);
+        assert_eq!(response.observation_revision, 0);
+
+        // 容器拉起中：仍是 provisioning，不冒充业务 starting。
+        let response = service
+            .get_app_readiness(UserappStage::Dev, "49")
+            .await
+            .unwrap();
+        assert_eq!(response.status, UserAppReadinessStatus::Provisioning);
+        assert_eq!(
+            response.reason_code,
+            Some(UserAppReadinessReason::ComputeProvisioning)
+        );
+        assert_eq!(response.container.status, UserAppContainerStatus::Starting);
+
+        // builder 进程尚未应答 admin：仍是 provisioning（单一窗口性质）。
+        let response = service
+            .get_app_readiness(UserappStage::Dev, "49")
+            .await
+            .unwrap();
+        assert_eq!(response.status, UserAppReadinessStatus::Provisioning);
+        assert_eq!(
+            response.reason_code,
+            Some(UserAppReadinessReason::ComputeProvisioning)
+        );
+        assert_eq!(response.container.status, UserAppContainerStatus::Running);
+
+        // dev 槽的 builder 操作不影响 prod 槽：同 app 的 prod 仍 not_deployed。
+        let response = service
+            .get_app_readiness(UserappStage::Prod, "49")
+            .await
+            .unwrap();
+        assert_eq!(response.status, UserAppReadinessStatus::NotDeployed);
+
+        // prod 槽受理业务启动后：那是 starting，不是 provisioning。
+        match store
+            .admit(&shared_types::UserAppAdmission {
+                runtime_policy_on_success: None,
+                command: None,
+                metadata: None,
+                app_id: app.app_id.clone(),
+                lifecycle_id: Some(app.lifecycle_id.clone()),
+                operation_id: "startprod".into(),
+                request_id: Some("startprodreq".into()),
+                request_fingerprint: "d".repeat(64),
+                kind: UserAppOperationKind::Start,
+            })
+            .await
+            .unwrap()
+        {
+            UserAppAdmissionOutcome::Accepted(_) => {}
+            UserAppAdmissionOutcome::Existing(_) => panic!("fresh admission expected"),
+        }
+        let response = service
+            .get_app_readiness(UserappStage::Prod, "49")
+            .await
+            .unwrap();
+        assert_eq!(response.status, UserAppReadinessStatus::Starting);
+        assert_eq!(
+            response.reason_code,
+            Some(UserAppReadinessReason::ServiceStarting)
+        );
+
+        // 窗口结束：app-cli 空 owner 快照胜出，即使 dev 槽仍被 EnsureBuilder
+        // 占用（provisioning 无后置覆盖）。
+        let response = service
+            .get_app_readiness(UserappStage::Dev, "49")
+            .await
+            .unwrap();
+        assert_eq!(response.status, UserAppReadinessStatus::NotDeployed);
+        assert_eq!(response.observation_revision, 2);
+
+        // 只读性：整个窗口查询不产生任何 runtime 写调用。
+        assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.scale_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.delete_calls.load(Ordering::SeqCst), 0);
+    }
 }

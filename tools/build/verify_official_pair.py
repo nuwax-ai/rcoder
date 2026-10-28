@@ -9,13 +9,41 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
+import tempfile
 import time
+import tomllib
 import urllib.error
 import urllib.request
 import uuid
+
+
+BUSINESS_SOURCE = '''import faulthandler, os, sys, time
+def phase(name):
+ print('PAIR_FIXTURE_PHASE', name, time.monotonic(), flush=True)
+phase('python-entered')
+print('PAIR_FIXTURE_PYTHON', sys.executable, sys.version, flush=True)
+faulthandler.dump_traceback_later(8, repeat=True)
+phase('http-import')
+import http.server, socketserver
+class Handler(http.server.BaseHTTPRequestHandler):
+ def do_GET(self):
+  body=b'official-pair-business';self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+phase('http-bind')
+# Preserve HTTPServer's port-reuse and request behavior without a reverse-DNS
+# lookup for a listener whose address is already the explicit loopback literal.
+class LoopbackServer(http.server.HTTPServer):
+ def server_bind(self):
+  socketserver.TCPServer.server_bind(self)
+  self.server_name='localhost';self.server_port=self.server_address[1]
+server=LoopbackServer(('127.0.0.1',int(os.environ['PORT'])),Handler)
+faulthandler.cancel_dump_traceback_later()
+phase('http-listening')
+server.serve_forever()
+'''
 
 
 def verify_unused_business_port(port=9080):
@@ -50,6 +78,7 @@ class NativePair:
                         APP_CLI_PINGAP_ADMIN_PORT=str(self.port()))
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self.owner, self.output = None, None
+        self.first_startup_failure = None
         self.result = {'platform': sys.platform, 'passed': False, 'checks': [],
                        'binary_sha256': {name: hashlib.file_digest(path.open('rb'), 'sha256').hexdigest()
                                          for name, path in [('app-cli', self.app), ('pingap', self.proxy)]}}
@@ -87,7 +116,8 @@ class NativePair:
             with self.opener.open(request, timeout=timeout) as response:
                 return response.status, response.read()
         except urllib.error.HTTPError as error:
-            return error.code, error.read()
+            with error:
+                return error.code, error.read()
 
     def data(self, path, body=None):
         status, raw = self.http(self.admin, path, body)
@@ -100,6 +130,12 @@ class NativePair:
         deadline = time.monotonic() + budget
         last = None
         while time.monotonic() < deadline:
+            # Read only this fixture's local evidence. Diagnostics must neither
+            # wait on another endpoint nor change the original gate verdict.
+            try:
+                self.observe_startup_failure()
+            except Exception as error:
+                self.result['diagnostic_error'] = f'first startup snapshot: {error}'
             try:
                 last = predicate()
                 if last:
@@ -164,13 +200,7 @@ class NativePair:
                    and operation.get('state') == 'succeeded')
 
     def execute(self):
-        server = '''import http.server, os
-class Handler(http.server.BaseHTTPRequestHandler):
- def do_GET(self):
-  body=b'official-pair-business';self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
-http.server.HTTPServer(('127.0.0.1',int(os.environ['PORT'])),Handler).serve_forever()
-'''
-        (self.workspace / 'web/server.py').write_text(server, encoding='utf-8')
+        (self.workspace / 'web/server.py').write_text(BUSINESS_SOURCE, encoding='utf-8')
         (self.workspace / 'sentinel').write_text('keep source and owner state', encoding='utf-8')
         (self.workspace / 'workspace.manifest.toml').write_text('schema_version=1\n[workspace]\nname="official-pair"\n', encoding='utf-8')
         command = json.dumps([sys.executable, 'server.py'])
@@ -210,6 +240,173 @@ http.server.HTTPServer(('127.0.0.1',int(os.environ['PORT'])),Handler).serve_fore
         self.check('sentinel preserved', (self.workspace / 'sentinel').read_text(encoding='utf-8') == 'keep source and owner state')
         self.result['passed'] = True
 
+    def owned_business_evidence(self, owner_log):
+        """Correlate log discovery with the current owned guardian incarnation.
+
+        Receipt PIDs are diagnostic locators, never process-liveness proof.
+        Export only selected fields, not launch tokens or inherited environment.
+        """
+        state = getattr(self, 'state', self.root / 'state')
+
+        def read_owned(path):
+            if not path.resolve().is_relative_to(state.resolve()):
+                raise ValueError('diagnostic receipt is outside the fixture state')
+            content = path.read_bytes()
+            value = json.loads(content)
+            if not isinstance(value, dict):
+                raise ValueError('diagnostic receipt is not an object')
+            return value, hashlib.sha256(content).hexdigest()
+
+        def identity(value):
+            if not isinstance(value, str) or str(uuid.UUID(value)) != value:
+                raise ValueError('diagnostic incarnation identity is invalid')
+            return value
+
+        try:
+            if (not state.resolve().is_relative_to(self.root.resolve())
+                    or not self.workspace.resolve().is_relative_to(self.root.resolve())):
+                raise ValueError('diagnostic scope is outside this fixture')
+            supervisor, supervisor_hash = read_owned(state / 'supervisor.json')
+            snapshot = supervisor['snapshot']
+            binding = snapshot['binding']
+            if (binding['component'] != 'app-cli'
+                    or not Path(binding['resource']).samefile(self.workspace)):
+                raise ValueError('supervisor diagnostic binding differs from fixture workspace')
+            supervisor_id = identity(snapshot['supervisor_id'])
+            if supervisor['instance'] != supervisor_id:
+                raise ValueError('supervisor diagnostic incarnation differs')
+            generation_id = identity(snapshot['generation'])
+            work = state / 'work' / generation_id
+            generation, generation_hash = read_owned(work / 'generation.json')
+            if generation['id'] != generation_id or generation['supervisor'] != supervisor_id:
+                raise ValueError('generation diagnostic incarnation differs')
+            lock = tomllib.loads((self.workspace / 'release.lock.toml').read_text(encoding='utf-8'))
+            web = next(service for service in lock['services'] if service['service_id'] == 'web')
+            # The log is discovery only. A matching current generation and its
+            # unique guardian receipt must independently name this same PID.
+            started = list(re.finditer(r'\bstart web \(web\) on :(\d+) \(pid=(\d+)\)', owner_log))
+            if not started or int(started[-1][1]) != web['port']:
+                raise ValueError('fixture web launch has no matching port witness')
+            pid = int(started[-1][2])
+            commands = []
+            for path in sorted((work / 'guardians').glob('*/receipt.json')):
+                receipt, receipt_hash = read_owned(path)
+                if receipt.get('diagnostic_pid') != pid:
+                    continue
+                guardian_id = identity(path.parent.name)
+                if (receipt['id'] != guardian_id or receipt['instance_id'] != generation_id
+                        or receipt.get('version') not in (1, 2)
+                        or receipt.get('phase') not in ('Pending', 'Running', 'Quiescent', 'Revoked')
+                        or (receipt.get('root_status') is not None
+                            and type(receipt['root_status']) is not int)
+                        or not re.fullmatch('[a-f0-9]{64}', receipt['command_digest'])):
+                    raise ValueError('guardian diagnostic incarnation differs')
+                commands.append({
+                    'supervisor_id': supervisor_id, 'generation_id': generation_id,
+                    'guardian_id': guardian_id, 'command_digest': receipt['command_digest'],
+                    'diagnostic_pid': pid, 'phase': receipt['phase'],
+                    'root_status': receipt.get('root_status'), 'receipt_sha256': receipt_hash,
+                })
+            if not commands:
+                raise ValueError('web launch PID has no matching owned guardian receipt')
+            _, current_hash = read_owned(state / 'supervisor.json')
+            if current_hash != supervisor_hash:
+                raise ValueError('supervisor changed while collecting diagnostic evidence')
+            return {'binding_verified': True, 'pid_is_liveness_proof': False,
+                    'supervisor_sha256': supervisor_hash, 'generation_sha256': generation_hash,
+                    'commands': commands}
+        except (OSError, ValueError, TypeError, KeyError, StopIteration) as error:
+            return {'binding_verified': False, 'pid_is_liveness_proof': False,
+                    'commands': [], 'read_error': str(error)}
+
+    def write_diagnostics(self, diagnostic):
+        # One complete file is visible to artifact upload and later diagnostics.
+        with tempfile.NamedTemporaryFile('w', dir=self.root, encoding='utf-8', delete=False) as stream:
+            json.dump(diagnostic, stream, indent=2)
+            stream.write('\n')
+            temporary = Path(stream.name)
+        try:
+            temporary.replace(self.root / 'failure-diagnostics.json')
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def observe_startup_failure(self):
+        if getattr(self, 'first_startup_failure', None) is not None:
+            return
+        path = self.root / 'owner.log'
+        if not path.is_file():
+            return
+        owner_log = path.read_text(encoding='utf-8', errors='replace')
+        for number, line in enumerate(owner_log.splitlines(), 1):
+            if not line.startswith('APP-CLI-EVT '):
+                continue
+            try:
+                event = json.loads(line[len('APP-CLI-EVT '):])
+            except ValueError:
+                continue  # The writer may still be publishing the final line.
+            if (isinstance(event, dict) and event.get('event') == 'service_start_fail'
+                    and event.get('service') == 'web'):
+                first = {'captured_unix_ns': time.time_ns(), 'owner_log_line': number,
+                         'event': event, 'business': self.owned_business_evidence(owner_log)}
+                self.write_diagnostics({'first_startup_failure': first})
+                self.first_startup_failure = first
+                return
+
+    def capture_failure_diagnostics(self):
+        # Capture this fixture's inputs and owner before shutdown. Do not dump
+        # inherited environment, token files, or unrelated system processes.
+        diagnostic = {
+            'python': {'executable': sys.executable, 'version': sys.version},
+            'owner': {'pid': self.owner.pid, 'exit_code': self.owner.poll()}
+                     if self.owner is not None else None,
+            'inputs': {}, 'observations': {},
+        }
+        diagnostic['first_startup_failure'] = getattr(self, 'first_startup_failure', None)
+        try:
+            diagnostic['business'] = self.owned_business_evidence(
+                (self.root / 'owner.log').read_text(encoding='utf-8', errors='replace'))
+        except OSError as error:
+            diagnostic['business'] = {'read_error': str(error)}
+        for relative in ('workspace.manifest.toml', 'web/project.manifest.toml',
+                         'release.lock.toml', 'web/server.py'):
+            path = self.workspace / relative
+            try:
+                diagnostic['inputs'][relative] = path.read_text(encoding='utf-8')
+            except OSError as error:
+                diagnostic['inputs'][relative] = {'read_error': str(error)}
+        if self.owner is not None and diagnostic['owner']['exit_code'] is None:
+            command = (['tasklist', '/FI', f'PID eq {self.owner.pid}', '/FO', 'CSV', '/NH']
+                       if sys.platform == 'win32' else
+                       ['ps', '-p', str(self.owner.pid), '-o', 'pid=,ppid=,pgid=,state=,comm='])
+            try:
+                observed = subprocess.run(command, capture_output=True, text=True, timeout=2)
+                diagnostic['owner']['os_observation'] = {
+                    'argv': command, 'exit_code': observed.returncode,
+                    'stdout': observed.stdout, 'stderr': observed.stderr,
+                }
+            except (OSError, subprocess.TimeoutExpired) as error:
+                diagnostic['owner']['observation_error'] = str(error)
+        ports = {9080, self.admin}
+        try:
+            lock = tomllib.loads(diagnostic['inputs']['release.lock.toml'])
+            ports.update(service['port'] for service in lock.get('services', []))
+        except (TypeError, KeyError, tomllib.TOMLDecodeError) as error:
+            diagnostic['lock_observation_error'] = str(error)
+        diagnostic['tcp_observations'] = {}
+        for port in sorted(ports):
+            try:
+                with socket.create_connection(('127.0.0.1', port), timeout=.25):
+                    diagnostic['tcp_observations'][str(port)] = {'connected': True}
+            except OSError as error:
+                diagnostic['tcp_observations'][str(port)] = {'connected': False, 'error': str(error)}
+        for route in ('/v1/runtime/identity', '/v1/runtime/status', '/v1/proxy/status'):
+            try:
+                status, raw = self.http(self.admin, route, timeout=2)
+                diagnostic['observations'][route] = {'status': status, 'body': json.loads(raw)}
+            except (OSError, ValueError) as error:
+                diagnostic['observations'][route] = {'read_error': str(error)}
+        self.write_diagnostics(diagnostic)
+
     def close(self):
         if self.owner is not None:
             try:
@@ -241,6 +438,10 @@ def main():
         pair.execute()
     except Exception as error:
         pair.result['error'] = str(error)
+        try:
+            pair.capture_failure_diagnostics()
+        except Exception as diagnostic_error:
+            pair.result['diagnostic_error'] = str(diagnostic_error)
     finally:
         pair.close()
     return 0 if pair.result['passed'] else 1

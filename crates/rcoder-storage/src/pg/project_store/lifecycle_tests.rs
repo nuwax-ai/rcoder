@@ -260,7 +260,7 @@ async fn lifecycle_contract_reload_and_cross_replica_sync_preserve_identity() {
         url: Some(dsn),
         ..Default::default()
     };
-    let (a, _) = crate::pg::PgStore::connect(&config, "contract".into(), "cluster.local".into())
+    let a = crate::pg::PgStore::connect(&config, "contract".into(), "cluster.local".into())
         .await
         .unwrap();
     let id = format!("reload-{}", crate::pg::test_support::uuid_suffix());
@@ -269,7 +269,7 @@ async fn lifecycle_contract_reload_and_cross_replica_sync_preserve_identity() {
         .await
         .unwrap();
     let original = a.get(&id).unwrap();
-    let (b, _) = crate::pg::PgStore::connect(&config, "contract".into(), "cluster.local".into())
+    let b = crate::pg::PgStore::connect(&config, "contract".into(), "cluster.local".into())
         .await
         .unwrap();
     let loaded = b.get(&id).unwrap();
@@ -281,7 +281,9 @@ async fn lifecycle_contract_reload_and_cross_replica_sync_preserve_identity() {
         loaded.persistence_identity().sessions[&sid],
         original.persistence_identity().sessions[&sid]
     );
-    super::sync::sync_once(&b, b.inner(), &pool).await.unwrap();
+    super::super::sync::sync_once(&b, b.inner(), &pool)
+        .await
+        .unwrap();
     assert_eq!(
         b.get(&id).unwrap().persistence_identity().sessions[&sid],
         original.persistence_identity().sessions[&sid]
@@ -379,7 +381,7 @@ async fn lifecycle_contract_container_delete_preserves_changed_association() {
         url: Some(std::env::var("RCODER_PG_TEST_DSN").unwrap()),
         ..Default::default()
     };
-    let (peer, _) = crate::pg::PgStore::connect(&config, "contract".into(), "cluster.local".into())
+    let peer = crate::pg::PgStore::connect(&config, "contract".into(), "cluster.local".into())
         .await
         .unwrap();
     assert_eq!(
@@ -496,7 +498,7 @@ async fn lifecycle_contract_container_delete_preserves_changed_association() {
     identity.container.as_mut().unwrap().predecessor_revision = Some(2);
     p.set_persistence_identity(identity);
     commit(&pool, &snapshot_ops(&p, &sid).unwrap()).await;
-    super::sync::sync_once(&peer, peer.inner(), &pool)
+    super::super::sync::sync_once(&peer, peer.inner(), &pool)
         .await
         .unwrap();
     let mirrored = peer.get(&id).unwrap();
@@ -642,10 +644,9 @@ async fn lifecycle_contract_cancelled_durable_write_is_queued_and_shutdown_waits
         url: Some(std::env::var("RCODER_PG_TEST_DSN").unwrap()),
         ..Default::default()
     };
-    let (store, _) =
-        crate::pg::PgStore::connect(&config, "contract".into(), "cluster.local".into())
-            .await
-            .unwrap();
+    let store = crate::pg::PgStore::connect(&config, "contract".into(), "cluster.local".into())
+        .await
+        .unwrap();
     let store = Arc::new(store);
     let id = format!("cancel-write-{}", crate::pg::test_support::uuid_suffix());
     let sid = format!("{id}-sid");
@@ -745,4 +746,334 @@ async fn lifecycle_contract_cancelled_durable_write_is_queued_and_shutdown_waits
         }],
     )
     .await;
+}
+
+/// R12/R13：snapshot 单次读取 sessions + 无变化快路径（真实 PG、独立 schema）。
+mod snapshot_and_fastpath_tests {
+    use super::*;
+    use crate::config::PostgresConfig;
+    use shared_types::ContainerBasicInfo;
+
+    /// 跨副本对：两个 store 指向同一独立 schema（计数断言不能混入共享库
+    /// 历史测试数据）。
+    async fn replica_pair(name: &str) -> Option<(crate::pg::PgStore, crate::pg::PgStore)> {
+        let dsn = crate::pg::test_support::test_dsn().await?;
+        let schema = format!(
+            "fastpath_{}_{}",
+            name,
+            crate::pg::test_support::uuid_suffix()
+        );
+        let mut admin = toasty::Db::builder().connect(&dsn).await.unwrap();
+        toasty::sql::statement(format!("CREATE SCHEMA {schema}"))
+            .exec(&mut admin)
+            .await
+            .unwrap();
+        let separator = if dsn.contains('?') { '&' } else { '?' };
+        let scoped = format!("{dsn}{separator}options=-csearch_path%3D{schema}");
+        let config = PostgresConfig {
+            url: Some(scoped),
+            ..Default::default()
+        };
+        let first = crate::pg::PgStore::connect(
+            &config,
+            format!("contract-{name}"),
+            "cluster.local".into(),
+        )
+        .await
+        .unwrap();
+        let second = crate::pg::PgStore::connect(
+            &config,
+            format!("contract-{name}"),
+            "cluster.local".into(),
+        )
+        .await
+        .unwrap();
+        Some((first, second))
+    }
+
+    fn container(id: &str) -> ContainerBasicInfo {
+        ContainerBasicInfo {
+            container_id: format!("pod-{id}"),
+            container_name: format!("agent-{id}"),
+            container_ip: "10.0.0.1".into(),
+            internal_port: 50051,
+            external_port: 0,
+            project_id: id.into(),
+            status: "running".into(),
+            created_at: chrono::DateTime::from_timestamp_micros(
+                chrono::Utc::now().timestamp_micros(),
+            )
+            .unwrap(),
+            service_url: format!("http://agent-{id}:50051"),
+            workload_uid: Some(format!("sts-{id}")),
+        }
+    }
+
+    async fn sync_changed_project(
+        store: &crate::pg::PgStore,
+        id: &str,
+    ) -> Arc<ProjectAndContainerInfo> {
+        let before = store.get(id).unwrap();
+        assert_eq!(
+            super::super::sync::sync_once(store, store.inner(), &store.database)
+                .await
+                .unwrap(),
+            (0, 1)
+        );
+        let after = store.get(id).unwrap();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(
+            super::super::sync::sync_once(store, store.inner(), &store.database)
+                .await
+                .unwrap(),
+            (0, 0)
+        );
+        assert!(Arc::ptr_eq(&after, &store.get(id).unwrap()));
+        after
+    }
+
+    /// R13：连续两轮无变化 sync——第二轮 changed=0、added=0 且镜像 Arc 原样
+    /// 复用（不重建项目与反向索引）。
+    #[tokio::test]
+    async fn unchanged_sync_round_reuses_arc_and_reports_zero_change() {
+        let Some((a, b)) = replica_pair("fp").await else {
+            return;
+        };
+        let id = format!("fastpath-{}", crate::pg::test_support::uuid_suffix());
+        let sid = format!("{id}-sid");
+        a.insert_with_session_durable(id.clone(), Arc::new(info(&id, &sid)), &sid)
+            .await
+            .unwrap();
+        let (added, changed) = super::super::sync::sync_once(&b, b.inner(), &b.database)
+            .await
+            .unwrap();
+        assert!(added >= 1, "first sync hydrates the project");
+        assert_eq!(changed, 0);
+        let before = b.get(&id).unwrap();
+        let (added, changed) = super::super::sync::sync_once(&b, b.inner(), &b.database)
+            .await
+            .unwrap();
+        assert_eq!((added, changed), (0, 0), "unchanged round must be a no-op");
+        let after = b.get(&id).unwrap();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "unchanged sync must reuse the existing Arc instead of rebuilding"
+        );
+        assert_eq!(
+            after.persistence_identity().sessions[&sid],
+            before.persistence_identity().sessions[&sid]
+        );
+        a.remove_durable(&id).await;
+        assert!(a.writer().flush_and_stop(Duration::from_secs(5)).await);
+        assert!(b.writer().flush_and_stop(Duration::from_secs(5)).await);
+    }
+
+    /// A rejected optimistic shared-container registration may outlive its
+    /// project (for example, readback fails and that member is then removed).
+    /// The remaining member can already equal SQL while the independent cursor
+    /// still needs repair. Inject only that cursor divergence; read canonical
+    /// project/container state from real PG through the original sync entry.
+    #[tokio::test]
+    async fn unchanged_project_repairs_stale_container_cursor_without_rebuilding() {
+        let Some((a, b)) = replica_pair("cursor").await else {
+            return;
+        };
+        let id = format!("fastcursor-{}", crate::pg::test_support::uuid_suffix());
+        let sid = format!("{id}-sid");
+        let basic = container(&id);
+        let mut project = info(&id, &sid);
+        project.set_container(Some(basic.clone()));
+        a.insert_with_session_durable(id.clone(), Arc::new(project), &sid)
+            .await
+            .unwrap();
+        super::super::sync::sync_once(&b, b.inner(), &b.database)
+            .await
+            .unwrap();
+        let before = b.get(&id).unwrap();
+        let canonical = before.persistence_identity().container.clone().unwrap();
+        let mut rejected = canonical.clone();
+        rejected.revision += 1;
+        b.container_registration
+            .lock()
+            .unwrap()
+            .insert(basic.container_name.clone(), rejected);
+
+        assert_eq!(
+            super::super::sync::sync_once(&b, b.inner(), &b.database)
+                .await
+                .unwrap(),
+            (0, 0),
+            "repairing the independent cursor must not rebuild an equal project"
+        );
+        assert!(Arc::ptr_eq(&before, &b.get(&id).unwrap()));
+        assert_eq!(
+            b.container_registration.lock().unwrap()[&basic.container_name],
+            canonical,
+            "project equality cannot skip canonical container cursor reconciliation"
+        );
+        assert!(b.get_by_session_id(&sid).is_some());
+        a.remove_durable(&id).await;
+        assert!(a.writer().flush_and_stop(Duration::from_secs(5)).await);
+        assert!(b.writer().flush_and_stop(Duration::from_secs(5)).await);
+    }
+
+    /// R13：字段变化即使未推进 revision 也必须同步。
+    #[tokio::test]
+    async fn real_changes_still_sync_past_the_fast_path() {
+        let Some((a, b)) = replica_pair("chg").await else {
+            return;
+        };
+        let id = format!("fastchg-{}", crate::pg::test_support::uuid_suffix());
+        let sid = format!("{id}-sid");
+        let mut p = info(&id, &sid);
+        p.set_status(Some(shared_types::AgentStatus::Idle));
+        a.insert_with_session_durable(id.clone(), Arc::new(p), &sid)
+            .await
+            .unwrap();
+        super::super::sync::sync_once(&b, b.inner(), &b.database)
+            .await
+            .unwrap();
+        // 状态变化（直接改行，绕过 durable CAS——本测试验证 sync 的观测而非写入链）
+        let status_project = id.clone();
+        b.database
+            .execute(move |mut db| async move {
+                Ok(toasty::sql::statement(
+                    "UPDATE projects SET agent_status_json = '\"Active\"' WHERE project_id = $1",
+                )
+                .bind(status_project)
+                .exec(&mut db)
+                .await?)
+            })
+            .await
+            .unwrap();
+        let (added, changed) = super::super::sync::sync_once(&b, b.inner(), &b.database)
+            .await
+            .unwrap();
+        assert_eq!(added, 0);
+        assert!(changed >= 1, "status change must not be swallowed");
+        assert_eq!(
+            b.get(&id).unwrap().status(),
+            Some(&shared_types::AgentStatus::Active)
+        );
+        a.remove_durable(&id).await;
+        assert!(a.writer().flush_and_stop(Duration::from_secs(5)).await);
+        assert!(b.writer().flush_and_stop(Duration::from_secs(5)).await);
+    }
+
+    /// Public durable writes must still change routing, endpoints and physical
+    /// epochs after an unchanged round, then converge back to Arc reuse.
+    #[tokio::test]
+    async fn durable_session_endpoint_and_replacement_changes_sync_after_noop() {
+        use shared_types::{
+            AgentWorkspaceIdentity, VerifiedAgentReplacement, persistence::PersistenceWriteOutcome,
+        };
+
+        let Some((a, b)) = replica_pair("changes").await else {
+            return;
+        };
+        let id = format!("fastdurable-{}", crate::pg::test_support::uuid_suffix());
+        let old_sid = format!("{id}-old");
+        let new_sid = format!("{id}-new");
+        let original = container(&id);
+        let mut project = info(&id, &old_sid);
+        project.set_container(Some(original));
+        a.insert_with_session_durable(id.clone(), Arc::new(project), &old_sid)
+            .await
+            .unwrap();
+        assert_eq!(
+            super::super::sync::sync_once(&b, b.inner(), &b.database)
+                .await
+                .unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            super::super::sync::sync_once(&b, b.inner(), &b.database)
+                .await
+                .unwrap(),
+            (0, 0)
+        );
+
+        assert_eq!(
+            a.append_session_for_container_durable(&a.get(&id).unwrap(), &new_sid)
+                .await
+                .unwrap(),
+            PersistenceWriteOutcome::Committed
+        );
+        let appended = sync_changed_project(&b, &id).await;
+        assert_eq!(appended.latest_session(), Some(new_sid.as_str()));
+        assert_eq!(appended.session_count(), 2);
+        assert!(b.get_by_session_id(&new_sid).is_some());
+
+        assert!(a.clear_session_one_durable(&id, &old_sid).await);
+        // The deletion pass removes routing first. That local mirror change
+        // intentionally prevents applying the earlier project baseline in the
+        // same round; the next round hydrates its canonical remaining sessions.
+        super::super::sync::sync_once(&b, b.inner(), &b.database)
+            .await
+            .unwrap();
+        assert!(b.get_by_session_id(&old_sid).is_none());
+        let cleared = sync_changed_project(&b, &id).await;
+        assert_eq!(cleared.session_count(), 1);
+        assert_eq!(cleared.latest_session(), Some(new_sid.as_str()));
+        assert!(b.get_by_session_id(&old_sid).is_none());
+
+        let mut endpoint = (*a.get(&id).unwrap()).clone();
+        let mut updated = endpoint.container_info().unwrap();
+        updated.container_ip = "10.0.0.2".into();
+        updated.service_url = "http://10.0.0.2:50051".into();
+        endpoint.set_container(Some(updated.clone()));
+        assert_eq!(
+            a.insert_project_registration_durable(id.clone(), Arc::new(endpoint))
+                .await
+                .unwrap(),
+            PersistenceWriteOutcome::Committed
+        );
+        assert_eq!(
+            sync_changed_project(&b, &id).await.container_info(),
+            Some(updated.clone())
+        );
+
+        let captured = (*a.get(&id).unwrap()).clone();
+        let predecessor = captured.persistence_identity().generation.clone();
+        let mut replacement = updated.clone();
+        replacement.container_id = format!("replacement-pod-{id}");
+        let proof = VerifiedAgentReplacement {
+            identifier: id.clone(),
+            service_type: ServiceType::WebAgentRunner,
+            previous: Some(updated),
+            replacement: replacement.clone(),
+            workspace: AgentWorkspaceIdentity {
+                namespace: "contract-changes".into(),
+                claim_name: "workspace".into(),
+                claim_uid: format!("workspace-{id}"),
+                mount_path: "/home/user".into(),
+                sub_path: None,
+            },
+        };
+        assert_eq!(
+            a.replace_agent_container_registration_durable(&captured, &proof)
+                .await
+                .unwrap(),
+            PersistenceWriteOutcome::Committed
+        );
+        let replaced = sync_changed_project(&b, &id).await;
+        assert_ne!(replaced.persistence_identity().generation, predecessor);
+        assert_eq!(replaced.container_info(), Some(replacement.clone()));
+        assert_eq!(
+            b.container_registration.lock().unwrap()[&replacement.container_name],
+            *replaced.persistence_identity().container.as_ref().unwrap()
+        );
+        assert_eq!(
+            b.get_by_session_id(&new_sid)
+                .unwrap()
+                .container_info()
+                .unwrap()
+                .container_id,
+            replacement.container_id
+        );
+        assert!(b.get_by_session_id(&old_sid).is_none());
+        a.remove_durable(&id).await;
+        assert!(a.writer().flush_and_stop(Duration::from_secs(5)).await);
+        assert!(b.writer().flush_and_stop(Duration::from_secs(5)).await);
+    }
 }

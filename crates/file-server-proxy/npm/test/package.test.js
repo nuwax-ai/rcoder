@@ -70,7 +70,9 @@ test("prepare consumes release manifest, publishes checked receipt and reuses im
   fs.writeFileSync(path.join(root, name), "fixture native artifact");
   const archivePath = path.join(root, `asset.${ext}`);
   if (windows) {
-    execFileSync("powershell", ["-NoProfile", "-Command", "Compress-Archive", "-LiteralPath", path.join(root, name), "-DestinationPath", archivePath]);
+    execFileSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference = 'Stop'; Compress-Archive -LiteralPath $env:NUWAX_TEST_BINARY -DestinationPath $env:NUWAX_TEST_ARCHIVE"], {
+      env: { ...process.env, NUWAX_TEST_BINARY: path.join(root, name), NUWAX_TEST_ARCHIVE: archivePath },
+    });
   } else execFileSync("tar", ["-czf", archivePath, "-C", root, name]);
   const bytes = fs.readFileSync(archivePath);
   const archive = `file-server-proxy-1.2.3-${target}.${ext}`;

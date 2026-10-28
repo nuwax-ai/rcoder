@@ -71,6 +71,18 @@ async fn legacy_pod_stop(
     State(state): State<Arc<AppState>>,
     I18nJsonOrQuery(request): I18nJsonOrQuery<StopPodRequest>,
 ) -> Result<HttpResult<StopPodResponse>, AppError> {
+    let flight = crate::handler::utils::owned_operation_flight(&state)?;
+    crate::handler::utils::spawn_owned_operation(flight, async move {
+        legacy_pod_stop_inner(state, request).await
+    })
+    .await
+    .map_err(|error| AppError::internal_server_error(&format!("Stop task failed: {error}")))?
+}
+
+async fn legacy_pod_stop_inner(
+    state: Arc<AppState>,
+    request: StopPodRequest,
+) -> Result<HttpResult<StopPodResponse>, AppError> {
     let locale = shared_types::current_request_locale();
 
     // 0. userApp 分派（app_id 存在即短路 agent 流程）
@@ -140,106 +152,24 @@ async fn legacy_pod_stop(
         request.user_id, request.project_id, service_type, container_identifier
     );
 
-    // 2. 检查容器是否存在（不存在=幂等空操作）
-    let existing_container = ComputerContainerManager::get_container_info_with_type(
-        &container_identifier,
-        state.runtime(),
-        &service_type,
-    )
-    .await?;
-    let Some(container_info) = existing_container else {
-        info!(
-            "[POD_STOP] Container does not exist (idempotent no-op): container_identifier={}",
-            container_identifier
-        );
-        return Ok(HttpResult::success(StopPodResponse {
-            was_existing: false,
-            message: "Container did not exist (idempotent no-op)".to_string(),
-        }));
-    };
-
-    // 3. 物理销毁（K8s：STS+svc，PVC 保留；Docker：删容器）。
-    //    与 restart 的 destroy 半程相反，此处先停后清账：物理失败即报错返回，
-    //    存储记录未动，调用方可安全重试（stop 幂等）。
-    if let Err(e) = state
-        .runtime()
-        .stop_container_by_identifier(&container_identifier, &service_type)
-        .await
-    {
-        error!(
-            "[POD_STOP] Failed to stop container: container_identifier={}, error={}",
-            container_identifier, e
-        );
-        return Err(AppError::with_message(
-            shared_types::error_codes::ERR_BACKEND_ERROR,
-            format!("failed to stop container {container_identifier}: {e}"),
-        ));
-    }
-    info!(
-        "[POD_STOP] Container destroyed: container_id={}",
-        container_info.container_id
-    );
-
-    // 4. 清理存储记录（容器 + 关联 project 行 + sessions claim 归还）。
-    //    物理已销毁，此处失败仅 warn——ensure 的实时查询自愈可兜底死记录。
-    let (container_deleted, deleted_projects) = state
-        .delete_container_with_projects_durable(&container_info.container_id)
-        .await;
-    info!(
-        "[POD_STOP] Cleaned up container records: container_id={}, container_deleted={}, deleted_projects={}",
-        container_info.container_id, container_deleted, deleted_projects
-    );
-
-    // 5. 关闭旧容器的 SSE 共享流 + 清理 gRPC 连接（契约二代次守卫：携带被
-    //    销毁实例的物理 UID，注册表已绑定新实例时作废本动作）
-    state
-        .teardown_container_connections_guarded(
-            &container_info.container_name,
-            &container_info.container_ip,
-            Some(&container_info.container_id),
+    let admission = state
+        .acquire_agent_workload(
+            &container_identifier,
+            &service_type,
+            rcoder_storage::WorkloadAdmissionMode::Exclusive,
         )
-        .await;
-
-    // 6. 清理 Pingora backend（stop 不重建，必须显式摘除，防流量打到死地址）。
-    //    键与注册侧对齐而非 container_identifier——后者在 pod_id 存在时为 pod_id：
-    //    VNC 按 user_id 注册（ensure/restart 的 register_vnc_backend 均用
-    //    request.user_id），project 按 project_id 注册（同 destroyer/agent_stop 的
-    //    键选择）
-    if let Some(ref pingora) = state.pingora_service {
-        match service_type {
-            ServiceType::ComputerAgentRunner => {
-                pingora.remove_vnc_backend(&request.user_id);
-            }
-            ServiceType::WebAgentRunner => {
-                pingora.remove_project_backend(&request.project_id);
-            }
-            _ => {}
-        }
-    }
-
-    // 7. 轮询确认容器真正移除（最多 5s；不确认只 warn 不翻案——物理销毁已返回成功）
-    let deletion_confirmed = confirm_container_removed(
-        state.runtime(),
-        &container_identifier,
-        &service_type,
-        "POD_STOP",
-    )
-    .await;
-    if !deletion_confirmed {
-        warn!(
-            "[POD_STOP] Wait for container removal timeout (physical destroy already succeeded): container_identifier={}",
-            container_identifier
-        );
-    }
-
-    info!(
-        "[POD_STOP] Completed: was_existing=true, container_id={}",
-        container_info.container_id
-    );
-
+        .await
+        .map_err(|error| {
+            AppError::with_message(
+                shared_types::error_codes::ERR_CONFLICT,
+                format!("Workload admission unavailable; retry later: {error}"),
+            )
+        })?;
+    let was_existing =
+        stop_ordinary_workload(&state, &admission, &container_identifier, &service_type).await?;
     Ok(HttpResult::success(StopPodResponse {
-        was_existing: true,
-        message: "Container stopped and destroyed (data volume preserved)".to_string(),
+        was_existing,
+        message: "Container stopped and destroyed (data volume preserved)".into(),
     }))
 }
 

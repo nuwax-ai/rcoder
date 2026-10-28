@@ -2,6 +2,55 @@ use super::*;
 
 #[async_trait]
 impl UserAppDeploymentRuntime for DockerRuntime {
+    async fn app_runtime_configuration_uid(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Option<String>> {
+        shared_types::validate_identifier(app_id, "app_id")
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        match self
+            .inner
+            .get_docker_client()
+            .inspect_container(&app_deployment_name(app_id), None)
+            .await
+        {
+            Ok(inspect) => inspect
+                .id
+                .filter(|uid| !uid.is_empty())
+                .map(Some)
+                .ok_or_else(|| {
+                    ContainerRuntimeError::DockerError(
+                        "Application configuration source has no physical identity".into(),
+                    )
+                }),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(None),
+            Err(error) => Err(ContainerRuntimeError::DockerError(format!(
+                "Inspect application configuration source: {error}"
+            ))),
+        }
+    }
+
+    async fn retain_app_runtime_configuration(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+        binding: Option<&shared_types::UserAppResourceBinding>,
+    ) -> ContainerRuntimeResult<()> {
+        self.retain_app_configuration(app_id, lifecycle_id, binding)
+            .await
+    }
+
+    async fn retained_app_runtime_configuration(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+    ) -> ContainerRuntimeResult<Option<ContainerCreateParams>> {
+        self.load_retained_app_configuration(app_id, lifecycle_id)
+            .await
+    }
+
     async fn observe_userapp_readiness(
         &self,
         app_id: &str,
@@ -236,6 +285,11 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             // keep their AlreadyExists conflict.
             return Ok(None);
         }
+        // A prior create may have committed before its snapshot publication
+        // failed. Retrying the original operation repairs that publication from
+        // the verified physical configuration, without issuing another create.
+        self.retain_app_configuration(&context.app_id, &context.lifecycle_id, None)
+            .await?;
         let preferred = inspect
             .host_config
             .as_ref()
@@ -291,6 +345,11 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             let uid = info.id.clone().ok_or_else(|| {
                 ContainerRuntimeError::Conflict("Discovered container ID missing".into())
             })?;
+            if scope == UserAppOperationScope::Prod {
+                let host_root =
+                    crate::runtime::docker_app_configuration::host_workspace_root().await?;
+                crate::runtime::docker_app_configuration::verify_mounts(&info, app_id, &host_root)?;
+            }
             let metadata = info
                 .config
                 .as_ref()
@@ -339,6 +398,16 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         self.prepare_compute_file_lease(context, scope).await
     }
 
+    async fn resume_original_compute_operation(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        scope: shared_types::UserAppOperationScope,
+        receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<Box<dyn shared_types::AppOperationLease>> {
+        self.resume_original_compute_file_lease(context, scope, receipt)
+            .await
+    }
+
     async fn inspect_compute_drain_lease(
         &self,
         context: &shared_types::UserAppExecutionContext,
@@ -346,6 +415,16 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
     ) -> ContainerRuntimeResult<shared_types::ComputeLeaseInspection> {
         self.inspect_compute_file_lease(context, scope, receipt)
+            .await
+    }
+
+    async fn prepare_compute_handoff(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        scope: shared_types::UserAppOperationScope,
+        receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
+    ) -> ContainerRuntimeResult<container_runtime_api::ComputeHandoff> {
+        self.prepare_compute_file_handoff(context, scope, receipt)
             .await
     }
 
@@ -674,6 +753,64 @@ impl UserAppDeploymentRuntime for DockerRuntime {
             ));
         }
         crate::runtime::docker_compute_receipt::save_app_start(&target.target).await
+    }
+
+    /// Receipt-free positive running observation of the captured application
+    /// container: the exact captured UID still exists and Docker reports it
+    /// executing. Readiness is not judged; read-only with a recheck.
+    async fn observe_app_compute_running(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        shared_types::validate_identifier(&target.context.app_id, "app_id")
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        if target.resource.kind != shared_types::AppResourceKind::Container
+            || target.resource.uid.is_empty()
+            || target.resource.name != app_deployment_name(&target.context.app_id)
+        {
+            return Err(ContainerRuntimeError::ConfigurationError(
+                "Invalid application running observation target".into(),
+            ));
+        }
+        let client = self.inner.get_docker_client();
+        let name = target.resource.name.clone();
+        let inspect_once = || {
+            let client = client.clone();
+            let name = name.clone();
+            async move {
+                match client.inspect_container(&name, None).await {
+                    Ok(current) => Ok(Some(current)),
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    }) => Ok(None),
+                    Err(error) => Err(ContainerRuntimeError::DockerError(format!(
+                        "Observe captured running application: {error}"
+                    ))),
+                }
+            }
+        };
+        let identity_executing = |inspect: &bollard::models::ContainerInspectResponse| {
+            if inspect.id.as_deref() != Some(target.resource.uid.as_str()) {
+                return Err(ContainerRuntimeError::Conflict(
+                    "Captured application container changed during running observation".into(),
+                ));
+            }
+            Ok(inspect
+                .state
+                .as_ref()
+                .is_some_and(|state| state.running == Some(true) && state.restarting != Some(true)))
+        };
+        let Some(first) = inspect_once().await? else {
+            return Ok(false);
+        };
+        if !identity_executing(&first)? {
+            return Ok(false);
+        }
+        match inspect_once().await? {
+            Some(second) => identity_executing(&second),
+            None => Ok(false),
+        }
     }
 
     async fn reconcile_app_compute_start(

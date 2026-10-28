@@ -444,6 +444,7 @@ impl RuntimeStore {
                 // Both routes use owner-controlled preparation and activation.
                 "deploy-artifact-url".into(),
                 "deploy-artifact-id".into(),
+                "recover-retained-workspace".into(),
                 workspace_manifest::STARTUP_PROBE_CAPABILITY.into(),
                 shared_types::OFFICIAL_PROXY_RESTART_CAPABILITY.into(),
             ],

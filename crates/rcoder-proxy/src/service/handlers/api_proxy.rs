@@ -156,17 +156,13 @@ pub async fn handle_api_proxy_request(
         pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
     })?;
 
-    upstream_request.set_uri(new_uri);
-
-    // 8. 设置 Host 头（从 base_url 提取）
-    if let Some(host) = base_url
-        .strip_prefix("https://")
-        .or_else(|| base_url.strip_prefix("http://"))
-        .and_then(|s: &str| s.split('/').next())
-    {
-        upstream_request.insert_header("Host", host)?;
+    // Use the parsed authority, preserving IPv6 brackets and an explicit port.
+    if let Some(host) = new_uri.authority() {
+        upstream_request.insert_header("Host", host.as_str())?;
         debug!("Host header already set: {}", host);
     }
+
+    upstream_request.set_uri(new_uri);
 
     // 9. 设置通用代理头
     utils::set_common_headers(upstream_request)?;
@@ -186,16 +182,6 @@ pub async fn handle_api_proxy_request(
     Ok(())
 }
 
-/// 解析 base_url 中的显式端口段；非法（非 u16）时返回 400 配置错误，
-/// 错误信息携带原始 base_url 与非法端口，绝不静默回落默认端口。
-fn parse_explicit_port(port_str: &str, base_url: &str) -> PingoraResult<u16> {
-    port_str.parse::<u16>().map_err(|_| {
-        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400)).more_context(format!(
-            "invalid port '{port_str}' in base_url '{base_url}'"
-        ))
-    })
-}
-
 /// 处理 API 密钥代理的上游选择
 ///
 /// 返回真实 API 端点的 HttpPeer
@@ -212,44 +198,51 @@ pub async fn handle_api_proxy_upstream(
     })?;
 
     // 2. 从 ApiKeyManager 查询 API 配置
-    let api_config = api_key_manager.get(service_name).ok_or_else(|| {
-        warn!("{} not in API config", service_name);
-        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(format!(
-            "API key config for service {} not found",
-            service_name
-        ))
-    })?;
+    let api_config = api_key_manager
+        .get(service_name)
+        .map(|config| config.value().clone())
+        .ok_or_else(|| {
+            warn!("{} not in API config", service_name);
+            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(
+                format!("API key config for service {} not found", service_name),
+            )
+        })?;
 
-    let config = api_config.value();
+    let config = &api_config;
     let base_url = &config.base_url;
 
-    // 3. 解析真实 API 端点的 host 和 port
-    // 支持 https://api.anthropic.com 和 https://api.openai.com:443 格式
-    // 显式端口非法时 fail-fast 报错，不静默回落默认端口
-    let (host, port, use_tls) = if let Some(https_url) = base_url.strip_prefix("https://") {
-        let host_part = https_url.split('/').next().unwrap_or(https_url);
-        if let Some(port_str) = host_part.split(':').nth(1) {
-            let port = parse_explicit_port(port_str, base_url)?;
-            let host = host_part.split(':').next().unwrap_or(host_part);
-            (host, port, true)
-        } else {
-            (host_part, 443, true)
+    // URL parsing must distinguish an IPv6 literal from a host:port pair.
+    // Invalid explicit ports remain configuration errors; never choose a default
+    // port after parsing failed. Error context excludes credentials and queries.
+    let endpoint = url::Url::parse(base_url).map_err(|error| {
+        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+            .more_context(format!("invalid model base_url: {error}"))
+    })?;
+    let use_tls = match endpoint.scheme() {
+        "https" => true,
+        "http" => false,
+        _ => {
+            return Err(
+                pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+                    .more_context("model base_url requires http or https"),
+            );
         }
-    } else if let Some(http_url) = base_url.strip_prefix("http://") {
-        let host_part = http_url.split('/').next().unwrap_or(http_url);
-        if let Some(port_str) = host_part.split(':').nth(1) {
-            let port = parse_explicit_port(port_str, base_url)?;
-            let host = host_part.split(':').next().unwrap_or(host_part);
-            (host, port, false)
-        } else {
-            (host_part, 80, false)
-        }
-    } else {
-        return Err(
-            pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
-                .more_context(format!("invalid base_url format: {}", base_url)),
-        );
     };
+    let host = match endpoint.host() {
+        Some(url::Host::Domain(host)) => host.to_owned(),
+        Some(url::Host::Ipv4(host)) => host.to_string(),
+        Some(url::Host::Ipv6(host)) => host.to_string(),
+        None => {
+            return Err(
+                pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+                    .more_context("model base_url requires a host"),
+            );
+        }
+    };
+    let port = endpoint.port_or_known_default().ok_or_else(|| {
+        pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(400))
+            .more_context("model base_url requires a valid port")
+    })?;
 
     // 4. 记录指标
     metrics.record_request();
@@ -257,18 +250,19 @@ pub async fn handle_api_proxy_upstream(
 
     // 4.1 记录上游信息到 ctx（用于 response_filter 打印协议）
     // ctx 仅日志/追踪记录：外部 API 域名不经注册表解析（dial_addr 只用于
-    // 注册表键），实际 peer 构造在下方直拼——原样记录避免误解析+噪声 warn
-    ctx.upstream_host = Some(format!("{host}:{port}"));
+    // 注册表键）；保留原域名日志，实际 peer 在下方异步解析为 SocketAddr
+    ctx.upstream_host = Some(format!(
+        "{}:{port}",
+        &endpoint[url::Position::BeforeHost..url::Position::AfterHost]
+    ));
     ctx.use_tls = use_tls;
 
     // 5. 创建真实 API 端点的 HttpPeer
     // 注意：SNI 必须设置为目标主机名，否则 TLS 握手会失败
     // 同时需要启用 HTTP/2 支持，因为很多 API 服务（如 open.bigmodel.cn）强制使用 HTTP/2
-    let mut peer = HttpPeer::new(
-        (host, port),
-        use_tls,          // 根据协议决定是否使用 TLS
-        host.to_string(), // SNI 必须设置为目标主机名
-    );
+    let mut peer = super::super::upstream::ConnectBudget::model_api()
+        .direct_peer(&host, port, use_tls, host.clone())
+        .await?;
     // 启用 HTTP/2 支持，优先 H2，兼容 H1
     peer.options.alpn = ALPN::H2H1;
 
@@ -282,7 +276,7 @@ pub async fn handle_api_proxy_upstream(
     info!(
         "[API_PROXY] {} -> {}:{} (TLS: {}, ALPN: {})",
         service_name,
-        utils::mask_domain(host),
+        utils::mask_domain(&host),
         port,
         use_tls,
         alpn_str
@@ -300,12 +294,146 @@ pub async fn handle_api_proxy_upstream(
         user_timeout: Duration::from_secs(85), // Linux: 数据未确认的最大时间
     });
     // 连接超时配置
-    peer.options.connection_timeout = Some(Duration::from_secs(10)); // 连接建立超时
-    peer.options.total_connection_timeout = Some(Duration::from_secs(30)); // 含 TLS 握手的总超时
+    // DNS and TCP/TLS share the original 10s/30s connection budgets above.
     // read_timeout: 不设置，默认 None，适合 AI API 长时间推理
     peer.options.idle_timeout = Some(Duration::from_secs(90)); // 连接池空闲超时
 
     let peer = Box::new(peer);
 
     Ok(peer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn configuration(base_url: &str) -> Arc<DashMap<String, ModelProviderConfig>> {
+        Arc::new(DashMap::from_iter([(
+            "model".into(),
+            ModelProviderConfig {
+                id: "model".into(),
+                name: "fixture".into(),
+                base_url: base_url.into(),
+                api_key: "fixture-key".into(),
+                requires_openai_auth: true,
+                default_model: "fixture".into(),
+                api_protocol: Some("openai".into()),
+                wire_api: None,
+            },
+        )]))
+    }
+
+    #[tokio::test]
+    async fn ipv6_model_endpoints_select_the_configured_peer() {
+        let mut router = matchit::Router::new();
+        router.insert("/api/{service_name}/{*path}", ()).unwrap();
+        let matched = router.at("/api/model/v1/messages").unwrap();
+        for base_url in ["http://[::1]:4321/v1", "https://[::1]:4321/v1"] {
+            let mut ctx = TrackingCtx::default();
+            let result = handle_api_proxy_upstream(
+                &mut ctx,
+                matched.params.clone(),
+                &configuration(base_url),
+                &Arc::new(ProxyMetrics::default()),
+            )
+            .await;
+            assert!(result.is_ok(), "{base_url}: {result:?}");
+            assert_eq!(ctx.upstream_host.as_deref(), Some("[::1]:4321"));
+            assert_eq!(ctx.use_tls, base_url.starts_with("https:"));
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_model_hostname_keeps_sni_tls_http2_and_original_timeouts() {
+        let mut router = matchit::Router::new();
+        router.insert("/api/{service_name}/{*path}", ()).unwrap();
+        let matched = router.at("/api/model/v1/messages").unwrap();
+        let peer = handle_api_proxy_upstream(
+            &mut TrackingCtx::default(),
+            matched.params,
+            &configuration("https://localhost:4321/v1"),
+            &Arc::new(ProxyMetrics::default()),
+        )
+        .await
+        .unwrap();
+        assert!(peer._address.as_inet().unwrap().ip().is_loopback());
+        assert_eq!(peer._address.as_inet().unwrap().port(), 4321);
+        assert_eq!(peer.sni, "localhost");
+        assert!(peer.is_tls());
+        assert_eq!(peer.options.alpn, ALPN::H2H1);
+        assert!(peer.options.connection_timeout.unwrap() <= Duration::from_secs(10));
+        assert!(peer.options.total_connection_timeout.unwrap() <= Duration::from_secs(30));
+        assert!(peer.options.read_timeout.is_none());
+        assert_eq!(peer.options.idle_timeout, Some(Duration::from_secs(90)));
+        assert_eq!(peer.options.h2_ping_interval, Some(Duration::from_secs(30)));
+        assert!(peer.options.tcp_keepalive.is_some());
+    }
+
+    #[tokio::test]
+    async fn invalid_model_endpoint_ports_remain_errors() {
+        let mut router = matchit::Router::new();
+        router.insert("/api/{service_name}/{*path}", ()).unwrap();
+        let matched = router.at("/api/model/v1/messages").unwrap();
+        for base_url in [
+            "http://127.0.0.1:abc/v1",
+            "https://127.0.0.1:65536/v1",
+            "http://[::1]:abc/v1",
+            "ftp://127.0.0.1/v1",
+        ] {
+            let metrics = Arc::new(ProxyMetrics::default());
+            assert!(
+                handle_api_proxy_upstream(
+                    &mut TrackingCtx::default(),
+                    matched.params.clone(),
+                    &configuration(base_url),
+                    &metrics,
+                )
+                .await
+                .is_err(),
+                "{base_url}"
+            );
+            assert_eq!(
+                metrics
+                    .active_connections
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn model_endpoint_rewrite_preserves_authority_path_query_and_auth() {
+        let mut router = matchit::Router::new();
+        router.insert("/api/{service_name}/{*path}", ()).unwrap();
+        let original: http::Uri = "/api/model/messages?stream=true".parse().unwrap();
+        let matched = router.at(original.path()).unwrap();
+        for (base_url, authority) in [
+            ("http://127.0.0.1:4321/v1", "127.0.0.1:4321"),
+            ("https://[::1]:4321/v1", "[::1]:4321"),
+            ("https://localhost:4321/v1", "localhost:4321"),
+        ] {
+            let mut request =
+                RequestHeader::build("POST", original.to_string().as_bytes(), None).unwrap();
+            request
+                .insert_header("authorization", "Bearer placeholder")
+                .unwrap();
+            handle_api_proxy_request(
+                &mut request,
+                &original,
+                matched.params.clone(),
+                &mut TrackingCtx::default(),
+                &configuration(base_url),
+            )
+            .await
+            .unwrap();
+            assert_eq!(request.uri.authority().unwrap().as_str(), authority);
+            assert_eq!(
+                request.uri.path_and_query().unwrap().as_str(),
+                "/v1/messages?stream=true"
+            );
+            assert_eq!(request.headers["host"], authority);
+            assert_eq!(request.headers["authorization"], "Bearer fixture-key");
+            assert!(!request.headers.contains_key("x-api-key"));
+        }
+    }
 }

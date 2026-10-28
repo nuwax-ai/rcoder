@@ -8,6 +8,116 @@ use toasty_core::schema::db::Type;
 
 use super::store_repo::outcome;
 
+pub(in crate::pg) async fn session_execution_is_current(
+    tx: &mut dyn Executor,
+    append: &crate::pg::project_store::persist_ops::ContainerSessionAppend,
+) -> Result<bool> {
+    let Some(container) =
+        crate::db::models::Container::filter_by_container_name(&append.container_name)
+            .first()
+            .exec(tx)
+            .await?
+    else {
+        return Ok(false);
+    };
+    if !container
+        .service_type
+        .parse::<shared_types::ServiceType>()
+        .map_err(anyhow::Error::msg)?
+        .same_container_family(
+            append
+                .service_type
+                .parse::<shared_types::ServiceType>()
+                .map_err(anyhow::Error::msg)?,
+        )
+    {
+        return Ok(false);
+    }
+    let owned = toasty::sql::query(
+        "SELECT p.project_id FROM projects p JOIN containers c
+           ON c.container_name=p.container_name AND c.container_generation=p.container_generation
+         WHERE p.project_id=$1 AND p.generation=$2 AND c.container_name=$3
+           AND c.container_generation=$4 AND c.container_id=$5
+           AND c.workload_uid IS NOT DISTINCT FROM $6 AND c.logical_id=$7
+           AND NOT EXISTS(SELECT 1 FROM project_tombstones t WHERE t.project_id=p.project_id AND t.generation=p.generation)
+           AND NOT EXISTS(SELECT 1 FROM container_tombstones t WHERE
+             (t.container_name=c.container_name AND t.container_generation=c.container_generation)
+             OR t.physical_uid=c.container_id)"
+    ).bind(&append.project_id).bind(&append.project_generation)
+        .bind(&append.container_name).bind(&append.container_generation).bind(&append.physical_uid)
+        .bind_typed(append.workload_uid.as_deref(), Type::Text)
+        .bind(&append.logical_id).exec(tx).await?;
+    Ok(!owned.is_empty())
+}
+
+pub(in crate::pg) async fn append_session_for_container(
+    tx: &mut dyn Executor,
+    append: &crate::pg::project_store::persist_ops::ContainerSessionAppend,
+) -> Result<PersistenceOperationOutcome> {
+    if !session_execution_is_current(tx, append).await? {
+        return Ok(PersistenceOperationOutcome::Superseded);
+    }
+    // The writer already holds this SID's advisory lock. Keep the point-read
+    // decision fenced against a Stop committed before the final append.
+    for generation in &append.retirement_fences {
+        if session_generation_is_retired(tx, &append.session_id, generation).await? {
+            return Ok(PersistenceOperationOutcome::Superseded);
+        }
+    }
+    let outcome = add_session(
+        tx,
+        &append.project_id,
+        &append.session_id,
+        &append.project_generation,
+        &append.session_generation,
+        append.predecessor.as_deref(),
+    )
+    .await?;
+    if outcome == PersistenceOperationOutcome::Committed {
+        super::touch_project(
+            tx,
+            &append.project_id,
+            &append.project_generation,
+            append.at,
+        )
+        .await?;
+        super::touch_container(
+            tx,
+            &append.container_name,
+            &append.container_generation,
+            append.at,
+        )
+        .await?;
+        toasty::sql::statement(
+            "UPDATE projects SET latest_session=$1 WHERE project_id=$2 AND generation=$3
+               AND row_revision=$4 AND request_id IS NOT DISTINCT FROM $5",
+        )
+        .bind(&append.session_id)
+        .bind(&append.project_id)
+        .bind(&append.project_generation)
+        .bind(append.dispatch_revision)
+        .bind_typed(append.request_id.as_deref(), Type::Text)
+        .exec(tx)
+        .await?;
+    }
+    Ok(outcome)
+}
+
+pub(in crate::pg) async fn session_generation_is_retired(
+    tx: &mut dyn Executor,
+    session_id: &str,
+    generation: &str,
+) -> Result<bool> {
+    Ok(!toasty::sql::query(
+        "SELECT session_id FROM session_tombstones WHERE session_id=$1 AND generation=$2",
+    )
+    .bind(session_id)
+    .bind(generation)
+    .exec(tx)
+    .await?
+    .is_empty())
+}
+
 pub(in crate::pg) async fn add_session(
     tx: &mut dyn Executor,
     project_id: &str,
@@ -16,6 +126,14 @@ pub(in crate::pg) async fn add_session(
     generation: &str,
     predecessor: Option<&str>,
 ) -> Result<PersistenceOperationOutcome> {
+    // Old queued snapshots can contain preparation placeholders. Resolve them
+    // without mutation or an error that would permanently retry the writer.
+    if shared_types::SessionHint::classify(Some(session_id))
+        .as_session_id()
+        .is_none()
+    {
+        return Ok(PersistenceOperationOutcome::Superseded);
+    }
     anyhow::ensure!(
         predecessor != Some(generation),
         "Session cannot replace its own generation"

@@ -3,11 +3,14 @@
 //! 从 `handle_computer_chat_internal` 抽出：Agent 自动安装检查、VNC 后端注册、
 //! Agent 状态探活、session_id 自动解析、响应后会话映射更新。
 
-use shared_types::{ChatResponse, ComputerChatRequest};
+use shared_types::{
+    ChatResponse, ComputerChatRequest, ProjectAndContainerInfo,
+    persistence::PersistenceWriteOutcome,
+};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::{HttpResult, router::AppState};
+use crate::{AppError, HttpResult, router::AppState};
 use docker_manager::ContainerBasicInfo;
 
 use super::super::chat_forward::ChatFlowExit;
@@ -184,225 +187,194 @@ pub(super) async fn probe_agent_status(
 /// 如果用户没有传递 session_id，尝试从状态中查找最新的 session_id，
 /// 并克隆 request 注入解析后的 session_id 用于转发。
 pub(super) fn resolve_forward_request(
-    state: &Arc<AppState>,
     request: &ComputerChatRequest,
-    project_id: &str,
+    captured: &ProjectAndContainerInfo,
 ) -> ComputerChatRequest {
-    let session_id_to_use = match &request.session_id {
-        Some(sid) if !sid.is_empty() => {
-            debug!("[COMPUTER_CHAT] Using session_id: {}", sid);
-            sid.clone()
-        }
-        _ => {
-            // 用户没有传递 session_id，尝试查找最新的
-            match state.get_project(project_id) {
-                Some(project_info) => {
-                    let existing_session_id = project_info.session_id();
-                    match existing_session_id {
-                        Some(sid) if !sid.is_empty() => {
-                            info!(
-                                "🔄 [COMPUTER_CHAT] No session_id provided, auto using latest session: project_id={}, session_id={}",
-                                project_id, sid
-                            );
-                            sid.to_string()
-                        }
-                        _ => {
-                            debug!("[COMPUTER_CHAT] Project exists, creating new session");
-                            String::new()
-                        }
-                    }
-                }
-                None => {
-                    debug!("[COMPUTER_CHAT] No project, creating new session");
-                    String::new()
-                }
-            }
-        }
-    };
-
-    // 克隆 request 并修改 session_id
-    let mut request_for_forward = request.clone();
-    request_for_forward.session_id = if session_id_to_use.is_empty() {
-        None
-    } else {
-        Some(session_id_to_use.clone())
-    };
-    // 🆕 自动查找 session_id 逻辑结束
-    request_for_forward
+    let mut forwarded = request.clone();
+    forwarded.session_id = shared_types::SessionHint::classify(request.session_id.as_deref())
+        .as_session_id()
+        .or_else(|| shared_types::SessionHint::classify(captured.session_id()).as_session_id())
+        .map(str::to_owned);
+    forwarded
 }
 
-/// 更新会话映射（填充所有三个映射表，保持一致性）
-/// 无论请求成功还是失败，只要响应中包含 session_id，都要更新映射
-/// 这样用户可以通过 SSE 接口获取错误通知，而不会收到 SESSION_EXPIRED 错误
-#[instrument(skip_all, fields(user_id = %user_id, project_id = %project_id))]
+/// Capture both the registration generation and a detached physical snapshot.
+/// Cloning the project alone would retain its mutable shared ContainerEntry.
+pub(super) fn capture_dispatch_project(
+    registered: &ProjectAndContainerInfo,
+) -> Result<ProjectAndContainerInfo, AppError> {
+    let basic = registered.container_info().ok_or_else(|| {
+        AppError::internal_server_error("Registered Computer container is missing before dispatch")
+    })?;
+    let mut captured = registered.clone();
+    captured.set_container(Some(basic));
+    Ok(captured)
+}
+
+/// Append only this accepted session against the captured execution identity.
+/// Completing an older RPC must not overwrite a later request's model/metadata.
+#[instrument(skip_all, fields(project_id = %captured.project_id()))]
 pub(super) async fn update_session_mappings_after_response(
     state: &Arc<AppState>,
-    result: &HttpResult<ChatResponse>,
-    user_id: &str,
-    project_id: &str,
-    container_info: &ContainerBasicInfo,
-    request: &ComputerChatRequest,
-    container_service_type: &shared_types::ServiceType,
+    result: &mut HttpResult<ChatResponse>,
+    captured: &ProjectAndContainerInfo,
+    locale: &'static str,
 ) {
-    let Some(chat_response) = &result.data else {
+    let Some(sid) = response_session_id(result, captured.project_id()) else {
         return;
     };
+    let outcome = state
+        .append_session_for_container_durable(captured, &sid)
+        .await;
+    complete_session_registration(
+        result,
+        captured,
+        &sid,
+        outcome,
+        state.is_session_registration_committed(captured, &sid),
+        locale,
+    )
+    .await;
+}
 
-    let session_id = chat_response.session_id.clone();
-
-    // 只有当 session_id 非空时才更新映射
-    if session_id.is_empty() {
-        return;
+/// Shared Computer/UserApp boundary: only an established ACP ID may be routed.
+pub(super) fn response_session_id(
+    result: &mut HttpResult<ChatResponse>,
+    project_id: &str,
+) -> Option<String> {
+    let response = result.data.as_ref()?;
+    match shared_types::SessionHint::classify(Some(&response.session_id)) {
+        shared_types::SessionHint::Established(sid) => Some(sid.to_owned()),
+        shared_types::SessionHint::LegacyPending => {
+            reject_unusable_session_response(result, project_id);
+            None
+        }
+        shared_types::SessionHint::Absent => {
+            // Ordinary failures before acceptance may legitimately have no
+            // session. A successful RPC must return an actual ACP identity.
+            if result.is_success() {
+                reject_unusable_session_response(result, project_id);
+            }
+            None
+        }
     }
+}
 
-    info!(
-        "🔗 [COMPUTER_CHAT] Associated session: session_id={} -> user_id={}, project_id={}, success={}",
-        session_id,
-        user_id,
-        project_id,
-        result.is_success()
-    );
-
-    // 从 Runtime API 获取最新容器信息，避免使用过期 IP。
-    // 查找 identifier：ComputerAgentRunner=user_id（per-user 容器）；
-    // UserappBuilder=project_id（userApp 开发对话的 per-app 开发容器）
-    let lookup_identifier = match container_service_type {
-        shared_types::ServiceType::UserappBuilder => project_id,
-        _ => user_id,
+/// An older Runner may have already submitted the prompt before returning its
+/// preparation label. Never register it or replay that accepted prompt. Drop
+/// the invalid identity from the existing optional error data, not the history.
+fn reject_unusable_session_response(result: &mut HttpResult<ChatResponse>, project_id: &str) {
+    let accepted = result.is_success();
+    let Some(response) = result.data.take() else {
+        return;
     };
-    let container_info = match state
-        .runtime()
-        .get_container_info_by_identifier(lookup_identifier, container_service_type)
-        .await
+    let diagnostic = if accepted {
+        "The task was accepted, but the Agent did not return a valid session ID. The execution outcome is unknown."
+            .to_owned()
+    } else {
+        format!(
+            "The Agent returned no usable session ID. Original error: {}",
+            response.error.as_deref().unwrap_or(&result.message)
+        )
+    };
+    error!(project_id,
+        session_id = %response.session_id, request_id = ?response.request_id,
+        accepted, original_code = %result.code,
+        detail = %shared_types::sanitize_error_text(&diagnostic),
+        "[COMPUTER_CHAT] Invalid Runner session identity; prompt must not be replayed");
+    if accepted {
+        result.code = shared_types::ERR_AGENT_ERROR.to_owned();
+        result.success = false;
+        result.message = diagnostic.clone();
+    }
+    let detail = result.error_detail.get_or_insert_with(|| {
+        shared_types::ErrorDetail::new(&result.code, "chat.session_identity", diagnostic)
+    });
+    if shared_types::SessionHint::classify(detail.task_id.as_deref())
+        .as_session_id()
+        .is_none()
     {
-        Ok(Some(info)) => {
-            info!(
-                "🔄 [COMPUTER_CHAT] Getting latest container info from Runtime API: identifier={}, container_id={}, container_ip={}",
-                lookup_identifier, info.container_id, info.container_ip
-            );
-            info
-        }
-        Ok(None) => {
-            warn!(
-                "⚠️ [COMPUTER_CHAT] Container not found in runtime: identifier={}, using cached container info",
-                lookup_identifier
-            );
-            // 使用之前获取的容器信息
-            container_info.clone()
-        }
-        Err(e) => {
-            warn!(
-                "⚠️ [COMPUTER_CHAT] Failed to get container info from runtime: identifier={}, error={}, using cached container info",
-                lookup_identifier, e
-            );
-            // 使用之前获取的容器信息
-            container_info.clone()
-        }
-    };
-
-    // ComputerAgentRunner 模式：每个 project 独立记录
-    // 使用真正的 project_id 作为 map_key，user_id 存储在数据字段中
-    let map_key = project_id.to_string();
-
-    // 检查是否已存在该 project_id 的记录
-    if let Some(existing_info) = state.get_project(&map_key) {
-        // 已存在：更新信息
-        let mut updated_info = (*existing_info).clone();
-
-        // 更新活动时间
-        updated_info.update_activity();
-        // 添加 session（多 session 模型，不清除其他 session）
-        updated_info.add_session(session_id.clone());
-
-        // 更新扩展信息
-        updated_info.update_extended_from_request(
-            Some(container_info.clone()),
-            request.model_provider.clone(),
-            request.request_id.clone(),
-            Some(*container_service_type),
-        );
-
-        // 单次原子写入（项目元数据 + session 映射），消除 CAS 竞态。
-        // durable：PG 事务提交完成才返回——session_id 到达前端时任何副本可服务
-        state
-            .insert_project_with_session_durable(
-                map_key.clone(),
-                Arc::new(updated_info),
-                &session_id,
-            )
-            .await
-            .unwrap_or_else(|e| {
-                // 降级不失败：gRPC chat 已成功、agent 已执行，映射写入失败时把
-                // 成功响应变 500 会让客户端重试重复发消息——PG 内部已降级
-                // write-behind，此处 Err 仅剩镜像写失败等罕见分支，warn 即可
-                tracing::warn!(
-                    "[STORAGE] session mapping degraded (durable fallback applied): {}",
-                    e
-                );
-            });
-
-        info!(
-            "🔄 [COMPUTER_CHAT] Updated existing container mapping: user_id={}, project_id={}, session_id={} (last_activity refreshed)",
-            user_id, project_id, session_id
-        );
-    } else {
-        // 不存在：创建新的 ProjectAndContainerInfo
-        let mut project_info = shared_types::ProjectAndContainerInfo::new(map_key.clone());
-
-        // 设置 user_id（ComputerAgentRunner 模式）
-        project_info.set_user_id(Some(user_id.to_string()));
-        // 设置 pod_id（共享容器模式）
-        project_info.set_pod_id(request.pod_id.clone());
-        // 添加 session（多 session 模型）
-        project_info.add_session(session_id.clone());
-
-        // 更新扩展信息（容器、模型配置等）
-        project_info.update_extended_from_request(
-            Some(container_info.clone()),
-            request.model_provider.clone(),
-            request.request_id.clone(),
-            Some(*container_service_type),
-        );
-        project_info.set_scope(
-            request.tenant_id.clone(),
-            request.space_id.clone(),
-            request.isolation_type.clone(),
-        );
-
-        // 单次原子写入（项目元数据 + session 映射），消除 CAS 竞态。
-        // durable：PG 事务提交完成才返回——session_id 到达前端时任何副本可服务
-        state
-            .insert_project_with_session_durable(
-                map_key.clone(),
-                Arc::new(project_info),
-                &session_id,
-            )
-            .await
-            .unwrap_or_else(|e| {
-                // 降级不失败：gRPC chat 已成功、agent 已执行，映射写入失败时把
-                // 成功响应变 500 会让客户端重试重复发消息——PG 内部已降级
-                // write-behind，此处 Err 仅剩镜像写失败等罕见分支，warn 即可
-                tracing::warn!(
-                    "[STORAGE] session mapping degraded (durable fallback applied): {}",
-                    e
-                );
-            });
-
-        info!(
-            "🆕 [COMPUTER_CHAT] Created new container mapping: user_id={}, project_id={}, session_id={}",
-            user_id, project_id, session_id
-        );
+        detail.task_id = None;
     }
+    detail.retryable = false;
+    detail.hint = "Inspect project status and logs; do not resend this prompt automatically. A preparation state is not a session ID."
+        .to_owned();
+}
 
-    if result.is_success() {
-        info!(
-            "✅ [COMPUTER_CHAT] Request processed: user_id={}, project_id={}, session_id={} (all mappings updated)",
-            user_id, project_id, session_id
-        );
+async fn complete_session_registration(
+    result: &mut HttpResult<ChatResponse>,
+    captured: &ProjectAndContainerInfo,
+    session_id: &str,
+    outcome: anyhow::Result<PersistenceWriteOutcome>,
+    readback: impl Future<Output = anyhow::Result<bool>>,
+    locale: &'static str,
+) {
+    let (code, diagnostic) = match outcome {
+        Ok(PersistenceWriteOutcome::Committed) => {
+            info!(project_id = %captured.project_id(), session_id,
+                "[COMPUTER_CHAT] Session registration committed");
+            return;
+        }
+        Ok(PersistenceWriteOutcome::Deferred { reason }) => {
+            // The store verifies the original registration against its committed
+            // source (PG primary), never an optimistic local pending mirror.
+            // No prompt replay, sleeps or new timeout budget.
+            match readback.await {
+                Ok(true) => {
+                    info!(project_id = %captured.project_id(), session_id,
+                        "[COMPUTER_CHAT] Session registration confirmed by readback");
+                    return;
+                }
+                Ok(false) => (
+                    shared_types::ERR_SERVICE_UNAVAILABLE,
+                    format!("Session registration remains deferred: {reason}"),
+                ),
+                Err(error) => (
+                    shared_types::ERR_SERVICE_UNAVAILABLE,
+                    format!("Session registration deferred: {reason}; readback failed: {error:#}"),
+                ),
+            }
+        }
+        Ok(PersistenceWriteOutcome::Superseded) => (
+            shared_types::ERR_CONFLICT,
+            "The captured execution identity was replaced before session registration".to_owned(),
+        ),
+        Err(error) => (
+            shared_types::ERR_SERVICE_UNAVAILABLE,
+            format!("Session registration failed after task acceptance: {error:#}"),
+        ),
+    };
+    error!(project_id = %captured.project_id(), session_id, %code,
+        detail = %shared_types::sanitize_error_text(&diagnostic),
+        "[COMPUTER_CHAT] Accepted task session registration unresolved; prompt must not be replayed");
+    let hint = if locale.starts_with("zh") {
+        "任务已受理，请仅使用现有 session_id 重连进度，不要重复发送原消息。"
     } else {
-        warn!(
-            "⚠️ [COMPUTER_CHAT] Request failed but session mapping saved: user_id={}, project_id={}, session_id={}, code={}, message={}",
-            user_id, project_id, session_id, result.code, result.message
+        "The task was accepted. Reconnect progress with its existing session_id; do not resend this prompt."
+    };
+    // Preserve a genuine runner business failure. Registration diagnostics may
+    // supplement it, but cannot turn it into a successful chat response.
+    if result.is_success() {
+        result.code = code.to_owned();
+        result.success = false;
+        result.message = shared_types::sanitize_error_text(&diagnostic);
+        result.error_detail = Some(
+            shared_types::ErrorDetail::new(code, "chat.session_registration", diagnostic)
+                .with_task_id(session_id)
+                .with_retryable(false)
+                .with_hint(hint)
+                .localized(locale),
+        );
+    } else if result.error_detail.is_none() {
+        result.error_detail = Some(
+            shared_types::ErrorDetail::new(code, "chat.session_registration", diagnostic)
+                .with_task_id(session_id)
+                .with_retryable(false)
+                .with_hint(hint)
+                .localized(locale),
         );
     }
 }
+
+#[cfg(test)]
+mod tests;

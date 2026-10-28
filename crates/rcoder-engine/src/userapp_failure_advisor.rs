@@ -10,15 +10,19 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rcoder_proxy::error_page::{UserAppProxyFailureAdvisor, UserAppProxyFailureHint};
+use rcoder_proxy::error_page::{
+    StandbyOrigin, UserAppProxyFailureAdvisor, UserAppProxyFailureHint,
+};
 use shared_types::{UserAppReadinessObservation, UserappStage};
 
 use crate::app_state::AppState;
 
 /// 提示缓存 TTL（错误风暴下的观察穿透上限；非 SLA）。
 const HINT_TTL: Duration = Duration::from_secs(30);
-/// 单次观察预算上限（失败路径诊断绝不拖长代理等待）。
-const ADVISE_BUDGET_CAP: Duration = Duration::from_secs(2);
+/// 单次观察预算上限。普通失败路径由调用方 min 钳制（1~1.5s，不拖长代理
+/// 等待）；standby 授权观察例外经此上限（3s——上游响应已返回，观察延迟
+/// 的是错误页呈现，慢观察环境需要覆盖，Codex 八轮）。
+const ADVISE_BUDGET_CAP: Duration = Duration::from_secs(4);
 const HINT_CACHE_CAPACITY: usize = 512;
 
 type HintKey = (String, &'static str);
@@ -44,6 +48,145 @@ struct CachedHint {
     hint: Option<UserAppProxyFailureHint>,
 }
 
+/// standby 摘流窗口的轻量来源判定缓存（与文案观察分离，Codex P2）。
+/// 每次完成的观察都会覆盖本条目：显式否定立即撤销旧的确认许可。
+/// owner 保留并比较 Weak 分配（ptr_eq）：跨 AppState 代次不继承，且保留
+/// 分配使地址不可复用（usize 令牌的 ABA 风险由此消除）。
+#[derive(Debug, Clone)]
+struct StandbyOriginEntry {
+    confirmed: bool,
+    at: Instant,
+    /// 观察者身份（保留分配）：许可绑定完成观察的 AppState 实例。
+    owner: std::sync::Weak<AppState>,
+}
+
+/// 同键预热/刷新去抖（30s 窗口）+ 归属代次：新 owner 同键直接重置窗口。
+static STANDBY_PREWARM: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<StandbyOriginKey, (Instant, usize)>>,
+> = std::sync::OnceLock::new();
+
+fn standby_prewarm_map() -> &'static std::sync::Mutex<HashMap<StandbyOriginKey, (Instant, usize)>> {
+    STANDBY_PREWARM.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// 两张控制表的硬容量上限（过期清理后仍满则逐出最早条目）。
+const STANDBY_ORIGIN_CACHE_CAPACITY: usize = 4096;
+const STANDBY_PREWARM_CAPACITY: usize = 4096;
+/// 同键预热/刷新的最小间隔。
+const STANDBY_PREWARM_INTERVAL: Duration = Duration::from_secs(30);
+
+fn epoch_of(state: &std::sync::Weak<AppState>) -> usize {
+    std::sync::Weak::as_ptr(state) as usize
+}
+
+fn owner_alive(entry: &StandbyOriginEntry, state: &std::sync::Weak<AppState>) -> bool {
+    std::sync::Weak::ptr_eq(&entry.owner, state) && entry.owner.upgrade().is_some()
+}
+
+/// 插入（带容量硬上限：先清过期，仍满则逐出最早）。
+fn insert_standby_origin_entry(
+    key: StandbyOriginKey,
+    confirmed: bool,
+    owner: &std::sync::Weak<AppState>,
+) {
+    let mut cache = standby_origin_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.len() >= STANDBY_ORIGIN_CACHE_CAPACITY {
+        let now = Instant::now();
+        cache.retain(|_, entry| {
+            let ttl = if entry.confirmed {
+                STANDBY_ORIGIN_POSITIVE_TTL
+            } else {
+                STANDBY_ORIGIN_NEGATIVE_TTL
+            };
+            now.duration_since(entry.at) < ttl
+        });
+        while cache.len() >= STANDBY_ORIGIN_CACHE_CAPACITY {
+            let earliest = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.at)
+                .map(|(key, _)| key.clone());
+            match earliest {
+                Some(oldest) => {
+                    cache.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
+    cache.insert(
+        key,
+        StandbyOriginEntry {
+            confirmed,
+            at: Instant::now(),
+            owner: owner.clone(),
+        },
+    );
+}
+
+/// 撤销（带归属校验：旧 owner 的迟到撤销不影响当前 owner 的条目）。
+fn revoke_standby_origin_entry(key: &StandbyOriginKey, owner: &std::sync::Weak<AppState>) {
+    let mut cache = standby_origin_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache
+        .get(key)
+        .is_some_and(|entry| std::sync::Weak::ptr_eq(&entry.owner, owner))
+    {
+        cache.remove(key);
+    }
+}
+
+/// 预热/刷新是否应发起（去抖 + 容量 + 代次重置）。
+fn prewarm_due(key: &StandbyOriginKey, epoch: usize) -> bool {
+    let mut prewarm = standby_prewarm_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = Instant::now();
+    // 先判当前键（Codex 七轮：先逐出会把未过期的当前键挤出 → 立即误判 due
+    // 重复发起观察）；确认要写入后才做过期清理与容量逐出——当前键即便在
+    // 逐出中最先被移除，紧随的 insert 也把它写回，语义不变。
+    let due = prewarm.get(key).is_none_or(|(at, owner_epoch)| {
+        *owner_epoch != epoch || now.duration_since(*at) >= STANDBY_PREWARM_INTERVAL
+    });
+    if !due {
+        return false;
+    }
+    prewarm.retain(|_, (at, _)| now.duration_since(*at) < STANDBY_PREWARM_INTERVAL);
+    while prewarm.len() >= STANDBY_PREWARM_CAPACITY {
+        let earliest = prewarm
+            .iter()
+            .min_by_key(|(_, (at, _))| *at)
+            .map(|(key, _)| key.clone());
+        match earliest {
+            Some(oldest) => {
+                prewarm.remove(&oldest);
+            }
+            None => break,
+        }
+    }
+    prewarm.insert(key.clone(), (now, epoch));
+    true
+}
+
+type StandbyOriginKey = (String, String);
+static STANDBY_ORIGIN_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<StandbyOriginKey, StandbyOriginEntry>>,
+> = std::sync::OnceLock::new();
+
+fn standby_origin_cache() -> &'static std::sync::Mutex<HashMap<StandbyOriginKey, StandbyOriginEntry>>
+{
+    STANDBY_ORIGIN_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// 正面判定的新鲜度上限。配置切换（managed→custom）后旧许可的最长残留
+/// 窗口：命中还会异步触发刷新观察（≤30s 去抖+观察时延内落账否定），
+/// TTL 是无流量兜底——两者叠加封顶误授权窗口（Codex 六轮）。
+const STANDBY_ORIGIN_POSITIVE_TTL: Duration = Duration::from_secs(120);
+/// 显式否定的复核间隔（custom 切回 managed 后在此时间内恢复替换）。
+const STANDBY_ORIGIN_NEGATIVE_TTL: Duration = Duration::from_secs(120);
+
 pub struct UserAppProxyFailureAdvisorImpl {
     state: std::sync::Weak<AppState>,
     cache: tokio::sync::Mutex<HashMap<HintKey, CachedHint>>,
@@ -59,10 +202,119 @@ impl UserAppProxyFailureAdvisorImpl {
             inflight: dashmap::DashMap::new(),
         }
     }
+
+    /// 完成观察后的来源结论落账：契约命中 → 正面（含代次绑定）；显式
+    /// 不同/缺失 → 否定（立即撤销旧许可，Codex P2）。非 Snapshot 结果
+    /// （超时/不可达）不改写缓存——未知不是否定。
+    fn note_standby_origin(
+        &self,
+        app_id: &str,
+        stage: &str,
+        snapshot: &shared_types::UserAppBusinessReadiness,
+    ) {
+        let confirmed = snapshot.proxy.error_origin_contract.as_deref()
+            == Some(shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT);
+        insert_standby_origin_entry(
+            (app_id.to_owned(), stage.to_owned()),
+            confirmed,
+            &self.state,
+        );
+    }
+
+    /// 容器已不在（NoCompute）：托管来源的物理载体消失——撤销该键的旧许可
+    /// （Codex 五轮：暖缓存遇 NoCompute 不得保持 Confirmed）。删除而非写
+    /// 否定：容器重建后（可能换配置形态）由下一次观察重新落账。归属校验：
+    /// 旧 owner 的迟到撤销不影响当前 owner 的条目（Codex 六轮）。
+    fn revoke_standby_origin(&self, app_id: &str, stage: &str) {
+        revoke_standby_origin_entry(&(app_id.to_owned(), stage.to_owned()), &self.state);
+    }
+
+    /// standby 来源判定：命中缓存按新鲜度返回；未预热/过期触发后台预热
+    /// 观察并返回 Unknown（本请求透传，重试命中）。
+    async fn standby_origin_impl(
+        state: &std::sync::Weak<AppState>,
+        app_id: &str,
+        stage: &str,
+    ) -> StandbyOrigin {
+        let key = (app_id.to_owned(), stage.to_owned());
+        let epoch = epoch_of(state);
+        let mut warm_confirmed = false;
+        {
+            let cache = standby_origin_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(entry) = cache.get(&key) {
+                let ttl = if entry.confirmed {
+                    STANDBY_ORIGIN_POSITIVE_TTL
+                } else {
+                    STANDBY_ORIGIN_NEGATIVE_TTL
+                };
+                if owner_alive(entry, state) && Instant::now().duration_since(entry.at) < ttl {
+                    if entry.confirmed {
+                        warm_confirmed = true;
+                    } else {
+                        return StandbyOrigin::Unconfirmed;
+                    }
+                }
+            }
+        }
+        // 后台预热/刷新（去抖：同键 30s 内只发起一次——冷调用风暴不放大观察；
+        // Confirmed 命中也触发——配置切换后 ≤30s+观察时延内落账否定，误授权
+        // 窗口不依赖 TTL 兜底）。detached 观察（5s 预算）完成后缓存即更新；
+        // 冷缓存本请求透传，后续请求命中。
+        if prewarm_due(&key, epoch) {
+            let state = state.clone();
+            let app_id = app_id.to_owned();
+            let stage_owned = stage.to_owned();
+            tokio::spawn(async move {
+                if let Some(state) = state.upgrade() {
+                    let _ = Self::observe_once_for_origin(&state, &app_id, &stage_owned).await;
+                }
+            });
+        }
+        if warm_confirmed {
+            StandbyOrigin::Confirmed
+        } else {
+            StandbyOrigin::Unknown
+        }
+    }
+
+    /// 后台预热观察：完成即更新来源缓存（含显式否定撤销）。
+    async fn observe_once_for_origin(state: &Arc<AppState>, app_id: &str, stage: &str) {
+        let Some(stage) = UserappStage::parse(stage) else {
+            return;
+        };
+        let Some(reader) = state.app_service.readiness_reader() else {
+            return;
+        };
+        let owner = Arc::downgrade(state);
+        match reader.observe(app_id, stage, Duration::from_secs(5)).await {
+            Ok(UserAppReadinessObservation::Snapshot { snapshot, .. }) => {
+                insert_standby_origin_entry(
+                    (app_id.to_owned(), stage.as_str().to_owned()),
+                    snapshot.proxy.error_origin_contract.as_deref()
+                        == Some(shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT),
+                    &owner,
+                );
+            }
+            // NoCompute：物理载体消失，撤销旧许可（与前台观察同口径）。
+            Ok(UserAppReadinessObservation::NoCompute { .. }) => {
+                revoke_standby_origin_entry(
+                    &(app_id.to_owned(), stage.as_str().to_owned()),
+                    &owner,
+                );
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl UserAppProxyFailureAdvisor for UserAppProxyFailureAdvisorImpl {
+    async fn standby_origin(&self, app_id: &str, stage: &str) -> StandbyOrigin {
+        Self::standby_origin_impl(&self.state, app_id, stage).await
+    }
+
     async fn advise(
         &self,
         app_id: &str,
@@ -112,25 +364,31 @@ impl UserAppProxyFailureAdvisorImpl {
             .await
         {
             Ok(UserAppReadinessObservation::Snapshot { physical, snapshot }) => {
+                self.note_standby_origin(app_id, stage.as_str(), &snapshot);
                 current_snapshot_hint(physical, *snapshot)
             }
-            Ok(UserAppReadinessObservation::NoCompute { state }) => Some(UserAppProxyFailureHint {
-                readiness_status: match state {
-                    shared_types::UserAppNoComputeState::Stopped => {
-                        Some(shared_types::UserAppReadinessStatus::Stopped)
-                    }
-                    shared_types::UserAppNoComputeState::Missing if stage == UserappStage::Prod => {
-                        Some(shared_types::UserAppReadinessStatus::NotDeployed)
-                    }
-                    shared_types::UserAppNoComputeState::Missing
-                    | shared_types::UserAppNoComputeState::Starting
-                    | shared_types::UserAppNoComputeState::Stopping
-                    | shared_types::UserAppNoComputeState::Failed
-                    | shared_types::UserAppNoComputeState::Unknown => None,
-                },
-                error_origin_confirmed: false,
-                proxy_confirmation: None,
-            }),
+            Ok(UserAppReadinessObservation::NoCompute { state }) => {
+                self.revoke_standby_origin(app_id, stage.as_str());
+                Some(UserAppProxyFailureHint {
+                    readiness_status: match state {
+                        shared_types::UserAppNoComputeState::Stopped => {
+                            Some(shared_types::UserAppReadinessStatus::Stopped)
+                        }
+                        shared_types::UserAppNoComputeState::Missing
+                            if stage == UserappStage::Prod =>
+                        {
+                            Some(shared_types::UserAppReadinessStatus::NotDeployed)
+                        }
+                        shared_types::UserAppNoComputeState::Missing
+                        | shared_types::UserAppNoComputeState::Starting
+                        | shared_types::UserAppNoComputeState::Stopping
+                        | shared_types::UserAppNoComputeState::Failed
+                        | shared_types::UserAppNoComputeState::Unknown => None,
+                    },
+                    error_origin_confirmed: false,
+                    proxy_confirmation: None,
+                })
+            }
             Ok(UserAppReadinessObservation::AdminUnreachable { .. })
             | Ok(UserAppReadinessObservation::UnsupportedRuntime { .. })
             | Ok(UserAppReadinessObservation::InstanceChanged)
@@ -198,6 +456,7 @@ impl UserAppProxyFailureAdvisorImpl {
         let reader = state.app_service.readiness_reader()?;
         match reader.observe(app_id, stage, budget).await {
             Ok(UserAppReadinessObservation::Snapshot { snapshot, .. }) => {
+                self.note_standby_origin(app_id, stage.as_str(), &snapshot);
                 Some(UserAppProxyFailureHint {
                     proxy_confirmation: None,
                     readiness_status: Some(snapshot.status),
@@ -210,6 +469,9 @@ impl UserAppProxyFailureAdvisorImpl {
             // Missing 仅 prod 透传：dev scope 无计算资源 ≠ 应用不存在（dev
             // 运行时未启动/被回收是常态），dev 路由的 cause 细分按方案延后。
             Ok(UserAppReadinessObservation::NoCompute { state }) => {
+                // 物理载体消失：撤销该键来源许可（与 observe_current/预热观察
+                // 同口径——Codex 六轮：所有完成路径一致撤销）。
+                self.revoke_standby_origin(app_id, stage.as_str());
                 // 全枚举显式匹配：NoComputeState 新增/改名时编译期即暴露此分支
                 let status = match state {
                     shared_types::UserAppNoComputeState::Stopped => {

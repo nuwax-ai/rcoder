@@ -28,6 +28,172 @@ const TS_PROBE_RETRY_MS: Duration = Duration::from_millis(100);
 const OWNER_EXIT_POLL_INTERVAL_MS: Duration = Duration::from_millis(100);
 /// owner 控制响应总超时（stop 可含完整代理排水预算）。
 const OWNER_RESPONSE_TIMEOUT_SECS: Duration = Duration::from_secs(60);
+
+/// Project a snapshot already obtained from the authenticated live supervisor.
+/// Unlike `control`, this does not replace a failed RPC with offline history.
+pub(crate) fn project_supervisor_status(
+    root: &Path,
+    snapshot: runtime_supervisor::Snapshot,
+) -> Result<String, String> {
+    supervisor_reply(snapshot, root)
+}
+
+/// A real control reply, never an offline projection of historical state.
+/// The legacy variant retains the exact target chosen before any Stop write.
+pub(crate) enum LiveOwner {
+    Supervised(runtime_supervisor::Snapshot),
+    Legacy(LiveLegacyOwner),
+}
+
+pub(crate) struct LiveLegacyOwner {
+    receipt: Receipt,
+    status: Reply,
+    supervisor_locator: Option<Vec<u8>>,
+}
+
+impl LiveLegacyOwner {
+    fn running_status(self) -> Result<String, String> {
+        if self.status.phase != "Running" {
+            return Err(format!(
+                "live legacy owner is {}; startup remains unconfirmed",
+                self.status.phase
+            ));
+        }
+        let address: std::net::SocketAddr = self
+            .status
+            .address
+            .parse()
+            .map_err(|_| "live legacy owner has no valid bound address")?;
+        if address.port() == 0 {
+            return Err("live legacy owner address is unbound".into());
+        }
+        serde_json::to_string(&self.status).map_err(|e| e.to_string())
+    }
+}
+
+impl LiveOwner {
+    pub(crate) fn status(self, root: &Path) -> Result<String, String> {
+        match self {
+            Self::Supervised(snapshot) => project_supervisor_status(root, snapshot),
+            Self::Legacy(owner) => owner.running_status(),
+        }
+    }
+}
+
+pub(crate) fn verify_supervisor_scope(
+    root: &Path,
+    snapshot: &runtime_supervisor::Snapshot,
+) -> Result<(), String> {
+    let expected = runtime_supervisor::Binding {
+        component: "file-server-proxy".into(),
+        resource: root.to_owned(),
+    };
+    if snapshot.binding != expected {
+        return Err("Live native owner belongs to another component or scope".into());
+    }
+    Ok(())
+}
+
+fn supervisor_locator(root: &Path) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::read(root.join("supervisor.json")) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("read native supervisor locator: {error}")),
+    }
+}
+
+/// Prefer the authenticated current supervisor. A stale locator is only a
+/// protocol hint: a typed connection refusal permits a read-only legacy probe
+/// if the same locator and exact legacy identity remain unchanged throughout.
+/// Timeouts, malformed replies and necessary IO failures never select a new
+/// target. Callers supply their existing absolute deadline around this probe.
+pub(crate) async fn observe_live_owner(root: &Path) -> Result<LiveOwner, String> {
+    let locator = supervisor_locator(root)?;
+    if locator.is_some() {
+        match runtime_supervisor::control(
+            root,
+            runtime_supervisor::Request::new(runtime_supervisor::Action::Status),
+        )
+        .await
+        {
+            Ok(snapshot) => {
+                return Ok(LiveOwner::Supervised(snapshot));
+            }
+            Err(error) => {
+                let refused = error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused);
+                if !refused {
+                    return Err(format!("{error:#}"));
+                }
+                if supervisor_locator(root)? != locator {
+                    return Err("native supervisor locator changed during observation".into());
+                }
+            }
+        }
+    }
+    let receipt = read(root)?.ok_or("legacy owner receipt is unavailable")?;
+    let status = owner_request(&receipt, "status").await?;
+    verify_legacy_observation(root, &receipt, &locator)?;
+    Ok(LiveOwner::Legacy(LiveLegacyOwner {
+        receipt,
+        status,
+        supervisor_locator: locator,
+    }))
+}
+
+#[cfg(test)]
+pub(crate) async fn observe_live_legacy_owner(root: &Path) -> Result<String, String> {
+    let scope = root.canonicalize().map_err(|e| e.to_string())?;
+    match observe_live_owner(&scope).await? {
+        owner @ LiveOwner::Legacy(_) => owner.status(&scope),
+        LiveOwner::Supervised(_) => Err("current owner uses the supervisor protocol".into()),
+    }
+}
+
+fn verify_legacy_observation(
+    root: &Path,
+    receipt: &Receipt,
+    locator: &Option<Vec<u8>>,
+) -> Result<(), String> {
+    let current = read(root)?.ok_or("legacy owner receipt disappeared during observation")?;
+    if current.instance_id != receipt.instance_id
+        || current.token != receipt.token
+        || current.control_address != receipt.control_address
+        || current.supervisor_id != receipt.supervisor_id
+    {
+        return Err("legacy owner receipt identity changed during observation".into());
+    }
+    if supervisor_locator(root)? != *locator {
+        return Err("native supervisor locator changed during legacy observation".into());
+    }
+    if !legacy_scope_held(root)? {
+        return Err("legacy owner no longer holds its physical scope".into());
+    }
+    Ok(())
+}
+
+fn scope_lock_held(root: &Path) -> Result<Option<bool>, String> {
+    let lock = match File::options()
+        .read(true)
+        .write(true)
+        .open(root.join("owner.lock"))
+    {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("observe native owner lock: {error}")),
+    };
+    match lock.try_lock() {
+        Err(std::fs::TryLockError::WouldBlock) => Ok(Some(true)),
+        Ok(()) => Ok(Some(false)),
+        Err(error) => Err(format!("observe native owner lock: {error}")),
+    }
+}
+
+fn legacy_scope_held(root: &Path) -> Result<bool, String> {
+    scope_lock_held(root)?.ok_or_else(|| "legacy owner lock is unavailable".into())
+}
+
 async fn frame(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>, String> {
     use tokio::io::AsyncReadExt;
     let mut bytes = Vec::new();
@@ -760,6 +926,7 @@ async fn retire_control(root: &Path, expected: Option<&str>) -> Result<String, S
     .map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
 pub async fn control(
     root: &Path,
     action: &str,
@@ -775,11 +942,47 @@ pub async fn control_with_request(
     request_id: Option<&str>,
     expected_supervisor: Option<&str>,
 ) -> Result<String, String> {
-    if root
-        .join("supervisor.json")
-        .try_exists()
-        .map_err(|e| e.to_string())?
-    {
+    let deadline = tokio::time::Instant::now() + OWNER_RESPONSE_TIMEOUT_SECS;
+    tokio::time::timeout_at(
+        deadline,
+        control_original_target(
+            root,
+            action,
+            expected_instance,
+            request_id,
+            expected_supervisor,
+        ),
+    )
+    .await
+    .map_err(|_| "owner response unknown; receipt preserved".to_owned())?
+}
+
+async fn control_original_target(
+    root: &Path,
+    action: &str,
+    expected_instance: Option<&str>,
+    request_id: Option<&str>,
+    expected_supervisor: Option<&str>,
+) -> Result<String, String> {
+    // Fix the physical scope once; retries must not follow a changed alias.
+    let scope = match root.canonicalize() {
+        Ok(scope) => scope,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => root.to_owned(),
+        Err(error) => return Err(format!("canonicalize native scope: {error}")),
+    };
+    let root = scope.as_path();
+    let locator = supervisor_locator(root)?;
+    if request_id.is_some() || expected_supervisor.is_some() {
+        if locator.is_none() {
+            return Err(if expected_supervisor.is_some() {
+                "captured supervisor cannot be verified by the legacy direct owner protocol"
+            } else {
+                "request identity requires the supervised owner protocol"
+            }
+            .into());
+        }
+        // A captured supervisor/request must never be reinterpreted as v1,
+        // even when that supervisor's endpoint has stopped responding.
         return supervised_control(
             root,
             action,
@@ -789,13 +992,57 @@ pub async fn control_with_request(
         )
         .await;
     }
-    if request_id.is_some() {
-        return Err("request identity requires the supervised owner protocol".into());
+    if matches!(action, "status" | "stop") && scope_lock_held(root)? == Some(true) {
+        // Select protocol and exact target only before any write. A failed Stop
+        // remains attached to this target; it must never probe/replay another.
+        return match observe_live_owner(root).await? {
+            LiveOwner::Supervised(snapshot) => {
+                verify_supervisor_scope(root, &snapshot)?;
+                if expected_instance.is_some_and(|expected| {
+                    if expected.is_empty() {
+                        snapshot.generation.is_some()
+                    } else {
+                        Some(expected) != snapshot.generation.as_deref()
+                    }
+                }) {
+                    return Err(
+                        "owner identity differs from expected launch; refusing control".into(),
+                    );
+                }
+                if action == "status" {
+                    return project_supervisor_status(root, snapshot);
+                }
+                supervised_control(
+                    root,
+                    action,
+                    Some(snapshot.generation.as_deref().unwrap_or("")),
+                    None,
+                    Some(&snapshot.supervisor_id),
+                )
+                .await
+            }
+            LiveOwner::Legacy(owner) => {
+                if expected_instance.is_some_and(|expected| expected != owner.receipt.instance_id) {
+                    return Err(
+                        "owner identity differs from expected launch; refusing control".into(),
+                    );
+                }
+                if action == "status" {
+                    return serde_json::to_string(&owner.status).map_err(|e| e.to_string());
+                }
+                verify_legacy_observation(root, &owner.receipt, &owner.supervisor_locator)?;
+                let reply = owner_request(&owner.receipt, "stop").await?;
+                if reply.phase != "Stopped" {
+                    return Err("owner shutdown unconfirmed".into());
+                }
+                confirm_stopped(root, &owner.receipt.instance_id).await?;
+                serde_json::to_string(&reply).map_err(|e| e.to_string())
+            }
+        };
     }
-    if expected_supervisor.is_some() {
-        return Err(
-            "captured supervisor cannot be verified by the legacy direct owner protocol".into(),
-        );
+    if locator.is_some() {
+        // Preserve the existing physically unowned/offline reconciliation path.
+        return supervised_control(root, action, expected_instance, None, None).await;
     }
     if action == "recover" {
         return recover(root, expected_instance);
@@ -803,7 +1050,6 @@ pub async fn control_with_request(
     if action == "retire" {
         return retire_control(root, expected_instance).await;
     }
-
     if !matches!(action, "status" | "stop") {
         return Err("unsupported owner command".into());
     }
@@ -833,49 +1079,49 @@ pub async fn control_with_request(
         })
         .map_err(|e| e.to_string());
     }
-    let result = async {
-        let mut stream = tokio::net::TcpStream::connect(&receipt.control_address)
-            .await
-            .map_err(|e| format!("owner unavailable; receipt preserved: {e}"))?;
-        send(
-            &mut stream,
-            &Request {
-                version: VERSION,
-                instance_id: receipt.instance_id.clone(),
-                token: receipt.token.clone(),
-                action: action.into(),
-            },
-        )
-        .await?;
-        // stop may include the full existing proxy drain budget.
-        let mut bytes = Vec::new();
-        use tokio::io::AsyncReadExt;
-        BufReader::new((&mut stream).take(MAX_FRAME + 1))
-            .read_until(b'\n', &mut bytes)
-            .await
-            .map_err(|e| e.to_string())?;
-        if bytes.len() as u64 > MAX_FRAME {
-            return Err("oversized owner response".into());
-        }
-        let reply: Reply =
-            serde_json::from_slice(&bytes).map_err(|e| format!("invalid owner response: {e}"))?;
-        if reply.version != VERSION || reply.instance_id != receipt.instance_id {
-            return Err("owner response identity mismatch".into());
-        }
-        if let Some(error) = &reply.error {
-            return Err(error.clone());
-        }
-        if action == "stop" && reply.phase != "Stopped" {
+    let reply = owner_request(&receipt, action).await?;
+    if action == "stop" {
+        if reply.phase != "Stopped" {
             return Err("owner shutdown unconfirmed".into());
         }
-        if action == "stop" {
-            confirm_stopped(root, &receipt.instance_id).await?;
-        }
-        serde_json::to_string(&reply).map_err(|e| e.to_string())
-    };
-    tokio::time::timeout(OWNER_RESPONSE_TIMEOUT_SECS, result)
+        confirm_stopped(root, &receipt.instance_id).await?;
+    }
+    serde_json::to_string(&reply).map_err(|e| e.to_string())
+}
+
+async fn owner_request(receipt: &Receipt, action: &str) -> Result<Reply, String> {
+    let mut stream = tokio::net::TcpStream::connect(&receipt.control_address)
         .await
-        .map_err(|_| "owner response unknown; receipt preserved".to_owned())?
+        .map_err(|e| format!("owner unavailable; receipt preserved: {e}"))?;
+    send(
+        &mut stream,
+        &Request {
+            version: VERSION,
+            instance_id: receipt.instance_id.clone(),
+            token: receipt.token.clone(),
+            action: action.into(),
+        },
+    )
+    .await?;
+    // stop may include the full existing proxy drain budget.
+    let mut bytes = Vec::new();
+    use tokio::io::AsyncReadExt;
+    BufReader::new((&mut stream).take(MAX_FRAME + 1))
+        .read_until(b'\n', &mut bytes)
+        .await
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_FRAME {
+        return Err("oversized owner response".into());
+    }
+    let reply: Reply =
+        serde_json::from_slice(&bytes).map_err(|e| format!("invalid owner response: {e}"))?;
+    if reply.version != VERSION || reply.instance_id != receipt.instance_id {
+        return Err("owner response identity mismatch".into());
+    }
+    if let Some(error) = &reply.error {
+        return Err(error.clone());
+    }
+    Ok(reply)
 }
 
 #[cfg(test)]
@@ -904,7 +1150,7 @@ mod tests {
             version: 1,
             binding: runtime_supervisor::Binding {
                 component: "file-server-proxy".into(),
-                resource: root.path().into(),
+                resource: root.path().canonicalize().unwrap(),
             },
             supervisor_id: successor.clone(),
             generation: Some(generation.clone()),

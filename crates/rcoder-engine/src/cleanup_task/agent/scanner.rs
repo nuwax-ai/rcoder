@@ -147,6 +147,18 @@ impl AgentScanner {
             return false;
         }
 
+        // Observe controller-owned Pod replacement before using a stale IP or
+        // the predecessor's idle evidence. The repair only updates registration.
+        match crate::userapp_builder::refresh_idle_builder_pod(&self.state, agent).await {
+            Ok(true) => return false,
+            Ok(false) => {}
+            Err(error) => {
+                debug!(project_id = agent.project_id(), error = %format!("{error:#}"),
+                    "Builder Pod refresh not confirmed; idle retirement deferred");
+                return false;
+            }
+        }
+
         // 🆕 gRPC 二次确认：查询容器内 agent 的真实状态
         if let Some(container) = agent.container_info() {
             // 从 service_url 提取 gRPC 地址
@@ -161,7 +173,10 @@ impl AgentScanner {
                         agent.project_id(),
                         e
                     );
-                    return true; // 解析失败，允许清理
+                    // An unreadable endpoint is not evidence that execution
+                    // has stopped. A later scan retries after configuration or
+                    // network recovery without retiring this registration.
+                    return false;
                 }
             };
 
@@ -190,6 +205,18 @@ impl AgentScanner {
                     );
                 }
                 Err(e) => {
+                    // A failed RPC never proves absence. Retire only metadata
+                    // after a separate runtime proof under exclusive admission.
+                    match self
+                        .state
+                        .retire_absent_ordinary_registration(agent, self.config.idle_timeout)
+                        .await
+                    {
+                        Ok(true) => return false,
+                        Ok(false) => {}
+                        Err(error) => debug!(project_id, error = %format!("{error:#}"),
+                            "Agent absence not confirmed; registration retained"),
+                    }
                     // gRPC 失败/超时 = agent 状态未知(典型:刚 OOM 由 restartPolicy 重启、
                     // 进程未就绪;或瞬时网络抖动)。**不当 idle 清理**,本轮跳过,等下一轮重试。
                     // 否则会误杀恢复中的 pod。

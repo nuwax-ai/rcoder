@@ -290,109 +290,153 @@ async fn claim_failure(code: Option<u16>, should_release: bool, cached: bool) {
         let server =
             tokio::spawn(async move {
                 let mut lease_object = serde_json::Value::Null;
-                // 前 4 个请求：acquire POST Lease → ensure 探测 GET PVC →
-                // claim 读 GET PVC → claim PATCH PVC；缓存场景继续 GET/PATCH Service。
-                for _ in 0..if cached { 6 } else { 4 } {
+                let mut pvc = serde_json::json!({
+                    "apiVersion":"v1","kind":"PersistentVolumeClaim",
+                    "metadata":{"namespace":"review-test", "name":"rcoder-app-builder-errclaim-workspace",
+                        "labels":{"service_type":"user-app-builder"},
+                        "uid":"pvc-owned","resourceVersion":"42"}
+                });
+                let mut service = serde_json::to_value(
+                    super::super::k8s_service::agent_service_object(
+                        "review-test", "rcoder-app-builder-errclaim-svc", "errclaim",
+                        &ServiceType::UserappBuilder,
+                    ),
+                ).expect("actual Service shape");
+                service["metadata"]["uid"] = "svc-owned".into();
+                service["metadata"]["resourceVersion"] = "42".into();
+                // The cached Pod is only a prior observation. The actual API
+                // retains its Service but no controller or Pod; admission must
+                // fence that real route before the existing port repair fails.
+                service["spec"]["ports"] = serde_json::json!([]);
+                let mut managed_lists = std::collections::BTreeSet::new();
+                let mut fence_writes = 0;
+                let mut lease_acquires = 0;
+                let mut claim_writes = 0;
+                loop {
                     let (mut stream, _) = listener.accept().await.expect("accept");
                     let (head, body) = read_request(&mut stream).await;
-                    if head.starts_with("POST ") && head.contains("/leases") {
+                    let first = head.lines().next().expect("request line");
+                    let path = first.split_whitespace().nth(1).expect("path");
+                    let resource_path = path.split('?').next().expect("resource path");
+                    assert!(resource_path.contains("/namespaces/review-test/"), "{head}");
+                    if head.starts_with("POST ") && resource_path.ends_with("/leases") {
+                        lease_acquires += 1;
+                        assert_eq!(lease_acquires, 1, "creation lease must not be replayed");
                         let mut object: serde_json::Value =
                             serde_json::from_slice(&body).expect("acquire body");
                         object["metadata"]["uid"] = "lease-owner".into();
                         object["metadata"]["resourceVersion"] = "42".into();
                         lease_object = object.clone();
                         write_reply(&mut stream, 200, &object).await;
-                    } else if head.starts_with("GET ") && head.contains("persistentvolumeclaims") {
-                        write_reply(
-                            &mut stream,
-                            200,
-                            &serde_json::json!({
-                                "apiVersion":"v1","kind":"PersistentVolumeClaim",
-                                "metadata":{
-                                    "name":"rcoder-app-builder-errclaim-workspace",
-                                    "labels":{"service_type":"user-app-builder"},
-                                    "uid":"pvc-owned","resourceVersion":"42"}
-                            }),
-                        )
-                        .await;
-                    } else if head.starts_with("PATCH ") && head.contains("persistentvolumeclaims")
+                    } else if head.starts_with("GET ")
+                        && ["/statefulsets", "/pods", "/services"]
+                            .iter().any(|suffix| resource_path.ends_with(suffix))
                     {
+                        let collection = resource_path.rsplit('/').next().expect("collection");
+                        managed_lists.insert(collection.to_owned());
+                        let (api_version, kind) = match collection {
+                            "statefulsets" => ("apps/v1", "StatefulSetList"),
+                            "pods" => ("v1", "PodList"),
+                            "services" => ("v1", "ServiceList"),
+                            other => panic!("unrecognized managed collection: {other}"),
+                        };
+                        let items = if cached && collection == "services" {
+                            vec![service.clone()]
+                        } else {
+                            vec![]
+                        };
+                        write_reply(&mut stream, 200, &serde_json::json!({
+                            "apiVersion":api_version,"kind":kind,
+                            "metadata":{"resourceVersion":"42"},"items":items
+                        })).await;
+                    } else if head.starts_with("GET ")
+                        && (resource_path.ends_with("/statefulsets/rcoder-app-builder-errclaim")
+                            || resource_path.ends_with("/pods/rcoder-app-builder-errclaim")
+                            || resource_path.ends_with("/pods/rcoder-app-builder-errclaim-0")
+                            || resource_path.ends_with("/services/rcoder-app-builder-errclaim-headless")
+                            || (!cached && resource_path.ends_with("/services/rcoder-app-builder-errclaim-svc")))
+                    {
+                        write_reply(&mut stream, 404, &serde_json::json!({
+                            "apiVersion":"v1","kind":"Status","status":"Failure",
+                            "reason":"NotFound","message":"original compute is absent","code":404
+                        })).await;
+                    } else if head.starts_with("GET ")
+                        && resource_path.ends_with("/persistentvolumeclaims")
+                    {
+                        write_reply(&mut stream, 200, &serde_json::json!({
+                            "apiVersion":"v1","kind":"PersistentVolumeClaimList",
+                            "metadata":{"resourceVersion":"42"},"items":[pvc.clone()]
+                        })).await;
+                    } else if head.starts_with("GET ")
+                        && resource_path.ends_with("/persistentvolumeclaims/rcoder-app-builder-errclaim-workspace")
+                    {
+                        write_reply(&mut stream, 200, &pvc).await;
+                    } else if head.starts_with("PATCH ")
+                        && resource_path.ends_with("/persistentvolumeclaims/rcoder-app-builder-errclaim-workspace")
+                    {
+                        claim_writes += 1;
+                        assert_eq!(claim_writes, 1, "unknown claim writes must not be replayed");
+                        let patch: serde_json::Value = serde_json::from_slice(&body).expect("claim patch");
+                        assert_eq!(patch["metadata"]["uid"], pvc["metadata"]["uid"]);
+                        assert_eq!(patch["metadata"]["resourceVersion"], pvc["metadata"]["resourceVersion"]);
                         if cached {
-                            write_reply(
-                                &mut stream,
-                                200,
-                                &serde_json::json!({
-                                    "apiVersion":"v1", "kind":"PersistentVolumeClaim",
-                                    "metadata":{"uid":"pvc-owned", "resourceVersion":"43"}
-                                }),
-                            )
-                            .await;
+                            pvc["metadata"]["resourceVersion"] = "43".into();
+                            pvc["metadata"]["annotations"] = patch["metadata"]["annotations"].clone();
+                            write_reply(&mut stream, 200, &pvc).await;
                             continue;
                         }
-                        // Receiving the write and closing without a response models an
-                        // unknown server outcome, not a rejected request.
-                        let Some(code) = code else {
-                            continue;
-                        };
-                        write_reply(
-                            &mut stream,
-                            code,
-                            &serde_json::json!({
+                        // Closing after the original write is an unknown result,
+                        // not evidence that the server rejected it.
+                        if let Some(code) = code {
+                            write_reply(&mut stream, code, &serde_json::json!({
                                 "apiVersion":"v1","kind":"Status","status":"Failure",
                                 "reason":"Failure","code":code,
                                 "message":"persistentvolumeclaims is forbidden: cannot patch"
-                            }),
-                        )
-                        .await;
-                    } else if cached && head.starts_with("GET ") && head.contains("/services/") {
-                        write_reply(
-                            &mut stream,
-                            200,
-                            // 归属校验（validate_builder_service）四要素齐全：
-                            // identifier/service-type 家族标签 + 全量 selector +
-                            // 非 headless（无 clusterIP）；uid/RV 供端口收敛
-                            // patch 的 precondition——夹具残缺会在到达注入失败
-                            // 前先撞归属 Conflict，遮蔽被测传播语义。
-                            &serde_json::json!({
-                                "apiVersion":"v1", "kind":"Service",
-                                "metadata":{
-                                    "name":"rcoder-app-builder-errclaim-svc",
-                                    "uid":"svc-owned","resourceVersion":"42",
-                                    "labels":{
-                                        "app.kubernetes.io/name":"user-app-builder",
-                                        "app.kubernetes.io/instance":"errclaim",
-                                        "app.kubernetes.io/version":"v1",
-                                        "app.kubernetes.io/component":"agent",
-                                        "app.kubernetes.io/managed-by":"rcoder-runtime",
-                                        "app.kubernetes.io/part-of":"rcoder",
-                                        "rcoder.io/app-id":"errclaim",
-                                        "rcoder.io/identifier":"errclaim",
-                                        "rcoder.io/service-type":"user-app-builder"
-                                    }
-                                },
-                                "spec":{
-                                    "selector":{
-                                        "app.kubernetes.io/name":"user-app-builder",
-                                        "app.kubernetes.io/instance":"errclaim",
-                                        "app.kubernetes.io/managed-by":"rcoder-runtime",
-                                        "rcoder.io/identifier":"errclaim"
-                                    },
-                                    "ports":[]
-                                }
-                            }),
-                        )
-                        .await;
-                    } else if cached && head.starts_with("PATCH ") && head.contains("/services/") {
-                        if let Some(code) = code {
-                            write_reply(&mut stream, code, &serde_json::json!({
-                                "apiVersion":"v1", "kind":"Status", "status":"Failure",
-                                "reason":"Failure", "code":code, "message":"service patch failed"
                             })).await;
                         }
+                        break;
+                    } else if cached && head.starts_with("GET ")
+                        && resource_path.ends_with("/services/rcoder-app-builder-errclaim-svc")
+                    {
+                        write_reply(&mut stream, 200, &service).await;
+                    } else if cached && head.starts_with("PATCH ")
+                        && resource_path.ends_with("/services/rcoder-app-builder-errclaim-svc")
+                    {
+                        let patch: serde_json::Value = serde_json::from_slice(&body).expect("Service patch");
+                        assert_eq!(patch["metadata"]["uid"], service["metadata"]["uid"]);
+                        assert_eq!(patch["metadata"]["resourceVersion"], service["metadata"]["resourceVersion"]);
+                        if patch.get("spec").is_none() {
+                            assert_eq!(patch.as_object().expect("fence object").len(), 1);
+                            assert_eq!(patch["metadata"].as_object().expect("fence metadata").len(), 3);
+                            let annotations = patch["metadata"]["annotations"].as_object().expect("fence annotations");
+                            assert_eq!(annotations.len(), 1);
+                            uuid::Uuid::parse_str(annotations["rcoder.io/agent-admission-fence"].as_str().expect("nonce"))
+                                .expect("actual admission nonce");
+                            fence_writes += 1;
+                            assert_eq!(fence_writes, 1);
+                            service["metadata"]["resourceVersion"] = "43".into();
+                            service["metadata"]["annotations"] = patch["metadata"]["annotations"].clone();
+                            write_reply(&mut stream, 200, &service).await;
+                            continue;
+                        }
+                        assert!(patch["spec"]["ports"].as_array().is_some_and(|ports| !ports.is_empty()));
+                        if let Some(code) = code {
+                            write_reply(&mut stream, code, &serde_json::json!({
+                                "apiVersion":"v1","kind":"Status","status":"Failure",
+                                "reason":"Failure","code":code,"message":"service patch failed"
+                            })).await;
+                        }
+                        break;
                     } else {
                         panic!("unexpected request: {head}");
                     }
                 }
+                assert_eq!(lease_acquires, 1);
+                assert_eq!(claim_writes, 1);
+                assert_eq!(managed_lists, std::collections::BTreeSet::from([
+                    "statefulsets".into(), "pods".into(), "services".into(),
+                ]));
+                assert_eq!(fence_writes, usize::from(cached));
                 // 后续请求：失败路径的锁释放 = GET Lease（重读身份/实时 RV）
                 // → DELETE Lease（本测试的修复断言核心；回归时（Err 不释放）
                 // 此处 accept 超时，saw_release 保持 false）。

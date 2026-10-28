@@ -73,42 +73,45 @@ pub(super) async fn discover_compute_leases(
         let store = store.clone();
         let runtime = runtime.clone();
         tasks.push(format!("compute:{}", record.operation_id), async move {
-            let context = record.execution_context().map_err(anyhow::Error::msg)?;
-            if let Some(receipt) = &record.lease {
-                runtime
-                    .release_app_operation_receipt(&context, receipt)
-                    .await?;
-                store
-                    .forget_compute_lease(
-                        &shared_types::ComputeExecutorIdentity {
-                            app_id: record.app_id.clone(),
-                            lifecycle_id: record.lifecycle_id.clone(),
-                            scope: record.scope,
-                            operation_id: record.operation_id.clone(),
-                            generation: record.generation,
-                            executor_id: context.executor_id.clone(),
-                        },
-                        receipt,
-                    )
-                    .await?;
-            }
-            if let Some(template) = template {
-                runtime.cleanup_builder_restart_archive(&template).await?;
-                let current = store
-                    .get_compute_control(&record.app_id, &record.operation_id)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("Archive cleanup operation disappeared"))?;
-                anyhow::ensure!(
-                    current.checkpoint.get("builder_restart_template")
-                        == record.checkpoint.get("builder_restart_template"),
-                    "Archive cleanup checkpoint changed"
-                );
-                store.mark_restart_archive_cleaned(&current).await?;
-            }
-            // These per-operation receipts no longer grant execution authority.
-            // A malformed archive above was not edited, deleted or marked clean.
-            runtime.cleanup_compute_receipt_files(&context).await?;
-            Ok(())
+            with_stall_budget("Clean terminal compute receipts", async move {
+                let context = record.execution_context().map_err(anyhow::Error::msg)?;
+                if let Some(receipt) = &record.lease {
+                    runtime
+                        .release_app_operation_receipt(&context, receipt)
+                        .await?;
+                    store
+                        .forget_compute_lease(
+                            &shared_types::ComputeExecutorIdentity {
+                                app_id: record.app_id.clone(),
+                                lifecycle_id: record.lifecycle_id.clone(),
+                                scope: record.scope,
+                                operation_id: record.operation_id.clone(),
+                                generation: record.generation,
+                                executor_id: context.executor_id.clone(),
+                            },
+                            receipt,
+                        )
+                        .await?;
+                }
+                if let Some(template) = template {
+                    runtime.cleanup_builder_restart_archive(&template).await?;
+                    let current = store
+                        .get_compute_control(&record.app_id, &record.operation_id)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("Archive cleanup operation disappeared"))?;
+                    anyhow::ensure!(
+                        current.checkpoint.get("builder_restart_template")
+                            == record.checkpoint.get("builder_restart_template"),
+                        "Archive cleanup checkpoint changed"
+                    );
+                    store.mark_restart_archive_cleaned(&current).await?;
+                }
+                // These per-operation receipts no longer grant execution authority.
+                // A malformed archive above was not edited, deleted or marked clean.
+                runtime.cleanup_compute_receipt_files(&context).await?;
+                Ok(())
+            })
+            .await?
         });
     }
     Ok(())
@@ -125,14 +128,22 @@ pub(super) async fn sweep_builder_creation_receipts(
     if tasks.is_full() {
         return Ok(());
     }
-    let contexts = runtime.list_builder_creation_receipt_contexts().await?;
+    let contexts = tokio::time::timeout(
+        SCAN_READ_TIMEOUT,
+        runtime.list_builder_creation_receipt_contexts(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Builder creation receipt inventory timed out"))??;
     for context in contexts {
         if tasks.is_full() {
             break;
         }
-        let Some(record) = store
-            .get_operation(&context.app_id, &context.operation_id)
-            .await?
+        let Some(record) = tokio::time::timeout(
+            SCAN_READ_TIMEOUT,
+            store.get_operation(&context.app_id, &context.operation_id),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Builder creation receipt operation read timed out"))??
         else {
             // No record to confirm a terminal outcome — retain the receipts.
             continue;
@@ -144,8 +155,11 @@ pub(super) async fn sweep_builder_creation_receipts(
         tasks.push(
             format!("creation-receipts:{}", context.operation_id),
             async move {
-                runtime.cleanup_builder_creation_receipts(&context).await?;
-                anyhow::Ok(())
+                with_stall_budget("Clean terminal builder creation receipts", async move {
+                    runtime.cleanup_builder_creation_receipts(&context).await?;
+                    anyhow::Ok(())
+                })
+                .await?
             },
         );
     }
@@ -234,6 +248,82 @@ pub(super) async fn discover_pending(
                         }
                         Err(error) => Err(error),
                     }
+                },
+            );
+            continue;
+        }
+        // Total-deadline settlement is dispatched as a CONCURRENT observer,
+        // never an exclusive scheduler: a record whose lease is still renewed
+        // (a takeover continuation mid-flight, or an executor that legitimately
+        // outran the budget) keeps receiving its normal recovery branches below,
+        // while the settlement itself defers until the lease provably stops
+        // renewing. Any CAS race between the two resolves by revision — the
+        // settlement maps its loss to a benign deferral. The dispatch reserves
+        // one further slot: with a single slot left the cheap, retrying
+        // observer steps aside so a saturated scan never starves the record's
+        // real continuation branch.
+        if matches!(
+            record.state,
+            shared_types::ComputeControlState::Running
+                | shared_types::ComputeControlState::RecoveryRequired
+        ) && tasks.remaining_capacity() >= 2
+            && crate::userapp_builder::compute_control::compute_deadline_expired(state, &record)
+                .await
+        {
+            let state = state.clone();
+            let settled = record.clone();
+            tasks.push(
+                format!("compute-deadline:{}", record.operation_id),
+                async move {
+                    tokio::time::timeout(
+                        Duration::from_secs(30),
+                        crate::userapp_builder::compute_control::settle_expired_compute_control(
+                            &state, &settled,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Compute deadline settlement timed out"))??;
+                    Ok(())
+                },
+            );
+        }
+        if crate::userapp_builder::compute_control::can_recover_original_docker_stop(&record) {
+            let flight = state.userapp_op_flight.guard()?;
+            let state = state.clone();
+            tasks.push(
+                format!("compute-original-docker-stop:{}", record.operation_id),
+                async move {
+                    let _flight = flight;
+                    // Bound scheduling exactly like the existing compute-resume
+                    // branch. Its Docker/readiness deadlines remain unchanged;
+                    // a new 60s whole-worker timeout would cancel legitimate
+                    // restore/Start before those original budgets expire.
+                    crate::userapp_builder::compute_control::recover_original_docker_stop(
+                        &state, &record,
+                    )
+                    .await
+                },
+            );
+            continue;
+        }
+        if crate::userapp_builder::compute_control::can_confirm_kubernetes_restart_stop(&record) {
+            let state = state.clone();
+            tasks.push(
+                format!("compute-restart-stop-receipt:{}", record.operation_id),
+                async move {
+                    // Observation plus an exact stage CAS; no physical mutation
+                    // is re-issued, so no operation flight is held.
+                    tokio::time::timeout(
+                        Duration::from_secs(30),
+                        crate::userapp_builder::compute_control::confirm_kubernetes_restart_stop(
+                            &state, &record,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("Kubernetes restart stop confirmation timed out")
+                    })??;
+                    Ok(())
                 },
             );
             continue;

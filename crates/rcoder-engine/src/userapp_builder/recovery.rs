@@ -1,6 +1,12 @@
 //! Restart discovery. Automatic replay is limited to unclaimed, matching inputs.
 mod compute;
 mod discovery;
+#[cfg(test)]
+mod hot_tests;
+#[cfg(all(test, feature = "userapp-turso"))]
+mod interrupted_update_tests;
+#[cfg(test)]
+mod predecessor_timeout_tests;
 use crate::app_state::AppState;
 use futures::{FutureExt as _, StreamExt as _, future::BoxFuture, stream::FuturesUnordered};
 use shared_types::{AppWakeControl as _, UserAppOperationKind, UserAppOperationState};
@@ -26,6 +32,17 @@ async fn with_stall_budget<F: Future>(label: &str, fut: F) -> anyhow::Result<F::
         .map_err(|_| anyhow::anyhow!("{label} timed out (stalled runtime call)"))
 }
 
+async fn sweep_legacy_locks(
+    runtime: &dyn container_runtime_api::UserAppDeploymentRuntime,
+) -> anyhow::Result<Vec<String>> {
+    with_stall_budget(
+        "Sweep legacy operation locks",
+        runtime.sweep_legacy_operation_locks(Duration::from_secs(24 * 3600)),
+    )
+    .await?
+    .map_err(anyhow::Error::from)
+}
+
 type RecoveryResult = (String, anyhow::Result<()>);
 
 /// Bounded process-local scheduling only. Durable claims and resource leases
@@ -36,9 +53,29 @@ struct RecoveryTasks {
     pending: FuturesUnordered<BoxFuture<'static, RecoveryResult>>,
 }
 
+#[cfg(test)]
+pub(super) async fn run_compute_scan_for_test(
+    state: &std::sync::Arc<AppState>,
+) -> anyhow::Result<()> {
+    let mut tasks = RecoveryTasks::default();
+    compute::discover_pending(state, &mut tasks, &mut None).await?;
+    while let Some((_, result)) = tasks.next().await {
+        result?;
+    }
+    Ok(())
+}
+
 impl RecoveryTasks {
     fn is_full(&self) -> bool {
         self.active.len() >= MAX_RECOVERIES
+    }
+
+    /// Free slots right now. The deadline settlement dispatch reserves at
+    /// least one further slot for the record's normal recovery branch: with
+    /// only one slot left, the (cheap, retrying) settlement observer steps
+    /// aside so a saturated scan never starves real continuation work.
+    fn remaining_capacity(&self) -> usize {
+        MAX_RECOVERIES.saturating_sub(self.active.len())
     }
 
     /// 槽满 = 扫描器瘫痪面（本次事故 9 小时不可见的直接成因：挂死任务
@@ -138,11 +175,7 @@ pub(crate) fn start_recovery(
                     // 24h 龄期（覆盖滚动升级窗口）+ uid precondition 删除。
                     // 只释放陈旧互斥，不授权任何变更。
                     if sweep_ticks.is_multiple_of(720) {
-                        match state
-                            .runtime
-                            .sweep_legacy_operation_locks(Duration::from_secs(24 * 3600))
-                            .await
-                        {
+                        match sweep_legacy_locks(state.runtime.as_ref()).await {
                             Ok(names) if !names.is_empty() => {
                                 tracing::info!(count = names.len(), ?names,
                                     "Legacy ConfigMap operation locks swept");
@@ -229,11 +262,14 @@ async fn discover_terminal_leases(
         let store = store.clone();
         let runtime = runtime.clone();
         tasks.push(binding.context.operation_id.clone(), async move {
-            runtime
-                .release_app_operation_receipt(&binding.context, &binding.receipt)
-                .await?;
-            store.forget_operation_lease(&binding).await?;
-            Ok(())
+            with_stall_budget("Release terminal operation lease", async move {
+                runtime
+                    .release_app_operation_receipt(&binding.context, &binding.receipt)
+                    .await?;
+                store.forget_operation_lease(&binding).await?;
+                Ok(())
+            })
+            .await?
         });
     }
     if consumed_all {
@@ -288,8 +324,72 @@ async fn discover(
                 return Ok(());
             }
             *cursor = Some(operation.operation_id.clone());
+            if shared_types::userapp_operation_has_deployment_update_receipt(&operation)
+                && tasks.remaining_capacity() >= 2
+            {
+                let state = state.clone();
+                let operation = operation.clone();
+                tasks.push(
+                    format!("deployment-update-expire:{}", operation.operation_id),
+                    async move {
+                        with_stall_budget("expire returned deployment update", async {
+                            // Normal rollout/preflight observations must not contend
+                            // for a write transaction before their original budget ends.
+                            let deadline = state
+                                .userapp_store
+                                .operation_deadline(&operation.app_id, &operation.operation_id)
+                                .await?;
+                            if deadline.is_none_or(|deadline| {
+                                deadline > chrono::Utc::now().timestamp_millis()
+                            }) {
+                                return Ok(());
+                            }
+                            match state
+                                .userapp_store
+                                .expire_deployment_update(&operation)
+                                .await
+                            {
+                                Ok(_) | Err(shared_types::UserAppStoreError::VersionConflict) => {
+                                    Ok(())
+                                }
+                                Err(error) => Err(error.into()),
+                            }
+                        })
+                        .await?
+                    },
+                );
+            }
             if operation.state == UserAppOperationState::RecoveryRequired
-                && operation.step == "hot_execution"
+                && operation.kind == UserAppOperationKind::StartDeployment
+                && operation.step == "creating_runtime"
+            {
+                let state = state.clone();
+                tasks.push(operation.operation_id.clone(), async move {
+                    if !state
+                        .app_service
+                        .reconcile_created_runtime_configuration(&operation)
+                        .await?
+                    {
+                        with_stall_budget(
+                            "observe interrupted production creation",
+                            super::creation::reconcile_fenced_ensure(&state, &operation),
+                        )
+                        .await??;
+                    }
+                    Ok(())
+                });
+                continue;
+            }
+            let hot_recovery_state = match operation.state {
+                UserAppOperationState::Running | UserAppOperationState::RecoveryRequired => true,
+                UserAppOperationState::Pending
+                | UserAppOperationState::WaitingRetry
+                | UserAppOperationState::Succeeded
+                | UserAppOperationState::Failed => false,
+            };
+            if hot_recovery_state
+                && operation.kind.supports_hot_deployment()
+                && matches!(operation.step.as_str(), "hot_execution" | "hot_converging")
                 && operation
                     .checkpoint
                     .pointer("/hot_execution/receipt_protocol")
@@ -298,7 +398,11 @@ async fn discover(
             {
                 let state = state.clone();
                 tasks.push(operation.operation_id.clone(), async move {
-                    state.app_service.resume_pending_control(&operation).await?;
+                    with_stall_budget(
+                        "observe interrupted hot deployment",
+                        state.app_service.resume_pending_control(&operation),
+                    )
+                    .await??;
                     Ok(())
                 });
                 continue;
@@ -358,12 +462,19 @@ async fn discover(
             if shared_types::userapp_builder_creation_needs_runtime_receipt(&operation) {
                 let state = state.clone();
                 tasks.push(operation.operation_id.clone(), async move {
-                    // receipt 恢复不可行（Ok(false)：runtime 无恢复证据）时
-                    // 穿落到证据化兜底，而不是每扫描周期空转重试——否则
-                    // checkpoint 为空的 EnsureBuilder 围栏被本分支永久截走，
-                    // 兜底 settler 永远轮不到（测试环境 20 个站立围栏的
-                    // 直接成因之一）。
+                    // receipt 恢复不可行（Ok(false)：runtime 无恢复证据）时，
+                    // 先走陈旧 Running 的证据化对账（生产 app 50/128 形态：
+                    // 无回执、无 deadline、无 binding，执行者死亡后 Running
+                    // 无人转换），再穿落到围栏兜底——RecoveryRequired 记录
+                    // 的原语义与状态门保持不变。否则 checkpoint 为空的
+                    // EnsureBuilder 围栏被本分支永久截走，兜底 settler 永远
+                    // 轮不到（测试环境 20 个站立围栏的直接成因之一）。
                     if !super::creation::reconcile_runtime_receipt(&state, &operation).await? {
+                        with_stall_budget(
+                            "reconcile_stale_running_creation",
+                            super::creation::reconcile_stale_running_creation(&state, &operation),
+                        )
+                        .await??;
                         with_stall_budget(
                             "reconcile_fenced_ensure",
                             super::creation::reconcile_fenced_ensure(&state, &operation),
@@ -596,6 +707,7 @@ mod terminal_tests;
 #[cfg(test)]
 mod discover_settle_tests {
     use super::*;
+    use crate::userapp_builder::creation::fence_settler_tests::stale_running_state;
     #[cfg(feature = "rcoder-pg")]
     use crate::userapp_builder::creation::fence_settler_tests::{
         FenceRuntime, fence_state, fence_state_pg, settled,
@@ -614,17 +726,59 @@ mod discover_settle_tests {
             .ok()
             .filter(|value| !value.is_empty())
         else {
+            assert_ne!(
+                std::env::var("RCODER_PG_TEST_STRICT").as_deref(),
+                Ok("1"),
+                "Strict PG discovery tests require an explicit disposable DSN"
+            );
             eprintln!("[skip] RCODER_PG_TEST_DSN not set");
             return;
         };
+        // discover intentionally scans every unfinished operation. A private
+        // schema isolates this fixture's controlled runtime without filtering
+        // the real scanner or deleting unrelated historical test records.
+        let schema = format!("fence_discovery_{}", uuid::Uuid::new_v4().simple());
+        eprintln!("Real PG discovery fixture schema: {schema}");
+        let mut admin = toasty::Db::builder().connect(&dsn).await.expect("PG admin");
+        toasty::sql::statement(format!("CREATE SCHEMA {schema}"))
+            .exec(&mut admin)
+            .await
+            .expect("create owned discovery schema");
+        let mut scoped = url::Url::parse(&dsn).expect("PG DSN URL");
+        let parameters = scoped
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+        let options = parameters
+            .iter()
+            .filter(|(key, _)| key == "options")
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        {
+            let mut query = scoped.query_pairs_mut();
+            query.clear();
+            query.extend_pairs(
+                parameters
+                    .iter()
+                    .filter(|(key, _)| key != "options")
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            );
+            query.append_pair("options", &format!("{options} -csearch_path={schema}"));
+        }
+        // PostgreSQL URI options require percent-encoded spaces. Restrict this
+        // conversion to the generated query; never alter userinfo/password '+'.
+        let postgres_query = scoped.query().map(|query| query.replace('+', "%20"));
+        scoped.set_query(postgres_query.as_deref());
+        let scoped_dsn: String = scoped.into();
         let operation_id = format!("op-pg-{}", uuid::Uuid::new_v4().simple());
         let runtime = FenceRuntime::scenario(None, None);
         *runtime.builder_workload.lock().expect("lock") = Some("rcoder-app-builder-fenced".into());
-        let state = fence_state_pg(
+        let (state, store) = fence_state_pg(
             runtime,
             UserAppOperationKind::EnsureBuilder,
             &operation_id,
-            &dsn,
+            &scoped_dsn,
         )
         .await;
         let mut tasks = RecoveryTasks::default();
@@ -644,6 +798,15 @@ mod discover_settle_tests {
             record.step,
             record.error_message
         );
+        store
+            .shutdown()
+            .await
+            .expect("stop discovery fixture writer");
+        drop(state);
+        toasty::sql::statement(format!("DROP SCHEMA {schema} CASCADE"))
+            .exec(&mut admin)
+            .await
+            .expect("drop owned discovery schema");
     }
 
     #[tokio::test]
@@ -671,6 +834,147 @@ mod discover_settle_tests {
             record.state,
             record.step,
             record.error_message
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_running_cleanup_failure_is_retried_by_terminal_scanner() {
+        let runtime = FenceRuntime::scenario(None, None);
+        *runtime.builder_workload.lock().unwrap() = Some("builder".into());
+        *runtime.unbound_creation_authority.lock().unwrap() = Some(
+            container_runtime_api::UnboundBuilderCreationAuthority::ExpiredOriginal {
+                holder: "executor-fenced:op-stale-cleanup".into(),
+                receipt: shared_types::UserAppOperationLeaseReceipt::Docker {
+                    service_type: shared_types::ServiceType::UserappBuilder,
+                    device: 1,
+                    inode: 1,
+                    token: "executor-fenced".into(),
+                },
+            },
+        );
+        let (state, _dir) = stale_running_state(runtime.clone(), "op-stale-cleanup", 1).await;
+        runtime
+            .compute_release_succeeds
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let before = settled(&state, "op-stale-cleanup").await;
+        assert!(
+            super::super::creation::reconcile_stale_running_creation(&state, &before)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            settled(&state, "op-stale-cleanup").await.state,
+            UserAppOperationState::Failed
+        );
+        assert!(
+            state
+                .userapp_store
+                .get_operation_lease("fenced", "op-stale-cleanup")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        runtime
+            .compute_release_succeeds
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut tasks = RecoveryTasks::default();
+        discover_terminal_leases(
+            state.userapp_store.clone(),
+            state.runtime.clone(),
+            &mut tasks,
+            &mut None,
+        )
+        .await
+        .unwrap();
+        while let Some((_, result)) = tasks.next().await {
+            result.unwrap();
+        }
+        assert!(
+            state
+                .userapp_store
+                .get_operation_lease("fenced", "op-stale-cleanup")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            settled(&state, "op-stale-cleanup").await.state,
+            UserAppOperationState::Failed
+        );
+    }
+
+    /// 陈旧 Running/claimed 反例（生产 app 50/128 形态：无回执、无 deadline、
+    /// 无租约绑定，执行者死亡且未写任何中断记录）。修复前：回执恢复返回
+    /// false 后围栏 settler 因状态门跳过 Running，记录永久停留、dev slot
+    /// 永久占用。修复后：discover 必须把该记录证据化收束为 Failed 并释放
+    /// slot，随后同 scope 的新请求可正常受理。
+    #[tokio::test]
+    async fn discover_settles_stale_running_builder_without_receipt() {
+        let operation_id = "op-stale-running";
+        let runtime = FenceRuntime::scenario(None, None);
+        *runtime.builder_workload.lock().expect("lock") = Some("rcoder-app-builder-fenced".into());
+        *runtime.unbound_creation_authority.lock().expect("lock") = Some(
+            container_runtime_api::UnboundBuilderCreationAuthority::ExpiredOriginal {
+                holder: "executor-fenced:op-stale-running".into(),
+                receipt: shared_types::UserAppOperationLeaseReceipt::Docker {
+                    service_type: shared_types::ServiceType::UserappBuilder,
+                    device: 1,
+                    inode: 1,
+                    token: "executor-fenced".into(),
+                },
+            },
+        );
+        let (state, _dir) = stale_running_state(runtime, operation_id, 1).await;
+        // 确认年龄门：claimed revision 的更新时间需 ≥ ensure_timeout（1s）。
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let mut tasks = RecoveryTasks::default();
+        let mut cursor = None;
+        discover(&state, &mut tasks, &mut cursor)
+            .await
+            .expect("discover");
+        while let Some((id, result)) = tasks.next().await {
+            result.unwrap_or_else(|error| panic!("recovery task {id} failed: {error}"));
+        }
+        let record = settled(&state, operation_id).await;
+        assert_eq!(
+            record.state,
+            UserAppOperationState::Failed,
+            "stale Running must settle via evidence; state={:?} step={} err={:?}",
+            record.state,
+            record.step,
+            record.error_message
+        );
+        assert!(
+            record
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("stale running")),
+            "release note must classify the settlement: {:?}",
+            record.error_message
+        );
+        // 端到端：dev slot 已释放——同 app 同 scope 新受理必须 Accepted。
+        let admitted = state
+            .userapp_store
+            .admit_with_input(
+                &shared_types::UserAppAdmission {
+                    app_id: "fenced".into(),
+                    lifecycle_id: Some(record.lifecycle_id.clone()),
+                    operation_id: format!("{operation_id}-retry"),
+                    request_id: Some(format!("req-{operation_id}-retry")),
+                    request_fingerprint: "cd".repeat(32),
+                    kind: UserAppOperationKind::EnsureBuilder,
+                    command: None,
+                    metadata: None,
+                    runtime_policy_on_success: None,
+                },
+                None,
+            )
+            .await
+            .expect("admit after settle");
+        assert!(
+            matches!(admitted, shared_types::UserAppAdmissionOutcome::Accepted(_)),
+            "slot must be freed after settlement: {admitted:?}"
         );
     }
 }

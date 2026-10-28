@@ -48,6 +48,10 @@ pub async fn stop_agent(
             ));
         };
         let session_id = target.session_id.to_string();
+        let routable = AGENT_REGISTRY
+            .get_project_by_session(&session_id)
+            .as_deref()
+            == Some(project_id.as_str());
         if req
             .expected_session_id
             .as_deref()
@@ -63,7 +67,9 @@ pub async fn stop_agent(
         }
         // 不在身份确认之前清 permission，也不按 project 清除另一代实例的状态。
         let cleanup = CapturedSessionCleanup::capture(&session_id, target.request_id.clone());
-        PERMISSION_MANAGER.cancel_session_permissions(&session_id);
+        if routable {
+            PERMISSION_MANAGER.cancel_session_permissions(&session_id);
+        }
         let expected_uuid = app_state
             .project_uuid_map
             .view(&project_id, |_, uuid| uuid.clone());
@@ -77,7 +83,11 @@ pub async fn stop_agent(
                 false
             }
         });
-        if !req.force && target.status == AgentStatus::Active && !target.cancel_tx.is_closed() {
+        if routable
+            && !req.force
+            && target.status == AgentStatus::Active
+            && !target.cancel_tx.is_closed()
+        {
             let seconds = app_state
                 .config
                 .grpc_timeouts
@@ -120,10 +130,12 @@ pub async fn stop_agent(
                 "Live agent execution has no lifecycle handle",
             ));
         }
-        let terminal = cleanup.send_prompt_end(StopReason::Cancelled, None).await;
-        cleanup.close(&terminal);
-        cleanup.remove();
-        PERMISSION_MANAGER.clear_session_state(&session_id);
+        if routable {
+            let terminal = cleanup.send_prompt_end(StopReason::Cancelled, None).await;
+            cleanup.close(&terminal);
+            cleanup.remove();
+            PERMISSION_MANAGER.clear_session_state(&session_id);
+        }
         let removed = AGENT_REGISTRY.remove_by_project_if_session_and_channel_matches(
             &project_id,
             &session_id,

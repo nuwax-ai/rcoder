@@ -17,6 +17,9 @@ path = "src/lib.rs"
 [features]
 default = ["userapp-turso"]
 
+# Explicit real-tonic protocol fixtures; absent from production image features.
+protocol-fixture = []
+
 # Hotpath 本地性能剖析（hotpath-rs；仅本地开发，不进 default）。
 # feature 关闭时 hotpath 宏全部 no-op、零依赖编译，代码里宏裸用不配 cfg。
 # axum-0-8 供 userapp_forward 路由装配处 hotpath::axum!（关闭时原样返回 router）；

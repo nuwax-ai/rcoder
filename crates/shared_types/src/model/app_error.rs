@@ -238,6 +238,7 @@ pub fn status_from_code(code: &str) -> axum::http::StatusCode {
         ec::ERR_AGENT_MGMT_BUILTIN_PROTECTED => axum::http::StatusCode::FORBIDDEN,
         ec::ERR_AGENT_MGMT_ALREADY_INSTALLED
         | ec::ERR_CONFLICT
+        | ec::ERR_COMPUTER_OWNER_CONFLICT
         | ec::ERR_OPERATION_IN_PROGRESS
         | ec::ERR_APP_ALREADY_EXISTS
         | ec::ERR_INVALID_STATE => axum::http::StatusCode::CONFLICT,

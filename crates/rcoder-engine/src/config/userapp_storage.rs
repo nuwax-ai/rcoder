@@ -36,6 +36,8 @@ impl std::str::FromStr for UserAppStorageBackend {
 #[serde(default, deny_unknown_fields)]
 pub struct UserAppStorageConfig {
     pub backend: UserAppStorageBackend,
+    /// Recover missing K8s control roots and workloads from retained managed PVCs.
+    pub default_recovery_enabled: bool,
     pub turso_path: PathBuf,
     /// None reuses PostgreSQL connection settings, never the Agent backend mode.
     #[serde(skip_serializing)]
@@ -55,6 +57,7 @@ impl Default for UserAppStorageConfig {
     fn default() -> Self {
         Self {
             backend: UserAppStorageBackend::Auto,
+            default_recovery_enabled: true,
             turso_path: PathBuf::from("data/rcoder/userapp.turso.db"),
             postgres: None,
             ensure_timeout_seconds: 90,
@@ -87,6 +90,11 @@ impl UserAppStorageConfig {
         &mut self,
         lookup: impl Fn(&str) -> Option<String>,
     ) -> anyhow::Result<()> {
+        if let Some(value) = lookup("RCODER_USERAPP_DEFAULT_RECOVERY_ENABLED") {
+            self.default_recovery_enabled = value.parse().context(
+                "invalid RCODER_USERAPP_DEFAULT_RECOVERY_ENABLED; expected true or false",
+            )?;
+        }
         if let Some(value) = lookup("RCODER_USERAPP_STORAGE_BACKEND") {
             self.backend = value
                 .parse()
@@ -208,6 +216,34 @@ impl UserAppStorageConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_default_recovery_is_explicit_and_environment_is_validated() {
+        let mut config = UserAppStorageConfig::default();
+        assert!(config.default_recovery_enabled);
+        config
+            .apply_overrides(|key| {
+                (key == "RCODER_USERAPP_DEFAULT_RECOVERY_ENABLED").then(|| "false".into())
+            })
+            .unwrap();
+        assert!(!config.default_recovery_enabled);
+        config
+            .apply_overrides(|key| {
+                (key == "RCODER_USERAPP_DEFAULT_RECOVERY_ENABLED").then(|| "true".into())
+            })
+            .unwrap();
+        assert!(config.default_recovery_enabled);
+        assert!(
+            config
+                .apply_overrides(
+                    |key| (key == "RCODER_USERAPP_DEFAULT_RECOVERY_ENABLED").then(|| "yes".into())
+                )
+                .is_err()
+        );
+        let disabled: UserAppStorageConfig =
+            serde_yaml::from_str("default_recovery_enabled: false").unwrap();
+        assert!(!disabled.default_recovery_enabled);
+    }
 
     #[cfg(feature = "userapp-turso")]
     #[tokio::test]

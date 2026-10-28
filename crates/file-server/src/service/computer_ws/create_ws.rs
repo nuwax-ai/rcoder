@@ -175,7 +175,8 @@ async fn create_workspace_locked(
 
     // 无 file 且无 skillUrls → syncAgents + 早退 (对齐 nuwax)
     if !had_file && !has_urls {
-        crate::service::skills::sync_agents(workspace).await?;
+        // 已持 workspace_lock (create_workspace 顶层 acquire)，走持锁执行体
+        crate::service::skills::sync_agents_locked(workspace).await?;
         tracing::info!(
             op = "create_workspace",
             elapsed_ms = start.elapsed().as_millis(),
@@ -291,7 +292,8 @@ async fn create_workspace_locked(
     }
 
     // syncAgents: .agents → SYNC_TARGET_DIRS 各家 ACP 目录 (grok/pi 临时屏蔽)
-    crate::service::skills::sync_agents(workspace).await?;
+    // 已持 workspace_lock (create_workspace 顶层 acquire)，走持锁执行体
+    crate::service::skills::sync_agents_locked(workspace).await?;
 
     let mut message = if updated_dirs.is_empty() {
         "Workspace created successfully (skills and agents directories not found)".to_string()

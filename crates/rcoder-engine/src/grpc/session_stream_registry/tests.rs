@@ -82,6 +82,20 @@ async fn first_client_claim_semantics() {
     );
 }
 
+#[tokio::test]
+async fn captured_stop_claim_only_releases_the_same_claim_incarnation() {
+    let reg = registry();
+    assert!(reg.claim_first_client("same-sid"));
+    let stopped = reg.capture_first_client_claim("same-sid").unwrap();
+    assert!(!reg.claim_first_client("same-sid"));
+    assert!(!reg.release_first_client_claim_if_current("same-sid", &stopped));
+    assert!(!reg.claim_first_client("same-sid"));
+    let current = reg.capture_first_client_claim("same-sid").unwrap();
+    assert!(reg.release_first_client_claim_if_current("same-sid", &current));
+    assert!(!reg.release_first_client_claim_if_current("same-sid", &current));
+    assert!(reg.claim_first_client("same-sid"));
+}
+
 /// 跨 session 隔离：s1 的资格状态不影响 s2
 #[tokio::test]
 async fn claim_is_per_session() {
@@ -160,8 +174,13 @@ async fn terminal_error_event_payload_is_valid_json() {
         "original connect failure",
         "grpc_connect",
         None,
+        FailureWindow {
+            started_at: None,
+            failed_at: chrono::Utc::now(),
+        },
     )
-    .await;
+    .await
+    .unwrap();
     assert_eq!(ev.message_type, "SessionPromptEnd");
     assert_eq!(ev.sub_type, "error");
     assert!(serde_json::from_str::<serde_json::Value>(&ev.payload).is_ok());
@@ -169,20 +188,25 @@ async fn terminal_error_event_payload_is_valid_json() {
 
 #[test]
 fn stream_error_payload_is_valid_json() {
-    let ev = make_stream_error_event(Code::Unavailable, "boom");
+    let ev = make_stream_error_event(Code::Unavailable, "boom").unwrap();
     assert_eq!(ev.sub_type, "error");
     assert!(serde_json::from_str::<serde_json::Value>(&ev.payload).is_ok());
 }
 
 #[test]
 fn sse_error_retains_original_transport_cause() {
-    let event = make_stream_error_event(Code::Unavailable, "subscription_original_failure");
+    let event =
+        make_stream_error_event(Code::Unavailable, "subscription_original_failure").unwrap();
     let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
     assert!(
-        payload["message"]
+        payload["error_detail"]["detail"]
             .as_str()
             .unwrap()
             .contains("subscription_original_failure")
+    );
+    assert_eq!(
+        payload["message"],
+        shared_types::get_error_message(shared_types::ERR_AGENT_CONTAINER_UNAVAILABLE, "en-US")
     );
     assert_eq!(payload["error_detail"]["retryable"], false);
 }
@@ -190,7 +214,7 @@ fn sse_error_retains_original_transport_cause() {
 /// cursor-reset 哨兵：非终态（不关流），seq=0（不污染游标）
 #[test]
 fn cursor_reset_event_is_non_terminal_zero_seq() {
-    let ev = make_cursor_reset_event();
+    let ev = make_cursor_reset_event().unwrap();
     assert_eq!(ev.message_type, "StreamReset");
     assert_eq!(ev.seq, 0);
     assert!(!is_stream_closing(&ev.message_type, &ev.sub_type));
@@ -210,4 +234,165 @@ fn terminal_classification_semantics() {
         "AgentSessionUpdate",
         "agent_message_chunk"
     ));
+}
+
+/// R06 反例: 真实 notifier 会产生 max_tokens/max_turn_requests/refusal 终态,
+/// 终端判定不得只认 end_turn/error——否则真实 Prompt 已结束、状态 Idle,
+/// SSE 流仍保持到 NoActiveTask 兜底, 且末事件被替换成合成 end_turn。
+/// 未知停止原因("unknown")不得伪造成终态。
+#[test]
+fn quota_and_refusal_stop_reasons_are_terminal() {
+    for sub in ["max_tokens", "max_turn_requests", "refusal"] {
+        assert!(is_turn_terminal("SessionPromptEnd", sub), "{sub}");
+        assert!(is_stream_closing("SessionPromptEnd", sub), "{sub}");
+    }
+    assert!(!is_turn_terminal("SessionPromptEnd", "unknown"));
+    assert!(!is_stream_closing("SessionPromptEnd", "unknown"));
+}
+#[tokio::test]
+async fn delayed_retirement_closes_only_captured_connections_with_reused_sid_and_address() {
+    let registry = Arc::new(SessionStreamRegistry::new());
+    let original = registry.admit_stream("same-endpoint", "same-sid").unwrap();
+    let old_token = original.token();
+    let captured = registry.capture_session_streams("same-sid");
+    // Establish a later real forwarding registration after the old retirement
+    // took its snapshot, including the same address and same session ID.
+    let newer = registry.admit_stream("same-endpoint", "same-sid").unwrap();
+    let newer_token = newer.token();
+    let unrelated = registry
+        .admit_stream("same-endpoint", "different-sid")
+        .unwrap();
+    let unrelated_token = unrelated.token();
+    registry.shutdown_captured_streams(captured);
+    assert!(old_token.is_cancelled());
+    assert!(!newer_token.is_cancelled());
+    assert!(!unrelated_token.is_cancelled());
+    drop(original);
+    assert!(
+        !newer_token.is_cancelled(),
+        "old task Drop must preserve the successor registration"
+    );
+    drop(newer);
+    drop(unrelated);
+    registry
+        .drain(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+}
+
+#[test]
+fn synchronous_transport_fallback_is_friendly_without_losing_h2_cause() {
+    let event = make_stream_error_event(tonic::Code::Internal, "h2 stream reset").unwrap();
+    let p: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+    assert_eq!(
+        p["message"],
+        shared_types::get_error_message(shared_types::ERR_AGENT_CONTAINER_UNAVAILABLE, "en-US")
+    );
+    assert_eq!(p["code"], "GRPC_INTERNAL");
+    assert!(
+        p["error_detail"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("h2 stream reset")
+    );
+}
+
+#[test]
+fn typed_sse_error_payload_preserves_wire_shape_and_omits_unknown_observation() {
+    let payload = StreamErrorPayload::new(
+        Code::Unavailable,
+        "original \"cause\"\npassword=hidden-marker",
+        "en-US",
+        "grpc_stream",
+    );
+    let encoded = serde_json::to_string(&payload).unwrap();
+    let wire: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(
+        wire.as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["code", "message", "error_detail"].into_iter().collect()
+    );
+    assert_eq!(wire["code"], "GRPC_SERVICE_UNAVAILABLE");
+    assert_eq!(wire["error_detail"]["stage"], "grpc_stream");
+    assert_eq!(
+        wire["error_detail"]["reason_code"],
+        "GRPC_SERVICE_UNAVAILABLE"
+    );
+    assert!(wire["error_detail"].get("task_id").is_none());
+    assert!(wire["error_detail"].get("service_id").is_none());
+    assert!(wire.get("observed_container_state").is_none());
+    assert!(!encoded.contains("hidden-marker"));
+    assert!(
+        wire["error_detail"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("\"cause\"\n")
+    );
+}
+
+#[test]
+fn typed_sse_observation_preserves_original_error_fields() {
+    let mut payload = StreamErrorPayload::new(
+        Code::Internal,
+        "original h2 \"failure\"\napi_key=hidden-marker",
+        "en-US",
+        "grpc_connect",
+    );
+    payload.error_detail.task_id = Some("captured-task".into());
+    payload.error_detail.service_id = Some("captured-service".into());
+    payload.observed_container_state =
+        Some("existing OOM observation \"quoted\"\nsecond line".into());
+    let normal: serde_json::Value = serde_json::to_value(&payload).unwrap();
+    assert_eq!(
+        normal["observed_container_state"],
+        "existing OOM observation \"quoted\"\nsecond line"
+    );
+    assert_eq!(normal["error_detail"]["task_id"], "captured-task");
+    assert_eq!(normal["error_detail"]["service_id"], "captured-service");
+    let event = payload
+        .into_event(Some("original-request".into()), 1234)
+        .unwrap();
+    assert_eq!(event.message_type, "SessionPromptEnd");
+    assert_eq!(event.sub_type, "error");
+    assert_eq!(event.seq, 0);
+    assert_eq!(event.request_id.as_deref(), Some("original-request"));
+    assert_eq!(event.timestamp, 1234);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&event.payload).unwrap(),
+        normal
+    );
+    assert!(!event.payload.contains("hidden-marker"));
+}
+
+#[test]
+fn typed_synthetic_status_messages_keep_existing_wire_contract() {
+    for (event, message_type, sub_type, reason, description) in [
+        (
+            make_prompt_end_event().unwrap(),
+            "SessionPromptEnd",
+            "end_turn",
+            "EndTurn",
+            "Agent has no task in execution",
+        ),
+        (
+            make_cursor_reset_event().unwrap(),
+            "StreamReset",
+            "epoch_changed",
+            "EpochChanged",
+            "Agent stream epoch changed; reset your dedup cursor",
+        ),
+    ] {
+        assert_eq!(event.message_type, message_type);
+        assert_eq!(event.sub_type, sub_type);
+        assert_eq!(event.seq, 0);
+        assert!(event.request_id.is_none());
+        let wire: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({"reason":reason,"description":description})
+        );
+    }
 }

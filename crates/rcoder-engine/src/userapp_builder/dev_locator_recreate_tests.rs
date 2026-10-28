@@ -6,7 +6,7 @@ use shared_types::{
     UserappDevDeletionReceipt,
 };
 
-async fn seed_deleted_application(
+pub(super) async fn seed_deleted_application(
     runtime: &LocatorRuntime,
 ) -> (UserAppLifecycleRecord, UserAppOperationRecord) {
     let mut operation = admit(

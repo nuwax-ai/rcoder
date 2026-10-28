@@ -39,7 +39,7 @@ impl fmt::Display for ModelApiProtocol {
 }
 
 /// 模型提供商配置
-#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct ModelProviderConfig {
     /// 模型id,确保唯一性
     #[schema(example = "id")]

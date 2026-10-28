@@ -17,6 +17,9 @@ cleanup_config:
   # - true: 启用（默认，自动清理闲置容器）
   # - false: 禁用
   enabled: true
+  # Reverse inventory: observe records candidates; reclaim also removes only
+  # empty unreferenced managed controllers/Services. Live orphan Pods are retained.
+  orphan_reconcile_mode: reclaim
   # 闲置超时时间（秒），超过此时间未活动的容器将被清理
   # 默认值: 600 (10分钟)
   idle_timeout_seconds: 600
@@ -266,7 +269,8 @@ api_key_auth:
 # 所有字段均可用环境变量覆盖（env > 本文件 > 默认值）：
 #   RCODER_STORAGE_BACKEND / RCODER_PG_HOST / RCODER_PG_PORT / RCODER_PG_USERNAME /
 #   RCODER_PG_PASSWORD / RCODER_PG_DATABASE / RCODER_PG_URL / RCODER_PG_MAX_CONNECTIONS /
-#   RCODER_PG_CONNECT_TIMEOUT_SECS / RCODER_PG_STATEMENT_TIMEOUT_SECS
+#   RCODER_PG_CONNECT_TIMEOUT_SECS / RCODER_PG_STATEMENT_TIMEOUT_SECS /
+#   RCODER_PG_DURABLE_COMMIT_TIMEOUT_MS
 storage:
   # 存储后端：memory（默认，纯内存单节点）| postgres（PG 持久化，多副本前置条件）
   backend: memory
@@ -283,4 +287,11 @@ storage:
     # url: "postgres://user:pass@host:5432/rcoder"
     max_connections: 10
     connect_timeout_secs: 10
-    statement_timeout_secs: 5
+    statement_timeout_secs: 15
+    # durable 提交链路总预算(ms)：注册/会话落库确认的共享 deadline 总窗口。
+    # 与单条SQL的statement_timeout独立；短预算耗尽不表示后台原操作已取消。
+    durable_commit_timeout_ms: 15000
+
+# Retained UserApp recovery (K8s); database read/write failures are never absence.
+userapp_storage:
+  default_recovery_enabled: true

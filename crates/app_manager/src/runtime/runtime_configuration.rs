@@ -552,6 +552,7 @@ mod tests {
                 command: Some(shared_types::UserAppControlCommand::Deploy {
                     restart: false,
                     input_digest: input.digest(),
+                    serving_recovery: false,
                 }),
                 metadata: None,
                 runtime_policy_on_success: None,
@@ -653,6 +654,7 @@ mod tests {
                 command: Some(shared_types::UserAppControlCommand::Deploy {
                     restart: false,
                     input_digest: input.digest(),
+                    serving_recovery: false,
                 }),
                 metadata: None,
                 runtime_policy_on_success: None,
@@ -751,6 +753,7 @@ mod tests {
                 command: Some(shared_types::UserAppControlCommand::Deploy {
                     restart: false,
                     input_digest: input.digest(),
+                    serving_recovery: false,
                 }),
                 metadata: None,
                 runtime_policy_on_success: None,

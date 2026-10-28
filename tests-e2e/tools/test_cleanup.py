@@ -7,6 +7,22 @@ from unittest.mock import patch
 from cleanup import owned, cleanup_case
 
 class OwnershipTests(unittest.TestCase):
+    def test_compute_failure_fallback_keeps_own_compute_out_of_shared_purge(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            compute = root / 'compute-failure-contract'
+            compute.mkdir()
+            app = 'cf' + 'a' * 20
+            (compute / 'ownership.json').write_text(json.dumps({
+                'project': 'rcoder-cfailure-' + 'b' * 16, 'app_id': app}))
+            late = self.container('rcoder-app-builder-' + app, labels={'rcoder.e2e.run': 'run'})
+            with patch('compute_failure_contract.cleanup', return_value={'ok': False}) as reclaim, \
+                    patch('cleanup.command', side_effect=['new', json.dumps([late])]) as api:
+                errors = cleanup_case('case', 'run', root)
+            reclaim.assert_called_once_with(compute, 'run', 'case', ())
+            self.assertTrue(any('Compute failure fixture cleanup incomplete' in error for error in errors))
+            self.assertEqual(api.call_count, 2, 'no fallback to shared HTTP purge or bare removal')
+
     def test_python_cache_fallback_keeps_own_compute_out_of_generic_purge(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

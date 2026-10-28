@@ -160,7 +160,9 @@ pub(super) fn supervisor_reply(
         runtime_supervisor::Phase::Stopping | runtime_supervisor::Phase::CleanupPending => {
             "Stopping"
         }
-        _ => "RecoveryRequired",
+        runtime_supervisor::Phase::Reconciling | runtime_supervisor::Phase::RecoveryRequired => {
+            "RecoveryRequired"
+        }
     };
     // Ready requires matching worker evidence and a real bound address. A
     // missing, damaged, or foreign receipt must not become successful Running

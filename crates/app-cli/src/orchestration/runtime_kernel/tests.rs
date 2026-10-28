@@ -50,6 +50,39 @@ mod cases {
     }
 
     #[tokio::test]
+    async fn retained_artifact_recovery_is_idempotent_and_preserves_revision_guards() {
+        let (dir, _) = temp_store();
+        let actions = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = actions.clone();
+        let kernel = RuntimeKernel::new(
+            open_store(&dir.path().join("workspace")),
+            identity(),
+            Box::new(move |action| sink.lock().unwrap().push(action)),
+        );
+        let mut input = request(RuntimeOperationKind::Deploy, "retained-boot");
+        input.profile = RunProfileInput::Artifact {
+            artifact: ArtifactInput::RetainedWorkspace {
+                release_id: "existing-release".into(),
+            },
+        };
+        kernel.admit(input.clone()).await.unwrap();
+        kernel.admit(input.clone()).await.unwrap();
+        {
+            let actions = actions.lock().unwrap();
+            assert_eq!(actions.len(), 1);
+            assert!(
+                matches!(&actions[0], DispatchAction::RecoverArtifact {operation_id,release_id,..} if operation_id=="retained-boot" && release_id=="existing-release")
+            );
+        }
+        input.operation_id = "stale-recovery".into();
+        input.expected_revision = 999;
+        assert_eq!(
+            kernel.admit(input).await.unwrap_err().code,
+            ERR_REVISION_MISMATCH
+        );
+    }
+
+    #[tokio::test]
     async fn internal_operation_retains_pg_for_audit_but_views_and_events_do_not() {
         let (dir, _) = temp_store();
         let kernel = kernel(dir.path());

@@ -173,7 +173,9 @@ mod tests {
     }
 
     /// fs_children 不 trim 路径：尾空格目录（URL 编码 %20）原样浏览——
-    /// 锁定 handler 层不做静默变形（POSIX 合法路径段）。
+    /// 锁定 handler 层不做静默变形（POSIX 合法路径段；Windows 宿主建不出尾空格
+    /// 目录名，会归一掉尾随空白，故本用例仅 POSIX）。
+    #[cfg(unix)]
     #[tokio::test]
     async fn fs_children_serves_trailing_space_path_verbatim() {
         use tower::ServiceExt;

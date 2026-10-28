@@ -12,6 +12,200 @@ use crate::service::{AppService, OwnedOperation};
 use crate::utils::{map_runtime_error, map_runtime_mutation_error};
 
 impl AppService {
+    /// Observe a compute-only creation that returned an error after its physical
+    /// create/start. This never reopens the executor or sends another resource
+    /// write. The original failure remains Failed with confirmation evidence.
+    pub async fn reconcile_created_runtime_configuration(
+        &self,
+        snapshot: &UserAppOperationRecord,
+    ) -> AppResult<bool> {
+        if snapshot.state != UserAppOperationState::RecoveryRequired
+            || snapshot.kind != shared_types::UserAppOperationKind::StartDeployment
+            || snapshot.step != "creating_runtime"
+            || !matches!(
+                &snapshot.command,
+                Some(Command::Deploy { restart: false, .. })
+            )
+        {
+            return Ok(false);
+        }
+        let lock = self
+            .release_locks
+            .entry((
+                snapshot.app_id.clone(),
+                shared_types::UserAppOperationScope::Prod,
+            ))
+            .or_default()
+            .clone();
+        let Ok(_local) = lock.try_lock_owned() else {
+            return Ok(false);
+        };
+        let observe = async {
+            let store = &self.metadata.store;
+            if store
+                .get_operation(&snapshot.app_id, &snapshot.operation_id)
+                .await?
+                .as_ref()
+                != Some(snapshot)
+            {
+                return Ok(false);
+            }
+            let Some(identity) = store.get_application(&snapshot.app_id).await? else {
+                return Ok(false);
+            };
+            if identity.state != shared_types::UserAppLifecycleState::Active
+                || identity.lifecycle_id != snapshot.lifecycle_id
+                || identity.active_operations.prod.as_deref()
+                    != Some(snapshot.operation_id.as_str())
+            {
+                return Ok(false);
+            }
+            let Some(binding) = store
+                .get_operation_lease(&snapshot.app_id, &snapshot.operation_id)
+                .await?
+            else {
+                return Ok(false);
+            };
+            let context: shared_types::UserAppExecutionContext = match snapshot
+                .checkpoint
+                .get("context")
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+            {
+                Some(context) => context,
+                None => return Ok(false),
+            };
+            if context != binding.context
+                || context.app_id != snapshot.app_id
+                || context.lifecycle_id != snapshot.lifecycle_id
+                || context.operation_id != snapshot.operation_id
+                || Some(&context.executor_id) != snapshot.executor_id.as_ref()
+                || context.request_fingerprint != snapshot.request_fingerprint
+                || *binding.receipt.service_type() != shared_types::ServiceType::Userapp
+            {
+                return Ok(false);
+            }
+            if !self
+                .runtime
+                .app_operation_receipt_holder_dead(&context, &binding.receipt)
+                .await
+                .map_err(|error| map_runtime_error("Observe original creation executor", error))?
+            {
+                return Ok(false);
+            }
+            let input = store.read_recovery_execution_input(snapshot).await?;
+            let input = super::super::deploy_control::DeployInput::decode(&input, false)?;
+            let Some(params) = input.compute_only_creation() else {
+                return Ok(false);
+            };
+            if params.project_id.as_deref() != Some(snapshot.app_id.as_str()) {
+                return Ok(false);
+            }
+            // Exact operation labels are required. A same-name Running resource
+            // is neither proof that this create landed nor adoption authority.
+            let Some(resource) = self
+                .runtime
+                .verify_committed_creation(&context)
+                .await
+                .map_err(|error| {
+                    map_runtime_error(
+                        "Confirm original creation and retain its configuration",
+                        error,
+                    )
+                })?
+            else {
+                return Ok(false);
+            };
+            if resource.container_id.is_empty() {
+                return Ok(false);
+            }
+            let Some(retained) = self
+                .runtime
+                .retained_app_runtime_configuration(&context.app_id, &context.lifecycle_id)
+                .await
+                .map_err(|error| {
+                    map_runtime_error("Observe repaired creation configuration", error)
+                })?
+            else {
+                return Ok(false);
+            };
+            let mut expected_env = params.env.clone().unwrap_or_default();
+            expected_env.extend(params.secrets.clone().unwrap_or_default());
+            // The saved configuration intentionally drops one-time deployment
+            // inputs. Compare current business values, not historical generation
+            // or platform tokens already covered by native operation ownership.
+            let expected_env = crate::release_flow::identity::business_env(expected_env);
+            let mut actual_env = retained.env.clone().unwrap_or_default();
+            actual_env.extend(retained.secrets.clone().unwrap_or_default());
+            // The original reference and the applied immutable content ID are
+            // different representations. Exact native operation/UID ownership
+            // already proves the source captured by verify_committed_creation;
+            // never compare a possibly mutable request tag to inspect.Image.
+            if params
+                .command
+                .as_ref()
+                .is_some_and(|command| retained.command.as_ref() != Some(command))
+                || expected_env
+                    .iter()
+                    .any(|(key, value)| actual_env.get(key) != Some(value))
+            {
+                return Ok(false);
+            }
+            let Some(status) = self
+                .runtime
+                .get_deployment_status(&context.app_id)
+                .await
+                .map_err(|error| map_runtime_error("Observe committed creation state", error))?
+            else {
+                return Ok(false);
+            };
+            if status.phase != "Running"
+                || self
+                    .runtime
+                    .app_runtime_configuration_uid(&context.app_id)
+                    .await
+                    .map_err(|error| {
+                        map_runtime_error("Confirm committed creation physical identity", error)
+                    })?
+                    .as_deref()
+                    != Some(resource.container_id.as_str())
+                || !self
+                    .runtime
+                    .app_operation_receipt_holder_dead(&context, &binding.receipt)
+                    .await
+                    .map_err(|error| {
+                        map_runtime_error("Confirm original creation executor retired", error)
+                    })?
+            {
+                return Ok(false);
+            }
+            // Revalidate the complete fenced record, slot and business authority
+            // after runtime I/O. Publication grants no authority to resume I/O.
+            store.read_recovery_execution_input(snapshot).await?;
+            store.settle_fenced_operation(snapshot, &serde_json::json!({
+                "kind": "committed_compute_configuration_retained",
+                "resource": resource,
+                "context": context,
+            }), "original compute creation confirmed; private configuration publication repaired without replay").await?;
+            self.runtime
+                .release_app_operation_receipt(&context, &binding.receipt)
+                .await
+                .map_err(|error| {
+                    map_runtime_error("Release original confirmed creation lease", error)
+                })?;
+            store.forget_operation_lease(&binding).await?;
+            self.refresh_pingora_after_restart(&context.app_id).await;
+            self.activity.try_mark_woken(&context.app_id);
+            Ok(true)
+        };
+        timeout_at(Instant::now() + Duration::from_secs(10), observe)
+            .await
+            .map_err(|_| {
+                AppOperationError::Backend(
+                    "Creation configuration recovery observation timed out".into(),
+                )
+            })?
+    }
+
     pub async fn retry_control_operation(
         &self,
         app_id: &str,
@@ -46,6 +240,19 @@ impl AppService {
         }
         if operation.revision != request.expected_revision {
             return Err(shared_types::UserAppStoreError::VersionConflict.into());
+        }
+        if self
+            .reconcile_created_runtime_configuration(&operation)
+            .await?
+        {
+            return self
+                .get_control_operation(app_id, Some(operation_id))
+                .await?
+                .ok_or_else(|| {
+                    AppOperationError::OperationNotFound(
+                        "Recovered creation operation disappeared".into(),
+                    )
+                });
         }
         if matches!(
             operation.kind,
@@ -382,15 +589,14 @@ impl AppService {
         &self,
         snapshot: &UserAppOperationRecord,
     ) -> AppResult<bool> {
-        if snapshot.state == UserAppOperationState::RecoveryRequired
-            && snapshot.step == "hot_execution"
+        if self
+            .reconcile_created_runtime_configuration(snapshot)
+            .await?
         {
-            return Ok(self.reconcile_hot_failure(snapshot).await?.is_some());
+            return Ok(true);
         }
-        if snapshot.state == UserAppOperationState::RecoveryRequired
-            && snapshot.step == "hot_converging"
-        {
-            return Ok(self.reconcile_hot_convergence(snapshot).await?.is_some());
+        if matches!(snapshot.step.as_str(), "hot_execution" | "hot_converging") {
+            return self.resume_hot_control(snapshot).await;
         }
         if self.reconcile_completed_control(snapshot).await? {
             return Ok(true);

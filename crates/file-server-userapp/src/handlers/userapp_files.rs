@@ -567,10 +567,14 @@ pub(crate) mod tests_support {
 
     /// userapp 版 make_state: `userapp_workspace_dir` 指向 tempdir (resolve_userapp_dev 的根)。
     pub(crate) fn make_state(userapp_root: std::path::PathBuf) -> UserAppState {
-        let config = Arc::new(Config {
+        make_state_with_config(Arc::new(Config {
             userapp_workspace_dir: userapp_root,
             ..Config::default()
-        });
+        }))
+    }
+
+    /// 同 make_state, 但允许测试覆盖个别配置项(如 upload_project_dir 指向可写临时目录)。
+    pub(crate) fn make_state_with_config(config: Arc<Config>) -> UserAppState {
         let resolver: Arc<dyn WorkspaceResolver> = Arc::new(LocalWorkspaceResolver::new(
             config.project_source_dir.clone(),
             config.computer_workspace_dir.clone(),

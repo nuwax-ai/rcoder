@@ -23,7 +23,7 @@ pub(crate) mod test_support;
 pub use project_store::sync;
 pub use project_store::writer::PersistWriter;
 pub mod leader_selection {
-    pub use super::project_store::leader::PgLeaderElection;
+    pub use super::project_store::leader::{LEADER_LOCK_KEY, PgLeaderElection};
 }
 
 use std::sync::Arc;
@@ -36,6 +36,9 @@ use tracing::info;
 
 use shared_types::{ContainerLookup, ProjectAndContainerInfo, ServiceType};
 
+use self::project_store::authoritative::{
+    AuthoritativeContainerBinding, AuthoritativeVerificationRequired, GateAuthority,
+};
 use self::project_store::persist_ops::PersistOp;
 use crate::adapter::{ProjectAdapter, container_entry_key};
 use crate::config::PostgresConfig;
@@ -50,6 +53,17 @@ const TOUCH_THROTTLE_TTI: Duration = Duration::from_secs(3600);
 pub struct PgStore {
     /// Serializes local mirror mutation and immutable operation registration; never spans await.
     registration: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Unconfirmed local clear-all projections; only cache convergence, never
+    /// startup admission or durable recovery proof. SQL owns the Stop fence.
+    project_stops: std::sync::Mutex<
+        std::collections::HashMap<String, Arc<project_store::project_stop::ProjectStop>>,
+    >,
+    rejected_container_intents: std::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            Arc<project_store::container_intent::RejectedContainerIntent>,
+        >,
+    >,
     container_registration: std::sync::Mutex<
         std::collections::HashMap<String, shared_types::persistence::ContainerPersistenceIdentity>,
     >,
@@ -70,15 +84,50 @@ pub struct PgStore {
     pending_ops: Arc<AtomicI64>,
     database: crate::db::owner::DatabaseOwner,
     postgres_config: PostgresConfig,
+    pub(crate) workload_admission: Arc<crate::workload_admission::pg::AdmissionPool>,
 }
 
 impl PgStore {
+    /// SQL has already committed; a local mirror is only conditionally pruned.
+    pub(crate) fn prune_committed_workload_frame(&self, frame: &crate::WorkloadRegistrationFrame) {
+        let _registration = self
+            .registration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut containers = self
+            .container_registration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cursor_matches = frame.container.as_ref().is_some_and(|expected| {
+            containers
+                .get(frame.container_name())
+                .is_some_and(|current| {
+                    current.generation == expected.generation
+                        && current.revision == expected.revision
+                        && current.physical_uid == expected.physical_uid
+                })
+        });
+        if self
+            .inner
+            .prune_committed_workload_frame(frame, cursor_matches)
+            && cursor_matches
+        {
+            containers.remove(frame.container_name());
+        }
+    }
+
     /// Stop admission before draining accepted direct writes and the fallback queue.
     pub async fn shutdown_flush_outcome(&self, timeout: Duration) -> shared_types::FlushOutcome {
         let deadline = tokio::time::Instant::now() + timeout;
         {
             let _registration = self.registration.lock().unwrap_or_else(|p| p.into_inner());
             self.closing.store(true, Ordering::Release);
+        }
+        if let Err(error) = self.workload_admission.shutdown(deadline).await {
+            return shared_types::FlushOutcome::Incomplete {
+                pending: self.pending_ops.load(Ordering::Acquire).max(0) as usize,
+                reason: error.to_string(),
+            };
         }
         loop {
             let done = self.write_finished.notified();
@@ -110,8 +159,7 @@ impl PgStore {
 
     /// 连接 + 迁移 + 全量加载，构造 PG 后端。
     ///
-    /// 返回 `(store, cleanup_rx)`：与 ProjectAdapter::new 同形，CleanupRequest
-    /// 队列语义完全复用（ResourceReaper 无感知切换）。
+    /// 返回元数据存储；物理容器退休由运行时调用方独立完成。
     ///
     /// # Errors
     /// 连接失败/迁移失败/加载解码失败均 fail fast（PG 模式下绝不静默降级内存）。
@@ -119,11 +167,14 @@ impl PgStore {
         config: &PostgresConfig,
         namespace: String,
         cluster_domain: String,
-    ) -> anyhow::Result<(Self, mpsc::Receiver<shared_types::CleanupRequest>)> {
+    ) -> anyhow::Result<Self> {
+        config
+            .validate_durable_commit_timeout()
+            .map_err(anyhow::Error::msg)?;
         let database =
             crate::db::postgres::open(config, vec![crate::db::schema::Component::Project]).await?;
 
-        let (inner, cleanup_rx) = ProjectAdapter::new(namespace, cluster_domain);
+        let inner = ProjectAdapter::new(namespace, cluster_domain);
         let container_registration = project_store::load::load_all(&database, &inner).await?;
         project_store::userapp_agent::validate_snapshot(&database).await?;
         let (ops_tx, ops_rx) = mpsc::unbounded_channel();
@@ -132,6 +183,8 @@ impl PgStore {
 
         let store = Self {
             registration: std::sync::Mutex::new(std::collections::HashMap::new()),
+            project_stops: std::sync::Mutex::new(std::collections::HashMap::new()),
+            rejected_container_intents: std::sync::Mutex::new(std::collections::HashMap::new()),
             container_registration: std::sync::Mutex::new(container_registration),
             closing: std::sync::atomic::AtomicBool::new(false),
             active_writes: std::sync::atomic::AtomicUsize::new(0),
@@ -143,13 +196,14 @@ impl PgStore {
             pending_ops,
             database,
             postgres_config: config.clone(),
+            workload_admission: crate::workload_admission::pg::AdmissionPool::new(config)?,
         };
         let stats = store.inner.get_stats();
         info!(
             "[STORAGE_PG] boot load complete: projects={} containers={} sessions={}",
             stats.total_projects, stats.total_containers, stats.active_sessions
         );
-        Ok((store, cleanup_rx))
+        Ok(store)
     }
 
     /// 内存镜像访问（backend 装配/快照构造等特有能力）
@@ -164,6 +218,11 @@ impl PgStore {
 
     pub fn postgres_config(&self) -> &PostgresConfig {
         &self.postgres_config
+    }
+
+    /// durable 提交链路总预算（运行期可配置，替代原 600ms 常量）。
+    pub(crate) fn durable_commit_budget(&self) -> Duration {
+        self.postgres_config.durable_commit_timeout()
     }
 
     /// 等待在途 op 全部落库（sync 任务的排空屏障；二次确认防批处理间隙误判）
@@ -220,7 +279,16 @@ impl PgStore {
         &self,
         mut info: Arc<ProjectAndContainerInfo>,
         retired: &std::collections::HashMap<String, String>,
+        authority: &GateAuthority,
     ) -> anyhow::Result<Arc<ProjectAndContainerInfo>> {
+        anyhow::ensure!(
+            !self
+                .project_stops
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(info.project_id()),
+            "Project Stop registration is pending authoritative confirmation"
+        );
         let supplied = info.persistence_identity().clone();
         // 契约三行3/§1.2 换代门输入：当前注册的 workload UID（同名替换判定）。
         let mut registered_workload_uid: Option<String> = None;
@@ -252,6 +320,21 @@ impl PgStore {
             .ok_or_else(|| anyhow::anyhow!("Project registration revision exhausted"))?;
         identity.container = if let Some(basic) = info.container_info() {
             let key = container_entry_key(&info);
+            // A new project still shares the canonical physical container with
+            // existing projects. Its own missing row does not authorize a
+            // workload change through ordinary registration. 权威快照在场时
+            // 门禁只认 DB 值；镜像回退供 Deferred/MirrorOnly 路径判定。
+            if registered_workload_uid.is_none()
+                && matches!(
+                    authority,
+                    GateAuthority::Deferred | GateAuthority::MirrorOnly
+                )
+            {
+                registered_workload_uid = self
+                    .inner
+                    .registered_container_by_key(&key)
+                    .and_then(|canonical| canonical.workload_uid);
+            }
             let registrations = self
                 .container_registration
                 .lock()
@@ -264,9 +347,16 @@ impl PgStore {
             if let (Some(previous), Some(supplied)) = (&current, &supplied.container) {
                 anyhow::ensure!(
                     supplied.generation == previous.generation
-                        && supplied.revision == previous.revision,
+                        && (supplied.revision == previous.revision
+                            || (supplied.revision < previous.revision
+                                && physical_uid.is_some()
+                                && supplied.physical_uid == physical_uid
+                                && previous.physical_uid == physical_uid)),
                     "Container registration changed; stale snapshot cannot be rebased"
                 );
+                // A shared container's ordinary row revision advances when any
+                // project registers it. Rebase only that same physical instance;
+                // replacement still requires the exact captured predecessor.
             }
             let next = match current {
                 Some(mut previous)
@@ -283,21 +373,67 @@ impl PgStore {
                         physical_uid.is_some(),
                         "A placeholder cannot clear a bound container identity"
                     );
-                    // 契约三行3/§1.2：同名 workload 对象已被替换（注册与观察的
-                    // workload UID 均在且不同）→ 禁止自动换代重绑——自动接管
-                    // 会把 projects/sessions 绑到别人的 workload 上；需显式
-                    // 恢复路径处置旧绑定。任一方缺 workload UID（Docker/
-                    // bare-pod/Deployment 族）不在此门内，按既有换代事务走。
-                    if let (Some(registered), Some(observed)) = (
-                        registered_workload_uid.as_deref(),
-                        basic.workload_uid.as_deref(),
-                    ) {
-                        anyhow::ensure!(
-                            registered == observed,
-                            "Container workload was replaced ({registered} -> {observed}); \
-                             stop the project to retire the stale binding before re-ensuring"
-                        );
+                    // 契约三行3/§1.2：同名 workload 对象已被替换 → 禁止自动换代
+                    // 重绑——自动接管会把 projects/sessions 绑到别人的 workload 上。
+                    // 裁决依据是权威快照（containers 行 + tombstone），内存镜像
+                    // 只是缓存：本系统已退役（tombstone 在案）的自我换代放行；
+                    // DB 绑定仍指向在案的旧 workload 属真外部替换，拒绝（409）；
+                    // 行与 tombstone 俱无属手工动库等异常状态，同样拒绝。
+                    // 任一方缺 workload UID（Docker/bare-pod/Deployment 族）不进
+                    // 此门，按既有换代事务走。
+                    let observed = basic.workload_uid.as_deref();
+                    let mirror_mismatch = match (registered_workload_uid.as_deref(), observed) {
+                        (Some(registered), Some(observed)) => registered != observed,
+                        _ => false,
+                    };
+                    match authority {
+                        GateAuthority::Snapshot(read) => match &read.binding {
+                            // 本系统已退役（tombstone 在案）的自我换代：放行换代事务。
+                            AuthoritativeContainerBinding::RetiredByUs => {}
+                            AuthoritativeContainerBinding::AnomalousAbsent => {
+                                tracing::warn!(
+                                    container = %key,
+                                    "authoritative container binding missing without a tombstone"
+                                );
+                                anyhow::bail!(
+                                    "Container binding vanished without a retirement record; \
+                                     stop the project to retire the stale binding before re-ensuring"
+                                );
+                            }
+                            AuthoritativeContainerBinding::Bound {
+                                workload_uid: registered,
+                            } => {
+                                if let (Some(registered), Some(observed)) =
+                                    (registered.as_deref(), observed)
+                                    && registered != observed
+                                {
+                                    return Err(anyhow::Error::new(
+                                        shared_types::ContainerWorkloadReplaced {
+                                            container_name: key.clone(),
+                                            registered_workload_uid: registered.to_string(),
+                                            observed_workload_uid: observed.to_string(),
+                                        },
+                                    ));
+                                }
+                            }
+                        },
+                        GateAuthority::Deferred
+                            if mirror_mismatch
+                                || (registered_workload_uid.is_none() && observed.is_some()) =>
+                        {
+                            return Err(anyhow::Error::new(AuthoritativeVerificationRequired {
+                                name: key.clone(),
+                            }));
+                        }
+                        GateAuthority::MirrorOnly if mirror_mismatch => {
+                            anyhow::bail!(
+                                "Container workload was replaced ({registered_workload_uid:?} -> {observed:?}); \
+                                 stop the project to retire the stale binding before re-ensuring"
+                            );
+                        }
+                        GateAuthority::Deferred | GateAuthority::MirrorOnly => {}
                     }
+                    // 走既有换代事务（新 generation + predecessor 捕获）。
                     shared_types::persistence::ContainerPersistenceIdentity {
                         generation: uuid_generation(),
                         revision: 1,
@@ -408,4 +544,16 @@ impl ContainerLookup for PgStore {
 
 fn uuid_generation() -> String {
     shared_types::persistence::ProjectPersistenceIdentity::default().generation
+}
+
+#[cfg(feature = "pg")]
+#[async_trait::async_trait]
+impl shared_types::ContainerUserRefresh for PgStore {
+    async fn refresh_user_container(
+        &self,
+        user_id: &str,
+        service_type: &ServiceType,
+    ) -> anyhow::Result<()> {
+        self.refresh_user_container(user_id, service_type).await
+    }
 }

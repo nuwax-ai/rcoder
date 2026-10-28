@@ -91,8 +91,21 @@ class AssetContextTests(unittest.TestCase):
         fixture.mkdir()
         for name in ('Cargo.toml', 'Cargo.lock'):
             (fixture / name).write_text(name)
-        for name in ('crates', 'tests-e2e'):
+        for name in ('crates', 'tests-e2e', 'vendor'):
             (fixture / name).mkdir()
+        vendor = fixture / 'vendor/utoipa-swagger-ui'
+        (vendor / 'src').mkdir(parents=True)
+        vendor_files = {
+            'Cargo.toml': b'[package]\nname = "utoipa-swagger-ui"\nversion = "10.0.1"\n',
+            'build.rs': b'fn main() {}\n',
+            'src/lib.rs': b'pub fn asset() {}\n',
+            '.cargo_vcs_info.json': b'{"git":{"sha1":"upstream-test-identity"}}\n',
+        }
+        for name, payload in vendor_files.items():
+            (vendor / name).write_bytes(payload)
+        (vendor / '.env.local').write_text('must not be copied')
+        (vendor / 'target').mkdir()
+        (vendor / 'target/private-cache').write_text('must not be copied')
         build = fixture / 'tools/build'
         build.mkdir(parents=True)
         for name in ('pingap_identity.py', 'pingap-assets.json', 'runtime_assets.py', 'pingap_official.py'):
@@ -109,6 +122,14 @@ class AssetContextTests(unittest.TestCase):
         self.assertTrue((copied / 'pingap-assets.json').is_file())
         self.assertFalse((copied / 'credentials.json').exists())
         self.assertFalse(list(copied.rglob('__pycache__')))
+        copied_vendor = destination / 'vendor/utoipa-swagger-ui'
+        for name, payload in vendor_files.items():
+            self.assertEqual((copied_vendor / name).read_bytes(), payload)
+        self.assertFalse((copied_vendor / '.env.local').exists())
+        self.assertFalse((copied_vendor / 'target').exists())
+        cli = destination / 'crates/app-cli'
+        cli.mkdir()
+        self.assertEqual((cli / '../../vendor/utoipa-swagger-ui').resolve(), copied_vendor.resolve())
 
     def test_agent_maps_pingap_to_downloads_without_node(self):
         target = self.root / 'snapshot'

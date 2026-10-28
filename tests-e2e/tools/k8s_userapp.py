@@ -6,6 +6,7 @@ Pod environment variables. Existing resources are inventoried before acceptance.
 """
 import argparse
 import concurrent.futures
+import ipaddress
 import hashlib
 import io
 import json
@@ -45,12 +46,53 @@ REQUIRED = {'cluster_ready', 'concurrent_ensure', 'ensure_retry', 'builder_ident
             'stop_idempotent', 'stop_zero_pods', 'wake_new_pod', 'wake', 'wake_content_B', 'cleanup',
             'tombstone_deleted', 'tombstone_old_ensure_rejected', 'recreate_new_lifecycle',
             'recreate_deleted', 'baseline_preserved', 'worker_artifact_contract', 'worker_process_running'}
+REQUIRED |= {'dev_readonly_seed_data', 'dev_compute_stop_identity', 'dev_stopped_resource_identity',
+             'dev_stopped_rv_advanced', 'dev_stopped_storage_both_replicas',
+             'dev_stopped_logs_both_replicas', 'dev_stopped_no_wake',
+             'dev_readonly_annotation_removed', 'dev_compute_restart_identity',
+             'dev_readonly_data_preserved'}
+REQUIRED |= {'recreate_workspace_usable', 'recreate_files_git', 'build_L2', 'artifact_L2',
+             'recreate_deploy_operation', 'recreate_content_L2',
+             'recreate_compute_stop', 'recreate_compute_restart', 'recreate_data_preserved',
+             'recreate_old_lifecycle_rejected', 'recreate_history_preserved',
+             'recreate_owned_pvc_identity'}
+REQUIRED |= {'traffic_wake_without_start', 'traffic_wake_single_instance',
+             'traffic_wake_pvc_data_preserved', 'wake_explicit_start_idempotent'}
+
+# The independent lifecycle scenario has its own complete contract. It never
+# narrows the default all-scenario contract or runs traffic wake as a prerequisite.
+RECREATE_REQUIRED = {
+    'cluster_ready', 'concurrent_ensure', 'concurrent_error_contract', 'ensure_retry',
+    'builder_identity', 'lifecycle_active', 'cross_replica_files',
+    'recreate_l1_files_git', 'import_L1', 'build_L1', 'artifact_L1',
+    'recreate_l1_deploy_operation', 'recreate_l1_content',
+    'recreate_l1_compute_history', 'recreate_l1_data_preserved',
+    'tombstone_deleted', 'tombstone_old_ensure_rejected', 'recreate_new_lifecycle',
+    'recreate_workspace_usable', 'recreate_files_git', 'build_L2', 'artifact_L2',
+    'recreate_deploy_operation', 'recreate_content_L2', 'recreate_compute_stop',
+    'recreate_compute_restart', 'recreate_data_preserved',
+    'recreate_old_lifecycle_rejected', 'recreate_history_preserved',
+    'recreate_owned_pvc_identity', 'recreate_deleted', 'cleanup', 'baseline_preserved',
+    'worker_artifact_contract',
+}
+from k8s_hot_recovery import REQUIRED as HOT_RECOVERY_REQUIRED
+from k8s_default_recovery import REQUIRED as DEFAULT_RECOVERY_REQUIRED
+
+SCENARIO_REQUIRED = {'all': frozenset(REQUIRED), 'recreate': frozenset(RECREATE_REQUIRED),
+                     'hot_recovery': HOT_RECOVERY_REQUIRED, 'default_recovery': DEFAULT_RECOVERY_REQUIRED}
+SCENARIO_IDENTITIES = {'all': 'k8s_userapp', 'recreate': 'k8s_userapp_recreate',
+                       'hot_recovery': 'k8s_userapp_hot_recovery', 'default_recovery': 'k8s_userapp_default_recovery'}
 
 RESTART_ADMISSION_WAIT_SECONDS = 30
 RESTART_EXECUTION_TIMEOUT_SECONDS = 300
 # The formal /restart controller calls restart_app_enhanced/deploy_controlled,
 # including the no-URL request; it does not use the independent compute kind.
 RESTART_OPERATION_KIND = 'RestartDeployment'
+
+
+class NoProxyRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, url):
+        return None
 
 
 def wire_name(name):
@@ -152,6 +194,84 @@ def remaining_timeout(deadline, limit):
     return min(limit, remaining)
 
 
+def dev_compute_view(view, app, lifecycle, action, operation_id):
+    """Only the original public compute identity can finish this normal scenario."""
+    if (not isinstance(view, dict) or not operation_id
+            or view.get('operation_id') != operation_id or view.get('app_id') != app
+            or view.get('lifecycle_id') != lifecycle or view.get('scope') != 'Dev'
+            or view.get('action') != action):
+        raise AssertionError('Development compute operation identity differs')
+    state = view.get('state')
+    if state in ('pending', 'running'):
+        return False
+    if state == 'succeeded':
+        if view.get('stage') != 'completed':
+            raise AssertionError('Succeeded development compute operation is not completed')
+        return True
+    if state in ('recovery_required', 'failed', 'superseded'):
+        raise AssertionError('Development compute did not succeed: ' + str(view))
+    raise AssertionError('Unknown development compute state: ' + str(state))
+
+
+def stopped_dev_logs(status, envelope):
+    # The existing locator diagnostic is wrapped by AppOperationError::Backend.
+    # This tests that diagnostic, without changing or inventing a public code.
+    return (status == 200 and isinstance(envelope, dict)
+            and envelope.get('code') == 'ERR_BACKEND_ERROR' and envelope.get('success') is False
+            and 'not running; its file logs are currently unavailable' in envelope.get('message', ''))
+
+
+def dev_controller_identity(row, app, lifecycle, expected_uid=None):
+    meta = row.get('metadata') or {}
+    labels, annotations = meta.get('labels') or {}, meta.get('annotations') or {}
+    if (row.get('kind') != 'StatefulSet' or meta.get('name') != 'rcoder-app-builder-' + app
+            or not meta.get('uid') or not meta.get('resourceVersion') or meta.get('deletionTimestamp')
+            or (expected_uid is not None and meta['uid'] != expected_uid)
+            or labels.get('rcoder.io/identifier') != app
+            or labels.get('rcoder.io/service-type') != 'user-app-builder'
+            or annotations.get('rcoder.io/application-id') != app
+            or annotations.get('rcoder.io/lifecycle-id') != lifecycle):
+        raise AssertionError('Refusing a different development controller identity')
+    return meta
+
+
+def owned_userapp_pvc_identities(rows, app, lifecycle, baseline_uids):
+    """Capture only exact, newly created UserApp volumes, never agent/baseline PVCs."""
+    expected = {'rcoder-app-builder-' + app + '-workspace': 'user-app-builder',
+                'rcoder-app-' + app + '-workspace': 'user-app'}
+    claims = []
+    for row in rows:
+        if row.get('kind') != 'PersistentVolumeClaim':
+            continue
+        labels, annotations = row.get('labels') or {}, row.get('annotations') or {}
+        if (row.get('name') not in expected or not row.get('uid') or row['uid'] in baseline_uids
+                or labels.get('app.kubernetes.io/managed-by') != 'rcoder-runtime'
+                or labels.get('service_type') != expected[row['name']]
+                or annotations.get('rcoder.io/application-id') != app
+                or annotations.get('rcoder.io/lifecycle-id') != lifecycle):
+            raise AssertionError('Recreated PVC is not an exact new lifecycle-owned UserApp volume')
+        claims.append((row['name'], row['uid']))
+    if len({name for name, _uid in claims}) != len(claims):
+        raise AssertionError('Recreated PVC names are ambiguous')
+    return sorted(claims)
+
+
+def stale_lifecycle_rejected(status, envelope, compute=False):
+    return (status in ((409,) if compute else (200, 409)) and isinstance(envelope, dict)
+            and envelope.get('code') == 'ERR_CONFLICT' and envelope.get('success') is False
+            and not envelope.get('operation_id'))
+
+
+def historical_compute_view_preserved(before, after):
+    """Terminal lease release may advance revision without rewriting the public receipt."""
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return False
+    original, current = before.get('revision'), after.get('revision')
+    return (type(original) is int and type(current) is int and original >= 0 and current >= original
+            and {key: value for key, value in before.items() if key != 'revision'}
+            == {key: value for key, value in after.items() if key != 'revision'})
+
+
 def rejected_without_execution(view, kind):
     return view is None or (view.get('kind') == kind and view.get('scope') == 'Prod'
                             and view.get('state') == 'Failed'
@@ -184,15 +304,27 @@ def compact_resource(row):
             'annotations': {key: value for key, value in (meta.get('annotations') or {}).items()
                             if key in ('rcoder.io/restart-operation', 'rcoder.io/application-id', 'rcoder.io/lifecycle-id')},
             'phase': row.get('status', {}).get('phase'),
+            'volumeName': row.get('spec', {}).get('volumeName'),
             'podIP': row.get('status', {}).get('podIP'),
             'conditions': row.get('status', {}).get('conditions', []),
             'images': [{k: c.get(k) for k in ('name', 'image', 'imageID', 'containerID', 'ready', 'restartCount')}
                        for c in row.get('status', {}).get('containerStatuses', [])]}
 
 
+def node_entry_addresses(advertised, interfaces):
+    local = {a['local'] for interface in interfaces for a in interface.get('addr_info', [])
+             if a.get('family') == 'inet' and isinstance(a.get('local'),str)
+             and not ipaddress.ip_address(a['local']).is_loopback}
+    # Build hosts can be outside the cluster. Extra interfaces are valid only
+    # when the SSH host itself owns an advertised test-node address.
+    return set(advertised) | local if set(advertised) & local else set(advertised)
+
+
 class Run:
     def __init__(self, args):
         self.args = args
+        self.scenario = getattr(args, 'scenario', 'all')
+        self.required = SCENARIO_REQUIRED[self.scenario]
         self.id = uuid.uuid4().hex
         # app_id 受 USERAPP_APP_ID_MAX_LEN=22 约束（K8s StatefulSet label 63 字节限制）：
         # 'e2e-k8s-'(8) + 14 hex = 22
@@ -207,12 +339,16 @@ class Run:
         self.tunnel = None
         self.baseline = []
         self.created = False
+        self.recreated = False
         self.lifecycle_id = None
         self.base = args.url.rstrip('/')
         self.entries = []
+        self.proxy_entries = []
         self.trace = uuid.uuid4().hex
         self.summary = {'run_id': self.id, 'app_id': self.app, 'namespace': args.namespace,
-                        'ssh': args.ssh, 'planned': sorted(REQUIRED), 'verdict': 'aborted',
+                        'ssh': args.ssh, 'scenario': self.scenario,
+                        'report_identity': {'scenario': SCENARIO_IDENTITIES[self.scenario], 'backend': 'k8s'},
+                        'planned': sorted(self.required), 'required': sorted(self.required), 'verdict': 'aborted',
                         'head': (ORIGIN_HEAD or self.local('git', 'rev-parse', 'HEAD')).strip(),
                         'harness_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
         from run import source_fingerprint
@@ -228,7 +364,9 @@ class Run:
 
     def kube(self, *args, deadline=None):
         context = getattr(self.args, 'context', None)
-        command = shlex.join(['kubectl', *(['--context', context] if context else []), '-n', self.args.namespace, *args])
+        server = getattr(self.args, 'kube_server', None)
+        command = shlex.join(['kubectl', *(['--context', context] if context else []),
+                              *(['--server', server] if server else []), '-n', self.args.namespace, *args])
         return self.local('ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', self.args.ssh, command,
                           deadline=deadline)
 
@@ -289,6 +427,26 @@ class Run:
             raise AssertionError(f'{path}: HTTP {status}: {data}')
         return data['data']
 
+    def first_proxy_get(self, path, entry, deadline):
+        """One real proxy GET: no environment proxy, redirect follow, or retry."""
+        headers = {'traceparent': '00-' + self.trace + '-' + uuid.uuid4().hex[:16] + '-01'}
+        request = urllib.request.Request(entry + path, headers=headers, method='GET')
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoProxyRedirect())
+        started = time.monotonic()
+        try:
+            response = opener.open(request, timeout=remaining_timeout(deadline, 150))
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            content, status = response.read(), response.status
+        remaining_timeout(deadline, 150)
+        self.requests.append({'path': path, 'method': 'GET', 'status': status,
+                              'elapsed': time.monotonic() - started, 'base': entry, 'trace_id': self.trace,
+                              'size': len(content), 'sha256': hashlib.sha256(content).hexdigest(),
+                              'attempts': 1, 'redirects_followed': False, 'environment_proxy': False})
+        self.save('requests.json', self.requests)
+        return status, content
+
     def api_retry_operation_busy(self, path, body=None, timeout=180, attempts=40, interval=10):
         """Only structured, safely retryable busy rejection permits replay.
 
@@ -339,6 +497,9 @@ class Run:
                 raise ValueError('Remote E2E namespace ownership mismatch')
         nodes = json.loads(self.kube('get', 'nodes', '-o', 'json'))['items']
         addresses = {a['address'] for n in nodes for a in n['status']['addresses']}
+        if not all(urllib.parse.urlparse(url).hostname in addresses for url in (self.args.url,self.args.proxy_url)):
+            interfaces = json.loads(self.local('ssh','-o','BatchMode=yes','-o','ConnectTimeout=10',self.args.ssh,'ip -j address show'))
+            addresses = node_entry_addresses(addresses,interfaces)
         self.check('entry_targets_test_nodes', all(urllib.parse.urlparse(url).hostname in addresses for url in (self.args.url, self.args.proxy_url)))
         self.baseline = self.inventory()
         self.save('baseline.json', self.baseline)
@@ -348,15 +509,21 @@ class Run:
         pods = json.loads(self.kube('get', 'pods', '-l', selector, '-o', 'json'))['items']
         ready = [p for p in pods if any(c['type'] == 'Ready' and c['status'] == 'True' for c in p['status'].get('conditions', []))]
         self.check('cluster_ready', len(ready) >= 2, [compact_resource(p) for p in pods])
-        forwards = []
+        forwards, allocated_ports = [], set()
         for pod in ready:
-            with socket.socket() as listener:
-                listener.bind(('127.0.0.1', 0))
-                port = listener.getsockname()[1]
-            forwards += ['-L', f'127.0.0.1:{port}:{pod["status"]["podIP"]}:8086']
-            self.entries.append(f'http://127.0.0.1:{port}')
+            for target_port, entries in ((8086, self.entries), (self.args.proxy_port, self.proxy_entries)):
+                while True:
+                    with socket.socket() as listener:
+                        listener.bind(('127.0.0.1', 0))
+                        port = listener.getsockname()[1]
+                    if port not in allocated_ports:
+                        allocated_ports.add(port)
+                        break
+                forwards += ['-L', f'127.0.0.1:{port}:{pod["status"]["podIP"]}:{target_port}']
+                entries.append(f'http://127.0.0.1:{port}')
         self.save('deployment.json', {'name': dep['metadata']['name'], 'uid': dep['metadata']['uid'], 'labels': dep['metadata'].get('labels'), 'images': [c['image'] for c in dep['spec']['template']['spec']['containers']]})
-        self.save('replicas.json', [{'entry': entry, **compact_resource(p)} for entry, p in zip(self.entries, ready)])
+        self.save('replicas.json', [{'entry': entry, 'proxy_entry': proxy, **compact_resource(p)}
+                                    for entry, proxy, p in zip(self.entries, self.proxy_entries, ready)])
         self.tunnel = subprocess.Popen(['ssh', '-N', '-o', 'BatchMode=yes', '-o', 'ExitOnForwardFailure=yes', *forwards, self.args.ssh], stderr=(self.root / 'tunnel.log').open('w'))
         for entry in self.entries:
             deadline = time.monotonic() + 15
@@ -403,6 +570,290 @@ class Run:
         _, data = self.request('/api/v1/userapp/get-file-list?' + urllib.parse.urlencode(payload), base=self.entries[-1], headers={'X-App-Id': self.app})
         names = {f['name'] for f in data.get('files', [])}
         self.check('cross_replica_files', all(f'replica-{i}.txt' in names for i in range(len(self.entries))), names.__str__())
+
+    def dev_compute(self, action, budget, deadline=None, request_id=None, evidence_prefix='readonly-dev'):
+        if action not in ('stop', 'restart'):
+            raise ValueError('Explicit development compute action required')
+        if deadline is None:
+            deadline = time.monotonic() + budget
+        body = {'app_id': self.app, 'app_stage': 'dev', 'service_type': 'userapp',
+                'lifecycle_id': self.lifecycle_id,
+                'request_id': request_id or 'readonly-' + action + '-' + self.id}
+        status, response = self.request('/computer/pod/' + action, body, self.entries[0],
+                                        timeout=remaining_timeout(deadline, 90))
+        remaining_timeout(deadline, 90)
+        view = response.get('data')
+        operation_id = response.get('operation_id')
+        if status not in (200, 202) or response.get('code') != '0000' or response.get('success') is not True:
+            raise AssertionError('Development compute admission failed: ' + str(response))
+        path = '/computer/pod/operations/' + self.app + '/' + str(operation_id)
+        while True:
+            self.save(evidence_prefix + '-' + action + '-operation.json', view)
+            if dev_compute_view(view, self.app, self.lifecycle_id, action, operation_id):
+                if not hasattr(self, 'compute_receipts'):
+                    self.compute_receipts = []
+                self.compute_receipts.append(json.loads(json.dumps(view)))
+                return view
+            time.sleep(min(.2, remaining_timeout(deadline, .2)))
+            view = self.api(path, base=self.entries[-1], timeout=remaining_timeout(deadline, 30))
+            remaining_timeout(deadline, 30)
+
+    def dev_controller(self, expected_uid=None, deadline=None):
+        row = json.loads(self.kube('get', 'statefulset', 'rcoder-app-builder-' + self.app,
+                                   '-o', 'json', deadline=deadline))
+        dev_controller_identity(row, self.app, self.lifecycle_id, expected_uid)
+        return row
+
+    def app_pvc_identities(self, resources):
+        """Compare only this lifecycle's claims; unrelated new apps are allowed."""
+        self.preserve_pvc_baseline(resources)
+        return owned_userapp_pvc_identities(
+            [row for row in resources if row['kind'] == 'PersistentVolumeClaim' and self.owned(row)],
+            self.app, self.lifecycle_id, {row['uid'] for row in getattr(self, 'baseline', [])})
+
+    def preserve_pvc_baseline(self, resources):
+        present = {row['uid']: row for row in resources if row['kind'] == 'PersistentVolumeClaim'}
+        for before in getattr(self, 'baseline', []):
+            if before['kind'] != 'PersistentVolumeClaim':
+                continue
+            after = present.get(before['uid'])
+            if (after is None or after['name'] != before['name'] or after.get('deletionTimestamp')
+                    or (before.get('volumeName') is not None
+                        and after.get('volumeName') != before['volumeName'])):
+                raise AssertionError('A baseline PVC UID or persistent-volume binding changed')
+
+    def stopped_dev_view(self, uid, deadline):
+        row = self.dev_controller(uid, deadline)
+        resources = self.inventory(deadline=deadline)
+        pods = [r for r in resources if r['kind'] == 'Pod'
+                and r['name'].startswith('rcoder-app-builder-' + self.app + '-')]
+        if row.get('spec', {}).get('replicas') != 0 or pods:
+            raise AssertionError('Read-only query woke development compute: ' + str(pods))
+        return {'controller': compact_resource(row), 'replicas': 0,
+                'claims': self.app_pvc_identities(resources)}
+
+    def observe_restarted_dev(self, uid, claims, deadline):
+        """Compute completion can precede kubelet Ready; share its original budget."""
+        observed_uid = None
+        last = None
+        try:
+            while True:
+                remaining_timeout(deadline, 90)
+                controller = self.dev_controller(uid, deadline)
+                resources = self.inventory(deadline=deadline)
+                builders = [r for r in resources if r['kind'] == 'Pod'
+                            and r['name'].startswith('rcoder-app-builder-' + self.app + '-')]
+                current_claims = self.app_pvc_identities(resources)
+                last = {'controller': compact_resource(controller), 'pods': builders,
+                        'claims': current_claims}
+                self.save('readonly-dev-restart-readiness.json', last)
+                remaining_timeout(deadline, 90)
+                if controller.get('spec', {}).get('replicas') != 1 or current_claims != claims:
+                    raise AssertionError('Development restart changed replica intent or PVC identity')
+                if len(builders) > 1:
+                    raise AssertionError('Development restart has multiple builder Pods')
+                if builders:
+                    pod = builders[0]
+                    if (not pod.get('uid') or pod['uid'] == self.builder_uid
+                            or pod.get('deletionTimestamp')
+                            or (observed_uid is not None and pod['uid'] != observed_uid)):
+                        raise AssertionError('Development restart Pod identity changed')
+                    observed_uid = pod['uid']
+                    if pod.get('phase') not in ('Pending', 'Running'):
+                        raise AssertionError('Unexpected development restart Pod phase')
+                    if (pod['phase'] == 'Running'
+                            and any(c.get('type') == 'Ready' and c.get('status') == 'True'
+                                    for c in pod.get('conditions', []))):
+                        return controller, builders
+                time.sleep(min(.2, remaining_timeout(deadline, .2)))
+        except TimeoutError as error:
+            raise TimeoutError('Development restart Ready deadline expired; last observation: '
+                               + str(last)) from error
+
+    def patch_readonly_annotation(self, uid, value, deadline):
+        row = self.dev_controller(uid, deadline)
+        meta = row['metadata']
+        intent = self.dev_readonly_annotation
+        current = (meta.get('annotations') or {}).get(intent['key'])
+        if current is not None and current not in intent['values']:
+            raise AssertionError('Refusing to overwrite another annotation value')
+        # Record intent before dispatch so an unknown SSH outcome can still be
+        # cleaned by its exact UID and this run's issued values.
+        intent['values'].add(value)
+        patch = {'metadata': {'uid': uid, 'resourceVersion': meta['resourceVersion'],
+                              'annotations': {intent['key']: value}}}
+        result = json.loads(self.kube('patch', 'statefulset', meta['name'], '--type=merge',
+                                     '-p', json.dumps(patch), '-o', 'json', deadline=deadline))
+        after = dev_controller_identity(result, self.app, self.lifecycle_id, uid)
+        if ((after.get('annotations') or {}).get(intent['key']) != value
+                or after['resourceVersion'] == meta['resourceVersion']):
+            raise AssertionError('Conditional test annotation did not advance resourceVersion')
+        return after['resourceVersion']
+
+    def remove_readonly_annotation(self):
+        intent = getattr(self, 'dev_readonly_annotation', None)
+        if intent is None:
+            return
+        deadline = time.monotonic() + 30
+        row = self.dev_controller(intent['uid'], deadline)
+        meta = row['metadata']
+        current = (meta.get('annotations') or {}).get(intent['key'])
+        if current is None:
+            self.dev_readonly_annotation = None
+            return
+        if current not in intent['values']:
+            raise AssertionError('Refusing removal of a foreign annotation value')
+        path = '/metadata/annotations/' + intent['key'].replace('~', '~0').replace('/', '~1')
+        patch = [{'op': 'test', 'path': '/metadata/uid', 'value': intent['uid']},
+                 {'op': 'test', 'path': '/metadata/resourceVersion', 'value': meta['resourceVersion']},
+                 {'op': 'test', 'path': path, 'value': current}, {'op': 'remove', 'path': path}]
+        result = json.loads(self.kube('patch', 'statefulset', meta['name'], '--type=json',
+                                     '-p', json.dumps(patch), '-o', 'json', deadline=deadline))
+        after = dev_controller_identity(result, self.app, self.lifecycle_id, intent['uid'])
+        if intent['key'] in (after.get('annotations') or {}):
+            raise AssertionError('Test annotation remains after conditional removal')
+        self.dev_readonly_annotation = None
+
+    def readonly_dev_pair(self, entry, deadline):
+        payload = {'page': 1, 'page_size': 10, 'filters': {'app_ids': [self.app]}}
+        storage = self.api('/api/v1/userapp/storage/dev/query', payload, entry,
+                           timeout=remaining_timeout(deadline, 15))
+        remaining_timeout(deadline, 15)
+        items = storage.get('items')
+        storage_ok = (isinstance(items, list) and len(items) == 1
+                      and items[0].get('app_id') == self.app and items[0].get('exists') is True
+                      and items[0].get('is_orphan') is False)
+        path = '/api/v1/userapp/' + self.app + '/dev/logs/sources/query?' + urllib.parse.urlencode({'user_id': self.user})
+        status, logs = self.request(path, {}, entry, timeout=remaining_timeout(deadline, 15))
+        remaining_timeout(deadline, 15)
+        if not storage_ok or not stopped_dev_logs(status, logs):
+            raise AssertionError('Stopped development read contract differs: ' + str({'storage': storage, 'logs': logs}))
+        return {'entry': self.entries.index(entry), 'storage_nonorphan': True,
+                'logs_stopped': True, 'logs_code': logs['code']}
+
+    def dev_git(self, suffix, extra=None, entry=None, query=False):
+        context = {'workspaceType': 'userApp', 'serviceType': 'userapp', 'appId': self.app,
+                   'workspacePath': '/home/user/' + self.app, 'userId': self.user, 'cId': self.app}
+        context.update(extra or {})
+        headers = {'X-Service-Type': 'userapp', 'X-Workspace-Type': 'userApp', 'X-App-Id': self.app}
+        path = '/api/git/' + suffix
+        status, response = self.request(path + ('?' + urllib.parse.urlencode(context) if query else ''),
+                                        None if query else context, entry, headers)
+        if status != 200 or response.get('success') is not True:
+            raise AssertionError('Development Git request failed: ' + str(response))
+        return response
+
+    def dev_data_proof(self, filename, commit):
+        proof = {'commit': commit}
+        for ref in ('worktree', commit):
+            response = self.dev_git('file-content', {'filePath': filename, 'ref': ref}, self.entries[-1])
+            content = response.get('content')
+            if content != self.id:
+                raise AssertionError('Original development sentinel content differs')
+            proof['sentinel_sha256' if ref == 'worktree' else 'git_blob_sha256'] = hashlib.sha256(content.encode()).hexdigest()
+        log = self.dev_git('log', {'maxCount': 10}, self.entries[-1], query=True)
+        if not any(row.get('hash') == commit for row in log.get('commits', [])):
+            raise AssertionError('Original development Git commit is missing')
+        payload = {'app_id': self.app, 'user_id': self.user}
+        status, files = self.request('/api/v1/userapp/get-file-list?' + urllib.parse.urlencode(payload),
+                                     base=self.entries[-1], headers={'X-App-Id': self.app})
+        names = {f['name'] for f in files.get('files', [])}
+        expected = {filename, *('replica-' + str(i) + '.txt' for i in range(len(self.entries)))}
+        if status != 200 or files.get('success') is not True or not expected.issubset(names):
+            raise AssertionError('Original development files are missing')
+        proof['files'] = sorted(expected)
+        return proof
+
+    def dev_readonly_locator(self):
+        """Real RV churn plus no-wake checks; deterministic cross-capture is a unit regression."""
+        if len(self.entries) < 2 or len(set(self.entries[:2])) != 2 or not self.lifecycle_id:
+            raise AssertionError('Two distinct RCoder replicas and a lifecycle are required')
+        filename = 'readonly-sentinel-' + self.id[:12] + '.txt'
+        status, seeded = self.request('/api/v1/userapp/generate-file',
+                                      {'app_id': self.app, 'user_id': self.user,
+                                       'file_name': filename, 'content': self.id}, self.entries[0],
+                                      {'X-App-Id': self.app})
+        if status != 200 or seeded.get('success') is not True:
+            raise AssertionError('Development sentinel file creation failed')
+        self.dev_git('init', entry=self.entries[0])
+        committed = self.dev_git('commit', {'files': [filename], 'message': 'e2e readonly locator ' + self.id}, self.entries[0])
+        commit = committed.get('commit')
+        if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit):
+            raise AssertionError('Sentinel seed did not create an actual Git commit')
+        data_before = self.dev_data_proof(filename, commit)
+        before = self.dev_controller()
+        uid = before['metadata']['uid']
+        claims = self.app_pvc_identities(self.inventory())
+        evidence = {'controller_uid': uid, 'old_pod_uid': self.builder_uid, 'claims': claims,
+                    'data_before': data_before, 'reads': [], 'versions': [],
+                    'cross_capture_rv_deterministic': False}
+        self.save('dev-readonly-locator.json', evidence)
+        self.check('dev_readonly_seed_data', True, data_before)
+        self.dev_sentinel = (filename, commit, data_before)
+        stop = self.dev_compute('stop', 120)
+        self.check('dev_compute_stop_identity', True, stop)
+        deadline = time.monotonic() + 90
+        stopped = self.stopped_dev_view(uid, deadline)
+        self.check('dev_stopped_resource_identity', stopped['claims'] == claims, stopped)
+        key = 'rcoder.e2e/readonly-locator-' + self.id[:12]
+        row = self.dev_controller(uid, deadline)
+        if key in (row['metadata'].get('annotations') or {}):
+            raise AssertionError('Refusing an existing test annotation')
+        self.dev_readonly_annotation = {'uid': uid, 'key': key, 'values': set()}
+        failure = None
+        try:
+            # Concurrent reads and UID/RV-conditioned metadata writes exercise
+            # genuine API-server RV changes without changing the Pod template.
+            # The report deliberately makes no per-capture scheduling claim.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                for index in range(4):
+                    futures = [pool.submit(self.readonly_dev_pair, entry, deadline) for entry in self.entries[:2]]
+                    evidence['versions'].append(self.patch_readonly_annotation(uid, self.id + ':' + str(index), deadline))
+                    evidence['reads'].extend(future.result() for future in futures)
+                    current = self.stopped_dev_view(uid, deadline)
+                    if current['claims'] != claims:
+                        raise AssertionError('Read-only query changed a PVC identity')
+                    self.save('dev-readonly-locator.json', evidence)
+            lifecycle = self.api('/api/v1/userapp/' + self.app + '/lifecycle?'
+                                 + urllib.parse.urlencode({'user_id': self.user}),
+                                 timeout=remaining_timeout(deadline, 15))
+            remaining_timeout(deadline, 15)
+            if (lifecycle.get('lifecycle_id') != self.lifecycle_id or lifecycle.get('state') != 'Active'
+                    or lifecycle.get('lifecycle_epoch') != 1):
+                raise AssertionError('Development lifecycle changed during read-only queries')
+            self.check('dev_stopped_rv_advanced', len(set(evidence['versions'])) == 4, evidence['versions'])
+            self.check('dev_stopped_storage_both_replicas', {r['entry'] for r in evidence['reads'] if r['storage_nonorphan']} == {0, 1})
+            self.check('dev_stopped_logs_both_replicas', {r['entry'] for r in evidence['reads'] if r['logs_stopped']} == {0, 1})
+            self.check('dev_stopped_no_wake', True, current)
+        except (Exception, KeyboardInterrupt) as error:
+            failure = error
+        try:
+            self.remove_readonly_annotation()
+        except (Exception, KeyboardInterrupt) as cleanup_error:
+            evidence['annotation_cleanup_error'] = repr(cleanup_error)
+            evidence['scenario_error'] = repr(failure) if failure else None
+            self.save('dev-readonly-locator.json', evidence)
+            if failure:
+                raise RuntimeError('Read-only scenario and annotation cleanup both failed: ' + repr(cleanup_error)) from failure
+            raise
+        if failure:
+            raise failure
+        self.check('dev_readonly_annotation_removed', True)
+        restart_deadline = time.monotonic() + 300
+        restarted = self.dev_compute('restart', 300, deadline=restart_deadline)
+        controller, builders = self.observe_restarted_dev(uid, claims, restart_deadline)
+        valid = (len(builders) == 1 and builders[0]['uid'] != self.builder_uid
+                 and builders[0].get('phase') == 'Running'
+                 and any(c.get('type') == 'Ready' and c.get('status') == 'True' for c in builders[0].get('conditions', []))
+                 and controller.get('spec', {}).get('replicas') == 1)
+        self.check('dev_compute_restart_identity', valid, {'operation': restarted, 'pods': builders})
+        self.builder_uid = builders[0]['uid']
+        data_after = self.dev_data_proof(filename, commit)
+        after_claims = self.app_pvc_identities(self.inventory())
+        evidence.update(new_pod_uid=self.builder_uid, data_after=data_after,
+                        controller_uid_after=controller['metadata']['uid'], claims_after=after_claims)
+        self.save('dev-readonly-locator.json', evidence)
+        self.check('dev_readonly_data_preserved', data_before == data_after and claims == after_claims, evidence)
 
     def build(self, version):
         buf = io.BytesIO()
@@ -474,6 +925,243 @@ startup_probe = "process"
             _, past = self.request(stream_path + '&from_seq=' + str(max(seqs) + 100), raw=True, timeout=15)
             self.check('sse_past_terminal', not re.search(rb'^data:', past, re.M), past.decode())
         return {'url': self.args.internal_url.rstrip('/') + artifact, 'sha256': sha}, release
+
+    def compute_history(self, receipts, lifecycle):
+        observed = []
+        for receipt in receipts:
+            if (receipt.get('app_id') != self.app or receipt.get('lifecycle_id') != lifecycle
+                    or receipt.get('action') not in ('stop', 'restart')
+                    or not dev_compute_view(receipt, self.app, lifecycle, receipt.get('action'),
+                                            receipt.get('operation_id'))):
+                raise AssertionError('Historical compute receipt is not this application lifecycle')
+            view = self.api('/computer/pod/operations/' + self.app + '/' + receipt['operation_id'],
+                            base=self.entries[-1])
+            if not historical_compute_view_preserved(receipt, view):
+                raise AssertionError('Historical compute receipt changed')
+            observed.append(view)
+        return observed
+
+    def capture_recreated_resources(self, filename):
+        rows = [row for row in self.inventory() if self.owned(row)]
+        self.save(filename, rows)
+        baseline_uids = {row['uid'] for row in self.baseline}
+        if any(row['uid'] in baseline_uids for row in rows):
+            raise AssertionError('Refusing recreated cleanup of a preexisting resource identity')
+        claims = owned_userapp_pvc_identities(rows, self.app, self.lifecycle_id,
+                                             baseline_uids)
+        return rows, claims
+
+    def recreated_runtime_identity(self):
+        rows = [row for row in self.inventory() if self.owned(row)
+                and row['kind'] in ('StatefulSet', 'Deployment', 'Pod', 'PersistentVolumeClaim')]
+        controller = self.dev_controller()
+        return {'resources': sorted((row['kind'], row['name'], row['uid'], row.get('generation')) for row in rows),
+                'dev_replicas': controller.get('spec', {}).get('replicas')}
+
+    def recreate_l1_business(self):
+        """Seed actual L1 business and public history without traffic/lock fault scenarios."""
+        filename = 'recreate-l1-sentinel-' + self.id[:12] + '.txt'
+        status, result = self.request('/api/v1/userapp/generate-file',
+            {'app_id': self.app, 'user_id': self.user, 'file_name': filename, 'content': self.id},
+            self.entries[0], {'X-App-Id': self.app})
+        if status != 200 or result.get('success') is not True:
+            raise AssertionError('L1 sentinel write failed')
+        self.dev_git('init', entry=self.entries[0])
+        committed = self.dev_git('commit', {'files': [filename], 'message': 'e2e recreate L1 ' + self.id},
+                                  self.entries[0])
+        commit = committed.get('commit')
+        if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit):
+            raise AssertionError('L1 fixture did not create an actual Git commit')
+        data_before = self.dev_data_proof(filename, commit)
+        self.check('recreate_l1_files_git', True, data_before)
+        artifact, _release = self.build('L1')
+        request_id = 'recreate-l1-deploy-' + self.id
+        deployed = self.api('/api/v1/userapp/' + self.app + '/start',
+            {'user_id': self.user, 'lifecycle_id': self.lifecycle_id, 'request_id': request_id, **artifact},
+            self.entries[0], timeout=360)
+        operation = self.operation_view(request_id)
+        self.check('recreate_l1_deploy_operation', operation and operation['kind'] == 'StartDeployment'
+                   and operation['scope'] == 'Prod' and operation['state'] == 'Succeeded'
+                   and deployed.get('operation_id') == operation['operation_id'], operation)
+        self.check('recreate_l1_content', self.content(self.id + '-L1'))
+        controller = self.dev_controller()
+        claims = self.app_pvc_identities(self.inventory())
+        stop = self.dev_compute('stop', 120, request_id='recreate-l1-stop-' + self.id,
+                                evidence_prefix='recreate-l1-dev')
+        stopped = self.stopped_dev_view(controller['metadata']['uid'], time.monotonic() + 90)
+        deadline = time.monotonic() + 300
+        restart = self.dev_compute('restart', 300, deadline=deadline,
+                                   request_id='recreate-l1-restart-' + self.id,
+                                   evidence_prefix='recreate-l1-dev')
+        _controller, builders = self.observe_restarted_dev(controller['metadata']['uid'], claims, deadline)
+        self.builder_uid = builders[0]['uid']
+        history = [stop, restart]
+        observed = self.compute_history(history, self.lifecycle_id)
+        self.check('recreate_l1_compute_history', len(observed) == 2
+                   and stop['operation_id'] != restart['operation_id']
+                   and {row['action'] for row in observed} == {'stop', 'restart'}
+                   and stopped['claims'] == claims, observed)
+        data_after = self.dev_data_proof(filename, commit)
+        self.check('recreate_l1_data_preserved', data_before == data_after
+                   and set(claims).issubset(self.app_pvc_identities(self.inventory()))
+                   and self.content(self.id + '-L1'), {'before': data_before, 'after': data_after})
+        self.save('recreate-l1-business.json', {'lifecycle_id': self.lifecycle_id,
+                  'history': observed, 'claims': claims, 'data': data_after})
+
+    def recreate_lifecycle(self):
+        """Delete/recreate is an explicit business phase, never finally cleanup."""
+        if not self.created or not self.lifecycle_id:
+            raise AssertionError('Recreate requires this invocation\'s registered L1')
+        old_lifecycle = self.lifecycle_id
+        rows, old_claims = self.capture_recreated_resources('before-cleanup.json')
+        history = [row for row in getattr(self, 'compute_receipts', [])
+                   if row.get('lifecycle_id') == old_lifecycle]
+        self.save('recreate-compute-history-before.json', history)
+        self.delete_owned_resources(rows)
+        self.poll(lambda: [row for row in self.inventory() if self.owned(row)], lambda rows: not rows, 180)
+        tombstone = self.lifecycle()
+        self.save('lifecycle-tombstone.json', tombstone)
+        self.check('tombstone_deleted', tombstone['state'] == 'Deleted'
+                   and tombstone['lifecycle_id'] == old_lifecycle, tombstone)
+        status, rejected = self.request('/api/v1/userapp/workspace',
+                                        {'app_id': self.app, 'user_id': self.user}, timeout=120)
+        self.save('tombstone-ensure.json', rejected)
+        self.check('tombstone_old_ensure_rejected', status == 200 and rejected.get('code') != '0000', rejected)
+        recreated = self.api('/api/v1/userapp/' + self.app + '/recreate',
+            {'user_id': self.user, 'expected_lifecycle_id': old_lifecycle,
+             'request_id': 'recreate-' + self.id}, timeout=120)
+        self.save('lifecycle-recreated.json', recreated)
+        # Capture the newly acknowledged lifecycle before assertions so a later
+        # business failure still permits only its exact original-API cleanup.
+        if isinstance(recreated.get('lifecycle_id'), str) and recreated['lifecycle_id']:
+            self.lifecycle_id = recreated['lifecycle_id']
+            self.recreated = self.lifecycle_id != old_lifecycle
+        self.check('recreate_new_lifecycle', self.recreated
+                   and recreated['lifecycle_epoch'] == tombstone['lifecycle_epoch'] + 1
+                   and recreated['state'] == 'Active', recreated)
+        self.recreated_business(old_lifecycle, history, old_claims)
+
+    def recreated_business(self, old_lifecycle, history, old_claims):
+        """Use the recreated lifecycle through business APIs, then prove old fences still hold."""
+        payload = {'app_id': self.app, 'user_id': self.user}
+        for entry in self.entries[:2]:
+            self.api('/api/v1/userapp/workspace', payload, entry, timeout=240)
+        rows, claims = self.capture_recreated_resources('recreate-after-ensure.json')
+        controller = self.dev_controller()
+        builders = [row for row in rows if row['kind'] == 'Pod'
+                    and row['name'].startswith('rcoder-app-builder-' + self.app + '-')]
+        self.check('recreate_workspace_usable', len(builders) == 1 and bool(claims)
+                   and controller.get('spec', {}).get('replicas') == 1, rows)
+        self.builder_uid = builders[0]['uid']
+        self.check('recreate_owned_pvc_identity',
+                   not ({uid for _name, uid in claims} & {uid for _name, uid in old_claims}),
+                   {'previous': old_claims, 'current': claims})
+
+        filename = 'recreated-sentinel-' + self.id[:12] + '.txt'
+        for index, entry in enumerate(self.entries):
+            status, result = self.request('/api/v1/userapp/generate-file',
+                                          {**payload, 'file_name': 'replica-' + str(index) + '.txt',
+                                           'content': self.id}, entry, {'X-App-Id': self.app})
+            if status != 200 or result.get('success') is not True:
+                raise AssertionError('Recreated cross-replica file write failed')
+        status, result = self.request('/api/v1/userapp/generate-file',
+                                      {**payload, 'file_name': filename, 'content': self.id},
+                                      self.entries[0], {'X-App-Id': self.app})
+        if status != 200 or result.get('success') is not True:
+            raise AssertionError('Recreated sentinel write failed')
+        self.dev_git('init', entry=self.entries[0])
+        committed = self.dev_git('commit', {'files': [filename], 'message': 'e2e recreated lifecycle ' + self.id},
+                                  self.entries[0])
+        commit = committed.get('commit')
+        if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit):
+            raise AssertionError('Recreated fixture did not create an actual Git commit')
+        data_before = self.dev_data_proof(filename, commit)
+        self.check('recreate_files_git', True, data_before)
+        artifact, _release = self.build('L2')
+        request_id = 'recreate-deploy-' + self.id
+        deployed = self.api('/api/v1/userapp/' + self.app + '/start',
+                            {'user_id': self.user, 'lifecycle_id': self.lifecycle_id,
+                             'request_id': request_id, **artifact}, self.entries[0], timeout=360)
+        operation = self.operation_view(request_id)
+        self.check('recreate_deploy_operation', operation and operation['kind'] == 'StartDeployment'
+                   and operation['scope'] == 'Prod' and operation['state'] == 'Succeeded'
+                   and deployed.get('operation_id') == operation['operation_id'], operation)
+        self.check('recreate_content_L2', self.content(self.id + '-L2'))
+
+        # Freeze actual L2 resources before sending explicitly stale L1 intents.
+        # A code-only refusal is insufficient if it also changed the current Pod.
+        before_stale = self.recreated_runtime_identity()
+        rejected = []
+        for action in ('stop', 'restart'):
+            status, response = self.request('/computer/pod/' + action,
+                {'app_id': self.app, 'app_stage': 'dev', 'service_type': 'userapp',
+                 'lifecycle_id': old_lifecycle, 'request_id': 'recreate-old-' + action + '-' + self.id},
+                self.entries[0], timeout=90)
+            rejected.append({'action': action, 'status': status, 'response': response})
+            if not stale_lifecycle_rejected(status, response, compute=True):
+                raise AssertionError('Old lifecycle compute request was not rejected: ' + str(response))
+        status, response = self.request('/api/v1/userapp/' + self.app + '/start',
+            {'user_id': self.user, 'lifecycle_id': old_lifecycle,
+             'request_id': 'recreate-old-deploy-' + self.id, **artifact}, self.entries[-1], timeout=90)
+        rejected.append({'action': 'start_deployment', 'status': status, 'response': response})
+        after_stale = self.recreated_runtime_identity()
+        self.save('recreate-stale-lifecycle.json', {'before': before_stale, 'after': after_stale,
+                                                  'responses': rejected})
+        self.check('recreate_old_lifecycle_rejected', stale_lifecycle_rejected(status, response)
+                   and before_stale == after_stale and self.content(self.id + '-L2'), rejected)
+
+        claims_before_stop = self.app_pvc_identities(self.inventory())
+        controller_uid = controller['metadata']['uid']
+        stopped = self.dev_compute('stop', 120, request_id='recreate-stop-' + self.id,
+                                   evidence_prefix='recreate-dev')
+        view = self.stopped_dev_view(controller_uid, time.monotonic() + 90)
+        old_ids = {row['operation_id'] for row in history}
+        self.check('recreate_compute_stop', stopped['operation_id'] not in old_ids
+                   and view['claims'] == claims_before_stop, {'operation': stopped, 'resources': view})
+        restart_deadline = time.monotonic() + 300
+        restarted = self.dev_compute('restart', 300, deadline=restart_deadline,
+                                     request_id='recreate-restart-' + self.id, evidence_prefix='recreate-dev')
+        _controller, builders = self.observe_restarted_dev(controller_uid, claims_before_stop, restart_deadline)
+        self.check('recreate_compute_restart', restarted['operation_id'] not in old_ids
+                   and restarted['operation_id'] != stopped['operation_id'] and len(builders) == 1,
+                   {'operation': restarted, 'pods': builders})
+        self.builder_uid = builders[0]['uid']
+        data_after = self.dev_data_proof(filename, commit)
+        _rows, final_claims = self.capture_recreated_resources('recreate-after-business.json')
+        current = self.lifecycle()
+        self.check('recreate_data_preserved', data_before == data_after
+                   and set(claims).issubset(final_claims) and current['lifecycle_id'] == self.lifecycle_id
+                   and current['state'] == 'Active' and self.content(self.id + '-L2'),
+                   {'before': data_before, 'after': data_after, 'claims': final_claims})
+        observed_history = self.compute_history(history, old_lifecycle)
+        self.save('recreate-compute-history.json', {'before': history, 'after': observed_history})
+        self.check('recreate_history_preserved', bool(history)
+                   and {row['action'] for row in history} == {'stop', 'restart'}
+                   and len(observed_history) == len(history)
+                   and all(historical_compute_view_preserved(before, after)
+                           for before, after in zip(history, observed_history)), observed_history)
+
+    def delete_owned_resources(self, rows):
+        """Reuse exact per-lifecycle requests if finally follows an unknown reply."""
+        identity = hashlib.sha256((self.id + ':' + (self.lifecycle_id or 'unresolved')).encode()).hexdigest()[:32]
+        payload = {'user_id': self.user}
+        if self.lifecycle_id:
+            payload['lifecycle_id'] = self.lifecycle_id
+        if any(row['kind'] == 'Deployment' and row['name'] == 'rcoder-app-' + self.app for row in rows):
+            self.api_retry_operation_busy('/api/v1/userapp/' + self.app + '/prod/delete',
+                {**payload, 'purge': True, 'request_id': 'e2e-prod-delete-' + identity})
+        self.api_retry_operation_busy('/api/v1/userapp/' + self.app + '/delete/app',
+            {**payload, 'request_id': 'e2e-app-delete-' + identity})
+
+    def cleanup_recreated(self):
+        """Cleanup remains eligible even if a recreated business assertion fails."""
+        rows, _claims = self.capture_recreated_resources('recreate-before-cleanup.json')
+        self.delete_owned_resources(rows)
+        final = self.lifecycle()
+        self.check('recreate_deleted', final['state'] == 'Deleted'
+                   and final['lifecycle_id'] == self.lifecycle_id, final)
+        remaining = self.poll(lambda: [row for row in self.inventory() if self.owned(row)], lambda rows: not rows, 180)
+        self.check('cleanup', not remaining, remaining)
 
     def prod_pod(self, deadline=None):
         rows = self.inventory(deadline=deadline)
@@ -901,6 +1589,47 @@ startup_probe = "process"
                 time.sleep(remaining_timeout(deadline, 2))
         return result[0] == 200
 
+    def traffic_wake(self, previous_pod, claims_before, data_before):
+        """The first concurrent business requests must wake compute without ensure/start."""
+        if len(self.proxy_entries) < 2 or len(set(self.proxy_entries[:2])) != 2:
+            raise AssertionError('Two distinct captured replica proxy entries are required for traffic wake')
+        path = f'/api/v1/userapp/proxy/app/prod/{self.user}/{self.app}/'
+        deadline = time.monotonic() + 180
+        # The two SSH forwards bind these requests to separate captured main
+        # replicas, rather than depending on an unspecified load-balancer choice.
+        def first_request(entry):
+            result = self.first_proxy_get(path, entry, deadline)
+            remaining_timeout(deadline, 150)
+            return result
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(first_request, self.proxy_entries[:2]))
+        self.check('traffic_wake_without_start',
+                   all(status == 200 and content == (self.id + '-B').encode() for status, content in results),
+                   [{'entry': entry, 'status': status, 'sha256': hashlib.sha256(content).hexdigest()}
+                    for entry, (status, content) in zip(self.proxy_entries[:2], results)])
+        awakened = self.prod_pod()
+        self.save('production-wake.json', awakened)
+        self.check('traffic_wake_single_instance', awakened['uid'] != previous_pod['uid']
+                   and awakened.get('phase') == 'Running'
+                   and any(row.get('type') == 'Ready' and row.get('status') == 'True'
+                           for row in awakened.get('conditions', [])), awakened)
+        claims_after = self.app_pvc_identities(self.inventory())
+        filename, commit, _initial = self.dev_sentinel
+        data_after = self.dev_data_proof(filename, commit)
+        self.check('traffic_wake_pvc_data_preserved', claims_before == claims_after and data_before == data_after,
+                   {'claims_before': claims_before, 'claims_after': claims_after,
+                    'data_before': data_before, 'data_after': data_after})
+        self.check('wake', True)
+        self.check('wake_content_B', True)
+        self.check('wake_new_pod', awakened['uid'] != previous_pod['uid'], awakened['uid'])
+        # Keep the former explicit-Start coverage, after traffic already restored
+        # service. It must reuse the new Pod and cannot act as a hidden pre-wake.
+        self.api('/api/v1/userapp/' + self.app + '/start', {'user_id': self.user}, timeout=240)
+        explicit = self.prod_pod()
+        self.check('wake_explicit_start_idempotent', explicit['uid'] == awakened['uid']
+                   and self.content(self.id + '-B'), {'traffic_pod': awakened['uid'], 'explicit_pod': explicit['uid']})
+        return awakened
+
     def worker_running(self, pod):
         # Inspect the process and its actual port from the lock; business HTTP
         # working alone does not prove that an enabled worker started correctly.
@@ -971,6 +1700,12 @@ print(json.dumps(out))'''
         self.lock_restart_wait(artifact_b)
         self.lock_start_waits(artifact_b)
         self.lease_dead_holder_takeover()
+        claims_before_stop = owned_userapp_pvc_identities(
+            [row for row in self.inventory() if self.owned(row)], self.app, self.lifecycle_id,
+            {row['uid'] for row in self.baseline})
+        filename, commit, _initial = self.dev_sentinel
+        data_before_stop = self.dev_data_proof(filename, commit)
+        before_stop = self.prod_pod()
         stop_request_id = 'stop-' + uuid.uuid4().hex
         for _ in range(2):
             status, envelope = self.request('/api/v1/userapp/' + self.app + '/stop?' + urllib.parse.urlencode({'user_id': self.user, 'request_id': stop_request_id}), {})
@@ -982,56 +1717,74 @@ print(json.dumps(out))'''
                    and view['kind'] == 'Stop' and view['state'] == 'Succeeded' and view['lifecycle_id'] == self.lifecycle_id, view)
         stopped = self.poll(lambda: [r for r in self.inventory() if r['kind'] == 'Pod' and r['name'].startswith('rcoder-app-' + self.app + '-')], lambda rows: not rows, 120)
         self.check('stop_zero_pods', not stopped)
-        self.api(path, {'user_id': self.user}, timeout=240)
-        self.check('wake', True)
-        self.check('wake_content_B', self.content(self.id + '-B'))
-        awakened = self.prod_pod()
-        self.save('production-wake.json', awakened)
-        self.check('wake_new_pod', awakened['uid'] != after['uid'], awakened['uid'])
+        self.traffic_wake(before_stop, claims_before_stop, data_before_stop)
         stable = self.lifecycle()
         self.check('lifecycle_stable_stop_wake', stable['lifecycle_id'] == self.lifecycle_id
                    and stable['state'] == 'Active' and stable['lifecycle_epoch'] == 1, stable)
         # delete 乐观锁护栏（stop/wake 换代后的过期版本必须被拒）
         self.delete_version_guard()
 
+    def exercise(self):
+        self.prepare()
+        self.workspace()
+        if self.scenario == 'recreate':
+            self.recreate_l1_business()
+        elif self.scenario == 'hot_recovery':
+            from k8s_hot_recovery import exercise
+            exercise(self)
+            return
+        elif self.scenario == 'default_recovery':
+            from k8s_default_recovery import exercise
+            exercise(self)
+            return
+        elif self.scenario == 'all':
+            self.dev_readonly_locator()
+            a, ra = self.build('A')
+            b, rb = self.build('B')
+            self.deploy(a, ra, b, rb)
+        else:
+            raise ValueError('Unknown K8s UserApp scenario')
+        self.recreate_lifecycle()
+
     def cleanup(self):
+        failure = None
+        try:
+            self.cleanup_owned()
+        except (Exception, KeyboardInterrupt) as error:
+            failure = error
+        try:
+            self.preserve_baseline()
+        except (Exception, KeyboardInterrupt) as error:
+            if failure:
+                raise RuntimeError('Application cleanup and baseline preservation both failed: '
+                                   + repr(error)) from failure
+            raise
+        if failure:
+            raise failure
+
+    def cleanup_owned(self):
+        if self.created and getattr(self, 'scenario', 'all') == 'default_recovery':
+            from k8s_default_recovery import cleanup
+            cleanup(self)
+            return
         if self.created:
+            if getattr(self, 'recreated', False):
+                self.cleanup_recreated()
+                return
             rows = self.inventory()
             owned = [r for r in rows if self.owned(r)]
             self.save('before-cleanup.json', owned)
             baseline_uids = {r['uid'] for r in self.baseline}
             if any(r['uid'] in baseline_uids for r in owned):
                 raise AssertionError('Refusing cleanup of a preexisting identity')
-            if any(r['kind'] == 'Deployment' and r['name'] == 'rcoder-app-' + self.app for r in owned):
-                self.api_retry_operation_busy('/api/v1/userapp/' + self.app + '/prod/delete', {'user_id': self.user, 'purge': True})
-            self.api_retry_operation_busy('/api/v1/userapp/' + self.app + '/delete/app', {'user_id': self.user})
-            if self.lifecycle_id is None:
-                remaining = self.poll(lambda: [r for r in self.inventory() if self.owned(r)], lambda r: not r, 180)
-                self.check('cleanup', not remaining, remaining)
-                return self.preserve_baseline()
-            tombstone = self.lifecycle()
-            self.save('lifecycle-tombstone.json', tombstone)
-            self.check('tombstone_deleted', tombstone['state'] == 'Deleted'
-                       and tombstone['lifecycle_id'] == self.lifecycle_id, tombstone)
-            status, rejected = self.request('/api/v1/userapp/workspace', {'app_id': self.app, 'user_id': self.user}, timeout=120)
-            self.save('tombstone-ensure.json', rejected)
-            self.check('tombstone_old_ensure_rejected', status == 200 and rejected.get('code') != '0000', rejected)
-            recreated = self.api('/api/v1/userapp/' + self.app + '/recreate', {'user_id': self.user, 'expected_lifecycle_id': self.lifecycle_id, 'request_id': 'recreate-' + self.id}, timeout=120)
-            self.save('lifecycle-recreated.json', recreated)
-            self.check('recreate_new_lifecycle', recreated['lifecycle_id'] != self.lifecycle_id
-                       and recreated['lifecycle_epoch'] == tombstone['lifecycle_epoch'] + 1
-                       and recreated['state'] == 'Active', recreated)
-            self.api('/api/v1/userapp/' + self.app + '/delete/app', {'user_id': self.user, 'lifecycle_id': recreated['lifecycle_id']}, timeout=180)
-            final = self.lifecycle()
-            self.check('recreate_deleted', final['state'] == 'Deleted'
-                       and final['lifecycle_id'] == recreated['lifecycle_id'], final)
+            self.delete_owned_resources(owned)
             remaining = self.poll(lambda: [r for r in self.inventory() if self.owned(r)], lambda r: not r, 180)
             self.check('cleanup', not remaining, remaining)
-        self.preserve_baseline()
 
     def preserve_baseline(self):
         after = self.inventory()
         self.save('after-cleanup.json', after)
+        self.preserve_pvc_baseline(after)
         # Workload/PVC UIDs are stable; unrelated Pods can legitimately roll independently.
         stable = {'PersistentVolumeClaim', 'Deployment', 'StatefulSet'}
         preserved = {(r['kind'], r['name'], r['uid']) for r in after}
@@ -1044,13 +1797,18 @@ def main():
     parser.add_argument('--ssh', default=os.environ.get('TEST_K8S_SSH'), required=not os.environ.get('TEST_K8S_SSH'))
     parser.add_argument('--namespace', default='nuwax-k8s-test')
     parser.add_argument('--context')
+    parser.add_argument('--kube-server', help='Explicit Kubernetes API server; normal TLS verification remains enabled')
     parser.add_argument('--environment-id')
     parser.add_argument('--deployment', default='nuwax-k8s-test-rcoder', help='RCoder workload name')
     parser.add_argument('--workload-kind', choices=['deployment', 'statefulset'], default='deployment',
                         help='Use statefulset for the Helm per-replica-cache deployment')
     parser.add_argument('--url', required=True)
     parser.add_argument('--proxy-url', required=True)
+    parser.add_argument('--proxy-port', type=int, default=8088,
+                        help='RCoder proxy listen port inside each captured main Pod')
     parser.add_argument('--internal-url', default='http://nuwax-k8s-test-rcoder:8086')
+    parser.add_argument('--scenario', choices=SCENARIO_REQUIRED, default='all',
+                        help='all keeps the full 81-step contract; recreate and hot_recovery are independent scenarios')
     args = parser.parse_args()
     run = Run(args)
     def interrupt(*_):
@@ -1058,11 +1816,7 @@ def main():
     signal.signal(signal.SIGTERM, interrupt)
     error = None
     try:
-        run.prepare()
-        run.workspace()
-        a, ra = run.build('A')
-        b, rb = run.build('B')
-        run.deploy(a, ra, b, rb)
+        run.exercise()
     except (Exception, KeyboardInterrupt) as exc:
         error = repr(exc)
         print(error, flush=True)
@@ -1074,7 +1828,7 @@ def main():
         if run.tunnel:
             run.tunnel.terminate()
             run.tunnel.wait(timeout=15)
-        missing = REQUIRED - {r['id'] for r in run.assertions if r['ok']}
+        missing = run.required - {r['id'] for r in run.assertions if r['ok']}
         run.summary.update(error=error, missing=sorted(missing), verdict='pass' if not error and not missing and all(r['ok'] for r in run.assertions) and not run.summary.get('cleanup_error') else 'fail')
         run.save('summary.json', run.summary)
     print(json.dumps(run.summary, ensure_ascii=False), flush=True)

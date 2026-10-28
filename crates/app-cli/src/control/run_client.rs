@@ -64,6 +64,7 @@ fn start_management(args: &RuntimeArgs) -> Result<(Child, PathBuf)> {
     // Keep the platform generation and every credential in the inherited env.
     for key in [
         "APP_DEPLOY_URL",
+        "APP_CLI_RECOVER_RETAINED",
         "APP_RELEASE_ID",
         "APP_DEPLOY_OPERATION_ID",
         "APP_DEPLOY_SHA256",

@@ -9,6 +9,11 @@ pub trait AppOperationLease: Send + Sync {
     fn receipt(&self) -> Option<crate::UserAppOperationLeaseReceipt> {
         None
     }
+    /// Verify this live retained guard, not a second temporary flock probe.
+    /// Unsupported guards grant no recovery mutation authority.
+    async fn validate_retained(&self) -> Result<bool, String> {
+        Ok(false)
+    }
     async fn release(self: Box<Self>) -> Result<(), String>;
 }
 
@@ -162,9 +167,11 @@ impl UserAppDeletionCheckpoint {
                 &development.runtime.operation_id,
                 &development.runtime.resources,
             )?;
-            if development.registry.as_ref().is_some_and(|identity| {
-                identity.generation.is_empty() || identity.container_id.is_empty()
-            }) {
+            if development
+                .registry
+                .as_ref()
+                .is_some_and(|identity| identity.container_id.is_empty())
+            {
                 return Err("Development registry identity is incomplete".into());
             }
         }
@@ -231,6 +238,9 @@ pub struct UserAppStorageClear {
 }
 
 impl UserAppStorageClear {
+    /// Written only after the captured contents/volume clear has completed.
+    pub const COMPLETE_STEP: &'static str = "storage_contents_cleared";
+
     pub fn validate(&self) -> Result<(), String> {
         self.context.validate_identity(&self.context.app_id)?;
         match &self.target {
@@ -283,9 +293,11 @@ impl UserAppStorageClear {
                 {
                     return Err("Storage clear Kubernetes workload receipt is missing".into());
                 }
-                if receipt.registry.as_ref().is_some_and(|identity| {
-                    identity.generation.is_empty() || identity.container_id.is_empty()
-                }) {
+                if receipt
+                    .registry
+                    .as_ref()
+                    .is_some_and(|identity| identity.container_id.is_empty())
+                {
                     return Err("Storage clear registry identity is incomplete".into());
                 }
                 Ok(())
@@ -310,6 +322,9 @@ pub enum UserAppStorageClearTarget {
 }
 
 impl UserAppStorageDestruction {
+    /// Written only after captured production (if present) and dev removal.
+    pub const COMPLETE_STEP: &'static str = "development_storage_removed";
+
     pub fn validate(&self) -> Result<(), String> {
         self.context.validate_identity(&self.context.app_id)?;
         if let Some(production) = &self.production {
@@ -325,9 +340,12 @@ impl UserAppStorageDestruction {
             &self.development.runtime.operation_id,
             &self.development.runtime.resources,
         )?;
-        if self.development.registry.as_ref().is_some_and(|identity| {
-            identity.generation.is_empty() || identity.container_id.is_empty()
-        }) {
+        if self
+            .development
+            .registry
+            .as_ref()
+            .is_some_and(|identity| identity.container_id.is_empty())
+        {
             return Err("Storage destruction registry identity is incomplete".into());
         }
         Ok(())

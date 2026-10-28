@@ -11,8 +11,9 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use dashmap::mapref::multiple::RefMulti;
 use dashmap::mapref::one::Ref;
+use pending_guard::PendingPreparation;
 pub use pending_guard::{PendingGuard, RegistryStats};
-use shared_types::ProjectAndAgentInfo;
+use shared_types::{ProjectAndAgentInfo, SessionHint};
 use std::sync::{Arc, LazyLock};
 use tracing::{debug, info};
 
@@ -34,6 +35,8 @@ impl Clone for AgentSessionRegistry {
             agent_info_map: self.agent_info_map.clone(),
             project_to_session: self.project_to_session.clone(),
             session_to_project: self.session_to_project.clone(),
+            // Request leases belong to this registry instance, not its copy.
+            preparations: DashMap::new(),
         }
     }
 }
@@ -45,6 +48,8 @@ pub struct AgentSessionRegistry {
     project_to_session: DashMap<String, String>,
     /// session_id → project_id (反向映射)
     session_to_project: DashMap<String, String>,
+    /// In-flight preparation has no ACP session identity or dummy channels.
+    preparations: DashMap<String, PendingPreparation>,
 }
 
 impl AgentSessionRegistry {
@@ -54,6 +59,7 @@ impl AgentSessionRegistry {
             agent_info_map: DashMap::new(),
             project_to_session: DashMap::new(),
             session_to_project: DashMap::new(),
+            preparations: DashMap::new(),
         }
     }
 
@@ -70,6 +76,21 @@ impl AgentSessionRegistry {
     /// - 采用"先插入后删除"策略，确保任何时刻至少有一个有效映射
     pub fn register(&self, project_id: &str, session_id: &str, agent_info: ProjectAndAgentInfo) {
         use dashmap::mapref::entry::Entry;
+
+        if SessionHint::classify(Some(session_id))
+            .as_session_id()
+            .is_none()
+        {
+            // Retain an actual legacy execution for project-scoped lifecycle
+            // management, but never publish a state label as a routing key.
+            self.agent_info_map
+                .insert(project_id.to_owned(), agent_info);
+            if let Some((_, previous)) = self.project_to_session.remove(project_id) {
+                self.session_to_project
+                    .remove_if(&previous, |_, owner| owner == project_id);
+            }
+            return;
+        }
 
         // 🎯 原子性地更新 project_to_session 并获取旧 session_id
         let old_session_id = match self.project_to_session.entry(project_id.to_string()) {
@@ -151,6 +172,8 @@ impl AgentSessionRegistry {
     /// 使用 DashMap entry API 的原子操作，与 register() 方法保持一致
     pub fn update_session(&self, project_id: &str, new_session_id: &str) -> Option<String> {
         use dashmap::mapref::entry::Entry;
+
+        SessionHint::classify(Some(new_session_id)).as_session_id()?;
 
         // 🎯 原子性地更新 project_to_session
         let old_session_id = match self.project_to_session.entry(project_id.to_string()) {
@@ -292,6 +315,7 @@ impl AgentSessionRegistry {
 
     /// 通过 session_id 获取 project_id（O(1) 复杂度）
     pub fn get_project_by_session(&self, session_id: &str) -> Option<String> {
+        SessionHint::classify(Some(session_id)).as_session_id()?;
         self.session_to_project
             .get(session_id)
             .map(|r| r.value().clone())
@@ -299,14 +323,27 @@ impl AgentSessionRegistry {
 
     /// 通过 project_id 获取 session_id
     pub fn get_session_by_project(&self, project_id: &str) -> Option<String> {
-        self.project_to_session
-            .get(project_id)
-            .map(|r| r.value().clone())
+        // Release each map guard before reading another: physical cleanup
+        // holds the execution entry while conditionally retiring its indexes.
+        let sid = self
+            .project_to_session
+            .view(project_id, |_, sid| sid.clone())?;
+        if self.get_project_by_session(&sid).as_deref() != Some(project_id) {
+            return None;
+        }
+        Some(sid)
     }
 
-    /// 通过 project_id 获取 agent_info 引用
+    /// 按项目读取真实执行，包括尚不能用于会话路由的历史身份。
+    /// 会话身份不合法不代表进程不存在；停止、替换和闲置清理必须仍能管理它。
     pub fn get_agent_info(&self, project_id: &str) -> Option<Ref<'_, String, ProjectAndAgentInfo>> {
         self.agent_info_map.get(project_id)
+    }
+
+    fn has_session_identity(info: &ProjectAndAgentInfo) -> bool {
+        SessionHint::classify(Some(info.session_id.0.as_ref()))
+            .as_session_id()
+            .is_some()
     }
 
     /// 通过 session_id 获取 agent_info 引用
@@ -347,13 +384,13 @@ impl AgentSessionRegistry {
         &self,
         session_id: &str,
     ) -> Option<Ref<'_, String, ProjectAndAgentInfo>> {
+        SessionHint::classify(Some(session_id)).as_session_id()?;
         // view() 在闭包返回后立即释放锁，无 Ref 暴露
         let project_id_str = self.session_to_project.view(session_id, |_, v| v.clone())?;
 
         // 再通过 project_id 获取 agent_info
-        self.agent_info_map
-            .get(&project_id_str)
-            .filter(|info| info.session_id.to_string() == session_id)
+        self.get_agent_info(&project_id_str)
+            .filter(|info| info.session_id.0.as_ref() == session_id)
     }
 
     /// 通过 project_id 在闭包内访问 agent_info;闭包返回即释放读锁(无 Ref 暴露,
@@ -373,22 +410,24 @@ impl AgentSessionRegistry {
         session_id: &str,
         f: impl FnOnce(&ProjectAndAgentInfo) -> R,
     ) -> Option<R> {
+        SessionHint::classify(Some(session_id)).as_session_id()?;
         let project_id_str = self.session_to_project.view(session_id, |_, v| v.clone())?;
         self.agent_info_map
             .view(&project_id_str, |_, info| {
-                (info.session_id.to_string() == session_id).then(|| f(info))
+                (Self::has_session_identity(info) && info.session_id.0.as_ref() == session_id)
+                    .then(|| f(info))
             })
             .flatten()
     }
 
     /// 检查 project 是否存在
     pub fn contains_project(&self, project_id: &str) -> bool {
-        self.agent_info_map.contains_key(project_id)
+        self.get_agent_info(project_id).is_some() || self.preparations.contains_key(project_id)
     }
 
     /// 检查 session 是否存在
     pub fn contains_session(&self, session_id: &str) -> bool {
-        self.session_to_project.contains_key(session_id)
+        self.get_project_by_session(session_id).is_some()
     }
 
     // ========== 清理操作 ==========
@@ -402,10 +441,7 @@ impl AgentSessionRegistry {
 
     /// 获取所有 project_id 列表
     pub fn all_project_ids(&self) -> Vec<String> {
-        self.agent_info_map
-            .iter()
-            .map(|r| r.key().clone())
-            .collect()
+        self.iter_agents().map(|r| r.key().clone()).collect()
     }
 
     /// 获取统计信息
@@ -454,7 +490,7 @@ impl SessionRegistry for AgentSessionRegistry {
     type Entry = ProjectAndAgentInfo;
 
     fn get(&self, project_id: &str) -> Option<Self::Entry> {
-        self.agent_info_map.get(project_id).map(|r| r.clone())
+        self.get_agent_info(project_id).map(|r| r.clone())
     }
 
     fn insert(&self, project_id: &str, session_id: &str, entry: Self::Entry) {
@@ -466,14 +502,11 @@ impl SessionRegistry for AgentSessionRegistry {
     }
 
     fn contains(&self, project_id: &str) -> bool {
-        self.contains_project(project_id)
+        self.get_agent_info(project_id).is_some()
     }
 
     fn get_project_by_session(&self, session_id: &str) -> Option<String> {
-        // 🔥 修复：调用内部方法，避免递归
-        self.session_to_project
-            .get(session_id)
-            .map(|r| r.value().clone())
+        AgentSessionRegistry::get_project_by_session(self, session_id)
     }
 
     fn get_entry_by_session(&self, session_id: &str) -> Option<Self::Entry> {
@@ -571,7 +604,10 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    fn create_test_agent_info(project_id: &str, session_id: &str) -> ProjectAndAgentInfo {
+    pub(super) fn create_test_agent_info(
+        project_id: &str,
+        session_id: &str,
+    ) -> ProjectAndAgentInfo {
         let (prompt_tx, _) = mpsc::channel(shared_types::AGENT_PROMPT_CHANNEL_CAPACITY);
         let (cancel_tx, _) = mpsc::channel(shared_types::AGENT_CANCEL_CHANNEL_CAPACITY);
 
@@ -607,6 +643,34 @@ mod tests {
         assert_eq!(
             registry.get_session_by_project("project1"),
             Some("session1".to_string())
+        );
+    }
+
+    #[test]
+    fn trait_session_owner_lookup_delegates_to_inherent_method_without_recursion() {
+        let registry = AgentSessionRegistry::new();
+        registry.register(
+            "project",
+            "opaque-session",
+            create_test_agent_info("project", "opaque-session"),
+        );
+        for sid in ["opaque-session", "missing", "pending"] {
+            assert_eq!(
+                SessionRegistry::get_project_by_session(&registry, sid),
+                AgentSessionRegistry::get_project_by_session(&registry, sid)
+            );
+        }
+        assert_eq!(
+            SessionRegistry::get_project_by_session(&registry, "opaque-session").as_deref(),
+            Some("project")
+        );
+        assert_eq!(
+            SessionRegistry::get_project_by_session(&registry, "missing"),
+            None
+        );
+        assert_eq!(
+            SessionRegistry::get_project_by_session(&registry, "pending"),
+            None
         );
     }
 

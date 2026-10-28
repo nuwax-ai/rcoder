@@ -34,12 +34,39 @@ pub async fn read_to_string_bounded(path: &Path, max_bytes: u64, label: &str) ->
 
 /// 递归复制目录, 跳过 `exclude_dirs` 中的目录名与 `exclude_files` 中的文件名
 /// (对齐 nuwax `copyDirectoryFiltered`)。
+///
+/// 符号链接条目**物化为实体副本**（跟随解析目标复制内容），断链/非常规类型
+/// 明确报错——历史行为静默跳过链接条目，会让 fan-out 产生缺项副本
+/// （生产实测：源 15 个技能目录、副本只剩 13 个）。
+/// 物化会跟随链接递归，环形链接由 [`COPY_MATERIALIZE_MAX_DEPTH`] 明确报错
+/// 拦截，而不是无限递归栈溢出拖垮进程。
 pub async fn copy_dir_filtered(
     src: &Path,
     dst: &Path,
     exclude_dirs: &[String],
     exclude_files: &[String],
 ) -> AppResult<()> {
+    copy_dir_filtered_depth(src, dst, exclude_dirs, exclude_files, 0).await
+}
+
+/// 物化/嵌套复制的递归深度上限。技能与 agent 目录的合法嵌套远低于此;
+/// 触达上限按数据异常报错 (典型成因: 符号链接环)。
+const COPY_MATERIALIZE_MAX_DEPTH: usize = 24;
+
+async fn copy_dir_filtered_depth(
+    src: &Path,
+    dst: &Path,
+    exclude_dirs: &[String],
+    exclude_files: &[String],
+    depth: usize,
+) -> AppResult<()> {
+    if depth > COPY_MATERIALIZE_MAX_DEPTH {
+        return Err(AppError::system(format!(
+            "copy recursion exceeds depth {} at {} (symbolic link loop?)",
+            COPY_MATERIALIZE_MAX_DEPTH,
+            src.display()
+        )));
+    }
     fs::create_dir_all(dst).await?;
     let mut entries = fs::read_dir(src).await?;
     while let Some(entry) = entries.next_entry().await? {
@@ -51,11 +78,12 @@ pub async fn copy_dir_filtered(
                 continue;
             }
             // async 递归需 Box::pin
-            Box::pin(copy_dir_filtered(
+            Box::pin(copy_dir_filtered_depth(
                 &path,
                 &dst.join(&name),
                 exclude_dirs,
                 exclude_files,
+                depth + 1,
             ))
             .await?;
         } else if ft.is_file() {
@@ -63,6 +91,45 @@ pub async fn copy_dir_filtered(
                 continue;
             }
             fs::copy(&path, &dst.join(&name)).await?;
+        } else {
+            // 符号链接等条目 (entry.file_type 不跟随链接): 解析后按目标类型物化
+            let resolved = fs::metadata(&path).await.map_err(|error| {
+                AppError::system(format!(
+                    "resolve symlinked entry {} while copying: {error}",
+                    path.display()
+                ))
+            })?;
+            if resolved.is_dir() {
+                if exclude_dirs.iter().any(|d| d == &name) {
+                    continue;
+                }
+                tracing::debug!(
+                    entry = %path.display(),
+                    "materializing symlinked directory entry"
+                );
+                Box::pin(copy_dir_filtered_depth(
+                    &path,
+                    &dst.join(&name),
+                    exclude_dirs,
+                    exclude_files,
+                    depth + 1,
+                ))
+                .await?;
+            } else if resolved.is_file() {
+                if exclude_files.iter().any(|f| f == &name) {
+                    continue;
+                }
+                tracing::debug!(
+                    entry = %path.display(),
+                    "materializing symlinked file entry"
+                );
+                fs::copy(&path, &dst.join(&name)).await?;
+            } else {
+                return Err(AppError::system(format!(
+                    "cannot copy non-regular entry {}",
+                    path.display()
+                )));
+            }
         }
     }
     Ok(())

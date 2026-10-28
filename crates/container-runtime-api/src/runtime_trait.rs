@@ -35,11 +35,117 @@ pub use tokio::sync::mpsc;
 /// 不含 Userapp Deployment 或 workspace PVC 解析能力。
 #[async_trait]
 pub trait AgentContainerRuntime: Send + Sync {
+    fn agent_workload_namespace(&self) -> String {
+        "unsupported".into()
+    }
+    fn agent_workload_name(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<String> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Agent workload naming is unsupported".into(),
+        ))
+    }
+    /// Read actual managed resources, including controllers/Services without Pods.
+    async fn agent_resource_inventory(
+        &self,
+    ) -> ContainerRuntimeResult<Vec<crate::AgentStopSnapshot>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Agent resource inventory is unsupported".into(),
+        ))
+    }
+    async fn capture_agent_stop(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<crate::AgentStopSnapshot> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Captured Agent retirement is unsupported".into(),
+        ))
+    }
+    /// Positively prove no compute remains at the canonical name or captured
+    /// physical identity. Lookup None, unready Pods and API errors are not proof.
+    async fn agent_compute_absent(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+        _registered: &ContainerBasicInfo,
+    ) -> ContainerRuntimeResult<bool> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Authoritative Agent absence observation is unsupported".into(),
+        ))
+    }
+    /// Delete only original identities and versions; never refresh a failed target.
+    async fn stop_captured_agent(
+        &self,
+        _snapshot: &crate::AgentStopSnapshot,
+    ) -> ContainerRuntimeResult<crate::AgentStopOutcome> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Captured Agent retirement is unsupported".into(),
+        ))
+    }
+    /// Automatic callers qualify empty remnants or idle Docker agents through
+    /// activity, canonical-reference and deployment-owned workspace checks.
+    async fn retire_agent_remnants(
+        &self,
+        _snapshot: &crate::AgentStopSnapshot,
+    ) -> ContainerRuntimeResult<crate::AgentStopOutcome> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Agent remnant retirement is unsupported".into(),
+        ))
+    }
+    /// Fence a delayed old DELETE before reusing actual resources. The caller
+    /// holds its current admission guard. This never changes a Pod template.
+    async fn refresh_agent_retirement_fence(
+        &self,
+        _snapshot: &crate::AgentStopSnapshot,
+    ) -> ContainerRuntimeResult<crate::AgentStopSnapshot> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Agent retirement fencing is unsupported".into(),
+        ))
+    }
+    async fn agent_resource_events(
+        &self,
+        _shutdown: tokio_util::sync::CancellationToken,
+        _interval: std::time::Duration,
+    ) -> ContainerRuntimeResult<crate::AgentResourceEvents> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Agent resource events are unsupported".into(),
+        ))
+    }
     /// Create and start a container
     async fn create_container(
         &self,
         params: ContainerCreateParams,
     ) -> ContainerRuntimeResult<ContainerBasicInfo>;
+
+    /// Verify a fresh Agent workload replacement without stopping, creating or
+    /// modifying resources. A cached address or a same-named workload is not
+    /// sufficient. Unsupported backends retain their ordinary registration path.
+    async fn verify_agent_replacement(
+        &self,
+        _params: &ContainerCreateParams,
+        _previous: Option<&ContainerBasicInfo>,
+        _replacement: &ContainerBasicInfo,
+    ) -> ContainerRuntimeResult<super::types::VerifiedAgentReplacement> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Verified Agent workload replacement is unsupported".into(),
+        ))
+    }
+
+    /// Stop only the captured Agent physical instance. Implementations must
+    /// never resolve a later same-named resource as a replacement delete target.
+    async fn stop_agent_container_if_matches(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+        _expected_container_id: &str,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Captured Agent stop is unsupported".into(),
+        ))
+    }
 
     async fn acquire_builder_operation(
         &self,
@@ -158,6 +264,19 @@ pub trait AgentContainerRuntime: Send + Sync {
         Ok(None)
     }
 
+    /// Read-only authority observation for a historical EnsureBuilder whose
+    /// creation receipt was never persisted (stale `Running` record, dead
+    /// executor). Discovers the native operation mutex by durable identity
+    /// only; `ExpiredOriginal`/`Absent` are candidates for a retained physical
+    /// handoff before durable settlement, never a success or death proof alone.
+    /// Transport errors propagate and must leave the record unsettled.
+    async fn observe_unbound_builder_creation_authority(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<super::types::UnboundBuilderCreationAuthority> {
+        Ok(super::types::UnboundBuilderCreationAuthority::Unsupported)
+    }
+
     /// Inspect an identity-bound orphan Pod for compute-only Stop. No adoption,
     /// storage mutation or controller creation is authorized by this witness.
     async fn capture_builder_orphan_stop(
@@ -210,6 +329,17 @@ pub trait AgentContainerRuntime: Send + Sync {
         ))
     }
 
+    /// Prove that the builder controller and all executable instances are
+    /// absent after the caller has fenced and drained the original operation.
+    /// Discovery without a Pod, or a target eligible for replacement, is not
+    /// physical absence. Unsupported backends retain the fence by returning false.
+    async fn builder_compute_absent(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
     /// Execute only in the captured builder. Callers retain the durable operation
     /// and runtime lease; no name-based fallback is permitted on target mismatch.
     async fn exec_builder_control_target(
@@ -241,6 +371,15 @@ pub trait AgentContainerRuntime: Send + Sync {
         Ok(false)
     }
 
+    /// Read-only original-result classification. A stopped-looking container
+    /// without its real Stop acknowledgement is never enough.
+    async fn observe_builder_restart_stop(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Option<shared_types::BuilderRestartStopKind>> {
+        Ok(None)
+    }
+
     /// Read actual stopped compute, including an external stop without a
     /// platform receipt. This does not authorize a write or retire a lease.
     /// Pending/restarting resources cannot be treated as stopped.
@@ -249,6 +388,22 @@ pub trait AgentContainerRuntime: Send + Sync {
         _target: &shared_types::BuilderControlTarget,
     ) -> ContainerRuntimeResult<bool> {
         Ok(false)
+    }
+
+    /// Positive RUNNING observation of the captured workload: the exact
+    /// captured controller currently declares at least one replica. Unlike
+    /// the start reconciliation this requires no per-operation receipt, so a
+    /// healthy instance started by a PREVIOUS operation still observes as
+    /// running. Read-only; never authorizes a write. `Ok(false)` covers
+    /// stopped, terminating and absent shapes — only a positive result is
+    /// evidence of running.
+    async fn observe_builder_compute_running(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Builder running observation is unsupported".into(),
+        ))
     }
 
     fn supports_builder_compute_fencing(&self) -> bool {
@@ -274,6 +429,15 @@ pub trait AgentContainerRuntime: Send + Sync {
         _receipt: &shared_types::UserAppOperationLeaseReceipt,
     ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
         Ok(None)
+    }
+
+    /// Confirm missing builder compute and no live native creation holder.
+    /// Used only to reconcile an acknowledged pre-creation failure.
+    async fn verify_absent_builder_recovery(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
     }
 
     /// Capture private original configuration before a compute-only restart.
@@ -495,6 +659,17 @@ pub trait AgentContainerRuntime: Send + Sync {
         project_id: &str,
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>>;
+
+    /// Observe compute for execution admission, where a cached physical UID
+    /// cannot authorize dispatch. Backends with a read cache override this;
+    /// ordinary query callers retain `find_container` and its existing policy.
+    async fn find_container_for_ensure(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
+        self.find_container(identifier, service_type).await
+    }
 
     /// Stop and remove container
     async fn stop_container(&self, project_id: &str) -> ContainerRuntimeResult<()>;
@@ -770,6 +945,48 @@ pub trait WorkspaceRuntime: Send + Sync {
 /// Docker 由 `DockerRuntime` 做等价语义映射（容器 create/stop/start）。
 #[async_trait]
 pub trait UserAppDeploymentRuntime: Send + Sync {
+    /// Observe the current physical configuration source without adopting,
+    /// starting or rebinding it. The UID lets the caller look up an existing
+    /// resource binding before retaining an adopted Docker configuration.
+    async fn app_runtime_configuration_uid(
+        &self,
+        _app_id: &str,
+    ) -> ContainerRuntimeResult<Option<String>> {
+        Ok(None)
+    }
+
+    /// Preserve the current production configuration independently of compute.
+    /// Docker stores its verified live specification; runtimes with native
+    /// desired-state controllers do not need this additional snapshot.
+    async fn retain_app_runtime_configuration(
+        &self,
+        _app_id: &str,
+        _lifecycle_id: &str,
+        _binding: Option<&shared_types::UserAppResourceBinding>,
+    ) -> ContainerRuntimeResult<()> {
+        Ok(())
+    }
+
+    /// Read a retained production specification for this exact lifecycle.
+    /// None means there is no recoverable specification; callers must never
+    /// substitute an empty/default deployment for a missing configured app.
+    /// Observe retained managed PVCs without creating, adopting or starting anything.
+    async fn discover_retained_app_storage(
+        &self,
+        _app_id: &str,
+        _scope: shared_types::UserAppOperationScope,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppRetainedStorage>> {
+        Ok(None)
+    }
+
+    async fn retained_app_runtime_configuration(
+        &self,
+        _app_id: &str,
+        _lifecycle_id: &str,
+    ) -> ContainerRuntimeResult<Option<ContainerCreateParams>> {
+        Ok(None)
+    }
+
     /// Inspect the exact dev/prod compute instance without ensure, adoption,
     /// cache registration or operation admission. Missing is a confirmed absence.
     async fn observe_userapp_readiness(
@@ -1199,6 +1416,20 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     }
 
     /// Verify the exact atomic start receipt after a lost restart response.
+    /// Positive RUNNING observation of the captured application workload:
+    /// desired replicas in the spec AND replicas the controller actually
+    /// reports executing. No operation receipt is consulted, and readiness is
+    /// deliberately not judged (the question is whether the captured write
+    /// surface kept its desired replicas). Read-only with a recheck.
+    async fn observe_app_compute_running(
+        &self,
+        _target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Application running observation is unsupported".into(),
+        ))
+    }
+
     async fn reconcile_app_compute_start(
         &self,
         _target: &shared_types::UserAppMutationTarget,
@@ -1318,6 +1549,30 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         Ok(super::types::AppOperationLeaseObservation::Unconfirmed)
     }
 
+    /// Read only the production application's physical mutex. This is a wake
+    /// hint, separate from operation admission, holder-death proof and writes.
+    async fn observe_app_operation_mutex(
+        &self,
+        _app_id: &str,
+        _lifecycle_id: &str,
+    ) -> ContainerRuntimeResult<super::types::AppOperationMutexObservation> {
+        Ok(super::types::AppOperationMutexObservation::Unconfirmed)
+    }
+
+    /// Wait for a change from this exact observation under one total budget.
+    /// A renewal is another `Occupied` observation, never a release. Timeout
+    /// and unsupported runtimes remain `Unconfirmed`; callers must re-enter
+    /// normal admission after any wake, including a confirmed absence.
+    async fn wait_app_operation_mutex_change(
+        &self,
+        _app_id: &str,
+        _lifecycle_id: &str,
+        _observed: &super::types::AppOperationMutexIdentity,
+        _budget: std::time::Duration,
+    ) -> ContainerRuntimeResult<super::types::AppOperationMutexObservation> {
+        Ok(super::types::AppOperationMutexObservation::Unconfirmed)
+    }
+
     /// Holder-death proof for fenced-operation settlement: `Ok(true)` only
     /// when the receipt's holder is provably gone (released, expired, or
     /// superseded by takeover); `Ok(false)` while a holder may still be
@@ -1352,6 +1607,35 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         ))
     }
 
+    /// Serving admission only: atomically create a vacant application mutex.
+    /// A 409 must never patch, take over, renew, or release the occupied object,
+    /// even when it appears expired. A preceding GET is not write authority.
+    /// Unsupported backends fail explicitly; never forward to a takeover API.
+    async fn acquire_vacant_app_operation(
+        &self,
+        _app_id: &str,
+    ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Vacant-only application mutex acquisition is unsupported".into(),
+        ))
+    }
+
+    /// Acquire only the exact observed, still-expired native mutex. The caller
+    /// must first verify current lifecycle, priority ledger and target ownership,
+    /// then repeat normal durable admission before any business mutation. A
+    /// changed/renewed/missing object is a definitive occupied result, never
+    /// permission to create, rebase the observation, or take over its successor.
+    async fn acquire_observed_expired_app_operation(
+        &self,
+        _app_id: &str,
+        _current_lifecycle_id: &str,
+        _observed: &super::types::AppOperationMutexIdentity,
+    ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Observed-expired application mutex acquisition is unsupported".into(),
+        ))
+    }
+
     async fn acquire_app_operation(
         &self,
         _app_id: &str,
@@ -1368,6 +1652,33 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
     ) -> ContainerRuntimeResult<Box<dyn shared_types::PreparedComputeLease>> {
         Err(ContainerRuntimeError::ConfigurationError(
             "Prepared compute leases are unsupported".into(),
+        ))
+    }
+
+    /// Retain the exact original Docker fd/inode/token while recovering a
+    /// proven Stop result. This must not create, truncate or renew a marker.
+    async fn resume_original_compute_operation(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _scope: shared_types::UserAppOperationScope,
+        _receipt: &shared_types::UserAppOperationLeaseReceipt,
+    ) -> ContainerRuntimeResult<Box<dyn shared_types::AppOperationLease>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Retained compute guards are unsupported".into(),
+        ))
+    }
+
+    /// Retain physical exclusion BEFORE revoking an early compute executor.
+    /// A live holder must leave the original durable Running record unchanged.
+    /// Dropping an acquired guard must not clear markers or delete Leases.
+    async fn prepare_compute_handoff(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _scope: shared_types::UserAppOperationScope,
+        _receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
+    ) -> ContainerRuntimeResult<super::types::ComputeHandoff> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "Early compute handoff observation is unsupported".into(),
         ))
     }
 

@@ -28,6 +28,8 @@ use crate::bootstrap;
 use crate::*;
 use docker_manager::runtime_selection::RuntimeType;
 
+mod controller_scope;
+
 /// 引擎装配产物：服务组合（http-server bin / desktop）继续装配 HTTP 面与
 /// 关停编排所需的全部句柄。`_config_watcher` 下划线字段名保持 watcher 存活。
 pub struct AssembledEngine {
@@ -50,6 +52,7 @@ pub struct AssembledEngine {
     pub userapp_op_flight: Arc<userapp_builder::shutdown_gate::OperationFlightGate>,
     pub userapp_recovery: Option<tokio::task::JoinHandle<()>>,
     pub _config_watcher: Option<config_watcher::ConfigWatcher>,
+    pub _controller_scope_locks: Vec<std::fs::File>,
 }
 
 /// 引擎装配序（详见模块文档）。bootstrap 之后、HTTP 面之前的全部启动逻辑。
@@ -74,25 +77,30 @@ pub async fn assemble(
     docker_init::init_path_resolver(runtime_type).await?;
     docker_init::init_docker_manager(&bootstrap_result.config).await?;
     docker_init::startup_cleanup(&bootstrap_result.config).await;
+    let _controller_scope_locks = if is_kubernetes {
+        Vec::new()
+    } else {
+        controller_scope::lock(&bootstrap_result.config)?
+    };
 
     // 提前创建存储后端（M4：按 config.storage 分叉 Memory/Postgres 枚举），
     // 以便同一 Arc 实例同时作为 Arc<dyn ContainerLookup> 注入 Pingora 代理层
     // （统一容器 IP 数据源）和作为 AppState.projects 共享给业务逻辑。
     let cluster_domain = shared_types::get_k8s_cluster_domain();
-    let (projects_backend, cleanup_rx) = match bootstrap_result.config.storage.backend {
+    let projects_backend = match bootstrap_result.config.storage.backend {
         config::StorageBackend::Memory => {
-            let (adapter, cleanup_rx) = ProjectAdapter::new(
+            let adapter = ProjectAdapter::new(
                 bootstrap_result.config.app_manager.namespace.clone(),
                 cluster_domain.clone(),
             );
-            (ProjectStoreBackend::Memory(Arc::new(adapter)), cleanup_rx)
+            ProjectStoreBackend::Memory(Arc::new(adapter))
         }
         // PG 模式 fail fast：未编译 feature / 连接失败 / 迁移失败均直接退出，
         // 绝不静默降级内存（会造成 PG 与镜像分叉）
         #[cfg(feature = "rcoder-pg")]
         config::StorageBackend::Postgres => {
             let pg_config = &bootstrap_result.config.storage.postgres;
-            let (store, cleanup_rx) = rcoder_storage::pg::PgStore::connect(
+            let store = rcoder_storage::pg::PgStore::connect(
                 pg_config,
                 bootstrap_result.config.app_manager.namespace.clone(),
                 cluster_domain.clone(),
@@ -102,7 +110,7 @@ pub async fn assemble(
                 eprintln!("[STORAGE_PG] postgres backend init failed: {e:#}");
                 std::process::exit(1);
             });
-            (ProjectStoreBackend::Postgres(Arc::new(store)), cleanup_rx)
+            ProjectStoreBackend::Postgres(Arc::new(store))
         }
         #[cfg(not(feature = "rcoder-pg"))]
         config::StorageBackend::Postgres => {
@@ -122,6 +130,11 @@ pub async fn assemble(
     // 到 trait object，避免类型推断把 clone 的类型参数反向绑定为 dyn。
     let projects_for_lookup = Arc::clone(&projects);
     let container_lookup: Arc<dyn shared_types::ContainerLookup> = projects_for_lookup;
+    // 用户维度查找 miss 时的 PG 回源（仅 Postgres 后端有；memory 部署 None）
+    #[cfg(feature = "rcoder-pg")]
+    let user_refresh = projects.user_refresh();
+    #[cfg(not(feature = "rcoder-pg"))]
+    let user_refresh: Option<Arc<dyn shared_types::ContainerUserRefresh>> = None;
 
     // Userapp 活动状态注册表（闲置回收 + 流量唤醒的共享状态）。
     // 独立 Arc 在 Pingora 之前构造（注入代理层）；runtime 延迟到下方 RuntimeManager::get 后
@@ -139,6 +152,7 @@ pub async fn assemble(
         &bootstrap_result.config,
         Arc::clone(&bootstrap_result.api_key_config),
         container_lookup,
+        user_refresh,
         access_tracker,
         wake_control,
     )
@@ -247,9 +261,15 @@ pub async fn assemble(
     // 60000 file-server 分流反代（Java/外部入口，独立 crate file-server-proxy）：
     // x-service-type: userapp → 本主服务（8086），其余 → TS nuwax-file-server（60001）。
     // 配置无条件注册（段缺失时兜底默认端口但 rust 上游对准本服务实际端口，
-    // 供运行时 `rcoder file-server start` 拉起）；段存在或 host 部署时自动启动。
-    // host 无显式段时使用 loopback:60000 / AllRust。运行时启停经
-    // /api/system/file-server/*（`rcoder file-server {start,stop,restart,status}`）。
+    // 供运行时 `rcoder file-server start` 拉起）；注册成功即自动启动。
+    // 段缺失的兜底：容器形态 0.0.0.0:60000 / ts_first（镜像内 start-services.sh
+    // 恒把 TS 起在 60001——老配置用户仅 `docker compose pull` 升镜像，60000 文件
+    // 入口（Java fileServerPort 对接面）也保持可用；2026-10-20 docker-computer
+    // 交付目录漏配段致 Connection refused 的治本）；host 形态仍收敛
+    // loopback:60000 / AllRust。收紧通道：config 显式段、
+    // FILE_SERVER_PROXY_PUBLIC_BIND=false 或 FILE_SERVER_PROXY_TOKEN。
+    // 运行时启停经 /api/system/file-server/*
+    // （`rcoder file-server {start,stop,restart,status}`）。
     // 预览协调启用时：dev 生命周期 7 端点在所有策略下改路 Rust 上游（coordinated_dev_lifecycle）。
     // env 显式值优先于 config。拒绝结果也注册到代理，确保之后的管理
     // start/restart 返回同一配置错误，不旁路成默认公开监听。
@@ -268,10 +288,9 @@ pub async fn assemble(
             false
         }
     };
-    if proxy_registered
-        && (bootstrap_result.config.file_server_proxy.is_some() || shared_types::is_deploy_host())
-    {
-        // 同步 bind 语义：启动失败（如端口被占）此刻即报，不留到首个请求
+    if proxy_registered {
+        // 同步 bind 语义：启动失败（如端口被占）此刻即报，不留到首个请求；
+        // 失败不阻断主服务（文件入口降级可见于本日志与 /proxy/status）
         if let Err(e) = file_server_proxy::try_start().await {
             error!("file-server 分流代理启动失败: {e}");
         }
@@ -286,7 +305,6 @@ pub async fn assemble(
         container_prefix_computer,
         runtime,
         projects,
-        cleanup_rx,
         activity_registry.clone(),
         shutdown_tx.clone(),
     )
@@ -365,5 +383,6 @@ pub async fn assemble(
         userapp_op_flight,
         userapp_recovery,
         _config_watcher,
+        _controller_scope_locks,
     })
 }

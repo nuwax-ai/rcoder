@@ -14,8 +14,12 @@ pub(super) enum LaunchObservation {
 /// spawn 进程退出时的处置策略——两条启动路径（vite / manifest 引擎）在
 /// 就绪等待上的唯一差异点。
 pub(super) enum ExitPolicy<'a> {
-    /// 进程常驻（vite 路径）：退出即启动失败，读 stderr 分类成可操作错误。
+    /// Numeric-only test fixture; production preview retains its original Child.
+    #[cfg(test)]
     Fail,
+    /// A resident preview must remain alive. Its original wait result takes
+    /// precedence over kill(0): an exited Unix root may still pin its PID for Stop.
+    OwnedPreviewFail(&'a Arc<SupervisedChild>),
     /// `app-cli run` 是一次性引导（0.3.16+，可重复执行），常驻主体是
     /// `app-cli serve` owner（manifest 路径）：run 退出后按 **监督退出码**
     /// 与 owner 身份双证据判移交（R2：run 非零退出不被 owner 存活掩盖——
@@ -46,6 +50,7 @@ pub(super) struct AliveWatch<'a> {
 impl DevServerManager {
     /// 就绪轮询: 进程早退 → Err (读 stderr ring 分类成可操作错误); HTTP 就绪 → Ok;
     /// 超时但进程仍在 → Ok (nuwax 宽松)。
+    #[cfg(test)]
     pub(crate) async fn poll_alive(
         &self,
         pid: u32,
@@ -59,6 +64,7 @@ impl DevServerManager {
             .map(|_| ())
     }
 
+    #[cfg(test)]
     pub(super) async fn poll_alive_with_launch_deadline(
         &self,
         pid: u32,
@@ -80,6 +86,31 @@ impl DevServerManager {
             },
         )
         .await
+    }
+
+    /// Preview readiness observes this spawn's actual exit, independently of
+    /// its pinned numeric PID. Stop retains ownership of the original tree.
+    pub(super) async fn poll_owned_alive(
+        &self,
+        supervised: &Arc<SupervisedChild>,
+        port: u16,
+        base_path: Option<&str>,
+        stderr_ring: &Arc<StderrRing>,
+        probe: AliveProbe<'_>,
+    ) -> AppResult<()> {
+        self.wait_alive(
+            supervised.pid(),
+            AliveWatch {
+                port,
+                base_path,
+                stderr_ring,
+                probe,
+                launch_deadline: None,
+                exit_policy: &ExitPolicy::OwnedPreviewFail(supervised),
+            },
+        )
+        .await
+        .map(|_| ())
     }
 
     /// manifest 引擎启动等待：探活打 9080 根路径（按 [proxy] path 路由时 404
@@ -195,7 +226,11 @@ impl DevServerManager {
         // 宽松就绪（超时未响应 HTTP）：存活判据按策略锚定——Fail=进程，
         // ConfirmOwner 在移交成立后=serve owner（再核验一次），未移交=进程。
         let alive = match exit_policy {
+            #[cfg(test)]
             ExitPolicy::Fail => process::is_process_running(pid),
+            ExitPolicy::OwnedPreviewFail(supervised) => {
+                preview_process_alive(supervised, pid, port, stderr_ring)?
+            }
             ExitPolicy::ConfirmOwner {
                 workspace,
                 supervised,
@@ -247,8 +282,15 @@ impl DevServerManager {
         watch: &AliveWatch<'_>,
     ) -> AppResult<Option<shared_types::RuntimeIdentityView>> {
         match watch.exit_policy {
+            #[cfg(test)]
             ExitPolicy::Fail => {
                 if !process::is_process_running(pid) {
+                    return Err(early_exit_err(pid, watch.port, watch.stderr_ring));
+                }
+                Ok(None)
+            }
+            ExitPolicy::OwnedPreviewFail(supervised) => {
+                if !preview_process_alive(supervised, pid, watch.port, watch.stderr_ring)? {
                     return Err(early_exit_err(pid, watch.port, watch.stderr_ring));
                 }
                 Ok(None)
@@ -354,6 +396,24 @@ impl DevServerManager {
     }
 }
 
+/// Pinned PID presence is not proof of execution. Preserve the exact wait
+/// failure instead of reporting readiness when the original child is unreadable.
+fn preview_process_alive(
+    supervised: &SupervisedChild,
+    pid: u32,
+    port: u16,
+    stderr_ring: &Arc<StderrRing>,
+) -> AppResult<bool> {
+    use crate::service::dev_server::supervise::ChildExit;
+    match supervised.exited() {
+        Some(ChildExit::Exited(_)) => Err(early_exit_err(pid, port, stderr_ring)),
+        Some(ChildExit::WaitFailed(error)) => Err(AppError::process(format!(
+            "Development server exit status could not be observed: {error}"
+        ))),
+        None => Ok(process::is_process_running(pid)),
+    }
+}
+
 /// A live management endpoint cannot prove that the original run succeeded.
 /// Missing/unreadable exit status is an observation error, never exit-code zero.
 fn require_successful_run_exit(
@@ -428,5 +488,169 @@ mod exit_evidence_tests {
                 .expect_err("unknown exit status must not authorize a successful handover");
             assert!(error.to_string().contains("exit status"));
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod owned_preview_exit_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use std::io::Write;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn manager() -> DevServerManager {
+        let mut config = crate::Config::from_env().expect("test config");
+        config.dev_alive_max_wait_ms = 30;
+        config.dev_alive_check_timeout_ms = 10;
+        config.dev_alive_poll_interval_ms = 5;
+        DevServerManager::new(Arc::new(config))
+    }
+
+    fn ring() -> Arc<StderrRing> {
+        Arc::new(Mutex::new(std::collections::VecDeque::from([
+            "actual-dev-environment-unavailable".to_owned(),
+        ])))
+    }
+
+    fn spawn(
+        script: &str,
+        input: Option<UnixStream>,
+        ring: &Arc<StderrRing>,
+    ) -> Arc<SupervisedChild> {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", script]);
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        if let Some(input) = input {
+            command.stdin(Stdio::from(OwnedFd::from(input)));
+        } else {
+            command.stdin(Stdio::null());
+        }
+        let child =
+            process_utils::managed_tree::spawn_managed(command).expect("owned fixture spawn");
+        SupervisedChild::adopt_managed(child, Arc::clone(ring)).expect("adopt original fixture")
+    }
+
+    async fn cleanup(child: &SupervisedChild) -> AppResult<bool> {
+        child
+            .stop_managed_until(
+                Duration::from_millis(50),
+                tokio::time::Instant::now() + Duration::from_secs(3),
+            )
+            .await
+    }
+
+    async fn assert_exited_root_rejected(code: u8) {
+        let ring = ring();
+        let child = spawn(&format!("exit {code}"), None, &ring);
+        let exit = child.wait_exit(Duration::from_secs(3)).await;
+        let still_pinned = process::is_process_running(child.pid());
+        let calls = AtomicUsize::new(0);
+        let result = manager()
+            .poll_owned_alive(&child, 1, None, &ring, &|_, _, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { true })
+            })
+            .await;
+        let cleaned = cleanup(&child).await;
+        assert!(
+            cleaned.expect("cleanup observation"),
+            "original tree cleaned"
+        );
+        assert!(
+            matches!(exit, Some(crate::service::dev_server::supervise::ChildExit::Exited(status)) if status.code() == Some(i32::from(code))),
+            "original Child produced its exact exit code"
+        );
+        assert!(
+            still_pinned,
+            "original exited root remains waitable before Stop"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "exit precedes HTTP probe");
+        let error = result.expect_err("a pinned exited root cannot report readiness");
+        assert_eq!(
+            error.into_response().status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_preview_exit_zero_rejects_pinned_pid_before_http() {
+        assert_exited_root_rejected(0).await;
+    }
+
+    #[tokio::test]
+    async fn owned_preview_exit_nonzero_rejects_pinned_pid_before_http() {
+        assert_exited_root_rejected(3).await;
+    }
+
+    #[tokio::test]
+    async fn owned_preview_exit_during_successful_http_probe_is_rejected() {
+        let ring = ring();
+        let (input, output) = UnixStream::pair().expect("controlled stdin pair");
+        let child = spawn("read token; exit 3", Some(input), &ring);
+        let release = Mutex::new(Some(output));
+        let observed_exit = Arc::new(Mutex::new(None));
+        let calls = AtomicUsize::new(0);
+        let result = manager()
+            .poll_owned_alive(&child, 1, None, &ring, &|_, _, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let mut writer = release.lock().unwrap().take().expect("one probe release");
+                writer
+                    .write_all(b"release\n")
+                    .expect("release original root");
+                let child = Arc::clone(&child);
+                let observed_exit = Arc::clone(&observed_exit);
+                Box::pin(async move {
+                    let exit = child.wait_exit(Duration::from_secs(3)).await;
+                    *observed_exit.lock().unwrap() = exit;
+                    true
+                })
+            })
+            .await;
+        let still_pinned = process::is_process_running(child.pid());
+        let cleaned = cleanup(&child).await;
+        assert!(
+            cleaned.expect("cleanup observation"),
+            "original tree cleaned"
+        );
+        assert!(
+            matches!(*observed_exit.lock().unwrap(), Some(crate::service::dev_server::supervise::ChildExit::Exited(status)) if status.code() == Some(3)),
+            "probe barrier observed the original exit"
+        );
+        assert!(still_pinned, "exit pin remains until original tree cleanup");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one actual probe");
+        let error = result.expect_err("a positive HTTP probe cannot mask the original exit");
+        assert_eq!(
+            error.into_response().status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_preview_live_slow_http_keeps_loose_readiness() {
+        let ring = ring();
+        let (input, _release) = UnixStream::pair().expect("controlled stdin pair");
+        let child = spawn("read token", Some(input), &ring);
+        let calls = AtomicUsize::new(0);
+        let result = manager()
+            .poll_owned_alive(&child, 1, None, &ring, &|_, _, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { false })
+            })
+            .await;
+        let original_still_running = child.exited().is_none();
+        let cleaned = cleanup(&child).await;
+        assert!(
+            cleaned.expect("cleanup observation"),
+            "original tree cleaned"
+        );
+        assert!(
+            original_still_running,
+            "barrier retains a real running child"
+        );
+        assert!(calls.load(Ordering::SeqCst) > 0, "HTTP was actually probed");
+        result.expect("live slow preview retains the existing loose deadline policy");
     }
 }

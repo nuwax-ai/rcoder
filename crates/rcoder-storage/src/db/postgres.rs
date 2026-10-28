@@ -13,6 +13,9 @@ pub(crate) async fn open(
     config: &PostgresConfig,
     components: Vec<Component>,
 ) -> Result<DatabaseOwner> {
+    config
+        .validate_durable_commit_timeout()
+        .map_err(anyhow::Error::msg)?;
     let config = config.clone();
     let max_connections = usize::try_from(config.max_connections())?;
     ensure!(max_connections > 0, "PostgreSQL pool size must be positive");

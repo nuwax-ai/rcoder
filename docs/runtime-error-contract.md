@@ -62,11 +62,15 @@ RCoder 的错误响应保留 `code`、`message`、`data`、`tid`、`operation_id
 
 一旦请求已经受理，改为查询自己的原 `operation_id`；`holder_operation_id` 只说明谁阻塞本次请求，不表示新的重启已经受理。调用方应将结构化 `data` 完整透传到最终响应，保留操作身份与重试证据。
 
+Prod 镜像滚动重启进入恢复后，若运行时正向确认目标及残留计算资源均已不存在，原操作以 `Failed`、`error_code=ERR_RUNTIME_ABSENT` 终态收束并释放操作槽。探测失败或仍有残留时继续恢复，不按缺席收束；Dev builder 不使用 Prod 运行时的缺席结果。查询该失败操作仍返回正常的操作状态信封，重放原请求保留原失败结果；重新启动须通过新的 Start 请求，使用当前发布配置重建运行时。
+
 `POST /api/v1/userapp/{app_id}/restart` 在业务受理前遇到有明确进度证据的正常流量唤醒、部署或重启占用时，每 200ms 重核生命周期、持久 intent 和物理租约。两层及所有受理前只读准备共用同一个单调时钟 deadline，默认 30 秒；可用 YAML `app_manager.restart_admission_wait_secs` 或环境 `RCODER_USERAPP_RESTART_ADMISSION_WAIT_SECS` 配置，显式 YAML 值优先，选中的非法输入直接报配置错误。等待耗尽保留原 blocker/data，不受理另一项业务操作。物理 Stop/Restart 控制、未知 holder、`recovery_required` 与陈旧 `running` 立即拒绝；外部 Stop 仍快失败，Start 与内部回收器保持原排队语义。
 
 等待期间 HTTP 断开会取消未受理请求。派发租约获取或持久受理写入后若结果未知，由原协调器继续核实，不能因为客户端已断开就重新派发；取得但未受理的租约只释放本次精确身份，并持续记录未确认清理。已成功 request ID 的重放返回原结果。30 秒等待预算不改变业务 Stop 的宽限或部署执行预算，客户端超时应覆盖等待与实际执行时间。
 
-`ERR_APP_NOT_FOUND` 的字符串保持不变，只用于权威应用不存在的结果。已登记应用的物理容器或 Deployment 缺失返回既有 `CONTAINER_NOT_FOUND`；源码常量名为 `ERR_CONTAINER_NOT_FOUND`，实际响应字符串没有 `ERR_` 前缀。数据库、容器查询失败或超时不能转换成 `ERR_APP_NOT_FOUND`。两种不存在错误的标准响应均可为 HTTP 404，已有正式 UserApp 接口仍按既有中间件包装成 HTTP 200 错误信封。调用方必须按结构化 `code` 区分，不得因 HTTP 404 或物理资源缺失直接创建应用；先核验原应用身份、生命周期和操作状态。
+`ERR_APP_NOT_FOUND` 的字符串保持不变，只用于权威应用不存在的结果。只读查询中，已登记应用的物理容器或 Deployment 缺失返回既有 `CONTAINER_NOT_FOUND`；源码常量名为 `ERR_CONTAINER_NOT_FOUND`，实际响应字符串没有 `ERR_` 前缀。数据库、容器查询失败或超时不能转换成 `ERR_APP_NOT_FOUND`。两种不存在错误的标准响应均可为 HTTP 404，已有正式 UserApp 接口仍按既有中间件包装成 HTTP 200 错误信封。调用方必须按结构化 `code` 区分，不得因 HTTP 404 直接新建应用身份。
+
+Docker prod 应用业务流量具有独立的恢复语义：确认物理容器缺失后，由生命周期协调器核验原 Active 应用及当前私有运行配置，复用原应用与数据重建计算资源。readiness、普通状态查询以及原工具使用入口不因此变为创建入口。运行时连接失败、超时、外属资源和已删除应用均不能按物理缺失推定授权；已经受理的重建在请求断开后仍由原执行者继续收束。
 
 HTTP 状态并不代替业务结果：原有 `HttpResult` 入口和正式 UserApp 包装继续使用 HTTP 200 + `success=false`；标准 `AppError` 入口按上表返回状态。已建立的 SSE 通过原事件类型输出错误，不改变已发送的 HTTP 状态。
 
@@ -122,6 +126,18 @@ HTTP 状态并不代替业务结果：原有 `HttpResult` 入口和正式 UserAp
 
 ## 重试与结果未知
 
+### Computer 聊天与进度订阅
+
+`POST /computer/chat` 在 Agent Runner 已受理任务后，只追加该执行实例的会话登记，不重发原消息。同一共享容器的其他项目登记或普通版本更新不表示容器已被替换；K8s 工作负载确实被替换时，由原入口重新观察当前实例、归属与工作区后恢复映射，保留已有会话标识和数据卷。
+
+容器注册门禁以数据库为唯一裁决依据（containers 行 + `container_tombstones`），内存镜像只是缓存：本系统 stop/cleaner 已退役的绑定（tombstone 在案）允许同名重建的自我换代直接注册，跨副本镜像残留不产生额外拒绝。数据库绑定仍在而真实 workload 已被外部替换时，派发前返回 `ERR_COMPUTER_OWNER_CONFLICT`（HTTP 409），`error_detail.reason_code=CONTAINER_WORKLOAD_REPLACED`、`stage=computer.registration.before_dispatch`、`retryable=false`，提示先停止该项目释放旧绑定；容器行与 tombstone 俱无的异常状态同样拒绝并记录告警，不静默放行。
+
+任务已经受理但会话登记未确认时，响应保留原 `data.session_id`：登记结果未知返回 `ERR_SERVICE_UNAVAILABLE`，执行身份已被替换返回 `ERR_CONFLICT`；沿既有 `HttpResult` 契约使用 HTTP 200 + `success=false`，保留会话数据。派发前的标准 `AppError` 则分别使用 503/409。`error_detail.stage` 为 `chat.session_registration`，`task_id` 为原会话标识，`retryable=false` 指原消息不能自动重发。调用方应保留会话标识，仅重连 `GET /computer/progress/{session_id}`；本地待提交缓存不构成持久化确认。已有 Agent Runner 业务失败继续保留原失败码和数据。
+
+准备中的请求尚无 ACP 会话标识，准备状态与真实会话登记分开保存。旧版本遗留的 `pending` 仅按缺失恢复提示处理，不参与会话恢复、反查或新登记；历史原文保留，不要求用户清库。若旧 Runner 成功响应却返回占位值或空标识，主控返回英文 `ERR_AGENT_ERROR`，使用 `chat.session_identity` 阶段、`data=null`，不生成虚假 `task_id`，也不自动重发消息。错误响应中的占位标识同样不发布，原业务错误码和原因保留。此时应查看项目状态和日志，不能使用占位值重连进度。真实会话仍保留跨项目归属保护。
+
+普通 Computer 会话的进度查询在存储读取失败时返回可重试的 503，只有确认找不到会话时才返回 404。进度入口仍优先解析 UserApp 会话，按该领域原有错误契约传播失败；不能将查询异常伪装成会话不存在。连接建立后，仍通过既有 SSE 事件报告后续错误。
+
 `error_detail.retryable` 表示在当前证据下，使用原身份和相同输入重试是否安全。不能仅因 HTTP 502–504、出现“timeout/starting”或中文提示就重试。
 
 - 明确的只读或派发前失败可以标记可重试；配置、凭据错误需修正输入后发起新请求。
@@ -130,6 +146,6 @@ HTTP 状态并不代替业务结果：原有 `HttpResult` 入口和正式 UserAp
 - 冲突、清理未确认和需要恢复的操作继续保持相应保护。后续请求重新核验，不以历史标签永久拒绝管理操作。
 - 无 `error_detail` 的旧响应仅按已知保守错误码处理；未知错误码默认不自动重试。
 
-诊断查询和业务 readiness 失败不授权停止或重启容器。SSE 后续观测可以补充 OOM、CrashLoop 等信息，但不能替换原失败原因和身份。
+诊断查询和业务 readiness 失败不授权停止或重启容器。SSE 保留原 gRPC 错误码、`error_detail` 中的 cause/stage 和已捕获 request 身份。传输错误的主 `message` 使用友好提示；只有诊断的物理 Pod UID/Docker CID 与该流已解析的实例相同，且 OOM 终止时间落在当前 stream/PromptStart 开始至本次有界诊断观测时刻的窗口内（不接受未来时间戳）时，主提示才明确呈现 OOM。历史、替代实例或缺少身份/时序证据的状态仅作 `observed_container_state` 补充，不归因于新执行。诊断共用原 2 秒预算，失败或超时降级通用提示，不增加启动、路由或 SSE 准入门禁；权限、参数、模型限流等非传输错误保持原提示。
 
 调用方应保留本页定义的结构化错误字段、原操作身份和重试语义，避免仅透传 message 或通过文案判断错误类型。

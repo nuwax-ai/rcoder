@@ -111,6 +111,17 @@ pub(crate) struct OperationDeadline {
 }
 
 #[derive(toasty::Model)]
+#[table = "userapp_compute_control_deadlines"]
+pub(crate) struct ComputeControlDeadline {
+    #[key]
+    pub operation_id: String,
+    pub app_id: String,
+    pub lifecycle_id: String,
+    pub deadline_ms: i64,
+    pub unheld_observed_ms: Option<i64>,
+}
+
+#[derive(toasty::Model)]
 #[table = "userapp_resource_bindings"]
 #[key(service_type, physical_uid)]
 pub(crate) struct ResourceBinding {
@@ -207,6 +218,7 @@ pub(crate) fn storage_models() -> toasty::ModelSet {
         OperationInput,
         OperationLease,
         OperationDeadline,
+        ComputeControlDeadline,
         ResourceBinding,
         RecoveryWitness,
         Activity,

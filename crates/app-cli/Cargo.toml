@@ -1,6 +1,6 @@
 [package]
 name = "app-cli"
-version = "0.3.16"
+version = "0.3.23"
 edition = "2024"
 license = "Apache-2.0"
 description = "Cross-platform UserApp build and service manager with orchestration, Pingap routing, and a management API"
@@ -49,12 +49,16 @@ notify = "8"
 tokio-stream = "0.1"
 futures = "0.3"
 async-stream = "0.3"
-tokio = { version = "1", features = ["full"] }
+# Match the root's Pingora 0.9 / Tokio zero-capacity compatibility constraint.
+tokio = { version = "=1.53.3", features = ["full"] }
 # server 主循环的编排取消令牌（热部署切换/容器停服级联）
-tokio-util = "0.7"
+tokio-util = "0.7.20"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "service"] }
 axum = "0.8"
+# 请求路径百分号解码：按字节解析的成熟实现（手写下标切片在原始多字节
+# request-target 上会 panic，见 services::percent_decode_path）
+percent-encoding = "2.3"
 utoipa = { version = "6", features = ["axum_extras"] }
 glob = "0.3"
 globset = "0.4"
@@ -77,7 +81,7 @@ roxmltree = "0.21"
 sha2 = "0.11"
 hex = "0.4"
 # 部署段解压制品包（与 rcoder workspace zip 同版本；deflate 足够覆盖平台制品）
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 # 部署段制品 zip 魔数校验（拦 HTTP 200 + 错误信封 body 被当 zip 落盘）；
 # 关 default 裁掉 cfb 传递依赖——只用 archive::is_zip 纯函数
 infer = { version = "0.22", default-features = false }

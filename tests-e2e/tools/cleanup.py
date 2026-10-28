@@ -76,6 +76,19 @@ def cleanup_case(case_id, run_id, directory, existing_ids=()):
     root = directory / 'resources'
     root.mkdir(exist_ok=True)
     managed_names = set()
+    owner_root = directory / 'owner-conflict-contract'
+    if (owner_root / 'ownership.json').exists():
+        try:
+            receipt = json.loads((owner_root / 'ownership.json').read_text())
+            managed_names.update(row['name'].removeprefix('/')
+                                 for rows in receipt.get('captured', {}).values() for row in rows)
+            from owner_conflict_contract import cleanup_fixture as cleanup_owner_conflict
+            result = cleanup_owner_conflict(owner_root, run_id, case_id, existing_ids)
+            (owner_root / 'fallback-cleanup.json').write_text(json.dumps(result, indent=2))
+            if not result.get('success'):
+                errors.append('Owner conflict fixture cleanup incomplete')
+        except (OSError, ValueError, KeyError, RuntimeError, AssertionError, subprocess.SubprocessError) as error:
+            errors.append('Owner conflict fixture cleanup failed: ' + type(error).__name__)
     # Reclaim either small build fixture after an interrupted child process.
     for context_name in ('build-context', 'build-artifacts'):
         context_directory = directory / context_name
@@ -136,6 +149,20 @@ def cleanup_case(case_id, run_id, directory, existing_ids=()):
             (receipt_path.parent / 'fallback-cleanup.json').write_text(json.dumps(result, indent=2))
         except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
             errors.append('Turso isolated runtime cleanup failed: ' + type(error).__name__)
+    compute_root = directory / 'compute-failure-contract'
+    if (compute_root / 'ownership.json').exists():
+        try:
+            receipt = json.loads((compute_root / 'ownership.json').read_text())
+            managed_names.update({receipt['project'] + '-rcoder-1',
+                                  receipt['project'] + '-docker-proxy-1',
+                                  'rcoder-app-builder-' + receipt['app_id']})
+            from compute_failure_contract import cleanup as cleanup_compute_failure
+            result = cleanup_compute_failure(compute_root, run_id, case_id, existing_ids)
+            (compute_root / 'fallback-cleanup.json').write_text(json.dumps(result, indent=2))
+            if not result.get('ok'):
+                errors.append('Compute failure fixture cleanup incomplete')
+        except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+            errors.append('Compute failure fixture cleanup failed: ' + type(error).__name__)
     idle_root = directory / 'idle-owner-runtime'
     if (idle_root / 'ownership.json').exists():
         try:

@@ -4,7 +4,7 @@ use shared_types::{
     UserAppOperationLeaseReceipt, UserAppOperationScope,
 };
 
-fn lease_name(
+pub(super) fn lease_name(
     context: &UserAppExecutionContext,
     scope: UserAppOperationScope,
 ) -> Result<(ServiceType, String)> {
@@ -21,6 +21,34 @@ fn lease_name(
 }
 
 impl DockerRuntime {
+    pub(crate) async fn resume_original_compute_file_lease(
+        &self,
+        context: &UserAppExecutionContext,
+        scope: UserAppOperationScope,
+        receipt: &UserAppOperationLeaseReceipt,
+    ) -> Result<Box<dyn shared_types::AppOperationLease>> {
+        let (family, name) = lease_name(context, scope)?;
+        receipt.validate().map_err(Error::ConfigurationError)?;
+        if receipt.service_type() != &family {
+            return Err(Error::Conflict(
+                "Original compute guard scope differs".into(),
+            ));
+        }
+        let path = ops::application_lease_root()
+            .await?
+            .join(".app-operation-locks")
+            .join(name);
+        let (receipt, executor) = (receipt.clone(), context.executor_id.clone());
+        // No UnclaimedBuilderLease wrapper: cancelling this observation may
+        // unlock its fd but must never clear an unknown operation's marker.
+        let guard = tokio::task::spawn_blocking(move || {
+            resume_original_builder_file(&path, &receipt, &executor)
+        })
+        .await
+        .map_err(|error| Error::DockerError(error.to_string()))??;
+        Ok(Box::new(guard))
+    }
+
     pub(crate) async fn prepare_compute_file_lease(
         &self,
         context: &UserAppExecutionContext,
@@ -67,6 +95,25 @@ impl DockerRuntime {
         tokio::task::spawn_blocking(move || inspect(&path, family, &token, receipt.as_ref()))
             .await
             .map_err(|error| Error::DockerError(format!("Inspect compute lease worker: {error}")))?
+    }
+
+    /// Read-only discovery of a historical builder creation's native
+    /// authority for a stale `Running` EnsureBuilder without a persisted
+    /// receipt. Reuses the receipt-free marker inspection: a free flock with
+    /// this execution's own marker (prepared compute writes the executor id,
+    /// an ordinary acquire the operation id) proves the original holder
+    /// stopped; a held flock or another execution's marker keeps the record.
+    #[cfg(unix)]
+    pub(crate) async fn observe_unbound_builder_creation_authority(
+        &self,
+        context: &UserAppExecutionContext,
+    ) -> Result<container_runtime_api::UnboundBuilderCreationAuthority> {
+        let inspection = self
+            .inspect_compute_file_lease(context, UserAppOperationScope::Dev, None)
+            .await?;
+        Ok(unbound_builder_authority_from_inspection(
+            inspection, context,
+        ))
     }
 
     pub(crate) async fn release_previous_compute_file_lease(
@@ -280,6 +327,156 @@ fn release_previous_file_receipt(
 #[cfg(all(test, unix))]
 #[path = "previous_operation_tests.rs"]
 mod previous_operation_tests;
+
+/// Map a receipt-free marker inspection to the stale-Running authority
+/// verdict. Pure mapping: `Releasable` means the free flock carries this
+/// execution's own prepared-compute marker; `PreviousOperation` names an
+/// ordinary operation marker, ours only when the ID matches.
+#[cfg(unix)]
+fn unbound_builder_authority_from_inspection(
+    inspection: ComputeLeaseInspection,
+    context: &UserAppExecutionContext,
+) -> container_runtime_api::UnboundBuilderCreationAuthority {
+    use container_runtime_api::UnboundBuilderCreationAuthority;
+    match inspection {
+        ComputeLeaseInspection::Absent => UnboundBuilderCreationAuthority::Absent,
+        // A live flock is held by some execution; it cannot be the dead
+        // original executor, and its identity stays unreadable while held.
+        ComputeLeaseInspection::Held => UnboundBuilderCreationAuthority::Foreign { holder: None },
+        ComputeLeaseInspection::Releasable(receipt) => match &receipt {
+            UserAppOperationLeaseReceipt::Docker { token, .. } => {
+                UnboundBuilderCreationAuthority::ExpiredOriginal {
+                    holder: token.clone(),
+                    receipt,
+                }
+            }
+            UserAppOperationLeaseReceipt::Kubernetes { .. } => {
+                UnboundBuilderCreationAuthority::Foreign { holder: None }
+            }
+        },
+        ComputeLeaseInspection::PreviousOperation {
+            operation_id,
+            receipt,
+        } if operation_id == context.operation_id => {
+            let holder = match &receipt {
+                UserAppOperationLeaseReceipt::Docker { token, .. } => token.clone(),
+                UserAppOperationLeaseReceipt::Kubernetes { .. } => {
+                    return UnboundBuilderCreationAuthority::Foreign {
+                        holder: Some(operation_id),
+                    };
+                }
+            };
+            UnboundBuilderCreationAuthority::ExpiredOriginal { holder, receipt }
+        }
+        ComputeLeaseInspection::PreviousOperation { operation_id, .. } => {
+            UnboundBuilderCreationAuthority::Foreign {
+                holder: Some(operation_id),
+            }
+        }
+        // A previous owner's full metadata or a discovered attempt needs its
+        // existing proof path; an uninterpretable marker is unknown, not dead.
+        ComputeLeaseInspection::PreviousOwner { .. }
+        | ComputeLeaseInspection::Discovered { .. }
+        | ComputeLeaseInspection::IdentityChanged(_) => {
+            UnboundBuilderCreationAuthority::Foreign { holder: None }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unbound_authority_mapping_tests {
+    use super::*;
+
+    fn context() -> UserAppExecutionContext {
+        UserAppExecutionContext {
+            app_id: "mapping-app".into(),
+            lifecycle_id: "life".into(),
+            operation_id: "op-original".into(),
+            executor_id: "executor-original".into(),
+            request_fingerprint: "ab".repeat(32),
+        }
+    }
+
+    fn docker_receipt(token: &str) -> UserAppOperationLeaseReceipt {
+        UserAppOperationLeaseReceipt::Docker {
+            service_type: ServiceType::UserappBuilder,
+            device: 1,
+            inode: 2,
+            token: token.into(),
+        }
+    }
+
+    /// 孤儿 compute marker（flock 已释放、token=本执行）：原执行者已停。
+    #[test]
+    fn free_flock_with_own_executor_marker_is_expired_original() {
+        assert_eq!(
+            unbound_builder_authority_from_inspection(
+                ComputeLeaseInspection::Releasable(docker_receipt("executor-original")),
+                &context(),
+            ),
+            container_runtime_api::UnboundBuilderCreationAuthority::ExpiredOriginal {
+                holder: "executor-original".into(),
+                receipt: docker_receipt("executor-original"),
+            }
+        );
+    }
+
+    /// 活 flock（无论归属）：身份不可读，不可判断为死亡。
+    #[test]
+    fn held_flock_is_foreign() {
+        assert_eq!(
+            unbound_builder_authority_from_inspection(ComputeLeaseInspection::Held, &context()),
+            container_runtime_api::UnboundBuilderCreationAuthority::Foreign { holder: None }
+        );
+    }
+
+    /// 普通操作 marker：本操作 ID = 原执行者的遗留互斥；他操作 = 外来。
+    #[test]
+    fn ordinary_marker_maps_by_operation_identity() {
+        let context = context();
+        assert_eq!(
+            unbound_builder_authority_from_inspection(
+                ComputeLeaseInspection::PreviousOperation {
+                    receipt: docker_receipt("op-original"),
+                    operation_id: "op-original".into(),
+                },
+                &context,
+            ),
+            container_runtime_api::UnboundBuilderCreationAuthority::ExpiredOriginal {
+                holder: "op-original".into(),
+                receipt: docker_receipt("op-original"),
+            }
+        );
+        assert_eq!(
+            unbound_builder_authority_from_inspection(
+                ComputeLeaseInspection::PreviousOperation {
+                    receipt: docker_receipt("op-later"),
+                    operation_id: "op-later".into(),
+                },
+                &context,
+            ),
+            container_runtime_api::UnboundBuilderCreationAuthority::Foreign {
+                holder: Some("op-later".into())
+            }
+        );
+    }
+
+    /// 缺席与不可解读标记：缺席 = 无权威残留；不可解读 = 未知（外来臂保持）。
+    #[test]
+    fn absent_and_uninterpretable_map_conservatively() {
+        assert_eq!(
+            unbound_builder_authority_from_inspection(ComputeLeaseInspection::Absent, &context()),
+            container_runtime_api::UnboundBuilderCreationAuthority::Absent
+        );
+        assert_eq!(
+            unbound_builder_authority_from_inspection(
+                ComputeLeaseInspection::IdentityChanged("marker replaced".into()),
+                &context(),
+            ),
+            container_runtime_api::UnboundBuilderCreationAuthority::Foreign { holder: None }
+        );
+    }
+}
 
 #[cfg(not(unix))]
 pub(super) fn inspect(

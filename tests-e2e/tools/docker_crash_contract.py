@@ -10,7 +10,7 @@ import tempfile
 import time
 import urllib.request
 import uuid
-from turso_runtime_contract import REPO, command, http, wait_ready, service_config, isolated_config, remove_private_config
+from turso_runtime_contract import REPO, command, http, wait_ready, service_config, paired_isolated_config, remove_private_config, offline_snapshot
 
 MODES = ('before_create', 'after_start')
 
@@ -24,17 +24,40 @@ def wait_file(path, deadline, process_id=None):
         time.sleep(0.02)
 
 
-def db_operation(base, app, user):
+def db_operation(base, app, user, operation_id=None, report=None):
     # T4：运行中观察走 HTTP（SQLite 引擎不读 Turso 活库；跨引擎 mmap 读
     # 已被容器 SIGBUS 实测排除）。operations/current 返回在途/最近权威操作。
-    request = base + '/api/v1/userapp/' + app + '/operations/current?user_id=' + user
+    request = base + '/api/v1/userapp/' + app + '/operations/' + (operation_id or 'current') + '?user_id=' + user
     with urllib.request.urlopen(request, timeout=10) as response:
         body = json.load(response)
+    if report is not None:
+        with (report / 'operation-observations.jsonl').open('a') as output:
+            output.write(json.dumps({'url': request, 'response': body}) + '\n')
     operations = body.get('data') if body.get('code') == '0000' else None
+    if operation_id:
+        if not isinstance(operations, dict) or operations.get('operation_id') != operation_id or operations.get('app_id') != app:
+            raise RuntimeError('original durable operation identity was lost')
+        return operations
     # operations/current 返回全部在途槽位；故障窗口内恰一条在途操作
     if not isinstance(operations, list) or len(operations) != 1:
         raise RuntimeError('expected exactly one original durable operation')
     return operations[0]
+
+
+def validate_recovered_operation(original, restored, persisted, mode, builder_ids):
+    for key in ('operation_id', 'app_id', 'lifecycle_id', 'request_id', 'kind'):
+        if restored.get(key) != original.get(key) or persisted.get(key) != original.get(key):
+            raise ValueError('crash recovery changed original ' + key)
+    if persisted.get('state') != restored.get('state') or not persisted.get('error_code') or not persisted.get('error_message'):
+        raise ValueError('crash recovery lost its original diagnostic')
+    state = restored.get('state')
+    if state == 'RecoveryRequired':
+        return
+    evidence = (persisted.get('checkpoint') or {}).get('fence_released_evidence') or {}
+    if (mode != 'after_start' or state != 'Failed' or evidence.get('kind') != 'live_builder'
+            or len(builder_ids) != 1 or (evidence.get('workload') or {}).get('uid') != builder_ids[0]
+            or 'physical state verified definite' not in persisted['error_message']):
+        raise ValueError('crash recovery has no exact physical evidence for terminal settlement')
 
 
 def owned_builder_rows(receipt):
@@ -116,7 +139,7 @@ def main():
             expected = os.environ['E2E_TURSO_BINARY_SHA256']
             image_id = command('docker', 'image', 'inspect', '--format', '{{.Id}}', os.environ.get('E2E_TURSO_RUNTIME_IMAGE', 'dev-master-rcoder:latest'))
             private = Path(tempfile.mkdtemp(prefix=receipt['project'] + '-config-')) / 'config.yml'
-            private.write_text(isolated_config((REPO / 'docker/config.yml').read_text()))
+            private.write_text(paired_isolated_config((REPO / 'docker/config.yml').read_text()))
             private.chmod(0o600)
             receipt['private_config'] = str(private)
             (root / 'ownership.json').write_text(json.dumps(receipt, indent=2))
@@ -156,13 +179,18 @@ def main():
             future = pool.submit(http, base, '/api/v1/userapp/workspace', {'app_id': receipt['app_id'], 'user_id': receipt['user_id']})
             wait_file(control / 'barrier.json', time.monotonic() + 90, cid)
             barrier = json.loads((control / 'barrier.json').read_text())
-            original = db_operation(base, receipt['app_id'], receipt['user_id'])
+            original = db_operation(base, receipt['app_id'], receipt['user_id'], report=root)
+            (root / 'original-operation.json').write_text(json.dumps(original, indent=2))
             receipt['lifecycle_id'] = original['lifecycle_id']
             (root / 'ownership.json').write_text(json.dumps(receipt, indent=2))
             builders = owned_builder_rows(receipt)
             if original['state'] != 'Running' or barrier['stage'] != mode or (mode == 'before_create' and builders) or (mode == 'after_start' and (len(builders) != 1 or not builders[0]['State']['Running'])):
                 raise RuntimeError('requested crash window was not established')
             record('Docker ' + mode + ' exact barrier established', True)
+            sentinel = root / 'userapp-workspace/dev/userapp' / receipt['app_id'] / 'code/crash-data-marker'
+            sentinel.parent.mkdir(parents=True, exist_ok=True)
+            sentinel.write_text(receipt['app_id'])
+            (root / 'builder-before.json').write_text(json.dumps(builders, indent=2))
             command('docker', 'kill', '--signal', 'KILL', cid)
             stopped = json.loads(command('docker', 'inspect', cid))[0]
             if stopped['State']['Running'] or stopped['State']['ExitCode'] != 128 + signal.SIGKILL:
@@ -180,26 +208,56 @@ def main():
             base = 'http://' + command(*compose, 'port', 'rcoder', '8090')
             receipt['base'] = base
             wait_ready(base)
-            # 恢复隔离由重启实例的异步扫描落库（启动+5s 周期）；有界等待
-            # quarantine 终态，不放宽断言本身。
+            # The same 20s budget covers quarantine or exact physical settlement.
+            # after_start has live identity evidence; before_create remains unknown.
             deadline = time.monotonic() + 20
             while True:
-                restored = db_operation(base, receipt['app_id'], receipt['user_id'])
-                if restored['state'] == 'RecoveryRequired' or time.monotonic() >= deadline:
+                restored = db_operation(base, receipt['app_id'], receipt['user_id'], original['operation_id'], root)
+                expected_state = 'Failed' if mode == 'after_start' else 'RecoveryRequired'
+                if restored['state'] == expected_state or time.monotonic() >= deadline:
                     break
                 time.sleep(0.5)
             after = owned_builder_rows(receipt)
             attempts = (control / 'create-attempts.jsonl').read_text().splitlines()
-            if (restored['operation_id'] != original['operation_id'] or restored['state'] != 'RecoveryRequired'
-                    or [row['Id'] for row in after] != [row['Id'] for row in builders] or len(attempts) != 1):
+            if ([row['Id'] for row in after] != [row['Id'] for row in builders] or len(attempts) != 1):
                 raise RuntimeError('restart replayed or misclassified an interrupted runtime mutation')
             # Wait through one real 5-second recovery scan, then inspect again.
             time.sleep(6)
-            if len((control / 'create-attempts.jsonl').read_text().splitlines()) != 1 or db_operation(base, receipt['app_id'], receipt['user_id'])['state'] != 'RecoveryRequired':
+            observed = db_operation(base, receipt['app_id'], receipt['user_id'], original['operation_id'], root)
+            if len((control / 'create-attempts.jsonl').read_text().splitlines()) != 1 or observed['state'] not in ('RecoveryRequired', 'Failed'):
                 raise RuntimeError('periodic recovery replayed an uncertain command')
+            snapshot, base = offline_snapshot(root, receipt['app_id'], compose)
+            (root / 'original-operation-offline.json').write_text(json.dumps(snapshot, indent=2))
+            persisted = snapshot['operations'][original['operation_id']]
+            restored = db_operation(base, receipt['app_id'], receipt['user_id'], original['operation_id'], root)
+            validate_recovered_operation(original, restored, persisted, mode, [row['Id'] for row in builders])
             (root / 'recovery.json').write_text(json.dumps({'before': original, 'after': restored,
                 'builder_ids': [row['Id'] for row in after], 'rcoder_id': cid, 'image_id': image_id}, indent=2))
-            record('Docker ' + mode + ' restart quarantines without replay', True)
+            record('Docker ' + mode + ' restart retains original outcome without replay', True)
+            if mode == 'after_start':
+                if restored['state'] != 'Failed':
+                    raise RuntimeError('live exact builder did not settle before normal ensure')
+                ensured = http(base, '/api/v1/userapp/workspace', {'app_id': receipt['app_id'], 'user_id': receipt['user_id']}, timeout=180)
+                (root / 'normal-ensure.json').write_text(json.dumps(ensured, indent=2))
+                current = owned_builder_rows(receipt)
+                if len(current) != 1 or not current[0]['State']['Running'] or sentinel.read_text() != receipt['app_id']:
+                    raise RuntimeError('normal ensure did not restore one builder with retained data')
+                request = urllib.request.Request(base + '/api/v1/userapp/execute-command',
+                    data=json.dumps({'app_id': receipt['app_id'], 'user_id': receipt['user_id'],
+                                     # The dev execution API starts at the application
+                                     # workspace root; the retained marker is under code/.
+                                     'command': 'cat code/crash-data-marker'}).encode(),
+                    headers={'Content-Type': 'application/json', 'X-App-Id': receipt['app_id']})
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    readable = json.load(response)
+                (root / 'normal-ensure-file.json').write_text(json.dumps(readable, indent=2))
+                if readable.get('exit_code') != 0 or readable.get('stdout', '').strip() != receipt['app_id']:
+                    raise RuntimeError('normal ensure file service cannot read the retained application data')
+                after_snapshot, base = offline_snapshot(root, receipt['app_id'], compose)
+                if after_snapshot['operations'][original['operation_id']] != persisted:
+                    raise RuntimeError('normal ensure overwrote the original failure receipt or checkpoint')
+                (root / 'after-normal-ensure-offline.json').write_text(json.dumps(after_snapshot, indent=2))
+                record('Docker after_start normal ensure restores one usable builder and retains original receipt', True)
         except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
             detail = type(error).__name__ if isinstance(error, (OSError, subprocess.SubprocessError)) \
                 else type(error).__name__ + ': ' + str(error)

@@ -144,6 +144,127 @@ mod cases {
         );
     }
 
+    /// Windows 反例（修复前失败）：junction 删除必须只摘链本身，且不能用
+    /// `remove_file`——junction 的 symlink_metadata 是 is_symlink=true/is_dir=false，
+    /// 会被 is_dir 分派放过而落进 remove_file，DeleteFile 对重解析点返回拒绝访问
+    /// (os error 5)，整个 sync_shared_skill_view 随之失败。
+    ///
+    /// 数据保护断言：共享实体及其内容必须原样保留（remove_dir 的 RemoveDirectory
+    /// 不递归进目标）。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn remove_any_if_exists_removes_junction_without_touching_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("store").join("skills");
+        fs::create_dir_all(&target).await.unwrap();
+        fs::write(target.join("SKILL.md"), "precious")
+            .await
+            .unwrap();
+
+        let link = tmp.path().join("ws").join(".agents").join("skills");
+        force_dir_symlink(&link, &target).await.unwrap();
+
+        remove_any_if_exists(&link)
+            .await
+            .expect("junction must be removable");
+
+        // 用 symlink_metadata 判链接自身：try_exists 会跟随链接，目标仍存在时
+        // 恒为 true，检测不到链接已被摘除。
+        assert!(fs::symlink_metadata(&link).await.is_err(), "链接应已摘除");
+        assert!(
+            fs::try_exists(&target).await.unwrap(),
+            "共享实体目录必须保留"
+        );
+        assert!(
+            fs::try_exists(target.join("SKILL.md")).await.unwrap(),
+            "共享实体内容必须保留（不得递归进目标删除）"
+        );
+    }
+
+    /// Windows 反例：实体已被外部删除 → junction 悬空，仍须能摘除。
+    ///
+    /// 悬空 junction 上 `junction::exists` 跟随链接返回 false、`try_exists` 亦报
+    /// 不存在，仅 `symlink_metadata` 可见；若按 exists 判据分派会落进
+    /// `remove_file`，DeleteFile 对重解析点返回拒绝访问 (os error 5)，
+    /// `sync_shared_skill_view` 随之失败（孤儿链清不掉）。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn remove_any_if_exists_removes_dangling_junction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("store").join("skills");
+        fs::create_dir_all(&target).await.unwrap();
+        fs::write(target.join("SKILL.md"), "precious")
+            .await
+            .unwrap();
+
+        let link = tmp.path().join("ws").join(".agents").join("skills");
+        force_dir_symlink(&link, &target).await.unwrap();
+        // 实体被外部删除（各 agent prune 已清）→ 链接悬空
+        fs::remove_dir_all(&target).await.unwrap();
+        assert!(
+            fs::symlink_metadata(&link).await.is_ok(),
+            "悬空 junction 仍应被 symlink_metadata 看见"
+        );
+
+        remove_any_if_exists(&link)
+            .await
+            .expect("dangling junction must be removable");
+
+        assert!(
+            fs::symlink_metadata(&link).await.is_err(),
+            "悬空链接应已摘除"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn remove_any_if_exists_removes_directory_symlink_without_touching_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("store");
+        fs::create_dir_all(&target).await.unwrap();
+        fs::write(target.join("SKILL.md"), "precious")
+            .await
+            .unwrap();
+        let link = tmp.path().join("view");
+        std::os::windows::fs::symlink_dir(&target, &link)
+            .expect("Windows directory-symlink fixture requires symlink permission");
+
+        remove_any_if_exists(&link)
+            .await
+            .expect("directory symlink must be removable");
+
+        assert_eq!(
+            fs::symlink_metadata(&link).await.unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("SKILL.md")).await.unwrap(),
+            "precious"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn remove_any_if_exists_removes_dangling_directory_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("store");
+        fs::create_dir_all(&target).await.unwrap();
+        let link = tmp.path().join("view");
+        std::os::windows::fs::symlink_dir(&target, &link)
+            .expect("Windows directory-symlink fixture requires symlink permission");
+        fs::remove_dir(&target).await.unwrap();
+        assert!(fs::symlink_metadata(&link).await.is_ok());
+
+        remove_any_if_exists(&link)
+            .await
+            .expect("dangling directory symlink must be removable");
+
+        assert_eq!(
+            fs::symlink_metadata(&link).await.unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn link_workspace_creates_all_agent_symlinks() {
@@ -989,5 +1110,137 @@ mod cases {
             "校验失败不得留下任何已创建目录"
         );
         assert!(!user_root.join(".agent-store").exists(), "store 不得被创建");
+    }
+
+    #[tokio::test]
+    async fn view_managed_workspace_targets_survive_legacy_sync_agents() {
+        // 生产回归反例 (2026-10-19): 启动 reconciler 的 legacy fan-out 曾把视图
+        // 内链 `.claude/skills` unlink 后实体化覆盖 (remove_dir_all 对 symlink 只删
+        // 链本身)。修复后 fan-out 必须跳过链接目标, 视图布局原样保留。
+        let tmp = tempfile::tempdir().unwrap();
+        let user_root = tmp.path().join("u1");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).await.unwrap();
+        seed_agent_skill(&user_root, "agent-a", "alpha", false).await;
+        sync_shared_skill_view(
+            &user_root,
+            &workspace,
+            "agent-a",
+            "proj",
+            SharedSkillLists {
+                skills: Some(vec!["alpha".into()]),
+                subagents: Some(vec![]),
+            },
+        )
+        .await
+        .unwrap();
+        // 视图布局签名: .agents/skills 实体主目录 + 各 ACP 目录为内链
+        assert!(
+            !fs::symlink_metadata(workspace.join(".agents/skills"))
+                .await
+                .unwrap()
+                .is_symlink()
+        );
+        assert!(
+            fs::symlink_metadata(workspace.join(".claude/skills"))
+                .await
+                .unwrap()
+                .is_symlink()
+        );
+
+        crate::service::skills::sync_agents(&workspace)
+            .await
+            .unwrap();
+
+        for dir in [".claude", ".opencode", ".codex"] {
+            assert!(
+                fs::symlink_metadata(workspace.join(dir).join("skills"))
+                    .await
+                    .unwrap()
+                    .is_symlink(),
+                "view inner link {dir}/skills must survive legacy fan-out"
+            );
+        }
+        assert_eq!(
+            view_entry_names(&workspace, "skills").await,
+            vec!["alpha".to_string()],
+            "view master entries unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_workspace_with_agent_store_no_deadlock_and_mutual_exclusion() {
+        // create_workspace_with_agent_store 持工作区锁运行全程 (含 materialize 兜底
+        // 的持锁 fan-out), 与并发 sync_agents 必须都完成且无重入死锁, 链接布局不被
+        // fan-out 毁坏
+        let tmp = tempfile::tempdir().unwrap();
+        let user_root = tmp.path().join("u1");
+        let ws = user_root.join("c1");
+        seed_agent_skill(&user_root, "agent-1", "alpha", false).await;
+
+        let create = {
+            let user_root = user_root.clone();
+            let ws = ws.clone();
+            tokio::spawn(async move {
+                crate::service::computer_ws::create_workspace_with_agent_store(
+                    crate::service::computer_ws::CreateAgentStoreParams {
+                        user_root: &user_root,
+                        session_workspace: &ws,
+                        agent_id: "agent-1",
+                        skill_zip: None,
+                        skill_urls: Vec::new(),
+                        skill_url_map: None,
+                        skill_names: None,
+                        update_skill_names: None,
+                        hook_config: None,
+                        downloader: None,
+                        shared_project_id: None,
+                    },
+                )
+                .await
+            })
+        };
+        let sync = {
+            let ws = ws.clone();
+            tokio::spawn(async move {
+                crate::service::skills::sync_agents_with_wait(
+                    &ws,
+                    std::time::Duration::from_secs(10),
+                )
+                .await
+            })
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), create)
+            .await
+            .expect("create completes without deadlock")
+            .unwrap()
+            .unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), sync)
+            .await
+            .expect("sync completes without deadlock")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outcome,
+            crate::service::skills::SyncAgentsOutcome::Completed
+        );
+
+        // 链接布局完好 (create 的装配不被 fan-out 毁坏)
+        assert!(
+            fs::symlink_metadata(ws.join(".agents/skills"))
+                .await
+                .unwrap()
+                .is_symlink()
+        );
+        for dir in [".claude", ".opencode", ".codex"] {
+            assert!(
+                fs::symlink_metadata(ws.join(dir).join("skills"))
+                    .await
+                    .unwrap()
+                    .is_symlink(),
+                "{dir}/skills link layout must survive"
+            );
+        }
     }
 }

@@ -99,7 +99,9 @@ pub async fn agent_status(
         let response = AgentStatusResponse {
             project_id: agent_info.project_id().to_string(),
             is_alive: true,
-            session_id: agent_info.session_id().map(|s| s.to_string()),
+            session_id: shared_types::SessionHint::classify(agent_info.session_id())
+                .as_session_id()
+                .map(str::to_owned),
             status: agent_info.status().cloned(),
             last_activity: Some(agent_info.last_activity()),
             created_at: Some(agent_info.created_at()),

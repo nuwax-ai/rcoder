@@ -37,6 +37,132 @@ mod cases {
         }
     }
 
+    async fn expired_pending_never_starts_creation(default_recovery_enabled: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+                &directory.path().join("expired-pending.db"),
+            )
+            .await
+            .unwrap(),
+        );
+        let runtime = Arc::new(fence_settler_tests::FenceRuntime::default());
+        let mut state =
+            crate::userapp_builder::builder_runtime_test_state(runtime.clone(), store, None).await;
+        let config = &mut Arc::get_mut(&mut state).unwrap().config.userapp_storage;
+        config.default_recovery_enabled = default_recovery_enabled;
+        config.ensure_timeout_seconds = 3600;
+        let input = creation_input(
+            &state,
+            "inputapp",
+            shared_types::BuilderStartupMode::ManagementOnly,
+        )
+        .unwrap();
+        let pending = match state
+            .userapp_store
+            .admit_with_input(&admission(input.digest(), "expired-pending"), Some(&input))
+            .await
+            .unwrap()
+        {
+            UserAppAdmissionOutcome::Accepted(record) => record,
+            other => panic!("unexpected admission {other:?}"),
+        };
+        // Models a process exiting after the bind but before its Running CAS.
+        let original_deadline = chrono::Utc::now().timestamp_millis() - 1000;
+        assert_eq!(
+            state
+                .userapp_store
+                .bind_operation_deadline(
+                    &pending.app_id,
+                    &pending.operation_id,
+                    &pending.lifecycle_id,
+                    original_deadline,
+                )
+                .await
+                .unwrap(),
+            original_deadline
+        );
+        assert!(resume_pending(&state, &pending).await.unwrap());
+        let failed = state
+            .userapp_store
+            .get_operation("inputapp", &pending.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            failed.state,
+            UserAppOperationState::Failed,
+            "no runtime write was issued, so no uncertain outcome needs a fence"
+        );
+        assert_eq!(failed.step, "creation_preflight");
+        assert_eq!(
+            state
+                .userapp_store
+                .operation_deadline("inputapp", &pending.operation_id)
+                .await
+                .unwrap(),
+            Some(original_deadline),
+            "a restarted Pending worker cannot extend its original deadline",
+        );
+        assert!(
+            failed
+                .error_message
+                .as_deref()
+                .unwrap()
+                .contains("no runtime writes")
+        );
+        assert_eq!(
+            runtime
+                .builder_create_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(
+            state
+                .userapp_store
+                .get_application("inputapp")
+                .await
+                .unwrap()
+                .unwrap()
+                .active_operations
+                .dev
+                .is_none()
+        );
+        // The same public entry can immediately admit a new operation; no old
+        // receipt is fabricated and no historical record is removed.
+        assert!(matches!(
+            state
+                .userapp_store
+                .admit_with_input(
+                    &admission(input.digest(), "fresh-after-expiry"),
+                    Some(&input),
+                )
+                .await
+                .unwrap(),
+            UserAppAdmissionOutcome::Accepted(_)
+        ));
+        assert_eq!(
+            state
+                .userapp_store
+                .get_operation("inputapp", &pending.operation_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            failed
+        );
+        state.userapp_store_control.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_pending_deadline_fails_before_writes_with_default_recovery() {
+        expired_pending_never_starts_creation(true).await;
+    }
+
+    #[tokio::test]
+    async fn expired_pending_deadline_fails_before_writes_without_default_recovery() {
+        expired_pending_never_starts_creation(false).await;
+    }
+
     #[tokio::test]
     async fn builder_startup_mode_survives_admission_and_executor_recovery_input() {
         for mode in [

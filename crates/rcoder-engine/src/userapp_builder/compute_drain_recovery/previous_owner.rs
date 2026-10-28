@@ -123,7 +123,7 @@ pub(super) async fn release(
     Ok(true)
 }
 
-fn same_lease_identity(
+pub(crate) fn same_lease_identity(
     left: &UserAppOperationLeaseReceipt,
     right: &UserAppOperationLeaseReceipt,
 ) -> bool {
@@ -160,6 +160,13 @@ fn same_lease_identity(
                 ..
             },
         ) => lf == rf && ln == rn && lname == rname && lu == ru && lt == rt,
-        _ => false,
+        (
+            UserAppOperationLeaseReceipt::Docker { .. },
+            UserAppOperationLeaseReceipt::Kubernetes { .. },
+        )
+        | (
+            UserAppOperationLeaseReceipt::Kubernetes { .. },
+            UserAppOperationLeaseReceipt::Docker { .. },
+        ) => false,
     }
 }

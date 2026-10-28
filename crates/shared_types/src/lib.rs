@@ -1,4 +1,12 @@
 mod agent;
+mod computer_registration_error;
+pub use computer_registration_error::{
+    ComputerOwnerMismatch, ContainerWorkloadReplaced, computer_registration_app_error,
+};
+mod agent_registration;
+pub use agent_registration::{
+    AgentRegistrationChange, AgentWorkspaceIdentity, VerifiedAgentReplacement,
+};
 pub mod app_cli_evt;
 pub mod archive_links;
 pub mod file_entry_policy;
@@ -10,18 +18,20 @@ mod model;
 mod runtime_config;
 mod userapp;
 pub use model::{ApiBody, OperationInProgressData, OperationOutcomeUnknown};
+mod session_hint;
+pub use session_hint::SessionHint;
 
 // 容器域类型（高内聚收拢于 container/ 模块）—— 条目/查找/清理/统计 + 服务与隔离枚举
 pub use container::{
-    AppRuntimeIpResolver, CLEANUP_CHANNEL_CAPACITY, CleanupRequest, ContainerEntry,
-    ContainerLookup, IdleContainerInfo, IsolationType, IsolationTypeError, MissingIdentifier,
-    ProjectScope, ServiceType, ServiceTypeError, StorageStats, get_enabled_service_types,
+    AppRuntimeIpResolver, ContainerEntry, ContainerLookup, ContainerUserRefresh, IdleContainerInfo,
+    IsolationType, IsolationTypeError, MissingIdentifier, ProjectScope, ServiceType,
+    ServiceTypeError, StorageStats, container_identity_from_name, get_enabled_service_types,
     get_supported_service_types,
 };
 
 // project/session/container 映射存储契约（内存与 PG 双后端统一接口）
 pub mod project_store;
-pub use project_store::ProjectStore;
+pub use project_store::{AgentStatusObservation, ProjectStore};
 pub mod userapp_agent;
 pub use userapp_agent::{UserAppAgentBinding, UserAppAgentSession};
 
@@ -30,12 +40,15 @@ pub use userapp::activity::{
     ActivityPersistence, ActivityRow, AppAccessTracker, AppWakeControl, RemoteWakeState,
     WakeFailure, WakeOutcome,
 };
+pub use userapp::app_files::{
+    UserappAppFilesEntry, UserappAppFilesListResult, UserappAppFilesUploadResult,
+};
 pub use userapp::app_stage::{UserappStage, invalid_app_stage_error};
 pub use userapp::build_event::BuildProgressEvent;
 pub use userapp::business_readiness::{
-    BUSINESS_READINESS_CAPABILITY, PINGAP_ETYPE_ORIGIN_CONTRACT, UserAppBusinessReadiness,
-    UserAppContainerOperation, UserAppContainerReadiness, UserAppContainerStatus,
-    UserAppNoComputeState, UserAppProxyReadiness, UserAppReadinessChannel,
+    BUSINESS_READINESS_CAPABILITY, PINGAP_ETYPE_ORIGIN_CONTRACT, PINGAP_STANDBY_ETYPE,
+    UserAppBusinessReadiness, UserAppContainerOperation, UserAppContainerReadiness,
+    UserAppContainerStatus, UserAppNoComputeState, UserAppProxyReadiness, UserAppReadinessChannel,
     UserAppReadinessObservation, UserAppReadinessPhysical, UserAppReadinessReader,
     UserAppReadinessReason, UserAppReadinessResponse, UserAppReadinessStatus,
     UserAppServiceReadiness, X_PINGAP_ETYPE_HEADER,
@@ -59,6 +72,7 @@ pub use userapp::dbx_readiness::{
 pub use userapp::dev_cleanup::{
     BuilderCollaboratorDeletionReceipt, BuilderDeletionSnapshot, BuilderRegistryIdentity,
     DeletionInspection, UserappDevCleanup, UserappDevDeletion, UserappDevDeletionReceipt,
+    captured_builder_deletion_for_execution,
 };
 pub use userapp::dev_locator::{
     DevBuilderInstance, DevEnsureError, UserappDevEnsure, UserappDevLocator,
@@ -114,8 +128,8 @@ pub use preview::{
     PreviewKeepAliveRequest, PreviewKeyInput, PreviewLifecycleStore, PreviewListEntry,
     PreviewOperationKind, PreviewOperationRecord, PreviewOperationState, PreviewProjectIdentity,
     PreviewRecoveryEvidence, PreviewRestartEnvelope, PreviewRestartRequest, PreviewRouteResolution,
-    PreviewStartEnvelope, PreviewStartRequest, PreviewStopEnvelope, PreviewStopRequest,
-    PreviewStoreError, is_preview_port, preview_key,
+    PreviewStartEnvelope, PreviewStartPortRetry, PreviewStartRequest, PreviewStopEnvelope,
+    PreviewStopRequest, PreviewStoreError, is_preview_port, preview_key,
 };
 pub use preview::{PreviewPortAllocation, PreviewPortPoolStatus};
 
@@ -161,22 +175,23 @@ pub use shared_types_i18n::{
     ERR_AGENT_MGMT_PLATFORM_NOT_FOUND, ERR_AGENT_MGMT_STREAM_TRUNCATED,
     ERR_AGENT_MGMT_UNINSTALL_FAILED, ERR_AGENT_MGMT_UNKNOWN_AGENT, ERR_AGENT_MGMT_UNSUPPORTED_TYPE,
     ERR_AGENT_NOT_FOUND, ERR_AGENT_RUNNER_UNAVAILABLE, ERR_API_KEY_AUTH_FAILED,
-    ERR_APP_ALREADY_EXISTS, ERR_APP_NOT_FOUND, ERR_BACKEND_ERROR, ERR_CANCEL_FAILED, ERR_CONFLICT,
-    ERR_CONTAINER_ADDRESS_NOT_READY, ERR_CONTAINER_CREATE_FAILED, ERR_CONTAINER_ERROR,
-    ERR_CONTAINER_EXEC_FAILED, ERR_CONTAINER_NOT_FOUND, ERR_CONTAINER_START_FAILED,
-    ERR_CONTAINER_STOP_FAILED, ERR_DATABASE_COMMAND_FAILED, ERR_DATABASE_NOT_READY,
-    ERR_DEV_NOT_RUNNING, ERR_FILE_NOT_FOUND, ERR_GRPC_ADDR_ERROR, ERR_GRPC_ERROR,
-    ERR_HTTP_FALLBACK_FAILED, ERR_IMAGE_PULL_FAILED, ERR_INTERNAL_SERVER_ERROR, ERR_INVALID_PARAMS,
-    ERR_INVALID_RESOURCE_LIMITS, ERR_INVALID_STATE, ERR_MODEL_UNAVAILABLE, ERR_NOT_FOUND,
-    ERR_OPERATION_IN_PROGRESS, ERR_OPERATION_NOT_SUPPORTED, ERR_OPERATION_OUTCOME_UNKNOWN,
-    ERR_PERMISSION_EXPIRED, ERR_PERMISSION_NOT_FOUND, ERR_PERMISSION_RESOLVE_FAILED,
-    ERR_PROJECT_NOT_FOUND, ERR_PROXY_DISABLED, ERR_PROXY_SERVICE_UNAVAILABLE,
-    ERR_RESOURCE_EXHAUSTED, ERR_RESUME_FAILED, ERR_RETRY_EXHAUSTED, ERR_RUNTIME_CONFIGURATION,
-    ERR_RUNTIME_TIMEOUT, ERR_RUNTIME_UNAVAILABLE, ERR_SERVICE_UNAVAILABLE, ERR_SESSION_NOT_FOUND,
-    ERR_STOP_FAILED, ERR_TOO_MANY_REQUESTS, ERR_UNKNOWN, ERR_USERAPP_WAIT_TIMEOUT,
-    ERR_USERAPP_WAKE_FAILED, ERR_VALIDATION, ERR_WORKSPACE_ERROR, SUCCESS, error_codes,
-    get_error_description, get_error_hint, get_error_message, get_i18n_message,
-    get_i18n_message_default, get_operation_in_progress_message,
+    ERR_APP_ALREADY_EXISTS, ERR_APP_NOT_FOUND, ERR_BACKEND_ERROR, ERR_CANCEL_FAILED,
+    ERR_COMPUTER_OWNER_CONFLICT, ERR_CONFLICT, ERR_CONTAINER_ADDRESS_NOT_READY,
+    ERR_CONTAINER_CREATE_FAILED, ERR_CONTAINER_ERROR, ERR_CONTAINER_EXEC_FAILED,
+    ERR_CONTAINER_NOT_FOUND, ERR_CONTAINER_START_FAILED, ERR_CONTAINER_STOP_FAILED,
+    ERR_DATABASE_COMMAND_FAILED, ERR_DATABASE_NOT_READY, ERR_DEV_NOT_RUNNING, ERR_FILE_NOT_FOUND,
+    ERR_GRPC_ADDR_ERROR, ERR_GRPC_ERROR, ERR_HTTP_FALLBACK_FAILED, ERR_IMAGE_PULL_FAILED,
+    ERR_INTERNAL_SERVER_ERROR, ERR_INVALID_PARAMS, ERR_INVALID_RESOURCE_LIMITS, ERR_INVALID_STATE,
+    ERR_MODEL_UNAVAILABLE, ERR_NOT_FOUND, ERR_OPERATION_IN_PROGRESS, ERR_OPERATION_NOT_SUPPORTED,
+    ERR_OPERATION_OUTCOME_UNKNOWN, ERR_PERMISSION_EXPIRED, ERR_PERMISSION_NOT_FOUND,
+    ERR_PERMISSION_RESOLVE_FAILED, ERR_PROJECT_NOT_FOUND, ERR_PROXY_DISABLED,
+    ERR_PROXY_SERVICE_UNAVAILABLE, ERR_RESOURCE_EXHAUSTED, ERR_RESUME_FAILED, ERR_RETRY_EXHAUSTED,
+    ERR_RUNTIME_ABSENT, ERR_RUNTIME_CONFIGURATION, ERR_RUNTIME_TIMEOUT, ERR_RUNTIME_UNAVAILABLE,
+    ERR_SERVICE_UNAVAILABLE, ERR_SESSION_NOT_FOUND, ERR_STOP_FAILED, ERR_TOO_MANY_REQUESTS,
+    ERR_UNKNOWN, ERR_USERAPP_WAIT_TIMEOUT, ERR_USERAPP_WAKE_FAILED, ERR_VALIDATION,
+    ERR_WORKSPACE_ERROR, SUCCESS, error_codes, get_error_description, get_error_hint,
+    get_error_message, get_i18n_message, get_i18n_message_default,
+    get_operation_in_progress_message,
 };
 
 // Validation 模块
@@ -213,7 +228,8 @@ pub use runtime_request_failure::RuntimeRequestRejection;
 pub use app_cli_deploy::{
     APP_CLI_UNIFIED_DEPLOY_PROTOCOL, APP_DEPLOY_GENERATION_ID, APP_DEPLOY_OPERATION_ID,
     AppCliDeployPhase, AppDeploymentOperation, AppDeploymentProgress, AppDeploymentRecovery,
-    AppDeploymentStage, AppEnvSnapshot, AppMutationPrecondition, HotDeploymentFailureEvidence,
+    AppDeploymentStage, AppEnvSnapshot, AppMutationPrecondition, HotDeploymentEnvPrecondition,
+    HotDeploymentFailureEvidence,
 };
 
 // gRPC 模块 — 重导出自 shared_types_grpc（过渡期兼容）
@@ -279,6 +295,7 @@ pub use model::{
     VncStatusResponse,
     current_otel_trace_id,
     error_status_from_code,
+    is_prompt_terminal_sub_type,
     redact_error_text,
     sanitize_error_text,
 };
@@ -364,7 +381,7 @@ pub use userapp::compute_control::*;
 pub use userapp::compute_recovery::*;
 pub use userapp::recovery_scan::UserAppRecoveryScanPage;
 
-pub use userapp::discovery::UserAppDiscoveredIdentity;
+pub use userapp::discovery::{UserAppDiscoveredIdentity, UserAppRetainedStorage};
 
 pub use app_resource_deletion::UserAppComputeStartTarget;
 

@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 
 use agent_client_protocol::schema::v1::{PromptRequest, SessionId};
 use anyhow::Result;
+use dashmap::DashMap;
 use shared_types::{ModelProviderConfig, ProjectAndAgentInfo};
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -34,6 +35,8 @@ pub struct SacpClaudeCodeLauncher<N: SessionNotifier> {
     permission_handler: Arc<dyn PermissionRequestHandler>,
     /// 进程诊断监听器（可选，注入自 AcpClientBuilder）
     diagnostics_listener: Option<Arc<dyn DiagnosticsListener>>,
+    api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
+    project_uuid_map: Option<Arc<DashMap<String, String>>>,
 }
 
 impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
@@ -67,7 +70,19 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             model_env_resolver,
             permission_handler,
             diagnostics_listener,
+            api_key_manager: None,
+            project_uuid_map: None,
         }
+    }
+
+    pub fn with_api_config_maps(
+        mut self,
+        api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
+        project_uuid_map: Option<Arc<DashMap<String, String>>>,
+    ) -> Self {
+        self.api_key_manager = api_key_manager;
+        self.project_uuid_map = project_uuid_map;
+        self
     }
 
     /// 启动 Claude Code ACP Agent 服务
@@ -85,6 +100,10 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
     where
         R::Entry: Into<ProjectAndAgentInfo> + From<ProjectAndAgentInfo>,
     {
+        start_config.resume_session_id =
+            shared_types::SessionHint::classify(start_config.resume_session_id.as_deref())
+                .as_session_id()
+                .map(str::to_owned);
         let session_create_timeout_secs = start_config
             .acp_session_create_timeout_secs
             .unwrap_or(shared_types::DEFAULT_ACP_SESSION_CREATE_TIMEOUT_SECS);
@@ -170,6 +189,26 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         if tokio::time::Instant::now() >= creation_deadline {
             anyhow::bail!("agent startup deadline exceeded before spawn for project {project_id}");
         }
+        // 必须在 spawn 前就可查询代理配置；只有真正使用代理的进程持有绑定。
+        // 没有 await 的 spawn→守卫接管窗口中，任何同步错误都由 pending 回滚。
+        let mut pending_proxy_config = if self.model_env_resolver.uses_proxy_credentials() {
+            match (model_provider.as_ref(), service_uuid.as_ref()) {
+                (Some(provider), Some(uuid)) => {
+                    let manager = self.api_key_manager.clone().ok_or_else(|| {
+                        anyhow::anyhow!("proxy model runtime requires an API config manager")
+                    })?;
+                    manager.insert(uuid.clone(), provider.clone());
+                    Some(PendingProxyConfig {
+                        uuid: uuid.clone(),
+                        manager,
+                        owned_by_process: false,
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         let spawned = spawn_agent_process(
             &finalized_env.command_path,
             &finalized_env.command_args,
@@ -333,13 +372,19 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
         let mut lifecycle_guard = AgentLifecycleGuard::new_claude_full(
             crate::launcher::lifecycle::ClaudeProcessParams {
                 project_id: project_id.clone(),
-                session_id: SessionId::from("initializing"),
+                session_id: None,
                 child_process: spawned.child,
                 stderr_task: stderr_task_handle,
                 cancel_token: cancel_token.clone(),
-                shared_api_key_manager: None,
-                project_uuid_map: None,
-                service_uuid: None,
+                shared_api_key_manager: pending_proxy_config
+                    .as_ref()
+                    .map(|binding| binding.manager.clone()),
+                project_uuid_map: pending_proxy_config
+                    .as_ref()
+                    .and(self.project_uuid_map.clone()),
+                service_uuid: pending_proxy_config
+                    .as_ref()
+                    .map(|binding| binding.uuid.clone()),
                 abnormal_exit_flag: Some(abnormal_exit_flag),
                 exit_detail: Some(exit_detail),
                 diagnostics_listener: self.diagnostics_listener.clone(),
@@ -348,6 +393,10 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
                 working_dir: project_path,
             },
         )?;
+
+        if let Some(binding) = &mut pending_proxy_config {
+            binding.owned_by_process = true;
+        }
 
         let startup_completed = startup_transition
             .map(|transition| lifecycle_guard.retain_startup_transition(transition));
@@ -388,5 +437,20 @@ impl<N: SessionNotifier + 'static> SacpClaudeCodeLauncher<N> {
             cancel_tx,
             lifecycle_guard: Arc::new(lifecycle_guard),
         })
+    }
+}
+
+/// spawn 失败时回滚尚未被任何实际进程持有的配置；成功后由 reaper 收回。
+struct PendingProxyConfig {
+    uuid: String,
+    manager: Arc<DashMap<String, ModelProviderConfig>>,
+    owned_by_process: bool,
+}
+
+impl Drop for PendingProxyConfig {
+    fn drop(&mut self) {
+        if !self.owned_by_process {
+            self.manager.remove(&self.uuid);
+        }
     }
 }

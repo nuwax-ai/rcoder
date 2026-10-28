@@ -89,7 +89,7 @@ jobs:
         run: |
           if ! command -v cargo > /dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
 
       - name: Update and record Rust stable
@@ -113,8 +113,8 @@ jobs:
             PROTOC_ARCH="linux-x86_64"
           fi
           curl -LO "https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-${PROTOC_ARCH}.zip"
-          unzip "protoc-25.1-${PROTOC_ARCH}.zip" -d $HOME/.local
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          unzip "protoc-25.1-${PROTOC_ARCH}.zip" -d "$HOME/.local"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Install protoc (Windows)
         if: runner.os == 'Windows'
@@ -126,7 +126,7 @@ jobs:
       - name: Ensure dist in PATH (Windows)
         if: runner.os == 'Windows'
         shell: bash
-        run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Fetch plan manifest
         uses: actions/download-artifact@v7
@@ -144,15 +144,17 @@ jobs:
           sed -i.bak "s/version = \".*\"/version = \"$BASE_VERSION\"/" crates/rcoder-cli/Cargo.toml
           rm -f crates/rcoder-cli/Cargo.toml.bak
 
-          dist build --tag=v$BASE_VERSION --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          dist build "--tag=v$BASE_VERSION" --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
 
       - name: Collect artifacts
         id: collect
         shell: bash
         run: |
-          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          {
+            echo "paths<<EOF"
+            dist print-upload-files-from-manifest --manifest dist-manifest.json
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
@@ -249,7 +251,7 @@ jobs:
           for dir in npm/*/; do
             if [ -d "$dir" ] && [ -f "$dir/package.json" ]; then
               echo "--- $dir ---"
-              ls -la "$dir" | head -5
+              find "$dir" -maxdepth 1 -ls | head -5
             fi
           done
 
@@ -304,13 +306,15 @@ jobs:
     steps:
       - name: Summary
         run: |
-          echo "## Beta Release Published" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Version**: ${{ needs.plan.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Tag**: ${{ needs.plan.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **npm tag**: beta" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Install with:" >> $GITHUB_STEP_SUMMARY
-          echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "npm install -g rcoder-cli@beta" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Beta Release Published"
+            echo ""
+            echo "- **Version**: ${{ needs.plan.outputs.version }}"
+            echo "- **Tag**: ${{ needs.plan.outputs.tag }}"
+            echo "- **npm tag**: beta"
+            echo ""
+            echo "Install with:"
+            echo '```bash'
+            echo "npm install -g rcoder-cli@beta"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

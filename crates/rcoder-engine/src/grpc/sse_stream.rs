@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 
 use super::session_stream_registry::{
-    MAX_RETRIES, is_stream_closing, is_turn_terminal, make_cursor_reset_event,
+    FailureWindow, MAX_RETRIES, is_stream_closing, is_turn_terminal, make_cursor_reset_event,
     make_prompt_end_event, make_stream_error_event, make_terminal_error_event,
     maybe_update_activity,
 };
@@ -26,6 +26,7 @@ struct CapturedFailure {
     cause: String,
     stage: &'static str,
     request_id: Option<String>,
+    window: FailureWindow,
 }
 
 /// 创建基于 gRPC 的 SSE 代理流
@@ -68,8 +69,12 @@ pub async fn create_grpc_sse_stream(
     // 容量 100 不变；hotpath channel! 关闭时原样返回原生通道（零插桩），
     // 开启时包装 Sender/Receiver 端点（send/recv 记排队延迟 delay）。
     // wrapper 重建内部通道，表达式必须内联构造（clone 先于包装的端点会脱管）。
-    let (tx, mut rx): (obs_mpsc::Sender<_>, obs_mpsc::Receiver<_>) =
-        hotpath::channel!(tokio::sync::mpsc::channel(100), label = "sse_client_events");
+    // Expression labels retain profiling without exporting an unsafe
+    // compile-time uniqueness symbol from hotpath's literal-label arm.
+    let (tx, mut rx): (obs_mpsc::Sender<_>, obs_mpsc::Receiver<_>) = hotpath::channel!(
+        tokio::sync::mpsc::channel(100),
+        label = { "sse_client_events" }
+    );
 
     // SSE 在线订阅 gauge（RAII：spawn 的任务被 abort / 任何 return 路径都会 -1）
     struct SubscriptionGuard;
@@ -85,6 +90,7 @@ pub async fn create_grpc_sse_stream(
         }
     }
 
+    let admitted_at = Utc::now();
     // Register before spawning, so shutdown also owns a task not yet polled.
     if let Some(task_guard) = registry.admit_stream(&grpc_addr, &session_id) {
         let cancel = task_guard.token();
@@ -122,6 +128,7 @@ pub async fn create_grpc_sse_stream(
                 // This identity belongs to the event observed on this stream;
                 // cancellation ends it, and no unrelated latest chat is queried.
                 let mut active_request_id = None;
+                let mut active_window_start = Some(admitted_at);
                 let mut captured_failure: Option<CapturedFailure> = None;
                 for attempt in 1..=MAX_RETRIES {
                     let mut client = match cancellable_read!(pool.get_client(&grpc_addr)) {
@@ -132,14 +139,17 @@ pub async fn create_grpc_sse_stream(
                             let captured = captured_failure.get_or_insert_with(|| CapturedFailure {
                                 code: tonic::Code::Unavailable, cause, stage: "grpc_connect",
                                 request_id: active_request_id.clone(),
+                                window: FailureWindow { started_at: active_window_start, failed_at: Utc::now() },
                             });
                             cancellable_read!(pool.remove(&grpc_addr));
                             if attempt < MAX_RETRIES { continue; }
                             let event = cancellable_read!(make_terminal_error_event(
                                 diag_ctx.as_ref(), locale, captured.code, &captured.cause,
-                                captured.stage, captured.request_id.clone(),
+                                captured.stage, captured.request_id.clone(), captured.window,
                             ));
-                            let _ = forward_to_client(&tx, &event, &session_id, &mut client_last_seq).await;
+                            let Some(event) = synthetic_event_or_log(event, &registry, &session_id,
+                                captured.code, &captured.cause, captured.stage, captured.request_id.as_deref()) else { return; };
+                            let _ = forward_to_client(&registry, &tx, &event, &session_id, &mut client_last_seq).await;
                             registry.release_first_client_claim(&session_id);
                             return;
                         }
@@ -157,6 +167,7 @@ pub async fn create_grpc_sse_stream(
                             let captured = captured_failure.get_or_insert_with(|| CapturedFailure {
                                 code: error.code(), cause, stage: "grpc_subscribe",
                                 request_id: active_request_id.clone(),
+                                window: FailureWindow { started_at: active_window_start, failed_at: Utc::now() },
                             });
                             if attempt < MAX_RETRIES {
                                 cancellable_read!(pool.remove(&grpc_addr));
@@ -164,9 +175,11 @@ pub async fn create_grpc_sse_stream(
                             }
                             let event = cancellable_read!(make_terminal_error_event(
                                 diag_ctx.as_ref(), locale, captured.code, &captured.cause,
-                                captured.stage, captured.request_id.clone(),
+                                captured.stage, captured.request_id.clone(), captured.window,
                             ));
-                            let _ = forward_to_client(&tx, &event, &session_id, &mut client_last_seq).await;
+                            let Some(event) = synthetic_event_or_log(event, &registry, &session_id,
+                                captured.code, &captured.cause, captured.stage, captured.request_id.as_deref()) else { return; };
+                            let _ = forward_to_client(&registry, &tx, &event, &session_id, &mut client_last_seq).await;
                             registry.release_first_client_claim(&session_id);
                             return;
                         }
@@ -177,17 +190,30 @@ pub async fn create_grpc_sse_stream(
                         match cancellable_read!(stream.message()) {
                             Ok(Some(event)) => {
                                 maybe_update_activity(&activity_updater, &session_id, &activity_secs);
-                                if let Some(request_id) = &event.request_id {
+                                if event.message_type == "SessionPromptStart" {
+                                    active_request_id = event.request_id.clone();
+                                    // Replay may start before this SSE subscription. Keep the
+                                    // original event time, not the replay arrival time.
+                                    active_window_start = (event.timestamp > 0)
+                                        .then(|| DateTime::<Utc>::from_timestamp_millis(event.timestamp))
+                                        .flatten()
+                                        .filter(|started| *started <= Utc::now());
+                                } else if let Some(request_id) = &event.request_id {
+                                    if active_request_id.as_ref() != Some(request_id) {
+                                        active_window_start = None;
+                                    }
                                     active_request_id = Some(request_id.clone());
                                 }
                                 if event.seq != 0 && event.seq <= client_last_seq {
                                     warn!(%session_id, seq = event.seq, cursor = client_last_seq, "gRPC SSE sequence regressed; resetting cursor");
-                                    let reset = make_cursor_reset_event();
-                                    if !forward_to_client(&tx, &reset, &session_id, &mut client_last_seq).await { return; }
+                                    let Some(reset) = synthetic_event_or_log(make_cursor_reset_event(), &registry, &session_id,
+                                        tonic::Code::Internal, "Agent stream sequence regressed", "sse.cursor_reset", active_request_id.as_deref()) else { return; };
+                                    if !forward_to_client(&registry, &tx, &reset, &session_id, &mut client_last_seq).await { return; }
                                 }
-                                let keep_open = forward_to_client(&tx, &event, &session_id, &mut client_last_seq).await;
+                                let keep_open = forward_to_client(&registry, &tx, &event, &session_id, &mut client_last_seq).await;
                                 if event.message_type == "SessionPromptEnd" && event.sub_type == "cancelled" {
                                     active_request_id = None;
+                                    active_window_start = None;
                                 }
                                 if !keep_open {
                                     if is_turn_terminal(&event.message_type, &event.sub_type) {
@@ -197,9 +223,10 @@ pub async fn create_grpc_sse_stream(
                                 }
                             }
                             Ok(None) => {
-                                let mut event = make_prompt_end_event();
+                                let Some(mut event) = synthetic_event_or_log(make_prompt_end_event(), &registry, &session_id,
+                                    tonic::Code::Ok, "Agent stream ended without a terminal", "sse.stream_ended", active_request_id.as_deref()) else { return; };
                                 event.request_id = active_request_id.clone();
-                                let _ = forward_to_client(&tx, &event, &session_id, &mut client_last_seq).await;
+                                let _ = forward_to_client(&registry, &tx, &event, &session_id, &mut client_last_seq).await;
                                 registry.release_first_client_claim(&session_id);
                                 return;
                             }
@@ -209,16 +236,20 @@ pub async fn create_grpc_sse_stream(
                                 let captured = captured_failure.get_or_insert_with(|| CapturedFailure {
                                     code: error.code(), cause, stage: "grpc_stream",
                                     request_id: active_request_id.clone(),
+                                    window: FailureWindow { started_at: active_window_start, failed_at: Utc::now() },
                                 });
                                 if attempt < MAX_RETRIES {
                                     cancellable_read!(pool.remove(&grpc_addr));
                                     from_seq = client_last_seq;
                                     break;
                                 }
-                                let event = super::session_stream_registry::make_stream_error_event_with_identity(
-                                    captured.code, &captured.cause, locale, captured.stage, captured.request_id.clone(),
-                                );
-                                let _ = forward_to_client(&tx, &event, &session_id, &mut client_last_seq).await;
+                                let event = cancellable_read!(make_terminal_error_event(
+                                    diag_ctx.as_ref(), locale, captured.code, &captured.cause,
+                                    captured.stage, captured.request_id.clone(), captured.window,
+                                ));
+                                let Some(event) = synthetic_event_or_log(event, &registry, &session_id,
+                                    captured.code, &captured.cause, captured.stage, captured.request_id.as_deref()) else { return; };
+                                let _ = forward_to_client(&registry, &tx, &event, &session_id, &mut client_last_seq).await;
                                 registry.release_first_client_claim(&session_id);
                                 return;
                             }
@@ -228,8 +259,11 @@ pub async fn create_grpc_sse_stream(
             })).await;
             if outcome.is_err() {
                 error!(%panic_sid, "gRPC SSE forwarding task panicked");
-                let event = make_stream_error_event(tonic::Code::Internal, "forward task panicked");
-                drop(panic_tx.try_send(Ok(progress_event_to_sse(&event, &panic_sid))));
+                if let Some(event) = synthetic_event_or_log(make_stream_error_event(tonic::Code::Internal, "forward task panicked"),
+                    &panic_registry, &panic_sid, tonic::Code::Internal, "forward task panicked", "grpc_stream", None)
+                    && let Ok(sse_event) = progress_event_to_sse(&event, &panic_sid) {
+                    drop(panic_tx.try_send(Ok(sse_event)));
+                }
                 panic_registry.release_first_client_claim(&panic_sid);
             }
         }.instrument(sse_span));
@@ -241,6 +275,52 @@ pub async fn create_grpc_sse_stream(
     futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx))
 }
 
+/// Serialization failure has no trustworthy wire payload. Retain the original
+/// diagnostics server-side and let the real task close, rather than send an
+/// empty event or invent a success/error body through a second serializer.
+fn synthetic_event_or_log(
+    result: Result<shared_types::grpc::ProgressEvent, serde_json::Error>,
+    registry: &crate::grpc::SessionStreamRegistry,
+    session_id: &str,
+    code: tonic::Code,
+    cause: &str,
+    stage: &str,
+    request_id: Option<&str>,
+) -> Option<shared_types::grpc::ProgressEvent> {
+    match result {
+        Ok(event) => Some(event),
+        Err(error) => {
+            log_sse_serialization_failure(
+                session_id,
+                &code.to_string(),
+                cause,
+                stage,
+                request_id,
+                &error,
+            );
+            registry.release_first_client_claim(session_id);
+            None
+        }
+    }
+}
+
+fn log_sse_serialization_failure(
+    session_id: &str,
+    code: &str,
+    cause: &str,
+    stage: &str,
+    request_id: Option<&str>,
+    error: &serde_json::Error,
+) {
+    let original_cause = shared_types::sanitize_error_text(cause);
+    let original_code = shared_types::sanitize_error_text(code);
+    let original_stage = shared_types::sanitize_error_text(stage);
+    let original_request_id = request_id.map(shared_types::sanitize_error_text);
+    let serialization_error = shared_types::sanitize_error_text(&error.to_string());
+    error!(session_id, code=%original_code, stage=%original_stage, request_id=?original_request_id, %original_cause, %serialization_error,
+        "SSE serialization failed; closing stream without a fabricated payload");
+}
+
 /// 转发一个 ProgressEvent 到 HTTP SSE channel。
 ///
 /// 返回 `false` 表示调用方应结束 task：HTTP 客户端断开（send 失败），或收到终端事件
@@ -248,6 +328,7 @@ pub async fn create_grpc_sse_stream(
 /// 否则后台 task 退出后客户端会 hang（broadcast `Receiver` 不会 Closed，因为 `SharedStream`
 /// 始终持有 sender）。
 async fn forward_to_client(
+    registry: &crate::grpc::SessionStreamRegistry,
     tx: &obs_mpsc::Sender<Result<axum::response::sse::Event, std::convert::Infallible>>,
     ev: &shared_types::grpc::ProgressEvent,
     session_id: &str,
@@ -261,7 +342,13 @@ async fn forward_to_client(
     if ev.message_type == "StreamReset" {
         *client_last_seq = 0;
     }
-    let sse_event = progress_event_to_sse(ev, session_id);
+    let sse_event = match progress_event_to_sse(ev, session_id) {
+        Ok(event) => event,
+        Err(_) => {
+            registry.release_first_client_claim(session_id);
+            return false;
+        }
+    };
     if let Err(error) = tx.try_send(Ok(sse_event)) {
         warn!(%session_id, %error, "Closing SSE subscriber because its queue is full or closed");
         return false;
@@ -279,7 +366,7 @@ async fn forward_to_client(
 fn progress_event_to_sse(
     event: &shared_types::grpc::ProgressEvent,
     session_id: &str,
-) -> axum::response::sse::Event {
+) -> Result<axum::response::sse::Event, serde_json::Error> {
     // 解析 payload 为 data 字段
     let mut data: serde_json::Value =
         serde_json::from_str(&event.payload).unwrap_or(serde_json::Value::Null);
@@ -323,20 +410,34 @@ fn progress_event_to_sse(
         timestamp,
     };
 
-    // 序列化为 JSON
     let json_data = match serde_json::to_string(&unified_message) {
         Ok(json) => json,
-        Err(e) => {
-            warn!(
-                "⚠️ [gRPC_SSE] Failed to serialize ProgressEvent message: session_id={}, message_type={}, error={}",
-                session_id, event.message_type, e
+        Err(error) => {
+            // This is a consumer of the existing open data contract. Missing
+            // legacy fields stay optional; no new validation gates old events.
+            let detail = unified_message.data.get("error_detail");
+            let code = unified_message
+                .data
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let stage = detail
+                .and_then(|v| v.get("stage"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("sse.envelope");
+            let cause = detail
+                .and_then(|v| v.get("detail"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Failed to serialize the SSE envelope");
+            log_sse_serialization_failure(
+                session_id,
+                code,
+                cause,
+                stage,
+                event.request_id.as_deref(),
+                &error,
             );
-            // 返回包含 session_id 的最小可用结构
-            serde_json::json!({
-                "sessionId": session_id, "messageType": "agentSessionUpdate",
-                "subType": event.sub_type, "data": null,
-            })
-            .to_string()
+            return Err(error);
         }
     };
 
@@ -347,11 +448,11 @@ fn progress_event_to_sse(
     let sse_event = axum::response::sse::Event::default()
         .event(&event.sub_type)
         .data(json_data);
-    if event.seq > 0 {
+    Ok(if event.seq > 0 {
         sse_event.id(event.seq.to_string())
     } else {
         sse_event
-    }
+    })
 }
 
 fn sanitize_diagnostic_fields(data: &mut serde_json::Value) {
@@ -489,6 +590,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn failed_synthetic_serialization_closes_owned_stream_without_fake_terminal() {
+        struct FailingPayload;
+        impl serde::Serialize for FailingPayload {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom(
+                    "controlled serialization failure",
+                ))
+            }
+        }
+        let registry = Arc::new(crate::grpc::SessionStreamRegistry::new());
+        assert!(registry.claim_first_client("captured-session"));
+        let guard = registry
+            .admit_stream("captured-address", "captured-session")
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let owned = registry.clone();
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            let result = crate::grpc::session_stream_registry::serialize_synthetic_event(
+                &FailingPayload,
+                "SessionPromptEnd",
+                "error",
+                Some("original-request".into()),
+                1234,
+            );
+            let Some(event) = synthetic_event_or_log(
+                result,
+                &owned,
+                "captured-session",
+                tonic::Code::Unavailable,
+                "original transport cause password=do-not-leak",
+                "grpc_stream",
+                Some("original-request"),
+            ) else {
+                return;
+            };
+            tx.send(event).await.unwrap();
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        task.await.unwrap();
+        assert!(registry.claim_first_client("captured-session"));
+        registry
+            .drain(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
     fn make_event(message_type: &str, seq: u64) -> shared_types::grpc::ProgressEvent {
         make_prompt_end(message_type, "test", seq)
     }
@@ -519,7 +673,13 @@ mod tests {
         let mut last_seq = 0;
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            forward_to_client(&tx, &ev, "slow", &mut last_seq),
+            forward_to_client(
+                &crate::grpc::SessionStreamRegistry::new(),
+                &tx,
+                &ev,
+                "slow",
+                &mut last_seq,
+            ),
         )
         .await;
         assert!(
@@ -537,7 +697,14 @@ mod tests {
         let mut last_seq = 0_u64;
         let ev = make_event("AgentSessionUpdate", 5);
 
-        let cont = forward_to_client(&tx, &ev, "s1", &mut last_seq).await;
+        let cont = forward_to_client(
+            &crate::grpc::SessionStreamRegistry::new(),
+            &tx,
+            &ev,
+            "s1",
+            &mut last_seq,
+        )
+        .await;
         assert!(cont, "non-terminal event should continue");
         assert_eq!(last_seq, 5, "seq should advance");
         assert!(rx.recv().await.is_some(), "event should be sent to client");
@@ -551,7 +718,14 @@ mod tests {
         let mut last_seq = 10_u64;
         let ev = make_prompt_end("SessionPromptEnd", "end_turn", 0); // turn 终态 + seq=0 合成消息
 
-        let cont = forward_to_client(&tx, &ev, "s1", &mut last_seq).await;
+        let cont = forward_to_client(
+            &crate::grpc::SessionStreamRegistry::new(),
+            &tx,
+            &ev,
+            "s1",
+            &mut last_seq,
+        )
+        .await;
         assert!(
             !cont,
             "SessionPromptEnd must stop the forward task (avoid hang)"
@@ -568,7 +742,14 @@ mod tests {
         let mut last_seq = 0;
         let ev = make_event("AgentSessionUpdate", 5);
 
-        let cont = forward_to_client(&tx, &ev, "s1", &mut last_seq).await;
+        let cont = forward_to_client(
+            &crate::grpc::SessionStreamRegistry::new(),
+            &tx,
+            &ev,
+            "s1",
+            &mut last_seq,
+        )
+        .await;
         assert!(!cont, "send failure (client gone) must stop the task");
     }
 
@@ -578,7 +759,7 @@ mod tests {
     #[tokio::test]
     async fn progress_event_to_sse_sets_id_for_real_seq() {
         let ev = make_event("AgentSessionUpdate", 42);
-        let sse_event = progress_event_to_sse(&ev, "s1");
+        let sse_event = progress_event_to_sse(&ev, "s1").unwrap();
         let text = render_sse_event(sse_event).await;
         assert!(
             text.contains("id: 42"),
@@ -591,7 +772,7 @@ mod tests {
     #[tokio::test]
     async fn progress_event_to_sse_omits_id_for_zero_seq() {
         let ev = make_event("SessionPromptEnd", 0);
-        let sse_event = progress_event_to_sse(&ev, "s1");
+        let sse_event = progress_event_to_sse(&ev, "s1").unwrap();
         let text = render_sse_event(sse_event).await;
         assert!(
             !text.contains("id:"),
@@ -627,7 +808,14 @@ mod tests {
         let mut last_seq = 10_u64;
         let ev = make_prompt_end("SessionPromptEnd", "cancelled", 11);
 
-        let cont = forward_to_client(&tx, &ev, "s", &mut last_seq).await;
+        let cont = forward_to_client(
+            &crate::grpc::SessionStreamRegistry::new(),
+            &tx,
+            &ev,
+            "s",
+            &mut last_seq,
+        )
+        .await;
         assert!(cont, "cancelled must NOT close the stream");
         assert_eq!(last_seq, 11);
     }
@@ -640,7 +828,14 @@ mod tests {
         let mut last_seq = 10_u64;
         let ev = make_prompt_end("SessionPromptEnd", "error", 0);
 
-        let cont = forward_to_client(&tx, &ev, "s", &mut last_seq).await;
+        let cont = forward_to_client(
+            &crate::grpc::SessionStreamRegistry::new(),
+            &tx,
+            &ev,
+            "s",
+            &mut last_seq,
+        )
+        .await;
         assert!(!cont, "error is a turn terminal and must close the stream");
     }
 
@@ -653,7 +848,14 @@ mod tests {
         let mut last_seq = 10_u64;
         let ev = make_prompt_end("SessionPromptEnd", "stream_ended", 0);
 
-        let cont = forward_to_client(&tx, &ev, "s", &mut last_seq).await;
+        let cont = forward_to_client(
+            &crate::grpc::SessionStreamRegistry::new(),
+            &tx,
+            &ev,
+            "s",
+            &mut last_seq,
+        )
+        .await;
         assert!(
             !cont,
             "stream_ended must close the stream (client should reconnect)"

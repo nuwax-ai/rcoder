@@ -195,13 +195,32 @@ pub(crate) fn build_probe(
 ///   ⚠️ 50m 只缓解 throttle，**不解决调度均衡**：requests 仍很低，调度器仍按"节点很轻"
 ///   看待，会把 pod 全堆在最闲节点。跨节点均衡由 PodSpec 的 topologySpreadConstraints
 ///   保证（见 build_agent_pod_spec），不靠调 requests。
-/// - `memory`（不可压缩）：requests=`64Mi`。pod 开了 swap，内存吃紧可换出不易 OOM；
-///   运行时实际可用到 limits 上限（swap + limits 双兜底）。⚠️ 代价：节点内存严重紧张时，
-///   低 requests + 高实际占用的 pod 可能被优先 evict；集群内存余量充足（实测 13~34%）
-///   且有 swap，风险可控；若频繁被 evict 再调大。
+/// - `memory`（不可压缩）：requests=`min(1Gi, limit)`（2026-10-28 从 64Mi 调大，触发：node5
+///   MemoryPressure 驱逐 1 个沙箱——实测占用中位数 955Mi，64Mi 让调度器对节点真实
+///   重量"失明"，堆积至 evict）。≈实测中位数定价：调度器开始按 allocatable−requests
+///   打分，新沙箱自然偏向轻节点。集群 commit 率 34%（195Gi/570Gi），单节点密度上限
+///   ≈130 个（135Gi÷1Gi），现峰值 67 个，余量约一倍。limits 4Gi 不变（超卖本体，
+///   单 pod 仍 4:1 弹性），swap 兜底不变；全员 p90 同时冲峰（350Gi）仍小于物理总量。
 /// - `ephemeral-storage`：requests=`512Mi`（overlay 实际写入少，数据在 PVC）。
 ///
 /// 返回 `None`：三者皆空（无任何 limits 需求）。
+/// The memory request is `min(1Gi, limit)`: 1Gi for weight-aware scheduling
+/// on normal workloads, but capped by the caller's limit so the combination
+/// always passes server-side validation (request ≤ limit). Unparseable
+/// quantities fall back to the limit itself (never exceeds it).
+fn min_memory_request(limit: &str) -> String {
+    const ONE_GIB_BYTES: u64 = 1024 * 1024 * 1024;
+    match shared_types::parse_memory_quantity(limit) {
+        // Strictly greater: the shared parser rounds to the nearest byte,
+        // so a value AT the 1GiB boundary may have been rounded UP from
+        // just below it — capping to "1Gi" there could produce request >
+        // limit (K8s rejects). At or below the boundary the original limit
+        // string is kept (always valid: request == limit).
+        Some(bytes) if bytes > ONE_GIB_BYTES => "1Gi".to_string(),
+        _ => limit.to_string(),
+    }
+}
+
 #[cfg(feature = "kubernetes")]
 pub(crate) fn build_decoupled_resources(
     cpu: Option<String>,
@@ -215,8 +234,13 @@ pub(crate) fn build_decoupled_resources(
         requests.insert("cpu".to_string(), Quantity("50m".to_string()));
     }
     if let Some(m) = memory {
-        limits.insert("memory".to_string(), Quantity(m));
-        requests.insert("memory".to_string(), Quantity("64Mi".to_string()));
+        limits.insert("memory".to_string(), Quantity(m.clone()));
+        // Request must not exceed the limit (K8s server-side validation
+        // rejects request > limit): small-memory workloads keep the limit
+        // itself as the request; larger ones cap at 1Gi for weight-aware
+        // scheduling (see the doc comment above for the sizing rationale).
+        let request = min_memory_request(&m);
+        requests.insert("memory".to_string(), Quantity(request));
     }
     if let Some(es) = ephemeral {
         limits.insert("ephemeral-storage".to_string(), Quantity(es));
@@ -328,16 +352,89 @@ mod tests {
     #[test]
     fn decoupled_resources_all_three_decoupled_values() {
         let rr =
-            build_decoupled_resources(Some("1".into()), Some("512Mi".into()), Some("1Gi".into()))
+            build_decoupled_resources(Some("1".into()), Some("4Gi".into()), Some("1Gi".into()))
                 .unwrap();
-        let limits = rr.limits.unwrap();
-        let requests = rr.requests.unwrap();
-        assert_eq!(limits["cpu"].0.clone(), "1");
-        assert_eq!(requests["cpu"].0.clone(), "50m");
-        assert_eq!(limits["memory"].0.clone(), "512Mi");
-        assert_eq!(requests["memory"].0.clone(), "64Mi");
-        assert_eq!(limits["ephemeral-storage"].0.clone(), "1Gi");
-        assert_eq!(requests["ephemeral-storage"].0.clone(), "512Mi");
+        let (limits, requests) = (rr.limits.clone().unwrap(), rr.requests.unwrap());
+        assert_eq!(limits["cpu"].0, "1");
+        assert_eq!(limits["memory"].0, "4Gi");
+        assert_eq!(limits["ephemeral-storage"].0, "1Gi");
+        assert_eq!(requests["cpu"].0, "50m");
+        // Large limit: request caps at 1Gi for weight-aware scheduling.
+        assert_eq!(requests["memory"].0, "1Gi");
+        assert_eq!(requests["ephemeral-storage"].0, "512Mi");
+    }
+
+    #[test]
+    fn decoupled_resources_memory_request_never_exceeds_limit() {
+        for (limit, expected_request) in [
+            ("512Mi", "512Mi"), // small: request = limit
+            ("1Gi", "1Gi"),     // boundary
+            ("2Gi", "1Gi"),     // large: capped at 1Gi
+            ("4Gi", "1Gi"),     // large: capped at 1Gi
+            ("weird", "weird"), // unparseable: falls back to limit
+        ] {
+            let rr = build_decoupled_resources(None, Some(limit.into()), None)
+                .expect("memory alone builds requirements");
+            let requests = rr.requests.as_ref().unwrap();
+            assert_eq!(
+                requests["memory"].0, expected_request,
+                "limit={limit}: request must never exceed limit"
+            );
+        }
+    }
+
+    #[test]
+    fn min_memory_request_covers_decimal_and_scientific_quantities() {
+        // Integer suffixes (the original matrix). "1Gi" is at the boundary:
+        // the parser rounds to exactly 1GiB, so the original string is kept
+        // (which happens to also be "1Gi" — same value, different reason).
+        for (limit, expected) in [
+            ("512Mi", "512Mi"),
+            ("1Gi", "1Gi"),
+            ("2Gi", "1Gi"),
+            ("4Gi", "1Gi"),
+        ] {
+            assert_eq!(min_memory_request(limit), expected, "limit={limit}");
+        }
+        // Codex rounding-boundary counterexamples: values just under 1GiB
+        // that the shared parser rounds UP to exactly 1073741824 — the
+        // strict > comparison must keep the original limit (restoring >=
+        // would cap to "1Gi" and produce request > limit).
+        assert_eq!(
+            min_memory_request("1073741823.6"),
+            "1073741823.6",
+            "half-byte below 1GiB must keep the original limit"
+        );
+        assert_eq!(
+            min_memory_request("1073741823.9"),
+            "1073741823.9",
+            "0.1 bytes below 1GiB must keep the original limit"
+        );
+        // Codex counterexamples: legal K8s Quantity formats the local integer
+        // parser missed (decimal and scientific notation).
+        assert_eq!(min_memory_request("8.0Gi"), "1Gi", "decimal Gi caps to 1Gi");
+        assert_eq!(
+            min_memory_request("1.5Gi"),
+            "1Gi",
+            "1.5Gi >= 1Gi caps to 1Gi"
+        );
+        assert_eq!(
+            min_memory_request("8e9"),
+            "1Gi",
+            "8e9 bytes = ~7.45Gi caps to 1Gi"
+        );
+        assert_eq!(
+            min_memory_request("0.5Gi"),
+            "0.5Gi",
+            "0.5Gi < 1Gi keeps limit"
+        );
+        assert_eq!(
+            min_memory_request("1536Mi"),
+            "1Gi",
+            "1.5Gi in Mi caps to 1Gi"
+        );
+        // Unparseable: falls back to the limit (never exceeds it).
+        assert_eq!(min_memory_request("weird"), "weird");
     }
 
     // ---- build_app_resource_requirements：ephemeral 回退 storage ----

@@ -28,6 +28,8 @@ spec:
             - containerPort: 7681
               name: ttyd
           env:
+            - name: RCODER_USERAPP_DEFAULT_RECOVERY_ENABLED
+              value: "true"
             - name: TZ
               value: "Asia/Shanghai"
             - name: DOCKER_SOCKET_PATH

@@ -394,6 +394,27 @@ pub(in crate::pg) async fn lock_ops(
     let mut keys = std::collections::BTreeSet::new();
     for op in ops {
         match op {
+            PersistOp::ApplyAgentStatusObservation {
+                project_id,
+                observation,
+                ..
+            } => {
+                keys.insert(format!("project:{project_id}"));
+                keys.insert(format!("container-name:{}", observation.container_name));
+            }
+            PersistOp::StopProject(stop) => {
+                keys.insert(format!("project:{}", stop.expected.project_id()));
+                if let Some(basic) = stop.expected.container_info() {
+                    keys.insert(format!("container-name:{}", basic.container_name));
+                    keys.insert(format!("container:{}", basic.container_id));
+                }
+            }
+            PersistOp::AppendSessionForContainer(append) => {
+                keys.insert(format!("project:{}", append.project_id));
+                keys.insert(format!("session:{}", append.session_id));
+                keys.insert(format!("container-name:{}", append.container_name));
+                keys.insert(format!("container:{}", append.physical_uid));
+            }
             PersistOp::UserAppAgentMapping {
                 request_id,
                 command,
@@ -502,6 +523,15 @@ pub(in crate::pg) async fn execute_op(
     use PersistOp as Op;
     let db = tx;
     let outcome = match op {
+        Op::ApplyAgentStatusObservation {
+            project_id,
+            observation,
+            at,
+        } => repo::apply_agent_status_observation(db, project_id, observation, *at).await?,
+        Op::StopProject(stop) => super::project_stop::execute_stop(db, stop).await?,
+        Op::AppendSessionForContainer(append) => {
+            repo::append_session_for_container(db, append).await?
+        }
         Op::UserAppAgentMapping {
             request_id,
             command,

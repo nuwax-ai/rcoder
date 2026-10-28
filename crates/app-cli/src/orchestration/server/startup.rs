@@ -443,7 +443,7 @@ impl runtime_supervisor::OwnerCleanup for OwnerResidentCleanup {
         if let Some(host) = SupervisordHost::from_env_until(deadline).await? {
             let scope = crate::services::supervisor::resident::owner_scope()?
                 .context("supervisord owner cleanup capability missing")?;
-            let runtime_root = crate::proxy::compiler::runtime_root(&self.args.log_dir);
+            let runtime_root = crate::proxy::compiler::runtime_root(&self.args.log_dir)?;
             host.shutdown_owner_entry_until(&runtime_root, &scope, deadline)
                 .await?;
         }
@@ -610,7 +610,7 @@ async fn business_session_inner(
             if let Some(host) = host.as_ref() {
                 // 同容器换 owner 的启动收束：残留业务组先经 standby 摘流再停
                 //（同容器常驻 pingap 仍在服务旧路由——裸停会留裸 502 窗口）。
-                let standby_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+                let standby_root = crate::proxy::compiler::runtime_root(&args.log_dir)?;
                 host.stop_all(Some(&standby_root)).await?;
             }
             crate::static_hosting::reconcile(&[], &args.workspace, false).await
@@ -838,47 +838,78 @@ async fn business_session_inner(
         && !env_deploy_requested(&state)
         && !automatic_deployment_recovery_allowed(&state)?;
     let mut explicit_run_operation_id = None;
-    let mut first_request =
-        if explicit_run_replacement && ownership_claimed && !kernel_recovery_hold {
-            // A foreground run is an explicit request, unlike an automatic serve
-            // restart. Route lost-journal recovery through the same operation path
-            // as a CLI dispatch instead of guessing the old target/credentials.
-            state.mark_initialized();
-            explicit_run_operation_id = admit_explicit_run_replacement(&args, &state).await?;
-            None
-        } else if stop_intent {
-            None
-        } else if let Some(error) = startup_error.as_ref() {
-            state.begin_failure(format!("startup shutdown unconfirmed: {error:#}"), true);
-            None
-        } else if kernel_recovery_hold {
-            state.set_phase(ServerPhase::Idle);
-            None
-        } else {
-            match initialize_startup(&args, &state).await {
-                Ok(action) => action,
-                Err(error) => {
-                    tracing::error!(%error, "Deployment startup reconciliation failed");
-                    state.ready.set_ready(false);
-                    if state.runtime_recovery_hold_active() {
-                        // Unknown identity/boundary is not a failed operation of
-                        // this owner; preserve its original durable evidence.
-                        state.begin_failure(
-                            format!("startup recovery required: {error:#}"),
-                            !state.source_replacement_hold_only(),
-                        );
-                    } else if let Err(persist_error) = state
-                        .fail_operation(format!("deployment startup: {error:#}"), Boundary::Failed)
-                    {
-                        state.begin_failure(
-                            format!("deployment startup: {error:#}; persist: {persist_error:#}"),
-                            true,
-                        );
-                    }
-                    None
-                }
+    let retained_recovery = match std::env::var("APP_CLI_RECOVER_RETAINED") {
+        Ok(id)
+            if !id.is_empty()
+                && !foreground
+                && !args.control_only
+                && !crate::deploy::deploy_requested() =>
+        {
+            shared_types::validate_identifier(&id, "retained_recovery_operation_id")
+                .map_err(anyhow::Error::msg)?;
+            let kernel = state
+                .runtime_kernel()
+                .context("retained recovery requires runtime store")?;
+            if kernel.store().load_operation(&id)?.is_none() {
+                Some(id)
+            } else {
+                None
             }
-        };
+        }
+        Ok(_) | Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error).context("read retained recovery operation"),
+    };
+    let mut first_request = if let Some(operation_id) = retained_recovery
+        .filter(|_| ownership_claimed && !kernel_recovery_hold && !args.control_only)
+    {
+        state.mark_initialized();
+        if let Err(error) = admit_retained_workspace_recovery(&args, &state, operation_id).await {
+            state.begin_failure(
+                format!("retained workspace recovery failed: {error:#}"),
+                false,
+            );
+        }
+        None
+    } else if explicit_run_replacement && ownership_claimed && !kernel_recovery_hold {
+        // A foreground run is an explicit request, unlike an automatic serve
+        // restart. Route lost-journal recovery through the same operation path
+        // as a CLI dispatch instead of guessing the old target/credentials.
+        state.mark_initialized();
+        explicit_run_operation_id = admit_explicit_run_replacement(&args, &state).await?;
+        None
+    } else if stop_intent {
+        None
+    } else if let Some(error) = startup_error.as_ref() {
+        state.begin_failure(format!("startup shutdown unconfirmed: {error:#}"), true);
+        None
+    } else if kernel_recovery_hold {
+        state.set_phase(ServerPhase::Idle);
+        None
+    } else {
+        match initialize_startup(&args, &state).await {
+            Ok(action) => action,
+            Err(error) => {
+                tracing::error!(%error, "Deployment startup reconciliation failed");
+                state.ready.set_ready(false);
+                if state.runtime_recovery_hold_active() {
+                    // Unknown identity/boundary is not a failed operation of
+                    // this owner; preserve its original durable evidence.
+                    state.begin_failure(
+                        format!("startup recovery required: {error:#}"),
+                        !state.source_replacement_hold_only(),
+                    );
+                } else if let Err(persist_error) =
+                    state.fail_operation(format!("deployment startup: {error:#}"), Boundary::Failed)
+                {
+                    state.begin_failure(
+                        format!("deployment startup: {error:#}; persist: {persist_error:#}"),
+                        true,
+                    );
+                }
+                None
+            }
+        }
+    };
     // R03/B05：desired 读取先于启动决策；读取失败同样压制自动启动。
     if ownership_claimed && !kernel_recovery_hold {
         let mut desired_unreadable = false;
@@ -1183,7 +1214,7 @@ async fn serve_supervised_worker(
             if let Some(host) = host.as_ref() {
                 // 同容器换 owner 的启动收束：残留业务组先经 standby 摘流再停
                 //（同容器常驻 pingap 仍在服务旧路由——裸停会留裸 502 窗口）。
-                let standby_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+                let standby_root = crate::proxy::compiler::runtime_root(&args.log_dir)?;
                 host.stop_all(Some(&standby_root)).await?;
             }
             crate::static_hosting::reconcile(&[], &args.workspace, false).await
@@ -1763,6 +1794,7 @@ pub(super) async fn assemble_runtime_kernel(
         }
         let executing_id = match &action {
             DispatchAction::OrchestrateSource { operation_id, .. }
+            | DispatchAction::RecoverArtifact { operation_id, .. }
             | DispatchAction::DeployLocalArtifact { operation_id, .. }
             | DispatchAction::DeployArtifact { operation_id, .. } => Some(operation_id),
             _ => None,
@@ -1801,6 +1833,10 @@ pub(super) async fn assemble_runtime_kernel(
             | DispatchAction::DeployLocalArtifact { pg, .. } => dispatch_state.credential_recovery(
                 pg.as_ref(),
                 CredentialRecoveryPurpose::DeployCurrentArtifact,
+            ),
+            DispatchAction::RecoverArtifact { pg, .. } => dispatch_state.credential_recovery(
+                pg.as_ref(),
+                CredentialRecoveryPurpose::RestoreRetainedWorkspace,
             ),
             DispatchAction::StopBusiness { .. } | DispatchAction::CancelSource { .. } => {
                 Ok(CredentialRecovery::NotRequired)
@@ -1984,6 +2020,61 @@ pub(super) async fn assemble_runtime_kernel(
                     business_start,
                     management_deadline,
                 );
+            }
+            DispatchAction::RecoverArtifact {
+                operation_id,
+                release_id,
+                pg,
+            } => {
+                let state = dispatch_state.clone();
+                let workspace = owner_workspace.clone();
+                tokio::spawn(async move {
+                    let checked = async {
+                        let permit = wait_business_management(
+                            &state,
+                            &operation_id,
+                            business_start,
+                            management_deadline,
+                        )
+                        .await?;
+                        let release = crate::manifest::read_release_lock(&workspace)?;
+                        anyhow::ensure!(
+                            release.release_id == release_id,
+                            "Retained production artifact changed"
+                        );
+                        crate::manifest::preflight_startup(&workspace, false).await?;
+                        state.commit_business_relaunch(
+                            &operation_id,
+                            permit.as_ref(),
+                            management_deadline,
+                        )?;
+                        require_management_deadline(&operation_id, management_deadline)?;
+                        Ok::<_, anyhow::Error>(())
+                    }
+                    .await;
+                    if let Err(error) = checked {
+                        reject_business_intent(&state, &operation_id, error);
+                        return;
+                    }
+                    if state
+                        .control_tx
+                        .send(ControlSignal::RecoverArtifact {
+                            operation_id: operation_id.clone(),
+                            workspace,
+                            release_id,
+                            pg,
+                        })
+                        .is_err()
+                    {
+                        reject_business_intent(
+                            &state,
+                            &operation_id,
+                            anyhow::anyhow!("owner control channel closed"),
+                        );
+                    } else {
+                        state.request_business_relaunch();
+                    }
+                });
             }
             DispatchAction::OrchestrateSource {
                 operation_id,
@@ -2994,3 +3085,59 @@ pub(super) async fn admit_explicit_run_replacement(
 #[cfg(test)]
 #[path = "business_management_tests.rs"]
 mod business_management_tests;
+
+/// The platform only supplies an operation identity; the production target is
+/// always the owner's fixed mounted workspace, never an arbitrary request path.
+async fn admit_retained_workspace_recovery(
+    args: &RuntimeArgs,
+    state: &ServerState,
+    operation_id: String,
+) -> Result<()> {
+    let release = crate::manifest::read_release_lock(&args.workspace)
+        .context("Retained production code is incomplete")?;
+    let kernel = state
+        .runtime_kernel()
+        .context("Retained recovery requires a management owner")?;
+    let identity = kernel.identity();
+    let (_, revision) = kernel.store().load_desired()?;
+    let saved_pg = state
+        .journal
+        .lock()
+        .map_err(|_| anyhow::anyhow!("deployment journal lock poisoned"))?
+        .as_ref()
+        .and_then(|journal| journal.receipt.as_ref())
+        .and_then(|receipt| {
+            receipt
+                .active
+                .as_ref()
+                .and_then(|active| active.request.as_ref())
+                .or(Some(&receipt.request))
+        })
+        .and_then(|request| request.run_pg.clone());
+    let pg = credential_recovery::restored_run_pg(saved_pg.as_ref())?;
+    let request = shared_types::RuntimeOperationRequest {
+        operation_id,
+        expected_runtime_instance_id: identity.runtime_instance_id.clone(),
+        expected_revision: revision,
+        workspace_id: identity.workspace_id.clone(),
+        kind: shared_types::RuntimeOperationKind::Deploy,
+        profile: shared_types::RunProfileInput::Artifact {
+            artifact: shared_types::ArtifactInput::RetainedWorkspace {
+                release_id: release.release_id,
+            },
+        },
+        run_config: pg.map(|pg| shared_types::OperationRunConfig { pg: Some(pg) }),
+        request_context: Some("platform default-template recovery".into()),
+    };
+    kernel
+        .admit_with_control_hold(
+            request,
+            state.runtime_recovery_hold_active(),
+            state.native_control_blocker(),
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("Retained artifact admission failed: {}", error.message)
+        })?;
+    Ok(())
+}

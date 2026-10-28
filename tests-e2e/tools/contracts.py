@@ -12,6 +12,7 @@ HOT = {
     'restart retains B operation identity', 'restart retains B content despite cold A env',
     'restart preserves container identity', 'slow B accepted',
     'concurrent deployment rejected', 'A serves during prepare',
+    'temporary upstream outage retries the original B operation',
     'former capacity and entry settings do not reject B', 'B identity', 'B serves content', 'container unchanged', 'owned resource cleanup',
 } | {name + suffix for name in FAULTS for suffix in (' accepted', ' fails correct operation', ' old content healthy', ' no temporary residue')}
 WORKER = {
@@ -87,11 +88,26 @@ REQUIRED['userapp_scope_isolation_during_deploy'] = {
     'current 数组双 scope 同现（Dev RestartBuilder + Prod 部署族）',
     '隔离场景部署终态 running（并发不破坏部署）',
     '同域并发 restart → 恰一胜者 + 败者 409 带 blocker.scope=Dev',
+    '⑤f 前置：⑤b restart 原操作成功终态',
+    'strict purge 前并发 dev restart 原操作成功终态',
     'prod image and container identity recorded before cleanup',
     'prod diagnostics captured before deletion',
     'prod delete purge 回收',
-    '删除后流量转 502（backend 已注销）',
 }
+
+PURGE_RECOVERY = {
+    'purge captures exact runtime and original four data mounts',
+    'purged old traffic never recreates runtime or four data directories',
+    'purge recovery fresh verified URL is prepared',
+    'purge explicit fresh URL deployment is accepted',
+    'fresh purge deployment identity is recorded without losing old evidence',
+    'fresh purge deployment final diagnostics retained',
+    'purge fresh deployment serves HTTP with one runtime and new data',
+    'fresh purge recovery deployment is explicitly cleaned',
+    'fresh deployment purge remains absent under old traffic',
+}
+for scenario in ('userapp_deploy_full_chain', 'userapp_scope_isolation_during_deploy'):
+    REQUIRED[scenario] |= PURGE_RECOVERY
 
 REQUIRED['userapp_deploy_full_chain'] |= {
     f'流量七路[{name}]就绪' for name in (
@@ -103,6 +119,8 @@ REQUIRED['userapp_deploy_full_chain'] |= {
 # Frozen acceptance steps from reviewed baseline runs; never inferred at runtime.
 for _scenario, _steps in json.loads(Path(__file__).with_name('acceptance_steps.json').read_text()).items():
     REQUIRED.setdefault(_scenario, set()).update(_steps)
+for _backend in ('anthropic', 'openai'):
+    REQUIRED[f'after_terminal_{_backend}'].add('原请求真实终态前置（同 SID/RID/seq）')
 HOT.update({
     name + suffix for name in ('static-A', 'static-B', 'static-C')
     for suffix in (' accepted', ' identity', ' actual content')
@@ -180,6 +198,21 @@ REQUIRED['lb_new_session_cross_entry'] = {
     f'轮{i} {step}' for i, keyword in enumerate(('分布式', '微服务', '负载均衡'))
     for step in ('新会话跨入口收到事件', f'内容正确（含 {keyword}）')
 }
+REQUIRED['lb_stop_resume_same_sid_cross_entry'] = {
+    '停止前真实对话完整执行', '普通 Computer Stop 明确成功',
+    '停止后原 SID 一次受理且无降级', '停止后跨入口 SSE 收到当前请求',
+    '停止后原会话上下文保留', '停止后新轮完整且没有错误事件',
+    '普通 Computer Stop 后原入口自动恢复',
+    '本 case 计算资源受控停止',
+}
+REQUIRED['lb_pod_stop_then_chat_cross_entry'] = {
+    'pod/stop 前真实对话完整执行',
+    'pod/stop 后跨副本 chat 全部自动恢复（无 workload replaced 500）',
+    'pod/stop case 计算资源受控停止',
+} | {
+    f'停止后第 {round} 轮{step}' for round in range(1, 6)
+    for step in ('跨副本 chat 直接受理', '真实对话完整执行')
+}
 
 REQUIRED['docker_deletion_identity_contract'] |= {
     'Docker lifecycle process completed', 'Q01 real Docker test executed',
@@ -214,9 +247,85 @@ REQUIRED['native_terminal_release_crash_contract'] = {
 
 REQUIRED['docker_runtime_crash_recovery_contract'] = {'Docker crash contract process completed'} | {
     'Docker ' + mode + ' ' + step for mode in ('before_create', 'after_start') for step in (
-        'exact barrier established', 'SIGKILL observed', 'restart quarantines without replay', 'owned cleanup',
+        'exact barrier established', 'SIGKILL observed', 'restart retains original outcome without replay', 'owned cleanup',
     )
 }
+REQUIRED['docker_runtime_crash_recovery_contract'].add(
+    'Docker after_start normal ensure restores one usable builder and retains original receipt')
+
+REQUIRED['userapp_compute_stopped_failure_recovery_contract'] = {
+    'compute failure contract process completed',
+    'compute failure contract reports full success',
+    'compute failure frozen inputs verified',
+    'compute failure isolated controller and real builder prepared',
+    'compute failure original source serves HTTP',
+    'compute failure exact Stopped phase fault observed',
+    'compute failure diagnostic belongs to original operation',
+    'compute failure stop acknowledged without any start dispatch',
+    'compute failure revoked fault resumes original operation',
+    'compute failure one builder retains original data mounts',
+    'compute failure corrected source rebuild serves HTTP',
+    'compute failure source stayed frozen',
+    'compute failure owned cleanup retains volumes',
+}
+
+REQUIRED['computer_owner_conflict_contract'] = {
+    'owner contract process completed', 'owner contract required steps complete',
+    'owner contract reports full success', 'owner cleanup confirms retained data',
+    'owner original ensure registered captured compute',
+    'owner default English chat typed409 preserves A',
+    'owner default English ensure typed409 preserves A',
+    'owner explicit Chinese chat typed409 preserves A',
+    'owner explicit Chinese ensure typed409 preserves A',
+    'owner original project reensure preserves A',
+    'owner four trace owner proof without Chat dispatch',
+    'owner own compute cleanup retains data',
+    'owner preexisting resources preserved',
+}
+
+REQUIRED['userapp_compute_stop_timeout_recovery_contract'] = {
+    'compute failure contract process completed', 'compute failure contract reports full success',
+    'compute stop timeout corrected source rebuild serves HTTP',
+    'compute stop timeout durable checkpoint retains original physical intent',
+    'compute stop timeout expired reply preserves original recovery diagnostic',
+    'compute stop timeout frozen inputs verified',
+    'compute stop timeout isolated controller and real builder prepared',
+    'compute stop timeout one builder retains original data mounts',
+    'compute stop timeout original operation remains Stopping while reply unknown',
+    'compute stop timeout original source serves HTTP',
+    'compute stop timeout owned cleanup retains volumes',
+    'compute stop timeout real Stop completed before held reply',
+    'compute stop timeout released reply resumes original operation',
+    'compute stop timeout source stayed frozen',
+    'compute stop timeout unknown period has no Start or Create',
+}
+
+REQUIRED['userapp_compute_late_stop_cid_absence_recovery_contract'] = {
+    'compute failure contract process completed',
+    'compute failure contract reports full success',
+    'compute stop timeout corrected source rebuild serves HTTP',
+    'compute stop timeout delayed original Stop misses only the old CID',
+    'compute stop timeout durable checkpoint retains original physical intent',
+    'compute stop timeout expired original request preserves original recovery diagnostic',
+    'compute stop timeout frozen inputs verified',
+    'compute stop timeout isolated controller and real builder prepared',
+    'compute stop timeout one builder retains original data mounts',
+    'compute stop timeout original Stop request held before upstream',
+    'compute stop timeout original operation remains Stopping while reply unknown',
+    'compute stop timeout original source serves HTTP',
+    'compute stop timeout owned cleanup retains volumes',
+    'compute stop timeout released reply resumes original operation',
+    'compute stop timeout source stayed frozen',
+    'compute stop timeout unknown period has no Start or Create',
+}
+
+REQUIRED['userapp_dev_idle_recycle_owner_recovery'].update({
+    'dev business proxy reaches original source before idle',
+    'first recycle: explicit Start restores one owner and proxy HTTP',
+    'first recycle: first business proxy request has no preparatory control',
+    'first recycle: first business proxy request recreated one builder',
+    'first recycle: first business proxy response matches dev builder-only contract',
+})
 
 REQUIRED['userapp_dev_app_proxy_lazy_start'].update({
     'lazy recreation removes only captured builder',
@@ -293,4 +402,29 @@ REQUIRED['host_k8s_userapp_dev_compute_no_llm'] = USERAPP_COMPUTE | {
     'host K8s explicit namespace',
     'host K8s RCoder reachable',
     'userapp K8s test resources absent after purge',
+}
+
+AUTO_RELOAD_SESSION_IDENTITY = {
+    f'new_project_{index} {step}' for index in range(3) for step in (
+        'project identity', 'real session', 'no fictional reload',
+        'independent session', 'real response', 'complete turn',
+    )
+} | {
+    f'{phase} {step}' for phase in ('resume_real', 'legacy_client_hint') for step in (
+        'retains real session', 'actual reload', 'real response', 'complete turn',
+    )
+}
+for _backend in ('anthropic', 'openai'):
+    REQUIRED[f'auto_reload_session_identity_{_backend}'] = AUTO_RELOAD_SESSION_IDENTITY.copy()
+
+from devcomputer_protocol_contract import STEPS as DEVCOMPUTER_PROTOCOL_STEPS
+
+REQUIRED['devcomputer_main_protocol_contract'] = DEVCOMPUTER_PROTOCOL_STEPS | {
+    'devcomputer protocol child completed', 'devcomputer original result explicit',
+}
+
+REQUIRED['devcomputer_main_real_model_smoke'] = {
+    'devcomputer real model omits explicit reload', 'devcomputer direct real model accepted',
+    'devcomputer direct real model actual SID', 'devcomputer direct real model exact terminal',
+    'devcomputer direct real model unique marker', 'devcomputer direct real model sequenced events',
 }

@@ -22,6 +22,10 @@ use rcoder_e2e::common::report::JsonlReporter;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use rcoder_e2e::common::dev_restart_settlement;
+#[path = "support/purge_recovery.rs"]
+mod purge_recovery;
+
 /// 套件级串行锁（对齐 compose_userapp_dev：单机资源天花板下防 builder 挤兑）。
 static SCENARIO_GATE: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
 
@@ -203,11 +207,14 @@ fn cleanup_builder(app_id: &str) {
 /// 前置探测：app-runtime 镜像存在 + agent-runner 镜像含 template-cli。
 /// 返回 None = 前置不满足（调用方 skip）。
 async fn preflight(report: &JsonlReporter) -> Option<()> {
+    let builder = env_or("E2E_BUILDER_IMAGE", "dev-rcoder-agent-runner:latest");
+    let runtime = env_or("E2E_RUNTIME_IMAGE", "dev-app-runtime:latest");
     let toolchains = std::process::Command::new("python3")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../docker/verify-userapp-toolchains.py"
         ))
+        .args(["--builder", builder.as_str(), "--runtime", runtime.as_str()])
         .output();
     let (compatible, detail) = match toolchains {
         Ok(output) => (
@@ -230,12 +237,12 @@ async fn preflight(report: &JsonlReporter) -> Option<()> {
     }
 
     let runtime_ok = std::process::Command::new("docker")
-        .args(["image", "inspect", "dev-app-runtime:latest"])
+        .args(["image", "inspect", runtime.as_str()])
         .output()
         .is_ok_and(|o| o.status.success());
     if !runtime_ok {
         report.diagnostic(
-            "preflight dev-app-runtime:latest",
+            "preflight selected app-runtime",
             "missing",
             "app 运行时镜像不存在：make docker-build-app-runtime",
         );
@@ -247,7 +254,7 @@ async fn preflight(report: &JsonlReporter) -> Option<()> {
             "--rm",
             "--entrypoint",
             "sh",
-            "dev-rcoder-agent-runner:latest",
+            builder.as_str(),
             "-c",
             "command -v template-cli",
         ])
@@ -2198,16 +2205,32 @@ async fn verify_stop_and_explicit_start(env: &Env, report: &JsonlReporter, app: 
     }
 }
 
-/// 回收：prod delete purge → 流量转 502。
-async fn cleanup_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str) {
+/// Purge cannot be undone by traffic; a caller's fresh URL can deploy again.
+async fn cleanup_prod(
+    env: &Env,
+    report: &JsonlReporter,
+    app: &str,
+    user: &str,
+    artifact: Option<(&str, &str)>,
+) {
     let identity =
         rcoder_e2e::common::resources::register_created_container(&format!("rcoder-app-{app}"));
+    let registered = identity.is_ok();
     report.assert_hard(
         "prod image and container identity recorded before cleanup",
         identity.is_ok(),
         identity
             .err()
             .unwrap_or_else(|| "resource receipt recorded".into()),
+    );
+    if !registered {
+        return;
+    }
+    let captured = purge_recovery::capture(app);
+    report.assert_hard(
+        "purge captures exact runtime and original four data mounts",
+        captured.is_ok(),
+        captured.as_ref().err().cloned().unwrap_or_default(),
     );
     let capture = rcoder_e2e::common::resources::capture_container(&format!("rcoder-app-{app}"));
     report.assert_hard(
@@ -2226,31 +2249,12 @@ async fn cleanup_prod(env: &Env, report: &JsonlReporter, app: &str, user: &str) 
         s.is_success() && http_ok(&b),
         format!("HTTP {s}, body 截断: {}", trunc(&b, 150)),
     );
-    // 删除后流量应转 502（backend 注销）；宽限重试几秒防注销竞态
-    let mut code = None;
-    for _ in 0..6 {
-        if let Ok(resp) = env
-            .http
-            .get(format!(
-                "{}/api/v1/userapp/proxy/app/prod/{user}/{app}/react/",
-                pingora_base()
-            ))
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await
-        {
-            code = Some(resp.status().as_u16());
-            if code == Some(502) {
-                break;
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+    if s.is_success()
+        && http_ok(&b)
+        && let Ok(captured) = captured
+    {
+        purge_recovery::verify(env, report, app, user, captured, artifact).await;
     }
-    report.assert_hard(
-        "删除后流量转 502（backend 已注销）",
-        code == Some(502),
-        format!("last status = {code:?}"),
-    );
 }
 
 #[tokio::test]
@@ -2307,7 +2311,7 @@ async fn userapp_deploy_full_chain() {
     {
         // ⑤ 部署 + 七路流量 ⑤b prod 观测族 ⑥ 回收
         if !deploy_and_verify_traffic(&env, &report, &app, user, &release_id, &sha256).await {
-            cleanup_prod(&env, &report, &app, user).await;
+            cleanup_prod(&env, &report, &app, user, None).await;
             cleanup_builder(&app);
             let path = report.path.display().to_string();
             assert!(report.finish(), "cold deployment failed: {path}");
@@ -2337,7 +2341,7 @@ async fn userapp_deploy_full_chain() {
             verify_immediate_runtime_password(&env, &report, &app, user).await;
             verify_password_governance_after_change(&env, &report, &app, user).await;
         }
-        cleanup_prod(&env, &report, &app, user).await;
+        cleanup_prod(&env, &report, &app, user, Some((&release_id, &sha256))).await;
     }
     // No production request was sent when build/artifact preparation failed.
     // Keep the original failure and clean the builder; do not invent a missing
@@ -2604,30 +2608,16 @@ async fn userapp_scope_isolation_during_deploy() {
     // 观测）可持续 ~80s。⑤f 测的是"两路并发 restart 互斥"，不是"撞上第三
     // 路的执行窗口"——先等 ⑤b 的操作到终态（有界），再发两路，语义才成立
     //（2026-09-27 三次复现：不等则两路必然双 409 被 ⑤b 挡住）。
-    let restart_op = rb["data"]["operation_id"].as_str().unwrap_or("").to_owned();
     let t0 = Instant::now();
-    let mut restart_settled = restart_op.is_empty();
-    while !restart_settled && t0.elapsed() < Duration::from_secs(150) {
-        let (s, b) = get_json(
-            &env,
-            &format!("/api/v1/userapp/{app}/operations/current?user_id={user}"),
-        )
-        .await;
-        let blocking = s.is_success()
-            && http_ok(&b)
-            && b["data"].as_array().is_some_and(|ops| {
-                ops.iter().any(|op| {
-                    op["operation_id"].as_str() == Some(restart_op.as_str())
-                        && op["state"].as_str().is_some_and(|st| {
-                            st == "Running" || st == "Pending" || st == "RecoveryRequired"
-                        })
-                })
-            });
-        restart_settled = !blocking;
-        if !restart_settled {
-            tokio::time::sleep(Duration::from_millis(1000)).await;
-        }
-    }
+    let restart_settlement = dev_restart_settlement::wait(
+        &env.http,
+        &env.rcoder,
+        &app,
+        std::slice::from_ref(&rb),
+        t0 + dev_restart_settlement::BUDGET,
+    )
+    .await;
+    let restart_settled = restart_settlement.is_ok();
     report.diagnostic(
         "⑤f 前置：⑤b restart 终态等待",
         &format!("{:.1}s", t0.elapsed().as_secs_f32()),
@@ -2637,10 +2627,23 @@ async fn userapp_scope_isolation_during_deploy() {
             "still running (timeout)"
         },
     );
+    report.assert_hard(
+        "⑤f 前置：⑤b restart 原操作成功终态",
+        restart_settled,
+        format!("{restart_settlement:?}"),
+    );
+    if !restart_settled {
+        // Do not issue new controls or destructive cleanup over an execution
+        // whose original terminal result remains unresolved.
+        let path = report.path.display().to_string();
+        assert!(report.finish(), "场景失败：断言明细见 {path}");
+        return;
+    }
 
     // ⑤f 同域并发 dev restart 反例（required 契约步）：两路不同 request 的
     // dev restart 并发 → 恰一胜者受理，败者 409 信封携带结构化
     // blocker.scope=Dev（M3 透传；不解析消息文本）。
+    let dev_restart_deadline = Instant::now() + dev_restart_settlement::BUDGET;
     let dr_http = env.http.clone();
     let dr_base = env.rcoder.clone();
     let dr_app = app.clone();
@@ -2694,7 +2697,7 @@ async fn userapp_scope_isolation_during_deploy() {
     //（OpenAPI 已声明 "no internal queue"），不与 UserApp 200 信封混用。
     let conflict_envelope = |s: reqwest::StatusCode, b: &Value| {
         (s.as_u16() == 409 || s.is_success())
-            && b["code"].as_str() == Some("ERR_CONFLICT")
+            && b["code"].as_str() == Some(shared_types::ERR_OPERATION_IN_PROGRESS)
             && b["blocker"]["scope"].as_str() == Some("Dev")
     };
     let b_conflict = conflict_envelope(drb_s, &drb_b);
@@ -2720,18 +2723,41 @@ async fn userapp_scope_isolation_during_deploy() {
         ),
     );
 
+    // Admission is not completion. Observe every distinct original Dev intent
+    // while the existing Prod assertions continue; all share one deadline.
+    // JoinSet cancels this read-only observer if the outer fixture exits early.
+    let admitted_dev_restarts: Vec<Value> = [(dra_s, &dra_b), (drb_s, &drb_b)]
+        .into_iter()
+        .filter(|(status, body)| status.is_success() && body["success"] == true)
+        .map(|(_, body)| Value::clone(body))
+        .collect();
+    let observe_http = env.http.clone();
+    let observe_base = env.rcoder.clone();
+    let observe_app = app.clone();
+    let mut dev_restart_observers = tokio::task::JoinSet::new();
+    dev_restart_observers.spawn(async move {
+        dev_restart_settlement::wait(
+            &observe_http,
+            &observe_base,
+            &observe_app,
+            &admitted_dev_restarts,
+            dev_restart_deadline,
+        )
+        .await
+    });
+
     // ⑤e 同域并发反例：窗口内第二个 prod start（不同 request_id）→
-    // 信封 ERR_CONFLICT + 结构化 blocker.scope=Prod。修复前：冲突但无 blocker 字段。
+    // 信封 ERR_OPERATION_IN_PROGRESS + blocker.scope=Prod；符合公开的操作槽互斥契约。
     let (cs, cb) = second_task.await.expect("second start task join");
     let same_scope_conflict = cs.is_success()
-        && cb["code"].as_str() == Some("ERR_CONFLICT")
+        && cb["code"].as_str() == Some(shared_types::ERR_OPERATION_IN_PROGRESS)
         && cb["blocker"]["scope"].as_str() == Some("Prod")
         && cb["blocker"]["kind"].as_str() == Some("StartDeployment")
         && cb["blocker"]["operation_id"]
             .as_str()
             .is_some_and(|id| !id.is_empty());
     report.assert_hard(
-        "同域并发 prod start → 信封 ERR_CONFLICT + blocker.scope=Prod",
+        "同域并发 prod start → 信封 ERR_OPERATION_IN_PROGRESS + blocker.scope=Prod",
         same_scope_conflict,
         format!("HTTP {cs}, body 截断: {}", trunc(&cb, 240)),
     );
@@ -2777,8 +2803,25 @@ async fn userapp_scope_isolation_during_deploy() {
         ),
     );
 
+    let dev_restart_settlement = match dev_restart_observers.join_next().await {
+        Some(Ok(result)) => result,
+        Some(Err(error)) => Err(format!("original Dev restart observer failed: {error}")),
+        None => Err("original Dev restart observer was not started".to_owned()),
+    };
+    let dev_restarts_settled = dev_restart_settlement.is_ok();
+    report.assert_hard(
+        "strict purge 前并发 dev restart 原操作成功终态",
+        dev_restarts_settled,
+        format!("{dev_restart_settlement:?}"),
+    );
+    if !dev_restarts_settled {
+        let path = report.path.display().to_string();
+        assert!(report.finish(), "场景失败：断言明细见 {path}");
+        return;
+    }
+
     // ⑥ 回收（复用 full_chain 清理链）
-    cleanup_prod(&env, &report, &app, user).await;
+    cleanup_prod(&env, &report, &app, user, Some((&release_id, &sha256))).await;
     cleanup_builder(&app);
 
     let path = report.path.display().to_string();

@@ -315,6 +315,8 @@ where
                     start_config,
                     service_uuid: None,
                     force_new_session: false,
+                    api_key_manager: None,
+                    project_uuid_map: None,
                 },
             )
             .await?;

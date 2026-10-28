@@ -309,8 +309,61 @@ impl BusinessReadinessObserver {
             };
         };
 
-        // 确认停止：相位回 Idle 且业务 ready 标志已撤销（StopBusiness 收束路径
-        // 恒经此组合）。stopped 不需要任何网络探测。
+        // 停止意图已受理且尚未收束（内核中存在 admitted、非终态的 Stop 运行
+        // 操作）：整个停机窗口（standby 发布 → 业务停止 → 终态持久化）顶层
+        // 一律 stopping/STOP_ACCEPTED。先于 Idle 和代理换代判断：Idle 可能
+        // 只是恢复驱动者停驻，不能证明未终态 Stop 已完成清理；standby 发布
+        // 本身也是一次 official 换代事务。Restart/热部署没有 Stop 受理，
+        // 不受影响。扫描失败则无法确认是否有未收束停止，显式返回 unknown，
+        // 不借用旧 ready/stopped 结果；观察本身不恢复或改写记录。
+        let stop_observation =
+            server
+                .runtime_kernel()
+                .and_then(|kernel| match kernel.outstanding_stop_operations() {
+                    Ok(stops) => stops.into_iter().min().map(|id| {
+                        (
+                            UserAppReadinessStatus::Stopping,
+                            UserAppReadinessReason::StopAccepted,
+                            Some(id),
+                        )
+                    }),
+                    Err(error) => {
+                        tracing::debug!(
+                            "business readiness: outstanding stop scan failed: {error:#}"
+                        );
+                        Some((
+                            UserAppReadinessStatus::Unknown,
+                            UserAppReadinessReason::ObserveIncomplete,
+                            operation_id.clone(),
+                        ))
+                    }
+                });
+        if let Some((status, reason, operation_id)) = stop_observation {
+            return UserAppBusinessReadiness {
+                ready: false,
+                status,
+                reason_code: Some(reason),
+                checked_at,
+                runtime_instance_id: instance_id,
+                serving_release_id: None,
+                target_release_id: None,
+                operation_id,
+                observation_revision: 0,
+                proxy: UserAppProxyReadiness {
+                    ready: false,
+                    status,
+                    reason_code: Some(reason),
+                    // 停止窗口入口仍是 standby mock（先摘流后停业务）：附加
+                    // 已核验的来源契约，故障页管线才能替换停止中/已停止文案
+                    error_origin_contract: standby_origin_contract(proxy_confirmation.as_ref()),
+                    confirmation: proxy_confirmation,
+                },
+                services: Vec::new(),
+            };
+        }
+
+        // 无未收束 Stop 后，Idle + ready=false 才能视为确认停止。
+        // 正常 StopBusiness 先持久化终态，再回 Idle；此处无需网络探测。
         if matches!(phase, ServerPhase::Idle) && !server.runtime_status().is_ready() {
             return UserAppBusinessReadiness {
                 ready: false,
@@ -326,7 +379,7 @@ impl BusinessReadinessObserver {
                     ready: false,
                     status: UserAppReadinessStatus::Stopped,
                     reason_code: None,
-                    error_origin_contract: None,
+                    error_origin_contract: standby_origin_contract(proxy_confirmation.as_ref()),
                     confirmation: None,
                 },
                 services: Vec::new(),
@@ -340,6 +393,7 @@ impl BusinessReadinessObserver {
                 UserAppReadinessStatus::Starting => UserAppReadinessReason::ServiceStarting,
                 UserAppReadinessStatus::Failed => UserAppReadinessReason::OrchestrationFailed,
                 UserAppReadinessStatus::NotDeployed
+                | UserAppReadinessStatus::Provisioning
                 | UserAppReadinessStatus::Stopping
                 | UserAppReadinessStatus::Stopped
                 | UserAppReadinessStatus::Ready
@@ -760,6 +814,23 @@ async fn fetch_admin_snapshot(
     }
 }
 
+/// standby 摘流窗口的来源契约（停止短路路径专用）。
+///
+/// 证据链：[`crate::proxy::compiler::record_confirmed_publication`] 只在
+/// admin 回报 hash 与 standby 期望一致、全部入口探针按 503 通过后写入
+/// confirmed Standby 相位（同时 pin 实例与配置摘要）；停止受理/已停止
+/// 短路不重发网络探测，直接消费该已核验记录。相位被后续发布事务覆盖
+/// （Preparing/Starting/Serving）后本函数自然失效——那时的入口要么仍在
+/// 旧 standby（短窗口，走全量探测路径由 `derive_proxy` 核验），要么已换代。
+fn standby_origin_contract(
+    confirmation: Option<&shared_types::ProxyConfirmation>,
+) -> Option<String> {
+    let confirmed_standby = confirmation.is_some_and(|confirmation| {
+        confirmation.confirmed && matches!(confirmation.phase, shared_types::ProxyPhase::Standby)
+    });
+    confirmed_standby.then(|| shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT.to_string())
+}
+
 /// 代理就绪推导：入口监听 + 生效 hash 匹配；来源契约仅在 hash 确认时透出。
 #[allow(clippy::type_complexity)]
 fn derive_proxy(
@@ -827,6 +898,19 @@ fn derive_proxy(
             UserAppReadinessStatus::Degraded,
             Some(UserAppReadinessReason::ProxyConfigMismatch),
             None,
+        );
+    }
+    // standby 摘流窗口：入口 mock 直出全部请求（无 upstream 代理），响应来源
+    // 全部为 Pingap 自产——来源契约成立，透出给故障页管线做友好替换；业务
+    // 状态细分（starting/stopped/failed）由顶层推导与各服务观察给出。
+    if crate::proxy::compiler::official_confirmation().is_some_and(|confirmation| {
+        confirmation.confirmed && matches!(confirmation.phase, shared_types::ProxyPhase::Standby)
+    }) {
+        return (
+            false,
+            UserAppReadinessStatus::Unknown,
+            Some(UserAppReadinessReason::ProxyStandby),
+            Some(shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT.to_string()),
         );
     }
     if !publication_confirmed {
@@ -900,6 +984,7 @@ fn top_level_reason(
         UserAppReadinessStatus::Failed => return Some(UserAppReadinessReason::OrchestrationFailed),
         UserAppReadinessStatus::Degraded => Some(UserAppReadinessReason::HealthDegraded),
         UserAppReadinessStatus::NotDeployed
+        | UserAppReadinessStatus::Provisioning
         | UserAppReadinessStatus::Starting
         | UserAppReadinessStatus::Stopping
         | UserAppReadinessStatus::Stopped
@@ -916,6 +1001,262 @@ fn top_level_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// standby 摘流确认后：hash 匹配即透出来源契约（故障页管线据此信任
+    /// `X-Pingap-EType: rcoder-standby`），代理不宣称 ready，原因标 PROXY_STANDBY。
+    #[test]
+    fn standby_confirmation_exposes_error_origin_contract() {
+        let publication_id = "8204e27d-a7af-42f9-aa92-0b69964b8df2";
+        let expected_hash = "STANDBYHASH01".to_string();
+        let outcome = crate::proxy::compiler::CompileOutcome {
+            serving_release_id: None,
+            operation_id: Some("standby-operation".into()),
+            config_path: "unused-standby-candidate.toml".into(),
+            expected_hash: expected_hash.clone(),
+            publication_id: publication_id.into(),
+            config_digest: "b".repeat(64),
+            entry_probes: vec![crate::proxy::compiler::ProxyProbeTarget {
+                address: "127.0.0.1:9080".parse().unwrap(),
+                expected_status: 503,
+            }],
+            business_probes: vec![],
+        };
+        let confirmed = crate::proxy::apply_status::ConfirmedPublication {
+            process_id: std::process::id(),
+            instance_id: "instance-standby".into(),
+            publication_id: publication_id.into(),
+            config_hash: expected_hash.clone(),
+            config_digest: outcome.config_digest.clone(),
+            attempt_id: 1,
+            operation_id: Some("standby-operation".into()),
+        };
+        crate::proxy::compiler::record_confirmed_publication(&outcome, &confirmed).unwrap();
+        assert!(matches!(
+            crate::proxy::compiler::official_confirmation()
+                .expect("standby confirmation recorded")
+                .phase,
+            shared_types::ProxyPhase::Standby
+        ));
+
+        let admin = admin_probe::AdminBasicSnapshot {
+            process_id: Some(std::process::id()),
+            config_hash: Some(expected_hash),
+            upstreams: std::collections::HashMap::new(),
+        };
+        let (ready, status, reason, contract) =
+            derive_proxy(Some(&admin), true, ServerPhase::Running, false);
+        assert!(!ready, "standby must not claim proxy readiness");
+        assert_eq!(status, UserAppReadinessStatus::Unknown);
+        assert_eq!(reason, Some(UserAppReadinessReason::ProxyStandby));
+        assert_eq!(
+            contract.as_deref(),
+            Some(shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT),
+            "standby window responses are entirely proxy-self-produced"
+        );
+    }
+
+    /// 非 standby 的未确认发布（serving 确认缺失）不透出来源契约——原行为不变。
+    #[test]
+    fn unconfirmed_serving_publication_still_hides_origin_contract() {
+        let publication_id = "0b69964b-8df2-42f9-aa92-8204e27da7af";
+        let expected_hash = "SERVINGHASH01".to_string();
+        let outcome = crate::proxy::compiler::CompileOutcome {
+            serving_release_id: Some("rel-serving".into()),
+            operation_id: None,
+            config_path: "unused-serving-candidate.toml".into(),
+            expected_hash: expected_hash.clone(),
+            publication_id: publication_id.into(),
+            config_digest: "c".repeat(64),
+            entry_probes: vec![crate::proxy::compiler::ProxyProbeTarget {
+                address: "127.0.0.1:9080".parse().unwrap(),
+                expected_status: 200,
+            }],
+            business_probes: vec![],
+        };
+        let confirmed = crate::proxy::apply_status::ConfirmedPublication {
+            process_id: std::process::id(),
+            instance_id: "instance-serving".into(),
+            publication_id: publication_id.into(),
+            config_hash: expected_hash.clone(),
+            config_digest: outcome.config_digest.clone(),
+            attempt_id: 1,
+            operation_id: None,
+        };
+        crate::proxy::compiler::record_confirmed_publication(&outcome, &confirmed).unwrap();
+
+        let admin = admin_probe::AdminBasicSnapshot {
+            process_id: Some(std::process::id()),
+            config_hash: Some(expected_hash),
+            upstreams: std::collections::HashMap::new(),
+        };
+        let (ready, status, reason, contract) =
+            derive_proxy(Some(&admin), true, ServerPhase::Running, false);
+        assert!(!ready);
+        assert_eq!(status, UserAppReadinessStatus::Unknown);
+        assert_eq!(reason, Some(UserAppReadinessReason::ObserveIncomplete));
+        assert_eq!(contract, None);
+    }
+
+    /// 真实 observer 回归（Codex 复现）：已确认 Standby 后停止收束（Idle +
+    /// !ready），快照必须保留 Stopped 判定并附加来源契约——停止/已停止是
+    /// standby 摘流的预期业务路径，不能因短路丢契约导致代理不替换正文。
+    #[tokio::test]
+    async fn stopped_snapshot_keeps_standby_origin_contract() {
+        let publication_id = "60fdbd11-ad41-458e-9557-04a0cfba7fb3";
+        let expected_hash = "STOPSTANDBY01".to_string();
+        let outcome = crate::proxy::compiler::CompileOutcome {
+            serving_release_id: None,
+            operation_id: Some("stop-operation".into()),
+            config_path: "unused-stop-standby-candidate.toml".into(),
+            expected_hash: expected_hash.clone(),
+            publication_id: publication_id.into(),
+            config_digest: "d".repeat(64),
+            entry_probes: vec![crate::proxy::compiler::ProxyProbeTarget {
+                address: "127.0.0.1:9080".parse().unwrap(),
+                expected_status: 503,
+            }],
+            business_probes: vec![],
+        };
+        let confirmed = crate::proxy::apply_status::ConfirmedPublication {
+            process_id: std::process::id(),
+            instance_id: "instance-stop-standby".into(),
+            publication_id: publication_id.into(),
+            config_hash: expected_hash,
+            config_digest: outcome.config_digest.clone(),
+            attempt_id: 1,
+            operation_id: Some("stop-operation".into()),
+        };
+        crate::proxy::compiler::record_confirmed_publication(&outcome, &confirmed).unwrap();
+
+        // 已停止形态：Idle + runtime 未 ready（无需服务/网络探测的短路路径）。
+        let state = Arc::new(ServerState::new(
+            crate::runtime_status::RuntimeStatusService::default(),
+        ));
+        state.mark_initialized();
+        state.set_release(combo_lock(0));
+        state.set_phase(ServerPhase::Idle);
+        let observer = BusinessReadinessObserver::new(state.clone());
+        let observed = observer.observe().await;
+
+        assert_eq!(observed.status, UserAppReadinessStatus::Stopped);
+        assert_eq!(
+            observed.proxy.error_origin_contract.as_deref(),
+            Some(shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT),
+            "stopped window entry still serves the confirmed standby mock"
+        );
+    }
+
+    /// 无 Standby 确认记录的已停止快照不得透出来源契约（无证据不虚报）。
+    #[tokio::test]
+    async fn stopped_snapshot_without_standby_record_hides_origin_contract() {
+        let state = Arc::new(ServerState::new(
+            crate::runtime_status::RuntimeStatusService::default(),
+        ));
+        state.mark_initialized();
+        state.set_release(combo_lock(0));
+        state.set_phase(ServerPhase::Idle);
+        let observer = BusinessReadinessObserver::new(state.clone());
+        let observed = observer.observe().await;
+
+        assert_eq!(observed.status, UserAppReadinessStatus::Stopped);
+        assert_eq!(observed.proxy.error_origin_contract, None);
+    }
+
+    /// 来源契约只跟随已确认的 Standby 相位：未确认、其他相位、无记录均不透出。
+    #[test]
+    fn standby_origin_contract_follows_confirmed_standby_phase() {
+        let confirmation =
+            |confirmed: bool, phase: shared_types::ProxyPhase| shared_types::ProxyConfirmation {
+                contract: shared_types::ProxyConfirmationContract::OfficialRestartHttpV1,
+                confirmed,
+                phase,
+                operation_id: "op".into(),
+                proxy_instance_id: None,
+                config_digest: None,
+            };
+        assert_eq!(
+            standby_origin_contract(Some(&confirmation(true, shared_types::ProxyPhase::Standby)))
+                .as_deref(),
+            Some(shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT)
+        );
+        assert_eq!(
+            standby_origin_contract(Some(&confirmation(
+                false,
+                shared_types::ProxyPhase::Standby
+            ))),
+            None,
+            "unconfirmed standby must not prove the entry origin"
+        );
+        assert_eq!(
+            standby_origin_contract(Some(&confirmation(true, shared_types::ProxyPhase::Serving))),
+            None,
+            "only the standby phase proves the mock-window origin"
+        );
+        assert_eq!(
+            standby_origin_contract(Some(&confirmation(
+                true,
+                shared_types::ProxyPhase::Preparing
+            ))),
+            None,
+            "transitional publication phases must not inherit the standby contract"
+        );
+        assert_eq!(standby_origin_contract(None), None);
+    }
+
+    /// 停止受理窗口（未收束 Stop 短路）同样透出已核验的 standby 契约：
+    /// 摘流先于停业务，stopping 期间入口仍是 mock 直出。
+    #[tokio::test]
+    async fn stopping_snapshot_keeps_standby_origin_contract() {
+        let publication_id = "0b69964b-8df2-42f9-aa92-60fdbd11ad41";
+        let expected_hash = "STOPPINGSTANDBY01".to_string();
+        let outcome = crate::proxy::compiler::CompileOutcome {
+            serving_release_id: None,
+            operation_id: Some("stop-operation".into()),
+            config_path: "unused-stopping-standby-candidate.toml".into(),
+            expected_hash: expected_hash.clone(),
+            publication_id: publication_id.into(),
+            config_digest: "e".repeat(64),
+            entry_probes: vec![crate::proxy::compiler::ProxyProbeTarget {
+                address: "127.0.0.1:9080".parse().unwrap(),
+                expected_status: 503,
+            }],
+            business_probes: vec![],
+        };
+        let confirmed = crate::proxy::apply_status::ConfirmedPublication {
+            process_id: std::process::id(),
+            instance_id: "instance-stopping-standby".into(),
+            publication_id: publication_id.into(),
+            config_hash: expected_hash,
+            config_digest: outcome.config_digest.clone(),
+            attempt_id: 1,
+            operation_id: Some("stop-operation".into()),
+        };
+        crate::proxy::compiler::record_confirmed_publication(&outcome, &confirmed).unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let kernel = kernel_with_admitted_stop(root.path(), "stop-window-standby").await;
+        let state = Arc::new(ServerState::new(
+            crate::runtime_status::RuntimeStatusService::default(),
+        ));
+        state.mark_initialized();
+        state.set_release(combo_lock(19495));
+        state.set_phase(ServerPhase::Running);
+        assert!(state.set_runtime_kernel(kernel.clone()));
+
+        let observer = BusinessReadinessObserver::new(state.clone());
+        let observed = await_status(&observer, UserAppReadinessStatus::Stopping).await;
+        assert_eq!(
+            observed.reason_code,
+            Some(UserAppReadinessReason::StopAccepted),
+            "stop priority must stay untouched by the contract attachment"
+        );
+        assert_eq!(
+            observed.proxy.error_origin_contract.as_deref(),
+            Some(shared_types::PINGAP_ETYPE_ORIGIN_CONTRACT),
+            "stopping window entry still serves the confirmed standby mock"
+        );
+        assert!(observed.proxy.confirmation.is_some());
+    }
 
     #[tokio::test]
     async fn cache_keeps_the_observed_identity_when_state_changes_before_store() {
@@ -999,6 +1340,249 @@ mod tests {
         );
         confirmation.phase = shared_types::ProxyPhase::Serving;
         assert_eq!(proxy_transition_status(Some(&confirmation)), None);
+    }
+
+    /// 构造带一条已受理未收束 Stop 操作的内核（harness 对齐
+    /// server::kernel_startup_tests 的 kernel()/request() 形态）。
+    async fn kernel_with_admitted_stop(
+        root: &std::path::Path,
+        operation_id: &str,
+    ) -> Arc<crate::runtime_kernel::RuntimeKernel> {
+        use crate::runtime_kernel::{RuntimeKernel, RuntimeStore};
+        let source = root.join("workspace");
+        std::fs::create_dir_all(&source).unwrap();
+        let store = RuntimeStore::open_with_root(root.join("control"), &source).unwrap();
+        let identity = store
+            .load_or_init_identity(
+                "readiness-app".into(),
+                "userapp-dev".into(),
+                "workspace".into(),
+                source.to_string_lossy().into_owned(),
+                "readiness-generation".into(),
+            )
+            .unwrap();
+        let kernel = Arc::new(RuntimeKernel::new(store, identity, Box::new(|_| {})));
+        let request = shared_types::RuntimeOperationRequest {
+            operation_id: operation_id.into(),
+            expected_runtime_instance_id: kernel.identity().runtime_instance_id.clone(),
+            expected_revision: 0,
+            workspace_id: "workspace".into(),
+            kind: shared_types::RuntimeOperationKind::Stop,
+            profile: shared_types::RunProfileInput::Source {
+                workspace_id: "workspace".into(),
+            },
+            run_config: None,
+            request_context: None,
+        };
+        match kernel.admit(request).await {
+            Ok(crate::runtime_kernel::AdmissionOutcome::Accepted(_)) => kernel,
+            other => panic!("stop admission must be accepted, got {other:?}"),
+        }
+    }
+
+    /// 反例（修复前失败）：Stop 已受理未收束的整个窗口（含 standby 发布的
+    /// 代理过渡期）顶层必须是 stopping/STOP_ACCEPTED，收束后回到 stopped。
+    #[tokio::test]
+    async fn admitted_stop_reports_stopping_until_settled() {
+        let root = tempfile::tempdir().unwrap();
+        let kernel = kernel_with_admitted_stop(root.path(), "stop-window").await;
+        assert_eq!(
+            kernel.outstanding_stop_operations().unwrap(),
+            vec!["stop-window"]
+        );
+
+        let state = Arc::new(ServerState::new(
+            crate::runtime_status::RuntimeStatusService::default(),
+        ));
+        state.mark_initialized();
+        state.set_release(combo_lock(19493));
+        state.set_phase(ServerPhase::Running);
+        assert!(state.set_runtime_kernel(kernel.clone()));
+
+        let observer = BusinessReadinessObserver::new(state.clone());
+        let observed = await_status(&observer, UserAppReadinessStatus::Stopping).await;
+        assert!(!observed.ready);
+        assert_eq!(
+            observed.reason_code,
+            Some(UserAppReadinessReason::StopAccepted)
+        );
+        assert_eq!(observed.operation_id.as_deref(), Some("stop-window"));
+        assert!(observed.serving_release_id.is_none());
+        assert!(observed.target_release_id.is_none());
+        assert!(observed.services.is_empty());
+        assert_eq!(observed.proxy.status, UserAppReadinessStatus::Stopping);
+        assert_eq!(
+            observed.proxy.reason_code,
+            Some(UserAppReadinessReason::StopAccepted)
+        );
+        assert!(observed.proxy.confirmation.is_none());
+        assert_eq!(
+            observed.runtime_instance_id.as_deref(),
+            Some(kernel.identity().runtime_instance_id.as_str())
+        );
+
+        // 只读纪律：观察既不推进也不收束内核状态。
+        assert_eq!(
+            kernel.outstanding_stop_operations().unwrap(),
+            vec!["stop-window"]
+        );
+        assert_eq!(
+            kernel.status().await.unwrap().desired,
+            shared_types::DesiredState::Stopped
+        );
+
+        // 按 run_loop 收束顺序：先终态持久化，再回 Idle。
+        state
+            .finish_runtime_operation_by_id(
+                "stop-window",
+                shared_types::RuntimeOperationState::Succeeded,
+                None,
+            )
+            .await
+            .unwrap();
+        state.set_phase(ServerPhase::Idle);
+
+        let settled = await_status(&observer, UserAppReadinessStatus::Stopped).await;
+        assert_eq!(settled.reason_code, None);
+        assert_eq!(settled.operation_id, None);
+        assert!(kernel.outstanding_stop_operations().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_phase_does_not_confirm_an_unsettled_stop() {
+        let root = tempfile::tempdir().unwrap();
+        let kernel = kernel_with_admitted_stop(root.path(), "idle-stop").await;
+        let state = Arc::new(ServerState::new(
+            crate::runtime_status::RuntimeStatusService::default(),
+        ));
+        state.mark_initialized();
+        state.set_release(combo_lock(19495));
+        state.set_phase(ServerPhase::Idle);
+        assert!(state.set_runtime_kernel(kernel.clone()));
+
+        let observed = BusinessReadinessObserver::new(state.clone())
+            .observe()
+            .await;
+        assert_eq!(observed.status, UserAppReadinessStatus::Stopping);
+        assert_eq!(observed.operation_id.as_deref(), Some("idle-stop"));
+
+        // A parked recovery driver can be Idle while cleanup remains unknown.
+        // RecoveryRequired is deliberately nonterminal; phase alone proves no exit.
+        state
+            .finish_runtime_operation_by_id(
+                "idle-stop",
+                shared_types::RuntimeOperationState::RecoveryRequired,
+                Some((
+                    shared_types::ERR_BACKEND_ERROR.into(),
+                    "cleanup unknown".into(),
+                )),
+            )
+            .await
+            .unwrap();
+        let observed = BusinessReadinessObserver::new(state.clone())
+            .observe()
+            .await;
+        assert_eq!(observed.status, UserAppReadinessStatus::Stopping);
+        assert_eq!(
+            observed.reason_code,
+            Some(UserAppReadinessReason::StopAccepted)
+        );
+        assert!(!observed.ready);
+        assert_eq!(
+            kernel.outstanding_stop_operations().unwrap(),
+            vec!["idle-stop"]
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_stop_records_do_not_confirm_stopped() {
+        let root = tempfile::tempdir().unwrap();
+        let kernel = kernel_with_admitted_stop(root.path(), "unreadable-stop").await;
+        let record = root.path().join("control/operations/unreadable-stop.json");
+        let original = std::fs::read(&record).unwrap();
+        std::fs::write(&record, b"incomplete record").unwrap();
+        let state = Arc::new(ServerState::new(
+            crate::runtime_status::RuntimeStatusService::default(),
+        ));
+        state.mark_initialized();
+        state.set_release(combo_lock(19496));
+        assert!(state.set_runtime_kernel(kernel));
+
+        for phase in [ServerPhase::Idle, ServerPhase::Running] {
+            state.set_phase(phase);
+            let observed = BusinessReadinessObserver::new(state.clone())
+                .observe()
+                .await;
+            assert_eq!(observed.status, UserAppReadinessStatus::Unknown);
+            assert_eq!(
+                observed.reason_code,
+                Some(UserAppReadinessReason::ObserveIncomplete)
+            );
+            assert!(!observed.ready);
+            assert!(observed.serving_release_id.is_none());
+            assert_eq!(observed.proxy.status, UserAppReadinessStatus::Unknown);
+        }
+        // Observation neither repairs nor discards durable evidence. A later
+        // successful read must recover naturally through the same observer path.
+        assert_eq!(std::fs::read(&record).unwrap(), b"incomplete record");
+        std::fs::write(&record, original).unwrap();
+        let observed = BusinessReadinessObserver::new(state).observe().await;
+        assert_eq!(observed.status, UserAppReadinessStatus::Stopping);
+        assert_eq!(observed.operation_id.as_deref(), Some("unreadable-stop"));
+    }
+
+    /// 停止意图优先于代理过渡短路；无停止意图时过渡窗口（restart 语义）
+    /// 保持 starting 不回归。
+    #[tokio::test]
+    async fn stop_intent_outranks_proxy_transition_but_restart_window_keeps_starting() {
+        let state = Arc::new(ServerState::new(
+            crate::runtime_status::RuntimeStatusService::default(),
+        ));
+        state.mark_initialized();
+        state.set_release(combo_lock(19494));
+        state.set_phase(ServerPhase::Running);
+
+        // Part A：无停止意图 → 在途代理过渡（Stopping 相位）仍报 starting。
+        let outcome = crate::proxy::compiler::CompileOutcome {
+            serving_release_id: Some("rel-transition".into()),
+            operation_id: Some("fs-restart-window".into()),
+            config_path: "unused-transition-candidate.toml".into(),
+            expected_hash: "TRANSITIONHASH1".into(),
+            publication_id: uuid::Uuid::new_v4().to_string(),
+            config_digest: "b".repeat(64),
+            entry_probes: vec![],
+            business_probes: vec![],
+        };
+        crate::proxy::compiler::record_official_phase(
+            &outcome,
+            shared_types::ProxyPhase::Stopping,
+            None,
+        )
+        .unwrap();
+        let observer = BusinessReadinessObserver::new(state.clone());
+        let observed = observer.observe().await;
+        assert_eq!(observed.status, UserAppReadinessStatus::Starting);
+        assert_eq!(
+            observed.reason_code,
+            Some(UserAppReadinessReason::ServiceStarting)
+        );
+
+        // Part B：同一 state 注入已受理未收束的 Stop 内核 → stopping 覆盖过渡。
+        let root = tempfile::tempdir().unwrap();
+        let kernel = kernel_with_admitted_stop(root.path(), "stop-outrank").await;
+        assert!(state.set_runtime_kernel(kernel.clone()));
+        let observed = await_status(&observer, UserAppReadinessStatus::Stopping).await;
+        assert_eq!(
+            observed.reason_code,
+            Some(UserAppReadinessReason::StopAccepted)
+        );
+        assert_eq!(observed.operation_id.as_deref(), Some("stop-outrank"));
+        assert_ne!(observed.operation_id.as_deref(), Some("fs-restart-window"));
+        let confirmation = observed
+            .proxy
+            .confirmation
+            .expect("transition confirmation stays visible");
+        assert_eq!(confirmation.phase, shared_types::ProxyPhase::Stopping);
     }
 
     fn service(

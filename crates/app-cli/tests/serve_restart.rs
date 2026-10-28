@@ -260,6 +260,11 @@ async fn replaced_container_consumes_deploy_declaration_env() {
         "APP_DEPLOY_URL".into(),
         "http://127.0.0.1:1/absent.zip".into(),
     ));
+    // A previous recovery hint must never replace a current explicit deployment.
+    envs.push((
+        "APP_CLI_RECOVER_RETAINED".into(),
+        "obsolete-recovery".into(),
+    ));
     envs.push(("APP_RELEASE_ID".into(), "rel-replaced-1".into()));
     envs.push(("APP_DEPLOY_OPERATION_ID".into(), operation_id.into()));
     envs.push(("APP_DEPLOY_GENERATION_ID".into(), operation_id.into()));

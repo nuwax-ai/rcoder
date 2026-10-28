@@ -10,7 +10,7 @@
 //! 1. **首连资格**（served_sessions）：无游标客户端"首连兜 chat→SSE 时间差
 //!    （from_seq=0 全量回放）vs 中间连接纯实时（不重放，防重复红线）"的裁决；
 //!    turn 终态（end_turn/error）时归还资格——新一轮 turn 的首连重新可兜。
-//! 2. **活跃流登记**（active）：容器销毁路径（reaper/restart/destroyer）按
+//! 2. **活跃流登记**（active）：容器销毁路径（restart/destroyer）按
 //!    grpc_addr / session_id 取消该容器上的所有客户端转发 task。
 
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use tonic::Code;
 use tracing::info;
 
 /// SSE 共享流关闭回调类型（参数为 grpc_addr）。
-/// 容器销毁路径（reaper/restart/ensure/destroyer）按地址关闭前端进度流。
+/// 容器销毁路径（restart/ensure/destroyer）按地址关闭前端进度流。
 pub type ShutdownSseFn = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// 流错误重试上限（连接失败/流错误的重试次数）
@@ -81,12 +81,20 @@ impl Drop for StreamTaskGuard {
     }
 }
 
+/// Opaque snapshot of one observed first-client claim, used by delayed Stop cleanup.
+#[derive(Clone)]
+pub(crate) struct FirstClientClaimToken(Arc<()>);
+
+/// Individual forwarding tasks captured before a registration CAS. Keeping
+/// their tokens does not capture later tasks sharing a SID or stable address.
+pub(crate) struct CapturedSessionStreams(Vec<Arc<CancellationToken>>);
+
 /// SSE 流注册表（rcoder 进程级单例，挂在 `AppState`）。
 pub struct SessionStreamRegistry {
     /// 已服务过客户端的 session（首连资格）：跨转发 task 生命周期——
     /// 长 turn 中客户端断连重连不会误重放已收消息；终端事件时移除条目
     /// = 新一轮 turn 的首连重新获得资格。
-    served_sessions: DashMap<String, ()>,
+    served_sessions: DashMap<String, Arc<()>>,
     /// grpc_addr → 活跃 per-client 转发 task（容器销毁按 addr 批量取消）
     active: DashMap<String, Vec<ActiveStreamRegistration>>,
     admission: Mutex<Admission>,
@@ -164,8 +172,28 @@ impl SessionStreamRegistry {
     /// （live-only，不重放——防重复红线）。turn 终态自动归还资格。
     pub fn claim_first_client(&self, session_id: &str) -> bool {
         self.served_sessions
-            .insert(session_id.to_string(), ())
+            .insert(session_id.to_string(), Arc::new(()))
             .is_none()
+    }
+
+    pub(crate) fn capture_first_client_claim(
+        &self,
+        session_id: &str,
+    ) -> Option<FirstClientClaimToken> {
+        self.served_sessions
+            .get(session_id)
+            .map(|entry| FirstClientClaimToken(Arc::clone(entry.value())))
+    }
+
+    /// A delayed Stop cannot release a later subscription's same-SID claim.
+    pub(crate) fn release_first_client_claim_if_current(
+        &self,
+        session_id: &str,
+        captured: &FirstClientClaimToken,
+    ) -> bool {
+        self.served_sessions
+            .remove_if(session_id, |_, current| Arc::ptr_eq(current, &captured.0))
+            .is_some()
     }
 
     /// turn 终态（end_turn/error）归还首连资格：新一轮 turn 的首个客户端
@@ -228,7 +256,31 @@ impl SessionStreamRegistry {
         closed > 0
     }
 
-    /// 按 grpc_addr 批量关闭客户端转发流（容器销毁路径：reaper/restart/ensure/
+    pub(crate) fn capture_session_streams(&self, session_id: &str) -> CapturedSessionStreams {
+        let tokens = self
+            .active
+            .iter()
+            .flat_map(|entry| {
+                entry
+                    .value()
+                    .iter()
+                    .filter(|stream| stream.session_id == session_id)
+                    .filter_map(|stream| stream.token.upgrade())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        CapturedSessionStreams(tokens)
+    }
+
+    /// Cancellation does not require removing an entry by SID/address. Each
+    /// task's existing guard removes its own exact token when it really exits.
+    pub(crate) fn shutdown_captured_streams(&self, captured: CapturedSessionStreams) {
+        for token in captured.0 {
+            token.cancel();
+        }
+    }
+
+    /// 按 grpc_addr 批量关闭客户端转发流（容器销毁路径：restart/ensure/
     /// destroyer 调用——"project/session 记录可能已被清空、只剩 grpc_addr 可用"）。
     /// 幂等：重复调用返回 0。
     pub fn shutdown_streams_by_addr(&self, grpc_addr: &str) -> usize {
@@ -269,18 +321,20 @@ impl Default for SessionStreamRegistry {
     }
 }
 
-/// turn 边界终端：本轮任务真实结束（正常完成或错误终止）。
+/// turn 边界终端：本轮任务真实结束（共享契约见
+/// `shared_types::is_prompt_terminal_sub_type`）。
 /// `cancelled` 不算——它是"用户连发消息自动取消当前任务"的常态事件，agent 随后
 /// 继续执行新任务；此刻归还首连资格会破坏下一轮的 replay 语义。
 pub(crate) fn is_turn_terminal(message_type: &str, sub_type: &str) -> bool {
-    message_type == "SessionPromptEnd" && matches!(sub_type, "end_turn" | "error")
+    message_type == "SessionPromptEnd" && shared_types::is_prompt_terminal_sub_type(sub_type)
 }
 
-/// SSE 流关闭信号：turn 终态（end_turn/error）+ rcoder 内部合成的 `stream_ended`。
+/// SSE 流关闭信号：turn 终态（共享契约）+ rcoder 内部合成的 `stream_ended`。
 /// cancelled 不关流——它是"用户连发消息自动取消"的常态事件，流保持供下一轮
 /// 实时投递（与 agent_runner 侧订阅判定对齐）。
 pub(crate) fn is_stream_closing(message_type: &str, sub_type: &str) -> bool {
-    message_type == "SessionPromptEnd" && matches!(sub_type, "end_turn" | "error" | "stream_ended")
+    message_type == "SessionPromptEnd"
+        && (shared_types::is_prompt_terminal_sub_type(sub_type) || sub_type == "stream_ended")
 }
 
 pub(crate) fn maybe_update_activity(
@@ -306,22 +360,95 @@ fn now_millis() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-/// agent_runner 正常关流但未推终端时的兜底 SessionPromptEnd（seq=0 合成消息）
-pub(crate) fn make_prompt_end_event() -> ProgressEvent {
-    ProgressEvent {
-        message_type: "SessionPromptEnd".to_string(),
-        sub_type: "end_turn".to_string(),
-        payload: r#"{"reason":"EndTurn","description":"Agent has no task in execution"}"#
-            .to_string(),
-        request_id: None,
+#[derive(serde::Serialize)]
+enum SyntheticStatusReason {
+    EndTurn,
+    EpochChanged,
+}
+
+#[derive(serde::Serialize)]
+struct SyntheticStatusPayload {
+    reason: SyntheticStatusReason,
+    description: &'static str,
+}
+
+/// One Serde boundary for internal synthetic events. A failed serialization is
+/// returned to the stream owner; it must not fabricate a successful terminal.
+pub(super) fn serialize_synthetic_event<T: serde::Serialize>(
+    payload: &T,
+    message_type: &str,
+    sub_type: &str,
+    request_id: Option<String>,
+    timestamp: i64,
+) -> Result<ProgressEvent, serde_json::Error> {
+    Ok(ProgressEvent {
+        message_type: message_type.into(),
+        sub_type: sub_type.into(),
+        payload: serde_json::to_string(payload)?,
+        request_id,
         seq: 0,
-        timestamp: now_millis(),
-    }
+        timestamp,
+    })
+}
+
+/// agent_runner 正常关流但未推终端时的兜底 SessionPromptEnd（seq=0 合成消息）
+pub(crate) fn make_prompt_end_event() -> Result<ProgressEvent, serde_json::Error> {
+    serialize_synthetic_event(
+        &SyntheticStatusPayload {
+            reason: SyntheticStatusReason::EndTurn,
+            description: "Agent has no task in execution",
+        },
+        "SessionPromptEnd",
+        "end_turn",
+        None,
+        now_millis(),
+    )
 }
 
 /// agent_runner stream failed; keep the captured failure and request identity.
-pub(crate) fn make_stream_error_event(code: Code, message: &str) -> ProgressEvent {
+pub(crate) fn make_stream_error_event(
+    code: Code,
+    message: &str,
+) -> Result<ProgressEvent, serde_json::Error> {
     make_stream_error_event_with_identity(code, message, "en-US", "grpc_stream", None)
+}
+
+/// Private wire payload: required fields have no defaults, so producer changes
+/// must preserve the complete error contract at compile time.
+#[derive(serde::Serialize)]
+struct StreamErrorPayload {
+    code: &'static str,
+    message: String,
+    error_detail: shared_types::ErrorDetail,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_container_state: Option<String>,
+}
+
+impl StreamErrorPayload {
+    fn new(code: Code, cause: &str, locale: &str, stage: &str) -> Self {
+        let error_code = map_tonic_code(code);
+        let detail = shared_types::ErrorDetail::new(error_code, stage, cause).localized(locale);
+        let presentation = if transport_failure(code) {
+            shared_types::get_error_message(shared_types::ERR_AGENT_CONTAINER_UNAVAILABLE, locale)
+        } else {
+            let base = shared_types::get_error_message(shared_types::ERR_GRPC_ERROR, locale);
+            format!("{base}: {}", detail.detail)
+        };
+        Self {
+            code: error_code,
+            message: shared_types::sanitize_error_text(&presentation),
+            error_detail: detail,
+            observed_container_state: None,
+        }
+    }
+
+    fn into_event(
+        self,
+        request_id: Option<String>,
+        timestamp: i64,
+    ) -> Result<ProgressEvent, serde_json::Error> {
+        serialize_synthetic_event(&self, "SessionPromptEnd", "error", request_id, timestamp)
+    }
 }
 
 pub(crate) fn make_stream_error_event_with_identity(
@@ -330,28 +457,50 @@ pub(crate) fn make_stream_error_event_with_identity(
     locale: &str,
     stage: &str,
     request_id: Option<String>,
-) -> ProgressEvent {
-    let error_code = map_tonic_code(code);
-    let detail = shared_types::ErrorDetail::new(error_code, stage, message).localized(locale);
-    let base = shared_types::get_error_message(shared_types::ERR_GRPC_ERROR, locale);
-    let payload = serde_json::json!({
-        "code": error_code,
-        "message": shared_types::sanitize_error_text(&format!("{base}: {}", detail.detail)),
-        "error_detail": detail,
-    })
-    .to_string();
-    ProgressEvent {
-        message_type: "SessionPromptEnd".to_string(),
-        sub_type: "error".to_string(),
-        payload,
-        request_id,
-        seq: 0,
-        timestamp: now_millis(),
-    }
+) -> Result<ProgressEvent, serde_json::Error> {
+    StreamErrorPayload::new(code, message, locale, stage).into_event(request_id, now_millis())
 }
 
-/// Supplemental diagnosis never replaces the original transport failure. It is
-/// read only, bounded, and cancellation at the caller can interrupt it.
+/// Captured from the original request/stream, never from a later latest chat.
+#[derive(Clone, Copy)]
+pub(crate) struct FailureWindow {
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub failed_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn transport_failure(code: Code) -> bool {
+    matches!(
+        code,
+        Code::Unavailable | Code::Internal | Code::Unknown | Code::DeadlineExceeded
+    )
+}
+
+fn attributed_oom(
+    ctx: &crate::utils::DiagCtx,
+    observed: &container_runtime_api::AgentPodDiagnostic,
+    window: FailureWindow,
+    observed_at: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let (Some(expected), Some(evidence), Some(started)) = (
+        ctx.expected_container_id.as_deref(),
+        observed.evidence.as_ref(),
+        window.started_at,
+    ) else {
+        return false;
+    };
+    !expected.trim().is_empty()
+        && expected == evidence.physical_id
+        && observed.is_oom()
+        && evidence.termination_finished_at.is_some_and(|finished| {
+            started <= window.failed_at
+                && started <= finished
+                && finished <= observed_at
+                && window.failed_at <= observed_at
+        })
+}
+
+/// Present a friendly transport error while retaining its original structured
+/// cause. Only same-instance, in-window OOM evidence may explain the main message.
 pub(crate) async fn make_terminal_error_event(
     diag: Option<&Arc<crate::utils::DiagCtx>>,
     locale: &str,
@@ -359,8 +508,14 @@ pub(crate) async fn make_terminal_error_event(
     message: &str,
     stage: &str,
     request_id: Option<String>,
-) -> ProgressEvent {
-    let mut event = make_stream_error_event_with_identity(code, message, locale, stage, request_id);
+    window: FailureWindow,
+) -> Result<ProgressEvent, serde_json::Error> {
+    // Preserve the original synthetic failure time while diagnosis is pending.
+    let timestamp = now_millis();
+    let mut payload = StreamErrorPayload::new(code, message, locale, stage);
+    if !transport_failure(code) {
+        return payload.into_event(request_id, timestamp);
+    }
     if let Some(ctx) = diag {
         let observation = tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -372,34 +527,32 @@ pub(crate) async fn make_terminal_error_event(
             && (observed.has_root_cause() || observed.is_starting_up())
         {
             let observed_reason = crate::utils::root_cause_message(&observed, locale);
-            // The original code/message and request identity remain unchanged.
-            // Observations describe current container state, not the failed job.
-            if let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&event.payload) {
-                payload["observed_container_state"] =
-                    serde_json::Value::String(shared_types::sanitize_error_text(&observed_reason));
-                event.payload = payload.to_string();
+            // Preserve the code, cause/stage and original request identity.
+            // Logical-name or historical observations are not the failed task.
+            payload.observed_container_state =
+                Some(shared_types::sanitize_error_text(&observed_reason));
+            if attributed_oom(ctx, &observed, window, chrono::Utc::now()) {
+                payload.message = shared_types::sanitize_error_text(&observed_reason);
             }
         }
     }
-    event
+    payload.into_event(request_id, timestamp)
 }
 
 /// seq 回退（agent_runner 重启后新 epoch 从 1 重新计数）时的 cursor-reset 哨兵
 /// (seq=0):告知客户端重置去重游标,让新 epoch 的低 seq 事件不被静默丢弃。
 /// 非终态(message_type≠SessionPromptEnd,不关流)。
-pub(crate) fn make_cursor_reset_event() -> ProgressEvent {
-    ProgressEvent {
-        message_type: "StreamReset".to_string(),
-        sub_type: "epoch_changed".to_string(),
-        payload: serde_json::json!({
-            "reason": "EpochChanged",
-            "description": "Agent stream epoch changed; reset your dedup cursor"
-        })
-        .to_string(),
-        request_id: None,
-        seq: 0,
-        timestamp: now_millis(),
-    }
+pub(crate) fn make_cursor_reset_event() -> Result<ProgressEvent, serde_json::Error> {
+    serialize_synthetic_event(
+        &SyntheticStatusPayload {
+            reason: SyntheticStatusReason::EpochChanged,
+            description: "Agent stream epoch changed; reset your dedup cursor",
+        },
+        "StreamReset",
+        "epoch_changed",
+        None,
+        now_millis(),
+    )
 }
 
 pub(crate) fn map_tonic_code(code: Code) -> &'static str {

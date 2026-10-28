@@ -9,15 +9,130 @@ use thiserror::Error;
 use utoipa::ToSchema;
 
 use crate::ContainerRuntime;
+pub use shared_types::{AgentWorkspaceIdentity, VerifiedAgentReplacement};
 
 /// Observation of an original coordinator lease, separate from write authority.
-/// No persisted or HTTP representation: unsupported/absent observations stay
-/// unconfirmed, while expiry alone never proves a completed runtime mutation.
+/// No persisted or HTTP representation. Unsupported backends stay unconfirmed;
+/// observed absence and expiry never prove a completed runtime mutation or
+/// authorize a write by themselves.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppOperationLeaseObservation {
     Held,
     ExpiredOriginalIdentity,
+    /// The receipt's own runtime object is verifiably absent at observation
+    /// time (backend checked both the Lease and legacy ConfigMap forms and
+    /// found nothing under the recorded name/scope). Distinct from
+    /// `Unconfirmed`, which also covers backends that cannot check.
+    /// This proves ONLY the object's absence then: it does not prove the
+    /// holder process exited, does not prove already-issued writes have
+    /// settled, and never authorizes drain or takeover by itself.
+    AbsentOriginalIdentity,
     Unconfirmed,
+}
+
+/// Pre-fence physical exclusion for an early compute coordinator. This is not
+/// a stop receipt and never grants permission to submit a runtime mutation.
+pub trait ComputeHandoffGuard: Send + Sync {}
+
+/// Result of physically observing an early coordinator before durable fencing.
+pub enum ComputeHandoff {
+    /// A real FD holder or an exact Lease with current renewal still executes.
+    Held,
+    /// The current native mutex was actually observed absent. No object is
+    /// created merely to observe it; durable CAS fences any late prepare.
+    Vacant { original_absent: bool },
+    /// Keep the physical exclusion until the durable reservation has committed.
+    Acquired {
+        guard: Box<dyn ComputeHandoffGuard>,
+        /// The captured physical identity is absent or no longer owns this
+        /// mutex. A same-original prepared attempt may now occupy it; this
+        /// observation must not replace the stored historical receipt.
+        original_absent: bool,
+    },
+    /// An observed predecessor or changed identity requires its existing proof
+    /// path. Historical metadata alone cannot authorize taking that mutex.
+    Deferred(Box<shared_types::ComputeLeaseInspection>),
+}
+
+impl ComputeHandoff {
+    /// Retain detailed physical evidence without inflating the common result.
+    pub fn deferred(inspection: shared_types::ComputeLeaseInspection) -> Self {
+        Self::Deferred(Box::new(inspection))
+    }
+}
+
+/// Ephemeral observation of the production application mutex, never a receipt
+/// or permission to acquire, renew, release, or mutate an application. A missing
+/// lifecycle annotation is observable, but cannot authorize any write.
+/// Deliberately has no serialization or HTTP schema representation.
+#[derive(Clone, Eq, PartialEq)]
+pub struct AppOperationMutexIdentity {
+    pub namespace: String,
+    pub name: String,
+    pub uid: String,
+    pub token: String,
+    pub resource_version: String,
+    pub lifecycle_id: Option<String>,
+}
+
+impl std::fmt::Debug for AppOperationMutexIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AppOperationMutexIdentity")
+            .field("namespace", &self.namespace)
+            .field("name", &self.name)
+            .field("uid", &self.uid)
+            .field("token", &"[redacted]")
+            .field("resource_version", &self.resource_version)
+            .field("lifecycle_id", &self.lifecycle_id)
+            .finish()
+    }
+}
+
+/// Read-only native Lease state, not proof that legacy lock metadata is absent.
+/// Even `Absent` requires vacant-only acquisition and normal durable admission
+/// before writes; it says nothing about completion of old in-flight work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AppOperationMutexObservation {
+    Absent,
+    Occupied(AppOperationMutexIdentity),
+    /// The native mutex is present but its renewal expired. This is only a
+    /// candidate for exact conditional acquisition after current admission
+    /// checks; it never establishes completion of the old business writes.
+    Expired(AppOperationMutexIdentity),
+    Unconfirmed,
+}
+
+/// Read-only discovery of a historical builder creation's native operation
+/// authority for a stale `Running` EnsureBuilder that never persisted a
+/// lease receipt binding. Located by durable identity only (name from the
+/// app/family, holder from the record's executor/operation) — never from a
+/// fabricated receipt. `ExpiredOriginal` is the only positive "the original
+/// executor provably stopped renewing" witness; no variant grants write
+/// authority or proves the original business writes completed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UnboundBuilderCreationAuthority {
+    /// Held by exactly this execution identity (holder `executor:operation`,
+    /// required execution annotations matching) and the native
+    /// renewal is expired. Carries the observed holder for audit.
+    ExpiredOriginal {
+        holder: String,
+        /// Actual native UID/version or device/inode, never a synthetic
+        /// completion receipt. Persist before settlement so terminal cleanup
+        /// can retry across crashes, including historical unbound markers.
+        receipt: shared_types::UserAppOperationLeaseReceipt,
+    },
+    /// Held by this identity and still being renewed: a live executor may
+    /// still be executing or confirming. The record must stay untouched.
+    ActiveOriginal,
+    /// Present but owned by another execution (successor takeover or a
+    /// different operation): not ours to judge or release.
+    Foreign { holder: Option<String> },
+    /// No native mutex was observed. This is a hint for conditional physical
+    /// handoff, not proof that a delayed execution cannot acquire it later.
+    Absent,
+    /// This backend cannot discover authority without a persisted receipt.
+    Unsupported,
 }
 
 /// Container runtime errors
@@ -40,6 +155,23 @@ pub enum ContainerRuntimeError {
 
     #[error("Container creation failed: {0}")]
     ContainerCreationError(String),
+
+    /// Docker create already acknowledged this physical container. A later
+    /// request's rejection does not reject or roll back the whole creation.
+    /// Retain its recovery fence until the confirmed partial resource settles.
+    #[error(
+        "Docker container {container_id} exists but {phase} failed: {source}{recording_note}",
+        recording_note = docker_recording_failure_note(.recording_failure.as_deref())
+    )]
+    DockerCreationIncomplete {
+        container_id: String,
+        phase: DockerCreationPhase,
+        #[source]
+        source: Box<ContainerRuntimeError>,
+        /// Secondary diagnostic; never replaces the original phase failure or
+        /// turns the acknowledged create into a whole-operation rejection.
+        recording_failure: Option<Box<ContainerRuntimeError>>,
+    },
 
     #[error("Container start failed: {0}")]
     ContainerStartError(String),
@@ -81,6 +213,29 @@ pub enum ContainerRuntimeError {
         progress: CreationProgress,
         source: Box<ContainerRuntimeError>,
     },
+}
+
+fn docker_recording_failure_note(error: Option<&ContainerRuntimeError>) -> String {
+    error
+        .map(|error| format!("; partial creation evidence could not be recorded: {error}"))
+        .unwrap_or_default()
+}
+
+/// Docker stages after create has returned a physical container ID. These are
+/// separate from the Kubernetes application orchestration stages below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockerCreationPhase {
+    Start,
+    Observe,
+}
+
+impl std::fmt::Display for DockerCreationPhase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Start => "start",
+            Self::Observe => "observe started container",
+        })
+    }
 }
 
 /// One stage of the K8s application creation chain, in execution order.
@@ -207,6 +362,15 @@ pub struct ExecResult {
     pub exit_code: i64,
 }
 
+/// Non-persisted evidence for attributing a diagnostic to one observed stream.
+/// A logical name alone cannot identify a replaced Pod or Docker container.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentPodDiagnosticEvidence {
+    pub physical_id: String,
+    pub termination_finished_at: Option<DateTime<Utc>>,
+    pub current_termination: bool,
+}
+
 /// agent pod 容器诊断结果(用于 gRPC 连接失败时定位真实根因:OOM/CrashLoop/缺失等)。
 ///
 /// `transport error` 往往只是"连不上"的表象,真实根因可能是容器被 OOMKilled、
@@ -214,6 +378,8 @@ pub struct ExecResult {
 /// 据此决定错误信息(根因为主,transport 原文降级为日志/附注)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentPodDiagnostic {
+    /// Missing evidence only limits error attribution; never compute admission.
+    pub evidence: Option<AgentPodDiagnosticEvidence>,
     /// pod/容器是否存在(不存在本身就是一种根因)
     pub exists: bool,
     /// 容器是否 ready(ready=false 可能是启动中或异常)
@@ -265,6 +431,8 @@ impl AgentPodDiagnostic {
 /// lib + bin 编译时"同一类型出现两个 crate 实例"导致的类型分裂 —— 放这里 lib/bin 引用的是
 /// **同一个** `DiagCtx`。`Option<Arc<DiagCtx>>` 语义:Some 才诊断,O None 回退通用文案。
 pub struct DiagCtx {
+    /// Physical origin resolved for this SSE, not a later logical-name lookup.
+    pub expected_container_id: Option<String>,
     /// 容器运行时抽象(Docker / K8s),来自 AppState.runtime()
     pub runtime: Arc<dyn ContainerRuntime>,
     /// 容器逻辑标识:ComputerAgentRunner=user_id,WebAgentRunner=project_id
@@ -281,6 +449,7 @@ pub struct DiagCtx {
 impl Default for AgentPodDiagnostic {
     fn default() -> Self {
         Self {
+            evidence: None,
             exists: true,
             ready: true,
             restart_count: 0,
@@ -386,6 +555,7 @@ mod agent_pod_diagnostic_tests {
     /// "存在且 ready、无任何根因" 的基准诊断
     fn healthy() -> AgentPodDiagnostic {
         AgentPodDiagnostic {
+            evidence: None,
             exists: true,
             ready: true,
             restart_count: 0,

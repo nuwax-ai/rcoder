@@ -3,14 +3,76 @@ import copy
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import tempfile
+from types import SimpleNamespace
+import tomllib
 import unittest
 from unittest.mock import patch
+import zipfile
 
 import prod_readiness_contract as contract
 
 
 class InputContracts(unittest.TestCase):
+    def test_runtime_restoration_retains_generation_without_replaying_the_previous_request(self):
+        before = ['APP_DEPLOY_URL=http://artifact.invalid/old.zip', 'APP_RELEASE_ID=old-release',
+                  'APP_DEPLOY_SHA256=old-sha', 'APP_DEPLOY_OPERATION_ID=old-request',
+                  'APP_DEPLOY_GENERATION_ID=stable-generation', 'APP_ID=ownedapp', 'BUSINESS_SECRET=x=y']
+        after = ['APP_DEPLOY_GENERATION_ID=stable-generation', 'APP_ID=ownedapp', 'BUSINESS_SECRET=x=y']
+        retained = contract.retained_runtime_environment(before)
+        self.assertEqual(retained, dict(entry.split('=', 1) for entry in after))
+        self.assertNotEqual(retained, contract.retained_runtime_environment(
+            [entry.replace('stable-generation', 'another-generation') for entry in after]))
+
+    def test_generated_probe_artifact_matches_current_manifest_protocol(self):
+        repo = Path(__file__).resolve().parents[2]
+        types = (repo / 'crates/workspace-manifest/src/types.rs').read_text()
+
+        def declaration(kind, name):
+            found = re.search(r'pub ' + kind + r' ' + name + r'\s*\{(.*?)\n\}', types, re.S)
+            self.assertIsNotNone(found, 'current manifest protocol declaration missing: ' + name)
+            return found.group(1)
+
+        # Read the real Rust enum vocabulary instead of validating the fixture
+        # against a copied list that could repeat its invalid "api" assumption.
+        kinds = {name.lower() for name in re.findall(r'^\s*([A-Z]\w*),\s*$', declaration('enum', 'ProjectKind'), re.M)}
+        languages = {name.lower() for name in re.findall(r'^\s*([A-Z]\w*),\s*$', declaration('enum', 'ProjectType'), re.M)}
+
+        def fields(name):
+            return set(re.findall(r'^\s*pub (?:r#)?(\w+)\s*:', declaration('struct', name), re.M))
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = contract.make_artifact(repo, Path(directory), 'fixture-release', 'FIXTURE_MARKER')
+            with zipfile.ZipFile(artifact) as archive:
+                self.assertIsNone(archive.testzip())
+                lock = tomllib.loads(archive.read('release.lock.toml').decode())
+                self.assertLessEqual(set(lock), fields('ReleaseLock'))
+                self.assertEqual({service['service_id'] for service in lock['services']}, {'web', 'probe'})
+                for service in lock['services']:
+                    self.assertLessEqual(set(service), fields('LockedService'))
+                    self.assertIn(service['kind'], kinds)
+                    self.assertIn(service['type'], languages)
+                    for section, rust_type in [('run', 'RunSection'), ('health', 'HealthSection'), ('proxy', 'ProxySection')]:
+                        self.assertLessEqual(set(service[section]), fields(rust_type))
+                    project = tomllib.loads(archive.read(service['dir'] + '/project.manifest.toml').decode())
+                    self.assertLessEqual(set(project), fields('ProjectManifest'))
+                    self.assertLessEqual(set(project['project']), fields('ProjectMeta'))
+                    self.assertEqual(project['project'].get('kind', 'web'), service['kind'])
+                    self.assertEqual(project['project']['type'], service['type'])
+                probe = next(service for service in lock['services'] if service['service_id'] == 'probe')
+                project = tomllib.loads(archive.read('probe/project.manifest.toml').decode())
+                self.assertEqual(probe['run']['command'], project['run']['command'])
+                self.assertEqual(probe['run']['migrate'], project['run']['migrate'])
+                self.assertGreater(probe['run']['shutdown_timeout_seconds'], 0)
+                self.assertTrue(all(path.startswith('/') for path in probe['health'].values()))
+                self.assertEqual(probe['proxy']['path'], '/contract-probe')
+                for argv in (probe['run']['command'], probe['run']['migrate']):
+                    self.assertEqual(argv[0], 'python3')
+                    path = 'probe/' + argv[1]
+                    compile(archive.read(path), path, 'exec')
+
     def test_snapshot_without_git_hashes_actual_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -53,6 +115,350 @@ class InputContracts(unittest.TestCase):
         self.assertFalse(contract.declaration_matches(['APP_DEPLOY_OPERATION_ID=cold-A',
                          'APP_DEPLOY_GENERATION_ID=native-session'], expected))
         self.assertFalse(contract.declaration_matches(['APP_DEPLOY_OPERATION_ID=cold-A'], expected))
+
+
+class ReviewedDriverContracts(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.producer, self.driver = self.root / 'producer', self.root / 'driver'
+        self.names = sorted([*contract.REVIEWED_DRIVER_PATHS, 'Cargo.lock', 'crates/example.rs',
+                             'docker/config.yml', 'tests-e2e/tools/another.py'])
+        for name in self.names:
+            path = self.producer / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('original ' + name)
+            path.chmod(0o644)
+        shutil.copytree(self.producer, self.driver)
+        self.producer_manifest, self.driver_manifest = self.root / 'producer.json', self.root / 'driver.json'
+        for manifest in (self.producer_manifest, self.driver_manifest):
+            manifest.write_text(json.dumps(dict.fromkeys(self.names, {})))
+        environment = patch.dict(os.environ, {'E2E_INPUT_MANIFEST': str(self.driver_manifest),
+                                             'E2E_ORIGIN_HEAD': 'new-driver-head'})
+        environment.start()
+        self.addCleanup(environment.stop)
+        source = contract.source_identity(self.producer, self.producer_manifest, origin_head='product-head')
+        self.build = {'version': 1, 'source': source,
+                      'rcoder': {'image_id': 'sha256:' + 'a' * 64, 'binary_sha256': 'b' * 64},
+                      'runtime': {'image_id': 'sha256:' + 'c' * 64, 'app_cli_sha256': 'd' * 64}}
+
+    def validate(self):
+        return contract.validate_build_for_driver(self.build, contract.source_identity(self.driver), self.driver,
+                                                  self.producer, self.producer_manifest)
+
+    def test_original_v1_stays_strict_and_reviewed_test_only_changes_have_two_real_identities(self):
+        original = copy.deepcopy(self.build)
+        self.assertEqual(contract.validate_build_for_driver(self.build, self.build['source'], self.producer)['kind'], 'same-source')
+        with self.assertRaisesRegex(ValueError, 'frozen source'):
+            contract.validate_build_for_driver(self.build, contract.source_identity(self.driver), self.driver)
+        for name in contract.REVIEWED_DRIVER_PATHS:
+            (self.driver / name).write_text('reviewed test correction ' + name)
+        proof = self.validate()
+        self.assertEqual(proof['producer_source'], self.build['source'])
+        self.assertEqual(proof['producer_source']['origin_head'], 'product-head')
+        self.assertEqual(proof['driver_source']['origin_head'], 'new-driver-head')
+        self.assertNotEqual(proof['producer_source'], proof['driver_source'])
+        self.assertEqual(set(proof['changed_paths']), contract.REVIEWED_DRIVER_PATHS)
+        self.assertTrue(proof['all_other_input_bytes_types_modes_equal'])
+        self.assertEqual(self.build, original)
+
+    def test_incomplete_parameters_and_wrong_producer_are_rejected(self):
+        driver = contract.source_identity(self.driver)
+        for directory, manifest in ((self.producer, None), (None, self.producer_manifest)):
+            with self.assertRaisesRegex(ValueError, 'together'):
+                contract.validate_build_for_driver(self.build, driver, self.driver, directory, manifest)
+        with patch.dict(os.environ, {'E2E_INPUT_MANIFEST': ''}):
+            with self.assertRaisesRegex(ValueError, 'frozen driver'):
+                contract.validate_build_for_driver(self.build, driver, self.driver,
+                                                   self.producer, self.producer_manifest)
+        self.build['source']['origin_head'] = ''
+        with self.assertRaisesRegex(ValueError, 'origin head'):
+            self.validate()
+
+    def test_producer_tamper_missing_inputs_and_binary_receipts_cannot_pass(self):
+        path = self.producer / 'Cargo.lock'
+        original = path.read_bytes()
+        path.write_text('changed producer')
+        with self.assertRaisesRegex(ValueError, 'frozen source'):
+            self.validate()
+        path.unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.validate()
+        path.write_bytes(original)
+        self.build['runtime']['app_cli_sha256'] = 'not-a-hash'
+        with self.assertRaisesRegex(ValueError, 'binary identity'):
+            self.validate()
+
+    def test_unreviewed_product_or_third_test_changes_and_path_set_changes_fail(self):
+        for name in ('Cargo.lock', 'crates/example.rs', 'docker/config.yml', 'tests-e2e/tools/another.py'):
+            with self.subTest(name=name):
+                path = self.driver / name
+                original = path.read_bytes()
+                path.write_text('unreviewed change')
+                with self.assertRaisesRegex(ValueError, 'unreviewed'):
+                    self.validate()
+                path.write_bytes(original)
+        for names in (self.names[:-1], [*self.names, 'extra.py']):
+            self.driver_manifest.write_text(json.dumps(dict.fromkeys(names, {})))
+            (self.driver / 'extra.py').write_text('extra')
+            with self.assertRaisesRegex(ValueError, 'path sets differ'):
+                self.validate()
+
+    def test_mode_type_and_escaping_parent_cannot_be_reviewed_away(self):
+        path = self.driver / 'tests-e2e/tools/prod_readiness_contract.py'
+        path.chmod(0o755)
+        with self.assertRaisesRegex(ValueError, 'type or mode'):
+            self.validate()
+        path.chmod(0o644)
+        path.unlink()
+        path.symlink_to(self.producer / 'tests-e2e/tools/prod_readiness_contract.py')
+        with self.assertRaisesRegex(ValueError, 'type or mode'):
+            self.validate()
+        path.unlink()
+        path.write_text('restored')
+        shutil.rmtree(self.driver / 'crates')
+        (self.driver / 'crates').symlink_to(self.producer / 'crates', target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, 'real source directory'):
+            self.validate()
+        self.driver_manifest.write_text(json.dumps({'../outside': {}}))
+        with self.assertRaisesRegex(ValueError, 'escapes'):
+            self.validate()
+
+    def test_prepare_rechecks_after_preflight_before_any_side_effect(self):
+        self.validate()
+        source = contract.source_identity(self.driver)
+        (self.driver / 'docker/config.yml').write_text('changed after preflight')
+        destination = self.root / 'must-not-be-created'
+        with patch.object(contract, 'run') as docker:
+            with self.assertRaisesRegex(ValueError, 'driver source changed'):
+                contract.prepare_controller(destination, self.driver, self.build, source,
+                    'run', 'case', 'app', 'private-key', self.producer, self.producer_manifest)
+            docker.assert_not_called()
+        self.assertFalse(destination.exists())
+
+
+class FormalReadOnlyQueryContracts(unittest.TestCase):
+    def exercise(self, status, envelope, compute_ids=()):
+        report = {'checks': []}
+        fixture = contract.Contract(SimpleNamespace(user_id='fixture-user'), report, 'formalapp')
+        with patch.object(fixture, 'readiness', return_value={'ready': False, 'container': {'status': 'missing'}}), \
+             patch.object(fixture, 'api_raw', return_value=(status, envelope)) as query, \
+             patch.object(fixture, 'application_ids', return_value=list(compute_ids)), \
+             patch.object(contract.time, 'sleep'), patch.object(contract, 'run') as docker, \
+             patch('builtins.print'):
+            fixture.assert_deleted_queries_read_only('formal-query')
+            docker.assert_not_called()
+            return report, [call.args[0] for call in query.call_args_list]
+
+    def test_formal_error_envelope_observes_missing_compute_without_creating(self):
+        # app_manager::routes installs userapp_http::envelope_errors: status 200
+        # is only transport success; exact code + false still describe failure.
+        report, paths = self.exercise(200, {'success': False, 'code': 'CONTAINER_NOT_FOUND'})
+        self.assertTrue(all(row['ok'] is True for row in report['checks']))
+        self.assertEqual(paths, [
+            '/api/v1/userapp/formalapp/prod/stats?user_id=fixture-user',
+            '/api/v1/userapp/formalapp',
+        ] * 2)
+        self.assertIn('deleted prod queries remain read only', {row['name'] for row in report['checks']})
+
+    def test_transport_404_wrong_semantic_errors_and_success_cannot_pass(self):
+        cases = [(404, {'success': False, 'code': 'CONTAINER_NOT_FOUND'}),
+                 (200, {'success': True, 'code': 'CONTAINER_NOT_FOUND'}),
+                 (200, {'success': False, 'code': 'ERR_APP_NOT_FOUND'}),
+                 (200, {'success': False, 'code': 'ERR_BACKEND_ERROR'}),
+                 (200, {'success': False, 'code': 'ERR_VALIDATION'}),
+                 (200, {'success': False, 'code': '0000'}),
+                 (200, {'success': 0, 'code': 'CONTAINER_NOT_FOUND'})]
+        for status, envelope in cases:
+            with self.subTest(status=status, envelope=envelope):
+                with self.assertRaises(RuntimeError):
+                    self.exercise(status, envelope)
+
+    def test_query_side_effect_cannot_pass_even_with_the_expected_error_envelope(self):
+        with self.assertRaises(RuntimeError):
+            self.exercise(200, {'success': False, 'code': 'CONTAINER_NOT_FOUND'}, ['unexpected-runtime'])
+
+
+class InvalidArtifactEnvelopeContracts(unittest.TestCase):
+    def exercise(self, status=200, response_patch=None, record_patch=None, fetched=True):
+        report = {'checks': []}
+        fixture = contract.Contract(SimpleNamespace(), report, 'artifactapp')
+        response = {'success': False, 'code': 'ERR_BACKEND_ERROR', 'operation_id': 'invalid-op',
+                    'message': 'invalid ZIP archive: central directory is missing'}
+        response.update(response_patch or {})
+        record = {'operation_id': 'invalid-op', 'app_id': 'artifactapp', 'state': 'Failed',
+                  'error_code': 'ERR_BACKEND_ERROR', 'error_message': 'invalid ZIP archive'}
+        record.update(record_patch or {})
+        with patch.object(fixture, 'api', return_value=(200, {'success': True, 'code': '0000', 'data': record})) as query, \
+             patch.object(contract, 'run') as docker, patch('builtins.print'):
+            failed_id = fixture.verify_invalid_artifact_failure(status, response, [{'path': '/invalid.zip'}] if fetched else [])
+            docker.assert_not_called()
+            query.assert_called_once_with('/api/v1/userapp/artifactapp/operations/invalid-op')
+            return failed_id, report
+
+    def test_formal_200_error_keeps_the_exact_failed_operation_and_actual_bad_download(self):
+        failed_id, report = self.exercise()
+        self.assertEqual(failed_id, 'invalid-op')
+        self.assertTrue(all(row['ok'] is True for row in report['checks']))
+
+    def test_unrelated_rejection_or_foreign_receipt_cannot_masquerade_as_a_bad_artifact(self):
+        cases = [dict(status=500), dict(response_patch={'success': True}),
+                 dict(response_patch={'code': '0000'}), dict(response_patch={'code': 'ERR_VALIDATION'}),
+                 dict(response_patch={'operation_id': None}), dict(fetched=False),
+                 dict(response_patch={'message': 'Backend service failed'}),
+                 dict(record_patch={'operation_id': 'foreign-op'}), dict(record_patch={'app_id': 'foreign-app'}),
+                 dict(record_patch={'state': 'Succeeded'}), dict(record_patch={'error_code': 'ERR_CONFLICT'})]
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(RuntimeError):
+                    self.exercise(**kwargs)
+
+
+class RuntimeCommitObservationContracts(unittest.TestCase):
+    def fixture(self):
+        return contract.Contract(SimpleNamespace(), {'checks': []}, 'ownedfixture')
+
+    def status(self, phase='orchestrating', **changes):
+        operation = {'operation_id': 'original-op', 'deployment_generation_id': 'original-generation',
+                     'request_release_id': 'release-b', 'artifact_release_id': 'release-b',
+                     'phase': phase, 'persisted': True, 'deploy_stage': 'succeeded'}
+        operation.update(changes)
+        return {'phase': phase, 'operation': operation}
+
+    def test_two_orchestrating_observations_wait_for_the_exact_running_receipt(self):
+        fixture = self.fixture()
+        with patch.object(fixture, 'runtime_json', side_effect=[self.status(), self.status(), self.status('running')]) as observe, \
+             patch.object(contract.time, 'sleep') as sleep, patch.object(contract, 'run') as docker, patch('builtins.print'):
+            final = fixture.wait_runtime_commit('captured-physical-uid', 'restored', 'original-op', 'original-generation', 'release-b')
+        self.assertEqual(final['operation']['phase'], 'running')
+        self.assertEqual(observe.call_count, 3)
+        self.assertTrue(all(call.args == ('captured-physical-uid', '/v1/deploy/status') for call in observe.call_args_list))
+        self.assertEqual(sleep.call_count, 2)
+        docker.assert_not_called()
+
+    def test_changed_identity_failed_or_uncommitted_running_is_not_a_startup_transition(self):
+        cases = [self.status(operation_id='foreign-op'), self.status(deployment_generation_id='foreign-generation'),
+                 self.status(request_release_id='release-a'), self.status(artifact_release_id='release-a'),
+                 self.status('failed'), self.status('idle'), self.status('deploying'),
+                 self.status('running', persisted=False), self.status('running', deploy_stage='failed')]
+        for status in cases:
+            with self.subTest(operation=status['operation']):
+                fixture = self.fixture()
+                with patch.object(fixture, 'runtime_json', return_value=status) as observe, \
+                     patch.object(contract.time, 'sleep') as sleep, patch.object(contract, 'run') as docker, patch('builtins.print'):
+                    with self.assertRaises(RuntimeError):
+                        fixture.wait_runtime_commit('captured-physical-uid', 'restored', 'original-op', 'original-generation', 'release-b')
+                self.assertEqual(observe.call_count, 1)
+                sleep.assert_not_called()
+                docker.assert_not_called()
+
+    def test_a_finite_orchestration_wait_cannot_report_timeout_as_success(self):
+        fixture = self.fixture()
+        with patch.object(fixture, 'runtime_json', return_value=self.status()) as observe, \
+             patch.object(contract.time, 'monotonic', side_effect=[0.0, 0.0, 61.0]), \
+             patch.object(contract.time, 'sleep'), patch.object(contract, 'run') as docker, patch('builtins.print'):
+            with self.assertRaisesRegex(RuntimeError, 'running receipt is committed'):
+                fixture.wait_runtime_commit('captured-physical-uid', 'restored', 'original-op', 'original-generation', 'release-b')
+        self.assertEqual(observe.call_count, 1)
+        self.assertIs(fixture.report['checks'][-1]['ok'], False)
+        self.assertEqual(fixture.report['checks'][-1]['detail']['timeout_seconds'], 60)
+        docker.assert_not_called()
+
+
+class ControllerRestartEndpointContracts(unittest.TestCase):
+    def fixture(self, root):
+        root = root.resolve()
+        receipt = {'version': 1, 'root': str(root), 'project': 'rcoder-prod-' + 'a' * 16,
+                   'run_id': 'run', 'case_id': 'case', 'app_id': 'private-app',
+                   'rcoder_image_id': 'sha256:' + 'b' * 64, 'controller_id': 'captured-controller',
+                   'base': 'http://127.0.0.1:32777'}
+        labels = {'com.docker.compose.project': receipt['project'], 'com.docker.compose.service': 'rcoder',
+                  'rcoder.e2e.run': 'run', 'rcoder.e2e.case': 'case'}
+        row = {'Id': receipt['controller_id'], 'Image': receipt['rcoder_image_id'],
+               'Name': '/' + receipt['project'] + '-rcoder-1', 'State': {'Running': True},
+               'Config': {'Labels': labels},
+               'Mounts': [{'Type': 'bind', 'Source': str(root / folder), 'Destination': '/app/' + folder}
+                          for folder in ('data', 'logs', 'project_workspace', 'computer-project-workspace',
+                                         'userapp-workspace', 'app-workspace')],
+               'NetworkSettings': {'Ports': {'8090/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '32777'}],
+                                             '8088/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '32778'}]}}}
+        fixture = contract.Contract(SimpleNamespace(controller_container=row['Id'], url=receipt['base']),
+                                    {'checks': []}, 'private-app')
+        fixture.owned_controller = receipt
+        fixture.fixture_root = root
+        fixture.proxy_base = 'http://127.0.0.1:32778'
+        fixture.build_receipt = {'rcoder': {'image_id': row['Image'], 'binary_sha256': 'c' * 64}}
+        return fixture, row
+
+    def test_restart_refreshes_both_random_ports_and_persists_before_waiting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture, before = self.fixture(Path(directory))
+            after = copy.deepcopy(before)
+            after['NetworkSettings']['Ports']['8090/tcp'][0]['HostPort'] = '32779'
+            after['NetworkSettings']['Ports']['8088/tcp'][0]['HostPort'] = '32780'
+            calls = []
+            def docker(argv, **_kwargs):
+                calls.append(argv)
+                if argv[1] == 'inspect':
+                    return json.dumps([before if len(calls) == 1 else after])
+                if argv[1] == 'exec':
+                    return 'c' * 64 + '  /app/bin/rcoder'
+                self.assertEqual(argv, ['docker', 'restart', '-t', '30', before['Id']])
+                return ''
+            def ready(base):
+                self.assertEqual(base, 'http://127.0.0.1:32779')
+                self.assertEqual(fixture.args.url, base)
+                self.assertEqual(fixture.proxy_base, 'http://127.0.0.1:32780')
+                persisted = json.loads((Path(directory) / 'ownership.json').read_text())
+                self.assertEqual(persisted['base'], base)
+                self.assertEqual(persisted['controller_id'], before['Id'])
+            with patch.object(contract, 'run', side_effect=docker), \
+                 patch('turso_runtime_contract.wait_ready', side_effect=ready) as wait, \
+                 patch.object(fixture, 'current', return_value=('same-runtime', {})), patch('builtins.print'):
+                fixture.restart_owned_controller('same-runtime')
+            wait.assert_called_once_with('http://127.0.0.1:32779')
+            self.assertEqual(sum(argv[1] == 'restart' for argv in calls), 1)
+            self.assertEqual([argv[1] for argv in calls], ['inspect', 'restart', 'inspect', 'exec'])
+
+    def test_each_endpoint_requires_one_actual_loopback_mapping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, row = self.fixture(Path(directory))
+            self.assertEqual(contract.controller_loopback_endpoints(row),
+                             ('http://127.0.0.1:32777', 'http://127.0.0.1:32778'))
+            for port in ('8090/tcp', '8088/tcp'):
+                for bindings in ([], [{'HostIp': '0.0.0.0', 'HostPort': '32777'}],
+                                 [{'HostIp': '192.0.2.1', 'HostPort': '32777'}],
+                                 [{'HostIp': '127.0.0.1', 'HostPort': '32777'}] * 2,
+                                 [{'HostIp': '127.0.0.1', 'HostPort': '32777'}, {'HostIp': '0.0.0.0', 'HostPort': '32777'}],
+                                 [{'HostIp': '127.0.0.1', 'HostPort': '0'}],
+                                 [{'HostIp': '127.0.0.1', 'HostPort': '65536'}]):
+                    with self.subTest(port=port, bindings=bindings):
+                        invalid = copy.deepcopy(row)
+                        invalid['NetworkSettings']['Ports'][port] = bindings
+                        with self.assertRaises(ValueError):
+                            contract.controller_loopback_endpoints(invalid)
+            row['NetworkSettings']['Ports']['8088/tcp'][0]['HostIp'] = '::1'
+            self.assertEqual(contract.controller_loopback_endpoints(row)[1], 'http://[::1]:32778')
+
+    def test_changed_controller_identity_is_rejected_before_waiting_or_rebinding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for change in ('Id', 'Image', 'ownership'):
+                with self.subTest(change=change):
+                    fixture, before = self.fixture(Path(directory))
+                    after = copy.deepcopy(before)
+                    if change == 'ownership':
+                        after['Config']['Labels']['rcoder.e2e.run'] = 'foreign-run'
+                    else:
+                        after[change] = 'foreign-value'
+                    with patch.object(contract, 'run', side_effect=[json.dumps([before]), '', json.dumps([after])]) as docker, \
+                         patch('turso_runtime_contract.wait_ready') as wait, patch('builtins.print'):
+                        with self.assertRaises(ValueError):
+                            fixture.restart_owned_controller('same-runtime')
+                    wait.assert_not_called()
+                    self.assertEqual(docker.call_count, 3)
+                    self.assertEqual(fixture.args.url, 'http://127.0.0.1:32777')
+                    self.assertFalse((Path(directory) / 'ownership.json').exists())
 
 
 class OwnedPreparationContracts(unittest.TestCase):
@@ -111,6 +517,197 @@ class OwnedPreparationContracts(unittest.TestCase):
             with patch.object(contract, 'run', side_effect=['preexisting', json.dumps([row])]):
                 with self.assertRaisesRegex(ValueError, 'preexisting'):
                     contract.cleanup(root, 'run', 'case', existing_ids={'preexisting'})
+
+
+class RuntimeOwnerProbeContracts(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.workspace = self.root / 'workspace'
+        self.workspace.mkdir()
+        self.proc = self.root / 'proc'
+        self.proc.mkdir()
+        namespace = {'__name__': 'contract_owner_probe'}
+        exec(compile(contract.OWNER_PROBE_CODE, '<actual remote owner probe>', 'exec'), namespace)
+        self.observe = namespace['owner_processes']
+
+    def process(self, pid=23, args=('/usr/local/bin/app-cli', 'serve'), environment=None, state='S'):
+        proc = self.proc / str(pid)
+        proc.mkdir()
+        (proc / 'cmdline').write_bytes(b'\0'.join(arg.encode() for arg in args) + b'\0')
+        (proc / 'environ').write_bytes(b'\0'.join(entry.encode() for entry in (environment or [])) + b'\0')
+        (proc / 'cwd').symlink_to(self.workspace, target_is_directory=True)
+        (proc / 'stat').write_text(f'{pid} (app-cli) ' + ' '.join([state, *['0'] * 18, '1234']))
+        return proc
+
+    def test_actual_runtime_two_argument_serve_uses_workspace_environment(self):
+        self.process(environment=['APP_CLI_WORKSPACE=' + str(self.workspace)])
+        result = self.observe(self.workspace, self.proc)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]['argv'], ['/usr/local/bin/app-cli', 'serve'])
+        self.assertEqual(result[0]['workspace_source'], 'environment')
+        self.assertEqual((result[0]['pid'], result[0]['start_ticks'], result[0]['process_state']), (23, '1234', 'S'))
+
+    def test_explicit_workspace_both_forms_override_foreign_environment(self):
+        for pid, flags in ((23, ['--control-only', '--workspace', str(self.workspace), '--admin-addr', '127.0.0.1:3010']),
+                           (24, ['--workspace=' + str(self.workspace)])):
+            self.process(pid, ['/usr/local/bin/app-cli', 'serve', *flags], ['APP_CLI_WORKSPACE=/foreign'])
+        result = self.observe(self.workspace, self.proc)
+        self.assertEqual({row['pid'] for row in result}, {23, 24})
+        self.assertTrue(all(row['workspace_source'] == 'argument' for row in result))
+
+    def test_absent_option_and_environment_use_the_actual_cwd(self):
+        self.process()
+        result = self.observe(self.workspace, self.proc)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]['workspace_source'], 'cwd')
+        self.assertEqual(result[0]['cwd'], str(self.workspace.resolve()))
+
+    def test_foreign_workspace_zombie_and_exited_processes_are_not_live_owners(self):
+        self.process(23, environment=['APP_CLI_WORKSPACE=/foreign'])
+        self.process(24, state='Z')
+        (self.proc / '25').mkdir()  # Exited between the /proc listing and cmdline read.
+        self.process(26, ['/usr/local/bin/app-cli', 'owner', 'status'])
+        self.assertEqual(self.observe(self.workspace, self.proc), [])
+
+    def test_unreadable_candidate_observation_is_not_absence_or_success(self):
+        proc = self.process(environment=['APP_CLI_WORKSPACE=' + str(self.workspace)])
+        original = Path.read_bytes
+        def read(path):
+            if path == proc / 'environ':
+                raise PermissionError('candidate workspace observation failed')
+            return original(path)
+        with patch.object(Path, 'read_bytes', read):
+            with self.assertRaisesRegex(PermissionError, 'candidate workspace'):
+                self.observe(self.workspace, self.proc)
+
+
+class StartupFailedRestoreContracts(unittest.TestCase):
+    def receipt(self):
+        operation = {'operation_id': 'deploy-A', 'deployment_generation_id': 'deploy-A',
+                     'phase': 'failed', 'error': 'startup interrupted while activating',
+                     'deploy_stage': 'succeeded', 'persisted': True, 'artifact_release_id': 'artifact-A'}
+        return {'generation': 'deploy-A', 'boundary': 'startup_failed', 'operation': operation,
+                'request': {'release_id': 'request-A'},
+                'active': {'artifact_release_id': 'artifact-A'},
+                'deploy_replays': {'deploy-A': {'fingerprint': 'original-input', 'operation': copy.deepcopy(operation)}}}
+
+    def test_seed_requires_real_failed_activation_of_the_confirmed_artifact(self):
+        before = self.receipt()
+        self.assertTrue(contract.startup_failure_receipt(before, 'deploy-A', 'artifact-A'))
+        for mutate in (
+                lambda row: row.update(boundary='active'),
+                lambda row: row['operation'].update(phase='running'),
+                lambda row: row['operation'].update(error=None),
+                lambda row: row['operation'].update(deploy_stage='pending'),
+                lambda row: row['active'].update(artifact_release_id='another-artifact'),
+                lambda row: row['deploy_replays'].clear()):
+            row = copy.deepcopy(before)
+            mutate(row)
+            self.assertFalse(contract.startup_failure_receipt(row, 'deploy-A', 'artifact-A'))
+        self.assertFalse(contract.startup_failure_receipt(before, 'foreign-operation', 'artifact-A'))
+
+    def test_recovery_cannot_rewrite_failed_error_or_request_replay(self):
+        before = self.receipt()
+        after = copy.deepcopy(before)
+        after['boundary'] = 'restored_active'
+        self.assertTrue(contract.startup_history_preserved(before, after))
+        for mutate in (
+                lambda row: row['operation'].update(phase='running'),
+                lambda row: row['operation'].update(error=None),
+                lambda row: row['request'].update(release_id='new-request'),
+                lambda row: row['deploy_replays']['deploy-A'].update(fingerprint='new-input'),
+                lambda row: row['active'].update(artifact_release_id='other')):
+            changed = copy.deepcopy(after)
+            mutate(changed)
+            self.assertFalse(contract.startup_history_preserved(before, changed))
+
+    def test_natural_failure_requires_exact_failed_receipt_exited_worker_and_no_current_hold(self):
+        before = self.receipt()
+        status = {'observed': 'stopped', 'recovery_protection': False, 'active_operation_id': None}
+        exited = {'original_process_exited': True}
+        self.assertTrue(contract.startup_failure_settled(before, status, exited, 'deploy-A', 'artifact-A'))
+        for changed in (dict(status, observed='ready'), dict(status, recovery_protection=True),
+                        dict(status, active_operation_id='current-op'), {}):
+            self.assertFalse(contract.startup_failure_settled(before, changed, exited, 'deploy-A', 'artifact-A'))
+        self.assertFalse(contract.startup_failure_settled(before, status, {}, 'deploy-A', 'artifact-A'))
+        self.assertFalse(contract.startup_failure_settled(before, status, exited, 'other', 'artifact-A'))
+        self.assertTrue(contract.startup_history_preserved(before, copy.deepcopy(before), boundary='startup_failed'))
+
+    def test_only_explicit_initializing_is_a_pending_status_observation(self):
+        fixture = contract.Contract(SimpleNamespace(), {'checks': []}, 'ownedfixture')
+        for envelope, pending in (({'success': False, 'code': 'ERR_INITIALIZING'}, True),
+                                  ({'success': False, 'code': 'ERR_BACKEND_ERROR'}, False),
+                                  ({'success': True, 'code': 'ERR_INITIALIZING'}, False)):
+            with patch.object(fixture, 'execute', return_value=json.dumps(envelope)):
+                if pending:
+                    self.assertIsNone(fixture.runtime_json('owned', '/v1/runtime/status', initializing_is_pending=True))
+                else:
+                    with self.assertRaises(RuntimeError):
+                        fixture.runtime_json('owned', '/v1/runtime/status', initializing_is_pending=True)
+        with patch.object(fixture, 'execute', side_effect=OSError('unreadable')):
+            with self.assertRaises(OSError):
+                fixture.runtime_json('owned', '/v1/runtime/status', initializing_is_pending=True)
+
+    def test_waiting_barrier_needs_exact_original_operation_and_live_worker_503(self):
+        operation = copy.deepcopy(self.receipt()['operation'])
+        operation.update(phase='orchestrating', error=None)
+        worker = {'status': 503, 'state': 'waiting', 'marker': 'NONCE',
+                  'processes': [{'pid': 23, 'start_ticks': '1234', 'process_state': 'S'}]}
+        self.assertTrue(contract.startup_waiting_observed({'operation': operation}, worker, 'deploy-A', 'artifact-A', 'NONCE'))
+        for field, value in (('phase', 'running'), ('persisted', False), ('operation_id', 'another')):
+            changed = dict(operation, **{field: value})
+            self.assertFalse(contract.startup_waiting_observed({'operation': changed}, worker, 'deploy-A', 'artifact-A', 'NONCE'))
+        for mutate in (lambda row: row.update(status=200), lambda row: row.update(marker='other'),
+                       lambda row: row.update(processes=[]),
+                       lambda row: row['processes'][0].update(process_state='Z')):
+            changed = copy.deepcopy(worker)
+            mutate(changed)
+            self.assertFalse(contract.startup_waiting_observed({'operation': operation}, changed, 'deploy-A', 'artifact-A', 'NONCE'))
+
+    def test_control_uses_public_start_deployment_and_never_replays_unknown_write(self):
+        with tempfile.TemporaryDirectory() as directory, patch('builtins.print'):
+            fixture = contract.Contract(SimpleNamespace(user_id='fixture-user', report=Path(directory) / 'report.json'), {'checks': []}, 'ownedapp')
+            fixture.lifecycle = 'lifecycle-A'
+            view = {'operation_id': 'accepted', 'app_id': 'ownedapp', 'lifecycle_id': 'lifecycle-A',
+                    'request_id': 'resume-original', 'scope': 'Prod', 'kind': 'StartDeployment', 'state': 'Succeeded'}
+            with patch.object(fixture, 'api', side_effect=[(200, {'operation_id': 'accepted'}), (200, {'data': view})]) as api:
+                self.assertEqual(fixture.public_control('start', 'resume-original'), view)
+                self.assertEqual(len([call for call in api.call_args_list if len(call.args) > 1]), 1)
+                self.assertNotIn('url', api.call_args_list[0].args[1])
+            with patch.object(fixture, 'api', side_effect=TimeoutError('reply lost')) as api:
+                with self.assertRaisesRegex(TimeoutError, 'reply lost'):
+                    fixture.public_control('start', 'unknown-once')
+                self.assertEqual(api.call_count, 1)
+                self.assertEqual(fixture.report['control_intents'][-1]['body']['request_id'], 'unknown-once')
+
+    def test_worker_gate_is_a_real_application_health_probe(self):
+        repo = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            artifact, gate = contract.make_startup_restore_artifact(repo, Path(directory), 'fixture-release', 'MARKER', 'ownedapp')
+            with zipfile.ZipFile(artifact) as archive:
+                self.assertIsNone(archive.testzip())
+                lock = tomllib.loads(archive.read('release.lock.toml').decode())
+                worker = next(row for row in lock['services'] if row['service_id'] == 'hold-worker')
+                self.assertEqual(worker['kind'], 'worker')
+                self.assertEqual(worker['health']['startup_probe'], 'http')
+                self.assertEqual(worker['health']['startup_timeout_seconds'], 30)
+                project = tomllib.loads(archive.read('hold-worker/project.manifest.toml').decode())
+                self.assertEqual(project['health']['startup_timeout_seconds'], 30)
+                self.assertEqual(worker['env']['READY_FILE'], gate)
+                self.assertTrue(gate.startswith('/home/user/data/'))
+                compile(archive.read('hold-worker/main.py'), 'hold-worker/main.py', 'exec')
+
+    def test_missing_precondition_or_current_ready_evidence_cannot_pass_report(self):
+        good = {'checks': [{'name': name, 'ok': True} for name in contract.STARTUP_RESTORE_STEPS],
+                'cleanup': {'captured_containers_removed': True, 'volumes_removed': False}}
+        contract.require_report_complete(good, required_steps=contract.STARTUP_RESTORE_STEPS)
+        for name in contract.STARTUP_RESTORE_STEPS:
+            report = copy.deepcopy(good)
+            report['checks'] = [row for row in report['checks'] if row['name'] != name]
+            with self.assertRaisesRegex(ValueError, 'missing required steps'):
+                contract.require_report_complete(report, required_steps=contract.STARTUP_RESTORE_STEPS)
 
 
 class CompletionContracts(unittest.TestCase):

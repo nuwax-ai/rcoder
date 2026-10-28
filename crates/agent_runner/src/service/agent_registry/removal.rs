@@ -11,6 +11,8 @@ impl AgentSessionRegistry {
     pub fn remove_by_project(&self, project_id: &str) -> Option<ProjectAndAgentInfo> {
         use dashmap::mapref::entry::Entry;
 
+        self.preparations.remove(project_id);
+
         info!(
             "[Registry] remove_by_project started: project_id={}",
             project_id
@@ -30,7 +32,8 @@ impl AgentSessionRegistry {
         // 移除反向映射
         if let Some(ref sid) = session_id {
             debug!("[Registry] Removing session_to_project mapping");
-            self.session_to_project.remove(sid);
+            self.session_to_project
+                .remove_if(sid, |_, owner| owner == project_id);
             debug!("[Registry] session_to_project mapping removed");
         }
 
@@ -196,14 +199,11 @@ impl AgentSessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::SessionId;
 
     #[test]
     fn delayed_cleanup_cannot_remove_replacement_loading_the_same_session() {
         let registry = AgentSessionRegistry::new();
-        registry.set_pending("p");
-        let mut first = registry.view_agent_info("p", Clone::clone).unwrap();
-        first.session_id = SessionId::from("same-session");
+        let mut first = super::super::tests::create_test_agent_info("p", "same-session");
         let (old_cancel, _old_receiver) = tokio::sync::mpsc::channel(1);
         first.cancel_tx = old_cancel.clone();
         registry.register("p", "same-session", first.clone());

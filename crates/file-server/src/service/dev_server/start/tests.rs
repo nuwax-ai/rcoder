@@ -571,7 +571,7 @@ mod owner_reuse_tests {
             serde_json::to_string(&registry).unwrap(),
         )
         .unwrap();
-        let discovery = crate::service::dev_server::supervision_tests::WireDiscoveryFile {
+        let discovery = crate::service::dev_server::wire_fixture::WireDiscoveryFile {
             version: 2,
             instance: "serve-supervisor".into(),
             address: "127.0.0.1:1".into(),
@@ -1994,16 +1994,28 @@ mod owner_reuse_tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn manifest_handover_converts_registration_for_repeat_start() {
-        manifest_handover_registration_case(false).await;
+        manifest_handover_registration_case(false, false).await;
     }
 
     #[tokio::test]
     #[cfg(unix)]
     async fn manifest_handover_after_original_launch_retired_never_reports_success() {
-        manifest_handover_registration_case(true).await;
+        manifest_handover_registration_case(true, false).await;
     }
 
-    async fn manifest_handover_registration_case(retire_before_handover: bool) {
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn late_original_child_exit_and_legal_handover_retire_only_its_cleanup() {
+        manifest_handover_registration_case(false, true).await;
+    }
+
+    // 三个调用方均为 cfg(unix)：fixture 是 `#!/bin/sh` 脚本 + POSIX 可执行位，
+    // Windows 无可执行位语义，helper 随之门控（否则 helper 本体在 Windows 编译失败）。
+    #[cfg(unix)]
+    async fn manifest_handover_registration_case(
+        retire_before_handover: bool,
+        delayed_cleanup: bool,
+    ) {
         if std::env::var_os("PROJECT_ID").is_some() {
             // 身份核验的 application_id 锚定 unknown-app 回退；宿主平台变量下跳过
             return;
@@ -2103,6 +2115,10 @@ mod owner_reuse_tests {
         let mut config = wait_test_config(&reserved.to_string(), &dir.path().join("logs"));
         // 宽松就绪窗覆盖脚本等待 + owner 上线 + 移交核验。
         config.dev_alive_max_wait_ms = 4_000;
+        if delayed_cleanup {
+            config.dev_stop_check_interval_ms = 1;
+            config.dev_stop_max_attempts = 2;
+        }
         config.app_cli_bin = Some(script.display().to_string());
         let manager = Arc::new(DevServerManager::new(Arc::new(config)));
 
@@ -2175,6 +2191,27 @@ mod owner_reuse_tests {
             .expect("original launch must be submitted")
             .unwrap();
         assert!(original_child.exited().is_none());
+        if delayed_cleanup {
+            let launch_id = lock(&manager.launches).unwrap()["userapp:handover-reg"]
+                .launch_id
+                .clone();
+            // Test-only signal outcome injection: no signal is sent. The real
+            // launcher remains at its release-file barrier until below.
+            let pending = manager
+                .close_local_registration_with_termination(
+                    "userapp:handover-reg",
+                    Some(&launch_id),
+                    |_pid| async { false },
+                )
+                .await;
+            assert!(pending.is_err());
+            assert!(
+                manager
+                    .has_uncleaned_cleanup("userapp:handover-reg")
+                    .unwrap()
+            );
+            assert!(original_child.exited().is_none());
+        }
         let listener = tokio::net::TcpListener::bind(reserved)
             .await
             .expect("rebind reserved owner port");
@@ -2234,6 +2271,14 @@ mod owner_reuse_tests {
                 .is_some()
         );
 
+        if delayed_cleanup {
+            assert!(
+                !manager
+                    .has_uncleaned_cleanup("userapp:handover-reg")
+                    .unwrap(),
+                "a real successful late exit and verified handover must finish its own cleanup"
+            );
+        }
         // R3 核心：重复 Start 不被死 run 的本地登记 guard 拒绝——登记已转换为
         // 外部 owner，复用链受理并提交 Restart。
         let again = manager

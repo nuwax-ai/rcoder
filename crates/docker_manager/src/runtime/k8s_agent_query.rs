@@ -169,6 +169,16 @@ impl KubernetesRuntime {
             return Ok(Some(info));
         }
 
+        self.find_container_uncached(identifier, service_type).await
+    }
+
+    /// Execution admission reads the API server even while ordinary query TTL
+    /// entries remain usable. Reuse the resolver and its Pending/Unknown rules.
+    pub(crate) async fn find_container_uncached(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
         // 契约四分层解析：label 发现 + 身份核验 + STS 规范名兜底 + 缺席证据
         //（细节见 k8s_resolution）。冲突/未知如实上报；仍无候选时保留旧标签
         // 兼容查询（平滑迁移，生产 UserApp Deployment 无这些标签，无撞车面）。
@@ -188,6 +198,13 @@ impl KubernetesRuntime {
             // 无候选：走旧标签兼容查询。Absent 的证据随日志留痕（对账/排障）。
             super::k8s_resolution::PodResolution::Absent { evidence } => {
                 tracing::debug!(%evidence, %identifier, "pod resolution: absent");
+            }
+            super::k8s_resolution::PodResolution::WorkloadWithoutPod { workload_name }
+                if service_type.same_container_family(ServiceType::ComputerAgentRunner) =>
+            {
+                return self
+                    .observe_computer_workload_without_pod(identifier, service_type, &workload_name)
+                    .await;
             }
             super::k8s_resolution::PodResolution::WorkloadWithoutPod { .. } => {}
         }
@@ -216,6 +233,57 @@ impl KubernetesRuntime {
             }
         }
 
+        Ok(None)
+    }
+
+    /// A different RCoder replica may have submitted the controller before
+    /// Kubernetes creates its first Pod. Only an explicitly scaled-down, owned
+    /// controller permits the ordinary ensure path to resume compute. Starting
+    /// or terminating controllers remain live work; neither is creation absence.
+    async fn observe_computer_workload_without_pod(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        workload_name: &str,
+    ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
+        let Some(workload) = self
+            .statefulsets()
+            .get_opt(workload_name)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::K8sError(format!(
+                    "Inspect Computer controller without Pod: {error}"
+                ))
+            })?
+        else {
+            return Ok(None);
+        };
+        let labels = super::k8s_service::build_selector_labels(identifier, service_type);
+        if workload.metadata.namespace.as_deref() != Some(self.namespace.as_str())
+            || workload.metadata.name.as_deref() != Some(workload_name)
+            || workload
+                .metadata
+                .uid
+                .as_deref()
+                .is_none_or(|uid| uid.is_empty())
+            || !labels.iter().all(|(key, value)| {
+                workload
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get(key))
+                    == Some(value)
+            })
+        {
+            return Err(ContainerRuntimeError::Conflict(
+                "Computer controller without Pod has unverified ownership".into(),
+            ));
+        }
+        if workload.metadata.deletion_timestamp.is_some()
+            || workload.spec.as_ref().and_then(|spec| spec.replicas) != Some(0)
+        {
+            return Err(ContainerRuntimeError::ManagementNotRunning);
+        }
         Ok(None)
     }
 
@@ -342,38 +410,58 @@ impl KubernetesRuntime {
             }
         };
 
-        // agent-runner STS 主容器名(与 k8s_agent_create.rs 创建处、k8s_agent_pod.rs 的 AGENT_CONTAINER 保持一致)
-        const AGENT_CONTAINER: &str = "agent";
-        let Some(cs) = pod
-            .status
-            .as_ref()
-            .and_then(|s| s.container_statuses.as_ref())
-            .and_then(|list| list.iter().find(|c| c.name == AGENT_CONTAINER))
-        else {
-            // pod 存在但 agent 容器状态尚未上报(刚创建 / ContainerCreating)
-            return Ok(AgentPodDiagnostic {
-                exists: true,
-                ready: false,
-                detail: Some("agent container status not available yet".to_string()),
-                ..Default::default()
-            });
-        };
+        Ok(pod_diagnostic(&pod))
+    }
+}
 
-        let last_terminated = cs.last_state.as_ref().and_then(|ls| ls.terminated.as_ref());
-        let waiting_reason = cs
+fn pod_diagnostic(pod: &Pod) -> AgentPodDiagnostic {
+    const AGENT_CONTAINER: &str = "agent";
+    let Some(cs) = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.container_statuses.as_ref())
+        .and_then(|list| list.iter().find(|c| c.name == AGENT_CONTAINER))
+    else {
+        return AgentPodDiagnostic {
+            exists: true,
+            ready: false,
+            detail: Some("agent container status not available yet".to_string()),
+            ..Default::default()
+        };
+    };
+    let current = cs.state.as_ref().and_then(|s| s.terminated.as_ref());
+    let terminated = current.or_else(|| cs.last_state.as_ref().and_then(|s| s.terminated.as_ref()));
+    AgentPodDiagnostic {
+        evidence: pod
+            .metadata
+            .uid
+            .clone()
+            .filter(|id| !id.is_empty())
+            .map(
+                |physical_id| container_runtime_api::AgentPodDiagnosticEvidence {
+                    physical_id,
+                    termination_finished_at: terminated
+                        .and_then(|t| t.finished_at.as_ref())
+                        .and_then(|t| {
+                            chrono::DateTime::from_timestamp_millis(t.0.as_millisecond())
+                        }),
+                    current_termination: current.is_some(),
+                },
+            ),
+        exists: true,
+        ready: cs.ready,
+        restart_count: u32::try_from(cs.restart_count).unwrap_or(0),
+        last_terminate_reason: terminated.and_then(|t| t.reason.clone()),
+        last_exit_code: terminated.map(|t| t.exit_code),
+        waiting_reason: cs
             .state
             .as_ref()
             .and_then(|s| s.waiting.as_ref())
-            .and_then(|w| w.reason.clone());
-
-        Ok(AgentPodDiagnostic {
-            exists: true,
-            ready: cs.ready,
-            restart_count: u32::try_from(cs.restart_count).unwrap_or(0),
-            last_terminate_reason: last_terminated.and_then(|t| t.reason.clone()),
-            last_exit_code: last_terminated.map(|t| t.exit_code),
-            waiting_reason,
-            detail: super::k8s_app_query::container_error_message(cs),
-        })
+            .and_then(|w| w.reason.clone()),
+        detail: super::k8s_app_query::container_error_message(cs),
     }
 }
+
+#[cfg(test)]
+#[path = "k8s_agent_query/diagnostic_tests.rs"]
+mod diagnostic_tests;

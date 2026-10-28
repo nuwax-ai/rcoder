@@ -4,8 +4,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use container_runtime_api::ContainerRuntime;
-use docker_manager::container_stop;
-use docker_manager::runtime_selection::RuntimeType;
 use rcoder_storage::ProjectStoreBackend;
 use tracing::{error, info, warn};
 
@@ -108,7 +106,7 @@ pub struct UserAppShutdown {
 pub async fn graceful_shutdown(
     deadline: tokio::time::Instant,
     config: crate::config::AppConfig,
-    runtime: Arc<dyn ContainerRuntime>,
+    _runtime: Arc<dyn ContainerRuntime>,
     projects: Option<Arc<ProjectStoreBackend>>,
     activity: Arc<app_manager::AppActivityRegistry>,
     userapp: UserAppShutdown,
@@ -158,92 +156,28 @@ pub async fn graceful_shutdown(
         .await
         .map_err(|_| anyhow::anyhow!("control storage shutdown deadline exceeded"))??;
 
-    // PG 模式：用户容器跨重启存活（多副本目标形态），跳过全量清删；
-    // 先 flush write-behind 队列（有界 5s），保证结构性 op 落盘后退出
-    if config.storage.backend == crate::config::StorageBackend::Postgres {
-        info!(
-            "[STORAGE_PG] container cleanup skipped (postgres mode: agent containers survive restarts)"
-        );
-        if let Some(backend) = &projects {
-            let outcome = tokio::time::timeout_at(
-                deadline,
-                backend.shutdown_flush_outcome(
-                    deadline.saturating_duration_since(tokio::time::Instant::now()),
-                ),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("project storage flush deadline exceeded"))?;
-            if outcome.is_complete() {
-                info!("[STORAGE_PG] shutdown flush completed");
-            } else {
-                error!(?outcome, "[STORAGE_PG] shutdown flush incomplete");
-                anyhow::bail!("project storage shutdown flush incomplete");
-            }
-        }
-        info!(" RCoder graceful shutdown completed");
-        return Ok(());
-    }
-
-    tokio::time::timeout_at(deadline, cleanup_all_containers(&config, &runtime))
+    // A management-process shutdown preserves compute in every storage mode.
+    // The PG project's write-behind queue still drains under the same deadline.
+    if config.storage.backend == crate::config::StorageBackend::Postgres
+        && let Some(backend) = &projects
+    {
+        let outcome = tokio::time::timeout_at(
+            deadline,
+            backend.shutdown_flush_outcome(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            ),
+        )
         .await
-        .map_err(|_| anyhow::anyhow!("container cleanup deadline exceeded"))??;
-    info!("container cleanup completed");
-
-    info!(" RCoder graceful shutdown completed");
-    Ok(())
-}
-
-async fn cleanup_all_containers(
-    config: &crate::config::AppConfig,
-    runtime: &Arc<dyn ContainerRuntime>,
-) -> anyhow::Result<()> {
-    info!(" starting cleanup of dynamically created containers...");
-
-    match docker_manager::runtime::RuntimeManager::runtime_type() {
-        RuntimeType::Docker => {
-            let docker_manager = docker_manager::global::get_global_docker_manager()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to get global DockerManager: {}", e))?;
-
-            let multi_image_config = if let Some(docker_config) = &config.docker_config {
-                docker_config.get_multi_image_config()
-            } else {
-                shared_types::create_default_multi_image_config()
-            };
-
-            match container_stop::startup_cleanup_all_enabled_services(
-                &docker_manager,
-                &multi_image_config,
-            )
-            .await
-            {
-                Ok(result) => {
-                    if result.successfully_removed > 0 {
-                        info!(
-                            " Cleaned up {} containers (all enabled services)",
-                            result.successfully_removed
-                        );
-                    }
-
-                    if result.failed_removals > 0 {
-                        warn!(
-                            "container cleanup failed: failed count={}",
-                            result.failed_removals
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!("container cleanup error: {}", e);
-                }
-            }
-        }
-        RuntimeType::Kubernetes => {
-            runtime
-                .cleanup_all()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to cleanup runtime resources: {}", e))?;
+        .map_err(|_| anyhow::anyhow!("project storage flush deadline exceeded"))?;
+        if outcome.is_complete() {
+            info!("[STORAGE_PG] shutdown flush completed");
+        } else {
+            error!(?outcome, "[STORAGE_PG] shutdown flush incomplete");
+            anyhow::bail!("project storage shutdown flush incomplete");
         }
     }
 
+    info!("Management shutdown preserves existing Agent and UserApp compute");
+    info!(" RCoder graceful shutdown completed");
     Ok(())
 }

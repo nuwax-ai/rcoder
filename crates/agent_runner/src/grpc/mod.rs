@@ -9,6 +9,8 @@ mod conversion;
 mod locale;
 mod permission;
 mod status;
+#[cfg(target_os = "linux")]
+pub(crate) use status::peer_is_loopback;
 mod stop_agent;
 mod subscribe_progress;
 mod trace_ctx;

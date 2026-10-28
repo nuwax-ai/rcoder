@@ -2,8 +2,11 @@
 //!
 //! 保证：受管进程的所有后代都随停止操作退出，不遗留孤儿进程。
 //!
-//! 底层归属与树杀由 `process-wrap`（watchexec 维护，command-group 官方
-//! 后继）承担：
+//! `process-wrap` provides atomic spawn ownership (Unix group / Windows Job).
+//! A POSIX PGID is a numeric locator, not a stable kernel handle: Unix keeps
+//! its original Child waitable with WNOWAIT until tree quiescence is proven,
+//! then commits that proof before reaping. Windows retains its original Job.
+//! Spawn wrappers (watchexec's successor to command-group):
 //! - Unix：`ProcessGroup::leader()`（子进程自成组长，spawn 原子归属）
 //! - Windows：`JobObject`——挂起 spawn → Job 归属 → 恢复执行（源码
 //!   windows.rs：`flags | CREATE_SUSPENDED` + assign 后 resume，进程
@@ -17,12 +20,20 @@ use std::process::ExitStatus;
 use std::time::Duration;
 
 type OwnedWrapper = Box<dyn process_wrap::tokio::ChildWrapper>;
+#[cfg(any(windows, test))]
 type PendingKill = tokio::task::JoinHandle<(OwnedWrapper, std::io::Result<()>)>;
 
 /// 受管子进程（持有进程组/Job 归属资源）。
 pub struct ManagedChild {
-    inner: Option<Box<dyn process_wrap::tokio::ChildWrapper>>,
+    inner: Option<OwnedWrapper>,
+    #[cfg(any(windows, test))]
     pending_kill: Option<PendingKill>,
+    /// Once the original tree is proven inactive, its numeric PGID is never
+    /// probed or signalled again. The original root alone is reaped afterward.
+    quiescent_exit: Option<ExitStatus>,
+    #[cfg(unix)]
+    observed_root_exit: Option<ExitStatus>,
+    root_reaped: bool,
     /// spawn 时固化的进程 ID（组信号/组探测目标）。不能事后从 wrapper 取：
     /// 进程被 reap 后 `Child::id()` 返回 None，会丢组身份。
     pid: Option<u32>,
@@ -61,7 +72,12 @@ pub fn spawn_managed(cmd: tokio::process::Command) -> Result<ManagedChild> {
     let pid = child.id();
     Ok(ManagedChild {
         inner: Some(child),
+        #[cfg(any(windows, test))]
         pending_kill: None,
+        quiescent_exit: None,
+        #[cfg(unix)]
+        observed_root_exit: None,
+        root_reaped: false,
         pid,
     })
 }
@@ -85,7 +101,7 @@ impl ManagedChild {
     /// 优雅停止：发送停止信号 → 宽限期 → 强制终止整个进程树，并确认收束。
     ///
     /// `grace_period` 为业务进程的正常退出等待时间。收束确认语义：
-    /// - Unix：root 已退出**且进程组内无存活成员**（组信号可达性与父子关系
+    /// - Unix：root 已退出**且进程组内无活执行成员**（组信号可达性与父子关系
     ///   无关——root 先死时孙进程被 reparent 到 init，waitpid 视角 ECHILD
     ///   不构成收束证据，必须组探测）；
     /// - Windows：wrapper `kill()`（TerminateJobObject + Job 空仓收束循环）
@@ -94,6 +110,12 @@ impl ManagedChild {
     /// 宽限期与确认路径都不能调用 wrapper 的树级 `wait()`——它会把 root 状态
     /// 写入缓存，使后续 `kill()` 内部的收束循环短路。
     pub async fn stop(&mut self, grace_period: Duration) -> StopOutcome {
+        if self.quiescent_exit.is_some() {
+            return self
+                .finish_confirmed_root()
+                .await
+                .map_or(StopOutcome::Unconfirmed, StopOutcome::Graceful);
+        }
         // 第一步：发送优雅停止信号（Windows 无跨树信号，为 no-op）
         self.send_stop_signal();
 
@@ -105,8 +127,8 @@ impl ManagedChild {
         #[cfg(windows)]
         let root_within_grace = tokio::time::timeout(grace_period, self.wait_root()).await;
 
-        // 第三步：强制终止整个进程树（kill 经 wrapper 派发到组/Job：
-        // Unix SIGKILL 进程组 + 收束 reap；Windows TerminateJobObject + Job 收束）。
+        // Force the original pinned POSIX group, or the original Windows Job.
+        // Unix must not use wrapper tree-wait/kill to release the PID pin early.
         #[cfg(unix)]
         {
             match self.kill_tree_and_confirm().await {
@@ -132,9 +154,64 @@ impl ManagedChild {
         }
     }
 
-    /// Keep the exact wrapper future alive across a deadline. process-wrap may
+    /// Stop within a caller-owned absolute deadline. The original wrapper and
+    /// an in-flight tree drain remain owned on timeout, so the same stop can be
+    /// observed again without manufacturing a new PID/Job handle.
+    pub async fn stop_until(
+        &mut self,
+        grace_period: Duration,
+        deadline: tokio::time::Instant,
+    ) -> StopOutcome {
+        if self.quiescent_exit.is_some() {
+            return self
+                .finish_confirmed_root()
+                .await
+                .map_or(StopOutcome::Unconfirmed, StopOutcome::Graceful);
+        }
+        // Observe quiescence before signalling a group whose root may already
+        // have been reaped. A completed tree never needs another numeric signal.
+        #[cfg(unix)]
+        if let Some(status) = self.await_tree_exit(Duration::ZERO).await {
+            return StopOutcome::Graceful(status);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return StopOutcome::Unconfirmed;
+        }
+        self.send_stop_signal();
+        let grace =
+            grace_period.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        #[cfg(unix)]
+        if let Some(status) = self.await_tree_exit(grace).await {
+            return StopOutcome::Graceful(status);
+        }
+        #[cfg(windows)]
+        let root_within_grace = tokio::time::timeout(grace, self.wait_root()).await;
+        #[cfg(unix)]
+        {
+            match self.kill_tree_and_confirm_until(deadline).await {
+                Some(status) => StopOutcome::Forced(status),
+                None => StopOutcome::Unconfirmed,
+            }
+        }
+        #[cfg(windows)]
+        {
+            if !self.kill_until(deadline).await {
+                return StopOutcome::Unconfirmed;
+            }
+            match root_within_grace {
+                Ok(Ok(status)) => StopOutcome::Graceful(status),
+                Ok(Err(_)) | Err(_) => match self.try_wait_root() {
+                    Ok(Some(status)) => StopOutcome::Forced(status),
+                    Ok(None) | Err(_) => StopOutcome::Unconfirmed,
+                },
+            }
+        }
+    }
+
+    /// Windows: keep the exact wrapper future alive across a deadline. process-wrap may
     /// cache root exit before tree reaping finishes, so dropping and re-creating
     /// kill() could turn an incomplete Windows Job drain into cached success.
+    #[cfg(any(windows, test))]
     async fn kill_until(&mut self, deadline: tokio::time::Instant) -> bool {
         if self.pending_kill.is_none() {
             let Some(mut inner) = self.inner.take() else {
@@ -164,39 +241,37 @@ impl ManagedChild {
         }
     }
 
-    /// Unix 强杀整树并有界确认（root 已 reap 且进程组 ESRCH）。
+    /// Unix force stop retains its original waitable root as a PID/PGID pin
+    /// until no executing group member remains, then reaps only that Child.
     ///
-    /// macOS 僵尸窗口：TERM 杀死成员后、收尸完成前，对"仅剩僵尸"的组
-    /// `killpg(SIGKILL)` 返回 **EPERM** 而非 Linux 的成功语义，且 start_kill
-    /// 失败使 wrapper kill 不进内部收束 reap——僵尸无人收尸则组探测永真。
-    /// 因此确认循环每轮复调 wrapper kill：start_kill 幂等（ESRCH/EPERM 均无
-    /// 害），内部 wait 的 reap 循环（waitpid(-pgid)）会收掉同组僵尸，收尸后
-    /// 组探测即 ESRCH。真正的 EPERM（无法送达的存活成员）由 deadline 兜底
-    /// 为收束未确认。
+    /// A readable all-zombie group has no executing member, including Darwin's
+    /// zombie-only killpg(0) EPERM. Live/inaccessible/unknown observations remain
+    /// unconfirmed. Reap only the original root after the terminal proof.
     #[cfg(unix)]
     async fn kill_tree_and_confirm(&mut self) -> Option<ExitStatus> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut root_status: Option<ExitStatus> = None;
-        loop {
-            if !self.kill_until(deadline).await && tokio::time::Instant::now() >= deadline {
-                return None;
-            }
-            if root_status.is_none() {
-                root_status = self.try_wait_root().ok().flatten();
-            }
-            if let Some(status) = root_status
-                && !self.process_group_alive()
-            {
-                return Some(status);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return None;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        self.kill_tree_and_confirm_until(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await
     }
 
-    /// 有界轮询整树收束（Unix）：root 已 reap 且进程组内无存活成员。
+    #[cfg(unix)]
+    async fn kill_tree_and_confirm_until(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Option<ExitStatus> {
+        // The original root is still waitable (NOWAIT), so its PID/PGID cannot
+        // be allocated to a foreign group between observation and this signal.
+        if self.try_wait_root().is_err() {
+            return None;
+        }
+        if let Some(pid) = self.pid {
+            crate::kill_process_group(pid, crate::KillSignal::SIGKILL);
+        }
+        self.await_tree_exit(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await
+    }
+
+    /// Observe root exit plus no active group member, commit terminal proof
+    /// before releasing the original waitable root/PID identity pin.
     /// 超时返回 None。等价旧 supervisor 的 wait_for_quiescence 双条件。
     #[cfg(unix)]
     async fn await_tree_exit(&mut self, budget: Duration) -> Option<ExitStatus> {
@@ -207,23 +282,33 @@ impl ManagedChild {
                 root_status = self.try_wait_root().ok().flatten();
             }
             if let Some(status) = root_status
-                && !self.process_group_alive()
+                && !self.process_group_alive(deadline).await
             {
-                return Some(status);
+                self.quiescent_exit = Some(status);
+                return self.finish_confirmed_root().await;
             }
             if tokio::time::Instant::now() >= deadline {
                 return None;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep_until(
+                deadline.min(tokio::time::Instant::now() + Duration::from_millis(20)),
+            )
+            .await;
         }
     }
 
     /// 进程组是否仍有存活成员（观察失败按存活处理——保守不误报收束）。
     #[cfg(unix)]
-    fn process_group_alive(&self) -> bool {
-        self.pid
-            .and_then(|pid| crate::process_group_exists(pid).ok())
-            .unwrap_or(true)
+    async fn process_group_alive(&self, deadline: tokio::time::Instant) -> bool {
+        let Some(pid) = self.pid else {
+            return true;
+        };
+        match tokio::time::timeout_at(deadline, crate::execution_tree::has_live_group_members(pid))
+            .await
+        {
+            Ok(Ok(live)) => live,
+            Ok(Err(_)) | Err(_) => true,
+        }
     }
 
     /// 发送优雅停止信号（平台特定）。
@@ -231,7 +316,10 @@ impl ManagedChild {
     fn send_stop_signal(&mut self) {
         // ProcessGroup::leader() 使子进程自成组长（pgid == pid）→ 组信号
         // 可达全部后代
-        if let Some(pid) = self.pid {
+        if self.quiescent_exit.is_none()
+            && self.try_wait_root().is_ok()
+            && let Some(pid) = self.pid
+        {
             crate::kill_process_group(pid, crate::KillSignal::SIGTERM);
         }
     }
@@ -245,9 +333,30 @@ impl ManagedChild {
     /// 只等**根进程**退出，不等整树收束。
     ///
     /// 服务退出检测与迁移状态捕获需要旧 `tokio::process::Child` 的 root 语义：
-    /// 根进程退出即触发后续全组清理——若用树级等待，一个挂死的孙进程会掩盖
-    /// 根进程死亡（监督循环不触发重启）。树级收束确认由 [`Self::stop`] 承担
-    /// （信号 → 宽限 → 整树强杀 → 确认）。
+    /// Root exit triggers subsequent tree cleanup. On Unix, observing exit
+    /// deliberately retains its kernel PID pin until Stop confirms no live
+    /// group member, then reaps it. Waiting for descendants here would hide a
+    /// failed root from the existing supervisor/restart loop.
+    #[cfg(unix)]
+    pub async fn wait_root(&mut self) -> Result<ExitStatus> {
+        let mut child_signal =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+                .context("observe original child exit signal")?;
+        loop {
+            if let Some(status) = self
+                .try_wait_root()
+                .context("observe original child exit without reaping its identity pin")?
+            {
+                return Ok(status);
+            }
+            child_signal
+                .recv()
+                .await
+                .context("original child exit observer closed")?;
+        }
+    }
+
+    #[cfg(windows)]
     pub async fn wait_root(&mut self) -> Result<ExitStatus> {
         self.inner
             .as_mut()
@@ -258,13 +367,64 @@ impl ManagedChild {
             .context("wait for managed child root process")
     }
 
-    /// 非阻塞查询**根进程**退出状态（root 语义，理由同 [`Self::wait_root`]）。
+    /// Unix observes with WNOWAIT, retaining the actual original Child/PID as
+    /// the group identity pin until Stop proves that no execution remains. This
+    /// is not a live-process/admission marker: a zombie never counts as work.
+    #[cfg(unix)]
+    pub fn try_wait_root(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(status) = self.observed_root_exit {
+            return Ok(Some(status));
+        }
+        let pid = self
+            .pid
+            .and_then(|pid| i32::try_from(pid).ok())
+            .filter(|pid| *pid > 1)
+            .and_then(Pid::from_raw)
+            .ok_or_else(|| {
+                std::io::Error::other("original child process identifier is unavailable")
+            })?;
+        let observed = waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+        )
+        .map_err(std::io::Error::from)?;
+        let Some(observed) = observed else {
+            return Ok(None);
+        };
+        let status = if let Some(code) = observed.exit_status() {
+            ExitStatus::from_raw(code << 8)
+        } else if let Some(signal) = observed.terminating_signal() {
+            ExitStatus::from_raw(signal | if observed.dumped() { 0x80 } else { 0 })
+        } else {
+            return Err(std::io::Error::other(
+                "original child exit observation has no terminal status",
+            ));
+        };
+        self.observed_root_exit = Some(status);
+        Ok(Some(status))
+    }
+
+    #[cfg(windows)]
     pub fn try_wait_root(&mut self) -> std::io::Result<Option<ExitStatus>> {
         self.inner
             .as_mut()
             .ok_or_else(|| std::io::Error::other("managed stop remains in flight"))?
             .inner_mut()
             .try_wait()
+    }
+
+    async fn finish_confirmed_root(&mut self) -> Option<ExitStatus> {
+        let status = self.quiescent_exit?;
+        if !self.root_reaped {
+            let root = self.inner.as_mut()?;
+            if root.inner_mut().wait().await.is_err() {
+                return None;
+            }
+            self.root_reaped = true;
+        }
+        Some(status)
     }
 }
 
@@ -318,6 +478,10 @@ mod deadline_tests {
                 calls: calls.clone(),
             })),
             pending_kill: None,
+            quiescent_exit: None,
+            #[cfg(unix)]
+            observed_root_exit: None,
+            root_reaped: false,
             pid,
         };
         let started = tokio::time::Instant::now();
@@ -345,5 +509,90 @@ mod deadline_tests {
         assert!(owned.inner.is_some());
         assert!(owned.pending_kill.is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod identity_pin_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A real observed exit must remain waitable until this same tree is
+    /// confirmed inactive. The reserved root PID makes foreign PGID reuse
+    /// impossible during TERM/KILL/observation, without a new persistent marker.
+    #[tokio::test]
+    async fn original_exit_keeps_kernel_identity_pin_until_tree_confirmation_and_reap() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        let mut owned = spawn_managed(command).unwrap();
+        let pid = owned.id().unwrap();
+        let exit = tokio::time::timeout(Duration::from_secs(2), owned.wait_root())
+            .await
+            .unwrap()
+            .unwrap();
+        let slot_pinned = crate::process_exists(pid).unwrap();
+        let actual_exit = owned.try_wait_root().unwrap();
+        let stopped = owned.stop(Duration::from_millis(200)).await;
+        let slot_released = !crate::process_exists(pid).unwrap();
+        assert!(exit.success());
+        assert!(
+            slot_pinned,
+            "root exit observation must not release its kernel PID pin before tree confirmation"
+        );
+        assert!(actual_exit.is_some_and(|status| status.success()));
+        assert!(matches!(
+            stopped,
+            StopOutcome::Graceful(_) | StopOutcome::Forced(_)
+        ));
+        assert!(
+            slot_released,
+            "successful Stop must reap the original owned root"
+        );
+    }
+
+    /// Controlled numeric-reuse injection after a REAL old tree was stopped.
+    /// We do not try to force the OS allocator to reuse a PID. The stale numeric
+    /// locator is replaced with a real independent group's PID; a late old Stop
+    /// must return its original receipt and send no TERM/KILL to that group.
+    #[tokio::test]
+    async fn confirmed_old_tree_never_signals_a_foreign_group_reusing_its_numeric_locator() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        let mut old = spawn_managed(command).unwrap();
+        assert!(matches!(
+            old.stop(Duration::from_millis(200)).await,
+            StopOutcome::Graceful(_) | StopOutcome::Forced(_)
+        ));
+        let mut foreign = tokio::process::Command::new("/bin/sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let foreign_pid = foreign.id().unwrap();
+        old.pid = Some(foreign_pid);
+        let late = old.stop(Duration::from_millis(20)).await;
+        let late_deadline = old
+            .stop_until(
+                Duration::ZERO,
+                tokio::time::Instant::now() + Duration::from_millis(20),
+            )
+            .await;
+        let foreign_alive = foreign.try_wait().unwrap().is_none();
+        if foreign_alive {
+            foreign.kill().await.unwrap();
+        }
+        let _exit = foreign.wait().await.unwrap();
+        assert!(
+            foreign_alive,
+            "late old Stop signalled an unrelated reused group locator"
+        );
+        assert!(matches!(
+            late,
+            StopOutcome::Graceful(_) | StopOutcome::Forced(_)
+        ));
+        assert!(matches!(
+            late_deadline,
+            StopOutcome::Graceful(_) | StopOutcome::Forced(_)
+        ));
     }
 }

@@ -1,9 +1,9 @@
-//! 项目适配器：纯 DashMap 内存存储 + RAII 自动资源回收
+//! 项目适配器：纯 DashMap 内存存储与容器引用跟踪
 //!
 //! 替代 DuckDB 内存模式：
 //! - 热路径 O(1) 无锁读（DashMap 分片）
 //! - 引用计数容器管理（共享容器安全）
-//! - RAII 清理（移除 project 时自动销毁无引用的容器）
+//! - 元数据删除不执行物理容器、连接或路由清理；由调用方受控退休
 //!
 //! ## DashMap 使用规范
 //!
@@ -18,10 +18,22 @@
 //! - `session_ops`: session 映射操作
 //! - `store_impl`: ProjectStore 契约实现
 
+mod agent_replacement;
+mod builder_retirement;
 mod container_ops;
 mod lookup;
 mod session_ops;
 mod store_impl;
+mod workload_registration;
+#[cfg(feature = "pg")]
+pub(crate) use agent_replacement::validate_agent_replacement;
+#[cfg(feature = "pg")]
+pub(crate) use builder_retirement::{
+    BuilderPhysicalRegistration, validate_builder_registration_retirement,
+};
+pub(crate) use session_ops::session_container_matches;
+#[cfg(feature = "pg")]
+pub(crate) use session_ops::stop_frame_matches;
 
 use std::sync::Arc;
 
@@ -29,18 +41,17 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use dashmap::DashSet;
 use dashmap::mapref::entry::Entry;
-use shared_types::ProjectAndContainerInfo;
+use shared_types::{ProjectAndContainerInfo, SessionHint};
 use tracing::{debug, info};
 
 use lockmap::LockMap;
-use shared_types::CleanupRequest;
 use shared_types::ContainerEntry;
 use shared_types::StorageStats;
 
 /// 项目适配器
 ///
 /// 纯内存存储，使用 DashMap 分片实现高并发。
-/// 容器引用计数归零时通过 channel 触发异步物理销毁（RAII）。
+/// 容器引用计数归零时保留条目，物理生命周期由运行时调用方管理。
 ///
 /// ## 反向索引
 ///
@@ -64,8 +75,6 @@ pub struct ProjectAdapter {
     pub(super) session_index: DashMap<String, (String, String)>,
     /// project_id → container_key（反向索引）
     pub(super) project_to_container: DashMap<String, String>,
-    /// RAII 清理通道（bounded，try_send 非阻塞，满时丢弃并告警）
-    pub(super) cleanup_tx: tokio::sync::mpsc::Sender<CleanupRequest>,
     /// K8s namespace（用于构建 K8s Service FQDN）
     pub(super) namespace: String,
     /// K8s 集群域名
@@ -88,19 +97,17 @@ pub struct ProjectAdapter {
     /// 消除跨 DashMap（projects ↔ containers）的 TOCTOU 竞态。
     /// `Arc<LockMap>` 保证 clone 后共享同一锁实例。
     project_locks: Arc<LockMap<String, ()>>,
+    /// Same physical-container updates and session admission share this lock.
+    /// Always acquire after a project lock; no guard crosses an await.
+    container_locks: Arc<LockMap<String, ()>>,
     pub(crate) userapp_agents: Arc<std::sync::Mutex<crate::userapp_agent::MemoryBindings>>,
+    pub(crate) workload_admission: Arc<crate::workload_admission::memory::AdmissionMap>,
 }
 
 impl ProjectAdapter {
     /// 创建新的项目适配器
     ///
-    /// 返回 (adapter, cleanup_receiver)。
-    /// cleanup_receiver 需要传给 ResourceReaper 以处理容器销毁。
-    pub fn new(
-        namespace: String,
-        cluster_domain: String,
-    ) -> (Self, tokio::sync::mpsc::Receiver<CleanupRequest>) {
-        let (tx, rx) = tokio::sync::mpsc::channel(shared_types::CLEANUP_CHANNEL_CAPACITY);
+    pub fn new(namespace: String, cluster_domain: String) -> Self {
         let adapter = Self {
             projects: DashMap::new(),
             namespace,
@@ -108,15 +115,16 @@ impl ProjectAdapter {
             containers: DashMap::new(),
             session_index: DashMap::new(),
             project_to_container: DashMap::new(),
-            cleanup_tx: tx,
             container_id_to_key: DashMap::new(),
             user_id_to_project_ids: DashMap::new(),
             pod_id_to_project_id: DashMap::new(),
             project_locks: Arc::new(LockMap::new()),
+            container_locks: Arc::new(LockMap::new()),
             userapp_agents: Arc::new(std::sync::Mutex::new(Default::default())),
+            workload_admission: Arc::new(Default::default()),
         };
-        info!("[STORAGE] ProjectAdapter initialized (DashMap, RAII enabled)");
-        (adapter, rx)
+        info!("[STORAGE] ProjectAdapter initialized (DashMap, metadata-only retirement)");
+        adapter
     }
 
     // ========== Project CRUD ==========
@@ -152,6 +160,17 @@ impl ProjectAdapter {
     ) -> anyhow::Result<()> {
         // DashMap 键：优先 container_name（跨重建稳定、含 service_type 前缀防跨类型碰撞），
         // 无容器信息时回退裸 logical_id（仅占位，不建容器条目）。
+        let key = container_entry_key(&info);
+        let _container_guard = self.container_locks.entry_by_ref(&key);
+        self.insert_container_locked(project_id, info)
+    }
+
+    /// Caller holds the project lock, then the target container lock.
+    fn insert_container_locked(
+        &self,
+        project_id: String,
+        info: Arc<ProjectAndContainerInfo>,
+    ) -> anyhow::Result<()> {
         let key = container_entry_key(&info);
 
         // 读取旧键（view: 读后立即释放锁）
@@ -259,8 +278,12 @@ impl ProjectAdapter {
             }
         }
         for sid in info.sessions() {
-            self.session_index
-                .insert(sid, (key.clone(), project_id.clone()));
+            // Historical membership is retained verbatim, but preparation state
+            // never becomes a routable identity during hydration or sync.
+            if SessionHint::classify(Some(&sid)).as_session_id().is_some() {
+                self.session_index
+                    .insert(sid, (key.clone(), project_id.clone()));
+            }
         }
 
         // 维护反向索引：container_id → 容器键
@@ -280,6 +303,65 @@ impl ProjectAdapter {
                 .insert(pid.to_string(), project_id);
         }
         Ok(())
+    }
+
+    /// Publish a verified replacement without mutating the old shared Arc held
+    /// by other projects. They retain their captured predecessor until migrated.
+    pub(crate) fn publish_verified_agent_registration(
+        &self,
+        expected: &ProjectAndContainerInfo,
+        committed: ProjectAndContainerInfo,
+    ) -> anyhow::Result<bool> {
+        let project_id = committed.project_id().to_owned();
+        let _project_guard = self.project_locks.entry_by_ref(&project_id);
+        let Some(current) = self.get(&project_id) else {
+            return Ok(false);
+        };
+        let basic = committed
+            .container_info()
+            .ok_or_else(|| anyhow::anyhow!("Replacement container missing"))?;
+        if current.persistence_identity().generation != expected.persistence_identity().generation {
+            return Ok(current.persistence_identity().generation
+                == committed.persistence_identity().generation
+                && current.container_info().is_some_and(|c| {
+                    c.container_id == basic.container_id && c.workload_uid == basic.workload_uid
+                }));
+        }
+        let key = container_entry_key(&committed);
+        let _container_guard = self.container_locks.entry_by_ref(&key);
+        let previous = expected.container_info();
+        let existing = self.containers.view(&key, |_, entry| Arc::clone(entry));
+        if let Some(entry) = existing {
+            let current_basic = entry.info();
+            anyhow::ensure!(
+                (previous
+                    .as_ref()
+                    .is_some_and(
+                        |previous| current_basic.container_id == previous.container_id
+                            && current_basic.workload_uid == previous.workload_uid
+                    ))
+                    || (current_basic.container_id == basic.container_id
+                        && current_basic.workload_uid == basic.workload_uid),
+                "Agent container changed before verified registry publication"
+            );
+            if current_basic.container_id != basic.container_id {
+                let service_type = committed
+                    .service_type()
+                    .ok_or_else(|| anyhow::anyhow!("Agent service type missing"))?;
+                self.containers.insert(
+                    key.clone(),
+                    Arc::new(ContainerEntry::with_ref_count(
+                        basic.clone(),
+                        service_type,
+                        entry.logical_id().to_owned(),
+                        entry.ref_count(),
+                    )),
+                );
+                self.container_id_to_key.remove(&current_basic.container_id);
+            }
+        }
+        self.insert_container_locked(project_id, Arc::new(committed))?;
+        Ok(true)
     }
 
     pub(crate) fn insert_after_verified_builder_replacement(
@@ -401,7 +483,7 @@ impl ProjectAdapter {
             .remove(project_id)
             .map(|(_, ck)| ck);
 
-        // 4. 容器引用计数减 1，归零时触发 RAII 清理
+        // 4. 容器引用计数减 1，归零后保留记录供闲置扫描观察
         if let Some(ck) = container_key {
             self.dec_container_ref(&ck);
         } else {
@@ -501,6 +583,46 @@ impl ProjectAdapter {
         }
     }
 
+    /// 按观察代次应用后台状态结论（物理身份不一致即丢弃，不写给后继代次）。
+    /// 状态写入与活动时钟同在单条 entry 锁内完成；容器条目的活动刷新在
+    /// entry 释放后进行（与 update_activity 相同的锁序）。
+    pub fn apply_agent_status_observation(
+        &self,
+        project_id: &str,
+        observation: &shared_types::AgentStatusObservation,
+    ) -> bool {
+        // Same project -> container lock order as registration/replacement.
+        // Keep exclusion through BOTH clocks, including shared ContainerEntry.
+        let _project_guard = self.project_locks.entry_by_ref(&project_id.to_string());
+        let _container_guard = self
+            .container_locks
+            .entry_by_ref(&observation.container_name);
+        let applied = 'apply: {
+            let Entry::Occupied(mut e) = self.projects.entry(project_id.to_string()) else {
+                break 'apply false;
+            };
+            let info = Arc::make_mut(e.get_mut());
+            if !observation.matches(info) {
+                break 'apply false;
+            }
+            info.set_status(Some(if observation.active {
+                shared_types::AgentStatus::Active
+            } else {
+                shared_types::AgentStatus::Idle
+            }));
+            if observation.active {
+                info.update_activity();
+            }
+            true
+        };
+        // entry 已释放，安全访问 containers map（与 update_activity 同锁序）
+        if applied && observation.active {
+            self.containers
+                .view(&observation.container_name, |_, ce| ce.update_activity());
+        }
+        applied
+    }
+
     // ========== 清理相关 ==========
 
     /// 获取存储统计信息
@@ -572,7 +694,7 @@ pub(crate) fn code_to_agent_status(code: i32, _name: &str) -> shared_types::Agen
 /// 不会与裸 id 相撞）。
 ///
 /// 注意：此键仅用于 DashMap 分组/refcount，**不等于** `ProjectAndContainerInfo::container_key()`
-/// （后者返回裸 logical id，供 RAII 清理 identifier 与外部消费者用）。
+/// （后者返回裸 logical id，供容器查找与显式控制入口用）。
 pub(crate) fn container_entry_key(info: &ProjectAndContainerInfo) -> String {
     match info.container_info() {
         Some(c) => c.container_name.clone(),

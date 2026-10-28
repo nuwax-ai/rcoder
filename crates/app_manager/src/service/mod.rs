@@ -14,6 +14,7 @@ mod file_credentials;
 mod operation_lock;
 mod operation_progress;
 pub(crate) mod restart_wait;
+pub(crate) mod traffic_wake_wait;
 pub(crate) use control::OwnedOperation;
 pub(crate) use operation_lock::AppOperationGuard;
 
@@ -297,6 +298,13 @@ impl super::AppServiceTrait for AppService {
         operation: &shared_types::UserAppOperationRecord,
     ) -> AppResult<bool> {
         self.resume_pending_control(operation).await
+    }
+    async fn reconcile_created_runtime_configuration(
+        &self,
+        operation: &shared_types::UserAppOperationRecord,
+    ) -> AppResult<bool> {
+        self.reconcile_created_runtime_configuration(operation)
+            .await
     }
 
     async fn reconcile_interrupted_deletion(

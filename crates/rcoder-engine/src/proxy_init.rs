@@ -54,6 +54,7 @@ pub async fn init_proxy(
     config: &AppConfig,
     api_key_config: Arc<ArcSwap<shared_types::ApiKeyAuthConfig>>,
     container_lookup: Arc<dyn shared_types::ContainerLookup>,
+    user_refresh: Option<Arc<dyn shared_types::ContainerUserRefresh>>,
     access_tracker: Arc<dyn shared_types::AppAccessTracker>,
     wake_control: Arc<dyn shared_types::AppWakeControl>,
 ) -> ProxyInitResult {
@@ -101,6 +102,7 @@ pub async fn init_proxy(
     let mut server_manager = PingoraServerManager::new(pingora_config)
         .with_api_key_config(Arc::clone(&api_key_config))
         .with_container_lookup(container_lookup)
+        .with_user_refresh_opt(user_refresh)
         .with_access_tracker(access_tracker)
         .with_wake_control(wake_control);
     let pingora_service = server_manager.service();

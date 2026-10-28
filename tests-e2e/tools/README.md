@@ -13,6 +13,12 @@ Source 凭据恢复专项使用 `make test-e2e-source-credential-recovery`，先
 这些场景均无 LLM，已加入固定套件、报告身份与必测步骤登记。可以分别运行，不必每次执行完整 E2E：
 
 ```bash
+# 账号归属冲突：默认英文/显式中文，HTTP409、reason、trace与未派发Chat的正面日志证据。
+RCODER_URL=http://127.0.0.1:8090 \
+E2E_OWNER_CONTROLLER_ID='<captured-full-Compose-controller-ID>' \
+  CARGO_BUILD_JOBS=2 make test-e2e-compose E2E_SUITE=compose_lifecycle \
+  E2E_FILTER=computer_owner_conflict_contract
+
 # 原平台闲置回收 → 同卷重建 → 编译/HTTP → Stop/再Start，含准确 owner 强杀。
 CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_dev E2E_FILTER=userapp_dev_idle_recycle_owner_recovery
 
@@ -20,10 +26,83 @@ CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_dev E2E_FILTER=userap
 E2E_PROD_BUILD_RECEIPT=/absolute/frozen-paired-build.json \
   CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_faults E2E_FILTER=userapp_prod_readiness_contract
 
+# 真实激活后、worker 尚未健康时 Stop → StartupFailed 原记录保留 → 新 Start 恢复。
+E2E_PROD_BUILD_RECEIPT=/absolute/frozen-paired-build.json \
+  CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_faults E2E_FILTER=userapp_prod_startup_failed_restore_contract
+
 # 实际模板脚本+真实pip：连续构建、平台停容器后原卷重建、缓存与两层ZIP。
 E2E_TEMPLATE_SOURCE_DIR=/absolute/frozen-userapp-workspace-template \
   CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_build_rules E2E_FILTER=userapp_python_dependency_cache_survives_builder_recycle
 ```
+
+两个 prod 定向场景都需要同一冻结源码的 Main/Runtime 配对镜像及实际二进制回执；
+controller/builder 的 CI 回执不能代替 Runtime 前置。新恢复场景自行创建隔离主控与随机应用，
+用真实 worker HTTP 503 和原操作/PID 作启动屏障；未自然观察到 `StartupFailed` 就失败，
+不篡改 journal、不把第一次已激活宣称为已健康，也不会自动重放未知写请求。
+
+`computer_owner_conflict_contract` 显式使用该 HTTP 地址及 `E2E_OWNER_CONTROLLER_ID`，
+不猜测日常容器名。它通过原 ensure/chat/stop API 操作两个本轮随机账号，使用 Docker
+只读观察原控制器和计算实例。默认请求确实不发送 `Accept-Language`；两条拒绝路径均
+须返回英文，显式 `zh-CN` 则返回中文。九个固定步骤还要求明确的 409/reason/stage、
+`retryable=false`、实际 trace ID、原账号仍复用原实例，以及四条 trace 对应的归属冲突
+日志和无 Chat 派发证据。它不调用真实模型、不修改 Java，也不声称所有准备 RPC 均为零。
+`owner-conflict-contract/ownership.json` 在首次 POST 前原子保存初始不存在证明、run/case、
+随机账号、控制器 UID 和基线；中断清理仅沿原 API 停止本 case 的计算资源，保留数据。
+控制器换代、基线 UID 冲突或请求结果仍未知均不能被空列表转换为清理成功。
+
+闲置回收用例的首请求现先访问真正的开发业务代理，不先调用 Stop/Start/ensure。
+开发代理的产品契约是恢复 builder 管理面，尚未显式启动的 Source 业务保持关闭；
+随后原 Start API 才重新编译并提供 HTTP。固定五项首请求断言会同时检查上述顺序、
+唯一 builder 和响应契约，不能把一次 502 当作生产应用已经自动恢复。生产代理的首流量
+自动唤醒由下方 K8s 场景验证；二者的启动意图不同。
+
+`userapp_compute_stopped_failure_recovery_contract` 使用 Python 3.11+、本轮冻结的
+RCoder/builder 配对构建和独立 Compose 项目，验证真实 Docker Stop 已完成、原操作
+持久化为 `stopped` 后的目标读取失败。仅本应用及生命周期的失败 GET 返回受控 500；
+停止确认阶段的读取和全部成功响应仍来自真实 Docker。原错误必须进入原操作的
+`recovery_required/stopped`，撤销故障后重试相同请求，必须沿原 operation 恢复，
+保留工作区数据并重新编译当前源码、检查实际 HTTP 内容。它不声称覆盖 Docker
+`starting` 前的存储校验或私有 lease/checkpoint 的完整存储契约。
+
+```bash
+E2E_COMPUTE_BUILD_RECEIPT=/absolute/frozen-compute-build.json \
+  CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_faults \
+  E2E_FILTER=userapp_compute_stopped_failure_recovery_contract
+
+# 真实Docker Stop已经执行，延迟其回复至原客户端超时；保留原操作再恢复。
+E2E_COMPUTE_BUILD_RECEIPT=/absolute/frozen-compute-build-with-observer.json \
+  CARGO_BUILD_JOBS=2 make test-e2e E2E_SUITE=compose_userapp_faults \
+  E2E_FILTER=userapp_compute_stop_timeout_recovery_contract
+```
+
+构建回执为 `version:1`，`source` 采用下方 `source_identity` 的
+`origin_head/worktree_sha256`；`rcoder` 包含 `image_id/binary_sha256`，`builder`
+包含 `image_id/agent_runner_sha256/app_cli_sha256`。镜像须为不可变 ID，哈希须由本轮
+真实构建阶段生成，运行中逐项核验。不能给旧镜像现算摘要冒充本轮构建。该入口不构建
+镜像、不修改日常服务；仅清理本轮捕获的计算资源，保留独立 Turso 命名卷、工作区与
+`compute-failure-contract/` 下的私有报告。
+
+`userapp_compute_stop_timeout_recovery_contract` 使用同一隔离 fixture，但显式固定
+`stop_reply_timeout`，不会把旧的 Stopped 后读取故障算作本场景通过。真实 Docker 已确认
+停止之后，故障代理只延迟该次 Stop 回复；120 秒客户端预算不变。未知期间不得出现
+Start/Create，原 operation 必须保留 Stopping/恢复诊断；释放回复后沿同一身份继续，
+重新构建当前源码并验证 HTTP、单实例及原卷数据。构建回执额外要求
+`rcoder.observer_sha256`，对应同一冻结源码构建的正式 `userapp-db-observer`；
+`compute_checkpoint_snapshot.py` 只在原控制器确认停止后，以同一存储引擎只读观察
+原命名卷的具体操作/checkpoint/lease。缺回执、observer 二进制不匹配、控制器仍运行、
+checkpoint 身份不一致或未知写入被误重放都必须失败，不能降为日志关键词检查。
+
+该场景的 Rust 严格入口从 `shared_types::APP_ENTRY_PORT` 向工具传入
+`E2E_COMPUTE_APP_ENTRY_PORT`，避免 Python 重复维护业务入口端口；它不是产品端口配置。
+缺少或无效的入口契约会在 Docker 操作前失败。源码文件编辑属于提交前的 fixture 准备；
+准备完成后，构建、Stopped 后读取故障和恢复阶段分别保留180、120、180秒总预算；
+Stop 回复超时模式的观察预算为210秒，以覆盖未改变的120秒客户端超时，从各自的
+POST开始，覆盖状态轮询、退避；构建还包含实际HTTP和构建计数读取。未知状态和迟到
+成功均明确失败。PG前置仍有独立180秒预算。
+
+故障配置由单一 writer 分两次发布到不同文件：固定目标身份和原 operation 身份各只写
+一次，避免 Docker Desktop bind 读到重写 JSON 的不一致内容。等待 operation 发布仍
+使用原15秒预算；损坏 JSON 直接失败，撤销故障只删除目标 arm 文件。
 
 prod 用例先核验构建输入，随后自动创建本 case 的私有 Compose RCoder/Turso、工作目录、loopback 端口，结束与中断后均按捕获身份清计算，保留数据。构建阶段生成的 `E2E_PROD_BUILD_RECEIPT` 格式如下；不能在验收时给任意旧镜像现算哈希冒充本轮构建：
 
@@ -109,8 +188,13 @@ A/B 制品由本机 HTTP 服务器提供；受控阻塞制造并发窗口，断�
 冷启动通过 env 下发 A 的独立操作与代次；热部署 B 后重启同一容器，必须保留 B 的操作、制品与真实响应，不能被不可变的 A 启动 env 覆盖。成功断言同时要求协议 4、匹配的操作/请求/制品/代次及已持久化的部署成功状态。
 准备失败保持 A；切换后失败保持失败，测试通过显式重新部署 A 完成手动回滚，不要求自动恢复旧版本。
 故障覆盖 404、截断、SHA、坏 ZIP、缺 lock、读取空闲超时及不安全链接。
+故障 fixture 显式把已有下载重试预算设为 8 秒，原产品默认 180 秒和外层 90 秒观察预算保持不变；慢 B 路由先实际返回两次 503，再返回 200，仍需证明原操作完成且准备期间 A 可用。worker 场景的 Source 启动提供真实 workspace/project manifests，使用当前编译器分配的端口，不把历史 release.lock 当成源码输入。
 按用户要求，app-cli 不再设置下载／解压容量及条目限额；B 制品超过测试中保留的旧 APP_DEPLOY_MAX_* 配置，必须成功部署。路径和符号链接安全检查仍保留。
 它不调用或替代 AI，不能作为真实 LLM 测试证据。
+
+完整制品部署和 scope 隔离场景还验证 purge：旧流量不得重建已删除的四个目录或运行容器；随后使用新 URL 显式部署已校验的同一 ZIP，必须出现单个新实例、真实 HTTP 和可写的新数据，再次 purge 后也不能被旧流量复活。临时制品服务只提供该 ZIP 的随机路径，使用完即关闭；macOS/Windows 默认经 `host.docker.internal` 访问，Linux 隔离运行从 `E2E_OWNER_CONTROLLER_ID` 的 Docker 网络取得宿主网关。其他网络布局可显式设置容器能访问的 `E2E_ARTIFACT_HOST`，不需要开放固定公网端口。
+
+Docker crash 场景按原 operation ID 查询历史，不用 `operations/current` 代替终态记录。创建前的未知写继续保持保护；实际启动后的围栏若已由同一物理实例证据收束为 Failed，必须保存停机同引擎 checkpoint、原诊断及 CID，再通过正常 ensure 验证数据、单实例和文件功能，原失败回执不得改写。
 
 运行前必须先构建 builder/runtime，并确认 Compose 的 `RCODER_RUNTIME_IMAGE_DIGEST=dev-app-runtime:latest`。
 生产集群与远程开发集群不属于默认入口；K8s API 契约测试使用本机适配器。
@@ -124,6 +208,14 @@ A/B 制品由本机 HTTP 服务器提供；受控阻塞制造并发窗口，断�
 
 完整部署前会探测实际镜像的 Python SOABI、架构和 Java 版本，拒绝旧 builder 基础镜像与 runtime 配对。构建可通过 `AGENT_BASE_IMAGE` 指定本地已验证的基础镜像；也可先运行 `make docker-build-agent-base` 重建默认基础镜像。用 `python3 docker/verify-userapp-toolchains.py --builder <image> --runtime <image>` 单独检查，输出包含不可变镜像 ID。
 
+完整部署套件可通过 `E2E_BUILDER_IMAGE`、`E2E_RUNTIME_IMAGE` 选择独立构建的
+builder/runtime；前置探测与工具链检查使用相同输入，不必覆盖共享的 dev 镜像标签。
+Turso/crash 用例仍支持原有 `E2E_TURSO_RUNTIME_IMAGE` 与
+`E2E_TURSO_BINARY_SHA256` 输入；显式 builder 同样用于其私有运行配置。
+若额外提供上方计算构建回执 `E2E_COMPUTE_BUILD_RECEIPT`，会核对当前源码及
+controller/builder 身份；若提供 `E2E_PROD_BUILD_RECEIPT`，会核对 runtime 身份。
+缺少这些可选回执时不宣称来源已被回执验证，原有用例自己的镜像与真实二进制核验继续执行。
+
 ## 显式真实 K8s userApp 验收
 
 用户授权个人测试集群后，可运行不依赖 Docker/LLM 的专用入口：
@@ -131,11 +223,52 @@ A/B 制品由本机 HTTP 服务器提供；受控阻塞制造并发窗口，断�
 ```bash
 make test-e2e-k8s-userapp \
   TEST_K8S_SSH=your-cluster-alias \
+  TEST_K8S_NAMESPACE=nuwax-k8s-test \
+  TEST_K8S_WORKLOAD_KIND=statefulset \
+  TEST_K8S_DEPLOYMENT=nuwax-k8s-test-rcoder \
+  TEST_K8S_CONTEXT=your-context \
+  TEST_K8S_KUBE_SERVER=https://cluster-api.example.com:6443 \
   RCODER_URL=http://node.example.com:30295 \
   E2E_PINGORA_URL=http://gateway.example.com:8089
 ```
 
-仅支持 `nuwax-k8s-test`，检查入口属于实际节点。通过 SSH 转发直连不同 rcoder Pod；构建真实 A/B 静态制品，验证任务/SSE、冷部署、容器内热部署、失败保旧、停止后新 Pod 恢复 B 和资源清理。无需改动日常 Compose 配置。
+目标限于 `nuwax-k8s-test` 或带匹配环境归属标签的独立 `rcoder-e2e-*` namespace；后者还需
+`TEST_K8S_ENVIRONMENT_ID`。`TEST_K8S_INTERNAL_URL` 可覆盖制品下载使用的集群内 RCoder
+地址；自建命名空间应显式填写其 Service 地址。API server 参数保留 TLS 校验，留空则
+沿用远端 kubeconfig。namespace、workload kind/name、context 均可配置，入口地址仍须
+属于实际节点。通过 SSH 转发直连不同 rcoder Pod；构建真实 A/B 静态制品，验证任务/SSE、
+冷部署、容器内热部署、失败保旧和清理。无需改动日常 Compose 配置。
+
+该入口还有两个业务回归：Stop 确认零 Pod 后，经 SSH 固定到两个不同主服务副本的
+代理端口各发一个 GET（端口由 `TEST_K8S_PROXY_PORT` 配置，默认 8088），不使用环境代理、
+不跟随重定向、不重试，也不调用
+start/ensure，要求首请求均得到 B、仅一个新 Pod、PVC UID 与文件/Git 数据保留；其后
+显式 Start 不能再次换 Pod。这里使用受控 Stop，不能据此声称已覆盖集群实际闲置扫描器。
+另一条在删除 L1、显式 recreate L2 后，真正使用 workspace、文件/Git、构建制品、部署
+HTTP 及 compute stop/restart；旧 L1 控制请求必须被拒绝且 L2 资源不变，旧公开操作回执
+不能被改写。原操作的 terminal lease 正常释放可以单调推进 revision，其他公开字段仍
+须完全一致；报告保留原始 before/after。它不依赖模型。失败也通过原 prod/delete 与
+delete/app API 收尾。其他应用新建 PVC 不会让本应用测试失败；原基线 PVC 的 UID/PV
+绑定仍须保留。
+
+L2 的 `recreate-after-ensure.json`、`recreate-after-business.json` 和
+`recreate-before-cleanup.json` 保存精确新建资源身份；外层保护器若监视 PVC 删除，必须
+核对本轮 app、lifecycle、managed-by、service family、名称和 UID 后才允许这些自有
+UserApp PVC 的原 API 清理。基线卷、普通 Agent 卷或仅名称相似的卷没有删除例外。
+
+独立验证 Delete/recreate 时，使用相同连接参数运行
+`make test-e2e-k8s-userapp-recreate`，或向 Python 入口传 `--scenario recreate`。
+它创建本轮随机应用，先验证 L1 workspace、跨副本文件/Git、真实构建制品和 HTTP、
+compute Stop/Restart 及数据保留，再通过原 Delete/recreate API 建立 L2，执行上述
+L2 完整业务、旧 L1 请求拒绝与操作历史保留检查。它不先执行 traffic wake、热部署锁
+冲突或只读 RV 故障场景，也不调用模型。默认 `--scenario all` 的完整 81 项必测断言保持。
+
+独立报告的 `scenario=recreate`，`report_identity.scenario=k8s_userapp_recreate`，
+`backend=k8s`；`planned` 与 `required` 只列其固定必测集合。它的通过不能替代默认完整
+场景通过；当前独立集合为 34 项。Delete/recreate 和 L2 业务属于正常测试阶段，失败记录在 `error`；finally
+仅用原 API 安全清理本轮当前生命周期并核对基线，独立记录 `cleanup_error`，不会为了
+收尾再次 recreate 或重跑失败业务。所有自有 UserApp PVC 清理沿上述身份规则；普通
+Agent 卷与基线卷保留。
 
 该入口独立生成 `reports/<run-id>/summary.json`、断言、请求、源码指纹和 K8s 镜像/UID 证据。所有必要断言必须通过；并发失败可记录后继续验证后续链路，但整体仍返回非零。它不覆盖原有 Agent/SSE LB、真实 AI 或七语言工具链全套场景。
 
@@ -255,3 +388,108 @@ python3 -m unittest discover -s tests-e2e/tools -p test_local_k8s_core.py -v
 `local_k8s_prod_execute.py` 和 `local_k8s_prod_expiry.py`。各脚本的 `--help`
 列出明确前置；续跑保留旧报告并核验原身份。验收边界和实例就绪规则见
 [Kubernetes 指南](../../docs/deployment/kubernetes.md)。
+
+
+### 隔离恢复 CI
+
+`isolated-e2e.yml` 是手动触发的独立 Docker 恢复门禁，不连接已有 Compose 或 K8s 服务。必须提供一对包含编译/运行前置的不可变镜像：controller 基底需 Rust、protoc、C/C++ 工具链与 Node/pnpm；builder 基底需 app-cli/Pingap 对应运行依赖。镜像 ID 或仓库 `@sha256:` 引用均可；可变 tag、缺失工具、空筛选、skip、业务失败或清理未确认均使任务失败。
+
+本地可用同一入口；报告目录应放在代码仓库之外：
+
+```bash
+python3 tests-e2e/tools/isolated_ci.py \
+  --controller-base "$E2E_CONTROLLER_BASE" \
+  --builder-base "$E2E_BUILDER_BASE" \
+  --report-root "$E2E_CI_REPORT_ROOT"
+```
+
+入口冻结源码并实际编译 RCoder、Agent Runner、独立 app-cli 和离线观察器，再启动本次专属控制面与动态随机应用。它核对二进制、严格逐用例报告、源码不漂移和既有容器保留；只清理本轮确认归属的计算资源，保留数据卷与失败证据。当前覆盖 owner 冲突、文件/Git、重复启停、多服务、预览 HTTP/HMR、闲置/owner 强杀及真实 Stop 回复超时和迟到 Stop。此 job 不代替 K8s 81 步与跨副本聊天/SSE 验收，也不代替独立 app-cli 的组件检查。
+
+### Main DevComputer 定向回归
+
+`compose_devcomputer` 包含受控真实 ACP 子进程的 `devcomputer_main_protocol_contract`
+和一次真实模型的 `devcomputer_main_real_model_smoke`。使用
+`E2E_SUITE=compose_devcomputer E2E_FILTER=devcomputer_main_protocol_contract make test-e2e-compose`
+定向选择；真实模型另选其完整用例名，并提供常规 E2E 模型配置。受控协议结果不能
+代替真实 AI 验证；正常订阅屏障也不证明首订阅前快速完成的事件保留。
+
+先在 Python 3.11+ 私有 venv 安装
+`pip install -r tests-e2e/tools/requirements-devcomputer.txt`，设置
+`E2E_PROTOCOL_PYTHON` 为其解释器。受控用例还要求本轮专属、可核对完整容器 ID 的
+控制面（`E2E_OWNER_CONTROLLER_ID`）及同次冻结构建回执
+（`E2E_COMPUTE_BUILD_RECEIPT`），不得指向共享或生产服务。隔离恢复 CI 自动安装
+依赖并只运行受控用例；缺少前置会失败，不会跳过。
+
+### 独立 K8s 热部署恢复故障回归
+
+向 `k8s_userapp.py` 传入相同连接参数及 `--scenario hot_recovery`，执行独立的
+`k8s_userapp_hot_recovery` 场景。该故障入口仅接受 `nuwax-k8s-test`，有固定必测
+集合；默认 `--scenario all` 的完整 81 项和独立 recreate 契约保持原样，其通过
+不能互相替代。先按构建部署流程冻结源码和镜像，再运行该场景；单纯 Python 单元
+测试不代表集群故障验收通过。
+
+它通过原 Workspace/Build/Deploy API 构建 A/B/C/D 四个真实 ZIP，冷启动 A，
+在本轮独立 ConfigMap/Service/Pod 中使用已运行 app-runtime 镜像和 Python 标准库
+提供 B/D 原始制品字节。下载请求停在有 180 秒上限的文件 barrier；控制仅经精确
+fixture Pod 的 `kubectl exec`，没有 HTTP 写控制接口。fixture 不启动 app-cli 或 PG，
+不挂 PVC、宿主目录或 Docker socket；元数据携带本 run、case、app/lifecycle 身份。
+
+- B 下载被真实 owner 受理后，使用原 Lease 的 UID 和当前 resourceVersion 条件
+  patch `renewTime` 为过去，TTL 保持 60 秒。原协调任务仍运行；先观察扫描器将原
+  `hot_execution` 围栏为 `RecoveryRequired`，再释放下载。验证真实 B 可达、原操作
+  自动终态及槽位/租约释放，随后普通热部署 C 成功；环境配置仍为旧值时不允许
+  把 B 的部分成功报告为平台完整成功，迟到原协调结果不能覆盖后续操作或诊断。
+  这属于精确过期 Lease 注入，**不是主机崩溃/停止续租的端到端模拟**。
+- D 下载期间，只对本应用实际 env ConfigMap 的 UID/RV 条件写一条本轮 annotation，
+  不改变业务环境。释放 D 后，原条件 env commit 必须明确拒绝；真实 D 运行、
+  ConfigMap 仍保留 C 及新增 annotation。自动恢复应保留原失败、释放操作槽和租约，
+  新普通热部署请求能恢复 C 并提交匹配的完整配置。冲突可能在客户端 RV 预检发现，
+  **没有 API 原始证据时不把它称为已观察到 HTTP 409**。
+
+同时核对原 Pod UID、真实构建制品身份、B/D 的实际下载次数、开发工作区文件/Git、
+生产数据 PVC 上的本轮文件见证及现有基线卷。下载次数证明没有通过重放原制品请求
+伪造恢复；此场景没有数据库迁移命令，不能据此声称完成数据库 SQL 审计或迁移重放
+全场景验证。完整原应用清理仍沿原 API；临时 fixture 只按本轮标签/作用域/UID 与
+当前 RV 删除精确 Pod/Service/ConfigMap，记录零 PVC 删除请求。创建响应丢失时也
+须重新核验本轮身份和基线排除，不能按名称盲删。finally 独立释放 barrier、有限等待
+原 HTTP 观察者并清理 fixture，分别保存原业务错误和清理错误。
+
+热恢复工具先真实构建并立即冷部署 A，再构建 B/C/D，避免正常的“默认保留最新
+3 份制品”策略使 A 的旧静态 URL 在部署前失效。fixture 同时提供已校验 C ZIP 的
+非阻塞只读 URL，供两个全新正常热部署请求使用；B/D 仍保留原 barrier 和各一次
+下载的严格断言，另核对 C 恰好被这两个新请求下载。它保留真实原制品字节，不
+调整平台保留策略。fixture 镜像取原运行 Pod status 中实际可拉取的 immutable
+`imageID`，不会把预载的裸 config ID 当作仓库名重新拉取。
+
+`native-link` 已包含 `native-files.cjs`：用真实 `workspacePath` 验证中文/空格路径的
+文件 CRUD、Git、ZIP CRC，并在 Stop 后通过原 native Start 重开，核对原数据与
+Git HEAD 保留。正式验收必须关联本轮注册的源码和实际二进制回执；未归因的本机
+二进制 API 前置探测不算最终验收，native-only 不能替代 K8s、Compose 或真实 AI 回归。
+
+
+## 本地 PG leader 与迟到元数据故障回归
+
+这两个定向用例不调用模型。PG 用例通过真实 Docker PostgreSQL、同一个 AppState 和生产后台装配，终止本轮精确持锁连接，保持失主窗口，再验证四个周期任务重新执行。Docker 用例启动真实后台装配，以受控运行时执行本轮容器操作，验证旧元数据晚于同名新 CID 退休时，新容器、会话索引与卷标记保留。它们不替代完整 HTTP/业务部署 E2E。
+
+先准备本地 `postgres:17` 镜像并单独编译测试二进制；工具冻结实际镜像 ID，不会替换日常 RCoder。测试二进制取 Cargo JSON 中 `target.name=rcoder_engine`、`reason=compiler-artifact` 对应的 `executable`，不能填写主服务二进制。
+
+```bash
+cargo test -p rcoder-engine --features rcoder-pg --lib --no-run --message-format=json \
+  > /tmp/rcoder-leader-tests.jsonl
+
+python3 tests-e2e/tools/leader_pg_fixture.py prepare \
+  --directory "tests-e2e/reports/leader-local-<run>"
+
+python3 tests-e2e/tools/leader_pg_fixture.py run \
+  --directory "tests-e2e/reports/leader-local-<run>" \
+  --test-binary "<engine-libtest-executable>"
+
+python3 tests-e2e/tools/leader_pg_fixture.py run \
+  --directory "tests-e2e/reports/leader-local-<run>" \
+  --test-binary "<engine-libtest-executable>" --case docker-metadata
+
+python3 tests-e2e/tools/leader_pg_fixture.py cleanup \
+  --directory "tests-e2e/reports/leader-local-<run>"
+```
+
+每轮使用新目录。私有凭据仅保存在权限为 0600 的环境文件中；工具检查本轮完整容器 ID、归属标签和 loopback 端口。`run` 必须实际执行恰好一个用例并生成成功回执，空筛选或缺回执会失败。清理只删除本轮捕获的 PG 容器，保留命名卷和故障日志；Docker 用例也只清本轮捕获的 CID，不删除数据卷。根关机或旧任务排空失败不算恢复成功。

@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use path_clean::PathClean;
 use serde::Serialize;
 
 use crate::config::Config;
@@ -21,6 +22,11 @@ use super::{FileEntry, build_file_proxy_url, resolve_subdir};
 
 /// 并行遍历线程上限: 取 CPU 并行度但封顶, 避免小目录过度开线程的调度开销。
 const MAX_SEARCH_THREADS: usize = 8;
+
+/// Keep the pre-5.0 bounded result queue: at most two batches per worker.
+/// Raising this trades memory for producer throughput without improving the
+/// search endpoint's visit/result budgets.
+const SEARCH_QUEUED_BATCHES_PER_WORKER: usize = 2;
 
 /// 搜索遍历的目录黑名单: 仅纯噪音目录 (VCS 元数据/依赖/解释器缓存)。
 /// 刻意放行产品运行时目录 (.claude/.agents/.codex/.opencode/.local-deploy 等) ——
@@ -177,7 +183,9 @@ pub async fn search_files(params: SearchParams<'_>) -> AppResult<SearchResult> {
         .collect::<HashSet<String>>();
 
     let ctx = BlockingCtx {
-        root: root.to_path_buf(),
+        // resolve_subdir 已按宿主组件 clean 遍历起点；相对路径基准须使用同一
+        // 形态，否则合法的 root/./、root/sub/.. 或 Windows 正斜杠根会失配。
+        root: root.clean(),
         search_root: search_root_abs,
         proxy_path: proxy_path.map(str::to_string),
         exclude_dirs,
@@ -262,9 +270,10 @@ fn search_blocking(ctx: &BlockingCtx) -> (Vec<FileEntry>, bool, usize) {
         &ctx.search_root,
         threads,
         dua_core::Order::ParentFirst,
-        // dua-core 3.3 新增的平台元数据开关（macOS APFS clone）默认关闭，
-        // 与 3.1 行为一致——search-files 只消费路径与文件类型
-        dua_core::Options::default(),
+        // dua-core 5 makes Options non-exhaustive: use its public builder.
+        // Retain metadata/APFS defaults and the original bounded buffering;
+        // changing metadata collection is outside this compatibility upgrade.
+        dua_core::Options::default().queued_batches_per_worker(SEARCH_QUEUED_BATCHES_PER_WORKER),
         descend,
     );
 
@@ -371,25 +380,50 @@ fn search_blocking(ctx: &BlockingCtx) -> (Vec<FileEntry>, bool, usize) {
 /// 得到相对路径。搜索根可能为 root 的子目录 (relative_path), 但条目路径是绝对的,
 /// 故前缀裁剪始终能得到正确的相对工作区路径。
 ///
-/// 性能: 每个访问条目都会调用 (命中前), 用"parent 切片 + format 拼接"一次分配,
-/// 取代 Path::join + strip_prefix + replace 的三次分配; Windows 分隔符条件替换。
-fn make_relative_posix(root: &Path, entry: &dua_core::Entry) -> String {
-    let parent = entry.parent_path.to_string_lossy();
-    let root_str = root.to_string_lossy();
-    let root_trimmed = root_str.trim_end_matches('/');
+/// 性能: 每个访问条目都会调用 (命中前)，用 parent 的组件前缀切片 + format
+/// 拼接，避免逐条 Path::join。Windows 的两种分隔符由 Path 组件语义统一。
+/// 宿主路径分隔符集合：仅用于不在 root 下时的既有 fallback。
+///
+/// **只认宿主分隔符**：Windows 上 `/` 与 `\` 都是分隔符；POSIX 上只有 `/`——
+/// `\` 在 POSIX 是合法文件名字符，当分隔符裁会把名为 `\sub` 的目录改成 `sub`
+/// （口径同 `path_safety::host_relative_to_wire` 的 FS-08 注释与 resolve 的
+/// `resolve_preserves_posix_backslash_filename` 反例）。
+#[cfg(windows)]
+const HOST_SEPARATORS: [char; 2] = ['/', '\\'];
+#[cfg(not(windows))]
+const HOST_SEPARATORS: [char; 1] = ['/'];
+
+/// root 组件前缀裁剪 + 段拼接 + wire 归一。不能用字符串 strip_prefix：Windows
+/// 合法的 `C:/ws` 与遍历器 `C:\ws\sub` 使用不同分隔符，且 `ws` 不是
+/// `ws-other` 的路径前缀。`\`→`/` 归一仍由 FS-08 唯一转换点
+/// `path_safety::host_relative_to_wire`）。返回即最终 wire 名。
+///
+/// 与 [`make_relative_posix`] 分开：本函数不依赖 `dua_core::Entry`（其
+/// `FileType` 字段私有、测试无法构造），分隔符口径因而可跨平台单测。
+fn relative_wire_path(root: &str, parent: &str, name: &str) -> String {
     // parent==root（根级条目）→ rel 空; parent=root/sub → "sub"; 非 root 前缀
     // （customTargetDir 等场景）→ 退化为绝对路径去前导斜杠。
-    let rel = match parent.strip_prefix(root_trimmed) {
-        Some(rest) => rest.trim_start_matches('/'),
-        None => parent.trim_start_matches('/'),
-    };
-    let name = entry.file_name.to_string_lossy();
+    let relative = Path::new(parent)
+        .strip_prefix(root)
+        .ok()
+        .map(Path::to_string_lossy);
+    let rel = relative
+        .as_deref()
+        .unwrap_or_else(|| parent.trim_start_matches(HOST_SEPARATORS));
     let joined = if rel.is_empty() {
-        name.into_owned()
+        name.to_string()
     } else {
         format!("{rel}/{name}")
     };
     crate::path_safety::host_relative_to_wire(&joined)
+}
+
+fn make_relative_posix(root: &Path, entry: &dua_core::Entry) -> String {
+    relative_wire_path(
+        &root.to_string_lossy(),
+        &entry.parent_path.to_string_lossy(),
+        &entry.file_name.to_string_lossy(),
+    )
 }
 
 /// 大小写不敏感子串匹配 (kw 须已转小写, 由调用方保证; 空串恒 false)。
@@ -429,6 +463,80 @@ mod tests {
 
     fn default_test_config() -> Config {
         Config::default()
+    }
+
+    /// 各平台都成立的 POSIX 形状契约：剥掉 root 前缀后不留前导分隔符。
+    #[test]
+    fn relative_wire_path_strips_posix_leading_separator() {
+        // 根级条目：parent == root → 裸文件名
+        assert_eq!(relative_wire_path("/app/ws", "/app/ws", "a.txt"), "a.txt");
+        // 前缀余下 `/sub` → `sub`
+        assert_eq!(
+            relative_wire_path("/app/ws", "/app/ws/sub", "c.txt"),
+            "sub/c.txt"
+        );
+        // 嵌套
+        assert_eq!(
+            relative_wire_path("/app/ws", "/app/ws/sub/nested", "e.txt"),
+            "sub/nested/e.txt"
+        );
+        // 根带尾部分隔符：前缀比对仍须命中，不得退化成绝对路径分支
+        assert_eq!(
+            relative_wire_path("/app/ws/", "/app/ws/sub", "c.txt"),
+            "sub/c.txt"
+        );
+        // 非 root 前缀（customTargetDir 等）→ 退化去前导斜杠
+        assert_eq!(
+            relative_wire_path("/app/ws", "/elsewhere/sub", "c.txt"),
+            "elsewhere/sub/c.txt"
+        );
+        // 字符串前缀不等于目录组件前缀，不能把兄弟目录裁成 "-other"。
+        assert_eq!(
+            relative_wire_path("/app/ws", "/app/ws-other/sub", "c.txt"),
+            "app/ws-other/sub/c.txt"
+        );
+    }
+
+    /// Windows 反例（修复前失败）：`strip_prefix` 余下的是 `\sub`，只裁 `/`
+    /// 会留下前导分隔符，经 host_relative_to_wire 归一成 `/sub`——前导斜杠让
+    /// 消费方把相对路径当绝对路径。
+    #[cfg(windows)]
+    #[test]
+    fn relative_wire_path_strips_windows_leading_separator() {
+        assert_eq!(
+            relative_wire_path(r"C:\ws", r"C:\ws\sub", "c.txt"),
+            "sub/c.txt"
+        );
+        assert_eq!(
+            relative_wire_path(r"C:\ws", r"C:\ws\sub\nested", "e.txt"),
+            "sub/nested/e.txt"
+        );
+        // 根带 `\` 尾部分隔符
+        assert_eq!(
+            relative_wire_path(r"C:\ws\", r"C:\ws\sub", "c.txt"),
+            "sub/c.txt"
+        );
+        // HTTP/workspace 规范路径用 `/`，遍历器可能用宿主 `\`；必须仍是相对名。
+        assert_eq!(
+            relative_wire_path("C:/ws", r"C:\ws\sub", "c.txt"),
+            "sub/c.txt"
+        );
+        // 非 root 前缀 → 退化为绝对路径，去前导分隔符后交 wire 归一
+        assert_eq!(
+            relative_wire_path(r"C:\ws", r"D:\elsewhere\sub", "c.txt"),
+            "D:/elsewhere/sub/c.txt"
+        );
+    }
+
+    /// POSIX 反例：`\` 是合法文件名字符，绝不能当分隔符剥。无条件按
+    /// `['/', '\\']` 裁会把名为 `\sub` 的目录改成 `sub`（同 FS-08 口径）。
+    #[cfg(not(windows))]
+    #[test]
+    fn relative_wire_path_keeps_posix_backslash_filename() {
+        assert_eq!(
+            relative_wire_path("/app/ws", r"/app/ws/\sub", "c.txt"),
+            r"\sub/c.txt"
+        );
     }
 
     /// 构造测试目录结构 (与 mod.rs tests 同构):
@@ -486,6 +594,67 @@ mod tests {
         assert!(!names.contains(&"b.md"));
         assert!(!names.contains(&"sub/d.log"));
         assert!(!r.truncated);
+    }
+
+    #[tokio::test]
+    async fn search_files_clean_root_keeps_results_relative() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_test_tree(tmp.path()).await;
+        // 遍历起点会 clean；传入根的历史 /sub/.. 形式不能泄漏进 wire 名和 URL。
+        let root = tmp.path().join("sub").join("..");
+        let cfg = default_test_config();
+        let result = search_files(SearchParams {
+            root: &root,
+            config: &cfg,
+            proxy_path: Some("/proxy"),
+            kw: ".txt",
+            relative_path: Some("sub"),
+            limit: 100,
+            max_visit: 1000,
+            timeout_ms: 5000,
+            kind_filter: None,
+        })
+        .await
+        .unwrap();
+        let names: Vec<_> = result
+            .files
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["sub/c.txt", "sub/nested/e.txt"]);
+        assert!(result.files.iter().all(|entry| {
+            entry.file_proxy_url.as_deref() == Some(format!("/proxy/{}", entry.name).as_str())
+        }));
+        assert!(!result.truncated);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn search_files_forward_slash_root_keeps_results_relative() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_test_tree(tmp.path()).await;
+        let wire_root = tmp.path().to_string_lossy().replace('\\', "/");
+        let cfg = default_test_config();
+        let result = search_files(SearchParams {
+            root: Path::new(&wire_root),
+            config: &cfg,
+            proxy_path: Some("/proxy"),
+            kw: ".txt",
+            relative_path: None,
+            limit: 100,
+            max_visit: 1000,
+            timeout_ms: 5000,
+            kind_filter: None,
+        })
+        .await
+        .unwrap();
+        let names: Vec<_> = result
+            .files
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["a.txt", "sub/c.txt", "sub/nested/e.txt"]);
+        assert!(!result.truncated);
     }
 
     #[tokio::test]
@@ -947,5 +1116,153 @@ mod tests {
         assert!(contains_ignore_case("数据/报表.csv", "报表"));
         assert!(contains_ignore_case("Ähnlich.txt", "ähnlich")); // Unicode 折叠
         assert!(!contains_ignore_case("数据/x.csv", "报表a"));
+    }
+
+    #[tokio::test]
+    async fn search_files_visit_budget_stops_a_backlogged_parallel_walk() {
+        let root = tempfile::tempdir().unwrap();
+        for directory in 0..32 {
+            let path = root.path().join(format!("batch-{directory}"));
+            std::fs::create_dir(&path).unwrap();
+            for file in 0..16 {
+                std::fs::write(path.join(format!("match-{file}.txt")), "retained").unwrap();
+            }
+        }
+        let config = default_test_config();
+        // Dropping a walker whose bounded output channel is full must still
+        // wake and join its workers; the endpoint's visit cap remains exact.
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            search_files(SearchParams {
+                root: root.path(),
+                config: &config,
+                proxy_path: None,
+                kw: "match",
+                relative_path: None,
+                limit: 100,
+                max_visit: 3,
+                timeout_ms: 5000,
+                kind_filter: Some(SearchKindFilter::File),
+            }),
+        )
+        .await
+        .expect("bounded walker must shut down after early termination")
+        .unwrap();
+        assert_eq!(result.visited, 3);
+        assert!(result.truncated);
+        assert!(result.files.len() <= 3);
+        assert!(
+            result
+                .files
+                .iter()
+                .all(|entry| !Path::new(&entry.name).is_absolute())
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("batch-0/match-0.txt")).unwrap(),
+            b"retained"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_files_does_not_follow_external_cyclic_or_broken_links() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("inside-match.txt"), "inside").unwrap();
+        std::fs::write(outside.path().join("secret-match.txt"), "outside").unwrap();
+        symlink(outside.path(), root.path().join("match-directory-link")).unwrap();
+        symlink(".", root.path().join("match-loop")).unwrap();
+        symlink(
+            outside.path().join("secret-match.txt"),
+            root.path().join("match-file-link"),
+        )
+        .unwrap();
+        symlink("missing-target", root.path().join("match-broken-link")).unwrap();
+        let config = default_test_config();
+        let result = search_files(SearchParams {
+            root: root.path(),
+            config: &config,
+            proxy_path: Some("/proxy"),
+            kw: "match",
+            relative_path: None,
+            limit: 100,
+            max_visit: 100,
+            timeout_ms: 5000,
+            kind_filter: None,
+        })
+        .await
+        .unwrap();
+        assert!(!result.truncated);
+        assert_eq!(result.files.len(), 5);
+        assert!(
+            result.files.iter().all(|entry| !entry.name.contains('/')),
+            "symlinked directory contents must not enter search results"
+        );
+        for name in [
+            "match-directory-link",
+            "match-loop",
+            "match-file-link",
+            "match-broken-link",
+        ] {
+            let link = result
+                .files
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap();
+            assert_eq!(link.is_link, Some(true));
+            assert!(
+                !link.is_dir,
+                "link type is retained without following its target"
+            );
+            assert_eq!(
+                link.file_proxy_url.as_deref(),
+                Some(format!("/proxy/{name}").as_str())
+            );
+        }
+        assert!(
+            !result
+                .files
+                .iter()
+                .any(|entry| entry.name == "secret-match.txt")
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn search_files_verbatim_windows_root_preserves_relative_results() {
+        let root = tempfile::tempdir().unwrap();
+        make_test_tree(root.path()).await;
+        // canonicalize supplies a Win32 verbatim root without changing the
+        // process cwd or requiring symbolic-link privileges.
+        let canonical = root.path().canonicalize().unwrap();
+        let config = default_test_config();
+        let result = search_files(SearchParams {
+            root: &canonical,
+            config: &config,
+            proxy_path: Some("/proxy"),
+            kw: ".txt",
+            relative_path: Some("sub"),
+            limit: 100,
+            max_visit: 1000,
+            timeout_ms: 5000,
+            kind_filter: Some(SearchKindFilter::File),
+        })
+        .await
+        .unwrap();
+        let names: Vec<_> = result
+            .files
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["sub/c.txt", "sub/nested/e.txt"]);
+        assert!(!result.truncated);
+        assert!(
+            result
+                .files
+                .iter()
+                .all(|entry| entry.file_proxy_url.as_deref()
+                    == Some(format!("/proxy/{}", entry.name).as_str()))
+        );
     }
 }

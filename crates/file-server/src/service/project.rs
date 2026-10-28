@@ -579,7 +579,7 @@ mod tests {
         let mut matches = 0;
         for i in 0..z.len() {
             let mut entry = z.by_index(i).unwrap();
-            if entry.name() == "cpage_config.json" {
+            if entry.name().unwrap() == "cpage_config.json" {
                 matches += 1;
                 let mut buf = String::new();
                 Read::read_to_string(&mut entry, &mut buf).unwrap();

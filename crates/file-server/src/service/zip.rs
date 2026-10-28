@@ -105,7 +105,10 @@ fn extract_open_file_with_limits(
         let mut entry = archive
             .by_index(i)
             .map_err(|e| zip_read_error(e, &format!("zip entry {i} read failed")))?;
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map_err(|e| zip_read_error(e, "zip entry name decode failed"))?
+            .into_owned();
         let target = match safe_zip_entry(dst, &name) {
             Ok(p) => p,
             Err(error) if strict_paths => return Err(error),
@@ -625,7 +628,7 @@ mod tests {
         let f = fs::File::open(zip_path).unwrap();
         let mut z = zip::ZipArchive::new(f).unwrap();
         (0..z.len())
-            .filter_map(|i| z.by_index(i).ok().map(|e| e.name().to_string()))
+            .filter_map(|i| z.by_index(i).ok().map(|e| e.name().unwrap().into_owned()))
             .collect()
     }
 

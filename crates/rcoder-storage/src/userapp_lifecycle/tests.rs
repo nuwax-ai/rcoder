@@ -240,6 +240,184 @@ async fn turso_interrupted_deletion_revokes_only_original_snapshot_and_preserves
     interrupted_deletion_recovery_contract(&store, &store).await;
 }
 
+/// 陈旧 Running EnsureBuilder 专用收束（窄门 + 快照 CAS + slot 原子释放）。
+/// 覆盖：正常收束、终态与证据留痕、slot 释放、重复/过期快照拒绝、
+/// 非 EnsureBuilder 与 RecoveryRequired 拒绝、后继 slot 不受影响。
+async fn stale_running_builder_settlement_contract(store: &dyn UserAppLifecycleStore) {
+    let app_id = format!("stale-running-{}", uuid::Uuid::new_v4().simple());
+    let mut admission = request(&uuid::Uuid::new_v4().to_string(), Kind::EnsureBuilder);
+    admission.app_id = app_id.clone();
+    let pending = operation(store.admit(&admission).await.unwrap());
+    let mut claim = progress(&pending, State::Running);
+    claim.step = "claimed".into();
+    claim.checkpoint = serde_json::Value::Null;
+    let running = store.advance(&claim).await.unwrap();
+    assert_eq!(running.state, State::Running);
+    let evidence = serde_json::json!({
+        "kind": "stale_running_authority_lost",
+        "authority": {"state": "expired_original", "holder": "worker-A:op"},
+        "builder": {"state": "live"},
+    });
+    let settled = store
+        .settle_stale_running_builder(&running, &evidence, "original authority expired")
+        .await
+        .unwrap();
+    assert_eq!(settled.state, State::Failed, "never manufacture success");
+    assert_eq!(settled.step, "claimed", "original step is preserved");
+    assert_eq!(settled.executor_id.as_deref(), Some("worker-A"));
+    assert_eq!(
+        settled.checkpoint["fence_released_evidence"], evidence,
+        "observation evidence is retained for audit"
+    );
+    assert!(
+        settled
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("stale running released"))
+    );
+    // 终态 + slot 释放：新同 scope 受理 Accepted；旧回调不能翻动。
+    let retry = request(&uuid::Uuid::new_v4().to_string(), Kind::EnsureBuilder);
+    let mut retry = retry;
+    retry.app_id = app_id.clone();
+    retry.lifecycle_id = Some(settled.lifecycle_id.clone());
+    let successor = operation(store.admit(&retry).await.unwrap());
+    assert!(
+        store
+            .advance(&progress(&settled, State::Failed))
+            .await
+            .is_err(),
+        "settled snapshot cannot be advanced anymore"
+    );
+    assert_eq!(
+        store
+            .get_application(&app_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .active_operations
+            .dev
+            .as_deref(),
+        Some(successor.operation_id.as_str()),
+        "settlement frees the original slot and the successor owns it"
+    );
+    assert!(
+        store
+            .settle_stale_running_builder(&running, &evidence, "double settle")
+            .await
+            .is_err(),
+        "a stale snapshot must never settle twice"
+    );
+    // Even EnsureBuilder must remain in an unresolved creation stage.
+    // A later Running readiness checkpoint belongs to its completion protocol.
+    let mut later = progress(&successor, State::Running);
+    later.step = "builder_ready_confirmed".into();
+    later.checkpoint = serde_json::json!({"ready":true});
+    let later = store.advance(&later).await.unwrap();
+    assert!(
+        store
+            .settle_stale_running_builder(&later, &evidence, "wrong stage")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .get_operation(&app_id, &later.operation_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        later
+    );
+    // 非 EnsureBuilder 的 Running 不开放给本动作（窄门）。
+    let other_app = format!("stale-running-other-{}", uuid::Uuid::new_v4().simple());
+    let input = shared_types::UserAppExecutionInput::new("{}".into());
+    let mut control = request(&uuid::Uuid::new_v4().to_string(), Kind::StartDeployment);
+    control.app_id = other_app.clone();
+    control.command = Some(shared_types::UserAppControlCommand::Deploy {
+        restart: false,
+        input_digest: input.digest(),
+        serving_recovery: false,
+    });
+    let control_running = {
+        let pending = operation(
+            store
+                .admit_with_input(&control, Some(&input))
+                .await
+                .unwrap(),
+        );
+        let mut claim = progress(&pending, State::Running);
+        claim.step = "claimed".into();
+        store.advance(&claim).await.unwrap()
+    };
+    assert!(
+        store
+            .settle_stale_running_builder(&control_running, &evidence, "narrow gate")
+            .await
+            .is_err(),
+        "generic Running operations are not exposed to scanner settlement"
+    );
+    // RecoveryRequired EnsureBuilder 属围栏收束域，本动作拒绝。
+    let fenced_app = format!("stale-running-fenced-{}", uuid::Uuid::new_v4().simple());
+    let mut fenced = request(&uuid::Uuid::new_v4().to_string(), Kind::EnsureBuilder);
+    fenced.app_id = fenced_app.clone();
+    let fenced_record = {
+        let pending = operation(store.admit(&fenced).await.unwrap());
+        let mut claim = progress(&pending, State::Running);
+        claim.step = "claimed".into();
+        let running = store.advance(&claim).await.unwrap();
+        let mut fence = progress(&running, State::RecoveryRequired);
+        fence.step = "creation_confirmation_timed_out".into();
+        store.advance(&fence).await.unwrap()
+    };
+    assert!(
+        store
+            .settle_stale_running_builder(&fenced_record, &evidence, "fence domain")
+            .await
+            .is_err(),
+        "RecoveryRequired records belong to the fence settler"
+    );
+    assert_eq!(
+        store
+            .get_operation(&fenced_app, &fenced_record.operation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        State::RecoveryRequired
+    );
+}
+
+#[tokio::test]
+async fn turso_stale_running_builder_settlement_contract() {
+    let (_directory, store) = database().await;
+    stale_running_builder_settlement_contract(&store).await;
+}
+
+#[cfg(feature = "pg")]
+#[tokio::test]
+#[ignore = "requires RCODER_USERAPP_PG_TEST_DSN for an isolated PostgreSQL instance"]
+async fn postgres_stale_running_builder_settlement_contract() {
+    let dsn = std::env::var("RCODER_USERAPP_PG_TEST_DSN")
+        .expect("explicit isolated PostgreSQL test DSN required");
+    let mut admin = toasty::Db::builder().connect(&dsn).await.unwrap();
+    let schema = format!("stale_running_{}", uuid::Uuid::new_v4().simple());
+    toasty::sql::statement(format!("CREATE SCHEMA {schema}"))
+        .exec(&mut admin)
+        .await
+        .unwrap();
+    let separator = if dsn.contains('?') { '&' } else { '?' };
+    let config = crate::config::PostgresConfig {
+        url: Some(format!("{dsn}{separator}options=-csearch_path%3D{schema}")),
+        ..Default::default()
+    };
+    let store = PgUserAppStore::connect(&config).await.unwrap();
+    stale_running_builder_settlement_contract(&store).await;
+    store.shutdown().await.unwrap();
+    toasty::sql::statement(format!("DROP SCHEMA {schema} CASCADE"))
+        .exec(&mut admin)
+        .await
+        .unwrap();
+}
+
 #[cfg(feature = "pg")]
 #[tokio::test]
 #[ignore = "requires RCODER_USERAPP_PG_TEST_DSN for an isolated PostgreSQL instance"]

@@ -220,7 +220,7 @@ class Acceptance:
                              max(0, deadline - time.monotonic()))
         self.wait_owner_initialized(captured, seconds=max(0, deadline - time.monotonic()))
 
-    def operate(self, kind: str, succeeds=True):
+    def operate(self, kind: str, succeeds=True, midwindow_readiness=False):
         identity = self.identity()
         status, envelope = self.request("/v1/runtime/status")
         self.check("runtime status is readable", status == 200, status=status, response=envelope)
@@ -233,6 +233,26 @@ class Acceptance:
         status, accepted = self.request("/v1/runtime/operations", "POST", request)
         self.check(f"{kind} accepted with exact operation", status == 202 and accepted.get("success"),
                    operation_id=operation_id, status=status, response=accepted)
+        if midwindow_readiness:
+            def open_stop_snapshot():
+                readiness = self.request("/v1/app/readiness")
+                operation = self.request(f"/v1/runtime/operations/{operation_id}")
+                return readiness, operation
+            def stopping_while_open(observed):
+                (readiness_status, readiness), (operation_status, operation) = observed
+                data = (readiness or {}).get("data") or {}
+                return (readiness_status == 200 and data.get("status") == "stopping"
+                        and operation_status == 200
+                        and (operation or {}).get("data", {}).get("state") not in TERMINAL)
+            (readiness, operation) = self.wait(open_stop_snapshot, stopping_while_open)
+            (readiness_status, readiness) = readiness
+            (operation_status, operation) = operation
+            data = readiness["data"]
+            self.check("stop window reports stopping while the operation is unsettled",
+                       readiness_status == 200 and operation_status == 200
+                       and data["status"] == "stopping" and data["reason_code"] == "STOP_ACCEPTED"
+                       and data["ready"] is False and data.get("operation_id") == operation_id,
+                       snapshot=data, operation=operation["data"])
         _, result = self.wait(lambda: self.request(f"/v1/runtime/operations/{operation_id}"),
                               lambda response: response[0] == 200 and response[1]["data"]["state"] in TERMINAL)
         view = result["data"]
@@ -490,7 +510,7 @@ class Acceptance:
         starts_before = (log.read_text().count("spawned: 'app-pingap' with pid")
                          if self.engine == "supervisord" else None)
         previous = self.proxy_receipt()
-        stopped = self.operate("stop")
+        stopped = self.operate("stop", midwindow_readiness=True)
         current = self.proxy_receipt()
         self.check("Stop standby belongs to its original operation", current["operation_id"] == stopped["operation_id"] and
                    current["instance_id"] != previous["instance_id"])
@@ -502,6 +522,15 @@ class Acceptance:
             starts_after = log.read_text().count("spawned: 'app-pingap' with pid")
             self.check("HTTP Stop performs exactly one supervisord standby spawn", starts_after - starts_before == 1,
                        starts_before=starts_before, starts_after=starts_after)
+        # The durable terminal can precede Idle publication, and the observer
+        # can retain its stopping snapshot for one second. Require convergence.
+        status, readiness = self.wait(lambda: self.request("/v1/app/readiness"),
+            lambda response: response[0] == 200
+            and (response[1] or {}).get("data", {}).get("status") == "stopped"
+            and response[1]["data"].get("ready") is False, seconds=5)
+        self.check("settled Stop reports stopped", status == 200 and
+                   readiness["data"]["status"] == "stopped" and readiness["data"]["ready"] is False,
+                   response=readiness)
         return stopped
 
     def prepare_fixture(self):

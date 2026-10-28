@@ -1,7 +1,7 @@
 //! 阶段3: 结果组装
 //!
 //! 等待 agent 响应（5 分钟超时），成功时提交 PendingGuard，
-//! 失败/超时时回滚 API key 配置（PendingGuard 自动清理）。
+//! 准备租约释放不等于取消已受理的执行；API 配置由真实进程生命周期管理。
 
 use shared_types::error_codes;
 use tokio::time::Duration;
@@ -12,8 +12,8 @@ use crate::service::AgentRequest;
 
 /// 等待 agent 响应并组装最终输出。
 ///
-/// 成功 → 提交 PendingGuard（保留 Pending 状态）；
-/// 失败/超时 → PendingGuard 自动 drop 清理 + 回滚 API key 配置。
+/// 成功 → 释放准备租约并保留真实执行状态；
+/// 失败 → 仅回滚同一旧执行的准备状态；超时保留可能已受理的执行。
 pub(super) async fn finalize_response(
     context: &ChatHandlerContext,
     agent_request: AgentRequest,
@@ -23,12 +23,11 @@ pub(super) async fn finalize_response(
     request_id: String,
 ) -> ChatHandlerOutput {
     let SessionPreparation {
-        pending_guard,
+        mut pending_guard,
         agent_version,
         was_reloaded,
         ..
     } = preparation;
-    let expected_uuid = agent_request.service_uuid.clone();
     // ========== 步骤9: 等待响应（5 分钟超时）==========
     match tokio::time::timeout(
         Duration::from_secs(300),
@@ -59,8 +58,7 @@ pub(super) async fn finalize_response(
                 output.success, output.session_id, output.reloaded
             );
 
-            // 只有请求成功时才提交 PendingGuard 保留 Pending 状态
-            // 失败时 PendingGuard 自动 drop 清理，允许下次请求重新创建 Agent
+            // Success preserves actual execution state; the preparation lease is released.
             if output.success {
                 pending_guard.commit_success();
             }
@@ -70,15 +68,8 @@ pub(super) async fn finalize_response(
         Ok(Err(e)) => {
             // PendingGuard 自动清理（在 drop 时）
             error!("[ChatHandler] Agent session processing failed: {}", e);
-            // 回滚 step7 写入的 API key 配置，避免失败累积泄漏（DashMap::remove 幂等）
-            if let Some(uuid) = expected_uuid.as_ref()
-                && context
-                    .project_uuid_map
-                    .remove_if(&project_id, |_, current| current == uuid)
-                    .is_some()
-            {
-                context.shared_api_key_manager.remove(uuid);
-            }
+            // API 配置归实际代理进程持有；请求失败或等待超时不能证明进程退出。
+            // 启动失败由 launcher 回滚，成功启动后只由 reaper 在确认退出后清理。
             ChatHandlerOutput::error(
                 project_id,
                 session_id.unwrap_or_default(),
@@ -91,20 +82,14 @@ pub(super) async fn finalize_response(
             )
         }
         Err(_elapsed) => {
-            // PendingGuard 自动清理（在 drop 时）
+            pending_guard.retain_unknown_outcome();
+            // Release preparation only; do not claim the accepted prompt was cancelled.
             error!(
                 "[ChatHandler] ⏰ Chat request timeout (300s): project_id={}",
                 project_id
             );
-            // 回滚 step7 写入的 API key 配置，避免失败累积泄漏（DashMap::remove 幂等）
-            if let Some(uuid) = expected_uuid.as_ref()
-                && context
-                    .project_uuid_map
-                    .remove_if(&project_id, |_, current| current == uuid)
-                    .is_some()
-            {
-                context.shared_api_key_manager.remove(uuid);
-            }
+            // API 配置归实际代理进程持有；请求失败或等待超时不能证明进程退出。
+            // 启动失败由 launcher 回滚，成功启动后只由 reaper 在确认退出后清理。
             ChatHandlerOutput::error(
                 project_id,
                 session_id.unwrap_or_default(),

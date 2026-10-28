@@ -23,6 +23,12 @@ pub trait ModelRuntimeEnvResolver: Send + Sync {
         provider: &ModelProviderConfig,
         service_uuid: Option<&str>,
     ) -> Result<ResolvedModelEnv>;
+
+    /// 是否需要为实际子进程登记代理 UUID 配置。
+    /// 凭据绑定该进程代次；变更配置时先确认旧进程退出再启动新进程。
+    fn uses_proxy_credentials(&self) -> bool {
+        false
+    }
 }
 
 /// Direct mode: pass through the provider values unchanged.
@@ -61,6 +67,10 @@ impl ProxyModelRuntimeEnvResolver {
 }
 
 impl ModelRuntimeEnvResolver for ProxyModelRuntimeEnvResolver {
+    fn uses_proxy_credentials(&self) -> bool {
+        true
+    }
+
     fn resolve(
         &self,
         provider: &ModelProviderConfig,

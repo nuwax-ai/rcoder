@@ -3,6 +3,11 @@
 `GET /api/v1/userapp/{app_id}/{app_stage}/readiness?user_id={user_id}`
 返回只读快照。`app_stage` 为 `dev` 或 `prod`，`user_id` 仍必填。
 HTTP 成功与 `code=0000` 表示查询成功，`data.ready` 才表示业务可用。
+顶层 `status` 词表：`not_deployed / provisioning / starting / stopping /
+stopped / ready / degraded / failed / unknown / unsupported`；其中
+`provisioning`（原因码 `COMPUTE_PROVISIONING`）只出现在 `dev`：平台正在
+申请/接管 builder 计算资源、业务快照尚未产生，它由平台合并层产出，
+app-cli 永不返回。
 
 ## 容器状态
 
@@ -41,7 +46,18 @@ HTTP 成功与 `code=0000` 表示查询成功，`data.ready` 才表示业务可�
 
 Restart 的停止、启动、验证阶段均为 `restarting`。物理 Start 当前复用
 Restart 协调器，因此也按该真实控制动作展示。应用热部署、应用进程重启
-不因此变成容器重启：容器可以 `running`，同时业务 `starting`。
+不因此变成容器重启：容器可以 `running`，同时业务 `starting`。顶层
+`provisioning` 期间 `container.status` 仍如实反映物理事实（`missing`、
+`starting`、`running` 都可能出现），不随业务等待态改名。
+
+容器在跑且容器内 Stop 运行操作已受理未收束时（如 dev 的
+`/api/v1/userapp/dev/stop` 停机窗口，含 standby 摘流发布期），顶层
+`status=stopping`、`reason_code=STOP_ACCEPTED` 由 app-cli 快照直接产出；
+平台侧 Stop 操作记录对顶层状态的改写（合并层兜底）与此一致，收束后回到
+`stopped`。未终态 Stop（含 `recovery_required`）优先于容器内 Idle 相位和
+代理换代状态；仅在不存在未收束 Stop 时，Idle 才可表示 `stopped`。停止
+记录读取或解码失败时返回 `unknown/OBSERVE_INCOMPLETE`，不以旧的就绪或
+停止状态代替本轮核验；查询不会修改原记录。
 
 Docker 强制结束进程可能留下非零退出码（例如 137）。当前 Stop 已确认成功、
 停止意图仍有效且实例确实未运行时，返回 `stopped`；失败或待核验的 Stop
@@ -63,8 +79,13 @@ Docker 强制结束进程可能留下非零退出码（例如 137）。当前 St
 1. 点击容器重启后立即显示处理中；接口仍为异步受理，不增加固定等待。
 2. 保存受理结果的 operation_id，再轮询 readiness 或原操作查询接口。
 3. 丢弃点击前发起、之后才返回的旧 readiness 请求；轮询尽量串行。
-4. `starting / restarting / stopping / recovery_required` 时展示进度或原因，
-   不因业务 `not_deployed` 自动追加部署，不在客户端隐式排队控制请求。
+4. `provisioning / starting / restarting / stopping / recovery_required` 时
+   展示进度或原因，不因业务 `not_deployed` 或 `provisioning` 自动追加部署，
+   不在客户端隐式排队控制请求。`provisioning` 与 `starting` 同属等待态：
+   继续轮询即可；业务快照一旦出现（如 `not_deployed`/`ready`），窗口自然
+   结束。`provisioning` 持续超过约 60 秒（常规窗口中位 12.5 秒、观测最大
+   约 31 秒）时，可展示 `operation_id` 并引导经
+   `GET /computer/pod/operations/{app_id}/{operation_id}` 查询原操作。
 5. 按关联的原操作终态展示成功/失败，再独立判断业务 ready。
    `ready=false` 本身不授权再次启动或部署；失败后用户仍可显式重试。
 

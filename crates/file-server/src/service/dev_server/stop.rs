@@ -1,7 +1,7 @@
 //! dev server 终止: stop_dev / shutdown_all / Drop 兜底。
 
-use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Context as _;
 
@@ -36,62 +36,192 @@ impl DevServerManager {
                 "persisted owner registration is not loaded; refusing process-name cleanup",
             ));
         }
-        let proc = lock(&self.processes)?.remove(project_id);
-        // P1-03：监督句柄同步摘除（进程组终止后句柄的 wait worker 自行收割
-        // 退出；此处不等待——停止确认语义在 dev 任务层经 wait_exit 处理）。
-        let supervised = lock(&self.supervised)?.remove(project_id);
-        // 候选 pid: 内存 Map + 系统扫描 (去重)
-        let mut candidates: Vec<u32> = Vec::new();
-        if let Some(p) = &proc {
-            candidates.push(p.pid);
+        self.stop_legacy_observed(project_id).await
+    }
+
+    async fn stop_legacy_observed(&self, project_id: &str) -> AppResult<StoppedDev> {
+        self.stop_legacy_observed_with_log_cleanup(project_id, |process| async move {
+            log::cleanup_temp_log(&process.log_dir, &process.temp_log_name).await;
+        })
+        .await
+    }
+
+    pub(super) async fn stop_legacy_observed_with_log_cleanup<F, Fut>(
+        &self,
+        project_id: &str,
+        cleanup_log: F,
+    ) -> AppResult<StoppedDev>
+    where
+        F: FnOnce(crate::models::DevProcess) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let serial = {
+            let mut locks = lock(&self.coordinated_stop_locks)?;
+            locks
+                .entry(format!("legacy:{project_id}"))
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _serial = serial.lock().await;
+        let (proc, supervised, launch_id) = {
+            let launches = lock(&self.launches)?;
+            let processes = lock(&self.processes)?;
+            let supervised = lock(&self.supervised)?;
+            (
+                processes.get(project_id).cloned(),
+                supervised.get(project_id).cloned(),
+                launches
+                    .get(project_id)
+                    .map(|launch| launch.launch_id.clone()),
+            )
+        };
+        // A failed scan is not an empty project. No registration or port is
+        // retired before both the scan and all captured exits are confirmed.
+        #[cfg(unix)]
+        let mut candidates = process::find_pids_by_project_id(project_id).await?;
+        #[cfg(windows)]
+        let mut candidates = Vec::new();
+        if let Some(process) = &proc {
+            candidates.push(process.pid);
         }
-        candidates.extend(process::find_pids_by_project_id(project_id).await);
+        if let Some(child) = &supervised {
+            candidates.push(child.pid());
+        }
         candidates.sort_unstable();
         candidates.dedup();
-
-        let candidates: Vec<(u32, Option<u32>)> = candidates
+        // Capture group membership before any await that may reap a leader.
+        // Members of the original managed group are stopped by its one owned
+        // wrapper, never re-signalled through stale individual numeric PIDs.
+        let candidates: Vec<_> = candidates
             .into_iter()
             .map(|pid| (pid, process::process_group_id(pid)))
             .collect();
-        let mut stopped_groups = HashSet::new();
-        let mut killed: Vec<KilledPid> = Vec::new();
-        for (pid, pgid) in candidates {
-            // 第一个成员已通过 kill(-pgid) 停止整组，其余成员不应
-            // 因无法再次发送信号而被误报为 false。
-            if pgid.is_some_and(|group| stopped_groups.contains(&group)) {
-                killed.push(KilledPid { pid, killed: true });
+        let capture = super::cleanup_record::CleanupRecord::capture(
+            CleanupStatus::Cleaning,
+            launch_id.as_deref(),
+            proc.as_ref(),
+            supervised.as_ref(),
+        );
+        {
+            let launches = lock(&self.launches)?;
+            let processes = lock(&self.processes)?;
+            let children = lock(&self.supervised)?;
+            let current = super::cleanup_record::CleanupRecord::capture(
+                CleanupStatus::Cleaning,
+                launches
+                    .get(project_id)
+                    .map(|launch| launch.launch_id.as_str()),
+                processes.get(project_id),
+                children.get(project_id),
+            );
+            if !capture.same_incarnation(&current)
+                || processes
+                    .get(project_id)
+                    .is_some_and(|process| process.external_owner.is_some())
+            {
+                return Err(AppError::Conflict(
+                    "project registration changed before stop dispatch; replacement retained"
+                        .into(),
+                ));
+            }
+            lock(&self.cleanup_state)?.insert(project_id.to_owned(), capture.clone());
+        }
+        let budget = self.config.dev_stop_drain_budget();
+        let deadline = tokio::time::Instant::now() + budget;
+        let grace = self.stop_grace_budget();
+        let mut killed = Vec::new();
+        for (pid, captured_group) in candidates {
+            if let Some(child) = supervised.as_ref().filter(|child| {
+                child.has_managed_tree()
+                    && (child.pid() == pid || captured_group == Some(child.pid()))
+            }) {
+                let confirmed = child.stop_managed_until(grace, deadline).await?;
+                killed.push(KilledPid {
+                    pid,
+                    killed: confirmed,
+                });
+                if !confirmed {
+                    return Err(AppError::process(
+                        "original project process-tree exit is not confirmed; registration and port retained",
+                    ));
+                }
                 continue;
             }
-            let k = self.terminate_pid_group(pid).await;
-            if k && let Some(group) = pgid {
-                stopped_groups.insert(group);
-            }
-            killed.push(KilledPid { pid, killed: k });
-        }
-        if let Some(p) = proc {
-            self.port_pool.release(project_id)?;
-            log::cleanup_temp_logs(&p.log_dir).await;
-        }
-        // stdout 管道有界排空（进程组已停；后代持有写端时窗口到期放弃）。
-        if let Some(supervised) = supervised {
-            // FS-09: 统一毫秒精度预算（200ms 不再截断为 0 秒）; 排空与退出等待共用同一 deadline。
-            let drain_timeout = self.config.dev_stop_drain_budget();
-            supervised.drain_stdout(drain_timeout).await;
-            // P1-05：记录 cleanup_status。即使进程已退出，仍可能有子进程继承 stdout
-            // 导致 EOF 未到达——在 wait_exit 结束前标记 Cleaning，完成后再标 Cleaned。
-            {
-                let mut cleanup = lock(&self.cleanup_state)?;
-                cleanup.insert(project_id.to_string(), CleanupStatus::Cleaning);
-            }
-            let cleanup_project_id = project_id.to_string();
-            let cleanup_map = self.cleanup_state.clone();
-            tokio::spawn(async move {
-                if supervised.wait_exit(drain_timeout).await.is_some()
-                    && let Ok(mut cleanup) = cleanup_map.lock()
-                {
-                    cleanup.insert(cleanup_project_id, CleanupStatus::Cleaned);
+            if let Some(child) = supervised.as_ref().filter(|child| child.pid() == pid) {
+                match child.exited() {
+                    Some(super::supervise::ChildExit::Exited(_)) => {
+                        // Root reaped: its PID may already belong to someone
+                        // else. Never signal that number again.
+                        killed.push(KilledPid { pid, killed: true });
+                        continue;
+                    }
+                    Some(super::supervise::ChildExit::WaitFailed(error)) => {
+                        return Err(AppError::process(format!(
+                            "captured child exit observation failed: {error}"
+                        )));
+                    }
+                    None => {}
                 }
+            }
+            let observation = self
+                .terminate_pid_group_observed_until(pid, deadline)
+                .await?;
+            killed.push(KilledPid {
+                pid,
+                killed: observation.exit_confirmed,
             });
+            if !observation.exit_confirmed {
+                return Err(AppError::process(
+                    "project process exit is not confirmed; original registration and port retained",
+                ));
+            }
+        }
+        if let Some(child) = &supervised {
+            child
+                .drain_stdout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+                .await;
+            if !matches!(
+                child
+                    .wait_exit(deadline.saturating_duration_since(tokio::time::Instant::now()))
+                    .await,
+                Some(super::supervise::ChildExit::Exited(_))
+            ) {
+                return Err(AppError::process(
+                    "captured child wait is unconfirmed; original registration and port retained",
+                ));
+            }
+        }
+        {
+            let mut launches = lock(&self.launches)?;
+            let mut processes = lock(&self.processes)?;
+            let mut children = lock(&self.supervised)?;
+            let current = super::cleanup_record::CleanupRecord::capture(
+                CleanupStatus::Cleaning,
+                launches
+                    .get(project_id)
+                    .map(|launch| launch.launch_id.as_str()),
+                processes.get(project_id),
+                children.get(project_id),
+            );
+            let mut cleanup = lock(&self.cleanup_state)?;
+            if !capture.same_incarnation(&current)
+                || cleanup.get(project_id).is_some_and(|entry| {
+                    matches!(entry.status, CleanupStatus::Cleaning)
+                        && !entry.same_incarnation(&capture)
+                })
+            {
+                return Err(AppError::Conflict(
+                    "project launch changed while observing stop; replacement retained".into(),
+                ));
+            }
+            self.port_pool.release(project_id)?;
+            launches.remove(project_id);
+            processes.remove(project_id);
+            children.remove(project_id);
+            cleanup.insert(project_id.to_owned(), capture.completed());
+        }
+        if let Some(process) = proc {
+            cleanup_log(process).await;
         }
         Ok(StoppedDev {
             owner_stopped: false,
@@ -457,28 +587,70 @@ impl DevServerManager {
     /// 单 pid 的终止升级（SIGTERM 宽限 → SIGKILL）。供 legacy stop_dev（候选循环）
     /// 与协调票据 stop_coordinated（仅记录 pid）共用。
     pub(super) async fn terminate_pid_group(&self, pid: u32) -> bool {
-        let ok = process::kill_process_group(pid);
-        process::wait_for_stop(
-            pid,
-            self.config.dev_stop_check_interval_ms,
-            self.config.dev_stop_max_attempts,
+        self.terminate_pid_group_observed(pid)
+            .await
+            .is_ok_and(|observation| observation.exit_confirmed)
+    }
+
+    pub(super) fn stop_grace_budget(&self) -> std::time::Duration {
+        let budget = self.config.dev_stop_drain_budget();
+        // Reserve one existing polling interval for force-kill observation.
+        // TERM + KILL + exit checks share the configured budget; no second
+        // max-attempts loop or detached cleanup timer expands the request.
+        budget.saturating_sub(
+            std::time::Duration::from_millis(self.config.dev_stop_check_interval_ms).min(budget),
         )
-        .await;
-        let mut k = ok;
-        if process::is_process_running(pid) {
-            tracing::warn!("dev server (pid {pid}) 未在 SIGTERM 宽限期退出, 升级 SIGKILL");
-            let force_sent = process::kill_process_group_force(pid);
-            process::wait_for_stop(
-                pid,
-                self.config.dev_stop_check_interval_ms,
-                self.config.dev_stop_max_attempts,
-            )
-            .await;
-            // zombie 进程在父进程回收前 `kill(pid, 0)` 仍会返回存在，
-            // 但 SIGKILL 已成功送达时业务上应视为 killed，对齐 nuwax killProcess。
-            k = k || force_sent || !process::is_process_running(pid);
+    }
+
+    pub(super) async fn terminate_pid_group_observed(
+        &self,
+        pid: u32,
+    ) -> AppResult<process::TerminationObservation> {
+        self.terminate_pid_group_observed_until(
+            pid,
+            tokio::time::Instant::now() + self.config.dev_stop_drain_budget(),
+        )
+        .await
+    }
+
+    async fn terminate_pid_group_observed_until(
+        &self,
+        pid: u32,
+        deadline: tokio::time::Instant,
+    ) -> AppResult<process::TerminationObservation> {
+        if process::stop_exit_observed(pid, deadline).await? {
+            return Ok(process::TerminationObservation {
+                signal_sent: false,
+                exit_confirmed: true,
+            });
         }
-        k
+        let mut signal_sent = process::kill_process_group(pid);
+        let grace_deadline = deadline.min(tokio::time::Instant::now() + self.stop_grace_budget());
+        let interval = std::time::Duration::from_millis(self.config.dev_stop_check_interval_ms);
+        loop {
+            if process::stop_exit_observed(pid, deadline).await? {
+                return Ok(process::TerminationObservation {
+                    signal_sent,
+                    exit_confirmed: true,
+                });
+            }
+            if tokio::time::Instant::now() >= grace_deadline {
+                break;
+            }
+            tokio::time::sleep_until(grace_deadline.min(tokio::time::Instant::now() + interval))
+                .await;
+        }
+        signal_sent |= process::kill_process_group_force(pid);
+        loop {
+            let exit_confirmed = process::stop_exit_observed(pid, deadline).await?;
+            if exit_confirmed || tokio::time::Instant::now() >= deadline {
+                return Ok(process::TerminationObservation {
+                    signal_sent,
+                    exit_confirmed,
+                });
+            }
+            tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + interval)).await;
+        }
     }
 
     /// 全量优雅停止 (供 main.rs graceful shutdown 调用):
@@ -547,7 +719,9 @@ impl Drop for DevServerManager {
     }
 }
 
-#[cfg(test)]
+// 本模块全部用例依赖 /bin/sh fixture + POSIX 进程组/退出观测语义，Windows 上
+// 无法成立，故整模块 cfg(all(test, unix))——避免逐个 cfg(unix) 后 import 悬空。
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::service::dev_server::{StderrRing, supervise::SupervisedChild};
@@ -562,6 +736,7 @@ mod tests {
         DevServerManager::new(Arc::new(config))
     }
 
+    /// fixture 用 `/bin/sh` 执行 POSIX shell 命令；Windows 无该路径。
     fn spawn_child(cmd: &str) -> tokio::process::Child {
         tokio::process::Command::new("/bin/sh")
             .args(["-c", cmd])
@@ -597,21 +772,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_cleanup_remains_cleaning_until_exit_observed() {
+    async fn stop_cleanup_retains_original_child_until_real_barrier_exit_and_retry() {
+        use tokio::io::AsyncWriteExt;
         let mgr = manager();
-        let project = "p1-05-hang";
-        let child = spawn_child("sleep 30");
+        let project = "p1-05-original-exit";
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "read release; exit 0"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut release = child.stdin.take().unwrap();
         let supervised = adopt(child);
         mgr.supervised
             .lock()
             .unwrap()
-            .insert(project.to_string(), supervised);
-
-        let _stopped = mgr.stop_dev(project).await.expect("stop");
-
-        // Immediately after stop_dev returns, cleanup watcher may still be pending.
-        // With a long-lived child, has_uncleaned_cleanup should initially be true.
-        assert!(mgr.has_uncleaned_cleanup(project).unwrap());
+            .insert(project.into(), supervised.clone());
+        // No signal is sent by this fixture callback. The actual original
+        // child remains blocked on stdin until after Stop's wait expires.
+        let first = mgr
+            .close_local_registration_with_termination(project, None, |_pid| async { false })
+            .await;
+        let pending = mgr.has_uncleaned_cleanup(project).unwrap();
+        let retained = mgr.supervised.lock().unwrap().get(project).cloned();
+        let not_exited = supervised.exited().is_none();
+        release.write_all(b"release\n").await.unwrap();
+        drop(release);
+        let exit = supervised.wait_exit(Duration::from_secs(2)).await;
+        let retry = mgr.close_local_registration(project, None).await;
+        assert!(first.is_err(), "unconfirmed wait cannot report stopped");
+        assert!(pending && not_exited);
+        assert!(retained.is_some_and(|captured| Arc::ptr_eq(&captured, &supervised)));
+        assert!(
+            matches!(exit, Some(super::super::supervise::ChildExit::Exited(status)) if status.success())
+        );
+        retry.unwrap();
+        assert!(!mgr.has_uncleaned_cleanup(project).unwrap());
+        assert!(!mgr.supervised.lock().unwrap().contains_key(project));
     }
 }
 

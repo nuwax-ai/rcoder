@@ -534,6 +534,10 @@ pub struct GetContainerStatusResponse {
     /// 可选：内存使用（MB）
     #[prost(int64, optional, tag = "6")]
     pub memory_mb: ::core::option::Option<i64>,
+    /// Version 1 includes pending preparations and established user-facing TCP
+    /// connections. Missing/zero is insufficient evidence for orphan retirement.
+    #[prost(uint32, tag = "7")]
+    pub idle_observation_version: u32,
 }
 /// VNC 状态查询请求
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

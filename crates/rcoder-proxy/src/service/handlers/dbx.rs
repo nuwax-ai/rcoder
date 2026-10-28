@@ -50,12 +50,9 @@ async fn dbx_rewrite_request(
 }
 
 /// 构造 dbx 上游 peer（流式长会话统一超时配置，idle 1 小时）。
-fn dbx_peer(container_addr: &str) -> pingora_core::Result<Box<HttpPeer>> {
-    let mut peer = HttpPeer::new(
-        super::super::upstream::dial_peer(container_addr, shared_types::DBX_PORT)?,
-        false,
-        "".to_string(),
-    );
+async fn dbx_peer(container_addr: &str) -> pingora_core::Result<Box<HttpPeer>> {
+    let mut peer =
+        super::super::upstream::dial_peer(container_addr, shared_types::DBX_PORT).await?;
     super::streaming_peer_options(&mut peer, Duration::from_secs(3600));
     Ok(Box::new(peer))
 }
@@ -95,7 +92,7 @@ pub async fn handle_dev_dbx_upstream(
         container_addr,
         shared_types::DBX_PORT
     );
-    dbx_peer(&container_addr)
+    dbx_peer(&container_addr).await
 }
 
 /// `/api/v1/userapp/proxy/dbx/prod/{user_id}/{app_id}/{*path}` 请求重写。
@@ -132,5 +129,5 @@ pub async fn handle_prod_dbx_upstream(
         container_addr,
         shared_types::DBX_PORT
     );
-    dbx_peer(&container_addr)
+    dbx_peer(&container_addr).await
 }

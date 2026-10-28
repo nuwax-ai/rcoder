@@ -57,6 +57,8 @@ mod source_cancellation;
 #[cfg(test)]
 mod source_recovery_tests;
 mod startup;
+#[cfg(all(test, unix))]
+mod startup_stop_tests;
 mod state;
 mod state_impl;
 #[cfg(test)]

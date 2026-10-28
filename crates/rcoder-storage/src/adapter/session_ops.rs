@@ -6,19 +6,150 @@
 use std::sync::Arc;
 
 use dashmap::mapref::entry::Entry;
-use shared_types::ProjectAndContainerInfo;
+use shared_types::{ProjectAndContainerInfo, SessionHint};
 
 use super::{ProjectAdapter, container_entry_key};
 use tracing::debug;
 
+/// Structural revisions are metadata cursors, not physical runner identities.
+pub(crate) fn session_container_matches(
+    expected: &ProjectAndContainerInfo,
+    current: &ProjectAndContainerInfo,
+) -> bool {
+    let (Some(expected_basic), Some(current_basic)) =
+        (expected.container_info(), current.container_info())
+    else {
+        return false;
+    };
+    expected.project_id() == current.project_id()
+        && expected.persistence_identity().generation == current.persistence_identity().generation
+        && expected
+            .service_type()
+            .zip(current.service_type())
+            .is_some_and(|(expected, current)| expected.same_container_family(current))
+        && expected.user_id() == current.user_id()
+        && expected.pod_id() == current.pod_id()
+        && expected
+            .persistence_identity()
+            .container
+            .as_ref()
+            .map(|c| &c.generation)
+            == current
+                .persistence_identity()
+                .container
+                .as_ref()
+                .map(|c| &c.generation)
+        && !expected_basic.container_id.is_empty()
+        && expected_basic.container_id == current_basic.container_id
+        && expected_basic.container_name == current_basic.container_name
+        && expected_basic.project_id == current_basic.project_id
+        && expected_basic.workload_uid == current_basic.workload_uid
+        && expected
+            .persistence_identity()
+            .container
+            .as_ref()
+            .is_none_or(|identity| {
+                identity.physical_uid.as_deref() == Some(expected_basic.container_id.as_str())
+            })
+        && current
+            .persistence_identity()
+            .container
+            .as_ref()
+            .is_none_or(|identity| {
+                identity.physical_uid.as_deref() == Some(current_basic.container_id.as_str())
+            })
+}
+
+pub(crate) fn stop_frame_matches(
+    expected: &ProjectAndContainerInfo,
+    current: &ProjectAndContainerInfo,
+) -> bool {
+    session_container_matches(expected, current)
+        && expected.persistence_identity().revision == current.persistence_identity().revision
+        && expected.request_id() == current.request_id()
+        && expected.tenant_id() == current.tenant_id()
+        && expected.space_id() == current.space_id()
+        && expected.isolation_type() == current.isolation_type()
+}
+
 impl ProjectAdapter {
+    pub(crate) fn clear_sessions_if_current_frame(&self, frame: &crate::ProjectStopFrame) -> bool {
+        let expected = frame.project();
+        let _project_guard = self.project_locks.entry_by_ref(expected.project_id());
+        let Some(current) = self.get(expected.project_id()) else {
+            return false;
+        };
+        let key = container_entry_key(&current);
+        let _container_guard = self.container_locks.entry_by_ref(&key);
+        if !Arc::ptr_eq(&frame.local_version, &current) || !stop_frame_matches(expected, &current) {
+            return false;
+        }
+        self.clear_session(expected.project_id());
+        true
+    }
     // ========== Session 操作 ==========
+
+    /// Append to the exact runner captured before dispatch. Preserve all current
+    /// project metadata and other sessions, including concurrent request updates.
+    pub(crate) fn append_session_for_container(
+        &self,
+        expected: &ProjectAndContainerInfo,
+        session_id: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            SessionHint::classify(Some(session_id))
+                .as_session_id()
+                .is_some(),
+            "An established session identity is required"
+        );
+        let project_id = expected.project_id();
+        let _project_guard = self.project_locks.entry_by_ref(project_id);
+        let Some(current) = self.get(project_id) else {
+            return Ok(false);
+        };
+        let key = container_entry_key(&current);
+        let _container_guard = self.container_locks.entry_by_ref(&key);
+        if !session_container_matches(expected, &current)
+            || current
+                .persistence_identity()
+                .retired_sessions
+                .get(session_id)
+                != expected
+                    .persistence_identity()
+                    .retired_sessions
+                    .get(session_id)
+        {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            self.session_index
+                .view(session_id, |_, owner| owner.1 == project_id)
+                .unwrap_or(true),
+            "Session belongs to another project"
+        );
+        let preserve_latest = current.persistence_identity().revision
+            != expected.persistence_identity().revision
+            || current.request_id() != expected.request_id();
+        let latest = current.latest_session().map(str::to_owned);
+        let appended = self.add_session_to_project(project_id, session_id);
+        if appended
+            && preserve_latest
+            && let Entry::Occupied(mut entry) = self.projects.entry(project_id.to_owned())
+        {
+            anyhow::ensure!(
+                Arc::make_mut(entry.get_mut()).restore_latest_session(latest.as_deref()),
+                "Current session selection disappeared during completion"
+            );
+        }
+        Ok(appended)
+    }
 
     /// 通过 session_id 获取项目信息
     ///
     /// 读时清理孤儿条目：如果 session_index 指向的 project 不存在，自动清理。
     /// 同时验证 session 是否仍在 project 的 sessions 集合中，防止已清除的 session 被误访问。
     pub fn get_by_session_id(&self, session_id: &str) -> Option<Arc<ProjectAndContainerInfo>> {
+        SessionHint::classify(Some(session_id)).as_session_id()?;
         let pid = self.session_index.view(session_id, |_, v| v.1.clone())?;
 
         match self.projects.view(&pid, |_, v| v.clone()) {
@@ -61,6 +192,12 @@ impl ProjectAdapter {
     ///
     /// 返回 false 表示 project 不存在（调用方需要走 insert_with_session 完整路径）。
     pub fn add_session_to_project(&self, project_id: &str, session_id: &str) -> bool {
+        if SessionHint::classify(Some(session_id))
+            .as_session_id()
+            .is_none()
+        {
+            return false;
+        }
         // entry API: 先检查 project 是否存在，存在时原子地把 sid 加入 sessions 集合
         let mut existed = false;
         let mut ck_opt: Option<String> = None;
@@ -104,6 +241,12 @@ impl ProjectAdapter {
         session_id: &str,
         session_generation: &str,
     ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            SessionHint::classify(Some(session_id))
+                .as_session_id()
+                .is_some(),
+            "An established session identity is required"
+        );
         let key = match self.projects.entry(app_id.to_owned()) {
             Entry::Occupied(mut entry) => {
                 let current = entry.get();
@@ -155,8 +298,13 @@ impl ProjectAdapter {
                 .view(project_id, |_, v| v.clone())
                 .unwrap_or_default()
         });
-        self.session_index
-            .insert(session_id.to_string(), (ck, project_id.to_string()));
+        if SessionHint::classify(Some(session_id))
+            .as_session_id()
+            .is_some()
+        {
+            self.session_index
+                .insert(session_id.to_string(), (ck, project_id.to_string()));
+        }
         true
     }
 
@@ -173,6 +321,10 @@ impl ProjectAdapter {
         info: Arc<ProjectAndContainerInfo>,
         session_id: Option<&str>,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            session_id.is_none_or(|sid| SessionHint::classify(Some(sid)).as_session_id().is_some()),
+            "An established session identity is required"
+        );
         // 执行 insert（维护容器引用计数）
         self.insert(project_id.clone(), info)?;
 
@@ -286,6 +438,7 @@ impl ProjectAdapter {
 
     /// 通过 session_id 获取容器名称（view: 两次锁获取均立即释放）
     pub fn get_container_name_by_session(&self, session_id: &str) -> Option<String> {
+        SessionHint::classify(Some(session_id)).as_session_id()?;
         let ck = self.session_index.view(session_id, |_, v| v.0.clone())?;
         self.containers
             .view(&ck, |_, ce| ce.info().container_name.clone())

@@ -325,6 +325,143 @@ fn bound_wake_accepts_api_defaults_but_rejects_changed_container_or_storage() {
 }
 
 #[tokio::test]
+async fn builder_without_pod_is_not_absent_while_its_controller_exists() {
+    use container_runtime_api::AgentContainerRuntime as _;
+
+    for replicas in [0, 1] {
+        let (runtime, params, state, server) = resume_tests::fixture(None).await;
+        let context = params.execution_context.as_ref().expect("context");
+        let pvc = {
+            let mut state = state.lock().expect("state");
+            state.sts["spec"]["replicas"] = replicas.into();
+            state.pod = serde_json::Value::Null;
+            state.pvc.clone()
+        };
+
+        // The generic query describes Pods, not positive compute absence.
+        assert!(
+            runtime
+                .find_container(&context.app_id, &ServiceType::UserappBuilder)
+                .await
+                .expect("ordinary query")
+                .is_none()
+        );
+        let target = runtime
+            .capture_builder_control(context)
+            .await
+            .expect("capture retained controller");
+        target.validate().expect("valid target");
+        assert_eq!(&target.context, context);
+        assert_eq!(
+            target.workload.as_ref().expect("workload").uid,
+            "sts-original"
+        );
+        assert!(target.pod.is_none());
+        assert!(
+            !runtime
+                .builder_compute_absent(context)
+                .await
+                .expect("observe controller"),
+            "replicas={replicas}: a retained controller cannot be absent"
+        );
+        let state = state.lock().expect("state");
+        assert_eq!(state.pvc, pvc);
+        assert!(
+            state
+                .requests
+                .iter()
+                .all(|request| request.starts_with("GET "))
+        );
+        assert!(state.puts.is_empty() && state.patches.is_empty());
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn missing_builder_controller_does_not_hide_remaining_or_terminating_pod() {
+    use container_runtime_api::AgentContainerRuntime as _;
+
+    for terminating in [false, true] {
+        let (runtime, params, state, server) = resume_tests::fixture(None).await;
+        let context = params.execution_context.as_ref().expect("context");
+        let (pvc, pod_uid) = {
+            let mut state = state.lock().expect("state");
+            state.sts = serde_json::Value::Null;
+            if terminating {
+                state.pod["metadata"]["deletionTimestamp"] = "2026-01-02T00:00:00Z".into();
+            }
+            (state.pvc.clone(), state.pod["metadata"]["uid"].clone())
+        };
+        let result = runtime.builder_compute_absent(context).await;
+        assert!(
+            matches!(&result, Err(Error::Conflict(message)) if message.contains("Pods remain")),
+            "terminating={terminating}: residual compute cannot count as absent: {result:?}"
+        );
+        let state = state.lock().expect("state");
+        assert_eq!(state.pod["metadata"]["uid"], pod_uid);
+        assert_eq!(state.pvc, pvc);
+        assert!(
+            state
+                .requests
+                .iter()
+                .all(|request| request.starts_with("GET "))
+        );
+        assert!(state.puts.is_empty() && state.patches.is_empty());
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn builder_absence_requires_successful_pod_reads_and_rechecked_controller() {
+    use container_runtime_api::AgentContainerRuntime as _;
+
+    for fail_read in [false, true] {
+        let (runtime, params, state, server) = resume_tests::fixture(None).await;
+        let context = params.execution_context.as_ref().expect("context");
+        let pvc = {
+            let mut state = state.lock().expect("state");
+            state.sts = serde_json::Value::Null;
+            state.pod = serde_json::Value::Null;
+            state.fail_pod_list = fail_read;
+            state.pvc.clone()
+        };
+        let result = runtime.builder_compute_absent(context).await;
+        if fail_read {
+            assert!(
+                matches!(&result, Err(Error::K8sError(message)) if message.contains("Inspect remaining builder Pods")),
+                "an HTTP read failure cannot become absence: {result:?}"
+            );
+        } else {
+            assert!(result.expect("confirmed absence"));
+        }
+        let state = state.lock().expect("state");
+        if !fail_read {
+            let workload = runtime
+                .pod_name(&context.app_id, &ServiceType::UserappBuilder)
+                .expect("workload name");
+            assert_eq!(
+                state
+                    .requests
+                    .iter()
+                    .filter(|request| request.contains(&format!("/statefulsets/{workload} ")))
+                    .count(),
+                2,
+                "absence must recheck the controller after observing remaining Pods"
+            );
+        }
+        assert_eq!(state.pvc, pvc);
+        assert!(
+            state
+                .requests
+                .iter()
+                .all(|request| request.starts_with("GET "))
+        );
+        assert!(state.puts.is_empty() && state.patches.is_empty());
+        server.abort();
+    }
+}
+
+#[tokio::test]
 async fn actual_stop_patch_is_fenced_and_never_touches_storage() {
     stop_api_contract(false, false, false, false).await;
     stop_api_contract(true, false, false, false).await;

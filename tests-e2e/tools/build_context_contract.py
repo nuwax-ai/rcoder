@@ -106,7 +106,7 @@ def artifact_stage(source):
     match = re.search(r'^FROM\s+scratch\s+AS\s+artifacts\s*$', source, re.M | re.I)
     if match is None:
         raise ValueError('production Dockerfile is missing the scratch artifacts stage')
-    if not re.search(r'^FROM\s+debian:12\s+AS\s+builder\s*$', source, re.M | re.I):
+    if not re.search(r'^FROM\s+(?:--platform=\S+\s+)?\S+\s+AS\s+builder\s*$', source, re.M | re.I):
         raise ValueError('production Dockerfile is missing the named builder stage')
     return source[match.start():]
 

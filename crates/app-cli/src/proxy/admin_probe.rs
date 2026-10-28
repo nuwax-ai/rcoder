@@ -86,14 +86,41 @@ pub fn ensure_admin_endpoint() -> Result<&'static AdminEndpoint> {
             );
             endpoint
         }
-        None => {
-            let user = uuid::Uuid::new_v4().simple().to_string();
-            let password = uuid::Uuid::new_v4().simple().to_string();
-            AdminEndpoint {
-                addr: format!("127.0.0.1:{}", admin_port()?),
-                user,
-                password,
-            }
+        None => fresh_admin_endpoint()?,
+    };
+    validate_endpoint(&endpoint)?;
+    Ok(ADMIN_ENDPOINT.get_or_init(|| endpoint))
+}
+
+fn fresh_admin_endpoint() -> Result<AdminEndpoint> {
+    Ok(AdminEndpoint {
+        addr: format!("127.0.0.1:{}", admin_port()?),
+        user: uuid::Uuid::new_v4().simple().to_string(),
+        password: uuid::Uuid::new_v4().simple().to_string(),
+    })
+}
+
+/// Only the supervisor host may call this after current-owner authorization,
+/// pending-write settlement and a fresh no-execution observation. Historical
+/// command spelling grants no authority to a path or a live proxy.
+pub(crate) fn register_retired_bootstrap_endpoint(
+    spec: &crate::svc_spec::ServiceSpecFile,
+) -> Result<&'static AdminEndpoint> {
+    anyhow::ensure!(
+        proxy_spec_relative_config_legacy(spec),
+        "retired proxy bootstrap is not the recognized relative-path record"
+    );
+    if let Some(endpoint) = ADMIN_ENDPOINT.get() {
+        validate_endpoint(endpoint)?;
+        return Ok(endpoint);
+    }
+    let endpoint = match endpoint_from_spec_env(&spec.env) {
+        Ok(endpoint) => endpoint,
+        Err(_) => {
+            // No execution retains these credentials. Do not turn corrupt
+            // historical metadata into a permanent gate for a fresh launch.
+            tracing::warn!("replaced unusable credentials from a retired proxy bootstrap");
+            fresh_admin_endpoint()?
         }
     };
     validate_endpoint(&endpoint)?;
@@ -138,6 +165,31 @@ fn verify_proxy_spec(spec: &crate::svc_spec::ServiceSpecFile) -> Result<()> {
         "proxy specification command does not match its launch contract"
     );
     Ok(())
+}
+
+/// 契约整体是否成立（供编排层判断既有 resident spec 可否继续使用）。
+pub(crate) fn proxy_spec_contract_ok(spec: &crate::svc_spec::ServiceSpecFile) -> bool {
+    verify_proxy_spec(spec).is_ok()
+}
+
+/// 精确识别"仅 argv[2] 为相对路径"的遗留 spec 形态（本地独立 serve 以
+/// `--log-dir .local-logs` 之类相对参数写入，其余字段完全符合契约）。
+/// 此类旧记录的路径基准是已消亡旧进程的 cwd，不可猜测归属；仅当旧执行
+/// 已退出时，编排层可用当前 owner 的绝对参数受控重建。
+pub(crate) fn proxy_spec_relative_config_legacy(spec: &crate::svc_spec::ServiceSpecFile) -> bool {
+    spec.service_id == "pingap"
+        && spec.port.is_none()
+        && spec.argv.first().is_some_and(|binary| {
+            std::path::Path::new(binary)
+                .file_name()
+                .is_some_and(|name| name == "pingap" || name == "pingap.exe")
+        })
+        && (spec.argv.len() == 3 || (spec.argv.len() == 4 && spec.argv[3] == "--autoreload"))
+        && spec.argv.get(1).is_some_and(|flag| flag == "-c")
+        && spec
+            .argv
+            .get(2)
+            .is_some_and(|config| !std::path::Path::new(config).is_absolute())
 }
 
 fn endpoint_from_spec_env(
@@ -542,6 +594,42 @@ pub async fn wait_for_config_hash(
 mod tests {
     use super::*;
 
+    fn spec_file(argv: Vec<String>) -> crate::svc_spec::ServiceSpecFile {
+        crate::svc_spec::ServiceSpecFile {
+            release_id: crate::svc_spec::RESIDENT_SPEC_ID.into(),
+            service_id: "pingap".into(),
+            cwd: "/".into(),
+            argv,
+            env: Default::default(),
+            port: None,
+        }
+    }
+
+    #[test]
+    fn relative_config_legacy_spec_is_precisely_recognized() {
+        let legacy = spec_file(vec![
+            "/usr/local/bin/pingap".into(),
+            "-c".into(),
+            ".local-logs/pingap/active/pingap.toml".into(),
+        ]);
+        assert!(proxy_spec_relative_config_legacy(&legacy));
+        assert!(!proxy_spec_contract_ok(&legacy));
+
+        let absolute = spec_file(vec![
+            "/usr/local/bin/pingap".into(),
+            "-c".into(),
+            "/home/user/2/.local-logs/pingap/active/pingap.toml".into(),
+        ]);
+        assert!(!proxy_spec_relative_config_legacy(&absolute));
+        assert!(proxy_spec_contract_ok(&absolute));
+
+        // 其他契约违规（业务命令、缺少 -c 形态）不落入遗留相对形态,
+        // 保持既有 Fail Fast 路径。
+        let business = spec_file(vec!["java".into(), "-jar".into(), "app.jar".into()]);
+        assert!(!proxy_spec_relative_config_legacy(&business));
+        assert!(!proxy_spec_contract_ok(&business));
+    }
+
     /// P1：常驻 spec 存在时优先恢复其凭证（跨 owner 存活的 pingap 仍持有
     /// 首任凭证；新 owner 生成新凭证将无法探 admin）。spec 路径受
     /// APP_CLI_SPEC_DIR 控制，与其它 spec 测试同锁串行。
@@ -550,17 +638,20 @@ mod tests {
         let _guard = crate::svc_spec::SPEC_ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("APP_CLI_SPEC_DIR", dir.path()) };
+        let root = std::fs::canonicalize(dir.path()).unwrap();
         // 无常驻 spec：恢复 None（走生成路径）
         assert!(endpoint_from_resident_spec().unwrap().is_none());
 
         let spec = crate::svc_spec::ServiceSpecFile {
             release_id: crate::svc_spec::RESIDENT_SPEC_ID.into(),
             service_id: "pingap".into(),
-            cwd: "/".into(),
+            cwd: root.to_string_lossy().into_owned(),
             argv: vec![
-                "/usr/local/bin/pingap".into(),
+                root.join("bin/pingap").to_string_lossy().into_owned(),
                 "-c".into(),
-                "/app/logs/pingap/active/pingap.toml".into(),
+                root.join("active/pingap.toml")
+                    .to_string_lossy()
+                    .into_owned(),
                 "--autoreload".into(),
             ],
             env: [

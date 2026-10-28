@@ -364,6 +364,107 @@ async fn failed_builder_completion_clears_only_confirmed_rejection_marker() {
 }
 
 #[tokio::test]
+async fn partial_builder_completion_retains_confirmed_container_and_recovery_marker() {
+    for status in [403, 409, 408, 500] {
+        let root = tempfile::tempdir().unwrap();
+        let lease = lock_builder_file(root.path(), "builder-test.lock").unwrap();
+        let marker = std::fs::read(root.path().join("builder-test.lock")).unwrap();
+        let failure = super::super::builder_completion::docker_error(
+            crate::DockerError::ContainerCreationIncomplete {
+                container_id: "confirmed-created-builder".into(),
+                phase: crate::ContainerCreationPhase::Start,
+                source: Box::new(crate::DockerError::BollardError(
+                    bollard::errors::Error::DockerResponseServerError {
+                        status_code: status,
+                        message: "start failed".into(),
+                    },
+                )),
+            },
+        );
+        let result: container_runtime_api::ContainerRuntimeResult<()> =
+            super::super::builder_completion::finish(Box::new(lease), Err(failure)).await;
+        let error = result.unwrap_err();
+        let container_runtime_api::ContainerRuntimeError::DockerCreationIncomplete {
+            container_id,
+            phase,
+            ..
+        } = &error
+        else {
+            panic!("completion must preserve confirmed partial creation: {error:?}");
+        };
+        assert_eq!(container_id, "confirmed-created-builder");
+        assert_eq!(*phase, crate::ContainerCreationPhase::Start);
+        assert!(container_runtime_api::runtime_mutation_outcome_unknown(
+            &error
+        ));
+        assert_eq!(
+            std::fs::read(root.path().join("builder-test.lock")).unwrap(),
+            marker,
+            "a start rejection must not erase the preceding create's recovery marker"
+        );
+        assert!(lock_builder_file(root.path(), "builder-test.lock").is_err());
+    }
+}
+
+#[tokio::test]
+async fn partial_builder_recording_failure_keeps_original_source_and_recovery_marker() {
+    use container_runtime_api::ContainerRuntimeError as Error;
+    for status in [403, 409] {
+        let root = tempfile::tempdir().unwrap();
+        let lease = lock_builder_file(root.path(), "builder-test.lock").unwrap();
+        let marker = std::fs::read(root.path().join("builder-test.lock")).unwrap();
+        let failure = super::super::builder_completion::docker_error(
+            crate::DockerError::ContainerCreationIncomplete {
+                container_id: "created-before-recording-failed".into(),
+                phase: crate::ContainerCreationPhase::Start,
+                source: Box::new(crate::DockerError::BollardError(
+                    bollard::errors::Error::DockerResponseServerError {
+                        status_code: status,
+                        message: "start denied".into(),
+                    },
+                )),
+            },
+        );
+        let recording =
+            super::super::builder_completion::record_partial_creation::<()>(Err(failure), async {
+                Err(Error::ConnectionError("receipt write failed".into()))
+            })
+            .await;
+        let error = super::super::builder_completion::finish(Box::new(lease), recording)
+            .await
+            .unwrap_err();
+        assert!(container_runtime_api::runtime_mutation_outcome_unknown(
+            &error
+        ));
+        assert!(error.to_string().contains("receipt write failed"));
+        let Error::DockerCreationIncomplete {
+            container_id,
+            phase,
+            source,
+            recording_failure,
+        } = error
+        else {
+            panic!("receipt failure cannot flatten confirmed partial creation");
+        };
+        assert_eq!(container_id, "created-before-recording-failed");
+        assert_eq!(phase, crate::ContainerCreationPhase::Start);
+        let Error::RequestRejected(rejection) = *source else {
+            panic!("receipt failure cannot replace the original source");
+        };
+        assert_eq!(rejection.status, status);
+        assert!(matches!(
+            recording_failure.as_deref(),
+            Some(Error::ConnectionError(message)) if message == "receipt write failed"
+        ));
+        assert_eq!(
+            std::fs::read(root.path().join("builder-test.lock")).unwrap(),
+            marker
+        );
+        assert!(lock_builder_file(root.path(), "builder-test.lock").is_err());
+    }
+}
+
+#[tokio::test]
 async fn failed_marker_release_does_not_erase_other_owner_or_original_error() {
     let root = tempfile::tempdir().unwrap();
     let lease = lock_builder_file(root.path(), "builder-test.lock").unwrap();

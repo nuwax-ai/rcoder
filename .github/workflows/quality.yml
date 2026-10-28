@@ -3,13 +3,13 @@
 #   拦截档（失败即红）: fmt / clippy -D warnings / vulnerability / 违禁许可证 / 未知来源
 #   观察档（只警告）: unmaintained 依赖、重复版本（bans.multiple-versions=warn）
 # 存量清理完后可将 audit 加 --deny-warnings、deny 的 bans 拉严。
-# audit/deny 当前均为绿灯；剩余的是观察档 warning（unmaintained / unsound 传递依赖），
-# 已拍板搁置的逐条登记在 .cargo/audit.toml 与 deny.toml 的 ignore（两处保持同步）。
+# audit/deny 以当次执行结果为准；app-cli 独立 lockfile 需单独检查。
+# 既有例外登记在 .cargo/audit.toml 与 deny.toml，本批不新增漏洞忽略项。
 name: quality
 
 on:
   push:
-    branches: [main, "feature-*"]
+    branches: [main, "feature-*", "feat-*"]
   pull_request:
 
 concurrency:
@@ -25,6 +25,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Workflow syntax check
+        run: |
+          command -v shellcheck
+          shellcheck --version
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.11 -color
+
+      - name: Native release fixture contracts
+        run: python3 -m unittest tools/tests/test_official_pair_fixture.py
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -62,6 +71,22 @@ jobs:
             features: --all-features
     env:
       FEATURE_ARGS: ${{ matrix.features }}
+      # PG contracts create private schemas; never point CI at a shared database.
+      RCODER_PG_TEST_DSN: postgres://rcoder_test:rcoder_test@127.0.0.1:5432/rcoder_test
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: rcoder_test
+          POSTGRES_PASSWORD: rcoder_test
+          POSTGRES_DB: rcoder_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rcoder_test -d rcoder_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v4
 
@@ -96,7 +121,30 @@ jobs:
           cargo nextest --version
 
       - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets $FEATURE_ARGS -- -D warnings
+        run: |
+          feature_args=()
+          if [ -n "$FEATURE_ARGS" ]; then read -r -a feature_args <<< "$FEATURE_ARGS"; fi
+          cargo clippy --workspace --all-targets "${feature_args[@]}" -- -D warnings
 
       - name: Tests
-        run: cargo nextest run --workspace --no-fail-fast $FEATURE_ARGS
+        run: |
+          feature_args=()
+          if [ -n "$FEATURE_ARGS" ]; then read -r -a feature_args <<< "$FEATURE_ARGS"; fi
+          cargo nextest run --workspace --no-fail-fast "${feature_args[@]}"
+
+  app-cli-audit:
+    name: app-cli independent audit + deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/app-cli
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+      - name: Audit the independent lockfile
+        run: cargo audit --file crates/app-cli/Cargo.lock
+      - name: Check the independent dependency graph
+        run: cargo deny --locked --manifest-path crates/app-cli/Cargo.toml --config deny.toml check

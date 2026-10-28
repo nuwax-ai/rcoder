@@ -11,7 +11,9 @@ use super::DYNAMIC_ADD_LOCK;
 use lock::{DirectoryIdentity, checked_directory, identity};
 use receipt::{Phase, Receipt, Skill, SkillPhase, SourceLayout, StoredReceipt};
 
-mod lock;
+// 锁原语已上提为 service 级共享模块（技能 fan-out 与保留重建共用同一把工作区锁）；
+// 以模块别名承接本子树既有的 `lock::` 引用，行为与可见性不变。
+use crate::service::workspace_lock as lock;
 mod receipt;
 mod receipt_io;
 

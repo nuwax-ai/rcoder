@@ -11,7 +11,7 @@ use container_runtime_api::{ContainerRuntimeError, ContainerRuntimeResult};
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
 #[cfg(feature = "kubernetes")]
-use kube::api::{Api, DeleteParams, ObjectMeta, Patch, PostParams};
+use kube::api::{Api, ObjectMeta, Patch, PostParams};
 #[cfg(feature = "kubernetes")]
 use shared_types::{
     AGENT_FILE_SERVER_PORT, APP_CLI_ADMIN_PORT, APP_ENTRY_PORT, DBX_PORT, GRPC_DEFAULT_PORT,
@@ -20,7 +20,7 @@ use shared_types::{
 #[cfg(feature = "kubernetes")]
 use std::collections::BTreeMap;
 #[cfg(feature = "kubernetes")]
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 #[cfg(feature = "kubernetes")]
 use super::k8s_pod::K8sPodOps;
@@ -337,7 +337,10 @@ pub(crate) fn build_standard_labels(
 /// 构建 K8s Selector 标签
 ///
 /// Selector 只包含必要的标签，用于精确匹配 Pod
-fn build_selector_labels(identifier: &str, service_type: &ServiceType) -> BTreeMap<String, String> {
+pub(super) fn build_selector_labels(
+    identifier: &str,
+    service_type: &ServiceType,
+) -> BTreeMap<String, String> {
     // 家族归一：selector 必须匹配 build_standard_labels 写入的家族值
     let service_type = service_type.container_family_key();
     let mut selector = BTreeMap::new();
@@ -430,15 +433,6 @@ pub(crate) trait K8sServiceOps {
     /// 已存在则跳过——例外：builder Service 缺 app-cli-admin 端口时 SSA patch
     /// 定向收敛（见函数内注释）。
     async fn create_agent_service(
-        &self,
-        identifier: &str,
-        service_type: &ServiceType,
-    ) -> ContainerRuntimeResult<()>;
-
-    /// 删除 agent Service
-    ///
-    /// 在 Pod 终止后调用。404 视为已删除，不报错。
-    async fn delete_agent_service(
         &self,
         identifier: &str,
         service_type: &ServiceType,
@@ -614,36 +608,6 @@ impl K8sServiceOps for KubernetesRuntime {
             "[K8S] Service {} created for {} ({})",
             svc_name, identifier, service_type
         );
-        Ok(())
-    }
-
-    async fn delete_agent_service(
-        &self,
-        identifier: &str,
-        service_type: &ServiceType,
-    ) -> ContainerRuntimeResult<()> {
-        let svc_name = self.agent_service_name(identifier, service_type)?;
-        let services: Api<Service> = Api::namespaced(self.client.clone(), &self.namespace);
-
-        // deploy-host：Service 删除同步注销发布端口注册表（双键对齐注册侧）
-        #[cfg(feature = "deploy-host")]
-        if shared_types::is_deploy_host() {
-            if let Some(sts_name) = svc_name.strip_suffix("-svc") {
-                shared_types::published::unregister(sts_name);
-            }
-            shared_types::published::unregister(identifier);
-        }
-        match services.delete(&svc_name, &DeleteParams::default()).await {
-            Ok(_) => {
-                info!("[K8S] Service {} deleted", svc_name);
-            }
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                debug!("[K8S] Service {} not found, already deleted", svc_name);
-            }
-            Err(e) => {
-                warn!("[K8S] Failed to delete Service '{}': {}", svc_name, e);
-            }
-        }
         Ok(())
     }
 }

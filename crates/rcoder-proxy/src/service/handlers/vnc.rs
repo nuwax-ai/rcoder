@@ -10,7 +10,7 @@ use pingora_http::RequestHeader;
 use shared_types::NOVNC_PORT;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info};
+use tracing::{debug, error, warn};
 
 use crate::service::types::{ProxyMetrics, TrackingCtx};
 use crate::service::utils;
@@ -82,6 +82,7 @@ pub async fn handle_vnc_upstream(
     vnc_backends: &Arc<DashMap<String, String>>,
     metrics: &Arc<ProxyMetrics>,
     container_lookup: &Option<Arc<dyn shared_types::ContainerLookup>>,
+    user_refresh: &Option<Arc<dyn shared_types::ContainerUserRefresh>>,
 ) -> PingoraResult<Box<HttpPeer>> {
     // 从路径参数中提取 user_id
     let user_id = params.get("user_id").ok_or_else(|| {
@@ -99,16 +100,49 @@ pub async fn handle_vnc_upstream(
     // 查找容器 IP:优先 ContainerLookupService(动态查项目存储,容器存在即可达,
     // 与 ttyd 一致、runtime 无关),回退 vnc_backends 显式注册
     // (chat / pod_ensure / pod_restart / pod_vnc_status 注册,作为兜底数据源)。
-    let container_ip = if let Some(lookup) = container_lookup {
-        lookup.find_by_user_id(user_id, &shared_types::ServiceType::ComputerAgentRunner)
-    } else {
-        vnc_backends.get(user_id).map(|r| r.value().clone())
+    let resolve = || {
+        if let Some(lookup) = container_lookup {
+            lookup.find_by_user_id(user_id, &shared_types::ServiceType::ComputerAgentRunner)
+        } else {
+            vnc_backends.get(user_id).map(|r| r.value().clone())
+        }
     };
+    let mut container_ip = resolve();
+
+    // On-miss PG read-through (node drains and event races can leave a
+    // replica's mirror without this user): re-read the user's authoritative
+    // rows through the guarded project read-through and retry once. Bounded
+    // by the refresh hook's own durable-commit deadline; failures keep the
+    // miss and fall through to the diagnosable 404.
+    if container_ip.is_none()
+        && let Some(refresh) = user_refresh
+        && let Err(error) = refresh
+            .refresh_user_container(user_id, &shared_types::ServiceType::ComputerAgentRunner)
+            .await
+    {
+        debug!(
+            %error,
+            user_id = user_id,
+            "VNC lookup miss: user container refresh failed; keeping the miss"
+        );
+    }
+    if container_ip.is_none() {
+        container_ip = resolve();
+    }
 
     let container_ip = match container_ip {
         Some(ip) => ip,
         None => {
-            info!("routing {} to VNC", user_id);
+            // 404 必须可诊断（2026-10-27 生产排障最缺的就是这条）：记录 user/
+            // project、解析路径（存储 lookup vs 内存注册表）、以及 fallback 是否
+            // 也未命中，供区分"用户确无容器"与"副本镜像缺陷"。
+            warn!(
+                user_id = user_id,
+                project_id = project_id,
+                storage_lookup = container_lookup.is_some(),
+                pg_refresh_attempted = user_refresh.is_some(),
+                "VNC upstream not resolved after the mirror lookup and the PG read-through"
+            );
             return Err(
                 pingora_core::Error::new(pingora_core::ErrorType::HTTPStatus(404)).more_context(
                     format!(
@@ -134,11 +168,7 @@ pub async fn handle_vnc_upstream(
 
     // 创建 HTTP Peer 到容器的 noVNC 端口
     // Pingora 会自动处理 WebSocket upgrade
-    let mut peer = HttpPeer::new(
-        super::super::upstream::dial_peer(&container_ip, NOVNC_PORT)?,
-        false,          // 不使用 TLS
-        "".to_string(), // SNI
-    );
+    let mut peer = super::super::upstream::dial_peer(&container_ip, NOVNC_PORT).await?;
 
     // VNC WebSocket 长连接优化配置（idle 1 小时）
     super::streaming_peer_options(&mut peer, Duration::from_secs(3600));

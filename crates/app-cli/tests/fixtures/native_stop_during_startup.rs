@@ -297,8 +297,46 @@ async fn native_stop_during_source_proxy_start_retains_its_drain_and_fresh_sourc
     );
 
     fixture.manifests("corrected-after-native-stop");
-    fixture.operation(&client, &base, &identity, "start").await;
-    fixture.http(&client, "corrected-after-native-stop").await;
+    // Identity/status remain available while the same owner's business startup
+    // recovery is still running. Await the existing read-only admission view,
+    // then submit exactly once; the original 20-second budget covers all reads,
+    // the POST, its terminal observation and corrected business HTTP together.
+    let fresh_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    tokio::time::timeout_at(fresh_deadline, async {
+        loop {
+            let response = client
+                .get(format!("{base}/v1/runtime/recovery"))
+                .header("X-Deploy-Token", token.trim())
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: Value = response.json().await.unwrap();
+            if status == reqwest::StatusCode::OK {
+                assert_eq!(body["success"], true, "{body}");
+                assert_eq!(body["code"], "OK", "{body}");
+                break;
+            }
+            assert!(
+                status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    && body["code"] == "ERR_INITIALIZING",
+                "unexpected fresh Source admission prerequisite: {status} {body}; {}",
+                fixture.diagnostics()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        fixture
+            .operation_until(&client, &base, &identity, "start", fresh_deadline)
+            .await;
+        fixture.http(&client, "corrected-after-native-stop").await;
+    })
+    .await
+    .unwrap_or_else(|error| {
+        panic!(
+            "fresh Source recovery exceeded its original deadline: {error}; {}",
+            fixture.diagnostics()
+        )
+    });
     fixture.same_owner(&client, &base, &identity, &native).await;
     let original_after_fresh_start = operation_view(&client, &base, &token, &start_id).await;
     assert_eq!(

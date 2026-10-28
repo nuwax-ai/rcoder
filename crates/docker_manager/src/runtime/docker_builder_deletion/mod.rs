@@ -44,7 +44,10 @@ pub(super) fn builder_identity(
 mod compute_lease;
 mod endpoint;
 mod file_lease;
+mod handoff;
 mod ops;
+#[cfg(test)]
+mod retained_guard_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

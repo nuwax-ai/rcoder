@@ -22,5 +22,8 @@ zip = { workspace = true, default-features = false, features = ["deflate"] }
 # 终端 ws 场景（ttyd 协议）：workspace 级 0.30，与 agent_runner ws_terminal 同款
 tokio-tungstenite = { workspace = true }
 
+[dev-dependencies]
+axum = { workspace = true }
+
 [lints]
 workspace = true

@@ -21,80 +21,15 @@ pub use config::CleanupConfig;
 #[allow(unused_imports)] // CleanupStats 用于类型导出
 pub use config::CleanupStats;
 
-/// 启动清理任务
+/// Start this leadership generation's idle scanner.
 ///
-/// # Errors
-/// 如果Failed to get DockerManager，返回错误而不是静默失败
+/// Metadata retirement has no detached physical-deletion consumer. Each
+/// generation owns only its scanner and can be joined and started again.
 pub async fn start_cleanup_task(
     config: CleanupConfig,
     state: Arc<crate::app_state::AppState>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let docker_manager = match docker_manager::global::get_global_docker_manager().await {
-        Ok(dm) => Some(dm),
-        Err(e) => {
-            if matches!(
-                docker_manager::runtime::RuntimeManager::runtime_type(),
-                docker_manager::runtime_selection::RuntimeType::Kubernetes
-            ) {
-                tracing::warn!(
-                    "⚠️ [CLEANUP_TASK] DockerManager unavailable in Kubernetes mode, starting lightweight cleanup task: {}",
-                    e
-                );
-                None
-            } else {
-                tracing::error!(
-                    "🚨 [CLEANUP_TASK] Failed to get DockerManager: {}, cleanup task cannot start",
-                    e
-                );
-                return Err(anyhow::anyhow!("Failed to get DockerManager: {}", e));
-            }
-        }
-    };
-
-    // 启动 ResourceReaper（消费 cleanup_rx，处理 RAII 容器销毁请求）
-    {
-        let reaper_rx = match state.cleanup_rx.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(e) => {
-                tracing::error!("[REAPER] cleanup_rx mutex poisoned: {}", e);
-                return Err(anyhow::anyhow!("cleanup_rx mutex poisoned: {}", e));
-            }
-        };
-
-        let reaper_rx = match reaper_rx {
-            Some(rx) => rx,
-            None => {
-                tracing::error!(
-                    "[REAPER] cleanup_rx already consumed, ResourceReaper can only be started once"
-                );
-                return Err(anyhow::anyhow!("ResourceReaper can only be started once"));
-            }
-        };
-
-        // SSE 关闭回调：reaper 销毁容器后按 grpc_addr 关闭前端进度流（幂等）
-        let shutdown_sse: crate::grpc::ShutdownSseFn = {
-            let state = state.clone();
-            Arc::new(move |addr: &str| state.shutdown_sse_streams_by_addr(addr))
-        };
-
-        let reaper = crate::storage::ResourceReaper::new(
-            reaper_rx,
-            state.runtime().clone(),
-            state.grpc_pool.clone(),
-            state.pingora_service.clone(),
-            docker_manager.clone(),
-            shutdown_sse,
-        );
-        // 观测接入（dial9）刻意不接：后台回收循环无 wake 因果排查需求
-        // （specs/observability-hotpath-dial9-upgrade v2 撤项裁定），防未来误接。
-        tokio::spawn(reaper.run());
-        tracing::info!(
-            "[REAPER] ResourceReaper started (docker_manager={})",
-            docker_manager.is_some()
-        );
-    }
-
     // K8s 与 Docker 统一走下面的 AgentCleaner 公共清理逻辑 (引用计数 + 两分支), 不再有专门的
     // K8s 裸循环 —— 旧 K8s 循环无引用计数, 会因单个 project idle 连坐销毁整个 user 容器
     // (prod 实测 490 次)。AgentCleaner 内部 destroyer 经 ContainerRuntime trait 物理销毁,

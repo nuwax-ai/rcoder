@@ -348,10 +348,62 @@ pub(crate) struct RuntimeProxyContext {
     pub dev_profile: bool,
 }
 
-pub(crate) fn runtime_root(log_root: &Path) -> PathBuf {
-    std::env::var_os("APP_CLI_PINGAP_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| log_root.join("pingap"))
+pub(crate) fn runtime_root(log_root: &Path) -> Result<PathBuf> {
+    runtime_root_from_override(
+        log_root,
+        std::env::var_os("APP_CLI_PINGAP_RUNTIME_DIR").as_deref(),
+    )
+}
+
+fn runtime_root_from_override(
+    log_root: &Path,
+    explicit: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf> {
+    let requested = match explicit {
+        Some(path) => {
+            anyhow::ensure!(
+                !path.is_empty(),
+                "APP_CLI_PINGAP_RUNTIME_DIR must not be empty"
+            );
+            PathBuf::from(path)
+        }
+        None => log_root.join("pingap"),
+    };
+    let absolute = std::path::absolute(&requested)
+        .context("resolve proxy runtime directory against invocation directory")?;
+    canonical_path_with_missing_tail(&absolute)
+}
+
+/// Resolve the existing ancestor through the filesystem before retaining a
+/// missing suffix. In particular, `link/..` must follow the link before `..`.
+pub(crate) fn canonical_path_with_missing_tail(path: &Path) -> Result<PathBuf> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                let mut resolved = std::fs::canonicalize(ancestor).with_context(|| {
+                    format!("resolve proxy runtime ancestor {}", ancestor.display())
+                })?;
+                for component in missing.into_iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(
+                    ancestor
+                        .file_name()
+                        .context("proxy runtime directory has no resolvable existing ancestor")?
+                        .to_os_string(),
+                );
+                ancestor = ancestor
+                    .parent()
+                    .context("proxy runtime directory has no existing parent")?;
+            }
+            Err(error) => return Err(error).context("observe proxy runtime directory"),
+        }
+    }
 }
 
 /// owner 生命周期固定的 active 配置路径（P1 常驻代理的 `-c` 目标）。
@@ -699,29 +751,118 @@ pub fn build_standby_from_topology(
             ..Default::default()
         },
     );
-    // mock（Request 阶段直出，无 upstream）：status/headers/data
-    let body =
-        format!("service stopped or restarting (publication {publication_id}); retry shortly");
-    let plugin: PluginConf = serde_json::from_str(
-        &serde_json::json!({
-            "category": "mock",
-            "status": 503,
-            "headers": [
-                "Retry-After: 2",
-                "Content-Type: text/plain; charset=utf-8",
-                "Cache-Control: no-store",
-                "X-Rcoder-Publication: ".to_string() + publication_id,
-            ],
-            "data": body,
-        })
-        .to_string(),
-    )?;
+    // mock（Request 阶段直出，无 upstream）：status/headers/data。
+    // `X-Pingap-EType: rcoder-standby` 证明响应为入口自产（该窗口无 upstream
+    // 代理，应用不可能注入），rcoder-proxy 故障页管线据此替换为友好表示；
+    // 业务状态细分（starting/stopped/failed）由就绪观察在错误时刻给出。
+    // 正文用与 rcoder-proxy 同一套自包含错误页（含 5s meta refresh，无 JS
+    // 依赖）：绕过 rcoder-proxy 替换层的路径（standby-origin 冷缓存首击透传、
+    // 直连预览域名）首击即见可自动恢复的页面，而非裸文本。语言固定 zh-CN
+    // （mock 是发布期静态产物，感知不了请求语言；代理路径由 rcoder-proxy 按
+    // 请求语言覆盖为本地化版本，两者共用同一资产互不冲突）。
+    // pingap 的 PluginConf 是自由键值袋（Map<String, Value>，模型层无插件
+    // 类型）：字段名经 StandbyMockPlugin 在编译期钉住，序列化后落回 PluginConf。
+    let body = standby_error_page(publication_id);
+    let plugin: PluginConf = serde_json::from_value(serde_json::to_value(StandbyMockPlugin {
+        category: "mock",
+        status: 503,
+        headers: vec![
+            "Retry-After: 2".to_string(),
+            "Content-Type: text/html; charset=utf-8".to_string(),
+            "Cache-Control: no-store".to_string(),
+            format!("X-Rcoder-Publication: {publication_id}"),
+            format!("X-Pingap-EType: {}", shared_types::PINGAP_STANDBY_ETYPE),
+        ],
+        data: body,
+    })?)?;
     cfg.plugins.insert("standby".into(), plugin);
     cfg = publication_config(cfg, publication_id, 503)?;
     cfg.validate().context("validate standby Pingap config")?;
     let expected_hash = cfg.hash().context("compute standby Pingap config hash")?;
     let content = toml::to_string_pretty(&cfg).context("serialize standby Pingap config")?;
     Ok((content, expected_hash))
+}
+
+/// standby 兜底页与 rcoder-proxy 的用户错误页共用同一资产；占位符按
+/// restarting 档（"启动或重启"）渲染，诊断编号直接用发布 ID（可定位具体
+/// 一次摘流发布）。UI 标签清单与 rcoder-proxy error_page::UI_LABELS 保持
+/// 同步；`standby_page_renders_without_placeholders` 测试兜底防漂移。
+const STANDBY_PAGE_TEMPLATE: &str =
+    include_str!("../../../rcoder-proxy/assets/userapp-error-default.html");
+
+const STANDBY_PAGE_LOCALE: &str = "zh-CN";
+
+/// standby 兜底 mock 插件的字段契约（pingap PluginConf 是 Map<String, Value>
+/// 自由键值袋，模型层无类型；本地结构体把字段名钉在编译期，键名拼写错误
+/// 直接编译失败而不是静默产出不生效的 mock）。
+#[derive(Debug, serde::Serialize)]
+struct StandbyMockPlugin<'a> {
+    category: &'a str,
+    status: u16,
+    headers: Vec<String>,
+    data: String,
+}
+
+fn standby_error_page(publication_id: &str) -> String {
+    let locale = STANDBY_PAGE_LOCALE;
+    let slug = "restarting";
+    let mut page = STANDBY_PAGE_TEMPLATE
+        .replace(
+            "{{RCODER_TITLE}}",
+            &shared_types::t(&format!("userapp_error_page.{slug}.title"), locale),
+        )
+        .replace(
+            "{{RCODER_MESSAGE}}",
+            &shared_types::t(&format!("userapp_error_page.{slug}.message"), locale),
+        )
+        .replace("{{RCODER_DIAGNOSTIC_ID}}", publication_id)
+        .replace("{{RCODER_STATUS}}", "503")
+        .replace("{{RCODER_LANG}}", locale)
+        .replace("{{RCODER_CAUSE}}", slug);
+    const UI_LABELS: [(&str, &str); 16] = [
+        ("{{RCODER_UI_BROWSER}}", "browser"),
+        ("{{RCODER_UI_CONNECTED}}", "connected"),
+        ("{{RCODER_UI_GATEWAY}}", "gateway"),
+        ("{{RCODER_UI_NORMAL}}", "normal"),
+        ("{{RCODER_UI_APP}}", "app_service"),
+        ("{{RCODER_UI_UNAVAILABLE}}", "unavailable"),
+        ("{{RCODER_UI_STARTING}}", "starting"),
+        ("{{RCODER_UI_STOPPED}}", "stopped"),
+        ("{{RCODER_UI_STOPPING}}", "stopping"),
+        ("{{RCODER_UI_FAILED}}", "failed"),
+        ("{{RCODER_UI_PREPARING}}", "preparing"),
+        ("{{RCODER_UI_RELOAD}}", "reload"),
+        ("{{RCODER_UI_HINT}}", "hint"),
+        ("{{RCODER_UI_COPY}}", "copy"),
+        ("{{RCODER_UI_COPIED}}", "copied"),
+        ("{{RCODER_UI_ARIA}}", "aria_chain"),
+    ];
+    for (placeholder, key) in UI_LABELS {
+        let text = shared_types::t(&format!("userapp_error_page.ui.{key}"), locale);
+        page = page.replace(placeholder, &text);
+    }
+    page
+}
+
+#[cfg(test)]
+mod standby_page_tests {
+    use super::standby_error_page;
+
+    /// 资产与 rcoder-proxy 共用：对方新增占位符而本清单未跟时，此处立即
+    /// 失败（裸 `{{RCODER_*}}` 直出浏览器）。
+    #[test]
+    fn standby_page_renders_without_placeholders() {
+        let page = standby_error_page("pub-123");
+        assert!(
+            page.contains("http-equiv=\"refresh\""),
+            "missing meta refresh"
+        );
+        assert!(page.contains("pub-123"), "publication id not rendered");
+        assert!(
+            !page.contains("{{RCODER_"),
+            "unresolved placeholder leaked into standby page"
+        );
+    }
 }
 
 /// 常驻热载兼容校验（P1 T15）：对比当前 active 与新候选的 server 拓扑。
@@ -1044,7 +1185,10 @@ pub(crate) async fn validate_candidate_until(
     .context("write native proxy validation configuration")?;
     let mut command = Command::new(pingap_bin);
     super::official_env::sanitize(&mut command);
-    command.arg("-t").arg("-c").arg(&target);
+    command
+        .arg("-t")
+        .arg("-c")
+        .arg(super::command_path::external_config_path(&target)?);
     let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
     anyhow::ensure!(
         !budget.is_zero(),
@@ -1820,6 +1964,13 @@ addr = "0.0.0.0:9081"
             joined.contains("X-Rcoder-Publication"),
             "publication marker required: {joined}"
         );
+        assert!(
+            joined.contains(&format!(
+                "X-Pingap-EType: {}",
+                shared_types::PINGAP_STANDBY_ETYPE
+            )),
+            "standby origin marker required for error-page replacement: {joined}"
+        );
         // pin（0.15.0 文件模式）周期轮询默认 90s——必须收紧到确认预算内
         assert_eq!(
             cfg.basic.auto_restart_check_interval,
@@ -1987,3 +2138,112 @@ mod startup_contract_tests;
 #[cfg(test)]
 #[path = "compiler_deadline_tests.rs"]
 mod file_deadline_tests;
+
+#[cfg(test)]
+mod runtime_root_tests {
+    use super::runtime_root_from_override;
+    use std::{ffi::OsStr, path::Path};
+
+    #[test]
+    fn default_root_retains_missing_log_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let log = temporary.path().join("future-logs");
+        let resolved = runtime_root_from_override(&log, None).unwrap();
+        assert_eq!(
+            resolved,
+            temporary
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("future-logs/pingap")
+        );
+        assert!(
+            !log.exists(),
+            "resolving a root must not create directories"
+        );
+    }
+
+    #[test]
+    fn relative_override_uses_invocation_directory_not_log_root() {
+        let name = format!("proxy-runtime-{}", uuid::Uuid::new_v4());
+        let expected = std::env::current_dir()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .join(&name);
+        let resolved =
+            runtime_root_from_override(Path::new("unrelated-logs"), Some(OsStr::new(&name)))
+                .unwrap();
+        assert_eq!(resolved, expected);
+        assert!(!resolved.exists());
+    }
+
+    #[test]
+    fn empty_override_is_an_error_without_default_fallback() {
+        let error =
+            runtime_root_from_override(Path::new("logs"), Some(OsStr::new(""))).unwrap_err();
+        assert!(error.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn normal_existing_parent_traversal_resolves_before_missing_tail() {
+        let temporary = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temporary.path().join("existing")).unwrap();
+        let requested = temporary.path().join("existing/../future/runtime");
+        assert_eq!(
+            runtime_root_from_override(Path::new("unused"), Some(requested.as_os_str())).unwrap(),
+            temporary
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("future/runtime")
+        );
+    }
+
+    #[test]
+    fn non_directory_ancestor_error_is_not_replaced_by_another_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = temporary.path().join("file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        let requested = file.join("runtime");
+        assert!(runtime_root_from_override(temporary.path(), Some(requested.as_os_str())).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_parent_traversal_uses_physical_target() {
+        let temporary = tempfile::tempdir().unwrap();
+        let physical = temporary.path().join("physical");
+        std::fs::create_dir_all(physical.join("nested")).unwrap();
+        std::os::unix::fs::symlink(physical.join("nested"), temporary.path().join("alias"))
+            .unwrap();
+        let requested = temporary.path().join("alias/../future/runtime");
+        assert_eq!(
+            runtime_root_from_override(Path::new("unused"), Some(requested.as_os_str())).unwrap(),
+            physical.canonicalize().unwrap().join("future/runtime")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_link_is_an_observation_error_not_a_missing_suffix() {
+        let temporary = tempfile::tempdir().unwrap();
+        let link = temporary.path().join("broken");
+        std::os::unix::fs::symlink(temporary.path().join("missing"), &link).unwrap();
+        let requested = link.join("runtime");
+        assert!(runtime_root_from_override(temporary.path(), Some(requested.as_os_str())).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_override_preserves_path_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let name = std::ffi::OsString::from_vec(b"runtime-\xff".to_vec());
+        let requested = temporary.path().join(&name);
+        assert_eq!(
+            runtime_root_from_override(Path::new("unused"), Some(requested.as_os_str())).unwrap(),
+            temporary.path().canonicalize().unwrap().join(name)
+        );
+    }
+}

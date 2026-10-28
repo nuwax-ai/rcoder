@@ -65,7 +65,7 @@ fn withdrawn_stopped_proxy_with_process_null_receipt_is_reconciled_by_original_d
         let identity = scope.identity().clone();
         let args = RuntimeArgs { workspace, log_dir: root.join("logs"), ..Default::default() };
         supervisor::resident::bind_owner(scope, &args).unwrap();
-        let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+        let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir).unwrap();
         std::fs::create_dir_all(&runtime_root).unwrap();
         let active = crate::proxy::compiler::active_config_path(&runtime_root);
         std::fs::create_dir_all(active.parent().unwrap()).unwrap();
@@ -160,7 +160,7 @@ fn withdrawn_case(
         let mut identity = scope.identity().clone();
         let args = RuntimeArgs { workspace, log_dir: root.join("logs"), ..Default::default() };
         supervisor::resident::bind_owner(scope, &args).unwrap();
-        let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir);
+        let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir).unwrap();
         let active = crate::proxy::compiler::active_config_path(&runtime_root);
         std::fs::create_dir_all(active.parent().unwrap()).unwrap();
         std::fs::write(&active, b"retained old proxy graph").unwrap();

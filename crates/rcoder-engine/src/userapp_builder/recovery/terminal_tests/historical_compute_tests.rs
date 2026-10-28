@@ -6,7 +6,7 @@ use shared_types::{
     ComputeControlStage, ComputeControlState, ComputeExecutorIdentity, UserAppOperationScope,
 };
 
-async fn seeded(
+pub(super) async fn seeded(
     directory: &std::path::Path,
     app_id: &str,
     action: ComputeControlAction,

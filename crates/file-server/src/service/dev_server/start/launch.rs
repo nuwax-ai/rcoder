@@ -79,11 +79,12 @@ impl DevServerManager {
         // 移植，对多服务模板不适用——web/computer 项目（无 workspace manifest）
         // 继续走原路径。
         let manifest = project_path.join("workspace.manifest.toml");
-        if tokio::fs::try_exists(&manifest).await.unwrap_or(false) {
+        if tokio::fs::try_exists(&manifest).await? {
             return self
                 .start_dev_manifest(project_id, project_path, launch)
                 .await;
         }
+        self.resume_pending_registered_stop(project_id).await?;
         // 幂等: 已运行则返回现有 pid/port
         if let Some(p) = lock(&self.processes)?.get(project_id).cloned() {
             return Ok(StartedDev {
@@ -108,9 +109,13 @@ impl DevServerManager {
                 launch.base_path,
                 None,
             )
-            .await?;
-        port_alloc.disarm(); // 分配成功且就绪, 不再归还端口 (Drop 变 no-op)
-        Ok(started)
+            .await;
+        // An unconfirmed original child remains registered for ordinary Stop
+        // recovery. Do not return its live port to another project on failure.
+        if started.is_ok() || lock(&self.processes)?.contains_key(project_id) {
+            port_alloc.disarm();
+        }
+        started
     }
 
     /// 共享启动管线（legacy start 与协调票据模式共用）：npmrc → dev-inject →
@@ -133,8 +138,10 @@ impl DevServerManager {
             .await
             .map_err(|e| AppError::system(format!("create dev log dir: {e}")))?;
         let now = process::now_ms();
+        let launch_id = uuid::Uuid::now_v7().simple().to_string();
+        let temp_log_name = log::launch_temp_log_name(now, &launch_id);
         let main_log = ldir.join(log::main_log_name());
-        let temp_log = ldrtemp(&ldir, now);
+        let temp_log = ldrtemp(&ldir, &temp_log_name);
 
         self.write_npmrc(project_path).await?;
 
@@ -213,10 +220,10 @@ impl DevServerManager {
         crate::service::dev_typecheck::run(project_path, log_key, &main_log, &temp_log).await?;
         let (child, stdout, stderr) = match prepared {
             PreparedDev::Override(command) => {
-                process::spawn_override_shell(&command, project_path)?
+                process::spawn_managed_override_shell(&command, project_path)?
             }
             PreparedDev::Package(args) => {
-                process::spawn_dev(args.program, &args.args, project_path, &args.env_extra)?
+                process::spawn_managed_dev(args.program, &args.args, project_path, &args.env_extra)?
             }
         };
         let pid = child
@@ -226,9 +233,10 @@ impl DevServerManager {
         let stderr_ring: Arc<StderrRing> = Arc::new(Mutex::new(
             std::collections::VecDeque::with_capacity(STDERR_RING_CAP),
         ));
-        // 日志管道 (fire-and-forget): stdout 仅写日志; stderr 额外 tee 到 ring (借鉴 vite-rs 分流)
+        let supervised = SupervisedChild::adopt_managed(child, stderr_ring.clone())?;
+        // stdout drain and root/tree observations retain their original handle.
         if let Some(out) = stdout {
-            log::spawn_log_pipe(out, main_log.clone(), temp_log.clone());
+            supervised.attach_stdout(log::spawn_log_pipe(out, main_log.clone(), temp_log.clone()));
         }
         if let Some(err) = stderr {
             log::spawn_log_pipe_with_ring(
@@ -238,40 +246,60 @@ impl DevServerManager {
                 stderr_ring.clone(),
             );
         }
-        // 丢弃 Child 句柄 (kill_on_drop=false → 进程独立存活, 靠 pid 杀)
-        drop(child);
-
-        // 就绪轮询 (在登记到 map 之前): 进程早退 → 读 stderr ring 分类成结构化错误;
-        // 端口归还由调用方守卫（legacy AllocGuard / 协调器存储端口记账）。避免把
-        // "启动失败已死的 vite"当成成功。
-        self.poll_alive(
-            pid,
-            port,
-            base_path,
-            &stderr_ring,
-            &|port, base, timeout_ms| Box::pin(process::is_project_alive(port, base, timeout_ms)),
-        )
-        .await?;
-
-        // 探活 base：显式值规范化（与 build_dev_args 同规则）或按端口组合的默认值
         let effective_base = base_path
             .map(process::normalize_base_path)
             .unwrap_or_else(|| format!("/proxy/{port}/"));
-        lock(&self.processes)?.insert(
-            registry_key.to_string(),
-            DevProcess {
-                pid,
+        {
+            let mut launches = lock(&self.launches)?;
+            let mut processes = lock(&self.processes)?;
+            let mut children = lock(&self.supervised)?;
+            launches.insert(
+                registry_key.into(),
+                super::super::types::LocalLaunch {
+                    launch_id: launch_id.clone(),
+                    state_root: None,
+                },
+            );
+            processes.insert(
+                registry_key.into(),
+                DevProcess {
+                    pid,
+                    port,
+                    project_id: log_key.into(),
+                    started_at: now,
+                    instance_id: instance_id.map(str::to_owned),
+                    base_path: Some(effective_base),
+                    log_dir: ldir,
+                    temp_log_name,
+                    external_owner: None,
+                },
+            );
+            children.insert(registry_key.into(), Arc::clone(&supervised));
+        }
+        // Publish the full original child before the first awaited readiness
+        // probe, so an overlapping Stop can capture and drain this very launch.
+        let ready = self
+            .poll_owned_alive(
+                &supervised,
                 port,
-                project_id: log_key.to_string(),
-                started_at: now,
-                instance_id: instance_id.map(str::to_string),
-                base_path: Some(effective_base),
-                log_dir: ldir.clone(),
-                temp_log_name: log::temp_log_name(now),
-                external_owner: None,
-            },
-        );
-
+                base_path,
+                &stderr_ring,
+                &|port, base, timeout_ms| {
+                    Box::pin(process::is_project_alive(port, base, timeout_ms))
+                },
+            )
+            .await;
+        if let Err(error) = ready {
+            if let Err(cleanup) = self
+                .close_local_registration(registry_key, Some(&launch_id))
+                .await
+            {
+                return Err(AppError::process(format!(
+                    "{error}; original startup cleanup pending: {cleanup}"
+                )));
+            }
+            return Err(error);
+        }
         Ok(StartedDev { pid, port })
     }
 }

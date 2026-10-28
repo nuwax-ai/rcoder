@@ -5,7 +5,10 @@
 //! 构造本模块私有 struct 字面量，随私有类型同档（prompt_channel_tests 已归
 //! session_manager.rs——其测试对象 send_prompt_to_entry 属 session 域）。
 
-use super::{AcpSessionManager, SessionCreationConfig};
+use super::{
+    AcpSessionManager, SessionCreationConfig, effective_model_config_changed,
+    require_session_identity,
+};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -69,22 +72,24 @@ where
         );
         start_config.session_create_deadline = Some(deadline);
         start_config.startup_transition = Some(transition.clone());
-        let agent_info = self
-            .create_session_internal(
-                project_id.clone(),
-                project_path,
+        // Both public creation and single-flight creation use the same
+        // physical retirement and post-factory ownership boundary. Preserve
+        // this API's fresh-process behavior and its explicit resume settings.
+        self.create_session_leader_path(
+            &project_id,
+            project_path,
+            SessionCreationConfig {
                 model_provider,
                 start_config,
                 service_uuid,
-            )
-            .await?;
-
-        // 存储会话信息到 registry
-        let session_id_str = agent_info.session_id().to_string();
-        self.registry
-            .insert(&project_id, &session_id_str, agent_info.clone());
-
-        Ok(agent_info)
+                force_new_session: true,
+                api_key_manager: None,
+                project_uuid_map: None,
+            },
+        )
+        .await
+        .map(|(entry, _)| entry)
+        .map_err(anyhow::Error::msg)
     }
 
     /// 内部方法：创建 Agent 会话但不插入到 registry
@@ -94,10 +99,16 @@ where
         &self,
         project_id: String,
         project_path: PathBuf,
-        model_provider: Option<ModelProviderConfig>,
-        start_config: AgentStartConfig,
-        service_uuid: Option<String>,
+        config: SessionCreationConfig,
     ) -> Result<R::Entry> {
+        let SessionCreationConfig {
+            model_provider,
+            start_config,
+            service_uuid,
+            api_key_manager,
+            project_uuid_map,
+            ..
+        } = config;
         info!("Creating Agent session, project ID: {}", project_id);
 
         // 创建 SACP 启动器
@@ -106,7 +117,8 @@ where
             self.model_env_resolver.clone(),
             self.permission_handler.clone(),
             self.diagnostics_listener.clone(),
-        );
+        )
+        .with_api_config_maps(api_key_manager, project_uuid_map);
 
         // 记录是否使用了 resume（仅用于日志）
         let has_resume = start_config.resume_session_id.is_some();
@@ -180,6 +192,15 @@ where
     /// 快速复用后，创建请求按 project_id 合流为 leader/follower；leader 在
     /// 执行转换锁内完成停旧、退出确认、启动和登记。DashMap guard 不跨 await，
     /// 不同 project 独立；控制请求在相同锁内完成旧实例清理。
+    /// 比较影响实际进程及其代理绑定的有效模型配置。
+    fn effective_model_changed(
+        &self,
+        existing: Option<&ModelProviderConfig>,
+        new: Option<&ModelProviderConfig>,
+    ) -> bool {
+        effective_model_config_changed(existing, new)
+    }
+
     pub async fn get_or_create_session(
         &self,
         project_id: &str,
@@ -187,6 +208,13 @@ where
         session_id_hint: Option<String>,
         mut config: SessionCreationConfig,
     ) -> Result<(R::Entry, bool)> {
+        let session_id_hint = shared_types::SessionHint::classify(session_id_hint.as_deref())
+            .as_session_id()
+            .map(str::to_owned);
+        config.start_config.resume_session_id =
+            shared_types::SessionHint::classify(config.start_config.resume_session_id.as_deref())
+                .as_session_id()
+                .map(str::to_owned);
         let project_id_key = project_id.to_string();
         if let Some(hint) = session_id_hint.as_deref()
             && let Some(owner) = self.registry.get_project_by_session(hint)
@@ -211,9 +239,11 @@ where
             && let Some(ref hint_sid) = session_id_hint
             && let Some(existing) = self.registry.get_entry_by_session(hint_sid)
             && existing.project_id() == project_id
+            && require_session_identity(existing.session_id()).is_ok()
             && *existing.status() != AgentStatus::Terminating
             && !existing.is_channel_closed()
-            && !existing.is_model_config_changed(&config.model_provider)
+            && !self
+                .effective_model_changed(existing.model_provider(), config.model_provider.as_ref())
             && session_id_hint
                 .as_deref()
                 .is_none_or(|hint| existing.session_id().to_string() == hint)
@@ -225,13 +255,16 @@ where
             return Ok((existing, false));
         }
 
-        // Phase B：project entry 快速复用（Pending 占位符除外——它需要被替换）
+        // Phase B: process ownership remains observable, but only a real
+        // session identity may enter the prompt reuse path.
         if !config.force_new_session
             && let Some(existing) = self.registry.get(&project_id_key)
+            && require_session_identity(existing.session_id()).is_ok()
             && *existing.status() != AgentStatus::Pending
             && *existing.status() != AgentStatus::Terminating
             && !existing.is_channel_closed()
-            && !existing.is_model_config_changed(&config.model_provider)
+            && !self
+                .effective_model_changed(existing.model_provider(), config.model_provider.as_ref())
             && session_id_hint
                 .as_deref()
                 .is_none_or(|hint| existing.session_id().to_string() == hint)
@@ -310,14 +343,7 @@ where
         // launcher 自己处理 handshake deadline 并等待失败子进程退出。
         // 这里不再用同一 deadline 抢先 drop launcher，single-flight 保持到清理完成。
         let result = self
-            .create_session_leader_path(
-                project_id,
-                project_path,
-                config.model_provider,
-                config.start_config,
-                config.service_uuid,
-                config.force_new_session,
-            )
+            .create_session_leader_path(project_id, project_path, config)
             .await;
         guard.outcome = Some(result.clone());
         result.map_err(anyhow::Error::msg)
@@ -332,107 +358,19 @@ where
         &self,
         project_id: &str,
         project_path: PathBuf,
-        model_provider: Option<ModelProviderConfig>,
-        start_config: AgentStartConfig,
-        service_uuid: Option<String>,
-        force_new_session: bool,
+        config: SessionCreationConfig,
     ) -> Result<(R::Entry, bool), String> {
-        // 停旧（若需）：Pending 占位符（dummy 通道）跳过；通道死/模型变才停。
-        // model_changed 停旧是切模型正确性的关键：双 opencode 进程同时持有同一
-        // session 会导致新进程 prompt 立即 service failure（切模型场景实测）。
-        if let Some(existing) = self.registry.get(project_id) {
-            let session_id_str = existing.session_id().to_string();
-            let channel_closed = existing.is_channel_closed();
-            let model_changed = existing.is_model_config_changed(&model_provider);
-            let resume_changed = start_config
-                .resume_session_id
-                .as_deref()
-                .is_some_and(|hint| existing.session_id().to_string() != hint);
-            let stopping = *existing.status() == AgentStatus::Terminating;
-            if !force_new_session
-                && !channel_closed
-                && !model_changed
-                && !resume_changed
-                && !stopping
-            {
-                return Ok((existing, false));
-            }
-            if channel_closed {
-                info!(
-                    "⚠️ [SESSION] Session channel closed, rebuilding: project_id={}, old session_id={}",
-                    project_id, session_id_str
-                );
-            }
-            if model_changed || force_new_session || channel_closed || resume_changed || stopping {
-                info!(
-                    "🔄 [SESSION] Model config changed, restarting Agent session: project_id={}, old session_id={}",
-                    project_id, session_id_str
-                );
-                // 🔪 显式停止旧 Agent 进程（graceful_stop 内部 CAS 幂等）
-                if let Some(handle) = existing.lifecycle_handle() {
-                    let deadline = start_config.session_create_deadline.ok_or_else(|| {
-                        format!("session creation deadline missing for project {project_id}")
-                    })?;
-                    self.registry.update_agent_status_for_session(
-                        project_id,
-                        &session_id_str,
-                        None,
-                        AgentStatus::Terminating,
-                    );
-                    // stop 内部脱离调用者执行 TERM/KILL/reaper。预算耗尽不移除
-                    // registry，后续重试仍必须观察这一个旧执行并确认退出。
-                    tokio::time::timeout_at(deadline, async {
-                        handle.graceful_stop().await?;
-                        handle.wait_for_exit().await
-                    }).await
-                        .map_err(|_| format!("old agent exit deadline exceeded for project {project_id}, session {session_id_str}"))?
-                        .map_err(|error| format!("old agent exit unconfirmed for project {project_id}, session {session_id_str}: {error}"))?;
-                    info!(
-                        "[SESSION] old agent exited before rebuild: project_id={}, old session_id={}",
-                        project_id, session_id_str
-                    );
-                }
-            }
-        }
-
-        // 创建（spawn agent 进程 + 连接任务，阻塞至 session 就绪）
-        let new_session = self
-            .create_session_internal(
-                project_id.to_string(),
-                project_path,
-                model_provider,
-                start_config,
-                service_uuid,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-
-        // 全量提交（三 map：覆盖 Pending 占位符/死 entry，正反向映射一致）
-        let new_session_id = new_session.session_id().to_string();
-        if let Some(owner) = self.registry.get_project_by_session(&new_session_id)
-            && owner != project_id
-        {
-            if let Some(handle) = new_session.lifecycle_handle() {
-                handle
-                    .graceful_stop()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                handle
-                    .wait_for_exit()
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
-            return Err(format!(
-                "agent returned session {new_session_id} already owned by project {owner}"
-            ));
-        }
-        self.registry
-            .insert(project_id, &new_session_id, new_session.clone());
-        info!(
-            "✅ [SESSION] Session committed (single-flight leader): project_id={}, session_id={}",
-            project_id, new_session_id
-        );
-        Ok((new_session, true))
+        let reconciliation = config.start_config.clone();
+        let model_provider = config.model_provider.clone();
+        create_after_reconciliation(
+            self.registry.as_ref(),
+            project_id,
+            &model_provider,
+            &reconciliation,
+            config.force_new_session,
+            || self.create_session_internal(project_id.to_owned(), project_path, config),
+        )
+        .await
     }
 
     /// Follower 路径：subscribe 等 Leader 广播（CreateGuard drop 必 send 一次）。
@@ -476,9 +414,12 @@ where
             .map_err(anyhow::Error::msg)
             .and_then(|(entry, is_new)| {
                 // 复检：Leader 刚建好即死 / 并发请求模型配置不同（并发切模型）
-                if entry.is_channel_closed() || entry.is_model_config_changed(model_provider) {
+                if require_session_identity(entry.session_id()).is_err()
+                    || entry.is_channel_closed()
+                    || self.effective_model_changed(entry.model_provider(), model_provider.as_ref())
+                {
                     return Err(anyhow::anyhow!(
-                        "in-flight session outcome stale (dead channel or model mismatch), caller retry will lead: project_id={}",
+                        "in-flight session outcome stale (unusable identity, dead channel or model mismatch), caller retry will lead: project_id={}",
                         project_id
                     ));
                 }
@@ -486,6 +427,193 @@ where
             })
     }
 }
+
+/// Caller holds the project execution transition. Keeping the factory inside
+/// this sequence prevents a retry from spawning before the retained child exits.
+async fn create_after_reconciliation<R, F, Fut>(
+    registry: &R,
+    project_id: &str,
+    model_provider: &Option<ModelProviderConfig>,
+    start_config: &AgentStartConfig,
+    force_new_session: bool,
+    create: F,
+) -> Result<(R::Entry, bool), String>
+where
+    R: SessionRegistry,
+    R::Entry: Into<ProjectAndAgentInfo> + From<ProjectAndAgentInfo>,
+    F: FnOnce() -> Fut + Send,
+    Fut: Future<Output = Result<R::Entry>> + Send,
+{
+    // An unusable historical SID does not hide a physical execution.
+    // Retire that exact lifecycle before creating a usable replacement.
+    // model_changed 停旧是切模型正确性的关键：双 opencode 进程同时持有同一
+    // session 会导致新进程 prompt 立即 service failure（切模型场景实测）。
+    if let Some(existing) = registry.get(project_id) {
+        let session_id_str = existing.session_id().to_string();
+        let established = require_session_identity(existing.session_id()).is_ok();
+        let channel_closed = existing.is_channel_closed();
+        let model_changed =
+            effective_model_config_changed(existing.model_provider(), model_provider.as_ref());
+        let resume_changed = start_config
+            .resume_session_id
+            .as_deref()
+            .is_some_and(|hint| existing.session_id().to_string() != hint);
+        let stopping = *existing.status() == AgentStatus::Terminating;
+        if !force_new_session
+            && established
+            && !channel_closed
+            && !model_changed
+            && !resume_changed
+            && !stopping
+        {
+            return Ok((existing, false));
+        }
+        if channel_closed {
+            info!(
+                "⚠️ [SESSION] Session channel closed, rebuilding: project_id={}, old session_id={}",
+                project_id, session_id_str
+            );
+        }
+        if !established
+            || model_changed
+            || force_new_session
+            || channel_closed
+            || resume_changed
+            || stopping
+        {
+            if !channel_closed && existing.lifecycle_handle().is_none() {
+                return Err(format!(
+                    "Existing agent physical exit cannot be confirmed: lifecycle handle is missing for project {project_id}"
+                ));
+            }
+            info!(
+                "🔄 [SESSION] Model config changed, restarting Agent session: project_id={}, old session_id={}",
+                project_id, session_id_str
+            );
+            // 🔪 显式停止旧 Agent 进程（graceful_stop 内部 CAS 幂等）
+            if let Some(handle) = existing.lifecycle_handle() {
+                let deadline = start_config.session_create_deadline.ok_or_else(|| {
+                    format!("session creation deadline missing for project {project_id}")
+                })?;
+                registry.update_agent_status_for_session(
+                    project_id,
+                    &session_id_str,
+                    None,
+                    AgentStatus::Terminating,
+                );
+                // stop 内部脱离调用者执行 TERM/KILL/reaper。预算耗尽不移除
+                // registry，后续重试仍必须观察这一个旧执行并确认退出。
+                tokio::time::timeout_at(deadline, async {
+                        handle.graceful_stop().await?;
+                        handle.wait_for_exit().await
+                    }).await
+                        .map_err(|_| format!("old agent exit deadline exceeded for project {project_id}, session {session_id_str}"))?
+                        .map_err(|error| format!("old agent exit unconfirmed for project {project_id}, session {session_id_str}: {error}"))?;
+                info!(
+                    "[SESSION] old agent exited before rebuild: project_id={}, old session_id={}",
+                    project_id, session_id_str
+                );
+            }
+        }
+    }
+
+    let new_session = create().await.map_err(|error| error.to_string())?;
+    let new_session_id = new_session.session_id().to_string();
+    let registered_owner = registry.get_project_by_session(&new_session_id);
+    confirm_created_session_identity(
+        registry,
+        project_id,
+        &new_session,
+        registered_owner.as_deref(),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    registry.insert(project_id, &new_session_id, new_session.clone());
+    info!(
+        "[SESSION] Session committed after physical retirement: project_id={}, session_id={}",
+        project_id, new_session_id
+    );
+    Ok((new_session, true))
+}
+
+#[derive(Debug)]
+enum CreatedSessionRejection {
+    Retired(String),
+    ExitUnconfirmed(String),
+}
+
+impl std::fmt::Display for CreatedSessionRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retired(reason) | Self::ExitUnconfirmed(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+/// Retain a rejected factory's physical execution before any cleanup await.
+/// Cancellation or an unconfirmed exit leaves that exact execution observable
+/// to the next Start or Stop, without publishing its rejected session route.
+async fn confirm_created_session_identity<R: SessionRegistry>(
+    registry: &R,
+    project_id: &str,
+    entry: &R::Entry,
+    registered_owner: Option<&str>,
+) -> Result<(), CreatedSessionRejection>
+where
+    R::Entry: Into<ProjectAndAgentInfo> + From<ProjectAndAgentInfo>,
+{
+    let rejection = match require_session_identity(entry.session_id()) {
+        Err(error) => Some(error.to_string()),
+        Ok(()) => registered_owner
+            .filter(|owner| *owner != entry.project_id())
+            .map(|owner| {
+                format!(
+                    "agent returned session {} already owned by project {owner}",
+                    entry.session_id()
+                )
+            }),
+    };
+    let Some(rejection) = rejection else {
+        return Ok(());
+    };
+    let mut retained: ProjectAndAgentInfo = entry.clone().into();
+    retained.status = AgentStatus::Terminating;
+    // Raw entry only: no SID index may be written or a foreign route replaced.
+    // This synchronous write precedes even graceful_stop's first poll.
+    drop(
+        registry
+            .entry(project_id.to_owned())
+            .insert(retained.into()),
+    );
+    let handle = entry.lifecycle_handle().ok_or_else(|| {
+        CreatedSessionRejection::ExitUnconfirmed(format!(
+            "{rejection}; child exit unconfirmed: lifecycle handle is missing"
+        ))
+    })?;
+    handle.graceful_stop().await.map_err(|error| {
+        CreatedSessionRejection::ExitUnconfirmed(format!(
+            "{rejection}; child exit unconfirmed while stopping: {error}"
+        ))
+    })?;
+    handle.wait_for_exit().await.map_err(|error| {
+        CreatedSessionRejection::ExitUnconfirmed(format!(
+            "{rejection}; child exit unconfirmed while reaping: {error}"
+        ))
+    })?;
+    // Same SID can identify a newer execution. Retire only the raw entity
+    // whose exit was observed, leaving replacement entities and routes intact.
+    if let dashmap::mapref::entry::Entry::Occupied(current) = registry.entry(project_id.to_owned())
+        && current.get().session_id() == entry.session_id()
+        && current.get().cancel_tx().same_channel(entry.cancel_tx())
+        && current.get().prompt_tx().same_channel(entry.prompt_tx())
+    {
+        current.remove();
+    }
+    Err(CreatedSessionRejection::Retired(rejection))
+}
+
+#[cfg(test)]
+mod identity_tests;
 
 /// follower 等待 leader 的额外宽限（leader 的 CreateGuard drop 必先广播，
 /// follower 不应先超时——宽限覆盖 leader 提交/清理的尾部耗时）

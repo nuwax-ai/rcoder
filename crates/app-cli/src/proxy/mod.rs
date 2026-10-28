@@ -3,6 +3,7 @@
 pub mod admin_probe;
 pub mod apply_status;
 pub(crate) mod capabilities;
+pub(crate) mod command_path;
 pub mod compiler;
 pub(crate) mod config_source;
 pub(crate) mod observation;

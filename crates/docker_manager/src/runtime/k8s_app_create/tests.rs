@@ -511,7 +511,13 @@ mod conditional_tests {
     #[tokio::test]
     async fn hot_env_commit_sends_resource_version_and_preserves_conflict() {
         use container_runtime_api::UserAppDeploymentRuntime;
-        for conflict in [false, true] {
+        for (conflict, captured_uid) in [
+            (false, Some("hot-env-uid")),
+            (true, Some("hot-env-uid")),
+            (false, None),
+            (false, Some("replaced-env-uid")),
+        ] {
+            let replaced = captured_uid == Some("replaced-env-uid");
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind");
@@ -528,7 +534,13 @@ mod conditional_tests {
             ]);
             let desired = target.clone();
             let server = tokio::spawn(async move {
-                for step in 0..if conflict { 3 } else { 5 } {
+                for step in 0..if replaced {
+                    2
+                } else if conflict {
+                    3
+                } else {
+                    5
+                } {
                     let (mut stream, _) = listener.accept().await.expect("accept");
                     let mut bytes = Vec::new();
                     let mut buffer = [0u8; 4096];
@@ -577,7 +589,7 @@ mod conditional_tests {
                             (
                                 200,
                                 serde_json::json!({"apiVersion":"v1","kind":"ConfigMap",
-                                "metadata":{"name":"hot-env","resourceVersion":if step == 1 {"42"} else {"43"}},
+                                "metadata":{"name":"hot-env","uid":"hot-env-uid","resourceVersion":if step == 1 {"42"} else {"43"}},
                                 "data": if step == 1 {serde_json::json!({"OLD_IDENTITY":"stale"})} else {serde_json::json!(desired)}}),
                             )
                         }
@@ -619,13 +631,14 @@ mod conditional_tests {
                 deployment_uid: Some("deployment-owned".into()),
                 deployment_version: Some("10".into()),
                 resource_name: Some("hot-env".into()),
+                resource_uid: captured_uid.map(str::to_owned),
                 resource_version: Some("42".into()),
                 env: std::collections::HashMap::from([("OLD_IDENTITY".into(), "stale".into())]),
             };
             let result = runtime
                 .update_env_configmap_if_version("hot", &target, &snapshot)
                 .await;
-            if conflict {
+            if conflict || replaced {
                 assert!(
                     matches!(result, Err(ContainerRuntimeError::Conflict(_))),
                     "{result:?}"

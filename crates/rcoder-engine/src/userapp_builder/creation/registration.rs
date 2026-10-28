@@ -62,10 +62,23 @@ pub(super) async fn attach_predecessor(
     {
         return Ok(evidence);
     }
-    let volumes = state
-        .runtime()
-        .capture_builder_compute_volumes(&evidence.target)
-        .await?;
+    // The create receipt has already returned under its own observation budget.
+    // Bound this separate read so a stalled API cannot retain the scanner slot
+    // and this application's local recovery lock indefinitely. No write or
+    // checkpoint is submitted until the unchanged identity checks below pass.
+    let volumes = tokio::time::timeout(
+        RUNTIME_OBSERVATION_TIMEOUT,
+        state
+            .runtime()
+            .capture_builder_compute_volumes(&evidence.target),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "Builder replacement volume observation deadline exceeded (app={}, operation={})",
+            operation.app_id, operation.operation_id
+        )
+    })??;
     source
         .validate_replacement(&evidence.target, &volumes)
         .map_err(anyhow::Error::msg)?;

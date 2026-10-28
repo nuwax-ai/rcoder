@@ -56,7 +56,7 @@ use agent_client_protocol::schema::v1::{ContentBlock, PromptRequest, SessionId, 
 use agent_config::PromptBuilder;
 use anyhow::Result;
 use dashmap::DashMap;
-use shared_types::{ProjectAndAgentInfo, SessionEntry};
+use shared_types::{ModelProviderConfig, ProjectAndAgentInfo, SessionEntry};
 use tracing::{debug, error, info};
 
 use crate::PromptMessage;
@@ -67,13 +67,60 @@ use crate::traits::{
     YoloPermissionRequestHandler,
 };
 
+/// Preparation state and an absent ID are never ACP routing identities.
+pub(crate) fn require_session_identity(session_id: &SessionId) -> Result<()> {
+    match shared_types::SessionHint::classify(Some(session_id.0.as_ref())) {
+        shared_types::SessionHint::Established(_) => Ok(()),
+        shared_types::SessionHint::Absent => {
+            anyhow::bail!("ACP session response did not contain a session ID")
+        }
+        shared_types::SessionHint::LegacyPending => {
+            anyhow::bail!(
+                "ACP session response contained a preparation state instead of a session ID"
+            )
+        }
+    }
+}
+
+/// 比较实际执行使用的模型配置；provider id 是身份，不是内容版本。
+/// direct 环境及代理 UUID 绑定都会保留本代次的 endpoint/凭据，因此两种模式
+/// 的轮换都需要沿既有受控停旧、确认退出、再建流程生效。
+pub(crate) fn effective_model_config_changed(
+    existing: Option<&ModelProviderConfig>,
+    new: Option<&ModelProviderConfig>,
+) -> bool {
+    let (Some(existing), Some(new)) = (existing, new) else {
+        return existing.is_some() != new.is_some();
+    };
+    let common = (
+        &existing.default_model,
+        &existing.name,
+        existing.requires_openai_auth,
+        &existing.api_protocol,
+        &existing.wire_api,
+    ) == (
+        &new.default_model,
+        &new.name,
+        new.requires_openai_auth,
+        &new.api_protocol,
+        &new.wire_api,
+    );
+    if !common {
+        return true;
+    }
+    (&existing.base_url, &existing.api_key) != (&new.base_url, &new.api_key)
+}
+
 /// 会话创建使用的运行配置。模型与其 UUID、agent 启动配置及 Fresh 策略一起传递。
 #[derive(Clone)]
 pub struct SessionCreationConfig {
-    pub model_provider: Option<shared_types::ModelProviderConfig>,
+    pub model_provider: Option<ModelProviderConfig>,
     pub start_config: AgentStartConfig,
     pub service_uuid: Option<String>,
     pub force_new_session: bool,
+    /// 只有实际代理进程启动才向共享表写入配置，由 reaper 确认退出后清理。
+    pub api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
+    pub project_uuid_map: Option<Arc<DashMap<String, String>>>,
 }
 
 /// ACP 会话管理器 (SACP 版本)
@@ -238,6 +285,7 @@ where
         prompt: &PromptMessage,
         session_id: SessionId,
     ) -> Result<PromptRequest> {
+        require_session_identity(&session_id)?;
         // 构建纯用户提示词
         let final_prompt = if prompt.data_source_attachments.is_empty() {
             PromptBuilder::build_user_prompt(&prompt.content)
@@ -277,6 +325,7 @@ where
         session_id: SessionId,
         attachment_blocks: Vec<ContentBlock>,
     ) -> Result<PromptRequest> {
+        require_session_identity(&session_id)?;
         // 构建纯用户提示词
         let final_prompt = if prompt.data_source_attachments.is_empty() {
             PromptBuilder::build_user_prompt(&prompt.content)
@@ -318,17 +367,7 @@ where
 
         let prompt_request = Self::build_text_prompt_request(prompt, session.session_id().clone())?;
 
-        session
-            .prompt_tx()
-            .send(prompt_request)
-            .await
-            .map_err(|e| {
-                error!("send Prompt requestfailed: {:?}", e);
-                anyhow::anyhow!("Failed to send Prompt request: {:?}", e)
-            })?;
-
-        info!("Prompt request already sent, project ID: {}", project_id);
-        Ok(())
+        self.send_prompt_request(project_id, prompt_request).await
     }
 
     /// 发送 Prompt 请求到指定会话
@@ -343,6 +382,22 @@ where
             .get_session(project_id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", project_id))?;
 
+        require_session_identity(session.session_id())?;
+        require_session_identity(&prompt_request.session_id)?;
+        anyhow::ensure!(
+            *session.status() != shared_types::AgentStatus::Terminating,
+            "Agent execution is stopping; session recovery must confirm its exit before dispatch"
+        );
+        anyhow::ensure!(
+            *session.session_id() == prompt_request.session_id,
+            "Prompt session ID does not match the current project execution"
+        );
+        anyhow::ensure!(
+            self.registry
+                .get_project_by_session(session.session_id().0.as_ref())
+                .is_none_or(|owner| owner == project_id),
+            "Session belongs to a different project"
+        );
         send_prompt_to_entry(&session, prompt_request)
             .await
             .map_err(|e| {

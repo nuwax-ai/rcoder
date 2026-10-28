@@ -172,6 +172,29 @@ pub fn extract_context_http(headers: &http::HeaderMap) -> Context {
     cx
 }
 
+/// 请求头摘要（仅用于低敏感排障头）：缺失记 absent，空值记 empty，
+/// 非法 UTF-8 记 <non-utf8>，其余记原值。凭据类头不走此处，见
+/// [`credential_header_presence`]。
+fn header_summary(headers: &http::HeaderMap, name: &str) -> String {
+    match headers.get(name) {
+        None => "absent".to_string(),
+        Some(value) => match value.to_str() {
+            Ok(text) if text.is_empty() => "empty".to_string(),
+            Ok(text) => text.to_string(),
+            Err(_) => "<non-utf8>".to_string(),
+        },
+    }
+}
+
+/// 凭据类请求头只记存在性：值含 API key / token，不落日志。
+fn credential_header_presence(headers: &http::HeaderMap, name: &str) -> &'static str {
+    if headers.contains_key(name) {
+        "present"
+    } else {
+        "absent"
+    }
+}
+
 /// tower_http TraceLayer 的 make_span_with 用 span 构造器：请求 span 继承
 /// 入站 W3C traceparent 指定的远端父上下文（e2e/上游注入 trace 贯通）；
 /// 无 header 或格式非法时退化为根 span（与原 TraceLayer 行为一致）。
@@ -182,6 +205,11 @@ pub fn make_span_with_trace_parent<B>(req: &http::Request<B>) -> tracing::Span {
     use opentelemetry::trace::TraceContextExt;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+    // span 宏以 Display 即时格式化字段值，摘要先取局部变量保证存活到宏结束
+    let accept_language = header_summary(req.headers(), "accept-language");
+    let content_type = header_summary(req.headers(), "content-type");
+    let user_agent = header_summary(req.headers(), "user-agent");
+    let x_forwarded_for = header_summary(req.headers(), "x-forwarded-for");
     let span = tracing::info_span!(
         "http_request",
         method = %req.method(),
@@ -190,6 +218,14 @@ pub fn make_span_with_trace_parent<B>(req: &http::Request<B>) -> tracing::Span {
         // OTel layer——OTLP 关闭时 set_parent 的 context 不生效，但 span
         // field 始终可读）。OTLP 开启时额外 set_parent 做全链路 export。
         trace_id = tracing::field::Empty,
+        // 排障归因用的关键请求头（语言/内容类型/客户端/代理链路）；
+        // 凭据类头只记存在性，值不落日志
+        accept_language = %accept_language,
+        content_type = %content_type,
+        user_agent = %user_agent,
+        x_forwarded_for = %x_forwarded_for,
+        api_key = credential_header_presence(req.headers(), "x-api-key"),
+        authorization = credential_header_presence(req.headers(), "authorization"),
     );
     // 无上游 traceparent 时合成（见 remote_context_or_synthesized）——
     // 日志 field、OTel span、注入的 traceparent、Tempo 四处同一 id。
@@ -246,6 +282,30 @@ pub fn set_global_propagator() {
 mod tests {
     use super::*;
     use opentelemetry::trace::TraceContextExt;
+
+    #[test]
+    fn header_summary_marks_absent_empty_and_non_utf8() {
+        let mut headers = http::HeaderMap::new();
+        assert_eq!(header_summary(&headers, "accept-language"), "absent");
+        headers.insert("accept-language", "".parse().unwrap());
+        assert_eq!(header_summary(&headers, "accept-language"), "empty");
+        // http 允许 >=0x80 的字节进入 header value；to_str 会失败
+        headers.insert(
+            "accept-language",
+            http::HeaderValue::from_bytes(&[0xFF, 0xFE]).unwrap(),
+        );
+        assert_eq!(header_summary(&headers, "accept-language"), "<non-utf8>");
+        headers.insert("accept-language", "zh-CN".parse().unwrap());
+        assert_eq!(header_summary(&headers, "accept-language"), "zh-CN");
+    }
+
+    #[test]
+    fn credential_header_presence_only_reports_existence() {
+        let mut headers = http::HeaderMap::new();
+        assert_eq!(credential_header_presence(&headers, "x-api-key"), "absent");
+        headers.insert("x-api-key", "secret-value".parse().unwrap());
+        assert_eq!(credential_header_presence(&headers, "x-api-key"), "present");
+    }
 
     #[test]
     fn test_metadata_injector_extractor() {
@@ -450,5 +510,65 @@ mod synth_trace_tests {
         // W3C: 00-{32 hex trace id}-{16 hex span id}-{flags}
         assert_eq!(tp.len(), 55, "traceparent 应写入有效值: {tp:?}");
         assert_eq!(&tp[3..35], logged, "注入 traceparent 与日志 trace_id 分叉");
+    }
+
+    /// 请求 span 的关键 header 字段随事件写入日志 JSON；凭据头只记
+    /// 存在性，值不得出现在日志任何位置。
+    #[test]
+    fn http_request_span_records_key_headers_without_credentials() {
+        let dir = std::env::temp_dir().join(format!("rcoder-b2-hdr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let appender = Builder::new()
+            .rotation(Rotation::NEVER)
+            .filename_prefix("hdr-test.log")
+            .build(&dir)
+            .unwrap();
+
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("hdr-test");
+        let subscriber = tracing_subscriber::registry()
+            .with(TraceIdExtractor)
+            .with(EnvFilter::new("debug"))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .event_format(TraceIdJsonFormat)
+                    .with_writer(appender)
+                    .with_ansi(false),
+            )
+            .with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let req = http::Request::builder()
+                .uri("/computer/pod/ensure")
+                .header("accept-language", "zh-CN,zh;q=0.9")
+                .header("user-agent", "Java/17.0.12")
+                .header("x-api-key", "secret-api-key-value")
+                .body(())
+                .unwrap();
+            let span = make_span_with_trace_parent(&req);
+            let _guard = span.enter();
+            tracing::warn!(target: "rcoder::b2", "hdr probe");
+        });
+
+        let written = std::fs::read_to_string(dir.join("hdr-test.log")).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        // 文件含多条 JSON 行（Propagation debug 行等）；取探针事件所在行
+        let probe_line = written
+            .lines()
+            .find(|l| l.contains("hdr probe"))
+            .expect("探针事件未写入日志");
+        let obj: serde_json::Value = serde_json::from_str(probe_line).unwrap();
+        let span = &obj["span"];
+        assert_eq!(span["accept_language"], serde_json::json!("zh-CN,zh;q=0.9"));
+        assert_eq!(span["user_agent"], serde_json::json!("Java/17.0.12"));
+        // 未设置的头记 absent
+        assert_eq!(span["x_forwarded_for"], serde_json::json!("absent"));
+        // 凭据头只记存在性，值不得出现在日志
+        assert_eq!(span["api_key"], serde_json::json!("present"));
+        assert!(
+            !probe_line.contains("secret-api-key-value"),
+            "凭据值泄露进日志"
+        );
     }
 }

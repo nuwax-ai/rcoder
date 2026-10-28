@@ -24,7 +24,9 @@ pub struct CapturedSessionCleanup {
 
 impl CapturedSessionCleanup {
     pub fn capture(session_id: &str, request_id: Option<String>) -> Self {
-        let data = SESSION_CACHE.view(session_id, |_, data| data.clone());
+        let data = shared_types::SessionHint::classify(Some(session_id))
+            .as_session_id()
+            .and_then(|sid| SESSION_CACHE.view(sid, |_, data| data.clone()));
         let connection_ids = data
             .as_ref()
             .map(|data| data.capture_connection_ids())
@@ -147,16 +149,12 @@ pub async fn cleanup_session_full(
 
 pub async fn remove_agent_and_cleanup(
     project_id: &str,
-    expected_session_id: &str,
+    target: &shared_types::ProjectAndAgentInfo,
 ) -> anyhow::Result<bool> {
-    let target = AGENT_REGISTRY
-        .view_agent_info(project_id, |info| {
-            (info.session_id.to_string() == expected_session_id).then(|| info.clone())
-        })
-        .flatten();
-    let Some(target) = target else {
-        return Ok(false);
-    };
+    anyhow::ensure!(
+        target.project_id == project_id,
+        "captured execution belongs to a different project"
+    );
     if let Some(handle) = &target.stop_handle {
         handle.graceful_stop().await?;
         handle.wait_for_exit().await?;
@@ -166,7 +164,7 @@ pub async fn remove_agent_and_cleanup(
     Ok(AGENT_REGISTRY
         .remove_by_project_if_session_and_channel_matches(
             project_id,
-            expected_session_id,
+            target.session_id.0.as_ref(),
             &target.cancel_tx,
         )
         .is_some())

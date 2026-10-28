@@ -485,6 +485,7 @@ pub async fn preview_contract(url: String) -> Result<()> {
         operation_id: format!("operation{id}"),
         instance_id: format!("instance{id}"),
         requested_port,
+        base_path: None,
         recover_unknown_evidence: None,
     };
     let (left, right) = tokio::join!(

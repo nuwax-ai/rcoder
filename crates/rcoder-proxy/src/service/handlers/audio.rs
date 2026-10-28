@@ -165,11 +165,7 @@ pub async fn handle_audio_upstream(
     ctx.vnc_target_ip = Some(container_ip.clone());
 
     let peer_addr = super::super::upstream::dial_addr(&container_ip, target_port)?;
-    let mut peer = Box::new(HttpPeer::new(
-        super::super::upstream::dial_peer(&container_ip, target_port)?,
-        false,          // 不使用 TLS
-        "".to_string(), // SNI
-    ));
+    let mut peer = Box::new(super::super::upstream::dial_peer(&container_ip, target_port).await?);
 
     // 音频流长连接优化配置
     // 音频流可能持续数小时，需要宽松的超时设置（idle 1 小时）

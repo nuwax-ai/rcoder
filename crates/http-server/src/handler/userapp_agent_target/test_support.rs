@@ -33,11 +33,18 @@ pub(crate) enum AgentCall {
     Progress(ProgressRequest),
 }
 
+type StopCallback = Box<dyn FnOnce() -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+
 #[derive(Default)]
 pub(crate) struct ProtocolAgent {
     pub(crate) calls: Mutex<Vec<AgentCall>>,
     pub(crate) sessions: Mutex<BTreeMap<String, String>>,
     pub(crate) events: Mutex<BTreeMap<String, Vec<ProgressEvent>>>,
+    /// Optional protocol fault boundary: the RPC is accepted, but its response
+    /// has not reached the HTTP handler's completion registration yet.
+    pub(crate) after_chat: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// The captured execution has stopped, but its RPC response is held back.
+    pub(crate) after_stop: Mutex<Option<StopCallback>>,
     sequence: AtomicUsize,
 }
 
@@ -66,6 +73,11 @@ impl agent_service_server::AgentService for ProtocolAgent {
                 })
         };
         sessions.insert(request.project_id.clone(), sid.clone());
+        drop(sessions);
+        let after_chat = self.after_chat.lock().unwrap().take();
+        if let Some(after_chat) = after_chat {
+            after_chat();
+        }
         Ok(Response::new(ChatResponse {
             success: true,
             project_id: request.project_id,
@@ -177,20 +189,26 @@ impl agent_service_server::AgentService for ProtocolAgent {
             .lock()
             .unwrap()
             .push(AgentCall::Stop(request.clone()));
-        let mut sessions = self.sessions.lock().unwrap();
-        if request
-            .expected_session_id
-            .as_ref()
-            .is_some_and(|sid| sessions.get(&request.project_id) != Some(sid))
-        {
-            return Ok(Response::new(StopAgentResponse {
-                success: false,
-                result: "session_mismatch".into(),
-                message: None,
-                project_id: request.project_id,
-            }));
+        let found = {
+            let mut sessions = self.sessions.lock().unwrap();
+            if request
+                .expected_session_id
+                .as_ref()
+                .is_some_and(|sid| sessions.get(&request.project_id) != Some(sid))
+            {
+                return Ok(Response::new(StopAgentResponse {
+                    success: false,
+                    result: "session_mismatch".into(),
+                    message: None,
+                    project_id: request.project_id,
+                }));
+            }
+            sessions.remove(&request.project_id).is_some()
+        };
+        let after_stop = self.after_stop.lock().unwrap().take();
+        if let Some(after_stop) = after_stop {
+            after_stop().await;
         }
-        let found = sessions.remove(&request.project_id).is_some();
         Ok(Response::new(StopAgentResponse {
             success: found,
             result: if found { "stopped" } else { "not_found" }.into(),
@@ -408,8 +426,7 @@ impl Fixture {
             .await
             .unwrap(),
         );
-        let (adapter, _) =
-            crate::storage::ProjectAdapter::new("test-ns".into(), "cluster.local".into());
+        let adapter = crate::storage::ProjectAdapter::new("test-ns".into(), "cluster.local".into());
         let projects = Arc::new(crate::storage::ProjectStoreBackend::Memory(Arc::new(
             adapter,
         )));
@@ -438,7 +455,7 @@ impl Fixture {
             container_prefix_rcoder: "fixture-web".into(),
             container_prefix_computer: "fixture-computer".into(),
             runtime: runtime.clone(),
-            cleanup_rx: Arc::new(Mutex::new(None)),
+
             agent_download_manager: Arc::new(
                 agent_provisioning::AgentDownloadManager::new(root.path()).unwrap(),
             ),
@@ -446,6 +463,8 @@ impl Fixture {
             activity,
             cluster_domain: "cluster.local".into(),
         });
+        let builder = runtime.builder.lock().unwrap().as_ref().unwrap().clone();
+        bind_protocol_target(&state, &builder).await;
         Self {
             state,
             store,
@@ -482,4 +501,36 @@ impl Fixture {
             .insert(project_id.into(), sid.into());
         binding
     }
+}
+
+/// Keep the production Service-FQDN key while connecting the real loopback
+/// tonic fixture. This isolates DNS from metadata/acceptance/SSE unit tests;
+/// deployed K8s E2E still exercises real Service discovery and routing.
+pub(crate) async fn bind_protocol_target(
+    state: &crate::app_state::AppState,
+    container: &ContainerBasicInfo,
+) {
+    #[cfg(all(feature = "kubernetes", not(feature = "deploy-host")))]
+    {
+        let authority = shared_types::build_grpc_addr(
+            &container.container_name,
+            &container.container_ip,
+            &state.config.app_manager.namespace,
+            &state.cluster_domain,
+        )
+        .expect("fixture production authority");
+        let endpoint = format!("http://127.0.0.1:{}", shared_types::GRPC_DEFAULT_PORT);
+        let channel = tonic::transport::Channel::from_shared(endpoint)
+            .unwrap()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .connect()
+            .await
+            .expect("real fixture tonic connection");
+        state
+            .grpc_pool
+            .bind_protocol_fixture_channel(authority, channel)
+            .await;
+    }
+    #[cfg(not(all(feature = "kubernetes", not(feature = "deploy-host"))))]
+    let _ = (state, container);
 }

@@ -1,8 +1,86 @@
 use super::*;
+use crate::runtime::k8s_pod::K8sPodOps;
 
 #[cfg(feature = "kubernetes")]
 #[async_trait]
 impl AgentContainerRuntime for KubernetesRuntime {
+    fn agent_workload_namespace(&self) -> String {
+        self.namespace.clone()
+    }
+    fn agent_workload_name(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<String> {
+        self.pod_name(identifier, service_type)
+    }
+    async fn agent_resource_inventory(
+        &self,
+    ) -> ContainerRuntimeResult<Vec<container_runtime_api::AgentStopSnapshot>> {
+        self.agent_retirement_inventory().await
+    }
+    async fn capture_agent_stop(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentStopSnapshot> {
+        self.capture_agent_retirement(identifier, service_type)
+            .await
+    }
+    async fn agent_compute_absent(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        registered: &ContainerBasicInfo,
+    ) -> ContainerRuntimeResult<bool> {
+        self.observe_agent_compute_absence(identifier, service_type, registered)
+            .await
+    }
+    async fn stop_captured_agent(
+        &self,
+        snapshot: &container_runtime_api::AgentStopSnapshot,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentStopOutcome> {
+        self.retire_agent_snapshot(snapshot, false).await
+    }
+    async fn retire_agent_remnants(
+        &self,
+        snapshot: &container_runtime_api::AgentStopSnapshot,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentStopOutcome> {
+        self.retire_agent_snapshot(snapshot, true).await
+    }
+    async fn refresh_agent_retirement_fence(
+        &self,
+        snapshot: &container_runtime_api::AgentStopSnapshot,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentStopSnapshot> {
+        self.fence_agent_snapshot(snapshot).await
+    }
+    async fn agent_resource_events(
+        &self,
+        shutdown: tokio_util::sync::CancellationToken,
+        interval: std::time::Duration,
+    ) -> ContainerRuntimeResult<container_runtime_api::AgentResourceEvents> {
+        Ok(self.watch_agent_resources(shutdown, interval))
+    }
+    async fn stop_agent_container_if_matches(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        expected_container_id: &str,
+    ) -> ContainerRuntimeResult<()> {
+        self.stop_captured_agent_workload(identifier, service_type, expected_container_id)
+            .await
+    }
+
+    async fn verify_agent_replacement(
+        &self,
+        params: &ContainerCreateParams,
+        previous: Option<&ContainerBasicInfo>,
+        replacement: &ContainerBasicInfo,
+    ) -> ContainerRuntimeResult<container_runtime_api::VerifiedAgentReplacement> {
+        self.verify_agent_registration_replacement(params, previous, replacement)
+            .await
+    }
+
     async fn stop_idle_builder_compute(
         &self,
         identifier: &str,
@@ -117,6 +195,13 @@ impl AgentContainerRuntime for KubernetesRuntime {
             .await
     }
 
+    async fn verify_absent_builder_recovery(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<bool> {
+        self.verify_absent_retained_builder(context).await
+    }
+
     async fn recover_builder_creation(
         &self,
         context: &shared_types::UserAppExecutionContext,
@@ -142,6 +227,14 @@ impl AgentContainerRuntime for KubernetesRuntime {
             target: receipt.target,
             container,
         }))
+    }
+
+    async fn observe_unbound_builder_creation_authority(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<container_runtime_api::UnboundBuilderCreationAuthority> {
+        self.observe_unbound_builder_creation_authority(context)
+            .await
     }
 
     async fn capture_builder_orphan_stop(
@@ -181,6 +274,31 @@ impl AgentContainerRuntime for KubernetesRuntime {
         context: &shared_types::UserAppExecutionContext,
     ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
         self.capture_builder_compute(context).await
+    }
+
+    async fn builder_compute_absent(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<bool> {
+        context
+            .validate_identity(&context.app_id)
+            .map_err(ContainerRuntimeError::ConfigurationError)?;
+        let name = self.pod_name(&context.app_id, &ServiceType::UserappBuilder)?;
+        if self
+            .statefulsets()
+            .get_opt(&name)
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::K8sError(format!(
+                    "Observe absent builder controller: {error}"
+                ))
+            })?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        self.confirm_builder_compute_absent(context).await?;
+        Ok(true)
     }
 
     async fn exec_builder_control_target(
@@ -277,6 +395,13 @@ impl AgentContainerRuntime for KubernetesRuntime {
         self.observe_retained_builder_stopped(target).await
     }
 
+    async fn observe_builder_compute_running(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        self.observe_retained_builder_running(target).await
+    }
+
     fn supports_builder_compute_fencing(&self) -> bool {
         true
     }
@@ -327,7 +452,25 @@ impl AgentContainerRuntime for KubernetesRuntime {
     ) -> ContainerRuntimeResult<ContainerBasicInfo> {
         params.validate_execution_context()?;
         let captured = if params.service_type == ServiceType::UserappBuilder {
-            self.capture_builder_reuse_snapshot(&params).await?
+            match self.capture_builder_reuse_snapshot(&params).await {
+                Ok(captured) => captured,
+                Err(error)
+                    if params.retained_storage.is_some()
+                        && matches!(error, ContainerRuntimeError::Conflict(_)) =>
+                {
+                    None
+                }
+                Err(error) => {
+                    return Err(ContainerRuntimeError::CreationAborted {
+                        progress: container_runtime_api::CreationProgress {
+                            failed_at: container_runtime_api::CreationStage::Capture,
+                            definitive_rejection: error.is_definitive_rejection(),
+                            retained_idempotent_resources: Vec::new(),
+                        },
+                        source: Box::new(error),
+                    });
+                }
+            }
         } else {
             None
         };
@@ -369,6 +512,17 @@ impl AgentContainerRuntime for KubernetesRuntime {
             let context = params.execution_context.clone();
             let binding = params.resource_binding.clone();
             return tokio::spawn(async move {
+                if let Some(storage) = &params.retained_storage {
+                    let context = params.execution_context.as_ref().ok_or_else(|| ContainerRuntimeError::ConfigurationError("Storage recovery operation missing".into()))?;
+                    if let Err(error) = runtime.recover_retained_storage(context, storage).await {
+                        let progress = container_runtime_api::CreationProgress {
+                            failed_at: container_runtime_api::CreationStage::StorageClaim,
+                            definitive_rejection: error.is_definitive_rejection(),
+                            retained_idempotent_resources: storage.volumes.iter().map(|v|format!("retained PVC {} uid={}",v.name,v.uid)).collect(),
+                        };
+                        return crate::runtime::builder_completion::finish(lease, Err(ContainerRuntimeError::CreationAborted {progress,source:Box::new(error)})).await;
+                    }
+                }
                 let observed = match runtime.capture_builder_reuse_snapshot(&params).await {
                     Ok(observed) => observed,
                     Err(error) => return crate::runtime::builder_completion::finish(lease, Err(error)).await,
@@ -391,6 +545,19 @@ impl AgentContainerRuntime for KubernetesRuntime {
                         return crate::runtime::builder_completion::finish(lease,
                             Err(ContainerRuntimeError::ConfigurationError("builder reuse capture missing".into()))).await;
                     };
+                    // Reuse bypasses create_agent_container_with_creation_receipt.
+                    // Fence every retained stable resource under this original
+                    // builder lease before an old orphan DELETE can reach it.
+                    let fencing = async {
+                        let previous = runtime.capture_agent_retirement(
+                            &captured.target.context.app_id, &ServiceType::UserappBuilder,
+                        ).await?;
+                        runtime.fence_agent_snapshot(&previous).await?;
+                        Ok::<_, ContainerRuntimeError>(())
+                    }.await;
+                    if let Err(error) = fencing {
+                        return crate::runtime::builder_completion::finish(lease, Err(error)).await;
+                    }
                     runtime
                         .resume_captured_builder(&params, captured.clone())
                         .await
@@ -507,6 +674,23 @@ impl AgentContainerRuntime for KubernetesRuntime {
         service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
         self.find_container_inner(identifier, service_type).await
+    }
+
+    async fn find_container_for_ensure(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
+        if matches!(
+            service_type,
+            ServiceType::WebAgentRunner
+                | ServiceType::ComputerAgentRunner
+                | ServiceType::ComputerNormalProject
+        ) {
+            self.find_container_uncached(identifier, service_type).await
+        } else {
+            self.find_container_inner(identifier, service_type).await
+        }
     }
 
     async fn stop_container(&self, project_id: &str) -> ContainerRuntimeResult<()> {

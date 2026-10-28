@@ -157,6 +157,12 @@ impl PgStore {
         &self,
         session_id: &str,
     ) -> Result<Option<(Binding, Session)>> {
+        if shared_types::SessionHint::classify(Some(session_id))
+            .as_session_id()
+            .is_none()
+        {
+            return Ok(None);
+        }
         let sid = session_id.to_owned();
         database::read(&self.database, move |tx| Box::pin(async move {
             let Some(row) = models::UserAppAgentSession::filter_by_session_id(&sid).first().exec(tx).await? else { return Ok(None); };
@@ -184,6 +190,12 @@ impl PgStore {
         deadline: tokio::time::Instant,
         expected_app_project_generation: &str,
     ) -> Result<Binding> {
+        ensure!(
+            shared_types::SessionHint::classify(Some(session_id))
+                .as_session_id()
+                .is_some(),
+            "An established session identity is required"
+        );
         let app_id = owner.app_id.clone();
         let sid = session_id.to_owned();
         let expected = expected_app_project_generation.to_owned();

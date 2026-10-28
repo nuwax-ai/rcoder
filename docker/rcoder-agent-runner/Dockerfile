@@ -168,6 +168,8 @@ RUN chmod +x /usr/local/bin/fix-ime
 COPY audio_server.py /usr/local/bin/audio_server.py
 COPY audio_static /usr/local/share/audio_static
 RUN chmod +x /usr/local/bin/audio_server.py
+# 构建期门禁: 随镜像的音频脚本必须可编译 (pcmflux API 契约漂移曾使其启动即 ImportError)
+RUN python3 -m py_compile /usr/local/bin/audio_server.py
 
 # 复制 MCP 配置文件（用于容器启动时的共享 MCP 代理服务）
 COPY mcp /etc/mcp

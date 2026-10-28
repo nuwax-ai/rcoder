@@ -29,6 +29,8 @@ pub struct WorkerRequest {
     pub service_uuid: Option<String>,
     /// 🔥 共享的 API 密钥管理器（用于自动清理）
     pub shared_api_key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,
+    /// 存活代理进程的 project_id → service_uuid 绑定。
+    pub project_uuid_map: Option<Arc<DashMap<String, String>>>,
 }
 
 impl WorkerRequest {
@@ -40,6 +42,7 @@ impl WorkerRequest {
             attachment_blocks: None,
             service_uuid: None,
             shared_api_key_manager: None,
+            project_uuid_map: None,
         }
     }
 
@@ -50,6 +53,11 @@ impl WorkerRequest {
     }
 
     /// 设置 shared_api_key_manager
+    pub fn with_project_uuid_map(mut self, map: Arc<DashMap<String, String>>) -> Self {
+        self.project_uuid_map = Some(map);
+        self
+    }
+
     pub fn with_key_manager(
         mut self,
         key_manager: Option<Arc<DashMap<String, ModelProviderConfig>>>,

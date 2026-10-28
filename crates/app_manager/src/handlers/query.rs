@@ -82,20 +82,26 @@ pub struct ReadinessParams {
 
 - 查询成功恒 200（`success=true` 只表示观察完成），**`data.ready` 才表示业务可用**；
   未就绪/启动中/已停止/失败/未知/不支持都是合法观察结果。
-- `status`：`not_deployed` / `starting` / `stopping` / `stopped` / `ready` /
-  `degraded` / `failed` / `unknown` / `unsupported`；`reason_code` 为结构化原因。
+- `status`：`not_deployed` / `provisioning` / `starting` / `stopping` / `stopped` /
+  `ready` / `degraded` / `failed` / `unknown` / `unsupported`；`reason_code` 为结构化原因。
+  `provisioning`（`COMPUTE_PROVISIONING`）只出现在 `app_stage=dev`：平台正在申请/接管
+  builder 计算资源，业务快照尚未产生，业务态未知；它由平台合并层产出，app-cli 永不返回。
 - `container.status` 独立描述计算资源：`missing` / `starting` / `restarting` /
   `stopping` / `running` / `stopped` / `failed` / `recovery_required` / `unknown`。
   `running` 不表示业务可用；控制操作恢复未确认时为 `recovery_required`。
+  顶层 `provisioning` 期间 `container.status` 仍如实反映物理事实（如 `missing`/`starting`）。
 - `container.operation` 为当前 dev/prod 控制头关联的操作，包含终态及错误。
   容器 Restart 的停止、启动、验证阶段均显示 `restarting`；物理 Start 复用
   Restart 协调器时同样按该动作展示。业务热部署不伪装为容器重启。
 - `container.operation=null` 不证明之前的操作成功；新请求可替换当前控制头，
   查询原操作请使用 `/computer/pod/operations/{app_id}/{operation_id}`。
-  调用方应关联已受理的操作 ID，忽略旧请求迟到的观察，不因 `ready=false`
-  或业务 `not_deployed` 自动重复部署。
+  调用方应关联已受理的操作 ID，忽略旧请求迟到的观察，不因 `ready=false`、
+  业务 `not_deployed` 或 `provisioning` 自动重复部署。
 - 只读保证：不启动/唤醒/停止容器，不刷新闲置计时，不阻塞 Stop/Restart。
-- 已停止的计算资源（含 Stop 后删除的开发容器）→ `stopped`；调度中/创建中 → `starting`。
+- 已停止的计算资源（含 Stop 后删除的开发容器）→ `stopped`；dev 计算资源
+  申请/接管中（builder 在途操作）→ `provisioning`；业务编排启动中 → `starting`。
+  `provisioning` 与 `starting` 同属等待态，前端继续轮询即可；快照一旦产生
+  （`not_deployed`/`ready`/…）即由 app-cli 接管，`provisioning` 不会驻留快照之后。
 - 查询包含定位、控制意图复核的总预算为 8 秒，耗尽标记 `OBSERVE_INCOMPLETE`；
   保留本次已经读取的容器控制操作，未观察的物理状态为 `unknown`，不改变业务状态。
 - 查询期间停止已受理 → `stopping`；旧运行时无新接口 → `unsupported`
@@ -162,7 +168,8 @@ pub async fn get_app_readiness(
 - `user_id` 必填，观察按 `app_id` 与 `app_stage` 定位；不使用用户 ID 改变实例归属。
 - `success=true` 表示查询完成；`data.ready` 才表示 DBX 可用。
 - `status` 为 `ready` / `starting` / `stopped` / `unknown`；`reason_code` 为稳定原因码，
-  `message` 为可选诊断信息。无法观察不等于服务停止。
+  `message` 为可选诊断信息。无法观察不等于服务停止。该词表刻意不含
+  `provisioning`（DBX 是数据库可达性契约，builder 资源申请期沿用 `starting` 一档）。
 - 启停、重启或恢复尚未确认完成时，不能用旧 DBX 应答宣布 `ready=true`。
   探测前后复核控制状态；总预算耗尽仍保留本次已读取的控制操作回执。
 - `container` 与 `/readiness` 同源同口径（存储控制意图 + 运行时观察双源合并）：

@@ -198,8 +198,10 @@ fn overlay_tree_on_worktree_and_index(
             continue;
         }
         let path = entry.path_in(target_backing);
+        let native_path = from_bstr(path)
+            .map_err(|error| map_git_err(error, "git decode checkout overlay path"))?;
         let plan =
-            super::materialize::plan_index_entry(workdir, &from_bstr(path), entry.mode, entry.id)?;
+            super::materialize::plan_index_entry(workdir, &native_path, entry.mode, entry.id)?;
         planned.push((plan, entry.stat, entry.flags, path.to_owned()));
     }
     for (plan, stat, flags, path) in &planned {
@@ -335,12 +337,9 @@ fn preflight_tree_materialization(
         .map_err(|e| map_git_err(e, "git index_from_tree (preflight)"))?;
     let backing = index.path_backing();
     for entry in index.entries() {
-        super::materialize::plan_index_entry(
-            workdir,
-            &from_bstr(entry.path_in(backing)),
-            entry.mode,
-            entry.id,
-        )?;
+        let native_path = from_bstr(entry.path_in(backing))
+            .map_err(|error| map_git_err(error, "git decode tree materialization path"))?;
+        super::materialize::plan_index_entry(workdir, &native_path, entry.mode, entry.id)?;
     }
     preflight_stale_files(repo, workdir, &index, old_tree_id)?;
     Ok(())
@@ -368,7 +367,9 @@ fn preflight_stale_files(
             .entry_by_path_and_stage(path, Stage::Unconflicted)
             .is_none()
         {
-            let relative = from_bstr(path).into_owned();
+            let relative = from_bstr(path)
+                .map_err(|error| map_git_err(error, "git decode stale worktree path"))?
+                .into_owned();
             ensure_within_path(workdir, &relative)?;
             super::materialize::preflight_parent_chain(workdir, &relative)?;
             removals.push(relative);
@@ -490,9 +491,11 @@ fn apply_tree_to_worktree(
     let mut planned = Vec::with_capacity(new_index.entries().len());
     for entry in new_index.entries() {
         let path = entry.path_in(new_backing);
+        let native_path = from_bstr(path)
+            .map_err(|error| map_git_err(error, "git decode worktree checkout path"))?;
         planned.push(super::materialize::plan_index_entry(
             workdir,
-            &from_bstr(path),
+            &native_path,
             entry.mode,
             entry.id,
         )?);
@@ -941,5 +944,40 @@ mod p14_preflight_tests {
             "v1\n"
         );
         drop(c1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn checkout_invalid_windows_git_path_fails_before_index_or_worktree_mutation() {
+        let directory = tempfile::tempdir().expect("repository directory");
+        let repo = crate::service::git::ensure_repo(directory.path()).expect("repository");
+        let blob = repo
+            .write_blob(b"must not materialize")
+            .expect("blob")
+            .detach();
+        let mut editor = repo.edit_tree(repo.empty_tree().id()).expect("tree editor");
+        editor
+            .upsert(
+                BString::from(b"invalid-\xff.txt".as_slice()),
+                gix::objs::tree::EntryKind::Blob,
+                blob,
+            )
+            .expect("Git tree retains opaque path bytes");
+        let tree = editor.write().expect("tree").detach();
+        let before = std::fs::read(repo.index_path()).expect("initial index");
+        let result = apply_tree_to_worktree(&repo, directory.path(), tree.as_ref(), None);
+        assert!(
+            result.is_err(),
+            "an unrepresentable Windows path must be returned as an error"
+        );
+        assert_eq!(
+            std::fs::read(repo.index_path()).expect("retained index"),
+            before
+        );
+        assert!(
+            std::fs::read_dir(directory.path())
+                .expect("worktree")
+                .all(|entry| entry.expect("entry").file_name() == ".git")
+        );
     }
 }

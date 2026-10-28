@@ -3,10 +3,12 @@
 //! 与 Python 套件（tests/sse_e2e/common.py）语义对齐；配置读取同为
 //! "环境变量优先，仓库根 .env.local 兜底"（API key 等不进 git）。
 
+pub mod dev_restart_settlement;
 pub mod metrics;
 pub mod report;
 pub mod scenario;
 pub mod sse;
+pub mod sse_terminal_barrier;
 
 pub mod fixtures;
 pub mod resources;
@@ -464,15 +466,46 @@ impl Env {
     }
 }
 
-/// 向指定入口发 chat 并校验（HttpResult 包装；success 字段 serde skip，
-/// 判定用 code == "0000"）。低层版（client+url），供 spawned 后台任务复用。
+/// Explicit HTTP entry family; base-origin rotation does not select this route.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChatRoute {
+    #[default]
+    Computer,
+    DevComputer,
+}
+
+impl ChatRoute {
+    pub const fn chat_path(self) -> &'static str {
+        match self {
+            Self::Computer => "/computer/chat",
+            Self::DevComputer => "/devcomputer/chat",
+        }
+    }
+
+    pub const fn progress_prefix(self) -> &'static str {
+        match self {
+            Self::Computer => "/computer/progress",
+            Self::DevComputer => "/devcomputer/progress",
+        }
+    }
+}
+
 pub async fn chat_via(
     client: &reqwest::Client,
     url: &str,
     req: &ComputerChatRequest,
 ) -> Result<ChatResponse> {
+    chat_via_route(client, url, req, ChatRoute::Computer).await
+}
+
+pub async fn chat_via_route(
+    client: &reqwest::Client,
+    url: &str,
+    req: &ComputerChatRequest,
+    route: ChatRoute,
+) -> Result<ChatResponse> {
     let resp = client
-        .post(format!("{url}/computer/chat"))
+        .post(format!("{url}{}", route.chat_path()))
         .timeout(Duration::from_secs(180))
         .json(req)
         .send()
@@ -504,9 +537,24 @@ pub async fn chat_reported(
     url: &str,
     req: &ComputerChatRequest,
 ) -> Result<ChatResponse> {
+    chat_reported_route(env, report, phase, url, req, ChatRoute::Computer).await
+}
+
+pub async fn chat_reported_route(
+    env: &Env,
+    report: &JsonlReporter,
+    phase: &str,
+    url: &str,
+    req: &ComputerChatRequest,
+    route: ChatRoute,
+) -> Result<ChatResponse> {
     let t0 = Instant::now();
     let req_sanitized = sanitize_request(req);
-    let result = chat_at(env, url, req).await;
+    let result = chat_via_route(&env.http, url, req, route).await;
+    let trace_url = match route {
+        ChatRoute::Computer => url.to_owned(), // Keep existing report bytes/shape.
+        ChatRoute::DevComputer => format!("{url}{}", route.chat_path()),
+    };
     let (ok, resp_value, error) = match &result {
         Ok(data) => (
             true,
@@ -517,7 +565,7 @@ pub async fn chat_reported(
     };
     report.chat_request(ChatTrace {
         phase,
-        url,
+        url: &trace_url,
         ok,
         request_sanitized: req_sanitized,
         response: resp_value.as_ref(),

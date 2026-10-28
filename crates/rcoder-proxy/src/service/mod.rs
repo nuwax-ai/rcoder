@@ -64,6 +64,8 @@ pub struct PingoraProxyService {
     pub api_key_config: Option<Arc<ArcSwap<shared_types::ApiKeyAuthConfig>>>,
     /// 容器查找服务（统一数据源）
     container_lookup: Option<Arc<dyn shared_types::ContainerLookup>>,
+    /// 用户维度查找 miss 时的 PG 回源钩子（仅 PG 部署注入）
+    user_refresh: Option<Arc<dyn shared_types::ContainerUserRefresh>>,
     /// Userapp 访问追踪（Pingora 热路径 touch 记录最近访问，供闲置回收判断）
     access_tracker: Option<Arc<dyn shared_types::AppAccessTracker>>,
     /// Userapp 流量唤醒（stopped app 收到请求时 hold-and-wait 拉起）
@@ -119,6 +121,8 @@ pub struct PortProxy {
     api_key_config: Option<Arc<ArcSwap<shared_types::ApiKeyAuthConfig>>>,
     /// 容器查找服务（统一数据源）
     container_lookup: Option<Arc<dyn shared_types::ContainerLookup>>,
+    /// 用户维度查找 miss 时的 PG 回源钩子（仅 PG 部署注入）
+    user_refresh: Option<Arc<dyn shared_types::ContainerUserRefresh>>,
     /// Userapp 访问追踪 + 流量唤醒（/api/v1/userapp/proxy/app/prod/* 路由用）
     access_tracker: Option<Arc<dyn shared_types::AppAccessTracker>>,
     wake_control: Option<Arc<dyn shared_types::AppWakeControl>>,
@@ -163,6 +167,7 @@ impl PingoraProxyService {
             api_key_manager: Arc::new(DashMap::new()),
             api_key_config: None, // 默认不启用 API Key 鉴权
             container_lookup: None,
+            user_refresh: None,
             access_tracker: None,
             wake_control: None,
             dev_ensure_slot: Arc::new(ArcSwapOption::from(None)),
@@ -216,6 +221,16 @@ impl PingoraProxyService {
         container_lookup: Arc<dyn shared_types::ContainerLookup>,
     ) -> Self {
         self.container_lookup = Some(container_lookup);
+        self
+    }
+
+    /// 设置用户维度查找的 PG 回源钩子（miss → 权威行回读 → 镜像 hydrate）；
+    /// None = 内存部署，无回源。
+    pub fn with_user_refresh_opt(
+        mut self,
+        user_refresh: Option<Arc<dyn shared_types::ContainerUserRefresh>>,
+    ) -> Self {
+        self.user_refresh = user_refresh;
         self
     }
 
@@ -290,6 +305,7 @@ impl PingoraProxyService {
             api_key_manager: self.api_key_manager.clone(),
             api_key_config: self.api_key_config.clone(),
             container_lookup: self.container_lookup.clone(),
+            user_refresh: self.user_refresh.clone(),
             access_tracker: self.access_tracker.clone(),
             wake_control: self.wake_control.clone(),
             dev_ensure_slot: Arc::clone(&self.dev_ensure_slot),
@@ -316,6 +332,7 @@ impl Clone for PingoraProxyService {
             api_key_manager: self.api_key_manager.clone(),
             api_key_config: self.api_key_config.clone(),
             container_lookup: self.container_lookup.clone(),
+            user_refresh: self.user_refresh.clone(),
             access_tracker: self.access_tracker.clone(),
             wake_control: self.wake_control.clone(),
             dev_ensure_slot: Arc::clone(&self.dev_ensure_slot),

@@ -211,6 +211,14 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
             .await?;
         Ok(())
     }
+    async fn discover_retained_app_storage(
+        &self,
+        app_id: &str,
+        scope: shared_types::UserAppOperationScope,
+    ) -> ContainerRuntimeResult<Option<shared_types::UserAppRetainedStorage>> {
+        self.missing_compute_storage_inventory(app_id, scope).await
+    }
+
     async fn discover_application_identity(
         &self,
         app_id: &str,
@@ -377,6 +385,25 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
             .await
     }
 
+    async fn observe_app_operation_mutex(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+    ) -> ContainerRuntimeResult<container_runtime_api::AppOperationMutexObservation> {
+        self.observe_application_mutex(app_id, lifecycle_id).await
+    }
+
+    async fn wait_app_operation_mutex_change(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+        observed: &container_runtime_api::AppOperationMutexIdentity,
+        budget: std::time::Duration,
+    ) -> ContainerRuntimeResult<container_runtime_api::AppOperationMutexObservation> {
+        self.wait_application_mutex_change(app_id, lifecycle_id, observed, budget)
+            .await
+    }
+
     async fn inspect_app_deletion(
         &self,
         context: &shared_types::UserAppExecutionContext,
@@ -417,6 +444,16 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
             .await
     }
 
+    async fn prepare_compute_handoff(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        scope: shared_types::UserAppOperationScope,
+        receipt: Option<&shared_types::UserAppOperationLeaseReceipt>,
+    ) -> ContainerRuntimeResult<container_runtime_api::ComputeHandoff> {
+        self.prepare_compute_k8s_handoff(context, scope, receipt)
+            .await
+    }
+
     async fn release_previous_compute_lease(
         &self,
         current: &shared_types::UserAppExecutionContext,
@@ -428,11 +465,31 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
             .await
     }
 
+    async fn acquire_vacant_app_operation(
+        &self,
+        app_id: &str,
+    ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
+        self.acquire_vacant_application_operation(app_id)
+            .await
+            .map(Some)
+    }
+
     async fn acquire_app_operation(
         &self,
         app_id: &str,
     ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
         self.acquire_application_operation(app_id, &ServiceType::Userapp)
+            .await
+            .map(Some)
+    }
+
+    async fn acquire_observed_expired_app_operation(
+        &self,
+        app_id: &str,
+        current_lifecycle_id: &str,
+        observed: &container_runtime_api::AppOperationMutexIdentity,
+    ) -> ContainerRuntimeResult<Option<Box<dyn shared_types::AppOperationLease>>> {
+        self.acquire_observed_expired_application_operation(app_id, current_lifecycle_id, observed)
             .await
             .map(Some)
     }
@@ -510,6 +567,7 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
             deployment_uid: deployment.metadata.uid,
             deployment_version: deployment.metadata.resource_version,
             resource_name: Some(name),
+            resource_uid: cm.metadata.uid,
             resource_version: cm.metadata.resource_version,
         })
     }
@@ -540,6 +598,7 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
         // such a write (2026-09-27 personal-K8s userapp r5/r6).
         if current.deployment_uid != snapshot.deployment_uid
             || current.resource_name != snapshot.resource_name
+            || snapshot.resource_uid.is_some() && current.resource_uid != snapshot.resource_uid
             || current.resource_version != snapshot.resource_version
         {
             return Err(ContainerRuntimeError::Conflict(
@@ -588,6 +647,7 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
         // are verified here.
         if committed.deployment_uid != snapshot.deployment_uid
             || committed.resource_name != snapshot.resource_name
+            || snapshot.resource_uid.is_some() && committed.resource_uid != snapshot.resource_uid
             || committed.env != *env
         {
             return Err(ContainerRuntimeError::Conflict(
@@ -861,6 +921,13 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
         target: &shared_types::UserAppMutationTarget,
     ) -> ContainerRuntimeResult<bool> {
         self.reconcile_captured_compute_start(target).await
+    }
+
+    async fn observe_app_compute_running(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        self.observe_captured_app_running(target).await
     }
 
     async fn reconcile_app_compute_stop(

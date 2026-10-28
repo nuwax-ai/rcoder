@@ -18,10 +18,11 @@ async function downloadArchive(url, outPath, signal = AbortSignal.timeout(300000
   return buf.length;
 }
 
-// 用系统工具解压：tar.gz 用 tar（mac/linux/Win10+ 自带），zip 用 PowerShell Expand-Archive。
-// N09：参数数组 + execFileSync——路径经 argv 传递不拼进命令字符串（空格/
-// 引号/特殊字符路径安全；zip 内路径穿越由 tar 1.x+/Expand-Archive 拒绝
-// 绝对路径与 .. 段——归档内容为发布产物单一可执行文件，无目录树）。
+// 用系统工具解压：tar.gz 用 tar，zip 用 Windows .NET 的 ZIP API。
+// PowerShell -Command reparses its arguments, even with execFileSync. Keep
+// the script fixed and pass paths through the environment so spaces, quotes
+// and shell metacharacters remain literal data. Expand-Archive also interprets
+// brackets in its destination internally; the .NET API keeps both paths literal.
 function extractArchive(archivePath, destDir, ext) {
   mkdirSync(destDir, { recursive: true });
   if (ext === "zip") {
@@ -29,15 +30,18 @@ function extractArchive(archivePath, destDir, ext) {
       "powershell",
       [
         "-NoProfile",
+        "-NonInteractive",
         "-Command",
-        "Expand-Archive",
-        "-Force",
-        "-LiteralPath",
-        archivePath,
-        "-DestinationPath",
-        destDir,
+        "$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory($env:NUWAX_PROXY_ARCHIVE, $env:NUWAX_PROXY_DESTINATION)",
       ],
-      { stdio: "inherit" },
+      {
+        stdio: "inherit",
+        env: {
+          ...process.env,
+          NUWAX_PROXY_ARCHIVE: archivePath,
+          NUWAX_PROXY_DESTINATION: destDir,
+        },
+      },
     );
   } else {
     execFileSync("tar", ["-xzf", archivePath, "-C", destDir], {

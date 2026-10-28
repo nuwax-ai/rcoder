@@ -5,6 +5,7 @@
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 /// PG 连接默认端口
 pub const DEFAULT_PG_PORT: u16 = 5432;
@@ -15,11 +16,16 @@ pub const DEFAULT_PG_MIN_CONNECTIONS: u32 = 2;
 /// 默认连接超时（秒）
 pub const DEFAULT_PG_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// 默认语句超时（秒，防拖死请求）
-pub const DEFAULT_PG_STATEMENT_TIMEOUT_SECS: u64 = 5;
+pub const DEFAULT_PG_STATEMENT_TIMEOUT_SECS: u64 = 15;
 /// 默认连接最大寿命（秒）。CNPG failover 后指向旧 primary 的
 /// 长寿命连接会变僵尸，到期（release/recycle 时）关闭重建即自愈——10min 是
 /// "failover 恢复上界"与"重建频率"的折中（建连 ms 级，重建开销可忽略）。
 pub const DEFAULT_PG_MAX_LIFETIME_SECS: u64 = 600;
+/// durable 提交链路总预算（毫秒）：reconcile/Stop 门禁/权威读/SQL COMMIT 共享同一 deadline。
+/// 与 PostgreSQL 单条语句超时、锁等待超时独立，覆盖排队、读取及提交的等待。
+pub const DEFAULT_PG_DURABLE_COMMIT_TIMEOUT_MS: u64 = 15_000;
+/// 支持的跨平台运行预算上限，避免未受约束的 u64 配置进入 Instant 运算。
+pub const MAX_PG_DURABLE_COMMIT_TIMEOUT_MS: u64 = i32::MAX as u64;
 
 /// `[storage.postgres]` 配置段
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -44,10 +50,12 @@ pub struct PostgresConfig {
     pub min_connections: Option<u32>,
     /// 连接超时秒数（默认 10）
     pub connect_timeout_secs: Option<u64>,
-    /// 语句超时秒数（默认 5）
+    /// 语句超时秒数（默认 15；显式配置保留原值）
     pub statement_timeout_secs: Option<u64>,
     /// 连接最大寿命秒数（默认 600；CNPG failover 僵尸连接自愈上界）
     pub max_lifetime_secs: Option<u64>,
+    /// durable 提交链路总预算毫秒（默认 15000，支持 1..=i32::MAX；独立于语句和锁超时）
+    pub durable_commit_timeout_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for PostgresConfig {
@@ -73,6 +81,7 @@ impl Default for PostgresConfig {
             connect_timeout_secs: Some(DEFAULT_PG_CONNECT_TIMEOUT_SECS),
             statement_timeout_secs: Some(DEFAULT_PG_STATEMENT_TIMEOUT_SECS),
             max_lifetime_secs: Some(DEFAULT_PG_MAX_LIFETIME_SECS),
+            durable_commit_timeout_ms: Some(DEFAULT_PG_DURABLE_COMMIT_TIMEOUT_MS),
         }
     }
 }
@@ -233,6 +242,36 @@ impl PostgresConfig {
     pub fn max_lifetime_secs(&self) -> u64 {
         self.max_lifetime_secs
             .unwrap_or(DEFAULT_PG_MAX_LIFETIME_SECS)
+    }
+
+    /// durable 提交链路总预算（带默认值兜底）
+    pub fn durable_commit_timeout(&self) -> Duration {
+        Duration::from_millis(
+            self.durable_commit_timeout_ms
+                .unwrap_or(DEFAULT_PG_DURABLE_COMMIT_TIMEOUT_MS),
+        )
+    }
+
+    /// 在接收请求或建立数据库连接前拒绝无效预算；不静默修正配置。
+    pub fn validate_durable_commit_timeout(&self) -> Result<(), String> {
+        let millis = self
+            .durable_commit_timeout_ms
+            .unwrap_or(DEFAULT_PG_DURABLE_COMMIT_TIMEOUT_MS);
+        if !(1..=MAX_PG_DURABLE_COMMIT_TIMEOUT_MS).contains(&millis) {
+            return Err(format!(
+                "storage.postgres.durable_commit_timeout_ms must be between 1 and {MAX_PG_DURABLE_COMMIT_TIMEOUT_MS}"
+            ));
+        }
+        if std::time::Instant::now()
+            .checked_add(Duration::from_millis(millis))
+            .is_none()
+        {
+            return Err(
+                "storage.postgres.durable_commit_timeout_ms cannot be represented as a deadline"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     /// 脱敏描述（日志用，不含密码）
@@ -512,5 +551,74 @@ mod tests {
             ..PostgresConfig::default()
         };
         assert_eq!(config.min_connections(), 5);
+    }
+
+    #[test]
+    fn durable_commit_timeout_defaults_and_overrides() {
+        // 默认 15000ms（覆盖慢存储 fsync 抖动 5-11s + 余量）
+        assert_eq!(
+            PostgresConfig::default().durable_commit_timeout(),
+            Duration::from_millis(15_000)
+        );
+        // unwrap_or 回退：字段为 None 时仍取默认
+        let none_field = PostgresConfig {
+            durable_commit_timeout_ms: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            none_field.durable_commit_timeout(),
+            Duration::from_millis(15_000)
+        );
+        // 显式值覆盖
+        let overridden = PostgresConfig {
+            durable_commit_timeout_ms: Some(600),
+            ..Default::default()
+        };
+        assert_eq!(
+            overridden.durable_commit_timeout(),
+            Duration::from_millis(600)
+        );
+    }
+
+    #[test]
+    fn durable_commit_timeout_rejects_zero_and_unbounded_values() {
+        for value in [0, MAX_PG_DURABLE_COMMIT_TIMEOUT_MS + 1, u64::MAX] {
+            let config = PostgresConfig {
+                durable_commit_timeout_ms: Some(value),
+                ..Default::default()
+            };
+            let error = config.validate_durable_commit_timeout().unwrap_err();
+            assert!(error.contains("durable_commit_timeout_ms"));
+        }
+        for value in [
+            1,
+            600,
+            DEFAULT_PG_DURABLE_COMMIT_TIMEOUT_MS,
+            MAX_PG_DURABLE_COMMIT_TIMEOUT_MS,
+        ] {
+            let config = PostgresConfig {
+                durable_commit_timeout_ms: Some(value),
+                ..Default::default()
+            };
+            config.validate_durable_commit_timeout().unwrap();
+        }
+        PostgresConfig {
+            durable_commit_timeout_ms: None,
+            ..Default::default()
+        }
+        .validate_durable_commit_timeout()
+        .unwrap();
+    }
+
+    #[test]
+    fn statement_timeout_default_and_explicit_value_are_independent_of_durable_budget() {
+        assert_eq!(PostgresConfig::default().statement_timeout_secs(), 15);
+        let explicit = PostgresConfig {
+            statement_timeout_secs: Some(5),
+            durable_commit_timeout_ms: Some(15_000),
+            ..Default::default()
+        };
+        assert_eq!(explicit.statement_timeout_secs(), 5);
+        explicit.validate_durable_commit_timeout().unwrap();
     }
 }

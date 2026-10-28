@@ -1645,7 +1645,7 @@ function wait_and_write_vnc_ready_marker() {
         if [ "$novnc_ready" = true ] && [ "$wallpaper_ready" = true ] && [ "$desktop_ready" = true ]; then
             echo "$(date +%s)" > /tmp/vnc_ready
             log_success "VNC ready marker written to /tmp/vnc_ready (noVNC + wallpaper + desktop all ready, took ${elapsed}s)"
-            log_success "  noVNC port ready at: $(cat /tmp/novnc_port_ready)"
+            log_success "  noVNC ready since: $(cat /tmp/novnc_port_ready) (port 6080)"
             log_success "  Wallpaper ready at: $(cat /tmp/wallpaper_ready)"
             return 0
         fi

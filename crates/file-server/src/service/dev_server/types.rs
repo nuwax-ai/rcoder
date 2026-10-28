@@ -261,7 +261,7 @@ pub struct DevServerManager {
     pub(super) owner_children: Mutex<HashMap<String, Arc<super::supervise::SupervisedChild>>>,
     /// 进程停止后未确认清理状态表（P1-05）：并发 dev 操作互斥清理——
     /// 旧 supervised 退出后再次受理 dev/start 前必须确认清理完毕。
-    pub(super) cleanup_state: Arc<Mutex<HashMap<String, CleanupStatus>>>,
+    pub(super) cleanup_state: Arc<Mutex<HashMap<String, super::cleanup_record::CleanupRecord>>>,
     /// 构建前捕获的 owner 期望（P3-03/R07）：key=project_id。构建期间 owner
     /// 被 stop/restart 时，提交按 ERR_REVISION_MISMATCH 拒绝（不自动刷新
     /// 重发）；观察失败（owner 在但读不到身份/凭据/状态）记录

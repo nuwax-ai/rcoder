@@ -345,3 +345,83 @@ async fn forwarded_path_preserves_trailing_slash_and_deep_rest() {
         "深层资产路径（含 @ 前缀段）原样保留"
     );
 }
+
+/// Execute the actual peer selector in a request task: an upstream resolver
+/// error must be a 502 Result, then the same route must serve a healthy target.
+/// The invalid hostname is deterministic even behind wildcard/fake-IP DNS.
+#[tokio::test]
+async fn upstream_lookup_failure_returns_error_without_panicking_and_next_request_recovers() {
+    let failed_request = tokio::spawn(async {
+        let router = create_router().unwrap();
+        let matched = router.at("/proxy/4200/page").unwrap();
+        let slot = slot_with(shared_types::PreviewRouteResolution::Forward {
+            instance_id: "dns-failure-instance".into(),
+            port: 4200,
+            host_ip: "invalid\0upstream.example".into(),
+        });
+        handle_port_proxy_upstream(
+            &mut TrackingCtx::new(),
+            matched.params,
+            &fixed_backends(),
+            "127.0.0.1",
+            &Arc::new(crate::service::types::ProxyMetrics::default()),
+            &slot,
+        )
+        .await
+    })
+    .await;
+    assert!(
+        failed_request.is_ok(),
+        "upstream lookup failed by panicking the request task: {failed_request:?}"
+    );
+    let error = failed_request.unwrap().unwrap_err();
+    assert_eq!(error.etype(), &pingora_core::ErrorType::HTTPStatus(502));
+    assert!(error.to_string().contains("upstream address resolution"));
+
+    // Same selector, independent request: the earlier failure leaves no global
+    // unavailable marker or poisoned resolver state.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let expected = b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let mut request = vec![0; expected.len()];
+        socket.read_exact(&mut request).await.unwrap();
+        assert_eq!(request, expected);
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nhealthy")
+            .await
+            .unwrap();
+    });
+    let router = create_router().unwrap();
+    let slot = Arc::new(arc_swap::ArcSwapOption::from(Some(Arc::new(Arc::new(
+        PreviewRouteDeps {
+            coordination: Arc::new(StubCoordination {
+                resolution: shared_types::PreviewRouteResolution::Forward {
+                    instance_id: "healthy-instance".into(),
+                    port: 4200,
+                    host_ip: address.ip().to_string(),
+                },
+            }),
+            peer_api_port: 8086,
+            peer_proxy_port: address.port(),
+            internal_token: "unit-test-token".into(),
+        },
+    )))));
+    let mut ctx = TrackingCtx::new();
+    let peer = run_upstream_phase(&router, &slot, "/proxy/4200/page", &mut ctx).await;
+    assert_eq!(peer._address.as_inet(), Some(&address));
+    let mut socket = tokio::net::TcpStream::connect(*peer._address.as_inet().unwrap())
+        .await
+        .unwrap();
+    socket
+        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = String::new();
+    socket.read_to_string(&mut response).await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(response.ends_with("healthy"));
+    server.await.unwrap();
+}

@@ -69,7 +69,10 @@ pub(crate) enum Disposition {
         new_physical_uid: String,
         workload_uid: Option<String>,
     },
-    /// 行3：同名 workload UID 变化 → 冲突/显式恢复，不自动接管。
+    /// 行3：同名 workload UID 变化 → 冲突/显式恢复，不自动接管。注册门
+    /// （rcoder-storage `prepare_info`）按 DB 权威裁决此类冲突：旧绑定经
+    /// 本系统 stop/cleaner 退役（container_tombstones 在案）的自我换代
+    /// 放行换代事务；DB 绑定仍在的替换保持拒绝（409）。
     WorkloadReplaced { observed_workload_uid: String },
     /// 行4：Pod 暂缺、workload 期望运行 → 重建中，不判停。
     Rebuilding,

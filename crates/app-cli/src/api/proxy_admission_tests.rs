@@ -223,8 +223,11 @@ async fn native_stopping_fences_new_proxy_writes_after_the_previous_writer_settl
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(body["code"], "ERR_OPERATION_IN_PROGRESS");
     assert!(
-        super::proxy_reload::read(&super::proxy_reload::root(&state), "native-blocked-reload")
-            .unwrap()
-            .is_none()
+        super::proxy_reload::read(
+            &super::proxy_reload::root(&state).unwrap(),
+            "native-blocked-reload"
+        )
+        .unwrap()
+        .is_none()
     );
 }

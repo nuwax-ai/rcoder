@@ -43,11 +43,15 @@ pub(crate) use access::BuilderAccessIntent;
 pub(crate) use access::tests::{
     fixture as builder_access_test_state, stopped as builder_stop_fixture,
 };
+#[cfg(all(test, feature = "rcoder-pg", feature = "userapp-turso"))]
+pub(crate) use creation::fence_settler_tests::FenceRuntime;
 #[cfg(test)]
 pub(crate) use creation::fence_settler_tests::runtime_state as builder_runtime_test_state;
 mod dev_cleanup;
 mod dev_locator;
+mod idle_registration;
 mod lifecycle;
+pub(crate) use idle_registration::refresh_idle_builder_pod;
 
 /// Idle retirement shares the existing local creation boundary. Target-side
 /// activity and physical UID checks provide the cross-replica observations;
@@ -56,6 +60,25 @@ pub(crate) async fn try_idle_builder_retirement(
     app_id: &str,
 ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
     lifecycle::try_acquire(app_id).await
+}
+
+async fn builder_workload_admission(
+    state: &AppState,
+    app_id: &str,
+    deadline: tokio::time::Instant,
+) -> Result<rcoder_storage::WorkloadAdmissionGuard> {
+    use rcoder_storage::{WorkloadAdmissionMode, WorkloadKey};
+    let runtime = state.runtime();
+    let name = runtime.agent_workload_name(app_id, &ServiceType::UserappBuilder)?;
+    let key = WorkloadKey::new(
+        &runtime.agent_workload_namespace(),
+        ServiceType::UserappBuilder,
+        &name,
+    )?;
+    state
+        .projects
+        .acquire_workload_admission(key, WorkloadAdmissionMode::Shared, deadline)
+        .await
 }
 mod recovery;
 pub(crate) mod retry;
@@ -165,11 +188,15 @@ async fn ensure_builder_target_until(
     deadline: tokio::time::Instant,
     intent: BuilderAccessIntent,
 ) -> Result<ContainerBasicInfo> {
+    // Order: workload admission -> local lifecycle -> durable operation/runtime
+    // lease. An orphan scan seeing no root must exclude first-time creation.
+    let _workload = builder_workload_admission(state, app_id, deadline).await?;
     let recovered = adoption::discover_missing_identity(state, app_id).await?;
     let identity = match recovered {
         Some(identity) => identity,
         None => state.userapp_store.ensure_identity(app_id).await?,
     };
+    creation::reconcile_default_recovery_before_ensure(state, &identity).await?;
     state
         .app_service
         .verify_recovered_storage(app_id, shared_types::UserAppOperationScope::Dev)
@@ -262,11 +289,13 @@ async fn ensure_userapp_builder_probed_until(
     app_id: &str,
     deadline: tokio::time::Instant,
 ) -> Result<(ContainerBasicInfo, bool)> {
+    let _workload = builder_workload_admission(state, app_id, deadline).await?;
     let recovered = adoption::discover_missing_identity(state, app_id).await?;
     let identity = match recovered {
         Some(identity) => identity,
         None => state.userapp_store.ensure_identity(app_id).await?,
     };
+    creation::reconcile_default_recovery_before_ensure(state, &identity).await?;
     state
         .app_service
         .verify_recovered_storage(app_id, shared_types::UserAppOperationScope::Dev)
@@ -479,34 +508,54 @@ async fn verify_registration(
     registered: &ContainerBasicInfo,
     publish: bool,
 ) -> Result<Option<ContainerBasicInfo>> {
+    verify_registration_observed(state, app_id, instance, registered, publish, None).await
+}
+
+async fn verify_registration_observed(
+    state: &AppState,
+    app_id: &str,
+    instance: &str,
+    registered: &ContainerBasicInfo,
+    publish: bool,
+    mut observation: Option<&mut BuilderReadinessObservation<'_>>,
+) -> Result<Option<ContainerBasicInfo>> {
+    readiness_begin(&mut observation, "find_container");
     let Some(rc) = state
         .runtime()
         .find_container(instance, &ServiceType::UserappBuilder)
         .await
         .context("inspect builder registration")?
     else {
+        readiness_result(&mut observation, "find_container", "absent");
         return Ok(None);
     };
     validate_builder_identity(instance, &rc)?;
     // 非 Running（含已删除容器的注册缓存残影）先归 None——调用方按需重建；
     // 此时 verify 的 capture 查无物理负载，会误报"身份变更"。
     if rc.status != container_runtime_api::ContainerRuntimeStatus::Running {
+        readiness_result(&mut observation, "find_container", "not_running");
         return Ok(None);
     }
+    readiness_result(&mut observation, "find_container", "running");
     // 物理身份校验由 verify_live_builder 的运行时 capture 执行（应用共享，
     // 无归属注解可比对）。
+    readiness_begin(&mut observation, "verify_live_builder");
     adoption::verify_live_builder(state, app_id, instance, &rc.container_id).await?;
+    readiness_result(&mut observation, "verify_live_builder", "verified");
     // A live Pod alone is insufficient when its management Service is absent.
     // Read-side discovery never repairs it; return to admitted creation/resume
     // so repair shares the same durable operation and runtime lease as Stop.
+    readiness_begin(&mut observation, "get_container_info");
     if state
         .runtime()
         .get_container_info_by_identifier(instance, &ServiceType::UserappBuilder)
         .await?
         .is_none()
     {
+        readiness_result(&mut observation, "get_container_info", "absent");
         return Ok(None);
     }
+    readiness_result(&mut observation, "get_container_info", "found");
     let Some(updated) = refreshed_registration(registered, &rc) else {
         return Ok(Some(registered.clone()));
     };
@@ -723,6 +772,15 @@ fn register_builder(state: &AppState, instance: &str, info: &ContainerBasicInfo)
         .get_project(instance)
         .map(|old| (*old).clone())
         .unwrap_or_else(|| ProjectAndContainerInfo::new(instance.to_owned()));
+    // A confirmed successor starts its own idle window even if the logical
+    // project survived retirement. Re-observing the same CID (including an IP
+    // correction) preserves historical activity instead of renewing it on reads.
+    let new_physical_instance = project
+        .container_info()
+        .is_none_or(|previous| previous.container_id != info.container_id);
+    if new_physical_instance {
+        project.update_activity();
+    }
     project.set_service_type(Some(ServiceType::UserappBuilder));
     project.set_container(Some(info.clone()));
     state
@@ -740,6 +798,68 @@ async fn confirm_builder_ready(
     confirm_builder_ready_inner(state, app_id, instance, info, None, deadline).await
 }
 
+/// Fixed stage names and result classes only: never credentials or URLs.
+/// Repeated polling logs once per stage/result change, not every 200ms.
+struct BuilderReadinessObservation<'a> {
+    app_id: &'a str,
+    operation_id: Option<&'a str>,
+    started: std::time::Instant,
+    stage_started: std::collections::BTreeMap<&'static str, std::time::Instant>,
+    stage: &'static str,
+    in_flight: bool,
+    results: std::collections::BTreeMap<&'static str, &'static str>,
+}
+
+impl BuilderReadinessObservation<'_> {
+    fn begin(&mut self, stage: &'static str) {
+        self.stage = stage;
+        self.in_flight = true;
+        self.stage_started.insert(stage, std::time::Instant::now());
+        if !self.results.contains_key(stage) {
+            self.result(stage, "started");
+        }
+    }
+
+    fn result(&mut self, stage: &'static str, result: &'static str) {
+        if self.stage == stage && result != "started" {
+            self.in_flight = false;
+        }
+        if self.results.insert(stage, result) != Some(result) {
+            info!(
+                app_id = self.app_id,
+                operation_id = self.operation_id,
+                stage,
+                result,
+                stage_elapsed_ms = self
+                    .stage_started
+                    .get(stage)
+                    .map(|started| started.elapsed().as_millis() as u64),
+                elapsed_ms = self.started.elapsed().as_millis() as u64,
+                "Builder readiness observation"
+            );
+        }
+    }
+}
+
+fn readiness_begin(
+    observation: &mut Option<&mut BuilderReadinessObservation<'_>>,
+    stage: &'static str,
+) {
+    if let Some(observation) = observation.as_deref_mut() {
+        observation.begin(stage);
+    }
+}
+
+fn readiness_result(
+    observation: &mut Option<&mut BuilderReadinessObservation<'_>>,
+    stage: &'static str,
+    result: &'static str,
+) {
+    if let Some(observation) = observation.as_deref_mut() {
+        observation.result(stage, result);
+    }
+}
+
 async fn confirm_builder_ready_inner(
     state: &AppState,
     app_id: &str,
@@ -748,8 +868,19 @@ async fn confirm_builder_ready_inner(
     operation: Option<&shared_types::UserAppOperationRecord>,
     deadline: tokio::time::Instant,
 ) -> Result<ContainerBasicInfo> {
-    tokio::time::timeout_at(deadline, async {
+    let started = std::time::Instant::now();
+    let mut observation = BuilderReadinessObservation {
+        app_id,
+        operation_id: operation.map(|operation| operation.operation_id.as_str()),
+        started,
+        stage_started: std::collections::BTreeMap::new(),
+        stage: "confirmation",
+        in_flight: false,
+        results: std::collections::BTreeMap::new(),
+    };
+    let result = tokio::time::timeout_at(deadline, async {
         loop {
+            observation.begin("check_cancellation");
             if let Some(operation) = operation
                 && let Err(shared_types::UserAppStoreError::OperationInProgress(blocker)) = state
                     .userapp_store
@@ -768,11 +899,30 @@ async fn confirm_builder_ready_inner(
                 // This loop performs only reads, so no mutation is abandoned.
                 return Err(container_runtime_api::ContainerRuntimeError::CreationCancelled.into());
             }
-            if let Some(actual) = verify_registration(state, app_id, instance, &info, false).await?
-            {
+            observation.result("check_cancellation", "current");
+            observation.begin("verify_registration");
+            let verified = verify_registration_observed(
+                state,
+                app_id,
+                instance,
+                &info,
+                false,
+                Some(&mut observation),
+            )
+            .await?;
+            observation.result(
+                "verify_registration",
+                if verified.is_some() {
+                    "verified"
+                } else {
+                    "unready"
+                },
+            );
+            if let Some(actual) = verified {
                 if actual.container_id != info.container_id {
                     return Err(anyhow!("Builder resource replaced before readiness"));
                 }
+                observation.begin("credentials");
                 let credentials = crate::userapp_forward::file_credentials::credentials(
                     state,
                     shared_types::UserappStage::Dev,
@@ -781,15 +931,35 @@ async fn confirm_builder_ready_inner(
                 )
                 .await
                 .map_err(shared_types::WakeFailure::into_app_error)?;
-                if probe_file_server(&dev_file_server_addr(state, &actual)?, &credentials).await {
+                observation.result("credentials", "available");
+                observation.begin("probe_file_server");
+                let ready =
+                    probe_file_server(&dev_file_server_addr(state, &actual)?, &credentials).await;
+                observation.result("probe_file_server", if ready { "ready" } else { "unready" });
+                if ready {
                     return Ok(actual);
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     })
-    .await
-    .context("Builder readiness deadline exceeded")?
+    .await;
+    let outcome = match &result {
+        Ok(Ok(_)) => "ready",
+        Ok(Err(_)) => "error",
+        Err(_) => "deadline_exceeded",
+    };
+    info!(
+        app_id,
+        operation_id = observation.operation_id,
+        stage = observation.stage,
+        stage_in_flight = observation.in_flight,
+        outcome,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        stage_results = ?observation.results,
+        "Builder readiness confirmation finished"
+    );
+    result.context("Builder readiness deadline exceeded")?
 }
 
 /// Create a builder without publishing its registration before the confirmation deadline.
@@ -822,6 +992,7 @@ async fn create_builder_inner(
 
     params.resource_binding = bound_target.resource_binding;
     params.builder_startup_mode = startup_mode;
+    params.retained_storage = creation::captured_storage(state, &execution_context).await?;
 
     let cancelled = params.creation_cancelled.clone();
     let creation = state.runtime().create_container(params);
@@ -931,6 +1102,166 @@ mod remediation_tests {
     fn refreshed_registration_updates_on_id_change() {
         let existing = registered("192.168.97.8", "id-old");
         assert!(refreshed_registration(&existing, &inspected("192.168.97.8", "id-new")).is_some());
+    }
+}
+
+#[cfg(test)]
+mod registration_activity_tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+    use shared_types::ProjectExtendedFields;
+
+    fn physical(app_id: &str, cid: &str) -> ContainerBasicInfo {
+        ContainerBasicInfo {
+            container_id: cid.into(),
+            container_name: format!("rcoder-app-builder-{app_id}"),
+            container_ip: "127.0.0.1".into(),
+            internal_port: AGENT_FILE_SERVER_PORT,
+            external_port: 0,
+            project_id: app_id.into(),
+            status: "running".into(),
+            created_at: Utc::now(),
+            service_url: format!("http://127.0.0.1:{AGENT_FILE_SERVER_PORT}"),
+            workload_uid: None,
+        }
+    }
+
+    fn historical_project(
+        app_id: &str,
+        container: Option<ContainerBasicInfo>,
+    ) -> ProjectAndContainerInfo {
+        let old_activity = Utc::now() - Duration::minutes(5);
+        let mut project = ProjectAndContainerInfo::from_parts(
+            app_id.into(),
+            None,
+            None,
+            None,
+            container,
+            ProjectExtendedFields {
+                last_activity: Some(old_activity),
+                created_at: Some(old_activity - Duration::days(1)),
+                request_id: Some("historical-request".into()),
+                service_type: Some(ServiceType::UserappBuilder),
+                ..Default::default()
+            },
+        );
+        project
+            .restore_session_identity("historical-session", "historical-session-generation".into());
+        assert!(project.restore_latest_session(None));
+        let mut identity = project.persistence_identity().clone();
+        identity.generation = "historical-project-generation".into();
+        identity.revision = 17;
+        identity.predecessor = Some("historical-project-predecessor".into());
+        project.set_persistence_identity(identity);
+        project
+    }
+
+    fn assert_history_preserved(
+        expected: &ProjectAndContainerInfo,
+        actual: &ProjectAndContainerInfo,
+    ) {
+        assert_eq!(actual.created_at(), expected.created_at());
+        assert_eq!(
+            actual.persistence_identity(),
+            expected.persistence_identity()
+        );
+        assert_eq!(actual.sessions(), expected.sessions());
+        assert_eq!(actual.session_id(), None);
+        assert_eq!(actual.request_id(), expected.request_id());
+    }
+
+    /// Real Docker successor registration must not inherit the predecessor's
+    /// already-expired idle clock, even when its old project survived retirement.
+    #[tokio::test]
+    async fn new_physical_registration_refreshes_activity_and_preserves_history() {
+        let (state, app, _directory) = builder_access_test_state().await;
+        let previous = historical_project(&app.app_id, Some(physical(&app.app_id, "old-cid")));
+        state
+            .insert_project(app.app_id.clone(), Arc::new(previous.clone()))
+            .unwrap();
+        let replacement = physical(&app.app_id, "new-cid");
+        let lower_bound = Utc::now();
+
+        register_builder(&state, &app.app_id, &replacement).unwrap();
+
+        let upper_bound = Utc::now();
+        let registered = state.get_project(&app.app_id).unwrap();
+        assert_eq!(registered.container_info().unwrap().container_id, "new-cid");
+        assert_history_preserved(&previous, &registered);
+        assert!(
+            registered.last_activity() >= lower_bound && registered.last_activity() <= upper_bound,
+            "new physical instance retained expired activity: old={}, registered={}, registration began={lower_bound}",
+            previous.last_activity(),
+            registered.last_activity(),
+        );
+        let lifecycle = state
+            .userapp_store
+            .get_application(&app.app_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(lifecycle).unwrap(),
+            serde_json::to_value(app).unwrap()
+        );
+        state.userapp_store_control.shutdown().await.unwrap();
+    }
+
+    /// A retained logical placeholder has no prior execution to lend a valid
+    /// activity window to the first attached physical instance.
+    #[tokio::test]
+    async fn first_physical_attachment_refreshes_old_placeholder_activity() {
+        let (state, app, _directory) = builder_access_test_state().await;
+        let previous = historical_project(&app.app_id, None);
+        state
+            .insert_project(app.app_id.clone(), Arc::new(previous.clone()))
+            .unwrap();
+        let first = physical(&app.app_id, "first-cid");
+        let lower_bound = Utc::now();
+
+        register_builder(&state, &app.app_id, &first).unwrap();
+
+        let registered = state.get_project(&app.app_id).unwrap();
+        assert_history_preserved(&previous, &registered);
+        assert!(
+            registered.last_activity() >= lower_bound,
+            "first attached execution retained the placeholder's expired activity"
+        );
+        state.userapp_store_control.shutdown().await.unwrap();
+    }
+
+    /// Repeated same-instance registration, address correction and registry
+    /// reads must preserve idle history instead of indefinitely renewing it.
+    #[tokio::test]
+    async fn same_physical_registration_and_reads_keep_expired_activity() {
+        let (state, app, _directory) = builder_access_test_state().await;
+        let basic = physical(&app.app_id, "same-cid");
+        let previous = historical_project(&app.app_id, Some(basic.clone()));
+        state
+            .insert_project(app.app_id.clone(), Arc::new(previous.clone()))
+            .unwrap();
+        let mut corrected = basic.clone();
+        corrected.container_ip = "127.0.0.2".into();
+        corrected.service_url = format!("http://127.0.0.2:{AGENT_FILE_SERVER_PORT}");
+        for observation in [&basic, &basic, &corrected] {
+            register_builder(&state, &app.app_id, observation).unwrap();
+            assert_eq!(
+                registered_builder(&state, &app.app_id)
+                    .unwrap()
+                    .container_id,
+                "same-cid"
+            );
+            let registered = state.get_project(&app.app_id).unwrap();
+            assert_eq!(registered.last_activity(), previous.last_activity());
+            assert_history_preserved(&previous, &registered);
+        }
+        assert_eq!(
+            registered_builder(&state, &app.app_id)
+                .unwrap()
+                .container_ip,
+            "127.0.0.2"
+        );
+        state.userapp_store_control.shutdown().await.unwrap();
     }
 }
 

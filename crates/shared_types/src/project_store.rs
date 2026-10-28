@@ -23,6 +23,64 @@ use chrono::{DateTime, Utc};
 
 use crate::{ContainerBasicInfo, ProjectAndContainerInfo, ServiceType, StorageStats};
 
+/// One background status observation bound to the physical incarnation it
+/// probed. A probe result may only be written back while the registration
+/// still holds exactly this physical identity; a replaced or retired
+/// registration must never inherit a predecessor's activity clock or status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentStatusObservation {
+    /// Physical registry key captured together with the incarnation.
+    pub container_name: String,
+    /// Physical UID of the probed instance (K8s Pod UID / Docker container ID).
+    pub container_id: String,
+    /// Controller identity captured with the probe (Docker: None).
+    pub workload_uid: Option<String>,
+    /// Project incarnation captured before dispatch, checked by both backends.
+    pub project_generation: String,
+    /// Structural revision captured with the generation.
+    pub project_revision: i64,
+    /// Memory-only projections may not have a durable container registration.
+    pub container_generation: Option<String>,
+    /// Captured container structural revision, never reread from a successor.
+    pub container_revision: Option<i64>,
+    /// Whether the probed instance reported active work.
+    pub active: bool,
+}
+
+impl AgentStatusObservation {
+    /// Capture owned identities before any runtime/RPC wait. A shared physical
+    /// projection already inconsistent with its durable binding is not a probe.
+    pub fn capture(info: &ProjectAndContainerInfo, active: bool) -> Option<Self> {
+        let basic = info.container_info()?;
+        let identity = info.persistence_identity();
+        if identity
+            .container
+            .as_ref()
+            .and_then(|value| value.physical_uid.as_ref())
+            .is_some_and(|uid| uid != &basic.container_id)
+        {
+            return None;
+        }
+        Some(Self {
+            container_name: basic.container_name,
+            container_id: basic.container_id,
+            workload_uid: basic.workload_uid,
+            project_generation: identity.generation.clone(),
+            project_revision: identity.revision,
+            container_generation: identity
+                .container
+                .as_ref()
+                .map(|value| value.generation.clone()),
+            container_revision: identity.container.as_ref().map(|value| value.revision),
+            active,
+        })
+    }
+
+    pub fn matches(&self, info: &ProjectAndContainerInfo) -> bool {
+        Self::capture(info, self.active).as_ref() == Some(self)
+    }
+}
+
 /// project/session/container 映射存储契约（内存与 PG 双后端统一接口）
 pub trait ProjectStore: Send + Sync {
     // ========== 查询（纯读，无副作用） ==========
@@ -116,11 +174,20 @@ pub trait ProjectStore: Send + Sync {
     /// 更新 agent 运行状态（status_checker / idle 标记）
     fn update_agent_status(&self, project_id: &str, status: i32, message: &str) -> bool;
 
+    /// 按观察代次应用后台状态结论：仅当注册仍持有该物理实例（UID/workload
+    /// 一致）时更新 agent 状态，且仅在 `active` 时刷新活动时钟；换代/缺席
+    /// 返回 false，观察结果整体丢弃，绝不写给后继代次。
+    fn apply_agent_status_observation(
+        &self,
+        project_id: &str,
+        observation: &AgentStatusObservation,
+    ) -> bool;
+
     // ========== 删除清理 ==========
 
-    /// 删除容器及其全部关联 project，并发送物理销毁请求（唯一物理销毁触发点）。
+    /// 仅删除容器及其全部关联 project 的元数据。
     ///
-    /// 返回 (容器是否存在, 连带删除的 project 数)。物理销毁经 CleanupRequest
-    /// 队列交给 ResourceReaper 异步执行；队满时实现侧丢弃并告警。
+    /// 返回 (容器是否存在, 连带删除的 project 数)。运行时调用方负责原物理实例
+    /// 的受控停止及连接退休；本方法不会提交额外物理删除、SSE或路由清理。
     fn delete_container_with_projects(&self, container_id: &str) -> (bool, usize);
 }

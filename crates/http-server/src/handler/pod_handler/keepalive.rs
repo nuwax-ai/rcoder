@@ -107,6 +107,22 @@ pub async fn pod_keepalive(
         request.user_id, request.project_id, container_identifier
     );
 
+    // Hold the same admission as creation and idle retirement through both
+    // runtime observation and publication of the canonical registration.
+    let _admission = state
+        .acquire_agent_workload(
+            &container_identifier,
+            &service_type,
+            rcoder_storage::WorkloadAdmissionMode::Shared,
+        )
+        .await
+        .map_err(|error| {
+            AppError::with_message(
+                shared_types::error_codes::ERR_CONFLICT,
+                format!("Workload admission unavailable; retry later: {error}"),
+            )
+        })?;
+
     // 2. 先确认容器存在（Docker 查询），不存在直接返回错误
     //
     // 修复（顺序问题）：必须先确认容器存在，再刷新活动时间。

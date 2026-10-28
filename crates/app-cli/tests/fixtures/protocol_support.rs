@@ -28,3 +28,29 @@ pub fn reserve_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
 }
+
+/// A wildcard bind alone can coexist with a specific listener on macOS. Check
+/// both the service bind and the actual HTTP destination before starting any
+/// owner; never signal or reuse an unrelated listener.
+pub fn business_port_available(port: u16) -> std::io::Result<bool> {
+    for address in [
+        std::net::Ipv4Addr::UNSPECIFIED,
+        std::net::Ipv4Addr::LOCALHOST,
+    ] {
+        match std::net::TcpListener::bind((address, port)) {
+            Ok(listener) => drop(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
+#[test]
+fn business_port_probe_rejects_an_existing_loopback_listener() {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    assert!(!business_port_available(port).unwrap());
+    drop(listener);
+    assert!(business_port_available(port).unwrap());
+}

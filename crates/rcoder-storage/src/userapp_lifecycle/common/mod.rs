@@ -2,6 +2,10 @@
 //! execute here; the storage owner drains complete admitted transactions.
 mod activity;
 #[cfg(feature = "pg")]
+mod builder_retirement;
+#[cfg(feature = "pg")]
+pub(crate) use builder_retirement::authorize_builder_registration_retirement;
+#[cfg(feature = "pg")]
 mod builder_registration;
 #[cfg(feature = "pg")]
 pub(crate) use builder_registration::{
@@ -12,9 +16,15 @@ pub(crate) use builder_registration::{
 mod activity_tests;
 #[cfg(test)]
 mod admission_cancellation_tests;
+#[cfg(all(test, any(feature = "userapp-turso", feature = "pg")))]
+mod builder_restart_stop_observation_tests;
 mod codec;
 mod compute;
+#[cfg(all(test, any(feature = "userapp-turso", feature = "pg")))]
+mod compute_deadline_tests;
 mod compute_execution;
+#[cfg(all(test, any(feature = "userapp-turso", feature = "pg")))]
+mod compute_interrupted_update_tests;
 mod compute_recovery;
 #[cfg(all(test, feature = "userapp-turso"))]
 mod compute_tests;
@@ -23,6 +33,8 @@ mod concurrency_tests;
 mod configuration;
 #[cfg(all(test, feature = "userapp-turso"))]
 mod configuration_tests;
+#[cfg(all(test, any(feature = "userapp-turso", feature = "pg")))]
+mod kubernetes_restart_stop_confirmation_tests;
 #[cfg(feature = "userapp-turso")]
 mod local_format;
 #[cfg(all(test, feature = "userapp-turso"))]
@@ -32,7 +44,9 @@ mod ops;
 mod pg_commit_reply_tests;
 #[cfg(test)]
 mod recovery_scan_tests;
+mod recovery_witness;
 mod repo;
+mod retained_input;
 #[cfg(test)]
 mod transaction_fault_tests;
 #[cfg(test)]
@@ -119,32 +133,51 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         let app_id = app_id.to_owned();
         let lifecycle_id = lifecycle_id.to_owned();
         self.run(true, move |tx, _backend| {
+            Box::pin(async move { recovery_witness::original(tx, &app_id, &lifecycle_id).await })
+        })
+        .await
+    }
+    async fn get_recovery_storage_witness(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+    ) -> Result<Option<UserAppDiscoveredIdentity>, UserAppStoreError> {
+        let app_id = app_id.to_owned();
+        let lifecycle_id = lifecycle_id.to_owned();
+        self.run(true, move |tx, _backend| {
+            Box::pin(async move { recovery_witness::remaining(tx, &app_id, &lifecycle_id).await })
+        })
+        .await
+    }
+    async fn restore_storage_identity(
+        &self,
+        storage: &UserAppRetainedStorage,
+    ) -> Result<UserAppLifecycleRecord, UserAppStoreError> {
+        storage
+            .validate()
+            .map_err(UserAppStoreError::InvalidOperation)?;
+        let storage = storage.clone();
+        self.run(false, move |tx, backend| {
             Box::pin(async move {
-                let Some(row) =
-                    crate::db::models::RecoveryWitness::filter_by_app_id_and_lifecycle_id(
-                        &app_id,
-                        &lifecycle_id,
-                    )
-                    .first()
-                    .exec(tx)
-                    .await
-                    .map_err(storage)?
-                else {
-                    return Ok(None);
-                };
-                let witness: UserAppDiscoveredIdentity =
-                    serde_json::from_str(&row.witness_json).map_err(storage)?;
-                witness
-                    .validate()
-                    .map_err(UserAppStoreError::InvalidOperation)?;
-                if witness.app_id != app_id || witness.lifecycle_id != lifecycle_id {
+                let mut proposed = super::domain::identity(&storage.app_id)?;
+                if let Some(id) = &storage.lifecycle_id {
+                    proposed.lifecycle_id = id.clone();
+                }
+                let app = repo::ensure(tx, backend, &proposed).await?;
+                super::domain::validate_active(&app)?;
+                if storage
+                    .lifecycle_id
+                    .as_ref()
+                    .is_some_and(|id| id != &app.lifecycle_id)
+                {
                     return Err(UserAppStoreError::LifecycleConflict);
                 }
-                Ok(Some(witness))
+                Ok(app)
             })
         })
         .await
     }
+
     async fn restore_discovered_identity(
         &self,
         discovered: &UserAppDiscoveredIdentity,
@@ -252,7 +285,7 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         explicit_start: bool,
     ) -> Result<(), UserAppStoreError> {
         let app_id = app_id.to_owned();
-        self.run(false, move |tx, backend| {
+        self.run(!explicit_start, move |tx, backend| {
             Box::pin(async move {
                 compute::check_access(tx, backend, &app_id, scope, explicit_start).await
             })
@@ -287,6 +320,17 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
             Box::pin(async move {
                 compute_execution::finalize_interrupted(tx, backend, &identity, &snapshot).await
             })
+        })
+        .await
+    }
+
+    async fn expire_deployment_update(
+        &self,
+        snapshot: &UserAppOperationRecord,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move { ops::expire_deployment_update(tx, backend, &snapshot).await })
         })
         .await
     }
@@ -348,6 +392,105 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
             Box::pin(async move {
                 compute_recovery::problem(tx, backend, &snapshot, &code, &message).await
             })
+        })
+        .await
+    }
+
+    /// 恢复器把不可恢复（如 image-roll 滚动目标缺席）的 recovery_required
+    /// compute 操作按 failed 终态收口：保留 checkpoint 证据并写 terminal_at_us。
+    async fn fail_unrecoverable_compute_control(
+        &self,
+        snapshot: &ComputeControlRecord,
+        code: &str,
+        message: &str,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let code = code.to_owned();
+        let message = message.to_owned();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_recovery::fail_unrecoverable(tx, backend, &snapshot, &code, &message).await
+            })
+        })
+        .await
+    }
+
+    async fn bind_compute_control_deadline(
+        &self,
+        snapshot: &ComputeControlRecord,
+        deadline_epoch_ms: i64,
+    ) -> Result<i64, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_recovery::bind_deadline(tx, backend, &snapshot, deadline_epoch_ms).await
+            })
+        })
+        .await
+    }
+
+    async fn compute_control_deadline(
+        &self,
+        app_id: &str,
+        operation_id: &str,
+    ) -> Result<Option<i64>, UserAppStoreError> {
+        let app_id = app_id.to_owned();
+        let operation_id = operation_id.to_owned();
+        self.run(true, move |tx, backend| {
+            Box::pin(async move {
+                compute_recovery::read_deadline(tx, backend, &app_id, &operation_id).await
+            })
+        })
+        .await
+    }
+
+    async fn fail_expired_compute_control(
+        &self,
+        snapshot: &ComputeControlRecord,
+        code: &str,
+        message: &str,
+        expected_unheld_observed_ms: i64,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let code = code.to_owned();
+        let message = message.to_owned();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_recovery::expire(
+                    tx,
+                    backend,
+                    &snapshot,
+                    &code,
+                    &message,
+                    expected_unheld_observed_ms,
+                )
+                .await
+            })
+        })
+        .await
+    }
+
+    async fn mark_compute_control_unheld(
+        &self,
+        snapshot: &ComputeControlRecord,
+        observed_ms: i64,
+    ) -> Result<i64, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_recovery::mark_unheld(tx, backend, &snapshot, observed_ms).await
+            })
+        })
+        .await
+    }
+
+    async fn clear_compute_control_unheld(
+        &self,
+        snapshot: &ComputeControlRecord,
+    ) -> Result<(), UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move { compute_recovery::clear_unheld(tx, backend, &snapshot).await })
         })
         .await
     }
@@ -421,6 +564,68 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         self.run(false, move |tx, backend| {
             Box::pin(async move {
                 compute_execution::resume_stopped_restart(tx, backend, &snapshot, &target).await
+            })
+        })
+        .await
+    }
+
+    async fn confirm_builder_restart_stopped(
+        &self,
+        snapshot: &ComputeControlRecord,
+        observation: &BuilderRestartStopObservation,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let observation = observation.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_execution::confirm_builder_restart_stopped(
+                    tx,
+                    backend,
+                    &snapshot,
+                    &observation,
+                )
+                .await
+            })
+        })
+        .await
+    }
+
+    async fn confirm_kubernetes_restart_stopped(
+        &self,
+        snapshot: &ComputeControlRecord,
+        evidence: KubernetesRestartStopEvidence,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_execution::confirm_kubernetes_restart_stopped(
+                    tx, backend, &snapshot, evidence,
+                )
+                .await
+            })
+        })
+        .await
+    }
+
+    async fn fail_unrebuildable_builder_restart(
+        &self,
+        snapshot: &ComputeControlRecord,
+        observation: &BuilderRestartStopObservation,
+        unavailable: Option<&BuilderRestartArchiveUnavailable>,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let observation = observation.clone();
+        let unavailable = unavailable.cloned();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_execution::fail_unrebuildable_builder_restart(
+                    tx,
+                    backend,
+                    &snapshot,
+                    &observation,
+                    unavailable.as_ref(),
+                )
+                .await
             })
         })
         .await
@@ -710,6 +915,19 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         })
         .await
     }
+    async fn read_retained_runtime_input(
+        &self,
+        app_id: &str,
+        lifecycle_id: &str,
+    ) -> Result<Option<UserAppExecutionInput>, UserAppStoreError> {
+        let app_id = app_id.to_owned();
+        let lifecycle_id = lifecycle_id.to_owned();
+        self.run(true, move |tx, backend| {
+            Box::pin(async move { retained_input::read(tx, backend, &app_id, &lifecycle_id).await })
+        })
+        .await
+    }
+
     async fn read_execution_input(
         &self,
         context: &UserAppExecutionContext,
@@ -717,6 +935,18 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         let context = context.clone();
         self.run(false, move |tx, backend| {
             Box::pin(async move { ops::read_execution_input(tx, backend, &context).await })
+        })
+        .await
+    }
+    async fn read_recovery_execution_input(
+        &self,
+        snapshot: &UserAppOperationRecord,
+    ) -> Result<UserAppExecutionInput, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(
+                async move { ops::read_recovery_execution_input(tx, backend, &snapshot).await },
+            )
         })
         .await
     }
@@ -952,6 +1182,20 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         })
         .await
     }
+    async fn reserve_interrupted_hot(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        binding: &UserAppOperationLeaseBinding,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let binding = binding.clone();
+        self.run(false, move |tx, backend| {
+            Box::pin(
+                async move { ops::reserve_interrupted_hot(tx, backend, &snapshot, &binding).await },
+            )
+        })
+        .await
+    }
     async fn finalize_observed_hot_failure(
         &self,
         snapshot: &UserAppOperationRecord,
@@ -978,6 +1222,24 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         self.run(false, move |tx, backend| {
             Box::pin(async move {
                 ops::settle_fenced_operation(tx, backend, &snapshot, &evidence, &release_note).await
+            })
+        })
+        .await
+    }
+
+    async fn settle_stale_running_builder(
+        &self,
+        snapshot: &UserAppOperationRecord,
+        evidence: &serde_json::Value,
+        release_note: &str,
+    ) -> Result<UserAppOperationRecord, UserAppStoreError> {
+        let snapshot = snapshot.clone();
+        let evidence = evidence.clone();
+        let release_note = release_note.to_string();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                ops::settle_stale_running_builder(tx, backend, &snapshot, &evidence, &release_note)
+                    .await
             })
         })
         .await
@@ -1298,12 +1560,8 @@ impl UserAppRuntimeConfigurationStore for ToastyUserAppStore {
     }
 }
 
-/// Offline E2E observation never initializes schemas or quarantines live records.
-/// The directory lease is held through owner shutdown, preventing concurrent RCoder access.
 #[cfg(feature = "userapp-turso")]
-pub async fn offline_snapshot(
-    path: &std::path::Path,
-) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+async fn offline_owner(path: &std::path::Path) -> anyhow::Result<DatabaseOwner> {
     use crate::db::{
         driver::{ConnectionPolicy, PolicyDriver},
         models,
@@ -1314,7 +1572,7 @@ pub async fn offline_snapshot(
         tokio::task::spawn_blocking(move || super::exclusive_directory::acquire(&requested))
             .await??;
     local_format::require_ready(&path)?;
-    let owner = DatabaseOwner::open(1, 1, lock, move || async move {
+    DatabaseOwner::open(1, 1, lock, move || async move {
         let mut db = toasty::Db::builder()
             .models(models::storage_models())
             .max_pool_size(1)
@@ -1326,7 +1584,18 @@ pub async fn offline_snapshot(
         schema::verify_existing(&mut db, Backend::Turso, Component::Userapp).await?;
         Ok(db)
     })
-    .await?;
+    .await
+}
+
+/// Offline E2E observation never initializes schemas or quarantines live records.
+/// The directory lease is held through owner shutdown, preventing concurrent RCoder access.
+#[cfg(feature = "userapp-turso")]
+pub async fn offline_snapshot(
+    path: &std::path::Path,
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    use crate::db::models;
+
+    let owner = offline_owner(path).await?;
     let result = owner
         .execute(|mut db| async move {
             let mut tx = db.transaction().await?;
@@ -1345,6 +1614,51 @@ pub async fn offline_snapshot(
             applications.sort();
             operations.sort();
             Ok((applications, operations))
+        })
+        .await;
+    owner.shutdown().await?;
+    result
+}
+
+/// Offline-only private operation view. Public HTTP serialization stays unchanged.
+#[cfg(feature = "userapp-turso")]
+#[derive(serde::Serialize)]
+struct OfflineComputeRecord<'a> {
+    #[serde(flatten)]
+    record: &'a ComputeControlRecord,
+    request_id: &'a str,
+    request_fingerprint: &'a str,
+    lease: &'a Option<UserAppOperationLeaseReceipt>,
+}
+
+/// Read one typed compute record while holding the same offline directory lease.
+/// Private admission and physical lease fields are exposed only to this observer.
+#[cfg(feature = "userapp-turso")]
+pub async fn offline_compute_snapshot(
+    path: &std::path::Path,
+    app_id: &str,
+    operation_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let owner = offline_owner(path).await?;
+    let app_id = app_id.to_owned();
+    let operation_id = operation_id.to_owned();
+    let result = owner
+        .execute(move |mut db| async move {
+            let mut tx = db.transaction().await?;
+            let record = compute::get(&mut tx, &app_id, &operation_id).await?;
+            let json = record
+                .as_ref()
+                .map(|record| {
+                    serde_json::to_string(&OfflineComputeRecord {
+                        record,
+                        request_id: &record.request_id,
+                        request_fingerprint: &record.request_fingerprint,
+                        lease: &record.lease,
+                    })
+                })
+                .transpose()?;
+            tx.commit().await?;
+            Ok(json)
         })
         .await;
     owner.shutdown().await?;

@@ -157,8 +157,17 @@ mod tests {
         assert!(resolve_file_path_within_workspace(root, "../escape").is_none());
         // 空 → None
         assert!(resolve_file_path_within_workspace(root, "").is_none());
-        // 绝对路径在 root 外 → None
-        assert!(resolve_file_path_within_workspace(root, "/etc/passwd").is_none());
+        // 绝对路径在 root 外 → None。探针须是**宿主绝对路径**：`Path::is_absolute`
+        // 是平台语义，Windows 上 `/etc/passwd` 不带盘符前缀、不算绝对路径，
+        // 会被当相对路径 join 进 root 而命中。
+        #[cfg(unix)]
+        let outside_absolute = "/etc/passwd";
+        #[cfg(windows)]
+        let outside_absolute = r"C:\Windows\system32";
+        assert!(
+            resolve_file_path_within_workspace(root, outside_absolute).is_none(),
+            "root 外的宿主绝对路径 {outside_absolute} 必须拒绝"
+        );
         // 注: "/src/a.txt" 形态的前导斜杠兼容由外层 resolve_existing_file 重试
         // （见 resolve_existing_file_hits_leading_slash_compat），本函数内先按
         // 绝对路径处理（不在 root 下 → None）

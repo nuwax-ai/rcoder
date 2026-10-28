@@ -2,6 +2,7 @@
 name = "file-server-ab"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish = false
 description = "Black-box A/B harness for RCoder Rust and nuwax TypeScript file servers"
 

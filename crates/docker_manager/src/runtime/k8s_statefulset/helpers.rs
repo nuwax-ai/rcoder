@@ -247,7 +247,8 @@ pub(super) fn conditional_scale_patch(
             .labels
             .as_ref()
             .and_then(|labels| labels.get(SERVICE_TYPE_LABEL))
-            != Some(&service_type.to_string())
+            .and_then(|value| value.parse::<ServiceType>().ok())
+            .is_none_or(|existing| !existing.same_container_family(*service_type))
     {
         return Err(ContainerRuntimeError::Conflict(
             "StatefulSet ownership changed or deletion is in progress".into(),

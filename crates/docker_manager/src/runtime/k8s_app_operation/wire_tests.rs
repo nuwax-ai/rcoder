@@ -5,6 +5,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[path = "previous_owner_wire_tests.rs"]
 mod previous_owner_wire_tests;
 
+#[path = "hot_lease_tests.rs"]
+mod hot_lease_tests;
+
+#[path = "observed_expired_tests.rs"]
+mod observed_expired_tests;
+
+#[path = "handoff_wire_tests.rs"]
+mod handoff_wire_tests;
+
 fn runtime_for(client: kube::Client) -> KubernetesRuntime {
     use crate::runtime::kubernetes_runtime::{KubernetesRuntime, KubernetesRuntimeConfig};
     KubernetesRuntime {
@@ -145,7 +154,7 @@ async fn client_for(address: std::net::SocketAddr) -> kube::Client {
 async fn original_lease_observation_is_read_only_and_distinguishes_expiry_from_identity() {
     use container_runtime_api::AppOperationLeaseObservation;
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        for variant in 0..14 {
+        for variant in 0..17 {
             let context = context_for("takeover", "original-op");
             let mut lease = lease_json("original-uid", "99", Some(&context.operation_id), 3600, 0);
             let annotations = lease["metadata"]["annotations"].as_object_mut().unwrap();
@@ -224,20 +233,77 @@ async fn original_lease_observation_is_read_only_and_distinguishes_expiry_from_i
                     lease["metadata"]["annotations"]["rcoder.io/application-id"] =
                         "foreign-app".into()
                 }
+                // 14-16：Lease 缺席后的 legacy ConfigMap fallback 观察。
+                14..=16 => {
+                    code = 404;
+                    lease = status(404, "absent");
+                }
                 _ => unreachable!(),
+            }
+            // ConfigMap fallback 应答（仅 Lease 404 的 variant 会触发第二个 GET）。
+            let configmap = serde_json::json!({
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": {
+                    "name": "rcoder-operation-prod-takeover",
+                    "namespace": "lease-test",
+                    "uid": "original-uid",
+                    "resourceVersion": "old-acquisition-rv",
+                    "labels": {
+                        "rcoder.io/operation-app": "takeover",
+                        "rcoder.io/operation-family": ServiceType::Userapp.to_string(),
+                    },
+                    "annotations": {
+                        "rcoder.io/legacy-operation-id": token,
+                    },
+                },
+            });
+            let mut configmap_code = 200;
+            let mut configmap_body = configmap.clone();
+            match variant {
+                10 | 15 => {
+                    if variant == 15 {
+                        configmap_code = 200;
+                        configmap_body["metadata"]["annotations"]["rcoder.io/legacy-operation-id"] =
+                            "successor-token".into();
+                    } else {
+                        configmap_code = 404;
+                        configmap_body = status(404, "absent");
+                    }
+                }
+                16 => {
+                    configmap_code = 500;
+                    configmap_body = status(500, "transport unavailable");
+                }
+                _ => {}
             }
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
+            let needs_configmap = matches!(variant, 10 | 14..=16);
             let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let (head, body) = read_request(&mut stream).await;
-                assert!(
-                    head.starts_with("GET ")
-                        && head.contains("/leases/rcoder-operation-prod-takeover"),
-                    "{head}"
-                );
-                assert!(body.is_empty(), "observation cannot submit a mutation body");
-                write_reply(&mut stream, code, &lease).await;
+                let mut replies = vec![(
+                    "GET /apis/coordination.k8s.io/v1/namespaces/lease-test/leases/rcoder-operation-prod-takeover HTTP/1.1",
+                    code,
+                    lease,
+                )];
+                if needs_configmap {
+                    replies.push((
+                        "GET /api/v1/namespaces/lease-test/configmaps/rcoder-operation-prod-takeover HTTP/1.1",
+                        configmap_code,
+                        configmap_body,
+                    ));
+                }
+                for (expected_request, reply_code, reply_body) in replies {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let (head, body) = read_request(&mut stream).await;
+                    assert_eq!(
+                        head.lines().next(),
+                        Some(expected_request),
+                        "observation must read the expected object in order: {head}"
+                    );
+                    assert!(body.is_empty(), "observation cannot submit a mutation body");
+                    write_reply(&mut stream, reply_code, &reply_body).await;
+                }
+                observed_expired_tests::reject_additional_request(&listener).await;
             });
             let runtime = runtime_for(client_for(address).await);
             let receipt = shared_types::UserAppOperationLeaseReceipt::Kubernetes {
@@ -256,8 +322,11 @@ async fn original_lease_observation_is_read_only_and_distinguishes_expiry_from_i
                     result.unwrap(),
                     AppOperationLeaseObservation::ExpiredOriginalIdentity
                 ),
-                1 => assert_eq!(result.unwrap(), AppOperationLeaseObservation::Held),
-                10 => assert_eq!(result.unwrap(), AppOperationLeaseObservation::Unconfirmed),
+                1 | 14 => assert_eq!(result.unwrap(), AppOperationLeaseObservation::Held),
+                10 => assert_eq!(
+                    result.unwrap(),
+                    AppOperationLeaseObservation::AbsentOriginalIdentity
+                ),
                 _ => assert!(
                     result.is_err(),
                     "variant {variant} unexpectedly granted observation: {result:?}"
@@ -782,4 +851,221 @@ async fn deletion_retirement_after_lease_takeover_never_deletes_successor_lease(
         runtime.release_captured_application_operation(&context, &original).await.expect("release old authority without touching successor");
         server.await.expect("wire assertions");
     }).await.expect("bounded lease takeover reconciliation");
+}
+
+#[tokio::test]
+async fn vacant_serving_acquisition_never_takes_over_an_expired_or_foreign_mutex() {
+    drop(rustls::crypto::ring::default_provider().install_default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (head, _) = read_request(&mut stream).await;
+        requests.push(head.lines().next().unwrap().to_owned());
+        write_reply(&mut stream, 409, &status(409, "occupied")).await;
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (head, _) = read_request(&mut stream).await;
+        requests.push(head.lines().next().unwrap().to_owned());
+        let mut occupied = lease_json("foreign-uid", "41", Some("foreign-holder"), 3600, 0);
+        occupied["metadata"]["labels"]["rcoder.io/operation-app"] = "another-app".into();
+        write_reply(&mut stream, 200, &occupied).await;
+        requests
+    });
+    let client = kube::Client::try_from(kube::Config::new(
+        format!("http://{address}").parse().unwrap(),
+    ))
+    .unwrap();
+    let runtime = runtime_for(client);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        runtime.acquire_vacant_application_operation("takeover"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(result, Err(ContainerRuntimeError::OperationInProgress(_))),
+        "No create409 path may proceed to a takeover/renew/release"
+    );
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("POST "));
+    assert!(requests[1].starts_with("GET "));
+}
+
+/// 陈旧 Running EnsureBuilder 的免回执权威观测：holder/注解身份区分 + 过期
+/// 判定 + 缺席/传输失败。身份不符一律 Foreign（不可判断、不可释放），活续
+/// 约 = ActiveOriginal，只有"本执行身份 + 已过期"才给 ExpiredOriginal。
+#[tokio::test]
+async fn unbound_builder_authority_observation_distinguishes_identity_and_expiry() {
+    use container_runtime_api::UnboundBuilderCreationAuthority;
+    let base_context = || shared_types::UserAppExecutionContext {
+        app_id: "unbound-app".into(),
+        lifecycle_id: "lifecycle-unbound".into(),
+        operation_id: "op-unbound".into(),
+        executor_id: "executor-unbound".into(),
+        request_fingerprint: "ab".repeat(32),
+    };
+    let builder_lease = |renew_age_secs: i64| {
+        let renew = (k8s_openapi::jiff::Timestamp::now()
+            - k8s_openapi::jiff::SignedDuration::from_secs(renew_age_secs))
+        .to_string();
+        let context = base_context();
+        serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
+            "metadata": {
+                "name": "rcoder-operation-builder-unbound-app",
+                "namespace": "lease-test",
+                "uid": "lease-uid-1", "resourceVersion": "12",
+                "labels": {
+                    "rcoder.io/operation-app": "unbound-app",
+                    "rcoder.io/operation-family": ServiceType::UserappBuilder.to_string(),
+                },
+                "annotations": {
+                    "rcoder.io/operation-id": context.operation_id,
+                    "rcoder.io/lifecycle-id": context.lifecycle_id,
+                    "rcoder.io/executor-id": context.executor_id,
+                    "rcoder.io/request-fingerprint": context.request_fingerprint,
+                    "rcoder.io/lease-token": context.executor_id,
+                    "rcoder.io/compute-lease": "true",
+                },
+            },
+            "spec": {
+                "holderIdentity": format!("{}:{}", context.executor_id, context.operation_id),
+                "leaseDurationSeconds": LEASE_TTL_SECONDS,
+                "acquireTime": renew,
+                "renewTime": renew,
+                "leaseTransitions": 0,
+            },
+        })
+    };
+    for variant in 0..14 {
+        let context = base_context();
+        let mut lease = builder_lease(3600);
+        let mut code = 200;
+        match variant {
+            0 => {}
+            1 => {
+                lease["spec"]["renewTime"] = k8s_openapi::jiff::Timestamp::now().to_string().into()
+            }
+            2 => lease["spec"]["holderIdentity"] = "successor:op-later".into(),
+            3 => {
+                code = 404;
+                lease = status(404, "absent");
+            }
+            4 => {
+                lease["metadata"]["annotations"]["rcoder.io/executor-id"] =
+                    "foreign-executor".into()
+            }
+            5 => {
+                // 历史部分戳记：只剩 holder 字符串绑定身份。
+                lease["metadata"]["annotations"] = serde_json::json!({});
+            }
+            6 => {
+                lease["metadata"]["annotations"]["rcoder.io/lease-token"] = "successor-token".into()
+            }
+            7 => {
+                lease["metadata"]["deletionTimestamp"] =
+                    k8s_openapi::jiff::Timestamp::now().to_string().into()
+            }
+            8 => {
+                lease["spec"].as_object_mut().unwrap().remove("renewTime");
+            }
+            9 => lease["spec"]["leaseDurationSeconds"] = 0.into(),
+            10 => {
+                lease["metadata"].as_object_mut().unwrap().remove("uid");
+            }
+            11 => lease["metadata"]["annotations"]["rcoder.io/lifecycle-id"] = "".into(),
+            12 | 13 => {}
+            _ => unreachable!(),
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (head, _) = read_request(&mut stream).await;
+            assert!(
+                head.starts_with("GET ")
+                    && head.contains("/configmaps/rcoder-operation-builder-unbound-app"),
+                "{head}"
+            );
+            if variant == 12 {
+                write_reply(&mut stream, 200, &serde_json::json!({"apiVersion":"v1", "kind":"ConfigMap", "metadata":{"name":"rcoder-operation-builder-unbound-app"}})).await;
+                return;
+            }
+            if variant == 13 {
+                write_reply(
+                    &mut stream,
+                    403,
+                    &status(403, "legacy observation forbidden"),
+                )
+                .await;
+                return;
+            }
+            write_reply(&mut stream, 404, &status(404, "legacy absent")).await;
+            stream.shutdown().await.unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (head, body) = read_request(&mut stream).await;
+            assert!(
+                head.starts_with("GET ")
+                    && head.contains("/leases/rcoder-operation-builder-unbound-app"),
+                "{head}"
+            );
+            assert!(body.is_empty(), "authority observation is read-only");
+            write_reply(&mut stream, code, &lease).await;
+        });
+        let runtime = runtime_for(client_for(address).await);
+        let result = runtime
+            .observe_unbound_builder_creation_authority(&context)
+            .await;
+        server.await.expect("wire assertions");
+        match variant {
+            0 => assert_eq!(
+                result.unwrap(),
+                UnboundBuilderCreationAuthority::ExpiredOriginal {
+                    holder: "executor-unbound:op-unbound".into(),
+                    receipt: shared_types::UserAppOperationLeaseReceipt::Kubernetes {
+                        service_type: ServiceType::UserappBuilder,
+                        namespace: "lease-test".into(),
+                        name: "rcoder-operation-builder-unbound-app".into(),
+                        uid: "lease-uid-1".into(),
+                        resource_version: "12".into(),
+                        token: "executor-unbound".into()
+                    },
+                }
+            ),
+            1 => assert_eq!(
+                result.unwrap(),
+                UnboundBuilderCreationAuthority::ActiveOriginal
+            ),
+            2 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 => assert!(
+                matches!(
+                    result.unwrap(),
+                    UnboundBuilderCreationAuthority::Foreign { .. }
+                ),
+                "variant {variant}: identity mismatch must stay foreign"
+            ),
+            3 => assert_eq!(result.unwrap(), UnboundBuilderCreationAuthority::Absent),
+            13 => assert!(
+                result.is_err(),
+                "legacy observation errors must stay unknown"
+            ),
+            _ => unreachable!(),
+        }
+    }
+    // 传输失败传播为 Err（保持不判死）。
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (_head, _body) = read_request(&mut stream).await;
+        write_reply(&mut stream, 500, &status(500, "transport unavailable")).await;
+    });
+    let runtime = runtime_for(client_for(address).await);
+    let result = runtime
+        .observe_unbound_builder_creation_authority(&base_context())
+        .await;
+    server.abort();
+    drop(server.await);
+    assert!(result.is_err(), "transport failures must propagate");
 }

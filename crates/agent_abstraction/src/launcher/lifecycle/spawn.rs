@@ -27,7 +27,7 @@ use super::{
 /// 将多个构造函数参数封装为结构体，提升可读性和可维护性。
 pub struct ClaudeProcessParams {
     pub project_id: String,
-    pub session_id: SessionId,
+    pub session_id: Option<SessionId>,
     pub child_process: Box<dyn ChildWrapper>,
     pub stderr_task: JoinHandle<()>,
     pub cancel_token: CancellationToken,
@@ -68,7 +68,7 @@ impl AgentLifecycleGuard {
     ) -> Result<Self> {
         Self::new_claude_full(ClaudeProcessParams {
             project_id,
-            session_id,
+            session_id: Some(session_id),
             child_process,
             stderr_task,
             cancel_token,
@@ -116,7 +116,14 @@ impl AgentLifecycleGuard {
         // process-wrap 的 ProcessGroup 使用 setpgid(0, 0) 创建新进程组，使进程成为组长
         let pgid = pid;
         let project_id_clone = project_id.clone();
-        let session_id_str = session_id.0.to_string();
+        // Process ownership exists before ACP assigns a session identity.
+        // A historical state label never becomes that identity either.
+        let session_id = session_id.filter(|id| {
+            shared_types::SessionHint::classify(Some(id.0.as_ref()))
+                .as_session_id()
+                .is_some()
+        });
+        let session_id_str = session_id.as_ref().map(|id| id.0.to_string());
 
         // 🔥 关键：立即启动后台回收任务
         // 这个任务会等待子进程退出，确保不会产生僵尸进程
@@ -130,6 +137,12 @@ impl AgentLifecycleGuard {
         let command_for_reaper = process_command.clone();
         let args_for_reaper = process_args.clone();
         let working_dir_for_reaper = working_dir.clone();
+        if let (Some(uuid), Some(map)) = (&service_uuid, &project_uuid_map) {
+            map.insert(project_id.clone(), uuid.clone());
+        }
+        let manager_for_reaper = shared_api_key_manager.clone();
+        let uuid_map_for_reaper = project_uuid_map.clone();
+        let uuid_for_reaper = service_uuid.clone();
         let (exit_tx, exit_result) = tokio::sync::watch::channel(None);
         let reaper_task = tokio::spawn(async move {
             info!(
@@ -155,6 +168,20 @@ impl AgentLifecycleGuard {
                 .as_ref()
                 .map(|_| ())
                 .map_err(ToString::to_string);
+
+            // 仅真实 wait 成功才能收回该代次的配置。取消受理、Drop 或未知
+            // wait 结果都不能先删仍可能被活进程使用的绑定。先清理再发布退出，
+            // 保证重试复用同一个请求 UUID 时，新进程配置不会被旧 reaper 删除。
+            if exit_outcome.is_ok()
+                && let Some(uuid) = &uuid_for_reaper
+            {
+                if let Some(map) = &uuid_map_for_reaper {
+                    map.remove_if(&project_id_for_reaper, |_, current| current == uuid);
+                }
+                if let Some(manager) = &manager_for_reaper {
+                    manager.remove(uuid);
+                }
+            }
 
             // 检查是否是外部取消（用户主动 stop）
             let was_cancelled = cancel_token_for_reaper.is_cancelled();
@@ -293,7 +320,7 @@ impl AgentLifecycleGuard {
         });
 
         info!(
-            "[LifecycleGuard] 创建 Claude Agent 守卫: project_id={}, pgid={}, session_id={}",
+            "[LifecycleGuard] 创建 Claude Agent 守卫: project_id={}, pgid={}, session_id={:?}",
             project_id, pgid, session_id_str
         );
 

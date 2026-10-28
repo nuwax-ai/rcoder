@@ -37,7 +37,10 @@ async fn prepare_conversation(
         .project_id
         .clone()
         .filter(|id| !id.trim().is_empty());
-    let hinted_session = request.session_id.clone().filter(|id| !id.is_empty());
+    let hinted_session = shared_types::SessionHint::classify(request.session_id.as_deref())
+        .as_session_id()
+        .map(str::to_owned);
+    request.session_id = hinted_session.clone();
     let session_owner = match hinted_session.as_deref() {
         Some(session_id) => state
             .projects
@@ -88,7 +91,9 @@ async fn prepare_conversation(
         None
     } else if hinted_session.is_some() {
         request.session_id.clone()
-    } else if let Some(session_id) = binding.current_session_id.as_deref() {
+    } else if let Some(session_id) =
+        shared_types::SessionHint::classify(binding.current_session_id.as_deref()).as_session_id()
+    {
         match state
             .projects
             .get_userapp_agent_session(session_id)
@@ -199,12 +204,12 @@ pub(super) async fn run_userapp_dev_chat_flow(
             force_new_session,
         })
         .await;
-    if let Some(response) = result
-        .data
-        .as_ref()
-        .filter(|data| !data.session_id.is_empty())
-    {
-        if response.project_id != project_id {
+    if let Some(session_id) = session::response_session_id(&mut result, &project_id) {
+        if result
+            .data
+            .as_ref()
+            .is_some_and(|response| response.project_id != project_id)
+        {
             return Err(AppError::internal_server_error(
                 "UserApp agent response changed the conversation project_id",
             )
@@ -229,7 +234,7 @@ pub(super) async fn run_userapp_dev_chat_flow(
             .projects
             .register_userapp_agent_session_for_route(
                 &binding,
-                &response.session_id,
+                &session_id,
                 request_id,
                 deadline,
                 &app_project_generation,

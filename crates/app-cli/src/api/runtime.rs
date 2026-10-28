@@ -263,9 +263,15 @@ pub(super) async fn submit_operation(
         }
         shared_types::RuntimeOperationKind::Deploy => match &body.request.profile {
             shared_types::RunProfileInput::Source { .. } => None,
-            shared_types::RunProfileInput::Artifact { .. } => {
-                Some(CredentialRecoveryPurpose::DeployCurrentArtifact)
-            }
+            shared_types::RunProfileInput::Artifact { artifact } => Some(match artifact {
+                shared_types::ArtifactInput::RetainedWorkspace { .. } => {
+                    CredentialRecoveryPurpose::RestoreRetainedWorkspace
+                }
+                shared_types::ArtifactInput::Url { .. }
+                | shared_types::ArtifactInput::ArtifactId { .. } => {
+                    CredentialRecoveryPurpose::DeployCurrentArtifact
+                }
+            }),
         },
         shared_types::RuntimeOperationKind::Stop => None,
     };

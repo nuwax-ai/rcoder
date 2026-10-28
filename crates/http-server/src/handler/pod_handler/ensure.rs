@@ -16,6 +16,8 @@ use axum::response::IntoResponse;
         (status = 202, description = "已有 UserApp 计算资源需要物理启动；返回持久操作 ID 和查询地址，不等待业务服务 Ready。受理后有界等待（≤15s）物理工作负载对象出现：creation_observed=true 表示创建已观察；false 表示仍在创建中（已受理，非失败），凭 operation_id 查询/重试", body = HttpResult<crate::userapp_builder::compute_control::ComputeOperationView>),
         (status = 400, description = "请求参数无效", body = HttpResult<String>),
         (status = 401, description = "API Key 鉴权失败", body = HttpResult<String>),
+        (status = 409, description = "普通 Computer 项目归属冲突：ERR_COMPUTER_OWNER_CONFLICT；reason 区分 user/pod/service_family，retryable=false；未派发聊天任务且不更换原登记归属", body = HttpResult<String>),
+        (status = 503, description = "普通 Computer 登记暂未确认，未派发聊天任务", body = HttpResult<String>),
         (status = 500, description = "服务器内部错误", body = HttpResult<String>)
     ),
     tag = "pod",
@@ -55,6 +57,23 @@ pub async fn pod_ensure(
 }
 
 pub(crate) async fn ensure_ordinary_pod(
+    state: &Arc<AppState>,
+    request: &EnsurePodRequest,
+    locale: &'static str,
+) -> Result<HttpResult<EnsurePodResponse>, AppError> {
+    let state = state.clone();
+    let request = request.clone();
+    // Runtime creation may outlive a disconnected HTTP caller. Its task owns
+    // admission until the accepted write and registration have both settled.
+    let flight = crate::handler::utils::owned_operation_flight(&state)?;
+    crate::handler::utils::spawn_owned_operation(flight, async move {
+        ensure_ordinary_pod_inner(&state, &request, locale).await
+    })
+    .await
+    .map_err(|error| AppError::internal_server_error(&format!("Ensure task failed: {error}")))?
+}
+
+async fn ensure_ordinary_pod_inner(
     state: &Arc<AppState>,
     request: &EnsurePodRequest,
     locale: &'static str,
@@ -107,34 +126,59 @@ pub(crate) async fn ensure_ordinary_pod(
         request.user_id, request.project_id, service_type, container_identifier
     );
 
-    // === 并发保护：检查是否有其他请求正在创建同一用户的容器 ===
-    // 使用原子标记（DashMap）避免并发请求互相干扰，无死锁风险
-    if let Some(response) = ensure_flow::wait_for_concurrent_creation(
+    let admission = state
+        .acquire_agent_workload(
+            &container_identifier,
+            &service_type,
+            rcoder_storage::WorkloadAdmissionMode::Shared,
+        )
+        .await
+        .map_err(|error| {
+            AppError::with_message(
+                shared_types::error_codes::ERR_CONFLICT,
+                format!("Workload admission unavailable; retry later: {error}"),
+            )
+        })?;
+
+    ensure_ordinary_pod_with_admission(
         state,
         request,
-        &service_type,
+        locale,
+        &admission,
         &container_identifier,
+        &service_type,
     )
     .await
-    {
-        return response;
-    }
+}
 
-    // 2. 🔍 实时查询 runtime 检查容器是否存在（不依赖缓存），未运行的旧容器
-    // 连同 SSE/gRPC 连接一并清理
-    let need_create =
-        ensure_flow::resolve_need_create(state, &container_identifier, &service_type).await?;
+/// Restart passes its exclusive guard through Ensure instead of reacquiring a
+/// shared lock behind itself. This preserves one admission lifetime per request.
+pub(super) async fn ensure_ordinary_pod_with_admission(
+    state: &Arc<AppState>,
+    request: &EnsurePodRequest,
+    _locale: &'static str,
+    admission: &rcoder_storage::WorkloadAdmissionGuard,
+    container_identifier: &str,
+    service_type: &ServiceType,
+) -> Result<HttpResult<EnsurePodResponse>, AppError> {
+    admission.verify_current().await.map_err(|error| {
+        AppError::with_message(
+            shared_types::error_codes::ERR_CONFLICT,
+            format!("Workload admission was lost; retry later: {error}"),
+        )
+    })?;
+    // Ensure and chat share one lifetime-bound creation admission. A waiter
+    // timeout or Pending observation never grants permission to replace compute.
+    let (container_info, created) =
+        ensure_flow::ensure_with_retry(state, request, service_type, container_identifier).await?;
 
-    // 3. 获取或创建容器（带重试机制 + 标记）
-    let (container_info, created) = if need_create {
-        let info =
-            ensure_flow::create_with_retry(state, request, &service_type, &container_identifier)
-                .await?;
-        (info, true)
-    } else {
-        ensure_flow::get_existing_with_sync(state, request, &service_type, &container_identifier)
-            .await?
-    };
+    crate::handler::utils::refresh_workload_fence(
+        state,
+        admission,
+        container_identifier,
+        service_type,
+    )
+    .await?;
 
     // 4/5/6. 注册 VNC backend + 更新存储记录 + 构建响应
     let message = if created {
@@ -145,11 +189,12 @@ pub(crate) async fn ensure_ordinary_pod(
     persist_and_respond(
         state,
         request,
-        &service_type,
+        service_type,
         &container_info,
         created,
         message,
     )
+    .await
 }
 
 // ============================================================================

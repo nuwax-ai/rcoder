@@ -375,7 +375,7 @@ def deploy(c):
     c.kube('rollout', 'status', 'statefulset/postgres', '--timeout=180s', timeout=210)
     c.kube('rollout', 'status', 'deployment/rcoder', '--timeout=300s', timeout=330)
     dep = owned(c, 'deployment', 'rcoder')
-    receipt.update(outside_baseline=baseline, deployment_uid=dep['metadata']['uid'], generation=dep['metadata']['generation'],
+    receipt.update(outside_baseline=baseline, fixture_profile=c.get('PROFILE', 'full'), deployment_uid=dep['metadata']['uid'], generation=dep['metadata']['generation'],
                    url=c.url, gateway_url=gateway_url(c), config_sha256=digest([r for r in resources if r['kind'] != 'Secret']))
     atomic_json(c.state / 'deployment.json', receipt)
     smoke(c, receipt)
@@ -424,7 +424,10 @@ def http_health(url):
 
 def smoke(c, receipt):
     identity(c, receipt)
-    for claim in ['workspace', 'computer-workspace', 'cephfs-root', 'postgres-data']:
+    claims = ['workspace', 'computer-workspace', 'postgres-data']
+    if receipt.get('fixture_profile', 'full') == 'full':
+        claims.append('cephfs-root')
+    for claim in claims:
         if owned(c, 'pvc', claim)['status']['phase'] != 'Bound':
             raise RuntimeError('Unbound PVC: ' + claim)
     http_health(receipt['url'])
@@ -530,6 +533,8 @@ def run_userapp_suite(c, receipt, context):
             '--internal-url', 'http://rcoder.' + c.ns + '.svc:8086']
     output = run(args, timeout=2400, env=env, log=context['report_dir'] / 'userapp.log', guard=lambda: alive(c))
     (context['report_dir'] / 'userapp.log').write_text(output)
+    run(args + ['--scenario', 'default_recovery'], timeout=2400, env=env,
+        log=context['report_dir'] / 'userapp-default-recovery.log', guard=lambda: alive(c))
 
 
 def prepare_test_snapshot(c, manifest_override=None):
@@ -557,6 +562,15 @@ def execute_suites(c, receipt, context, suite, case=''):
     test_snapshot.verify(context['snapshot_record'])
     started = time.monotonic()
     try:
+        if suite == 'orphan':
+            # Load the selected test driver from this run's frozen source, not
+            # from a later active checkout or a filtered chat suite.
+            import importlib.util
+            path = context['snapshot_path'] / 'tools/remote_k8s/orphan.py'
+            spec = importlib.util.spec_from_file_location('remote_k8s_orphan_frozen', path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            module.run(c, receipt, context, guard=lambda: alive(c))
         if suite in ['gateway', 'all']:
             for kind, name in [('gateway', 'rcoder'), ('httproute', 'rcoder')]:
                 row = owned(c, kind, name)
@@ -841,7 +855,7 @@ def main():
     parser.add_argument('action', choices=['doctor', 'sync-start', 'sync-status', 'sync-stop', 'build', 'deploy',
                                            'test', 'verify', 'logs', 'down', 'status', 'check', 'retest-failed', 'tenant-isolation'])
     # 参数经环境变量安全传递（make 侧不插值进 shell；见 make/remote-k8s.mk）。
-    parser.add_argument('--suite', choices=['smoke', 'userapp', 'chat', 'gateway', 'all'],
+    parser.add_argument('--suite', choices=['smoke', 'userapp', 'chat', 'gateway', 'orphan', 'all'],
                         default=os.environ.get('REMOTE_K8S_SUITE', 'smoke'))
     parser.add_argument('--case', default=os.environ.get('REMOTE_K8S_CASE', ''))
     parser.add_argument('--run', default=os.environ.get('REMOTE_K8S_RUN', ''))

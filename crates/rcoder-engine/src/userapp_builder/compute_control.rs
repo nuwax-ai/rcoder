@@ -1,5 +1,9 @@
 //! Detached compute coordination. Admission never waits for a business slot.
 //! Runtime calls retain their physical receipt until their outcome is confirmed.
+#![deny(
+    clippy::wildcard_enum_match_arm,
+    clippy::match_wildcard_for_single_variants
+)]
 use crate::app_state::AppState;
 use anyhow::{Context, Result, anyhow, ensure};
 use futures::FutureExt as _;
@@ -9,7 +13,28 @@ use std::{sync::Arc, time::Duration};
 
 mod builder_start;
 use builder_start::prepare_start_options;
+mod failure;
+mod policy;
+mod restart_stop_recovery;
 mod stopped_template;
+
+const PREVIOUS_EXECUTIONS_DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
+const PREVIOUS_EXECUTIONS_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const RESTART_READINESS_TIMEOUT: Duration = Duration::from_secs(300);
+const RESTART_READINESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Total-operation budget for a compute control: it covers drain, stop, start
+/// and every recovery continuation of the same operation id. At expiry (and
+/// only once the physical lease provably stopped renewing) the recovery scan
+/// settles the control as failed, which unblocks the scope's admission fence.
+const COMPUTE_CONTROL_TOTAL_DEADLINE_SECS: i64 = 15 * 60;
+/// Settlement quiet window after the first durable unheld observation. The
+/// kube client's default write timeout is 295s (connect is 30s, reads are
+/// unbounded), so a write the dead holder had already submitted can land up
+/// to ~5 minutes after its last renewal — well past the 60s lease TTL. The
+/// window must exceed that plus a re-observation margin before the terminal
+/// CAS releases the scope's admission fence.
+const COMPUTE_SETTLEMENT_QUIET_MS: i64 = 360 * 1000;
+const ERR_DEADLINE_EXCEEDED: &str = "ERR_DEADLINE_EXCEEDED";
 
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct ComputeOperationView {
@@ -78,7 +103,7 @@ pub async fn submit(
         scope,
         action,
         request,
-        action == ComputeControlAction::Restart,
+        policy::is_restart(action),
     )
     .await
 }
@@ -161,8 +186,11 @@ async fn submit_with_startup_mode(
         .ok_or_else(|| {
             app_manager::AppOperationError::NotFound(format!("Application {app_id} was not found"))
         })?;
-    if app.state != UserAppLifecycleState::Active {
-        return Err(UserAppStoreError::LifecycleConflict.into());
+    match app.state {
+        UserAppLifecycleState::Active => {}
+        UserAppLifecycleState::Deleting | UserAppLifecycleState::Deleted => {
+            return Err(UserAppStoreError::LifecycleConflict.into());
+        }
     }
     if request
         .lifecycle_id
@@ -213,10 +241,15 @@ async fn submit_with_startup_mode(
         Ok(record) => record,
         Err(UserAppStoreError::OperationInProgress(blocker))
             if blocker.scope == scope
-                && matches!(
-                    blocker.state,
-                    UserAppOperationState::Running | UserAppOperationState::RecoveryRequired
-                ) =>
+                && match blocker.state {
+                    UserAppOperationState::Running | UserAppOperationState::RecoveryRequired => {
+                        true
+                    }
+                    UserAppOperationState::Pending
+                    | UserAppOperationState::WaitingRetry
+                    | UserAppOperationState::Succeeded
+                    | UserAppOperationState::Failed => false,
+                } =>
         {
             // A retry of the same physical intent must continue the original
             // operation. A new operation would discard its unknown remote write
@@ -242,7 +275,15 @@ async fn submit_with_startup_mode(
         }
         Err(error) => return Err(error.into()),
     };
-    if record.state == ComputeControlState::RecoveryRequired || record.can_recover_compute_drain() {
+    let resume_existing = match record.state {
+        ComputeControlState::RecoveryRequired => true,
+        ComputeControlState::Pending
+        | ComputeControlState::Running
+        | ComputeControlState::Succeeded
+        | ComputeControlState::Failed
+        | ComputeControlState::Superseded => record.can_recover_compute_drain(),
+    };
+    if resume_existing {
         let state = state.clone();
         let retry = record.clone();
         tokio::spawn(async move {
@@ -253,15 +294,24 @@ async fn submit_with_startup_mode(
                 tracing::warn!(%error, operation_id = %retry.operation_id, "Compute retry still requires inspection");
             }
         });
-    } else if record.state == ComputeControlState::Pending {
-        let state = state.clone();
-        let pending = record.clone();
-        tokio::spawn(async move {
-            let _flight = flight;
-            if let Err(error) = execute_pending(&state, pending).await {
-                tracing::error!(%error, "Compute coordinator stopped; inspect durable operation");
+    } else {
+        match record.state {
+            ComputeControlState::Pending => {
+                let state = state.clone();
+                let pending = record.clone();
+                tokio::spawn(async move {
+                    let _flight = flight;
+                    if let Err(error) = execute_pending(&state, pending).await {
+                        tracing::error!(%error, "Compute coordinator stopped; inspect durable operation");
+                    }
+                });
             }
-        });
+            ComputeControlState::Running
+            | ComputeControlState::RecoveryRequired
+            | ComputeControlState::Succeeded
+            | ComputeControlState::Failed
+            | ComputeControlState::Superseded => {}
+        }
     }
     Ok(record.into())
 }
@@ -283,9 +333,20 @@ pub async fn recover(
         return Err(UserAppStoreError::VersionConflict.into());
     }
     let flight = state.userapp_op_flight.guard()?;
-    if current.action == ComputeControlAction::Restart
-        && (current.stage == "stopped"
-            || (current.stage == "starting"
+    if restart_stop_recovery::eligible(&current) {
+        let (state, current_worker) = (state.clone(), current.clone());
+        tokio::spawn(async move {
+            let _flight = flight;
+            if let Err(error) = restart_stop_recovery::recover(&state, &current_worker).await {
+                tracing::warn!(%error, operation_id = %current_worker.operation_id,
+                    "Original Docker Restart stop recovery requires inspection");
+            }
+        });
+        return Ok(current.into());
+    }
+    if policy::is_restart(current.action)
+        && (current.stage == ComputeControlStage::Stopped.as_str()
+            || (current.stage == ComputeControlStage::Starting.as_str()
                 && (current.has_conditional_compute_write()
                     || builder_start::missing_creation(&current))))
     {
@@ -299,16 +360,7 @@ pub async fn recover(
         });
         return Ok(current.into());
     }
-    if matches!(
-        (current.action, current.stage.as_str()),
-        (ComputeControlAction::Stop, "stopped" | "stopping")
-            | (ComputeControlAction::Restart, "verifying" | "starting")
-    ) || (current.scope == UserAppOperationScope::Prod
-        && matches!(
-            (current.action, current.stage.as_str()),
-            (ComputeControlAction::Stop, "stopping") | (ComputeControlAction::Restart, "starting")
-        ))
-    {
+    if policy::can_observe_completion(current.action, &current.stage) {
         let completed = recover_confirmed(state, &current).await?;
         drop(flight);
         return Ok(completed.into());
@@ -332,15 +384,51 @@ pub async fn recover(
     Ok(current.into())
 }
 
+/// Shared by explicit same-operation recovery and the bounded background scan.
+/// Scheduling is not execution authority; the original runtime FD and store CAS
+/// remain mandatory inside the recovery worker.
+pub(crate) fn can_recover_original_docker_stop(record: &ComputeControlRecord) -> bool {
+    restart_stop_recovery::eligible(record)
+}
+
+pub(crate) async fn recover_original_docker_stop(
+    state: &AppState,
+    record: &ComputeControlRecord,
+) -> Result<()> {
+    restart_stop_recovery::recover(state, record).await
+}
+
+/// The Kubernetes counterpart of the boundary above: read-only stop evidence
+/// plus the exact stage CAS; scheduling is not execution authority.
+pub(crate) fn can_confirm_kubernetes_restart_stop(record: &ComputeControlRecord) -> bool {
+    restart_stop_recovery::kubernetes_eligible(record)
+}
+
+pub(crate) async fn confirm_kubernetes_restart_stop(
+    state: &AppState,
+    record: &ComputeControlRecord,
+) -> Result<()> {
+    restart_stop_recovery::confirm_kubernetes_stop(state, record).await
+}
+
 /// Recover a durable completion boundary or an exact atomic remote stop receipt.
 /// This path contains no start/stop/redeploy calls, even after a lost response.
 pub(crate) async fn recover_confirmed(
     state: &AppState,
     record: &ComputeControlRecord,
 ) -> Result<ComputeControlRecord> {
-    let observed_stop = record.action == ComputeControlAction::Stop && record.stage == "stopping";
+    recover_confirmed_with_guard(state, record, None).await
+}
+
+async fn recover_confirmed_with_guard(
+    state: &AppState,
+    record: &ComputeControlRecord,
+    held_guard: Option<&dyn AppOperationLease>,
+) -> Result<ComputeControlRecord> {
+    let observed_stop = !policy::is_restart(record.action)
+        && record.stage == ComputeControlStage::Stopping.as_str();
     let observed_restart =
-        record.action == ComputeControlAction::Restart && record.stage == "starting";
+        policy::is_restart(record.action) && record.stage == ComputeControlStage::Starting.as_str();
     let mut observation_only = false;
     if observed_restart || observed_stop {
         let context = record.execution_context().map_err(anyhow::Error::msg)?;
@@ -348,7 +436,9 @@ pub(crate) async fn recover_confirmed(
             .lease
             .as_ref()
             .context("Compute completion recovery lease is missing")?;
-        if !state
+        if let Some(guard) = held_guard {
+            restart_stop_recovery::validate_guard(guard, record).await?;
+        } else if !state
             .runtime()
             .validate_app_operation_receipt(&context, receipt)
             .await?
@@ -399,7 +489,7 @@ pub(crate) async fn recover_confirmed(
     }
     let mut observed_builder = None;
     let mut observed_checkpoint = None;
-    if observed_restart && record.scope == UserAppOperationScope::Dev {
+    if observed_restart && policy::uses_builder(record.scope)? {
         let target: BuilderControlTarget =
             BuilderControlTarget::from_observation_checkpoint(&record.checkpoint)?;
         ensure!(
@@ -456,8 +546,7 @@ pub(crate) async fn recover_confirmed(
         }
         // Runtime observation must not refresh a cache before the terminal CAS.
     }
-    if record.action == ComputeControlAction::Restart && record.scope == UserAppOperationScope::Prod
-    {
+    if policy::is_restart(record.action) && !policy::uses_builder(record.scope)? {
         let context = record.execution_context().map_err(anyhow::Error::msg)?;
         let expected: UserAppMutationTarget = serde_json::from_value(record.checkpoint.clone())?;
         ensure!(
@@ -552,7 +641,9 @@ pub(crate) async fn recover_confirmed(
     }
     // A release failure leaves terminal + receipt for the ordinary cleanup scan.
     // It must not turn the confirmed runtime outcome back into uncertainty.
-    if let Some(receipt) = &completed.lease {
+    if held_guard.is_none()
+        && let Some(receipt) = &completed.lease
+    {
         let context = completed.execution_context().map_err(anyhow::Error::msg)?;
         match state
             .runtime()
@@ -590,15 +681,18 @@ async fn require_original_lease_identity(
     receipt: &UserAppOperationLeaseReceipt,
 ) -> Result<()> {
     use container_runtime_api::AppOperationLeaseObservation;
+    let confirmed = match state
+        .runtime()
+        .observe_app_operation_lease(context, receipt)
+        .await?
+    {
+        AppOperationLeaseObservation::Held
+        | AppOperationLeaseObservation::ExpiredOriginalIdentity => true,
+        AppOperationLeaseObservation::AbsentOriginalIdentity
+        | AppOperationLeaseObservation::Unconfirmed => false,
+    };
     ensure!(
-        matches!(
-            state
-                .runtime()
-                .observe_app_operation_lease(context, receipt)
-                .await?,
-            AppOperationLeaseObservation::Held
-                | AppOperationLeaseObservation::ExpiredOriginalIdentity
-        ),
+        confirmed,
         "Original compute lease identity is not confirmed for result observation"
     );
     Ok(())
@@ -616,10 +710,13 @@ async fn progress(
         .advance_compute_control(&ComputeControlProgress {
             identity: identity.clone(),
             expected_revision: record.revision,
-            state: if stage == ComputeControlStage::Completed {
-                ComputeControlState::Succeeded
-            } else {
-                ComputeControlState::Running
+            state: match stage {
+                ComputeControlStage::Completed => ComputeControlState::Succeeded,
+                ComputeControlStage::DrainingPrevious
+                | ComputeControlStage::Stopping
+                | ComputeControlStage::Stopped
+                | ComputeControlStage::Starting
+                | ComputeControlStage::Verifying => ComputeControlState::Running,
             },
             stage,
             checkpoint,
@@ -648,6 +745,24 @@ pub(crate) async fn execute_pending(state: &AppState, pending: ComputeControlRec
         Err(UserAppStoreError::VersionConflict) => return Ok(()), // another replica won
         Err(error) => return Err(error.into()),
     };
+    // The total deadline bounds the whole operation (drain, stop, start and
+    // every recovery continuation of this operation id). A binding failure is
+    // a liveness-net shortfall, not a business error: the recovery scan binds
+    // lazily on the next observation.
+    if let Err(error) = state
+        .userapp_store
+        .bind_compute_control_deadline(
+            &record,
+            chrono::Utc::now().timestamp_millis() + COMPUTE_CONTROL_TOTAL_DEADLINE_SECS * 1000,
+        )
+        .await
+    {
+        tracing::warn!(
+            %error,
+            operation_id = %record.operation_id,
+            "Compute control deadline binding deferred to the recovery scan"
+        );
+    }
     if record
         .request_id
         .starts_with(AUTOMATIC_REPAIR_REQUEST_PREFIX)
@@ -699,86 +814,61 @@ pub(crate) async fn execute_pending(state: &AppState, pending: ComputeControlRec
             return Ok(());
         }
     }
-    let mut stage = ComputeControlStage::DrainingPrevious;
-    let mut settled = true;
-    let result = std::panic::AssertUnwindSafe(execute_claimed(
-        state,
-        &mut record,
-        &identity,
-        &mut stage,
-        &mut settled,
-    ))
-    .catch_unwind()
-    .await
-    .unwrap_or_else(|_| {
-        Err(anyhow!(
-            "Compute execution panicked; inspect its captured runtime stage"
-        ))
-    });
-    if let Err(error) = result {
-        // A superseding Stop owns the head now; this executor cannot rewrite it.
-        if state
-            .userapp_store
-            .check_compute_executor(&identity)
+    // Until predecessor drain and lease preparation finish, absence of our
+    // local receipt does not establish that all outstanding effects are settled.
+    let mut settled = false;
+    let result =
+        std::panic::AssertUnwindSafe(execute_claimed(state, &mut record, &identity, &mut settled))
+            .catch_unwind()
             .await
-            .is_ok()
-        {
-            let failure = ComputeControlProgress {
-                identity: identity.clone(),
-                expected_revision: record.revision,
-                state: if settled && stage == ComputeControlStage::Stopped {
-                    ComputeControlState::Failed
-                } else {
-                    ComputeControlState::RecoveryRequired
-                },
-                stage,
-                checkpoint: record.checkpoint.clone(),
-                error_code: Some(ERR_BACKEND_ERROR.into()),
-                error_message: Some(format!("{error:#}")),
-            };
-            state
-                .userapp_store
-                .advance_compute_control(&failure)
-                .await
-                .context("Persist compute execution recovery state")?;
-        }
-        if settled
-            && let Some(current) = state
-                .userapp_store
-                .get_compute_control(&identity.app_id, &identity.operation_id)
-                .await?
-            && current.state == ComputeControlState::Superseded
-        {
-            let evidence = if current.stage == "draining_previous" {
-                ComputeControlDrainEvidence::NoMutationSubmitted
-            } else {
-                ComputeControlDrainEvidence::MutationCompleted {
-                    checkpoint: current.checkpoint.clone(),
-                }
-            };
-            let drained = state
-                .userapp_store
-                .acknowledge_compute_drain(&ComputeControlDrainAcknowledgement {
-                    identity: identity.clone(),
-                    expected_revision: current.revision,
-                    evidence,
-                })
-                .await?;
-            if let Some(ref receipt) = drained.lease {
-                state
-                    .runtime()
-                    .release_app_operation_receipt(
-                        &drained.execution_context().map_err(anyhow::Error::msg)?,
-                        receipt,
-                    )
-                    .await?;
-                state
+            .unwrap_or_else(|_| {
+                Err(anyhow!(
+                    "Compute execution panicked; inspect its captured runtime stage"
+                ))
+            });
+    if let Err(error) = result {
+        let reporting = async {
+            failure::record(state, &record, &identity, settled, &error).await?;
+            if settled
+                && let Some(current) = state
                     .userapp_store
-                    .forget_compute_lease(&identity, receipt)
+                    .get_compute_control(&identity.app_id, &identity.operation_id)
+                    .await?
+                && current.state == ComputeControlState::Superseded
+            {
+                let evidence = if current.stage == ComputeControlStage::DrainingPrevious.as_str() {
+                    ComputeControlDrainEvidence::NoMutationSubmitted
+                } else {
+                    ComputeControlDrainEvidence::MutationCompleted {
+                        checkpoint: current.checkpoint.clone(),
+                    }
+                };
+                let drained = state
+                    .userapp_store
+                    .acknowledge_compute_drain(&ComputeControlDrainAcknowledgement {
+                        identity: identity.clone(),
+                        expected_revision: current.revision,
+                        evidence,
+                    })
                     .await?;
+                if let Some(ref receipt) = drained.lease {
+                    state
+                        .runtime()
+                        .release_app_operation_receipt(
+                            &drained.execution_context().map_err(anyhow::Error::msg)?,
+                            receipt,
+                        )
+                        .await?;
+                    state
+                        .userapp_store
+                        .forget_compute_lease(&identity, receipt)
+                        .await?;
+                }
             }
+            Ok(())
         }
-        return Err(error);
+        .await;
+        return Err(failure::with_reporting_error(error, reporting));
     }
     Ok(())
 }
@@ -846,9 +936,9 @@ pub(super) async fn drain_previous_once(
                 "Interrupted compute lifecycle differs from current control"
             );
             if old.state == ComputeControlState::Superseded
-                && old.action == ComputeControlAction::Restart
-                && (matches!(old.stage.as_str(), "stopped" | "verifying")
-                    || (matches!(old.stage.as_str(), "starting" | "stopping")
+                && policy::is_restart(old.action)
+                && (policy::persisted_mutation_boundary(&old.stage)
+                    || (policy::write_in_flight(&old.stage)
                         && (old.has_conditional_compute_write()
                             || old.has_docker_compute_target())))
                 && old.lease.is_some()
@@ -856,10 +946,9 @@ pub(super) async fn drain_previous_once(
                 match reconcile_superseded(state, &old).await {
                     Ok(closed) => old = closed,
                     Err(error)
-                        if matches!(
-                            error.downcast_ref::<UserAppStoreError>(),
-                            Some(UserAppStoreError::VersionConflict)
-                        ) =>
+                        if error
+                            .downcast_ref::<UserAppStoreError>()
+                            .is_some_and(policy::is_version_conflict) =>
                     {
                         drained = false;
                         continue;
@@ -867,10 +956,8 @@ pub(super) async fn drain_previous_once(
                     Err(error) => return Err(error),
                 }
             }
-            if matches!(
-                old.state,
-                ComputeControlState::Succeeded | ComputeControlState::Failed
-            ) && let Some(receipt) = old.lease.as_ref()
+            if policy::completed_result(old.state)
+                && let Some(receipt) = old.lease.as_ref()
             {
                 let context = old.execution_context().map_err(anyhow::Error::msg)?;
                 state
@@ -899,11 +986,8 @@ pub(super) async fn drain_previous_once(
                 drained = false;
                 continue;
             }
-            drained &= (matches!(
-                old.state,
-                ComputeControlState::Succeeded | ComputeControlState::Failed
-            ) || (old.state == ComputeControlState::Superseded
-                && old.executor_id.is_none()))
+            drained &= (policy::completed_result(old.state)
+                || (old.state == ComputeControlState::Superseded && old.executor_id.is_none()))
                 && old.lease.is_none();
         } else {
             return Err(anyhow!("Interrupted operation evidence is missing: {id}"));
@@ -916,12 +1000,12 @@ async fn execute_claimed(
     state: &AppState,
     record: &mut ComputeControlRecord,
     identity: &ComputeExecutorIdentity,
-    stage: &mut ComputeControlStage,
     settled: &mut bool,
 ) -> Result<()> {
+    let builder_scope = policy::uses_builder(identity.scope)?;
     // Pending business operations were atomically cancelled by claim. Running
     // writers must finish their actual calls and leave a terminal receipt.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline = tokio::time::Instant::now() + PREVIOUS_EXECUTIONS_DRAIN_TIMEOUT;
     loop {
         state.userapp_store.check_compute_executor(identity).await?;
         let drained = drain_previous_once(state, record, identity).await?;
@@ -932,17 +1016,21 @@ async fn execute_claimed(
             tokio::time::Instant::now() < deadline,
             "Previous execution is not yet reconciled; retain the original operation and physical receipt"
         );
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(PREVIOUS_EXECUTIONS_DRAIN_POLL_INTERVAL).await;
     }
+    // Preparation/binding can itself have an unconfirmed outcome. A missing
+    // local receipt after an error does not prove that nothing was prepared.
+    *settled = false;
     let mut lease =
         super::compute_drain_recovery::prepare_and_bind(state, record, identity).await?;
+    *settled = true;
     let receipt = lease.receipt().map_err(anyhow::Error::msg)?;
     lease
         .begin_external_mutation()
         .map_err(anyhow::Error::msg)?;
     let context = record.execution_context().map_err(anyhow::Error::msg)?;
-    if record.action == ComputeControlAction::Stop
-        && identity.scope == UserAppOperationScope::Dev
+    if !policy::is_restart(record.action)
+        && builder_scope
         && let Some(orphan) = super::adoption::capture_bound_orphan_stop(state, &context).await?
     {
         let checkpoint = serde_json::to_value(&orphan)?;
@@ -954,7 +1042,6 @@ async fn execute_claimed(
             checkpoint.clone(),
         )
         .await?;
-        *stage = ComputeControlStage::Stopping;
         state.userapp_store.check_compute_executor(identity).await?;
         *settled = false;
         state.runtime().stop_builder_orphan(&orphan).await?;
@@ -967,7 +1054,6 @@ async fn execute_claimed(
             checkpoint.clone(),
         )
         .await?;
-        *stage = ComputeControlStage::Stopped;
         crate::userapp_forward::invalidate_probe_cache(&record.app_id);
         progress(
             state,
@@ -977,7 +1063,6 @@ async fn execute_claimed(
             checkpoint,
         )
         .await?;
-        *stage = ComputeControlStage::Completed;
         lease
             .finish_external_mutation()
             .await
@@ -988,7 +1073,7 @@ async fn execute_claimed(
             .await?;
         return Ok(());
     }
-    let absent = if record.action == ComputeControlAction::Stop {
+    let absent = if !policy::is_restart(record.action) {
         match identity.scope {
             UserAppOperationScope::Dev => super::adoption::capture_bound_target(state, &context)
                 .await?
@@ -1014,7 +1099,6 @@ async fn execute_claimed(
             ComputeControlStage::Completed,
         ] {
             progress(state, record, identity, next, evidence.clone()).await?;
-            *stage = next;
         }
         lease
             .finish_external_mutation()
@@ -1026,7 +1110,7 @@ async fn execute_claimed(
             .await?;
         return Ok(());
     }
-    let mut target = if identity.scope == UserAppOperationScope::Dev {
+    let mut target = if builder_scope {
         let mut captured = super::adoption::capture_bound_target(state, &context).await?;
         captured.builder_startup_mode = record
             .checkpoint
@@ -1035,9 +1119,9 @@ async fn execute_claimed(
             .transpose()
             .context("Decode captured builder startup mode")?
             .unwrap_or_default();
-        if record.action == ComputeControlAction::Restart
+        if policy::is_restart(record.action)
             && (captured.workload.is_none()
-                || captured.builder_startup_mode == BuilderStartupMode::ManagementOnly
+                || policy::management_only(captured.builder_startup_mode)
                 || record
                     .checkpoint
                     .get("restart_image_roll")
@@ -1050,15 +1134,10 @@ async fn execute_claimed(
             captured.restart_image = state.runtime().current_builder_image().await?;
         }
         freeze_builder_restart_workspace(&mut captured, record.action);
-        builder_compute_checkpoint(
-            state,
-            &captured,
-            record.action == ComputeControlAction::Restart,
-        )
-        .await?
+        builder_compute_checkpoint(state, &captured, policy::is_restart(record.action)).await?
     } else {
         let target = super::app_adoption::capture_bound_app_target(state, &context).await?;
-        if record.action == ComputeControlAction::Restart {
+        if policy::is_restart(record.action) {
             let mut prepared_target = state.runtime().prepare_app_compute_start(&target).await?;
             // Freeze the platform-default image into the very first checkpoint:
             // every later stage (including crash resume) replays this frozen
@@ -1082,9 +1161,7 @@ async fn execute_claimed(
             serde_json::to_value(target)?
         }
     };
-    if identity.scope == UserAppOperationScope::Dev
-        && record.action == ComputeControlAction::Restart
-    {
+    if builder_scope && policy::is_restart(record.action) {
         let captured: BuilderControlTarget = serde_json::from_value(target.clone())?;
         state.userapp_store.check_compute_executor(identity).await?;
         if captured.workload.is_some()
@@ -1101,10 +1178,9 @@ async fn execute_claimed(
         target.clone(),
     )
     .await?;
-    *stage = ComputeControlStage::Stopping;
     state.userapp_store.check_compute_executor(identity).await?;
     *settled = false;
-    if identity.scope == UserAppOperationScope::Dev {
+    if builder_scope {
         let target: BuilderControlTarget = serde_json::from_value(target.clone())?;
         state
             .runtime()
@@ -1124,13 +1200,12 @@ async fn execute_claimed(
         target.clone(),
     )
     .await?;
-    *stage = ComputeControlStage::Stopped;
-    if identity.scope == UserAppOperationScope::Dev {
+    if builder_scope {
         crate::userapp_forward::invalidate_probe_cache(&record.app_id);
     }
-    if record.action == ComputeControlAction::Restart {
+    if policy::is_restart(record.action) {
         // Scale-down changed resourceVersion. Refresh only the SAME physical UID.
-        let mut fresh = if identity.scope == UserAppOperationScope::Dev {
+        let mut fresh = if builder_scope {
             let old: BuilderControlTarget = serde_json::from_value(target.clone())?;
             let mut fresh = super::adoption::capture_bound_target(state, &context).await?;
             fresh.restart_image = old.restart_image.clone();
@@ -1143,7 +1218,15 @@ async fn execute_claimed(
                         && fresh.resource_binding.is_none(),
                     "A builder appeared before the original missing-compute startup"
                 );
-            } else if fresh.workload.is_none() {
+            } else if fresh.workload.is_none()
+                && old
+                    .workload
+                    .as_ref()
+                    .is_some_and(|workload| policy::uses_retained_pvc(workload.kind))
+            {
+                // Kubernetes can recreate compute from its retained PVCs.
+                // An auto-removed Docker container needs its original archive
+                // and follows the existing replacement branch below instead.
                 fresh = builder_start::prepare_missing_restart_target(
                     state.runtime().as_ref(),
                     &old,
@@ -1201,7 +1284,7 @@ async fn execute_claimed(
             }
             fresh
         };
-        let builder_options = if identity.scope == UserAppOperationScope::Dev {
+        let builder_options = if builder_scope {
             let captured: BuilderControlTarget = serde_json::from_value(fresh.clone())?;
             Some(prepare_start_options(state.runtime().as_ref(), &captured, &fresh).await?)
         } else {
@@ -1215,14 +1298,13 @@ async fn execute_claimed(
             fresh.clone(),
         )
         .await?;
-        *stage = ComputeControlStage::Starting;
         state
             .app_service
             .verify_recovered_storage(&record.app_id, identity.scope)
             .await?;
         state.userapp_store.check_compute_executor(identity).await?;
         *settled = false;
-        if identity.scope == UserAppOperationScope::Dev {
+        if builder_scope {
             let target: BuilderControlTarget = serde_json::from_value(fresh.clone())?;
             let options = builder_options
                 .as_ref()
@@ -1259,9 +1341,8 @@ async fn execute_claimed(
             fresh,
         )
         .await?;
-        *stage = ComputeControlStage::Verifying;
-        if identity.scope == UserAppOperationScope::Prod {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+        if !builder_scope {
+            let deadline = tokio::time::Instant::now() + RESTART_READINESS_TIMEOUT;
             loop {
                 state.userapp_store.check_compute_executor(identity).await?;
                 let expected: UserAppMutationTarget =
@@ -1299,7 +1380,7 @@ async fn execute_claimed(
                     tokio::time::Instant::now() < deadline,
                     "Production container did not reach the captured running generation"
                 );
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(RESTART_READINESS_POLL_INTERVAL).await;
             }
         }
     }
@@ -1373,10 +1454,9 @@ async fn resolve_stopped_app_restart<
         }
         Ok(_) => {} // restore validates the archive marker of a previous replacement.
         Err(error)
-            if matches!(
-                error.downcast_ref::<container_runtime_api::ContainerRuntimeError>(),
-                Some(container_runtime_api::ContainerRuntimeError::ContainerNotFound(_))
-            ) => {}
+            if error
+                .downcast_ref::<container_runtime_api::ContainerRuntimeError>()
+                .is_some_and(policy::is_runtime_absence) => {}
         Err(error) => return Err(error),
     }
     let template: AppRestartTemplate = serde_json::from_value(
@@ -1401,7 +1481,7 @@ pub(crate) async fn resume_restart_start(
     state: &AppState,
     snapshot: &ComputeControlRecord,
 ) -> Result<()> {
-    if snapshot.scope == UserAppOperationScope::Dev {
+    if policy::uses_builder(snapshot.scope)? {
         return resume_builder_start(state, snapshot).await;
     }
     let context = snapshot.execution_context().map_err(anyhow::Error::msg)?;
@@ -1422,7 +1502,7 @@ pub(crate) async fn resume_restart_start(
         prior.target.context == context,
         "Restart context differs from original capture"
     );
-    let prepared = if snapshot.stage == "starting" {
+    let prepared = if snapshot.stage == ComputeControlStage::Starting.as_str() {
         if state
             .runtime()
             .reconcile_app_compute_start(&prior.target)
@@ -1435,7 +1515,7 @@ pub(crate) async fn resume_restart_start(
             .context("Original startup is committed but not ready; continue observing the same operation")?
     } else {
         ensure!(
-            snapshot.stage == "stopped",
+            snapshot.stage == ComputeControlStage::Stopped.as_str(),
             "Restart has no durable stopped boundary"
         );
         let target = stopped_app_restart_target(state, &prior, &snapshot.checkpoint).await?;
@@ -1469,8 +1549,17 @@ enum RestartContinuation {
 
 async fn run_restart_continuation(
     state: &AppState,
+    record: ComputeControlRecord,
+    prepared: RestartContinuation,
+) -> Result<()> {
+    run_restart_continuation_with_guard(state, record, prepared, None).await
+}
+
+async fn run_restart_continuation_with_guard(
+    state: &AppState,
     mut record: ComputeControlRecord,
     prepared: RestartContinuation,
+    held_guard: Option<&dyn AppOperationLease>,
 ) -> Result<()> {
     let context = record.execution_context().map_err(anyhow::Error::msg)?;
     let mut checkpoint = match &prepared {
@@ -1504,6 +1593,9 @@ async fn run_restart_continuation(
             .userapp_store
             .check_compute_executor(&identity)
             .await?;
+        if let Some(guard) = held_guard {
+            restart_stop_recovery::validate_guard(guard, &record).await?;
+        }
         match &prepared {
             RestartContinuation::Prod(target) => {
                 unknown_write = true;
@@ -1552,11 +1644,11 @@ async fn run_restart_continuation(
         .await?;
         // Readiness may still be pending. Persisted Verifying lets the existing
         // scanner finish later without launching a second startup.
-        recover_confirmed(state, &record).await?;
+        recover_confirmed_with_guard(state, &record, held_guard).await?;
         // The restart reached its terminal boundary; the private archive has
         // no remaining recovery value. Records that crash before this point
         // stay covered by the scan-based GC instead.
-        if record.action == ComputeControlAction::Restart {
+        if policy::is_restart(record.action) {
             let cleanup = match record.scope {
                 UserAppOperationScope::Dev => {
                     match record.checkpoint.get("builder_restart_template") {
@@ -1595,53 +1687,33 @@ async fn run_restart_continuation(
         Ok(())
     }
     .await;
-    if let Err(error) = &result {
-        if state
-            .userapp_store
-            .check_compute_executor(&identity)
-            .await
-            .is_ok()
-        {
-            state
-                .userapp_store
-                .advance_compute_control(&ComputeControlProgress {
-                    identity: identity.clone(),
-                    expected_revision: record.revision,
-                    state: if !unknown_write && record.stage != "verifying" {
-                        ComputeControlState::Failed
-                    } else {
-                        ComputeControlState::RecoveryRequired
-                    },
-                    stage: if record.stage == "verifying" {
-                        ComputeControlStage::Verifying
-                    } else {
-                        ComputeControlStage::Starting
-                    },
-                    checkpoint: record.checkpoint.clone(),
-                    error_code: Some(ERR_BACKEND_ERROR.into()),
-                    error_message: Some(format!("{error:#}")),
-                })
-                .await?;
-        } else if !unknown_write
-            && let Some(current) = state
-                .userapp_store
-                .get_compute_control(&identity.app_id, &identity.operation_id)
-                .await?
-            && current.state == ComputeControlState::Superseded
-        {
-            state
-                .userapp_store
-                .acknowledge_compute_drain(&ComputeControlDrainAcknowledgement {
-                    identity,
-                    expected_revision: current.revision,
-                    evidence: ComputeControlDrainEvidence::MutationCompleted {
-                        checkpoint: current.checkpoint,
-                    },
-                })
-                .await?;
+    if let Err(error) = result {
+        let reporting = async {
+            if !failure::record(state, &record, &identity, !unknown_write, &error).await?
+                && !unknown_write
+                && let Some(current) = state
+                    .userapp_store
+                    .get_compute_control(&identity.app_id, &identity.operation_id)
+                    .await?
+                && current.state == ComputeControlState::Superseded
+            {
+                state
+                    .userapp_store
+                    .acknowledge_compute_drain(&ComputeControlDrainAcknowledgement {
+                        identity,
+                        expected_revision: current.revision,
+                        evidence: ComputeControlDrainEvidence::MutationCompleted {
+                            checkpoint: current.checkpoint,
+                        },
+                    })
+                    .await?;
+            }
+            Ok(())
         }
+        .await;
+        return Err(failure::with_reporting_error(error, reporting));
     }
-    result
+    Ok(())
 }
 
 pub(crate) fn missing_builder_creation(record: &ComputeControlRecord) -> bool {
@@ -1655,11 +1727,13 @@ pub(crate) async fn reconcile_superseded(
     old: &ComputeControlRecord,
 ) -> Result<ComputeControlRecord> {
     ensure!(
-        old.state == ComputeControlState::Superseded && old.action == ComputeControlAction::Restart,
+        old.state == ComputeControlState::Superseded && policy::is_restart(old.action),
         "Compute operation is not a superseded restart"
     );
     let context = old.execution_context().map_err(anyhow::Error::msg)?;
-    let evidence = if old.stage == "starting" && missing_builder_creation(old) {
+    let evidence = if old.stage == ComputeControlStage::Starting.as_str()
+        && missing_builder_creation(old)
+    {
         let receipt = old
             .lease
             .as_ref()
@@ -1684,9 +1758,7 @@ pub(crate) async fn reconcile_superseded(
         ComputeControlDrainEvidence::PersistedRuntimeAcknowledgement {
             checkpoint: old.checkpoint.clone(),
         }
-    } else if matches!(old.stage.as_str(), "starting" | "stopping")
-        && old.has_docker_compute_target()
-    {
+    } else if policy::write_in_flight(&old.stage) && old.has_docker_compute_target() {
         let receipt = old
             .lease
             .as_ref()
@@ -1704,7 +1776,7 @@ pub(crate) async fn reconcile_superseded(
                     .runtime()
                     .builder_compute_write_acknowledged(
                         &serde_json::from_value::<BuilderControlTarget>(old.checkpoint.clone())?,
-                        old.stage == "starting",
+                        old.stage == ComputeControlStage::Starting.as_str(),
                     )
                     .await?
             }
@@ -1713,7 +1785,7 @@ pub(crate) async fn reconcile_superseded(
                     .runtime()
                     .app_compute_write_acknowledged(
                         &serde_json::from_value::<UserAppMutationTarget>(old.checkpoint.clone())?,
-                        old.stage == "starting",
+                        old.stage == ComputeControlStage::Starting.as_str(),
                     )
                     .await?
             }
@@ -1726,7 +1798,7 @@ pub(crate) async fn reconcile_superseded(
         ComputeControlDrainEvidence::PersistedRuntimeAcknowledgement {
             checkpoint: old.checkpoint.clone(),
         }
-    } else if matches!(old.stage.as_str(), "starting" | "stopping") {
+    } else if policy::write_in_flight(&old.stage) {
         ensure!(
             old.has_conditional_compute_write(),
             "Original conditional-write capability missing"
@@ -1742,7 +1814,7 @@ pub(crate) async fn reconcile_superseded(
                 .await?,
             "Original compute lease cannot be verified"
         );
-        let fenced = if old.scope == UserAppOperationScope::Dev {
+        let fenced = if policy::uses_builder(old.scope)? {
             let target: BuilderControlTarget = serde_json::from_value(old.checkpoint.clone())?;
             ensure!(target.context == context, "Builder fence context differs");
             state.runtime().fence_builder_compute_write(&target).await?
@@ -1753,7 +1825,7 @@ pub(crate) async fn reconcile_superseded(
                 captured.target.context == context,
                 "Startup fence context differs"
             );
-            if old.stage == "stopping" {
+            if old.stage == ComputeControlStage::Stopping.as_str() {
                 state.runtime().fence_app_compute_stop(&captured).await?
             } else {
                 state.runtime().fence_app_compute_start(&captured).await?
@@ -1763,7 +1835,7 @@ pub(crate) async fn reconcile_superseded(
             fenced,
             "Superseded conditional compute write is not yet fenced"
         );
-        if old.stage == "stopping" {
+        if old.stage == ComputeControlStage::Stopping.as_str() {
             ComputeControlDrainEvidence::ConditionalStopFenced {
                 checkpoint: old.checkpoint.clone(),
             }
@@ -1798,26 +1870,735 @@ pub(crate) async fn reconcile_superseded(
         .map_err(Into::into)
 }
 
+/// The retained authority of a taken-over Kubernetes compute lease. The
+/// runtime handoff renewed the exact original Lease (same uid and holder
+/// token) and its heartbeat keeps renewing until this guard drops, so the
+/// ORIGINAL durable receipt stays the live physical identity throughout the
+/// continuation that holds this guard.
+struct RetainedComputeTakeover {
+    // Keeps the renewal heartbeat alive across the whole continuation.
+    _guard: Box<dyn container_runtime_api::ComputeHandoffGuard>,
+    receipt: UserAppOperationLeaseReceipt,
+    context: UserAppExecutionContext,
+    runtime: Arc<dyn container_runtime_api::ContainerRuntime>,
+}
+
+impl RetainedComputeTakeover {
+    fn as_lease(&self) -> &dyn AppOperationLease {
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl AppOperationLease for RetainedComputeTakeover {
+    fn receipt(&self) -> Option<UserAppOperationLeaseReceipt> {
+        Some(self.receipt.clone())
+    }
+    async fn validate_retained(&self) -> Result<bool, String> {
+        // Holding the guard object does NOT prove the lease is still held:
+        // the heartbeat exits on a lost renewal (identity change, conflicting
+        // update) while this guard lives on. Every claim point therefore
+        // re-observes the physical lease through the runtime; an expired or
+        // reassigned lease refuses further old-identity writes.
+        self.runtime
+            .validate_app_operation_receipt(&self.context, &self.receipt)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    async fn release(self: Box<Self>) -> Result<(), String> {
+        // Never released through the guard: the takeover kept the original
+        // identity, so terminal cleanup releases through the record's receipt
+        // exactly like an ordinary continuation.
+        Ok(())
+    }
+}
+
+/// Take over the expired original compute lease through the runtime handoff
+/// protocol so the restart continuation runs under the ORIGINAL operation
+/// identity with a continuously renewing guard covering the whole
+/// continuation. Only an exact retained acquisition qualifies: a lease that
+/// is held or renewed again, a vanished lease, a changed identity, a previous
+/// owner or a foreign prepared attempt each keep their existing recovery
+/// paths, and so does the whole Docker lease domain (it re-acquires through
+/// its own retained-fd protocol).
+async fn take_over_expired_builder_lease(
+    state: &AppState,
+    snapshot: &ComputeControlRecord,
+) -> Result<Option<RetainedComputeTakeover>> {
+    use container_runtime_api::ComputeHandoff;
+    let receipt = snapshot
+        .lease
+        .as_ref()
+        .context("Builder continuation lease missing")?;
+    if !matches!(receipt, UserAppOperationLeaseReceipt::Kubernetes { .. }) {
+        tracing::debug!(
+            operation_id = %snapshot.operation_id,
+            app_id = %snapshot.app_id,
+            "Expired-lease takeover is the Kubernetes lease domain; the Docker receipt keeps its retained-fd path"
+        );
+        return Ok(None);
+    }
+    // A deadline-expired operation must not be revived: once its lease stops
+    // being renewed the settlement scan fails it and unblocks the scope.
+    if state
+        .userapp_store
+        .compute_control_deadline(&snapshot.app_id, &snapshot.operation_id)
+        .await?
+        .is_some_and(|ms| ms <= chrono::Utc::now().timestamp_millis())
+    {
+        tracing::debug!(
+            operation_id = %snapshot.operation_id,
+            app_id = %snapshot.app_id,
+            "Expired original lease is past the operation deadline; leaving settlement to the recovery scan"
+        );
+        return Ok(None);
+    }
+    let context = snapshot.execution_context().map_err(anyhow::Error::msg)?;
+    match state
+        .runtime()
+        .prepare_compute_handoff(&context, snapshot.scope, Some(receipt))
+        .await?
+    {
+        ComputeHandoff::Acquired {
+            guard,
+            original_absent: false,
+        } => {
+            tracing::info!(
+                operation_id = %snapshot.operation_id,
+                app_id = %snapshot.app_id,
+                "Expired original compute lease taken over under its original identity; continuing the restart"
+            );
+            Ok(Some(RetainedComputeTakeover {
+                _guard: guard,
+                receipt: receipt.clone(),
+                context,
+                runtime: state.runtime().clone(),
+            }))
+        }
+        ComputeHandoff::Acquired {
+            original_absent: true,
+            ..
+        } => {
+            // A same-executor unregistered prepared attempt holds the lease;
+            // the record's receipt is not that holder's identity.
+            tracing::debug!(
+                operation_id = %snapshot.operation_id,
+                app_id = %snapshot.app_id,
+                "Compute handoff acquired a lease the record receipt never bound; not a continuation authority"
+            );
+            Ok(None)
+        }
+        ComputeHandoff::Held => {
+            tracing::debug!(
+                operation_id = %snapshot.operation_id,
+                app_id = %snapshot.app_id,
+                "Original compute lease is held or renewed again; deferring the continuation"
+            );
+            Ok(None)
+        }
+        ComputeHandoff::Vacant { .. } => {
+            tracing::debug!(
+                operation_id = %snapshot.operation_id,
+                app_id = %snapshot.app_id,
+                "Original compute lease object is gone; leaving the record to existing recovery paths"
+            );
+            Ok(None)
+        }
+        ComputeHandoff::Deferred(inspection) => {
+            tracing::debug!(
+                operation_id = %snapshot.operation_id,
+                app_id = %snapshot.app_id,
+                ?inspection,
+                "Compute handoff deferred the expired lease; leaving the record to existing recovery paths"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Deadline observation for the recovery scan: binds the budget lazily for
+/// controls that predate deadline binding (or whose claim crashed before
+/// binding) and reports whether the bound deadline has expired. Infallible by
+/// design — a store hiccup defers to the next scan and the durable expiry
+/// re-verification lives in [`settle_expired_compute_control`].
+pub(crate) async fn compute_deadline_expired(
+    state: &AppState,
+    record: &ComputeControlRecord,
+) -> bool {
+    match state
+        .userapp_store
+        .compute_control_deadline(&record.app_id, &record.operation_id)
+        .await
+    {
+        Ok(Some(deadline)) => deadline <= chrono::Utc::now().timestamp_millis(),
+        Ok(None) => {
+            let budget =
+                chrono::Utc::now().timestamp_millis() + COMPUTE_CONTROL_TOTAL_DEADLINE_SECS * 1000;
+            match state
+                .userapp_store
+                .bind_compute_control_deadline(record, budget)
+                .await
+            {
+                Ok(bound) => {
+                    tracing::info!(
+                        operation_id = %record.operation_id,
+                        app_id = %record.app_id,
+                        deadline_ms = bound,
+                        "Bound a missing compute control deadline from the recovery scan"
+                    );
+                    false
+                }
+                Err(UserAppStoreError::VersionConflict) => false,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        operation_id = %record.operation_id,
+                        app_id = %record.app_id,
+                        "Compute control deadline binding failed; retrying on the next scan"
+                    );
+                    false
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                operation_id = %record.operation_id,
+                app_id = %record.app_id,
+                "Compute control deadline read failed; retrying on the next scan"
+            );
+            false
+        }
+    }
+}
+
+/// Stage-appropriate result reconciliation for deadline settlement. The quiet
+/// window bounds any in-flight API write (a received mutating request is
+/// applied or aborted by the apiserver within its own request timeout, far
+/// inside the window), so this observation then records WHICH settled state
+/// the operation's write surface is in — evidence, not a clock claim, backs
+/// the settlement. `None` defers: the surface is running (normal completion
+/// is preferable to failure) or unreadable this round.
+async fn settlement_surface_note(
+    state: &AppState,
+    current: &ComputeControlRecord,
+) -> Result<Option<String>> {
+    use ComputeControlStage as Stage;
+    let stage = Stage::from_storage_value(&current.stage);
+    let note = |text: &str| Some(text.to_owned());
+    let surface = match stage {
+        Some(Stage::DrainingPrevious) => note("no compute write was ever authorized (drain phase)"),
+        Some(Stage::Stopped) => note("the durable stopped boundary already confirms the stop side"),
+        Some(Stage::Stopping) => match current.scope {
+            UserAppOperationScope::Dev => {
+                let target = match BuilderControlTarget::from_observation_checkpoint(
+                    &current.checkpoint,
+                ) {
+                    Ok(target)
+                        if target.context
+                            == current.execution_context().map_err(anyhow::Error::msg)? =>
+                    {
+                        target
+                    }
+                    _ => {
+                        tracing::warn!(
+                            operation_id = %current.operation_id,
+                            "Deadline settlement cannot reconcile an unparseable stop target; deferring"
+                        );
+                        return Ok(None);
+                    }
+                };
+                // Evidence errors are classified, never propagated: the stop
+                // receipt query itself conflicts while the workload still runs
+                // (replicas != 0), and that shape must stay settleable.
+                let receipt = match state
+                    .runtime()
+                    .reconcile_builder_compute_stop(&target)
+                    .await
+                {
+                    Ok(confirmed) => confirmed,
+                    Err(error) => {
+                        tracing::debug!(
+                            %error,
+                            operation_id = %current.operation_id,
+                            "Deadline settlement stop-receipt query failed; falling back to observation"
+                        );
+                        false
+                    }
+                };
+                if receipt {
+                    note("stop receipt confirmed after the deadline")
+                } else {
+                    let observed_stopped = match state
+                        .runtime()
+                        .observe_builder_compute_stopped(&target)
+                        .await
+                    {
+                        Ok(observed) => observed,
+                        Err(error) => {
+                            tracing::debug!(
+                                %error,
+                                operation_id = %current.operation_id,
+                                "Deadline settlement stopped-observation failed; deferring"
+                            );
+                            false
+                        }
+                    };
+                    // A positive RUNNING observation — not a double negative —
+                    // proves the stop write never landed (and after the quiet
+                    // window it can no longer land). The running probe is the
+                    // receipt-free controller observation: an instance started
+                    // by a PREVIOUS operation (the common healthy shape when a
+                    // Restart dies before dispatching its stop) still observes
+                    // as running. Ambiguous shapes (scaled to zero with pods
+                    // still terminating, or unreadable) defer: a double false
+                    // proves nothing.
+                    let running = match state
+                        .runtime()
+                        .observe_builder_compute_running(&target)
+                        .await
+                    {
+                        Ok(running) => running,
+                        Err(error) => {
+                            tracing::debug!(
+                                %error,
+                                operation_id = %current.operation_id,
+                                "Deadline settlement running-observation failed; deferring"
+                            );
+                            false
+                        }
+                    };
+                    if observed_stopped {
+                        note("workload observed stopped after the deadline")
+                    } else if running {
+                        note(
+                            "workload still running after the quiet window; the stop write can no longer land",
+                        )
+                    } else {
+                        tracing::debug!(
+                            operation_id = %current.operation_id,
+                            "Deadline settlement stop surface is ambiguous (likely mid-teardown); deferring"
+                        );
+                        return Ok(None);
+                    }
+                }
+            }
+            UserAppOperationScope::Prod | UserAppOperationScope::Application => {
+                let expected: Result<UserAppMutationTarget> =
+                    serde_json::from_value(current.checkpoint.clone()).map_err(Into::into);
+                let expected = match expected {
+                    Ok(expected)
+                        if expected.context
+                            == current.execution_context().map_err(anyhow::Error::msg)? =>
+                    {
+                        expected
+                    }
+                    _ => {
+                        tracing::warn!(
+                            operation_id = %current.operation_id,
+                            "Deadline settlement cannot reconcile an unparseable application stop target; deferring"
+                        );
+                        return Ok(None);
+                    }
+                };
+                let receipt = match state.runtime().reconcile_app_compute_stop(&expected).await {
+                    Ok(confirmed) => confirmed,
+                    Err(error) => {
+                        tracing::debug!(
+                            %error,
+                            operation_id = %current.operation_id,
+                            "Deadline settlement application stop-receipt query failed; falling back to observation"
+                        );
+                        false
+                    }
+                };
+                // Receipt-free running probe: an instance started by a
+                // PREVIOUS operation carries no receipt for this one, and the
+                // never-dispatched-stop shape must stay settleable.
+                let running = match state.runtime().observe_app_compute_running(&expected).await {
+                    Ok(running) => running,
+                    Err(error) => {
+                        tracing::debug!(
+                            %error,
+                            operation_id = %current.operation_id,
+                            "Deadline settlement application running-observation failed; deferring"
+                        );
+                        false
+                    }
+                };
+                if receipt {
+                    note("application stop receipt confirmed after the deadline")
+                } else if running {
+                    note(
+                        "application workload still running after the quiet window; the stop write can no longer land",
+                    )
+                } else {
+                    tracing::debug!(
+                        operation_id = %current.operation_id,
+                        "Deadline settlement application stop surface is ambiguous; deferring"
+                    );
+                    return Ok(None);
+                }
+            }
+        },
+        Some(Stage::Starting) | Some(Stage::Verifying) => {
+            // Only Restart reaches these stages; a running surface prefers the
+            // normal completion branch over a deadline failure. Evidence
+            // errors defer rather than fail the scan.
+            match current.scope {
+                UserAppOperationScope::Dev => {
+                    let target = match BuilderControlTarget::from_observation_checkpoint(
+                        &current.checkpoint,
+                    ) {
+                        Ok(target)
+                            if target.context
+                                == current.execution_context().map_err(anyhow::Error::msg)? =>
+                        {
+                            target
+                        }
+                        _ => {
+                            tracing::warn!(
+                                operation_id = %current.operation_id,
+                                "Deadline settlement cannot reconcile an unparseable start target; deferring"
+                            );
+                            return Ok(None);
+                        }
+                    };
+                    // A receipt-confirmed running surface prefers normal
+                    // completion. The receipt query conflicts while the
+                    // controller still sits at zero replicas (a start never
+                    // dispatched, or applied-then-scaled) — that error is
+                    // evidence-missing, not a reason to skip classification.
+                    let receipt_running = match state
+                        .runtime()
+                        .reconcile_builder_compute_start(&target)
+                        .await
+                    {
+                        Ok(info) => info.is_some(),
+                        Err(error) => {
+                            tracing::debug!(
+                                %error,
+                                operation_id = %current.operation_id,
+                                "Deadline settlement start-receipt query failed; continuing classification"
+                            );
+                            false
+                        }
+                    };
+                    // Only RECEIPT-CONFIRMED readiness short-circuits to the
+                    // completion branch. The receipt-free running observation
+                    // (desired replicas + owned pod) deliberately does NOT
+                    // gate the start side: a Pending or CrashLooping pod
+                    // observes as running there, and letting it defer would
+                    // re-block the committed-but-never-ready shape the
+                    // deadline exists to settle.
+                    if receipt_running {
+                        tracing::debug!(
+                            operation_id = %current.operation_id,
+                            "Deadline-expired restart is running; preferring normal completion over settlement"
+                        );
+                        return Ok(None);
+                    }
+                    // Contract: Ok(None) = the original start COMMITTED and can
+                    // only be observed (the app81 form); Ok(Some) = a retryable
+                    // owned partial exists. Neither alone proves settlement;
+                    // the elapsed quiet window closes further writes and the
+                    // recorded shape hands physical reconciliation to the next
+                    // admission's capture-fresh phases.
+                    match state.runtime().prepare_builder_compute_retry(&target).await {
+                        Ok(None) => {
+                            note("start committed but never reached readiness within the deadline")
+                        }
+                        Ok(Some(_)) => note(
+                            "start left an owned retryable partial; further writes are closed by the quiet window and reconciliation hands off to the next admission",
+                        ),
+                        Err(error) => {
+                            tracing::debug!(
+                                %error,
+                                operation_id = %current.operation_id,
+                                "Deadline settlement cannot classify the start surface; deferring"
+                            );
+                            return Ok(None);
+                        }
+                    }
+                }
+                UserAppOperationScope::Prod | UserAppOperationScope::Application => {
+                    let expected: Result<UserAppMutationTarget> =
+                        serde_json::from_value(current.checkpoint.clone()).map_err(Into::into);
+                    let expected = match expected {
+                        Ok(expected)
+                            if expected.context
+                                == current.execution_context().map_err(anyhow::Error::msg)? =>
+                        {
+                            expected
+                        }
+                        _ => {
+                            tracing::warn!(
+                                operation_id = %current.operation_id,
+                                "Deadline settlement cannot reconcile an unparseable application start target; deferring"
+                            );
+                            return Ok(None);
+                        }
+                    };
+                    // Receipt errors are evidence-missing, never a reason to
+                    // skip classification; the receipt-free probe decides the
+                    // running branch without a per-operation receipt.
+                    let receipt_running = match state
+                        .runtime()
+                        .reconcile_app_compute_start(&expected)
+                        .await
+                    {
+                        Ok(running) => running,
+                        Err(error) => {
+                            tracing::debug!(
+                                %error,
+                                operation_id = %current.operation_id,
+                                "Deadline settlement application start-receipt query failed; continuing classification"
+                            );
+                            false
+                        }
+                    };
+                    // Only RECEIPT-CONFIRMED readiness (which includes the
+                    // running-pod check) defers to the completion branch. The
+                    // receipt-free probe observes desired+executing replicas,
+                    // which a permanently Pending or ImagePullBackOff pod also
+                    // satisfies — letting it gate here would defer the
+                    // never-ready form forever while completion also fails.
+                    if receipt_running {
+                        tracing::debug!(
+                            operation_id = %current.operation_id,
+                            "Deadline-expired application restart is running; preferring normal completion over settlement"
+                        );
+                        return Ok(None);
+                    }
+                    note("application start not confirmed after the quiet window")
+                }
+            }
+        }
+        Some(Stage::Completed) => {
+            // Non-terminal at the completed stage is a corrupt shape; never
+            // settle what its own writer never terminalized.
+            tracing::warn!(
+                operation_id = %current.operation_id,
+                "Deadline settlement refuses a non-terminal completed stage; deferring"
+            );
+            return Ok(None);
+        }
+        None => {
+            tracing::warn!(
+                operation_id = %current.operation_id,
+                stage = %current.stage,
+                "Deadline settlement cannot reconcile an unknown stage; deferring"
+            );
+            return Ok(None);
+        }
+    };
+    Ok(surface)
+}
+
+/// Settle a non-terminal compute control whose total deadline expired. Two
+/// gates stand between expiry and the terminal CAS:
+///
+/// 1. Lease liveness — never settle by age against a lease that still
+///    validates: a live renewal (the original executor or another replica's
+///    takeover continuation) owns the physical write path, and the quiet-window
+///    anchor is dropped so a later death re-anchors from its own observation.
+/// 2. Quiet window — the first unheld observation is anchored durably and the
+///    settlement waits longer than the runtime's maximum in-flight write
+///    window (the kube client's default write timeout is 295s, far beyond the
+///    60s lease TTL): a write the dead holder had already submitted when its
+///    renewal stopped cannot still land after the control is terminalized and
+///    the scope admits new work. Expiry alone never implies settled effects.
+///
+/// A revision CAS race with a progressing executor is benign and waits for the
+/// next scan.
+pub(crate) async fn settle_expired_compute_control(
+    state: &AppState,
+    snapshot: &ComputeControlRecord,
+) -> Result<()> {
+    let Some(current) = state
+        .userapp_store
+        .get_compute_control(&snapshot.app_id, &snapshot.operation_id)
+        .await?
+    else {
+        return Ok(());
+    };
+    match current.state {
+        ComputeControlState::Running | ComputeControlState::RecoveryRequired => {}
+        ComputeControlState::Pending
+        | ComputeControlState::Succeeded
+        | ComputeControlState::Failed
+        | ComputeControlState::Superseded => return Ok(()),
+    }
+    if !compute_deadline_expired(state, &current).await {
+        return Ok(());
+    }
+    if let Some(receipt) = current.lease.clone() {
+        let context = current.execution_context().map_err(anyhow::Error::msg)?;
+        match state
+            .runtime()
+            .validate_app_operation_receipt(&context, &receipt)
+            .await
+        {
+            Ok(true) => {
+                // Renewed again: the anchor is stale, drop it so a later
+                // unheld transition measures its own quiet window. A clearing
+                // failure only re-defers to the next scan.
+                if let Err(error) = state
+                    .userapp_store
+                    .clear_compute_control_unheld(&current)
+                    .await
+                {
+                    tracing::warn!(
+                        %error,
+                        operation_id = %current.operation_id,
+                        "Compute control unheld anchor clearing failed; retrying on the next scan"
+                    );
+                }
+                tracing::debug!(
+                    operation_id = %current.operation_id,
+                    app_id = %current.app_id,
+                    "Compute control exceeded its deadline but its lease is still renewed; deferring settlement"
+                );
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    operation_id = %current.operation_id,
+                    app_id = %current.app_id,
+                    "Compute deadline settlement could not confirm the lease is unheld; deferring"
+                );
+                return Ok(());
+            }
+        }
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let anchor = state
+        .userapp_store
+        .mark_compute_control_unheld(&current, now)
+        .await?;
+    if now < anchor + COMPUTE_SETTLEMENT_QUIET_MS {
+        tracing::debug!(
+            operation_id = %current.operation_id,
+            app_id = %current.app_id,
+            anchor_ms = anchor,
+            "Compute control is unheld past its deadline; waiting out the write quiet window before settlement"
+        );
+        return Ok(());
+    }
+    let Some(surface) = settlement_surface_note(state, &current).await? else {
+        return Ok(());
+    };
+    let message = format!(
+        "Compute control exceeded its total deadline of {} seconds at stage {}; the physical lease stopped renewing at least {} seconds before settlement ({})",
+        COMPUTE_CONTROL_TOTAL_DEADLINE_SECS,
+        current.stage,
+        COMPUTE_SETTLEMENT_QUIET_MS / 1000,
+        surface
+    );
+    match state
+        .userapp_store
+        .fail_expired_compute_control(&current, ERR_DEADLINE_EXCEEDED, &message, anchor)
+        .await
+    {
+        Ok(settled) => {
+            tracing::info!(
+                operation_id = %settled.operation_id,
+                app_id = %settled.app_id,
+                stage = %settled.stage,
+                "Compute control settled as failed after its total deadline and write quiet window; the scope admission fence is released"
+            );
+            Ok(())
+        }
+        Err(UserAppStoreError::VersionConflict) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A durable Kubernetes stop-boundary confirmation proves the original stop
+/// completed even without this operation's platform stop receipt (e.g. an
+/// exact UID-matched external stop). Continuation honors the recorded fact;
+/// physical write authority still flows from the lease/CAS chain.
+fn kubernetes_stop_boundary_confirmed(snapshot: &ComputeControlRecord) -> bool {
+    snapshot
+        .checkpoint
+        .get(KUBERNETES_RESTART_STOP_CONFIRMATION_KEY)
+        .is_some_and(|value| {
+            serde_json::from_value::<KubernetesRestartStopConfirmation>(value.clone()).is_ok()
+        })
+}
+
 async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord) -> Result<()> {
+    resume_builder_start_with_guard(state, snapshot, None).await
+}
+
+async fn original_continuation_lease_current(
+    state: &AppState,
+    snapshot: &ComputeControlRecord,
+    held_guard: Option<&dyn AppOperationLease>,
+) -> Result<bool> {
+    if let Some(guard) = held_guard {
+        restart_stop_recovery::validate_guard(guard, snapshot).await?;
+        return Ok(true);
+    }
+    let context = snapshot.execution_context().map_err(anyhow::Error::msg)?;
+    let receipt = snapshot
+        .lease
+        .as_ref()
+        .context("Builder continuation lease missing")?;
+    state
+        .runtime()
+        .validate_app_operation_receipt(&context, receipt)
+        .await
+        .map_err(Into::into)
+}
+
+async fn resume_builder_start_with_guard(
+    state: &AppState,
+    snapshot: &ComputeControlRecord,
+    held_guard: Option<&dyn AppOperationLease>,
+) -> Result<()> {
     let mut continuing = snapshot.clone();
     let context = snapshot.execution_context().map_err(anyhow::Error::msg)?;
     let receipt = snapshot
         .lease
         .as_ref()
         .context("Builder continuation lease missing")?;
-    if !state
-        .runtime()
-        .validate_app_operation_receipt(&context, receipt)
-        .await?
-    {
-        recover_confirmed(state, snapshot).await?;
-        return Ok(());
-    }
+    // An expired original lease is not the end of this continuation: the
+    // runtime handoff protocol can retake the exact Lease under its ORIGINAL
+    // identity and keep renewing it, after which the whole continuation below
+    // runs under that guard. Any other outcome keeps the previous fallback.
+    let takeover;
+    let held_guard = if original_continuation_lease_current(state, snapshot, held_guard).await? {
+        held_guard
+    } else {
+        // The takeover is an enabler, never a gate: a handoff attempt that
+        // itself fails (unsupported runtime, transport) leaves the record to
+        // the exact fallback the pre-takeover code took.
+        takeover = match take_over_expired_builder_lease(state, snapshot).await {
+            Ok(taken) => taken,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    operation_id = %snapshot.operation_id,
+                    app_id = %snapshot.app_id,
+                    "Expired-lease takeover attempt failed; falling back to the previous recovery path"
+                );
+                None
+            }
+        };
+        let Some(taken_over) = takeover.as_ref() else {
+            recover_confirmed_with_guard(state, snapshot, held_guard).await?;
+            return Ok(());
+        };
+        Some(taken_over.as_lease())
+    };
     // Result observation needs only the original submitted identity. New
     // writes still require both the Held lease and the existing strict target.
     ensure!(
-        snapshot.stage == "stopped"
-            || (snapshot.stage == "starting"
+        snapshot.stage == ComputeControlStage::Stopped.as_str()
+            || (snapshot.stage == ComputeControlStage::Starting.as_str()
                 && (snapshot.has_conditional_compute_write()
                     || builder_start::missing_creation(snapshot))),
         "Builder continuation requires a stopped boundary or conditional-write witness"
@@ -1833,7 +2614,7 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
             builder_start::missing_creation(snapshot),
             "Missing builder continuation has no original retained PVC/lease witness"
         );
-        let prepared = if snapshot.stage == "starting" {
+        let prepared = if snapshot.stage == ComputeControlStage::Starting.as_str() {
             if let Some(info) = state
                 .runtime()
                 .reconcile_builder_compute_start(&old)
@@ -1867,26 +2648,23 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
             RestartContinuation::Dev(old.clone())
         };
         ensure!(
-            state
-                .runtime()
-                .validate_app_operation_receipt(&context, receipt)
-                .await?,
+            original_continuation_lease_current(state, snapshot, held_guard).await?,
             "Original missing builder lease changed before continuation claim"
         );
         let record = state
             .userapp_store
             .resume_builder_restart_start(snapshot, &old)
             .await?;
-        return run_restart_continuation(state, record, prepared).await;
+        return run_restart_continuation_with_guard(state, record, prepared, held_guard).await;
     }
-    let target = if snapshot.stage == "starting" {
+    let target = if snapshot.stage == ComputeControlStage::Starting.as_str() {
         if state
             .runtime()
             .reconcile_builder_compute_start(&old)
             .await?
             .is_some()
         {
-            recover_confirmed(state, snapshot).await?;
+            recover_confirmed_with_guard(state, snapshot, held_guard).await?;
             return Ok(());
         }
         state
@@ -1899,7 +2677,12 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
         fresh.restart_image = old.restart_image.clone();
         fresh.restart_runtime_workspace = old.restart_runtime_workspace.clone();
         fresh.builder_startup_mode = old.builder_startup_mode;
-        if fresh.workload.is_none() {
+        if fresh.workload.is_none()
+            && old
+                .workload
+                .as_ref()
+                .is_some_and(|workload| policy::uses_retained_pvc(workload.kind))
+        {
             builder_start::prepare_missing_restart_target(
                 state.runtime().as_ref(),
                 &old,
@@ -1914,14 +2697,26 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
                 .builder_image_replacement_needed(&fresh)
                 .await?
         {
-            let (captured, template) = stopped_template::prepare(
-                state.runtime().as_ref(),
-                state.userapp_store.as_ref(),
-                snapshot,
-                &old,
-                &fresh,
-            )
-            .await?;
+            let (captured, template) = if held_guard.is_some() {
+                stopped_template::prepare_with_guard(
+                    state.runtime().as_ref(),
+                    state.userapp_store.as_ref(),
+                    snapshot,
+                    &old,
+                    &fresh,
+                    held_guard,
+                )
+                .await?
+            } else {
+                stopped_template::prepare(
+                    state.runtime().as_ref(),
+                    state.userapp_store.as_ref(),
+                    snapshot,
+                    &old,
+                    &fresh,
+                )
+                .await?
+            };
             continuing = captured;
             // The durable stopped boundary already confirms old compute exited.
             // Restore only a zero-replica controller; the CAS below must succeed
@@ -1933,7 +2728,8 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
             restored
         } else {
             ensure!(
-                state.runtime().reconcile_builder_compute_stop(&old).await?,
+                state.runtime().reconcile_builder_compute_stop(&old).await?
+                    || kubernetes_stop_boundary_confirmed(snapshot),
                 "Original builder stop receipt is not confirmed"
             );
             fresh
@@ -1948,10 +2744,7 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
         "Builder Pod appeared before continuation"
     );
     ensure!(
-        state
-            .runtime()
-            .validate_app_operation_receipt(&context, receipt)
-            .await?,
+        original_continuation_lease_current(state, &continuing, held_guard).await?,
         "Builder lease changed before continuation claim"
     );
     let prepared = builder_compute_checkpoint(state, &target, true).await?;
@@ -1960,7 +2753,8 @@ async fn resume_builder_start(state: &AppState, snapshot: &ComputeControlRecord)
         .userapp_store
         .resume_builder_restart_start(&continuing, &target)
         .await?;
-    run_restart_continuation(state, record, RestartContinuation::Dev(target)).await
+    run_restart_continuation_with_guard(state, record, RestartContinuation::Dev(target), held_guard)
+        .await
 }
 
 /// Only a captured Kubernetes dev workload receives directory convergence.
@@ -1969,11 +2763,11 @@ fn freeze_builder_restart_workspace(
     target: &mut BuilderControlTarget,
     action: ComputeControlAction,
 ) {
-    if action == ComputeControlAction::Restart
+    if policy::is_restart(action)
         && target
             .workload
             .as_ref()
-            .is_some_and(|workload| workload.kind == AppResourceKind::StatefulSet)
+            .is_some_and(|workload| policy::uses_retained_pvc(workload.kind))
     {
         target.restart_runtime_workspace =
             Some(paths::userapp_dev_workspace(&target.context.app_id));
@@ -2025,7 +2819,7 @@ async fn capture_missing_partial(
             && actual
                 .workload
                 .as_ref()
-                .is_some_and(|workload| workload.kind == AppResourceKind::StatefulSet),
+                .is_some_and(|workload| policy::uses_retained_pvc(workload.kind)),
         "Original missing-builder creation has no current owned partial controller"
     );
     ensure!(
@@ -2061,7 +2855,7 @@ async fn confirmed_missing_builder_checkpoint(
         .as_ref()
         .context("Ensured builder has no actual running Pod")?;
     ensure!(
-        workload.kind == AppResourceKind::StatefulSet
+        policy::uses_retained_pvc(workload.kind)
             && info.project_id == original.context.app_id
             && info.workload_uid.as_ref() == Some(&workload.uid)
             && info.container_id == pod.uid,
@@ -2258,3 +3052,9 @@ mod restart_workspace_tests {
 
 #[cfg(all(test, feature = "userapp-turso"))]
 mod missing_tests;
+
+#[cfg(all(test, feature = "userapp-turso"))]
+mod failure_tests;
+
+#[cfg(all(test, feature = "userapp-turso"))]
+mod deadline_takeover_tests;

@@ -57,12 +57,54 @@ pub(crate) async fn sync_once(
     store: &PgStore,
     inner: &crate::adapter::ProjectAdapter,
     pool: &DatabaseOwner,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(usize, usize)> {
+    sync_once_inner(
+        store,
+        inner,
+        pool,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+/// Fault injection only: stop the real sync chain after its drain barrier,
+/// before taking the local baseline. Production has no hook or waiting branch.
+#[cfg(test)]
+pub(super) async fn sync_once_paused_after_drain(
+    store: &PgStore,
+    inner: &crate::adapter::ProjectAdapter,
+    pool: &DatabaseOwner,
+    reached: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+) -> anyhow::Result<(usize, usize)> {
+    sync_once_inner(store, inner, pool, Some((reached, resume))).await
+}
+
+async fn sync_once_inner(
+    store: &PgStore,
+    inner: &crate::adapter::ProjectAdapter,
+    pool: &DatabaseOwner,
+    #[cfg(test)] after_drain: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+) -> anyhow::Result<(usize, usize)> {
     // 排空屏障：本副本写全部落库后，PG 快照才可作为 diff 基准。
     // 超时（PG 故障重试中）跳过本轮，避免用旧快照误删镜像条目。
     if !store.wait_drained(DRAIN_TIMEOUT).await {
         debug!("[STORAGE_PG] sync skipped: drain barrier timeout (writer backlogged?)");
-        return Ok(());
+        return Ok((0, 0));
+    }
+
+    #[cfg(test)]
+    if let Some((reached, resume)) = after_drain {
+        reached
+            .send(())
+            .map_err(|_| anyhow::anyhow!("Sync after-drain observer dropped"))?;
+        resume
+            .await
+            .map_err(|_| anyhow::anyhow!("Sync after-drain release dropped"))?;
     }
 
     let (baseline, baseline_containers): (HashMap<_, _>, _) = {
@@ -135,12 +177,70 @@ pub(crate) async fn sync_once(
         }
     }
 
+    // 1b) 容器删除对账：本地注册表有而 PG containers 快照无 → 二次确认后
+    //     移除注册表与镜像条目。peer 副本 cleaner/stop 的 durable 删除只清
+    //     自己的内存镜像（DB 行 + tombstone 是唯一事实源），本 pass 是其跨
+    //     副本失效通道；否则镜像残留的旧 workload UID 会把后续注册误判为
+    //     外部替换。护栏：二次确认（屏障后直查）+ baseline 身份相等 +
+    //     无本地 project 引用，任一不满足保守保留待下轮。
+    let pg_container_names: std::collections::HashSet<&str> = containers
+        .iter()
+        .map(|row| row.container_name.as_str())
+        .collect();
+    let registered_names: Vec<String> = store
+        .container_registration
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .keys()
+        .cloned()
+        .collect();
+    for name in registered_names {
+        if pg_container_names.contains(name.as_str())
+            || self_confirm_container_alive(store, pool, &name, baseline_containers.get(&name))
+                .await
+        {
+            continue;
+        }
+        let expected = baseline_containers
+            .get(&name)
+            .and_then(|identity| identity.physical_uid.clone());
+        let pruned = {
+            let _registration = store.registration.lock().unwrap_or_else(|p| p.into_inner());
+            let mut registrations = store
+                .container_registration
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if registrations.get(&name) != baseline_containers.get(&name) {
+                continue;
+            }
+            // 注册表和容器镜像同锁移除；否则新注册可能在间隙中回指旧 Arc。
+            let pruned = store
+                .inner()
+                .prune_container_mirror(&name, expected.as_deref());
+            if pruned {
+                registrations.remove(&name);
+            }
+            pruned
+        };
+        if pruned {
+            info!(
+                "[STORAGE_PG] sync remove container registration {name} (deleted on peer replica)"
+            );
+        }
+    }
+
     // 2) 新增/变更：PG 有而镜像无 → 补入；都有 → 签名比对后按需重建
     let container_by_name = container_rows_to_map(containers);
     let mut changed = 0usize;
     let mut added = 0usize;
     for row in projects {
-        let _registration = store.registration.lock().unwrap_or_else(|p| p.into_inner());
+        let registration = store.registration.lock().unwrap_or_else(|p| p.into_inner());
+        // A local retirement can be admitted after the drain barrier but before
+        // baseline capture. Its SQL may still be pending, so an absent baseline
+        // does not authorize restoring that exact retired generation or its SIDs.
+        if registration.get(&row.project_id) == Some(&row.generation) {
+            continue;
+        }
         let existing = inner.get(&row.project_id);
         if let Some(current) = &existing {
             if baseline
@@ -171,19 +271,36 @@ pub(crate) async fn sync_once(
             }
             // Equality with target permits another project in this same snapshot
             // to hydrate after the first project already refreshed this registry.
-            Some((name.clone(), target))
+            if current == Some(&target) {
+                None
+            } else {
+                Some((name.clone(), target))
+            }
         } else {
             None
         };
-        inner.insert(row.project_id.clone(), Arc::new(info))?;
-        // Publish only after mirror insertion succeeds. The outer registration
-        // guard still excludes local writes and other snapshot application.
+        // The container cursor is independent of the project projection: a
+        // rejected registration for another shared member can leave it ahead
+        // of SQL even when this project's fields already match. Keep its race
+        // guard and reconciliation on the no-op path as well.
+        let unchanged = existing
+            .as_ref()
+            .is_some_and(|current| recovery_projection(current) == recovery_projection(&info));
+        if !unchanged {
+            inner.insert(row.project_id.clone(), Arc::new(info))?;
+        }
+        // Publish after mirror insertion succeeds or its projection is already
+        // equal. The registration guard still excludes local writes and other
+        // snapshot application.
         if let Some((name, target)) = registration_update {
             store
                 .container_registration
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .insert(name, target);
+        }
+        if unchanged {
+            continue;
         }
         if existing.is_some() {
             changed += 1;
@@ -195,7 +312,7 @@ pub(crate) async fn sync_once(
     if added + changed > 0 {
         info!("[STORAGE_PG] cross-replica sync applied: +{added} projects, {changed} changed");
     }
-    Ok(())
+    Ok((added, changed))
 }
 
 /// remove 候选的二次确认：短排空后直查该行是否已落库（屏障后新写防误删）。
@@ -245,4 +362,96 @@ async fn self_confirm_session_alive(
     } else {
         true
     }
+}
+
+/// 容器注册表二次确认：短排空后按 name 直查 containers 行（屏障后本地
+/// 新注册的容器必已落库，不会被误判为远端删除）。PG 故障时返回 true
+/// （宁可不删也不误删——下轮 sync 再收敛）。
+async fn self_confirm_container_alive(
+    store: &PgStore,
+    pool: &DatabaseOwner,
+    name: &str,
+    expected: Option<&shared_types::persistence::ContainerPersistenceIdentity>,
+) -> bool {
+    if store.wait_drained(Duration::from_millis(200)).await {
+        let name = name.to_owned();
+        let expected = expected.cloned();
+        match super::database::read(pool, move |tx| {
+            Box::pin(async move {
+                if repo::fetch_container_registration(tx, &name)
+                    .await?
+                    .is_some()
+                {
+                    return Ok(true);
+                }
+                // Absence without the exact generation's tombstone remains
+                // anomalous; clearing the cache must not bypass that guard.
+                match expected {
+                    Some(identity) => match identity.physical_uid {
+                        Some(uid) => Ok(!repo::container_generation_is_retired(
+                            tx,
+                            &name,
+                            &identity.generation,
+                            &uid,
+                        )
+                        .await?),
+                        None => Ok(true),
+                    },
+                    None => Ok(true),
+                }
+            })
+        })
+        .await
+        {
+            Ok(alive) => alive,
+            Err(e) => {
+                debug!("[STORAGE_PG] sync container remove-confirm failed (keeping): {e}");
+                true
+            }
+        }
+    } else {
+        true
+    }
+}
+
+/// R13：当前同步负责恢复的完整类型化投影。
+///
+/// 仅含 `hydrate_project` 从数据库行确定性恢复的字段（身份/代次/会话清单/
+/// 容器投影/归属与作用域/时间戳/模型与状态/最近会话）；不含任何运行期随机
+/// 值。两轮快照对该投影完全相等即视为权威已收敛，无需重建 Arc 与索引。
+fn recovery_projection(info: &shared_types::ProjectAndContainerInfo) -> RecoveryProjection {
+    RecoveryProjection {
+        identity: info.persistence_identity().clone(),
+        service_type: info.service_type(),
+        user_id: info.user_id().map(str::to_owned),
+        pod_id: info.pod_id().map(str::to_owned),
+        tenant_id: info.tenant_id().map(str::to_owned),
+        space_id: info.space_id().map(str::to_owned),
+        isolation_type: info.isolation_type().map(str::to_owned),
+        request_id: info.request_id().map(str::to_owned),
+        created_at: info.created_at(),
+        last_activity: info.last_activity(),
+        latest_session: info.latest_session().map(str::to_owned),
+        model_provider: info.model_provider().cloned(),
+        status: info.status().copied(),
+        container: info.container_info(),
+    }
+}
+
+#[derive(PartialEq)]
+struct RecoveryProjection {
+    identity: shared_types::persistence::ProjectPersistenceIdentity,
+    service_type: Option<shared_types::ServiceType>,
+    user_id: Option<String>,
+    pod_id: Option<String>,
+    tenant_id: Option<String>,
+    space_id: Option<String>,
+    isolation_type: Option<String>,
+    request_id: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    last_activity: chrono::DateTime<chrono::Utc>,
+    latest_session: Option<String>,
+    model_provider: Option<shared_types::ModelProviderConfig>,
+    status: Option<shared_types::AgentStatus>,
+    container: Option<shared_types::ContainerBasicInfo>,
 }

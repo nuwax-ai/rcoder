@@ -65,7 +65,7 @@ class OwnerContinuationTests(unittest.TestCase):
 
     def test_new_owner_report_never_overwrites_origin_or_replays_existing_fault_report(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root=Path(temporary);config=root/'kubeconfig';config.write_text('opaque fixture')
+            root=Path(temporary).resolve();config=root/'kubeconfig';config.write_text('opaque fixture')
             (root/'identity.json').write_text(json.dumps({'root':str(root),'run_id':'a'*32,'namespace':'rcoder-owned','context':'orbstack',
                 'cluster_api':'https://127.0.0.1:26443','kubeconfig':str(config),'apps':['ownedapp']}))
             prior=root/'local-k8s-business-ownedapp-resumed2.json';prior.write_text(json.dumps(self.report()));original=prior.read_bytes()
@@ -122,7 +122,7 @@ class OwnerContinuationTests(unittest.TestCase):
 
     def test_second_report_refuses_prior_signal_dispatch_and_preserves_permission_report(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root=Path(temporary);config=root/'kubeconfig';config.write_text('opaque fixture')
+            root=Path(temporary).resolve();config=root/'kubeconfig';config.write_text('opaque fixture')
             (root/'identity.json').write_text(json.dumps({'root':str(root),'run_id':'a'*32,'namespace':'rcoder-owned','context':'orbstack',
                 'cluster_api':'https://127.0.0.1:26443','kubeconfig':str(config),'apps':['ownedapp']}))
             prior=root/'local-k8s-business-ownedapp-resumed2.json';prior.write_text(json.dumps(self.report()))

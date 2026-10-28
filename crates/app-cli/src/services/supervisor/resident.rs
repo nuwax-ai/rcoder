@@ -130,7 +130,7 @@ pub(crate) fn bind_owner(scope: ResidentScope, args: &RuntimeArgs) -> Result<()>
             == workspace,
         "resident owner belongs to another workspace"
     );
-    let runtime_root = compiler::runtime_root(&args.log_dir);
+    let runtime_root = compiler::runtime_root(&args.log_dir)?;
     let (tx, rx) = mpsc::channel(16);
     let owner = Arc::new(Controller {
         scope,
@@ -328,7 +328,7 @@ pub(super) async fn ensure_resident(args: &RuntimeArgs, outcome: &CompileOutcome
     let normalized = args.for_management()?;
     ensure!(
         runtime_state_layout::resolve_project_origin(&normalized.workspace)? == owner.workspace
-            && compiler::runtime_root(&args.log_dir) == owner.runtime_root,
+            && compiler::runtime_root(&args.log_dir)? == owner.runtime_root,
         "resident request belongs to another workspace or runtime range"
     );
     reload(outcome).await.map(|_| ())
@@ -1342,7 +1342,9 @@ impl ResidentProxy {
         let mut command = tokio::process::Command::new(&self.args.pingap_bin);
         command
             .arg("-c")
-            .arg(&outcome.config_path)
+            .arg(crate::proxy::command_path::external_config_path(
+                &outcome.config_path,
+            )?)
             .env("PINGAP_ADMIN_ADDR", &endpoint.addr)
             .env("PINGAP_ADMIN_USER", &endpoint.user)
             .env("PINGAP_ADMIN_PASSWORD", &endpoint.password);
@@ -1586,14 +1588,19 @@ impl ResidentProxy {
         if tokio::time::Instant::now() >= deadline || self.owner.stopping.load(Ordering::Acquire) {
             return Ok(());
         }
-        if self.confirmed.is_none() || tokio::time::Instant::now() < self.next_restart {
+        if self.confirmed.is_none() || !self.observe_exit()? {
             return Ok(());
         }
-        if !self.observe_exit()? {
+        // A rebuild backoff delays only the next spawn. It must not retain an
+        // exited root or its old tree: the owned POSIX Child remains waitable
+        // until this exact cleanup commits and reaps its identity pin.
+        if self.child.is_some() {
+            self.retire_dead_child().await?;
+        }
+        if tokio::time::Instant::now() < self.next_restart {
             return Ok(());
         }
         self.next_restart = tokio::time::Instant::now() + Duration::from_secs(1);
-        self.retire_dead_child().await?;
         self.restore_with_deadline(deadline, epoch).await
     }
 
