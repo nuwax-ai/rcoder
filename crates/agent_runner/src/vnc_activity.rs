@@ -67,7 +67,13 @@ pub fn active_vnc_client_count() -> usize {
             Ok(entries) => {
                 count += entries
                     .iter()
-                    .filter(|e| is_vnc_client(e.local_address.port(), &e.state))
+                    .filter(|e| {
+                        // Loopback peers are intra-container IPC, not a
+                        // viewer at the proxy (same exclusion as the agent
+                        // status connection counter).
+                        !crate::grpc::peer_is_loopback(&e.remote_address)
+                            && is_vnc_client(e.local_address.port(), &e.state)
+                    })
                     .count();
             }
             Err(e) => {
