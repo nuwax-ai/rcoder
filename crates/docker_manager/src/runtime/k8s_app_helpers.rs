@@ -195,7 +195,7 @@ pub(crate) fn build_probe(
 ///   ⚠️ 50m 只缓解 throttle，**不解决调度均衡**：requests 仍很低，调度器仍按"节点很轻"
 ///   看待，会把 pod 全堆在最闲节点。跨节点均衡由 PodSpec 的 topologySpreadConstraints
 ///   保证（见 build_agent_pod_spec），不靠调 requests。
-/// - `memory`（不可压缩）：requests=`1Gi`（2026-10-28 从 64Mi 调大，触发：node5
+/// - `memory`（不可压缩）：requests=`min(1Gi, limit)`（2026-10-28 从 64Mi 调大，触发：node5
 ///   MemoryPressure 驱逐 1 个沙箱——实测占用中位数 955Mi，64Mi 让调度器对节点真实
 ///   重量"失明"，堆积至 evict）。≈实测中位数定价：调度器开始按 allocatable−requests
 ///   打分，新沙箱自然偏向轻节点。集群 commit 率 34%（195Gi/570Gi），单节点密度上限
@@ -211,7 +211,12 @@ pub(crate) fn build_probe(
 fn min_memory_request(limit: &str) -> String {
     const ONE_GIB_BYTES: u64 = 1024 * 1024 * 1024;
     match shared_types::parse_memory_quantity(limit) {
-        Some(bytes) if bytes >= ONE_GIB_BYTES => "1Gi".to_string(),
+        // Strictly greater: the shared parser rounds to the nearest byte,
+        // so a value AT the 1GiB boundary may have been rounded UP from
+        // just below it — capping to "1Gi" there could produce request >
+        // limit (K8s rejects). At or below the boundary the original limit
+        // string is kept (always valid: request == limit).
+        Some(bytes) if bytes > ONE_GIB_BYTES => "1Gi".to_string(),
         _ => limit.to_string(),
     }
 }
@@ -380,7 +385,9 @@ mod tests {
 
     #[test]
     fn min_memory_request_covers_decimal_and_scientific_quantities() {
-        // Integer suffixes (the original matrix).
+        // Integer suffixes (the original matrix). "1Gi" is at the boundary:
+        // the parser rounds to exactly 1GiB, so the original string is kept
+        // (which happens to also be "1Gi" — same value, different reason).
         for (limit, expected) in [
             ("512Mi", "512Mi"),
             ("1Gi", "1Gi"),
