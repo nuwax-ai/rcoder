@@ -396,6 +396,20 @@ mod tests {
         ] {
             assert_eq!(min_memory_request(limit), expected, "limit={limit}");
         }
+        // Codex rounding-boundary counterexamples: values just under 1GiB
+        // that the shared parser rounds UP to exactly 1073741824 — the
+        // strict > comparison must keep the original limit (restoring >=
+        // would cap to "1Gi" and produce request > limit).
+        assert_eq!(
+            min_memory_request("1073741823.6"),
+            "1073741823.6",
+            "half-byte below 1GiB must keep the original limit"
+        );
+        assert_eq!(
+            min_memory_request("1073741823.9"),
+            "1073741823.9",
+            "0.1 bytes below 1GiB must keep the original limit"
+        );
         // Codex counterexamples: legal K8s Quantity formats the local integer
         // parser missed (decimal and scientific notation).
         assert_eq!(min_memory_request("8.0Gi"), "1Gi", "decimal Gi caps to 1Gi");
