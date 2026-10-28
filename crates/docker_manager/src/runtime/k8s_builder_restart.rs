@@ -9,6 +9,7 @@ use k8s_openapi::{
         apps::v1::StatefulSet,
         core::v1::{PodSpec, Secret},
     },
+    apimachinery::pkg::api::resource::Quantity,
 };
 use kube::{Api, api::PostParams};
 use sha2::{Digest as _, Sha256};
@@ -162,7 +163,8 @@ impl KubernetesRuntime {
             .builder_app_id(target.context.app_id.clone())
             .service_type(shared_types::ServiceType::UserappBuilder)
             .build();
-        let mut candidate = if target.restart_image.is_some() {
+        let apply_platform_recipe = target.restart_image.is_some();
+        let mut candidate = if apply_platform_recipe {
             self.build_agent_pod_spec(
                 &target.context.app_id,
                 &shared_types::ServiceType::UserappBuilder,
@@ -194,6 +196,28 @@ impl KubernetesRuntime {
             .clone()
             .or_else(|| original_agent.image.clone());
         agent.resources = original_agent.resources.clone();
+        // A rollout that adopts the current platform template also adopts the
+        // current platform memory-request policy: recompute exactly this one
+        // field as min(1Gi, limit) from the retained limit, so a candidate
+        // rebuilt from a pre-upgrade original (e.g. request=64Mi under a 6Gi
+        // limit) no longer resurrects the outdated request. Everything else —
+        // all limits and the cpu/ephemeral-storage requests — stays verbatim,
+        // and shapes without a memory limit keep their original resources.
+        if apply_platform_recipe
+            && let Some(limit) = agent
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.limits.as_ref())
+                .and_then(|limits| limits.get("memory"))
+        {
+            let request = super::k8s_app_helpers::min_memory_request(&limit.0);
+            agent
+                .resources
+                .get_or_insert_default()
+                .requests
+                .get_or_insert_default()
+                .insert("memory".to_string(), Quantity(request));
+        }
         let env = agent.env.get_or_insert_default();
         // Existing application-owned entries absent from the platform recipe
         // remain verbatim, including valueFrom. Never silently remove them.
