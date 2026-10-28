@@ -9,7 +9,7 @@ mod conversion;
 mod locale;
 mod permission;
 mod status;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 pub(crate) use status::peer_is_loopback;
 mod stop_agent;
 mod subscribe_progress;

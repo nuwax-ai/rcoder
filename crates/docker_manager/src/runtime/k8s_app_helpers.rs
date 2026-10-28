@@ -204,6 +204,43 @@ pub(crate) fn build_probe(
 /// - `ephemeral-storage`：requests=`512Mi`（overlay 实际写入少，数据在 PVC）。
 ///
 /// 返回 `None`：三者皆空（无任何 limits 需求）。
+/// The memory request is `min(1Gi, limit)`: 1Gi for weight-aware scheduling
+/// on normal workloads, but capped by the caller's limit so the combination
+/// always passes server-side validation (request ≤ limit). Unparseable
+/// quantities fall back to the limit itself (never exceeds it).
+fn min_memory_request(limit: &str) -> String {
+    const ONE_GIB_BYTES: u64 = 1024 * 1024 * 1024;
+    match parse_memory_quantity(limit) {
+        Some(bytes) if bytes >= ONE_GIB_BYTES => "1Gi".to_string(),
+        Some(_) => limit.to_string(),
+        None => limit.to_string(),
+    }
+}
+
+/// Parse a K8s memory Quantity string to bytes. Handles the binary
+/// suffixes (Ki/Mi/Gi/Ti) and plain byte counts; decimal suffixes
+/// (k/M/G/T) are less common for memory and handled as well.
+fn parse_memory_quantity(s: &str) -> Option<u64> {
+    let suffixes: &[(&str, u64)] = &[
+        ("Ki", 1024),
+        ("Mi", 1024u64 * 1024),
+        ("Gi", 1024u64 * 1024 * 1024),
+        ("Ti", 1024u64 * 1024 * 1024 * 1024),
+        ("k", 1000),
+        ("M", 1000u64 * 1000),
+        ("G", 1000u64 * 1000 * 1000),
+        ("T", 1000u64 * 1000 * 1000 * 1000),
+    ];
+    for (suffix, multiplier) in suffixes {
+        if let Some(num) = s.strip_suffix(suffix) {
+            if let Ok(n) = num.parse::<u64>() {
+                return Some(n.saturating_mul(*multiplier));
+            }
+        }
+    }
+    s.parse::<u64>().ok()
+}
+
 #[cfg(feature = "kubernetes")]
 pub(crate) fn build_decoupled_resources(
     cpu: Option<String>,
@@ -217,8 +254,13 @@ pub(crate) fn build_decoupled_resources(
         requests.insert("cpu".to_string(), Quantity("50m".to_string()));
     }
     if let Some(m) = memory {
-        limits.insert("memory".to_string(), Quantity(m));
-        requests.insert("memory".to_string(), Quantity("1Gi".to_string()));
+        limits.insert("memory".to_string(), Quantity(m.clone()));
+        // Request must not exceed the limit (K8s server-side validation
+        // rejects request > limit): small-memory workloads keep the limit
+        // itself as the request; larger ones cap at 1Gi for weight-aware
+        // scheduling (see the doc comment above for the sizing rationale).
+        let request = min_memory_request(&m);
+        requests.insert("memory".to_string(), Quantity(request));
     }
     if let Some(es) = ephemeral {
         limits.insert("ephemeral-storage".to_string(), Quantity(es));
@@ -330,16 +372,51 @@ mod tests {
     #[test]
     fn decoupled_resources_all_three_decoupled_values() {
         let rr =
-            build_decoupled_resources(Some("1".into()), Some("512Mi".into()), Some("1Gi".into()))
+            build_decoupled_resources(Some("1".into()), Some("4Gi".into()), Some("1Gi".into()))
                 .unwrap();
-        let limits = rr.limits.unwrap();
-        let requests = rr.requests.unwrap();
-        assert_eq!(limits["cpu"].0.clone(), "1");
-        assert_eq!(requests["cpu"].0.clone(), "50m");
-        assert_eq!(limits["memory"].0.clone(), "512Mi");
-        assert_eq!(requests["memory"].0.clone(), "1Gi");
-        assert_eq!(limits["ephemeral-storage"].0.clone(), "1Gi");
-        assert_eq!(requests["ephemeral-storage"].0.clone(), "512Mi");
+        let (limits, requests) = (rr.limits.clone().unwrap(), rr.requests.unwrap());
+        assert_eq!(limits["cpu"].0, "1");
+        assert_eq!(limits["memory"].0, "4Gi");
+        assert_eq!(limits["ephemeral-storage"].0, "1Gi");
+        assert_eq!(requests["cpu"].0, "50m");
+        // Large limit: request caps at 1Gi for weight-aware scheduling.
+        assert_eq!(requests["memory"].0, "1Gi");
+        assert_eq!(requests["ephemeral-storage"].0, "512Mi");
+    }
+
+    #[test]
+    fn decoupled_resources_memory_request_never_exceeds_limit() {
+        for (limit, expected_request) in [
+            ("512Mi", "512Mi"), // small: request = limit
+            ("1Gi", "1Gi"),     // boundary
+            ("2Gi", "1Gi"),     // large: capped at 1Gi
+            ("4Gi", "1Gi"),     // large: capped at 1Gi
+            ("weird", "weird"), // unparseable: falls back to limit
+        ] {
+            let rr = build_decoupled_resources(None, Some(limit.into()), None)
+                .expect("memory alone builds requirements");
+            let requests = rr.requests.as_ref().unwrap();
+            assert_eq!(
+                requests["memory"].0, expected_request,
+                "limit={limit}: request must never exceed limit"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_memory_quantity_common_suffixes() {
+        assert_eq!(parse_memory_quantity("512Mi"), Some(536870912));
+        assert_eq!(parse_memory_quantity("1Gi"), Some(1073741824));
+        assert_eq!(parse_memory_quantity("4Gi"), Some(4294967296));
+        assert_eq!(parse_memory_quantity("100Ki"), Some(102400));
+        assert_eq!(parse_memory_quantity("1073741824"), Some(1073741824));
+        assert_eq!(parse_memory_quantity("1G"), Some(1_000_000_000));
+        assert_eq!(parse_memory_quantity("invalid"), None);
+        // min_memory_request correctness
+        assert_eq!(min_memory_request("512Mi"), "512Mi");
+        assert_eq!(min_memory_request("1Gi"), "1Gi");
+        assert_eq!(min_memory_request("4Gi"), "1Gi");
+        assert_eq!(min_memory_request("2Gi"), "1Gi");
     }
 
     // ---- build_app_resource_requirements：ephemeral 回退 storage ----

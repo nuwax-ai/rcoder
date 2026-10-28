@@ -267,8 +267,9 @@ fn user_connection_count() -> anyhow::Result<usize> {
 fn user_connection(port: u16, established: bool, listening: bool, remote_loopback: bool) -> bool {
     // Loopback peers are intra-container IPC (a resident tool's local
     // socketpairs — opencode keeps several alive forever), not user traffic.
-    // Production 2026-10-28: they held every legacy container at
-    // active_tasks >= 3, so idle reclaim never fired while such a tool ran.
+    // Future agents running this code would otherwise hold new containers
+    // at active_tasks >= 3 whenever such a tool runs (the pre-70f30aab
+    // agents in legacy containers lacked this counter entirely).
     established && listening && port != shared_types::GRPC_DEFAULT_PORT && !remote_loopback
 }
 
