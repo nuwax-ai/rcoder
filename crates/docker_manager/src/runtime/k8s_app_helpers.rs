@@ -210,35 +210,10 @@ pub(crate) fn build_probe(
 /// quantities fall back to the limit itself (never exceeds it).
 fn min_memory_request(limit: &str) -> String {
     const ONE_GIB_BYTES: u64 = 1024 * 1024 * 1024;
-    match parse_memory_quantity(limit) {
+    match shared_types::parse_memory_quantity(limit) {
         Some(bytes) if bytes >= ONE_GIB_BYTES => "1Gi".to_string(),
-        Some(_) => limit.to_string(),
-        None => limit.to_string(),
+        _ => limit.to_string(),
     }
-}
-
-/// Parse a K8s memory Quantity string to bytes. Handles the binary
-/// suffixes (Ki/Mi/Gi/Ti) and plain byte counts; decimal suffixes
-/// (k/M/G/T) are less common for memory and handled as well.
-fn parse_memory_quantity(s: &str) -> Option<u64> {
-    let suffixes: &[(&str, u64)] = &[
-        ("Ki", 1024),
-        ("Mi", 1024u64 * 1024),
-        ("Gi", 1024u64 * 1024 * 1024),
-        ("Ti", 1024u64 * 1024 * 1024 * 1024),
-        ("k", 1000),
-        ("M", 1000u64 * 1000),
-        ("G", 1000u64 * 1000 * 1000),
-        ("T", 1000u64 * 1000 * 1000 * 1000),
-    ];
-    for (suffix, multiplier) in suffixes {
-        if let Some(num) = s.strip_suffix(suffix) {
-            if let Ok(n) = num.parse::<u64>() {
-                return Some(n.saturating_mul(*multiplier));
-            }
-        }
-    }
-    s.parse::<u64>().ok()
 }
 
 #[cfg(feature = "kubernetes")]
@@ -404,19 +379,41 @@ mod tests {
     }
 
     #[test]
-    fn parse_memory_quantity_common_suffixes() {
-        assert_eq!(parse_memory_quantity("512Mi"), Some(536870912));
-        assert_eq!(parse_memory_quantity("1Gi"), Some(1073741824));
-        assert_eq!(parse_memory_quantity("4Gi"), Some(4294967296));
-        assert_eq!(parse_memory_quantity("100Ki"), Some(102400));
-        assert_eq!(parse_memory_quantity("1073741824"), Some(1073741824));
-        assert_eq!(parse_memory_quantity("1G"), Some(1_000_000_000));
-        assert_eq!(parse_memory_quantity("invalid"), None);
-        // min_memory_request correctness
-        assert_eq!(min_memory_request("512Mi"), "512Mi");
-        assert_eq!(min_memory_request("1Gi"), "1Gi");
-        assert_eq!(min_memory_request("4Gi"), "1Gi");
-        assert_eq!(min_memory_request("2Gi"), "1Gi");
+    fn min_memory_request_covers_decimal_and_scientific_quantities() {
+        // Integer suffixes (the original matrix).
+        for (limit, expected) in [
+            ("512Mi", "512Mi"),
+            ("1Gi", "1Gi"),
+            ("2Gi", "1Gi"),
+            ("4Gi", "1Gi"),
+        ] {
+            assert_eq!(min_memory_request(limit), expected, "limit={limit}");
+        }
+        // Codex counterexamples: legal K8s Quantity formats the local integer
+        // parser missed (decimal and scientific notation).
+        assert_eq!(min_memory_request("8.0Gi"), "1Gi", "decimal Gi caps to 1Gi");
+        assert_eq!(
+            min_memory_request("1.5Gi"),
+            "1Gi",
+            "1.5Gi >= 1Gi caps to 1Gi"
+        );
+        assert_eq!(
+            min_memory_request("8e9"),
+            "1Gi",
+            "8e9 bytes = ~7.45Gi caps to 1Gi"
+        );
+        assert_eq!(
+            min_memory_request("0.5Gi"),
+            "0.5Gi",
+            "0.5Gi < 1Gi keeps limit"
+        );
+        assert_eq!(
+            min_memory_request("1536Mi"),
+            "1Gi",
+            "1.5Gi in Mi caps to 1Gi"
+        );
+        // Unparseable: falls back to the limit (never exceeds it).
+        assert_eq!(min_memory_request("weird"), "weird");
     }
 
     // ---- build_app_resource_requirements：ephemeral 回退 storage ----
