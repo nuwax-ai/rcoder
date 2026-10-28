@@ -195,10 +195,12 @@ pub(crate) fn build_probe(
 ///   ⚠️ 50m 只缓解 throttle，**不解决调度均衡**：requests 仍很低，调度器仍按"节点很轻"
 ///   看待，会把 pod 全堆在最闲节点。跨节点均衡由 PodSpec 的 topologySpreadConstraints
 ///   保证（见 build_agent_pod_spec），不靠调 requests。
-/// - `memory`（不可压缩）：requests=`64Mi`。pod 开了 swap，内存吃紧可换出不易 OOM；
-///   运行时实际可用到 limits 上限（swap + limits 双兜底）。⚠️ 代价：节点内存严重紧张时，
-///   低 requests + 高实际占用的 pod 可能被优先 evict；集群内存余量充足（实测 13~34%）
-///   且有 swap，风险可控；若频繁被 evict 再调大。
+/// - `memory`（不可压缩）：requests=`1Gi`（2026-10-28 从 64Mi 调大，触发：node5
+///   MemoryPressure 驱逐 1 个沙箱——实测占用中位数 955Mi，64Mi 让调度器对节点真实
+///   重量"失明"，堆积至 evict）。≈实测中位数定价：调度器开始按 allocatable−requests
+///   打分，新沙箱自然偏向轻节点。集群 commit 率 34%（195Gi/570Gi），单节点密度上限
+///   ≈130 个（135Gi÷1Gi），现峰值 67 个，余量约一倍。limits 4Gi 不变（超卖本体，
+///   单 pod 仍 4:1 弹性），swap 兜底不变；全员 p90 同时冲峰（350Gi）仍小于物理总量。
 /// - `ephemeral-storage`：requests=`512Mi`（overlay 实际写入少，数据在 PVC）。
 ///
 /// 返回 `None`：三者皆空（无任何 limits 需求）。
@@ -216,7 +218,7 @@ pub(crate) fn build_decoupled_resources(
     }
     if let Some(m) = memory {
         limits.insert("memory".to_string(), Quantity(m));
-        requests.insert("memory".to_string(), Quantity("64Mi".to_string()));
+        requests.insert("memory".to_string(), Quantity("1Gi".to_string()));
     }
     if let Some(es) = ephemeral {
         limits.insert("ephemeral-storage".to_string(), Quantity(es));
@@ -335,7 +337,7 @@ mod tests {
         assert_eq!(limits["cpu"].0.clone(), "1");
         assert_eq!(requests["cpu"].0.clone(), "50m");
         assert_eq!(limits["memory"].0.clone(), "512Mi");
-        assert_eq!(requests["memory"].0.clone(), "64Mi");
+        assert_eq!(requests["memory"].0.clone(), "1Gi");
         assert_eq!(limits["ephemeral-storage"].0.clone(), "1Gi");
         assert_eq!(requests["ephemeral-storage"].0.clone(), "512Mi");
     }
