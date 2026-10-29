@@ -16,7 +16,7 @@
 //!   permission to adopt nor permission to delete.
 use super::{adoption, creation, validate_builder_identity};
 use crate::app_state::AppState;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use shared_types::{
     AGENT_FILE_SERVER_PORT, ContainerBasicInfo, ProjectAndContainerInfo, ProjectStore as _,
     ServiceType, UserAppLifecycleState, persistence::PersistenceWriteOutcome,
@@ -40,16 +40,20 @@ pub(crate) enum RegistrationGap {
     BindingMissing,
     /// 原卷连续性未证实：同名 PVC 换代次、卷删除中，或根本没有卷证据。
     VolumeUnverified,
+    /// 登记写入未被确认（并发写入胜出，或 Project Stop 正在等待持久化确认）。
+    /// 结果未知，既不算成功也不算失败。
+    WriteNotConfirmed,
 }
 
 impl RegistrationGap {
     /// 有界原因集合（聚合计数的下标来源，新增必须同步）。
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::NotObserved,
         Self::OperationInFlight,
         Self::SharedRegistryReceiptMissing,
         Self::BindingMissing,
         Self::VolumeUnverified,
+        Self::WriteNotConfirmed,
     ];
 
     pub(crate) fn as_str(self) -> &'static str {
@@ -59,6 +63,7 @@ impl RegistrationGap {
             Self::SharedRegistryReceiptMissing => "shared_registry_receipt_missing",
             Self::BindingMissing => "binding_missing",
             Self::VolumeUnverified => "volume_unverified",
+            Self::WriteNotConfirmed => "write_not_confirmed",
         }
     }
 }
@@ -75,11 +80,14 @@ pub(crate) async fn recover_missing_builder_registration(
     state: &AppState,
     app_id: &str,
 ) -> Result<BuilderRegistrationRecovery> {
-    let app = state
-        .userapp_store
-        .get_application(app_id)
-        .await?
-        .ok_or_else(|| anyhow!("Builder registration recovery lifecycle missing: {app_id}"))?;
+    // A missing lifecycle record is an expected reconciliation outcome (the
+    // workload may be protected only by a binding or a compute control), not a
+    // programming error: report it as a gap instead of failing the scan round.
+    let Some(app) = state.userapp_store.get_application(app_id).await? else {
+        return Ok(BuilderRegistrationRecovery::Unconfirmed(
+            RegistrationGap::NotObserved,
+        ));
+    };
     if app.state != UserAppLifecycleState::Active {
         return Ok(BuilderRegistrationRecovery::Unconfirmed(
             RegistrationGap::NotObserved,
@@ -203,7 +211,9 @@ pub(crate) async fn recover_missing_builder_registration(
     Ok(if outcome == PersistenceWriteOutcome::Committed {
         BuilderRegistrationRecovery::Completed(verified)
     } else {
-        BuilderRegistrationRecovery::Unconfirmed(RegistrationGap::NotObserved)
+        // Superseded (a concurrent writer won) or Deferred (a Project Stop is
+        // awaiting durable confirmation): the outcome is unknown, never success.
+        BuilderRegistrationRecovery::Unconfirmed(RegistrationGap::WriteNotConfirmed)
     })
 }
 
@@ -605,5 +615,26 @@ mod pg_tests {
             ),
             "no current-lifecycle binding must not complete a registration"
         );
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    /// `ALL` 是聚合计数的唯一来源：必须无重复原因串，否则有界告警会把两个不同
+    /// 缺口显示成同一个。`as_str` 的穷尽 match 由编译器保证覆盖每个变体。
+    #[test]
+    fn gap_reasons_are_distinct_and_bounded() {
+        let mut seen = std::collections::HashSet::new();
+        for gap in RegistrationGap::ALL {
+            assert!(
+                seen.insert(gap.as_str()),
+                "duplicate registration gap reason: {}",
+                gap.as_str()
+            );
+            assert!(!gap.as_str().is_empty());
+        }
+        assert_eq!(seen.len(), RegistrationGap::ALL.len());
     }
 }
