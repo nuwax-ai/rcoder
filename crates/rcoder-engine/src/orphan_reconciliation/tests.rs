@@ -949,6 +949,64 @@ async fn live_builder_without_registration_or_evidence_is_retained() {
     assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
 }
 
+/// 在途 dev 操作围栏期间不得补齐登记：该应用的登记归属在途操作，后台对账不能
+/// 抢在它前面为正在被替换/停止的 Pod 写行。围栏释放后才恢复。
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn live_builder_registration_recovery_defers_to_inflight_operation() {
+    let (mut scanner, runtime, _probe, _directory) = fixture().await;
+    let app = scanner
+        .state
+        .userapp_store
+        .ensure_identity("example")
+        .await
+        .unwrap();
+    *runtime.snapshot.lock().unwrap() = live_builder();
+    *runtime.builder.lock().unwrap() = Some(RuntimeContainerInfo {
+        container_id: "pod-live".into(),
+        container_name: "example".into(),
+        container_ip: "10.42.4.207".into(),
+        status: container_runtime_api::ContainerRuntimeStatus::Running,
+        created_at: Utc::now(),
+        env_vars: None,
+        service_type: Some(ServiceType::UserappBuilder),
+        project_id: Some("example".into()),
+        app_id: Some("example".into()),
+        user_id: None,
+        pod_id: None,
+        workload_uid: Some("sts-current".into()),
+    });
+    bind_current_lifecycle(&scanner.state, &app.lifecycle_id).await;
+    // dev 槽在途操作（StopBuilder）即围栏。
+    scanner
+        .state
+        .userapp_store
+        .admit(&shared_types::UserAppAdmission {
+            app_id: "example".into(),
+            lifecycle_id: None,
+            request_id: Some("fence-request".into()),
+            operation_id: "fence-stop".into(),
+            request_fingerprint: "a".repeat(64),
+            kind: shared_types::UserAppOperationKind::StopBuilder,
+            command: None,
+            metadata: None,
+            runtime_policy_on_success: None,
+        })
+        .await
+        .unwrap();
+
+    scanner.scan().await.unwrap();
+    assert!(
+        scanner
+            .state
+            .projects
+            .get("example")
+            .is_none_or(|project| project.container_info().is_none()),
+        "an in-flight operation must own the registration decision"
+    );
+    assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
+}
+
 /// 存活 builder 的快照：controller + Pod + Service，年龄足够、身份完整。
 #[cfg(feature = "userapp-turso")]
 fn live_builder() -> AgentStopSnapshot {

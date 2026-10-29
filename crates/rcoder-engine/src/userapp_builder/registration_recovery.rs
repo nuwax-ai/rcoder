@@ -52,6 +52,18 @@ pub(crate) async fn recover_missing_builder_registration(
     }
     // Real runtime identity, current application/lifecycle and workload UID.
     adoption::verify_live_builder_observation(state, app_id, app_id, &observed).await?;
+    // An in-flight dev/application operation owns this application's
+    // registration decision (Stop/Restart/Ensure/Destroy/ClearDevStorage/Purge).
+    // A background reconciliation must never race it into a row for a Pod that
+    // the operation is replacing or retiring. An unreadable fence also defers.
+    if crate::cleanup_task::cleaner::builder_fenced_by_active_operations(
+        state.userapp_store.as_ref(),
+        app_id,
+    )
+    .await
+    {
+        return Ok(None);
+    }
     // A live Pod without its management Service is incomplete routing, not a
     // missing row: repair belongs to admitted creation/resume, which owns the
     // durable operation and runtime lease.
