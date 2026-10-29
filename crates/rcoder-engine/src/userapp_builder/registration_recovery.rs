@@ -294,11 +294,18 @@ async fn workspace_volumes_verified(
         .await
     {
         Ok(()) => Ok(true),
-        Err(error) => {
-            tracing::debug!(app_id, error = %format!("{error:#}"),
-                "recorded workspace volumes no longer match the live builder; registration retained");
+        // 只有**确定的卷冲突**是本轮可判定的缺口：UID 不等、卷正在删除、注解不属于
+        // 当前代次、挂载集变化（运行时把它们统一映射为 `Conflict`）。读取失败、超时、
+        // PG/K8s 故障的结果**未知**，必须向上传播——扫描按未知处理（保留资源 + 告警），
+        // 不能伪装成"卷不一致"去污染缺口统计与默认日志。
+        Err(app_manager::AppOperationError::Conflict(_)) => {
+            tracing::debug!(
+                app_id,
+                "recorded workspace volumes no longer match the live builder; registration retained"
+            );
             Ok(false)
         }
+        Err(error) => Err(error).context("verify recorded builder workspace volumes"),
     }
 }
 

@@ -15,10 +15,12 @@ use tokio::{sync::broadcast, time::Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::userapp_builder::registration_recovery::{
+    BuilderRegistrationRecovery, RegistrationGap, recover_missing_builder_registration,
+};
 use crate::{
     app_state::AppState,
     config::{CleanupConfigSettings, OrphanReconcileMode},
-    userapp_builder::registration_recovery::{BuilderRegistrationRecovery, RegistrationGap},
 };
 
 #[cfg(test)]
@@ -335,9 +337,7 @@ impl Scanner {
                 Some(RegistrationGap::OperationInFlight),
             ));
         };
-        match crate::userapp_builder::recover_missing_builder_registration(&self.state, app_id)
-            .await
-        {
+        match recover_missing_builder_registration(&self.state, app_id).await {
             Ok(BuilderRegistrationRecovery::Completed(verified)) => {
                 info!(app_id, workload = %name,
                     container_id = %verified.container_id, container_name = %verified.container_name,

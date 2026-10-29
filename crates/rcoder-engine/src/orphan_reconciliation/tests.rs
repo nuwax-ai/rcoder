@@ -213,6 +213,8 @@ struct Runtime {
     builder_release: tokio::sync::Notify,
     /// Live volumes no longer match the recorded discovery witness.
     volumes_replaced: AtomicBool,
+    /// The volume witness cannot be read at all (API failure/timeout).
+    volumes_unreadable: AtomicBool,
 }
 
 /// What the runtime reports for a builder's workspace volumes. `Absent` is the
@@ -384,6 +386,11 @@ impl UserAppDeploymentRuntime for Runtime {
                 "Recovered workspace volume was replaced or is deleting".into(),
             ));
         }
+        if self.volumes_unreadable.load(Ordering::Acquire) {
+            return Err(ContainerRuntimeError::K8sError(
+                "controlled volume witness read failure".into(),
+            ));
+        }
         for expected in volumes {
             if expected.uid.is_empty() || expected.name.is_empty() {
                 return Err(ContainerRuntimeError::ConfigurationError(
@@ -455,6 +462,7 @@ async fn fixture() -> (Scanner, Arc<Runtime>, Arc<ScriptedProbe>, tempfile::Temp
         builder_entered: tokio::sync::Notify::new(),
         builder_release: tokio::sync::Notify::new(),
         volumes_replaced: AtomicBool::new(false),
+        volumes_unreadable: AtomicBool::new(false),
     });
     let state =
         crate::userapp_builder::builder_runtime_test_state(runtime.clone(), store, None).await;
@@ -1213,6 +1221,110 @@ async fn live_builder_registration_recovery_refuses_replaced_recorded_volume() {
         "a replaced recorded volume must not complete a registration"
     );
     assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
+}
+
+/// 卷**读取失败**与卷**UID 冲突**必须分开归类（Codex 复核 P2）：
+/// 前者结果未知，必须向上传播（扫描按未知处理：保留资源 + 告警），不能伪装成
+/// "卷不一致"；后者才是本轮可判定的 `volume_unverified` 缺口。
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn unreadable_volume_witness_is_unknown_not_a_volume_gap() {
+    let (scanner, runtime, _probe, _directory) = fixture().await;
+    record_discovery_witness(&scanner.state, "witness-lifecycle", "pvc-original").await;
+    let app = scanner
+        .state
+        .userapp_store
+        .get_application("example")
+        .await
+        .unwrap()
+        .expect("witness restore creates the root");
+    *runtime.builder.lock().unwrap() = Some(RuntimeContainerInfo {
+        container_id: "pod-live".into(),
+        container_name: "example".into(),
+        container_ip: "10.42.4.207".into(),
+        status: container_runtime_api::ContainerRuntimeStatus::Running,
+        created_at: Utc::now(),
+        env_vars: None,
+        service_type: Some(ServiceType::UserappBuilder),
+        project_id: Some("example".into()),
+        app_id: Some("example".into()),
+        user_id: None,
+        pod_id: None,
+        workload_uid: Some("sts-current".into()),
+    });
+    bind_current_lifecycle(&scanner.state, &app.lifecycle_id).await;
+    *runtime.volumes.lock().unwrap() =
+        VolumeWitness::Present(vec![shared_types::AppResourceIdentity {
+            kind: shared_types::AppResourceKind::PersistentVolumeClaim,
+            name: "example-workspace".into(),
+            uid: "pvc-current".into(),
+            resource_version: None,
+        }]);
+    runtime.volumes_unreadable.store(true, Ordering::Release);
+
+    let outcome = recover_missing_builder_registration(&scanner.state, "example").await;
+    assert!(
+        outcome.is_err(),
+        "an unreadable volume witness is an unknown outcome and must propagate, \
+         not be reported as a confirmed volume gap"
+    );
+    assert!(
+        scanner
+            .state
+            .projects
+            .get("example")
+            .is_none_or(|project| project.container_info().is_none()),
+        "an unknown outcome never writes a registration"
+    );
+}
+
+/// 对照：UID 冲突是**确定**的缺口，返回 `volume_unverified` 而不是错误。
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn replaced_recorded_volume_is_a_confirmed_gap_not_an_error() {
+    let (scanner, runtime, _probe, _directory) = fixture().await;
+    record_discovery_witness(&scanner.state, "witness-lifecycle", "pvc-original").await;
+    let app = scanner
+        .state
+        .userapp_store
+        .get_application("example")
+        .await
+        .unwrap()
+        .expect("witness restore creates the root");
+    *runtime.builder.lock().unwrap() = Some(RuntimeContainerInfo {
+        container_id: "pod-live".into(),
+        container_name: "example".into(),
+        container_ip: "10.42.4.207".into(),
+        status: container_runtime_api::ContainerRuntimeStatus::Running,
+        created_at: Utc::now(),
+        env_vars: None,
+        service_type: Some(ServiceType::UserappBuilder),
+        project_id: Some("example".into()),
+        app_id: Some("example".into()),
+        user_id: None,
+        pod_id: None,
+        workload_uid: Some("sts-current".into()),
+    });
+    bind_current_lifecycle(&scanner.state, &app.lifecycle_id).await;
+    *runtime.volumes.lock().unwrap() =
+        VolumeWitness::Present(vec![shared_types::AppResourceIdentity {
+            kind: shared_types::AppResourceKind::PersistentVolumeClaim,
+            name: "example-workspace".into(),
+            uid: "pvc-recreated".into(),
+            resource_version: None,
+        }]);
+    runtime.volumes_replaced.store(true, Ordering::Release);
+
+    let outcome = recover_missing_builder_registration(&scanner.state, "example").await;
+    assert!(
+        matches!(
+            outcome,
+            Ok(BuilderRegistrationRecovery::Unconfirmed(
+                RegistrationGap::VolumeUnverified
+            ))
+        ),
+        "a replaced recorded volume is a confirmed gap, not an unknown outcome"
+    );
 }
 
 /// 在途 dev 操作围栏期间不得补齐登记：该应用的登记归属在途操作，后台对账不能
