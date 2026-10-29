@@ -52,6 +52,10 @@ pub struct ProxyMetrics {
     port_map: DashMap<u16, Arc<PerPortMetrics>>,
     // 活跃连接数（请求进行中）
     pub active_connections: AtomicU64,
+    /// 已按预期客户端断开降级的下游 ConnectionClosed 计数（有界 counter：
+    /// 单调 u64，不按用户/项目/operation ID 展开标签）。日志采样节奏由
+    /// [`Self::note_client_disconnected`] 决定（首条 + 每 100 条采样）。
+    pub client_disconnected_suppressed: AtomicU64,
 }
 
 impl Default for ProxyMetrics {
@@ -64,6 +68,7 @@ impl Default for ProxyMetrics {
             total_response_time_ns: AtomicU64::new(0),
             port_map: DashMap::new(),
             active_connections: AtomicU64::new(0),
+            client_disconnected_suppressed: AtomicU64::new(0),
         }
     }
 }
@@ -145,6 +150,16 @@ impl ProxyMetrics {
 
     pub fn active(&self) -> u64 {
         self.active_connections.load(Ordering::Relaxed)
+    }
+
+    /// 记录一次按预期客户端断开降级的下游断开，返回本次是否采样输出
+    /// 常规 info 摘要（首条 + 每 100 条；其余仅 debug 级）。
+    pub fn note_client_disconnected(&self) -> bool {
+        let count = self
+            .client_disconnected_suppressed
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        count == 1 || count.is_multiple_of(100)
     }
 
     /// 获取或创建端口指标
@@ -282,6 +297,12 @@ pub struct TrackingCtx {
     pub preview_origin_port: Option<u16>,
     /// UserApp app 代理路由（request_filter 阶段捕获；错误页/来源识别只覆盖该域）
     pub userapp_route: Option<UserAppRouteCtx>,
+    /// 已知流式路由标记（request_filter 阶段捕获）：`"app"`（UserApp app
+    /// dev/prod 预览，含 HMR/WS/SSE）或 `"dbx"`（数据库流式接口——生产
+    /// 431 条 Downstream ConnectionClosed 的来源族）。客户端断开日志分类
+    /// （suppress_error_log）只对带本标记的路由生效；其余路由保持完整
+    /// ERROR 可诊断性。
+    pub streaming_route: Option<&'static str>,
     /// Captured wake failure; later readiness advice must not replace its identity.
     pub wake_failure: Option<shared_types::WakeFailure>,
     /// Fresh UID-rechecked evidence; never copied from the advisor TTL cache.
@@ -316,6 +337,7 @@ impl TrackingCtx {
         Self {
             start: std::time::Instant::now(),
             userapp_route: None,
+            streaming_route: None,
             wake_failure: None,
             failure_hint: None,
             fresh_failure_evidence: false,

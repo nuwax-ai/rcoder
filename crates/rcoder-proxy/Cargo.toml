@@ -57,6 +57,10 @@ uuid = { workspace = true }
 [dev-dependencies]
 # 仅测试构造 ContainerBasicInfo 时间字段；工作区图内既有依赖，不新增外部面
 chrono = { workspace = true }
+# 协议测试捕获 tracing 输出（客户端断开分类断言：抑制 ERROR/降级行可见）
+tracing-subscriber = { workspace = true }
+# log 门面桥（pingora 内部日志经 log crate 输出；tracing-subscriber 传递依赖）
+tracing-log = "0.2"
 
 [features]
 default = []

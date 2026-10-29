@@ -322,7 +322,20 @@ impl ProxyHttp for PortProxy {
                     app_id: app_id.to_string(),
                     stage,
                 });
+                // app 预览（HMR/WS/SSE）属已知流式路由：客户端断开日志分类用。
+                ctx.streaming_route = Some("app");
             }
+        }
+        // dbx 流式路由标记（生产 431 条 Downstream ConnectionClosed 的来源族）：
+        // 须在 classify_wake_target 的 dev 早退之前捕获。
+        if path.starts_with("/api/v1/userapp/proxy/dbx/")
+            && let Ok(matched) = self.router.at(path)
+            && matches!(
+                matched.value,
+                RouteType::DevDbxProxy | RouteType::ProdDbxProxy
+            )
+        {
+            ctx.streaming_route = Some("dbx");
         }
         if let Some((app_id, touch, stage)) = classify_wake_target(&self.router, path) {
             // ① 访问追踪（仅 prod 业务流量）
@@ -803,6 +816,77 @@ impl ProxyHttp for PortProxy {
         error
     }
 
+    /// 客户端断开日志分类（生产巡检批次二A）：仅当①已知流式路由
+    /// （`ctx.streaming_route`：UserApp app 预览或 dbx 族）、②响应已建立
+    /// （`response_written` 为非 1xx 终态或 101——与错误页守卫同语义）、
+    /// ③错误源为 Downstream 且 etype 为 ConnectionClosed（客户端 FIN）
+    /// 三者同时成立，才把该错误按**预期客户端断开**分类：抑制 pingora
+    /// 的最终 `Fail to proxy` ERROR（proxy lib.rs 在本 hook 返回 true 时不
+    /// 打印），代之以降级 debug（每条）+ 首条/每 100 条采样 info，计数入
+    /// 有界 counter `ProxyMetrics::client_disconnected_suppressed`。
+    ///
+    /// 不降级（返回 false 保持 ERROR 可诊断性）：Upstream 错误、其他
+    /// etype（含 ReadTimedout——下游空闲截断是批次一已根因修复的缺陷
+    /// 签名，不得藏进静默）、响应未建立前的断开、非流式路由。
+    /// hook 内 ctx 为共享引用——计数与采样 gate 必须走 `&self.metrics`，
+    /// 不能写 TrackingCtx。
+    fn suppress_error_log(
+        &self,
+        session: &Session,
+        ctx: &Self::CTX,
+        error: &pingora_core::Error,
+    ) -> bool {
+        use pingora::ErrorSource;
+        let Some(family) = ctx.streaming_route else {
+            return false;
+        };
+        if !matches!(error.esource(), ErrorSource::Downstream)
+            || !matches!(error.etype(), ErrorType::ConnectionClosed)
+        {
+            return false;
+        }
+        let response_established =
+            session
+                .as_downstream()
+                .response_written()
+                .is_some_and(|written| {
+                    !written.status.is_informational() || written.status.as_u16() == 101
+                });
+        if !response_established {
+            return false;
+        }
+        let sampled = self.metrics.note_client_disconnected();
+        let uri = session
+            .req_header()
+            .uri
+            .path_and_query()
+            .map(|path_and_query| path_and_query.as_str().to_string())
+            .unwrap_or_else(|| session.req_header().uri.path().to_string());
+        tracing::debug!(
+            family,
+            classification = "client_disconnected",
+            upgraded = session.as_downstream().was_upgraded(),
+            downstream_sent_bytes = session.as_downstream().body_bytes_sent(),
+            duration_ms = u64::try_from(ctx.start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            uri = %uri,
+            error = %error,
+            "expected client disconnect on streaming route; platform error log suppressed"
+        );
+        if sampled {
+            tracing::info!(
+                family,
+                classification = "client_disconnected",
+                uri = %uri,
+                suppressed_total = self
+                    .metrics
+                    .client_disconnected_suppressed
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                "sampled client disconnect classification"
+            );
+        }
+        true
+    }
+
     /// 连接到上游后的回调
     ///
     /// 用于记录连接协议信息（HTTP/1.1 或 HTTP/2）
@@ -926,6 +1010,29 @@ impl ProxyHttp for PortProxy {
                 "[API_PROXY] Response: status={}, duration={:?}",
                 status_text, duration
             );
+        }
+
+        // ── 成功升级的 UserApp WebSocket：下游有限空闲读窗口 ──────────────
+        // Pingora HTTP/1 server 的下游默认 read_timeout=60s 对升级后的 WS
+        // 隧道仍生效（升级后的帧仍经 read_body 逐次读取），空闲客户端 60s
+        // 即被 Downstream ReadTimedout 截断（生产巡检 2026-10-29 已复现的
+        // 492 条 reading body/400 签名根因）。仅当下游请求带 Upgrade 且
+        // 上游响应为 101/HTTP1.1——与 Pingora 写 101 时置 upgraded 的同一
+        // 握手验证（response_filter 先于 101 写出，此时 was_upgraded 仍为
+        // false，须用 is_upgrade 判定）——且请求属于 UserApp app 代理
+        // （dev/prod 预览路由）时，为下游读设置有限空闲窗口（默认 3600s，
+        // 具名常量见 PingoraProxyService::DEFAULT_UPGRADED_DOWNSTREAM_READ_TIMEOUT）。
+        // read_body 按每次调用包裹该超时：窗口随每次客户端读自然刷新，
+        // 不是无限保活。普通 HTTP、未完成 body、仅有 Upgrade 头但被拒
+        // （非 101 响应）或 H2 下游（is_upgrade 恒 None）都不进入本分支，
+        // 保持默认超时保护；升级连接关闭后不进 keepalive 池，窗口不会
+        // 泄漏到后续请求。
+        if ctx.userapp_route.is_some()
+            && session.as_downstream_mut().is_upgrade(upstream_response) == Some(true)
+        {
+            session
+                .as_downstream_mut()
+                .set_read_timeout(Some(self.upgraded_downstream_read_timeout()));
         }
 
         Ok(())

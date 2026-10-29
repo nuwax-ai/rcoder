@@ -47,6 +47,8 @@ use tonic::{Request, Response, Status};
 struct IdentityRuntime {
     found: Option<RuntimeContainerInfo>,
     replacement: Option<VerifiedAgentReplacement>,
+    /// verify 拒绝的错误工厂（ContainerRuntimeError 未实现 Clone，按次构造）。
+    verify_error: Option<Arc<dyn Fn() -> ContainerRuntimeError + Send + Sync>>,
     stalled_lookup: std::sync::atomic::AtomicBool,
     queries: Mutex<Vec<(String, ServiceType)>>,
     verify_calls: Mutex<Vec<String>>,
@@ -57,6 +59,7 @@ impl IdentityRuntime {
         Arc::new(Self {
             found,
             replacement: None,
+            verify_error: None,
             stalled_lookup: std::sync::atomic::AtomicBool::new(false),
             queries: Mutex::new(Vec::new()),
             verify_calls: Mutex::new(Vec::new()),
@@ -66,6 +69,15 @@ impl IdentityRuntime {
     fn with_replacement(self: Arc<Self>, evidence: VerifiedAgentReplacement) -> Arc<Self> {
         let mut runtime = Arc::try_unwrap(self).ok().expect("独占运行时句柄");
         runtime.replacement = Some(evidence);
+        Arc::new(runtime)
+    }
+
+    fn with_verify_error<F>(self: Arc<Self>, make: F) -> Arc<Self>
+    where
+        F: Fn() -> ContainerRuntimeError + Send + Sync + 'static,
+    {
+        let mut runtime = Arc::try_unwrap(self).ok().expect("独占运行时句柄");
+        runtime.verify_error = Some(Arc::new(make));
         Arc::new(runtime)
     }
 
@@ -130,6 +142,9 @@ impl AgentContainerRuntime for IdentityRuntime {
         _replacement: &ContainerBasicInfo,
     ) -> ContainerRuntimeResult<VerifiedAgentReplacement> {
         self.verify_calls.lock().unwrap().push("verify".into());
+        if let Some(make) = &self.verify_error {
+            return Err(make());
+        }
         match &self.replacement {
             Some(evidence) => Ok(evidence.clone()),
             None => Err(ContainerRuntimeError::ConfigurationError(
@@ -260,6 +275,30 @@ async fn spawn_probe_at(
             .serve_with_incoming(TcpListenerStream::new(listener)),
     );
     (port, (hits, task))
+}
+
+/// 捕获 tracing 事件的缓冲 writer（与 background_tasks::pg_fault_tests 同一模式）。
+#[derive(Clone, Default)]
+struct Capture(Arc<Mutex<Vec<u8>>>);
+impl std::io::Write for Capture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+impl Capture {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
 }
 
 async fn identity_state(runtime: Arc<IdentityRuntime>) -> (Arc<AppState>, tempfile::TempDir) {
@@ -670,6 +709,161 @@ async fn rejected_computer_replacement_keeps_registration_without_probe() {
         current.container_info().unwrap().container_id,
         "pod-old",
         "verify 拒绝不改注册"
+    );
+    server.abort();
+}
+
+/// 诊断契约（生产巡检批次二B）：verify 以 Conflict 拒绝换代时，WARN 必须携带
+/// 完整脱敏 cause 链（外层 context + typed 换代冲突 + runtime 底层原因）、
+/// typed 类别与新旧物理身份；注册保留与不探测语义不变，凭据不落日志。
+#[tokio::test]
+async fn rejected_computer_replacement_warn_carries_full_chain_category_and_identities() {
+    let (port, (hits, server)) = spawn_probe_at(false, None).await;
+    let runtime = IdentityRuntime::new(Some(runtime_info(
+        "pod-new",
+        Some("sts-2"),
+        "127.0.0.1",
+        "computer-agent-runner-u-diag",
+    )))
+    .with_verify_error(|| {
+        ContainerRuntimeError::Conflict(
+            "replacement evidence rejected; token=secret-diag-token".into(),
+        )
+    });
+    let (state, _dir) = identity_state(runtime.clone()).await;
+    let info = registered(
+        "proj-diag",
+        Some("u-diag"),
+        ServiceType::ComputerAgentRunner,
+        "pod-old",
+        Some("sts-1"),
+        "127.0.0.1",
+    );
+    state
+        .insert_project("proj-diag".to_string(), info.clone())
+        .expect("注册旧实例");
+
+    let capture = Capture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(capture.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+
+    let (checker, _published) = checker(state.clone(), port);
+    let outcome = checker.check_single_container("u-diag", &info).await;
+
+    // 保护语义不变：拒绝按失败观察上报、不探测、注册原样保留。
+    assert!(outcome.is_err(), "verify 拒绝必须按失败观察上报");
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "拒绝时不探测任何地址");
+    assert_eq!(runtime.verified(), 1, "诊断增强不得绕过运行时 verify");
+    let current = state.projects.get("proj-diag").expect("注册保留");
+    assert_eq!(
+        current.container_info().unwrap().container_id,
+        "pod-old",
+        "诊断增强不得改变注册保留语义"
+    );
+
+    let text = capture.text();
+    assert!(
+        text.contains("Computer replacement recovery rejected"),
+        "保留原 WARN 事件：{text}"
+    );
+    assert!(
+        text.contains("Observe Computer workload replacement"),
+        "外层 context 仍在链上：{text}"
+    );
+    assert!(
+        text.contains("Container workload was replaced (sts-1 -> sts-2)"),
+        "typed ContainerWorkloadReplaced 上下文必须可见：{text}"
+    );
+    assert!(
+        text.contains("Concurrent resource update: replacement evidence rejected"),
+        "runtime 底层原因必须可见：{text}"
+    );
+    assert!(
+        text.contains(shared_types::error_codes::CONTAINER_WORKLOAD_REPLACED),
+        "typed 拒绝类别必须透出：{text}"
+    );
+    assert!(
+        text.contains("pod-old") && text.contains("pod-new"),
+        "新旧物理 container_id 必须出现在诊断字段：{text}"
+    );
+    assert!(
+        text.contains("sts-1") && text.contains("sts-2"),
+        "新旧 workload UID 必须出现在诊断字段：{text}"
+    );
+    assert!(
+        !text.contains("secret-diag-token"),
+        "cause 链中的凭据必须脱敏：{text}"
+    );
+    server.abort();
+}
+
+/// 诊断契约：verify 以 runtime 传输错误拒绝（无 typed 冲突上下文）时，
+/// 传播链返回的错误与 WARN 类别必须携带 runtime 原因与变体分类，
+/// record_failure 的失败原因不再只剩最外层 context。
+#[tokio::test]
+async fn rejected_computer_replacement_reason_carries_runtime_cause_and_category() {
+    let (port, (_hits, server)) = spawn_probe_at(false, None).await;
+    let runtime = IdentityRuntime::new(Some(runtime_info(
+        "pod-new",
+        Some("sts-4"),
+        "127.0.0.1",
+        "computer-agent-runner-u-diag2",
+    )))
+    .with_verify_error(|| {
+        ContainerRuntimeError::ConnectionError("management plane unreachable".into())
+    });
+    let (state, _dir) = identity_state(runtime).await;
+    let info = registered(
+        "proj-diag2",
+        Some("u-diag2"),
+        ServiceType::ComputerAgentRunner,
+        "pod-old-2",
+        Some("sts-3"),
+        "127.0.0.1",
+    );
+    state
+        .insert_project("proj-diag2".to_string(), info.clone())
+        .expect("注册旧实例");
+
+    let capture = Capture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(capture.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+
+    let (checker, _published) = checker(state, port);
+    let error = checker
+        .check_single_container("u-diag2", &info)
+        .await
+        .expect_err("verify 拒绝必须按失败观察上报");
+
+    // 真实传播链（checker→recover→verify→replacement_verification_error）返回的
+    // 错误文本：不得只剩 "Observe Computer workload replacement"。
+    let text = error.to_string();
+    assert!(
+        text.contains("Observe Computer workload replacement"),
+        "外层 context 仍在：{text}"
+    );
+    assert!(
+        text.contains("Connection error: management plane unreachable"),
+        "返回错误必须携带 runtime 底层原因：{text}"
+    );
+    let logs = capture.text();
+    assert!(
+        logs.contains("Connection error: management plane unreachable"),
+        "WARN 必须携带 runtime 底层原因：{logs}"
+    );
+    assert!(
+        logs.contains(shared_types::ERR_RUNTIME_UNAVAILABLE),
+        "runtime 变体类别必须透出：{logs}"
     );
     server.abort();
 }

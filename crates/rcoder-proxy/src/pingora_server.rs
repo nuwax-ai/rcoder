@@ -27,6 +27,14 @@ use shared_types::ModelProviderConfig;
 #[path = "prod_serving_recovery_tests.rs"]
 mod prod_serving_recovery_tests;
 
+#[cfg(all(test, unix))]
+#[path = "ws_upgrade_timeout_tests.rs"]
+mod ws_upgrade_timeout_tests;
+
+#[cfg(all(test, unix))]
+#[path = "proxy_client_disconnect_tests.rs"]
+mod proxy_client_disconnect_tests;
+
 /// Pingora 服务器管理器
 pub struct PingoraServerManager {
     config: ProxyConfig,
@@ -268,6 +276,18 @@ impl ProxyHttp for ProxyServiceWrapper {
         error: Box<pingora_core::Error>,
     ) -> Box<pingora_core::Error> {
         self.inner.fail_to_connect(session, peer, ctx, error)
+    }
+
+    /// 委托 suppress_error_log——pingora 调用的是 wrapper 的实现，缺委托
+    /// 会使 PortProxy 的客户端断开分类在真实服务路径上不生效（与
+    /// upstream_response_body_filter 委托缺失教训同源）。
+    fn suppress_error_log(
+        &self,
+        session: &pingora_proxy::Session,
+        ctx: &Self::CTX,
+        error: &pingora_core::Error,
+    ) -> bool {
+        self.inner.suppress_error_log(session, ctx, error)
     }
 
     async fn fail_to_proxy(
@@ -997,8 +1017,8 @@ mod tests {
                     "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\nRetry-After: 2\r\nX-Rcoder-Publication: 11111111-1111-4111-8111-111111111111\r\nX-Pingap-EType: rcoder-standby\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.write_all(body).await;
+                let _response_write = socket.write_all(response.as_bytes()).await;
+                let _body_write = socket.write_all(body).await;
             });
         }
     }

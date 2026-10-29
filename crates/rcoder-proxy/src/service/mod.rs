@@ -91,6 +91,11 @@ pub struct PingoraProxyService {
     /// 共享槽——engine 配置装配后经 [`Self::set_dev_entry_wait`] 覆盖，
     /// PortProxy 共享同槽实时见。
     dev_entry_wait_slot: Arc<ArcSwap<std::time::Duration>>,
+    /// 成功升级的 UserApp WebSocket 下游空闲读窗口（共享槽；默认
+    /// [`Self::DEFAULT_UPGRADED_DOWNSTREAM_READ_TIMEOUT`]，仅测试可经
+    /// [`Self::set_upgraded_downstream_read_timeout_for_tests`] 压缩以
+    /// 受控验证窗口分支——生产无配置入口）。
+    pub(crate) upgraded_downstream_read_timeout_slot: Arc<ArcSwap<std::time::Duration>>,
 }
 
 /// 为了兼容现有接口，我们保留原来的 PortProxyService 别名
@@ -139,12 +144,19 @@ pub struct PortProxy {
         Arc<ArcSwapOption<Arc<dyn crate::error_page::UserAppProxyFailureAdvisor>>>,
     /// dev 入口恢复预算槽（与 PingoraProxyService 共享同一 Arc）
     pub(crate) dev_entry_wait_slot: Arc<ArcSwap<std::time::Duration>>,
+    /// 升级下游空闲读窗口槽（与 PingoraProxyService 共享同一 Arc）
+    pub(crate) upgraded_downstream_read_timeout_slot: Arc<ArcSwap<std::time::Duration>>,
 }
 
 impl PortProxy {
     /// dev 入口恢复总预算（共享槽实时值）。
     pub(crate) fn dev_entry_wait(&self) -> std::time::Duration {
         *self.dev_entry_wait_slot.load_full()
+    }
+
+    /// 成功升级连接的下游空闲读窗口（共享槽实时值）。
+    pub(crate) fn upgraded_downstream_read_timeout(&self) -> std::time::Duration {
+        *self.upgraded_downstream_read_timeout_slot.load_full()
     }
 }
 
@@ -176,12 +188,37 @@ impl PingoraProxyService {
             error_pages_slot: Arc::new(ArcSwapOption::from(None)),
             failure_advisor_slot: Arc::new(ArcSwapOption::from(None)),
             dev_entry_wait_slot: Arc::new(ArcSwap::from_pointee(Self::DEFAULT_DEV_ENTRY_WAIT)),
+            upgraded_downstream_read_timeout_slot: Arc::new(ArcSwap::from_pointee(
+                Self::DEFAULT_UPGRADED_DOWNSTREAM_READ_TIMEOUT,
+            )),
         }
     }
 
     /// dev 入口恢复默认预算（15s，clamp 区间 5-60s；配置接线见 engine 侧）。
     pub(crate) const DEFAULT_DEV_ENTRY_WAIT: std::time::Duration =
         std::time::Duration::from_secs(15);
+
+    /// 成功升级的 UserApp WebSocket 下游空闲读窗口默认值（生产巡检
+    /// 2026-10-29 批次一）：Pingora HTTP/1 server 下游默认 `read_timeout`
+    /// 60s 对升级后的 WS 隧道仍生效，空闲客户端 60s 即被
+    /// `Downstream ReadTimedout / reading body / 400` 截断。本窗口只在
+    /// 下游 Upgrade 请求拿到上游 101/HTTP1.1（Pingora 判定成功升级的
+    /// 同一握手验证）且路由属于 UserApp app 代理（dev/prod）时套用到
+    /// 下游读；窗口按每次客户端读刷新，是有限空闲窗口而非无限保活。
+    /// 用具名常量集中维护，不新增 HTTP 参数或数据库配置。
+    pub(crate) const DEFAULT_UPGRADED_DOWNSTREAM_READ_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(3600);
+
+    /// 仅测试用：压缩升级下游空闲窗口以受控验证窗口分支（含有限性、
+    /// 读活动刷新与不泄漏到非升级请求）。生产恒用默认常量，无配置入口。
+    #[cfg(test)]
+    pub(crate) fn set_upgraded_downstream_read_timeout_for_tests(
+        &self,
+        timeout: std::time::Duration,
+    ) {
+        self.upgraded_downstream_read_timeout_slot
+            .store(Arc::new(timeout));
+    }
 
     /// 覆盖 dev 入口恢复预算（engine 配置装配后调用；越界值 clamp 到
     /// [5s, 60s]——配置错误不得放大等待面；PortProxy 共享槽实时见）。
@@ -314,6 +351,9 @@ impl PingoraProxyService {
             error_pages_slot: Arc::clone(&self.error_pages_slot),
             failure_advisor_slot: Arc::clone(&self.failure_advisor_slot),
             dev_entry_wait_slot: Arc::clone(&self.dev_entry_wait_slot),
+            upgraded_downstream_read_timeout_slot: Arc::clone(
+                &self.upgraded_downstream_read_timeout_slot,
+            ),
         })
     }
 }
@@ -341,6 +381,9 @@ impl Clone for PingoraProxyService {
             error_pages_slot: Arc::clone(&self.error_pages_slot),
             failure_advisor_slot: Arc::clone(&self.failure_advisor_slot),
             dev_entry_wait_slot: Arc::clone(&self.dev_entry_wait_slot),
+            upgraded_downstream_read_timeout_slot: Arc::clone(
+                &self.upgraded_downstream_read_timeout_slot,
+            ),
         }
     }
 }
