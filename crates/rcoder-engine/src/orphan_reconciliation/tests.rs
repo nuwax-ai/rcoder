@@ -201,6 +201,9 @@ struct Runtime {
     capture_entered: tokio::sync::Notify,
     capture_release: tokio::sync::Notify,
     capture_blocked: AtomicBool,
+    /// Live builder observation for the registration-recovery path. `None` =
+    /// the runtime reports no builder (the historical fixture behaviour).
+    builder: Mutex<Option<RuntimeContainerInfo>>,
 }
 
 #[async_trait::async_trait]
@@ -275,9 +278,31 @@ impl AgentContainerRuntime for Runtime {
     async fn find_container(
         &self,
         _: &str,
-        _: &ServiceType,
+        family: &ServiceType,
     ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
+        if *family == ServiceType::UserappBuilder {
+            return Ok(self.builder.lock().unwrap().clone());
+        }
         Ok(None)
+    }
+    async fn inspect_builder_candidate(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        self.builder_target(context)
+    }
+    async fn capture_builder_control(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        self.builder_target(context)
+    }
+    async fn capture_bound_builder_control(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        _binding: Option<&shared_types::UserAppResourceBinding>,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        self.builder_target(context)
     }
     async fn stop_container(&self, _: &str) -> ContainerRuntimeResult<()> {
         panic!("scanner must not use name-based stop")
@@ -309,6 +334,42 @@ impl UserAppDeploymentRuntime for Runtime {
     }
 }
 
+impl Runtime {
+    /// Live builder control target: the observed Pod/controller pair, with the
+    /// StatefulSet workload the identity checks compare against.
+    fn builder_target(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        let observed = self
+            .builder
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| ContainerRuntimeError::K8sError("no builder observed".into()))?;
+        Ok(shared_types::BuilderControlTarget {
+            context: context.clone(),
+            resource_binding: None,
+            workload: Some(shared_types::AppResourceIdentity {
+                kind: shared_types::AppResourceKind::StatefulSet,
+                name: observed.container_name.clone(),
+                uid: observed.workload_uid.clone().ok_or_else(|| {
+                    ContainerRuntimeError::K8sError("workload uid missing".into())
+                })?,
+                resource_version: Some("1".into()),
+            }),
+            pod: Some(shared_types::BuilderPodIdentity {
+                name: format!("{}-0", observed.container_name),
+                uid: observed.container_id,
+                resource_version: "2".into(),
+            }),
+            restart_image: None,
+            restart_runtime_workspace: None,
+            builder_startup_mode: Default::default(),
+        })
+    }
+}
+
 #[cfg(feature = "userapp-turso")]
 async fn fixture() -> (Scanner, Arc<Runtime>, Arc<ScriptedProbe>, tempfile::TempDir) {
     let directory = tempfile::tempdir().unwrap();
@@ -327,6 +388,7 @@ async fn fixture() -> (Scanner, Arc<Runtime>, Arc<ScriptedProbe>, tempfile::Temp
         capture_entered: tokio::sync::Notify::new(),
         capture_release: tokio::sync::Notify::new(),
         capture_blocked: AtomicBool::new(false),
+        builder: Mutex::new(None),
     });
     let state =
         crate::userapp_builder::builder_runtime_test_state(runtime.clone(), store, None).await;
@@ -777,3 +839,225 @@ async fn deferred_live_docker_workload_cannot_credit_unobserved_idle_time() {
 
 #[cfg(feature = "userapp-turso")]
 mod probe;
+
+/// 现场 8 个 builder 的形态：UserApp 生命周期引用仍在（`ensure_identity`）、
+/// 真实同 controller 的 Pod 存活、`projects` 无登记。修复前反向库存只给
+/// `LifecycleReferenced`，普通 scanner 又遍历不到——永久不进回收链。
+///
+/// 修复后：同一当前生命周期的有效绑定即可补齐 canonical 登记（不创建/不启动/
+/// 不重放迁移），实例进入普通 scanner；且首期登记获得**新的**闲置观察窗，
+/// 不会因"刚发现"就被删。
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn live_builder_without_registration_is_completed_from_current_lifecycle_binding() {
+    let (mut scanner, runtime, _probe, _directory) = fixture().await;
+    let app = scanner
+        .state
+        .userapp_store
+        .ensure_identity("example")
+        .await
+        .unwrap();
+    *runtime.snapshot.lock().unwrap() = live_builder();
+    *runtime.builder.lock().unwrap() = Some(RuntimeContainerInfo {
+        container_id: "pod-live".into(),
+        container_name: "example".into(),
+        container_ip: "10.42.4.207".into(),
+        status: container_runtime_api::ContainerRuntimeStatus::Running,
+        created_at: Utc::now(),
+        env_vars: None,
+        service_type: Some(ServiceType::UserappBuilder),
+        project_id: Some("example".into()),
+        app_id: Some("example".into()),
+        user_id: None,
+        pod_id: None,
+        workload_uid: Some("sts-current".into()),
+    });
+    bind_current_lifecycle(&scanner.state, &app.lifecycle_id).await;
+
+    scanner.scan().await.unwrap();
+    let registered = scanner
+        .state
+        .projects
+        .get("example")
+        .expect("missing builder registration must be completed");
+    let container = registered.container_info().expect("builder container");
+    assert_eq!(container.container_id, "pod-live");
+    assert_eq!(container.container_ip, "10.42.4.207");
+    assert_eq!(container.workload_uid.as_deref(), Some("sts-current"));
+    assert_eq!(registered.service_type(), Some(ServiceType::UserappBuilder));
+    assert_eq!(
+        runtime.deletes.load(Ordering::Acquire),
+        0,
+        "completing a registration must never retire compute"
+    );
+    // 首期登记 = 新的闲置观察窗：不会因刚补齐就被回收。
+    let idle = (Utc::now() - registered.last_activity()).num_seconds();
+    assert!(
+        idle < 5,
+        "recovered registration must start its own idle window"
+    );
+
+    // 补齐后该 workload 已被登记：反向库存按 Registered 评估，不再需要恢复。
+    age_candidates(&mut scanner);
+    scanner.scan().await.unwrap();
+    assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
+    assert!(
+        scanner
+            .state
+            .projects
+            .get("example")
+            .is_some_and(|project| project.container_info().is_some())
+    );
+}
+
+/// 缺证据（无当前生命周期绑定、也无成功回执）时保留资源并给出明确分类——
+/// 缺证据不是接管许可，也不是删除许可。
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn live_builder_without_registration_or_evidence_is_retained() {
+    let (mut scanner, runtime, _probe, _directory) = fixture().await;
+    scanner
+        .state
+        .userapp_store
+        .ensure_identity("example")
+        .await
+        .unwrap();
+    *runtime.snapshot.lock().unwrap() = live_builder();
+    *runtime.builder.lock().unwrap() = Some(RuntimeContainerInfo {
+        container_id: "pod-live".into(),
+        container_name: "example".into(),
+        container_ip: "10.42.4.207".into(),
+        status: container_runtime_api::ContainerRuntimeStatus::Running,
+        created_at: Utc::now(),
+        env_vars: None,
+        service_type: Some(ServiceType::UserappBuilder),
+        project_id: Some("example".into()),
+        app_id: Some("example".into()),
+        user_id: None,
+        pod_id: None,
+        workload_uid: Some("sts-current".into()),
+    });
+    scanner.scan().await.unwrap();
+    assert!(
+        scanner
+            .state
+            .projects
+            .get("example")
+            .is_none_or(|project| project.container_info().is_none()),
+        "no identity evidence must not create a registration"
+    );
+    assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
+}
+
+/// 存活 builder 的快照：controller + Pod + Service，年龄足够、身份完整。
+#[cfg(feature = "userapp-turso")]
+fn live_builder() -> AgentStopSnapshot {
+    let created = Some(Utc::now() - chrono::Duration::hours(3));
+    AgentStopSnapshot {
+        app_id_hint: Some("example".into()),
+        namespace: Some("isolated".into()),
+        identifier: "example".into(),
+        service_type: ServiceType::UserappBuilder,
+        controller: Some(AgentResourceIdentity {
+            kind: AgentResourceKind::StatefulSet,
+            name: "example".into(),
+            uid: "sts-current".into(),
+            resource_version: Some("7".into()),
+            created_at: created,
+            owner_uid: None,
+        }),
+        pods: vec![AgentResourceIdentity {
+            kind: AgentResourceKind::Pod,
+            name: "example-0".into(),
+            uid: "pod-live".into(),
+            resource_version: Some("9".into()),
+            created_at: created,
+            owner_uid: Some("sts-current".into()),
+        }],
+        container: None,
+        services: vec![AgentResourceIdentity {
+            kind: AgentResourceKind::Service,
+            name: "example-svc".into(),
+            uid: "service-live".into(),
+            resource_version: Some("3".into()),
+            created_at: created,
+            owner_uid: None,
+        }],
+        replicas: Some(1),
+        compute_data_protection: None,
+        endpoint: None,
+    }
+}
+
+/// 当前生命周期对该 controller 的有效绑定（今天保护该 workload 的同一证据）。
+#[cfg(feature = "userapp-turso")]
+async fn bind_current_lifecycle(state: &AppState, lifecycle_id: &str) {
+    let request = shared_types::AdoptBuilderRequest {
+        lifecycle_id: lifecycle_id.into(),
+        request_id: "binding-request".into(),
+        expected_container_id: "pod-live".into(),
+    };
+    let input = shared_types::UserAppExecutionInput::new(serde_json::to_string(&request).unwrap());
+    let admitted = state
+        .userapp_store
+        .admit_with_input(
+            &shared_types::UserAppAdmission {
+                app_id: "example".into(),
+                lifecycle_id: Some(lifecycle_id.into()),
+                request_id: Some("binding-request".into()),
+                operation_id: "binding-operation".into(),
+                request_fingerprint: input.digest(),
+                kind: shared_types::UserAppOperationKind::AdoptBuilder,
+                command: None,
+                metadata: None,
+                runtime_policy_on_success: None,
+            },
+            Some(&input),
+        )
+        .await
+        .unwrap();
+    let running = match admitted {
+        shared_types::UserAppAdmissionOutcome::Accepted(record) => state
+            .userapp_store
+            .advance(&shared_types::UserAppOperationProgress {
+                app_id: record.app_id.clone(),
+                lifecycle_id: record.lifecycle_id.clone(),
+                operation_id: record.operation_id.clone(),
+                expected_revision: record.revision,
+                executor_id: "fixture".into(),
+                state: shared_types::UserAppOperationState::Running,
+                step: "claimed".into(),
+                checkpoint: serde_json::Value::Null,
+                error_code: None,
+                error_message: None,
+            })
+            .await
+            .unwrap(),
+        other => panic!("fresh fixture admission: {other:?}"),
+    };
+    state
+        .userapp_store
+        .commit_resource_binding(
+            &shared_types::UserAppResourceBinding {
+                app_id: running.app_id.clone(),
+                lifecycle_id: running.lifecycle_id.clone(),
+                service_type: ServiceType::UserappBuilder,
+                physical_uid: "sts-current".into(),
+                adopted_by_operation: running.operation_id.clone(),
+            },
+            &shared_types::UserAppOperationProgress {
+                app_id: running.app_id.clone(),
+                lifecycle_id: running.lifecycle_id.clone(),
+                operation_id: running.operation_id.clone(),
+                expected_revision: running.revision,
+                executor_id: "fixture".into(),
+                state: shared_types::UserAppOperationState::Succeeded,
+                step: "adopted".into(),
+                checkpoint: serde_json::Value::Null,
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .await
+        .unwrap();
+}
