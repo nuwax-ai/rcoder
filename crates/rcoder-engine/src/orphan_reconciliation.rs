@@ -287,6 +287,12 @@ impl Scanner {
         {
             return Ok(None);
         }
+        // Legacy collaborator identifiers are not the current pure-app admission
+        // domain (same rule `protected_shape` preserves them by): never guess an
+        // app id for them, and never complete a registration from one.
+        if snapshot.app_id_hint.as_deref() != Some(snapshot.identifier.as_str()) {
+            return Ok(None);
+        }
         let app_id = snapshot
             .app_id_hint
             .as_deref()

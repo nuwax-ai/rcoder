@@ -130,6 +130,10 @@ pub(crate) async fn recover_missing_builder_registration(
 
 /// 同一当前生命周期对该 controller 的有效绑定。缺绑定、跨应用或跨代次的绑定
 /// 都不构成补齐登记的依据。
+///
+/// 绑定按 **workload UID**（StatefulSet）检索：这正是现场形态（controller 重建
+/// Pod 后新代次从未落登记）。Docker 容器没有 workload UID，其物理身份是容器 ID，
+/// 本批不据此补齐——缺证据即保留，交由显式受控恢复入口处理。
 async fn bound_to_current_lifecycle(
     state: &AppState,
     app_id: &str,
