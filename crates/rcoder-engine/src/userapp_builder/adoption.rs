@@ -471,7 +471,7 @@ pub(super) async fn verify_live_builder_observation(
     app_id: &str,
     instance: &str,
     observed: &container_runtime_api::RuntimeContainerInfo,
-) -> Result<()> {
+) -> Result<shared_types::BuilderControlTarget> {
     let target = verified_live_builder_target(state, app_id, instance).await?;
     verify_captured_builder_physical_id(&target, &observed.container_id)?;
     let workload_matches = target
@@ -496,7 +496,10 @@ pub(super) async fn verify_live_builder_observation(
             "Builder workload identity changed during address verification"
         ));
     }
-    Ok(())
+    // Return the verified target so a caller that must inspect the same physical
+    // workload (for example its workspace volumes) reuses this capture instead of
+    // issuing a second controller/Pod read.
+    Ok(target)
 }
 
 pub(super) async fn verified_live_builder_target(

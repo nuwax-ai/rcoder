@@ -211,6 +211,8 @@ struct Runtime {
     builder_blocked: AtomicBool,
     builder_entered: tokio::sync::Notify,
     builder_release: tokio::sync::Notify,
+    /// Live volumes no longer match the recorded discovery witness.
+    volumes_replaced: AtomicBool,
 }
 
 /// What the runtime reports for a builder's workspace volumes. `Absent` is the
@@ -368,6 +370,29 @@ impl UserAppDeploymentRuntime for Runtime {
     ) -> ContainerRuntimeResult<Vec<container_runtime_api::DeploymentStatus>> {
         Ok(vec![])
     }
+    /// Mirrors the K8s implementation's contract: the live PVC must carry the
+    /// recorded UID and must not be deleting. `Replaced` reproduces a
+    /// same-named PVC recreated with a new UID.
+    async fn verify_recovered_volumes(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _scope: shared_types::UserAppOperationScope,
+        volumes: &[shared_types::AppResourceIdentity],
+    ) -> ContainerRuntimeResult<()> {
+        if self.volumes_replaced.load(Ordering::Acquire) {
+            return Err(ContainerRuntimeError::Conflict(
+                "Recovered workspace volume was replaced or is deleting".into(),
+            ));
+        }
+        for expected in volumes {
+            if expected.uid.is_empty() || expected.name.is_empty() {
+                return Err(ContainerRuntimeError::ConfigurationError(
+                    "Invalid recovered volume witness".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Runtime {
@@ -429,6 +454,7 @@ async fn fixture() -> (Scanner, Arc<Runtime>, Arc<ScriptedProbe>, tempfile::Temp
         builder_blocked: AtomicBool::new(false),
         builder_entered: tokio::sync::Notify::new(),
         builder_release: tokio::sync::Notify::new(),
+        volumes_replaced: AtomicBool::new(false),
     });
     let state =
         crate::userapp_builder::builder_runtime_test_state(runtime.clone(), store, None).await;
@@ -891,12 +917,15 @@ mod probe;
 #[tokio::test]
 async fn live_builder_without_registration_is_completed_from_current_lifecycle_binding() {
     let (mut scanner, runtime, _probe, _directory) = fixture().await;
+    // 记录在案的原卷期望（与 live 卷一致）：第二层卷验证通过。
+    record_discovery_witness(&scanner.state, "witness-lifecycle", "pvc-current").await;
     let app = scanner
         .state
         .userapp_store
-        .ensure_identity("example")
+        .get_application("example")
         .await
-        .unwrap();
+        .unwrap()
+        .expect("witness restore creates the root");
     *runtime.snapshot.lock().unwrap() = live_builder();
     *runtime.builder.lock().unwrap() = Some(RuntimeContainerInfo {
         container_id: "pod-live".into(),
@@ -1133,6 +1162,59 @@ async fn live_builder_registration_recovery_requires_volume_evidence() {
     assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
 }
 
+/// 记录在案的原卷期望与 live 卷不一致时不得补齐登记（第二层卷验证）：同名 PVC
+/// 被重建（UID 变）或正在删除。`verify_recovered_volumes` 按 UID 相等判定，
+/// `verify_recovered_mounts` 复核挂载集——与 ensure 链复用同一验证。
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn live_builder_registration_recovery_refuses_replaced_recorded_volume() {
+    let (mut scanner, runtime, _probe, _directory) = fixture().await;
+    // 记录在案的原卷 UID 与 live 不同：同名 PVC 被重建。
+    record_discovery_witness(&scanner.state, "witness-lifecycle", "pvc-original").await;
+    let app = scanner
+        .state
+        .userapp_store
+        .get_application("example")
+        .await
+        .unwrap()
+        .expect("witness restore creates the root");
+    *runtime.snapshot.lock().unwrap() = live_builder();
+    *runtime.builder.lock().unwrap() = Some(RuntimeContainerInfo {
+        container_id: "pod-live".into(),
+        container_name: "example".into(),
+        container_ip: "10.42.4.207".into(),
+        status: container_runtime_api::ContainerRuntimeStatus::Running,
+        created_at: Utc::now(),
+        env_vars: None,
+        service_type: Some(ServiceType::UserappBuilder),
+        project_id: Some("example".into()),
+        app_id: Some("example".into()),
+        user_id: None,
+        pod_id: None,
+        workload_uid: Some("sts-current".into()),
+    });
+    bind_current_lifecycle(&scanner.state, &app.lifecycle_id).await;
+    *runtime.volumes.lock().unwrap() =
+        VolumeWitness::Present(vec![shared_types::AppResourceIdentity {
+            kind: shared_types::AppResourceKind::PersistentVolumeClaim,
+            name: "example-workspace".into(),
+            uid: "pvc-recreated".into(),
+            resource_version: None,
+        }]);
+    runtime.volumes_replaced.store(true, Ordering::Release);
+
+    scanner.scan().await.unwrap();
+    assert!(
+        scanner
+            .state
+            .projects
+            .get("example")
+            .is_none_or(|project| project.container_info().is_none()),
+        "a replaced recorded volume must not complete a registration"
+    );
+    assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
+}
+
 /// 在途 dev 操作围栏期间不得补齐登记：该应用的登记归属在途操作，后台对账不能
 /// 抢在它前面为正在被替换/停止的 Pod 写行。围栏释放后才恢复。
 #[cfg(feature = "userapp-turso")]
@@ -1196,6 +1278,31 @@ async fn live_builder_registration_recovery_defers_to_inflight_operation() {
         "an in-flight operation must own the registration decision"
     );
     assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
+}
+
+/// 记录在案的原卷期望（发现路径写入 `userapp_recovery_witnesses` 的同一数据）。
+/// 必须在 `ensure_identity` 之前调用：`restore_identity` 只在根记录新建时落见证。
+#[cfg(feature = "userapp-turso")]
+async fn record_discovery_witness(state: &AppState, lifecycle_id: &str, volume_uid: &str) {
+    state
+        .userapp_store
+        .restore_discovered_identity(&shared_types::UserAppDiscoveredIdentity {
+            app_id: "example".into(),
+            lifecycle_id: lifecycle_id.into(),
+            dev_uid: Some("pod-live".into()),
+            prod_uid: None,
+            dev_stopped: false,
+            prod_stopped: false,
+            dev_volumes: vec![shared_types::AppResourceIdentity {
+                kind: shared_types::AppResourceKind::PersistentVolumeClaim,
+                name: "example-workspace".into(),
+                uid: volume_uid.into(),
+                resource_version: None,
+            }],
+            prod_volumes: Vec::new(),
+        })
+        .await
+        .unwrap();
 }
 
 /// 存活 builder 的快照：controller + Pod + Service，年龄足够、身份完整。

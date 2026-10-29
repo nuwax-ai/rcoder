@@ -110,8 +110,11 @@ pub(crate) async fn recover_missing_builder_registration(
             RegistrationGap::NotObserved,
         ));
     }
-    // Real runtime identity, current application/lifecycle and workload UID.
-    adoption::verify_live_builder_observation(state, app_id, app_id, &observed).await?;
+    // Real runtime identity, current application/lifecycle and workload UID. The
+    // verified target is reused for the volume check below instead of capturing
+    // the same controller/Pod a second time.
+    let verified_target =
+        adoption::verify_live_builder_observation(state, app_id, app_id, &observed).await?;
     // An in-flight dev/application operation owns this application's
     // registration decision (Stop/Restart/Ensure/Destroy/ClearDevStorage/Purge).
     // A background reconciliation must never race it into a row for a Pod that
@@ -177,13 +180,22 @@ pub(crate) async fn recover_missing_builder_registration(
             RegistrationGap::BindingMissing,
         ));
     }
-    // Original-volume continuity. A missing registration records no predecessor,
-    // so the only volume evidence available is the witness the runtime reads from
-    // the live controller: it proves every claimed workspace volume exists, is
-    // not deleting, carries a UID, and is stamped with THIS application and
-    // lifecycle. A same-named PVC recreated under another lifecycle, a deleted
-    // volume or a changed mount set is refused rather than registered.
-    if !workspace_volumes_verified(state, app_id).await? {
+    // Original-volume continuity, in two independent layers:
+    //
+    // 1. a non-vacuous live witness — at least one claimed workspace volume
+    //    exists, is not deleting, carries a UID, and is stamped with THIS
+    //    application and lifecycle (the runtime validates the annotations);
+    // 2. whenever the control store HAS a recorded discovery witness for this
+    //    app/lifecycle, the live volumes must match it exactly — PVC UID
+    //    equality, not deleting, and an unchanged mount/claim set
+    //    (`verify_recovered_volumes` + `verify_recovered_mounts`, the same
+    //    verification the ensure path runs before reusing a recovered workspace).
+    //
+    // Layer 2 is what catches a same-named PVC recreated with a new UID. The
+    // witness only exists for apps whose identity was restored from retained
+    // storage, so its absence must not block layer 1 — but when present it is
+    // authoritative history and is never rewritten.
+    if !workspace_volumes_verified(state, app_id, &app.lifecycle_id, &verified_target).await? {
         return Ok(BuilderRegistrationRecovery::Unconfirmed(
             RegistrationGap::VolumeUnverified,
         ));
@@ -247,27 +259,47 @@ async fn bound_to_current_lifecycle(
         }))
 }
 
-/// 原卷连续性见证：从已验证的活体 controller 读取工作负载卷，并要求至少一个
-/// 卷被证实。运行时实现负责校验每个卷存在、未删除、有 UID，且其
-/// `rcoder.io/application-id` / `rcoder.io/lifecycle-id` 注解属于**当前**应用与
-/// 代次（`lifecycle_discovery::discover_volume_identities`）。
-///
-/// 读失败/无卷/卷不属于当前代次 → `false`（保留资源，不补齐登记）。空向量
-/// 不构成"无卷也可登记"——没有卷证据就没有原卷连续性证据。
-async fn workspace_volumes_verified(state: &AppState, app_id: &str) -> Result<bool> {
-    let target = adoption::verified_live_builder_target(state, app_id, app_id).await?;
+async fn workspace_volumes_verified(
+    state: &AppState,
+    app_id: &str,
+    lifecycle_id: &str,
+    target: &shared_types::BuilderControlTarget,
+) -> Result<bool> {
     let volumes = state
         .runtime()
-        .capture_builder_compute_volumes(&target)
+        .capture_builder_compute_volumes(target)
         .await?;
     if volumes.is_empty() {
         return Ok(false);
     }
-    Ok(volumes.iter().all(|volume| {
+    if !volumes.iter().all(|volume| {
         volume.kind == shared_types::AppResourceKind::PersistentVolumeClaim
             && !volume.name.is_empty()
             && !volume.uid.is_empty()
-    }))
+    }) {
+        return Ok(false);
+    }
+    // 记录在案的原卷期望存在时，逐项核对 live 卷（UID 相等、未删除、挂载集未变）。
+    let recorded = state
+        .userapp_store
+        .get_recovery_storage_witness(app_id, lifecycle_id)
+        .await?
+        .is_some_and(|witness| !witness.dev_volumes.is_empty());
+    if !recorded {
+        return Ok(true);
+    }
+    match state
+        .app_service
+        .verify_recovered_storage(app_id, shared_types::UserAppOperationScope::Dev)
+        .await
+    {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            tracing::debug!(app_id, error = %format!("{error:#}"),
+                "recorded workspace volumes no longer match the live builder; registration retained");
+            Ok(false)
+        }
+    }
 }
 
 #[cfg(all(test, feature = "rcoder-pg"))]
