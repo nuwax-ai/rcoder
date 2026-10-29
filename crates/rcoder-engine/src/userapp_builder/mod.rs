@@ -51,7 +51,7 @@ mod dev_cleanup;
 mod dev_locator;
 mod idle_registration;
 mod lifecycle;
-mod registration_recovery;
+pub(crate) mod registration_recovery;
 pub(crate) use idle_registration::refresh_idle_builder_pod;
 pub(crate) use registration_recovery::recover_missing_builder_registration;
 

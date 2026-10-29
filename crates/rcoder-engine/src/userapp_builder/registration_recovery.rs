@@ -23,19 +23,67 @@ use shared_types::{
 };
 use std::sync::Arc;
 
-/// 补齐缺失的 canonical builder 登记。`Some` = 登记已落库（可被普通 scanner
-/// 遍历）；`None` = 本轮证据不足，资源保留并需显式受控恢复入口。
+/// 登记缺口为何本轮无法闭环。**受控枚举**：日志与指标只允许这些值，不按
+/// 用户/项目/操作 ID 展开，避免高基数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegistrationGap {
+    /// 生命周期不在 Active、运行时未见、非 Running、管理 Service 缺席，或历史
+    /// 标识/标签不一致（不猜 app id）。
+    NotObserved,
+    /// 在途 dev/application 操作围栏：登记归属在途操作。
+    OperationInFlight,
+    /// 共享 SQL 注册表下缺当前 Pod 的成功 Ensure 回执。这是既有安全门
+    /// （`requires_durable_confirmation`），本批**不放宽**：缺回执即保留资源，
+    /// 交由显式受控恢复入口。
+    SharedRegistryReceiptMissing,
+    /// 无当前生命周期对观察到的 controller 的有效绑定。
+    BindingMissing,
+    /// 原卷连续性未证实：同名 PVC 换代次、卷删除中，或根本没有卷证据。
+    VolumeUnverified,
+}
+
+impl RegistrationGap {
+    /// 有界原因集合（聚合计数的下标来源，新增必须同步）。
+    pub(crate) const ALL: [Self; 5] = [
+        Self::NotObserved,
+        Self::OperationInFlight,
+        Self::SharedRegistryReceiptMissing,
+        Self::BindingMissing,
+        Self::VolumeUnverified,
+    ];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NotObserved => "not_observed",
+            Self::OperationInFlight => "operation_in_flight",
+            Self::SharedRegistryReceiptMissing => "shared_registry_receipt_missing",
+            Self::BindingMissing => "binding_missing",
+            Self::VolumeUnverified => "volume_unverified",
+        }
+    }
+}
+
+/// 受控恢复结果：`Completed` = 登记已落库（可被普通 scanner 遍历）；
+/// `Unconfirmed` = 本轮证据不足，资源保留并需显式受控恢复入口。
+pub(crate) enum BuilderRegistrationRecovery {
+    Completed(ContainerBasicInfo),
+    Unconfirmed(RegistrationGap),
+}
+
+/// 补齐缺失的 canonical builder 登记。
 pub(crate) async fn recover_missing_builder_registration(
     state: &AppState,
     app_id: &str,
-) -> Result<Option<ContainerBasicInfo>> {
+) -> Result<BuilderRegistrationRecovery> {
     let app = state
         .userapp_store
         .get_application(app_id)
         .await?
         .ok_or_else(|| anyhow!("Builder registration recovery lifecycle missing: {app_id}"))?;
     if app.state != UserAppLifecycleState::Active {
-        return Ok(None);
+        return Ok(BuilderRegistrationRecovery::Unconfirmed(
+            RegistrationGap::NotObserved,
+        ));
     }
     // Read-only runtime observation: the same source the ordinary path uses.
     let Some(observed) = state
@@ -44,11 +92,15 @@ pub(crate) async fn recover_missing_builder_registration(
         .await
         .context("inspect builder without canonical registration")?
     else {
-        return Ok(None);
+        return Ok(BuilderRegistrationRecovery::Unconfirmed(
+            RegistrationGap::NotObserved,
+        ));
     };
     validate_builder_identity(app_id, &observed)?;
     if observed.status != container_runtime_api::ContainerRuntimeStatus::Running {
-        return Ok(None);
+        return Ok(BuilderRegistrationRecovery::Unconfirmed(
+            RegistrationGap::NotObserved,
+        ));
     }
     // Real runtime identity, current application/lifecycle and workload UID.
     adoption::verify_live_builder_observation(state, app_id, app_id, &observed).await?;
@@ -62,7 +114,9 @@ pub(crate) async fn recover_missing_builder_registration(
     )
     .await
     {
-        return Ok(None);
+        return Ok(BuilderRegistrationRecovery::Unconfirmed(
+            RegistrationGap::OperationInFlight,
+        ));
     }
     // A live Pod without its management Service is incomplete routing, not a
     // missing row: repair belongs to admitted creation/resume, which owns the
@@ -73,7 +127,9 @@ pub(crate) async fn recover_missing_builder_registration(
         .await?
         .is_none()
     {
-        return Ok(None);
+        return Ok(BuilderRegistrationRecovery::Unconfirmed(
+            RegistrationGap::NotObserved,
+        ));
     }
     let verified = ContainerBasicInfo {
         container_id: observed.container_id.clone(),
@@ -93,17 +149,36 @@ pub(crate) async fn recover_missing_builder_registration(
     // Shared SQL registry: only a succeeded, identity-bound Ensure receipt may
     // publish the registration, through the existing transactional chain.
     match creation::repair_live_registration(state, app_id, app_id, &verified).await {
-        Ok(true) => return Ok(Some(verified)),
+        Ok(true) => {
+            return Ok(BuilderRegistrationRecovery::Completed(verified));
+        }
         Ok(false) => {}
         Err(error) if error.is::<creation::BuilderRegistrationConfirmationRequired>() => {
-            return Ok(None);
+            // 共享 SQL 注册表的既有安全门：只有成功且身份绑定的 Ensure 回执能
+            // 发布登记。不放宽——保留资源并明确指出需要的受控入口。
+            return Ok(BuilderRegistrationRecovery::Unconfirmed(
+                RegistrationGap::SharedRegistryReceiptMissing,
+            ));
         }
         Err(error) => return Err(error),
     }
     // Ordinary backend: authority is the binding of the CURRENT lifecycle to
     // the observed controller — the same evidence that protects this workload.
     if !bound_to_current_lifecycle(state, app_id, &app.lifecycle_id, &verified).await? {
-        return Ok(None);
+        return Ok(BuilderRegistrationRecovery::Unconfirmed(
+            RegistrationGap::BindingMissing,
+        ));
+    }
+    // Original-volume continuity. A missing registration records no predecessor,
+    // so the only volume evidence available is the witness the runtime reads from
+    // the live controller: it proves every claimed workspace volume exists, is
+    // not deleting, carries a UID, and is stamped with THIS application and
+    // lifecycle. A same-named PVC recreated under another lifecycle, a deleted
+    // volume or a changed mount set is refused rather than registered.
+    if !workspace_volumes_verified(state, app_id).await? {
+        return Ok(BuilderRegistrationRecovery::Unconfirmed(
+            RegistrationGap::VolumeUnverified,
+        ));
     }
     // A first-ever registration starts its own idle window; re-observing an
     // already registered instance would keep its historical clock instead
@@ -125,7 +200,11 @@ pub(crate) async fn recover_missing_builder_registration(
         .projects
         .insert_project_registration_durable(app_id.into(), Arc::new(project))
         .await?;
-    Ok((outcome == PersistenceWriteOutcome::Committed).then_some(verified))
+    Ok(if outcome == PersistenceWriteOutcome::Committed {
+        BuilderRegistrationRecovery::Completed(verified)
+    } else {
+        BuilderRegistrationRecovery::Unconfirmed(RegistrationGap::NotObserved)
+    })
 }
 
 /// 同一当前生命周期对该 controller 的有效绑定。缺绑定、跨应用或跨代次的绑定
@@ -156,6 +235,29 @@ async fn bound_to_current_lifecycle(
                 && binding.lifecycle_id == lifecycle_id
                 && binding.service_type == ServiceType::UserappBuilder
         }))
+}
+
+/// 原卷连续性见证：从已验证的活体 controller 读取工作负载卷，并要求至少一个
+/// 卷被证实。运行时实现负责校验每个卷存在、未删除、有 UID，且其
+/// `rcoder.io/application-id` / `rcoder.io/lifecycle-id` 注解属于**当前**应用与
+/// 代次（`lifecycle_discovery::discover_volume_identities`）。
+///
+/// 读失败/无卷/卷不属于当前代次 → `false`（保留资源，不补齐登记）。空向量
+/// 不构成"无卷也可登记"——没有卷证据就没有原卷连续性证据。
+async fn workspace_volumes_verified(state: &AppState, app_id: &str) -> Result<bool> {
+    let target = adoption::verified_live_builder_target(state, app_id, app_id).await?;
+    let volumes = state
+        .runtime()
+        .capture_builder_compute_volumes(&target)
+        .await?;
+    if volumes.is_empty() {
+        return Ok(false);
+    }
+    Ok(volumes.iter().all(|volume| {
+        volume.kind == shared_types::AppResourceKind::PersistentVolumeClaim
+            && !volume.name.is_empty()
+            && !volume.uid.is_empty()
+    }))
 }
 
 #[cfg(all(test, feature = "rcoder-pg"))]
@@ -289,10 +391,15 @@ mod pg_tests {
             .await
             .unwrap();
 
-        let recovered = recover_missing_builder_registration(&state, &app_id)
+        let recovered = match recover_missing_builder_registration(&state, &app_id)
             .await
             .unwrap()
-            .expect("current-lifecycle binding must complete the registration");
+        {
+            BuilderRegistrationRecovery::Completed(verified) => verified,
+            BuilderRegistrationRecovery::Unconfirmed(gap) => {
+                panic!("current-lifecycle binding must complete the registration: {gap:?}")
+            }
+        };
         assert_eq!(recovered.container_id, runtime.pod_uid);
         assert_eq!(
             recovered.workload_uid.as_deref(),
@@ -369,6 +476,17 @@ mod pg_tests {
             _binding: Option<&shared_types::UserAppResourceBinding>,
         ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
             self.target(context)
+        }
+        async fn capture_builder_compute_volumes(
+            &self,
+            _target: &shared_types::BuilderControlTarget,
+        ) -> ContainerRuntimeResult<Vec<shared_types::AppResourceIdentity>> {
+            Ok(vec![shared_types::AppResourceIdentity {
+                kind: shared_types::AppResourceKind::PersistentVolumeClaim,
+                name: format!("{}-workspace", self.app_id),
+                uid: format!("pvc-{}", self.pod_uid),
+                resource_version: None,
+            }])
         }
         async fn stop_container(&self, _: &str) -> ContainerRuntimeResult<()> {
             panic!("registration recovery must not stop compute")
@@ -479,10 +597,12 @@ mod pg_tests {
         let state = Arc::new(state);
         state.userapp_store.ensure_identity(&app_id).await.unwrap();
         assert!(
-            recover_missing_builder_registration(&state, &app_id)
-                .await
-                .unwrap()
-                .is_none(),
+            matches!(
+                recover_missing_builder_registration(&state, &app_id)
+                    .await
+                    .unwrap(),
+                BuilderRegistrationRecovery::Unconfirmed(_)
+            ),
             "no current-lifecycle binding must not complete a registration"
         );
     }

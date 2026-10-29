@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 use crate::{
     app_state::AppState,
     config::{CleanupConfigSettings, OrphanReconcileMode},
+    userapp_builder::registration_recovery::{BuilderRegistrationRecovery, RegistrationGap},
 };
 
 #[cfg(test)]
@@ -281,17 +282,17 @@ impl Scanner {
         key: &WorkloadKey,
         snapshot: &AgentStopSnapshot,
         deadline: Instant,
-    ) -> Result<Option<Classification>> {
+    ) -> Result<(Option<Classification>, Option<RegistrationGap>)> {
         if snapshot.service_type != ServiceType::UserappBuilder
             || (snapshot.controller.is_none() && snapshot.pods.is_empty())
         {
-            return Ok(None);
+            return Ok((None, None));
         }
         // Legacy collaborator identifiers are not the current pure-app admission
         // domain (same rule `protected_shape` preserves them by): never guess an
         // app id for them, and never complete a registration from one.
         if snapshot.app_id_hint.as_deref() != Some(snapshot.identifier.as_str()) {
-            return Ok(None);
+            return Ok((None, None));
         }
         let app_id = snapshot
             .app_id_hint
@@ -304,12 +305,12 @@ impl Scanner {
             .await?
             .is_some()
         {
-            return Ok(None);
+            return Ok((None, None));
         }
         // Only the UserApp authority keeps this workload: without it the
         // workload is an ordinary unreferenced remnant, not a registration gap.
         if !self.lifecycle_referenced(snapshot).await? {
-            return Ok(None);
+            return Ok((None, None));
         }
         ensure!(
             Instant::now() < deadline,
@@ -324,26 +325,29 @@ impl Scanner {
             .acquire_workload_admission(key.clone(), WorkloadAdmissionMode::Exclusive, deadline)
             .await?;
         if guard.has_canonical_references().await? {
-            return Ok(Some(Classification::Registered));
+            return Ok((Some(Classification::Registered), None));
         }
         let Some(_local) = crate::userapp_builder::try_idle_builder_retirement(app_id).await else {
-            debug!(app_id, workload = %name,
+            debug!(app_id, workload = %name, gap = "operation_in_flight",
                 "[ORPHAN_RECONCILIATION] builder registration recovery deferred; local lifecycle is busy");
-            return Ok(Some(Classification::RegistrationUnconfirmed));
+            return Ok((
+                Some(Classification::RegistrationUnconfirmed),
+                Some(RegistrationGap::OperationInFlight),
+            ));
         };
         match crate::userapp_builder::recover_missing_builder_registration(&self.state, app_id)
             .await
         {
-            Ok(Some(verified)) => {
+            Ok(BuilderRegistrationRecovery::Completed(verified)) => {
                 info!(app_id, workload = %name,
                     container_id = %verified.container_id, container_name = %verified.container_name,
                     "[ORPHAN_RECONCILIATION] missing builder registration completed from identity evidence");
-                Ok(Some(Classification::RegistrationRecovered))
+                Ok((Some(Classification::RegistrationRecovered), None))
             }
-            Ok(None) => {
-                debug!(app_id, workload = %name,
+            Ok(BuilderRegistrationRecovery::Unconfirmed(gap)) => {
+                debug!(app_id, workload = %name, gap = gap.as_str(),
                     "[ORPHAN_RECONCILIATION] builder registration gap unconfirmed; resource retained");
-                Ok(Some(Classification::RegistrationUnconfirmed))
+                Ok((Some(Classification::RegistrationUnconfirmed), Some(gap)))
             }
             Err(error) => Err(error),
         }
@@ -549,6 +553,10 @@ impl Scanner {
         let mut classified = 0usize;
         let mut failed = 0usize;
         let mut registrations = 0usize;
+        let mut unconfirmed = 0usize;
+        // Bounded per-reason tally of registration gaps that could not be
+        // closed this round: controlled enum only, never per-app cardinality.
+        let mut gaps = [0usize; RegistrationGap::ALL.len()];
         self.next_workload = None;
         for (index, (name, key, snapshot)) in inventory.iter().enumerate() {
             if Instant::now() >= deadline {
@@ -570,18 +578,44 @@ impl Scanner {
             // Close a missing canonical registration before evaluating this
             // workload, so a recovered builder is judged by its registration
             // (and enters the ordinary scanner) instead of being protected
-            // forever as a lifecycle reference.
-            match self
-                .complete_missing_builder_registration(name, key, snapshot, deadline)
-                .await
-            {
-                Ok(Some(Classification::RegistrationRecovered)) => registrations += 1,
-                Ok(Some(Classification::RegistrationUnconfirmed)) => {}
-                Ok(Some(_)) | Ok(None) => {}
-                Err(error) => {
+            // forever as a lifecycle reference. The recovery shares the scan's
+            // absolute deadline: its SQL/Kube reads and registration write must
+            // never outlive the budget and stall later workloads or shutdown.
+            let recovery = tokio::time::timeout_at(
+                deadline,
+                self.complete_missing_builder_registration(name, key, snapshot, deadline),
+            )
+            .await;
+            match recovery {
+                Ok(Ok((Some(Classification::RegistrationRecovered), _))) => registrations += 1,
+                Ok(Ok((Some(Classification::RegistrationUnconfirmed), gap))) => {
+                    unconfirmed += 1;
+                    if let Some(gap) = gap
+                        && let Some(slot) =
+                            RegistrationGap::ALL.iter().position(|known| *known == gap)
+                    {
+                        gaps[slot] += 1;
+                    }
+                }
+                Ok(Ok((Some(_), _))) | Ok(Ok((None, _))) => {}
+                Ok(Err(error)) => {
                     failed += 1;
                     warn!(workload = %name, error = %format!("{error:#}"),
                         "Builder registration recovery is unknown; resource retained");
+                }
+                Err(_elapsed) => {
+                    // A registration write may already have been dispatched, so
+                    // its outcome is unknown. Never claim it succeeded, and never
+                    // let the next round treat the workload as still missing
+                    // before re-reading the authoritative store.
+                    failed += 1;
+                    warn!(workload = %name,
+                        "Builder registration recovery budget reached; write outcome may be unknown");
+                    self.next_workload = inventory
+                        .get(index + 1)
+                        .or_else(|| inventory.first())
+                        .map(|(name, _, _)| name.clone());
+                    break;
                 }
             }
             let candidate =
@@ -659,7 +693,22 @@ impl Scanner {
                 }
             }
         }
-        info!(discovered, visited, classified, failed, registrations,
+        if unconfirmed > 0 {
+            // One bounded anomaly line per round: a live builder whose canonical
+            // registration is still missing stays protected and invisible to the
+            // ordinary scanner, so the reason must stay visible without per-app
+            // spam. Each reason names the controlled entry that can close it.
+            let by_reason = RegistrationGap::ALL
+                .iter()
+                .zip(gaps)
+                .filter(|(_, count)| *count > 0)
+                .map(|(gap, count)| format!("{}={count}", gap.as_str()))
+                .collect::<Vec<_>>()
+                .join(",");
+            warn!(unconfirmed, by_reason = %by_reason,
+                "[ORPHAN_RECONCILIATION] builder registration gaps remain open; resources retained");
+        }
+        info!(discovered, visited, classified, failed, registrations, unconfirmed,
             deferred = discovered.saturating_sub(visited),
             elapsed_ms = started.elapsed().as_millis() as u64,
             budget_ms = budget.as_millis() as u64,
