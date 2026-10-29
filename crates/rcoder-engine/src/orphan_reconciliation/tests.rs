@@ -1282,6 +1282,19 @@ async fn unreadable_volume_witness_is_unknown_not_a_volume_gap() {
 #[cfg(feature = "userapp-turso")]
 #[tokio::test]
 async fn replaced_recorded_volume_is_a_confirmed_gap_not_an_error() {
+    use tracing::instrument::WithSubscriber as _;
+
+    struct DiagnosticWriter(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for DiagnosticWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     let (scanner, runtime, _probe, _directory) = fixture().await;
     record_discovery_witness(&scanner.state, "witness-lifecycle", "pvc-original").await;
     let app = scanner
@@ -1315,7 +1328,17 @@ async fn replaced_recorded_volume_is_a_confirmed_gap_not_an_error() {
         }]);
     runtime.volumes_replaced.store(true, Ordering::Release);
 
-    let outcome = recover_missing_builder_registration(&scanner.state, "example").await;
+    let diagnostic = Arc::new(Mutex::new(Vec::new()));
+    let writer = diagnostic.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || DiagnosticWriter(writer.clone()))
+        .finish();
+    let outcome = recover_missing_builder_registration(&scanner.state, "example")
+        .with_subscriber(subscriber)
+        .await;
     assert!(
         matches!(
             outcome,
@@ -1324,6 +1347,11 @@ async fn replaced_recorded_volume_is_a_confirmed_gap_not_an_error() {
             ))
         ),
         "a replaced recorded volume is a confirmed gap, not an unknown outcome"
+    );
+    let logged = String::from_utf8(diagnostic.lock().unwrap().clone()).unwrap();
+    assert!(
+        logged.contains("Recovered workspace volume was replaced or is deleting"),
+        "default-level diagnostics must preserve the actual rejection: {logged}"
     );
 }
 

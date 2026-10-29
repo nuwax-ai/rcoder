@@ -38,7 +38,8 @@ pub(crate) enum RegistrationGap {
     SharedRegistryReceiptMissing,
     /// 无当前生命周期对观察到的 controller 的有效绑定。
     BindingMissing,
-    /// 原卷连续性未证实：同名 PVC 换代次、卷删除中，或根本没有卷证据。
+    /// 卷校验未通过或证据缺失；也可能是校验中的生命周期/资源视图变化，
+    /// 不能仅凭此分类断言原卷已经损坏或被替换。
     VolumeUnverified,
     /// 登记写入未被确认（并发写入胜出，或 Project Stop 正在等待持久化确认）。
     /// 结果未知，既不算成功也不算失败。
@@ -294,14 +295,16 @@ async fn workspace_volumes_verified(
         .await
     {
         Ok(()) => Ok(true),
-        // 只有**确定的卷冲突**是本轮可判定的缺口：UID 不等、卷正在删除、注解不属于
-        // 当前代次、挂载集变化（运行时把它们统一映射为 `Conflict`）。读取失败、超时、
-        // PG/K8s 故障的结果**未知**，必须向上传播——扫描按未知处理（保留资源 + 告警），
-        // 不能伪装成"卷不一致"去污染缺口统计与默认日志。
-        Err(app_manager::AppOperationError::Conflict(_)) => {
-            tracing::debug!(
+        // Conflict rejects this observation, but may describe a PVC mismatch,
+        // lifecycle change or a changed resource view. Preserve its actual
+        // cause at the default log level instead of claiming the PVC changed.
+        // Read failures/timeouts still propagate as unknown observations.
+        Err(error @ app_manager::AppOperationError::Conflict(_)) => {
+            tracing::warn!(
                 app_id,
-                "recorded workspace volumes no longer match the live builder; registration retained"
+                stage = "builder_registration_volume_verification",
+                error = %shared_types::sanitize_error_text(&format!("{error:#}")),
+                "builder workspace verification rejected; registration retained"
             );
             Ok(false)
         }
