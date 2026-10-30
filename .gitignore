@@ -91,3 +91,6 @@ tools/dial9-probe/target/
 docker/.runtime-assets-locks
 docker/app-runtime-base/.dbx-locks
 docker/rcoder-agent-runner/.dbx-locks
+
+# vendored pingora-core standalone test builds
+/vendor/pingora-core/target/

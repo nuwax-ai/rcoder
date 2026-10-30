@@ -1,6 +1,11 @@
 [workspace]
 members = ["crates/*", "tests-e2e"]
-exclude = ["tmp/*", "crates/app-cli", "vendor/toasty-driver-postgresql"]
+exclude = [
+    "tmp/*",
+    "crates/app-cli",
+    "vendor/toasty-driver-postgresql",
+    "vendor/pingora-core",
+]
 resolver = "2"
 
 default-members = [
@@ -386,5 +391,8 @@ inherits = "release"
 lto = "thin"
 
 # Official PG TLS configuration with an owned, abortable session driver.
+# pingora-core: response-header-phase budget (response_header_timeout) — see
+# vendor/pingora-core/README.md for provenance and the exact diff.
 [patch.crates-io]
 toasty-driver-postgresql = { path = "vendor/toasty-driver-postgresql" }
+pingora-core = { path = "vendor/pingora-core" }
