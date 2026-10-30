@@ -26,6 +26,10 @@ enum StatusTarget {
     },
     /// 不发 RPC 的保留结论：缺席/未知/不可核实的换代，注册原样保留。
     Keep { reason: String },
+    /// 已确认的预期停态（F2 §5.2）：完成 Stop 回执 + 当前意图 + 注册代次上
+    /// controller 实际停止。跳过失效地址的探测**与失败计数**——不是错误，
+    /// 也不伪造停态给任何未确认场景。
+    Stopped { evidence: String },
 }
 
 /// 一次探针的观察身份：物理 UID/workload + 注册代次/revision，全部在
@@ -304,12 +308,21 @@ impl ContainerStatusChecker {
 
         let project_id = container_info.project_id().to_string();
 
-        // 解析目标：缺席/未知/不可核实的换代一律保留注册，不探测旧地址
+        // 解析目标：缺席/未知/不可核实的换代一律保留注册，不探测旧地址；
+        // 已确认的预期停态（F2）连失败计数也跳过——那是预期状态，不是故障。
         let (grpc_addr, captured) = match self
             .resolve_status_target(family, lookup_key, container_info)
             .await?
         {
             StatusTarget::Probe { addr, captured } => (addr, captured),
+            StatusTarget::Stopped { evidence } => {
+                debug!(
+                    container_key = lookup_key,
+                    evidence = %evidence,
+                    "[STATUS_CHECKER] Confirmed expected stop; probe and failure counting skipped"
+                );
+                return Ok(false);
+            }
             StatusTarget::Keep { reason } => {
                 let scope = HealthScope::of(&registered);
                 let registered_addr = self
@@ -451,6 +464,19 @@ impl ContainerStatusChecker {
             }
         };
         let Some(found) = found else {
+            // F2 §5.2：builder 的已确认预期停态（完成 Stop 回执 + 当前意图 +
+            // 注册代次上 controller 实际停止）跳过探测与失败计数；其余（含
+            // 证据读取失败）保持既有 Keep→失败路径，绝不伪造停态。
+            if family == shared_types::ServiceType::UserappBuilder
+                && let Some(evidence) = crate::userapp_builder::confirmed_builder_stop_evidence(
+                    &self.state,
+                    registration.project_id(),
+                    registered.workload_uid.as_deref(),
+                )
+                .await?
+            {
+                return Ok(StatusTarget::Stopped { evidence });
+            }
             info!(
                 container_key = lookup_key,
                 "[STATUS_CHECKER] No runtime candidate observed; registration retained for authoritative reconciliation"

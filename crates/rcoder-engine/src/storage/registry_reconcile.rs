@@ -194,6 +194,15 @@ pub(crate) fn start_registry_reconcile(
 }
 
 async fn reconcile_once(state: &AppState) -> anyhow::Result<()> {
+    reconcile_once_with(state, &mut std::collections::HashMap::new()).await
+}
+
+/// `last_dispositions` 记录每个项目上一轮的处置类别，用于确认停态的
+/// **状态变化**日志（首轮 info，之后 debug）——有界表达，不逐轮刷 info。
+async fn reconcile_once_with(
+    state: &AppState,
+    last_dispositions: &mut std::collections::HashMap<String, &'static str>,
+) -> anyhow::Result<()> {
     use container_runtime_api::ContainerRuntimeStatus;
     use shared_types::ProjectStore as _;
 
@@ -247,9 +256,33 @@ async fn reconcile_once(state: &AppState) -> anyhow::Result<()> {
                     LiveObservation::Exited
                 }
             }
-            Ok(None) => LiveObservation::Unknown {
-                reason: "no live candidate found by runtime lookup".into(),
-            },
+            Ok(None) => {
+                // F2（任务书 §5.1/§5.2）：builder 的**已确认预期停态**是结构化
+                // 缺席证据（完成 Stop 回执 + desired-stopped + 注册代次上
+                // controller 实际停止），经既有处置表行5/6 归 ObservedStopped
+                // （保留历史/卷，不清理）；读取失败与证据不完整保持 Unknown。
+                if service_type == ServiceType::UserappBuilder {
+                    match crate::userapp_builder::confirmed_builder_stop_evidence(
+                        state,
+                        &project_id,
+                        basic.workload_uid.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(Some(evidence)) => LiveObservation::Absent { evidence },
+                        Ok(None) => LiveObservation::Unknown {
+                            reason: "no live candidate found by runtime lookup".into(),
+                        },
+                        Err(error) => LiveObservation::Unknown {
+                            reason: format!("stopped-evidence observation failed: {error}"),
+                        },
+                    }
+                } else {
+                    LiveObservation::Unknown {
+                        reason: "no live candidate found by runtime lookup".into(),
+                    }
+                }
+            }
             Err(error) => LiveObservation::Unknown {
                 reason: format!("runtime lookup failed: {error}"),
             },
@@ -260,7 +293,15 @@ async fn reconcile_once(state: &AppState) -> anyhow::Result<()> {
             workload_name: basic.container_name.clone(),
             ip: basic.container_ip.clone(),
         };
-        match disposition(&binding, &live, &service_type) {
+        let disposition = disposition(&binding, &live, &service_type);
+        let disposition_key = match &disposition {
+            Disposition::ObservedStopped { .. } => "observed_stopped",
+            Disposition::ObservedStoppedDocker => "observed_stopped_docker",
+            _ => "",
+        };
+        let changed =
+            last_dispositions.insert(project_id.clone(), disposition_key) != Some(disposition_key);
+        match disposition {
             Disposition::RefreshHint { .. } | Disposition::Rebuilding => {}
             Disposition::ObserveGenerationChange {
                 new_physical_uid, ..
@@ -285,19 +326,37 @@ async fn reconcile_once(state: &AppState) -> anyhow::Result<()> {
                 );
             }
             Disposition::ObservedStopped { evidence } => {
-                tracing::info!(
-                    project_id = %project_id,
-                    workload = %binding.workload_name,
-                    %evidence,
-                    "Registry reconcile: bound compute observed stopped; history and volumes retained"
-                );
+                // 状态变化日志：首轮/变更 info，其后 debug（§5.6 有界表达）。
+                if changed {
+                    tracing::info!(
+                        project_id = %project_id,
+                        workload = %binding.workload_name,
+                        %evidence,
+                        "Registry reconcile: bound compute observed stopped; history and volumes retained"
+                    );
+                } else {
+                    tracing::debug!(
+                        project_id = %project_id,
+                        workload = %binding.workload_name,
+                        %evidence,
+                        "Registry reconcile: bound compute still confirmed stopped"
+                    );
+                }
             }
             Disposition::ObservedStoppedDocker => {
-                tracing::info!(
-                    project_id = %project_id,
-                    workload = %binding.workload_name,
-                    "Registry reconcile: container exited (observed stopped)"
-                );
+                if changed {
+                    tracing::info!(
+                        project_id = %project_id,
+                        workload = %binding.workload_name,
+                        "Registry reconcile: container exited (observed stopped)"
+                    );
+                } else {
+                    tracing::debug!(
+                        project_id = %project_id,
+                        workload = %binding.workload_name,
+                        "Registry reconcile: container still observed stopped"
+                    );
+                }
             }
             Disposition::Unknown { reason } => {
                 tracing::warn!(
@@ -310,6 +369,333 @@ async fn reconcile_once(state: &AppState) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod stopped_evidence_tests {
+    use crate::app_state::AppState;
+    use container_runtime_api::{
+        AgentContainerRuntime, ContainerRuntimeResult, RuntimeContainerInfo,
+        UserAppDeploymentRuntime, WorkspaceRuntime,
+    };
+    use shared_types::{ContainerBasicInfo, ProjectAndContainerInfo, ServiceType};
+    use std::future::Future;
+    use std::sync::{Arc, Mutex};
+
+    /// 已停 builder 的最小运行时：find 恒 None；controller 捕获返回注册代次；
+    /// 证停观察可注入失败。Pod 恢复场景由 observe=false 表达。
+    struct StoppedRuntime {
+        workload_uid: &'static str,
+        observe_fails: bool,
+        observe_running: bool,
+    }
+
+    fn stopped_target(
+        runtime: &StoppedRuntime,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        Ok(shared_types::BuilderControlTarget {
+            context: context.clone(),
+            resource_binding: None,
+            workload: Some(shared_types::AppResourceIdentity {
+                kind: shared_types::AppResourceKind::StatefulSet,
+                name: context.app_id.clone(),
+                uid: runtime.workload_uid.to_owned(),
+                resource_version: Some("9".into()),
+            }),
+            pod: None,
+            restart_image: None,
+            restart_runtime_workspace: None,
+            builder_startup_mode: Default::default(),
+        })
+    }
+
+    #[async_trait::async_trait]
+    impl AgentContainerRuntime for StoppedRuntime {
+        fn agent_workload_name(
+            &self,
+            identifier: &str,
+            _: &ServiceType,
+        ) -> ContainerRuntimeResult<String> {
+            Ok(identifier.into())
+        }
+        fn agent_workload_namespace(&self) -> String {
+            "isolated".into()
+        }
+        async fn find_container(
+            &self,
+            _: &str,
+            _: &ServiceType,
+        ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
+            Ok(None)
+        }
+        async fn inspect_builder_candidate(
+            &self,
+            context: &shared_types::UserAppExecutionContext,
+        ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+            stopped_target(self, context)
+        }
+        async fn capture_builder_control(
+            &self,
+            context: &shared_types::UserAppExecutionContext,
+        ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+            stopped_target(self, context)
+        }
+        async fn capture_bound_builder_control(
+            &self,
+            context: &shared_types::UserAppExecutionContext,
+            _: Option<&shared_types::UserAppResourceBinding>,
+        ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+            stopped_target(self, context)
+        }
+        async fn observe_builder_compute_stopped(
+            &self,
+            _: &shared_types::BuilderControlTarget,
+        ) -> ContainerRuntimeResult<bool> {
+            if self.observe_fails {
+                return Err(container_runtime_api::ContainerRuntimeError::K8sError(
+                    "controlled stop observation failed".into(),
+                ));
+            }
+            Ok(!self.observe_running)
+        }
+        async fn create_container(
+            &self,
+            _: container_runtime_api::ContainerCreateParams,
+        ) -> ContainerRuntimeResult<ContainerBasicInfo> {
+            panic!("reconcile must not create")
+        }
+        async fn get_container_info(
+            &self,
+            _: &str,
+        ) -> ContainerRuntimeResult<Option<ContainerBasicInfo>> {
+            Ok(None)
+        }
+        async fn stop_container(&self, _: &str) -> ContainerRuntimeResult<()> {
+            panic!("reconcile must not stop by name")
+        }
+        async fn is_container_running(&self, _: &str) -> ContainerRuntimeResult<bool> {
+            Ok(false)
+        }
+        async fn list_containers(&self) -> ContainerRuntimeResult<Vec<RuntimeContainerInfo>> {
+            Ok(vec![])
+        }
+        async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {
+            panic!("reconcile must not run global cleanup")
+        }
+        async fn health_check(&self) -> ContainerRuntimeResult<()> {
+            Ok(())
+        }
+        async fn sync_states(
+            &self,
+        ) -> ContainerRuntimeResult<(u32, Vec<container_runtime_api::RemovedContainerInfo>)>
+        {
+            Ok((0, vec![]))
+        }
+    }
+    #[async_trait::async_trait]
+    impl WorkspaceRuntime for StoppedRuntime {}
+    #[async_trait::async_trait]
+    impl UserAppDeploymentRuntime for StoppedRuntime {
+        async fn list_deployments(
+            &self,
+        ) -> ContainerRuntimeResult<Vec<container_runtime_api::DeploymentStatus>> {
+            Ok(vec![])
+        }
+    }
+
+    async fn stopped_state(
+        runtime: Arc<StoppedRuntime>,
+        registered_workload_uid: &str,
+    ) -> (Arc<AppState>, shared_types::UserAppLifecycleRecord) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+                &directory.path().join("reconcile.db"),
+            )
+            .await
+            .unwrap(),
+        );
+        let state = crate::userapp_builder::builder_runtime_test_state(runtime, store, None).await;
+        let app = state
+            .userapp_store
+            .ensure_identity("stoppedapp")
+            .await
+            .unwrap();
+        let mut project = ProjectAndContainerInfo::new("stoppedapp".into());
+        project.set_service_type(Some(ServiceType::UserappBuilder));
+        project.set_container(Some(ContainerBasicInfo {
+            container_id: "pod-old".into(),
+            container_name: "stoppedapp".into(),
+            container_ip: "10.42.0.1".into(),
+            internal_port: 60000,
+            external_port: 0,
+            project_id: "stoppedapp".into(),
+            status: "Running".into(),
+            created_at: chrono::Utc::now(),
+            service_url: String::new(),
+            workload_uid: Some(registered_workload_uid.into()),
+        }));
+        state
+            .insert_project("stoppedapp".into(), Arc::new(project))
+            .unwrap();
+        (state, app)
+    }
+
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn with_captured_logs<F, Fut>(future: F) -> String
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || LogWriter(writer.clone()))
+            .finish();
+        use tracing::instrument::WithSubscriber as _;
+        async move { future().await }
+            .with_subscriber(subscriber)
+            .await;
+        String::from_utf8(buffer.lock().unwrap().clone()).unwrap()
+    }
+
+    /// F2 §5.1/§5.2：已确认预期停态（Succeeded Stop 回执 + desired-stopped +
+    /// 注册代次上 controller 实际停止）是结构化缺席，不是未知故障；
+    /// 状态变化日志有界（后续轮次降为 debug）。
+    #[tokio::test]
+    async fn confirmed_stop_is_observed_stopped_not_unknown() {
+        let runtime = Arc::new(StoppedRuntime {
+            workload_uid: "sts-stopped",
+            observe_fails: false,
+            observe_running: false,
+        });
+        let (state, app) = stopped_state(runtime, "sts-stopped").await;
+        crate::userapp_builder::access::tests::stopped(&state, &app, true).await;
+
+        let logs = with_captured_logs(|| async {
+            let mut last = std::collections::HashMap::new();
+            super::reconcile_once_with(&state, &mut last).await.unwrap();
+            super::reconcile_once_with(&state, &mut last).await.unwrap();
+        })
+        .await;
+        assert!(
+            logs.contains("bound compute observed stopped"),
+            "confirmed stop must be an observed-stopped disposition: {logs}"
+        );
+        assert!(
+            logs.contains("compute stop confirmed"),
+            "the structured evidence (receipt/intent/controller) is retained: {logs}"
+        );
+        assert!(
+            !logs.contains("live state unknown"),
+            "a confirmed expected stop is not an unknown fault: {logs}"
+        );
+        assert_eq!(
+            logs.matches("bound compute observed stopped").count(),
+            1,
+            "state-change logging is bounded: later rounds downgrade to debug: {logs}"
+        );
+    }
+
+    /// 无停机意图/回执：保持既有 Unknown 告警（不因“没有活 Pod”伪造停态）。
+    #[tokio::test]
+    async fn unconfirmed_stop_stays_unknown() {
+        let runtime = Arc::new(StoppedRuntime {
+            workload_uid: "sts-stopped",
+            observe_fails: false,
+            observe_running: false,
+        });
+        let (state, _app) = stopped_state(runtime, "sts-stopped").await;
+
+        let logs = with_captured_logs(|| async {
+            super::reconcile_once(&state).await.unwrap();
+        })
+        .await;
+        assert!(
+            logs.contains("live state unknown"),
+            "without a confirmed receipt the disposition stays unknown: {logs}"
+        );
+        assert!(!logs.contains("bound compute observed stopped"), "{logs}");
+    }
+
+    /// 证据读取失败仍是未知：绝不把读不到证据当成已确认停态（§5.4）。
+    #[tokio::test]
+    async fn evidence_read_failure_stays_unknown() {
+        let runtime = Arc::new(StoppedRuntime {
+            workload_uid: "sts-stopped",
+            observe_fails: true,
+            observe_running: false,
+        });
+        let (state, app) = stopped_state(runtime, "sts-stopped").await;
+        crate::userapp_builder::access::tests::stopped(&state, &app, true).await;
+
+        let logs = with_captured_logs(|| async {
+            super::reconcile_once(&state).await.unwrap();
+        })
+        .await;
+        assert!(
+            logs.contains("live state unknown")
+                && logs.contains("stopped-evidence observation failed"),
+            "a read failure keeps the unknown disposition with its reason: {logs}"
+        );
+    }
+
+    /// 注册指向的 controller 与被停的 controller 不一致（换代/替换）：
+    /// 不确认停态，保持未知（§5.2/§5.5——旧停止观察不得覆盖新代次）。
+    #[tokio::test]
+    async fn generation_mismatch_is_not_a_confirmed_stop() {
+        let runtime = Arc::new(StoppedRuntime {
+            workload_uid: "sts-new-generation",
+            observe_fails: false,
+            observe_running: false,
+        });
+        let (state, app) = stopped_state(runtime, "sts-registered-old").await;
+        crate::userapp_builder::access::tests::stopped(&state, &app, true).await;
+
+        let logs = with_captured_logs(|| async {
+            super::reconcile_once(&state).await.unwrap();
+        })
+        .await;
+        assert!(
+            logs.contains("live state unknown"),
+            "a stop receipt for another controller generation must not confirm this registration: {logs}"
+        );
+    }
+
+    /// Pod 仍运行（业务 Stopped 不等于计算停止，§5.3）：不确认停态。
+    #[tokio::test]
+    async fn running_pod_is_not_a_confirmed_stop() {
+        let runtime = Arc::new(StoppedRuntime {
+            workload_uid: "sts-stopped",
+            observe_fails: false,
+            observe_running: true,
+        });
+        let (state, app) = stopped_state(runtime, "sts-stopped").await;
+        crate::userapp_builder::access::tests::stopped(&state, &app, true).await;
+
+        let logs = with_captured_logs(|| async {
+            super::reconcile_once(&state).await.unwrap();
+        })
+        .await;
+        assert!(
+            logs.contains("live state unknown"),
+            "a running Pod is never a confirmed stop: {logs}"
+        );
+    }
 }
 
 #[cfg(test)]

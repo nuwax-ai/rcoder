@@ -32,7 +32,7 @@ impl std::fmt::Display for BuilderEnsureSuperseded {
 }
 
 impl std::error::Error for BuilderEnsureSuperseded {}
-mod access;
+pub(crate) mod access;
 pub(crate) mod auto_repair;
 pub mod compute_control;
 mod compute_drain_recovery;
@@ -98,7 +98,8 @@ use container_runtime_api::ContainerCreateParams;
 // 存储契约 trait：state.projects（ProjectStoreBackend 枚举）上的方法经此解析
 use shared_types::ProjectStore as _;
 use shared_types::{
-    AGENT_FILE_SERVER_PORT, ContainerBasicInfo, ProjectAndContainerInfo, ServiceType,
+    AGENT_FILE_SERVER_PORT, ComputeControlAction, ComputeControlState, ContainerBasicInfo,
+    ProjectAndContainerInfo, ServiceType,
 };
 use tracing::info;
 
@@ -639,6 +640,80 @@ pub(crate) fn registered_builder(state: &AppState, instance: &str) -> Option<Con
         .projects
         .get(instance)
         .and_then(|p| p.container_info())
+}
+
+/// 已确认的预期停态证据（F2，任务书 §5.2）：已完成的 Stop 回执 + 当前
+/// desired-stopped 意图 + 注册 workload 的实际停止观察，三者同代次匹配才
+/// 返回 `Some`。消费方仅可据此跳过失效地址的探测与失败计数；任何读取
+/// 失败（`Err`）或证据不完整（`None`）都必须保持未知/正常探测，绝不伪造
+/// 停态。Start/Restart 后 `desired_stopped` 翻转，本证据自然失效，新代次
+/// 恢复正常探测（§5.5）。
+pub(crate) async fn confirmed_builder_stop_evidence(
+    state: &AppState,
+    app_id: &str,
+    registered_workload_uid: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(app) = state.userapp_store.get_application(app_id).await? else {
+        return Ok(None);
+    };
+    if app.state != shared_types::UserAppLifecycleState::Active {
+        return Ok(None);
+    }
+    // 已完成 Stop 的原回执：desired-stopped 意图 + Succeeded Stop 控制。
+    // 在途/失败的控制记录都不构成确认停态（§5.4）。
+    let status = state
+        .userapp_store
+        .read_compute_status(
+            app_id,
+            &app.lifecycle_id,
+            shared_types::UserAppOperationScope::Dev,
+        )
+        .await?;
+    if !status.desired_stopped {
+        return Ok(None);
+    }
+    let Some(stop) = status.operation else {
+        return Ok(None);
+    };
+    if stop.lifecycle_id != app.lifecycle_id
+        || stop.scope != shared_types::UserAppOperationScope::Dev
+        || stop.action != ComputeControlAction::Stop
+        || stop.state != ComputeControlState::Succeeded
+    {
+        return Ok(None);
+    }
+    // 当前代次匹配：注册的 workload 必须就是被停的那个 controller——
+    // 注册指向旧/新 controller 时不得跳过探测（§5.2/§5.5）。
+    let Some(registered_uid) = registered_workload_uid.filter(|uid| !uid.is_empty()) else {
+        return Ok(None);
+    };
+    let context = shared_types::UserAppExecutionContext {
+        app_id: app_id.to_owned(),
+        lifecycle_id: app.lifecycle_id.clone(),
+        operation_id: "stopped-evidence-observation".into(),
+        executor_id: "reader".into(),
+        request_fingerprint: "0".repeat(64),
+    };
+    let target = adoption::capture_bound_target(state, &context).await?;
+    let Some(workload) = target.workload.as_ref() else {
+        return Ok(None);
+    };
+    if workload.uid != registered_uid {
+        return Ok(None);
+    }
+    // Pod 仍在运行（业务 Stopped 不等于计算停止，§5.3）时观察为 false，
+    // 消费方继续正常探测管理面。
+    if !state
+        .runtime()
+        .observe_builder_compute_stopped(&target)
+        .await?
+    {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "compute stop confirmed: operation={} generation={} controller={}",
+        stop.operation_id, stop.generation, workload.uid
+    )))
 }
 
 /// Physical state for `/computer/pod/ensure`. The management file server and

@@ -30,12 +30,14 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::broadcast;
 
-/// find_container 的可重复响应行为（多次查询返回一致结果）
-#[derive(Clone, Copy)]
+/// find_container 的可重复响应行为（多次查询返回一致结果）。
+/// `StoppedBuilder` = 缺席候选 + 已停 controller 观察（F2 确认停态形态）。
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum FindBehavior {
     Found,
     Missing,
     Fail,
+    StoppedBuilder,
 }
 
 /// 可编程桩运行时：记录 find_container 的每次查询参数，返回行为可由测试预设。
@@ -51,6 +53,27 @@ impl ProbeRuntime {
             behavior,
             queries: Mutex::new(Vec::new()),
         }
+    }
+
+    /// F2 已停 builder 的 controller 捕获（Pod 无、注册代次 sts-stopped）。
+    fn stopped_target(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        Ok(shared_types::BuilderControlTarget {
+            context: context.clone(),
+            resource_binding: None,
+            workload: Some(shared_types::AppResourceIdentity {
+                kind: shared_types::AppResourceKind::StatefulSet,
+                name: context.app_id.clone(),
+                uid: "sts-stopped".into(),
+                resource_version: Some("9".into()),
+            }),
+            pod: None,
+            restart_image: None,
+            restart_runtime_workspace: None,
+            builder_startup_mode: Default::default(),
+        })
     }
 
     fn queried_identifiers(&self) -> Vec<String> {
@@ -87,6 +110,7 @@ impl AgentContainerRuntime for ProbeRuntime {
             .unwrap()
             .push((identifier.to_string(), *service_type));
         match self.behavior {
+            FindBehavior::StoppedBuilder | FindBehavior::Missing => Ok(None),
             FindBehavior::Found => Ok(Some(RuntimeContainerInfo {
                 container_id: "stub".to_string(),
                 container_name: "stub".to_string(),
@@ -101,7 +125,6 @@ impl AgentContainerRuntime for ProbeRuntime {
                 app_id: None,
                 workload_uid: None,
             })),
-            FindBehavior::Missing => Ok(None),
             FindBehavior::Fail => Err(ContainerRuntimeError::ConnectionError(
                 "probe error".to_string(),
             )),
@@ -118,6 +141,31 @@ impl AgentContainerRuntime for ProbeRuntime {
     }
     async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {
         Ok(())
+    }
+    async fn inspect_builder_candidate(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        self.stopped_target(context)
+    }
+    async fn capture_builder_control(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        self.stopped_target(context)
+    }
+    async fn capture_bound_builder_control(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        _binding: Option<&shared_types::UserAppResourceBinding>,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        self.stopped_target(context)
+    }
+    async fn observe_builder_compute_stopped(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(self.behavior == FindBehavior::StoppedBuilder)
     }
     async fn health_check(&self) -> ContainerRuntimeResult<()> {
         Ok(())
@@ -693,5 +741,96 @@ async fn cleanup_keeps_health_for_shared_user_without_a_same_named_project() {
             .health_states
             .contains_key(&scope.key("shared-user")),
         "logical user key was mistaken for a missing project ID"
+    );
+}
+
+/// F2 §5.2/§5.6：已确认预期停态（Succeeded Stop 回执 + desired-stopped +
+/// 注册代次上 controller 实际停止）跳过失效地址的 gRPC 探测与失败计数——
+/// 既不报错也不累积失败；Start/Restart 后证据失效恢复正常探测。
+#[tokio::test]
+async fn confirmed_stop_skips_probe_and_failure_counting() {
+    let (state, _metadata_dir) =
+        test_state(Arc::new(ProbeRuntime::new(FindBehavior::StoppedBuilder))).await;
+    let app = state
+        .userapp_store
+        .ensure_identity("stoppedapp")
+        .await
+        .unwrap();
+    let project = ProjectAndContainerInfo::from_parts(
+        "stoppedapp".to_string(),
+        None,
+        None,
+        None,
+        Some(ContainerBasicInfo {
+            container_id: "pod-old".to_string(),
+            container_name: "stoppedapp".to_string(),
+            container_ip: "127.0.0.1".to_string(),
+            internal_port: 8086,
+            external_port: 0,
+            project_id: "stoppedapp".to_string(),
+            status: "running".to_string(),
+            created_at: Utc::now(),
+            service_url: String::new(),
+            workload_uid: Some("sts-stopped".to_string()),
+        }),
+        ProjectExtendedFields {
+            service_type: Some(ServiceType::UserappBuilder),
+            ..Default::default()
+        },
+    );
+    let project = Arc::new(project);
+    state
+        .insert_project("stoppedapp".to_string(), project.clone())
+        .unwrap();
+    crate::userapp_builder::access::tests::stopped(&state, &app, true).await;
+
+    let c = checker(ContainerStatusCheckerConfig::default(), state);
+    let active = c.check_single_container("stoppedapp", &project).await;
+    assert_eq!(
+        active.map_err(|error| format!("{error:#}")),
+        Ok(false),
+        "a confirmed expected stop is neither an error nor an activity update"
+    );
+    // Keep→record_failure 路径在返回值上即为 Err；Ok(false) 证明既未探测、
+    // 也未走失败计数（失败计数只在 record_failure 内发生）。
+}
+
+/// 未确认（无停机意图）：保持既有 Keep→失败路径（错误可见，不伪造停态）。
+#[tokio::test]
+async fn unconfirmed_missing_stays_a_visible_failure() {
+    let (state, _metadata_dir) =
+        test_state(Arc::new(ProbeRuntime::new(FindBehavior::Missing))).await;
+    let project = ProjectAndContainerInfo::from_parts(
+        "stoppedapp".to_string(),
+        None,
+        None,
+        None,
+        Some(ContainerBasicInfo {
+            container_id: "pod-old".to_string(),
+            container_name: "stoppedapp".to_string(),
+            container_ip: "127.0.0.1".to_string(),
+            internal_port: 8086,
+            external_port: 0,
+            project_id: "stoppedapp".to_string(),
+            status: "running".to_string(),
+            created_at: Utc::now(),
+            service_url: String::new(),
+            workload_uid: Some("sts-stopped".to_string()),
+        }),
+        ProjectExtendedFields {
+            service_type: Some(ServiceType::UserappBuilder),
+            ..Default::default()
+        },
+    );
+    let project = Arc::new(project);
+    state
+        .insert_project("stoppedapp".to_string(), project.clone())
+        .unwrap();
+
+    let c = checker(ContainerStatusCheckerConfig::default(), state);
+    let active = c.check_single_container("stoppedapp", &project).await;
+    assert!(
+        active.is_err(),
+        "without a confirmed receipt the stale address stays a visible failure"
     );
 }
