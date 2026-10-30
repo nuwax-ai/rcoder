@@ -1267,12 +1267,19 @@ impl RunState {
             // 保留未确认记录直接退出，不得伪装 Stopped，也不得无限重试。
             let owner_shutdown =
                 self.shutdown.is_cancelled() || self.core.intent() == Intent::Shutdown;
-            let cleanup_unconfirmed = self.cleanup_abandoned || self.owner_cleanup_abandoned;
+            // Pre-await view decides only WHETHER to consult the owner-resource
+            // cleanup. The final verdict is recomputed AFTER the await: that
+            // call may itself conclude an unconfirmed owner cleanup (writing
+            // RecoveryRequired/problem and arming owner_cleanup_abandoned), and
+            // deciding with the stale pre-await value would publish Stopped and
+            // wipe the record it just wrote (Codex review P1).
+            let cleanup_unconfirmed_before = self.cleanup_abandoned || self.owner_cleanup_abandoned;
             if owner_shutdown
                 && !self.cleanup_pending()
-                && (self.fence_cleared() || cleanup_unconfirmed)
+                && (self.fence_cleared() || cleanup_unconfirmed_before)
                 && self.owner_resources_quiescent().await?
             {
+                let cleanup_unconfirmed = self.cleanup_abandoned || self.owner_cleanup_abandoned;
                 if cleanup_unconfirmed {
                     // record_problem 已写 RecoveryRequired + 问题记录；这里
                     // 不发布 Stopped、不清 problem——进程退出但清理未确认。
@@ -1961,6 +1968,68 @@ mod tests {
     /// 此时必须**放弃**无效重试（预修复行为：poll_cleanup 每 2s 无限重臂，
     /// drive_idle 永不返回→容器 90s 被 SIGKILL），保留未确认记录退出：
     /// 快照保持 RecoveryRequired（绝不伪装 Stopped），问题记录在案。
+    /// Codex 复审 P1（runtime-timeout-independent-review-20261030）：仅 owner
+    /// 资源清理失败（generation 清理干净）时，退出路径不得把快照写成
+    /// Stopped——`cleanup_unconfirmed` 在 await 前缓存，等待期间清理失败
+    /// 置位后被旧值覆盖，problem/error 被清空。落盘必须保持
+    /// RecoveryRequired 且问题记录在案。
+    #[tokio::test]
+    async fn owner_cleanup_failure_alone_never_publishes_stopped() {
+        struct FailingOwnerCleanup;
+        #[async_trait::async_trait]
+        impl OwnerCleanup for FailingOwnerCleanup {
+            async fn shutdown(&self) -> Result<()> {
+                Err(anyhow::anyhow!("fixture owner resource cleanup failed"))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let shutdown = CancellationToken::new();
+        let session = Arc::new(
+            OwnerSession::start(
+                Owner::try_acquire(dir.path()).unwrap().unwrap(),
+                SessionOptions {
+                    binding: control::Binding {
+                        component: "app-cli".into(),
+                        resource: dir.path().to_path_buf(),
+                    },
+                    policy: crate::Policy::default(),
+                    cleanup_adapter: None,
+                    restart_on_exit: true,
+                    shutdown: shutdown.clone(),
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        session
+            .set_owner_cleanup(Arc::new(FailingOwnerCleanup))
+            .unwrap();
+        let mut state = session.run.lock().unwrap().take().unwrap();
+        shutdown.cancel();
+        let mut factory: BusinessFactory = Box::new(|_| panic!("shutdown must not relaunch"));
+        let exit = tokio::time::timeout(Duration::from_secs(20), state.drive_idle(&mut factory))
+            .await
+            .expect("drive_idle must conclude after the owner cleanup failure")
+            .unwrap();
+        assert!(matches!(exit, IdleFlow::Shutdown));
+        drop(state);
+        drop(session);
+        let after = crate::last_snapshot(dir.path()).unwrap();
+        assert_ne!(
+            after.phase,
+            Phase::Stopped,
+            "an owner-cleanup-only failure must never be published as Stopped: {after:#?}"
+        );
+        assert!(
+            after.problem.is_some()
+                && after
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("owner resource cleanup")),
+            "the unconfirmed owner-cleanup record must survive on disk: {after:#?}"
+        );
+    }
+
     #[tokio::test]
     async fn process_shutdown_abandons_failing_generation_cleanup_instead_of_retrying_forever() {
         let dir = tempfile::tempdir().unwrap();
