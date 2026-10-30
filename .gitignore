@@ -94,3 +94,5 @@ docker/rcoder-agent-runner/.dbx-locks
 
 # vendored pingora-core standalone test builds
 /vendor/pingora-core/target/
+
+/vendor/pingora-proxy/target/

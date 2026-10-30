@@ -31,6 +31,7 @@ use std::task::{ready, Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
+use tokio::sync::Notify;
 use tokio::time::Instant as TokioInstant;
 
 use crate::connectors::http::v2::ConnectionRef;
@@ -72,6 +73,12 @@ pub struct Http2Session {
     // armed once END_STREAM has been sent on the request stream.
     pub response_header_timeout: Option<Duration>,
     response_header_deadline: Option<TokioInstant>,
+    // RCoder vendored patch: signaled when END_STREAM was sent on the request
+    // stream. The proxy driver detaches the body writer and streams DATA/
+    // END_STREAM through the raw SendStream, so the session can only learn
+    // about upload EOS through this signal (notify_one keeps a permit for a
+    // waiter that has not reached `notified()` yet).
+    end_stream_signal: Arc<Notify>,
     pub conn: ConnectionRef,
     // Indicate that whether a END_STREAM is already sent
     ended: bool,
@@ -98,6 +105,7 @@ impl Http2Session {
             write_timeout: None,
             response_header_timeout: None,
             response_header_deadline: None,
+            end_stream_signal: Arc::new(Notify::new()),
             conn,
             ended: false,
             body_recv: 0,
@@ -155,7 +163,9 @@ impl Http2Session {
         self.req_sent = Some(req);
         self.send_body = Some(send_body);
         self.resp_fut = Some(resp_fut);
-        self.ended = self.ended || end;
+        if end {
+            self.mark_end_stream();
+        }
 
         Ok(())
     }
@@ -175,8 +185,29 @@ impl Http2Session {
         super::write_body(body_writer, data, end, self.write_timeout)
             .await
             .map_err(|e| self.handle_err(e))?;
-        self.ended = self.ended || end;
+        if end {
+            self.mark_end_stream();
+        }
         Ok(())
+    }
+
+    // RCoder vendored patch: mark END_STREAM as sent and wake any header
+    // reader waiting for upload EOS (see `end_stream_signal`).
+    fn mark_end_stream(&mut self) {
+        if !self.ended {
+            self.ended = true;
+            self.end_stream_signal.notify_one();
+        }
+    }
+
+    /// RCoder vendored patch: handle to the END_STREAM notification for
+    /// callers that detached the request body writer via
+    /// [`Self::take_request_body_writer`] and stream DATA/END_STREAM through
+    /// the raw `SendStream` themselves (the proxy driver does). They must
+    /// `notify_one()` on this handle once END_STREAM was sent, otherwise a
+    /// configured `response_header_timeout` cannot observe upload EOS.
+    pub fn request_end_stream_signal(&self) -> Arc<Notify> {
+        Arc::clone(&self.end_stream_signal)
     }
 
     /// Signal that the request body has ended
@@ -195,7 +226,7 @@ impl Http2Session {
             .send_data("".into(), true)
             .or_err(WriteError, "while writing empty h2 request body")
             .map_err(|e| self.handle_err(e))?;
-        self.ended = true;
+        self.mark_end_stream();
         Ok(())
     }
 
@@ -212,13 +243,36 @@ impl Http2Session {
         // END_STREAM has been sent on the request stream, so request upload
         // time never counts against the budget. The deadline is absolute;
         // re-entering this function (cancelled reads) never re-arms it.
-        if self.response_header_timeout.is_some()
-            && self.response_header_deadline.is_none()
-            && self.ended
-        {
-            self.response_header_deadline = self
-                .response_header_timeout
-                .map(|t| TokioInstant::now() + t);
+        // When the body writer was detached, EOS is only observable through
+        // the end-stream signal, so wait for that signal (or the header
+        // itself, or the per-read timeout) before the bounded wait below.
+        if self.response_header_timeout.is_some() && self.response_header_deadline.is_none() {
+            if self.ended {
+                self.response_header_deadline = self
+                    .response_header_timeout
+                    .map(|t| TokioInstant::now() + t);
+            } else {
+                let signal = Arc::clone(&self.end_stream_signal);
+                let read_timeout = self.read_timeout;
+                let header = std::future::poll_fn(|cx| self.poll_response_header(cx));
+                tokio::select! {
+                    res = header => {
+                        return self.complete_response_header_read(res);
+                    }
+                    _ = signal.notified() => {
+                        self.ended = true;
+                        self.response_header_deadline = self
+                            .response_header_timeout
+                            .map(|t| TokioInstant::now() + t);
+                    }
+                    _ = tokio::time::sleep(read_timeout.unwrap_or(Duration::MAX)), if read_timeout.is_some() => {
+                        return Err(self.handle_err(Error::explain(
+                            ReadTimedout,
+                            "while reading h2 response header",
+                        )));
+                    }
+                }
+            }
         }
         if let Some(deadline) = self.response_header_deadline {
             if TokioInstant::now() >= deadline {
@@ -242,35 +296,44 @@ impl Http2Session {
             (None, None) => None,
         };
         let res = match effective_timeout {
-            Some(t) => match timeout(t, std::future::poll_fn(|cx| self.poll_response_header(cx)))
-                .await
-            {
-                Ok(res) => res,
-                Err(_) => {
-                    // With no per-read timeout the absolute header deadline is
-                    // the only bound, so a fired timer is that deadline (the
-                    // timer wheel rounds to 10ms ticks and may fire marginally
-                    // early); otherwise attribute to the header deadline only
-                    // once it has actually elapsed.
-                    let deadline_exhausted = match read_timeout {
-                        None => self.response_header_deadline.is_some(),
-                        Some(_) => self
-                            .response_header_deadline
-                            .is_some_and(|deadline| TokioInstant::now() >= deadline),
-                    };
-                    let error = if deadline_exhausted {
-                        Error::explain(
-                            RESPONSE_HEADER_TIMEDOUT,
-                            "while awaiting the h2 response header",
-                        )
-                    } else {
-                        Error::explain(ReadTimedout, "while reading h2 response header")
-                    };
-                    return Err(self.handle_err(error));
+            Some(t) => {
+                match timeout(t, std::future::poll_fn(|cx| self.poll_response_header(cx))).await {
+                    Ok(res) => res,
+                    Err(_) => {
+                        // With no per-read timeout the absolute header deadline is
+                        // the only bound, so a fired timer is that deadline (the
+                        // timer wheel rounds to 10ms ticks and may fire marginally
+                        // early); otherwise attribute to the header deadline only
+                        // once it has actually elapsed.
+                        let deadline_exhausted = match read_timeout {
+                            None => self.response_header_deadline.is_some(),
+                            Some(_) => self
+                                .response_header_deadline
+                                .is_some_and(|deadline| TokioInstant::now() >= deadline),
+                        };
+                        let error = if deadline_exhausted {
+                            Error::explain(
+                                RESPONSE_HEADER_TIMEDOUT,
+                                "while awaiting the h2 response header",
+                            )
+                        } else {
+                            Error::explain(ReadTimedout, "while reading h2 response header")
+                        };
+                        return Err(self.handle_err(error));
+                    }
                 }
-            },
+            }
             None => std::future::poll_fn(|cx| self.poll_response_header(cx)).await,
         };
+        self.complete_response_header_read(res)
+    }
+
+    // RCoder vendored patch: shared tail for every response-header completion
+    // path (pre-arm early response and the bounded/plain wait above).
+    fn complete_response_header_read(
+        &mut self,
+        res: std::result::Result<http::Response<RecvStream>, h2::Error>,
+    ) -> Result<()> {
         let (resp, body_reader) = res.map_err(handle_read_header_error)?.into_parts();
         let response_header = ResponseHeader::from(resp);
         validate_response_header(&response_header)?;
@@ -949,6 +1012,218 @@ mod tests_h2 {
 
         let err = validate_response_header(&response).unwrap_err();
         assert_eq!(err.etype(), &InvalidHTTPHeader);
+    }
+
+    /// RCoder vendored-patch regression: the proxy driver detaches the request
+    /// body writer (`take_request_body_writer`) and streams DATA/END_STREAM
+    /// through the raw `SendStream`, so the session-side `ended` flag never
+    /// flips on that path. A configured `response_header_timeout` must still
+    /// bound the header wait once upload EOS was sent from the detached
+    /// writer (the driver notifies the session's end-stream signal).
+    #[tokio::test]
+    async fn detached_upload_end_stream_still_bounds_header_deadline() {
+        use tokio::io::duplex;
+
+        let (client_io, server_io) = duplex(65536);
+        let (request_body_done_tx, request_body_done_rx) = oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_io).await.unwrap();
+            if let Some(result) = conn.accept().await {
+                let (req, _send_resp) = result.unwrap();
+                assert_eq!(req.method(), http::Method::POST);
+                let mut body = req.into_body();
+                while let Some(chunk) = body.data().await {
+                    let chunk = chunk.unwrap();
+                    body.flow_control().release_capacity(chunk.len()).unwrap();
+                }
+                let _ = request_body_done_tx.send(());
+                // blackhole: never send the response header
+                std::future::pending::<()>().await;
+            }
+        });
+
+        let (send_req, connection) = h2::client::handshake(client_io).await.unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::watch::channel(false);
+        let ping_timeout = Arc::new(AtomicBool::new(false));
+        let connection_task = tokio::spawn(async move {
+            let _ = connection.await;
+            let _ = closed_tx.send(true);
+        });
+        let conn_ref = crate::connectors::http::v2::ConnectionRef::new(
+            send_req.clone(),
+            closed_rx,
+            ping_timeout,
+            0,
+            1,
+            Digest::default(),
+        );
+        let mut h2s = Http2Session::new(send_req, conn_ref);
+
+        // mirror the real driver: header without end, then the detached writer
+        // carries the body and END_STREAM
+        let mut req = RequestHeader::build("POST", b"/", None).unwrap();
+        req.insert_header(http::header::HOST, "example.com")
+            .unwrap();
+        h2s.write_request_header(Box::new(req), false).unwrap();
+        let end_stream_signal = h2s.request_end_stream_signal();
+        let mut writer = h2s.take_request_body_writer().expect("writer present");
+        writer
+            .send_data(Bytes::from_static(b"payload"), true)
+            .unwrap();
+        // the driver notifies the session once END_STREAM was sent on the
+        // detached writer (see the vendored proxy_h2 wiring)
+        end_stream_signal.notify_one();
+        request_body_done_rx
+            .await
+            .expect("server should consume the request body");
+
+        h2s.response_header_timeout = Some(Duration::from_millis(100));
+        let err = tokio::time::timeout(Duration::from_millis(400), h2s.read_response_header())
+            .await
+            .expect("header deadline must bound the detached-upload wait (4x budget)")
+            .expect_err("blackhole upstream must fail the header read");
+        assert!(
+            matches!(
+                err.etype,
+                crate::protocols::http::v1::client::RESPONSE_HEADER_TIMEDOUT
+            ),
+            "unexpected error type: {err:?}"
+        );
+
+        server_task.abort();
+        connection_task.abort();
+    }
+
+    /// RCoder vendored-patch regression: a header-deadline timeout on one
+    /// stream must only cancel that stream — a concurrent stream on the same
+    /// connection keeps working, and the timed-out stream is actually reset
+    /// (the server can no longer respond on it).
+    #[tokio::test]
+    async fn header_deadline_timeout_isolates_the_stream() {
+        use tokio::io::duplex;
+
+        let (client_io, server_io) = duplex(65536);
+        let (a_body_done_tx, a_body_done_rx) = oneshot::channel::<()>();
+        let (probe_a_reset_tx, probe_a_reset_rx) = oneshot::channel::<()>();
+        let (a_reset_observed_tx, a_reset_observed_rx) = oneshot::channel::<bool>();
+        let (b_done_tx, b_done_rx) = oneshot::channel::<bool>();
+        let mut probe_a_reset_rx = Some(probe_a_reset_rx);
+        let server_task = tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_io).await.unwrap();
+            let mut a_body_done_tx = Some(a_body_done_tx);
+            let mut probe_rx = probe_a_reset_rx.take();
+            let mut a_reset_observed_tx = Some(a_reset_observed_tx);
+            let mut b_done_tx = Some(b_done_tx);
+            while let Some(result) = conn.accept().await {
+                let (req, mut send_resp) = result.unwrap();
+                if req.method() == http::Method::POST {
+                    let body_done_tx = a_body_done_tx.take().expect("one POST stream");
+                    let mut probe_rx = probe_rx.take().expect("one POST stream");
+                    let observed_tx = a_reset_observed_tx.take().expect("one POST stream");
+                    tokio::spawn(async move {
+                        let mut body = req.into_body();
+                        while let Some(chunk) = body.data().await {
+                            let chunk = chunk.unwrap();
+                            body.flow_control().release_capacity(chunk.len()).unwrap();
+                        }
+                        let _ = body_done_tx.send(());
+                        // blackhole until the client reports the timeout, then
+                        // prove the stream was reset: poll_reset yields the
+                        // reset Reason once the peer cancels this stream
+                        let _ = probe_rx.await;
+                        let reset_reason =
+                            std::future::poll_fn(|cx| send_resp.poll_reset(cx)).await;
+                        let reset_observed =
+                            matches!(reset_reason, Ok(reason) if reason == h2::Reason::CANCEL);
+                        let _ = observed_tx.send(reset_observed);
+                    });
+                } else {
+                    let done_tx = b_done_tx.take().expect("one GET stream");
+                    tokio::spawn(async move {
+                        let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
+                        let _ = done_tx.send(send_resp.send_response(resp, true).is_ok());
+                    });
+                }
+            }
+        });
+
+        let (send_req, connection) = h2::client::handshake(client_io).await.unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::watch::channel(false);
+        let ping_timeout = Arc::new(AtomicBool::new(false));
+        let connection_task = tokio::spawn(async move {
+            let _ = connection.await;
+            let _ = closed_tx.send(true);
+        });
+        let conn_ref = crate::connectors::http::v2::ConnectionRef::new(
+            send_req.clone(),
+            closed_rx,
+            ping_timeout,
+            0,
+            2,
+            Digest::default(),
+        );
+
+        // stream A: detached upload + blackhole, with a 100ms header budget
+        let mut h2s_a = Http2Session::new(send_req.clone(), conn_ref.clone());
+        let mut req = RequestHeader::build("POST", b"/a", None).unwrap();
+        req.insert_header(http::header::HOST, "example.com")
+            .unwrap();
+        h2s_a.write_request_header(Box::new(req), false).unwrap();
+        let end_stream_signal = h2s_a.request_end_stream_signal();
+        let mut writer_a = h2s_a.take_request_body_writer().expect("writer present");
+        writer_a
+            .send_data(Bytes::from_static(b"payload"), true)
+            .unwrap();
+        end_stream_signal.notify_one();
+        h2s_a.response_header_timeout = Some(Duration::from_millis(100));
+        a_body_done_rx
+            .await
+            .expect("server should consume stream A body");
+
+        // stream B: normal request on the same connection while A blackholes
+        let mut h2s_b = Http2Session::new(send_req, conn_ref);
+        let mut req_b = RequestHeader::build("GET", b"/b", None).unwrap();
+        req_b
+            .insert_header(http::header::HOST, "example.com")
+            .unwrap();
+        h2s_b.write_request_header(Box::new(req_b), true).unwrap();
+        h2s_b.response_header_timeout = Some(Duration::from_millis(100));
+        h2s_b
+            .read_response_header()
+            .await
+            .expect("concurrent stream B must keep working");
+        assert_eq!(h2s_b.response_header().unwrap().status, StatusCode::OK);
+        assert!(b_done_rx.await.expect("stream B server handler"));
+
+        // stream A times out with the dedicated error type
+        let a_read = tokio::time::timeout(Duration::from_secs(1), h2s_a.read_response_header())
+            .await
+            .expect("stream A deadline must fire within 1s")
+            .expect_err("blackhole stream A must fail");
+        assert!(
+            matches!(
+                a_read.etype,
+                crate::protocols::http::v1::client::RESPONSE_HEADER_TIMEDOUT
+            ),
+            "unexpected stream A error type: {a_read:?}"
+        );
+        // dropping the session (with the taken writer) resets stream A
+        drop(h2s_a);
+        drop(writer_a);
+        probe_a_reset_tx
+            .send(())
+            .expect("server still probing stream A");
+        let reset_observed = tokio::time::timeout(Duration::from_secs(2), a_reset_observed_rx)
+            .await
+            .expect("server must report the stream A probe within 2s")
+            .expect("reset observation channel intact");
+        assert!(
+            reset_observed,
+            "the timed-out stream must be reset for the server (poll_reset)"
+        );
+
+        server_task.abort();
+        connection_task.abort();
     }
 
     #[test]
