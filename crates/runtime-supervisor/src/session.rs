@@ -499,6 +499,8 @@ impl OwnerSession {
             core: core.clone(),
             business: None,
             cleanup: None,
+            cleanup_abandoned: false,
+            owner_cleanup_abandoned: false,
             pending_binding,
             next_cleanup: tokio::time::Instant::now(),
             next_discovery_check: tokio::time::Instant::now(),
@@ -795,6 +797,16 @@ struct RunState {
     core: Arc<SessionCore>,
     business: Option<ActiveBusiness>,
     cleanup: Option<CleanupSlot>,
+    /// Generation cleanup concluded as UNCONFIRMED because the process is
+    /// exiting and the external engine channel (e.g. a supervisord already in
+    /// SHUTDOWN_STATE) rejects every retry. Futile retries stop; the record
+    /// keeps RecoveryRequired and the shutdown exit proceeds without
+    /// publishing Stopped.
+    cleanup_abandoned: bool,
+    /// Same conclusion for the owner-resource cleanup (resident/engine
+    /// shutdown adapters): while the process itself is exiting, a failing
+    /// adapter is recorded unconfirmed instead of being retried forever.
+    owner_cleanup_abandoned: bool,
     /// Retain the original binding while any old receipt may still need it.
     pending_binding: Option<control::Binding>,
     next_cleanup: tokio::time::Instant,
@@ -918,6 +930,17 @@ impl RunState {
             return match result {
                 Ok(()) => Ok(true),
                 Err(error) => {
+                    if self.shutdown.is_cancelled() {
+                        // While the process itself is exiting (outer container
+                        // teardown), retrying the owner-resource adapter is
+                        // deterministically futile: keep the unconfirmed
+                        // record above and let the shutdown exit proceed.
+                        tracing::warn!(
+                            "owner resource cleanup abandoned during process shutdown; outcome stays unconfirmed"
+                        );
+                        self.owner_cleanup_abandoned = true;
+                        return Ok(true);
+                    }
                     self.next_owner_cleanup = tokio::time::Instant::now() + Duration::from_secs(1);
                     self.core.with_discovery(|discovery| {
                         discovery.snapshot.phase = Phase::RecoveryRequired;
@@ -1130,12 +1153,28 @@ impl RunState {
                         );
                     }
                     Err(error) => {
+                        self.core.record_problem(&error)?;
+                        if self.shutdown.is_cancelled() {
+                            // The process itself is exiting: the external
+                            // engine (here: supervisord XML-RPC) is shutting
+                            // down with the container, so every retry is
+                            // deterministically futile. Keep the unconfirmed
+                            // record, drop the slot, and let the shutdown exit
+                            // proceed. The next boot's reconciliation fence
+                            // settles the residue by the existing recovery
+                            // chain; this never becomes a Stopped success.
+                            tracing::warn!(
+                                generation = %slot.generation,
+                                "generation cleanup abandoned during process shutdown; outcome stays unconfirmed"
+                            );
+                            self.cleanup_abandoned = true;
+                            return Ok(());
+                        }
                         // Receipt handed back by the task drives the bounded
                         // retry; never publish Stopped or success here.
                         slot.value = Some(returned);
                         slot.next_attempt = tokio::time::Instant::now() + Duration::from_secs(2);
                         self.cleanup = Some(slot);
-                        self.core.record_problem(&error)?;
                     }
                 }
             }
@@ -1222,14 +1261,25 @@ impl RunState {
         tick.tick().await;
         loop {
             // Shutdown completes only after the background cleanup settles
-            //（R2.2：不因进程退出把未确认清理写成 Stopped）。
+            //（R2.2：不因进程退出把未确认清理写成 Stopped）。例外：清理已按
+            // “进程退出中、外部通道关闭”显式放弃（cleanup_abandoned）——此时
+            // 保留未确认记录直接退出，不得伪装 Stopped，也不得无限重试。
             let owner_shutdown =
                 self.shutdown.is_cancelled() || self.core.intent() == Intent::Shutdown;
+            let cleanup_unconfirmed = self.cleanup_abandoned || self.owner_cleanup_abandoned;
             if owner_shutdown
                 && !self.cleanup_pending()
-                && self.fence_cleared()
+                && (self.fence_cleared() || cleanup_unconfirmed)
                 && self.owner_resources_quiescent().await?
             {
+                if cleanup_unconfirmed {
+                    // record_problem 已写 RecoveryRequired + 问题记录；这里
+                    // 不发布 Stopped、不清 problem——进程退出但清理未确认。
+                    tracing::warn!(
+                        "owner exits during shutdown with unconfirmed generation cleanup; the recovery fence retains the record"
+                    );
+                    return Ok(IdleFlow::Shutdown);
+                }
                 self.core.with_discovery(|discovery| {
                     if discovery.snapshot.intent != Intent::Shutdown {
                         discovery.snapshot.intent = Intent::Shutdown;
@@ -1903,6 +1953,98 @@ mod tests {
             .await
             .unwrap(),
         )
+    }
+
+    /// app-runtime-stop-slow §2.2（夹具复现）：进程自身退出中，外部引擎清理
+    /// 通道（supervisord 已入 SHUTDOWN_STATE 拒绝 XML-RPC）确定性失效。
+    /// 此时必须**放弃**无效重试（预修复行为：poll_cleanup 每 2s 无限重臂，
+    /// drive_idle 永不返回→容器 90s 被 SIGKILL），保留未确认记录退出：
+    /// 快照保持 RecoveryRequired（绝不伪装 Stopped），问题记录在案。
+    #[tokio::test]
+    async fn process_shutdown_abandons_failing_generation_cleanup_instead_of_retrying_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let shutdown = CancellationToken::new();
+        let session = Arc::new(
+            OwnerSession::start(
+                Owner::try_acquire(dir.path()).unwrap().unwrap(),
+                SessionOptions {
+                    binding: control::Binding {
+                        component: "app-cli".into(),
+                        resource: dir.path().to_path_buf(),
+                    },
+                    policy: crate::Policy::default(),
+                    cleanup_adapter: None,
+                    restart_on_exit: true,
+                    shutdown: shutdown.clone(),
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let id = uuid::Uuid::new_v4().to_string();
+        let work = record::work_root(dir.path(), &id).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        let generation = record::Generation {
+            version: 1,
+            id: id.clone(),
+            supervisor: session.snapshot().supervisor_id.clone(),
+            token: "fixture".into(),
+            intent: Intent::Stopped,
+            phase: record::GenerationPhase::Draining,
+            worker_pid: None,
+            exit_code: None,
+            error: None,
+            physical_domain: None,
+            process_epoch: None,
+        };
+        record::save(&work.join("generation.json"), &generation).unwrap();
+        session
+            .core
+            .mark_pending_cleanup("generation cleanup held by the fixture".into())
+            .unwrap();
+        let mut state = session.run.lock().unwrap().take().unwrap();
+        let failing = generation.clone();
+        state.cleanup = Some(CleanupSlot {
+            generation: id.clone(),
+            root: work.clone(),
+            lock: record::lock(&work.join("generation.lock")).unwrap(),
+            task: Some(AbortOnDrop(tokio::spawn(async move {
+                (
+                    failing,
+                    Err::<(), anyhow::Error>(anyhow::anyhow!(
+                        "external engine cleanup failed: supervisord fault 6 SHUTDOWN_STATE"
+                    )) as Result<()>,
+                )
+            }))),
+            value: None,
+            next_attempt: tokio::time::Instant::now(),
+        });
+        // 进程正在退出（外层容器拆除已发 TERM）。
+        shutdown.cancel();
+        let mut factory: BusinessFactory = Box::new(|_| panic!("shutdown must not relaunch"));
+        let exit = tokio::time::timeout(Duration::from_secs(20), state.drive_idle(&mut factory))
+            .await
+            .expect("drive_idle must return after abandoning the futile cleanup retry")
+            .unwrap();
+        assert!(
+            matches!(exit, IdleFlow::Shutdown),
+            "the shutdown exit proceeds with the unconfirmed record"
+        );
+        let after = crate::last_snapshot(dir.path()).unwrap();
+        assert_ne!(
+            after.phase,
+            Phase::Stopped,
+            "an abandoned cleanup must never be published as Stopped"
+        );
+        assert!(
+            after.problem.is_some(),
+            "the unconfirmed outcome keeps its recorded problem"
+        );
+        assert_eq!(
+            record::generation(&work).unwrap().phase,
+            record::GenerationPhase::Draining,
+            "the generation never reaches Quiescent without a confirmed cleanup"
+        );
     }
 
     #[tokio::test]

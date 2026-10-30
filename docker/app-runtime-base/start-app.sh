@@ -77,13 +77,16 @@ command=/usr/local/bin/app-cli serve
 directory=$WS/code
 priority=40
 autostart=true
-autorestart=true
-startsecs=5
+; The CLI supervisor handles worker recovery. Explicit shutdown exits 0 and
+; must not be undone by the outer service manager, even during early startup.
+autorestart=unexpected
+exitcodes=0
+startsecs=0
 startretries=10
 stopsignal=TERM
 stopasgroup=true
 killasgroup=true
-stopwaitsecs=45
+stopwaitsecs=90
 environment=APP_CLI_WORKSPACE="$WS/code",APP_CLI_LOG_DIR="/home/user/logs"
 stdout_logfile=/home/user/logs/app-cli.out.log
 stderr_logfile=/home/user/logs/app-cli.err.log
