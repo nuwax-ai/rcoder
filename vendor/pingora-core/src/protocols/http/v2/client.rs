@@ -247,9 +247,17 @@ impl Http2Session {
             {
                 Ok(res) => res,
                 Err(_) => {
-                    let deadline_exhausted = self
-                        .response_header_deadline
-                        .is_some_and(|deadline| TokioInstant::now() >= deadline);
+                    // With no per-read timeout the absolute header deadline is
+                    // the only bound, so a fired timer is that deadline (the
+                    // timer wheel rounds to 10ms ticks and may fire marginally
+                    // early); otherwise attribute to the header deadline only
+                    // once it has actually elapsed.
+                    let deadline_exhausted = match read_timeout {
+                        None => self.response_header_deadline.is_some(),
+                        Some(_) => self
+                            .response_header_deadline
+                            .is_some_and(|deadline| TokioInstant::now() >= deadline),
+                    };
                     let error = if deadline_exhausted {
                         Error::explain(
                             RESPONSE_HEADER_TIMEDOUT,

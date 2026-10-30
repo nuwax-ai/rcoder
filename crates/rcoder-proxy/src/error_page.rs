@@ -136,7 +136,8 @@ impl ErrorPageRenderer {
         let meta_refresh = if manual_refresh_only(vars.cause_slug.as_str()) {
             ""
         } else {
-            "<meta http-equiv=\"refresh\" content=\"5\">\n    "
+            // 与原模板逐字节同形：meta 行 + 换行后紧跟 <title>
+            "<meta http-equiv=\"refresh\" content=\"5\">\n"
         };
         let mut rendered = template
             .replace(VAR_TITLE, &html_escape(&vars.title))

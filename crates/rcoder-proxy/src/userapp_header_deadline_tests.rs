@@ -59,6 +59,8 @@ impl shared_types::AppWakeControl for RunningWakeControl {
 struct BackendObs {
     /// 收到完整请求（头+body）的连接数。
     completed: AtomicUsize,
+    /// Dribble1xx 形态下成功写出的滴字节数（负载无关的 deadline 语义信号）。
+    dribble_bytes: AtomicUsize,
 }
 
 /// 读到响应头结束（\r\n\r\n）为止的原始字节。
@@ -85,7 +87,7 @@ async fn read_header_bytes(stream: &mut TcpStream) -> Vec<u8> {
 /// `bind(:0)` 与外联连接的分配来源，释放→代理绑定之间的窗口会被并发监听
 /// 者抢占（满载全量跑实测：请求落到别人的代理，收到与 fixture 无关的
 /// 响应）。改为在临时段以下随机取显式端口——内核不会自动分配该区间，
-/// 只有显式绑定者会触碰；同套件内仅本文件 9 个用例使用，随机起点下撞
+/// 只有显式绑定者会触碰；同套件内仅本文件 8 个用例使用，随机起点下撞
 /// 率可忽略，撞了（bind 失败）换一个重试。
 fn reserve_port() -> u16 {
     let mut seed = std::time::SystemTime::now()
@@ -146,12 +148,15 @@ fn prod_backend_unregister(host: &str) {
 enum HangBehavior {
     /// 永不回响应头（黑洞形态）。
     Silent,
-    /// 先回 100-continue，然后每 250ms 滴一个字节的真实响应头行（永不完成
-    /// 头部）——零碎头字节/1xx 不得重置绝对 deadline。
+    /// 等 500ms 先回 100-continue，然后每 250ms 滴一个字节的真实响应头行
+    /// （永不完成头部）。绝对 deadline 语义的反例锚点：若 1xx 或零碎头
+    /// 字节错误地重置计时，deadline 会被推迟/无限延长；`sent_dribble_bytes`
+    /// 记录代理终结交换前后端成功滴出的字节数，作为与负载无关的判定信号。
     Dribble1xx,
 }
 
-/// 启动挂起后端；`obs.completed` 在每条连接读完**完整请求**（头+body）时递增。
+/// 启动挂起后端；`obs.completed` 在每条连接读完**完整请求**（头+body）时递增；
+/// `obs.dribble_bytes` 记录 Dribble1xx 形态下实际写出的滴字节总数。
 async fn spawn_hang_backend(listener: TcpListener, behavior: HangBehavior) -> Arc<BackendObs> {
     let obs = Arc::new(BackendObs::default());
     let obs_for_task = obs.clone();
@@ -188,9 +193,18 @@ async fn spawn_hang_backend(listener: TcpListener, behavior: HangBehavior) -> Ar
                         std::future::pending::<()>().await;
                     }
                     HangBehavior::Dribble1xx => {
+                        // 1xx 故意延迟 800ms：绝对 deadline（1s 槽）在 ~1.0s
+                        // 终结——后端只来得及滴出 ~2-3 字节（0.8s/1.05s/…）；
+                        // 若实现错误地在 1xx 处重置计时，deadline 推到 ~1.8s，
+                        // 滴出 ≥4 字节（0.8/1.05/1.3/1.55/1.8）；若每次滴字节
+                        // 重置则永不终结（外层 guard 失败）。
+                        tokio::time::sleep(Duration::from_millis(800)).await;
                         drop(socket.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await);
                         for byte in b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n" {
-                            drop(socket.write_all(&[*byte]).await);
+                            if socket.write_all(&[*byte]).await.is_err() {
+                                break; // 代理已按 deadline 终结并回收上游连接
+                            }
+                            obs.dribble_bytes.fetch_add(1, Ordering::SeqCst);
                             tokio::time::sleep(Duration::from_millis(250)).await;
                         }
                         std::future::pending::<()>().await;
@@ -398,16 +412,18 @@ async fn exchange(proxy_port: u16, request: &[u8], guard: Duration) -> String {
     String::from_utf8_lossy(&response).to_string()
 }
 
-/// 零碎响应头 + 100-continue 不能延长预算：后端先回 1xx、再每 250ms 滴一个
-/// 头字节永不完成——绝对 deadline（1s 槽 + 松弛）内必须 504，且总时长明显
-/// 小于"若每次滴字节重置预算"的假想时长（滴字节持续 >2s 仍被 1s 槽终结）。
+/// 零碎响应头 + 100-continue 不能延长预算：后端 800ms 后回 1xx、再每 250ms
+/// 滴一个头字节永不完成。绝对 deadline（1s 槽）内必须 504；且用后端实际
+/// 滴出的字节数做**负载无关**判定：绝对 deadline 终结在 ~1.0-1.3s（滴出
+/// ≤3 字节）；若 1xx 重置计时则终结在 ~1.8s（≥4 字节）；若每次滴字节重置
+/// 则永不终结（外层 guard 失败）。
 #[tokio::test]
 async fn dribbling_1xx_headers_cannot_extend_the_budget() {
     let backend_listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind dribble backend");
     let backend_port = backend_listener.local_addr().expect("backend addr").port();
-    spawn_hang_backend(backend_listener, HangBehavior::Dribble1xx).await;
+    let obs = spawn_hang_backend(backend_listener, HangBehavior::Dribble1xx).await;
 
     let backend_host = prod_backend_host(backend_port);
     let (proxy_port, stop, proxy_task) =
@@ -425,9 +441,13 @@ async fn dribbling_1xx_headers_cannot_extend_the_budget() {
         response.contains("HTTP/1.1 504"),
         "504 must terminate the dribbling exchange: {response}"
     );
+    // 负载无关锚点：绝对 deadline 终结在 1s 槽附近，后端只来得及滴出极少
+    // 字节（首字节 800ms、之后每 250ms 一枚；1xx-重置回归会滴出 ≥4 枚）。
+    let dribbled = obs.dribble_bytes.load(Ordering::SeqCst);
     assert!(
-        started.elapsed() < Duration::from_secs(4),
-        "absolute deadline must not be reset by 1xx/dribbled bytes: {:?}",
+        dribbled <= 3,
+        "absolute deadline must not be reset by 1xx/dribbled bytes: \
+         {dribbled} bytes dribbled before termination, elapsed={:?}",
         started.elapsed()
     );
     assert!(started.elapsed() >= Duration::from_millis(900));
