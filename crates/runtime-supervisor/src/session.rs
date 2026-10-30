@@ -930,18 +930,6 @@ impl RunState {
             return match result {
                 Ok(()) => Ok(true),
                 Err(error) => {
-                    if self.shutdown.is_cancelled() {
-                        // While the process itself is exiting (outer container
-                        // teardown), retrying the owner-resource adapter is
-                        // deterministically futile: keep the unconfirmed
-                        // record above and let the shutdown exit proceed.
-                        tracing::warn!(
-                            "owner resource cleanup abandoned during process shutdown; outcome stays unconfirmed"
-                        );
-                        self.owner_cleanup_abandoned = true;
-                        return Ok(true);
-                    }
-                    self.next_owner_cleanup = tokio::time::Instant::now() + Duration::from_secs(1);
                     self.core.with_discovery(|discovery| {
                         discovery.snapshot.phase = Phase::RecoveryRequired;
                         discovery.snapshot.error =
@@ -952,6 +940,19 @@ impl RunState {
                         });
                         Ok(())
                     })?;
+                    if self.shutdown.is_cancelled() {
+                        // While the process itself is exiting (outer container
+                        // teardown), retrying the owner-resource adapter is
+                        // deterministically futile: the unconfirmed record is
+                        // already written above; let the shutdown exit proceed
+                        // instead of re-arming the one-second retry forever.
+                        tracing::warn!(
+                            "owner resource cleanup abandoned during process shutdown; outcome stays unconfirmed"
+                        );
+                        self.owner_cleanup_abandoned = true;
+                        return Ok(true);
+                    }
+                    self.next_owner_cleanup = tokio::time::Instant::now() + Duration::from_secs(1);
                     Ok(false)
                 }
             };
