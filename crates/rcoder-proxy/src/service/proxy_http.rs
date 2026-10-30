@@ -52,20 +52,21 @@ async fn wait_for_peer_connection(peer: &HttpPeer, deadline: tokio::time::Instan
 }
 
 impl PortProxy {
-    /// UserApp app dev/prod：为 peer 套上"等待上游最终响应头"阶段预算。
+    /// UserApp app dev/prod：首头阶段预算的**重试准入墙钟**与按尝试分配。
     ///
-    /// 语义（复审明确的边界）：ctx 在**首次 upstream_peer（选 peer、拨号
-    /// 之前）**武装绝对 deadline；库侧在该次尝试的请求 EOS 后起算所传入
-    /// 的剩余时长。单次尝试因此与阶段语义一致——上传耗时不计入（EOS 后
-    /// 仍有完整预算）。跨重试共享的是**自首次选 peer 起的墙钟剩余**：前
-    /// 次尝试的上传/建连/等待都从预算中扣除（重连不得重新获得完整预算），
-    /// 最后一次尝试自身的建连+上传会带来相应超界——总时长有界优先于
-    /// 严格只累计首头等待（后者需驱动配合回报，无法在库外精确计量）。
-    /// 预算在拨号前已耗尽时按同一超时身份直接失败——不再发起新的上游
-    /// 交换（避免制造结果未知的写入）。依赖补丁在 Pingora 驱动层按请求
-    /// EOS 后起算、最终头（含 101）到达即止；SSE/WS/上传/正文不受本预算
-    /// 影响（跨重试共享语义见 `retry_after_reused_connection_reset_shares_
-    /// the_header_budget` 回归）。
+    /// 语义（独立增量终审确认的取舍，用词对齐 2026-10-30）：
+    /// - ctx 在**首次 upstream_peer（选 peer、拨号之前）**武装绝对 deadline
+    ///   （重试准入墙钟）；库侧在该次尝试的请求 EOS 后起算所分配的剩余
+    ///   时长——**单次尝试内**上传耗时不计入该尝试的首头等待。
+    /// - 该 deadline 是**重试准入边界，不是整次请求的总终止 deadline**：
+    ///   耗尽后不再发起新的上游尝试（拨号前按同一超时身份直接失败，不
+    ///   制造结果未知的写入）；已获准的最后一次尝试仍可跨过该时间点——
+    ///   完成上传，再等待其选 peer 时分配到的剩余时长。因此整次请求不
+    ///   保证严格 60s 结束；慢上传虽受保护（首尝试内不计入首头等待），
+    ///   但会消耗后续重试的准入资格。
+    /// - 不因预算耗尽自动重放；既有安全重试约束（幂等方法、ReusedOnly、
+    ///   请求体缓冲重放）不变。SSE/WS/正文不受本预算影响；真实重放重试
+    ///   的回归见 `retry_after_reused_connection_reset_shares_the_header_budget`。
     fn apply_userapp_header_budget(
         &self,
         ctx: &mut TrackingCtx,
@@ -76,10 +77,11 @@ impl PortProxy {
             return Ok(());
         }
         let deadline = ctx
-            .userapp_header_deadline
+            .userapp_retry_admission_deadline
             .get_or_insert(tokio::time::Instant::now() + self.userapp_response_header_timeout());
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
+            // 准入墙钟已耗尽：不再发起新的上游交换（避免制造结果未知的写入）
             return Err(pingora_core::Error::new(response_header_timeout_etype())
                 .more_context("userapp response header budget exhausted before dial"));
         }
@@ -1722,9 +1724,9 @@ mod tests {
         create_router().expect("router build")
     }
 
-    /// 首头预算只套 UserApp app dev/prod 两类路由；重试共享剩余预算
-    /// （重连不得重新获得完整预算）。非 app 路由完全不套（LLM API/VNC/
-    /// ttyd/dbx 等保持原行为）。
+    /// 首头预算只套 UserApp app dev/prod 两类路由；重试受重试准入墙钟约束
+    /// （重连不得重新获得完整预算，耗尽即不再准入新尝试）。非 app 路由
+    /// 完全不套（LLM API/VNC/ttyd/dbx 等保持原行为）。
     #[tokio::test]
     async fn userapp_header_budget_scopes_to_app_routes_and_shares_remaining() {
         let service =
@@ -1737,13 +1739,13 @@ mod tests {
         proxy
             .apply_userapp_header_budget(&mut ctx, RouteType::RuntimeTtydProxy, &mut peer)
             .expect("non-app route is out of scope");
-        assert!(ctx.userapp_header_deadline.is_none());
+        assert!(ctx.userapp_retry_admission_deadline.is_none());
         assert!(peer.options.response_header_timeout.is_none());
 
         proxy
             .apply_userapp_header_budget(&mut ctx, RouteType::ProdAppProxy, &mut peer)
             .expect("prod app route arms the budget");
-        assert!(ctx.userapp_header_deadline.is_some());
+        assert!(ctx.userapp_retry_admission_deadline.is_some());
         assert!(peer.options.response_header_timeout.unwrap() <= Duration::from_millis(1500));
 
         tokio::time::sleep(Duration::from_millis(300)).await;

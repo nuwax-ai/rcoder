@@ -316,11 +316,12 @@ pub struct TrackingCtx {
     pub error_replacement_emitted: bool,
     /// Request-scoped deadline and retry state for prod UserApp connections.
     pub app_connect_recovery: Option<AppConnectRecovery>,
-    /// UserApp app 路由"等待上游最终响应头"阶段预算的绝对 deadline（首次
-    /// upstream_peer 武装；跨重试共享剩余预算——重连不得重新获得完整预算）。
-    /// None = 未启用（非 UserApp app 路由）。预算只覆盖请求 EOS 后到最终
-    /// 响应头的等待，不影响上传/SSE/WS/正文。
-    pub userapp_header_deadline: Option<tokio::time::Instant>,
+    /// UserApp app 路由首头预算的**重试准入墙钟**（首次 upstream_peer 武装；
+    /// 耗尽后不再准入新的上游尝试，已获准尝试照常完成）。None = 未启用
+    /// （非 UserApp app 路由）。这是重试准入边界，**不是**整次请求的总
+    /// 终止 deadline：已获准的最后一次尝试可跨过该时间点（完成上传后
+    /// 等待其分配到的剩余首头预算），慢上传也会消耗后续重试的准入资格。
+    pub userapp_retry_admission_deadline: Option<tokio::time::Instant>,
     /// Keep prod app request counting stable across retries, including route failures.
     pub prod_request_recorded: bool,
     /// Only one handler metric increment and active gauge increment per request.
@@ -364,7 +365,7 @@ impl TrackingCtx {
             preview_forward_port: None,
             preview_origin_port: None,
             app_connect_recovery: None,
-            userapp_header_deadline: None,
+            userapp_retry_admission_deadline: None,
             prod_request_recorded: false,
             prod_metrics_counted: false,
             dev_request_recorded: false,

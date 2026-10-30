@@ -9,13 +9,15 @@
 //!
 //! - 绝对单调 deadline：请求 EOS（含 body）发完后起算，零碎头字节/100/103
 //!   不重新起表；合法 101 即止；最终头到达即取消 timer——SSE 已回头、WS
-//!   已升级、慢上传、下载正文不受影响；
+//!   已升级、单次尝试内的慢上传、下载正文不受影响；
 //! - 超时只终结该上游交换（H1 连接不回收复用；H2 只结束本流），错误带
 //!   独立身份 `ResponseHeaderTimedout`（与普通 ReadTimedout 区分）；
 //! - 超时映射 504 + 既有本地错误页管线（浏览器 HTML / API JSON），文案
 //!   不宣称应用已停止，超时档不自动刷新（避免自动重复触发业务，特别是
 //!   结果可能仍在处理中的写请求）；
-//! - 重试共享剩余预算（ctx 绝对 deadline），POST 不自动重放。
+//! - 重试受**重试准入墙钟**约束（首次选 peer 起 60s 后不再准入新尝试；
+//!   已获准尝试完成上传后等待其分配到的剩余首头预算——整次请求不保证
+//!   严格 60s 结束，慢上传会消耗后续重试资格），POST 不自动重放。
 //!
 //! 全部用例经真实 `PingoraServerManager`（`ProxyServiceWrapper` →
 //! `PortProxy`）与真实 dev/prod app 代理路由。压缩用例用测试槽
@@ -954,12 +956,12 @@ async fn spawn_retry_budget_backend(listener: TcpListener) -> Arc<BackendObs> {
     obs
 }
 
-/// 重试共享首头预算的真实回归（独立复审边界项）：复用连接在请求写出后
+/// 重试准入墙钟的真实回归（独立复审边界项）：复用连接在请求写出后
 /// ~700ms 被 RST → 幂等 PUT 走 Pingora 既有安全重试 → 重放连接黑洞。
-/// 共享语义（自首次选 peer 起的墙钟剩余）下 504 在 ~1s（1s 槽）附近；
-/// 若每次重连重新获得完整预算，则要在重放 EOS（~0.75s）之后再等满 1s
-/// （~1.75s）——1400ms 上限区分两者。全程经真实代理链路（含连接池复用、
-/// RST 错误分类与请求体缓冲重放），非 helper sleep 等价。
+/// 准入墙钟语义（首次选 peer 起扣减、重试分配剩余）下 504 在 ~1s（1s
+/// 槽）附近；若每次重连重新获得完整预算，则要在重放 EOS（~0.75s）之后
+/// 再等满 1s（~1.75s）——1400ms 上限区分两者。全程经真实代理链路（含
+/// 连接池复用、RST 错误分类与请求体缓冲重放），非 helper sleep 等价。
 #[tokio::test]
 async fn retry_after_reused_connection_reset_shares_the_header_budget() {
     let backend_listener = TcpListener::bind("127.0.0.1:0")
