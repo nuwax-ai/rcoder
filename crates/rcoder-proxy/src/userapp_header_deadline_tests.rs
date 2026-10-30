@@ -59,6 +59,8 @@ impl shared_types::AppWakeControl for RunningWakeControl {
 struct BackendObs {
     /// 收到完整请求（头+body）的连接数。
     completed: AtomicUsize,
+    /// 收到的连接总数（重试次数断言用）。
+    accepted: AtomicUsize,
     /// Dribble1xx 形态下成功写出的滴字节数（负载无关的 deadline 语义信号）。
     dribble_bytes: AtomicUsize,
 }
@@ -165,6 +167,7 @@ async fn spawn_hang_backend(listener: TcpListener, behavior: HangBehavior) -> Ar
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
             };
+            obs_for_task.accepted.fetch_add(1, Ordering::SeqCst);
             let obs = obs_for_task.clone();
             tokio::spawn(async move {
                 let header = read_header_bytes(&mut socket).await;
@@ -871,6 +874,150 @@ async fn request_after_timeout_is_not_poisoned_by_the_old_timer() {
 
     prod_backend_unregister(&hang_host);
     prod_backend_unregister(&ok_host);
+    stop.send(()).expect("stop isolated proxy");
+    tokio::time::timeout(Duration::from_secs(10), proxy_task)
+        .await
+        .expect("proxy shutdown deadline")
+        .expect("join proxy task");
+}
+
+/// 重试预算共享后端：连接 #1 服务一次 keep-alive 预热 GET 后被 PUT 复用——
+/// 完整读取 PUT、700ms 后以 RST（SO_LINGER=0）断开，触发 Pingora 既有
+/// ReusedOnly 重试（幂等 PUT + 请求体缓冲重放）；连接 #2 完整接收重放的
+/// PUT 后黑洞。`completed` 只计连接 #2（重试到达的证明）。
+async fn spawn_retry_budget_backend(listener: TcpListener) -> Arc<BackendObs> {
+    let obs = Arc::new(BackendObs::default());
+    let obs_for_task = obs.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let ordinal = obs_for_task.accepted.fetch_add(1, Ordering::SeqCst) + 1;
+            let obs = obs_for_task.clone();
+            tokio::spawn(async move {
+                if ordinal == 1 {
+                    // 预热 GET：keep-alive 响应让代理把该连接放回上游池
+                    let _warmup = read_header_bytes(&mut socket).await;
+                    drop(
+                        socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .await,
+                    );
+                    // 同一连接上的复用 PUT：读完整请求（刻意留 1 字节不读——
+                    // 关闭时接收缓冲非空会让内核发 RST 而非 FIN），700ms 后断开
+                    let header = read_header_bytes(&mut socket).await;
+                    let content_length = header
+                        .split(|&b| b == b'\n')
+                        .map(|line| String::from_utf8_lossy(line).to_ascii_lowercase())
+                        .find_map(|line| {
+                            let value = line.strip_prefix("content-length:")?.trim().to_string();
+                            value.parse::<usize>().ok()
+                        })
+                        .unwrap_or(0);
+                    let mut body = Vec::new();
+                    while body.len() + 1 < content_length {
+                        let want = (content_length - 1 - body.len()).min(4096);
+                        let mut chunk = vec![0u8; want];
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => body.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                    drop(socket);
+                } else {
+                    // 重试连接：完整接收重放的 PUT 后黑洞
+                    let header = read_header_bytes(&mut socket).await;
+                    let content_length = header
+                        .split(|&b| b == b'\n')
+                        .map(|line| String::from_utf8_lossy(line).to_ascii_lowercase())
+                        .find_map(|line| {
+                            let value = line.strip_prefix("content-length:")?.trim().to_string();
+                            value.parse::<usize>().ok()
+                        })
+                        .unwrap_or(0);
+                    let mut body = Vec::new();
+                    while body.len() < content_length {
+                        let mut chunk = [0u8; 4096];
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => body.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    obs.completed.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                }
+            });
+        }
+    });
+    obs
+}
+
+/// 重试共享首头预算的真实回归（独立复审边界项）：复用连接在请求写出后
+/// ~700ms 被 RST → 幂等 PUT 走 Pingora 既有安全重试 → 重放连接黑洞。
+/// 共享语义（自首次选 peer 起的墙钟剩余）下 504 在 ~1s（1s 槽）附近；
+/// 若每次重连重新获得完整预算，则要在重放 EOS（~0.75s）之后再等满 1s
+/// （~1.75s）——1400ms 上限区分两者。全程经真实代理链路（含连接池复用、
+/// RST 错误分类与请求体缓冲重放），非 helper sleep 等价。
+#[tokio::test]
+async fn retry_after_reused_connection_reset_shares_the_header_budget() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind retry backend");
+    let backend_port = backend_listener.local_addr().expect("backend addr").port();
+    let obs = spawn_retry_budget_backend(backend_listener).await;
+
+    let backend_host = prod_backend_host(backend_port);
+    let (proxy_port, stop, proxy_task) =
+        start_proxy_with_slot(backend_port, &backend_host, "retryapp").await;
+
+    // 预热：一次 GET 让上游连接进入代理连接池（keep-alive）
+    let warmup = exchange(
+        proxy_port,
+        b"GET /api/v1/userapp/proxy/app/prod/u1/retryapp/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        Duration::from_secs(6),
+    )
+    .await;
+    assert!(warmup.starts_with("HTTP/1.1 200"), "{warmup}");
+
+    // 幂等 PUT + 一次性完整 body（代理缓冲后写往复用连接）
+    let body = vec![b'p'; 1024];
+    let mut request = format!(
+        "PUT /api/v1/userapp/proxy/app/prod/u1/retryapp/submit HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(&body);
+
+    let started = Instant::now();
+    let response = exchange(proxy_port, &request, Duration::from_secs(6)).await;
+    let elapsed = started.elapsed();
+    assert!(
+        response.starts_with("HTTP/1.1 504"),
+        "shared budget must end in the timeout tier: {response}"
+    );
+    assert!(
+        response.contains("\"reason\":\"upstream_response_timeout\""),
+        "{response}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(950) && elapsed <= Duration::from_millis(1400),
+        "retry must share the remaining wall budget from first peer selection \
+         (fresh full budget after replay would land ~1.75s): {elapsed:?}"
+    );
+    assert_eq!(
+        obs.accepted.load(Ordering::SeqCst),
+        2,
+        "exactly one warmup+PUT connection and one retry connection"
+    );
+    assert_eq!(
+        obs.completed.load(Ordering::SeqCst),
+        1,
+        "the replayed PUT must reach the retry connection in full"
+    );
+
+    prod_backend_unregister(&backend_host);
     stop.send(()).expect("stop isolated proxy");
     tokio::time::timeout(Duration::from_secs(10), proxy_task)
         .await
