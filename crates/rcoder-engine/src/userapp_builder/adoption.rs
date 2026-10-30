@@ -119,6 +119,16 @@ pub(super) async fn resume_pending(
     Ok(true)
 }
 
+/// Run an already-admitted adoption operation inline. The caller holds the
+/// workload admission and the local lifecycle lock (same order as `execute`);
+/// only an admitted registration-confirmation intent may use this entry.
+pub(crate) async fn run_admitted(
+    state: &AppState,
+    record: UserAppOperationRecord,
+) -> Result<BuilderControlResult> {
+    run(state, record).await
+}
+
 async fn run(state: &AppState, record: UserAppOperationRecord) -> Result<BuilderControlResult> {
     let executor = uuid::Uuid::new_v4().to_string();
     let claimed = state
@@ -168,8 +178,8 @@ async fn run(state: &AppState, record: UserAppOperationRecord) -> Result<Builder
             if target.context != context {
                 return Err(anyhow!("Adoption capture context mismatch"));
             }
-            let repair = capture_registration_repair(state, &target).await?;
-            Ok::<_, anyhow::Error>((target, repair))
+            let registration = capture_registration(state, &target).await?;
+            Ok::<_, anyhow::Error>((target, registration))
         }
         .await;
         // Inspection has no remote writes. Release the runtime read fence before
@@ -178,7 +188,7 @@ async fn run(state: &AppState, record: UserAppOperationRecord) -> Result<Builder
         lease.finish_read_only().await.map_err(anyhow::Error::msg)?;
         lease_uncertain = false;
 
-        let (target, repair) = inspected?;
+        let (target, registration) = inspected?;
         let workload = target
             .workload
             .ok_or_else(|| anyhow!("Builder disappeared before adoption"))?;
@@ -192,21 +202,37 @@ async fn run(state: &AppState, record: UserAppOperationRecord) -> Result<Builder
         let result = BuilderControlResult {
             operation_id: context.operation_id.clone(),
             was_existing: true,
-            container: repair.as_ref().map(|repair| repair.container.clone()),
+            container: match &registration {
+                CapturedRegistration::Repair(repair) => Some(repair.container.clone()),
+                CapturedRegistration::Missing(missing) => Some(missing.container.clone()),
+                CapturedRegistration::Nothing => None,
+            },
         };
         let mut checkpoint = serde_json::to_value(&result)?;
-        if let Some(repair) = &repair {
-            let object = checkpoint
-                .as_object_mut()
-                .ok_or_else(|| anyhow!("Adoption result must be an object"))?;
-            object.insert(
-                "registration_target".into(),
-                serde_json::to_value(&repair.target)?,
-            );
-            object.insert(
-                "registration_volumes".into(),
-                serde_json::to_value(&repair.volumes)?,
-            );
+        {
+            let registry_target = match &registration {
+                CapturedRegistration::Repair(repair) => Some(&repair.target),
+                CapturedRegistration::Missing(missing) => Some(&missing.target),
+                CapturedRegistration::Nothing => None,
+            };
+            if let Some(registry_target) = registry_target {
+                let object = checkpoint
+                    .as_object_mut()
+                    .ok_or_else(|| anyhow!("Adoption result must be an object"))?;
+                object.insert(
+                    "registration_target".into(),
+                    serde_json::to_value(registry_target)?,
+                );
+                let registry_volumes = match &registration {
+                    CapturedRegistration::Repair(repair) => &repair.volumes,
+                    CapturedRegistration::Missing(missing) => &missing.volumes,
+                    CapturedRegistration::Nothing => unreachable!("registry_target set"),
+                };
+                object.insert(
+                    "registration_volumes".into(),
+                    serde_json::to_value(registry_volumes)?,
+                );
+            }
         }
         committing = true;
         let progress = UserAppOperationProgress {
@@ -221,22 +247,58 @@ async fn run(state: &AppState, record: UserAppOperationRecord) -> Result<Builder
             error_code: None,
             error_message: None,
         };
-        if let Some(repair) = repair {
-            state
-                .projects
-                .complete_builder_registration_adoption(
-                    &repair.expected,
-                    &repair.target,
-                    &repair.container,
-                    &repair.volumes,
-                    &progress,
-                )
-                .await?;
-        } else {
-            state
-                .userapp_store
-                .commit_resource_binding(&binding, &progress)
-                .await?;
+        match registration {
+            CapturedRegistration::Repair(repair) => {
+                state
+                    .projects
+                    .complete_builder_registration_adoption(
+                        &repair.expected,
+                        &repair.target,
+                        &repair.container,
+                        &repair.volumes,
+                        &progress,
+                    )
+                    .await?;
+            }
+            CapturedRegistration::Missing(missing) => {
+                // The canonical registration is absent: this confirmed adoption
+                // installs it with its OWN receipt. The shared SQL registry
+                // commits registry rows, binding and outcome in one transaction;
+                // the ordinary memory registry first binds, then installs the
+                // verified workload through the same completion entry.
+                let resolved = missing.target.resource_binding.clone().unwrap_or(binding);
+                if state.projects.is_postgres() {
+                    state
+                        .projects
+                        .complete_missing_builder_registration_adoption(
+                            &missing.target,
+                            &missing.container,
+                            &missing.volumes,
+                            &progress,
+                        )
+                        .await?;
+                } else {
+                    state
+                        .userapp_store
+                        .commit_resource_binding(&resolved, &progress)
+                        .await?;
+                    state
+                        .projects
+                        .complete_missing_builder_registration_adoption(
+                            &missing.target,
+                            &missing.container,
+                            &missing.volumes,
+                            &progress,
+                        )
+                        .await?;
+                }
+            }
+            CapturedRegistration::Nothing => {
+                state
+                    .userapp_store
+                    .commit_resource_binding(&binding, &progress)
+                    .await?;
+            }
         }
         Ok::<_, anyhow::Error>(result)
     })
@@ -293,29 +355,77 @@ struct RegistrationRepair {
     volumes: Vec<shared_types::AppResourceIdentity>,
 }
 
+/// What an explicit adoption may do with the registry. `Missing` = the
+/// canonical registration is absent; the confirmed adoption installs it.
+enum CapturedRegistration {
+    Nothing,
+    Repair(RegistrationRepair),
+    Missing(MissingRegistration),
+}
+
+struct MissingRegistration {
+    target: shared_types::BuilderControlTarget,
+    container: shared_types::ContainerBasicInfo,
+    volumes: Vec<shared_types::AppResourceIdentity>,
+}
+
 /// Explicit adoption repairs only the registry. It never claims that old
 /// processes exited or that historical PVC identities were preserved.
-async fn capture_registration_repair(
+async fn capture_registration(
     state: &AppState,
     captured: &shared_types::BuilderControlTarget,
-) -> Result<Option<RegistrationRepair>> {
-    let Some(expected) = state.projects.get(&captured.context.app_id) else {
-        return Ok(None);
-    };
-    let Some(previous) = expected.container_info() else {
-        return Ok(None);
-    };
+) -> Result<CapturedRegistration> {
     let workload = captured
         .workload
         .as_ref()
         .ok_or_else(|| anyhow!("Adopted workload missing"))?;
-    if workload.kind != shared_types::AppResourceKind::StatefulSet
-        || previous
-            .workload_uid
-            .as_deref()
-            .is_none_or(|uid| uid == workload.uid)
+    if workload.kind != shared_types::AppResourceKind::StatefulSet {
+        return Ok(CapturedRegistration::Nothing);
+    }
+    // A MISSING canonical registration (no projects row, or one without its
+    // container linkage) is completed by this confirmed adoption: resolve the
+    // binding (the existing one, or this operation's own), then verify the
+    // capture is stable and gather the registry evidence.
+    let existing = state.projects.get(&captured.context.app_id);
+    if existing
+        .as_ref()
+        .is_none_or(|project| project.container_info().is_none())
     {
-        return Ok(None);
+        let binding = state
+            .userapp_store
+            .get_resource_binding(&shared_types::ServiceType::UserappBuilder, &workload.uid)
+            .await?
+            .unwrap_or_else(|| UserAppResourceBinding {
+                app_id: captured.context.app_id.clone(),
+                lifecycle_id: captured.context.lifecycle_id.clone(),
+                service_type: shared_types::ServiceType::UserappBuilder,
+                physical_uid: workload.uid.clone(),
+                adopted_by_operation: captured.context.operation_id.clone(),
+            });
+        let mut target = captured.clone();
+        target.resource_binding = Some(binding);
+        let volumes = state
+            .runtime()
+            .capture_builder_compute_volumes(&target)
+            .await?;
+        let container = verify_capture_unchanged(state, captured, &target, &volumes).await?;
+        return Ok(CapturedRegistration::Missing(MissingRegistration {
+            target,
+            container,
+            volumes,
+        }));
+    }
+    let expected =
+        existing.context("Adopted builder registration disappeared before inspection")?;
+    let previous = expected
+        .container_info()
+        .context("Adopted builder registration has no container")?;
+    if previous
+        .workload_uid
+        .as_deref()
+        .is_none_or(|uid| uid == workload.uid)
+    {
+        return Ok(CapturedRegistration::Nothing);
     }
     let mut target = captured.clone();
     target.resource_binding = Some(
@@ -335,6 +445,27 @@ async fn capture_registration_repair(
         .runtime()
         .capture_builder_compute_volumes(&target)
         .await?;
+    let container = verify_capture_unchanged(state, captured, &target, &volumes).await?;
+    Ok(CapturedRegistration::Repair(RegistrationRepair {
+        expected,
+        target,
+        container,
+        volumes,
+    }))
+}
+
+/// TOCTOU re-verification shared by both registry outcomes: the live builder
+/// must still be the captured Pod/controller with the same workspace volumes.
+async fn verify_capture_unchanged(
+    state: &AppState,
+    captured: &shared_types::BuilderControlTarget,
+    target: &shared_types::BuilderControlTarget,
+    volumes: &[shared_types::AppResourceIdentity],
+) -> Result<shared_types::ContainerBasicInfo> {
+    let workload = captured
+        .workload
+        .as_ref()
+        .ok_or_else(|| anyhow!("Adopted workload missing"))?;
     let actual = state
         .runtime()
         .find_container(
@@ -343,13 +474,19 @@ async fn capture_registration_repair(
         )
         .await?
         .ok_or_else(|| anyhow!("Adopted builder Pod disappeared before registration"))?;
+    // `RuntimeContainerInfo::container_name` carries the WORKLOAD name (the
+    // StatefulSet), not the Pod name: compare against the captured workload,
+    // never against the Pod identity, whose name is not observable here. The
+    // captured Pod stays bound by its UID, and the re-capture equality below
+    // covers any name or view drift.
     if actual.identity_key() != Some(captured.context.app_id.as_str())
         || actual.service_type != Some(shared_types::ServiceType::UserappBuilder)
         || actual.workload_uid.as_deref() != Some(workload.uid.as_str())
+        || workload.name != actual.container_name
         || captured
             .pod
             .as_ref()
-            .is_none_or(|pod| pod.uid != actual.container_id || pod.name != actual.container_name)
+            .is_none_or(|pod| pod.uid != actual.container_id)
     {
         return Err(anyhow!(
             "Adopted builder changed during registration inspection"
@@ -362,7 +499,7 @@ async fn capture_registration_repair(
     if after != *captured
         || state
             .runtime()
-            .capture_builder_compute_volumes(&target)
+            .capture_builder_compute_volumes(target)
             .await?
             != volumes
     {
@@ -370,7 +507,7 @@ async fn capture_registration_repair(
             "Adopted controller or PVC identity changed during registration inspection"
         ));
     }
-    let container = shared_types::ContainerBasicInfo {
+    Ok(shared_types::ContainerBasicInfo {
         container_id: actual.container_id,
         container_name: actual.container_name,
         container_ip: actual.container_ip.clone(),
@@ -381,13 +518,7 @@ async fn capture_registration_repair(
         created_at: actual.created_at,
         service_url: String::new(),
         workload_uid: actual.workload_uid,
-    };
-    Ok(Some(RegistrationRepair {
-        expected,
-        target,
-        container,
-        volumes,
-    }))
+    })
 }
 
 pub(super) async fn capture_bound_orphan_stop(

@@ -344,6 +344,37 @@ impl AgentContainerRuntime for Runtime {
             VolumeWitness::Refused(reason) => Err(ContainerRuntimeError::Conflict(reason)),
         }
     }
+    async fn acquire_builder_operation(
+        &self,
+        _: &str,
+    ) -> ContainerRuntimeResult<Box<dyn shared_types::AppOperationLease>> {
+        struct NoopLease;
+        #[async_trait::async_trait]
+        impl shared_types::AppOperationLease for NoopLease {
+            async fn release(self: Box<Self>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        Ok(Box::new(NoopLease))
+    }
+    async fn capture_builder_adoption(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        expected_container_id: &str,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        let mut target = self.builder_target(context)?;
+        let pod = target
+            .pod
+            .as_ref()
+            .ok_or_else(|| ContainerRuntimeError::K8sError("no builder pod observed".into()))?;
+        if pod.uid != expected_container_id {
+            return Err(ContainerRuntimeError::Conflict(
+                "expected physical builder differs from the live pod".into(),
+            ));
+        }
+        target.resource_binding = None;
+        Ok(target)
+    }
     async fn stop_container(&self, _: &str) -> ContainerRuntimeResult<()> {
         panic!("scanner must not use name-based stop")
     }
@@ -1417,6 +1448,81 @@ async fn live_builder_registration_recovery_defers_to_inflight_operation() {
             .is_none_or(|project| project.container_info().is_none()),
         "an in-flight operation must own the registration decision"
     );
+    assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
+}
+
+/// 显式 Adopt 在“canonical 登记缺失”时必须**完成登记**（不只写绑定）：
+/// 受控完成步骤复用原 admission → runtime 核验/租约 → 回执 → 原子发布链
+///（任务书 specs/idle-recovery-followup-20261030 §4.5）。
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn explicit_adoption_completes_missing_registration() {
+    let (scanner, runtime, _probe, _directory) = fixture().await;
+    record_discovery_witness(&scanner.state, "witness-lifecycle", "pvc-current").await;
+    let app = scanner
+        .state
+        .userapp_store
+        .get_application("example")
+        .await
+        .unwrap()
+        .expect("witness restore creates the root");
+    *runtime.snapshot.lock().unwrap() = live_builder();
+    *runtime.builder.lock().unwrap() = Some(RuntimeContainerInfo {
+        container_id: "pod-live".into(),
+        container_name: "example".into(),
+        container_ip: "10.42.4.207".into(),
+        status: container_runtime_api::ContainerRuntimeStatus::Running,
+        created_at: Utc::now(),
+        env_vars: None,
+        service_type: Some(ServiceType::UserappBuilder),
+        project_id: Some("example".into()),
+        app_id: Some("example".into()),
+        user_id: None,
+        pod_id: None,
+        workload_uid: Some("sts-current".into()),
+    });
+    *runtime.volumes.lock().unwrap() =
+        VolumeWitness::Present(vec![shared_types::AppResourceIdentity {
+            kind: shared_types::AppResourceKind::PersistentVolumeClaim,
+            name: "example-workspace".into(),
+            uid: "pvc-current".into(),
+            resource_version: None,
+        }]);
+
+    // 未预置绑定：显式 Adopt 以 expected 物理身份为凭，创建绑定并补齐登记。
+    let result = crate::userapp_builder::adoption::execute(
+        &scanner.state,
+        "example",
+        shared_types::AdoptBuilderRequest {
+            lifecycle_id: app.lifecycle_id.clone(),
+            request_id: "explicit-adopt".into(),
+            expected_container_id: "pod-live".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let registered = scanner
+        .state
+        .projects
+        .get("example")
+        .expect("explicit adoption must complete the missing registration");
+    let container = registered.container_info().expect("builder container");
+    assert_eq!(container.container_id, "pod-live");
+    assert_eq!(container.workload_uid.as_deref(), Some("sts-current"));
+    assert_eq!(registered.service_type(), Some(ServiceType::UserappBuilder));
+    assert!(
+        result.container.is_some(),
+        "the adoption result carries the registered container"
+    );
+    let binding = scanner
+        .state
+        .userapp_store
+        .get_resource_binding(&ServiceType::UserappBuilder, "sts-current")
+        .await
+        .unwrap()
+        .expect("physical binding");
+    assert_eq!(binding.lifecycle_id, app.lifecycle_id);
     assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
 }
 

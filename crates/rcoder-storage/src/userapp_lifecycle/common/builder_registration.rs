@@ -243,6 +243,78 @@ pub(crate) async fn commit_builder_registration_adoption(
     source
         .validate(context, expected_source_uid)
         .map_err(anyhow::Error::msg)?;
+    commit_adoption_binding(tx, context, target, workload).await?;
+    ops::advance(tx, Backend::Postgres, progress).await?;
+    Ok(())
+}
+
+/// Complete a MISSING canonical registration from an admitted adoption
+/// confirmation for the current lifecycle. The binding is validated in this
+/// transaction and created under this operation's identity when absent; no
+/// historical creator is invented. The registry rows themselves are rebinding
+/// in the caller's transaction, which enforces canonical absence.
+pub(crate) async fn commit_missing_builder_registration_adoption(
+    tx: &mut dyn Executor,
+    target: &BuilderControlTarget,
+    progress: &UserAppOperationProgress,
+) -> Result<()> {
+    target.validate().map_err(anyhow::Error::msg)?;
+    let context = &target.context;
+    let workload = target
+        .workload
+        .as_ref()
+        .context("Adopted builder workload missing")?;
+    ensure!(
+        workload.kind == AppResourceKind::StatefulSet
+            && progress.app_id == context.app_id
+            && progress.lifecycle_id == context.lifecycle_id
+            && progress.operation_id == context.operation_id
+            && progress.executor_id == context.executor_id
+            && progress.state == UserAppOperationState::Succeeded,
+        "Builder registry adoption identity differs"
+    );
+    repo::claim_app(tx, Backend::Postgres, &context.app_id).await?;
+    compute::check_access(
+        tx,
+        Backend::Postgres,
+        &context.app_id,
+        UserAppOperationScope::Dev,
+        false,
+    )
+    .await?;
+    let app = repo::app(tx, &context.app_id)
+        .await?
+        .context("Builder lifecycle disappeared")?;
+    domain::validate_active(&app)?;
+    ensure!(
+        app.lifecycle_id == context.lifecycle_id,
+        "Builder adoption lifecycle changed"
+    );
+    let operation = repo::operation(tx, &context.app_id, &context.operation_id)
+        .await?
+        .context("Builder adoption operation disappeared")?;
+    ensure!(
+        operation.kind == UserAppOperationKind::AdoptBuilder
+            && operation.state == UserAppOperationState::Running
+            && operation.revision == progress.expected_revision
+            && operation.executor_id.as_deref() == Some(context.executor_id.as_str())
+            && operation.request_fingerprint == context.request_fingerprint,
+        "Builder registry adoption operation changed"
+    );
+    commit_adoption_binding(tx, context, target, workload).await?;
+    ops::advance(tx, Backend::Postgres, progress).await?;
+    Ok(())
+}
+
+/// Validate the captured binding against the current transaction's view and
+/// insert it under this operation's identity when absent. A conflicting
+/// existing binding is never bypassed or rewritten.
+async fn commit_adoption_binding(
+    tx: &mut dyn Executor,
+    context: &UserAppExecutionContext,
+    target: &BuilderControlTarget,
+    workload: &AppResourceIdentity,
+) -> Result<()> {
     let binding = target
         .resource_binding
         .as_ref()
@@ -277,7 +349,7 @@ pub(crate) async fn commit_builder_registration_adoption(
                 tx,
                 Backend::Postgres,
                 &ServiceType::UserappBuilder,
-                &workload.uid
+                &workload.uid,
             )
             .await?
             .as_ref()
@@ -285,6 +357,5 @@ pub(crate) async fn commit_builder_registration_adoption(
             "Adopted builder binding belongs to another lifecycle"
         );
     }
-    ops::advance(tx, Backend::Postgres, progress).await?;
     Ok(())
 }
