@@ -96,6 +96,11 @@ pub struct PingoraProxyService {
     /// [`Self::set_upgraded_downstream_read_timeout_for_tests`] 压缩以
     /// 受控验证窗口分支——生产无配置入口）。
     pub(crate) upgraded_downstream_read_timeout_slot: Arc<ArcSwap<std::time::Duration>>,
+    /// UserApp app dev/prod"等待上游最终响应头"阶段预算（共享槽；默认
+    /// [`Self::DEFAULT_USERAPP_RESPONSE_HEADER_TIMEOUT`]，仅测试可经
+    /// [`Self::set_userapp_response_header_timeout_for_tests`] 压缩以受控
+    /// 验证预算分支——生产无配置入口）。
+    pub(crate) userapp_response_header_timeout_slot: Arc<ArcSwap<std::time::Duration>>,
 }
 
 /// 为了兼容现有接口，我们保留原来的 PortProxyService 别名
@@ -146,6 +151,8 @@ pub struct PortProxy {
     pub(crate) dev_entry_wait_slot: Arc<ArcSwap<std::time::Duration>>,
     /// 升级下游空闲读窗口槽（与 PingoraProxyService 共享同一 Arc）
     pub(crate) upgraded_downstream_read_timeout_slot: Arc<ArcSwap<std::time::Duration>>,
+    /// 上游首头预算槽（与 PingoraProxyService 共享同一 Arc）
+    pub(crate) userapp_response_header_timeout_slot: Arc<ArcSwap<std::time::Duration>>,
 }
 
 impl PortProxy {
@@ -157,6 +164,11 @@ impl PortProxy {
     /// 成功升级连接的下游空闲读窗口（共享槽实时值）。
     pub(crate) fn upgraded_downstream_read_timeout(&self) -> std::time::Duration {
         *self.upgraded_downstream_read_timeout_slot.load_full()
+    }
+
+    /// UserApp app 路由等待上游最终响应头的阶段预算（共享槽实时值）。
+    pub(crate) fn userapp_response_header_timeout(&self) -> std::time::Duration {
+        *self.userapp_response_header_timeout_slot.load_full()
     }
 }
 
@@ -191,6 +203,9 @@ impl PingoraProxyService {
             upgraded_downstream_read_timeout_slot: Arc::new(ArcSwap::from_pointee(
                 Self::DEFAULT_UPGRADED_DOWNSTREAM_READ_TIMEOUT,
             )),
+            userapp_response_header_timeout_slot: Arc::new(ArcSwap::from_pointee(
+                Self::DEFAULT_USERAPP_RESPONSE_HEADER_TIMEOUT,
+            )),
         }
     }
 
@@ -208,6 +223,28 @@ impl PingoraProxyService {
     /// 用具名常量集中维护，不新增 HTTP 参数或数据库配置。
     pub(crate) const DEFAULT_UPGRADED_DOWNSTREAM_READ_TIMEOUT: std::time::Duration =
         std::time::Duration::from_secs(3600);
+
+    /// UserApp app dev/prod"等待上游最终响应头"阶段预算默认值（生产症状：
+    /// 请求已发往上游但始终等不到响应头，外层 OpenResty 约 10 分钟才断开，
+    /// 浏览器长期白屏）。仅套用到这两类路由的 peer
+    /// （`PeerOptions::response_header_timeout`，依赖补丁能力）：绝对
+    /// deadline 自请求 EOS 后起算，零碎头/1xx 不重置，101 即止，最终头到
+    /// 达即取消；上传、已回头的 SSE、已升级 WS、下载正文不受影响。具名
+    /// 常量集中维护，不新增 HTTP 参数或数据库配置。
+    pub(crate) const DEFAULT_USERAPP_RESPONSE_HEADER_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(60);
+
+    /// 仅测试用：压缩首头阶段预算以受控验证预算分支（含绝对 deadline 不
+    /// 被零碎头/1xx 重置、上传不计时、头到即取消、504 映射与不自动刷新）。
+    /// 生产恒用默认常量，无配置入口。
+    #[cfg(test)]
+    pub(crate) fn set_userapp_response_header_timeout_for_tests(
+        &self,
+        timeout: std::time::Duration,
+    ) {
+        self.userapp_response_header_timeout_slot
+            .store(Arc::new(timeout));
+    }
 
     /// 仅测试用：压缩升级下游空闲窗口以受控验证窗口分支（含有限性、
     /// 读活动刷新与不泄漏到非升级请求）。生产恒用默认常量，无配置入口。
@@ -354,6 +391,9 @@ impl PingoraProxyService {
             upgraded_downstream_read_timeout_slot: Arc::clone(
                 &self.upgraded_downstream_read_timeout_slot,
             ),
+            userapp_response_header_timeout_slot: Arc::clone(
+                &self.userapp_response_header_timeout_slot,
+            ),
         })
     }
 }
@@ -383,6 +423,9 @@ impl Clone for PingoraProxyService {
             dev_entry_wait_slot: Arc::clone(&self.dev_entry_wait_slot),
             upgraded_downstream_read_timeout_slot: Arc::clone(
                 &self.upgraded_downstream_read_timeout_slot,
+            ),
+            userapp_response_header_timeout_slot: Arc::clone(
+                &self.userapp_response_header_timeout_slot,
             ),
         }
     }

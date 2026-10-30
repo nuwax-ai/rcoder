@@ -818,7 +818,13 @@ fn standby_error_page(publication_id: &str) -> String {
         .replace("{{RCODER_DIAGNOSTIC_ID}}", publication_id)
         .replace("{{RCODER_STATUS}}", "503")
         .replace("{{RCODER_LANG}}", locale)
-        .replace("{{RCODER_CAUSE}}", slug);
+        .replace("{{RCODER_CAUSE}}", slug)
+        // standby 摘流是瞬时错误态：保留 5s 整页自愈刷新（rcoder-proxy 侧
+        // 仅对首头超时/结果未知档抑制该 meta——见 error_page::VAR_META_REFRESH）。
+        .replace(
+            "{{RCODER_META_REFRESH}}",
+            "<meta http-equiv=\"refresh\" content=\"5\">",
+        );
     const UI_LABELS: [(&str, &str); 16] = [
         ("{{RCODER_UI_BROWSER}}", "browser"),
         ("{{RCODER_UI_CONNECTED}}", "connected"),

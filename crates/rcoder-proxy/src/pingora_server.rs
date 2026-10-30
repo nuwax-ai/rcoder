@@ -35,6 +35,10 @@ mod ws_upgrade_timeout_tests;
 #[path = "proxy_client_disconnect_tests.rs"]
 mod proxy_client_disconnect_tests;
 
+#[cfg(all(test, unix))]
+#[path = "userapp_header_deadline_tests.rs"]
+mod userapp_header_deadline_tests;
+
 /// Pingora 服务器管理器
 pub struct PingoraServerManager {
     config: ProxyConfig,

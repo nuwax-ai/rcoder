@@ -41,6 +41,10 @@ pub const VAR_LANG: &str = "{{RCODER_LANG}}";
 /// 结构化失败档位 slug（如 starting/stopped/platform_unavailable）——内置
 /// 页脚本按它驱动 UI 状态（R6：不再解析翻译标题文案）；自定义页可选。
 pub const VAR_CAUSE: &str = "{{RCODER_CAUSE}}";
+/// 内置页 5s 自动刷新 meta 行（瞬时错误态整页自愈用）。超时/结果未知等
+/// 档位不注入——自动重复触发业务（尤其写请求结果可能仍在处理中）是错误
+/// 行为；自定义页不包含该占位符则不受影响。
+pub const VAR_META_REFRESH: &str = "{{RCODER_META_REFRESH}}";
 /// 内置页固定标签的本地化占位符（键名与 userapp_error_page.ui.* 对应；
 /// 渲染时按 locale 注入，自定义页不强制包含）。
 pub const VAR_UI_BROWSER: &str = "{{RCODER_UI_BROWSER}}";
@@ -129,13 +133,19 @@ impl ErrorPageRenderer {
     /// 渲染（变量全部 HTML 转义；未知占位符不解析——上传侧已校验拒绝）。
     pub fn render(&self, vars: &ErrorPageVars, locale: &str) -> Vec<u8> {
         let template = self.template();
+        let meta_refresh = if manual_refresh_only(vars.cause_slug.as_str()) {
+            ""
+        } else {
+            "<meta http-equiv=\"refresh\" content=\"5\">\n    "
+        };
         let mut rendered = template
             .replace(VAR_TITLE, &html_escape(&vars.title))
             .replace(VAR_MESSAGE, &html_escape(&vars.message))
             .replace(VAR_DIAGNOSTIC_ID, &html_escape(&vars.diagnostic_id))
             .replace(VAR_STATUS, &html_escape(&vars.status))
             .replace(VAR_LANG, &html_escape(locale))
-            .replace(VAR_CAUSE, &html_escape(&vars.cause_slug));
+            .replace(VAR_CAUSE, &html_escape(&vars.cause_slug))
+            .replace(VAR_META_REFRESH, meta_refresh);
         for (placeholder, key) in UI_LABELS {
             let text = shared_types::t(&format!("userapp_error_page.ui.{key}"), locale);
             rendered = rendered.replace(placeholder, &html_escape(&text));
@@ -182,6 +192,9 @@ pub enum ErrorPageCause {
     PlatformUnavailable,
     /// 操作结果未知（不虚报成败，也不凭连接失败断言）
     OutcomeUnknown,
+    /// 上游最终响应头等待预算耗尽（阶段超时，504）：应用可能仍在处理，
+    /// 不宣称应用已停止/正在重启，页面不自动刷新（避免自动重复触发业务）
+    UpstreamResponseTimeout,
     /// 连接失败/状态未知：不凭连接拒绝宣称"正在启动"
     Generic,
 }
@@ -189,6 +202,13 @@ pub enum ErrorPageCause {
 /// 档位 slug（对外：[`ErrorPageVars::cause_slug`] 注入用）。
 pub fn cause_slug(cause: ErrorPageCause) -> &'static str {
     cause.i18n_slug()
+}
+
+/// 这些档位的内置页不注入 5s 自动刷新：上游首头超时/结果未知——请求
+/// （特别是写请求）可能仍在后端处理中，自动重复触发业务是错误行为；
+/// 其余瞬时错误态（启动中/standby 等）保持整页自愈刷新。
+fn manual_refresh_only(cause_slug: &str) -> bool {
+    matches!(cause_slug, "upstream_response_timeout" | "outcome_unknown")
 }
 
 impl ErrorPageCause {
@@ -206,6 +226,7 @@ impl ErrorPageCause {
             Self::RecoveryRequired => "recovery_required",
             Self::PlatformUnavailable => "platform_unavailable",
             Self::OutcomeUnknown => "outcome_unknown",
+            Self::UpstreamResponseTimeout => "upstream_response_timeout",
             Self::Generic => "generic",
         }
     }
@@ -796,7 +817,7 @@ mod tests {
         ErrorPageRenderer::new(None)
     }
 
-    fn all_causes() -> [ErrorPageCause; 12] {
+    fn all_causes() -> [ErrorPageCause; 13] {
         [
             ErrorPageCause::Starting,
             ErrorPageCause::Restarting,
@@ -809,6 +830,7 @@ mod tests {
             ErrorPageCause::RecoveryRequired,
             ErrorPageCause::PlatformUnavailable,
             ErrorPageCause::OutcomeUnknown,
+            ErrorPageCause::UpstreamResponseTimeout,
             ErrorPageCause::Generic,
         ]
     }
@@ -870,6 +892,37 @@ mod tests {
         assert!(!rendered.contains("{{RCODER_"));
     }
 
+    /// 自动刷新注入按档位分流：瞬时错误态保持 5s 整页自愈；上游首头
+    /// 超时/结果未知档不注入——请求（尤其写请求）可能仍在后端处理中，
+    /// 自动重复触发业务是错误行为（阶段超时修复的手动刷新要求）。
+    #[test]
+    fn builtin_page_auto_refresh_follows_cause() {
+        let page_for = |slug: &str| {
+            let vars = ErrorPageVars {
+                title: "t".into(),
+                message: "m".into(),
+                diagnostic_id: "d".into(),
+                status: "504".into(),
+                cause_slug: slug.into(),
+            };
+            String::from_utf8(renderer().render(&vars, "zh-CN")).unwrap()
+        };
+        for transient in ["starting", "restarting", "provisioning", "generic"] {
+            let page = page_for(transient);
+            assert!(
+                page.contains("<meta http-equiv=\"refresh\" content=\"5\">"),
+                "transient cause {transient} keeps auto refresh"
+            );
+        }
+        for manual in ["upstream_response_timeout", "outcome_unknown"] {
+            let page = page_for(manual);
+            assert!(
+                !page.to_ascii_lowercase().contains("http-equiv=\"refresh\""),
+                "cause {manual} must not auto refresh business traffic"
+            );
+        }
+    }
+
     #[test]
     fn zh_cn_copywriting_matches_approved_matrix() {
         let cases = [
@@ -917,6 +970,11 @@ mod tests {
                 ErrorPageCause::OutcomeUnknown,
                 "应用状态确认中",
                 "应用操作结果正在确认，请稍后重试；如持续出现请重新部署。",
+            ),
+            (
+                ErrorPageCause::UpstreamResponseTimeout,
+                "应用暂未响应",
+                "应用暂未响应，请求可能仍在处理中；请稍后手动刷新查看。",
             ),
             (
                 ErrorPageCause::Generic,

@@ -52,6 +52,34 @@ async fn wait_for_peer_connection(peer: &HttpPeer, deadline: tokio::time::Instan
 }
 
 impl PortProxy {
+    /// UserApp app dev/prod：为 peer 套上"等待上游最终响应头"阶段预算。
+    ///
+    /// 首次进入时武装绝对 deadline（ctx 持有），此后每次重试/重解析都只拿
+    /// **剩余**预算（重连不得重新获得完整 60s）。预算在拨号前已耗尽时按
+    /// 同一超时身份直接失败——不再发起新的上游交换（避免制造结果未知的
+    /// 写入）。依赖补丁在 Pingora 驱动层按请求 EOS 后起算、最终头（含
+    /// 101）到达即止；SSE/WS/上传/正文不受本预算影响。
+    fn apply_userapp_header_budget(
+        &self,
+        ctx: &mut TrackingCtx,
+        route: RouteType,
+        peer: &mut HttpPeer,
+    ) -> PingoraResult<()> {
+        if !matches!(route, RouteType::ProdAppProxy | RouteType::DevAppProxy) {
+            return Ok(());
+        }
+        let deadline = ctx
+            .userapp_header_deadline
+            .get_or_insert(tokio::time::Instant::now() + self.userapp_response_header_timeout());
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(pingora_core::Error::new(response_header_timeout_etype())
+                .more_context("userapp response header budget exhausted before dial"));
+        }
+        peer.options.response_header_timeout = Some(remaining);
+        Ok(())
+    }
+
     fn validate_request_api_key(&self, session: &Session, path: &str) -> PingoraResult<()> {
         let Some(config) = self.api_key_config.as_ref() else {
             return Ok(());
@@ -726,6 +754,7 @@ impl ProxyHttp for PortProxy {
                 return Err(pingora_core::Error::new(ErrorType::HTTPStatus(503)));
             }
         }
+        self.apply_userapp_header_budget(ctx, *matched.value, &mut peer)?;
         Ok(peer)
     }
 
@@ -743,7 +772,13 @@ impl ProxyHttp for PortProxy {
     {
         let connect_failure =
             ctx.userapp_route.is_some() && is_entry_connect_failure(error.etype());
-        let code = if connect_failure {
+        // 上游最终响应头 deadline 耗尽（依赖补丁独立错误身份）：唯一映射
+        // 504 超时档的类别——不把普通 ReadTimedout（下游请求读取超时等）
+        // 一并改成 504。
+        let header_timeout = ctx.userapp_route.is_some() && is_response_header_timeout(error);
+        let code = if header_timeout {
+            504
+        } else if connect_failure {
             503
         } else {
             default_error_status(error)
@@ -764,13 +799,23 @@ impl ProxyHttp for PortProxy {
             Self::capture_proxy_transition(ctx);
         }
         if ctx.userapp_route.is_some() && code > 0 {
-            // 原因用封闭的错误类型词表（etype），不透出内部地址/凭据细节
-            let reason = error.etype().as_str().to_string();
+            // 原因用封闭的错误类型词表（etype），不透出内部地址/凭据细节；
+            // 首头超时档用封闭 reason（机器可读），文案档不宣称应用已停止。
+            let reason = if header_timeout {
+                "upstream_response_timeout".to_string()
+            } else {
+                error.etype().as_str().to_string()
+            };
+            let cause = if header_timeout {
+                crate::error_page::ErrorPageCause::UpstreamResponseTimeout
+            } else {
+                crate::error_page::ErrorPageCause::Generic
+            };
             self.respond_userapp_error(
                 session,
                 ctx,
                 code,
-                crate::error_page::ErrorPageCause::Generic,
+                cause,
                 &reason,
                 connect_failure.then_some(15),
                 // 错误链完整进日志（可能含内部地址——只进日志不进页面）
@@ -1442,6 +1487,16 @@ fn is_entry_connect_failure(error: &ErrorType) -> bool {
         ErrorType::ConnectRefused | ErrorType::ConnectNoRoute | ErrorType::ConnectTimedout
     )
 }
+
+/// 上游最终响应头 deadline 耗尽的错误身份（依赖补丁提供，见
+/// `vendor/pingora-core/README.md`）。用常量克隆而非字面量，防止与补丁漂移。
+fn response_header_timeout_etype() -> ErrorType {
+    pingora_core::protocols::http::v1::client::RESPONSE_HEADER_TIMEDOUT.clone()
+}
+
+fn is_response_header_timeout(error: &pingora_core::Error) -> bool {
+    error.etype() == &pingora_core::protocols::http::v1::client::RESPONSE_HEADER_TIMEDOUT
+}
 fn is_connect_etype_header(value: &str) -> bool {
     matches!(
         value,
@@ -1658,6 +1713,44 @@ mod tests {
 
     fn test_router() -> Router<RouteType> {
         create_router().expect("router build")
+    }
+
+    /// 首头预算只套 UserApp app dev/prod 两类路由；重试共享剩余预算
+    /// （重连不得重新获得完整预算）。非 app 路由完全不套（LLM API/VNC/
+    /// ttyd/dbx 等保持原行为）。
+    #[tokio::test]
+    async fn userapp_header_budget_scopes_to_app_routes_and_shares_remaining() {
+        let service =
+            crate::service::PingoraProxyService::new(crate::config::ProxyConfig::default());
+        service.set_userapp_response_header_timeout_for_tests(Duration::from_millis(1500));
+        let proxy = service.create_pingora_proxy().expect("build proxy");
+        let mut ctx = TrackingCtx::new();
+        let mut peer = HttpPeer::new("127.0.0.1:1", false, String::new());
+
+        proxy
+            .apply_userapp_header_budget(&mut ctx, RouteType::RuntimeTtydProxy, &mut peer)
+            .expect("non-app route is out of scope");
+        assert!(ctx.userapp_header_deadline.is_none());
+        assert!(peer.options.response_header_timeout.is_none());
+
+        proxy
+            .apply_userapp_header_budget(&mut ctx, RouteType::ProdAppProxy, &mut peer)
+            .expect("prod app route arms the budget");
+        assert!(ctx.userapp_header_deadline.is_some());
+        assert!(peer.options.response_header_timeout.unwrap() <= Duration::from_millis(1500));
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        proxy
+            .apply_userapp_header_budget(&mut ctx, RouteType::DevAppProxy, &mut peer)
+            .expect("dev app route shares the same deadline");
+        let remaining = peer
+            .options
+            .response_header_timeout
+            .expect("retry still gets the remaining budget");
+        assert!(
+            remaining <= Duration::from_millis(1200),
+            "retry must share the remaining budget: {remaining:?}"
+        );
     }
 
     /// 工具族路由：识别为唤醒目标且不 touch（挂终端不算业务活跃）。
