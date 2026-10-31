@@ -278,12 +278,9 @@ fn prod_backend_unregister(host: &str) {
 /// `Downstream ReadTimedout / reading body, timeout: 60s / 400` 签名。
 #[tokio::test]
 async fn dev_upgraded_websocket_survives_idle_past_default_downstream_timeout() {
-    let backend_addr: std::net::SocketAddr = format!("[::1]:{}", shared_types::APP_ENTRY_PORT)
-        .parse()
-        .expect("parse IPv6 loopback backend addr");
-    let backend = TcpListener::bind(backend_addr)
-        .await
-        .expect("isolated backend on [::1]:APP_ENTRY_PORT");
+    // [::1]:APP_ENTRY_PORT 固定端口——冲突时重试等待其他 dev 用例释放
+    //（见 pingora_server::dev_entry_port）。
+    let backend = dev_entry_port::bind_backend().await;
     spawn_backend(backend, BackendBehavior::EchoPong).await;
 
     let proxy_port = reserve_port();

@@ -36,8 +36,38 @@ mod ws_upgrade_timeout_tests;
 mod proxy_client_disconnect_tests;
 
 #[cfg(all(test, unix))]
-#[path = "userapp_header_deadline_tests.rs"]
-mod userapp_header_deadline_tests;
+#[path = "userapp_upstream_read_timeout_tests.rs"]
+mod userapp_upstream_read_timeout_tests;
+
+/// dev 族隔离测试的固定上游端口绑定：`[::1]:APP_ENTRY_PORT` 是 dev app
+/// 代理的恒定上游端口，多个 dev 用例都要独占绑定。nextest 每用例独立
+/// 进程——进程内互斥锁跨进程无效，`AddrInUse` 时按 100ms 重试等待上一
+/// 用例释放（上限覆盖最长 dev 用例 ~66s），而不是立即失败。
+#[cfg(all(test, unix))]
+mod dev_entry_port {
+    use std::time::Duration;
+
+    /// 绑定 dev 族隔离后端（[::1]:APP_ENTRY_PORT），冲突时重试等待。
+    pub(super) async fn bind_backend() -> tokio::net::TcpListener {
+        let addr: std::net::SocketAddr = format!("[::1]:{}", shared_types::APP_ENTRY_PORT)
+            .parse()
+            .expect("parse IPv6 loopback backend addr");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(75);
+        loop {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => return listener,
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "isolated backend on [::1]:APP_ENTRY_PORT stayed occupied: {error}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => panic!("bind [::1]:APP_ENTRY_PORT failed: {error}"),
+            }
+        }
+    }
+}
 
 /// Pingora 服务器管理器
 pub struct PingoraServerManager {

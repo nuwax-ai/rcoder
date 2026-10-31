@@ -92,10 +92,5 @@ docker/.runtime-assets-locks
 docker/app-runtime-base/.dbx-locks
 docker/rcoder-agent-runner/.dbx-locks
 
-# vendored pingora-core standalone test builds
-/vendor/pingora-core/target/
-
-/vendor/pingora-proxy/target/
-
 # 本地工作文档（交接/巡检/方案草稿，不随仓库发布）
 docs-local/
