@@ -140,6 +140,9 @@ fn write_panic_to_file(panic_info: &panic::PanicHookInfo) -> std::io::Result<()>
 /// - 发 TERM 后轮询等待退出, 上限 [`SUPERVISORD_STOP_BUDGET`](10s, 必须 <
 ///   pid1 timeout 15s < k8s grace 30s); 超时放行 —— 慢停链不拖住容器退出,
 ///   保住"删 Pod 周期快"的既有语义(实测脏停止时周期 8-9s, 修复后目标 <15s)。
+// Unix-only（nix 信号 + /proc 探活）；与模块内 tokio::signal::unix 的门控
+// 形态一致（本模块本就不参与非 Unix 构建）。
+#[cfg(unix)]
 fn stop_supervisord_bounded() {
     use std::time::{Duration, Instant};
 
