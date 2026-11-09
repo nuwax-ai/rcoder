@@ -506,3 +506,47 @@ EPERM 自动降级兜底**。这条组合已在两个集群环境实测闭环。
 hostPath 注入 + initContainer 覆盖是**测试专用**形态。生产正确做法：
 `dev-oom` 分支构建正式镜像（`build-agent-runner-amd64` 等），rcoder 的 pod 模板加
 appArmorProfile 与 `RCODER_MEM_WATCH_LIMIT_BYTES` env。
+
+## 20. 生产测试集群部署验证（192.168.1.19，nuwax-k8s-test）
+
+标准发版流程验证闭环（`make k8s-helm-rcoder-version-publish ENV=test`，源码冻结
+commit `7accc5e1` = dev-oom，含 rcoder 改造 + 看门狗）：
+
+- 镜像推送：`rcoder-computer-agent-runner:0.1.419-amd64`、`rcoder-k8s:0.1.419-amd64`（其余 6 镜像 server-side 复制）
+- chart 发布：`nuwax-platform:0.1.419`（OCI + 留存版本）
+- 部署脚本：`scripts/deploy-oom-test-19.sh`
+
+### 20.1 实测结果
+
+**wd-int-oom**（真实 agent_runner 完整运行时，`RCODER_MEM_WATCH=dry`，8Gi 限额）：
+```json
+{"event":"mem_watch.started","mode":"dry","ratio":0.85,"interval_ms":500,...}
+{"event":"mem_watch.mode_changed","from":"off","to":"dry"}
+{"event":"mem_watch.mode_changed","from":"dry","to":"on"}   ← exec 热切换
+```
+
+**wd-beh-oom**（512Mi 限额场景 e2e，镜像从阿里云拉取）：
+```
+[scn1] PASS hogA 存活（off 不杀）
+[scn2] PASS hogB 被淘汰，hogA（窗口内）存活
+[scn3] PASS hogC 存活（dry 只记录）
+ALL SCENARIOS PASS
+```
+
+### 20.2 三环境验证矩阵（最终）
+
+| 环境 | 集成验证 | 行为验证 | AppArmor signal | 容器内 memory.max |
+|---|---|---|---|---|
+| 本地 Docker | ✅ | ✅ 三场景 | 放行 | 可读 |
+| 45 测试 k8s | ✅ | ✅ 三场景（需 profile） | ❌ 拒绝 | max（host ns） |
+| 19 nuwax-k8s-test | ✅ started+热切换 | ✅ 三场景 | ✅ 放行 | 可读（6Gi） |
+
+### 20.3 生产测试集群结论
+
+- **无需 AppArmor 配置改动**（signal 放行，标签为基础名无叠加）；
+- **无需 LIMIT_BYTES env**（容器内可直接读 memory.max）；
+- 看门狗在 nuwax-k8s-test 即插即用：agent-runner 镜像升级到 0.1.419+，
+  会话 Pod 默认 `off`，按需以 `RCODER_MEM_WATCH=dry/on` 或文件开关启用。
+- 遗留注意：nuwax-k8s-test 的 rcoder 主服务（STS 3 副本）在验证期间处于
+  CrashLoopBackOff（11 天），与本功能无关，但"完整链路"（rcoder 创建动态
+  agent-runner → 真实 claude 会话 → would_evict）待主服务恢复后补测。
