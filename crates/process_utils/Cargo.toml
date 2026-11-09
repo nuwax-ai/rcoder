@@ -20,6 +20,9 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 process-wrap = { workspace = true }
 
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 rustix = { workspace = true, features = ["process", "param"] }

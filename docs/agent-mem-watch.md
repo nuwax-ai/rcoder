@@ -406,3 +406,55 @@ OK
 
 首次运行发现的问题：`mem_watch::start` 需要 tokio 上下文，example 里改为
 自建 runtime `rt.spawn(run(cfg))`（同时导出 `mem_watch::run`）。
+
+## 19. 单节点 k8s 部署验证（192.168.31.45，k3s v1.35.4）
+
+部署脚本：`scripts/deploy-oom-test-45.sh`（45 的 docker 内容存储损坏——save 只出
+37KB 空壳 tar，同 AGENTS.md 已知问题 2 的形态——所以完全绕开 docker：
+`k3s ctr images tag` 复用已有生产镜像（零拷贝）+ hostPath 注入新二进制 +
+initContainer 覆盖 `/usr/local/bin/agent_runner`）。
+
+### 19.1 结果
+
+| Pod | 内容 | 结果 |
+|---|---|---|
+| wd-integration | **真实 agent_runner 二进制**（完整沙箱镜像），`RUST_LOG=info` | ✅ `mem_watch.started(mode=off)` 落 telemetry 文件日志；`kubectl exec` 写 `/tmp/mem-watch.conf` → `mem_watch.mode_changed(off→dry)` |
+| wd-behavior | 场景化 e2e（`--memory=512m`，k8s 托管 cgroup） | ✅ 三场景 PASS（同 §15.2） |
+
+### 19.2 两个**必须在生产部署前确认**的发现
+
+**① AppArmor 拒绝容器内 signal → 看门狗静默失效（本次实测踩中）**
+
+该节点 k8s（Ubuntu 24.04 + containerd）给容器挂 `cri-containerd.apparmor.d`（enforce），
+profile 拒绝向 peer 发信号 ⇒ `pidfd_send_signal`/`kill` 全部 `EPERM`，
+evict 事件每 500ms 刷一条但进程死不掉。加
+`securityContext.appArmorProfile: {type: Unconfined}` 后三场景立即全 PASS。
+
+⇒ **rcoder 给沙箱 pod 的模板需要二选一**：
+- `appArmorProfile: {type: Unconfined}`（简单，代价是放弃该层 LSM）；
+- 或节点下发 Localhost profile（默认规则 + `signal (send) peer=<自身>`）。
+- 且**必须在启动时自检**（代码已实现：EPERM → `mem_watch.disabled` 日志并自动停用），
+  另外灰度前先在目标节点 `dmesg | grep 'operation="signal"'` 验证。
+
+**② 该集群容器内 `/sys/fs/cgroup/memory.max` 是 `max`（host cgroup namespace）**
+
+看门狗读不到限额 → 保持空闲。已支持 `RCODER_MEM_WATCH_LIMIT_BYTES` env 覆盖
+（rcoder 创建 pod 时知道限额，注入即可）。生产集群部署前需确认：
+```bash
+kubectl exec <agent-pod> -- cat /sys/fs/cgroup/memory.max   # 8589934592=私有ns；max=host ns
+```
+是 `max` 就必须注入 env（或改集群 kubelet `cgroupNamespaceMode: private`）。
+
+### 19.3 与生产集群（192.168.1.19…）的差异
+
+| 检查项 | 45（测试） | 生产（待确认） |
+|---|---|---|
+| AppArmor signal | ❌ 拒绝 | 未验证（agent_runner 从不杀进程，无 DENIED 记录不能证明放行） |
+| 容器内 memory.max | max（host ns） | 未验证 |
+| 验证方法 | — | `kubectl exec` 一条 python kill 自身子进程 + `cat memory.max` |
+
+### 19.4 部署形态的临时性
+
+hostPath 注入 + initContainer 覆盖是**测试专用**形态。生产正确做法：
+`dev-oom` 分支构建正式镜像（`build-agent-runner-amd64` 等），rcoder 的 pod 模板加
+appArmorProfile 与 `RCODER_MEM_WATCH_LIMIT_BYTES` env。

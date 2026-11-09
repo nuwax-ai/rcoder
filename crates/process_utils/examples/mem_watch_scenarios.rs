@@ -28,6 +28,11 @@ const HOG_A_MB: usize = 250;
 const HOG_MB: usize = 150;
 
 fn main() -> anyhow::Result<()> {
+    // RUST_LOG 非空时输出看门狗内部事件（无订阅者时 tracing 全部静默，
+    // 场景断言只看进程状态；需要排查时设 RUST_LOG=debug 即可看到全部）。
+    if std::env::var("RUST_LOG").is_ok() {
+        let _ = tracing_subscriber::fmt::try_init();
+    }
     let registry = registry::install();
     let self_pid = std::process::id();
     registry.register("scn", self_pid).expect("register self");
