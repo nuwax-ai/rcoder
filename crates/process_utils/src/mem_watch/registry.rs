@@ -128,16 +128,21 @@ impl Registry {
             .unwrap_or_default()
             .to_owned();
 
-        let root = Arc::new(Root::new(project, pid, info.starttime, exe, script_hint));
-        let mut guard = self.roots.write().unwrap_or_else(|e| e.into_inner());
-        guard.insert(pid, Arc::clone(&root));
-        Some(root)
+        Some(self.insert(Root::new(project, pid, info.starttime, exe, script_hint)))
     }
 
-    /// 测试与无 `/proc` 场景使用。
+    /// 登记一个会话；**同一 pid 且 starttime 相同则复用既有条目**。
+    ///
+    /// 幂等很重要：重复注册如果重建 `Root`，会重置启动窗口（`spawned_at`）
+    /// 并清空保护集——等于把已经"封窗"的会话重新打开，用户命令会被误保护。
     pub fn insert(&self, root: Root) -> Arc<Root> {
-        let root = Arc::new(root);
         let mut guard = self.roots.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = guard.get(&root.pid) {
+            if existing.born == root.born {
+                return Arc::clone(existing);
+            }
+        }
+        let root = Arc::new(root);
         guard.insert(root.pid, Arc::clone(&root));
         root
     }
@@ -293,9 +298,12 @@ mod tests {
         ProcInfo {
             pid,
             ppid,
+            pgrp: ppid,
             comm: format!("p{pid}"),
             rss_bytes: 0,
             starttime,
+            utime_ticks: 0,
+            stime_ticks: 0,
         }
     }
 
@@ -408,6 +416,29 @@ mod tests {
         registry.unregister("p1", 200);
         assert!(registry.get_pid(100).is_some());
         assert!(registry.get_pid(200).is_none());
+    }
+
+    #[test]
+    fn register_is_idempotent_and_keeps_window_state() {
+        let registry = Registry::new();
+        let first = registry.insert(root_of("p1", 100, 1000));
+        registry.snapshot_bootstrap(&table());
+        let protected_before = first.protected().len();
+
+        // 同一 pid + 同一 starttime 再次登记：必须复用，不能重置窗口/保护集
+        let second = registry.insert(root_of("p1", 100, 1000));
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(second.protected().len(), protected_before);
+        assert_eq!(registry.all().len(), 1);
+    }
+
+    #[test]
+    fn register_replaces_entry_when_starttime_differs() {
+        let registry = Registry::new();
+        registry.insert(root_of("p1", 100, 1000));
+        let replaced = registry.insert(root_of("p1", 100, 2000)); // pid 复用
+        assert_eq!(replaced.born, 2000);
+        assert_eq!(registry.all().len(), 1);
     }
 
     #[test]

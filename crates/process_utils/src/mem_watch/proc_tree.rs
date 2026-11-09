@@ -10,15 +10,23 @@ use std::collections::{HashMap, HashSet};
 pub struct ProcInfo {
     pub pid: u32,
     pub ppid: u32,
+    /// 进程组 id（`stat.pgrp`）。资源采集按它聚合。
+    pub pgrp: u32,
     /// 内核的 `comm`，最多 15 字节，**不可用于身份判断**（会截断），仅用于日志。
     pub comm: String,
     pub rss_bytes: u64,
     /// `/proc/<pid>/stat` 第 22 字段，用于识别 PID 复用。
     pub starttime: u64,
+    /// 用户态/内核态 CPU 时间（clock ticks，除以 `sysconf(SC_CLK_TCK)` 得秒）。
+    pub utime_ticks: u64,
+    pub stime_ticks: u64,
 }
 
 /// `)` 之后字段的下标（`state` 记为 0）。
 const FIELD_PPID: usize = 1;
+const FIELD_PGRP: usize = 2;
+const FIELD_UTIME: usize = 11;
+const FIELD_STIME: usize = 12;
 const FIELD_STARTTIME: usize = 19;
 const FIELD_RSS: usize = 21;
 /// `/proc/stat` 的字段个数下限（rss 之后的字段不需要）。
@@ -49,15 +57,19 @@ pub fn parse_stat(pid: u32, line: &[u8], page_size: u64) -> Option<ProcInfo> {
         |idx: usize| -> Option<u64> { std::str::from_utf8(fields[idx]).ok()?.parse::<u64>().ok() };
 
     let ppid = u32::try_from(parse(FIELD_PPID)?).ok()?;
+    let pgrp = u32::try_from(parse(FIELD_PGRP)?).ok()?;
     let starttime = parse(FIELD_STARTTIME)?;
     let rss_pages = parse(FIELD_RSS)?;
 
     Some(ProcInfo {
         pid,
         ppid,
+        pgrp,
         comm,
         rss_bytes: rss_pages.saturating_mul(page_size),
         starttime,
+        utime_ticks: parse(FIELD_UTIME)?,
+        stime_ticks: parse(FIELD_STIME)?,
     })
 }
 
@@ -162,17 +174,16 @@ mod tests {
 
     const PS: u64 = 4096;
 
-    /// 构造一行 stat：`pid (comm) S ppid ... rss ... starttime ...`
+    /// 构造一行 stat（字段下标与解析器一致）。
     fn stat_line(pid: u32, comm: &str, ppid: u32, rss_pages: u64, starttime: u64) -> Vec<u8> {
-        let mut fields = vec!["S".to_string(), ppid.to_string()];
-        while fields.len() < FIELD_STARTTIME {
-            fields.push("0".to_string());
-        }
-        fields.push(starttime.to_string()); // FIELD_STARTTIME
-        while fields.len() < FIELD_RSS {
-            fields.push("0".to_string());
-        }
-        fields.push(rss_pages.to_string()); // FIELD_RSS
+        let mut fields = vec!["0".to_string(); MIN_FIELDS];
+        fields[0] = "S".to_string();
+        fields[FIELD_PPID] = ppid.to_string();
+        fields[FIELD_PGRP] = ppid.to_string();
+        fields[FIELD_UTIME] = "7".to_string();
+        fields[FIELD_STIME] = "3".to_string();
+        fields[FIELD_STARTTIME] = starttime.to_string();
+        fields[FIELD_RSS] = rss_pages.to_string();
         format!("{pid} ({comm}) {}", fields.join(" ")).into_bytes()
     }
 
@@ -180,9 +191,12 @@ mod tests {
         ProcInfo {
             pid,
             ppid,
+            pgrp: ppid,
             comm: format!("p{pid}"),
             rss_bytes,
             starttime,
+            utime_ticks: 7,
+            stime_ticks: 3,
         }
     }
 
@@ -194,6 +208,9 @@ mod tests {
         assert_eq!(parsed.comm, "python3");
         assert_eq!(parsed.rss_bytes, 100 * PS);
         assert_eq!(parsed.starttime, 12345);
+        assert_eq!(parsed.pgrp, 7);
+        assert_eq!(parsed.utime_ticks, 7);
+        assert_eq!(parsed.stime_ticks, 3);
     }
 
     #[test]

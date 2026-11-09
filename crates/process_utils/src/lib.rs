@@ -20,6 +20,14 @@ pub mod command_context;
 pub mod execution_tree;
 pub mod managed_tree;
 pub mod mem_watch;
+
+/// 跨模块共用的只读 `/proc` 快照。
+///
+/// 与其让每个消费者各写一份 `/proc/<pid>/stat` 解析（字段下标、comm 里的
+/// 括号、rss 的页到字节换算都容易写错），不如统一从这里取。
+pub mod proc_scan {
+    pub use crate::mem_watch::{ProcInfo, snapshot};
+}
 pub mod observe;
 pub mod request_activity;
 mod spawn_program;

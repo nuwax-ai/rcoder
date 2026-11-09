@@ -123,26 +123,21 @@ pub fn sample_agent_resources(
     prune_stale_baselines();
 
     let tps = procfs::ticks_per_second();
-    let page_size = procfs::page_size();
     let mut rss_bytes: u64 = 0;
     let mut total_ticks: u64 = 0;
     let mut process_count: u32 = 0;
 
-    let iter = match procfs::process::all_processes() {
-        Ok(iter) => iter,
-        // /proc 整体不可读:按降级语义返回 None,不报错。
-        Err(_) => return None,
-    };
-    for process in iter.flatten() {
-        // 采样期间进程可能退出(ESRCH)或权限变化:单个失败按该进程缺席处理。
-        let Ok(stat) = process.stat() else {
-            continue;
-        };
-        if stat.pgrp < 0 || stat.pgrp as u32 != pgid {
+    // 进程表统一走 process_utils 的公共快照：与内存看门狗共用同一份
+    // /proc/<pid>/stat 解析（字段下标、comm 括号、rss 页→字节换算只维护一处）。
+    // /proc 整体不可读时返回空表 ⇒ process_count == 0 ⇒ 按降级语义返回 None。
+    let table = process_utils::proc_scan::snapshot();
+    for info in table.values() {
+        if info.pgrp != pgid {
             continue;
         }
-        rss_bytes = rss_bytes.saturating_add(stat.rss.saturating_mul(page_size));
-        total_ticks = total_ticks.saturating_add(stat.utime.saturating_add(stat.stime));
+        rss_bytes = rss_bytes.saturating_add(info.rss_bytes);
+        total_ticks =
+            total_ticks.saturating_add(info.utime_ticks.saturating_add(info.stime_ticks));
         process_count += 1;
     }
 

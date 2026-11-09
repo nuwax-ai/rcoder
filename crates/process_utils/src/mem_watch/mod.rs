@@ -22,6 +22,14 @@ mod switch;
 mod sys;
 
 pub use config::{Config, Mode};
+pub use proc_tree::ProcInfo;
+
+/// 当前进程表快照（`pid -> ProcInfo`）。非 Linux 返回空表。
+///
+/// 供其它模块复用，避免各自再写一份 `/proc` 解析。
+pub fn snapshot() -> std::collections::HashMap<u32, ProcInfo> {
+    sys::read_all()
+}
 pub use registry::{mark_session_active, try_register, try_unregister};
 pub use sampler::start;
 

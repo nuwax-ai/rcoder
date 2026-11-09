@@ -357,3 +357,37 @@ OK
 
 残留的唯一窗口：`mode=off` 期间 sampler 不跑（`step` 不执行），此时只有 reaper 在清理；
 但该状态下看门狗本来就不动作，不存在误杀风险；重新打开后的第一个 tick 会先剪枝。
+
+## 18. 公共化与收敛（与 agent_resource_monitor 的关系）
+
+### 18.1 `/proc` 扫描：已收敛为一份
+
+新增 `process_utils::proc_scan::snapshot()`（`pid -> ProcInfo`），`ProcInfo` 现在同时提供
+`ppid / pgrp / comm / rss_bytes / starttime / utime_ticks / stime_ticks`，
+字段下标、`comm` 含括号、rss 页→字节换算只维护一处。
+
+| 消费者 | 用途 | 迁移前 | 迁移后 |
+|---|---|---|---|
+| `mem_watch` | 建进程树、选淘汰目标、校验 pid 复用 | 自己解析 | `proc_scan::snapshot()` |
+| `agent_resource_monitor` | 按 pgid 聚合 RSS / CPU ticks | `procfs::all_processes()` 逐进程 `stat()` | `proc_scan::snapshot()` |
+
+资源采集只保留了 `procfs::ticks_per_second()`（时钟频率与扫描无关），
+聚合语义（按 `pgrp` 过滤、RSS 相加、utime+stime 相加、空集合返回 `None`）逐条对齐。
+
+### 18.2 会话注册表：**不合并**，但要幂等
+
+`AGENT_REGISTRY` 在 `agent_runner::service`（二进制 crate），`mem_watch` 在
+`process_utils`（被 `agent_abstraction` 依赖的库）——让库依赖二进制的注册表会**反向依赖**，
+所以不能直接复用。两者职责也不同：
+
+| | `AGENT_REGISTRY` | `mem_watch::registry` |
+|---|---|---|
+| 层级 | RPC / 会话视图 | 进程树视图 |
+| 键 | project_id / session_id | pid |
+| 存 | 会话身份、lifecycle handle、pgid | starttime、启动窗口快照、受保护集合 |
+| 生命周期 | 业务会话 | 进程存续 |
+
+真正需要保证的是**重复登记不能破坏窗口状态**，因此 `Registry::insert` 改为幂等：
+同一 `pid` 且 `starttime` 相同则复用既有 `Root`（不重置 `spawned_at`、不清空保护集）；
+`starttime` 不同（pid 复用）才替换。这样将来若有第二条登记路径（例如从
+`AGENT_REGISTRY` 桥接），也不会把已封窗的会话重新打开。
