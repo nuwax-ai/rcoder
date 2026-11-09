@@ -78,8 +78,13 @@ async fn step(reg: &Arc<Registry>, cfg: &Config, last_action: &mut Option<Instan
     }
     let bootstrapping = roots.iter().any(|root| !root.is_sealed());
 
-    // 快速路径：没有待封窗的会话、且未超阈值 → 不扫 /proc。
+    // 快速路径：没有待封窗的会话、且未超阈值 → 不扫全表，
+    // 但仍校验 root 存活，避免 pid 复用后把无关进程纳入淘汰范围。
     if !bootstrapping && working_set < threshold {
+        let pruned = reg.prune_dead_light();
+        if pruned > 0 {
+            tracing::debug!(event = "mem_watch.pruned_dead_roots", count = pruned);
+        }
         return;
     }
 

@@ -212,7 +212,21 @@ impl Registry {
         sealed
     }
 
-    /// 清理已退出或被复用的 root。返回清理数量。
+    /// 轻量剪枝：只校验 root 自己是否还活着（不扫全表）。
+    ///
+    /// 采样走"快速路径"（全部封窗且内存未超阈值）时不会读全表，
+    /// 这时仍要确认 root 没死——否则 pid 被复用后会把它当成有效会话，
+    /// 其子进程会被纳入淘汰范围。
+    pub fn prune_dead_light(&self) -> usize {
+        let mut guard = self.roots.write().unwrap_or_else(|e| e.into_inner());
+        let before = guard.len();
+        guard.retain(|_, root| {
+            sys::read_pid(root.pid).is_some_and(|info| info.starttime == root.born)
+        });
+        before - guard.len()
+    }
+
+    /// 清理已退出或被复用的 root（需要完整进程表）。返回清理数量。
     pub fn prune_dead(&self, table: &HashMap<u32, ProcInfo>) -> usize {
         let mut guard = self.roots.write().unwrap_or_else(|e| e.into_inner());
         let before = guard.len();
