@@ -1,9 +1,13 @@
 //! 会话注册表：谁是被监控的 agent 根进程，以及"启动窗口"保护的进程集合。
 //!
-//! 按 `project_id` 索引（spawn 时必有，`process_prompt` 处也能拿到），
-//! 而不是按 pid——否则封窗钩子挂不上。
+//! **按 pid 索引，按 project_id 分组**：一个 project 可能同时有多个 agent 进程
+//! （并发上限配置允许），按 project 做 key 会互相覆盖，导致先注册的会话失去保护。
+//! `mark_session_active(project)` 会封窗该 project 下的所有根进程。
+//!
+//! 受保护集合记录的是 `(pid, starttime)`：只用 pid 会让「pid 被复用后的新进程」
+//! 继承保护，从而永远杀不掉。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -11,6 +15,14 @@ use std::time::Instant;
 
 use super::proc_tree::{ProcInfo, descendants};
 use super::sys;
+
+/// 取 `root` 所有后代的 `(pid, starttime)`，用作启动窗口快照。
+fn descendant_births(table: &HashMap<u32, ProcInfo>, root: u32) -> Vec<(u32, u64)> {
+    descendants(table, root)
+        .into_iter()
+        .filter_map(|pid| table.get(&pid).map(|info| (pid, info.starttime)))
+        .collect()
+}
 
 /// 一个被监控的 agent 会话。
 pub struct Root {
@@ -20,11 +32,13 @@ pub struct Root {
     pub born: u64,
     /// root 的 exe（`/proc/<pid>/exe`）。
     pub exe: PathBuf,
-    /// root 的 `cmdline[1]` 的 basename，例如 `claude-code-acp-ts`。
+    /// root 的 `cmdline[1]` 的 basename，例如 `claude-code-acp-ts`；
+    /// `cmdline[1]` 是参数（以 `-` 开头）时为空。
     pub script_hint: String,
     pub spawned_at: Instant,
     sealed: AtomicBool,
-    protected: Mutex<HashSet<u32>>,
+    /// pid → starttime；只有 starttime 一致才算"受保护"。
+    protected: Mutex<HashMap<u32, u64>>,
 }
 
 impl Root {
@@ -43,7 +57,7 @@ impl Root {
             script_hint,
             spawned_at: Instant::now(),
             sealed: AtomicBool::new(false),
-            protected: Mutex::new(HashSet::new()),
+            protected: Mutex::new(HashMap::new()),
         }
     }
 
@@ -51,43 +65,50 @@ impl Root {
         self.sealed.load(Ordering::Relaxed)
     }
 
-    /// 把一批进程加入永久保护（启动窗口快照）。
-    pub fn protect(&self, pids: impl IntoIterator<Item = u32>) {
+    /// 把一批进程（pid + starttime）加入永久保护。
+    pub fn protect(&self, pids: impl IntoIterator<Item = (u32, u64)>) {
         let mut guard = self.protected.lock().unwrap_or_else(|e| e.into_inner());
         guard.extend(pids);
     }
 
-    pub fn protected(&self) -> HashSet<u32> {
+    pub fn protected(&self) -> HashMap<u32, u64> {
         self.protected
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 
+    /// 该 pid 是否受保护；**starttime 必须一致**，否则说明 pid 已被复用。
+    pub fn is_protected(&self, pid: u32, starttime: u64) -> bool {
+        self.protected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pid)
+            .is_some_and(|born| *born == starttime)
+    }
+
     /// 封窗：先加入最终快照，再翻转标志（顺序不能反，否则有竞态）。
-    pub fn seal_with(&self, snapshot: impl IntoIterator<Item = u32>) {
+    pub fn seal_with(&self, snapshot: impl IntoIterator<Item = (u32, u64)>) {
         self.protect(snapshot);
         self.sealed.store(true, Ordering::Release);
     }
 
     /// 规则 4/5：`exe` 等于 root 的 exe，或路径里包含 root 的脚本名。
     pub fn matches_exe(&self, exe: &Path) -> bool {
-        if exe == self.exe {
+        if !self.exe.as_os_str().is_empty() && exe == self.exe {
             return true;
         }
-        if !self.script_hint.is_empty() {
-            if let Some(text) = exe.to_str() {
-                return text.contains(&self.script_hint);
-            }
-        }
-        false
+        !self.script_hint.is_empty()
+            && exe
+                .to_str()
+                .is_some_and(|text| text.contains(&self.script_hint))
     }
 }
 
-/// 会话注册表。
+/// 会话注册表（pid → Root）。
 #[derive(Default)]
 pub struct Registry {
-    roots: RwLock<HashMap<String, Arc<Root>>>,
+    roots: RwLock<HashMap<u32, Arc<Root>>>,
 }
 
 impl Registry {
@@ -99,9 +120,9 @@ impl Registry {
     pub fn register(&self, project: &str, pid: u32) -> Option<Arc<Root>> {
         let info = sys::read_pid(pid)?;
         let exe = sys::read_exe(pid).unwrap_or_default();
-        let argv = sys::read_cmdline(pid);
-        let script_hint = argv
+        let script_hint = sys::read_cmdline(pid)
             .get(1)
+            .filter(|arg| !arg.starts_with('-'))
             .and_then(|arg| Path::new(arg).file_name())
             .and_then(|name| name.to_str())
             .unwrap_or_default()
@@ -109,7 +130,7 @@ impl Registry {
 
         let root = Arc::new(Root::new(project, pid, info.starttime, exe, script_hint));
         let mut guard = self.roots.write().unwrap_or_else(|e| e.into_inner());
-        guard.insert(project.to_owned(), Arc::clone(&root));
+        guard.insert(pid, Arc::clone(&root));
         Some(root)
     }
 
@@ -117,20 +138,32 @@ impl Registry {
     pub fn insert(&self, root: Root) -> Arc<Root> {
         let root = Arc::new(root);
         let mut guard = self.roots.write().unwrap_or_else(|e| e.into_inner());
-        guard.insert(root.project.clone(), Arc::clone(&root));
+        guard.insert(root.pid, Arc::clone(&root));
         root
     }
 
-    pub fn unregister(&self, project: &str) {
+    /// 会话结束：只移除该 pid（同 project 的其它并发会话不受影响）。
+    pub fn unregister(&self, project: &str, pid: u32) {
         let mut guard = self.roots.write().unwrap_or_else(|e| e.into_inner());
-        guard.remove(project);
+        if guard.get(&pid).is_some_and(|root| root.project == project) {
+            guard.remove(&pid);
+        }
     }
 
     pub fn get(&self, project: &str) -> Option<Arc<Root>> {
         self.roots
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .get(project)
+            .values()
+            .find(|root| root.project == project)
+            .cloned()
+    }
+
+    pub fn get_pid(&self, pid: u32) -> Option<Arc<Root>> {
+        self.roots
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pid)
             .cloned()
     }
 
@@ -148,6 +181,8 @@ impl Registry {
     }
 
     /// 未封窗的会话：把当前后代加入保护（由 sampler 每 tick 调用）。
+    ///
+    /// 返回新增的 pid 数（用于日志/测试）。
     pub fn snapshot_bootstrap(&self, table: &HashMap<u32, ProcInfo>) -> usize {
         let mut added = 0usize;
         for root in self.all() {
@@ -155,25 +190,26 @@ impl Registry {
                 continue;
             }
             let before = root.protected().len();
-            root.protect(descendants(table, root.pid));
+            root.protect(descendant_births(table, root.pid));
             added += root.protected().len().saturating_sub(before);
         }
         added
     }
 
-    /// 封窗：用当前进程表做**同步最终快照**，然后关闭窗口。
+    /// 封窗某个 project 下**所有**未封窗的会话。
     ///
     /// 为什么必须同步快照：首条消息可能落在两次采样之间，此时 agent 的子进程
     /// 还没被任何 tick 看到；不补这一次，它会在窗口关闭后立刻变成可杀候选。
-    pub fn seal(&self, project: &str, table: &HashMap<u32, ProcInfo>) -> bool {
-        let Some(root) = self.get(project) else {
-            return false;
-        };
-        if root.is_sealed() {
-            return false;
+    pub fn seal_project(&self, project: &str, table: &HashMap<u32, ProcInfo>) -> usize {
+        let mut sealed = 0usize;
+        for root in self.all() {
+            if root.project != project || root.is_sealed() {
+                continue;
+            }
+            root.seal_with(descendant_births(table, root.pid));
+            sealed += 1;
         }
-        root.seal_with(descendants(table, root.pid));
-        true
+        sealed
     }
 
     /// 清理已退出或被复用的 root。返回清理数量。
@@ -202,15 +238,19 @@ pub fn global() -> Option<Arc<Registry>> {
 
 /// spawn 后调用；未安装注册表（其它二进制/测试）时静默 no-op。
 pub fn try_register(project: &str, pid: u32) {
-    if let Some(registry) = global() {
-        drop(registry.register(project, pid));
+    let Some(registry) = global() else {
+        return;
+    };
+    if registry.register(project, pid).is_none() {
+        // 进程可能在 register 前就退出；只影响该会话，不打断 spawn。
+        tracing::debug!(event = "mem_watch.register_skipped", project, pid);
     }
 }
 
 /// 会话结束时调用；未安装注册表时 no-op。
-pub fn try_unregister(project: &str) {
+pub fn try_unregister(project: &str, pid: u32) {
     if let Some(registry) = global() {
-        registry.unregister(project);
+        registry.unregister(project, pid);
     }
 }
 
@@ -220,18 +260,20 @@ pub fn mark_session_active(project: &str) {
         return;
     };
     // 已封窗就不必再扫 /proc（`process_prompt` 每次都会调这里）
-    match registry.get(project) {
-        Some(root) if !root.is_sealed() => {}
-        _ => return,
+    let pending = registry
+        .all()
+        .into_iter()
+        .any(|root| root.project == project && !root.is_sealed());
+    if !pending {
+        return;
     }
     let table = sys::read_all();
-    registry.seal(project, &table);
+    registry.seal_project(project, &table);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mem_watch::proc_tree::ProcInfo;
 
     fn info(pid: u32, ppid: u32, starttime: u64) -> ProcInfo {
         ProcInfo {
@@ -251,7 +293,7 @@ mod tests {
         t
     }
 
-    fn root(project: &str, pid: u32, born: u64) -> Root {
+    fn root_of(project: &str, pid: u32, born: u64) -> Root {
         Root::new(
             project,
             pid,
@@ -264,35 +306,41 @@ mod tests {
     #[test]
     fn bootstrap_snapshot_protects_descendants() {
         let registry = Registry::new();
-        registry.insert(root("p1", 100, 1000));
+        registry.insert(root_of("p1", 100, 1000));
 
-        let added = registry.snapshot_bootstrap(&table());
-        assert!(added >= 2, "root 的后代应全部进保护集");
+        assert!(registry.snapshot_bootstrap(&table()) >= 2);
 
-        let sealed = registry.get("p1").unwrap();
-        let protected = sealed.protected();
-        assert!(protected.contains(&101));
-        assert!(protected.contains(&102));
-        assert!(
-            !protected.contains(&100),
-            "root 自己不进保护集（另有规则排除）"
-        );
+        let root = registry.get("p1").unwrap();
+        assert!(root.is_protected(101, 1001));
+        assert!(root.is_protected(102, 1002));
+        assert!(!root.is_protected(100, 1000), "root 自己不进保护集");
+    }
+
+    #[test]
+    fn protection_is_bound_to_starttime() {
+        let registry = Registry::new();
+        registry.insert(root_of("p1", 100, 1000));
+        registry.snapshot_bootstrap(&table());
+
+        let root = registry.get("p1").unwrap();
+        // 同一个 pid、不同 starttime ⇒ 是复用后的新进程，不能被保护
+        assert!(!root.is_protected(101, 9999));
     }
 
     #[test]
     fn seal_takes_final_snapshot_before_closing() {
         let registry = Registry::new();
-        registry.insert(root("p1", 100, 1000));
+        registry.insert(root_of("p1", 100, 1000));
 
         // 模拟：首条消息在两次采样之间到达，之前一次快照都没做
         let mut late = table();
-        late.insert(103, info(103, 100, 1003)); // 消息到达瞬间刚起的进程
-        assert!(registry.seal("p1", &late));
+        late.insert(103, info(103, 100, 1003));
+        assert_eq!(registry.seal_project("p1", &late), 1);
 
-        let sealed = registry.get("p1").unwrap();
-        assert!(sealed.is_sealed());
+        let root = registry.get("p1").unwrap();
+        assert!(root.is_sealed());
         assert!(
-            sealed.protected().contains(&103),
+            root.is_protected(103, 1003),
             "封窗前的同步快照必须包含新进程"
         );
     }
@@ -300,42 +348,70 @@ mod tests {
     #[test]
     fn snapshot_stops_after_seal() {
         let registry = Registry::new();
-        registry.insert(root("p1", 100, 1000));
-        registry.seal("p1", &table());
+        registry.insert(root_of("p1", 100, 1000));
+        registry.seal_project("p1", &table());
 
         let mut later = table();
         later.insert(104, info(104, 100, 1004));
-        assert_eq!(
-            registry.snapshot_bootstrap(&later),
-            0,
-            "封窗后不再吸收新进程"
+        assert_eq!(registry.snapshot_bootstrap(&later), 0, "封窗后不再吸收新进程");
+    }
+
+    #[test]
+    fn seals_only_the_requested_project() {
+        let registry = Registry::new();
+        registry.insert(root_of("p1", 100, 1000));
+        registry.insert(root_of("p2", 200, 2000));
+
+        let mut t = table();
+        t.insert(200, info(200, 1, 2000));
+        assert_eq!(registry.seal_project("p1", &t), 1);
+
+        assert!(registry.get("p1").unwrap().is_sealed());
+        assert!(
+            !registry.get("p2").unwrap().is_sealed(),
+            "其它 project 不能被误封"
         );
     }
 
     #[test]
+    fn concurrent_sessions_of_same_project_are_independent() {
+        let registry = Registry::new();
+        registry.insert(root_of("p1", 100, 1000));
+        registry.insert(root_of("p1", 200, 2000)); // 同 project 的第二个 agent
+
+        let mut t = table();
+        t.insert(200, info(200, 1, 2000));
+        assert_eq!(registry.root_pids().len(), 2, "同 project 多会话不能互相覆盖");
+
+        registry.unregister("p1", 200);
+        assert!(registry.get_pid(100).is_some());
+        assert!(registry.get_pid(200).is_none());
+    }
+
+    #[test]
     fn matches_exe_covers_sibling_binary() {
-        let r = root("p1", 100, 1000);
-        assert!(r.matches_exe(Path::new("/usr/local/bin/node")));
-        assert!(r.matches_exe(Path::new(
+        let root = root_of("p1", 100, 1000);
+        assert!(root.matches_exe(Path::new("/usr/local/bin/node")));
+        assert!(root.matches_exe(Path::new(
             "/usr/local/lib/node_modules/claude-code-acp-ts/node_modules/x/claude"
         )));
-        assert!(!r.matches_exe(Path::new("/usr/bin/python3")));
+        assert!(!root.matches_exe(Path::new("/usr/bin/python3")));
     }
 
     #[test]
     fn prune_removes_reused_or_dead_roots() {
         let registry = Registry::new();
-        registry.insert(root("dead", 200, 5000));
-        registry.insert(root("reused", 201, 6000));
-        registry.insert(root("alive", 202, 7000));
+        registry.insert(root_of("dead", 200, 5000));
+        registry.insert(root_of("reused", 201, 6000));
+        registry.insert(root_of("alive", 202, 7000));
 
         let mut t = HashMap::new();
         t.insert(201, info(201, 1, 9999)); // starttime 变了 ⇒ 复用
         t.insert(202, info(202, 1, 7000)); // 正常
 
         assert_eq!(registry.prune_dead(&t), 2);
-        assert!(registry.get("alive").is_some());
-        assert!(registry.get("dead").is_none());
-        assert!(registry.get("reused").is_none());
+        assert!(registry.get_pid(202).is_some());
+        assert!(registry.get_pid(200).is_none());
+        assert!(registry.get_pid(201).is_none());
     }
 }

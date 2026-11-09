@@ -143,17 +143,19 @@ impl Switch {
         }
         self.last_refresh = Some(now);
 
-        let raw = self.read_first_existing();
-        if raw.is_none() {
-            // 文件被删除 ⇒ 回到默认
+        let Some(raw) = self.read_first_existing() else {
+            // 所有路径都不存在 ⇒ 回到默认（文件被删除是"关闭覆盖"的意图）
             if self.cached != Overrides::default() {
                 self.cached = Overrides::default();
                 self.cached_raw = None;
             }
             return;
-        }
-        let raw = raw.expect("checked above");
+        };
         if self.cached_raw.as_deref() == Some(raw.as_str()) {
+            return;
+        }
+        if raw.is_empty() {
+            // 存在但暂时读不出来：保留上一份有效配置，等下次刷新
             return;
         }
 
@@ -173,11 +175,16 @@ impl Switch {
         }
     }
 
+    /// 返回第一个**存在**的开关文件内容。
+    ///
+    /// 存在但读不出来（权限/半成品）时返回空串：保持上一份有效配置，
+    /// 不要因为一次瞬时读取失败就把 `on` 退回默认值。
     fn read_first_existing(&self) -> Option<String> {
         for path in &self.paths {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                return Some(content);
+            if !path.exists() {
+                continue;
             }
+            return Some(std::fs::read_to_string(path).unwrap_or_default());
         }
         None
     }

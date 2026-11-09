@@ -88,8 +88,8 @@ impl Config {
             min_rss_floor: parse_u64(
                 env_str("RCODER_MEM_WATCH_MIN_RSS_MB").as_deref(),
                 d.min_rss_floor / (1024 * 1024),
-            ) * 1024
-                * 1024,
+            )
+            .saturating_mul(1024 * 1024),
             grace: Duration::from_millis(parse_u64(
                 env_str("RCODER_MEM_WATCH_GRACE_MS").as_deref(),
                 d.grace.as_millis() as u64,

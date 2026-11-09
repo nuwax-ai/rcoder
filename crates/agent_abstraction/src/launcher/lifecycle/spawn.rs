@@ -173,7 +173,7 @@ impl AgentLifecycleGuard {
                 .map_err(ToString::to_string);
 
             // agent 已退出：从看门狗注册表移除，避免 pid 复用后被误认。
-            process_utils::mem_watch::try_unregister(&project_id_for_reaper);
+            process_utils::mem_watch::try_unregister(&project_id_for_reaper, pid);
 
             // 仅真实 wait 成功才能收回该代次的配置。取消受理、Drop 或未知
             // wait 结果都不能先删仍可能被活进程使用的绑定。先清理再发布退出，

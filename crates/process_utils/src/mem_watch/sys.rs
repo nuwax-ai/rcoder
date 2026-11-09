@@ -17,6 +17,7 @@ pub fn page_size() -> u64 {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn page_size() -> u64 {
     4096
 }
