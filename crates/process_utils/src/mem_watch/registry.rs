@@ -353,7 +353,11 @@ mod tests {
 
         let mut later = table();
         later.insert(104, info(104, 100, 1004));
-        assert_eq!(registry.snapshot_bootstrap(&later), 0, "封窗后不再吸收新进程");
+        assert_eq!(
+            registry.snapshot_bootstrap(&later),
+            0,
+            "封窗后不再吸收新进程"
+        );
     }
 
     #[test]
@@ -381,7 +385,11 @@ mod tests {
 
         let mut t = table();
         t.insert(200, info(200, 1, 2000));
-        assert_eq!(registry.root_pids().len(), 2, "同 project 多会话不能互相覆盖");
+        assert_eq!(
+            registry.root_pids().len(),
+            2,
+            "同 project 多会话不能互相覆盖"
+        );
 
         registry.unregister("p1", 200);
         assert!(registry.get_pid(100).is_some());
