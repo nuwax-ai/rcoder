@@ -1294,3 +1294,34 @@ async fn swagger_ui_serves_vendored_assets() {
         );
     }
 }
+
+/// 重启接口契约锚点：path 已注册，请求与 stop 同形，响应带 resumed_session_id
+/// 及其 None 语义说明（前端据此判断上下文是否可恢复）。
+#[test]
+fn computer_agent_restart_path_documents_resume_contract() {
+    let document = ApiDoc::openapi();
+    let item = document
+        .paths
+        .paths
+        .get("/computer/agent/restart")
+        .expect("restart path documented");
+    let op = item.post.as_ref().expect("POST operation");
+    let desc = op.description.as_deref().expect("restart description");
+    for token in ["保留会话注册", "session/load", "幂等成功", "不销毁容器"] {
+        assert!(desc.contains(token), "restart 描述缺契约锚点 {token}");
+    }
+    let schema = document
+        .components
+        .as_ref()
+        .and_then(|c| c.schemas.get("ComputerAgentRestartResponse"))
+        .expect("restart response schema registered");
+    let json = serde_json::to_value(schema).unwrap();
+    let props = json
+        .get("properties")
+        .and_then(|p| p.get("resumed_session_id"))
+        .expect("resumed_session_id documented");
+    assert!(
+        serde_json::to_string(props).unwrap().contains("可恢复会话"),
+        "resumed_session_id must explain its None semantics"
+    );
+}

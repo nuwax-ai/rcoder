@@ -140,6 +140,8 @@ impl ContainerActivityProbe for GrpcContainerActivityProbe {
                 &grpc_addr,
                 identifier,
                 identifier,
+                // idle 判定不消费资源字段,不约束执行身份
+                None,
                 Duration::from_secs(3),
             ),
         )

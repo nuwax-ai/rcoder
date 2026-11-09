@@ -6,6 +6,8 @@ success: "操作成功"
 success.container_destroyed: "容器已成功銷毀"
 success.container_not_exist: "容器不存在，無需操作"
 success.agent_already_stopped: "Agent 已處於停止狀態"
+success.agent_restarted: "Agent 已重啟，下次對話將嘗試恢復上下文"
+success.agent_restart_idempotent: "Agent 未在執行，無需重啟"
 
 # Agent 相關錯誤
 error.agent_busy: "Agent 正在執行任務"

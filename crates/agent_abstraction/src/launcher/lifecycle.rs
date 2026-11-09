@@ -179,6 +179,10 @@ impl AgentLifecycle for AgentLifecycleGuard {
         AgentLifecycleGuard::is_stopped(self)
     }
 
+    fn agent_pgid(&self) -> Option<u32> {
+        Some(self.inner.pgid)
+    }
+
     fn cancellation_token(&self) -> &CancellationToken {
         AgentLifecycleGuard::cancellation_token(self)
     }

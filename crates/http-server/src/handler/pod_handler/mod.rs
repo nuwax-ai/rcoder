@@ -34,6 +34,7 @@ mod ensure_flow;
 mod helpers;
 mod keepalive;
 mod queries;
+mod resources;
 mod restart;
 #[cfg(all(test, feature = "userapp-turso"))]
 mod retirement_tests;
@@ -54,6 +55,7 @@ pub(crate) use helpers::{
 };
 pub use keepalive::*;
 pub use queries::*;
+pub use resources::*;
 pub use restart::*;
 pub use status::*;
 pub use stop::*;

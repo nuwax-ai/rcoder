@@ -225,6 +225,10 @@ pub struct GetStatusResponse {
     /// * 清 ring + cursor-reset,避免新 epoch 的低 seq 事件被客户端去重静默丢弃(#15)。
     #[prost(string, optional, tag = "3")]
     pub stream_epoch: ::core::option::Option<::prost::alloc::string::String>,
+    /// Registry 确认的当前执行身份（is_found=true 时必填）。调用方以此作为
+    /// 状态聚合与资源核验的执行身份，避免与资源采样聚合自不同换代。
+    #[prost(string, optional, tag = "4")]
+    pub session_id: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -256,6 +260,11 @@ pub struct StopAgentResponse {
     /// 被停止的 Agent 的项目 ID
     #[prost(string, tag = "4")]
     pub project_id: ::prost::alloc::string::String,
+    /// 本 RPC 实际确认停止的执行身份（registry 条目的会话 ID）。not_found 时
+    /// 缺省。调用方以此为准返回/记录被重启的会话，不得事后从注册表读取
+    /// （停止与读取之间可能换代）。
+    #[prost(string, optional, tag = "5")]
+    pub stopped_session_id: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -542,6 +551,10 @@ pub struct GetContainerStatusRequest {
     /// 项目ID
     #[prost(string, tag = "2")]
     pub project_id: ::prost::alloc::string::String,
+    /// 预期执行身份（可选）。registry 当前会话与其不符时不采集资源（资源字段
+    /// 降级为缺省），防止状态与资源聚合自不同换代的执行。旧调用方不填，行为不变。
+    #[prost(string, optional, tag = "3")]
+    pub expected_session_id: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// 容器状态响应
 #[allow(clippy::all)]
@@ -569,6 +582,19 @@ pub struct GetContainerStatusResponse {
     /// connections. Missing/zero is insufficient evidence for orphan retirement.
     #[prost(uint32, tag = "7")]
     pub idle_observation_version: u32,
+    /// 整个容器（pod 形态下的计算容器）CPU 使用率（0 起，多核可超 100）。
+    /// cgroup v2 cpu.stat usage_usec 查询驱动差分；不可得时缺省（降级不 500）。
+    #[prost(double, optional, tag = "8")]
+    pub container_cpu_percent: ::core::option::Option<f64>,
+    /// 整个容器内存占用（MB，cgroup v2 memory.current；含 agent/VNC/桌面全部进程）
+    #[prost(int64, optional, tag = "9")]
+    pub container_memory_mb: ::core::option::Option<i64>,
+    /// 容器内存限额（MB，cgroup memory.max；未设限或缺省为 None）
+    #[prost(int64, optional, tag = "10")]
+    pub container_memory_limit_mb: ::core::option::Option<i64>,
+    /// 容器 CPU 核数限额（cgroup cpu.max quota/period；未设限或缺省为 None）
+    #[prost(double, optional, tag = "11")]
+    pub container_cpu_limit_cores: ::core::option::Option<f64>,
 }
 /// VNC 状态查询请求
 #[allow(clippy::all)]

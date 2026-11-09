@@ -65,38 +65,61 @@ pub async fn handle_computer_status(
         request.isolation_type
     );
 
-    // 从 AGENT_REGISTRY 查询 Agent 状态
-    let agent_info = AGENT_REGISTRY.get_agent_info(project_id).filter(|info| {
-        request
-            .session_id
-            .as_deref()
-            .filter(|sid| !sid.is_empty())
-            .is_none_or(|sid| {
-                shared_types::SessionHint::classify(Some(sid))
-                    .as_session_id()
-                    .is_some()
-                    && info.session_id.0.as_ref() == sid
-            })
-    });
+    // 从 AGENT_REGISTRY 查询 Agent 状态。在 guard 作用域内提取所需快照并
+    // 立即释放 Ref,后续 /proc 资源扫描不得持有注册表读锁(锁纪律:
+    // guard 不跨 I/O,避免阻塞注册表写方)。
+    let agent_snapshot = AGENT_REGISTRY
+        .get_agent_info(project_id)
+        .filter(|info| {
+            request
+                .session_id
+                .as_deref()
+                .filter(|sid| !sid.is_empty())
+                .is_none_or(|sid| {
+                    shared_types::SessionHint::classify(Some(sid))
+                        .as_session_id()
+                        .is_some()
+                        && info.session_id.0.as_ref() == sid
+                })
+        })
+        .map(|info| {
+            let session_id = shared_types::SessionHint::classify(Some(info.session_id.0.as_ref()))
+                .as_session_id()
+                .map(str::to_owned);
+            let status = format!("{:?}", info.status);
+            let (last_activity, created_at) = (info.last_activity, info.created_at);
+            drop(info);
+            (session_id, status, last_activity, created_at)
+        });
 
-    let response = match agent_info {
-        Some(info) => {
+    // agent 进程组资源采集(本地注册表直采;失败/未运行降级 None)。
+    // 传入快照里的执行身份:registry 在两次读取之间换代时,资源缺省,
+    // 状态(session_id)与资源保证来自同一执行。
+    let (cpu_percent, memory_mb) = crate::service::agent_resource_monitor::sample_for_project(
+        project_id,
+        agent_snapshot
+            .as_ref()
+            .and_then(|(sid, _, _, _)| sid.as_deref()),
+    );
+
+    let response = match agent_snapshot {
+        Some((session_id, status, last_activity, created_at)) => {
             // Agent 存在且活跃
             info!(
                 "✅ [HTTP] Agent status: project_id={}, is_alive=true, session_id={:?}",
-                project_id, info.session_id
+                project_id, session_id
             );
 
             ComputerAgentStatusResponse {
                 user_id: request.user_id.clone(),
                 project_id: project_id.to_string(),
                 is_alive: true,
-                session_id: shared_types::SessionHint::classify(Some(info.session_id.0.as_ref()))
-                    .as_session_id()
-                    .map(str::to_owned),
-                status: Some(format!("{:?}", info.status)),
-                last_activity: Some(info.last_activity),
-                created_at: Some(info.created_at),
+                session_id,
+                status: Some(status),
+                last_activity: Some(last_activity),
+                created_at: Some(created_at),
+                cpu_percent,
+                memory_mb,
             }
         }
         None => {
@@ -111,6 +134,8 @@ pub async fn handle_computer_status(
                 status: None,
                 last_activity: None,
                 created_at: None,
+                cpu_percent: None,
+                memory_mb: None,
             }
         }
     };
