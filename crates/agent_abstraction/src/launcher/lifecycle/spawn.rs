@@ -115,6 +115,9 @@ impl AgentLifecycleGuard {
         // 🔥 进程组 ID 等于组长进程的 PID
         // process-wrap 的 ProcessGroup 使用 setpgid(0, 0) 创建新进程组，使进程成为组长
         let pgid = pid;
+
+        // 内存看门狗：登记这个会话的 agent 根进程。未安装时 no-op。
+        process_utils::mem_watch::try_register(&project_id, pid);
         let project_id_clone = project_id.clone();
         // Process ownership exists before ACP assigns a session identity.
         // A historical state label never becomes that identity either.
@@ -168,6 +171,9 @@ impl AgentLifecycleGuard {
                 .as_ref()
                 .map(|_| ())
                 .map_err(ToString::to_string);
+
+            // agent 已退出：从看门狗注册表移除，避免 pid 复用后被误认。
+            process_utils::mem_watch::try_unregister(&project_id_for_reaper);
 
             // 仅真实 wait 成功才能收回该代次的配置。取消受理、Drop 或未知
             // wait 结果都不能先删仍可能被活进程使用的绑定。先清理再发布退出，

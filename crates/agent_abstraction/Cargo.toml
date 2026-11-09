@@ -21,6 +21,7 @@ dial9 = ["rcoder-obs/dial9"]
 workspace = true
 
 [dependencies]
+process_utils = { workspace = true }
 # 依赖其他 crate
 agent_config = { workspace = true }
 shared_types = { workspace = true }

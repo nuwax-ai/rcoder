@@ -112,6 +112,10 @@ async fn agent_runner_run(cli_args: CliArgs) -> anyhow::Result<()> {
     let telemetry: TelemetryGuard = rcoder_telemetry::init(telemetry_config).await?;
     let _telemetry = Arc::new(telemetry);
 
+    // 内存看门狗：安装会话注册表 + 启动采样任务。
+    // 默认 mode=off（空转），可用文件开关 / env 在运行期打开，见 docs/agent-mem-watch.md。
+    process_utils::mem_watch::install_and_start();
+
     // 初始化 FeatureFlags（进程级单例：读 RCODER_EMBED_FILE_SERVER 等环境开关）
     shared_types::FeatureFlags::init();
 
