@@ -63,8 +63,10 @@ pub async fn run(config: Config) {
 }
 
 async fn step(reg: &Arc<Registry>, cfg: &Config, last_action: &mut Option<Instant>) {
-    let Some(limit) = sys::read_memory_max() else {
-        return; // 无限制或非 Linux
+    let Some(limit) = cfg.effective_limit() else {
+        // 无限额信息：host cgroup namespace（容器内 memory.max=max）且没有
+        // env 覆盖——看门狗无法判断阈值，保持空闲（安全方向）。
+        return;
     };
 
     let current = sys::read_memory_current().unwrap_or(0);

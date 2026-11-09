@@ -50,12 +50,17 @@ pub struct Config {
     pub cooldown: Duration,
     /// 启动窗口兜底：到点强制封窗（没有 `mark_session_active` 的 agent）。
     pub bootstrap_cap: Duration,
+    /// 内存限额覆盖（字节）。集群用 host cgroup namespace 时，容器内
+    /// `/sys/fs/cgroup/memory.max` 是 `max`，读不到真实限额；由 rcoder 创建
+    /// pod 时把已知限额注入 env，看门狗以它为准。
+    pub limit_override: Option<u64>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             mode: Mode::Off,
+            limit_override: None,
             ratio: 0.85,
             interval: Duration::from_millis(500),
             min_ratio: 0.08,
@@ -102,6 +107,9 @@ impl Config {
                 env_str("RCODER_MEM_WATCH_BOOTSTRAP_CAP_MS").as_deref(),
                 d.bootstrap_cap.as_millis() as u64,
             )),
+            limit_override: env_str("RCODER_MEM_WATCH_LIMIT_BYTES")
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|v| *v > 0),
         }
     }
 
@@ -117,6 +125,11 @@ impl Config {
     /// 触发阈值（字节）。
     pub fn threshold(&self, limit: u64) -> u64 {
         (limit as f64 * self.ratio) as u64
+    }
+
+    /// 生效限额：显式覆盖优先，否则读 cgroup。
+    pub fn effective_limit(&self) -> Option<u64> {
+        self.limit_override.or_else(super::sys::read_memory_max)
     }
 }
 
@@ -167,6 +180,16 @@ mod tests {
             cfg.threshold(8 << 30),
             (8f64 * 0.85 * 1024.0 * 1024.0 * 1024.0) as u64
         );
+    }
+
+    #[test]
+    fn effective_limit_prefers_override() {
+        let mut cfg = Config::default();
+        cfg.limit_override = Some(512 * 1024 * 1024);
+        assert_eq!(cfg.effective_limit(), Some(512 * 1024 * 1024));
+        cfg.limit_override = None;
+        // 非 Linux（macOS 测试机）读不到 cgroup → None；Linux 有限制时返回真实值
+        let _ = cfg.effective_limit();
     }
 
     #[test]

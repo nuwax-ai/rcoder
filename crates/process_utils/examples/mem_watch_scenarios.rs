@@ -46,6 +46,8 @@ fn main() -> anyhow::Result<()> {
         grace: Duration::from_secs(1),
         cooldown: Duration::from_millis(500),
         bootstrap_cap: Duration::from_secs(120),
+        // k8s host cgroupns 下容器内 memory.max=max，示例显式给限额（512Mi）
+        limit_override: Some(512 * 1024 * 1024),
         ..Default::default()
     };
     // mem_watch::start 需要 tokio 上下文：起一个后台 runtime 承载采样任务。
