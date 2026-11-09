@@ -320,6 +320,8 @@ pub async fn computer_agent_status(
             status: Some(grpc_response.status.clone()),
             last_activity: Some(project_info.last_activity()),
             created_at: Some(project_info.created_at()),
+            cpu_percent: None,
+            memory_mb: None,
         }
     } else {
         // no project record found，但 gRPC 确认 Agent 存在
@@ -378,7 +380,42 @@ pub async fn computer_agent_status(
             // 使用当前时间作为最后活动时间，避免立即被清理
             last_activity: Some(chrono::Utc::now()),
             created_at: Some(chrono::Utc::now()), // 使用当前时间作为创建时间（近似）
+            cpu_percent: None,
+            memory_mb: None,
         }
+    };
+
+    // 7. agent 进程组资源用量（失败降级 None，不影响状态字段）。
+    // expected = GetStatus 确认并返回的执行身份（grpc_response.session_id，
+    // registry 确认时的单一事实源）——不再回退注册表重读（确认与读取之间
+    // 可能换代，读到 B 会用 B 通过资源校验、拼出 A 的状态与 B 的资源）。
+    // 响应 session_id 同步改为该确认值，状态与资源保证同执行；agent_runner
+    // 侧二次核验不符时资源缺省。
+    let confirmed_session = grpc_response
+        .session_id
+        .clone()
+        .filter(|sid| !sid.is_empty())
+        .and_then(|sid| {
+            shared_types::SessionHint::classify(Some(&sid))
+                .as_session_id()
+                .map(str::to_owned)
+        });
+    let (cpu_percent, memory_mb) = query_agent_resource_usage(
+        &state,
+        &grpc_addr,
+        request.user_id.as_deref(),
+        project_id,
+        confirmed_session.as_deref(),
+    )
+    .await;
+    // 响应 session_id 保持既有语义(classify 请求值,回退注册表;LegacyPending
+    // 与自愈场景不发布身份——既有测试保护的需求)。资源核验身份(expected)
+    // 单独使用 GetStatus 确认值;换代不符时资源缺省,不会把 B 的资源拼进
+    // A 的状态,也不会发布未确认的身份。
+    let response = ComputerAgentStatusResponse {
+        cpu_percent,
+        memory_mb,
+        ..response
     };
 
     info!(
@@ -390,6 +427,43 @@ pub async fn computer_agent_status(
     );
 
     Ok(HttpResult::success(response))
+}
+
+/// 查询 agent 进程组资源用量（gRPC GetContainerStatus；agent_runner 内按
+/// pgid 采集进程组 RSS 与 CPU 差分）。
+///
+/// `grpc_addr` 由调用方按各自路径的寻址约定解析（computer 走
+/// `build_grpc_addr`，userApp dev 走 `extract_grpc_addr(service_url)`）。
+/// `expected_session` 是本响应已确认并要报告的执行身份：agent_runner 侧
+/// registry 当前会话与其不符时不采集（资源字段缺省）——保证状态与资源
+/// 聚合自同一执行，换代不拼装。任何 gRPC 失败按降级语义返回 `(None, None)`，
+/// 不影响状态查询主链路——与 proto `cpu_percent`/`memory_mb` 的
+/// "用量降级不 500"契约一致。仅容器运行中且 agent 存活时调用。
+async fn query_agent_resource_usage(
+    state: &AppState,
+    grpc_addr: &str,
+    user_id: Option<&str>,
+    project_id: &str,
+    expected_session: Option<&str>,
+) -> (Option<f64>, Option<i64>) {
+    match crate::grpc::status_query::query_container_status(
+        &state.grpc_pool,
+        grpc_addr,
+        user_id.unwrap_or_default(),
+        project_id,
+        expected_session,
+        std::time::Duration::from_secs(shared_types::GRPC_CONTAINER_STATUS_TIMEOUT_SECS),
+    )
+    .await
+    {
+        Ok(response) => (response.cpu_percent, response.memory_mb),
+        Err(e) => {
+            warn!(
+                "[COMPUTER_AGENT_STATUS] resource query degraded: project_id={project_id}, error={e}"
+            );
+            (None, None)
+        }
+    }
 }
 
 mod retry;

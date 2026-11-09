@@ -13,6 +13,10 @@ pub(super) fn computer_routes(state: Arc<AppState>) -> Router {
         .route("/computer/chat", post(handler::handle_computer_chat))
         .route("/computer/agent/stop", post(handler::computer_agent_stop))
         .route(
+            "/computer/agent/restart",
+            post(handler::computer_agent_restart),
+        )
+        .route(
             "/computer/agent/status",
             post(handler::computer_agent_status),
         ) // 🆕 新增
@@ -58,6 +62,14 @@ pub(super) fn computer_routes(state: Arc<AppState>) -> Router {
             post(handler::pod_compute_recover),
         )
         .route("/computer/pod/status", get(handler::pod_status))
+        .route(
+            "/computer/pod/resources",
+            get(handler::computer_pod_resources),
+        )
+        .route(
+            "/computer/pod/resources/stream",
+            get(handler::computer_pod_resources_stream),
+        )
         .route("/computer/pod/vnc-status", get(handler::pod_vnc_status))
         // 🆕 音频代理路由（用于 OpenAPI 文档）
         .route(

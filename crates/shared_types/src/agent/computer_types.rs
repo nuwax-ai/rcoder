@@ -262,6 +262,20 @@ pub struct ComputerAgentStatusResponse {
     /// 创建时间（仅当 is_alive=true 时存在）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+
+    /// agent 进程组 CPU 使用率（0-100，多核/多进程可超 100）。
+    /// None = 首次查询（无差分基线）/ 采样间隔不足 / 采集降级，稍后轮询即有值；
+    /// is_alive=false 时恒为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 12.5)]
+    pub cpu_percent: Option<f64>,
+
+    /// agent 进程组内存占用（MB，不含容器内 supervisord/VNC 等其他进程）。
+    /// None = agent 未运行、平台不支持（非 Linux）或 /proc 读取失败（降级不报错）；
+    /// is_alive=false 时恒为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 256)]
+    pub memory_mb: Option<i64>,
 }
 
 impl ComputerAgentStatusResponse {
@@ -275,6 +289,8 @@ impl ComputerAgentStatusResponse {
             status: None,
             last_activity: None,
             created_at: None,
+            cpu_percent: None,
+            memory_mb: None,
         }
     }
 }
@@ -383,6 +399,114 @@ pub struct ComputerAgentStopResponse {
     /// 项目 ID
     #[schema(example = "project_456")]
     pub project_id: String,
+}
+
+/// Computer Agent 重启响应
+///
+/// 重启只停止并重建 agent 执行，不销毁容器；与 stop 的差异是保留会话注册，
+/// 同一 project 的下次对话自动尝试恢复上下文（恢复失败自动降级新会话）。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ComputerAgentRestartResponse {
+    /// 是否成功（agent 未运行时也返回成功——目标态已达成，幂等语义）
+    #[schema(example = true)]
+    pub success: bool,
+
+    /// 结果消息
+    #[schema(example = "Agent 已重启，下次对话将尝试恢复上下文")]
+    pub message: String,
+
+    /// 用户 ID（可选，因为请求中 user_id 和 pod_id 二选一）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "user_123")]
+    pub user_id: Option<String>,
+
+    /// Pod ID（可选，因为请求中 user_id 和 pod_id 二选一）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "pod_abc123")]
+    pub pod_id: Option<String>,
+
+    /// 项目 ID
+    #[schema(example = "project_456")]
+    pub project_id: String,
+
+    /// 重启后保留的可恢复会话 ID；None 表示该 project 没有可恢复的会话
+    /// （此前无成功对话），下次对话将是全新会话
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "session789")]
+    pub resumed_session_id: Option<String>,
+}
+
+/// Computer 容器(整个 pod)资源用量响应
+///
+/// 统计口径:容器 cgroup v2(agent/VNC/桌面全部进程),与
+/// `/computer/agent/status` 的 agent 进程组粒度互补。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ComputerPodResourcesResponse {
+    /// 用户 ID(可选)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "user_123")]
+    pub user_id: Option<String>,
+
+    /// Pod ID(可选)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "pod_abc123")]
+    pub pod_id: Option<String>,
+
+    /// 容器是否存活(true=存在且运行中)
+    #[schema(example = true)]
+    pub alive: bool,
+
+    /// 整容器 CPU 使用率(0 起,多核可超 100;查询驱动差分)。
+    /// None = 首次查询(无基线)/ 采样间隔不足 / 采集降级
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 35.0)]
+    pub container_cpu_percent: Option<f64>,
+
+    /// 整容器内存占用(MB,cgroup memory.current;含 agent/VNC/桌面全部进程)。
+    /// None = 采集降级(不报错)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 1080)]
+    pub container_memory_mb: Option<i64>,
+
+    /// 容器内存限额(MB,容器创建时的 resource_limits;未设限为 None)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 3954)]
+    pub container_memory_limit_mb: Option<i64>,
+
+    /// 容器 CPU 核数限额(容器创建时的 resource_limits;未设限为 None)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 2.0)]
+    pub container_cpu_limit_cores: Option<f64>,
+
+    /// agent_runner 进程存活时长(秒)
+    #[schema(example = 3600)]
+    pub uptime_seconds: i64,
+
+    /// 容器 ID(定位成功时)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "abc123def456")]
+    pub container_id: Option<String>,
+
+    /// 容器名称(定位成功时)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "computer-agent-runner-user_123")]
+    pub container_name: Option<String>,
+}
+
+/// Computer 容器资源查询参数(GET query)
+#[derive(Debug, Clone, Deserialize, IntoParams, ToSchema)]
+pub struct ComputerPodResourcesQuery {
+    /// 用户 ID(与 pod_id 二选一)
+    #[serde(default)]
+    #[param(example = "user_123")]
+    #[schema(example = "user_123")]
+    pub user_id: Option<String>,
+
+    /// Pod/容器标识符(与 user_id 二选一)
+    #[serde(default)]
+    #[param(example = "pod_abc123")]
+    #[schema(example = "pod_abc123")]
+    pub pod_id: Option<String>,
 }
 
 /// Computer Agent 取消任务的请求参数

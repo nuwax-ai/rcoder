@@ -397,6 +397,12 @@ pub const GRPC_STOP_AGENT_TIMEOUT_SECS: u64 = 30;
 /// 权限解析是简单的状态更新操作，10 秒足够
 pub const GRPC_RESOLVE_PERMISSION_TIMEOUT_SECS: u64 = 10;
 
+/// GetContainerStatus 请求超时（秒）
+///
+/// 状态/资源查询是轻量操作（活跃计数 + /proc 采样），10 秒足够；
+/// 采集失败在响应字段层降级，不用超时掩盖
+pub const GRPC_CONTAINER_STATUS_TIMEOUT_SECS: u64 = 10;
+
 // === SSE 配置 ===
 
 /// SSE Keep-alive 间隔（秒）

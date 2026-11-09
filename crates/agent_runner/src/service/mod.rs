@@ -1,4 +1,5 @@
 pub mod agent_registry;
+pub mod agent_resource_monitor;
 pub mod agent_session_service;
 mod cancel;
 pub mod chat_handler;

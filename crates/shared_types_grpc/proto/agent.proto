@@ -210,6 +210,9 @@ message GetStatusResponse {
   // rcoder 据此判断 seq epoch:同 epoch → 增量订阅保留 last_seq;epoch 变化 → 重置 last_seq
   // + 清 ring + cursor-reset,避免新 epoch 的低 seq 事件被客户端去重静默丢弃(#15)。
   optional string stream_epoch = 3;
+  // Registry 确认的当前执行身份（is_found=true 时必填）。调用方以此作为
+  // 状态聚合与资源核验的执行身份，避免与资源采样聚合自不同换代。
+  optional string session_id = 4;
 }
 
 // === Stop Agent ===
@@ -233,6 +236,10 @@ message StopAgentResponse {
   optional string message = 3;
   // 被停止的 Agent 的项目 ID
   string project_id = 4;
+  // 本 RPC 实际确认停止的执行身份（registry 条目的会话 ID）。not_found 时
+  // 缺省。调用方以此为准返回/记录被重启的会话，不得事后从注册表读取
+  //（停止与读取之间可能换代）。
+  optional string stopped_session_id = 5;
 }
 
 // === Model Provider Config ===
@@ -418,6 +425,9 @@ message GetContainerStatusRequest {
   string user_id = 1;
   // 项目ID
   string project_id = 2;
+  // 预期执行身份（可选）。registry 当前会话与其不符时不采集资源（资源字段
+  // 降级为缺省），防止状态与资源聚合自不同换代的执行。旧调用方不填，行为不变。
+  optional string expected_session_id = 3;
 }
 
 // 容器状态响应
@@ -437,6 +447,15 @@ message GetContainerStatusResponse {
   // Version 1 includes pending preparations and established user-facing TCP
   // connections. Missing/zero is insufficient evidence for orphan retirement.
   uint32 idle_observation_version = 7;
+  // 整个容器（pod 形态下的计算容器）CPU 使用率（0 起，多核可超 100）。
+  // cgroup v2 cpu.stat usage_usec 查询驱动差分；不可得时缺省（降级不 500）。
+  optional double container_cpu_percent = 8;
+  // 整个容器内存占用（MB，cgroup v2 memory.current；含 agent/VNC/桌面全部进程）
+  optional int64 container_memory_mb = 9;
+  // 容器内存限额（MB，cgroup memory.max；未设限或缺省为 None）
+  optional int64 container_memory_limit_mb = 10;
+  // 容器 CPU 核数限额（cgroup cpu.max quota/period；未设限或缺省为 None）
+  optional double container_cpu_limit_cores = 11;
 }
 
 // === Get VNC Status ===

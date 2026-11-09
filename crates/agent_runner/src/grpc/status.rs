@@ -39,9 +39,11 @@ pub async fn get_status(
                 status: "not_found".to_string(),
                 is_found: false,
                 stream_epoch: None,
+                session_id: None,
             }));
         };
 
+        let mut confirmed_session_id: Option<String> = None;
         let (status_str, is_found) = if let Some(ref pid) = project_id {
             if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(pid)
                 .filter(|info| req.session_id.is_empty() || info.session_id.to_string() == req.session_id) {
@@ -51,6 +53,9 @@ pub async fn get_status(
                     AgentStatus::Idle => "idle",
                     AgentStatus::Terminating => "busy",
                 };
+                // 确认的执行身份:调用方(状态聚合/资源核验)以此为单一事实源,
+                // 不得事后从注册表重读(读取与确认之间可能换代)。
+                confirmed_session_id = Some(agent_info.session_id.to_string());
                 (status_str, true)
             } else if req.session_id.is_empty() && AGENT_REGISTRY.is_pending(pid) {
                 // Project preparation is busy even before ACP assigns a real
@@ -89,6 +94,7 @@ pub async fn get_status(
             status: status_str.to_string(),
             is_found,
             stream_epoch,
+            session_id: confirmed_session_id,
         }))
     })
     .await
@@ -117,6 +123,19 @@ pub async fn get_container_status(
         let uptime_seconds = get_uptime_seconds();
         let is_active = active_tasks > 0;
 
+        // agent 进程组资源采集:查询驱动,失败/未运行一律降级为 None,
+        // 不影响本 RPC 既有字段(见 proto cpu_percent/memory_mb 降级契约)。
+        // expected_session_id 由调用方(如 http-server 状态聚合)传入已确认
+        // 的执行身份;换代不符时资源缺省,避免状态与资源来自不同执行。
+        let (cpu_percent, memory_mb) = crate::service::agent_resource_monitor::sample_for_project(
+            &req.project_id,
+            req.expected_session_id.as_deref().filter(|s| !s.is_empty()),
+        );
+
+        // 整容器资源(cgroup v2,与执行换代无关——容器级统计不绑定执行身份)
+        let (container_cpu_percent, container_memory_mb, container_memory_limit_mb, container_cpu_limit_cores) =
+            crate::service::agent_resource_monitor::sample_container_resources();
+
         let status = if active_tasks > 0 {
             "Processing".to_string()
         } else {
@@ -128,9 +147,13 @@ pub async fn get_container_status(
             active_tasks,
             uptime_seconds,
             status: status.clone(),
-            cpu_percent: None,
-            memory_mb: None,
+            cpu_percent,
+            memory_mb,
             idle_observation_version: u32::from(cfg!(target_os = "linux")),
+            container_cpu_percent,
+            container_memory_mb,
+            container_memory_limit_mb,
+            container_cpu_limit_cores,
         };
 
         debug!(

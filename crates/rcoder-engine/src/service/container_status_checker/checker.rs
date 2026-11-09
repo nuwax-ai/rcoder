@@ -347,6 +347,8 @@ impl ContainerStatusChecker {
             &grpc_addr,
             &user_id,
             &project_id,
+            // idle 判定不消费资源字段,不约束执行身份
+            None,
             self.config.query_timeout,
         )
         .await

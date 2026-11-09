@@ -45,6 +45,12 @@ pub(crate) struct ProtocolAgent {
     pub(crate) after_chat: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// The captured execution has stopped, but its RPC response is held back.
     pub(crate) after_stop: Mutex<Option<StopCallback>>,
+    /// StopAgent 已受理、尚未停止执行——确定性交错点:钩子内可换代注册与
+    /// 执行(模拟 restart 读取会话之后、停止执行之前发生新 chat 换代)。
+    pub(crate) before_stop: Mutex<Option<StopCallback>>,
+    /// 预配置的 GetContainerStatus 响应（资源字段透传断言用）；None 时该 RPC
+    /// 保持 unimplemented（状态链路按降级语义容错）。
+    pub(crate) container_status: Mutex<Option<GetContainerStatusResponse>>,
     sequence: AtomicUsize,
 }
 
@@ -173,10 +179,17 @@ impl agent_service_server::AgentService for ProtocolAgent {
         let found = sessions
             .get(&request.project_id)
             .is_some_and(|sid| request.session_id.is_empty() || sid == &request.session_id);
+        // 确认的执行身份(对齐真实 runner):found 时返回 registry 当前会话。
+        let confirmed = if found {
+            sessions.get(&request.project_id).cloned()
+        } else {
+            None
+        };
         Ok(Response::new(GetStatusResponse {
             status: if found { "busy" } else { "not_found" }.into(),
             is_found: found,
             stream_epoch: None,
+            session_id: confirmed,
         }))
     }
 
@@ -189,6 +202,14 @@ impl agent_service_server::AgentService for ProtocolAgent {
             .lock()
             .unwrap()
             .push(AgentCall::Stop(request.clone()));
+        // 确定性交错点:StopAgent 已受理、尚未触及执行——钩子内可换代
+        // 注册与执行(模拟读取会话之后、停止之前发生新 chat 换代)。
+        let before_stop = self.before_stop.lock().unwrap().take();
+        if let Some(before_stop) = before_stop {
+            before_stop().await;
+        }
+        #[allow(unused_assignments)] // 初始 None 仅为类型占位,块内必然重赋值
+        let mut stopped = None;
         let found = {
             let mut sessions = self.sessions.lock().unwrap();
             if request
@@ -201,9 +222,12 @@ impl agent_service_server::AgentService for ProtocolAgent {
                     result: "session_mismatch".into(),
                     message: None,
                     project_id: request.project_id,
+                    stopped_session_id: None,
                 }));
             }
-            sessions.remove(&request.project_id).is_some()
+            // 保留被移除的会话:即本 RPC 实际确认停止的执行身份。
+            stopped = sessions.remove(&request.project_id);
+            stopped.is_some()
         };
         let after_stop = self.after_stop.lock().unwrap().take();
         if let Some(after_stop) = after_stop {
@@ -214,16 +238,38 @@ impl agent_service_server::AgentService for ProtocolAgent {
             result: if found { "stopped" } else { "not_found" }.into(),
             message: None,
             project_id: request.project_id,
+            stopped_session_id: if found { stopped } else { None },
         }))
     }
 
     async fn get_container_status(
         &self,
-        _: Request<GetContainerStatusRequest>,
+        request: Request<GetContainerStatusRequest>,
     ) -> Result<Response<GetContainerStatusResponse>, Status> {
-        Err(Status::unimplemented(
-            "container status is not part of this protocol fixture",
-        ))
+        // 核验 expected 身份(对齐真实 runner):registry 当前会话与调用方
+        // 确认的会话不符时不采集(资源字段缺省),防止异代拼装。
+        let request = request.into_inner();
+        let expected_matches = request
+            .expected_session_id
+            .as_deref()
+            .filter(|sid| !sid.is_empty())
+            .is_none_or(|expected| {
+                self.sessions.lock().unwrap().get(&request.project_id)
+                    == Some(&expected.to_string())
+            });
+        let mut response = match self.container_status.lock().unwrap().clone() {
+            Some(response) => response,
+            None => {
+                return Err(Status::unimplemented(
+                    "container status is not part of this protocol fixture",
+                ));
+            }
+        };
+        if !expected_matches {
+            response.cpu_percent = None;
+            response.memory_mb = None;
+        }
+        Ok(Response::new(response))
     }
     async fn get_vnc_status(
         &self,

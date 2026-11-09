@@ -6,6 +6,8 @@ success: "Operation successful"
 success.container_destroyed: "Container destroyed successfully"
 success.container_not_exist: "Container does not exist, no action needed"
 success.agent_already_stopped: "Agent is already stopped"
+success.agent_restarted: "Agent restarted; the next chat will attempt to restore its context"
+success.agent_restart_idempotent: "Agent is not running; nothing to restart"
 
 # Agent errors
 error.agent_busy: "Agent is busy processing"

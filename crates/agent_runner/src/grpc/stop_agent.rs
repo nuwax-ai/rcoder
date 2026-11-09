@@ -19,12 +19,15 @@ fn reply(
     success: bool,
     result: &str,
     message: &str,
+    stopped_session_id: Option<String>,
 ) -> Response<StopAgentResponse> {
     Response::new(StopAgentResponse {
         project_id,
         success,
         result: result.to_string(),
         message: Some(message.to_string()),
+        // 本 RPC 实际确认停止的执行身份:not_found/mismatch/未确认停止时缺省。
+        stopped_session_id,
     })
 }
 
@@ -45,6 +48,7 @@ pub async fn stop_agent(
                 true,
                 "not_found",
                 "Agent execution is absent",
+                None,
             ));
         };
         let session_id = target.session_id.to_string();
@@ -63,6 +67,7 @@ pub async fn stop_agent(
                 false,
                 "session_mismatch",
                 "The requested session does not match this project execution",
+                None,
             ));
         }
         // 不在身份确认之前清 permission，也不按 project 清除另一代实例的状态。
@@ -102,6 +107,7 @@ pub async fn stop_agent(
                     false,
                     "error",
                     "Agent task cancellation was not confirmed",
+                    None,
                 ));
             }
         }
@@ -112,6 +118,7 @@ pub async fn stop_agent(
                     false,
                     "error",
                     &format!("Agent exit is unconfirmed: {error}"),
+                    None,
                 ));
             }
             if let Err(error) = handle.wait_for_exit().await {
@@ -120,6 +127,7 @@ pub async fn stop_agent(
                     false,
                     "error",
                     &format!("Agent reaping failed: {error}"),
+                    None,
                 ));
             }
         } else if !target.prompt_tx.is_closed() {
@@ -128,6 +136,7 @@ pub async fn stop_agent(
                 false,
                 "error",
                 "Live agent execution has no lifecycle handle",
+                None,
             ));
         }
         if routable {
@@ -160,6 +169,7 @@ pub async fn stop_agent(
             true,
             "stopped",
             "Agent execution exited and was reaped",
+            Some(session_id),
         ))
     })
     .await

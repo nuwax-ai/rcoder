@@ -489,6 +489,14 @@ pub trait AgentLifecycle: Send + Sync + 'static {
     /// 检查是否已停止
     fn is_stopped(&self) -> bool;
 
+    /// agent 子进程的进程组 ID（组长 PID）。
+    ///
+    /// 默认 None：实现方不持有或不暴露进程组身份。资源采集方据此在
+    /// /proc 中定位 agent 进程组，None 表示无法采集（降级，不报错）。
+    fn agent_pgid(&self) -> Option<u32> {
+        None
+    }
+
     /// 获取取消令牌
     fn cancellation_token(&self) -> &CancellationToken;
 }
