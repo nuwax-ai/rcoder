@@ -1,0 +1,148 @@
+//! 操作系统交互的最小封装。
+//!
+//! 非 Linux 平台全部返回空/`None`：本模块只保证 crate 在 macOS 上能编译，
+//! 真正的看门狗只在 Linux 容器内运行。
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use super::proc_tree::ProcInfo;
+#[cfg(target_os = "linux")]
+use super::proc_tree::parse_stat;
+
+#[cfg(target_os = "linux")]
+pub fn page_size() -> u64 {
+    // rustix 的安全封装（内部处理 sysconf/auxv）
+    rustix::param::page_size() as u64
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn page_size() -> u64 {
+    4096
+}
+
+/// 读取单个进程的 stat。
+#[cfg(target_os = "linux")]
+pub fn read_pid(pid: u32) -> Option<ProcInfo> {
+    let raw = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    parse_stat(pid, &raw, page_size())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_pid(_pid: u32) -> Option<ProcInfo> {
+    None
+}
+
+/// 读取全部进程（失败的单条跳过）。
+#[cfg(target_os = "linux")]
+pub fn read_all() -> HashMap<u32, ProcInfo> {
+    let mut out = HashMap::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    let page = page_size();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        if let Some(info) = parse_stat(pid, &raw, page) {
+            out.insert(pid, info);
+        }
+    }
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_all() -> HashMap<u32, ProcInfo> {
+    HashMap::new()
+}
+
+/// 进程可执行文件路径（已解析符号链接）。权限不足或已退出返回 `None`。
+#[cfg(target_os = "linux")]
+pub fn read_exe(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_exe(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+/// 命令行参数（已按 NUL 切分）。
+#[cfg(target_os = "linux")]
+pub fn read_cmdline(pid: u32) -> Vec<String> {
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return Vec::new();
+    };
+    raw.split(|b| *b == 0)
+        .filter(|chunk| !chunk.is_empty())
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_cmdline(_pid: u32) -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+fn read_u64_file(path: &str) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// 当前 cgroup 的内存用量（含 page cache）。
+pub fn read_memory_current() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        read_u64_file(super::cgroup::MEMORY_CURRENT_PATH)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// `memory.max`；`max`（无限制）返回 `None`。
+pub fn read_memory_max() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let raw = std::fs::read_to_string(super::cgroup::MEMORY_MAX_PATH).ok()?;
+        super::cgroup::parse_limit(&raw)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// `memory.stat` 原文。
+pub fn read_memory_stat() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(super::cgroup::MEMORY_STAT_PATH).ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_size_is_sane() {
+        let ps = page_size();
+        assert!(
+            ps == 4096 || ps == 16384 || ps == 65536,
+            "unexpected page size {ps}"
+        );
+    }
+}
