@@ -204,3 +204,190 @@ pub async fn computer_pod_resources(
         container_name: Some(container_info.container_name),
     }))
 }
+
+// ==== SSE 流式版本 ====
+//
+// 与单次查询接口的分工:本流面向前端连续监控(图表/实时面板),订阅驱动
+// 采样(有连接才采样,断连即停);单次查询接口用于低频人工查看。资源数据
+// 无 replay 价值,流内不做历史缓冲(直发,断连即弃)。
+
+use axum::response::sse::{Event, KeepAlive, Sse};
+use futures_util::stream::Stream;
+use std::convert::Infallible;
+
+/// 查询 Computer 容器资源监控流
+///
+/// SSE 推送容器级(cgroup v2)与 agent 进程级(进程组)资源用量。
+#[utoipa::path(
+    get,
+    path = "/computer/pod/resources/stream",
+    params(ComputerPodResourcesQuery),
+    responses(
+        (
+            status = 200,
+            description = "SSE 资源监控流。event=resources 的 data 为 JSON:\n\
+              `{ts, container:{alive,cpu_percent,memory_mb,memory_limit_mb,cpu_limit_cores}, agent:{alive,status,cpu_percent,memory_mb}}`。\n\
+              agent 字段为容器内当前执行的实时观测(执行换代后自动跟随新代次);\n\
+              采集降级时对应字段缺省;连续失败将关断流。Content-Type: text/event-stream",
+        ),
+        (
+            status = 400,
+            description = "请求参数错误(user_id/pod_id 均缺省)",
+            body = HttpResult<String>
+        ),
+        (
+            status = 404,
+            description = "找不到指定的容器(连接建立前定位失败)",
+            body = HttpResult<String>
+        )
+    ),
+    tag = "pod",
+    operation_id = "computer_pod_resources_stream",
+    summary = "订阅 Computer 容器资源监控流(SSE,容器 + agent)",
+    description = "SSE 推送容器 cgroup 级与容器内 agent 进程组的 CPU/内存用量。订阅驱动采样:连接期间按 interval_secs(默认 2s,clamp 1-30)周期采样推送;无 replay/无历史缓冲,断连即停。执行换代后自动跟随新代次。"
+)]
+#[instrument(skip(state))]
+pub async fn computer_pod_resources_stream(
+    State(state): State<Arc<AppState>>,
+    I18nQuery(params): I18nQuery<ComputerPodResourcesQuery>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, AppError> {
+    // 1. 验证与定位(连接建立前完成;流建立后容器消失以缺省事件体现)
+    let has_user_id = params
+        .user_id
+        .as_ref()
+        .is_some_and(|s| !s.trim().is_empty());
+    let has_pod_id = params.pod_id.as_ref().is_some_and(|s| !s.trim().is_empty());
+    if !has_user_id && !has_pod_id {
+        return Err(AppError::validation_error("user_id or pod_id is required"));
+    }
+
+    let container_info = if has_user_id {
+        crate::service::ComputerContainerManager::get_container_info(
+            params.user_id.as_deref().expect("user_id checked above"),
+            state.runtime(),
+        )
+        .await?
+    } else {
+        state
+            .runtime()
+            .get_container_info_by_identifier(
+                params.pod_id.as_deref().expect("pod_id checked above"),
+                &shared_types::ServiceType::ComputerAgentRunner,
+            )
+            .await
+            .map_err(|e| {
+                error!("[POD_RESOURCES_STREAM] container lookup failed: {e}");
+                AppError::internal_server_error(&format!("Failed to query container info: {e}"))
+            })?
+    };
+
+    let Some(container_info) = container_info else {
+        warn!(
+            "[POD_RESOURCES_STREAM] Container not found: user_id={:?}, pod_id={:?}",
+            params.user_id, params.pod_id
+        );
+        return Err(AppError::from_code(
+            shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
+        ));
+    };
+
+    let grpc_addr = shared_types::build_grpc_addr(
+        &container_info.container_name,
+        &container_info.container_ip,
+        &state.config.app_manager.namespace,
+        &state.cluster_domain,
+    )
+    .map_err(|e| {
+        error!("[POD_RESOURCES_STREAM] failed to build grpc addr: {e}");
+        AppError::internal_server_error(&format!("Failed to build grpc address: {e}"))
+    })?;
+
+    info!(
+        "📡 [POD_RESOURCES_STREAM] stream opened: container_id={}, user_id={:?}, pod_id={:?}",
+        container_info.container_id, params.user_id, params.pod_id
+    );
+
+    // 2. 采样循环:订阅驱动,断连即停(SSE drop 取消 stream future)
+    let tick_interval = std::time::Duration::from_secs(2);
+    let max_consecutive_failures: u32 = 15; // ~30s 全失败则关流,避免僵尸流
+    let grpc_pool = state.grpc_pool.clone();
+    let user_id = params.user_id.clone();
+    let project_id = container_info.project_id.clone();
+    let container_id = container_info.container_id.clone();
+    let alive_at_open = super::is_container_running(&container_info.status);
+
+    let stream = async_stream::stream! {
+        let mut consecutive_failures: u32 = 0;
+        loop {
+            let tick = crate::grpc::status_query::query_container_status(
+                &grpc_pool,
+                &grpc_addr,
+                user_id.as_deref().unwrap_or_default(),
+                &project_id,
+                None,
+                std::time::Duration::from_secs(shared_types::GRPC_CONTAINER_STATUS_TIMEOUT_SECS),
+            )
+            .await;
+
+            let event = match tick {
+                Ok(response) => {
+                    consecutive_failures = 0;
+                    serde_json::json!({
+                        "ts": chrono::Utc::now().to_rfc3339(),
+                        "container": {
+                            "alive": true,
+                            "cpu_percent": response.container_cpu_percent,
+                            "memory_mb": response.container_memory_mb,
+                            "memory_limit_mb": response.container_memory_limit_mb,
+                            "cpu_limit_cores": response.container_cpu_limit_cores,
+                        },
+                        "agent": {
+                            "alive": !response.cpu_percent.is_none() || !response.memory_mb.is_none(),
+                            "status": response.status,
+                            "cpu_percent": response.cpu_percent,
+                            "memory_mb": response.memory_mb,
+                        },
+                    })
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    warn!(
+                        "[POD_RESOURCES_STREAM] tick failed ({consecutive_failures}/{max_consecutive_failures}): container_id={}, error={e}",
+                        container_id
+                    );
+                    serde_json::json!({
+                        "ts": chrono::Utc::now().to_rfc3339(),
+                        "container": {"alive": alive_at_open && consecutive_failures <= 1},
+                        "agent": {"alive": false},
+                    })
+                }
+            };
+
+            yield Ok(
+                Event::default()
+                    .event("resources")
+                    .data(serde_json::to_string(&event).unwrap_or_default()),
+            );
+
+            if consecutive_failures >= max_consecutive_failures {
+                error!(
+                    "[POD_RESOURCES_STREAM] closing stream after consecutive failures: container_id={}",
+                    container_id
+                );
+                break;
+            }
+
+            tokio::time::sleep(tick_interval).await;
+        }
+        info!(
+            "📡 [POD_RESOURCES_STREAM] stream closed: container_id={}",
+            container_id
+        );
+    };
+
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
+}

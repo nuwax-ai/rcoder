@@ -23,6 +23,7 @@ use crate::handler;
         handler::computer_agent_stop,
         handler::computer_agent_restart,
         handler::computer_pod_resources,
+        handler::computer_pod_resources_stream,
         handler::computer_agent_status, // 🆕 新增
         handler::computer_agent_session_cancel,
         handler::computer_notify_resolved,
