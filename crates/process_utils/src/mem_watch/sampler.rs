@@ -10,7 +10,7 @@ use std::time::Instant;
 use tokio::task::JoinHandle;
 
 use super::config::{Config, Mode};
-use super::proc_tree::{ProcInfo, select_victim};
+use super::proc_tree::{ProcInfo, select_victim, subtree_targets};
 use super::registry::{Registry, Root};
 use super::switch::Switch;
 use super::{cgroup, kill, registry, sys};
@@ -162,8 +162,20 @@ async fn step(reg: &Arc<Registry>, cfg: &Config, last_action: &mut Option<Instan
         limit_mb = limit >> 20,
     );
 
+    // 连子树一起杀：只杀父进程会让子进程 reparent 到 PID 1，
+    // 脱离 descendants(root) 范围后既不会被回收也不会再被选中。
+    let targets = subtree_targets(&table, victim.pid, &protected);
+    tracing::warn!(
+        event = "mem_watch.evict_targets",
+        victim = victim.pid,
+        targets = targets.len(),
+    );
+
     // 终止序列独立执行，不能阻塞采样：grace 期间可能还有第二个尖峰。
-    tokio::spawn(kill::terminate(victim.pid, cfg.grace));
+    let grace = cfg.grace;
+    tokio::spawn(async move {
+        kill::terminate_many(&targets, grace).await;
+    });
 }
 
 /// 永不入选的进程：PID 1、所有会话的启动窗口快照、以及 exe 命中规则的进程。

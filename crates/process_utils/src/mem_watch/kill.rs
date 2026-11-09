@@ -10,35 +10,47 @@ mod imp {
     use super::Duration;
     use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 
-    pub(super) async fn terminate(pid: u32, grace: Duration) {
-        let Some(target) = Pid::from_raw(pid as i32) else {
-            return;
-        };
-        let Ok(handle) = pidfd_open(target, PidfdFlags::empty()) else {
-            // 进程已退出，或内核不支持 pidfd
-            return;
-        };
-
+    pub(super) async fn terminate_many(pids: &[u32], grace: Duration) {
         // pidfd 绑定的是"那个进程"，即使 pid 被复用也不会误杀。
-        let _ = pidfd_send_signal(&handle, Signal::TERM);
+        let handles: Vec<_> = pids
+            .iter()
+            .filter_map(|pid| Pid::from_raw(*pid as i32))
+            .filter_map(|target| pidfd_open(target, PidfdFlags::empty()).ok())
+            .collect();
+        if handles.is_empty() {
+            return;
+        }
+        for handle in &handles {
+            let _ = pidfd_send_signal(handle, Signal::TERM);
+        }
         tokio::time::sleep(grace).await;
-        let _ = pidfd_send_signal(&handle, Signal::KILL);
-        // handle 是 OwnedFd，离开作用域自动 close
+        for handle in &handles {
+            let _ = pidfd_send_signal(handle, Signal::KILL);
+        }
+        // OwnedFd 离开作用域自动 close
     }
 }
 
-/// SIGTERM → `grace` → SIGKILL。
+/// 对一组进程执行 SIGTERM → `grace` → SIGKILL。
+///
+/// 传整棵子树而不只是 victim：命令树里 `bash -c "..."` 的子进程在父进程死后
+/// 会被 reparent 到 PID 1，从此脱离 `descendants(root)`，内存不会被释放。
 ///
 /// 非 Linux 平台为空操作（看门狗只在 Linux 容器内运行）。
-pub async fn terminate(pid: u32, grace: Duration) {
+pub async fn terminate_many(pids: &[u32], grace: Duration) {
     #[cfg(target_os = "linux")]
     {
-        imp::terminate(pid, grace).await;
+        imp::terminate_many(pids, grace).await;
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (pid, grace);
+        let _ = (pids, grace);
     }
+}
+
+/// 单个进程的便捷封装。
+pub async fn terminate(pid: u32, grace: Duration) {
+    terminate_many(&[pid], grace).await;
 }
 
 #[cfg(all(test, target_os = "linux"))]

@@ -324,6 +324,9 @@ OK
 | 9 | dry-run 每 tick 记一条 | 一周日志被 `would_evict` 淹没 | 与真实淘汰共用 cooldown 节流 |
 | 10 | `script_hint` 可能取到参数 | `node --inspect` 时 hint 无意义 | 跳过以 `-` 开头的 `cmdline[1]` |
 
+| 11 | 只杀 victim 单进程 | 命令树常是 `bash -c "..."`：杀掉 bash 后 python 被 reparent 到 PID 1，**脱离 `descendants(root)` 范围**，内存不释放且再也不会被选中 | 改为杀 victim 的整棵子树（排除 PID 1/root/受保护进程），新增 `subtree_targets` 纯函数 + 单测 |
+| 12 | 快速路径不校验 root 存活 | root 死后 pid 被复用，`descendants(新进程)` 会把无关进程当命令 | 快速路径加 `prune_dead_light`（每 root 一次 stat） |
+
 ### 16.1 已知行为（不是 bug，但要知道）
 
 - **运行期从 `off` 切到 `on`**：第一次活跃 tick 会把当下所有进程当作"启动窗口"保护起来
@@ -331,6 +334,8 @@ OK
   只有切换后新起的命令才会被淘汰。这是安全方向，但会让"开了没效果"看起来像 bug。
 - **`node` 系进程全被保护**（规则 4：`exe == root.exe`）：用户自己跑的 node 脚本也不会被淘汰。
 - **多会话时按全局最大 RSS 选**：可能杀掉"没在泄漏的那个会话"的命令（v1 限制）。
+- **子树终止仍有极小竞态**：从读进程表到发信号之间新 fork 的子进程不在终止列表里，
+  父进程死后它会 reparent 到 PID 1 并脱离范围。窗口是毫秒级，v2 可用 SIGSTOP 后再扫描消除。
 
 ## 17. 记录的生命周期（agent 被回收后会发生什么）
 

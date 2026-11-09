@@ -138,6 +138,24 @@ pub fn select_victim(
     })
 }
 
+/// 淘汰目标：victim 本身 + 它的所有后代，排除 `exclude`（PID 1、root、受保护进程）。
+///
+/// 为什么不是只杀 victim：命令树常见 `bash -c "..."` 里再起子进程；
+/// 只杀父进程会让子进程被 reparent 到 PID 1，从此脱离 `descendants(root)`
+/// 的范围——内存没释放，而且再也不会被选中。
+pub fn subtree_targets(
+    table: &HashMap<u32, ProcInfo>,
+    victim: u32,
+    exclude: &HashSet<u32>,
+) -> Vec<u32> {
+    let mut targets = vec![victim];
+    targets.extend(descendants(table, victim));
+    targets.retain(|pid| *pid != 1 && !exclude.contains(pid));
+    targets.sort_unstable();
+    targets.dedup();
+    targets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +272,29 @@ mod tests {
         // 两个都在 registry 里时，才可能选到 B 的那个
         let victim = select_victim(&table, &[10, 20], &HashSet::new(), 0).unwrap();
         assert_eq!(victim.pid, 21);
+    }
+
+    #[test]
+    fn subtree_targets_includes_children_but_not_excluded() {
+        let mut table = HashMap::new();
+        table.insert(10, info(10, 1, 0, 0)); // root
+        table.insert(11, info(11, 10, 0, 0)); // bash（victim）
+        table.insert(12, info(12, 11, 0, 0)); // python
+        table.insert(13, info(13, 12, 0, 0)); // python 子进程
+        table.insert(14, info(14, 11, 0, 0)); // 受保护（例如 MCP）
+
+        let exclude = HashSet::from([14u32]);
+        let targets = subtree_targets(&table, 11, &exclude);
+        assert_eq!(targets, vec![11, 12, 13], "要带上后代，但不能碰受保护进程");
+    }
+
+    #[test]
+    fn subtree_targets_skips_pid1() {
+        let mut table = HashMap::new();
+        table.insert(1, info(1, 0, 0, 0));
+        table.insert(11, info(11, 10, 0, 0));
+        let targets = subtree_targets(&table, 11, &HashSet::new());
+        assert_eq!(targets, vec![11]);
     }
 
     #[test]
