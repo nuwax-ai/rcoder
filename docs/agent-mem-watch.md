@@ -391,3 +391,18 @@ OK
 同一 `pid` 且 `starttime` 相同则复用既有 `Root`（不重置 `spawned_at`、不清空保护集）；
 `starttime` 不同（pid 复用）才替换。这样将来若有第二条登记路径（例如从
 `AGENT_REGISTRY` 桥接），也不会把已封窗的会话重新打开。
+
+### 15.2 场景化验证（`examples/mem_watch_scenarios.rs`，`--memory=512m`）
+
+| 场景 | 配置 | 断言 | 结果 |
+|---|---|---|---|
+| 1 off | 文件 `mode=off`，hog 250MB（单进程即超 40% 阈值） | hog 存活 | ✅ |
+| 2 on + 窗口 | 删开关文件（回落默认 On）→ 封窗 → 新 hog 150MB | **封窗前**的 hog 存活（窗口保护），封窗后的新 hog 被淘汰 | ✅ |
+| 3 dry | 文件 `mode=dry`，hog 150MB | hog 存活（只记录） | ✅ |
+
+全程根进程存活、容器未被 OOM。场景 1 特意让 hog **单个即超阈值**——否则"off 不杀"
+可能只是"内存没到阈值"，不算真验证；写完开关后也各等 1.5s 让配置生效，
+排除「残留 on 窗口内被杀」的假阴性/假阳性。
+
+首次运行发现的问题：`mem_watch::start` 需要 tokio 上下文，example 里改为
+自建 runtime `rt.spawn(run(cfg))`（同时导出 `mem_watch::run`）。

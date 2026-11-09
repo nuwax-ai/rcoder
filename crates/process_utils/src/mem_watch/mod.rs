@@ -31,7 +31,7 @@ pub fn snapshot() -> std::collections::HashMap<u32, ProcInfo> {
     sys::read_all()
 }
 pub use registry::{mark_session_active, try_register, try_unregister};
-pub use sampler::start;
+pub use sampler::{run, start};
 
 /// 安装全局注册表并启动采样任务。
 ///
