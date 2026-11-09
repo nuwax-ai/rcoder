@@ -1,0 +1,72 @@
+#this-profile-is-generated-by-nuwax-node-apparmor-setup
+# 来源：containerd 官方模板（contrib/apparmor/template.go）+ signal 放行扩展
+# 目的：保留容器默认 AppArmor 限制（mount//proc 写/sys 写/ptrace 等），
+#       同时放行容器内部进程互发信号 —— 让内存看门狗可以 kill 命令树。
+#
+# 与默认 profile 的差异（仅 signal 段，其余逐行一致）：
+#   默认只有  signal (send,receive) peer=cri-containerd.apparmor.d
+#   本文件追加 peer=cri-containerd.apparmor.d//&unconfined（新内核标签叠加形态）
+#              peer=cri-containerd-signal（本 profile 自身）
+#
+# pod 侧用法：
+#   securityContext:
+#     appArmorProfile: {type: Localhost, localhostProfile: cri-containerd-signal}
+#
+# 加载：sudo apparmor_parser -Kr /etc/apparmor.d/cri-containerd-signal
+# 验证：aa-status | grep cri-containerd-signal
+
+abi <abi/3.0>,
+
+#include <tunables/global>
+
+profile cri-containerd-signal flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  network,
+  # Disallow AF_ALG (Linux kernel crypto API); see https://copy.fail/
+  deny network alg,
+  # Disallow AF_VSOCK to prevent host/guest communication.
+  deny network vsock,
+  capability,
+  file,
+  umount,
+  # Host (privileged) processes may send signals to container processes.
+  signal (receive) peer=unconfined,
+  # runc may send signals to container processes.
+  signal (receive) peer=runc,
+  # crun may send signals to container processes.
+  signal (receive) peer=crun,
+  # Manager may send signals to container processes.
+  signal (receive) peer=unconfined,
+  # Container processes may send signals amongst themselves.
+  # —— 与默认 profile 的差异在此：除自身外，追加三类历史/叠加标签形态，
+  #    覆盖 Ubuntu 24.04（基础名）与 26.04/新内核（//&unconfined 叠加）。
+  signal (send,receive) peer=cri-containerd-signal,
+  signal (send,receive) peer=cri-containerd-signal//&unconfined,
+  signal (send,receive) peer=cri-containerd.apparmor.d,
+  signal (send,receive) peer=cri-containerd.apparmor.d//&unconfined,
+
+  deny @{PROC}/* w,   # deny write for all files directly in /proc (not in a subdir)
+  # deny write to files not in /proc/<number>/** or /proc/sys/**
+  deny @{PROC}/{[^1-9/],[^1-9/][^0-9/],[^1-9s/],[^1-9/][^0-9/]*}/** w,
+  deny @{PROC}/sys/[^k]** w,  # deny /proc/sys except /proc/sys/k* (effectively /proc/sys/kernel)
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,  # deny everything except shm* in /proc/sys/kernel/
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/kcore rwklx,
+
+  deny mount,
+
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/fs/[^c]*/** wklx,
+  deny /sys/fs/c[^g]*/** wklx,
+  deny /sys/fs/cg[^r]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/devices/virtual/powercap/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+
+  # allow processes within the container to trace each other,
+  # provided all other LSM and yama setting allow it.
+  ptrace (trace,tracedby,read,readby) peer=cri-containerd-signal,
+  ptrace (trace,tracedby,read,readby) peer=cri-containerd-signal//&unconfined,
+}
