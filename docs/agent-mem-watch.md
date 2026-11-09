@@ -453,7 +453,55 @@ kubectl exec <agent-pod> -- cat /sys/fs/cgroup/memory.max   # 8589934592=私有n
 | 容器内 memory.max | max（host ns） | 未验证 |
 | 验证方法 | — | `kubectl exec` 一条 python kill 自身子进程 + `cat memory.max` |
 
-### 19.4 部署形态的临时性
+### 19.4 ✅ 正式方案已验证：Localhost profile（保留 LSM，只放行 signal）
+
+Unconfined 只是排障手段。正式方案 `k8s/scripts/node-apparmor/`：
+
+**原理**：AppArmor signal 规则的 peer 匹配是**标签字符串精确匹配**。新内核
+（Ubuntu 24.04+/26.04）标签叠加后，容器标签为 `<profile>//&unconfined`，
+默认 profile 的 `peer=cri-containerd.apparmor.d` 匹配失败 → 容器内 kill 子进程 EPERM。
+
+**profile**：containerd 官方模板全文 + 追加 4 条 signal peer
+（自身基础名/叠加名 + legacy 基础名/叠加名），ptrace 规则同步。
+其余 deny（mount//proc 写/sys 写/ptrace 跨界）全部保留——LSM 防护不丢。
+
+**45 实测闭环**（三态对照）：
+
+| Pod appArmorProfile | kill 子进程 | 场景结果 |
+|---|---|---|
+| 默认（apparmor.d enforce） | ❌ EPERM | 场景 2 失败（hogB 存活） |
+| `{type: Unconfined}` | ✅ | 全 PASS（排障手段，LSM 全丢） |
+| **`{type: Localhost, cri-containerd-signal}`** | ✅ | **全 PASS，LSM 保留** ✅ 推荐 |
+
+**节点部署**：`install.sh`（语法校验 → 内核加载 → 持久化 /etc/apparmor.d），
+`install.sh --verify` 行为探针（fork+kill，节点/Pod 内均可跑）。
+
+**生产落地三步**：
+1. 生产节点跑 install.sh（每节点一次，k3s 的 profile 是启动时从内嵌模板加载，
+   节点重启后需重新执行——建议并入节点初始化脚本）；
+2. rcoder pod 模板加 `appArmorProfile: {type: Localhost, localhostProfile: cri-containerd-signal}`；
+3. 部署后用探针验证一次。
+
+### 19.5 附：调研结论——"kill 子进程能否交给内核"
+
+无法完全交给内核；AppArmor 的 signal 拦截发生在 `kill(2)/pidfd_send_signal`
+系统调用路径的 LSM 钩子上，**任何用户态库（nix/rustix/libc）都无法绕过**——
+这是内核安全边界本身。内核侧的替代通道只有两条，且各有代价：
+
+| 通道 | 原理 | 代价 |
+|---|---|---|
+| `cgroup.kill`（cgroup v2，kernel 5.14+） | 向 cgroup 写 `1`，内核原子杀掉组内全部进程——不走信号 LSM 路径 | **杀整个容器**（失败域回到会话级），且需要容器外特权上下文（k8s 自身终止 Pod 就是这么做的） |
+| memcg OOM killer | 让 cgroup 自然撞 `memory.max`，内核选最大进程杀 | 不走 LSM（内核内部行为），但时机/受害者不可控——正是看门狗要解决的问题 |
+
+用户态可做的两个正向加固（已实现/推荐）：
+- `pidfd`（rustix 安全封装）：绑定进程而非 pid，免疫 pid 复用——已用；
+- `prctl(PR_SET_PDEATHSIG, SIGKILL)`：watcher 意外死亡时内核自动清理其子进程——
+  这是"内核托管清理"的正确方向（父死子亡），值得后续加到 guardian 的 spawn 路径。
+
+结论：**保持"用户态 pidfd + 信号"为主路径，AppArmor 用 Localhost profile 放行，
+EPERM 自动降级兜底**。这条组合已在两个集群环境实测闭环。
+
+### 19.6 部署形态的临时性
 
 hostPath 注入 + initContainer 覆盖是**测试专用**形态。生产正确做法：
 `dev-oom` 分支构建正式镜像（`build-agent-runner-amd64` 等），rcoder 的 pod 模板加
