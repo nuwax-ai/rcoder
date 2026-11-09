@@ -98,7 +98,14 @@ async fn probe_once(
             return ProbeResult::Inconclusive; // 拿不准 → fail-open
         }
     };
-    let client = Client::builder().with_reqwest(reqwest_client).build();
+    // genai 0.7：build() 返回 Result（0.6 直接返回 Client）。
+    let client = match Client::builder().with_reqwest(reqwest_client).build() {
+        Ok(client) => client,
+        Err(error) => {
+            warn!("[MODEL_PROBE] failed to build genai client: {error}");
+            return ProbeResult::Inconclusive; // 拿不准 → fail-open
+        }
+    };
 
     let target = ServiceTarget {
         endpoint: Endpoint::from_owned(endpoint.to_string()),

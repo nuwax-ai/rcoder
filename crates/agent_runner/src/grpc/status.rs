@@ -111,7 +111,7 @@ pub async fn get_container_status(
         let connections = user_connection_count().map_err(|error| {
             Status::unavailable(format!("Container connection activity unavailable: {error}"))
         })?;
-        let active_tasks = get_active_tasks_count().saturating_add(
+        let active_tasks = get_active_tasks_count(connections).saturating_add(
             i32::try_from(connections).unwrap_or(i32::MAX),
         );
         let uptime_seconds = get_uptime_seconds();
@@ -193,7 +193,7 @@ pub async fn get_vnc_status(
     .await
 }
 
-fn get_active_tasks_count() -> i32 {
+fn get_active_tasks_count(connections: usize) -> i32 {
     let agent_count = AGENT_REGISTRY
         .iter_agents()
         .filter(|entry| match entry.value().status {
@@ -221,9 +221,12 @@ fn get_active_tasks_count() -> i32 {
     let http_requests =
         i32::try_from(process_utils::request_activity::active_in_process()).unwrap_or(i32::MAX);
 
+    // `connections` belongs in the same breakdown: an over-count of resident
+    // loopback IPC (legacy images without the peer filter) is only diagnosable
+    // when the component that produced it is visible next to the others.
     debug!(
-        "[GET_CONTAINER_STATUS] active breakdown: agents={}, terminals={}, vnc={}, local_workers={}, http_requests={}",
-        agent_count, terminal_count, vnc_count, local_workers, http_requests
+        "[GET_CONTAINER_STATUS] active breakdown: agents={}, terminals={}, vnc={}, local_workers={}, http_requests={}, connections={}",
+        agent_count, terminal_count, vnc_count, local_workers, http_requests, connections
     );
 
     agent_count
@@ -302,11 +305,11 @@ mod tests {
     #[test]
     fn preparing_without_a_session_keeps_container_active() {
         let project = "container-status-preparation";
-        assert_eq!(get_active_tasks_count(), 0);
+        assert_eq!(get_active_tasks_count(0), 0);
         AGENT_REGISTRY.set_pending(project);
-        assert!(get_active_tasks_count() > 0);
+        assert!(get_active_tasks_count(0) > 0);
         AGENT_REGISTRY.clear_pending_if_exists(project);
-        assert_eq!(get_active_tasks_count(), 0);
+        assert_eq!(get_active_tasks_count(0), 0);
     }
 
     #[test]
@@ -354,10 +357,10 @@ mod tests {
         let worker = registry
             .spawn(async move { released.await.unwrap() })
             .unwrap();
-        assert!(get_active_tasks_count() > 0);
+        assert!(get_active_tasks_count(0) > 0);
         registry.close().unwrap();
         assert!(
-            get_active_tasks_count() > 0,
+            get_active_tasks_count(0) > 0,
             "cancellation is not execution exit"
         );
         release.send(()).unwrap();

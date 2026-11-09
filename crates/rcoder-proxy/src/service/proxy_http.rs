@@ -52,6 +52,62 @@ async fn wait_for_peer_connection(peer: &HttpPeer, deadline: tokio::time::Instan
 }
 
 impl PortProxy {
+    /// UserApp app dev/prod：官方上游读空闲窗口策略（唯一应用点，
+    /// `upstream_peer` 最终出口——重解析/重试产生的新 peer 一致经过）。
+    ///
+    /// 语义（官方 `PeerOptions::read_timeout`，逐次读取计时）：
+    /// - 只套 `ProdAppProxy`/`DevAppProxy` 两类路由；LLM API、VNC、
+    ///   ttyd、dbx、IME、端口转发及管理接口不改（`streaming_peer_options`
+    ///   保持 `read_timeout = None` 的长连接行为）。
+    /// - 明确识别的 WebSocket 升级请求（HTTP/1.1 + `Upgrade: websocket`，
+    ///   官方 `is_upgrade_req` 判定 + websocket 协议字段核对——仅任意
+    ///   Upgrade 头不豁免）不套本窗口，保留既有长连接 peer 行为；
+    ///   下游空闲窗口由升级成功后的
+    ///   [`Self::upgraded_downstream_read_timeout`] 负责。握手被上游拒绝
+    ///   仍按原 HTTP 路径返回原错误，不伪造 101。
+    /// - 窗口是**连续静默上限**，不是连接/请求总寿命：持续收到上游字节
+    ///   即重新起算。SSE/WS 有心跳或数据可运行远超窗口；静默超窗按官方
+    ///   `ReadTimedout`（Upstream）结束，失败出口映射 504 超时档。上传
+    ///   语义（官方 relay `tokio::select!` 实测）：客户端**持续发送**的
+    ///   每片 body 写入会重建上游读 future、重置计时，活跃慢上传不受
+    ///   误伤；客户端**中途停住**且上游零响应字节的交换按窗口超时。
+    /// - 重试遵循官方既有安全规则（幂等方法、ReusedOnly、请求体缓冲
+    ///   重放），每次尝试获得同一窗口；无跨重试共享墙钟，不为凑总时限
+    ///   重放 POST，也不宣称整次请求固定窗口时长内结束。
+    fn apply_userapp_upstream_read_timeout(
+        &self,
+        route: RouteType,
+        websocket_upgrade: bool,
+        peer: &mut HttpPeer,
+    ) {
+        let is_userapp_app_route = match route {
+            RouteType::ProdAppProxy | RouteType::DevAppProxy => true,
+            // 其余路由族穷尽列明：LLM API、VNC、ttyd、dbx、IME、音频、
+            // 端口转发、预览转发与健康检查均保持 `streaming_peer_options`
+            // 的 `read_timeout = None` 长连接行为。新增路由变体在此触发
+            // 编译错误，迫使显式决策是否套读窗口，不被静默跳过。
+            RouteType::VncProxy
+            | RouteType::PortProxy
+            | RouteType::PreviewForward
+            | RouteType::DevTtydProxy
+            | RouteType::DevVncProxy
+            | RouteType::DevAudioProxy
+            | RouteType::DevImeProxy
+            | RouteType::RuntimeTtydProxy
+            | RouteType::DevDbxProxy
+            | RouteType::ProdDbxProxy
+            | RouteType::HealthCheck
+            | RouteType::ApiProxy
+            | RouteType::AudioProxy
+            | RouteType::ImeProxy
+            | RouteType::TtydProxy
+            | RouteType::WebTtydProxy => false,
+        };
+        if is_userapp_app_route && !websocket_upgrade {
+            peer.options.read_timeout = Some(self.userapp_upstream_read_timeout());
+        }
+    }
+
     fn validate_request_api_key(&self, session: &Session, path: &str) -> PingoraResult<()> {
         let Some(config) = self.api_key_config.as_ref() else {
             return Ok(());
@@ -322,7 +378,20 @@ impl ProxyHttp for PortProxy {
                     app_id: app_id.to_string(),
                     stage,
                 });
+                // app 预览（HMR/WS/SSE）属已知流式路由：客户端断开日志分类用。
+                ctx.streaming_route = Some("app");
             }
+        }
+        // dbx 流式路由标记（生产 431 条 Downstream ConnectionClosed 的来源族）：
+        // 须在 classify_wake_target 的 dev 早退之前捕获。
+        if path.starts_with("/api/v1/userapp/proxy/dbx/")
+            && let Ok(matched) = self.router.at(path)
+            && matches!(
+                matched.value,
+                RouteType::DevDbxProxy | RouteType::ProdDbxProxy
+            )
+        {
+            ctx.streaming_route = Some("dbx");
         }
         if let Some((app_id, touch, stage)) = classify_wake_target(&self.router, path) {
             // ① 访问追踪（仅 prod 业务流量）
@@ -713,6 +782,11 @@ impl ProxyHttp for PortProxy {
                 return Err(pingora_core::Error::new(ErrorType::HTTPStatus(503)));
             }
         }
+        self.apply_userapp_upstream_read_timeout(
+            *matched.value,
+            is_websocket_upgrade_request(session.req_header()),
+            &mut peer,
+        );
         Ok(peer)
     }
 
@@ -730,7 +804,13 @@ impl ProxyHttp for PortProxy {
     {
         let connect_failure =
             ctx.userapp_route.is_some() && is_entry_connect_failure(error.etype());
-        let code = if connect_failure {
+        // 上游读空闲窗口耗尽（官方 `ReadTimedout` 且来源 Upstream）：唯一
+        // 映射 504 超时档的类别——下游读取超时（来源 Downstream）不在此
+        // 列，不得一并改成应用 504。
+        let upstream_read_timeout = ctx.userapp_route.is_some() && is_upstream_read_timeout(error);
+        let code = if upstream_read_timeout {
+            504
+        } else if connect_failure {
             503
         } else {
             default_error_status(error)
@@ -751,13 +831,23 @@ impl ProxyHttp for PortProxy {
             Self::capture_proxy_transition(ctx);
         }
         if ctx.userapp_route.is_some() && code > 0 {
-            // 原因用封闭的错误类型词表（etype），不透出内部地址/凭据细节
-            let reason = error.etype().as_str().to_string();
+            // 原因用封闭的错误类型词表（etype），不透出内部地址/凭据细节；
+            // 上游读超时档用封闭 reason（机器可读），文案档不宣称应用已停止。
+            let reason = if upstream_read_timeout {
+                "upstream_response_timeout".to_string()
+            } else {
+                error.etype().as_str().to_string()
+            };
+            let cause = if upstream_read_timeout {
+                crate::error_page::ErrorPageCause::UpstreamResponseTimeout
+            } else {
+                crate::error_page::ErrorPageCause::Generic
+            };
             self.respond_userapp_error(
                 session,
                 ctx,
                 code,
-                crate::error_page::ErrorPageCause::Generic,
+                cause,
                 &reason,
                 connect_failure.then_some(15),
                 // 错误链完整进日志（可能含内部地址——只进日志不进页面）
@@ -801,6 +891,77 @@ impl ProxyHttp for PortProxy {
             }
         }
         error
+    }
+
+    /// 客户端断开日志分类（生产巡检批次二A）：仅当①已知流式路由
+    /// （`ctx.streaming_route`：UserApp app 预览或 dbx 族）、②响应已建立
+    /// （`response_written` 为非 1xx 终态或 101——与错误页守卫同语义）、
+    /// ③错误源为 Downstream 且 etype 为 ConnectionClosed（客户端 FIN）
+    /// 三者同时成立，才把该错误按**预期客户端断开**分类：抑制 pingora
+    /// 的最终 `Fail to proxy` ERROR（proxy lib.rs 在本 hook 返回 true 时不
+    /// 打印），代之以降级 debug（每条）+ 首条/每 100 条采样 info，计数入
+    /// 有界 counter `ProxyMetrics::client_disconnected_suppressed`。
+    ///
+    /// 不降级（返回 false 保持 ERROR 可诊断性）：Upstream 错误、其他
+    /// etype（含 ReadTimedout——下游空闲截断是批次一已根因修复的缺陷
+    /// 签名，不得藏进静默）、响应未建立前的断开、非流式路由。
+    /// hook 内 ctx 为共享引用——计数与采样 gate 必须走 `&self.metrics`，
+    /// 不能写 TrackingCtx。
+    fn suppress_error_log(
+        &self,
+        session: &Session,
+        ctx: &Self::CTX,
+        error: &pingora_core::Error,
+    ) -> bool {
+        use pingora::ErrorSource;
+        let Some(family) = ctx.streaming_route else {
+            return false;
+        };
+        if !matches!(error.esource(), ErrorSource::Downstream)
+            || !matches!(error.etype(), ErrorType::ConnectionClosed)
+        {
+            return false;
+        }
+        let response_established =
+            session
+                .as_downstream()
+                .response_written()
+                .is_some_and(|written| {
+                    !written.status.is_informational() || written.status.as_u16() == 101
+                });
+        if !response_established {
+            return false;
+        }
+        let sampled = self.metrics.note_client_disconnected();
+        let uri = session
+            .req_header()
+            .uri
+            .path_and_query()
+            .map(|path_and_query| path_and_query.as_str().to_string())
+            .unwrap_or_else(|| session.req_header().uri.path().to_string());
+        tracing::debug!(
+            family,
+            classification = "client_disconnected",
+            upgraded = session.as_downstream().was_upgraded(),
+            downstream_sent_bytes = session.as_downstream().body_bytes_sent(),
+            duration_ms = u64::try_from(ctx.start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            uri = %uri,
+            error = %error,
+            "expected client disconnect on streaming route; platform error log suppressed"
+        );
+        if sampled {
+            tracing::info!(
+                family,
+                classification = "client_disconnected",
+                uri = %uri,
+                suppressed_total = self
+                    .metrics
+                    .client_disconnected_suppressed
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                "sampled client disconnect classification"
+            );
+        }
+        true
     }
 
     /// 连接到上游后的回调
@@ -926,6 +1087,29 @@ impl ProxyHttp for PortProxy {
                 "[API_PROXY] Response: status={}, duration={:?}",
                 status_text, duration
             );
+        }
+
+        // ── 成功升级的 UserApp WebSocket：下游有限空闲读窗口 ──────────────
+        // Pingora HTTP/1 server 的下游默认 read_timeout=60s 对升级后的 WS
+        // 隧道仍生效（升级后的帧仍经 read_body 逐次读取），空闲客户端 60s
+        // 即被 Downstream ReadTimedout 截断（生产巡检 2026-10-29 已复现的
+        // 492 条 reading body/400 签名根因）。仅当下游请求带 Upgrade 且
+        // 上游响应为 101/HTTP1.1——与 Pingora 写 101 时置 upgraded 的同一
+        // 握手验证（response_filter 先于 101 写出，此时 was_upgraded 仍为
+        // false，须用 is_upgrade 判定）——且请求属于 UserApp app 代理
+        // （dev/prod 预览路由）时，为下游读设置有限空闲窗口（默认 3600s，
+        // 具名常量见 PingoraProxyService::DEFAULT_UPGRADED_DOWNSTREAM_READ_TIMEOUT）。
+        // read_body 按每次调用包裹该超时：窗口随每次客户端读自然刷新，
+        // 不是无限保活。普通 HTTP、未完成 body、仅有 Upgrade 头但被拒
+        // （非 101 响应）或 H2 下游（is_upgrade 恒 None）都不进入本分支，
+        // 保持默认超时保护；升级连接关闭后不进 keepalive 池，窗口不会
+        // 泄漏到后续请求。
+        if ctx.userapp_route.is_some()
+            && session.as_downstream_mut().is_upgrade(upstream_response) == Some(true)
+        {
+            session
+                .as_downstream_mut()
+                .set_read_timeout(Some(self.upgraded_downstream_read_timeout()));
         }
 
         Ok(())
@@ -1335,6 +1519,28 @@ fn is_entry_connect_failure(error: &ErrorType) -> bool {
         ErrorType::ConnectRefused | ErrorType::ConnectNoRoute | ErrorType::ConnectTimedout
     )
 }
+
+/// WebSocket 升级请求判定（选择读超时策略用，不改变鉴权/路由/升级授权）：
+/// 官方 H1 Upgrade 识别能力（`pingora-core` v1 `is_upgrade_req` 同款——
+/// HTTP/1.1 且带 Upgrade 头）**加** websocket 协议字段核对（值大小写不
+/// 敏感等于 `websocket`）。仅任意 Upgrade 头（如 `Upgrade: h2c`）不豁免
+/// 读空闲窗口；H2 下游（无 Upgrade 概念，扩展 CONNECT 不在本批宣称）
+/// 恒 false。
+fn is_websocket_upgrade_request(req: &RequestHeader) -> bool {
+    req.version == http::Version::HTTP_11
+        && req
+            .headers
+            .get(http::header::UPGRADE)
+            .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"))
+}
+
+/// 上游读空闲窗口耗尽（官方 `ReadTimedout`，来源 Upstream——读响应头/
+/// 正文逐次读取超时）的判定：唯一映射 504 超时档的类别。下游读取超时
+/// （来源 Downstream——请求侧读取）不在此列，不得误报为应用 504。
+fn is_upstream_read_timeout(error: &pingora_core::Error) -> bool {
+    use pingora_core::ErrorSource;
+    error.esource() == &ErrorSource::Upstream && error.etype() == &ErrorType::ReadTimedout
+}
 fn is_connect_etype_header(value: &str) -> bool {
     matches!(
         value,
@@ -1551,6 +1757,90 @@ mod tests {
 
     fn test_router() -> Router<RouteType> {
         create_router().expect("router build")
+    }
+
+    /// 官方读空闲窗口只套 UserApp app dev/prod 两类路由；WebSocket 升级
+    /// 请求豁免（保留 `streaming_peer_options` 的长连接 peer 行为）；非
+    /// app 路由（LLM API/VNC/ttyd/dbx 等）完全不套。
+    #[test]
+    fn userapp_upstream_read_timeout_scopes_to_non_ws_app_routes() {
+        let service =
+            crate::service::PingoraProxyService::new(crate::config::ProxyConfig::default());
+        let proxy = service.create_pingora_proxy().expect("build proxy");
+        let mut peer = HttpPeer::new("127.0.0.1:1", false, String::new());
+        // streaming_peer_options 的基线：长连接路由 read_timeout = None。
+        peer.options.read_timeout = None;
+
+        proxy.apply_userapp_upstream_read_timeout(RouteType::RuntimeTtydProxy, false, &mut peer);
+        assert!(
+            peer.options.read_timeout.is_none(),
+            "non-app routes must keep the streaming long-connection policy"
+        );
+
+        proxy.apply_userapp_upstream_read_timeout(RouteType::ProdAppProxy, false, &mut peer);
+        assert_eq!(
+            peer.options.read_timeout,
+            Some(crate::service::PingoraProxyService::DEFAULT_USERAPP_UPSTREAM_READ_TIMEOUT),
+            "prod app route arms the official read idle window"
+        );
+
+        peer.options.read_timeout = None;
+        proxy.apply_userapp_upstream_read_timeout(RouteType::DevAppProxy, true, &mut peer);
+        assert!(
+            peer.options.read_timeout.is_none(),
+            "websocket upgrade requests keep the long-lived peer policy"
+        );
+    }
+
+    /// WebSocket 升级判定矩阵：官方 H1 Upgrade 识别 + websocket 协议字段
+    /// 核对——任意 Upgrade 头（h2c）或 H2 下游不豁免；大小写不敏感。
+    #[test]
+    fn websocket_upgrade_detection_requires_the_websocket_field() {
+        let build = |version: http::Version, upgrade: Option<&str>| {
+            let mut req = RequestHeader::build("GET", b"/ws", None).expect("build request");
+            if let Some(value) = upgrade {
+                req.insert_header("Upgrade", value)
+                    .expect("insert upgrade header");
+            }
+            req.set_version(version);
+            req
+        };
+        assert!(is_websocket_upgrade_request(&build(
+            http::Version::HTTP_11,
+            Some("websocket")
+        )));
+        assert!(is_websocket_upgrade_request(&build(
+            http::Version::HTTP_11,
+            Some("WebSocket")
+        )));
+        assert!(
+            !is_websocket_upgrade_request(&build(http::Version::HTTP_11, Some("h2c"))),
+            "an arbitrary Upgrade token must not exempt the read window"
+        );
+        assert!(
+            !is_websocket_upgrade_request(&build(http::Version::HTTP_11, None)),
+            "requests without an Upgrade header are not websocket upgrades"
+        );
+        assert!(
+            !is_websocket_upgrade_request(&build(http::Version::HTTP_2, Some("websocket"))),
+            "H2 downstream has no HTTP/1 Upgrade semantics"
+        );
+    }
+
+    /// 上游/下游 ReadTimedout 分类：只有官方 Upstream 来源的读超时进入
+    /// 504 超时档；下游（请求侧读取）超时保持自身状态映射，不得误报为
+    /// 应用 504。用官方构造器造两类同型错误做区分反例。
+    #[test]
+    fn upstream_read_timeout_classification_separates_sources() {
+        let upstream = pingora_core::Error::new_up(ErrorType::ReadTimedout);
+        assert!(is_upstream_read_timeout(&upstream));
+        let downstream = pingora_core::Error::new_down(ErrorType::ReadTimedout);
+        assert!(
+            !is_upstream_read_timeout(&downstream),
+            "downstream read timeouts must not be reported as app 504"
+        );
+        let upstream_other = pingora_core::Error::new_up(ErrorType::ConnectTimedout);
+        assert!(!is_upstream_read_timeout(&upstream_other));
     }
 
     /// 工具族路由：识别为唤醒目标且不 touch（挂终端不算业务活跃）。

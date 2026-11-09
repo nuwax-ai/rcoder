@@ -179,7 +179,7 @@ fn header_summary(headers: &http::HeaderMap, name: &str) -> String {
     match headers.get(name) {
         None => "absent".to_string(),
         Some(value) => match value.to_str() {
-            Ok(text) if text.is_empty() => "empty".to_string(),
+            Ok("") => "empty".to_string(),
             Ok(text) => text.to_string(),
             Err(_) => "<non-utf8>".to_string(),
         },

@@ -39,7 +39,7 @@ runtime-state-layout = { path = "../runtime-state-layout" }
 pingap-config = { git = "https://github.com/vicanso/pingap", rev = "8270a1ebb7a238ea86fa220215714613410378bb" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "1.1.6"
+toml = "1.1.8"
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 tracing = "0.1"
@@ -65,7 +65,7 @@ globset = "0.4"
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.23"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1.29", features = ["v4"] }
 # 对齐 rcoder workspace 的 reqwest 特性集（rustls 固化 + stream 供部署段流式下载）
 reqwest = { version = "0.13", default-features = false, features = [
     "stream",
@@ -81,7 +81,7 @@ roxmltree = "0.21"
 sha2 = "0.11"
 hex = "0.4"
 # 部署段解压制品包（与 rcoder workspace zip 同版本；deflate 足够覆盖平台制品）
-zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
+zip = { version = "9.1", default-features = false, features = ["deflate"] }
 # 部署段制品 zip 魔数校验（拦 HTTP 200 + 错误信封 body 被当 zip 落盘）；
 # 关 default 裁掉 cfb 传递依赖——只用 archive::is_zip 纯函数
 infer = { version = "0.22", default-features = false }

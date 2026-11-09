@@ -5,9 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
 <!-- 大多数错误态是瞬态（服务启动中/standby 摘流窗口），整页每 5s 自动重载，
-     恢复后自然回到应用；仍在错误中则重新渲染本页。无 JS 依赖，脚本失败也能恢复。 -->
-<meta http-equiv="refresh" content="5">
-<title>{{RCODER_TITLE}} · {{RCODER_STATUS}}</title>
+     恢复后自然回到应用；仍在错误中则重新渲染本页。无 JS 依赖，脚本失败也能恢复。
+     例外：上游首头超时/结果未知档不自动刷新（请求可能仍在处理中，自动重复
+     触发业务是错误行为）——服务端按档位注入占位符位置。 -->
+{{RCODER_META_REFRESH}}<title>{{RCODER_TITLE}} · {{RCODER_STATUS}}</title>
 <style>
   :root {
     color-scheme: light dark;

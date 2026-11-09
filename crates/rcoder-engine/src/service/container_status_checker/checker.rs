@@ -8,8 +8,10 @@ use tokio::time;
 use tracing::{Instrument, debug, info, warn};
 
 use crate::app_state::AppState;
+use container_runtime_api::ContainerRuntimeError;
 use shared_types::{
-    AgentStatusObservation, ContainerBasicInfo, ProjectAndContainerInfo, ProjectStore as _,
+    AgentStatusObservation, ComputerOwnerMismatch, ContainerBasicInfo, ContainerWorkloadReplaced,
+    ProjectAndContainerInfo, ProjectStore as _,
 };
 
 use super::state::{ContainerHealthState, ContainerStatusCheckerConfig, HealthScope};
@@ -24,6 +26,10 @@ enum StatusTarget {
     },
     /// 不发 RPC 的保留结论：缺席/未知/不可核实的换代，注册原样保留。
     Keep { reason: String },
+    /// 已确认的预期停态（F2 §5.2）：完成 Stop 回执 + 当前意图 + 注册代次上
+    /// controller 实际停止。跳过失效地址的探测**与失败计数**——不是错误，
+    /// 也不伪造停态给任何未确认场景。
+    Stopped { evidence: String },
 }
 
 /// 一次探针的观察身份：物理 UID/workload + 注册代次/revision，全部在
@@ -97,6 +103,33 @@ fn format_relative_time(dt: DateTime<Utc>) -> String {
         format!("{}h ago", duration.num_hours())
     } else {
         format!("{}d ago", duration.num_days())
+    }
+}
+
+/// Computer 换代恢复被拒的完整脱敏 cause 链。anyhow 的 Display 只剩最外层
+/// context（"Observe Computer workload replacement"），会同时隐藏
+/// [`ContainerWorkloadReplaced`] typed 冲突与 runtime 底层原因；`{error:#}`
+/// 按仓库惯例单行展开整链，再经 [`shared_types::sanitize_error_text`] 脱敏
+/// 凭据并限长（有界诊断）。
+fn replacement_rejection_detail(error: &anyhow::Error) -> String {
+    shared_types::sanitize_error_text(&format!("{error:#}"))
+}
+
+/// Computer 换代恢复被拒的 typed 类别：优先透出 durable 注册闸门已构造的
+/// typed 冲突契约（[`ContainerWorkloadReplaced`] / [`ComputerOwnerMismatch`]），
+/// 否则按 cause 链中的 runtime 变体分类；两者都不可得（如存储刷新失败、
+/// 重试围栏）时保留显式标签，不冒领 runtime 类别。
+fn replacement_rejection_category(error: &anyhow::Error) -> &'static str {
+    const UNCLASSIFIED: &str = "computer.replacement.rejected.unclassified";
+    if error.downcast_ref::<ContainerWorkloadReplaced>().is_some() {
+        return shared_types::error_codes::CONTAINER_WORKLOAD_REPLACED;
+    }
+    if let Some(mismatch) = error.downcast_ref::<ComputerOwnerMismatch>() {
+        return mismatch.reason_code();
+    }
+    match error.downcast_ref::<ContainerRuntimeError>() {
+        Some(runtime) => container_runtime_api::runtime_error_code(runtime).0,
+        None => UNCLASSIFIED,
     }
 }
 
@@ -275,12 +308,21 @@ impl ContainerStatusChecker {
 
         let project_id = container_info.project_id().to_string();
 
-        // 解析目标：缺席/未知/不可核实的换代一律保留注册，不探测旧地址
+        // 解析目标：缺席/未知/不可核实的换代一律保留注册，不探测旧地址；
+        // 已确认的预期停态（F2）连失败计数也跳过——那是预期状态，不是故障。
         let (grpc_addr, captured) = match self
             .resolve_status_target(family, lookup_key, container_info)
             .await?
         {
             StatusTarget::Probe { addr, captured } => (addr, captured),
+            StatusTarget::Stopped { evidence } => {
+                debug!(
+                    container_key = lookup_key,
+                    evidence = %evidence,
+                    "[STATUS_CHECKER] Confirmed expected stop; probe and failure counting skipped"
+                );
+                return Ok(false);
+            }
             StatusTarget::Keep { reason } => {
                 let scope = HealthScope::of(&registered);
                 let registered_addr = self
@@ -422,6 +464,19 @@ impl ContainerStatusChecker {
             }
         };
         let Some(found) = found else {
+            // F2 §5.2：builder 的已确认预期停态（完成 Stop 回执 + 当前意图 +
+            // 注册代次上 controller 实际停止）跳过探测与失败计数；其余（含
+            // 证据读取失败）保持既有 Keep→失败路径，绝不伪造停态。
+            if family == shared_types::ServiceType::UserappBuilder
+                && let Some(evidence) = crate::userapp_builder::confirmed_builder_stop_evidence(
+                    &self.state,
+                    registration.project_id(),
+                    registered.workload_uid.as_deref(),
+                )
+                .await?
+            {
+                return Ok(StatusTarget::Stopped { evidence });
+            }
             info!(
                 container_key = lookup_key,
                 "[STATUS_CHECKER] No runtime candidate observed; registration retained for authoritative reconciliation"
@@ -485,10 +540,25 @@ impl ContainerStatusChecker {
                             reason: "computer replacement registration is not committed yet".into(),
                         }),
                         Err(error) => {
-                            warn!(container_key = lookup_key, %error,
+                            // 诊断增强（保护语义不变，不放开接管）：anyhow 的
+                            // Display 只剩最外层 context，无法归因 runtime 拒绝
+                            // 原因。完整脱敏 cause 链 + typed 类别 + 新旧物理
+                            // 身份；WARN 级别与保留注册行为均不变。
+                            let rejection = replacement_rejection_detail(&error);
+                            warn!(container_key = lookup_key,
+                                rejection = %rejection,
+                                category = replacement_rejection_category(&error),
+                                registered_container_id = %registered.container_id,
+                                registered_workload_uid = ?registered.workload_uid,
+                                observed_container_id = %observed.container_id,
+                                observed_workload_uid = ?observed.workload_uid,
                                 "[STATUS_CHECKER] Computer replacement recovery rejected; registration retained");
+                            // reason 会进入 record_failure 的失败日志与向上传播的
+                            // 错误文本：同样携带完整链，不再只剩最外层 context。
                             Ok(StatusTarget::Keep {
-                                reason: format!("computer replacement recovery rejected: {error}"),
+                                reason: format!(
+                                    "computer replacement recovery rejected: {rejection}"
+                                ),
                             })
                         }
                     }

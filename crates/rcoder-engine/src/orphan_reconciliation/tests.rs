@@ -201,6 +201,32 @@ struct Runtime {
     capture_entered: tokio::sync::Notify,
     capture_release: tokio::sync::Notify,
     capture_blocked: AtomicBool,
+    /// Live builder observation for the registration-recovery path. `None` =
+    /// the runtime reports no builder (the historical fixture behaviour).
+    builder: Mutex<Option<RuntimeContainerInfo>>,
+    /// Workspace volume witness for the registration-recovery path.
+    volumes: Mutex<VolumeWitness>,
+    /// Slow builder observation (registration-recovery path): the budget
+    /// counterexample blocks here.
+    builder_blocked: AtomicBool,
+    builder_entered: tokio::sync::Notify,
+    builder_release: tokio::sync::Notify,
+    /// Live volumes no longer match the recorded discovery witness.
+    volumes_replaced: AtomicBool,
+    /// The volume witness cannot be read at all (API failure/timeout).
+    volumes_unreadable: AtomicBool,
+}
+
+/// What the runtime reports for a builder's workspace volumes. `Absent` is the
+/// historical fixture behaviour (no volume evidence at all).
+#[derive(Clone, Default)]
+enum VolumeWitness {
+    #[default]
+    Absent,
+    Present(Vec<shared_types::AppResourceIdentity>),
+    /// The runtime refuses the witness, e.g. a same-named PVC recreated under
+    /// another lifecycle or a deleted volume.
+    Refused(String),
 }
 
 #[async_trait::async_trait]
@@ -275,9 +301,79 @@ impl AgentContainerRuntime for Runtime {
     async fn find_container(
         &self,
         _: &str,
-        _: &ServiceType,
+        family: &ServiceType,
     ) -> ContainerRuntimeResult<Option<RuntimeContainerInfo>> {
+        if *family == ServiceType::UserappBuilder {
+            if self.builder_blocked.load(Ordering::Acquire) {
+                let released = self.builder_release.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
+                self.builder_entered.notify_one();
+                released.await;
+            }
+            return Ok(self.builder.lock().unwrap().clone());
+        }
         Ok(None)
+    }
+    async fn inspect_builder_candidate(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        self.builder_target(context)
+    }
+    async fn capture_builder_control(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        self.builder_target(context)
+    }
+    async fn capture_bound_builder_control(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        _binding: Option<&shared_types::UserAppResourceBinding>,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        self.builder_target(context)
+    }
+    async fn capture_builder_compute_volumes(
+        &self,
+        _target: &shared_types::BuilderControlTarget,
+    ) -> ContainerRuntimeResult<Vec<shared_types::AppResourceIdentity>> {
+        match self.volumes.lock().unwrap().clone() {
+            VolumeWitness::Absent => Ok(Vec::new()),
+            VolumeWitness::Present(volumes) => Ok(volumes),
+            VolumeWitness::Refused(reason) => Err(ContainerRuntimeError::Conflict(reason)),
+        }
+    }
+    async fn acquire_builder_operation(
+        &self,
+        _: &str,
+    ) -> ContainerRuntimeResult<Box<dyn shared_types::AppOperationLease>> {
+        struct NoopLease;
+        #[async_trait::async_trait]
+        impl shared_types::AppOperationLease for NoopLease {
+            async fn release(self: Box<Self>) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        Ok(Box::new(NoopLease))
+    }
+    async fn capture_builder_adoption(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+        expected_container_id: &str,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        let mut target = self.builder_target(context)?;
+        let pod = target
+            .pod
+            .as_ref()
+            .ok_or_else(|| ContainerRuntimeError::K8sError("no builder pod observed".into()))?;
+        if pod.uid != expected_container_id {
+            return Err(ContainerRuntimeError::Conflict(
+                "expected physical builder differs from the live pod".into(),
+            ));
+        }
+        target.resource_binding = None;
+        Ok(target)
     }
     async fn stop_container(&self, _: &str) -> ContainerRuntimeResult<()> {
         panic!("scanner must not use name-based stop")
@@ -307,6 +403,70 @@ impl UserAppDeploymentRuntime for Runtime {
     ) -> ContainerRuntimeResult<Vec<container_runtime_api::DeploymentStatus>> {
         Ok(vec![])
     }
+    /// Mirrors the K8s implementation's contract: the live PVC must carry the
+    /// recorded UID and must not be deleting. `Replaced` reproduces a
+    /// same-named PVC recreated with a new UID.
+    async fn verify_recovered_volumes(
+        &self,
+        _context: &shared_types::UserAppExecutionContext,
+        _scope: shared_types::UserAppOperationScope,
+        volumes: &[shared_types::AppResourceIdentity],
+    ) -> ContainerRuntimeResult<()> {
+        if self.volumes_replaced.load(Ordering::Acquire) {
+            return Err(ContainerRuntimeError::Conflict(
+                "Recovered workspace volume was replaced or is deleting".into(),
+            ));
+        }
+        if self.volumes_unreadable.load(Ordering::Acquire) {
+            return Err(ContainerRuntimeError::K8sError(
+                "controlled volume witness read failure".into(),
+            ));
+        }
+        for expected in volumes {
+            if expected.uid.is_empty() || expected.name.is_empty() {
+                return Err(ContainerRuntimeError::ConfigurationError(
+                    "Invalid recovered volume witness".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Runtime {
+    /// Live builder control target: the observed Pod/controller pair, with the
+    /// StatefulSet workload the identity checks compare against.
+    fn builder_target(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<shared_types::BuilderControlTarget> {
+        let observed = self
+            .builder
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| ContainerRuntimeError::K8sError("no builder observed".into()))?;
+        Ok(shared_types::BuilderControlTarget {
+            context: context.clone(),
+            resource_binding: None,
+            workload: Some(shared_types::AppResourceIdentity {
+                kind: shared_types::AppResourceKind::StatefulSet,
+                name: observed.container_name.clone(),
+                uid: observed.workload_uid.clone().ok_or_else(|| {
+                    ContainerRuntimeError::K8sError("workload uid missing".into())
+                })?,
+                resource_version: Some("1".into()),
+            }),
+            pod: Some(shared_types::BuilderPodIdentity {
+                name: format!("{}-0", observed.container_name),
+                uid: observed.container_id,
+                resource_version: "2".into(),
+            }),
+            restart_image: None,
+            restart_runtime_workspace: None,
+            builder_startup_mode: Default::default(),
+        })
+    }
 }
 
 #[cfg(feature = "userapp-turso")]
@@ -327,6 +487,13 @@ async fn fixture() -> (Scanner, Arc<Runtime>, Arc<ScriptedProbe>, tempfile::Temp
         capture_entered: tokio::sync::Notify::new(),
         capture_release: tokio::sync::Notify::new(),
         capture_blocked: AtomicBool::new(false),
+        builder: Mutex::new(None),
+        volumes: Mutex::new(VolumeWitness::default()),
+        builder_blocked: AtomicBool::new(false),
+        builder_entered: tokio::sync::Notify::new(),
+        builder_release: tokio::sync::Notify::new(),
+        volumes_replaced: AtomicBool::new(false),
+        volumes_unreadable: AtomicBool::new(false),
     });
     let state =
         crate::userapp_builder::builder_runtime_test_state(runtime.clone(), store, None).await;
@@ -777,3 +944,722 @@ async fn deferred_live_docker_workload_cannot_credit_unobserved_idle_time() {
 
 #[cfg(feature = "userapp-turso")]
 mod probe;
+
+/// 现场 8 个 builder 的形态：UserApp 生命周期引用仍在（`ensure_identity`）、
+/// 真实同 controller 的 Pod 存活、`projects` 无登记。修复前反向库存只给
+/// `LifecycleReferenced`，普通 scanner 又遍历不到——永久不进回收链。
+///
+/// 修复后：同一当前生命周期的有效绑定即可补齐 canonical 登记（不创建/不启动/
+/// 不重放迁移），实例进入普通 scanner；且首期登记获得**新的**闲置观察窗，
+/// 不会因"刚发现"就被删。
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn live_builder_without_registration_is_completed_from_current_lifecycle_binding() {
+    let (mut scanner, runtime, _probe, _directory) = fixture().await;
+    // 记录在案的原卷期望（与 live 卷一致）：第二层卷验证通过。
+    record_discovery_witness(&scanner.state, "witness-lifecycle", "pvc-current").await;
+    let app = scanner
+        .state
+        .userapp_store
+        .get_application("example")
+        .await
+        .unwrap()
+        .expect("witness restore creates the root");
+    *runtime.snapshot.lock().unwrap() = live_builder();
+    *runtime.builder.lock().unwrap() = Some(RuntimeContainerInfo {
+        container_id: "pod-live".into(),
+        container_name: "example".into(),
+        container_ip: "10.42.4.207".into(),
+        status: container_runtime_api::ContainerRuntimeStatus::Running,
+        created_at: Utc::now(),
+        env_vars: None,
+        service_type: Some(ServiceType::UserappBuilder),
+        project_id: Some("example".into()),
+        app_id: Some("example".into()),
+        user_id: None,
+        pod_id: None,
+        workload_uid: Some("sts-current".into()),
+    });
+    bind_current_lifecycle(&scanner.state, &app.lifecycle_id).await;
+    *runtime.volumes.lock().unwrap() =
+        VolumeWitness::Present(vec![shared_types::AppResourceIdentity {
+            kind: shared_types::AppResourceKind::PersistentVolumeClaim,
+            name: "example-workspace".into(),
+            uid: "pvc-current".into(),
+            resource_version: None,
+        }]);
+
+    scanner.scan().await.unwrap();
+    let registered = scanner
+        .state
+        .projects
+        .get("example")
+        .expect("missing builder registration must be completed");
+    let container = registered.container_info().expect("builder container");
+    assert_eq!(container.container_id, "pod-live");
+    assert_eq!(container.container_ip, "10.42.4.207");
+    assert_eq!(container.workload_uid.as_deref(), Some("sts-current"));
+    assert_eq!(registered.service_type(), Some(ServiceType::UserappBuilder));
+    assert_eq!(
+        runtime.deletes.load(Ordering::Acquire),
+        0,
+        "completing a registration must never retire compute"
+    );
+    // 首期登记 = 新的闲置观察窗：不会因刚补齐就被回收。
+    let idle = (Utc::now() - registered.last_activity()).num_seconds();
+    assert!(
+        idle < 5,
+        "recovered registration must start its own idle window"
+    );
+
+    // 补齐后该 workload 已被登记：反向库存按 Registered 评估，不再需要恢复。
+    age_candidates(&mut scanner);
+    scanner.scan().await.unwrap();
+    assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
+    assert!(
+        scanner
+            .state
+            .projects
+            .get("example")
+            .is_some_and(|project| project.container_info().is_some())
+    );
+}
+
+/// 缺证据（无当前生命周期绑定、也无成功回执）时保留资源并给出明确分类——
+/// 缺证据不是接管许可，也不是删除许可。
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn live_builder_without_registration_or_evidence_is_retained() {
+    let (mut scanner, runtime, _probe, _directory) = fixture().await;
+    scanner
+        .state
+        .userapp_store
+        .ensure_identity("example")
+        .await
+        .unwrap();
+    *runtime.snapshot.lock().unwrap() = live_builder();
+    *runtime.builder.lock().unwrap() = Some(RuntimeContainerInfo {
+        container_id: "pod-live".into(),
+        container_name: "example".into(),
+        container_ip: "10.42.4.207".into(),
+        status: container_runtime_api::ContainerRuntimeStatus::Running,
+        created_at: Utc::now(),
+        env_vars: None,
+        service_type: Some(ServiceType::UserappBuilder),
+        project_id: Some("example".into()),
+        app_id: Some("example".into()),
+        user_id: None,
+        pod_id: None,
+        workload_uid: Some("sts-current".into()),
+    });
+    scanner.scan().await.unwrap();
+    assert!(
+        scanner
+            .state
+            .projects
+            .get("example")
+            .is_none_or(|project| project.container_info().is_none()),
+        "no identity evidence must not create a registration"
+    );
+    assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
+}
+
+/// 恢复的各阶段必须共享扫描绝对预算（Codex 复核 P2）：慢的运行时观察不能让
+/// 扫描整体越界，把后续 workload 和关机 drain 一起拖住。写入结果未知时不得
+/// 计为成功。
+#[tokio::test]
+async fn registration_recovery_cannot_outlive_the_scan_budget() {
+    let (mut scanner, runtime, _probe, _directory) = fixture().await;
+    scanner.config.orphan_scan_budget_seconds = 1;
+    scanner
+        .state
+        .userapp_store
+        .ensure_identity("example")
+        .await
+        .unwrap();
+    *runtime.snapshot.lock().unwrap() = live_builder();
+    *runtime.builder.lock().unwrap() = Some(RuntimeContainerInfo {
+        container_id: "pod-live".into(),
+        container_name: "example".into(),
+        container_ip: "10.42.4.207".into(),
+        status: container_runtime_api::ContainerRuntimeStatus::Running,
+        created_at: Utc::now(),
+        env_vars: None,
+        service_type: Some(ServiceType::UserappBuilder),
+        project_id: Some("example".into()),
+        app_id: Some("example".into()),
+        user_id: None,
+        pod_id: None,
+        workload_uid: Some("sts-current".into()),
+    });
+    runtime.builder_blocked.store(true, Ordering::Release);
+    let observer = runtime.clone();
+    let notified = tokio::spawn(async move { observer.builder_entered.notified().await });
+    let scan = tokio::spawn(async move { scanner.scan().await });
+    tokio::time::timeout(Duration::from_secs(5), notified)
+        .await
+        .expect("recovery must reach the runtime observation")
+        .expect("observer task");
+    // 预算内收手：整轮扫描必须返回，不能挂在慢查询上。
+    let finished = tokio::time::timeout(Duration::from_secs(5), scan)
+        .await
+        .expect("a slow registration recovery must not outlive the scan budget");
+    assert!(finished.unwrap().is_ok(), "budgeted scan still completes");
+    assert_eq!(
+        runtime.deletes.load(Ordering::Acquire),
+        0,
+        "an unfinished recovery never retires compute"
+    );
+    runtime.builder_release.notify_waiters();
+}
+
+/// 原卷连续性不成立时不得补齐登记（Codex 复核 P2）：运行时读到的卷见证被拒绝
+/// ——现场形态是同名 PVC 在另一代次下被重建（UID 变、内容可能已丢），或卷正在
+/// 删除。此时"当前生命周期绑定"不足以证明原卷连续，必须保留资源。
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn live_builder_registration_recovery_refuses_unverified_workspace_volume() {
+    let (mut scanner, runtime, _probe, _directory) = fixture().await;
+    let app = scanner
+        .state
+        .userapp_store
+        .ensure_identity("example")
+        .await
+        .unwrap();
+    *runtime.snapshot.lock().unwrap() = live_builder();
+    *runtime.builder.lock().unwrap() = Some(RuntimeContainerInfo {
+        container_id: "pod-live".into(),
+        container_name: "example".into(),
+        container_ip: "10.42.4.207".into(),
+        status: container_runtime_api::ContainerRuntimeStatus::Running,
+        created_at: Utc::now(),
+        env_vars: None,
+        service_type: Some(ServiceType::UserappBuilder),
+        project_id: Some("example".into()),
+        app_id: Some("example".into()),
+        user_id: None,
+        pod_id: None,
+        workload_uid: Some("sts-current".into()),
+    });
+    bind_current_lifecycle(&scanner.state, &app.lifecycle_id).await;
+    // 同名 PVC 已在该应用之外被重建：其生命周期注解不属于当前代次。
+    *runtime.volumes.lock().unwrap() = VolumeWitness::Refused(
+        "Application resource identity mismatch: rcoder.io/lifecycle-id".into(),
+    );
+
+    scanner.scan().await.unwrap();
+    assert!(
+        scanner
+            .state
+            .projects
+            .get("example")
+            .is_none_or(|project| project.container_info().is_none()),
+        "an unverifiable workspace volume must not complete a registration"
+    );
+    assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
+}
+
+/// 完全没有卷证据（空见证）同样不补齐：没有卷证据就没有原卷连续性证据，
+/// 空向量不构成"无卷也可登记"。
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn live_builder_registration_recovery_requires_volume_evidence() {
+    let (mut scanner, runtime, _probe, _directory) = fixture().await;
+    let app = scanner
+        .state
+        .userapp_store
+        .ensure_identity("example")
+        .await
+        .unwrap();
+    *runtime.snapshot.lock().unwrap() = live_builder();
+    *runtime.builder.lock().unwrap() = Some(RuntimeContainerInfo {
+        container_id: "pod-live".into(),
+        container_name: "example".into(),
+        container_ip: "10.42.4.207".into(),
+        status: container_runtime_api::ContainerRuntimeStatus::Running,
+        created_at: Utc::now(),
+        env_vars: None,
+        service_type: Some(ServiceType::UserappBuilder),
+        project_id: Some("example".into()),
+        app_id: Some("example".into()),
+        user_id: None,
+        pod_id: None,
+        workload_uid: Some("sts-current".into()),
+    });
+    bind_current_lifecycle(&scanner.state, &app.lifecycle_id).await;
+    // VolumeWitness::Absent（fixture 默认）：运行时读不到任何卷。
+
+    scanner.scan().await.unwrap();
+    assert!(
+        scanner
+            .state
+            .projects
+            .get("example")
+            .is_none_or(|project| project.container_info().is_none()),
+        "missing volume evidence must not complete a registration"
+    );
+    assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
+}
+
+/// 记录在案的原卷期望与 live 卷不一致时不得补齐登记（第二层卷验证）：同名 PVC
+/// 被重建（UID 变）或正在删除。`verify_recovered_volumes` 按 UID 相等判定，
+/// `verify_recovered_mounts` 复核挂载集——与 ensure 链复用同一验证。
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn live_builder_registration_recovery_refuses_replaced_recorded_volume() {
+    let (mut scanner, runtime, _probe, _directory) = fixture().await;
+    // 记录在案的原卷 UID 与 live 不同：同名 PVC 被重建。
+    record_discovery_witness(&scanner.state, "witness-lifecycle", "pvc-original").await;
+    let app = scanner
+        .state
+        .userapp_store
+        .get_application("example")
+        .await
+        .unwrap()
+        .expect("witness restore creates the root");
+    *runtime.snapshot.lock().unwrap() = live_builder();
+    *runtime.builder.lock().unwrap() = Some(RuntimeContainerInfo {
+        container_id: "pod-live".into(),
+        container_name: "example".into(),
+        container_ip: "10.42.4.207".into(),
+        status: container_runtime_api::ContainerRuntimeStatus::Running,
+        created_at: Utc::now(),
+        env_vars: None,
+        service_type: Some(ServiceType::UserappBuilder),
+        project_id: Some("example".into()),
+        app_id: Some("example".into()),
+        user_id: None,
+        pod_id: None,
+        workload_uid: Some("sts-current".into()),
+    });
+    bind_current_lifecycle(&scanner.state, &app.lifecycle_id).await;
+    *runtime.volumes.lock().unwrap() =
+        VolumeWitness::Present(vec![shared_types::AppResourceIdentity {
+            kind: shared_types::AppResourceKind::PersistentVolumeClaim,
+            name: "example-workspace".into(),
+            uid: "pvc-recreated".into(),
+            resource_version: None,
+        }]);
+    runtime.volumes_replaced.store(true, Ordering::Release);
+
+    scanner.scan().await.unwrap();
+    assert!(
+        scanner
+            .state
+            .projects
+            .get("example")
+            .is_none_or(|project| project.container_info().is_none()),
+        "a replaced recorded volume must not complete a registration"
+    );
+    assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
+}
+
+/// 卷**读取失败**与卷**UID 冲突**必须分开归类（Codex 复核 P2）：
+/// 前者结果未知，必须向上传播（扫描按未知处理：保留资源 + 告警），不能伪装成
+/// "卷不一致"；后者才是本轮可判定的 `volume_unverified` 缺口。
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn unreadable_volume_witness_is_unknown_not_a_volume_gap() {
+    let (scanner, runtime, _probe, _directory) = fixture().await;
+    record_discovery_witness(&scanner.state, "witness-lifecycle", "pvc-original").await;
+    let app = scanner
+        .state
+        .userapp_store
+        .get_application("example")
+        .await
+        .unwrap()
+        .expect("witness restore creates the root");
+    *runtime.builder.lock().unwrap() = Some(RuntimeContainerInfo {
+        container_id: "pod-live".into(),
+        container_name: "example".into(),
+        container_ip: "10.42.4.207".into(),
+        status: container_runtime_api::ContainerRuntimeStatus::Running,
+        created_at: Utc::now(),
+        env_vars: None,
+        service_type: Some(ServiceType::UserappBuilder),
+        project_id: Some("example".into()),
+        app_id: Some("example".into()),
+        user_id: None,
+        pod_id: None,
+        workload_uid: Some("sts-current".into()),
+    });
+    bind_current_lifecycle(&scanner.state, &app.lifecycle_id).await;
+    *runtime.volumes.lock().unwrap() =
+        VolumeWitness::Present(vec![shared_types::AppResourceIdentity {
+            kind: shared_types::AppResourceKind::PersistentVolumeClaim,
+            name: "example-workspace".into(),
+            uid: "pvc-current".into(),
+            resource_version: None,
+        }]);
+    runtime.volumes_unreadable.store(true, Ordering::Release);
+
+    let outcome = recover_missing_builder_registration(&scanner.state, "example").await;
+    assert!(
+        outcome.is_err(),
+        "an unreadable volume witness is an unknown outcome and must propagate, \
+         not be reported as a confirmed volume gap"
+    );
+    assert!(
+        scanner
+            .state
+            .projects
+            .get("example")
+            .is_none_or(|project| project.container_info().is_none()),
+        "an unknown outcome never writes a registration"
+    );
+}
+
+/// 对照：UID 冲突是**确定**的缺口，返回 `volume_unverified` 而不是错误。
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn replaced_recorded_volume_is_a_confirmed_gap_not_an_error() {
+    use tracing::instrument::WithSubscriber as _;
+
+    struct DiagnosticWriter(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for DiagnosticWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let (scanner, runtime, _probe, _directory) = fixture().await;
+    record_discovery_witness(&scanner.state, "witness-lifecycle", "pvc-original").await;
+    let app = scanner
+        .state
+        .userapp_store
+        .get_application("example")
+        .await
+        .unwrap()
+        .expect("witness restore creates the root");
+    *runtime.builder.lock().unwrap() = Some(RuntimeContainerInfo {
+        container_id: "pod-live".into(),
+        container_name: "example".into(),
+        container_ip: "10.42.4.207".into(),
+        status: container_runtime_api::ContainerRuntimeStatus::Running,
+        created_at: Utc::now(),
+        env_vars: None,
+        service_type: Some(ServiceType::UserappBuilder),
+        project_id: Some("example".into()),
+        app_id: Some("example".into()),
+        user_id: None,
+        pod_id: None,
+        workload_uid: Some("sts-current".into()),
+    });
+    bind_current_lifecycle(&scanner.state, &app.lifecycle_id).await;
+    *runtime.volumes.lock().unwrap() =
+        VolumeWitness::Present(vec![shared_types::AppResourceIdentity {
+            kind: shared_types::AppResourceKind::PersistentVolumeClaim,
+            name: "example-workspace".into(),
+            uid: "pvc-recreated".into(),
+            resource_version: None,
+        }]);
+    runtime.volumes_replaced.store(true, Ordering::Release);
+
+    let diagnostic = Arc::new(Mutex::new(Vec::new()));
+    let writer = diagnostic.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || DiagnosticWriter(writer.clone()))
+        .finish();
+    let outcome = recover_missing_builder_registration(&scanner.state, "example")
+        .with_subscriber(subscriber)
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Ok(BuilderRegistrationRecovery::Unconfirmed(
+                RegistrationGap::VolumeUnverified
+            ))
+        ),
+        "a replaced recorded volume is a confirmed gap, not an unknown outcome"
+    );
+    let logged = String::from_utf8(diagnostic.lock().unwrap().clone()).unwrap();
+    assert!(
+        logged.contains("Recovered workspace volume was replaced or is deleting"),
+        "default-level diagnostics must preserve the actual rejection: {logged}"
+    );
+}
+
+/// 在途 dev 操作围栏期间不得补齐登记：该应用的登记归属在途操作，后台对账不能
+/// 抢在它前面为正在被替换/停止的 Pod 写行。围栏释放后才恢复。
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn live_builder_registration_recovery_defers_to_inflight_operation() {
+    let (mut scanner, runtime, _probe, _directory) = fixture().await;
+    let app = scanner
+        .state
+        .userapp_store
+        .ensure_identity("example")
+        .await
+        .unwrap();
+    *runtime.snapshot.lock().unwrap() = live_builder();
+    *runtime.builder.lock().unwrap() = Some(RuntimeContainerInfo {
+        container_id: "pod-live".into(),
+        container_name: "example".into(),
+        container_ip: "10.42.4.207".into(),
+        status: container_runtime_api::ContainerRuntimeStatus::Running,
+        created_at: Utc::now(),
+        env_vars: None,
+        service_type: Some(ServiceType::UserappBuilder),
+        project_id: Some("example".into()),
+        app_id: Some("example".into()),
+        user_id: None,
+        pod_id: None,
+        workload_uid: Some("sts-current".into()),
+    });
+    bind_current_lifecycle(&scanner.state, &app.lifecycle_id).await;
+    *runtime.volumes.lock().unwrap() =
+        VolumeWitness::Present(vec![shared_types::AppResourceIdentity {
+            kind: shared_types::AppResourceKind::PersistentVolumeClaim,
+            name: "example-workspace".into(),
+            uid: "pvc-current".into(),
+            resource_version: None,
+        }]);
+    // dev 槽在途操作（StopBuilder）即围栏。
+    scanner
+        .state
+        .userapp_store
+        .admit(&shared_types::UserAppAdmission {
+            app_id: "example".into(),
+            lifecycle_id: None,
+            request_id: Some("fence-request".into()),
+            operation_id: "fence-stop".into(),
+            request_fingerprint: "a".repeat(64),
+            kind: shared_types::UserAppOperationKind::StopBuilder,
+            command: None,
+            metadata: None,
+            runtime_policy_on_success: None,
+        })
+        .await
+        .unwrap();
+
+    scanner.scan().await.unwrap();
+    assert!(
+        scanner
+            .state
+            .projects
+            .get("example")
+            .is_none_or(|project| project.container_info().is_none()),
+        "an in-flight operation must own the registration decision"
+    );
+    assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
+}
+
+/// 显式 Adopt 在“canonical 登记缺失”时必须**完成登记**（不只写绑定）：
+/// 受控完成步骤复用原 admission → runtime 核验/租约 → 回执 → 原子发布链
+///（任务书 specs/idle-recovery-followup-20261030 §4.5）。
+#[cfg(feature = "userapp-turso")]
+#[tokio::test]
+async fn explicit_adoption_completes_missing_registration() {
+    let (scanner, runtime, _probe, _directory) = fixture().await;
+    record_discovery_witness(&scanner.state, "witness-lifecycle", "pvc-current").await;
+    let app = scanner
+        .state
+        .userapp_store
+        .get_application("example")
+        .await
+        .unwrap()
+        .expect("witness restore creates the root");
+    *runtime.snapshot.lock().unwrap() = live_builder();
+    *runtime.builder.lock().unwrap() = Some(RuntimeContainerInfo {
+        container_id: "pod-live".into(),
+        container_name: "example".into(),
+        container_ip: "10.42.4.207".into(),
+        status: container_runtime_api::ContainerRuntimeStatus::Running,
+        created_at: Utc::now(),
+        env_vars: None,
+        service_type: Some(ServiceType::UserappBuilder),
+        project_id: Some("example".into()),
+        app_id: Some("example".into()),
+        user_id: None,
+        pod_id: None,
+        workload_uid: Some("sts-current".into()),
+    });
+    *runtime.volumes.lock().unwrap() =
+        VolumeWitness::Present(vec![shared_types::AppResourceIdentity {
+            kind: shared_types::AppResourceKind::PersistentVolumeClaim,
+            name: "example-workspace".into(),
+            uid: "pvc-current".into(),
+            resource_version: None,
+        }]);
+
+    // 未预置绑定：显式 Adopt 以 expected 物理身份为凭，创建绑定并补齐登记。
+    let result = crate::userapp_builder::adoption::execute(
+        &scanner.state,
+        "example",
+        shared_types::AdoptBuilderRequest {
+            lifecycle_id: app.lifecycle_id.clone(),
+            request_id: "explicit-adopt".into(),
+            expected_container_id: "pod-live".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let registered = scanner
+        .state
+        .projects
+        .get("example")
+        .expect("explicit adoption must complete the missing registration");
+    let container = registered.container_info().expect("builder container");
+    assert_eq!(container.container_id, "pod-live");
+    assert_eq!(container.workload_uid.as_deref(), Some("sts-current"));
+    assert_eq!(registered.service_type(), Some(ServiceType::UserappBuilder));
+    assert!(
+        result.container.is_some(),
+        "the adoption result carries the registered container"
+    );
+    let binding = scanner
+        .state
+        .userapp_store
+        .get_resource_binding(&ServiceType::UserappBuilder, "sts-current")
+        .await
+        .unwrap()
+        .expect("physical binding");
+    assert_eq!(binding.lifecycle_id, app.lifecycle_id);
+    assert_eq!(runtime.deletes.load(Ordering::Acquire), 0);
+}
+
+/// 记录在案的原卷期望（发现路径写入 `userapp_recovery_witnesses` 的同一数据）。
+/// 必须在 `ensure_identity` 之前调用：`restore_identity` 只在根记录新建时落见证。
+#[cfg(feature = "userapp-turso")]
+async fn record_discovery_witness(state: &AppState, lifecycle_id: &str, volume_uid: &str) {
+    state
+        .userapp_store
+        .restore_discovered_identity(&shared_types::UserAppDiscoveredIdentity {
+            app_id: "example".into(),
+            lifecycle_id: lifecycle_id.into(),
+            dev_uid: Some("pod-live".into()),
+            prod_uid: None,
+            dev_stopped: false,
+            prod_stopped: false,
+            dev_volumes: vec![shared_types::AppResourceIdentity {
+                kind: shared_types::AppResourceKind::PersistentVolumeClaim,
+                name: "example-workspace".into(),
+                uid: volume_uid.into(),
+                resource_version: None,
+            }],
+            prod_volumes: Vec::new(),
+        })
+        .await
+        .unwrap();
+}
+
+/// 存活 builder 的快照：controller + Pod + Service，年龄足够、身份完整。
+#[cfg(feature = "userapp-turso")]
+fn live_builder() -> AgentStopSnapshot {
+    let created = Some(Utc::now() - chrono::Duration::hours(3));
+    AgentStopSnapshot {
+        app_id_hint: Some("example".into()),
+        namespace: Some("isolated".into()),
+        identifier: "example".into(),
+        service_type: ServiceType::UserappBuilder,
+        controller: Some(AgentResourceIdentity {
+            kind: AgentResourceKind::StatefulSet,
+            name: "example".into(),
+            uid: "sts-current".into(),
+            resource_version: Some("7".into()),
+            created_at: created,
+            owner_uid: None,
+        }),
+        pods: vec![AgentResourceIdentity {
+            kind: AgentResourceKind::Pod,
+            name: "example-0".into(),
+            uid: "pod-live".into(),
+            resource_version: Some("9".into()),
+            created_at: created,
+            owner_uid: Some("sts-current".into()),
+        }],
+        container: None,
+        services: vec![AgentResourceIdentity {
+            kind: AgentResourceKind::Service,
+            name: "example-svc".into(),
+            uid: "service-live".into(),
+            resource_version: Some("3".into()),
+            created_at: created,
+            owner_uid: None,
+        }],
+        replicas: Some(1),
+        compute_data_protection: None,
+        endpoint: None,
+    }
+}
+
+/// 当前生命周期对该 controller 的有效绑定（今天保护该 workload 的同一证据）。
+#[cfg(feature = "userapp-turso")]
+async fn bind_current_lifecycle(state: &AppState, lifecycle_id: &str) {
+    let request = shared_types::AdoptBuilderRequest {
+        lifecycle_id: lifecycle_id.into(),
+        request_id: "binding-request".into(),
+        expected_container_id: "pod-live".into(),
+    };
+    let input = shared_types::UserAppExecutionInput::new(serde_json::to_string(&request).unwrap());
+    let admitted = state
+        .userapp_store
+        .admit_with_input(
+            &shared_types::UserAppAdmission {
+                app_id: "example".into(),
+                lifecycle_id: Some(lifecycle_id.into()),
+                request_id: Some("binding-request".into()),
+                operation_id: "binding-operation".into(),
+                request_fingerprint: input.digest(),
+                kind: shared_types::UserAppOperationKind::AdoptBuilder,
+                command: None,
+                metadata: None,
+                runtime_policy_on_success: None,
+            },
+            Some(&input),
+        )
+        .await
+        .unwrap();
+    let running = match admitted {
+        shared_types::UserAppAdmissionOutcome::Accepted(record) => state
+            .userapp_store
+            .advance(&shared_types::UserAppOperationProgress {
+                app_id: record.app_id.clone(),
+                lifecycle_id: record.lifecycle_id.clone(),
+                operation_id: record.operation_id.clone(),
+                expected_revision: record.revision,
+                executor_id: "fixture".into(),
+                state: shared_types::UserAppOperationState::Running,
+                step: "claimed".into(),
+                checkpoint: serde_json::Value::Null,
+                error_code: None,
+                error_message: None,
+            })
+            .await
+            .unwrap(),
+        other => panic!("fresh fixture admission: {other:?}"),
+    };
+    state
+        .userapp_store
+        .commit_resource_binding(
+            &shared_types::UserAppResourceBinding {
+                app_id: running.app_id.clone(),
+                lifecycle_id: running.lifecycle_id.clone(),
+                service_type: ServiceType::UserappBuilder,
+                physical_uid: "sts-current".into(),
+                adopted_by_operation: running.operation_id.clone(),
+            },
+            &shared_types::UserAppOperationProgress {
+                app_id: running.app_id.clone(),
+                lifecycle_id: running.lifecycle_id.clone(),
+                operation_id: running.operation_id.clone(),
+                expected_revision: running.revision,
+                executor_id: "fixture".into(),
+                state: shared_types::UserAppOperationState::Succeeded,
+                step: "adopted".into(),
+                checkpoint: serde_json::Value::Null,
+                error_code: None,
+                error_message: None,
+            },
+        )
+        .await
+        .unwrap();
+}

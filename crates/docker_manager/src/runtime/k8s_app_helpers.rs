@@ -208,7 +208,9 @@ pub(crate) fn build_probe(
 /// on normal workloads, but capped by the caller's limit so the combination
 /// always passes server-side validation (request ≤ limit). Unparseable
 /// quantities fall back to the limit itself (never exceeds it).
-fn min_memory_request(limit: &str) -> String {
+/// Also reused by the builder restart candidate (k8s_builder_restart) to
+/// refresh a rollout candidate's memory request from its retained limit.
+pub(super) fn min_memory_request(limit: &str) -> String {
     const ONE_GIB_BYTES: u64 = 1024 * 1024 * 1024;
     match shared_types::parse_memory_quantity(limit) {
         // Strictly greater: the shared parser rounds to the nearest byte,

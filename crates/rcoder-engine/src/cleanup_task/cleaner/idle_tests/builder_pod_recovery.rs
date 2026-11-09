@@ -51,6 +51,99 @@ async fn builder_successor_gets_registration_and_new_idle_grace_without_stop_or_
     f.close().await;
 }
 
+/// 同 Pod UID 仅地址漂移（现场 102 的形态）：登记快照指向不可达的旧地址，
+/// 运行时保持**同一物理 UID / 同一 controller** 并已使用新地址。
+///
+/// 修复前 `refresh_idle_builder_pod` 对 sameCID 直接返回 false，scanner 继续
+/// 用旧 service_url 探测 → 状态未知 → 该实例永不进入回收链（现场 102 长期
+/// Idle 未被回收的成因）。修复后：登记地址收敛到真实 Pod、原活动时钟不刷新
+/// （地址修正不是用户活动），并在两轮独立完整扫描后由原 reaper 回收自建计算
+/// 资源。
+#[tokio::test]
+async fn builder_same_pod_address_drift_converges_and_keeps_idle_clock() {
+    let (mut f, app_id, live_url) = builder_address_drift_fixture().await;
+    let stale_clock = f
+        .cleaner
+        .state
+        .get_project(&app_id)
+        .unwrap()
+        .last_activity();
+
+    // 第一轮：地址收敛 + 时钟保留，本轮不回收。
+    f.cleaner.cleanup_once().await.unwrap();
+    let converged = f.cleaner.state.get_project(&app_id).unwrap();
+    let container = converged.container_info().unwrap();
+    assert_eq!(
+        container.container_id, "physical-original",
+        "address correction must not change the physical generation"
+    );
+    assert_eq!(
+        container.container_ip, "127.0.0.1",
+        "stale registered address must converge to the live Pod"
+    );
+    assert_eq!(container.service_url, live_url);
+    assert_eq!(
+        converged.last_activity(),
+        stale_clock,
+        "an address correction is not user activity and must not restart the idle window"
+    );
+    assert_eq!(f.runtime.stops.load(Ordering::SeqCst), 0);
+
+    // 第二轮：首次独立闲置观察，仍不回收。
+    f.cleaner.cleanup_once().await.unwrap();
+    assert_eq!(f.runtime.stops.load(Ordering::SeqCst), 0);
+
+    // 第三轮：两轮独立完整扫描都确认后，由原 reaper 回收自建计算资源。
+    f.cleaner.cleanup_once().await.unwrap();
+    assert_eq!(f.runtime.stops.load(Ordering::SeqCst), 1);
+    assert!(
+        f.cleaner.state.get_project(&app_id).is_none(),
+        "retired builder registration must be removed by the original chain"
+    );
+    f.close().await;
+}
+
+/// 同 UID 地址漂移 fixture：登记写为不可达旧地址，运行时保持同一物理 UID 与
+/// 同一 controller、使用新地址。返回 (fixture, app_id, 真实地址的 service_url)。
+async fn builder_address_drift_fixture() -> (Fixture, String, String) {
+    let f = Fixture::new_with_family(1, ServiceType::UserappBuilder).await;
+    let (app_id, current) = f.cleaner.state.projects.iter().into_iter().next().unwrap();
+    f.cleaner
+        .state
+        .userapp_store
+        .ensure_identity(&app_id)
+        .await
+        .unwrap();
+    let basic = current.container_info().unwrap();
+    let live_url = basic.service_url.clone();
+    let mut drifted = basic.clone();
+    drifted.container_ip = "127.0.0.2".into();
+    drifted.service_url = format!("http://127.0.0.2:{}", basic.internal_port);
+    let mut project = (*current).clone();
+    project.set_container(Some(drifted));
+    f.cleaner
+        .state
+        .projects
+        .insert_project_registration_durable(app_id.clone(), Arc::new(project))
+        .await
+        .unwrap();
+    *f.runtime.builder.lock().unwrap() = Some(RuntimeContainerInfo {
+        container_id: basic.container_id.clone(),
+        container_name: basic.container_name.clone(),
+        container_ip: basic.container_ip.clone(),
+        status: container_runtime_api::ContainerRuntimeStatus::Running,
+        created_at: Utc::now(),
+        env_vars: None,
+        service_type: Some(ServiceType::UserappBuilder),
+        project_id: Some(app_id.clone()),
+        app_id: Some(app_id.clone()),
+        user_id: None,
+        pod_id: None,
+        workload_uid: basic.workload_uid.clone(),
+    });
+    (f, app_id, live_url)
+}
+
 #[tokio::test]
 async fn builder_foreign_controller_or_family_is_not_adopted_by_idle_repair() {
     let (mut f, app_id) = builder_fixture().await;

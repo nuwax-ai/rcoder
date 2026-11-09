@@ -81,7 +81,7 @@ pub fn mask_url(url: &str) -> String {
         let scheme = parsed_url.scheme();
         let port = parsed_url
             .port()
-            .map(|p| format!(":{}", p))
+            .map(|p| format!(":{p}"))
             .unwrap_or_default();
         let path = parsed_url.path();
         let query = parsed_url

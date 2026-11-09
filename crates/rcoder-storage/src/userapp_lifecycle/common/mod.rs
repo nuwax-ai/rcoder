@@ -10,7 +10,7 @@ mod builder_registration;
 #[cfg(feature = "pg")]
 pub(crate) use builder_registration::{
     bind_completed_builder_registration, commit_builder_registration_adoption,
-    completed_builder_registration_candidates,
+    commit_missing_builder_registration_adoption, completed_builder_registration_candidates,
 };
 #[cfg(test)]
 mod activity_tests;

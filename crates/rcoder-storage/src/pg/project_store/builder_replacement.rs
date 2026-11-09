@@ -174,6 +174,85 @@ impl PgStore {
         self.publish_rebound_builder(baseline, committed)
     }
 
+    /// Registration-only completion for an explicitly adopted workload whose
+    /// canonical registration is MISSING. The admitted adoption confirmation
+    /// carries its own receipt (checkpoint target/volumes/container); the same
+    /// transaction validates the operation, the binding and canonical absence,
+    /// then publishes registry rows and this operation's outcome together.
+    #[cfg(feature = "pg")]
+    pub async fn complete_missing_builder_registration_adoption(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+        container: &shared_types::ContainerBasicInfo,
+        volumes: &[AppResourceIdentity],
+        progress: &shared_types::UserAppOperationProgress,
+    ) -> Result<()> {
+        target.validate().map_err(anyhow::Error::msg)?;
+        ensure!(
+            progress.checkpoint.get("registration_target") == Some(&serde_json::to_value(target)?)
+                && progress.checkpoint.get("registration_volumes")
+                    == Some(&serde_json::to_value(volumes)?)
+                && progress.checkpoint.get("container") == Some(&serde_json::to_value(container)?),
+            "Builder adoption checkpoint differs from the inspected registry evidence"
+        );
+        ensure!(
+            !volumes.is_empty()
+                && volumes.iter().all(|volume| volume.kind
+                    == shared_types::AppResourceKind::PersistentVolumeClaim
+                    && !volume.name.is_empty()
+                    && !volume.uid.is_empty())
+                && volumes
+                    .iter()
+                    .map(|volume| &volume.name)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    == volumes.len(),
+            "Builder registration confirmation requires current PVC identities"
+        );
+        let app_id = target.context.app_id.clone();
+        let baseline = {
+            let _registration = self
+                .registration
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Project registration lock poisoned"))?;
+            ensure!(
+                !self.closing.load(Ordering::Acquire),
+                "Persistence is shutting down"
+            );
+            let baseline = self.inner.get(&app_id);
+            self.active_writes.fetch_add(1, Ordering::AcqRel);
+            baseline
+        };
+        let _in_flight = InFlight(self);
+        let target = target.clone();
+        let container = container.clone();
+        let progress = progress.clone();
+        let committed = super::database::write_with_conflict_retry(&self.database, move |tx| {
+            let target = target.clone();
+            let progress = progress.clone();
+            let container = container.clone();
+            Box::pin(async move {
+                crate::userapp_lifecycle::commit_missing_builder_registration_adoption(
+                    tx, &target, &progress,
+                )
+                .await?;
+                rebind_rows(
+                    tx,
+                    &target.context,
+                    &target,
+                    &container,
+                    None,
+                    &[],
+                    RegistrationAuthority::ExplicitAdoptionMissing,
+                )
+                .await
+            })
+        })
+        .await
+        .context("Commit explicit missing builder registration adoption")?;
+        self.publish_rebound_builder(baseline, committed)
+    }
+
     fn publish_rebound_builder(
         &self,
         baseline: Option<Arc<ProjectAndContainerInfo>>,
@@ -330,6 +409,9 @@ enum RegistrationAuthority<'a> {
     /// binding pass the same root CAS as compute and deletion admission.
     CompletedCurrent,
     ExplicitAdoption(&'a ProjectAndContainerInfo),
+    /// The canonical registry is ABSENT and is installed fresh by an admitted
+    /// adoption confirmation; the same transaction rejects any present row.
+    ExplicitAdoptionMissing,
 }
 
 async fn rebind_rows(
@@ -344,6 +426,7 @@ async fn rebind_rows(
     let expected_registry = match authority {
         RegistrationAuthority::CompletedCurrent => None,
         RegistrationAuthority::ExplicitAdoption(expected) => Some(expected),
+        RegistrationAuthority::ExplicitAdoptionMissing => None,
     };
     let source = predecessor.and_then(|source| source.target.workload.as_ref());
     let replacement = target
@@ -395,6 +478,15 @@ async fn rebind_rows(
         .first()
         .exec(tx)
         .await?;
+    // A missing-registration confirmation may only install an actually absent
+    // canonical registry. A dangling container row means something already
+    // wrote registry state for this name: refuse and keep explicit recovery.
+    if let RegistrationAuthority::ExplicitAdoptionMissing = authority {
+        ensure!(
+            previous.is_none(),
+            "Builder registry is not missing; a container row already exists for this name"
+        );
+    }
     let mut project_family_needs_write = false;
     let mut old = match project {
         Some(mut project) => {
@@ -406,7 +498,8 @@ async fn rebind_rows(
                         project.service_type = Some(ServiceType::UserappBuilder.to_string());
                         project_family_needs_write = true;
                     }
-                    RegistrationAuthority::ExplicitAdoption(_) => {
+                    RegistrationAuthority::ExplicitAdoption(_)
+                    | RegistrationAuthority::ExplicitAdoptionMissing => {
                         anyhow::bail!("Builder registration service family is missing");
                     }
                 }
@@ -501,6 +594,11 @@ async fn rebind_rows(
                 // An absent historical field cannot veto an independently
                 // confirmed current builder. Never invent an old workload UID.
                 RegistrationAuthority::CompletedCurrent => None,
+                RegistrationAuthority::ExplicitAdoptionMissing => {
+                    anyhow::bail!(
+                        "A present legacy container row cannot join a missing-registration adoption"
+                    )
+                }
                 RegistrationAuthority::ExplicitAdoption(_) => {
                     Some(verify_legacy_registration_history(tx, context, previous, None).await?)
                 }
@@ -561,6 +659,11 @@ async fn rebind_rows(
                         source_uid.as_deref(),
                     )
                     .await?;
+                }
+                RegistrationAuthority::ExplicitAdoptionMissing => {
+                    anyhow::bail!(
+                        "A present legacy container row cannot join a missing-registration adoption"
+                    );
                 }
                 RegistrationAuthority::ExplicitAdoption(_) => {
                     let source_uid = source_uid

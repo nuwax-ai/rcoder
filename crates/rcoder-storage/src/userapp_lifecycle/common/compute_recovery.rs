@@ -360,16 +360,14 @@ pub(super) async fn mark_unheld(
     if changed != 1 {
         // A concurrent scan anchored first; its earlier anchor is the one the
         // quiet window must keep measuring from.
-        return Ok(
-            models::ComputeControlDeadline::filter_by_operation_id(&snapshot.operation_id)
-                .first()
-                .exec(tx)
-                .await
-                .map_err(storage)?
-                .ok_or(UserAppStoreError::NotFound)?
-                .unheld_observed_ms
-                .ok_or(UserAppStoreError::VersionConflict)?,
-        );
+        return models::ComputeControlDeadline::filter_by_operation_id(&snapshot.operation_id)
+            .first()
+            .exec(tx)
+            .await
+            .map_err(storage)?
+            .ok_or(UserAppStoreError::NotFound)?
+            .unheld_observed_ms
+            .ok_or(UserAppStoreError::VersionConflict);
     }
     Ok(observed_ms)
 }

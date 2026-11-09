@@ -52,13 +52,17 @@ impl VersionResponse {
     /// `version` 由调用方传入（如 rcoder 的 `env!("CARGO_PKG_VERSION")`，
     /// 语义上服务版本属于服务自身），系统信息在构造时经 sysinfo 跨平台采集。
     pub fn new(service: impl Into<String>, version: impl Into<String>) -> Self {
+        // sysinfo 0.40：OS 信息采集从 `Option<String>` 改为 `Result`（错误类型
+        // 未公开导出），采集失败按原 Option::None 语义呈现——版本接口不因
+        // 系统信息缺失失败，空串同样归一为 None。
+        let os_info = |value: Option<String>| value.filter(|value| !value.trim().is_empty());
         Self {
             service: service.into(),
             version: version.into(),
             system_info: SystemInfo::current(),
-            os_version: sysinfo::System::os_version(),
-            os_release: sysinfo::System::long_os_version(),
-            kernel_version: sysinfo::System::kernel_version(),
+            os_version: os_info(sysinfo::System::os_version().ok()),
+            os_release: os_info(sysinfo::System::long_os_version().ok()),
+            kernel_version: os_info(sysinfo::System::kernel_version().ok()),
         }
     }
 }

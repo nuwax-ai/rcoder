@@ -1288,7 +1288,7 @@ fn test_get_container_by_user_id_skips_retired_projects() {
     use shared_types::ContainerLookup as _;
     let via_trait = adapter.find_by_user_id("user-retire", &ServiceType::ComputerAgentRunner);
     assert_eq!(
-        via_trait.as_ref().map(|ip| ip.as_str()),
+        via_trait.as_deref(),
         Some(adapter.resolve_backend_addr(&found).as_str())
     );
 }

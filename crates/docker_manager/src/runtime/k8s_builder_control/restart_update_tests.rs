@@ -32,6 +32,16 @@ async fn explicit_restart_applies_frozen_template_once_and_retains_token_pvc_and
             .services
             .insert(ServiceType::UserappBuilder.to_string(), config);
         state.lock().expect("state").allow_writes = true;
+        // Legacy pre-upgrade shape (like a builder still carrying request=64Mi
+        // under a 6Gi limit): the non-memory fields are recognisable values so
+        // any wholesale resource replacement would be caught.
+        {
+            let mut state = state.lock().expect("state");
+            state.sts["spec"]["template"]["spec"]["containers"][0]["resources"] = serde_json::json!({
+                "limits": {"cpu": "1500m", "ephemeral-storage": "3Gi", "memory": "6Gi"},
+                "requests": {"cpu": "300m", "ephemeral-storage": "700Mi", "memory": "64Mi"}
+            });
+        }
         let mut source = captured(&runtime, &params).await;
         source.restart_image = Some("paired-runtime:new".into());
         source.restart_runtime_workspace = Some(shared_types::paths::userapp_dev_workspace("app"));
@@ -118,9 +128,15 @@ async fn explicit_restart_applies_frozen_template_once_and_retains_token_pvc_and
             candidate["containers"][0]["command"],
             serde_json::json!(["/updated-platform-entrypoint"])
         );
+        // A rollout candidate refreshes exactly one resource field: the
+        // platform-managed memory request, recomputed as min(1Gi, limit) from
+        // the retained 6Gi limit. Every other resource field — all limits and
+        // the cpu/ephemeral-storage requests — is retained verbatim.
+        let mut expected_resources = original_spec["containers"][0]["resources"].clone();
+        expected_resources["requests"]["memory"] = "1Gi".into();
         assert_eq!(
-            candidate["containers"][0]["resources"],
-            original_spec["containers"][0]["resources"]
+            candidate["containers"][0]["resources"], expected_resources,
+            "only requests.memory may follow the current platform policy; all other resource fields are retained"
         );
         assert_eq!(
             candidate["volumes"][0]["persistentVolumeClaim"]["claimName"],
@@ -201,6 +217,14 @@ async fn restart_refuses_live_old_pod_and_changed_pvc_before_configuration_write
 async fn non_rollout_restart_freezes_existing_configuration() {
     let (mut runtime, params, state, server) = resume_tests::fixture(Some("release")).await;
     state.lock().expect("state").allow_writes = true;
+    // Legacy resource shape: a recovery that does not adopt the current
+    // platform template must not refresh the platform resource policy either.
+    let legacy_resources = serde_json::json!({
+        "limits": {"cpu": "1500m", "memory": "6Gi"},
+        "requests": {"cpu": "300m", "memory": "64Mi"}
+    });
+    state.lock().expect("state").sts["spec"]["template"]["spec"]["containers"][0]["resources"] =
+        legacy_resources.clone();
     let source = captured(&runtime, &params).await;
     let template = runtime
         .archive_builder_restart(&source)
@@ -226,6 +250,10 @@ async fn non_rollout_restart_freezes_existing_configuration() {
     let candidate = &state.puts[0]["spec"]["template"]["spec"];
     assert_eq!(candidate["containers"][0]["image"], "old-release:1");
     assert_eq!(candidate["serviceAccountName"], "test");
+    assert_eq!(
+        candidate["containers"][0]["resources"], legacy_resources,
+        "recovery without a rollout keeps the original resources verbatim"
+    );
     assert!(
         candidate["containers"][0]["env"]
             .as_array()
@@ -301,4 +329,285 @@ async fn missing_or_damaged_archive_does_not_block_confirmed_retained_stop() {
         assert_eq!(state.pvc["metadata"]["uid"], "pvc-original");
         server.abort();
     }
+}
+
+/// The platform memory request is recomputed through the real candidate
+/// chain, so a small retained limit keeps request == limit (never 1Gi above
+/// it, which K8s server-side validation would reject).
+#[tokio::test]
+async fn explicit_restart_small_memory_limit_keeps_refreshed_request_within_limit() {
+    let (runtime, params, state, server) = resume_tests::fixture(None).await;
+    state.lock().expect("state").allow_writes = true;
+    {
+        let mut state = state.lock().expect("state");
+        state.sts["spec"]["template"]["spec"]["containers"][0]["resources"] = serde_json::json!({
+            "limits": {"cpu": "1500m", "memory": "512Mi"},
+            "requests": {"cpu": "300m", "memory": "64Mi"}
+        });
+    }
+    let mut source = captured(&runtime, &params).await;
+    source.restart_image = Some("paired-runtime:new".into());
+    let template = runtime
+        .archive_builder_restart(&source)
+        .await
+        .expect("archive")
+        .expect("K8s archive");
+    assert!(
+        runtime
+            .apply_builder_control(&source, false)
+            .await
+            .expect("actual stop")
+            .is_none()
+    );
+    {
+        let state = state.lock().expect("state");
+        assert_eq!(state.sts["spec"]["replicas"], 0);
+        assert!(state.pod.is_null());
+    }
+    let mut stopped = captured(&runtime, &params).await;
+    stopped.restart_image = source.restart_image.clone();
+    let started = tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.start_builder_control_with_restart(&stopped, &template),
+    )
+    .await
+    .expect("start budget");
+    assert_eq!(
+        started.expect("started").expect("ready").container_id,
+        "pod-updated"
+    );
+    let state = state.lock().expect("state");
+    let resources = &state.puts[0]["spec"]["template"]["spec"]["containers"][0]["resources"];
+    assert_eq!(
+        resources["requests"]["memory"], "512Mi",
+        "request must cap at the retained limit"
+    );
+    assert_eq!(resources["limits"]["memory"], "512Mi");
+    assert_eq!(resources["requests"]["cpu"], "300m");
+    assert_eq!(resources["limits"]["cpu"], "1500m");
+    server.abort();
+}
+
+/// Candidate construction matrix, asserted on the frozen archive payload so
+/// each shape exercises the real capture→candidate→freeze chain.
+#[tokio::test]
+async fn restart_candidate_memory_request_follows_platform_policy_matrix() {
+    struct Case {
+        limits: serde_json::Value,
+        requests: serde_json::Value,
+        expected_requests: serde_json::Value,
+    }
+    let cases = [
+        // Large limits in every legal Quantity format cap the request at 1Gi
+        // while the original limit string is retained verbatim.
+        Case {
+            limits: serde_json::json!({"cpu": "1", "memory": "8.0Gi"}),
+            requests: serde_json::json!({"cpu": "300m", "memory": "64Mi"}),
+            expected_requests: serde_json::json!({"cpu": "300m", "memory": "1Gi"}),
+        },
+        Case {
+            limits: serde_json::json!({"memory": "1.5Gi"}),
+            requests: serde_json::json!({"memory": "64Mi"}),
+            expected_requests: serde_json::json!({"memory": "1Gi"}),
+        },
+        Case {
+            limits: serde_json::json!({"memory": "8e9"}),
+            requests: serde_json::json!({"memory": "64Mi"}),
+            expected_requests: serde_json::json!({"memory": "1Gi"}),
+        },
+        Case {
+            limits: serde_json::json!({"memory": "1536Mi"}),
+            requests: serde_json::json!({"memory": "64Mi"}),
+            expected_requests: serde_json::json!({"memory": "1Gi"}),
+        },
+        // At or below the 1GiB boundary the limit itself is the request.
+        Case {
+            limits: serde_json::json!({"memory": "1024Mi"}),
+            requests: serde_json::json!({"memory": "64Mi"}),
+            expected_requests: serde_json::json!({"memory": "1024Mi"}),
+        },
+        Case {
+            limits: serde_json::json!({"memory": "1Gi"}),
+            requests: serde_json::json!({"memory": "64Mi"}),
+            expected_requests: serde_json::json!({"memory": "1Gi"}),
+        },
+        Case {
+            limits: serde_json::json!({"memory": "512Mi"}),
+            requests: serde_json::json!({"memory": "64Mi"}),
+            expected_requests: serde_json::json!({"memory": "512Mi"}),
+        },
+        // Half-byte values the shared parser rounds up to exactly 1GiB keep
+        // the original limit (a 1Gi request would exceed it).
+        Case {
+            limits: serde_json::json!({"memory": "1073741823.6"}),
+            requests: serde_json::json!({"memory": "64Mi"}),
+            expected_requests: serde_json::json!({"memory": "1073741823.6"}),
+        },
+        Case {
+            limits: serde_json::json!({"memory": "1073741823.9"}),
+            requests: serde_json::json!({"memory": "64Mi"}),
+            expected_requests: serde_json::json!({"memory": "1073741823.9"}),
+        },
+        // No memory limit: nothing is invented, requests stay as configured.
+        Case {
+            limits: serde_json::json!({"cpu": "1500m"}),
+            requests: serde_json::json!({"cpu": "300m"}),
+            expected_requests: serde_json::json!({"cpu": "300m"}),
+        },
+        // No requests map at all: only the memory entry is created.
+        Case {
+            limits: serde_json::json!({"memory": "6Gi"}),
+            requests: serde_json::Value::Null,
+            expected_requests: serde_json::json!({"memory": "1Gi"}),
+        },
+    ];
+    for case in &cases {
+        let (runtime, params, state, server) = resume_tests::fixture(None).await;
+        state.lock().expect("state").allow_writes = true;
+        {
+            let mut state = state.lock().expect("state");
+            let resources =
+                &mut state.sts["spec"]["template"]["spec"]["containers"][0]["resources"];
+            *resources = serde_json::json!({"limits": case.limits.clone()});
+            if !case.requests.is_null() {
+                resources["requests"] = case.requests.clone();
+            }
+        }
+        let mut source = captured(&runtime, &params).await;
+        source.restart_image = Some("paired-runtime:new".into());
+        let template = runtime
+            .archive_builder_restart(&source)
+            .await
+            .expect("archive")
+            .expect("K8s archive");
+        let resources = {
+            use base64::Engine as _;
+            let state = state.lock().expect("state");
+            let payload = state.archives[&template.archive.name]["data"]["template"]
+                .as_str()
+                .expect("archive payload")
+                .to_owned();
+            let archive: serde_json::Value = serde_json::from_slice(
+                &base64::engine::general_purpose::STANDARD
+                    .decode(payload)
+                    .expect("base64"),
+            )
+            .expect("archive json");
+            archive["candidate_pod_spec"]["containers"][0]["resources"].clone()
+        };
+        let mut expected = serde_json::json!({"limits": case.limits.clone()});
+        if !case.expected_requests.is_null() {
+            expected["requests"] = case.expected_requests.clone();
+        }
+        assert_eq!(
+            resources, expected,
+            "limits={}: candidate must refresh only the platform memory request",
+            case.limits,
+        );
+        server.abort();
+    }
+    // resources absent entirely: no default resource shape is invented.
+    let (runtime, params, state, server) = resume_tests::fixture(None).await;
+    state.lock().expect("state").allow_writes = true;
+    state.lock().expect("state").sts["spec"]["template"]["spec"]["containers"][0]["resources"] =
+        serde_json::Value::Null;
+    let mut source = captured(&runtime, &params).await;
+    source.restart_image = Some("paired-runtime:new".into());
+    let template = runtime
+        .archive_builder_restart(&source)
+        .await
+        .expect("archive")
+        .expect("K8s archive");
+    {
+        use base64::Engine as _;
+        let state = state.lock().expect("state");
+        let payload = state.archives[&template.archive.name]["data"]["template"]
+            .as_str()
+            .expect("archive payload");
+        let archive: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::STANDARD
+                .decode(payload)
+                .expect("base64"),
+        )
+        .expect("archive json");
+        assert!(
+            archive["candidate_pod_spec"]["containers"][0]["resources"].is_null(),
+            "no original resources means no invented defaults"
+        );
+    }
+    server.abort();
+}
+
+/// An operation whose archive was frozen by the previous release (candidate
+/// still carries the old 64Mi request) applies that frozen value verbatim;
+/// recovery never catches the frozen configuration up to today's policy.
+#[tokio::test]
+async fn restart_applies_frozen_archive_resources_without_policy_catch_up() {
+    let (runtime, params, state, server) = resume_tests::fixture(None).await;
+    state.lock().expect("state").allow_writes = true;
+    {
+        let mut state = state.lock().expect("state");
+        state.sts["spec"]["template"]["spec"]["containers"][0]["resources"] = serde_json::json!({
+            "limits": {"cpu": "1500m", "memory": "6Gi"},
+            "requests": {"cpu": "300m", "memory": "64Mi"}
+        });
+    }
+    let mut source = captured(&runtime, &params).await;
+    source.restart_image = Some("paired-runtime:new".into());
+    let template = runtime
+        .archive_builder_restart(&source)
+        .await
+        .expect("archive")
+        .expect("K8s archive");
+    {
+        // Doctor the frozen candidate back to the pre-upgrade request so the
+        // archive looks exactly like one written by the previous release.
+        use base64::Engine as _;
+        let mut state = state.lock().expect("state");
+        let payload = state.archives[&template.archive.name]["data"]["template"]
+            .as_str()
+            .expect("archive payload")
+            .to_owned();
+        let mut archive: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::STANDARD
+                .decode(payload)
+                .expect("base64"),
+        )
+        .expect("archive json");
+        archive["candidate_pod_spec"]["containers"][0]["resources"]["requests"]["memory"] =
+            "64Mi".into();
+        state
+            .archives
+            .get_mut(&template.archive.name)
+            .expect("archive")["data"]["template"] = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&archive).expect("re-encode"))
+            .into();
+    }
+    assert!(
+        runtime
+            .apply_builder_control(&source, false)
+            .await
+            .expect("actual stop")
+            .is_none()
+    );
+    let mut stopped = captured(&runtime, &params).await;
+    stopped.restart_image = source.restart_image.clone();
+    let started = tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.start_builder_control_with_restart(&stopped, &template),
+    )
+    .await
+    .expect("start budget");
+    assert_eq!(
+        started.expect("started").expect("ready").container_id,
+        "pod-updated"
+    );
+    let state = state.lock().expect("state");
+    let resources = &state.puts[0]["spec"]["template"]["spec"]["containers"][0]["resources"];
+    assert_eq!(
+        resources["requests"]["memory"], "64Mi",
+        "the frozen archive value wins; a later policy never rewrites it"
+    );
+    assert_eq!(resources["limits"]["memory"], "6Gi");
+    server.abort();
 }

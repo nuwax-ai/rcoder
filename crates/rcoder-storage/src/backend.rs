@@ -127,6 +127,54 @@ impl ProjectStoreBackend {
         }
     }
 
+    /// Complete a MISSING canonical registration from an admitted adoption
+    /// confirmation. PG commits registry rows, the binding and the operation
+    /// outcome in one transaction; the memory registry (not receipt-gated)
+    /// installs the verified workload like `register_completed_builder_replacement`.
+    pub async fn complete_missing_builder_registration_adoption(
+        &self,
+        target: &shared_types::BuilderControlTarget,
+        container: &ContainerBasicInfo,
+        volumes: &[shared_types::AppResourceIdentity],
+        progress: &shared_types::UserAppOperationProgress,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !volumes.is_empty()
+                && volumes.iter().all(|volume| volume.kind
+                    == shared_types::AppResourceKind::PersistentVolumeClaim
+                    && !volume.name.is_empty()
+                    && !volume.uid.is_empty()),
+            "Builder registration confirmation requires current PVC identities"
+        );
+        match self {
+            Self::Memory(inner) => {
+                let _ = progress;
+                let mut project = inner
+                    .get(&target.context.app_id)
+                    .map(|old| (*old).clone())
+                    .unwrap_or_else(|| ProjectAndContainerInfo::new(target.context.app_id.clone()));
+                anyhow::ensure!(
+                    project.container_info().is_none(),
+                    "Builder registration is not missing; confirmation requires an absent registry"
+                );
+                // First registration opens its own idle observation window,
+                // mirroring the ordinary registration rule.
+                project.update_activity();
+                project.set_service_type(Some(ServiceType::UserappBuilder));
+                project.set_container(Some(container.clone()));
+                inner.insert(target.context.app_id.clone(), Arc::new(project))
+            }
+            #[cfg(feature = "pg")]
+            Self::Postgres(store) => {
+                store
+                    .complete_missing_builder_registration_adoption(
+                        target, container, volumes, progress,
+                    )
+                    .await
+            }
+        }
+    }
+
     pub async fn completed_builder_registration_candidates(
         &self,
         app_id: &str,
