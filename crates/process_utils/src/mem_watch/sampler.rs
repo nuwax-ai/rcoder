@@ -5,7 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::task::JoinHandle;
 
@@ -14,6 +15,9 @@ use super::proc_tree::{ProcInfo, select_victim, subtree_targets};
 use super::registry::{Registry, Root};
 use super::switch::Switch;
 use super::{cgroup, kill, registry, sys};
+
+/// LSM 拒绝信号后的全局降级标志（kill EPERM 时置位）。
+static DISABLED: AtomicBool = AtomicBool::new(false);
 
 /// 启动单例采样任务。`registry` 需已通过 [`registry::install`] 安装。
 pub fn start(config: Config) -> JoinHandle<()> {
@@ -45,6 +49,11 @@ pub async fn run(config: Config) {
     );
 
     loop {
+        if DISABLED.load(Ordering::Relaxed) {
+            // EPERM 降级后不再采样（保留 started/mode_changed 历史日志可查）
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            continue;
+        }
         let cfg = switch.effective(&config);
         if cfg.mode != last_mode {
             tracing::info!(
@@ -175,9 +184,23 @@ async fn step(reg: &Arc<Registry>, cfg: &Config, last_action: &mut Option<Instan
     );
 
     // 终止序列独立执行，不能阻塞采样：grace 期间可能还有第二个尖峰。
+    // 但其结果必须监督：EPERM（LSM 拒绝 signal）意味着看门狗杀不掉任何进程，
+    // 若不降级会永远刷 evict 日志——"以为在工作其实杀不掉"是最坏的失效形态。
     let grace = cfg.grace;
+    let kill_task = tokio::spawn(async move { kill::terminate_many(&targets, grace).await });
     tokio::spawn(async move {
-        kill::terminate_many(&targets, grace).await;
+        if let Ok(joined) = kill_task.await
+            && let Err(err) = joined
+            && err.kind() == std::io::ErrorKind::PermissionDenied
+        {
+            tracing::error!(
+                event = "mem_watch.disabled",
+                reason = "signal denied by LSM (EPERM)",
+                hint = "apparmor/SELinux 拒绝容器内发信号；检查 dmesg 与 pod appArmorProfile",
+                error = %err,
+            );
+            DISABLED.store(true, Ordering::Relaxed);
+        }
     });
 }
 
