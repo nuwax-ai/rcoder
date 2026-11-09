@@ -30,7 +30,7 @@ pub async fn run(config: Config) {
     };
 
     let mut switch = Switch::default();
-    let mut last_kill: Option<Instant> = None;
+    let mut last_action: Option<Instant> = None;
     let mut last_mode = Mode::Off;
 
     tracing::info!(
@@ -55,14 +55,14 @@ pub async fn run(config: Config) {
             last_mode = cfg.mode;
         }
         if cfg.mode != Mode::Off {
-            step(&reg, &cfg, &mut last_kill).await;
+            step(&reg, &cfg, &mut last_action).await;
         }
         // 用 sleep 而不是 interval：开关文件可以改 interval_ms 并立刻生效。
         tokio::time::sleep(cfg.interval).await;
     }
 }
 
-async fn step(reg: &Arc<Registry>, cfg: &Config, last_kill: &mut Option<Instant>) {
+async fn step(reg: &Arc<Registry>, cfg: &Config, last_action: &mut Option<Instant>) {
     let Some(limit) = sys::read_memory_max() else {
         return; // 无限制或非 Linux
     };
@@ -127,6 +127,11 @@ async fn step(reg: &Arc<Registry>, cfg: &Config, last_kill: &mut Option<Instant>
     };
 
     if cfg.mode == Mode::DryRun {
+        // dry-run 也按冷却节流：否则超阈值期间每 tick 一条，一周的日志会淹没一切。
+        if last_action.is_some_and(|at| at.elapsed() < cfg.cooldown) {
+            return;
+        }
+        *last_action = Some(Instant::now());
         tracing::info!(
             event = "mem_watch.would_evict",
             pid = victim.pid,
@@ -138,10 +143,10 @@ async fn step(reg: &Arc<Registry>, cfg: &Config, last_kill: &mut Option<Instant>
         return;
     }
 
-    if last_kill.is_some_and(|at| at.elapsed() < cfg.cooldown) {
+    if last_action.is_some_and(|at| at.elapsed() < cfg.cooldown) {
         return;
     }
-    *last_kill = Some(Instant::now());
+    *last_action = Some(Instant::now());
 
     tracing::warn!(
         event = "mem_watch.evict",
