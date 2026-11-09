@@ -475,8 +475,6 @@ mod tests {
         use std::future::Future;
         use std::pin::Pin;
 
-        use super::*;
-
         pub(super) struct TestLifecycle {
             pub pgid: u32,
             pub token: tokio_util::sync::CancellationToken,

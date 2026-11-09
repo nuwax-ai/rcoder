@@ -102,14 +102,15 @@ async fn step(reg: &Arc<Registry>, cfg: &Config, last_action: &mut Option<Instan
 
         // 没有封窗钩子的 agent：到点强制封窗，否则永远不工作。
         for root in reg.all() {
-            if !root.is_sealed() && root.spawned_at.elapsed() >= cfg.bootstrap_cap {
-                if reg.seal_project(&root.project, &table) > 0 {
-                    tracing::info!(
-                        event = "mem_watch.bootstrap_timeout",
-                        project = %root.project,
-                        cap_ms = cfg.bootstrap_cap.as_millis() as u64,
-                    );
-                }
+            if !root.is_sealed()
+                && root.spawned_at.elapsed() >= cfg.bootstrap_cap
+                && reg.seal_project(&root.project, &table) > 0
+            {
+                tracing::info!(
+                    event = "mem_watch.bootstrap_timeout",
+                    project = %root.project,
+                    cap_ms = cfg.bootstrap_cap.as_millis() as u64,
+                );
             }
         }
     }
@@ -193,10 +194,10 @@ fn protected_set(roots: &[Arc<Root>], table: &HashMap<u32, ProcInfo>) -> HashSet
         if protected.contains(pid) {
             continue;
         }
-        if let Some(exe) = sys::read_exe(*pid) {
-            if roots.iter().any(|root| root.matches_exe(&exe)) {
-                protected.insert(*pid);
-            }
+        if let Some(exe) = sys::read_exe(*pid)
+            && roots.iter().any(|root| root.matches_exe(&exe))
+        {
+            protected.insert(*pid);
         }
     }
     protected

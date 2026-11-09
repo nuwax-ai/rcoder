@@ -136,10 +136,10 @@ impl Switch {
 
     fn refresh_if_due(&mut self) {
         let now = Instant::now();
-        if let Some(last) = self.last_refresh {
-            if now.duration_since(last) < REFRESH_EVERY {
-                return;
-            }
+        if let Some(last) = self.last_refresh
+            && now.duration_since(last) < REFRESH_EVERY
+        {
+            return;
         }
         self.last_refresh = Some(now);
 

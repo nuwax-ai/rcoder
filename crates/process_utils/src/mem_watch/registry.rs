@@ -137,10 +137,10 @@ impl Registry {
     /// 并清空保护集——等于把已经"封窗"的会话重新打开，用户命令会被误保护。
     pub fn insert(&self, root: Root) -> Arc<Root> {
         let mut guard = self.roots.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(existing) = guard.get(&root.pid) {
-            if existing.born == root.born {
-                return Arc::clone(existing);
-            }
+        if let Some(existing) = guard.get(&root.pid)
+            && existing.born == root.born
+        {
+            return Arc::clone(existing);
         }
         let root = Arc::new(root);
         guard.insert(root.pid, Arc::clone(&root));
