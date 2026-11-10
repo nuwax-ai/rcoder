@@ -71,10 +71,48 @@ async fn wait_row_for_pid(root: &Path, event: &str, project: &str, pid: u32) {
     });
 }
 
-// Observe only this test's actual ACP fixture children: Chat preparation also
-// launches a short-lived `python -v` version probe, which is not an ACP owner.
-// Reject zombies rather than treating kill(0) as proof of a live execution.
-fn owned_live_fixture_children() -> Vec<u32> {
+/// 进程级全局 `SESSION_CACHE` 的保留字互斥锁。
+///
+/// 下面几个用例要按**生产保留字**（`"pending"` / `""`，即 preparation 状态的
+/// sentinel）往全局缓存里插入或断言"不该有条目"。保留字是测试意图的一部分
+/// ——换成随机 id 就再也走不到"不可路由"那条路了;而全局键在并行测试间共享,
+/// 两个用例同时插 `"pending"` 就会互相覆盖、互相误判。
+/// 因此这些用例必须互斥执行,锁在本用例结束(含 panic 路径)时释放。
+static SENTINEL_CACHE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn sentinel_cache_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    SENTINEL_CACHE_LOCK.lock().await
+}
+
+/// 本测试自己 spawn 记录里的 fixture 子进程 pid（按 root 隔离）。
+///
+/// 每个测试用独立 tempdir 作 root，`protocol.jsonl` 因此是测试私有的；
+/// 进程级的 `ps` 则不然——并行测试共享同一进程，会看到别的测试刚拉起的
+/// fixture 子进程。归属必须以本测试的 spawn 记录为准。
+fn own_fixture_pids(root: &Path) -> Vec<u32> {
+    let mut pids: Vec<u32> = rows(root)
+        .iter()
+        .filter(|row| row["event"] == "spawn")
+        .filter_map(|row| row["pid"].as_u64())
+        .map(|pid| pid as u32)
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+/// Observe only this test's actual ACP fixture children: Chat preparation also
+/// launches a short-lived `python -v` version probe, which is not an ACP owner.
+/// Reject zombies rather than treating kill(0) as proof of a live execution.
+///
+/// 归属按 `own_fixture_pids` 收窄（并行测试不能互相看见子进程），但**存活与
+/// 僵尸状态仍由 ps 独立判定**——不看日志怎么说。这样既保持隔离，又不把
+/// "日志记了 spawn 但进程还活着/已成僵尸" 这类真实泄漏放过去。
+fn owned_live_fixture_children(root: &Path) -> Vec<u32> {
+    let owned = own_fixture_pids(root);
+    if owned.is_empty() {
+        return Vec::new();
+    }
     let observer = std::process::Command::new("ps")
         .args(["-ww", "-axo", "pid=,ppid=,stat=,args="])
         .stdout(std::process::Stdio::piped())
@@ -93,7 +131,11 @@ fn owned_live_fixture_children() -> Vec<u32> {
         let pid: u32 = fields.next().unwrap().parse().unwrap();
         let parent: u32 = fields.next().unwrap().parse().unwrap();
         let state = fields.next().unwrap();
-        if parent == std::process::id() && pid != observer_pid && line.contains(&fixture) {
+        if parent == std::process::id()
+            && pid != observer_pid
+            && owned.binary_search(&pid).is_ok()
+            && line.contains(&fixture)
+        {
             assert!(
                 !state.starts_with('Z'),
                 "owned fixture child {pid} is a zombie"
@@ -186,6 +228,7 @@ async fn service(root: &Path, create_budget: u64) -> AgentServiceImpl {
 
 #[tokio::test]
 async fn invalid_acp_session_id_is_rejected_before_prompt_and_reaped_before_retry() {
+    let _sentinel = sentinel_cache_guard().await;
     for (invalid_id, resume) in [
         ("pending", ""),
         ("", ""),
@@ -214,7 +257,7 @@ async fn invalid_acp_session_id_is_rejected_before_prompt_and_reaped_before_retr
             .into_inner();
         wait_row(root.path(), "new", &project, 1).await;
         let accepted_before_cleanup = response.success;
-        let live_before_cleanup = owned_live_fixture_children();
+        let live_before_cleanup = owned_live_fixture_children(root.path());
         let prompt_before_cleanup = rows(root.path()).iter().any(|row| row["event"] == "prompt");
         let published_sid = AGENT_REGISTRY.get_session_by_project(&project);
         // On an unfixed baseline Stop hides this actual execution. Capture its
@@ -244,7 +287,7 @@ async fn invalid_acp_session_id_is_rejected_before_prompt_and_reaped_before_retr
             .into_inner();
         assert!(retried.success, "normal retry must recover: {retried:?}");
         wait_row(root.path(), "prompt", &project, 1).await;
-        let live_after_retry = owned_live_fixture_children();
+        let live_after_retry = owned_live_fixture_children(root.path());
         stop(&service, &project, &retried.session_id).await;
         assert!(
             !accepted_before_cleanup,
@@ -272,7 +315,7 @@ async fn invalid_acp_session_id_is_rejected_before_prompt_and_reaped_before_retr
             1,
             "retry must have exactly one actual execution"
         );
-        assert!(owned_live_fixture_children().is_empty());
+        assert!(owned_live_fixture_children(root.path()).is_empty());
         assert!(
             response
                 .error
@@ -287,6 +330,7 @@ async fn invalid_acp_session_id_is_rejected_before_prompt_and_reaped_before_retr
 
 #[tokio::test]
 async fn early_acp_notification_cannot_publish_state_labels_before_a_real_session_exists() {
+    let _sentinel = sentinel_cache_guard().await;
     for invalid in ["pending", ""] {
         let root = tempfile::tempdir().unwrap();
         let service = Arc::new(service(root.path(), 10).await);
@@ -367,12 +411,13 @@ async fn early_acp_notification_cannot_publish_state_labels_before_a_real_sessio
                 .count(),
             1
         );
-        assert!(owned_live_fixture_children().is_empty());
+        assert!(owned_live_fixture_children(root.path()).is_empty());
     }
 }
 
 #[tokio::test]
 async fn progress_subscription_rejects_unassigned_identity_without_touching_legacy_cache() {
+    let _sentinel = sentinel_cache_guard().await;
     let root = tempfile::tempdir().unwrap();
     let service = service(root.path(), 10).await;
     for invalid in ["", "pending"] {
@@ -486,7 +531,7 @@ async fn early_foreign_notification_cannot_mutate_another_live_project() {
     wait_row(root.path(), "prompt", &second_project, 1).await;
     stop(&service, &second_project, &second.session_id).await;
     let first_still_live = !original.stop_handle.as_ref().unwrap().is_stopped();
-    let live_after_second_stop = owned_live_fixture_children().len();
+    let live_after_second_stop = owned_live_fixture_children(root.path()).len();
     stop(&service, &first_project, &first.session_id).await;
     assert_eq!(
         after_foreign_notification, before,
@@ -496,11 +541,12 @@ async fn early_foreign_notification_cannot_mutate_another_live_project() {
     assert_eq!(live_after_second_stop, 1);
     assert_ne!(second.session_id, first.session_id);
     assert_eq!(second.session_id, second_sid);
-    assert!(owned_live_fixture_children().is_empty());
+    assert!(owned_live_fixture_children(root.path()).is_empty());
 }
 
 #[tokio::test]
 async fn legacy_unroutable_execution_remains_stoppable_and_recovers_without_loading_state_labels() {
+    let _sentinel = sentinel_cache_guard().await;
     for mode in ["stop", "run", "auto-reload"] {
         let root = tempfile::tempdir().unwrap();
         let service = service(root.path(), 10).await;
@@ -565,7 +611,7 @@ async fn legacy_unroutable_execution_remains_stoppable_and_recovers_without_load
             .into_inner();
         assert!(recovered.success, "legacy {mode} recovery: {recovered:?}");
         wait_row(root.path(), "prompt", &project, 2).await;
-        let live = owned_live_fixture_children();
+        let live = owned_live_fixture_children(root.path());
         stop(&service, &project, &recovered.session_id).await;
         assert!(
             agent_runner::service::SESSION_CACHE
@@ -608,7 +654,7 @@ async fn legacy_unroutable_execution_remains_stoppable_and_recovers_without_load
             2,
             "accepted prompts must not be replayed"
         );
-        assert!(owned_live_fixture_children().is_empty());
+        assert!(owned_live_fixture_children(root.path()).is_empty());
     }
 }
 
@@ -1208,7 +1254,7 @@ async fn stop_and_same_sid_replacement(exit: ControlledExitCause) {
     drop(agent_abstraction::session::lock_execution_transition(&project).await);
     std::fs::write(root.path().join(format!("{project}.exit-barrier")), "").unwrap();
     let release = FixtureExitBarrier(root.path().join(format!("{project}.exit-release")));
-    assert_eq!(owned_live_fixture_children(), vec![old_pid]);
+    assert_eq!(owned_live_fixture_children(root.path()), vec![old_pid]);
     match exit {
         ControlledExitCause::Eof => lifecycle.cancel(),
         ControlledExitCause::Sigterm => nix::sys::signal::kill(
@@ -1225,7 +1271,7 @@ async fn stop_and_same_sid_replacement(exit: ControlledExitCause) {
     assert_eq!(started["cause"], cause);
     assert!(!lifecycle.is_stopped());
     assert_eq!(
-        owned_live_fixture_children(),
+        owned_live_fixture_children(root.path()),
         vec![old_pid],
         "the original must remain physically alive at the exit barrier"
     );
@@ -1258,7 +1304,7 @@ async fn stop_and_same_sid_replacement(exit: ControlledExitCause) {
         "replacement cannot complete before the old execution exits"
     );
     assert_eq!(
-        owned_live_fixture_children(),
+        owned_live_fixture_children(root.path()),
         vec![old_pid],
         "an unfinished Stop cannot be overtaken by a new child spawn"
     );

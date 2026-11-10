@@ -367,12 +367,22 @@ mod tests {
 
     #[test]
     fn preparing_without_a_session_keeps_container_active() {
-        let project = "container-status-preparation";
-        assert_eq!(get_active_tasks_count(0), 0);
-        AGENT_REGISTRY.set_pending(project);
-        assert!(get_active_tasks_count(0) > 0);
-        AGENT_REGISTRY.clear_pending_if_exists(project);
-        assert_eq!(get_active_tasks_count(0), 0);
+        // 断言**增量**而不是绝对值:get_active_tasks_count 读的是进程级全局
+        // AGENT_REGISTRY,并行测试随时可能注册/清理自己的 agent,写死"必须是 0"
+        // 会让本条随其它测试的调度随机失败(既有 flake)。
+        // project 也用 uuid 唯一化,避免与别的用例抢同一个 pending 键。
+        let project = format!("container-status-preparation-{}", uuid::Uuid::new_v4());
+        let baseline = get_active_tasks_count(0);
+        AGENT_REGISTRY.set_pending(&project);
+        assert!(
+            get_active_tasks_count(0) >= baseline + 1,
+            "pending preparation 必须让容器保持活跃"
+        );
+        AGENT_REGISTRY.clear_pending_if_exists(&project);
+        assert!(
+            get_active_tasks_count(0) <= baseline,
+            "清理后不得留下活跃计数"
+        );
     }
 
     #[test]
