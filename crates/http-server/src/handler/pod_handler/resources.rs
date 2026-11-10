@@ -133,6 +133,9 @@ pub async fn computer_pod_resources(
             uptime_seconds: 0,
             container_id: Some(container_info.container_id),
             container_name: Some(container_info.container_name),
+            processes: None,
+            process_count: None,
+            process_groups: None,
         }));
     }
 
@@ -154,13 +157,14 @@ pub async fn computer_pod_resources(
         AppError::internal_server_error(&format!("Failed to build grpc address: {e}"))
     })?;
 
-    let response = match crate::grpc::status_query::query_container_status(
+    let response = match crate::grpc::status_query::query_container_status_with_options(
         &state.grpc_pool,
         &grpc_addr,
         params.user_id.as_deref().unwrap_or_default(),
         &container_info.project_id,
         None,
         std::time::Duration::from_secs(shared_types::GRPC_CONTAINER_STATUS_TIMEOUT_SECS),
+        params.include_processes.unwrap_or(true),
     )
     .await
     {
@@ -182,6 +186,9 @@ pub async fn computer_pod_resources(
                 uptime_seconds: 0,
                 container_id: Some(container_info.container_id),
                 container_name: Some(container_info.container_name),
+                processes: None,
+                process_count: None,
+                process_groups: None,
             }));
         }
     };
@@ -190,6 +197,29 @@ pub async fn computer_pod_resources(
         "✅ [POD_RESOURCES] container resources: container_id={}, cpu={:?}, mem={:?}MB",
         container_info.container_id, response.container_cpu_percent, response.container_memory_mb
     );
+
+    // 进程明细+分组聚合(proto → 响应;MB 换算,分组字符串透传)
+    let processes = (!response.processes.is_empty()).then(|| {
+        response
+            .processes
+            .iter()
+            .map(|p| shared_types::ComputerProcessEntry {
+                pid: p.pid,
+                comm: p.comm.clone(),
+                rss_mb: p.rss_bytes as f64 / 1_048_576.0,
+                group: p.group.clone(),
+                args_head: (!p.args_head.is_empty()).then(|| p.args_head.clone()),
+            })
+            .collect()
+    });
+    let groups = (response.infra_rss_bytes.is_some()
+        || response.platform_rss_bytes.is_some()
+        || response.workload_rss_bytes.is_some())
+    .then(|| shared_types::ComputerProcessGroups {
+        infra_rss_bytes: response.infra_rss_bytes.unwrap_or(0),
+        platform_rss_bytes: response.platform_rss_bytes.unwrap_or(0),
+        workload_rss_bytes: response.workload_rss_bytes.unwrap_or(0),
+    });
 
     Ok(HttpResult::success(ComputerPodResourcesResponse {
         user_id: params.user_id.clone(),
@@ -202,6 +232,10 @@ pub async fn computer_pod_resources(
         uptime_seconds: response.uptime_seconds,
         container_id: Some(container_info.container_id),
         container_name: Some(container_info.container_name),
+        processes,
+        process_count: (!response.processes.is_empty())
+            .then(|| response.processes.len() as u32),
+        process_groups: groups,
     }))
 }
 
@@ -319,13 +353,14 @@ pub async fn computer_pod_resources_stream(
     let stream = async_stream::stream! {
         let mut consecutive_failures: u32 = 0;
         loop {
-            let tick = crate::grpc::status_query::query_container_status(
+            let tick = crate::grpc::status_query::query_container_status_with_options(
                 &grpc_pool,
                 &grpc_addr,
                 user_id.as_deref().unwrap_or_default(),
                 &project_id,
                 None,
                 std::time::Duration::from_secs(shared_types::GRPC_CONTAINER_STATUS_TIMEOUT_SECS),
+                params.include_processes.unwrap_or(true),
             )
             .await;
 
@@ -346,6 +381,37 @@ pub async fn computer_pod_resources_stream(
                             "status": response.status,
                             "cpu_percent": response.cpu_percent,
                             "memory_mb": response.memory_mb,
+                        },
+                        // 容器内进程明细+分组聚合(仅 include_processes 请求携带)
+                        "processes": if response.processes.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                response
+                                    .processes
+                                    .iter()
+                                    .map(|p| {
+                                        serde_json::json!({
+                                            "pid": p.pid,
+                                            "comm": p.comm,
+                                            "rss_mb": p.rss_bytes as f64 / 1_048_576.0,
+                                            "group": p.group,
+                                        })
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )
+                        },
+                        "process_groups": if response.infra_rss_bytes.is_none()
+                            && response.platform_rss_bytes.is_none()
+                            && response.workload_rss_bytes.is_none()
+                        {
+                            None
+                        } else {
+                            Some(serde_json::json!({
+                                "infra_rss_mb": response.infra_rss_bytes.unwrap_or(0) as f64 / 1_048_576.0,
+                                "platform_rss_mb": response.platform_rss_bytes.unwrap_or(0) as f64 / 1_048_576.0,
+                                "workload_rss_mb": response.workload_rss_bytes.unwrap_or(0) as f64 / 1_048_576.0,
+                            }))
                         },
                     })
                 }

@@ -363,6 +363,156 @@ fn sample_container_resources_impl() -> Option<ContainerResourceSample> {
     })
 }
 
+
+// === 容器内进程明细采集（资源观测扩展）===
+
+/// 进程角色:与内存看门狗淘汰语义对齐。
+/// infra/platform = 基础设施与平台服务(看门狗永不淘汰);
+/// workload = 会话命令树(看门狗的可淘汰范围)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessRole {
+    Infra,
+    Platform,
+    Workload,
+}
+
+impl ProcessRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Infra => "infra",
+            Self::Platform => "platform",
+            Self::Workload => "workload",
+        }
+    }
+}
+
+/// 桌面/系统基础设施(按 comm 判定,永不入选淘汰范围)
+const INFRA_COMMS: &[&str] = &[
+    "Xvnc", "Xvfb", "Xorg", "xfce4-session", "xfwm4", "xfdesktop", "xfce4-panel",
+    "xfsettingsd", "xfconfd", "fcitx5", "dbus-daemon", "dbus-launch", "pulseaudio",
+    "pipewire", "websockify", "systemd", "init", "tini", "gvfsd", "gvfsd-trash",
+    "dconf-service", "polkitd", "upowerd", "colord", "udisksd", "gpg-agent",
+    "ssh-agent", "rtkit-daemon", "accounts-daemon", "Thunar", "gjs",
+];
+
+/// 平台服务标记(args 命中即 platform;claude 本体的安装路径也在 acp-ts 包下)
+const PLATFORM_ARGS_MARKERS: &[&str] = &[
+    "nuwax-file-server", "mcp-proxy", "chrome-devtools-mcp",
+    "claude-code-acp-ts", "claude-agent-sdk", "@nuwax-ai/openui-mcp",
+    "nuwax-ask-question-mcp", "@nuwax-ai/nuwax-harness-acp-ts",
+    "nuwax-upload",
+];
+
+/// 单进程明细行。
+#[derive(Debug, Clone)]
+pub struct ProcessRow {
+    pub pid: u32,
+    pub ppid: u32,
+    pub comm: String,
+    pub rss_bytes: u64,
+    /// 累计 CPU 时间(秒,utime+stime)
+    pub cpu_seconds: f64,
+    pub role: ProcessRole,
+    /// 命令行前缀(≤120 字符)
+    pub args_head: String,
+}
+
+/// 按角色聚合的分组统计(字节口径)。
+#[derive(Debug, Default, Clone)]
+pub struct ProcessGroups {
+    pub infra_rss_bytes: u64,
+    pub platform_rss_bytes: u64,
+    pub workload_rss_bytes: u64,
+}
+
+/// 采集容器内全部进程明细并按角色分类。
+///
+/// `self_pid`: 采集进程自身(agent_runner),标记为 platform 且不重复计入。
+/// 进程命令行逐个读取(≤120 字符),失败按 comm 分类。
+#[cfg(target_os = "linux")]
+pub fn collect_container_processes() -> Vec<ProcessRow> {
+    let table = process_utils::proc_scan::snapshot();
+    let mut rows: Vec<ProcessRow> = Vec::with_capacity(table.len());
+    let tps = procfs::ticks_per_second().max(1) as f64;
+    for (pid, info) in &table {
+        if pid == &std::process::id() {
+            continue; // 采集进程自身
+        }
+        let args_head = read_cmdline_head(*pid);
+        let role = classify(&info.comm, &args_head, *pid);
+        rows.push(ProcessRow {
+            pid: *pid,
+            ppid: info.ppid,
+            comm: info.comm.clone(),
+            rss_bytes: info.rss_bytes,
+            cpu_seconds: (info.utime_ticks + info.stime_ticks) as f64 / tps,
+            role,
+            args_head,
+        });
+    }
+    rows.sort_by(|a, b| b.rss_bytes.cmp(&a.rss_bytes));
+    rows
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn collect_container_processes() -> Vec<ProcessRow> {
+    Vec::new()
+}
+
+/// 命令行前缀(≤120 字符,NUL 分隔转空格)。
+#[cfg(target_os = "linux")]
+fn read_cmdline_head(pid: u32) -> String {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    let joined = raw
+        .split(|b| *b == 0)
+        .filter(|c| !c.is_empty())
+        .map(|c| String::from_utf8_lossy(c).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    joined.chars().take(120).collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_cmdline_head(_pid: u32) -> String {
+    String::new()
+}
+
+#[cfg(target_os = "linux")]
+fn classify(comm: &str, args_head: &str, pid: u32) -> ProcessRole {
+    if pid == std::process::id() {
+        return ProcessRole::Platform; // agent_runner 自身(采集方)
+    }
+    if INFRA_COMMS.contains(&comm) {
+        return ProcessRole::Infra;
+    }
+    if PLATFORM_ARGS_MARKERS.iter().any(|m| args_head.contains(m)) {
+        return ProcessRole::Platform;
+    }
+    ProcessRole::Workload
+}
+
+/// 分组聚合。
+pub fn group_totals(rows: &[ProcessRow]) -> ProcessGroups {
+    let mut g = ProcessGroups::default();
+    for row in rows {
+        match row.role {
+            ProcessRole::Infra => g.infra_rss_bytes += row.rss_bytes,
+            ProcessRole::Platform => g.platform_rss_bytes += row.rss_bytes,
+            ProcessRole::Workload => g.workload_rss_bytes += row.rss_bytes,
+        }
+    }
+    g
+}
+
+/// 采集容器内进程明细与分组聚合(供 GetContainerStatus 返回)。
+///
+/// 非 Linux 返回空明细与零聚合(采集在容器内进行)。
+pub fn sample_container_processes() -> (Vec<ProcessRow>, ProcessGroups) {
+    let rows = collect_container_processes();
+    let groups = group_totals(&rows);
+    (rows, groups)
+}
+
 /// 重置容器 CPU 基线(读取失败时调用,下次从零重建)。
 #[cfg(target_os = "linux")]
 fn reset_container_baseline() {

@@ -601,6 +601,18 @@ pub struct GetContainerStatusResponse {
     /// 容器内进程明细（按 RSS 降序 top N；仅请求 include_processes 时填充）
     #[prost(message, repeated, tag = "12")]
     pub processes: ::prost::alloc::vec::Vec<ContainerProcess>,
+    /// 容器内进程总数
+    #[prost(int32, optional, tag = "13")]
+    pub process_count: ::core::option::Option<i32>,
+    /// 桌面/系统 RSS（字节，永不淘汰组）
+    #[prost(uint64, optional, tag = "14")]
+    pub infra_rss_bytes: ::core::option::Option<u64>,
+    /// 平台服务 RSS（字节，永不淘汰组：claude/MCP/file-server）
+    #[prost(uint64, optional, tag = "15")]
+    pub platform_rss_bytes: ::core::option::Option<u64>,
+    /// 会话工作负载 RSS（字节，看门狗可淘汰范围）
+    #[prost(uint64, optional, tag = "16")]
+    pub workload_rss_bytes: ::core::option::Option<u64>,
 }
 /// 容器内单进程快照（资源观测用）
 #[allow(clippy::all)]

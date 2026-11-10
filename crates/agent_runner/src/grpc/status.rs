@@ -1,7 +1,8 @@
 //! GetStatus / GetContainerStatus / GetVncStatus RPC 实现
 
 use shared_types::grpc::{
-    GetContainerStatusRequest, GetContainerStatusResponse, GetStatusRequest, GetStatusResponse,
+    ContainerProcess, GetContainerStatusRequest, GetContainerStatusResponse, GetStatusRequest,
+    GetStatusResponse,
     GetVncStatusRequest, GetVncStatusResponse,
 };
 use std::sync::Arc;
@@ -136,6 +137,35 @@ pub async fn get_container_status(
         let (container_cpu_percent, container_memory_mb, container_memory_limit_mb, container_cpu_limit_cores) =
             crate::service::agent_resource_monitor::sample_container_resources();
 
+        // 容器内进程明细+分组聚合(req.include_processes 控制;旧调用方缺省 false 零开销)
+        let include_processes = req.include_processes.unwrap_or(false);
+        let (processes, process_count, infra_rss_bytes, platform_rss_bytes, workload_rss_bytes) =
+            if include_processes {
+                let (rows, groups) =
+                    crate::service::agent_resource_monitor::sample_container_processes();
+                let process_rows = rows
+                    .iter()
+                    .map(|row| ContainerProcess {
+                        pid: row.pid,
+                        ppid: row.ppid,
+                        comm: row.comm.clone(),
+                        rss_bytes: row.rss_bytes,
+                        cpu_seconds: row.cpu_seconds,
+                        group: row.role.as_str().to_string(),
+                        args_head: row.args_head.clone(),
+                    })
+                    .collect();
+                (
+                    process_rows,
+                    Some(rows.len() as i32),
+                    Some(groups.infra_rss_bytes),
+                    Some(groups.platform_rss_bytes),
+                    Some(groups.workload_rss_bytes),
+                )
+            } else {
+                (Vec::new(), None, None, None, None)
+            };
+
         let status = if active_tasks > 0 {
             "Processing".to_string()
         } else {
@@ -154,6 +184,11 @@ pub async fn get_container_status(
             container_memory_mb,
             container_memory_limit_mb,
             container_cpu_limit_cores,
+            processes,
+            process_count,
+            infra_rss_bytes,
+            platform_rss_bytes,
+            workload_rss_bytes,
         };
 
         debug!(
