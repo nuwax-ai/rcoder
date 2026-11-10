@@ -1740,3 +1740,101 @@ async fn actual_acp_abnormal_exit_after_cancel_keeps_rpc_failure_and_error_ident
     );
     stop(&service, project, &response.session_id).await;
 }
+
+#[tokio::test]
+async fn process_roles_follow_the_watchdog_scope_end_to_end() {
+    // 端到端回归(用户实拍发现):`python3 -m websockify` 曾被标成"可淘汰"。
+    // 角色必须由进程树决定,与看门狗真实行为同源。这里自造一棵"agent 命令树"
+    // (root + 后代),连同真实 spawn 的 agent 一起验证三条不变式:
+    //   1. 已注册 root 的后代 → workload(看门狗真会杀)
+    //   2. root 自身          → 永不淘汰(杀 root 等于杀会话)
+    //   3. 树外进程           → infra(远程桌面/系统服务在此列)
+    process_utils::mem_watch::registry::install();
+    let registry = process_utils::mem_watch::registry::global().expect("registry");
+
+    let root = tempfile::tempdir().unwrap();
+    let service = service(root.path(), 3).await;
+    let project = "protocol-process-roles";
+    let response = service
+        .chat(Request::new(chat(root.path(), project, "", true, "hold")))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.success, "chat: {response:?}");
+    wait_row(root.path(), "prompt", project, 1).await;
+
+    // 自造命令树:sh(root) → sleep(后代)。另有一个完全无关的树外进程。
+    let mut tree = std::process::Command::new("/bin/sh")
+        .args(["-c", "sleep 60 & wait"])
+        .spawn()
+        .expect("spawn tree");
+    let tree_root = tree.id();
+    let mut outsider = std::process::Command::new("/bin/sh")
+        .args(["-c", "exec sleep 60"])
+        .spawn()
+        .expect("spawn outsider");
+    let outsider_pid = outsider.id();
+    // register 要读 /proc/<pid>/stat 与 exe,macOS 上没有 → 只在 Linux 上注册
+    if cfg!(target_os = "linux") {
+        assert!(
+            registry
+                .register("protocol-roles-tree", tree_root)
+                .is_some(),
+            "注册命令树 root 失败"
+        );
+    }
+
+    // posix_spawn 返回时 sh 刚 exec,还没 fork 出后代——给命令树留出建立时间
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (rows, groups) =
+        agent_runner::service::agent_resource_monitor::sample_container_processes();
+    let role_of = |pid: u32| rows.iter().find(|r| r.pid == pid).map(|r| r.role);
+    use agent_runner::service::agent_resource_monitor::ProcessRole;
+
+    if cfg!(target_os = "linux") {
+        assert!(!rows.is_empty(), "Linux 上必须能采到容器进程");
+
+        // 1) 树内后代必须是 workload
+        let descendant = rows
+            .iter()
+            .find(|r| r.ppid == tree_root && r.pid != tree_root)
+            .map(|r| (r.pid, r.role));
+        assert!(
+            matches!(descendant, Some((_, ProcessRole::Workload))),
+            "已注册 root 的后代必须标成可淘汰,实际 {descendant:?}"
+        );
+
+        // 2) root 自身永不淘汰
+        assert_ne!(
+            role_of(tree_root),
+            Some(ProcessRole::Workload),
+            "root 自身不能被标成可淘汰(杀 root 等于杀会话)"
+        );
+
+        // 3) 树外进程必须是 infra
+        assert_eq!(
+            role_of(outsider_pid),
+            Some(ProcessRole::Infra),
+            "树外进程必须不淘汰"
+        );
+
+        // 4) 不变式:所有 workload 行的 RSS 之和必须等于分组值
+        let sum: u64 = rows
+            .iter()
+            .filter(|r| r.role == ProcessRole::Workload)
+            .map(|r| r.rss_bytes)
+            .sum();
+        assert_eq!(
+            sum, groups.workload_rss_bytes,
+            "workload 分组必须等于逐行求和"
+        );
+    }
+
+    stop(&service, project, &response.session_id).await;
+    registry.unregister("protocol-roles-tree", tree_root);
+    drop(tree.kill());
+    drop(tree.wait());
+    drop(outsider.kill());
+    drop(outsider.wait());
+}
