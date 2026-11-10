@@ -331,6 +331,14 @@ async fn status_resource_query_rejects_stale_expected_identity() {
             container_memory_mb: Some(1024),
             container_memory_limit_mb: Some(3954),
             container_cpu_limit_cores: Some(2.0),
+            // 进程明细与分组聚合(0.1.419+ 新增字段;这里只做结构完整性)
+            processes: Vec::new(),
+            process_count: Some(0),
+            infra_rss_bytes: Some(0),
+            platform_rss_bytes: Some(0),
+            workload_rss_bytes: Some(0),
+            // 执行存在性(与资源降级无关的显式存活信号)
+            agent_present: Some(true),
         });
 
     // 身份匹配(expected=A,registry=A):资源返回。
@@ -504,6 +512,14 @@ async fn status_endpoint_reports_agent_resource_usage() {
             container_memory_mb: Some(1024),
             container_memory_limit_mb: Some(3954),
             container_cpu_limit_cores: Some(2.0),
+            // 进程明细与分组聚合(0.1.419+ 新增字段;这里只做结构完整性)
+            processes: Vec::new(),
+            process_count: Some(0),
+            infra_rss_bytes: Some(0),
+            platform_rss_bytes: Some(0),
+            workload_rss_bytes: Some(0),
+            // 执行存在性(与资源降级无关的显式存活信号)
+            agent_present: Some(true),
         });
 
     let result = post_json(

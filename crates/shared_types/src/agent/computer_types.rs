@@ -554,10 +554,34 @@ pub struct ComputerPodResourcesQuery {
     #[param(example = true)]
     #[schema(example = true)]
     pub include_processes: Option<bool>,
+
+    /// SSE 采样周期(秒,默认 2,clamp 1-30)。仅 `/stream` 端点使用。
+    #[serde(default)]
+    #[param(example = 2, minimum = 1, maximum = 30)]
+    #[schema(example = 2)]
+    pub interval_secs: Option<u64>,
 }
 
 fn computer_pod_resources_default_include_processes() -> Option<bool> {
     Some(true)
+}
+
+/// SSE 采样周期的默认值(秒)。
+pub const COMPUTER_POD_RESOURCES_DEFAULT_INTERVAL_SECS: u64 = 2;
+
+/// SSE 采样周期的合法区间(秒):下限防止把 agent_runner 打成 DoS,
+/// 上限防止连接挂着却几乎不采样。
+pub const COMPUTER_POD_RESOURCES_MIN_INTERVAL_SECS: u64 = 1;
+pub const COMPUTER_POD_RESOURCES_MAX_INTERVAL_SECS: u64 = 30;
+
+/// 归一化 SSE 采样周期:非法值回落到默认,越界夹到区间内。
+pub fn computer_pod_resources_clamp_interval(raw: Option<u64>) -> u64 {
+    raw.filter(|v| *v > 0)
+        .unwrap_or(COMPUTER_POD_RESOURCES_DEFAULT_INTERVAL_SECS)
+        .clamp(
+            COMPUTER_POD_RESOURCES_MIN_INTERVAL_SECS,
+            COMPUTER_POD_RESOURCES_MAX_INTERVAL_SECS,
+        )
 }
 
 /// Computer Agent 取消任务的请求参数

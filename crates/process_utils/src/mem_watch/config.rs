@@ -128,6 +128,10 @@ impl Config {
     }
 
     /// 生效限额：显式覆盖优先，否则读 cgroup。
+    ///
+    /// 覆盖值只是"候选"：调用方必须再用 [`cgroup::CgroupProbe::confirms`]
+    /// 与实测 `memory.max` 对账，确认用量和限额来自同一组，否则不淘汰
+    /// （host cgroup namespace 下根路径是整机用量，见 `cgroup` 模块文档）。
     pub fn effective_limit(&self) -> Option<u64> {
         self.limit_override.or_else(super::sys::read_memory_max)
     }

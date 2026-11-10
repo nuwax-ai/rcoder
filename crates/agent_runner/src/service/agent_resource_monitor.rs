@@ -47,14 +47,28 @@ struct CpuBaseline {
 }
 
 /// 清除 project 的过期 CPU 基线。
+///
+/// - `owner = None`：注册表里已没有任何执行，整键删除（不存在误删新代次的风险）；
+/// - `owner = Some((execution, pgid))`：只删**属于该执行**的基线。迟到的旧采样
+///   （扫描期间已换代）不能把新执行刚建立的基线一起删掉——那会让新代次的
+///   第一次 CPU% 白白丢失。
 #[cfg(any(target_os = "linux", test))]
-fn invalidate_baseline(project_id: &str) {
-    CPU_BASELINES.remove(project_id);
+fn invalidate_baseline(project_id: &str, owner: Option<(&str, u32)>) {
+    match owner {
+        None => {
+            CPU_BASELINES.remove(project_id);
+        }
+        Some((execution, pgid)) => {
+            CPU_BASELINES.remove_if(project_id, |_, baseline| {
+                baseline.execution == execution && baseline.pgid == pgid
+            });
+        }
+    }
 }
 
 /// 非 Linux 非 test 构建:无基线机制,空操作。
 #[cfg(not(any(target_os = "linux", test)))]
-fn invalidate_baseline(_project_id: &str) {}
+fn invalidate_baseline(_project_id: &str, _owner: Option<(&str, u32)>) {}
 
 /// 单次 agent 进程组采样结果。
 pub struct AgentResourceSample {
@@ -92,7 +106,7 @@ pub fn sample_for_project(
 
     let Some((execution, pgid)) = execution else {
         // agent 未运行(或实现方不暴露 pgid):清掉过期基线,字段缺省。
-        invalidate_baseline(project_id);
+        invalidate_baseline(project_id, None);
         return (None, None);
     };
     if let Some(expected) = expected_session
@@ -105,8 +119,10 @@ pub fn sample_for_project(
     match sample_agent_resources(project_id, &execution, pgid) {
         Some(sample) => (sample.cpu_percent, Some(sample.memory_mb)),
         None => {
-            // 进程组已消失(退出竞态):基线一并失效。
-            invalidate_baseline(project_id);
+            // 进程组已消失(退出竞态)或扫描期间换代:基线一并失效。
+            // 只删属于本次采样的那条:换代后新执行可能已建好基线,
+            // 迟到的旧样本不能把它一起清掉。
+            invalidate_baseline(project_id, Some((&execution, pgid)));
             (None, None)
         }
     }
@@ -136,8 +152,7 @@ pub fn sample_agent_resources(
             continue;
         }
         rss_bytes = rss_bytes.saturating_add(info.rss_bytes);
-        total_ticks =
-            total_ticks.saturating_add(info.utime_ticks.saturating_add(info.stime_ticks));
+        total_ticks = total_ticks.saturating_add(info.utime_ticks.saturating_add(info.stime_ticks));
         process_count += 1;
     }
 
@@ -189,6 +204,9 @@ pub fn sample_agent_resources(
 ///
 /// 规则(纯函数,便于单测):
 /// - 无基线(首次):记录水位,CPU% = None;
+/// - **基线比本次采样还新**(`baseline.at > now`):说明已有更晚的采样(换代后的
+///   新执行)落过账,本次是迟到的旧样本——**不碰基线**,CPU% = None。
+///   少了这条,旧样本会按旧身份重置基线,把新代次的第一次 CPU% 也搭进去;
 /// - 执行身份或进程组变化(会话换代/同会话换进程):旧基线不可比,
 ///   重置水位,CPU% = None;
 /// - 距上次采样 < 1s:窗口太短,保留原基线,CPU% = None;
@@ -219,6 +237,11 @@ fn advance_cpu_baseline(
         }
         dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
             let baseline = occupied.get();
+            if baseline.at > now {
+                // 迟到的旧样本:已经有更晚的采样(通常是换代后的新执行)落账。
+                // 原样保留,不重置也不差分——跨代差分是虚假数据。
+                return (None, Some(baseline.clone()));
+            }
             if baseline.execution != execution || baseline.pgid != pgid {
                 // 换代(会话变化或同会话换进程):新执行 ticks 从 0 重新累计,
                 // 与旧水位不可比(多核下新组可很快越过旧水位,跨代差分是
@@ -363,7 +386,6 @@ fn sample_container_resources_impl() -> Option<ContainerResourceSample> {
     })
 }
 
-
 // === 容器内进程明细采集（资源观测扩展）===
 
 /// 进程角色:与内存看门狗淘汰语义对齐。
@@ -388,18 +410,49 @@ impl ProcessRole {
 
 /// 桌面/系统基础设施(按 comm 判定,永不入选淘汰范围)
 const INFRA_COMMS: &[&str] = &[
-    "Xvnc", "Xvfb", "Xorg", "xfce4-session", "xfwm4", "xfdesktop", "xfce4-panel",
-    "xfsettingsd", "xfconfd", "fcitx5", "dbus-daemon", "dbus-launch", "pulseaudio",
-    "pipewire", "websockify", "systemd", "init", "tini", "gvfsd", "gvfsd-trash",
-    "dconf-service", "polkitd", "upowerd", "colord", "udisksd", "gpg-agent",
-    "ssh-agent", "rtkit-daemon", "accounts-daemon", "Thunar", "gjs",
+    "Xvnc",
+    "Xvfb",
+    "Xorg",
+    "xfce4-session",
+    "xfwm4",
+    "xfdesktop",
+    "xfce4-panel",
+    "xfsettingsd",
+    "xfconfd",
+    "fcitx5",
+    "dbus-daemon",
+    "dbus-launch",
+    "pulseaudio",
+    "pipewire",
+    "websockify",
+    "systemd",
+    "init",
+    "tini",
+    "gvfsd",
+    "gvfsd-trash",
+    "dconf-service",
+    "polkitd",
+    "upowerd",
+    "colord",
+    "udisksd",
+    "gpg-agent",
+    "ssh-agent",
+    "rtkit-daemon",
+    "accounts-daemon",
+    "Thunar",
+    "gjs",
 ];
 
 /// 平台服务标记(args 命中即 platform;claude 本体的安装路径也在 acp-ts 包下)
 const PLATFORM_ARGS_MARKERS: &[&str] = &[
-    "nuwax-file-server", "mcp-proxy", "chrome-devtools-mcp",
-    "claude-code-acp-ts", "claude-agent-sdk", "@nuwax-ai/openui-mcp",
-    "nuwax-ask-question-mcp", "@nuwax-ai/nuwax-harness-acp-ts",
+    "nuwax-file-server",
+    "mcp-proxy",
+    "chrome-devtools-mcp",
+    "claude-code-acp-ts",
+    "claude-agent-sdk",
+    "@nuwax-ai/openui-mcp",
+    "nuwax-ask-question-mcp",
+    "@nuwax-ai/nuwax-harness-acp-ts",
     "nuwax-upload",
 ];
 
@@ -428,7 +481,8 @@ pub struct ProcessGroups {
 /// 采集容器内全部进程明细并按角色分类。
 ///
 /// `self_pid`: 采集进程自身(agent_runner),标记为 platform 且不重复计入。
-/// 进程命令行逐个读取(≤120 字符),失败按 comm 分类。
+/// 进程命令行逐个读取并**脱敏**后截断到 120 字符;角色分类用未脱敏的原始
+/// 命令行(脱敏可能抹掉分类标记),原始串不外泄。
 #[cfg(target_os = "linux")]
 pub fn collect_container_processes() -> Vec<ProcessRow> {
     let table = process_utils::proc_scan::snapshot();
@@ -438,8 +492,11 @@ pub fn collect_container_processes() -> Vec<ProcessRow> {
         if pid == &std::process::id() {
             continue; // 采集进程自身
         }
-        let args_head = read_cmdline_head(*pid);
-        let role = classify(&info.comm, &args_head, *pid);
+        let raw_args = read_cmdline_args(*pid);
+        let raw_joined = raw_args.join(" ");
+        // 分类用原始串:脱敏会抹掉 --token 这类标记,导致平台服务被误判为负载
+        let role = classify(&info.comm, &raw_joined, *pid);
+        let args_head = redact_cmdline(&raw_args);
         rows.push(ProcessRow {
             pid: *pid,
             ppid: info.ppid,
@@ -459,25 +516,161 @@ pub fn collect_container_processes() -> Vec<ProcessRow> {
     Vec::new()
 }
 
-/// 命令行前缀(≤120 字符,NUL 分隔转空格)。
+/// 命令行原文(按 NUL 切分,不过滤空段之外的任何处理)。
 #[cfg(target_os = "linux")]
-fn read_cmdline_head(pid: u32) -> String {
-    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-    let joined = raw
-        .split(|b| *b == 0)
+fn read_cmdline_args(pid: u32) -> Vec<String> {
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return Vec::new();
+    };
+    raw.split(|b| *b == 0)
         .filter(|c| !c.is_empty())
         .map(|c| String::from_utf8_lossy(c).into_owned())
-        .collect::<Vec<_>>()
-        .join(" ");
-    joined.chars().take(120).collect()
+        .collect()
 }
 
 #[cfg(not(target_os = "linux"))]
-fn read_cmdline_head(_pid: u32) -> String {
+#[allow(dead_code)] // 平台替身:非 Linux 非采集路径不使用
+fn read_cmdline_args(_pid: u32) -> Vec<String> {
+    Vec::new()
+}
+
+/// 需要脱敏的参数名片段(大小写不敏感,匹配 flag 名或 `KEY=` 的键名)。
+#[cfg(any(target_os = "linux", test))]
+const SENSITIVE_NAME_MARKERS: &[&str] = &[
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "passphrase",
+    "pass",
+    "pwd",
+    "apikey",
+    "api-key",
+    "api_key",
+    "credential",
+    "auth",
+    "bearer",
+    "cookie",
+    "private-key",
+    "private_key",
+    "access-key",
+    "access_key",
+    "secret-key",
+    "secret_key",
+    "session-token",
+    "session_token",
+    "signature",
+    "sig",
+    "key",
+];
+
+/// 一看就是凭据的值前缀(精确匹配,避免误伤普通路径/名称)。
+#[cfg(any(target_os = "linux", test))]
+const SECRET_VALUE_PREFIXES: &[&str] = &[
+    "eyJ", // JWT
+    "sk-", // OpenAI/Anthropic 风格
+    "ghp_", "gho_", "ghs_", "ghu_",   // GitHub
+    "glpat-", // GitLab
+    "AKIA",   // AWS access key id
+    "xox",    // Slack
+    "npm_",   // npm
+    "ya29.",  // Google OAuth
+];
+
+/// 脱敏掩码。
+#[cfg(any(target_os = "linux", test))]
+const MASK: &str = "***";
+
+/// 参数名是否敏感(去掉前导 `-` 后按片段匹配)。
+#[cfg(any(target_os = "linux", test))]
+fn is_sensitive_name(name: &str) -> bool {
+    let n = name.trim_start_matches('-').to_ascii_lowercase();
+    !n.is_empty() && SENSITIVE_NAME_MARKERS.iter().any(|m| n.contains(m))
+}
+
+/// 值本身是否像凭据(精确前缀 + 高熵串)。
+///
+/// 高熵判定刻意严格:必须同时含大写字母与数字、长度 ≥20、且只含 base64/hex
+/// 类字符。否则 `computer-agent-runner-1743762321` 这类普通名字会被误掩，
+/// 观测价值就没了——真正的高熵凭据几乎都满足大小写混合。
+#[cfg(any(target_os = "linux", test))]
+fn looks_like_secret(value: &str) -> bool {
+    if SECRET_VALUE_PREFIXES.iter().any(|p| value.starts_with(p)) {
+        return true;
+    }
+    if value.len() < 20 {
+        return false;
+    }
+    let charset_ok = value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '/' | '='));
+    if !charset_ok {
+        return false;
+    }
+    let has_upper = value.chars().any(|c| c.is_ascii_uppercase());
+    let has_digit = value.chars().any(|c| c.is_ascii_digit());
+    has_upper && has_digit
+}
+
+/// 脱敏后的命令行(≤120 字符,NUL 分隔转空格)。
+///
+/// 进程明细会经 `/computer/pod/resources` 暴露给观测端,而 `--token=xxx`
+/// 这类写法在真实命令行里很常见——截断长度挡不住凭据。这里做三重处理:
+/// 1. `name=value`(含 `KEY=VALUE` 环境风格):名敏感或值像凭据 → 值掩码;
+/// 2. 独立敏感 flag(`--password secret`):连同**下一个**参数一起掩码;
+/// 3. 任意位置的高熵值:直接掩码。
+///
+/// 宁多掩勿漏:多掩只是少看一个参数,漏掩是把凭据送出容器。
+#[cfg(any(target_os = "linux", test))]
+fn redact_cmdline(args: &[String]) -> String {
+    let mut out: Vec<String> = Vec::with_capacity(args.len());
+    let mut mask_next = false;
+    for arg in args {
+        if mask_next {
+            out.push(MASK.to_owned());
+            mask_next = false;
+            continue;
+        }
+        if let Some(eq) = arg.find('=') {
+            let (name, value) = (&arg[..eq], &arg[eq + 1..]);
+            if !value.is_empty() && (is_sensitive_name(name) || looks_like_secret(value)) {
+                out.push(format!("{name}={MASK}"));
+                continue;
+            }
+            out.push(arg.clone());
+            continue;
+        }
+        if arg.starts_with('-') {
+            // 独立敏感 flag:值在下一个参数里
+            if is_sensitive_name(arg) {
+                mask_next = true;
+                out.push(arg.clone());
+                continue;
+            }
+            // 附着形式:-pSECRET / --tokenSECRET(短 flag 只有 -p 有实际用法)
+            if arg.len() > 2 && arg.starts_with("-p") && looks_like_secret(&arg[2..]) {
+                out.push(format!("-p{MASK}"));
+                continue;
+            }
+            out.push(arg.clone());
+            continue;
+        }
+        if looks_like_secret(arg) {
+            out.push(MASK.to_owned());
+            continue;
+        }
+        out.push(arg.clone());
+    }
+    out.join(" ").chars().take(120).collect()
+}
+
+#[cfg(not(any(target_os = "linux", test)))]
+fn redact_cmdline(_args: &[String]) -> String {
     String::new()
 }
 
-#[cfg(target_os = "linux")]
+/// 角色分类(纯函数,跨平台可测)。
+#[cfg(any(target_os = "linux", test))]
 fn classify(comm: &str, args_head: &str, pid: u32) -> ProcessRole {
     if pid == std::process::id() {
         return ProcessRole::Platform; // agent_runner 自身(采集方)
@@ -617,6 +810,7 @@ fn advance_container_cpu(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// 最小生命周期替身:暴露指定 pgid,其余行为为空实现。
     /// 仅 Linux 门控测试使用(own_process_group)。
@@ -689,7 +883,7 @@ mod tests {
             "exec-A",
             101,
             1_000,
-            now - std::time::Duration::from_secs(4),
+            now - Duration::from_secs(4),
             tps(),
         );
         // 400 ticks / 100tps = 4 CPU 秒,窗口 4s → 100%
@@ -708,7 +902,7 @@ mod tests {
             "exec-A",
             101,
             5_000,
-            now - std::time::Duration::from_secs(4),
+            now - Duration::from_secs(4),
             tps(),
         );
         // 同代计数回绕:低于旧水位。
@@ -728,7 +922,7 @@ mod tests {
             "exec-A",
             101,
             1_000,
-            now - std::time::Duration::from_secs(4),
+            now - Duration::from_secs(4),
             tps(),
         );
         let (percent, updated) =
@@ -754,7 +948,7 @@ mod tests {
             "exec-same",
             101,
             1_000,
-            now - std::time::Duration::from_secs(4),
+            now - Duration::from_secs(4),
             tps(),
         );
         let (percent, updated) =
@@ -772,13 +966,11 @@ mod tests {
         let (percent, next) = advance_container_cpu(None, 1_000_000, t0);
         assert_eq!(percent, None);
         // t0+4s:消耗 2 CPU 秒(2_000_000 usec)→ 50%。
-        let (percent, next) =
-            advance_container_cpu(next, 3_000_000, t0 + std::time::Duration::from_secs(4));
+        let (percent, next) = advance_container_cpu(next, 3_000_000, t0 + Duration::from_secs(4));
         let percent = percent.expect("container percent");
         assert!((percent - 50.0).abs() < 1.0, "percent={percent}");
         // t0+5s 回退(容器重启,usage 归零重计):None + 重置。
-        let (percent, next) =
-            advance_container_cpu(next, 100_000, t0 + std::time::Duration::from_secs(5));
+        let (percent, next) = advance_container_cpu(next, 100_000, t0 + Duration::from_secs(5));
         assert_eq!(percent, None);
         assert_eq!(next.expect("reset").usage_usec, 100_000);
     }
@@ -867,5 +1059,166 @@ mod tests {
                 assert!(cores > 0.0);
             }
         }
+    }
+
+    // ==== 换代竞态:迟到的旧样本不得动新基线 ====
+
+    #[test]
+    fn late_old_sample_does_not_reset_newer_baseline() {
+        // 新执行(exec-B)已建立基线;旧执行(exec-A)的迟到样本再来,
+        // 必须原样保留新基线,不能按旧身份重置。
+        let t0 = Instant::now();
+        advance_cpu_baseline("p-late", "exec-A", 101, 500, t0, tps());
+        let t1 = t0 + Duration::from_secs(2);
+        let (_, newer) = advance_cpu_baseline("p-late", "exec-B", 202, 900, t1, tps());
+        let newer = newer.expect("new baseline");
+
+        // 迟到:旧样本的 now 早于新基线落账时间
+        let (percent, after) = advance_cpu_baseline(
+            "p-late",
+            "exec-A",
+            101,
+            500,
+            t0 + Duration::from_millis(1),
+            tps(),
+        );
+        assert_eq!(percent, None, "跨代不得给出 CPU%");
+        let after = after.expect("baseline kept");
+        assert_eq!(after.execution, "exec-B", "旧样本篡改了基线归属");
+        assert_eq!(after.pgid, 202);
+        assert_eq!(after.ticks, newer.ticks, "旧样本篡改了水位");
+    }
+
+    #[test]
+    fn invalidate_only_removes_matching_execution() {
+        // 旧采样的 None 分支只应删自己的基线,不能连坐新执行
+        let t0 = Instant::now();
+        advance_cpu_baseline("p-inv", "exec-A", 101, 500, t0, tps());
+        advance_cpu_baseline(
+            "p-inv",
+            "exec-B",
+            202,
+            900,
+            t0 + Duration::from_secs(2),
+            tps(),
+        );
+
+        invalidate_baseline("p-inv", Some(("exec-A", 101)));
+
+        let kept = CPU_BASELINES.get("p-inv").expect("新执行基线必须保留");
+        assert_eq!(kept.execution, "exec-B");
+        assert_eq!(kept.pgid, 202);
+        drop(kept);
+        CPU_BASELINES.remove("p-inv");
+    }
+
+    #[test]
+    fn invalidate_without_owner_clears_everything() {
+        let t0 = Instant::now();
+        advance_cpu_baseline("p-inv-all", "exec-A", 101, 500, t0, tps());
+        invalidate_baseline("p-inv-all", None);
+        assert!(!CPU_BASELINES.contains_key("p-inv-all"));
+    }
+
+    // ==== 命令行脱敏(进程明细会经 HTTP 暴露) ====
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn redacts_equals_form_secrets() {
+        assert_eq!(
+            redact_cmdline(&args(&[
+                "claude",
+                "--api-key=sk-ant-api03-XYZ1234567890abc"
+            ])),
+            "claude --api-key=***"
+        );
+        assert_eq!(
+            redact_cmdline(&args(&["app", "DB_PASSWORD=hunter2Hunter2"])),
+            "app DB_PASSWORD=***"
+        );
+        // 值本身高熵也要掩,不管参数名
+        assert_eq!(
+            redact_cmdline(&args(&[
+                "app",
+                "--url=https://x/y",
+                "AbCdEf123456GhIjKlMnOp"
+            ])),
+            "app --url=https://x/y ***"
+        );
+    }
+
+    #[test]
+    fn redacts_separate_value_flag() {
+        // --password 的值在下一个参数里
+        assert_eq!(
+            redact_cmdline(&args(&[
+                "mysql",
+                "-h",
+                "db",
+                "--password",
+                "s3cr3tPassw0rd!"
+            ])),
+            "mysql -h db --password ***"
+        );
+        // 附着形式:-pSECRET
+        assert_eq!(
+            redact_cmdline(&args(&["curl", "-u", "user", "-pAbCdEf123456GhIjKlMn"])),
+            "curl -u user -p***"
+        );
+    }
+
+    #[test]
+    fn keeps_ordinary_command_lines_intact() {
+        // 观测价值优先:普通命令行必须原样保留
+        let normal = args(&[
+            "node",
+            "/usr/local/bin/nuwax-file-server",
+            "start",
+            "--env",
+            "production",
+            "--port",
+            "60001",
+        ]);
+        assert_eq!(redact_cmdline(&normal), normal.join(" "));
+
+        let containerish = args(&["computer-agent-runner-1743762321", "--port", "8086"]);
+        assert_eq!(redact_cmdline(&containerish), containerish.join(" "));
+    }
+
+    #[test]
+    fn redaction_covers_known_token_prefixes() {
+        for token in [
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+            "ghp_AbCdEf123456GhIjKlMnOpQrSt",
+            "AKIAIOSFODNN7EXAMPLE",
+            "xoxb-1234567890-AbCdEfGhIjKl",
+        ] {
+            let out = redact_cmdline(&args(&["agent", token]));
+            assert_eq!(out, "agent ***", "token {token} 必须被掩码");
+        }
+    }
+
+    #[test]
+    fn redaction_truncates_to_120_chars() {
+        let long: Vec<String> = (0..40).map(|i| format!("arg{i:04}")).collect();
+        let out = redact_cmdline(&long);
+        assert!(
+            out.chars().count() <= 120,
+            "长度 {} 超限",
+            out.chars().count()
+        );
+    }
+
+    #[test]
+    fn classify_uses_raw_args_not_redacted() {
+        // 平台标记出现在被脱敏的参数里时,分类仍必须认出来
+        // (脱敏只作用于输出,不作用于分类)
+        let raw = args(&["node", "mcp-proxy", "--token=sk-ant-AbCdEf123456GhIjKlMn"]);
+        assert_eq!(classify("node", &raw.join(" "), 999), ProcessRole::Platform);
+        let redacted = redact_cmdline(&raw);
+        assert!(redacted.contains("mcp-proxy"), "脱敏不应抹掉非敏感参数");
+        assert!(!redacted.contains("sk-ant-"), "凭据必须被掩");
     }
 }

@@ -101,6 +101,17 @@ pub struct Victim {
     pub comm: String,
 }
 
+/// 待终止的进程：PID + 快照里的启动时间（身份二元组）。
+///
+/// 只带 PID 不够：`pidfd_open` 发生在扫表之后，原进程退出且 PID 被复用时
+/// pidfd 会绑定新进程。`starttime` 用于终止前复核"还是原来那个进程吗"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KillTarget {
+    pub pid: u32,
+    /// `/proc/<pid>/stat` 第 22 字段（自 boot 起的时钟 tick）。
+    pub starttime: u64,
+}
+
 /// 在多个会话的子树里选一个淘汰目标。
 ///
 /// - 只考虑 `roots` 的后代（`roots` 自己永不入选）；
@@ -155,17 +166,29 @@ pub fn select_victim(
 /// 为什么不是只杀 victim：命令树常见 `bash -c "..."` 里再起子进程；
 /// 只杀父进程会让子进程被 reparent 到 PID 1，从此脱离 `descendants(root)`
 /// 的范围——内存没释放，而且再也不会被选中。
+///
+/// 带 `starttime`：从扫表到 `pidfd_open` 之间有真实窗口，原进程退出后 PID
+/// 被复用会让 pidfd 绑定到**无关的新进程**。携带快照里的启动时间，由终止方
+/// 在打开 pidfd 后、发信号前复核身份（见 [`kill::terminate_many`]）。
 pub fn subtree_targets(
     table: &HashMap<u32, ProcInfo>,
     victim: u32,
     exclude: &HashSet<u32>,
-) -> Vec<u32> {
+) -> Vec<KillTarget> {
     let mut targets = vec![victim];
     targets.extend(descendants(table, victim));
     targets.retain(|pid| *pid != 1 && !exclude.contains(pid));
     targets.sort_unstable();
     targets.dedup();
     targets
+        .into_iter()
+        .filter_map(|pid| {
+            table.get(&pid).map(|info| KillTarget {
+                pid,
+                starttime: info.starttime,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -295,14 +318,23 @@ mod tests {
     fn subtree_targets_includes_children_but_not_excluded() {
         let mut table = HashMap::new();
         table.insert(10, info(10, 1, 0, 0)); // root
-        table.insert(11, info(11, 10, 0, 0)); // bash（victim）
-        table.insert(12, info(12, 11, 0, 0)); // python
-        table.insert(13, info(13, 12, 0, 0)); // python 子进程
-        table.insert(14, info(14, 11, 0, 0)); // 受保护（例如 MCP）
+        table.insert(11, info(11, 10, 0, 700)); // bash（victim）
+        table.insert(12, info(12, 11, 0, 800)); // python
+        table.insert(13, info(13, 12, 0, 900)); // python 子进程
+        table.insert(14, info(14, 11, 0, 950)); // 受保护（例如 MCP）
 
         let exclude = HashSet::from([14u32]);
         let targets = subtree_targets(&table, 11, &exclude);
-        assert_eq!(targets, vec![11, 12, 13], "要带上后代，但不能碰受保护进程");
+        let pids: Vec<u32> = targets.iter().map(|t| t.pid).collect();
+        assert_eq!(pids, vec![11, 12, 13], "要带上后代，但不能碰受保护进程");
+        assert_eq!(
+            targets[0],
+            KillTarget {
+                pid: 11,
+                starttime: 700
+            },
+            "必须携带快照 starttime 供终止前复核身份"
+        );
     }
 
     #[test]
@@ -311,7 +343,24 @@ mod tests {
         table.insert(1, info(1, 0, 0, 0));
         table.insert(11, info(11, 10, 0, 0));
         let targets = subtree_targets(&table, 11, &HashSet::new());
-        assert_eq!(targets, vec![11]);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].pid, 11);
+    }
+
+    #[test]
+    fn subtree_targets_drops_pids_missing_from_table() {
+        // 表里没有的 pid（扫描后立刻退出）不能成为目标：没有 starttime 就无法复核
+        let mut table = HashMap::new();
+        table.insert(11, info(11, 10, 0, 42));
+        let targets = subtree_targets(&table, 11, &HashSet::new());
+        assert_eq!(
+            targets,
+            vec![KillTarget {
+                pid: 11,
+                starttime: 42
+            }]
+        );
+        assert!(subtree_targets(&HashMap::new(), 11, &HashSet::new()).is_empty());
     }
 
     #[test]

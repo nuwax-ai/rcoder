@@ -234,8 +234,7 @@ pub async fn computer_pod_resources(
         container_id: Some(container_info.container_id),
         container_name: Some(container_info.container_name),
         processes,
-        process_count: (!response.processes.is_empty())
-            .then(|| response.processes.len() as u32),
+        process_count: (!response.processes.is_empty()).then_some(response.processes.len() as u32),
         process_groups: groups,
     }))
 }
@@ -279,7 +278,7 @@ use std::convert::Infallible;
     tag = "pod",
     operation_id = "computer_pod_resources_stream",
     summary = "订阅 Computer 容器资源监控流(SSE,容器 + agent)",
-    description = "SSE 推送容器 cgroup 级与容器内 agent 进程组的 CPU/内存用量。订阅驱动采样:连接期间按 interval_secs(默认 2s,clamp 1-30)周期采样推送;无 replay/无历史缓冲,断连即停。执行换代后自动跟随新代次。"
+    description = "SSE 推送容器 cgroup 级与容器内 agent 进程组的 CPU/内存用量。订阅驱动采样:连接期间按 interval_secs(默认 2s,clamp 1-30)周期采样推送;无 replay/无历史缓冲,断连即停。执行换代后自动跟随新代次;agent.alive 来自显式的执行存在性,采集降级时资源字段缺省但不会误报 agent 退出。"
 )]
 #[instrument(skip(state))]
 pub async fn computer_pod_resources_stream(
@@ -343,7 +342,9 @@ pub async fn computer_pod_resources_stream(
     );
 
     // 2. 采样循环:订阅驱动,断连即停(SSE drop 取消 stream future)
-    let tick_interval = std::time::Duration::from_secs(2);
+    let tick_interval = std::time::Duration::from_secs(
+        shared_types::computer_pod_resources_clamp_interval(params.interval_secs),
+    );
     let max_consecutive_failures: u32 = 15; // ~30s 全失败则关流,避免僵尸流
     let grpc_pool = state.grpc_pool.clone();
     let user_id = params.user_id.clone();
@@ -353,6 +354,9 @@ pub async fn computer_pod_resources_stream(
 
     let stream = async_stream::stream! {
         let mut consecutive_failures: u32 = 0;
+        // 最近一次成功采样看到的 agent 存在性:单次 tick 失败不能把活着的
+        // agent 报成已退出(采集降级 ≠ agent 退出),未知时为 None。
+        let mut last_agent_present: Option<bool> = None;
         loop {
             let tick = crate::grpc::status_query::query_container_status_with_options(
                 &grpc_pool,
@@ -368,6 +372,7 @@ pub async fn computer_pod_resources_stream(
             let event = match tick {
                 Ok(response) => {
                     consecutive_failures = 0;
+                    last_agent_present = response.agent_present;
                     serde_json::json!({
                         "ts": chrono::Utc::now().to_rfc3339(),
                         "container": {
@@ -378,7 +383,10 @@ pub async fn computer_pod_resources_stream(
                             "cpu_limit_cores": response.container_cpu_limit_cores,
                         },
                         "agent": {
-                            "alive": !response.cpu_percent.is_none() || !response.memory_mb.is_none(),
+                            // 存活用显式的 agent_present,不用资源字段推断:
+                            // 采集降级时 cpu_percent/memory_mb 同为 None,
+                            // 会把活着的 agent 显示成已退出。
+                            "alive": response.agent_present.unwrap_or(false),
                             "status": response.status,
                             "cpu_percent": response.cpu_percent,
                             "memory_mb": response.memory_mb,
@@ -426,7 +434,8 @@ pub async fn computer_pod_resources_stream(
                     serde_json::json!({
                         "ts": chrono::Utc::now().to_rfc3339(),
                         "container": {"alive": alive_at_open && consecutive_failures <= 1},
-                        "agent": {"alive": false},
+                        // 沿用上次已知值:一次查询失败不代表 agent 退出
+                        "agent": {"alive": last_agent_present},
                     })
                 }
             };

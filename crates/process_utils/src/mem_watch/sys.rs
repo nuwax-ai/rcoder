@@ -92,19 +92,18 @@ pub fn read_cmdline(_pid: u32) -> Vec<String> {
     Vec::new()
 }
 
-#[cfg(target_os = "linux")]
-fn read_u64_file(path: &str) -> Option<u64> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
-}
-
 /// 当前 cgroup 的内存用量（含 page cache）。
-pub fn read_memory_current() -> Option<u64> {
+///
+/// 必须传 [`cgroup::CgroupProbe`]：host cgroup namespace 下根路径是宿主整机
+/// 用量，拿它和容器限额比较会误杀（见 `cgroup` 模块文档）。
+pub fn read_memory_current(probe: &super::cgroup::CgroupProbe) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        read_u64_file(super::cgroup::MEMORY_CURRENT_PATH)
+        super::cgroup::read_u64(&probe.current_path())
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = probe;
         None
     }
 }
@@ -122,14 +121,15 @@ pub fn read_memory_max() -> Option<u64> {
     }
 }
 
-/// `memory.stat` 原文。
-pub fn read_memory_stat() -> Option<String> {
+/// `memory.stat` 原文（同样按 probe 定位的组读）。
+pub fn read_memory_stat(probe: &super::cgroup::CgroupProbe) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        std::fs::read_to_string(super::cgroup::MEMORY_STAT_PATH).ok()
+        std::fs::read_to_string(probe.stat_path()).ok()
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = probe;
         None
     }
 }

@@ -613,6 +613,11 @@ pub struct GetContainerStatusResponse {
     /// 会话工作负载 RSS（字节，看门狗可淘汰范围）
     #[prost(uint64, optional, tag = "16")]
     pub workload_rss_bytes: ::core::option::Option<u64>,
+    /// 当前 project 是否有已注册的 agent 执行（与资源采集是否降级无关）。
+    /// 观测端据此判断"agent 在不在"，不能用 cpu_percent/memory_mb 推断——
+    /// 那两个字段在采集降级时同样为 None，会把活着的 agent 显示成已退出。
+    #[prost(bool, optional, tag = "17")]
+    pub agent_present: ::core::option::Option<bool>,
 }
 /// 容器内单进程快照（资源观测用）
 #[allow(clippy::all)]

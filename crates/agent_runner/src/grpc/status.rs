@@ -2,8 +2,7 @@
 
 use shared_types::grpc::{
     ContainerProcess, GetContainerStatusRequest, GetContainerStatusResponse, GetStatusRequest,
-    GetStatusResponse,
-    GetVncStatusRequest, GetVncStatusResponse,
+    GetStatusResponse, GetVncStatusRequest, GetVncStatusResponse,
 };
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -172,6 +171,11 @@ pub async fn get_container_status(
             "Idle".to_string()
         };
 
+        // agent 执行是否存在的**显式**判断,与资源采集是否降级无关:
+        // cpu_percent/memory_mb 在 /proc 读取失败、采样间隔不足时同样为 None,
+        // 用它们推断"agent 活着"会把活着的 agent 显示成已退出。
+        let agent_present = AGENT_REGISTRY.contains_project(&req.project_id);
+
         let response = GetContainerStatusResponse {
             is_active,
             active_tasks,
@@ -189,6 +193,7 @@ pub async fn get_container_status(
             infra_rss_bytes,
             platform_rss_bytes,
             workload_rss_bytes,
+            agent_present: Some(agent_present),
         };
 
         debug!(
