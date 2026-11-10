@@ -26,17 +26,29 @@ const DEFAULT_SLOW_ROUND_THRESHOLD_SECS: u64 = 120;
 /// [TOOL] 骨架行里工具标题的截断长度（按字符数，中文安全）
 const TOOL_TITLE_MAX_CHARS: usize = 80;
 
-/// 轮次指标的 key：(project, session, request)。
+/// 轮次指标的 key：(project, session)。
 ///
-/// 只用 session_id 不够：PromptEnd 在 `await` 内部 notifier 之后才移除指标，
-/// 这期间同一 session 可能已开启下一轮（新 request）并插入新指标——
-/// 旧轮的结束事件会**取走新轮的指标**，把新轮的耗时/计数当成旧轮的打出来，
-/// 新轮自己的汇总则永久丢失。带上 request 身份后，结束事件只能移除自己的那条。
-type RoundKey = (String, String, String);
+/// **不要往 key 里加 request_id**：它来自两处且不可比——PromptStart 的
+/// request_id 取自 `prompt_request.meta`（rcoder 自己塞的，通常有值），
+/// 而 SessionUpdate 的 request_id 取自 **agent 通知的 `notification.meta`**，
+/// 底层 ACP agent 不透传它，基本恒为 `None`。用 request_id 做 key 会让
+/// start 与 update 永远匹配不上，chunk/tool 计数全部落空。
+///
+/// 跨轮污染改用**时间界**防：PromptEnd 在 `await` 内部 notifier 之后才移除
+/// 指标，这期间同一 session 可能已开启新一轮并插入更晚的指标。移除前比对
+/// 指标建立时刻与"本轮 end 开始的时刻"，只取属于自己的那条（见
+/// [`round_metrics_belong_to_round`]）。
+type RoundKey = (String, String);
 
-/// 把 request_id 归一化成 key 分量：`None` 时退化为空串（调用方未提供身份）。
-fn round_key_part(request_id: Option<&str>) -> String {
-    request_id.unwrap_or_default().to_owned()
+/// 本轮 end 是否该取走这条指标。
+///
+/// `started_at <= end_began_at` 才认：`end_began_at` 在 await 内部 notifier
+/// **之前**取，故 await 期间新轮 insert 的条目 `started_at` 更晚，不属于本轮，
+/// 不能被本次 end 取走（否则新轮的耗时/计数会被当成旧轮打出来，新轮自己的
+/// 汇总永久丢失）。
+#[inline]
+fn round_metrics_belong_to_round(started_at: Instant, end_began_at: Instant) -> bool {
+    started_at <= end_began_at
 }
 
 /// 单轮 prompt 的计时聚合指标。
@@ -160,12 +172,8 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
             project_id, session_id, request_id
         );
 
-        // 观测：开启新一轮计时（覆盖同 key 的异常残留；不同 request 互不干扰）
-        let key: RoundKey = (
-            project_id.to_owned(),
-            session_id.to_owned(),
-            round_key_part(request_id.as_deref()),
-        );
+        // 观测：开启新一轮计时（覆盖同 key 的异常残留）
+        let key: RoundKey = (project_id.to_owned(), session_id.to_owned());
         self.round_metrics.insert(key, RoundMetrics::new());
 
         // 1. 更新状态为 Active（在推送 SSE 之前）
@@ -202,6 +210,8 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
 
         // 1. 推送 SSE 消息（在恢复状态之前）
         let expected_request_id = request_id.clone();
+        // await 之前记下时刻：这期间同一 session 可能已开启新一轮。
+        let end_began_at = Instant::now();
         let result = self
             .inner
             .notify_prompt_end(
@@ -222,14 +232,12 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
         );
 
         // 3. 观测：输出轮次耗时汇总（业务完成后执行，失败只丢统计行）
-        // 按 (project, session, request) 精确移除：await 期间同一 session 可能
-        // 已开启下一轮，旧轮的结束事件不能取走新轮的指标。
-        let key: RoundKey = (
-            project_id.to_owned(),
-            session_id.to_owned(),
-            round_key_part(expected_request_id.as_deref()),
-        );
-        if let Some((_, m)) = self.round_metrics.remove(&key) {
+        // 只取"本轮 end 开始前就已存在"的指标：await 期间新轮 insert 的条目
+        // 建立时刻更晚，不属于本轮，不能被本次 end 取走。
+        let key: RoundKey = (project_id.to_owned(), session_id.to_owned());
+        if let Some((_, m)) = self.round_metrics.remove_if(&key, |_, m| {
+            round_metrics_belong_to_round(m.start, end_began_at)
+        }) {
             let duration = m.start.elapsed();
             let first_chunk = m
                 .first_chunk_at
@@ -299,12 +307,12 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
         );
 
         // 3. 观测：清理本轮计时（错误事件自身已由 error! 记录，不输出汇总）
-        let key: RoundKey = (
-            project_id.to_owned(),
-            session_id.to_owned(),
-            round_key_part(expected_request_id.as_deref()),
-        );
-        self.round_metrics.remove(&key);
+        // 同 PromptEnd：只清"本轮 error 开始前就已存在"的条目。
+        let key: RoundKey = (project_id.to_owned(), session_id.to_owned());
+        let error_began_at = Instant::now();
+        drop(self.round_metrics.remove_if(&key, |_, m| {
+            round_metrics_belong_to_round(m.start, error_began_at)
+        }));
 
         result
     }
@@ -326,13 +334,9 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
 
         // 观测：更新轮次指标 + 工具事件骨架行（只在委托前借用，不改变转发行为）
         use agent_client_protocol::schema::v1::SessionUpdate as Su;
-        // chunk/tool 事件归属哪一轮，由调用方传入的 request_id 决定：
-        // 与 PromptStart 用同一个 key，换代期间的迟到事件才可能错轮。
-        let key: RoundKey = (
-            project_id.to_owned(),
-            session_id.to_owned(),
-            round_key_part(request_id.as_deref()),
-        );
+        // 与 PromptStart 用同一个 key。不能用 request_id 归属：agent 通知的
+        // meta 里没有它（ACP agent 不透传），加了反而让 update 全部落空。
+        let key: RoundKey = (project_id.to_owned(), session_id.to_owned());
         match &session_update {
             Su::AgentMessageChunk(_) | Su::AgentThoughtChunk(_) => {
                 // 高频 chunk：只聚合计数，不打日志（避免日志洪流）
@@ -420,8 +424,9 @@ mod tests {
     use tokio::sync::mpsc;
 
     /// 测试用 key 构造（与生产的 (project, session, request) 三元组一致）。
-    fn key_of(project: &str, session: &str, request: &str) -> RoundKey {
-        (project.to_owned(), session.to_owned(), request.to_owned())
+    /// 测试用 key 构造（与生产的 (project, session) 二元组一致）。
+    fn key_of(project: &str, session: &str) -> RoundKey {
+        (project.to_owned(), session.to_owned())
     }
 
     // ---- registry stub ----
@@ -578,7 +583,7 @@ mod tests {
         {
             let m = n
                 .round_metrics
-                .get(&key_of("633", "ses_a", "req-1"))
+                .get(&key_of("633", "ses_a"))
                 .expect("metrics 存在");
             assert_eq!(m.chunks, 3);
             assert_eq!(m.tool_events, 2);
@@ -596,8 +601,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            !n.round_metrics
-                .contains_key(&key_of("633", "ses_a", "req-1")),
+            !n.round_metrics.contains_key(&key_of("633", "ses_a")),
             "PromptEnd 后 metrics 应被清理"
         );
     }
@@ -617,14 +621,13 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !n.round_metrics
-                .contains_key(&key_of("633", "ses_b", "req-1")),
+            !n.round_metrics.contains_key(&key_of("633", "ses_b")),
             "PromptError 后 metrics 应被清理"
         );
     }
 
     #[tokio::test]
-    async fn repeated_start_same_request_overwrites_previous_round() {
+    async fn repeated_start_overwrites_previous_round() {
         let n = notifier(120);
         n.notify_prompt_start("633", "ses_c", Some("req-1".into()))
             .await
@@ -639,99 +642,93 @@ mod tests {
 
         let m = n
             .round_metrics
-            .get(&key_of("633", "ses_c", "req-1"))
+            .get(&key_of("633", "ses_c"))
             .expect("metrics 存在");
         assert_eq!(m.chunks, 0, "重复 start 应重置计数");
         assert!(m.first_chunk_at.is_none());
     }
 
+    #[test]
+    fn round_metrics_belong_to_round_uses_time_boundary() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        let t2 = t1 + Duration::from_millis(5);
+        // 本轮 end 开始前建立的指标 → 属于本轮
+        assert!(round_metrics_belong_to_round(t0, t1));
+        assert!(round_metrics_belong_to_round(t1, t1), "同一时刻也算");
+        // await 期间新轮 insert 的指标 → 不属于本轮
+        assert!(!round_metrics_belong_to_round(t2, t1));
+    }
+
     #[tokio::test]
-    async fn late_end_does_not_take_new_round_metrics() {
-        // 跨请求污染反例：旧轮的 end 在 await 内部 notifier 之后才恢复，
-        // 这期间同一 session 已开启新轮。旧轮 end 只能移除自己的指标。
+    async fn end_does_not_take_metrics_created_after_it_began() {
+        // 场景：旧轮 end 在 await 内部 notifier 期间，同 session 已开启新一轮
+        // （新轮 insert 了更晚建立的指标）。旧轮 end 回来后不得取走它。
         let n = notifier(120);
-        n.notify_prompt_start("633", "ses_g", Some("req-old".into()))
+        n.notify_prompt_start("633", "ses_g", None).await.unwrap();
+        // 直接把指标替换成"更晚建立"的那条，模拟 await 期间发生的新轮
+        let late_start = Instant::now() + Duration::from_secs(1);
+        let mut replacement = RoundMetrics::new();
+        replacement.start = late_start;
+        replacement.chunks = 7;
+        n.round_metrics.insert(key_of("633", "ses_g"), replacement);
+
+        let end_began_at = Instant::now();
+        let removed = n.round_metrics.remove_if(&key_of("633", "ses_g"), |_, m| {
+            round_metrics_belong_to_round(m.start, end_began_at)
+        });
+        assert!(removed.is_none(), "更晚建立的指标不能被本轮 end 取走");
+        let kept = n
+            .round_metrics
+            .get(&key_of("633", "ses_g"))
+            .expect("新轮指标必须保留");
+        assert_eq!(kept.chunks, 7, "新轮计数不得被清掉");
+    }
+
+    #[tokio::test]
+    async fn normal_round_still_prints_and_clears() {
+        // 常规路径不受影响：没有换代时 end 照旧取走并清掉本轮指标
+        let n = notifier(120);
+        n.notify_prompt_start("633", "ses_i", None).await.unwrap();
+        n.notify_session_update("633", "ses_i", chunk_update("输出"), None)
             .await
             .unwrap();
-        n.notify_session_update(
-            "633",
-            "ses_g",
-            chunk_update("旧轮输出"),
-            Some("req-old".into()),
-        )
-        .await
-        .unwrap();
-
-        // 换代：新轮开启并产生自己的指标
-        n.notify_prompt_start("633", "ses_g", Some("req-new".into()))
+        n.notify_prompt_end("633", "ses_i", StopReason::EndTurn, None, None)
             .await
             .unwrap();
-        n.notify_session_update(
-            "633",
-            "ses_g",
-            chunk_update("新轮输出"),
-            Some("req-new".into()),
-        )
-        .await
-        .unwrap();
-
-        // 旧轮的结束事件迟到
-        n.notify_prompt_end(
-            "633",
-            "ses_g",
-            StopReason::EndTurn,
-            None,
-            Some("req-old".into()),
-        )
-        .await
-        .unwrap();
-
-        {
-            let m = n
-                .round_metrics
-                .get(&key_of("633", "ses_g", "req-new"))
-                .expect("新轮指标必须保留");
-            assert_eq!(m.chunks, 1, "旧轮 end 取走了新轮的 chunk 计数");
-            assert!(
-                m.first_chunk_at.is_some(),
-                "旧轮 end 清掉了新轮的首 token 时刻"
-            );
-        }
         assert!(
-            !n.round_metrics
-                .contains_key(&key_of("633", "ses_g", "req-old")),
-            "旧轮指标应被自己的 end 清掉"
+            !n.round_metrics.contains_key(&key_of("633", "ses_i")),
+            "end 后本轮指标必须被清掉"
         );
     }
 
     #[tokio::test]
-    async fn late_error_does_not_take_new_round_metrics() {
+    async fn updates_count_without_request_id() {
+        // 回归：agent 通知不透传 request_id（恒为 None），chunk/tool 计数
+        // 仍必须按 session 归属计上——不能因为 request_id 缺失就落空。
         let n = notifier(120);
-        n.notify_prompt_start("633", "ses_h", Some("req-old".into()))
+        n.notify_prompt_start("633", "ses_j", Some("req-1".into()))
             .await
             .unwrap();
-        n.notify_prompt_start("633", "ses_h", Some("req-new".into()))
+        n.notify_session_update("633", "ses_j", chunk_update("输出"), None)
             .await
             .unwrap();
-        n.notify_session_update("633", "ses_h", chunk_update("新轮"), Some("req-new".into()))
-            .await
-            .unwrap();
-
-        let err = agent_client_protocol::schema::v1::Error::new(-32000, "boom");
-        n.notify_prompt_error("633", "ses_h", err, Some("req-old".into()))
-            .await
-            .unwrap();
-
-        assert!(
-            !n.round_metrics
-                .contains_key(&key_of("633", "ses_h", "req-old")),
-            "旧轮指标应被自己的 error 清掉"
-        );
+        n.notify_session_update(
+            "633",
+            "ses_j",
+            Su::ToolCall(ToolCall::new("call-1", "Bash")),
+            None,
+        )
+        .await
+        .unwrap();
         let m = n
             .round_metrics
-            .get(&key_of("633", "ses_h", "req-new"))
-            .expect("新轮指标必须保留");
-        assert_eq!(m.chunks, 1);
+            .get(&key_of("633", "ses_j"))
+            .expect("metrics 存在");
+        assert_eq!(m.chunks, 1, "request_id 为 None 的 update 也必须计数");
+        assert_eq!(m.tool_events, 1);
+        assert!(m.first_chunk_at.is_some());
+        assert!(m.first_tool_at.is_some());
     }
 
     #[tokio::test]
@@ -744,10 +741,7 @@ mod tests {
         n.notify_prompt_end("633", "ses_d", StopReason::EndTurn, None, None)
             .await
             .unwrap();
-        assert!(
-            !n.round_metrics
-                .contains_key(&key_of("633", "ses_d", "req-1"))
-        );
+        assert!(!n.round_metrics.contains_key(&key_of("633", "ses_d")));
     }
 
     #[tokio::test]
@@ -769,10 +763,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            !n.round_metrics
-                .contains_key(&key_of("633", "ses_e", "req-1"))
-        );
+        assert!(!n.round_metrics.contains_key(&key_of("633", "ses_e")));
     }
 
     #[tokio::test]
@@ -793,7 +784,7 @@ mod tests {
         {
             let m = n
                 .round_metrics
-                .get(&key_of("633", "ses_f", "req-1"))
+                .get(&key_of("633", "ses_f"))
                 .expect("metrics 存在");
             assert_eq!(m.chunks, 0, "用户输入回显不应计入 LLM 输出");
             assert!(m.first_chunk_at.is_none(), "first_chunk 不得被用户输入污染");
@@ -804,7 +795,7 @@ mod tests {
             .unwrap();
         let m = n
             .round_metrics
-            .get(&key_of("633", "ses_f", "req-1"))
+            .get(&key_of("633", "ses_f"))
             .expect("metrics 存在");
         assert_eq!(m.chunks, 1);
         assert!(m.first_chunk_at.is_some());

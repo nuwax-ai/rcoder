@@ -375,7 +375,7 @@ mod tests {
         let baseline = get_active_tasks_count(0);
         AGENT_REGISTRY.set_pending(&project);
         assert!(
-            get_active_tasks_count(0) >= baseline + 1,
+            get_active_tasks_count(0) > baseline,
             "pending preparation 必须让容器保持活跃"
         );
         AGENT_REGISTRY.clear_pending_if_exists(&project);
