@@ -5400,6 +5400,10 @@ mod activation_final_query_identity_tests {
         restart: bool,
         replay: bool,
     ) {
+        // 本组用例的前提是"未配置平台镜像"：配了平台镜像时 start 会走 restart
+        // （换镜像必须重启）。env 是进程级的，先跑过的用例可能已设置它，
+        // 这里显式清掉，避免结论随执行顺序漂移。
+        crate::test_support::clear_runtime_image_env();
         let directory = tempfile::tempdir().expect("directory");
         let (service, runtime) = created_app_service(directory.path(), "activationquery").await;
         let before = service.get_lifecycle("activationquery").await.unwrap();
