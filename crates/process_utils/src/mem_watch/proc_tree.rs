@@ -93,6 +93,25 @@ pub fn descendants(table: &HashMap<u32, ProcInfo>, root: u32) -> HashSet<u32> {
     seen
 }
 
+/// 看门狗的淘汰范围：`roots` 的后代，排除 PID 1、root 自身与受保护进程。
+///
+/// **选 victim 与资源接口打标签共用这一个函数**，保证"标成可淘汰"和"真会被杀"
+/// 永远一致。此前资源接口用 comm/args 允许名单猜角色，`python3 -m websockify`
+/// 这类 comm 与真实服务名不同的进程会被误标成"可淘汰"——标签错了比没有标签
+/// 更糟，会让人以为看门狗会杀远程桌面服务。
+pub fn evictable_scope(
+    table: &HashMap<u32, ProcInfo>,
+    roots: &[u32],
+    protected: &HashSet<u32>,
+) -> HashSet<u32> {
+    let mut scope: HashSet<u32> = HashSet::new();
+    for root in roots {
+        scope.extend(descendants(table, *root));
+    }
+    scope.retain(|pid| *pid != 1 && !roots.contains(pid) && !protected.contains(pid));
+    scope
+}
+
 /// 被选中的淘汰目标。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Victim {
@@ -124,10 +143,7 @@ pub fn select_victim(
     protected: &HashSet<u32>,
     min_rss: u64,
 ) -> Option<Victim> {
-    let mut scope: HashSet<u32> = HashSet::new();
-    for root in roots {
-        scope.extend(descendants(table, *root));
-    }
+    let scope = evictable_scope(table, roots, protected);
 
     let mut best: Option<&ProcInfo> = None;
     for pid in scope {
@@ -272,6 +288,46 @@ mod tests {
         table.insert(1, info(1, 2, 0, 0));
         table.insert(2, info(2, 1, 0, 0));
         drop(descendants(&table, 1));
+    }
+
+    #[test]
+    fn evictable_scope_matches_select_victim_scope() {
+        // 标签与选 victim 必须同源:同一个表,evictable_scope 里的候选
+        // 就是 select_victim 能选中的范围。
+        let mut table = HashMap::new();
+        table.insert(1, info(1, 0, 0, 0)); // PID 1
+        table.insert(10, info(10, 1, 0, 0)); // root
+        table.insert(11, info(11, 10, 800 * 1024 * 1024, 0)); // 树内大进程
+        table.insert(12, info(12, 10, 100 * 1024 * 1024, 0)); // 树内小进程
+        table.insert(13, info(13, 1, 900 * 1024 * 1024, 0)); // 树外(别的会话)
+
+        let protected = HashSet::new();
+        let scope = evictable_scope(&table, &[10], &protected);
+        assert_eq!(scope, HashSet::from([11, 12]), "只含 root 的后代");
+        assert!(!scope.contains(&1), "PID 1 永不淘汰");
+        assert!(!scope.contains(&10), "root 自身永不淘汰");
+        assert!(!scope.contains(&13), "树外进程永不淘汰");
+
+        // select_victim 只能从 scope 里选
+        let victim = select_victim(&table, &[10], &protected, 64 * 1024 * 1024).unwrap();
+        assert!(scope.contains(&victim.pid), "victim 必须落在 scope 内");
+    }
+
+    #[test]
+    fn evictable_scope_excludes_protected_and_reused() {
+        let mut table = HashMap::new();
+        table.insert(10, info(10, 1, 0, 0));
+        table.insert(11, info(11, 10, 800 * 1024 * 1024, 0)); // 受保护
+        table.insert(12, info(12, 10, 700 * 1024 * 1024, 0)); // 可淘汰
+
+        let protected = HashSet::from([11u32]);
+        assert_eq!(
+            evictable_scope(&table, &[10], &protected),
+            HashSet::from([12u32]),
+            "受保护进程必须排除"
+        );
+        // 没有 root 时没有任何可淘汰范围
+        assert!(evictable_scope(&table, &[], &protected).is_empty());
     }
 
     #[test]

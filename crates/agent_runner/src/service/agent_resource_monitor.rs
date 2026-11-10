@@ -408,41 +408,6 @@ impl ProcessRole {
     }
 }
 
-/// 桌面/系统基础设施(按 comm 判定,永不入选淘汰范围)
-const INFRA_COMMS: &[&str] = &[
-    "Xvnc",
-    "Xvfb",
-    "Xorg",
-    "xfce4-session",
-    "xfwm4",
-    "xfdesktop",
-    "xfce4-panel",
-    "xfsettingsd",
-    "xfconfd",
-    "fcitx5",
-    "dbus-daemon",
-    "dbus-launch",
-    "pulseaudio",
-    "pipewire",
-    "websockify",
-    "systemd",
-    "init",
-    "tini",
-    "gvfsd",
-    "gvfsd-trash",
-    "dconf-service",
-    "polkitd",
-    "upowerd",
-    "colord",
-    "udisksd",
-    "gpg-agent",
-    "ssh-agent",
-    "rtkit-daemon",
-    "accounts-daemon",
-    "Thunar",
-    "gjs",
-];
-
 /// 平台服务标记(args 命中即 platform;claude 本体的安装路径也在 acp-ts 包下)
 const PLATFORM_ARGS_MARKERS: &[&str] = &[
     "nuwax-file-server",
@@ -480,12 +445,16 @@ pub struct ProcessGroups {
 
 /// 采集容器内全部进程明细并按角色分类。
 ///
-/// `self_pid`: 采集进程自身(agent_runner),标记为 platform 且不重复计入。
-/// 进程命令行逐个读取并**脱敏**后截断到 120 字符;角色分类用未脱敏的原始
-/// 命令行(脱敏可能抹掉分类标记),原始串不外泄。
+/// 角色语义与看门狗**淘汰范围**严格对齐(共用 `mem_watch::evictable_pids`):
+/// - `workload` 会话工作负载 = 在淘汰范围内 → 可能被杀;
+/// - `platform` 平台服务 / `infra` 系统其他 = 不在范围内 → 永不淘汰。
+/// 进程命令行逐个读取并**脱敏**后截断到 120 字符;平台判定用未脱敏的原始
+/// 命令行(脱敏会抹掉标记),原始串不外泄。
 #[cfg(target_os = "linux")]
 pub fn collect_container_processes() -> Vec<ProcessRow> {
     let table = process_utils::proc_scan::snapshot();
+    // 淘汰范围只算一次:与看门狗选 victim 同一口径(见 mem_watch::evictable_pids)
+    let evictable = process_utils::mem_watch::evictable_pids(&table);
     let mut rows: Vec<ProcessRow> = Vec::with_capacity(table.len());
     let tps = procfs::ticks_per_second().max(1) as f64;
     for (pid, info) in &table {
@@ -495,7 +464,7 @@ pub fn collect_container_processes() -> Vec<ProcessRow> {
         let raw_args = read_cmdline_args(*pid);
         let raw_joined = raw_args.join(" ");
         // 分类用原始串:脱敏会抹掉 --token 这类标记,导致平台服务被误判为负载
-        let role = classify(&info.comm, &raw_joined, *pid);
+        let role = classify(&info.comm, &raw_joined, evictable.contains(pid));
         let args_head = redact_cmdline(&raw_args);
         rows.push(ProcessRow {
             pid: *pid,
@@ -670,18 +639,26 @@ fn redact_cmdline(_args: &[String]) -> String {
 }
 
 /// 角色分类(纯函数,跨平台可测)。
+/// 角色分类。`evictable` = 该 pid 在**看门狗的淘汰范围内**
+/// (`mem_watch::evictable_pids`,即已注册 agent 命令树的后代且未受保护)。
+///
+/// 顺序很重要:先判 evictable。标签必须与看门狗行为一致——标成"可淘汰"却
+/// 杀不掉,或反过来把不杀的标成可淘汰,都会误导人。因此"是不是负载"只由
+/// 进程树决定,comm/args 只用于区分**不会**被淘汰的进程属于哪一类。
+///
+/// 曾经用 comm 允许名单判 infra,但 `python3 -m websockify` 的 comm 是
+/// `python3`,名单里的 "websockify" 永远命中不了,远程桌面服务被误标成
+/// "可淘汰"。现在 comm 不再参与判定。
 #[cfg(any(target_os = "linux", test))]
-fn classify(comm: &str, args_head: &str, pid: u32) -> ProcessRole {
-    if pid == std::process::id() {
-        return ProcessRole::Platform; // agent_runner 自身(采集方)
-    }
-    if INFRA_COMMS.contains(&comm) {
-        return ProcessRole::Infra;
+fn classify(comm: &str, args_head: &str, evictable: bool) -> ProcessRole {
+    let _ = comm; // comm 不可用于身份判断(会截断),也不再用于分类
+    if evictable {
+        return ProcessRole::Workload;
     }
     if PLATFORM_ARGS_MARKERS.iter().any(|m| args_head.contains(m)) {
         return ProcessRole::Platform;
     }
-    ProcessRole::Workload
+    ProcessRole::Infra
 }
 
 /// 分组聚合。
@@ -1213,12 +1190,55 @@ mod tests {
 
     #[test]
     fn classify_uses_raw_args_not_redacted() {
-        // 平台标记出现在被脱敏的参数里时,分类仍必须认出来
+        // 平台标记出现在被脱敏的参数里时,平台判定仍必须认出来
         // (脱敏只作用于输出,不作用于分类)
         let raw = args(&["node", "mcp-proxy", "--token=sk-ant-AbCdEf123456GhIjKlMn"]);
-        assert_eq!(classify("node", &raw.join(" "), 999), ProcessRole::Platform);
+        assert_eq!(
+            classify("node", &raw.join(" "), false),
+            ProcessRole::Platform
+        );
         let redacted = redact_cmdline(&raw);
         assert!(redacted.contains("mcp-proxy"), "脱敏不应抹掉非敏感参数");
         assert!(!redacted.contains("sk-ant-"), "凭据必须被掩");
+    }
+
+    #[test]
+    fn remote_desktop_service_is_never_labelled_workload() {
+        // 反例(用户实拍发现):`python3 -m websockify` 的 comm 是 `python3`,
+        // 旧的 comm 允许名单里的 "websockify" 永远命中不了,于是远程桌面服务
+        // 被标成"可淘汰"。现在 comm 不参与判定,树外进程一律不淘汰。
+        let cmd = "python3 -m websockify --web /opt/noVNC 6080 localhost:5900 --heartbeat 30";
+        assert_eq!(classify("python3", cmd, false), ProcessRole::Infra);
+        // 同理:Xvnc 的桌面子进程、xfce 面板等都不该是负载
+        for cmd in [
+            "Xvnc :0 -geometry 1400x1050",
+            "xfce4-panel",
+            "fcitx5 -d --replace",
+            "/usr/bin/python3 /share/system-config-printer/applet.py",
+        ] {
+            assert_eq!(
+                classify("python3", cmd, false),
+                ProcessRole::Infra,
+                "树外进程必须不淘汰: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn workload_label_follows_the_watchdog_scope_only() {
+        // "可淘汰"只由进程树决定:同一个 websockify 命令行,在淘汰范围内就是
+        // Workload(看门狗真会杀),不在就不是。标签与行为必须一致。
+        let cmd = "python3 -m websockify --web /opt/noVNC 6080 localhost:5900";
+        assert_eq!(classify("python3", cmd, true), ProcessRole::Workload);
+        assert_eq!(classify("python3", cmd, false), ProcessRole::Infra);
+        // comm 是什么都不影响:node 既可能是平台也可能是负载
+        assert_eq!(
+            classify("node", "node /usr/local/bin/mcp-proxy", false),
+            ProcessRole::Platform
+        );
+        assert_eq!(
+            classify("node", "node /usr/local/bin/mcp-proxy", true),
+            ProcessRole::Workload
+        );
     }
 }

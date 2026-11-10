@@ -271,6 +271,28 @@ async fn step(
     });
 }
 
+/// 当前看门狗真正能淘汰的 pid 集合。
+///
+/// 与 [`crate::mem_watch::sampler`] 选 victim 用的是同一条路：解析全局注册表
+/// → 取 root → 算 protected → [`proc_tree::evictable_scope`]。资源接口
+/// (`/computer/pod/resources` 的进程明细)用它给"会话工作负载"打标签，
+/// 因此标签与看门狗行为严格一致。
+///
+/// 看门狗未安装、或没有任何已注册会话时返回空集——此时"没有可淘汰范围"
+/// 是事实，不该把进程猜成负载。
+pub fn evictable_pids(table: &HashMap<u32, ProcInfo>) -> HashSet<u32> {
+    let Some(reg) = registry::global() else {
+        return HashSet::new();
+    };
+    let roots = reg.all();
+    if roots.is_empty() {
+        return HashSet::new();
+    }
+    let root_pids: Vec<u32> = roots.iter().map(|root| root.pid).collect();
+    let protected = protected_set(&roots, table);
+    super::proc_tree::evictable_scope(table, &root_pids, &protected)
+}
+
 /// 永不入选的进程：PID 1、所有会话的启动窗口快照、以及 exe 命中规则的进程。
 fn protected_set(roots: &[Arc<Root>], table: &HashMap<u32, ProcInfo>) -> HashSet<u32> {
     let mut protected: HashSet<u32> = HashSet::from([1u32]);
@@ -308,8 +330,10 @@ mod tests {
     fn scope_ok_rejects_mismatched_limit_override() {
         // host cgroupns 误杀的防线:覆盖限额与实测 memory.max 不一致 → 拒绝淘汰
         let p = probe(Some(4 << 30), None);
-        let mut cfg = Config::default();
-        cfg.limit_override = Some(512 << 20);
+        let cfg = Config {
+            limit_override: Some(512 << 20),
+            ..Config::default()
+        };
         let mut warned = false;
         assert!(
             !scope_ok(&cfg, &p, 512 << 20, &mut warned),
@@ -326,16 +350,18 @@ mod tests {
     #[test]
     fn scope_ok_accepts_matching_override_and_no_override() {
         let p = probe(Some(4 << 30), None);
-        let mut cfg = Config::default();
 
         // 无覆盖:限额本就来自本组,天然同源
-        cfg.limit_override = None;
+        let cfg = Config::default();
         let mut w = false;
         assert!(scope_ok(&cfg, &p, 4 << 30, &mut w));
         assert!(!w, "无需告警");
 
         // 覆盖值与实测一致:放行
-        cfg.limit_override = Some(4 << 30);
+        let cfg = Config {
+            limit_override: Some(4 << 30),
+            ..Config::default()
+        };
         let mut w = false;
         assert!(scope_ok(&cfg, &p, 4 << 30, &mut w));
         assert!(!w);
@@ -344,8 +370,10 @@ mod tests {
     #[test]
     fn scope_ok_rejects_unresolved_probe() {
         let broken = probe(None, Some("cannot read /proc/self/cgroup"));
-        let mut cfg = Config::default();
-        cfg.limit_override = Some(4 << 30);
+        let cfg = Config {
+            limit_override: Some(4 << 30),
+            ..Config::default()
+        };
         let mut warned = false;
         assert!(
             !scope_ok(&cfg, &broken, 4 << 30, &mut warned),
@@ -359,8 +387,7 @@ mod tests {
         // 没有覆盖时不存在"两个来源",即使传入的 limit 与实测不同也放行
         // (该 limit 就是从本组读出来的)
         let p = probe(Some(4 << 30), None);
-        let mut cfg = Config::default();
-        cfg.limit_override = None;
+        let cfg = Config::default();
         let mut warned = false;
         assert!(scope_ok(&cfg, &p, 1 << 30, &mut warned));
         assert!(!warned);
