@@ -514,6 +514,8 @@ pub struct ComputerProcessEntry {
     pub comm: String,
     /// RSS(MB)
     pub rss_mb: f64,
+    /// 累计 CPU 时间(秒,utime+stime;前端按采样差分得 CPU%)
+    pub cpu_seconds: f64,
     /// 角色分组: infra | platform | workload
     pub group: String,
     /// 命令行前缀(≤120 字符)

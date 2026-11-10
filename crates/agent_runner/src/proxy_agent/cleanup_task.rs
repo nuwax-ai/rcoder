@@ -166,7 +166,8 @@ impl AgentCleaner {
         let registry_stats = AGENT_REGISTRY.stats();
         let total_agents = registry_stats.agent_count;
 
-        info!(
+        // 每分钟一次的例行心跳行,降为 debug 避免刷屏
+        debug!(
             "Starting cleanup for idle agents and SSE messages, current_time: {}, active_agent_count: {}",
             current_time, total_agents
         );

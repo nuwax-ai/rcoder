@@ -207,6 +207,7 @@ pub async fn computer_pod_resources(
                 pid: p.pid,
                 comm: p.comm.clone(),
                 rss_mb: p.rss_bytes as f64 / 1_048_576.0,
+                cpu_seconds: p.cpu_seconds,
                 group: p.group.clone(),
                 args_head: (!p.args_head.is_empty()).then(|| p.args_head.clone()),
             })
@@ -395,6 +396,7 @@ pub async fn computer_pod_resources_stream(
                                             "pid": p.pid,
                                             "comm": p.comm,
                                             "rss_mb": p.rss_bytes as f64 / 1_048_576.0,
+                                            "cpu_seconds": p.cpu_seconds,
                                             "group": p.group,
                                         })
                                     })

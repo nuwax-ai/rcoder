@@ -10,11 +10,61 @@
 use agent_abstraction::SessionNotifier;
 use agent_abstraction::traits::SessionRegistry;
 use async_trait::async_trait;
+use dashmap::DashMap;
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use std::time::{Duration, Instant};
+use tracing::{debug, error, info, warn};
 
 use super::session_notifier::SseSessionNotifier;
 use shared_types::{AgentStatus, SessionNotify};
+
+/// 默认慢轮阈值（秒）：轮次耗时超过该值时 [ROUND] 汇总升级为 WARN。
+/// 后续如需可配置，通过 [`StateAwareNotifier::with_slow_round_threshold_secs`] 接线 config。
+const DEFAULT_SLOW_ROUND_THRESHOLD_SECS: u64 = 120;
+
+/// [TOOL] 骨架行里工具标题的截断长度（按字符数，中文安全）
+const TOOL_TITLE_MAX_CHARS: usize = 80;
+
+/// 单轮 prompt 的计时聚合指标。
+///
+/// ACP 语义下一 session 同时只有一个活跃 prompt（串行），
+/// 因此按 session_id 建 key：PromptStart 覆盖插入，PromptEnd/PromptError 移除。
+/// 异常路径残留（start 后无 end/error）会被同 session 下一轮 PromptStart 覆盖，
+/// 量级上界 = 异常 session 数，无需额外清理任务。
+#[derive(Debug, Clone)]
+struct RoundMetrics {
+    start: Instant,
+    /// 首个 AgentMessageChunk 时刻 → LLM 首 token 延迟代理指标（对所有 acp agent 通用）
+    first_chunk_at: Option<Instant>,
+    /// 首个 ToolCall 时刻
+    first_tool_at: Option<Instant>,
+    /// chunk 事件计数（只计数不打内容，避免高频日志洪流）
+    chunks: u64,
+    /// 工具事件计数（ToolCall + ToolCallUpdate）
+    tool_events: u64,
+}
+
+impl RoundMetrics {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            first_chunk_at: None,
+            first_tool_at: None,
+            chunks: 0,
+            tool_events: 0,
+        }
+    }
+}
+
+/// 截断长文本用于日志（按字符数截断，多字节安全）
+fn brief(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        s.to_owned()
+    } else {
+        format!("{}…(+{})", s.chars().take(max).collect::<String>(), n - max)
+    }
+}
 
 /// 状态感知的 SessionNotifier 包装器
 ///
@@ -35,6 +85,11 @@ pub struct StateAwareNotifier<R: SessionRegistry> {
     inner: Arc<SseSessionNotifier>,
     /// 通过 trait 引用操作注册表，不直接依赖 AGENT_REGISTRY
     registry: Arc<R>,
+    /// 每会话当前轮次的计时聚合指标（纯观测，不参与任何业务判断）。
+    /// 仅单 key get_mut/insert/remove 短临界区，无嵌套锁、无跨锁调用。
+    round_metrics: DashMap<String, RoundMetrics>,
+    /// 慢轮判定阈值，超过则 [ROUND] 汇总行升级为 WARN
+    slow_round_threshold: Duration,
 }
 
 impl<R: SessionRegistry> StateAwareNotifier<R> {
@@ -43,9 +98,16 @@ impl<R: SessionRegistry> StateAwareNotifier<R> {
     /// # Arguments
     /// * `registry` - SessionRegistry trait 引用，用于更新 agent 状态
     pub fn new(registry: Arc<R>) -> Self {
+        Self::with_slow_round_threshold_secs(registry, DEFAULT_SLOW_ROUND_THRESHOLD_SECS)
+    }
+
+    /// 以自定义慢轮阈值创建实例（预留 config 接线，当前调用方使用 [`Self::new`]）
+    pub fn with_slow_round_threshold_secs(registry: Arc<R>, threshold_secs: u64) -> Self {
         Self {
             inner: Arc::new(SseSessionNotifier::new()),
             registry,
+            round_metrics: DashMap::new(),
+            slow_round_threshold: Duration::from_secs(threshold_secs),
         }
     }
 
@@ -90,6 +152,10 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
             "📨 Project[{}] sending SessionPromptStart notification, session_id={}, request_id={:?}",
             project_id, session_id, request_id
         );
+
+        // 观测：开启新一轮计时（同 session 串行，覆盖任何异常残留）
+        self.round_metrics
+            .insert(session_id.to_owned(), RoundMetrics::new());
 
         // 1. 更新状态为 Active（在推送 SSE 之前）
         self.update_agent_status(
@@ -144,6 +210,35 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
             AgentStatus::Idle,
         );
 
+        // 3. 观测：输出轮次耗时汇总（业务完成后执行，失败只丢统计行）
+        if let Some((_, m)) = self.round_metrics.remove(session_id) {
+            let duration = m.start.elapsed();
+            let first_chunk = m
+                .first_chunk_at
+                .map(|t| (t - m.start).as_secs_f64())
+                .map(|s| format!("{:.1}s", s))
+                .unwrap_or_else(|| "-".to_owned());
+            let first_tool = m
+                .first_tool_at
+                .map(|t| (t - m.start).as_secs_f64())
+                .map(|s| format!("{:.1}s", s))
+                .unwrap_or_else(|| "-".to_owned());
+            let line = format!(
+                "[ROUND] project={} session={} duration={:.1}s first_chunk={} first_tool={} chunks={} tools={} stop={:?}",
+                project_id, session_id, duration.as_secs_f64(), first_chunk, first_tool,
+                m.chunks, m.tool_events, stop_reason
+            );
+            if duration >= self.slow_round_threshold {
+                warn!(
+                    "{} ⚠ SLOW ROUND (threshold={}s)",
+                    line,
+                    self.slow_round_threshold.as_secs()
+                );
+            } else {
+                info!("{}", line);
+            }
+        }
+
         result
     }
 
@@ -179,6 +274,9 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
             AgentStatus::Idle,
         );
 
+        // 3. 观测：清理本轮计时（错误事件自身已由 error! 记录，不输出汇总）
+        self.round_metrics.remove(session_id);
+
         result
     }
 
@@ -196,6 +294,51 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
             "🔄 Project[{}] sending SessionUpdate notification, session_id={}",
             project_id, session_id
         );
+
+        // 观测：更新轮次指标 + 工具事件骨架行（只在委托前借用，不改变转发行为）
+        use agent_client_protocol::schema::v1::SessionUpdate as Su;
+        match &session_update {
+            Su::AgentMessageChunk(_) | Su::UserMessageChunk(_) | Su::AgentThoughtChunk(_) => {
+                // 高频 chunk：只聚合计数，不打日志（避免日志洪流）
+                if let Some(mut m) = self.round_metrics.get_mut(session_id) {
+                    m.chunks += 1;
+                    if m.first_chunk_at.is_none() {
+                        m.first_chunk_at = Some(Instant::now());
+                    }
+                }
+            }
+            Su::ToolCall(tc) => {
+                if let Some(mut m) = self.round_metrics.get_mut(session_id) {
+                    m.tool_events += 1;
+                    if m.first_tool_at.is_none() {
+                        m.first_tool_at = Some(Instant::now());
+                    }
+                }
+                debug!(
+                    "[TOOL] project={} session={} call={} tool={:?} kind={:?} status={:?} title={}",
+                    project_id,
+                    session_id,
+                    tc.tool_call_id.0.as_ref(),
+                    tc.name,
+                    tc.kind,
+                    tc.status,
+                    brief(&tc.title, TOOL_TITLE_MAX_CHARS)
+                );
+            }
+            Su::ToolCallUpdate(u) => {
+                if let Some(mut m) = self.round_metrics.get_mut(session_id) {
+                    m.tool_events += 1;
+                }
+                debug!(
+                    "[TOOL] project={} session={} call={} status={:?}",
+                    project_id,
+                    session_id,
+                    u.tool_call_id.0.as_ref(),
+                    u.fields.status
+                );
+            }
+            _ => {}
+        }
 
         // 委托给内部 notifier，不更新状态
         self.inner
@@ -221,3 +364,232 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
         self.inner.notify(project_id, session_id, notify).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_client_protocol::schema::v1::{
+        ContentChunk, PromptRequest, SessionId as AcpSessionId, StopReason, ToolCall,
+        ToolCallUpdate, ToolCallUpdateFields,
+    };
+    use agent_client_protocol::schema::v1::SessionUpdate as Su;
+    use dashmap::mapref::entry::Entry;
+    use shared_types::{AgentLifecycle, CancelNotificationRequestWrapper, ModelProviderConfig, SessionEntry};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::mpsc;
+
+    // ---- brief() ----
+
+    #[test]
+    fn brief_keeps_short_text() {
+        assert_eq!(brief("hello", 80), "hello");
+    }
+
+    #[test]
+    fn brief_exact_max_unchanged() {
+        let s = "a".repeat(80);
+        assert_eq!(brief(&s, 80), s);
+    }
+
+    #[test]
+    fn brief_truncates_long_text() {
+        let s = "a".repeat(100);
+        assert_eq!(brief(&s, 80), format!("{}…(+20)", "a".repeat(80)));
+    }
+
+    #[test]
+    fn brief_counts_chars_not_bytes() {
+        // 90 个中文字符（270 字节）→ 截到 80 字符
+        let s = "招".repeat(90);
+        let out = brief(&s, 80);
+        assert_eq!(out.chars().count(), 86); // 80 个中文 + … + "(+10)" 5 字符
+        assert!(out.contains("…(+10)"));
+    }
+
+    #[test]
+    fn brief_empty_string() {
+        assert_eq!(brief("", 80), "");
+    }
+
+    // ---- registry stub ----
+
+    struct StubEntry {
+        project_id: String,
+        session_id: AcpSessionId,
+        prompt_tx: mpsc::Sender<PromptRequest>,
+        cancel_tx: mpsc::Sender<CancelNotificationRequestWrapper>,
+        status: AgentStatus,
+    }
+
+    impl Clone for StubEntry {
+        fn clone(&self) -> Self {
+            Self {
+                project_id: self.project_id.clone(),
+                session_id: AcpSessionId::new(self.session_id.0.as_ref()),
+                prompt_tx: self.prompt_tx.clone(),
+                cancel_tx: self.cancel_tx.clone(),
+                status: self.status.clone(),
+            }
+        }
+    }
+
+    impl SessionEntry for StubEntry {
+        fn project_id(&self) -> &str {
+            &self.project_id
+        }
+        fn session_id(&self) -> &AcpSessionId {
+            &self.session_id
+        }
+        fn prompt_tx(&self) -> &mpsc::Sender<PromptRequest> {
+            &self.prompt_tx
+        }
+        fn cancel_tx(&self) -> &mpsc::Sender<CancelNotificationRequestWrapper> {
+            &self.cancel_tx
+        }
+        fn model_provider(&self) -> Option<&ModelProviderConfig> {
+            None
+        }
+        fn lifecycle_handle(&self) -> Option<&Arc<dyn AgentLifecycle>> {
+            None
+        }
+        fn status(&self) -> &AgentStatus {
+            &self.status
+        }
+        fn is_channel_closed(&self) -> bool {
+            false
+        }
+        fn is_model_config_changed(&self, _new: &Option<ModelProviderConfig>) -> bool {
+            false
+        }
+    }
+
+    #[derive(Default)]
+    struct StubRegistry {
+        entries: DashMap<String, StubEntry>,
+        routes: DashMap<String, String>,
+        status_updates: AtomicUsize,
+    }
+
+    impl SessionRegistry for StubRegistry {
+        type Entry = StubEntry;
+
+        fn get(&self, project_id: &str) -> Option<StubEntry> {
+            self.entries.get(project_id).map(|e| e.clone())
+        }
+        fn insert(&self, project_id: &str, session_id: &str, entry: StubEntry) {
+            self.routes
+                .insert(session_id.to_owned(), project_id.to_owned());
+            self.entries.insert(project_id.to_owned(), entry);
+        }
+        fn remove(&self, project_id: &str) -> Option<StubEntry> {
+            self.entries.remove(project_id).map(|(_, e)| e)
+        }
+        fn contains(&self, project_id: &str) -> bool {
+            self.entries.contains_key(project_id)
+        }
+        fn get_project_by_session(&self, session_id: &str) -> Option<String> {
+            self.routes.get(session_id).map(|p| p.clone())
+        }
+        fn get_entry_by_session(&self, session_id: &str) -> Option<StubEntry> {
+            self.get(&self.get_project_by_session(session_id)?)
+        }
+        fn list_project_ids(&self) -> Vec<String> {
+            self.entries.iter().map(|e| e.key().clone()).collect()
+        }
+        fn count(&self) -> usize {
+            self.entries.len()
+        }
+        fn entry(&self, project_id: String) -> Entry<'_, String, StubEntry> {
+            self.entries.entry(project_id)
+        }
+        fn update_agent_status_for_session(
+            &self,
+            _project_id: &str,
+            _session_id: &str,
+            _request_id: Option<&str>,
+            _status: AgentStatus,
+        ) {
+            self.status_updates.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // ---- StateAwareNotifier 轮次指标 ----
+
+    fn notifier(threshold_secs: u64) -> StateAwareNotifier<StubRegistry> {
+        StateAwareNotifier::with_slow_round_threshold_secs(Arc::new(StubRegistry::default()), threshold_secs)
+    }
+
+    fn chunk_update(text: &str) -> Su {
+        Su::AgentMessageChunk(ContentChunk::new(
+            text.to_owned().into(),
+            
+        ))
+    }
+
+    #[tokio::test]
+    async fn round_flow_counts_and_clears() {
+        let n = notifier(120);
+        n.notify_prompt_start("633", "ses_a", Some("req-1".into())).await.unwrap();
+
+        n.notify_session_update("633", "ses_a", chunk_update("你"), Some("req-1".into())).await.unwrap();
+        n.notify_session_update("633", "ses_a", chunk_update("好"), Some("req-1".into())).await.unwrap();
+        n.notify_session_update("633", "ses_a", Su::ToolCall(ToolCall::new("call_1", "读取文件")), Some("req-1".into())).await.unwrap();
+        n.notify_session_update("633", "ses_a", Su::ToolCallUpdate(ToolCallUpdate::new("call_1", ToolCallUpdateFields::default())), Some("req-1".into())).await.unwrap();
+        n.notify_session_update("633", "ses_a", chunk_update("结果"), Some("req-1".into())).await.unwrap();
+
+        {
+            let m = n.round_metrics.get("ses_a").expect("metrics 存在");
+            assert_eq!(m.chunks, 3);
+            assert_eq!(m.tool_events, 2);
+            assert!(m.first_chunk_at.is_some());
+            assert!(m.first_tool_at.is_some());
+        }
+
+        n.notify_prompt_end("633", "ses_a", StopReason::EndTurn, None, Some("req-1".into())).await.unwrap();
+        assert!(!n.round_metrics.contains_key("ses_a"), "PromptEnd 后 metrics 应被清理");
+    }
+
+    #[tokio::test]
+    async fn prompt_error_clears_metrics() {
+        let n = notifier(120);
+        n.notify_prompt_start("633", "ses_b", Some("req-1".into())).await.unwrap();
+        n.notify_session_update("633", "ses_b", chunk_update("x"), Some("req-1".into())).await.unwrap();
+
+        let err = agent_client_protocol::schema::v1::Error::new(-32000, "boom");
+        n.notify_prompt_error("633", "ses_b", err, Some("req-1".into())).await.unwrap();
+        assert!(!n.round_metrics.contains_key("ses_b"), "PromptError 后 metrics 应被清理");
+    }
+
+    #[tokio::test]
+    async fn repeated_start_overwrites_previous_round() {
+        let n = notifier(120);
+        n.notify_prompt_start("633", "ses_c", Some("req-1".into())).await.unwrap();
+        n.notify_session_update("633", "ses_c", chunk_update("x"), Some("req-1".into())).await.unwrap();
+        // 异常时序：未 end 直接再来一轮 start
+        n.notify_prompt_start("633", "ses_c", Some("req-2".into())).await.unwrap();
+
+        let m = n.round_metrics.get("ses_c").expect("metrics 存在");
+        assert_eq!(m.chunks, 0, "新一轮应重置计数");
+        assert!(m.first_chunk_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_without_start_is_ignored_gracefully() {
+        let n = notifier(120);
+        // 无 PromptStart 直接 update / end：不 panic、不留残留
+        n.notify_session_update("633", "ses_d", chunk_update("x"), None).await.unwrap();
+        n.notify_prompt_end("633", "ses_d", StopReason::EndTurn, None, None).await.unwrap();
+        assert!(!n.round_metrics.contains_key("ses_d"));
+    }
+
+    #[tokio::test]
+    async fn zero_threshold_marks_slow_round() {
+        // threshold=0 → 任何轮次都走 WARN 分支（只验证执行路径不 panic）
+        let n = notifier(0);
+        n.notify_prompt_start("633", "ses_e", Some("req-1".into())).await.unwrap();
+        n.notify_session_update("633", "ses_e", chunk_update("x"), Some("req-1".into())).await.unwrap();
+        n.notify_prompt_end("633", "ses_e", StopReason::EndTurn, None, Some("req-1".into())).await.unwrap();
+        assert!(!n.round_metrics.contains_key("ses_e"));
+    }
+}
+
