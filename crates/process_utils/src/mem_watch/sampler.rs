@@ -294,3 +294,75 @@ fn protected_set(roots: &[Arc<Root>], table: &HashMap<u32, ProcInfo>) -> HashSet
     }
     protected
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mem_watch::cgroup::CgroupProbe;
+
+    fn probe(max: Option<u64>, unresolved: Option<&'static str>) -> CgroupProbe {
+        CgroupProbe::for_test("", max, unresolved)
+    }
+
+    #[test]
+    fn scope_ok_rejects_mismatched_limit_override() {
+        // host cgroupns 误杀的防线:覆盖限额与实测 memory.max 不一致 → 拒绝淘汰
+        let p = probe(Some(4 << 30), None);
+        let mut cfg = Config::default();
+        cfg.limit_override = Some(512 << 20);
+        let mut warned = false;
+        assert!(
+            !scope_ok(&cfg, &p, 512 << 20, &mut warned),
+            "限额来自别处时必须拒绝"
+        );
+        assert!(warned, "拒绝必须留痕(且只报一次)");
+
+        // 第二次沿用同一标记,不重复告警
+        let before = warned;
+        assert!(!scope_ok(&cfg, &p, 512 << 20, &mut warned));
+        assert_eq!(warned, before);
+    }
+
+    #[test]
+    fn scope_ok_accepts_matching_override_and_no_override() {
+        let p = probe(Some(4 << 30), None);
+        let mut cfg = Config::default();
+
+        // 无覆盖:限额本就来自本组,天然同源
+        cfg.limit_override = None;
+        let mut w = false;
+        assert!(scope_ok(&cfg, &p, 4 << 30, &mut w));
+        assert!(!w, "无需告警");
+
+        // 覆盖值与实测一致:放行
+        cfg.limit_override = Some(4 << 30);
+        let mut w = false;
+        assert!(scope_ok(&cfg, &p, 4 << 30, &mut w));
+        assert!(!w);
+    }
+
+    #[test]
+    fn scope_ok_rejects_unresolved_probe() {
+        let broken = probe(None, Some("cannot read /proc/self/cgroup"));
+        let mut cfg = Config::default();
+        cfg.limit_override = Some(4 << 30);
+        let mut warned = false;
+        assert!(
+            !scope_ok(&cfg, &broken, 4 << 30, &mut warned),
+            "定位失败一律拒绝"
+        );
+        assert!(warned);
+    }
+
+    #[test]
+    fn scope_ok_ignores_mismatch_without_override() {
+        // 没有覆盖时不存在"两个来源",即使传入的 limit 与实测不同也放行
+        // (该 limit 就是从本组读出来的)
+        let p = probe(Some(4 << 30), None);
+        let mut cfg = Config::default();
+        cfg.limit_override = None;
+        let mut warned = false;
+        assert!(scope_ok(&cfg, &p, 1 << 30, &mut warned));
+        assert!(!warned);
+    }
+}

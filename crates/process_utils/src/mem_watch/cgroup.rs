@@ -111,6 +111,20 @@ impl CgroupProbe {
         self.unresolved
     }
 
+    /// 测试用构造器（字段私有，跨模块测试经此构造）。
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        relpath: &str,
+        max: Option<u64>,
+        unresolved: Option<&'static str>,
+    ) -> Self {
+        Self {
+            relpath: relpath.to_owned(),
+            max,
+            unresolved,
+        }
+    }
+
     pub fn current_path(&self) -> PathBuf {
         join(&self.relpath, "memory.current")
     }
