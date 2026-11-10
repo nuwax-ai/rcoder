@@ -487,10 +487,49 @@ pub struct ComputerPodResourcesResponse {
     #[schema(example = "abc123def456")]
     pub container_id: Option<String>,
 
+    /// 容器内进程明细(按 RSS 降序;include_processes=false 或采集降级时缺省)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processes: Option<Vec<ComputerProcessEntry>>,
+
+    /// 进程总数(容器内全部进程)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_count: Option<u32>,
+
+    /// 角色分组聚合(与内存看门狗淘汰语义对齐)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_groups: Option<ComputerProcessGroups>,
+
     /// 容器名称(定位成功时)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "computer-agent-runner-user_123")]
     pub container_name: Option<String>,
+}
+
+/// 容器内单进程明细(资源观测)
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ComputerProcessEntry {
+    /// 进程 ID(容器 pid namespace)
+    pub pid: u32,
+    /// 进程名(内核 comm,≤15 字符)
+    pub comm: String,
+    /// RSS(MB)
+    pub rss_mb: f64,
+    /// 角色分组: infra | platform | workload
+    pub group: String,
+    /// 命令行前缀(≤120 字符)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args_head: Option<String>,
+}
+
+/// 进程角色分组聚合(字节口径,前端按需换算 MB)
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ComputerProcessGroups {
+    /// 桌面/系统(永不淘汰)
+    pub infra_rss_bytes: u64,
+    /// 平台服务(claude/MCP/file-server,永不淘汰)
+    pub platform_rss_bytes: u64,
+    /// 会话工作负载(看门狗可淘汰范围)
+    pub workload_rss_bytes: u64,
 }
 
 /// Computer 容器资源查询参数(GET query)
@@ -507,6 +546,16 @@ pub struct ComputerPodResourcesQuery {
     #[param(example = "pod_abc123")]
     #[schema(example = "pod_abc123")]
     pub pod_id: Option<String>,
+
+    /// 是否返回容器内进程明细(默认 true;响应 processes 字段)
+    #[serde(default = "computer_pod_resources_default_include_processes")]
+    #[param(example = true)]
+    #[schema(example = true)]
+    pub include_processes: Option<bool>,
+}
+
+fn computer_pod_resources_default_include_processes() -> Option<bool> {
+    Some(true)
 }
 
 /// Computer Agent 取消任务的请求参数

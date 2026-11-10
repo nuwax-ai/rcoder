@@ -555,6 +555,9 @@ pub struct GetContainerStatusRequest {
     /// 降级为缺省），防止状态与资源聚合自不同换代的执行。旧调用方不填，行为不变。
     #[prost(string, optional, tag = "3")]
     pub expected_session_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// 是否返回容器内进程明细（默认 false——旧调用方零开销）
+    #[prost(bool, optional, tag = "4")]
+    pub include_processes: ::core::option::Option<bool>,
 }
 /// 容器状态响应
 #[allow(clippy::all)]
@@ -595,6 +598,33 @@ pub struct GetContainerStatusResponse {
     /// 容器 CPU 核数限额（cgroup cpu.max quota/period；未设限或缺省为 None）
     #[prost(double, optional, tag = "11")]
     pub container_cpu_limit_cores: ::core::option::Option<f64>,
+    /// 容器内进程明细（按 RSS 降序 top N；仅请求 include_processes 时填充）
+    #[prost(message, repeated, tag = "12")]
+    pub processes: ::prost::alloc::vec::Vec<ContainerProcess>,
+}
+/// 容器内单进程快照（资源观测用）
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ContainerProcess {
+    #[prost(uint32, tag = "1")]
+    pub pid: u32,
+    #[prost(uint32, tag = "2")]
+    pub ppid: u32,
+    /// 内核 comm（≤15 字符，可能被进程改写）
+    #[prost(string, tag = "3")]
+    pub comm: ::prost::alloc::string::String,
+    /// RSS（字节）
+    #[prost(uint64, tag = "4")]
+    pub rss_bytes: u64,
+    /// 累计 CPU 时间（秒，utime+stime）
+    #[prost(double, tag = "5")]
+    pub cpu_seconds: f64,
+    /// 角色分组：infra | platform | workload（与看门狗保护语义对齐）
+    #[prost(string, tag = "6")]
+    pub group: ::prost::alloc::string::String,
+    /// 命令行前缀（≤120 字符）
+    #[prost(string, tag = "7")]
+    pub args_head: ::prost::alloc::string::String,
 }
 /// VNC 状态查询请求
 #[allow(clippy::all)]

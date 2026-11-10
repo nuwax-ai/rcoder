@@ -428,6 +428,8 @@ message GetContainerStatusRequest {
   // 预期执行身份（可选）。registry 当前会话与其不符时不采集资源（资源字段
   // 降级为缺省），防止状态与资源聚合自不同换代的执行。旧调用方不填，行为不变。
   optional string expected_session_id = 3;
+  // 是否返回容器内进程明细（默认 false——旧调用方零开销）
+  optional bool include_processes = 4;
 }
 
 // 容器状态响应
@@ -456,6 +458,24 @@ message GetContainerStatusResponse {
   optional int64 container_memory_limit_mb = 10;
   // 容器 CPU 核数限额（cgroup cpu.max quota/period；未设限或缺省为 None）
   optional double container_cpu_limit_cores = 11;
+  // 容器内进程明细（按 RSS 降序 top N；仅请求 include_processes 时填充）
+  repeated ContainerProcess processes = 12;
+}
+
+// 容器内单进程快照（资源观测用）
+message ContainerProcess {
+  uint32 pid = 1;
+  uint32 ppid = 2;
+  // 内核 comm（≤15 字符，可能被进程改写）
+  string comm = 3;
+  // RSS（字节）
+  uint64 rss_bytes = 4;
+  // 累计 CPU 时间（秒，utime+stime）
+  double cpu_seconds = 5;
+  // 角色分组：infra | platform | workload（与看门狗保护语义对齐）
+  string group = 6;
+  // 命令行前缀（≤120 字符）
+  string args_head = 7;
 }
 
 // === Get VNC Status ===
