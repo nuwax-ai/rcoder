@@ -104,6 +104,7 @@ pub use userapp::runtime_control::{
 
 // 灵活的字符串反序列化器（支持 JSON 字符串和数字）
 pub mod flexible_string;
+pub mod log_brief;
 pub mod version_util;
 
 // i18n 国际化模块 — 重导出自 shared_types_i18n（过渡期兼容）

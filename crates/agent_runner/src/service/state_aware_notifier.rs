@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use super::session_notifier::SseSessionNotifier;
+use shared_types::log_brief::brief_log;
 use shared_types::{AgentStatus, SessionNotify};
 
 /// 默认慢轮阈值（秒）：轮次耗时超过该值时 [ROUND] 汇总升级为 WARN。
@@ -53,16 +54,6 @@ impl RoundMetrics {
             chunks: 0,
             tool_events: 0,
         }
-    }
-}
-
-/// 截断长文本用于日志（按字符数截断，多字节安全）
-fn brief(s: &str, max: usize) -> String {
-    let n = s.chars().count();
-    if n <= max {
-        s.to_owned()
-    } else {
-        format!("{}…(+{})", s.chars().take(max).collect::<String>(), n - max)
     }
 }
 
@@ -225,8 +216,14 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
                 .unwrap_or_else(|| "-".to_owned());
             let line = format!(
                 "[ROUND] project={} session={} duration={:.1}s first_chunk={} first_tool={} chunks={} tools={} stop={:?}",
-                project_id, session_id, duration.as_secs_f64(), first_chunk, first_tool,
-                m.chunks, m.tool_events, stop_reason
+                project_id,
+                session_id,
+                duration.as_secs_f64(),
+                first_chunk,
+                first_tool,
+                m.chunks,
+                m.tool_events,
+                stop_reason
             );
             if duration >= self.slow_round_threshold {
                 warn!(
@@ -298,7 +295,7 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
         // 观测：更新轮次指标 + 工具事件骨架行（只在委托前借用，不改变转发行为）
         use agent_client_protocol::schema::v1::SessionUpdate as Su;
         match &session_update {
-            Su::AgentMessageChunk(_) | Su::UserMessageChunk(_) | Su::AgentThoughtChunk(_) => {
+            Su::AgentMessageChunk(_) | Su::AgentThoughtChunk(_) => {
                 // 高频 chunk：只聚合计数，不打日志（避免日志洪流）
                 if let Some(mut m) = self.round_metrics.get_mut(session_id) {
                     m.chunks += 1;
@@ -306,6 +303,9 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
                         m.first_chunk_at = Some(Instant::now());
                     }
                 }
+            }
+            Su::UserMessageChunk(_) => {
+                // 用户输入回显：不是 LLM 输出，不计 chunks/first_chunk（避免污染首 token 指标）
             }
             Su::ToolCall(tc) => {
                 if let Some(mut m) = self.round_metrics.get_mut(session_id) {
@@ -322,7 +322,7 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
                     tc.name,
                     tc.kind,
                     tc.status,
-                    brief(&tc.title, TOOL_TITLE_MAX_CHARS)
+                    brief_log(&tc.title, TOOL_TITLE_MAX_CHARS)
                 );
             }
             Su::ToolCallUpdate(u) => {
@@ -368,48 +368,17 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::v1::SessionUpdate as Su;
     use agent_client_protocol::schema::v1::{
         ContentChunk, PromptRequest, SessionId as AcpSessionId, StopReason, ToolCall,
         ToolCallUpdate, ToolCallUpdateFields,
     };
-    use agent_client_protocol::schema::v1::SessionUpdate as Su;
     use dashmap::mapref::entry::Entry;
-    use shared_types::{AgentLifecycle, CancelNotificationRequestWrapper, ModelProviderConfig, SessionEntry};
+    use shared_types::{
+        AgentLifecycle, CancelNotificationRequestWrapper, ModelProviderConfig, SessionEntry,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
-
-    // ---- brief() ----
-
-    #[test]
-    fn brief_keeps_short_text() {
-        assert_eq!(brief("hello", 80), "hello");
-    }
-
-    #[test]
-    fn brief_exact_max_unchanged() {
-        let s = "a".repeat(80);
-        assert_eq!(brief(&s, 80), s);
-    }
-
-    #[test]
-    fn brief_truncates_long_text() {
-        let s = "a".repeat(100);
-        assert_eq!(brief(&s, 80), format!("{}…(+20)", "a".repeat(80)));
-    }
-
-    #[test]
-    fn brief_counts_chars_not_bytes() {
-        // 90 个中文字符（270 字节）→ 截到 80 字符
-        let s = "招".repeat(90);
-        let out = brief(&s, 80);
-        assert_eq!(out.chars().count(), 86); // 80 个中文 + … + "(+10)" 5 字符
-        assert!(out.contains("…(+10)"));
-    }
-
-    #[test]
-    fn brief_empty_string() {
-        assert_eq!(brief("", 80), "");
-    }
 
     // ---- registry stub ----
 
@@ -428,7 +397,7 @@ mod tests {
                 session_id: AcpSessionId::new(self.session_id.0.as_ref()),
                 prompt_tx: self.prompt_tx.clone(),
                 cancel_tx: self.cancel_tx.clone(),
-                status: self.status.clone(),
+                status: self.status,
             }
         }
     }
@@ -516,26 +485,51 @@ mod tests {
     // ---- StateAwareNotifier 轮次指标 ----
 
     fn notifier(threshold_secs: u64) -> StateAwareNotifier<StubRegistry> {
-        StateAwareNotifier::with_slow_round_threshold_secs(Arc::new(StubRegistry::default()), threshold_secs)
+        StateAwareNotifier::with_slow_round_threshold_secs(
+            Arc::new(StubRegistry::default()),
+            threshold_secs,
+        )
     }
 
     fn chunk_update(text: &str) -> Su {
-        Su::AgentMessageChunk(ContentChunk::new(
-            text.to_owned().into(),
-            
-        ))
+        Su::AgentMessageChunk(ContentChunk::new(text.to_owned().into()))
     }
 
     #[tokio::test]
     async fn round_flow_counts_and_clears() {
         let n = notifier(120);
-        n.notify_prompt_start("633", "ses_a", Some("req-1".into())).await.unwrap();
+        n.notify_prompt_start("633", "ses_a", Some("req-1".into()))
+            .await
+            .unwrap();
 
-        n.notify_session_update("633", "ses_a", chunk_update("你"), Some("req-1".into())).await.unwrap();
-        n.notify_session_update("633", "ses_a", chunk_update("好"), Some("req-1".into())).await.unwrap();
-        n.notify_session_update("633", "ses_a", Su::ToolCall(ToolCall::new("call_1", "读取文件")), Some("req-1".into())).await.unwrap();
-        n.notify_session_update("633", "ses_a", Su::ToolCallUpdate(ToolCallUpdate::new("call_1", ToolCallUpdateFields::default())), Some("req-1".into())).await.unwrap();
-        n.notify_session_update("633", "ses_a", chunk_update("结果"), Some("req-1".into())).await.unwrap();
+        n.notify_session_update("633", "ses_a", chunk_update("你"), Some("req-1".into()))
+            .await
+            .unwrap();
+        n.notify_session_update("633", "ses_a", chunk_update("好"), Some("req-1".into()))
+            .await
+            .unwrap();
+        n.notify_session_update(
+            "633",
+            "ses_a",
+            Su::ToolCall(ToolCall::new("call_1", "读取文件")),
+            Some("req-1".into()),
+        )
+        .await
+        .unwrap();
+        n.notify_session_update(
+            "633",
+            "ses_a",
+            Su::ToolCallUpdate(ToolCallUpdate::new(
+                "call_1",
+                ToolCallUpdateFields::default(),
+            )),
+            Some("req-1".into()),
+        )
+        .await
+        .unwrap();
+        n.notify_session_update("633", "ses_a", chunk_update("结果"), Some("req-1".into()))
+            .await
+            .unwrap();
 
         {
             let m = n.round_metrics.get("ses_a").expect("metrics 存在");
@@ -545,28 +539,54 @@ mod tests {
             assert!(m.first_tool_at.is_some());
         }
 
-        n.notify_prompt_end("633", "ses_a", StopReason::EndTurn, None, Some("req-1".into())).await.unwrap();
-        assert!(!n.round_metrics.contains_key("ses_a"), "PromptEnd 后 metrics 应被清理");
+        n.notify_prompt_end(
+            "633",
+            "ses_a",
+            StopReason::EndTurn,
+            None,
+            Some("req-1".into()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !n.round_metrics.contains_key("ses_a"),
+            "PromptEnd 后 metrics 应被清理"
+        );
     }
 
     #[tokio::test]
     async fn prompt_error_clears_metrics() {
         let n = notifier(120);
-        n.notify_prompt_start("633", "ses_b", Some("req-1".into())).await.unwrap();
-        n.notify_session_update("633", "ses_b", chunk_update("x"), Some("req-1".into())).await.unwrap();
+        n.notify_prompt_start("633", "ses_b", Some("req-1".into()))
+            .await
+            .unwrap();
+        n.notify_session_update("633", "ses_b", chunk_update("x"), Some("req-1".into()))
+            .await
+            .unwrap();
 
         let err = agent_client_protocol::schema::v1::Error::new(-32000, "boom");
-        n.notify_prompt_error("633", "ses_b", err, Some("req-1".into())).await.unwrap();
-        assert!(!n.round_metrics.contains_key("ses_b"), "PromptError 后 metrics 应被清理");
+        n.notify_prompt_error("633", "ses_b", err, Some("req-1".into()))
+            .await
+            .unwrap();
+        assert!(
+            !n.round_metrics.contains_key("ses_b"),
+            "PromptError 后 metrics 应被清理"
+        );
     }
 
     #[tokio::test]
     async fn repeated_start_overwrites_previous_round() {
         let n = notifier(120);
-        n.notify_prompt_start("633", "ses_c", Some("req-1".into())).await.unwrap();
-        n.notify_session_update("633", "ses_c", chunk_update("x"), Some("req-1".into())).await.unwrap();
+        n.notify_prompt_start("633", "ses_c", Some("req-1".into()))
+            .await
+            .unwrap();
+        n.notify_session_update("633", "ses_c", chunk_update("x"), Some("req-1".into()))
+            .await
+            .unwrap();
         // 异常时序：未 end 直接再来一轮 start
-        n.notify_prompt_start("633", "ses_c", Some("req-2".into())).await.unwrap();
+        n.notify_prompt_start("633", "ses_c", Some("req-2".into()))
+            .await
+            .unwrap();
 
         let m = n.round_metrics.get("ses_c").expect("metrics 存在");
         assert_eq!(m.chunks, 0, "新一轮应重置计数");
@@ -577,8 +597,12 @@ mod tests {
     async fn update_without_start_is_ignored_gracefully() {
         let n = notifier(120);
         // 无 PromptStart 直接 update / end：不 panic、不留残留
-        n.notify_session_update("633", "ses_d", chunk_update("x"), None).await.unwrap();
-        n.notify_prompt_end("633", "ses_d", StopReason::EndTurn, None, None).await.unwrap();
+        n.notify_session_update("633", "ses_d", chunk_update("x"), None)
+            .await
+            .unwrap();
+        n.notify_prompt_end("633", "ses_d", StopReason::EndTurn, None, None)
+            .await
+            .unwrap();
         assert!(!n.round_metrics.contains_key("ses_d"));
     }
 
@@ -586,10 +610,50 @@ mod tests {
     async fn zero_threshold_marks_slow_round() {
         // threshold=0 → 任何轮次都走 WARN 分支（只验证执行路径不 panic）
         let n = notifier(0);
-        n.notify_prompt_start("633", "ses_e", Some("req-1".into())).await.unwrap();
-        n.notify_session_update("633", "ses_e", chunk_update("x"), Some("req-1".into())).await.unwrap();
-        n.notify_prompt_end("633", "ses_e", StopReason::EndTurn, None, Some("req-1".into())).await.unwrap();
+        n.notify_prompt_start("633", "ses_e", Some("req-1".into()))
+            .await
+            .unwrap();
+        n.notify_session_update("633", "ses_e", chunk_update("x"), Some("req-1".into()))
+            .await
+            .unwrap();
+        n.notify_prompt_end(
+            "633",
+            "ses_e",
+            StopReason::EndTurn,
+            None,
+            Some("req-1".into()),
+        )
+        .await
+        .unwrap();
         assert!(!n.round_metrics.contains_key("ses_e"));
     }
-}
 
+    #[tokio::test]
+    async fn user_message_chunk_not_counted_as_llm_output() {
+        let n = notifier(120);
+        n.notify_prompt_start("633", "ses_f", Some("req-1".into()))
+            .await
+            .unwrap();
+        // 用户输入回显到达（先于 LLM 输出）：不得计入 chunks / first_chunk
+        n.notify_session_update(
+            "633",
+            "ses_f",
+            Su::UserMessageChunk(ContentChunk::new("用户输入".into())),
+            Some("req-1".into()),
+        )
+        .await
+        .unwrap();
+        {
+            let m = n.round_metrics.get("ses_f").expect("metrics 存在");
+            assert_eq!(m.chunks, 0, "用户输入回显不应计入 LLM 输出");
+            assert!(m.first_chunk_at.is_none(), "first_chunk 不得被用户输入污染");
+        }
+        // 随后真正的 LLM chunk 正常计入
+        n.notify_session_update("633", "ses_f", chunk_update("输出"), Some("req-1".into()))
+            .await
+            .unwrap();
+        let m = n.round_metrics.get("ses_f").expect("metrics 存在");
+        assert_eq!(m.chunks, 1);
+        assert!(m.first_chunk_at.is_some());
+    }
+}
