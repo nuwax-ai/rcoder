@@ -83,7 +83,7 @@ impl TerminateReport {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use super::{Duration, KillTarget, TerminateReport};
+    use super::{Duration, KillTarget, SignalError, TerminateReport};
     use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 
     /// 读 `/proc/<pid>/stat` 的 starttime（第 22 字段）。不存在返回 `None`。
