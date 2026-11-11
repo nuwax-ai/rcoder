@@ -695,56 +695,85 @@ pub struct AgentExecutionSummary {
 /// 本就只含本容器的执行。用"注册表里所有 root 的 pgid"做聚合，避免调用方
 /// 还得猜 project_id（实测 agent 的 project_id 与容器 project_id 并不相同）。
 /// 无注册执行时返回 None。
+///
+/// **一个 user 容器可以承载多个 project**（工作目录 `/home/user/<project_id>`），
+/// 因此这里必须"选一个执行并只聚合它"，不能"取第一个的身份 + 聚合所有进程组"：
+/// 后者会报出会话 A 的 session_id 配两个会话之和的 RSS，且 DashMap 遍历顺序
+/// 不确定，session_id 会在轮询间跳变。选取规则：RSS 最大（内存压力下最该被
+/// 关注的执行），RSS 相同时按 session_id 升序兜底，保证结果可复现。
 #[cfg(target_os = "linux")]
 pub fn agent_execution_summary(
     table: &std::collections::HashMap<u32, process_utils::proc_scan::ProcInfo>,
 ) -> Option<AgentExecutionSummary> {
-    let mut session_id: Option<String> = None;
-    let mut status = "Idle";
-    let mut pgids = std::collections::HashSet::new();
+    struct Candidate {
+        rss_bytes: u64,
+        session_id: String,
+        status: &'static str,
+        ticks: u64,
+        process_count: u32,
+    }
+
+    let mut best: Option<Candidate> = None;
     for entry in AGENT_REGISTRY.iter_agents() {
         let info = entry.value();
-        if let Some(pgid) = info.stop_handle.as_ref().and_then(|h| h.agent_pgid()) {
-            pgids.insert(pgid);
+        let Some(pgid) = info
+            .stop_handle
+            .as_ref()
+            .and_then(|handle| handle.agent_pgid())
+        else {
+            continue;
+        };
+        let mut rss_bytes: u64 = 0;
+        let mut ticks: u64 = 0;
+        let mut process_count: u32 = 0;
+        for proc in table.values() {
+            if proc.pgrp != pgid {
+                continue;
+            }
+            rss_bytes = rss_bytes.saturating_add(proc.rss_bytes);
+            ticks = ticks.saturating_add(proc.utime_ticks.saturating_add(proc.stime_ticks));
+            process_count += 1;
         }
-        if session_id.is_none() {
-            session_id = Some(info.session_id.to_string());
-            // 全量匹配，不写 `_ =>`：以后新增 AgentStatus 变体时，这里
-            // 必须编译失败，避免新状态被悄悄当成"Processing"。
-            status = match info.status {
-                // Pending = 任务已入队、等待 worker。对外仍是"忙"，与
-                // GetStatus 的 busy 口径一致。
-                crate::model::AgentStatus::Pending => "Processing",
-                crate::model::AgentStatus::Active => "Processing",
-                crate::model::AgentStatus::Idle => "Idle",
-                crate::model::AgentStatus::Terminating => "Terminating",
-            };
-        }
-    }
-    if pgids.is_empty() {
-        return None;
-    }
-    let tps = procfs::ticks_per_second().max(1) as f64;
-    let mut rss_bytes: u64 = 0;
-    let mut ticks: u64 = 0;
-    let mut process_count: u32 = 0;
-    for info in table.values() {
-        if !pgids.contains(&info.pgrp) {
+        if process_count == 0 {
             continue;
         }
-        rss_bytes = rss_bytes.saturating_add(info.rss_bytes);
-        ticks = ticks.saturating_add(info.utime_ticks.saturating_add(info.stime_ticks));
-        process_count += 1;
+        // 全量匹配，不写 `_ =>`：以后新增 AgentStatus 变体时，这里必须
+        // 编译失败，避免新状态被悄悄当成"Processing"。
+        let status = match info.status {
+            // Pending = 任务已入队、等待 worker。对外仍是"忙"，
+            // 与 GetStatus 的 busy 口径一致。
+            crate::model::AgentStatus::Pending => "Processing",
+            crate::model::AgentStatus::Active => "Processing",
+            crate::model::AgentStatus::Idle => "Idle",
+            crate::model::AgentStatus::Terminating => "Terminating",
+        };
+        let session_id = info.session_id.to_string();
+        let better = match &best {
+            None => true,
+            Some(current) => {
+                rss_bytes > current.rss_bytes
+                    || (rss_bytes == current.rss_bytes && session_id < current.session_id)
+            }
+        };
+        if better {
+            best = Some(Candidate {
+                rss_bytes,
+                session_id,
+                status,
+                ticks,
+                process_count,
+            });
+        }
     }
-    if process_count == 0 {
-        return None;
-    }
+
+    let best = best?;
+    let tps = procfs::ticks_per_second().max(1) as f64;
     Some(AgentExecutionSummary {
-        session_id,
-        status: status.to_string(),
-        rss_bytes,
-        cpu_seconds: ticks as f64 / tps,
-        process_count,
+        session_id: Some(best.session_id),
+        status: best.status.to_string(),
+        rss_bytes: best.rss_bytes,
+        cpu_seconds: best.ticks as f64 / tps,
+        process_count: best.process_count,
     })
 }
 
