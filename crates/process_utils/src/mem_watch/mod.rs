@@ -30,7 +30,9 @@ pub use proc_tree::ProcInfo;
 pub fn snapshot() -> std::collections::HashMap<u32, ProcInfo> {
     sys::read_all()
 }
-pub use registry::{mark_session_active, try_register, try_unregister};
+pub use registry::{
+    AGENT_RUNTIME_MARKERS, is_agent_runtime, mark_session_active, try_register, try_unregister,
+};
 pub use sampler::{evictable_pids, run, start};
 
 /// 安装全局注册表并启动采样任务。

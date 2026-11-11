@@ -408,19 +408,6 @@ impl ProcessRole {
     }
 }
 
-/// 平台服务标记(args 命中即 platform;claude 本体的安装路径也在 acp-ts 包下)
-const PLATFORM_ARGS_MARKERS: &[&str] = &[
-    "nuwax-file-server",
-    "mcp-proxy",
-    "chrome-devtools-mcp",
-    "claude-code-acp-ts",
-    "claude-agent-sdk",
-    "@nuwax-ai/openui-mcp",
-    "nuwax-ask-question-mcp",
-    "@nuwax-ai/nuwax-harness-acp-ts",
-    "nuwax-upload",
-];
-
 /// 单进程明细行。
 #[derive(Debug, Clone)]
 pub struct ProcessRow {
@@ -655,7 +642,9 @@ fn classify(comm: &str, args_head: &str, evictable: bool) -> ProcessRole {
     if evictable {
         return ProcessRole::Workload;
     }
-    if PLATFORM_ARGS_MARKERS.iter().any(|m| args_head.contains(m)) {
+    // 与看门狗的保护清单共用同一份(单一事实源):面板标成"不淘汰"的,
+    // 必须正好是看门狗真正不杀的,否则标签会与行为脱节。
+    if process_utils::mem_watch::is_agent_runtime(args_head) {
         return ProcessRole::Platform;
     }
     ProcessRole::Infra

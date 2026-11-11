@@ -41,6 +41,48 @@ pub struct Root {
     protected: Mutex<HashMap<u32, u64>>,
 }
 
+/// 通用解释器/外壳的可执行文件名。
+///
+/// 这些 exe 只说明"用哪个运行时解释脚本"，不说明"跑的是哪个程序"，
+/// 因此不能用作进程身份判定（详见 [`Root::matches_exe`]）。
+const GENERIC_INTERPRETERS: &[&str] = &[
+    "node", "nodejs", "bun", "deno", "java", "perl", "ruby", "php", "bash", "sh", "dash", "zsh",
+    "ksh", "fish", "python", "python2", "python3",
+];
+
+/// `exe` 是否是通用解释器。
+fn is_generic_interpreter(exe: &Path) -> bool {
+    let Some(name) = exe.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    GENERIC_INTERPRETERS.contains(&name)
+        || name.starts_with("python2.")
+        || name.starts_with("python3.")
+}
+
+/// agent 运行时家族标记：命令行命中即视为 agent 自身的一部分，永不淘汰。
+///
+/// 为什么按命令行而不是 exe：见 [`Root::matches_exe`] —— 解释器的 exe 是
+/// node/python 本体，拿它做身份判定会把无关负载一起保护。资源接口的角色
+/// 判定复用同一份清单（`is_agent_runtime`），保证"标成不淘汰"与"真的不杀"
+/// 是同一个结论。
+pub const AGENT_RUNTIME_MARKERS: &[&str] = &[
+    "claude-code-acp-ts",
+    "claude-agent-sdk",
+    "@nuwax-ai/openui-mcp",
+    "nuwax-ask-question-mcp",
+    "@nuwax-ai/nuwax-harness-acp-ts",
+    "mcp-proxy",
+    "nuwax-file-server",
+    "chrome-devtools-mcp",
+    "nuwax-upload",
+];
+
+/// 命令行是否属于 agent 运行时家族。
+pub fn is_agent_runtime(cmdline: &str) -> bool {
+    AGENT_RUNTIME_MARKERS.iter().any(|m| cmdline.contains(m))
+}
+
 impl Root {
     pub fn new(
         project: impl Into<String>,
@@ -95,7 +137,12 @@ impl Root {
 
     /// 规则 4/5：`exe` 等于 root 的 exe，或路径里包含 root 的脚本名。
     pub fn matches_exe(&self, exe: &Path) -> bool {
-        if !self.exe.as_os_str().is_empty() && exe == self.exe {
+        // exe 相等只在"专用二进制"上才是身份证据。node/python 这类解释器的
+        // `/proc/<pid>/exe` 指向**解释器本体**，容器里所有同语言进程路径完全
+        // 相同 —— 用相等判定会把整个解释器家族一起保护掉，agent 自己 spawn
+        // 的 node 负载就再也杀不动（实测 compose 容器里 4 个 node 进程全是
+        // /usr/local/bin/node）。这类 exe 只走下面的 script_hint（安装路径）判定。
+        if !is_generic_interpreter(exe) && !self.exe.as_os_str().is_empty() && exe == self.exe {
             return true;
         }
         !self.script_hint.is_empty()
@@ -444,11 +491,52 @@ mod tests {
     #[test]
     fn matches_exe_covers_sibling_binary() {
         let root = root_of("p1", 100, 1000);
-        assert!(root.matches_exe(Path::new("/usr/local/bin/node")));
+        // 解释器本体不算身份证据:否则容器里所有 node 进程都被保护
+        assert!(!root.matches_exe(Path::new("/usr/local/bin/node")));
+        // 安装路径下的子二进制仍按 script_hint 命中
         assert!(root.matches_exe(Path::new(
             "/usr/local/lib/node_modules/claude-code-acp-ts/node_modules/x/claude"
         )));
         assert!(!root.matches_exe(Path::new("/usr/bin/python3")));
+    }
+
+    #[test]
+    fn generic_interpreters_are_not_identity() {
+        for exe in [
+            "/usr/local/bin/node",
+            "/usr/bin/python3",
+            "/usr/bin/python3.13",
+            "/bin/bash",
+            "/bin/sh",
+            "/usr/bin/java",
+        ] {
+            assert!(
+                is_generic_interpreter(Path::new(exe)),
+                "{exe} 应识别为通用解释器"
+            );
+        }
+        for exe in ["/usr/local/bin/agent_runner", "/opt/app/claude"] {
+            assert!(
+                !is_generic_interpreter(Path::new(exe)),
+                "{exe} 是专用二进制,应参与相等判定"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_runtime_markers_match_agent_family_only() {
+        assert!(is_agent_runtime(
+            "node /usr/local/lib/node_modules/claude-code-acp-ts/dist/main.js"
+        ));
+        assert!(is_agent_runtime(
+            "node /usr/local/bin/mcp-proxy proxy --port 18099"
+        ));
+        assert!(is_agent_runtime(
+            "node /usr/local/bin/nuwax-file-server start"
+        ));
+        // 普通 node 负载不属于 agent 家族 —— 必须可淘汰
+        assert!(!is_agent_runtime("node /app/webpack-dev-server.js"));
+        assert!(!is_agent_runtime("node /app/node_modules/.bin/tsc --watch"));
     }
 
     #[test]

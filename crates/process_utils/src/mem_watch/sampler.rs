@@ -293,7 +293,7 @@ pub fn evictable_pids(table: &HashMap<u32, ProcInfo>) -> HashSet<u32> {
     super::proc_tree::evictable_scope(table, &root_pids, &protected)
 }
 
-/// 永不入选的进程：PID 1、所有会话的启动窗口快照、以及 exe 命中规则的进程。
+/// 永不入选的进程：PID 1、所有会话的启动窗口快照、以及 agent 运行时家族。
 fn protected_set(roots: &[Arc<Root>], table: &HashMap<u32, ProcInfo>) -> HashSet<u32> {
     let mut protected: HashSet<u32> = HashSet::from([1u32]);
     for root in roots {
@@ -308,13 +308,32 @@ fn protected_set(roots: &[Arc<Root>], table: &HashMap<u32, ProcInfo>) -> HashSet
         if protected.contains(pid) {
             continue;
         }
-        if let Some(exe) = sys::read_exe(*pid)
-            && roots.iter().any(|root| root.matches_exe(&exe))
-        {
+        let cmdline = sys::read_cmdline(*pid).join(" ");
+        let exe = sys::read_exe(*pid);
+        if is_protected_by_identity(roots, exe.as_deref(), &cmdline) {
             protected.insert(*pid);
         }
     }
     protected
+}
+
+/// 单个进程是否因"身份"而受保护（除 PID 1 与会话启动窗口快照之外的两条规则）。
+///
+/// - 命令行命中 agent 运行时家族（claude/MCP/file-server…）→ 保护；
+/// - `exe` 命中会话的安装路径（`script_hint`，或专用二进制相等）→ 保护。
+///
+/// **不能用解释器 exe 相等判身份**：node/python 的 `/proc/<pid>/exe` 是解释器
+/// 本体，容器里所有同语言进程同路径，相等判定会让 agent 自己 spawn 的
+/// node/python 负载永远杀不掉（详见 `registry::Root::matches_exe`）。
+fn is_protected_by_identity(
+    roots: &[Arc<Root>],
+    exe: Option<&std::path::Path>,
+    cmdline: &str,
+) -> bool {
+    if registry::is_agent_runtime(cmdline) {
+        return true;
+    }
+    exe.is_some_and(|exe| roots.iter().any(|root| root.matches_exe(exe)))
 }
 
 #[cfg(test)]
@@ -324,6 +343,74 @@ mod tests {
 
     fn probe(max: Option<u64>, unresolved: Option<&'static str>) -> CgroupProbe {
         CgroupProbe::for_test("", max, unresolved)
+    }
+
+    fn node_root() -> Vec<Arc<Root>> {
+        vec![Arc::new(Root::new(
+            "p",
+            100,
+            42,
+            std::path::PathBuf::from("/usr/local/bin/node"),
+            "claude-code-acp-ts".into(),
+        ))]
+    }
+
+    #[test]
+    fn interpreter_family_is_not_blindly_protected() {
+        let roots = node_root();
+        // 无关 node 负载：exe 与 agent 根相同，但命令行不属于 agent 家族
+        // → 必须可淘汰（修复前会被 exe 相等规则误保护）
+        assert!(!is_protected_by_identity(
+            &roots,
+            Some(std::path::Path::new("/usr/local/bin/node")),
+            "node /app/webpack-dev-server.js",
+        ));
+        assert!(!is_protected_by_identity(
+            &roots,
+            Some(std::path::Path::new("/usr/local/bin/node")),
+            "node /app/node_modules/.bin/tsc --watch",
+        ));
+    }
+
+    #[test]
+    fn agent_runtime_and_install_path_stay_protected() {
+        let roots = node_root();
+        // agent 家族子进程（同解释器，但命令行命中标记）→ 保护
+        assert!(is_protected_by_identity(
+            &roots,
+            Some(std::path::Path::new("/usr/local/bin/node")),
+            "node /usr/local/lib/node_modules/claude-code-acp-ts/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs",
+        ));
+        // 安装路径下的子二进制 → exe 命中 script_hint → 保护
+        assert!(is_protected_by_identity(
+            &roots,
+            Some(std::path::Path::new(
+                "/usr/local/lib/node_modules/claude-code-acp-ts/node_modules/x/claude"
+            )),
+            "claude --resume",
+        ));
+    }
+
+    #[test]
+    fn python_root_does_not_shield_python_children() {
+        // python agent 同理：它 spawn 的普通 python 工具必须可淘汰
+        let roots = vec![Arc::new(Root::new(
+            "p",
+            200,
+            7,
+            std::path::PathBuf::from("/usr/bin/python3.13"),
+            "main.py".into(),
+        ))];
+        assert!(!is_protected_by_identity(
+            &roots,
+            Some(std::path::Path::new("/usr/bin/python3.13")),
+            "python3 heavy_tool.py",
+        ));
+        assert!(!is_protected_by_identity(
+            &roots,
+            Some(std::path::Path::new("/usr/bin/python3.13")),
+            "python3 -m websockify --web /opt/noVNC 6080 localhost:5900",
+        ));
     }
 
     #[test]
