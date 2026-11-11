@@ -26,9 +26,30 @@ impl ProjectAdapter {
             .containers
             .view(name, |_, entry| (entry.info(), entry.service_type()));
         if let Some((_, family)) = &container {
+            // 诊断:family 不一致时把两侧的原始 service_type 与族键都打出来。
+            // 这条守卫只比较族键，"another family" 看不到具体值，排查时无从下手。
+            if !family.same_container_family(key.family()) {
+                tracing::warn!(
+                    event = "workload.family_mismatch",
+                    source = "adapter",
+                    logical_name = %key.logical_name(),
+                    namespace = %key.namespace(),
+                    stored_service_type = %family,
+                    stored_family_key = family.container_family_key(),
+                    requested_family = %key.family(),
+                    requested_family_key = key.family().container_family_key(),
+                    "Canonical container belongs to another family"
+                );
+            }
             ensure!(
                 family.same_container_family(key.family()),
-                "Canonical container belongs to another family"
+                "Canonical container belongs to another family: \
+                 stored={} ({}) requested={} ({}) name={}",
+                family,
+                family.container_family_key(),
+                key.family(),
+                key.family().container_family_key(),
+                key.logical_name()
             );
         }
         let mut memory = self

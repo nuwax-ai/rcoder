@@ -207,6 +207,17 @@ impl AppState {
             *service_type,
             &name,
         )?;
+        // 诊断:准入键是"期望侧"的事实源，与注册表行(实际侧)的 family 对不上时
+        // 光看 "another family" 无法定位，这里把键的三个分量都记下来。
+        tracing::debug!(
+            event = "workload.admission_key",
+            identifier = identifier,
+            namespace = key.namespace(),
+            family = %key.family(),
+            family_key = key.family().container_family_key(),
+            logical_name = key.logical_name(),
+            "resolved workload admission key"
+        );
         // Same wait budget as Computer creation admission; the caller acquires
         // once and reuses this guard through all internal stages.
         self.projects
