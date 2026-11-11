@@ -69,9 +69,15 @@ fn is_generic_interpreter(exe: &Path) -> bool {
 pub const AGENT_RUNTIME_MARKERS: &[&str] = &[
     "claude-code-acp-ts",
     "claude-agent-sdk",
+    // 带 npm scope 的写法与**裸名**都要列：MCP 启动时常见
+    // `npm exec @nuwax-ai/openui-mcp`（带 scope）与 `sh -c openui-mcp`
+    // （包装 shell，命令行是裸名）两种形态。只列带 scope 的形式会让包装
+    // shell 落进可淘汰范围——杀它虽然只省几 MB，却会打挂对应的 MCP 服务。
     "@nuwax-ai/openui-mcp",
+    "openui-mcp",
     "nuwax-ask-question-mcp",
     "@nuwax-ai/nuwax-harness-acp-ts",
+    "nuwax-harness-acp-ts",
     "mcp-proxy",
     "nuwax-file-server",
     "chrome-devtools-mcp",
@@ -534,6 +540,9 @@ mod tests {
         assert!(is_agent_runtime(
             "node /usr/local/bin/nuwax-file-server start"
         ));
+        // MCP 的包装 shell 是裸名(不带 npm scope),必须同样命中
+        assert!(is_agent_runtime("sh -c openui-mcp"));
+        assert!(is_agent_runtime("sh -c nuwax-ask-question-mcp"));
         // 普通 node 负载不属于 agent 家族 —— 必须可淘汰
         assert!(!is_agent_runtime("node /app/webpack-dev-server.js"));
         assert!(!is_agent_runtime("node /app/node_modules/.bin/tsc --watch"));
