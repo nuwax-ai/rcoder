@@ -14,6 +14,12 @@
 //! [`PgStore::reconcile_authoritative_binding`] 同锁失效旧投影并恢复 DB 中
 //! 仍存活的项目、会话和已由 peer 重建的容器，防止旧持久身份或残留游标让
 //! 新源码请求永久 Superseded。退休项目的会话不复制到新项目代次。
+//!
+//! 自愈（`binding_autoheal`，默认开）：读到 `AnomalousAbsent`（行+墓碑俱无）
+//! 且镜像持有完整旧 identity 时，读取入口
+//! [`PgStore::read_authoritative_container_binding`] 以独立写事务补写精确
+//! 三元组墓碑后重读为 `RetiredByUs` 放行——用户下一次重试即恢复，无需
+//! 重启进程。关闭开关恢复原拒绝语义（fail fast）。
 
 use crate::pg::PgStore;
 use shared_types::{ProjectAndContainerInfo, persistence::ContainerPersistenceIdentity};
@@ -75,8 +81,8 @@ impl PgStore {
     ///
     /// 自愈（`binding_autoheal` 开启时）：读到 `AnomalousAbsent` 且镜像持有
     /// 完整旧 identity（generation + physical_uid 非空）→ 补写退休墓碑后
-    /// 重读一次（按 `RetiredByUs` 自我换代放行）。生产 2026-11-11 事故中
-    /// 该状态曾把用户会话永久 500，唯一出路是重启进程清镜像。
+    /// 重读一次（按 `RetiredByUs` 自我换代放行）。该异常状态曾把用户
+    /// 会话永久 500，唯一出路是重启进程清镜像。
     pub(in crate::pg) async fn read_authoritative_container_binding(
         &self,
         container_name: &str,

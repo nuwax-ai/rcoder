@@ -1118,7 +1118,7 @@ async fn workload_replacement_and_anomalous_absence_stay_refused_when_autoheal_d
 }
 
 // ---------------------------------------------------------------------------
-// 绑定门禁自愈（binding_autoheal，生产 2026-11-11 事故收敛）
+// 绑定门禁自愈（binding_autoheal）
 // ---------------------------------------------------------------------------
 
 /// 读 DB 中容器绑定行：(container_id, workload_uid)。
@@ -1167,7 +1167,7 @@ struct HealFixture {
     store_c: PgStore,
 }
 
-/// 事故复现骨架：A 注册原绑定 → B 连接（镜像持有旧游标）→ 绕过 durable
+/// 异常复现骨架：A 注册原绑定 → B 连接（镜像持有旧游标）→ 绕过 durable
 /// 裸删行（行+墓碑俱无 = AnomalousAbsent）。
 async fn heal_fixture(physical: &str, workload: &str) -> Option<HealFixture> {
     let dsn = test_dsn().await?;
@@ -1298,7 +1298,7 @@ impl HealFixture {
     }
 }
 
-/// 路径 A 自愈（生产 2026-11-11 事故正片）：行+墓碑俱无时，持有完整旧
+/// 路径 A 自愈（异常形态正片）：行+墓碑俱无时，持有完整旧
 /// identity 的副本注册 → 补写墓碑 → 按自我换代放行，绑定行重建。
 #[tokio::test]
 async fn anomalous_absent_binding_heals_from_the_mirror_cursor() {

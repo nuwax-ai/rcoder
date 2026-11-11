@@ -28,8 +28,8 @@ pub const DEFAULT_PG_DURABLE_COMMIT_TIMEOUT_MS: u64 = 15_000;
 pub const MAX_PG_DURABLE_COMMIT_TIMEOUT_MS: u64 = i32::MAX as u64;
 
 /// 绑定门禁自愈默认值：开启。
-/// 背景（生产 2026-11-11 事故）：PG 绑定行异常缺失（行+墓碑俱无）或带外
-/// workload 换代（kubectl delete pod / 节点宕机重建）时，门禁拒绝导致用户
+/// 背景：PG 绑定行异常缺失（行+墓碑俱无）或带外 workload 换代
+/// （kubectl 重启 pod / 节点宕机重建）时，门禁拒绝导致用户
 /// 永久 500，唯一恢复手段是重启 central rcoder 进程。自愈开启后：
 /// - AnomalousAbsent：镜像持有完整旧 identity 时补写墓碑，按自我换代放行；
 /// - Bound+UID 不匹配：按带外换代走既有换代事务放行（写墓碑留痕）。
@@ -574,6 +574,29 @@ mod tests {
             ..PostgresConfig::default()
         };
         assert_eq!(config.min_connections(), 5);
+    }
+
+    /// binding_autoheal：默认开启；yaml 显式 false 关闭；serde 往返保真。
+    /// （RCODER_PG_BINDING_AUTOHEAL env 覆盖在 rcoder-engine 侧，与
+    /// durable_commit_timeout_ms 的分层一致。）
+    #[test]
+    fn binding_autoheal_defaults_on_and_parses_explicit_opt_out() {
+        assert!(PostgresConfig::default().binding_autoheal());
+        // yaml/config 未提及该字段（旧配置文件兼容）→ serde default 开启
+        let legacy: PostgresConfig =
+            serde_json::from_str("{\"host\":\"db\",\"username\":\"u\",\"database\":\"d\"}")
+                .unwrap();
+        assert!(legacy.binding_autoheal());
+        // 显式关闭
+        let opt_out: PostgresConfig = serde_json::from_str(
+            "{\"host\":\"db\",\"username\":\"u\",\"database\":\"d\",\"binding_autoheal\":false}",
+        )
+        .unwrap();
+        assert!(!opt_out.binding_autoheal());
+        // 序列化往返保真（关闭状态不因序列化丢失）
+        let round: PostgresConfig =
+            serde_json::from_str(&serde_json::to_string(&opt_out).unwrap()).unwrap();
+        assert!(!round.binding_autoheal());
     }
 
     #[test]

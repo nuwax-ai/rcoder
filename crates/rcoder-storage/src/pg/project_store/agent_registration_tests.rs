@@ -1287,7 +1287,7 @@ async fn new_shared_project_cannot_replace_a_canonical_workload_without_verified
     );
 }
 
-/// 契约（binding_autoheal，2026-11-11 调整）：durable RegisterProject 必经
+/// 契约（binding_autoheal 开启时）：durable RegisterProject 必经
 /// prepare_info 权威门禁——workload 换代要么被 autoheal 显式放行（门禁内
 /// 决策 + warn 留痕），要么被 409 拒绝（op 不产生）。SQL 层保留换代 CAS
 /// （predecessor 精确匹配）与墓碑写入；predecessor CAS 不匹配的陈旧副本
