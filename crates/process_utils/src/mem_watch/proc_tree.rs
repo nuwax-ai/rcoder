@@ -1,7 +1,8 @@
 //! `/proc` 解析与候选选择。
 //!
-//! 本模块是**纯函数**：不读真实 `/proc`、不做 IO，输入是解析后的进程表，
-//! 因此可以在任意平台（含 macOS 开发机）跑单测。
+//! 本模块是**纯函数**：不读真实 `/proc`、不做 IO，输入是已采集的进程表
+//! （采集与解析在 [`super::sys`]，由 `procfs` 完成），因此可以在任意平台
+//! （含 macOS 开发机）跑单测。
 
 use std::collections::{HashMap, HashSet};
 
@@ -20,57 +21,6 @@ pub struct ProcInfo {
     /// 用户态/内核态 CPU 时间（clock ticks，除以 `sysconf(SC_CLK_TCK)` 得秒）。
     pub utime_ticks: u64,
     pub stime_ticks: u64,
-}
-
-/// `)` 之后字段的下标（`state` 记为 0）。
-const FIELD_PPID: usize = 1;
-const FIELD_PGRP: usize = 2;
-const FIELD_UTIME: usize = 11;
-const FIELD_STIME: usize = 12;
-const FIELD_STARTTIME: usize = 19;
-const FIELD_RSS: usize = 21;
-/// `/proc/stat` 的字段个数下限（rss 之后的字段不需要）。
-const MIN_FIELDS: usize = FIELD_RSS + 1;
-
-/// 解析一行 `/proc/<pid>/stat`。
-///
-/// 格式：`pid (comm) state ppid ...`
-/// `comm` 可能包含空格和括号（甚至 `)`），所以必须按**最后一个** `)` 切分。
-pub fn parse_stat(pid: u32, line: &[u8], page_size: u64) -> Option<ProcInfo> {
-    let rparen = line.iter().rposition(|b| *b == b')')?;
-    let lparen = line.iter().position(|b| *b == b'(')?;
-    if rparen <= lparen {
-        return None;
-    }
-    let comm = String::from_utf8_lossy(&line[lparen + 1..rparen]).into_owned();
-
-    let tail = &line[rparen + 1..];
-    let fields: Vec<&[u8]> = tail
-        .split(|b| b.is_ascii_whitespace())
-        .filter(|f| !f.is_empty())
-        .collect();
-    if fields.len() < MIN_FIELDS {
-        return None;
-    }
-
-    let parse =
-        |idx: usize| -> Option<u64> { std::str::from_utf8(fields[idx]).ok()?.parse::<u64>().ok() };
-
-    let ppid = u32::try_from(parse(FIELD_PPID)?).ok()?;
-    let pgrp = u32::try_from(parse(FIELD_PGRP)?).ok()?;
-    let starttime = parse(FIELD_STARTTIME)?;
-    let rss_pages = parse(FIELD_RSS)?;
-
-    Some(ProcInfo {
-        pid,
-        ppid,
-        pgrp,
-        comm,
-        rss_bytes: rss_pages.saturating_mul(page_size),
-        starttime,
-        utime_ticks: parse(FIELD_UTIME)?,
-        stime_ticks: parse(FIELD_STIME)?,
-    })
 }
 
 /// 以 `root` 为起点收集所有后代（不含 `root` 自己）。
@@ -211,21 +161,6 @@ pub fn subtree_targets(
 mod tests {
     use super::*;
 
-    const PS: u64 = 4096;
-
-    /// 构造一行 stat（字段下标与解析器一致）。
-    fn stat_line(pid: u32, comm: &str, ppid: u32, rss_pages: u64, starttime: u64) -> Vec<u8> {
-        let mut fields = vec!["0".to_string(); MIN_FIELDS];
-        fields[0] = "S".to_string();
-        fields[FIELD_PPID] = ppid.to_string();
-        fields[FIELD_PGRP] = ppid.to_string();
-        fields[FIELD_UTIME] = "7".to_string();
-        fields[FIELD_STIME] = "3".to_string();
-        fields[FIELD_STARTTIME] = starttime.to_string();
-        fields[FIELD_RSS] = rss_pages.to_string();
-        format!("{pid} ({comm}) {}", fields.join(" ")).into_bytes()
-    }
-
     fn info(pid: u32, ppid: u32, rss_bytes: u64, starttime: u64) -> ProcInfo {
         ProcInfo {
             pid,
@@ -237,34 +172,6 @@ mod tests {
             utime_ticks: 7,
             stime_ticks: 3,
         }
-    }
-
-    #[test]
-    fn parses_basic_stat() {
-        let parsed = parse_stat(42, &stat_line(42, "python3", 7, 100, 12345), PS).unwrap();
-        assert_eq!(parsed.pid, 42);
-        assert_eq!(parsed.ppid, 7);
-        assert_eq!(parsed.comm, "python3");
-        assert_eq!(parsed.rss_bytes, 100 * PS);
-        assert_eq!(parsed.starttime, 12345);
-        assert_eq!(parsed.pgrp, 7);
-        assert_eq!(parsed.utime_ticks, 7);
-        assert_eq!(parsed.stime_ticks, 3);
-    }
-
-    #[test]
-    fn parses_comm_with_spaces_and_parens() {
-        // 内核允许 comm 里有空格和括号，必须按最后一个 ')' 切
-        let line = stat_line(9, "my (weird) proc", 1, 5, 99);
-        let parsed = parse_stat(9, &line, PS).unwrap();
-        assert_eq!(parsed.comm, "my (weird) proc");
-        assert_eq!(parsed.ppid, 1);
-    }
-
-    #[test]
-    fn rejects_truncated_stat() {
-        assert!(parse_stat(1, b"1 (x) S 0", PS).is_none());
-        assert!(parse_stat(1, b"", PS).is_none());
     }
 
     #[test]

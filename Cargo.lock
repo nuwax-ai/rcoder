@@ -10283,6 +10283,7 @@ dependencies = [
  "anyhow",
  "nix 0.31.3",
  "process-wrap",
+ "procfs",
  "rustix 1.1.6",
  "serde",
  "serde_json",

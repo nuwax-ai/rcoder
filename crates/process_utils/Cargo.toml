@@ -32,3 +32,8 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_
 which = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
+
+# procfs 只支持 Linux/Android:macOS 开发机上不参与构建,
+# 这样 process_utils 仍能跨平台编译(cfg(target_os="linux") 之外的路径不用它)。
+[target.'cfg(target_os = "linux")'.dependencies]
+procfs = { workspace = true }

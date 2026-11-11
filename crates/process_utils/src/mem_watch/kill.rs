@@ -88,9 +88,8 @@ mod imp {
 
     /// 读 `/proc/<pid>/stat` 的 starttime（第 22 字段）。不存在返回 `None`。
     fn current_starttime(pid: u32) -> Option<u64> {
-        let raw = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
-        super::super::proc_tree::parse_stat(pid, &raw, super::super::sys::page_size())
-            .map(|info| info.starttime)
+        // 复用 sys::read_pid：不要再写一份 /proc/<pid>/stat 读取与解析
+        super::super::sys::read_pid(pid).map(|info| info.starttime)
     }
 
     /// Linux 的 ESRCH（No such process）。各架构取值一致，恒为 3。
@@ -229,11 +228,9 @@ mod tests {
 
     fn target_of(child: &tokio::process::Child) -> KillTarget {
         let pid = child.id().expect("pid");
-        let raw = std::fs::read(format!("/proc/{pid}/stat")).expect("stat");
-        let starttime =
-            crate::mem_watch::proc_tree::parse_stat(pid, &raw, crate::mem_watch::sys::page_size())
-                .expect("parse")
-                .starttime;
+        let starttime = crate::mem_watch::sys::read_pid(pid)
+            .expect("/proc/<pid>/stat 可读")
+            .starttime;
         KillTarget { pid, starttime }
     }
 
@@ -320,7 +317,7 @@ mod tests {
         let target = target_of(&child);
         // 在 grace 窗口内等待并回收,模拟 PID 1 及时 reap
         let reaper = tokio::spawn(async move {
-            let _ = child.wait().await;
+            drop(child.wait().await);
         });
         let report = terminate_many(&[target], Duration::from_millis(600)).await;
         reaper.await.expect("reaper join");
