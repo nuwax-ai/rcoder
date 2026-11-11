@@ -8,6 +8,10 @@ use toasty_core::schema::db::Type;
 use super::store_repo::outcome;
 use crate::{db::models::Container, pg::project_store::persist_ops::ContainerSnapshot};
 
+/// Observed admission（守卫 workload 变更）：write-behind 测试路径与
+/// builder 注册测试沿用；生产 durable RegisterProject 已改走
+/// [`upsert_verified_replacement_container`]（门禁内已裁决 workload 换代）。
+#[cfg(test)]
 pub(in crate::pg) async fn upsert_container(
     tx: &mut dyn Executor,
     c: &ContainerSnapshot,

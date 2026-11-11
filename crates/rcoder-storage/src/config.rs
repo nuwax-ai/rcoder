@@ -27,6 +27,18 @@ pub const DEFAULT_PG_DURABLE_COMMIT_TIMEOUT_MS: u64 = 15_000;
 /// 支持的跨平台运行预算上限，避免未受约束的 u64 配置进入 Instant 运算。
 pub const MAX_PG_DURABLE_COMMIT_TIMEOUT_MS: u64 = i32::MAX as u64;
 
+/// 绑定门禁自愈默认值：开启。
+/// 背景（生产 2026-11-11 事故）：PG 绑定行异常缺失（行+墓碑俱无）或带外
+/// workload 换代（kubectl delete pod / 节点宕机重建）时，门禁拒绝导致用户
+/// 永久 500，唯一恢复手段是重启 central rcoder 进程。自愈开启后：
+/// - AnomalousAbsent：镜像持有完整旧 identity 时补写墓碑，按自我换代放行；
+/// - Bound+UID 不匹配：按带外换代走既有换代事务放行（写墓碑留痕）。
+///
+/// 信任边界：K8s RBAC 管谁能操作集群，业务鉴权在平台前置层。
+fn default_binding_autoheal() -> bool {
+    true
+}
+
 /// `[storage.postgres]` 配置段
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -56,6 +68,10 @@ pub struct PostgresConfig {
     pub max_lifetime_secs: Option<u64>,
     /// durable 提交链路总预算毫秒（默认 15000，支持 1..=i32::MAX；独立于语句和锁超时）
     pub durable_commit_timeout_ms: Option<u64>,
+    /// 绑定门禁自愈（默认 true；false 恢复保守行为：AnomalousAbsent 拒绝、
+    /// 带外 workload 替换 409）。env：`RCODER_PG_BINDING_AUTOHEAL`
+    #[serde(default = "default_binding_autoheal")]
+    pub binding_autoheal: bool,
 }
 
 impl std::fmt::Debug for PostgresConfig {
@@ -82,6 +98,7 @@ impl Default for PostgresConfig {
             statement_timeout_secs: Some(DEFAULT_PG_STATEMENT_TIMEOUT_SECS),
             max_lifetime_secs: Some(DEFAULT_PG_MAX_LIFETIME_SECS),
             durable_commit_timeout_ms: Some(DEFAULT_PG_DURABLE_COMMIT_TIMEOUT_MS),
+            binding_autoheal: default_binding_autoheal(),
         }
     }
 }
@@ -250,6 +267,12 @@ impl PostgresConfig {
             self.durable_commit_timeout_ms
                 .unwrap_or(DEFAULT_PG_DURABLE_COMMIT_TIMEOUT_MS),
         )
+    }
+
+    /// 绑定门禁自愈开关（裸 bool，serde default 已保证 true；此处保留方法
+    /// 形态与相邻 getter 一致，便于未来叠加运行时切换）
+    pub fn binding_autoheal(&self) -> bool {
+        self.binding_autoheal
     }
 
     /// 在接收请求或建立数据库连接前拒绝无效预算；不静默修正配置。

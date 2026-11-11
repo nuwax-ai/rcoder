@@ -373,14 +373,18 @@ impl PgStore {
                         physical_uid.is_some(),
                         "A placeholder cannot clear a bound container identity"
                     );
-                    // 契约三行3/§1.2：同名 workload 对象已被替换 → 禁止自动换代
-                    // 重绑——自动接管会把 projects/sessions 绑到别人的 workload 上。
+                    // 契约三行3/§1.2：同名 workload 对象已被替换时的准入裁决。
                     // 裁决依据是权威快照（containers 行 + tombstone），内存镜像
                     // 只是缓存：本系统已退役（tombstone 在案）的自我换代放行；
-                    // DB 绑定仍指向在案的旧 workload 属真外部替换，拒绝（409）；
-                    // 行与 tombstone 俱无属手工动库等异常状态，同样拒绝。
+                    // DB 绑定仍指向在案的旧 workload（带外换代：kubectl 重启
+                    // pod / 节点宕机重建 / 驱逐）在 binding_autoheal 开启时按
+                    // 换代事务放行并写墓碑留痕（生产 2026-11-11 前曾 409 拒绝
+                    // 且重启进程无效）；关闭开关恢复 409 拒绝。
+                    // 行与 tombstone 俱无：读路径自愈补写墓碑（authoritative.rs），
+                    // 无法自愈的（identity 残缺/墓碑冲突）仍拒绝。
                     // 任一方缺 workload UID（Docker/bare-pod/Deployment 族）不进
-                    // 此门，按既有换代事务走。
+                    // 此门，按既有换代事务走。信任边界：K8s RBAC 管集群操作权，
+                    // 业务鉴权在平台前置层。
                     let observed = basic.workload_uid.as_deref();
                     let mirror_mismatch = match (registered_workload_uid.as_deref(), observed) {
                         (Some(registered), Some(observed)) => registered != observed,
@@ -407,13 +411,26 @@ impl PgStore {
                                     (registered.as_deref(), observed)
                                     && registered != observed
                                 {
-                                    return Err(anyhow::Error::new(
-                                        shared_types::ContainerWorkloadReplaced {
-                                            container_name: key.clone(),
-                                            registered_workload_uid: registered.to_string(),
-                                            observed_workload_uid: observed.to_string(),
-                                        },
-                                    ));
+                                    if self.postgres_config.binding_autoheal() {
+                                        // 带外换代放行：走下方既有换代事务
+                                        // （旧代写墓碑 + 新代落库，row_revision CAS
+                                        // 保护并发）。warn 留审计痕迹。
+                                        tracing::warn!(
+                                            container = %key,
+                                            registered_workload_uid = registered,
+                                            observed_workload_uid = observed,
+                                            "binding autoheal: accepting an out-of-band \
+                                             workload replacement and retiring the stale binding"
+                                        );
+                                    } else {
+                                        return Err(anyhow::Error::new(
+                                            shared_types::ContainerWorkloadReplaced {
+                                                container_name: key.clone(),
+                                                registered_workload_uid: registered.to_string(),
+                                                observed_workload_uid: observed.to_string(),
+                                            },
+                                        ));
+                                    }
                                 }
                             }
                         },

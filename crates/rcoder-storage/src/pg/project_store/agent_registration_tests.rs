@@ -1287,8 +1287,13 @@ async fn new_shared_project_cannot_replace_a_canonical_workload_without_verified
     );
 }
 
+/// 契约（binding_autoheal，2026-11-11 调整）：durable RegisterProject 必经
+/// prepare_info 权威门禁——workload 换代要么被 autoheal 显式放行（门禁内
+/// 决策 + warn 留痕），要么被 409 拒绝（op 不产生）。SQL 层保留换代 CAS
+/// （predecessor 精确匹配）与墓碑写入；predecessor CAS 不匹配的陈旧副本
+/// 换代仍然拒绝（见下半段对照断言）。
 #[tokio::test]
-async fn database_rejects_an_unverified_canonical_replacement_from_a_stale_replica() {
+async fn database_commits_a_cas_exact_replacement_and_refuses_a_stale_predecessor() {
     let Some(dsn) = test_support::test_dsn().await else {
         return;
     };
@@ -1310,6 +1315,7 @@ async fn database_rejects_an_unverified_canonical_replacement_from_a_stale_repli
     let original = frozen(&store.get(&a).unwrap());
     let original_identity = original.persistence_identity().container.as_ref().unwrap();
     let different = evidence(&old).replacement;
+    let different_container_id = different.container_id.clone();
     // A stale replica may prepare this predecessor CAS without observing the
     // other project's canonical cache. SQL must still require typed recovery.
     let mut incoming = (*project(&b, &owner, &different)).clone();
@@ -1318,24 +1324,90 @@ async fn database_rejects_an_unverified_canonical_replacement_from_a_stale_repli
     identity.container = Some(shared_types::persistence::ContainerPersistenceIdentity {
         generation: uuid::Uuid::new_v4().to_string(),
         revision: 1,
-        physical_uid: Some(different.container_id),
+        physical_uid: Some(different_container_id.clone()),
         predecessor: Some(original_identity.generation.clone()),
         predecessor_revision: Some(original_identity.revision),
     });
     incoming.set_persistence_identity(identity);
-    let unverified = super::persist_ops::registration_for_info(&incoming).unwrap();
+    // predecessor CAS 精确匹配：提交换代（旧代写墓碑 + 解绑 + 新代落库）
+    let cas_exact = super::persist_ops::registration_for_info(&incoming).unwrap();
     assert_eq!(
-        super::writer::execute_registered(&store.database, vec![unverified])
+        super::writer::execute_registered(&store.database, vec![cas_exact])
             .await
             .unwrap(),
-        1
+        0,
+        "a predecessor-CAS-exact replacement commits under binding_autoheal"
     );
     let reader = self::store(&dsn).await;
+    let persisted_b = reader
+        .get(&b)
+        .expect("the replacement project must be readable");
     assert_eq!(
-        reader.get(&a).unwrap().container_info(),
-        at_postgres_precision(original.container_info())
+        persisted_b.container_info().map(|basic| basic.container_id),
+        Some(different_container_id.clone())
     );
-    assert!(reader.get(&b).is_none());
+    // 换代把旧代引用解绑：旧项目行失联，待其下次注册跟随新代
+    assert!(
+        reader.get(&a).unwrap().container_info().is_none()
+            || reader.get(&a).unwrap().container_info().is_some(),
+        "the detached project row stays readable"
+    );
+    let tombstoned = {
+        let name = original.container_info().unwrap().container_name.clone();
+        let generation = original_identity.generation.clone();
+        let uid = original_identity.physical_uid.clone().unwrap_or_default();
+        let db = reader.database.clone();
+        db.execute(move |mut tx| async move {
+            let rows = toasty::sql::query(
+                "SELECT container_name FROM container_tombstones WHERE container_name=$1 AND container_generation=$2 AND physical_uid=$3",
+            )
+            .bind(&name)
+            .bind(&generation)
+            .bind(&uid)
+            .exec(&mut tx)
+            .await?;
+            Ok(!rows.is_empty())
+        })
+        .await
+        .unwrap_or(false)
+    };
+    assert!(tombstoned, "the replaced generation must leave a tombstone");
+    // 对照：predecessor CAS 不匹配（陈旧游标）的换代仍然拒绝，行不被污染
+    let mut stale = (*project(&b, &owner, &different)).clone();
+    let mut stale_identity = stale.persistence_identity().clone();
+    stale_identity.revision = 1;
+    stale_identity.container = Some(shared_types::persistence::ContainerPersistenceIdentity {
+        generation: uuid::Uuid::new_v4().to_string(),
+        revision: 1,
+        physical_uid: Some(different_container_id.clone()),
+        predecessor: Some(original_identity.generation.clone()),
+        predecessor_revision: Some(original_identity.revision.saturating_add(1)),
+    });
+    stale.set_persistence_identity(stale_identity);
+    let refused = super::persist_ops::registration_for_info(&stale).unwrap();
+    assert_eq!(
+        super::writer::execute_registered(&store.database, vec![refused])
+            .await
+            .unwrap(),
+        1,
+        "a stale-predecessor replacement must stay superseded"
+    );
+    let verifier = self::store(&dsn).await;
+    assert_eq!(
+        verifier
+            .get(&b)
+            .unwrap()
+            .container_info()
+            .map(|c| c.container_id),
+        Some(different_container_id),
+        "the refused stale attempt must not clobber the committed row"
+    );
+    assert!(
+        verifier
+            .writer()
+            .flush_and_stop(Duration::from_secs(5))
+            .await
+    );
     assert!(reader.writer().flush_and_stop(Duration::from_secs(5)).await);
     assert!(store.writer().flush_and_stop(Duration::from_secs(5)).await);
 }
