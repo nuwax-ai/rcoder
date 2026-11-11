@@ -574,14 +574,14 @@ pub(in crate::pg) async fn execute_op(
                 .await?;
             let mut outcome = PersistenceOperationOutcome::Committed;
             if let Some(container) = container {
-                // RegisterProject 仅由 durable 注册路径产生（durable.rs:106），
+                // RegisterProject 仅由 durable 注册路径产生（durable.rs），
                 // 必经 prepare_info 的权威门禁：workload 变化要么经
                 // binding_autoheal 显式放行（带外换代，写墓碑留痕），要么在
                 // 门禁被 409 拒绝（op 不会产生）。此处走 VerifiedReplacement
                 // admission——跳过对"已过门禁者"的重复 workload 拦截；
                 // 换代 CAS（predecessor 精确匹配）与墓碑写入全额保留。
-                // write-behind 的 UpsertContainer 路径不受影响，仍按 Observed
-                // 守卫拦截。
+                // 注：PersistOp::UpsertContainer（Observed admission）本身是
+                // cfg(test) 故障注入专用，生产注册不可分割、无独立容器 upsert。
                 outcome = repo::upsert_verified_replacement_container(db, container).await?;
             }
             if outcome == PersistenceOperationOutcome::Committed {
