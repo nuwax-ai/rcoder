@@ -160,6 +160,13 @@ pub fn sample_agent_resources(
         return None;
     }
 
+    // 采样时刻必须在这里就取,不能放到复核之后:
+    // 旧样本可能在"复核通过"与"取 now"之间被抢占,恢复后拿到比新执行基线
+    // **更晚**的 Instant,于是 advance_cpu_baseline 里的 `baseline.at > now`
+    // 迟到保护失效,旧执行会覆盖新执行的基线。先取时刻可保证"越早的样本
+    // 时刻越早",迟到保护才成立。
+    let now = Instant::now();
+
     // 扫描结束复核:扫描期间发生换代(execution/pgid 变化)的迟到样本直接
     // 丢弃——样本可能混有旧组进程,不得计入也不得覆盖新代次基线。
     let still_current = AGENT_REGISTRY
@@ -179,7 +186,6 @@ pub fn sample_agent_resources(
         return None;
     }
 
-    let now = Instant::now();
     let cpu_percent = advance_cpu_baseline(project_id, execution, pgid, total_ticks, now, tps).0;
 
     Some(AgentResourceSample {
@@ -590,6 +596,87 @@ fn looks_like_secret(value: &str) -> bool {
     has_upper && has_digit
 }
 
+/// 参数内部出现即视为凭据的键名（后接分隔符才算，避免误伤 tokenizer 这类词）。
+#[cfg(any(target_os = "linux", test))]
+const INLINE_SECRET_KEYS: &[&str] = &[
+    "authorization",
+    "x-api-key",
+    "api-key",
+    "apikey",
+    "access-token",
+    "access_token",
+    "bearer",
+    "password",
+    "passwd",
+    "secret",
+    "token",
+];
+
+/// 遮盖参数**内部**的 `键名: 值` / `键名=值` 形态。
+///
+/// 为什么需要它：`looks_like_secret` 只处理"整个参数是个值"的情况，而真实
+/// 命令行里凭据常嵌在更长的参数中，典型是 HTTP 头：
+///
+///     sh -c "curl -H 'Authorization: Bearer example-secret' https://…"
+///
+/// 这个参数带空格、引号、冒号，字符集校验必然失败 → 原样输出。这里按键名
+/// 定位后**从分隔符起整段遮盖**（宁可多掩，观测价值换不来凭据安全）。
+///
+/// 键名后必须紧跟分隔符（`:` / `=` / 空白）才算命中，因此
+/// `node tokenizer.js`、`sh -c openui-mcp` 这类普通命令不受影响。
+#[cfg(any(target_os = "linux", test))]
+fn redact_inline_secret(arg: &str) -> Option<String> {
+    let lower = arg.to_ascii_lowercase();
+    let mut hit: Option<(usize, usize)> = None; // (键起点, 键长)
+    for key in INLINE_SECRET_KEYS {
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(key) {
+            let start = from + pos;
+            let end = start + key.len();
+            let next = lower[end..].chars().next();
+            if matches!(next, Some(':') | Some('=') | Some(' ') | Some('\t')) {
+                if hit.is_none_or(|(best, _)| start < best) {
+                    hit = Some((start, key.len()));
+                }
+                break;
+            }
+            from = end;
+        }
+    }
+    let (start, key_len) = hit?;
+    let mut head_end = start + key_len;
+    // 连分隔符一起保留，遮盖从分隔符之后开始
+    if let Some(sep) = arg[head_end..].chars().next()
+        && matches!(sep, ':' | '=')
+    {
+        head_end += sep.len_utf8();
+    }
+    Some(format!("{}{MASK}", &arg[..head_end]))
+}
+
+/// 遮盖 URL 里的 userinfo（`scheme://user:pass@host` → `scheme://***@host`）。
+///
+/// 为什么需要它：`redis-cli -u redis://:example-password@localhost:6379/0`
+/// 里的密码含 `:` 和 `@`，不在 `looks_like_secret` 允许的字符集内，会被
+/// 判成"不像凭据"而原文输出。这是结构性问题（URL userinfo 位置固定），
+/// 只能按结构识别，加多少 token 前缀都盖不住。
+#[cfg(any(target_os = "linux", test))]
+fn redact_url_userinfo(arg: &str) -> Option<String> {
+    let scheme_at = arg.find("://")?;
+    let rest = &arg[scheme_at + 3..];
+    let at = rest.find('@')?;
+    // `@` 必须出现在路径之前，否则是路径里恰好带 @，不按 userinfo 处理
+    if let Some(slash) = rest.find('/')
+        && at > slash
+    {
+        return None;
+    }
+    if at == 0 {
+        return None;
+    }
+    Some(format!("{}{MASK}{}", &arg[..scheme_at + 3], &rest[at..]))
+}
+
 /// 脱敏后的命令行(≤120 字符,NUL 分隔转空格)。
 ///
 /// 进程明细会经 `/computer/pod/resources` 暴露给观测端,而 `--token=xxx`
@@ -607,6 +694,15 @@ fn redact_cmdline(args: &[String]) -> String {
         if mask_next {
             out.push(MASK.to_owned());
             mask_next = false;
+            continue;
+        }
+        // 结构性脱敏优先：URL userinfo 与参数内嵌的 键名:值 / 键名=值
+        if let Some(masked) = redact_inline_secret(arg) {
+            out.push(masked);
+            continue;
+        }
+        if let Some(masked) = redact_url_userinfo(arg) {
+            out.push(masked);
             continue;
         }
         if let Some(eq) = arg.find('=') {
@@ -1237,6 +1333,60 @@ mod tests {
     // ==== 命令行脱敏(进程明细会经 HTTP 暴露) ====
     fn args(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 审查反例：URL userinfo 与 shell -c 里的 HTTP 头都必须被遮盖。
+    ///
+    /// 这两个反例在原实现下都会**原文输出**：`redis://:pass@` 含 `:`/`@`，
+    /// 不在 looks_like_secret 的字符集白名单内；`-c` 脚本含空格引号，同理。
+    #[test]
+    fn redacts_url_userinfo_and_inline_header_secrets() {
+        let got = redact_cmdline(&[
+            "redis-cli".to_owned(),
+            "-u".to_owned(),
+            "redis://:example-password@localhost:6379/0".to_owned(),
+        ]);
+        assert!(
+            !got.contains("example-password"),
+            "URL userinfo 泄漏: {got}"
+        );
+
+        let got = redact_cmdline(&[
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "curl -H 'Authorization: Bearer example-secret' https://example.invalid".to_owned(),
+        ]);
+        assert!(!got.contains("example-secret"), "shell -c 凭据泄漏: {got}");
+
+        // 常见变体：X-Api-Key 头、Bearer 独立参数
+        let got = redact_cmdline(&[
+            "curl".to_owned(),
+            "-H".to_owned(),
+            "X-Api-Key: abc123".to_owned(),
+        ]);
+        assert!(!got.contains("abc123"), "X-Api-Key 泄漏: {got}");
+    }
+
+    /// 结构性脱敏不得误伤普通命令——面板靠 args 区分 MCP 等平台服务。
+    #[test]
+    fn redaction_keeps_ordinary_commands_readable() {
+        assert_eq!(
+            redact_cmdline(&["sh".to_owned(), "-c".to_owned(), "openui-mcp".to_owned()]),
+            "sh -c openui-mcp"
+        );
+        assert_eq!(
+            redact_cmdline(&["node".to_owned(), "tokenizer.js".to_owned()]),
+            "node tokenizer.js",
+            "tokenizer 含 token 但不是键名,不应被掩"
+        );
+        assert_eq!(
+            redact_cmdline(&[
+                "npm".to_owned(),
+                "exec".to_owned(),
+                "@nuwax-ai/openui-mcp".to_owned()
+            ]),
+            "npm exec @nuwax-ai/openui-mcp"
+        );
     }
 
     #[test]

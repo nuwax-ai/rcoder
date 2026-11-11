@@ -292,6 +292,11 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
             project_id, session_id, error.code, error.message, request_id
         );
 
+        // 与 notify_prompt_end 对齐：时间界必须在 await 之前取。
+        // 若放到 await 之后，期间同一 session 开启的新一轮，其 start 会
+        // 早于这个迟到的时间界，remove_if 就会把**新轮**的指标删掉。
+        let error_began_at = Instant::now();
+
         // 1. 推送错误消息（在恢复状态之前）
         let expected_request_id = request_id.clone();
         let result = self
@@ -310,7 +315,6 @@ impl<R: SessionRegistry + 'static> SessionNotifier for StateAwareNotifier<R> {
         // 3. 观测：清理本轮计时（错误事件自身已由 error! 记录，不输出汇总）
         // 同 PromptEnd：只清"本轮 error 开始前就已存在"的条目。
         let key: RoundKey = (project_id.to_owned(), session_id.to_owned());
-        let error_began_at = Instant::now();
         drop(self.round_metrics.remove_if(&key, |_, m| {
             round_metrics_belong_to_round(m.start, error_began_at)
         }));

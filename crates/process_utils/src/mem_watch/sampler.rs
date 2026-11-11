@@ -84,11 +84,10 @@ pub async fn run(config: Config) {
 /// 1. 定位失败（读不到 `/proc/self/cgroup` v2 行）；
 /// 2. env 覆盖的限额与实测 `memory.max` 不一致——典型是 host cgroup namespace
 ///    下根路径给出整机用量，却和容器限额比大小。
-fn scope_ok(cfg: &Config, probe: &cgroup::CgroupProbe, limit: u64, warned: &mut bool) -> bool {
-    if cfg.limit_override.is_none() {
-        // 没有覆盖：限额就是从本组读出来的，天然同源
-        return true;
-    }
+fn scope_ok(probe: &cgroup::CgroupProbe, limit: u64, warned: &mut bool) -> bool {
+    // 不论限额来自 env 覆盖还是本组 memory.max，都要求与本组实测一致。
+    // 原实现在"无 override"时直接放行，前提是"限额从本组读出"——但限额此前
+    // 读的是固定根路径，host cgroupns 下与本组不同源，该前提不成立。
     if probe.confirms(limit) {
         return true;
     }
@@ -96,9 +95,9 @@ fn scope_ok(cfg: &Config, probe: &cgroup::CgroupProbe, limit: u64, warned: &mut 
         *warned = true;
         tracing::error!(
             event = "mem_watch.scope_mismatch",
-            reason = probe
-                .unresolved()
-                .unwrap_or("limit override does not match this cgroup's memory.max"),
+            reason = probe.unresolved().unwrap_or(
+                "limit does not match this cgroup's memory.max; usage and limit are not the same group"
+            ),
             limit_bytes = limit,
             cgroup_max_bytes = probe.max(),
             cgroup_relpath = %probe.relpath(),
@@ -115,12 +114,12 @@ async fn step(
     last_action: &mut Option<Instant>,
     scope_warned: &mut bool,
 ) {
-    let Some(limit) = cfg.effective_limit() else {
+    let Some(limit) = cfg.effective_limit(probe) else {
         // 无限额信息：host cgroup namespace（容器内 memory.max=max）且没有
         // env 覆盖——看门狗无法判断阈值，保持空闲（安全方向）。
         return;
     };
-    if !scope_ok(cfg, probe, limit, scope_warned) {
+    if !scope_ok(probe, limit, scope_warned) {
         return;
     }
 
@@ -417,66 +416,58 @@ mod tests {
     fn scope_ok_rejects_mismatched_limit_override() {
         // host cgroupns 误杀的防线:覆盖限额与实测 memory.max 不一致 → 拒绝淘汰
         let p = probe(Some(4 << 30), None);
-        let cfg = Config {
-            limit_override: Some(512 << 20),
-            ..Config::default()
-        };
         let mut warned = false;
         assert!(
-            !scope_ok(&cfg, &p, 512 << 20, &mut warned),
+            !scope_ok(&p, 512 << 20, &mut warned),
             "限额来自别处时必须拒绝"
         );
         assert!(warned, "拒绝必须留痕(且只报一次)");
 
         // 第二次沿用同一标记,不重复告警
         let before = warned;
-        assert!(!scope_ok(&cfg, &p, 512 << 20, &mut warned));
+        assert!(!scope_ok(&p, 512 << 20, &mut warned));
         assert_eq!(warned, before);
-    }
-
-    #[test]
-    fn scope_ok_accepts_matching_override_and_no_override() {
-        let p = probe(Some(4 << 30), None);
-
-        // 无覆盖:限额本就来自本组,天然同源
-        let cfg = Config::default();
-        let mut w = false;
-        assert!(scope_ok(&cfg, &p, 4 << 30, &mut w));
-        assert!(!w, "无需告警");
-
-        // 覆盖值与实测一致:放行
-        let cfg = Config {
-            limit_override: Some(4 << 30),
-            ..Config::default()
-        };
-        let mut w = false;
-        assert!(scope_ok(&cfg, &p, 4 << 30, &mut w));
-        assert!(!w);
     }
 
     #[test]
     fn scope_ok_rejects_unresolved_probe() {
         let broken = probe(None, Some("cannot read /proc/self/cgroup"));
-        let cfg = Config {
-            limit_override: Some(4 << 30),
-            ..Config::default()
-        };
         let mut warned = false;
-        assert!(
-            !scope_ok(&cfg, &broken, 4 << 30, &mut warned),
-            "定位失败一律拒绝"
-        );
+        assert!(!scope_ok(&broken, 4 << 30, &mut warned), "定位失败一律拒绝");
         assert!(warned);
     }
 
     #[test]
-    fn scope_ok_ignores_mismatch_without_override() {
-        // 没有覆盖时不存在"两个来源",即使传入的 limit 与实测不同也放行
-        // (该 limit 就是从本组读出来的)
+    fn scope_ok_accepts_limit_matching_this_group() {
+        // 限额与本组实测一致 → 放行（不论来自本组 memory.max 还是 env 覆盖）
         let p = probe(Some(4 << 30), None);
-        let cfg = Config::default();
         let mut warned = false;
-        assert!(scope_ok(&cfg, &p, 1 << 30, &mut warned));
-        assert!(!warned);
+        assert!(scope_ok(&p, 4 << 30, &mut warned));
+        assert!(!warned, "同源时不该告警");
+    }
+
+    /// 回归（审查 P2-3）：无 env override 时，若传入限额与本组实测不一致，
+    /// 必须拒绝而不是放行。
+    ///
+    /// 原实现的前提是"没有 override ⇒ 限额就是从本组读出来的"，但限额当时读的是
+    /// 固定根路径 `/sys/fs/cgroup/memory.max`。host cgroup namespace 下根是宿主
+    /// 整机限额，与容器子组不同源 —— 必须拒绝，否则就是"容器用量比宿主限额"。
+    #[test]
+    fn scope_ok_rejects_mismatch_without_override() {
+        let p = probe(Some(4 << 30), None);
+        let mut warned = false;
+        assert!(
+            !scope_ok(&p, 1 << 30, &mut warned),
+            "限额与本组 memory.max 不同源时必须拒绝"
+        );
+        assert!(warned, "拒绝时应记录一次 scope_mismatch");
+    }
+
+    /// 根路径 memory.max 为 `max`（probe 拿不到有限限额）时也不得放行。
+    #[test]
+    fn scope_ok_rejects_when_limit_unknown() {
+        let p = probe(None, None);
+        let mut warned = false;
+        assert!(!scope_ok(&p, 4 << 30, &mut warned));
     }
 }

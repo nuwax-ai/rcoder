@@ -123,15 +123,19 @@ pub fn read_memory_current(probe: &super::cgroup::CgroupProbe) -> Option<u64> {
     }
 }
 
-/// `memory.max`；`max`（无限制）返回 `None`。
-pub fn read_memory_max() -> Option<u64> {
+/// 本组 `memory.max`；`max`（无限制）返回 `None`。
+///
+/// 必须传 probe：host cgroup namespace 下 `/sys/fs/cgroup/memory.max` 是**宿主
+/// 整机**限额（通常为 `max`），拿它当容器限额会得到"无限额"→ 看门狗静默停摆；
+/// 若宿主恰好设了限额，则会用容器用量比宿主限额，阈值完全错误。
+pub fn read_memory_max(probe: &super::cgroup::CgroupProbe) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        let raw = std::fs::read_to_string(super::cgroup::MEMORY_MAX_PATH).ok()?;
-        super::cgroup::parse_limit(&raw)
+        super::cgroup::read_u64(&probe.max_path())
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = probe;
         None
     }
 }

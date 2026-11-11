@@ -127,13 +127,18 @@ impl Config {
         (limit as f64 * self.ratio) as u64
     }
 
-    /// 生效限额：显式覆盖优先，否则读 cgroup。
+    /// 生效限额：显式覆盖优先，否则读**本组** `memory.max`。
     ///
-    /// 覆盖值只是"候选"：调用方必须再用 [`cgroup::CgroupProbe::confirms`]
-    /// 与实测 `memory.max` 对账，确认用量和限额来自同一组，否则不淘汰
-    /// （host cgroup namespace 下根路径是整机用量，见 `cgroup` 模块文档）。
-    pub fn effective_limit(&self) -> Option<u64> {
-        self.limit_override.or_else(super::sys::read_memory_max)
+    /// 之前这里读的是固定根路径 `/sys/fs/cgroup/memory.max`，与用量
+    /// （probe 定位的容器子组）不同源。host cgroup namespace 下后果有两种：
+    /// 根为 `max` → 返回 None → 看门狗静默停摆；根为有限值 → 用容器用量比
+    /// 宿主限额，阈值错误。现在限额与用量都走同一个 [`cgroup::CgroupProbe`]。
+    ///
+    /// 覆盖值仍只是"候选"：调用方必须再用
+    /// [`cgroup::CgroupProbe::confirms`] 对账，见 `scope_ok`。
+    pub fn effective_limit(&self, probe: &super::cgroup::CgroupProbe) -> Option<u64> {
+        self.limit_override
+            .or_else(|| super::sys::read_memory_max(probe))
     }
 }
 
@@ -188,12 +193,13 @@ mod tests {
 
     #[test]
     fn effective_limit_prefers_override() {
+        let probe = super::super::cgroup::CgroupProbe::for_test("", Some(1 << 30), None);
         let mut cfg = Config::default();
         cfg.limit_override = Some(512 * 1024 * 1024);
-        assert_eq!(cfg.effective_limit(), Some(512 * 1024 * 1024));
+        assert_eq!(cfg.effective_limit(&probe), Some(512 * 1024 * 1024));
         cfg.limit_override = None;
         // 非 Linux（macOS 测试机）读不到 cgroup → None；Linux 有限制时返回真实值
-        let _ = cfg.effective_limit();
+        let _ = cfg.effective_limit(&probe);
     }
 
     #[test]

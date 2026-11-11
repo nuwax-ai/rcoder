@@ -304,7 +304,7 @@ impl PgStore {
             let verify_name = name.to_owned();
             let verify_generation = generation.to_owned();
             let verify_uid = physical_uid.to_owned();
-            let exact = super::database::read(&self.database, move |tx| {
+            let verify = super::database::read(&self.database, move |tx| {
                 Box::pin(async move {
                     super::repo::container_generation_is_retired(
                         tx,
@@ -314,9 +314,18 @@ impl PgStore {
                     )
                     .await
                 })
-            })
-            .await;
-            let confirmed = matches!(exact, Ok(true));
+            });
+            // 二次核验同样受 durable 总预算约束：并发副本补碑是正常触发途径，
+            // 若这里不套 deadline，DB 排队/连接等待会把整个调用拖过预算。
+            let exact = tokio::time::timeout_at(deadline, verify).await;
+            let confirmed = matches!(exact, Ok(Ok(true)));
+            if matches!(exact, Err(_)) {
+                tracing::warn!(
+                    container = name,
+                    "binding autoheal tombstone verification exceeded the durable deadline; keeping the refusal"
+                );
+                return Ok(false);
+            }
             if !confirmed {
                 tracing::warn!(
                     container = name,

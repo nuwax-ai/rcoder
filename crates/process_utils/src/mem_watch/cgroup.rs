@@ -129,6 +129,11 @@ impl CgroupProbe {
         join(&self.relpath, "memory.current")
     }
 
+    /// 本组的 `memory.max`（与 current/stat 同源）。
+    pub fn max_path(&self) -> PathBuf {
+        join(&self.relpath, "memory.max")
+    }
+
     pub fn stat_path(&self) -> PathBuf {
         join(&self.relpath, "memory.stat")
     }
