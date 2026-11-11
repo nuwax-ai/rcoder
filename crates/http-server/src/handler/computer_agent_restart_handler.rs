@@ -18,29 +18,12 @@
 use axum::extract::State;
 use axum::http::HeaderMap;
 use std::sync::Arc;
-use tracing::instrument;
+use tracing::{error, info, instrument, warn};
 
 use crate::{AppError, HttpResult, router::AppState};
 use shared_types::{ComputerAgentRestartResponse, ComputerAgentStopRequest};
 
 use super::utils::{I18nJsonOrQuery, extract_grpc_addr, get_locale_from_headers};
-
-/// 本文件专用日志宏。
-///
-/// 为什么不用裸 `info!/warn!/error!`：默认 `EnvFilter` 指令是
-/// `rcoder=debug,tower_http=debug,axum=info,hyper=info,tonic=info`
-/// （见 `rcoder-telemetry::subscriber`），而它的匹配方式是**目标字符串前缀**
-/// （tracing-subscriber `env/directive.rs`: `meta.target().starts_with(target)`）。
-/// `http_server` 这个 target 不以 `rcoder` 开头、也没有对应指令，于是整个
-/// http-server crate 的日志都是 OFF —— 本接口的日志一条都进不了日志文件。
-///
-/// 这里显式用 `rcoder::computer_agent_restart` 作为 target，让**本接口**的日志
-/// 可见，同时不动全局 filter，避免改变其他 handler 的日志行为。
-macro_rules! restart_log {
-    ($level:ident, $($arg:tt)*) => {
-        tracing::$level!(target: "rcoder::computer_agent_restart", $($arg)*)
-    };
-}
 
 /// 重启 Computer Agent
 ///
@@ -117,11 +100,9 @@ pub async fn computer_agent_restart(
     ) {
         Ok(super::pod_handler::AppTarget::NotApp) => {}
         Ok(super::pod_handler::AppTarget::Dev(app_id)) => {
-            restart_log!(
-                info,
+            info!(
                 "🔁 [COMPUTER_RESTART] userApp dev dispatch: app_id={}, session_id={:?}",
-                app_id,
-                request.session_id
+                app_id, request.session_id
             );
             let target = super::userapp_agent_target::resolve_agent_target(
                 &state,
@@ -156,7 +137,7 @@ pub async fn computer_agent_restart(
         .as_ref()
         .is_some_and(|s| !s.trim().is_empty());
     if !has_user_id && !has_pod_id {
-        restart_log!(error, "[COMPUTER_RESTART] user_id or pod_id is required");
+        error!("[COMPUTER_RESTART] user_id or pod_id is required");
         return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_VALIDATION,
             locale,
@@ -192,12 +173,9 @@ pub async fn computer_agent_restart(
         && !owner.is_empty()
         && owner != claimed
     {
-        restart_log!(
-            warn,
+        warn!(
             "⛔ [COMPUTER_RESTART] Owner mismatch: project_id={}, claimed user_id={}, owner={}",
-            project_id,
-            claimed,
-            owner
+            project_id, claimed, owner
         );
         return Ok(HttpResult::error_with_message(
             shared_types::error_codes::ERR_COMPUTER_OWNER_CONFLICT,
@@ -213,13 +191,9 @@ pub async fn computer_agent_restart(
     // mismatch）。所以不传 expected；代价是"点击重启到 RPC 到达之间若刚好有
     // 新对话 spawn 了新执行，会被一并停掉"——调用方若需要精确，可显式传
     // session_id（那时语义由调用方保证）。
-    restart_log!(
-        info,
+    info!(
         "🔁 [COMPUTER_RESTART] Starting to restart Agent: user_id={:?}, pod_id={:?}, project_id={}, session_id={:?}",
-        user_id,
-        pod_id,
-        project_id,
-        request.session_id
+        user_id, pod_id, project_id, request.session_id
     );
 
     // 2. 查找容器：project 映射优先（computer 与 userApp 开发对话都注册映射，
@@ -229,11 +203,9 @@ pub async fn computer_agent_restart(
         .get_project(project_id)
         .and_then(|p| p.container_info())
     {
-        restart_log!(
-            info,
+        info!(
             "📦 [COMPUTER_RESTART] Container resolved from project mapping: project_id={}, container_id={}",
-            project_id,
-            mapped.container_id
+            project_id, mapped.container_id
         );
         Some(mapped)
     } else if has_user_id {
@@ -252,11 +224,9 @@ pub async fn computer_agent_restart(
     let container_info = match container_info {
         Some(info) => info,
         None => {
-            restart_log!(
-                warn,
+            warn!(
                 "[COMPUTER_RESTART] Container not found: user_id={:?}, pod_id={:?}",
-                user_id,
-                pod_id
+                user_id, pod_id
             );
             return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_CONTAINER_NOT_FOUND,
@@ -265,23 +235,20 @@ pub async fn computer_agent_restart(
         }
     };
 
-    restart_log!(
-        info,
+    info!(
         "📦 [COMPUTER_RESTART] Container found: container_id={}, ip={}",
-        container_info.container_id,
-        container_info.container_ip
+        container_info.container_id, container_info.container_ip
     );
 
     // 3. 通过 gRPC 调用 StopAgent RPC（重启 = 停止执行；agent_runner 侧
     //    进程退出确认与缓存清理复用既有链路，gRPC 层零改动）
-    restart_log!(
-        info,
+    info!(
         "🔄 [COMPUTER_RESTART] Preparing to call StopAgent RPC: project_id={}",
         project_id
     );
 
     let grpc_addr = extract_grpc_addr(&container_info.service_url)?;
-    restart_log!(info, "[COMPUTER_RESTART] gRPC addr: {}", grpc_addr);
+    info!("[COMPUTER_RESTART] gRPC addr: {}", grpc_addr);
 
     match crate::grpc::grpc_stop_agent_with_pool_and_session(
         &state.grpc_pool,
@@ -295,11 +262,9 @@ pub async fn computer_agent_restart(
     .await
     {
         Ok(response) => {
-            restart_log!(
-                info,
+            info!(
                 "📥 [COMPUTER_RESTART] Received StopAgent response: result={}, success={}",
-                response.result,
-                response.success
+                response.result, response.success
             );
 
             // 幂等成功的结果集合；错误分支如实返回（不伪造重启成功）。
@@ -330,14 +295,9 @@ pub async fn computer_agent_restart(
                     } else {
                         shared_types::get_i18n_message("success.agent_restart_idempotent", locale)
                     };
-                    restart_log!(
-                        info,
+                    info!(
                         "✅ [COMPUTER_RESTART] Agent restart completed: user_id={:?}, pod_id={:?}, project_id={}, result={}, resumed_session_id={:?}",
-                        user_id,
-                        pod_id,
-                        project_id,
-                        response.result,
-                        resumed_session_id
+                        user_id, pod_id, project_id, response.result, resumed_session_id
                     );
                     return Ok(HttpResult::success(ComputerAgentRestartResponse {
                         success: true,
@@ -356,12 +316,9 @@ pub async fn computer_agent_restart(
                     let current = state
                         .get_project(project_id)
                         .and_then(|project| project.session_id().map(str::to_owned));
-                    restart_log!(
-                        warn,
+                    warn!(
                         "[COMPUTER_RESTART] Session mismatch: project_id={}, expected={:?}, current={:?}",
-                        project_id,
-                        request.session_id,
-                        current
+                        project_id, request.session_id, current
                     );
                     return Ok(HttpResult::error_with_message(
                         shared_types::error_codes::ERR_CONFLICT,
@@ -377,18 +334,14 @@ pub async fn computer_agent_restart(
                     let err_msg = response
                         .message
                         .unwrap_or_else(|| "Unknown error".to_string());
-                    restart_log!(
-                        error,
-                        "[COMPUTER_RESTART] Agent restart failed: {}",
-                        err_msg
-                    );
+                    error!("[COMPUTER_RESTART] Agent restart failed: {}", err_msg);
                     return Ok(HttpResult::error_with_locale(
                         shared_types::error_codes::ERR_STOP_FAILED,
                         locale,
                     ));
                 }
                 other => {
-                    restart_log!(warn, "[COMPUTER_RESTART] unexpected result: {}", other);
+                    warn!("[COMPUTER_RESTART] unexpected result: {}", other);
                     return Ok(HttpResult::error_with_locale(
                         shared_types::error_codes::ERR_UNKNOWN,
                         locale,
@@ -397,11 +350,9 @@ pub async fn computer_agent_restart(
             }
         }
         Err(e) => {
-            restart_log!(
-                error,
+            error!(
                 "❌ [COMPUTER_RESTART] StopAgent RPC call failed: {}, project_id={}",
-                e,
-                project_id
+                e, project_id
             );
             return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_GRPC_ERROR,
@@ -465,11 +416,9 @@ async fn restart_userapp_dev(
     {
         Ok(response) => response,
         Err(error) => {
-            restart_log!(
-                error,
+            error!(
                 "[COMPUTER_RESTART][USERAPP] StopAgent RPC failed: app_id={}, project_id={}, error={error}",
-                target.binding.app_id,
-                target.binding.project_id
+                target.binding.app_id, target.binding.project_id
             );
             return Ok(HttpResult::error_with_locale(
                 shared_types::error_codes::ERR_GRPC_ERROR,
@@ -508,13 +457,9 @@ async fn restart_userapp_dev(
     } else {
         shared_types::get_i18n_message("success.agent_restart_idempotent", locale)
     };
-    restart_log!(
-        info,
+    info!(
         "[COMPUTER_RESTART][USERAPP] restart completed: app_id={}, project_id={}, result={}, resumed_session_id={:?} (binding preserved)",
-        target.binding.app_id,
-        target.binding.project_id,
-        response.result,
-        resumed_session_id
+        target.binding.app_id, target.binding.project_id, response.result, resumed_session_id
     );
     Ok(HttpResult::success(ComputerAgentRestartResponse {
         success: true,
