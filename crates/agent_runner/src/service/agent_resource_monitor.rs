@@ -709,11 +709,15 @@ pub fn agent_execution_summary(
         }
         if session_id.is_none() {
             session_id = Some(info.session_id.to_string());
+            // 全量匹配，不写 `_ =>`：以后新增 AgentStatus 变体时，这里
+            // 必须编译失败，避免新状态被悄悄当成"Processing"。
             status = match info.status {
+                // Pending = 任务已入队、等待 worker。对外仍是"忙"，与
+                // GetStatus 的 busy 口径一致。
+                crate::model::AgentStatus::Pending => "Processing",
+                crate::model::AgentStatus::Active => "Processing",
                 crate::model::AgentStatus::Idle => "Idle",
                 crate::model::AgentStatus::Terminating => "Terminating",
-                // Pending/Active 都是"在处理请求"
-                _ => "Processing",
             };
         }
     }
