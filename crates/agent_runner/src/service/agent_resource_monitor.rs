@@ -288,7 +288,17 @@ fn advance_cpu_baseline(
 /// 修剪注册表已不存在的 project 基线(自愈,无需挂钩每个注册表移除点)。
 #[cfg(target_os = "linux")]
 fn prune_stale_baselines() {
-    CPU_BASELINES.retain(|project_id, _| AGENT_REGISTRY.contains_project(project_id));
+    // 先取存活 project 的快照，再在 CPU_BASELINES 上过滤。
+    //
+    // 原写法 `CPU_BASELINES.retain(|k, _| AGENT_REGISTRY.contains_project(k))`
+    // 是"持 CPU_BASELINES 的写锁，再取 AGENT_REGISTRY 的读锁"——两把独立的
+    // DashMap 嵌套加锁。当前没有反向顺序（没有"持注册表锁再取基线锁"的路径），
+    // 所以不会死锁；但这种依赖加锁顺序的写法一旦将来被反向使用就是死锁，
+    // 而且 DashMap 不可重入、只在写方排队时偶发，极难排查。
+    // 拆开后任一时刻只持一把锁。
+    let live: std::collections::HashSet<String> =
+        AGENT_REGISTRY.all_project_ids().into_iter().collect();
+    CPU_BASELINES.retain(|project_id, _| live.contains(project_id));
 }
 
 // ==== 整容器资源采集(cgroup v2) ====
@@ -697,83 +707,80 @@ pub struct AgentExecutionSummary {
 /// 无注册执行时返回 None。
 ///
 /// **一个 user 容器可以承载多个 project**（工作目录 `/home/user/<project_id>`），
-/// 因此这里必须"选一个执行并只聚合它"，不能"取第一个的身份 + 聚合所有进程组"：
-/// 后者会报出会话 A 的 session_id 配两个会话之和的 RSS，且 DashMap 遍历顺序
-/// 不确定，session_id 会在轮询间跳变。选取规则：RSS 最大（内存压力下最该被
-/// 关注的执行），RSS 相同时按 session_id 升序兜底，保证结果可复现。
+/// 所以这里必须"选一个执行并只聚合它"：取第一个的身份 + 聚合所有进程组会
+/// 报出"会话 A 的 session_id 配两个会话之和的 RSS"。
+///
+/// 选谁：RSS 最大（内存压力下最该被关注的执行）；RSS 相同取 `session_id`
+/// 最小的。`execution_snapshots()` 已按 session_id 升序，因此"先遇到者胜"
+/// 就等于该兜底规则，结果**不依赖 DashMap 的遍历顺序**。
+///
+/// 复杂度：一次遍历进程表 + 一次遍历执行快照（≤ 并发上限），不做 n×m 重复扫描。
 #[cfg(target_os = "linux")]
 pub fn agent_execution_summary(
     table: &std::collections::HashMap<u32, process_utils::proc_scan::ProcInfo>,
 ) -> Option<AgentExecutionSummary> {
-    struct Candidate {
-        rss_bytes: u64,
-        session_id: String,
-        status: &'static str,
-        ticks: u64,
-        process_count: u32,
+    let executions = AGENT_REGISTRY.execution_snapshots();
+    let pgids: std::collections::HashSet<u32> =
+        executions.iter().filter_map(|exec| exec.pgid).collect();
+    if pgids.is_empty() {
+        return None;
     }
 
-    let mut best: Option<Candidate> = None;
-    for entry in AGENT_REGISTRY.iter_agents() {
-        let info = entry.value();
-        let Some(pgid) = info
-            .stop_handle
-            .as_ref()
-            .and_then(|handle| handle.agent_pgid())
-        else {
+    // 单次遍历进程表，按 pgid 累加
+    let mut totals: std::collections::HashMap<u32, (u64, u64, u32)> =
+        std::collections::HashMap::new();
+    for info in table.values() {
+        if !pgids.contains(&info.pgrp) {
+            continue;
+        }
+        let slot = totals.entry(info.pgrp).or_insert((0, 0, 0));
+        slot.0 = slot.0.saturating_add(info.rss_bytes);
+        slot.1 = slot
+            .1
+            .saturating_add(info.utime_ticks.saturating_add(info.stime_ticks));
+        slot.2 += 1;
+    }
+
+    let mut best: Option<(
+        u64,
+        &crate::service::agent_registry::ExecutionSnapshot,
+        u64,
+        u32,
+    )> = None;
+    for exec in &executions {
+        let Some(pgid) = exec.pgid else {
             continue;
         };
-        let mut rss_bytes: u64 = 0;
-        let mut ticks: u64 = 0;
-        let mut process_count: u32 = 0;
-        for proc in table.values() {
-            if proc.pgrp != pgid {
-                continue;
-            }
-            rss_bytes = rss_bytes.saturating_add(proc.rss_bytes);
-            ticks = ticks.saturating_add(proc.utime_ticks.saturating_add(proc.stime_ticks));
-            process_count += 1;
-        }
+        let Some(&(rss_bytes, ticks, process_count)) = totals.get(&pgid) else {
+            continue;
+        };
         if process_count == 0 {
             continue;
         }
-        // 全量匹配，不写 `_ =>`：以后新增 AgentStatus 变体时，这里必须
-        // 编译失败，避免新状态被悄悄当成"Processing"。
-        let status = match info.status {
-            // Pending = 任务已入队、等待 worker。对外仍是"忙"，
-            // 与 GetStatus 的 busy 口径一致。
-            crate::model::AgentStatus::Pending => "Processing",
-            crate::model::AgentStatus::Active => "Processing",
-            crate::model::AgentStatus::Idle => "Idle",
-            crate::model::AgentStatus::Terminating => "Terminating",
-        };
-        let session_id = info.session_id.to_string();
-        let better = match &best {
-            None => true,
-            Some(current) => {
-                rss_bytes > current.rss_bytes
-                    || (rss_bytes == current.rss_bytes && session_id < current.session_id)
-            }
-        };
-        if better {
-            best = Some(Candidate {
-                rss_bytes,
-                session_id,
-                status,
-                ticks,
-                process_count,
-            });
+        // 严格大于才替换：快照按 session_id 升序，因此并列时保留最小 session_id
+        if best.is_none_or(|(current, ..)| rss_bytes > current) {
+            best = Some((rss_bytes, exec, ticks, process_count));
         }
     }
 
-    let best = best?;
+    let (rss_bytes, exec, ticks, process_count) = best?;
+    // 全量匹配，不写 `_ =>`：以后新增 AgentStatus 变体时，这里必须编译失败，
+    // 避免新状态被悄悄当成"Processing"。
+    let status = match exec.status {
+        // Pending = 任务已入队、等待 worker。对外仍是"忙"，
+        // 与 GetStatus 的 busy 口径一致。
+        crate::model::AgentStatus::Pending => "Processing",
+        crate::model::AgentStatus::Active => "Processing",
+        crate::model::AgentStatus::Idle => "Idle",
+        crate::model::AgentStatus::Terminating => "Terminating",
+    };
     let tps = procfs::ticks_per_second().max(1) as f64;
     Some(AgentExecutionSummary {
-        session_id: Some(best.session_id),
-        status: best.status.to_string(),
-        rss_bytes: best.rss_bytes,
-        cpu_seconds: best.ticks as f64 / tps,
-        process_count: best.process_count,
+        session_id: Some(exec.session_id.clone()),
+        status: status.to_string(),
+        rss_bytes,
+        cpu_seconds: ticks as f64 / tps,
+        process_count,
     })
 }
 

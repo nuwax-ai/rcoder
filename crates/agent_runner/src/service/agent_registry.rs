@@ -13,7 +13,7 @@ use dashmap::mapref::multiple::RefMulti;
 use dashmap::mapref::one::Ref;
 use pending_guard::PendingPreparation;
 pub use pending_guard::{PendingGuard, RegistryStats};
-use shared_types::{ProjectAndAgentInfo, SessionHint};
+use shared_types::{AgentLifecycle, ProjectAndAgentInfo, SessionHint};
 use std::sync::{Arc, LazyLock};
 use tracing::{debug, info};
 
@@ -39,6 +39,15 @@ impl Clone for AgentSessionRegistry {
             preparations: DashMap::new(),
         }
     }
+}
+
+/// 单个已注册执行的快照（脱离 DashMap 的 `Ref`）。
+#[derive(Debug, Clone)]
+pub struct ExecutionSnapshot {
+    pub session_id: String,
+    pub status: shared_types::AgentStatus,
+    /// 执行进程组；实现方未暴露时为 None。
+    pub pgid: Option<u32>,
 }
 
 pub struct AgentSessionRegistry {
@@ -440,6 +449,68 @@ impl AgentSessionRegistry {
     }
 
     /// 获取所有 project_id 列表
+    /// 当前所有已注册执行的**确定性快照**（按 `session_id` 升序）。
+    ///
+    /// # 为什么需要这层封装
+    ///
+    /// DashMap 的 `iter()` **不是无锁读**：它逐个 shard 取读锁（`_yield_read_shard`），
+    /// 且把 guard 保存在迭代器里、clone 进每个 `RefMulti` —— 只要 `RefMulti`
+    /// 没被 drop，该 shard 的读锁就一直持有，同 shard 的写方会被挡住。
+    /// 另外遍历顺序**不确定**（按 shard 哈希分布），依赖顺序的调用方会出现
+    /// "同一容器两次轮询报不同会话"这种不可复现行为。
+    ///
+    /// 所以这里：
+    /// 1. 每个元素**立即拷贝成自有数据**（`RefMulti` 随 map 闭包结束即释放，
+    ///    读锁不会跨越后续工作——尤其不能跨越"扫描整张进程表"这种耗时操作）；
+    /// 2. 拷完再按 `session_id` 排序，调用方拿到的顺序是确定的。
+    ///
+    /// 单 key 读取请用 `view()` / `get_agent_info()`：O(1)、只碰一个 shard。
+    /// 本方法只用于确实需要枚举全量的场景。
+    ///
+    /// 规模上界 = 并发会话上限（默认 10），一次遍历 + 排序成本可忽略；
+    /// 若该上界将来显著增大，再考虑在注册/注销时维护有序索引（代价是引入
+    /// 第二份事实源，必须保证所有变更路径都同步更新）。
+    pub fn execution_snapshots(&self) -> Vec<ExecutionSnapshot> {
+        // 阶段一（持 shard 读锁）：**只做拷贝** —— 克隆 Arc 与标量。
+        //
+        // 绝不能在这一段里调用 `agent_pgid()`：它是 `Arc<dyn AgentLifecycle>`
+        // 上的 trait 方法，属于外部实现。DashMap 的锁**不可重入**，其文档对
+        // 每个会取锁的方法都写着 "May deadlock if called when holding any sort
+        // of reference into the map"。今天 `agent_pgid()` 只是读字段，但将来
+        // 任何实现（或包装层）一旦碰注册表，就会在同一 shard 上重入死锁——
+        // 且只在"恰好有写方排队"时触发，属于极难复现的偶发卡死。
+        //
+        // 也不要在锁内做格式化/分配之外的耗时工作（更不要跨 await 持锁）。
+        let mut staged: Vec<(
+            String,
+            shared_types::AgentStatus,
+            Option<Arc<dyn AgentLifecycle>>,
+        )> = Vec::with_capacity(self.agent_info_map.len());
+        for entry in self.agent_info_map.iter() {
+            let info = entry.value();
+            if !Self::has_session_identity(info) {
+                continue;
+            }
+            staged.push((
+                info.session_id.to_string(),
+                info.status,
+                info.stop_handle.clone(),
+            ));
+        }
+        // 迭代器在上一段结束时已 drop，所有 shard 读锁此时必然已释放。
+        // 阶段二：在锁外调用外部实现。
+        let mut out: Vec<ExecutionSnapshot> = staged
+            .into_iter()
+            .map(|(session_id, status, handle)| ExecutionSnapshot {
+                session_id,
+                status,
+                pgid: handle.and_then(|handle| handle.agent_pgid()),
+            })
+            .collect();
+        out.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        out
+    }
+
     pub fn all_project_ids(&self) -> Vec<String> {
         self.iter_agents().map(|r| r.key().clone()).collect()
     }
