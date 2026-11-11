@@ -54,10 +54,11 @@ fn round_metrics_belong_to_round(started_at: Instant, end_began_at: Instant) -> 
 /// 单轮 prompt 的计时聚合指标。
 ///
 /// ACP 语义下一 session 同时只有一个活跃 prompt（串行），
-/// 因此按 (project, session, request) 建 key：PromptStart 覆盖插入，
-/// PromptEnd/PromptError 按同一 key 移除。异常路径残留（start 后无 end/error）
-/// 会被同 session 下一轮 PromptStart 覆盖，量级上界 = 异常 session 数，
-/// 无需额外清理任务。
+/// 因此按 (project, session) 建 key：PromptStart 覆盖插入，
+/// PromptEnd/PromptError 按时间界移除（见 [`round_metrics_belong_to_round`，
+/// request_id 不可用作 key——见 RoundKey 文档]）。异常路径残留
+/// （start 后无 end/error）会被同 session 下一轮 PromptStart 覆盖，
+/// 量级上界 = 异常 session 数，无需额外清理任务。
 #[derive(Debug, Clone)]
 struct RoundMetrics {
     start: Instant,
