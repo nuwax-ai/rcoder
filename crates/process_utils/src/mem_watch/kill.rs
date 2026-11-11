@@ -93,15 +93,30 @@ mod imp {
             .map(|info| info.starttime)
     }
 
-    fn classify(err: std::io::Error, pid: u32, report: &mut TerminateReport) {
+    /// Linux 的 ESRCH（No such process）。各架构取值一致，恒为 3。
+    ///
+    /// 必须按 raw errno 单独判定：std 的 `decode_error_kind` 映射表里**没有**
+    /// ESRCH（只有 `ENOENT => NotFound`），它会落到 `Uncategorized`。
+    /// 只认 `ErrorKind::NotFound` 会把"目标已退出"错记成失败——而这条路径
+    /// 恰恰是最常见的正常路径：SIGTERM 送达后进程自行退出并被 PID 1 回收，
+    /// 随后补的 SIGKILL 必然 ESRCH。真按失败记账的话，每一次**成功**的淘汰
+    /// 都会打一条 `terminate_partial_failure` 错误日志。
+    const ESRCH: i32 = 3;
+
+    pub(super) fn classify(err: std::io::Error, pid: u32, report: &mut TerminateReport) {
+        let raw = err.raw_os_error();
+        let kind = err.kind();
         let entry = SignalError {
             pid,
-            kind: err.kind(),
+            kind,
             detail: err.to_string(),
         };
-        match entry.kind {
-            // 目标已退出：不是失败
-            std::io::ErrorKind::NotFound => report.gone += 1,
+        // 目标已退出（ENOENT 或 ESRCH）：不是失败
+        if kind == std::io::ErrorKind::NotFound || raw == Some(ESRCH) {
+            report.gone += 1;
+            return;
+        }
+        match kind {
             std::io::ErrorKind::PermissionDenied => report.denied.push(entry),
             _ => report.failed.push(entry),
         }
@@ -289,6 +304,70 @@ mod tests {
         );
         drop(child.kill());
         drop(child.wait());
+    }
+
+    #[tokio::test]
+    async fn target_reaped_during_grace_is_not_a_failure() {
+        // 真实路径复现:TERM 送达 -> 目标自行退出并被回收 -> 补的 KILL 返回 ESRCH。
+        // 这就是容器里 PID 1(tini/dumb-init)立即 reap 的日常情况。
+        // 修复前:ESRCH 落到 Uncategorized -> 记成 failed -> is_clean() 为假,
+        // 于是每次"淘汰成功"都会打一条 terminate_partial_failure 错误日志。
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .spawn()
+            .expect("spawn sleep");
+        let target = target_of(&child);
+        // 在 grace 窗口内等待并回收,模拟 PID 1 及时 reap
+        let reaper = tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+        let report = terminate_many(&[target], Duration::from_millis(600)).await;
+        reaper.await.expect("reaper join");
+        assert!(report.term_ok >= 1, "TERM 应送达: {report:?}");
+        assert!(report.is_clean(), "目标已退出并被回收不算失败: {report:?}");
+        assert!(report.failed.is_empty(), "不应产生 failed: {report:?}");
+    }
+
+    #[test]
+    fn esrch_counts_as_gone_not_failure() {
+        // 回归:TERM 送达后进程自行退出并被 PID 1 回收,随后补的 KILL 必然 ESRCH。
+        // std 的 decode_error_kind 映射表里没有 ESRCH,它会落到 Uncategorized,
+        // 只看 ErrorKind 会把它错记成失败 —— 那样每次成功淘汰都会打错误日志。
+        let mut report = TerminateReport::default();
+        imp::classify(std::io::Error::from_raw_os_error(3), 42, &mut report);
+        assert_eq!(report.gone, 1, "ESRCH 必须记为 gone: {report:?}");
+        assert!(report.failed.is_empty(), "ESRCH 不能进 failed: {report:?}");
+        assert!(report.denied.is_empty(), "ESRCH 不是 EPERM: {report:?}");
+        assert!(report.is_clean(), "已退出的目标必须算干净");
+    }
+
+    #[test]
+    fn enoent_counts_as_gone() {
+        let mut report = TerminateReport::default();
+        imp::classify(std::io::Error::from_raw_os_error(2), 43, &mut report);
+        assert_eq!(report.gone, 1);
+        assert!(report.is_clean());
+    }
+
+    #[test]
+    fn eperm_still_counts_as_denied() {
+        // 修复 ESRCH 不能顺带把 EPERM 也当成 gone —— 那会让 LSM 拒绝
+        // 静默变成"目标已退出",看门狗的降级保护失效。
+        let mut report = TerminateReport::default();
+        imp::classify(std::io::Error::from_raw_os_error(1), 44, &mut report);
+        assert!(report.gone == 0, "EPERM 不是 gone: {report:?}");
+        assert_eq!(report.denied.len(), 1, "EPERM 必须进 denied: {report:?}");
+        assert!(report.denied().is_some());
+        assert!(!report.is_clean());
+    }
+
+    #[test]
+    fn other_errors_stay_failures() {
+        let mut report = TerminateReport::default();
+        imp::classify(std::io::Error::from_raw_os_error(22), 45, &mut report);
+        assert_eq!(report.failed.len(), 1, "EINVAL 应记为失败: {report:?}");
+        assert!(!report.is_clean());
     }
 
     #[tokio::test]
