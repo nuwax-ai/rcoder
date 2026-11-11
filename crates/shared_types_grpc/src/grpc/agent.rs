@@ -559,6 +559,29 @@ pub struct GetContainerStatusRequest {
     #[prost(bool, optional, tag = "4")]
     pub include_processes: ::core::option::Option<bool>,
 }
+/// 容器内 agent 执行的聚合（进程组维度，与容器 cgroup 维度分开统计）
+#[allow(clippy::all)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AgentExecution {
+    /// 当前执行的会话 ID
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+    /// 执行状态：Processing / Idle / Terminating
+    #[prost(string, tag = "2")]
+    pub status: ::prost::alloc::string::String,
+    /// agent 进程组 RSS 合计（字节，含其 MCP 子进程）
+    #[prost(uint64, tag = "3")]
+    pub rss_bytes: u64,
+    /// agent 进程组**累计** CPU 秒（utime+stime）。
+    /// 刻意给累计值而非百分比：百分比需要服务端保存差分基线，多个消费者
+    /// （面板轮询 + 平台自身查询）会互相改写基线、拿到 None 或失真值。
+    /// 累计值无状态，任意多个消费者可各自差分。
+    #[prost(double, tag = "4")]
+    pub cpu_seconds: f64,
+    /// agent 进程组内进程数
+    #[prost(uint32, tag = "5")]
+    pub process_count: u32,
+}
 /// 容器状态响应
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -618,6 +641,11 @@ pub struct GetContainerStatusResponse {
     /// 那两个字段在采集降级时同样为 None，会把活着的 agent 显示成已退出。
     #[prost(bool, optional, tag = "17")]
     pub agent_present: ::core::option::Option<bool>,
+    /// 容器内 agent 执行的进程组聚合（仅请求 include_processes 时填充）。
+    /// 供观测端用**新接口**拿到 agent 维度数据，无需再调 /computer/agent/status
+    /// ——那个接口的 cpu_percent 是服务端差分，外部轮询会干扰它的基线。
+    #[prost(message, optional, tag = "18")]
+    pub agent: ::core::option::Option<AgentExecution>,
 }
 /// 容器内单进程快照（资源观测用）
 #[allow(clippy::all)]

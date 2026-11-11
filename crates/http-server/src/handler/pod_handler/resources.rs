@@ -136,6 +136,7 @@ pub async fn computer_pod_resources(
             processes: None,
             process_count: None,
             process_groups: None,
+            agent: None,
         }));
     }
 
@@ -189,6 +190,7 @@ pub async fn computer_pod_resources(
                 processes: None,
                 process_count: None,
                 process_groups: None,
+                agent: None,
             }));
         }
     };
@@ -213,6 +215,16 @@ pub async fn computer_pod_resources(
             })
             .collect()
     });
+    let agent = response
+        .agent
+        .as_ref()
+        .map(|a| shared_types::ComputerAgentExecution {
+            session_id: (!a.session_id.is_empty()).then(|| a.session_id.clone()),
+            status: a.status.clone(),
+            rss_mb: a.rss_bytes as f64 / 1_048_576.0,
+            cpu_seconds: a.cpu_seconds,
+            process_count: a.process_count,
+        });
     let groups = (response.infra_rss_bytes.is_some()
         || response.platform_rss_bytes.is_some()
         || response.workload_rss_bytes.is_some())
@@ -236,6 +248,7 @@ pub async fn computer_pod_resources(
         processes,
         process_count: (!response.processes.is_empty()).then_some(response.processes.len() as u32),
         process_groups: groups,
+        agent,
     }))
 }
 
@@ -411,6 +424,14 @@ pub async fn computer_pod_resources_stream(
                                     .collect::<Vec<_>>(),
                             )
                         },
+                        // agent 进程组聚合(仅 include_processes 时携带)
+                        "agent": response.agent.as_ref().map(|a| serde_json::json!({
+                            "session_id": a.session_id,
+                            "status": a.status,
+                            "rss_mb": a.rss_bytes as f64 / 1_048_576.0,
+                            "cpu_seconds": a.cpu_seconds,
+                            "process_count": a.process_count,
+                        })),
                         "process_groups": if response.infra_rss_bytes.is_none()
                             && response.platform_rss_bytes.is_none()
                             && response.workload_rss_bytes.is_none()

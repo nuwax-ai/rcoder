@@ -413,6 +413,8 @@ impl ProcessRole {
 pub struct ProcessRow {
     pub pid: u32,
     pub ppid: u32,
+    /// 进程组 id。仅用于在本地按 agent 进程组聚合，不对外暴露。
+    pub pgrp: u32,
     pub comm: String,
     pub rss_bytes: u64,
     /// 累计 CPU 时间(秒,utime+stime)
@@ -442,9 +444,18 @@ pub fn collect_container_processes() -> Vec<ProcessRow> {
     let table = process_utils::proc_scan::snapshot();
     // 淘汰范围只算一次:与看门狗选 victim 同一口径(见 mem_watch::evictable_pids)
     let evictable = process_utils::mem_watch::evictable_pids(&table);
+    collect_rows(&table, &evictable)
+}
+
+/// 从已采集的进程表构建明细行（供两个入口复用，避免重复扫 /proc）。
+#[cfg(target_os = "linux")]
+fn collect_rows(
+    table: &std::collections::HashMap<u32, process_utils::proc_scan::ProcInfo>,
+    evictable: &std::collections::HashSet<u32>,
+) -> Vec<ProcessRow> {
     let mut rows: Vec<ProcessRow> = Vec::with_capacity(table.len());
     let tps = procfs::ticks_per_second().max(1) as f64;
-    for (pid, info) in &table {
+    for (pid, info) in table {
         if pid == &std::process::id() {
             continue; // 采集进程自身
         }
@@ -456,6 +467,7 @@ pub fn collect_container_processes() -> Vec<ProcessRow> {
         rows.push(ProcessRow {
             pid: *pid,
             ppid: info.ppid,
+            pgrp: info.pgrp,
             comm: info.comm.clone(),
             rss_bytes: info.rss_bytes,
             cpu_seconds: (info.utime_ticks + info.stime_ticks) as f64 / tps,
@@ -661,6 +673,107 @@ pub fn group_totals(rows: &[ProcessRow]) -> ProcessGroups {
         }
     }
     g
+}
+
+/// 容器内 agent 执行的进程组聚合。
+///
+/// 刻意不含 CPU 百分比：那需要服务端保存差分基线，而多个消费者
+/// （观测面板轮询 + 平台自身查询）会互相改写基线，导致各自拿到 `None`
+/// 或失真值。这里只给**累计** `cpu_seconds`，由消费者自行差分。
+#[derive(Debug, Clone)]
+pub struct AgentExecutionSummary {
+    pub session_id: Option<String>,
+    pub status: String,
+    pub rss_bytes: u64,
+    pub cpu_seconds: f64,
+    pub process_count: u32,
+}
+
+/// 按 agent 进程组聚合容器内进程。
+///
+/// 不依赖 project_id：computer 容器一次只跑一个会话，且容器内的注册表
+/// 本就只含本容器的执行。用"注册表里所有 root 的 pgid"做聚合，避免调用方
+/// 还得猜 project_id（实测 agent 的 project_id 与容器 project_id 并不相同）。
+/// 无注册执行时返回 None。
+#[cfg(target_os = "linux")]
+pub fn agent_execution_summary(
+    table: &std::collections::HashMap<u32, process_utils::proc_scan::ProcInfo>,
+) -> Option<AgentExecutionSummary> {
+    let mut session_id: Option<String> = None;
+    let mut status = "Idle";
+    let mut pgids = std::collections::HashSet::new();
+    for entry in AGENT_REGISTRY.iter_agents() {
+        let info = entry.value();
+        if let Some(pgid) = info.stop_handle.as_ref().and_then(|h| h.agent_pgid()) {
+            pgids.insert(pgid);
+        }
+        if session_id.is_none() {
+            session_id = Some(info.session_id.to_string());
+            status = match info.status {
+                crate::model::AgentStatus::Idle => "Idle",
+                crate::model::AgentStatus::Terminating => "Terminating",
+                // Pending/Active 都是"在处理请求"
+                _ => "Processing",
+            };
+        }
+    }
+    if pgids.is_empty() {
+        return None;
+    }
+    let tps = procfs::ticks_per_second().max(1) as f64;
+    let mut rss_bytes: u64 = 0;
+    let mut ticks: u64 = 0;
+    let mut process_count: u32 = 0;
+    for info in table.values() {
+        if !pgids.contains(&info.pgrp) {
+            continue;
+        }
+        rss_bytes = rss_bytes.saturating_add(info.rss_bytes);
+        ticks = ticks.saturating_add(info.utime_ticks.saturating_add(info.stime_ticks));
+        process_count += 1;
+    }
+    if process_count == 0 {
+        return None;
+    }
+    Some(AgentExecutionSummary {
+        session_id,
+        status: status.to_string(),
+        rss_bytes,
+        cpu_seconds: ticks as f64 / tps,
+        process_count,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn agent_execution_summary(
+    _table: &std::collections::HashMap<u32, process_utils::proc_scan::ProcInfo>,
+) -> Option<AgentExecutionSummary> {
+    None
+}
+
+/// 一次 `/proc` 扫描同时产出进程明细、分组聚合与 agent 进程组聚合。
+///
+/// 观测端只用这个入口即可拿到"容器维度 + agent 维度"，不必再调
+/// `/computer/agent/status`（那个老接口的 CPU% 是服务端差分，被外部轮询
+/// 会污染基线，影响平台自身查询）。
+pub fn sample_container_processes_and_agent() -> (
+    Vec<ProcessRow>,
+    ProcessGroups,
+    Option<AgentExecutionSummary>,
+) {
+    #[cfg(not(target_os = "linux"))]
+    {
+        return (Vec::new(), ProcessGroups::default(), None);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let table = process_utils::proc_scan::snapshot();
+        let evictable = process_utils::mem_watch::evictable_pids(&table);
+        let rows = collect_rows(&table, &evictable);
+        let groups = group_totals(&rows);
+        let agent = agent_execution_summary(&table);
+        (rows, groups, agent)
+    }
 }
 
 /// 采集容器内进程明细与分组聚合(供 GetContainerStatus 返回)。

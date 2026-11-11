@@ -499,6 +499,11 @@ pub struct ComputerPodResourcesResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_groups: Option<ComputerProcessGroups>,
 
+    /// agent 执行的进程组聚合(仅 include_processes 时填充)。
+    /// 无注册执行或进程组已消失时为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<ComputerAgentExecution>,
+
     /// 容器名称(定位成功时)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "computer-agent-runner-user_123")]
@@ -582,6 +587,27 @@ pub fn computer_pod_resources_clamp_interval(raw: Option<u64>) -> u64 {
             COMPUTER_POD_RESOURCES_MIN_INTERVAL_SECS,
             COMPUTER_POD_RESOURCES_MAX_INTERVAL_SECS,
         )
+}
+
+/// 容器内 agent 执行的进程组聚合（`/computer/pod/resources` 提供）。
+///
+/// 观测端只用新接口就能拿到 agent 维度数据，不必再调
+/// `/computer/agent/status`——那个接口的 `cpu_percent` 是**服务端差分**，
+/// 外部 2s 轮询会改写它的基线，让平台自身查询拿到 None 或失真值。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ComputerAgentExecution {
+    /// 当前执行的会话 ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// 执行状态：Processing / Idle / Terminating
+    pub status: String,
+    /// agent 进程组 RSS 合计（MB，含其 MCP 子进程）
+    pub rss_mb: f64,
+    /// agent 进程组**累计** CPU 秒（utime+stime）。
+    /// 消费方自行差分算百分比：累计值无状态，任意多个消费者互不影响。
+    pub cpu_seconds: f64,
+    /// agent 进程组内进程数
+    pub process_count: u32,
 }
 
 /// Computer Agent 取消任务的请求参数

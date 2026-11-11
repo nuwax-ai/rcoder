@@ -432,6 +432,23 @@ message GetContainerStatusRequest {
   optional bool include_processes = 4;
 }
 
+// 容器内 agent 执行的聚合（进程组维度，与容器 cgroup 维度分开统计）
+message AgentExecution {
+  // 当前执行的会话 ID
+  string session_id = 1;
+  // 执行状态：Processing / Idle / Terminating
+  string status = 2;
+  // agent 进程组 RSS 合计（字节，含其 MCP 子进程）
+  uint64 rss_bytes = 3;
+  // agent 进程组**累计** CPU 秒（utime+stime）。
+  // 刻意给累计值而非百分比：百分比需要服务端保存差分基线，多个消费者
+  // （面板轮询 + 平台自身查询）会互相改写基线、拿到 None 或失真值。
+  // 累计值无状态，任意多个消费者可各自差分。
+  double cpu_seconds = 4;
+  // agent 进程组内进程数
+  uint32 process_count = 5;
+}
+
 // 容器状态响应
 message GetContainerStatusResponse {
   // 容器是否活跃（有活跃任务）
@@ -472,6 +489,10 @@ message GetContainerStatusResponse {
   // 观测端据此判断"agent 在不在"，不能用 cpu_percent/memory_mb 推断——
   // 那两个字段在采集降级时同样为 None，会把活着的 agent 显示成已退出。
   optional bool agent_present = 17;
+  // 容器内 agent 执行的进程组聚合（仅请求 include_processes 时填充）。
+  // 供观测端用**新接口**拿到 agent 维度数据，无需再调 /computer/agent/status
+  // ——那个接口的 cpu_percent 是服务端差分，外部轮询会干扰它的基线。
+  optional AgentExecution agent = 18;
 }
 
 // 容器内单进程快照（资源观测用）
