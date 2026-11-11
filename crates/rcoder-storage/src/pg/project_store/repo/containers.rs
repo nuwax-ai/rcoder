@@ -8,9 +8,9 @@ use toasty_core::schema::db::Type;
 use super::store_repo::outcome;
 use crate::{db::models::Container, pg::project_store::persist_ops::ContainerSnapshot};
 
-/// Observed admission（守卫 workload 变更）：write-behind 测试路径与
-/// builder 注册测试沿用；生产 durable RegisterProject 已改走
-/// [`upsert_verified_replacement_container`]（门禁内已裁决 workload 换代）。
+/// Observed admission（守卫 workload 变更）：`PersistOp::UpsertContainer`
+/// 故障注入测试专用（cfg(test)；生产注册不可分割，容器写入走
+/// [`upsert_verified_replacement_container`] 的 RegisterProject 路径）。
 #[cfg(test)]
 pub(in crate::pg) async fn upsert_container(
     tx: &mut dyn Executor,
@@ -19,8 +19,11 @@ pub(in crate::pg) async fn upsert_container(
     upsert_container_admitted(tx, c, ContainerAdmission::Observed).await
 }
 
-/// Only the existing typed runtime/lifecycle recovery paths call this after
-/// validating ownership and predecessor absence. Generation CAS still applies.
+/// Verified admission：调用方已对 workload 换代做过权威裁决
+/// （durable RegisterProject 经 binding_autoheal 门禁，或 runtime/lifecycle
+/// 恢复路径的 ownership 核验）。换代 CAS（predecessor 精确匹配）与墓碑
+/// 写入仍全额执行；仅"观测丢失 workload（None）试图清空在案绑定
+/// （Some）"被继续拒绝——那是观测缺层，不是换代。
 pub(in crate::pg) async fn upsert_verified_replacement_container(
     tx: &mut dyn Executor,
     c: &ContainerSnapshot,
@@ -67,15 +70,22 @@ async fn upsert_container_admitted(
         .exec(tx)
         .await?;
     if let Some(current) = current {
-        if admission == ContainerAdmission::Observed
-            && current
-                .workload_uid
-                .as_ref()
-                .is_some_and(|uid| c.workload_uid.as_ref() != Some(uid))
-        {
-            // The database is authoritative even when a replica has not seen
-            // this shared resource yet. A new project's missing local row is
-            // never evidence that another workload can be retired.
+        // workload 变化矩阵：Some→Some 不同（换代，门禁裁决）；
+        // Some→None（观测丢失，不得清空在案绑定）；None→*（补全/无冲突）。
+        let changes_registered_workload = current
+            .workload_uid
+            .as_ref()
+            .is_some_and(|registered| c.workload_uid.as_ref() != Some(registered));
+        let clears_registered_workload = current.workload_uid.is_some() && c.workload_uid.is_none();
+        // The database is authoritative even when a replica has not seen
+        // this shared resource yet. A new project's missing local row is
+        // never evidence that another workload can be retired.
+        if admission == ContainerAdmission::Observed && changes_registered_workload {
+            return Ok(PersistenceOperationOutcome::Superseded);
+        }
+        // Verified 换代放行 Some→Some 的 workload 变更（调用方门禁已裁决）；
+        // 观测丢失（None）清空在案绑定仍然拒绝。
+        if admission == ContainerAdmission::VerifiedReplacement && clears_registered_workload {
             return Ok(PersistenceOperationOutcome::Superseded);
         }
         if current.container_generation == c.generation {

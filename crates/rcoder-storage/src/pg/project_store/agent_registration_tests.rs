@@ -1347,11 +1347,13 @@ async fn database_commits_a_cas_exact_replacement_and_refuses_a_stale_predecesso
         Some(different_container_id.clone())
     );
     // 换代把旧代引用解绑：旧项目行失联，待其下次注册跟随新代
+    // 换代把旧代引用解绑：旧项目行的容器绑定被置空（待其下次注册跟随新代），
+    // 项目行本身仍可读。
     assert!(
-        reader.get(&a).unwrap().container_info().is_none()
-            || reader.get(&a).unwrap().container_info().is_some(),
-        "the detached project row stays readable"
+        reader.get(&a).unwrap().container_info().is_none(),
+        "the replaced generation must detach the old project's container binding"
     );
+    assert!(reader.get(&a).is_some());
     let tombstoned = {
         let name = original.container_info().unwrap().container_name.clone();
         let generation = original_identity.generation.clone();
