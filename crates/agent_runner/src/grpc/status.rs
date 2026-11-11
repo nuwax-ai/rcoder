@@ -144,7 +144,7 @@ pub async fn get_container_status(
             infra_rss_bytes,
             platform_rss_bytes,
             workload_rss_bytes,
-            agent,
+            agents,
         ) = if include_processes {
             // 一次 /proc 扫描同时产出容器维度与 agent 进程组维度，
             // 观测端无需再调 /computer/agent/status。
@@ -162,23 +162,28 @@ pub async fn get_container_status(
                     args_head: row.args_head.clone(),
                 })
                 .collect();
-            let agent = agent_summary.map(|a| AgentExecution {
-                session_id: a.session_id.unwrap_or_default(),
-                status: a.status,
-                rss_bytes: a.rss_bytes,
-                cpu_seconds: a.cpu_seconds,
-                process_count: a.process_count,
-            });
+            // 每个 project 一条（多会话并存时不能只报一个）
+            let agents: Vec<AgentExecution> = agent_summary
+                .into_iter()
+                .map(|a| AgentExecution {
+                    project_id: a.project_id,
+                    session_id: a.session_id.unwrap_or_default(),
+                    status: a.status,
+                    rss_bytes: a.rss_bytes,
+                    cpu_seconds: a.cpu_seconds,
+                    process_count: a.process_count,
+                })
+                .collect();
             (
                 process_rows,
                 Some(rows.len() as i32),
                 Some(groups.infra_rss_bytes),
                 Some(groups.platform_rss_bytes),
                 Some(groups.workload_rss_bytes),
-                agent,
+                agents,
             )
         } else {
-            (Vec::new(), None, None, None, None, None)
+            (Vec::new(), None, None, None, None, Vec::new())
         };
 
         let status = if active_tasks > 0 {
@@ -210,7 +215,7 @@ pub async fn get_container_status(
             platform_rss_bytes,
             workload_rss_bytes,
             agent_present: Some(agent_present),
-            agent,
+            agents,
         };
 
         debug!(

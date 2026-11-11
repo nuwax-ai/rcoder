@@ -44,6 +44,7 @@ impl Clone for AgentSessionRegistry {
 /// 单个已注册执行的快照（脱离 DashMap 的 `Ref`）。
 #[derive(Debug, Clone)]
 pub struct ExecutionSnapshot {
+    pub project_id: String,
     pub session_id: String,
     pub status: shared_types::AgentStatus,
     /// 执行进程组；实现方未暴露时为 None。
@@ -483,6 +484,7 @@ impl AgentSessionRegistry {
         // 也不要在锁内做格式化/分配之外的耗时工作（更不要跨 await 持锁）。
         let mut staged: Vec<(
             String,
+            String,
             shared_types::AgentStatus,
             Option<Arc<dyn AgentLifecycle>>,
         )> = Vec::with_capacity(self.agent_info_map.len());
@@ -492,6 +494,7 @@ impl AgentSessionRegistry {
                 continue;
             }
             staged.push((
+                entry.key().clone(),
                 info.session_id.to_string(),
                 info.status,
                 info.stop_handle.clone(),
@@ -501,11 +504,14 @@ impl AgentSessionRegistry {
         // 阶段二：在锁外调用外部实现。
         let mut out: Vec<ExecutionSnapshot> = staged
             .into_iter()
-            .map(|(session_id, status, handle)| ExecutionSnapshot {
-                session_id,
-                status,
-                pgid: handle.and_then(|handle| handle.agent_pgid()),
-            })
+            .map(
+                |(project_id, session_id, status, handle)| ExecutionSnapshot {
+                    project_id,
+                    session_id,
+                    status,
+                    pgid: handle.and_then(|handle| handle.agent_pgid()),
+                },
+            )
             .collect();
         out.sort_by(|a, b| a.session_id.cmp(&b.session_id));
         out

@@ -692,6 +692,7 @@ pub fn group_totals(rows: &[ProcessRow]) -> ProcessGroups {
 /// 或失真值。这里只给**累计** `cpu_seconds`，由消费者自行差分。
 #[derive(Debug, Clone)]
 pub struct AgentExecutionSummary {
+    pub project_id: String,
     pub session_id: Option<String>,
     pub status: String,
     pub rss_bytes: u64,
@@ -699,31 +700,25 @@ pub struct AgentExecutionSummary {
     pub process_count: u32,
 }
 
-/// 按 agent 进程组聚合容器内进程。
+/// 按 agent 进程组聚合容器内进程，**每个 project 一条**。
 ///
-/// 不依赖 project_id：computer 容器一次只跑一个会话，且容器内的注册表
-/// 本就只含本容器的执行。用"注册表里所有 root 的 pgid"做聚合，避免调用方
-/// 还得猜 project_id（实测 agent 的 project_id 与容器 project_id 并不相同）。
-/// 无注册执行时返回 None。
+/// 一个 user 容器可以并存多个 project（工作目录 `/home/user/<project_id>`），
+/// 每个 project 有独立的 agent 进程组。因此这里必须逐执行返回，只报一个会
+/// 让多会话场景漏报（实测 2 个会话并存时，只报一个且 RSS 是两个之和）。
 ///
-/// **一个 user 容器可以承载多个 project**（工作目录 `/home/user/<project_id>`），
-/// 所以这里必须"选一个执行并只聚合它"：取第一个的身份 + 聚合所有进程组会
-/// 报出"会话 A 的 session_id 配两个会话之和的 RSS"。
+/// 不依赖调用方传 project_id：容器内注册表本就只含本容器的执行。新接口
+/// 请求里也没有可靠的 project_id（agent 的 project 与容器 project 并不相同）。
 ///
-/// 选谁：RSS 最大（内存压力下最该被关注的执行）；RSS 相同取 `session_id`
-/// 最小的。`execution_snapshots()` 已按 session_id 升序，因此"先遇到者胜"
-/// 就等于该兜底规则，结果**不依赖 DashMap 的遍历顺序**。
-///
-/// 复杂度：一次遍历进程表 + 一次遍历执行快照（≤ 并发上限），不做 n×m 重复扫描。
+/// 复杂度：一次遍历进程表 + 一次遍历执行快照（≤ 并发上限）。
 #[cfg(target_os = "linux")]
-pub fn agent_execution_summary(
+pub fn agent_executions(
     table: &std::collections::HashMap<u32, process_utils::proc_scan::ProcInfo>,
-) -> Option<AgentExecutionSummary> {
+) -> Vec<AgentExecutionSummary> {
     let executions = AGENT_REGISTRY.execution_snapshots();
     let pgids: std::collections::HashSet<u32> =
         executions.iter().filter_map(|exec| exec.pgid).collect();
     if pgids.is_empty() {
-        return None;
+        return Vec::new();
     }
 
     // 单次遍历进程表，按 pgid 累加
@@ -741,12 +736,8 @@ pub fn agent_execution_summary(
         slot.2 += 1;
     }
 
-    let mut best: Option<(
-        u64,
-        &crate::service::agent_registry::ExecutionSnapshot,
-        u64,
-        u32,
-    )> = None;
+    let tps = procfs::ticks_per_second().max(1) as f64;
+    let mut out: Vec<AgentExecutionSummary> = Vec::with_capacity(executions.len());
     for exec in &executions {
         let Some(pgid) = exec.pgid else {
             continue;
@@ -757,38 +748,39 @@ pub fn agent_execution_summary(
         if process_count == 0 {
             continue;
         }
-        // 严格大于才替换：快照按 session_id 升序，因此并列时保留最小 session_id
-        if best.is_none_or(|(current, ..)| rss_bytes > current) {
-            best = Some((rss_bytes, exec, ticks, process_count));
-        }
+        // 全量匹配，不写 `_ =>`：以后新增 AgentStatus 变体时，这里必须编译失败，
+        // 避免新状态被悄悄当成"Processing"。
+        let status = match exec.status {
+            // Pending = 任务已入队、等待 worker。对外仍是"忙"，
+            // 与 GetStatus 的 busy 口径一致。
+            crate::model::AgentStatus::Pending => "Processing",
+            crate::model::AgentStatus::Active => "Processing",
+            crate::model::AgentStatus::Idle => "Idle",
+            crate::model::AgentStatus::Terminating => "Terminating",
+        };
+        out.push(AgentExecutionSummary {
+            project_id: exec.project_id.clone(),
+            session_id: Some(exec.session_id.clone()),
+            status: status.to_string(),
+            rss_bytes,
+            cpu_seconds: ticks as f64 / tps,
+            process_count,
+        });
     }
-
-    let (rss_bytes, exec, ticks, process_count) = best?;
-    // 全量匹配，不写 `_ =>`：以后新增 AgentStatus 变体时，这里必须编译失败，
-    // 避免新状态被悄悄当成"Processing"。
-    let status = match exec.status {
-        // Pending = 任务已入队、等待 worker。对外仍是"忙"，
-        // 与 GetStatus 的 busy 口径一致。
-        crate::model::AgentStatus::Pending => "Processing",
-        crate::model::AgentStatus::Active => "Processing",
-        crate::model::AgentStatus::Idle => "Idle",
-        crate::model::AgentStatus::Terminating => "Terminating",
-    };
-    let tps = procfs::ticks_per_second().max(1) as f64;
-    Some(AgentExecutionSummary {
-        session_id: Some(exec.session_id.clone()),
-        status: status.to_string(),
-        rss_bytes,
-        cpu_seconds: ticks as f64 / tps,
-        process_count,
-    })
+    // RSS 降序（内存占用大的排在前面），同 RSS 按 project_id 升序保证稳定
+    out.sort_by(|a, b| {
+        b.rss_bytes
+            .cmp(&a.rss_bytes)
+            .then_with(|| a.project_id.cmp(&b.project_id))
+    });
+    out
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn agent_execution_summary(
+pub fn agent_executions(
     _table: &std::collections::HashMap<u32, process_utils::proc_scan::ProcInfo>,
-) -> Option<AgentExecutionSummary> {
-    None
+) -> Vec<AgentExecutionSummary> {
+    Vec::new()
 }
 
 /// 一次 `/proc` 扫描同时产出进程明细、分组聚合与 agent 进程组聚合。
@@ -796,14 +788,11 @@ pub fn agent_execution_summary(
 /// 观测端只用这个入口即可拿到"容器维度 + agent 维度"，不必再调
 /// `/computer/agent/status`（那个老接口的 CPU% 是服务端差分，被外部轮询
 /// 会污染基线，影响平台自身查询）。
-pub fn sample_container_processes_and_agent() -> (
-    Vec<ProcessRow>,
-    ProcessGroups,
-    Option<AgentExecutionSummary>,
-) {
+pub fn sample_container_processes_and_agent()
+-> (Vec<ProcessRow>, ProcessGroups, Vec<AgentExecutionSummary>) {
     #[cfg(not(target_os = "linux"))]
     {
-        return (Vec::new(), ProcessGroups::default(), None);
+        return (Vec::new(), ProcessGroups::default(), Vec::new());
     }
     #[cfg(target_os = "linux")]
     {

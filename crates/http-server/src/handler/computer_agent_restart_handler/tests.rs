@@ -339,8 +339,8 @@ async fn status_resource_query_rejects_stale_expected_identity() {
             workload_rss_bytes: Some(0),
             // 执行存在性(与资源降级无关的显式存活信号)
             agent_present: Some(true),
-            // agent 进程组聚合(仅 include_processes 时填充)
-            agent: None,
+            // agent 进程组聚合(仅 include_processes 时填充)；每 project 一条
+            agents: Vec::new(),
         });
 
     // 身份匹配(expected=A,registry=A):资源返回。
@@ -522,8 +522,8 @@ async fn status_endpoint_reports_agent_resource_usage() {
             workload_rss_bytes: Some(0),
             // 执行存在性(与资源降级无关的显式存活信号)
             agent_present: Some(true),
-            // agent 进程组聚合(仅 include_processes 时填充)
-            agent: None,
+            // agent 进程组聚合(仅 include_processes 时填充)；每 project 一条
+            agents: Vec::new(),
         });
 
     let result = post_json(

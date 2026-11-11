@@ -563,6 +563,9 @@ pub struct GetContainerStatusRequest {
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AgentExecution {
+    /// 该执行所属 project（同一 user 容器可并存多个 project，重启需按它定位）
+    #[prost(string, tag = "6")]
+    pub project_id: ::prost::alloc::string::String,
     /// 当前执行的会话 ID
     #[prost(string, tag = "1")]
     pub session_id: ::prost::alloc::string::String,
@@ -641,11 +644,15 @@ pub struct GetContainerStatusResponse {
     /// 那两个字段在采集降级时同样为 None，会把活着的 agent 显示成已退出。
     #[prost(bool, optional, tag = "17")]
     pub agent_present: ::core::option::Option<bool>,
-    /// 容器内 agent 执行的进程组聚合（仅请求 include_processes 时填充）。
+    /// 容器内**所有** agent 执行的进程组聚合（仅请求 include_processes 时填充）。
+    ///
+    /// 刻意是列表：一个 user 容器可并存多个 project（工作目录 /home/user/<id>），
+    /// 每个 project 有独立的 agent 进程组。只报一个会让多会话场景漏报。
+    ///
     /// 供观测端用**新接口**拿到 agent 维度数据，无需再调 /computer/agent/status
     /// ——那个接口的 cpu_percent 是服务端差分，外部轮询会干扰它的基线。
-    #[prost(message, optional, tag = "18")]
-    pub agent: ::core::option::Option<AgentExecution>,
+    #[prost(message, repeated, tag = "18")]
+    pub agents: ::prost::alloc::vec::Vec<AgentExecution>,
 }
 /// 容器内单进程快照（资源观测用）
 #[allow(clippy::all)]

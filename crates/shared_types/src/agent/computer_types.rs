@@ -499,10 +499,10 @@ pub struct ComputerPodResourcesResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_groups: Option<ComputerProcessGroups>,
 
-    /// agent 执行的进程组聚合(仅 include_processes 时填充)。
-    /// 无注册执行或进程组已消失时为 None。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent: Option<ComputerAgentExecution>,
+    /// 容器内**所有** agent 执行的进程组聚合(仅 include_processes 时填充)。
+    /// 一个 user 容器可并存多个 project，每个一条；无注册执行时为空。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<ComputerAgentExecution>,
 
     /// 容器名称(定位成功时)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -596,6 +596,8 @@ pub fn computer_pod_resources_clamp_interval(raw: Option<u64>) -> u64 {
 /// 外部 2s 轮询会改写它的基线，让平台自身查询拿到 None 或失真值。
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ComputerAgentExecution {
+    /// 该执行所属 project（同一 user 容器可并存多个 project）
+    pub project_id: String,
     /// 当前执行的会话 ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,

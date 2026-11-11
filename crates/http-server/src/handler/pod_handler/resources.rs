@@ -136,7 +136,7 @@ pub async fn computer_pod_resources(
             processes: None,
             process_count: None,
             process_groups: None,
-            agent: None,
+            agents: Vec::new(),
         }));
     }
 
@@ -190,7 +190,7 @@ pub async fn computer_pod_resources(
                 processes: None,
                 process_count: None,
                 process_groups: None,
-                agent: None,
+                agents: Vec::new(),
             }));
         }
     };
@@ -215,16 +215,18 @@ pub async fn computer_pod_resources(
             })
             .collect()
     });
-    let agent = response
-        .agent
-        .as_ref()
+    let agents: Vec<shared_types::ComputerAgentExecution> = response
+        .agents
+        .iter()
         .map(|a| shared_types::ComputerAgentExecution {
+            project_id: a.project_id.clone(),
             session_id: (!a.session_id.is_empty()).then(|| a.session_id.clone()),
             status: a.status.clone(),
             rss_mb: a.rss_bytes as f64 / 1_048_576.0,
             cpu_seconds: a.cpu_seconds,
             process_count: a.process_count,
-        });
+        })
+        .collect();
     let groups = (response.infra_rss_bytes.is_some()
         || response.platform_rss_bytes.is_some()
         || response.workload_rss_bytes.is_some())
@@ -248,7 +250,7 @@ pub async fn computer_pod_resources(
         processes,
         process_count: (!response.processes.is_empty()).then_some(response.processes.len() as u32),
         process_groups: groups,
-        agent,
+        agents,
     }))
 }
 
@@ -424,14 +426,15 @@ pub async fn computer_pod_resources_stream(
                                     .collect::<Vec<_>>(),
                             )
                         },
-                        // agent 进程组聚合(仅 include_processes 时携带)
-                        "agent": response.agent.as_ref().map(|a| serde_json::json!({
+                        // 每个 project 一条 agent 进程组聚合(仅 include_processes 时携带)
+                        "agents": response.agents.iter().map(|a| serde_json::json!({
+                            "project_id": a.project_id,
                             "session_id": a.session_id,
                             "status": a.status,
                             "rss_mb": a.rss_bytes as f64 / 1_048_576.0,
                             "cpu_seconds": a.cpu_seconds,
                             "process_count": a.process_count,
-                        })),
+                        })).collect::<Vec<_>>(),
                         "process_groups": if response.infra_rss_bytes.is_none()
                             && response.platform_rss_bytes.is_none()
                             && response.workload_rss_bytes.is_none()

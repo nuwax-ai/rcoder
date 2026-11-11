@@ -434,6 +434,8 @@ message GetContainerStatusRequest {
 
 // 容器内 agent 执行的聚合（进程组维度，与容器 cgroup 维度分开统计）
 message AgentExecution {
+  // 该执行所属 project（同一 user 容器可并存多个 project，重启需按它定位）
+  string project_id = 6;
   // 当前执行的会话 ID
   string session_id = 1;
   // 执行状态：Processing / Idle / Terminating
@@ -489,10 +491,14 @@ message GetContainerStatusResponse {
   // 观测端据此判断"agent 在不在"，不能用 cpu_percent/memory_mb 推断——
   // 那两个字段在采集降级时同样为 None，会把活着的 agent 显示成已退出。
   optional bool agent_present = 17;
-  // 容器内 agent 执行的进程组聚合（仅请求 include_processes 时填充）。
+  // 容器内**所有** agent 执行的进程组聚合（仅请求 include_processes 时填充）。
+  //
+  // 刻意是列表：一个 user 容器可并存多个 project（工作目录 /home/user/<id>），
+  // 每个 project 有独立的 agent 进程组。只报一个会让多会话场景漏报。
+  //
   // 供观测端用**新接口**拿到 agent 维度数据，无需再调 /computer/agent/status
   // ——那个接口的 cpu_percent 是服务端差分，外部轮询会干扰它的基线。
-  optional AgentExecution agent = 18;
+  repeated AgentExecution agents = 18;
 }
 
 // 容器内单进程快照（资源观测用）
