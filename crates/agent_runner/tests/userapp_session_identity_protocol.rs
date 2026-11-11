@@ -1835,7 +1835,7 @@ async fn process_roles_follow_the_watchdog_scope_end_to_end() {
     // 面板靠它拿 agent 维度 CPU/内存,不再轮询 /computer/agent/status。
     if cfg!(target_os = "linux") {
         let (_, _, agents) =
-            agent_runner::service::agent_resource_monitor::sample_container_processes_and_agent();
+            agent_runner::service::agent_resource_monitor::sample_container_processes_and_agents();
         // 每个 project 一条；这里注册了一个会话
         let a = agents
             .iter()

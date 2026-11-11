@@ -738,10 +738,16 @@ pub fn agent_executions(
 
     let tps = procfs::ticks_per_second().max(1) as f64;
     let mut out: Vec<AgentExecutionSummary> = Vec::with_capacity(executions.len());
+    // 同一进程组只报一次：若两个 project 的注册项指向同一 pgid（异常或
+    // 共享启动器），重复输出会让"进程数/内存"被看成人均一份，实为重复计数。
+    let mut seen_pgids: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for exec in &executions {
         let Some(pgid) = exec.pgid else {
             continue;
         };
+        if !seen_pgids.insert(pgid) {
+            continue;
+        }
         let Some(&(rss_bytes, ticks, process_count)) = totals.get(&pgid) else {
             continue;
         };
@@ -788,7 +794,7 @@ pub fn agent_executions(
 /// 观测端只用这个入口即可拿到"容器维度 + agent 维度"，不必再调
 /// `/computer/agent/status`（那个老接口的 CPU% 是服务端差分，被外部轮询
 /// 会污染基线，影响平台自身查询）。
-pub fn sample_container_processes_and_agent()
+pub fn sample_container_processes_and_agents()
 -> (Vec<ProcessRow>, ProcessGroups, Vec<AgentExecutionSummary>) {
     #[cfg(not(target_os = "linux"))]
     {
@@ -800,8 +806,8 @@ pub fn sample_container_processes_and_agent()
         let evictable = process_utils::mem_watch::evictable_pids(&table);
         let rows = collect_rows(&table, &evictable);
         let groups = group_totals(&rows);
-        let agent = agent_execution_summary(&table);
-        (rows, groups, agent)
+        let agents = agent_executions(&table);
+        (rows, groups, agents)
     }
 }
 

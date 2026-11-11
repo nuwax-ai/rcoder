@@ -149,7 +149,7 @@ pub async fn get_container_status(
             // 一次 /proc 扫描同时产出容器维度与 agent 进程组维度，
             // 观测端无需再调 /computer/agent/status。
             let (rows, groups, agent_summary) =
-                crate::service::agent_resource_monitor::sample_container_processes_and_agent();
+                crate::service::agent_resource_monitor::sample_container_processes_and_agents();
             let process_rows = rows
                 .iter()
                 .map(|row| ContainerProcess {
