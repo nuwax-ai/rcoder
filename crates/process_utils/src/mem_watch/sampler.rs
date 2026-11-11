@@ -84,11 +84,18 @@ pub async fn run(config: Config) {
 /// 1. 定位失败（读不到 `/proc/self/cgroup` v2 行）；
 /// 2. env 覆盖的限额与实测 `memory.max` 不一致——典型是 host cgroup namespace
 ///    下根路径给出整机用量，却和容器限额比大小。
-fn scope_ok(probe: &cgroup::CgroupProbe, limit: u64, warned: &mut bool) -> bool {
-    // 不论限额来自 env 覆盖还是本组 memory.max，都要求与本组实测一致。
-    // 原实现在"无 override"时直接放行，前提是"限额从本组读出"——但限额此前
-    // 读的是固定根路径，host cgroupns 下与本组不同源，该前提不成立。
-    if probe.confirms(limit) {
+fn scope_ok(
+    probe: &cgroup::CgroupProbe,
+    limit: u64,
+    group_max: Option<u64>,
+    warned: &mut bool,
+) -> bool {
+    // 不论限额来自 env 覆盖还是本组 memory.max，都要求与本组**当前**限额一致。
+    //
+    // `group_max` 必须是本轮新读的值：`probe.max` 是启动快照，运行中调整限额
+    // （4Gi→6Gi）后用它比对会永远不匹配，看门狗从此每轮拒绝工作，直到重启。
+    // 组路径（relpath）才是需要缓存的不变量。
+    if group_max == Some(limit) {
         return true;
     }
     if !*warned {
@@ -99,7 +106,8 @@ fn scope_ok(probe: &cgroup::CgroupProbe, limit: u64, warned: &mut bool) -> bool 
                 "limit does not match this cgroup's memory.max; usage and limit are not the same group"
             ),
             limit_bytes = limit,
-            cgroup_max_bytes = probe.max(),
+            group_max_now = group_max,
+            cached_startup_max = probe.max(),
             cgroup_relpath = %probe.relpath(),
             hint = "host cgroup namespace 下根路径是整机用量;确认用量与限额同组后再启用淘汰",
         );
@@ -114,12 +122,14 @@ async fn step(
     last_action: &mut Option<Instant>,
     scope_warned: &mut bool,
 ) {
-    let Some(limit) = cfg.effective_limit(probe) else {
+    // 每轮重新读本组限额：限额可以在运行中调整，启动快照不能作为归属证明
+    let group_max = sys::read_memory_max(probe);
+    let Some(limit) = cfg.effective_limit(group_max) else {
         // 无限额信息：host cgroup namespace（容器内 memory.max=max）且没有
         // env 覆盖——看门狗无法判断阈值，保持空闲（安全方向）。
         return;
     };
-    if !scope_ok(probe, limit, scope_warned) {
+    if !scope_ok(probe, limit, group_max, scope_warned) {
         return;
     }
 
@@ -418,22 +428,52 @@ mod tests {
         let p = probe(Some(4 << 30), None);
         let mut warned = false;
         assert!(
-            !scope_ok(&p, 512 << 20, &mut warned),
+            !scope_ok(&p, 512 << 20, Some(4 << 30), &mut warned),
             "限额来自别处时必须拒绝"
         );
         assert!(warned, "拒绝必须留痕(且只报一次)");
 
         // 第二次沿用同一标记,不重复告警
         let before = warned;
-        assert!(!scope_ok(&p, 512 << 20, &mut warned));
+        assert!(!scope_ok(&p, 512 << 20, Some(4 << 30), &mut warned));
         assert_eq!(warned, before);
+    }
+
+    /// 回归（复审 P2）：运行中把限额从 4Gi 调到 6Gi 后，看门狗必须继续工作。
+    ///
+    /// 原实现用启动快照 `probe.max` 证明"当前归属"，限额一变就永远不匹配，
+    /// 之后每轮都拒绝，直到进程重启。现在用本轮新读的 `group_max`，
+    /// 只要限额来自本组就放行。
+    #[test]
+    fn scope_ok_follows_runtime_limit_change() {
+        // probe 里缓存的是启动时的 4Gi
+        let p = probe(Some(4 << 30), None);
+
+        // 运行中已调到 6Gi：本轮读到的 group_max 是 6Gi，limit 也来自本组
+        let mut warned = false;
+        assert!(
+            scope_ok(&p, 6 << 30, Some(6 << 30), &mut warned),
+            "限额调整后应继续放行(用当前值而非启动快照)"
+        );
+        assert!(!warned);
+
+        // 若 env 覆盖仍是旧的 4Gi，而本组现在是 6Gi → 必须拒绝(不同源)
+        let mut warned = false;
+        assert!(
+            !scope_ok(&p, 4 << 30, Some(6 << 30), &mut warned),
+            "覆盖值与当前本组限额不一致时必须拒绝"
+        );
+        assert!(warned);
     }
 
     #[test]
     fn scope_ok_rejects_unresolved_probe() {
         let broken = probe(None, Some("cannot read /proc/self/cgroup"));
         let mut warned = false;
-        assert!(!scope_ok(&broken, 4 << 30, &mut warned), "定位失败一律拒绝");
+        assert!(
+            !scope_ok(&broken, 4 << 30, None, &mut warned),
+            "定位失败一律拒绝"
+        );
         assert!(warned);
     }
 
@@ -442,7 +482,7 @@ mod tests {
         // 限额与本组实测一致 → 放行（不论来自本组 memory.max 还是 env 覆盖）
         let p = probe(Some(4 << 30), None);
         let mut warned = false;
-        assert!(scope_ok(&p, 4 << 30, &mut warned));
+        assert!(scope_ok(&p, 4 << 30, Some(4 << 30), &mut warned));
         assert!(!warned, "同源时不该告警");
     }
 
@@ -457,7 +497,7 @@ mod tests {
         let p = probe(Some(4 << 30), None);
         let mut warned = false;
         assert!(
-            !scope_ok(&p, 1 << 30, &mut warned),
+            !scope_ok(&p, 1 << 30, Some(4 << 30), &mut warned),
             "限额与本组 memory.max 不同源时必须拒绝"
         );
         assert!(warned, "拒绝时应记录一次 scope_mismatch");
@@ -468,6 +508,6 @@ mod tests {
     fn scope_ok_rejects_when_limit_unknown() {
         let p = probe(None, None);
         let mut warned = false;
-        assert!(!scope_ok(&p, 4 << 30, &mut warned));
+        assert!(!scope_ok(&p, 4 << 30, None, &mut warned));
     }
 }

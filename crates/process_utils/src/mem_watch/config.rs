@@ -136,9 +136,12 @@ impl Config {
     ///
     /// 覆盖值仍只是"候选"：调用方必须再用
     /// [`cgroup::CgroupProbe::confirms`] 对账，见 `scope_ok`。
-    pub fn effective_limit(&self, probe: &super::cgroup::CgroupProbe) -> Option<u64> {
-        self.limit_override
-            .or_else(|| super::sys::read_memory_max(probe))
+    /// # 参数
+    /// * `group_max` —— **本轮新读**的本组 `memory.max`。调用方每轮重新读取，
+    ///   不能传启动时的快照：运行中调整限额（4Gi→6Gi）后，旧快照会让
+    ///   `scope_ok` 永远判定"不同源"，看门狗此后每轮都拒绝工作。
+    pub fn effective_limit(&self, group_max: Option<u64>) -> Option<u64> {
+        self.limit_override.or(group_max)
     }
 }
 
@@ -193,13 +196,12 @@ mod tests {
 
     #[test]
     fn effective_limit_prefers_override() {
-        let probe = super::super::cgroup::CgroupProbe::for_test("", Some(1 << 30), None);
         let mut cfg = Config::default();
         cfg.limit_override = Some(512 * 1024 * 1024);
-        assert_eq!(cfg.effective_limit(&probe), Some(512 * 1024 * 1024));
+        assert_eq!(cfg.effective_limit(Some(1 << 30)), Some(512 * 1024 * 1024));
         cfg.limit_override = None;
         // 非 Linux（macOS 测试机）读不到 cgroup → None；Linux 有限制时返回真实值
-        let _ = cfg.effective_limit(&probe);
+        let _ = cfg.effective_limit(None);
     }
 
     #[test]

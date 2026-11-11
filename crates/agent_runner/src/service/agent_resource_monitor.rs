@@ -690,19 +690,40 @@ fn redact_url_userinfo(arg: &str) -> Option<String> {
 fn redact_cmdline(args: &[String]) -> String {
     let mut out: Vec<String> = Vec::with_capacity(args.len());
     let mut mask_next = false;
+    // 上一个参数是 shell 的 `-c`（命令串）时，下一个参数是**脚本文本**。
+    // 脚本文本无法逐项确认安全（可能含任意拼接的凭据），因此一旦在其中检出
+    // 凭据就整体遮盖，而不是只遮检出片段。
+    let mut script_next = false;
     for arg in args {
         if mask_next {
             out.push(MASK.to_owned());
             mask_next = false;
             continue;
         }
-        // 结构性脱敏优先：URL userinfo 与参数内嵌的 键名:值 / 键名=值
-        if let Some(masked) = redact_inline_secret(arg) {
-            out.push(masked);
+        if script_next {
+            script_next = false;
+            let from_url = redact_url_userinfo(arg).is_some();
+            let scrubbed = redact_url_userinfo(arg).unwrap_or_else(|| arg.clone());
+            let from_inline = redact_inline_secret(&scrubbed).is_some();
+            if from_url || from_inline {
+                out.push(MASK.to_owned());
+            } else {
+                out.push(arg.clone());
+            }
             continue;
         }
-        if let Some(masked) = redact_url_userinfo(arg) {
-            out.push(masked);
+        // 两条结构性规则必须**串联**，不能命中一条就 continue：
+        // `redis://:pass@host/0?token=x` 同时含 URL userinfo 与 token 参数，
+        // 只做其中一条会漏掉另一条（复审实锤泄漏）。
+        let mut scrubbed = arg.clone();
+        if let Some(masked) = redact_url_userinfo(&scrubbed) {
+            scrubbed = masked;
+        }
+        if let Some(masked) = redact_inline_secret(&scrubbed) {
+            scrubbed = masked;
+        }
+        if scrubbed != *arg {
+            out.push(scrubbed);
             continue;
         }
         if let Some(eq) = arg.find('=') {
@@ -715,6 +736,12 @@ fn redact_cmdline(args: &[String]) -> String {
             continue;
         }
         if arg.starts_with('-') {
+            // shell 命令串：下一个参数是脚本文本，按整体遮盖策略处理
+            if matches!(arg.as_str(), "-c" | "-lc" | "-ic" | "--command") {
+                script_next = true;
+                out.push(arg.clone());
+                continue;
+            }
             // 独立敏感 flag:值在下一个参数里
             if is_sensitive_name(arg) {
                 mask_next = true;
@@ -1365,6 +1392,38 @@ mod tests {
             "X-Api-Key: abc123".to_owned(),
         ]);
         assert!(!got.contains("abc123"), "X-Api-Key 泄漏: {got}");
+    }
+
+    /// 复审反例（P1）：同一参数里组合多种凭据时，inline 命中后 must 继续做
+    /// URL 脱敏，否则 URL 里的密码会残留。
+    #[test]
+    fn redacts_combined_credentials_in_one_argument() {
+        let got = redact_cmdline(&[
+            "redis-cli".to_owned(),
+            "-u".to_owned(),
+            "redis://:example-password@localhost/0?token=example-token".to_owned(),
+        ]);
+        assert!(
+            !got.contains("example-password"),
+            "组合参数里的 URL 密码泄漏: {got}"
+        );
+        assert!(!got.contains("example-token"), "token 也应被遮盖: {got}");
+    }
+
+    /// shell/script 参数一旦检出凭据，无法确认剩余部分安全 → 整体遮盖。
+    #[test]
+    fn masks_whole_script_when_credentials_detected() {
+        let got = redact_cmdline(&[
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "curl redis://:example-password@host/x -H 'Authorization: Bearer example-secret'"
+                .to_owned(),
+        ]);
+        assert!(
+            !got.contains("example-password"),
+            "脚本内 URL 密码泄漏: {got}"
+        );
+        assert!(!got.contains("example-secret"), "脚本内 header 泄漏: {got}");
     }
 
     /// 结构性脱敏不得误伤普通命令——面板靠 args 区分 MCP 等平台服务。
