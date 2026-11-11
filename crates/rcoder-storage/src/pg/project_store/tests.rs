@@ -1139,6 +1139,24 @@ async fn fetch_binding_row(
 }
 
 /// 精确三元组 (name, generation, physical_uid) 的退休墓碑是否在案。
+/// 断言自愈墓碑只按 (name, generation) 存在，且 `physical_uid` 为 NULL。
+///
+/// 这是复审 P1-1 的安全性要求：镜像旧 identity 不能证明物理对象已退役。
+/// 一旦墓碑带上 physical_uid，`repo/containers.rs` 的
+/// `physical_uid=$3` 分支会让该 UID 之后**任何**注册被判 Superseded，
+/// 且墓碑不会自动消失 —— 属于永久性生产故障。
+async fn assert_generation_only_tombstone(store: &PgStore, name: &str, generation: &str) {
+    let sql = format!(
+        "SELECT count(*) FROM container_tombstones \
+         WHERE container_name='{name}' AND container_generation='{generation}' \
+           AND physical_uid IS NULL"
+    );
+    assert!(
+        wait_for(&store.database, &sql, 1).await,
+        "自愈墓碑必须按代次存在且不带 physical_uid(否则该 UID 会被永久拒绝): {sql}"
+    );
+}
+
 async fn exact_tombstone_exists(
     store: &PgStore,
     name: &str,
@@ -1323,17 +1341,10 @@ async fn anomalous_absent_binding_heals_from_the_mirror_cursor() {
         f.store_b.wait_drained(Duration::from_secs(5)).await,
         "healed register drain"
     );
-    // 墓碑以镜像旧游标精确三元组补写；绑定行重建指向新 pod。
-    assert!(
-        exact_tombstone_exists(
-            &f.store_b,
-            &f.container_name,
-            &stale_generation,
-            stale_uid.as_deref().unwrap_or_default(),
-        )
-        .await,
-        "the stale cursor must be retired by an exact-triple tombstone"
-    );
+    // 自愈只按 (name, generation) 立墓碑，**不写 physical_uid**：
+    // 镜像游标不能证明物理对象退役，写 uid 会让该 UID 之后任何注册被永久拒绝。
+    let _ = &stale_uid;
+    assert_generation_only_tombstone(&f.store_b, &f.container_name, &stale_generation).await;
     let row = fetch_binding_row(&f.store_b, &f.container_name)
         .await
         .expect("the binding row must be rebuilt");

@@ -250,35 +250,67 @@ impl PgStore {
         Ok(read)
     }
 
-    /// AnomalousAbsent 自愈：以镜像旧 identity 补写退休墓碑（独立写事务；
+    /// AnomalousAbsent 自愈：以镜像旧 generation 补写退休墓碑（独立写事务；
     /// 权威读事务是 READ ONLY，不能原地写）。
     ///
-    /// 幂等（`ON CONFLICT DO NOTHING`）；插入 no-op 且精确三元组亦不成立
-    /// （同 (name, generation) 已被不同 physical_uid 的墓碑占用）时返回
-    /// false，保持原拒绝语义——fail fast，不静默放行。
+    /// # 为什么与注册共用锁序
+    /// 补写发生在权威读之后，注册可能已经并发完成。不与注册共用
+    /// `container-name:{name}` advisory lock，就会出现"读时缺席 → 别人注册成功
+    /// → 迟到的墓碑落地"的倒序。这里在同一写事务内先取同一把锁，再复查
+    /// `containers`：已存在绑定说明异常已消失，直接放行重读，不写墓碑。
+    ///
+    /// # 为什么墓碑不带 physical_uid
+    /// 注册的拒绝条件是
+    /// `(name,generation) 匹配 OR physical_uid 匹配`（`repo/containers.rs`）。
+    /// 自愈依据只是镜像里的旧 identity——它**不能证明物理对象已退役**：容器
+    /// 可能仍在运行、甚至已被新代次合法复用。若把 physical_uid 写进墓碑，之后
+    /// 任何使用该 UID 的注册都会被判 `Superseded`，且**无法自愈**（墓碑不会
+    /// 自动消失），属于永久性生产故障。
+    ///
+    /// 只记录 `(name, generation)` 即可达到自愈目的（下一次权威读按
+    /// `RetiredByUs` 放行），同时把"物理退役"的权力保留给运行时确证退役的
+    /// 路径，不由镜像推断授予。
+    ///
+    /// 幂等（`ON CONFLICT DO NOTHING`）；返回 true 表示"可以重读"——包括
+    /// 补写成功与"复查发现绑定已出现"两种情形。
     async fn heal_anomalous_absent_binding(
         &self,
         name: &str,
         generation: &str,
-        physical_uid: &str,
+        _physical_uid: &str,
         deadline: Instant,
     ) -> anyhow::Result<bool> {
         let insert_name = name.to_owned();
         let insert_generation = generation.to_owned();
-        let insert_uid = physical_uid.to_owned();
         let retired_at = chrono::Utc::now().timestamp_micros();
+        let lock_key = format!("container-name:{name}");
         let heal = super::database::write_with_conflict_retry(&self.database, move |tx| {
             Box::pin(async move {
+                // 与注册路径同一把锁，串行化"读后补碑"与"并发注册"
+                toasty::sql::query(
+                    "SELECT 1 FROM pg_advisory_xact_lock(hashtextextended($1, 719324))",
+                )
+                .bind(&lock_key)
+                .exec(tx)
+                .await
+                .map_err(anyhow::Error::from)?;
+                // 锁内复查：读后若已有绑定，异常已消失，不必补碑
+                let existing = toasty::sql::query(
+                    "SELECT container_name FROM containers WHERE container_name=$1",
+                )
+                .bind(&insert_name)
+                .exec(tx)
+                .await
+                .map_err(anyhow::Error::from)?;
+                if !existing.is_empty() {
+                    return Ok(1u64);
+                }
                 toasty::sql::statement(
                     "INSERT INTO container_tombstones(container_name,container_generation,physical_uid,retired_at_us) \
-                     VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING",
+                     VALUES($1,$2,NULL,$3) ON CONFLICT DO NOTHING",
                 )
                 .bind(&insert_name)
                 .bind(&insert_generation)
-                .bind_typed(
-                    Some(insert_uid.as_str()),
-                    toasty_core::schema::db::Type::Text,
-                )
                 .bind(retired_at)
                 .exec(tx)
                 .await
@@ -301,40 +333,15 @@ impl PgStore {
             }
         };
         if !inserted {
-            let verify_name = name.to_owned();
-            let verify_generation = generation.to_owned();
-            let verify_uid = physical_uid.to_owned();
-            let verify = super::database::read(&self.database, move |tx| {
-                Box::pin(async move {
-                    super::repo::container_generation_is_retired(
-                        tx,
-                        &verify_name,
-                        &verify_generation,
-                        &verify_uid,
-                    )
-                    .await
-                })
-            });
-            // 二次核验同样受 durable 总预算约束：并发副本补碑是正常触发途径，
-            // 若这里不套 deadline，DB 排队/连接等待会把整个调用拖过预算。
-            let exact = tokio::time::timeout_at(deadline, verify).await;
-            let confirmed = matches!(exact, Ok(Ok(true)));
-            if matches!(exact, Err(_)) {
-                tracing::warn!(
-                    container = name,
-                    "binding autoheal tombstone verification exceeded the durable deadline; keeping the refusal"
-                );
-                return Ok(false);
-            }
-            if !confirmed {
-                tracing::warn!(
-                    container = name,
-                    generation,
-                    physical_uid,
-                    "binding autoheal skipped: a conflicting tombstone exists for this generation"
-                );
-            }
-            return Ok(confirmed);
+            // 冲突(no-op)：本代次已有墓碑（可能是自己或 peer 补的）。此时无需
+            // 二次核验——直接放行重读，由权威读按 `RetiredByUs`/精确墓碑裁决。
+            // 原来这里有一次不带 deadline 的 `database::read` 复核，既越过
+            // durable 预算，又在墓碑不带 physical_uid 后失去意义。
+            tracing::debug!(
+                container = name,
+                generation,
+                "binding autoheal: tombstone already present; re-reading for verdict"
+            );
         }
         tracing::warn!(
             container = name,
