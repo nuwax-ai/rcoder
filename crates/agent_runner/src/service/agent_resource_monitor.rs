@@ -612,6 +612,19 @@ const INLINE_SECRET_KEYS: &[&str] = &[
     "token",
 ];
 
+/// 允许原样展示的脚本名（精确匹配）。
+///
+/// 面板靠 `args` 区分平台服务（例如 `sh -c openui-mcp`），但这些包装脚本与
+/// 用户命令不可区分。既然脚本文本**无法逐项确认安全**（第三轮复审实测
+/// `sh -c "curl -u alice:hunter2 …"` 不含任何已知凭据特征，仍然泄漏密码），
+/// 默认整体遮盖，只对下列已知服务名放行。
+const SAFE_SCRIPT_NAMES: &[&str] = &[
+    "openui-mcp",
+    "nuwax-ask-question-mcp",
+    "chrome-devtools-mcp",
+    "mcp-proxy",
+];
+
 /// 遮盖参数**内部**的 `键名: 值` / `键名=值` 形态。
 ///
 /// 为什么需要它：`looks_like_secret` 只处理"整个参数是个值"的情况，而真实
@@ -702,13 +715,13 @@ fn redact_cmdline(args: &[String]) -> String {
         }
         if script_next {
             script_next = false;
-            let from_url = redact_url_userinfo(arg).is_some();
-            let scrubbed = redact_url_userinfo(arg).unwrap_or_else(|| arg.clone());
-            let from_inline = redact_inline_secret(&scrubbed).is_some();
-            if from_url || from_inline {
-                out.push(MASK.to_owned());
-            } else {
+            // 脚本文本是任意拼接的 shell 片段，凭据可能以任何形式出现
+            // （`-u alice:hunter2`、`--data '...'`、位置参数……），逐条识别
+            // 必然漏。默认整体遮盖，只放行精确匹配的已知服务名。
+            if SAFE_SCRIPT_NAMES.contains(&arg.trim()) {
                 out.push(arg.clone());
+            } else {
+                out.push(MASK.to_owned());
             }
             continue;
         }
@@ -1408,6 +1421,23 @@ mod tests {
             "组合参数里的 URL 密码泄漏: {got}"
         );
         assert!(!got.contains("example-token"), "token 也应被遮盖: {got}");
+    }
+
+    /// 复审第三轮反例：不含任何已知凭据特征的脚本同样会泄漏。
+    ///
+    /// `sh -c "curl -u alice:hunter2 https://example.invalid"` 里
+    /// `alice:hunter2` 既不是 URL userinfo（无 `://`），也不含敏感键名，
+    /// `looks_like_secret` 还会因含 `:` 判否 —— 逐条识别注定漏。
+    /// 因此脚本文本默认整体遮盖。
+    #[test]
+    fn masks_whole_script_even_without_known_credential_shape() {
+        let got = redact_cmdline(&[
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "curl -u alice:hunter2 https://example.invalid".to_owned(),
+        ]);
+        assert!(!got.contains("hunter2"), "脚本内 -u 密码泄漏: {got}");
+        assert!(!got.contains("alice"), "用户 info 也不应保留: {got}");
     }
 
     /// shell/script 参数一旦检出凭据，无法确认剩余部分安全 → 整体遮盖。

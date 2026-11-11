@@ -346,9 +346,9 @@ impl PgStore {
         tracing::warn!(
             container = name,
             generation,
-            physical_uid,
+            mirrored_physical_uid = _physical_uid,
             "binding autoheal: container binding vanished without a retirement record; \
-             recorded a tombstone from the in-memory cursor to unblock re-ensure"
+             recorded a generation-only tombstone from the in-memory cursor to unblock re-ensure"
         );
         Ok(true)
     }

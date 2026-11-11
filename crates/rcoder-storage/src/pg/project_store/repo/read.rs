@@ -169,8 +169,17 @@ pub(in crate::pg) async fn container_generation_is_retired(
     generation: &str,
     physical_uid: &str,
 ) -> Result<bool> {
+    // 两类证据分别在墓碑里表达，读取时都要认：
+    // - `physical_uid IS NULL`：**逻辑代次退休**（自愈补碑走这条）——证明这个
+    //   代次不再使用，与物理对象是谁无关；
+    // - `physical_uid = $3`：**物理对象退休**——只对那个具体物理容器生效。
+    //
+    // 只认后者会让自愈写的 NULL 墓碑永远匹配不到，补碑后仍判 AnomalousAbsent，
+    // 自愈链路闭合不了（第三轮复审实测："墓碑存在，但读取条件匹配 0 行"）。
     Ok(!toasty::sql::query(
-        "SELECT container_name FROM container_tombstones WHERE container_name=$1 AND container_generation=$2 AND physical_uid=$3",
+        "SELECT container_name FROM container_tombstones \
+         WHERE container_name=$1 AND container_generation=$2 \
+           AND (physical_uid IS NULL OR physical_uid=$3)",
     )
     .bind(name)
     .bind(generation)
