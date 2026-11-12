@@ -528,25 +528,34 @@ fn requested_paths_have_staged_changes(
         .map(|path| normalize_relative_path(path))
         .collect::<AppResult<Vec<_>>>()?;
     let tree_id = head_tree.unwrap_or_else(|| repo.empty_tree().id().detach());
+    // 官方 literal Pathspec (已验证 match_verbatim 与 git 语义逐字节等价:
+    // path == pattern 或 path[len] == '/' 的 leading-dir 前缀)。任一请求为
+    // 根 (`.` → 空键) → 整体按全仓, 不带 pathspec (无过滤)。
+    let mut pathspec = None;
+    if !scope.iter().any(String::is_empty) {
+        let patterns = scope
+            .iter()
+            .map(|path| BString::from(format!(":(literal){path}")));
+        pathspec = Some(
+            repo.pathspec(
+                true,
+                patterns,
+                true,
+                index,
+                gix::worktree::stack::state::attributes::Source::IdMapping,
+            )
+            .map_err(|e| map_git_err(e, "git pathspec"))?,
+        );
+    }
     let mut has_change = false;
     repo.tree_index_status(
         &tree_id,
         index,
-        None,
+        pathspec.as_mut(),
         gix::status::tree_index::TrackRenames::Disabled,
-        |change, _, _| {
-            if !has_change
-                && scope
-                    .iter()
-                    .any(|prefix| in_scope(change.location(), prefix))
-            {
-                has_change = true;
-            }
-            Ok(if has_change {
-                std::ops::ControlFlow::Break(())
-            } else {
-                std::ops::ControlFlow::Continue(())
-            })
+        |_, _, _| {
+            has_change = true;
+            Ok(std::ops::ControlFlow::Break(()))
         },
     )
     .map_err(|e| map_git_err(e, "git tree_index_status"))?;
@@ -587,17 +596,6 @@ fn normalize_relative_path(path: &str) -> AppResult<String> {
         }
     }
     Ok(stack.join("/"))
-}
-
-/// 变更路径是否落在请求范围内: 精确匹配, 或位于请求目录之下 (`<dir>/` 前缀)。
-fn in_scope(location: &BStr, prefix: &str) -> bool {
-    // 根目录请求 (`.`) 归一为空串 = 整个工作区范围 (对齐 `git diff -- .`)
-    if prefix.is_empty() {
-        return true;
-    }
-    let prefix = prefix.as_bytes();
-    location == prefix
-        || (location.starts_with(prefix) && location.get(prefix.len()) == Some(&b'/'))
 }
 
 // ── init / unstage / discard ───────────────────────────────────────────────────
