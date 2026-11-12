@@ -8,6 +8,7 @@ pub(crate) mod materialize;
 pub mod ops;
 pub mod read;
 pub mod refs;
+pub(crate) mod workspace_lock;
 pub mod write;
 
 pub use diff::*;
@@ -239,7 +240,18 @@ fn set_unborn_head_to_main(repo: &Repository) -> AppResult<()> {
 
 /// gix 错误 → AppError::system。
 pub(crate) fn map_git_err(e: impl std::fmt::Display, ctx: &str) -> AppError {
-    AppError::system(format!("{ctx}: {e}"))
+    let detail = e.to_string();
+    // 跨进程锁冲突提示 (如 agent 启动的 git CLI 与本服务并发)。进程内并发
+    // 已由 workspace_lock 串行化; stage 事务另有有界退避等待,
+    // 走到这里的锁冲突多为其他 index 写路径 (checkout/reset 等) 撞上活跃外部进程。
+    if detail.contains("Could not acquire lock") {
+        return AppError::system(format!(
+            "{ctx}: {detail} \
+             (index.lock is held by another git operation, e.g. a running git CLI; \
+             retry after it completes, or remove .git/index.lock if no git process is running)"
+        ));
+    }
+    AppError::system(format!("{ctx}: {detail}"))
 }
 
 /// `refs/heads/main` → `main`; `refs/tags/v1` → `v1`。

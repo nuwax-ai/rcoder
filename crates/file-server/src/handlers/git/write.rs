@@ -18,12 +18,17 @@ use crate::models::{
 };
 use crate::service::git;
 
-/// 写 handler 共享前奏：工作区存在 → `ensure_repo` → `ensure_gitignore`，再执行 body。
-/// 目录不存在 = Resource 错（git 操作只面向已存在工作区，不创建）。
+/// 写 handler 共享前奏：工作区存在 → 取工作区 git 写锁 → `ensure_repo` →
+/// `ensure_gitignore`，再执行 body。目录不存在 = Resource 错（git 操作只面向
+/// 已存在工作区，不创建）。
+///
+/// 锁按规范化物理路径键控, 所有服务端 git 写入口共用 (refs/init 亦然);
+/// 同工作区并发写在进程内排队, 而非在 gix index.lock 上撞车报错。
 fn with_repo<T>(path: &Path, f: impl FnOnce(&Repository) -> AppResult<T>) -> AppResult<T> {
     if !path.exists() {
         return Err(AppError::resource("workspace does not exist"));
     }
+    let _guard = git::workspace_lock::acquire(path)?;
     let repo = git::ensure_repo(path)?;
     git::ensure_gitignore(path)?;
     f(&repo)
@@ -39,9 +44,13 @@ pub(crate) async fn init(
     Json(body): Json<GitWriteBody>,
 ) -> Result<Json<GitInitResult>, AppError> {
     let (path, log_id) = resolve_body(&state, &body).await?;
-    let already = tokio::task::spawn_blocking(move || git::init_repo_only(&path))
-        .await
-        .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    let already = tokio::task::spawn_blocking(move || {
+        // init 幂等创建仓库 (含不存在的目录), 与其他 git 写操作共用工作区锁
+        let _guard = git::workspace_lock::acquire(&path)?;
+        git::init_repo_only(&path)
+    })
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
     Ok(Json(GitInitResult {
         success: true,
         message: if already {
@@ -97,13 +106,9 @@ pub(crate) async fn commit(
         .unwrap_or_else(|| state.config.git_default_author_email.clone());
     let result = tokio::task::spawn_blocking(move || {
         with_repo(&path, |repo| {
-            git::stage_files(repo, &files)?;
-            let st = git::get_status(repo)?;
-            if st.staged.is_empty() {
-                return Ok(None);
-            }
-            let hash = git::commit_indexed(repo, &message, &an, &ae)?;
-            Ok(Some(hash))
+            // 事务化 stage+commit (codex v4): 同一把 index.lock 内完成批量
+            // 暂存、冲突拒绝、tree 比对与 CAS 发布; 不再 stage 后全工作区 status
+            git::stage_and_commit(repo, &files, &message, &an, &ae)
         })
     })
     .await
