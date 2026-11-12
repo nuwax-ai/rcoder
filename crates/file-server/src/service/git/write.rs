@@ -64,9 +64,54 @@ fn expand_stage_paths(
     let abs = crate::path_safety::ensure_within(workdir, worktree_path)?;
     if std::fs::symlink_metadata(&abs).is_ok_and(|metadata| metadata.is_dir()) {
         collect_stage_paths(workdir, &abs, out)?;
+        collect_missing_dir_entries(repo, worktree_path, out)?;
         return Ok(());
     }
     out.push(worktree_path.to_string());
+    Ok(())
+}
+
+/// 目录请求补齐**未暂存的删除** (codex 业务缺口): `git add <dir>` 会暂存
+/// 目录内已从工作区消失的文件, 而上面只展开现存文件——index 里有、磁盘
+/// 上没有的条目漏掉后, 请求目录的提交永远不包含这些删除。展开时把这类
+/// 条目一并加入列表, staging 的 NotFound 分支即按删除语义暂存。
+fn collect_missing_dir_entries(
+    repo: &Repository,
+    dir_request: &str,
+    out: &mut Vec<String>,
+) -> AppResult<()> {
+    let prefix = normalize_relative_path(dir_request)?;
+    if prefix.is_empty() {
+        // 根目录请求: 根范围由空 files 分支或空键 scope 覆盖, 此处不处理
+        return Ok(());
+    }
+    let prefix_bstr = BString::from(prefix);
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| AppError::system("git repo has no workdir"))?;
+    let index = repo
+        .open_index()
+        .map_err(|e| map_git_err(e, "git open_index"))?;
+    let backing = index.path_backing();
+    let mut seen: HashSet<&BStr> = out.iter().map(|p| BStr::new(&**p)).collect();
+    let mut missing = Vec::new();
+    for entry in index.entries() {
+        let path = entry.path_in(backing);
+        let under_dir = path.len() > prefix_bstr.len()
+            && path.starts_with(prefix_bstr.as_ref())
+            && path[prefix_bstr.len()] == b'/';
+        if !under_dir {
+            continue;
+        }
+        if seen.insert(path) {
+            use gix::bstr::ByteSlice as _;
+            let abs = crate::path_safety::ensure_within(workdir, path.to_str_lossy().as_ref())?;
+            if std::fs::symlink_metadata(&abs).is_err() {
+                missing.push(path.to_string());
+            }
+        }
+    }
+    out.extend(missing);
     Ok(())
 }
 
@@ -161,7 +206,7 @@ fn stage_paths_with_probe(
     index: &mut gix::index::File,
     paths: &[String],
     stat_probe: impl Fn(&Path) -> std::io::Result<gix::index::fs::Metadata>,
-) -> AppResult<()> {
+) -> AppResult<bool> {
     let workdir = repo
         .workdir()
         .ok_or_else(|| AppError::system("git repo has no workdir"))?;
@@ -171,6 +216,10 @@ fn stage_paths_with_probe(
     let index_timestamp = index.timestamp();
     let mut new_entries: Vec<(Stat, ObjectId, IndexMode, BString)> = Vec::new();
     let mut deleted: HashSet<BString> = HashSet::new();
+    // 本轮是否有任何 index 变更(条目更新/新增/删除)——供调用方区分
+    // "内容没变"与"stat 缓存刷新需落盘" (codex P2: 存量零 stat 仓库靠
+    // 无变更提交时的 stat 刷新落盘来预热快路径)。
+    let mut dirty = false;
     // 以**最终 index 路径**去重: Windows 上 `dir\file.txt` 与 `dir/file.txt`
     // 归一后同键, 字符串级去重会漏; 重复 key 两条都会查不到既有 entry,
     // 延后追加将产生重复 index 条目
@@ -197,6 +246,7 @@ fn stage_paths_with_probe(
         };
         let Some(metadata) = metadata else {
             deleted.insert(bstr_owned);
+            dirty = true;
             continue;
         };
         let mode = if metadata.is_symlink() {
@@ -262,6 +312,7 @@ fn stage_paths_with_probe(
             }
             None => new_entries.push((new_stat.unwrap_or_default(), blob_id, mode, bstr_owned)),
         }
+        dirty = true;
     }
     // 删除: 单趟批量过滤 (保序, 无需再排序)
     if !deleted.is_empty() {
@@ -276,7 +327,7 @@ fn stage_paths_with_probe(
         index.sort_entries();
     }
     index.remove_tree();
-    Ok(())
+    Ok(dirty)
 }
 
 /// ≤此大小的文件经 `Repository::write_blob_stream` 暂存 (内存聚合换取
@@ -323,24 +374,26 @@ impl IndexLock {
     }
 }
 
-/// 写 index 前给 racy 条目打标记 (对齐 git `ce_smudge_racily_clean_entry`):
-/// 记录 stat 的 mtime ≥ 本次写入时刻的条目, 把 `stat.size` 置 0 持久化。
+/// 写 index 前给 racy 条目打标记 (对齐 git `ce_smudge_racily_clean_entry`)。
 ///
-/// 为什么必须持久化在条目里: 秒级粒度下, "T0 提交 a.txt → 同秒内改为同长度
-/// 新内容 → 暂存无关的 b.txt (index 在更晚的秒重写)" 会让 a.txt 旧条目的
-/// mtime (T0) < 新 index 时间戳, 读取侧的 is_racy 判定失灵——但 smudge
-/// 出的 size=0 已写进条目字节, 跨后续无关重写存活, 下次 stat 比对必然
-/// size 失配 → 强制重读内容 (racy-git.txt 的第二形态)。
-/// 空文件天然 size=0, 无影响; 永远偏向重读 (fail-safe)。
+/// 判定基准是**旧 index 检查点**(本事务读入的 index 文件时间戳), 不是
+/// 当前时刻: 条目 stat 的 mtime ≥ 检查点 = "捕获该 stat 之后从未有过已
+/// 验证的检查点" → racy, 把 `stat.size` 置 0 持久化。用 now() 会漏掉
+/// 存量仓库: 旧版实现/外部工具写出的 index 里, 条目 mtime 与旧检查点
+/// 同秒但未带标记, mtime < now → 不补标记 → 后续无关重写洗白 racy 状态
+/// → 同秒同长度真实修改被跳过 (codex 受控反例: git 得 BBB, 旧逻辑残留
+/// AAA)。
+///
+/// 标记持久化在条目字节里, 跨后续无关 index 重写存活; 下次 stat 比对
+/// 必然 size 失配 → 强制重读内容 (racy-git.txt 第二形态)。空文件天然
+/// size=0 无影响; 永远偏向重读 (fail-safe)。被重新验证过的条目携带
+/// 文件真实 mtime (早于新检查点) → 不再标记, 不会循环 smudge。
 fn smudge_racily_clean_entries(index: &mut gix::index::File) {
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0);
+    let checkpoint_secs = index.timestamp().unix_seconds().clamp(0, u32::MAX as i64) as u32;
     for entry in index.entries_mut() {
         if entry.stage() == Stage::Unconflicted
             && entry.stat.size != 0
-            && entry.stat.mtime.secs >= now_secs
+            && entry.stat.mtime.secs >= checkpoint_secs
         {
             entry.stat.size = 0;
         }
@@ -500,8 +553,9 @@ pub fn stage_and_commit(
     let mut index = repo
         .open_index()
         .map_err(|e| map_git_err(e, "git open_index"))?;
+    let mut staging_dirty = false;
     if !paths.is_empty() {
-        stage_paths_with_probe(repo, &mut index, &paths, |path| {
+        staging_dirty = stage_paths_with_probe(repo, &mut index, &paths, |path| {
             gix::index::fs::Metadata::from_path_no_follow(path)
         })?;
     }
@@ -546,15 +600,17 @@ pub fn stage_and_commit(
         !requested_paths_have_staged_changes(repo, &index, files, head_tree)?
     };
     if nothing_to_commit {
-        // 无需创建 commit ≠ 暂存区无需落盘: 本批可能修改了暂存区 (如用户把
-        // 工作树恢复成 HEAD 内容, 抵消旧的暂存差异) —— 必须落盘, 否则磁盘
-        // 残留旧暂存, 下次提交其他文件会连带提交 (codex 终审 P1)。锁内磁盘
-        // index 未变: 重读比对 tree, 不同才写, 真无变化 (纯 stat 刷新) 免写。
-        let disk_index = repo
-            .open_index()
-            .map_err(|e| map_git_err(e, "git open_index"))?;
-        let disk_tree = tree_id_from_index(repo, &disk_index)?;
-        if disk_tree != tree_id {
+        // 无需创建 commit ≠ 暂存区无需落盘。staging_dirty 区分两种情况
+        // (codex P2):
+        // - dirty (条目更新/新增/删除): 必须落盘——含暂存恢复 (用户把工作树
+        //   恢复成 HEAD 内容抵消旧暂存差异) 与 **stat 刷新预热** (旧版实现
+        //   持久化的零 stat 在本轮 staging 已重新验证为真实值, 不落盘则
+        //   存量仓库永远全量重读, 快路径无法生效);
+        // - 全部跳过 (纯 stat 命中): index 字节不变, 免写。
+        // 此前按"磁盘 tree 是否等于内存 tree"决定写盘, 纯 stat 刷新时 tree
+        // 不变 → 刷新丢失 → 零 stat 永久残留。锁在手, 磁盘 index 不可能被
+        // 并发改动, dirty 标记即充分依据。
+        if staging_dirty {
             lock.commit_index(&mut index)?;
         }
         return Ok(None);
@@ -611,11 +667,23 @@ fn requested_paths_have_staged_changes(
             return true;
         }
         // leading-dir: 请求 "dir" / "dir/" 命中 "dir/xxx" (对齐 git pathspec
-        // 语义)。diff 回调只对**变更条目**触发(通常远小于全量), 此处线性
-        // 扫描仅作用于变更路径, 不构成 O(N²)。
-        prefixes
-            .iter()
-            .any(|p| path.starts_with(p.as_ref()) && path.get(p.len()) == Some(&b'/'))
+        // 语义)。未精确命中时**枚举变更路径的父目录**逐个查同一 HashSet —
+        // O(路径深度) 次哈希查找, 与请求数量无关。此前线性扫全部请求前缀
+        // 是 O(变更×请求): 大量无关暂存 + 大量未变请求时二次增长
+        // (codex 实测 1000×1000 → 100 万次比较, 翻倍 → 400 万)。
+        let bytes: &[u8] = path.as_ref();
+        let mut scratch = BString::default();
+        let mut start = 0;
+        while let Some(slash) = bytes[start..].iter().position(|&b| b == b'/') {
+            let end = start + slash;
+            scratch.clear();
+            scratch.extend_from_slice(&bytes[..end]);
+            if requested_exact.contains(&scratch) {
+                return true;
+            }
+            start = end + 1;
+        }
+        false
     };
     let mut has_change = false;
     repo.tree_index_status(
@@ -1024,6 +1092,39 @@ mod tests {
         );
     }
 
+    /// codex 业务缺口: 目录请求必须自动暂存目录内的**未暂存删除**。
+    /// `git add <dir>` 会暂存已消失文件; 此前展开只收集现存文件,
+    /// 请求 ["dir"] 对已删除文件永远返回无变更。TS 走 git CLI 天然覆盖。
+    #[test]
+    fn explicit_commit_stages_deletion_inside_requested_dir() {
+        let test = TestRepo::new();
+        std::fs::create_dir_all(test.0.join("d")).expect("mkdir");
+        commit_file(&test, "d/keep.txt", "k", "add keep");
+        commit_file(&test, "d/gone.txt", "g", "add gone");
+        let repo = test.open();
+        // 删除 d/gone.txt (未暂存), 请求整个目录
+        std::fs::remove_file(test.0.join("d/gone.txt")).expect("remove");
+        let result = stage_and_commit(&repo, &["d".to_string()], "rm gone", "T", "t@e.c")
+            .expect("must not fail");
+        let hash = result.expect("directory request must stage the deletion and commit");
+        let commit = repo
+            .find_commit(ObjectId::from_hex(hash.as_bytes()).expect("parse"))
+            .expect("find");
+        let tree = commit.tree().expect("tree");
+        assert!(
+            tree.lookup_entry_by_path("d/gone.txt")
+                .expect("lk")
+                .is_none(),
+            "未暂存的删除必须经目录请求进入提交"
+        );
+        assert!(
+            tree.lookup_entry_by_path("d/keep.txt")
+                .expect("lk")
+                .is_some(),
+            "目录内未删除文件必须保留"
+        );
+    }
+
     /// racy-git 回归 (codex 复审): a.txt 已修改(同秒同长度), 先只暂存
     /// b.txt (index 重写), 再暂存 a.txt —— 必须 stage 新内容 BBB。
     /// 修复前: index 重写时间 > a.txt mtime(同秒折叠), racy 判定误信
@@ -1050,6 +1151,140 @@ mod tests {
             b"BBB".to_vec(),
             "racy entry 必须重读内容: 暂存区不得残留旧 AAA"
         );
+    }
+
+    /// codex 130k 复审 P1 受控反例: 存量仓库里旧版实现写出的 index 无
+    /// smudge, 条目 mtime 与旧检查点同秒; 同秒同长度真实修改 + mtime 钉回,
+    /// 无关文件的暂存 (推进 index 时间戳) 不得洗白该条目的 racy 状态。
+    /// git CLI 得 BBB, 修复前 Rust 残留 AAA。
+    #[test]
+    fn legacy_unsmudged_racy_entry_survives_unrelated_index_write() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "AAA", "init a");
+        commit_file(&test, "b.txt", "xxx", "init b");
+        let repo = test.open();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let pinned = filetime::FileTime::from_unix_time(now - 60, 0);
+        {
+            // 构造旧版形态: 直接改写磁盘 index 的 a.txt 条目 stat 为
+            // 钉住的时间 (无 smudge), 再把 index 文件 mtime 钉到同一检查点
+            let mut index = repo.open_index().expect("open index");
+            let entry = index
+                .entry_mut_by_path_and_stage(
+                    gix::bstr::ByteSlice::as_bstr(b"a.txt"),
+                    Stage::Unconflicted,
+                )
+                .expect("a.txt entry");
+            entry.stat.mtime.secs = (now - 60) as u32;
+            entry.stat.mtime.nsecs = 0;
+            entry.stat.size = 3;
+            let lock = gix::lock::File::acquire_to_update_resource(
+                repo.index_path(),
+                gix::lock::acquire::Fail::Immediately,
+                None,
+                0,
+            )
+            .expect("raw lock");
+            use std::io::Write as _;
+            let mut lock = lock;
+            {
+                let mut w = std::io::BufWriter::new(&mut lock);
+                index
+                    .write_to(&mut w, IndexWriteOptions::default())
+                    .expect("raw write");
+                w.flush().expect("raw flush");
+            }
+            lock.commit().expect("raw commit");
+        }
+        filetime::set_file_mtime(repo.index_path(), pinned).expect("pin index mtime");
+        // 同秒同长度修改 a.txt, mtime 钉回同一时刻 (stat 字段完全一致)
+        std::fs::write(test.0.join("a.txt"), "BBB").expect("modify a");
+        filetime::set_file_mtime(test.0.join("a.txt"), pinned).expect("pin a mtime");
+        // 无关暂存推进 index 时间戳 → 再暂存 a.txt: 必须拾取 BBB
+        stage_path(&repo, "b.txt").expect("stage b");
+        stage_path(&repo, "a.txt").expect("stage a");
+        let index = repo.open_index().expect("reopen");
+        let entry = index
+            .entry_by_path_and_stage(gix::bstr::ByteSlice::as_bstr(b"a.txt"), Stage::Unconflicted)
+            .expect("entry");
+        let blob = repo.find_blob(entry.id).expect("blob").data.to_vec();
+        assert_eq!(
+            blob,
+            b"BBB".to_vec(),
+            "存量仓库未 smudge 的 racy 条目在无关 index 重写后必须重新验证"
+        );
+    }
+
+    /// codex 130k 复审 P2: 无变更提交必须把刷新后的 stat 落盘——存量
+    /// 零 stat 仓库经一次显式无变更提交预热后, 磁盘 entry stat 应为真实值,
+    /// 后续轮次可命中快路径。修复前纯 stat 刷新时 tree 不变 → 免写盘 →
+    /// 零 stat 永久残留, 每轮全量重读。
+    #[test]
+    fn nothing_to_commit_persists_refreshed_stat_for_legacy_zero_stat_index() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "AAA", "init a");
+        let repo = test.open();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let pinned = filetime::FileTime::from_unix_time(now - 120, 0);
+        // 构造旧版零 stat 索引 (mtime=0/size=0), 并钉住 a.txt 与 index 检查点
+        {
+            let mut index = repo.open_index().expect("open");
+            let entry = index
+                .entry_mut_by_path_and_stage(
+                    gix::bstr::ByteSlice::as_bstr(b"a.txt"),
+                    Stage::Unconflicted,
+                )
+                .expect("entry");
+            entry.stat = Stat::default();
+            let lock = gix::lock::File::acquire_to_update_resource(
+                repo.index_path(),
+                gix::lock::acquire::Fail::Immediately,
+                None,
+                0,
+            )
+            .expect("raw lock");
+            use std::io::Write as _;
+            let mut lock = lock;
+            {
+                let mut w = std::io::BufWriter::new(&mut lock);
+                index
+                    .write_to(&mut w, IndexWriteOptions::default())
+                    .expect("raw write");
+                w.flush().expect("raw flush");
+            }
+            lock.commit().expect("raw commit");
+        }
+        filetime::set_file_mtime(repo.index_path(), pinned).expect("pin index");
+        filetime::set_file_mtime(test.0.join("a.txt"), pinned).expect("pin a");
+        // 连续两次显式无变更提交: 第一次刷新 stat 落盘 (checkpoint 早于
+        // 文件 mtime 的秒 → 不再 smudge), 第二次命中快路径
+        for i in 0..2 {
+            let outcome = stage_and_commit(
+                &repo,
+                &["a.txt".to_string()],
+                &format!("noop{i}"),
+                "T",
+                "t@e.c",
+            )
+            .expect("noop commit must not fail");
+            assert!(outcome.is_none(), "unchanged file must be nothingToCommit");
+        }
+        let index = repo.open_index().expect("reopen");
+        let entry = index
+            .entry_by_path_and_stage(gix::bstr::ByteSlice::as_bstr(b"a.txt"), Stage::Unconflicted)
+            .expect("entry");
+        assert_ne!(
+            entry.stat,
+            Stat::default(),
+            "刷新后的真实 stat 必须落盘, 否则存量仓库永远无法预热快路径"
+        );
+        assert_eq!(entry.stat.size, 3, "size 应为文件真实大小");
     }
 
     /// stat 快路径不得吞掉真实变更: 内容或执行位变化必须重新 stage。
@@ -1128,7 +1363,7 @@ mod tests {
                 }
             });
             match result {
-                Ok(()) => panic!("batch with injected stat failure must fail"),
+                Ok(_) => panic!("batch with injected stat failure must fail"),
                 Err(error) => error,
             }
         };

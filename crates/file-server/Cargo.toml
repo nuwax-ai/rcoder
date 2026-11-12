@@ -139,3 +139,4 @@ winapi-util = "0.1.11"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+filetime = "0.2"

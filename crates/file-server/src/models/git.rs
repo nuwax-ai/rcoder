@@ -158,7 +158,11 @@ pub struct CommitBody {
     /// 提交信息（必填非空）
     #[garde(custom(crate::validation_rules::not_blank))]
     pub message: String,
-    /// 限定提交的文件集合（缺省等价提交全部暂存）
+    /// 限定**暂存与触发范围**的文件/目录集合（省略/null/空数组 = 全量分支:
+    /// 暂存全部变更, 有差异即提交）。非空列表: 先暂存列表内的新增/修改/
+    /// 删除 (目录请求含目录内已消失文件的删除), 仅当该范围相对 HEAD 有
+    /// 暂存差异时触发提交; **触发后提交体仍是整个暂存区** (含此前已由
+    /// 其他请求暂存的内容)。不能仅因列表很大而自动切换为全量语义。
     #[serde(default)]
     #[garde(skip)]
     pub files: Option<Vec<String>>,
