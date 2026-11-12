@@ -414,13 +414,21 @@ impl PgStore {
                                     if self.postgres_config.binding_autoheal() {
                                         // 迟到观察防线（审查 P1）：UID 不同只证明
                                         // "不是同一对象"，不证明"观察比当前绑定新"。
-                                        // 换代只接受创建时间不早于在案行的观察：
-                                        // k8s 重建的 pod creationTimestamp 必然晚于
-                                        // 被替旧代（秒级精度，同秒视为不可判而放行），
-                                        // 而迟到的旧观察携带旧 pod 的创建时间，早于
-                                        // 刚落库的新行 → 拒绝。否则旧观察会退休较新
-                                        // 绑定并写物理墓碑，把真实新对象的后续登记
-                                        // 永久封死（Superseded）。
+                                        // k8s pod creationTimestamp 是秒级精度：
+                                        // - 观察创建时间**早于**在案行 → 迟到的旧
+                                        //   观察，拒绝（否则它会退休较新绑定并写
+                                        //   物理墓碑，把真实新对象的后续登记永久
+                                        //   封死 Superseded）；
+                                        // - **同秒** → 无法按时间排序。只放行携带
+                                        //   匹配前驱身份的**受控换代**（supplied
+                                        //   有值 = 调用方此前注册过当前行，上游
+                                        //   rebase 检查已证明其见过当前代次）；
+                                        //   全新观察（supplied 为空，如重启后空
+                                        //   镜像副本）不能在不可判定时退休当前
+                                        //   绑定 → 拒绝，经运行时/生命周期流程
+                                        //   （重新观察或 stop→退休→重建）确证。
+                                        //   不能一刀切拒绝同秒：合法的同秒重建
+                                        //   （受控方）必须能通过原入口恢复。
                                         let bound_created = read
                                             .canonical_container
                                             .as_ref()
@@ -443,6 +451,28 @@ impl PgStore {
                                                  cannot retire a newer binding",
                                                 basic.created_at,
                                                 bound_created.unwrap_or_default(),
+                                            );
+                                        }
+                                        if bound_created
+                                            .is_some_and(|bound| basic.created_at == bound)
+                                            && supplied.container.is_none()
+                                        {
+                                            tracing::warn!(
+                                                container = %key,
+                                                registered_workload_uid = registered,
+                                                observed_workload_uid = observed,
+                                                observed_created_at = %basic.created_at,
+                                                "binding autoheal rejected an unverifiable \
+                                                 same-second observation; re-observe or retire \
+                                                 the binding through the lifecycle flow"
+                                            );
+                                            anyhow::bail!(
+                                                "Observed workload was created in the same \
+                                                 second as the current binding ({}); a fresh \
+                                                 observation cannot prove it is newer — \
+                                                 re-observe or stop the project to retire the \
+                                                 binding first",
+                                                basic.created_at,
                                             );
                                         }
                                         // 带外换代放行：走下方既有换代事务

@@ -1743,6 +1743,157 @@ async fn late_older_observation_cannot_retire_newer_binding() {
     let _ = store.writer().flush_and_stop(Duration::from_secs(5)).await;
 }
 
+/// 审查 P1 复审：同秒观察（creationTimestamp 秒级精度，无法排序）不得退休
+/// 当前绑定，除非是携带匹配前驱身份的受控换代。
+///
+/// 时序：注册 wl-0（t0）→ B（t0+1h，较新）带外换代 Committed → 迟到登记同秒
+/// 的全新观察 D（无前驱身份）→ 必须拒绝、绑定仍是 B、B 不进墓碑、B 可重登记
+/// → 持有 B 前驱身份的受控同秒换代（C，原入口）→ Committed：合法同秒重建
+/// 不被一刀切封死，且只有受控换代才把 B 写进墓碑。
+#[tokio::test]
+async fn same_second_fresh_observation_cannot_retire_binding_but_controlled_can() {
+    let Some(dsn) = test_dsn().await else {
+        eprintln!("[skip] {DSN_ENV} not set");
+        return;
+    };
+    let id = format!("tie-obs-{}", uuid_suffix());
+    let container_name = format!("rcoder-{id}");
+    let t0 = chrono::Utc::now();
+    let t_b = t0 + chrono::Duration::hours(1);
+    let mk = |physical: &str, workload: &str, created: chrono::DateTime<chrono::Utc>| {
+        ContainerBasicInfo {
+            container_id: if physical.is_empty() {
+                String::new()
+            } else {
+                format!("{physical}-{id}")
+            },
+            container_name: container_name.clone(),
+            container_ip: "10.42.0.9".into(),
+            internal_port: 50051,
+            external_port: 0,
+            project_id: id.clone(),
+            status: "running".into(),
+            created_at: created,
+            service_url: format!("http://{container_name}"),
+            workload_uid: Some(workload.to_string()),
+        }
+    };
+    let project_for = |container: ContainerBasicInfo| {
+        let mut info = ProjectAndContainerInfo::new(id.clone());
+        info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+        info.set_user_id(Some(format!("user-{id}")));
+        info.set_container(Some(container));
+        Arc::new(info)
+    };
+    let store = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .expect("connect");
+
+    // 1. 原绑定 wl-0。
+    store
+        .insert_project_registration_durable(id.clone(), project_for(mk("pod-0", "wl-0", t0)))
+        .await
+        .expect("register original binding");
+    assert!(
+        store.wait_drained(Duration::from_secs(5)).await,
+        "original drain"
+    );
+
+    // 2. B 较新（t0+1h）→ 合法带外换代。
+    let outcome = store
+        .insert_project_registration_durable(id.clone(), project_for(mk("pod-b", "wl-b", t_b)))
+        .await
+        .expect("newer replacement must be admitted");
+    assert_eq!(
+        outcome,
+        shared_types::persistence::PersistenceWriteOutcome::Committed
+    );
+    assert!(store.wait_drained(Duration::from_secs(5)).await, "B drain");
+    let row = fetch_binding_row(&store, &container_name)
+        .await
+        .expect("row after B");
+    assert_eq!(row.1.as_deref(), Some("wl-b"));
+
+    // 3. 迟到的同秒全新观察 D（创建时间与 B 行相同，无前驱身份）→ 必须拒绝。
+    let same_second = store
+        .insert_project_registration_durable(id.clone(), project_for(mk("pod-d", "wl-d", t_b)))
+        .await;
+    assert!(
+        same_second.is_err(),
+        "an unverifiable same-second fresh observation must be rejected, got {same_second:?}"
+    );
+    let row = fetch_binding_row(&store, &container_name)
+        .await
+        .expect("row after same-second rejection");
+    assert_eq!(row.0.as_deref(), Some(format!("pod-b-{id}").as_str()));
+    assert_eq!(row.1.as_deref(), Some("wl-b"), "binding must stay on B");
+
+    // B 未进墓碑；B（同 UID）重登记走普通 rebase → Committed。
+    let name_for_gen = container_name.clone();
+    let b_generation = super::database::read(&store.database, move |tx| {
+        let name = name_for_gen;
+        Box::pin(async move {
+            Ok(super::repo::fetch_container_registration(tx, &name)
+                .await?
+                .map(|row| row.container_generation))
+        })
+    })
+    .await
+    .expect("read B generation")
+    .expect("B row present");
+    assert!(
+        !exact_tombstone_exists(
+            &store,
+            &container_name,
+            &b_generation,
+            &format!("pod-b-{id}"),
+        )
+        .await,
+        "B must not be retired by a tombstone"
+    );
+    let recommit = store
+        .insert_project_registration_durable(id.clone(), project_for(mk("pod-b", "wl-b", t_b)))
+        .await
+        .expect("B must remain registrable (same-UID rebase)");
+    assert_eq!(
+        recommit,
+        shared_types::persistence::PersistenceWriteOutcome::Committed
+    );
+
+    // 4. 受控同秒换代（原入口）：调用方持有 B 的前驱身份（同秒创建的 C）→ 放行。
+    let stored_b = store.inner().get(&id).expect("stored B info").clone();
+    let mut c_info = project_for(mk("pod-c", "wl-c", t_b));
+    Arc::make_mut(&mut c_info).set_persistence_identity(stored_b.persistence_identity().clone());
+    let outcome = store
+        .insert_project_registration_durable(id.clone(), c_info)
+        .await
+        .expect("a controlled same-second replacement must recover through the original entry");
+    assert_eq!(
+        outcome,
+        shared_types::persistence::PersistenceWriteOutcome::Committed
+    );
+    assert!(store.wait_drained(Duration::from_secs(5)).await, "C drain");
+    let row = fetch_binding_row(&store, &container_name)
+        .await
+        .expect("row after C");
+    assert_eq!(
+        row.1.as_deref(),
+        Some("wl-c"),
+        "controlled replacement rebinds"
+    );
+    assert!(
+        exact_tombstone_exists(
+            &store,
+            &container_name,
+            &b_generation,
+            &format!("pod-b-{id}"),
+        )
+        .await,
+        "only the controlled replacement may retire B with a tombstone"
+    );
+    let _ = store.writer().flush_and_stop(Duration::from_secs(5)).await;
+}
+
 /// 回源自愈链（生产 2026-10-27 P0 的第二层防线）：副本镜像缺失该 user（节点
 /// drain / 事件竞序）时，用户维度的查找 miss 经 `refresh_user_container` 回读
 /// 权威行 + 受护栏的 project read-through hydrate 后重试命中；无容器的孤儿
