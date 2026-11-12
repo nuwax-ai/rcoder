@@ -563,38 +563,50 @@ fn requested_paths_have_staged_changes(
         .map(|path| normalize_relative_path(path))
         .collect::<AppResult<Vec<_>>>()?;
     let tree_id = head_tree.unwrap_or_else(|| repo.empty_tree().id().detach());
-    // 官方 literal Pathspec (已验证 match_verbatim 与 git 语义逐字节等价:
-    // path == pattern 或 path[len] == '/' 的 leading-dir 前缀)。任一请求为
-    // 根 (`.` → 空键) → 整体按全仓, 不带 pathspec (无过滤)。
-    let mut pathspec = None;
-    if !scope.iter().any(String::is_empty) {
-        let patterns = scope
-            .iter()
-            .map(|path| BString::from(format!(":(literal){path}")));
-        pathspec = Some(
-            repo.pathspec(
-                true,
-                patterns,
-                // tree↔index 比对不继承 core.ignoreCase：对齐 gix 自身
-                // (`status/tree_index.rs` 默认 false; 只有 index↔worktree 才 true)。
-                // 继承会让 macOS/Windows 开发机 (ICASE) 与 Linux 生产对同一
-                // 请求给出不同的 nothingToCommit 判定。
-                false,
-                index,
-                gix::worktree::stack::state::attributes::Source::IdMapping,
-            )
-            .map_err(|e| map_git_err(e, "git pathspec"))?,
-        );
+    // 请求范围判定: 不再用 N 条 :(literal) pathspec 过滤 tree_index_status ——
+    // gix-pathspec 的多模式匹配是**每条 index 条目线性扫描全部 pattern**
+    // (search/matching.rs patterns.iter_mut().find_map), N 请求 × N 条目 =
+    // O(N²): 40k 全量请求仅模式匹配就要 ~6.4s, 130k ≈ 2 分钟 (生产实测
+    // 2.6min 的主因)。
+    // 改为无 pathspec 全量 diff(纯内存 oid/mode 比较, O(N)) + 变更路径对
+    // 请求集合的 HashSet 判定。任一请求为根 (`.` → 空键) → 全仓范围,
+    // 首个变更即真。目录请求的 leading-dir 语义由前缀匹配保留。
+    let root_scope = scope.iter().any(String::is_empty);
+    let prefixes: Vec<BString> = if root_scope {
+        Vec::new()
+    } else {
+        scope.iter().map(|p| BString::from(p.as_str())).collect()
+    };
+    let mut requested_exact: HashSet<BString> = HashSet::with_capacity(prefixes.len());
+    for path in &prefixes {
+        requested_exact.insert(path.clone());
     }
+    let in_scope = |path: &BStr| -> bool {
+        if root_scope || requested_exact.contains(path) {
+            return true;
+        }
+        // leading-dir: 请求 "dir" / "dir/" 命中 "dir/xxx" (对齐 git pathspec
+        // 语义)。diff 回调只对**变更条目**触发(通常远小于全量), 此处线性
+        // 扫描仅作用于变更路径, 不构成 O(N²)。
+        prefixes
+            .iter()
+            .any(|p| path.starts_with(p.as_ref()) && path.get(p.len()) == Some(&b'/'))
+    };
     let mut has_change = false;
     repo.tree_index_status(
         &tree_id,
         index,
-        pathspec.as_mut(),
+        // None = 不带 pathspec: diff 本体不做模式匹配, 过滤在回调内完成
+        None,
         gix::status::tree_index::TrackRenames::Disabled,
-        |_, _, _| {
-            has_change = true;
-            Ok(std::ops::ControlFlow::Break(()))
+        |change, _, _| {
+            let path = change.location();
+            if in_scope(path) {
+                has_change = true;
+                Ok(std::ops::ControlFlow::Break(()))
+            } else {
+                Ok(std::ops::ControlFlow::Continue(()))
+            }
         },
     )
     .map_err(|e| map_git_err(e, "git tree_index_status"))?;
