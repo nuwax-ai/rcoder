@@ -721,8 +721,11 @@ impl DiscardBuckets {
 }
 
 /// discard (对齐 nuwax discard): files 空 → discard 全部 modified/staged/deleted。
+/// - 每个请求先词法归一成规范键 (`x/../b.txt` → `b.txt`), HEAD 查询 / 物化 /
+///   index / 分桶共用该键
 /// - HEAD 有该文件 (tracked, modified/deleted) → 恢复 worktree 到 HEAD + `stage_path` 同步 index
 /// - HEAD 无 (untracked/staged-new) → 删除 worktree + `stage_path` 同步 index (移除 staged-new entry)
+/// - 目录请求 (含归一后为根的 `.`) → 拒绝: 无单文件语义, 且目录展开等于 add
 ///
 /// 返回三桶明细 (trackedFiles / newFiles / untrackedFiles), 与 nuwax 一致。
 pub fn discard_files(repo: &Repository, files: &[String]) -> AppResult<DiscardBuckets> {
