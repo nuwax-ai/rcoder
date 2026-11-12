@@ -142,6 +142,7 @@ root   pid=3407241 exe=/usr/local/bin/node  cmdline="node /usr/local/bin/claude-
 | 首条消息之后才起的 agent 子进程 | 可能被杀 | 静态规则 4/5 兜底 |
 | 无钩子且 5 分钟后才启动 agent | cap 关闭后可能误杀 | 调大 cap 或补钩子 |
 | 用户首条消息极早（agent 还在初始化） | 该阶段进程未受保护 | 概率低；agent 初始化通常先于 UI 可用 |
+| agent 拉起后台进程、工具 shell 退出（reparent 到 PID 1） | **永不淘汰** | 背景长跑负载（dev server / whisper / 构建）整类落在盲区，见 21 节 |
 
 ## 6. 触发指标：**working set，不是 memory.current**
 
@@ -550,3 +551,100 @@ ALL SCENARIOS PASS
 - 遗留注意：nuwax-k8s-test 的 rcoder 主服务（STS 3 副本）在验证期间处于
   CrashLoopBackOff（11 天），与本功能无关，但"完整链路"（rcoder 创建动态
   agent-runner → 真实 claude 会话 → would_evict）待主服务恢复后补测。
+
+## 21. 已知盲区：reparent 后逃逸的负载（实测，v1 明确不修）
+
+### 21.1 现象
+
+预发布环境（`nuwax-k8s-test`，`192.168.1.19`）用真实模型驱动一次工具调用：
+
+```
+nohup python3 -c "…bytearray(1200*1024*1024)…" > /tmp/hog.log 2>&1 &
+```
+
+容器内存 1007MB → 3562MB，进程确实在跑：
+
+```
+    PID    PPID    PGID   RSS        COMMAND
+   3171       1    3171   1238716KB  python3 -c import time;b=bytearray(1200*1024*1024)
+```
+
+但 `/computer/pod/resources` 返回：
+
+```
+groups: {infra: 4078MB, platform: 1421MB, workload: 0MB}
+workload 行: []
+```
+
+1.2GB 的负载被归成 `infra`，`workload` 恒为 0。
+
+### 21.2 机制：淘汰范围只认 ppid 树
+
+```rust
+for root in roots {
+    scope.extend(descendants(table, *root));   // proc_tree::evictable_scope
+}
+```
+
+agent 用 `… &` 拉起后台进程、工具 shell 返回后，内核把这棵子树 reparent 到 PID 1
+（POSIX 标准行为，不是内核 bug）。此时：
+
+- `ppid = 1` → 不再是任何 root 的后代；
+- `pgid = 自己的 pid`（工具执行走 setsid）→ 也不在 root 的进程组里；
+- `sid` 同理。
+
+于是它永久脱离淘汰范围。`agent_resource_monitor` 的角色分类因此把它落到 `infra`
+（`evictable_pids` 不含它），面板上只表现为「一个 infra 进程吃了 1.2GB」。
+
+> 注意：这不是「进程丢了」。资源采集、`agents[]`、进程明细都正常，丢的是
+> **淘汰资格**。第 `agent_scan` 诊断计数器也抓不到它（那些计数只覆盖
+> 「注册项 → 进程表」的匹配失败），所以现场依然安静。
+
+### 21.3 影响面
+
+**凡 agent 拉起就撒手的进程都在盲区里**：dev server、whisper 转写、长跑构建。
+它们恰好是最容易把容器撑爆的一类。因此当前看门狗的真实覆盖是
+「agent 还在前台等着的子进程树」，背景长跑负载不在其中。
+
+生产那次 3×whisper 5.9GB 是否属于该形状，当时没留 `ppid/pgid`，无法回溯。
+下次必须先取证再决定是否修改范围。
+
+### 21.4 为什么不修（v1 决策）
+
+| 方案 | 问题 |
+|---|---|
+| `cwd` 在 `/home/user/<project_id>` 下的启发式 | 用户自己在终端 `cd` 进去跑的东西同样命中 → 可能杀用户正在干活的进程 |
+| 启动时注入 session 环境变量 | 可靠性高，但要改 spawn 路径；`env -i` 包装会丢；只对新会话生效 |
+| 出生时间（starttime 晚于 root） | 无法区分归属 |
+| 全量取反（除保护集外都可淘汰） | Xvnc / chromium / ttyd / websockify 全被纳入，杀伤面失控 |
+| `PR_SET_CHILD_SUBREAPER` | **原理上正确**：让 agent_runner 成为孤儿收割者，孤儿 reparent 到它而非 PID 1，ppid 树不断，**零范围改动、零启发式**。代价真实：agent_runner 需收割孤儿，而它的 ACP 子进程由 tokio `Child::wait` 管理；直接 `waitpid(-1)` 会抢走退出状态、打坏 `StopAgent` 的 "child exit confirmed"。安全做法是 `waitid(WNOWAIT)` 先窥探、过滤自家 pid、只对孤儿真 reap —— 改在 OOM 处置路径上，写错就是**杀错进程** |
+
+结论：在没有真实数据证明这是 OOM 主因之前，**不动杀伤面**。看门狗定位应表述为
+「兜底 + 观测」；真正的 OOM 防线仍是容器内存限额 + 上层重试/隔离。
+
+补充一条边界：即使将来解决了「归属识别」，**信号能不能发出去**仍受 §19.4 的
+AppArmor 约束（默认 profile 下容器内 kill 子进程 EPERM，需要
+`cri-containerd-signal` Localhost profile 放行 signal peer）。识别与投递是两道
+独立的门槛，别把「识别到了」当成「能杀掉」。另外 subreaper 属于 **ppid 树
+完整性**问题，与 §19.5「kill 能否交给内核」不是同一件事：后者讲的是信号通道
+无法绕过 LSM，这里讲的是范围识别依赖的内核属性会被 reparent 改变。
+
+### 21.5 下次如何快速判断
+
+```bash
+# 容器内：找 ppid=1 且 RSS 很大的进程
+ps -eo pid,ppid,pgid,rss,args --sort=-rss | head
+
+# 接口：workload 为 0，但 infra 里有个大家伙 → 命中本盲区
+curl -s "http://<rcoder>/computer/pod/resources?user_id=<id>" | jq '.data.process_groups'
+```
+
+### 21.6 未做的零风险改进（待办）
+
+1. 面板/接口把「不在任何注册树里、且 RSS 超阈值」的进程单独标一类
+   （`orphan` / `unmanaged[]`），并在面板上写明「看门狗不会淘汰这类进程」，
+   避免它藏在 `infra` 里误导判断。
+2. 进程行透出 `ppid/pgid`（proto 已有 `ppid`，只是未进 HTTP 响应），
+   让线上事故可自证。
+
+两条都只加字段/标签、不动 kill 路径；出问题最多是标签不准，不会杀错东西。
