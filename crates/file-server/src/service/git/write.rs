@@ -106,7 +106,7 @@ pub fn stage_files(repo: &Repository, files: &[String]) -> AppResult<()> {
         .open_index()
         .map_err(|e| map_git_err(e, "git open_index"))?;
     stage_paths_with_probe(repo, &mut index, &paths, |path| {
-        std::fs::symlink_metadata(path)
+        gix::index::fs::Metadata::from_path_no_follow(path)
     })?;
     lock.commit_index(&mut index)
 }
@@ -149,15 +149,26 @@ fn collect_status_paths(repo: &Repository) -> AppResult<Vec<String>> {
 /// 循环期间 index 恒为原始有序状态——既有 entry 原地改字段 (不移动),
 /// 新增与删除全部缓冲延后——`entry_mut_by_path_and_stage` 的二分查找因此
 /// 始终有效; 排序与删除过滤各只做一次 (避免逐 entry 全表扫描/排序)。
+///
+/// 未变更文件走 git 同款快路径: `Stat::matches` 命中 (mtime/ctime/size 按
+/// repo stat 配置比较) 且 mode 未变且非 racy-clean → 完全跳过, 不 open
+/// 不读不哈希不写对象——`git add` 对未变更文件只花一次 lstat 的机制
+/// (read-cache.c ie_match_stat)。每对象落盘成本在网络卷 (RBD/CephFS)
+/// 上是毫秒级, 此前每轮 commit 重写全部未变更对象是数万文件耗时数十秒
+/// 的直接原因。entry.stat 写真实 stat (非零值), 否则下一轮永远比对不中。
 fn stage_paths_with_probe(
     repo: &Repository,
     index: &mut gix::index::File,
     paths: &[String],
-    stat_probe: impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+    stat_probe: impl Fn(&Path) -> std::io::Result<gix::index::fs::Metadata>,
 ) -> AppResult<()> {
     let workdir = repo
         .workdir()
         .ok_or_else(|| AppError::system("git repo has no workdir"))?;
+    let stat_options = repo
+        .stat_options()
+        .map_err(|e| map_git_err(e, "git stat options"))?;
+    let index_timestamp = index.timestamp();
     let mut new_entries: Vec<(Stat, ObjectId, IndexMode, BString)> = Vec::new();
     let mut deleted: HashSet<BString> = HashSet::new();
     // 以**最终 index 路径**去重: Windows 上 `dir\file.txt` 与 `dir/file.txt`
@@ -188,49 +199,68 @@ fn stage_paths_with_probe(
             deleted.insert(bstr_owned);
             continue;
         };
-        let (blob_id, mode) = if metadata.file_type().is_symlink() {
-            let target = std::fs::read_link(&abs)?;
-            let data = into_bstr(target)
-                .map_err(|error| map_git_err(error, "git encode symlink target"))?
-                .into_owned();
-            let id = repo
-                .write_blob(data.as_slice())
-                .map_err(|e| map_git_err(e, "git write symlink blob"))?
-                .detach();
-            (id, IndexMode::SYMLINK)
+        let mode = if metadata.is_symlink() {
+            IndexMode::SYMLINK
         } else if metadata.is_file() {
-            #[cfg(unix)]
-            let executable = {
-                use std::os::unix::fs::PermissionsExt;
-                metadata.permissions().mode() & 0o111 != 0
-            };
-            #[cfg(not(unix))]
-            let executable = false;
-            let mode = if executable {
+            if metadata.is_executable() {
                 IndexMode::FILE_EXECUTABLE
             } else {
                 IndexMode::FILE
-            };
-            // Repository::write_blob_stream() 在 gix 0.85 中仍先聚合到内存；
-            // 直接写公开 ODB handle 才会流式压缩并落到 loose object。
-            let mut file = std::fs::File::open(&abs)?;
-            let id = repo
-                .objects
-                .write_stream(gix::objs::Kind::Blob, metadata.len(), &mut file)
-                .map_err(|e| map_git_err(e, "git stream worktree blob"))?;
-            (id, mode)
+            }
         } else {
             return Err(AppError::validation(format!(
                 "unsupported file type: {worktree_path}"
             )));
         };
+        // gix_index::fs::Metadata 携带 git 语义的 ctime (std 在 Unix 上没有),
+        // Stat::from_fs 因此必须配它使用。pre-epoch 等异常 → None,
+        // 退化为旧行为 (零 stat, 每轮全量重处理) 而非失败。
+        let new_stat = Stat::from_fs(&metadata).ok();
+        // 未变更快路径 (对齐 gix-status function.rs 的 racy-git 判定):
+        // stat 一致 + mode 一致 + 非空 blob 例外 + 非 racy-clean → 跳过。
+        // racy-clean: entry mtime ≥ index 时间戳时 stat 不可信 (同秒内改回
+        // 同大小), 必须落内容比较; empty blob 例外是 git 对 size=0 racy
+        // 标记的补丁 (racy-git.txt)。
+        if let (Some(stat), Some(entry)) = (
+            new_stat.as_ref(),
+            index.entry_by_path_and_stage(bstr_path, Stage::Unconflicted),
+        ) && stat.matches(&entry.stat, stat_options)
+            && entry.mode == mode
+            && (!entry.id.is_empty_blob() || entry.stat.size == 0)
+            && !stat.is_racy(index_timestamp, stat_options)
+        {
+            continue;
+        }
+        let blob_id = if metadata.is_symlink() {
+            let target = std::fs::read_link(&abs)?;
+            let data = into_bstr(target)
+                .map_err(|error| map_git_err(error, "git encode symlink target"))?
+                .into_owned();
+            repo.write_blob(data.as_slice())
+                .map_err(|e| map_git_err(e, "git write symlink blob"))?
+                .detach()
+        } else {
+            let mut file = std::fs::File::open(&abs)?;
+            // 小文件走 facade: write_blob_stream 自带 exists 去重——同内容
+            // 对象已存在时不写盘 (git freshen 的等价物, gix 只在 facade 层
+            // 提供)。大文件保持 ODB 流式写 (不聚合进内存), 放弃去重。
+            if metadata.len() <= STAGE_FACADE_DEDUPE_MAX_BYTES {
+                repo.write_blob_stream(&mut file)
+                    .map_err(|e| map_git_err(e, "git write worktree blob"))?
+                    .detach()
+            } else {
+                repo.objects
+                    .write_stream(gix::objs::Kind::Blob, metadata.len(), &mut file)
+                    .map_err(|e| map_git_err(e, "git stream worktree blob"))?
+            }
+        };
         match index.entry_mut_by_path_and_stage(bstr_path, Stage::Unconflicted) {
             Some(entry) => {
                 entry.id = blob_id;
-                entry.stat = Stat::default();
+                entry.stat = new_stat.unwrap_or_default();
                 entry.mode = mode;
             }
-            None => new_entries.push((Stat::default(), blob_id, mode, bstr_owned)),
+            None => new_entries.push((new_stat.unwrap_or_default(), blob_id, mode, bstr_owned)),
         }
     }
     // 删除: 单趟批量过滤 (保序, 无需再排序)
@@ -248,6 +278,11 @@ fn stage_paths_with_probe(
     index.remove_tree();
     Ok(())
 }
+
+/// ≤此大小的文件经 `Repository::write_blob_stream` 暂存 (内存聚合换取
+/// exists 去重); 超过则走 ODB 流式写。绝大多数工作区变更文件是小文件,
+/// 大文件聚合进内存的峰值不可接受。
+const STAGE_FACADE_DEDUPE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 // ── index.lock 事务 ──────────────────────────────────────────────────────────
 
@@ -442,7 +477,7 @@ pub fn stage_and_commit(
         .map_err(|e| map_git_err(e, "git open_index"))?;
     if !paths.is_empty() {
         stage_paths_with_probe(repo, &mut index, &paths, |path| {
-            std::fs::symlink_metadata(path)
+            gix::index::fs::Metadata::from_path_no_follow(path)
         })?;
     }
     assert_no_unresolved_conflicts(&index)?;
@@ -918,6 +953,85 @@ mod tests {
         );
     }
 
+    /// P0-a 快路径: 未变更文件重 stage 必须跳过——不重写 loose 对象
+    /// (以对象文件 mtime 不变为证)。修复前每轮重写全部对象, 网络卷上
+    /// 每对象毫秒级, 是数万文件 commit 数十秒的直接原因。
+    #[test]
+    fn stage_skips_unchanged_file_without_rewriting_object() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        std::fs::write(test.0.join("a.txt"), "two").expect("change");
+        let repo = test.open();
+        stage_path(&repo, "a.txt").expect("stage change");
+        let oid = repo
+            .write_blob(b"two".as_slice())
+            .expect("blob of staged content")
+            .detach();
+        let hex = oid.to_hex().to_string();
+        let obj_path = repo
+            .git_dir()
+            .join("objects")
+            .join(&hex[..2])
+            .join(&hex[2..]);
+        let mtime0 = std::fs::metadata(&obj_path)
+            .and_then(|m| m.modified())
+            .expect("staged loose object");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        stage_path(&repo, "a.txt").expect("re-stage unchanged");
+        let mtime1 = std::fs::metadata(&obj_path)
+            .and_then(|m| m.modified())
+            .expect("object must survive");
+        assert_eq!(
+            mtime0, mtime1,
+            "未变更文件重 stage 不得重写 loose 对象 (stat 快路径失效)"
+        );
+    }
+
+    /// stat 快路径不得吞掉真实变更: 内容或执行位变化必须重新 stage。
+    #[test]
+    fn stage_skips_do_not_swallow_real_changes() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        commit_file(&test, "b.sh", "echo", "add b");
+        let repo = test.open();
+        // 重 stage (未变更, 应跳过) 后再改内容: 仍必须被拾取
+        stage_path(&repo, "a.txt").expect("noop stage");
+        std::fs::write(test.0.join("a.txt"), "changed").expect("change");
+        stage_path(&repo, "a.txt").expect("stage after change");
+        let index = repo.open_index().expect("index");
+        let entry = index
+            .entry_by_path_and_stage(gix::bstr::ByteSlice::as_bstr(b"a.txt"), Stage::Unconflicted)
+            .expect("entry");
+        let blob = repo.find_blob(entry.id).expect("blob").data.to_vec();
+        assert_eq!(blob, b"changed".to_vec(), "内容变更必须重新 stage");
+        assert_ne!(entry.stat, Stat::default(), "entry.stat 必须写真实值");
+    }
+
+    /// 执行位变化 = mode 变化, 不得被 stat 快路径跳过。
+    #[cfg(unix)]
+    #[test]
+    fn stage_mode_change_is_not_skipped() {
+        let test = TestRepo::new();
+        commit_file(&test, "run.sh", "echo", "add run");
+        let repo = test.open();
+        stage_path(&repo, "run.sh").expect("noop stage");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            test.0.join("run.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod +x");
+        stage_path(&repo, "run.sh").expect("stage mode change");
+        let index = repo.open_index().expect("index");
+        let entry = index
+            .entry_by_path_and_stage(
+                gix::bstr::ByteSlice::as_bstr(b"run.sh"),
+                Stage::Unconflicted,
+            )
+            .expect("entry");
+        assert_eq!(entry.mode, IndexMode::FILE_EXECUTABLE, "mode 变更必须生效");
+    }
+
     /// 批量 stage 中途失败必须原子: 既有暂存保留, 本批任何文件都不落盘
     /// (codex 审查要求的失败回归)。
     #[test]
@@ -945,7 +1059,7 @@ mod tests {
                         "injected",
                     ))
                 } else {
-                    std::fs::symlink_metadata(path)
+                    gix::index::fs::Metadata::from_path_no_follow(path)
                 }
             });
             match result {
