@@ -690,6 +690,42 @@ fn redact_url_userinfo(arg: &str) -> Option<String> {
     Some(format!("{}{MASK}{}", &arg[..scheme_at + 3], &rest[at..]))
 }
 
+/// shell 的命令串 flag：`-c` / `--command`，以及**含 `c` 的短 flag 组合**
+/// （`-ec`/`-ce`/`-lc`/`-ic`/`-ecx`）。
+///
+/// 为什么按"含 c"而不是枚举：`sh -ec 'curl -u alice:hunter2 …'` 这种组合写法
+/// 曾整段泄漏脚本文本（枚举只认 `-c`，`-ec` 被当成普通 flag 放行，下一个参数
+/// 便按普通参数逐条识别，必然漏）。代价是 `curl -c cookiejar` 这类无关用法会
+/// 连带掩掉下一个参数——掩一个路径不泄密，符合本模块宁多掩勿漏的取向。
+#[cfg(any(target_os = "linux", test))]
+fn is_shell_command_flag(arg: &str) -> bool {
+    if arg == "--command" {
+        return true;
+    }
+    arg.strip_prefix('-').is_some_and(|rest| {
+        !rest.is_empty()
+            && !rest.starts_with('-')
+            && rest.chars().all(|c| c.is_ascii_lowercase())
+            && rest.contains('c')
+    })
+}
+
+/// userinfo 形态的取值：`user:pass`（两侧非空），且不是 URL。
+///
+/// curl / redis-cli 等工具的 `-u` 取值。判别特征是含 `:`，据此**精确**掩，
+/// 避免把 `sort -u file`、`rsync -u src` 这类无关 flag 的下一个参数也掩掉
+/// （掩普通路径会白丢观测价值）。
+#[cfg(any(target_os = "linux", test))]
+fn is_userinfo_value(value: &str) -> bool {
+    if value.contains("://") {
+        return false;
+    }
+    match value.split_once(':') {
+        Some((user, pass)) => !user.is_empty() && !pass.is_empty(),
+        None => false,
+    }
+}
+
 /// 脱敏后的命令行(≤120 字符,NUL 分隔转空格)。
 ///
 /// 进程明细会经 `/computer/pod/resources` 暴露给观测端,而 `--token=xxx`
@@ -707,7 +743,10 @@ fn redact_cmdline(args: &[String]) -> String {
     // 脚本文本无法逐项确认安全（可能含任意拼接的凭据），因此一旦在其中检出
     // 凭据就整体遮盖，而不是只遮检出片段。
     let mut script_next = false;
+    // 上一个参数原样保留:用于识别 `-u user:pass` 的分离写法。
+    let mut prev_flag: Option<&str> = None;
     for arg in args {
+        let prev = prev_flag.replace(arg.as_str());
         if mask_next {
             out.push(MASK.to_owned());
             mask_next = false;
@@ -723,6 +762,12 @@ fn redact_cmdline(args: &[String]) -> String {
             } else {
                 out.push(MASK.to_owned());
             }
+            continue;
+        }
+        // `-u user:pass` / `--user user:pass` 的分离写法:userinfo 含 `:`,
+        // 不在 `name=value` 与高熵判据的覆盖范围内,曾原文泄漏。
+        if matches!(prev, Some("-u") | Some("--user")) && is_userinfo_value(arg) {
+            out.push(MASK.to_owned());
             continue;
         }
         // 两条结构性规则必须**串联**，不能命中一条就 continue：
@@ -749,10 +794,19 @@ fn redact_cmdline(args: &[String]) -> String {
             continue;
         }
         if arg.starts_with('-') {
-            // shell 命令串：下一个参数是脚本文本，按整体遮盖策略处理
-            if matches!(arg.as_str(), "-c" | "-lc" | "-ic" | "--command") {
+            // shell 命令串：下一个参数是脚本文本，按整体遮盖策略处理。
+            // 组合短 flag(`-ec`/`-ce`/…)同样按命令串识别,见 is_shell_command_flag。
+            if is_shell_command_flag(arg) {
                 script_next = true;
                 out.push(arg.clone());
+                continue;
+            }
+            // 附着形式:-uuser:pass(curl 支持值紧跟 flag)
+            if let Some(rest) = arg.strip_prefix("-u")
+                && !rest.is_empty()
+                && is_userinfo_value(rest)
+            {
+                out.push(format!("-u{MASK}"));
                 continue;
             }
             // 独立敏感 flag:值在下一个参数里
@@ -1005,15 +1059,10 @@ pub fn agent_executions(
 /// 观测端只用这个入口即可拿到"容器维度 + agent 维度"，不必再调
 /// `/computer/agent/status`（那个老接口的 CPU% 是服务端差分，被外部轮询
 /// 会污染基线，影响平台自身查询）。
-pub fn sample_container_processes_and_agents()
--> (Vec<ProcessRow>, ProcessGroups, AgentScan) {
+pub fn sample_container_processes_and_agents() -> (Vec<ProcessRow>, ProcessGroups, AgentScan) {
     #[cfg(not(target_os = "linux"))]
     {
-        return (
-            Vec::new(),
-            ProcessGroups::default(),
-            AgentScan::default(),
-        );
+        return (Vec::new(), ProcessGroups::default(), AgentScan::default());
     }
     #[cfg(target_os = "linux")]
     {
@@ -1543,6 +1592,39 @@ mod tests {
         assert!(!got.contains("example-secret"), "脚本内 header 泄漏: {got}");
     }
 
+    /// codex 反例 1: `-u user:pass` 直接出现在 argv 里 (无 shell 包裹)。
+    #[test]
+    fn redacts_bare_curl_u_credentials() {
+        let got = redact_cmdline(&[
+            "curl".to_owned(),
+            "-u".to_owned(),
+            "alice:hunter2".to_owned(),
+            "https://example.invalid".to_owned(),
+        ]);
+        assert!(!got.contains("hunter2"), "-u 密码泄漏: {got}");
+        assert!(!got.contains("alice"), "-u 用户 info 泄漏: {got}");
+    }
+
+    /// codex 反例 2: `sh -ec` 组合 flag 也要按脚本文本整体遮盖。
+    #[test]
+    fn masks_script_after_combined_shell_flags() {
+        for flag in ["-ec", "-ce", "-ecx", "-lc"] {
+            let got = redact_cmdline(&[
+                "sh".to_owned(),
+                flag.to_owned(),
+                "curl -u alice:hunter2 https://example.invalid".to_owned(),
+            ]);
+            assert!(
+                !got.contains("hunter2"),
+                "组合 flag {flag} 未识别为脚本文本, 密码泄漏: {got}"
+            );
+            assert!(
+                !got.contains("alice"),
+                "组合 flag {flag} 用户 info 泄漏: {got}"
+            );
+        }
+    }
+
     /// 结构性脱敏不得误伤普通命令——面板靠 args 区分 MCP 等平台服务。
     #[test]
     fn redaction_keeps_ordinary_commands_readable() {
@@ -1705,7 +1787,6 @@ mod tests {
         );
     }
 }
-
 
 /// agent 聚合的「静默丢行」诊断。
 ///

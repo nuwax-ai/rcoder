@@ -412,6 +412,39 @@ impl PgStore {
                                     && registered != observed
                                 {
                                     if self.postgres_config.binding_autoheal() {
+                                        // 迟到观察防线（审查 P1）：UID 不同只证明
+                                        // "不是同一对象"，不证明"观察比当前绑定新"。
+                                        // 换代只接受创建时间不早于在案行的观察：
+                                        // k8s 重建的 pod creationTimestamp 必然晚于
+                                        // 被替旧代（秒级精度，同秒视为不可判而放行），
+                                        // 而迟到的旧观察携带旧 pod 的创建时间，早于
+                                        // 刚落库的新行 → 拒绝。否则旧观察会退休较新
+                                        // 绑定并写物理墓碑，把真实新对象的后续登记
+                                        // 永久封死（Superseded）。
+                                        let bound_created = read
+                                            .canonical_container
+                                            .as_ref()
+                                            .map(|row| row.created_at);
+                                        if bound_created
+                                            .is_some_and(|bound| basic.created_at < bound)
+                                        {
+                                            tracing::warn!(
+                                                container = %key,
+                                                registered_workload_uid = registered,
+                                                observed_workload_uid = observed,
+                                                observed_created_at = %basic.created_at,
+                                                bound_created_at = ?bound_created,
+                                                "binding autoheal rejected a stale observation \
+                                                 older than the current binding"
+                                            );
+                                            anyhow::bail!(
+                                                "Observed workload is older than the current \
+                                                 binding (created {} < {}); stale observation \
+                                                 cannot retire a newer binding",
+                                                basic.created_at,
+                                                bound_created.unwrap_or_default(),
+                                            );
+                                        }
                                         // 带外换代放行：走下方既有换代事务
                                         // （旧代写墓碑 + 新代落库，row_revision CAS
                                         // 保护并发）。warn 留审计痕迹。

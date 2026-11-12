@@ -95,6 +95,24 @@ fn scope_ok(
     // `group_max` 必须是本轮新读的值：`probe.max` 是启动快照，运行中调整限额
     // （4Gi→6Gi）后用它比对会永远不匹配，看门狗从此每轮拒绝工作，直到重启。
     // 组路径（relpath）才是需要缓存的不变量。
+    //
+    // 定位失败必须**先于**限额比对拒绝（审查 P2）：`unresolved` 时 relpath 为空，
+    // current/max 都落到命名空间根——host cgroup namespace 下根就是整机，用量与
+    // 限额"同源"地成立，于是放行并按宿主压力淘汰容器内进程。文档承诺的第一类
+    // 拒绝此前只出现在 mismatch 分支的日志理由里，从未真正拦过。
+    if let Some(reason) = probe.unresolved() {
+        if !*warned {
+            *warned = true;
+            tracing::error!(
+                event = "mem_watch.scope_unresolved",
+                reason = reason,
+                limit_bytes = limit,
+                cgroup_relpath = %probe.relpath(),
+                hint = "cgroup 定位失败, 用量与限额只能取自命名空间根(宿主); 拒绝淘汰",
+            );
+        }
+        return false;
+    }
     if group_max == Some(limit) {
         return true;
     }
@@ -475,6 +493,23 @@ mod tests {
             "定位失败一律拒绝"
         );
         assert!(warned);
+    }
+
+    /// 审查 P2：定位失败但**根路径限额恰好匹配**时同样必须拒绝。
+    ///
+    /// `unresolved` 时 relpath 为空，current/max 都取自命名空间根；host cgroup
+    /// namespace 下根即整机，于是"用量与限额同源"成立、旧实现直接放行，看门狗
+    /// 会按宿主内存压力淘汰容器内进程。既有反例只传了 `group_max=None`
+    /// （走 mismatch 分支），盖不住这条路径。
+    #[test]
+    fn scope_ok_rejects_unresolved_probe_even_when_root_limit_matches() {
+        let broken = probe(None, Some("cannot read /proc/self/cgroup"));
+        let mut warned = false;
+        assert!(
+            !scope_ok(&broken, 4 << 30, Some(4 << 30), &mut warned),
+            "定位失败时根路径限额匹配不得放行"
+        );
+        assert!(warned, "拒绝必须留一条 error 日志");
     }
 
     #[test]

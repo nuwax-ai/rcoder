@@ -214,11 +214,8 @@ pub async fn computer_pod_resources(
             "container status RPC succeeded but returned no process detail; observation will see empty processes/agents"
         );
     }
-    let agents: Vec<shared_types::ComputerAgentExecution> = response
-        .agents
-        .iter()
-        .map(map_agent_execution)
-        .collect();
+    let agents: Vec<shared_types::ComputerAgentExecution> =
+        response.agents.iter().map(map_agent_execution).collect();
 
     Ok(HttpResult::success(ComputerPodResourcesResponse {
         user_id: params.user_id.clone(),
@@ -293,6 +290,16 @@ fn map_agent_execution(
         cpu_seconds: a.cpu_seconds,
         process_count: a.process_count,
     }
+}
+
+/// SSE 事件里 agent 行的存活字段。
+///
+/// `None` = 对端没回 `agent_present`（**未知**，典型是混布旧版 agent_runner），
+/// 必须保持 `null`；塌成 `false` 会把活着的老 agent 误报成已退出。显式
+/// `Some(false)` 才是"确认已退出"。与 tick 失败分支的 `last_agent_present`
+/// 同一口径，也符合本文件"未知保持未知"的一贯契约。
+fn agent_alive_field(agent_present: Option<bool>) -> serde_json::Value {
+    serde_json::json!(agent_present)
 }
 
 // ==== SSE 流式版本 ====
@@ -442,7 +449,15 @@ pub async fn computer_pod_resources_stream(
                             // 存活用显式的 agent_present,不用资源字段推断:
                             // 采集降级时 cpu_percent/memory_mb 同为 None,
                             // 会把活着的 agent 显示成已退出。
-                            "alive": response.agent_present.unwrap_or(false),
+                            //
+                            // `None` = 对端没回这个字段(**未知**), 必须原样输出
+                            // null, 与下方 tick 失败分支的 `last_agent_present`
+                            // 同一口径。旧实现 `unwrap_or(false)` 会把未知塌成
+                            // "已退出": 混布旧版 agent_runner(proto 无该字段)时,
+                            // 明明活着却被观测端判死。本文件的契约一贯是"未知保持
+                            // 未知"(见 unsampled_detail_stays_absent 等用例),
+                            // 客户端按 null 显示"未知", 不按 false 显示"已退出"。
+                            "alive": agent_alive_field(response.agent_present),
                             "status": response.status,
                             "cpu_percent": response.cpu_percent,
                             "memory_mb": response.memory_mb,
@@ -570,7 +585,10 @@ mod tests {
         assert_eq!(processes.as_deref().map(<[_]>::len), Some(0));
         assert_eq!(count, Some(0));
         let groups = groups.expect("采样的分组聚合必须出现");
-        assert_eq!(groups.infra_rss_bytes + groups.platform_rss_bytes + groups.workload_rss_bytes, 0);
+        assert_eq!(
+            groups.infra_rss_bytes + groups.platform_rss_bytes + groups.workload_rss_bytes,
+            0
+        );
     }
 
     /// 采样到进程 → 明细条数以 `process_count` 为准（不是 `processes.len()`，
@@ -607,7 +625,24 @@ mod tests {
         assert_eq!(processes.len(), 2);
         assert_eq!(processes[0].rss_mb, 2.0);
         assert_eq!(processes[0].args_head.as_deref(), Some("python3 train.py"));
-        assert!(processes[1].args_head.is_none(), "空 args_head 不应变成 Some(\"\")");
+        assert!(
+            processes[1].args_head.is_none(),
+            "空 args_head 不应变成 Some(\"\")"
+        );
+    }
+
+    /// 审查 P2：对端没回 `agent_present`（混布旧版 agent_runner）时必须报
+    /// `null`（未知），不能塌成 `false`（已退出）——活着的老 agent 会被误报死亡。
+    /// 显式 `Some(false)` 仍是"确认已退出"。
+    #[test]
+    fn agent_alive_field_keeps_unknown_distinct_from_dead() {
+        assert_eq!(
+            agent_alive_field(None),
+            serde_json::Value::Null,
+            "未知必须保持 null, 不能变成 false"
+        );
+        assert_eq!(agent_alive_field(Some(true)), serde_json::json!(true));
+        assert_eq!(agent_alive_field(Some(false)), serde_json::json!(false));
     }
 
     /// agent 行：空 session_id 不能变成 `Some("")`（前端会当成真实 id）。

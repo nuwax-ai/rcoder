@@ -1605,6 +1605,144 @@ async fn out_of_band_workload_replacement_retires_and_rebinds() {
     f.finish().await;
 }
 
+/// 审查 P1 反例：迟到登记的旧观察不得退休较新的绑定（Bound 行仍在分支）。
+///
+/// 时序：A 副本注册 workload-0 → B（创建更晚）带外换代 Committed（合法，
+/// 同时补上"Bound 行仍在"的换代覆盖——原 out_of_band 用例走的是先删行的
+/// heal_fixture）→ 迟到登记更旧的 A 观察：必须拒绝、绑定仍是 B、B 的
+/// physical_uid 不进墓碑、B 可重新登记。
+///
+/// 修复前行为：迟到 A 被当作带外换代放行（UID 不同即放行），绑定翻成 A、
+/// B 落物理退休墓碑，B 的后续登记永远 Superseded——真实新对象被旧观察封死。
+#[tokio::test]
+async fn late_older_observation_cannot_retire_newer_binding() {
+    let Some(dsn) = test_dsn().await else {
+        eprintln!("[skip] {DSN_ENV} not set");
+        return;
+    };
+    let id = format!("late-obs-{}", uuid_suffix());
+    let container_name = format!("rcoder-{id}");
+    let t0 = chrono::Utc::now();
+    let mk = |physical: &str, workload: &str, created: chrono::DateTime<chrono::Utc>| {
+        ContainerBasicInfo {
+            container_id: if physical.is_empty() {
+                String::new()
+            } else {
+                format!("{physical}-{id}")
+            },
+            container_name: container_name.clone(),
+            container_ip: "10.42.0.9".into(),
+            internal_port: 50051,
+            external_port: 0,
+            project_id: id.clone(),
+            status: "running".into(),
+            created_at: created,
+            service_url: format!("http://{container_name}"),
+            workload_uid: Some(workload.to_string()),
+        }
+    };
+    let project_for = |container: ContainerBasicInfo| {
+        let mut info = ProjectAndContainerInfo::new(id.clone());
+        info.set_service_type(Some(shared_types::ServiceType::ComputerAgentRunner));
+        info.set_user_id(Some(format!("user-{id}")));
+        info.set_container(Some(container));
+        Arc::new(info)
+    };
+    let store = PgStore::connect(&pg_config(&dsn), "test-ns".into(), "cluster.local".into())
+        .await
+        .expect("connect");
+
+    // 1. 注册原绑定 workload-0。
+    store
+        .insert_project_registration_durable(id.clone(), project_for(mk("pod-0", "wl-0", t0)))
+        .await
+        .expect("register original binding");
+    assert!(
+        store.wait_drained(Duration::from_secs(5)).await,
+        "original drain"
+    );
+    let original = fetch_binding_row(&store, &container_name)
+        .await
+        .expect("original row present");
+    assert_eq!(original.1.as_deref(), Some("wl-0"));
+
+    // 2+3. 构造更早的观察 A（不登记）；登记创建更晚的 B → 合法带外换代。
+    let late_a = mk("pod-a", "wl-a", t0 - chrono::Duration::hours(1));
+    let b_info = mk("pod-b", "wl-b", t0 + chrono::Duration::hours(1));
+    let outcome = store
+        .insert_project_registration_durable(id.clone(), project_for(b_info.clone()))
+        .await
+        .expect("a newer out-of-band replacement must be admitted");
+    assert_eq!(
+        outcome,
+        shared_types::persistence::PersistenceWriteOutcome::Committed
+    );
+    assert!(
+        store.wait_drained(Duration::from_secs(5)).await,
+        "replacement drain"
+    );
+    let row = fetch_binding_row(&store, &container_name)
+        .await
+        .expect("row after replacement");
+    assert_eq!(row.1.as_deref(), Some("wl-b"), "binding must flip to B");
+
+    // 4. 迟到登记 A：必须被拒绝，绑定不退回 A。
+    let late = store
+        .insert_project_registration_durable(id.clone(), project_for(late_a))
+        .await;
+    assert!(
+        late.is_err(),
+        "a stale observation older than the current binding must be rejected, got {late:?}"
+    );
+    let row = fetch_binding_row(&store, &container_name)
+        .await
+        .expect("row after late rejection");
+    assert_eq!(
+        row.0.as_deref(),
+        Some(format!("pod-b-{id}").as_str()),
+        "physical binding must stay on B"
+    );
+    assert_eq!(
+        row.1.as_deref(),
+        Some("wl-b"),
+        "workload binding must stay on B"
+    );
+
+    // 5. B 未被墓碑退休：物理三元组查无墓碑，且 B 仍可重新登记（Committed）。
+    let name_for_gen = container_name.clone();
+    let b_generation = super::database::read(&store.database, move |tx| {
+        let name = name_for_gen;
+        Box::pin(async move {
+            Ok(super::repo::fetch_container_registration(tx, &name)
+                .await?
+                .map(|row| row.container_generation))
+        })
+    })
+    .await
+    .expect("read B generation")
+    .expect("B row present");
+    assert!(
+        !exact_tombstone_exists(
+            &store,
+            &container_name,
+            &b_generation,
+            &format!("pod-b-{id}"),
+        )
+        .await,
+        "B must not be retired by a tombstone"
+    );
+    let recommit = store
+        .insert_project_registration_durable(id.clone(), project_for(b_info))
+        .await
+        .expect("B must remain registrable");
+    assert_eq!(
+        recommit,
+        shared_types::persistence::PersistenceWriteOutcome::Committed,
+        "re-registering B is a plain rebase, not Superseded"
+    );
+    let _ = store.writer().flush_and_stop(Duration::from_secs(5)).await;
+}
+
 /// 回源自愈链（生产 2026-10-27 P0 的第二层防线）：副本镜像缺失该 user（节点
 /// drain / 事件竞序）时，用户维度的查找 miss 经 `refresh_user_container` 回读
 /// 权威行 + 受护栏的 project read-through hydrate 后重试命中；无容器的孤儿
