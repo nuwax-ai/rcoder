@@ -550,14 +550,23 @@ fn requested_paths_have_staged_changes(
     Ok(has_change)
 }
 
-/// 请求路径 → 比对范围键: 分隔符归一 (Windows `\` → `/`) 并剥离开头 `./` 段,
-/// 与 index/HEAD 条目存储口径一致。
+/// 请求路径 → 比对范围键: 先按 FS-08 归一分隔符 (Windows `\` → `/`; POSIX
+/// 下反斜杠是合法文件名字符, 原样保留), 再经 `Path::components()` 归一掉
+/// `./` 段 (含前导与中间)、重复分隔符与尾斜杠, 以 `/` 重组——与 index/HEAD
+/// 条目存储口径一致。
+///
+/// `ParentDir`/`RootDir`/`Prefix` 不属于合法工作区相对路径 (上游 `ensure_within`
+/// 已拒绝穿越), 防御性丢弃后范围键自然匹配不到任何条目 (fail-closed)。
 fn normalize_scope_path(path: &str) -> String {
-    let mut normalized = crate::path_safety::host_relative_to_wire(path);
-    while let Some(stripped) = normalized.strip_prefix("./") {
-        normalized = stripped.to_string();
-    }
-    normalized
+    let wire = crate::path_safety::host_relative_to_wire(path);
+    Path::new(&wire)
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// 变更路径是否落在请求范围内: 精确匹配, 或位于请求目录之下 (`<dir>/` 前缀)。
@@ -1001,6 +1010,18 @@ mod tests {
             repo.head_commit().is_ok(),
             "HEAD must remain valid after rejection"
         );
+    }
+
+    /// 范围键归一化: `./` 段 (前导/中间)、重复分隔符、尾斜杠。
+    #[test]
+    fn scope_path_normalizes_dot_and_duplicate_separators() {
+        assert_eq!(normalize_scope_path("./a.txt"), "a.txt");
+        assert_eq!(normalize_scope_path("a/./b.txt"), "a/b.txt");
+        assert_eq!(normalize_scope_path("a//b.txt"), "a/b.txt");
+        assert_eq!(normalize_scope_path("dir/"), "dir");
+        assert_eq!(normalize_scope_path("dir"), "dir");
+        // POSIX 下反斜杠是合法文件名字符, 原样保留 (FS-08 契约)
+        assert_eq!(normalize_scope_path("a\\b.txt"), "a\\b.txt");
     }
 
     /// codex r7 P2: 请求目录时, 目录内**已暂存的删除**必须算变更
