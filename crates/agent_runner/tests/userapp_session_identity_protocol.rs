@@ -1834,13 +1834,19 @@ async fn process_roles_follow_the_watchdog_scope_end_to_end() {
     // ── agent 进程组聚合(新接口 /computer/pod/resources 的 agent 字段) ──
     // 面板靠它拿 agent 维度 CPU/内存,不再轮询 /computer/agent/status。
     if cfg!(target_os = "linux") {
-        let (_, _, agents) =
+        let (_, _, scan) =
             agent_runner::service::agent_resource_monitor::sample_container_processes_and_agents();
+        let agents = scan.entries;
         // 每个 project 一条；这里注册了一个会话
         let a = agents
             .iter()
             .find(|a| a.session_id.is_some())
-            .unwrap_or_else(|| panic!("有注册会话时必须给出 agent 聚合, 实际 {agents:?}"));
+            .unwrap_or_else(|| {
+                panic!(
+                    "有注册会话时必须给出 agent 聚合, 实际 entries={agents:?} stats={:?}",
+                    scan.stats
+                )
+            });
         assert!(a.process_count >= 1, "agent 进程组至少要含根进程: {a:?}");
         assert!(a.rss_bytes > 0, "agent 进程组 RSS 必须为正: {a:?}");
         assert!(a.cpu_seconds >= 0.0, "累计 CPU 秒非负: {a:?}");

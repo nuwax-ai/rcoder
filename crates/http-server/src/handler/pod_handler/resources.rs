@@ -201,40 +201,12 @@ pub async fn computer_pod_resources(
     );
 
     // 进程明细+分组聚合(proto → 响应;MB 换算,分组字符串透传)
-    let processes = (!response.processes.is_empty()).then(|| {
-        response
-            .processes
-            .iter()
-            .map(|p| shared_types::ComputerProcessEntry {
-                pid: p.pid,
-                comm: p.comm.clone(),
-                rss_mb: p.rss_bytes as f64 / 1_048_576.0,
-                cpu_seconds: p.cpu_seconds,
-                group: p.group.clone(),
-                args_head: (!p.args_head.is_empty()).then(|| p.args_head.clone()),
-            })
-            .collect()
-    });
+    let (processes, process_count, groups) = map_process_detail(&response);
     let agents: Vec<shared_types::ComputerAgentExecution> = response
         .agents
         .iter()
-        .map(|a| shared_types::ComputerAgentExecution {
-            project_id: a.project_id.clone(),
-            session_id: (!a.session_id.is_empty()).then(|| a.session_id.clone()),
-            status: a.status.clone(),
-            rss_mb: a.rss_bytes as f64 / 1_048_576.0,
-            cpu_seconds: a.cpu_seconds,
-            process_count: a.process_count,
-        })
+        .map(map_agent_execution)
         .collect();
-    let groups = (response.infra_rss_bytes.is_some()
-        || response.platform_rss_bytes.is_some()
-        || response.workload_rss_bytes.is_some())
-    .then(|| shared_types::ComputerProcessGroups {
-        infra_rss_bytes: response.infra_rss_bytes.unwrap_or(0),
-        platform_rss_bytes: response.platform_rss_bytes.unwrap_or(0),
-        workload_rss_bytes: response.workload_rss_bytes.unwrap_or(0),
-    });
 
     Ok(HttpResult::success(ComputerPodResourcesResponse {
         user_id: params.user_id.clone(),
@@ -248,10 +220,67 @@ pub async fn computer_pod_resources(
         container_id: Some(container_info.container_id),
         container_name: Some(container_info.container_name),
         processes,
-        process_count: (!response.processes.is_empty()).then_some(response.processes.len() as u32),
+        process_count,
         process_groups: groups,
         agents,
     }))
+}
+
+/// proto → 对外响应：进程明细、明细条数、分组聚合。
+///
+/// `process_count` 是「是否采样过」的单一事实源：agent_runner 只在
+/// `include_processes=true` 时回填它（哪怕是 0），未采样时整组字段缺省。
+/// 以前这里用 `!processes.is_empty()` 判断，导致「采样了但确实是 0 条」
+/// 和「压根没采样」在响应里完全同形——两者都会变成 `processes: null`，
+/// 观测端无法区分（预发布环境就因此把一次空扫描读成了「没有进程」）。
+fn map_process_detail(
+    response: &shared_types::grpc::GetContainerStatusResponse,
+) -> (
+    Option<Vec<shared_types::ComputerProcessEntry>>,
+    Option<u32>,
+    Option<shared_types::ComputerProcessGroups>,
+) {
+    let sampled = response.process_count.is_some();
+    let processes = sampled.then(|| {
+        response
+            .processes
+            .iter()
+            .map(|p| shared_types::ComputerProcessEntry {
+                pid: p.pid,
+                comm: p.comm.clone(),
+                rss_mb: p.rss_bytes as f64 / 1_048_576.0,
+                cpu_seconds: p.cpu_seconds,
+                group: p.group.clone(),
+                args_head: (!p.args_head.is_empty()).then(|| p.args_head.clone()),
+            })
+            .collect()
+    });
+    let process_count = response
+        .process_count
+        .and_then(|count| u32::try_from(count).ok());
+    let groups = (response.infra_rss_bytes.is_some()
+        || response.platform_rss_bytes.is_some()
+        || response.workload_rss_bytes.is_some())
+    .then(|| shared_types::ComputerProcessGroups {
+        infra_rss_bytes: response.infra_rss_bytes.unwrap_or(0),
+        platform_rss_bytes: response.platform_rss_bytes.unwrap_or(0),
+        workload_rss_bytes: response.workload_rss_bytes.unwrap_or(0),
+    });
+    (processes, process_count, groups)
+}
+
+/// proto → 对外响应：单个 agent 执行。
+fn map_agent_execution(
+    a: &shared_types::grpc::AgentExecution,
+) -> shared_types::ComputerAgentExecution {
+    shared_types::ComputerAgentExecution {
+        project_id: a.project_id.clone(),
+        session_id: (!a.session_id.is_empty()).then(|| a.session_id.clone()),
+        status: a.status.clone(),
+        rss_mb: a.rss_bytes as f64 / 1_048_576.0,
+        cpu_seconds: a.cpu_seconds,
+        process_count: a.process_count,
+    }
 }
 
 // ==== SSE 流式版本 ====
@@ -491,4 +520,98 @@ pub async fn computer_pod_resources_stream(
             .interval(std::time::Duration::from_secs(15))
             .text("keep-alive"),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared_types::grpc::{AgentExecution, ContainerProcess, GetContainerStatusResponse};
+
+    /// 未采样（agent_runner 当次没跑进程扫描）→ 三组字段都缺省，
+    /// 与「采样了但确实是 0 条」必须可区分。
+    #[test]
+    fn unsampled_detail_stays_absent() {
+        let response = GetContainerStatusResponse::default();
+        let (processes, count, groups) = map_process_detail(&response);
+        assert!(processes.is_none(), "未采样不能报空明细");
+        assert!(count.is_none());
+        assert!(groups.is_none());
+    }
+
+    /// `process_count: Some(0)` 是「采样过」的显式信号 → 必须报
+    /// `processes: []` 而不是缺省。
+    ///
+    /// 这正是之前的缺陷：用 `!processes.is_empty()` 当信号，把「采样到 0 条」
+    /// 也压成 `null`，观测端只能读成「不知道」。当前 agent_runner 在扫描
+    /// 失败时回 `None`（未知），因此 `Some(0)` 属于防御性契约，客户端仍必须
+    /// 按「采样过」处理，不能把空明细当成缺省。
+    #[test]
+    fn sampled_empty_detail_is_reported_as_empty_not_absent() {
+        let response = GetContainerStatusResponse {
+            process_count: Some(0),
+            infra_rss_bytes: Some(0),
+            platform_rss_bytes: Some(0),
+            workload_rss_bytes: Some(0),
+            ..Default::default()
+        };
+        let (processes, count, groups) = map_process_detail(&response);
+        assert_eq!(processes.as_deref().map(<[_]>::len), Some(0));
+        assert_eq!(count, Some(0));
+        let groups = groups.expect("采样的分组聚合必须出现");
+        assert_eq!(groups.infra_rss_bytes + groups.platform_rss_bytes + groups.workload_rss_bytes, 0);
+    }
+
+    /// 采样到进程 → 明细条数以 `process_count` 为准（不是 `processes.len()`，
+    /// 两者不一致时以 agent_runner 的统计为准并在响应里保持自洽）。
+    #[test]
+    fn sampled_rows_are_mapped_with_mb_and_optional_args() {
+        let response = GetContainerStatusResponse {
+            processes: vec![
+                ContainerProcess {
+                    pid: 42,
+                    comm: "python3".to_string(),
+                    rss_bytes: 2 * 1_048_576,
+                    cpu_seconds: 1.5,
+                    group: "workload".to_string(),
+                    args_head: "python3 train.py".to_string(),
+                    ..Default::default()
+                },
+                ContainerProcess {
+                    pid: 43,
+                    comm: "sh".to_string(),
+                    rss_bytes: 1_048_576,
+                    cpu_seconds: 0.0,
+                    group: "infra".to_string(),
+                    args_head: String::new(),
+                    ..Default::default()
+                },
+            ],
+            process_count: Some(2),
+            ..Default::default()
+        };
+        let (processes, count, _) = map_process_detail(&response);
+        let processes = processes.expect("采样到进程必须有明细");
+        assert_eq!(count, Some(2));
+        assert_eq!(processes.len(), 2);
+        assert_eq!(processes[0].rss_mb, 2.0);
+        assert_eq!(processes[0].args_head.as_deref(), Some("python3 train.py"));
+        assert!(processes[1].args_head.is_none(), "空 args_head 不应变成 Some(\"\")");
+    }
+
+    /// agent 行：空 session_id 不能变成 `Some("")`（前端会当成真实 id）。
+    #[test]
+    fn agent_mapping_drops_empty_session_id() {
+        let mapped = map_agent_execution(&AgentExecution {
+            project_id: "p1".to_string(),
+            session_id: String::new(),
+            status: "Idle".to_string(),
+            rss_bytes: 3 * 1_048_576,
+            cpu_seconds: 2.0,
+            process_count: 7,
+            ..Default::default()
+        });
+        assert!(mapped.session_id.is_none());
+        assert_eq!(mapped.rss_mb, 3.0);
+        assert_eq!(mapped.process_count, 7);
+    }
 }

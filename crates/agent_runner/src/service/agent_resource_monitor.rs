@@ -836,6 +836,39 @@ pub struct AgentExecutionSummary {
     pub process_count: u32,
 }
 
+/// agent 执行聚合的扫描统计：解释「注册了执行，但报出来是空」这一类情况。
+///
+/// 以前这三条丢弃路径都是静默 `continue`，观测端只看到 `agents: []`，
+/// 无法区分「容器内确实没有执行」和「有执行但每条都被跳过」。预发布环境
+/// 实测出现过整段为空、几分钟后自愈的窗口（09:22–10:11），当时只能靠反复
+/// 轮询猜，日志里没有任何痕迹。所以这里把每次跳过按原因计数，由调用方
+/// 在「有注册却全被丢」时打 warn。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentScanStats {
+    /// 注册表里的执行数（已按 `has_session_identity` 过滤）
+    pub registered: usize,
+    /// 注册项没有 pgid：行已停止、`stop_handle` 已释放，但进程可能仍在跑
+    pub no_pgid: usize,
+    /// pgid 在进程表里找不到：进程组已退出或已换代
+    pub pgid_not_found: usize,
+    /// 多个执行指向同一 pgid，只报第一条（避免重复计数）
+    pub duplicate_pgid: usize,
+}
+
+impl AgentScanStats {
+    /// 被跳过的执行总数。
+    pub fn dropped(&self) -> usize {
+        self.no_pgid + self.pgid_not_found + self.duplicate_pgid
+    }
+}
+
+/// 一次 agent 聚合的结果：逐 project 的行 + 跳过原因统计。
+#[derive(Debug, Clone, Default)]
+pub struct AgentScan {
+    pub entries: Vec<AgentExecutionSummary>,
+    pub stats: AgentScanStats,
+}
+
 /// 按 agent 进程组聚合容器内进程，**每个 project 一条**。
 ///
 /// 一个 user 容器可以并存多个 project（工作目录 `/home/user/<project_id>`），
@@ -849,12 +882,21 @@ pub struct AgentExecutionSummary {
 #[cfg(target_os = "linux")]
 pub fn agent_executions(
     table: &std::collections::HashMap<u32, process_utils::proc_scan::ProcInfo>,
-) -> Vec<AgentExecutionSummary> {
+) -> AgentScan {
     let executions = AGENT_REGISTRY.execution_snapshots();
+    let mut stats = AgentScanStats {
+        registered: executions.len(),
+        ..AgentScanStats::default()
+    };
     let pgids: std::collections::HashSet<u32> =
         executions.iter().filter_map(|exec| exec.pgid).collect();
     if pgids.is_empty() {
-        return Vec::new();
+        stats.no_pgid = executions.len();
+        log_agent_scan(&stats, 0);
+        return AgentScan {
+            entries: Vec::new(),
+            stats,
+        };
     }
 
     // 单次遍历进程表，按 pgid 累加
@@ -879,17 +921,17 @@ pub fn agent_executions(
     let mut seen_pgids: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for exec in &executions {
         let Some(pgid) = exec.pgid else {
+            stats.no_pgid += 1;
             continue;
         };
         if !seen_pgids.insert(pgid) {
+            stats.duplicate_pgid += 1;
             continue;
         }
         let Some(&(rss_bytes, ticks, process_count)) = totals.get(&pgid) else {
+            stats.pgid_not_found += 1;
             continue;
         };
-        if process_count == 0 {
-            continue;
-        }
         // 全量匹配，不写 `_ =>`：以后新增 AgentStatus 变体时，这里必须编译失败，
         // 避免新状态被悄悄当成"Processing"。
         let status = match exec.status {
@@ -915,14 +957,47 @@ pub fn agent_executions(
             .cmp(&a.rss_bytes)
             .then_with(|| a.project_id.cmp(&b.project_id))
     });
-    out
+    log_agent_scan(&stats, out.len());
+    AgentScan {
+        entries: out,
+        stats,
+    }
+}
+
+/// 按「有注册却全被丢」的严重程度决定日志级别。
+///
+/// - 注册表非空但一条都没报出来：`warn`。这是**观测端会误判成没有 agent**
+///   的情况（预发布环境实测出现过），必须在日志里留痕。
+/// - 部分被丢：`debug`，因为该接口会被面板高频轮询，info 级别会刷屏。
+#[cfg(target_os = "linux")]
+fn log_agent_scan(stats: &AgentScanStats, reported: usize) {
+    if stats.registered > 0 && reported == 0 {
+        tracing::warn!(
+            event = "agent_scan.all_dropped",
+            registered = stats.registered,
+            no_pgid = stats.no_pgid,
+            pgid_not_found = stats.pgid_not_found,
+            duplicate_pgid = stats.duplicate_pgid,
+            "registered agent executions all dropped from process-group aggregation"
+        );
+    } else if stats.dropped() > 0 {
+        tracing::debug!(
+            event = "agent_scan.partially_dropped",
+            registered = stats.registered,
+            reported,
+            no_pgid = stats.no_pgid,
+            pgid_not_found = stats.pgid_not_found,
+            duplicate_pgid = stats.duplicate_pgid,
+            "some registered agent executions were dropped"
+        );
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn agent_executions(
     _table: &std::collections::HashMap<u32, process_utils::proc_scan::ProcInfo>,
-) -> Vec<AgentExecutionSummary> {
-    Vec::new()
+) -> AgentScan {
+    AgentScan::default()
 }
 
 /// 一次 `/proc` 扫描同时产出进程明细、分组聚合与 agent 进程组聚合。
@@ -931,14 +1006,26 @@ pub fn agent_executions(
 /// `/computer/agent/status`（那个老接口的 CPU% 是服务端差分，被外部轮询
 /// 会污染基线，影响平台自身查询）。
 pub fn sample_container_processes_and_agents()
--> (Vec<ProcessRow>, ProcessGroups, Vec<AgentExecutionSummary>) {
+-> (Vec<ProcessRow>, ProcessGroups, AgentScan) {
     #[cfg(not(target_os = "linux"))]
     {
-        return (Vec::new(), ProcessGroups::default(), Vec::new());
+        return (
+            Vec::new(),
+            ProcessGroups::default(),
+            AgentScan::default(),
+        );
     }
     #[cfg(target_os = "linux")]
     {
         let table = process_utils::proc_scan::snapshot();
+        // 空表只可能是扫描失败（容器里至少有 agent_runner 自己）。
+        // 不区分的话，观测端会把「扫描失败」读成「没有进程、没有 agent」。
+        if table.is_empty() {
+            tracing::warn!(
+                event = "proc_scan.empty",
+                "process table is empty; /proc scan returned nothing"
+            );
+        }
         let evictable = process_utils::mem_watch::evictable_pids(&table);
         let rows = collect_rows(&table, &evictable);
         let groups = group_totals(&rows);
@@ -1616,5 +1703,169 @@ mod tests {
             classify("node", "node /usr/local/bin/mcp-proxy", true),
             ProcessRole::Workload
         );
+    }
+}
+
+
+/// agent 聚合的「静默丢行」诊断。
+///
+/// 这些用例锁的是**可诊断性**而不是数值：预发布环境出现过「注册表里有执行、
+/// 接口却报 agents: []」的窗口（几分钟后自愈），当时没有任何日志能解释，
+/// 只能反复轮询猜。所以每条丢弃路径都必须落到 `AgentScanStats` 上。
+#[cfg(all(test, target_os = "linux"))]
+mod agent_scan_stats_tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    /// 只暴露 pgid 的生命周期替身（与既有测试模块互不依赖）。
+    struct Lifecycle {
+        pgid: u32,
+        token: tokio_util::sync::CancellationToken,
+    }
+
+    impl shared_types::AgentLifecycle for Lifecycle {
+        fn graceful_stop(&self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn wait_for_exit(&self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn cancel(&self) {}
+        fn is_stopped(&self) -> bool {
+            false
+        }
+        fn agent_pgid(&self) -> Option<u32> {
+            Some(self.pgid)
+        }
+        fn cancellation_token(&self) -> &tokio_util::sync::CancellationToken {
+            &self.token
+        }
+    }
+
+    fn lifecycle(pgid: u32) -> Arc<dyn shared_types::AgentLifecycle> {
+        Arc::new(Lifecycle {
+            pgid,
+            token: tokio_util::sync::CancellationToken::new(),
+        })
+    }
+
+    fn agent_info(
+        project: &str,
+        session: &str,
+        handle: Option<Arc<dyn shared_types::AgentLifecycle>>,
+    ) -> shared_types::ProjectAndAgentInfo {
+        let (prompt_tx, _prompt_rx) =
+            tokio::sync::mpsc::channel(shared_types::AGENT_PROMPT_CHANNEL_CAPACITY);
+        let (cancel_tx, _cancel_rx) =
+            tokio::sync::mpsc::channel(shared_types::AGENT_CANCEL_CHANNEL_CAPACITY);
+        shared_types::ProjectAndAgentInfo {
+            project_id: project.to_string(),
+            session_id: agent_client_protocol::schema::v1::SessionId::new(Arc::from(session)),
+            prompt_tx,
+            cancel_tx,
+            model_provider: None,
+            request_id: None,
+            status: shared_types::AgentStatus::Idle,
+            last_activity: chrono::Utc::now(),
+            created_at: chrono::Utc::now(),
+            stop_handle: handle,
+            agent_binary_snapshot: None,
+        }
+    }
+
+    fn cleanup(project: &str) {
+        AGENT_REGISTRY.inner_mut().remove(project);
+    }
+
+    /// pgid 在进程表里 → 正常报一行，且该执行不产生任何「丢弃」计数。
+    #[test]
+    fn reports_entry_and_no_drops_when_pgid_alive() {
+        let table = process_utils::proc_scan::snapshot();
+        let own = std::process::id();
+        // 用自己所在进程组：它必然在进程表里，不依赖 cargo 怎么分组。
+        let own_pgid = table.get(&own).map(|info| info.pgrp).unwrap_or(own);
+        let project = "scan-alive";
+        let session = "3f3f3f3f-0000-4000-8000-000000000001";
+        AGENT_REGISTRY.register(
+            project,
+            session,
+            agent_info(project, session, Some(lifecycle(own_pgid))),
+        );
+
+        let scan = agent_executions(&table);
+        let row = scan
+            .entries
+            .iter()
+            .find(|entry| entry.project_id == project)
+            .unwrap_or_else(|| panic!("已注册且进程组存在的执行必须报出来: {:?}", scan.stats));
+        assert!(row.process_count >= 1, "进程组至少含根进程");
+        assert!(row.rss_bytes > 0, "RSS 必须为正");
+        assert_eq!(scan.stats.no_pgid, 0);
+        assert_eq!(scan.stats.pgid_not_found, 0);
+        cleanup(project);
+    }
+
+    /// pgid 指向不存在的进程组（已退出/换代）→ 计入 `pgid_not_found`，
+    /// 而不是静默消失。
+    #[test]
+    fn counts_pgid_not_found_instead_of_dropping_silently() {
+        let table = process_utils::proc_scan::snapshot();
+        let missing_pgid = table
+            .keys()
+            .copied()
+            .max()
+            .unwrap_or(1)
+            .saturating_add(100_000);
+        let project = "scan-missing-pgid";
+        let session = "3f3f3f3f-0000-4000-8000-000000000002";
+        AGENT_REGISTRY.register(
+            project,
+            session,
+            agent_info(project, session, Some(lifecycle(missing_pgid))),
+        );
+
+        let scan = agent_executions(&table);
+        assert!(
+            scan.entries.iter().all(|entry| entry.project_id != project),
+            "进程组不存在时不该报这一行"
+        );
+        assert!(
+            scan.stats.pgid_not_found >= 1,
+            "必须计入 pgid_not_found: {:?}",
+            scan.stats
+        );
+        cleanup(project);
+    }
+
+    /// 没有 stop_handle（已停止，句柄释放）→ 计入 `no_pgid`。
+    #[test]
+    fn counts_no_pgid_for_stopped_handle() {
+        let table = process_utils::proc_scan::snapshot();
+        let project = "scan-no-pgid";
+        let session = "3f3f3f3f-0000-4000-8000-000000000003";
+        AGENT_REGISTRY.register(project, session, agent_info(project, session, None));
+
+        let scan = agent_executions(&table);
+        assert!(
+            scan.stats.no_pgid >= 1,
+            "句柄已释放必须计入 no_pgid: {:?}",
+            scan.stats
+        );
+        cleanup(project);
+    }
+
+    /// 每条被丢的执行都必须能在这三个计数里找到归宿：
+    /// 「有注册却全被丢」正是观测端会误判成「没有 agent」的情况。
+    #[test]
+    fn dropped_counts_explain_every_registered_execution() {
+        let stats = AgentScanStats {
+            registered: 5,
+            no_pgid: 2,
+            pgid_not_found: 2,
+            duplicate_pgid: 1,
+        };
+        assert_eq!(stats.dropped(), 5);
     }
 }
