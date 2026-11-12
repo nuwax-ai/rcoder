@@ -62,12 +62,21 @@ fn expand_stage_paths(
         .workdir()
         .ok_or_else(|| AppError::system("git repo has no workdir"))?;
     let abs = crate::path_safety::ensure_within(workdir, worktree_path)?;
-    if std::fs::symlink_metadata(&abs).is_ok_and(|metadata| metadata.is_dir()) {
-        collect_stage_paths(workdir, &abs, out)?;
-        collect_missing_dir_entries(repo, worktree_path, out)?;
-        return Ok(());
+    match std::fs::symlink_metadata(&abs) {
+        Ok(metadata) if metadata.is_dir() => {
+            collect_stage_paths(workdir, &abs, out)?;
+            collect_missing_dir_entries(repo, worktree_path, out)?;
+        }
+        Ok(_) => out.push(worktree_path.to_string()),
+        // 路径不存在: 已删除的文件 (index 同名条目由单路径入列覆盖) 或
+        // **已整体删除的目录** (codex 边界: 此前进不了目录收集分支,
+        // 请求 ["dir"] 对子树删除永远无变更) —— 按前缀收集 index 内
+        // 子条目的删除。
+        Err(_) => {
+            out.push(worktree_path.to_string());
+            collect_missing_dir_entries(repo, worktree_path, out)?;
+        }
     }
-    out.push(worktree_path.to_string());
     Ok(())
 }
 
@@ -81,10 +90,9 @@ fn collect_missing_dir_entries(
     out: &mut Vec<String>,
 ) -> AppResult<()> {
     let prefix = normalize_relative_path(dir_request)?;
-    if prefix.is_empty() {
-        // 根目录请求: 根范围由空 files 分支或空键 scope 覆盖, 此处不处理
-        return Ok(());
-    }
+    // 根请求 (`.` → 空前缀) 同样要收集缺失条目 (codex 边界: 此前直接
+    // 跳过, 删除跟踪文件后请求 ["."] 返回无变更); 空前缀 = 全部 index
+    // 条目都在范围内。
     let prefix_bstr = BString::from(prefix);
     let workdir = repo
         .workdir()
@@ -97,9 +105,10 @@ fn collect_missing_dir_entries(
     let mut missing = Vec::new();
     for entry in index.entries() {
         let path = entry.path_in(backing);
-        let under_dir = path.len() > prefix_bstr.len()
-            && path.starts_with(prefix_bstr.as_ref())
-            && path[prefix_bstr.len()] == b'/';
+        let under_dir = prefix_bstr.is_empty()
+            || (path.len() > prefix_bstr.len()
+                && path.starts_with(prefix_bstr.as_ref())
+                && path[prefix_bstr.len()] == b'/');
         if !under_dir {
             continue;
         }
@@ -1089,6 +1098,66 @@ mod tests {
         assert_eq!(
             mtime0, mtime1,
             "未变更文件重 stage 不得重写 loose 对象 (stat 快路径失效)"
+        );
+    }
+
+    /// codex 边界: 根请求 `["."]` 删除跟踪文件后必须暂存并提交删除
+    /// (此前缺失条目收集对空前缀直接跳过 → nothingToCommit)。
+    #[test]
+    fn explicit_commit_root_scope_stages_deletion() {
+        let test = TestRepo::new();
+        commit_file(&test, "keep.txt", "k", "add keep");
+        commit_file(&test, "gone.txt", "g", "add gone");
+        let repo = test.open();
+        std::fs::remove_file(test.0.join("gone.txt")).expect("remove");
+        let result = stage_and_commit(&repo, &[".".to_string()], "rm gone", "T", "t@e.c")
+            .expect("must not fail");
+        let hash = result.expect("root scope must stage the deletion and commit");
+        let commit = repo
+            .find_commit(ObjectId::from_hex(hash.as_bytes()).expect("parse"))
+            .expect("find");
+        let tree = commit.tree().expect("tree");
+        assert!(
+            tree.lookup_entry_by_path("gone.txt").expect("lk").is_none(),
+            "根请求必须暂存未暂存的删除"
+        );
+        assert!(
+            tree.lookup_entry_by_path("keep.txt").expect("lk").is_some(),
+            "未删除文件必须保留"
+        );
+    }
+
+    /// codex 边界: 整个目录已从工作区删除, 请求 `["dir"]` 必须暂存并提交
+    /// 子树删除 (此前目录不存在进不了目录收集分支 → nothingToCommit)。
+    #[test]
+    fn explicit_commit_stages_whole_dir_deletion() {
+        let test = TestRepo::new();
+        std::fs::create_dir_all(test.0.join("d/sub")).expect("mkdir");
+        commit_file(&test, "d/a.txt", "a", "add a");
+        commit_file(&test, "d/sub/b.txt", "b", "add b");
+        commit_file(&test, "outside.txt", "o", "add outside");
+        let repo = test.open();
+        std::fs::remove_dir_all(test.0.join("d")).expect("rm dir");
+        let result = stage_and_commit(&repo, &["d".to_string()], "rm dir", "T", "t@e.c")
+            .expect("must not fail");
+        let hash = result.expect("whole-dir deletion must be staged and committed");
+        let commit = repo
+            .find_commit(ObjectId::from_hex(hash.as_bytes()).expect("parse"))
+            .expect("find");
+        let tree = commit.tree().expect("tree");
+        assert!(
+            tree.lookup_entry_by_path("d/a.txt").expect("lk").is_none()
+                && tree
+                    .lookup_entry_by_path("d/sub/b.txt")
+                    .expect("lk")
+                    .is_none(),
+            "子树内所有文件删除必须进入提交"
+        );
+        assert!(
+            tree.lookup_entry_by_path("outside.txt")
+                .expect("lk")
+                .is_some(),
+            "范围外文件必须保留"
         );
     }
 

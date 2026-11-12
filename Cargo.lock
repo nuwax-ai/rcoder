@@ -3532,6 +3532,7 @@ dependencies = [
  "download_utils",
  "dua-core 5.0.1",
  "encoding_rs",
+ "filetime",
  "futures-util",
  "garde",
  "gix",
