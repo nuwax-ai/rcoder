@@ -307,6 +307,7 @@ impl IndexLock {
         let mut inner = self.inner;
         {
             use std::io::Write as _;
+            smudge_racily_clean_entries(index);
             let mut writer = std::io::BufWriter::with_capacity(64 * 1024, &mut inner);
             if let Err(error) = index.write_to(&mut writer, IndexWriteOptions::default()) {
                 return Err(map_git_err(error, "git index write"));
@@ -319,6 +320,30 @@ impl IndexLock {
             .commit()
             .map(|_| ())
             .map_err(|e| map_git_err(e, "git index commit"))
+    }
+}
+
+/// 写 index 前给 racy 条目打标记 (对齐 git `ce_smudge_racily_clean_entry`):
+/// 记录 stat 的 mtime ≥ 本次写入时刻的条目, 把 `stat.size` 置 0 持久化。
+///
+/// 为什么必须持久化在条目里: 秒级粒度下, "T0 提交 a.txt → 同秒内改为同长度
+/// 新内容 → 暂存无关的 b.txt (index 在更晚的秒重写)" 会让 a.txt 旧条目的
+/// mtime (T0) < 新 index 时间戳, 读取侧的 is_racy 判定失灵——但 smudge
+/// 出的 size=0 已写进条目字节, 跨后续无关重写存活, 下次 stat 比对必然
+/// size 失配 → 强制重读内容 (racy-git.txt 的第二形态)。
+/// 空文件天然 size=0, 无影响; 永远偏向重读 (fail-safe)。
+fn smudge_racily_clean_entries(index: &mut gix::index::File) {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0);
+    for entry in index.entries_mut() {
+        if entry.stage() == Stage::Unconflicted
+            && entry.stat.size != 0
+            && entry.stat.mtime.secs >= now_secs
+        {
+            entry.stat.size = 0;
+        }
     }
 }
 
@@ -996,6 +1021,34 @@ mod tests {
         assert_eq!(
             mtime0, mtime1,
             "未变更文件重 stage 不得重写 loose 对象 (stat 快路径失效)"
+        );
+    }
+
+    /// racy-git 回归 (codex 复审): a.txt 已修改(同秒同长度), 先只暂存
+    /// b.txt (index 重写), 再暂存 a.txt —— 必须 stage 新内容 BBB。
+    /// 修复前: index 重写时间 > a.txt mtime(同秒折叠), racy 判定误信
+    /// 旧 entry 的 stat, 跳过内容读取, 暂存区残留旧 AAA → 漏提交。
+    #[test]
+    fn stage_after_intermediate_index_write_rereads_racy_entry() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "AAA", "init a");
+        commit_file(&test, "b.txt", "xxx", "init b");
+        // 同秒同长度修改 (racy-git 场景)
+        std::fs::write(test.0.join("a.txt"), "BBB").expect("modify a");
+        let repo = test.open();
+        // 先只暂存 b.txt 未变更部分会跳过; a.txt 不在列表
+        stage_path(&repo, "b.txt").expect("stage b only");
+        // 再暂存 a.txt: 必须拾取 BBB, 不得被 stat 快路径吞掉
+        stage_path(&repo, "a.txt").expect("stage a");
+        let index = repo.open_index().expect("index");
+        let entry = index
+            .entry_by_path_and_stage(gix::bstr::ByteSlice::as_bstr(b"a.txt"), Stage::Unconflicted)
+            .expect("a.txt entry");
+        let blob = repo.find_blob(entry.id).expect("blob").data.to_vec();
+        assert_eq!(
+            blob,
+            b"BBB".to_vec(),
+            "racy entry 必须重读内容: 暂存区不得残留旧 AAA"
         );
     }
 
