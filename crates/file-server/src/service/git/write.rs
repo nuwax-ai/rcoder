@@ -478,7 +478,9 @@ pub fn stage_and_commit(
             None => tree_id == repo.empty_tree().id(),
         }
     } else {
-        !requested_paths_have_staged_changes(repo, &index, &paths, head_tree)?
+        // 传**原始请求列表** (非展开结果): 目录请求按前缀覆盖目录内已暂存
+        // 的删除/新增 (codex r7 P2)
+        !requested_paths_have_staged_changes(repo, &index, files, head_tree)?
     };
     if nothing_to_commit {
         // 无需创建 commit ≠ 暂存区无需落盘: 本批可能修改了暂存区 (如用户把
@@ -502,46 +504,67 @@ pub fn stage_and_commit(
     Ok(Some(commit_id))
 }
 
-/// 请求路径相对 HEAD 的暂存差异判定 (TS `nativeHasStagedChangesForPaths` /
-/// iso `statusMatrix` 对齐): 任一请求路径的 index 条目与 HEAD tree 条目
-/// 内容或可执行位不同、单侧新增、单侧删除 → 有变更。
+/// 请求路径相对 HEAD 的暂存差异判定 (TS `git diff --cached --quiet -- <paths>`
+/// 语义, codex r7 收敛): 官方 [`Repository::tree_index_status`] 比对 HEAD tree
+/// 与**同一份内存 index** (不扫工作树), 按原始请求范围过滤——
+/// - 目录请求按前缀匹配, 覆盖目录内**已暂存的删除/新增** (展开现存文件的
+///   手写判定会漏删除);
+/// - 文件类型变化 (普通文件 ↔ 符号链接, blob 相同) 由官方 diff 判定;
+/// - unborn 对比空 tree (请求路径已暂存即变更), 不再手查 index;
+/// - Windows 反斜杠请求路径先归一化, 与 index 存储口径一致。
+///
+/// 首个命中即 Cancel 提前退出。
 fn requested_paths_have_staged_changes(
     repo: &Repository,
     index: &gix::index::File,
     requested: &[String],
     head_tree: Option<ObjectId>,
 ) -> AppResult<bool> {
-    use gix::bstr::ByteSlice as _;
-    let Some(head_tree_id) = head_tree else {
-        // unborn: 相对空树, 请求路径任一已暂存 (存在 index) 即有变更
-        return Ok(requested.iter().any(|path| {
-            index
-                .entry_by_path_and_stage(path.as_bytes().as_bstr(), Stage::Unconflicted)
-                .is_some()
-        }));
-    };
-    let tree = repo
-        .find_tree(head_tree_id)
-        .map_err(|e| map_git_err(e, "git find_tree"))?;
-    for path in requested {
-        let normalized = crate::path_safety::host_relative_to_wire(path);
-        let staged =
-            index.entry_by_path_and_stage(normalized.as_bytes().as_bstr(), Stage::Unconflicted);
-        let head_entry = tree
-            .lookup_entry_by_path(normalized.as_str())
-            .map_err(|e| map_git_err(e, "git lookup HEAD tree entry"))?;
-        match (staged, head_entry) {
-            (None, None) => continue,
-            (Some(_), None) | (None, Some(_)) => return Ok(true),
-            (Some(staged), Some(head)) => {
-                let staged_exec = staged.mode == IndexMode::FILE_EXECUTABLE;
-                if staged.id != head.id() || staged_exec != head.mode().is_executable() {
-                    return Ok(true);
-                }
+    let scope: Vec<String> = requested
+        .iter()
+        .map(|path| normalize_scope_path(path))
+        .collect();
+    let tree_id = head_tree.unwrap_or_else(|| repo.empty_tree().id().detach());
+    let mut has_change = false;
+    repo.tree_index_status(
+        &tree_id,
+        index,
+        None,
+        gix::status::tree_index::TrackRenames::Disabled,
+        |change, _, _| {
+            if !has_change
+                && scope
+                    .iter()
+                    .any(|prefix| in_scope(change.location(), prefix))
+            {
+                has_change = true;
             }
-        }
+            Ok(if has_change {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            })
+        },
+    )
+    .map_err(|e| map_git_err(e, "git tree_index_status"))?;
+    Ok(has_change)
+}
+
+/// 请求路径 → 比对范围键: 分隔符归一 (Windows `\` → `/`) 并剥离开头 `./` 段,
+/// 与 index/HEAD 条目存储口径一致。
+fn normalize_scope_path(path: &str) -> String {
+    let mut normalized = crate::path_safety::host_relative_to_wire(path);
+    while let Some(stripped) = normalized.strip_prefix("./") {
+        normalized = stripped.to_string();
     }
-    Ok(false)
+    normalized
+}
+
+/// 变更路径是否落在请求范围内: 精确匹配, 或位于请求目录之下 (`<dir>/` 前缀)。
+fn in_scope(location: &BStr, prefix: &str) -> bool {
+    let prefix = prefix.as_bytes();
+    location == prefix
+        || (location.starts_with(prefix) && location.get(prefix.len()) == Some(&b'/'))
 }
 
 // ── init / unstage / discard ───────────────────────────────────────────────────
@@ -977,6 +1000,71 @@ mod tests {
         assert!(
             repo.head_commit().is_ok(),
             "HEAD must remain valid after rejection"
+        );
+    }
+
+    /// codex r7 P2: 请求目录时, 目录内**已暂存的删除**必须算变更
+    /// (展开现存文件的手写判定会漏掉)。
+    #[test]
+    fn explicit_commit_detects_staged_deletion_inside_requested_dir() {
+        let test = TestRepo::new();
+        std::fs::create_dir_all(test.0.join("dir")).expect("mkdir dir");
+        commit_file(&test, "dir/gone.txt", "v", "add gone");
+        commit_file(&test, "dir/keep.txt", "k", "add keep");
+        let repo = test.open();
+
+        // 暂存删除 gone.txt (工作区删除 + stage 删除)
+        std::fs::remove_file(test.0.join("dir/gone.txt")).expect("remove");
+        stage_files(&repo, &["dir/gone.txt".to_string()]).expect("stage deletion");
+        // 工作区再无 dir 下其他变更; 请求整个 dir 目录
+        let result = stage_and_commit(&repo, &["dir".to_string()], "rm gone", "T", "t@e.c")
+            .expect("must not fail");
+        let hash = result.expect("staged deletion inside requested dir must commit");
+        let commit = repo
+            .find_commit(ObjectId::from_hex(hash.as_bytes()).expect("parse"))
+            .expect("find");
+        let tree = commit.tree().expect("tree");
+        assert!(
+            tree.lookup_entry_by_path("dir/gone.txt")
+                .expect("lk")
+                .is_none(),
+            "deletion must be published"
+        );
+        assert!(
+            tree.lookup_entry_by_path("dir/keep.txt")
+                .expect("lk")
+                .is_some(),
+            "sibling file must survive"
+        );
+    }
+
+    /// codex r7 P2: 文件类型变化 (普通文件 ↔ 符号链接, blob 内容相同) 必须算变更。
+    #[cfg(unix)]
+    #[test]
+    fn explicit_commit_detects_type_change_between_file_and_symlink() {
+        let test = TestRepo::new();
+        // 普通文件内容恰为符号链接目标路径 → 两种形态 blob 相同
+        commit_file(&test, "target.txt", "target.txt", "add target");
+        commit_file(&test, "link.txt", "target.txt", "add as file");
+        let repo = test.open();
+
+        // link.txt 改为指向 target.txt 的符号链接 (内容与原普通文件相同)
+        std::fs::remove_file(test.0.join("link.txt")).expect("remove file");
+        std::os::unix::fs::symlink("target.txt", test.0.join("link.txt")).expect("symlink");
+        let result = stage_and_commit(&repo, &["link.txt".to_string()], "to symlink", "T", "t@e.c")
+            .expect("must not fail");
+        let hash = result.expect("type change must commit despite identical blob");
+        let commit = repo
+            .find_commit(ObjectId::from_hex(hash.as_bytes()).expect("parse"))
+            .expect("find");
+        let tree = commit.tree().expect("tree");
+        let entry = tree
+            .lookup_entry_by_path("link.txt")
+            .expect("lk")
+            .expect("present");
+        assert!(
+            entry.mode().is_link(),
+            "published entry must be the symlink form"
         );
     }
 
