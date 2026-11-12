@@ -202,6 +202,18 @@ pub async fn computer_pod_resources(
 
     // 进程明细+分组聚合(proto → 响应;MB 换算,分组字符串透传)
     let (processes, process_count, groups) = map_process_detail(&response);
+    // RPC 成功却没有明细：只有两种可能——沙箱侧没跑扫描（旧版本 agent_runner
+    // 忽略 include_processes）或扫描失败。两者都会让观测端看到「没有进程 /
+    // 没有 agent」，预发布环境那次空窗口正是这种形态，所以这里必须留痕。
+    // 用 info 而不是 warn：混版本滚动期间旧沙箱每次轮询都会命中，warn 会刷屏。
+    if process_count.is_none() {
+        info!(
+            event = "pod_resources.detail_absent",
+            container_id = %container_info.container_id,
+            user_id = ?params.user_id,
+            "container status RPC succeeded but returned no process detail; observation will see empty processes/agents"
+        );
+    }
     let agents: Vec<shared_types::ComputerAgentExecution> = response
         .agents
         .iter()
