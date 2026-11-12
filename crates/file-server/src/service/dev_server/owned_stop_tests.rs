@@ -38,7 +38,10 @@ fn manager(root: &Path) -> Arc<DevServerManager> {
     Arc::new(DevServerManager::new(Arc::new(crate::Config {
         log_base_dir: root.join("logs"),
         dev_stop_check_interval_ms: 10,
-        dev_stop_max_attempts: 100,
+        // 整包并行时测试任务调度可被压 >1s, 固定 100 次 (1s) 会让持锁的
+        // 首 stop 在测试写出 release 前耗尽预算, 误报 "exit not confirmed"
+        // (偶发根因); 门闩/单次树观测语义与预算无关, 放宽到 10s 消除竞态。
+        dev_stop_max_attempts: 1000,
         ..Default::default()
     })))
 }

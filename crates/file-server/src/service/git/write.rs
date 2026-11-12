@@ -466,12 +466,25 @@ pub fn stage_and_commit(
         })
         .transpose()?;
     let tree_id = tree_id_from_index(repo, &index)?;
-    if Some(tree_id) == head_tree {
-        // nothingToCommit: 新 tree 与 HEAD 一致只说明**无需创建 commit**;
-        // 本批可能修改了暂存区 (如用户把工作树恢复成 HEAD 内容, 抵消旧的
-        // 暂存差异) —— 必须落盘, 否则磁盘残留旧暂存, 下次提交其他文件会
-        // 连带提交 (codex 终审 P1)。锁内磁盘 index 未变: 重读比对 tree,
-        // 不同才写, 真无变化 (纯 stat 刷新) 免写。
+    // nothingToCommit 判定对齐 TS 契约 (nativeCommitFiles / isoCommitFiles):
+    // - 显式列表: 看**请求路径**相对 HEAD 有无暂存差异——没有则不提交,
+    //   其他文件已暂存的内容原样保留 (不连带发布用户未请求的内容);
+    // - addAll (空列表): 任意暂存变更即提交 (nativeAddAllAndCommit 语义);
+    // - unborn + 空 tree: 不创建空的首提交。
+    // 提交体始终是整个暂存区 (nativeCommitStaged 语义)。
+    let nothing_to_commit = if files.is_empty() {
+        match head_tree {
+            Some(head) => head == tree_id,
+            None => tree_id == repo.empty_tree().id(),
+        }
+    } else {
+        !requested_paths_have_staged_changes(repo, &index, &paths, head_tree)?
+    };
+    if nothing_to_commit {
+        // 无需创建 commit ≠ 暂存区无需落盘: 本批可能修改了暂存区 (如用户把
+        // 工作树恢复成 HEAD 内容, 抵消旧的暂存差异) —— 必须落盘, 否则磁盘
+        // 残留旧暂存, 下次提交其他文件会连带提交 (codex 终审 P1)。锁内磁盘
+        // index 未变: 重读比对 tree, 不同才写, 真无变化 (纯 stat 刷新) 免写。
         let disk_index = repo
             .open_index()
             .map_err(|e| map_git_err(e, "git open_index"))?;
@@ -487,6 +500,48 @@ pub fn stage_and_commit(
     // deref 透写分支并同步维护两侧 reflog
     let commit_id = commit_to_head(repo, message, tree_id, &parents, author_name, author_email)?;
     Ok(Some(commit_id))
+}
+
+/// 请求路径相对 HEAD 的暂存差异判定 (TS `nativeHasStagedChangesForPaths` /
+/// iso `statusMatrix` 对齐): 任一请求路径的 index 条目与 HEAD tree 条目
+/// 内容或可执行位不同、单侧新增、单侧删除 → 有变更。
+fn requested_paths_have_staged_changes(
+    repo: &Repository,
+    index: &gix::index::File,
+    requested: &[String],
+    head_tree: Option<ObjectId>,
+) -> AppResult<bool> {
+    use gix::bstr::ByteSlice as _;
+    let Some(head_tree_id) = head_tree else {
+        // unborn: 相对空树, 请求路径任一已暂存 (存在 index) 即有变更
+        return Ok(requested.iter().any(|path| {
+            index
+                .entry_by_path_and_stage(path.as_bytes().as_bstr(), Stage::Unconflicted)
+                .is_some()
+        }));
+    };
+    let tree = repo
+        .find_tree(head_tree_id)
+        .map_err(|e| map_git_err(e, "git find_tree"))?;
+    for path in requested {
+        let normalized = crate::path_safety::host_relative_to_wire(path);
+        let staged =
+            index.entry_by_path_and_stage(normalized.as_bytes().as_bstr(), Stage::Unconflicted);
+        let head_entry = tree
+            .lookup_entry_by_path(normalized.as_str())
+            .map_err(|e| map_git_err(e, "git lookup HEAD tree entry"))?;
+        match (staged, head_entry) {
+            (None, None) => continue,
+            (Some(_), None) | (None, Some(_)) => return Ok(true),
+            (Some(staged), Some(head)) => {
+                let staged_exec = staged.mode == IndexMode::FILE_EXECUTABLE;
+                if staged.id != head.id() || staged_exec != head.mode().is_executable() {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 // ── init / unstage / discard ───────────────────────────────────────────────────
@@ -923,6 +978,119 @@ mod tests {
             repo.head_commit().is_ok(),
             "HEAD must remain valid after rejection"
         );
+    }
+
+    /// TS 契约对齐 (nativeCommitFiles/isoCommitFiles): 显式列表提交的
+    /// nothingToCommit 看**请求路径**的暂存差异——请求文件无变化时不提交,
+    /// 其他文件的已暂存内容原样保留, 不连带发布。
+    #[test]
+    fn explicit_commit_without_requested_change_keeps_unrelated_staging() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "original-a", "add a");
+        let repo = test.open();
+        let head_before = repo.head_commit().expect("head").id().to_string();
+
+        // b.txt 暂存另一版本 (与本次请求无关)
+        std::fs::write(test.0.join("b.txt"), "staged-b").expect("write b");
+        stage_files(&repo, &["b.txt".to_string()]).expect("stage b");
+
+        // 请求 a.txt (内容与 HEAD 一致) → nothingToCommit, b 的暂存保留
+        let result = stage_and_commit(&repo, &["a.txt".to_string()], "m", "T", "t@e.c")
+            .expect("must not fail");
+        assert!(
+            result.is_none(),
+            "requested path unchanged → nothingToCommit"
+        );
+        assert_eq!(
+            repo.head_commit().expect("head").id().to_string(),
+            head_before,
+            "HEAD must not move"
+        );
+
+        // 重开仓库验证磁盘暂存: b.txt 仍在暂存区
+        let reopened = open(&test.0).expect("reopen");
+        let st = get_status(&reopened).expect("status");
+        assert_eq!(
+            st.staged,
+            vec!["b.txt".to_string()],
+            "unrelated staging must survive: {:?}",
+            st.staged
+        );
+
+        // 之后提交 b.txt → 正常发布 (整个暂存区只有 b 的差异)
+        let hash = stage_and_commit(&reopened, &["b.txt".to_string()], "commit b", "T", "t@e.c")
+            .expect("commit b")
+            .expect("hash");
+        assert_ne!(hash, head_before);
+    }
+
+    /// TS 契约: 请求路径有变更时, 提交体是**整个暂存区** (nativeCommitStaged),
+    /// 无关文件已暂存的差异会随本次提交一起发布。
+    #[test]
+    fn explicit_commit_with_requested_change_publishes_whole_staging() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "original-a", "add a");
+        let repo = test.open();
+
+        // b 先暂存另一版本
+        std::fs::write(test.0.join("b.txt"), "staged-b").expect("write b");
+        stage_files(&repo, &["b.txt".to_string()]).expect("stage b");
+        // 请求 a.txt 且确有变更 → 提交应包含 b 的暂存内容
+        std::fs::write(test.0.join("a.txt"), "changed-a").expect("change a");
+        let hash = stage_and_commit(&repo, &["a.txt".to_string()], "m", "T", "t@e.c")
+            .expect("commit")
+            .expect("hash");
+
+        let commit = repo
+            .find_commit(ObjectId::from_hex(hash.as_bytes()).expect("parse"))
+            .expect("find commit");
+        let tree = commit.tree().expect("tree");
+        let b = tree
+            .lookup_entry_by_path("b.txt")
+            .expect("lookup b")
+            .expect("b committed");
+        let blob = repo
+            .find_object(b.id())
+            .expect("find blob b")
+            .try_into_blob()
+            .expect("blob");
+        let blob_data: &[u8] = blob.data.as_ref();
+        assert_eq!(
+            blob_data,
+            b"staged-b".as_slice(),
+            "unrelated staged content must be published with the whole staging area"
+        );
+    }
+
+    /// TS 契约: unborn + 无任何暂存 → 不创建空的首提交。
+    #[test]
+    fn unborn_empty_commit_creates_no_root_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).expect("mkdir");
+        // 走生产入口 ensure_repo (含缺 index 自愈), 与 handler 行为一致
+        drop(super::super::ensure_repo(&ws).expect("ensure_repo"));
+        let repo = open(&ws).expect("open unborn repo");
+        assert!(repo.head().expect("head").is_unborn());
+
+        // 空列表 addAll, 无任何暂存 → None, 不创建首提交
+        let result = stage_and_commit(&repo, &[], "empty", "T", "t@e.c").expect("must not fail");
+        assert!(
+            result.is_none(),
+            "unborn + empty staging must be nothingToCommit"
+        );
+        assert!(
+            repo.head().expect("head after").is_unborn(),
+            "no root commit must be created"
+        );
+
+        // 有真实文件 → 正常创建首提交
+        std::fs::write(ws.join("f.txt"), "first").expect("write f");
+        let hash = stage_and_commit(&repo, &["f.txt".to_string()], "root", "T", "t@e.c")
+            .expect("commit")
+            .expect("hash");
+        assert!(!hash.is_empty());
+        assert!(!repo.head().expect("head").is_unborn());
     }
 
     /// 事务化 stage+commit: 显式列表提交 / nothingToCommit / 冲突传播。
