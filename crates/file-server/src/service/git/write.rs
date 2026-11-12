@@ -31,7 +31,10 @@ use super::read::get_status;
 /// 仅用于 index/tree 名，**不做文件系统访问**——文件系统侧仍用原始路径
 /// （Win32 两种分隔符都接受）。
 fn index_bstr_path(worktree_path: &str) -> AppResult<BString> {
-    let normalized = crate::path_safety::host_relative_to_wire(worktree_path);
+    // 词法归一 (./、..、分隔符、尾斜杠): 请求可携带 `x/../b.txt` 形态, git
+    // CLI 由 pathspec 清理消化; gix 侧必须在 index/tree 命名收口处归一,
+    // 否则 `..` 段会原样进入 index 并在 tree 构造时被拒绝。
+    let normalized = normalize_relative_path(worktree_path)?;
     into_bstr(std::path::PathBuf::from(normalized))
         .map(|path| path.into_owned())
         .map_err(|error| map_git_err(error, "git encode worktree index path"))
@@ -522,8 +525,8 @@ fn requested_paths_have_staged_changes(
 ) -> AppResult<bool> {
     let scope: Vec<String> = requested
         .iter()
-        .map(|path| normalize_scope_path(path))
-        .collect();
+        .map(|path| normalize_relative_path(path))
+        .collect::<AppResult<Vec<_>>>()?;
     let tree_id = head_tree.unwrap_or_else(|| repo.empty_tree().id().detach());
     let mut has_change = false;
     repo.tree_index_status(
@@ -550,27 +553,48 @@ fn requested_paths_have_staged_changes(
     Ok(has_change)
 }
 
-/// 请求路径 → 比对范围键: 先按 FS-08 归一分隔符 (Windows `\` → `/`; POSIX
-/// 下反斜杠是合法文件名字符, 原样保留), 再经 `Path::components()` 归一掉
-/// `./` 段 (含前导与中间)、重复分隔符与尾斜杠, 以 `/` 重组——与 index/HEAD
-/// 条目存储口径一致。
-///
-/// `ParentDir`/`RootDir`/`Prefix` 不属于合法工作区相对路径 (上游 `ensure_within`
-/// 已拒绝穿越), 防御性丢弃后范围键自然匹配不到任何条目 (fail-closed)。
-fn normalize_scope_path(path: &str) -> String {
+/// 工作区相对路径 → 规范 wire 键 (对齐 git pathspec 清理语义), 供
+/// 请求范围匹配与 index/tree 条目命名共用的单一归一化点:
+/// - 先按 FS-08 归一分隔符 (Windows `\` → `/`; POSIX 下反斜杠是合法文件
+///   名字符, 原样保留), 再经 `Path::components()` 归一 `./` 段 (前导/中间)、
+///   重复分隔符与尾斜杠, 以 `/` 重组——与 index/HEAD 条目存储口径一致;
+/// - `..` 词法消解 (栈式回退, 对齐 git 对 pathspec 的清理): `a/../b` → `b`;
+///   回退越过根 = 越出工作区 → 拒绝 (对齐 git "outside repository");
+/// - 根目录请求 (`.` / `./`) 归一为**空串**, 由 [`in_scope`] 解释为整个
+///   工作区范围 (对齐 `git diff --cached -- .`);
+/// - `RootDir`/`Prefix` (绝对路径) 不属于工作区相对请求 → 拒绝。
+fn normalize_relative_path(path: &str) -> AppResult<String> {
     let wire = crate::path_safety::host_relative_to_wire(path);
-    Path::new(&wire)
-        .components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut stack: Vec<String> = Vec::new();
+    for component in Path::new(&wire).components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                stack.push(part.to_string_lossy().into_owned());
+            }
+            std::path::Component::ParentDir => {
+                if stack.pop().is_none() {
+                    return Err(AppError::validation(format!(
+                        "git request path escapes workspace root: {path}"
+                    )));
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(AppError::validation(format!(
+                    "git request path must be workspace-relative: {path}"
+                )));
+            }
+            std::path::Component::CurDir => {}
+        }
+    }
+    Ok(stack.join("/"))
 }
 
 /// 变更路径是否落在请求范围内: 精确匹配, 或位于请求目录之下 (`<dir>/` 前缀)。
 fn in_scope(location: &BStr, prefix: &str) -> bool {
+    // 根目录请求 (`.`) 归一为空串 = 整个工作区范围 (对齐 `git diff -- .`)
+    if prefix.is_empty() {
+        return true;
+    }
     let prefix = prefix.as_bytes();
     location == prefix
         || (location.starts_with(prefix) && location.get(prefix.len()) == Some(&b'/'))
@@ -1012,16 +1036,85 @@ mod tests {
         );
     }
 
-    /// 范围键归一化: `./` 段 (前导/中间)、重复分隔符、尾斜杠。
+    /// 范围键归一化: `./` 段 (前导/中间)、重复分隔符、尾斜杠、`..` 词法消解、
+    /// 根目录请求与拒绝形态。
     #[test]
     fn scope_path_normalizes_dot_and_duplicate_separators() {
-        assert_eq!(normalize_scope_path("./a.txt"), "a.txt");
-        assert_eq!(normalize_scope_path("a/./b.txt"), "a/b.txt");
-        assert_eq!(normalize_scope_path("a//b.txt"), "a/b.txt");
-        assert_eq!(normalize_scope_path("dir/"), "dir");
-        assert_eq!(normalize_scope_path("dir"), "dir");
-        // POSIX 下反斜杠是合法文件名字符, 原样保留 (FS-08 契约)
-        assert_eq!(normalize_scope_path("a\\b.txt"), "a\\b.txt");
+        assert_eq!(normalize_relative_path("./a.txt").unwrap(), "a.txt");
+        assert_eq!(normalize_relative_path("a/./b.txt").unwrap(), "a/b.txt");
+        assert_eq!(normalize_relative_path("a//b.txt").unwrap(), "a/b.txt");
+        assert_eq!(normalize_relative_path("dir/").unwrap(), "dir");
+        assert_eq!(normalize_relative_path("dir").unwrap(), "dir");
+        // 根目录请求 → 空串 = 整个工作区范围
+        assert_eq!(normalize_relative_path(".").unwrap(), "");
+        assert_eq!(normalize_relative_path("./").unwrap(), "");
+        // `..` 词法消解 (栈式回退, 对齐 git pathspec 清理)
+        assert_eq!(normalize_relative_path("a/../b.txt").unwrap(), "b.txt");
+        assert_eq!(
+            normalize_relative_path("dir/sub/../x.txt").unwrap(),
+            "dir/x.txt"
+        );
+        // 越出工作区根 / 绝对路径 → 拒绝
+        assert!(normalize_relative_path("../escape.txt").is_err());
+        assert!(normalize_relative_path("a/../../escape.txt").is_err());
+        assert!(normalize_relative_path("/abs/path.txt").is_err());
+    }
+
+    /// 反斜杠的分隔符语义按平台断言 (FS-08): Windows 归一为 `/`,
+    /// POSIX 视为合法文件名字符原样保留。
+    #[test]
+    fn scope_path_backslash_follows_platform_contract() {
+        #[cfg(windows)]
+        assert_eq!(normalize_relative_path("a\\b.txt").unwrap(), "a/b.txt");
+        #[cfg(not(windows))]
+        assert_eq!(normalize_relative_path("a\\b.txt").unwrap(), "a\\b.txt");
+    }
+
+    /// codex r8 P2: 根目录请求 (`.`) 是整个工作区范围, 任一暂存变更都必须提交
+    /// (归一为空串后由 in_scope 解释为全仓, 修复前匹配不到任何条目)。
+    #[test]
+    fn explicit_commit_with_root_scope_detects_staged_changes() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        let repo = test.open();
+        // b 暂存另一版本; 请求 "." (全仓范围) → 必须提交
+        std::fs::write(test.0.join("b.txt"), "staged-b").expect("write b");
+        stage_files(&repo, &["b.txt".to_string()]).expect("stage b");
+        let result = stage_and_commit(&repo, &[".".to_string()], "root", "T", "t@e.c")
+            .expect("must not fail");
+        assert!(result.is_some(), "root scope must see the staged change");
+
+        // "./" 同义
+        std::fs::write(test.0.join("c.txt"), "staged-c").expect("write c");
+        stage_files(&repo, &["c.txt".to_string()]).expect("stage c");
+        let result = stage_and_commit(&repo, &["./".to_string()], "root2", "T", "t@e.c")
+            .expect("must not fail");
+        assert!(result.is_some(), "./ root scope must see the staged change");
+    }
+
+    /// codex r8 P2: 带 `..` 的请求路径按 git pathspec 语义词法消解后生效。
+    #[test]
+    fn explicit_commit_resolves_dotdot_in_requested_scope() {
+        let test = TestRepo::new();
+        commit_file(&test, "b.txt", "original", "add b");
+        let repo = test.open();
+        // 请求 "x/../b.txt" → 范围键 "b.txt"; b 有变更必须提交
+        std::fs::write(test.0.join("b.txt"), "changed").expect("change b");
+        let result = stage_and_commit(&repo, &["x/../b.txt".to_string()], "dotdot", "T", "t@e.c")
+            .expect("must not fail");
+        assert!(
+            result.is_some(),
+            "lexically resolved scope must see the change"
+        );
+        // 越出工作区根的请求 → 拒绝
+        let error = stage_and_commit(&repo, &["../outside.txt".to_string()], "esc", "T", "t@e.c")
+            .expect_err("escape must be rejected");
+        // 越界在 staging 边界被 ensure_within 拒绝 (上游分层防御,
+        // 消息为 path_safety 的 "cannot exceed project directory")
+        assert!(
+            format!("{error}").contains("not safe") || format!("{error}").contains("escapes"),
+            "escape request must be rejected with a path-safety error: {error}"
+        );
     }
 
     /// codex r7 P2: 请求目录时, 目录内**已暂存的删除**必须算变更
