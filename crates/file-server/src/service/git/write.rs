@@ -540,7 +540,11 @@ fn requested_paths_have_staged_changes(
             repo.pathspec(
                 true,
                 patterns,
-                true,
+                // tree↔index 比对不继承 core.ignoreCase：对齐 gix 自身
+                // (`status/tree_index.rs` 默认 false; 只有 index↔worktree 才 true)。
+                // 继承会让 macOS/Windows 开发机 (ICASE) 与 Linux 生产对同一
+                // 请求给出不同的 nothingToCommit 判定。
+                false,
                 index,
                 gix::worktree::stack::state::attributes::Source::IdMapping,
             )
@@ -748,11 +752,21 @@ pub fn discard_files(repo: &Repository, files: &[String]) -> AppResult<DiscardBu
     };
     let mut buckets = DiscardBuckets::default();
     for f in &to_discard {
-        // 安全：用户可控的 files 必须在任何 fs 操作前做路径校验，拒绝 `..` / 绝对路径穿越。
-        // stage_path 内部的 ensure_within 发生在 write/remove 之后（太晚），故在此先行拦截。
-        let abs = crate::path_safety::ensure_within(workdir, f)?;
+        // 单一规范键：请求先词法归一（`x/../b.txt` → `b.txt`、Windows `\` → `/`），
+        // HEAD 查询 / 物化 / index / 分桶全部使用它。此前 ensure_within 内部已归一
+        // （FS 侧落点正确）而 HEAD 查询用原始串：归一前形态在 tree 里查不到条目，
+        // 被误判 untracked——删掉工作区文件并 stage 一次删除，与 discard 语义相反。
+        let key = normalize_relative_path(f)?;
+        let abs = crate::path_safety::ensure_within(workdir, &key)?;
+        // 目录请求没有单文件语义：stage_path 的目录展开会把整棵子树 stage 进
+        // index（等于 add，与 discard 相反），故 fail-fast 拒绝而非静默做错。
+        if std::fs::symlink_metadata(&abs).is_ok_and(|meta| meta.is_dir()) {
+            return Err(AppError::validation(format!(
+                "git discard path must be a file, not a directory: {f}"
+            )));
+        }
         match tree
-            .lookup_entry_by_path(f)
+            .lookup_entry_by_path(&key)
             .map_err(|e| map_git_err(e, "git lookup_entry_by_path"))?
         {
             Some(entry) => {
@@ -760,24 +774,24 @@ pub fn discard_files(repo: &Repository, files: &[String]) -> AppResult<DiscardBu
                 // （共享安全物化器: 界内目录链 + leaf 不跟随 + mode 如实恢复, FS-03/06）
                 let planned = super::materialize::plan_tree_entry(
                     workdir,
-                    Path::new(f),
+                    Path::new(&key),
                     entry.mode(),
                     entry.id(),
                 )?;
                 super::materialize::materialize_planned(repo, workdir, &planned)?;
-                stage_path(repo, f)?;
-                buckets.tracked_files.push(f.clone());
+                stage_path(repo, &key)?;
+                buckets.tracked_files.push(key);
             }
             None => {
                 // untracked / staged-new: 删 worktree + 同步 index (移除 staged-new entry)
                 if let Err(e) = std::fs::remove_file(&abs) {
                     tracing::warn!(error = %e, "remove untracked worktree file failed (skipping)");
                 }
-                stage_path(repo, f)?;
-                if staged_set.contains(f) {
-                    buckets.new_files.push(f.clone());
+                stage_path(repo, &key)?;
+                if staged_set.contains(&key) {
+                    buckets.new_files.push(key);
                 } else {
-                    buckets.untracked_files.push(f.clone());
+                    buckets.untracked_files.push(key);
                 }
             }
         }
@@ -1726,6 +1740,128 @@ mod tests {
             "path traversal must be rejected before any fs op"
         );
         assert!(!outside.exists(), "no fs side effect outside workdir");
+    }
+
+    /// codex r8-rereview P1: 归一化前的请求形态必须走同一条规范键——此前
+    /// `ensure_within` 内部已归一 (FS 落点正确) 而 HEAD 查询用原始串,
+    /// `x/../b.txt` 在 tree 里查不到条目 → 误判 untracked: 删工作区文件 +
+    /// stage 一次删除 (与 discard 语义相反)。
+    #[test]
+    fn discard_resolves_dotdot_before_head_lookup() {
+        let test = TestRepo::new();
+        commit_file(&test, "b.txt", "head", "add b");
+        std::fs::write(test.0.join("b.txt"), "modified").expect("modify fixture");
+        let repo = test.open();
+
+        let buckets =
+            discard_files(&repo, &["x/../b.txt".to_string()]).expect("discard with dotdot");
+        assert_eq!(
+            buckets.tracked_files,
+            vec!["b.txt".to_string()],
+            "dotdot request must be reported under its canonical key"
+        );
+        assert!(
+            buckets.new_files.is_empty() && buckets.untracked_files.is_empty(),
+            "tracked file must not be misclassified as new/untracked"
+        );
+        // 工作区恢复到 HEAD 内容 (未被误删)
+        assert_eq!(
+            std::fs::read_to_string(test.0.join("b.txt")).unwrap(),
+            "head"
+        );
+        // index 未残留删除: 条目仍在且等于 HEAD
+        let index = repo.open_index().expect("open index");
+        let entry = index
+            .entry_by_path_and_stage("b.txt".into(), Stage::Unconflicted)
+            .expect("b.txt must stay tracked in index");
+        let head_entry = repo
+            .head_tree()
+            .expect("head tree")
+            .lookup_entry_by_path("b.txt")
+            .expect("head lookup")
+            .expect("head entry");
+        assert_eq!(entry.id, head_entry.id().detach());
+        assert!(
+            !test.0.join("x").exists(),
+            "raw request must not create a stray directory"
+        );
+    }
+
+    /// 目录请求 fail-fast: `stage_path` 的目录展开会把整棵子树 stage 进 index
+    /// (等于 add, 与 discard 相反), 旧路径只会留下一条 remove_file 失败 WARN。
+    #[test]
+    fn discard_rejects_directory_request() {
+        let test = TestRepo::new();
+        std::fs::create_dir_all(test.0.join("src")).expect("mkdir");
+        commit_file(&test, "src/a.txt", "v", "add a");
+        let repo = test.open();
+
+        let error = discard_files(&repo, &["src".to_string()])
+            .expect_err("directory request must be rejected");
+        assert!(
+            format!("{error}").contains("must be a file"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(test.0.join("src/a.txt")).unwrap(),
+            "v",
+            "rejected request must not touch the worktree"
+        );
+        let status = get_status(&repo).expect("status");
+        assert!(
+            status.staged.is_empty(),
+            "rejected request must not stage the subtree: {:?}",
+            status.staged
+        );
+    }
+
+    /// codex r8-rereview P2: tree↔index 范围判定不继承 `core.ignoreCase`
+    /// (对齐 gix `status/tree_index` 默认 false; 只有 index↔worktree 才 true)。
+    /// macOS/Windows 客户仓库常带该配置, 继承会让大小写不同的请求命中已暂存
+    /// 条目, 与 Linux 生产 (无该配置) 的 nothingToCommit 判定不一致。
+    #[test]
+    fn requested_scope_matching_ignores_core_ignore_case() {
+        use std::io::Write as _;
+        let test = TestRepo::new();
+        commit_file(&test, "Readme.md", "v1", "add Readme");
+        // 模拟大小写不敏感平台的客户仓库配置 (保留原有配置, 仅追加)
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(test.0.join(".git/config"))
+            .expect("open config")
+            .write_all(b"[core]\n\tignoreCase = true\n")
+            .expect("append config");
+
+        let repo = test.open();
+        std::fs::write(test.0.join("Readme.md"), "v2").expect("change");
+        stage_files(&repo, &["Readme.md".to_string()]).expect("stage");
+
+        let index = repo.open_index().expect("open index");
+        let head_tree = repo
+            .head_tree_id_or_empty()
+            .map_err(|e| map_git_err(e, "git head_tree_id_or_empty"))
+            .expect("head tree")
+            .detach();
+        assert!(
+            !requested_paths_have_staged_changes(
+                &repo,
+                &index,
+                &["readme.md".to_string()],
+                Some(head_tree)
+            )
+            .expect("probe case-mismatched request"),
+            "case-mismatched request must not match the staged entry"
+        );
+        assert!(
+            requested_paths_have_staged_changes(
+                &repo,
+                &index,
+                &["Readme.md".to_string()],
+                Some(head_tree)
+            )
+            .expect("probe exact-case request"),
+            "exact-case request must match"
+        );
     }
 
     #[test]
