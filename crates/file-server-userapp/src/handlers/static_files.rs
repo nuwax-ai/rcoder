@@ -111,10 +111,17 @@ pub async fn artifact_meta(
     let Some(artifact) = resolve_build_artifact(&root, release_id) else {
         return Err(AppError::resource(no_artifact_message(release_id, &app_id)).into());
     };
+    // 与下载接口同一物理边界（serve_from_root 内的 ensure_resolved_within）：
+    // 解析 symlink 链后必须仍在 workspace 根内——`builds` 中段/产物文件链接
+    // 越界的,下载 404,meta 同样按"无产物"拒绝,不单靠拼接相对路径的"看似安全",
+    // 也不给越界文件提供元数据观察面。
+    let full = file_server::path_safety::ensure_resolved_within(&root, &artifact)
+        .await
+        .map_err(|_| AppError::resource(no_artifact_message(release_id, &app_id)))?;
     // resolve 只证明相对路径可解析（exact 分支已 is_file、latest 分支只认普通
     // 文件），此处 stat 拿 size/mtime——与下载接口打开文件同一竞态窗口，
     // NotFound 按"无产物"同语义回，其余 IO 错误如实传播（Fail Fast）。
-    let meta = tokio::fs::metadata(root.join(&artifact))
+    let meta = tokio::fs::metadata(&full)
         .await
         .map_err(|error| match error.kind() {
             std::io::ErrorKind::NotFound => {
@@ -153,13 +160,26 @@ fn no_artifact_message(release_id: Option<&str>, app_id: &str) -> String {
     }
 }
 
-/// 从产物文件名反剥 release_id（`workspace-package-{release_id}.zip`）。
+/// release_id 形状原语：非空 + 白名单字符集（字母数字+连字符，覆盖 UUID 两种
+/// 形态）。exact 输入校验与 latest 候选过滤共用——latest 选出的产物名必可被
+/// exact 精确定位，回传的 release_id 必可用于 `?release_id=` 钉版本。
+fn is_release_id_shape(release_id: &str) -> bool {
+    !release_id.is_empty()
+        && release_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// 从产物文件名剥出 release_id（`workspace-package-{release_id}.zip`），
+/// 并校验形状（非空+白名单）——空 stem（`workspace-package-.zip`）与白名单外
+/// 字符一律 None，latest 候选过滤与 handler 回传共用同一接受集合。
 fn release_id_from_artifact_name(file_name: &str) -> Option<&str> {
     use crate::service::userapp::WORKSPACE_PACKAGE_PREFIX;
 
-    file_name
-        .strip_prefix(WORKSPACE_PACKAGE_PREFIX)
-        .and_then(|stem| stem.strip_suffix(".zip"))
+    let stem = file_name
+        .strip_prefix(WORKSPACE_PACKAGE_PREFIX)?
+        .strip_suffix(".zip")?;
+    is_release_id_shape(stem).then_some(stem)
 }
 
 /// mtime → epoch 毫秒。时钟异常（早于 epoch / 平台不支持）如实报错，不用 0
@@ -183,14 +203,12 @@ fn resolve_build_artifact(ws_root: &Path, release_id: Option<&str>) -> Option<St
 }
 
 /// 按 release_id 精确定位产物。release_id 是用户输入——白名单字符集
-/// （字母数字+连字符，覆盖 UUID 两种形态）防路径注入：`..`、`/`、后缀注入均被拒。
+/// （字母数字+连字符，覆盖 UUID 两种形态，且非空）防路径注入：`..`、`/`、
+/// 后缀注入与空串均被拒。
 fn exact_build_artifact(ws_root: &Path, release_id: &str) -> Option<String> {
     use crate::service::userapp::workspace_artifact_rel_path;
 
-    if !release_id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
+    if !is_release_id_shape(release_id) {
         return None;
     }
     let rel = workspace_artifact_rel_path(release_id);
@@ -199,8 +217,12 @@ fn exact_build_artifact(ws_root: &Path, release_id: &str) -> Option<String> {
 
 /// 选 workspace 内最新构建产物（`builds/` 下 `workspace-package-*.zip` 字典序最大，
 /// UUIDv7 文件名字典序 = 构建时间序）。无产物返回 None。
+///
+/// 候选须通过 [`release_id_from_artifact_name`] 形状校验（与 exact 同一接受
+/// 集合）：空 stem / 白名单外字符的遗留文件名不参与选择——选出的产物必可被
+/// `?release_id=` 精确定位，meta 回传的 release_id 才真正钉得住版本。
 fn latest_build_artifact(ws_root: &Path) -> Option<String> {
-    use crate::service::userapp::{WORKSPACE_BUILDS_DIR, WORKSPACE_PACKAGE_PREFIX};
+    use crate::service::userapp::WORKSPACE_BUILDS_DIR;
 
     let builds_dir = ws_root.join(WORKSPACE_BUILDS_DIR);
     // NotFound = 尚无产物（合法 None）；其他错误（权限/IO）不能伪装成"无产物"，
@@ -224,7 +246,7 @@ fn latest_build_artifact(ws_root: &Path) -> Option<String> {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with(WORKSPACE_PACKAGE_PREFIX) || !name.ends_with(".zip") {
+        if release_id_from_artifact_name(&name).is_none() {
             continue;
         }
         if latest.as_deref().is_none_or(|cur| name.as_str() > cur) {
@@ -251,6 +273,12 @@ mod tests {
             "workspace-package-.zip.part",
             "",
         ] {
+            assert_eq!(release_id_from_artifact_name(bad), None, "bad: {bad:?}");
+        }
+        // 形状校验（与 exact 白名单同一原语）：空 stem 与白名单外字符一律
+        // None——否则 meta 回传的 release_id 钉不住 `?release_id=` 精确下载
+        // （P2 回归：`workspace-package-.zip` 曾回空串、`zzz_bad` 曾回非法 id）
+        for bad in ["workspace-package-.zip", "workspace-package-zzz_bad.zip"] {
             assert_eq!(release_id_from_artifact_name(bad), None, "bad: {bad:?}");
         }
     }
@@ -354,6 +382,35 @@ mod tests {
             );
         }
 
+        /// P2 回归：非法 stem 候选（字典序压过合法产物）不参与 latest 选择，
+        /// 回传的 release_id 必可用于 `?release_id=` 精确定位。
+        #[tokio::test]
+        async fn non_addressable_names_never_win_latest() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            ws_with_artifacts(
+                tmp.path(),
+                "app-1",
+                &[
+                    OLDER,
+                    // 字典序大于一切 UUIDv7 hex，但 stem 非法（下划线/空）
+                    "workspace-package-zzz_bad.zip",
+                    "workspace-package-.zip",
+                ],
+            );
+            let state = make_state(tmp.path().to_path_buf());
+            let (ok, _message, data) = meta(&state, "app-1", None).await;
+            assert!(ok);
+            let data = data.expect("meta data");
+            assert_eq!(data.release_id, "01999999zzzzeeee1111222233334444");
+            // 回传值可被 exact 精确定位（钉版本闭环）
+            let (ok, _message, data) = meta(&state, "app-1", Some(&data.release_id)).await;
+            assert!(ok, "returned release_id must pin via ?release_id=");
+            assert_eq!(
+                data.expect("pinned meta").file_name,
+                "workspace-package-01999999zzzzeeee1111222233334444.zip"
+            );
+        }
+
         #[tokio::test]
         async fn no_artifact_is_not_found_envelope_with_distinct_messages() {
             let tmp = tempfile::tempdir().expect("tempdir");
@@ -437,6 +494,58 @@ mod tests {
                 "builds/workspace-package-01999999zzzzeeee1111222233334444.zip"
             );
         }
+
+        /// P2 回归（unix）：meta 与下载接口同一物理边界——symlink 解析越出
+        /// workspace 根的（`builds` 中段链接 / 产物文件链接），下载 404、meta
+        /// 同样按"无产物"拒绝，不给越界文件提供元数据观察面；链接仍指向
+        /// workspace 内的照常放行（边界是 workspace 根，不是 builds 目录）。
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn symlink_outside_workspace_is_rejected_inside_kept() {
+            const RID: &str = "01999999zzzzeeee1111222233334444";
+            const NAME: &str = "workspace-package-01999999zzzzeeee1111222233334444.zip";
+
+            // 1) `builds` 整目录链到工作区外 sibling（内放合法名产物）：
+            //    修复前 meta 成功返回外部文件 size，下载却 404
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let outside = tmp.path().join("outside-builds");
+            std::fs::create_dir_all(&outside).expect("mkdir outside");
+            std::fs::write(outside.join(NAME), b"outside-zip").expect("write outside");
+            let ws = tmp.path().join("app-1");
+            std::fs::create_dir_all(&ws).expect("mkdir ws");
+            std::os::unix::fs::symlink(&outside, ws.join("builds")).expect("symlink builds");
+            let state = make_state(tmp.path().to_path_buf());
+            let (ok, message, data) = meta(&state, "app-1", None).await;
+            assert!(!ok, "outside symlink must be rejected");
+            assert!(data.is_none());
+            assert_eq!(message, "no build artifact yet (app_id=app-1)");
+
+            // 2) 产物文件本身链到工作区外（exact 分支 is_file 跟随链接）：
+            //    同样拒绝，与下载 404 对齐
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let outside_file = tmp.path().join("outside.zip");
+            std::fs::write(&outside_file, b"outside-zip").expect("write outside file");
+            let ws = tmp.path().join("app-1");
+            std::fs::create_dir_all(ws.join("builds")).expect("mkdir builds");
+            std::os::unix::fs::symlink(&outside_file, ws.join("builds").join(NAME))
+                .expect("symlink artifact");
+            let state = make_state(tmp.path().to_path_buf());
+            let (ok, _message, data) = meta(&state, "app-1", Some(RID)).await;
+            assert!(!ok, "outside artifact symlink must be rejected");
+            assert!(data.is_none());
+
+            // 3) 链接指向 workspace 内另一目录：放行（同一物理根内）
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let ws = tmp.path().join("app-1");
+            let real = ws.join("real-builds");
+            std::fs::create_dir_all(&real).expect("mkdir real");
+            std::fs::write(real.join(NAME), b"zip-payload-0123456789").expect("write real");
+            std::os::unix::fs::symlink("real-builds", ws.join("builds")).expect("symlink inside");
+            let state = make_state(tmp.path().to_path_buf());
+            let (ok, _message, data) = meta(&state, "app-1", None).await;
+            assert!(ok, "inside symlink must stay reachable");
+            assert_eq!(data.expect("meta data").size_bytes, 22);
+        }
     }
 
     #[test]
@@ -466,6 +575,35 @@ mod tests {
             latest_build_artifact(ws).as_deref(),
             Some("builds/workspace-package-01999999zzzzeeee1111222233334445.zip")
         );
+    }
+
+    /// P2 回归：latest 候选须与 exact 同一形状校验——空 stem / 白名单外字符
+    /// 的遗留文件名不参与选择（否则 meta 回传的 release_id 无法用于精确下载）。
+    #[test]
+    fn latest_build_artifact_skips_non_addressable_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("builds")).expect("mkdir builds");
+        // 非法形态字典序都大于合法候选：曾会被误选为"最新"
+        for name in [
+            "workspace-package-01999999zzzzeeee1111222233334444.zip", // 合法
+            "workspace-package-zzz_bad.zip",                          // 下划线（白名单外）
+            "workspace-package-.zip",                                 // 空 stem
+        ] {
+            std::fs::write(ws.join("builds").join(name), b"zip").expect("write");
+        }
+        // 与合法候选并存：选合法者，非法形态跳过
+        assert_eq!(
+            latest_build_artifact(ws).as_deref(),
+            Some("builds/workspace-package-01999999zzzzeeee1111222233334444.zip")
+        );
+        // 仅非法候选：None（不回传钉不住版本的 release_id）
+        let only_bad = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(only_bad.path().join("builds")).expect("mkdir builds");
+        for name in ["workspace-package-zzz_bad.zip", "workspace-package-.zip"] {
+            std::fs::write(only_bad.path().join("builds").join(name), b"zip").expect("write");
+        }
+        assert_eq!(latest_build_artifact(only_bad.path()), None);
     }
 
     #[test]
