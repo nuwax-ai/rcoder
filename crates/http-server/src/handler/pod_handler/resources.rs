@@ -8,7 +8,7 @@
 use axum::extract::State;
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock, Mutex};
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::router::AppState;
 use crate::{AppError, HttpResult};
@@ -79,6 +79,19 @@ impl TargetReject {
 fn resolve_resource_target(
     params: &ComputerPodResourcesQuery,
 ) -> Result<ResourceTarget, TargetReject> {
+    // 租户/空间/隔离类型只属于创建期（容器 env、Deployment 标签、工作目录），
+    // 不参与容器定位——容器标识只由 user_id/project_id/app_id 决定。这里只留
+    // 一条 debug：调用方把 ensure 的入参原样带过来时，能看出"传了但没用于定位"，
+    // 而不是以为它在做租户过滤。
+    if params.tenant_id.is_some() || params.space_id.is_some() || params.isolation_type.is_some() {
+        debug!(
+            event = "pod_resources.scope_ignored",
+            tenant_id = ?params.tenant_id,
+            space_id = ?params.space_id,
+            isolation_type = ?params.isolation_type,
+            "tenant/space/isolation 是创建期隔离元数据，不参与容器定位"
+        );
+    }
     let service_type = params
         .service_type
         .unwrap_or(shared_types::ServiceType::ComputerAgentRunner);
@@ -842,9 +855,40 @@ mod tests {
             app_id: app_id.map(str::to_string),
             app_stage: app_stage.map(str::to_string),
             service_type,
+            tenant_id: None,
+            space_id: None,
+            isolation_type: None,
             include_processes: None,
             interval_secs: None,
         }
+    }
+
+    /// 租户/空间/隔离类型是**创建期隔离元数据**：决定共享容器里的工作目录
+    /// （`/app/project_workspace/{tenant}/{space}/{project}`）与 compose 的
+    /// 宿主目录映射，但**不改变定位到哪台容器**（容器标识只由 user_id /
+    /// project_id / app_id 决定，一个 user 在 computer 族只有一台）。
+    /// 这条测试把该语义锁住：带不带它们，解析结果必须相同。
+    #[test]
+    fn scope_fields_do_not_change_resolution() {
+        let base = resolve_resource_target(&q(Some("42"), None, None, None, None, None))
+            .expect("应解析成功");
+        let mut with_scope = q(Some("42"), None, None, None, None, None);
+        with_scope.tenant_id = Some("t-1".to_string());
+        with_scope.space_id = Some("s-1".to_string());
+        with_scope.isolation_type = Some("tenant".to_string());
+        let scoped = resolve_resource_target(&with_scope).expect("应解析成功");
+        assert_eq!(scoped, base, "隔离元数据不应影响容器定位");
+
+        // pod_id 场景同样不受影响（共享容器由 pod_id 明确定位）
+        let base_pod = resolve_resource_target(&q(None, Some("pod-7"), None, None, None, None))
+            .expect("应解析成功");
+        let mut scoped_pod = q(None, Some("pod-7"), None, None, None, None);
+        scoped_pod.tenant_id = Some("t-1".to_string());
+        scoped_pod.space_id = Some("s-1".to_string());
+        assert_eq!(
+            resolve_resource_target(&scoped_pod).expect("应解析成功"),
+            base_pod
+        );
     }
 
     /// 不传任何分派字段：行为必须和改动前完全一致。

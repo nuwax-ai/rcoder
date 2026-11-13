@@ -599,6 +599,33 @@ pub struct ComputerPodResourcesQuery {
     #[schema(example = "proj_456")]
     pub project_id: Option<String>,
 
+    /// 租户 ID（可选，仅创建期隔离元数据）。
+    ///
+    /// **不参与容器定位**：容器标识只由 `user_id` / `project_id` / `app_id`
+    /// 决定，而一租户下的同一 user 在 computer 族里只有一台容器（名字由
+    /// identifier 拼），所以传入它找到的是同一台容器。
+    ///
+    /// 之所以仍然接受，是为了和 `/computer/pod/ensure` 的入参面对齐——调用方
+    /// 可以把创建时的请求参数原样带过来，不必删字段。传入值只用于日志留痕。
+    /// 若将来需要"按租户过滤/隔离查询"，那是查找层要支持的新能力，不是加个
+    /// 参数就能生效的。
+    #[serde(default)]
+    #[param(example = "tenant_abc")]
+    #[schema(example = "tenant_abc")]
+    pub tenant_id: Option<String>,
+
+    /// 空间 ID（可选，仅创建期隔离元数据；语义同 `tenant_id`，不参与定位）。
+    #[serde(default)]
+    #[param(example = "space_xyz")]
+    #[schema(example = "space_xyz")]
+    pub space_id: Option<String>,
+
+    /// 隔离类型（可选，仅创建期隔离元数据；语义同 `tenant_id`，不参与定位）。
+    #[serde(default)]
+    #[param(example = "tenant")]
+    #[schema(example = "tenant")]
+    pub isolation_type: Option<String>,
+
     /// 是否返回容器内进程明细(默认 true;响应 processes 字段)
     #[serde(default = "computer_pod_resources_default_include_processes")]
     #[param(example = true)]
