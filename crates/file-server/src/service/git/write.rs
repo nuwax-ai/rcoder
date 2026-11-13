@@ -98,7 +98,9 @@ fn staged_index<'a>(
                 .map_err(|e| map_git_err(e, "git open_index"))?,
         );
     }
-    Ok(index_once.as_ref().expect("just populated"))
+    index_once
+        .as_ref()
+        .ok_or_else(|| AppError::system("git staged index missing after lazy load"))
 }
 
 /// 目录请求补齐**未暂存的删除** (codex 业务缺口): `git add <dir>` 会暂存
