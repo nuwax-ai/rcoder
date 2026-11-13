@@ -628,7 +628,7 @@ pub fn commit_indexed(
     // 历史毒化修复: 锁内读-清-按需落盘 (codex 复审 543bd91f: 只清内存会让
     // 磁盘 index 永远带着坏条目, 重开仓库 status 仍显示待提交)。无修复
     // 内容时保持原语义 (不取写路径, 不重写 index)。
-    let mut index = {
+    let index = {
         let lock = acquire_index_lock(repo)?;
         let mut index = repo
             .open_index()
