@@ -12,6 +12,7 @@
 //! - Pod 列表失败 → 503（`error_detail.stage=pod.overview.list`）；
 //!   分区失败（events/pvc）→ `degraded[]` 标注，不影响状态码。
 
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use axum::extract::{Query, State};
@@ -33,13 +34,17 @@ pub struct PodOverviewQuery {
     /// 每 Pod 返回最近 N 条事件（默认 20，上限 50）
     #[serde(default)]
     pub events_limit: Option<u32>,
-    /// 按结构化身份过滤
+    /// 按业务场景过滤（computer-agent-runner / computer-normal-project /
+    /// web-agent-runner / userapp / userapp-builder）
     #[serde(default)]
     pub service_type: Option<String>,
+    /// 按 computer 族的 user_id 过滤
     #[serde(default)]
     pub user_id: Option<String>,
+    /// 按 userapp 族的 app_id 过滤
     #[serde(default)]
     pub app_id: Option<String>,
+    /// 按 web 族的 project_id 过滤
     #[serde(default)]
     pub project_id: Option<String>,
     /// 是否在 spec.containers/usage.containers 里带上内部 sidecar
@@ -82,59 +87,102 @@ pub struct PodOverviewSummary {
     pub with_warning_events: usize,
 }
 
-// ── 缓存：键 = 无（P1 只按 runtime 一份全量快照；过滤参数不进键）───────
+// ── 缓存（复审 R10 修正）───────────────────────────────────────────────
 //
-// 说明：过滤（search/身份）在快照上做内存运算，同一份快照可服务所有过滤
-// 组合——所以缓存键不含过滤参数。events_limit 影响采集形态，进缓存键。
+// 硬要求（方案 §6.5/§13-4）：10s 缓存 + 同键单飞。实现：
+// - **按 runtime 指针隔离**：多 AppState / 嵌入场景不串用快照（不同
+//   runtime 的 namespace/容器集不同，串用会让 B 看到 A 的数据）；
+// - **tokio 异步锁单飞**：miss 的并发请求在采集锁上排队，第二个进来时
+//   先重查缓存（双检）——上游只打一次；
+// - **固定按上限采集事件**（MAX_EVENTS），展示时按 events_limit 截断：
+//   20→50→20 的参数交替不再互相驱逐缓存；
+// - 过滤（search/身份）在快照上做内存运算，不进缓存键。
+//
+// 锁中毒处理：poisoned 视为"无缓存可用"直接采集——缓存是纯优化，
+// 不能因 poison 让观测接口 5xx（生产代码不留 panic 路径）。
 
+/// 采集时的固定事件条数上限（= events_limit 的 clamp 上限）。
+const MAX_EVENTS: usize = 50;
+
+#[derive(Clone)]
 struct OverviewCache {
     snapshot: PodOverviewSnapshot,
-    events_limit: usize,
     ts: std::time::Instant,
 }
 
-static CACHE: LazyLock<Mutex<Option<OverviewCache>>> = LazyLock::new(|| Mutex::new(None));
+#[derive(Default)]
+struct CacheCell {
+    cached: Mutex<Option<OverviewCache>>,
+    /// 采集串行化（单飞）。
+    inflight: tokio::sync::Mutex<()>,
+}
+
+static CACHES: LazyLock<Mutex<HashMap<usize, Arc<CacheCell>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 缓存 TTL。metrics-server 本身 15~60s 粒度，10s 足够"新鲜"；
-/// 面板 2s 轮询在这层被吸收，不会打穿到 k8s API。
+/// 面板轮询在这层被吸收，不会打穿到 k8s API。
 const CACHE_TTL_SECS: u64 = 10;
 
-/// 取快照：命中且 events_limit 一致 → 复用；否则采集并回填。
-///
-/// **不是单飞**：缓存 miss 的并发请求会各自采集（采集在锁外）。代价是
-/// 冷启动时可能出现几次重复读——对只读的 list/inspect 无害；面板 10s
-/// 轮询 + 10s TTL 的形态下，miss 窗口极小。真要做去重得加 in-flight
-/// 通道，对观测接口不值得那份复杂度。
+/// 读缓存（短临界区：Clone 后立即释放）。中毒 → None（当没缓存）。
+fn read_cache(cell: &Arc<CacheCell>) -> Option<OverviewCache> {
+    let guard = cell.cached.lock().ok()?;
+    guard.clone()
+}
+
 async fn snapshot_with_cache(
     state: &Arc<AppState>,
-    events_limit: usize,
 ) -> Result<(PodOverviewSnapshot, u64), AppError> {
-    // 先试缓存（非阻塞快速路径）
-    if let Some(cached) = CACHE.lock().expect("overview cache poisoned").as_ref()
-        && cached.events_limit == events_limit
+    // runtime 身份 = Arc 指针（同一 runtime 的所有 AppState 共享同一 Arc）
+    let runtime = state.runtime().clone();
+    // fat pointer（dyn）先转 thin：取数据指针地址做键
+    let key = Arc::as_ptr(&runtime) as *const () as usize;
+    let cell = {
+        let mut caches = match CACHES.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(), // 缓存簿记中毒 ≠ 5xx
+        };
+        caches
+            .entry(key)
+            .or_insert_with(|| Arc::new(CacheCell::default()))
+            .clone()
+    };
+
+    // 快路径：命中新鲜缓存直接返回
+    if let Some(cached) = read_cache(&cell)
         && cached.ts.elapsed().as_secs() < CACHE_TTL_SECS
     {
-        return Ok((cached.snapshot.clone(), cached.ts.elapsed().as_secs()));
+        return Ok((cached.snapshot, cached.ts.elapsed().as_secs()));
     }
-    // 采集（不在锁内——采集要几百毫秒，持锁会让所有并发请求串行）
-    let snapshot = state
-        .runtime()
-        .observe_namespace_pods(events_limit)
+
+    // 单飞：采集锁内双检（并发 miss 只打一次上游）
+    let _inflight = cell.inflight.lock().await;
+    if let Some(cached) = read_cache(&cell)
+        && cached.ts.elapsed().as_secs() < CACHE_TTL_SECS
+    {
+        return Ok((cached.snapshot, cached.ts.elapsed().as_secs()));
+    }
+    let snapshot = runtime
+        .observe_namespace_pods(MAX_EVENTS)
         .await
         .map_err(|e| {
-            error!("[POD_OVERVIEW] observe failed: {e}");
-            AppError::internal_server_error(&format!("pod overview observation failed: {e}"))
+            error!(event = "pod_overview.observe_failed", error = %e, "observe failed");
+            // R12：列表失败 = 503 语义（服务/依赖暂不可用），带结构化 stage
+            AppError::from_code(shared_types::error_codes::ERR_SERVICE_UNAVAILABLE)
+                .with_error_detail(shared_types::ErrorDetail::new(
+                    shared_types::error_codes::ERR_SERVICE_UNAVAILABLE,
+                    "pod.overview.list",
+                    format!("pod overview observation failed: {e}"),
+                ))
         })?;
-    let age = 0;
-    {
-        let mut guard = CACHE.lock().expect("overview cache poisoned");
-        *guard = Some(OverviewCache {
-            snapshot: snapshot.clone(),
-            events_limit,
-            ts: std::time::Instant::now(),
-        });
+    let entry = OverviewCache {
+        snapshot: snapshot.clone(),
+        ts: std::time::Instant::now(),
+    };
+    if let Ok(mut guard) = cell.cached.lock() {
+        *guard = Some(entry);
     }
-    Ok((snapshot, age))
+    Ok((snapshot, 0))
 }
 
 /// 隐藏的内部 sidecar（与方案 §13 决策 2 一致）。
@@ -161,7 +209,7 @@ pub async fn pod_overview(
     let limit = params.limit.unwrap_or(500).clamp(1, 1000) as usize;
     let include_sidecars = params.include_sidecars.unwrap_or(false);
 
-    let (snapshot, cache_age) = snapshot_with_cache(&state, events_limit).await?;
+    let (snapshot, cache_age) = snapshot_with_cache(&state).await?;
 
     // 过滤（内存，快照上）
     let filter = PodOverviewFilter {
@@ -176,6 +224,11 @@ pub async fn pod_overview(
         .into_iter()
         .cloned()
         .collect();
+    // 展示截断：缓存固定采集 MAX_EVENTS 条，按请求的 events_limit 截断
+    // （R10：展示参数不再影响采集/缓存）
+    for pod in &mut pods {
+        pod.events.truncate(events_limit);
+    }
 
     // sidecar 隐藏（默认）
     if !include_sidecars {
@@ -207,12 +260,15 @@ pub async fn pod_overview(
     });
     pods.truncate(limit);
 
-    let source = if state.runtime().agent_workload_namespace() != "unsupported" {
-        "kubernetes"
+    // R5：后端形态由**采集方声明**（快照携带）——不能用"命名域方法是否
+    // 实现"推断：docker 运行时也实现了该方法（返回 docker:<addr>），
+    // 据此推断会把 docker 标成 kubernetes。
+    let source = if snapshot.source.is_empty() {
+        "unknown".to_string()
     } else {
-        "docker"
+        snapshot.source.clone()
     };
-    let namespace = (source == "kubernetes").then(|| state.runtime().agent_workload_namespace());
+    let namespace = snapshot.namespace.clone();
 
     info!(
         event = "pod_overview.served",
@@ -297,6 +353,8 @@ mod tests {
                 item("c", true, true, 1),
             ],
             degraded: Vec::new(),
+            source: "kubernetes".to_string(),
+            namespace: Some("test".to_string()),
         };
         let s = summarize(&snapshot);
         assert_eq!(s.pods, 3);
@@ -398,6 +456,7 @@ mod tests {
                 reason: "events_list_failed".into(),
                 detail: None,
             }],
+            ..Default::default()
         };
         assert_eq!(snapshot.degraded.len(), 1);
         assert!(snapshot.pods[0].events.is_empty(), "降级时事件为空数组");

@@ -76,6 +76,8 @@ pub struct PodWorkload {
 /// 结构化业务身份（与 `RuntimeContainerInfo` 的槽位语义一致）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PodIdentity {
+    /// 业务场景。可选值：`WebAgentRunner` / `ComputerAgentRunner` /
+    /// `ComputerNormalProject` / `Userapp` / `UserappBuilder`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_type: Option<shared_types::ServiceType>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -169,13 +171,21 @@ pub struct PodHealth {
     pub detail: Option<String>,
 }
 
-/// 一次概览采集的结果：Pod 列表 + 分区降级说明。
+/// 一次概览采集的结果：Pod 列表 + 分区降级说明 + 后端声明。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PodOverviewSnapshot {
     pub pods: Vec<PodOverviewItem>,
     /// 分区级降级（如 events 列取失败）；空 = 全部成功。
     /// **"空数组"与"取不到"必须可区分**——靠这里，不靠猜。
     pub degraded: Vec<PodOverviewDegraded>,
+    /// 后端形态："kubernetes" / "docker"。由**采集方自己声明**——
+    /// 不能从"某个生命周期方法是否实现"推断（docker 运行时也实现了
+    /// 命名域方法，返回 docker:<addr>，据此推断会把 docker 标成 k8s）。
+    #[serde(default)]
+    pub source: String,
+    /// namespace（k8s；docker 为 None）。
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 /// 单个分区降级说明。
@@ -330,6 +340,8 @@ mod tests {
                 obs("b-builder-1", None, Some("132")),
             ],
             degraded: Vec::new(),
+            source: "kubernetes".to_string(),
+            namespace: None,
         };
         let filter = PodOverviewFilter {
             search: Some("builder".to_string()),

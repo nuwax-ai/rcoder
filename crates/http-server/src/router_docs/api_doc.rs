@@ -36,6 +36,7 @@ use crate::handler;
         handler::computer_db_create_database,
         handler::computer_ttyd_proxy,
         handler::pod_count,
+        handler::pod_overview,
         handler::pod_list,
         handler::pod_ensure,
         handler::pod_keepalive,

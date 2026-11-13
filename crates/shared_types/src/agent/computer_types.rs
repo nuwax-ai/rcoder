@@ -452,7 +452,9 @@ pub struct ComputerPodResourcesResponse {
     #[schema(example = "pod_abc123")]
     pub pod_id: Option<String>,
 
-    /// 实际解析到的业务场景(回显)。
+    /// 实际解析到的业务场景(回显)。可选值：`WebAgentRunner` /
+    /// `ComputerAgentRunner` / `ComputerNormalProject` / `Userapp` /
+    /// `UserappBuilder`。
     ///
     /// 同一个标识符在不同容器族下指向不同容器，调用方应以此字段确认自己看的
     /// 是哪一个族，不要按 `container_name` 前缀猜。
@@ -562,7 +564,9 @@ pub struct ComputerPodResourcesQuery {
     #[schema(example = "pod_abc123")]
     pub pod_id: Option<String>,
 
-    /// 业务场景(容器族)。缺省 `computer-agent-runner`。
+    /// 业务场景(容器族)。缺省 `computer-agent-runner`。可选值：
+    /// `WebAgentRunner` / `ComputerAgentRunner` / `ComputerNormalProject` /
+    /// `Userapp` / `UserappBuilder`。
     ///
     /// **与 `/computer/pod/ensure` 同一套三字段分派**（`service_type` +
     /// `app_id` + `app_stage`，共用 `parse_app_target`，不另立规则）：

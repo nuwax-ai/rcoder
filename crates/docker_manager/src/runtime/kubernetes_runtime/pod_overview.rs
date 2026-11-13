@@ -105,7 +105,10 @@ impl super::KubernetesRuntime {
                     .collect();
                 // group_events_by_pod 的契约：输入倒序（截断到 limit 时保留的
                 // 才是"最近"的）。k8s list 返回任意顺序，必须显式排。
-                infos.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                // **按解析后的时间值排，不能按字符串**：lastTimestamp 的
+                // ":00Z" 与 eventTime 的 ":00.1Z" 同秒时后者更新，但 'Z' 的
+                // 字典序会让前者靠前（留旧弃新）。解析失败的无时间事件排最后。
+                infos.sort_by_key(|e| std::cmp::Reverse(event_sort_key(e)));
                 group_events_by_pod(&infos, events_limit)
             }
             Err(e) => {
@@ -155,6 +158,8 @@ impl super::KubernetesRuntime {
         Ok(PodOverviewSnapshot {
             pods: items,
             degraded,
+            source: "kubernetes".to_string(),
+            namespace: Some(self.namespace.clone()),
         })
     }
 }
@@ -182,12 +187,61 @@ fn workload_from_owner(pod: &Pod) -> Option<PodWorkload> {
     })
 }
 
-/// ready + 健康（复用抽取后的纯函数 `pod_container_diagnostic`，主容器名自适应）。
+/// ready + 健康（复用抽取后的纯函数 `pod_container_diagnostic`）。
+///
+/// 选取规则（复审 R8 修正）：
+/// 1. **主容器名先从 spec.containers 选**（`agent` > `app` > `rcoder` > 第一个），
+///    再按名字到 containerStatuses 里查——两个列表顺序可能不同，直接
+///    `statuses.first()` 会把健康 sidecar 当主容器；
+/// 2. **阻塞中的 init 容器优先**：init 还在重启/CrashLoop 时，Pod 的真实
+///    状态就是 init 的状态（这正是 Init:CrashLoopBackOff 要排查的根因）；
+///    正常完成的 init 不覆盖主容器健康。
 fn pod_health_from_status(pod: &Pod) -> (bool, PodHealth) {
-    let statuses = pod
-        .status
-        .as_ref()
-        .and_then(|s| s.container_statuses.as_ref());
+    let status = pod.status.as_ref();
+    let main_name = main_container_name_from_spec(pod);
+    let statuses = status.and_then(|s| s.container_statuses.as_ref());
+    let init_statuses = status.and_then(|s| s.init_container_statuses.as_ref());
+
+    // ① 阻塞 init：有 waiting 原因（非空）或最近终止异常的 init 容器
+    let blocking_init = init_statuses.and_then(|inits| {
+        inits.iter().find(|cs| {
+            let waiting = cs
+                .state
+                .as_ref()
+                .and_then(|st| st.waiting.as_ref())
+                .and_then(|w| w.reason.as_deref())
+                .is_some_and(|r| !r.is_empty());
+            let terminated_bad = cs
+                .last_state
+                .as_ref()
+                .and_then(|st| st.terminated.as_ref())
+                .is_some();
+            waiting || terminated_bad
+        })
+    });
+    if let Some(cs) = blocking_init {
+        let diagnostic = pod_container_diagnostic(cs);
+        let oom_killed_last = diagnostic.is_oom();
+        let ready = false; // init 未完成 → pod 必然未就绪
+        return (
+            ready,
+            PodHealth {
+                restart_count: diagnostic.restart_count,
+                restart_source: "container_status".to_string(),
+                last_terminate_reason: diagnostic.last_terminate_reason,
+                last_exit_code: diagnostic.last_exit_code,
+                oom_killed_last,
+                waiting_reason: diagnostic.waiting_reason,
+                detail: Some(format!(
+                    "init container {}: {}",
+                    cs.name,
+                    diagnostic.detail.unwrap_or_default()
+                )),
+            },
+        );
+    }
+
+    // ② 主容器：spec 选名 → 按名查状态
     let Some(statuses) = statuses else {
         return (
             false,
@@ -198,7 +252,10 @@ fn pod_health_from_status(pod: &Pod) -> (bool, PodHealth) {
             },
         );
     };
-    let main = main_container_status(statuses).cloned();
+    let main = main_name
+        .as_deref()
+        .and_then(|name| statuses.iter().find(|c| c.name == name))
+        .or_else(|| statuses.first());
     let Some(cs) = main else {
         return (
             false,
@@ -209,7 +266,7 @@ fn pod_health_from_status(pod: &Pod) -> (bool, PodHealth) {
             },
         );
     };
-    let diagnostic = pod_container_diagnostic(&cs);
+    let diagnostic = pod_container_diagnostic(cs);
     let oom_killed_last = diagnostic.is_oom();
     let ready = cs.ready;
     (
@@ -226,16 +283,15 @@ fn pod_health_from_status(pod: &Pod) -> (bool, PodHealth) {
     )
 }
 
-/// 主容器：`agent` > `app` > `rcoder` > 第一个（与方案 §6.2 一致）。
-fn main_container_status<'a>(
-    statuses: &'a [k8s_openapi::api::core::v1::ContainerStatus],
-) -> Option<&'a k8s_openapi::api::core::v1::ContainerStatus> {
+/// 主容器名（从 **spec** 选，与状态列表解耦）：`agent` > `app` > `rcoder` > 第一个。
+fn main_container_name_from_spec(pod: &Pod) -> Option<String> {
+    let spec = pod.spec.as_ref()?;
     for name in ["agent", "app", "rcoder"] {
-        if let Some(cs) = statuses.iter().find(|c| c.name == name) {
-            return Some(cs);
+        if let Some(c) = spec.containers.iter().find(|c| c.name == name) {
+            return Some(c.name.clone());
         }
     }
-    statuses.first()
+    spec.containers.first().map(|c| c.name.clone())
 }
 
 /// 主容器规格 + 逐容器规格 + 卷。
@@ -314,14 +370,13 @@ fn pod_spec(pod: &Pod, pvc_capacity: &HashMap<String, i64>) -> PodResourcesSpec 
         }
     }
     // 主容器的 volumeMounts → mount_path
-    if let Some(main_name) = main.map(|m| m.name.clone()) {
-        if let Some(container) = spec.containers.iter().find(|c| c.name == main_name) {
-            if let Some(mounts) = &container.volume_mounts {
-                for mount in mounts {
-                    if let Some(vol) = volumes.iter_mut().find(|v| v.name == mount.name) {
-                        vol.mount_path = Some(mount.mount_path.clone());
-                    }
-                }
+    if let Some(main_name) = main.map(|m| m.name.clone())
+        && let Some(container) = spec.containers.iter().find(|c| c.name == main_name)
+        && let Some(mounts) = &container.volume_mounts
+    {
+        for mount in mounts {
+            if let Some(vol) = volumes.iter_mut().find(|v| v.name == mount.name) {
+                vol.mount_path = Some(mount.mount_path.clone());
             }
         }
     }
@@ -376,4 +431,139 @@ fn main_container_resources<'a>(
         .find(|name| spec.containers.iter().any(|c| c.name == *name))
         .or_else(|| spec.containers.first().map(|c| c.name.as_str()))?;
     containers.iter().find(|c| c.name == main_name)
+}
+
+/// 事件排序键：解析 RFC3339 为时间值；解析失败 → 最小值（排最后）。
+fn event_sort_key(event: &AppEventInfo) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+}
+
+#[cfg(test)]
+mod overview_tests {
+    use super::*;
+
+    /// 构造最小 Pod（spec 容器列表 + 可选 init/主容器状态）。
+    fn pod_with(
+        spec_names: &[&str],
+        statuses: &[(&str, bool, u32, &str)],          // (name, ready, restarts, last_reason)
+        init_statuses: &[(&str, &str)],                // (name, waiting_reason)
+    ) -> Pod {
+        let mut pod = Pod::default();
+        let mut spec = k8s_openapi::api::core::v1::PodSpec::default();
+        for name in spec_names {
+            let mut c = k8s_openapi::api::core::v1::Container::default();
+            c.name = name.to_string();
+            spec.containers.push(c);
+        }
+        pod.spec = Some(spec);
+        let mut status = k8s_openapi::api::core::v1::PodStatus::default();
+        status.phase = Some("Pending".to_string());
+        let mk_cs = |name: &str, ready: bool, restarts: u32, reason: &str| {
+            let mut cs = k8s_openapi::api::core::v1::ContainerStatus::default();
+            cs.name = name.to_string();
+            cs.ready = ready;
+            cs.restart_count = restarts as i32;
+            if !reason.is_empty() {
+                let mut term = k8s_openapi::api::core::v1::ContainerStateTerminated::default();
+                term.reason = Some(reason.to_string());
+                term.exit_code = 137;
+                let mut last = k8s_openapi::api::core::v1::ContainerState::default();
+                last.terminated = Some(term);
+                cs.last_state = Some(last);
+            }
+            cs
+        };
+        let mut main = Vec::new();
+        for (name, ready, restarts, reason) in statuses {
+            main.push(mk_cs(name, *ready, *restarts, reason));
+        }
+        status.container_statuses = Some(main);
+        let mut inits = Vec::new();
+        for (name, waiting) in init_statuses {
+            let mut cs = mk_cs(name, false, 6, "OOMKilled");
+            if !waiting.is_empty() {
+                let mut w = k8s_openapi::api::core::v1::ContainerStateWaiting::default();
+                w.reason = Some(waiting.to_string());
+                let mut state = k8s_openapi::api::core::v1::ContainerState::default();
+                state.waiting = Some(w);
+                cs.state = Some(state);
+            }
+            inits.push(cs);
+        }
+        status.init_container_statuses = Some(inits);
+        pod.status = Some(status);
+        pod
+    }
+
+    /// R8：阻塞 init 容器（重启 6 次 + OOMKilled + CrashLoopBackOff）必须
+    /// 反映到健康——这正是 Init:CrashLoopBackOff 要排查的根因。
+    #[test]
+    fn blocking_init_container_surfaces_in_health() {
+        let pod = pod_with(&["app"], &[("app", false, 0, "")], &[("init-db", "CrashLoopBackOff")]);
+        let (ready, health) = pod_health_from_status(&pod);
+        assert!(!ready);
+        assert_eq!(health.restart_count, 6, "init 的重启数要浮出来");
+        assert!(health.oom_killed_last, "init 的 OOMKilled 要浮出来");
+        assert_eq!(health.waiting_reason.as_deref(), Some("CrashLoopBackOff"));
+        assert!(
+            health.detail.as_deref().is_some_and(|d| d.contains("init")),
+            "detail 要注明是 init 容器: {:?}",
+            health.detail
+        );
+    }
+
+    /// R8：spec 与 containerStatuses 顺序不同时，主容器按 **spec** 选——
+    /// 不能把 statuses.first()（健康 sidecar）当主容器。
+    #[test]
+    fn main_container_follows_spec_order_not_status_order() {
+        // spec: [db, sidecar]；statuses: [sidecar(ready), db(OOM+重启6)]
+        let pod = pod_with(
+            &["db", "sidecar"],
+            &[("sidecar", true, 0, ""), ("db", false, 6, "OOMKilled")],
+            &[],
+        );
+        let (ready, health) = pod_health_from_status(&pod);
+        assert!(!ready, "主容器 db 未就绪，不能报 ready");
+        assert_eq!(health.restart_count, 6);
+        assert!(health.oom_killed_last);
+    }
+
+    /// 正常完成的 init（无 waiting、无异常 lastState）不覆盖主容器健康。
+    #[test]
+    fn completed_init_does_not_override_main() {
+        let mut pod = pod_with(&["app"], &[("app", true, 0, "")], &[("init-ok", "")]);
+        // 把 init 的异常 lastState 清掉（模拟成功完成）
+        if let Some(status) = pod.status.as_mut() {
+            if let Some(inits) = status.init_container_statuses.as_mut() {
+                inits[0].last_state = None;
+                inits[0].restart_count = 0;
+            }
+        }
+        let (ready, health) = pod_health_from_status(&pod);
+        assert!(ready, "主容器 ready");
+        assert_eq!(health.restart_count, 0);
+        assert!(health.detail.is_none() || !health.detail.unwrap().contains("init"));
+    }
+
+    /// R9：":00Z" 与 ":00.1Z" 同秒——字符串字典序会把 Z 排在数字前
+    /// （留旧弃新），按解析后的时间值排才正确。
+    #[test]
+    fn subsecond_timestamp_sorts_by_parsed_value() {
+        let mk = |ts: &str| AppEventInfo {
+            event_type: "Normal".into(),
+            reason: "Started".into(),
+            message: String::new(),
+            timestamp: ts.into(),
+            object: "p".into(),
+            count: 1,
+        };
+        let mut events = vec![mk("2026-11-13T10:00:00Z"), mk("2026-11-13T10:00:00.1Z")];
+        events.sort_by_key(|e| std::cmp::Reverse(event_sort_key(e)));
+        assert_eq!(
+            events[0].timestamp, "2026-11-13T10:00:00.1Z",
+            "同秒的 .1Z 更新，必须排前面"
+        );
+    }
 }
