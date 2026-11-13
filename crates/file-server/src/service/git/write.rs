@@ -625,11 +625,19 @@ pub fn commit_indexed(
     author_name: &str,
     author_email: &str,
 ) -> AppResult<String> {
-    let mut index = repo
-        .open_index()
-        .map_err(|e| map_git_err(e, "git open_index"))?;
-    // 历史毒化修复: 独立提交入口 (ops 链) 同样不得被保留名条目卡死。
-    purge_reserved_git_entries(&mut index, repo_path_protection_options(repo)?);
+    // 历史毒化修复: 锁内读-清-按需落盘 (codex 复审 543bd91f: 只清内存会让
+    // 磁盘 index 永远带着坏条目, 重开仓库 status 仍显示待提交)。无修复
+    // 内容时保持原语义 (不取写路径, 不重写 index)。
+    let mut index = {
+        let lock = acquire_index_lock(repo)?;
+        let mut index = repo
+            .open_index()
+            .map_err(|e| map_git_err(e, "git open_index"))?;
+        if purge_reserved_git_entries(&mut index, repo_path_protection_options(repo)?) {
+            lock.commit_index(&mut index)?;
+        }
+        index
+    };
     assert_no_unresolved_conflicts(&index)?;
     let tree_id = tree_id_from_index(repo, &index)?;
     // unborn → root commit（合法首提交）；head() 真错误传播，不吞成"无 parent"
@@ -1653,6 +1661,57 @@ mod tests {
                 .expect("tree")
                 .lookup_entry_by_path(".git/config")
                 .expect("lookup")
+                .is_none(),
+            "提交树不得包含毒化条目"
+        );
+    }
+
+    /// commit_indexed 的毒化修复必须**落盘** (codex 复审 543bd91f): 只清
+    /// 内存会让磁盘 index 永远带着坏条目 —— 重开仓库后 status 仍显示待
+    /// 提交。断言按复审建议: 重开后磁盘 index 无保留名条目、正常暂存
+    /// 内容进入提交、get_status 不再呈现元数据条目。
+    #[test]
+    fn poisoned_index_commit_indexed_persists_repair() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        std::fs::write(test.0.join("b.txt"), "b").expect("write b");
+        let repo = test.open();
+        stage_files(&repo, &["b.txt".to_string()]).expect("stage b");
+        {
+            let lock = acquire_index_lock(&repo).expect("lock");
+            let mut index = repo.open_index().expect("index");
+            index.dangerously_push_entry(
+                Stat::default(),
+                ObjectId::empty_tree(gix::hash::Kind::Sha1),
+                Flags::empty(),
+                IndexMode::FILE,
+                gix::bstr::ByteSlice::as_bstr(b".git/config"),
+            );
+            index.sort_entries();
+            lock.commit_index(&mut index).expect("write poisoned index");
+        }
+        let hash =
+            commit_indexed(&repo, "c", "T", "t@e.c").expect("独立提交入口必须从毒化 index 恢复");
+        // 重开仓库: 磁盘 index 已修复 (不是只清了内存副本)
+        let repo = test.open();
+        assert_no_dotgit_entries(&repo);
+        let st = get_status(&repo).expect("status");
+        assert!(
+            !st.staged.iter().any(|p| p.starts_with(".git/")),
+            "status 不得再呈现保留名条目: {:?}",
+            st.staged
+        );
+        let commit = repo
+            .find_commit(ObjectId::from_hex(hash.as_bytes()).expect("parse"))
+            .expect("find");
+        let tree = commit.tree().expect("tree");
+        assert!(
+            tree.lookup_entry_by_path("b.txt").expect("lk").is_some(),
+            "正常暂存的 b.txt 必须进入提交"
+        );
+        assert!(
+            tree.lookup_entry_by_path(".git/config")
+                .expect("lk")
                 .is_none(),
             "提交树不得包含毒化条目"
         );
