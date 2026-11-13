@@ -202,7 +202,12 @@ fn pod_health_from_status(pod: &Pod) -> (bool, PodHealth) {
     let statuses = status.and_then(|s| s.container_statuses.as_ref());
     let init_statuses = status.and_then(|s| s.init_container_statuses.as_ref());
 
-    // ① 阻塞 init：有 waiting 原因（非空）或最近终止异常的 init 容器
+    // ① 阻塞 init 的三种形态都要抓到：
+    //    a) waiting 有原因（CrashLoopBackOff / PodInitializing 后的异常重启中）；
+    //    b) last_state.terminated（重启过——上次终止无论成败都说明 init 没一次过）；
+    //    c) state.terminated 且 reason != "Completed"（restartPolicy=Never 下
+    //       init 失败直接 Failed：无 waiting、无 last_state，不看这条会漏诊）。
+    //    正常完成的 init（state.terminated.reason == "Completed"）不算阻塞。
     let blocking_init = init_statuses.and_then(|inits| {
         inits.iter().find(|cs| {
             let waiting = cs
@@ -211,12 +216,17 @@ fn pod_health_from_status(pod: &Pod) -> (bool, PodHealth) {
                 .and_then(|st| st.waiting.as_ref())
                 .and_then(|w| w.reason.as_deref())
                 .is_some_and(|r| !r.is_empty());
-            let terminated_bad = cs
+            let restarted = cs
                 .last_state
                 .as_ref()
                 .and_then(|st| st.terminated.as_ref())
                 .is_some();
-            waiting || terminated_bad
+            let failed_terminated = cs
+                .state
+                .as_ref()
+                .and_then(|st| st.terminated.as_ref())
+                .is_some_and(|t| t.reason.as_deref() != Some("Completed"));
+            waiting || restarted || failed_terminated
         })
     });
     if let Some(cs) = blocking_init {
@@ -447,61 +457,78 @@ mod overview_tests {
     /// 构造最小 Pod（spec 容器列表 + 可选 init/主容器状态）。
     fn pod_with(
         spec_names: &[&str],
-        statuses: &[(&str, bool, u32, &str)],          // (name, ready, restarts, last_reason)
-        init_statuses: &[(&str, &str)],                // (name, waiting_reason)
+        statuses: &[(&str, bool, u32, &str)], // (name, ready, restarts, last_reason)
+        init_statuses: &[(&str, &str)],       // (name, waiting_reason)
     ) -> Pod {
-        let mut pod = Pod::default();
-        let mut spec = k8s_openapi::api::core::v1::PodSpec::default();
-        for name in spec_names {
-            let mut c = k8s_openapi::api::core::v1::Container::default();
-            c.name = name.to_string();
-            spec.containers.push(c);
-        }
-        pod.spec = Some(spec);
-        let mut status = k8s_openapi::api::core::v1::PodStatus::default();
-        status.phase = Some("Pending".to_string());
+        let containers = spec_names
+            .iter()
+            .map(|name| k8s_openapi::api::core::v1::Container {
+                name: name.to_string(),
+                ..Default::default()
+            })
+            .collect();
         let mk_cs = |name: &str, ready: bool, restarts: u32, reason: &str| {
-            let mut cs = k8s_openapi::api::core::v1::ContainerStatus::default();
-            cs.name = name.to_string();
-            cs.ready = ready;
-            cs.restart_count = restarts as i32;
-            if !reason.is_empty() {
-                let mut term = k8s_openapi::api::core::v1::ContainerStateTerminated::default();
-                term.reason = Some(reason.to_string());
-                term.exit_code = 137;
-                let mut last = k8s_openapi::api::core::v1::ContainerState::default();
-                last.terminated = Some(term);
-                cs.last_state = Some(last);
+            let last_state =
+                (!reason.is_empty()).then(|| k8s_openapi::api::core::v1::ContainerState {
+                    terminated: Some(k8s_openapi::api::core::v1::ContainerStateTerminated {
+                        reason: Some(reason.to_string()),
+                        exit_code: 137,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+            k8s_openapi::api::core::v1::ContainerStatus {
+                name: name.to_string(),
+                ready,
+                restart_count: restarts as i32,
+                last_state,
+                ..Default::default()
             }
-            cs
         };
-        let mut main = Vec::new();
-        for (name, ready, restarts, reason) in statuses {
-            main.push(mk_cs(name, *ready, *restarts, reason));
+        let main = statuses
+            .iter()
+            .map(|(name, ready, restarts, reason)| mk_cs(name, *ready, *restarts, reason))
+            .collect();
+        let inits = init_statuses
+            .iter()
+            .map(|(name, waiting)| {
+                let state =
+                    (!waiting.is_empty()).then(|| k8s_openapi::api::core::v1::ContainerState {
+                        waiting: Some(k8s_openapi::api::core::v1::ContainerStateWaiting {
+                            reason: Some(waiting.to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    });
+                let mut cs = mk_cs(name, false, 6, "OOMKilled");
+                cs.state = state;
+                cs
+            })
+            .collect();
+        Pod {
+            spec: Some(k8s_openapi::api::core::v1::PodSpec {
+                containers,
+                ..Default::default()
+            }),
+            status: Some(k8s_openapi::api::core::v1::PodStatus {
+                phase: Some("Pending".to_string()),
+                container_statuses: Some(main),
+                init_container_statuses: Some(inits),
+                ..Default::default()
+            }),
+            ..Default::default()
         }
-        status.container_statuses = Some(main);
-        let mut inits = Vec::new();
-        for (name, waiting) in init_statuses {
-            let mut cs = mk_cs(name, false, 6, "OOMKilled");
-            if !waiting.is_empty() {
-                let mut w = k8s_openapi::api::core::v1::ContainerStateWaiting::default();
-                w.reason = Some(waiting.to_string());
-                let mut state = k8s_openapi::api::core::v1::ContainerState::default();
-                state.waiting = Some(w);
-                cs.state = Some(state);
-            }
-            inits.push(cs);
-        }
-        status.init_container_statuses = Some(inits);
-        pod.status = Some(status);
-        pod
     }
 
     /// R8：阻塞 init 容器（重启 6 次 + OOMKilled + CrashLoopBackOff）必须
     /// 反映到健康——这正是 Init:CrashLoopBackOff 要排查的根因。
     #[test]
     fn blocking_init_container_surfaces_in_health() {
-        let pod = pod_with(&["app"], &[("app", false, 0, "")], &[("init-db", "CrashLoopBackOff")]);
+        let pod = pod_with(
+            &["app"],
+            &[("app", false, 0, "")],
+            &[("init-db", "CrashLoopBackOff")],
+        );
         let (ready, health) = pod_health_from_status(&pod);
         assert!(!ready);
         assert_eq!(health.restart_count, 6, "init 的重启数要浮出来");
@@ -510,6 +537,39 @@ mod overview_tests {
         assert!(
             health.detail.as_deref().is_some_and(|d| d.contains("init")),
             "detail 要注明是 init 容器: {:?}",
+            health.detail
+        );
+    }
+
+    /// init 在 restartPolicy=Never 下失败：state.terminated(reason=Error)、
+    /// 无 waiting、无 last_state——第三种阻塞形态，不看 state.terminated
+    /// 会漏诊（pod Failed 的根因正是这个 init）。
+    #[test]
+    fn failed_init_without_restart_still_surfaces() {
+        let mut pod = pod_with(&["app"], &[("app", false, 0, "")], &[]);
+        // 构造 init：state.terminated(reason=Error)，无 waiting / last_state
+        let init_cs = k8s_openapi::api::core::v1::ContainerStatus {
+            name: "init-never".to_string(),
+            ready: false,
+            restart_count: 0,
+            state: Some(k8s_openapi::api::core::v1::ContainerState {
+                terminated: Some(k8s_openapi::api::core::v1::ContainerStateTerminated {
+                    reason: Some("Error".to_string()),
+                    exit_code: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        if let Some(status) = pod.status.as_mut() {
+            status.init_container_statuses = Some(vec![init_cs]);
+        }
+        let (ready, health) = pod_health_from_status(&pod);
+        assert!(!ready);
+        assert!(
+            health.detail.as_deref().is_some_and(|d| d.contains("init")),
+            "根因要归到 init 容器: {:?}",
             health.detail
         );
     }
@@ -535,11 +595,11 @@ mod overview_tests {
     fn completed_init_does_not_override_main() {
         let mut pod = pod_with(&["app"], &[("app", true, 0, "")], &[("init-ok", "")]);
         // 把 init 的异常 lastState 清掉（模拟成功完成）
-        if let Some(status) = pod.status.as_mut() {
-            if let Some(inits) = status.init_container_statuses.as_mut() {
-                inits[0].last_state = None;
-                inits[0].restart_count = 0;
-            }
+        if let Some(status) = pod.status.as_mut()
+            && let Some(inits) = status.init_container_statuses.as_mut()
+        {
+            inits[0].last_state = None;
+            inits[0].restart_count = 0;
         }
         let (ready, health) = pod_health_from_status(&pod);
         assert!(ready, "主容器 ready");
@@ -559,7 +619,7 @@ mod overview_tests {
             object: "p".into(),
             count: 1,
         };
-        let mut events = vec![mk("2026-11-13T10:00:00Z"), mk("2026-11-13T10:00:00.1Z")];
+        let mut events = [mk("2026-11-13T10:00:00Z"), mk("2026-11-13T10:00:00.1Z")];
         events.sort_by_key(|e| std::cmp::Reverse(event_sort_key(e)));
         assert_eq!(
             events[0].timestamp, "2026-11-13T10:00:00.1Z",
