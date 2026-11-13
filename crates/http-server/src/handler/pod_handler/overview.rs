@@ -105,9 +105,23 @@ pub struct PodOverviewSummary {
 const MAX_EVENTS: usize = 50;
 
 #[derive(Clone)]
+enum CachedObservation {
+    Ok(PodOverviewSnapshot),
+    /// 采集失败的**错误共享**（复审补充项）：重叠的失败请求不各自重打
+    /// 上游——第一条的失败以短 TTL 缓存，后来者在窗口内拿到同一错误。
+    Err(String),
+}
+
+#[derive(Clone)]
 struct OverviewCache {
-    snapshot: PodOverviewSnapshot,
+    observation: CachedObservation,
     ts: std::time::Instant,
+}
+
+impl OverviewCache {
+    fn is_fresh(&self, ttl: u64) -> bool {
+        self.ts.elapsed().as_secs() < ttl
+    }
 }
 
 #[derive(Default)]
@@ -123,6 +137,8 @@ static CACHES: LazyLock<Mutex<HashMap<usize, Arc<CacheCell>>>> =
 /// 缓存 TTL。metrics-server 本身 15~60s 粒度，10s 足够"新鲜"；
 /// 面板轮询在这层被吸收，不会打穿到 k8s API。
 const CACHE_TTL_SECS: u64 = 10;
+/// 采集失败的短 TTL：重叠失败共享同一次观察；窗口过后允许重试。
+const FAILURE_TTL_SECS: u64 = 2;
 
 /// 读缓存（短临界区：Clone 后立即释放）。中毒 → None（当没缓存）。
 fn read_cache(cell: &Arc<CacheCell>) -> Option<OverviewCache> {
@@ -130,9 +146,7 @@ fn read_cache(cell: &Arc<CacheCell>) -> Option<OverviewCache> {
     guard.clone()
 }
 
-async fn snapshot_with_cache(
-    state: &Arc<AppState>,
-) -> Result<(PodOverviewSnapshot, u64), AppError> {
+async fn snapshot_with_cache(state: &Arc<AppState>) -> Result<(CachedObservation, u64), AppError> {
     // runtime 身份 = Arc 指针（同一 runtime 的所有 AppState 共享同一 Arc）
     let runtime = state.runtime().clone();
     // fat pointer（dyn）先转 thin：取数据指针地址做键
@@ -148,41 +162,42 @@ async fn snapshot_with_cache(
             .clone()
     };
 
-    // 快路径：命中新鲜缓存直接返回
+    // 快路径：命中新鲜缓存直接返回（成功 10s / 失败 2s）
     if let Some(cached) = read_cache(&cell)
-        && cached.ts.elapsed().as_secs() < CACHE_TTL_SECS
+        && cached.is_fresh(match cached.observation {
+            CachedObservation::Ok(_) => CACHE_TTL_SECS,
+            CachedObservation::Err(_) => FAILURE_TTL_SECS,
+        })
     {
-        return Ok((cached.snapshot, cached.ts.elapsed().as_secs()));
+        return Ok((cached.observation, cached.ts.elapsed().as_secs()));
     }
 
-    // 单飞：采集锁内双检（并发 miss 只打一次上游）
+    // 单飞：采集锁内双检（并发 miss 只打一次上游；失败结果也被共享）
     let _inflight = cell.inflight.lock().await;
     if let Some(cached) = read_cache(&cell)
-        && cached.ts.elapsed().as_secs() < CACHE_TTL_SECS
+        && cached.is_fresh(match cached.observation {
+            CachedObservation::Ok(_) => CACHE_TTL_SECS,
+            CachedObservation::Err(_) => FAILURE_TTL_SECS,
+        })
     {
-        return Ok((cached.snapshot, cached.ts.elapsed().as_secs()));
+        return Ok((cached.observation, cached.ts.elapsed().as_secs()));
     }
-    let snapshot = runtime
-        .observe_namespace_pods(MAX_EVENTS)
-        .await
-        .map_err(|e| {
+    let observation = match runtime.observe_namespace_pods(MAX_EVENTS).await {
+        Ok(snapshot) => CachedObservation::Ok(snapshot),
+        Err(e) => {
             error!(event = "pod_overview.observe_failed", error = %e, "observe failed");
-            // R12：列表失败 = 503 语义（服务/依赖暂不可用），带结构化 stage
-            AppError::from_code(shared_types::error_codes::ERR_SERVICE_UNAVAILABLE)
-                .with_error_detail(shared_types::ErrorDetail::new(
-                    shared_types::error_codes::ERR_SERVICE_UNAVAILABLE,
-                    "pod.overview.list",
-                    format!("pod overview observation failed: {e}"),
-                ))
-        })?;
+            // 失败也写缓存（短 TTL）：重叠请求共享这次观察，不各自重打
+            CachedObservation::Err(e.to_string())
+        }
+    };
     let entry = OverviewCache {
-        snapshot: snapshot.clone(),
+        observation: observation.clone(),
         ts: std::time::Instant::now(),
     };
     if let Ok(mut guard) = cell.cached.lock() {
         *guard = Some(entry);
     }
-    Ok((snapshot, 0))
+    Ok((observation, 0))
 }
 
 /// 隐藏的内部 sidecar（与方案 §13 决策 2 一致）。
@@ -196,7 +211,7 @@ const SIDECAR_PREFIXES: &[&str] = &["log-shipper", "log-collector"];
     operation_id = "computer_pod_overview",
     params(PodOverviewQuery),
     responses(
-        (status = 200, description = "命名空间内全部 Pod 的规格/健康/事件概览（分区失败以 degraded 标注；10s 缓存）", body = HttpResult<PodOverviewResponse>),
+        (status = 200, description = "命名空间内全部 Pod 的规格/健康/事件概览（分区失败以 degraded 标注；10s 缓存）。事件覆盖边界：k8s Events 默认保留约 1h；docker 只回放最近 256 条事件（即使不足 1h 也可能正常返回，截断时以 degraded(events/docker_events_partial) 标注）", body = HttpResult<PodOverviewResponse>),
         (status = 503, description = "Pod 列表本身失败（没有列表这个查询没有意义）", body = HttpResult<String>)
     )
 )]
@@ -210,10 +225,10 @@ pub async fn pod_overview(
     let limit = params.limit.unwrap_or(500).clamp(1, 1000) as usize;
     let include_sidecars = params.include_sidecars.unwrap_or(false);
 
-    let (snapshot, cache_age) = snapshot_with_cache(&state).await?;
-
-    // R12：非法 service_type 必须明确拒绝——静默变成"无过滤"会把输入错误
-    // 伪装成"返回全集"，调用方以为筛选命中了
+    // F6/R12：**纯输入校验在任何缓存加载/上游 await 之前**——否则后端
+    // 故障时 503 会覆盖本应返回的验证错误（非法参数遇到故障环境返回了
+    // SERVICE_UNAVAILABLE，调用方修不好参数）。静默 .ok() 也不行：会把
+    // 输入错误伪装成"返回全集"。
     let parsed_service_type = match params.service_type.as_deref() {
         None => None,
         Some(raw) => match raw.parse() {
@@ -240,6 +255,23 @@ pub async fn pod_overview(
             }
         },
     };
+
+    let (observation, cache_age) = snapshot_with_cache(&state).await?;
+    let snapshot = match observation {
+        CachedObservation::Ok(snapshot) => snapshot,
+        CachedObservation::Err(error) => {
+            // R12：列表失败 = 503 语义（服务/依赖暂不可用），带结构化 stage
+            return Err(
+                AppError::from_code(shared_types::error_codes::ERR_SERVICE_UNAVAILABLE)
+                    .with_error_detail(shared_types::ErrorDetail::new(
+                        shared_types::error_codes::ERR_SERVICE_UNAVAILABLE,
+                        "pod.overview.list",
+                        format!("pod overview observation failed: {error}"),
+                    )),
+            );
+        }
+    };
+
     // 过滤（内存，快照上）
     let filter = PodOverviewFilter {
         search: params.search.as_deref().map(str::to_string),

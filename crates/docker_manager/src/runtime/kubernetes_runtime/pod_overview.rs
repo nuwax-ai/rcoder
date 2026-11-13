@@ -202,14 +202,24 @@ fn pod_health_from_status(pod: &Pod) -> (bool, PodHealth) {
     let statuses = status.and_then(|s| s.container_statuses.as_ref());
     let init_statuses = status.and_then(|s| s.init_container_statuses.as_ref());
 
-    // ① 阻塞 init 的三种形态都要抓到：
-    //    a) waiting 有原因（CrashLoopBackOff / PodInitializing 后的异常重启中）；
-    //    b) last_state.terminated（重启过——上次终止无论成败都说明 init 没一次过）；
-    //    c) state.terminated 且 reason != "Completed"（restartPolicy=Never 下
-    //       init 失败直接 Failed：无 waiting、无 last_state，不看这条会漏诊）。
-    //    正常完成的 init（state.terminated.reason == "Completed"）不算阻塞。
+    // ① 阻塞 init：**当前执行状态优先**（F1）——先看 init 现在是否已经
+    //    完成/就绪，历史 lastState 单独不能判阻塞：
+    //    - state.terminated.reason == "Completed" → 已完成，不阻塞；
+    //    - cs.ready == true → 运行中的 native sidecar 已就绪，不阻塞；
+    //    - 否则（waiting 有原因 / 上次终止后未恢复 / 一次性失败）→ 阻塞，
+    //      其诊断（重启数/OOM/waiting）浮出到 pod 健康。
+    //    反例教训：完成过的 init 保留旧 lastState（此前 OOM）、ready 的
+    //    sidecar 保留历史——只看历史会把健康 pod 判成未就绪。
     let blocking_init = init_statuses.and_then(|inits| {
         inits.iter().find(|cs| {
+            let current_completed = cs
+                .state
+                .as_ref()
+                .and_then(|st| st.terminated.as_ref())
+                .is_some_and(|t| t.reason.as_deref() == Some("Completed"));
+            if current_completed || cs.ready {
+                return false;
+            }
             let waiting = cs
                 .state
                 .as_ref()
@@ -262,10 +272,25 @@ fn pod_health_from_status(pod: &Pod) -> (bool, PodHealth) {
             },
         );
     };
-    let main = main_name
-        .as_deref()
-        .and_then(|name| statuses.iter().find(|c| c.name == name))
-        .or_else(|| statuses.first());
+    // 主容器名已知但状态缺席：保持未就绪并说明——**不能借用别的容器**
+    // （F2：明知主容器是 db，回退到健康 sidecar 会报 ready=true）。
+    // 只在完全无法确定主名时才退到第一个状态。
+    let main = match main_name.as_deref() {
+        Some(name) => match statuses.iter().find(|c| c.name == name) {
+            Some(cs) => Some(cs),
+            None => {
+                return (
+                    false,
+                    PodHealth {
+                        restart_source: "container_status".to_string(),
+                        detail: Some(format!("main container {name} status not available yet")),
+                        ..Default::default()
+                    },
+                );
+            }
+        },
+        None => statuses.first(),
+    };
     let Some(cs) = main else {
         return (
             false,
@@ -537,6 +562,63 @@ mod overview_tests {
         assert!(
             health.detail.as_deref().is_some_and(|d| d.contains("init")),
             "detail 要注明是 init 容器: {:?}",
+            health.detail
+        );
+    }
+
+    /// F1：已完成的 init 保留旧 lastState（此前 OOM）不得判阻塞——
+    /// 主容器 Running/ready 必须原样透出。
+    #[test]
+    fn completed_init_with_history_does_not_block() {
+        let mut pod = pod_with(&["app"], &[("app", true, 0, "")], &[("init-x", "")]);
+        // init：当前 state.terminated=Completed/exit=0/ready=true，
+        // lastState 保留旧 OOM（pod_with 的 mk_cs 会设 last_state）
+        if let Some(status) = pod.status.as_mut()
+            && let Some(inits) = status.init_container_statuses.as_mut()
+        {
+            inits[0].state = Some(k8s_openapi::api::core::v1::ContainerState {
+                terminated: Some(k8s_openapi::api::core::v1::ContainerStateTerminated {
+                    reason: Some("Completed".to_string()),
+                    exit_code: 0,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            inits[0].ready = true;
+        }
+        let (ready, health) = pod_health_from_status(&pod);
+        assert!(ready, "主容器 ready，完成 init 的历史不覆盖");
+        assert!(!health.oom_killed_last);
+        assert_eq!(health.restart_count, 0);
+    }
+
+    /// F1：ready 的 native sidecar（restartPolicy=Always init）保留旧 OOM
+    /// lastState——同样不得判阻塞。
+    #[test]
+    fn ready_native_sidecar_with_history_does_not_block() {
+        let mut pod = pod_with(&["app"], &[("app", true, 0, "")], &[("sidecar-init", "")]);
+        // sidecar：当前 Running/ready=true，lastState 留旧 OOM（mk_cs 默认）
+        if let Some(status) = pod.status.as_mut()
+            && let Some(inits) = status.init_container_statuses.as_mut()
+        {
+            inits[0].ready = true;
+            // state 留空 = Running（无 terminated/waiting）
+        }
+        let (ready, health) = pod_health_from_status(&pod);
+        assert!(ready, "主容器 ready，就绪 sidecar 的历史不覆盖");
+        assert!(!health.oom_killed_last);
+    }
+
+    /// F2：主容器名已知（spec 里有 db）但状态缺席——保持未就绪并说明，
+    /// 不得借用健康 sidecar 报 ready=true。
+    #[test]
+    fn missing_main_status_does_not_borrow_sidecar() {
+        let pod = pod_with(&["db", "sidecar"], &[("sidecar", true, 0, "")], &[]);
+        let (ready, health) = pod_health_from_status(&pod);
+        assert!(!ready, "主容器 db 无状态 → 未就绪");
+        assert!(
+            health.detail.as_deref().is_some_and(|d| d.contains("db")),
+            "detail 要点名缺席的主容器: {:?}",
             health.detail
         );
     }
