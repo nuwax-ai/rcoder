@@ -86,37 +86,93 @@ fn expand_stage_paths(
             let index = staged_index(repo, index_once)?;
             collect_missing_dir_entries(index, workdir, &rel_request, seen, out)?;
         }
-        Ok(_) => out.push(worktree_path.to_string()),
+        // 相对请求推 clean 后的相对形态, 绝对请求 (文件/缺失路径) 转相对:
+        // 下游 index 命名与范围判定都按相对口径 (codex 复审 P2)。
+        Ok(_) => out.push(rel_request.clone()),
         // 路径不存在: 已删除的文件 (index 同名条目由单路径入列覆盖;
         // 前缀范围查询对同名条目无副作用) 或**已整体删除的目录**
         // (codex 边界: 此前进不了目录收集分支, 请求 ["dir"] 对子树
         // 删除永远无变更) —— 按前缀范围收集 index 内子条目的删除。
         Err(_) => {
-            out.push(worktree_path.to_string());
             let index = staged_index(repo, index_once)?;
             collect_missing_dir_entries(index, workdir, &rel_request, seen, out)?;
+            out.push(rel_request);
         }
     }
     Ok(())
 }
 
-/// 路径任一组件命中 Git 保留元数据名 (`.git` 及大小写折叠 / HFS+ 忽略
-/// 码点 / NTFS `git~1` 等别名) → true。
-///
-/// 复用 gix 官方 [`gix::validate`] 的组件校验, 与 tree editor 拒绝
-/// `.git` 的规则同源 (gix-validate 0.13); **只消费 DotGitDir 一类** ——
-/// Windows 保留名 / 非法字符等其他校验错误维持既有行为, 不在此静默丢
-/// 文件。原生 git 对这类 pathspec 同样整体豁免 (实测 `git add .git` /
-/// `.git/config` / Linux 下 `.GIT` 均 exit 0 或 invalid path, 不产生
-/// index 条目)。
-fn path_has_reserved_git_component(path: &BStr) -> bool {
-    let options = gix::validate::path::component::Options::default();
+/// 与仓库实际策略一致的路径保护选项 —— 复用官方 [`Repository::checkout_options`]
+/// 携带的 validate 配置 (gix 同源构造: `core.protectHFS` 默认仅 macOS,
+/// `core.protectNTFS` 默认恒开, `gitoxide.core.protectWindows` 默认仅
+/// Windows)。不用 `Options::default()` 的全平台保护: 那会在
+/// `protectHFS=false` 的仓库静默忽略原生 git 可正常暂存的 HFS 别名文件
+/// (codex 复审 P2)。
+fn repo_path_protection_options(
+    repo: &Repository,
+) -> AppResult<gix::validate::path::component::Options> {
+    let options = repo
+        .checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)
+        .map_err(|e| map_git_err(e, "git checkout options"))?;
+    Ok(options.validate)
+}
+
+/// 路径任一组件命中 Git 保留元数据名 (`.git` 及配置启用的折叠/别名) →
+/// true。规则与 tree editor 同源; 只识别 DotGitDir 一类 —— 其他校验错误
+/// (Windows 保留名等) 维持既有行为, 不在此静默丢文件。
+fn path_has_reserved_git_component(
+    path: &BStr,
+    options: gix::validate::path::component::Options,
+) -> bool {
     path.split(|b| *b == b'/').any(|component| {
         matches!(
             gix::validate::path::component(component.as_bstr(), None, options),
             Err(gix::validate::path::component::Error::DotGitDir)
         )
     })
+}
+
+/// 全量清除 index 内已有的保留名条目 (历史毒化的受控修复, codex 复审:
+/// 只请求命中坏条目才清理不够, 无关文件提交也必须能恢复) —— 只删保留名
+/// 条目, 其余暂存内容不动。返回是否有删除。
+fn purge_reserved_git_entries(
+    index: &mut gix::index::File,
+    options: gix::validate::path::component::Options,
+) -> bool {
+    let reserved: HashSet<BString> = {
+        let backing = index.path_backing();
+        index
+            .entries()
+            .iter()
+            .filter(|e| e.stage() == Stage::Unconflicted)
+            .map(|e| e.path_in(backing).to_owned())
+            .filter(|p| path_has_reserved_git_component(p.as_bstr(), options))
+            .collect()
+    };
+    if reserved.is_empty() {
+        return false;
+    }
+    // 保留名条目按路径移除 (冲突阶段的同路径条目同为保留名, 一并清除)
+    index.remove_entries(|_, p, _| reserved.contains(p));
+    true
+}
+
+/// 请求路径 → 工作区相对规范键 (codex 复审 P2: 范围判定与展开层同口径)。
+/// 相对路径直接词法归一 (130k 热路径零额外开销); 工作区内**绝对路径**先过
+/// `ensure_within` 安全边界 (放行 base 内, 拒绝越界) 再转相对。
+fn worktree_relative_key(workdir: &Path, path: &str) -> AppResult<String> {
+    let wire = crate::path_safety::host_relative_to_wire(path);
+    if Path::new(&wire).is_absolute() {
+        let abs = crate::path_safety::ensure_within(workdir, path)?;
+        let rel = abs
+            .strip_prefix(workdir)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+            .ok_or_else(|| AppError::validation("git path is outside worktree"))?;
+        normalize_relative_path(&rel)
+    } else {
+        normalize_relative_path(path)
+    }
 }
 
 /// 整批共享的 index 懒加载: 首个需要缺失条目收集的路径读一次,
@@ -231,6 +287,7 @@ pub fn stage_files(repo: &Repository, files: &[String]) -> AppResult<()> {
     stage_paths_with_probe(repo, &mut index, &paths, |path| {
         gix::index::fs::Metadata::from_path_no_follow(path)
     })?;
+    purge_reserved_git_entries(&mut index, repo_path_protection_options(repo)?);
     lock.commit_index(&mut index)
 }
 
@@ -296,6 +353,7 @@ fn stage_paths_with_probe(
     let stat_options = repo
         .stat_options()
         .map_err(|e| map_git_err(e, "git stat options"))?;
+    let validate_options = repo_path_protection_options(repo)?;
     let index_timestamp = index.timestamp();
     let mut new_entries: Vec<(Stat, ObjectId, IndexMode, BString)> = Vec::new();
     let mut deleted: HashSet<BString> = HashSet::new();
@@ -316,16 +374,8 @@ fn stage_paths_with_probe(
         let bstr_path: &BStr = bstr_owned.as_ref();
         // 统一边界 (codex 复审 P1): 保留名路径**无论来自显式请求还是目录
         // 展开**都不得进入 index —— 对齐 git add 的静默忽略。index 里已有
-        // 该形态条目 (旧版写入的毒化) 时按删除修复: 只清这些条目, 其余
-        // 暂存内容不动。
-        if path_has_reserved_git_component(bstr_path) {
-            if index
-                .entry_by_path_and_stage(bstr_path, Stage::Unconflicted)
-                .is_some()
-            {
-                deleted.insert(bstr_owned);
-                dirty = true;
-            }
+        // 毒化条目的清理由调用方全量 purge 完成 (purge_reserved_git_entries)。
+        if path_has_reserved_git_component(bstr_path, validate_options) {
             continue;
         }
         // NotFound = 文件确已删除 → 从 index 移除（对齐 git add 删档语义）；
@@ -575,9 +625,11 @@ pub fn commit_indexed(
     author_name: &str,
     author_email: &str,
 ) -> AppResult<String> {
-    let index = repo
+    let mut index = repo
         .open_index()
         .map_err(|e| map_git_err(e, "git open_index"))?;
+    // 历史毒化修复: 独立提交入口 (ops 链) 同样不得被保留名条目卡死。
+    purge_reserved_git_entries(&mut index, repo_path_protection_options(repo)?);
     assert_no_unresolved_conflicts(&index)?;
     let tree_id = tree_id_from_index(repo, &index)?;
     // unborn → root commit（合法首提交）；head() 真错误传播，不吞成"无 parent"
@@ -656,6 +708,9 @@ pub fn stage_and_commit(
             gix::index::fs::Metadata::from_path_no_follow(path)
         })?;
     }
+    // 历史毒化修复 (codex 复审): 与请求无关也要恢复 —— paths 为空的
+    // addAll 提交同样不得被 index 里的保留名条目卡死 tree 构造。
+    staging_dirty |= purge_reserved_git_entries(&mut index, repo_path_protection_options(repo)?);
     assert_no_unresolved_conflicts(&index)?;
     // 锁内捕获 HEAD 状态: parent (发布 CAS 依据); 分支由发布时的 HEAD 透写解析
     let head = repo.head().map_err(|e| map_git_err(e, "git head"))?;
@@ -736,9 +791,14 @@ fn requested_paths_have_staged_changes(
     requested: &[String],
     head_tree: Option<ObjectId>,
 ) -> AppResult<bool> {
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| AppError::system("git repo has no workdir"))?;
+    // 范围键与展开层同口径 (codex 复审 P2): 工作区内绝对路径请求同样
+    // 归一为相对键, 不得在判定处 400。
     let scope: Vec<String> = requested
         .iter()
-        .map(|path| normalize_relative_path(path))
+        .map(|path| worktree_relative_key(workdir, path))
         .collect::<AppResult<Vec<_>>>()?;
     let tree_id = head_tree.unwrap_or_else(|| repo.empty_tree().id().detach());
     // 请求范围判定: 不再用 N 条 :(literal) pathspec 过滤 tree_index_status ——
@@ -1555,6 +1615,124 @@ mod tests {
                 )
                 .is_some(),
             "a.txt 条目必须保留"
+        );
+    }
+
+    /// 历史恢复边界 (codex 复审 ea93a5a4): index 已有毒化条目时, 用户只
+    /// 提交**普通无关文件** (不触碰坏条目) 也必须能成功 —— tree 构造不得
+    /// 再被保留名条目 500 卡死。
+    #[test]
+    fn poisoned_index_unrelated_commit_recovers() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        let repo = test.open();
+        {
+            let lock = acquire_index_lock(&repo).expect("lock");
+            let mut index = repo.open_index().expect("index");
+            index.dangerously_push_entry(
+                Stat::default(),
+                ObjectId::empty_tree(gix::hash::Kind::Sha1),
+                Flags::empty(),
+                IndexMode::FILE,
+                gix::bstr::ByteSlice::as_bstr(b".git/config"),
+            );
+            index.sort_entries();
+            lock.commit_index(&mut index).expect("write poisoned index");
+        }
+        std::fs::write(test.0.join("a.txt"), "two").expect("modify a");
+        let result = stage_and_commit(&repo, &["a.txt".to_string()], "m", "T", "t@e.c")
+            .expect("无关文件提交必须从毒化 index 中恢复, 不得 500");
+        let hash = result.expect("a.txt 真实变更必须提交");
+        let repo = test.open();
+        let commit = repo
+            .find_commit(ObjectId::from_hex(hash.as_bytes()).expect("parse"))
+            .expect("find");
+        assert!(
+            commit
+                .tree()
+                .expect("tree")
+                .lookup_entry_by_path(".git/config")
+                .expect("lookup")
+                .is_none(),
+            "提交树不得包含毒化条目"
+        );
+    }
+
+    /// 绝对路径**完整提交链** (codex 复审 ea93a5a4 P2): 展开层已转相对,
+    /// 范围判定与暂存也必须同口径 —— 绝对文件与绝对目录请求都能完成
+    /// stage_and_commit, 不在 scope 归一处 400。
+    #[test]
+    fn absolute_path_commit_roundtrip() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        std::fs::write(test.0.join("a.txt"), "two").expect("modify a");
+        std::fs::create_dir_all(test.0.join(".github")).expect("mkdir .github");
+        std::fs::write(test.0.join(".github/ci.yml"), "ci").expect("write ci");
+        let repo = test.open();
+        let abs_file = test.0.join("a.txt").to_string_lossy().into_owned();
+        let result = stage_and_commit(&repo, &[abs_file], "file", "T", "t@e.c")
+            .expect("绝对文件请求必须完成提交");
+        assert!(result.is_some(), "a.txt 真实变更必须经绝对路径提交");
+        let abs_dir = test.0.join(".github").to_string_lossy().into_owned();
+        let result = stage_and_commit(&repo, &[abs_dir], "dir", "T", "t@e.c")
+            .expect("绝对目录请求必须完成提交");
+        assert!(result.is_some(), ".github 新文件必须经绝对目录提交");
+        let commit = repo
+            .find_commit(ObjectId::from_hex(result.expect("commit").as_bytes()).expect("parse"))
+            .expect("find");
+        assert!(
+            commit
+                .tree()
+                .expect("tree")
+                .lookup_entry_by_path(".github/ci.yml")
+                .expect("lookup")
+                .is_some(),
+            ".github/ci.yml 必须在提交树中"
+        );
+    }
+
+    /// 保护选项跟随仓库配置 (codex 复审 ea93a5a4 P2): `core.protectHFS=false`
+    /// 的仓库里 HFS 别名文件 (`.g`+U+200C+`it`) 原生 git 可正常暂存, 我们
+    /// 不得用平台全开的 Options::default() 静默忽略; 显式开启时才忽略。
+    #[test]
+    fn hfs_alias_follows_repo_protect_config() {
+        use std::io::Write as _;
+        let alias = ".g\u{200c}it";
+        // 关保护: 正常暂存 (对齐 git 在 protectHFS=false 平台的行为)
+        let test = TestRepo::new();
+        std::fs::write(test.0.join(alias), "x").expect("write alias");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(test.0.join(".git/config"))
+            .expect("open config")
+            .write_all(b"\n[core]\n\tprotectHFS = false\n")
+            .expect("append config");
+        let repo = test.open();
+        stage_files(&repo, &[alias.to_string()]).expect("protectHFS=false 时别名文件必须可暂存");
+        let index = repo.open_index().expect("index");
+        assert!(
+            index
+                .entry_by_path_and_stage(alias.as_bytes().as_bstr(), Stage::Unconflicted)
+                .is_some(),
+            "别名文件必须已暂存"
+        );
+        // 开保护: 静默忽略
+        let test = TestRepo::new();
+        std::fs::write(test.0.join(alias), "x").expect("write alias");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(test.0.join(".git/config"))
+            .expect("open config")
+            .write_all(b"\n[core]\n\tprotectHFS = true\n")
+            .expect("append config");
+        let repo = test.open();
+        stage_files(&repo, &[alias.to_string()]).expect("protectHFS=true 时不得报错");
+        let index = repo.open_index().expect("index");
+        assert!(
+            index
+                .entry_by_path_and_stage(alias.as_bytes().as_bstr(), Stage::Unconflicted)
+                .is_none(),
+            "保护开启时别名文件必须被忽略"
         );
     }
 
