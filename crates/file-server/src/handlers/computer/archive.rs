@@ -52,7 +52,7 @@ pub(crate) async fn zip_workspace(
 /// 下载工作区全部文件
 ///
 /// 对齐 nuwax downloadAllFiles:
-/// 顶层前缀 `${userId}_${cId}/` + 空 zip 兜底 + 100MB 大小上限 + UTF-8 filename* + customTargetDir。
+/// 顶层前缀 `${userId}_${cId}/` + 空 zip 兜底 + 默认 5 GiB 大小上限 + UTF-8 filename* + customTargetDir。
 #[utoipa::path(
     get,
     path = "/download-all-files",

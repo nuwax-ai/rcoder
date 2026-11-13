@@ -6,12 +6,11 @@ use anyhow::{Context, Result, anyhow};
 use shared_types::AGENT_FILE_SERVER_PORT;
 use shared_types::paths::{COMPUTER_WORKSPACE_ROOT, USERAPP_WORKSPACE_ROOT, WORKSPACE_ROOT};
 
-use super::Config;
-use super::DeploymentMode;
 use super::env::{
     MAX_UPLOAD_FILE_SIZE_BYTES, default_attachment_extensions, env_bool, env_list, env_opt_string,
     env_parse, env_str, request_body_max_bytes, validate_request_body_limit, validate_upload_limit,
 };
+use super::{Config, DEFAULT_DOWNLOAD_MAX_FILE_SIZE_BYTES, DeploymentMode};
 
 impl Config {
     /// 二进制默认加载入口：设置 `FILE_SERVER_CONFIG` 时读取 YAML/TOML/JSON，
@@ -235,7 +234,10 @@ impl Config {
             skill_url_allow_http: env_bool("SKILL_URL_ALLOW_HTTP", true)?,
             skill_url_allow_private_networks: env_bool("SKILL_URL_ALLOW_PRIVATE_NETWORKS", true)?,
             skill_url_allowed_hosts: env_list("SKILL_URL_ALLOWED_HOSTS", "")?,
-            download_max_file_size_bytes: env_parse("DOWNLOAD_MAX_FILE_SIZE_BYTES", 104_857_600)?,
+            download_max_file_size_bytes: env_parse(
+                "DOWNLOAD_MAX_FILE_SIZE_BYTES",
+                DEFAULT_DOWNLOAD_MAX_FILE_SIZE_BYTES,
+            )?,
             request_body_max_bytes: request_body_max_bytes(MAX_UPLOAD_FILE_SIZE_BYTES)?,
             log_cache_enabled: env_bool("LOG_CACHE_ENABLED", true)?,
             log_cache_duration_ms: env_parse("LOG_CACHE_DURATION", 180_000)?,
@@ -523,6 +525,7 @@ mod tests {
         assert_eq!(config.port, 60_123);
         assert!(config.git_enabled);
         assert_eq!(config.request_body_max_bytes, MAX_UPLOAD_FILE_SIZE_BYTES);
+        assert_eq!(config.download_max_file_size_bytes, 5 * 1024 * 1024 * 1024);
         assert_eq!(config.service_log_retention_days, 7);
         assert_eq!(config.build_artifact_retain_count, 3);
         assert_eq!(config.build_log_retention_days, 7);

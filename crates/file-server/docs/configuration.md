@@ -10,6 +10,7 @@ project_source_dir: /app/project_workspace
 computer_workspace_dir: /app/computer-project-workspace
 request_body_max_bytes: 1073741824
 upload_max_file_size_bytes: 1073741824
+download_max_file_size_bytes: 5368709120
 git_enabled: true
 git_diff_max_file_size_bytes: 16777216
 git_diff_max_total_bytes: 67108864
@@ -18,6 +19,10 @@ git_file_content_max_bytes: 67108864
 service_log_dir: /app/logs/file-server
 service_log_retention_days: 7
 ```
+
+`download_max_file_size_bytes` 默认为 5 GiB（5,368,709,120 字节），也可通过
+`DOWNLOAD_MAX_FILE_SIZE_BYTES` 环境变量覆盖。它限制 `download-all-files`
+接口过滤后、压缩前的文件总大小，Computer 与 UserApp 共用此限制。
 
 独立二进制按 UTC 日期滚动 `file-server.log`，最多保留 7 个每日日志文件。
 `FILE_SERVER_LOG_DIR` 和 `FILE_SERVER_LOG_RETENTION_DAYS` 可覆盖目录和保留天数，
