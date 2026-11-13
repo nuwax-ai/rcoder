@@ -5,7 +5,7 @@ use std::path::Path;
 
 use gix::Repository;
 use gix::actor::Signature;
-use gix::bstr::{BStr, BString};
+use gix::bstr::{BStr, BString, ByteSlice as _};
 use gix::date::{Time, parse::TimeBuf};
 use gix::hash::ObjectId;
 use gix::index::{
@@ -43,7 +43,9 @@ fn index_bstr_path(worktree_path: &str) -> AppResult<BString> {
 /// stage 单个路径: 文件存在 → 更新/新增 index entry; 不存在 → stage 删除 (对齐 nuwax stageFiles)。
 pub fn stage_path(repo: &Repository, worktree_path: &str) -> AppResult<()> {
     let mut paths = Vec::new();
-    expand_stage_paths(repo, worktree_path, &mut paths)?;
+    let mut index_once = None;
+    let mut seen = HashSet::new();
+    expand_stage_paths(repo, worktree_path, &mut index_once, &mut seen, &mut paths)?;
     // 空目录展开为空 → 无操作; 不能落入 stage_files 的空列表 addAll 语义
     if paths.is_empty() {
         return Ok(());
@@ -56,6 +58,8 @@ pub fn stage_path(repo: &Repository, worktree_path: &str) -> AppResult<()> {
 fn expand_stage_paths(
     repo: &Repository,
     worktree_path: &str,
+    index_once: &mut Option<gix::index::File>,
+    seen: &mut HashSet<BString>,
     out: &mut Vec<String>,
 ) -> AppResult<()> {
     let workdir = repo
@@ -65,19 +69,36 @@ fn expand_stage_paths(
     match std::fs::symlink_metadata(&abs) {
         Ok(metadata) if metadata.is_dir() => {
             collect_stage_paths(workdir, &abs, out)?;
-            collect_missing_dir_entries(repo, worktree_path, out)?;
+            let index = staged_index(repo, index_once)?;
+            collect_missing_dir_entries(index, workdir, worktree_path, seen, out)?;
         }
         Ok(_) => out.push(worktree_path.to_string()),
-        // 路径不存在: 已删除的文件 (index 同名条目由单路径入列覆盖) 或
-        // **已整体删除的目录** (codex 边界: 此前进不了目录收集分支,
-        // 请求 ["dir"] 对子树删除永远无变更) —— 按前缀收集 index 内
-        // 子条目的删除。
+        // 路径不存在: 已删除的文件 (index 同名条目由单路径入列覆盖;
+        // 前缀范围查询对同名条目无副作用) 或**已整体删除的目录**
+        // (codex 边界: 此前进不了目录收集分支, 请求 ["dir"] 对子树
+        // 删除永远无变更) —— 按前缀范围收集 index 内子条目的删除。
         Err(_) => {
             out.push(worktree_path.to_string());
-            collect_missing_dir_entries(repo, worktree_path, out)?;
+            let index = staged_index(repo, index_once)?;
+            collect_missing_dir_entries(index, workdir, worktree_path, seen, out)?;
         }
     }
     Ok(())
+}
+
+/// 整批共享的 index 懒加载: 首个需要缺失条目收集的路径读一次,
+/// 后续复用 (staging 事务随后仍会持锁重读——此处只服务路径展开)。
+fn staged_index<'a>(
+    repo: &Repository,
+    index_once: &'a mut Option<gix::index::File>,
+) -> AppResult<&'a gix::index::File> {
+    if index_once.is_none() {
+        *index_once = Some(
+            repo.open_index()
+                .map_err(|e| map_git_err(e, "git open_index"))?,
+        );
+    }
+    Ok(index_once.as_ref().expect("just populated"))
 }
 
 /// 目录请求补齐**未暂存的删除** (codex 业务缺口): `git add <dir>` 会暂存
@@ -85,42 +106,45 @@ fn expand_stage_paths(
 /// 上没有的条目漏掉后, 请求目录的提交永远不包含这些删除。展开时把这类
 /// 条目一并加入列表, staging 的 NotFound 分支即按删除语义暂存。
 fn collect_missing_dir_entries(
-    repo: &Repository,
+    index: &gix::index::File,
+    workdir: &Path,
     dir_request: &str,
+    seen: &mut HashSet<BString>,
     out: &mut Vec<String>,
 ) -> AppResult<()> {
     let prefix = normalize_relative_path(dir_request)?;
     // 根请求 (`.` → 空前缀) 同样要收集缺失条目 (codex 边界: 此前直接
     // 跳过, 删除跟踪文件后请求 ["."] 返回无变更); 空前缀 = 全部 index
     // 条目都在范围内。
-    let prefix_bstr = BString::from(prefix);
-    let workdir = repo
-        .workdir()
-        .ok_or_else(|| AppError::system("git repo has no workdir"))?;
-    let index = repo
-        .open_index()
-        .map_err(|e| map_git_err(e, "git open_index"))?;
+    //
+    // index 条目按路径字典序排列, `dir/` 前缀的条目连续——**二分定位
+    // 范围起点, 只遍历范围内条目** (codex 复审: 全量线性扫对 K 个缺失
+    // 路径是 O(K×N))。已删除的单文件前缀 (`gone.txt/`) 范围为空,
+    // 二分即返回, 不产生扫描。
+    let prefix_slash: BString = if prefix.is_empty() {
+        BString::default()
+    } else {
+        BString::from(format!("{prefix}/"))
+    };
     let backing = index.path_backing();
-    let mut seen: HashSet<&BStr> = out.iter().map(|p| BStr::new(&**p)).collect();
-    let mut missing = Vec::new();
-    for entry in index.entries() {
-        let path = entry.path_in(backing);
-        let under_dir = prefix_bstr.is_empty()
-            || (path.len() > prefix_bstr.len()
-                && path.starts_with(prefix_bstr.as_ref())
-                && path[prefix_bstr.len()] == b'/');
-        if !under_dir {
-            continue;
+    let entries = index.entries();
+    let start = if prefix_slash.is_empty() {
+        0
+    } else {
+        entries.partition_point(|entry| entry.path_in(backing) < prefix_slash.as_bstr())
+    };
+    for entry in &entries[start..] {
+        let path: &BStr = entry.path_in(backing);
+        if !prefix_slash.is_empty() && !path.starts_with(prefix_slash.as_ref()) {
+            break;
         }
-        if seen.insert(path) {
-            use gix::bstr::ByteSlice as _;
+        if seen.insert(path.to_owned()) {
             let abs = crate::path_safety::ensure_within(workdir, path.to_str_lossy().as_ref())?;
             if std::fs::symlink_metadata(&abs).is_err() {
-                missing.push(path.to_string());
+                out.push(path.to_string());
             }
         }
     }
-    out.extend(missing);
     Ok(())
 }
 
@@ -171,8 +195,13 @@ fn resolve_stage_paths(repo: &Repository, files: &[String]) -> AppResult<Vec<Str
         return collect_status_paths(repo);
     }
     let mut paths = Vec::with_capacity(files.len());
+    // index 懒加载 + 整批共享 (codex 复审: 此前每个缺失路径重开重扫
+    // 全量 index, K 个删除路径 × N 条目 = O(K×N); 微基准 2000 缺失
+    // 路径 8.2s, 翻倍四倍)。纯现存文件的请求一次都不开。
+    let mut index_once: Option<gix::index::File> = None;
+    let mut seen: HashSet<BString> = HashSet::new();
     for f in files {
-        expand_stage_paths(repo, f, &mut paths)?;
+        expand_stage_paths(repo, f, &mut index_once, &mut seen, &mut paths)?;
     }
     Ok(paths)
 }
@@ -1098,6 +1127,63 @@ mod tests {
         assert_eq!(
             mtime0, mtime1,
             "未变更文件重 stage 不得重写 loose 对象 (stat 快路径失效)"
+        );
+    }
+
+    /// codex 复审 P2 回归: 大批量缺失路径不得回到二次开销。此前每个缺失
+    /// 路径重开重扫全量 index (O(K×N), 微基准 2000 缺失 → 8.2s); 现在
+    /// 整批共享一次懒加载 index + 有序前缀二分, 已删除单文件前缀范围为空
+    /// 即返回。本例为形态回归: 1000 个已删除文件 + 1000 现存文件的显式
+    /// 列表一次 stage, 全部删除正确入列且必须在秒级内完成。
+    #[test]
+    fn batch_stage_with_many_missing_paths_stays_linear() {
+        let test = TestRepo::new();
+        std::fs::create_dir_all(test.0.join("gone")).expect("mkdir gone");
+        std::fs::create_dir_all(test.0.join("keep")).expect("mkdir keep");
+        let mut all = Vec::new();
+        for i in 0..1000 {
+            std::fs::write(test.0.join(format!("gone/g{i:04}.txt")), "x").expect("w");
+            std::fs::write(test.0.join(format!("keep/k{i:04}.txt")), "x").expect("w");
+            all.push(format!("gone/g{i:04}.txt"));
+            all.push(format!("keep/k{i:04}.txt"));
+        }
+        // 单次提交入库 (2000 次独立 commit 的夹具成本会让测试分钟级)
+        let repo = test.open();
+        stage_files(&repo, &all).expect("stage fixture");
+        commit_indexed(&repo, "seed", "T", "t@e.c").expect("commit fixture");
+        let mut files = Vec::new();
+        for i in 0..1000 {
+            std::fs::remove_file(test.0.join(format!("gone/g{i:04}.txt"))).expect("rm");
+            files.push(format!("gone/g{i:04}.txt"));
+            files.push(format!("keep/k{i:04}.txt"));
+        }
+        let t0 = std::time::Instant::now();
+        stage_files(&repo, &files).expect("stage mixed missing/existing");
+        let elapsed = t0.elapsed();
+        // 2000 路径 + 1000 缺失: 二次实现此规模本地也需 ~2s+, 线性实现
+        // 应在 1s 内 (留足 CI 余量; 形态断言为主)。
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "批量缺失路径 stage 应保持线性, 实测 {elapsed:?}"
+        );
+        let index = repo.open_index().expect("index");
+        assert!(
+            index
+                .entry_by_path_and_stage(
+                    gix::bstr::ByteSlice::as_bstr(b"gone/g0000.txt"),
+                    Stage::Unconflicted,
+                )
+                .is_none(),
+            "缺失文件必须从 index 移除 (删除已暂存)"
+        );
+        assert!(
+            index
+                .entry_by_path_and_stage(
+                    gix::bstr::ByteSlice::as_bstr(b"keep/k0000.txt"),
+                    Stage::Unconflicted,
+                )
+                .is_some(),
+            "现存文件必须保留"
         );
     }
 
