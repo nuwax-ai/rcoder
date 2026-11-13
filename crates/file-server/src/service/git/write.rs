@@ -62,6 +62,12 @@ fn expand_stage_paths(
     seen: &mut HashSet<BString>,
     out: &mut Vec<String>,
 ) -> AppResult<()> {
+    // git 语义: 含 `.git` 组件的请求路径**静默忽略** (原生 `git add .git` /
+    // `.git/config` / `./.git` 均 exit 0 且 index 零条目)。此前目录展开会
+    // 走进 .git 收集内部文件, tree 构造拒绝 `.git` 路径组件, 整个提交 500。
+    if request_has_dotgit_component(worktree_path)? {
+        return Ok(());
+    }
     let workdir = repo
         .workdir()
         .ok_or_else(|| AppError::system("git repo has no workdir"))?;
@@ -84,6 +90,23 @@ fn expand_stage_paths(
         }
     }
     Ok(())
+}
+
+/// 请求路径归一后任一组件为 `.git` → true (git add 对 .git 子树整体豁免,
+/// 实测 `git add .git` / `.git/config` / `./.git` 均 exit 0 且 index 零条目)。
+///
+/// 子串预筛避免 130k 全量请求逐条归一: 路径不含 ".git" 子串就不可能有该
+/// 组件, 热路径只付一次扫描; `foo.github.txt` / `.github/ci.yml` 含子串
+/// 但无组件命中, 走完整归一后正常放行。`a/.git/../b.txt` 词法消解后不含
+/// `.git` 组件, 同样放行 (与 git pathspec 清理语义一致)。
+fn request_has_dotgit_component(worktree_path: &str) -> AppResult<bool> {
+    if !worktree_path.contains(".git") {
+        return Ok(false);
+    }
+    let normalized = normalize_relative_path(worktree_path)?;
+    Ok(Path::new(&normalized)
+        .components()
+        .any(|c| c.as_os_str() == std::ffi::OsStr::new(".git")))
 }
 
 /// 整批共享的 index 懒加载: 首个需要缺失条目收集的路径读一次,
@@ -1282,8 +1305,119 @@ mod tests {
         );
     }
 
-    /// racy-git 回归 (codex 复审): a.txt 已修改(同秒同长度), 先只暂存
-    /// b.txt (index 重写), 再暂存 a.txt —— 必须 stage 新内容 BBB。
+    /// `.git` 子树请求忽略 (对齐原生 git): `git add .git` / `.git/config` /
+    /// `./.git` 实测均 exit 0 且 index 零条目。修复前目录展开走进 .git 收集
+    /// 内部文件, stage_files 会把 `.git/config` 等写入 index (毒化), 后续
+    /// 提交在 tree 构造拒绝 `.git` 组件时整体 500。
+    #[test]
+    fn dotgit_request_paths_are_ignored() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        let repo = test.open();
+        stage_files(
+            &repo,
+            &[
+                ".git".to_string(),
+                ".git/config".to_string(),
+                "./.git".to_string(),
+            ],
+        )
+        .expect("dotgit 请求必须被忽略而非报错/暂存");
+        assert_no_dotgit_entries(&repo);
+        // 无变更 + 全部请求被忽略 → nothingToCommit (修复前 tree 构造报 500)
+        let result = stage_and_commit(&repo, &[".git".to_string()], "x", "T", "t@e.c")
+            .expect("dotgit commit 请求不得失败");
+        assert!(
+            result.is_none(),
+            "全被忽略的请求范围必须判定 nothingToCommit"
+        );
+        assert_no_dotgit_entries(&repo);
+    }
+
+    /// `.git` 请求与正常路径混排: 忽略 .git 项, 兄弟路径正常暂存提交。
+    #[test]
+    fn dotgit_request_sibling_still_commits() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        std::fs::write(test.0.join("a.txt"), "two").expect("modify a");
+        let repo = test.open();
+        let result = stage_and_commit(
+            &repo,
+            &[".git".to_string(), "a.txt".to_string()],
+            "m",
+            "T",
+            "t@e.c",
+        )
+        .expect("混排请求不得失败");
+        let hash = result.expect("a.txt 的真实变更必须提交");
+        let commit = repo
+            .find_commit(ObjectId::from_hex(hash.as_bytes()).expect("parse"))
+            .expect("find");
+        let tree = commit.tree().expect("tree");
+        let blob = tree
+            .lookup_entry_by_path("a.txt")
+            .expect("lookup a.txt")
+            .expect("a.txt 必须在提交树中");
+        assert_eq!(blob.object().expect("blob").data, b"two".as_ref());
+        assert!(
+            tree.lookup_entry_by_path(".git/config")
+                .expect("lookup .git/config")
+                .is_none(),
+            "提交树不得包含 .git 条目"
+        );
+        assert_no_dotgit_entries(&repo);
+    }
+
+    /// 子串命中但无 `.git` 组件的路径不得误伤 (预筛只挡组件)。
+    #[test]
+    fn dotgit_substring_paths_are_not_ignored() {
+        let test = TestRepo::new();
+        std::fs::create_dir_all(test.0.join(".github")).expect("mkdir");
+        std::fs::write(test.0.join(".github/ci.yml"), "ci").expect("write");
+        std::fs::write(test.0.join("foo.github.txt"), "x").expect("write");
+        let repo = test.open();
+        stage_files(
+            &repo,
+            &[".github/ci.yml".to_string(), "foo.github.txt".to_string()],
+        )
+        .expect("含 .git 子串的正常路径必须正常暂存");
+        let index = repo.open_index().expect("index");
+        assert!(
+            index
+                .entry_by_path_and_stage(
+                    gix::bstr::ByteSlice::as_bstr(b".github/ci.yml"),
+                    Stage::Unconflicted
+                )
+                .is_some(),
+            ".github/ci.yml 必须已暂存"
+        );
+        assert!(
+            index
+                .entry_by_path_and_stage(
+                    gix::bstr::ByteSlice::as_bstr(b"foo.github.txt"),
+                    Stage::Unconflicted
+                )
+                .is_some(),
+            "foo.github.txt 必须已暂存"
+        );
+    }
+
+    /// `.git/../a.txt` 词法消解后不含 .git 组件 → 正常暂存 (git pathspec
+    /// 清理同样先消解再匹配)。
+    #[test]
+    fn dotgit_lexical_escape_is_not_ignored() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        std::fs::write(test.0.join("a.txt"), "two").expect("modify a");
+        let repo = test.open();
+        let result = stage_and_commit(&repo, &[".git/../a.txt".to_string()], "m", "T", "t@e.c")
+            .expect("词法消解后的路径不得被忽略");
+        assert!(
+            result.is_some(),
+            ".git/../a.txt 消解为 a.txt, 真实变更必须提交"
+        );
+    }
+
     /// 修复前: index 重写时间 > a.txt mtime(同秒折叠), racy 判定误信
     /// 旧 entry 的 stat, 跳过内容读取, 暂存区残留旧 AAA → 漏提交。
     #[test]
@@ -2180,6 +2314,19 @@ mod tests {
         fn drop(&mut self) {
             drop(std::fs::remove_dir_all(&self.0));
         }
+    }
+
+    /// 断言 index 内没有任何 `.git` 前缀条目 (stage 侧不得毒化 index)。
+    fn assert_no_dotgit_entries(repo: &Repository) {
+        let index = repo.open_index().expect("index");
+        let backing = index.path_backing();
+        let leaked: Vec<_> = index
+            .entries()
+            .iter()
+            .map(|e| e.path_in(backing).to_str_lossy().into_owned())
+            .filter(|p| p == ".git" || p.starts_with(".git/"))
+            .collect();
+        assert!(leaked.is_empty(), "index 不得包含 .git 条目: {leaked:?}");
     }
 
     fn commit_file(test: &TestRepo, path: &str, data: &str, message: &str) -> String {
