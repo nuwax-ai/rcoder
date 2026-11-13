@@ -771,6 +771,13 @@ impl AgentContainerRuntime for KubernetesRuntime {
         self.list_containers_inner().await
     }
 
+    async fn observe_namespace_pods(
+        &self,
+        events_limit: usize,
+    ) -> ContainerRuntimeResult<container_runtime_api::pod_overview::PodOverviewSnapshot> {
+        self.pod_overview_inner(events_limit).await
+    }
+
     async fn sync_states(&self) -> ContainerRuntimeResult<(u32, Vec<RemovedContainerInfo>)> {
         self.sync_states_inner().await
     }

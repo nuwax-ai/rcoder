@@ -239,4 +239,6 @@ mod builder_log_identity_tests;
 #[cfg(all(test, feature = "kubernetes"))]
 mod create_lease_tests;
 #[cfg(feature = "kubernetes")]
+mod pod_overview;
+#[cfg(feature = "kubernetes")]
 mod workspace_runtime;

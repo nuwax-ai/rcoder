@@ -114,6 +114,23 @@ pub trait AgentContainerRuntime: Send + Sync {
             "Agent resource events are unsupported".into(),
         ))
     }
+    /// 命名空间级 Pod 概览观测（`/computer/pod/overview` 数据源）。
+    ///
+    /// 采集当前 namespace（k8s）/ 本 daemon（docker）内**全部**容器/Pod 的
+    /// 规格、健康与最近事件。分区失败以 `degraded` 标注（事件/卷），
+    /// 列表本身失败返回 Err——没有列表这个查询没有意义。
+    ///
+    /// 默认 Unsupported：老实现与测试替身行为不变；调用方（overview
+    /// handler）把它映射为 503 + `error_detail`，不静默返回空。
+    async fn observe_namespace_pods(
+        &self,
+        _events_limit: usize,
+    ) -> ContainerRuntimeResult<crate::pod_overview::PodOverviewSnapshot> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "pod overview is unsupported by this runtime".into(),
+        ))
+    }
+
     /// Create and start a container
     async fn create_container(
         &self,

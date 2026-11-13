@@ -6,6 +6,7 @@
 pub mod agent_retirement;
 pub mod container_params;
 pub mod error_diagnostic;
+pub mod pod_overview;
 pub mod readiness;
 pub mod runtime_trait;
 pub mod types;
@@ -15,6 +16,7 @@ pub mod utils;
 pub use agent_retirement::*;
 pub use container_params::*;
 pub use error_diagnostic::*;
+pub use pod_overview::*;
 pub use readiness::*;
 pub use runtime_trait::*;
 pub use types::*;

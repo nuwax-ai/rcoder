@@ -1074,6 +1074,13 @@ impl AgentContainerRuntime for DockerRuntime {
             .unwrap_or(false))
     }
 
+    async fn observe_namespace_pods(
+        &self,
+        events_limit: usize,
+    ) -> ContainerRuntimeResult<container_runtime_api::pod_overview::PodOverviewSnapshot> {
+        self.pod_overview_inner(events_limit).await
+    }
+
     async fn list_containers(&self) -> ContainerRuntimeResult<Vec<RuntimeContainerInfo>> {
         let epoch = self.inner.containers.list_epoch();
         // 命中且代次一致才可用；状态已变更（创建/删除/更新）则强制刷新
