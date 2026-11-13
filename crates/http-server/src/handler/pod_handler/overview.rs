@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use axum::extract::{Query, State};
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
 
 use crate::router::AppState;
 use crate::{AppError, HttpResult};
@@ -205,16 +205,45 @@ pub async fn pod_overview(
     State(state): State<Arc<AppState>>,
     Query(params): Query<PodOverviewQuery>,
 ) -> Result<HttpResult<PodOverviewResponse>, AppError> {
+    let locale = shared_types::current_request_locale();
     let events_limit = params.events_limit.unwrap_or(20).clamp(1, 50) as usize;
     let limit = params.limit.unwrap_or(500).clamp(1, 1000) as usize;
     let include_sidecars = params.include_sidecars.unwrap_or(false);
 
     let (snapshot, cache_age) = snapshot_with_cache(&state).await?;
 
+    // R12：非法 service_type 必须明确拒绝——静默变成"无过滤"会把输入错误
+    // 伪装成"返回全集"，调用方以为筛选命中了
+    let parsed_service_type = match params.service_type.as_deref() {
+        None => None,
+        Some(raw) => match raw.parse() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                warn!(
+                    event = "pod_overview.invalid_service_type",
+                    value = %raw,
+                    "invalid service_type filter"
+                );
+                let mut response = HttpResult::error_with_locale(
+                    shared_types::error_codes::ERR_VALIDATION,
+                    locale,
+                );
+                response.error_detail = Some(
+                    shared_types::ErrorDetail::new(
+                        shared_types::error_codes::ERR_VALIDATION,
+                        "pod.overview.resolve",
+                        format!("invalid service_type {raw:?}"),
+                    )
+                    .localized(locale),
+                );
+                return Ok(response);
+            }
+        },
+    };
     // 过滤（内存，快照上）
     let filter = PodOverviewFilter {
         search: params.search.as_deref().map(str::to_string),
-        service_type: params.service_type.as_deref().and_then(|s| s.parse().ok()),
+        service_type: parsed_service_type,
         user_id: params.user_id.clone(),
         app_id: params.app_id.clone(),
         project_id: params.project_id.clone(),
