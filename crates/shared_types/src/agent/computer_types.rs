@@ -452,6 +452,14 @@ pub struct ComputerPodResourcesResponse {
     #[schema(example = "pod_abc123")]
     pub pod_id: Option<String>,
 
+    /// 实际解析到的业务场景(回显)。
+    ///
+    /// 同一个标识符在不同容器族下指向不同容器，调用方应以此字段确认自己看的
+    /// 是哪一个族，不要按 `container_name` 前缀猜。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "computer-agent-runner")]
+    pub service_type: Option<ServiceType>,
+
     /// 容器是否存活(true=存在且运行中)
     #[schema(example = true)]
     pub alive: bool,
@@ -553,6 +561,18 @@ pub struct ComputerPodResourcesQuery {
     #[param(example = "pod_abc123")]
     #[schema(example = "pod_abc123")]
     pub pod_id: Option<String>,
+
+    /// 业务场景(容器族)。缺省 `computer-agent-runner`。
+    ///
+    /// - `computer-agent-runner` / `computer-normal-project`：同一容器族
+    ///   （共容器、共镜像、共 PVC），标识符是 `user_id`；
+    /// - `user-app-builder`：每 app 一个构建容器，标识符是 `app_id`（`pod_id` 传）；
+    /// - `user-app`：业务运行容器里没有 agent_runner，**不支持**（返回
+    ///   `ERR_OPERATION_NOT_SUPPORTED`，不返回空数据）。
+    #[serde(default)]
+    #[param(example = "user-app-builder")]
+    #[schema(example = "user-app-builder")]
+    pub service_type: Option<ServiceType>,
 
     /// 是否返回容器内进程明细(默认 true;响应 processes 字段)
     #[serde(default = "computer_pod_resources_default_include_processes")]

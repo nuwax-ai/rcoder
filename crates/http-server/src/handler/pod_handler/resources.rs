@@ -15,6 +15,136 @@ use shared_types::{ComputerPodResourcesQuery, ComputerPodResourcesResponse};
 
 use super::I18nQuery;
 
+/// 解析后的查询目标：业务场景 + 该场景下用于定位容器的标识符。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResourceTarget {
+    service_type: shared_types::ServiceType,
+    identifier: String,
+}
+
+/// 目标解析的拒绝原因。与 HTTP 层解耦，便于单测断言。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TargetReject {
+    /// 既没给 user_id 也没给 pod_id
+    MissingIdentifier,
+    /// user-app-builder 的容器标识是 app_id，只能经 pod_id 传
+    BuilderNeedsIdentifier,
+    /// user-app 业务运行容器里没有 agent_runner，本接口没有数据源
+    Unsupported(shared_types::ServiceType),
+}
+
+impl TargetReject {
+    fn reason_code(&self) -> &'static str {
+        match self {
+            // 参数问题与"场景不支持"分开：前者调用方改参数即可，后者得换接口/数据源
+            Self::MissingIdentifier | Self::BuilderNeedsIdentifier => {
+                shared_types::error_codes::ERR_VALIDATION
+            }
+            Self::Unsupported(_) => shared_types::error_codes::ERR_OPERATION_NOT_SUPPORTED,
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self {
+            Self::MissingIdentifier => "user_id or pod_id is required".to_string(),
+            Self::BuilderNeedsIdentifier => {
+                "service_type=user-app-builder 的容器标识是 app_id，请用 pod_id 传入".to_string()
+            }
+            Self::Unsupported(service_type) => format!(
+                concat!(
+                    "service_type={} 不提供资源监控：该容器内没有 agent_runner，",
+                    "本接口的数据源（gRPC GetContainerStatus + 容器内 /proc 扫描）不存在，",
+                    "需要容器外部数据源（metrics-server / cAdvisor）另行实现"
+                ),
+                service_type
+            ),
+        }
+    }
+}
+
+/// 按 `service_type` 解析目标。
+///
+/// 缺省 `ComputerAgentRunner`，因此不传 `service_type` 的老调用方行为不变。
+/// 显式传 `user-app` 直接拒绝——它不是"查不到"，而是这条链路根本没有数据源，
+/// 静默返回空数据会被读成"容器空载"。
+fn resolve_resource_target(
+    params: &ComputerPodResourcesQuery,
+) -> Result<ResourceTarget, TargetReject> {
+    let service_type = params
+        .service_type
+        .unwrap_or(shared_types::ServiceType::ComputerAgentRunner);
+    let user_id = params
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let pod_id = params
+        .pod_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    // 全量匹配、不写 `_ =>`：以后新增 ServiceType 变体时这里必须编译失败，
+    // 逼着明确"这个场景能不能监控"，而不是被默默当成 computer 去查。
+    match service_type {
+        shared_types::ServiceType::Userapp => Err(TargetReject::Unsupported(service_type)),
+        shared_types::ServiceType::UserappBuilder => {
+            let Some(app_id) = pod_id else {
+                return Err(TargetReject::BuilderNeedsIdentifier);
+            };
+            Ok(ResourceTarget {
+                service_type,
+                identifier: app_id.to_string(),
+            })
+        }
+        shared_types::ServiceType::ComputerAgentRunner
+        | shared_types::ServiceType::ComputerNormalProject
+        | shared_types::ServiceType::WebAgentRunner => {
+            // computer 族与 normal-project 共容器，标识符是 user_id；
+            // web-agent-runner 走同一套标识符解析（未验证是否有 agent_runner，
+            // 查不到数据时按既有降级契约返回缺省字段）。
+            let Some(identifier) = user_id.or(pod_id) else {
+                return Err(TargetReject::MissingIdentifier);
+            };
+            Ok(ResourceTarget {
+                service_type,
+                identifier: identifier.to_string(),
+            })
+        }
+    }
+}
+
+/// 按解析结果定位容器。
+///
+/// computer 族且给了 user_id 时沿用既有 `get_container_info`（带刷新语义），
+/// 其余场景走 `get_container_info_by_identifier`，避免改动既有行为。
+async fn locate_container(
+    state: &Arc<AppState>,
+    target: &ResourceTarget,
+    user_id: Option<&str>,
+) -> Result<Option<shared_types::ContainerBasicInfo>, AppError> {
+    let computer_family = matches!(
+        target.service_type,
+        shared_types::ServiceType::ComputerAgentRunner
+            | shared_types::ServiceType::ComputerNormalProject
+    );
+    if computer_family && user_id.is_some() {
+        return crate::service::ComputerContainerManager::get_container_info(
+            user_id.expect("checked above"),
+            state.runtime(),
+        )
+        .await;
+    }
+    state
+        .runtime()
+        .get_container_info_by_identifier(&target.identifier, &target.service_type)
+        .await
+        .map_err(|e| {
+            error!("[POD_RESOURCES] container lookup failed: {e}");
+            AppError::internal_server_error(&format!("Failed to query container info: {e}"))
+        })
+}
+
 /// 查询 Computer 容器(整个 pod)资源用量
 ///
 /// 返回容器 cgroup v2 的 CPU/内存实时用量与创建时设定的限额。
@@ -61,7 +191,7 @@ use super::I18nQuery;
     tag = "pod",
     operation_id = "computer_pod_resources",
     summary = "查询 Computer 容器资源用量(整个 pod)",
-    description = "按 user_id 或 pod_id 定位 Computer 容器,返回容器 cgroup v2 级别的 CPU/内存实时用量与创建时设定的资源限额。与 /computer/agent/status(agent 进程组粒度)互补:容器口径包含 VNC/桌面环境等全部进程。资源字段在采集降级时缺省(None),不报错。"
+    description = "按 service_type + user_id/pod_id 定位容器,返回容器 cgroup v2 级别的 CPU/内存实时用量与创建时设定的资源限额。service_type 缺省 computer-agent-runner(行为与改动前一致);computer-normal-project 与 computer 共容器(标识符同为 user_id);user-app-builder 用 app_id(pod_id)且容器内有 agent_runner,可返回进程明细与 agents;user-app(业务运行容器)没有 agent_runner 数据源,返回 ERR_OPERATION_NOT_SUPPORTED。与 /computer/agent/status(agent 进程组粒度)互补:容器口径包含 VNC/桌面环境等全部进程。资源字段在采集降级时缺省(None),不报错。"
 )]
 #[instrument(skip(state))]
 pub async fn computer_pod_resources(
@@ -70,40 +200,34 @@ pub async fn computer_pod_resources(
 ) -> Result<HttpResult<ComputerPodResourcesResponse>, AppError> {
     let locale = shared_types::current_request_locale();
 
-    // 1. 验证参数:user_id 或 pod_id 至少一个
-    let has_user_id = params
-        .user_id
-        .as_ref()
-        .is_some_and(|s| !s.trim().is_empty());
-    let has_pod_id = params.pod_id.as_ref().is_some_and(|s| !s.trim().is_empty());
-    if !has_user_id && !has_pod_id {
-        error!("[POD_RESOURCES] user_id or pod_id is required");
-        return Ok(HttpResult::error_with_locale(
-            shared_types::error_codes::ERR_VALIDATION,
-            locale,
-        ));
-    }
-
-    // 2. 定位容器:user_id 直查,pod_id 按 ComputerAgentRunner 标识符查
-    let container_info = if has_user_id {
-        crate::service::ComputerContainerManager::get_container_info(
-            params.user_id.as_deref().expect("user_id checked above"),
-            state.runtime(),
-        )
-        .await?
-    } else {
-        state
-            .runtime()
-            .get_container_info_by_identifier(
-                params.pod_id.as_deref().expect("pod_id checked above"),
-                &shared_types::ServiceType::ComputerAgentRunner,
-            )
-            .await
-            .map_err(|e| {
-                error!("[POD_RESOURCES] container lookup failed: {e}");
-                AppError::internal_server_error(&format!("Failed to query container info: {e}"))
-            })?
+    // 1. 解析目标:业务场景 + 标识符。缺省 computer-agent-runner(老调用方不变)
+    let target = match resolve_resource_target(&params) {
+        Ok(target) => target,
+        Err(reject) => {
+            warn!(
+                event = "pod_resources.target_rejected",
+                reason = reject.reason_code(),
+                detail = %reject.detail(),
+                service_type = ?params.service_type,
+                user_id = ?params.user_id,
+                pod_id = ?params.pod_id,
+                "resource target rejected"
+            );
+            let mut response = HttpResult::error_with_locale(reject.reason_code(), locale);
+            response.error_detail = Some(
+                shared_types::ErrorDetail::new(
+                    reject.reason_code(),
+                    "pod.resources.resolve",
+                    reject.detail(),
+                )
+                .localized(locale),
+            );
+            return Ok(response);
+        }
     };
+
+    // 2. 定位容器
+    let container_info = locate_container(&state, &target, params.user_id.as_deref()).await?;
 
     let Some(container_info) = container_info else {
         warn!(
@@ -125,6 +249,7 @@ pub async fn computer_pod_resources(
         return Ok(HttpResult::success(ComputerPodResourcesResponse {
             user_id: params.user_id.clone(),
             pod_id: params.pod_id.clone(),
+            service_type: Some(target.service_type),
             alive: false,
             container_cpu_percent: None,
             container_memory_mb: None,
@@ -179,6 +304,7 @@ pub async fn computer_pod_resources(
             return Ok(HttpResult::success(ComputerPodResourcesResponse {
                 user_id: params.user_id.clone(),
                 pod_id: params.pod_id.clone(),
+                service_type: Some(target.service_type),
                 alive: true,
                 container_cpu_percent: None,
                 container_memory_mb: None,
@@ -220,6 +346,7 @@ pub async fn computer_pod_resources(
     Ok(HttpResult::success(ComputerPodResourcesResponse {
         user_id: params.user_id.clone(),
         pod_id: params.pod_id.clone(),
+        service_type: Some(target.service_type),
         alive: true,
         container_cpu_percent: response.container_cpu_percent,
         container_memory_mb: response.container_memory_mb,
@@ -341,42 +468,30 @@ use std::convert::Infallible;
     tag = "pod",
     operation_id = "computer_pod_resources_stream",
     summary = "订阅 Computer 容器资源监控流(SSE,容器 + agent)",
-    description = "SSE 推送容器 cgroup 级与容器内 agent 进程组的 CPU/内存用量。订阅驱动采样:连接期间按 interval_secs(默认 2s,clamp 1-30)周期采样推送;无 replay/无历史缓冲,断连即停。执行换代后自动跟随新代次;agent.alive 来自显式的执行存在性,采集降级时资源字段缺省但不会误报 agent 退出。"
+    description = "SSE 推送容器 cgroup 级与容器内 agent 进程组的 CPU/内存用量。service_type 语义与单次查询接口一致(缺省 computer-agent-runner,支持 computer-normal-project / user-app-builder,user-app 返回 ERR_OPERATION_NOT_SUPPORTED 且不建立流)。订阅驱动采样:连接期间按 interval_secs(默认 2s,clamp 1-30)周期采样推送;无 replay/无历史缓冲,断连即停。执行换代后自动跟随新代次;agent.alive 来自显式的执行存在性,采集降级时资源字段缺省但不会误报 agent 退出。"
 )]
 #[instrument(skip(state))]
 pub async fn computer_pod_resources_stream(
     State(state): State<Arc<AppState>>,
     I18nQuery(params): I18nQuery<ComputerPodResourcesQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, AppError> {
-    // 1. 验证与定位(连接建立前完成;流建立后容器消失以缺省事件体现)
-    let has_user_id = params
-        .user_id
-        .as_ref()
-        .is_some_and(|s| !s.trim().is_empty());
-    let has_pod_id = params.pod_id.as_ref().is_some_and(|s| !s.trim().is_empty());
-    if !has_user_id && !has_pod_id {
-        return Err(AppError::validation_error("user_id or pod_id is required"));
-    }
+    // 1. 解析与定位(连接建立前完成;流建立后容器消失以缺省事件体现)
+    let target = resolve_resource_target(&params).map_err(|reject| {
+        warn!(
+            event = "pod_resources_stream.target_rejected",
+            reason = reject.reason_code(),
+            detail = %reject.detail(),
+            service_type = ?params.service_type,
+            "resource stream target rejected"
+        );
+        AppError::from_code(reject.reason_code()).with_error_detail(shared_types::ErrorDetail::new(
+            reject.reason_code(),
+            "pod.resources.resolve",
+            reject.detail(),
+        ))
+    })?;
 
-    let container_info = if has_user_id {
-        crate::service::ComputerContainerManager::get_container_info(
-            params.user_id.as_deref().expect("user_id checked above"),
-            state.runtime(),
-        )
-        .await?
-    } else {
-        state
-            .runtime()
-            .get_container_info_by_identifier(
-                params.pod_id.as_deref().expect("pod_id checked above"),
-                &shared_types::ServiceType::ComputerAgentRunner,
-            )
-            .await
-            .map_err(|e| {
-                error!("[POD_RESOURCES_STREAM] container lookup failed: {e}");
-                AppError::internal_server_error(&format!("Failed to query container info: {e}"))
-            })?
-    };
+    let container_info = locate_container(&state, &target, params.user_id.as_deref()).await?;
 
     let Some(container_info) = container_info else {
         warn!(
@@ -643,6 +758,108 @@ mod tests {
         );
         assert_eq!(agent_alive_field(Some(true)), serde_json::json!(true));
         assert_eq!(agent_alive_field(Some(false)), serde_json::json!(false));
+    }
+
+    /// ── 目标解析（service_type + 标识符）──
+    fn q(
+        user_id: Option<&str>,
+        pod_id: Option<&str>,
+        service_type: Option<shared_types::ServiceType>,
+    ) -> ComputerPodResourcesQuery {
+        ComputerPodResourcesQuery {
+            user_id: user_id.map(str::to_string),
+            pod_id: pod_id.map(str::to_string),
+            service_type,
+            include_processes: None,
+            interval_secs: None,
+        }
+    }
+
+    /// 不传 service_type：行为必须和改动前完全一致（ComputerAgentRunner + user_id）。
+    #[test]
+    fn resolve_defaults_to_computer_agent_runner() {
+        let target = resolve_resource_target(&q(Some("42"), None, None)).expect("应解析成功");
+        assert_eq!(
+            target.service_type,
+            shared_types::ServiceType::ComputerAgentRunner
+        );
+        assert_eq!(target.identifier, "42");
+    }
+
+    /// normal-project 与 computer 共容器，标识符同样是 user_id。
+    #[test]
+    fn resolve_normal_project_uses_user_id() {
+        let target = resolve_resource_target(&q(
+            Some("42"),
+            None,
+            Some(shared_types::ServiceType::ComputerNormalProject),
+        ))
+        .expect("应解析成功");
+        assert_eq!(
+            target.service_type,
+            shared_types::ServiceType::ComputerNormalProject
+        );
+        assert_eq!(target.identifier, "42");
+    }
+
+    /// builder 的容器标识是 app_id，经 pod_id 传入。
+    #[test]
+    fn resolve_builder_uses_app_id_from_pod_id() {
+        let target = resolve_resource_target(&q(
+            None,
+            Some("app-7"),
+            Some(shared_types::ServiceType::UserappBuilder),
+        ))
+        .expect("应解析成功");
+        assert_eq!(
+            target.service_type,
+            shared_types::ServiceType::UserappBuilder
+        );
+        assert_eq!(target.identifier, "app-7");
+    }
+
+    /// builder 只给 user_id 时必须拒绝：user_id 不是 builder 的容器标识，
+    /// 用它去查会静默落到错误的容器上。
+    #[test]
+    fn resolve_builder_requires_pod_id() {
+        let err = resolve_resource_target(&q(
+            Some("42"),
+            None,
+            Some(shared_types::ServiceType::UserappBuilder),
+        ))
+        .expect_err("builder 只给 user_id 应被拒绝");
+        assert_eq!(err, TargetReject::BuilderNeedsIdentifier);
+        assert_eq!(err.reason_code(), shared_types::error_codes::ERR_VALIDATION);
+    }
+
+    /// user-app 业务运行容器没有 agent_runner：明确拒绝，而不是返回空数据
+    /// （空数据会被读成「容器空载」）。
+    #[test]
+    fn resolve_rejects_userapp_with_unsupported_code() {
+        let err = resolve_resource_target(&q(
+            Some("42"),
+            None,
+            Some(shared_types::ServiceType::Userapp),
+        ))
+        .expect_err("user-app 应被拒绝");
+        assert!(matches!(err, TargetReject::Unsupported(_)));
+        assert_eq!(
+            err.reason_code(),
+            shared_types::error_codes::ERR_OPERATION_NOT_SUPPORTED
+        );
+        assert!(
+            err.detail().contains("agent_runner"),
+            "拒绝原因要说清数据源缺失: {}",
+            err.detail()
+        );
+    }
+
+    /// 两个标识符都没给 → 参数错误。
+    #[test]
+    fn resolve_requires_an_identifier() {
+        let err = resolve_resource_target(&q(None, None, None)).expect_err("缺标识符应被拒绝");
+        assert_eq!(err, TargetReject::MissingIdentifier);
+        assert_eq!(err.reason_code(), shared_types::error_codes::ERR_VALIDATION);
     }
 
     /// agent 行：空 session_id 不能变成 `Some("")`（前端会当成真实 id）。
