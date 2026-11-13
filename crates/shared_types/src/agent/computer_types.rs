@@ -564,15 +564,40 @@ pub struct ComputerPodResourcesQuery {
 
     /// 业务场景(容器族)。缺省 `computer-agent-runner`。
     ///
+    /// **与 `/computer/pod/ensure` 同一套三字段分派**（`service_type` +
+    /// `app_id` + `app_stage`，共用 `parse_app_target`，不另立规则）：
+    ///
     /// - `computer-agent-runner` / `computer-normal-project`：同一容器族
     ///   （共容器、共镜像、共 PVC），标识符是 `user_id`；
-    /// - `user-app-builder`：每 app 一个构建容器，标识符是 `app_id`（`pod_id` 传）；
-    /// - `user-app`：业务运行容器里没有 agent_runner，**不支持**（返回
-    ///   `ERR_OPERATION_NOT_SUPPORTED`，不返回空数据）。
+    /// - `userapp`（或省略 service_type）+ `app_id`：按 `app_stage` 分派，
+    ///   `dev`（缺省）→ UserappBuilder 开发容器（有 agent_runner，可返回明细），
+    ///   `prod` → 业务运行 Deployment（无 agent_runner，返回
+    ///   `ERR_OPERATION_NOT_SUPPORTED`）；
+    /// - `web-agent-runner`：标识符是 `project_id`。
     #[serde(default)]
-    #[param(example = "user-app-builder")]
-    #[schema(example = "user-app-builder")]
+    #[param(example = "userapp")]
+    #[schema(example = "userapp")]
     pub service_type: Option<ServiceType>,
+
+    /// userApp 应用 ID（与 `service_type=userapp` 搭配；存在即走 userApp 分派）。
+    /// 语义与 `/computer/pod/ensure` 完全一致。
+    #[serde(default)]
+    #[param(example = "app_789")]
+    #[schema(example = "app_789")]
+    pub app_id: Option<String>,
+
+    /// userApp 容器阶段（缺省 `dev`）：`dev` = UserappBuilder 开发容器；
+    /// `prod` = 业务运行 Deployment（本接口不支持，无 agent_runner）。
+    #[serde(default)]
+    #[param(example = "dev")]
+    #[schema(example = "dev")]
+    pub app_stage: Option<String>,
+
+    /// 项目 ID：`web-agent-runner` 族的容器标识符（其余族不使用）。
+    #[serde(default)]
+    #[param(example = "proj_456")]
+    #[schema(example = "proj_456")]
+    pub project_id: Option<String>,
 
     /// 是否返回容器内进程明细(默认 true;响应 processes 字段)
     #[serde(default = "computer_pod_resources_default_include_processes")]
