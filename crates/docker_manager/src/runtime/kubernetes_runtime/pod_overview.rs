@@ -80,7 +80,7 @@ impl super::KubernetesRuntime {
             .await
         {
             Ok(list) => {
-                let infos: Vec<AppEventInfo> = list
+                let mut infos: Vec<AppEventInfo> = list
                     .items
                     .into_iter()
                     .filter_map(|event| {
@@ -103,6 +103,9 @@ impl super::KubernetesRuntime {
                         })
                     })
                     .collect();
+                // group_events_by_pod 的契约：输入倒序（截断到 limit 时保留的
+                // 才是"最近"的）。k8s list 返回任意顺序，必须显式排。
+                infos.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
                 group_events_by_pod(&infos, events_limit)
             }
             Err(e) => {

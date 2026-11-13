@@ -101,9 +101,10 @@ const CACHE_TTL_SECS: u64 = 10;
 
 /// 取快照：命中且 events_limit 一致 → 复用；否则采集并回填。
 ///
-/// 单飞：同键并发请求只打一次采集（`Mutex` 在采集前释放，采集期间后来者
-/// 等待下一次轮询窗口自然收敛——对 10s TTL 的观测接口，"稍后重试"比
-/// "排队等锁"更简单也更稳）。
+/// **不是单飞**：缓存 miss 的并发请求会各自采集（采集在锁外）。代价是
+/// 冷启动时可能出现几次重复读——对只读的 list/inspect 无害；面板 10s
+/// 轮询 + 10s TTL 的形态下，miss 窗口极小。真要做去重得加 in-flight
+/// 通道，对观测接口不值得那份复杂度。
 async fn snapshot_with_cache(
     state: &Arc<AppState>,
     events_limit: usize,

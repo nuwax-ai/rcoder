@@ -161,19 +161,28 @@ async fn collect_recent_events(
             let Some(attributes) = actor.attributes.as_ref() else {
                 continue;
             };
-            // 只关心容器事件（镜像/网络/卷事件的 actor.id 不是容器）
-            if !attributes.contains_key("container") && !attributes.contains_key("name") {
+            // 只关心容器事件：docker 只给**容器**事件带 `container=<id>` 属性——
+            // 镜像事件（pull）也有 `name`（如 "alpine"），只按 name 过滤会把
+            // 镜像事件混进归组（object=镜像名，污染按容器名的分组）。
+            if !attributes.contains_key("container") {
                 continue;
             }
             let Some(container_name) = attributes.get("name") else {
                 continue;
             };
             let action = message.action.clone().unwrap_or_default();
+            // 时间戳统一 RFC3339：k8s 侧是 RFC3339 字符串，unix 秒的字符串
+            // 表示会让同一字段出现两种格式，且字典序排序对它无效。
+            let timestamp = message
+                .time
+                .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default();
             events.push(AppEventInfo {
                 event_type: classify_event(&action),
                 reason: action.clone(),
                 message: format!("{action} {container_name}"),
-                timestamp: message.time.unwrap_or_default().to_string(),
+                timestamp,
                 object: container_name.clone(),
                 count: 1,
             });
@@ -184,6 +193,8 @@ async fn collect_recent_events(
         }
     })
     .await;
+    // 回放是升序；group_events_by_pod 契约要求倒序（截断保留最近的）
+    events.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     match collected {
         Ok(()) => Ok(events),
         Err(_elapsed) => Ok(events), // timebox 到点：用已收到的部分（正常路径）
