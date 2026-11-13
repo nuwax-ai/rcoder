@@ -55,6 +55,11 @@ pub fn stage_path(repo: &Repository, worktree_path: &str) -> AppResult<()> {
 
 /// 路径展开: 目录 → 递归收集内部文件 (跳过 .git); 文件/不存在 → 原样收集
 /// (不存在后续按 stage 删除语义处理, 对齐原 stage_path 行为)。
+///
+/// `.git` 保留名的防护**不在请求层**做: 请求路径可能是工作区内绝对路径
+/// (ensure_within 放行, 目录展开产出相对子路径), 在此提前归一会改变
+/// 既有契约 (codex 复审 P2)。统一防护见 [`path_has_reserved_git_component`]
+/// —— 实际入 index 的边界, 覆盖显式请求与展开产物两条来路。
 fn expand_stage_paths(
     repo: &Repository,
     worktree_path: &str,
@@ -62,21 +67,24 @@ fn expand_stage_paths(
     seen: &mut HashSet<BString>,
     out: &mut Vec<String>,
 ) -> AppResult<()> {
-    // git 语义: 含 `.git` 组件的请求路径**静默忽略** (原生 `git add .git` /
-    // `.git/config` / `./.git` 均 exit 0 且 index 零条目)。此前目录展开会
-    // 走进 .git 收集内部文件, tree 构造拒绝 `.git` 路径组件, 整个提交 500。
-    if request_has_dotgit_component(worktree_path)? {
-        return Ok(());
-    }
     let workdir = repo
         .workdir()
         .ok_or_else(|| AppError::system("git repo has no workdir"))?;
     let abs = crate::path_safety::ensure_within(workdir, worktree_path)?;
+    // 绝对形态的工作区内请求 (codex 复审 P2): ensure_within 放行 base 内
+    // 绝对路径, 但下游 [`collect_missing_dir_entries`] 的归一只接受相对
+    // 形态 —— 先过安全边界, 再统一转工作区相对路径 (clean 幂等, 相对
+    // 请求结果不变)。
+    let rel_request = abs
+        .strip_prefix(workdir)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .ok_or_else(|| AppError::validation("git path is outside worktree"))?;
     match std::fs::symlink_metadata(&abs) {
         Ok(metadata) if metadata.is_dir() => {
             collect_stage_paths(workdir, &abs, out)?;
             let index = staged_index(repo, index_once)?;
-            collect_missing_dir_entries(index, workdir, worktree_path, seen, out)?;
+            collect_missing_dir_entries(index, workdir, &rel_request, seen, out)?;
         }
         Ok(_) => out.push(worktree_path.to_string()),
         // 路径不存在: 已删除的文件 (index 同名条目由单路径入列覆盖;
@@ -86,27 +94,29 @@ fn expand_stage_paths(
         Err(_) => {
             out.push(worktree_path.to_string());
             let index = staged_index(repo, index_once)?;
-            collect_missing_dir_entries(index, workdir, worktree_path, seen, out)?;
+            collect_missing_dir_entries(index, workdir, &rel_request, seen, out)?;
         }
     }
     Ok(())
 }
 
-/// 请求路径归一后任一组件为 `.git` → true (git add 对 .git 子树整体豁免,
-/// 实测 `git add .git` / `.git/config` / `./.git` 均 exit 0 且 index 零条目)。
+/// 路径任一组件命中 Git 保留元数据名 (`.git` 及大小写折叠 / HFS+ 忽略
+/// 码点 / NTFS `git~1` 等别名) → true。
 ///
-/// 子串预筛避免 130k 全量请求逐条归一: 路径不含 ".git" 子串就不可能有该
-/// 组件, 热路径只付一次扫描; `foo.github.txt` / `.github/ci.yml` 含子串
-/// 但无组件命中, 走完整归一后正常放行。`a/.git/../b.txt` 词法消解后不含
-/// `.git` 组件, 同样放行 (与 git pathspec 清理语义一致)。
-fn request_has_dotgit_component(worktree_path: &str) -> AppResult<bool> {
-    if !worktree_path.contains(".git") {
-        return Ok(false);
-    }
-    let normalized = normalize_relative_path(worktree_path)?;
-    Ok(Path::new(&normalized)
-        .components()
-        .any(|c| c.as_os_str() == std::ffi::OsStr::new(".git")))
+/// 复用 gix 官方 [`gix::validate`] 的组件校验, 与 tree editor 拒绝
+/// `.git` 的规则同源 (gix-validate 0.13); **只消费 DotGitDir 一类** ——
+/// Windows 保留名 / 非法字符等其他校验错误维持既有行为, 不在此静默丢
+/// 文件。原生 git 对这类 pathspec 同样整体豁免 (实测 `git add .git` /
+/// `.git/config` / Linux 下 `.GIT` 均 exit 0 或 invalid path, 不产生
+/// index 条目)。
+fn path_has_reserved_git_component(path: &BStr) -> bool {
+    let options = gix::validate::path::component::Options::default();
+    path.split(|b| *b == b'/').any(|component| {
+        matches!(
+            gix::validate::path::component(component.as_bstr(), None, options),
+            Err(gix::validate::path::component::Error::DotGitDir)
+        )
+    })
 }
 
 /// 整批共享的 index 懒加载: 首个需要缺失条目收集的路径读一次,
@@ -176,12 +186,22 @@ fn collect_missing_dir_entries(
 fn collect_stage_paths(workdir: &Path, dir: &Path, out: &mut Vec<String>) -> AppResult<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
+        // `.git` 保留名**目录与文件两种形态都跳过** (codex 复审 P1: 文件
+        // 形态是 worktree/submodule 的真实布局, 此前只跳目录), 大小写折叠
+        // (大小写不敏感卷上 .GIT 即 .git 本体; 大小写敏感卷上 git 同样
+        // 拒收 .GIT 组件)。入 index 边界另有 [`path_has_reserved_git_component`]
+        // 兜底, 此处同时避免把整个 .git 子树收进列表。
+        if entry
+            .file_name()
+            .as_encoded_bytes()
+            .eq_ignore_ascii_case(b".git")
+        {
+            continue;
+        }
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            if entry.file_name() != ".git" {
-                collect_stage_paths(workdir, &path, out)?;
-            }
+            collect_stage_paths(workdir, &path, out)?;
         } else {
             let relative = path
                 .strip_prefix(workdir)
@@ -294,6 +314,20 @@ fn stage_paths_with_probe(
             continue;
         }
         let bstr_path: &BStr = bstr_owned.as_ref();
+        // 统一边界 (codex 复审 P1): 保留名路径**无论来自显式请求还是目录
+        // 展开**都不得进入 index —— 对齐 git add 的静默忽略。index 里已有
+        // 该形态条目 (旧版写入的毒化) 时按删除修复: 只清这些条目, 其余
+        // 暂存内容不动。
+        if path_has_reserved_git_component(bstr_path) {
+            if index
+                .entry_by_path_and_stage(bstr_path, Stage::Unconflicted)
+                .is_some()
+            {
+                deleted.insert(bstr_owned);
+                dirty = true;
+            }
+            continue;
+        }
         // NotFound = 文件确已删除 → 从 index 移除（对齐 git add 删档语义）；
         // 其他 IO 错误（EACCES/ESTALE——CephFS 瞬时 stat 失败是现实场景）必须传播：
         // 静默按删除写入 index 会让存在的文件被后续 commit 从历史里删掉。
@@ -1418,6 +1452,112 @@ mod tests {
         );
     }
 
+    /// 大小写折叠 (codex 复审 P1): macOS 大小写不敏感卷上 `.GIT` 即 `.git`
+    /// 本体; 大小写敏感卷上原生 git 也拒收 `.GIT` 组件 (invalid path)。
+    /// 请求与展开产物两种来路都不得把保留名写进 index。
+    #[test]
+    fn dotgit_case_folded_variants_are_ignored() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        // Linux 下是独立的 .GIT 目录; macOS 下解析进 .git 本体 (临时仓库,
+        // 无碍)。两种平台 walk 层都必须跳过。
+        std::fs::create_dir_all(test.0.join(".GIT")).expect("mkdir .GIT");
+        std::fs::write(test.0.join(".GIT/probe.txt"), "p").expect("write probe");
+        let repo = test.open();
+        stage_files(&repo, &[".GIT".to_string(), ".GIT/probe.txt".to_string()])
+            .expect("大小写折叠的保留名请求必须被忽略");
+        assert_no_dotgit_entries(&repo);
+    }
+
+    /// walk 层文件形态 (codex 复审 P1): worktree/submodule 的 `.git` 是
+    /// **文件**; 目录请求展开时文件形态此前会被推入结果并暂存。
+    #[test]
+    fn dotgit_file_form_inside_walked_dir_is_not_staged() {
+        let test = TestRepo::new();
+        std::fs::create_dir_all(test.0.join("nested")).expect("mkdir nested");
+        std::fs::write(test.0.join("nested/app.txt"), "app").expect("write app");
+        std::fs::write(test.0.join("nested/.git"), "gitdir: ../.git/worktrees/x")
+            .expect("write gitlink file");
+        let repo = test.open();
+        stage_files(&repo, &["nested".to_string()]).expect("目录请求不得失败");
+        let index = repo.open_index().expect("index");
+        assert!(
+            index
+                .entry_by_path_and_stage(
+                    gix::bstr::ByteSlice::as_bstr(b"nested/app.txt"),
+                    Stage::Unconflicted
+                )
+                .is_some(),
+            "nested/app.txt 必须已暂存"
+        );
+        assert_no_dotgit_entries(&repo);
+    }
+
+    /// 工作区内绝对路径目录 (codex 复审 P2): ensure_within 对 base 内的
+    /// 绝对路径放行, 目录展开产出相对子路径 —— 含 `.git` 子串 (`.github`)
+    /// 的绝对目录请求在旧代码可正常暂存, 不得被保留名防护改变为 400。
+    #[test]
+    fn absolute_dir_under_workspace_with_dotgit_substring_stages() {
+        let test = TestRepo::new();
+        std::fs::create_dir_all(test.0.join(".github")).expect("mkdir .github");
+        std::fs::write(test.0.join(".github/ci.yml"), "ci").expect("write ci");
+        let repo = test.open();
+        let absolute = test.0.join(".github");
+        stage_files(&repo, &[absolute.to_string_lossy().into_owned()])
+            .expect("工作区内绝对目录请求必须保持既有可暂存行为");
+        let index = repo.open_index().expect("index");
+        assert!(
+            index
+                .entry_by_path_and_stage(
+                    gix::bstr::ByteSlice::as_bstr(b".github/ci.yml"),
+                    Stage::Unconflicted
+                )
+                .is_some(),
+            ".github/ci.yml 必须已暂存"
+        );
+    }
+
+    /// 旧版毒化条目的受控修复 (codex 复审): index 里已有保留名条目、且
+    /// 磁盘上该路径**存在** (大小写不敏感卷上 `.GIT/*` 解析进真 .git) ——
+    /// 此时既有 NotFound 删除语义帮不上忙, 必须由保留名边界按删除修复,
+    /// 只清保留名条目, 其余暂存内容不动。
+    #[test]
+    fn poisoned_index_reserved_entry_is_repaired() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        // 磁盘上真实存在: Linux 下是独立 .GIT 目录, macOS 下解析进 .git
+        // 本体 (临时仓库, 无碍)。
+        std::fs::create_dir_all(test.0.join(".GIT")).expect("mkdir .GIT");
+        std::fs::write(test.0.join(".GIT/probe.txt"), "p").expect("write probe");
+        let repo = test.open();
+        {
+            let lock = acquire_index_lock(&repo).expect("lock");
+            let mut index = repo.open_index().expect("index");
+            index.dangerously_push_entry(
+                Stat::default(),
+                ObjectId::empty_tree(gix::hash::Kind::Sha1),
+                Flags::empty(),
+                IndexMode::FILE,
+                gix::bstr::ByteSlice::as_bstr(b".GIT/probe.txt"),
+            );
+            index.sort_entries();
+            lock.commit_index(&mut index).expect("write poisoned index");
+        }
+        stage_files(&repo, &[".GIT/probe.txt".to_string()]).expect("保留名请求必须被忽略而非报错");
+        assert_no_dotgit_entries(&repo);
+        // 修复不得动其他条目
+        let index = repo.open_index().expect("index");
+        assert!(
+            index
+                .entry_by_path_and_stage(
+                    gix::bstr::ByteSlice::as_bstr(b"a.txt"),
+                    Stage::Unconflicted
+                )
+                .is_some(),
+            "a.txt 条目必须保留"
+        );
+    }
+
     /// 修复前: index 重写时间 > a.txt mtime(同秒折叠), racy 判定误信
     /// 旧 entry 的 stat, 跳过内容读取, 暂存区残留旧 AAA → 漏提交。
     #[test]
@@ -2316,7 +2456,7 @@ mod tests {
         }
     }
 
-    /// 断言 index 内没有任何 `.git` 前缀条目 (stage 侧不得毒化 index)。
+    /// 断言 index 内没有任何 `.git` 前缀条目 (大小写折叠; stage 侧不得毒化 index)。
     fn assert_no_dotgit_entries(repo: &Repository) {
         let index = repo.open_index().expect("index");
         let backing = index.path_backing();
@@ -2324,7 +2464,10 @@ mod tests {
             .entries()
             .iter()
             .map(|e| e.path_in(backing).to_str_lossy().into_owned())
-            .filter(|p| p == ".git" || p.starts_with(".git/"))
+            .filter(|p| {
+                let low = p.to_lowercase();
+                low == ".git" || low.starts_with(".git/")
+            })
             .collect();
         assert!(leaked.is_empty(), "index 不得包含 .git 条目: {leaked:?}");
     }
