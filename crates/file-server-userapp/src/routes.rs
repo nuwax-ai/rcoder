@@ -53,6 +53,7 @@ fn userapp_router() -> OpenApiRouter<UserAppState> {
         .routes(routes!(userapp_dev_server::dev_list))
         .routes(routes!(userapp_dev_server::framework_info))
         .routes(routes!(static_files::serve_userapp))
+        .routes(routes!(static_files::artifact_meta))
         .route("/static/{app_id}", options(static_files::serve_userapp))
 }
 
@@ -151,13 +152,14 @@ mod tests {
             "/api/v1/userapp/dev/list",
             "/api/v1/userapp/dev/framework-info",
             "/api/v1/userapp/static/{app_id}",
+            "/api/v1/userapp/static/{app_id}/meta",
         ] {
             assert!(
                 document.paths.paths.contains_key(path),
                 "userapp path missing: {path}"
             );
         }
-        assert_eq!(document.paths.paths.len(), 39);
+        assert_eq!(document.paths.paths.len(), 40);
         assert!(document.paths.paths.keys().all(|path| !path.contains("{*")));
     }
 

@@ -92,6 +92,9 @@ pub const CONTAINER_PASS_THROUGH_PATHS: &[&str] = &[
     "/api/v1/userapp/dev/framework-info",
     // 静态资源（按 releaseId 取包；注解侧另挂 OPTIONS，any 已覆盖）
     "/api/v1/userapp/static/{app_id}",
+    // 静态资源元数据（下载前预检：size_bytes 判下载阈值；回传解析出的
+    // release_id 供调用方钉版本——与下载接口同参同源定位）
+    "/api/v1/userapp/static/{app_id}/meta",
 ];
 
 /// userapp 路径快照等守卫夹具（openapi 守卫测试消费——引擎拆分后跨 crate

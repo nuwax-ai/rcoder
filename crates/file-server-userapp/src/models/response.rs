@@ -32,6 +32,27 @@ pub struct CancelData {
     pub already_terminal: Option<bool>,
 }
 
+/// GET static/{app_id}/meta 响应 data（构建产物元数据，下载前预检用）。
+///
+/// `release_id` 回传服务端实际解析出的版本（调用方缺省请求时 = 最新产物），
+/// 供调用方把后续下载 URL 钉死为 `?release_id=`——预检与下载指向同一份文件，
+/// 消除"查大小后落了新构建"的竞态。字段命名与 BuildTaskSnapshot 产物字段
+/// 同词表（release_id/size_bytes/file_name/artifact_path）。
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct StaticArtifactMeta {
+    /// 服务端解析出的产物版本（缺省请求 = 最新产物；与 `?release_id=` 精确定位同源）
+    pub release_id: String,
+    /// 产物相对路径（`builds/workspace-package-{release_id}.zip`，与
+    /// BuildCreatedData.artifact_path 同形）
+    pub artifact_path: String,
+    /// 产物文件名（`workspace-package-{release_id}.zip`）
+    pub file_name: String,
+    /// 文件字节数（调用方按此判下载阈值）
+    pub size_bytes: u64,
+    /// 修改时间（epoch 毫秒；产物 part+rename 原子落盘时间 ≈ 构建完成时间）
+    pub mtime_ms: u64,
+}
+
 /// detect 响应 data。
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct DetectData {
