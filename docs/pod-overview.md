@@ -230,7 +230,8 @@ GET /computer/pod/overview
 | `service_type` | string | — | 按 `RuntimeContainerInfo.service_type` 过滤 |
 | `user_id` / `app_id` / `project_id` | string | — | 按结构化身份过滤 |
 | `label_selector` | string | — | 透传（k8s）；docker 下映射为 `label=` 过滤 |
-| `only_problem` | bool | false | 只返回"有问题"的（未就绪 / 有重启 / 有 OOM / 有 Warning 事件） |
+| `only_problem` | bool | false | **过滤器**：只返回"有异常"的对象，异常 = 下列任一成立：① `ready=false`；② `restart_count > 0`；③ `oom_killed_last=true`；④ 最近 1h 内有 `type=Warning` 事件。默认关闭（返回全部），仅用于面板"只看问题"开关 |
+| `include_sidecars` | bool | false | 是否在 `usage.containers[]` 里带上内部 sidecar（默认隐藏 `log-shipper` / `log-collector`） |
 | `limit` | u32 | 500 | 安全上限，防一次吐爆 |
 
 > 不做 `namespace` 参数（§2）。
@@ -291,11 +292,16 @@ GET /computer/pod/overview
         "source": "agent_grpc",     // agent_grpc | metrics_server | docker_stats
         "sampled_at": "2026-11-13T17:19:58Z",
         "window": null,             // metrics_server 时为 "15s"，gRPC 为 null（实时）
-        "cpu_percent": 1.7,
+        "cpu_percent": 1.7,         // Pod 合计（含被隐藏的 sidecar）
         "cpu_cores": 0.03,
         "mem_used_mb": 1186,
         "mem_limit_mb": 6144,
-        "process_count": 84         // 拿不到就是 null
+        "process_count": 84,        // 拿不到就是 null
+        "containers": [             // 按容器拆分；默认隐藏 sidecar（include_sidecars=false）
+          { "name": "agent", "cpu_cores": 0.03, "mem_used_mb": 1186, "hidden": false },
+          { "name": "log-collector", "cpu_cores": 0.0, "mem_used_mb": 7, "hidden": true }
+        ],
+        "hidden_containers": 1      // 被隐藏的 sidecar 数量，UI 可提示"另有 1 个内部容器"
       },
       "events": [
         { "type": "Warning", "reason": "OOMKilling", "count": 2,
@@ -376,8 +382,13 @@ http-server  handler/pod_handler/overview.rs      ← 新增，只依赖下面�
 > （`involvedObject.kind=Pod` 是 k8s 支持的选择器），避免把 369 条全拉下来做客户端过滤。
 
 **spec 提取**：Pod `spec.containers[]` 可能多容器（我们有 `rcoder`+`log-shipper`、
-`agent`+`log-collector`）。取**主容器**（按 label `agent`/`app`/`rcoder` 顺序匹配，
-匹配不到取第一个），并把多容器情况在 `spec.containers[]` 里保留（可选字段，P2）。
+`agent`+`log-collector`）。`spec` 顶层的 cpu/mem 取**主容器**（按 `agent`/`app`/`rcoder`
+顺序匹配，匹配不到取第一个），同时保留 `spec.containers[]` 逐容器的 request/limit。
+
+**sidecar 策略（已定）**：`usage.containers[]` 默认**隐藏** `log-shipper` / `log-collector`
+这类内部容器（`include_sidecars=false`），只暴露用户关心的主容器；被隐藏的数量用
+`hidden_containers` 透出，UI 可显示"另有 N 个内部容器"。隐藏名单放在
+`shared_types` 常量里（可配置），不散落在 handler 里。
 
 **磁盘**：
 - `volumes[].persistentVolumeClaim.claimName` → PVC `status.capacity.storage`（配额）；
@@ -400,7 +411,7 @@ http-server  handler/pod_handler/overview.rs      ← 新增，只依赖下面�
 - `NanoCpus == 0` 时用 `CpuQuota/CpuPeriod` 反推，两者都没有 → `null`；
 - `state.OOMKilled` 只在"当前状态"为 OOM 时 true；**历史 OOM 从 events 的 `oom` 事件数**；
 - `RestartCount` 仅参考（§3.4），重启次数以 events 里 `restart`+`die` 数为准，
-  并在 `health.restart_source` 标注；
+  并在 `health.restart_source` 标注（**已定：不额外改造 RestartCount 语义，也不为它加探针**）；
 - events 流必须 timebox，否则请求挂死（§3.5）。
 
 ### 6.4 归一化与排序
@@ -504,10 +515,86 @@ P1 的收益最直接：**立刻能定位"哪个容器在反复被 OOM 杀"**（
 
 ---
 
-## 13. 遗留待确认 / 待实测
+## 13. 决策记录（已确认）
 
-1. **docker 手工重启语义**已实测（不计数），但**重启策略重启**是否计数未实测 —— P1 前补一个
-   `--restart=always` + kill 的探针确认。
-2. **`only_problem` 的"问题"定义**：未就绪 + 有重启 + 最近一次 OOM + 有 Warning 事件，是否够？
-3. **多容器 Pod 的 usage 聚合**：metrics 给了每个容器，概览里是否要按容器拆行（P2 再定）。
-4. **面板入口位置**：新页 vs 现有面板顶部加 Tab（P3）。
+| # | 问题 | 决定 |
+|---|---|---|
+| 1 | docker 策略重启是否要计入 `RestartCount` | **不用计入**。`RestartCount` 原样透出（仅策略重启），重启次数以 events 为准，不额外加探针 |
+| 2 | 多容器 Pod 的 usage | **拆开**：`usage.containers[]` 逐容器；默认隐藏 `log-shipper` / `log-collector` 等内部 sidecar，用 `hidden_containers` 提示数量 |
+| 3 | `only_problem` 的"问题"定义 | 四个条件**任一**即算问题（未就绪 / 有重启 / 最近一次 OOM / 近 1h 有 Warning 事件），默认关闭 |
+| 4 | 面板入口位置 | 待定（见下） |
+
+## 14. 仍待确认
+
+1. **面板入口位置**：单容器视图加"健康卡片"（轻）vs 顶部加 Tab 的命名空间概览表（重）。
+2. **概览表粒度**：Pod 一行 + 展开看容器，还是容器一行（84 Pod → 约 190 容器行）？
+3. 详情抽屉里事件条数默认多少（10 还是 20）。
+
+---
+
+## 15. 本地调试面板（`:8765`）接入分析
+
+> 对象：`build-agent-docker/k8s/scripts/oom-dashboard`（`index.html` 684 行 + `server.py` 480 行，
+> 无框架、原生 DOM、`poll()` 每 2s 一轮）。本节只做分析，不含实现。
+
+### 15.1 面板现状（决定了怎么接）
+
+| 事实 | 影响 |
+|---|---|
+| 只有一个"关注容器"维度（`OOM_WATCH_USER_ID` 合成条目） | 概览是**新增维度**，不是替换 |
+| 已有目标切换（`base`/`user`/`project` + localStorage） | overview 必须复用同一 `TARGET`，否则会出现"上面看 19、下面看 45" |
+| 服务端只是薄代理（`/api/rcoder-pod`、`/api/rcoder/*`）+ 2s 小缓存 | 需要新增一个带 10s 缓存的 `/api/overview` 代理 |
+| 单文件 HTML（便于运维整包拷走） | 建议**继续单文件**，用注释分区；拆 `overview.js` 会破坏"单文件可拷贝"的优点 |
+| `poll()` 是 2s 主循环 | 概览不能塞进这个循环（84 Pod 太重），要独立 `pollOverview()`（10s） |
+
+### 15.2 三个接入档位
+
+| 档 | 内容 | 依赖 | 改动量 | 价值 |
+|---|---|---|---|---|
+| **A（推荐先做）** | 单容器视图上加一张「健康 / 规格」卡：重启次数、最近是否 OOM、等待原因、CPU/内存限额、最近 3 条事件 | 后端 P1 即可（health+spec+events） | 页面 +1 卡（~60 行）、server +1 代理（~40 行） | 直接回答"我这台容器为什么反复重启" |
+| **B（其次）** | 顶部「命名空间概览」可折叠区：Pod 表（名称/身份/Phase/Ready/规格/用量/重启/OOM/事件数），支持 `only_problem` 过滤与排序，点行回填 `TARGET` 并滚到 A | 后端 P1（无 usage 列）/ P2（有 usage 列） | 页面 ~150 行、server 复用同一代理 | 一眼看到"谁在被 OOM 杀"，是 19 上 backend `Init:CrashLoopBackOff` 这类问题的定位入口 |
+| **C（后置）** | 详情抽屉（events/containers/spec 全展开）、CSV 导出、自动刷新开关 | A+B | ~150 行 | 排障效率 |
+
+### 15.3 关键设计点
+
+1. **必须走服务端代理**，不要浏览器直连 rcoder：统一 `TARGET`、避免 CORS、可缓存/单飞、跨机器切换无需改前端逻辑。
+   代理路由建议 `GET /api/overview?base=…&only_problem=…`，缓存 10s（面板 2s 轮询会打爆 84 Pod 的采集）。
+2. **目标模型复用**：`TARGET.base` 决定查哪台；`TARGET.user` 只用于"高亮当前容器"（在概览表里标一行），
+   不作为 overview 的必需参数。
+3. **轮询节奏**：主循环 2s 不变；概览独立 10s；`document.hidden` 时暂停；概览失败**不得影响**主循环（各自 try/catch）。
+4. **旧版本兼容**：rcoder 返回 404 / `ERR_OPERATION_NOT_SUPPORTED` 时，页面显示
+   「当前 rcoder 版本不支持集群概览」并隐藏该区块，**不能白屏、不能把空表当"没有 Pod"**。
+5. **数值口径**：每行带 `usage.source` 徽标（`agent_grpc` 实时 / `metrics_server` ~15s / `docker_stats`）；
+   `null` 一律显示 `—`（不是 0）；sidecar 默认折叠，行尾提示"另有 N 个内部容器"。
+6. **表格粒度**：建议 **Pod 一行 + 点击展开容器**（84 Pod → 约 190 容器行，直接铺容器行会太长）。
+7. **渲染性能**：只在数据指纹变化时重建 DOM（84 行 × 10s，`innerHTML` 全量重建也可接受，但要避免 2s 级别的重建）。
+
+### 15.4 布局草案（在现有页面上增量加，不推翻）
+
+```
+┌ OOM 观测面板  k8s · 192.168.1.19:30295 · user 6        [切换] [复位] ┐
+├ [目标栏：rcoder 地址 / user_id / project_id]  ← 已存在                  ┤
+├ ▼ 命名空间概览（84 pods · 3 个有问题）        ← B 档新增（可折叠）      │
+│   ⚠ backend-7f6d…  CrashLoop  重启 62  近1h: BackOff×3                   │
+│   ⚠ es-0           Running    重启 1   OOM(最近一次)                     │
+│     redis-0        Running    重启 0                                     │
+├ 关注容器卡片（内存/CPU/进程/距限额 + 曲线）   ← 已存在                    │
+├ 🩺 健康与规格（重启/最近OOM/等待原因/限额/最近事件） ← A 档新增            │
+├ Agent 会话（每 project 一行 + 停止）          ← 已存在                    │
+└ 容器内进程 TOP + 角色分组                     ← 已存在                    │
+```
+
+### 15.5 代价与风险
+
+| 项 | 说明 |
+|---|---|
+| 页面长度 | A+B 合计约 +210 行（684 → ~900）；仍是单文件，可接受 |
+| 兼容矩阵 | 面板要同时能跑在 `0.1.427`（无概览）、`0.1.438`（有 overview 无 tenant 参数）、未来版本 → 全部走"能力探测 + 降级" |
+| 数据放大 | 概览一次 <100KB / 10s；对 127.0.0.1 本地工具无压力 |
+| 误导风险 | 最大风险是"概览说没问题、单容器视图却在涨"——两者来源不同（前者 metrics 15s / 后者 gRPC 实时），UI 必须显示来源与采样时间 |
+| 安全 | 仍是 loopback 只读工具；概览只增信息面（Pod 名/IP），与 `kubectl get pods` 等价 |
+
+### 15.6 建议
+
+先做 **A**（与后端 P1 同批），它把"重启/OOM/限额"这三件最有用的事直接贴到现有视图上，
+改动最小、回归面最小；等 P2 的 `usage` 上线后再加 **B** 的概览表。
