@@ -226,15 +226,23 @@ GET /computer/pod/overview
 | 参数 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `include` | string(csv) | `spec,health,events,usage` | 分段开关，可只要 `health` 做轻量巡检 |
-| `events_limit` | u32 | 10 | 每 Pod 返回最近 N 条事件（上限 50） |
+| `search` | string | — | **关键字过滤**（大小写不敏感的子串匹配，匹配 `name` / `identity.{user_id,app_id,project_id,pod_id}`）。服务端缓存全量快照后做内存过滤，实现成本极低 |
+| `events_limit` | u32 | **20** | 每 Pod 返回最近 N 条事件（上限 50） |
 | `service_type` | string | — | 按 `RuntimeContainerInfo.service_type` 过滤 |
 | `user_id` / `app_id` / `project_id` | string | — | 按结构化身份过滤 |
 | `label_selector` | string | — | 透传（k8s）；docker 下映射为 `label=` 过滤 |
-| `only_problem` | bool | false | **过滤器**：只返回"有异常"的对象，异常 = 下列任一成立：① `ready=false`；② `restart_count > 0`；③ `oom_killed_last=true`；④ 最近 1h 内有 `type=Warning` 事件。默认关闭（返回全部），仅用于面板"只看问题"开关 |
 | `include_sidecars` | bool | false | 是否在 `usage.containers[]` 里带上内部 sidecar（默认隐藏 `log-shipper` / `log-collector`） |
 | `limit` | u32 | 500 | 安全上限，防一次吐爆 |
 
+> 已移除 `only_problem`（当前不需要）。将来若要"只看异常"，两种低成本补法：
+> ① 面板拿全量后本地过滤（`summary` 已给 `not_ready/oom/restarted` 计数）；
+> ② 服务端加回该参数（过滤逻辑与 `summary` 同一套谓词函数，几行代码）。
+
 > 不做 `namespace` 参数（§2）。
+
+> **缓存是硬要求**：所有上游调用（k8s 4 次 list + N 次 gRPC / docker inspect+stats+events）
+> 必须经过 10s 服务端缓存 + 单飞（§6.5），`search` 等过滤参数在**缓存的快照上**做内存过滤，
+> 不触发新的上游调用。
 
 ### 5.2 响应
 
@@ -521,14 +529,15 @@ P1 的收益最直接：**立刻能定位"哪个容器在反复被 OOM 杀"**（
 |---|---|---|
 | 1 | docker 策略重启是否要计入 `RestartCount` | **不用计入**。`RestartCount` 原样透出（仅策略重启），重启次数以 events 为准，不额外加探针 |
 | 2 | 多容器 Pod 的 usage | **拆开**：`usage.containers[]` 逐容器；默认隐藏 `log-shipper` / `log-collector` 等内部 sidecar，用 `hidden_containers` 提示数量 |
-| 3 | `only_problem` 的"问题"定义 | 四个条件**任一**即算问题（未就绪 / 有重启 / 最近一次 OOM / 近 1h 有 Warning 事件），默认关闭 |
-| 4 | 面板入口位置 | 待定（见下） |
+| 3 | `only_problem` 过滤器 | **当前不需要，移除**；改提供 `search` 关键字过滤（子串匹配 name/identity） |
+| 4 | 缓存 | **硬要求**：10s 服务端缓存 + 单飞；过滤参数在缓存快照上做内存过滤 |
+| 5 | 事件默认条数 | **20**（上限 50） |
+| 6 | 面板节奏 | **先 A（健康卡，与后端 P1 同批）再 B（概览表）**，最后 C（抽屉） |
+| 7 | 概览表粒度 | **Pod 一行 + 点击展开容器** |
 
 ## 14. 仍待确认
 
-1. **面板入口位置**：单容器视图加"健康卡片"（轻）vs 顶部加 Tab 的命名空间概览表（重）。
-2. **概览表粒度**：Pod 一行 + 展开看容器，还是容器一行（84 Pod → 约 190 容器行）？
-3. 详情抽屉里事件条数默认多少（10 还是 20）。
+（无 —— 设计参数已全部确认，可进入实施。）
 
 ---
 
@@ -552,7 +561,7 @@ P1 的收益最直接：**立刻能定位"哪个容器在反复被 OOM 杀"**（
 | 档 | 内容 | 依赖 | 改动量 | 价值 |
 |---|---|---|---|---|
 | **A（推荐先做）** | 单容器视图上加一张「健康 / 规格」卡：重启次数、最近是否 OOM、等待原因、CPU/内存限额、最近 3 条事件 | 后端 P1 即可（health+spec+events） | 页面 +1 卡（~60 行）、server +1 代理（~40 行） | 直接回答"我这台容器为什么反复重启" |
-| **B（其次）** | 顶部「命名空间概览」可折叠区：Pod 表（名称/身份/Phase/Ready/规格/用量/重启/OOM/事件数），支持 `only_problem` 过滤与排序，点行回填 `TARGET` 并滚到 A | 后端 P1（无 usage 列）/ P2（有 usage 列） | 页面 ~150 行、server 复用同一代理 | 一眼看到"谁在被 OOM 杀"，是 19 上 backend `Init:CrashLoopBackOff` 这类问题的定位入口 |
+| **B（其次）** | 顶部「命名空间概览」可折叠区：Pod 表（名称/身份/Phase/Ready/规格/用量/重启/OOM/事件数），顶部一个 `search` 输入框（服务端参数、10s 缓存下内存过滤），点行回填 `TARGET` 并滚到 A | 后端 P1（无 usage 列）/ P2（有 usage 列） | 页面 ~150 行、server 复用同一代理 | 一眼看到"谁在被 OOM 杀"，是 19 上 backend `Init:CrashLoopBackOff` 这类问题的定位入口 |
 | **C（后置）** | 详情抽屉（events/containers/spec 全展开）、CSV 导出、自动刷新开关 | A+B | ~150 行 | 排障效率 |
 
 ### 15.3 关键设计点
