@@ -6,8 +6,9 @@
 //! 换代无关,不绑定 expected 身份)。
 
 use axum::extract::State;
-use std::sync::Arc;
-use tracing::{error, info, instrument, warn};
+use std::collections::HashSet;
+use std::sync::{Arc, LazyLock, Mutex};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::router::AppState;
 use crate::{AppError, HttpResult};
@@ -92,6 +93,16 @@ fn resolve_resource_target(
             let Some(app_id) = pod_id else {
                 return Err(TargetReject::BuilderNeedsIdentifier);
             };
+            if user_id.is_some() {
+                // 两个都传时以 app_id 为准：builder 的容器标识就是 app_id。
+                // 留一条 debug，避免调用方以为自己传的 user_id 生效了。
+                debug!(
+                    event = "pod_resources.builder_ignores_user_id",
+                    user_id = ?user_id,
+                    app_id,
+                    "user-app-builder 使用 pod_id(app_id) 定位，忽略 user_id"
+                );
+            }
             Ok(ResourceTarget {
                 service_type,
                 identifier: app_id.to_string(),
@@ -128,9 +139,9 @@ async fn locate_container(
         shared_types::ServiceType::ComputerAgentRunner
             | shared_types::ServiceType::ComputerNormalProject
     );
-    if computer_family && user_id.is_some() {
+    if let (true, Some(user_id)) = (computer_family, user_id) {
         return crate::service::ComputerContainerManager::get_container_info(
-            user_id.expect("checked above"),
+            user_id,
             state.runtime(),
         )
         .await;
@@ -143,6 +154,28 @@ async fn locate_container(
             error!("[POD_RESOURCES] container lookup failed: {e}");
             AppError::internal_server_error(&format!("Failed to query container info: {e}"))
         })
+}
+
+/// 已经就「RPC 成功但没有明细」告警过的容器。
+///
+/// 旧版本 agent_runner（例如 builder 镜像里还停在 0.1.369）会**永久**缺省
+/// 进程明细，而这两个资源接口会被面板高频轮询——不去重就是永久 info 刷屏，
+/// 刷屏等于没有日志。按容器去重后，每台容器每次进程生命周期只留一条。
+static DETAIL_ABSENT_LOGGED: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// 首次见到该容器时返回 true（应当告警），之后返回 false。
+///
+/// 锁中毒时返回 false：宁可少一条日志，也不要让观测路径 panic。
+fn first_detail_absent(container_id: &str) -> bool {
+    let Ok(mut seen) = DETAIL_ABSENT_LOGGED.lock() else {
+        return false;
+    };
+    // 容器会不断创建/销毁，集合要有界；超出后整体清空（只会多打一轮日志）。
+    if seen.len() > 256 {
+        seen.clear();
+    }
+    seen.insert(container_id.to_string())
 }
 
 /// 查询 Computer 容器(整个 pod)资源用量
@@ -332,12 +365,13 @@ pub async fn computer_pod_resources(
     // 忽略 include_processes）或扫描失败。两者都会让观测端看到「没有进程 /
     // 没有 agent」，预发布环境那次空窗口正是这种形态，所以这里必须留痕。
     // 用 info 而不是 warn：混版本滚动期间旧沙箱每次轮询都会命中，warn 会刷屏。
-    if process_count.is_none() {
+    if process_count.is_none() && first_detail_absent(&container_info.container_id) {
         info!(
             event = "pod_resources.detail_absent",
             container_id = %container_info.container_id,
             user_id = ?params.user_id,
-            "container status RPC succeeded but returned no process detail; observation will see empty processes/agents"
+            service_type = ?target.service_type,
+            "container status RPC succeeded but returned no process detail (logged once per container); observation will see empty processes/agents"
         );
     }
     let agents: Vec<shared_types::ComputerAgentExecution> =
@@ -714,21 +748,21 @@ mod tests {
             processes: vec![
                 ContainerProcess {
                     pid: 42,
+                    ppid: 1,
                     comm: "python3".to_string(),
                     rss_bytes: 2 * 1_048_576,
                     cpu_seconds: 1.5,
                     group: "workload".to_string(),
                     args_head: "python3 train.py".to_string(),
-                    ..Default::default()
                 },
                 ContainerProcess {
                     pid: 43,
+                    ppid: 1,
                     comm: "sh".to_string(),
                     rss_bytes: 1_048_576,
                     cpu_seconds: 0.0,
                     group: "infra".to_string(),
                     args_head: String::new(),
-                    ..Default::default()
                 },
             ],
             process_count: Some(2),
@@ -862,6 +896,53 @@ mod tests {
         assert_eq!(err.reason_code(), shared_types::error_codes::ERR_VALIDATION);
     }
 
+    /// `service_type` 是查询参数，必须能按 URL query 里的常见写法解析出来。
+    /// 这条锁的是"输入面"：如果 `user-app-builder` 解析不出来，调用方会收到
+    /// 一个和文档不符的 400。
+    #[test]
+    fn service_type_parses_from_query_string() {
+        use shared_types::ServiceType;
+        for (raw, want) in [
+            ("user-app-builder", ServiceType::UserappBuilder),
+            ("UserappBuilder", ServiceType::UserappBuilder),
+            ("userapp-builder", ServiceType::UserappBuilder),
+            (
+                "computer-normal-project",
+                ServiceType::ComputerNormalProject,
+            ),
+            ("computer-agent-runner", ServiceType::ComputerAgentRunner),
+            ("user-app", ServiceType::Userapp),
+        ] {
+            let qs = format!("user_id=999&service_type={raw}");
+            let parsed: ComputerPodResourcesQuery =
+                serde_urlencoded::from_str(&qs).unwrap_or_else(|e| panic!("{raw} 解析失败: {e}"));
+            assert_eq!(parsed.service_type, Some(want), "{raw} 解析成了别的场景");
+        }
+        // 不传就保持 None（调用方走缺省 computer-agent-runner）
+        let parsed: ComputerPodResourcesQuery = serde_urlencoded::from_str("user_id=999").unwrap();
+        assert_eq!(parsed.service_type, None);
+        // 不认识的词必须报错，不能被静默当成缺省
+        assert!(
+            serde_urlencoded::from_str::<ComputerPodResourcesQuery>(
+                "user_id=999&service_type=not-a-service"
+            )
+            .is_err(),
+            "非法 service_type 应解析失败"
+        );
+    }
+
+    /// 「无明细」告警按容器去重：同一台只报一次，不同容器各自报一次。
+    #[test]
+    fn detail_absent_log_is_deduped_per_container() {
+        let cid = "test-container-detail-absent";
+        assert!(first_detail_absent(cid), "首次应告警");
+        assert!(!first_detail_absent(cid), "同一容器不应重复告警");
+        assert!(
+            first_detail_absent("test-container-detail-absent-2"),
+            "不同容器应各自告警"
+        );
+    }
+
     /// agent 行：空 session_id 不能变成 `Some("")`（前端会当成真实 id）。
     #[test]
     fn agent_mapping_drops_empty_session_id() {
@@ -872,7 +953,6 @@ mod tests {
             rss_bytes: 3 * 1_048_576,
             cpu_seconds: 2.0,
             process_count: 7,
-            ..Default::default()
         });
         assert!(mapped.session_id.is_none());
         assert_eq!(mapped.rss_mb, 3.0);
