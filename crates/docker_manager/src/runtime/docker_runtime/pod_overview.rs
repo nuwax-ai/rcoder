@@ -108,7 +108,12 @@ impl super::DockerRuntime {
             .filter_map(|c| c.names.as_ref().and_then(|n| n.first().cloned()))
             .map(|n| n.trim_start_matches('/').to_string())
             .collect();
-        let (inspections, inspect_failures) = inspect_all(self, &names).await;
+        // 期望的物理身份集合（来自权威 list）：inspect 返回不同 CID =
+        // 同名容器已被删除重建，规格/状态属于另一代，不能与本次 list 的
+        // 身份/事件拼接（第二轮复审 #2）
+        let expected_cids: std::collections::HashSet<String> =
+            summary_list.iter().filter_map(|c| c.id.clone()).collect();
+        let (inspections, inspect_failures) = inspect_all(self, &names, &expected_cids).await;
         let real_failures: Vec<&String> = inspect_failures
             .iter()
             .filter(|(_, err)| !is_not_found_error(err))
@@ -211,9 +216,10 @@ impl super::DockerRuntime {
 async fn inspect_all(
     runtime: &super::DockerRuntime,
     names: &[String],
+    expected_cids: &std::collections::HashSet<String>,
 ) -> (
     HashMap<String, ContainerInspectResponse>,
-    Vec<(String, String)>,
+    Vec<(String, bollard::errors::Error)>,
 ) {
     use std::sync::Arc;
     let client = Arc::new(runtime.inner.get_docker_client().clone());
@@ -233,11 +239,22 @@ async fn inspect_all(
     while let Some((name, result)) = stream.next().await {
         match result {
             Ok(inspect) => {
+                // 核验返回的物理身份：同名容器可能在 list 与 inspect 之间
+                // 被删除重建（CID-A → CID-B）。规格/状态属于 inspect 到的
+                // 那一代，但身份/事件属于 list 那一代——拼起来是两代混合。
+                // 请求按名、核验按 ID：不匹配按"列表项已消失"处理（跳过）。
+                let returned_id = inspect.id.clone().unwrap_or_default();
+                if !returned_id.is_empty() && !expected_cids.contains(&returned_id) {
+                    warn!(
+                        "[POD_OVERVIEW] inspect {name} returned different generation                          (id={returned_id:.12}), skipping to avoid mixing generations"
+                    );
+                    continue;
+                }
                 out.insert(name, inspect);
             }
             Err(e) => {
                 warn!("[POD_OVERVIEW] inspect {name} failed: {e}");
-                failures.push((name, e.to_string()));
+                failures.push((name, e));
             }
         }
     }
@@ -245,8 +262,17 @@ async fn inspect_all(
 }
 
 /// 404 = 容器在 list 与 inspect 之间被删除（真实竞态，非采集故障）。
-fn is_not_found_error(err: &str) -> bool {
-    err.contains("404") || err.to_lowercase().contains("not found")
+///
+/// **必须按 Bollard 错误的真实状态码判断**：按文本匹配会把"HTTP 500 的
+/// 正文里含 not found"或"403 正文里含 404"误当删除竞态，漏掉降级标注。
+fn is_not_found_error(err: &bollard::errors::Error) -> bool {
+    matches!(
+        err,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            ..
+        }
+    )
 }
 
 /// RawEvent → 对外事件形态（显示用容器名；CID 留在内部关联）。
@@ -468,10 +494,9 @@ fn docker_health(state: Option<&ContainerState>, events: &[&RawEvent]) -> PodHea
 /// 扫描倒序列表：第一条 die/kill 是最近一次终止；从它往更旧方向直到
 /// `start`（周期边界）为止的窗口内出现 `oom` → 该次退出为 OOM。
 fn last_exit_cycle(events: &[&RawEvent]) -> (bool, Option<i64>) {
-    let Some(term_idx) = events
-        .iter()
-        .position(|e| matches!(e.action.as_str(), "die" | "kill"))
-    else {
+    // 锚点**只认 die**（实际退出）：kill 信号不必然导致退出——OOM 恢复后
+    // 收到不致命的 SIGHUP 也产生 kill 事件，把它当退出会误清最近 OOM。
+    let Some(term_idx) = events.iter().position(|e| e.action == "die") else {
         return (false, None);
     };
     let exit_code = events[term_idx].exit_code;
@@ -492,7 +517,10 @@ fn count_recovery_cycles(events: &[&RawEvent]) -> u32 {
         // 孤立 die（容器停着没起来）不计；**跨 CID 的 start 不是旧实例的
         // 重启**（名字复用创建的新容器，F4）
         match event.action.as_str() {
-            "die" | "oom" | "kill" => pending_die_cid = Some(event.cid.as_str()),
+            // 只有 die（实际退出）开启恢复对；oom/kill 是周期内上下文，
+            // 不单独构成"等待 start"
+            "die" => pending_die_cid = Some(event.cid.as_str()),
+            "oom" | "kill" => {}
             "start" => {
                 if let Some(die_cid) = pending_die_cid
                     && die_cid == event.cid
@@ -587,6 +615,54 @@ mod tests {
         ];
         let health = docker_health(None, &events.iter().collect::<Vec<_>>());
         assert_eq!(health.restart_count, 0, "跨 CID 不构成恢复对");
+    }
+
+    /// 第三轮 #1：kill 不构成实际退出——OOM 恢复后一个不致命的 kill
+    /// （如 SIGHUP）不得清掉最近 OOM 归因。倒序：kill(3) start(2) die(1,137) oom(0)。
+    #[test]
+    fn non_fatal_kill_does_not_reset_oom_attribution() {
+        let events = [
+            raw("kill", 4, "c1", None),
+            raw("start", 3, "c1", None),
+            raw("die", 2, "c1", Some(137)),
+            raw("oom", 1, "c1", None),
+        ];
+        let state = ContainerState {
+            oom_killed: Some(false),
+            exit_code: Some(0),
+            ..Default::default()
+        };
+        let health = docker_health(Some(&state), &events.iter().collect::<Vec<_>>());
+        assert!(
+            health.oom_killed_last,
+            "die 仍是最近的实际退出，其周期内 oom 有效"
+        );
+        assert_eq!(health.last_exit_code, Some(137));
+    }
+
+    /// 第三轮 #3：状态码判断（真实 Bollard 错误类型，非文本匹配）。
+    #[test]
+    fn not_found_detection_uses_status_code_only() {
+        let not_found = bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            message: "No such container".to_string(),
+        };
+        assert!(is_not_found_error(&not_found));
+        // 500 的正文含 "not found" —— 不是删除竞态
+        let server_500 = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "backend said not found".to_string(),
+        };
+        assert!(
+            !is_not_found_error(&server_500),
+            "文本含 not found 但状态码 500"
+        );
+        // 403 正文含 "404" —— 不是删除竞态
+        let forbidden = bollard::errors::Error::DockerResponseServerError {
+            status_code: 403,
+            message: "caller 404-ish token invalid".to_string(),
+        };
+        assert!(!is_not_found_error(&forbidden), "文本含 404 但状态码 403");
     }
 
     /// F7：health_status: unhealthy 归 Warning，healthy/starting 归 Normal。
