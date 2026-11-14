@@ -111,8 +111,22 @@ impl super::DockerRuntime {
         // 期望的物理身份集合（来自权威 list）：inspect 返回不同 CID =
         // 同名容器已被删除重建，规格/状态属于另一代，不能与本次 list 的
         // 身份/事件拼接（第二轮复审 #2）
-        let expected_cids: std::collections::HashSet<String> =
-            summary_list.iter().filter_map(|c| c.id.clone()).collect();
+        // 每个名字期望的 CID（来自权威 list 的**同一行**）：inspect 返回
+        // 的 ID 必须与该行的 CID 一致——按"整表集合"判断会放行同名接替者
+        // （B 接替了 A 的名字后 inspect 返回 B，B 也在集合中，结果把 A 行
+        // 的身份/事件与 B 的规格/状态拼接）。空 ID 按**未确认**处理。
+        let expected_cids: HashMap<String, String> = summary_list
+            .iter()
+            .filter_map(|c| {
+                let name = c
+                    .names
+                    .as_ref()
+                    .and_then(|n| n.first())
+                    .map(|n| n.trim_start_matches('/').to_string())?;
+                let cid = c.id.clone()?;
+                Some((name, cid))
+            })
+            .collect();
         let (inspections, inspect_failures) = inspect_all(self, &names, &expected_cids).await;
         let real_failures: Vec<&String> = inspect_failures
             .iter()
@@ -216,7 +230,7 @@ impl super::DockerRuntime {
 async fn inspect_all(
     runtime: &super::DockerRuntime,
     names: &[String],
-    expected_cids: &std::collections::HashSet<String>,
+    expected_cids: &HashMap<String, String>,
 ) -> (
     HashMap<String, ContainerInspectResponse>,
     Vec<(String, bollard::errors::Error)>,
@@ -239,14 +253,16 @@ async fn inspect_all(
     while let Some((name, result)) = stream.next().await {
         match result {
             Ok(inspect) => {
-                // 核验返回的物理身份：同名容器可能在 list 与 inspect 之间
-                // 被删除重建（CID-A → CID-B）。规格/状态属于 inspect 到的
-                // 那一代，但身份/事件属于 list 那一代——拼起来是两代混合。
-                // 请求按名、核验按 ID：不匹配按"列表项已消失"处理（跳过）。
+                // 核验返回的物理身份（**逐行**）：返回 ID 必须等于**该行**的
+                // 期望 CID；空 ID 无法确认归属，同样按未确认跳过——未确认
+                // 的规格/状态不能填进这一行。
                 let returned_id = inspect.id.clone().unwrap_or_default();
-                if !returned_id.is_empty() && !expected_cids.contains(&returned_id) {
+                let confirmed = expected_cids
+                    .get(&name)
+                    .is_some_and(|expected| !returned_id.is_empty() && returned_id == *expected);
+                if !confirmed {
                     warn!(
-                        "[POD_OVERVIEW] inspect {name} returned different generation                          (id={returned_id:.12}), skipping to avoid mixing generations"
+                        "[POD_OVERVIEW] inspect {name} returned unconfirmed identity (id={returned_id:.12}), skipping to avoid mixing generations"
                     );
                     continue;
                 }
