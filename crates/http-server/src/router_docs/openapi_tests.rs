@@ -1325,3 +1325,21 @@ fn computer_agent_restart_path_documents_resume_contract() {
         "resumed_session_id must explain its None semantics"
     );
 }
+
+#[test]
+fn overview_params_are_complete() {
+    let doc = ApiDoc::openapi();
+    let item = doc.paths.paths.get("/computer/pod/overview").expect("path");
+    let params: Vec<String> = item
+        .get
+        .as_ref()
+        .and_then(|g| g.parameters.as_ref())
+        .map(|ps| ps.iter().map(|p| inline(p).name.clone()).collect())
+        .unwrap_or_default();
+    for want in [
+        "search", "events_limit", "service_type", "user_id", "app_id", "project_id",
+        "include_sidecars", "limit",
+    ] {
+        assert!(params.iter().any(|p| p == want), "缺少参数 {want}: {params:?}");
+    }
+}

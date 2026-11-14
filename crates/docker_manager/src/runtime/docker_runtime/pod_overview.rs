@@ -257,9 +257,7 @@ async fn inspect_all(
                 // 期望 CID；空 ID 无法确认归属，同样按未确认跳过——未确认
                 // 的规格/状态不能填进这一行。
                 let returned_id = inspect.id.clone().unwrap_or_default();
-                let confirmed = expected_cids
-                    .get(&name)
-                    .is_some_and(|expected| !returned_id.is_empty() && returned_id == *expected);
+                let confirmed = inspect_identity_confirmed(expected_cids.get(&name), &returned_id);
                 if !confirmed {
                     warn!(
                         "[POD_OVERVIEW] inspect {name} returned unconfirmed identity (id={returned_id:.12}), skipping to avoid mixing generations"
@@ -289,6 +287,18 @@ fn is_not_found_error(err: &bollard::errors::Error) -> bool {
             ..
         }
     )
+}
+
+/// inspect 返回身份是否与该行的期望 CID 一致（四轮复审收口项）。
+///
+/// 三种未确认：期望缺席（list 行无 id）、返回空 id、返回**别人的** id
+/// （同名接替者——它可能也在本页列表里，但不属于**这一行**）。
+/// 未确认 → 跳过，规格/状态不填入该行（宁缺毋混代）。
+fn inspect_identity_confirmed(expected: Option<&String>, returned_id: &str) -> bool {
+    match expected {
+        Some(expected) => !returned_id.is_empty() && returned_id == expected,
+        None => false,
+    }
 }
 
 /// RawEvent → 对外事件形态（显示用容器名；CID 留在内部关联）。
@@ -654,6 +664,28 @@ mod tests {
             "die 仍是最近的实际退出，其周期内 oom 有效"
         );
         assert_eq!(health.last_exit_code, Some(137));
+    }
+
+    /// 四轮收口：inspect 身份核验三态——匹配✓、接替者✗、空/缺席✗。
+    #[test]
+    fn inspect_identity_confirmation_three_states() {
+        let expected = "cid-a".to_string();
+        assert!(
+            inspect_identity_confirmed(Some(&expected), "cid-a"),
+            "同行同 CID 确认"
+        );
+        assert!(
+            !inspect_identity_confirmed(Some(&expected), "cid-b"),
+            "同名接替者（在列表里但不属于这一行）不确认"
+        );
+        assert!(
+            !inspect_identity_confirmed(Some(&expected), ""),
+            "空 ID 未确认"
+        );
+        assert!(
+            !inspect_identity_confirmed(None, "cid-a"),
+            "期望缺席（list 行无 id）未确认"
+        );
     }
 
     /// 第三轮 #3：状态码判断（真实 Bollard 错误类型，非文本匹配）。
