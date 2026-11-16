@@ -238,7 +238,6 @@ pub async fn computer_pod_health(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     /// 语义红线：`last_oom_at` 只在 is_oom 时出现，非 OOM 必须是 null
     /// （不能填 0 或当前时间——前端会把任何非空值当成"刚 OOM 过"）。
