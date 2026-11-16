@@ -492,6 +492,116 @@ fn event_sort_key(event: &AppEventInfo) -> chrono::DateTime<chrono::Utc> {
 }
 
 impl super::KubernetesRuntime {
+    /// 单容器健康（`/computer/pod/health`）。
+    ///
+    /// **只 GET 一个 Pod**：容器被 OOM 杀掉后这个接口照样能查——数据源是
+    /// k8s API，不在容器内（这正是它和 `/resources/stream` 的本质区别）。
+    ///
+    /// `identifier` 是 Pod 名（k8s 下 RuntimeContainerInfo.container_name
+    /// 即 Pod 名）。
+    pub(crate) async fn pod_health_inner(
+        &self,
+        identifier: &str,
+    ) -> container_runtime_api::ContainerRuntimeResult<Option<container_runtime_api::ContainerHealth>>
+    {
+        use container_runtime_api::{ContainerHealth, LastTermination};
+
+        let api: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        let pod = match api.get(identifier).await {
+            Ok(pod) => pod,
+            Err(kube::Error::Api(resp)) if resp.code == 404 => return Ok(None),
+            Err(e) => {
+                return Err(container_runtime_api::ContainerRuntimeError::DockerError(
+                    format!("get pod {identifier}: {e}"),
+                ));
+            }
+        };
+
+        let status = pod.status.as_ref();
+        let phase = status
+            .and_then(|s| s.phase.clone())
+            .unwrap_or_else(|| "Unknown".to_string());
+        // 主容器名从 spec 选（与 overview 同一规则：agent>app>rcoder>first）
+        let main_name = main_container_name_from_spec(&pod).filter(|n| !n.is_empty());
+        let cs = main_name
+            .as_deref()
+            .and_then(|name| {
+                status
+                    .and_then(|s| s.container_statuses.as_ref())
+                    .and_then(|list| list.iter().find(|c| c.name == name))
+            })
+            .or_else(|| {
+                status
+                    .and_then(|s| s.container_statuses.as_ref())
+                    .and_then(|list| list.first())
+            });
+
+        let Some(cs) = cs else {
+            // Pod 存在但容器状态还没出来（刚调度）：返回"已知存在但无状态"，
+            // 不伪装成 not found。
+            return Ok(Some(ContainerHealth {
+                container_name: identifier.to_string(),
+                pod_uid: pod.metadata.uid.clone(),
+                alive: false,
+                phase,
+                ready: false,
+                restart_count: 0,
+                last_termination: None,
+                oom_killed_last: false,
+                last_oom_at: None,
+                waiting_reason: Some("ContainerStatusPending".to_string()),
+                detail: Some("container statuses not available yet".to_string()),
+                sampled_at: chrono::Utc::now(),
+                source: "kubernetes".to_string(),
+            }));
+        };
+
+        let diagnostic = pod_container_diagnostic(cs);
+        // 最近一次终止：当前 terminated 优先，否则 lastState（与本仓
+        // pod_diagnostic 同一口径）。finishedAt 是"最近一次重启时刻"的
+        // 权威来源。
+        let terminated = cs
+            .state
+            .as_ref()
+            .and_then(|s| s.terminated.as_ref())
+            .or_else(|| cs.last_state.as_ref().and_then(|s| s.terminated.as_ref()));
+        let finished_at = terminated
+            .and_then(|t| t.finished_at.as_ref())
+            .and_then(|t| chrono::DateTime::from_timestamp_millis(t.0.as_millisecond()));
+        let is_oom = terminated
+            .and_then(|t| t.reason.as_deref())
+            .is_some_and(|r| r == "OOMKilled")
+            || diagnostic.is_oom();
+        let last = terminated.map(|t| LastTermination {
+            reason: t.reason.clone(),
+            exit_code: Some(t.exit_code),
+            finished_at,
+            is_oom,
+        });
+        let alive = status
+            .and_then(|s| s.container_statuses.as_ref())
+            .and_then(|list| list.iter().find(|c| c.name == cs.name))
+            .and_then(|c| c.state.as_ref())
+            .and_then(|st| st.running.as_ref())
+            .is_some();
+
+        Ok(Some(ContainerHealth {
+            container_name: identifier.to_string(),
+            pod_uid: pod.metadata.uid.clone(),
+            alive,
+            phase,
+            ready: cs.ready,
+            restart_count: diagnostic.restart_count,
+            last_termination: last,
+            oom_killed_last: is_oom,
+            last_oom_at: if is_oom { finished_at } else { None },
+            waiting_reason: diagnostic.waiting_reason.clone(),
+            detail: diagnostic.detail.clone(),
+            sampled_at: chrono::Utc::now(),
+            source: "kubernetes".to_string(),
+        }))
+    }
+
     /// 采集命名空间内全部 Pod 的实际用量（metrics.k8s.io）。
     ///
     /// 生态里**没有**维护良好的 `PodMetrics` typed crate（k8s-openapi 不含

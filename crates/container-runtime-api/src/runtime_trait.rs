@@ -120,6 +120,21 @@ pub trait AgentContainerRuntime: Send + Sync {
     /// 规格、健康与最近事件。分区失败以 `degraded` 标注（事件/卷），
     /// 列表本身失败返回 Err——没有列表这个查询没有意义。
     ///
+    /// 单容器健康快照（`/computer/pod/health`，供前端轮询）。
+    ///
+    /// 只查**一个**容器：k8s 单 Pod GET、docker inspect(+events)。刻意不复用
+    /// `observe_namespace_pods`（那是 namespace 全量 list，为一个容器付 48 个
+    /// 的成本）。默认 Unsupported——老实现/测试替身行为不变。
+    async fn container_health(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Option<crate::ContainerHealth>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "container health is unsupported by this runtime".to_string(),
+        ))
+    }
+
     /// 默认 Unsupported：老实现与测试替身行为不变；调用方（overview
     /// handler）把它映射为 503 + `error_detail`，不静默返回空。
     async fn observe_namespace_pods(

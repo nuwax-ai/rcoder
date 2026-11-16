@@ -150,6 +150,71 @@ pub struct PodVolumeSpec {
     pub host_path: Option<String>,
 }
 
+/// 单个容器的健康快照（`/computer/pod/health` 的载荷）。
+///
+/// 与 `PodHealth` 的区别：这是**专供轮询**的轻量视图——只查一个容器、
+/// 携带"最近一次终止"的完整证据（含**时间**与**pod_uid**），不返回
+/// Pod 列表/事件/spec。
+///
+/// 语义红线（与 overview 一致）：
+/// - `last_termination` 为 `None` = 从未终止过（**不是**空对象）；
+/// - `last_oom_at` 非 OOM 时为 `None`（**不填 0、不填当前时间**）；
+/// - `is_oom` 由 `reason == "OOMKilled"` 判定，**绝不用 exit_code==137
+///   推断**（实测 137 也来自 liveness SIGKILL）；
+/// - `pod_uid` 变化 = 容器被删除重建（计数归零），前端据此识别换代。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ContainerHealth {
+    /// 容器/Pod 名
+    pub container_name: String,
+    /// 物理身份（k8s: Pod UID；docker: container ID）。
+    /// 变化即代表"换了一个容器"，历史计数不再可比。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod_uid: Option<String>,
+    /// 容器是否存活（k8s：phase/state；docker：State.Running）。
+    /// **容器死了这个接口照样能查**——数据源在运行时侧，不在容器内。
+    pub alive: bool,
+    /// 运行阶段（k8s: Pod phase；docker: running/exited/…）
+    pub phase: String,
+    /// 主容器是否 ready
+    pub ready: bool,
+    /// 累计重启次数（含非 OOM）
+    pub restart_count: u32,
+    /// 最近一次终止的完整信息；`None` = 从未终止过
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_termination: Option<LastTermination>,
+    /// 最近一次退出是否为 OOM（等价 `last_termination.is_oom`，便于前端直取）
+    pub oom_killed_last: bool,
+    /// 最近一次 OOM 的时间；非 OOM 时为 `None`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_oom_at: Option<DateTime<Utc>>,
+    /// 当前等待原因（CrashLoopBackOff 等）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_reason: Option<String>,
+    /// 可读详情（k8s: back-off 描述；docker: State.Error 等启动/运行错误）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// 本次采样时间（前端据此判断数据新鲜度）
+    pub sampled_at: DateTime<Utc>,
+    /// 数据来源："kubernetes" / "docker"
+    pub source: String,
+}
+
+/// 最近一次终止/重启的证据。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct LastTermination {
+    /// 终止原因：`OOMKilled` / `Error` / `Completed` / `ContainerCannotRun`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// 退出码（137=SIGKILL 但**不等于** OOM）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// 终止时刻（k8s `lastState.terminated.finishedAt`；docker die 事件时间）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+    /// 是否 OOM（`reason == "OOMKilled"`）
+    pub is_oom: bool,
+}
+
 /// 实际用量段（P2：k8s metrics-server / agent gRPC / docker stats）。
 ///
 /// **整段可缺省**：采集不到就是 `None`，绝不填 0——0 会被读成"空载"。

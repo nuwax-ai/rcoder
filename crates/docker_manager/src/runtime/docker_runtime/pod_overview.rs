@@ -299,6 +299,107 @@ fn is_not_found_error(err: &bollard::errors::Error) -> bool {
     )
 }
 
+impl super::DockerRuntime {
+    /// 单容器健康（`/computer/pod/health`，docker 后端）。
+    ///
+    /// docker 的重启信息与 k8s 不同：
+    /// - `State.OOMKilled` / `ExitCode` **只在容器停止时有效**，运行中会被
+    ///   重置（ExitCode=0、OOMKilled=false）——所以"最近一次重启"必须靠
+    ///   `docker events` 的 `die`（带 exitCode 属性和纳秒时间）；
+    /// - `RestartCount` 不包含 `docker restart`（实测），故重启次数以
+    ///   die→start 恢复对计数（与 overview 同一口径）；
+    /// - `State.Error` 是启动/运行错误（如 OCI runtime error），不是重启
+    ///   原因，作为 `detail` 透出。
+    pub(crate) async fn container_health_inner(
+        &self,
+        name: &str,
+    ) -> container_runtime_api::ContainerRuntimeResult<Option<container_runtime_api::ContainerHealth>>
+    {
+        use container_runtime_api::{ContainerHealth, LastTermination};
+
+        let client = self.inner.get_docker_client();
+        let inspect = match client
+            .inspect_container(name, Some(InspectContainerOptionsBuilder::new().build()))
+            .await
+        {
+            Ok(inspect) => inspect,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Ok(None),
+            Err(e) => {
+                return Err(container_runtime_api::ContainerRuntimeError::DockerError(
+                    format!("inspect {name}: {e}"),
+                ));
+            }
+        };
+        let cid = inspect.id.clone().unwrap_or_default();
+        let state = inspect.state.as_ref();
+        let alive = state.and_then(|s| s.running).unwrap_or(false);
+        let phase = state
+            .and_then(|s| s.status.as_ref())
+            .map(|st| st.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // 事件：找本 CID 最近的 die（退出码 + 时间）；失败只降级不影响
+        // 存活判定（events 是"历史可见性"，不是"活着没"）。
+        let (raw_events, _partial) = match collect_recent_events(self).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("[POD_HEALTH] docker events degraded: {e}");
+                (Vec::new(), false)
+            }
+        };
+        let own: Vec<&RawEvent> = raw_events.iter().filter(|e| e.cid == cid).collect();
+        let last_die = own.iter().find(|e| e.action == "die");
+        // 退出周期归因：最近一条 die 及其窗口内的 oom（与 overview 同一函数）
+        let (oom_in_cycle, die_exit_code) = last_exit_cycle(&own);
+
+        let finished_at = last_die
+            .map(|e| e.time_nano)
+            .filter(|nano| *nano > 0)
+            .and_then(|nano| {
+                chrono::DateTime::from_timestamp(
+                    nano.div_euclid(1_000_000_000),
+                    nano.rem_euclid(1_000_000_000) as u32,
+                )
+            });
+        let reason = if oom_in_cycle {
+            Some("OOMKilled".to_string())
+        } else if last_die.is_some() {
+            Some("Error".to_string())
+        } else {
+            None
+        };
+
+        Ok(Some(ContainerHealth {
+            container_name: name.to_string(),
+            pod_uid: (!cid.is_empty()).then_some(cid),
+            alive,
+            phase,
+            ready: alive,
+            restart_count: count_recovery_cycles(&own),
+            last_termination: if last_die.is_some() {
+                Some(LastTermination {
+                    reason,
+                    exit_code: die_exit_code.map(|c| c as i32),
+                    finished_at,
+                    is_oom: oom_in_cycle,
+                })
+            } else {
+                None
+            },
+            oom_killed_last: oom_in_cycle || state.and_then(|s| s.oom_killed).unwrap_or(false),
+            last_oom_at: if oom_in_cycle { finished_at } else { None },
+            waiting_reason: None,
+            detail: state
+                .and_then(|s| s.error.clone())
+                .filter(|e| !e.is_empty()),
+            sampled_at: chrono::Utc::now(),
+            source: "docker".to_string(),
+        }))
+    }
+}
+
 /// 采集容器实际用量（docker stats 单次采样，并发 8）。
 ///
 /// 返回 (按容器名索引的 usage, 失败数)；失败不阻塞整体（属实降级）。

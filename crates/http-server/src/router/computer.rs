@@ -71,6 +71,7 @@ pub(super) fn computer_routes(state: Arc<AppState>) -> Router {
             "/computer/pod/resources/stream",
             get(handler::computer_pod_resources_stream),
         )
+        .route("/computer/pod/health", get(handler::computer_pod_health))
         .route("/computer/pod/vnc-status", get(handler::pod_vnc_status))
         // 🆕 音频代理路由（用于 OpenAPI 文档）
         .route(

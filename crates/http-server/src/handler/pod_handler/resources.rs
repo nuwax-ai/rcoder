@@ -18,14 +18,14 @@ use super::I18nQuery;
 
 /// 解析后的查询目标：业务场景 + 该场景下用于定位容器的标识符。
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ResourceTarget {
-    service_type: shared_types::ServiceType,
-    identifier: String,
+pub(super) struct ResourceTarget {
+    pub(super) service_type: shared_types::ServiceType,
+    pub(super) identifier: String,
 }
 
 /// 目标解析的拒绝原因。与 HTTP 层解耦，便于单测断言。
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum TargetReject {
+pub(super) enum TargetReject {
     /// 三字段分派不合法（与 `/computer/pod/ensure` 同一套报错语义）
     InvalidAppTarget(String),
     /// 既没给标识符也没给 app_id
@@ -38,7 +38,7 @@ enum TargetReject {
 }
 
 impl TargetReject {
-    fn reason_code(&self) -> &'static str {
+    pub(super) fn reason_code(&self) -> &'static str {
         match self {
             Self::InvalidAppTarget(_) | Self::MissingIdentifier | Self::BuilderNeedsAppId => {
                 shared_types::error_codes::ERR_VALIDATION
@@ -47,7 +47,7 @@ impl TargetReject {
         }
     }
 
-    fn detail(&self) -> String {
+    pub(super) fn detail(&self) -> String {
         match self {
             Self::InvalidAppTarget(message) => message.clone(),
             Self::MissingIdentifier => "user_id or pod_id is required".to_string(),
@@ -76,7 +76,7 @@ impl TargetReject {
 /// 资源查询必须和"创建/保活/停止"看到同一台容器，否则会出现"界面看到的
 /// 容器"和"实际被操作/被监控的容器"不是一台。缺省不传 = computer-agent-runner，
 /// 老调用方行为不变。
-fn resolve_resource_target(
+pub(super) fn resolve_resource_target(
     params: &ComputerPodResourcesQuery,
 ) -> Result<ResourceTarget, TargetReject> {
     // 租户/空间/隔离类型只属于创建期（容器 env、Deployment 标签、工作目录），
@@ -165,7 +165,7 @@ fn resolve_resource_target(
 ///
 /// computer 族且给了 user_id 时沿用既有 `get_container_info`（带刷新语义），
 /// 其余场景走 `get_container_info_by_identifier`，避免改动既有行为。
-async fn locate_container(
+pub(super) async fn locate_container(
     state: &Arc<AppState>,
     target: &ResourceTarget,
     user_id: Option<&str>,

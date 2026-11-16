@@ -37,6 +37,7 @@ use crate::handler;
         handler::computer_ttyd_proxy,
         handler::pod_count,
         handler::pod_overview,
+        handler::computer_pod_health,
         handler::pod_list,
         handler::pod_ensure,
         handler::pod_keepalive,

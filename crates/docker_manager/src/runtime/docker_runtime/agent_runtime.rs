@@ -1097,6 +1097,14 @@ impl AgentContainerRuntime for DockerRuntime {
         Ok(result)
     }
 
+    async fn container_health(
+        &self,
+        identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Option<container_runtime_api::ContainerHealth>> {
+        self.container_health_inner(identifier).await
+    }
+
     async fn sync_states(&self) -> ContainerRuntimeResult<(u32, Vec<RemovedContainerInfo>)> {
         self.inner
             .sync_all_container_states()

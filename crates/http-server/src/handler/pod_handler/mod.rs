@@ -31,6 +31,7 @@ mod compute;
 pub use compute::*;
 mod ensure;
 mod ensure_flow;
+mod health;
 mod helpers;
 mod keepalive;
 mod overview;
@@ -47,6 +48,7 @@ mod types;
 mod vnc_status;
 
 pub use ensure::*;
+pub use health::*;
 pub(crate) use helpers::resolve_resource_limits_from_config;
 /// userApp 三字段（service_type/app_id/app_stage）分派共用件——pod 族与
 /// agent 族（status/stop/cancel/notify-resolved/cache-clean）单一事实源
