@@ -1337,9 +1337,18 @@ fn overview_params_are_complete() {
         .map(|ps| ps.iter().map(|p| inline(p).name.clone()).collect())
         .unwrap_or_default();
     for want in [
-        "search", "events_limit", "service_type", "user_id", "app_id", "project_id",
-        "include_sidecars", "limit",
+        "search",
+        "events_limit",
+        "service_type",
+        "user_id",
+        "app_id",
+        "project_id",
+        "include_sidecars",
+        "limit",
     ] {
-        assert!(params.iter().any(|p| p == want), "缺少参数 {want}: {params:?}");
+        assert!(
+            params.iter().any(|p| p == want),
+            "缺少参数 {want}: {params:?}"
+        );
     }
 }

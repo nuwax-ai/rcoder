@@ -359,7 +359,10 @@ fn summarize(snapshot: &PodOverviewSnapshot) -> PodOverviewSummary {
         if pod.phase == "running" || pod.phase == "Running" {
             summary.running += 1;
         }
-        if !pod.ready {
+        // 已完成任务（Succeeded/Completed）的 ready=false 是终态，不是
+        // "未就绪"——计入会让面板报"未就绪 27"却找不到 27 个异常
+        let is_done_task = matches!(pod.phase.as_str(), "Succeeded" | "Completed");
+        if !pod.ready && !is_done_task {
             summary.not_ready += 1;
         }
         if pod.health.restart_count > 0 {
