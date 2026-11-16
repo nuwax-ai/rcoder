@@ -165,9 +165,12 @@ pub struct PodUsage {
     /// CPU 使用（核）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_cores: Option<f64>,
-    /// CPU 使用率（% of limit；无 limit 时为 % of 1 核，由前端决定口径）
+    /// CPU 使用率（%）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_percent: Option<f64>,
+    /// `cpu_percent` 的分母口径："limit"（占上限）| "request"（占申请）| "none"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_percent_basis: Option<String>,
     /// 内存使用（MB）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mem_used_mb: Option<i64>,

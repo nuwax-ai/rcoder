@@ -362,6 +362,7 @@ async fn collect_stats(
                 window: None,
                 cpu_cores: None, // one_shot 无基线，见上方说明
                 cpu_percent: None,
+                cpu_percent_basis: None,
                 mem_used_mb: mem_bytes.map(|b| (b / 1_048_576) as i64),
                 mem_limit_mb: limit_bytes.map(|b| (b / 1_048_576) as i64),
                 process_count: pids.map(|p| p as u32),

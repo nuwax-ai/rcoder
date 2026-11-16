@@ -297,13 +297,23 @@ pub async fn pod_overview(
     for pod in &mut pods {
         if let Some(usage) = pod.usage.as_mut() {
             if usage.mem_limit_mb.is_none() {
-                usage.mem_limit_mb = Some(pod.spec.mem_limit_mb).flatten();
+                usage.mem_limit_mb = pod.spec.mem_limit_mb;
             }
+            // 使用率的分母：limit 优先；没设 limit 的 Pod 很多（只设 request），
+            // 直接空着会让"使用率"整列缺失。退回 request 并在 percent_basis
+            // 标注口径，避免把"占 request 的比例"误读成"占上限的比例"。
             if usage.cpu_percent.is_none()
-                && let (Some(cores), Some(limit)) = (usage.cpu_cores, pod.spec.cpu_limit_cores)
-                && limit > 0.0
+                && let Some(cores) = usage.cpu_cores
             {
-                usage.cpu_percent = Some(cores / limit * 100.0);
+                let (denom, basis) = match (pod.spec.cpu_limit_cores, pod.spec.cpu_request_cores) {
+                    (Some(limit), _) if limit > 0.0 => (Some(limit), "limit"),
+                    (None, Some(request)) if request > 0.0 => (Some(request), "request"),
+                    _ => (None, "none"),
+                };
+                if let Some(denom) = denom {
+                    usage.cpu_percent = Some(cores / denom * 100.0);
+                    usage.cpu_percent_basis = Some(basis.to_string());
+                }
             }
         }
     }

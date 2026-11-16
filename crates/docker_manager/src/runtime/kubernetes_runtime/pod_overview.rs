@@ -556,7 +556,8 @@ impl super::KubernetesRuntime {
                     source: "metrics_server".to_string(),
                     window,
                     cpu_cores: Some(cpu_cores),
-                    cpu_percent: None, // 由 handler 结合 limit 计算
+                    cpu_percent: None, // 由 handler 结合 limit/request 计算
+                    cpu_percent_basis: None,
                     mem_used_mb: Some((mem_bytes / 1_048_576) as i64),
                     mem_limit_mb: None,  // 由 handler 从 spec 填
                     process_count: None, // metrics API 无 pids
