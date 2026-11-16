@@ -507,14 +507,27 @@ impl super::KubernetesRuntime {
         use container_runtime_api::{ContainerHealth, LastTermination};
 
         let api: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
-        let pod = match api.get(identifier).await {
-            Ok(pod) => pod,
-            Err(kube::Error::Api(resp)) if resp.code == 404 => return Ok(None),
-            Err(e) => {
-                return Err(container_runtime_api::ContainerRuntimeError::DockerError(
-                    format!("get pod {identifier}: {e}"),
-                ));
+        // 名字解析：`container_name` 在 k8s 下是 **workload 名**
+        // （`rcoder-computer-agent-runner-6`），Pod 名带 StatefulSet 序号
+        // （`...-6-0`）。三级解析，成本从低到高：
+        //   ① 直接 GET（identifier 本身即 Pod 名时命中）
+        //   ② GET `<identifier>-0`（sts 单副本；rcoder 全部 workload 的常态）
+        //   ③ list + ownerReference 匹配（多副本/异常序号兜底）
+        let pod = match Self::get_pod_or_404(&api, identifier).await {
+            Ok(Some(pod)) => pod,
+            Ok(None) => {
+                let ordinal = format!("{identifier}-0");
+                match Self::get_pod_or_404(&api, &ordinal).await {
+                    Ok(Some(pod)) => pod,
+                    Ok(None) => match Self::find_pod_by_owner(&api, identifier).await {
+                        Ok(Some(pod)) => pod,
+                        Ok(None) => return Ok(None),
+                        Err(e) => return Err(e),
+                    },
+                    Err(e) => return Err(e),
+                }
             }
+            Err(e) => return Err(e),
         };
 
         let status = pod.status.as_ref();
@@ -675,6 +688,41 @@ impl super::KubernetesRuntime {
             );
         }
         Ok(out)
+    }
+}
+
+impl super::KubernetesRuntime {
+    /// GET 单个 Pod；404 返回 `Ok(None)`（不是错误）。
+    async fn get_pod_or_404(
+        api: &Api<Pod>,
+        name: &str,
+    ) -> container_runtime_api::ContainerRuntimeResult<Option<Pod>> {
+        match api.get(name).await {
+            Ok(pod) => Ok(Some(pod)),
+            Err(kube::Error::Api(resp)) if resp.code == 404 => Ok(None),
+            Err(e) => Err(container_runtime_api::ContainerRuntimeError::K8sError(
+                format!("get pod {name}: {e}"),
+            )),
+        }
+    }
+
+    /// 兜底：按 ownerReference 名匹配（workload 名 → Pod）。
+    /// 只在①②都 404 时走（异常路径），一次 list 可接受。
+    async fn find_pod_by_owner(
+        api: &Api<Pod>,
+        workload: &str,
+    ) -> container_runtime_api::ContainerRuntimeResult<Option<Pod>> {
+        let list = api.list(&ListParams::default()).await.map_err(|e| {
+            container_runtime_api::ContainerRuntimeError::K8sError(format!(
+                "list pods for owner {workload}: {e}"
+            ))
+        })?;
+        Ok(list.items.into_iter().find(|pod| {
+            pod.metadata
+                .owner_references
+                .as_ref()
+                .is_some_and(|refs| refs.iter().any(|r| r.name == workload))
+        }))
     }
 }
 
