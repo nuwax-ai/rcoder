@@ -291,6 +291,23 @@ pub async fn pod_overview(
         pod.events.truncate(events_limit);
     }
 
+    // usage 后处理：用 spec 的 limit 补 mem_limit 与 cpu_percent
+    // （metrics/k8s 只给原始用量，百分比需要 limit 才能算——放在这里而不是
+    //  采集层，是因为 limit 来自 Pod spec，采集层不该再读一遍）
+    for pod in &mut pods {
+        if let Some(usage) = pod.usage.as_mut() {
+            if usage.mem_limit_mb.is_none() {
+                usage.mem_limit_mb = Some(pod.spec.mem_limit_mb).flatten();
+            }
+            if usage.cpu_percent.is_none()
+                && let (Some(cores), Some(limit)) = (usage.cpu_cores, pod.spec.cpu_limit_cores)
+                && limit > 0.0
+            {
+                usage.cpu_percent = Some(cores / limit * 100.0);
+            }
+        }
+    }
+
     // sidecar 隐藏（默认）
     if !include_sidecars {
         for pod in &mut pods {
@@ -398,6 +415,7 @@ mod tests {
             ip: None,
             created_at: None,
             spec: Default::default(),
+            usage: None,
             health: container_runtime_api::pod_overview::PodHealth {
                 restart_count: restarts,
                 oom_killed_last: oom,

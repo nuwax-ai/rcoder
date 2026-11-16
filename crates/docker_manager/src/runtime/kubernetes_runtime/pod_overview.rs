@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use container_runtime_api::AppEventInfo;
 use container_runtime_api::pod_overview::{
     PodHealth, PodIdentity, PodOverviewDegraded, PodOverviewItem, PodOverviewSnapshot,
-    PodResourcesSpec, PodVolumeSpec, PodWorkload, group_events_by_pod,
+    PodResourcesSpec, PodUsage, PodVolumeSpec, PodWorkload, group_events_by_pod,
 };
 use k8s_openapi::api::core::v1::{Event, PersistentVolumeClaim, Pod};
 use kube::api::{Api, ListParams};
@@ -122,6 +122,21 @@ impl super::KubernetesRuntime {
             }
         };
 
+        // 3.5) 实际用量：metrics.k8s.io（一次 list 覆盖全部 Pod）。
+        //      失败只降级（usage=None + degraded），不失败整体。
+        let usage_by_pod = match self.pod_metrics_usage().await {
+            Ok(map) => map,
+            Err(e) => {
+                warn!("[POD_OVERVIEW] metrics degraded: {e}");
+                degraded.push(PodOverviewDegraded {
+                    section: "usage".to_string(),
+                    reason: "metrics_unavailable".to_string(),
+                    detail: Some(e),
+                });
+                HashMap::new()
+            }
+        };
+
         // 4) 组装
         let mut items = Vec::with_capacity(pod_list.items.len());
         for pod in pod_list.items {
@@ -151,6 +166,7 @@ impl super::KubernetesRuntime {
                 }),
                 spec: pod_spec(&pod, &pvc_capacity),
                 health,
+                usage: usage_by_pod.get(&name).cloned(),
                 events: events_by_pod.get(&name).cloned().unwrap_or_default(),
             });
         }
@@ -473,6 +489,82 @@ fn event_sort_key(event: &AppEventInfo) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::parse_from_rfc3339(&event.timestamp)
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+}
+
+impl super::KubernetesRuntime {
+    /// 采集命名空间内全部 Pod 的实际用量（metrics.k8s.io）。
+    ///
+    /// 生态里**没有**维护良好的 `PodMetrics` typed crate（k8s-openapi 不含
+    /// metrics 组），官方支持的路径是 `Api<DynamicObject>` + `ApiResource`
+    /// ——仍走 kube 的完整客户端栈（TLS/鉴权/超时/错误类型），只把返回值
+    /// 当动态对象解析要的两个字段，而不是手写 HTTP。
+    ///
+    /// 失败（未装 metrics-server / RBAC 不足）返回 Err，由调用方降级为
+    /// `usage=None + degraded(usage)`，不影响其他分区。
+    pub(crate) async fn pod_metrics_usage(&self) -> Result<HashMap<String, PodUsage>, String> {
+        use kube::api::{ApiResource, DynamicObject, GroupVersionKind};
+        use shared_types::{parse_cpu_quantity, parse_memory_quantity};
+
+        let gvk = GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "PodMetrics");
+        let resource = ApiResource::from_gvk(&gvk);
+        let api: Api<DynamicObject> =
+            Api::namespaced_with(self.client.clone(), &self.namespace, &resource);
+        let list = api
+            .list(&ListParams::default())
+            .await
+            .map_err(|e| format!("list pod metrics: {e}"))?;
+
+        let mut out = HashMap::new();
+        for item in list.items {
+            let Some(name) = item.metadata.name.clone() else {
+                continue;
+            };
+            // window 是"采样值而非瞬时值"的证据，必须回显
+            let window = item
+                .data
+                .get("window")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let mut cpu_cores = 0.0f64;
+            let mut mem_bytes = 0u64;
+            let mut seen = false;
+            if let Some(containers) = item.data.get("containers").and_then(|v| v.as_array()) {
+                for container in containers {
+                    let Some(usage) = container.get("usage") else {
+                        continue;
+                    };
+                    if let Some(cpu) = usage.get("cpu").and_then(|v| v.as_str())
+                        && let Some(cores) = parse_cpu_quantity(cpu)
+                    {
+                        cpu_cores += cores;
+                        seen = true;
+                    }
+                    if let Some(mem) = usage.get("memory").and_then(|v| v.as_str())
+                        && let Some(bytes) = parse_memory_quantity(mem)
+                    {
+                        mem_bytes = mem_bytes.saturating_add(bytes);
+                        seen = true;
+                    }
+                }
+            }
+            if !seen {
+                continue;
+            }
+            out.insert(
+                name,
+                PodUsage {
+                    source: "metrics_server".to_string(),
+                    window,
+                    cpu_cores: Some(cpu_cores),
+                    cpu_percent: None, // 由 handler 结合 limit 计算
+                    mem_used_mb: Some((mem_bytes / 1_048_576) as i64),
+                    mem_limit_mb: None,  // 由 handler 从 spec 填
+                    process_count: None, // metrics API 无 pids
+                },
+            );
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

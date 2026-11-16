@@ -22,7 +22,7 @@ use bollard::query_parameters::{
 use container_runtime_api::AppEventInfo;
 use container_runtime_api::pod_overview::{
     PodHealth, PodIdentity, PodOverviewDegraded, PodOverviewItem, PodOverviewSnapshot,
-    PodResourcesSpec, PodVolumeSpec,
+    PodResourcesSpec, PodUsage, PodVolumeSpec,
 };
 use futures_util::StreamExt;
 use tracing::warn;
@@ -127,6 +127,15 @@ impl super::DockerRuntime {
                 Some((name, cid))
             })
             .collect();
+        // 实际用量：docker stats（one_shot 单次采样）。失败只降级。
+        let (stats_map, stats_failed) = collect_stats(self, &names).await;
+        if stats_failed > 0 {
+            degraded.push(PodOverviewDegraded {
+                section: "usage".to_string(),
+                reason: "docker_stats_partial".to_string(),
+                detail: Some(format!("{stats_failed} 个容器 stats 采集失败")),
+            });
+        }
         let (inspections, inspect_failures) = inspect_all(self, &names, &expected_cids).await;
         let real_failures: Vec<&String> = inspect_failures
             .iter()
@@ -212,6 +221,7 @@ impl super::DockerRuntime {
                 }),
                 spec: docker_spec(inspect),
                 health: docker_health(state, &own_events),
+                usage: stats_map.get(&name).cloned(),
                 events: display_events,
             });
         }
@@ -287,6 +297,78 @@ fn is_not_found_error(err: &bollard::errors::Error) -> bool {
             ..
         }
     )
+}
+
+/// 采集容器实际用量（docker stats 单次采样，并发 8）。
+///
+/// 返回 (按容器名索引的 usage, 失败数)；失败不阻塞整体（属实降级）。
+async fn collect_stats(
+    runtime: &super::DockerRuntime,
+    names: &[String],
+) -> (HashMap<String, PodUsage>, usize) {
+    use bollard::query_parameters::StatsOptionsBuilder;
+    use std::sync::Arc;
+
+    let client = Arc::new(runtime.inner.get_docker_client().clone());
+    let mut out = HashMap::new();
+    let mut failed = 0usize;
+    const CONCURRENCY: usize = 8;
+    let results: Vec<(String, Option<bollard::models::ContainerStatsResponse>)> =
+        futures_util::stream::iter(names.to_vec())
+            .map(|name| {
+                let client = client.clone();
+                async move {
+                    let options = StatsOptionsBuilder::new()
+                        .stream(false)
+                        .one_shot(true)
+                        .build();
+                    let mut stream = client.stats(&name, Some(options));
+                    // one_shot 只出一帧：取首个结果即止（Ok 或 Err）
+                    let got = match stream.next().await {
+                        Some(Ok(stat)) => Some(stat),
+                        Some(Err(e)) => {
+                            warn!("[POD_OVERVIEW] stats {name} failed: {e}");
+                            None
+                        }
+                        None => None,
+                    };
+                    (name, got)
+                }
+            })
+            .buffer_unordered(CONCURRENCY)
+            .collect()
+            .await;
+
+    for (name, stat) in results {
+        let Some(stat) = stat else {
+            failed += 1;
+            continue;
+        };
+        // 单次采样没有 precpu 基线，用 docker 的"相对 limit/核数"口径：
+        // cpu_stats.cpu_usage.total_usage 是累计值，不能算瞬时百分比 →
+        // 这里只给 cores（total/system 差分在同一次响应内是 0），
+        // 因此改用 memory + pids 可靠字段，CPU 标注为不可用。
+        let mem_bytes = stat.memory_stats.as_ref().and_then(|m| m.usage);
+        let limit_bytes = stat
+            .memory_stats
+            .as_ref()
+            .and_then(|m| m.limit)
+            .filter(|limit| *limit > 0);
+        let pids = stat.pids_stats.as_ref().and_then(|p| p.current);
+        out.insert(
+            name,
+            PodUsage {
+                source: "docker_stats".to_string(),
+                window: None,
+                cpu_cores: None, // one_shot 无基线，见上方说明
+                cpu_percent: None,
+                mem_used_mb: mem_bytes.map(|b| (b / 1_048_576) as i64),
+                mem_limit_mb: limit_bytes.map(|b| (b / 1_048_576) as i64),
+                process_count: pids.map(|p| p as u32),
+            },
+        );
+    }
+    (out, failed)
 }
 
 /// inspect 返回身份是否与该行的期望 CID 一致（四轮复审收口项）。

@@ -60,6 +60,9 @@ pub struct PodOverviewItem {
     pub spec: PodResourcesSpec,
     /// 健康段
     pub health: PodHealth,
+    /// 实际用量段（采集不到为 None，不填 0）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<PodUsage>,
     /// 最近事件（倒序，最多 `events_limit` 条；采集失败为空数组——
     /// 与"没有事件"的区分靠 `PodOverviewSnapshot::degraded`）
     #[serde(default)]
@@ -145,6 +148,35 @@ pub struct PodVolumeSpec {
     /// docker：宿主机源路径（Source）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_path: Option<String>,
+}
+
+/// 实际用量段（P2：k8s metrics-server / agent gRPC / docker stats）。
+///
+/// **整段可缺省**：采集不到就是 `None`，绝不填 0——0 会被读成"空载"。
+/// `source` 与 `window` 必须回显：agent gRPC 是实时值，metrics-server 是
+/// 采样窗口内的平均值，两者不可直接对比。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PodUsage {
+    /// 数据来源："agent_grpc"（实时）| "metrics_server"（~15s 窗口）| "docker_stats"
+    pub source: String,
+    /// 采样窗口（metrics-server 的 `window`，如 "15s"；gRPC 为 None = 实时）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    /// CPU 使用（核）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_cores: Option<f64>,
+    /// CPU 使用率（% of limit；无 limit 时为 % of 1 核，由前端决定口径）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_percent: Option<f64>,
+    /// 内存使用（MB）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem_used_mb: Option<i64>,
+    /// 内存限额（MB，用于算使用率；来源同 spec）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem_limit_mb: Option<i64>,
+    /// 进程数（仅 agent gRPC / docker stats 有）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_count: Option<u32>,
 }
 
 /// 健康段。数值语义见模块头注释。
@@ -316,6 +348,7 @@ mod tests {
             created_at: None,
             spec: Default::default(),
             health: Default::default(),
+            usage: None,
             events: Vec::new(),
         }
     }
