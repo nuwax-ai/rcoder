@@ -97,7 +97,7 @@ const CACHE_TTL_SECS: u64 = 3;
     tag = "pod",
     operation_id = "computer_pod_health",
     summary = "查询单个容器的健康/OOM 信息（供前端轮询）",
-    description = "只查一个容器（k8s 单 Pod GET / docker inspect+events），**容器被 OOM 杀掉后仍可查询**——数据源在运行时侧，不在容器内。\n\n语义红线：`last_termination=null` 表示从未终止过；`is_oom` 由 `reason==OOMKilled` 判定（**不**用 exit_code==137 推断，liveness SIGKILL 同样给 137）；`last_oom_at` 非 OOM 时为 null。`pod_uid` 变化 = 容器被删除重建（计数归零）。\n\n默认 3s 缓存；`fresh=true` 强制直读。k8s 用 `lastState.terminated.finishedAt` 作为最近一次重启时间；docker 用 `die` 事件时间（`State` 字段在运行中会被重置，靠事件补历史）。"
+    description = "只查一个容器（k8s 单 Pod GET / docker inspect+events），**容器被 OOM 杀掉后仍可查询**——数据源在运行时侧，不在容器内。\n\n语义红线：`last_termination=null` 表示从未终止过；`is_oom` 由 `reason==OOMKilled` 判定（**不**用 exit_code==137 推断，liveness SIGKILL 同样给 137）；`last_oom_at` 非 OOM 时为 null。`pod_uid` 变化 = 容器被删除重建（计数归零）。\n\n默认 3s 缓存；`fresh=true` 强制直读。k8s 用 `lastState.terminated.finishedAt` 作为最近一次重启时间；docker 用 `die` 事件时间（`State` 字段在运行中会被重置，靠事件补历史）。\n\n**能力差异（务必按部署模式解读）**：k8s 下 OOM 归因完整（`OOMKilled` + exit code + 终止时间 + 重启数）。docker compose 下 rcoder 创建的容器是 `auto_remove=true`：容器退出即被 Docker 删除，此时返回 `phase=NotFound` 且**不带 `last_termination`**——不是查询失败，而是容器连同其终止记录已不存在（Docker 不保留已删除容器的退出历史）。该模式下请把 `alive=false` / `phase=NotFound` 当作容器已消失处理，不要期待 OOM 归因。"
 )]
 #[instrument(skip(state))]
 pub async fn computer_pod_health(

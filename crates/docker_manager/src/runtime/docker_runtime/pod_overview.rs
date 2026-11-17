@@ -323,6 +323,11 @@ impl super::DockerRuntime {
             .await
         {
             Ok(inspect) => inspect,
+            // 容器不存在：rcoder 创建的 agent 容器是 auto_remove=true，退出
+            // 即被 Docker 删除，**终止记录随之消失**。这里不返回历史，也不
+            // 用 events 兜底：die 事件无 OOM 标志，只能给 exitCode，而 137
+            // 与 OOM 不可互推（见 is_oom 的语义红线），补出来反而是误导。
+            // 需要 OOM 归因请用 k8s（Pod 保留 terminated 状态）。
             Err(bollard::errors::Error::DockerResponseServerError {
                 status_code: 404, ..
             }) => return Ok(None),
