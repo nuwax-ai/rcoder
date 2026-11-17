@@ -86,11 +86,13 @@ impl KubernetesRuntime {
         }
 
         // 阶段2 per-agent PVC (CephFS subvolume, ceph-csi 服务端配额, 绕开 client setfattr):
-        // 仅隔离容器 (pod_id=None, project/user 级) 且 per_agent_pvc_enabled=true 走 per-agent PVC。
-        // 共享容器 (pod_id=Some) 或回滚开关 false → 共享 PVC (选项A 行为)。
+        // 仅隔离容器 (pod_id=None, project/user 级) 且 per-agent 开关开启走 per-agent PVC。
+        // 两变体: per_agent_pvc(subvolume, 挂根聚合读) / per_agent_rbd(RWO 块盘, 转发层读,
+        // 二者互斥 fail-fast 见 FeatureFlags::init)。共享容器 (pod_id=Some) 或开关全关 → 共享 PVC。
         // UserappBuilder 天然 per-app PVC(不受灰度开关限制),总是 ensure。
         if pod_id.is_none()
             && (shared_types::per_agent_pvc_enabled()
+                || shared_types::per_agent_rbd_enabled()
                 || matches!(service_type, ServiceType::UserappBuilder))
         {
             if params.retained_storage.is_some() {
@@ -293,9 +295,11 @@ impl KubernetesRuntime {
         };
 
         // workspace PVC:
-        // - per-agent (pod_id=None + per_agent_pvc_enabled=true): per-agent PVC (subPath=None)
-        // - 共享 (pod_id=Some 或 per_agent_pvc_enabled=false): 共享 PVC + subPath (选项A / 回滚)
-        let per_agent = params.pod_id.is_none() && shared_types::per_agent_pvc_enabled();
+        // - per-agent (pod_id=None + 任一 per-agent 开关): per-agent PVC (subPath=None)
+        // - 共享 (pod_id=Some 或开关全关): 共享 PVC + subPath (选项A / 回滚)
+        let per_agent = params.pod_id.is_none()
+            && (shared_types::per_agent_pvc_enabled()
+                || shared_types::per_agent_rbd_enabled());
         let (workspace_pvc, workspace_sub_path): (String, Option<String>) = if per_agent {
             (self.workspace_pvc_name(identifier, service_type)?, None)
         } else {
