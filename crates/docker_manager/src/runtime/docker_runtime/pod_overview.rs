@@ -390,11 +390,12 @@ impl super::DockerRuntime {
             .and_then(|s| s.finished_at.as_ref())
             .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t.to_string()).ok())
             .map(|dt| dt.with_timezone(&chrono::Utc));
-        let last_oom_at = if is_oom {
-            finished_at.or(state_finished)
-        } else {
-            None
-        };
+        // 本次启动时间（running 时才有）
+        let started_at = state
+            .filter(|s| s.running.unwrap_or(false))
+            .and_then(|s| s.started_at.as_ref())
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t.to_string()).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
 
         Ok(Some(ContainerHealth {
             container_name: name.to_string(),
@@ -415,8 +416,7 @@ impl super::DockerRuntime {
             } else {
                 None
             },
-            oom_killed_last: is_oom,
-            last_oom_at,
+            started_at,
             waiting_reason: None,
             detail: state
                 .and_then(|s| s.error.clone())
@@ -798,7 +798,24 @@ fn docker_health(state: Option<&ContainerState>, events: &[&RawEvent]) -> PodHea
         restart_source: "docker_events".to_string(),
         last_terminate_reason,
         last_exit_code: exit_code,
-        oom_killed_last,
+        // 终止时间：事件里最近 die 的时间优先，退回 State.FinishedAt
+        last_terminate_at: events
+            .iter()
+            .find(|e| e.action == "die")
+            .map(|e| e.time_nano)
+            .filter(|nano| *nano > 0)
+            .and_then(|nano| {
+                chrono::DateTime::from_timestamp(
+                    nano.div_euclid(1_000_000_000),
+                    nano.rem_euclid(1_000_000_000) as u32,
+                )
+            })
+            .or_else(|| {
+                state
+                    .and_then(|s| s.finished_at.as_ref())
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t.to_string()).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            }),
         waiting_reason: None, // docker 无 CrashLoopBackOff 概念
         detail: state
             .and_then(|s| s.error.clone())

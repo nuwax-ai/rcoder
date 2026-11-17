@@ -257,7 +257,6 @@ fn pod_health_from_status(pod: &Pod) -> (bool, PodHealth) {
     });
     if let Some(cs) = blocking_init {
         let diagnostic = pod_container_diagnostic(cs);
-        let oom_killed_last = diagnostic.is_oom();
         let ready = false; // init 未完成 → pod 必然未就绪
         return (
             ready,
@@ -266,7 +265,7 @@ fn pod_health_from_status(pod: &Pod) -> (bool, PodHealth) {
                 restart_source: "container_status".to_string(),
                 last_terminate_reason: diagnostic.last_terminate_reason,
                 last_exit_code: diagnostic.last_exit_code,
-                oom_killed_last,
+                last_terminate_at: None,
                 waiting_reason: diagnostic.waiting_reason,
                 detail: Some(format!(
                     "init container {}: {}",
@@ -318,7 +317,6 @@ fn pod_health_from_status(pod: &Pod) -> (bool, PodHealth) {
         );
     };
     let diagnostic = pod_container_diagnostic(cs);
-    let oom_killed_last = diagnostic.is_oom();
     let ready = cs.ready;
     (
         ready,
@@ -327,7 +325,7 @@ fn pod_health_from_status(pod: &Pod) -> (bool, PodHealth) {
             restart_source: "container_status".to_string(),
             last_terminate_reason: diagnostic.last_terminate_reason,
             last_exit_code: diagnostic.last_exit_code,
-            oom_killed_last,
+            last_terminate_at: terminated_finished_at(cs),
             waiting_reason: diagnostic.waiting_reason,
             detail: diagnostic.detail,
         },
@@ -484,6 +482,18 @@ fn main_container_resources<'a>(
     containers.iter().find(|c| c.name == main_name)
 }
 
+/// 最近一次终止时间（当前 terminated 优先，否则 lastState）。
+fn terminated_finished_at(
+    cs: &k8s_openapi::api::core::v1::ContainerStatus,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    cs.state
+        .as_ref()
+        .and_then(|s| s.terminated.as_ref())
+        .or_else(|| cs.last_state.as_ref().and_then(|s| s.terminated.as_ref()))
+        .and_then(|t| t.finished_at.as_ref())
+        .and_then(|t| chrono::DateTime::from_timestamp_millis(t.0.as_millisecond()))
+}
+
 /// 事件排序键：解析 RFC3339 为时间值；解析失败 → 最小值（排最后）。
 fn event_sort_key(event: &AppEventInfo) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::parse_from_rfc3339(&event.timestamp)
@@ -560,8 +570,7 @@ impl super::KubernetesRuntime {
                 ready: false,
                 restart_count: 0,
                 last_termination: None,
-                oom_killed_last: false,
-                last_oom_at: None,
+                started_at: None,
                 waiting_reason: Some("ContainerStatusPending".to_string()),
                 detail: Some("container statuses not available yet".to_string()),
                 sampled_at: chrono::Utc::now(),
@@ -599,6 +608,15 @@ impl super::KubernetesRuntime {
             .and_then(|st| st.running.as_ref())
             .is_some();
 
+        // 本次启动时间：容器 running 时才有（与 last_termination.finished_at
+        // 相邻比较可算出这次重启的耗时）
+        let started_at = cs
+            .state
+            .as_ref()
+            .and_then(|st| st.running.as_ref())
+            .and_then(|r| r.started_at.as_ref())
+            .and_then(|t| chrono::DateTime::from_timestamp_millis(t.0.as_millisecond()));
+
         Ok(Some(ContainerHealth {
             container_name: identifier.to_string(),
             pod_uid: pod.metadata.uid.clone(),
@@ -607,8 +625,7 @@ impl super::KubernetesRuntime {
             ready: cs.ready,
             restart_count: diagnostic.restart_count,
             last_termination: last,
-            oom_killed_last: is_oom,
-            last_oom_at: if is_oom { finished_at } else { None },
+            started_at,
             waiting_reason: diagnostic.waiting_reason.clone(),
             detail: diagnostic.detail.clone(),
             sampled_at: chrono::Utc::now(),
@@ -809,7 +826,11 @@ mod overview_tests {
         let (ready, health) = pod_health_from_status(&pod);
         assert!(!ready);
         assert_eq!(health.restart_count, 6, "init 的重启数要浮出来");
-        assert!(health.oom_killed_last, "init 的 OOMKilled 要浮出来");
+        assert_eq!(
+            health.last_terminate_reason.as_deref(),
+            Some("OOMKilled"),
+            "init 的 OOMKilled 要浮出来"
+        );
         assert_eq!(health.waiting_reason.as_deref(), Some("CrashLoopBackOff"));
         assert!(
             health.detail.as_deref().is_some_and(|d| d.contains("init")),
@@ -840,7 +861,7 @@ mod overview_tests {
         }
         let (ready, health) = pod_health_from_status(&pod);
         assert!(ready, "主容器 ready，完成 init 的历史不覆盖");
-        assert!(!health.oom_killed_last);
+        assert_ne!(health.last_terminate_reason.as_deref(), Some("OOMKilled"));
         assert_eq!(health.restart_count, 0);
     }
 
@@ -858,7 +879,7 @@ mod overview_tests {
         }
         let (ready, health) = pod_health_from_status(&pod);
         assert!(ready, "主容器 ready，就绪 sidecar 的历史不覆盖");
-        assert!(!health.oom_killed_last);
+        assert_ne!(health.last_terminate_reason.as_deref(), Some("OOMKilled"));
     }
 
     /// F2：主容器名已知（spec 里有 db）但状态缺席——保持未就绪并说明，

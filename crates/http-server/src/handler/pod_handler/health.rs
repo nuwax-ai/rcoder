@@ -97,7 +97,7 @@ const CACHE_TTL_SECS: u64 = 3;
     tag = "pod",
     operation_id = "computer_pod_health",
     summary = "查询单个容器的健康/OOM 信息（供前端轮询）",
-    description = "只查一个容器（k8s 单 Pod GET / docker inspect+events），**容器被 OOM 杀掉后仍可查询**——数据源在运行时侧，不在容器内。\n\n语义红线：`last_termination=null` 表示从未终止过；`is_oom` 由 `reason==OOMKilled` 判定（**不**用 exit_code==137 推断，liveness SIGKILL 同样给 137）；`last_oom_at` 非 OOM 时为 null。`pod_uid` 变化 = 容器被删除重建（计数归零）。\n\n默认 3s 缓存；`fresh=true` 强制直读。k8s 用 `lastState.terminated.finishedAt` 作为最近一次重启时间；docker 用 `die` 事件时间（`State` 字段在运行中会被重置，靠事件补历史）。\n\n**能力差异（务必按部署模式解读）**：k8s 下 OOM 归因完整（`OOMKilled` + exit code + 终止时间 + 重启数），且容器 OOM 后由 kubelet 自动重启。docker compose 下 rcoder 创建的容器是 `auto_remove=true` 且无 restart policy：**容器退出即被删除、不会自动重启**，需要业务侧检测 `phase=NotFound` 后主动 `/computer/pod/ensure` 重建。此时 `last_termination` 仍会尽量从**Docker daemon 的事件历史**还原（`oom` 事件 → `reason=OOMKilled`；`die` 事件 → exit code 与终止时间），但受事件回放窗口限制（最近 256 条 / 1 小时），超出窗口则返回 null。"
+    description = "只查一个容器（k8s 单 Pod GET / docker inspect+events），**容器被 OOM 杀掉后仍可查询**——数据源在运行时侧，不在容器内。\n\n字段以**终止**为主语，不以 OOM 为主语：`last_termination` 对任何原因的终止都完整给出（`reason`/`exit_code`/`finished_at`），OOM 只是 `reason` 的一个取值；`is_oom` 是 `reason==OOMKilled` 的派生便捷位（**不要**用 exit_code==137 推断——liveness SIGKILL 同样给 137）。`last_termination=null` 表示从未终止过；`started_at` 是本次容器启动时间。`pod_uid` 变化 = 容器被删除重建（计数归零）。\n\n默认 3s 缓存；`fresh=true` 强制直读。k8s 用 `lastState.terminated.finishedAt` 作为最近一次重启时间；docker 用 `die` 事件时间（`State` 字段在运行中会被重置，靠事件补历史）。\n\n**能力差异（务必按部署模式解读）**：k8s 下 OOM 归因完整（`OOMKilled` + exit code + 终止时间 + 重启数），且容器 OOM 后由 kubelet 自动重启。docker compose 下 rcoder 创建的容器是 `auto_remove=true` 且无 restart policy：**容器退出即被删除、不会自动重启**，需要业务侧检测 `phase=NotFound` 后主动 `/computer/pod/ensure` 重建。此时 `last_termination` 仍会尽量从**Docker daemon 的事件历史**还原（`oom` 事件 → `reason=OOMKilled`；`die` 事件 → exit code 与终止时间），但受事件回放窗口限制（最近 256 条 / 1 小时），超出窗口则返回 null。"
 )]
 #[instrument(skip(state))]
 pub async fn computer_pod_health(
@@ -166,12 +166,8 @@ pub async fn computer_pod_health(
                 phase: "NotFound".to_string(),
                 ready: false,
                 restart_count: 0,
-                oom_killed_last: history.as_ref().is_some_and(|h| h.is_oom),
-                last_oom_at: history
-                    .as_ref()
-                    .and_then(|h| h.finished_at)
-                    .filter(|_| history.as_ref().is_some_and(|h| h.is_oom)),
                 last_termination: history,
+                started_at: None,
                 waiting_reason: None,
                 detail: Some(
                     "container not found (docker: already removed by auto_remove)".to_string(),
@@ -232,18 +228,11 @@ pub async fn computer_pod_health(
                 debug!(event = "pod_health.history_failed", error = %e, "history probe failed");
                 None
             });
-        let is_oom = history.as_ref().is_some_and(|h| h.is_oom);
         return Ok(HttpResult::success(PodHealthResponse {
             health: container_runtime_api::ContainerHealth {
                 container_name: container.container_name.clone(),
                 alive: false,
                 phase: "NotFound".to_string(),
-                oom_killed_last: is_oom,
-                last_oom_at: if is_oom {
-                    history.as_ref().and_then(|h| h.finished_at)
-                } else {
-                    None
-                },
                 last_termination: history,
                 detail: Some(
                     "container disappeared between locate and inspect (docker auto_remove)"
@@ -280,31 +269,16 @@ pub async fn computer_pod_health(
 
 #[cfg(test)]
 mod tests {
+    use container_runtime_api::ContainerHealth;
 
-    /// 语义红线：`last_oom_at` 只在 is_oom 时出现，非 OOM 必须是 null
-    /// （不能填 0 或当前时间——前端会把任何非空值当成"刚 OOM 过"）。
+    /// 语义红线：非 OOM 的终止同样带齐 reason/exit_code/finished_at。
+    /// 字段不提供 `last_oom_at` 这类"只在 OOM 时有值"的顶层字段——那会让
+    /// 调用方误以为非 OOM 时没有信息。
     #[test]
-    fn oom_fields_follow_reason_not_exit_code() {
-        use container_runtime_api::{ContainerHealth, LastTermination};
+    fn non_oom_termination_is_fully_populated() {
+        use container_runtime_api::LastTermination;
 
-        let oom = ContainerHealth {
-            oom_killed_last: true,
-            last_oom_at: chrono::DateTime::from_timestamp(1_700_000_000, 0),
-            last_termination: Some(LastTermination {
-                reason: Some("OOMKilled".into()),
-                exit_code: Some(137),
-                finished_at: chrono::DateTime::from_timestamp(1_700_000_000, 0),
-                is_oom: true,
-            }),
-            ..Default::default()
-        };
-        assert!(oom.oom_killed_last);
-        assert!(oom.last_oom_at.is_some());
-
-        // 137 + 非 OOM（liveness SIGKILL）：last_oom_at 必须为空
         let killed = ContainerHealth {
-            oom_killed_last: false,
-            last_oom_at: None,
             last_termination: Some(LastTermination {
                 reason: Some("Error".into()),
                 exit_code: Some(137),
@@ -313,29 +287,21 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(!killed.oom_killed_last, "137 不等于 OOM");
-        assert!(
-            killed.last_oom_at.is_none(),
-            "非 OOM 时 last_oom_at 必须是 null"
-        );
-        assert_eq!(
-            killed
-                .last_termination
-                .as_ref()
-                .and_then(|t| t.finished_at)
-                .map(|t| t.timestamp()),
-            Some(1_700_000_100),
-            "非 OOM 重启也带时间（前端要知道什么时候重启的）"
-        );
+        let last = killed
+            .last_termination
+            .as_ref()
+            .expect("非 OOM 也必须有终止信息");
+        assert_eq!(last.reason.as_deref(), Some("Error"));
+        assert_eq!(last.exit_code, Some(137));
+        assert!(last.finished_at.is_some(), "非 OOM 也要有终止时间");
+        assert!(!last.is_oom, "137 不等于 OOM");
     }
 
     /// 从未终止过：last_termination 必须是 None（不是空对象）
     #[test]
     fn never_terminated_is_none_not_empty_object() {
-        use container_runtime_api::ContainerHealth;
         let health = ContainerHealth::default();
         assert!(health.last_termination.is_none());
-        assert!(!health.oom_killed_last);
-        assert!(health.last_oom_at.is_none());
+        assert!(health.started_at.is_none());
     }
 }

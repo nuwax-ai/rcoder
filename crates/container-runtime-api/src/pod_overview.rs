@@ -179,14 +179,20 @@ pub struct ContainerHealth {
     pub ready: bool,
     /// 累计重启次数（含非 OOM）
     pub restart_count: u32,
-    /// 最近一次终止的完整信息；`None` = 从未终止过
+    /// **最近一次终止**的完整信息（任何原因：OOM / 应用崩溃 / 正常结束）。
+    /// `None` = 从未终止过。
+    ///
+    /// 字段设计刻意**不以 OOM 为主语**：容器重启大多源于 OOM，但并不都是
+    /// ——把 `oom_killed_last` / `last_oom_at` 这类字段摆在顶层，会让调用方
+    /// 误以为"非 OOM 时没有信息"。真正的通用事实是"最近一次怎么终止的"，
+    /// 是否 OOM 只是 `last_termination.reason` 的一个取值。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_termination: Option<LastTermination>,
-    /// 最近一次退出是否为 OOM（等价 `last_termination.is_oom`，便于前端直取）
-    pub oom_killed_last: bool,
-    /// 最近一次 OOM 的时间；非 OOM 时为 `None`
+    /// 本次容器**启动时间**（k8s: `state.running.startedAt`；docker:
+    /// `State.StartedAt`）。与 `last_termination.finished_at` 相邻比较可算出
+    /// 这次重启花了多久；容器当前不在运行时为 `None`。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_oom_at: Option<DateTime<Utc>>,
+    pub started_at: Option<DateTime<Utc>>,
     /// 当前等待原因（CrashLoopBackOff 等）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting_reason: Option<String>,
@@ -199,7 +205,10 @@ pub struct ContainerHealth {
     pub source: String,
 }
 
-/// 最近一次终止/重启的证据。
+/// 最近一次终止/重启的证据（**不论原因**）。
+///
+/// 三个事实字段（`reason` / `exit_code` / `finished_at`）在非 OOM 时同样
+/// 完整；`is_oom` 只是 `reason == "OOMKilled"` 的派生便捷位。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct LastTermination {
     /// 终止原因：`OOMKilled` / `Error` / `Completed` / `ContainerCannotRun`
@@ -211,7 +220,10 @@ pub struct LastTermination {
     /// 终止时刻（k8s `lastState.terminated.finishedAt`；docker die 事件时间）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<DateTime<Utc>>,
-    /// 是否 OOM（`reason == "OOMKilled"`）
+    /// 是否 OOM（派生自 `reason == "OOMKilled"`）。
+    ///
+    /// 提供这个便捷位是为了**阻止调用方用 `exit_code == 137` 推断 OOM**：
+    /// 137 同样来自 liveness 探针 SIGKILL 或人工 kill，只有 reason 能定性。
     pub is_oom: bool,
 }
 
@@ -255,14 +267,18 @@ pub struct PodHealth {
     pub restart_count: u32,
     /// 重启计数的来源："container_status"（k8s）| "docker_events"（docker）
     pub restart_source: String,
-    /// 最近一次终止原因（"OOMKilled" / "Error" / …；无终止为 None）
+    /// 最近一次终止原因（"OOMKilled" / "Error" / "Completed" / …；
+    /// 从未终止为 None）。**是否 OOM 就是本字段是否等于 "OOMKilled"**——
+    /// 不再单列 `oom_killed_last`：把 OOM 提到顶层会让人误以为非 OOM 时
+    /// 没有健康信息。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_terminate_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_exit_code: Option<i32>,
-    /// 最近一次终止是否 OOM
-    #[serde(default)]
-    pub oom_killed_last: bool,
+    /// 最近一次终止的**时间**（k8s `lastState.terminated.finishedAt`；
+    /// docker `die` 事件时间）。任何原因的终止都有值，非 OOM 同样可读。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_terminate_at: Option<DateTime<Utc>>,
     /// k8s waiting 原因（CrashLoopBackOff / ContainerCreating / …）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting_reason: Option<String>,

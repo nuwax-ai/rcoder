@@ -79,11 +79,21 @@ pub struct PodOverviewResponse {
 /// 汇总（在**全量**快照上算，不受过滤影响）。
 #[derive(Debug, Clone, Default, serde::Serialize, ToSchema)]
 pub struct PodOverviewSummary {
+    /// Pod 总数
     pub pods: usize,
+    /// 运行中（phase=Running）
     pub running: usize,
+    /// 未就绪（**不含** Succeeded/Completed 的终态任务）
     pub not_ready: usize,
+    /// 有重启记录的 Pod 数（restart_count > 0）
     pub restarted: usize,
+    /// **最近一次**终止为 OOMKilled 的 Pod 数。
+    ///
+    /// 统计口径只看最近一次终止——不是"历史 OOM 过几次"（k8s 只保留
+    /// lastState 一个槽位）。判断某个 Pod 是否 OOM 请用
+    /// `health.last_terminate_reason == "OOMKilled"`，别用 exit_code==137。
     pub oom_killed_last: usize,
+    /// 有 Warning 事件的 Pod 数
     pub with_warning_events: usize,
 }
 
@@ -198,6 +208,12 @@ async fn snapshot_with_cache(state: &Arc<AppState>) -> Result<(CachedObservation
         *guard = Some(entry);
     }
     Ok((observation, 0))
+}
+
+/// 最近一次终止是否为 OOM（唯一判据是 reason，不看 exit_code——
+/// 137 同样来自 liveness SIGKILL/人工 kill）。
+fn is_oom_reason(reason: Option<&str>) -> bool {
+    reason == Some("OOMKilled")
 }
 
 /// 隐藏的内部 sidecar（与方案 §13 决策 2 一致）。
@@ -337,7 +353,7 @@ pub async fn pod_overview(
         let severity = |p: &container_runtime_api::pod_overview::PodOverviewItem| {
             (
                 !p.ready,
-                p.health.oom_killed_last,
+                is_oom_reason(p.health.last_terminate_reason.as_deref()),
                 p.health.restart_count > 0,
             )
         };
@@ -395,7 +411,7 @@ fn summarize(snapshot: &PodOverviewSnapshot) -> PodOverviewSummary {
         if pod.health.restart_count > 0 {
             summary.restarted += 1;
         }
-        if pod.health.oom_killed_last {
+        if is_oom_reason(pod.health.last_terminate_reason.as_deref()) {
             summary.oom_killed_last += 1;
         }
         if pod.events.iter().any(|e| e.event_type == "Warning") {
@@ -428,7 +444,7 @@ mod tests {
             usage: None,
             health: container_runtime_api::pod_overview::PodHealth {
                 restart_count: restarts,
-                oom_killed_last: oom,
+                last_terminate_reason: oom.then(|| "OOMKilled".to_string()),
                 ..Default::default()
             },
             events: Vec::new(),
@@ -469,7 +485,7 @@ mod tests {
             let severity = |p: &container_runtime_api::pod_overview::PodOverviewItem| {
                 (
                     !p.ready,
-                    p.health.oom_killed_last,
+                    is_oom_reason(p.health.last_terminate_reason.as_deref()),
                     p.health.restart_count > 0,
                 )
             };
