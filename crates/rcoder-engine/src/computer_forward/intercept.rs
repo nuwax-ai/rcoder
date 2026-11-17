@@ -27,7 +27,7 @@ use crate::service::computer_container_manager::{
     ComputerContainerManager, ContainerCreateOptions,
 };
 
-use super::{is_pass_through_path, resolve_target, TargetResolution, TargetSource};
+use super::{is_pass_through_path, resolve_target, TargetResolution};
 
 /// wake 预算：spike 实测冷启动（STS 0→1 到文件可服务）5.0-9.5s，常态 5-6s。
 /// 超预算返回 503+Retry-After；K8s 侧创建继续，下一请求幂等 ensure 走快路径。

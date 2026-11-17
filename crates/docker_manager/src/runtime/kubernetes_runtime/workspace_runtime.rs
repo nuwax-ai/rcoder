@@ -182,6 +182,26 @@ impl WorkspaceRuntime for KubernetesRuntime {
         Ok(())
     }
 
+    async fn workspace_volume_attached(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<bool> {
+        self.workspace_volume_attached_inner(identifier, service_type)
+            .await
+    }
+
+    async fn run_workspace_migration_sync(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        mode: shared_types::WorkspaceSyncMode,
+        src_pvc: &str,
+    ) -> ContainerRuntimeResult<()> {
+        self.run_workspace_migration_sync_inner(identifier, service_type, mode, src_pvc)
+            .await
+    }
+
     /// 枚举某 service_type 的所有 per-app PVC，从 PVC 名反解 identifier（app_id）。
     ///
     /// 用于 storage/query 发现"有持久数据"的 app（含已 delete 但 PVC 保留的孤儿）——

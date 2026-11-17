@@ -118,6 +118,34 @@ impl WorkspaceMigrationState {
 /// per-agent workspace PVC 的迁移状态 annotation key。
 pub const WORKSPACE_MIGRATION_ANNOTATION: &str = "rcoder.io/workspace-migration";
 
+/// 迁移同步模式（rclone sync 的两种档）。
+///
+/// - `Full`：phase-a 预同步（首轮全量, 限速 `--bwlimit` 防 OSD 写风暴）
+/// - `Incremental`：cutover 切换增量（只补变化, 不限速求快; agent 已停,
+///   数据面冻结, 增量体积极小）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceSyncMode {
+    Full,
+    Incremental,
+}
+
+impl WorkspaceSyncMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Incremental => "incremental",
+        }
+    }
+}
+
+/// 迁移 Job 默认排除规则（可重建数据不迁——与 k8s/migration 脚本同词表）。
+/// node_modules/.cache/dist 重建即可; core.* 是 agent_runner core dump。
+pub const WORKSPACE_MIGRATION_EXCLUDES: &[&str] =
+    &["node_modules/", ".cache/", "dist/", "core.[0-9]*"];
+
+/// 迁移同步 Job 的 label（运维识别/清理用）。
+pub const WORKSPACE_MIGRATION_JOB_LABEL: &str = "rcoder.io/workspace-migration";
+
 // Userapp K8s 永远 per-app (代码不读开关, 无分裂);
 // FeatureFlags.userapp_per_app_pvc 字段保留供启动日志 + chart cephfs-root 派生标记。
 

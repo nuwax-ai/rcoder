@@ -152,6 +152,92 @@ pub async fn set_state(
     }
 }
 
+/// POST /api/migration/{user_id}/phase-a —— 建 PVC + 全量预同步（不停机,
+/// 不翻标记; 用户照常共享卷读写）。
+pub async fn phase_a(
+    State(state): State<std::sync::Arc<AppState>>,
+    Path(user_id): Path<String>,
+) -> Response {
+    if let Some(resp) = ensure_allowed(&user_id) {
+        return resp;
+    }
+    let src_pvc = migration_src_pvc();
+    match crate::computer_forward::orchestrate::phase_a(&state, &user_id, &src_pvc).await {
+        Ok(outcome) => Json(serde_json::json!({
+            "user_id": outcome.user_id,
+            "action": outcome.action,
+            "migration_state": "not-migrated",
+            "steps": outcome.steps,
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            format!("phase-a failed: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/migration/{user_id}/cutover —— 停 agent → 防呆等 detach →
+/// 增量 sync → 翻 Migrated → 起 agent（原子编排; 失败即整体失败）。
+pub async fn cutover(
+    State(state): State<std::sync::Arc<AppState>>,
+    Path(user_id): Path<String>,
+) -> Response {
+    if let Some(resp) = ensure_allowed(&user_id) {
+        return resp;
+    }
+    let src_pvc = migration_src_pvc();
+    match crate::computer_forward::orchestrate::cutover(&state, &user_id, &src_pvc).await {
+        Ok(outcome) => Json(serde_json::json!({
+            "user_id": outcome.user_id,
+            "action": outcome.action,
+            "migration_state": "migrated",
+            "steps": outcome.steps,
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            format!("cutover failed: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/migration/{user_id}/rollback —— 翻回 NotMigrated（共享卷数据
+/// 全程保留; 下一次 agent 重建即回共享卷）。
+pub async fn rollback(
+    State(state): State<std::sync::Arc<AppState>>,
+    Path(user_id): Path<String>,
+) -> Response {
+    if let Some(resp) = ensure_allowed(&user_id) {
+        return resp;
+    }
+    match crate::computer_forward::orchestrate::rollback(&state, &user_id).await {
+        Ok(outcome) => Json(serde_json::json!({
+            "user_id": outcome.user_id,
+            "action": outcome.action,
+            "migration_state": "not-migrated",
+            "steps": outcome.steps,
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            format!("rollback failed: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+/// 源共享 PVC 名（env `RCODER_MIGRATION_SRC_PVC`; 缺省回退 computer 共享卷名）。
+fn migration_src_pvc() -> String {
+    std::env::var("RCODER_MIGRATION_SRC_PVC")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("RCODER_COMPUTER_WORKSPACE_PVC_NAME").ok())
+        .unwrap_or_else(|| "rcoder-computer-workspace".to_string())
+}
+
 /// 路由组装（与 userapp_forward 等族平行; 挂主 Router, 调用处 with_state）。
 pub fn routes() -> axum::Router<std::sync::Arc<AppState>> {
     axum::Router::new()
@@ -162,5 +248,17 @@ pub fn routes() -> axum::Router<std::sync::Arc<AppState>> {
         .route(
             "/api/migration/{user_id}/migration-state",
             axum::routing::post(set_state),
+        )
+        .route(
+            "/api/migration/{user_id}/phase-a",
+            axum::routing::post(phase_a),
+        )
+        .route(
+            "/api/migration/{user_id}/cutover",
+            axum::routing::post(cutover),
+        )
+        .route(
+            "/api/migration/{user_id}/rollback",
+            axum::routing::post(rollback),
         )
 }

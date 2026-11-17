@@ -12,10 +12,11 @@
 //! （ensure STS → 等 Ready ≤8s → 转发, 超时 503+Retry-After）随 P1 接线落地。
 
 pub mod intercept;
+pub mod orchestrate;
 
 pub use intercept::computer_rbd_intercept;
 
-use shared_types::{ServiceType, USER_ID_HEADER};
+
 
 /// computer 域转发透传清单（path 前缀/模板，method 透传不分类）。
 ///

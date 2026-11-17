@@ -392,7 +392,9 @@ impl super::DockerRuntime {
         let state_finished = state
             .and_then(|s| s.finished_at.as_ref())
             .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t.to_string()).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            // 运行中的容器 Docker 返回零值（0001-01-01），不是 None
+            .filter(|dt| dt.timestamp() > 0);
         // 本次启动时间（running 时才有）
         let started_at = state
             .filter(|s| s.running.unwrap_or(false))
@@ -410,10 +412,16 @@ impl super::DockerRuntime {
             // `/pod/resources` 对 docker 的口径一致）
             ready: alive,
             restart_count: count_recovery_cycles(&own),
-            last_termination: if last_die.is_some() || state_oom {
+            // `last_termination` 只承载**真实终止**（容器已停止，或事件里
+            // 有 die）。进程级 OOM（cgroup OOM 只杀掉容器内某个进程、容器
+            // 仍在运行）不构成终止——把它写进这里会得到自相矛盾的结果：
+            // is_oom=true 却没有退出码/终止时间。该类信息走下方 detail。
+            last_termination: if last_die.is_some() || !alive {
                 Some(LastTermination {
                     reason,
-                    exit_code: die_exit_code.map(|c| c as i32),
+                    exit_code: die_exit_code
+                        .or_else(|| (!alive).then(|| state.and_then(|s| s.exit_code)).flatten())
+                        .map(|c| c as i32),
                     finished_at: finished_at.or(state_finished),
                     is_oom,
                 })
@@ -422,9 +430,17 @@ impl super::DockerRuntime {
             },
             started_at,
             waiting_reason: None,
-            detail: state
-                .and_then(|s| s.error.clone())
-                .filter(|e| !e.is_empty()),
+            detail: {
+                // 运行中但发生过 cgroup OOM（进程被杀、容器未退）：这是
+                // 诊断信息，不是终止记录，放 detail 而不是 last_termination。
+                let oom_note = (alive && state_oom).then_some(
+                    "cgroup OOM killed a process during the current run (container still alive)",
+                );
+                state
+                    .and_then(|s| s.error.clone())
+                    .filter(|e| !e.is_empty())
+                    .or_else(|| oom_note.map(str::to_string))
+            },
             sampled_at: chrono::Utc::now(),
             source: "docker".to_string(),
         }))
@@ -804,9 +820,16 @@ fn docker_health(state: Option<&ContainerState>, events: &[&RawEvent]) -> PodHea
     // 在 k8s 下是 "Error"，调用方按字符串比较会踩坑。
     let has_die = events.iter().any(|e| e.action == "die");
     let stopped = state.is_some_and(|s| !s.running.unwrap_or(false));
-    let last_terminate_reason = if oom_killed_last {
+    // 只有**真实终止**（已停止，或事件里有 die）才报终止原因。运行中的
+    // 容器即便 `State.OOMKilled=true`（cgroup OOM 杀了进程、容器没退）
+    // 也不该报——否则会出现 "reason=OOMKilled 但 last_terminate_at=None"
+    // 的自相矛盾。
+    let terminated = has_die || stopped;
+    let last_terminate_reason = if !terminated {
+        None
+    } else if oom_killed_last {
         Some("OOMKilled".to_string())
-    } else if has_die || stopped {
+    } else {
         Some(
             match exit_code {
                 Some(0) => "Completed",
@@ -815,9 +838,6 @@ fn docker_health(state: Option<&ContainerState>, events: &[&RawEvent]) -> PodHea
             }
             .to_string(),
         )
-    } else {
-        // 运行中且无 die 事件：从未终止过
-        None
     };
     PodHealth {
         restart_count,
@@ -1092,6 +1112,24 @@ mod tests {
         let (oom, code) = last_exit_cycle(&own);
         assert!(!oom, "最近周期是正常退出，不得粘住更早的 OOM");
         assert_eq!(code, Some(0), "取最近 die 的退出码");
+    }
+
+    /// 运行中的容器即便 `State.OOMKilled=true`（cgroup OOM 只杀了进程、
+    /// 容器没退）也不报终止原因——否则 reason 有值而终止时间为空，自相矛盾。
+    #[test]
+    fn running_container_with_oom_flag_reports_no_termination() {
+        let state = ContainerState {
+            running: Some(true),
+            oom_killed: Some(true), // 进程级 OOM 留下的标记
+            exit_code: Some(0),
+            ..Default::default()
+        };
+        let health = docker_health(Some(&state), &[]);
+        assert_eq!(
+            health.last_terminate_reason, None,
+            "容器仍在运行 → 没有终止，不应报 reason"
+        );
+        assert_eq!(health.last_terminate_at, None);
     }
 
     /// 名字末段匹配：`-6` 不能误配 `-16`。

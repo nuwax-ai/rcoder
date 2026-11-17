@@ -928,6 +928,37 @@ pub trait WorkspaceRuntime: Send + Sync {
         ))
     }
 
+    /// per-agent workspace 卷当前是否仍被 Pod 挂载（迁移 cutover 防呆）。
+    ///
+    /// K8s: PVC→PV→VolumeAttachment(status.attached) 查询。**fail-closed 语义
+    /// 由调用方保证**：查询出错时调用方必须中止（RWO 同节点双挂 = ext4 损坏）。
+    /// Docker: 恒 false（无 VA 概念, 宿主机 bind 无此风险）。
+    async fn workspace_volume_attached(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    /// 跑一轮 rclone 同步（Job 载体: src 共享卷 RO + dst per-agent RBD RW）。
+    ///
+    /// `mode` 见 [`shared_types::WorkspaceSyncMode`]。Job 完成判据用
+    /// `.status.succeeded>=1`（**不是** failed!=0——failed 是累计计数器,
+    /// backoffLimit 重试成功后仍为 1）。Job 失败/超时返回 Err（含尾部日志）。
+    /// Docker: 不支持（宿主机无 PVC 双卷形态）。
+    async fn run_workspace_migration_sync(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+        _mode: shared_types::WorkspaceSyncMode,
+        _src_pvc: &str,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "workspace migration sync is unsupported by this runtime".to_string(),
+        ))
+    }
+
     /// 确保 per-agent workspace PVC 存在 (幂等: 已存在则复用, 不存在则创建)。
     ///
     /// K8s: 调 `ensure_workspace_pvc`; Docker: no-op。
