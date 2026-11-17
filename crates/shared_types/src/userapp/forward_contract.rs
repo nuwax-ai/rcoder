@@ -81,6 +81,15 @@ pub fn is_userapp_service_type_value(value: &str) -> bool {
 /// rcoder 零 body 解析定位 per-app 开发容器（multipart/SSE 全覆盖）。
 pub const APP_ID_HEADER: &str = "x-app-id";
 
+/// 用户维度定位 header（per-agent RBD 转发层）：computer 会话的文件/构建请求
+/// 由 Java（`WorkspaceServiceSupport.applyContainerRouteHeaders`，集成阶段补一行）
+/// 或测试脚本注入，rcoder 据此定位目标 agent 容器，零 body 解析（multipart/SSE
+/// 全覆盖）。三级 fallback 之一：header > GET query `userId` > static 路径段
+/// （`/api/computer/static/{user_id}/...`，分享链路浏览器直出场景天然无 header）。
+/// 值为平台 user_id（与共享卷子目录、per-agent PVC 名同键），白名单校验
+/// （`validate_identifier`）在转发层做——header 原样进容器标识，含 `/` 即越界。
+pub const USER_ID_HEADER: &str = "x-user-id";
+
 /// dev/prod 阶段分派 header（文件操作转发目标）：`dev`（缺省，开发容器 builder）
 /// / `prod`（生产运行容器，唤醒后转发其 :60000）。与 pod 接口族 `app_stage`
 /// 字段同词表——同一 app_id 可同时存在 builder 与生产 Deployment，必须显式区分。
