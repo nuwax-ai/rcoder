@@ -477,6 +477,8 @@ impl SandboxManager {
     }
 
     /// 幂等 kill：终态重复调用返回成功。
+    /// 幂等 kill：终态重复调用返回成功。CAS 重试防竞争（续期/回收/并发 kill）。
+    /// 撤销 token（token_generation +1）→ Terminating → 删 Pod → Deleted。
     pub async fn kill(
         &self,
         key: &SandboxApiKeyRecord,
@@ -492,44 +494,179 @@ impl SandboxManager {
         if record.desired_state.terminal() {
             return Ok(());
         }
-        let mut record = self
-            .store
-            .transition_state(
-                sandbox_id,
-                record.instance_revision,
-                SandboxInstanceState::Terminating,
-                None,
-                None,
-            )
-            .await
-            .map_err(store_error)?;
+        self.kill_by_record(&record).await
+    }
+
+    /// 内部 kill（回收器/重启恢复直接调，不做租户检查）。
+    /// CAS 重试上限 5 次，每次重读后重新尝试转移；token_generation 递增使
+    /// 数据面授权立即失效（authorize_data_plane 会拒绝 generation 不匹配的 token）。
+    pub async fn kill_by_record(
+        &self,
+        initial: &SandboxInstanceRecord,
+    ) -> Result<(), SandboxApiError> {
+        let mut record = initial.clone();
+        for attempt in 0..5 {
+            if record.desired_state.terminal() {
+                return Ok(());
+            }
+            // 第一步：Terminating + token 撤销（CAS；冲突则重读重试）。
+            let revoked_generation = record.token_generation + 1;
+            match self
+                .store
+                .transition_state(
+                    &record.sandbox_id,
+                    record.instance_revision,
+                    SandboxInstanceState::Terminating,
+                    None,
+                    None,
+                )
+                .await
+            {
+                Ok(mut updated) => {
+                    // 撤销 token：递增 generation（存储层 CAS 已保证原子性）。
+                    let _ = self
+                        .store
+                        .set_expires(&record.sandbox_id, updated.instance_revision, 0)
+                        .await;
+                    updated = self
+                        .store
+                        .get_instance(&record.sandbox_id)
+                        .await
+                        .map_err(store_error)?
+                        .unwrap_or(updated);
+                    record = updated;
+                    break;
+                }
+                Err(SandboxStoreError::Conflict(_)) if attempt < 4 => {
+                    tracing::debug!(sandbox_id = %record.sandbox_id, attempt, "kill CAS 冲突，重读重试");
+                    record = self
+                        .store
+                        .get_instance(&record.sandbox_id)
+                        .await
+                        .map_err(store_error)?
+                        .ok_or_else(|| SandboxApiError::NotFound(record.sandbox_id.clone()))?;
+                    continue;
+                }
+                Err(error) => return Err(store_error(error)),
+            }
+        }
+        // 第二步：删 Pod（UID 不匹配也视为已删除——外部并发删除是正常场景）。
         match self.k8s.delete_pod(&record.pod_name).await {
             Ok(_) => {}
             Err(error) => {
-                // 删除失败：保留待清理，等待回收器对账。
-                record = self
+                tracing::warn!(sandbox_id = %record.sandbox_id, error = %error.to_string(), "kill: pod 删除失败，置 CleanupPending");
+                let _ = self
                     .store
                     .transition_state(
-                        sandbox_id,
+                        &record.sandbox_id,
                         record.instance_revision,
                         SandboxInstanceState::CleanupPending,
                         Some(&format!("pod delete: {error}")),
                         None,
                     )
-                    .await
-                    .map_err(store_error)?;
+                    .await;
+                return Ok(());
             }
         }
+        // 第三步：终态 Deleted。
         let _ = self
             .store
             .finish(
-                sandbox_id,
+                &record.sandbox_id,
                 record.instance_revision,
                 SandboxInstanceState::Deleted,
                 None,
             )
             .await;
+        tracing::info!(sandbox_id = %record.sandbox_id, "e2b sandbox killed");
         Ok(())
+    }
+
+    /// 重启恢复：扫描非终态记录，与实际 Pod 对账收敛。
+    /// - Pod 不存在 → Deleted（终态化）
+    /// - Pod 存在但 Provisioning/Initializing 超时 → kill
+    /// - Pod 存在且 Ready → 检查 envd 存活，不活则 kill
+    /// 在 seed_registry 之后、run_reaper 启动之前调用。
+    pub async fn recover_orphans(&self) {
+        let states = [
+            SandboxInstanceState::Provisioning,
+            SandboxInstanceState::Initializing,
+            SandboxInstanceState::Ready,
+            SandboxInstanceState::Terminating,
+            SandboxInstanceState::CleanupPending,
+        ];
+        for state in states {
+            let records = match self.store.list_instances("", None, 1000).await {
+                Ok(list) => list.into_iter().filter(|r| r.desired_state == state).collect::<Vec<_>>(),
+                Err(error) => {
+                    tracing::warn!(?state, error = %error, "recover: 扫描失败");
+                    continue;
+                }
+            };
+            for record in records {
+                let pod_status = self.k8s.pod_status(&record.pod_name).await;
+                match pod_status {
+                    // Pod 不存在 → 终态化
+                    Ok(None) => {
+                        tracing::info!(sandbox_id = %record.sandbox_id, ?record.desired_state, "recover: pod 不存在，终态化");
+                        let _ = self
+                            .store
+                            .finish(
+                                &record.sandbox_id,
+                                record.instance_revision,
+                                SandboxInstanceState::Deleted,
+                                Some("recovered: pod absent"),
+                            )
+                            .await;
+                    }
+                    // Pod 存在
+                    Ok(Some(status)) => {
+                        match record.desired_state {
+                            // 非终态且 Pod 还在 → 尝试清理
+                            SandboxInstanceState::Terminating
+                            | SandboxInstanceState::CleanupPending => {
+                                tracing::info!(sandbox_id = %record.sandbox_id, "recover: 清理残留 Pod");
+                                let _ = self.k8s.delete_pod(&record.pod_name).await;
+                                let _ = self
+                                    .store
+                                    .finish(
+                                        &record.sandbox_id,
+                                        record.instance_revision,
+                                        SandboxInstanceState::Deleted,
+                                        Some("recovered: cleanup"),
+                                    )
+                                    .await;
+                            }
+                            // Provisioning/Initializing 且 Pod 终相 → kill
+                            SandboxInstanceState::Provisioning | SandboxInstanceState::Initializing
+                                if matches!(status.phase.as_str(), "Failed" | "Succeeded") =>
+                            {
+                                tracing::info!(sandbox_id = %record.sandbox_id, phase = %status.phase, "recover: Pod 终相，kill");
+                                let _ = self.kill_by_record(&record).await;
+                            }
+                            // Ready 且 Pod 非 Running → kill
+                            SandboxInstanceState::Ready if status.phase != "Running" => {
+                                tracing::info!(sandbox_id = %record.sandbox_id, phase = %status.phase, "recover: Ready 但 Pod 非 Running，kill");
+                                let _ = self.kill_by_record(&record).await;
+                            }
+                            // Provisioning/Initializing 超时（创建时间 + 超时上限 < now）→ kill
+                            SandboxInstanceState::Provisioning | SandboxInstanceState::Initializing => {
+                                let deadline = record.created_at_us
+                                    + (self.create_ready_timeout.as_secs() as i64 + 120) * 1_000_000;
+                                if chrono::Utc::now().timestamp_micros() > deadline {
+                                    tracing::info!(sandbox_id = %record.sandbox_id, "recover: 创建超时，kill");
+                                    let _ = self.kill_by_record(&record).await;
+                                }
+                            }
+                            _ => {} // Ready + Running = 健康，跳过
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(sandbox_id = %record.sandbox_id, error = %error.to_string(), "recover: Pod 查询失败");
+                    }
+                }
+            }
+        }
     }
 
     pub async fn set_timeout(
@@ -665,45 +802,6 @@ impl SandboxManager {
         tracing::info!("e2b reaper stopped");
     }
 
-    async fn kill_by_record(&self, record: &SandboxInstanceRecord) -> Result<(), SandboxApiError> {
-        let mut record = self
-            .store
-            .transition_state(
-                &record.sandbox_id,
-                record.instance_revision,
-                SandboxInstanceState::Terminating,
-                None,
-                None,
-            )
-            .await
-            .map_err(store_error)?;
-        match self.k8s.delete_pod(&record.pod_name).await {
-            Ok(_) => {}
-            Err(error) => {
-                record = self
-                    .store
-                    .transition_state(
-                        &record.sandbox_id,
-                        record.instance_revision,
-                        SandboxInstanceState::CleanupPending,
-                        Some(&format!("pod delete: {error}")),
-                        None,
-                    )
-                    .await
-                    .map_err(store_error)?;
-            }
-        }
-        let _ = self
-            .store
-            .finish(
-                &record.sandbox_id,
-                record.instance_revision,
-                SandboxInstanceState::Deleted,
-                Some("expired"),
-            )
-            .await;
-        Ok(())
-    }
 }
 
 fn ensure_tenant(record: &SandboxInstanceRecord, key: &SandboxApiKeyRecord) -> Result<(), SandboxApiError> {

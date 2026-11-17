@@ -175,6 +175,8 @@ async fn build_sandbox_deps(
             .seed_registry(&config.e2b_sandbox)
             .await
             .map_err(|error| format!("sandbox seed: {error}"))?;
+        // M3: 重启恢复——扫描非终态记录与实际 Pod 对账收敛
+        manager.recover_orphans().await;
         Ok::<_, String>(manager)
     };
     match assembled.await {
