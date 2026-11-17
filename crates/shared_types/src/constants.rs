@@ -14,6 +14,9 @@ use std::sync::OnceLock;
 pub struct FeatureFlags {
     /// 主线 Web/Computer per-agent PVC (per-agent subvolume + 配额 + lazy mv + batch migrate)
     pub per_agent_pvc: bool,
+    /// 主线 Web/Computer per-agent RBD (RWO 块盘 + 转发层 + wake-on-forward;
+    /// 与 per_agent_pvc(subvolume 变体)互斥 —— 挂根聚合/懒迁移与 RBD 转发路径冲突)
+    pub per_agent_rbd: bool,
     /// Userapp per-app PVC (新功能, 独立于主线; 依赖 cephfs-root 派生挂载 + SC Immediate)
     pub userapp_per_app_pvc: bool,
     /// rcoder 嵌入 Rust file-server (替代 nuwax-file-server 独立进程)
@@ -26,6 +29,7 @@ impl FeatureFlags {
     fn from_env() -> Self {
         Self {
             per_agent_pvc: env_flag("RCODER_PER_AGENT_PVC_ENABLED"),
+            per_agent_rbd: env_flag("RCODER_PER_AGENT_RBD_ENABLED"),
             userapp_per_app_pvc: env_flag("RCODER_USERAPP_PER_APP_PVC_ENABLED"),
             embed_file_server: env_flag("RCODER_EMBED_FILE_SERVER"),
             batch_migrate_on_startup: env_flag("RCODER_BATCH_MIGRATE_ON_STARTUP"),
@@ -36,9 +40,17 @@ impl FeatureFlags {
     /// 重复调用安全 (幂等, 日志会重复打印 — main 只调一次)。
     pub fn init() {
         let f = FEATURE_FLAGS.get_or_init(Self::from_env);
+        // 互斥 fail-fast: 双开必出数据路由错乱(subvolume 挂根聚合读 vs RBD 转发),
+        // 启动即死好过运行期静默写错卷。
+        if f.per_agent_pvc && f.per_agent_rbd {
+            panic!(
+                "RCODER_PER_AGENT_PVC_ENABLED 与 RCODER_PER_AGENT_RBD_ENABLED 互斥, \
+                 不允许同时开启 (subvolume 聚合路径与 RBD 转发路径冲突)"
+            );
+        }
         eprintln!(
-            "🔧 [FEATURE_FLAGS] per_agent_pvc={} userapp_per_app_pvc={} embed_file_server={} batch_migrate_on_startup={}",
-            f.per_agent_pvc, f.userapp_per_app_pvc, f.embed_file_server, f.batch_migrate_on_startup
+            "🔧 [FEATURE_FLAGS] per_agent_pvc={} per_agent_rbd={} userapp_per_app_pvc={} embed_file_server={} batch_migrate_on_startup={}",
+            f.per_agent_pvc, f.per_agent_rbd, f.userapp_per_app_pvc, f.embed_file_server, f.batch_migrate_on_startup
         );
     }
 
@@ -58,6 +70,11 @@ fn env_flag(key: &str) -> bool {
 /// 主线 per-agent PVC 开关 (便捷访问, 内部读 [`FeatureFlags`] 单例)。
 pub fn per_agent_pvc_enabled() -> bool {
     FeatureFlags::get().per_agent_pvc
+}
+
+/// 主线 per-agent RBD 开关 (便捷访问, 内部读 [`FeatureFlags`] 单例)。
+pub fn per_agent_rbd_enabled() -> bool {
+    FeatureFlags::get().per_agent_rbd
 }
 
 // Userapp K8s 永远 per-app (代码不读开关, 无分裂);

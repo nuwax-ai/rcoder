@@ -474,13 +474,15 @@ impl super::DockerRuntime {
                 )
             })
             .flatten();
-        // OOM 判定：该 die 之前、同一容器最近一次 start 之后的窗口里
-        // 是否出现 `oom` 事件（Docker 的 oom 事件在 die 之前发出）
-        let oom_in_cycle = own.iter().any(|e| e.action == "oom");
+        // OOM 判定复用**退出周期归因**（与 overview 的 docker_health 同一
+        // 函数）：只看最近一次 die 到它之前最近一次 start 之间的窗口，
+        // 而不是"历史任何 oom"——否则容器先 OOM 恢复、后来正常退出，也会
+        // 被误报成最近一次是 OOM。
+        let (oom_in_cycle, die_exit_code) = last_exit_cycle(&own);
         let reason = if oom_in_cycle {
             Some("OOMKilled".to_string())
         } else {
-            match die.exit_code {
+            match die_exit_code {
                 Some(0) => Some("Completed".to_string()),
                 Some(_) => Some("Error".to_string()),
                 None => Some("Unknown".to_string()),
@@ -488,7 +490,7 @@ impl super::DockerRuntime {
         };
         Ok(Some(LastTermination {
             reason,
-            exit_code: die.exit_code.map(|c| c as i32),
+            exit_code: die_exit_code.map(|c| c as i32),
             finished_at,
             is_oom: oom_in_cycle,
         }))
@@ -1025,6 +1027,22 @@ mod tests {
         assert_eq!(mk(Some(1)), "Error");
         assert_eq!(mk(Some(137)), "Error", "无 oom 事件时 137 不升格为 OOM");
         assert_eq!(mk(None), "Unknown");
+    }
+
+    /// 历史还原也不得粘连：先 OOM 恢复、后正常退出 → 最近一次不是 OOM。
+    /// 倒序：die(4,0) start(3) die(2,137) oom(1)
+    #[test]
+    fn history_does_not_stick_to_older_oom() {
+        let events = [
+            raw("die", 4, "c1", Some(0)),
+            raw("start", 3, "c1", None),
+            raw("die", 2, "c1", Some(137)),
+            raw("oom", 1, "c1", None),
+        ];
+        let own: Vec<&RawEvent> = events.iter().collect();
+        let (oom, code) = last_exit_cycle(&own);
+        assert!(!oom, "最近周期是正常退出，不得粘住更早的 OOM");
+        assert_eq!(code, Some(0), "取最近 die 的退出码");
     }
 
     /// 名字末段匹配：`-6` 不能误配 `-16`。

@@ -27,6 +27,17 @@ const DEFAULT_PVC_STORAGE_SIZE: &str = "50Gi";
 #[cfg(feature = "kubernetes")]
 const DEFAULT_USERAPP_PVC_STORAGE_SIZE: &str = "100Gi";
 
+/// 主线 Web/Computer per-agent RBD 卷默认容量兜底。
+///
+/// 与 [`DEFAULT_USERAPP_PVC_STORAGE_SIZE`] 同语义：RBD image size 是硬上限，
+/// 100Gi 是「无显式 storage_size 时」的兜底（chart kubernetes_config 通常显式
+/// 传入, 此值仅兜底 chart 未配置的场景）。取 100Gi 而非 CephFS 兜底的 50Gi：
+/// 存量迁移用户的净数据（排除 node_modules 等可重建数据后）可能达几十 GB，
+/// 兜底过小会在迁移/使用期直接 ENOSPC（RBD 硬上限不可越）。SC 须
+/// allowVolumeExpansion=true 以支持在线扩容逃生。
+#[cfg(feature = "kubernetes")]
+const DEFAULT_PER_AGENT_RBD_STORAGE_SIZE: &str = "100Gi";
+
 #[cfg(feature = "kubernetes")]
 use async_trait::async_trait;
 #[cfg(feature = "kubernetes")]
