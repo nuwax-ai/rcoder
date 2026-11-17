@@ -64,20 +64,26 @@ impl WorkspaceRuntime for KubernetesRuntime {
             }
         }
         let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
-        let exists = self
-            .pvcs()
-            .get_opt(&pvc_name)
-            .await
-            .map(|pvc| pvc.is_some())
-            .map_err(|e| {
-                ContainerRuntimeError::K8sError(format!(
+        // 单次 GET 同时取 exists + annotation(read_migration_annotation 会对
+        // 同一 PVC 再发一次全量 GET——合并掉)。
+        let (exists, state) = match self.pvcs().get_opt(&pvc_name).await {
+            Ok(pvc) => {
+                let value = pvc
+                    .as_ref()
+                    .and_then(|p| p.metadata.annotations.as_ref())
+                    .and_then(|a| a.get(shared_types::WORKSPACE_MIGRATION_ANNOTATION))
+                    .map(String::as_str);
+                (
+                    pvc.is_some(),
+                    shared_types::WorkspaceMigrationState::from_annotation(value),
+                )
+            }
+            Err(e) => {
+                return Err(ContainerRuntimeError::K8sError(format!(
                     "workspace_pvc_exists: get PVC '{pvc_name}' failed: {e}"
-                ))
-            })?;
-        let state = self
-            .read_migration_annotation(&pvc_name)
-            .await
-            .unwrap_or(shared_types::WorkspaceMigrationState::NotMigrated);
+                )))
+            }
+        };
         self.workspace_exists_cache
             .write()
             .await
@@ -100,21 +106,35 @@ impl WorkspaceRuntime for KubernetesRuntime {
                 return Ok(*state);
             }
         }
+        // 单次 GET 同时取 exists + annotation(此前 get_opt 后又全量 GET 同一
+        // PVC, 每请求两次 API); miss 后**回写缓存**——此前只读不写导致
+        // intercept 每请求都打 API, 快路径名不副实, 且 replacement 冷缓存
+        // 对 RBD 用户永远 Conflict 也同根于此。
         let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
-        let state = if self
-            .pvcs()
-            .get_opt(&pvc_name)
-            .await
-            .ok()
-            .flatten()
-            .is_some()
-        {
-            self.read_migration_annotation(&pvc_name)
-                .await
-                .unwrap_or(shared_types::WorkspaceMigrationState::NotMigrated)
-        } else {
-            shared_types::WorkspaceMigrationState::NotMigrated
+        let (exists, state) = match self.pvcs().get_opt(&pvc_name).await {
+            Ok(Some(pvc)) => {
+                let value = pvc
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get(shared_types::WORKSPACE_MIGRATION_ANNOTATION))
+                    .map(String::as_str);
+                (
+                    true,
+                    shared_types::WorkspaceMigrationState::from_annotation(value),
+                )
+            }
+            Ok(None) => (false, shared_types::WorkspaceMigrationState::NotMigrated),
+            Err(e) => {
+                return Err(ContainerRuntimeError::K8sError(format!(
+                    "get PVC '{pvc_name}': {e}"
+                )))
+            }
         };
+        self.workspace_exists_cache
+            .write()
+            .await
+            .insert(cache_key, (exists, state, std::time::Instant::now()));
         Ok(state)
     }
 

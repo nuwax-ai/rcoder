@@ -217,7 +217,18 @@ async fn running_agent_addr(state: &AppState, user_id: &str) -> Option<String> {
 async fn wait_file_server_ready(addr: &str, budget: Duration) -> Option<String> {
     let deadline = tokio::time::Instant::now() + budget;
     loop {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+        // connect 必须带自身超时: 无超时时 SYN 被丢(pod 刚删无 endpoint,
+        // Cilium drop 而非 RST)会让单次 connect 挂满内核 tcp_syn_retries
+        // (~127s)——预算检查在 connect 之后, 750ms/3s 预算全部失效。
+        // 剩余预算即本次 connect 的超时上限。
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        if tokio::time::timeout(remaining, tokio::net::TcpStream::connect(addr))
+            .await
+            .is_ok_and(|r| r.is_ok())
+        {
             return Some(addr.to_string());
         }
         if tokio::time::Instant::now() >= deadline {
