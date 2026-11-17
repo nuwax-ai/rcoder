@@ -620,6 +620,8 @@ pub struct E2bSandboxConfig {
     pub envd_init_retries: u32,
     /// create 响应里的 domain 字段（SDK 侧主要用 E2B_DOMAIN，此值用于展示）。
     pub public_domain: String,
+    /// 温池总开关（M4）：false 时不启动补池器，create 走冷启动。
+    pub warm_pool_enabled: bool,
     /// Volume 使用的 StorageClass（默认 cephfs，RWX 多沙箱并发挂载）。
     pub volume_storage_class: String,
     /// Volume 最大容量（GiB）。
@@ -680,6 +682,7 @@ impl Default for E2bSandboxConfig {
             create_ready_timeout_seconds: 90,
             envd_init_retries: 5,
             public_domain: String::new(),
+            warm_pool_enabled: false,
             volume_storage_class: "cephfs".to_string(),
             volume_max_size_gib: 10,
             allowed_ports: vec![49983, 8787, 8788, 49999],

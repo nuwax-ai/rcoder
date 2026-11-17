@@ -116,6 +116,7 @@ fn api_key_record(row: SandboxApiKey) -> SandboxApiKeyRecord {
 fn state_from_str(raw: &str) -> Result<SandboxInstanceState, SandboxStoreError> {
     match raw {
         "provisioning" => Ok(SandboxInstanceState::Provisioning),
+        "warm_ready" => Ok(SandboxInstanceState::WarmReady),
         "initializing" => Ok(SandboxInstanceState::Initializing),
         "ready" => Ok(SandboxInstanceState::Ready),
         "terminating" => Ok(SandboxInstanceState::Terminating),
@@ -626,7 +627,7 @@ impl SandboxStore for PgSandboxStore {
             Box::pin(async move {
                 // 重启恢复需要全量扫描——按 desired_state 逐一列出非终态。
                 let mut all = Vec::new();
-                for state in ["provisioning", "initializing", "ready", "terminating", "cleanup_pending"] {
+                for state in ["provisioning", "warm_ready", "initializing", "ready", "terminating", "cleanup_pending"] {
                     let rows = SandboxInstance::filter_by_desired_state(state)
                         .exec(tx)
                         .await
@@ -657,6 +658,72 @@ impl SandboxStore for PgSandboxStore {
                     .find(|row| row.idempotency_key.as_deref() == Some(key.as_str()))
                     .map(instance_record)
                     .transpose()?)
+            })
+        })
+        .await
+    }
+
+
+    async fn claim_warm_instance(
+        &self,
+        sandbox_id: &str,
+        expected_revision: i64,
+        tenant_id: &str,
+        key_id: &str,
+        token_hash: &str,
+        encrypted_token: &str,
+        env_json: &str,
+        metadata_json: Option<&str>,
+        idempotency_key: Option<&str>,
+    ) -> Result<SandboxInstanceRecord, SandboxStoreError> {
+        let sandbox_id = sandbox_id.to_string();
+        let (tenant_id, key_id, token_hash, encrypted_token) = (
+            tenant_id.to_string(), key_id.to_string(),
+            token_hash.to_string(), encrypted_token.to_string(),
+        );
+        let (env_json, metadata_json, idempotency_key) = (
+            env_json.to_string(),
+            metadata_json.map(str::to_string),
+            idempotency_key.map(str::to_string),
+        );
+        self.run(move |tx| {
+            let sandbox_id = sandbox_id.clone();
+            let tenant_id = tenant_id.clone();
+            let key_id = key_id.clone();
+            let token_hash = token_hash.clone();
+            let encrypted_token = encrypted_token.clone();
+            let env_json = env_json.clone();
+            let metadata_json = metadata_json.clone();
+            let idempotency_key = idempotency_key.clone();
+            Box::pin(async move {
+                let count = toasty::sql::statement(
+                    "UPDATE sandbox_instances SET desired_state='initializing',tenant_id=$1,key_id=$2,token_hash=$3,encrypted_token=$4,env_json=$5,metadata_json=$6,idempotency_key=$7,instance_revision=instance_revision+1,updated_at_us=$8 WHERE sandbox_id=$9 AND instance_revision=$10 AND desired_state='warm_ready'",
+                )
+                .bind(&tenant_id)
+                .bind(&key_id)
+                .bind(&token_hash)
+                .bind(&encrypted_token)
+                .bind(&env_json)
+                .bind_typed(metadata_json.as_deref(), Type::Text)
+                .bind_typed(idempotency_key.as_deref(), Type::Text)
+                .bind(now_us())
+                .bind(&sandbox_id)
+                .bind(expected_revision)
+                .exec(tx)
+                .await
+                .map_err(unavailable)?;
+                if count != 1 {
+                    return Err(SandboxStoreError::Conflict(format!(
+                        "warm claim CAS failed for {sandbox_id} at revision {expected_revision}"
+                    )));
+                }
+                let row = SandboxInstance::filter_by_sandbox_id(&sandbox_id)
+                    .first()
+                    .exec(tx)
+                    .await
+                    .map_err(unavailable)?
+                    .ok_or_else(|| SandboxStoreError::Unavailable("claim row vanished".into()))?;
+                instance_record(row)
             })
         })
         .await

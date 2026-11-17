@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub enum SandboxInstanceState {
     Provisioning,
+    /// 温池预创建：Pod Running、envd 启动、未注入租户数据。被 create 认领后进入 Initializing。
+    WarmReady,
     Initializing,
     Ready,
     Terminating,
@@ -33,6 +35,7 @@ impl SandboxInstanceState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Provisioning => "provisioning",
+            Self::WarmReady => "warm_ready",
             Self::Initializing => "initializing",
             Self::Ready => "ready",
             Self::Terminating => "terminating",
@@ -237,6 +240,20 @@ pub trait SandboxStore: Send + Sync {
         &self,
         key: &str,
     ) -> Result<Option<SandboxInstanceRecord>, SandboxStoreError>;
+    /// 原子认领温池实例：WarmReady → Initializing + 注入租户/token/env/metadata。
+    /// CAS on instance_revision；返回更新后的完整记录。
+    async fn claim_warm_instance(
+        &self,
+        sandbox_id: &str,
+        expected_revision: i64,
+        tenant_id: &str,
+        key_id: &str,
+        token_hash: &str,
+        encrypted_token: &str,
+        env_json: &str,
+        metadata_json: Option<&str>,
+        idempotency_key: Option<&str>,
+    ) -> Result<SandboxInstanceRecord, SandboxStoreError>;
 
     // ---------- Volumes（M5） ----------
     async fn insert_volume(

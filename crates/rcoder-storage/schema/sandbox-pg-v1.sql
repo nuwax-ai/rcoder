@@ -48,7 +48,7 @@ CREATE TABLE sandbox_instances (
  runtime_class TEXT,
  cpu_millicores BIGINT NOT NULL CHECK(cpu_millicores>0),
  memory_mib BIGINT NOT NULL CHECK(memory_mib>0),
- desired_state TEXT NOT NULL CHECK(desired_state IN ('provisioning','initializing','ready','terminating','cleanup_pending','deleted','failed')),
+ desired_state TEXT NOT NULL CHECK(desired_state IN ('provisioning','warm_ready','initializing','ready','terminating','cleanup_pending','deleted','failed')),
  observed_state TEXT,
  instance_revision BIGINT NOT NULL DEFAULT 1 CHECK(instance_revision>=1),
  operation_id TEXT,
