@@ -145,11 +145,17 @@ impl WorkspaceRuntime for KubernetesRuntime {
         let rv = existing.metadata.resource_version.clone().ok_or_else(|| {
             ContainerRuntimeError::Conflict(format!("PVC '{pvc_name}' has no resourceVersion"))
         })?;
+        // NotMigrated 必须用显式 null 删除 key——RFC 7386 下空对象 {} 是
+        // **无操作**(不删任何 key), 之前的 annotations:{} 导致 rollback 只
+        // 改缓存、PVC 上 annotation 保留, 30s TTL 过后判据回弹 migrated
+        // (静默假回滚, 比不提供 rollback 更危险)。
         let annotations = match state.as_annotation() {
             Some(value) => serde_json::json!({
                 shared_types::WORKSPACE_MIGRATION_ANNOTATION: value
             }),
-            None => serde_json::json!({}),
+            None => serde_json::json!({
+                shared_types::WORKSPACE_MIGRATION_ANNOTATION: serde_json::Value::Null
+            }),
         };
         let patch = serde_json::json!({
             "metadata": {"uid": uid, "resourceVersion": rv, "annotations": annotations}

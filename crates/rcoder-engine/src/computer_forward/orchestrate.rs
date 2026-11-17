@@ -44,6 +44,38 @@ pub async fn phase_a(
     let service_type = ServiceType::ComputerAgentRunner;
     let mut steps = Vec::new();
 
+    // 入口校验: 已 Migrated 用户重跑 phase-a, rclone mirror 会把 RBD 上
+    // cutover 后新写、共享卷没有的文件**全部删除**——必须显式拒绝。
+    // (想重迁: 先 rollback → agent 重建回共享 → 再 phase-a。)
+    if matches!(
+        state
+            .runtime()
+            .workspace_migration_state(user_id, &service_type)
+            .await
+            .map_err(|e| wrap("migration_state_check", e))?,
+        WorkspaceMigrationState::Migrated
+    ) {
+        return Err(ContainerRuntimeError::Conflict(format!(
+            "user '{user_id}' is already migrated; \
+             rollback before re-running phase-a (mirror sync would delete \
+             post-cutover writes on the RBD volume)"
+        )));
+    }
+    // RBD 卷仍被挂载时(rollback 后 agent 未重建仍挂 RBD), 双卷 Job 的 RWO
+    // 第二挂载会卡 Pending 直到 activeDeadlineSeconds(4h)——防呆拒绝。
+    if state
+        .runtime()
+        .workspace_volume_attached(user_id, &service_type)
+        .await
+        .map_err(|e| wrap("volume_attached_check", e))?
+    {
+        return Err(ContainerRuntimeError::Conflict(format!(
+            "RBD volume for '{user_id}' is still attached (agent not yet \
+             rebuilt on shared volume after rollback?); restart the agent \
+             before phase-a"
+        )));
+    }
+
     state
         .runtime()
         .ensure_workspace(user_id, &service_type, None)
@@ -78,6 +110,21 @@ pub async fn cutover(
 ) -> Result<MigrationOutcome, ContainerRuntimeError> {
     let service_type = ServiceType::ComputerAgentRunner;
     let mut steps = Vec::new();
+
+    // 入口校验: 已 Migrated 重跑 cutover = mirror 删 RBD 新写数据(P0)。
+    if matches!(
+        state
+            .runtime()
+            .workspace_migration_state(user_id, &service_type)
+            .await
+            .map_err(|e| wrap("migration_state_check", e))?,
+        WorkspaceMigrationState::Migrated
+    ) {
+        return Err(ContainerRuntimeError::Conflict(format!(
+            "user '{user_id}' is already migrated; cutover is not idempotent-safe \
+             to re-run (mirror sync would delete post-cutover writes)"
+        )));
+    }
 
     // 1. 停 agent（删 STS → 卷卸载开始）
     state
@@ -129,15 +176,25 @@ pub async fn cutover(
     steps.push("migration state = migrated".to_string());
 
     // 5. 起 agent（ensure 幂等; migrated 已生效 → 重建即挂 per-agent RBD）
+    let resource_limits = state
+        .config
+        .kubernetes_config
+        .as_ref()
+        .and_then(|kc| kc.get_service_config(&service_type))
+        .map(|sc| sc.resource_limits.clone());
+    if resource_limits.is_none() {
+        // 与 intercept.rs wake 路径同口径 fail-fast——None 会回落
+        // DEFAULT_AGENT_* 常量, 同一用户两条创建路径 limits 分裂。
+        return Err(ContainerRuntimeError::Conflict(
+            "kubernetes_config missing resource_limits for computer-agent-runner; \
+             refusing to restart agent with fallback limits"
+                .to_string(),
+        ));
+    }
     let options = ContainerCreateOptions {
         user_id: user_id.to_string(),
         project_id: user_id.to_string(),
-        resource_limits: state
-            .config
-            .kubernetes_config
-            .as_ref()
-            .and_then(|kc| kc.get_service_config(&service_type))
-            .map(|sc| sc.resource_limits.clone()),
+        resource_limits,
         pod_id: None,
         isolation_type: None,
         tenant_id: None,
