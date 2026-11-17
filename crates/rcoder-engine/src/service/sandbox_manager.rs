@@ -72,6 +72,8 @@ pub struct SandboxManager {
     envd_init_retries: u32,
     cipher: Aes256Gcm,
     public_domain: String,
+    volume_storage_class: String,
+    volume_max_size_gib: i32,
 }
 
 fn random_id(len: usize) -> String {
@@ -119,6 +121,8 @@ impl SandboxManager {
             envd_init_retries: config.envd_init_retries.max(1),
             cipher: Aes256Gcm::new(key),
             public_domain: config.public_domain.clone(),
+            volume_storage_class: config.volume_storage_class.clone(),
+            volume_max_size_gib: config.volume_max_size_gib,
         })
     }
 
@@ -295,6 +299,23 @@ impl SandboxManager {
         record = self.store.insert_instance(&record).await.map_err(store_error)?;
 
         // 外部副作用：Pod 创建 + 等待 Ready。
+        // Volume 挂载：按名称查找租户的 volume，转换为 (pvc_name, mount_path)。
+        let mut volume_mounts = Vec::new();
+        for mount in &params.volume_mounts {
+            let volume = self
+                .store
+                .find_volume_by_name(&key.tenant_id, &mount.volume_name)
+                .await
+                .map_err(store_error)?
+                .ok_or_else(|| {
+                    SandboxApiError::Invalid(format!(
+                        "volume \"{}\" 不存在",
+                        mount.volume_name
+                    ))
+                })?;
+            volume_mounts.push((volume.pvc_name.clone(), mount.mount_path.clone()));
+        }
+
         let pod_params = SandboxPodParams {
             name: record.pod_name.clone(),
             image: record.image.clone(),
@@ -304,6 +325,7 @@ impl SandboxManager {
             envd_port: ENVD_PORT,
             max_lifetime_seconds: spec.ttl_max_seconds + self.create_ready_timeout.as_secs() as i64 + 120,
             env: Vec::new(),
+            volume_mounts,
         };
         if let Err(error) = self.k8s.create_pod(&pod_params).await {
             return self
@@ -748,6 +770,98 @@ impl SandboxManager {
         status
             .pod_ip
             .ok_or_else(|| SandboxApiError::Unavailable("pod 无 IP".into()))
+    }
+
+
+    // ---------- Volumes（M5） ----------
+
+    pub async fn create_volume(
+        &self,
+        key: &SandboxApiKeyRecord,
+        name: &str,
+        size_gib: i32,
+    ) -> Result<shared_types::sandbox::SandboxVolumeRecord, SandboxApiError> {
+        if name.is_empty() || name.len() > 64 {
+            return Err(SandboxApiError::Invalid("volume 名称长度 1-64".into()));
+        }
+        if size_gib <= 0 || size_gib > self.volume_max_size_gib {
+            return Err(SandboxApiError::Invalid(format!(
+                "size {}Gi 超限（1-{}Gi）",
+                size_gib, self.volume_max_size_gib
+            )));
+        }
+        // 同名检查
+        if let Some(existing) = self
+            .store
+            .find_volume_by_name(&key.tenant_id, name)
+            .await
+            .map_err(store_error)?
+        {
+            return Err(SandboxApiError::Conflict(format!(
+                "volume \"{}\" 已存在",
+                name
+            )));
+        }
+        let volume_id = random_id(12);
+        let pvc_name = format!("e2b-vol-{volume_id}");
+        self.k8s
+            .create_pvc(&pvc_name, &self.volume_storage_class, size_gib)
+            .await
+            .map_err(k8s_error)?;
+        let now = chrono::Utc::now().timestamp_micros();
+        let record = shared_types::sandbox::SandboxVolumeRecord {
+            volume_id: volume_id.clone(),
+            tenant_id: key.tenant_id.clone(),
+            key_id: key.key_id.clone(),
+            name: name.to_string(),
+            pvc_name,
+            storage_class: self.volume_storage_class.clone(),
+            size_gib,
+            created_at_us: now,
+            updated_at_us: now,
+            deleted_at_us: None,
+        };
+        self.store
+            .insert_volume(&record)
+            .await
+            .map_err(store_error)
+    }
+
+    pub async fn list_volumes(
+        &self,
+        key: &SandboxApiKeyRecord,
+    ) -> Result<Vec<shared_types::sandbox::SandboxVolumeRecord>, SandboxApiError> {
+        self.store
+            .list_volumes(&key.tenant_id)
+            .await
+            .map_err(store_error)
+    }
+
+    pub async fn delete_volume(
+        &self,
+        key: &SandboxApiKeyRecord,
+        volume_id: &str,
+    ) -> Result<(), SandboxApiError> {
+        let record = self
+            .store
+            .get_volume(volume_id)
+            .await
+            .map_err(store_error)?
+            .ok_or_else(|| SandboxApiError::NotFound(volume_id.to_string()))?;
+        if record.tenant_id != key.tenant_id {
+            return Err(SandboxApiError::NotFound(volume_id.to_string()));
+        }
+        if record.deleted_at_us.is_some() {
+            return Ok(()); // 幂等
+        }
+        // 先软删（防新沙箱挂载），再删 PVC。
+        self.store
+            .mark_volume_deleted(volume_id)
+            .await
+            .map_err(store_error)?;
+        let _ = self.k8s.delete_pvc(&record.pvc_name).await; // PVC 删除失败不阻塞（回收器兜底）
+        tracing::info!(volume_id = %record.volume_id, "e2b volume deleted");
+        Ok(())
     }
 
     /// 超时回收循环（tokio 任务体）：到期实例与待清理实例的收敛。

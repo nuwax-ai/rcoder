@@ -43,6 +43,8 @@ pub struct CreateSandboxBody {
     #[serde(default)]
     pub envVars: Option<serde_json::Map<String, serde_json::Value>>,
     pub metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    pub volumeMounts: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -146,6 +148,26 @@ pub async fn create_sandbox(
             env.push((name.clone(), value));
         }
     }
+    let mut volume_mounts = Vec::new();
+    if let Some(mounts) = &body.volumeMounts {
+        for (mount_path, vol_ref) in mounts {
+            let volume_name = match vol_ref {
+                serde_json::Value::String(name) => name.clone(),
+                serde_json::Value::Object(map) => map
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                _ => continue,
+            };
+            if !volume_name.is_empty() {
+                volume_mounts.push(shared_types::sandbox::VolumeMountRequest {
+                    volume_name,
+                    mount_path: mount_path.clone(),
+                });
+            }
+        }
+    }
     let params = shared_types::sandbox::CreateSandboxParams {
         template_id: template,
         timeout_seconds: body.timeout,
@@ -154,6 +176,7 @@ pub async fn create_sandbox(
             .metadata
             .as_ref()
             .map(|value| value.to_string()),
+        volume_mounts,
     };
     match manager.create(&key, &params).await {
         Ok(CreateOutcome { record, token }) => {
@@ -291,4 +314,88 @@ pub async fn not_supported(
     Extension(_key): Extension<SandboxApiKeyRecord>,
 ) -> Response {
     wire_error(SandboxApiError::NotSupported("e2b sandbox M1 不支持该能力"))
+}
+
+// ---------- Volume handlers（M5） ----------
+
+#[derive(Debug, serde::Deserialize)]
+pub struct CreateVolumeBody {
+    pub name: String,
+    #[serde(default = "default_volume_size")]
+    pub size: i32,
+}
+
+fn default_volume_size() -> i32 {
+    1
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct VolumeWire {
+    pub volumeID: String,
+    pub name: String,
+    pub sizeGiB: i32,
+    pub createdAt: String,
+}
+
+pub async fn create_volume(
+    State(deps): State<SandboxDeps>,
+    Extension(key): Extension<SandboxApiKeyRecord>,
+    axum::Json(body): axum::Json<CreateVolumeBody>,
+) -> Response {
+    let manager = match manager_of(&deps).await {
+        Ok(manager) => manager,
+        Err(response) => return response,
+    };
+    match manager.create_volume(&key, &body.name, body.size).await {
+        Ok(record) => {
+            let wire = VolumeWire {
+                volumeID: record.volume_id,
+                name: record.name,
+                sizeGiB: record.size_gib,
+                createdAt: rfc3339(record.created_at_us),
+            };
+            (StatusCode::CREATED, axum::Json(wire)).into_response()
+        }
+        Err(error) => wire_error(error),
+    }
+}
+
+pub async fn list_volumes(
+    State(deps): State<SandboxDeps>,
+    Extension(key): Extension<SandboxApiKeyRecord>,
+) -> Response {
+    let manager = match manager_of(&deps).await {
+        Ok(manager) => manager,
+        Err(response) => return response,
+    };
+    match manager.list_volumes(&key).await {
+        Ok(records) => {
+            let items: Vec<VolumeWire> = records
+                .into_iter()
+                .map(|r| VolumeWire {
+                    volumeID: r.volume_id,
+                    name: r.name,
+                    sizeGiB: r.size_gib,
+                    createdAt: rfc3339(r.created_at_us),
+                })
+                .collect();
+            (StatusCode::OK, axum::Json(items)).into_response()
+        }
+        Err(error) => wire_error(error),
+    }
+}
+
+pub async fn delete_volume(
+    State(deps): State<SandboxDeps>,
+    Extension(key): Extension<SandboxApiKeyRecord>,
+    Path(volume_id): Path<String>,
+) -> Response {
+    let manager = match manager_of(&deps).await {
+        Ok(manager) => manager,
+        Err(response) => return response,
+    };
+    match manager.delete_volume(&key, &volume_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => wire_error(error),
+    }
 }

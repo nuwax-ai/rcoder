@@ -4,7 +4,7 @@
 //! 事务纪律沿用 preview store：变更严格在提交后返回，未知结果由
 //! 调用方按 operation 语义对账（M3 引入台账前的过渡约束）。
 use crate::db::{
-    models::{SandboxApiKey, SandboxInstance, SandboxTemplate, SandboxTemplateRevision},
+    models::{SandboxApiKey, SandboxInstance, SandboxTemplate, SandboxTemplateRevision, SandboxVolume},
     owner::DatabaseOwner,
     schema::Component,
 };
@@ -12,6 +12,7 @@ use futures::future::BoxFuture;
 use shared_types::sandbox::{
     SandboxApiKeyRecord, SandboxInstanceRecord, SandboxInstanceState,
     SandboxStore, SandboxStoreError, SandboxTemplateSpec, SandboxTemplateSummary,
+    SandboxVolumeRecord,
 };
 use toasty::Executor;
 use toasty_core::schema::db::Type;
@@ -613,6 +614,147 @@ impl SandboxStore for PgSandboxStore {
         })
         .await
     }
+
+
+    // ---------- Volumes（M5） ----------
+
+    async fn insert_volume(
+        &self,
+        record: &SandboxVolumeRecord,
+    ) -> Result<SandboxVolumeRecord, SandboxStoreError> {
+        let record = record.clone();
+        self.run(move |tx| {
+            let record = record.clone();
+            Box::pin(async move {
+                let count = toasty::sql::statement(
+                    "INSERT INTO sandbox_volumes(volume_id,tenant_id,key_id,name,pvc_name,storage_class,size_gib,created_at_us,updated_at_us,deleted_at_us) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$8,NULL) ON CONFLICT(volume_id) DO NOTHING",
+                )
+                .bind(&record.volume_id)
+                .bind(&record.tenant_id)
+                .bind(&record.key_id)
+                .bind(&record.name)
+                .bind(&record.pvc_name)
+                .bind(&record.storage_class)
+                .bind(record.size_gib as i64)
+                .bind(record.created_at_us)
+                .exec(tx)
+                .await
+                .map_err(unavailable)?;
+                let _ = count;
+                let row = SandboxVolume::filter_by_volume_id(&record.volume_id)
+                    .first()
+                    .exec(tx)
+                    .await
+                    .map_err(unavailable)?
+                    .ok_or_else(|| SandboxStoreError::Unavailable("volume insert row vanished".into()))?;
+                volume_record(row)
+            })
+        })
+        .await
+    }
+
+    async fn get_volume(
+        &self,
+        volume_id: &str,
+    ) -> Result<Option<SandboxVolumeRecord>, SandboxStoreError> {
+        let volume_id = volume_id.to_string();
+        self.run(move |tx| {
+            Box::pin(async move {
+                let row = SandboxVolume::filter_by_volume_id(&volume_id)
+                    .first()
+                    .exec(tx)
+                    .await
+                    .map_err(unavailable)?;
+                row.map(volume_record).transpose()
+            })
+        })
+        .await
+    }
+
+    async fn find_volume_by_name(
+        &self,
+        tenant_id: &str,
+        name: &str,
+    ) -> Result<Option<SandboxVolumeRecord>, SandboxStoreError> {
+        let tenant_id = tenant_id.to_string();
+        let name = name.to_string();
+        self.run(move |tx| {
+            let tenant_id = tenant_id.clone();
+            Box::pin(async move {
+                let rows = SandboxVolume::filter_by_tenant_id(&tenant_id)
+                    .exec(tx)
+                    .await
+                    .map_err(unavailable)?;
+                rows.into_iter()
+                    .filter(|row| row.name == name && row.deleted_at_us.is_none())
+                    .next()
+                    .map(volume_record)
+                    .transpose()
+            })
+        })
+        .await
+    }
+
+    async fn list_volumes(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Vec<SandboxVolumeRecord>, SandboxStoreError> {
+        let tenant_id = tenant_id.to_string();
+        self.run(move |tx| {
+            let tenant_id = tenant_id.clone();
+            Box::pin(async move {
+                let rows = SandboxVolume::filter_by_tenant_id(&tenant_id)
+                    .exec(tx)
+                    .await
+                    .map_err(unavailable)?;
+                let mut records: Vec<SandboxVolumeRecord> = rows
+                    .into_iter()
+                    .filter(|row| row.deleted_at_us.is_none())
+                    .map(volume_record)
+                    .collect::<Result<Vec<_>, _>>()?;
+                records.sort_by(|a, b| b.created_at_us.cmp(&a.created_at_us));
+                Ok(records)
+            })
+        })
+        .await
+    }
+
+    async fn mark_volume_deleted(
+        &self,
+        volume_id: &str,
+    ) -> Result<(), SandboxStoreError> {
+        let volume_id = volume_id.to_string();
+        self.run(move |tx| {
+            Box::pin(async move {
+                toasty::sql::statement(
+                    "UPDATE sandbox_volumes SET deleted_at_us=$1,updated_at_us=$1 WHERE volume_id=$2 AND deleted_at_us IS NULL",
+                )
+                .bind(now_us())
+                .bind(&volume_id)
+                .exec(tx)
+                .await
+                .map_err(unavailable)?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
+}
+
+fn volume_record(row: SandboxVolume) -> Result<SandboxVolumeRecord, SandboxStoreError> {
+    Ok(SandboxVolumeRecord {
+        volume_id: row.volume_id,
+        tenant_id: row.tenant_id,
+        key_id: row.key_id,
+        name: row.name,
+        pvc_name: row.pvc_name,
+        storage_class: row.storage_class,
+        size_gib: row.size_gib as i32,
+        created_at_us: row.created_at_us,
+        updated_at_us: row.updated_at_us,
+        deleted_at_us: row.deleted_at_us,
+    })
 }
 
 async fn read_back(

@@ -239,7 +239,8 @@ pub(crate) fn storage_models() -> toasty::ModelSet {
         SandboxTemplate,
         SandboxTemplateRevision,
         SandboxApiKey,
-        SandboxInstance
+        SandboxInstance,
+        SandboxVolume
     )
 }
 
@@ -531,4 +532,21 @@ pub(crate) struct ComputeControl {
     pub created_at_us: i64,
     pub updated_at_us: i64,
     pub terminal_at_us: Option<i64>,
+}
+
+#[derive(toasty::Model)]
+#[table = "sandbox_volumes"]
+pub(crate) struct SandboxVolume {
+    #[key]
+    pub volume_id: String,
+    #[index]
+    pub tenant_id: String,
+    pub key_id: String,
+    pub name: String,
+    pub pvc_name: String,
+    pub storage_class: String,
+    pub size_gib: i64,
+    pub created_at_us: i64,
+    pub updated_at_us: i64,
+    pub deleted_at_us: Option<i64>,
 }

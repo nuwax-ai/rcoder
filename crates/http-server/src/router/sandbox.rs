@@ -96,6 +96,9 @@ pub fn sandbox_routes(deps: SandboxDeps) -> Router {
         .route("/sandboxes/{sandbox_id}/connect", post(sbx_handler::connect_sandbox))
         .route("/v2/sandboxes/{sandbox_id}/connect", post(sbx_handler::connect_sandbox))
         .route("/templates", get(sbx_handler::list_templates))
+        .route("/volumes", post(sbx_handler::create_volume))
+        .route("/volumes", get(sbx_handler::list_volumes))
+        .route("/volumes/{volume_id}", delete(sbx_handler::delete_volume))
         .route(
             "/sandboxes/{sandbox_id}/pause",
             post(sbx_handler::not_supported),

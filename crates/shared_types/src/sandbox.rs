@@ -134,6 +134,8 @@ pub struct CreateSandboxParams {
     pub env: Vec<(String, String)>,
     /// SDK metadata 透传（JSON 字符串原样存储）。
     pub metadata: Option<String>,
+    /// 卷挂载（M5）：E2B volume name → 容器内路径。
+    pub volume_mounts: Vec<VolumeMountRequest>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -224,6 +226,31 @@ pub trait SandboxStore: Send + Sync {
     async fn list_expired(&self, now_us: i64) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError>;
     /// 非终态且 CleanupPending 的待对账实例（M3 使用；M1 返回空亦可）。
     async fn list_cleanup_pending(&self) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError>;
+
+    // ---------- Volumes（M5） ----------
+    async fn insert_volume(
+        &self,
+        record: &SandboxVolumeRecord,
+    ) -> Result<SandboxVolumeRecord, SandboxStoreError>;
+    async fn get_volume(
+        &self,
+        volume_id: &str,
+    ) -> Result<Option<SandboxVolumeRecord>, SandboxStoreError>;
+    /// 按租户+名称查找（未删除的；创建沙箱挂载用）。
+    async fn find_volume_by_name(
+        &self,
+        tenant_id: &str,
+        name: &str,
+    ) -> Result<Option<SandboxVolumeRecord>, SandboxStoreError>;
+    async fn list_volumes(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Vec<SandboxVolumeRecord>, SandboxStoreError>;
+    /// 软删除（deleted_at_us 置值；物理 PVC 删除由服务层协调）。
+    async fn mark_volume_deleted(
+        &self,
+        volume_id: &str,
+    ) -> Result<(), SandboxStoreError>;
 }
 
 /// sha256 hex（token/api key 摘要的唯一哈希入口）。
@@ -238,4 +265,32 @@ pub fn sha256_hex(input: &str) -> String {
         let _ = write!(hex, "{b:02x}");
     }
     hex
+}
+
+// ---------- E2B Volumes（M5：持久卷） ----------
+
+/// E2B Volume 记录（存储投影）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxVolumeRecord {
+    pub volume_id: String,
+    pub tenant_id: String,
+    pub key_id: String,
+    /// 用户可读名称（租户内唯一，未删除的）。
+    pub name: String,
+    /// K8s PVC 名称（e2b-vol-{volume_id}）。
+    pub pvc_name: String,
+    pub storage_class: String,
+    pub size_gib: i32,
+    pub created_at_us: i64,
+    pub updated_at_us: i64,
+    pub deleted_at_us: Option<i64>,
+}
+
+/// create sandbox 时的卷挂载请求。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeMountRequest {
+    /// E2B volume 名称（租户内查找）。
+    pub volume_name: String,
+    /// 沙箱内挂载路径（如 /home/user/data）。
+    pub mount_path: String,
 }

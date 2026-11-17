@@ -30,6 +30,18 @@ impl Component {
             Self::Sandbox => "sandbox",
         }
     }
+
+    /// 集中的 string→enum 解析（与 `name()` 对称）。新增 Component 变体时
+    /// 必须同步两处（name + from_name），下方 round-trip 测试会捕获遗漏。
+    fn from_name(name: &str) -> Result<Self> {
+        match name {
+            "userapp" => Ok(Self::Userapp),
+            "project" => Ok(Self::Project),
+            "preview" => Ok(Self::Preview),
+            "sandbox" => Ok(Self::Sandbox),
+            other => bail!("unknown database schema component: {other}"),
+        }
+    }
     fn ddl(self, backend: Backend) -> Result<&'static str> {
         match (self, backend) {
             (Self::Userapp, Backend::Postgres) => {
@@ -255,13 +267,7 @@ async fn initialize_component(
         let [name, version, migration_name, checksum, fingerprint] = row.as_slice() else {
             bail!("invalid migration ledger shape");
         };
-        let known = match name.as_str() {
-            "userapp" => Component::Userapp,
-            "project" => Component::Project,
-            "preview" => Component::Preview,
-            "sandbox" => Component::Sandbox,
-            _ => bail!("unknown database schema component"),
-        };
+        let known = Component::from_name(name)?;
         let version: i64 = version.parse().context("invalid schema version")?;
         let ddl = migration_ddl(known, backend, version)?;
         ensure!(
@@ -400,4 +406,29 @@ async fn catalog_fingerprint(
         }
     }
     Ok(digest(&bytes))
+}
+
+#[cfg(test)]
+mod component_tests {
+    use super::Component;
+
+    /// 所有变体 name↔from_name 往返一致。新增变体忘了加映射会在此测试失败
+    /// （不是完美的编译时检查，但比运行时 bail 好得多）。
+    #[test]
+    fn component_names_round_trip() {
+        let all = [
+            Component::Userapp,
+            Component::Project,
+            Component::Preview,
+            Component::Sandbox,
+        ];
+        for component in all {
+            let name = component.name();
+            assert_eq!(
+                Component::from_name(name).unwrap(),
+                component,
+                "name() 产出 \"{name}\" 但 from_name 无法解析回去"
+            );
+        }
+    }
 }

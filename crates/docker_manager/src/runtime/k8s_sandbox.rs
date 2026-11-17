@@ -8,8 +8,12 @@
 //! RuntimeClass（如 kata-clh-runtime-rs）由模板规格透传；模板不可用应在注册表
 //! 层拒绝，而非静默回退 runc。
 
-use k8s_openapi::api::core::v1::{Container, ContainerPort, Pod, PodSpec, ResourceRequirements};
+use k8s_openapi::api::core::v1::{
+    Container, ContainerPort, PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod, PodSpec,
+    ResourceRequirements, Volume, VolumeMount,
+};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use kube::{api::ObjectMeta, Api, Client};
 use std::time::Duration;
 
@@ -34,6 +38,8 @@ pub struct SandboxPodParams {
     pub max_lifetime_seconds: i64,
     /// 透传给 envd 进程的容器级环境（M1 通常为空；进程 env 走 envd /init）。
     pub env: Vec<(String, String)>,
+    /// 卷挂载：(PVC 名称, 容器内挂载路径)。
+    pub volume_mounts: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +79,56 @@ impl SandboxK8s {
         &self.namespace
     }
 
+
+    /// 创建 CephFS PVC（RWX，多沙箱可并发挂载）。
+    pub async fn create_pvc(
+        &self,
+        pvc_name: &str,
+        storage_class: &str,
+        size_gib: i32,
+    ) -> Result<(), SandboxK8sError> {
+        let pvc = PersistentVolumeClaim {
+            metadata: ObjectMeta {
+                name: Some(pvc_name.to_string()),
+                labels: Some(std::collections::BTreeMap::from([
+                    ("app".to_string(), "e2b-sandbox".to_string()),
+                    ("e2b-volume".to_string(), "true".to_string()),
+                ])),
+                ..Default::default()
+            },
+            spec: Some(PersistentVolumeClaimSpec {
+                access_modes: Some(vec!["ReadWriteMany".to_string()]),
+                storage_class_name: Some(storage_class.to_string()),
+                resources: Some(k8s_openapi::api::core::v1::VolumeResourceRequirements {
+                    requests: Some(std::collections::BTreeMap::from([(
+                        "storage".to_string(),
+                        Quantity(format!("{}Gi", size_gib)),
+                    )])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Api::<PersistentVolumeClaim>::namespaced(self.client.clone(), &self.namespace)
+            .create(&kube::api::PostParams::default(), &pvc)
+            .await
+            .map(|_| ())
+            .map_err(|error| err("create pvc", error))
+    }
+
+    /// 删除 PVC；404 视为已删除。
+    pub async fn delete_pvc(&self, pvc_name: &str) -> Result<bool, SandboxK8sError> {
+        match Api::<PersistentVolumeClaim>::namespaced(self.client.clone(), &self.namespace)
+            .delete(pvc_name, &kube::api::DeleteParams::default())
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(kube::Error::Api(response)) if response.code == 404 => Ok(false),
+            Err(error) => Err(err("delete pvc", error)),
+        }
+    }
+
     fn pods(&self) -> Api<Pod> {
         Api::namespaced(self.client.clone(), &self.namespace)
     }
@@ -104,6 +160,21 @@ impl SandboxK8s {
                 ..Default::default()
             }]),
             resources: Some(resources),
+            volume_mounts: if params.volume_mounts.is_empty() {
+                None
+            } else {
+                Some(
+                    params
+                        .volume_mounts
+                        .iter()
+                        .map(|(pvc_name, mount_path)| VolumeMount {
+                            name: format!("vol-{}", pvc_name.trim_start_matches("e2b-vol-")),
+                            mount_path: mount_path.clone(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                )
+            },
             env: Some(
                 params
                     .env
@@ -117,7 +188,20 @@ impl SandboxK8s {
             ),
             ..Default::default()
         };
+        let volumes: Vec<Volume> = params
+            .volume_mounts
+            .iter()
+            .map(|(pvc_name, _)| Volume {
+                name: format!("vol-{}", pvc_name.trim_start_matches("e2b-vol-")),
+                persistent_volume_claim: Some(k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+                    claim_name: pvc_name.clone(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .collect();
         let spec = PodSpec {
+            volumes: if volumes.is_empty() { None } else { Some(volumes) },
             containers: vec![container],
             runtime_class_name: params.runtime_class.clone(),
             active_deadline_seconds: Some(params.max_lifetime_seconds),

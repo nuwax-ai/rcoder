@@ -70,3 +70,17 @@ CREATE UNIQUE INDEX sandbox_instances_pod ON sandbox_instances(pod_name) WHERE d
 CREATE INDEX sandbox_instances_list ON sandbox_instances(tenant_id,created_at_us,sandbox_id);
 CREATE INDEX sandbox_instances_expiry ON sandbox_instances(expires_at_us) WHERE deleted_at_us IS NULL;
 CREATE INDEX sandbox_instances_reconcile ON sandbox_instances(desired_state) WHERE deleted_at_us IS NULL;
+CREATE TABLE sandbox_volumes (
+ volume_id TEXT NOT NULL PRIMARY KEY CHECK(length(volume_id)>0),
+ tenant_id TEXT NOT NULL CHECK(length(tenant_id)>0),
+ key_id TEXT REFERENCES sandbox_api_keys(key_id),
+ name TEXT NOT NULL CHECK(length(name)>0),
+ pvc_name TEXT NOT NULL CHECK(length(pvc_name)>0),
+ storage_class TEXT NOT NULL,
+ size_gib INTEGER NOT NULL CHECK(size_gib>0 AND size_gib<=100),
+ created_at_us BIGINT NOT NULL, updated_at_us BIGINT NOT NULL,
+ deleted_at_us BIGINT,
+ CONSTRAINT sandbox_volume_terminal CHECK((deleted_at_us IS NOT NULL) OR (deleted_at_us IS NULL))
+);
+CREATE INDEX sandbox_volumes_list ON sandbox_volumes(tenant_id,created_at_us,volume_id);
+CREATE UNIQUE INDEX sandbox_volumes_name ON sandbox_volumes(tenant_id,name) WHERE deleted_at_us IS NULL;
