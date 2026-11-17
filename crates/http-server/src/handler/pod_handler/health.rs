@@ -104,9 +104,6 @@ pub async fn computer_pod_health(
     State(state): State<Arc<AppState>>,
     I18nQuery(params): I18nQuery<PodHealthQuery>,
 ) -> Result<HttpResult<PodHealthResponse>, AppError> {
-    let locale = shared_types::current_request_locale();
-    let _ = locale;
-
     // 1) 目标解析（与 /pod/resources 同一函数，参数规则完全一致）
     let resources_query = shared_types::ComputerPodResourcesQuery {
         user_id: params.user_id.clone(),
@@ -148,7 +145,9 @@ pub async fn computer_pod_health(
         );
         return Ok(HttpResult::success(PodHealthResponse {
             health: container_runtime_api::ContainerHealth {
-                container_name: String::new(),
+                // 目标解析成功但容器不存在：名字仍然填上（前端要显示"是哪个
+                // 容器不在"），source 标 "none" 而不是空串
+                container_name: target.identifier.clone(),
                 alive: false,
                 phase: "NotFound".to_string(),
                 ready: false,
@@ -159,7 +158,7 @@ pub async fn computer_pod_health(
                 waiting_reason: None,
                 detail: Some("container not found".to_string()),
                 sampled_at: chrono::Utc::now(),
-                source: String::new(),
+                source: "none".to_string(),
                 pod_uid: None,
             },
             cache_age_seconds: 0,
@@ -209,6 +208,9 @@ pub async fn computer_pod_health(
                 container_name: container.container_name.clone(),
                 alive: false,
                 phase: "NotFound".to_string(),
+                detail: Some("container disappeared between locate and inspect".to_string()),
+                source: "none".to_string(),
+                sampled_at: chrono::Utc::now(),
                 ..Default::default()
             },
             cache_age_seconds: 0,

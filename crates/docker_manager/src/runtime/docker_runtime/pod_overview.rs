@@ -77,7 +77,7 @@ impl super::DockerRuntime {
             };
 
         // 3) 事件（全量收集，健康在截断前计算；失败降级但**如实标注**）
-        let (full_events, events_partial) = match collect_recent_events(self).await {
+        let (full_events, events_partial) = match collect_recent_events(self, None).await {
             Ok((events, partial)) => (events, partial),
             Err(e) => {
                 warn!("[POD_OVERVIEW] docker events degraded: {e}");
@@ -342,7 +342,7 @@ impl super::DockerRuntime {
 
         // 事件：找本 CID 最近的 die（退出码 + 时间）；失败只降级不影响
         // 存活判定（events 是"历史可见性"，不是"活着没"）。
-        let (raw_events, _partial) = match collect_recent_events(self).await {
+        let (raw_events, _partial) = match collect_recent_events(self, Some(&cid)).await {
             Ok(v) => v,
             Err(e) => {
                 warn!("[POD_HEALTH] docker events degraded: {e}");
@@ -363,10 +363,30 @@ impl super::DockerRuntime {
                     nano.rem_euclid(1_000_000_000) as u32,
                 )
             });
-        let reason = if oom_in_cycle {
+        // exit 0 = 正常结束（Completed），不是 "Error"。docker 的 die 事件
+        // 对正常 stop 也发，标成 Error 会把"优雅停止"计成崩溃。
+        let state_oom = state.and_then(|s| s.oom_killed).unwrap_or(false);
+        let is_oom = oom_in_cycle || state_oom;
+        let reason = if is_oom {
             Some("OOMKilled".to_string())
-        } else if last_die.is_some() {
-            Some("Error".to_string())
+        } else {
+            match die_exit_code {
+                Some(0) => Some("Completed".to_string()),
+                Some(_) => Some("Error".to_string()),
+                // 有 die 但拿不到退出码：不能猜 0（会伪装成正常）
+                None if last_die.is_some() => Some("Unknown".to_string()),
+                None => None,
+            }
+        };
+        // `State.OOMKilled` 为真但事件里没有 oom（events 采集失败/超出 256 条
+        // 回放窗口）时，`last_oom_at` 不能空着——否则 oom_killed_last=true 却
+        // 没有时间，前端无法记录"什么时候 OOM 的"。退回 State.FinishedAt。
+        let state_finished = state
+            .and_then(|s| s.finished_at.as_ref())
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t.to_string()).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let last_oom_at = if is_oom {
+            finished_at.or(state_finished)
         } else {
             None
         };
@@ -376,20 +396,22 @@ impl super::DockerRuntime {
             pod_uid: (!cid.is_empty()).then_some(cid),
             alive,
             phase,
+            // docker 没有 readiness 概念：running 即视为可用（与本仓
+            // `/pod/resources` 对 docker 的口径一致）
             ready: alive,
             restart_count: count_recovery_cycles(&own),
-            last_termination: if last_die.is_some() {
+            last_termination: if last_die.is_some() || state_oom {
                 Some(LastTermination {
                     reason,
                     exit_code: die_exit_code.map(|c| c as i32),
-                    finished_at,
-                    is_oom: oom_in_cycle,
+                    finished_at: finished_at.or(state_finished),
+                    is_oom,
                 })
             } else {
                 None
             },
-            oom_killed_last: oom_in_cycle || state.and_then(|s| s.oom_killed).unwrap_or(false),
-            last_oom_at: if oom_in_cycle { finished_at } else { None },
+            oom_killed_last: is_oom,
+            last_oom_at,
             waiting_reason: None,
             detail: state
                 .and_then(|s| s.error.clone())
@@ -522,10 +544,20 @@ struct RawEvent {
 /// （R2-3：吞错会把失败伪装成"无事件"）。
 async fn collect_recent_events(
     runtime: &super::DockerRuntime,
+    only_cid: Option<&str>,
 ) -> Result<(Vec<RawEvent>, bool), String> {
     let client = runtime.inner.get_docker_client();
     let now = chrono::Utc::now().timestamp();
-    let options = EventsOptionsBuilder::new()
+    let mut builder = EventsOptionsBuilder::new();
+    // 服务端过滤：overview 要全量，health 只要单个容器——后者把流缩到
+    // 一个对象的量级（否则每次 3s 轮询都拉整 daemon 近 1h 事件）
+    if let Some(cid) = only_cid {
+        let mut filters = HashMap::new();
+        filters.insert("container".to_string(), vec![cid.to_string()]);
+        filters.insert("type".to_string(), vec!["container".to_string()]);
+        builder = builder.filters(&filters);
+    }
+    let options = builder
         .since(&(now - EVENT_WINDOW_SECS).to_string()) // Unix 秒（R2-1："1h" 是 CLI 写法，API 会 400）
         .until(&now.to_string())
         .build();
@@ -870,6 +902,25 @@ mod tests {
             !inspect_identity_confirmed(None, "cid-a"),
             "期望缺席（list 行无 id）未确认"
         );
+    }
+
+    /// 自查：正常停止（exit 0）不能标成 Error——docker 对优雅 stop 也发
+    /// die 事件，标 Error 会把"正常停止"计成崩溃。
+    #[test]
+    fn clean_exit_zero_is_completed_not_error() {
+        let events = [raw("die", 1, "c1", Some(0))];
+        let (oom, code) = last_exit_cycle(&events.iter().collect::<Vec<_>>());
+        assert!(!oom);
+        assert_eq!(code, Some(0), "退出码 0 要原样保留（供上层判 Completed）");
+    }
+
+    /// 自查：有 die 但拿不到 exitCode 时不能猜 0（会伪装成正常退出）。
+    #[test]
+    fn missing_exit_code_stays_unknown() {
+        let events = [raw("die", 1, "c1", None)];
+        let (oom, code) = last_exit_cycle(&events.iter().collect::<Vec<_>>());
+        assert!(!oom);
+        assert_eq!(code, None, "未知就是未知，不能填 0");
     }
 
     /// 第三轮 #3：状态码判断（真实 Bollard 错误类型，非文本匹配）。

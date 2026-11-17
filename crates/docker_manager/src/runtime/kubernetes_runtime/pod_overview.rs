@@ -591,10 +591,11 @@ impl super::KubernetesRuntime {
             finished_at,
             is_oom,
         });
-        let alive = status
-            .and_then(|s| s.container_statuses.as_ref())
-            .and_then(|list| list.iter().find(|c| c.name == cs.name))
-            .and_then(|c| c.state.as_ref())
+        // `cs` 本身就是该容器状态（上面已定位），直接用——再按名字回查是
+        // 冗余的二次查找。
+        let alive = cs
+            .state
+            .as_ref()
             .and_then(|st| st.running.as_ref())
             .is_some();
 
