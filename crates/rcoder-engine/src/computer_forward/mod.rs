@@ -174,8 +174,12 @@ mod tests {
 
     #[test]
     fn target_from_header_wins() {
-        let t = resolve_target(Some(" u_1001 "), "userId=u_999&x=1", "/api/computer/get-file-list")
-            .expect("header target");
+        let t = resolve_target(
+            Some(" u_1001 "),
+            Some("userId=u_999&x=1"),
+            "/api/computer/get-file-list",
+        )
+        .expect("header target");
         assert_eq!(t.user_id, "u_1001");
         assert_eq!(t.source, TargetSource::Header);
     }
