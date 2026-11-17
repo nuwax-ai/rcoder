@@ -19,6 +19,7 @@ pub(crate) enum Component {
     Userapp,
     Project,
     Preview,
+    Sandbox,
 }
 impl Component {
     fn name(self) -> &'static str {
@@ -26,6 +27,7 @@ impl Component {
             Self::Userapp => "userapp",
             Self::Project => "project",
             Self::Preview => "preview",
+            Self::Sandbox => "sandbox",
         }
     }
     fn ddl(self, backend: Backend) -> Result<&'static str> {
@@ -41,6 +43,9 @@ impl Component {
             }
             (Self::Preview, Backend::Postgres) => {
                 Ok(include_str!("../../schema/preview-pg-v1.sql"))
+            }
+            (Self::Sandbox, Backend::Postgres) => {
+                Ok(include_str!("../../schema/sandbox-pg-v1.sql"))
             }
             _ => bail!("requested database component is unsupported by this backend"),
         }
@@ -73,6 +78,7 @@ fn latest_version(component: Component) -> i64 {
         Component::Userapp => 4,
         Component::Project => 2,
         Component::Preview => 1,
+        Component::Sandbox => 1,
     }
 }
 fn migration_name(component: Component, version: i64) -> &'static str {
