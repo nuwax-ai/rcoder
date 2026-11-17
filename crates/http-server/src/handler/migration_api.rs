@@ -45,7 +45,9 @@ fn allowed_users() -> &'static HashSet<String> {
 fn ensure_allowed(user_id: &str) -> Option<Response> {
     // Docker Compose 形态: 迁移编排只对 K8s 有意义(trait 默认 sync=Err),
     // 显式拒绝防误设(白名单与 flag 双误设时 cutover 会真停容器然后失败)。
-    if !shared_types::is_kubernetes_runtime() {
+    let kubernetes_runtime = shared_types::is_kubernetes_runtime()
+        && docker_manager::runtime_selection::RuntimeType::from_env().is_kubernetes();
+    if !kubernetes_runtime {
         return Some(
             (
                 StatusCode::NOT_IMPLEMENTED,

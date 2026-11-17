@@ -68,8 +68,11 @@ pub async fn computer_rbd_intercept(
     // Docker Compose 形态硬短路: RBD 判据层在非 K8s runtime 下无意义
     // (trait 默认 state=NotMigrated 恒放行是行为兜底, 这里是显式防线——
     // 即便 env 误设也不会让后续闸门逻辑在 Docker 形态下有任何行为面)。
-    // cfg! 是编译期常量, Docker 构建下此分支恒真、零运行时开销。
-    if !shared_types::is_kubernetes_runtime() {
+    // 双判定: cfg! 编译期(Docker 构建恒真零开销) + RuntimeType 运行时
+    // (CONTAINER_RUNTIME=docker)——k8s 镜像混装 docker runtime 也挡死。
+    if !shared_types::is_kubernetes_runtime()
+        || !docker_manager::runtime_selection::RuntimeType::from_env().is_kubernetes()
+    {
         return next.run(req).await;
     }
     // userapp 标记请求让行（userapp 转发层优先——同用户可能同时存在 computer
