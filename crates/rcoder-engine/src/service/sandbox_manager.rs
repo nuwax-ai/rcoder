@@ -141,7 +141,7 @@ impl SandboxManager {
         for template in &config.templates {
             let spec = SandboxTemplateSpec {
                 template_id: template.template_id.clone(),
-                revision: 1,
+                revision: template.revision,
                 image: template.image.clone(),
                 image_digest: template.image_digest.clone(),
                 envd_version: template.envd_version.clone(),
@@ -160,7 +160,7 @@ impl SandboxManager {
                         template_id: template.template_id.clone(),
                         display_name: template.display_name.clone(),
                         enabled: template.enabled,
-                        current_revision: 1,
+                        current_revision: template.revision,
                     },
                     &spec,
                 )

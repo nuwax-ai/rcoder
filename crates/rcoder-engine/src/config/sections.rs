@@ -639,6 +639,9 @@ pub struct E2bSandboxApiKeySeed {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct E2bSandboxTemplateSeed {
     pub template_id: String,
+    /// 修订号：镜像/envd/规格变更必须 +1（修订行不可变，同号冲突被忽略）。
+    #[serde(default = "default_template_revision")]
+    pub revision: i64,
     pub display_name: Option<String>,
     pub enabled: bool,
     pub image: String,
@@ -655,6 +658,10 @@ pub struct E2bSandboxTemplateSeed {
     pub ttl_max_seconds: i64,
     #[serde(default)]
     pub warm_target: i64,
+}
+
+fn default_template_revision() -> i64 {
+    1
 }
 
 impl Default for E2bSandboxConfig {
