@@ -193,26 +193,30 @@ pub(crate) fn per_agent_rbd_storage_class() -> String {
 
 /// workspace PVC 卷型选择（`ensure_workspace_pvc` 决策核心, 纯函数供单测）。
 ///
-/// 三臂: ① Userapp 域恒 RWO+RBD(env 可覆盖) ② 主线 agent 域 + per-agent RBD
-/// 开关 → RWO + 块盘 SC + 100Gi 兜底(RBD image size 硬上限, 50Gi 兜底会在
-/// 存量迁移场景直接 ENOSPC) ③ 主线 agent 域默认(全局 SC/access_mode,
-/// 共享语义——CephFS 卷不构成业务容量约束)。② 仅在
-/// RCODER_PER_AGENT_RBD_ENABLED=true 生效, 关闭时与现状逐字节一致。
+/// 三臂: ① Userapp 域恒 RWO+RBD(env 可覆盖, 由调用方解析传入) ② 主线 agent 域 +
+/// per-agent RBD 开关 → RWO + 块盘 SC + 100Gi 兜底(RBD image size 硬上限, 50Gi
+/// 兜底会在存量迁移场景直接 ENOSPC) ③ 主线 agent 域默认(全局 SC/access_mode,
+/// 共享语义——CephFS 卷不构成业务容量约束)。② 仅在 RCODER_PER_AGENT_RBD_ENABLED=true
+/// 生效, 关闭时与现状逐字节一致。env 读取全部在调用方完成——本函数不触 env,
+/// 单测无需进程级 env 写入（crate 禁 unsafe, edition 2024 下 env::set_var 不可用）。
 #[cfg(feature = "kubernetes")]
 fn select_volume_spec(
     service_type: &ServiceType,
     global_access_mode: &str,
     global_storage_class: &str,
+    userapp_sc: Option<String>,
+    per_agent_rbd: bool,
+    per_agent_rbd_sc: Option<String>,
 ) -> (String, Option<String>, &'static str) {
     match service_type {
         ServiceType::Userapp | ServiceType::UserappBuilder => (
             "ReadWriteOnce".to_string(),
-            userapp_storage_class(),
+            userapp_sc,
             DEFAULT_USERAPP_PVC_STORAGE_SIZE,
         ),
-        _ if shared_types::per_agent_rbd_enabled() => (
+        _ if per_agent_rbd => (
             "ReadWriteOnce".to_string(),
-            Some(per_agent_rbd_storage_class()),
+            per_agent_rbd_sc,
             DEFAULT_PER_AGENT_RBD_STORAGE_SIZE,
         ),
         _ => (
@@ -249,6 +253,9 @@ impl K8sPvcOps for KubernetesRuntime {
             service_type,
             &self.config.access_mode,
             &self.config.storage_class,
+            userapp_storage_class(),
+            shared_types::per_agent_rbd_enabled(),
+            Some(per_agent_rbd_storage_class()),
         );
         let mut extra_labels: Vec<(String, String)> = Vec::new();
         // builder 聚合标签（identifier 应用共享后即纯 app_id；存量复合键
@@ -663,13 +670,14 @@ fn compare_storage_quantity(current: &str, requested: &str) -> StorageVerdict {
 mod tests {
     use super::*;
 
-    // nextest 每测试独立进程: env 置位 + 首次触碰 FeatureFlags 单例安全。
-    // cargo test 同进程串行亦可(此处不并发冲突)。
+    // select_volume_spec 全参传入（含 env 解析结果）, 测试不触进程 env
+    // （crate 禁 unsafe; edition 2024 下 env::set_var 不可用）。
 
     #[test]
-    fn volume_spec_userapp_arm_unchanged() {
-        let (am, sc, size) =
-            select_volume_spec(&ServiceType::Userapp, "ReadWriteMany", "cephfs");
+    fn volume_spec_userapp_arm() {
+        let (am, sc, size) = select_volume_spec(
+            &ServiceType::Userapp, "ReadWriteMany", "cephfs", None, false, None,
+        );
         assert_eq!(am, "ReadWriteOnce");
         assert_eq!(size, DEFAULT_USERAPP_PVC_STORAGE_SIZE);
         assert!(sc.is_none()); // 无 env 时 None → 集群 default SC
@@ -677,12 +685,11 @@ mod tests {
 
     #[test]
     fn volume_spec_default_arm_when_rbd_flag_off() {
-        // 进程未设 RBD env → 单例初始化为 false → 走全局共享臂
         let (am, sc, size) = select_volume_spec(
-            &ServiceType::ComputerAgentRunner,
-            "ReadWriteMany",
-            "cephfs",
+            &ServiceType::ComputerAgentRunner, "ReadWriteMany", "cephfs",
+            None, false, Some("ceph-rbd".into()),
         );
+        // 开关关: RBD 参数被无视, 走全局共享臂（与现状逐字节一致）
         assert_eq!(am, "ReadWriteMany");
         assert_eq!(sc.as_deref(), Some("cephfs"));
         assert_eq!(size, DEFAULT_PVC_STORAGE_SIZE);
@@ -690,15 +697,9 @@ mod tests {
 
     #[test]
     fn volume_spec_rbd_arm_defaults() {
-        // edition 2024: env 写入是 unsafe（单线程测试内无竞争, 此处安全）
-        unsafe {
-            std::env::set_var("RCODER_PER_AGENT_RBD_ENABLED", "true");
-            std::env::remove_var("RCODER_PER_AGENT_RBD_STORAGE_CLASS");
-        }
         let (am, sc, size) = select_volume_spec(
-            &ServiceType::ComputerAgentRunner,
-            "ReadWriteMany",
-            "cephfs",
+            &ServiceType::ComputerAgentRunner, "ReadWriteMany", "cephfs",
+            None, true, Some("ceph-rbd".into()),
         );
         assert_eq!(am, "ReadWriteOnce");
         assert_eq!(sc.as_deref(), Some("ceph-rbd"));
@@ -707,12 +708,11 @@ mod tests {
     }
 
     #[test]
-    fn volume_spec_rbd_arm_env_sc_override() {
-        unsafe {
-            std::env::set_var("RCODER_PER_AGENT_RBD_ENABLED", "true");
-            std::env::set_var("RCODER_PER_AGENT_RBD_STORAGE_CLASS", "rook-ceph-block");
-        }
-        let (_, sc, _) = select_volume_spec(&ServiceType::WebAgentRunner, "RWX", "cephfs");
+    fn volume_spec_rbd_arm_sc_override() {
+        let (_, sc, _) = select_volume_spec(
+            &ServiceType::WebAgentRunner, "RWX", "cephfs",
+            None, true, Some("rook-ceph-block".into()),
+        );
         assert_eq!(sc.as_deref(), Some("rook-ceph-block"));
     }
 
