@@ -14,34 +14,41 @@ pub(crate) enum Backend {
     Postgres,
     Turso,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Component {
-    Userapp,
-    Project,
-    Preview,
-    Sandbox,
+/// Component 枚举的单一数据源：变体列表只在此处定义一次，
+/// `name()`/`from_name()`/`ALL` 全部由宏自动生成——新增变体只加一行，
+/// 漏配映射是编译错误（match 非穷举），而非运行时 bail。
+macro_rules! define_components {
+    ($($variant:ident => $name:literal),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        pub(crate) enum Component {
+            $($variant),+
+        }
+        impl Component {
+            /// 全部变体（迭代/测试用）。
+            pub(crate) const ALL: &'static [Component] = &[$(Component::$variant),+];
+            fn name(self) -> &'static str {
+                match self {
+                    $(Component::$variant => $name),+
+                }
+            }
+            fn from_name(name: &str) -> Result<Self> {
+                match name {
+                    $($name => Ok(Component::$variant)),+,
+                    other => bail!("unknown database schema component: {other}"),
+                }
+            }
+        }
+    };
 }
-impl Component {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Userapp => "userapp",
-            Self::Project => "project",
-            Self::Preview => "preview",
-            Self::Sandbox => "sandbox",
-        }
-    }
 
-    /// 集中的 string→enum 解析（与 `name()` 对称）。新增 Component 变体时
-    /// 必须同步两处（name + from_name），下方 round-trip 测试会捕获遗漏。
-    fn from_name(name: &str) -> Result<Self> {
-        match name {
-            "userapp" => Ok(Self::Userapp),
-            "project" => Ok(Self::Project),
-            "preview" => Ok(Self::Preview),
-            "sandbox" => Ok(Self::Sandbox),
-            other => bail!("unknown database schema component: {other}"),
-        }
-    }
+define_components! {
+    Userapp => "userapp",
+    Project => "project",
+    Preview => "preview",
+    Sandbox => "sandbox",
+}
+
+impl Component {
     fn ddl(self, backend: Backend) -> Result<&'static str> {
         match (self, backend) {
             (Self::Userapp, Backend::Postgres) => {
@@ -416,13 +423,7 @@ mod component_tests {
     /// （不是完美的编译时检查，但比运行时 bail 好得多）。
     #[test]
     fn component_names_round_trip() {
-        let all = [
-            Component::Userapp,
-            Component::Project,
-            Component::Preview,
-            Component::Sandbox,
-        ];
-        for component in all {
+        for &component in Component::ALL {
             let name = component.name();
             assert_eq!(
                 Component::from_name(name).unwrap(),
