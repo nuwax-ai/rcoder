@@ -289,12 +289,13 @@ mod tests {
     #[test]
     fn pass_through_table_matches_and_rejects() {
         assert!(is_pass_through_path("/api/computer/get-file-list"));
-        assert!(is_pass_through_path("/api/build/build-project"));
         assert!(is_pass_through_path("/api/computer/static/6/1696379/deep/dir/f.txt"));
         // 未登记路径不被前缀吞并
         assert!(!is_pass_through_path("/api/computer/staticx/6"));
         assert!(!is_pass_through_path("/api/computer/unknown-route"));
-        assert!(!is_pass_through_path("/api/build/parse-build-error")); // 留本地
+        // build 族本期整体摘出(web 会话分流判据未实现, 防误转发)
+        assert!(!is_pass_through_path("/api/build/build-project"));
+        assert!(!is_pass_through_path("/api/build/parse-build-error"));
     }
 
     #[test]
