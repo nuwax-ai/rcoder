@@ -215,6 +215,7 @@ fn path_matches(tmpl: &str, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shared_types::ServiceType;
 
     fn found(resolution: TargetResolution) -> ComputerForwardTarget {
         match resolution {
