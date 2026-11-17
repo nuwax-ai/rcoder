@@ -616,6 +616,27 @@ impl SandboxStore for PgSandboxStore {
     }
 
 
+
+    async fn list_all_non_terminal(
+        &self,
+    ) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError> {
+        self.run(move |tx| {
+            Box::pin(async move {
+                // 重启恢复需要全量扫描——按 desired_state 逐一列出非终态。
+                let mut all = Vec::new();
+                for state in ["provisioning", "initializing", "ready", "terminating", "cleanup_pending"] {
+                    let rows = SandboxInstance::filter_by_desired_state(state)
+                        .exec(tx)
+                        .await
+                        .map_err(unavailable)?;
+                    all.extend(rows.into_iter().map(instance_record).collect::<Result<Vec<_>, _>>()?);
+                }
+                Ok(all)
+            })
+        })
+        .await
+    }
+
     // ---------- Volumes（M5） ----------
 
     async fn insert_volume(
@@ -743,6 +764,11 @@ impl SandboxStore for PgSandboxStore {
 }
 
 fn volume_record(row: SandboxVolume) -> Result<SandboxVolumeRecord, SandboxStoreError> {
+    debug_assert!(
+        (1..=100).contains(&row.size_gib),
+        "volume size_gib {} 超出预期范围 1-100",
+        row.size_gib
+    );
     Ok(SandboxVolumeRecord {
         volume_id: row.volume_id,
         tenant_id: row.tenant_id,

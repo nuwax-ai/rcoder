@@ -302,6 +302,23 @@ impl SandboxManager {
         // Volume 挂载：按名称查找租户的 volume，转换为 (pvc_name, mount_path)。
         let mut volume_mounts = Vec::new();
         for mount in &params.volume_mounts {
+            // mount_path 安全校验：必须以 / 开头、不含 ..、不挂载敏感路径
+            if !mount.mount_path.starts_with('/') {
+                return Err(SandboxApiError::Invalid(format!(
+                    "mountPath \"{}\" 必须以 / 开头",
+                    mount.mount_path
+                )));
+            }
+            if mount.mount_path.contains("..") {
+                return Err(SandboxApiError::Invalid("mountPath 不允许路径穿越".into()));
+            }
+            const SENSITIVE: &[&str] = &["/proc", "/sys", "/dev", "/etc", "/var/run", "/run"];
+            if SENSITIVE.iter().any(|p| mount.mount_path == *p || mount.mount_path.starts_with(&format!("{}/", p))) {
+                return Err(SandboxApiError::Invalid(format!(
+                    "mountPath \"{}\" 不允许挂载系统路径",
+                    mount.mount_path
+                )));
+            }
             let volume = self
                 .store
                 .find_volume_by_name(&key.tenant_id, &mount.volume_name)
@@ -610,19 +627,12 @@ impl SandboxManager {
     /// - Pod 存在且 Ready → 检查 envd 存活，不活则 kill
     /// 在 seed_registry 之后、run_reaper 启动之前调用。
     pub async fn recover_orphans(&self) {
-        let states = [
-            SandboxInstanceState::Provisioning,
-            SandboxInstanceState::Initializing,
-            SandboxInstanceState::Ready,
-            SandboxInstanceState::Terminating,
-            SandboxInstanceState::CleanupPending,
-        ];
-        for state in states {
-            let records = match self.store.list_instances("", None, 1000).await {
-                Ok(list) => list.into_iter().filter(|r| r.desired_state == state).collect::<Vec<_>>(),
+        {
+            let records = match self.store.list_all_non_terminal().await {
+                Ok(list) => list,
                 Err(error) => {
-                    tracing::warn!(?state, error = %error, "recover: 扫描失败");
-                    continue;
+                    tracing::warn!(error = %error, "recover: 扫描失败");
+                    return;
                 }
             };
             for record in records {

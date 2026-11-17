@@ -226,6 +226,8 @@ pub trait SandboxStore: Send + Sync {
     async fn list_expired(&self, now_us: i64) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError>;
     /// 非终态且 CleanupPending 的待对账实例（M3 使用；M1 返回空亦可）。
     async fn list_cleanup_pending(&self) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError>;
+    /// 全部非终态实例（重启恢复用；不按租户过滤）。
+    async fn list_all_non_terminal(&self) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError>;
 
     // ---------- Volumes（M5） ----------
     async fn insert_volume(
