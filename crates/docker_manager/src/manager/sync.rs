@@ -5,13 +5,87 @@
 
 use std::sync::Arc;
 
+use bollard::query_parameters::{InspectContainerOptions, RemoveContainerOptions};
 use container_runtime_api::RemovedContainerInfo;
 use shared_types::ServiceType;
 use tracing::{debug, info, warn};
 
 use super::super::{ContainerStatus, DockerContainerInfo, DockerManager, DockerResult};
 
+/// 已停止的 agent 容器保留多久再回收。
+///
+/// 存在的意义：agent 容器不再 `auto_remove`（那会让 OOM 的容器连同
+/// `State.OOMKilled / ExitCode / FinishedAt` 一起消失，OOM 归因只能靠
+/// Docker events 的 256 条回放窗口，繁忙 daemon 上只覆盖几分钟）。
+/// 保留窗口让 `/computer/pod/health` 能**直接 inspect** 到真实死因，
+/// 到期由 60s 的容器对账任务回收，不长期占用磁盘。
+const STOPPED_AGENT_RETENTION_SECS: i64 = 600;
+
 impl DockerManager {
+    /// 回收「已停止超过保留窗口」的 agent 容器。
+    ///
+    /// 只回收带 rcoder 身份 label 的容器（`service-type`），不碰用户
+    /// userapp / 构建器等其它容器。返回 `Some(removed_info)` 表示已删除
+    /// 并应从缓存移除。
+    async fn reap_stopped_agent(
+        &self,
+        project_id: &str,
+        container_id: &str,
+    ) -> Option<RemovedContainerInfo> {
+        let details = match self
+            .docker
+            .inspect_container(container_id, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(details) => details,
+            Err(e) => {
+                debug!(%project_id, error = %e, "reap: inspect failed, skip");
+                return None;
+            }
+        };
+        // 只处理有 rcoder 身份的 agent 容器
+        let is_agent = details
+            .config
+            .as_ref()
+            .and_then(|c| c.labels.as_ref())
+            .is_some_and(|labels| labels.contains_key("service-type"));
+        if !is_agent {
+            return None;
+        }
+        let state = details.state.as_ref()?;
+        // 仍在运行 / 重启中：不回收
+        if state.running == Some(true) || state.restarting == Some(true) {
+            return None;
+        }
+        let finished_at = state
+            .finished_at
+            .as_ref()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t.to_string()).ok())
+            .map(|t| t.timestamp());
+        let finished_at = finished_at?;
+        if finished_at <= 0 {
+            return None; // 零值 = 不可信
+        }
+        let age = chrono::Utc::now().timestamp() - finished_at;
+        if age < STOPPED_AGENT_RETENTION_SECS {
+            return None;
+        }
+        info!(
+            %project_id, container_id, age_seconds = age,
+            "reclaiming stopped agent container past retention window"
+        );
+        if let Err(e) = self
+            .docker
+            .remove_container(container_id, None::<RemoveContainerOptions>)
+            .await
+        {
+            warn!(%project_id, error = %e, "reclaim: remove container failed");
+            return None;
+        }
+        let info = self.containers.get(project_id).await?;
+        Some(self.build_removed_container_info(project_id, &info).await)
+    }
+
     /// 遍历缓存中的所有容器，调用 Docker API 检查其真实状态。
     /// 如果容器已被外部删除（如手动 `docker stop`），则从缓存中移除。
     /// 🆕 对运行中的容器执行服务健康检查（HTTP + gRPC）
@@ -118,6 +192,16 @@ impl DockerManager {
                         .await
                 {
                     return Some((project_id, None, true));
+                }
+                // 已停止的 agent 容器：超过保留窗口则回收（这是 auto_remove
+                // 关闭后唯一的清理路径——容器死后没人 ensure 时不能永久留存）
+                if matches!(status, ContainerStatus::Stopped)
+                    && let Some(info) = container_info_before_update.as_ref()
+                    && let Some(removed_info) = self
+                        .reap_stopped_agent(&project_id, &info.container_id)
+                        .await
+                {
+                    return Some((project_id, Some(removed_info), false));
                 }
                 Some((project_id, None, false))
             }

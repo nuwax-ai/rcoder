@@ -6,10 +6,8 @@
 //! 与 k8s_agent_query.rs（读）、k8s_agent_pod.rs（stop/restart/sync/cleanup 变更）正交。
 
 use container_runtime_api::{
-    WorkspaceRuntime,
-
-
     ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult, ContainerRuntimeStatus,
+    WorkspaceRuntime,
 };
 use k8s_openapi::api::core::v1::{
     Container as K8sContainer, ContainerPort, EnvVar, LocalObjectReference,
@@ -99,7 +97,8 @@ impl KubernetesRuntime {
                         ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject
                     )
                     && matches!(
-                        self.workspace_migration_state(identifier, &service_type).await?,
+                        self.workspace_migration_state(identifier, &service_type)
+                            .await?,
                         shared_types::WorkspaceMigrationState::Migrated
                     )));
         // 阶段2 per-agent PVC (CephFS subvolume, ceph-csi 服务端配额, 绕开 client setfattr):
@@ -785,4 +784,3 @@ async fn legacy_shared_workspace_nonempty(identifier: &str) -> bool {
         Err(_) => false,
     }
 }
-

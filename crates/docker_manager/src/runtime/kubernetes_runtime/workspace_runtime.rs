@@ -57,8 +57,7 @@ impl WorkspaceRuntime for KubernetesRuntime {
         use crate::runtime::k8s_pvc::K8sPvcOps;
         const TTL: std::time::Duration = std::time::Duration::from_secs(30);
         let cache_key = format!("{service_type}/{identifier}");
-        if let Some((exists, state, at)) =
-            self.workspace_exists_cache.read().await.get(&cache_key)
+        if let Some((exists, state, at)) = self.workspace_exists_cache.read().await.get(&cache_key)
         {
             if at.elapsed() < TTL {
                 return Ok(*exists);
@@ -82,10 +81,7 @@ impl WorkspaceRuntime for KubernetesRuntime {
         self.workspace_exists_cache
             .write()
             .await
-            .insert(
-                cache_key,
-                (exists, state, std::time::Instant::now()),
-            );
+            .insert(cache_key, (exists, state, std::time::Instant::now()));
         Ok(exists)
     }
 
@@ -99,15 +95,20 @@ impl WorkspaceRuntime for KubernetesRuntime {
         use crate::runtime::k8s_pvc::K8sPvcOps;
         const TTL: std::time::Duration = std::time::Duration::from_secs(30);
         let cache_key = format!("{service_type}/{identifier}");
-        if let Some((_, state, at)) =
-            self.workspace_exists_cache.read().await.get(&cache_key)
-        {
+        if let Some((_, state, at)) = self.workspace_exists_cache.read().await.get(&cache_key) {
             if at.elapsed() < TTL {
                 return Ok(*state);
             }
         }
         let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
-        let state = if self.pvcs().get_opt(&pvc_name).await.ok().flatten().is_some() {
+        let state = if self
+            .pvcs()
+            .get_opt(&pvc_name)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
             self.read_migration_annotation(&pvc_name)
                 .await
                 .unwrap_or(shared_types::WorkspaceMigrationState::NotMigrated)
@@ -154,7 +155,11 @@ impl WorkspaceRuntime for KubernetesRuntime {
             "metadata": {"uid": uid, "resourceVersion": rv, "annotations": annotations}
         });
         self.pvcs()
-            .patch(&pvc_name, &kube::api::PatchParams::default(), &kube::api::Patch::Merge(&patch))
+            .patch(
+                &pvc_name,
+                &kube::api::PatchParams::default(),
+                &kube::api::Patch::Merge(&patch),
+            )
             .await
             .map_err(|e| match &e {
                 kube::Error::Api(response) if response.code == 404 => {
@@ -170,16 +175,12 @@ impl WorkspaceRuntime for KubernetesRuntime {
                 )),
             })?;
         // 即时写缓存: cutover 后首个请求就要按新判据路由
-        self.workspace_exists_cache
-            .write()
-            .await
-            .insert(
-                format!("{service_type}/{identifier}"),
-                (true, state, std::time::Instant::now()),
-            );
+        self.workspace_exists_cache.write().await.insert(
+            format!("{service_type}/{identifier}"),
+            (true, state, std::time::Instant::now()),
+        );
         Ok(())
     }
-
 
     /// 枚举某 service_type 的所有 per-app PVC，从 PVC 名反解 identifier（app_id）。
     ///
@@ -239,13 +240,10 @@ impl WorkspaceRuntime for KubernetesRuntime {
             .read_migration_annotation(&pvc_name)
             .await
             .unwrap_or(shared_types::WorkspaceMigrationState::NotMigrated);
-        self.workspace_exists_cache
-            .write()
-            .await
-            .insert(
-                format!("{service_type}/{identifier}"),
-                (true, state, std::time::Instant::now()),
-            );
+        self.workspace_exists_cache.write().await.insert(
+            format!("{service_type}/{identifier}"),
+            (true, state, std::time::Instant::now()),
+        );
         Ok(())
     }
 
@@ -349,17 +347,18 @@ impl KubernetesRuntime {
         &self,
         pvc_name: &str,
     ) -> ContainerRuntimeResult<shared_types::WorkspaceMigrationState> {
-        let pvc = self
-            .pvcs()
-            .get(pvc_name)
-            .await
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("get PVC '{pvc_name}': {e}")))?;
+        let pvc =
+            self.pvcs().get(pvc_name).await.map_err(|e| {
+                ContainerRuntimeError::K8sError(format!("get PVC '{pvc_name}': {e}"))
+            })?;
         let value = pvc
             .metadata
             .annotations
             .as_ref()
             .and_then(|a| a.get(shared_types::WORKSPACE_MIGRATION_ANNOTATION))
             .map(String::as_str);
-        Ok(shared_types::WorkspaceMigrationState::from_annotation(value))
+        Ok(shared_types::WorkspaceMigrationState::from_annotation(
+            value,
+        ))
     }
 }

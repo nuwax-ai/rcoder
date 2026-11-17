@@ -219,13 +219,11 @@ fn select_volume_spec(
         // RBD PVC = agent 写块盘 / rcoder 读共享卷 = 用户文件"消失"的数据
         // 分裂。computer 族(ComputerAgentRunner/ComputerNormalProject)的读取
         // 已由转发层接管(computer_forward), 是唯一安全域。
-        ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject
-            if per_agent_rbd =>
-            (
-                "ReadWriteOnce".to_string(),
-                per_agent_rbd_sc,
-                DEFAULT_PER_AGENT_RBD_STORAGE_SIZE,
-            ),
+        ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject if per_agent_rbd => (
+            "ReadWriteOnce".to_string(),
+            per_agent_rbd_sc,
+            DEFAULT_PER_AGENT_RBD_STORAGE_SIZE,
+        ),
         _ => (
             global_access_mode.to_string(),
             Some(global_storage_class.to_string()),

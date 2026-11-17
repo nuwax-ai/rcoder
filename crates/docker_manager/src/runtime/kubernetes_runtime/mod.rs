@@ -75,7 +75,11 @@ pub struct KubernetesRuntime {
         RwLock<
             std::collections::HashMap<
                 String,
-                (bool, shared_types::WorkspaceMigrationState, std::time::Instant),
+                (
+                    bool,
+                    shared_types::WorkspaceMigrationState,
+                    std::time::Instant,
+                ),
             >,
         >,
     >,
