@@ -43,6 +43,17 @@ fn allowed_users() -> &'static HashSet<String> {
 }
 
 fn ensure_allowed(user_id: &str) -> Option<Response> {
+    // Docker Compose 形态: 迁移编排只对 K8s 有意义(trait 默认 sync=Err),
+    // 显式拒绝防误设(白名单与 flag 双误设时 cutover 会真停容器然后失败)。
+    if !shared_types::is_kubernetes_runtime() {
+        return Some(
+            (
+                StatusCode::NOT_IMPLEMENTED,
+                "workspace migration requires the Kubernetes runtime",
+            )
+                .into_response(),
+        );
+    }
     if allowed_users().contains(user_id) {
         return None;
     }

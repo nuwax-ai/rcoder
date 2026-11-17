@@ -65,6 +65,13 @@ pub async fn computer_rbd_intercept(
     if !shared_types::per_agent_rbd_enabled() {
         return next.run(req).await;
     }
+    // Docker Compose 形态硬短路: RBD 判据层在非 K8s runtime 下无意义
+    // (trait 默认 state=NotMigrated 恒放行是行为兜底, 这里是显式防线——
+    // 即便 env 误设也不会让后续闸门逻辑在 Docker 形态下有任何行为面)。
+    // cfg! 是编译期常量, Docker 构建下此分支恒真、零运行时开销。
+    if !shared_types::is_kubernetes_runtime() {
+        return next.run(req).await;
+    }
     // userapp 标记请求让行（userapp 转发层优先——同用户可能同时存在 computer
     // agent 与 userapp 容器, PVC 名前缀不同但判据链不该被交叉触发）
     if req
