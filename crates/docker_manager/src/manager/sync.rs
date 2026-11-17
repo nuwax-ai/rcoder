@@ -21,6 +21,16 @@ use super::super::{ContainerStatus, DockerContainerInfo, DockerManager, DockerRe
 /// 到期由 60s 的容器对账任务回收，不长期占用磁盘。
 const STOPPED_AGENT_RETENTION_SECS: i64 = 600;
 
+/// 保留窗口可被环境变量覆盖（运维调优 / 测试用短窗口验证回收）。
+/// 非法值回落默认，不 panic——这是清理任务的参数，不该让进程起不来。
+fn stopped_agent_retention_secs() -> i64 {
+    std::env::var("RCODER_STOPPED_AGENT_RETENTION_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+        .unwrap_or(STOPPED_AGENT_RETENTION_SECS)
+}
+
 impl DockerManager {
     /// 回收「已停止超过保留窗口」的 agent 容器。
     ///
@@ -67,11 +77,12 @@ impl DockerManager {
             return None; // 零值 = 不可信
         }
         let age = chrono::Utc::now().timestamp() - finished_at;
-        if age < STOPPED_AGENT_RETENTION_SECS {
+        let retention = stopped_agent_retention_secs();
+        if age < retention {
             return None;
         }
         info!(
-            %project_id, container_id, age_seconds = age,
+            %project_id, container_id, age_seconds = age, retention_secs = retention,
             "reclaiming stopped agent container past retention window"
         );
         if let Err(e) = self
