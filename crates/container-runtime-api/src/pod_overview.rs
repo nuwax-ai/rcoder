@@ -1,15 +1,18 @@
 //! `/computer/pod/overview` 的运行时观测类型（方案：docs/pod-overview.md）。
 //!
-//! 命名空间级 Pod 概览：规格（申请了多少）、健康（重启/OOM/等待原因）、
-//! 最近事件。P1 不含 usage（实际用量）——那是 P2 的 metrics/gRPC 双源合并。
+//! 命名空间级 Pod 概览：规格（申请了多少）、健康（重启/终止/等待原因）、
+//! 实际用量（usage，metrics-server / docker stats）、最近事件。
 //!
 //! 语义红线（与既有接口同一套原则）：
 //! - **`None` ≠ `0`**：取不到就是 `None`，绝不填 0（0 会被读成"空载/没重启"）；
-//! - `oom_killed_last` 只表示**最近一次**终止是否 OOM，不是历史次数；
-//!   历史只能从近 1h 事件里数（k8s Events 默认保留 ~1h）；
-//! - docker 的 `restart_count` 只统计重启策略触发的重启（实测：
-//!   手工 `docker restart` 不计数），重启次数以事件里的 restart/die 计数为准，
-//!   `restart_source` 必须如实标注。
+//! - 健康段**以「终止」为主语**，不以 OOM 为主语：`last_terminate_reason`
+//!   对任何原因的终止都有值（`OOMKilled` / `Error` / `Completed`），
+//!   是否 OOM 就是它等于 `"OOMKilled"`；**不要**用 `last_exit_code == 137`
+//!   推断 OOM（liveness SIGKILL 同样给 137）；
+//! - 只保留**最近一次**终止（k8s `lastState` 只有一个槽位），历史次数不可得；
+//! - docker 的 `restart_count` 只统计策略重启（实测：手工 `docker restart`
+//!   不计数），以事件里的 die→start 恢复对为准，`restart_source` 必须如实标注；
+//! - 零值时间（`0001-01-01` / epoch）一律按"未知"处理，返回 `None`。
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -158,7 +161,8 @@ pub struct PodVolumeSpec {
 ///
 /// 语义红线（与 overview 一致）：
 /// - `last_termination` 为 `None` = 从未终止过（**不是**空对象）；
-/// - `last_oom_at` 非 OOM 时为 `None`（**不填 0、不填当前时间**）；
+/// - 不提供 `last_oom_at` 这类"只在 OOM 时有值"的顶层字段：终止时间在
+///   `last_termination.finished_at`，任何原因都有值；
 /// - `is_oom` 由 `reason == "OOMKilled"` 判定，**绝不用 exit_code==137
 ///   推断**（实测 137 也来自 liveness SIGKILL）；
 /// - `pod_uid` 变化 = 容器被删除重建（计数归零），前端据此识别换代。

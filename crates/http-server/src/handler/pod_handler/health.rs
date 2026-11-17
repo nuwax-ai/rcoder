@@ -150,6 +150,23 @@ pub async fn computer_pod_health(
             "container not found, probing termination history"
         );
         let runtime = state.runtime().clone();
+        // 容器不存在时**同样走缓存**：事件历史探测要拉全量 docker 事件，
+        // 前端 3s 轮询一个已消失的容器会把 daemon 打满。
+        let absent_key = (
+            Arc::as_ptr(&runtime) as *const () as usize,
+            target.identifier.clone(),
+        );
+        let fresh_absent = params.fresh.unwrap_or(false);
+        if !fresh_absent
+            && let Ok(cache) = CACHE.lock()
+            && let Some(entry) = cache.get(&absent_key)
+            && entry.ts.elapsed().as_secs() < CACHE_TTL_SECS
+        {
+            return Ok(HttpResult::success(PodHealthResponse {
+                health: entry.health.clone(),
+                cache_age_seconds: entry.ts.elapsed().as_secs(),
+            }));
+        }
         let history = runtime
             .container_termination_history(&target.identifier)
             .await
@@ -157,25 +174,39 @@ pub async fn computer_pod_health(
                 debug!(event = "pod_health.history_failed", error = %e, "history probe failed");
                 None
             });
+        let absent = container_runtime_api::ContainerHealth {
+            // 目标解析成功但容器不存在：名字仍然填上（前端要显示"是哪个
+            // 容器不在"），source 标 "none" 而不是空串
+            container_name: target.identifier.clone(),
+            alive: false,
+            phase: "NotFound".to_string(),
+            ready: false,
+            restart_count: 0,
+            last_termination: history,
+            started_at: None,
+            waiting_reason: None,
+            detail: Some(
+                "container not found (docker: already removed by auto_remove)".to_string(),
+            ),
+            sampled_at: chrono::Utc::now(),
+            source: "none".to_string(),
+            pod_uid: None,
+        };
+        if let Ok(mut cache) = CACHE.lock() {
+            cache.insert(
+                absent_key,
+                HealthCache {
+                    health: absent.clone(),
+                    ts: std::time::Instant::now(),
+                },
+            );
+            if cache.len() > 256 {
+                let now = std::time::Instant::now();
+                cache.retain(|_, entry| now.duration_since(entry.ts).as_secs() < 60);
+            }
+        }
         return Ok(HttpResult::success(PodHealthResponse {
-            health: container_runtime_api::ContainerHealth {
-                // 目标解析成功但容器不存在：名字仍然填上（前端要显示"是哪个
-                // 容器不在"），source 标 "none" 而不是空串
-                container_name: target.identifier.clone(),
-                alive: false,
-                phase: "NotFound".to_string(),
-                ready: false,
-                restart_count: 0,
-                last_termination: history,
-                started_at: None,
-                waiting_reason: None,
-                detail: Some(
-                    "container not found (docker: already removed by auto_remove)".to_string(),
-                ),
-                sampled_at: chrono::Utc::now(),
-                source: "none".to_string(),
-                pod_uid: None,
-            },
+            health: absent,
             cache_age_seconds: 0,
         }));
     };

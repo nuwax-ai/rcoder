@@ -796,12 +796,25 @@ fn docker_health(state: Option<&ContainerState>, events: &[&RawEvent]) -> PodHea
             }
         })
         .map(|c| c as i32);
+    // reason 用**与 k8s 同一套词表**（OOMKilled / Error / Completed），退出码
+    // 只由 `last_exit_code` 承载——否则同一事件在 docker 下是 "Error(137)"、
+    // 在 k8s 下是 "Error"，调用方按字符串比较会踩坑。
+    let has_die = events.iter().any(|e| e.action == "die");
+    let stopped = state.is_some_and(|s| !s.running.unwrap_or(false));
     let last_terminate_reason = if oom_killed_last {
         Some("OOMKilled".to_string())
+    } else if has_die || stopped {
+        Some(
+            match exit_code {
+                Some(0) => "Completed",
+                Some(_) => "Error",
+                None => "Unknown",
+            }
+            .to_string(),
+        )
     } else {
-        exit_code
-            .filter(|code| *code != 0)
-            .map(|code| format!("Error({code})"))
+        // 运行中且无 die 事件：从未终止过
+        None
     };
     PodHealth {
         restart_count,
@@ -1172,7 +1185,8 @@ mod tests {
             Some("OOMKilled"),
             "最近周期（die=1 普通）无 oom → 不粘旧 OOM"
         );
-        assert_eq!(health.last_terminate_reason.as_deref(), Some("Error(1)"));
+        assert_eq!(health.last_terminate_reason.as_deref(), Some("Error"));
+        assert_eq!(health.last_exit_code, Some(1), "退出码在独立字段里");
     }
 
     /// R7：exit 137 单独出现不推断 OOM（SIGKILL 不只来自 OOM）。
@@ -1189,7 +1203,12 @@ mod tests {
             Some("OOMKilled"),
             "137 ≠ OOM"
         );
-        assert_eq!(health.last_terminate_reason.as_deref(), Some("Error(137)"));
+        assert_eq!(
+            health.last_terminate_reason.as_deref(),
+            Some("Error"),
+            "reason 用 k8s 词表（退出码走 last_exit_code）"
+        );
+        assert_eq!(health.last_exit_code, Some(137));
     }
 
     #[test]
