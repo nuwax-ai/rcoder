@@ -43,6 +43,43 @@ impl WorkspaceRuntime for KubernetesRuntime {
         Ok(Some(format!("{cephfs_root}/{sub}")))
     }
 
+    /// per-agent workspace PVC 存在性（混住判据读侧, 30s TTL 缓存）。
+    ///
+    /// PVC 存在 = 该用户已切 RBD（转发层路由依据）；不存在 = 共享用户。
+    /// 只读不创建（ensure 会把共享用户误变 RBD 用户——判据必须走本方法）。
+    /// TTL 取 30s：迁移 cutover 翻转后最多一个窗口内判据滞后（此时容器已
+    /// 按 RBD 起，转发路径不受影响；共享残留窗口只影响"转发 vs 本地"选择）。
+    async fn workspace_pvc_exists(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<bool> {
+        use crate::runtime::k8s_pvc::K8sPvcOps;
+        const TTL: std::time::Duration = std::time::Duration::from_secs(30);
+        let cache_key = format!("{service_type}/{identifier}");
+        if let Some((exists, at)) = self.workspace_exists_cache.read().await.get(&cache_key) {
+            if at.elapsed() < TTL {
+                return Ok(*exists);
+            }
+        }
+        let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
+        let exists = self
+            .pvcs()
+            .get_opt(&pvc_name)
+            .await
+            .map(|pvc| pvc.is_some())
+            .map_err(|e| {
+                ContainerRuntimeError::K8sError(format!(
+                    "workspace_pvc_exists: get PVC '{pvc_name}' failed: {e}"
+                ))
+            })?;
+        self.workspace_exists_cache
+            .write()
+            .await
+            .insert(cache_key, (exists, std::time::Instant::now()));
+        Ok(exists)
+    }
+
     /// 枚举某 service_type 的所有 per-app PVC，从 PVC 名反解 identifier（app_id）。
     ///
     /// 用于 storage/query 发现"有持久数据"的 app（含已 delete 但 PVC 保留的孤儿）——

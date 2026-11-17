@@ -1,0 +1,264 @@
+//! computer 域 per-agent RBD 转发拦截层（P1 接线）。
+//!
+//! 挂载于 file-server 路由前置（与 userapp `computer_intercept` 同层），
+//! 决策序（任一不命中即 `next.run` 原样放行——flag 关闭时与现状逐字节一致）：
+//!
+//! ```text
+//! flag 开? → 路径在透传清单? → 三级定位有目标? → 混住判据(PVC 存在)?
+//!   → wake(幂等 ensure agent, ≤8s 预算) → 全流式转发 http://{pod_ip}:8086
+//! ```
+//!
+//! 放行分支的语义：POST body 类路由无 header 时（Java 未集成的存量流量）
+//! 落回 rcoder 本地共享卷直读——共享用户正确；RBD 用户的此类请求在 Java
+//! 补 `x-user-id` header 前不被拦截（集成期已知的窗口，见 plan §5.1 协作时序）。
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::body::Body;
+use axum::extract::{Request, State};
+use axum::http::HeaderMap;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use shared_types::ServiceType;
+
+use crate::app_state::AppState;
+use crate::service::computer_container_manager::{
+    ComputerContainerManager, ContainerCreateOptions,
+};
+
+use super::{is_pass_through_path, resolve_target, TargetSource};
+
+/// wake 预算：spike 实测冷启动（STS 0→1 到文件可服务）5.0-9.5s，常态 5-6s。
+/// 超预算返回 503+Retry-After；K8s 侧创建继续，下一请求幂等 ensure 走快路径。
+const WAKE_BUDGET: Duration = Duration::from_secs(8);
+/// Retry-After 建议值（秒）：覆盖冷启动尾延 + 调用方退避下限。
+const RETRY_AFTER_SECS: &str = "10";
+
+/// 拦截决策（纯逻辑, 供单测）：四道闸门全开才转发。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterceptDecision {
+    /// 原样放行到 rcoder 本地 file-server（共享卷直读）。
+    PassThrough,
+    /// 转发到目标 agent 容器内嵌 file-server。
+    Forward,
+}
+
+fn decide(flag_on: bool, path_in_table: bool, target_present: bool, is_rbd_user: bool) -> InterceptDecision {
+    if flag_on && path_in_table && target_present && is_rbd_user {
+        InterceptDecision::Forward
+    } else {
+        InterceptDecision::PassThrough
+    }
+}
+
+/// computer 域 RBD 转发拦截（axum middleware）。
+pub async fn computer_rbd_intercept(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if !shared_types::per_agent_rbd_enabled() {
+        return next.run(req).await;
+    }
+    // userapp 标记请求让行（userapp 转发层优先——同用户可能同时存在 computer
+    // agent 与 userapp 容器, PVC 名前缀不同但判据链不该被交叉触发）
+    if req
+        .headers()
+        .get(shared_types::SERVICE_TYPE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(shared_types::is_userapp_service_type_value)
+    {
+        return next.run(req).await;
+    }
+    let path = req.uri().path();
+    if !is_pass_through_path(path) {
+        return next.run(req).await;
+    }
+    let user_id_header = req
+        .headers()
+        .get(shared_types::USER_ID_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let Some(target) = resolve_target(user_id_header, req.uri().query(), path) else {
+        return next.run(req).await;
+    };
+    // 混住判据: PVC 存在才转发（不存在 = 共享用户 → 本地直读）
+    let is_rbd_user = match state
+        .runtime()
+        .workspace_pvc_exists(&target.user_id, &ServiceType::ComputerAgentRunner)
+        .await
+    {
+        Ok(exists) => exists,
+        Err(error) => {
+            tracing::warn!(
+                user_id = %target.user_id,
+                error = %error,
+                "[COMPUTER_FORWARD] mix check failed, pass through"
+            );
+            return next.run(req).await;
+        }
+    };
+    if decide(true, true, true, is_rbd_user) == InterceptDecision::PassThrough {
+        return next.run(req).await;
+    }
+    tracing::info!(
+        user_id = %target.user_id,
+        source = ?target.source,
+        "[COMPUTER_FORWARD] {} -> agent container",
+        req.uri().path()
+    );
+    forward_to_agent(&state, &target.user_id, req).await
+}
+
+/// wake（幂等 ensure agent 容器, ≤WAKE_BUDGET）+ 全流式转发其 :8086。
+async fn forward_to_agent(state: &AppState, user_id: &str, req: Request) -> Response {
+    let options = ContainerCreateOptions {
+        user_id: user_id.to_string(),
+        // ComputerAgentRunner 的容器标识只取 user_id（container_identifier）；
+        // project_id 在此族无消费者，占位同值防御空串校验。
+        project_id: user_id.to_string(),
+        resource_limits: None,
+        pod_id: None,
+        isolation_type: None,
+        tenant_id: None,
+        space_id: None,
+        service_type: ServiceType::ComputerAgentRunner,
+    };
+    let info = match tokio::time::timeout(
+        WAKE_BUDGET,
+        ComputerContainerManager::ensure_container_for_user_with_type(&options, state.runtime()),
+    )
+    .await
+    {
+        Ok(Ok((info, _created))) => info,
+        Ok(Err(error)) => {
+            tracing::warn!(user_id, %error, "[COMPUTER_FORWARD] wake ensure failed");
+            return service_unavailable("agent container unavailable");
+        }
+        Err(_) => {
+            tracing::info!(user_id, "[COMPUTER_FORWARD] wake budget exceeded, 503+retry");
+            return service_unavailable("agent container is starting, retry shortly");
+        }
+    };
+    let Some(ip) = info.container_ip.split(':').next().filter(|s| !s.is_empty()) else {
+        return service_unavailable("agent container address not ready");
+    };
+    let addr = format!("{}:{}", ip, shared_types::HTTP_DEFAULT_PORT);
+    stream_to_addr(&addr, req).await
+}
+
+/// 全流式转发（与 userapp_forward::upstream 内核同语义的 computer 域实现：
+/// 该内核私有且耦合 userapp 凭据/错误族, 待后续统一抽取; hop-by-hop 剥离
+/// 按 RFC 9110 静态表 ∪ Connection 动态列举）。
+async fn stream_to_addr(addr: &str, req: Request) -> Response {
+    let target = format!("http://{addr}{}", req.uri());
+    let (mut parts, body) = req.into_parts();
+    parts.headers.remove("host");
+    parts.headers.remove("x-api-key");
+    let listed = connection_listed(&parts.headers);
+    let mut outbound = crate::http_client::forward_client()
+        .request(parts.method.clone(), &target);
+    for (name, value) in &parts.headers {
+        if is_hop_by_hop(name.as_str(), &listed) {
+            continue;
+        }
+        outbound = outbound.header(name, value);
+    }
+    let upstream = match outbound
+        .body(reqwest::Body::wrap_stream(body.into_data_stream()))
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(error) => {
+            tracing::warn!(addr, %error, "[COMPUTER_FORWARD] upstream request failed");
+            return service_unavailable("agent container file-server unreachable, retry shortly");
+        }
+    };
+    let status = upstream.status();
+    let resp_listed = connection_listed(upstream.headers());
+    let mut builder = Response::builder().status(status);
+    for (name, value) in upstream.headers() {
+        if is_hop_by_hop(name.as_str(), &resp_listed) {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(Body::from_stream(upstream.bytes_stream()))
+        .unwrap_or_else(|error| {
+            tracing::error!(addr, %error, "[COMPUTER_FORWARD] build upstream response failed");
+            axum::http::StatusCode::BAD_GATEWAY.into_response()
+        })
+}
+
+fn service_unavailable(message: &str) -> Response {
+    Response::builder()
+        .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+        .header("Retry-After", RETRY_AFTER_SECS)
+        .header("Content-Type", "application/json")
+        .body(Body::from(format!(
+            "{{\"success\":false,\"code\":\"CONTAINER_STARTING\",\"message\":\"{message}\"}}"
+        )))
+        .unwrap_or_else(|_| axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response())
+}
+
+/// 逐跳头静态表（RFC 9110 §7.6.1）。
+const HOP_BY_HOP: [&str; 10] = [
+    "connection",
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "keep-alive",
+    "upgrade",
+    "te",
+    "trailer",
+    "proxy-authenticate",
+    "proxy-authorization",
+];
+
+fn is_hop_by_hop(name: &str, connection_listed: &[String]) -> bool {
+    let lower = name.to_ascii_lowercase();
+    HOP_BY_HOP.contains(&lower.as_str())
+        || connection_listed.iter().any(|listed| listed.eq_ignore_ascii_case(name))
+}
+
+fn connection_listed(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get("connection")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_ascii_lowercase)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decision_all_gates_required() {
+        assert_eq!(decide(true, true, true, true), InterceptDecision::Forward);
+        // 任一闸门关闭 → 放行（flag 关 = 现状逐字节一致的关键）
+        assert_eq!(decide(false, true, true, true), InterceptDecision::PassThrough);
+        assert_eq!(decide(true, false, true, true), InterceptDecision::PassThrough);
+        assert_eq!(decide(true, true, false, true), InterceptDecision::PassThrough);
+        assert_eq!(decide(true, true, true, false), InterceptDecision::PassThrough);
+    }
+
+    #[test]
+    fn hop_by_hop_static_and_dynamic() {
+        let mut headers = HeaderMap::new();
+        headers.insert("connection", "X-Custom, keep-alive".parse().unwrap());
+        let listed = connection_listed(&headers);
+        assert!(is_hop_by_hop("te", &listed));
+        assert!(is_hop_by_hop("x-custom", &listed)); // Connection 动态列举
+        assert!(!is_hop_by_hop("content-type", &listed));
+        assert!(!is_hop_by_hop("x-app-id", &listed));
+    }
+}

@@ -69,6 +69,9 @@ pub struct KubernetesRuntime {
     /// 失效时机:PVC destroy(destroy_workspace_pvc 等 remove)+ cleanup_all clear。
     /// 阶段2: rcoder 挂根聚合访问 agent subvolume (/app/cephfs-root/{subvolumePath}/...)。
     pub(crate) subvolume_path_cache: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    /// per-agent PVC 存在性缓存（混住判据, 30s TTL）：key=`{service_type}/{identifier}`。
+    pub(crate) workspace_exists_cache:
+        Arc<RwLock<std::collections::HashMap<String, (bool, std::time::Instant)>>>,
     /// 受管共享 Event publisher（批次 C）：Arc 共享，clone 不重建；非阻塞
     /// 提交，单消费者串行发布；Default = inactive（测试构造用）。
     pub(crate) event_publisher: super::k8s_event_publisher::KubernetesEventPublisher,
@@ -195,6 +198,7 @@ impl KubernetesRuntime {
             },
             pod_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
             subvolume_path_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            workspace_exists_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
             event_publisher,
         })
     }

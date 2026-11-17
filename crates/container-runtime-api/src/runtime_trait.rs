@@ -884,6 +884,22 @@ pub trait WorkspaceRuntime: Send + Sync {
         Ok(vec![])
     }
 
+    /// 该 identifier 的 per-agent workspace PVC 是否存在（**纯存在性, 不创建**）。
+    ///
+    /// per-agent RBD 转发层的混住判据读侧：PVC 存在 = 该用户已切 RBD（请求转发到
+    /// agent 容器）；不存在 = 共享用户（请求走 rcoder 本地共享卷直读）。
+    /// 与 [`Self::ensure_workspace`] 的关键差异：ensure 会创建（把共享用户误变
+    /// RBD 用户），本方法只读。K8s 实现带短 TTL 缓存（30s，对齐 userapp 探活
+    /// 缓存口径——迁移翻转标记后最多一个 TTL 窗口内判据滞后）；Docker 模式
+    /// 恒 false（无 per-agent PVC 概念）。
+    async fn workspace_pvc_exists(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
     /// 确保 per-agent workspace PVC 存在 (幂等: 已存在则复用, 不存在则创建)。
     ///
     /// K8s: 调 `ensure_workspace_pvc`; Docker: no-op。
