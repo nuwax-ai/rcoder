@@ -262,20 +262,29 @@ pub async fn computer_pod_health(
                 debug!(event = "pod_health.history_failed", error = %e, "history probe failed");
                 None
             });
+        let absent = container_runtime_api::ContainerHealth {
+            container_name: container.container_name.clone(),
+            alive: false,
+            phase: "NotFound".to_string(),
+            last_termination: history,
+            detail: Some(
+                "container disappeared between locate and inspect (docker auto_remove)".to_string(),
+            ),
+            source: "none".to_string(),
+            sampled_at: chrono::Utc::now(),
+            ..Default::default()
+        };
+        if let Ok(mut cache) = CACHE.lock() {
+            cache.insert(
+                key,
+                HealthCache {
+                    health: absent.clone(),
+                    ts: std::time::Instant::now(),
+                },
+            );
+        }
         return Ok(HttpResult::success(PodHealthResponse {
-            health: container_runtime_api::ContainerHealth {
-                container_name: container.container_name.clone(),
-                alive: false,
-                phase: "NotFound".to_string(),
-                last_termination: history,
-                detail: Some(
-                    "container disappeared between locate and inspect (docker auto_remove)"
-                        .to_string(),
-                ),
-                source: "none".to_string(),
-                sampled_at: chrono::Utc::now(),
-                ..Default::default()
-            },
+            health: absent,
             cache_age_seconds: 0,
         }));
     };
