@@ -206,8 +206,12 @@ impl DockerManager {
                 }
                 // 已停止的 agent 容器：超过保留窗口则回收（这是 auto_remove
                 // 关闭后唯一的清理路径——容器死后没人 ensure 时不能永久留存）
-                if matches!(status, ContainerStatus::Stopped)
-                    && let Some(info) = container_info_before_update.as_ref()
+                // Docker 的容器终态字符串是 "exited"（映射到 Exited），
+                // 不是 "stopped"——只判 Stopped 会让回收永不触发。
+                if matches!(
+                    status,
+                    ContainerStatus::Stopped | ContainerStatus::Exited | ContainerStatus::Dead
+                ) && let Some(info) = container_info_before_update.as_ref()
                     && let Some(removed_info) = self
                         .reap_stopped_agent(&project_id, &info.container_id)
                         .await
