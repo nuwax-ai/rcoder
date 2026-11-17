@@ -618,6 +618,8 @@ pub struct E2bSandboxConfig {
     pub create_ready_timeout_seconds: u64,
     /// envd /init 重试次数（同 token + 新 timestamp，源码实证幂等）。
     pub envd_init_retries: u32,
+    /// create 响应里的 domain 字段（SDK 侧主要用 E2B_DOMAIN，此值用于展示）。
+    pub public_domain: String,
     pub api_keys: Vec<E2bSandboxApiKeySeed>,
     pub templates: Vec<E2bSandboxTemplateSeed>,
 }
@@ -662,6 +664,7 @@ impl Default for E2bSandboxConfig {
             reaper_interval_seconds: 10,
             create_ready_timeout_seconds: 90,
             envd_init_retries: 5,
+            public_domain: String::new(),
             api_keys: Vec::new(),
             templates: Vec::new(),
         }

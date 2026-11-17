@@ -85,7 +85,7 @@ pub async fn run() -> anyhow::Result<()> {
     } = engine;
 
     let sse_registry = Arc::clone(&state.session_stream_registry);
-    let app = router::create_router(state, Some(Arc::clone(&telemetry)), merged_fs);
+    let app = router::create_router(state, Some(Arc::clone(&telemetry)), merged_fs, router::sandbox::SandboxDeps::default());
     let server_handle = server::start_http_server(
         app,
         config.port,

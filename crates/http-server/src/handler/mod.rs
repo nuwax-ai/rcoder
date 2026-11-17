@@ -22,6 +22,8 @@ mod internal_handler;
 mod permission_handler;
 pub mod pod_handler;
 pub mod proxy_api;
+#[cfg(feature = "kubernetes")]
+pub mod sandbox;
 pub mod proxy_handler_api;
 mod sse_builder;
 pub(crate) mod userapp_agent_target;

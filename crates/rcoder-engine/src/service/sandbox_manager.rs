@@ -71,6 +71,7 @@ pub struct SandboxManager {
     create_ready_timeout: Duration,
     envd_init_retries: u32,
     cipher: Aes256Gcm,
+    public_domain: String,
 }
 
 fn random_id(len: usize) -> String {
@@ -117,6 +118,7 @@ impl SandboxManager {
             create_ready_timeout: Duration::from_secs(config.create_ready_timeout_seconds),
             envd_init_retries: config.envd_init_retries.max(1),
             cipher: Aes256Gcm::new(key),
+            public_domain: config.public_domain.clone(),
         })
     }
 
@@ -166,6 +168,16 @@ impl SandboxManager {
                 .map_err(store_error)?;
         }
         Ok(())
+    }
+
+    pub fn public_domain(&self) -> &str {
+        &self.public_domain
+    }
+
+    pub async fn list_templates(
+        &self,
+    ) -> Result<Vec<shared_types::sandbox::SandboxTemplateSummary>, SandboxApiError> {
+        self.store.list_templates().await.map_err(store_error)
     }
 
     pub async fn authenticate(&self, provided_key: &str) -> Result<SandboxApiKeyRecord, SandboxApiError> {
