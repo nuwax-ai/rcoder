@@ -19,6 +19,10 @@ pub(crate) enum Component {
     Userapp,
     Project,
     Preview,
+    /// E2B sandbox 域。主服务不提供 sandbox API，但**必须认识这个组件**：
+    /// 与 e2b 部署共享同一数据库，schema 校验遇到不认识的 component 会
+    /// 直接拒绝启动（"unknown database schema component"）。
+    Sandbox,
 }
 impl Component {
     fn name(self) -> &'static str {
@@ -26,6 +30,7 @@ impl Component {
             Self::Userapp => "userapp",
             Self::Project => "project",
             Self::Preview => "preview",
+            Self::Sandbox => "sandbox",
         }
     }
     fn ddl(self, backend: Backend) -> Result<&'static str> {
@@ -41,6 +46,9 @@ impl Component {
             }
             (Self::Preview, Backend::Postgres) => {
                 Ok(include_str!("../../schema/preview-pg-v1.sql"))
+            }
+            (Self::Sandbox, Backend::Postgres) => {
+                Ok(include_str!("../../schema/sandbox-pg-v1.sql"))
             }
             _ => bail!("requested database component is unsupported by this backend"),
         }
@@ -73,6 +81,7 @@ fn latest_version(component: Component) -> i64 {
         Component::Userapp => 4,
         Component::Project => 2,
         Component::Preview => 1,
+        Component::Sandbox => 1,
     }
 }
 fn migration_name(component: Component, version: i64) -> &'static str {
@@ -253,6 +262,7 @@ async fn initialize_component(
             "userapp" => Component::Userapp,
             "project" => Component::Project,
             "preview" => Component::Preview,
+            "sandbox" => Component::Sandbox,
             _ => bail!("unknown database schema component"),
         };
         let version: i64 = version.parse().context("invalid schema version")?;
