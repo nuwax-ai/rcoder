@@ -682,7 +682,7 @@ impl Default for E2bSandboxConfig {
             public_domain: String::new(),
             volume_storage_class: "cephfs".to_string(),
             volume_max_size_gib: 10,
-            allowed_ports: vec![49983, 8787, 8788],
+            allowed_ports: vec![49983, 8787, 8788, 49999],
             api_keys: Vec::new(),
             templates: Vec::new(),
         }
