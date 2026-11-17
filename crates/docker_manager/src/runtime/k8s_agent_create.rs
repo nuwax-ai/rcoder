@@ -6,6 +6,8 @@
 //! 与 k8s_agent_query.rs（读）、k8s_agent_pod.rs（stop/restart/sync/cleanup 变更）正交。
 
 use container_runtime_api::{
+
+
     ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult, ContainerRuntimeStatus,
 };
 use k8s_openapi::api::core::v1::{
@@ -105,6 +107,25 @@ impl KubernetesRuntime {
                 )
                 .await?;
             } else {
+                // P0 防护: RBD 模式下新建 per-agent PVC 前探测共享卷存量。
+                // 非空 = 存量用户——建了空 RBD PVC 后混住判据立即切转发,
+                // 共享卷老数据静默不可见(用户文件"消失")。正确流程是先跑
+                // k8s/migration 两阶段迁移(预同步→cutover 增量)再建 PVC。
+                // 探测是 best-effort(共享卷未挂/形态不同 → 放行, 不阻断
+                // 合法新用户); 非空则 Conflict 拒绝。
+                if shared_types::per_agent_rbd_enabled()
+                    && matches!(
+                        service_type,
+                        ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject
+                    )
+                    && legacy_shared_workspace_nonempty(identifier).await
+                {
+                    return Err(ContainerRuntimeError::Conflict(format!(
+                        "legacy shared workspace for '{identifier}' is non-empty; \
+                         run k8s/migration two-phase migration (phase-a + cutover) \
+                         before creating per-agent RBD volume"
+                    )));
+                }
                 self.ensure_workspace_pvc(
                     identifier,
                     &service_type,
@@ -723,3 +744,28 @@ impl KubernetesRuntime {
         Ok(())
     }
 }
+
+/// 共享 CephFS 卷在 rcoder 容器内的挂载根（env `COMPUTER_WORKSPACE_DIR`，
+/// 与 file-server LocalWorkspaceResolver 同源；未设 → None = 不探测）。
+fn legacy_shared_root() -> Option<std::path::PathBuf> {
+    std::env::var("COMPUTER_WORKSPACE_DIR")
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// 该 identifier 的共享卷目录是否非空。NotFound → false（新用户）；
+/// 其他 IO 错误 → false（fail-open：探测失败不阻断创建，迁移流程是真源）。
+async fn legacy_shared_workspace_nonempty(identifier: &str) -> bool {
+    let Some(root) = legacy_shared_root() else {
+        return false;
+    };
+    let path = root.join(identifier);
+    match tokio::fs::read_dir(&path).await {
+        Ok(mut rd) => rd.next_entry().await.ok().flatten().is_some(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => false,
+    }
+}
+

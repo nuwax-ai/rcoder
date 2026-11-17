@@ -213,9 +213,12 @@ pub async fn computer_pod_health(
 
     // 3) 缓存查询
     let runtime = state.runtime().clone();
+    // 缓存键统一用 **identifier**（调用方视角的唯一目标标识），不用
+    // container_name：容器消失前后会走不同分支（locate 就失败 / 登记表有
+    // 但 inspect 404），用不同键会让"刚查过"的结果命中不了缓存。
     let key = (
         Arc::as_ptr(&runtime) as *const () as usize,
-        container.container_name.clone(),
+        target.identifier.clone(),
     );
     let fresh = params.fresh.unwrap_or(false);
     if !fresh

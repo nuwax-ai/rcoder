@@ -214,11 +214,18 @@ fn select_volume_spec(
             userapp_sc,
             DEFAULT_USERAPP_PVC_STORAGE_SIZE,
         ),
-        _ if per_agent_rbd => (
-            "ReadWriteOnce".to_string(),
-            per_agent_rbd_sc,
-            DEFAULT_PER_AGENT_RBD_STORAGE_SIZE,
-        ),
+        // RBD 臂**只覆盖 computer 族**: WebAgentRunner(/api/project|git|page)
+        // 的读取面本期仍走 rcoder 本地共享 CephFS(plan §3 二期才切), 给它
+        // RBD PVC = agent 写块盘 / rcoder 读共享卷 = 用户文件"消失"的数据
+        // 分裂。computer 族(ComputerAgentRunner/ComputerNormalProject)的读取
+        // 已由转发层接管(computer_forward), 是唯一安全域。
+        ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject
+            if per_agent_rbd =>
+            (
+                "ReadWriteOnce".to_string(),
+                per_agent_rbd_sc,
+                DEFAULT_PER_AGENT_RBD_STORAGE_SIZE,
+            ),
         _ => (
             global_access_mode.to_string(),
             Some(global_storage_class.to_string()),
@@ -676,7 +683,12 @@ mod tests {
     #[test]
     fn volume_spec_userapp_arm() {
         let (am, sc, size) = select_volume_spec(
-            &ServiceType::Userapp, "ReadWriteMany", "cephfs", None, false, None,
+            &ServiceType::Userapp,
+            "ReadWriteMany",
+            "cephfs",
+            None,
+            false,
+            None,
         );
         assert_eq!(am, "ReadWriteOnce");
         assert_eq!(size, DEFAULT_USERAPP_PVC_STORAGE_SIZE);
@@ -686,8 +698,12 @@ mod tests {
     #[test]
     fn volume_spec_default_arm_when_rbd_flag_off() {
         let (am, sc, size) = select_volume_spec(
-            &ServiceType::ComputerAgentRunner, "ReadWriteMany", "cephfs",
-            None, false, Some("ceph-rbd".into()),
+            &ServiceType::ComputerAgentRunner,
+            "ReadWriteMany",
+            "cephfs",
+            None,
+            false,
+            Some("ceph-rbd".into()),
         );
         // 开关关: RBD 参数被无视, 走全局共享臂（与现状逐字节一致）
         assert_eq!(am, "ReadWriteMany");
@@ -698,8 +714,12 @@ mod tests {
     #[test]
     fn volume_spec_rbd_arm_defaults() {
         let (am, sc, size) = select_volume_spec(
-            &ServiceType::ComputerAgentRunner, "ReadWriteMany", "cephfs",
-            None, true, Some("ceph-rbd".into()),
+            &ServiceType::ComputerAgentRunner,
+            "ReadWriteMany",
+            "cephfs",
+            None,
+            true,
+            Some("ceph-rbd".into()),
         );
         assert_eq!(am, "ReadWriteOnce");
         assert_eq!(sc.as_deref(), Some("ceph-rbd"));
@@ -708,10 +728,31 @@ mod tests {
     }
 
     #[test]
+    fn volume_spec_web_runner_never_takes_rbd_arm() {
+        // 防数据分裂回归: WebAgentRunner 即使 flag 开也必须走全局共享臂
+        // (它的读取面在 rcoder 本地, 没有转发层)
+        let (am, sc, size) = select_volume_spec(
+            &ServiceType::WebAgentRunner,
+            "ReadWriteMany",
+            "cephfs",
+            None,
+            true,
+            Some("ceph-rbd".into()),
+        );
+        assert_eq!(am, "ReadWriteMany");
+        assert_eq!(sc.as_deref(), Some("cephfs"));
+        assert_eq!(size, DEFAULT_PVC_STORAGE_SIZE);
+    }
+
+    #[test]
     fn volume_spec_rbd_arm_sc_override() {
         let (_, sc, _) = select_volume_spec(
-            &ServiceType::WebAgentRunner, "RWX", "cephfs",
-            None, true, Some("rook-ceph-block".into()),
+            &ServiceType::ComputerAgentRunner,
+            "RWX",
+            "cephfs",
+            None,
+            true,
+            Some("rook-ceph-block".into()),
         );
         assert_eq!(sc.as_deref(), Some("rook-ceph-block"));
     }

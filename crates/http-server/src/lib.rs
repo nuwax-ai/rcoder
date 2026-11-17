@@ -8,10 +8,10 @@
 //! 引擎模块在此 re-export 以保持迁移代码的 `crate::X` 路径零改写（与 Phase 0
 //! rcoder 侧同款策略，行为零变化）。
 pub use rcoder_engine::{
-    app_state, background_tasks, batch_migrate, bootstrap, cleanup_task, config, config_watcher,
-    docker_init, file_server_admin, file_server_embed, grpc, http_client, preview_assembly,
-    proxy_init, service, shutdown, skill_sync_reconciler, storage, userapp_builder,
-    computer_forward, userapp_forward, userapp_recycle, utils, vnc, workspace_migrate,
+    app_state, background_tasks, batch_migrate, bootstrap, cleanup_task, computer_forward, config,
+    config_watcher, docker_init, file_server_admin, file_server_embed, grpc, http_client,
+    preview_assembly, proxy_init, service, shutdown, skill_sync_reconciler, storage,
+    userapp_builder, userapp_forward, userapp_recycle, utils, vnc, workspace_migrate,
 };
 
 // HTTP 面（本 crate 主体）

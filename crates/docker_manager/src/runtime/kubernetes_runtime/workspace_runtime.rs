@@ -128,7 +128,18 @@ impl WorkspaceRuntime for KubernetesRuntime {
     ) -> ContainerRuntimeResult<()> {
         // 复用 K8sPvcOps::ensure_workspace_pvc (幂等: active→复用 / not_found→创建)
         self.ensure_workspace_pvc(identifier, service_type, storage_size)
+            .await?;
+        // 缓存即时失效: PVC 此刻必存在, 写 true——否则刚创建的 volume 在
+        // workspace_pvc_exists 的 30s TTL 窗口内仍可能读到 false（新用户
+        // 首个文件请求会落本地共享卷读到空数据）。
+        self.workspace_exists_cache
+            .write()
             .await
+            .insert(
+                format!("{service_type}/{identifier}"),
+                (true, std::time::Instant::now()),
+            );
+        Ok(())
     }
 
     async fn destroy_app_pvc(&self, app_id: &str) -> ContainerRuntimeResult<()> {

@@ -19,11 +19,16 @@ use shared_types::{ServiceType, USER_ID_HEADER};
 
 /// computer 域转发透传清单（path 前缀/模板，method 透传不分类）。
 ///
-/// 与 userapp `CONTAINER_PASS_THROUGH_PATHS` 同治理模式：显式枚举 + 守卫测试
-/// 双向闭包（容器 file-server 加接口不登记当场报红）。来源 = plan 文档 §3
-/// 逐路由分类表（29 computer 全量转发 + build 域 computer 会话 7 条；
-/// `parse-build-error`/`get-log-cache-stats`/`clear-all-log-cache` 不碰用户
-/// 工作区留本地）。
+/// 与 userapp `CONTAINER_PASS_THROUGH_PATHS` 同治理模式：显式枚举。来源 =
+/// plan 文档 §3 逐路由分类表（computer 27 条全量 + static 分享链路终点）。
+///
+/// ⚠️ `/api/build/*` **暂不登记**：build 域需按会话维度分流（computer 会话
+/// 转发、web 会话留本地），而接线层当前只判 userapp 让行——web 会话一旦带
+/// user 维度定位参数就会被误转发进 computer agent 容器（错工作区）。
+/// 待会话维度判据落地后按 plan §3.3 补登记（含 7 条转发 + 3 条本地）。
+///
+/// 不碰用户工作区留本地：`parse-build-error`/`get-log-cache-stats`/
+/// `clear-all-log-cache`（纯计算/进程内缓存）。
 pub const COMPUTER_PASS_THROUGH_PATHS: &[&str] = &[
     // /api/computer（file-server computer_router 全量, 29）
     "/api/computer/fs-roots",
@@ -53,15 +58,6 @@ pub const COMPUTER_PASS_THROUGH_PATHS: &[&str] = &[
     "/api/computer/init-project-template",
     "/api/computer/build-agent-package",
     "/api/computer/static/{user_id}/{c_id}/{*rest}", // 分享链路终点/产物下载/打包读取
-    // /api/build（computer 会话 7——web 会话仍留本地, 会话维度分流由接线层判）
-    "/api/build/start-dev",
-    "/api/build/stop-dev",
-    "/api/build/restart-dev",
-    "/api/build/list-dev",
-    "/api/build/keep-alive",
-    "/api/build/port-pool-status",
-    "/api/build/get-dev-log",
-    "/api/build/build-project",
 ];
 
 /// 转发目标（per-agent RBD 用户的 agent 容器）。
@@ -84,43 +80,86 @@ pub enum TargetSource {
     StaticPath,
 }
 
+/// 三级 fallback 目标定位的结果语义。
+///
+/// - `Absent`：无任何定位来源 → 调用方**放行**（共享用户本地直读）
+/// - `Invalid`：有来源但值非法（越界/格式错）→ 调用方 **400**。
+///   与 Absent 分开是关键：非法值静默放行会让 RBD 用户的请求落到本地共享
+///   卷读到空数据（看似成功的错误响应），必须显式拒绝。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetResolution {
+    Absent,
+    Invalid,
+    Found(ComputerForwardTarget),
+}
+
 /// 三级 fallback 目标定位。输入零 body——GET query 与路径段解析不缓冲请求体,
 /// multipart/SSE 全覆盖。
 ///
 /// 校验: `shared_types::validate_identifier` 白名单（user_id 原样进容器标识与
-/// PVC 名拼接, 含 `/` 即越界）, 非法值返回 `None`（调用方 400, 不静默降级）。
+/// PVC 名拼接, 含 `/` 即越界）。query 值先 percent-decode（`userId=%75_1001`
+/// 是合法编码形态, 不解码会把合法用户误判非法）。
 pub fn resolve_target(
     user_id_header: Option<&str>,
     raw_query: Option<&str>,
     path: &str,
-) -> Option<ComputerForwardTarget> {
+) -> TargetResolution {
     // ① header（最终契约）
     if let Some(raw) = user_id_header.map(str::trim).filter(|s| !s.is_empty()) {
-        if valid_identifier(raw) {
-            return Some(ComputerForwardTarget {
+        return if valid_identifier(raw) {
+            TargetResolution::Found(ComputerForwardTarget {
                 user_id: raw.to_string(),
                 source: TargetSource::Header,
-            });
-        }
-        return None;
+            })
+        } else {
+            TargetResolution::Invalid
+        };
     }
     // ② GET query userId（现有 Java 流量兜底; 解析零缓冲）
     if let Some(query) = raw_query {
         if let Some(raw) = query_param(query, "userId") {
-            if valid_identifier(&raw) {
-                return Some(ComputerForwardTarget {
-                    user_id: raw,
+            let decoded = percent_decode(&raw);
+            return if valid_identifier(&decoded) {
+                TargetResolution::Found(ComputerForwardTarget {
+                    user_id: decoded,
                     source: TargetSource::Query,
-                });
-            }
-            return None;
+                })
+            } else {
+                TargetResolution::Invalid
+            };
         }
     }
     // ③ static 路径段: /api/computer/static/{user_id}/...（分享链路, 无 header 场景）
-    static_path_user_id(path).map(|user_id| ComputerForwardTarget {
-        user_id,
-        source: TargetSource::StaticPath,
-    })
+    match static_path_user_id(path) {
+        Some(user_id) => TargetResolution::Found(ComputerForwardTarget {
+            user_id,
+            source: TargetSource::StaticPath,
+        }),
+        None => TargetResolution::Absent,
+    }
+}
+
+/// percent-decode（query 值用）: `%75_1001` → `u_1001`。无 `%` 快路径原样返回;
+/// 非 UTF-8 序列保留原样（随后被 validate_identifier 拒绝）。
+fn percent_decode(value: &str) -> String {
+    if !value.contains('%') {
+        return value.to_string();
+    }
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| value.to_string())
 }
 
 /// static 路由路径段定位：`/api/computer/static/{user_id}/...` 首段即 user_id。
@@ -176,22 +215,31 @@ fn path_matches(tmpl: &str, path: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn found(resolution: TargetResolution) -> ComputerForwardTarget {
+        match resolution {
+            TargetResolution::Found(target) => target,
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
     #[test]
     fn target_from_header_wins() {
-        let t = resolve_target(
+        let t = found(resolve_target(
             Some(" u_1001 "),
             Some("userId=u_999&x=1"),
             "/api/computer/get-file-list",
-        )
-        .expect("header target");
+        ));
         assert_eq!(t.user_id, "u_1001");
         assert_eq!(t.source, TargetSource::Header);
     }
 
     #[test]
     fn target_falls_back_to_query() {
-        let t = resolve_target(None, Some("userId=6&cId=1696379"), "/api/computer/resolve-file")
-            .expect("query target");
+        let t = found(resolve_target(
+            None,
+            Some("userId=6&cId=1696379"),
+            "/api/computer/resolve-file",
+        ));
         assert_eq!(t.user_id, "6");
         assert_eq!(t.source, TargetSource::Query);
     }
@@ -199,23 +247,43 @@ mod tests {
     #[test]
     fn target_from_static_path_segment() {
         // 分享链路: 浏览器直出, 无 header 无 query userId
-        let t = resolve_target(None, Some("sk=abc"), "/api/computer/static/6/1696379/test.txt")
-            .expect("static target");
+        let t = found(resolve_target(
+            None,
+            Some("sk=abc"),
+            "/api/computer/static/6/1696379/test.txt",
+        ));
         assert_eq!(t.user_id, "6");
         assert_eq!(t.source, TargetSource::StaticPath);
     }
 
     #[test]
     fn static_path_requires_trailing_segments() {
-        // 只有 user 段没有后续路径 → 不是合法 static 请求
-        assert!(resolve_target(None, None, "/api/computer/static/6").is_none());
+        // 只有 user 段没有后续路径 → Absent（放行本地）, 不是 Invalid
+        assert_eq!(
+            resolve_target(None, None, "/api/computer/static/6"),
+            TargetResolution::Absent
+        );
     }
 
     #[test]
-    fn invalid_identifier_rejected_not_degraded() {
-        // 越界值（路径穿越/空）→ None（调用方 400）, 绝不静默降级到下一级
-        assert!(resolve_target(Some("../etc"), None, "/x").is_none());
-        assert!(resolve_target(Some(""), None, "/x").is_none());
+    fn invalid_identifier_is_invalid_not_absent() {
+        // 有来源但值非法 → Invalid（调用方 400）；空 header 值视为"无来源"→ Absent
+        assert_eq!(
+            resolve_target(Some("../etc"), None, "/x"),
+            TargetResolution::Invalid
+        );
+        assert_eq!(resolve_target(Some(""), None, "/x"), TargetResolution::Absent);
+        assert_eq!(
+            resolve_target(None, Some("userId=..%2Fetc"), "/x"),
+            TargetResolution::Invalid
+        );
+    }
+
+    #[test]
+    fn query_value_is_percent_decoded() {
+        // %75_1001 → u_1001（合法编码形态, 不解码会误判非法）
+        let t = found(resolve_target(None, Some("userId=%75_1001"), "/x"));
+        assert_eq!(t.user_id, "u_1001");
     }
 
     #[test]

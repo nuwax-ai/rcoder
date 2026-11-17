@@ -92,15 +92,17 @@ fn file_server_routes_with_intercept(
     state: &Arc<AppState>,
     merged: crate::file_server_embed::MergedFileServer,
 ) -> Router {
-    merged.router.layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        crate::userapp_forward::computer_intercept,
-    ))
-    // per-agent RBD 转发拦截（flag 关闭时逐字节放行; 详见 computer_forward::intercept）
-    .layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        crate::computer_forward::computer_rbd_intercept,
-    ))
+    merged
+        .router
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::userapp_forward::computer_intercept,
+        ))
+        // per-agent RBD 转发拦截（flag 关闭时逐字节放行; 详见 computer_forward::intercept）
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::computer_forward::computer_rbd_intercept,
+        ))
 }
 
 /// 创建 Axum 路由

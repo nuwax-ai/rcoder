@@ -27,7 +27,7 @@ use crate::service::computer_container_manager::{
     ComputerContainerManager, ContainerCreateOptions,
 };
 
-use super::{is_pass_through_path, resolve_target, TargetSource};
+use super::{is_pass_through_path, resolve_target, TargetResolution, TargetSource};
 
 /// wake 预算：spike 实测冷启动（STS 0→1 到文件可服务）5.0-9.5s，常态 5-6s。
 /// 超预算返回 503+Retry-After；K8s 侧创建继续，下一请求幂等 ensure 走快路径。
@@ -79,8 +79,18 @@ pub async fn computer_rbd_intercept(
         .headers()
         .get(shared_types::USER_ID_HEADER)
         .and_then(|v| v.to_str().ok());
-    let Some(target) = resolve_target(user_id_header, req.uri().query(), path) else {
-        return next.run(req).await;
+    let target = match resolve_target(user_id_header, req.uri().query(), path) {
+        TargetResolution::Found(target) => target,
+        TargetResolution::Absent => return next.run(req).await,
+        TargetResolution::Invalid => {
+            // 有定位来源但值非法: 显式 400——静默放行会让 RBD 用户请求落
+            // 本地共享卷读到空数据(看似成功的错误响应)
+            tracing::warn!(
+                path,
+                "[COMPUTER_FORWARD] invalid user identifier in request, rejecting"
+            );
+            return (axum::http::StatusCode::BAD_REQUEST, "invalid user identifier").into_response();
+        }
     };
     // 混住判据: PVC 存在才转发（不存在 = 共享用户 → 本地直读）
     let is_rbd_user = match state
@@ -112,12 +122,29 @@ pub async fn computer_rbd_intercept(
 
 /// wake（幂等 ensure agent 容器, ≤WAKE_BUDGET）+ 全流式转发其 :8086。
 async fn forward_to_agent(state: &AppState, user_id: &str, req: Request) -> Response {
+    // limits 必须从 kubernetes_config 解析（与 /computer/chat、/pod/ensure
+    // 同一真源）——传 None 会让 k8s_agent_create 回落 DEFAULT_AGENT_* 常量,
+    // 同一用户两条创建路径拿到不同 limits（OOM 行为分裂 + 双真源）。
+    let resource_limits = state
+        .config
+        .kubernetes_config
+        .as_ref()
+        .and_then(|kc| kc.get_service_config(&ServiceType::ComputerAgentRunner))
+        .map(|sc| sc.resource_limits.clone());
+    if resource_limits.is_none() {
+        tracing::error!(
+            user_id,
+            "[COMPUTER_FORWARD] kubernetes_config 未配置 computer-agent-runner 的 \
+             resource_limits, 拒绝 wake（与 pod_handler 同口径 fail-fast）"
+        );
+        return service_unavailable("agent container resource limits not configured");
+    }
     let options = ContainerCreateOptions {
         user_id: user_id.to_string(),
         // ComputerAgentRunner 的容器标识只取 user_id（container_identifier）；
         // project_id 在此族无消费者，占位同值防御空串校验。
         project_id: user_id.to_string(),
-        resource_limits: None,
+        resource_limits,
         pod_id: None,
         isolation_type: None,
         tenant_id: None,
