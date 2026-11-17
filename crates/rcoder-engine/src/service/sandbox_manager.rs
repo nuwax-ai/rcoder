@@ -417,7 +417,7 @@ impl SandboxManager {
                 "defaultUser": spec.default_user,
                 "defaultWorkdir": spec.default_workdir,
                 "envVars": envs,
-                "timestamp": chrono::Utc::now().timestamp_millis(),
+                "timestamp": chrono::Utc::now().to_rfc3339(),
             });
             match self.http.post(&url).json(&body).send().await {
                 Ok(response) if response.status().is_success() => return Ok(()),
