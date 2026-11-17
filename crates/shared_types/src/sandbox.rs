@@ -116,6 +116,8 @@ pub struct SandboxInstanceRecord {
     pub token_generation: i64,
     pub env: Vec<(String, String)>,
     pub metadata: Option<String>,
+    /// 网络重试幂等键（Idempotency-Key 头）。
+    pub idempotency_key: Option<String>,
     pub failure_reason: Option<String>,
     pub created_at_us: i64,
     pub updated_at_us: i64,
@@ -136,6 +138,8 @@ pub struct CreateSandboxParams {
     pub metadata: Option<String>,
     /// 卷挂载（M5）：E2B volume name → 容器内路径。
     pub volume_mounts: Vec<VolumeMountRequest>,
+    /// 幂等键（Idempotency-Key 头）：同键重试返回已有实例，不重复创建。
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -228,6 +232,11 @@ pub trait SandboxStore: Send + Sync {
     async fn list_cleanup_pending(&self) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError>;
     /// 全部非终态实例（重启恢复用；不按租户过滤）。
     async fn list_all_non_terminal(&self) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError>;
+    /// 按幂等键查找非终态实例（网络重试去重）。
+    async fn find_by_idempotency_key(
+        &self,
+        key: &str,
+    ) -> Result<Option<SandboxInstanceRecord>, SandboxStoreError>;
 
     // ---------- Volumes（M5） ----------
     async fn insert_volume(

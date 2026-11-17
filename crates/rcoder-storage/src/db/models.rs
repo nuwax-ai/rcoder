@@ -323,6 +323,7 @@ pub(crate) struct SandboxInstance {
     pub token_generation: i64,
     pub env_json: Option<String>,
     pub metadata_json: Option<String>,
+    pub idempotency_key: Option<String>,
     pub failure_reason: Option<String>,
     pub created_at_us: i64,
     pub updated_at_us: i64,

@@ -234,6 +234,20 @@ impl SandboxManager {
         key: &SandboxApiKeyRecord,
         params: &CreateSandboxParams,
     ) -> Result<CreateOutcome, SandboxApiError> {
+        // 幂等：同 Idempotency-Key 的非终态实例直接返回（网络重试去重）
+        if let Some(idem_key) = &params.idempotency_key {
+            if let Some(existing) = self
+                .store
+                .find_by_idempotency_key(idem_key)
+                .await
+                .map_err(store_error)?
+            {
+                tracing::info!(sandbox_id = %existing.sandbox_id, "e2b create 幂等命中，返回已有实例");
+                let token = self.decrypt_token(&existing)?;
+                return Ok(CreateOutcome { record: existing, token });
+            }
+        }
+
         let spec = self
             .store
             .get_template_spec(&params.template_id)
@@ -288,6 +302,7 @@ impl SandboxManager {
             token_generation: 1,
             env: params.env.clone(),
             metadata: params.metadata.clone(),
+            idempotency_key: params.idempotency_key.clone(),
             failure_reason: None,
             created_at_us: now,
             updated_at_us: now,
@@ -727,20 +742,39 @@ impl SandboxManager {
                 "timeout {timeout_seconds}s 超过上限 {spec_cap}s"
             )));
         }
-        let now = chrono::Utc::now().timestamp_micros();
-        let new_expires = now + timeout_seconds * 1_000_000;
-        if let Some(hard) = record.hard_deadline_us {
-            if new_expires > hard {
-                return Err(SandboxApiError::Invalid(format!(
-                    "续期越过硬顶（hard_deadline）"
-                )));
+        // CAS 重试：续期与回收/kill 可能并发
+        let mut record = record;
+        for attempt in 0..5 {
+            let now = chrono::Utc::now().timestamp_micros();
+            let new_expires = now + timeout_seconds * 1_000_000;
+            if let Some(hard) = record.hard_deadline_us {
+                if new_expires > hard {
+                    return Err(SandboxApiError::Invalid("续期越过硬顶（hard_deadline）".into()));
+                }
+            }
+            match self
+                .store
+                .set_expires(sandbox_id, record.instance_revision, new_expires)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(SandboxStoreError::Conflict(_)) if attempt < 4 => {
+                    tracing::debug!(sandbox_id, attempt, "set_timeout CAS 冲突，重读重试");
+                    record = self
+                        .store
+                        .get_instance(sandbox_id)
+                        .await
+                        .map_err(store_error)?
+                        .ok_or_else(|| SandboxApiError::NotFound(sandbox_id.to_string()))?;
+                    if record.desired_state != SandboxInstanceState::Ready {
+                        return Err(SandboxApiError::Invalid("沙箱已不在 Ready 状态".into()));
+                    }
+                    continue;
+                }
+                Err(error) => return Err(store_error(error)),
             }
         }
-        self.store
-            .set_expires(sandbox_id, record.instance_revision, new_expires)
-            .await
-            .map_err(store_error)?;
-        Ok(())
+        Err(SandboxApiError::Conflict("set_timeout CAS 重试 5 次后放弃".into()))
     }
 
     /// 数据面授权：沙箱存在、Ready、未到期、token 匹配。

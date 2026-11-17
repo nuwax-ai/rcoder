@@ -128,6 +128,7 @@ async fn manager_of(deps: &SandboxDeps) -> Result<Arc<SandboxManager>, Response>
 pub async fn create_sandbox(
     State(deps): State<SandboxDeps>,
     Extension(key): Extension<SandboxApiKeyRecord>,
+    headers: axum::http::HeaderMap,
     axum::Json(body): axum::Json<CreateSandboxBody>,
 ) -> Response {
     let manager = match manager_of(&deps).await {
@@ -168,6 +169,11 @@ pub async fn create_sandbox(
             }
         }
     }
+    let idempotency_key = headers
+        .get("Idempotency-Key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .map(str::to_string);
     let params = shared_types::sandbox::CreateSandboxParams {
         template_id: template,
         timeout_seconds: body.timeout,
@@ -177,6 +183,7 @@ pub async fn create_sandbox(
             .as_ref()
             .map(|value| value.to_string()),
         volume_mounts,
+        idempotency_key,
     };
     match manager.create(&key, &params).await {
         Ok(CreateOutcome { record, token }) => {

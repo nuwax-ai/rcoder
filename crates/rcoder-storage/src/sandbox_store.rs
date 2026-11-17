@@ -150,6 +150,7 @@ fn instance_record(row: SandboxInstance) -> Result<SandboxInstanceRecord, Sandbo
         token_generation: row.token_generation,
         env: parse_env_json(&row.env_json)?,
         metadata: row.metadata_json,
+        idempotency_key: row.idempotency_key,
         failure_reason: row.failure_reason,
         created_at_us: row.created_at_us,
         updated_at_us: row.updated_at_us,
@@ -328,8 +329,8 @@ impl SandboxStore for PgSandboxStore {
                 let env_json = serde_json::to_string(&record.env)
                     .map_err(|error| SandboxStoreError::Corrupt(error.to_string()))?;
                 toasty::sql::statement(
-                    "INSERT INTO sandbox_instances(sandbox_id,tenant_id,key_id,template_id,template_revision,image,image_digest,envd_version,runtime_class,cpu_millicores,memory_mib,desired_state,observed_state,instance_revision,namespace,pod_name,pod_uid,token_hash,encrypted_token,token_generation,env_json,metadata_json,failure_reason,created_at_us,updated_at_us,ready_at_us,expires_at_us,hard_deadline_us,deleted_at_us) \
-                     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NULL,1,$13,$14,NULL,$15,$16,1,$17,$18,NULL,$19,$19,NULL,$20,$21,NULL) \
+                    "INSERT INTO sandbox_instances(sandbox_id,tenant_id,key_id,template_id,template_revision,image,image_digest,envd_version,runtime_class,cpu_millicores,memory_mib,desired_state,observed_state,instance_revision,namespace,pod_name,pod_uid,token_hash,encrypted_token,token_generation,env_json,metadata_json,idempotency_key,failure_reason,created_at_us,updated_at_us,ready_at_us,expires_at_us,hard_deadline_us,deleted_at_us) \
+                     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NULL,1,$13,$14,NULL,$15,$16,1,$17,$18,$19,NULL,$20,$20,NULL,$21,$22,NULL) \
                      ON CONFLICT(sandbox_id) DO NOTHING",
                 )
                 .bind(&record.sandbox_id)
@@ -350,6 +351,7 @@ impl SandboxStore for PgSandboxStore {
                 .bind_typed(record.encrypted_token.as_deref(), Type::Text)
                 .bind(&env_json)
                 .bind_typed(record.metadata.as_deref(), Type::Text)
+                .bind_typed(record.idempotency_key.as_deref(), Type::Text)
                 .bind(record.created_at_us)
                 .bind_typed(record.expires_at_us, Type::Integer(8))
                 .bind_typed(record.hard_deadline_us, Type::Integer(8))
@@ -632,6 +634,29 @@ impl SandboxStore for PgSandboxStore {
                     all.extend(rows.into_iter().map(instance_record).collect::<Result<Vec<_>, _>>()?);
                 }
                 Ok(all)
+            })
+        })
+        .await
+    }
+
+
+    async fn find_by_idempotency_key(
+        &self,
+        key: &str,
+    ) -> Result<Option<SandboxInstanceRecord>, SandboxStoreError> {
+        // 无 Toasty 索引注解——用裸语句查询（低频路径，启动重试去重）
+        let key = key.to_string();
+        self.run(move |tx| {
+            Box::pin(async move {
+                let rows = SandboxInstance::filter_by_desired_state("ready")
+                    .exec(tx)
+                    .await
+                    .map_err(unavailable)?;
+                Ok(rows
+                    .into_iter()
+                    .find(|row| row.idempotency_key.as_deref() == Some(key.as_str()))
+                    .map(instance_record)
+                    .transpose()?)
             })
         })
         .await

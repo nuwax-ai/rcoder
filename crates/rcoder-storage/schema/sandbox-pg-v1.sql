@@ -60,6 +60,7 @@ CREATE TABLE sandbox_instances (
  token_generation BIGINT NOT NULL DEFAULT 1 CHECK(token_generation>=1),
  env_json TEXT,
  metadata_json TEXT,
+ idempotency_key TEXT,
  failure_reason TEXT,
  created_at_us BIGINT NOT NULL, updated_at_us BIGINT NOT NULL,
  ready_at_us BIGINT, expires_at_us BIGINT, hard_deadline_us BIGINT, deleted_at_us BIGINT,
@@ -84,3 +85,4 @@ CREATE TABLE sandbox_volumes (
 );
 CREATE INDEX sandbox_volumes_list ON sandbox_volumes(tenant_id,created_at_us,volume_id);
 CREATE UNIQUE INDEX sandbox_volumes_name ON sandbox_volumes(tenant_id,name) WHERE deleted_at_us IS NULL;
+CREATE UNIQUE INDEX sandbox_instances_idem ON sandbox_instances(idempotency_key) WHERE deleted_at_us IS NULL AND idempotency_key IS NOT NULL;
