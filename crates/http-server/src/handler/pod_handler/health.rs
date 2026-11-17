@@ -61,50 +61,56 @@ pub struct PodHealthResponse {
     pub cache_age_seconds: u64,
 }
 
-// ── 3s 缓存（按 runtime × 容器隔离）────────────────────────────────────
+// ── 3s 缓存（moka，与仓内既有缓存同一套方案）──────────────────────────
 //
-// 前端轮询 3s，命中缓存后实际打 k8s 的频率 ≈ 1/3s/容器。
-// 键 = (runtime 指针, 容器标识, service_type)——不同 runtime 不串数据。
-struct HealthCache {
+// 用 `moka::future::Cache` 而不是手写 `HashMap + Mutex`：TTL 过期、容量
+// 淘汰、分片锁都由库负责。手写版在评审里连续暴露过三类问题（某个分支
+// 忘写缓存 / 缓存键前后不一致 / 清理逻辑只在部分路径），这类簿记不该
+// 由业务代码维护。
+//
+// 键 = (runtime 指针, identifier)：按 runtime 隔离，不同 AppState 不串
+// 数据；用 identifier 而非 container_name，因为容器消失前后会走不同
+// 分支（locate 就失败 / 登记表有但 inspect 404）。
+#[derive(Clone)]
+struct CachedHealth {
     health: container_runtime_api::ContainerHealth,
-    ts: std::time::Instant,
+    /// 写入时刻，用于回报 `cache_age_seconds`（moka 不暴露条目年龄）
+    stored_at: std::time::Instant,
 }
 
-static CACHE: LazyLock<Mutex<std::collections::HashMap<(usize, String), HealthCache>>> =
-    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+type CacheKey = (usize, String);
 
-/// 缓存 TTL：pod status 的变化（OOM/重启）本身就有秒级延迟（kubelet
-/// 汇报周期），3s 足够灵敏，同时把轮询压力压到 1/3。
+/// TTL：pod status 的变化（OOM/重启）有秒级延迟（kubelet 汇报周期），
+/// 3s 足够灵敏，同时把轮询压力压到 1/3。
 const CACHE_TTL_SECS: u64 = 3;
+/// 容量上限：moka 按最近最少使用自动淘汰，长期运行不累积。
+const CACHE_MAX_ENTRIES: u64 = 256;
 
-/// 缓存条目上限；超过则清理 60s 未访问的旧项（长期运行不累积）。
-const CACHE_MAX_ENTRIES: usize = 256;
+static CACHE: LazyLock<moka::future::Cache<CacheKey, CachedHealth>> = LazyLock::new(|| {
+    moka::future::Cache::builder()
+        .max_capacity(CACHE_MAX_ENTRIES)
+        .time_to_live(std::time::Duration::from_secs(CACHE_TTL_SECS))
+        .build()
+});
 
-/// 读缓存（短临界区：Clone 后立刻释放，不跨 await）。
-/// 返回 `(health, age_seconds)`；未命中或已过期返回 None。
-fn cache_read(key: &(usize, String)) -> Option<(container_runtime_api::ContainerHealth, u64)> {
-    let cache = CACHE.lock().ok()?;
-    let entry = cache.get(key)?;
-    let age = entry.ts.elapsed().as_secs();
-    (age < CACHE_TTL_SECS).then(|| (entry.health.clone(), age))
+/// 读缓存。返回 `(health, age_seconds)`；未命中或已过期（moka 自动剔除）
+/// 返回 None。
+async fn cache_read(key: &CacheKey) -> Option<(container_runtime_api::ContainerHealth, u64)> {
+    let entry = CACHE.get(key).await?;
+    Some((entry.health, entry.stored_at.elapsed().as_secs()))
 }
 
-/// 写缓存（含上限清理）。所有分支共用——避免"某个分支忘了清理/忘了写"。
-fn cache_write(key: (usize, String), health: container_runtime_api::ContainerHealth) {
-    let Ok(mut cache) = CACHE.lock() else {
-        return;
-    };
-    cache.insert(
-        key,
-        HealthCache {
-            health,
-            ts: std::time::Instant::now(),
-        },
-    );
-    if cache.len() > CACHE_MAX_ENTRIES {
-        let now = std::time::Instant::now();
-        cache.retain(|_, entry| now.duration_since(entry.ts).as_secs() < 60);
-    }
+/// 写缓存。所有分支共用——避免"某个分支忘了写"。
+async fn cache_write(key: CacheKey, health: container_runtime_api::ContainerHealth) {
+    CACHE
+        .insert(
+            key,
+            CachedHealth {
+                health,
+                stored_at: std::time::Instant::now(),
+            },
+        )
+        .await;
 }
 
 /// `GET /computer/pod/health`
@@ -172,7 +178,7 @@ pub async fn computer_pod_health(
         target.identifier.clone(),
     );
     if !params.fresh.unwrap_or(false)
-        && let Some((cached, age)) = cache_read(&key)
+        && let Some((cached, age)) = cache_read(&key).await
     {
         return Ok(HttpResult::success(PodHealthResponse {
             health: cached,
@@ -226,7 +232,7 @@ pub async fn computer_pod_health(
             source: "none".to_string(),
             pod_uid: None,
         };
-        cache_write(key, absent.clone());
+        cache_write(key, absent.clone()).await;
         return Ok(HttpResult::success(PodHealthResponse {
             health: absent,
             cache_age_seconds: 0,
@@ -275,14 +281,14 @@ pub async fn computer_pod_health(
             sampled_at: chrono::Utc::now(),
             ..Default::default()
         };
-        cache_write(key, absent.clone());
+        cache_write(key, absent.clone()).await;
         return Ok(HttpResult::success(PodHealthResponse {
             health: absent,
             cache_age_seconds: 0,
         }));
     };
 
-    cache_write(key, health.clone());
+    cache_write(key, health.clone()).await;
 
     Ok(HttpResult::success(PodHealthResponse {
         health,
