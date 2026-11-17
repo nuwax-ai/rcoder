@@ -77,6 +77,36 @@ static CACHE: LazyLock<Mutex<std::collections::HashMap<(usize, String), HealthCa
 /// 汇报周期），3s 足够灵敏，同时把轮询压力压到 1/3。
 const CACHE_TTL_SECS: u64 = 3;
 
+/// 缓存条目上限；超过则清理 60s 未访问的旧项（长期运行不累积）。
+const CACHE_MAX_ENTRIES: usize = 256;
+
+/// 读缓存（短临界区：Clone 后立刻释放，不跨 await）。
+/// 返回 `(health, age_seconds)`；未命中或已过期返回 None。
+fn cache_read(key: &(usize, String)) -> Option<(container_runtime_api::ContainerHealth, u64)> {
+    let cache = CACHE.lock().ok()?;
+    let entry = cache.get(key)?;
+    let age = entry.ts.elapsed().as_secs();
+    (age < CACHE_TTL_SECS).then(|| (entry.health.clone(), age))
+}
+
+/// 写缓存（含上限清理）。所有分支共用——避免"某个分支忘了清理/忘了写"。
+fn cache_write(key: (usize, String), health: container_runtime_api::ContainerHealth) {
+    let Ok(mut cache) = CACHE.lock() else {
+        return;
+    };
+    cache.insert(
+        key,
+        HealthCache {
+            health,
+            ts: std::time::Instant::now(),
+        },
+    );
+    if cache.len() > CACHE_MAX_ENTRIES {
+        let now = std::time::Instant::now();
+        cache.retain(|_, entry| now.duration_since(entry.ts).as_secs() < 60);
+    }
+}
+
 /// `GET /computer/pod/health`
 #[utoipa::path(
     get,
@@ -132,7 +162,25 @@ pub async fn computer_pod_health(
         ))
     })?;
 
-    // 2) 定位容器（拿 container_name 作为运行时侧的查询键）
+    // 2) **先查缓存**：键用 identifier（调用方视角的唯一目标），与后端
+    // 返回的 container_name 无关——容器消失前后会走不同分支，用 name 作键
+    // 会命中不了。缓存命中时连 locate 都不做（k8s 走 pod_cache、docker 要
+    // list 容器，都别在 3s 轮询里白跑）。
+    let runtime = state.runtime().clone();
+    let key = (
+        Arc::as_ptr(&runtime) as *const () as usize,
+        target.identifier.clone(),
+    );
+    if !params.fresh.unwrap_or(false)
+        && let Some((cached, age)) = cache_read(&key)
+    {
+        return Ok(HttpResult::success(PodHealthResponse {
+            health: cached,
+            cache_age_seconds: age,
+        }));
+    }
+
+    // 3) 定位容器（拿 container_name 作为运行时侧的查询键）
     let container =
         super::resources::locate_container(&state, &target, params.user_id.as_deref()).await?;
     let Some(container) = container else {
@@ -142,31 +190,15 @@ pub async fn computer_pod_health(
         // `oom` 事件是 Docker 专为 cgroup OOM 发出的（比 exitCode 可靠：
         // 137 同样来自 SIGKILL）。所以这里再问一次运行时：容器没了，
         // 但"最近一次终止"可能还能从事件还原。
-        info!(
+        debug!(
             event = "pod_health.container_absent",
             identifier = %target.identifier,
             user_id = ?params.user_id,
             pod_id = ?params.pod_id,
             "container not found, probing termination history"
         );
-        let runtime = state.runtime().clone();
-        // 容器不存在时**同样走缓存**：事件历史探测要拉全量 docker 事件，
-        // 前端 3s 轮询一个已消失的容器会把 daemon 打满。
-        let absent_key = (
-            Arc::as_ptr(&runtime) as *const () as usize,
-            target.identifier.clone(),
-        );
-        let fresh_absent = params.fresh.unwrap_or(false);
-        if !fresh_absent
-            && let Ok(cache) = CACHE.lock()
-            && let Some(entry) = cache.get(&absent_key)
-            && entry.ts.elapsed().as_secs() < CACHE_TTL_SECS
-        {
-            return Ok(HttpResult::success(PodHealthResponse {
-                health: entry.health.clone(),
-                cache_age_seconds: entry.ts.elapsed().as_secs(),
-            }));
-        }
+        // 容器不存在：事件历史探测要拉全量 docker 事件，所以结果也要进
+        // 缓存（上面已做统一缓存查询，这里只负责探测 + 回填）。
         let history = runtime
             .container_termination_history(&target.identifier)
             .await
@@ -185,52 +217,21 @@ pub async fn computer_pod_health(
             last_termination: history,
             started_at: None,
             waiting_reason: None,
+            // 文案不假定后端：k8s 下"不存在"通常是还没创建，docker 下是
+            // auto_remove 已删除——两者都成立的说法才不误导
             detail: Some(
-                "container not found (docker: already removed by auto_remove)".to_string(),
+                "container not found (k8s: not created yet; docker: already removed)".to_string(),
             ),
             sampled_at: chrono::Utc::now(),
             source: "none".to_string(),
             pod_uid: None,
         };
-        if let Ok(mut cache) = CACHE.lock() {
-            cache.insert(
-                absent_key,
-                HealthCache {
-                    health: absent.clone(),
-                    ts: std::time::Instant::now(),
-                },
-            );
-            if cache.len() > 256 {
-                let now = std::time::Instant::now();
-                cache.retain(|_, entry| now.duration_since(entry.ts).as_secs() < 60);
-            }
-        }
+        cache_write(key, absent.clone());
         return Ok(HttpResult::success(PodHealthResponse {
             health: absent,
             cache_age_seconds: 0,
         }));
     };
-
-    // 3) 缓存查询
-    let runtime = state.runtime().clone();
-    // 缓存键统一用 **identifier**（调用方视角的唯一目标标识），不用
-    // container_name：容器消失前后会走不同分支（locate 就失败 / 登记表有
-    // 但 inspect 404），用不同键会让"刚查过"的结果命中不了缓存。
-    let key = (
-        Arc::as_ptr(&runtime) as *const () as usize,
-        target.identifier.clone(),
-    );
-    let fresh = params.fresh.unwrap_or(false);
-    if !fresh
-        && let Ok(cache) = CACHE.lock()
-        && let Some(entry) = cache.get(&key)
-        && entry.ts.elapsed().as_secs() < CACHE_TTL_SECS
-    {
-        return Ok(HttpResult::success(PodHealthResponse {
-            health: entry.health.clone(),
-            cache_age_seconds: entry.ts.elapsed().as_secs(),
-        }));
-    }
 
     // 4) 采集（单容器；容器不存在 → None）
     let health = runtime
@@ -274,35 +275,14 @@ pub async fn computer_pod_health(
             sampled_at: chrono::Utc::now(),
             ..Default::default()
         };
-        if let Ok(mut cache) = CACHE.lock() {
-            cache.insert(
-                key,
-                HealthCache {
-                    health: absent.clone(),
-                    ts: std::time::Instant::now(),
-                },
-            );
-        }
+        cache_write(key, absent.clone());
         return Ok(HttpResult::success(PodHealthResponse {
             health: absent,
             cache_age_seconds: 0,
         }));
     };
 
-    if let Ok(mut cache) = CACHE.lock() {
-        cache.insert(
-            key,
-            HealthCache {
-                health: health.clone(),
-                ts: std::time::Instant::now(),
-            },
-        );
-        // 有界：只保留最近 256 个容器的条目，防止长期运行累积
-        if cache.len() > 256 {
-            let now = std::time::Instant::now();
-            cache.retain(|_, entry| now.duration_since(entry.ts).as_secs() < 60);
-        }
-    }
+    cache_write(key, health.clone());
 
     Ok(HttpResult::success(PodHealthResponse {
         health,
