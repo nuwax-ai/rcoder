@@ -44,7 +44,7 @@ pub struct CreateSandboxBody {
     pub envVars: Option<serde_json::Map<String, serde_json::Value>>,
     pub metadata: Option<serde_json::Value>,
     #[serde(default)]
-    pub volumeMounts: Option<serde_json::Map<String, serde_json::Value>>,
+    pub volumeMounts: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -151,22 +151,43 @@ pub async fn create_sandbox(
     }
     let mut volume_mounts = Vec::new();
     if let Some(mounts) = &body.volumeMounts {
-        for (mount_path, vol_ref) in mounts {
-            let volume_name = match vol_ref {
-                serde_json::Value::String(name) => name.clone(),
-                serde_json::Value::Object(map) => map
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                _ => continue,
-            };
-            if !volume_name.is_empty() {
-                volume_mounts.push(shared_types::sandbox::VolumeMountRequest {
-                    volume_name,
-                    mount_path: mount_path.clone(),
-                });
+        match mounts {
+            // 官方 REST wire 格式：数组 [{name: "vol-name", path: "/mount/path"}]
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    if let Some(obj) = item.as_object() {
+                        let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+                        let path = obj.get("path").and_then(|v| v.as_str()).unwrap_or_default();
+                        if !name.is_empty() && !path.is_empty() {
+                            volume_mounts.push(shared_types::sandbox::VolumeMountRequest {
+                                volume_name: name.to_string(),
+                                mount_path: path.to_string(),
+                            });
+                        }
+                    }
+                }
             }
+            // SDK 客户端形态：map {mountPath: volumeName 或 {name: volumeName}}
+            serde_json::Value::Object(map) => {
+                for (mount_path, vol_ref) in map {
+                    let volume_name = match vol_ref {
+                        serde_json::Value::String(name) => name.clone(),
+                        serde_json::Value::Object(obj) => obj
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        _ => continue,
+                    };
+                    if !volume_name.is_empty() {
+                        volume_mounts.push(shared_types::sandbox::VolumeMountRequest {
+                            volume_name,
+                            mount_path: mount_path.clone(),
+                        });
+                    }
+                }
+            }
+            _ => {}
         }
     }
     let idempotency_key = headers

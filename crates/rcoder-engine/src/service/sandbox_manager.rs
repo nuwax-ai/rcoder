@@ -311,13 +311,9 @@ impl SandboxManager {
             hard_deadline_us: Some(hard_deadline_us),
             deleted_at_us: None,
         };
-        record = self.store.insert_instance(&record).await.map_err(store_error)?;
-
-        // 外部副作用：Pod 创建 + 等待 Ready。
-        // Volume 挂载：按名称查找租户的 volume，转换为 (pvc_name, mount_path)。
-        let mut volume_mounts = Vec::new();
+        // Volume 挂载校验前置（纯读操作，insert 之前——卷名错误不泄漏 Provisioning 行）
+        let mut resolved_volume_mounts = Vec::new();
         for mount in &params.volume_mounts {
-            // mount_path 安全校验：必须以 / 开头、不含 ..、不挂载敏感路径
             if !mount.mount_path.starts_with('/') {
                 return Err(SandboxApiError::Invalid(format!(
                     "mountPath \"{}\" 必须以 / 开头",
@@ -345,9 +341,12 @@ impl SandboxManager {
                         mount.volume_name
                     ))
                 })?;
-            volume_mounts.push((volume.pvc_name.clone(), mount.mount_path.clone()));
+            resolved_volume_mounts.push((volume.pvc_name.clone(), mount.mount_path.clone()));
         }
 
+        record = self.store.insert_instance(&record).await.map_err(store_error)?;
+
+        // 外部副作用：Pod 创建 + 等待 Ready。
         let pod_params = SandboxPodParams {
             name: record.pod_name.clone(),
             image: record.image.clone(),
@@ -357,7 +356,7 @@ impl SandboxManager {
             envd_port: ENVD_PORT,
             max_lifetime_seconds: spec.ttl_max_seconds + self.create_ready_timeout.as_secs() as i64 + 120,
             env: Vec::new(),
-            volume_mounts,
+            volume_mounts: resolved_volume_mounts,
         };
         if let Err(error) = self.k8s.create_pod(&pod_params).await {
             return self

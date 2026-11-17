@@ -66,6 +66,7 @@ impl ApiKeyValidator {
             || path.starts_with("/v2/sandboxes")
             || path.starts_with("/templates")
             || path.starts_with("/v2/templates")
+            || path.starts_with("/volumes")
         {
             return true;
         }
