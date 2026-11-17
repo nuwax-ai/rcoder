@@ -30,8 +30,6 @@ use shared_types::{ServiceType, WorkspaceSyncMode};
 
 use super::*;
 
-const DEFAULT_MIGRATION_IMAGE: &str =
-    "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-k8s-test/rclone-migrate:1.76.0";
 const DEFAULT_MIGRATION_ALT_IMAGE: &str = "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-k8s-test/rcoder-computer-agent-runner:0.1.426";
 /// Job 等待上限（4h, 与迁移脚本 activeDeadlineSeconds 对齐）。
 const JOB_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(14400);
@@ -231,22 +229,26 @@ impl KubernetesRuntime {
                 "destination PVC '{dst_pvc}' not found; run phase-a first"
             )));
         }
-        let image = std::env::var("RCODER_MIGRATION_IMAGE")
+        // 镜像选择（显式配置即信任——部署方设 RCODER_MIGRATION_IMAGE 意味着
+        // 专用 rclone-migrate 镜像已构建推送; 无法在本地可靠探测远端镜像存在性,
+        // 之前"恒 false 走 fallback"会让显式配置被静默忽略）:
+        //   1. RCODER_MIGRATION_IMAGE 显式设置 → 直接用（rclone 已在镜像内, 零下载）
+        //   2. 否则 fallback: RCODER_MIGRATION_ALT_IMAGE（缺省 agent-runner）
+        //      + 容器内在线下载 rclone（32MB 外网, 10-55s 随机——仅测试期可接受）
+        let (final_image, download_rclone) = match std::env::var("RCODER_MIGRATION_IMAGE")
             .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_MIGRATION_IMAGE.to_string());
-        let (alt_image, download) = match std::env::var("RCODER_MIGRATION_ALT_IMAGE")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
         {
-            Some(alt) => (alt, true),
-            None => (DEFAULT_MIGRATION_ALT_IMAGE.to_string(), true),
-        };
-        // 专用镜像不存在时（未构建推送）用 fallback: agent-runner + 容器内下载
-        let (final_image, download_rclone) = if image_available(&image) {
-            (image, false)
-        } else {
-            (alt_image, download)
+            Some(image) => (image, false),
+            None => (
+                std::env::var("RCODER_MIGRATION_ALT_IMAGE")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| DEFAULT_MIGRATION_ALT_IMAGE.to_string()),
+                true,
+            ),
         };
         let plan = MigrationJobPlan {
             job_name: format!("migrate-{}-{}", identifier.replace('_', "-"), mode.as_str()),
@@ -317,14 +319,6 @@ impl KubernetesRuntime {
         let _ = jobs.delete(&plan.job_name, &DeleteParams::default()).await;
         Ok(())
     }
-}
-
-/// 专用镜像是否可用（crictl 不可靠, 用 PVC Job 的 ImagePull 失败快速判断成本高;
-/// 简化: 默认假定**不可用**走 fallback——专用镜像推送后由部署方设
-/// RCODER_MIGRATION_IMAGE 并通过 imagePullPolicy 验证; 测试期 fallback 路径
-/// 已在 31.45 实证可跑）。
-fn image_available(_image: &str) -> bool {
-    false
 }
 
 #[cfg(test)]

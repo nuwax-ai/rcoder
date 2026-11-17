@@ -34,6 +34,10 @@ use super::{is_pass_through_path, resolve_target, TargetResolution};
 const WAKE_BUDGET: Duration = Duration::from_secs(8);
 /// Retry-After 建议值（秒）：覆盖冷启动尾延 + 调用方退避下限。
 const RETRY_AFTER_SECS: &str = "10";
+/// 快路径探活预算：稳态容器 8086 必在线, 只兜 readiness 尾窗（亚秒级）。
+const FAST_PATH_PROBE: Duration = Duration::from_millis(750);
+/// wake 后探活预算：phase Running → 8086 监听的实测间隔 ~200ms-2s。
+const WAKE_PROBE: Duration = Duration::from_secs(3);
 
 /// 拦截决策（纯逻辑, 供单测）：四道闸门全开才转发。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +130,17 @@ pub async fn computer_rbd_intercept(
 
 /// wake（幂等 ensure agent 容器, ≤WAKE_BUDGET）+ 全流式转发其 :8086。
 async fn forward_to_agent(state: &AppState, user_id: &str, req: Request) -> Response {
+    // ① 快路径: 容器 Running 且 :8086 探活成功 → 直接转发（稳态分享请求
+    // 毫秒级; 跳过 ensure——ensure 即使命中 pod_cache 也要走锁与状态比对）。
+    // 探活兜 readiness 尾窗（phase Running ≠ 8086 已监听, 实测差 ~200ms）;
+    // 失败自然落入慢路径 wake。
+    if let Some(addr) = running_agent_addr(state, user_id).await {
+        if let Some(ready_addr) = wait_file_server_ready(&addr, FAST_PATH_PROBE).await {
+            return stream_to_addr(&ready_addr, req).await;
+        }
+    }
+    // ② 慢路径: wake（幂等 ensure, ≤WAKE_BUDGET）。
+    //
     // limits 必须从 kubernetes_config 解析（与 /computer/chat、/pod/ensure
     // 同一真源）——传 None 会让 k8s_agent_create 回落 DEFAULT_AGENT_* 常量,
     // 同一用户两条创建路径拿到不同 limits（OOM 行为分裂 + 双真源）。
@@ -175,7 +190,41 @@ async fn forward_to_agent(state: &AppState, user_id: &str, req: Request) -> Resp
         return service_unavailable("agent container address not ready");
     };
     let addr = format!("{}:{}", ip, shared_types::HTTP_DEFAULT_PORT);
-    stream_to_addr(&addr, req).await
+    // ensure 等的是 phase Running; 8086 监听晚 ~200ms-2s（readinessProbe
+    // period=1s）。预算内探活, 探不到按 503 降级（预览页重试吸收）。
+    match wait_file_server_ready(&addr, WAKE_PROBE).await {
+        Some(ready_addr) => stream_to_addr(&ready_addr, req).await,
+        None => service_unavailable("agent container is starting, retry shortly"),
+    }
+}
+
+/// 容器 Running 时的转发地址（None = 不在跑/查询失败, 走 wake 慢路径）。
+async fn running_agent_addr(state: &AppState, user_id: &str) -> Option<String> {
+    let info = state
+        .runtime()
+        .get_container_info_by_identifier(user_id, &ServiceType::ComputerAgentRunner)
+        .await
+        .ok()??;
+    if info.status != "Running" {
+        return None;
+    }
+    let ip = info.container_ip.split(':').next()?.trim();
+    (!ip.is_empty()).then(|| format!("{}:{}", ip, shared_types::HTTP_DEFAULT_PORT))
+}
+
+/// 探活 agent 容器内嵌 file-server :8086（TCP connect, 250ms 间隔）。
+/// 返回 Some(addr)=可转发; None=预算内未就绪。
+async fn wait_file_server_ready(addr: &str, budget: Duration) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return Some(addr.to_string());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 /// 全流式转发（与 userapp_forward::upstream 内核同语义的 computer 域实现：
