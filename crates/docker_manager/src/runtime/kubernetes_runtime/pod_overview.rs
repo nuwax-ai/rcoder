@@ -945,7 +945,7 @@ mod overview_tests {
         let (ready, health) = pod_health_from_status(&pod);
         assert!(!ready, "主容器 db 未就绪，不能报 ready");
         assert_eq!(health.restart_count, 6);
-        assert!(health.oom_killed_last);
+        assert_eq!(health.last_terminate_reason.as_deref(), Some("OOMKilled"));
     }
 
     /// 正常完成的 init（无 waiting、无异常 lastState）不覆盖主容器健康。

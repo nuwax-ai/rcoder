@@ -783,9 +783,18 @@ fn docker_health(state: Option<&ContainerState>, events: &[&RawEvent]) -> PodHea
     let restart_count = count_recovery_cycles(events);
     let (oom_in_cycle, die_exit_code) = last_exit_cycle(events);
     let oom_killed_last = state.and_then(|s| s.oom_killed).unwrap_or(false) || oom_in_cycle;
-    // 退出码：die 事件属性 > 当前 State（运行中为 0/None）
+    // 退出码：die 事件属性优先；**容器正在运行时不用 State.ExitCode**
+    // ——Docker 对运行中容器返回 ExitCode=0（默认值），把它当"上次退出码"
+    // 会让前端看到"运行中，上次退出码 0"，误以为刚正常退出过。
+    let running = state.and_then(|s| s.running).unwrap_or(false);
     let exit_code = die_exit_code
-        .or_else(|| state.and_then(|s| s.exit_code))
+        .or_else(|| {
+            if running {
+                None
+            } else {
+                state.and_then(|s| s.exit_code)
+            }
+        })
         .map(|c| c as i32);
     let last_terminate_reason = if oom_killed_last {
         Some("OOMKilled".to_string())
@@ -932,8 +941,9 @@ mod tests {
             ..Default::default()
         };
         let health = docker_health(Some(&state), &events.iter().collect::<Vec<_>>());
-        assert!(
-            health.oom_killed_last,
+        assert_eq!(
+            health.last_terminate_reason.as_deref(),
+            Some("OOMKilled"),
             "oom→die(137)→start 的最近周期是 OOM"
         );
         assert_eq!(
@@ -972,8 +982,9 @@ mod tests {
             ..Default::default()
         };
         let health = docker_health(Some(&state), &events.iter().collect::<Vec<_>>());
-        assert!(
-            health.oom_killed_last,
+        assert_eq!(
+            health.last_terminate_reason.as_deref(),
+            Some("OOMKilled"),
             "die 仍是最近的实际退出，其周期内 oom 有效"
         );
         assert_eq!(health.last_exit_code, Some(137));
@@ -1156,8 +1167,9 @@ mod tests {
             ..Default::default()
         };
         let health = docker_health(Some(&state), &events.iter().collect::<Vec<_>>());
-        assert!(
-            !health.oom_killed_last,
+        assert_ne!(
+            health.last_terminate_reason.as_deref(),
+            Some("OOMKilled"),
             "最近周期（die=1 普通）无 oom → 不粘旧 OOM"
         );
         assert_eq!(health.last_terminate_reason.as_deref(), Some("Error(1)"));
@@ -1172,7 +1184,11 @@ mod tests {
             ..Default::default()
         };
         let health = docker_health(Some(&state), &events.iter().collect::<Vec<_>>());
-        assert!(!health.oom_killed_last, "137 ≠ OOM");
+        assert_ne!(
+            health.last_terminate_reason.as_deref(),
+            Some("OOMKilled"),
+            "137 ≠ OOM"
+        );
         assert_eq!(health.last_terminate_reason.as_deref(), Some("Error(137)"));
     }
 
