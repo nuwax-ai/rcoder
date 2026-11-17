@@ -1,4 +1,5 @@
 use super::*;
+use tracing::warn;
 
 #[async_trait]
 impl AgentContainerRuntime for DockerRuntime {
@@ -1113,6 +1114,12 @@ impl AgentContainerRuntime for DockerRuntime {
     }
 
     async fn sync_states(&self) -> ContainerRuntimeResult<(u32, Vec<RemovedContainerInfo>)> {
+        // 先按 Docker 真实列表回收超期的 stopped agent 容器（不依赖任何
+        // 注册表——agent 容器在 rcoder-engine 的 projects 表里，
+        // DockerManager.containers 是另一套缓存，挂那里永远不会触发）。
+        if let Err(e) = self.inner.reap_stopped_agents().await {
+            warn!("[SYNC] reclaim stopped agent containers failed: {e}");
+        }
         self.inner
             .sync_all_container_states()
             .await
