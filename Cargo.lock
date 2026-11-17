@@ -11052,6 +11052,7 @@ dependencies = [
 name = "rcoder-engine"
 version = "0.1.4"
 dependencies = [
+ "aes-gcm",
  "agent_provisioning",
  "anyhow",
  "app_manager",

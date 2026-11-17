@@ -596,3 +596,74 @@ impl DockerConfig {
         )
     }
 }
+
+// ============================================================
+// E2B 兼容沙箱（M1：单副本；启用需 kubernetes + pg）
+// ============================================================
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct E2bSandboxConfig {
+    /// 总开关：false 时完全不装配（无路由、无任务、无存储连接）。
+    pub enabled: bool,
+    /// 沙箱 Pod 所在 namespace（独立于业务 runner）。
+    pub namespace: String,
+    /// token 加密密钥（64 位 hex = 32 字节 AES-256-GCM key）。
+    /// 生产经环境注入；缺失且 enabled=true 时启动 fail-fast。
+    pub token_key_hex: String,
+    pub default_ttl_seconds: i64,
+    pub max_ttl_seconds: i64,
+    pub reaper_interval_seconds: u64,
+    /// create 等待 Pod Ready 的上限（秒）。
+    pub create_ready_timeout_seconds: u64,
+    /// envd /init 重试次数（同 token + 新 timestamp，源码实证幂等）。
+    pub envd_init_retries: u32,
+    pub api_keys: Vec<E2bSandboxApiKeySeed>,
+    pub templates: Vec<E2bSandboxTemplateSeed>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct E2bSandboxApiKeySeed {
+    pub key_id: String,
+    pub tenant_id: String,
+    /// 明文 key（仅用于计算哈希入库与运维对照；库中只存 sha256）。
+    pub secret: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct E2bSandboxTemplateSeed {
+    pub template_id: String,
+    pub display_name: Option<String>,
+    pub enabled: bool,
+    pub image: String,
+    pub image_digest: Option<String>,
+    pub envd_version: String,
+    /// None/空 = runc；如 kata-clh-runtime-rs。
+    pub runtime_class: Option<String>,
+    pub cpu_millicores: i64,
+    pub memory_mib: i64,
+    pub default_user: String,
+    pub default_workdir: String,
+    #[serde(default)]
+    pub default_env: std::collections::BTreeMap<String, String>,
+    pub ttl_max_seconds: i64,
+    #[serde(default)]
+    pub warm_target: i64,
+}
+
+impl Default for E2bSandboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            namespace: "nuwax-e2b".to_string(),
+            token_key_hex: String::new(),
+            default_ttl_seconds: 300,
+            max_ttl_seconds: 3600,
+            reaper_interval_seconds: 10,
+            create_ready_timeout_seconds: 90,
+            envd_init_retries: 5,
+            api_keys: Vec::new(),
+            templates: Vec::new(),
+        }
+    }
+}
