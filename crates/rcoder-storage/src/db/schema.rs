@@ -259,6 +259,7 @@ async fn initialize_component(
             "userapp" => Component::Userapp,
             "project" => Component::Project,
             "preview" => Component::Preview,
+            "sandbox" => Component::Sandbox,
             _ => bail!("unknown database schema component"),
         };
         let version: i64 = version.parse().context("invalid schema version")?;
