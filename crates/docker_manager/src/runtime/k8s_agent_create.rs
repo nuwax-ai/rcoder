@@ -298,8 +298,7 @@ impl KubernetesRuntime {
         // - per-agent (pod_id=None + 任一 per-agent 开关): per-agent PVC (subPath=None)
         // - 共享 (pod_id=Some 或开关全关): 共享 PVC + subPath (选项A / 回滚)
         let per_agent = params.pod_id.is_none()
-            && (shared_types::per_agent_pvc_enabled()
-                || shared_types::per_agent_rbd_enabled());
+            && (shared_types::per_agent_pvc_enabled() || shared_types::per_agent_rbd_enabled());
         let (workspace_pvc, workspace_sub_path): (String, Option<String>) = if per_agent {
             (self.workspace_pvc_name(identifier, service_type)?, None)
         } else {

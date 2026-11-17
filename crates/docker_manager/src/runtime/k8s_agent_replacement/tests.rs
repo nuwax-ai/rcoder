@@ -100,6 +100,7 @@ pub(super) fn runtime(client: kube::Client) -> KubernetesRuntime {
         },
         pod_cache: Default::default(),
         subvolume_path_cache: Default::default(),
+        workspace_exists_cache: Default::default(),
         event_publisher: Default::default(),
         event_counters: Arc::new(crate::runtime::k8s_event_publisher::PublisherCounters::default()),
     }

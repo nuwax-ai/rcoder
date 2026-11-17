@@ -456,6 +456,7 @@ fn runtime(client: kube::Client) -> KubernetesRuntime {
         },
         pod_cache: Default::default(),
         subvolume_path_cache: Default::default(),
+        workspace_exists_cache: Default::default(),
         event_publisher: Default::default(),
         event_counters: Default::default(),
     }
@@ -906,6 +907,7 @@ async fn compute_restart_then_cold_unbound_ensure_preserves_updated_compute_and_
         config: runtime.config.clone(),
         pod_cache: Default::default(),
         subvolume_path_cache: Default::default(),
+        workspace_exists_cache: Default::default(),
         event_publisher: Default::default(),
         event_counters: Default::default(),
     };
