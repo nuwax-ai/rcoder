@@ -53,6 +53,14 @@ impl SandboxK8s {
         Self { client, namespace }
     }
 
+    /// 独立发现 kube 配置并自建 client（不依赖 KubernetesRuntime 实例；
+    /// 组合根装配用，与主运行时共享同一集群凭据来源）。
+    pub async fn discover(namespace: String) -> Result<Self, SandboxK8sError> {
+        let config = kube::Config::infer().await.map_err(|error| err("kube config", error))?;
+        let client = Client::try_from(config).map_err(|error| err("kube client", error))?;
+        Ok(Self::new(client, namespace))
+    }
+
     /// 复用既有 KubernetesRuntime 的 client/namespace（字段 crate 可见）。
     pub fn from_runtime(
         runtime: &super::kubernetes_runtime::KubernetesRuntime,

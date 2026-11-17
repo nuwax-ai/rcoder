@@ -190,10 +190,11 @@ impl SandboxManager {
         if record.revoked_at_us.is_some() {
             return Err(SandboxApiError::Unauthorized);
         }
-        if let Some(expires) = record.expires_at_us {
-            if expires <= chrono::Utc::now().timestamp_micros() {
-                return Err(SandboxApiError::Unauthorized);
-            }
+        if record
+            .expires_at_us
+            .is_some_and(|expires| expires <= chrono::Utc::now().timestamp_micros())
+        {
+            return Err(SandboxApiError::Unauthorized);
         }
         Ok(record)
     }
@@ -613,13 +614,13 @@ impl SandboxManager {
     }
 
     /// 超时回收循环（tokio 任务体）：到期实例与待清理实例的收敛。
-    pub async fn run_reaper(self: Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>, interval_seconds: u64) {
+    pub async fn run_reaper(self: Arc<Self>, mut shutdown: tokio::sync::broadcast::Receiver<()>, interval_seconds: u64) {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_seconds.max(1)));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = ticker.tick() => {}
-                _ = shutdown.changed() => break,
+                _ = shutdown.recv() => break,
             }
             let now = chrono::Utc::now().timestamp_micros();
             let expired = match self.store.list_expired(now).await {

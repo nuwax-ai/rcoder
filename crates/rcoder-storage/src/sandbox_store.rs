@@ -10,7 +10,7 @@ use crate::db::{
 };
 use futures::future::BoxFuture;
 use shared_types::sandbox::{
-    CreateSandboxParams, SandboxApiKeyRecord, SandboxInstanceRecord, SandboxInstanceState,
+    SandboxApiKeyRecord, SandboxInstanceRecord, SandboxInstanceState,
     SandboxStore, SandboxStoreError, SandboxTemplateSpec, SandboxTemplateSummary,
 };
 use toasty::Executor;

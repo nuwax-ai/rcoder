@@ -13,10 +13,9 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
-use shared_types::sandbox::SandboxApiKeyRecord;
 
 #[cfg(feature = "kubernetes")]
-use rcoder_engine::service::sandbox_manager::SandboxManager;
+pub use rcoder_engine::service::sandbox_manager::SandboxManager;
 #[cfg(not(feature = "kubernetes"))]
 enum SandboxManager {} // 占位：非 kubernetes 构建下的不可达空类型
 #[cfg(feature = "kubernetes")]
