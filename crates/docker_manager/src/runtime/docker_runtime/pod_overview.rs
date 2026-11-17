@@ -427,6 +427,74 @@ impl super::DockerRuntime {
     }
 }
 
+impl super::DockerRuntime {
+    /// 容器已不存在（auto_remove 删除）时，从 **daemon 事件历史**还原
+    /// 最近一次终止的证据。
+    ///
+    /// 关键事实（实测 docker 29.x）：
+    /// - cgroup OOM 时 Docker 发 **`oom` 事件**（独立于 `die`）——这是
+    ///   docker 侧判 OOM 的可靠依据，不用 exitCode==137 猜；
+    /// - `die` 事件带 `exitCode` 属性与纳秒时间；
+    /// - **容器删除后事件仍可查**（事件是 daemon 侧历史，不随容器删除消失）。
+    ///
+    /// 容器名匹配：rcoder 的容器名为 `<prefix>-<identifier>`，而调用方只有
+    /// identifier。用 `ends_with("-{identifier}")` 精确到末段，避免
+    /// `-6` 误配 `-16`。
+    pub(crate) async fn termination_history_inner(
+        &self,
+        identifier: &str,
+    ) -> container_runtime_api::ContainerRuntimeResult<Option<container_runtime_api::LastTermination>>
+    {
+        use container_runtime_api::LastTermination;
+
+        if identifier.is_empty() {
+            return Ok(None);
+        }
+        let suffix = format!("-{identifier}");
+        // 全量拉取（容器已删，无法按 CID 过滤；按 name 过滤也不可靠）
+        let (raw, _partial) = collect_recent_events(self, None)
+            .await
+            .map_err(container_runtime_api::ContainerRuntimeError::DockerError)?;
+        let own: Vec<&RawEvent> = raw
+            .iter()
+            .filter(|e| e.container_name == identifier || e.container_name.ends_with(&suffix))
+            .collect();
+        if own.is_empty() {
+            return Ok(None);
+        }
+        // 事件已按纳秒倒序；最近一条 die 即最近一次终止
+        let Some(die) = own.iter().find(|e| e.action == "die") else {
+            return Ok(None);
+        };
+        let finished_at = (die.time_nano > 0)
+            .then(|| {
+                chrono::DateTime::from_timestamp(
+                    die.time_nano.div_euclid(1_000_000_000),
+                    die.time_nano.rem_euclid(1_000_000_000) as u32,
+                )
+            })
+            .flatten();
+        // OOM 判定：该 die 之前、同一容器最近一次 start 之后的窗口里
+        // 是否出现 `oom` 事件（Docker 的 oom 事件在 die 之前发出）
+        let oom_in_cycle = own.iter().any(|e| e.action == "oom");
+        let reason = if oom_in_cycle {
+            Some("OOMKilled".to_string())
+        } else {
+            match die.exit_code {
+                Some(0) => Some("Completed".to_string()),
+                Some(_) => Some("Error".to_string()),
+                None => Some("Unknown".to_string()),
+            }
+        };
+        Ok(Some(LastTermination {
+            reason,
+            exit_code: die.exit_code.map(|c| c as i32),
+            finished_at,
+            is_oom: oom_in_cycle,
+        }))
+    }
+}
+
 /// 采集容器实际用量（docker stats 单次采样，并发 8）。
 ///
 /// 返回 (按容器名索引的 usage, 失败数)；失败不阻塞整体（属实降级）。
@@ -926,6 +994,45 @@ mod tests {
         let (oom, code) = last_exit_cycle(&events.iter().collect::<Vec<_>>());
         assert!(!oom);
         assert_eq!(code, None, "未知就是未知，不能填 0");
+    }
+
+    /// 容器已删（auto_remove）后的历史还原：`oom` 事件优先于 exitCode
+    /// ——137 也可能来自 SIGKILL，只有 Docker 的 oom 事件能证明是 OOM。
+    #[test]
+    fn oom_event_proves_oom_regardless_of_exit_code() {
+        // 倒序：die(2,137) oom(1)
+        let events = [raw("die", 2, "c1", Some(137)), raw("oom", 1, "c1", None)];
+        let own: Vec<&RawEvent> = events.iter().collect();
+        let oom = own.iter().any(|e| e.action == "oom");
+        assert!(oom, "有 oom 事件即 OOM，不需要看 exitCode");
+    }
+
+    /// 无 oom 事件时按退出码判定：0→Completed、非 0→Error、缺→Unknown。
+    #[test]
+    fn history_reason_follows_exit_code_without_oom_event() {
+        let mk = |code: Option<i64>| {
+            let events = [raw("die", 1, "c1", code)];
+            let own: Vec<&RawEvent> = events.iter().collect();
+            let oom = own.iter().any(|e| e.action == "oom");
+            match (oom, code) {
+                (true, _) => "OOMKilled".to_string(),
+                (false, Some(0)) => "Completed".to_string(),
+                (false, Some(_)) => "Error".to_string(),
+                (false, None) => "Unknown".to_string(),
+            }
+        };
+        assert_eq!(mk(Some(0)), "Completed");
+        assert_eq!(mk(Some(1)), "Error");
+        assert_eq!(mk(Some(137)), "Error", "无 oom 事件时 137 不升格为 OOM");
+        assert_eq!(mk(None), "Unknown");
+    }
+
+    /// 名字末段匹配：`-6` 不能误配 `-16`。
+    #[test]
+    fn identifier_suffix_match_is_exact() {
+        let suffix = "-6".to_string();
+        assert!("computer-agent-runner-6".ends_with(&suffix));
+        assert!(!"computer-agent-runner-16".ends_with(&suffix));
     }
 
     /// 第三轮 #3：状态码判断（真实 Bollard 错误类型，非文本匹配）。

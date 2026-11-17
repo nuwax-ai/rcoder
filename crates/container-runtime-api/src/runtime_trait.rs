@@ -120,6 +120,22 @@ pub trait AgentContainerRuntime: Send + Sync {
     /// 规格、健康与最近事件。分区失败以 `degraded` 标注（事件/卷），
     /// 列表本身失败返回 Err——没有列表这个查询没有意义。
     ///
+    /// 容器已不存在时，探测它**最近一次终止**的证据。
+    ///
+    /// 场景：docker 下 rcoder 创建的容器 `auto_remove=true`，容器退出即被
+    /// 删除，`inspect` 无从查询；但 daemon 的**事件历史仍在**，其中
+    /// `oom` 事件是 Docker 专为 cgroup OOM 发出的（比 exitCode 可靠——
+    /// 137 同样来自 SIGKILL）。k8s 不需要本方法（Pod 保留 terminated 状态）。
+    ///
+    /// 返回 `None` = 事件窗口内查不到（超出回放条数/时间窗，或从未运行过）。
+    /// 默认实现返回 `None`（老实现/测试替身行为不变）。
+    async fn container_termination_history(
+        &self,
+        _identifier: &str,
+    ) -> ContainerRuntimeResult<Option<crate::LastTermination>> {
+        Ok(None)
+    }
+
     /// 单容器健康快照（`/computer/pod/health`，供前端轮询）。
     ///
     /// 只查**一个**容器：k8s 单 Pod GET、docker inspect(+events)。刻意不复用

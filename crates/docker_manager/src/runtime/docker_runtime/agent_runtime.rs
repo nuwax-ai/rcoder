@@ -1105,6 +1105,13 @@ impl AgentContainerRuntime for DockerRuntime {
         self.container_health_inner(identifier).await
     }
 
+    async fn container_termination_history(
+        &self,
+        identifier: &str,
+    ) -> ContainerRuntimeResult<Option<container_runtime_api::LastTermination>> {
+        self.termination_history_inner(identifier).await
+    }
+
     async fn sync_states(&self) -> ContainerRuntimeResult<(u32, Vec<RemovedContainerInfo>)> {
         self.inner
             .sync_all_container_states()

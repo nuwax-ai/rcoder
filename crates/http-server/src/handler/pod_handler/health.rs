@@ -14,7 +14,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use axum::extract::State;
 use serde::{Deserialize, Serialize};
 use shared_types::ServiceType;
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 use utoipa::ToSchema;
 
 use crate::router::AppState;
@@ -97,7 +97,7 @@ const CACHE_TTL_SECS: u64 = 3;
     tag = "pod",
     operation_id = "computer_pod_health",
     summary = "查询单个容器的健康/OOM 信息（供前端轮询）",
-    description = "只查一个容器（k8s 单 Pod GET / docker inspect+events），**容器被 OOM 杀掉后仍可查询**——数据源在运行时侧，不在容器内。\n\n语义红线：`last_termination=null` 表示从未终止过；`is_oom` 由 `reason==OOMKilled` 判定（**不**用 exit_code==137 推断，liveness SIGKILL 同样给 137）；`last_oom_at` 非 OOM 时为 null。`pod_uid` 变化 = 容器被删除重建（计数归零）。\n\n默认 3s 缓存；`fresh=true` 强制直读。k8s 用 `lastState.terminated.finishedAt` 作为最近一次重启时间；docker 用 `die` 事件时间（`State` 字段在运行中会被重置，靠事件补历史）。\n\n**能力差异（务必按部署模式解读）**：k8s 下 OOM 归因完整（`OOMKilled` + exit code + 终止时间 + 重启数）。docker compose 下 rcoder 创建的容器是 `auto_remove=true`：容器退出即被 Docker 删除，此时返回 `phase=NotFound` 且**不带 `last_termination`**——不是查询失败，而是容器连同其终止记录已不存在（Docker 不保留已删除容器的退出历史）。该模式下请把 `alive=false` / `phase=NotFound` 当作容器已消失处理，不要期待 OOM 归因。"
+    description = "只查一个容器（k8s 单 Pod GET / docker inspect+events），**容器被 OOM 杀掉后仍可查询**——数据源在运行时侧，不在容器内。\n\n语义红线：`last_termination=null` 表示从未终止过；`is_oom` 由 `reason==OOMKilled` 判定（**不**用 exit_code==137 推断，liveness SIGKILL 同样给 137）；`last_oom_at` 非 OOM 时为 null。`pod_uid` 变化 = 容器被删除重建（计数归零）。\n\n默认 3s 缓存；`fresh=true` 强制直读。k8s 用 `lastState.terminated.finishedAt` 作为最近一次重启时间；docker 用 `die` 事件时间（`State` 字段在运行中会被重置，靠事件补历史）。\n\n**能力差异（务必按部署模式解读）**：k8s 下 OOM 归因完整（`OOMKilled` + exit code + 终止时间 + 重启数），且容器 OOM 后由 kubelet 自动重启。docker compose 下 rcoder 创建的容器是 `auto_remove=true` 且无 restart policy：**容器退出即被删除、不会自动重启**，需要业务侧检测 `phase=NotFound` 后主动 `/computer/pod/ensure` 重建。此时 `last_termination` 仍会尽量从**Docker daemon 的事件历史**还原（`oom` 事件 → `reason=OOMKilled`；`die` 事件 → exit code 与终止时间），但受事件回放窗口限制（最近 256 条 / 1 小时），超出窗口则返回 null。"
 )]
 #[instrument(skip(state))]
 pub async fn computer_pod_health(
@@ -136,13 +136,27 @@ pub async fn computer_pod_health(
     let container =
         super::resources::locate_container(&state, &target, params.user_id.as_deref()).await?;
     let Some(container) = container else {
-        // 容器不存在不是错误：`data = null`，前端据此显示"未运行"
+        // 容器不存在不是错误，但仍要尽量回答"它是怎么没的"：
+        // docker 模式下 rcoder 创建的容器 auto_remove=true，容器退出即被
+        // 删除，inspect 无从查询——但 **daemon 侧的事件历史仍在**，其中
+        // `oom` 事件是 Docker 专为 cgroup OOM 发出的（比 exitCode 可靠：
+        // 137 同样来自 SIGKILL）。所以这里再问一次运行时：容器没了，
+        // 但"最近一次终止"可能还能从事件还原。
         info!(
             event = "pod_health.container_absent",
+            identifier = %target.identifier,
             user_id = ?params.user_id,
             pod_id = ?params.pod_id,
-            "container not found"
+            "container not found, probing termination history"
         );
+        let runtime = state.runtime().clone();
+        let history = runtime
+            .container_termination_history(&target.identifier)
+            .await
+            .unwrap_or_else(|e| {
+                debug!(event = "pod_health.history_failed", error = %e, "history probe failed");
+                None
+            });
         return Ok(HttpResult::success(PodHealthResponse {
             health: container_runtime_api::ContainerHealth {
                 // 目标解析成功但容器不存在：名字仍然填上（前端要显示"是哪个
@@ -152,11 +166,16 @@ pub async fn computer_pod_health(
                 phase: "NotFound".to_string(),
                 ready: false,
                 restart_count: 0,
-                last_termination: None,
-                oom_killed_last: false,
-                last_oom_at: None,
+                oom_killed_last: history.as_ref().is_some_and(|h| h.is_oom),
+                last_oom_at: history
+                    .as_ref()
+                    .and_then(|h| h.finished_at)
+                    .filter(|_| history.as_ref().is_some_and(|h| h.is_oom)),
+                last_termination: history,
                 waiting_reason: None,
-                detail: Some("container not found".to_string()),
+                detail: Some(
+                    "container not found (docker: already removed by auto_remove)".to_string(),
+                ),
                 sampled_at: chrono::Utc::now(),
                 source: "none".to_string(),
                 pod_uid: None,
