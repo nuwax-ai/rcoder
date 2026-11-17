@@ -57,7 +57,9 @@ impl WorkspaceRuntime for KubernetesRuntime {
         use crate::runtime::k8s_pvc::K8sPvcOps;
         const TTL: std::time::Duration = std::time::Duration::from_secs(30);
         let cache_key = format!("{service_type}/{identifier}");
-        if let Some((exists, at)) = self.workspace_exists_cache.read().await.get(&cache_key) {
+        if let Some((exists, state, at)) =
+            self.workspace_exists_cache.read().await.get(&cache_key)
+        {
             if at.elapsed() < TTL {
                 return Ok(*exists);
             }
@@ -73,12 +75,111 @@ impl WorkspaceRuntime for KubernetesRuntime {
                     "workspace_pvc_exists: get PVC '{pvc_name}' failed: {e}"
                 ))
             })?;
+        let state = self
+            .read_migration_annotation(&pvc_name)
+            .await
+            .unwrap_or(shared_types::WorkspaceMigrationState::NotMigrated);
         self.workspace_exists_cache
             .write()
             .await
-            .insert(cache_key, (exists, std::time::Instant::now()));
+            .insert(
+                cache_key,
+                (exists, state, std::time::Instant::now()),
+            );
         Ok(exists)
     }
+
+    /// 迁移状态（PVC annotation, 30s TTL 缓存——与 exists 同 cache 同口径,
+    /// 一次 GET 同时得两个判据; annotation 缺失/无法识别 → NotMigrated）。
+    async fn workspace_migration_state(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<shared_types::WorkspaceMigrationState> {
+        use crate::runtime::k8s_pvc::K8sPvcOps;
+        const TTL: std::time::Duration = std::time::Duration::from_secs(30);
+        let cache_key = format!("{service_type}/{identifier}");
+        if let Some((_, state, at)) =
+            self.workspace_exists_cache.read().await.get(&cache_key)
+        {
+            if at.elapsed() < TTL {
+                return Ok(*state);
+            }
+        }
+        let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
+        let state = if self.pvcs().get_opt(&pvc_name).await.ok().flatten().is_some() {
+            self.read_migration_annotation(&pvc_name)
+                .await
+                .unwrap_or(shared_types::WorkspaceMigrationState::NotMigrated)
+        } else {
+            shared_types::WorkspaceMigrationState::NotMigrated
+        };
+        Ok(state)
+    }
+
+    /// 翻迁移状态（patch PVC annotation; NotMigrated = 移除 annotation）。
+    /// 成功后即时写缓存（否则 30s TTL 窗口内判据滞后——cutover 后首个
+    /// 请求可能仍走共享卷）。PVC 不存在 → NotFound。
+    async fn set_workspace_migration_state(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        state: shared_types::WorkspaceMigrationState,
+    ) -> ContainerRuntimeResult<()> {
+        use crate::runtime::k8s_pvc::K8sPvcOps;
+        let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
+        let existing = self
+            .pvcs()
+            .get_opt(&pvc_name)
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("get PVC '{pvc_name}': {e}")))?
+            .ok_or_else(|| {
+                ContainerRuntimeError::ContainerNotFound(format!(
+                    "PVC '{pvc_name}' not found; run phase-a before flipping migration state"
+                ))
+            })?;
+        let uid = existing.metadata.uid.clone().ok_or_else(|| {
+            ContainerRuntimeError::Conflict(format!("PVC '{pvc_name}' has no UID"))
+        })?;
+        let rv = existing.metadata.resource_version.clone().ok_or_else(|| {
+            ContainerRuntimeError::Conflict(format!("PVC '{pvc_name}' has no resourceVersion"))
+        })?;
+        let annotations = match state.as_annotation() {
+            Some(value) => serde_json::json!({
+                shared_types::WORKSPACE_MIGRATION_ANNOTATION: value
+            }),
+            None => serde_json::json!({}),
+        };
+        let patch = serde_json::json!({
+            "metadata": {"uid": uid, "resourceVersion": rv, "annotations": annotations}
+        });
+        self.pvcs()
+            .patch(&pvc_name, &kube::api::PatchParams::default(), &kube::api::Patch::Merge(&patch))
+            .await
+            .map_err(|e| match &e {
+                kube::Error::Api(response) if response.code == 404 => {
+                    ContainerRuntimeError::ContainerNotFound(format!("PVC '{pvc_name}' vanished"))
+                }
+                kube::Error::Api(response) if response.code == 409 => {
+                    ContainerRuntimeError::Conflict(format!(
+                        "PVC '{pvc_name}' changed concurrently; retry"
+                    ))
+                }
+                other => ContainerRuntimeError::K8sError(format!(
+                    "patch PVC '{pvc_name}' migration state: {other}"
+                )),
+            })?;
+        // 即时写缓存: cutover 后首个请求就要按新判据路由
+        self.workspace_exists_cache
+            .write()
+            .await
+            .insert(
+                format!("{service_type}/{identifier}"),
+                (true, state, std::time::Instant::now()),
+            );
+        Ok(())
+    }
+
 
     /// 枚举某 service_type 的所有 per-app PVC，从 PVC 名反解 identifier（app_id）。
     ///
@@ -132,12 +233,18 @@ impl WorkspaceRuntime for KubernetesRuntime {
         // 缓存即时失效: PVC 此刻必存在, 写 true——否则刚创建的 volume 在
         // workspace_pvc_exists 的 30s TTL 窗口内仍可能读到 false（新用户
         // 首个文件请求会落本地共享卷读到空数据）。
+        use crate::runtime::k8s_pvc::K8sPvcOps;
+        let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
+        let state = self
+            .read_migration_annotation(&pvc_name)
+            .await
+            .unwrap_or(shared_types::WorkspaceMigrationState::NotMigrated);
         self.workspace_exists_cache
             .write()
             .await
             .insert(
                 format!("{service_type}/{identifier}"),
-                (true, std::time::Instant::now()),
+                (true, state, std::time::Instant::now()),
             );
         Ok(())
     }
@@ -200,5 +307,59 @@ impl WorkspaceRuntime for KubernetesRuntime {
         // 委派 K8sPvcOps::resize_app_pvc（读当前值→比较→patch/事实拒绝）。
         // trait 方法默认 no-op, Docker 不覆盖（bind 目录无容量语义）。
         K8sPvcOps::resize_app_pvc(self, app_id, new_size).await
+    }
+}
+
+impl KubernetesRuntime {
+    /// per-agent 卷判据的**同步**版（best-effort, 供 replacement 等同步构造
+    /// 路径）：只读 30s TTL 缓存, 未命中/不确定 → false（保守共享路径）。
+    /// 权威判定在 async create 编排（查 PVC annotation, 见
+    /// k8s_agent_create 的 per_agent_volume 计算）。
+    pub(crate) fn cached_per_agent_volume(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> bool {
+        if !matches!(
+            service_type,
+            ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject
+        ) {
+            return false;
+        }
+        // subvolume 变体无 migrated 概念: 开关开即 per-agent
+        if shared_types::per_agent_pvc_enabled() {
+            return true;
+        }
+        if !shared_types::per_agent_rbd_enabled() {
+            return false;
+        }
+        match self.workspace_exists_cache.try_read() {
+            Ok(cache) => matches!(
+                cache.get(&format!("{service_type}/{identifier}")),
+                Some((true, shared_types::WorkspaceMigrationState::Migrated, sampled))
+                    if sampled.elapsed() < std::time::Duration::from_secs(30)
+            ),
+            Err(_) => false,
+        }
+    }
+
+    /// 读 PVC 的迁移 annotation（无法识别的值 → NotMigrated）。私有 helper
+    /// （非 WorkspaceRuntime 接口——内部实现细节）。
+    async fn read_migration_annotation(
+        &self,
+        pvc_name: &str,
+    ) -> ContainerRuntimeResult<shared_types::WorkspaceMigrationState> {
+        let pvc = self
+            .pvcs()
+            .get(pvc_name)
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("get PVC '{pvc_name}': {e}")))?;
+        let value = pvc
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(shared_types::WORKSPACE_MIGRATION_ANNOTATION))
+            .map(String::as_str);
+        Ok(shared_types::WorkspaceMigrationState::from_annotation(value))
     }
 }

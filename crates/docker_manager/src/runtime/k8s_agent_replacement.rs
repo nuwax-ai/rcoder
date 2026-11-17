@@ -348,7 +348,12 @@ impl KubernetesRuntime {
             ));
         }
         let requested = workspace(
-            &self.build_agent_pod_spec(identifier, &service_type, params)?,
+            &self.build_agent_pod_spec(
+                identifier,
+                &service_type,
+                params,
+                self.cached_per_agent_volume(identifier, &service_type),
+            )?,
             None,
         )?;
         let labels = super::k8s_service::build_selector_labels(identifier, &service_type);
@@ -381,7 +386,12 @@ impl KubernetesRuntime {
             let mut workspace_params = params.clone();
             workspace_params.user_id = Some(creator.clone());
             workspace(
-                &self.build_agent_pod_spec(identifier, &service_type, &workspace_params)?,
+                &self.build_agent_pod_spec(
+                    identifier,
+                    &service_type,
+                    &workspace_params,
+                    self.cached_per_agent_volume(identifier, &service_type),
+                )?,
                 None,
             )?
         } else {

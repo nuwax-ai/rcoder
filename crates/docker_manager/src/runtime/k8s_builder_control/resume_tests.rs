@@ -524,7 +524,7 @@ pub(super) async fn fixture(
         .service_type(ServiceType::UserappBuilder)
         .build();
     let mut spec = runtime
-        .build_agent_pod_spec("app", &ServiceType::UserappBuilder, &params)
+        .build_agent_pod_spec("app", &ServiceType::UserappBuilder, &params, false)
         .expect("spec");
     let env = spec.containers[0].env.get_or_insert_default();
     env.retain(|entry| entry.name != "APP_CLI_DEPLOY_TOKEN");

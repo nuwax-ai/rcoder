@@ -900,6 +900,34 @@ pub trait WorkspaceRuntime: Send + Sync {
         Ok(false)
     }
 
+    /// per-agent workspace 的迁移状态（PVC annotation 投影）。
+    ///
+    /// 判据层三态的真源: PVC 不存在 = NotMigrated; 存在但无/无法识别
+    /// annotation = NotMigrated(fail-safe); `migrated` = Migrated。
+    /// K8s 实现带 30s TTL 缓存（与 workspace_pvc_exists 同口径）;
+    /// Docker 恒 NotMigrated。
+    async fn workspace_migration_state(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<shared_types::WorkspaceMigrationState> {
+        Ok(shared_types::WorkspaceMigrationState::NotMigrated)
+    }
+
+    /// 翻迁移状态（cutover 落 / 回滚撤）。K8s: patch PVC annotation
+    /// （UID+resourceVersion 条件化, 与 resize 同款 CAS 语义）; PVC 不存在
+    /// 报 NotFound（未 phase-a 不能 cutover）。Docker: 不支持。
+    async fn set_workspace_migration_state(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+        _state: shared_types::WorkspaceMigrationState,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "workspace migration state is unsupported by this runtime".to_string(),
+        ))
+    }
+
     /// 确保 per-agent workspace PVC 存在 (幂等: 已存在则复用, 不存在则创建)。
     ///
     /// K8s: 调 `ensure_workspace_pvc`; Docker: no-op。

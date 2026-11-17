@@ -117,6 +117,7 @@ pub fn create_router(
         .merge(computer::computer_routes(state.clone()))
         .merge(devcomputer::devcomputer_routes(state.clone()))
         .merge(userapp_proxy::proxy_api_routes(state.clone()))
+        .merge(handler::migration_api::routes().with_state(state.clone()))
         .merge(agent_mgmt::agent_mgmt_routes(state.clone()))
         .merge(app_manager_routes(&state))
         .merge(crate::userapp_builder::adoption::routes().with_state(state.clone()))

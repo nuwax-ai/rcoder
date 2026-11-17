@@ -6,6 +6,7 @@
 //! 与 k8s_agent_query.rs（读）、k8s_agent_pod.rs（stop/restart/sync/cleanup 变更）正交。
 
 use container_runtime_api::{
+    WorkspaceRuntime,
 
 
     ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult, ContainerRuntimeStatus,
@@ -87,16 +88,26 @@ impl KubernetesRuntime {
             self.fence_agent_snapshot(&previous).await?;
         }
 
+        // per_agent_volume 决策(async): pod_id=None 且开关开; RBD 变体额外
+        // 要求 migrated 标记(预同步期 PVC 已存在但用户仍在共享卷写, agent
+        // 此刻挂 RBD 旧副本会丢写); 族限定 computer(Userapp 域有自己的卷逻辑)。
+        let per_agent_volume = params.pod_id.is_none()
+            && (shared_types::per_agent_pvc_enabled()
+                || (shared_types::per_agent_rbd_enabled()
+                    && matches!(
+                        service_type,
+                        ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject
+                    )
+                    && matches!(
+                        self.workspace_migration_state(identifier, &service_type).await?,
+                        shared_types::WorkspaceMigrationState::Migrated
+                    )));
         // 阶段2 per-agent PVC (CephFS subvolume, ceph-csi 服务端配额, 绕开 client setfattr):
         // 仅隔离容器 (pod_id=None, project/user 级) 且 per-agent 开关开启走 per-agent PVC。
         // 两变体: per_agent_pvc(subvolume, 挂根聚合读) / per_agent_rbd(RWO 块盘, 转发层读,
         // 二者互斥 fail-fast 见 FeatureFlags::init)。共享容器 (pod_id=Some) 或开关全关 → 共享 PVC。
         // UserappBuilder 天然 per-app PVC(不受灰度开关限制),总是 ensure。
-        if pod_id.is_none()
-            && (shared_types::per_agent_pvc_enabled()
-                || shared_types::per_agent_rbd_enabled()
-                || matches!(service_type, ServiceType::UserappBuilder))
-        {
+        if per_agent_volume || matches!(service_type, ServiceType::UserappBuilder) {
             if params.retained_storage.is_some() {
                 // recover_retained_storage already verified exact UID and ownership.
             } else if let Some(context) = &params.execution_context {
@@ -197,7 +208,8 @@ impl KubernetesRuntime {
         } else {
             None
         };
-        let mut pod_spec = self.build_agent_pod_spec(identifier, &service_type, &params)?;
+        let mut pod_spec =
+            self.build_agent_pod_spec(identifier, &service_type, &params, per_agent_volume)?;
         if let Some(credential) = credential {
             Self::install_builder_credential(&mut pod_spec, credential)?;
         }
@@ -285,6 +297,7 @@ impl KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
         params: &ContainerCreateParams,
+        per_agent_volume: bool,
     ) -> ContainerRuntimeResult<PodSpec> {
         let project_id_val = params.project_id.clone().unwrap_or_default();
         let user_id_val = params.user_id.clone().unwrap_or_default();
@@ -318,8 +331,12 @@ impl KubernetesRuntime {
         // workspace PVC:
         // - per-agent (pod_id=None + 任一 per-agent 开关): per-agent PVC (subPath=None)
         // - 共享 (pod_id=Some 或开关全关): 共享 PVC + subPath (选项A / 回滚)
-        let per_agent = params.pod_id.is_none()
-            && (shared_types::per_agent_pvc_enabled() || shared_types::per_agent_rbd_enabled());
+        // ⚠️ per_agent_rbd 还要求 migrated 标记: phase-a 预同步期 PVC 已存在
+        // 但用户仍在共享卷写——此刻 agent 重建若挂 RBD 旧副本, 预同步后的写
+        // 全丢。未 migrated → 继续共享路径, 等 cutover 翻标记后下次重建才切。
+        // per_agent_volume 由调用方算定传入: RBD 变体的 migrated 查询是 async
+        // (PVC annotation), 本函数是纯同步 PodSpec 构造, 不能在此 await。
+        let per_agent = per_agent_volume;
         let (workspace_pvc, workspace_sub_path): (String, Option<String>) = if per_agent {
             (self.workspace_pvc_name(identifier, service_type)?, None)
         } else {

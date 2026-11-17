@@ -77,6 +77,47 @@ pub fn per_agent_rbd_enabled() -> bool {
     FeatureFlags::get().per_agent_rbd
 }
 
+/// per-agent workspace 的迁移状态（PVC annotation 投影, 判据层单一事实源）。
+///
+/// 两阶段迁移的状态机:
+/// ```text
+/// (无 PVC) ──phase-a──► PVC 存在 + NotMigrated ──cutover──► PVC 存在 + Migrated
+///                              │                                │
+///                        用户照常共享卷读写               agent 挂 RBD + 请求转发
+///                        (预同步期双份共存)               (共享卷保留作回滚)
+/// ```
+/// `Migrated` 是 agent 卷选择与转发判据的**唯一**开关——不是"PVC 存在"
+/// (预同步期 PVC 已存在但用户仍在共享卷, agent 重建若挂 RBD 旧副本即丢写)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceMigrationState {
+    /// 未迁移: PVC 可能存在(phase-a 预同步中)或不存在; 用户走共享卷。
+    NotMigrated,
+    /// 已迁移: cutover 完成; agent 挂 RBD, 请求走转发层。
+    Migrated,
+}
+
+impl WorkspaceMigrationState {
+    /// PVC annotation 值词表（持久化形态）。
+    pub fn as_annotation(self) -> Option<&'static str> {
+        match self {
+            Self::NotMigrated => None, // 不写 annotation = 未迁移（缺省语义）
+            Self::Migrated => Some("migrated"),
+        }
+    }
+
+    /// 从 PVC annotation 值解析; 无法识别的值按 [`Self::NotMigrated`]（fail-safe:
+    /// 认不出的一律按未迁移, 不会把用户误切到 RBD）。
+    pub fn from_annotation(value: Option<&str>) -> Self {
+        match value {
+            Some("migrated") => Self::Migrated,
+            _ => Self::NotMigrated,
+        }
+    }
+}
+
+/// per-agent workspace PVC 的迁移状态 annotation key。
+pub const WORKSPACE_MIGRATION_ANNOTATION: &str = "rcoder.io/workspace-migration";
+
 // Userapp K8s 永远 per-app (代码不读开关, 无分裂);
 // FeatureFlags.userapp_per_app_pvc 字段保留供启动日志 + chart cephfs-root 派生标记。
 
@@ -475,4 +516,39 @@ pub const BUILTIN_AGENT_IDS: &[&str] = &[DEFAULT_AGENT_ID, "nuwaxcode"];
 /// 判断是否为内置 agent
 pub fn is_builtin_agent(agent_id: &str) -> bool {
     BUILTIN_AGENT_IDS.contains(&agent_id)
+}
+
+#[cfg(test)]
+mod migration_state_tests {
+    use super::*;
+
+    #[test]
+    fn annotation_roundtrip() {
+        assert_eq!(
+            WorkspaceMigrationState::Migrated.as_annotation(),
+            Some("migrated")
+        );
+        assert_eq!(WorkspaceMigrationState::NotMigrated.as_annotation(), None);
+    }
+
+    #[test]
+    fn from_annotation_fails_safe_to_not_migrated() {
+        // 认不出的一律按未迁移——不会把用户误切到 RBD
+        assert_eq!(
+            WorkspaceMigrationState::from_annotation(Some("migrated")),
+            WorkspaceMigrationState::Migrated
+        );
+        assert_eq!(
+            WorkspaceMigrationState::from_annotation(None),
+            WorkspaceMigrationState::NotMigrated
+        );
+        assert_eq!(
+            WorkspaceMigrationState::from_annotation(Some("MIGRATED")),
+            WorkspaceMigrationState::NotMigrated
+        );
+        assert_eq!(
+            WorkspaceMigrationState::from_annotation(Some("garbage")),
+            WorkspaceMigrationState::NotMigrated
+        );
+    }
 }

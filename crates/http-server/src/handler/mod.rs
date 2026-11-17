@@ -2,6 +2,7 @@
 mod agent_cancel_handler;
 pub mod agent_install_strategy;
 pub mod agent_mgmt;
+pub mod migration_api;
 mod agent_session_notification;
 mod agent_status_handler;
 mod agent_stop_handler;

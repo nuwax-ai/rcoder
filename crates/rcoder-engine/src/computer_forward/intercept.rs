@@ -92,22 +92,26 @@ pub async fn computer_rbd_intercept(
             return (axum::http::StatusCode::BAD_REQUEST, "invalid user identifier").into_response();
         }
     };
-    // 混住判据: PVC 存在才转发（不存在 = 共享用户 → 本地直读）
-    let is_rbd_user = match state
+    // 混住判据: PVC 存在 **且 migrated 标记生效**才转发。
+    // 只有 PVC 存在(phase-a 预同步中/已切流未完成)不够——那期间用户仍在
+    // 共享卷读写, 转发会把请求送进 RBD 旧副本(读到过时数据)。
+    let migration_state = match state
         .runtime()
-        .workspace_pvc_exists(&target.user_id, &ServiceType::ComputerAgentRunner)
+        .workspace_migration_state(&target.user_id, &ServiceType::ComputerAgentRunner)
         .await
     {
-        Ok(exists) => exists,
+        Ok(state) => state,
         Err(error) => {
             tracing::warn!(
                 user_id = %target.user_id,
                 error = %error,
-                "[COMPUTER_FORWARD] mix check failed, pass through"
+                "[COMPUTER_FORWARD] migration state check failed, pass through"
             );
             return next.run(req).await;
         }
     };
+    let is_rbd_user =
+        migration_state == shared_types::WorkspaceMigrationState::Migrated;
     if decide(true, true, true, is_rbd_user) == InterceptDecision::PassThrough {
         return next.run(req).await;
     }
