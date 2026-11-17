@@ -620,6 +620,10 @@ pub struct E2bSandboxConfig {
     pub envd_init_retries: u32,
     /// create 响应里的 domain 字段（SDK 侧主要用 E2B_DOMAIN，此值用于展示）。
     pub public_domain: String,
+    /// 数据面端口白名单：路径/头路由只代理这些沙箱内端口
+    /// （49983 envd / 8787 CDP / 8788 MCP）。任意端口默认 403，防 SSRF 与
+    /// 任意端口转发；模板需要新端口须显式加白。
+    pub allowed_ports: Vec<i32>,
     pub api_keys: Vec<E2bSandboxApiKeySeed>,
     pub templates: Vec<E2bSandboxTemplateSeed>,
 }
@@ -665,6 +669,7 @@ impl Default for E2bSandboxConfig {
             create_ready_timeout_seconds: 90,
             envd_init_retries: 5,
             public_domain: String::new(),
+            allowed_ports: vec![49983, 8787, 8788],
             api_keys: Vec::new(),
             templates: Vec::new(),
         }

@@ -185,7 +185,7 @@ async fn build_sandbox_deps(
                 shutdown_rx,
                 config.e2b_sandbox.reaper_interval_seconds,
             ));
-            router::sandbox::SandboxDeps::new(manager)
+            router::sandbox::SandboxDeps::new(manager, config.e2b_sandbox.allowed_ports.clone())
         }
         Err(error) => {
             tracing::error!("e2b_sandbox 装配失败（fail-fast 禁止静默降级）: {error}");

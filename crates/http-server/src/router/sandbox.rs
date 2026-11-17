@@ -26,6 +26,8 @@ use crate::handler::sandbox as sbx_handler;
 pub struct SandboxDeps {
     #[cfg(feature = "kubernetes")]
     pub manager: Option<Arc<SandboxManager>>,
+    /// 数据面端口白名单（M1.5）；空 = 不放行任何端口。
+    pub allowed_ports: Vec<i32>,
 }
 
 impl SandboxDeps {
@@ -40,8 +42,11 @@ impl SandboxDeps {
         }
     }
     #[cfg(feature = "kubernetes")]
-    pub fn new(manager: Arc<SandboxManager>) -> Self {
-        Self { manager: Some(manager) }
+    pub fn new(manager: Arc<SandboxManager>, allowed_ports: Vec<i32>) -> Self {
+        Self {
+            manager: Some(manager),
+            allowed_ports,
+        }
     }
 }
 
