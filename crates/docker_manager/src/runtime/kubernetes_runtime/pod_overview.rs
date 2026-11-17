@@ -492,6 +492,8 @@ fn terminated_finished_at(
         .or_else(|| cs.last_state.as_ref().and_then(|s| s.terminated.as_ref()))
         .and_then(|t| t.finished_at.as_ref())
         .and_then(|t| chrono::DateTime::from_timestamp_millis(t.0.as_millisecond()))
+        // k8s 未设置时可能给零值（0001-01-01）；只接受真实时间
+        .filter(|dt| dt.timestamp() > 0)
 }
 
 /// 事件排序键：解析 RFC3339 为时间值；解析失败 → 最小值（排最后）。
@@ -615,7 +617,8 @@ impl super::KubernetesRuntime {
             .as_ref()
             .and_then(|st| st.running.as_ref())
             .and_then(|r| r.started_at.as_ref())
-            .and_then(|t| chrono::DateTime::from_timestamp_millis(t.0.as_millisecond()));
+            .and_then(|t| chrono::DateTime::from_timestamp_millis(t.0.as_millisecond()))
+            .filter(|dt| dt.timestamp() > 0);
 
         Ok(Some(ContainerHealth {
             container_name: identifier.to_string(),

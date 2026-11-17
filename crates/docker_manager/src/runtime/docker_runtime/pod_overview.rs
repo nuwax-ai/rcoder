@@ -395,7 +395,8 @@ impl super::DockerRuntime {
             .filter(|s| s.running.unwrap_or(false))
             .and_then(|s| s.started_at.as_ref())
             .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t.to_string()).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .filter(|dt| dt.timestamp() > 0);
 
         Ok(Some(ContainerHealth {
             container_name: name.to_string(),
@@ -811,10 +812,14 @@ fn docker_health(state: Option<&ContainerState>, events: &[&RawEvent]) -> PodHea
                 )
             })
             .or_else(|| {
+                // Docker 对**运行中**容器返回 State.FinishedAt =
+                // "0001-01-01T00:00:00Z"（零值，不是 None）——不过滤会把
+                // "从未终止"显示成 0001 年。
                 state
                     .and_then(|s| s.finished_at.as_ref())
                     .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t.to_string()).ok())
                     .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .filter(|dt| dt.timestamp() > 0)
             }),
         waiting_reason: None, // docker 无 CrashLoopBackOff 概念
         detail: state
