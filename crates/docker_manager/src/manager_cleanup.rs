@@ -74,6 +74,11 @@ impl DockerManager {
             .await
             .map_err(|e| DockerError::ConnectionError(format!("list containers for reap: {e}")))?;
 
+        info!(
+            listed = listed.len(),
+            retention_secs = retention,
+            "reap: scanning stopped agent containers"
+        );
         let mut reclaimed = 0u32;
         for container in listed {
             let Some(id) = container.id else { continue };
@@ -84,6 +89,7 @@ impl DockerManager {
                 Some("exited") | Some("dead") | Some("created")
             );
             if !terminal {
+                debug!(container_id = %id, ?state, "reap: not terminal, skip");
                 continue;
             }
             // FinishedAt 只在 inspect 里有
@@ -109,6 +115,7 @@ impl DockerManager {
                 continue;
             };
             let age = chrono::Utc::now().timestamp() - finished_at;
+            debug!(container_id = %id, age, retention, "reap: candidate age");
             if age < retention {
                 continue;
             }
