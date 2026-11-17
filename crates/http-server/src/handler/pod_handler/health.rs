@@ -222,12 +222,33 @@ pub async fn computer_pod_health(
         })?;
 
     let Some(health) = health else {
+        // 登记表仍认为容器在、但运行时侧已查不到（docker auto_remove 删除的
+        // 典型窗口）。与"locate 就失败"同样处理：从事件历史尽量还原
+        // "它是怎么没的"，而不是只回一句"消失了"。
+        let history = runtime
+            .container_termination_history(&container.container_name)
+            .await
+            .unwrap_or_else(|e| {
+                debug!(event = "pod_health.history_failed", error = %e, "history probe failed");
+                None
+            });
+        let is_oom = history.as_ref().is_some_and(|h| h.is_oom);
         return Ok(HttpResult::success(PodHealthResponse {
             health: container_runtime_api::ContainerHealth {
                 container_name: container.container_name.clone(),
                 alive: false,
                 phase: "NotFound".to_string(),
-                detail: Some("container disappeared between locate and inspect".to_string()),
+                oom_killed_last: is_oom,
+                last_oom_at: if is_oom {
+                    history.as_ref().and_then(|h| h.finished_at)
+                } else {
+                    None
+                },
+                last_termination: history,
+                detail: Some(
+                    "container disappeared between locate and inspect (docker auto_remove)"
+                        .to_string(),
+                ),
                 source: "none".to_string(),
                 sampled_at: chrono::Utc::now(),
                 ..Default::default()
