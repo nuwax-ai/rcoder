@@ -799,7 +799,7 @@ impl SandboxStore for PgSandboxStore {
                 .bind(&record.name)
                 .bind(&record.pvc_name)
                 .bind(&record.storage_class)
-                .bind(record.size_gib as i64)
+                .bind(record.size_gib)
                 .bind(record.created_at_us)
                 .exec(tx)
                 .await
@@ -919,7 +919,7 @@ fn volume_record(row: SandboxVolume) -> Result<SandboxVolumeRecord, SandboxStore
         name: row.name,
         pvc_name: row.pvc_name,
         storage_class: row.storage_class,
-        size_gib: row.size_gib as i32,
+        size_gib: row.size_gib,
         created_at_us: row.created_at_us,
         updated_at_us: row.updated_at_us,
         deleted_at_us: row.deleted_at_us,

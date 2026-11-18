@@ -546,7 +546,8 @@ pub(crate) struct SandboxVolume {
     pub name: String,
     pub pvc_name: String,
     pub storage_class: String,
-    pub size_gib: i64,
+    /// 列是 INTEGER——模型必须 i32，i64 会让 Toasty 读回时类型断言 panic。
+    pub size_gib: i32,
     pub created_at_us: i64,
     pub updated_at_us: i64,
     pub deleted_at_us: Option<i64>,
