@@ -618,6 +618,10 @@ const INLINE_SECRET_KEYS: &[&str] = &[
 /// 用户命令不可区分。既然脚本文本**无法逐项确认安全**（第三轮复审实测
 /// `sh -c "curl -u alice:hunter2 …"` 不含任何已知凭据特征，仍然泄漏密码），
 /// 默认整体遮盖，只对下列已知服务名放行。
+///
+/// cfg 与唯一消费方 `redact_cmdline` 对齐：非 Linux 生产构建不编译
+/// （否则在 macOS 等目标上因无消费方触发 dead_code）。
+#[cfg(any(target_os = "linux", test))]
 const SAFE_SCRIPT_NAMES: &[&str] = &[
     "openui-mcp",
     "nuwax-ask-question-mcp",
@@ -830,11 +834,6 @@ fn redact_cmdline(args: &[String]) -> String {
         out.push(arg.clone());
     }
     out.join(" ").chars().take(120).collect()
-}
-
-#[cfg(not(any(target_os = "linux", test)))]
-fn redact_cmdline(_args: &[String]) -> String {
-    String::new()
 }
 
 /// 角色分类(纯函数,跨平台可测)。
@@ -1062,7 +1061,7 @@ pub fn agent_executions(
 pub fn sample_container_processes_and_agents() -> (Vec<ProcessRow>, ProcessGroups, AgentScan) {
     #[cfg(not(target_os = "linux"))]
     {
-        return (Vec::new(), ProcessGroups::default(), AgentScan::default());
+        (Vec::new(), ProcessGroups::default(), AgentScan::default())
     }
     #[cfg(target_os = "linux")]
     {

@@ -115,18 +115,18 @@ pub fn resolve_target(
         };
     }
     // ② GET query userId（现有 Java 流量兜底; 解析零缓冲）
-    if let Some(query) = raw_query {
-        if let Some(raw) = query_param(query, "userId") {
-            let decoded = percent_decode(&raw);
-            return if valid_identifier(&decoded) {
-                TargetResolution::Found(ComputerForwardTarget {
-                    user_id: decoded,
-                    source: TargetSource::Query,
-                })
-            } else {
-                TargetResolution::Invalid
-            };
-        }
+    if let Some(query) = raw_query
+        && let Some(raw) = query_param(query, "userId")
+    {
+        let decoded = percent_decode(&raw);
+        return if valid_identifier(&decoded) {
+            TargetResolution::Found(ComputerForwardTarget {
+                user_id: decoded,
+                source: TargetSource::Query,
+            })
+        } else {
+            TargetResolution::Invalid
+        };
     }
     // ③ static 路径段: /api/computer/static/{user_id}/...（分享链路, 无 header 场景）
     match static_path_user_id(path) {
@@ -148,12 +148,13 @@ fn percent_decode(value: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
-                out.push(byte);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&value[i + 1..i + 3], 16)
+        {
+            out.push(byte);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -176,7 +177,7 @@ fn valid_identifier(value: &str) -> bool {
 
 /// 极简 query 参数提取（percent-decoding 不做——user_id 词表内无编码字符;
 /// 其他参数原样透传, 不在此重写 URL）。
-fn query_param<'a>(query: &'a str, key: &str) -> Option<String> {
+fn query_param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
         (k == key && !v.is_empty()).then(|| v.to_string())
@@ -199,13 +200,9 @@ fn path_matches(tmpl: &str, path: &str) -> bool {
         match (t.peek(), p.peek()) {
             (None, None) => return true,
             (Some(&tt), _) if tt.starts_with('{') && tt.contains("*rest") => return true,
-            (Some(&tt), Some(&pp)) => {
-                if tt.starts_with('{') || tt == pp {
-                    t.next();
-                    p.next();
-                } else {
-                    return false;
-                }
+            (Some(&tt), Some(&pp)) if tt.starts_with('{') || tt == pp => {
+                t.next();
+                p.next();
             }
             _ => return false,
         }

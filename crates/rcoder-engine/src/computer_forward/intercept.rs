@@ -155,10 +155,10 @@ async fn forward_to_agent(state: &AppState, user_id: &str, req: Request) -> Resp
     // 毫秒级; 跳过 ensure——ensure 即使命中 pod_cache 也要走锁与状态比对）。
     // 探活兜 readiness 尾窗（phase Running ≠ 8086 已监听, 实测差 ~200ms）;
     // 失败自然落入慢路径 wake。
-    if let Some(addr) = running_agent_addr(state, user_id).await {
-        if let Some(ready_addr) = wait_file_server_ready(&addr, FAST_PATH_PROBE).await {
-            return stream_to_addr(&ready_addr, req).await;
-        }
+    if let Some(addr) = running_agent_addr(state, user_id).await
+        && let Some(ready_addr) = wait_file_server_ready(&addr, FAST_PATH_PROBE).await
+    {
+        return stream_to_addr(&ready_addr, req).await;
     }
     // ② 慢路径: wake（幂等 ensure, ≤WAKE_BUDGET）。
     //

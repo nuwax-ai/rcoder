@@ -9,12 +9,12 @@
 //! 本接口只 GET 一个容器，数据源在运行时侧（k8s API / docker daemon），
 //! **容器死了照样能查**——这是它作为"OOM 监控"通道的关键性质。
 
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 
 use axum::extract::State;
 use serde::{Deserialize, Serialize};
 use shared_types::ServiceType;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, instrument, warn};
 use utoipa::ToSchema;
 
 use crate::router::AppState;

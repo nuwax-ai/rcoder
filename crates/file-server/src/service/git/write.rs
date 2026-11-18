@@ -1835,7 +1835,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        let pinned = filetime::FileTime::from_unix_time(now - 60, 0);
+        let pinned = std::time::UNIX_EPOCH + std::time::Duration::from_secs((now - 60) as u64);
         {
             // 构造旧版形态: 直接改写磁盘 index 的 a.txt 条目 stat 为
             // 钉住的时间 (无 smudge), 再把 index 文件 mtime 钉到同一检查点
@@ -1867,10 +1867,18 @@ mod tests {
             }
             lock.commit().expect("raw commit");
         }
-        filetime::set_file_mtime(repo.index_path(), pinned).expect("pin index mtime");
+        std::fs::set_times(
+            repo.index_path(),
+            std::fs::FileTimes::new().set_modified(pinned),
+        )
+        .expect("pin index mtime");
         // 同秒同长度修改 a.txt, mtime 钉回同一时刻 (stat 字段完全一致)
         std::fs::write(test.0.join("a.txt"), "BBB").expect("modify a");
-        filetime::set_file_mtime(test.0.join("a.txt"), pinned).expect("pin a mtime");
+        std::fs::set_times(
+            test.0.join("a.txt"),
+            std::fs::FileTimes::new().set_modified(pinned),
+        )
+        .expect("pin a mtime");
         // 无关暂存推进 index 时间戳 → 再暂存 a.txt: 必须拾取 BBB
         stage_path(&repo, "b.txt").expect("stage b");
         stage_path(&repo, "a.txt").expect("stage a");
@@ -1899,7 +1907,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        let pinned = filetime::FileTime::from_unix_time(now - 120, 0);
+        let pinned = std::time::UNIX_EPOCH + std::time::Duration::from_secs((now - 120) as u64);
         // 构造旧版零 stat 索引 (mtime=0/size=0), 并钉住 a.txt 与 index 检查点
         {
             let mut index = repo.open_index().expect("open");
@@ -1928,8 +1936,16 @@ mod tests {
             }
             lock.commit().expect("raw commit");
         }
-        filetime::set_file_mtime(repo.index_path(), pinned).expect("pin index");
-        filetime::set_file_mtime(test.0.join("a.txt"), pinned).expect("pin a");
+        std::fs::set_times(
+            repo.index_path(),
+            std::fs::FileTimes::new().set_modified(pinned),
+        )
+        .expect("pin index");
+        std::fs::set_times(
+            test.0.join("a.txt"),
+            std::fs::FileTimes::new().set_modified(pinned),
+        )
+        .expect("pin a");
         // 连续两次显式无变更提交: 第一次刷新 stat 落盘 (checkpoint 早于
         // 文件 mtime 的秒 → 不再 smudge), 第二次命中快路径
         for i in 0..2 {

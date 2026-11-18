@@ -49,7 +49,6 @@ deploy-host = ["shared_types/deploy-host", "docker_manager/deploy-host", "rcoder
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-filetime = { workspace = true }
 http-body-util = { workspace = true }
 toasty = { workspace = true }
 toasty-driver-turso = { workspace = true }

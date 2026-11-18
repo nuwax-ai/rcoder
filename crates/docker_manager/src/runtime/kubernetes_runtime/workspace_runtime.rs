@@ -57,10 +57,10 @@ impl WorkspaceRuntime for KubernetesRuntime {
         use crate::runtime::k8s_pvc::K8sPvcOps;
         const TTL: std::time::Duration = std::time::Duration::from_secs(30);
         let cache_key = format!("{service_type}/{identifier}");
-        if let Some((exists, _, at)) = self.workspace_exists_cache.read().await.get(&cache_key) {
-            if at.elapsed() < TTL {
-                return Ok(*exists);
-            }
+        if let Some((exists, _, at)) = self.workspace_exists_cache.read().await.get(&cache_key)
+            && at.elapsed() < TTL
+        {
+            return Ok(*exists);
         }
         // sampled_at 语义同 migration_state(防旧值覆盖 set_state 的即时写)。
         let sampled_at = std::time::Instant::now();
@@ -100,10 +100,10 @@ impl WorkspaceRuntime for KubernetesRuntime {
         use crate::runtime::k8s_pvc::K8sPvcOps;
         const TTL: std::time::Duration = std::time::Duration::from_secs(30);
         let cache_key = format!("{service_type}/{identifier}");
-        if let Some((_, state, at)) = self.workspace_exists_cache.read().await.get(&cache_key) {
-            if at.elapsed() < TTL {
-                return Ok(*state);
-            }
+        if let Some((_, state, at)) = self.workspace_exists_cache.read().await.get(&cache_key)
+            && at.elapsed() < TTL
+        {
+            return Ok(*state);
         }
         // 单次 GET 同时取 exists + annotation(此前 get_opt 后又全量 GET 同一
         // PVC, 每请求两次 API); miss 后**回写缓存**——此前只读不写导致
@@ -365,10 +365,10 @@ impl KubernetesRuntime {
         sampled_at: std::time::Instant,
     ) {
         let mut cache = self.workspace_exists_cache.write().await;
-        if let Some((_, _, existing_at)) = cache.get(cache_key) {
-            if *existing_at > sampled_at {
-                return; // 期间已有更新写入, 旧查询结果作废
-            }
+        if let Some((_, _, existing_at)) = cache.get(cache_key)
+            && *existing_at > sampled_at
+        {
+            return; // 期间已有更新写入, 旧查询结果作废
         }
         cache.insert(
             cache_key.to_string(),

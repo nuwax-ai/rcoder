@@ -310,13 +310,27 @@ impl KubernetesRuntime {
                         .map(|c| format!("{c:?}"))
                 })
                 .unwrap_or_default();
-            let _ = jobs.delete(&plan.job_name, &DeleteParams::default()).await;
+            // 清理 best-effort：删除失败不改变主结果，但必须可观测
+            // （Job 静默残留会误导后续迁移与排障）。
+            if let Err(e) = jobs.delete(&plan.job_name, &DeleteParams::default()).await {
+                tracing::warn!(
+                    job = %plan.job_name,
+                    error = %e,
+                    "migration sync job cleanup delete failed after job failure"
+                );
+            }
             return Err(ContainerRuntimeError::K8sError(format!(
                 "migration sync job '{}' did not succeed ({reason}): {tail}",
                 plan.job_name
             )));
         }
-        let _ = jobs.delete(&plan.job_name, &DeleteParams::default()).await;
+        if let Err(e) = jobs.delete(&plan.job_name, &DeleteParams::default()).await {
+            tracing::warn!(
+                job = %plan.job_name,
+                error = %e,
+                "migration sync job cleanup delete failed after success"
+            );
+        }
         Ok(())
     }
 }

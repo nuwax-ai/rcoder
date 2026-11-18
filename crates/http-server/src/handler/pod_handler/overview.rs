@@ -210,12 +210,6 @@ async fn snapshot_with_cache(state: &Arc<AppState>) -> Result<(CachedObservation
     Ok((observation, 0))
 }
 
-/// 最近一次终止是否为 OOM（唯一判据是 reason，不看 exit_code——
-/// 137 同样来自 liveness SIGKILL/人工 kill）。
-fn is_oom_reason(reason: Option<&str>) -> bool {
-    reason == Some("OOMKilled")
-}
-
 /// 隐藏的内部 sidecar（与方案 §13 决策 2 一致）。
 const SIDECAR_PREFIXES: &[&str] = &["log-shipper", "log-collector"];
 

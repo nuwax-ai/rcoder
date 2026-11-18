@@ -482,12 +482,14 @@ impl AgentSessionRegistry {
         // 且只在"恰好有写方排队"时触发，属于极难复现的偶发卡死。
         //
         // 也不要在锁内做格式化/分配之外的耗时工作（更不要跨 await 持锁）。
-        let mut staged: Vec<(
+        /// 阶段一 staging 行：`(agent_id, session_id, status, stop_handle)`。
+        type StagedExecution = (
             String,
             String,
             shared_types::AgentStatus,
             Option<Arc<dyn AgentLifecycle>>,
-        )> = Vec::with_capacity(self.agent_info_map.len());
+        );
+        let mut staged: Vec<StagedExecution> = Vec::with_capacity(self.agent_info_map.len());
         for entry in self.agent_info_map.iter() {
             let info = entry.value();
             if !Self::has_session_identity(info) {

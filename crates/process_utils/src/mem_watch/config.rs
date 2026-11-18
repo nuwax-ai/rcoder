@@ -196,12 +196,13 @@ mod tests {
 
     #[test]
     fn effective_limit_prefers_override() {
-        let mut cfg = Config::default();
-        cfg.limit_override = Some(512 * 1024 * 1024);
+        let cfg = Config {
+            limit_override: Some(512 * 1024 * 1024),
+            ..Config::default()
+        };
         assert_eq!(cfg.effective_limit(Some(1 << 30)), Some(512 * 1024 * 1024));
-        cfg.limit_override = None;
         // 非 Linux（macOS 测试机）读不到 cgroup → None；Linux 有限制时返回真实值
-        let _ = cfg.effective_limit(None);
+        let _ = Config::default().effective_limit(None);
     }
 
     #[test]
