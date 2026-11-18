@@ -46,3 +46,5 @@ pub mod userapp_lifecycle;
 // Custom Page 预览权威注册表（PG 实现；Compose 进程内实现在 preview-coordinator crate）。
 #[cfg(feature = "pg")]
 pub mod preview_lifecycle;
+#[cfg(feature = "pg")]
+pub mod sandbox_store;

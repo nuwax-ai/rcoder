@@ -596,3 +596,104 @@ impl DockerConfig {
         )
     }
 }
+
+// ============================================================
+// E2B 兼容沙箱（M1：单副本；启用需 kubernetes + pg）
+// ============================================================
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct E2bSandboxConfig {
+    /// 总开关：false 时完全不装配（无路由、无任务、无存储连接）。
+    pub enabled: bool,
+    /// 沙箱 Pod 所在 namespace（独立于业务 runner）。
+    pub namespace: String,
+    /// token 加密密钥（64 位 hex = 32 字节 AES-256-GCM key）。
+    /// 生产经环境注入；缺失且 enabled=true 时启动 fail-fast。
+    pub token_key_hex: String,
+    pub default_ttl_seconds: i64,
+    pub max_ttl_seconds: i64,
+    pub reaper_interval_seconds: u64,
+    /// create 等待 Pod Ready 的上限（秒）。
+    pub create_ready_timeout_seconds: u64,
+    /// envd /init 重试次数（同 token + 新 timestamp，源码实证幂等）。
+    pub envd_init_retries: u32,
+    /// create 响应里的 domain 字段（SDK 侧主要用 E2B_DOMAIN，此值用于展示）。
+    pub public_domain: String,
+    /// 温池总开关（M4）：false 时不启动补池器，create 走冷启动。
+    pub warm_pool_enabled: bool,
+    /// 补池器巡检周期（秒）。
+    pub warm_pool_interval_seconds: u64,
+    /// 温池实例未被认领的最长闲置秒数（Pod activeDeadline 与 expires 同源）。
+    pub warm_idle_ttl_seconds: i64,
+    /// Volume 使用的 StorageClass（默认 cephfs，RWX 多沙箱并发挂载）。
+    pub volume_storage_class: String,
+    /// Volume 最大容量（GiB）。
+    pub volume_max_size_gib: i32,
+    /// 数据面端口白名单：路径/头路由只代理这些沙箱内端口
+    /// （49983 envd / 8787 CDP / 8788 MCP）。任意端口默认 403，防 SSRF 与
+    /// 任意端口转发；模板需要新端口须显式加白。
+    pub allowed_ports: Vec<i32>,
+    pub api_keys: Vec<E2bSandboxApiKeySeed>,
+    pub templates: Vec<E2bSandboxTemplateSeed>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct E2bSandboxApiKeySeed {
+    pub key_id: String,
+    pub tenant_id: String,
+    /// 明文 key（仅用于计算哈希入库与运维对照；库中只存 sha256）。
+    pub secret: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct E2bSandboxTemplateSeed {
+    pub template_id: String,
+    /// 修订号：镜像/envd/规格变更必须 +1（修订行不可变，同号冲突被忽略）。
+    #[serde(default = "default_template_revision")]
+    pub revision: i64,
+    pub display_name: Option<String>,
+    pub enabled: bool,
+    pub image: String,
+    pub image_digest: Option<String>,
+    pub envd_version: String,
+    /// None/空 = runc；如 kata-clh-runtime-rs。
+    pub runtime_class: Option<String>,
+    pub cpu_millicores: i64,
+    pub memory_mib: i64,
+    pub default_user: String,
+    pub default_workdir: String,
+    #[serde(default)]
+    pub default_env: std::collections::BTreeMap<String, String>,
+    pub ttl_max_seconds: i64,
+    #[serde(default)]
+    pub warm_target: i64,
+}
+
+fn default_template_revision() -> i64 {
+    1
+}
+
+impl Default for E2bSandboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            namespace: "nuwax-e2b".to_string(),
+            token_key_hex: String::new(),
+            default_ttl_seconds: 300,
+            max_ttl_seconds: 3600,
+            reaper_interval_seconds: 10,
+            create_ready_timeout_seconds: 90,
+            envd_init_retries: 5,
+            public_domain: String::new(),
+            warm_pool_enabled: false,
+            warm_pool_interval_seconds: 30,
+            warm_idle_ttl_seconds: 3600,
+            volume_storage_class: "cephfs".to_string(),
+            volume_max_size_gib: 10,
+            allowed_ports: vec![49983, 8787, 8788, 49999],
+            api_keys: Vec::new(),
+            templates: Vec::new(),
+        }
+    }
+}

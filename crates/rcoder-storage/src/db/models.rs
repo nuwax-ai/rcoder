@@ -235,8 +235,102 @@ pub(crate) fn storage_models() -> toasty::ModelSet {
         ContainerTombstone,
         ProjectWriteReceipt,
         UserAppAgentBinding,
-        UserAppAgentSession
+        UserAppAgentSession,
+        SandboxTemplate,
+        SandboxTemplateRevision,
+        SandboxApiKey,
+        SandboxInstance,
+        SandboxVolume
     )
+}
+
+// E2B 兼容沙箱（Component::Sandbox）。列与 schema/sandbox-pg-v1.sql 严格一致；
+// 记录映射在 src/sandbox_store.rs。
+
+#[derive(toasty::Model)]
+#[table = "sandbox_templates"]
+pub(crate) struct SandboxTemplate {
+    #[key]
+    pub template_id: String,
+    pub current_revision: i64,
+    pub enabled: bool,
+    pub display_name: Option<String>,
+    pub created_at_us: i64,
+    pub updated_at_us: i64,
+}
+
+#[derive(toasty::Model)]
+#[table = "sandbox_template_revisions"]
+#[key(template_id, revision)]
+pub(crate) struct SandboxTemplateRevision {
+    pub template_id: String,
+    pub revision: i64,
+    pub image: String,
+    pub image_digest: Option<String>,
+    pub envd_version: String,
+    pub runtime_class: Option<String>,
+    pub cpu_millicores: i64,
+    pub memory_mib: i64,
+    pub default_user: String,
+    pub default_workdir: String,
+    pub default_env_json: Option<String>,
+    pub ttl_max_seconds: i64,
+    pub warm_target: i64,
+    pub created_at_us: i64,
+}
+
+#[derive(toasty::Model)]
+#[table = "sandbox_api_keys"]
+pub(crate) struct SandboxApiKey {
+    #[key]
+    pub key_id: String,
+    pub tenant_id: String,
+    pub public_prefix: String,
+    #[unique]
+    pub key_hash: String,
+    pub scopes: String,
+    pub created_at_us: i64,
+    pub expires_at_us: Option<i64>,
+    pub revoked_at_us: Option<i64>,
+}
+
+#[derive(toasty::Model)]
+#[table = "sandbox_instances"]
+pub(crate) struct SandboxInstance {
+    #[key]
+    pub sandbox_id: String,
+    #[index]
+    pub tenant_id: String,
+    pub key_id: String,
+    pub template_id: String,
+    pub template_revision: i64,
+    pub image: String,
+    pub image_digest: Option<String>,
+    pub envd_version: String,
+    pub runtime_class: Option<String>,
+    pub cpu_millicores: i64,
+    pub memory_mib: i64,
+    #[index]
+    pub desired_state: String,
+    pub observed_state: Option<String>,
+    pub instance_revision: i64,
+    pub operation_id: Option<String>,
+    pub namespace: String,
+    pub pod_name: String,
+    pub pod_uid: Option<String>,
+    pub token_hash: String,
+    pub encrypted_token: Option<String>,
+    pub token_generation: i64,
+    pub env_json: Option<String>,
+    pub metadata_json: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub failure_reason: Option<String>,
+    pub created_at_us: i64,
+    pub updated_at_us: i64,
+    pub ready_at_us: Option<i64>,
+    pub expires_at_us: Option<i64>,
+    pub hard_deadline_us: Option<i64>,
+    pub deleted_at_us: Option<i64>,
 }
 
 #[derive(toasty::Model)]
@@ -439,4 +533,22 @@ pub(crate) struct ComputeControl {
     pub created_at_us: i64,
     pub updated_at_us: i64,
     pub terminal_at_us: Option<i64>,
+}
+
+#[derive(toasty::Model)]
+#[table = "sandbox_volumes"]
+pub(crate) struct SandboxVolume {
+    #[key]
+    pub volume_id: String,
+    #[index]
+    pub tenant_id: String,
+    pub key_id: String,
+    pub name: String,
+    pub pvc_name: String,
+    pub storage_class: String,
+    /// 列是 INTEGER——模型必须 i32，i64 会让 Toasty 读回时类型断言 panic。
+    pub size_gib: i32,
+    pub created_at_us: i64,
+    pub updated_at_us: i64,
+    pub deleted_at_us: Option<i64>,
 }

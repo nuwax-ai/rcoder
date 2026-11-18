@@ -38,7 +38,7 @@ dial9 = ["rcoder-engine/dial9", "http-server/dial9"]
 # 启用后可通过 CONTAINER_RUNTIME=kubernetes 环境变量切换到 K8s 模式
 userapp-turso = ["rcoder-engine/userapp-turso"]
 
-kubernetes = ["rcoder-engine/kubernetes"]
+kubernetes = ["rcoder-engine/kubernetes", "http-server/kubernetes"]
 
 # Agent 项目/会话 PostgreSQL 后端；运行期由 [storage].backend 选择。
 # userApp 后端独立配置，不因 Agent 仍使用 memory 而回退到内存。

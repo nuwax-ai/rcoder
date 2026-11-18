@@ -197,6 +197,7 @@ pub use shared_types_i18n::{
 
 // Validation 模块
 pub mod validation;
+pub mod sandbox;
 pub use validation::{
     ABSOLUTE_DIR_MAX_LEN, AGENT_WORK_DIR_MAX_SEGMENTS, IDENTIFIER_RE, USERAPP_APP_ID_MAX_LEN,
     garde_err_to_app_error, is_absolute_path_like, normalize_absolute_dir, validate_agent_work_dir,

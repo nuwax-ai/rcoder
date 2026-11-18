@@ -48,7 +48,7 @@ CREATE TABLE sandbox_instances (
  runtime_class TEXT,
  cpu_millicores BIGINT NOT NULL CHECK(cpu_millicores>0),
  memory_mib BIGINT NOT NULL CHECK(memory_mib>0),
- desired_state TEXT NOT NULL CHECK(desired_state IN ('provisioning','initializing','ready','terminating','cleanup_pending','deleted','failed')),
+ desired_state TEXT NOT NULL CHECK(desired_state IN ('provisioning','warm_ready','initializing','ready','terminating','cleanup_pending','deleted','failed')),
  observed_state TEXT,
  instance_revision BIGINT NOT NULL DEFAULT 1 CHECK(instance_revision>=1),
  operation_id TEXT,
@@ -60,6 +60,7 @@ CREATE TABLE sandbox_instances (
  token_generation BIGINT NOT NULL DEFAULT 1 CHECK(token_generation>=1),
  env_json TEXT,
  metadata_json TEXT,
+ idempotency_key TEXT,
  failure_reason TEXT,
  created_at_us BIGINT NOT NULL, updated_at_us BIGINT NOT NULL,
  ready_at_us BIGINT, expires_at_us BIGINT, hard_deadline_us BIGINT, deleted_at_us BIGINT,
@@ -70,3 +71,18 @@ CREATE UNIQUE INDEX sandbox_instances_pod ON sandbox_instances(pod_name) WHERE d
 CREATE INDEX sandbox_instances_list ON sandbox_instances(tenant_id,created_at_us,sandbox_id);
 CREATE INDEX sandbox_instances_expiry ON sandbox_instances(expires_at_us) WHERE deleted_at_us IS NULL;
 CREATE INDEX sandbox_instances_reconcile ON sandbox_instances(desired_state) WHERE deleted_at_us IS NULL;
+CREATE TABLE sandbox_volumes (
+ volume_id TEXT NOT NULL PRIMARY KEY CHECK(length(volume_id)>0),
+ tenant_id TEXT NOT NULL CHECK(length(tenant_id)>0),
+ key_id TEXT REFERENCES sandbox_api_keys(key_id),
+ name TEXT NOT NULL CHECK(length(name)>0),
+ pvc_name TEXT NOT NULL CHECK(length(pvc_name)>0),
+ storage_class TEXT NOT NULL,
+ size_gib INTEGER NOT NULL CHECK(size_gib>0 AND size_gib<=100),
+ created_at_us BIGINT NOT NULL, updated_at_us BIGINT NOT NULL,
+ deleted_at_us BIGINT,
+ CONSTRAINT sandbox_volume_terminal CHECK((deleted_at_us IS NOT NULL) OR (deleted_at_us IS NULL))
+);
+CREATE INDEX sandbox_volumes_list ON sandbox_volumes(tenant_id,created_at_us,volume_id);
+CREATE UNIQUE INDEX sandbox_volumes_name ON sandbox_volumes(tenant_id,name) WHERE deleted_at_us IS NULL;
+CREATE UNIQUE INDEX sandbox_instances_idem ON sandbox_instances(idempotency_key) WHERE deleted_at_us IS NULL AND idempotency_key IS NOT NULL;

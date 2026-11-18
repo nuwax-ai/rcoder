@@ -14,25 +14,44 @@ pub(crate) enum Backend {
     Postgres,
     Turso,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Component {
-    Userapp,
-    Project,
-    Preview,
-    /// E2B sandbox 域。主服务不提供 sandbox API，但**必须认识这个组件**：
-    /// 与 e2b 部署共享同一数据库，schema 校验遇到不认识的 component 会
-    /// 直接拒绝启动（"unknown database schema component"）。
-    Sandbox,
-}
-impl Component {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Userapp => "userapp",
-            Self::Project => "project",
-            Self::Preview => "preview",
-            Self::Sandbox => "sandbox",
+/// Component 枚举的单一数据源：变体列表只在此处定义一次，
+/// `name()`/`from_name()`/`ALL` 全部由宏自动生成——新增变体只加一行，
+/// 漏配映射是编译错误（match 非穷举），而非运行时 bail。
+macro_rules! define_components {
+    ($($variant:ident => $name:literal),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        pub(crate) enum Component {
+            $($variant),+
         }
-    }
+        impl Component {
+            /// 全部变体（迭代/测试用）。
+            pub(crate) const ALL: &'static [Component] = &[$(Component::$variant),+];
+            fn name(self) -> &'static str {
+                match self {
+                    $(Component::$variant => $name),+
+                }
+            }
+            fn from_name(name: &str) -> Result<Self> {
+                match name {
+                    $($name => Ok(Component::$variant)),+,
+                    other => bail!("unknown database schema component: {other}"),
+                }
+            }
+        }
+    };
+}
+
+define_components! {
+    Userapp => "userapp",
+    Project => "project",
+    Preview => "preview",
+    // E2B sandbox 域：主服务不一定启用 sandbox API，但必须认识该组件——
+    // 与 e2b 部署共享同一数据库时，不认识的 component 会让 schema 校验
+    // 直接拒绝启动（"unknown database schema component"，31.45 实测）。
+    Sandbox => "sandbox",
+}
+
+impl Component {
     fn ddl(self, backend: Backend) -> Result<&'static str> {
         match (self, backend) {
             (Self::Userapp, Backend::Postgres) => {
@@ -258,13 +277,7 @@ async fn initialize_component(
         let [name, version, migration_name, checksum, fingerprint] = row.as_slice() else {
             bail!("invalid migration ledger shape");
         };
-        let known = match name.as_str() {
-            "userapp" => Component::Userapp,
-            "project" => Component::Project,
-            "preview" => Component::Preview,
-            "sandbox" => Component::Sandbox,
-            _ => bail!("unknown database schema component"),
-        };
+        let known = Component::from_name(name)?;
         let version: i64 = version.parse().context("invalid schema version")?;
         let ddl = migration_ddl(known, backend, version)?;
         ensure!(
@@ -403,4 +416,23 @@ async fn catalog_fingerprint(
         }
     }
     Ok(digest(&bytes))
+}
+
+#[cfg(test)]
+mod component_tests {
+    use super::Component;
+
+    /// 所有变体 name↔from_name 往返一致。新增变体忘了加映射会在此测试失败
+    /// （不是完美的编译时检查，但比运行时 bail 好得多）。
+    #[test]
+    fn component_names_round_trip() {
+        for &component in Component::ALL {
+            let name = component.name();
+            assert_eq!(
+                Component::from_name(name).unwrap(),
+                component,
+                "name() 产出 \"{name}\" 但 from_name 无法解析回去"
+            );
+        }
+    }
 }
