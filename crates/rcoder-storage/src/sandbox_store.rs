@@ -749,7 +749,15 @@ impl SandboxStore for PgSandboxStore {
                 .bind(expected_revision)
                 .exec(tx)
                 .await
-                .map_err(unavailable)?;
+                .map_err(|error| {
+                    // 并发同 Idempotency-Key 双 claim：UPDATE 撞幂等唯一索引 →
+                    // Conflict → 调用方回落冷路径（insert 的读回兜底随后接管）。
+                    if error.to_string().contains("sandbox_instances_idem") {
+                        SandboxStoreError::Conflict(format!("idempotency key conflict: {error}"))
+                    } else {
+                        unavailable(error)
+                    }
+                })?;
                 if count != 1 {
                     return Err(SandboxStoreError::Conflict(format!(
                         "warm claim CAS failed for {sandbox_id} at revision {expected_revision}"
