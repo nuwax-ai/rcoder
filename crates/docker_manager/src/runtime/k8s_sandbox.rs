@@ -46,6 +46,8 @@ pub struct SandboxPodStatus {
     pub phase: String,
     pub pod_ip: Option<String>,
     pub pod_uid: Option<String>,
+    /// Pod startTime（Unix 秒）；温池认领换算 activeDeadline 用。
+    pub start_time_unix: Option<i64>,
 }
 
 pub struct SandboxK8s {
@@ -281,6 +283,11 @@ impl SandboxK8s {
                     .unwrap_or_else(|| "Unknown".to_string()),
                 pod_ip: pod.status.as_ref().and_then(|status| status.pod_ip.clone()),
                 pod_uid: pod.metadata.uid.clone(),
+                start_time_unix: pod
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.start_time.as_ref())
+                    .map(|time| time.0.as_second()),
             })),
             Err(kube::Error::Api(response)) if response.code == 404 => Ok(None),
             Err(error) => Err(err("get pod", error)),

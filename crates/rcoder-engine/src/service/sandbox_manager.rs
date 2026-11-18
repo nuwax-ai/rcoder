@@ -1096,10 +1096,19 @@ impl SandboxManager {
                 .pod_ip
                 .clone()
                 .ok_or_else(|| SandboxApiError::Unavailable("温池 Pod 无 IP".into()))?;
-            // 重置 Pod activeDeadline：spawn 时设的是温池闲置 TTL，认领后按
-            // 真实生命周期续算，否则实例会在 spawn+闲置TTL 被无条件杀掉。
+            // K8s 的 activeDeadlineSeconds 只允许下调；deadline 计时从 Pod startTime
+            // 起算。认领要的"认领时刻 + lifetime"换算为绝对秒数 =
+            // lifetime + 已闲置时长（spawn 时给了 idle_ttl+lifetime 全程余量，
+            // 此值恒 ≤ spawn 值，合法下调）。
+            let patch_deadline = match status.start_time_unix {
+                Some(started) => {
+                    let elapsed = ((now - started * 1_000_000) / 1_000_000).max(0);
+                    lifetime_seconds + elapsed
+                }
+                None => lifetime_seconds,
+            };
             self.k8s
-                .patch_pod_deadline(&record.pod_name, lifetime_seconds)
+                .patch_pod_deadline(&record.pod_name, patch_deadline)
                 .await
                 .map_err(k8s_error)?;
             let mut env_map = spec.default_env.clone();
@@ -1252,8 +1261,12 @@ impl SandboxManager {
             cpu_millicores: record.cpu_millicores,
             memory_mib: record.memory_mib,
             envd_port: ENVD_PORT,
-            // Pod 级兜底与 record expires 同源；认领时会 patch 重置。
-            max_lifetime_seconds: self.warm_idle_ttl_seconds,
+            // K8s 只允许下调 activeDeadline：spawn 就给"闲置窗口 + 完整可认领
+            // 生命周期"，认领时换算下调；未认领的兜底回收靠 record expires（更早）。
+            max_lifetime_seconds: self.warm_idle_ttl_seconds
+                + spec.ttl_max_seconds
+                + self.create_ready_timeout.as_secs() as i64
+                + 120,
             env: Vec::new(),
             volume_mounts: Vec::new(),
         };
