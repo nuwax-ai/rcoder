@@ -78,7 +78,10 @@ struct CachedHealth {
     stored_at: std::time::Instant,
 }
 
-type CacheKey = (usize, String);
+// 键含容器族（复审 P2）：Computer user_id / Web project_id / Builder app_id
+// 允许同数字——只按 identifier 缓存会在 3s 窗口里把另一族同名对象的健康
+// 结果串给对方。族用 ServiceType 的字符串形式（未知=空串，保持原行为）。
+type CacheKey = (usize, String, String);
 
 /// TTL：pod status 的变化（OOM/重启）有秒级延迟（kubelet 汇报周期），
 /// 3s 足够灵敏，同时把轮询压力压到 1/3。
@@ -176,6 +179,7 @@ pub async fn computer_pod_health(
     let key = (
         Arc::as_ptr(&runtime) as *const () as usize,
         target.identifier.clone(),
+        target.service_type.to_string(),
     );
     if !params.fresh.unwrap_or(false)
         && let Some((cached, age)) = cache_read(&key).await

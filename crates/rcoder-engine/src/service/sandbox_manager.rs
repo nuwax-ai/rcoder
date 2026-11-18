@@ -676,20 +676,43 @@ impl SandboxManager {
                 .await
             {
                 Ok(mut updated) => {
-                    // expires=0 让数据面立即失效。输给并发 set_timeout 无害：
-                    // 终态化后 authorize 同样拒绝。
-                    let _ = self
+                    // expires=0 让数据面立即失效。两步必须都落库：set_expires
+                    // 失败（并发 set_timeout 赢了 CAS）时重读重试而非吞错——
+                    // 否则 Terminating 行残留旧 expires（甚至 NULL），回收
+                    // 扫描按 expires 过滤会永久漏掉它（复审 P2）。
+                    match self
                         .store
                         .set_expires(&record.sandbox_id, updated.instance_revision, 0)
-                        .await;
-                    updated = self
-                        .store
-                        .get_instance(&record.sandbox_id)
                         .await
-                        .map_err(store_error)?
-                        .unwrap_or(updated);
-                    record = updated;
-                    break;
+                    {
+                        Ok(_) => {
+                            updated = self
+                                .store
+                                .get_instance(&record.sandbox_id)
+                                .await
+                                .map_err(store_error)?
+                                .unwrap_or(updated);
+                            record = updated;
+                            break;
+                        }
+                        Err(SandboxStoreError::Conflict(_)) if attempt < 4 => {
+                            tracing::debug!(
+                                sandbox_id = %record.sandbox_id,
+                                attempt,
+                                "kill set_expires CAS 冲突，重读重试"
+                            );
+                            record = self
+                                .store
+                                .get_instance(&record.sandbox_id)
+                                .await
+                                .map_err(store_error)?
+                                .ok_or_else(|| {
+                                    SandboxApiError::NotFound(record.sandbox_id.clone())
+                                })?;
+                            continue;
+                        }
+                        Err(error) => return Err(store_error(error)),
+                    }
                 }
                 Err(SandboxStoreError::Conflict(_)) if attempt < 4 => {
                     tracing::debug!(sandbox_id = %record.sandbox_id, attempt, "kill CAS 冲突，重读重试");
@@ -1420,6 +1443,31 @@ impl SandboxManager {
                 tracing::info!(sandbox_id = %record.sandbox_id, "e2b sandbox expired");
                 if let Err(error) = self.kill_by_record(&record, KillReason::ReapExpired).await {
                     tracing::warn!(sandbox_id = %record.sandbox_id, error = %error, "e2b reaper kill 失败，下轮重试");
+                }
+            }
+            // Terminating 卡死兜底（复审 P2）：kill 第一步落库后进程中断，
+            // 行残留旧 expires（甚至 NULL）→ list_expired 按 expires 过滤漏扫。
+            // 超过 10 分钟仍停在 Terminating 的行强制对账收敛。
+            const STUCK_TERMINATING_GRACE_US: i64 = 600 * 1_000_000;
+            if let Ok(all_non_terminal) = self.store.list_all_non_terminal().await {
+                for record in all_non_terminal {
+                    if record.desired_state != SandboxInstanceState::Terminating {
+                        continue;
+                    }
+                    if now - record.updated_at_us < STUCK_TERMINATING_GRACE_US {
+                        continue;
+                    }
+                    tracing::warn!(
+                        sandbox_id = %record.sandbox_id,
+                        updated_at = record.updated_at_us,
+                        "e2b reaper: Terminating 卡死超宽限，强制收敛"
+                    );
+                    if let Err(error) = self
+                        .kill_by_record(&record, KillReason::ReapExpired)
+                        .await
+                    {
+                        tracing::warn!(sandbox_id = %record.sandbox_id, error = %error, "e2b reaper 卡死收敛失败，下轮重试");
+                    }
                 }
             }
             let pending = match self.store.list_cleanup_pending().await {

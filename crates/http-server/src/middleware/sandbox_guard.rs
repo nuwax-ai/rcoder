@@ -282,10 +282,10 @@ async fn websocket_tunnel(request: Request<Body>, target: &str, rest: &str, toke
         }
     };
 
-    // 非 101：上游拒绝升级（如鉴权失败）——原样回传状态与响应体。
-    // 定界按上游声明：Content-Length 精确读；chunked 透传原始字节并保留
-    // Transfer-Encoding 头（客户端自行解块），读到终止块为止；两者皆无
-    // 才以连接关闭（EOF）为界——避免 keep-alive 上游让客户端挂等。
+    // 非 101：上游拒绝升级（如鉴权失败）——缓冲完整响应体后以明文回传。
+    // 必须解掉上游的 chunked framing（复审 P2：保留 TE 头透传原始帧会被
+    // Hyper 对流式 body 再次 chunked 编码，客户端解码后仍看到帧标记）。
+    // 缓冲上限 1MB（上游拒绝响应的合理上界）；超限/畸形按 502 处理。
     if head.status != 101 {
         let content_length = head
             .headers
@@ -301,11 +301,10 @@ async fn websocket_tunnel(request: Request<Body>, target: &str, rest: &str, toke
         let mut builder =
             Response::builder().status(StatusCode::from_u16(head.status).unwrap_or(StatusCode::BAD_GATEWAY));
         for (name, value) in &head.headers {
-            let name = name.as_str();
-            // 定界头保留（与 body 构造方式一致），其余 hop-by-hop 滤除。
-            if HOP_BY_HOP.contains(&name)
-                && name != "content-length"
-                && name != "transfer-encoding"
+            // 定界头不透传（body 已解帧为明文，由本端重新编码）。
+            if HOP_BY_HOP.contains(&name.as_str())
+                || name == "content-length"
+                || name == "transfer-encoding"
             {
                 continue;
             }
@@ -316,20 +315,20 @@ async fn websocket_tunnel(request: Request<Body>, target: &str, rest: &str, toke
                 builder = builder.header(name, value);
             }
         }
-        let bound = if let Some(length) = content_length {
-            BodyBound::Length(length)
-        } else if chunked {
-            BodyBound::Chunked
-        } else {
-            BodyBound::Eof
-        };
-        return match builder.body(Body::from_stream(bounded_body(
-            head.leftover,
+        let body = read_upstream_error_body(
             upstream,
-            bound,
-        ))) {
-            Ok(response) => response,
-            Err(_) => error_response(StatusCode::BAD_GATEWAY, "代理响应构造失败"),
+            head.leftover,
+            content_length,
+            chunked,
+            1024 * 1024,
+        )
+        .await;
+        return match body {
+            Some(bytes) => match builder.body(Body::from(bytes)) {
+                Ok(response) => response,
+                Err(_) => error_response(StatusCode::BAD_GATEWAY, "代理响应构造失败"),
+            },
+            None => error_response(StatusCode::BAD_GATEWAY, "上游错误响应体读取失败"),
         };
     }
 
@@ -463,84 +462,85 @@ fn parse_response_head(head: &[u8], leftover: Vec<u8>) -> Option<UpstreamHead> {
     })
 }
 
-/// 非 101 场景的响应体定界。
-enum BodyBound {
-    /// 精确读 N 字节（上游 Content-Length）。
-    Length(u64),
-    /// 透传原始 chunked 字节，读到终止块（\r\n0\r\n\r\n 且其后无数据）为止。
-    Chunked,
-    /// 以连接关闭为界（上游未声明任何定界）。
-    Eof,
-}
-
-/// 非 101 场景的响应体：先吐 leftover，再按 BodyBound 定界转发上游字节。
-fn bounded_body(
-    leftover: Vec<u8>,
-    stream: tokio::net::TcpStream,
-    bound: BodyBound,
-) -> impl futures::Stream<Item = Result<axum::body::Bytes, std::io::Error>> {
+/// 缓冲并解帧上游错误响应体（非 101 专用）。
+/// - `Some(bytes)`：完整明文体——Content-Length 精确截取 / chunked 解帧至
+///   终止块（trailer 忽略）/ 无定界读到 EOF。
+/// - `None`：超上限、连接中断（CL 不足）、chunked 帧损坏——调用方按 502。
+async fn read_upstream_error_body(
+    mut stream: tokio::net::TcpStream,
+    mut buffer: Vec<u8>,
+    content_length: Option<u64>,
+    chunked: bool,
+    cap: usize,
+) -> Option<Vec<u8>> {
     use tokio::io::AsyncReadExt as _;
-    struct Source {
-        pending: Option<Vec<u8>>,
-        stream: Option<tokio::net::TcpStream>,
-        bound: BodyBound,
-        sent: u64,
-    }
-    futures::stream::unfold(
-        Source {
-            pending: Some(leftover),
-            stream: Some(stream),
-            bound,
-            sent: 0,
-        },
-        |mut state| async move {
-            if let Some(pending) = state.pending.take() {
-                if !pending.is_empty() {
-                    state.sent += pending.len() as u64;
-                    return Some((Ok(axum::body::Bytes::from(pending)), state));
-                }
+    let needed = content_length.map(|length| length as usize).unwrap_or(cap);
+    let cap = cap.max(needed);
+    loop {
+        if let Some(length) = content_length {
+            if buffer.len() >= length as usize {
+                buffer.truncate(length as usize);
+                return Some(buffer);
             }
-            // Length 定界：已读满即结束（即便上游连接仍开着）。
-            if let BodyBound::Length(total) = state.bound {
-                if state.sent >= total {
-                    return None;
-                }
+        } else if chunked {
+            if let Some((plain, _consumed)) = dechunk(&buffer) {
+                return Some(plain);
             }
-            let Some(mut stream) = state.stream.take() else {
+        }
+        if buffer.len() > cap {
+            return None;
+        }
+        let mut chunk = vec![0u8; 16 * 1024];
+        match stream.read(&mut chunk).await {
+            Ok(0) => {
+                // EOF：无定界声明时连接关闭即正文边界；其余为畸形。
+                if content_length.is_none() && !chunked {
+                    return Some(buffer);
+                }
                 return None;
-            };
-            let mut buf = vec![0u8; 16 * 1024];
-            match stream.read(&mut buf).await {
-                Ok(0) => None,
-                Ok(read) => {
-                    buf.truncate(read);
-                    let chunk = axum::body::Bytes::from(buf);
-                    // Chunked 定界：终止块到达即收（stream 不归还，流自然终止）。
-                    // 终止块字节保留在流内——客户端解块器会正确停在其后。
-                    if let BodyBound::Chunked = state.bound {
-                        if ends_with_chunked_terminator(&chunk) {
-                            state.sent += chunk.len() as u64;
-                            return Some((Ok(chunk), state));
-                        }
-                    }
-                    state.sent += chunk.len() as u64;
-                    state.stream = Some(stream);
-                    Some((Ok(chunk), state))
-                }
-                Err(error) => Some((Err(error), state)),
             }
-        },
-    )
+            Ok(read) => {
+                chunk.truncate(read);
+                buffer.extend_from_slice(&chunk);
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
-/// 判断该字节段是否以 chunked 终止块收尾：`0\r\n\r\n` 结束，且其前是行首
-/// （\n 之后或恰为段首，即空 chunked 体）。近似检测：跨读边界的终止符交给
-/// EOF 兜底（安全方向——不截断，只是可能多等连接关闭）。
-fn ends_with_chunked_terminator(chunk: &[u8]) -> bool {
-    if !chunk.ends_with(b"0\r\n\r\n") {
-        return false;
+/// 解析 chunked 流：成功抵达终止块返回 (明文, 消费字节数)；未完结/畸形返回 None。
+fn dechunk(buffer: &[u8]) -> Option<(Vec<u8>, usize)> {
+    let mut plain = Vec::new();
+    let mut pos = 0usize;
+    loop {
+        let line_end = buffer[pos..].windows(2).position(|w| w == b"\r\n")? + pos;
+        let size_text = &buffer[pos..line_end];
+        // chunk 扩展（";ext=..."）取分号前；u8 切片无稳定 split_once。
+        let size_hex_end = size_text.iter().position(|b| *b == b';').unwrap_or(size_text.len());
+        let size_hex = &size_text[..size_hex_end];
+        let size = usize::from_str_radix(std::str::from_utf8(size_hex).ok()?.trim(), 16).ok()?;
+        pos = line_end + 2;
+        if size == 0 {
+            // 终止块（忽略 trailer：仅要求其后是行界或恰在此结束）。
+            if buffer.len() == pos {
+                return Some((plain, pos));
+            }
+            if buffer[pos..].starts_with(b"\r\n") {
+                return Some((plain, pos + 2));
+            }
+            // trailer 行存在：需要更多数据或后续行——不完整则 None 继续读。
+            return None;
+        }
+        if buffer.len() < pos + size + 2 {
+            return None;
+        }
+        plain.extend_from_slice(&buffer[pos..pos + size]);
+        pos += size;
+        if &buffer[pos..pos + 2] != b"\r\n" {
+            return None;
+        }
+        pos += 2;
     }
-    chunk.len() == 5 || chunk[chunk.len() - 6] == b'\n'
 }
 
 #[cfg(test)]
@@ -690,11 +690,21 @@ mod tests {
     }
 
     #[test]
-    fn chunked_terminator_detection() {
-        assert!(ends_with_chunked_terminator(b"body\r\n0\r\n\r\n"));
-        assert!(ends_with_chunked_terminator(b"0\r\n\r\n"));
-        assert!(!ends_with_chunked_terminator(b"body\r\n5\r\nhello"));
-        assert!(!ends_with_chunked_terminator(b"0\r\n\r\nextra"));
+    fn chunked_decode_roundtrip() {
+        // 完整 chunked 流 → 明文 + 消费长度
+        let (plain, consumed) = dechunk(b"5\r\nhello\r\n0\r\n\r\n").unwrap();
+        assert_eq!(plain, b"hello");
+        assert_eq!(consumed, b"5\r\nhello\r\n0\r\n\r\n".len());
+        // 空体
+        let (plain, _) = dechunk(b"0\r\n\r\n").unwrap();
+        assert!(plain.is_empty());
+        // 多块 + 大小写 hex + chunk 扩展
+        let (plain, _) = dechunk(b"3;ext=1\r\nabc\r\n4\r\nABCD\r\n0\r\n\r\n").unwrap();
+        assert_eq!(plain, b"abcABCD");
+        // 不完整/畸形
+        assert!(dechunk(b"5\r\nhel").is_none());
+        assert!(dechunk(b"zz\r\n").is_none());
+        assert!(dechunk(b"5\r\nhelloXX").is_none());
     }
 
     #[test]

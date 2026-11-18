@@ -33,6 +33,13 @@ use crate::{
 /// 可用 `RCODER_STOPPED_AGENT_RETENTION_SECS` 覆盖（运维调优/测试）。
 const STOPPED_AGENT_RETENTION_SECS: i64 = 600;
 
+/// 停止容器回收的 service-type 白名单（仅 agent 族；Display 值）。
+const REAPABLE_SERVICE_TYPES: &[&str] = &[
+    "computer-agent-runner",
+    "computer-normal-project",
+    "web-agent-runner",
+];
+
 fn stopped_agent_retention_secs() -> i64 {
     std::env::var("RCODER_STOPPED_AGENT_RETENTION_SECS")
         .ok()
@@ -77,6 +84,19 @@ impl DockerManager {
         let mut reclaimed = 0u32;
         for container in listed {
             let Some(id) = container.id else { continue };
+            // 只回收 agent 族的尸体：service-type 的**值**必须命中 agent 白名单。
+            // UserApp("user-app"/"rcoder-app") 与 builder 同样携带 service-type
+            // label（docker_app_create 打的），但其生命周期由各自管理器负责
+            // ——此处误删会破坏 UserApp 的停止-重启语义（复审 P1）。
+            let service_type = container
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("service-type"))
+                .cloned()
+                .unwrap_or_default();
+            if !REAPABLE_SERVICE_TYPES.contains(&service_type.as_str()) {
+                continue;
+            }
             // list 的 State 是字符串："exited" / "dead" / "created" / ...
             let state = container.state.map(|s| s.to_string().to_lowercase());
             let terminal = matches!(

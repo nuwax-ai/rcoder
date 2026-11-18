@@ -183,6 +183,19 @@ pub async fn cutover(
     // 共享卷是安全方向: 标记未翻, 数据面本就仍在共享卷)。
     let _migration_gate_guard = MigrationGateGuard::new(user_id);
 
+    // 在途写排空(复审 P1): 门禁开启前已受理的写(长上传/慢盘)还在异步执行,
+    // 不等它们落盘就停 agent + 最终 sync 会把这些写留在旧卷 → 源/目标分叉。
+    // 数据面此刻仍活着(agent 未停), 10s 内排空是常态; 超时残留则中止切换
+    // (释放门禁, 用户可写共享卷语义完好), 下次重试 cutover。
+    let drain_timeout = std::time::Duration::from_secs(10);
+    let remaining = super::migration_gate::drain_user_writes(user_id, drain_timeout).await;
+    if remaining > 0 {
+        return Err(ContainerRuntimeError::ConnectionError(format!(
+            "cutover aborted: {remaining} in-flight write(s) for '{user_id}' did not drain within {drain_timeout:?}"
+        )));
+    }
+    steps.push("in-flight writes drained".to_string());
+
     // 1. 停 agent（删 STS → 卷卸载开始）
     state
         .runtime()

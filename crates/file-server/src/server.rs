@@ -60,10 +60,26 @@ impl FileServerBuilder {
             .context("validate file-server config")?;
         let config = Arc::new(self.config);
         let resolver = self.resolver.unwrap_or_else(|| {
-            Arc::new(LocalWorkspaceResolver::new(
-                config.project_source_dir.clone(),
-                config.computer_workspace_dir.clone(),
-            ))
+            // 默认 resolver 保留配置根目录，但尊重容器注入的单用户卷视角：
+            // `RCODER_AGENT_BOUND_USER_ID` 非空（RBD 独占卷形态的 agent 容器）
+            // 必须走 {root}/{cid} 单层布局 + 归属校验——否则共享双层布局会把
+            // 读写分裂到第二棵目录树（下载 404 / 更新写错位置，复审 P1）。
+            // rcoder 主进程不设该 env，行为保持共享双层布局不变。
+            let bound_user = std::env::var("RCODER_AGENT_BOUND_USER_ID")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            match bound_user {
+                Some(bound_user) => Arc::new(LocalWorkspaceResolver::new_single_user(
+                    config.project_source_dir.clone(),
+                    config.computer_workspace_dir.clone(),
+                    bound_user,
+                )),
+                None => Arc::new(LocalWorkspaceResolver::new(
+                    config.project_source_dir.clone(),
+                    config.computer_workspace_dir.clone(),
+                )),
+            }
         });
         let skill_downloader = Arc::new(
             SkillDownloader::new(&config)

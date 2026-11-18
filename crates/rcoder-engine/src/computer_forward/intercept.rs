@@ -90,15 +90,44 @@ pub async fn computer_rbd_intercept(
     {
         return next.run(req).await;
     }
-    let path = req.uri().path();
-    if !is_pass_through_path(path) {
+    let path = req.uri().path().to_string();
+    if !is_pass_through_path(&path) {
         return next.run(req).await;
     }
+    // Git JSON 定位兜底（复审 P1）：Git handler 允许 POST 在 JSON body 里带
+    // userId/cId，仅靠 header/query/静态路径定位会让已迁移用户的 Git 写绕过
+    // 转发与写门禁直达旧共享卷。对「写方法 + Git 族 + 无 header + JSON」
+    // 的请求缓冲 body（≤64KB，Git JSON 均远小于此）提取 userId 注入 header。
+    // 非该形态（GET/带 header/非 JSON/body 超限）不动 body 原样放行。
+    let mut req = req;
+    if !req.headers().contains_key(shared_types::USER_ID_HEADER)
+        && super::migration_gate::is_write_method(req.method())
+        && path.starts_with("/api/git/")
+        && req
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.to_ascii_lowercase().contains("application/json"))
+    {
+        let content_length_ok = req
+            .headers()
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok())
+            .is_none_or(|len| len <= 64 * 1024);
+        if content_length_ok {
+            match extract_git_json_user(req).await {
+                Ok((parts, body)) => req = Request::from_parts(parts, body),
+                Err(response) => return response,
+            }
+        }
+    }
+    // 注入成功时从新请求重读（None → Some 的唯一来源）。
     let user_id_header = req
         .headers()
         .get(shared_types::USER_ID_HEADER)
         .and_then(|v| v.to_str().ok());
-    let target = match resolve_target(user_id_header, req.uri().query(), path) {
+    let target = match resolve_target(user_id_header, req.uri().query(), &path) {
         TargetResolution::Found(target) => target,
         TargetResolution::Absent => return next.run(req).await,
         TargetResolution::Invalid => {
@@ -129,6 +158,15 @@ pub async fn computer_rbd_intercept(
         );
         return service_unavailable("workspace migration in progress, retry shortly");
     }
+    // 在途写登记（复审 P1）：门禁通过 ≠ 落盘完成——cutover begin 后到这笔写
+    // 异步落盘之间，最终同步可能已跑完导致写落旧卷。登记后 cutover 在停
+    // agent 前排空（drain_user_writes）。guard 持有到本 middleware 返回
+    // （= 响应完成），所有早退路径自动释放。
+    let _write_admission = if super::migration_gate::is_write_method(req.method()) {
+        Some(super::migration_gate::write_admitted(&target.user_id))
+    } else {
+        None
+    };
     // 混住判据: PVC 存在 **且 migrated 标记生效**才转发。
     // 只有 PVC 存在(phase-a 预同步中/已切流未完成)不够——那期间用户仍在
     // 共享卷读写, 转发会把请求送进 RBD 旧副本(读到过时数据)。
@@ -408,4 +446,59 @@ mod tests {
         assert!(!is_hop_by_hop("content-type", &listed));
         assert!(!is_hop_by_hop("x-app-id", &listed));
     }
+}
+
+/// 缓冲 Git JSON 请求提取 userId 并注入定位 header（复审 P1）。
+/// body 读取失败（连接截断/超限）返回 Err(400)——半截 body 放行下游只会
+/// 得到更晚也更迷惑的失败。无可定位 userId 时原样重建（body 保持字节不变）。
+async fn extract_git_json_user(
+    req: Request,
+) -> Result<
+    (axum::http::request::Parts, Body),
+    Response,
+> {
+    let (mut parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, 64 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(error = %error, "[COMPUTER_FORWARD] git json body read failed");
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                "unreadable request body",
+            )
+                .into_response());
+        }
+    };
+    let user_id = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| value.get("userId").cloned())
+        .and_then(|value| match value {
+            serde_json::Value::String(text) => Some(text),
+            serde_json::Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        })
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(user_id) = user_id {
+        match axum::http::HeaderValue::from_str(&user_id) {
+            Ok(header_value) => {
+                parts.headers.insert(shared_types::USER_ID_HEADER, header_value);
+            }
+            Err(error) => {
+                // 非法 userId 显式 400（对齐 resolve_target 的 Invalid 语义——
+                // 静默放行等于让该写绕过转发落共享卷）。
+                tracing::warn!(
+                    user_id = %user_id,
+                    error = %error,
+                    "[COMPUTER_FORWARD] git json userId invalid, rejecting"
+                );
+                return Err((
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "invalid user identifier",
+                )
+                    .into_response());
+            }
+        }
+    }
+    Ok((parts, Body::from(bytes)))
 }
