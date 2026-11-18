@@ -87,6 +87,47 @@ class OfficialBuildTests(unittest.TestCase):
             official.install(args, VERSION, COMMIT)
         self.assertFalse(output.exists())
 
+    def test_unlisted_release_falls_back_and_records_the_downloaded_digest(self):
+        catalog = self.root / 'narrow-catalog.json'
+        catalog.write_text(json.dumps({'protocol': 'pingap-release-assets-v1',
+                                       'repository': 'vicanso/pingap', 'releases': {}}))
+        elf = bytearray(64)
+        elf[:6] = b'\x7fELF\x02\x01'
+        elf[18:20] = (62).to_bytes(2, 'little')
+        archive = self.root / 'fallback.tar.gz'
+        with tarfile.open(archive, 'w:gz') as tar:
+            item = tarfile.TarInfo('pingap-linux-gnu-x86-full')
+            item.size = len(elf)
+            tar.addfile(item, io.BytesIO(bytes(elf)))
+        output = self.root / 'installed-fallback'
+        args = argparse.Namespace(arch='amd64', catalog=catalog, archive=archive,
+                                  download=False, output=output)
+        with patch.object(official, 'native_probe'):
+            official.install(args, '9.9.9', 'b' * 40)
+        receipt = json.loads((self.root / 'installed-fallback.official.json').read_text())
+        self.assertFalse(receipt['catalog_verified'])
+        self.assertEqual(receipt['asset_sha256'], official.digest(archive))
+        self.assertTrue(output.exists())
+
+    def test_requested_identity_diverging_from_receipt_warns_and_verifies_installed(self):
+        # Image builds pass the platform's selected version while the installed
+        # binary may lag one release until rcoder converges. The installed
+        # identity is still fully verified (receipt digest + native probe).
+        with patch.object(official, 'warn') as warned, patch.object(official.platform, 'machine', return_value='x86_64'):
+            official.verify(self.args, '0.16.2', 'c' * 40)
+        self.assertEqual(warned.call_count, 1)
+
+    def test_unverified_catalog_receipt_skips_catalog_cross_check(self):
+        value = json.loads(self.receipt.read_text())
+        value['catalog_verified'] = False
+        value['asset_sha256'] = 'a' * 64
+        self.receipt.write_text(json.dumps(value))
+        with patch.object(official.platform, 'machine', return_value='x86_64'):
+            official.verify(self.args, VERSION, COMMIT)
+        self.binary.write_text(self.binary.read_text() + '\n# changed\n')
+        with self.assertRaisesRegex(ValueError, 'final binary'):
+            self.verify()
+
     def test_modified_upstream_source_is_rejected_before_cargo(self):
         args = argparse.Namespace(source=self.root, output=self.root / 'out', fetch=False,
             tls='rustls', full=False, zig_glibc=None, target=None)

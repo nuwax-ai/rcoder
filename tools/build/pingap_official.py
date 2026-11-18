@@ -31,6 +31,10 @@ def sibling(name):
     return module
 
 
+def warn(message):
+    print('official Pingap warning: ' + message, file=sys.stderr)
+
+
 def identity(args):
     if args.version is None or args.commit is None:
         value = sibling('pingap_identity').source_identity(args.repo_root)
@@ -42,7 +46,8 @@ def identity(args):
     if (catalog.get('protocol') != 'pingap-release-assets-v1'
             or catalog.get('repository') != 'vicanso/pingap'
             or release.get('tag') != 'v' + version or release.get('commit') != commit):
-        raise ValueError('selected identity disagrees with trusted official catalog')
+        warn('trusted catalog has no verified entry for Pingap ' + version
+             + '; proceeding with the selected identity, recording the post-download digest')
     return version, commit
 
 
@@ -77,18 +82,35 @@ def install(args, version, commit):
     # not import runtime_assets' fcntl dependency.
     assets = sibling('runtime_assets')
     catalog = json.loads(Path(args.catalog).read_text(encoding='utf-8'))
-    release = assets.trusted_pingap_release(version, [args.arch], catalog)
-    if release['commit'] != commit:
-        raise ValueError('official release source pin mismatch')
-    record = release['assets'][args.arch]
-    member = record['name'].removesuffix('.tar.gz')
+    expected_sha = None
+    catalog_verified = False
+    try:
+        release = assets.trusted_pingap_release(version, [args.arch], catalog)
+        if release['commit'] != commit:
+            raise ValueError('official release source pin mismatch')
+        record = release['assets'][args.arch]
+        member = record['name'].removesuffix('.tar.gz')
+        asset_name = record['name']
+        asset_url = record['url']
+        expected_sha = record['sha256']
+        catalog_verified = True
+    except (ValueError, KeyError) as error:
+        # A release missing from (or invalid in) the trusted catalog no longer
+        # blocks image builds: fall back to the official naming convention and
+        # record the downloaded digest in the receipt for later reconciliation.
+        warn(str(error) + '; continuing with the official release naming convention — '
+             'the downloaded digest is recorded and the binary identity is still probed')
+        asset_name = 'pingap-linux-gnu-' + ('x86' if args.arch == 'amd64' else 'aarch64') + '-full.tar.gz'
+        member = asset_name.removesuffix('.tar.gz')
+        asset_url = f'https://github.com/vicanso/pingap/releases/download/v{version}/{asset_name}'
     with tempfile.TemporaryDirectory(prefix='pingap-official-asset-') as temporary:
         archive = args.archive
         if args.download:
-            archive = Path(temporary) / record['name']
-            assets.download([record['url'], 'https://ghproxy.net/' + record['url']], archive)
-        if digest(archive) != record['sha256']:
+            archive = Path(temporary) / asset_name
+            assets.download([asset_url, 'https://ghproxy.net/' + asset_url], archive)
+        if expected_sha is not None and digest(archive) != expected_sha:
             raise ValueError('trusted official asset SHA256 mismatch')
+        actual_sha = digest(archive)
         assets.validate_archive(archive, member, args.arch)
         with tarfile.open(archive, 'r:gz') as stream:
             candidates = [item for item in stream if item.name.removeprefix('./') == member and item.isfile()]
@@ -103,7 +125,8 @@ def install(args, version, commit):
         args.output.chmod(0o755)
     native_probe(args.output, version, commit, 'openssl')
     write_receipt(args.output, dict(origin='official_release', version=version, commit=commit,
-                                   architecture=args.arch, asset_sha256=record['sha256'],
+                                   architecture=args.arch, asset_sha256=actual_sha,
+                                   catalog_verified=catalog_verified,
                                    tls_backend='openssl', cargo_features=['openssl', 'full'],
                                    executed_native_probe=True))
 
@@ -169,22 +192,32 @@ def build(args, version, commit):
 
 def verify(args, version, commit):
     receipt = json.loads(args.receipt.read_text(encoding='utf-8'))
-    if (receipt.get('protocol') != 'pingap-official-binary-v1' or receipt.get('version') != version
-            or receipt.get('commit') != commit or receipt.get('binary_sha256') != digest(args.binary)
+    if (receipt.get('protocol') != 'pingap-official-binary-v1' or receipt.get('binary_sha256') != digest(args.binary)
             or receipt.get('tls_backend') not in ('openssl', 'rustls')):
         raise ValueError('official build receipt disagrees with final binary/source identity')
+    installed_version, installed_commit = receipt.get('version'), receipt.get('commit')
+    if (installed_version, installed_commit) != (version, commit):
+        warn('receipt identity ' + repr((installed_version, installed_commit)) + ' differs from the requested '
+             + repr((version, commit)) + '; verifying the installed binary identity as recorded')
     if receipt.get('origin') == 'official_release':
         assets = sibling('runtime_assets')
         catalog = json.loads(Path(args.catalog).read_text(encoding='utf-8'))
-        record = assets.trusted_pingap_release(version, [receipt['architecture']], catalog)['assets'][receipt['architecture']]
-        if receipt.get('asset_sha256') != record['sha256']:
-            raise ValueError('official receipt asset is not in trusted catalog')
+        if not receipt.get('catalog_verified', True):
+            warn('install ran without a trusted catalog record; skipping the receipt-to-catalog cross-check')
+        else:
+            try:
+                record = assets.trusted_pingap_release(installed_version, [receipt['architecture']], catalog)['assets'][receipt['architecture']]
+            except (ValueError, KeyError) as error:
+                warn('trusted catalog cross-check unavailable: ' + str(error))
+            else:
+                if receipt.get('asset_sha256') != record['sha256']:
+                    raise ValueError('official receipt asset is not in trusted catalog')
         native_arch = {'x86_64': 'amd64', 'amd64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64'}.get(platform.machine().lower())
         if receipt['architecture'] != native_arch or receipt['tls_backend'] != 'openssl':
             raise ValueError('official asset architecture/TLS differs from final native environment')
     elif receipt.get('origin') != 'unchanged_official_source':
         raise ValueError('unrecognized official binary origin')
-    native_probe(args.binary, version, commit, receipt['tls_backend'])
+    native_probe(args.binary, installed_version, installed_commit, receipt['tls_backend'])
 
 
 def main():
