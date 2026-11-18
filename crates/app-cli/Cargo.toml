@@ -6,6 +6,7 @@ license = "Apache-2.0"
 description = "Cross-platform UserApp build and service manager with orchestration, Pingap routing, and a management API"
 # app-cli 是 rcoder workspace 成员（2026-11-18 并入）：原 exclude 理由（pingap-config
 # 传递依赖 bollard/regex 与主锁冲突）已消失——bollard 双方同为 0.21.1，可统一解析。
+# 全部依赖（含本 crate 专用依赖与共用 path crate）统一在根 [workspace.dependencies] 维护。
 
 [lib]
 name = "app_cli"
@@ -22,76 +23,75 @@ path = "tests/fixtures/tree_fixture.rs"
 
 [dependencies]
 # 极轻量 manifest 类型（path 到同仓库的独立小 crate）
-workspace-manifest = { path = "../workspace-manifest" }
+workspace-manifest = { workspace = true }
 # 受管进程树与信号工具；内部使用 process-wrap 管理 Unix 进程组 / Windows Job Object，
 # app-cli 通过此共享层调用，不另行声明 process-wrap。
 process_utils = { path = "../process_utils" }
 runtime-supervisor = { path = "../runtime-supervisor" }
-async-trait = "0.1"
+async-trait = { workspace = true }
 # 跨进程 wire 契约（日志域 DTO 单一事实源；rcoder 文档 schema 同源派生）
-shared_types = { path = "../shared_types" }
-userapp-log-reader = { path = "../userapp-log-reader" }
+shared_types = { workspace = true }
+userapp-log-reader = { workspace = true }
 # 运行态状态根解析契约（R09：与 file-server 同一解析规则；独立 crate 两边共用）
 runtime-state-layout = { path = "../runtime-state-layout" }
-# pingap 官方配置类型（pin 到 v0.15.0 tag commit：crates.io 0.13.x 有发布 bug，用 git rev；
-# 与 app-runtime-base 镜像里的 pingap 二进制版本保持一致，避免 config schema 漂移）
-pingap-config = { git = "https://github.com/vicanso/pingap", rev = "8270a1ebb7a238ea86fa220215714613410378bb" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-toml = "1.2.1"
-clap = { version = "4", features = ["derive", "env"] }
-anyhow = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
-tracing-appender = "0.2"
-tokio-stream = "0.1"
-futures = "0.3"
-async-stream = "0.3"
-tokio = { version = "=1.54", features = ["full"] }
+# pingap 官方配置类型（crates.io 正式发布版：0.13.x 时代的发布 bug 已随 0.15/0.16
+# 修复，不再需要 git rev pin；0.16.1 必须与 app-runtime-base 镜像里的 pingap
+# 二进制 0.16.x 联动升级，避免 config schema 漂移）
+pingap-config = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt", "json"] }
+tracing-appender = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+tokio = { workspace = true }
 # server 主循环的编排取消令牌（热部署切换/容器停服级联）
-tokio-util = "0.7.20"
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "service"] }
-axum = "0.8"
+# workspace 版额外带 compat/time 特性（其他成员需要，对本 crate 无害）
+tokio-util = { workspace = true }
+hyper = { workspace = true }
+# workspace 版额外带 server/server-auto 特性；service 为本 crate 增补
+hyper-util = { workspace = true, features = ["service"] }
+axum = { workspace = true }
 # 请求路径百分号解码：按字节解析的成熟实现（手写下标切片在原始多字节
 # request-target 上会 panic，见 services::percent_decode_path）
-percent-encoding = "2.3"
-utoipa = { version = "6", features = ["axum_extras"] }
-glob = "0.3"
-globset = "0.4"
-regex = "1.13"
-chrono = { version = "0.4", features = ["serde"] }
-base64 = "0.23"
-uuid = { version = "1.29", features = ["v4"] }
-# 对齐 rcoder workspace 的 reqwest 特性集（rustls 固化 + stream 供部署段流式下载）
-reqwest = { version = "0.13", default-features = false, features = [
-    "stream",
-    "rustls",
-    "charset",
-    "http2",
-    "system-proxy",
-] }
-semver = "1"
-# supervisord XML-RPC 响应解析（服务托管引擎）
-roxmltree = "0.21"
+percent-encoding = { workspace = true }
+utoipa = { workspace = true }
+# 仅本 crate 消费，未入 workspace.dependencies
+glob = { workspace = true }
+globset = { workspace = true }
+regex = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }
+uuid = { workspace = true }
+# 对齐 rcoder workspace 的 reqwest 特性集（rustls 固化 + stream 供部署段流式下载）；
+# workspace 特性集（json/query/multipart 增补）为原本地 5 特性的超集
+reqwest = { workspace = true }
+semver = { workspace = true }
+# supervisord XML-RPC 响应解析（服务托管引擎）；仅本 crate 消费
+roxmltree = { workspace = true }
 # Pingap admin 鉴权头：sha256("{user}:{pass}:{ts}")（pingap plugin/admin.rs 算法，非 Basic Auth）
-sha2 = "0.11"
-hex = "0.4"
-# 部署段解压制品包（与 rcoder workspace zip 同版本；deflate 足够覆盖平台制品）
-zip = { version = "9.7", default-features = false, features = ["deflate"] }
+sha2 = { workspace = true }
+hex = { workspace = true }
+# 部署段解压制品包（deflate 足够覆盖平台制品）
+zip = { workspace = true }
 # 部署段制品 zip 魔数校验（拦 HTTP 200 + 错误信封 body 被当 zip 落盘）；
-# 关 default 裁掉 cfb 传递依赖——只用 archive::is_zip 纯函数
-infer = { version = "0.22", default-features = false }
+# 关 default 裁掉 cfb 传递依赖——只用 archive::is_zip 纯函数；仅本 crate 消费
+infer = { workspace = true }
 
-tempfile = "3"
+tempfile = { workspace = true }
 
 # 仅测试 fixture（tests/fixtures/tree_fixture.rs）安装 SIGTERM 忽略用；
 # 生产代码不直接依赖（传递依赖树中已存在）
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { workspace = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-rustix = { version = "1.1", features = ["fs"] }
+rustix = { workspace = true }
 
 [lints]
 workspace = true
@@ -99,6 +99,5 @@ workspace = true
 
 [dev-dependencies]
 # idle/api 路由行为测试：axum Router oneshot（axum 不 re-export ServiceExt）
-tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
-
+tower = { workspace = true, features = ["util"] }
+http-body-util = { workspace = true }

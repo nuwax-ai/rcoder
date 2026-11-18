@@ -1927,7 +1927,7 @@ mod lifecycle_tests {
             [pingap]
             mode = "custom"
             config = "proxy.toml"
-            version = "0.15.0"
+            version = "0.16.1"
             commit = "fixture"
             [[services]]
             service_id = "web"

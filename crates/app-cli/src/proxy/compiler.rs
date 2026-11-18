@@ -873,7 +873,7 @@ mod standby_page_tests {
 
 /// 常驻热载兼容校验（P1 T15）：对比当前 active 与新候选的 server 拓扑。
 ///
-/// pin（0.15.0）热载支持既有 server 的 locations/upstreams/plugins 更新；
+/// pin（0.16.1）热载支持既有 server 的 locations/upstreams/plugins 更新；
 /// **server 增删/改名/监听地址变化不可热载**——受理前 Fail Fast（保旧服务
 /// 运行，指引走完整重配置流程），不得静默半生效。首编（active 不存在或
 /// 无法解析）跳过校验（bootstrap 建立全量拓扑）。
@@ -892,11 +892,11 @@ pub fn validate_hot_reload_compatible(active: &Path, candidate: &str) -> Result<
     let active_cfg = PingapConfig::new(active_content.as_bytes(), true)
         .with_context(|| format!("parse active config {}", active.display()))?;
     let candidate_cfg = PingapConfig::new(candidate.as_bytes(), true).context("parse candidate")?;
-    // C7：pin（0.15.0）热载支持 = 既有 server 的 locations 变化 + plugins +
+    // C7：pin（0.16.1）热载支持 = 既有 server 的 locations 变化 + plugins +
     // upstreams。其余全部逐项比较：server 名单/监听/非 locations 字段、
     // storages、basic（热载语义未承诺的段落变化一律 Fail Fast）。
     // locations/upstreams/plugins 的**内容**差异放行（受支持类别）。
-    // pingap-config 0.15.0 的 conf 类型未 derive PartialEq——经 serde 序列化
+    // pingap-config 的 conf 类型未承诺 derive PartialEq——经 serde 序列化
     // 成 serde_json::Value 比较（值语义等价，天然忽略 None vs 缺省差异）。
     let strip_locations = |mut server: pingap_config::ServerConf| {
         server.locations = None;
@@ -1973,7 +1973,7 @@ addr = "0.0.0.0:9081"
             )),
             "standby origin marker required for error-page replacement: {joined}"
         );
-        // pin（0.15.0 文件模式）周期轮询默认 90s——必须收紧到确认预算内
+        // pin（0.16.1 文件模式）周期轮询默认 90s——必须收紧到确认预算内
         assert_eq!(
             cfg.basic.auto_restart_check_interval,
             Some(std::time::Duration::from_secs(2))

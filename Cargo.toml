@@ -63,11 +63,9 @@ publish = false
 agent-client-protocol = { version = "3.6" }
 
 # MCP 协议 - rmcp 官方库
-rmcp = { version = "3.11"}
 # mcp-proxy convert fallback 参数解析与文件重写。
 mcp-proxy-args = { version = "0.2.10" }
 
-piper = "0.2"
 
 clap = { version = "4.6", features = ["derive", "env"] }
 
@@ -103,7 +101,6 @@ hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
 tonic = { version = "0.14", features = ["tls-native-roots"] }
 tonic-prost = "0.14"
 prost = "0.14"
-prost-types = "0.14"
 tonic-prost-build = "0.14"
 http = "1.5"
 http-body = "1.1"
@@ -138,7 +135,6 @@ opentelemetry-otlp = { version = "0.33", features = [
     "http-proto",
 ] }
 tracing-opentelemetry = "0.34"
-axum-tracing-opentelemetry = "0.42"
 
 # Prometheus Metrics
 metrics = "0.24"
@@ -162,7 +158,6 @@ futures = "0.3"
 futures-util = "0.3"
 bytes = "1.12"
 arc-swap = "1.9"
-md5 = "0.8"
 process-wrap = { version = "10.0.1", features = ["tokio1", "process-group", "job-object"] }
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
 
@@ -232,10 +227,20 @@ node-semver = "2.2"
 winnow = "1.0.4"
 workspace-manifest = { path = "crates/workspace-manifest" }
 userapp-log-reader = { path = "crates/userapp-log-reader" }
+# runtime-state-layout（app-cli/file-server/file-server-userapp 三方共用的状态根
+# 解析契约）：本次收编为 workspace 声明；process_utils/runtime-supervisor 早已
+# 在下方"项目依赖"区声明，勿重复添加。
+runtime-state-layout = { path = "crates/runtime-state-layout" }
 shlex = "2.0"
 
 toml = "1.2"
 which = "8.0"
+
+# app-cli 专用依赖（版本仍集中在此维护，成员以 workspace = true 引用）
+pingap-config = "0.16.1"
+glob = "0.3"
+roxmltree = "0.21"
+infer = { version = "0.22", default-features = false }
 
 
 # Dev dependencies for testing

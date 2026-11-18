@@ -1120,7 +1120,7 @@ mod official_orchestration_protocol_tests {
                 runtime_image_digest="fixture"
                 [pingap]
                 mode="managed"
-                version="0.15.0"
+                version="0.16.1"
                 commit="fixture"
                 [[services]]
                 service_id="web"
@@ -1188,7 +1188,7 @@ mod official_orchestration_protocol_tests {
                     let (body,extra)=if is_admin {
                         assert!(request.starts_with("GET /api/basic "));assert!(!request.contains("apply-status"));
                         assert!(request.to_ascii_lowercase().contains("authorization:"));
-                        (serde_json::json!({"pid":"42","config_hash":hash,"version":"0.15.0"}).to_string(),String::new())
+                        (serde_json::json!({"pid":"42","config_hash":hash,"version":"0.16.1"}).to_string(),String::new())
                     }else{assert!(request.starts_with(&format!("GET /_pub/{id} ")));hits.fetch_add(1,std::sync::atomic::Ordering::SeqCst);(id.clone(),format!("X-Rcoder-Publication: {id}\r\n"))};
                     stream.write_all(format!("HTTP/1.1 200 OK\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
                 }}));

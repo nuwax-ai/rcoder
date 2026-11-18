@@ -10,7 +10,7 @@ fn state(root: &Path) -> AppState {
         crate::runtime_status::RuntimeStatusService::default(),
     ));
     server.mark_initialized();
-    server.set_release(toml::from_str("schema_version=1\nrelease_id='reload-release'\nworkspace_name='reload-test'\nminimum_app_cli_version='0.0.1'\nruntime_image_digest='fixture'\nservices=[]\n[pingap]\nmode='managed'\nversion='0.15.0'\ncommit='8270a1ebb7a238ea86fa220215714613410378bb'\n").unwrap());
+    server.set_release(toml::from_str("schema_version=1\nrelease_id='reload-release'\nworkspace_name='reload-test'\nminimum_app_cli_version='0.0.1'\nruntime_image_digest='fixture'\nservices=[]\n[pingap]\nmode='managed'\nversion='0.16.1'\ncommit='695538b2745dcf9df812d2fa8f2e4ad8c7cbb1fb'\n").unwrap());
     server.set_proxy_context(root.join("workspace"), true);
     AppState {
         readiness: Arc::new(crate::business_readiness::BusinessReadinessObserver::new(
@@ -411,7 +411,7 @@ pathlib.Path({marker}).write_text(str(os.getpid()))
 time.sleep(1)
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        body = json.dumps({{'pid':str(os.getpid()), 'version':'0.15.0','git_hash':'8270a1ebb7a238ea86fa220215714613410378bb','supported_plugins':['mock']}}).encode()
+        body = json.dumps({{'pid':str(os.getpid()), 'version':'0.16.1','git_hash':'695538b2745dcf9df812d2fa8f2e4ad8c7cbb1fb','supported_plugins':['mock']}}).encode()
         self.send_response(200); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
     def log_message(self, *args): pass
 address = os.environ['PINGAP_ADMIN_ADDR'].split(':')

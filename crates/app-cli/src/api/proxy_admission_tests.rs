@@ -205,7 +205,7 @@ async fn native_stopping_fences_new_proxy_writes_after_the_previous_writer_settl
     state
         .server
         .set_proxy_context(directory.path().join("workspace"), true);
-    state.server.set_release(toml::from_str("schema_version=1\nrelease_id='native-stop'\nworkspace_name='test'\nminimum_app_cli_version='0.0.1'\nruntime_image_digest='fixture'\nservices=[]\n[pingap]\nmode='managed'\nversion='0.15.0'\ncommit='8270a1ebb7a238ea86fa220215714613410378bb'\n").unwrap());
+    state.server.set_release(toml::from_str("schema_version=1\nrelease_id='native-stop'\nworkspace_name='test'\nminimum_app_cli_version='0.0.1'\nruntime_image_digest='fixture'\nservices=[]\n[pingap]\nmode='managed'\nversion='0.16.1'\ncommit='695538b2745dcf9df812d2fa8f2e4ad8c7cbb1fb'\n").unwrap());
     let response = api_router(state.clone())
         .oneshot(
             Request::builder()

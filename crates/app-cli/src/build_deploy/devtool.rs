@@ -12,9 +12,12 @@ use workspace_manifest::ReleaseMetadata;
 use super::inspection::{InspectionPurpose, inspect};
 
 /// 本地无环境变量时的 pingap 身份回退值（升级 pingap 时与 Cargo.toml 的
-/// pingap-config git rev、build-agent-docker 16-app-runtime.mk 的 PINGAP_COMMIT 一起改）。
-pub(crate) const DEFAULT_PINGAP_VERSION: &str = "0.15.0";
-pub(crate) const DEFAULT_PINGAP_COMMIT: &str = "8270a1ebb7a238ea86fa220215714613410378bb";
+/// pingap-config 版本、tools/build/pingap-assets.json 的 releases 条目一起改；
+/// 三方由 tools/build/pingap_identity.py 门禁校验一致）。
+/// commit 为 v0.16.1 tag 的官方提交（config crate 版本必须与镜像 pingap
+/// 二进制联动，见 16-app-runtime.mk 单一版本源）。
+pub(crate) const DEFAULT_PINGAP_VERSION: &str = "0.16.1";
+pub(crate) const DEFAULT_PINGAP_COMMIT: &str = "695538b2745dcf9df812d2fa8f2e4ad8c7cbb1fb";
 
 /// pingap 身份优先读 `RCODER_PINGAP_VERSION`/`RCODER_PINGAP_COMMIT`（与 file-server
 /// 真实发布链路同名；容器内由镜像 ENV 注入，见 16-app-runtime.mk 单一版本源），
@@ -132,25 +135,40 @@ pub async fn gen_lock(workspace: &Path, dev_profile: bool) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// 防漂移守卫：Cargo.toml 的 pingap-config git rev 必须与
-    /// DEFAULT_PINGAP_COMMIT 常量一致——升级 pingap 时两处（连同
-    /// build-agent-docker 16-app-runtime.mk）必须一起改，CI 在此绑定。
+    /// 防漂移守卫（单一版本源三方绑定，CI 在此锚定）：根
+    /// [workspace.dependencies] 的 pingap-config 版本、本文件回退常量
+    /// （版本 + commit）、tools/build/pingap-assets.json 官方资产目录条目
+    /// 必须一致——升级 pingap 时三处（连同镜像 PINGAP_VERSION 注入）一起改。
+    /// Python 门禁 tools/build/pingap_identity.py 校验同一契约。
     #[test]
-    fn pingap_commit_constant_matches_cargo_toml_pin() {
-        let cargo_toml = include_str!("../../Cargo.toml");
-        let pin_line = cargo_toml
+    fn pingap_constants_match_workspace_pin_and_official_catalog() {
+        let workspace_toml = include_str!("../../../../Cargo.toml");
+        let pin_line = workspace_toml
             .lines()
             .find(|l| l.trim_start().starts_with("pingap-config"))
-            .expect("Cargo.toml 应有 pingap-config 依赖行");
-        let rev = pin_line
-            .split("rev = \"")
+            .expect("根 Cargo.toml 应有 pingap-config 版本声明");
+        let version = pin_line
+            .split('"')
             .nth(1)
-            .and_then(|s| s.split('"').next())
-            .expect("pingap-config 行应含 rev = \"...\"");
+            .expect("pingap-config 行应为 \"<semver>\" 字符串形态");
         assert_eq!(
-            rev, DEFAULT_PINGAP_COMMIT,
-            "Cargo.toml 的 pingap-config rev 与 devtool DEFAULT_PINGAP_COMMIT 漂移——\
-             升级 pingap 时两处必须同步修改（另见 build-agent-docker 16-app-runtime.mk）"
+            version, DEFAULT_PINGAP_VERSION,
+            "根 workspace 的 pingap-config 版本与 devtool DEFAULT_PINGAP_VERSION 漂移——\
+             升级 pingap 时两处必须同步修改"
+        );
+        let catalog: serde_json::Value = serde_json::from_str(
+            include_str!("../../../../tools/build/pingap-assets.json"),
+        )
+        .expect("官方资产目录 JSON 合法");
+        let release = &catalog["releases"][DEFAULT_PINGAP_VERSION];
+        assert_eq!(
+            release["tag"],
+            format!("v{DEFAULT_PINGAP_VERSION}"),
+            "官方资产目录缺 v{DEFAULT_PINGAP_VERSION} 条目或 tag 不匹配"
+        );
+        assert_eq!(
+            release["commit"], DEFAULT_PINGAP_COMMIT,
+            "官方资产目录 commit 与 devtool DEFAULT_PINGAP_COMMIT 漂移"
         );
     }
 }

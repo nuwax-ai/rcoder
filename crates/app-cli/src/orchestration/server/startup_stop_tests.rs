@@ -291,7 +291,7 @@ async fn run(scenario: Scenario) {
             run_pg: None,
         })
         .unwrap();
-    let release: ReleaseLock = toml::from_str("schema_version=1\nrelease_id='startup-release'\nworkspace_name='startup'\nminimum_app_cli_version='0.0.0'\nruntime_image_digest='fixture'\n[pingap]\nmode='managed'\nversion='0.15.0'\ncommit='fixture'\n[[services]]\nservice_id='worker'\nname='Worker'\ndir='worker'\ntype='node'\nkind='worker'\nenabled=true\nport=4100\nlogs=[]\n[services.run]\ncommand=['controlled-worker']\nmigrate=[]\ndepends_on=[]\nshutdown_timeout_seconds=1\n[services.health]\n[services.env]\n").unwrap();
+    let release: ReleaseLock = toml::from_str("schema_version=1\nrelease_id='startup-release'\nworkspace_name='startup'\nminimum_app_cli_version='0.0.0'\nruntime_image_digest='fixture'\n[pingap]\nmode='managed'\nversion='0.16.1'\ncommit='fixture'\n[[services]]\nservice_id='worker'\nname='Worker'\ndir='worker'\ntype='node'\nkind='worker'\nenabled=true\nport=4100\nlogs=[]\n[services.run]\ncommand=['controlled-worker']\nmigrate=[]\ndepends_on=[]\nshutdown_timeout_seconds=1\n[services.health]\n[services.env]\n").unwrap();
     std::fs::write(
         workspace.join("release.lock.toml"),
         toml::to_string(&release).unwrap(),

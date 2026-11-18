@@ -10069,8 +10069,9 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pingap-config"
-version = "0.15.0"
-source = "git+https://github.com/vicanso/pingap?rev=8270a1ebb7a238ea86fa220215714613410378bb#8270a1ebb7a238ea86fa220215714613410378bb"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6290c38ab35af81461a00febc27746e8b0c2be8a17d3df5681e9c2c6e0c2809"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -10087,6 +10088,7 @@ dependencies = [
  "pingap-discovery",
  "pingap-util",
  "regex",
+ "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -10102,8 +10104,9 @@ dependencies = [
 
 [[package]]
 name = "pingap-core"
-version = "0.15.0"
-source = "git+https://github.com/vicanso/pingap?rev=8270a1ebb7a238ea86fa220215714613410378bb#8270a1ebb7a238ea86fa220215714613410378bb"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be37a5cb3e04b6bdc65721ffe78fdc36a6c28ea32797e71d88ef3a80b02a344c"
 dependencies = [
  "TinyUFO",
  "ahash",
@@ -10124,12 +10127,15 @@ dependencies = [
  "strum 0.28.0",
  "tokio",
  "tracing",
+ "url",
+ "urlencoding",
 ]
 
 [[package]]
 name = "pingap-discovery"
-version = "0.15.0"
-source = "git+https://github.com/vicanso/pingap?rev=8270a1ebb7a238ea86fa220215714613410378bb#8270a1ebb7a238ea86fa220215714613410378bb"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e389c74ed0bb8815f3fa1b7064f33954a137479490d7d4ea082a911f50bbef95"
 dependencies = [
  "async-trait",
  "bollard",
@@ -10145,13 +10151,13 @@ dependencies = [
 
 [[package]]
 name = "pingap-util"
-version = "0.15.0"
-source = "git+https://github.com/vicanso/pingap?rev=8270a1ebb7a238ea86fa220215714613410378bb#8270a1ebb7a238ea86fa220215714613410378bb"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3b9e71fe37dd6ef64c18251fbe019521c2d18b1ac3178ef61d3a3ec66646ba0"
 dependencies = [
  "aes-gcm-siv",
  "ahash",
  "base64 0.23.1",
- "dirs 7.0.0",
  "ipnet",
  "itoa",
  "path-absolutize",
@@ -15248,6 +15254,12 @@ dependencies = [
  "serde",
  "serde_derive",
 ]
+
+[[package]]
+name = "urlencoding"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "userapp-log-reader"
