@@ -622,6 +622,10 @@ pub struct E2bSandboxConfig {
     pub public_domain: String,
     /// 温池总开关（M4）：false 时不启动补池器，create 走冷启动。
     pub warm_pool_enabled: bool,
+    /// 补池器巡检周期（秒）。
+    pub warm_pool_interval_seconds: u64,
+    /// 温池实例未被认领的最长闲置秒数（Pod activeDeadline 与 expires 同源）。
+    pub warm_idle_ttl_seconds: i64,
     /// Volume 使用的 StorageClass（默认 cephfs，RWX 多沙箱并发挂载）。
     pub volume_storage_class: String,
     /// Volume 最大容量（GiB）。
@@ -683,6 +687,8 @@ impl Default for E2bSandboxConfig {
             envd_init_retries: 5,
             public_domain: String::new(),
             warm_pool_enabled: false,
+            warm_pool_interval_seconds: 30,
+            warm_idle_ttl_seconds: 3600,
             volume_storage_class: "cephfs".to_string(),
             volume_max_size_gib: 10,
             allowed_ports: vec![49983, 8787, 8788, 49999],

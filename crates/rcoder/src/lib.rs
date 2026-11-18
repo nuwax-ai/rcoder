@@ -187,6 +187,14 @@ async fn build_sandbox_deps(
                 shutdown_rx,
                 config.e2b_sandbox.reaper_interval_seconds,
             ));
+            // M4 温池补池器（run_pool_replenisher 内部检查 warm_pool_enabled，
+            // 关闭时立即返回——保持装配路径与开关解耦）。
+            let replenisher = std::sync::Arc::clone(&manager);
+            let shutdown_rx = shutdown_tx.subscribe();
+            tokio::spawn(replenisher.run_pool_replenisher(
+                shutdown_rx,
+                config.e2b_sandbox.warm_pool_interval_seconds,
+            ));
             router::sandbox::SandboxDeps::new(manager, config.e2b_sandbox.allowed_ports.clone())
         }
         Err(error) => {

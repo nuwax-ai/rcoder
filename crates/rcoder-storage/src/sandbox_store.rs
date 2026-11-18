@@ -230,7 +230,7 @@ impl SandboxStore for PgSandboxStore {
             Box::pin(async move {
                 let count = toasty::sql::statement(
                     "INSERT INTO sandbox_api_keys(key_id,tenant_id,public_prefix,key_hash,scopes,created_at_us,expires_at_us,revoked_at_us) \
-                     VALUES($1,$2,$3,$4,$5,$6,NULL,NULL) ON CONFLICT(key_id) DO NOTHING",
+                     VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(key_id) DO NOTHING",
                 )
                 .bind(&record.key_id)
                 .bind(&record.tenant_id)
@@ -238,6 +238,8 @@ impl SandboxStore for PgSandboxStore {
                 .bind(&record.key_hash)
                 .bind(&record.scopes)
                 .bind(now_us())
+                .bind_typed(record.expires_at_us, Type::Integer(8))
+                .bind_typed(record.revoked_at_us, Type::Integer(8))
                 .exec(tx)
                 .await
                 .map_err(unavailable)?;
@@ -358,7 +360,14 @@ impl SandboxStore for PgSandboxStore {
                 .bind_typed(record.hard_deadline_us, Type::Integer(8))
                 .exec(tx)
                 .await
-                .map_err(unavailable)?;
+                .map_err(|error| {
+                    // 并发同 Idempotency-Key 插入触发条件唯一索引——交给调用方按幂等语义收敛。
+                    if error.to_string().contains("sandbox_instances_idem") {
+                        SandboxStoreError::Conflict(format!("idempotency key conflict: {error}"))
+                    } else {
+                        unavailable(error)
+                    }
+                })?;
                 // 幂等读回（并发同 ID 时读回已存在行）。
                 let row = SandboxInstance::filter_by_sandbox_id(&record.sandbox_id)
                     .first()
@@ -587,16 +596,19 @@ impl SandboxStore for PgSandboxStore {
     async fn list_expired(&self, now_us: i64) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError> {
         self.run(move |tx| {
             Box::pin(async move {
-                // 到期实例只可能处于 Ready（Provisioning/Initializing 尚无 expires）。
-                let rows = SandboxInstance::filter_by_desired_state("ready")
-                    .exec(tx)
-                    .await
-                    .map_err(unavailable)?;
+                // Ready（用户 TTL 到期）+ WarmReady（温池闲置到期）；
+                // Provisioning/Initializing 无 expires。
                 let mut expired = Vec::new();
-                for row in rows {
-                    let record = instance_record(row)?;
-                    if record.expires_at_us.is_some_and(|expiry| expiry <= now_us) {
-                        expired.push(record);
+                for state in ["ready", "warm_ready"] {
+                    let rows = SandboxInstance::filter_by_desired_state(state)
+                        .exec(tx)
+                        .await
+                        .map_err(unavailable)?;
+                    for row in rows {
+                        let record = instance_record(row)?;
+                        if record.expires_at_us.is_some_and(|expiry| expiry <= now_us) {
+                            expired.push(record);
+                        }
                     }
                 }
                 Ok(expired)
@@ -645,19 +657,32 @@ impl SandboxStore for PgSandboxStore {
         &self,
         key: &str,
     ) -> Result<Option<SandboxInstanceRecord>, SandboxStoreError> {
-        // 无 Toasty 索引注解——用裸语句查询（低频路径，启动重试去重）
         let key = key.to_string();
         self.run(move |tx| {
+            let key = key.clone();
             Box::pin(async move {
-                let rows = SandboxInstance::filter_by_desired_state("ready")
-                    .exec(tx)
-                    .await
-                    .map_err(unavailable)?;
-                Ok(rows
-                    .into_iter()
-                    .find(|row| row.idempotency_key.as_deref() == Some(key.as_str()))
-                    .map(instance_record)
-                    .transpose()?)
+                // 必须覆盖全部非终态：创建进行中（Provisioning/Initializing）的网络重试
+                // 正是幂等键存在的意义，只扫 Ready 会让并发重试重复建沙箱。
+                for state in [
+                    "provisioning",
+                    "warm_ready",
+                    "initializing",
+                    "ready",
+                    "terminating",
+                    "cleanup_pending",
+                ] {
+                    let rows = SandboxInstance::filter_by_desired_state(state)
+                        .exec(tx)
+                        .await
+                        .map_err(unavailable)?;
+                    if let Some(row) = rows
+                        .into_iter()
+                        .find(|row| row.idempotency_key.as_deref() == Some(key.as_str()))
+                    {
+                        return Ok(Some(instance_record(row)?));
+                    }
+                }
+                Ok(None)
             })
         })
         .await
@@ -675,6 +700,7 @@ impl SandboxStore for PgSandboxStore {
         env_json: &str,
         metadata_json: Option<&str>,
         idempotency_key: Option<&str>,
+        hard_deadline_us: i64,
     ) -> Result<SandboxInstanceRecord, SandboxStoreError> {
         let sandbox_id = sandbox_id.to_string();
         let (tenant_id, key_id, token_hash, encrypted_token) = (
@@ -696,8 +722,10 @@ impl SandboxStore for PgSandboxStore {
             let metadata_json = metadata_json.clone();
             let idempotency_key = idempotency_key.clone();
             Box::pin(async move {
+                // expires_at_us 置 NULL：温池闲置 expires 若晚于新 hard_deadline 会违反
+                // sandbox_deadline CHECK；真实 expires 由随后的 mark_ready 写入。
                 let count = toasty::sql::statement(
-                    "UPDATE sandbox_instances SET desired_state='initializing',tenant_id=$1,key_id=$2,token_hash=$3,encrypted_token=$4,env_json=$5,metadata_json=$6,idempotency_key=$7,instance_revision=instance_revision+1,updated_at_us=$8 WHERE sandbox_id=$9 AND instance_revision=$10 AND desired_state='warm_ready'",
+                    "UPDATE sandbox_instances SET desired_state='initializing',tenant_id=$1,key_id=$2,token_hash=$3,encrypted_token=$4,env_json=$5,metadata_json=$6,idempotency_key=$7,expires_at_us=NULL,hard_deadline_us=$8,instance_revision=instance_revision+1,updated_at_us=$9 WHERE sandbox_id=$10 AND instance_revision=$11 AND desired_state='warm_ready'",
                 )
                 .bind(&tenant_id)
                 .bind(&key_id)
@@ -706,6 +734,7 @@ impl SandboxStore for PgSandboxStore {
                 .bind(&env_json)
                 .bind_typed(metadata_json.as_deref(), Type::Text)
                 .bind_typed(idempotency_key.as_deref(), Type::Text)
+                .bind(hard_deadline_us)
                 .bind(now_us())
                 .bind(&sandbox_id)
                 .bind(expected_revision)
@@ -724,6 +753,19 @@ impl SandboxStore for PgSandboxStore {
                     .map_err(unavailable)?
                     .ok_or_else(|| SandboxStoreError::Unavailable("claim row vanished".into()))?;
                 instance_record(row)
+            })
+        })
+        .await
+    }
+
+    async fn list_warm_ready(&self) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError> {
+        self.run(move |tx| {
+            Box::pin(async move {
+                let rows = SandboxInstance::filter_by_desired_state("warm_ready")
+                    .exec(tx)
+                    .await
+                    .map_err(unavailable)?;
+                rows.into_iter().map(instance_record).collect()
             })
         })
         .await

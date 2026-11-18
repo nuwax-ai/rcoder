@@ -240,7 +240,8 @@ pub trait SandboxStore: Send + Sync {
         &self,
         key: &str,
     ) -> Result<Option<SandboxInstanceRecord>, SandboxStoreError>;
-    /// 原子认领温池实例：WarmReady → Initializing + 注入租户/token/env/metadata。
+    /// 原子认领温池实例：WarmReady → Initializing + 注入租户/token/env/metadata
+    /// + 清空过期时间并设置 hard_deadline（认领时刻起的不可续期硬顶）。
     /// CAS on instance_revision；返回更新后的完整记录。
     async fn claim_warm_instance(
         &self,
@@ -253,7 +254,10 @@ pub trait SandboxStore: Send + Sync {
         env_json: &str,
         metadata_json: Option<&str>,
         idempotency_key: Option<&str>,
+        hard_deadline_us: i64,
     ) -> Result<SandboxInstanceRecord, SandboxStoreError>;
+    /// 全部 WarmReady 实例（温池候选与水位统计；调用方按模板过滤）。
+    async fn list_warm_ready(&self) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError>;
 
     // ---------- Volumes（M5） ----------
     async fn insert_volume(

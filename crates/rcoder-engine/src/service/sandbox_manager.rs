@@ -28,6 +28,10 @@ use docker_manager::runtime::k8s_sandbox::{
 
 pub const ENVD_PORT: i32 = 49983;
 
+/// 温池占位实例的 key_id（seed_registry 注入系统 key 满足外键；secret 是
+/// 永不签发的常量且 seed 时即置为已过期，无法通过 authenticate）。
+pub const WARM_POOL_KEY_ID: &str = "_warm-pool";
+
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxApiError {
     #[error("unauthorized")]
@@ -75,6 +79,7 @@ pub struct SandboxManager {
     volume_storage_class: String,
     volume_max_size_gib: i32,
     warm_pool_enabled: bool,
+    warm_idle_ttl_seconds: i64,
 }
 
 fn random_id(len: usize) -> String {
@@ -125,11 +130,26 @@ impl SandboxManager {
             volume_storage_class: config.volume_storage_class.clone(),
             volume_max_size_gib: config.volume_max_size_gib,
             warm_pool_enabled: config.warm_pool_enabled,
+            warm_idle_ttl_seconds: config.warm_idle_ttl_seconds.max(60),
         })
     }
 
     /// 配置驱动的幂等种子（api key 哈希 + 模板注册表）。
     pub async fn seed_registry(&self, config: &E2bSandboxConfig) -> Result<(), SandboxApiError> {
+        // 温池系统 key：sandbox_instances.key_id 有外键，占位实例必须引用一个真实行；
+        // expires=1（1970）使其永远无法通过 authenticate。
+        self.store
+            .seed_api_key(&SandboxApiKeyRecord {
+                key_id: WARM_POOL_KEY_ID.to_string(),
+                tenant_id: "_warm_pool".to_string(),
+                public_prefix: "_warm-po".to_string(),
+                key_hash: sha256_hex("rcoder:e2b:warm-pool:never-issue"),
+                scopes: "sandbox".to_string(),
+                expires_at_us: Some(1),
+                revoked_at_us: None,
+            })
+            .await
+            .map_err(store_error)?;
         for seed in &config.api_keys {
             self.store
                 .seed_api_key(&SandboxApiKeyRecord {
@@ -250,8 +270,9 @@ impl SandboxManager {
             }
         }
 
-        // 温池认领：找 WarmReady 实例 → 原子认领 → /init → Ready（跳过 Pod 创建）
-        if self.warm_pool_enabled {
+        // 温池认领：找 WarmReady 实例 → 原子认领 → /init → Ready（跳过 Pod 创建）。
+        // 卷挂载只能冷启动——温池 Pod 创建时没有任何 PVC。
+        if self.warm_pool_enabled && params.volume_mounts.is_empty() {
             if let Some(outcome) = self.try_claim_warm(&key, &params).await? {
                 return Ok(outcome);
             }
@@ -288,7 +309,7 @@ impl SandboxManager {
                 + 120)
                 * 1_000_000;
 
-        let mut record = SandboxInstanceRecord {
+        let record = SandboxInstanceRecord {
             sandbox_id: sandbox_id.clone(),
             tenant_id: key.tenant_id.clone(),
             key_id: key.key_id.clone(),
@@ -353,7 +374,30 @@ impl SandboxManager {
             resolved_volume_mounts.push((volume.pvc_name.clone(), mount.mount_path.clone()));
         }
 
-        record = self.store.insert_instance(&record).await.map_err(store_error)?;
+        // 并发同 Idempotency-Key 插入命中条件唯一索引（Conflict）→ 读回已有实例返回；
+        // 与前置 find_by_idempotency_key 检查构成双保险（检查-插入窗口内的竞态由此兜底）。
+        let record = match self.store.insert_instance(&record).await {
+            Ok(inserted) => inserted,
+            Err(SandboxStoreError::Conflict(reason)) => {
+                if let Some(idem_key) = &params.idempotency_key {
+                    if let Some(existing) = self
+                        .store
+                        .find_by_idempotency_key(idem_key)
+                        .await
+                        .map_err(store_error)?
+                    {
+                        tracing::info!(
+                            sandbox_id = %existing.sandbox_id,
+                            "e2b create 幂等冲突收敛，返回已有实例"
+                        );
+                        let token = self.decrypt_token(&existing)?;
+                        return Ok(CreateOutcome { record: existing, token });
+                    }
+                }
+                return Err(SandboxApiError::Conflict(reason));
+            }
+            Err(error) => return Err(store_error(error)),
+        };
 
         // 外部副作用：Pod 创建 + 等待 Ready。
         let pod_params = SandboxPodParams {
@@ -538,9 +582,8 @@ impl SandboxManager {
             .collect())
     }
 
-    /// 幂等 kill：终态重复调用返回成功。
     /// 幂等 kill：终态重复调用返回成功。CAS 重试防竞争（续期/回收/并发 kill）。
-    /// 撤销 token（token_generation +1）→ Terminating → 删 Pod → Deleted。
+    /// 撤销 token（状态置 Terminating + expires=0）→ 删 Pod → Deleted。
     pub async fn kill(
         &self,
         key: &SandboxApiKeyRecord,
@@ -559,9 +602,9 @@ impl SandboxManager {
         self.kill_by_record(&record).await
     }
 
-    /// 内部 kill（回收器/重启恢复直接调，不做租户检查）。
-    /// CAS 重试上限 5 次，每次重读后重新尝试转移；token_generation 递增使
-    /// 数据面授权立即失效（authorize_data_plane 会拒绝 generation 不匹配的 token）。
+    /// 内部 kill（回收器/重启恢复直接调，不做租户检查）。CAS 重试上限 5 次，
+    /// 每次重读后重新尝试转移。数据面授权立即失效的实际机制是状态检查 +
+    /// expires=0（authorize_data_plane 拒绝非 Ready 或已到期实例）。
     pub async fn kill_by_record(
         &self,
         initial: &SandboxInstanceRecord,
@@ -571,8 +614,7 @@ impl SandboxManager {
             if record.desired_state.terminal() {
                 return Ok(());
             }
-            // 第一步：Terminating + token 撤销（CAS；冲突则重读重试）。
-            let revoked_generation = record.token_generation + 1;
+            // 第一步：Terminating + expires=0（CAS；冲突则重读重试）。
             match self
                 .store
                 .transition_state(
@@ -585,7 +627,8 @@ impl SandboxManager {
                 .await
             {
                 Ok(mut updated) => {
-                    // 撤销 token：递增 generation（存储层 CAS 已保证原子性）。
+                    // expires=0 让数据面立即失效。输给并发 set_timeout 无害：
+                    // 终态化后 authorize 同样拒绝。
                     let _ = self
                         .store
                         .set_expires(&record.sandbox_id, updated.instance_revision, 0)
@@ -704,6 +747,22 @@ impl SandboxManager {
                                 tracing::info!(sandbox_id = %record.sandbox_id, phase = %status.phase, "recover: Ready 但 Pod 非 Running，kill");
                                 let _ = self.kill_by_record(&record).await;
                             }
+                            // Ready + Running → envd 存活检查（Pod 活着但 envd 死掉的
+                            // 场景正是生产事故里"沙箱不响应"的形态）
+                            SandboxInstanceState::Ready => {
+                                let Some(pod_ip) = status.pod_ip.clone() else {
+                                    continue;
+                                };
+                                if !self.envd_alive(&pod_ip).await {
+                                    tracing::warn!(sandbox_id = %record.sandbox_id, "recover: envd 无响应，kill");
+                                    let _ = self.kill_by_record(&record).await;
+                                }
+                            }
+                            // WarmReady 且 Pod 非 Running（节点回收等）→ kill 交回收器补池
+                            SandboxInstanceState::WarmReady if status.phase != "Running" => {
+                                tracing::info!(sandbox_id = %record.sandbox_id, phase = %status.phase, "recover: 温池 Pod 非 Running，kill");
+                                let _ = self.kill_by_record(&record).await;
+                            }
                             // Provisioning/Initializing 超时（创建时间 + 超时上限 < now）→ kill
                             SandboxInstanceState::Provisioning | SandboxInstanceState::Initializing => {
                                 let deadline = record.created_at_us
@@ -722,6 +781,26 @@ impl SandboxManager {
                 }
             }
         }
+    }
+
+    /// envd 存活探测：任何 HTTP 应答（含 404）都算进程活着；连续 3 次网络层
+    /// 失败才判死，避免 CNI 抖动误杀。
+    async fn envd_alive(&self, pod_ip: &str) -> bool {
+        let url = format!("http://{pod_ip}:{ENVD_PORT}/health");
+        for attempt in 1..=3u32 {
+            match self
+                .http
+                .get(&url)
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+            {
+                Ok(_) => return true,
+                Err(_) if attempt == 3 => return false,
+                Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+            }
+        }
+        false
     }
 
     pub async fn set_timeout(
@@ -843,15 +922,15 @@ impl SandboxManager {
             )));
         }
         // 同名检查
-        if let Some(existing) = self
+        if self
             .store
             .find_volume_by_name(&key.tenant_id, name)
             .await
             .map_err(store_error)?
+            .is_some()
         {
             return Err(SandboxApiError::Conflict(format!(
-                "volume \"{}\" 已存在",
-                name
+                "volume \"{name}\" 已存在"
             )));
         }
         let volume_id = random_id(12);
@@ -873,10 +952,12 @@ impl SandboxManager {
             updated_at_us: now,
             deleted_at_us: None,
         };
-        self.store
-            .insert_volume(&record)
-            .await
-            .map_err(store_error)
+        // 插入失败（同名竞态等）时回收已建的 PVC，不留无主卷。
+        if let Err(error) = self.store.insert_volume(&record).await {
+            let _ = self.k8s.delete_pvc(&record.pvc_name).await;
+            return Err(store_error(error));
+        }
+        Ok(record)
     }
 
     pub async fn list_volumes(
@@ -919,38 +1000,58 @@ impl SandboxManager {
 
     // ---------- 温池（M4） ----------
 
-    /// 尝试从温池认领一个实例。成功返回 Some(CreateOutcome)，池空返回 None 走冷启动。
+    /// 尝试从温池认领一个实例。成功返回 Some(CreateOutcome)；池空/被并发抢先
+    /// 返回 None 走冷启动。认领成功后的任何失败都会 kill 该实例（不留孤儿）。
     async fn try_claim_warm(
         &self,
         key: &SandboxApiKeyRecord,
         params: &CreateSandboxParams,
     ) -> Result<Option<CreateOutcome>, SandboxApiError> {
-        // 找 WarmReady 实例（按模板匹配）
+        // 先做与冷路径一致的入参校验（模板可用 + TTL 合法），再找候选。
+        let Some(spec) = self
+            .store
+            .get_template_spec(&params.template_id)
+            .await
+            .map_err(store_error)?
+        else {
+            return Ok(None);
+        };
+        let ttl_seconds = params.timeout_seconds.unwrap_or(self.default_ttl_seconds);
+        if ttl_seconds <= 0 {
+            return Err(SandboxApiError::Invalid("timeout 必须为正数秒".into()));
+        }
+        let ttl_cap = self.max_ttl_seconds.min(spec.ttl_max_seconds);
+        if ttl_seconds > ttl_cap {
+            return Err(SandboxApiError::Invalid(format!(
+                "timeout {ttl_seconds}s 超过上限 {ttl_cap}s"
+            )));
+        }
+
         let candidates = self
             .store
-            .list_all_non_terminal()
+            .list_warm_ready()
             .await
             .map_err(store_error)?;
-        let warm = candidates
+        let Some(mut record) = candidates
             .into_iter()
-            .filter(|r| {
-                r.desired_state == SandboxInstanceState::WarmReady
-                    && r.template_id == params.template_id
-            })
-            .next();
-        let Some(mut record) = warm else {
+            .find(|r| r.template_id == params.template_id)
+        else {
             return Ok(None);
         };
 
-        // 生成 token
         let token = random_token();
         let token_hash = sha256_hex(&token);
         let encrypted_token = self.encrypt_token(&token)?;
         let env_json = serde_json::to_string(&params.env)
             .map_err(|e| SandboxApiError::Unavailable(e.to_string()))?;
+        // hard_deadline 与冷路径同公式，但从认领时刻起算（Pod deadline 同步重置）。
+        let now = chrono::Utc::now().timestamp_micros();
+        let lifetime_seconds =
+            spec.ttl_max_seconds + self.create_ready_timeout.as_secs() as i64 + 120;
+        let hard_deadline_us = now + lifetime_seconds * 1_000_000;
 
-        // 原子认领（CAS）
-        record = self
+        // 原子认领；CAS 冲突 = 被并发 create 抢先 → 回落冷启动而非报 409。
+        record = match self
             .store
             .claim_warm_instance(
                 &record.sandbox_id,
@@ -962,46 +1063,71 @@ impl SandboxManager {
                 &env_json,
                 params.metadata.as_deref(),
                 params.idempotency_key.as_deref(),
+                hard_deadline_us,
             )
             .await
-            .map_err(store_error)?;
-
+        {
+            Ok(record) => record,
+            Err(SandboxStoreError::Conflict(_)) => {
+                tracing::debug!("e2b warm claim CAS 冲突，回落冷启动");
+                return Ok(None);
+            }
+            Err(error) => return Err(store_error(error)),
+        };
         tracing::info!(sandbox_id = %record.sandbox_id, "e2b warm claim: 从温池认领");
 
-        // envd /init（Pod 已在跑）
-        let spec = self
-            .store
-            .get_template_spec(&record.template_id)
-            .await
-            .map_err(store_error)?
-            .ok_or_else(|| SandboxApiError::Unavailable("模板消失".into()))?;
-        let status = self.k8s.pod_status(&record.pod_name).await
-            .map_err(k8s_error)?
-            .ok_or_else(|| SandboxApiError::Unavailable("温池 Pod 消失".into()))?;
-        let pod_ip = status.pod_ip.unwrap_or_default();
-        let mut env_map = spec.default_env.clone();
-        env_map.extend(params.env.iter().cloned());
-        self.envd_init(&pod_ip, &token, &spec, &env_map).await
-            .map_err(SandboxApiError::Unavailable)?;
+        let claimed = async {
+            let status = self
+                .k8s
+                .pod_status(&record.pod_name)
+                .await
+                .map_err(k8s_error)?
+                .ok_or_else(|| SandboxApiError::Unavailable("温池 Pod 消失".into()))?;
+            let pod_ip = status
+                .pod_ip
+                .clone()
+                .ok_or_else(|| SandboxApiError::Unavailable("温池 Pod 无 IP".into()))?;
+            // 重置 Pod activeDeadline：spawn 时设的是温池闲置 TTL，认领后按
+            // 真实生命周期续算，否则实例会在 spawn+闲置TTL 被无条件杀掉。
+            self.k8s
+                .patch_pod_deadline(&record.pod_name, lifetime_seconds)
+                .await
+                .map_err(k8s_error)?;
+            let mut env_map = spec.default_env.clone();
+            env_map.extend(params.env.iter().cloned());
+            self.envd_init(&pod_ip, &token, &spec, &env_map)
+                .await
+                .map_err(SandboxApiError::Unavailable)?;
+            let ready_at = chrono::Utc::now().timestamp_micros();
+            record = self
+                .store
+                .mark_ready(
+                    &record.sandbox_id,
+                    record.instance_revision,
+                    status.pod_uid.as_deref(),
+                    ready_at,
+                    ready_at + ttl_seconds * 1_000_000,
+                )
+                .await
+                .map_err(store_error)?;
+            Ok::<_, SandboxApiError>(())
+        }
+        .await;
 
-        let ttl_seconds = params.timeout_seconds.unwrap_or(self.default_ttl_seconds);
-        let ttl_cap = self.max_ttl_seconds.min(spec.ttl_max_seconds);
-        let ttl = ttl_seconds.min(ttl_cap);
-        let ready_at = chrono::Utc::now().timestamp_micros();
-
-        record = self
-            .store
-            .mark_ready(
-                &record.sandbox_id,
-                record.instance_revision,
-                status.pod_uid.as_deref(),
-                ready_at,
-                ready_at + ttl * 1_000_000,
-            )
-            .await
-            .map_err(store_error)?;
-
-        Ok(Some(CreateOutcome { record, token }))
+        match claimed {
+            Ok(()) => Ok(Some(CreateOutcome { record, token })),
+            Err(error) => {
+                // 认领后的失败必须回收：实例已带租户数据且置了 Initializing，
+                // 不 kill 会变成无 expires 的僵尸行。
+                tracing::warn!(
+                    sandbox_id = %record.sandbox_id,
+                    error = %error.to_string(),
+                    "e2b warm claim 失败，回收实例"
+                );
+                let _ = self.kill_by_record(&record).await;
+                Err(error)
+            }
+        }
     }
 
     /// 温池补池器（后台任务体）：保持每模板的 WarmReady 数量 ≥ warm_target。
@@ -1029,6 +1155,14 @@ impl SandboxManager {
                     continue;
                 }
             };
+            // 每轮一次全量温池水位扫描，按模板分组（替代逐模板全表扫）。
+            let warm_all = match self.store.list_warm_ready().await {
+                Ok(list) => list,
+                Err(error) => {
+                    tracing::warn!(error = %error, "warm pool: 温池水位扫描失败");
+                    continue;
+                }
+            };
             for template in templates {
                 let spec = match self.store.get_template_spec(&template.template_id).await {
                     Ok(Some(spec)) => spec,
@@ -1037,17 +1171,9 @@ impl SandboxManager {
                 if spec.warm_target <= 0 {
                     continue;
                 }
-                // 统计当前 WarmReady 数
-                let all = match self.store.list_all_non_terminal().await {
-                    Ok(list) => list,
-                    Err(_) => continue,
-                };
-                let warm_count = all
-                    .into_iter()
-                    .filter(|r| {
-                        r.desired_state == SandboxInstanceState::WarmReady
-                            && r.template_id == template.template_id
-                    })
+                let warm_count = warm_all
+                    .iter()
+                    .filter(|r| r.template_id == template.template_id)
                     .count();
                 if warm_count >= spec.warm_target as usize {
                     continue;
@@ -1063,6 +1189,8 @@ impl SandboxManager {
     }
 
     /// 创建一个温池实例（无租户数据，token 为占位符）。
+    /// 两阶段：先 Provisioning（带闲置 expires，可被恢复/回收器收敛），Pod Running
+    /// 后才转 WarmReady 进入可认领池；任一步失败即终态化，绝不留僵尸 WarmReady 行。
     async fn spawn_warm_instance(&self, spec: &SandboxTemplateSpec) -> Result<(), SandboxApiError> {
         let sandbox_id = random_id(12);
         let pod_name = format!("e2b-warm-{sandbox_id}");
@@ -1072,7 +1200,7 @@ impl SandboxManager {
         let record = SandboxInstanceRecord {
             sandbox_id: sandbox_id.clone(),
             tenant_id: "_warm_pool".to_string(),
-            key_id: "_warm".to_string(),
+            key_id: WARM_POOL_KEY_ID.to_string(),
             template_id: spec.template_id.clone(),
             template_revision: spec.revision,
             image: spec.image.clone(),
@@ -1081,7 +1209,8 @@ impl SandboxManager {
             runtime_class: spec.runtime_class.clone(),
             cpu_millicores: spec.cpu_millicores,
             memory_mib: spec.memory_mib,
-            desired_state: SandboxInstanceState::WarmReady,
+            // Provisioning 而非 WarmReady：Pod 未 Running 前不可认领。
+            desired_state: SandboxInstanceState::Provisioning,
             observed_state: None,
             instance_revision: 1,
             namespace: self.k8s.namespace().to_string(),
@@ -1097,11 +1226,16 @@ impl SandboxManager {
             created_at_us: now,
             updated_at_us: now,
             ready_at_us: None,
-            expires_at_us: None,
+            // 未认领到期由回收器收敛（list_expired 含 warm_ready）。
+            expires_at_us: Some(now + self.warm_idle_ttl_seconds * 1_000_000),
             hard_deadline_us: None,
             deleted_at_us: None,
         };
-        self.store.insert_instance(&record).await.map_err(store_error)?;
+        let record = self
+            .store
+            .insert_instance(&record)
+            .await
+            .map_err(store_error)?;
         let pod_params = SandboxPodParams {
             name: record.pod_name.clone(),
             image: record.image.clone(),
@@ -1109,7 +1243,8 @@ impl SandboxManager {
             cpu_millicores: record.cpu_millicores,
             memory_mib: record.memory_mib,
             envd_port: ENVD_PORT,
-            max_lifetime_seconds: 3600, // 温池实例最长 1h 未认领则回收
+            // Pod 级兜底与 record expires 同源；认领时会 patch 重置。
+            max_lifetime_seconds: self.warm_idle_ttl_seconds,
             env: Vec::new(),
             volume_mounts: Vec::new(),
         };
@@ -1117,12 +1252,48 @@ impl SandboxManager {
             Ok(_) => {}
             Err(error) => {
                 let _ = self.k8s.delete_pod(&record.pod_name).await;
-                let _ = self.store.finish(&sandbox_id, 1, SandboxInstanceState::Failed, Some(&error.to_string())).await;
+                let _ = self
+                    .store
+                    .finish(
+                        &sandbox_id,
+                        record.instance_revision,
+                        SandboxInstanceState::Failed,
+                        Some(&error.to_string()),
+                    )
+                    .await;
                 return Err(k8s_error(error));
             }
         }
-        // 等 Pod Running 即转 WarmReady（不等 envd /init——认领时才 init）
-        let _ = self.k8s.wait_ready(&record.pod_name, self.create_ready_timeout).await;
+        match self
+            .k8s
+            .wait_ready(&record.pod_name, self.create_ready_timeout)
+            .await
+        {
+            Ok(_) => {}
+            Err(error) => {
+                let _ = self.k8s.delete_pod(&record.pod_name).await;
+                let _ = self
+                    .store
+                    .finish(
+                        &sandbox_id,
+                        record.instance_revision,
+                        SandboxInstanceState::Failed,
+                        Some(&error.to_string()),
+                    )
+                    .await;
+                return Err(k8s_error(error));
+            }
+        }
+        self.store
+            .transition_state(
+                &sandbox_id,
+                record.instance_revision,
+                SandboxInstanceState::WarmReady,
+                None,
+                Some("Running"),
+            )
+            .await
+            .map_err(store_error)?;
         tracing::info!(sandbox_id = %sandbox_id, template = %spec.template_id, "warm pool: 实例就绪");
         Ok(())
     }

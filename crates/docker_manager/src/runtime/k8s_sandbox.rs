@@ -13,7 +13,6 @@ use k8s_openapi::api::core::v1::{
     ResourceRequirements, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use kube::{api::ObjectMeta, Api, Client};
 use std::time::Duration;
 
@@ -234,6 +233,19 @@ impl SandboxK8s {
             Err(kube::Error::Api(response)) if response.code == 404 => Ok(false),
             Err(error) => Err(err("delete pod", error)),
         }
+    }
+
+    /// 重置 Pod activeDeadlineSeconds（温池认领时续命：K8s 语义为更新即重置计时，
+    /// 否则认领的实例会在"spawn 时刻 + 温池闲置 TTL"被无条件杀掉）。
+    pub async fn patch_pod_deadline(&self, name: &str, seconds: i64) -> Result<(), SandboxK8sError> {
+        let patch = kube::api::Patch::Merge(serde_json::json!({
+            "spec": { "activeDeadlineSeconds": seconds }
+        }));
+        self.pods()
+            .patch(name, &kube::api::PatchParams::default(), &patch)
+            .await
+            .map(|_| ())
+            .map_err(|error| err("patch pod deadline", error))
     }
 
     pub async fn pod_status(&self, name: &str) -> Result<Option<SandboxPodStatus>, SandboxK8sError> {
