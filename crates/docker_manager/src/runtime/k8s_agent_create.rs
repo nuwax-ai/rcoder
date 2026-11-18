@@ -155,6 +155,10 @@ impl KubernetesRuntime {
                         }
                         // 新用户初始化中断的自愈: 卷已建但 Migrated 未落——
                         // 重放标记完成初始化(幂等), 不留在共享卷等显式迁移。
+                        // 残余边角(已评估接受): phase-a 用户在预同步期把共享卷
+                        // 删空会落入本象限被误判——后果是被切到预同步快照
+                        // (删除操作"复活"为旧数据, 非新数据丢失); 需要同时满足
+                        // "删空全部数据 + 恰逢 agent 重建"两个条件, 概率极低。
                         (true, SharedDirProbe::Absent) => {
                             self.set_workspace_migration_state(
                                 identifier,
