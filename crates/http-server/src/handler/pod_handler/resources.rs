@@ -528,10 +528,23 @@ use std::convert::Infallible;
     responses(
         (
             status = 200,
-            description = "SSE 资源监控流。event=resources 的 data 为 JSON:\n\
-              `{ts, container:{alive,cpu_percent,memory_mb,memory_limit_mb,cpu_limit_cores}, agent:{alive,status,cpu_percent,memory_mb}}`。\n\
-              agent 字段为容器内当前执行的实时观测(执行换代后自动跟随新代次);\n\
-              采集降级时对应字段缺省;连续失败将关断流。Content-Type: text/event-stream",
+            description = "SSE 资源监控流。event=resources 的 data 为 JSON:\n\n\
+              `{ts, container:{alive,cpu_percent,memory_mb,memory_limit_mb,cpu_limit_cores},\n\
+                agent:{alive,status,cpu_percent,memory_mb},\n\
+                processes?:[{pid,comm,rss_mb,cpu_seconds,group}],\n\
+                agents?:[{project_id,session_id,status,rss_mb,cpu_seconds,process_count}],\n\
+                process_groups?:{infra_rss_mb,platform_rss_mb,workload_rss_mb}}`\n\n\
+              **`processes` / `agents` / `process_groups` 仅在 `include_processes=true`（默认 true）时携带**：\n\
+              - `processes` 是容器内进程明细（含 cgroup 角色分组 group：infra/platform/workload）；\n\
+              - `agents` 是**每个 project 一条**的 agent 进程组聚合（会话级 RSS/CPU/进程数），\n\
+                做「Agent 会话列表」用这个，不要自己从 processes 里猜；\n\
+              - 三者**缺省 = 本轮未采样**，与「采样了但确实是 0 条」不同（后者是空数组）。\n\n\
+              口径：container.* 是**容器 cgroup 级**实时值（区别于 `/computer/pod/overview` 的\n\
+              `usage`——那是 metrics-server 的窗口平均值，两者数值会有差异，别混用）。\n\
+              agent 字段为容器内当前执行的实时观测（执行换代后自动跟随新代次）；\n\
+              采集降级时对应字段缺省；连续失败（约 30s）将关断流，客户端需自行重连。\n\
+              **容器死亡时流会断开**：要感知 OOM/重启请用 `/computer/pod/health`，不要只靠本流。\n\
+              Content-Type: text/event-stream",
         ),
         (
             status = 400,
