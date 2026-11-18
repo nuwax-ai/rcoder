@@ -57,8 +57,7 @@ impl WorkspaceRuntime for KubernetesRuntime {
         use crate::runtime::k8s_pvc::K8sPvcOps;
         const TTL: std::time::Duration = std::time::Duration::from_secs(30);
         let cache_key = format!("{service_type}/{identifier}");
-        if let Some((exists, _, at)) = self.workspace_exists_cache.read().await.get(&cache_key)
-        {
+        if let Some((exists, _, at)) = self.workspace_exists_cache.read().await.get(&cache_key) {
             if at.elapsed() < TTL {
                 return Ok(*exists);
             }
@@ -83,7 +82,7 @@ impl WorkspaceRuntime for KubernetesRuntime {
             Err(e) => {
                 return Err(ContainerRuntimeError::K8sError(format!(
                     "workspace_pvc_exists: get PVC '{pvc_name}' failed: {e}"
-                )))
+                )));
             }
         };
         self.upsert_cache_if_not_stale(&cache_key, (exists, state), sampled_at)
@@ -131,7 +130,7 @@ impl WorkspaceRuntime for KubernetesRuntime {
             Err(e) => {
                 return Err(ContainerRuntimeError::K8sError(format!(
                     "get PVC '{pvc_name}': {e}"
-                )))
+                )));
             }
         };
         self.upsert_cache_if_not_stale(&cache_key, (exists, state), sampled_at)
@@ -371,7 +370,10 @@ impl KubernetesRuntime {
                 return; // 期间已有更新写入, 旧查询结果作废
             }
         }
-        cache.insert(cache_key.to_string(), (value.0, value.1, std::time::Instant::now()));
+        cache.insert(
+            cache_key.to_string(),
+            (value.0, value.1, std::time::Instant::now()),
+        );
     }
 
     /// per-agent 卷判据的**同步**版（best-effort, 供 replacement 等同步构造

@@ -16,8 +16,6 @@ pub mod orchestrate;
 
 pub use intercept::computer_rbd_intercept;
 
-
-
 /// computer 域转发透传清单（path 前缀/模板，method 透传不分类）。
 ///
 /// 与 userapp `CONTAINER_PASS_THROUGH_PATHS` 同治理模式：显式枚举。来源 =
@@ -188,7 +186,9 @@ fn query_param<'a>(query: &'a str, key: &str) -> Option<String> {
 /// 该路径是否在透传清单内（转发前过滤; 精确段匹配不前缀吞并——
 /// `/api/computer/static-x` 不得被 static 模板误吞）。
 pub fn is_pass_through_path(path: &str) -> bool {
-    COMPUTER_PASS_THROUGH_PATHS.iter().any(|tmpl| path_matches(tmpl, path))
+    COMPUTER_PASS_THROUGH_PATHS
+        .iter()
+        .any(|tmpl| path_matches(tmpl, path))
 }
 
 /// 模板匹配: `{seg}` 单段通配, `{*rest}` 尾部通配（对齐 axum 语法子集）。
@@ -274,7 +274,10 @@ mod tests {
             resolve_target(Some("../etc"), None, "/x"),
             TargetResolution::Invalid
         );
-        assert_eq!(resolve_target(Some(""), None, "/x"), TargetResolution::Absent);
+        assert_eq!(
+            resolve_target(Some(""), None, "/x"),
+            TargetResolution::Absent
+        );
         assert_eq!(
             resolve_target(None, Some("userId=..%2Fetc"), "/x"),
             TargetResolution::Invalid
@@ -291,7 +294,9 @@ mod tests {
     #[test]
     fn pass_through_table_matches_and_rejects() {
         assert!(is_pass_through_path("/api/computer/get-file-list"));
-        assert!(is_pass_through_path("/api/computer/static/6/1696379/deep/dir/f.txt"));
+        assert!(is_pass_through_path(
+            "/api/computer/static/6/1696379/deep/dir/f.txt"
+        ));
         // 未登记路径不被前缀吞并
         assert!(!is_pass_through_path("/api/computer/staticx/6"));
         assert!(!is_pass_through_path("/api/computer/unknown-route"));

@@ -50,7 +50,11 @@ impl FeatureFlags {
         }
         eprintln!(
             "🔧 [FEATURE_FLAGS] per_agent_pvc={} per_agent_rbd={} userapp_per_app_pvc={} embed_file_server={} batch_migrate_on_startup={}",
-            f.per_agent_pvc, f.per_agent_rbd, f.userapp_per_app_pvc, f.embed_file_server, f.batch_migrate_on_startup
+            f.per_agent_pvc,
+            f.per_agent_rbd,
+            f.userapp_per_app_pvc,
+            f.embed_file_server,
+            f.batch_migrate_on_startup
         );
     }
 

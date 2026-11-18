@@ -20,10 +20,10 @@
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Deserialize;
 
 use crate::router::AppState;
@@ -183,11 +183,7 @@ pub async fn phase_a(
             "steps": outcome.steps,
         }))
         .into_response(),
-        Err(error) => (
-            StatusCode::BAD_GATEWAY,
-            format!("phase-a failed: {error}"),
-        )
-            .into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, format!("phase-a failed: {error}")).into_response(),
     }
 }
 
@@ -209,11 +205,7 @@ pub async fn cutover(
             "steps": outcome.steps,
         }))
         .into_response(),
-        Err(error) => (
-            StatusCode::BAD_GATEWAY,
-            format!("cutover failed: {error}"),
-        )
-            .into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, format!("cutover failed: {error}")).into_response(),
     }
 }
 
@@ -234,11 +226,9 @@ pub async fn rollback(
             "steps": outcome.steps,
         }))
         .into_response(),
-        Err(error) => (
-            StatusCode::BAD_GATEWAY,
-            format!("rollback failed: {error}"),
-        )
-            .into_response(),
+        Err(error) => {
+            (StatusCode::BAD_GATEWAY, format!("rollback failed: {error}")).into_response()
+        }
     }
 }
 

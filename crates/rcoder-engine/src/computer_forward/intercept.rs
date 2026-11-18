@@ -27,7 +27,7 @@ use crate::service::computer_container_manager::{
     ComputerContainerManager, ContainerCreateOptions,
 };
 
-use super::{is_pass_through_path, resolve_target, TargetResolution};
+use super::{TargetResolution, is_pass_through_path, resolve_target};
 
 /// wake 预算：spike 实测冷启动（STS 0→1 到文件可服务）5.0-9.5s，常态 5-6s。
 /// 超预算返回 503+Retry-After；K8s 侧创建继续，下一请求幂等 ensure 走快路径。
@@ -48,7 +48,12 @@ pub enum InterceptDecision {
     Forward,
 }
 
-fn decide(flag_on: bool, path_in_table: bool, target_present: bool, is_rbd_user: bool) -> InterceptDecision {
+fn decide(
+    flag_on: bool,
+    path_in_table: bool,
+    target_present: bool,
+    is_rbd_user: bool,
+) -> InterceptDecision {
     if flag_on && path_in_table && target_present && is_rbd_user {
         InterceptDecision::Forward
     } else {
@@ -103,7 +108,11 @@ pub async fn computer_rbd_intercept(
                 path,
                 "[COMPUTER_FORWARD] invalid user identifier in request, rejecting"
             );
-            return (axum::http::StatusCode::BAD_REQUEST, "invalid user identifier").into_response();
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid user identifier",
+            )
+                .into_response();
         }
     };
     // 混住判据: PVC 存在 **且 migrated 标记生效**才转发。
@@ -127,8 +136,7 @@ pub async fn computer_rbd_intercept(
             return service_unavailable("workspace state temporarily unavailable");
         }
     };
-    let is_rbd_user =
-        migration_state == shared_types::WorkspaceMigrationState::Migrated;
+    let is_rbd_user = migration_state == shared_types::WorkspaceMigrationState::Migrated;
     if decide(true, true, true, is_rbd_user) == InterceptDecision::PassThrough {
         return next.run(req).await;
     }
@@ -195,11 +203,19 @@ async fn forward_to_agent(state: &AppState, user_id: &str, req: Request) -> Resp
             return service_unavailable("agent container unavailable");
         }
         Err(_) => {
-            tracing::info!(user_id, "[COMPUTER_FORWARD] wake budget exceeded, 503+retry");
+            tracing::info!(
+                user_id,
+                "[COMPUTER_FORWARD] wake budget exceeded, 503+retry"
+            );
             return service_unavailable("agent container is starting, retry shortly");
         }
     };
-    let Some(ip) = info.container_ip.split(':').next().filter(|s| !s.is_empty()) else {
+    let Some(ip) = info
+        .container_ip
+        .split(':')
+        .next()
+        .filter(|s| !s.is_empty())
+    else {
         return service_unavailable("agent container address not ready");
     };
     let addr = format!("{}:{}", ip, shared_types::HTTP_DEFAULT_PORT);
@@ -260,8 +276,7 @@ async fn stream_to_addr(addr: &str, req: Request) -> Response {
     parts.headers.remove("host");
     parts.headers.remove("x-api-key");
     let listed = connection_listed(&parts.headers);
-    let mut outbound = crate::http_client::forward_client()
-        .request(parts.method.clone(), &target);
+    let mut outbound = crate::http_client::forward_client().request(parts.method.clone(), &target);
     for (name, value) in &parts.headers {
         if is_hop_by_hop(name.as_str(), &listed) {
             continue;
@@ -324,7 +339,9 @@ const HOP_BY_HOP: [&str; 10] = [
 fn is_hop_by_hop(name: &str, connection_listed: &[String]) -> bool {
     let lower = name.to_ascii_lowercase();
     HOP_BY_HOP.contains(&lower.as_str())
-        || connection_listed.iter().any(|listed| listed.eq_ignore_ascii_case(name))
+        || connection_listed
+            .iter()
+            .any(|listed| listed.eq_ignore_ascii_case(name))
 }
 
 fn connection_listed(headers: &HeaderMap) -> Vec<String> {
@@ -349,10 +366,22 @@ mod tests {
     fn decision_all_gates_required() {
         assert_eq!(decide(true, true, true, true), InterceptDecision::Forward);
         // 任一闸门关闭 → 放行（flag 关 = 现状逐字节一致的关键）
-        assert_eq!(decide(false, true, true, true), InterceptDecision::PassThrough);
-        assert_eq!(decide(true, false, true, true), InterceptDecision::PassThrough);
-        assert_eq!(decide(true, true, false, true), InterceptDecision::PassThrough);
-        assert_eq!(decide(true, true, true, false), InterceptDecision::PassThrough);
+        assert_eq!(
+            decide(false, true, true, true),
+            InterceptDecision::PassThrough
+        );
+        assert_eq!(
+            decide(true, false, true, true),
+            InterceptDecision::PassThrough
+        );
+        assert_eq!(
+            decide(true, true, false, true),
+            InterceptDecision::PassThrough
+        );
+        assert_eq!(
+            decide(true, true, true, false),
+            InterceptDecision::PassThrough
+        );
     }
 
     #[test]

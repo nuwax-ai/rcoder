@@ -80,12 +80,7 @@ impl ComputerContainerManager {
         user_id: &str,
     ) -> Result<tokio::sync::OwnedMutexGuard<()>, AppError> {
         let deadline = tokio::time::Instant::now() + creation::WAITER_BUDGET;
-        creation::acquire(
-            &ServiceType::ComputerAgentRunner,
-            user_id,
-            deadline,
-        )
-        .await
+        creation::acquire(&ServiceType::ComputerAgentRunner, user_id, deadline).await
     }
 }
 

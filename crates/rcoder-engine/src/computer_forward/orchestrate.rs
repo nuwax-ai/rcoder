@@ -279,11 +279,7 @@ pub async fn rollback(
     steps.push("agent stopped".to_string());
     state
         .runtime()
-        .set_workspace_migration_state(
-            user_id,
-            &service_type,
-            WorkspaceMigrationState::NotMigrated,
-        )
+        .set_workspace_migration_state(user_id, &service_type, WorkspaceMigrationState::NotMigrated)
         .await
         .map_err(|e| wrap("set_not_migrated", e))?;
     steps.push("migration state = not-migrated".to_string());
