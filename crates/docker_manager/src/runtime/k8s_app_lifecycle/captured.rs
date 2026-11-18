@@ -175,6 +175,26 @@ impl KubernetesRuntime {
         }
         self.claim_app_storage_with_context(&target.context.app_id, Some(&target.context))
             .await?;
+        // Start-path image alignment only rolls workloads already running a
+        // platform-managed image: the pod template's repository must equal the
+        // platform reference's repository. Foreign or explicitly pinned images
+        // keep their template (spec sandbox-image-version-drift R1); the
+        // explicit restart entry keeps its unconditional roll contract.
+        let image = match image {
+            Some(desired) => {
+                if self.template_runs_platform_image(target, desired).await? {
+                    Some(desired)
+                } else {
+                    tracing::warn!(
+                        app = %target.context.app_id,
+                        desired,
+                        "start image alignment skipped: template image is not platform-managed"
+                    );
+                    None
+                }
+            }
+            None => None,
+        };
         let receipt = serde_json::to_string(&target.context).map_err(|error| {
             ContainerRuntimeError::ConfigurationError(format!("Encode start receipt: {error}"))
         })?;
@@ -189,6 +209,36 @@ impl KubernetesRuntime {
         } else {
             self.patch_captured_app(&target.resource, patch).await
         }
+    }
+
+    /// Whether the deployment's current pod template image belongs to the
+    /// platform's image repository. Read-only precheck for the start-path
+    /// alignment guard; the caller's conditional patch still fences concurrent
+    /// mutations, and a UID change between this read and the patch surfaces as
+    /// a capture conflict on retry.
+    async fn template_runs_platform_image(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+        platform_reference: &str,
+    ) -> ContainerRuntimeResult<bool> {
+        let name = self.app_deployment_name(&target.context.app_id);
+        let deployment = self.deployments_api().get(&name).await.map_err(|error| {
+            ContainerRuntimeError::K8sError(format!("Read application template image: {error}"))
+        })?;
+        if deployment.metadata.uid.as_deref().unwrap_or_default() != target.resource.uid {
+            return Err(ContainerRuntimeError::Conflict(
+                "Application start target identity changed".into(),
+            ));
+        }
+        let template_image = deployment
+            .spec
+            .and_then(|spec| spec.template.spec)
+            .and_then(|spec| spec.containers.into_iter().next())
+            .and_then(|container| container.image);
+        Ok(template_image
+            .as_deref()
+            .map(image_repository)
+            .is_some_and(|repository| repository == image_repository(platform_reference)))
     }
 
     pub(crate) async fn stop_captured_target(

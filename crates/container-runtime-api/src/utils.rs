@@ -18,3 +18,18 @@ pub fn split_log_timestamp(line: &str, timestamps: bool) -> (Option<String>, Str
     }
     (None, line.to_string())
 }
+
+/// 镜像引用的仓库段（`registry/ns/app:tag@digest` → `registry/ns/app`）。
+/// 最后一个不在路径段内的冒号起点是 tag；digest 后缀忽略。daemon 内容
+/// ID（`sha256:…`）无仓库段，返回 `sha256`，永不与平台仓库相等。
+///
+/// 启动路径镜像对齐的归属守卫共用（K8s 与 Docker 同一判定）：仅当现有
+/// 模板/容器镜像与平台当前引用同仓库时才滚动到新 tag；外部或显式钉住
+/// 的镜像保留原样（spec sandbox-image-version-drift R1）。
+pub fn image_repository(reference: &str) -> &str {
+    let without_digest = reference.split('@').next().unwrap_or(reference);
+    match without_digest.rsplit_once(':') {
+        Some((repository, tag)) if !tag.is_empty() && !tag.contains('/') => repository,
+        _ => without_digest,
+    }
+}

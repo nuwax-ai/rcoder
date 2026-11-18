@@ -3391,6 +3391,42 @@ async fn controlled_restart_deduplicates_and_is_distinct_from_start() {
 }
 
 #[tokio::test]
+async fn traffic_cold_wake_carries_platform_image_into_start_write() {
+    restart_image_env();
+    let root = tempfile::tempdir().expect("directory");
+    let (service, runtime) = created_app_service(root.path(), "coldwakeimage").await;
+    service
+        .stop_app_controlled(
+            "coldwakeimage",
+            shared_types::UserAppControlRequest {
+                lifecycle_id: None,
+                request_id: Some("stop-before-wake".into()),
+            },
+        )
+        .await
+        .expect("stop");
+    let before_restart = runtime.restart_calls.load(Ordering::SeqCst);
+    let outcome = service
+        .wake_app_on_traffic("coldwakeimage", std::time::Duration::from_secs(5))
+        .await
+        .expect("cold wake");
+    assert!(
+        matches!(
+            outcome,
+            shared_types::WakeOutcome::Ready | shared_types::WakeOutcome::AlreadyRunning
+        ),
+        "{outcome:?}"
+    );
+    // 冷唤醒与显式启动共享同一镜像意图（spec sandbox-image-version-drift R1）：
+    // 平台镜像受理时冻结并进入启动写入；归属守卫在 k8s 写边界。
+    assert_eq!(runtime.restart_calls.load(Ordering::SeqCst), before_restart + 1);
+    assert_eq!(
+        runtime.restart_images.lock().expect("images").as_slice(),
+        &[Some("registry.test/app-runtime:ut".to_string())]
+    );
+}
+
+#[tokio::test]
 async fn bare_start_rolls_existing_app_to_platform_image() {
     restart_image_env();
     let root = tempfile::tempdir().expect("directory");

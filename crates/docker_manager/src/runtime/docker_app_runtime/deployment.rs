@@ -708,6 +708,55 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         self.start_captured_target(target).await
     }
 
+    /// 启动路径镜像对齐的归属守卫（与 K8s `start_captured_with_policy` 同一
+    /// 判定，spec sandbox-image-version-drift R1）：仅当捕获容器当前镜像与
+    /// 平台当前引用同仓库时才滚动；外部/显式钉住的镜像保留原容器启动。
+    async fn start_app_target_with_image(
+        &self,
+        target: &shared_types::UserAppMutationTarget,
+        image: Option<&str>,
+    ) -> ContainerRuntimeResult<()> {
+        let image = match image {
+            Some(desired) => {
+                let inspect = self
+                    .inner
+                    .get_docker_client()
+                    .inspect_container(&target.resource.uid, None)
+                    .await
+                    .map_err(|error| {
+                        ContainerRuntimeError::DockerError(format!(
+                            "Inspect application start target: {error}"
+                        ))
+                    })?;
+                let current = inspect
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.image.as_deref());
+                if current
+                    .map(container_runtime_api::image_repository)
+                    .is_some_and(|repository| {
+                        repository == container_runtime_api::image_repository(desired)
+                    })
+                {
+                    Some(desired)
+                } else {
+                    tracing::warn!(
+                        app = %target.context.app_id,
+                        desired,
+                        "start image alignment skipped: container image is not platform-managed"
+                    );
+                    None
+                }
+            }
+            None => None,
+        };
+        if image.is_some() {
+            self.restart_captured_target(target, image).await
+        } else {
+            self.start_captured_target(target).await
+        }
+    }
+
     async fn prepare_app_compute_start(
         &self,
         target: &shared_types::UserAppMutationTarget,

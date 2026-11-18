@@ -1,5 +1,8 @@
 use super::*;
 
+// 启动对齐归属守卫的仓库段判定下沉在 container-runtime-api（K8s/Docker 共用）。
+pub(super) use container_runtime_api::image_repository;
+
 pub(super) fn app_mutation_identity(
     name: String,
     metadata: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
