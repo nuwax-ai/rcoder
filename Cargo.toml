@@ -118,8 +118,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.151"
 serde_yaml = "=0.9.33"
 serde_urlencoded = "0.7"
-schemars = { version = "1.2", features = ["derive"] }
-config = "0.15"
 
 # Validation
 garde = { version = "0.23.0", features = ["derive", "regex"] }
@@ -163,9 +161,7 @@ path-clean = "1.0"
 dashmap = "6.2"
 futures = "0.3"
 futures-util = "0.3"
-itertools = "0.15"
 bytes = "1.12"
-arrayvec = "0.7"
 arc-swap = "1.9"
 md5 = "0.8"
 process-wrap = { version = "10.0.1", features = ["tokio1", "process-group", "job-object"] }
@@ -178,16 +174,11 @@ percent-encoding = "2.3"
 rustls = { version = "0.23", features = ["ring"] }
 
 # Additional utilities
-indoc = "2.0"
 parking_lot = "0.13"
 lockmap = "0.2.3"
-convert_case = "0.12"
 # Persistent data structures for CoW-friendly multi-session tracking (C2/M3 fix)
 # imbl = im 的活跃维护 fork（im 15.1 已 unmaintained，RUSTSEC-2026-0248）
 imbl = { version = "7.0", features = ["serde"] }
-handlebars = { version = "6.4", features = ["rust-embed"] }
-rust-embed = "8.14"
-zstd = "0.14"
 
 # Kubernetes
 kube = { version = "5.1", features = ["runtime", "client", "kube-runtime", "config", "ws"] }
@@ -205,16 +196,11 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 # /proc 解析（agent_runner 统计容器内 noVNC 端口 ESTABLISHED 连接，判 VNC 桌面是否在用）。
 # 仅在 Linux target 的 agent_runner 里引入（target-gated），Mac 开发编译不拉它。
 procfs = "0.18"
-unindent = "0.2"                                                   # 使用 crates.io 版本
-open = "5.4"                                                       # 使用 crates.io 版本
-git2 = "0.21"
-tree-sitter-rust = "0.24"                                          # 使用 crates.io 版本
 
 
 # Additional dependencies for nuwax_parser
 sha2 = "0.11"
 hex = "0.4"
-walkdir = "2.5"
 # 并行目录遍历 (work-stealing 线程池), 用于 file-server search-files。
 # 取代手写 BFS: 零 syscall d_type + 多线程并行, dua-cli (gitoxide 作者 Byron 维护) 的核心库。
 dua-core = "6.1"
@@ -237,38 +223,25 @@ reqwest = { version = "0.13", default-features = false, features = [
 genai = "0.7"
 
 # 项目依赖 - 保留核心功能
-aho-corasick = "1.1"
 base64 = "0.23"
-circular-buffer = "2.0"
-fancy-regex = "0.20"
-fuzzy = "0.0.1"
 globset = "0.4"
-image = "0.25"
-indexmap = "2.14"
 pathdiff = "0.2"
-postage = "0.5"
 regex = "1.13"
 semver = "1.0"
 # npm/node 版本范围语义（与 package.json 依赖版本一致；不同于 Cargo semver）
 node-semver = "2.2"
-shellexpand = "3.1"
 winnow = "1.0.4"
 workspace-manifest = { path = "crates/workspace-manifest" }
 userapp-log-reader = { path = "crates/userapp-log-reader" }
 shlex = "2.0"
-smallvec = "1.16"
 
 toml = "1.2"
 which = "8.0"
 
 
 # Dev dependencies for testing
-ctor = "1.0"
-pretty_assertions = "1.4"
 tempfile = "3.27"
 rand = "0.10"
-tokio-test = "0.4"
-expect-test = "1.5"
 
 # File system utilities
 dirs = "7.0"
@@ -291,7 +264,6 @@ utoipa-scalar = { version = "0.4", features = ["axum"] }
 ringbuf = "0.6"
 
 
-diffy = { version = "0.5" }
 
 pingora = { version = "0.9.1", features = ["lb", "rustls"] }
 pingora-core = { version = "0.9.1", features = ["rustls"] }
