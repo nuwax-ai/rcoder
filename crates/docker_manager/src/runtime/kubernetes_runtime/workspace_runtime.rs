@@ -202,7 +202,7 @@ impl WorkspaceRuntime for KubernetesRuntime {
             })?;
         // 即时写缓存: cutover 后首个请求就要按新判据路由
         self.workspace_exists_cache.write().await.insert(
-            format!("{service_type}/{identifier}"),
+            self.migration_cache_key(identifier, service_type),
             (true, state, std::time::Instant::now()),
         );
         Ok(())
@@ -287,7 +287,7 @@ impl WorkspaceRuntime for KubernetesRuntime {
             .await
             .unwrap_or(shared_types::WorkspaceMigrationState::NotMigrated);
         self.workspace_exists_cache.write().await.insert(
-            format!("{service_type}/{identifier}"),
+            self.migration_cache_key(identifier, service_type),
             (true, state, std::time::Instant::now()),
         );
         Ok(())

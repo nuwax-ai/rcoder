@@ -25,7 +25,7 @@ static MIGRATING_USERS: LazyLock<std::sync::RwLock<HashSet<String>>> =
 pub fn begin(user_id: &str) {
     MIGRATING_USERS
         .write()
-        .expect("migration gate lock poisoned")
+        .unwrap_or_else(|e| e.into_inner())  // 锁毒化恢复(项目禁 expect)
         .insert(user_id.to_string());
 }
 
@@ -34,7 +34,7 @@ pub fn begin(user_id: &str) {
 pub fn end(user_id: &str) {
     MIGRATING_USERS
         .write()
-        .expect("migration gate lock poisoned")
+        .unwrap_or_else(|e| e.into_inner())  // 锁毒化恢复(项目禁 expect)
         .remove(user_id);
 }
 
@@ -42,7 +42,7 @@ pub fn end(user_id: &str) {
 pub fn is_migrating(user_id: &str) -> bool {
     MIGRATING_USERS
         .read()
-        .expect("migration gate lock poisoned")
+        .unwrap_or_else(|e| e.into_inner())
         .contains(user_id)
 }
 

@@ -64,7 +64,7 @@ pub const COMPUTER_PASS_THROUGH_PATHS: &[&str] = &[
     // 判 Absent 自然放行本地，无需按 workspaceType 细分。
     "/api/git/branches",
     "/api/git/tags",
-    "/api/git/log-history",
+    "/api/git/log", // 实际路由是 /log（handler 名 log_history 误导, 终审 P1）
     "/api/git/file-content",
     "/api/git/status",
     "/api/git/init",

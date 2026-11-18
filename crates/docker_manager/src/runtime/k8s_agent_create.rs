@@ -118,9 +118,12 @@ impl KubernetesRuntime {
                         .await
                         .map(|p| p.is_some())
                         .unwrap_or(false);
-                    if pvc_exists || legacy_shared_workspace_nonempty(identifier).await {
-                        false
-                    } else {
+                    let shared_state = probe_shared_dir(identifier).await;
+                    match (pvc_exists, shared_state) {
+                        // PVC 已建(phase-a 过) 或 共享卷有存量: 保持共享路径
+                        (true, _) | (false, SharedDirProbe::NonEmpty) => false,
+                        // 真新用户: 初始化直上 RBD
+                        (false, SharedDirProbe::Absent) => {
                         self.ensure_workspace_pvc(
                             identifier,
                             &service_type,
@@ -133,10 +136,21 @@ impl KubernetesRuntime {
                             shared_types::WorkspaceMigrationState::Migrated,
                         )
                         .await?;
-                        info!(
-                            "[K8S] new user '{identifier}' initialized on per-agent RBD"
-                        );
-                        true
+                            info!(
+                                "[K8S] new user '{identifier}' initialized on per-agent RBD"
+                            );
+                            true
+                        }
+                        // 探测不可信(env 未设/IO 错误): fail-closed 拒绝初始化
+                        // ——误判新用户会让存量用户数据"消失"(空 RBD 卷+存在即
+                        // 转发)。上抛可重试错误, 不静默回落(语义随机漂移)。
+                        (false, SharedDirProbe::ProbeFailed) => {
+                            return Err(ContainerRuntimeError::ConnectionError(format!(
+                                "cannot probe shared workspace for '{identifier}' \
+                                 (COMPUTER_WORKSPACE_DIR unset or IO error); \
+                                 refusing new-user RBD initialization"
+                            )));
+                        }
                     }
                 }
             }
@@ -171,7 +185,7 @@ impl KubernetesRuntime {
                         service_type,
                         ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject
                     )
-                    && legacy_shared_workspace_nonempty(identifier).await
+                    && matches!(probe_shared_dir(identifier).await, SharedDirProbe::NonEmpty)
                 {
                     // PVC 已存在(phase-a 建过/已迁移) = 流程内用户, 不拦;
                     // PVC 缺失 + 共享卷非空 = 未迁移存量用户误触, 拒绝。
@@ -827,14 +841,29 @@ fn legacy_shared_root() -> Option<std::path::PathBuf> {
 
 /// 该 identifier 的共享卷目录是否非空。NotFound → false（新用户）；
 /// 其他 IO 错误 → false（fail-open：探测失败不阻断创建，迁移流程是真源）。
-async fn legacy_shared_workspace_nonempty(identifier: &str) -> bool {
+/// 共享卷探测三态（终审 P1）：Absent=目录不存在（真新用户）；
+/// NonEmpty=有存量（存量用户）；ProbeFailed=无法探测（env 未设/IO 错误）。
+/// 消费方语义相反：legacy 防护把 ProbeFailed 当"无存量"放行（fail-open，
+/// 保持共享=安全方向）；F8 初始化把 ProbeFailed 上抛（fail-closed——
+/// 当新用户处理会让存量用户数据"消失"，探测不可信时必须拒绝初始化）。
+enum SharedDirProbe {
+    Absent,
+    NonEmpty,
+    ProbeFailed,
+}
+
+async fn probe_shared_dir(identifier: &str) -> SharedDirProbe {
     let Some(root) = legacy_shared_root() else {
-        return false;
+        return SharedDirProbe::ProbeFailed;
     };
     let path = root.join(identifier);
     match tokio::fs::read_dir(&path).await {
-        Ok(mut rd) => rd.next_entry().await.ok().flatten().is_some(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => false,
+        Ok(mut rd) => match rd.next_entry().await {
+            Ok(Some(_)) => SharedDirProbe::NonEmpty,
+            Ok(None) => SharedDirProbe::Absent,
+            Err(_) => SharedDirProbe::ProbeFailed,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => SharedDirProbe::Absent,
+        Err(_) => SharedDirProbe::ProbeFailed,
     }
 }

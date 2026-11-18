@@ -59,7 +59,12 @@ pub(crate) fn build_agent_env_vars(
     // file-server 据此把 computer 解析切到 {root}/{cid}（卷根即用户家目录）
     // 并拒绝 user_id 不匹配的请求（防转发层定位错乱跨用户读写）。
     // 共享形态不注入（保持 {root}/{uid}/{cid} 双层布局）。
-    if per_agent_volume {
+    if per_agent_volume
+        && matches!(
+            service_type,
+            ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject
+        )
+    {
         env_vars.push(EnvVar {
             name: "RCODER_AGENT_BOUND_USER_ID".to_string(),
             value: Some(user_id_val.to_string()),
