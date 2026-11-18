@@ -362,8 +362,11 @@ impl SandboxStore for PgSandboxStore {
                 .await
                 .map_err(|error| {
                     // 并发同 Idempotency-Key 插入触发条件唯一索引——交给调用方按幂等语义收敛。
+                    // 固定文案：PG 原始错误不外泄。
                     if error.to_string().contains("sandbox_instances_idem") {
-                        SandboxStoreError::Conflict(format!("idempotency key conflict: {error}"))
+                        SandboxStoreError::Conflict(
+                            "idempotency key already in flight for another request".into(),
+                        )
                     } else {
                         unavailable(error)
                     }
@@ -605,10 +608,11 @@ impl SandboxStore for PgSandboxStore {
     async fn list_expired(&self, now_us: i64) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError> {
         self.run(move |tx| {
             Box::pin(async move {
-                // Ready（用户 TTL 到期）+ WarmReady（温池闲置到期）；
-                // Provisioning/Initializing 无 expires。
+                // Ready（用户 TTL 到期）+ WarmReady（温池闲置到期）+ Terminating
+                // （kill 中断兜底：第一步已置 expires=0，第二步删 Pod 前进程死亡，
+                // 无其他在线扫描覆盖 Terminating）；Provisioning/Initializing 无 expires。
                 let mut expired = Vec::new();
-                for state in ["ready", "warm_ready"] {
+                for state in ["ready", "warm_ready", "terminating"] {
                     let rows = SandboxInstance::filter_by_desired_state(state)
                         .exec(tx)
                         .await
@@ -664,14 +668,19 @@ impl SandboxStore for PgSandboxStore {
 
     async fn find_by_idempotency_key(
         &self,
+        tenant_id: &str,
         key: &str,
     ) -> Result<Option<SandboxInstanceRecord>, SandboxStoreError> {
+        let tenant_id = tenant_id.to_string();
         let key = key.to_string();
         self.run(move |tx| {
+            let tenant_id = tenant_id.clone();
             let key = key.clone();
             Box::pin(async move {
                 // 必须覆盖全部非终态：创建进行中（Provisioning/Initializing）的网络重试
                 // 正是幂等键存在的意义，只扫 Ready 会让并发重试重复建沙箱。
+                // 租户过滤：幂等唯一索引是全局的（baseline 冻结不可改），
+                // 跨租户同键命中由调用方按冲突拒绝。
                 for state in [
                     "provisioning",
                     "warm_ready",
@@ -688,7 +697,11 @@ impl SandboxStore for PgSandboxStore {
                         .into_iter()
                         .find(|row| row.idempotency_key.as_deref() == Some(key.as_str()))
                     {
-                        return Ok(Some(instance_record(row)?));
+                        let record = instance_record(row)?;
+                        if record.tenant_id != tenant_id {
+                            return Ok(None);
+                        }
+                        return Ok(Some(record));
                     }
                 }
                 Ok(None)
@@ -753,7 +766,9 @@ impl SandboxStore for PgSandboxStore {
                     // 并发同 Idempotency-Key 双 claim：UPDATE 撞幂等唯一索引 →
                     // Conflict → 调用方回落冷路径（insert 的读回兜底随后接管）。
                     if error.to_string().contains("sandbox_instances_idem") {
-                        SandboxStoreError::Conflict(format!("idempotency key conflict: {error}"))
+                        SandboxStoreError::Conflict(
+                            "idempotency key already in flight for another request".into(),
+                        )
                     } else {
                         unavailable(error)
                     }
@@ -811,7 +826,14 @@ impl SandboxStore for PgSandboxStore {
                 .bind(record.created_at_us)
                 .exec(tx)
                 .await
-                .map_err(unavailable)?;
+                .map_err(|error| {
+                    // 并发同名创建撞 (tenant,name) 部分唯一索引——固定文案 409。
+                    if error.to_string().contains("sandbox_volumes_name") {
+                        SandboxStoreError::Conflict("volume name already exists".into())
+                    } else {
+                        unavailable(error)
+                    }
+                })?;
                 let _ = count;
                 let row = SandboxVolume::filter_by_volume_id(&record.volume_id)
                     .first()
@@ -862,6 +884,24 @@ impl SandboxStore for PgSandboxStore {
                     .next()
                     .map(volume_record)
                     .transpose()
+            })
+        })
+        .await
+    }
+
+    async fn list_all_active_volumes(
+        &self,
+    ) -> Result<Vec<SandboxVolumeRecord>, SandboxStoreError> {
+        self.run(move |tx| {
+            Box::pin(async move {
+                let rows = SandboxVolume::all()
+                    .exec(tx)
+                    .await
+                    .map_err(unavailable)?;
+                rows.into_iter()
+                    .filter(|row| row.deleted_at_us.is_none())
+                    .map(volume_record)
+                    .collect()
             })
         })
         .await

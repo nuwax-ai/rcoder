@@ -235,9 +235,11 @@ pub trait SandboxStore: Send + Sync {
     async fn list_cleanup_pending(&self) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError>;
     /// 全部非终态实例（重启恢复用；不按租户过滤）。
     async fn list_all_non_terminal(&self) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError>;
-    /// 按幂等键查找非终态实例（网络重试去重）。
+    /// 按幂等键查找非终态实例（网络重试去重；租户内匹配——跨租户同键
+    /// 视为冲突，由调用方拒绝，绝不返回他人实例）。
     async fn find_by_idempotency_key(
         &self,
+        tenant_id: &str,
         key: &str,
     ) -> Result<Option<SandboxInstanceRecord>, SandboxStoreError>;
     /// 原子认领温池实例：WarmReady → Initializing + 注入租户/token/env/metadata
@@ -274,6 +276,9 @@ pub trait SandboxStore: Send + Sync {
         tenant_id: &str,
         name: &str,
     ) -> Result<Option<SandboxVolumeRecord>, SandboxStoreError>;
+    /// 全部未软删卷（回收器对账"行在 PVC 缺失"的空卷用）。
+    async fn list_all_active_volumes(&self)
+    -> Result<Vec<SandboxVolumeRecord>, SandboxStoreError>;
     async fn list_volumes(
         &self,
         tenant_id: &str,

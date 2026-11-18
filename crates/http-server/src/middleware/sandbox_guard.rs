@@ -96,6 +96,9 @@ fn proxy_client() -> &'static reqwest::Client {
         reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             // 数据面流不设总超时（长任务/PTY 由沙箱生命周期约束）。
+            // 禁止跟随重定向：沙箱侧 3xx 不得让 rcoder 进程向授权外的目标
+            // 发起请求（白名单只覆盖首次连接）；3xx 原样交还客户端。
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("e2b proxy client")
     })
@@ -172,7 +175,7 @@ pub async fn e2b_data_plane_guard(
     let target = format!("{pod_ip}:{port}");
 
     if is_websocket_upgrade(request.headers()) {
-        return websocket_tunnel(request, &target).await;
+        return websocket_tunnel(request, &target, &rest, &token).await;
     }
 
     let (parts, body) = request.into_parts();
@@ -238,14 +241,14 @@ pub async fn e2b_data_plane_guard(
 /// `Sec-WebSocket-Accept`）原样回传客户端；随后双向透传，不解 WS 帧
 /// （copy_bidirectional 直通，天然支持 CDP/MCP 等任意子协议）。
 /// 上游不可达或拒绝握手时，客户端拿到真实错误而非一个随后黑洞的 101。
-async fn websocket_tunnel(request: Request<Body>, target: &str) -> Response {
+async fn websocket_tunnel(request: Request<Body>, target: &str, rest: &str, token: &str) -> Response {
     use tokio::io::AsyncWriteExt;
 
     const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
     const HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
     let (parts, _body) = request.into_parts();
-    let handshake = serialize_upgrade_request(&parts);
+    let handshake = serialize_upgrade_request(&parts, rest, token);
     let on_upgrade = hyper::upgrade::on(Request::from_parts(parts, Body::empty()));
     let target = target.to_string();
 
@@ -280,11 +283,30 @@ async fn websocket_tunnel(request: Request<Body>, target: &str) -> Response {
     };
 
     // 非 101：上游拒绝升级（如鉴权失败）——原样回传状态与响应体。
+    // 定界按上游声明：Content-Length 精确读；chunked 透传原始字节并保留
+    // Transfer-Encoding 头（客户端自行解块），读到终止块为止；两者皆无
+    // 才以连接关闭（EOF）为界——避免 keep-alive 上游让客户端挂等。
     if head.status != 101 {
+        let content_length = head
+            .headers
+            .iter()
+            .find(|(name, _)| name == "content-length")
+            .and_then(|(_, value)| value.parse::<u64>().ok());
+        let chunked = head
+            .headers
+            .iter()
+            .any(|(name, value)| {
+                name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked")
+            });
         let mut builder =
             Response::builder().status(StatusCode::from_u16(head.status).unwrap_or(StatusCode::BAD_GATEWAY));
         for (name, value) in &head.headers {
-            if HOP_BY_HOP.contains(&name.to_ascii_lowercase().as_str()) {
+            let name = name.as_str();
+            // 定界头保留（与 body 构造方式一致），其余 hop-by-hop 滤除。
+            if HOP_BY_HOP.contains(&name)
+                && name != "content-length"
+                && name != "transfer-encoding"
+            {
                 continue;
             }
             if let (Ok(name), Ok(value)) = (
@@ -294,9 +316,17 @@ async fn websocket_tunnel(request: Request<Body>, target: &str) -> Response {
                 builder = builder.header(name, value);
             }
         }
-        return match builder.body(Body::from_stream(leftover_then_socket(
+        let bound = if let Some(length) = content_length {
+            BodyBound::Length(length)
+        } else if chunked {
+            BodyBound::Chunked
+        } else {
+            BodyBound::Eof
+        };
+        return match builder.body(Body::from_stream(bounded_body(
             head.leftover,
             upstream,
+            bound,
         ))) {
             Ok(response) => response,
             Err(_) => error_response(StatusCode::BAD_GATEWAY, "代理响应构造失败"),
@@ -348,19 +378,18 @@ async fn websocket_tunnel(request: Request<Body>, target: &str) -> Response {
     response
 }
 
-/// 把客户端的升级请求重新序列化为 HTTP/1.1 原始字节（网关路由头剔除，
-/// 其余逐字保留——Sec-WebSocket-Key/Protocol/Version 必须原样到达上游）。
-fn serialize_upgrade_request(parts: &axum::http::request::Parts) -> Vec<u8> {
-    let path = parts
-        .uri
-        .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or("/");
-    let mut out = format!("{} {} HTTP/1.1\r\n", parts.method, path).into_bytes();
+/// 把客户端的升级请求重新序列化为 HTTP/1.1 原始字节。
+/// 请求行用**已解析的 rest**（路径模式下去掉 /sandboxes/{id}/{port} 前缀；
+/// 头模式即原始路径）；网关路由头剔除、客户端 X-Access-Token 剔除后注入
+/// 网关已校验的值——query 模式的令牌（rest 携带）之外，上游同时得到
+/// 标准头形式。Sec-WebSocket-Key/Protocol/Version 必须原样到达上游。
+fn serialize_upgrade_request(parts: &axum::http::request::Parts, rest: &str, token: &str) -> Vec<u8> {
+    let mut out = format!("GET {rest} HTTP/1.1\r\n").into_bytes();
     for (name, value) in parts.headers.iter() {
         let name = name.as_str();
         if name.eq_ignore_ascii_case("e2b-sandbox-id")
             || name.eq_ignore_ascii_case("e2b-sandbox-port")
+            || name.eq_ignore_ascii_case("x-access-token")
         {
             continue;
         }
@@ -369,7 +398,9 @@ fn serialize_upgrade_request(parts: &axum::http::request::Parts) -> Vec<u8> {
         out.extend_from_slice(value.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
-    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(b"X-Access-Token: ");
+    out.extend_from_slice(token.as_bytes());
+    out.extend_from_slice(b"\r\n\r\n");
     out
 }
 
@@ -432,40 +463,84 @@ fn parse_response_head(head: &[u8], leftover: Vec<u8>) -> Option<UpstreamHead> {
     })
 }
 
-/// 非 101 场景的响应体：先吐 leftover，再流式转发上游 socket 剩余字节。
-fn leftover_then_socket(
+/// 非 101 场景的响应体定界。
+enum BodyBound {
+    /// 精确读 N 字节（上游 Content-Length）。
+    Length(u64),
+    /// 透传原始 chunked 字节，读到终止块（\r\n0\r\n\r\n 且其后无数据）为止。
+    Chunked,
+    /// 以连接关闭为界（上游未声明任何定界）。
+    Eof,
+}
+
+/// 非 101 场景的响应体：先吐 leftover，再按 BodyBound 定界转发上游字节。
+fn bounded_body(
     leftover: Vec<u8>,
     stream: tokio::net::TcpStream,
+    bound: BodyBound,
 ) -> impl futures::Stream<Item = Result<axum::body::Bytes, std::io::Error>> {
     use tokio::io::AsyncReadExt as _;
     struct Source {
         pending: Option<Vec<u8>>,
         stream: Option<tokio::net::TcpStream>,
+        bound: BodyBound,
+        sent: u64,
     }
     futures::stream::unfold(
         Source {
             pending: Some(leftover),
             stream: Some(stream),
+            bound,
+            sent: 0,
         },
         |mut state| async move {
-            if let Some(pending) = state.pending.take()
-                && !pending.is_empty()
-            {
-                return Some((Ok(axum::body::Bytes::from(pending)), state));
+            if let Some(pending) = state.pending.take() {
+                if !pending.is_empty() {
+                    state.sent += pending.len() as u64;
+                    return Some((Ok(axum::body::Bytes::from(pending)), state));
+                }
             }
-            let mut stream = state.stream.take()?;
+            // Length 定界：已读满即结束（即便上游连接仍开着）。
+            if let BodyBound::Length(total) = state.bound {
+                if state.sent >= total {
+                    return None;
+                }
+            }
+            let Some(mut stream) = state.stream.take() else {
+                return None;
+            };
             let mut buf = vec![0u8; 16 * 1024];
             match stream.read(&mut buf).await {
                 Ok(0) => None,
                 Ok(read) => {
                     buf.truncate(read);
+                    let chunk = axum::body::Bytes::from(buf);
+                    // Chunked 定界：终止块到达即收（stream 不归还，流自然终止）。
+                    // 终止块字节保留在流内——客户端解块器会正确停在其后。
+                    if let BodyBound::Chunked = state.bound {
+                        if ends_with_chunked_terminator(&chunk) {
+                            state.sent += chunk.len() as u64;
+                            return Some((Ok(chunk), state));
+                        }
+                    }
+                    state.sent += chunk.len() as u64;
                     state.stream = Some(stream);
-                    Some((Ok(axum::body::Bytes::from(buf)), state))
+                    Some((Ok(chunk), state))
                 }
                 Err(error) => Some((Err(error), state)),
             }
         },
     )
+}
+
+/// 判断该字节段是否以 chunked 终止块收尾：`0\r\n\r\n` 结束，且其前是行首
+/// （\n 之后或恰为段首，即空 chunked 体）。近似检测：跨读边界的终止符交给
+/// EOF 兜底（安全方向——不截断，只是可能多等连接关闭）。
+fn ends_with_chunked_terminator(chunk: &[u8]) -> bool {
+    if !chunk.ends_with(b"0\r\n\r\n") {
+        return false;
+    }
+    chunk.len() == 5 || chunk[chunk.len() - 6] == b'\n'
 }
 
 #[cfg(test)]
@@ -584,25 +659,42 @@ mod tests {
     #[test]
     fn serialize_upgrade_request_keeps_handshake_and_strips_routing_headers() {
         let parts = upgrade_parts(
-            "/mcp?session=1",
+            "/sandboxes/abc123/49983/mcp?session=1",
             &[
                 ("e2b-sandbox-id", "abc123"),
-                ("e2b-sandbox-port", "8788"),
+                ("e2b-sandbox-port", "49983"),
                 ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
                 ("sec-websocket-version", "13"),
-                ("x-access-token", "tok"),
+                ("x-access-token", "client-side-token"),
             ],
         );
-        let raw = serialize_upgrade_request(&parts);
+        let raw = serialize_upgrade_request(&parts, "/mcp?session=1", "verified-token");
         let text = String::from_utf8(raw.clone()).unwrap();
+        // 请求行必须是已解析的 rest（去掉沙箱路由前缀），不是原始 URI
         assert!(
             text.starts_with("GET /mcp?session=1 HTTP/1.1\r\n"),
-            "请求行必须原样（含查询串）：{text:?}"
+            "请求行必须用解析后的 rest：{text:?}"
         );
+        assert!(!text.contains("/sandboxes/"), "路由前缀不得透传上游");
         assert!(text.contains("sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ=="));
-        assert!(text.contains("x-access-token: tok"));
+        // 客户端 token 剔除、网关校验值注入（恰好一次；头名大小写不敏感）
+        assert!(!text.contains("client-side-token"));
+        assert_eq!(
+            text.to_lowercase()
+                .matches("x-access-token: verified-token")
+                .count(),
+            1
+        );
         assert!(!text.contains("e2b-sandbox"), "网关路由头不得透传");
         assert!(raw.ends_with(b"\r\n\r\n"), "头区必须以空行结束");
+    }
+
+    #[test]
+    fn chunked_terminator_detection() {
+        assert!(ends_with_chunked_terminator(b"body\r\n0\r\n\r\n"));
+        assert!(ends_with_chunked_terminator(b"0\r\n\r\n"));
+        assert!(!ends_with_chunked_terminator(b"body\r\n5\r\nhello"));
+        assert!(!ends_with_chunked_terminator(b"0\r\n\r\nextra"));
     }
 
     #[test]

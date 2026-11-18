@@ -28,6 +28,18 @@ use docker_manager::runtime::k8s_sandbox::{
 
 pub const ENVD_PORT: i32 = 49983;
 
+/// kill 的处置资格来源：决定 CAS 重试重读后是否复核原判定仍成立。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillReason {
+    /// 用户显式 kill / 认领失败回收 / 创建失败回收：无需复核（操作者持有最新事实）。
+    Explicit,
+    /// 回收器按到期扫描：重读后必须复核 expires 仍 <= now——并发续期/温池认领
+    /// 赢得 CAS 时放弃处置，绝不误杀刚续期或刚被认领的实例。
+    ReapExpired,
+    /// 重启恢复按陈旧状态判定：重读后复核非终态即可（竞态窗口为启动一次性）。
+    Recover,
+}
+
 /// 温池占位实例的 key_id（seed_registry 注入系统 key 满足外键；secret 是
 /// 永不签发的常量且 seed 时即置为已过期，无法通过 authenticate）。
 pub const WARM_POOL_KEY_ID: &str = "_warm-pool";
@@ -120,6 +132,9 @@ impl SandboxManager {
             k8s,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
+                // 禁止跟随重定向：沙箱侧 3xx 不得让 rcoder 进程向授权外的
+                // 目标发起请求（SSRF 面）；上游 3xx 原样交由调用方处理。
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|error| format!("e2b_sandbox http client: {error}"))?,
             default_ttl_seconds: config.default_ttl_seconds,
@@ -257,17 +272,26 @@ impl SandboxManager {
         key: &SandboxApiKeyRecord,
         params: &CreateSandboxParams,
     ) -> Result<CreateOutcome, SandboxApiError> {
-        // 幂等：同 Idempotency-Key 的非终态实例直接返回（网络重试去重）
+        // 幂等：同 Idempotency-Key 的非终态实例直接返回（网络重试去重）。
+        // 仅租户内匹配 + 仅 Ready 视为可复用成功；进行中/清理中返回 409 让
+        // 客户端重试（官方幂等语义：创建未完成不得当成功发布）。
         if let Some(idem_key) = &params.idempotency_key {
             if let Some(existing) = self
                 .store
-                .find_by_idempotency_key(idem_key)
+                .find_by_idempotency_key(&key.tenant_id, idem_key)
                 .await
                 .map_err(store_error)?
             {
-                tracing::info!(sandbox_id = %existing.sandbox_id, "e2b create 幂等命中，返回已有实例");
-                let token = self.decrypt_token(&existing)?;
-                return Ok(CreateOutcome { record: existing, token });
+                return match existing.desired_state {
+                    SandboxInstanceState::Ready => {
+                        tracing::info!(sandbox_id = %existing.sandbox_id, "e2b create 幂等命中，返回已有实例");
+                        let token = self.decrypt_token(&existing)?;
+                        Ok(CreateOutcome { record: existing, token })
+                    }
+                    state => Err(SandboxApiError::Conflict(format!(
+                        "同幂等键的沙箱正在{state:?}，请稍后重试"
+                    ))),
+                };
             }
         }
 
@@ -375,24 +399,31 @@ impl SandboxManager {
             resolved_volume_mounts.push((volume.pvc_name.clone(), mount.mount_path.clone()));
         }
 
-        // 并发同 Idempotency-Key 插入命中条件唯一索引（Conflict）→ 读回已有实例返回；
-        // 与前置 find_by_idempotency_key 检查构成双保险（检查-插入窗口内的竞态由此兜底）。
+        // 并发同 Idempotency-Key 插入命中条件唯一索引（Conflict）→ 读回已有实例：
+        // 仅租户内且 Ready 才按成功返回（跨租户同键/进行中一律 409，绝不解密
+        // 他人实例）；与前置 find_by_idempotency_key 构成双保险。
         let record = match self.store.insert_instance(&record).await {
             Ok(inserted) => inserted,
             Err(SandboxStoreError::Conflict(reason)) => {
                 if let Some(idem_key) = &params.idempotency_key {
                     if let Some(existing) = self
                         .store
-                        .find_by_idempotency_key(idem_key)
+                        .find_by_idempotency_key(&key.tenant_id, idem_key)
                         .await
                         .map_err(store_error)?
                     {
-                        tracing::info!(
-                            sandbox_id = %existing.sandbox_id,
-                            "e2b create 幂等冲突收敛，返回已有实例"
-                        );
-                        let token = self.decrypt_token(&existing)?;
-                        return Ok(CreateOutcome { record: existing, token });
+                        if existing.desired_state == SandboxInstanceState::Ready {
+                            tracing::info!(
+                                sandbox_id = %existing.sandbox_id,
+                                "e2b create 幂等冲突收敛，返回已有实例"
+                            );
+                            let token = self.decrypt_token(&existing)?;
+                            return Ok(CreateOutcome { record: existing, token });
+                        }
+                        return Err(SandboxApiError::Conflict(format!(
+                            "同幂等键的沙箱正在{:?}，请稍后重试",
+                            existing.desired_state
+                        )));
                     }
                 }
                 return Err(SandboxApiError::Conflict(reason));
@@ -600,20 +631,37 @@ impl SandboxManager {
         if record.desired_state.terminal() {
             return Ok(());
         }
-        self.kill_by_record(&record).await
+        self.kill_by_record(&record, KillReason::Explicit).await
     }
 
     /// 内部 kill（回收器/重启恢复直接调，不做租户检查）。CAS 重试上限 5 次，
-    /// 每次重读后重新尝试转移。数据面授权立即失效的实际机制是状态检查 +
-    /// expires=0（authorize_data_plane 拒绝非 Ready 或已到期实例）。
+    /// 每次重读后按 KillReason 复核处置资格。数据面授权立即失效的实际机制是
+    /// 状态检查 + expires=0（authorize_data_plane 拒绝非 Ready 或已到期实例）。
     pub async fn kill_by_record(
         &self,
         initial: &SandboxInstanceRecord,
+        reason: KillReason,
     ) -> Result<(), SandboxApiError> {
         let mut record = initial.clone();
         for attempt in 0..5 {
             if record.desired_state.terminal() {
                 return Ok(());
+            }
+            if let KillReason::ReapExpired = reason {
+                // 处置资格复核：并发续期（expires 推后）或温池认领（expires 置
+                // NULL、状态 Initializing）都使本方丧失回收资格。
+                let now = chrono::Utc::now().timestamp_micros();
+                if !record
+                    .expires_at_us
+                    .is_some_and(|expires| expires <= now)
+                {
+                    tracing::info!(
+                        sandbox_id = %record.sandbox_id,
+                        ?record.expires_at_us,
+                        "e2b reaper: 到期资格已被并发操作刷新，放弃回收"
+                    );
+                    return Ok(());
+                }
             }
             // 第一步：Terminating + expires=0（CAS；冲突则重读重试）。
             match self
@@ -725,28 +773,50 @@ impl SandboxManager {
                             SandboxInstanceState::Terminating
                             | SandboxInstanceState::CleanupPending => {
                                 tracing::info!(sandbox_id = %record.sandbox_id, "recover: 清理残留 Pod");
-                                let _ = self.k8s.delete_pod(&record.pod_name).await;
-                                let _ = self
-                                    .store
-                                    .finish(
-                                        &record.sandbox_id,
-                                        record.instance_revision,
-                                        SandboxInstanceState::Deleted,
-                                        Some("recovered: cleanup"),
-                                    )
-                                    .await;
+                                // 删除结果未知/失败不得写终态——保留可重试状态
+                                // （CleanupPending 由 reaper 兜底再扫）。
+                                match self.k8s.delete_pod(&record.pod_name).await {
+                                    Ok(_) => {
+                                        let _ = self
+                                            .store
+                                            .finish(
+                                                &record.sandbox_id,
+                                                record.instance_revision,
+                                                SandboxInstanceState::Deleted,
+                                                Some("recovered: cleanup"),
+                                            )
+                                            .await;
+                                    }
+                                    Err(delete_error) => {
+                                        tracing::warn!(
+                                            sandbox_id = %record.sandbox_id,
+                                            error = %delete_error.to_string(),
+                                            "recover: Pod 删除失败，保留待清理状态"
+                                        );
+                                        let _ = self
+                                            .store
+                                            .transition_state(
+                                                &record.sandbox_id,
+                                                record.instance_revision,
+                                                SandboxInstanceState::CleanupPending,
+                                                Some(&format!("pod delete: {delete_error}")),
+                                                None,
+                                            )
+                                            .await;
+                                    }
+                                }
                             }
                             // Provisioning/Initializing 且 Pod 终相 → kill
                             SandboxInstanceState::Provisioning | SandboxInstanceState::Initializing
                                 if matches!(status.phase.as_str(), "Failed" | "Succeeded") =>
                             {
                                 tracing::info!(sandbox_id = %record.sandbox_id, phase = %status.phase, "recover: Pod 终相，kill");
-                                let _ = self.kill_by_record(&record).await;
+                                let _ = self.kill_by_record(&record, KillReason::Recover).await;
                             }
                             // Ready 且 Pod 非 Running → kill
                             SandboxInstanceState::Ready if status.phase != "Running" => {
                                 tracing::info!(sandbox_id = %record.sandbox_id, phase = %status.phase, "recover: Ready 但 Pod 非 Running，kill");
-                                let _ = self.kill_by_record(&record).await;
+                                let _ = self.kill_by_record(&record, KillReason::Recover).await;
                             }
                             // Ready + Running → envd 存活检查（Pod 活着但 envd 死掉的
                             // 场景正是生产事故里"沙箱不响应"的形态）
@@ -756,13 +826,13 @@ impl SandboxManager {
                                 };
                                 if !self.envd_alive(&pod_ip).await {
                                     tracing::warn!(sandbox_id = %record.sandbox_id, "recover: envd 无响应，kill");
-                                    let _ = self.kill_by_record(&record).await;
+                                    let _ = self.kill_by_record(&record, KillReason::Recover).await;
                                 }
                             }
                             // WarmReady 且 Pod 非 Running（节点回收等）→ kill 交回收器补池
                             SandboxInstanceState::WarmReady if status.phase != "Running" => {
                                 tracing::info!(sandbox_id = %record.sandbox_id, phase = %status.phase, "recover: 温池 Pod 非 Running，kill");
-                                let _ = self.kill_by_record(&record).await;
+                                let _ = self.kill_by_record(&record, KillReason::Recover).await;
                             }
                             // Provisioning/Initializing 超时（创建时间 + 超时上限 < now）→ kill
                             SandboxInstanceState::Provisioning | SandboxInstanceState::Initializing => {
@@ -770,7 +840,7 @@ impl SandboxManager {
                                     + (self.create_ready_timeout.as_secs() as i64 + 120) * 1_000_000;
                                 if chrono::Utc::now().timestamp_micros() > deadline {
                                     tracing::info!(sandbox_id = %record.sandbox_id, "recover: 创建超时，kill");
-                                    let _ = self.kill_by_record(&record).await;
+                                    let _ = self.kill_by_record(&record, KillReason::Recover).await;
                                 }
                             }
                             _ => {} // Ready + Running = 健康，跳过
@@ -1041,9 +1111,13 @@ impl SandboxManager {
             .list_warm_ready()
             .await
             .map_err(store_error)?;
+        // 候选必须匹配当前修订：模板升级（rev+1）后旧修订的温池实例不得再
+        // 认领——它们由闲置过期自然排空，新修订池由补池器按新水位补建。
         let Some(mut record) = candidates
             .into_iter()
-            .find(|r| r.template_id == params.template_id)
+            .find(|r| {
+                r.template_id == params.template_id && r.template_revision == spec.revision
+            })
         else {
             return Ok(None);
         };
@@ -1142,7 +1216,7 @@ impl SandboxManager {
                     error = %error.to_string(),
                     "e2b warm claim 失败，回收实例"
                 );
-                let _ = self.kill_by_record(&record).await;
+                let _ = self.kill_by_record(&record, KillReason::Explicit).await;
                 Err(error)
             }
         }
@@ -1191,7 +1265,12 @@ impl SandboxManager {
                 }
                 let warm_count = warm_all
                     .iter()
-                    .filter(|r| r.template_id == template.template_id)
+                    // 水位按 (template_id, revision)：旧修订实例不计入新修订水位，
+                    // 保证模板升级后新修订池立即开始补建。
+                    .filter(|r| {
+                        r.template_id == template.template_id
+                            && r.template_revision == spec.revision
+                    })
                     .count();
                 if warm_count >= spec.warm_target as usize {
                     continue;
@@ -1339,7 +1418,7 @@ impl SandboxManager {
             };
             for record in expired {
                 tracing::info!(sandbox_id = %record.sandbox_id, "e2b sandbox expired");
-                if let Err(error) = self.kill_by_record(&record).await {
+                if let Err(error) = self.kill_by_record(&record, KillReason::ReapExpired).await {
                     tracing::warn!(sandbox_id = %record.sandbox_id, error = %error, "e2b reaper kill 失败，下轮重试");
                 }
             }
@@ -1371,36 +1450,63 @@ impl SandboxManager {
             // PVC 对账（P1-5b）：行已软删或不存在的卷，其 PVC 兜底回收——
             // 覆盖 delete_volume 的 PVC 删除失败与 create_volume 的半建残留。
             // 查询失败时保守跳过（本轮不删任何 PVC）。
-            match self.k8s.list_volume_pvcs().await {
-                Ok(pvc_names) => {
-                    for pvc_name in pvc_names {
-                        let Some(volume_id) = pvc_name.strip_prefix("e2b-vol-") else {
-                            continue;
-                        };
-                        let orphaned = match self.store.get_volume(volume_id).await {
-                            Ok(None) => true,
-                            Ok(Some(volume)) => volume.deleted_at_us.is_some(),
-                            Err(error) => {
-                                tracing::warn!(%pvc_name, error = %error, "e2b reaper PVC 对账查询失败，保守跳过");
-                                false
-                            }
-                        };
-                        if !orphaned {
-                            continue;
-                        }
-                        match self.k8s.delete_pvc(&pvc_name).await {
-                            Ok(_) => {
-                                tracing::info!(%pvc_name, "e2b reaper: 回收孤儿 PVC");
-                            }
-                            Err(error) => {
-                                tracing::warn!(%pvc_name, error = %error.to_string(), "e2b reaper PVC 回收失败，下轮重试");
-                            }
-                        }
+            // 反向：行活跃但 PVC 长期缺失（落行与建 PVC 之间中断）——软删行
+            // 释放占名，防永久占名空卷。
+            let (pvc_names, active_volumes) = match (
+                self.k8s.list_volume_pvcs().await,
+                self.store.list_all_active_volumes().await,
+            ) {
+                (Ok(pvcs), Ok(volumes)) => (pvcs, volumes),
+                (pvc_result, volume_result) => {
+                    if let Err(error) = pvc_result {
+                        tracing::warn!(error = %error.to_string(), "e2b reaper PVC 列举失败");
+                    }
+                    if let Err(error) = volume_result {
+                        tracing::warn!(error = %error.to_string(), "e2b reaper 卷行列举失败");
+                    }
+                    continue;
+                }
+            };
+            for pvc_name in &pvc_names {
+                let Some(volume_id) = pvc_name.strip_prefix("e2b-vol-") else {
+                    continue;
+                };
+                let orphaned = match self.store.get_volume(volume_id).await {
+                    Ok(None) => true,
+                    Ok(Some(volume)) => volume.deleted_at_us.is_some(),
+                    Err(error) => {
+                        tracing::warn!(%pvc_name, error = %error, "e2b reaper PVC 对账查询失败，保守跳过");
+                        false
+                    }
+                };
+                if !orphaned {
+                    continue;
+                }
+                match self.k8s.delete_pvc(pvc_name).await {
+                    Ok(_) => {
+                        tracing::info!(%pvc_name, "e2b reaper: 回收孤儿 PVC");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%pvc_name, error = %error.to_string(), "e2b reaper PVC 回收失败，下轮重试");
                     }
                 }
-                Err(error) => {
-                    tracing::warn!(error = %error.to_string(), "e2b reaper PVC 列举失败");
+            }
+            const VOLUME_PVC_GRACE_SECONDS: i64 = 300;
+            let pvc_set: std::collections::HashSet<&String> = pvc_names.iter().collect();
+            let now_us = chrono::Utc::now().timestamp_micros();
+            for volume in &active_volumes {
+                if pvc_set.contains(&volume.pvc_name) {
+                    continue;
                 }
+                if now_us - volume.created_at_us < VOLUME_PVC_GRACE_SECONDS * 1_000_000 {
+                    continue; // 宽限期内（创建窗口），不动
+                }
+                tracing::warn!(
+                    volume_id = %volume.volume_id,
+                    pvc = %volume.pvc_name,
+                    "e2b reaper: 卷行活跃但 PVC 缺失超宽限期，软删释放占名"
+                );
+                let _ = self.store.mark_volume_deleted(&volume.volume_id).await;
             }
         }
         tracing::info!("e2b reaper stopped");
