@@ -1,6 +1,6 @@
 //! 原子文件写入辅助 (对齐 nuwax `writeFileAtomic` / `writeJsonFileAtomic`)。
 //!
-//! 供 agent_hooks 各子模块复用: staging 写 codex 脚本 / settings.json / hook 脚本等。
+//! 供 agent_hooks 各子模块复用: staging 写 harness 脚本 / settings.json / hook 脚本等。
 
 use std::io::Write;
 use std::path::Path;

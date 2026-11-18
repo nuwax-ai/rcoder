@@ -56,7 +56,7 @@ impl WorkspaceRuntime for KubernetesRuntime {
     ) -> ContainerRuntimeResult<bool> {
         use crate::runtime::k8s_pvc::K8sPvcOps;
         const TTL: std::time::Duration = std::time::Duration::from_secs(30);
-        let cache_key = format!("{service_type}/{identifier}");
+        let cache_key = self.migration_cache_key(identifier, service_type);
         if let Some((exists, _, at)) = self.workspace_exists_cache.read().await.get(&cache_key)
             && at.elapsed() < TTL
         {
@@ -99,7 +99,7 @@ impl WorkspaceRuntime for KubernetesRuntime {
     ) -> ContainerRuntimeResult<shared_types::WorkspaceMigrationState> {
         use crate::runtime::k8s_pvc::K8sPvcOps;
         const TTL: std::time::Duration = std::time::Duration::from_secs(30);
-        let cache_key = format!("{service_type}/{identifier}");
+        let cache_key = self.migration_cache_key(identifier, service_type);
         if let Some((_, state, at)) = self.workspace_exists_cache.read().await.get(&cache_key)
             && at.elapsed() < TTL
         {
@@ -355,6 +355,20 @@ impl WorkspaceRuntime for KubernetesRuntime {
 }
 
 impl KubernetesRuntime {
+
+    /// 判据缓存键 = 物理 PVC 名（终审 F5）：ComputerAgentRunner 与
+    /// ComputerNormalProject 同 PVC 但不同 service_type——此前
+    /// `{service_type}/{identifier}` 双键会同一 PVC 返回 Migrated 与
+    /// NotMigrated 并存（cutover 只 warm 一个键）。PVC 名是物理唯一键。
+    fn migration_cache_key(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> String {
+        use crate::runtime::k8s_pvc::K8sPvcOps;
+        self.workspace_pvc_name(identifier, service_type)
+            .unwrap_or_else(|_| format!("{service_type}/{identifier}"))
+    }
     /// 缓存回写防旧值覆盖（并发终审 A）: 若现有条目的写入时刻晚于本次查询
     /// 的发起时刻（如 cutover 的 set_state 即时写入），本次结果作废不回写。
     /// set_state/ensure_workspace 的权威写入不经此守卫（无条件写）。
@@ -400,7 +414,7 @@ impl KubernetesRuntime {
         }
         match self.workspace_exists_cache.try_read() {
             Ok(cache) => matches!(
-                cache.get(&format!("{service_type}/{identifier}")),
+                cache.get(&self.migration_cache_key(identifier, service_type)),
                 Some((true, shared_types::WorkspaceMigrationState::Migrated, sampled))
                     if sampled.elapsed() < std::time::Duration::from_secs(30)
             ),

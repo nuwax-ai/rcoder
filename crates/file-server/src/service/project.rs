@@ -765,7 +765,10 @@ mod tests {
         for (path, contents) in [
             (".agents/skills/review/SKILL.md", "skill"),
             (".attachments/design.txt", "attachment"),
-            (".nuwax-harness/instructions.md", "codex instructions"),
+            (
+                ".nuwax-harness/instructions.md",
+                "nuwax-harness instructions",
+            ),
             (".grok/config.md", "grok config"),
             (".opencode/agents.md", "opencode agents"),
             (".pi/settings.json", "pi settings"),

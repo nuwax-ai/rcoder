@@ -1,7 +1,7 @@
-//! Codex hooks 转换 (对齐 nuwax `transformHooksForCodex` + 配套 shell 脚本辅助)。
+//! nuwax-harness hooks 转换 (对齐 nuwax `transformHooksForNuwaxHarness` + 配套 shell 脚本辅助)。
 //!
-//! 把 Claude 格式 hooks 转为 Codex `hooks.json`: 仅保留 Codex 官方生命周期事件,
-//! command handler 经 `normalizeCodexCommand` 规范, http handler 生成 `http-hook-N.sh`
+//! 把 Claude 格式 hooks 转为 nuwax-harness `hooks.json`: 仅保留 harness 官方生命周期事件,
+//! command handler 经 `normalizeNuwaxHarnessCommand` 规范, http handler 生成 `http-hook-N.sh`
 //! curl wrapper 脚本后转 command handler。
 
 use serde_json::{Map, Value};
@@ -15,7 +15,7 @@ use crate::error::{AppError, AppResult};
 
 use super::io_util::write_file_atomic;
 
-/// Codex 官方文档支持的生命周期事件 (HARNESS_HOOK_EVENTS)。
+/// nuwax-harness 支持的生命周期事件 (HARNESS_HOOK_EVENTS)。
 const HARNESS_HOOK_EVENTS: &[&str] = &[
     "SessionStart",
     "SubagentStart",
@@ -187,7 +187,7 @@ fn escape_for_double_quote(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// 把相对脚本路径规范为基于 git 根目录的 bash 调用 (对齐 nuwax normalizeCodexCommand)。
+/// 把相对脚本路径规范为基于 git 根目录的 bash 调用 (对齐 nuwax normalizeNuwaxHarnessCommand)。
 fn normalize_harness_command(command: &str) -> String {
     let trimmed = command.trim();
     if !is_likely_script_path(trimmed) {

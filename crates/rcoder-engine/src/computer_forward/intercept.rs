@@ -115,6 +115,20 @@ pub async fn computer_rbd_intercept(
                 .into_response();
         }
     };
+    // 迁移写门禁(终审 F1): cutover 进行中(停agent→增量sync→翻标记)该用户
+    // 判据仍 NotMigrated, 写请求若放行本地会写共享卷且不在最终 RBD
+    // (增量sync后的已确认写丢失)——一律 503, 切换完成后重试成功。
+    // 只拦写: 读旧卷不影响切换后一致性。门禁在判据查询前(省一次 API 调用),
+    // 且同时保护转发与本地放行两条去向。
+    if super::migration_gate::is_write_method(req.method())
+        && super::migration_gate::is_migrating(&target.user_id)
+    {
+        tracing::info!(
+            user_id = %target.user_id,
+            "[COMPUTER_FORWARD] write gated during migration, 503"
+        );
+        return service_unavailable("workspace migration in progress, retry shortly");
+    }
     // 混住判据: PVC 存在 **且 migrated 标记生效**才转发。
     // 只有 PVC 存在(phase-a 预同步中/已切流未完成)不够——那期间用户仍在
     // 共享卷读写, 转发会把请求送进 RBD 旧副本(读到过时数据)。

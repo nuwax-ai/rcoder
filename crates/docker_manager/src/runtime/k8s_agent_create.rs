@@ -89,18 +89,60 @@ impl KubernetesRuntime {
         // per_agent_volume 决策(async): pod_id=None 且开关开; RBD 变体额外
         // 要求 migrated 标记(预同步期 PVC 已存在但用户仍在共享卷写, agent
         // 此刻挂 RBD 旧副本会丢写); 族限定 computer(Userapp 域有自己的卷逻辑)。
-        let per_agent_volume = params.pod_id.is_none()
-            && (shared_types::per_agent_pvc_enabled()
-                || (shared_types::per_agent_rbd_enabled()
-                    && matches!(
-                        service_type,
-                        ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject
-                    )
-                    && matches!(
-                        self.workspace_migration_state(identifier, &service_type)
-                            .await?,
-                        shared_types::WorkspaceMigrationState::Migrated
-                    )));
+        let per_agent_volume = if params.pod_id.is_some() {
+            false
+        } else if shared_types::per_agent_pvc_enabled() {
+            true
+        } else if shared_types::per_agent_rbd_enabled()
+            && matches!(
+                service_type,
+                ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject
+            )
+        {
+            use container_runtime_api::WorkspaceRuntime;
+            match self.workspace_migration_state(identifier, &service_type).await? {
+                shared_types::WorkspaceMigrationState::Migrated => true,
+                shared_types::WorkspaceMigrationState::NotMigrated => {
+                    // 新用户初始化（终审 F8）：flag 开 + PVC 缺失 + 共享卷无该
+                    // 用户存量 → 直接建 RBD PVC 并写 Migrated（新用户=直上
+                    // RBD，无迁移必要——plan §P0 目标）。三个前提缺一不可：
+                    // PVC 已存在（phase-a 建过）= 预同步期用户，保持共享；
+                    // 共享卷非空 = 存量用户，须显式走两阶段迁移（下方 legacy
+                    // 防护同语义）；初始化失败原样上抛（fail-fast，不静默
+                    // 回落共享——那会让"新用户 RBD"语义随机漂移）。
+                    let pvc_exists = self
+                        .pvcs()
+                        .get_opt(
+                            &self.workspace_pvc_name(identifier, &service_type)?,
+                        )
+                        .await
+                        .map(|p| p.is_some())
+                        .unwrap_or(false);
+                    if pvc_exists || legacy_shared_workspace_nonempty(identifier).await {
+                        false
+                    } else {
+                        self.ensure_workspace_pvc(
+                            identifier,
+                            &service_type,
+                            params.storage_size.as_deref(),
+                        )
+                        .await?;
+                        self.set_workspace_migration_state(
+                            identifier,
+                            &service_type,
+                            shared_types::WorkspaceMigrationState::Migrated,
+                        )
+                        .await?;
+                        info!(
+                            "[K8S] new user '{identifier}' initialized on per-agent RBD"
+                        );
+                        true
+                    }
+                }
+            }
+        } else {
+            false
+        };
         // 阶段2 per-agent PVC (CephFS subvolume, ceph-csi 服务端配额, 绕开 client setfattr):
         // 仅隔离容器 (pod_id=None, project/user 级) 且 per-agent 开关开启走 per-agent PVC。
         // 两变体: per_agent_pvc(subvolume, 挂根聚合读) / per_agent_rbd(RWO 块盘, 转发层读,
@@ -630,6 +672,7 @@ impl KubernetesRuntime {
                             (docker_service, k8s_service),
                             params,
                             None,
+                            per_agent_volume,
                         );
                         if matches!(service_type, ServiceType::UserappBuilder) {
                             // 执行域身份（进程域退出回执的绑定锚点）：instance 经

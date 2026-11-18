@@ -1,7 +1,7 @@
 //! Claude Code Hook 配置。
 //!
 //! 负责合并 `.claude/settings.json` 中的 `hooks` / `permissions`，以及替换
-//! `.claude/hooks/` 外挂脚本。Codex 与 OpenCode 的派生产物由各自模块处理。
+//! `.claude/hooks/` 外挂脚本。nuwax-harness 与 OpenCode 的派生产物由各自模块处理。
 
 use std::path::Path;
 

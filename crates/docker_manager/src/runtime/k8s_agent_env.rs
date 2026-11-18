@@ -19,6 +19,7 @@ pub(crate) fn build_agent_env_vars(
     service_configs: (Option<&ServiceImageConfig>, Option<&K8sServiceConfig>),
     params: &ContainerCreateParams,
     builder_deploy_credential: Option<&EnvVar>,
+    per_agent_volume: bool,
 ) -> Vec<EnvVar> {
     let (docker_service, k8s_service) = service_configs;
     // 容器内契约（agent_runner profiler 标签、PROJECT_ID env）要纯 app_id：
@@ -54,6 +55,17 @@ pub(crate) fn build_agent_env_vars(
             ..Default::default()
         },
     ];
+    // 单用户卷视角（终审 F2）: per-agent 卷形态时声明卷归属——容器内嵌
+    // file-server 据此把 computer 解析切到 {root}/{cid}（卷根即用户家目录）
+    // 并拒绝 user_id 不匹配的请求（防转发层定位错乱跨用户读写）。
+    // 共享形态不注入（保持 {root}/{uid}/{cid} 双层布局）。
+    if per_agent_volume {
+        env_vars.push(EnvVar {
+            name: "RCODER_AGENT_BOUND_USER_ID".to_string(),
+            value: Some(user_id_val.to_string()),
+            ..Default::default()
+        });
+    }
     // R07：UserappBuilder 容器注入稳定状态根（app-cli 运行内核的操作记录/
     // desired 持久化锚点，env 权威——dev 容器内 source/.run 轮换不漂移锁域；
     // 路径=workspace 卷内专属 state 子目录，跨容器重建稳定）
@@ -328,6 +340,7 @@ mod b03_tests {
                 (None, Some(&service)),
                 &base,
                 Some(&credential),
+                false,
             );
             assert_eq!(
                 value_of(&on, "APP_CLI_MANAGED").as_deref(),
@@ -358,6 +371,7 @@ mod b03_tests {
             (None, Some(&disabled)),
             &base,
             Some(&credential),
+                false,
         );
         assert_eq!(value_of(&forced, "APP_CLI_MANAGED").as_deref(), Some("1"));
         // 键唯一性：kubelet 取后值，重复键会让 config 的 0 实际生效。
@@ -381,6 +395,7 @@ mod b03_tests {
             (None, Some(&web)),
             &base,
             None,
+                false,
         );
         assert!(value_of(&off, "APP_CLI_MANAGED").is_none());
         assert!(value_of(&off, "APP_CLI_RUNTIME_WORKSPACE").is_none());

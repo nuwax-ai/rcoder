@@ -1,7 +1,7 @@
 //! staging 预生成 + 应用 (对齐 nuwax `stageRuntimeHookArtifacts` /
 //! `applyStagedRuntimeHookArtifacts` + `clearHookArtifacts`)。
 //!
-//! Codex/OpenCode 运行时产物先在 `.tmp/hook-staging-*` 预生成, 成功后再替换工作区,
+//! nuwax-harness/OpenCode 运行时产物先在 `.tmp/hook-staging-*` 预生成, 成功后再替换工作区,
 //! 缩小半更新窗口。
 
 use std::path::{Path, PathBuf};
@@ -28,7 +28,7 @@ pub(super) struct StagedRuntime {
     pub platform_env_plugin_installed: bool,
 }
 
-/// 在 `.tmp/hook-staging-*` 预生成 Codex hooks + OpenCode 插件, 成功后再应用到工作区。
+/// 在 `.tmp/hook-staging-*` 预生成 nuwax-harness hooks + OpenCode 插件, 成功后再应用到工作区。
 pub(super) async fn stage_runtime_hook_artifacts(
     workspace: &Path,
     hooks_map: &Map<String, Value>,
@@ -45,7 +45,7 @@ pub(super) async fn stage_runtime_hook_artifacts(
     .map_err(|error| {
         crate::error::AppError::system(format!("join hook staging creator: {error}"))
     })??;
-    let harness_staging_root = staging_root.path().join("codex");
+    let harness_staging_root = staging_root.path().join("nuwax-harness");
     let harness_hooks_dir = harness_staging_root.join("hooks");
     let opencode_plugins_staging = staging_root.path().join("opencode").join("plugins");
 
@@ -79,7 +79,7 @@ pub(super) async fn apply_staged_runtime_hook_artifacts(
     clear_hook_artifacts(workspace).await?;
     fs::create_dir_all(&harness_root).await?;
 
-    // Codex hooks 目录 (含 http wrapper 脚本)
+    // nuwax-harness hooks 目录 (含 http wrapper 脚本)
     let staged_harness_hooks_dir = staged.harness_staging_root.join("hooks");
     if path_exists(&staged_harness_hooks_dir).await? {
         remove_path_if_exists(&harness_hooks_target).await?;

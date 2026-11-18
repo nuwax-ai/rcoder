@@ -12,7 +12,7 @@ pub struct HookScript {
 pub struct HookConfigInput {
     /// mcpServersConfig: JSON 字符串, 解析后写入 `.mcp.json` 的 mcpServers 字段。
     pub mcp_servers_config: Option<String>,
-    /// hooksConfig: JSON 字符串, 解析后写入 `.claude/settings.json` hooks + 转 Codex hooks.json。
+    /// hooksConfig: JSON 字符串, 解析后写入 `.claude/settings.json` hooks + 转 nuwax-harness hooks.json。
     pub hooks_config: Option<String>,
     /// permissionsConfig: JSON 字符串, 解析后写入 `.claude/settings.json` permissions 字段。
     pub permissions_config: Option<String>,

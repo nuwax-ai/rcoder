@@ -351,7 +351,7 @@ async fn find_skills_dir(root: &Path) -> AppResult<Option<PathBuf>> {
 
 /// sync_agents fan-out 目标目录: 权威源 .agents/{skills,agents} → 各家 ACP agent 约定目录。
 /// 加新 agent 在此追加目录名即可 (注意: .agents 是权威源本身, 不在此列)。
-/// 源码实证: claude(.claude) / opencode(.opencode) / codex(.nuwax-harness) / grok(.grok) / pi(.pi)。
+/// 源码实证: claude(.claude) / opencode(.opencode) / nuwax-harness(.nuwax-harness) / grok(.grok) / pi(.pi)。
 // 临时屏蔽: 暂不接入 grok/pi agent, skills/agents 不再 fan-out 到这两家; 接入时取消注释即恢复。
 pub const SYNC_TARGET_DIRS: &[&str] = &[
     ".claude",

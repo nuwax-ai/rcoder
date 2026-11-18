@@ -23,6 +23,35 @@ use crate::service::computer_container_manager::{
     ComputerContainerManager, ContainerCreateOptions,
 };
 
+/// cutover 写门禁守卫：Drop 时解除门禁（任何失败路径 `?` 提前返回都会
+/// 走 Drop），成功路径显式 `forget` 后手动 end（保证步骤信息完整）。
+struct MigrationGateGuard {
+    user_id: String,
+    disarmed: bool,
+}
+
+impl MigrationGateGuard {
+    fn new(user_id: &str) -> Self {
+        super::migration_gate::begin(user_id);
+        Self {
+            user_id: user_id.to_string(),
+            disarmed: false,
+        }
+    }
+    /// 成功路径：解除 Drop 语义（end 由调用方在打完日志后手动调）。
+    fn disarm(mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for MigrationGateGuard {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            super::migration_gate::end(&self.user_id);
+        }
+    }
+}
+
 /// 编排结果（API 层原样投影给调用方）。
 #[derive(Debug, Clone)]
 pub struct MigrationOutcome {
@@ -122,7 +151,6 @@ pub async fn cutover(
     let migration_lock = ComputerContainerManager::acquire_migration_lock(user_id)
         .await
         .map_err(|e| wrap("acquire_migration_lock", runtime_error_from_app(e)))?;
-
     // 入口校验①: 已 Migrated 重跑 = mirror 删 RBD 新写数据(P0)。
     if matches!(
         state
@@ -149,6 +177,11 @@ pub async fn cutover(
             "per-agent PVC for '{user_id}' not found; run phase-a before cutover"
         )));
     }
+
+    // 写门禁开(终审 F1): 从停 agent 起该用户文件写一律 503。guard 的 Drop
+    // 覆盖所有 `?` 失败路径(失败即解除, 该用户恢复可写——失败中间态下写
+    // 共享卷是安全方向: 标记未翻, 数据面本就仍在共享卷)。
+    let _migration_gate_guard = MigrationGateGuard::new(user_id);
 
     // 1. 停 agent（删 STS → 卷卸载开始）
     state
@@ -233,6 +266,8 @@ pub async fn cutover(
         .map_err(|e| wrap("ensure_agent", runtime_error_from_app(e)))?;
     steps.push("agent restarted on RBD".to_string());
 
+    _migration_gate_guard.disarm();
+    super::migration_gate::end(user_id);
     Ok(MigrationOutcome {
         user_id: user_id.to_string(),
         action: "cutover",

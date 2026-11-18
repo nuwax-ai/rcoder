@@ -12,6 +12,7 @@
 //! （ensure STS → 等 Ready ≤8s → 转发, 超时 503+Retry-After）随 P1 接线落地。
 
 pub mod intercept;
+pub mod migration_gate;
 pub mod orchestrate;
 
 pub use intercept::computer_rbd_intercept;
@@ -56,8 +57,30 @@ pub const COMPUTER_PASS_THROUGH_PATHS: &[&str] = &[
     "/api/computer/push-skills-to-workspace-v2",
     "/api/computer/init-project-template",
     "/api/computer/build-agent-package",
-    "/api/computer/static/{user_id}/{c_id}/{*rest}", // 分享链路终点/产物下载/打包读取
-];
+    "/api/computer/static/{user_id}/{c_id}/{*rest}",
+    // /api/git 全族（终审 F3）：git 契约缺省/taskAgent/normalProject 是
+    // userId+cId 会话工作区（computer 域）——迁移后必须转发。web/pageApp
+    // 的 git 请求以 projectId 定位（无 userId query/header），resolve_target
+    // 判 Absent 自然放行本地，无需按 workspaceType 细分。
+    "/api/git/branches",
+    "/api/git/tags",
+    "/api/git/log-history",
+    "/api/git/file-content",
+    "/api/git/status",
+    "/api/git/init",
+    "/api/git/add",
+    "/api/git/commit",
+    "/api/git/unstage",
+    "/api/git/discard",
+    "/api/git/diff",
+    "/api/git/reset",
+    "/api/git/checkout",
+    "/api/git/revert",
+    "/api/git/branch-create",
+    "/api/git/branch-delete",
+    "/api/git/branch-switch",
+    "/api/git/tag-create",
+    "/api/git/tag-delete",];
 
 /// 转发目标（per-agent RBD 用户的 agent 容器）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,13 +152,18 @@ pub fn resolve_target(
         };
     }
     // ③ static 路径段: /api/computer/static/{user_id}/...（分享链路, 无 header 场景）
-    match static_path_user_id(path) {
-        Some(user_id) => TargetResolution::Found(ComputerForwardTarget {
-            user_id,
-            source: TargetSource::StaticPath,
-        }),
-        None => TargetResolution::Absent,
+    // 前缀命中即有定位来源: 段有效 → Found; 无效 → Invalid(400)。decode 后
+    // 无法识别不允许退化为本地回退（读旧共享卷, 终审 F6）。
+    if path.starts_with("/api/computer/static/") {
+        return match static_path_user_id(path) {
+            Ok(user_id) => TargetResolution::Found(ComputerForwardTarget {
+                user_id,
+                source: TargetSource::StaticPath,
+            }),
+            Err(()) => TargetResolution::Invalid,
+        };
     }
+    TargetResolution::Absent
 }
 
 /// percent-decode（query 值用）: `%75_1001` → `u_1001`。无 `%` 快路径原样返回;
@@ -144,31 +172,44 @@ fn percent_decode(value: &str) -> String {
     if !value.contains('%') {
         return value.to_string();
     }
+    // 纯字节切片操作——不用 str 字节索引切片（`%中` 时 `&value[i+1..i+3]`
+    // 落在 UTF-8 字符内部 panic "not a char boundary", 终审 F7 实证）。
+    // 非法转义（截断 %/非 hex）原字节保留, 由 validate_identifier 拒绝。
     let bytes = value.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Ok(byte) = u8::from_str_radix(&value[i + 1..i + 3], 16)
-        {
-            out.push(byte);
-            i += 3;
-            continue;
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = String::from_utf8_lossy(&bytes[i + 1..i + 3]).into_owned();
+            if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
         }
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8(out).unwrap_or_else(|_| value.to_string())
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// static 路由路径段定位：`/api/computer/static/{user_id}/...` 首段即 user_id。
 /// 容器内视角根 = `{COMPUTER_WORKSPACE_DIR}/{user_id}/{c_id}`（与 rcoder 侧
 /// 三段路径同构），转发时原样透传路径（容器 file-server 自己解析）。
-fn static_path_user_id(path: &str) -> Option<String> {
-    let rest = path.strip_prefix("/api/computer/static/")?;
-    let user_id = rest.split('/').next()?;
-    (valid_identifier(user_id) && rest.contains('/')).then(|| user_id.to_string())
+/// Err(()) 语义见调用方：static 前缀已命中但段无效 → Invalid(400)，
+/// 不退化为 Absent（编码形态静默本地回退 = 读旧共享卷，终审 F6）。
+fn static_path_user_id(path: &str) -> Result<String, ()> {
+    let Some(rest) = path.strip_prefix("/api/computer/static/") else {
+        return Err(());
+    };
+    let raw_segment = rest.split('/').next().unwrap_or("");
+    if raw_segment.is_empty() || !rest.contains('/') {
+        return Err(()); // 无 user 段/无后续路径——非 static 请求形态
+    }
+    // 路径段 percent-decode：URI path 是原始形式(%36 不解码), axum 实际
+    // 路由的 Path 提取器会解码——两层口径必须一致。
+    let decoded = percent_decode(raw_segment);
+    valid_identifier(&decoded).then(|| decoded).ok_or(())
 }
 
 fn valid_identifier(value: &str) -> bool {
@@ -257,9 +298,50 @@ mod tests {
 
     #[test]
     fn static_path_requires_trailing_segments() {
-        // 只有 user 段没有后续路径 → Absent（放行本地）, 不是 Invalid
+        // static 前缀命中=有定位来源; 无尾段/空段 → Invalid(400), 不是 Absent
+        // (终审 F6: 不允许编码/畸形形态退化为本地回退)
         assert_eq!(
             resolve_target(None, None, "/api/computer/static/6"),
+            TargetResolution::Invalid
+        );
+        assert_eq!(
+            resolve_target(None, None, "/api/computer/static/"),
+            TargetResolution::Invalid
+        );
+    }
+
+    #[test]
+    fn encoded_static_segment_is_decoded_and_routed() {
+        // %36 → 6: 编码形态与明文形态路由到同一目标(不再绕过转发读旧卷)
+        let t = found(resolve_target(None, None, "/api/computer/static/%36/1696379/f.txt"));
+        assert_eq!(t.user_id, "6");
+        // 非法编码段 → Invalid, 不落 Absent
+        assert_eq!(
+            resolve_target(None, None, "/api/computer/static/%zz/1696/f.txt"),
+            TargetResolution::Invalid
+        );
+    }
+
+    #[test]
+    fn percent_decode_never_panics_on_multibyte_or_truncated() {
+        // 终审 F7 反例: 多字节字符内切片 panic——现在必须安全返回
+        assert!(!percent_decode("%中").is_empty());
+        assert_eq!(percent_decode("a%"), "a%");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("%75_1001"), "u_1001");
+    }
+
+    #[test]
+    fn git_paths_are_pass_through_computer_routed_by_userid() {
+        assert!(is_pass_through_path("/api/git/status"));
+        assert!(is_pass_through_path("/api/git/commit"));
+        // computer git(userId 定位)→Found; web git(projectId, 无 userId)→Absent
+        assert!(matches!(
+            resolve_target(None, Some("userId=6&cId=c1"), "/api/git/status"),
+            TargetResolution::Found(_)
+        ));
+        assert_eq!(
+            resolve_target(None, Some("projectId=p1"), "/api/git/status"),
             TargetResolution::Absent
         );
     }
