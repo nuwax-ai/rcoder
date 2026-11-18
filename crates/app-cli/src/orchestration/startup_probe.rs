@@ -79,7 +79,7 @@ pub(crate) fn deadline(spec: &ServiceSpec, started: Instant) -> Result<Instant> 
 pub(crate) async fn within_budget<T>(
     deadline: Instant,
     cancel: Option<&CancellationToken>,
-    future: impl std::future::Future<Output = Result<T>>,
+    future: impl Future<Output = Result<T>>,
 ) -> Result<T> {
     let cancelled = async {
         match cancel {

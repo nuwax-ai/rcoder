@@ -172,7 +172,7 @@ jobs:
         run: |
           BIN=app-cli
           if [ "${{ runner.os }}" = "Windows" ]; then BIN=app-cli.exe; fi
-          cp "target/${TARGET}/release/${BIN}" "app-cli-${TARGET}$( [ "${{ runner.os }}" = "Windows" ] && echo ".exe" )"
+          cp "../../target/${TARGET}/release/${BIN}" "app-cli-${TARGET}$( [ "${{ runner.os }}" = "Windows" ] && echo ".exe" )"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

@@ -43,7 +43,7 @@ pub(super) async fn supervise(
     // ownership has already been surrendered. Unexpected exits and signals
     // cannot preserve a live business execution; close an undrainable proxy.
     let fault = if forced {
-        super::resident::begin_fault_cleanup(captured_scope)
+        resident::begin_fault_cleanup(captured_scope)
     } else {
         Ok(None)
     };
@@ -51,10 +51,10 @@ pub(super) async fn supervise(
         match &fault {
             Ok(Some(fault)) => {
                 if let Err(drain_error) = fault
-                    .drain(tokio::time::Instant::now() + crate::proxy::admin_probe::CONFIRM_BUDGET)
+                    .drain(tokio::time::Instant::now() + admin_probe::CONFIRM_BUDGET)
                     .await
                 {
-                    super::resident::close_entry().await.map_err(|close_error|ShutdownUnconfirmed(format!("fault entry drain failed: {drain_error:#}; closure unconfirmed: {close_error:#}")).into())
+                    resident::close_entry().await.map_err(|close_error|ShutdownUnconfirmed(format!("fault entry drain failed: {drain_error:#}; closure unconfirmed: {close_error:#}")).into())
                 } else {
                     Ok(())
                 }
@@ -80,8 +80,8 @@ pub(super) async fn supervise(
 }
 
 pub(super) async fn drain_or_close_resident() -> Result<()> {
-    if let Err(drain_error) = super::resident::publish_standby_if_serving().await {
-        super::resident::close_entry().await.map_err(|close_error| {
+    if let Err(drain_error) = resident::publish_standby_if_serving().await {
+        resident::close_entry().await.map_err(|close_error| {
             ShutdownUnconfirmed(format!(
                 "entry drain failed: {drain_error:#}; entry shutdown unconfirmed: {close_error:#}"
             ))
@@ -96,9 +96,7 @@ pub(super) async fn drain_or_close_resident_for_startup(
     cancel: Option<&tokio_util::sync::CancellationToken>,
     deadline: tokio::time::Instant,
 ) -> Result<()> {
-    match super::resident::await_captured_control_for_startup(captured_scope, cancel, deadline)
-        .await
-    {
+    match resident::await_captured_control_for_startup(captured_scope, cancel, deadline).await {
         Ok(true) => Ok(()),
         Ok(false) => drain_or_close_resident().await,
         Err(error) => Err(ShutdownUnconfirmed(format!(

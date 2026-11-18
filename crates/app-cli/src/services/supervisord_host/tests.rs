@@ -56,12 +56,12 @@ mod tests {
         });
         // 非 dev profile：run 兜底
         assert_eq!(
-            crate::supervisor::effective_run_argv(&spec, false),
+            supervisor::effective_run_argv(&spec, false),
             &spec.run.command
         );
         // dev profile：devrun 优先
         assert_eq!(
-            crate::supervisor::effective_run_argv(&spec, true),
+            supervisor::effective_run_argv(&spec, true),
             &["pnpm".to_string(), "dev".to_string()]
         );
     }
@@ -76,10 +76,10 @@ mod tests {
             command: vec!["vite".into(), "--host".into()],
         });
         assert!(
-            crate::supervisor::effective_run_argv(&spec, true)
+            supervisor::effective_run_argv(&spec, true)
                 == ["vite".to_string(), "--host".to_string()]
         );
-        assert!(crate::supervisor::effective_run_argv(&spec, false).is_empty());
+        assert!(supervisor::effective_run_argv(&spec, false).is_empty());
     }
 
     fn spec(id: &str, dir: &str, shutdown: u64) -> ServiceSpec {
@@ -1030,7 +1030,7 @@ mod publication_receipt_tests {
                 user: "fixture".into(),
                 password: "fixture".into(),
             };
-            let mut process_host = super::resident::OfficialSupervisorHost {
+            let mut process_host = resident::OfficialSupervisorHost {
                 host: &host,
                 runtime_root: &runtime_root,
                 spec: pingap_service_spec(&args, &endpoint).unwrap(),

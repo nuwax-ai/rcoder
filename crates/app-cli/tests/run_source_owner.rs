@@ -1302,8 +1302,8 @@ impl Fixture {
         use std::io::{BufRead, BufReader};
         let mut child = self
             .command("run", log)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()
             .unwrap();
         let stdout = child.stdout.take().unwrap();

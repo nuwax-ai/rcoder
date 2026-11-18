@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn binary_digest_future_does_not_embed_large_io_buffers() {
     let future = binary_digest(Path::new("not-polled-official-proxy"));
-    let bytes = std::mem::size_of_val(&future);
+    let bytes = size_of_val(&future);
     assert!(
         bytes <= 8192,
         "binary digest future embeds {bytes} bytes; nested startup futures must keep I/O buffers on the heap"

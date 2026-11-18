@@ -490,7 +490,7 @@ impl ServerState {
             Some(generation.to_owned());
         self.initializing
             .store(true, std::sync::atomic::Ordering::Release);
-        Ok(Arc::new(super::state::GenerationControl {
+        Ok(Arc::new(GenerationControl {
             state: self.clone(),
             generation: generation.to_owned(),
             standby_root: crate::proxy::compiler::runtime_root(log_dir)?,
@@ -662,7 +662,7 @@ impl ServerState {
         })
     }
 
-    pub(crate) fn begin_runtime_admission(&self) -> Result<super::state::RuntimeAdmission<'_>> {
+    pub(crate) fn begin_runtime_admission(&self) -> Result<RuntimeAdmission<'_>> {
         let _admission = self
             .admission
             .lock()
@@ -688,7 +688,7 @@ impl ServerState {
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.runtime_admission_epoch
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        Ok(super::state::RuntimeAdmission {
+        Ok(RuntimeAdmission {
             state: self,
             auxiliary_hold,
         })
@@ -791,8 +791,7 @@ impl ServerState {
                 // HTTP/configuration callers may have returned at their deadline
                 // while a dispatched supervisor mutation still owns its socket.
                 // Physical shutdown cannot acknowledge only the caller counters.
-                crate::supervisord_host::SupervisordHost::wait_pending_mutations_until(deadline)
-                    .await?;
+                SupervisordHost::wait_pending_mutations_until(deadline).await?;
                 crate::proxy::compiler::wait_for_file_replacements_until(deadline).await?;
                 return Ok(());
             }

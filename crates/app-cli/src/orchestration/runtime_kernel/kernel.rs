@@ -324,7 +324,7 @@ impl RuntimeKernel {
                             None
                         } else {
                             Some((
-                                shared_types::ERR_RECOVERY_REQUIRED.to_string(),
+                                ERR_RECOVERY_REQUIRED.to_string(),
                                 "business session ended before the operation completed".to_string(),
                             ))
                         };

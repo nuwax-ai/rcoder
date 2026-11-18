@@ -164,8 +164,7 @@ async fn run(command: app_cli::config::Command) -> anyhow::Result<()> {
     // 端口冲突在一切业务副作用之前 fail-fast（非零退出，不下载制品、不 spawn
     // 任何用户服务）。legacy 形态以静态 ServerState 承载（初始化期 /v1/deploy
     // 等写端点由 initializing 门控拒绝，/health 恒200覆盖 kubelet liveness）。
-    let legacy_state =
-        std::sync::Arc::new(app_cli::server::ServerState::new(runtime_status.clone()));
+    let legacy_state = Arc::new(app_cli::server::ServerState::new(runtime_status.clone()));
     if let Ok(release) = app_cli::manifest::read_release_lock(&args.workspace) {
         legacy_state.set_release(release);
         legacy_state.set_phase(app_cli::server::ServerPhase::Running);
@@ -183,7 +182,7 @@ async fn run(command: app_cli::config::Command) -> anyhow::Result<()> {
         api_state,
     )
     .await?;
-    let api_failure = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let api_failure = Arc::new(std::sync::Mutex::new(None::<String>));
     let api_monitor_failure = api_failure.clone();
     let supervisor_cancel = tokio_util::sync::CancellationToken::new();
     let api_cancel = supervisor_cancel.clone();

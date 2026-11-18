@@ -208,7 +208,7 @@ mod cases {
         let port = listener.local_addr().expect("addr").port();
         drop(listener);
         let spec = spec_with(None);
-        let spec = crate::manifest::ServiceSpec {
+        let spec = ServiceSpec {
             port,
             health: workspace_manifest::HealthSection {
                 readiness_path: "/ready".into(),

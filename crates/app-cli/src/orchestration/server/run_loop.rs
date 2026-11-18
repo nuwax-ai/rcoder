@@ -13,7 +13,7 @@ pub(super) struct PreparedActivation {
     workspace: std::path::PathBuf,
     target: Option<ExecutionTarget>,
     pg: Option<shared_types::StartPgCredential>,
-    proxy: Option<crate::supervisor::PreparedProxy>,
+    proxy: Option<supervisor::PreparedProxy>,
 }
 
 /// 状态机主循环：初始动作（env 部署 / 卷上既有版本直接编排 / 空容器挂 Idle）→
@@ -24,8 +24,8 @@ pub(super) enum InitialAction {
     Prepared(PreparedActivation),
     /// Explicit Source switches back from .run to the canonical source root.
     Source,
-    SourcePrepared(crate::supervisor::PreparedProxy),
-    ExistingPrepared(crate::supervisor::PreparedProxy),
+    SourcePrepared(supervisor::PreparedProxy),
+    ExistingPrepared(supervisor::PreparedProxy),
     /// 卷上既有 release.lock（Pod 重建恢复/激活目录复用）：跳过下载直接
     /// 编排。携带确认的执行目录——artifact 目标可能与当前执行目录不同
     ///（源码态 owner 切回 `.run`），编排必须落在该目录上。
@@ -122,10 +122,10 @@ pub(super) async fn signal_operation_already_settled(
 /// 操作受理后即拒：旧业务保持运行（standby 都不发——那是拆流，会中断
 /// 服务），操作按 Failed 收束，走完整重配置流程。
 pub(super) async fn preflight_hot_reload_compat(
-    args: &crate::RuntimeArgs,
+    args: &RuntimeArgs,
     dev_profile: bool,
     host: crate::startup_probe::StartupHost,
-) -> anyhow::Result<crate::supervisor::PreparedProxy> {
+) -> Result<supervisor::PreparedProxy> {
     let release = crate::manifest::read_release_lock(&args.workspace)
         .context("read release lock for hot-reload preflight")?;
     let runtime_root = crate::proxy::compiler::runtime_root(&args.log_dir)?;
@@ -138,7 +138,7 @@ pub(super) async fn preflight_hot_reload_compat(
     )
     .await
     .context("compile and validate candidate before stopping predecessor")?;
-    Ok(crate::supervisor::PreparedProxy {
+    Ok(supervisor::PreparedProxy {
         workspace: args.workspace.clone(),
         release,
         dev_profile,
@@ -150,7 +150,7 @@ async fn prepare_source_control(
     owner_args: &RuntimeArgs,
     state: &ServerState,
     signal: &ControlSignal,
-) -> anyhow::Result<Option<crate::supervisor::PreparedProxy>> {
+) -> Result<Option<supervisor::PreparedProxy>> {
     if let ControlSignal::RecoverArtifact {
         workspace,
         release_id,
@@ -182,7 +182,7 @@ async fn prepare_source_control(
 async fn settle_configuration_before_stop(
     state: &ServerState,
     signal: &ControlSignal,
-) -> anyhow::Result<Option<tokio::time::Instant>> {
+) -> Result<Option<tokio::time::Instant>> {
     match signal {
         ControlSignal::OrchestrateSource { .. } | ControlSignal::RecoverArtifact { .. } => Ok(None),
         ControlSignal::StopBusiness { .. } => {
@@ -332,7 +332,7 @@ fn restore_running_predecessor(state: &ServerState, ready: bool) {
 async fn settled_prepared_control(
     state: &ServerState,
     signal: ControlSignal,
-    prepared: Option<crate::supervisor::PreparedProxy>,
+    prepared: Option<supervisor::PreparedProxy>,
 ) -> InitialAction {
     let action = settle_control_signal_inner(state, signal, true).await;
     match (action, prepared) {
@@ -523,7 +523,7 @@ pub(super) async fn next_prepared(
         let pg = request.run_pg.clone();
         let state_clone = state.clone();
         let progress_cb: crate::deploy::ProgressCallback =
-            std::sync::Arc::new(move |p: shared_types::AppDeploymentProgress| {
+            Arc::new(move |p: shared_types::AppDeploymentProgress| {
                 state_clone.set_deploy_progress(p);
             });
         match state
@@ -641,7 +641,7 @@ async fn prepare_artifact_proxy(
     execution_workspace: &std::path::Path,
     dev_profile: bool,
     host: crate::startup_probe::StartupHost,
-) -> anyhow::Result<crate::supervisor::PreparedProxy> {
+) -> Result<supervisor::PreparedProxy> {
     let release = crate::manifest::read_release_lock(read_workspace)?;
     let root = crate::proxy::compiler::runtime_root(&owner_args.log_dir)?;
     let outcome = crate::proxy::compiler::compile_prepared(
@@ -688,7 +688,7 @@ async fn prepare_artifact_proxy(
     } else {
         outcome
     };
-    Ok(crate::supervisor::PreparedProxy {
+    Ok(supervisor::PreparedProxy {
         workspace: execution_workspace.into(),
         release,
         dev_profile,
@@ -1249,7 +1249,7 @@ pub(super) async fn server_loop(
                 state.set_request_release_id(&request.release_id);
                 let state_ref = state.clone();
                 let progress_cb: crate::deploy::ProgressCallback =
-                    std::sync::Arc::new(move |p: shared_types::AppDeploymentProgress| {
+                    Arc::new(move |p: shared_types::AppDeploymentProgress| {
                         state_ref.set_deploy_progress(p);
                     });
                 match state
@@ -1400,7 +1400,7 @@ pub(super) async fn server_loop(
         // legacy/部署路径 → env 兜底）。take 一次性消费——每次编排对应一次取值
         let run_dev_profile = state
             .take_pending_dev_profile()
-            .unwrap_or_else(crate::supervisor::dev_run_profile);
+            .unwrap_or_else(supervisor::dev_run_profile);
         let mut execution_args = args.clone();
         execution_args.operation_id = state.current_runtime_operation().or_else(|| {
             state
@@ -1428,7 +1428,7 @@ pub(super) async fn server_loop(
                 &execution_args,
                 &release,
                 &runtime_status,
-                crate::supervisor::RunProfile {
+                supervisor::RunProfile {
                     run_migrations,
                     dev_profile: run_dev_profile,
                     pg: run_pg,

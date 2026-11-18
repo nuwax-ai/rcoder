@@ -43,7 +43,7 @@ pub struct ServerState {
     pub(super) preparations: Arc<preparation::Preparations>,
     pub(super) journal: std::sync::Mutex<Option<Journal>>,
     /// Legacy run/tests have no durable journal; preserve same-process replays.
-    pub(super) volatile_deploy_replays: std::sync::Mutex<super::deploy_replay::History>,
+    pub(super) volatile_deploy_replays: std::sync::Mutex<deploy_replay::History>,
     /// 部署代次：来自平台 env，standalone 沿用持久 journal；跨业务会话不变。
     /// 读取方经 [`ServerState::generation_value`]。
     pub(super) generation: RwLock<String>,
@@ -222,11 +222,11 @@ impl runtime_supervisor::WorkerControl for ServerState {
         self.wait_auxiliary_writes(deadline)
             .await
             .map_err(|error| {
-                crate::supervisor::ShutdownUnconfirmed(format!(
+                supervisor::ShutdownUnconfirmed(format!(
                     "configuration writes remain unsettled before Stop: {error:#}"
                 ))
             })?;
-        crate::supervisor::resident::publish_standby_for_operation_until(
+        supervisor::resident::publish_standby_for_operation_until(
             deadline,
             self.current_runtime_operation(),
         )
@@ -303,7 +303,7 @@ impl runtime_supervisor::WorkerControl for GenerationControl {
     }
     fn stop_error_is_uncertain(&self, error: &anyhow::Error) -> bool {
         error
-            .downcast_ref::<crate::supervisor::ShutdownUnconfirmed>()
+            .downcast_ref::<supervisor::ShutdownUnconfirmed>()
             .is_some()
             || error
                 .downcast_ref::<tokio::time::error::Elapsed>()
@@ -328,18 +328,16 @@ impl runtime_supervisor::WorkerControl for GenerationControl {
             .wait_auxiliary_writes(deadline)
             .await
             .map_err(|error| {
-                crate::supervisor::ShutdownUnconfirmed(format!(
+                supervisor::ShutdownUnconfirmed(format!(
                     "configuration writes remain unsettled before generation Stop: {error:#}"
                 ))
             })?;
         // This is called before the native control closes its generation gate.
         // Do not queue another control request: the native handler owns that queue.
-        if let Some(host) =
-            crate::supervisord_host::SupervisordHost::from_env_until(deadline).await?
-        {
+        if let Some(host) = SupervisordHost::from_env_until(deadline).await? {
             host.drain_entry_until(&self.standby_root, deadline).await?;
         } else {
-            crate::supervisor::resident::publish_standby_for_captured_scope_until(
+            supervisor::resident::publish_standby_for_captured_scope_until(
                 deadline, request_id, scope,
             )
             .await?;

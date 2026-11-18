@@ -499,7 +499,7 @@ async fn run(scenario: Scenario) {
 }
 
 async fn within<T>(
-    future: impl std::future::Future<Output = T>,
+    future: impl Future<Output = T>,
     engine: &Engine,
     kernel: &crate::runtime_kernel::RuntimeKernel,
     label: &str,

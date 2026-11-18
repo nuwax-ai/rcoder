@@ -122,7 +122,7 @@ mod cases {
             .try_accept_deploy_with_id(request(), "original".into())
             .unwrap();
         assert!(
-            super::super::startup::initial_action_for_deployment_admission(&state, admission)
+            initial_action_for_deployment_admission(&state, admission)
                 .await
                 .unwrap()
                 .is_none()
@@ -693,8 +693,8 @@ mod cases {
         assert!(queue.try_recv().is_err());
     }
 
-    fn release(rid: &str) -> workspace_manifest::ReleaseLock {
-        let mut release: workspace_manifest::ReleaseLock = toml::from_str(
+    fn release(rid: &str) -> ReleaseLock {
+        let mut release: ReleaseLock = toml::from_str(
             r#"
 schema_version = 1
 release_id = "test-release-0001"
@@ -1697,7 +1697,7 @@ format = "jsonl"
     fn boot_id_tracks_release_generation() {
         let st = state();
         assert_eq!(st.boot_id(), "idle");
-        let mk_release = |rid: &str| workspace_manifest::ReleaseLock {
+        let mk_release = |rid: &str| ReleaseLock {
             schema_version: 1,
             release_id: rid.into(),
             workspace_name: "ws".into(),
@@ -1755,7 +1755,7 @@ format = "jsonl"
         );
 
         // 部署编排完成：包内构建 id 写入 release_id，令牌回显不被覆盖
-        st.set_release(workspace_manifest::ReleaseLock {
+        st.set_release(ReleaseLock {
             schema_version: 1,
             release_id: "build-9".into(),
             workspace_name: "ws".into(),
@@ -1822,7 +1822,7 @@ format = "jsonl"
 
     // ===== R01/R02/R04：执行身份生命周期与屏障裁决 =====
 
-    fn kernel_for(dir: &std::path::Path) -> std::sync::Arc<crate::runtime_kernel::RuntimeKernel> {
+    fn kernel_for(dir: &std::path::Path) -> Arc<crate::runtime_kernel::RuntimeKernel> {
         let workspace = dir.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         let identity = shared_types::RuntimeIdentityView {
@@ -1838,7 +1838,7 @@ format = "jsonl"
         let store =
             crate::runtime_kernel::RuntimeStore::open_with_root(dir.join("state-root"), &workspace)
                 .expect("store");
-        std::sync::Arc::new(crate::runtime_kernel::RuntimeKernel::new(
+        Arc::new(crate::runtime_kernel::RuntimeKernel::new(
             store,
             identity,
             Box::new(|_| {}),
@@ -2392,9 +2392,7 @@ format = "jsonl"
     /// 两个可写 owner 或两个监听。
     #[tokio::test]
     async fn concurrent_bootstrap_yields_exactly_one_owner() {
-        fn describe(
-            outcome: &anyhow::Result<crate::control::supervision::SupervisionOutcome>,
-        ) -> String {
+        fn describe(outcome: &Result<crate::control::supervision::SupervisionOutcome>) -> String {
             match outcome {
                 Ok(crate::control::supervision::SupervisionOutcome::Owner(_)) => "owner".into(),
                 Ok(crate::control::supervision::SupervisionOutcome::Dispatch) => "dispatch".into(),
@@ -2405,7 +2403,7 @@ format = "jsonl"
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().join("ws-race");
         std::fs::create_dir_all(&ws).unwrap();
-        let args = crate::config::RuntimeArgs {
+        let args = RuntimeArgs {
             workspace: ws,
             log_dir: dir.path().join("logs-race"),
             attach: false,
@@ -2415,7 +2413,7 @@ format = "jsonl"
             crate::control::supervision::supervise(&args, false),
             crate::control::supervision::supervise(&args, false),
         );
-        let mut owner_session: Option<std::sync::Arc<runtime_supervisor::OwnerSession>> = None;
+        let mut owner_session: Option<Arc<runtime_supervisor::OwnerSession>> = None;
         let (mut owners, mut dispatches) = (0usize, 0usize);
         let mut unexpected = Vec::new();
         for outcome in [first, second] {
