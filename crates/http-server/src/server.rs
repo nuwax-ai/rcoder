@@ -92,7 +92,11 @@ fn spawn_http_listener(
                                         match Service::<std::net::SocketAddr>::call(&mut app_clone, addr).await {
                                             Ok(service) => {
                                                 let hyper_service = TowerToHyperService::new(service);
-                                                let connection = http_builder.serve_connection(io, hyper_service);
+                                                // with_upgrades：E2B 数据面 WS 隧道依赖
+                                                // hyper::upgrade::on —— 普通 serve_connection
+                                                // 会发 101 但永不切协议，升级字节全被丢弃。
+                                                let connection =
+                                                    http_builder.serve_connection_with_upgrades(io, hyper_service);
                                                 tokio::pin!(connection);
                                                 let result = tokio::select! {
                                                     result = &mut connection => result,
