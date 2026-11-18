@@ -125,7 +125,6 @@ chrono = { workspace = true, features = ["serde"] }
 dashmap = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
-piper = { workspace = true }
 base64 = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
@@ -141,7 +140,6 @@ zip = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 tracing-opentelemetry = { workspace = true }
-axum-tracing-opentelemetry = { workspace = true }
 
 # File system
 path-clean = { workspace = true }

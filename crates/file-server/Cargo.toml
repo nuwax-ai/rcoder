@@ -72,7 +72,6 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 
 # app-files 转发族：容器内流式下载 + zip/tar.gz 解压（与 app_manager 原实现同源）
-download_utils = { workspace = true }
 # 下载取消令牌（download_to_file 签名要求）
 tokio-util = { workspace = true }
 # 运行态状态根解析契约（R09：与 app-cli 同一解析规则）
@@ -127,7 +126,6 @@ tempfile = { workspace = true }
 rustix = { workspace = true }
 
 # 异步流构造 (UserApp build 进度 SSE: async_stream::stream!)
-async-stream = { workspace = true }
 
 # 相对路径计算 (agent-store 软链: pathdiff::diff_paths)
 pathdiff = { workspace = true }

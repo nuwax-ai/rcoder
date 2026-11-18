@@ -136,7 +136,6 @@ dashmap = { workspace = true }
 notify = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
-piper = { workspace = true }
 base64 = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
@@ -147,7 +146,6 @@ rustls = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 tracing-opentelemetry = { workspace = true }
-axum-tracing-opentelemetry = { workspace = true }
 
 # File system
 path-clean = { workspace = true }
@@ -155,13 +153,10 @@ path-clean = { workspace = true }
 # OpenAPI documentation
 utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
-utoipa-scalar = { workspace = true }
 
-ringbuf = { workspace = true }
 
 # Random and hashing
 rand = { workspace = true }
-md5 = { workspace = true }
 
 # Cache
 moka = { workspace = true }

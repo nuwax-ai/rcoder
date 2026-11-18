@@ -24,7 +24,6 @@ container-runtime-api = { workspace = true }
 docker_manager = { workspace = true }
 rcoder-proxy = { workspace = true }
 shared_types = { workspace = true }
-download_utils = { workspace = true }
 workspace-manifest = { workspace = true }
 
 # Async runtime
@@ -67,7 +66,6 @@ tempfile = { workspace = true }
 tokio-util = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-zip = { workspace = true }
 
 [dev-dependencies]
 rcoder-storage = { workspace = true, features = ["userapp-turso"] }
