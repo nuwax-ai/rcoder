@@ -8,6 +8,7 @@
 mod api_doc;
 #[cfg(test)]
 mod openapi_tests;
+mod scalar_assets;
 
 pub use api_doc::ApiDoc;
 
@@ -85,20 +86,24 @@ pub fn create_swagger_ui() -> SwaggerUi {
 /// - `/api/docs/scalar`：主文档（应用管理 + userApp 业务域）
 /// - `/api/docs/scalar/file-server`：file-server 全量文档
 ///
-/// 注意：Scalar 的 UI JS 由页面从公网 CDN（jsdelivr）加载，spec 本身
-/// 内嵌在返回的 HTML 中——浏览器无法出网时页面会白屏（Swagger UI 资产
-/// 是编译期内嵌的，不受影响）；届时用 `custom_html` 换自托管 JS。
+/// UI 资产（JS bundle + 字体）编译期内嵌于二进制（见 [`scalar_assets`]），
+/// 页面模板经 `custom_html` 指向同源路由——浏览器无法出网时与 Swagger UI
+/// 一样可用（spec 亦内嵌在返回的 HTML 中）。
 /// 路由共存依赖 matchit static 优先于 `/api/docs/{*rest}` 通配。
 pub fn create_scalar_docs() -> axum::Router {
     use utoipa_scalar::{Scalar, Servable};
-    // `.title()` 在已发布的 0.3.0 尚未提供（master 未发版），页面标题
-    // 用默认 "Scalar"；升级 0.4+ 可补。
     axum::Router::new()
-        .merge(Scalar::with_url("/api/docs/scalar", primary_document()))
-        .merge(Scalar::with_url(
-            "/api/docs/scalar/file-server",
-            file_server_document(),
-        ))
+        .merge(scalar_assets::asset_router())
+        .merge(
+            Scalar::with_url("/api/docs/scalar", primary_document())
+                .title("RCoder API")
+                .custom_html(scalar_assets::page_template()),
+        )
+        .merge(
+            Scalar::with_url("/api/docs/scalar/file-server", file_server_document())
+                .title("file-server API")
+                .custom_html(scalar_assets::page_template()),
+        )
 }
 
 /// file-server 下拉文档 = file-server 全量文档（TS 对齐域）+ userApp 域文档
