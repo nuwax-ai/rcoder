@@ -64,7 +64,7 @@ publish = false
 agent-client-protocol = { version = "3.6" }
 
 # MCP 协议 - rmcp 官方库
-rmcp = { version = "3.8"}
+rmcp = { version = "3.11"}
 # mcp-proxy convert fallback 参数解析与文件重写。
 mcp-proxy-args = { version = "0.2.10" }
 
@@ -73,9 +73,11 @@ piper = "0.2"
 clap = { version = "4.6", features = ["derive", "env"] }
 
 # Async runtime
-# Pingora 0.9 initializes streams with a zero-capacity reader. Tokio 1.54
-# panics on that constructor; keep the compatible patch until Pingora adapts.
-tokio = { version = "=1.53.3", features = ["full"] }
+# pingora 0.9.0 与 tokio 1.54 曾不兼容（pingora 以 zero-capacity reader 初始化
+# 流，tokio 1.54 对该构造 panic，首个 accept 连接即崩）：pingora 0.9.1 已随
+# 上游 cloudflare/pingora#1059 修复（fix 5b30d71d），tokio 兼容钉就此解除。
+# 后续升级 tokio 前确认 pingora ≥0.9.1 即可。
+tokio = { version = "=1.54", features = ["full"] }
 # CancellationToken lock/wake and stream EOF fixes are required by task drain.
 tokio-util = { version = "0.7.20", features = ["compat", "time"] }
 tokio-stream = "0.1"
@@ -184,12 +186,12 @@ convert_case = "0.12"
 # imbl = im 的活跃维护 fork（im 15.1 已 unmaintained，RUSTSEC-2026-0248）
 imbl = { version = "7.0", features = ["serde"] }
 handlebars = { version = "6.4", features = ["rust-embed"] }
-rust-embed = "8.12"
+rust-embed = "8.14"
 zstd = "0.14"
 
 # Kubernetes
-kube = { version = "4.2", features = ["runtime", "client", "kube-runtime", "config", "ws"] }
-k8s-openapi = { version = "0.28", features = ["v1_32"] }
+kube = { version = "5.1", features = ["runtime", "client", "kube-runtime", "config", "ws"] }
+k8s-openapi = { version = "0.29", features = ["v1_33"] }
 
 
 # 构建工具
@@ -197,7 +199,7 @@ derive_builder = "0.20"
 
 # Zed 核心功能依赖
 libc = "0.2"
-nix = { version = "0.31.3", features = ["fs", "process", "term", "signal"] }
+nix = { version = "0.32", features = ["fs", "process", "term", "signal"] }
 # Windows 引导会话身份（runtime-supervisor epoch：GetTickCount64/FILETIME FFI）。
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_SystemInformation"] }
 # /proc 解析（agent_runner 统计容器内 noVNC 端口 ESTABLISHED 连接，判 VNC 桌面是否在用）。
@@ -215,7 +217,7 @@ hex = "0.4"
 walkdir = "2.5"
 # 并行目录遍历 (work-stealing 线程池), 用于 file-server search-files。
 # 取代手写 BFS: 零 syscall d_type + 多线程并行, dua-cli (gitoxide 作者 Byron 维护) 的核心库。
-dua-core = "5.0"
+dua-core = "6.1"
 # HTTP client。reqwest 0.13 的 default-tls 本就是 rustls(aws-lc-rs + rustls-platform-verifier 读 OS 根证书)，
 # 并无 openssl/native-tls。这里 default-features=false + 显式 rustls 固化“全 workspace 用 rustls”，
 # 防止未来 reqwest 改默认后悄悄回退；charset/http2/system-proxy 补回原默认特性。
@@ -256,15 +258,14 @@ userapp-log-reader = { path = "crates/userapp-log-reader" }
 shlex = "2.0"
 smallvec = "1.16"
 
-toml = "1.1.8"
+toml = "1.2"
 which = "8.0"
 
 
 # Dev dependencies for testing
-ctor = "1.0.13"
+ctor = "1.0"
 pretty_assertions = "1.4"
 tempfile = "3.27"
-filetime = "0.2"
 rand = "0.10"
 tokio-test = "0.4"
 expect-test = "1.5"
@@ -365,7 +366,7 @@ model_probe = { path = "crates/model_probe" }
 # Hotpath 本地性能剖析（hotpath-rs，本地开发观测；见 AGENTS.md「AI 调试路由」）。
 # 非 optional（官方推荐）：不开 feature 时宏全 no-op、内部依赖零编译；
 # 不进 default features → 生产构建（build-agent-docker）完全无感。
-hotpath = { version = "0.30", default-features = false }
+hotpath = { version = "0.32", default-features = false }
 
 # dial9 事件级 Tokio tracing（本地开发观测，取代已移除的 tokio-console）。
 # default=[] 必须显式开 `tokio`（runtime hooks + recorder_from_env）；不开
