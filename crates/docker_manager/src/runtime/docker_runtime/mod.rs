@@ -202,6 +202,7 @@ pub(super) fn extract_container_ports(
 mod agent_runtime;
 mod container_query;
 mod partial_creation;
+mod pod_overview;
 #[cfg(test)]
 mod tests;
 

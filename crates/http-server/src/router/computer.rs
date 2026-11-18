@@ -48,6 +48,7 @@ pub(super) fn computer_routes(state: Arc<AppState>) -> Router {
         )
         // Pod 容器管理接口
         .route("/computer/pod/count", get(handler::pod_count))
+        .route("/computer/pod/overview", get(handler::pod_overview))
         .route("/computer/pod/list", get(handler::pod_list))
         .route("/computer/pod/ensure", post(handler::pod_ensure))
         .route("/computer/pod/keepalive", post(handler::pod_keepalive))
@@ -70,6 +71,7 @@ pub(super) fn computer_routes(state: Arc<AppState>) -> Router {
             "/computer/pod/resources/stream",
             get(handler::computer_pod_resources_stream),
         )
+        .route("/computer/pod/health", get(handler::computer_pod_health))
         .route("/computer/pod/vnc-status", get(handler::pod_vnc_status))
         // 🆕 音频代理路由（用于 OpenAPI 文档）
         .route(

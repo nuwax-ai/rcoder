@@ -483,7 +483,7 @@ fn serve_attach_without_existing_instance_starts_as_owner() {
     command.arg("--attach");
     let mut child = command.spawn().expect("spawn attach serve");
     // 等待足够时间让进程完成 attach 检测（无实例 → serve_without_attach）
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    std::thread::sleep(Duration::from_secs(3));
     // 进程应该仍然存活（进入了 serve 流程，不会立即因 attach 失败退出）
     assert!(
         child.try_wait().expect("try_wait").is_none(),
@@ -519,7 +519,7 @@ fn serve_attach_identity_mismatch_exits_fast() {
             axum::serve(listener, app).await.unwrap();
         });
     });
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(Duration::from_millis(500));
 
     let (_dir, workspace) = temp_workspace();
     write_lock(&workspace, MINIMAL_LOCK);

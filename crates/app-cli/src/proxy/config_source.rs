@@ -257,9 +257,18 @@ mod tests {
             pingap_config::read_all_config_files(&directory.path().to_string_lossy())
                 .await
                 .unwrap();
+        // pingap-config 0.16.1 起官方聚合输出经 TOML 规范化序列化（字符串用
+        // basic string、无文件间空行），与目录原文件字节不再逐字节相等
+        // （0.15 的 toml_edit 保格式序列化恰好逐字节一致）。本断言守护的实质
+        // 不变量是两侧解析语义一致——digest、错误 span、热载比对都先解析再
+        // 消费，不依赖聚合字节的原样形态。
+        let source_value: toml::Value = toml::from_str(&String::from_utf8_lossy(&source.bytes))
+            .expect("aggregate parses as TOML");
+        let pinned_value: toml::Value =
+            toml::from_str(&String::from_utf8_lossy(&pinned_bytes)).expect("official parses");
         assert_eq!(
-            source.bytes, pinned_bytes,
-            "TOML wins over lower-priority formats with identical source bytes"
+            source_value, pinned_value,
+            "TOML wins over lower-priority formats with identical parsed semantics"
         );
         std::fs::write(
             directory.path().join("10-bad.toml"),

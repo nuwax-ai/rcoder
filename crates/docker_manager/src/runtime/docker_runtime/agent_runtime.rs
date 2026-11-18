@@ -1,4 +1,5 @@
 use super::*;
+use tracing::warn;
 
 #[async_trait]
 impl AgentContainerRuntime for DockerRuntime {
@@ -1074,6 +1075,13 @@ impl AgentContainerRuntime for DockerRuntime {
             .unwrap_or(false))
     }
 
+    async fn observe_namespace_pods(
+        &self,
+        events_limit: usize,
+    ) -> ContainerRuntimeResult<container_runtime_api::pod_overview::PodOverviewSnapshot> {
+        self.pod_overview_inner(events_limit).await
+    }
+
     async fn list_containers(&self) -> ContainerRuntimeResult<Vec<RuntimeContainerInfo>> {
         let epoch = self.inner.containers.list_epoch();
         // 命中且代次一致才可用；状态已变更（创建/删除/更新）则强制刷新
@@ -1090,7 +1098,28 @@ impl AgentContainerRuntime for DockerRuntime {
         Ok(result)
     }
 
+    async fn container_health(
+        &self,
+        identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Option<container_runtime_api::ContainerHealth>> {
+        self.container_health_inner(identifier).await
+    }
+
+    async fn container_termination_history(
+        &self,
+        identifier: &str,
+    ) -> ContainerRuntimeResult<Option<container_runtime_api::LastTermination>> {
+        self.termination_history_inner(identifier).await
+    }
+
     async fn sync_states(&self) -> ContainerRuntimeResult<(u32, Vec<RemovedContainerInfo>)> {
+        // 先按 Docker 真实列表回收超期的 stopped agent 容器（不依赖任何
+        // 注册表——agent 容器在 rcoder-engine 的 projects 表里，
+        // DockerManager.containers 是另一套缓存，挂那里永远不会触发）。
+        if let Err(e) = self.inner.reap_stopped_agents().await {
+            warn!("[SYNC] reclaim stopped agent containers failed: {e}");
+        }
         self.inner
             .sync_all_container_states()
             .await

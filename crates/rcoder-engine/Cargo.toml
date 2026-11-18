@@ -49,7 +49,6 @@ deploy-host = ["shared_types/deploy-host", "docker_manager/deploy-host", "rcoder
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-filetime = { workspace = true }
 http-body-util = { workspace = true }
 toasty = { workspace = true }
 toasty-driver-turso = { workspace = true }
@@ -59,6 +58,7 @@ workspace = true
 
 [dependencies]
 sha2 = { workspace = true }
+aes-gcm = "0.10"
 hex = { workspace = true }
 # Internal crates
 shared_types = { workspace = true }
@@ -137,7 +137,6 @@ dashmap = { workspace = true }
 notify = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
-piper = { workspace = true }
 base64 = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
@@ -148,7 +147,6 @@ rustls = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 tracing-opentelemetry = { workspace = true }
-axum-tracing-opentelemetry = { workspace = true }
 
 # File system
 path-clean = { workspace = true }
@@ -156,13 +154,10 @@ path-clean = { workspace = true }
 # OpenAPI documentation
 utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
-utoipa-scalar = { workspace = true }
 
-ringbuf = { workspace = true }
 
 # Random and hashing
 rand = { workspace = true }
-md5 = { workspace = true }
 
 # Cache
 moka = { workspace = true }

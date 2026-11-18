@@ -456,6 +456,7 @@ fn runtime(client: kube::Client) -> KubernetesRuntime {
         },
         pod_cache: Default::default(),
         subvolume_path_cache: Default::default(),
+        workspace_exists_cache: Default::default(),
         event_publisher: Default::default(),
         event_counters: Default::default(),
     }
@@ -523,7 +524,7 @@ pub(super) async fn fixture(
         .service_type(ServiceType::UserappBuilder)
         .build();
     let mut spec = runtime
-        .build_agent_pod_spec("app", &ServiceType::UserappBuilder, &params)
+        .build_agent_pod_spec("app", &ServiceType::UserappBuilder, &params, false)
         .expect("spec");
     let env = spec.containers[0].env.get_or_insert_default();
     env.retain(|entry| entry.name != "APP_CLI_DEPLOY_TOKEN");
@@ -906,6 +907,7 @@ async fn compute_restart_then_cold_unbound_ensure_preserves_updated_compute_and_
         config: runtime.config.clone(),
         pod_cache: Default::default(),
         subvolume_path_cache: Default::default(),
+        workspace_exists_cache: Default::default(),
         event_publisher: Default::default(),
         event_counters: Default::default(),
     };

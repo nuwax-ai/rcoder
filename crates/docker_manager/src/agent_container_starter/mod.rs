@@ -182,7 +182,15 @@ impl<'a> AgentContainerStarter<'a> {
             .name_prefix(service_config.container_prefix())
             .work_dir(service_config.work_dir.clone())
             .network_mode(service_config.network_mode.clone())
-            .auto_remove(true)
+            // **不自动删除**：auto_remove=true 会让 OOM 的容器连同
+            // `State.OOMKilled / ExitCode / FinishedAt` 一起消失，OOM 归因
+            // 只能退回 Docker events（只回放最近 256 条，繁忙 daemon 上仅
+            // 覆盖几分钟）。保留尸体让 /computer/pod/health 能直接 inspect
+            // 真实死因；由 60s 的容器对账任务在保留窗口（10 分钟）后回收，
+            // 见 docker_manager/src/manager/sync.rs::reap_stopped_agent。
+            // 不会导致"复用旧镜像"：start_prepared 每次创建前都会
+            // clear_previous_container_for_rebuild 删掉旧容器。
+            .auto_remove(false)
             // 结构化身份 label（对齐 K8s build_standard_labels / Docker Userapp
             // 容器的身份载体）：rcoder 重启后 Docker API list 按 label 还原身份
             // （消费侧暂未切换，铺重启窗口的 label 直读）

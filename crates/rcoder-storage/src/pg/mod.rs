@@ -373,14 +373,18 @@ impl PgStore {
                         physical_uid.is_some(),
                         "A placeholder cannot clear a bound container identity"
                     );
-                    // 契约三行3/§1.2：同名 workload 对象已被替换 → 禁止自动换代
-                    // 重绑——自动接管会把 projects/sessions 绑到别人的 workload 上。
+                    // 契约三行3/§1.2：同名 workload 对象已被替换时的准入裁决。
                     // 裁决依据是权威快照（containers 行 + tombstone），内存镜像
                     // 只是缓存：本系统已退役（tombstone 在案）的自我换代放行；
-                    // DB 绑定仍指向在案的旧 workload 属真外部替换，拒绝（409）；
-                    // 行与 tombstone 俱无属手工动库等异常状态，同样拒绝。
+                    // DB 绑定仍指向在案的旧 workload（带外换代：kubectl 重启
+                    // pod / 节点宕机重建 / 驱逐）在 binding_autoheal 开启时按
+                    // 换代事务放行并写墓碑留痕（旧行为为 409 拒绝
+                    // 且重启进程无效）；关闭开关恢复 409 拒绝。
+                    // 行与 tombstone 俱无：读路径自愈补写墓碑（authoritative.rs），
+                    // 无法自愈的（identity 残缺/墓碑冲突）仍拒绝。
                     // 任一方缺 workload UID（Docker/bare-pod/Deployment 族）不进
-                    // 此门，按既有换代事务走。
+                    // 此门，按既有换代事务走。信任边界：K8s RBAC 管集群操作权，
+                    // 业务鉴权在平台前置层。
                     let observed = basic.workload_uid.as_deref();
                     let mirror_mismatch = match (registered_workload_uid.as_deref(), observed) {
                         (Some(registered), Some(observed)) => registered != observed,
@@ -407,13 +411,89 @@ impl PgStore {
                                     (registered.as_deref(), observed)
                                     && registered != observed
                                 {
-                                    return Err(anyhow::Error::new(
-                                        shared_types::ContainerWorkloadReplaced {
-                                            container_name: key.clone(),
-                                            registered_workload_uid: registered.to_string(),
-                                            observed_workload_uid: observed.to_string(),
-                                        },
-                                    ));
+                                    if self.postgres_config.binding_autoheal() {
+                                        // 迟到观察防线（审查 P1）：UID 不同只证明
+                                        // "不是同一对象"，不证明"观察比当前绑定新"。
+                                        // k8s pod creationTimestamp 是秒级精度：
+                                        // - 观察创建时间**早于**在案行 → 迟到的旧
+                                        //   观察，拒绝（否则它会退休较新绑定并写
+                                        //   物理墓碑，把真实新对象的后续登记永久
+                                        //   封死 Superseded）；
+                                        // - **同秒** → 无法按时间排序。只放行携带
+                                        //   匹配前驱身份的**受控换代**（supplied
+                                        //   有值 = 调用方此前注册过当前行，上游
+                                        //   rebase 检查已证明其见过当前代次）；
+                                        //   全新观察（supplied 为空，如重启后空
+                                        //   镜像副本）不能在不可判定时退休当前
+                                        //   绑定 → 拒绝，经运行时/生命周期流程
+                                        //   （重新观察或 stop→退休→重建）确证。
+                                        //   不能一刀切拒绝同秒：合法的同秒重建
+                                        //   （受控方）必须能通过原入口恢复。
+                                        let bound_created = read
+                                            .canonical_container
+                                            .as_ref()
+                                            .map(|row| row.created_at);
+                                        if bound_created
+                                            .is_some_and(|bound| basic.created_at < bound)
+                                        {
+                                            tracing::warn!(
+                                                container = %key,
+                                                registered_workload_uid = registered,
+                                                observed_workload_uid = observed,
+                                                observed_created_at = %basic.created_at,
+                                                bound_created_at = ?bound_created,
+                                                "binding autoheal rejected a stale observation \
+                                                 older than the current binding"
+                                            );
+                                            anyhow::bail!(
+                                                "Observed workload is older than the current \
+                                                 binding (created {} < {}); stale observation \
+                                                 cannot retire a newer binding",
+                                                basic.created_at,
+                                                bound_created.unwrap_or_default(),
+                                            );
+                                        }
+                                        if bound_created
+                                            .is_some_and(|bound| basic.created_at == bound)
+                                            && supplied.container.is_none()
+                                        {
+                                            tracing::warn!(
+                                                container = %key,
+                                                registered_workload_uid = registered,
+                                                observed_workload_uid = observed,
+                                                observed_created_at = %basic.created_at,
+                                                "binding autoheal rejected an unverifiable \
+                                                 same-second observation; re-observe or retire \
+                                                 the binding through the lifecycle flow"
+                                            );
+                                            anyhow::bail!(
+                                                "Observed workload was created in the same \
+                                                 second as the current binding ({}); a fresh \
+                                                 observation cannot prove it is newer — \
+                                                 re-observe or stop the project to retire the \
+                                                 binding first",
+                                                basic.created_at,
+                                            );
+                                        }
+                                        // 带外换代放行：走下方既有换代事务
+                                        // （旧代写墓碑 + 新代落库，row_revision CAS
+                                        // 保护并发）。warn 留审计痕迹。
+                                        tracing::warn!(
+                                            container = %key,
+                                            registered_workload_uid = registered,
+                                            observed_workload_uid = observed,
+                                            "binding autoheal: accepting an out-of-band \
+                                             workload replacement and retiring the stale binding"
+                                        );
+                                    } else {
+                                        return Err(anyhow::Error::new(
+                                            shared_types::ContainerWorkloadReplaced {
+                                                container_name: key.clone(),
+                                                registered_workload_uid: registered.to_string(),
+                                                observed_workload_uid: observed.to_string(),
+                                            },
+                                        ));
+                                    }
                                 }
                             }
                         },

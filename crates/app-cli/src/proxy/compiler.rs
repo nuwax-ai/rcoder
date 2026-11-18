@@ -873,7 +873,7 @@ mod standby_page_tests {
 
 /// 常驻热载兼容校验（P1 T15）：对比当前 active 与新候选的 server 拓扑。
 ///
-/// pin（0.15.0）热载支持既有 server 的 locations/upstreams/plugins 更新；
+/// pin（0.16.1）热载支持既有 server 的 locations/upstreams/plugins 更新；
 /// **server 增删/改名/监听地址变化不可热载**——受理前 Fail Fast（保旧服务
 /// 运行，指引走完整重配置流程），不得静默半生效。首编（active 不存在或
 /// 无法解析）跳过校验（bootstrap 建立全量拓扑）。
@@ -892,11 +892,11 @@ pub fn validate_hot_reload_compatible(active: &Path, candidate: &str) -> Result<
     let active_cfg = PingapConfig::new(active_content.as_bytes(), true)
         .with_context(|| format!("parse active config {}", active.display()))?;
     let candidate_cfg = PingapConfig::new(candidate.as_bytes(), true).context("parse candidate")?;
-    // C7：pin（0.15.0）热载支持 = 既有 server 的 locations 变化 + plugins +
+    // C7：pin（0.16.1）热载支持 = 既有 server 的 locations 变化 + plugins +
     // upstreams。其余全部逐项比较：server 名单/监听/非 locations 字段、
     // storages、basic（热载语义未承诺的段落变化一律 Fail Fast）。
     // locations/upstreams/plugins 的**内容**差异放行（受支持类别）。
-    // pingap-config 0.15.0 的 conf 类型未 derive PartialEq——经 serde 序列化
+    // pingap-config 的 conf 类型未承诺 derive PartialEq——经 serde 序列化
     // 成 serde_json::Value 比较（值语义等价，天然忽略 None vs 缺省差异）。
     let strip_locations = |mut server: pingap_config::ServerConf| {
         server.locations = None;
@@ -1476,7 +1476,7 @@ fn resolve_service_addresses(config: &mut PingapConfig, release: &ReleaseLock) -
 
 /// N02：`layout_roots` = 本次编译的实际布局根（workspace / pingap 运行
 /// 目录的规范化路径）——与容器字面量根并集做路径校验，原生平台不整段跳过。
-fn validate_guardrails(config: &PingapConfig, layout_roots: &[std::path::PathBuf]) -> Result<()> {
+fn validate_guardrails(config: &PingapConfig, layout_roots: &[PathBuf]) -> Result<()> {
     for (category, count) in [
         ("server", config.servers.len()),
         ("location", config.locations.len()),
@@ -1568,7 +1568,7 @@ fn validate_plugin_paths(name: &str, plugin: &impl serde::Serialize) -> Result<(
 fn validate_plugin_paths_with_roots(
     name: &str,
     plugin: &impl serde::Serialize,
-    extra_roots: &[std::path::PathBuf],
+    extra_roots: &[PathBuf],
 ) -> Result<()> {
     let value = serde_json::to_value(plugin)
         .with_context(|| format!("serialize Pingap plugin {name} for guardrail validation"))?;
@@ -1592,7 +1592,7 @@ fn validate_plugin_paths_with_roots(
         let Some(path) = value.as_str() else { continue };
         // 绝对样式值才可能是文件路径（相对值/URL 值不在此判定）：
         // has_root 跨平台（Unix='/' 前缀；Windows=盘符或根相对 '\'/'/'）
-        if !std::path::Path::new(path).has_root() {
+        if !Path::new(path).has_root() {
             continue;
         }
         let is_file_field =
@@ -1609,17 +1609,13 @@ fn validate_plugin_paths_with_roots(
 /// 目录不存在即无从逃逸，真实布局根由调用方以 extra_roots 追加）。
 const CONTAINER_RUNTIME_ROOTS: [&str; 4] = ["/app/code", "/app/data", "/app/logs", "/run/app-cli"];
 
-fn validate_runtime_path(
-    field: &str,
-    value: &str,
-    extra_roots: &[std::path::PathBuf],
-) -> Result<()> {
+fn validate_runtime_path(field: &str, value: &str, extra_roots: &[PathBuf]) -> Result<()> {
     // N02：路径校验不再按平台整段跳过——Windows 原生同样需要防配置逃逸。
     // 组件化前缀比较（Path::starts_with）在三个平台语义一致，正确处理
     // 分隔符差异（"/app/data/x" 与 "C:\app\data\x" 各按本平台规则比较）。
-    let path = std::path::Path::new(value);
+    let path = Path::new(value);
     let matched = CONTAINER_RUNTIME_ROOTS.iter().any(|root| {
-        let root = std::path::Path::new(root);
+        let root = Path::new(root);
         // Windows 上 "/app/..." 无盘符非绝对，但组件比较仍按根相对路径语义匹配
         path.starts_with(root)
     }) || extra_roots.iter().any(|root| path.starts_with(root));
@@ -1977,7 +1973,7 @@ addr = "0.0.0.0:9081"
             )),
             "standby origin marker required for error-page replacement: {joined}"
         );
-        // pin（0.15.0 文件模式）周期轮询默认 90s——必须收紧到确认预算内
+        // pin（0.16.1 文件模式）周期轮询默认 90s——必须收紧到确认预算内
         assert_eq!(
             cfg.basic.auto_restart_check_interval,
             Some(std::time::Duration::from_secs(2))
@@ -2022,8 +2018,7 @@ addr = "0.0.0.0:9081"
         let active_directory = root.path().join("pingap.toml");
         std::fs::create_dir(&active_directory).unwrap();
         let candidate = "[servers.app]\naddr='0.0.0.0:9080'\n";
-        let error =
-            super::validate_hot_reload_compatible(&active_directory, candidate).unwrap_err();
+        let error = validate_hot_reload_compatible(&active_directory, candidate).unwrap_err();
         assert!(format!("{error:#}").contains("before preflight"));
         assert!(active_directory.is_dir());
     }

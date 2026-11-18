@@ -270,7 +270,10 @@ api_key_auth:
 #   RCODER_STORAGE_BACKEND / RCODER_PG_HOST / RCODER_PG_PORT / RCODER_PG_USERNAME /
 #   RCODER_PG_PASSWORD / RCODER_PG_DATABASE / RCODER_PG_URL / RCODER_PG_MAX_CONNECTIONS /
 #   RCODER_PG_CONNECT_TIMEOUT_SECS / RCODER_PG_STATEMENT_TIMEOUT_SECS /
-#   RCODER_PG_DURABLE_COMMIT_TIMEOUT_MS
+#   RCODER_PG_DURABLE_COMMIT_TIMEOUT_MS / RCODER_PG_BINDING_AUTOHEAL
+# RCODER_PG_BINDING_AUTOHEAL（默认 true）：绑定门禁自愈——PG 绑定行异常缺失
+# （行+墓碑俱无）时补写墓碑放行；带外 workload 换代（kubectl 重启 pod / 节点
+# 宕机重建）按换代事务放行。false 恢复保守行为（拒绝 / 409）。
 storage:
   # 存储后端：memory（默认，纯内存单节点）| postgres（PG 持久化，多副本前置条件）
   backend: memory

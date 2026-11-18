@@ -331,6 +331,16 @@ async fn status_resource_query_rejects_stale_expected_identity() {
             container_memory_mb: Some(1024),
             container_memory_limit_mb: Some(3954),
             container_cpu_limit_cores: Some(2.0),
+            // 进程明细与分组聚合(0.1.419+ 新增字段;这里只做结构完整性)
+            processes: Vec::new(),
+            process_count: Some(0),
+            infra_rss_bytes: Some(0),
+            platform_rss_bytes: Some(0),
+            workload_rss_bytes: Some(0),
+            // 执行存在性(与资源降级无关的显式存活信号)
+            agent_present: Some(true),
+            // agent 进程组聚合(仅 include_processes 时填充)；每 project 一条
+            agents: Vec::new(),
         });
 
     // 身份匹配(expected=A,registry=A):资源返回。
@@ -405,7 +415,52 @@ async fn restart_is_idempotent_when_agent_is_absent() {
 }
 
 #[tokio::test]
-async fn restart_session_mismatch_returns_agent_not_found() {
+async fn restart_rejects_project_owned_by_another_user() {
+    // 归属校验：用自己的 user_id + 别人的 project_id 不能重启他人的 agent。
+    // seed 会把 project 归属写成 `owner-{project}`。
+    let fixture = Fixture::new().await;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let project = format!("restart-owner-{suffix}");
+    let live_sid = format!("live-{suffix}");
+    let state = state(&fixture, memory()).await;
+    let physical = builder_container(&fixture);
+    seed(&state, physical, &project, &live_sid).await;
+    fixture
+        .agent
+        .sessions
+        .lock()
+        .unwrap()
+        .insert(project.clone(), live_sid.clone());
+
+    let result = post_json(
+        router(state.clone()),
+        "/computer/agent/restart",
+        serde_json::json!({
+            "user_id": "attacker-user", "project_id": project,
+        }),
+    )
+    .await;
+
+    assert_eq!(result["success"], false, "{result}");
+    assert_eq!(
+        result["code"],
+        shared_types::ERR_COMPUTER_OWNER_CONFLICT,
+        "{result}"
+    );
+    // 拒绝路径不得停止执行、也不得清注册。
+    assert_eq!(
+        fixture.agent.sessions.lock().unwrap().get(&project),
+        Some(&live_sid),
+        "归属校验失败的请求不应改动注册"
+    );
+    assert!(
+        state.get_project(&project).is_some(),
+        "归属校验失败不应移除 project 注册"
+    );
+}
+
+#[tokio::test]
+async fn restart_session_mismatch_returns_conflict_with_generation_detail() {
     let fixture = Fixture::new().await;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let project = format!("restart-mismatch-{suffix}");
@@ -432,10 +487,13 @@ async fn restart_session_mismatch_returns_agent_not_found() {
     .await;
 
     assert_eq!(result["success"], false, "{result}");
-    assert_eq!(
-        result["code"],
-        shared_types::ERR_AGENT_NOT_FOUND,
-        "{result}"
+    // 执行换代属于冲突，不是"agent 不存在"：agent 明明在跑，只是不是调用方
+    // 期望的那个。返回 409 语义(ERR_CONFLICT)，并在 message 里带上两侧身份。
+    assert_eq!(result["code"], shared_types::ERR_CONFLICT, "{result}");
+    let message = result["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&format!("other-{suffix}")) && message.contains(&live_sid),
+        "冲突信息应同时带期望与会话当前身份: {message}"
     );
     // 拒绝路径同样不得清注册。
     assert!(
@@ -504,6 +562,16 @@ async fn status_endpoint_reports_agent_resource_usage() {
             container_memory_mb: Some(1024),
             container_memory_limit_mb: Some(3954),
             container_cpu_limit_cores: Some(2.0),
+            // 进程明细与分组聚合(0.1.419+ 新增字段;这里只做结构完整性)
+            processes: Vec::new(),
+            process_count: Some(0),
+            infra_rss_bytes: Some(0),
+            platform_rss_bytes: Some(0),
+            workload_rss_bytes: Some(0),
+            // 执行存在性(与资源降级无关的显式存活信号)
+            agent_present: Some(true),
+            // agent 进程组聚合(仅 include_processes 时填充)；每 project 一条
+            agents: Vec::new(),
         });
 
     let result = post_json(

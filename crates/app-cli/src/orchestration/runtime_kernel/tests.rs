@@ -25,7 +25,7 @@ mod cases {
     }
 
     /// 测试助手：测试应用的稳定根位置（断言/预置用）。
-    fn app_state_root(workspace: &Path) -> std::path::PathBuf {
+    fn app_state_root(workspace: &Path) -> PathBuf {
         RuntimeStore::resolve_root(workspace, "test-app").expect("resolve root")
     }
 
@@ -902,8 +902,8 @@ mod cases {
             }),
         );
         let mut request = request_deploy_url("op-art");
-        request.profile = shared_types::RunProfileInput::Artifact {
-            artifact: shared_types::ArtifactInput::ArtifactId {
+        request.profile = RunProfileInput::Artifact {
+            artifact: ArtifactInput::ArtifactId {
                 artifact_id: "rel-777".into(),
             },
         };

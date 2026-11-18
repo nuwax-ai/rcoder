@@ -252,9 +252,19 @@ pub(crate) fn init_tracing_subscriber(params: SubscriberParams<'_>) -> Result<()
     } = params;
 
     // 创建 EnvFilter（支持 RUST_LOG 环境变量）
+    //
+    // 注意匹配方式：EnvFilter 的指令是按**目标字符串前缀**匹配的
+    // （tracing-subscriber `env/directive.rs`: `meta.target().starts_with(target)`），
+    // 且没有全局指令时，未被任何指令命中的 target 一律 **OFF**。
+    //
+    // 因此 `{service}=debug` 只能覆盖以该名字开头的 target（rcoder →
+    // rcoder_engine / rcoder_proxy / rcoder_storage…），覆盖不到独立 crate 名，
+    // 例如 http-server 的 target 是 `http_server`：之前整个 crate 的日志
+    // （所有 handler 的 info/warn/error）都被静默丢弃，线上排障时看不到任何
+    // 请求级业务日志。这里显式补上 `http_server`。
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         format!(
-            "{}=debug,tower_http=debug,axum=info,hyper=info,tonic=info",
+            "{}=debug,http_server=info,tower_http=debug,axum=info,hyper=info,tonic=info",
             service_name.replace('-', "_")
         )
         .into()

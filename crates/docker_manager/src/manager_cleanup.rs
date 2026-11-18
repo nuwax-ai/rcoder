@@ -14,19 +14,149 @@ use std::time::Instant;
 use anyhow::Result;
 use bollard::models::ContainerSummary;
 use bollard::query_parameters::{
-    InspectContainerOptions, RemoveContainerOptions, StopContainerOptions,
+    InspectContainerOptions, ListContainersOptions, RemoveContainerOptions, StopContainerOptions,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     CleanupOptions, CleanupResult, ContainerRemovalFailure, ContainerStatus, DockerError,
     DockerManager, DockerResult,
 };
 
+/// 已停止的 agent 容器保留多久再回收（默认 10 分钟）。
+///
+/// 保留窗口的意义：agent 容器不再 `auto_remove`，尸体让
+/// `/computer/pod/health` 能直接 `inspect` 到 `State.OOMKilled / ExitCode /
+/// FinishedAt`——比 Docker events（只回放最近 256 条，繁忙 daemon 上仅覆盖
+/// 几分钟）精确得多。到期由 60s 对账任务回收，不长期占磁盘。
+///
+/// 可用 `RCODER_STOPPED_AGENT_RETENTION_SECS` 覆盖（运维调优/测试）。
+const STOPPED_AGENT_RETENTION_SECS: i64 = 600;
+
+/// 停止容器回收的 service-type 白名单（仅 agent 族；Display 值）。
+const REAPABLE_SERVICE_TYPES: &[&str] = &[
+    "computer-agent-runner",
+    "computer-normal-project",
+    "web-agent-runner",
+];
+
+fn stopped_agent_retention_secs() -> i64 {
+    std::env::var("RCODER_STOPPED_AGENT_RETENTION_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+        .unwrap_or(STOPPED_AGENT_RETENTION_SECS)
+}
+
 impl DockerManager {
     // ========================================================================
     // Cleanup entry points
     // ========================================================================
+
+    /// 回收「已停止超过保留窗口」的 agent 容器。
+    ///
+    /// **直接扫 Docker 真实容器列表**，不经过任何注册表：agent 容器注册在
+    /// rcoder-engine 的 projects 表，而 `DockerManager::containers` 是另一套
+    /// 缓存——挂在后者上的回收对 agent 容器永远不会触发（实测确认）。
+    /// 直接 list 还能覆盖"从所有缓存里消失但 Docker 里还在"的孤儿。
+    ///
+    /// 判据（缺一不可）：
+    /// - 带 `service-type` label（只看 rcoder 管理的 agent 容器，不碰 userapp）；
+    /// - 状态已停止（exited/dead/created，非 running/restarting/paused）；
+    /// - `State.FinishedAt` 有效且距今超过保留窗口（零值一律跳过）。
+    ///
+    /// 返回实际回收数量。
+    pub async fn reap_stopped_agents(&self) -> DockerResult<u32> {
+        let retention = stopped_agent_retention_secs();
+        let listed = self
+            .docker
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                filters: Some(std::collections::HashMap::from([(
+                    "label".into(),
+                    vec!["service-type".to_string()],
+                )])),
+                ..Default::default()
+            }))
+            .await
+            .map_err(|e| DockerError::ConnectionError(format!("list containers for reap: {e}")))?;
+
+        let mut reclaimed = 0u32;
+        for container in listed {
+            let Some(id) = container.id else { continue };
+            // 只回收 agent 族的尸体：service-type 的**值**必须命中 agent 白名单。
+            // UserApp("user-app"/"rcoder-app") 与 builder 同样携带 service-type
+            // label（docker_app_create 打的），但其生命周期由各自管理器负责
+            // ——此处误删会破坏 UserApp 的停止-重启语义（复审 P1）。
+            let service_type = container
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("service-type"))
+                .cloned()
+                .unwrap_or_default();
+            if !REAPABLE_SERVICE_TYPES.contains(&service_type.as_str()) {
+                continue;
+            }
+            // list 的 State 是字符串："exited" / "dead" / "created" / ...
+            let state = container.state.map(|s| s.to_string().to_lowercase());
+            let terminal = matches!(
+                state.as_deref(),
+                Some("exited") | Some("dead") | Some("created")
+            );
+            if !terminal {
+                continue;
+            }
+            // FinishedAt 只在 inspect 里有
+            let details = match self
+                .docker
+                .inspect_container(&id, None::<InspectContainerOptions>)
+                .await
+            {
+                Ok(details) => details,
+                Err(e) => {
+                    debug!(container_id = %id, error = %e, "reap: inspect failed, skip");
+                    continue;
+                }
+            };
+            let finished_at = details
+                .state
+                .as_ref()
+                .and_then(|s| s.finished_at.as_ref())
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t.to_string()).ok())
+                .map(|t| t.timestamp())
+                .filter(|ts| *ts > 0);
+            let Some(finished_at) = finished_at else {
+                continue;
+            };
+            let age = chrono::Utc::now().timestamp() - finished_at;
+            if age < retention {
+                continue;
+            }
+            let name = container
+                .names
+                .as_ref()
+                .and_then(|n| n.first())
+                .map(|n| n.trim_start_matches('/').to_string())
+                .unwrap_or_else(|| id.clone());
+            info!(
+                container_id = %id, container = %name, age_seconds = age,
+                retention_secs = retention,
+                "reclaiming stopped agent container past retention window"
+            );
+            match self
+                .docker
+                .remove_container(&id, None::<RemoveContainerOptions>)
+                .await
+            {
+                Ok(()) => reclaimed += 1,
+                Err(e) => warn!(container_id = %id, error = %e, "reap: remove failed"),
+            }
+        }
+        if reclaimed > 0 {
+            info!(reclaimed, "stopped agent containers reclaimed");
+        }
+        Ok(reclaimed)
+    }
 
     /// 清理所有容器
     pub async fn cleanup_all_containers(&self) -> DockerResult<()> {

@@ -100,6 +100,7 @@ pub(super) fn runtime(client: kube::Client) -> KubernetesRuntime {
         },
         pod_cache: Default::default(),
         subvolume_path_cache: Default::default(),
+        workspace_exists_cache: Default::default(),
         event_publisher: Default::default(),
         event_counters: Arc::new(crate::runtime::k8s_event_publisher::PublisherCounters::default()),
     }
@@ -146,7 +147,7 @@ async fn run(case: Case) -> (Result<VerifiedAgentReplacement>, Vec<String>) {
         .agent_pod_name(&identifier, &params.service_type)
         .unwrap();
     let spec = runtime
-        .build_agent_pod_spec(&identifier, &params.service_type, &params)
+        .build_agent_pod_spec(&identifier, &params.service_type, &params, false)
         .unwrap();
     let workspace = workspace(&spec, None).unwrap();
     // Build the actual controller and Pod as A, then verify the same shared

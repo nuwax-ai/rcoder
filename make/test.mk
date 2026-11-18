@@ -24,15 +24,15 @@ test-integration:
 test-blocking:
 	cargo nextest run --workspace --features testing --test '*_blocking*' --no-fail-fast --test-threads=1 $(NEXTEST_ARGS)
 
-# app-cli 被根 workspace 排除，必须单独运行。
+# app-cli 为 workspace 成员（2026-11-18 并入）；保留独立入口便于聚焦。
 test-app-cli:
-	cargo nextest run --manifest-path crates/app-cli/Cargo.toml --no-fail-fast $(TEST_FEATURES) $(NEXTEST_ARGS)
+	cargo nextest run -p app-cli --no-fail-fast $(TEST_FEATURES) $(NEXTEST_ARGS)
 
 # nextest 不覆盖 doctest；两部分串行执行，任一失败整体失败。
 test-doc:
 	@status=0; \
 	cargo test --workspace --doc --no-fail-fast $(TEST_FEATURES) || status=1; \
-	cargo test --manifest-path crates/app-cli/Cargo.toml --doc --no-fail-fast $(TEST_FEATURES) || status=1; \
+	cargo test -p app-cli --doc --no-fail-fast $(TEST_FEATURES) || status=1; \
 	exit $$status
 
 # Rust 完整检查：即便某部分失败仍收集其他部分结果；不隐式部署或运行 E2E。

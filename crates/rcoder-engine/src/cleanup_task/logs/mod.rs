@@ -247,7 +247,9 @@ mod tests {
         let old_time = std::time::SystemTime::now() - Duration::from_secs(15 * 24 * 60 * 60);
         for (filename, _) in &test_files[..2] {
             let file_path = log_dir.join(filename);
-            if let Err(e) = filetime::set_file_mtime(&file_path, old_time.into()) {
+            if let Err(e) =
+                std::fs::set_times(&file_path, std::fs::FileTimes::new().set_modified(old_time))
+            {
                 // 系统不支持设置修改时间，跳过此测试
                 println!(" set mtime not supported, skip: {}", e);
                 return;

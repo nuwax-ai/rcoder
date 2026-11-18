@@ -1510,3 +1510,18 @@ pub(crate) fn restart_image_env() {
         );
     }
 }
+
+/// 清掉平台镜像 env，让用例回到"未配置平台镜像"的前提。
+///
+/// `restart_image_env()` 是 `set_var` 且**永不清除**，而环境变量是进程级的：
+/// 任何先跑过的用例都会把它泄漏给后续用例。配了平台镜像时
+/// `start_app_target_with_image` 的默认实现会转调 `restart_app_target`
+/// （换镜像必须重启，见 runtime_trait.rs 的文档），于是"纯 start 用例"
+/// 的 `restart_calls == 0` 断言随用例顺序随机失败。
+/// 需要"无平台镜像"前提的用例在开头调它，与执行顺序解耦。
+#[allow(unsafe_code)]
+pub(crate) fn clear_runtime_image_env() {
+    unsafe {
+        std::env::remove_var("RCODER_RUNTIME_IMAGE_DIGEST");
+    }
+}

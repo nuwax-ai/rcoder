@@ -506,6 +506,7 @@ impl AgentContainerRuntime for KubernetesRuntime {
                 config: self.config.clone(),
                 pod_cache: self.pod_cache.clone(),
                 subvolume_path_cache: self.subvolume_path_cache.clone(),
+                workspace_exists_cache: self.workspace_exists_cache.clone(),
                 event_publisher: self.event_publisher.clone(),
                 event_counters: self.event_counters.clone(),
             };
@@ -769,6 +770,21 @@ impl AgentContainerRuntime for KubernetesRuntime {
 
     async fn list_containers(&self) -> ContainerRuntimeResult<Vec<RuntimeContainerInfo>> {
         self.list_containers_inner().await
+    }
+
+    async fn observe_namespace_pods(
+        &self,
+        events_limit: usize,
+    ) -> ContainerRuntimeResult<container_runtime_api::pod_overview::PodOverviewSnapshot> {
+        self.pod_overview_inner(events_limit).await
+    }
+
+    async fn container_health(
+        &self,
+        identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Option<container_runtime_api::ContainerHealth>> {
+        self.pod_health_inner(identifier).await
     }
 
     async fn sync_states(&self) -> ContainerRuntimeResult<(u32, Vec<RemovedContainerInfo>)> {

@@ -887,21 +887,26 @@ async fn swagger_ui_serves_both_documents() {
 }
 
 /// Scalar 文档页 HTTP 层验证：两个页面均实际提供服务，spec 内嵌于
-/// HTML（含各文档语义锚点路径）。与 SwaggerUi 同 Router merge 构造
-/// 即验证 `/api/docs/{*rest}` 通配与 `/api/docs/scalar` static 共存
-/// 不冲突（冲突会在 merge 时 panic）。
+/// HTML（含各文档语义锚点路径），UI JS 指向编译期内嵌 bundle 的同源
+/// 路由（零 CDN 外链，离线可用），静态资产路由实际可达。与 SwaggerUi
+/// 同 Router merge 构造即验证 `/api/docs/{*rest}` 通配与 `/api/docs/scalar`
+/// static 共存不冲突（冲突会在 merge 时 panic）。
 #[tokio::test]
 async fn scalar_docs_serve_both_documents() {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
+    let js_path = format!(
+        "/api/docs/scalar/assets/scalar-api-reference-{}.js",
+        scalar_assets::SCALAR_ASSET_VERSION
+    );
     let app = Router::new()
         .merge(create_swagger_ui())
         .merge(create_scalar_docs());
     for (path, needle) in [
-        // 主文档页：Scalar 引导脚本 + spec 锚点（应用管理 + userApp）
-        ("/api/docs/scalar", "@scalar/api-reference"),
+        // 主文档页：本地 bundle 引导脚本 + spec 锚点（应用管理 + userApp）
+        ("/api/docs/scalar", js_path.as_str()),
         ("/api/docs/scalar", "/api/v1/userapp"),
         ("/api/docs/scalar", "/api/v1/userapp/dev/start"),
         // file-server 页：全量文档锚点
@@ -916,6 +921,27 @@ async fn scalar_docs_serve_both_documents() {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains(needle), "{path} 响应缺少 {needle}");
+        if path == "/api/docs/scalar" {
+            // 资源引用必须零外链：spec JSON 内的业务 URL（servers/contact/文档
+            // 示例等）不受此约束，只禁页面加载的资源来源。
+            assert!(!text.contains("cdn.jsdelivr"), "页面不得从 CDN 加载资源");
+            assert!(
+                !text.contains("<script src=\"http"),
+                "页面不得加载外网脚本: {text}"
+            );
+        }
+    }
+    // 内嵌资产路由：bundle 与字体实际可达
+    for path in [
+        js_path.as_str(),
+        "/api/docs/scalar/assets/fonts/inter-latin.woff2",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "GET {path} 非 200");
     }
     // Swagger UI 原有路由不受 Scalar 挂载影响（static 优先不改变通配兜底）
     let response = app
@@ -1324,4 +1350,31 @@ fn computer_agent_restart_path_documents_resume_contract() {
         serde_json::to_string(props).unwrap().contains("可恢复会话"),
         "resumed_session_id must explain its None semantics"
     );
+}
+
+#[test]
+fn overview_params_are_complete() {
+    let doc = ApiDoc::openapi();
+    let item = doc.paths.paths.get("/computer/pod/overview").expect("path");
+    let params: Vec<String> = item
+        .get
+        .as_ref()
+        .and_then(|g| g.parameters.as_ref())
+        .map(|ps| ps.iter().map(|p| inline(p).name.clone()).collect())
+        .unwrap_or_default();
+    for want in [
+        "search",
+        "events_limit",
+        "service_type",
+        "user_id",
+        "app_id",
+        "project_id",
+        "include_sidecars",
+        "limit",
+    ] {
+        assert!(
+            params.iter().any(|p| p == want),
+            "缺少参数 {want}: {params:?}"
+        );
+    }
 }

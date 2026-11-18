@@ -114,6 +114,54 @@ pub trait AgentContainerRuntime: Send + Sync {
             "Agent resource events are unsupported".into(),
         ))
     }
+    /// 命名空间级 Pod 概览观测（`/computer/pod/overview` 数据源）。
+    ///
+    /// 采集当前 namespace（k8s）/ 本 daemon（docker）内**全部**容器/Pod 的
+    /// 规格、健康与最近事件。分区失败以 `degraded` 标注（事件/卷），
+    /// 列表本身失败返回 Err——没有列表这个查询没有意义。
+    ///
+    /// 容器已不存在时，探测它**最近一次终止**的证据。
+    ///
+    /// 场景：docker 下 rcoder 创建的容器 `auto_remove=true`，容器退出即被
+    /// 删除，`inspect` 无从查询；但 daemon 的**事件历史仍在**，其中
+    /// `oom` 事件是 Docker 专为 cgroup OOM 发出的（比 exitCode 可靠——
+    /// 137 同样来自 SIGKILL）。k8s 不需要本方法（Pod 保留 terminated 状态）。
+    ///
+    /// 返回 `None` = 事件窗口内查不到（超出回放条数/时间窗，或从未运行过）。
+    /// 默认实现返回 `None`（老实现/测试替身行为不变）。
+    async fn container_termination_history(
+        &self,
+        _identifier: &str,
+    ) -> ContainerRuntimeResult<Option<crate::LastTermination>> {
+        Ok(None)
+    }
+
+    /// 单容器健康快照（`/computer/pod/health`，供前端轮询）。
+    ///
+    /// 只查**一个**容器：k8s 单 Pod GET、docker inspect(+events)。刻意不复用
+    /// `observe_namespace_pods`（那是 namespace 全量 list，为一个容器付 48 个
+    /// 的成本）。默认 Unsupported——老实现/测试替身行为不变。
+    async fn container_health(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<Option<crate::ContainerHealth>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "container health is unsupported by this runtime".to_string(),
+        ))
+    }
+
+    /// 默认 Unsupported：老实现与测试替身行为不变；调用方（overview
+    /// handler）把它映射为 503 + `error_detail`，不静默返回空。
+    async fn observe_namespace_pods(
+        &self,
+        _events_limit: usize,
+    ) -> ContainerRuntimeResult<crate::pod_overview::PodOverviewSnapshot> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "pod overview is unsupported by this runtime".into(),
+        ))
+    }
+
     /// Create and start a container
     async fn create_container(
         &self,
@@ -834,6 +882,81 @@ pub trait WorkspaceRuntime: Send + Sync {
         _service_type: &ServiceType,
     ) -> ContainerRuntimeResult<Vec<String>> {
         Ok(vec![])
+    }
+
+    /// 该 identifier 的 per-agent workspace PVC 是否存在（**纯存在性, 不创建**）。
+    ///
+    /// per-agent RBD 转发层的混住判据读侧：PVC 存在 = 该用户已切 RBD（请求转发到
+    /// agent 容器）；不存在 = 共享用户（请求走 rcoder 本地共享卷直读）。
+    /// 与 [`Self::ensure_workspace`] 的关键差异：ensure 会创建（把共享用户误变
+    /// RBD 用户），本方法只读。K8s 实现带短 TTL 缓存（30s，对齐 userapp 探活
+    /// 缓存口径——迁移翻转标记后最多一个 TTL 窗口内判据滞后）；Docker 模式
+    /// 恒 false（无 per-agent PVC 概念）。
+    async fn workspace_pvc_exists(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    /// per-agent workspace 的迁移状态（PVC annotation 投影）。
+    ///
+    /// 判据层三态的真源: PVC 不存在 = NotMigrated; 存在但无/无法识别
+    /// annotation = NotMigrated(fail-safe); `migrated` = Migrated。
+    /// K8s 实现带 30s TTL 缓存（与 workspace_pvc_exists 同口径）;
+    /// Docker 恒 NotMigrated。
+    async fn workspace_migration_state(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<shared_types::WorkspaceMigrationState> {
+        Ok(shared_types::WorkspaceMigrationState::NotMigrated)
+    }
+
+    /// 翻迁移状态（cutover 落 / 回滚撤）。K8s: patch PVC annotation
+    /// （UID+resourceVersion 条件化, 与 resize 同款 CAS 语义）; PVC 不存在
+    /// 报 NotFound（未 phase-a 不能 cutover）。Docker: 不支持。
+    async fn set_workspace_migration_state(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+        _state: shared_types::WorkspaceMigrationState,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "workspace migration state is unsupported by this runtime".to_string(),
+        ))
+    }
+
+    /// per-agent workspace 卷当前是否仍被 Pod 挂载（迁移 cutover 防呆）。
+    ///
+    /// K8s: PVC→PV→VolumeAttachment(status.attached) 查询。**fail-closed 语义
+    /// 由调用方保证**：查询出错时调用方必须中止（RWO 同节点双挂 = ext4 损坏）。
+    /// Docker: 恒 false（无 VA 概念, 宿主机 bind 无此风险）。
+    async fn workspace_volume_attached(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<bool> {
+        Ok(false)
+    }
+
+    /// 跑一轮 rclone 同步（Job 载体: src 共享卷 RO + dst per-agent RBD RW）。
+    ///
+    /// `mode` 见 [`shared_types::WorkspaceSyncMode`]。Job 完成判据用
+    /// `.status.succeeded>=1`（**不是** failed!=0——failed 是累计计数器,
+    /// backoffLimit 重试成功后仍为 1）。Job 失败/超时返回 Err（含尾部日志）。
+    /// Docker: 不支持（宿主机无 PVC 双卷形态）。
+    async fn run_workspace_migration_sync(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+        _mode: shared_types::WorkspaceSyncMode,
+        _src_pvc: &str,
+    ) -> ContainerRuntimeResult<()> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "workspace migration sync is unsupported by this runtime".to_string(),
+        ))
     }
 
     /// 确保 per-agent workspace PVC 存在 (幂等: 已存在则复用, 不存在则创建)。

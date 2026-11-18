@@ -56,12 +56,12 @@ mod tests {
         });
         // 非 dev profile：run 兜底
         assert_eq!(
-            crate::supervisor::effective_run_argv(&spec, false),
+            supervisor::effective_run_argv(&spec, false),
             &spec.run.command
         );
         // dev profile：devrun 优先
         assert_eq!(
-            crate::supervisor::effective_run_argv(&spec, true),
+            supervisor::effective_run_argv(&spec, true),
             &["pnpm".to_string(), "dev".to_string()]
         );
     }
@@ -76,10 +76,10 @@ mod tests {
             command: vec!["vite".into(), "--host".into()],
         });
         assert!(
-            crate::supervisor::effective_run_argv(&spec, true)
+            supervisor::effective_run_argv(&spec, true)
                 == ["vite".to_string(), "--host".to_string()]
         );
-        assert!(crate::supervisor::effective_run_argv(&spec, false).is_empty());
+        assert!(supervisor::effective_run_argv(&spec, false).is_empty());
     }
 
     fn spec(id: &str, dir: &str, shutdown: u64) -> ServiceSpec {
@@ -1030,7 +1030,7 @@ mod publication_receipt_tests {
                 user: "fixture".into(),
                 password: "fixture".into(),
             };
-            let mut process_host = super::resident::OfficialSupervisorHost {
+            let mut process_host = resident::OfficialSupervisorHost {
                 host: &host,
                 runtime_root: &runtime_root,
                 spec: pingap_service_spec(&args, &endpoint).unwrap(),
@@ -1120,7 +1120,7 @@ mod official_orchestration_protocol_tests {
                 runtime_image_digest="fixture"
                 [pingap]
                 mode="managed"
-                version="0.15.0"
+                version="0.16.1"
                 commit="fixture"
                 [[services]]
                 service_id="web"
@@ -1188,7 +1188,7 @@ mod official_orchestration_protocol_tests {
                     let (body,extra)=if is_admin {
                         assert!(request.starts_with("GET /api/basic "));assert!(!request.contains("apply-status"));
                         assert!(request.to_ascii_lowercase().contains("authorization:"));
-                        (serde_json::json!({"pid":"42","config_hash":hash,"version":"0.15.0"}).to_string(),String::new())
+                        (serde_json::json!({"pid":"42","config_hash":hash,"version":"0.16.1"}).to_string(),String::new())
                     }else{assert!(request.starts_with(&format!("GET /_pub/{id} ")));hits.fetch_add(1,std::sync::atomic::Ordering::SeqCst);(id.clone(),format!("X-Rcoder-Publication: {id}\r\n"))};
                     stream.write_all(format!("HTTP/1.1 200 OK\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
                 }}));

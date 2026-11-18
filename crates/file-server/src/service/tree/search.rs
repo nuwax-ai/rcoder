@@ -29,7 +29,7 @@ const MAX_SEARCH_THREADS: usize = 8;
 const SEARCH_QUEUED_BATCHES_PER_WORKER: usize = 2;
 
 /// 搜索遍历的目录黑名单: 仅纯噪音目录 (VCS 元数据/依赖/解释器缓存)。
-/// 刻意放行产品运行时目录 (.claude/.agents/.codex/.opencode/.local-deploy 等) ——
+/// 刻意放行产品运行时目录 (.claude/.agents/.nuwax-harness/.opencode/.local-deploy 等) ——
 /// 其下的技能 (SKILL.md) 与配置文件正是搜索要找的目标; 与浏览列表的隐藏口径
 /// (listDirectoryLevel 对点开头条目的整体隐藏) 解耦, 各管各的。
 /// 与 env TRAVERSE_EXCLUDE_DIRS 合并生效: 配置可追加排除项, 不可放行内置噪音项。

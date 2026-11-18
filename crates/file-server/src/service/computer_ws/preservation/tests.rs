@@ -382,7 +382,7 @@ async fn create_workspace_writes_agents_skills() {
     // syncAgents 镜像目录 (grok/pi 临时屏蔽, 不再创建)
     assert!(tmp.join(".claude").join("skills").is_dir());
     assert!(tmp.join(".opencode").join("skills").is_dir());
-    assert!(tmp.join(".codex").join("skills").is_dir());
+    assert!(tmp.join(".nuwax-harness").join("skills").is_dir());
     assert!(!tmp.join(".grok").join("skills").exists());
     assert!(!tmp.join(".pi").join("skills").exists());
     // sync_agents 写版本 marker (启动 reconciler 据此 O(1) 判断是否需补 sync)

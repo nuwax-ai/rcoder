@@ -2,6 +2,7 @@
 //! observations come from the API server; no cache, resource writes or new ledger.
 
 use container_runtime_api::{
+    ContainerRuntimeResult,
     AgentWorkspaceIdentity, ContainerCreateParams, ContainerRuntimeError as Error,
     ContainerRuntimeResult as Result, ContainerRuntimeStatus, VerifiedAgentReplacement,
 };
@@ -165,6 +166,34 @@ fn controlled_by(pod: &Pod, workload_name: &str, workload_uid: &str) -> bool {
 }
 
 impl KubernetesRuntime {
+
+    /// per-agent 卷判据的**权威**版（终审 F4）：异步直读（读穿缓存）——
+    /// replacement 是恢复关键路径，冷缓存（重启后/无流量用户）误判 false 会
+    /// 把健康 RBD 工作负载与共享模板比较而 Conflict，且无自然 warm 通道。
+    /// 读取失败返回可重试错误（不把未知当共享卷）。
+    async fn authoritative_per_agent_volume(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<bool> {
+        use container_runtime_api::WorkspaceRuntime;
+        if shared_types::per_agent_pvc_enabled() {
+            return Ok(true);
+        }
+        if !shared_types::per_agent_rbd_enabled() {
+            return Ok(false);
+        }
+        if !matches!(
+            service_type,
+            ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject
+        ) {
+            return Ok(false);
+        }
+        Ok(matches!(
+            self.workspace_migration_state(identifier, service_type).await?,
+            shared_types::WorkspaceMigrationState::Migrated
+        ))
+    }
     pub(super) async fn stop_captured_agent_workload(
         &self,
         identifier: &str,
@@ -348,7 +377,12 @@ impl KubernetesRuntime {
             ));
         }
         let requested = workspace(
-            &self.build_agent_pod_spec(identifier, &service_type, params)?,
+            &self.build_agent_pod_spec(
+                identifier,
+                &service_type,
+                params,
+                self.authoritative_per_agent_volume(identifier, &service_type).await?,
+            )?,
             None,
         )?;
         let labels = super::k8s_service::build_selector_labels(identifier, &service_type);
@@ -381,7 +415,12 @@ impl KubernetesRuntime {
             let mut workspace_params = params.clone();
             workspace_params.user_id = Some(creator.clone());
             workspace(
-                &self.build_agent_pod_spec(identifier, &service_type, &workspace_params)?,
+                &self.build_agent_pod_spec(
+                    identifier,
+                    &service_type,
+                    &workspace_params,
+                    self.authoritative_per_agent_volume(identifier, &service_type).await?,
+                )?,
                 None,
             )?
         } else {

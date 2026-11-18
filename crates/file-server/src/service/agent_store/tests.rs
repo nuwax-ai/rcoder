@@ -1152,7 +1152,7 @@ mod cases {
             .await
             .unwrap();
 
-        for dir in [".claude", ".opencode", ".codex"] {
+        for dir in [".claude", ".opencode", ".nuwax-harness"] {
             assert!(
                 fs::symlink_metadata(workspace.join(dir).join("skills"))
                     .await
@@ -1233,7 +1233,7 @@ mod cases {
                 .unwrap()
                 .is_symlink()
         );
-        for dir in [".claude", ".opencode", ".codex"] {
+        for dir in [".claude", ".opencode", ".nuwax-harness"] {
             assert!(
                 fs::symlink_metadata(ws.join(dir).join("skills"))
                     .await

@@ -221,7 +221,7 @@ async fn copy_project_tree(src: &Path, dst: &Path, exclude_dirs: &[String]) -> A
     const PRESERVED_ROOT_DIRS: &[&str] = &[
         ".agents",
         ".attachments",
-        ".codex",
+        ".nuwax-harness",
         ".grok",
         ".opencode",
         ".pi",
@@ -749,7 +749,7 @@ mod tests {
             ".agents/skills/review",
             ".agents/skills/review/node_modules/cache",
             ".attachments",
-            ".codex",
+            ".nuwax-harness",
             ".grok",
             ".opencode",
             ".pi",
@@ -765,7 +765,10 @@ mod tests {
         for (path, contents) in [
             (".agents/skills/review/SKILL.md", "skill"),
             (".attachments/design.txt", "attachment"),
-            (".codex/instructions.md", "codex instructions"),
+            (
+                ".nuwax-harness/instructions.md",
+                "nuwax-harness instructions",
+            ),
             (".grok/config.md", "grok config"),
             (".opencode/agents.md", "opencode agents"),
             (".pi/settings.json", "pi settings"),
@@ -792,7 +795,7 @@ mod tests {
         for path in [
             ".agents/skills/review/SKILL.md",
             ".attachments/design.txt",
-            ".codex/instructions.md",
+            ".nuwax-harness/instructions.md",
             ".grok/config.md",
             ".opencode/agents.md",
             ".pi/settings.json",

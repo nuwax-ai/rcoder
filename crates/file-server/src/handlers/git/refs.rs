@@ -29,6 +29,8 @@ pub(crate) async fn branch_create(
     let author_name = state.config.git_default_author_name.clone();
     let author_email = state.config.git_default_author_email.clone();
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        // 分支创建+切换写 HEAD/index/工作树, 必须与 commit 等写操作共用工作区锁
+        let _guard = git::workspace_lock::acquire(&path)?;
         let repo = git::ensure_repo(&path)?;
         git::ensure_gitignore(&path)?;
         // switch=true: 创建后立即 checkout (对齐 nuwax git.branch checkout:true)
@@ -65,6 +67,7 @@ pub(crate) async fn branch_delete(
     let name = body.branch_name.clone();
     let force = body.force.unwrap_or(false);
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        let _guard = git::workspace_lock::acquire(&path)?;
         let repo = git::ensure_repo(&path)?;
         if git::is_current_branch(&repo, &name)? {
             return Err(AppError::business("cannot delete the current branch"));
@@ -97,6 +100,7 @@ pub(crate) async fn tag_create(
     let an = state.config.git_default_author_name.clone();
     let ae = state.config.git_default_author_email.clone();
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        let _guard = git::workspace_lock::acquire(&path)?;
         let repo = git::ensure_repo(&path)?;
         // annotated tag 的 tagger 用 config author (对齐 nuwax getDefaultAuthor)
         git::create_tag(&repo, &name, msg.as_deref(), &an, &ae)
@@ -124,6 +128,7 @@ pub(crate) async fn tag_delete(
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let name = body.tag_name.clone();
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        let _guard = git::workspace_lock::acquire(&path)?;
         let repo = git::ensure_repo(&path)?;
         git::delete_tag(&repo, &name)
     })
@@ -152,6 +157,8 @@ pub(crate) async fn branch_switch(
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let name = body.branch_name.clone();
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        // 切分支写 HEAD/index/工作树, 必须与 commit 等写操作共用工作区锁
+        let _guard = git::workspace_lock::acquire(&path)?;
         let repo = git::ensure_repo(&path)?;
         git::ensure_gitignore(&path)?;
         git::switch_branch(&repo, &name)

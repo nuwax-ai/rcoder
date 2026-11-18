@@ -80,8 +80,8 @@ pub use userapp::dev_locator::{
 pub use userapp::forward_contract::{
     APP_ID_HEADER, APP_STAGE_DEV, APP_STAGE_HEADER, APP_STAGE_PROD, ComputerServiceKind,
     SERVICE_TYPE_HEADER, SERVICE_TYPE_NORMAL_PROJECT, SERVICE_TYPE_PAGE_APP,
-    SERVICE_TYPE_TASK_AGENT, SERVICE_TYPE_USERAPP, WORKSPACE_PATH_HEADER, WORKSPACE_TYPE_HEADER,
-    is_userapp_service_type_value, normalize_computer_service_type,
+    SERVICE_TYPE_TASK_AGENT, SERVICE_TYPE_USERAPP, USER_ID_HEADER, WORKSPACE_PATH_HEADER,
+    WORKSPACE_TYPE_HEADER, is_userapp_service_type_value, normalize_computer_service_type,
 };
 pub use userapp::http_credentials::{FileServerCredentialsProvider, FileServerRequestCredentials};
 pub use userapp::metadata::AppMetadataRecord;
@@ -104,6 +104,7 @@ pub use userapp::runtime_control::{
 
 // 灵活的字符串反序列化器（支持 JSON 字符串和数字）
 pub mod flexible_string;
+pub mod log_brief;
 pub mod version_util;
 
 // i18n 国际化模块 — 重导出自 shared_types_i18n（过渡期兼容）
@@ -196,6 +197,7 @@ pub use shared_types_i18n::{
 
 // Validation 模块
 pub mod validation;
+pub mod sandbox;
 pub use validation::{
     ABSOLUTE_DIR_MAX_LEN, AGENT_WORK_DIR_MAX_SEGMENTS, IDENTIFIER_RE, USERAPP_APP_ID_MAX_LEN,
     garde_err_to_app_error, is_absolute_path_like, normalize_absolute_dir, validate_agent_work_dir,

@@ -19,9 +19,12 @@ mod docs;
 pub mod error_page_admin;
 mod health_handler;
 mod internal_handler;
+pub mod migration_api;
 mod permission_handler;
 pub mod pod_handler;
 pub mod proxy_api;
+#[cfg(feature = "kubernetes")]
+pub mod sandbox;
 pub mod proxy_handler_api;
 mod sse_builder;
 pub(crate) mod userapp_agent_target;

@@ -106,6 +106,8 @@ pub struct AppConfig {
     /// Userapp 闲置自动回收 + 流量唤醒配置
     #[serde(default)]
     pub userapp_recycle: UserAppRecycleConfig,
+    #[serde(default)]
+    pub e2b_sandbox: E2bSandboxConfig,
     /// 存储后端配置（rcoder-pg：memory=纯内存单节点，postgres=PG 持久化）
     #[serde(default)]
     pub storage: StorageConfig,
@@ -174,6 +176,7 @@ impl Default for AppConfig {
             kubernetes_config: None,
             cleanup_config: CleanupConfigSettings::default(),
             userapp_recycle: UserAppRecycleConfig::default(),
+            e2b_sandbox: E2bSandboxConfig::default(),
             userapp_error_page: None,
             storage: StorageConfig::default(),
             userapp_storage: UserAppStorageConfig::default(),
@@ -195,6 +198,6 @@ pub use loader::{
     load_config_with_args, parse_api_key_config,
 };
 pub use sections::{
-    CleanupConfigSettings, DeployHostConfig, DockerConfig, OrphanReconcileMode, ProxyConfig,
-    UserAppRecycleConfig,
+    CleanupConfigSettings, DeployHostConfig, DockerConfig, E2bSandboxConfig,
+    OrphanReconcileMode, ProxyConfig, UserAppRecycleConfig,
 };

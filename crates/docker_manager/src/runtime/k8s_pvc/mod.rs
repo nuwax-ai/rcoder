@@ -27,6 +27,17 @@ const DEFAULT_PVC_STORAGE_SIZE: &str = "50Gi";
 #[cfg(feature = "kubernetes")]
 const DEFAULT_USERAPP_PVC_STORAGE_SIZE: &str = "100Gi";
 
+/// 主线 Web/Computer per-agent RBD 卷默认容量兜底。
+///
+/// 与 [`DEFAULT_USERAPP_PVC_STORAGE_SIZE`] 同语义：RBD image size 是硬上限，
+/// 100Gi 是「无显式 storage_size 时」的兜底（chart kubernetes_config 通常显式
+/// 传入, 此值仅兜底 chart 未配置的场景）。取 100Gi 而非 CephFS 兜底的 50Gi：
+/// 存量迁移用户的净数据（排除 node_modules 等可重建数据后）可能达几十 GB，
+/// 兜底过小会在迁移/使用期直接 ENOSPC（RBD 硬上限不可越）。SC 须
+/// allowVolumeExpansion=true 以支持在线扩容逃生。
+#[cfg(feature = "kubernetes")]
+const DEFAULT_PER_AGENT_RBD_STORAGE_SIZE: &str = "100Gi";
+
 #[cfg(feature = "kubernetes")]
 use async_trait::async_trait;
 #[cfg(feature = "kubernetes")]
@@ -165,6 +176,63 @@ pub(crate) fn userapp_storage_class() -> Option<String> {
 }
 
 #[cfg(feature = "kubernetes")]
+/// 主线 Web/Computer per-agent RBD 卷的 storage class（env
+/// `RCODER_PER_AGENT_RBD_STORAGE_CLASS` 显式覆盖；缺省 `ceph-rbd`）。
+///
+/// 与 [`userapp_storage_class`] 的差异：RBD 变体**必须**是块存储 SC——
+/// 缺省回落集群 default SC 不可接受（部分集群 default 是 cephfs，
+/// RWO+cephfs 语义错位），故给字面缺省值；非本命名空间的集群须显式覆盖。
+#[cfg(feature = "kubernetes")]
+pub(crate) fn per_agent_rbd_storage_class() -> String {
+    std::env::var("RCODER_PER_AGENT_RBD_STORAGE_CLASS")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "ceph-rbd".to_string())
+}
+
+/// workspace PVC 卷型选择（`ensure_workspace_pvc` 决策核心, 纯函数供单测）。
+///
+/// 三臂: ① Userapp 域恒 RWO+RBD(env 可覆盖, 由调用方解析传入) ② 主线 agent 域 +
+/// per-agent RBD 开关 → RWO + 块盘 SC + 100Gi 兜底(RBD image size 硬上限, 50Gi
+/// 兜底会在存量迁移场景直接 ENOSPC) ③ 主线 agent 域默认(全局 SC/access_mode,
+/// 共享语义——CephFS 卷不构成业务容量约束)。② 仅在 RCODER_PER_AGENT_RBD_ENABLED=true
+/// 生效, 关闭时与现状逐字节一致。env 读取全部在调用方完成——本函数不触 env,
+/// 单测无需进程级 env 写入（crate 禁 unsafe, edition 2024 下 env::set_var 不可用）。
+#[cfg(feature = "kubernetes")]
+fn select_volume_spec(
+    service_type: &ServiceType,
+    global_access_mode: &str,
+    global_storage_class: &str,
+    userapp_sc: Option<String>,
+    per_agent_rbd: bool,
+    per_agent_rbd_sc: Option<String>,
+) -> (String, Option<String>, &'static str) {
+    match service_type {
+        ServiceType::Userapp | ServiceType::UserappBuilder => (
+            "ReadWriteOnce".to_string(),
+            userapp_sc,
+            DEFAULT_USERAPP_PVC_STORAGE_SIZE,
+        ),
+        // RBD 臂**只覆盖 computer 族**: WebAgentRunner(/api/project|git|page)
+        // 的读取面本期仍走 rcoder 本地共享 CephFS(plan §3 二期才切), 给它
+        // RBD PVC = agent 写块盘 / rcoder 读共享卷 = 用户文件"消失"的数据
+        // 分裂。computer 族(ComputerAgentRunner/ComputerNormalProject)的读取
+        // 已由转发层接管(computer_forward), 是唯一安全域。
+        ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject if per_agent_rbd => (
+            "ReadWriteOnce".to_string(),
+            per_agent_rbd_sc,
+            DEFAULT_PER_AGENT_RBD_STORAGE_SIZE,
+        ),
+        _ => (
+            global_access_mode.to_string(),
+            Some(global_storage_class.to_string()),
+            DEFAULT_PVC_STORAGE_SIZE,
+        ),
+    }
+}
+
+#[cfg(feature = "kubernetes")]
 #[async_trait]
 impl K8sPvcOps for KubernetesRuntime {
     fn workspace_pvc_name(
@@ -186,21 +254,14 @@ impl K8sPvcOps for KubernetesRuntime {
         storage_size: Option<&str>,
     ) -> ContainerRuntimeResult<()> {
         let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
-        // Userapp 域（生产运行卷 + builder 开发卷）: RWO + RBD（env 可覆盖）,
-        // 兜底容量 100Gi; 其余 service_type 用全局 access_mode/storage_class
-        // 与 50Gi 兜底。
-        let (access_mode, storage_class_name, default_size) = match service_type {
-            ServiceType::Userapp | ServiceType::UserappBuilder => (
-                "ReadWriteOnce".to_string(),
-                userapp_storage_class(),
-                DEFAULT_USERAPP_PVC_STORAGE_SIZE,
-            ),
-            _ => (
-                self.config.access_mode.clone(),
-                Some(self.config.storage_class.clone()),
-                DEFAULT_PVC_STORAGE_SIZE,
-            ),
-        };
+        let (access_mode, storage_class_name, default_size) = select_volume_spec(
+            service_type,
+            &self.config.access_mode,
+            &self.config.storage_class,
+            userapp_storage_class(),
+            shared_types::per_agent_rbd_enabled(),
+            Some(per_agent_rbd_storage_class()),
+        );
         let mut extra_labels: Vec<(String, String)> = Vec::new();
         // builder 聚合标签（identifier 应用共享后即纯 app_id；存量复合键
         // 残留右切还原，保按 app 聚合清理可用）。
@@ -613,6 +674,86 @@ fn compare_storage_quantity(current: &str, requested: &str) -> StorageVerdict {
 #[cfg(all(test, feature = "kubernetes"))]
 mod tests {
     use super::*;
+
+    // select_volume_spec 全参传入（含 env 解析结果）, 测试不触进程 env
+    // （crate 禁 unsafe; edition 2024 下 env::set_var 不可用）。
+
+    #[test]
+    fn volume_spec_userapp_arm() {
+        let (am, sc, size) = select_volume_spec(
+            &ServiceType::Userapp,
+            "ReadWriteMany",
+            "cephfs",
+            None,
+            false,
+            None,
+        );
+        assert_eq!(am, "ReadWriteOnce");
+        assert_eq!(size, DEFAULT_USERAPP_PVC_STORAGE_SIZE);
+        assert!(sc.is_none()); // 无 env 时 None → 集群 default SC
+    }
+
+    #[test]
+    fn volume_spec_default_arm_when_rbd_flag_off() {
+        let (am, sc, size) = select_volume_spec(
+            &ServiceType::ComputerAgentRunner,
+            "ReadWriteMany",
+            "cephfs",
+            None,
+            false,
+            Some("ceph-rbd".into()),
+        );
+        // 开关关: RBD 参数被无视, 走全局共享臂（与现状逐字节一致）
+        assert_eq!(am, "ReadWriteMany");
+        assert_eq!(sc.as_deref(), Some("cephfs"));
+        assert_eq!(size, DEFAULT_PVC_STORAGE_SIZE);
+    }
+
+    #[test]
+    fn volume_spec_rbd_arm_defaults() {
+        let (am, sc, size) = select_volume_spec(
+            &ServiceType::ComputerAgentRunner,
+            "ReadWriteMany",
+            "cephfs",
+            None,
+            true,
+            Some("ceph-rbd".into()),
+        );
+        assert_eq!(am, "ReadWriteOnce");
+        assert_eq!(sc.as_deref(), Some("ceph-rbd"));
+        assert_eq!(size, DEFAULT_PER_AGENT_RBD_STORAGE_SIZE);
+        assert_eq!(DEFAULT_PER_AGENT_RBD_STORAGE_SIZE, "100Gi");
+    }
+
+    #[test]
+    fn volume_spec_web_runner_never_takes_rbd_arm() {
+        // 防数据分裂回归: WebAgentRunner 即使 flag 开也必须走全局共享臂
+        // (它的读取面在 rcoder 本地, 没有转发层)
+        let (am, sc, size) = select_volume_spec(
+            &ServiceType::WebAgentRunner,
+            "ReadWriteMany",
+            "cephfs",
+            None,
+            true,
+            Some("ceph-rbd".into()),
+        );
+        assert_eq!(am, "ReadWriteMany");
+        assert_eq!(sc.as_deref(), Some("cephfs"));
+        assert_eq!(size, DEFAULT_PVC_STORAGE_SIZE);
+    }
+
+    #[test]
+    fn volume_spec_rbd_arm_sc_override() {
+        let (_, sc, _) = select_volume_spec(
+            &ServiceType::ComputerAgentRunner,
+            "RWX",
+            "cephfs",
+            None,
+            true,
+            Some("rook-ceph-block".into()),
+        );
+        assert_eq!(sc.as_deref(), Some("rook-ceph-block"));
+    }
 
     #[test]
     fn pvc_resize_identity_rejects_replacement_family_and_missing_preconditions() {

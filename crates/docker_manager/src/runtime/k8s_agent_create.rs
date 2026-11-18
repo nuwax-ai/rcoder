@@ -7,6 +7,7 @@
 
 use container_runtime_api::{
     ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult, ContainerRuntimeStatus,
+    WorkspaceRuntime,
 };
 use k8s_openapi::api::core::v1::{
     Container as K8sContainer, ContainerPort, EnvVar, LocalObjectReference,
@@ -85,14 +86,83 @@ impl KubernetesRuntime {
             self.fence_agent_snapshot(&previous).await?;
         }
 
-        // 阶段2 per-agent PVC (CephFS subvolume, ceph-csi 服务端配额, 绕开 client setfattr):
-        // 仅隔离容器 (pod_id=None, project/user 级) 且 per_agent_pvc_enabled=true 走 per-agent PVC。
-        // 共享容器 (pod_id=Some) 或回滚开关 false → 共享 PVC (选项A 行为)。
-        // UserappBuilder 天然 per-app PVC(不受灰度开关限制),总是 ensure。
-        if pod_id.is_none()
-            && (shared_types::per_agent_pvc_enabled()
-                || matches!(service_type, ServiceType::UserappBuilder))
+        // per_agent_volume 决策(async): pod_id=None 且开关开; RBD 变体额外
+        // 要求 migrated 标记(预同步期 PVC 已存在但用户仍在共享卷写, agent
+        // 此刻挂 RBD 旧副本会丢写); 族限定 computer(Userapp 域有自己的卷逻辑)。
+        let per_agent_volume = if params.pod_id.is_some() {
+            false
+        } else if shared_types::per_agent_pvc_enabled() {
+            true
+        } else if shared_types::per_agent_rbd_enabled()
+            && matches!(
+                service_type,
+                ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject
+            )
         {
+            use container_runtime_api::WorkspaceRuntime;
+            match self.workspace_migration_state(identifier, &service_type).await? {
+                shared_types::WorkspaceMigrationState::Migrated => true,
+                shared_types::WorkspaceMigrationState::NotMigrated => {
+                    // 新用户初始化（终审 F8）：flag 开 + PVC 缺失 + 共享卷无该
+                    // 用户存量 → 直接建 RBD PVC 并写 Migrated（新用户=直上
+                    // RBD，无迁移必要——plan §P0 目标）。三个前提缺一不可：
+                    // PVC 已存在（phase-a 建过）= 预同步期用户，保持共享；
+                    // 共享卷非空 = 存量用户，须显式走两阶段迁移（下方 legacy
+                    // 防护同语义）；初始化失败原样上抛（fail-fast，不静默
+                    // 回落共享——那会让"新用户 RBD"语义随机漂移）。
+                    let pvc_exists = self
+                        .pvcs()
+                        .get_opt(
+                            &self.workspace_pvc_name(identifier, &service_type)?,
+                        )
+                        .await
+                        .map(|p| p.is_some())
+                        .unwrap_or(false);
+                    let shared_state = probe_shared_dir(identifier).await;
+                    match (pvc_exists, shared_state) {
+                        // PVC 已建(phase-a 过) 或 共享卷有存量: 保持共享路径
+                        (true, _) | (false, SharedDirProbe::NonEmpty) => false,
+                        // 真新用户: 初始化直上 RBD
+                        (false, SharedDirProbe::Absent) => {
+                        self.ensure_workspace_pvc(
+                            identifier,
+                            &service_type,
+                            params.storage_size.as_deref(),
+                        )
+                        .await?;
+                        self.set_workspace_migration_state(
+                            identifier,
+                            &service_type,
+                            shared_types::WorkspaceMigrationState::Migrated,
+                        )
+                        .await?;
+                            info!(
+                                "[K8S] new user '{identifier}' initialized on per-agent RBD"
+                            );
+                            true
+                        }
+                        // 探测不可信(env 未设/IO 错误): fail-closed 拒绝初始化
+                        // ——误判新用户会让存量用户数据"消失"(空 RBD 卷+存在即
+                        // 转发)。上抛可重试错误, 不静默回落(语义随机漂移)。
+                        (false, SharedDirProbe::ProbeFailed) => {
+                            return Err(ContainerRuntimeError::ConnectionError(format!(
+                                "cannot probe shared workspace for '{identifier}' \
+                                 (COMPUTER_WORKSPACE_DIR unset or IO error); \
+                                 refusing new-user RBD initialization"
+                            )));
+                        }
+                    }
+                }
+            }
+        } else {
+            false
+        };
+        // 阶段2 per-agent PVC (CephFS subvolume, ceph-csi 服务端配额, 绕开 client setfattr):
+        // 仅隔离容器 (pod_id=None, project/user 级) 且 per-agent 开关开启走 per-agent PVC。
+        // 两变体: per_agent_pvc(subvolume, 挂根聚合读) / per_agent_rbd(RWO 块盘, 转发层读,
+        // 二者互斥 fail-fast 见 FeatureFlags::init)。共享容器 (pod_id=Some) 或开关全关 → 共享 PVC。
+        // UserappBuilder 天然 per-app PVC(不受灰度开关限制),总是 ensure。
+        if per_agent_volume || matches!(service_type, ServiceType::UserappBuilder) {
             if params.retained_storage.is_some() {
                 // recover_retained_storage already verified exact UID and ownership.
             } else if let Some(context) = &params.execution_context {
@@ -103,6 +173,36 @@ impl KubernetesRuntime {
                 )
                 .await?;
             } else {
+                // P0 防护(仅 NotMigrated 存量用户): flag 开但用户未迁移时,
+                // ensure 会建**空** RBD PVC——混住判据(存在即转发)立即把请求
+                // 送进空卷, 共享卷老数据静默不可见。正确流程先跑两阶段迁移。
+                // ⚠️ 只在 PVC 不存在时探测(终审修正): per_agent_volume=true
+                // 蕴含 Migrated, 其共享卷回滚副本必然非空——对 Migrated 用户
+                // 探测 = 每次 cutover 第 5 步 ensure 必误报 Conflict 且无法
+                // 自愈(状态已翻, 停机残留)。
+                if shared_types::per_agent_rbd_enabled()
+                    && matches!(
+                        service_type,
+                        ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject
+                    )
+                    && matches!(probe_shared_dir(identifier).await, SharedDirProbe::NonEmpty)
+                {
+                    // PVC 已存在(phase-a 建过/已迁移) = 流程内用户, 不拦;
+                    // PVC 缺失 + 共享卷非空 = 未迁移存量用户误触, 拒绝。
+                    let pvc_exists = self
+                        .pvcs()
+                        .get_opt(&self.workspace_pvc_name(identifier, &service_type)?)
+                        .await
+                        .map(|p| p.is_some())
+                        .unwrap_or(false);
+                    if !pvc_exists {
+                        return Err(ContainerRuntimeError::Conflict(format!(
+                            "legacy shared workspace for '{identifier}' is non-empty and no \
+                             per-agent PVC exists; run phase-a + cutover before creating \
+                             per-agent RBD volume"
+                        )));
+                    }
+                }
                 self.ensure_workspace_pvc(
                     identifier,
                     &service_type,
@@ -174,7 +274,8 @@ impl KubernetesRuntime {
         } else {
             None
         };
-        let mut pod_spec = self.build_agent_pod_spec(identifier, &service_type, &params)?;
+        let mut pod_spec =
+            self.build_agent_pod_spec(identifier, &service_type, &params, per_agent_volume)?;
         if let Some(credential) = credential {
             Self::install_builder_credential(&mut pod_spec, credential)?;
         }
@@ -262,6 +363,7 @@ impl KubernetesRuntime {
         identifier: &str,
         service_type: &ServiceType,
         params: &ContainerCreateParams,
+        per_agent_volume: bool,
     ) -> ContainerRuntimeResult<PodSpec> {
         let project_id_val = params.project_id.clone().unwrap_or_default();
         let user_id_val = params.user_id.clone().unwrap_or_default();
@@ -293,9 +395,14 @@ impl KubernetesRuntime {
         };
 
         // workspace PVC:
-        // - per-agent (pod_id=None + per_agent_pvc_enabled=true): per-agent PVC (subPath=None)
-        // - 共享 (pod_id=Some 或 per_agent_pvc_enabled=false): 共享 PVC + subPath (选项A / 回滚)
-        let per_agent = params.pod_id.is_none() && shared_types::per_agent_pvc_enabled();
+        // - per-agent (pod_id=None + 任一 per-agent 开关): per-agent PVC (subPath=None)
+        // - 共享 (pod_id=Some 或开关全关): 共享 PVC + subPath (选项A / 回滚)
+        // ⚠️ per_agent_rbd 还要求 migrated 标记: phase-a 预同步期 PVC 已存在
+        // 但用户仍在共享卷写——此刻 agent 重建若挂 RBD 旧副本, 预同步后的写
+        // 全丢。未 migrated → 继续共享路径, 等 cutover 翻标记后下次重建才切。
+        // per_agent_volume 由调用方算定传入: RBD 变体的 migrated 查询是 async
+        // (PVC annotation), 本函数是纯同步 PodSpec 构造, 不能在此 await。
+        let per_agent = per_agent_volume;
         let (workspace_pvc, workspace_sub_path): (String, Option<String>) = if per_agent {
             (self.workspace_pvc_name(identifier, service_type)?, None)
         } else {
@@ -579,6 +686,7 @@ impl KubernetesRuntime {
                             (docker_service, k8s_service),
                             params,
                             None,
+                            per_agent_volume,
                         );
                         if matches!(service_type, ServiceType::UserappBuilder) {
                             // 执行域身份（进程域退出回执的绑定锚点）：instance 经
@@ -718,5 +826,44 @@ impl KubernetesRuntime {
         env.retain(|entry| entry.name != "APP_CLI_DEPLOY_TOKEN");
         env.push(credential);
         Ok(())
+    }
+}
+
+/// 共享 CephFS 卷在 rcoder 容器内的挂载根（env `COMPUTER_WORKSPACE_DIR`，
+/// 与 file-server LocalWorkspaceResolver 同源；未设 → None = 不探测）。
+fn legacy_shared_root() -> Option<std::path::PathBuf> {
+    std::env::var("COMPUTER_WORKSPACE_DIR")
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// 该 identifier 的共享卷目录是否非空。NotFound → false（新用户）；
+/// 其他 IO 错误 → false（fail-open：探测失败不阻断创建，迁移流程是真源）。
+/// 共享卷探测三态（终审 P1）：Absent=目录不存在（真新用户）；
+/// NonEmpty=有存量（存量用户）；ProbeFailed=无法探测（env 未设/IO 错误）。
+/// 消费方语义相反：legacy 防护把 ProbeFailed 当"无存量"放行（fail-open，
+/// 保持共享=安全方向）；F8 初始化把 ProbeFailed 上抛（fail-closed——
+/// 当新用户处理会让存量用户数据"消失"，探测不可信时必须拒绝初始化）。
+enum SharedDirProbe {
+    Absent,
+    NonEmpty,
+    ProbeFailed,
+}
+
+async fn probe_shared_dir(identifier: &str) -> SharedDirProbe {
+    let Some(root) = legacy_shared_root() else {
+        return SharedDirProbe::ProbeFailed;
+    };
+    let path = root.join(identifier);
+    match tokio::fs::read_dir(&path).await {
+        Ok(mut rd) => match rd.next_entry().await {
+            Ok(Some(_)) => SharedDirProbe::NonEmpty,
+            Ok(None) => SharedDirProbe::Absent,
+            Err(_) => SharedDirProbe::ProbeFailed,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => SharedDirProbe::Absent,
+        Err(_) => SharedDirProbe::ProbeFailed,
     }
 }

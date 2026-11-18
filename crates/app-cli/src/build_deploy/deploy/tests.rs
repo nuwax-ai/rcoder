@@ -19,7 +19,7 @@ fn preparation_lease_releases_while_inherited_descriptor_survives() {
         next.try_lock().is_err(),
         "active operation remains exclusive"
     );
-    drop(super::PreparationLease(owner));
+    drop(PreparationLease(owner));
     next.try_lock()
         .expect("completed operation releases even with inherited description");
     next.unlock().expect("release next");
@@ -252,7 +252,7 @@ async fn artifact_download_retries_5xx_within_budget() {
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("addr");
-    let hits = std::sync::Arc::new(AtomicU32::new(0));
+    let hits = Arc::new(AtomicU32::new(0));
     let body = zip_bytes.clone();
     let hits_server = hits.clone();
     tokio::spawn(async move {

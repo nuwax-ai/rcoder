@@ -20,9 +20,28 @@ pub(super) async fn capture(
     let frame = read(&tx, key, owner).await?;
     if let Some(container) = &frame.container {
         let family: ServiceType = container.family.parse().map_err(anyhow::Error::msg)?;
+        if !family.same_container_family(key.family()) {
+            tracing::warn!(
+                event = "workload.family_mismatch",
+                source = "pg",
+                logical_name = %key.logical_name(),
+                namespace = %key.namespace(),
+                stored_service_type = %family,
+                stored_family_key = family.container_family_key(),
+                requested_family = %key.family(),
+                requested_family_key = key.family().container_family_key(),
+                "Canonical container belongs to another family"
+            );
+        }
         ensure!(
             family.same_container_family(key.family()),
-            "Canonical container belongs to another family"
+            "Canonical container belongs to another family: \
+             stored={} ({}) requested={} ({}) name={}",
+            family,
+            family.container_family_key(),
+            key.family(),
+            key.family().container_family_key(),
+            key.logical_name()
         );
     }
     tx.commit().await?;

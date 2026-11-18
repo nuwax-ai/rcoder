@@ -5,7 +5,7 @@ use std::path::Path;
 
 use gix::Repository;
 use gix::actor::Signature;
-use gix::bstr::{BStr, BString};
+use gix::bstr::{BStr, BString, ByteSlice as _};
 use gix::date::{Time, parse::TimeBuf};
 use gix::hash::ObjectId;
 use gix::index::{
@@ -31,7 +31,10 @@ use super::read::get_status;
 /// 仅用于 index/tree 名，**不做文件系统访问**——文件系统侧仍用原始路径
 /// （Win32 两种分隔符都接受）。
 fn index_bstr_path(worktree_path: &str) -> AppResult<BString> {
-    let normalized = crate::path_safety::host_relative_to_wire(worktree_path);
+    // 词法归一 (./、..、分隔符、尾斜杠): 请求可携带 `x/../b.txt` 形态, git
+    // CLI 由 pathspec 清理消化; gix 侧必须在 index/tree 命名收口处归一,
+    // 否则 `..` 段会原样进入 index 并在 tree 构造时被拒绝。
+    let normalized = normalize_relative_path(worktree_path)?;
     into_bstr(std::path::PathBuf::from(normalized))
         .map(|path| path.into_owned())
         .map_err(|error| map_git_err(error, "git encode worktree index path"))
@@ -39,30 +42,222 @@ fn index_bstr_path(worktree_path: &str) -> AppResult<BString> {
 
 /// stage 单个路径: 文件存在 → 更新/新增 index entry; 不存在 → stage 删除 (对齐 nuwax stageFiles)。
 pub fn stage_path(repo: &Repository, worktree_path: &str) -> AppResult<()> {
+    let mut paths = Vec::new();
+    let mut index_once = None;
+    let mut seen = HashSet::new();
+    expand_stage_paths(repo, worktree_path, &mut index_once, &mut seen, &mut paths)?;
+    // 空目录展开为空 → 无操作; 不能落入 stage_files 的空列表 addAll 语义
+    if paths.is_empty() {
+        return Ok(());
+    }
+    stage_files(repo, &paths)
+}
+
+/// 路径展开: 目录 → 递归收集内部文件 (跳过 .git); 文件/不存在 → 原样收集
+/// (不存在后续按 stage 删除语义处理, 对齐原 stage_path 行为)。
+///
+/// `.git` 保留名的防护**不在请求层**做: 请求路径可能是工作区内绝对路径
+/// (ensure_within 放行, 目录展开产出相对子路径), 在此提前归一会改变
+/// 既有契约 (codex 复审 P2)。统一防护见 [`path_has_reserved_git_component`]
+/// —— 实际入 index 的边界, 覆盖显式请求与展开产物两条来路。
+fn expand_stage_paths(
+    repo: &Repository,
+    worktree_path: &str,
+    index_once: &mut Option<gix::index::File>,
+    seen: &mut HashSet<BString>,
+    out: &mut Vec<String>,
+) -> AppResult<()> {
     let workdir = repo
         .workdir()
         .ok_or_else(|| AppError::system("git repo has no workdir"))?;
     let abs = crate::path_safety::ensure_within(workdir, worktree_path)?;
-    if std::fs::symlink_metadata(&abs).is_ok_and(|metadata| metadata.is_dir()) {
-        let mut files = Vec::new();
-        collect_stage_paths(workdir, &abs, &mut files)?;
-        for path in files {
-            stage_file(repo, &path)?;
+    // 绝对形态的工作区内请求 (codex 复审 P2): ensure_within 放行 base 内
+    // 绝对路径, 但下游 [`collect_missing_dir_entries`] 的归一只接受相对
+    // 形态 —— 先过安全边界, 再统一转工作区相对路径 (clean 幂等, 相对
+    // 请求结果不变)。
+    let rel_request = abs
+        .strip_prefix(workdir)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .ok_or_else(|| AppError::validation("git path is outside worktree"))?;
+    match std::fs::symlink_metadata(&abs) {
+        Ok(metadata) if metadata.is_dir() => {
+            collect_stage_paths(workdir, &abs, out)?;
+            let index = staged_index(repo, index_once)?;
+            collect_missing_dir_entries(index, workdir, &rel_request, seen, out)?;
         }
-        return Ok(());
+        // 相对请求推 clean 后的相对形态, 绝对请求 (文件/缺失路径) 转相对:
+        // 下游 index 命名与范围判定都按相对口径 (codex 复审 P2)。
+        Ok(_) => out.push(rel_request.clone()),
+        // 路径不存在: 已删除的文件 (index 同名条目由单路径入列覆盖;
+        // 前缀范围查询对同名条目无副作用) 或**已整体删除的目录**
+        // (codex 边界: 此前进不了目录收集分支, 请求 ["dir"] 对子树
+        // 删除永远无变更) —— 按前缀范围收集 index 内子条目的删除。
+        Err(_) => {
+            let index = staged_index(repo, index_once)?;
+            collect_missing_dir_entries(index, workdir, &rel_request, seen, out)?;
+            out.push(rel_request);
+        }
     }
-    stage_file(repo, worktree_path)
+    Ok(())
+}
+
+/// 与仓库实际策略一致的路径保护选项 —— 复用官方 [`Repository::checkout_options`]
+/// 携带的 validate 配置 (gix 同源构造: `core.protectHFS` 默认仅 macOS,
+/// `core.protectNTFS` 默认恒开, `gitoxide.core.protectWindows` 默认仅
+/// Windows)。不用 `Options::default()` 的全平台保护: 那会在
+/// `protectHFS=false` 的仓库静默忽略原生 git 可正常暂存的 HFS 别名文件
+/// (codex 复审 P2)。
+fn repo_path_protection_options(
+    repo: &Repository,
+) -> AppResult<gix::validate::path::component::Options> {
+    let options = repo
+        .checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)
+        .map_err(|e| map_git_err(e, "git checkout options"))?;
+    Ok(options.validate)
+}
+
+/// 路径任一组件命中 Git 保留元数据名 (`.git` 及配置启用的折叠/别名) →
+/// true。规则与 tree editor 同源; 只识别 DotGitDir 一类 —— 其他校验错误
+/// (Windows 保留名等) 维持既有行为, 不在此静默丢文件。
+fn path_has_reserved_git_component(
+    path: &BStr,
+    options: gix::validate::path::component::Options,
+) -> bool {
+    path.split(|b| *b == b'/').any(|component| {
+        matches!(
+            gix::validate::path::component(component.as_bstr(), None, options),
+            Err(gix::validate::path::component::Error::DotGitDir)
+        )
+    })
+}
+
+/// 全量清除 index 内已有的保留名条目 (历史毒化的受控修复, codex 复审:
+/// 只请求命中坏条目才清理不够, 无关文件提交也必须能恢复) —— 只删保留名
+/// 条目, 其余暂存内容不动。返回是否有删除。
+fn purge_reserved_git_entries(
+    index: &mut gix::index::File,
+    options: gix::validate::path::component::Options,
+) -> bool {
+    let reserved: HashSet<BString> = {
+        let backing = index.path_backing();
+        index
+            .entries()
+            .iter()
+            .filter(|e| e.stage() == Stage::Unconflicted)
+            .map(|e| e.path_in(backing).to_owned())
+            .filter(|p| path_has_reserved_git_component(p.as_bstr(), options))
+            .collect()
+    };
+    if reserved.is_empty() {
+        return false;
+    }
+    // 保留名条目按路径移除 (冲突阶段的同路径条目同为保留名, 一并清除)
+    index.remove_entries(|_, p, _| reserved.contains(p));
+    true
+}
+
+/// 请求路径 → 工作区相对规范键 (codex 复审 P2: 范围判定与展开层同口径)。
+/// 相对路径直接词法归一 (130k 热路径零额外开销); 工作区内**绝对路径**先过
+/// `ensure_within` 安全边界 (放行 base 内, 拒绝越界) 再转相对。
+fn worktree_relative_key(workdir: &Path, path: &str) -> AppResult<String> {
+    let wire = crate::path_safety::host_relative_to_wire(path);
+    if Path::new(&wire).is_absolute() {
+        let abs = crate::path_safety::ensure_within(workdir, path)?;
+        let rel = abs
+            .strip_prefix(workdir)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+            .ok_or_else(|| AppError::validation("git path is outside worktree"))?;
+        normalize_relative_path(&rel)
+    } else {
+        normalize_relative_path(path)
+    }
+}
+
+/// 整批共享的 index 懒加载: 首个需要缺失条目收集的路径读一次,
+/// 后续复用 (staging 事务随后仍会持锁重读——此处只服务路径展开)。
+fn staged_index<'a>(
+    repo: &Repository,
+    index_once: &'a mut Option<gix::index::File>,
+) -> AppResult<&'a gix::index::File> {
+    if index_once.is_none() {
+        *index_once = Some(
+            repo.open_index()
+                .map_err(|e| map_git_err(e, "git open_index"))?,
+        );
+    }
+    index_once
+        .as_ref()
+        .ok_or_else(|| AppError::system("git staged index missing after lazy load"))
+}
+
+/// 目录请求补齐**未暂存的删除** (codex 业务缺口): `git add <dir>` 会暂存
+/// 目录内已从工作区消失的文件, 而上面只展开现存文件——index 里有、磁盘
+/// 上没有的条目漏掉后, 请求目录的提交永远不包含这些删除。展开时把这类
+/// 条目一并加入列表, staging 的 NotFound 分支即按删除语义暂存。
+fn collect_missing_dir_entries(
+    index: &gix::index::File,
+    workdir: &Path,
+    dir_request: &str,
+    seen: &mut HashSet<BString>,
+    out: &mut Vec<String>,
+) -> AppResult<()> {
+    let prefix = normalize_relative_path(dir_request)?;
+    // 根请求 (`.` → 空前缀) 同样要收集缺失条目 (codex 边界: 此前直接
+    // 跳过, 删除跟踪文件后请求 ["."] 返回无变更); 空前缀 = 全部 index
+    // 条目都在范围内。
+    //
+    // index 条目按路径字典序排列, `dir/` 前缀的条目连续——**二分定位
+    // 范围起点, 只遍历范围内条目** (codex 复审: 全量线性扫对 K 个缺失
+    // 路径是 O(K×N))。已删除的单文件前缀 (`gone.txt/`) 范围为空,
+    // 二分即返回, 不产生扫描。
+    let prefix_slash: BString = if prefix.is_empty() {
+        BString::default()
+    } else {
+        BString::from(format!("{prefix}/"))
+    };
+    let backing = index.path_backing();
+    let entries = index.entries();
+    let start = if prefix_slash.is_empty() {
+        0
+    } else {
+        entries.partition_point(|entry| entry.path_in(backing) < prefix_slash.as_bstr())
+    };
+    for entry in &entries[start..] {
+        let path: &BStr = entry.path_in(backing);
+        if !prefix_slash.is_empty() && !path.starts_with(prefix_slash.as_ref()) {
+            break;
+        }
+        if seen.insert(path.to_owned()) {
+            let abs = crate::path_safety::ensure_within(workdir, path.to_str_lossy().as_ref())?;
+            if std::fs::symlink_metadata(&abs).is_err() {
+                out.push(path.to_string());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn collect_stage_paths(workdir: &Path, dir: &Path, out: &mut Vec<String>) -> AppResult<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
+        // `.git` 保留名**目录与文件两种形态都跳过** (codex 复审 P1: 文件
+        // 形态是 worktree/submodule 的真实布局, 此前只跳目录), 大小写折叠
+        // (大小写不敏感卷上 .GIT 即 .git 本体; 大小写敏感卷上 git 同样
+        // 拒收 .GIT 组件)。入 index 边界另有 [`path_has_reserved_git_component`]
+        // 兜底, 此处同时避免把整个 .git 子树收进列表。
+        if entry
+            .file_name()
+            .as_encoded_bytes()
+            .eq_ignore_ascii_case(b".git")
+        {
+            continue;
+        }
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            if entry.file_name() != ".git" {
-                collect_stage_paths(workdir, &path, out)?;
-            }
+            collect_stage_paths(workdir, &path, out)?;
         } else {
             let relative = path
                 .strip_prefix(workdir)
@@ -73,136 +268,337 @@ fn collect_stage_paths(workdir: &Path, dir: &Path, out: &mut Vec<String>) -> App
     Ok(())
 }
 
-fn stage_file(repo: &Repository, worktree_path: &str) -> AppResult<()> {
-    stage_file_with_metadata(repo, worktree_path, |path| std::fs::symlink_metadata(path))
-}
-
-fn stage_file_with_metadata(
-    repo: &Repository,
-    worktree_path: &str,
-    metadata: impl FnOnce(&Path) -> std::io::Result<std::fs::Metadata>,
-) -> AppResult<()> {
+/// stage 多个文件 (对齐 nuwax stageFiles; files 为空则 addAll: 基于 status stage 全部变更)。
+///
+/// 事务语义: 持真 index.lock (gix 官方锁, 有界退避等待) 完成整批"读-改-写"——
+/// 外部 git 进程 (agent 启动的 git CLI) 的暂存不会被旧快照静默覆盖; 整批原子
+/// 落盘 (中途失败不留下部分暂存, 既有暂存保持不变)。批量实现下 index 只读/写
+/// 各一次, 循环仅内存更新 entry——逐文件全量读写 index 在数万文件时是 O(n²)
+/// IO, 单次 commit 可达数十分钟 (生产 43k 文件事故)。
+pub fn stage_files(repo: &Repository, files: &[String]) -> AppResult<()> {
+    let paths = resolve_stage_paths(repo, files)?;
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let lock = acquire_index_lock(repo)?;
     let mut index = repo
         .open_index()
         .map_err(|e| map_git_err(e, "git open_index"))?;
+    stage_paths_with_probe(repo, &mut index, &paths, |path| {
+        gix::index::fs::Metadata::from_path_no_follow(path)
+    })?;
+    purge_reserved_git_entries(&mut index, repo_path_protection_options(repo)?);
+    lock.commit_index(&mut index)
+}
+
+/// stage 路径收集: 显式列表 → 展开; 空 → addAll (status 变更)。
+fn resolve_stage_paths(repo: &Repository, files: &[String]) -> AppResult<Vec<String>> {
+    if files.is_empty() {
+        return collect_status_paths(repo);
+    }
+    let mut paths = Vec::with_capacity(files.len());
+    // index 懒加载 + 整批共享 (codex 复审: 此前每个缺失路径重开重扫
+    // 全量 index, K 个删除路径 × N 条目 = O(K×N); 微基准 2000 缺失
+    // 路径 8.2s, 翻倍四倍)。纯现存文件的请求一次都不开。
+    let mut index_once: Option<gix::index::File> = None;
+    let mut seen: HashSet<BString> = HashSet::new();
+    for f in files {
+        expand_stage_paths(repo, f, &mut index_once, &mut seen, &mut paths)?;
+    }
+    Ok(paths)
+}
+
+/// addAll 路径收集: modified/untracked + 磁盘上已消失的 deleted。
+fn collect_status_paths(repo: &Repository) -> AppResult<Vec<String>> {
+    let st = get_status(repo)?;
     let workdir = repo
         .workdir()
         .ok_or_else(|| AppError::system("git repo has no workdir"))?;
-    let abs = crate::path_safety::ensure_within(workdir, worktree_path)?;
-    let bstr_owned = index_bstr_path(worktree_path)?;
-    let bstr_path: &BStr = bstr_owned.as_ref();
-    // NotFound = 文件确已删除 → 从 index 移除（对齐 git add 删档语义）；
-    // 其他 IO 错误（EACCES/ESTALE——CephFS 瞬时 stat 失败是现实场景）必须传播：
-    // 静默按删除写入 index 会让存在的文件被后续 commit 从历史里删掉。
-    let metadata = match metadata(&abs) {
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(AppError::system(format!(
-                "git stat {}: {error}",
-                abs.display()
-            )));
+    let mut paths: Vec<String> = st
+        .modified
+        .iter()
+        .chain(st.untracked.iter())
+        .cloned()
+        .collect();
+    paths.extend(
+        st.deleted
+            .iter()
+            .filter(|f| !workdir.join(f).exists())
+            .cloned(),
+    );
+    Ok(paths)
+}
+
+/// 内存中整批更新 index entry (blob 写 ODB + entry 增删), 不落盘。
+///
+/// 循环期间 index 恒为原始有序状态——既有 entry 原地改字段 (不移动),
+/// 新增与删除全部缓冲延后——`entry_mut_by_path_and_stage` 的二分查找因此
+/// 始终有效; 排序与删除过滤各只做一次 (避免逐 entry 全表扫描/排序)。
+///
+/// 未变更文件走 git 同款快路径: `Stat::matches` 命中 (mtime/ctime/size 按
+/// repo stat 配置比较) 且 mode 未变且非 racy-clean → 完全跳过, 不 open
+/// 不读不哈希不写对象——`git add` 对未变更文件只花一次 lstat 的机制
+/// (read-cache.c ie_match_stat)。每对象落盘成本在网络卷 (RBD/CephFS)
+/// 上是毫秒级, 此前每轮 commit 重写全部未变更对象是数万文件耗时数十秒
+/// 的直接原因。entry.stat 写真实 stat (非零值), 否则下一轮永远比对不中。
+fn stage_paths_with_probe(
+    repo: &Repository,
+    index: &mut gix::index::File,
+    paths: &[String],
+    stat_probe: impl Fn(&Path) -> std::io::Result<gix::index::fs::Metadata>,
+) -> AppResult<bool> {
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| AppError::system("git repo has no workdir"))?;
+    let stat_options = repo
+        .stat_options()
+        .map_err(|e| map_git_err(e, "git stat options"))?;
+    let validate_options = repo_path_protection_options(repo)?;
+    let index_timestamp = index.timestamp();
+    let mut new_entries: Vec<(Stat, ObjectId, IndexMode, BString)> = Vec::new();
+    let mut deleted: HashSet<BString> = HashSet::new();
+    // 本轮是否有任何 index 变更(条目更新/新增/删除)——供调用方区分
+    // "内容没变"与"stat 缓存刷新需落盘" (codex P2: 存量零 stat 仓库靠
+    // 无变更提交时的 stat 刷新落盘来预热快路径)。
+    let mut dirty = false;
+    // 以**最终 index 路径**去重: Windows 上 `dir\file.txt` 与 `dir/file.txt`
+    // 归一后同键, 字符串级去重会漏; 重复 key 两条都会查不到既有 entry,
+    // 延后追加将产生重复 index 条目
+    let mut seen: HashSet<BString> = HashSet::with_capacity(paths.len());
+    for worktree_path in paths {
+        let abs = crate::path_safety::ensure_within(workdir, worktree_path)?;
+        let bstr_owned = index_bstr_path(worktree_path)?;
+        if !seen.insert(bstr_owned.clone()) {
+            continue;
         }
-    };
-    if let Some(metadata) = metadata {
-        let (blob_id, mode) = if metadata.file_type().is_symlink() {
-            let target = std::fs::read_link(&abs)?;
-            let data = into_bstr(target)
-                .map_err(|error| map_git_err(error, "git encode symlink target"))?
-                .into_owned();
-            let id = repo
-                .write_blob(data.as_slice())
-                .map_err(|e| map_git_err(e, "git write symlink blob"))?
-                .detach();
-            (id, IndexMode::SYMLINK)
+        let bstr_path: &BStr = bstr_owned.as_ref();
+        // 统一边界 (codex 复审 P1): 保留名路径**无论来自显式请求还是目录
+        // 展开**都不得进入 index —— 对齐 git add 的静默忽略。index 里已有
+        // 毒化条目的清理由调用方全量 purge 完成 (purge_reserved_git_entries)。
+        if path_has_reserved_git_component(bstr_path, validate_options) {
+            continue;
+        }
+        // NotFound = 文件确已删除 → 从 index 移除（对齐 git add 删档语义）；
+        // 其他 IO 错误（EACCES/ESTALE——CephFS 瞬时 stat 失败是现实场景）必须传播：
+        // 静默按删除写入 index 会让存在的文件被后续 commit 从历史里删掉。
+        let metadata = match stat_probe(&abs) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(AppError::system(format!(
+                    "git stat {}: {error}",
+                    abs.display()
+                )));
+            }
+        };
+        let Some(metadata) = metadata else {
+            deleted.insert(bstr_owned);
+            dirty = true;
+            continue;
+        };
+        let mode = if metadata.is_symlink() {
+            IndexMode::SYMLINK
         } else if metadata.is_file() {
-            #[cfg(unix)]
-            let executable = {
-                use std::os::unix::fs::PermissionsExt;
-                metadata.permissions().mode() & 0o111 != 0
-            };
-            #[cfg(not(unix))]
-            let executable = false;
-            let mode = if executable {
+            if metadata.is_executable() {
                 IndexMode::FILE_EXECUTABLE
             } else {
                 IndexMode::FILE
-            };
-            // Repository::write_blob_stream() 在 gix 0.85 中仍先聚合到内存；
-            // 直接写公开 ODB handle 才会流式压缩并落到 loose object。
-            let mut file = std::fs::File::open(&abs)?;
-            let id = repo
-                .objects
-                .write_stream(gix::objs::Kind::Blob, metadata.len(), &mut file)
-                .map_err(|e| map_git_err(e, "git stream worktree blob"))?;
-            (id, mode)
+            }
         } else {
             return Err(AppError::validation(format!(
                 "unsupported file type: {worktree_path}"
             )));
         };
-        let stat = Stat::default();
-        if let Some(e) = index.entry_mut_by_path_and_stage(bstr_path, Stage::Unconflicted) {
-            e.id = blob_id;
-            e.stat = stat;
-            e.mode = mode;
-        } else {
-            index.dangerously_push_entry(stat, blob_id, Flags::empty(), mode, bstr_path);
-            index.sort_entries();
+        // gix_index::fs::Metadata 携带 git 语义的 ctime (std 在 Unix 上没有),
+        // Stat::from_fs 因此必须配它使用。pre-epoch 等异常 → None,
+        // 退化为旧行为 (零 stat, 每轮全量重处理) 而非失败。
+        let new_stat = Stat::from_fs(&metadata).ok();
+        // 未变更快路径 (对齐 gix-status function.rs 的 racy-git 判定):
+        // stat 一致 + mode 一致 + 非空 blob 例外 + 非 racy-clean → 跳过。
+        // racy-clean: entry mtime ≥ index 时间戳时 stat 不可信 (同秒内改回
+        // 同大小), 必须落内容比较; empty blob 例外是 git 对 size=0 racy
+        // 标记的补丁 (racy-git.txt)。
+        if let (Some(stat), Some(entry)) = (
+            new_stat.as_ref(),
+            index.entry_by_path_and_stage(bstr_path, Stage::Unconflicted),
+        ) && stat.matches(&entry.stat, stat_options)
+            && entry.mode == mode
+            && (!entry.id.is_empty_blob() || entry.stat.size == 0)
+            && !stat.is_racy(index_timestamp, stat_options)
+        {
+            continue;
         }
-    } else {
-        index.remove_entries(|_, p, _| p == bstr_path);
+        let blob_id = if metadata.is_symlink() {
+            let target = std::fs::read_link(&abs)?;
+            let data = into_bstr(target)
+                .map_err(|error| map_git_err(error, "git encode symlink target"))?
+                .into_owned();
+            repo.write_blob(data.as_slice())
+                .map_err(|e| map_git_err(e, "git write symlink blob"))?
+                .detach()
+        } else {
+            let mut file = std::fs::File::open(&abs)?;
+            // 小文件走 facade: write_blob_stream 自带 exists 去重——同内容
+            // 对象已存在时不写盘 (git freshen 的等价物, gix 只在 facade 层
+            // 提供)。大文件保持 ODB 流式写 (不聚合进内存), 放弃去重。
+            if metadata.len() <= STAGE_FACADE_DEDUPE_MAX_BYTES {
+                repo.write_blob_stream(&mut file)
+                    .map_err(|e| map_git_err(e, "git write worktree blob"))?
+                    .detach()
+            } else {
+                repo.objects
+                    .write_stream(gix::objs::Kind::Blob, metadata.len(), &mut file)
+                    .map_err(|e| map_git_err(e, "git stream worktree blob"))?
+            }
+        };
+        match index.entry_mut_by_path_and_stage(bstr_path, Stage::Unconflicted) {
+            Some(entry) => {
+                entry.id = blob_id;
+                entry.stat = new_stat.unwrap_or_default();
+                entry.mode = mode;
+            }
+            None => new_entries.push((new_stat.unwrap_or_default(), blob_id, mode, bstr_owned)),
+        }
+        dirty = true;
+    }
+    // 删除: 单趟批量过滤 (保序, 无需再排序)
+    if !deleted.is_empty() {
+        index.remove_entries(|_, p, _| deleted.contains(p));
+    }
+    // 新增: 缓冲合并后一次追加 + 一次排序
+    if !new_entries.is_empty() {
+        for (stat, id, mode, path) in new_entries {
+            let bstr_path: &BStr = path.as_ref();
+            index.dangerously_push_entry(stat, id, Flags::empty(), mode, bstr_path);
+        }
         index.sort_entries();
     }
     index.remove_tree();
-    index
-        .write(IndexWriteOptions::default())
-        .map_err(|e| map_git_err(e, "git index write"))?;
+    Ok(dirty)
+}
+
+/// ≤此大小的文件经 `Repository::write_blob_stream` 暂存 (内存聚合换取
+/// exists 去重); 超过则走 ODB 流式写。绝大多数工作区变更文件是小文件,
+/// 大文件聚合进内存的峰值不可接受。
+const STAGE_FACADE_DEDUPE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+// ── index.lock 事务 ──────────────────────────────────────────────────────────
+
+/// 锁竞争 (外部 git CLI 大仓库 add 等活跃持有者) 的有界退避等待;
+/// 超时返回明确错误, 永不抢锁。
+const INDEX_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 本事务持有的 index 锁。跨进程互斥完全依赖官方 gix 锁文件:
+/// 读前取得 → 持锁完成读-改-写 → `write_to` + `commit()` rename 落盘,
+/// 正常失败 (含提交失败回滚) 由 gix 自动清理锁文件。
+///
+/// **残锁边界 (明确保留)**: 进程被强杀可能残留官方 `index.lock`, 普通重试
+/// 无法解除; 该情况由后续受控诊断与恢复流程处理, 本处不用自定义协议自动
+/// 删锁 (多轮复审确认: 身份判定/删除协议引入的竞态面多于其解决的问题)。
+struct IndexLock {
+    inner: gix::lock::File,
+}
+
+impl IndexLock {
+    /// 写出 index 并 rename 提交; 失败由 gix 回滚锁文件, 原 index 保留。
+    fn commit_index(self, index: &mut gix::index::File) -> AppResult<()> {
+        let mut inner = self.inner;
+        {
+            use std::io::Write as _;
+            smudge_racily_clean_entries(index);
+            let mut writer = std::io::BufWriter::with_capacity(64 * 1024, &mut inner);
+            if let Err(error) = index.write_to(&mut writer, IndexWriteOptions::default()) {
+                return Err(map_git_err(error, "git index write"));
+            }
+            if let Err(error) = writer.flush() {
+                return Err(map_git_err(error, "git index flush"));
+            }
+        }
+        inner
+            .commit()
+            .map(|_| ())
+            .map_err(|e| map_git_err(e, "git index commit"))
+    }
+}
+
+/// 写 index 前给 racy 条目打标记 (对齐 git `ce_smudge_racily_clean_entry`)。
+///
+/// 判定基准是**旧 index 检查点**(本事务读入的 index 文件时间戳), 不是
+/// 当前时刻: 条目 stat 的 mtime ≥ 检查点 = "捕获该 stat 之后从未有过已
+/// 验证的检查点" → racy, 把 `stat.size` 置 0 持久化。用 now() 会漏掉
+/// 存量仓库: 旧版实现/外部工具写出的 index 里, 条目 mtime 与旧检查点
+/// 同秒但未带标记, mtime < now → 不补标记 → 后续无关重写洗白 racy 状态
+/// → 同秒同长度真实修改被跳过 (codex 受控反例: git 得 BBB, 旧逻辑残留
+/// AAA)。
+///
+/// 标记持久化在条目字节里, 跨后续无关 index 重写存活; 下次 stat 比对
+/// 必然 size 失配 → 强制重读内容 (racy-git.txt 第二形态)。空文件天然
+/// size=0 无影响; 永远偏向重读 (fail-safe)。被重新验证过的条目携带
+/// 文件真实 mtime (早于新检查点) → 不再标记, 不会循环 smudge。
+fn smudge_racily_clean_entries(index: &mut gix::index::File) {
+    let checkpoint_secs = index.timestamp().unix_seconds().clamp(0, u32::MAX as i64) as u32;
+    for entry in index.entries_mut() {
+        if entry.stage() == Stage::Unconflicted
+            && entry.stat.size != 0
+            && entry.stat.mtime.secs >= checkpoint_secs
+        {
+            entry.stat.size = 0;
+        }
+    }
+}
+
+fn acquire_index_lock(repo: &Repository) -> AppResult<IndexLock> {
+    let inner = gix::lock::File::acquire_to_update_resource(
+        repo.index_path(),
+        gix::lock::acquire::Fail::AfterDurationWithBackoff(INDEX_LOCK_WAIT),
+        None,
+        // 与 gix-index 自身 write() 及 ensure_index_file 一致: umask 前 0o666 策略
+        0,
+    )
+    .map_err(|error| {
+        AppError::system(format!(
+            "git acquire index.lock: {error} \
+             (index.lock is held by another git operation, or was left by a killed \
+             process; retry after the operation completes, or remove .git/index.lock \
+             if no git process is running)"
+        ))
+    })?;
+    Ok(IndexLock { inner })
+}
+
+/// git/gix 同款锁文件命名: `<index>.lock`。
+#[cfg(test)]
+fn index_lock_path(index_path: &Path) -> std::path::PathBuf {
+    let mut lock = index_path.to_path_buf();
+    lock.set_file_name("index.lock");
+    lock
+}
+
+/// 未解决冲突条目存在时拒绝提交 (codex v4 P1, 既有缺陷):
+/// 旧实现静默跳过非 Unconflicted 条目——merge 冲突仓库提交后冲突文件会
+/// 从提交树中消失 (等效提交删除)。必须在任何发布副作用之前响亮失败。
+fn assert_no_unresolved_conflicts(index: &gix::index::File) -> AppResult<()> {
+    let backing = index.path_backing();
+    for entry in index.entries() {
+        if entry.stage() != Stage::Unconflicted {
+            use gix::bstr::ByteSlice as _;
+            let path = entry.path_in(backing).to_str_lossy();
+            return Err(AppError::business(format!(
+                "unresolved merge conflict present for {path}; \
+                 resolve conflicts before committing"
+            )));
+        }
+    }
     Ok(())
 }
 
-/// stage 多个文件 (对齐 nuwax stageFiles; files 为空则 addAll: 基于 status stage 全部变更)。
-pub fn stage_files(repo: &Repository, files: &[String]) -> AppResult<()> {
-    if !files.is_empty() {
-        for f in files {
-            stage_path(repo, f)?;
-        }
-        return Ok(());
-    }
-    let st = get_status(repo)?;
-    for f in st.modified.iter().chain(st.untracked.iter()) {
-        stage_path(repo, f)?;
-    }
-    for f in st.deleted.iter() {
-        let abs = repo
-            .workdir()
-            .ok_or_else(|| AppError::system("git repo has no workdir"))?
-            .join(f);
-        if !abs.exists() {
-            stage_path(repo, f)?;
-        }
-    }
-    Ok(())
-}
-
-/// 提交当前 index。新 tree 完全由 index 构造，确保暂存删除不会被 HEAD tree 带回。
-pub fn commit_indexed(
-    repo: &Repository,
-    message: &str,
-    author_name: &str,
-    author_email: &str,
-) -> AppResult<String> {
-    let index = repo
-        .open_index()
-        .map_err(|e| map_git_err(e, "git open_index"))?;
+/// 由 index 全量构造 tree (调用方须先通过 [`assert_no_unresolved_conflicts`])。
+fn tree_id_from_index(repo: &Repository, index: &gix::index::File) -> AppResult<ObjectId> {
     let mut editor = repo
         .edit_tree(repo.empty_tree().id())
         .map_err(|e| map_git_err(e, "git edit_tree"))?;
     let path_backing = index.path_backing();
     for entry in index.entries() {
-        if entry.stage() != Stage::Unconflicted {
-            continue;
-        }
         let path = entry.path_in(path_backing);
         let kind = match entry.mode {
             IndexMode::FILE => TreeEntryKind::Blob,
@@ -215,9 +611,35 @@ pub fn commit_indexed(
             .upsert(path, kind, entry.id)
             .map_err(|e| map_git_err(e, "git editor upsert"))?;
     }
-    let tree_id = editor
+    editor
         .write()
-        .map_err(|e| map_git_err(e, "git editor write"))?;
+        .map(|id| id.detach())
+        .map_err(|e| map_git_err(e, "git editor write"))
+}
+
+/// 提交当前 index。新 tree 完全由 index 构造，确保暂存删除不会被 HEAD tree 带回。
+/// 带未解决冲突条目时拒绝 (不静默跳过)。
+pub fn commit_indexed(
+    repo: &Repository,
+    message: &str,
+    author_name: &str,
+    author_email: &str,
+) -> AppResult<String> {
+    // 历史毒化修复: 锁内读-清-按需落盘 (codex 复审 543bd91f: 只清内存会让
+    // 磁盘 index 永远带着坏条目, 重开仓库 status 仍显示待提交)。无修复
+    // 内容时保持原语义 (不取写路径, 不重写 index)。
+    let index = {
+        let lock = acquire_index_lock(repo)?;
+        let mut index = repo
+            .open_index()
+            .map_err(|e| map_git_err(e, "git open_index"))?;
+        if purge_reserved_git_entries(&mut index, repo_path_protection_options(repo)?) {
+            lock.commit_index(&mut index)?;
+        }
+        index
+    };
+    assert_no_unresolved_conflicts(&index)?;
+    let tree_id = tree_id_from_index(repo, &index)?;
     // unborn → root commit（合法首提交）；head() 真错误传播，不吞成"无 parent"
     let head = repo.head().map_err(|e| map_git_err(e, "git head"))?;
     let parents: Vec<ObjectId> = if head.is_unborn() {
@@ -229,6 +651,25 @@ pub fn commit_indexed(
                 .detach(),
         ]
     };
+    commit_to_head(repo, message, tree_id, &parents, author_name, author_email)
+}
+
+/// 写 commit 对象并发布到 HEAD (官方 `commit_as`, gix 0.90 语义):
+/// - 有父提交 → HEAD 走**严格** `MustExistAndMatch(parent)`: 分支被删/前进 → 冲突报错;
+/// - 首次提交 → `MustNotExist`;
+/// - symbolic HEAD 经 deref 透写目标分支, **同步维护 HEAD 与分支两侧 reflog**;
+///   detached HEAD 直接更新自身。
+///
+/// 目标为发布时刻的 HEAD (标准 git 行为), 不额外固定捕获时的分支名
+/// (曾因命名分支调用走宽松 ExistingMustMatch 而手写引用事务, 已按 codex r6 复核回归官方)。
+fn commit_to_head(
+    repo: &Repository,
+    message: &str,
+    tree_id: ObjectId,
+    parents: &[ObjectId],
+    author_name: &str,
+    author_email: &str,
+) -> AppResult<String> {
     let sig = Signature {
         name: BString::from(author_name),
         email: BString::from(author_email),
@@ -247,6 +688,223 @@ pub fn commit_indexed(
         )
         .map_err(|e| map_git_err(e, "git commit"))?;
     Ok(commit_id.to_string())
+}
+
+/// 事务化 stage + commit (codex v4 方案): 同一把 index.lock 内完成
+/// 读 index → 内存批量 stage → 冲突拒绝 → 由**同一份内存 index** 构造 tree
+/// 并与 HEAD tree 比对 (nothingToCommit 判定, 不再全工作区 status 扫描)
+/// → index 单次原子落盘 → 按发布时 HEAD 严格 CAS 发布提交 (见 [`commit_to_head`])。
+///
+/// 失败语义: ref 冲突 (外部并行使引用前进) 时 index 已落盘 = 已暂存内容
+/// 保留, 明确报错供重试; commit 对象未写入则无任何副作用。index 与 ref 是
+/// 两个文件, 不宣称跨两者原子。
+pub fn stage_and_commit(
+    repo: &Repository,
+    files: &[String],
+    message: &str,
+    author_name: &str,
+    author_email: &str,
+) -> AppResult<Option<String>> {
+    let paths = resolve_stage_paths(repo, files)?;
+    let lock = acquire_index_lock(repo)?;
+    let mut index = repo
+        .open_index()
+        .map_err(|e| map_git_err(e, "git open_index"))?;
+    let mut staging_dirty = false;
+    if !paths.is_empty() {
+        staging_dirty = stage_paths_with_probe(repo, &mut index, &paths, |path| {
+            gix::index::fs::Metadata::from_path_no_follow(path)
+        })?;
+    }
+    // 历史毒化修复 (codex 复审): 与请求无关也要恢复 —— paths 为空的
+    // addAll 提交同样不得被 index 里的保留名条目卡死 tree 构造。
+    staging_dirty |= purge_reserved_git_entries(&mut index, repo_path_protection_options(repo)?);
+    assert_no_unresolved_conflicts(&index)?;
+    // 锁内捕获 HEAD 状态: parent (发布 CAS 依据); 分支由发布时的 HEAD 透写解析
+    let head = repo.head().map_err(|e| map_git_err(e, "git head"))?;
+    let unborn = head.is_unborn();
+    let parents: Vec<ObjectId> = if unborn {
+        vec![]
+    } else {
+        vec![
+            head.into_peeled_id()
+                .map_err(|e| map_git_err(e, "git head_id"))?
+                .detach(),
+        ]
+    };
+    let head_tree: Option<ObjectId> = parents
+        .first()
+        .map(|parent| {
+            repo.find_commit(parent.to_owned())
+                .map_err(|e| map_git_err(e, "git find_commit"))?
+                .tree_id()
+                .map(|id| id.detach())
+                .map_err(|e| map_git_err(e, "git tree_id"))
+        })
+        .transpose()?;
+    let tree_id = tree_id_from_index(repo, &index)?;
+    // nothingToCommit 判定对齐 TS 契约 (nativeCommitFiles / isoCommitFiles):
+    // - 显式列表: 看**请求路径**相对 HEAD 有无暂存差异——没有则不提交,
+    //   其他文件已暂存的内容原样保留 (不连带发布用户未请求的内容);
+    // - addAll (空列表): 任意暂存变更即提交 (nativeAddAllAndCommit 语义);
+    // - unborn + 空 tree: 不创建空的首提交。
+    // 提交体始终是整个暂存区 (nativeCommitStaged 语义)。
+    let nothing_to_commit = if files.is_empty() {
+        match head_tree {
+            Some(head) => head == tree_id,
+            None => tree_id == repo.empty_tree().id(),
+        }
+    } else {
+        // 传**原始请求列表** (非展开结果): 目录请求按前缀覆盖目录内已暂存
+        // 的删除/新增 (codex r7 P2)
+        !requested_paths_have_staged_changes(repo, &index, files, head_tree)?
+    };
+    if nothing_to_commit {
+        // 无需创建 commit ≠ 暂存区无需落盘。staging_dirty 区分两种情况
+        // (codex P2):
+        // - dirty (条目更新/新增/删除): 必须落盘——含暂存恢复 (用户把工作树
+        //   恢复成 HEAD 内容抵消旧暂存差异) 与 **stat 刷新预热** (旧版实现
+        //   持久化的零 stat 在本轮 staging 已重新验证为真实值, 不落盘则
+        //   存量仓库永远全量重读, 快路径无法生效);
+        // - 全部跳过 (纯 stat 命中): index 字节不变, 免写。
+        // 此前按"磁盘 tree 是否等于内存 tree"决定写盘, 纯 stat 刷新时 tree
+        // 不变 → 刷新丢失 → 零 stat 永久残留。锁在手, 磁盘 index 不可能被
+        // 并发改动, dirty 标记即充分依据。
+        if staging_dirty {
+            lock.commit_index(&mut index)?;
+        }
+        return Ok(None);
+    }
+    // index 先原子落盘 (失败保留原 index)
+    lock.commit_index(&mut index)?;
+    // 再发布提交: 官方 commit_as("HEAD") —— 严格 CAS (分支被删/前进 → 冲突),
+    // deref 透写分支并同步维护两侧 reflog
+    let commit_id = commit_to_head(repo, message, tree_id, &parents, author_name, author_email)?;
+    Ok(Some(commit_id))
+}
+
+/// 请求路径相对 HEAD 的暂存差异判定 (TS `git diff --cached --quiet -- <paths>`
+/// 语义, codex r7 收敛): 官方 [`Repository::tree_index_status`] 比对 HEAD tree
+/// 与**同一份内存 index** (不扫工作树), 按原始请求范围过滤——
+/// - 目录请求按前缀匹配, 覆盖目录内**已暂存的删除/新增** (展开现存文件的
+///   手写判定会漏删除);
+/// - 文件类型变化 (普通文件 ↔ 符号链接, blob 相同) 由官方 diff 判定;
+/// - unborn 对比空 tree (请求路径已暂存即变更), 不再手查 index;
+/// - Windows 反斜杠请求路径先归一化, 与 index 存储口径一致。
+///
+/// 首个命中即 Cancel 提前退出。
+fn requested_paths_have_staged_changes(
+    repo: &Repository,
+    index: &gix::index::File,
+    requested: &[String],
+    head_tree: Option<ObjectId>,
+) -> AppResult<bool> {
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| AppError::system("git repo has no workdir"))?;
+    // 范围键与展开层同口径 (codex 复审 P2): 工作区内绝对路径请求同样
+    // 归一为相对键, 不得在判定处 400。
+    let scope: Vec<String> = requested
+        .iter()
+        .map(|path| worktree_relative_key(workdir, path))
+        .collect::<AppResult<Vec<_>>>()?;
+    let tree_id = head_tree.unwrap_or_else(|| repo.empty_tree().id().detach());
+    // 请求范围判定: 不再用 N 条 :(literal) pathspec 过滤 tree_index_status ——
+    // gix-pathspec 的多模式匹配是**每条 index 条目线性扫描全部 pattern**
+    // (search/matching.rs patterns.iter_mut().find_map), N 请求 × N 条目 =
+    // O(N²): 40k 全量请求仅模式匹配就要 ~6.4s, 130k ≈ 2 分钟 (生产实测
+    // 2.6min 的主因)。
+    // 改为无 pathspec 全量 diff(纯内存 oid/mode 比较, O(N)) + 变更路径对
+    // 请求集合的 HashSet 判定。任一请求为根 (`.` → 空键) → 全仓范围,
+    // 首个变更即真。目录请求的 leading-dir 语义由前缀匹配保留。
+    let root_scope = scope.iter().any(String::is_empty);
+    let prefixes: Vec<BString> = if root_scope {
+        Vec::new()
+    } else {
+        scope.iter().map(|p| BString::from(p.as_str())).collect()
+    };
+    let mut requested_exact: HashSet<BString> = HashSet::with_capacity(prefixes.len());
+    for path in &prefixes {
+        requested_exact.insert(path.clone());
+    }
+    let in_scope = |path: &BStr| -> bool {
+        if root_scope || requested_exact.contains(path) {
+            return true;
+        }
+        // leading-dir: 请求 "dir" / "dir/" 命中 "dir/xxx" (对齐 git pathspec
+        // 语义)。未精确命中时**枚举变更路径的父目录**逐个查同一 HashSet —
+        // O(路径深度) 次哈希查找, 与请求数量无关。此前线性扫全部请求前缀
+        // 是 O(变更×请求): 大量无关暂存 + 大量未变请求时二次增长
+        // (codex 实测 1000×1000 → 100 万次比较, 翻倍 → 400 万)。
+        let bytes: &[u8] = path.as_ref();
+        let mut scratch = BString::default();
+        let mut start = 0;
+        while let Some(slash) = bytes[start..].iter().position(|&b| b == b'/') {
+            let end = start + slash;
+            scratch.clear();
+            scratch.extend_from_slice(&bytes[..end]);
+            if requested_exact.contains(&scratch) {
+                return true;
+            }
+            start = end + 1;
+        }
+        false
+    };
+    let mut has_change = false;
+    repo.tree_index_status(
+        &tree_id,
+        index,
+        // None = 不带 pathspec: diff 本体不做模式匹配, 过滤在回调内完成
+        None,
+        gix::status::tree_index::TrackRenames::Disabled,
+        |change, _, _| {
+            let path = change.location();
+            if in_scope(path) {
+                has_change = true;
+                Ok(std::ops::ControlFlow::Break(()))
+            } else {
+                Ok(std::ops::ControlFlow::Continue(()))
+            }
+        },
+    )
+    .map_err(|e| map_git_err(e, "git tree_index_status"))?;
+    Ok(has_change)
+}
+
+/// 工作区相对路径 → 规范 wire 键 (对齐 git pathspec 清理语义), 供
+/// 请求范围匹配与 index/tree 条目命名共用的单一归一化点:
+/// - 先按 FS-08 归一分隔符 (Windows `\` → `/`; POSIX 下反斜杠是合法文件
+///   名字符, 原样保留), 再经 `Path::components()` 归一 `./` 段 (前导/中间)、
+///   重复分隔符与尾斜杠, 以 `/` 重组——与 index/HEAD 条目存储口径一致;
+/// - `..` 词法消解 (栈式回退, 对齐 git 对 pathspec 的清理): `a/../b` → `b`;
+///   回退越过根 = 越出工作区 → 拒绝 (对齐 git "outside repository");
+/// - 根目录请求 (`.` / `./`) 归一为**空串**, 由 [`in_scope`] 解释为整个
+///   工作区范围 (对齐 `git diff --cached -- .`);
+/// - `RootDir`/`Prefix` (绝对路径) 不属于工作区相对请求 → 拒绝。
+fn normalize_relative_path(path: &str) -> AppResult<String> {
+    let wire = crate::path_safety::host_relative_to_wire(path);
+    let mut stack: Vec<String> = Vec::new();
+    for component in Path::new(&wire).components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                stack.push(part.to_string_lossy().into_owned());
+            }
+            std::path::Component::ParentDir => {
+                if stack.pop().is_none() {
+                    return Err(AppError::validation(format!(
+                        "git request path escapes workspace root: {path}"
+                    )));
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(AppError::validation(format!(
+                    "git request path must be workspace-relative: {path}"
+                )));
+            }
+            std::path::Component::CurDir => {}
+        }
+    }
+    Ok(stack.join("/"))
 }
 
 // ── init / unstage / discard ───────────────────────────────────────────────────
@@ -368,8 +1026,11 @@ impl DiscardBuckets {
 }
 
 /// discard (对齐 nuwax discard): files 空 → discard 全部 modified/staged/deleted。
+/// - 每个请求先词法归一成规范键 (`x/../b.txt` → `b.txt`), HEAD 查询 / 物化 /
+///   index / 分桶共用该键
 /// - HEAD 有该文件 (tracked, modified/deleted) → 恢复 worktree 到 HEAD + `stage_path` 同步 index
 /// - HEAD 无 (untracked/staged-new) → 删除 worktree + `stage_path` 同步 index (移除 staged-new entry)
+/// - 目录请求 (含归一后为根的 `.`) → 拒绝: 无单文件语义, 且目录展开等于 add
 ///
 /// 返回三桶明细 (trackedFiles / newFiles / untrackedFiles), 与 nuwax 一致。
 pub fn discard_files(repo: &Repository, files: &[String]) -> AppResult<DiscardBuckets> {
@@ -399,11 +1060,21 @@ pub fn discard_files(repo: &Repository, files: &[String]) -> AppResult<DiscardBu
     };
     let mut buckets = DiscardBuckets::default();
     for f in &to_discard {
-        // 安全：用户可控的 files 必须在任何 fs 操作前做路径校验，拒绝 `..` / 绝对路径穿越。
-        // stage_path 内部的 ensure_within 发生在 write/remove 之后（太晚），故在此先行拦截。
-        let abs = crate::path_safety::ensure_within(workdir, f)?;
+        // 单一规范键：请求先词法归一（`x/../b.txt` → `b.txt`、Windows `\` → `/`），
+        // HEAD 查询 / 物化 / index / 分桶全部使用它。此前 ensure_within 内部已归一
+        // （FS 侧落点正确）而 HEAD 查询用原始串：归一前形态在 tree 里查不到条目，
+        // 被误判 untracked——删掉工作区文件并 stage 一次删除，与 discard 语义相反。
+        let key = normalize_relative_path(f)?;
+        let abs = crate::path_safety::ensure_within(workdir, &key)?;
+        // 目录请求没有单文件语义：stage_path 的目录展开会把整棵子树 stage 进
+        // index（等于 add，与 discard 相反），故 fail-fast 拒绝而非静默做错。
+        if std::fs::symlink_metadata(&abs).is_ok_and(|meta| meta.is_dir()) {
+            return Err(AppError::validation(format!(
+                "git discard path must be a file, not a directory: {f}"
+            )));
+        }
         match tree
-            .lookup_entry_by_path(f)
+            .lookup_entry_by_path(&key)
             .map_err(|e| map_git_err(e, "git lookup_entry_by_path"))?
         {
             Some(entry) => {
@@ -411,24 +1082,24 @@ pub fn discard_files(repo: &Repository, files: &[String]) -> AppResult<DiscardBu
                 // （共享安全物化器: 界内目录链 + leaf 不跟随 + mode 如实恢复, FS-03/06）
                 let planned = super::materialize::plan_tree_entry(
                     workdir,
-                    Path::new(f),
+                    Path::new(&key),
                     entry.mode(),
                     entry.id(),
                 )?;
                 super::materialize::materialize_planned(repo, workdir, &planned)?;
-                stage_path(repo, f)?;
-                buckets.tracked_files.push(f.clone());
+                stage_path(repo, &key)?;
+                buckets.tracked_files.push(key);
             }
             None => {
                 // untracked / staged-new: 删 worktree + 同步 index (移除 staged-new entry)
                 if let Err(e) = std::fs::remove_file(&abs) {
                     tracing::warn!(error = %e, "remove untracked worktree file failed (skipping)");
                 }
-                stage_path(repo, f)?;
-                if staged_set.contains(f) {
-                    buckets.new_files.push(f.clone());
+                stage_path(repo, &key)?;
+                if staged_set.contains(&key) {
+                    buckets.new_files.push(key);
                 } else {
-                    buckets.untracked_files.push(f.clone());
+                    buckets.untracked_files.push(key);
                 }
             }
         }
@@ -447,9 +1118,13 @@ pub async fn init_repo_offloaded(
     author_name: String,
     author_email: String,
 ) -> AppResult<bool> {
-    tokio::task::spawn_blocking(move || init_repo(&path, &author_name, &author_email))
-        .await
-        .map_err(|e| map_git_err(e, "git init_repo join"))?
+    tokio::task::spawn_blocking(move || {
+        // init 的 stage/commit 与 /api/git/* 写操作共用工作区锁 (codex v2 P2)
+        let _guard = super::workspace_lock::acquire(&path)?;
+        init_repo(&path, &author_name, &author_email)
+    })
+    .await
+    .map_err(|e| map_git_err(e, "git init_repo join"))?
 }
 
 /// [`init_and_commit`] 的 async 安全包装（同 [`init_repo_offloaded`] 动因）。
@@ -460,6 +1135,7 @@ pub async fn init_and_commit_offloaded(
     author_email: String,
 ) -> AppResult<()> {
     tokio::task::spawn_blocking(move || {
+        let _guard = super::workspace_lock::acquire(&path)?;
         init_and_commit(&path, &message, &author_name, &author_email)
     })
     .await
@@ -503,24 +1179,32 @@ mod tests {
         init_repo(dir, "Test", "test@example.com").expect("init");
         std::fs::write(dir.join("protected/a.txt"), "alive").expect("写文件");
         let repo = open(dir).expect("open");
-        stage_file(&repo, "protected/a.txt").expect("正常 stage");
+        stage_path(&repo, "protected/a.txt").expect("正常 stage");
         commit_indexed(&repo, "c1", "Test", "test@example.com").expect("commit");
 
         let before = std::fs::read(repo.index_path()).expect("index bytes");
         // 受控 stat 故障走完整 stage 分支，不依赖 chmod 对 root/Windows 的行为。
+        // 直接注入到内存批量 stage: 事务语义下错误即中止, 不落盘。
         for kind in [
             std::io::ErrorKind::PermissionDenied,
             std::io::ErrorKind::Other,
         ] {
-            let error = stage_file_with_metadata(&repo, "protected/a.txt", |path| {
-                assert_eq!(path, dir.join("protected/a.txt"));
-                Err(std::io::Error::new(kind, "injected stat failure"))
-            })
+            let mut index = repo.open_index().expect("open index");
+            let error = stage_paths_with_probe(
+                &repo,
+                &mut index,
+                &["protected/a.txt".to_string()],
+                |path| {
+                    assert_eq!(path, dir.join("protected/a.txt"));
+                    Err(std::io::Error::new(kind, "injected stat failure"))
+                },
+            )
             .expect_err("stat IO 错误必须传播而非按删除处理");
             assert!(
                 matches!(error, AppError::System(_)),
                 "应为系统错误: {error:?}"
             );
+            drop(index);
             assert_eq!(
                 std::fs::read(repo.index_path()).expect("unchanged index"),
                 before
@@ -536,6 +1220,1464 @@ mod tests {
                 )
                 .is_some(),
             "存在的文件不得因 stat 失败被移出 index"
+        );
+    }
+
+    /// P0-a 快路径: 未变更文件重 stage 必须跳过——不重写 loose 对象
+    /// (以对象文件 mtime 不变为证)。修复前每轮重写全部对象, 网络卷上
+    /// 每对象毫秒级, 是数万文件 commit 数十秒的直接原因。
+    #[test]
+    fn stage_skips_unchanged_file_without_rewriting_object() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        std::fs::write(test.0.join("a.txt"), "two").expect("change");
+        let repo = test.open();
+        stage_path(&repo, "a.txt").expect("stage change");
+        let oid = repo
+            .write_blob(b"two".as_slice())
+            .expect("blob of staged content")
+            .detach();
+        let hex = oid.to_hex().to_string();
+        let obj_path = repo
+            .git_dir()
+            .join("objects")
+            .join(&hex[..2])
+            .join(&hex[2..]);
+        let mtime0 = std::fs::metadata(&obj_path)
+            .and_then(|m| m.modified())
+            .expect("staged loose object");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        stage_path(&repo, "a.txt").expect("re-stage unchanged");
+        let mtime1 = std::fs::metadata(&obj_path)
+            .and_then(|m| m.modified())
+            .expect("object must survive");
+        assert_eq!(
+            mtime0, mtime1,
+            "未变更文件重 stage 不得重写 loose 对象 (stat 快路径失效)"
+        );
+    }
+
+    /// codex 复审 P2 回归: 大批量缺失路径不得回到二次开销。此前每个缺失
+    /// 路径重开重扫全量 index (O(K×N), 微基准 2000 缺失 → 8.2s); 现在
+    /// 整批共享一次懒加载 index + 有序前缀二分, 已删除单文件前缀范围为空
+    /// 即返回。本例为形态回归: 1000 个已删除文件 + 1000 现存文件的显式
+    /// 列表一次 stage, 全部删除正确入列且必须在秒级内完成。
+    #[test]
+    fn batch_stage_with_many_missing_paths_stays_linear() {
+        let test = TestRepo::new();
+        std::fs::create_dir_all(test.0.join("gone")).expect("mkdir gone");
+        std::fs::create_dir_all(test.0.join("keep")).expect("mkdir keep");
+        let mut all = Vec::new();
+        for i in 0..1000 {
+            std::fs::write(test.0.join(format!("gone/g{i:04}.txt")), "x").expect("w");
+            std::fs::write(test.0.join(format!("keep/k{i:04}.txt")), "x").expect("w");
+            all.push(format!("gone/g{i:04}.txt"));
+            all.push(format!("keep/k{i:04}.txt"));
+        }
+        // 单次提交入库 (2000 次独立 commit 的夹具成本会让测试分钟级)
+        let repo = test.open();
+        stage_files(&repo, &all).expect("stage fixture");
+        commit_indexed(&repo, "seed", "T", "t@e.c").expect("commit fixture");
+        let mut files = Vec::new();
+        for i in 0..1000 {
+            std::fs::remove_file(test.0.join(format!("gone/g{i:04}.txt"))).expect("rm");
+            files.push(format!("gone/g{i:04}.txt"));
+            files.push(format!("keep/k{i:04}.txt"));
+        }
+        let t0 = std::time::Instant::now();
+        stage_files(&repo, &files).expect("stage mixed missing/existing");
+        let elapsed = t0.elapsed();
+        // 2000 路径 + 1000 缺失: 二次实现此规模本地也需 ~2s+, 线性实现
+        // 应在 1s 内 (留足 CI 余量; 形态断言为主)。
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "批量缺失路径 stage 应保持线性, 实测 {elapsed:?}"
+        );
+        let index = repo.open_index().expect("index");
+        assert!(
+            index
+                .entry_by_path_and_stage(
+                    gix::bstr::ByteSlice::as_bstr(b"gone/g0000.txt"),
+                    Stage::Unconflicted,
+                )
+                .is_none(),
+            "缺失文件必须从 index 移除 (删除已暂存)"
+        );
+        assert!(
+            index
+                .entry_by_path_and_stage(
+                    gix::bstr::ByteSlice::as_bstr(b"keep/k0000.txt"),
+                    Stage::Unconflicted,
+                )
+                .is_some(),
+            "现存文件必须保留"
+        );
+    }
+
+    /// codex 边界: 根请求 `["."]` 删除跟踪文件后必须暂存并提交删除
+    /// (此前缺失条目收集对空前缀直接跳过 → nothingToCommit)。
+    #[test]
+    fn explicit_commit_root_scope_stages_deletion() {
+        let test = TestRepo::new();
+        commit_file(&test, "keep.txt", "k", "add keep");
+        commit_file(&test, "gone.txt", "g", "add gone");
+        let repo = test.open();
+        std::fs::remove_file(test.0.join("gone.txt")).expect("remove");
+        let result = stage_and_commit(&repo, &[".".to_string()], "rm gone", "T", "t@e.c")
+            .expect("must not fail");
+        let hash = result.expect("root scope must stage the deletion and commit");
+        let commit = repo
+            .find_commit(ObjectId::from_hex(hash.as_bytes()).expect("parse"))
+            .expect("find");
+        let tree = commit.tree().expect("tree");
+        assert!(
+            tree.lookup_entry_by_path("gone.txt").expect("lk").is_none(),
+            "根请求必须暂存未暂存的删除"
+        );
+        assert!(
+            tree.lookup_entry_by_path("keep.txt").expect("lk").is_some(),
+            "未删除文件必须保留"
+        );
+    }
+
+    /// codex 边界: 整个目录已从工作区删除, 请求 `["dir"]` 必须暂存并提交
+    /// 子树删除 (此前目录不存在进不了目录收集分支 → nothingToCommit)。
+    #[test]
+    fn explicit_commit_stages_whole_dir_deletion() {
+        let test = TestRepo::new();
+        std::fs::create_dir_all(test.0.join("d/sub")).expect("mkdir");
+        commit_file(&test, "d/a.txt", "a", "add a");
+        commit_file(&test, "d/sub/b.txt", "b", "add b");
+        commit_file(&test, "outside.txt", "o", "add outside");
+        let repo = test.open();
+        std::fs::remove_dir_all(test.0.join("d")).expect("rm dir");
+        let result = stage_and_commit(&repo, &["d".to_string()], "rm dir", "T", "t@e.c")
+            .expect("must not fail");
+        let hash = result.expect("whole-dir deletion must be staged and committed");
+        let commit = repo
+            .find_commit(ObjectId::from_hex(hash.as_bytes()).expect("parse"))
+            .expect("find");
+        let tree = commit.tree().expect("tree");
+        assert!(
+            tree.lookup_entry_by_path("d/a.txt").expect("lk").is_none()
+                && tree
+                    .lookup_entry_by_path("d/sub/b.txt")
+                    .expect("lk")
+                    .is_none(),
+            "子树内所有文件删除必须进入提交"
+        );
+        assert!(
+            tree.lookup_entry_by_path("outside.txt")
+                .expect("lk")
+                .is_some(),
+            "范围外文件必须保留"
+        );
+    }
+
+    /// codex 业务缺口: 目录请求必须自动暂存目录内的**未暂存删除**。
+    /// `git add <dir>` 会暂存已消失文件; 此前展开只收集现存文件,
+    /// 请求 ["dir"] 对已删除文件永远返回无变更。TS 走 git CLI 天然覆盖。
+    #[test]
+    fn explicit_commit_stages_deletion_inside_requested_dir() {
+        let test = TestRepo::new();
+        std::fs::create_dir_all(test.0.join("d")).expect("mkdir");
+        commit_file(&test, "d/keep.txt", "k", "add keep");
+        commit_file(&test, "d/gone.txt", "g", "add gone");
+        let repo = test.open();
+        // 删除 d/gone.txt (未暂存), 请求整个目录
+        std::fs::remove_file(test.0.join("d/gone.txt")).expect("remove");
+        let result = stage_and_commit(&repo, &["d".to_string()], "rm gone", "T", "t@e.c")
+            .expect("must not fail");
+        let hash = result.expect("directory request must stage the deletion and commit");
+        let commit = repo
+            .find_commit(ObjectId::from_hex(hash.as_bytes()).expect("parse"))
+            .expect("find");
+        let tree = commit.tree().expect("tree");
+        assert!(
+            tree.lookup_entry_by_path("d/gone.txt")
+                .expect("lk")
+                .is_none(),
+            "未暂存的删除必须经目录请求进入提交"
+        );
+        assert!(
+            tree.lookup_entry_by_path("d/keep.txt")
+                .expect("lk")
+                .is_some(),
+            "目录内未删除文件必须保留"
+        );
+    }
+
+    /// `.git` 子树请求忽略 (对齐原生 git): `git add .git` / `.git/config` /
+    /// `./.git` 实测均 exit 0 且 index 零条目。修复前目录展开走进 .git 收集
+    /// 内部文件, stage_files 会把 `.git/config` 等写入 index (毒化), 后续
+    /// 提交在 tree 构造拒绝 `.git` 组件时整体 500。
+    #[test]
+    fn dotgit_request_paths_are_ignored() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        let repo = test.open();
+        stage_files(
+            &repo,
+            &[
+                ".git".to_string(),
+                ".git/config".to_string(),
+                "./.git".to_string(),
+            ],
+        )
+        .expect("dotgit 请求必须被忽略而非报错/暂存");
+        assert_no_dotgit_entries(&repo);
+        // 无变更 + 全部请求被忽略 → nothingToCommit (修复前 tree 构造报 500)
+        let result = stage_and_commit(&repo, &[".git".to_string()], "x", "T", "t@e.c")
+            .expect("dotgit commit 请求不得失败");
+        assert!(
+            result.is_none(),
+            "全被忽略的请求范围必须判定 nothingToCommit"
+        );
+        assert_no_dotgit_entries(&repo);
+    }
+
+    /// `.git` 请求与正常路径混排: 忽略 .git 项, 兄弟路径正常暂存提交。
+    #[test]
+    fn dotgit_request_sibling_still_commits() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        std::fs::write(test.0.join("a.txt"), "two").expect("modify a");
+        let repo = test.open();
+        let result = stage_and_commit(
+            &repo,
+            &[".git".to_string(), "a.txt".to_string()],
+            "m",
+            "T",
+            "t@e.c",
+        )
+        .expect("混排请求不得失败");
+        let hash = result.expect("a.txt 的真实变更必须提交");
+        let commit = repo
+            .find_commit(ObjectId::from_hex(hash.as_bytes()).expect("parse"))
+            .expect("find");
+        let tree = commit.tree().expect("tree");
+        let blob = tree
+            .lookup_entry_by_path("a.txt")
+            .expect("lookup a.txt")
+            .expect("a.txt 必须在提交树中");
+        assert_eq!(blob.object().expect("blob").data, b"two".as_ref());
+        assert!(
+            tree.lookup_entry_by_path(".git/config")
+                .expect("lookup .git/config")
+                .is_none(),
+            "提交树不得包含 .git 条目"
+        );
+        assert_no_dotgit_entries(&repo);
+    }
+
+    /// 子串命中但无 `.git` 组件的路径不得误伤 (预筛只挡组件)。
+    #[test]
+    fn dotgit_substring_paths_are_not_ignored() {
+        let test = TestRepo::new();
+        std::fs::create_dir_all(test.0.join(".github")).expect("mkdir");
+        std::fs::write(test.0.join(".github/ci.yml"), "ci").expect("write");
+        std::fs::write(test.0.join("foo.github.txt"), "x").expect("write");
+        let repo = test.open();
+        stage_files(
+            &repo,
+            &[".github/ci.yml".to_string(), "foo.github.txt".to_string()],
+        )
+        .expect("含 .git 子串的正常路径必须正常暂存");
+        let index = repo.open_index().expect("index");
+        assert!(
+            index
+                .entry_by_path_and_stage(
+                    gix::bstr::ByteSlice::as_bstr(b".github/ci.yml"),
+                    Stage::Unconflicted
+                )
+                .is_some(),
+            ".github/ci.yml 必须已暂存"
+        );
+        assert!(
+            index
+                .entry_by_path_and_stage(
+                    gix::bstr::ByteSlice::as_bstr(b"foo.github.txt"),
+                    Stage::Unconflicted
+                )
+                .is_some(),
+            "foo.github.txt 必须已暂存"
+        );
+    }
+
+    /// `.git/../a.txt` 词法消解后不含 .git 组件 → 正常暂存 (git pathspec
+    /// 清理同样先消解再匹配)。
+    #[test]
+    fn dotgit_lexical_escape_is_not_ignored() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        std::fs::write(test.0.join("a.txt"), "two").expect("modify a");
+        let repo = test.open();
+        let result = stage_and_commit(&repo, &[".git/../a.txt".to_string()], "m", "T", "t@e.c")
+            .expect("词法消解后的路径不得被忽略");
+        assert!(
+            result.is_some(),
+            ".git/../a.txt 消解为 a.txt, 真实变更必须提交"
+        );
+    }
+
+    /// 大小写折叠 (codex 复审 P1): macOS 大小写不敏感卷上 `.GIT` 即 `.git`
+    /// 本体; 大小写敏感卷上原生 git 也拒收 `.GIT` 组件 (invalid path)。
+    /// 请求与展开产物两种来路都不得把保留名写进 index。
+    #[test]
+    fn dotgit_case_folded_variants_are_ignored() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        // Linux 下是独立的 .GIT 目录; macOS 下解析进 .git 本体 (临时仓库,
+        // 无碍)。两种平台 walk 层都必须跳过。
+        std::fs::create_dir_all(test.0.join(".GIT")).expect("mkdir .GIT");
+        std::fs::write(test.0.join(".GIT/probe.txt"), "p").expect("write probe");
+        let repo = test.open();
+        stage_files(&repo, &[".GIT".to_string(), ".GIT/probe.txt".to_string()])
+            .expect("大小写折叠的保留名请求必须被忽略");
+        assert_no_dotgit_entries(&repo);
+    }
+
+    /// walk 层文件形态 (codex 复审 P1): worktree/submodule 的 `.git` 是
+    /// **文件**; 目录请求展开时文件形态此前会被推入结果并暂存。
+    #[test]
+    fn dotgit_file_form_inside_walked_dir_is_not_staged() {
+        let test = TestRepo::new();
+        std::fs::create_dir_all(test.0.join("nested")).expect("mkdir nested");
+        std::fs::write(test.0.join("nested/app.txt"), "app").expect("write app");
+        std::fs::write(test.0.join("nested/.git"), "gitdir: ../.git/worktrees/x")
+            .expect("write gitlink file");
+        let repo = test.open();
+        stage_files(&repo, &["nested".to_string()]).expect("目录请求不得失败");
+        let index = repo.open_index().expect("index");
+        assert!(
+            index
+                .entry_by_path_and_stage(
+                    gix::bstr::ByteSlice::as_bstr(b"nested/app.txt"),
+                    Stage::Unconflicted
+                )
+                .is_some(),
+            "nested/app.txt 必须已暂存"
+        );
+        assert_no_dotgit_entries(&repo);
+    }
+
+    /// 工作区内绝对路径目录 (codex 复审 P2): ensure_within 对 base 内的
+    /// 绝对路径放行, 目录展开产出相对子路径 —— 含 `.git` 子串 (`.github`)
+    /// 的绝对目录请求在旧代码可正常暂存, 不得被保留名防护改变为 400。
+    #[test]
+    fn absolute_dir_under_workspace_with_dotgit_substring_stages() {
+        let test = TestRepo::new();
+        std::fs::create_dir_all(test.0.join(".github")).expect("mkdir .github");
+        std::fs::write(test.0.join(".github/ci.yml"), "ci").expect("write ci");
+        let repo = test.open();
+        let absolute = test.0.join(".github");
+        stage_files(&repo, &[absolute.to_string_lossy().into_owned()])
+            .expect("工作区内绝对目录请求必须保持既有可暂存行为");
+        let index = repo.open_index().expect("index");
+        assert!(
+            index
+                .entry_by_path_and_stage(
+                    gix::bstr::ByteSlice::as_bstr(b".github/ci.yml"),
+                    Stage::Unconflicted
+                )
+                .is_some(),
+            ".github/ci.yml 必须已暂存"
+        );
+    }
+
+    /// 旧版毒化条目的受控修复 (codex 复审): index 里已有保留名条目、且
+    /// 磁盘上该路径**存在** (大小写不敏感卷上 `.GIT/*` 解析进真 .git) ——
+    /// 此时既有 NotFound 删除语义帮不上忙, 必须由保留名边界按删除修复,
+    /// 只清保留名条目, 其余暂存内容不动。
+    #[test]
+    fn poisoned_index_reserved_entry_is_repaired() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        // 磁盘上真实存在: Linux 下是独立 .GIT 目录, macOS 下解析进 .git
+        // 本体 (临时仓库, 无碍)。
+        std::fs::create_dir_all(test.0.join(".GIT")).expect("mkdir .GIT");
+        std::fs::write(test.0.join(".GIT/probe.txt"), "p").expect("write probe");
+        let repo = test.open();
+        {
+            let lock = acquire_index_lock(&repo).expect("lock");
+            let mut index = repo.open_index().expect("index");
+            index.dangerously_push_entry(
+                Stat::default(),
+                ObjectId::empty_tree(gix::hash::Kind::Sha1),
+                Flags::empty(),
+                IndexMode::FILE,
+                gix::bstr::ByteSlice::as_bstr(b".GIT/probe.txt"),
+            );
+            index.sort_entries();
+            lock.commit_index(&mut index).expect("write poisoned index");
+        }
+        stage_files(&repo, &[".GIT/probe.txt".to_string()]).expect("保留名请求必须被忽略而非报错");
+        assert_no_dotgit_entries(&repo);
+        // 修复不得动其他条目
+        let index = repo.open_index().expect("index");
+        assert!(
+            index
+                .entry_by_path_and_stage(
+                    gix::bstr::ByteSlice::as_bstr(b"a.txt"),
+                    Stage::Unconflicted
+                )
+                .is_some(),
+            "a.txt 条目必须保留"
+        );
+    }
+
+    /// 历史恢复边界 (codex 复审 ea93a5a4): index 已有毒化条目时, 用户只
+    /// 提交**普通无关文件** (不触碰坏条目) 也必须能成功 —— tree 构造不得
+    /// 再被保留名条目 500 卡死。
+    #[test]
+    fn poisoned_index_unrelated_commit_recovers() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        let repo = test.open();
+        {
+            let lock = acquire_index_lock(&repo).expect("lock");
+            let mut index = repo.open_index().expect("index");
+            index.dangerously_push_entry(
+                Stat::default(),
+                ObjectId::empty_tree(gix::hash::Kind::Sha1),
+                Flags::empty(),
+                IndexMode::FILE,
+                gix::bstr::ByteSlice::as_bstr(b".git/config"),
+            );
+            index.sort_entries();
+            lock.commit_index(&mut index).expect("write poisoned index");
+        }
+        std::fs::write(test.0.join("a.txt"), "two").expect("modify a");
+        let result = stage_and_commit(&repo, &["a.txt".to_string()], "m", "T", "t@e.c")
+            .expect("无关文件提交必须从毒化 index 中恢复, 不得 500");
+        let hash = result.expect("a.txt 真实变更必须提交");
+        let repo = test.open();
+        let commit = repo
+            .find_commit(ObjectId::from_hex(hash.as_bytes()).expect("parse"))
+            .expect("find");
+        assert!(
+            commit
+                .tree()
+                .expect("tree")
+                .lookup_entry_by_path(".git/config")
+                .expect("lookup")
+                .is_none(),
+            "提交树不得包含毒化条目"
+        );
+    }
+
+    /// commit_indexed 的毒化修复必须**落盘** (codex 复审 543bd91f): 只清
+    /// 内存会让磁盘 index 永远带着坏条目 —— 重开仓库后 status 仍显示待
+    /// 提交。断言按复审建议: 重开后磁盘 index 无保留名条目、正常暂存
+    /// 内容进入提交、get_status 不再呈现元数据条目。
+    #[test]
+    fn poisoned_index_commit_indexed_persists_repair() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        std::fs::write(test.0.join("b.txt"), "b").expect("write b");
+        let repo = test.open();
+        stage_files(&repo, &["b.txt".to_string()]).expect("stage b");
+        {
+            let lock = acquire_index_lock(&repo).expect("lock");
+            let mut index = repo.open_index().expect("index");
+            index.dangerously_push_entry(
+                Stat::default(),
+                ObjectId::empty_tree(gix::hash::Kind::Sha1),
+                Flags::empty(),
+                IndexMode::FILE,
+                gix::bstr::ByteSlice::as_bstr(b".git/config"),
+            );
+            index.sort_entries();
+            lock.commit_index(&mut index).expect("write poisoned index");
+        }
+        let hash =
+            commit_indexed(&repo, "c", "T", "t@e.c").expect("独立提交入口必须从毒化 index 恢复");
+        // 重开仓库: 磁盘 index 已修复 (不是只清了内存副本)
+        let repo = test.open();
+        assert_no_dotgit_entries(&repo);
+        let st = get_status(&repo).expect("status");
+        assert!(
+            !st.staged.iter().any(|p| p.starts_with(".git/")),
+            "status 不得再呈现保留名条目: {:?}",
+            st.staged
+        );
+        let commit = repo
+            .find_commit(ObjectId::from_hex(hash.as_bytes()).expect("parse"))
+            .expect("find");
+        let tree = commit.tree().expect("tree");
+        assert!(
+            tree.lookup_entry_by_path("b.txt").expect("lk").is_some(),
+            "正常暂存的 b.txt 必须进入提交"
+        );
+        assert!(
+            tree.lookup_entry_by_path(".git/config")
+                .expect("lk")
+                .is_none(),
+            "提交树不得包含毒化条目"
+        );
+    }
+
+    /// 绝对路径**完整提交链** (codex 复审 ea93a5a4 P2): 展开层已转相对,
+    /// 范围判定与暂存也必须同口径 —— 绝对文件与绝对目录请求都能完成
+    /// stage_and_commit, 不在 scope 归一处 400。
+    #[test]
+    fn absolute_path_commit_roundtrip() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        std::fs::write(test.0.join("a.txt"), "two").expect("modify a");
+        std::fs::create_dir_all(test.0.join(".github")).expect("mkdir .github");
+        std::fs::write(test.0.join(".github/ci.yml"), "ci").expect("write ci");
+        let repo = test.open();
+        let abs_file = test.0.join("a.txt").to_string_lossy().into_owned();
+        let result = stage_and_commit(&repo, &[abs_file], "file", "T", "t@e.c")
+            .expect("绝对文件请求必须完成提交");
+        assert!(result.is_some(), "a.txt 真实变更必须经绝对路径提交");
+        let abs_dir = test.0.join(".github").to_string_lossy().into_owned();
+        let result = stage_and_commit(&repo, &[abs_dir], "dir", "T", "t@e.c")
+            .expect("绝对目录请求必须完成提交");
+        assert!(result.is_some(), ".github 新文件必须经绝对目录提交");
+        let commit = repo
+            .find_commit(ObjectId::from_hex(result.expect("commit").as_bytes()).expect("parse"))
+            .expect("find");
+        assert!(
+            commit
+                .tree()
+                .expect("tree")
+                .lookup_entry_by_path(".github/ci.yml")
+                .expect("lookup")
+                .is_some(),
+            ".github/ci.yml 必须在提交树中"
+        );
+    }
+
+    /// 保护选项跟随仓库配置 (codex 复审 ea93a5a4 P2): `core.protectHFS=false`
+    /// 的仓库里 HFS 别名文件 (`.g`+U+200C+`it`) 原生 git 可正常暂存, 我们
+    /// 不得用平台全开的 Options::default() 静默忽略; 显式开启时才忽略。
+    #[test]
+    fn hfs_alias_follows_repo_protect_config() {
+        use std::io::Write as _;
+        let alias = ".g\u{200c}it";
+        // 关保护: 正常暂存 (对齐 git 在 protectHFS=false 平台的行为)
+        let test = TestRepo::new();
+        std::fs::write(test.0.join(alias), "x").expect("write alias");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(test.0.join(".git/config"))
+            .expect("open config")
+            .write_all(b"\n[core]\n\tprotectHFS = false\n")
+            .expect("append config");
+        let repo = test.open();
+        stage_files(&repo, &[alias.to_string()]).expect("protectHFS=false 时别名文件必须可暂存");
+        let index = repo.open_index().expect("index");
+        assert!(
+            index
+                .entry_by_path_and_stage(alias.as_bytes().as_bstr(), Stage::Unconflicted)
+                .is_some(),
+            "别名文件必须已暂存"
+        );
+        // 开保护: 静默忽略
+        let test = TestRepo::new();
+        std::fs::write(test.0.join(alias), "x").expect("write alias");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(test.0.join(".git/config"))
+            .expect("open config")
+            .write_all(b"\n[core]\n\tprotectHFS = true\n")
+            .expect("append config");
+        let repo = test.open();
+        stage_files(&repo, &[alias.to_string()]).expect("protectHFS=true 时不得报错");
+        let index = repo.open_index().expect("index");
+        assert!(
+            index
+                .entry_by_path_and_stage(alias.as_bytes().as_bstr(), Stage::Unconflicted)
+                .is_none(),
+            "保护开启时别名文件必须被忽略"
+        );
+    }
+
+    /// 修复前: index 重写时间 > a.txt mtime(同秒折叠), racy 判定误信
+    /// 旧 entry 的 stat, 跳过内容读取, 暂存区残留旧 AAA → 漏提交。
+    #[test]
+    fn stage_after_intermediate_index_write_rereads_racy_entry() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "AAA", "init a");
+        commit_file(&test, "b.txt", "xxx", "init b");
+        // 同秒同长度修改 (racy-git 场景)
+        std::fs::write(test.0.join("a.txt"), "BBB").expect("modify a");
+        let repo = test.open();
+        // 先只暂存 b.txt 未变更部分会跳过; a.txt 不在列表
+        stage_path(&repo, "b.txt").expect("stage b only");
+        // 再暂存 a.txt: 必须拾取 BBB, 不得被 stat 快路径吞掉
+        stage_path(&repo, "a.txt").expect("stage a");
+        let index = repo.open_index().expect("index");
+        let entry = index
+            .entry_by_path_and_stage(gix::bstr::ByteSlice::as_bstr(b"a.txt"), Stage::Unconflicted)
+            .expect("a.txt entry");
+        let blob = repo.find_blob(entry.id).expect("blob").data.to_vec();
+        assert_eq!(
+            blob,
+            b"BBB".to_vec(),
+            "racy entry 必须重读内容: 暂存区不得残留旧 AAA"
+        );
+    }
+
+    /// codex 130k 复审 P1 受控反例: 存量仓库里旧版实现写出的 index 无
+    /// smudge, 条目 mtime 与旧检查点同秒; 同秒同长度真实修改 + mtime 钉回,
+    /// 无关文件的暂存 (推进 index 时间戳) 不得洗白该条目的 racy 状态。
+    /// git CLI 得 BBB, 修复前 Rust 残留 AAA。
+    #[test]
+    fn legacy_unsmudged_racy_entry_survives_unrelated_index_write() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "AAA", "init a");
+        commit_file(&test, "b.txt", "xxx", "init b");
+        let repo = test.open();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let pinned = std::time::UNIX_EPOCH + std::time::Duration::from_secs((now - 60) as u64);
+        {
+            // 构造旧版形态: 直接改写磁盘 index 的 a.txt 条目 stat 为
+            // 钉住的时间 (无 smudge), 再把 index 文件 mtime 钉到同一检查点
+            let mut index = repo.open_index().expect("open index");
+            let entry = index
+                .entry_mut_by_path_and_stage(
+                    gix::bstr::ByteSlice::as_bstr(b"a.txt"),
+                    Stage::Unconflicted,
+                )
+                .expect("a.txt entry");
+            entry.stat.mtime.secs = (now - 60) as u32;
+            entry.stat.mtime.nsecs = 0;
+            entry.stat.size = 3;
+            let lock = gix::lock::File::acquire_to_update_resource(
+                repo.index_path(),
+                gix::lock::acquire::Fail::Immediately,
+                None,
+                0,
+            )
+            .expect("raw lock");
+            use std::io::Write as _;
+            let mut lock = lock;
+            {
+                let mut w = std::io::BufWriter::new(&mut lock);
+                index
+                    .write_to(&mut w, IndexWriteOptions::default())
+                    .expect("raw write");
+                w.flush().expect("raw flush");
+            }
+            lock.commit().expect("raw commit");
+        }
+        std::fs::set_times(
+            repo.index_path(),
+            std::fs::FileTimes::new().set_modified(pinned),
+        )
+        .expect("pin index mtime");
+        // 同秒同长度修改 a.txt, mtime 钉回同一时刻 (stat 字段完全一致)
+        std::fs::write(test.0.join("a.txt"), "BBB").expect("modify a");
+        std::fs::set_times(
+            test.0.join("a.txt"),
+            std::fs::FileTimes::new().set_modified(pinned),
+        )
+        .expect("pin a mtime");
+        // 无关暂存推进 index 时间戳 → 再暂存 a.txt: 必须拾取 BBB
+        stage_path(&repo, "b.txt").expect("stage b");
+        stage_path(&repo, "a.txt").expect("stage a");
+        let index = repo.open_index().expect("reopen");
+        let entry = index
+            .entry_by_path_and_stage(gix::bstr::ByteSlice::as_bstr(b"a.txt"), Stage::Unconflicted)
+            .expect("entry");
+        let blob = repo.find_blob(entry.id).expect("blob").data.to_vec();
+        assert_eq!(
+            blob,
+            b"BBB".to_vec(),
+            "存量仓库未 smudge 的 racy 条目在无关 index 重写后必须重新验证"
+        );
+    }
+
+    /// codex 130k 复审 P2: 无变更提交必须把刷新后的 stat 落盘——存量
+    /// 零 stat 仓库经一次显式无变更提交预热后, 磁盘 entry stat 应为真实值,
+    /// 后续轮次可命中快路径。修复前纯 stat 刷新时 tree 不变 → 免写盘 →
+    /// 零 stat 永久残留, 每轮全量重读。
+    #[test]
+    fn nothing_to_commit_persists_refreshed_stat_for_legacy_zero_stat_index() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "AAA", "init a");
+        let repo = test.open();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let pinned = std::time::UNIX_EPOCH + std::time::Duration::from_secs((now - 120) as u64);
+        // 构造旧版零 stat 索引 (mtime=0/size=0), 并钉住 a.txt 与 index 检查点
+        {
+            let mut index = repo.open_index().expect("open");
+            let entry = index
+                .entry_mut_by_path_and_stage(
+                    gix::bstr::ByteSlice::as_bstr(b"a.txt"),
+                    Stage::Unconflicted,
+                )
+                .expect("entry");
+            entry.stat = Stat::default();
+            let lock = gix::lock::File::acquire_to_update_resource(
+                repo.index_path(),
+                gix::lock::acquire::Fail::Immediately,
+                None,
+                0,
+            )
+            .expect("raw lock");
+            use std::io::Write as _;
+            let mut lock = lock;
+            {
+                let mut w = std::io::BufWriter::new(&mut lock);
+                index
+                    .write_to(&mut w, IndexWriteOptions::default())
+                    .expect("raw write");
+                w.flush().expect("raw flush");
+            }
+            lock.commit().expect("raw commit");
+        }
+        std::fs::set_times(
+            repo.index_path(),
+            std::fs::FileTimes::new().set_modified(pinned),
+        )
+        .expect("pin index");
+        std::fs::set_times(
+            test.0.join("a.txt"),
+            std::fs::FileTimes::new().set_modified(pinned),
+        )
+        .expect("pin a");
+        // 连续两次显式无变更提交: 第一次刷新 stat 落盘 (checkpoint 早于
+        // 文件 mtime 的秒 → 不再 smudge), 第二次命中快路径
+        for i in 0..2 {
+            let outcome = stage_and_commit(
+                &repo,
+                &["a.txt".to_string()],
+                &format!("noop{i}"),
+                "T",
+                "t@e.c",
+            )
+            .expect("noop commit must not fail");
+            assert!(outcome.is_none(), "unchanged file must be nothingToCommit");
+        }
+        let index = repo.open_index().expect("reopen");
+        let entry = index
+            .entry_by_path_and_stage(gix::bstr::ByteSlice::as_bstr(b"a.txt"), Stage::Unconflicted)
+            .expect("entry");
+        assert_ne!(
+            entry.stat,
+            Stat::default(),
+            "刷新后的真实 stat 必须落盘, 否则存量仓库永远无法预热快路径"
+        );
+        assert_eq!(entry.stat.size, 3, "size 应为文件真实大小");
+    }
+
+    /// stat 快路径不得吞掉真实变更: 内容或执行位变化必须重新 stage。
+    #[test]
+    fn stage_skips_do_not_swallow_real_changes() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        commit_file(&test, "b.sh", "echo", "add b");
+        let repo = test.open();
+        // 重 stage (未变更, 应跳过) 后再改内容: 仍必须被拾取
+        stage_path(&repo, "a.txt").expect("noop stage");
+        std::fs::write(test.0.join("a.txt"), "changed").expect("change");
+        stage_path(&repo, "a.txt").expect("stage after change");
+        let index = repo.open_index().expect("index");
+        let entry = index
+            .entry_by_path_and_stage(gix::bstr::ByteSlice::as_bstr(b"a.txt"), Stage::Unconflicted)
+            .expect("entry");
+        let blob = repo.find_blob(entry.id).expect("blob").data.to_vec();
+        assert_eq!(blob, b"changed".to_vec(), "内容变更必须重新 stage");
+        assert_ne!(entry.stat, Stat::default(), "entry.stat 必须写真实值");
+    }
+
+    /// 执行位变化 = mode 变化, 不得被 stat 快路径跳过。
+    #[cfg(unix)]
+    #[test]
+    fn stage_mode_change_is_not_skipped() {
+        let test = TestRepo::new();
+        commit_file(&test, "run.sh", "echo", "add run");
+        let repo = test.open();
+        stage_path(&repo, "run.sh").expect("noop stage");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            test.0.join("run.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod +x");
+        stage_path(&repo, "run.sh").expect("stage mode change");
+        let index = repo.open_index().expect("index");
+        let entry = index
+            .entry_by_path_and_stage(
+                gix::bstr::ByteSlice::as_bstr(b"run.sh"),
+                Stage::Unconflicted,
+            )
+            .expect("entry");
+        assert_eq!(entry.mode, IndexMode::FILE_EXECUTABLE, "mode 变更必须生效");
+    }
+
+    /// 批量 stage 中途失败必须原子: 既有暂存保留, 本批任何文件都不落盘
+    /// (codex 审查要求的失败回归)。
+    #[test]
+    fn batch_stage_failure_preserves_prior_staging_and_stages_nothing() {
+        let test = TestRepo::new();
+        commit_file(&test, "base.txt", "base", "add base");
+        std::fs::write(test.0.join("staged-earlier.txt"), "earlier").expect("write earlier");
+        let repo = test.open();
+        // 先单独 stage 一个文件 (模拟用户此前已暂存的内容)
+        stage_path(&repo, "staged-earlier.txt").expect("stage earlier");
+        let before = std::fs::read(repo.index_path()).expect("index bytes");
+
+        // 批量 [新文件, stat 注入失败]: 整批失败
+        std::fs::write(test.0.join("new-in-batch.txt"), "new").expect("write new");
+        let files = vec![
+            "new-in-batch.txt".to_string(),
+            "staged-earlier.txt".to_string(),
+        ];
+        let error = {
+            let mut index = repo.open_index().expect("open index");
+            let result = stage_paths_with_probe(&repo, &mut index, &files, |path| {
+                if path.ends_with("new-in-batch.txt") {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected",
+                    ))
+                } else {
+                    gix::index::fs::Metadata::from_path_no_follow(path)
+                }
+            });
+            match result {
+                Ok(_) => panic!("batch with injected stat failure must fail"),
+                Err(error) => error,
+            }
+        };
+        assert!(matches!(error, AppError::System(_)));
+
+        // index 逐字节不变: 既有暂存保留, 批内新文件未写入
+        assert_eq!(
+            std::fs::read(repo.index_path()).expect("index after failure"),
+            before
+        );
+        let st = get_status(&repo).expect("status");
+        assert!(
+            st.staged.iter().any(|f| f == "staged-earlier.txt"),
+            "prior staging must survive: {:?}",
+            st.staged
+        );
+        assert!(
+            !st.staged.iter().any(|f| f == "new-in-batch.txt"),
+            "failed batch must not stage anything"
+        );
+    }
+
+    /// 外部进程持有的新鲜 index.lock: stage 必须明确失败, 不覆盖不抢锁
+    /// (codex 复现的 a+b → 仅 a 静默丢失场景, 修复后应报冲突)。
+    /// 锁等待有退避上限, 该测试会占用 INDEX_LOCK_WAIT (10s) 一次。
+    #[test]
+    fn fresh_external_index_lock_is_refused_not_overwritten() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "a", "add a");
+        std::fs::write(test.0.join("b.txt"), "b").expect("write b");
+        let repo = test.open();
+
+        // 模拟外部 git CLI 持锁: 手工创建新鲜 index.lock
+        let lock_path = index_lock_path(&repo.index_path());
+        std::fs::write(&lock_path, b"partial").expect("create lock");
+
+        let error = stage_files(&repo, &["b.txt".to_string()])
+            .expect_err("fresh external lock must be refused");
+        assert!(
+            format!("{error}").contains("index.lock"),
+            "error should mention index.lock: {error}"
+        );
+        // 锁未被抢走, index 未被写: 外部暂存语义不受影响
+        assert!(lock_path.exists(), "live lock must not be stolen");
+        // 清理: 释放后 stage 可正常完成
+        std::fs::remove_file(&lock_path).expect("remove lock");
+        stage_files(&repo, &["b.txt".to_string()]).expect("stage after lock release");
+        let st = get_status(&repo).expect("status");
+        assert!(st.staged.iter().any(|f| f == "b.txt"));
+    }
+
+    /// 未解决冲突条目必须拒绝提交 (codex v4 P1 既有缺陷回归):
+    /// 旧实现静默跳过非 Unconflicted 条目, 冲突文件从提交树消失。
+    #[test]
+    fn commit_rejects_unresolved_conflict_entries() {
+        let test = TestRepo::new();
+        commit_file(&test, "f.txt", "base", "base");
+        let repo = test.open();
+
+        // 构造冲突 index: 同路径追加 stage 位非 0 的 entry ( Theirs )
+        use gix::bstr::ByteSlice as _;
+        let mut index = repo.open_index().expect("open index");
+        let blob = repo.write_blob(b"theirs").expect("blob").detach();
+        index.dangerously_push_entry(
+            Stat::default(),
+            blob,
+            Flags::from_bits_retain(Flags::STAGE_MASK.bits()),
+            IndexMode::FILE,
+            b"f.txt".as_bstr(),
+        );
+        index.sort_entries();
+        let mut lock = gix::lock::File::acquire_to_update_resource(
+            repo.index_path(),
+            gix::lock::acquire::Fail::Immediately,
+            None,
+            0,
+        )
+        .expect("lock for fixture write");
+        {
+            use std::io::Write as _;
+            let mut writer = std::io::BufWriter::new(&mut lock);
+            index
+                .write_to(&mut writer, IndexWriteOptions::default())
+                .expect("write conflicted index");
+            writer.flush().expect("flush");
+        }
+        lock.commit().expect("commit fixture index");
+
+        let error = commit_indexed(&repo, "on conflict", "Test", "test@example.com")
+            .expect_err("conflicted index must be rejected");
+        assert!(
+            format!("{error}").contains("unresolved merge conflict"),
+            "error should explain the conflict: {error}"
+        );
+        // HEAD 未动
+        assert!(
+            repo.head_commit().is_ok(),
+            "HEAD must remain valid after rejection"
+        );
+    }
+
+    /// 范围键归一化: `./` 段 (前导/中间)、重复分隔符、尾斜杠、`..` 词法消解、
+    /// 根目录请求与拒绝形态。
+    #[test]
+    fn scope_path_normalizes_dot_and_duplicate_separators() {
+        assert_eq!(normalize_relative_path("./a.txt").unwrap(), "a.txt");
+        assert_eq!(normalize_relative_path("a/./b.txt").unwrap(), "a/b.txt");
+        assert_eq!(normalize_relative_path("a//b.txt").unwrap(), "a/b.txt");
+        assert_eq!(normalize_relative_path("dir/").unwrap(), "dir");
+        assert_eq!(normalize_relative_path("dir").unwrap(), "dir");
+        // 根目录请求 → 空串 = 整个工作区范围
+        assert_eq!(normalize_relative_path(".").unwrap(), "");
+        assert_eq!(normalize_relative_path("./").unwrap(), "");
+        // `..` 词法消解 (栈式回退, 对齐 git pathspec 清理)
+        assert_eq!(normalize_relative_path("a/../b.txt").unwrap(), "b.txt");
+        assert_eq!(
+            normalize_relative_path("dir/sub/../x.txt").unwrap(),
+            "dir/x.txt"
+        );
+        // 越出工作区根 / 绝对路径 → 拒绝
+        assert!(normalize_relative_path("../escape.txt").is_err());
+        assert!(normalize_relative_path("a/../../escape.txt").is_err());
+        assert!(normalize_relative_path("/abs/path.txt").is_err());
+    }
+
+    /// 反斜杠的分隔符语义按平台断言 (FS-08): Windows 归一为 `/`,
+    /// POSIX 视为合法文件名字符原样保留。
+    #[test]
+    fn scope_path_backslash_follows_platform_contract() {
+        #[cfg(windows)]
+        assert_eq!(normalize_relative_path("a\\b.txt").unwrap(), "a/b.txt");
+        #[cfg(not(windows))]
+        assert_eq!(normalize_relative_path("a\\b.txt").unwrap(), "a\\b.txt");
+    }
+
+    /// codex r8 P2: 根目录请求 (`.`) 是整个工作区范围, 任一暂存变更都必须提交
+    /// (归一为空串后由 in_scope 解释为全仓, 修复前匹配不到任何条目)。
+    #[test]
+    fn explicit_commit_with_root_scope_detects_staged_changes() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        let repo = test.open();
+        // b 暂存另一版本; 请求 "." (全仓范围) → 必须提交
+        std::fs::write(test.0.join("b.txt"), "staged-b").expect("write b");
+        stage_files(&repo, &["b.txt".to_string()]).expect("stage b");
+        let result = stage_and_commit(&repo, &[".".to_string()], "root", "T", "t@e.c")
+            .expect("must not fail");
+        assert!(result.is_some(), "root scope must see the staged change");
+
+        // "./" 同义
+        std::fs::write(test.0.join("c.txt"), "staged-c").expect("write c");
+        stage_files(&repo, &["c.txt".to_string()]).expect("stage c");
+        let result = stage_and_commit(&repo, &["./".to_string()], "root2", "T", "t@e.c")
+            .expect("must not fail");
+        assert!(result.is_some(), "./ root scope must see the staged change");
+    }
+
+    /// codex r8 P2: 带 `..` 的请求路径按 git pathspec 语义词法消解后生效。
+    #[test]
+    fn explicit_commit_resolves_dotdot_in_requested_scope() {
+        let test = TestRepo::new();
+        commit_file(&test, "b.txt", "original", "add b");
+        let repo = test.open();
+        // 请求 "x/../b.txt" → 范围键 "b.txt"; b 有变更必须提交
+        std::fs::write(test.0.join("b.txt"), "changed").expect("change b");
+        let result = stage_and_commit(&repo, &["x/../b.txt".to_string()], "dotdot", "T", "t@e.c")
+            .expect("must not fail");
+        assert!(
+            result.is_some(),
+            "lexically resolved scope must see the change"
+        );
+        // 越出工作区根的请求 → 拒绝
+        let error = stage_and_commit(&repo, &["../outside.txt".to_string()], "esc", "T", "t@e.c")
+            .expect_err("escape must be rejected");
+        // 越界在 staging 边界被 ensure_within 拒绝 (上游分层防御,
+        // 消息为 path_safety 的 "cannot exceed project directory")
+        assert!(
+            format!("{error}").contains("not safe") || format!("{error}").contains("escapes"),
+            "escape request must be rejected with a path-safety error: {error}"
+        );
+    }
+
+    /// codex r7 P2: 请求目录时, 目录内**已暂存的删除**必须算变更
+    /// (展开现存文件的手写判定会漏掉)。
+    #[test]
+    fn explicit_commit_detects_staged_deletion_inside_requested_dir() {
+        let test = TestRepo::new();
+        std::fs::create_dir_all(test.0.join("dir")).expect("mkdir dir");
+        commit_file(&test, "dir/gone.txt", "v", "add gone");
+        commit_file(&test, "dir/keep.txt", "k", "add keep");
+        let repo = test.open();
+
+        // 暂存删除 gone.txt (工作区删除 + stage 删除)
+        std::fs::remove_file(test.0.join("dir/gone.txt")).expect("remove");
+        stage_files(&repo, &["dir/gone.txt".to_string()]).expect("stage deletion");
+        // 工作区再无 dir 下其他变更; 请求整个 dir 目录
+        let result = stage_and_commit(&repo, &["dir".to_string()], "rm gone", "T", "t@e.c")
+            .expect("must not fail");
+        let hash = result.expect("staged deletion inside requested dir must commit");
+        let commit = repo
+            .find_commit(ObjectId::from_hex(hash.as_bytes()).expect("parse"))
+            .expect("find");
+        let tree = commit.tree().expect("tree");
+        assert!(
+            tree.lookup_entry_by_path("dir/gone.txt")
+                .expect("lk")
+                .is_none(),
+            "deletion must be published"
+        );
+        assert!(
+            tree.lookup_entry_by_path("dir/keep.txt")
+                .expect("lk")
+                .is_some(),
+            "sibling file must survive"
+        );
+    }
+
+    /// codex r7 P2: 文件类型变化 (普通文件 ↔ 符号链接, blob 内容相同) 必须算变更。
+    #[cfg(unix)]
+    #[test]
+    fn explicit_commit_detects_type_change_between_file_and_symlink() {
+        let test = TestRepo::new();
+        // 普通文件内容恰为符号链接目标路径 → 两种形态 blob 相同
+        commit_file(&test, "target.txt", "target.txt", "add target");
+        commit_file(&test, "link.txt", "target.txt", "add as file");
+        let repo = test.open();
+
+        // link.txt 改为指向 target.txt 的符号链接 (内容与原普通文件相同)
+        std::fs::remove_file(test.0.join("link.txt")).expect("remove file");
+        std::os::unix::fs::symlink("target.txt", test.0.join("link.txt")).expect("symlink");
+        let result = stage_and_commit(&repo, &["link.txt".to_string()], "to symlink", "T", "t@e.c")
+            .expect("must not fail");
+        let hash = result.expect("type change must commit despite identical blob");
+        let commit = repo
+            .find_commit(ObjectId::from_hex(hash.as_bytes()).expect("parse"))
+            .expect("find");
+        let tree = commit.tree().expect("tree");
+        let entry = tree
+            .lookup_entry_by_path("link.txt")
+            .expect("lk")
+            .expect("present");
+        assert!(
+            entry.mode().is_link(),
+            "published entry must be the symlink form"
+        );
+    }
+
+    /// TS 契约对齐 (nativeCommitFiles/isoCommitFiles): 显式列表提交的
+    /// nothingToCommit 看**请求路径**的暂存差异——请求文件无变化时不提交,
+    /// 其他文件的已暂存内容原样保留, 不连带发布。
+    #[test]
+    fn explicit_commit_without_requested_change_keeps_unrelated_staging() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "original-a", "add a");
+        let repo = test.open();
+        let head_before = repo.head_commit().expect("head").id().to_string();
+
+        // b.txt 暂存另一版本 (与本次请求无关)
+        std::fs::write(test.0.join("b.txt"), "staged-b").expect("write b");
+        stage_files(&repo, &["b.txt".to_string()]).expect("stage b");
+
+        // 请求 a.txt (内容与 HEAD 一致) → nothingToCommit, b 的暂存保留
+        let result = stage_and_commit(&repo, &["a.txt".to_string()], "m", "T", "t@e.c")
+            .expect("must not fail");
+        assert!(
+            result.is_none(),
+            "requested path unchanged → nothingToCommit"
+        );
+        assert_eq!(
+            repo.head_commit().expect("head").id().to_string(),
+            head_before,
+            "HEAD must not move"
+        );
+
+        // 重开仓库验证磁盘暂存: b.txt 仍在暂存区
+        let reopened = open(&test.0).expect("reopen");
+        let st = get_status(&reopened).expect("status");
+        assert_eq!(
+            st.staged,
+            vec!["b.txt".to_string()],
+            "unrelated staging must survive: {:?}",
+            st.staged
+        );
+
+        // 之后提交 b.txt → 正常发布 (整个暂存区只有 b 的差异)
+        let hash = stage_and_commit(&reopened, &["b.txt".to_string()], "commit b", "T", "t@e.c")
+            .expect("commit b")
+            .expect("hash");
+        assert_ne!(hash, head_before);
+    }
+
+    /// TS 契约: 请求路径有变更时, 提交体是**整个暂存区** (nativeCommitStaged),
+    /// 无关文件已暂存的差异会随本次提交一起发布。
+    #[test]
+    fn explicit_commit_with_requested_change_publishes_whole_staging() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "original-a", "add a");
+        let repo = test.open();
+
+        // b 先暂存另一版本
+        std::fs::write(test.0.join("b.txt"), "staged-b").expect("write b");
+        stage_files(&repo, &["b.txt".to_string()]).expect("stage b");
+        // 请求 a.txt 且确有变更 → 提交应包含 b 的暂存内容
+        std::fs::write(test.0.join("a.txt"), "changed-a").expect("change a");
+        let hash = stage_and_commit(&repo, &["a.txt".to_string()], "m", "T", "t@e.c")
+            .expect("commit")
+            .expect("hash");
+
+        let commit = repo
+            .find_commit(ObjectId::from_hex(hash.as_bytes()).expect("parse"))
+            .expect("find commit");
+        let tree = commit.tree().expect("tree");
+        let b = tree
+            .lookup_entry_by_path("b.txt")
+            .expect("lookup b")
+            .expect("b committed");
+        let blob = repo
+            .find_object(b.id())
+            .expect("find blob b")
+            .try_into_blob()
+            .expect("blob");
+        let blob_data: &[u8] = blob.data.as_ref();
+        assert_eq!(
+            blob_data,
+            b"staged-b".as_slice(),
+            "unrelated staged content must be published with the whole staging area"
+        );
+    }
+
+    /// TS 契约: unborn + 无任何暂存 → 不创建空的首提交。
+    #[test]
+    fn unborn_empty_commit_creates_no_root_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).expect("mkdir");
+        // 走生产入口 ensure_repo (含缺 index 自愈), 与 handler 行为一致
+        drop(super::super::ensure_repo(&ws).expect("ensure_repo"));
+        let repo = open(&ws).expect("open unborn repo");
+        assert!(repo.head().expect("head").is_unborn());
+
+        // 空列表 addAll, 无任何暂存 → None, 不创建首提交
+        let result = stage_and_commit(&repo, &[], "empty", "T", "t@e.c").expect("must not fail");
+        assert!(
+            result.is_none(),
+            "unborn + empty staging must be nothingToCommit"
+        );
+        assert!(
+            repo.head().expect("head after").is_unborn(),
+            "no root commit must be created"
+        );
+
+        // 有真实文件 → 正常创建首提交
+        std::fs::write(ws.join("f.txt"), "first").expect("write f");
+        let hash = stage_and_commit(&repo, &["f.txt".to_string()], "root", "T", "t@e.c")
+            .expect("commit")
+            .expect("hash");
+        assert!(!hash.is_empty());
+        assert!(!repo.head().expect("head").is_unborn());
+    }
+
+    /// 事务化 stage+commit: 显式列表提交 / nothingToCommit / 冲突传播。
+    #[test]
+    fn stage_and_commit_commits_and_detects_nothing_to_commit() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        let repo = test.open();
+
+        // 修改后提交 → Some(hash), 只含该变更
+        std::fs::write(test.0.join("a.txt"), "two").expect("modify a");
+        let hash = stage_and_commit(&repo, &["a.txt".to_string()], "m1", "T", "t@e.c")
+            .expect("commit")
+            .expect("must produce a commit");
+        assert!(!hash.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(test.0.join("a.txt")).expect("worktree intact"),
+            "two"
+        );
+
+        // 内容未变重提交 → None (nothingToCommit, 不写 index 不发布)
+        let again = stage_and_commit(&repo, &["a.txt".to_string()], "m2", "T", "t@e.c")
+            .expect("no-error on nothing to commit");
+        assert!(again.is_none(), "unchanged content must be nothingToCommit");
+        assert_eq!(
+            repo.head_commit().expect("head").id().to_string(),
+            hash,
+            "nothingToCommit must not move HEAD"
+        );
+
+        // 新文件 addAll (空列表) → Some
+        std::fs::write(test.0.join("b.txt"), "b").expect("add b");
+        let hash2 = stage_and_commit(&repo, &[], "m3", "T", "t@e.c")
+            .expect("addAll commit")
+            .expect("commit hash");
+        assert_ne!(hash, hash2);
+    }
+
+    /// nothingToCommit 也必须落盘本批对暂存区的有效修改 (codex 终审 P1):
+    /// 旧暂存内容与 HEAD 有差异, 用户把工作树恢复成 HEAD 内容后提交——
+    /// 结果应是 None (无新 commit) 且旧暂存从磁盘 index 消失。
+    #[test]
+    fn nothing_to_commit_persists_staging_restoration() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "original", "add a");
+        let repo = test.open();
+
+        // 暂存另一版本
+        std::fs::write(test.0.join("a.txt"), "old-staged-content").expect("stage v2");
+        stage_files(&repo, &["a.txt".to_string()]).expect("stage");
+        // 工作树恢复为 HEAD 内容
+        std::fs::write(test.0.join("a.txt"), "original").expect("restore");
+
+        let result = stage_and_commit(&repo, &["a.txt".to_string()], "m", "T", "t@e.c")
+            .expect("commit must not fail");
+        assert!(result.is_none(), "tree==HEAD → nothingToCommit");
+
+        // 旧暂存必须已从磁盘 index 消失 (重新打开仓库验证, 排除内存态)
+        let reopened = open(&test.0).expect("reopen repo");
+        let st = get_status(&reopened).expect("status after");
+        assert!(
+            st.staged.is_empty(),
+            "stale staging must be gone from disk index: {:?}",
+            st.staged
+        );
+        // 再次提交同文件 → 仍 None, HEAD 不动
+        assert!(
+            stage_and_commit(&reopened, &["a.txt".to_string()], "m2", "T", "t@e.c")
+                .expect("retry")
+                .is_none()
+        );
+    }
+
+    /// 多文件全部恢复: 显式列表只控制暂存范围, 提交的是整个 index——
+    /// 当全部暂存差异被恢复抵消时 nothingToCommit, 磁盘暂存区同步清空。
+    #[test]
+    fn nothing_to_commit_persists_multi_file_restoration() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "original-a", "add a");
+        commit_file(&test, "b.txt", "original-b", "add b");
+        let repo = test.open();
+
+        std::fs::write(test.0.join("a.txt"), "staged-a").expect("stage a v2");
+        std::fs::write(test.0.join("b.txt"), "staged-b").expect("stage b v2");
+        stage_files(&repo, &["a.txt".to_string(), "b.txt".to_string()]).expect("stage");
+        // 两文件都恢复成 HEAD 内容后提交 (addAll 空列表路径)
+        std::fs::write(test.0.join("a.txt"), "original-a").expect("restore a");
+        std::fs::write(test.0.join("b.txt"), "original-b").expect("restore b");
+
+        let result = stage_and_commit(&repo, &[], "m", "T", "t@e.c").expect("addAll must not fail");
+        assert!(result.is_none(), "全部暂存差异被抵消 → nothingToCommit");
+
+        let reopened = open(&test.0).expect("reopen repo");
+        let st = get_status(&reopened).expect("status");
+        assert!(
+            st.staged.is_empty(),
+            "stale staging must be gone: {:?}",
+            st.staged
+        );
+    }
+
+    /// 捕获后被删除的分支: 严格 CAS 必须报冲突且**不复活**分支 (codex 终审 P2)。
+    #[test]
+    fn publish_cas_refuses_deleted_branch_without_recreating() {
+        let test = TestRepo::new();
+        let first = commit_file(&test, "a.txt", "a", "add a");
+        let repo = test.open();
+
+        // 捕获 main 的 parent, 然后删除 main
+        let head = repo.head().expect("head");
+        let parent = head.into_peeled_id().expect("peel").detach();
+        {
+            use gix::refs::FullName;
+            use gix::refs::transaction::{Change, PreviousValue, RefEdit, RefLog};
+            repo.edit_references(std::iter::once(RefEdit {
+                change: Change::Delete {
+                    expected: PreviousValue::Any,
+                    log: RefLog::AndReference,
+                },
+                name: FullName::try_from("refs/heads/main").expect("valid name"),
+                deref: false,
+            }))
+            .expect("delete main");
+        }
+
+        // 按捕获的 parent 发布 → 官方 HEAD 严格 CAS 必须冲突
+        let index = repo.open_index().expect("index");
+        let new_tree = tree_id_from_index(&repo, &index).expect("tree");
+        let error = commit_to_head(
+            &repo,
+            "orphan",
+            new_tree,
+            std::slice::from_ref(&parent),
+            "T",
+            "t@e.c",
+        )
+        .expect_err("deleted branch must conflict");
+
+        // 分支不得被复活
+        assert!(
+            repo.find_reference("refs/heads/main").is_err(),
+            "deleted branch must not be recreated: {error}"
+        );
+        drop(first);
+    }
+
+    /// CAS 冲突后的可恢复性: 发布冲突不留下任何锁定/损坏状态,
+    /// 下一次 stage_and_commit 立即按最新 HEAD 正常提交。
+    #[test]
+    fn repo_stays_usable_after_publish_conflict() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "a", "add a");
+        let repo = test.open();
+
+        // 用过期的 parent 模拟"捕获后引用被外部前进"的发布冲突
+        let stale_parent = repo
+            .head()
+            .expect("head")
+            .into_peeled_id()
+            .expect("peel")
+            .detach();
+        // 外部先前进 main (模拟并发提交)
+        std::fs::write(test.0.join("b.txt"), "external").expect("external file");
+        stage_files(&repo, &[]).expect("external stage");
+        commit_indexed(&repo, "external commit", "T", "t@e.c").expect("external commit lands");
+        let advanced = repo
+            .head()
+            .expect("head")
+            .into_peeled_id()
+            .expect("peel")
+            .detach();
+        assert_ne!(stale_parent, advanced, "前置: 外部已前进 main");
+
+        // 拿旧 parent 发布 → 官方 HEAD 严格 CAS 必须冲突
+        let index = repo.open_index().expect("index");
+        let tree = tree_id_from_index(&repo, &index).expect("tree");
+        let conflict = commit_to_head(
+            &repo,
+            "stale attempt",
+            tree,
+            std::slice::from_ref(&stale_parent),
+            "T",
+            "t@e.c",
+        )
+        .expect_err("stale parent must conflict");
+        assert!(
+            format!("{conflict}").contains("reference"),
+            "error should mention the reference conflict: {conflict}"
+        );
+        // main 仍指向外部提交, 未被覆盖/未复活
+        let current = repo
+            .head()
+            .expect("head after conflict")
+            .into_peeled_id()
+            .expect("peel")
+            .detach();
+        assert_eq!(
+            current, advanced,
+            "external commit must survive the conflict"
+        );
+
+        // 冲突后正常提交立即成功 (重新捕获最新 HEAD)
+        std::fs::write(test.0.join("a.txt"), "retry content").expect("modify");
+        let hash = stage_and_commit(
+            &repo,
+            &["a.txt".to_string()],
+            "after conflict",
+            "T",
+            "t@e.c",
+        )
+        .expect("repo must remain usable after publish conflict")
+        .expect("commit hash");
+        let parent_of_new = repo
+            .find_commit(ObjectId::from_hex(hash.as_bytes()).expect("parse hash"))
+            .expect("find new commit")
+            .parent_ids()
+            .next()
+            .map(|id| id.detach());
+        assert_eq!(
+            parent_of_new,
+            Some(advanced),
+            "retry must land on the advanced (external) head, not the stale one"
+        );
+    }
+
+    /// 分支提交必须同步更新 HEAD reflog (codex r6 P2):
+    /// 此前直写分支漏 HEAD 日志, `git reflog` 停在旧提交, 影响 `HEAD@{n}` 定位。
+    /// 覆盖: 普通分支提交 / unborn 首次提交 / detached HEAD。
+    #[test]
+    fn commit_updates_head_reflog() {
+        let test = TestRepo::new();
+        // unborn 首次提交: HEAD reflog 应记录 root commit
+        let root = commit_file(&test, "a.txt", "a", "root commit");
+        assert_head_reflog_ends_with(&test.0, &root, "unborn root commit");
+
+        // 普通分支提交
+        let repo = test.open();
+        std::fs::write(test.0.join("a.txt"), "v2").expect("modify");
+        let second = stage_and_commit(&repo, &["a.txt".to_string()], "second", "T", "t@e.c")
+            .expect("commit")
+            .expect("hash");
+        assert_head_reflog_ends_with(&test.0, &second, "branch commit");
+
+        // detached HEAD 提交: 直接把 HEAD 写成 oid
+        std::fs::write(test.0.join(".git/HEAD"), format!("{root}\n")).expect("detach HEAD");
+        std::fs::write(test.0.join("a.txt"), "v3").expect("modify again");
+        let detached_repo = test.open();
+        let detached = stage_and_commit(
+            &detached_repo,
+            &["a.txt".to_string()],
+            "detached",
+            "T",
+            "t@e.c",
+        )
+        .expect("commit")
+        .expect("hash");
+        assert_head_reflog_ends_with(&test.0, &detached, "detached commit");
+    }
+
+    fn assert_head_reflog_ends_with(workdir: &Path, expected_hex: &str, case: &str) {
+        let reflog = std::fs::read_to_string(workdir.join(".git/logs/HEAD"))
+            .unwrap_or_else(|_| panic!("{case}: HEAD reflog missing"));
+        let last_new_oid = reflog
+            .lines()
+            .last()
+            .unwrap_or_else(|| panic!("{case}: HEAD reflog empty"))
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_else(|| panic!("{case}: malformed reflog line"));
+        assert_eq!(
+            last_new_oid, expected_hex,
+            "{case}: HEAD reflog must end with the new commit"
         );
     }
 
@@ -567,11 +2709,106 @@ mod tests {
         }
     }
 
+    /// 断言 index 内没有任何 `.git` 前缀条目 (大小写折叠; stage 侧不得毒化 index)。
+    fn assert_no_dotgit_entries(repo: &Repository) {
+        let index = repo.open_index().expect("index");
+        let backing = index.path_backing();
+        let leaked: Vec<_> = index
+            .entries()
+            .iter()
+            .map(|e| e.path_in(backing).to_str_lossy().into_owned())
+            .filter(|p| {
+                let low = p.to_lowercase();
+                low == ".git" || low.starts_with(".git/")
+            })
+            .collect();
+        assert!(leaked.is_empty(), "index 不得包含 .git 条目: {leaked:?}");
+    }
+
     fn commit_file(test: &TestRepo, path: &str, data: &str, message: &str) -> String {
         std::fs::write(test.0.join(path), data).expect("write fixture");
         let repo = test.open();
         stage_path(&repo, path).expect("stage fixture");
         commit_indexed(&repo, message, "Test", "test@example.com").expect("commit fixture")
+    }
+
+    #[test]
+    fn stage_files_batches_mixed_ops_into_single_commit() {
+        let test = TestRepo::new();
+        commit_file(&test, "a.txt", "one", "add a");
+        commit_file(&test, "b.txt", "two", "add b");
+        commit_file(&test, "c.txt", "three", "add c");
+        // 修改 a + 删除 b + 新增 d, 路径列表含重复项 (幂等)
+        std::fs::write(test.0.join("a.txt"), "one-mod").expect("modify a");
+        std::fs::remove_file(test.0.join("b.txt")).expect("remove b");
+        std::fs::write(test.0.join("d.txt"), "new").expect("add d");
+        let repo = test.open();
+        let files = vec![
+            "a.txt".to_string(),
+            "b.txt".to_string(),
+            "d.txt".to_string(),
+            "a.txt".to_string(),
+        ];
+        stage_files(&repo, &files).expect("batch stage");
+        let st = get_status(&repo).expect("status");
+        let mut staged = st.staged.clone();
+        staged.sort();
+        assert_eq!(staged, vec!["a.txt", "b.txt", "d.txt"]);
+        commit_indexed(&repo, "batch", "Test", "test@example.com").expect("commit");
+        let tree = repo.head_tree().expect("head tree");
+        assert!(
+            tree.lookup_entry_by_path("b.txt")
+                .expect("lookup")
+                .is_none()
+        );
+        assert!(
+            tree.lookup_entry_by_path("d.txt")
+                .expect("lookup")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn stage_files_expands_directory_paths() {
+        let test = TestRepo::new();
+        std::fs::create_dir_all(test.0.join("dir/nested")).expect("create dirs");
+        commit_file(&test, "dir/outer.txt", "outer", "add outer");
+        commit_file(&test, "dir/nested/inner.txt", "inner", "add inner");
+        std::fs::write(test.0.join("dir/nested/inner.txt"), "inner-mod").expect("modify nested");
+        std::fs::write(test.0.join("dir/new.txt"), "new").expect("add new in dir");
+        let repo = test.open();
+        stage_files(&repo, &["dir".to_string()]).expect("stage dir");
+        let st = get_status(&repo).expect("status");
+        let mut staged = st.staged.clone();
+        staged.sort();
+        assert_eq!(staged, vec!["dir/nested/inner.txt", "dir/new.txt"]);
+    }
+
+    #[test]
+    fn stage_files_empty_list_stages_all_changes() {
+        let test = TestRepo::new();
+        commit_file(&test, "base.txt", "base", "base");
+        std::fs::write(test.0.join("base.txt"), "mod").expect("modify");
+        std::fs::write(test.0.join("untracked.txt"), "new").expect("untracked");
+        std::fs::remove_file(test.0.join("base.txt")).expect("replace by delete below");
+        std::fs::write(test.0.join("extra.txt"), "extra").expect("extra untracked");
+        let repo = test.open();
+        stage_files(&repo, &[]).expect("stage all");
+        let st = get_status(&repo).expect("status");
+        let mut staged = st.staged.clone();
+        staged.sort();
+        // base.txt 的删除也进入 staged (git add -A 语义)
+        assert_eq!(staged, vec!["base.txt", "extra.txt", "untracked.txt"]);
+    }
+
+    #[test]
+    fn stage_files_unchanged_paths_leave_staged_empty() {
+        let test = TestRepo::new();
+        commit_file(&test, "same.txt", "same", "add");
+        let repo = test.open();
+        stage_files(&repo, &["same.txt".to_string()]).expect("stage unchanged");
+        let st = get_status(&repo).expect("status");
+        assert!(st.staged.is_empty(), "重 stage 未变更文件必须产生空 staged");
     }
 
     #[test]
@@ -620,6 +2857,128 @@ mod tests {
             "path traversal must be rejected before any fs op"
         );
         assert!(!outside.exists(), "no fs side effect outside workdir");
+    }
+
+    /// codex r8-rereview P1: 归一化前的请求形态必须走同一条规范键——此前
+    /// `ensure_within` 内部已归一 (FS 落点正确) 而 HEAD 查询用原始串,
+    /// `x/../b.txt` 在 tree 里查不到条目 → 误判 untracked: 删工作区文件 +
+    /// stage 一次删除 (与 discard 语义相反)。
+    #[test]
+    fn discard_resolves_dotdot_before_head_lookup() {
+        let test = TestRepo::new();
+        commit_file(&test, "b.txt", "head", "add b");
+        std::fs::write(test.0.join("b.txt"), "modified").expect("modify fixture");
+        let repo = test.open();
+
+        let buckets =
+            discard_files(&repo, &["x/../b.txt".to_string()]).expect("discard with dotdot");
+        assert_eq!(
+            buckets.tracked_files,
+            vec!["b.txt".to_string()],
+            "dotdot request must be reported under its canonical key"
+        );
+        assert!(
+            buckets.new_files.is_empty() && buckets.untracked_files.is_empty(),
+            "tracked file must not be misclassified as new/untracked"
+        );
+        // 工作区恢复到 HEAD 内容 (未被误删)
+        assert_eq!(
+            std::fs::read_to_string(test.0.join("b.txt")).unwrap(),
+            "head"
+        );
+        // index 未残留删除: 条目仍在且等于 HEAD
+        let index = repo.open_index().expect("open index");
+        let entry = index
+            .entry_by_path_and_stage("b.txt".into(), Stage::Unconflicted)
+            .expect("b.txt must stay tracked in index");
+        let head_entry = repo
+            .head_tree()
+            .expect("head tree")
+            .lookup_entry_by_path("b.txt")
+            .expect("head lookup")
+            .expect("head entry");
+        assert_eq!(entry.id, head_entry.id().detach());
+        assert!(
+            !test.0.join("x").exists(),
+            "raw request must not create a stray directory"
+        );
+    }
+
+    /// 目录请求 fail-fast: `stage_path` 的目录展开会把整棵子树 stage 进 index
+    /// (等于 add, 与 discard 相反), 旧路径只会留下一条 remove_file 失败 WARN。
+    #[test]
+    fn discard_rejects_directory_request() {
+        let test = TestRepo::new();
+        std::fs::create_dir_all(test.0.join("src")).expect("mkdir");
+        commit_file(&test, "src/a.txt", "v", "add a");
+        let repo = test.open();
+
+        let error = discard_files(&repo, &["src".to_string()])
+            .expect_err("directory request must be rejected");
+        assert!(
+            format!("{error}").contains("must be a file"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(test.0.join("src/a.txt")).unwrap(),
+            "v",
+            "rejected request must not touch the worktree"
+        );
+        let status = get_status(&repo).expect("status");
+        assert!(
+            status.staged.is_empty(),
+            "rejected request must not stage the subtree: {:?}",
+            status.staged
+        );
+    }
+
+    /// codex r8-rereview P2: tree↔index 范围判定不继承 `core.ignoreCase`
+    /// (对齐 gix `status/tree_index` 默认 false; 只有 index↔worktree 才 true)。
+    /// macOS/Windows 客户仓库常带该配置, 继承会让大小写不同的请求命中已暂存
+    /// 条目, 与 Linux 生产 (无该配置) 的 nothingToCommit 判定不一致。
+    #[test]
+    fn requested_scope_matching_ignores_core_ignore_case() {
+        use std::io::Write as _;
+        let test = TestRepo::new();
+        commit_file(&test, "Readme.md", "v1", "add Readme");
+        // 模拟大小写不敏感平台的客户仓库配置 (保留原有配置, 仅追加)
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(test.0.join(".git/config"))
+            .expect("open config")
+            .write_all(b"[core]\n\tignoreCase = true\n")
+            .expect("append config");
+
+        let repo = test.open();
+        std::fs::write(test.0.join("Readme.md"), "v2").expect("change");
+        stage_files(&repo, &["Readme.md".to_string()]).expect("stage");
+
+        let index = repo.open_index().expect("open index");
+        let head_tree = repo
+            .head_tree_id_or_empty()
+            .map_err(|e| map_git_err(e, "git head_tree_id_or_empty"))
+            .expect("head tree")
+            .detach();
+        assert!(
+            !requested_paths_have_staged_changes(
+                &repo,
+                &index,
+                &["readme.md".to_string()],
+                Some(head_tree)
+            )
+            .expect("probe case-mismatched request"),
+            "case-mismatched request must not match the staged entry"
+        );
+        assert!(
+            requested_paths_have_staged_changes(
+                &repo,
+                &index,
+                &["Readme.md".to_string()],
+                Some(head_tree)
+            )
+            .expect("probe exact-case request"),
+            "exact-case request must match"
+        );
     }
 
     #[test]

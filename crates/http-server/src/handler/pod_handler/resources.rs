@@ -6,14 +6,222 @@
 //! 换代无关,不绑定 expected 身份)。
 
 use axum::extract::State;
-use std::sync::Arc;
-use tracing::{error, info, instrument, warn};
+use std::collections::HashSet;
+use std::sync::{Arc, LazyLock, Mutex};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::router::AppState;
 use crate::{AppError, HttpResult};
 use shared_types::{ComputerPodResourcesQuery, ComputerPodResourcesResponse};
 
 use super::I18nQuery;
+
+/// 解析后的查询目标：业务场景 + 该场景下用于定位容器的标识符。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ResourceTarget {
+    pub(super) service_type: shared_types::ServiceType,
+    pub(super) identifier: String,
+}
+
+/// 目标解析的拒绝原因。与 HTTP 层解耦，便于单测断言。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum TargetReject {
+    /// 三字段分派不合法（与 `/computer/pod/ensure` 同一套报错语义）
+    InvalidAppTarget(String),
+    /// 既没给标识符也没给 app_id
+    MissingIdentifier,
+    /// `service_type=userapp` 的 `prod` 阶段：业务运行容器没有 agent_runner
+    UnsupportedProd(String),
+    /// 直接传了 user-app-builder 这类族名：本接口按 ensure 的三字段分派，
+    /// 需要 service_type=userapp + app_id + app_stage=dev
+    BuilderNeedsAppId,
+}
+
+impl TargetReject {
+    pub(super) fn reason_code(&self) -> &'static str {
+        match self {
+            Self::InvalidAppTarget(_) | Self::MissingIdentifier | Self::BuilderNeedsAppId => {
+                shared_types::error_codes::ERR_VALIDATION
+            }
+            Self::UnsupportedProd(_) => shared_types::error_codes::ERR_OPERATION_NOT_SUPPORTED,
+        }
+    }
+
+    pub(super) fn detail(&self) -> String {
+        match self {
+            Self::InvalidAppTarget(message) => message.clone(),
+            Self::MissingIdentifier => "user_id or pod_id is required".to_string(),
+            Self::BuilderNeedsAppId => concat!(
+                "user-app 开发容器请按 /computer/pod/ensure 的形态传参：",
+                "service_type=userapp&app_id=<app_id>&app_stage=dev",
+                "（本接口不接受 user-app-builder 作为独立 service_type）"
+            )
+            .to_string(),
+            Self::UnsupportedProd(app_id) => format!(
+                concat!(
+                    "app_id={} 的 app_stage=prod 不提供资源监控：",
+                    "业务运行 Deployment 里没有 agent_runner，",
+                    "本接口的数据源（gRPC GetContainerStatus + 容器内 /proc 扫描）不存在，",
+                    "需要容器外部数据源（metrics-server / cAdvisor）另行实现"
+                ),
+                app_id
+            ),
+        }
+    }
+}
+
+/// 按 `service_type` + `app_id` + `app_stage` 解析目标。
+///
+/// **三字段分派与 `/computer/pod/ensure` 共用同一个 `parse_app_target`**：
+/// 资源查询必须和"创建/保活/停止"看到同一台容器，否则会出现"界面看到的
+/// 容器"和"实际被操作/被监控的容器"不是一台。缺省不传 = computer-agent-runner，
+/// 老调用方行为不变。
+pub(super) fn resolve_resource_target(
+    params: &ComputerPodResourcesQuery,
+) -> Result<ResourceTarget, TargetReject> {
+    // 租户/空间/隔离类型只属于创建期（容器 env、Deployment 标签、工作目录），
+    // 不参与容器定位——容器标识只由 user_id/project_id/app_id 决定。这里只留
+    // 一条 debug：调用方把 ensure 的入参原样带过来时，能看出"传了但没用于定位"，
+    // 而不是以为它在做租户过滤。
+    if params.tenant_id.is_some() || params.space_id.is_some() || params.isolation_type.is_some() {
+        debug!(
+            event = "pod_resources.scope_ignored",
+            tenant_id = ?params.tenant_id,
+            space_id = ?params.space_id,
+            isolation_type = ?params.isolation_type,
+            "tenant/space/isolation 是创建期隔离元数据，不参与容器定位"
+        );
+    }
+    let service_type = params
+        .service_type
+        .unwrap_or(shared_types::ServiceType::ComputerAgentRunner);
+    let service_type_str = params.service_type.map(|value| value.to_string());
+
+    // ① userApp 分派：与 ensure 完全同源
+    match super::parse_app_target(
+        params.app_id.as_deref(),
+        params.app_stage.as_deref(),
+        service_type_str.as_deref(),
+    ) {
+        Err(message) => return Err(TargetReject::InvalidAppTarget(message)),
+        Ok(super::AppTarget::Dev(app_id)) => {
+            return Ok(ResourceTarget {
+                service_type: shared_types::ServiceType::UserappBuilder,
+                identifier: app_id,
+            });
+        }
+        Ok(super::AppTarget::Prod(app_id)) => {
+            return Err(TargetReject::UnsupportedProd(app_id));
+        }
+        Ok(super::AppTarget::NotApp) => {}
+    }
+
+    // ② 非 userApp：按 service_type 选标识符
+    let user_id = params
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let pod_id = params
+        .pod_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let project_id = params
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    // 全量匹配、不写 `_ =>`：以后新增 ServiceType 变体时这里必须编译失败，
+    // 逼着明确"这个场景能不能监控"，而不是被默默当成 computer 去查。
+    match service_type {
+        // computer 族：per-user 容器，标识符是 user_id
+        shared_types::ServiceType::ComputerAgentRunner
+        | shared_types::ServiceType::ComputerNormalProject => match user_id.or(pod_id) {
+            Some(identifier) => Ok(ResourceTarget {
+                service_type,
+                identifier: identifier.to_string(),
+            }),
+            None => Err(TargetReject::MissingIdentifier),
+        },
+        // web 族：标识符是 project_id（与 container_identifier 同源）
+        shared_types::ServiceType::WebAgentRunner => match project_id.or(pod_id) {
+            Some(identifier) => Ok(ResourceTarget {
+                service_type,
+                identifier: identifier.to_string(),
+            }),
+            None => Err(TargetReject::MissingIdentifier),
+        },
+        // app_id 缺失时 parse_app_target 已给出明确报错；走到这里说明调用方
+        // 直接传了族名而不是 userapp
+        shared_types::ServiceType::Userapp | shared_types::ServiceType::UserappBuilder => {
+            Err(TargetReject::BuilderNeedsAppId)
+        }
+    }
+}
+
+/// 按解析结果定位容器。
+///
+/// computer 族且给了 user_id 时沿用既有 `get_container_info`（带刷新语义），
+/// 其余场景走 `get_container_info_by_identifier`，避免改动既有行为。
+pub(super) async fn locate_container(
+    state: &Arc<AppState>,
+    target: &ResourceTarget,
+    user_id: Option<&str>,
+) -> Result<Option<shared_types::ContainerBasicInfo>, AppError> {
+    // userApp dev 容器必须和 agent 族五接口走同一个解析（含注册交叉校验），
+    // 否则资源接口可能看到一台"状态接口已经不认"的旧容器。
+    if matches!(
+        target.service_type,
+        shared_types::ServiceType::UserappBuilder
+    ) {
+        return super::resolve_userapp_dev_container(state, &target.identifier, "POD_RESOURCES")
+            .await;
+    }
+    let computer_family = matches!(
+        target.service_type,
+        shared_types::ServiceType::ComputerAgentRunner
+            | shared_types::ServiceType::ComputerNormalProject
+    );
+    if let (true, Some(user_id)) = (computer_family, user_id) {
+        return crate::service::ComputerContainerManager::get_container_info(
+            user_id,
+            state.runtime(),
+        )
+        .await;
+    }
+    state
+        .runtime()
+        .get_container_info_by_identifier(&target.identifier, &target.service_type)
+        .await
+        .map_err(|e| {
+            error!("[POD_RESOURCES] container lookup failed: {e}");
+            AppError::internal_server_error(&format!("Failed to query container info: {e}"))
+        })
+}
+
+/// 已经就「RPC 成功但没有明细」告警过的容器。
+///
+/// 旧版本 agent_runner（例如 builder 镜像里还停在 0.1.369）会**永久**缺省
+/// 进程明细，而这两个资源接口会被面板高频轮询——不去重就是永久 info 刷屏，
+/// 刷屏等于没有日志。按容器去重后，每台容器每次进程生命周期只留一条。
+static DETAIL_ABSENT_LOGGED: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// 首次见到该容器时返回 true（应当告警），之后返回 false。
+///
+/// 锁中毒时返回 false：宁可少一条日志，也不要让观测路径 panic。
+fn first_detail_absent(container_id: &str) -> bool {
+    let Ok(mut seen) = DETAIL_ABSENT_LOGGED.lock() else {
+        return false;
+    };
+    // 容器会不断创建/销毁，集合要有界；超出后整体清空（只会多打一轮日志）。
+    if seen.len() > 256 {
+        seen.clear();
+    }
+    seen.insert(container_id.to_string())
+}
 
 /// 查询 Computer 容器(整个 pod)资源用量
 ///
@@ -61,7 +269,7 @@ use super::I18nQuery;
     tag = "pod",
     operation_id = "computer_pod_resources",
     summary = "查询 Computer 容器资源用量(整个 pod)",
-    description = "按 user_id 或 pod_id 定位 Computer 容器,返回容器 cgroup v2 级别的 CPU/内存实时用量与创建时设定的资源限额。与 /computer/agent/status(agent 进程组粒度)互补:容器口径包含 VNC/桌面环境等全部进程。资源字段在采集降级时缺省(None),不报错。"
+    description = "按与 /computer/pod/ensure 相同的三字段(service_type + app_id + app_stage)定位容器,返回容器 cgroup v2 级别的 CPU/内存实时用量与创建时设定的资源限额。缺省(不传任何分派字段)= computer-agent-runner,行为与改动前一致;computer-normal-project 与 computer 共容器(标识符 user_id);userapp + app_id + app_stage=dev(缺省) 定位 UserappBuilder 开发容器(有 agent_runner,可返回进程明细与 agents);app_stage=prod 的业务运行 Deployment 没有 agent_runner,返回 ERR_OPERATION_NOT_SUPPORTED;web-agent-runner 用 project_id。与 /computer/agent/status(agent 进程组粒度)互补:容器口径包含 VNC/桌面环境等全部进程。资源字段在采集降级时缺省(None),不报错。"
 )]
 #[instrument(skip(state))]
 pub async fn computer_pod_resources(
@@ -70,40 +278,34 @@ pub async fn computer_pod_resources(
 ) -> Result<HttpResult<ComputerPodResourcesResponse>, AppError> {
     let locale = shared_types::current_request_locale();
 
-    // 1. 验证参数:user_id 或 pod_id 至少一个
-    let has_user_id = params
-        .user_id
-        .as_ref()
-        .is_some_and(|s| !s.trim().is_empty());
-    let has_pod_id = params.pod_id.as_ref().is_some_and(|s| !s.trim().is_empty());
-    if !has_user_id && !has_pod_id {
-        error!("[POD_RESOURCES] user_id or pod_id is required");
-        return Ok(HttpResult::error_with_locale(
-            shared_types::error_codes::ERR_VALIDATION,
-            locale,
-        ));
-    }
-
-    // 2. 定位容器:user_id 直查,pod_id 按 ComputerAgentRunner 标识符查
-    let container_info = if has_user_id {
-        crate::service::ComputerContainerManager::get_container_info(
-            params.user_id.as_deref().expect("user_id checked above"),
-            state.runtime(),
-        )
-        .await?
-    } else {
-        state
-            .runtime()
-            .get_container_info_by_identifier(
-                params.pod_id.as_deref().expect("pod_id checked above"),
-                &shared_types::ServiceType::ComputerAgentRunner,
-            )
-            .await
-            .map_err(|e| {
-                error!("[POD_RESOURCES] container lookup failed: {e}");
-                AppError::internal_server_error(&format!("Failed to query container info: {e}"))
-            })?
+    // 1. 解析目标:业务场景 + 标识符。缺省 computer-agent-runner(老调用方不变)
+    let target = match resolve_resource_target(&params) {
+        Ok(target) => target,
+        Err(reject) => {
+            warn!(
+                event = "pod_resources.target_rejected",
+                reason = reject.reason_code(),
+                detail = %reject.detail(),
+                service_type = ?params.service_type,
+                user_id = ?params.user_id,
+                pod_id = ?params.pod_id,
+                "resource target rejected"
+            );
+            let mut response = HttpResult::error_with_locale(reject.reason_code(), locale);
+            response.error_detail = Some(
+                shared_types::ErrorDetail::new(
+                    reject.reason_code(),
+                    "pod.resources.resolve",
+                    reject.detail(),
+                )
+                .localized(locale),
+            );
+            return Ok(response);
+        }
     };
+
+    // 2. 定位容器
+    let container_info = locate_container(&state, &target, params.user_id.as_deref()).await?;
 
     let Some(container_info) = container_info else {
         warn!(
@@ -125,6 +327,7 @@ pub async fn computer_pod_resources(
         return Ok(HttpResult::success(ComputerPodResourcesResponse {
             user_id: params.user_id.clone(),
             pod_id: params.pod_id.clone(),
+            service_type: Some(target.service_type),
             alive: false,
             container_cpu_percent: None,
             container_memory_mb: None,
@@ -133,6 +336,10 @@ pub async fn computer_pod_resources(
             uptime_seconds: 0,
             container_id: Some(container_info.container_id),
             container_name: Some(container_info.container_name),
+            processes: None,
+            process_count: None,
+            process_groups: None,
+            agents: Vec::new(),
         }));
     }
 
@@ -154,13 +361,14 @@ pub async fn computer_pod_resources(
         AppError::internal_server_error(&format!("Failed to build grpc address: {e}"))
     })?;
 
-    let response = match crate::grpc::status_query::query_container_status(
+    let response = match crate::grpc::status_query::query_container_status_with_options(
         &state.grpc_pool,
         &grpc_addr,
         params.user_id.as_deref().unwrap_or_default(),
         &container_info.project_id,
         None,
         std::time::Duration::from_secs(shared_types::GRPC_CONTAINER_STATUS_TIMEOUT_SECS),
+        params.include_processes.unwrap_or(true),
     )
     .await
     {
@@ -174,6 +382,7 @@ pub async fn computer_pod_resources(
             return Ok(HttpResult::success(ComputerPodResourcesResponse {
                 user_id: params.user_id.clone(),
                 pod_id: params.pod_id.clone(),
+                service_type: Some(target.service_type),
                 alive: true,
                 container_cpu_percent: None,
                 container_memory_mb: None,
@@ -182,6 +391,10 @@ pub async fn computer_pod_resources(
                 uptime_seconds: 0,
                 container_id: Some(container_info.container_id),
                 container_name: Some(container_info.container_name),
+                processes: None,
+                process_count: None,
+                process_groups: None,
+                agents: Vec::new(),
             }));
         }
     };
@@ -191,9 +404,28 @@ pub async fn computer_pod_resources(
         container_info.container_id, response.container_cpu_percent, response.container_memory_mb
     );
 
+    // 进程明细+分组聚合(proto → 响应;MB 换算,分组字符串透传)
+    let (processes, process_count, groups) = map_process_detail(&response);
+    // RPC 成功却没有明细：只有两种可能——沙箱侧没跑扫描（旧版本 agent_runner
+    // 忽略 include_processes）或扫描失败。两者都会让观测端看到「没有进程 /
+    // 没有 agent」，预发布环境那次空窗口正是这种形态，所以这里必须留痕。
+    // 用 info 而不是 warn：混版本滚动期间旧沙箱每次轮询都会命中，warn 会刷屏。
+    if process_count.is_none() && first_detail_absent(&container_info.container_id) {
+        info!(
+            event = "pod_resources.detail_absent",
+            container_id = %container_info.container_id,
+            user_id = ?params.user_id,
+            service_type = ?target.service_type,
+            "container status RPC succeeded but returned no process detail (logged once per container); observation will see empty processes/agents"
+        );
+    }
+    let agents: Vec<shared_types::ComputerAgentExecution> =
+        response.agents.iter().map(map_agent_execution).collect();
+
     Ok(HttpResult::success(ComputerPodResourcesResponse {
         user_id: params.user_id.clone(),
         pod_id: params.pod_id.clone(),
+        service_type: Some(target.service_type),
         alive: true,
         container_cpu_percent: response.container_cpu_percent,
         container_memory_mb: response.container_memory_mb,
@@ -202,7 +434,78 @@ pub async fn computer_pod_resources(
         uptime_seconds: response.uptime_seconds,
         container_id: Some(container_info.container_id),
         container_name: Some(container_info.container_name),
+        processes,
+        process_count,
+        process_groups: groups,
+        agents,
     }))
+}
+
+/// proto → 对外响应：进程明细、明细条数、分组聚合。
+///
+/// `process_count` 是「是否采样过」的单一事实源：agent_runner 只在
+/// `include_processes=true` 时回填它（哪怕是 0），未采样时整组字段缺省。
+/// 以前这里用 `!processes.is_empty()` 判断，导致「采样了但确实是 0 条」
+/// 和「压根没采样」在响应里完全同形——两者都会变成 `processes: null`，
+/// 观测端无法区分（预发布环境就因此把一次空扫描读成了「没有进程」）。
+fn map_process_detail(
+    response: &shared_types::grpc::GetContainerStatusResponse,
+) -> (
+    Option<Vec<shared_types::ComputerProcessEntry>>,
+    Option<u32>,
+    Option<shared_types::ComputerProcessGroups>,
+) {
+    let sampled = response.process_count.is_some();
+    let processes = sampled.then(|| {
+        response
+            .processes
+            .iter()
+            .map(|p| shared_types::ComputerProcessEntry {
+                pid: p.pid,
+                comm: p.comm.clone(),
+                rss_mb: p.rss_bytes as f64 / 1_048_576.0,
+                cpu_seconds: p.cpu_seconds,
+                group: p.group.clone(),
+                args_head: (!p.args_head.is_empty()).then(|| p.args_head.clone()),
+            })
+            .collect()
+    });
+    let process_count = response
+        .process_count
+        .and_then(|count| u32::try_from(count).ok());
+    let groups = (response.infra_rss_bytes.is_some()
+        || response.platform_rss_bytes.is_some()
+        || response.workload_rss_bytes.is_some())
+    .then(|| shared_types::ComputerProcessGroups {
+        infra_rss_bytes: response.infra_rss_bytes.unwrap_or(0),
+        platform_rss_bytes: response.platform_rss_bytes.unwrap_or(0),
+        workload_rss_bytes: response.workload_rss_bytes.unwrap_or(0),
+    });
+    (processes, process_count, groups)
+}
+
+/// proto → 对外响应：单个 agent 执行。
+fn map_agent_execution(
+    a: &shared_types::grpc::AgentExecution,
+) -> shared_types::ComputerAgentExecution {
+    shared_types::ComputerAgentExecution {
+        project_id: a.project_id.clone(),
+        session_id: (!a.session_id.is_empty()).then(|| a.session_id.clone()),
+        status: a.status.clone(),
+        rss_mb: a.rss_bytes as f64 / 1_048_576.0,
+        cpu_seconds: a.cpu_seconds,
+        process_count: a.process_count,
+    }
+}
+
+/// SSE 事件里 agent 行的存活字段。
+///
+/// `None` = 对端没回 `agent_present`（**未知**，典型是混布旧版 agent_runner），
+/// 必须保持 `null`；塌成 `false` 会把活着的老 agent 误报成已退出。显式
+/// `Some(false)` 才是"确认已退出"。与 tick 失败分支的 `last_agent_present`
+/// 同一口径，也符合本文件"未知保持未知"的一贯契约。
+fn agent_alive_field(agent_present: Option<bool>) -> serde_json::Value {
+    serde_json::json!(agent_present)
 }
 
 // ==== SSE 流式版本 ====
@@ -225,10 +528,23 @@ use std::convert::Infallible;
     responses(
         (
             status = 200,
-            description = "SSE 资源监控流。event=resources 的 data 为 JSON:\n\
-              `{ts, container:{alive,cpu_percent,memory_mb,memory_limit_mb,cpu_limit_cores}, agent:{alive,status,cpu_percent,memory_mb}}`。\n\
-              agent 字段为容器内当前执行的实时观测(执行换代后自动跟随新代次);\n\
-              采集降级时对应字段缺省;连续失败将关断流。Content-Type: text/event-stream",
+            description = "SSE 资源监控流。event=resources 的 data 为 JSON:\n\n\
+              `{ts, container:{alive,cpu_percent,memory_mb,memory_limit_mb,cpu_limit_cores},\n\
+                agent:{alive,status,cpu_percent,memory_mb},\n\
+                processes?:[{pid,comm,rss_mb,cpu_seconds,group}],\n\
+                agents?:[{project_id,session_id,status,rss_mb,cpu_seconds,process_count}],\n\
+                process_groups?:{infra_rss_mb,platform_rss_mb,workload_rss_mb}}`\n\n\
+              **`processes` / `agents` / `process_groups` 仅在 `include_processes=true`（默认 true）时携带**：\n\
+              - `processes` 是容器内进程明细（含 cgroup 角色分组 group：infra/platform/workload）；\n\
+              - `agents` 是**每个 project 一条**的 agent 进程组聚合（会话级 RSS/CPU/进程数），\n\
+                做「Agent 会话列表」用这个，不要自己从 processes 里猜；\n\
+              - 三者**缺省 = 本轮未采样**，与「采样了但确实是 0 条」不同（后者是空数组）。\n\n\
+              口径：container.* 是**容器 cgroup 级**实时值（区别于 `/computer/pod/overview` 的\n\
+              `usage`——那是 metrics-server 的窗口平均值，两者数值会有差异，别混用）。\n\
+              agent 字段为容器内当前执行的实时观测（执行换代后自动跟随新代次）；\n\
+              采集降级时对应字段缺省；连续失败（约 30s）将关断流，客户端需自行重连。\n\
+              **容器死亡时流会断开**：要感知 OOM/重启请用 `/computer/pod/health`，不要只靠本流。\n\
+              Content-Type: text/event-stream",
         ),
         (
             status = 400,
@@ -244,42 +560,30 @@ use std::convert::Infallible;
     tag = "pod",
     operation_id = "computer_pod_resources_stream",
     summary = "订阅 Computer 容器资源监控流(SSE,容器 + agent)",
-    description = "SSE 推送容器 cgroup 级与容器内 agent 进程组的 CPU/内存用量。订阅驱动采样:连接期间按 interval_secs(默认 2s,clamp 1-30)周期采样推送;无 replay/无历史缓冲,断连即停。执行换代后自动跟随新代次。"
+    description = "SSE 推送容器 cgroup 级与容器内 agent 进程组的 CPU/内存用量。分派语义与单次查询接口完全一致(service_type + app_id + app_stage,与 /computer/pod/ensure 同源):缺省 computer-agent-runner;userapp + app_id + app_stage=dev 推送 UserappBuilder 开发容器;app_stage=prod 返回 ERR_OPERATION_NOT_SUPPORTED 且不建立流。订阅驱动采样:连接期间按 interval_secs(默认 2s,clamp 1-30)周期采样推送;无 replay/无历史缓冲,断连即停。执行换代后自动跟随新代次;agent.alive 来自显式的执行存在性,采集降级时资源字段缺省但不会误报 agent 退出。"
 )]
 #[instrument(skip(state))]
 pub async fn computer_pod_resources_stream(
     State(state): State<Arc<AppState>>,
     I18nQuery(params): I18nQuery<ComputerPodResourcesQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>> + use<>>, AppError> {
-    // 1. 验证与定位(连接建立前完成;流建立后容器消失以缺省事件体现)
-    let has_user_id = params
-        .user_id
-        .as_ref()
-        .is_some_and(|s| !s.trim().is_empty());
-    let has_pod_id = params.pod_id.as_ref().is_some_and(|s| !s.trim().is_empty());
-    if !has_user_id && !has_pod_id {
-        return Err(AppError::validation_error("user_id or pod_id is required"));
-    }
+    // 1. 解析与定位(连接建立前完成;流建立后容器消失以缺省事件体现)
+    let target = resolve_resource_target(&params).map_err(|reject| {
+        warn!(
+            event = "pod_resources_stream.target_rejected",
+            reason = reject.reason_code(),
+            detail = %reject.detail(),
+            service_type = ?params.service_type,
+            "resource stream target rejected"
+        );
+        AppError::from_code(reject.reason_code()).with_error_detail(shared_types::ErrorDetail::new(
+            reject.reason_code(),
+            "pod.resources.resolve",
+            reject.detail(),
+        ))
+    })?;
 
-    let container_info = if has_user_id {
-        crate::service::ComputerContainerManager::get_container_info(
-            params.user_id.as_deref().expect("user_id checked above"),
-            state.runtime(),
-        )
-        .await?
-    } else {
-        state
-            .runtime()
-            .get_container_info_by_identifier(
-                params.pod_id.as_deref().expect("pod_id checked above"),
-                &shared_types::ServiceType::ComputerAgentRunner,
-            )
-            .await
-            .map_err(|e| {
-                error!("[POD_RESOURCES_STREAM] container lookup failed: {e}");
-                AppError::internal_server_error(&format!("Failed to query container info: {e}"))
-            })?
-    };
+    let container_info = locate_container(&state, &target, params.user_id.as_deref()).await?;
 
     let Some(container_info) = container_info else {
         warn!(
@@ -308,7 +612,9 @@ pub async fn computer_pod_resources_stream(
     );
 
     // 2. 采样循环:订阅驱动,断连即停(SSE drop 取消 stream future)
-    let tick_interval = std::time::Duration::from_secs(2);
+    let tick_interval = std::time::Duration::from_secs(
+        shared_types::computer_pod_resources_clamp_interval(params.interval_secs),
+    );
     let max_consecutive_failures: u32 = 15; // ~30s 全失败则关流,避免僵尸流
     let grpc_pool = state.grpc_pool.clone();
     let user_id = params.user_id.clone();
@@ -318,20 +624,25 @@ pub async fn computer_pod_resources_stream(
 
     let stream = async_stream::stream! {
         let mut consecutive_failures: u32 = 0;
+        // 最近一次成功采样看到的 agent 存在性:单次 tick 失败不能把活着的
+        // agent 报成已退出(采集降级 ≠ agent 退出),未知时为 None。
+        let mut last_agent_present: Option<bool> = None;
         loop {
-            let tick = crate::grpc::status_query::query_container_status(
+            let tick = crate::grpc::status_query::query_container_status_with_options(
                 &grpc_pool,
                 &grpc_addr,
                 user_id.as_deref().unwrap_or_default(),
                 &project_id,
                 None,
                 std::time::Duration::from_secs(shared_types::GRPC_CONTAINER_STATUS_TIMEOUT_SECS),
+                params.include_processes.unwrap_or(true),
             )
             .await;
 
             let event = match tick {
                 Ok(response) => {
                     consecutive_failures = 0;
+                    last_agent_present = response.agent_present;
                     serde_json::json!({
                         "ts": chrono::Utc::now().to_rfc3339(),
                         "container": {
@@ -342,10 +653,62 @@ pub async fn computer_pod_resources_stream(
                             "cpu_limit_cores": response.container_cpu_limit_cores,
                         },
                         "agent": {
-                            "alive": !response.cpu_percent.is_none() || !response.memory_mb.is_none(),
+                            // 存活用显式的 agent_present,不用资源字段推断:
+                            // 采集降级时 cpu_percent/memory_mb 同为 None,
+                            // 会把活着的 agent 显示成已退出。
+                            //
+                            // `None` = 对端没回这个字段(**未知**), 必须原样输出
+                            // null, 与下方 tick 失败分支的 `last_agent_present`
+                            // 同一口径。旧实现 `unwrap_or(false)` 会把未知塌成
+                            // "已退出": 混布旧版 agent_runner(proto 无该字段)时,
+                            // 明明活着却被观测端判死。本文件的契约一贯是"未知保持
+                            // 未知"(见 unsampled_detail_stays_absent 等用例),
+                            // 客户端按 null 显示"未知", 不按 false 显示"已退出"。
+                            "alive": agent_alive_field(response.agent_present),
                             "status": response.status,
                             "cpu_percent": response.cpu_percent,
                             "memory_mb": response.memory_mb,
+                        },
+                        // 容器内进程明细+分组聚合(仅 include_processes 请求携带)
+                        "processes": if response.processes.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                response
+                                    .processes
+                                    .iter()
+                                    .map(|p| {
+                                        serde_json::json!({
+                                            "pid": p.pid,
+                                            "comm": p.comm,
+                                            "rss_mb": p.rss_bytes as f64 / 1_048_576.0,
+                                            "cpu_seconds": p.cpu_seconds,
+                                            "group": p.group,
+                                        })
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )
+                        },
+                        // 每个 project 一条 agent 进程组聚合(仅 include_processes 时携带)
+                        "agents": response.agents.iter().map(|a| serde_json::json!({
+                            "project_id": a.project_id,
+                            "session_id": a.session_id,
+                            "status": a.status,
+                            "rss_mb": a.rss_bytes as f64 / 1_048_576.0,
+                            "cpu_seconds": a.cpu_seconds,
+                            "process_count": a.process_count,
+                        })).collect::<Vec<_>>(),
+                        "process_groups": if response.infra_rss_bytes.is_none()
+                            && response.platform_rss_bytes.is_none()
+                            && response.workload_rss_bytes.is_none()
+                        {
+                            None
+                        } else {
+                            Some(serde_json::json!({
+                                "infra_rss_mb": response.infra_rss_bytes.unwrap_or(0) as f64 / 1_048_576.0,
+                                "platform_rss_mb": response.platform_rss_bytes.unwrap_or(0) as f64 / 1_048_576.0,
+                                "workload_rss_mb": response.workload_rss_bytes.unwrap_or(0) as f64 / 1_048_576.0,
+                            }))
                         },
                     })
                 }
@@ -358,7 +721,8 @@ pub async fn computer_pod_resources_stream(
                     serde_json::json!({
                         "ts": chrono::Utc::now().to_rfc3339(),
                         "container": {"alive": alive_at_open && consecutive_failures <= 1},
-                        "agent": {"alive": false},
+                        // 沿用上次已知值:一次查询失败不代表 agent 退出
+                        "agent": {"alive": last_agent_present},
                     })
                 }
             };
@@ -390,4 +754,394 @@ pub async fn computer_pod_resources_stream(
             .interval(std::time::Duration::from_secs(15))
             .text("keep-alive"),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared_types::grpc::{AgentExecution, ContainerProcess, GetContainerStatusResponse};
+
+    /// 未采样（agent_runner 当次没跑进程扫描）→ 三组字段都缺省，
+    /// 与「采样了但确实是 0 条」必须可区分。
+    #[test]
+    fn unsampled_detail_stays_absent() {
+        let response = GetContainerStatusResponse::default();
+        let (processes, count, groups) = map_process_detail(&response);
+        assert!(processes.is_none(), "未采样不能报空明细");
+        assert!(count.is_none());
+        assert!(groups.is_none());
+    }
+
+    /// `process_count: Some(0)` 是「采样过」的显式信号 → 必须报
+    /// `processes: []` 而不是缺省。
+    ///
+    /// 这正是之前的缺陷：用 `!processes.is_empty()` 当信号，把「采样到 0 条」
+    /// 也压成 `null`，观测端只能读成「不知道」。当前 agent_runner 在扫描
+    /// 失败时回 `None`（未知），因此 `Some(0)` 属于防御性契约，客户端仍必须
+    /// 按「采样过」处理，不能把空明细当成缺省。
+    #[test]
+    fn sampled_empty_detail_is_reported_as_empty_not_absent() {
+        let response = GetContainerStatusResponse {
+            process_count: Some(0),
+            infra_rss_bytes: Some(0),
+            platform_rss_bytes: Some(0),
+            workload_rss_bytes: Some(0),
+            ..Default::default()
+        };
+        let (processes, count, groups) = map_process_detail(&response);
+        assert_eq!(processes.as_deref().map(<[_]>::len), Some(0));
+        assert_eq!(count, Some(0));
+        let groups = groups.expect("采样的分组聚合必须出现");
+        assert_eq!(
+            groups.infra_rss_bytes + groups.platform_rss_bytes + groups.workload_rss_bytes,
+            0
+        );
+    }
+
+    /// 采样到进程 → 明细条数以 `process_count` 为准（不是 `processes.len()`，
+    /// 两者不一致时以 agent_runner 的统计为准并在响应里保持自洽）。
+    #[test]
+    fn sampled_rows_are_mapped_with_mb_and_optional_args() {
+        let response = GetContainerStatusResponse {
+            processes: vec![
+                ContainerProcess {
+                    pid: 42,
+                    ppid: 1,
+                    comm: "python3".to_string(),
+                    rss_bytes: 2 * 1_048_576,
+                    cpu_seconds: 1.5,
+                    group: "workload".to_string(),
+                    args_head: "python3 train.py".to_string(),
+                },
+                ContainerProcess {
+                    pid: 43,
+                    ppid: 1,
+                    comm: "sh".to_string(),
+                    rss_bytes: 1_048_576,
+                    cpu_seconds: 0.0,
+                    group: "infra".to_string(),
+                    args_head: String::new(),
+                },
+            ],
+            process_count: Some(2),
+            ..Default::default()
+        };
+        let (processes, count, _) = map_process_detail(&response);
+        let processes = processes.expect("采样到进程必须有明细");
+        assert_eq!(count, Some(2));
+        assert_eq!(processes.len(), 2);
+        assert_eq!(processes[0].rss_mb, 2.0);
+        assert_eq!(processes[0].args_head.as_deref(), Some("python3 train.py"));
+        assert!(
+            processes[1].args_head.is_none(),
+            "空 args_head 不应变成 Some(\"\")"
+        );
+    }
+
+    /// 审查 P2：对端没回 `agent_present`（混布旧版 agent_runner）时必须报
+    /// `null`（未知），不能塌成 `false`（已退出）——活着的老 agent 会被误报死亡。
+    /// 显式 `Some(false)` 仍是"确认已退出"。
+    #[test]
+    fn agent_alive_field_keeps_unknown_distinct_from_dead() {
+        assert_eq!(
+            agent_alive_field(None),
+            serde_json::Value::Null,
+            "未知必须保持 null, 不能变成 false"
+        );
+        assert_eq!(agent_alive_field(Some(true)), serde_json::json!(true));
+        assert_eq!(agent_alive_field(Some(false)), serde_json::json!(false));
+    }
+
+    /// ── 目标解析（service_type + app_id + app_stage，与 /computer/pod/ensure 同源）──
+    fn q(
+        user_id: Option<&str>,
+        pod_id: Option<&str>,
+        project_id: Option<&str>,
+        app_id: Option<&str>,
+        app_stage: Option<&str>,
+        service_type: Option<shared_types::ServiceType>,
+    ) -> ComputerPodResourcesQuery {
+        ComputerPodResourcesQuery {
+            user_id: user_id.map(str::to_string),
+            pod_id: pod_id.map(str::to_string),
+            project_id: project_id.map(str::to_string),
+            app_id: app_id.map(str::to_string),
+            app_stage: app_stage.map(str::to_string),
+            service_type,
+            tenant_id: None,
+            space_id: None,
+            isolation_type: None,
+            include_processes: None,
+            interval_secs: None,
+        }
+    }
+
+    /// 租户/空间/隔离类型是**创建期隔离元数据**：决定共享容器里的工作目录
+    /// （`/app/project_workspace/{tenant}/{space}/{project}`）与 compose 的
+    /// 宿主目录映射，但**不改变定位到哪台容器**（容器标识只由 user_id /
+    /// project_id / app_id 决定，一个 user 在 computer 族只有一台）。
+    /// 这条测试把该语义锁住：带不带它们，解析结果必须相同。
+    #[test]
+    fn scope_fields_do_not_change_resolution() {
+        let base = resolve_resource_target(&q(Some("42"), None, None, None, None, None))
+            .expect("应解析成功");
+        let mut with_scope = q(Some("42"), None, None, None, None, None);
+        with_scope.tenant_id = Some("t-1".to_string());
+        with_scope.space_id = Some("s-1".to_string());
+        with_scope.isolation_type = Some("tenant".to_string());
+        let scoped = resolve_resource_target(&with_scope).expect("应解析成功");
+        assert_eq!(scoped, base, "隔离元数据不应影响容器定位");
+
+        // pod_id 场景同样不受影响（共享容器由 pod_id 明确定位）
+        let base_pod = resolve_resource_target(&q(None, Some("pod-7"), None, None, None, None))
+            .expect("应解析成功");
+        let mut scoped_pod = q(None, Some("pod-7"), None, None, None, None);
+        scoped_pod.tenant_id = Some("t-1".to_string());
+        scoped_pod.space_id = Some("s-1".to_string());
+        assert_eq!(
+            resolve_resource_target(&scoped_pod).expect("应解析成功"),
+            base_pod
+        );
+    }
+
+    /// 不传任何分派字段：行为必须和改动前完全一致。
+    #[test]
+    fn resolve_defaults_to_computer_agent_runner() {
+        let target = resolve_resource_target(&q(Some("42"), None, None, None, None, None))
+            .expect("应解析成功");
+        assert_eq!(
+            target.service_type,
+            shared_types::ServiceType::ComputerAgentRunner
+        );
+        assert_eq!(target.identifier, "42");
+    }
+
+    /// normal-project 与 computer 共容器，标识符同样是 user_id。
+    #[test]
+    fn resolve_normal_project_uses_user_id() {
+        let target = resolve_resource_target(&q(
+            Some("42"),
+            None,
+            None,
+            None,
+            None,
+            Some(shared_types::ServiceType::ComputerNormalProject),
+        ))
+        .expect("应解析成功");
+        assert_eq!(
+            target.service_type,
+            shared_types::ServiceType::ComputerNormalProject
+        );
+        assert_eq!(target.identifier, "42");
+    }
+
+    /// web 族的容器标识符是 project_id（与 container_identifier 同源）。
+    #[test]
+    fn resolve_web_agent_uses_project_id() {
+        let target = resolve_resource_target(&q(
+            None,
+            None,
+            Some("proj-7"),
+            None,
+            None,
+            Some(shared_types::ServiceType::WebAgentRunner),
+        ))
+        .expect("应解析成功");
+        assert_eq!(
+            target.service_type,
+            shared_types::ServiceType::WebAgentRunner
+        );
+        assert_eq!(target.identifier, "proj-7");
+    }
+
+    /// userApp dev（缺省阶段）→ UserappBuilder 开发容器，标识符是 app_id。
+    /// 与 ensure 的 `parse_app_target` 同源，因此 app_id 单独传即可。
+    #[test]
+    fn resolve_userapp_dev_uses_app_id() {
+        let target = resolve_resource_target(&q(None, None, None, Some("app-9"), None, None))
+            .expect("应解析成功");
+        assert_eq!(
+            target.service_type,
+            shared_types::ServiceType::UserappBuilder
+        );
+        assert_eq!(target.identifier, "app-9");
+
+        // 显式 service_type=userapp + app_stage=dev 必须得到同一个目标
+        let explicit = resolve_resource_target(&q(
+            None,
+            None,
+            None,
+            Some("app-9"),
+            Some("dev"),
+            Some(shared_types::ServiceType::Userapp),
+        ))
+        .expect("应解析成功");
+        assert_eq!(explicit, target);
+    }
+
+    /// userApp prod → 业务运行 Deployment，没有 agent_runner，明确拒绝。
+    #[test]
+    fn resolve_userapp_prod_is_rejected() {
+        let err = resolve_resource_target(&q(
+            None,
+            None,
+            None,
+            Some("app-9"),
+            Some("prod"),
+            Some(shared_types::ServiceType::Userapp),
+        ))
+        .expect_err("prod 应被拒绝");
+        assert!(matches!(err, TargetReject::UnsupportedProd(_)));
+        assert_eq!(
+            err.reason_code(),
+            shared_types::error_codes::ERR_OPERATION_NOT_SUPPORTED
+        );
+        assert!(
+            err.detail().contains("agent_runner"),
+            "拒绝原因要说清数据源缺失: {}",
+            err.detail()
+        );
+    }
+
+    /// 三字段分派的非法组合由 `parse_app_target` 统一报错（与 ensure 同文案）：
+    /// app_id 与 computer 族互斥、app_stage 非法、userapp 缺 app_id。
+    #[test]
+    fn resolve_invalid_app_target_combinations() {
+        // app_id + 非 userapp 族
+        let err = resolve_resource_target(&q(
+            None,
+            None,
+            None,
+            Some("app-9"),
+            None,
+            Some(shared_types::ServiceType::ComputerAgentRunner),
+        ))
+        .expect_err("app_id 与 computer 族互斥");
+        assert!(matches!(err, TargetReject::InvalidAppTarget(_)), "{err:?}");
+        assert_eq!(err.reason_code(), shared_types::error_codes::ERR_VALIDATION);
+
+        // 非法 app_stage
+        let err =
+            resolve_resource_target(&q(None, None, None, Some("app-9"), Some("staging"), None))
+                .expect_err("非法 app_stage 应报错");
+        assert!(matches!(err, TargetReject::InvalidAppTarget(_)), "{err:?}");
+
+        // service_type=userapp 但没有 app_id
+        let err = resolve_resource_target(&q(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(shared_types::ServiceType::Userapp),
+        ))
+        .expect_err("userapp 缺 app_id 应报错");
+        assert!(matches!(err, TargetReject::InvalidAppTarget(_)), "{err:?}");
+    }
+
+    /// 直接传族名 user-app-builder 时给出正确的传参形态，而不是含糊报错。
+    #[test]
+    fn resolve_builder_service_type_guides_to_three_field_form() {
+        let err = resolve_resource_target(&q(
+            None,
+            Some("132"),
+            None,
+            None,
+            None,
+            Some(shared_types::ServiceType::UserappBuilder),
+        ))
+        .expect_err("应引导到三字段形态");
+        assert_eq!(err, TargetReject::BuilderNeedsAppId);
+        assert!(
+            err.detail().contains("app_id") && err.detail().contains("app_stage"),
+            "提示要给出正确形态: {}",
+            err.detail()
+        );
+    }
+
+    /// 两个标识符都没给 → 参数错误。
+    #[test]
+    fn resolve_requires_an_identifier() {
+        let err = resolve_resource_target(&q(None, None, None, None, None, None))
+            .expect_err("缺标识符应被拒绝");
+        assert_eq!(err, TargetReject::MissingIdentifier);
+        assert_eq!(err.reason_code(), shared_types::error_codes::ERR_VALIDATION);
+    }
+
+    /// `service_type` / `app_id` / `app_stage` / `project_id` 都是 URL 查询参数，
+    /// 必须按文档里的常见写法解析出来。这条锁的是"输入面"：解析不出来会变成
+    /// 一个和文档不符的 400。
+    #[test]
+    fn dispatch_fields_parse_from_query_string() {
+        use shared_types::ServiceType;
+        for (raw, want) in [
+            ("userapp", ServiceType::Userapp),
+            ("user-app", ServiceType::Userapp),
+            ("Userapp", ServiceType::Userapp),
+            (
+                "computer-normal-project",
+                ServiceType::ComputerNormalProject,
+            ),
+            ("computer-agent-runner", ServiceType::ComputerAgentRunner),
+        ] {
+            let qs = format!("user_id=999&service_type={raw}");
+            let parsed: ComputerPodResourcesQuery =
+                serde_urlencoded::from_str(&qs).unwrap_or_else(|e| panic!("{raw} 解析失败: {e}"));
+            assert_eq!(parsed.service_type, Some(want), "{raw} 解析成了别的场景");
+        }
+
+        // 不传就保持 None（走缺省 computer-agent-runner）
+        let parsed: ComputerPodResourcesQuery = serde_urlencoded::from_str("user_id=999").unwrap();
+        assert_eq!(parsed.service_type, None);
+        assert_eq!(parsed.app_id, None);
+        assert_eq!(parsed.app_stage, None);
+        assert_eq!(parsed.project_id, None);
+
+        // 三字段分派参数都要能解析（与 /computer/pod/ensure 同形）
+        let parsed: ComputerPodResourcesQuery = serde_urlencoded::from_str(
+            "service_type=userapp&app_id=app-9&app_stage=dev&project_id=proj-1",
+        )
+        .expect("userApp 三字段应可解析");
+        assert_eq!(parsed.service_type, Some(ServiceType::Userapp));
+        assert_eq!(parsed.app_id.as_deref(), Some("app-9"));
+        assert_eq!(parsed.app_stage.as_deref(), Some("dev"));
+        assert_eq!(parsed.project_id.as_deref(), Some("proj-1"));
+
+        // 不认识的词必须报错，不能被静默当成缺省
+        assert!(
+            serde_urlencoded::from_str::<ComputerPodResourcesQuery>(
+                "user_id=999&service_type=not-a-service"
+            )
+            .is_err(),
+            "非法 service_type 应解析失败"
+        );
+    }
+
+    /// 「无明细」告警按容器去重：同一台只报一次，不同容器各自报一次。
+    #[test]
+    fn detail_absent_log_is_deduped_per_container() {
+        let cid = "test-container-detail-absent";
+        assert!(first_detail_absent(cid), "首次应告警");
+        assert!(!first_detail_absent(cid), "同一容器不应重复告警");
+        assert!(
+            first_detail_absent("test-container-detail-absent-2"),
+            "不同容器应各自告警"
+        );
+    }
+
+    /// agent 行：空 session_id 不能变成 `Some("")`（前端会当成真实 id）。
+    #[test]
+    fn agent_mapping_drops_empty_session_id() {
+        let mapped = map_agent_execution(&AgentExecution {
+            project_id: "p1".to_string(),
+            session_id: String::new(),
+            status: "Idle".to_string(),
+            rss_bytes: 3 * 1_048_576,
+            cpu_seconds: 2.0,
+            process_count: 7,
+        });
+        assert!(mapped.session_id.is_none());
+        assert_eq!(mapped.rss_mb, 3.0);
+        assert_eq!(mapped.process_count, 7);
+    }
 }

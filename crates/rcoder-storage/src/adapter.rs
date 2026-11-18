@@ -221,6 +221,17 @@ impl ProjectAdapter {
                         Some(Arc::clone(ce)) // 回指权威条目
                     }
                     Entry::Vacant(e) => {
+                        // 诊断:首次登记容器行时记录落库的 service_type。
+                        // 这是"实际侧" family 的来源，与准入键不匹配时靠它定位。
+                        debug!(
+                            event = "workload.container_registered",
+                            container = %key,
+                            project_id = %project_id,
+                            service_type = %st,
+                            family_key = st.container_family_key(),
+                            container_id = %temp_entry.info().container_id,
+                            "registered canonical container"
+                        );
                         e.insert(Arc::clone(&temp_entry)); // 共享 temp Arc
                         None // info 已持 temp，无需回指
                     }
@@ -249,6 +260,16 @@ impl ProjectAdapter {
                     if previous != replacement {
                         // 注册表恒存族代表值（防御归一——st 虽经 facade setter
                         // 已归一，此权威 Arc 刷新点保持同一约定）
+                        debug!(
+                            event = "workload.container_refreshed",
+                            container = %key,
+                            project_id = %project_id,
+                            service_type = %st,
+                            family_key = st.container_family_key(),
+                            stored_family = %st.family_representative(),
+                            container_id = %replacement.container_id,
+                            "refreshed canonical container"
+                        );
                         existing_ref.update(replacement.clone(), st.family_representative());
                     }
                     drop(existing_ref); // 释放读锁后再操作其他 map

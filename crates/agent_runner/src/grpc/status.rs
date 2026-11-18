@@ -1,8 +1,8 @@
 //! GetStatus / GetContainerStatus / GetVncStatus RPC 实现
 
 use shared_types::grpc::{
-    GetContainerStatusRequest, GetContainerStatusResponse, GetStatusRequest, GetStatusResponse,
-    GetVncStatusRequest, GetVncStatusResponse,
+    AgentExecution, ContainerProcess, GetContainerStatusRequest, GetContainerStatusResponse,
+    GetStatusRequest, GetStatusResponse, GetVncStatusRequest, GetVncStatusResponse,
 };
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -136,11 +136,81 @@ pub async fn get_container_status(
         let (container_cpu_percent, container_memory_mb, container_memory_limit_mb, container_cpu_limit_cores) =
             crate::service::agent_resource_monitor::sample_container_resources();
 
+        // 容器内进程明细+分组聚合(req.include_processes 控制;旧调用方缺省 false 零开销)
+        let include_processes = req.include_processes.unwrap_or(false);
+        let (
+            processes,
+            process_count,
+            infra_rss_bytes,
+            platform_rss_bytes,
+            workload_rss_bytes,
+            agents,
+        ) = if include_processes {
+            // 一次 /proc 扫描同时产出容器维度与 agent 进程组维度，
+            // 观测端无需再调 /computer/agent/status。
+            let (rows, groups, agent_scan) =
+                crate::service::agent_resource_monitor::sample_container_processes_and_agents();
+            // 明细为空可能是"确实没有"也可能是"没采样"，两者在响应里长得一样
+            // (见 proto 契约)，只能靠日志区分。
+            tracing::debug!(
+                event = "container_status.process_scan",
+                include_processes,
+                rows = rows.len(),
+                agents = agent_scan.entries.len(),
+                registered = agent_scan.stats.registered,
+                dropped = agent_scan.stats.dropped(),
+                "container process scan result"
+            );
+            let process_rows = rows
+                .iter()
+                .map(|row| ContainerProcess {
+                    pid: row.pid,
+                    ppid: row.ppid,
+                    comm: row.comm.clone(),
+                    rss_bytes: row.rss_bytes,
+                    cpu_seconds: row.cpu_seconds,
+                    group: row.role.as_str().to_string(),
+                    args_head: row.args_head.clone(),
+                })
+                .collect();
+            // 每个 project 一条（多会话并存时不能只报一个）
+            let agents: Vec<AgentExecution> = agent_scan
+                .entries
+                .into_iter()
+                .map(|a| AgentExecution {
+                    project_id: a.project_id,
+                    session_id: a.session_id.unwrap_or_default(),
+                    status: a.status,
+                    rss_bytes: a.rss_bytes,
+                    cpu_seconds: a.cpu_seconds,
+                    process_count: a.process_count,
+                })
+                .collect();
+            (
+                process_rows,
+                // 空表只可能是扫描失败（本进程自己就在表里），此时报 None
+                // 表示「未知」而不是「0 个进程」：`Some(0)` 会被观测端当真，
+                // 反而比缺省更误导。扫描失败已在上面 warn 留痕。
+                (!rows.is_empty()).then_some(rows.len() as i32),
+                (!rows.is_empty()).then_some(groups.infra_rss_bytes),
+                (!rows.is_empty()).then_some(groups.platform_rss_bytes),
+                (!rows.is_empty()).then_some(groups.workload_rss_bytes),
+                agents,
+            )
+        } else {
+            (Vec::new(), None, None, None, None, Vec::new())
+        };
+
         let status = if active_tasks > 0 {
             "Processing".to_string()
         } else {
             "Idle".to_string()
         };
+
+        // agent 执行是否存在的**显式**判断,与资源采集是否降级无关:
+        // cpu_percent/memory_mb 在 /proc 读取失败、采样间隔不足时同样为 None,
+        // 用它们推断"agent 活着"会把活着的 agent 显示成已退出。
+        let agent_present = AGENT_REGISTRY.contains_project(&req.project_id);
 
         let response = GetContainerStatusResponse {
             is_active,
@@ -154,6 +224,13 @@ pub async fn get_container_status(
             container_memory_mb,
             container_memory_limit_mb,
             container_cpu_limit_cores,
+            processes,
+            process_count,
+            infra_rss_bytes,
+            platform_rss_bytes,
+            workload_rss_bytes,
+            agent_present: Some(agent_present),
+            agents,
         };
 
         debug!(
@@ -327,12 +404,22 @@ mod tests {
 
     #[test]
     fn preparing_without_a_session_keeps_container_active() {
-        let project = "container-status-preparation";
-        assert_eq!(get_active_tasks_count(0), 0);
-        AGENT_REGISTRY.set_pending(project);
-        assert!(get_active_tasks_count(0) > 0);
-        AGENT_REGISTRY.clear_pending_if_exists(project);
-        assert_eq!(get_active_tasks_count(0), 0);
+        // 断言**增量**而不是绝对值:get_active_tasks_count 读的是进程级全局
+        // AGENT_REGISTRY,并行测试随时可能注册/清理自己的 agent,写死"必须是 0"
+        // 会让本条随其它测试的调度随机失败(既有 flake)。
+        // project 也用 uuid 唯一化,避免与别的用例抢同一个 pending 键。
+        let project = format!("container-status-preparation-{}", uuid::Uuid::new_v4());
+        let baseline = get_active_tasks_count(0);
+        AGENT_REGISTRY.set_pending(&project);
+        assert!(
+            get_active_tasks_count(0) > baseline,
+            "pending preparation 必须让容器保持活跃"
+        );
+        AGENT_REGISTRY.clear_pending_if_exists(&project);
+        assert!(
+            get_active_tasks_count(0) <= baseline,
+            "清理后不得留下活跃计数"
+        );
     }
 
     #[test]

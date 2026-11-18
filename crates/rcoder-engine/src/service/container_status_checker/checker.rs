@@ -5,7 +5,7 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
-use tracing::{Instrument, debug, info, warn};
+use tracing::{Instrument, debug, info, trace, warn};
 
 use crate::app_state::AppState;
 use container_runtime_api::ContainerRuntimeError;
@@ -353,7 +353,8 @@ impl ContainerStatusChecker {
         )
         .await
         .map(|status| {
-            debug!(
+            // 30s 级高频心跳行,降为 trace 避免刷屏(错误/跳过路径仍为 debug)
+            trace!(
                 "[STATUS_CHECKER] Container status: user_id={}, is_active={}, active_tasks={}, status={}, last_activity={} ({})",
                 user_id,
                 status.is_active,
@@ -380,13 +381,13 @@ impl ContainerStatusChecker {
                 }
                 self.record_success(lookup_key, &scope);
                 if active {
-                    debug!(
+                    trace!(
                         "[STATUS_CHECKER] Container is active, updated activity time and status: container_key={}, project_id={}",
                         lookup_key, project_id
                     );
                     Ok(true)
                 } else {
-                    debug!(
+                    trace!(
                         "[STATUS_CHECKER] Container is idle, updated status to Idle: container_key={}, project_id={}",
                         lookup_key, project_id
                     );

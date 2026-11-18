@@ -14,6 +14,9 @@ use std::sync::OnceLock;
 pub struct FeatureFlags {
     /// 主线 Web/Computer per-agent PVC (per-agent subvolume + 配额 + lazy mv + batch migrate)
     pub per_agent_pvc: bool,
+    /// 主线 Web/Computer per-agent RBD (RWO 块盘 + 转发层 + wake-on-forward;
+    /// 与 per_agent_pvc(subvolume 变体)互斥 —— 挂根聚合/懒迁移与 RBD 转发路径冲突)
+    pub per_agent_rbd: bool,
     /// Userapp per-app PVC (新功能, 独立于主线; 依赖 cephfs-root 派生挂载 + SC Immediate)
     pub userapp_per_app_pvc: bool,
     /// rcoder 嵌入 Rust file-server (替代 nuwax-file-server 独立进程)
@@ -26,6 +29,7 @@ impl FeatureFlags {
     fn from_env() -> Self {
         Self {
             per_agent_pvc: env_flag("RCODER_PER_AGENT_PVC_ENABLED"),
+            per_agent_rbd: env_flag("RCODER_PER_AGENT_RBD_ENABLED"),
             userapp_per_app_pvc: env_flag("RCODER_USERAPP_PER_APP_PVC_ENABLED"),
             embed_file_server: env_flag("RCODER_EMBED_FILE_SERVER"),
             batch_migrate_on_startup: env_flag("RCODER_BATCH_MIGRATE_ON_STARTUP"),
@@ -36,9 +40,21 @@ impl FeatureFlags {
     /// 重复调用安全 (幂等, 日志会重复打印 — main 只调一次)。
     pub fn init() {
         let f = FEATURE_FLAGS.get_or_init(Self::from_env);
+        // 互斥 fail-fast: 双开必出数据路由错乱(subvolume 挂根聚合读 vs RBD 转发),
+        // 启动即死好过运行期静默写错卷。
+        if f.per_agent_pvc && f.per_agent_rbd {
+            panic!(
+                "RCODER_PER_AGENT_PVC_ENABLED 与 RCODER_PER_AGENT_RBD_ENABLED 互斥, \
+                 不允许同时开启 (subvolume 聚合路径与 RBD 转发路径冲突)"
+            );
+        }
         eprintln!(
-            "🔧 [FEATURE_FLAGS] per_agent_pvc={} userapp_per_app_pvc={} embed_file_server={} batch_migrate_on_startup={}",
-            f.per_agent_pvc, f.userapp_per_app_pvc, f.embed_file_server, f.batch_migrate_on_startup
+            "🔧 [FEATURE_FLAGS] per_agent_pvc={} per_agent_rbd={} userapp_per_app_pvc={} embed_file_server={} batch_migrate_on_startup={}",
+            f.per_agent_pvc,
+            f.per_agent_rbd,
+            f.userapp_per_app_pvc,
+            f.embed_file_server,
+            f.batch_migrate_on_startup
         );
     }
 
@@ -59,6 +75,80 @@ fn env_flag(key: &str) -> bool {
 pub fn per_agent_pvc_enabled() -> bool {
     FeatureFlags::get().per_agent_pvc
 }
+
+/// 主线 per-agent RBD 开关 (便捷访问, 内部读 [`FeatureFlags`] 单例)。
+pub fn per_agent_rbd_enabled() -> bool {
+    FeatureFlags::get().per_agent_rbd
+}
+
+/// per-agent workspace 的迁移状态（PVC annotation 投影, 判据层单一事实源）。
+///
+/// 两阶段迁移的状态机:
+/// ```text
+/// (无 PVC) ──phase-a──► PVC 存在 + NotMigrated ──cutover──► PVC 存在 + Migrated
+///                              │                                │
+///                        用户照常共享卷读写               agent 挂 RBD + 请求转发
+///                        (预同步期双份共存)               (共享卷保留作回滚)
+/// ```
+/// `Migrated` 是 agent 卷选择与转发判据的**唯一**开关——不是"PVC 存在"
+/// (预同步期 PVC 已存在但用户仍在共享卷, agent 重建若挂 RBD 旧副本即丢写)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceMigrationState {
+    /// 未迁移: PVC 可能存在(phase-a 预同步中)或不存在; 用户走共享卷。
+    NotMigrated,
+    /// 已迁移: cutover 完成; agent 挂 RBD, 请求走转发层。
+    Migrated,
+}
+
+impl WorkspaceMigrationState {
+    /// PVC annotation 值词表（持久化形态）。
+    pub fn as_annotation(self) -> Option<&'static str> {
+        match self {
+            Self::NotMigrated => None, // 不写 annotation = 未迁移（缺省语义）
+            Self::Migrated => Some("migrated"),
+        }
+    }
+
+    /// 从 PVC annotation 值解析; 无法识别的值按 [`Self::NotMigrated`]（fail-safe:
+    /// 认不出的一律按未迁移, 不会把用户误切到 RBD）。
+    pub fn from_annotation(value: Option<&str>) -> Self {
+        match value {
+            Some("migrated") => Self::Migrated,
+            _ => Self::NotMigrated,
+        }
+    }
+}
+
+/// per-agent workspace PVC 的迁移状态 annotation key。
+pub const WORKSPACE_MIGRATION_ANNOTATION: &str = "rcoder.io/workspace-migration";
+
+/// 迁移同步模式（rclone sync 的两种档）。
+///
+/// - `Full`：phase-a 预同步（首轮全量, 限速 `--bwlimit` 防 OSD 写风暴）
+/// - `Incremental`：cutover 切换增量（只补变化, 不限速求快; agent 已停,
+///   数据面冻结, 增量体积极小）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceSyncMode {
+    Full,
+    Incremental,
+}
+
+impl WorkspaceSyncMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Incremental => "incremental",
+        }
+    }
+}
+
+/// 迁移 Job 默认排除规则（可重建数据不迁——与 k8s/migration 脚本同词表）。
+/// node_modules/.cache/dist 重建即可; core.* 是 agent_runner core dump。
+pub const WORKSPACE_MIGRATION_EXCLUDES: &[&str] =
+    &["node_modules/", ".cache/", "dist/", "core.[0-9]*"];
+
+/// 迁移同步 Job 的 label（运维识别/清理用）。
+pub const WORKSPACE_MIGRATION_JOB_LABEL: &str = "rcoder.io/workspace-migration";
 
 // Userapp K8s 永远 per-app (代码不读开关, 无分裂);
 // FeatureFlags.userapp_per_app_pvc 字段保留供启动日志 + chart cephfs-root 派生标记。
@@ -458,4 +548,39 @@ pub const BUILTIN_AGENT_IDS: &[&str] = &[DEFAULT_AGENT_ID, "nuwaxcode"];
 /// 判断是否为内置 agent
 pub fn is_builtin_agent(agent_id: &str) -> bool {
     BUILTIN_AGENT_IDS.contains(&agent_id)
+}
+
+#[cfg(test)]
+mod migration_state_tests {
+    use super::*;
+
+    #[test]
+    fn annotation_roundtrip() {
+        assert_eq!(
+            WorkspaceMigrationState::Migrated.as_annotation(),
+            Some("migrated")
+        );
+        assert_eq!(WorkspaceMigrationState::NotMigrated.as_annotation(), None);
+    }
+
+    #[test]
+    fn from_annotation_fails_safe_to_not_migrated() {
+        // 认不出的一律按未迁移——不会把用户误切到 RBD
+        assert_eq!(
+            WorkspaceMigrationState::from_annotation(Some("migrated")),
+            WorkspaceMigrationState::Migrated
+        );
+        assert_eq!(
+            WorkspaceMigrationState::from_annotation(None),
+            WorkspaceMigrationState::NotMigrated
+        );
+        assert_eq!(
+            WorkspaceMigrationState::from_annotation(Some("MIGRATED")),
+            WorkspaceMigrationState::NotMigrated
+        );
+        assert_eq!(
+            WorkspaceMigrationState::from_annotation(Some("garbage")),
+            WorkspaceMigrationState::NotMigrated
+        );
+    }
 }

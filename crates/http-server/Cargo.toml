@@ -40,7 +40,6 @@ dial9 = ["rcoder-obs/dial9"]
 [dev-dependencies]
 rcoder-engine = { workspace = true, features = ["protocol-fixture"] }
 tokio = { workspace = true, features = ["test-util"] }
-filetime = { workspace = true }
 http-body-util = { workspace = true }
 
 [lints]
@@ -125,7 +124,6 @@ dashmap = { workspace = true }
 notify = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
-piper = { workspace = true }
 base64 = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
@@ -136,7 +134,6 @@ rustls = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 tracing-opentelemetry = { workspace = true }
-axum-tracing-opentelemetry = { workspace = true }
 
 # File system
 path-clean = { workspace = true }
@@ -146,11 +143,9 @@ utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
 utoipa-scalar = { workspace = true }
 
-ringbuf = { workspace = true }
 
 # Random and hashing
 rand = { workspace = true }
-md5 = { workspace = true }
 
 # Cache
 moka = { workspace = true }

@@ -13,7 +13,7 @@ struct OldOwner {
     state: PathBuf,
     address: String,
     identity: RuntimeIdentityView,
-    native: tokio::task::JoinHandle<anyhow::Result<i32>>,
+    native: tokio::task::JoinHandle<Result<i32>>,
     http: tokio::task::JoinHandle<()>,
 }
 

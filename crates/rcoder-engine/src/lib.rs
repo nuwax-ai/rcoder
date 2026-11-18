@@ -12,6 +12,7 @@ pub mod background_tasks;
 pub mod batch_migrate;
 pub mod bootstrap;
 pub mod cleanup_task;
+pub mod computer_forward;
 pub mod config;
 pub mod config_watcher;
 /// dial9 事件级 Tokio tracing 装配（`dial9` feature 专用；bin 的 main 手动

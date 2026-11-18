@@ -22,6 +22,8 @@ mod layers;
 mod metrics;
 mod userapp_proxy;
 
+pub mod sandbox;
+
 use std::sync::Arc;
 
 use axum::{
@@ -92,10 +94,17 @@ fn file_server_routes_with_intercept(
     state: &Arc<AppState>,
     merged: crate::file_server_embed::MergedFileServer,
 ) -> Router {
-    merged.router.layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        crate::userapp_forward::computer_intercept,
-    ))
+    merged
+        .router
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::userapp_forward::computer_intercept,
+        ))
+        // per-agent RBD 转发拦截（flag 关闭时逐字节放行; 详见 computer_forward::intercept）
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::computer_forward::computer_rbd_intercept,
+        ))
 }
 
 /// 创建 Axum 路由
@@ -103,6 +112,7 @@ pub fn create_router(
     state: Arc<AppState>,
     telemetry: Option<Arc<TelemetryGuard>>,
     merged_fs: crate::file_server_embed::MergedFileServer,
+    sandbox_deps: sandbox::SandboxDeps,
 ) -> Router {
     let mut router = Router::new()
         .merge(health_routes(&state))
@@ -110,6 +120,7 @@ pub fn create_router(
         .merge(computer::computer_routes(state.clone()))
         .merge(devcomputer::devcomputer_routes(state.clone()))
         .merge(userapp_proxy::proxy_api_routes(state.clone()))
+        .merge(handler::migration_api::routes().with_state(state.clone()))
         .merge(agent_mgmt::agent_mgmt_routes(state.clone()))
         .merge(app_manager_routes(&state))
         .merge(crate::userapp_builder::adoption::routes().with_state(state.clone()))
@@ -129,6 +140,12 @@ pub fn create_router(
         .merge(crate::router_docs::create_swagger_ui())
         .merge(crate::router_docs::create_scalar_docs());
 
+    // E2B 兼容沙箱控制面（独立 e2b key 鉴权链）
+    #[cfg(feature = "kubernetes")]
+    {
+        router = router.merge(sandbox::sandbox_routes(sandbox_deps.clone()));
+    }
+
     // 仅在启用 debug feature 时添加调试路由
     #[cfg(feature = "debug")]
     {
@@ -143,7 +160,7 @@ pub fn create_router(
     // 🆕 克隆共享的 API Key 配置用于中间件
     let api_key_config = Arc::clone(&state.api_key_config);
 
-    hotpath::axum!(apply_route_security(
+    let app = hotpath::axum!(apply_route_security(
         router,
         create_internal_routes(state.clone()),
         merged_fs
@@ -156,7 +173,17 @@ pub fn create_router(
     .layer(axum::middleware::from_fn_with_state(
         state.userapp_op_flight.clone(),
         admission_during_shutdown,
-    ))
+    ));
+    // E2B 数据面守卫（最外层）：带 E2b-Sandbox-Id 头的请求短路进流式代理，
+    // 不进入 rcoder 路由树，也不受全局 API key 约束（代理自身做 token 授权）。
+    #[cfg(feature = "kubernetes")]
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        sandbox_deps,
+        crate::middleware::sandbox_guard::e2b_data_plane_guard,
+    ));
+    #[cfg(not(feature = "kubernetes"))]
+    let _ = sandbox_deps;
+    app
 }
 
 /// Compose the real protected surfaces; preview keeps its own peer token.
@@ -212,6 +239,7 @@ mod assembly_guard {
             "computer::computer_routes",
             "userapp_proxy::proxy_api_routes",
             "agent_mgmt::agent_mgmt_routes",
+            "sandbox::sandbox_routes",
         ] {
             assert!(
                 src.contains(family),

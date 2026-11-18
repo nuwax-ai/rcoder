@@ -169,6 +169,9 @@ impl KubernetesRuntime {
                 &target.context.app_id,
                 &shared_types::ServiceType::UserappBuilder,
                 &params,
+                // UserappBuilder 有自己的卷逻辑(ensure_owned + 四 subPath),
+                // 不走 per-agent 单卷——per_agent_pvc/rbd 开关都不适用于它。
+                false,
             )?
         } else {
             // Repair/recovery did not authorize a release rollout. Retain its
