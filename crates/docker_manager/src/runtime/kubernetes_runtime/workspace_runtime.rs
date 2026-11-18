@@ -390,37 +390,6 @@ impl KubernetesRuntime {
         );
     }
 
-    /// per-agent 卷判据的**同步**版（best-effort, 供 replacement 等同步构造
-    /// 路径）：只读 30s TTL 缓存, 未命中/不确定 → false（保守共享路径）。
-    /// 权威判定在 async create 编排（查 PVC annotation, 见
-    /// k8s_agent_create 的 per_agent_volume 计算）。
-    pub(crate) fn cached_per_agent_volume(
-        &self,
-        identifier: &str,
-        service_type: &ServiceType,
-    ) -> bool {
-        if !matches!(
-            service_type,
-            ServiceType::ComputerAgentRunner | ServiceType::ComputerNormalProject
-        ) {
-            return false;
-        }
-        // subvolume 变体无 migrated 概念: 开关开即 per-agent
-        if shared_types::per_agent_pvc_enabled() {
-            return true;
-        }
-        if !shared_types::per_agent_rbd_enabled() {
-            return false;
-        }
-        match self.workspace_exists_cache.try_read() {
-            Ok(cache) => matches!(
-                cache.get(&self.migration_cache_key(identifier, service_type)),
-                Some((true, shared_types::WorkspaceMigrationState::Migrated, sampled))
-                    if sampled.elapsed() < std::time::Duration::from_secs(30)
-            ),
-            Err(_) => false,
-        }
-    }
 
     /// 读 PVC 的迁移 annotation（无法识别的值 → NotMigrated）。私有 helper
     /// （非 WorkspaceRuntime 接口——内部实现细节）。
