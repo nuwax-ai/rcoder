@@ -57,12 +57,14 @@ impl WorkspaceRuntime for KubernetesRuntime {
         use crate::runtime::k8s_pvc::K8sPvcOps;
         const TTL: std::time::Duration = std::time::Duration::from_secs(30);
         let cache_key = format!("{service_type}/{identifier}");
-        if let Some((exists, state, at)) = self.workspace_exists_cache.read().await.get(&cache_key)
+        if let Some((exists, _, at)) = self.workspace_exists_cache.read().await.get(&cache_key)
         {
             if at.elapsed() < TTL {
                 return Ok(*exists);
             }
         }
+        // sampled_at 语义同 migration_state(防旧值覆盖 set_state 的即时写)。
+        let sampled_at = std::time::Instant::now();
         let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
         // 单次 GET 同时取 exists + annotation(read_migration_annotation 会对
         // 同一 PVC 再发一次全量 GET——合并掉)。
@@ -84,10 +86,8 @@ impl WorkspaceRuntime for KubernetesRuntime {
                 )))
             }
         };
-        self.workspace_exists_cache
-            .write()
-            .await
-            .insert(cache_key, (exists, state, std::time::Instant::now()));
+        self.upsert_cache_if_not_stale(&cache_key, (exists, state), sampled_at)
+            .await;
         Ok(exists)
     }
 
@@ -110,6 +110,9 @@ impl WorkspaceRuntime for KubernetesRuntime {
         // PVC, 每请求两次 API); miss 后**回写缓存**——此前只读不写导致
         // intercept 每请求都打 API, 快路径名不副实, 且 replacement 冷缓存
         // 对 RBD 用户永远 Conflict 也同根于此。
+        // sampled_at 记 GET 发起时刻: 若期间 set_state 已写入更新值(如
+        // cutover 翻 Migrated), 本回写不得用旧查询结果覆盖(写时间单调)。
+        let sampled_at = std::time::Instant::now();
         let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
         let (exists, state) = match self.pvcs().get_opt(&pvc_name).await {
             Ok(Some(pvc)) => {
@@ -131,10 +134,8 @@ impl WorkspaceRuntime for KubernetesRuntime {
                 )))
             }
         };
-        self.workspace_exists_cache
-            .write()
-            .await
-            .insert(cache_key, (exists, state, std::time::Instant::now()));
+        self.upsert_cache_if_not_stale(&cache_key, (exists, state), sampled_at)
+            .await;
         Ok(state)
     }
 
@@ -355,6 +356,24 @@ impl WorkspaceRuntime for KubernetesRuntime {
 }
 
 impl KubernetesRuntime {
+    /// 缓存回写防旧值覆盖（并发终审 A）: 若现有条目的写入时刻晚于本次查询
+    /// 的发起时刻（如 cutover 的 set_state 即时写入），本次结果作废不回写。
+    /// set_state/ensure_workspace 的权威写入不经此守卫（无条件写）。
+    async fn upsert_cache_if_not_stale(
+        &self,
+        cache_key: &str,
+        value: (bool, shared_types::WorkspaceMigrationState),
+        sampled_at: std::time::Instant,
+    ) {
+        let mut cache = self.workspace_exists_cache.write().await;
+        if let Some((_, _, existing_at)) = cache.get(cache_key) {
+            if *existing_at > sampled_at {
+                return; // 期间已有更新写入, 旧查询结果作废
+            }
+        }
+        cache.insert(cache_key.to_string(), (value.0, value.1, std::time::Instant::now()));
+    }
+
     /// per-agent 卷判据的**同步**版（best-effort, 供 replacement 等同步构造
     /// 路径）：只读 30s TTL 缓存, 未命中/不确定 → false（保守共享路径）。
     /// 权威判定在 async create 编排（查 PVC annotation, 见

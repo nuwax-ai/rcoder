@@ -117,12 +117,13 @@ impl KubernetesRuntime {
                 )
                 .await?;
             } else {
-                // P0 防护: RBD 模式下新建 per-agent PVC 前探测共享卷存量。
-                // 非空 = 存量用户——建了空 RBD PVC 后混住判据立即切转发,
-                // 共享卷老数据静默不可见(用户文件"消失")。正确流程是先跑
-                // k8s/migration 两阶段迁移(预同步→cutover 增量)再建 PVC。
-                // 探测是 best-effort(共享卷未挂/形态不同 → 放行, 不阻断
-                // 合法新用户); 非空则 Conflict 拒绝。
+                // P0 防护(仅 NotMigrated 存量用户): flag 开但用户未迁移时,
+                // ensure 会建**空** RBD PVC——混住判据(存在即转发)立即把请求
+                // 送进空卷, 共享卷老数据静默不可见。正确流程先跑两阶段迁移。
+                // ⚠️ 只在 PVC 不存在时探测(终审修正): per_agent_volume=true
+                // 蕴含 Migrated, 其共享卷回滚副本必然非空——对 Migrated 用户
+                // 探测 = 每次 cutover 第 5 步 ensure 必误报 Conflict 且无法
+                // 自愈(状态已翻, 停机残留)。
                 if shared_types::per_agent_rbd_enabled()
                     && matches!(
                         service_type,
@@ -130,11 +131,21 @@ impl KubernetesRuntime {
                     )
                     && legacy_shared_workspace_nonempty(identifier).await
                 {
-                    return Err(ContainerRuntimeError::Conflict(format!(
-                        "legacy shared workspace for '{identifier}' is non-empty; \
-                         run k8s/migration two-phase migration (phase-a + cutover) \
-                         before creating per-agent RBD volume"
-                    )));
+                    // PVC 已存在(phase-a 建过/已迁移) = 流程内用户, 不拦;
+                    // PVC 缺失 + 共享卷非空 = 未迁移存量用户误触, 拒绝。
+                    let pvc_exists = self
+                        .pvcs()
+                        .get_opt(&self.workspace_pvc_name(identifier, &service_type)?)
+                        .await
+                        .map(|p| p.is_some())
+                        .unwrap_or(false);
+                    if !pvc_exists {
+                        return Err(ContainerRuntimeError::Conflict(format!(
+                            "legacy shared workspace for '{identifier}' is non-empty and no \
+                             per-agent PVC exists; run phase-a + cutover before creating \
+                             per-agent RBD volume"
+                        )));
+                    }
                 }
                 self.ensure_workspace_pvc(
                     identifier,

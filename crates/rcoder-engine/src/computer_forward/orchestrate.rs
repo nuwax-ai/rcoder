@@ -44,6 +44,13 @@ pub async fn phase_a(
     let service_type = ServiceType::ComputerAgentRunner;
     let mut steps = Vec::new();
 
+    // 编排互斥(终审 B/D): 与 ensure/chat 共用 per-workload 锁——封死并发
+    // 编排(Job 同名互删/同节点双挂 mirror 删数据)与编排期间 ensure 穿透
+    // 重建共享形态 agent。持锁后入口校验重读(排队方拿到锁时状态已可见)。
+    let _migration_lock = ComputerContainerManager::acquire_migration_lock(user_id)
+        .await
+        .map_err(|e| wrap("acquire_migration_lock", runtime_error_from_app(e)))?;
+
     // 入口校验: 已 Migrated 用户重跑 phase-a, rclone mirror 会把 RBD 上
     // cutover 后新写、共享卷没有的文件**全部删除**——必须显式拒绝。
     // (想重迁: 先 rollback → agent 重建回共享 → 再 phase-a。)
@@ -111,7 +118,12 @@ pub async fn cutover(
     let service_type = ServiceType::ComputerAgentRunner;
     let mut steps = Vec::new();
 
-    // 入口校验: 已 Migrated 重跑 cutover = mirror 删 RBD 新写数据(P0)。
+    // 编排互斥(同 phase_a)。
+    let migration_lock = ComputerContainerManager::acquire_migration_lock(user_id)
+        .await
+        .map_err(|e| wrap("acquire_migration_lock", runtime_error_from_app(e)))?;
+
+    // 入口校验①: 已 Migrated 重跑 = mirror 删 RBD 新写数据(P0)。
     if matches!(
         state
             .runtime()
@@ -123,6 +135,18 @@ pub async fn cutover(
         return Err(ContainerRuntimeError::Conflict(format!(
             "user '{user_id}' is already migrated; cutover is not idempotent-safe \
              to re-run (mirror sync would delete post-cutover writes)"
+        )));
+    }
+    // 入口校验②(终审补): dst PVC 必须存在(跑过 phase-a)——否则 NotFound
+    // 要到停 agent **之后**才触发, 留下停机残留。
+    if !state
+        .runtime()
+        .workspace_pvc_exists(user_id, &service_type)
+        .await
+        .map_err(|e| wrap("pvc_exists_check", e))?
+    {
+        return Err(ContainerRuntimeError::ContainerNotFound(format!(
+            "per-agent PVC for '{user_id}' not found; run phase-a before cutover"
         )));
     }
 
@@ -175,7 +199,10 @@ pub async fn cutover(
         .map_err(|e| wrap("set_migrated", e))?;
     steps.push("migration state = migrated".to_string());
 
-    // 5. 起 agent（ensure 幂等; migrated 已生效 → 重建即挂 per-agent RBD）
+    // 5. 起 agent（ensure 幂等; migrated 已生效 → 重建即挂 per-agent RBD）。
+    // 先释放编排锁——ensure 内部 acquire 同一 key, tokio Mutex 不可重入,
+    // 持锁调用必死锁(creation::acquire 的 WAITER_BUDGET 30s 全耗尽)。
+    drop(migration_lock);
     let resource_limits = state
         .config
         .kubernetes_config
@@ -221,6 +248,35 @@ pub async fn rollback(
     user_id: &str,
 ) -> Result<MigrationOutcome, ContainerRuntimeError> {
     let service_type = ServiceType::ComputerAgentRunner;
+    let mut steps = Vec::new();
+
+    let migration_lock = ComputerContainerManager::acquire_migration_lock(user_id)
+        .await
+        .map_err(|e| wrap("acquire_migration_lock", runtime_error_from_app(e)))?;
+    // 未迁移用户 rollback = no-op(幂等)
+    if matches!(
+        state
+            .runtime()
+            .workspace_migration_state(user_id, &service_type)
+            .await
+            .map_err(|e| wrap("migration_state_check", e))?,
+        WorkspaceMigrationState::NotMigrated
+    ) {
+        return Ok(MigrationOutcome {
+            user_id: user_id.to_string(),
+            action: "rollback",
+            migration_state: WorkspaceMigrationState::NotMigrated,
+            steps: vec!["already not-migrated, no-op".to_string()],
+        });
+    }
+    // C-1(终审): 翻标记前先停 agent——否则挂 RBD 的存量 agent 继续写 RBD,
+    // 而转发层判 NotMigrated 放行共享卷(双卷读写分裂, 窗口无界)。
+    state
+        .runtime()
+        .stop_container_by_identifier(user_id, &service_type)
+        .await
+        .map_err(|e| wrap("stop_agent", e))?;
+    steps.push("agent stopped".to_string());
     state
         .runtime()
         .set_workspace_migration_state(
@@ -230,11 +286,46 @@ pub async fn rollback(
         )
         .await
         .map_err(|e| wrap("set_not_migrated", e))?;
+    steps.push("migration state = not-migrated".to_string());
+    // 与 cutover 对称: 重建 agent(此时 NotMigrated → 共享卷形态)。
+    // ensure 前释放锁(不可重入)。
+    drop(migration_lock);
+    let resource_limits = state
+        .config
+        .kubernetes_config
+        .as_ref()
+        .and_then(|kc| kc.get_service_config(&service_type))
+        .map(|sc| sc.resource_limits.clone());
+    if let Some(limits) = resource_limits {
+        let options = ContainerCreateOptions {
+            user_id: user_id.to_string(),
+            project_id: user_id.to_string(),
+            resource_limits: Some(limits),
+            pod_id: None,
+            isolation_type: None,
+            tenant_id: None,
+            space_id: None,
+            service_type,
+        };
+        match ComputerContainerManager::ensure_container_for_user_with_type(
+            &options,
+            state.runtime(),
+        )
+        .await
+        {
+            Ok(_) => steps.push("agent restarted on shared volume".to_string()),
+            Err(e) => {
+                // 重建失败不阻断 rollback(标记已翻, 下次请求自会 ensure 重建)
+                tracing::warn!(user_id, error = %e, "[MIGRATION] rollback ensure agent failed");
+                steps.push("agent restart deferred (will rebuild on next request)".to_string());
+            }
+        }
+    }
     Ok(MigrationOutcome {
         user_id: user_id.to_string(),
         action: "rollback",
         migration_state: WorkspaceMigrationState::NotMigrated,
-        steps: vec!["migration state = not-migrated".to_string()],
+        steps,
     })
 }
 

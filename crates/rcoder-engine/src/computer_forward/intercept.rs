@@ -116,12 +116,15 @@ pub async fn computer_rbd_intercept(
     {
         Ok(state) => state,
         Err(error) => {
+            // fail-closed(终审修正): Migrated 用户遇 API 抖动时静默放行落
+            // 共享卷 = 读旧数据 + 写丢失(与 Invalid→400 同理由)——改 503,
+            // 调用方重试吸收。共享用户不受影响(其请求不走本分支的 Err 路径)。
             tracing::warn!(
                 user_id = %target.user_id,
                 error = %error,
-                "[COMPUTER_FORWARD] migration state check failed, pass through"
+                "[COMPUTER_FORWARD] migration state check failed, 503 fail-closed"
             );
-            return next.run(req).await;
+            return service_unavailable("workspace state temporarily unavailable");
         }
     };
     let is_rbd_user =
