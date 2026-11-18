@@ -411,6 +411,13 @@ impl SandboxStore for PgSandboxStore {
         failure_reason: Option<&str>,
         observed_state: Option<&str>,
     ) -> Result<SandboxInstanceRecord, SandboxStoreError> {
+        // 通用转移只覆盖非终态间的转移；终态化必须走 finish，Ready 必须走 mark_ready
+        // （它们各自携带额外的时间戳/UID 语义）。
+        if new_state.terminal() || new_state == SandboxInstanceState::Ready {
+            return Err(SandboxStoreError::InvalidOperation(format!(
+                "invalid transition target {new_state:?}: use finish/mark_ready"
+            )));
+        }
         let sandbox_id = sandbox_id.to_string();
         let state_str = new_state.as_str().to_string();
         let failure_reason = failure_reason.map(str::to_string);
@@ -422,7 +429,7 @@ impl SandboxStore for PgSandboxStore {
             let observed_state = observed_state.clone();
             Box::pin(async move {
                 let count = toasty::sql::statement(
-                    "UPDATE sandbox_instances SET desired_state=$1,failure_reason=$2,observed_state=$3,instance_revision=instance_revision+1,updated_at_us=$4 WHERE sandbox_id=$5 AND instance_revision=$6",
+                    "UPDATE sandbox_instances SET desired_state=$1,failure_reason=$2,observed_state=$3,instance_revision=instance_revision+1,updated_at_us=$4 WHERE sandbox_id=$5 AND instance_revision=$6 AND desired_state NOT IN ('deleted','failed')",
                 )
                 .bind(&state_str)
                 .bind_typed(failure_reason.as_deref(), Type::Text)
@@ -459,7 +466,7 @@ impl SandboxStore for PgSandboxStore {
             let pod_uid = pod_uid.clone();
             Box::pin(async move {
                 let count = toasty::sql::statement(
-                    "UPDATE sandbox_instances SET desired_state='ready',pod_uid=$1,ready_at_us=$2,expires_at_us=$3,instance_revision=instance_revision+1,updated_at_us=$4 WHERE sandbox_id=$5 AND instance_revision=$6",
+                    "UPDATE sandbox_instances SET desired_state='ready',pod_uid=$1,ready_at_us=$2,expires_at_us=$3,instance_revision=instance_revision+1,updated_at_us=$4 WHERE sandbox_id=$5 AND instance_revision=$6 AND desired_state='initializing'",
                 )
                 .bind_typed(pod_uid.as_deref(), Type::Text)
                 .bind(ready_at_us)
@@ -491,8 +498,9 @@ impl SandboxStore for PgSandboxStore {
         self.run(move |tx| {
             let sandbox_id = sandbox_id.clone();
             Box::pin(async move {
+                // set_expires 只对 Ready（续期）与 Terminating（kill 置 0）合法。
                 let count = toasty::sql::statement(
-                    "UPDATE sandbox_instances SET expires_at_us=$1,instance_revision=instance_revision+1,updated_at_us=$2 WHERE sandbox_id=$3 AND instance_revision=$4",
+                    "UPDATE sandbox_instances SET expires_at_us=$1,instance_revision=instance_revision+1,updated_at_us=$2 WHERE sandbox_id=$3 AND instance_revision=$4 AND desired_state IN ('ready','terminating')",
                 )
                 .bind(expires_at_us)
                 .bind(now_us())
@@ -527,8 +535,9 @@ impl SandboxStore for PgSandboxStore {
             let state_str = state_str.clone();
             let failure_reason = failure_reason.clone();
             Box::pin(async move {
+                // 终态行不可变：重复 finish 由调用方的终态预检 + 这里 0 行冲突兜底。
                 let count = toasty::sql::statement(
-                    "UPDATE sandbox_instances SET desired_state=$1,failure_reason=$2,deleted_at_us=$3,instance_revision=instance_revision+1,updated_at_us=$3 WHERE sandbox_id=$4 AND instance_revision=$5",
+                    "UPDATE sandbox_instances SET desired_state=$1,failure_reason=$2,deleted_at_us=$3,instance_revision=instance_revision+1,updated_at_us=$3 WHERE sandbox_id=$4 AND instance_revision=$5 AND desired_state NOT IN ('deleted','failed')",
                 )
                 .bind(&state_str)
                 .bind_typed(failure_reason.as_deref(), Type::Text)

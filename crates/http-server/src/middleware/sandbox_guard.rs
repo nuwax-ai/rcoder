@@ -46,11 +46,23 @@ pub(crate) fn resolve_target(uri: &Uri, headers: &axum::http::HeaderMap) -> Opti
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty())
     {
-        let port = headers
-            .get("E2b-Sandbox-Port")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<i32>().ok())
-            .unwrap_or(ENVD_PORT);
+        let port = match headers.get("E2b-Sandbox-Port") {
+            None => ENVD_PORT,
+            // 端口头非法（非数字/越界）不得静默回落默认端口——那会把
+            // 恶意构造的端口重定向到 envd；放行给控制面（404）。
+            Some(value) => {
+                let Some(text) = value.to_str().ok() else {
+                    return None;
+                };
+                let Ok(port) = text.trim().parse::<i32>() else {
+                    return None;
+                };
+                if !(1..=65535).contains(&port) {
+                    return None;
+                }
+                port
+            }
+        };
         let rest = uri
             .path_and_query()
             .map(|value| value.as_str())
@@ -486,6 +498,25 @@ mod tests {
             ("e2b-sandbox-port", "8788"),
         ]));
         assert_eq!(resolved, Some(("abc123".to_string(), 8788, "/mcp".to_string())));
+    }
+
+    #[test]
+    fn header_mode_rejects_malformed_port() {
+        // 非法端口不得静默回落 49983（等于把恶意端口重定向到 envd）
+        for bad in ["", "abc", "99999999999", "-1", "65536"] {
+            let uri: Uri = "/x".parse().unwrap();
+            assert_eq!(
+                resolve_target(
+                    &uri,
+                    &headers(&[
+                        ("e2b-sandbox-id", "abc123"),
+                        ("e2b-sandbox-port", bad),
+                    ])
+                ),
+                None,
+                "端口 {bad:?} 应放行给控制面"
+            );
+        }
     }
 
     #[test]

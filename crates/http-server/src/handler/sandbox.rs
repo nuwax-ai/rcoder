@@ -22,9 +22,17 @@ fn wire_error(error: SandboxApiError) -> Response {
         SandboxApiError::NotSupported(_) => StatusCode::NOT_IMPLEMENTED,
         SandboxApiError::Unavailable(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
+    // 5xx 的内部细节（k8s/PG 错误原文，含 pod 名等）只进日志，不进响应体。
+    let message = match &error {
+        SandboxApiError::Unavailable(reason) => {
+            tracing::warn!(error = %reason, "e2b sandbox 5xx（细节已隐藏）");
+            "服务暂不可用，请稍后重试".to_string()
+        }
+        other => other.to_string(),
+    };
     let body = serde_json::json!({
         "code": status.as_u16(),
-        "message": error.to_string(),
+        "message": message,
     });
     (status, axum::Json(body)).into_response()
 }
@@ -82,7 +90,9 @@ fn wire_from_record(
         clientID: client_id,
         envdVersion: record.envd_version.clone(),
         envdAccessToken: token,
-        trafficAccessToken: record.token_hash[..16].to_string(),
+        // 官方 wire 的 trafficAccessToken 是独立签发的令牌；我们没有等价物，
+        // 也不得把存储的 token_hash 前缀当令牌回传（哈希片段泄露）。
+        trafficAccessToken: String::new(),
         domain: domain.to_string(),
         metadata: record
             .metadata

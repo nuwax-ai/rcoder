@@ -107,13 +107,14 @@ impl SandboxManager {
     ) -> Result<Self, String> {
         let key_bytes = hex::decode(config.token_key_hex.trim())
             .map_err(|error| format!("e2b_sandbox token_key_hex 解析失败: {error}"))?;
-        let key = aes_gcm::Key::<Aes256Gcm>::from_slice(&key_bytes);
+        // 长度校验必须在 from_slice 之前——它对错误长度是 panic 而非错误。
         if key_bytes.len() != 32 {
             return Err(format!(
                 "e2b_sandbox token_key_hex 长度错误: {} 字节（需要 32）",
                 key_bytes.len()
             ));
         }
+        let key = aes_gcm::Key::<Aes256Gcm>::from_slice(&key_bytes);
         Ok(Self {
             store,
             k8s,
@@ -933,29 +934,37 @@ impl SandboxManager {
                 "volume \"{name}\" 已存在"
             )));
         }
+        // 先落行（(tenant,name) 唯一索引承担并发仲裁），再建 PVC——
+        // 回收器只删"无行或已软删"的 PVC，这个顺序保证新卷不会被对账误删。
         let volume_id = random_id(12);
         let pvc_name = format!("e2b-vol-{volume_id}");
-        self.k8s
-            .create_pvc(&pvc_name, &self.volume_storage_class, size_gib)
-            .await
-            .map_err(k8s_error)?;
         let now = chrono::Utc::now().timestamp_micros();
         let record = shared_types::sandbox::SandboxVolumeRecord {
             volume_id: volume_id.clone(),
             tenant_id: key.tenant_id.clone(),
             key_id: key.key_id.clone(),
             name: name.to_string(),
-            pvc_name,
+            pvc_name: pvc_name.clone(),
             storage_class: self.volume_storage_class.clone(),
             size_gib,
             created_at_us: now,
             updated_at_us: now,
             deleted_at_us: None,
         };
-        // 插入失败（同名竞态等）时回收已建的 PVC，不留无主卷。
-        if let Err(error) = self.store.insert_volume(&record).await {
-            let _ = self.k8s.delete_pvc(&record.pvc_name).await;
-            return Err(store_error(error));
+        let record = self
+            .store
+            .insert_volume(&record)
+            .await
+            .map_err(store_error)?;
+        if let Err(error) = self
+            .k8s
+            .create_pvc(&pvc_name, &self.volume_storage_class, size_gib)
+            .await
+        {
+            // 建卷失败回滚：软删行 + 清理可能半建的 PVC。
+            let _ = self.store.mark_volume_deleted(&volume_id).await;
+            let _ = self.k8s.delete_pvc(&pvc_name).await;
+            return Err(k8s_error(error));
         }
         Ok(record)
     }
@@ -1344,6 +1353,40 @@ impl SandboxManager {
                     Err(error) => {
                         tracing::warn!(sandbox_id = %record.sandbox_id, error = %error.to_string(), "e2b reaper 清理删除失败，保留待清理");
                     }
+                }
+            }
+            // PVC 对账（P1-5b）：行已软删或不存在的卷，其 PVC 兜底回收——
+            // 覆盖 delete_volume 的 PVC 删除失败与 create_volume 的半建残留。
+            // 查询失败时保守跳过（本轮不删任何 PVC）。
+            match self.k8s.list_volume_pvcs().await {
+                Ok(pvc_names) => {
+                    for pvc_name in pvc_names {
+                        let Some(volume_id) = pvc_name.strip_prefix("e2b-vol-") else {
+                            continue;
+                        };
+                        let orphaned = match self.store.get_volume(volume_id).await {
+                            Ok(None) => true,
+                            Ok(Some(volume)) => volume.deleted_at_us.is_some(),
+                            Err(error) => {
+                                tracing::warn!(%pvc_name, error = %error, "e2b reaper PVC 对账查询失败，保守跳过");
+                                false
+                            }
+                        };
+                        if !orphaned {
+                            continue;
+                        }
+                        match self.k8s.delete_pvc(&pvc_name).await {
+                            Ok(_) => {
+                                tracing::info!(%pvc_name, "e2b reaper: 回收孤儿 PVC");
+                            }
+                            Err(error) => {
+                                tracing::warn!(%pvc_name, error = %error.to_string(), "e2b reaper PVC 回收失败，下轮重试");
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error.to_string(), "e2b reaper PVC 列举失败");
                 }
             }
         }

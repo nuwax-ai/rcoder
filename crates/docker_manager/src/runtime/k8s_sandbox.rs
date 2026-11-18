@@ -128,6 +128,21 @@ impl SandboxK8s {
         }
     }
 
+    /// 列出本沙箱命名空间的卷 PVC（label 由 create_pvc 打上）。
+    /// 回收器用它对账"行已软删/不存在"的孤儿 PVC。
+    pub async fn list_volume_pvcs(&self) -> Result<Vec<String>, SandboxK8sError> {
+        let params = kube::api::ListParams::default()
+            .labels("app=e2b-sandbox,e2b-volume=true");
+        let pvcs = Api::<PersistentVolumeClaim>::namespaced(self.client.clone(), &self.namespace)
+            .list(&params)
+            .await
+            .map_err(|error| err("list pvcs", error))?;
+        Ok(pvcs
+            .iter()
+            .filter_map(|pvc| pvc.metadata.name.clone())
+            .collect())
+    }
+
     fn pods(&self) -> Api<Pod> {
         Api::namespaced(self.client.clone(), &self.namespace)
     }
@@ -167,7 +182,12 @@ impl SandboxK8s {
                         .volume_mounts
                         .iter()
                         .map(|(pvc_name, mount_path)| VolumeMount {
-                            name: format!("vol-{}", pvc_name.trim_start_matches("e2b-vol-")),
+                            // strip_prefix 而非 trim_start_matches——后者会重复剥
+                            // （"e2b-vol-e2b-vol-x" → "x"）且不校验前缀存在。
+                            name: format!(
+                                "vol-{}",
+                                pvc_name.strip_prefix("e2b-vol-").unwrap_or(pvc_name)
+                            ),
                             mount_path: mount_path.clone(),
                             ..Default::default()
                         })
@@ -191,7 +211,10 @@ impl SandboxK8s {
             .volume_mounts
             .iter()
             .map(|(pvc_name, _)| Volume {
-                name: format!("vol-{}", pvc_name.trim_start_matches("e2b-vol-")),
+                name: format!(
+                    "vol-{}",
+                    pvc_name.strip_prefix("e2b-vol-").unwrap_or(pvc_name)
+                ),
                 persistent_volume_claim: Some(k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
                     claim_name: pvc_name.clone(),
                     ..Default::default()
