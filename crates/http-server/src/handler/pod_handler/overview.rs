@@ -353,7 +353,7 @@ pub async fn pod_overview(
         let severity = |p: &container_runtime_api::pod_overview::PodOverviewItem| {
             (
                 !p.ready,
-                is_oom_reason(p.health.last_terminate_reason.as_deref()),
+                p.health.last_termination.as_ref().is_some_and(|t| t.is_oom),
                 p.health.restart_count > 0,
             )
         };
@@ -411,7 +411,12 @@ fn summarize(snapshot: &PodOverviewSnapshot) -> PodOverviewSummary {
         if pod.health.restart_count > 0 {
             summary.restarted += 1;
         }
-        if is_oom_reason(pod.health.last_terminate_reason.as_deref()) {
+        if pod
+            .health
+            .last_termination
+            .as_ref()
+            .is_some_and(|t| t.is_oom)
+        {
             summary.oom_killed_last += 1;
         }
         if pod.events.iter().any(|e| e.event_type == "Warning") {
@@ -435,6 +440,7 @@ mod tests {
             name: name.to_string(),
             workload: None,
             identity: None,
+            pod_uid: None,
             phase: "Running".to_string(),
             ready,
             node: None,
@@ -444,7 +450,14 @@ mod tests {
             usage: None,
             health: container_runtime_api::pod_overview::PodHealth {
                 restart_count: restarts,
-                last_terminate_reason: oom.then(|| "OOMKilled".to_string()),
+                last_termination: oom.then(|| {
+                    container_runtime_api::pod_overview::LastTermination {
+                        reason: Some("OOMKilled".to_string()),
+                        exit_code: Some(137),
+                        finished_at: None,
+                        is_oom: true,
+                    }
+                }),
                 ..Default::default()
             },
             events: Vec::new(),
@@ -485,7 +498,7 @@ mod tests {
             let severity = |p: &container_runtime_api::pod_overview::PodOverviewItem| {
                 (
                     !p.ready,
-                    is_oom_reason(p.health.last_terminate_reason.as_deref()),
+                    p.health.last_termination.as_ref().is_some_and(|t| t.is_oom),
                     p.health.restart_count > 0,
                 )
             };

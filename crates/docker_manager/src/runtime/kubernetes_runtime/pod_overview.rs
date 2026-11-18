@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use container_runtime_api::AppEventInfo;
 use container_runtime_api::pod_overview::{
     PodHealth, PodIdentity, PodOverviewDegraded, PodOverviewItem, PodOverviewSnapshot,
-    PodResourcesSpec, PodUsage, PodVolumeSpec, PodWorkload, group_events_by_pod,
+    PodResourcesSpec, PodUsage, PodVolumeSpec, PodWorkload, group_events_by_pod, sampled_now,
 };
 use k8s_openapi::api::core::v1::{Event, PersistentVolumeClaim, Pod};
 use kube::api::{Api, ListParams};
@@ -154,6 +154,7 @@ impl super::KubernetesRuntime {
                 name: name.clone(),
                 workload: workload_from_owner(&pod),
                 identity,
+                pod_uid: pod.metadata.uid.clone(),
                 phase,
                 ready,
                 node: pod.spec.as_ref().and_then(|s| s.node_name.clone()),
@@ -263,9 +264,15 @@ fn pod_health_from_status(pod: &Pod) -> (bool, PodHealth) {
             PodHealth {
                 restart_count: diagnostic.restart_count,
                 restart_source: "container_status".to_string(),
-                last_terminate_reason: diagnostic.last_terminate_reason,
-                last_exit_code: diagnostic.last_exit_code,
-                last_terminate_at: None,
+                last_termination: diagnostic.last_terminate_reason.map(|reason| {
+                    let is_oom = reason == "OOMKilled";
+                    container_runtime_api::pod_overview::LastTermination {
+                        reason: Some(reason),
+                        exit_code: diagnostic.last_exit_code,
+                        finished_at: terminated_finished_at(cs),
+                        is_oom,
+                    }
+                }),
                 waiting_reason: diagnostic.waiting_reason,
                 detail: Some(format!(
                     "init container {}: {}",
@@ -323,9 +330,15 @@ fn pod_health_from_status(pod: &Pod) -> (bool, PodHealth) {
         PodHealth {
             restart_count: diagnostic.restart_count,
             restart_source: "container_status".to_string(),
-            last_terminate_reason: diagnostic.last_terminate_reason,
-            last_exit_code: diagnostic.last_exit_code,
-            last_terminate_at: terminated_finished_at(cs),
+            last_termination: diagnostic.last_terminate_reason.map(|reason| {
+                let is_oom = reason == "OOMKilled";
+                container_runtime_api::pod_overview::LastTermination {
+                    reason: Some(reason),
+                    exit_code: diagnostic.last_exit_code,
+                    finished_at: terminated_finished_at(cs),
+                    is_oom,
+                }
+            }),
             waiting_reason: diagnostic.waiting_reason,
             detail: diagnostic.detail,
         },
@@ -566,6 +579,7 @@ impl super::KubernetesRuntime {
             // 不伪装成 not found。
             return Ok(Some(ContainerHealth {
                 container_name: identifier.to_string(),
+                pod_name: pod.metadata.name.clone(),
                 pod_uid: pod.metadata.uid.clone(),
                 alive: false,
                 phase,
@@ -575,7 +589,7 @@ impl super::KubernetesRuntime {
                 started_at: None,
                 waiting_reason: Some("ContainerStatusPending".to_string()),
                 detail: Some("container statuses not available yet".to_string()),
-                sampled_at: chrono::Utc::now(),
+                sampled_at: sampled_now(),
                 source: "kubernetes".to_string(),
             }));
         };
@@ -622,6 +636,7 @@ impl super::KubernetesRuntime {
 
         Ok(Some(ContainerHealth {
             container_name: identifier.to_string(),
+            pod_name: pod.metadata.name.clone(),
             pod_uid: pod.metadata.uid.clone(),
             alive,
             phase,
@@ -631,7 +646,7 @@ impl super::KubernetesRuntime {
             started_at,
             waiting_reason: diagnostic.waiting_reason.clone(),
             detail: diagnostic.detail.clone(),
-            sampled_at: chrono::Utc::now(),
+            sampled_at: sampled_now(),
             source: "kubernetes".to_string(),
         }))
     }
@@ -830,7 +845,10 @@ mod overview_tests {
         assert!(!ready);
         assert_eq!(health.restart_count, 6, "init 的重启数要浮出来");
         assert_eq!(
-            health.last_terminate_reason.as_deref(),
+            health
+                .last_termination
+                .as_ref()
+                .and_then(|t| t.reason.as_deref()),
             Some("OOMKilled"),
             "init 的 OOMKilled 要浮出来"
         );
@@ -864,7 +882,13 @@ mod overview_tests {
         }
         let (ready, health) = pod_health_from_status(&pod);
         assert!(ready, "主容器 ready，完成 init 的历史不覆盖");
-        assert_ne!(health.last_terminate_reason.as_deref(), Some("OOMKilled"));
+        assert_ne!(
+            health
+                .last_termination
+                .as_ref()
+                .and_then(|t| t.reason.as_deref()),
+            Some("OOMKilled")
+        );
         assert_eq!(health.restart_count, 0);
     }
 
@@ -882,7 +906,13 @@ mod overview_tests {
         }
         let (ready, health) = pod_health_from_status(&pod);
         assert!(ready, "主容器 ready，就绪 sidecar 的历史不覆盖");
-        assert_ne!(health.last_terminate_reason.as_deref(), Some("OOMKilled"));
+        assert_ne!(
+            health
+                .last_termination
+                .as_ref()
+                .and_then(|t| t.reason.as_deref()),
+            Some("OOMKilled")
+        );
     }
 
     /// F2：主容器名已知（spec 里有 db）但状态缺席——保持未就绪并说明，
@@ -945,7 +975,13 @@ mod overview_tests {
         let (ready, health) = pod_health_from_status(&pod);
         assert!(!ready, "主容器 db 未就绪，不能报 ready");
         assert_eq!(health.restart_count, 6);
-        assert_eq!(health.last_terminate_reason.as_deref(), Some("OOMKilled"));
+        assert_eq!(
+            health
+                .last_termination
+                .as_ref()
+                .and_then(|t| t.reason.as_deref()),
+            Some("OOMKilled")
+        );
     }
 
     /// 正常完成的 init（无 waiting、无异常 lastState）不覆盖主容器健康。

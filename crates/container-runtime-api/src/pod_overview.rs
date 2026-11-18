@@ -19,6 +19,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::AppEventInfo;
 
+/// 采样时间戳，**秒精度**。
+///
+/// 与 `last_termination.finished_at` / `started_at`（都来自 k8s/Docker 的
+/// 秒级时间）保持一致——若这里用 `Utc::now()` 会输出 9 位小数，调用方
+/// 解析同一份响应里的时间字段就得处理两种精度。
+pub fn sampled_now() -> DateTime<Utc> {
+    let now = Utc::now();
+    DateTime::from_timestamp(now.timestamp(), 0).unwrap_or(now)
+}
+
 /// 概览过滤参数。所有字段可选；`search` 是大小写不敏感的子串匹配，
 /// 命中 `name` 或 `identity` 任一字段即保留。
 ///
@@ -48,6 +58,11 @@ pub struct PodOverviewItem {
     /// 业务身份（结构化，不从名字反解；非 rcoder 管理的 Pod 为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity: Option<PodIdentity>,
+    /// 物理身份（k8s: Pod UID）。与 `/computer/pod/health` 的 `pod_uid`
+    /// **同一个值**——用它判断"容器是否被删除重建"，重建后此值会变、
+    /// `restart_count` 归零。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod_uid: Option<String>,
     /// k8s Pod phase（Running/Pending/…）；docker 用 State.Status（running/exited/…）
     pub phase: String,
     /// 主容器是否 ready（docker：running 即 ready）
@@ -168,8 +183,20 @@ pub struct PodVolumeSpec {
 /// - `pod_uid` 变化 = 容器被删除重建（计数归零），前端据此识别换代。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ContainerHealth {
-    /// 容器/Pod 名
+    /// **稳定的容器标识**（k8s: workload 名，如
+    /// `rcoder-computer-agent-runner-6`；docker: 容器名）。
+    ///
+    /// 用它与 `/computer/pod/resources`、`/computer/pod/overview` 的
+    /// `workload.name` 对齐——**跨容器重建不变**，适合做业务侧的关联键。
+    /// 想看具体 Pod（排障 / kubectl logs）用 `pod_name`。
     pub container_name: String,
+    /// 实际 Pod 名（k8s: `metadata.name`，如
+    /// `rcoder-computer-agent-runner-6-0`；docker: 与 `container_name` 相同）。
+    ///
+    /// 与 `/computer/pod/overview` 的 `items[].name` **同一个值**——两接口
+    /// 用它可以互相定位。容器重建后序号可能变化，**不要**拿它做长期关联键。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod_name: Option<String>,
     /// 物理身份（k8s: Pod UID；docker: container ID）。
     /// 变化即代表"换了一个容器"，历史计数不再可比。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -271,18 +298,13 @@ pub struct PodHealth {
     pub restart_count: u32,
     /// 重启计数的来源："container_status"（k8s）| "docker_events"（docker）
     pub restart_source: String,
-    /// 最近一次终止原因（"OOMKilled" / "Error" / "Completed" / …；
-    /// 从未终止为 None）。**是否 OOM 就是本字段是否等于 "OOMKilled"**——
-    /// 不再单列 `oom_killed_last`：把 OOM 提到顶层会让人误以为非 OOM 时
-    /// 没有健康信息。
+    /// **最近一次终止**的完整信息（任何原因），与
+    /// `/computer/pod/health` 的 `health.last_termination` **结构完全一致**
+    /// —— 两个接口对同一概念用同一个形状，调用方只需一套解析逻辑。
+    ///
+    /// `None` = 从未终止过。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_terminate_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_exit_code: Option<i32>,
-    /// 最近一次终止的**时间**（k8s `lastState.terminated.finishedAt`；
-    /// docker `die` 事件时间）。任何原因的终止都有值，非 OOM 同样可读。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_terminate_at: Option<DateTime<Utc>>,
+    pub last_termination: Option<LastTermination>,
     /// k8s waiting 原因（CrashLoopBackOff / ContainerCreating / …）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting_reason: Option<String>,
@@ -429,6 +451,7 @@ mod tests {
                 app_id: app.map(str::to_string),
                 ..Default::default()
             }),
+            pod_uid: None,
             phase: "Running".to_string(),
             ready: true,
             node: None,

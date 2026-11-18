@@ -216,6 +216,7 @@ pub async fn computer_pod_health(
             // 目标解析成功但容器不存在：名字仍然填上（前端要显示"是哪个
             // 容器不在"），source 标 "none" 而不是空串
             container_name: target.identifier.clone(),
+            pod_name: None,
             alive: false,
             phase: "NotFound".to_string(),
             ready: false,
@@ -228,7 +229,7 @@ pub async fn computer_pod_health(
             detail: Some(
                 "container not found (k8s: not created yet; docker: already removed)".to_string(),
             ),
-            sampled_at: chrono::Utc::now(),
+            sampled_at: container_runtime_api::pod_overview::sampled_now(),
             source: "none".to_string(),
             pod_uid: None,
         };
@@ -271,6 +272,7 @@ pub async fn computer_pod_health(
             });
         let absent = container_runtime_api::ContainerHealth {
             container_name: container.container_name.clone(),
+            pod_name: None,
             alive: false,
             phase: "NotFound".to_string(),
             last_termination: history,
@@ -278,7 +280,7 @@ pub async fn computer_pod_health(
                 "container disappeared between locate and inspect (docker auto_remove)".to_string(),
             ),
             source: "none".to_string(),
-            sampled_at: chrono::Utc::now(),
+            sampled_at: container_runtime_api::pod_overview::sampled_now(),
             ..Default::default()
         };
         cache_write(key, absent.clone()).await;

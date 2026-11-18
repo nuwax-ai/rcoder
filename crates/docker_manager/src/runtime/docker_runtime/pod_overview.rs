@@ -22,7 +22,7 @@ use bollard::query_parameters::{
 use container_runtime_api::AppEventInfo;
 use container_runtime_api::pod_overview::{
     PodHealth, PodIdentity, PodOverviewDegraded, PodOverviewItem, PodOverviewSnapshot,
-    PodResourcesSpec, PodUsage, PodVolumeSpec,
+    PodResourcesSpec, PodUsage, PodVolumeSpec, sampled_now,
 };
 use futures_util::StreamExt;
 use tracing::warn;
@@ -199,6 +199,7 @@ impl super::DockerRuntime {
                 name: name.clone(),
                 workload: None, // docker：容器名即 workload 身份
                 identity,
+                pod_uid: (!cid.is_empty()).then(|| cid.clone()),
                 phase,
                 ready: running,
                 node: None,
@@ -405,6 +406,8 @@ impl super::DockerRuntime {
 
         Ok(Some(ContainerHealth {
             container_name: name.to_string(),
+            // docker 没有 Pod 概念：两者同值，方便调用方统一处理
+            pod_name: Some(name.to_string()),
             pod_uid: (!cid.is_empty()).then_some(cid),
             alive,
             phase,
@@ -441,7 +444,7 @@ impl super::DockerRuntime {
                     .filter(|e| !e.is_empty())
                     .or_else(|| oom_note.map(str::to_string))
             },
-            sampled_at: chrono::Utc::now(),
+            sampled_at: sampled_now(),
             source: "docker".to_string(),
         }))
     }
@@ -839,33 +842,40 @@ fn docker_health(state: Option<&ContainerState>, events: &[&RawEvent]) -> PodHea
             .to_string(),
         )
     };
+    // 终止时间：事件里最近 die 的时间优先，退回 State.FinishedAt
+    let finished_at = events
+        .iter()
+        .find(|e| e.action == "die")
+        .map(|e| e.time_nano)
+        .filter(|nano| *nano > 0)
+        .and_then(|nano| {
+            chrono::DateTime::from_timestamp(
+                nano.div_euclid(1_000_000_000),
+                nano.rem_euclid(1_000_000_000) as u32,
+            )
+        })
+        .or_else(|| {
+            // Docker 对**运行中**容器返回 State.FinishedAt =
+            // "0001-01-01T00:00:00Z"（零值，不是 None）——不过滤会把
+            // "从未终止"显示成 0001 年。
+            state
+                .and_then(|s| s.finished_at.as_ref())
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t.to_string()).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .filter(|dt| dt.timestamp() > 0)
+        });
     PodHealth {
         restart_count,
         restart_source: "docker_events".to_string(),
-        last_terminate_reason,
-        last_exit_code: exit_code,
-        // 终止时间：事件里最近 die 的时间优先，退回 State.FinishedAt
-        last_terminate_at: events
-            .iter()
-            .find(|e| e.action == "die")
-            .map(|e| e.time_nano)
-            .filter(|nano| *nano > 0)
-            .and_then(|nano| {
-                chrono::DateTime::from_timestamp(
-                    nano.div_euclid(1_000_000_000),
-                    nano.rem_euclid(1_000_000_000) as u32,
-                )
-            })
-            .or_else(|| {
-                // Docker 对**运行中**容器返回 State.FinishedAt =
-                // "0001-01-01T00:00:00Z"（零值，不是 None）——不过滤会把
-                // "从未终止"显示成 0001 年。
-                state
-                    .and_then(|s| s.finished_at.as_ref())
-                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t.to_string()).ok())
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .filter(|dt| dt.timestamp() > 0)
-            }),
+        last_termination: last_terminate_reason.map(|reason| {
+            let is_oom = reason == "OOMKilled";
+            container_runtime_api::pod_overview::LastTermination {
+                reason: Some(reason),
+                exit_code,
+                finished_at,
+                is_oom,
+            }
+        }),
         waiting_reason: None, // docker 无 CrashLoopBackOff 概念
         detail: state
             .and_then(|s| s.error.clone())
@@ -978,16 +988,25 @@ mod tests {
         };
         let health = docker_health(Some(&state), &events.iter().collect::<Vec<_>>());
         assert_eq!(
-            health.last_terminate_reason.as_deref(),
+            health
+                .last_termination
+                .as_ref()
+                .and_then(|t| t.reason.as_deref()),
             Some("OOMKilled"),
             "oom→die(137)→start 的最近周期是 OOM"
         );
         assert_eq!(
-            health.last_exit_code,
+            health.last_termination.as_ref().and_then(|t| t.exit_code),
             Some(137),
             "退出码取 die 的 137，不被当前运行态 0 覆盖"
         );
-        assert_eq!(health.last_terminate_reason.as_deref(), Some("OOMKilled"));
+        assert_eq!(
+            health
+                .last_termination
+                .as_ref()
+                .and_then(|t| t.reason.as_deref()),
+            Some("OOMKilled")
+        );
         assert_eq!(health.restart_count, 1);
     }
 
@@ -1019,11 +1038,17 @@ mod tests {
         };
         let health = docker_health(Some(&state), &events.iter().collect::<Vec<_>>());
         assert_eq!(
-            health.last_terminate_reason.as_deref(),
+            health
+                .last_termination
+                .as_ref()
+                .and_then(|t| t.reason.as_deref()),
             Some("OOMKilled"),
             "die 仍是最近的实际退出，其周期内 oom 有效"
         );
-        assert_eq!(health.last_exit_code, Some(137));
+        assert_eq!(
+            health.last_termination.as_ref().and_then(|t| t.exit_code),
+            Some(137)
+        );
     }
 
     /// 四轮收口：inspect 身份核验三态——匹配✓、接替者✗、空/缺席✗。
@@ -1125,11 +1150,10 @@ mod tests {
             ..Default::default()
         };
         let health = docker_health(Some(&state), &[]);
-        assert_eq!(
-            health.last_terminate_reason, None,
+        assert!(
+            health.last_termination.is_none(),
             "容器仍在运行 → 没有终止，不应报 reason"
         );
-        assert_eq!(health.last_terminate_at, None);
     }
 
     /// 名字末段匹配：`-6` 不能误配 `-16`。
@@ -1222,12 +1246,25 @@ mod tests {
         };
         let health = docker_health(Some(&state), &events.iter().collect::<Vec<_>>());
         assert_ne!(
-            health.last_terminate_reason.as_deref(),
+            health
+                .last_termination
+                .as_ref()
+                .and_then(|t| t.reason.as_deref()),
             Some("OOMKilled"),
             "最近周期（die=1 普通）无 oom → 不粘旧 OOM"
         );
-        assert_eq!(health.last_terminate_reason.as_deref(), Some("Error"));
-        assert_eq!(health.last_exit_code, Some(1), "退出码在独立字段里");
+        assert_eq!(
+            health
+                .last_termination
+                .as_ref()
+                .and_then(|t| t.reason.as_deref()),
+            Some("Error")
+        );
+        assert_eq!(
+            health.last_termination.as_ref().and_then(|t| t.exit_code),
+            Some(1),
+            "退出码在同一结构的 exit_code"
+        );
     }
 
     /// R7：exit 137 单独出现不推断 OOM（SIGKILL 不只来自 OOM）。
@@ -1240,16 +1277,25 @@ mod tests {
         };
         let health = docker_health(Some(&state), &events.iter().collect::<Vec<_>>());
         assert_ne!(
-            health.last_terminate_reason.as_deref(),
+            health
+                .last_termination
+                .as_ref()
+                .and_then(|t| t.reason.as_deref()),
             Some("OOMKilled"),
             "137 ≠ OOM"
         );
         assert_eq!(
-            health.last_terminate_reason.as_deref(),
+            health
+                .last_termination
+                .as_ref()
+                .and_then(|t| t.reason.as_deref()),
             Some("Error"),
-            "reason 用 k8s 词表（退出码走 last_exit_code）"
+            "reason 用 k8s 词表（退出码在同一结构的 exit_code）"
         );
-        assert_eq!(health.last_exit_code, Some(137));
+        assert_eq!(
+            health.last_termination.as_ref().and_then(|t| t.exit_code),
+            Some(137)
+        );
     }
 
     #[test]
