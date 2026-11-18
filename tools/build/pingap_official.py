@@ -86,14 +86,6 @@ def install(args, version, commit):
     catalog_verified = False
     try:
         release = assets.trusted_pingap_release(version, [args.arch], catalog)
-        if release['commit'] != commit:
-            raise ValueError('official release source pin mismatch')
-        record = release['assets'][args.arch]
-        member = record['name'].removesuffix('.tar.gz')
-        asset_name = record['name']
-        asset_url = record['url']
-        expected_sha = record['sha256']
-        catalog_verified = True
     except (ValueError, KeyError) as error:
         # A release missing from (or invalid in) the trusted catalog no longer
         # blocks image builds: fall back to the official naming convention and
@@ -103,6 +95,20 @@ def install(args, version, commit):
         asset_name = 'pingap-linux-gnu-' + ('x86' if args.arch == 'amd64' else 'aarch64') + '-full.tar.gz'
         member = asset_name.removesuffix('.tar.gz')
         asset_url = f'https://github.com/vicanso/pingap/releases/download/v{version}/{asset_name}'
+    else:
+        # Catalog HAS the requested version but its commit pin differs: the
+        # artifact identity cannot be proven — refuse instead of shipping an
+        # official build whose provenance disagrees with the request (review P2).
+        if release['commit'] != commit:
+            raise ValueError('official release source pin mismatch: catalog record '
+                             + repr(release['commit']) + ' differs from requested '
+                             + repr(commit))
+        record = release['assets'][args.arch]
+        member = record['name'].removesuffix('.tar.gz')
+        asset_name = record['name']
+        asset_url = record['url']
+        expected_sha = record['sha256']
+        catalog_verified = True
     with tempfile.TemporaryDirectory(prefix='pingap-official-asset-') as temporary:
         archive = args.archive
         if args.download:

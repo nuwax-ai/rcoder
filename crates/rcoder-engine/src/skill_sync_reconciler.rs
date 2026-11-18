@@ -65,6 +65,11 @@ struct Stats {
 async fn run_reconcile(stop: &tokio_util::sync::CancellationToken) -> Result<(), String> {
     let current = file_server::sync_target_version();
     let mut stats = Stats::default();
+    // 范围（复审 P2 分工）：主进程只扫本地可见的普通工作区与共享 computer
+    // 根；RBD 独占卷（Migrated 用户的卷）挂载在 agent 容器内，由
+    // agent_runner::skill_startup_reconcile 在容器侧启动对账——此处对共享
+    // 卷中已迁移用户的旧副本目录做的是无害的本地维护（不再被读，不会
+    // 与 RBD 卷产生双向漂移）。
     for root in [WORKSPACE_ROOT, COMPUTER_WORKSPACE_ROOT] {
         if stop.is_cancelled() {
             break;

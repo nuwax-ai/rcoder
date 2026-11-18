@@ -19,6 +19,7 @@ pub mod proxy_agent;
 pub mod router;
 pub mod service; // 🔥 设为 public，供测试使用
 pub mod shutdown;
+pub mod skill_startup_reconcile;
 pub mod utils;
 
 // Userapp builder 容器内运行时路径解析（env 驱动，与 file-server 同源）

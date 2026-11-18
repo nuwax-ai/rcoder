@@ -103,25 +103,37 @@ impl KubernetesRuntime {
             match self.workspace_migration_state(identifier, &service_type).await? {
                 shared_types::WorkspaceMigrationState::Migrated => true,
                 shared_types::WorkspaceMigrationState::NotMigrated => {
-                    // 新用户初始化（终审 F8）：flag 开 + PVC 缺失 + 共享卷无该
+                    // 新用户初始化（终审 F8 + 复审 P2）：flag 开 + 共享卷无该
                     // 用户存量 → 直接建 RBD PVC 并写 Migrated（新用户=直上
-                    // RBD，无迁移必要——plan §P0 目标）。三个前提缺一不可：
-                    // PVC 已存在（phase-a 建过）= 预同步期用户，保持共享；
-                    // 共享卷非空 = 存量用户，须显式走两阶段迁移（下方 legacy
-                    // 防护同语义）；初始化失败原样上抛（fail-fast，不静默
-                    // 回落共享——那会让"新用户 RBD"语义随机漂移）。
+                    // RBD，plan §P0 目标）。判据四象限：
+                    // - PVC 缺 + 共享 Absent：真新用户，建卷+标记（两步）。
+                    // - PVC 在 + 共享 NonEmpty：phase-a 预同步用户（有数据才
+                    //   迁移），保持共享路径。
+                    // - PVC 在 + 共享 Absent：只能是"新用户初始化中断"（首建
+                    //   卷成功、写 Migrated 前中断）——重放 set_migrated 幂等
+                    //   自愈，不得误判预同步把新用户留在共享卷（复审 P2）。
+                    // - 共享 NonEmpty 而无卷：存量用户，须显式两阶段迁移
+                    //   （下方 legacy 防护同语义）。
+                    // PVC 读失败原样上抛（fail-fast，不猜——暂态错误下误判
+                    // "真新用户"会让存量用户被切到空卷）。
                     let pvc_exists = self
                         .pvcs()
                         .get_opt(
                             &self.workspace_pvc_name(identifier, &service_type)?,
                         )
                         .await
-                        .map(|p| p.is_some())
-                        .unwrap_or(false);
+                        .map_err(|error| {
+                            ContainerRuntimeError::ConnectionError(format!(
+                                "cannot read workspace PVC state for '{identifier}': {error}"
+                            ))
+                        })?
+                        .is_some();
                     let shared_state = probe_shared_dir(identifier).await;
                     match (pvc_exists, shared_state) {
-                        // PVC 已建(phase-a 过) 或 共享卷有存量: 保持共享路径
-                        (true, _) | (false, SharedDirProbe::NonEmpty) => false,
+                        // phase-a 预同步卷(共享卷有存量) 或 探测不可信: 保持共享路径
+                        (true, SharedDirProbe::NonEmpty)
+                        | (true, SharedDirProbe::ProbeFailed)
+                        | (false, SharedDirProbe::NonEmpty) => false,
                         // 真新用户: 初始化直上 RBD
                         (false, SharedDirProbe::Absent) => {
                         self.ensure_workspace_pvc(
@@ -138,6 +150,20 @@ impl KubernetesRuntime {
                         .await?;
                             info!(
                                 "[K8S] new user '{identifier}' initialized on per-agent RBD"
+                            );
+                            true
+                        }
+                        // 新用户初始化中断的自愈: 卷已建但 Migrated 未落——
+                        // 重放标记完成初始化(幂等), 不留在共享卷等显式迁移。
+                        (true, SharedDirProbe::Absent) => {
+                            self.set_workspace_migration_state(
+                                identifier,
+                                &service_type,
+                                shared_types::WorkspaceMigrationState::Migrated,
+                            )
+                            .await?;
+                            info!(
+                                "[K8S] new user '{identifier}' RBD init resumed (fresh volume existed, marker replayed)"
                             );
                             true
                         }
