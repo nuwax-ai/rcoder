@@ -15,8 +15,8 @@ use crate::error::{AppError, AppResult};
 
 use super::io_util::write_file_atomic;
 
-/// Codex 官方文档支持的生命周期事件 (CODEX_HOOK_EVENTS)。
-const CODEX_HOOK_EVENTS: &[&str] = &[
+/// Codex 官方文档支持的生命周期事件 (HARNESS_HOOK_EVENTS)。
+const HARNESS_HOOK_EVENTS: &[&str] = &[
     "SessionStart",
     "SubagentStart",
     "SubagentStop",
@@ -188,7 +188,7 @@ fn escape_for_double_quote(s: &str) -> String {
 }
 
 /// 把相对脚本路径规范为基于 git 根目录的 bash 调用 (对齐 nuwax normalizeCodexCommand)。
-fn normalize_codex_command(command: &str) -> String {
+fn normalize_harness_command(command: &str) -> String {
     let trimmed = command.trim();
     if !is_likely_script_path(trimmed) {
         return trimmed.to_string();
@@ -198,15 +198,15 @@ fn normalize_codex_command(command: &str) -> String {
         return format!("bash \"{}\"", escape_for_double_quote(&format!("/{rest}")));
     }
     let relative = trimmed.strip_prefix("./").unwrap_or(trimmed);
-    let codex_hooks_prefix = ".codex/hooks/";
-    if let Some(script_name) = relative.strip_prefix(codex_hooks_prefix)
+    let harness_hooks_prefix = ".nuwax-harness/hooks/";
+    if let Some(script_name) = relative.strip_prefix(harness_hooks_prefix)
         && !script_name.is_empty()
         && !script_name.contains('/')
     {
-        return build_codex_hook_command(script_name);
+        return build_harness_hook_command(script_name);
     }
     if is_bare_shell_script(relative) {
-        return build_codex_hook_command(relative);
+        return build_harness_hook_command(relative);
     }
     format!(
         "bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/{}\"",
@@ -215,9 +215,9 @@ fn normalize_codex_command(command: &str) -> String {
 }
 
 /// Codex hook 脚本路径解析前缀 (对齐 nuwax buildCodexHookCommand)。
-fn build_codex_hook_command(script_name: &str) -> String {
+fn build_harness_hook_command(script_name: &str) -> String {
     format!(
-        "bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.codex/hooks/{script_name}\""
+        "bash \"$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.nuwax-harness/hooks/{script_name}\""
     )
 }
 
@@ -268,21 +268,21 @@ fn build_http_wrapper_script(
 // ── transformHooksForCodex ──────────────────────────────────────────────────────
 
 /// 把 Claude 格式 hooks 转为 Codex hooks map (对齐 nuwax transformHooksForCodex):
-/// - 仅保留 CODEX_HOOK_EVENTS 事件
+/// - 仅保留 HARNESS_HOOK_EVENTS 事件
 /// - command handler: normalizeCodexCommand
 /// - http handler: 生成 `http-hook-N.sh` wrapper 脚本 (0o755), 转 command handler
 /// - prompt/agent/未知: 跳过 (warn)
 ///
-/// wrapper 脚本写入 `codex_hooks_dir`; 返回 Codex hooks map (空则 None)。
-pub(super) async fn transform_hooks_for_codex(
+/// wrapper 脚本写入 `harness_hooks_dir`; 返回 Codex hooks map (空则 None)。
+pub(super) async fn transform_hooks_for_harness(
     hooks_map: &Map<String, Value>,
-    codex_hooks_dir: &Path,
+    harness_hooks_dir: &Path,
 ) -> AppResult<Option<Map<String, Value>>> {
-    let mut codex_hooks: Map<String, Value> = Map::new();
+    let mut harness_hooks: Map<String, Value> = Map::new();
     let mut wrapper_index = 0u32;
 
     for (event_name, matcher_groups) in hooks_map {
-        if !CODEX_HOOK_EVENTS.contains(&event_name.as_str()) {
+        if !HARNESS_HOOK_EVENTS.contains(&event_name.as_str()) {
             tracing::warn!(event = %event_name, "Skipping unsupported Codex hook event");
             continue;
         }
@@ -318,7 +318,7 @@ pub(super) async fn transform_hooks_for_codex(
                                 .insert("type".to_string(), Value::String("command".to_string()));
                             new_handler.insert(
                                 "command".to_string(),
-                                Value::String(normalize_codex_command(cmd)),
+                                Value::String(normalize_harness_command(cmd)),
                             );
                             transformed_handlers.push(Value::Object(new_handler));
                         }
@@ -336,9 +336,9 @@ pub(super) async fn transform_hooks_for_codex(
                             .unwrap_or(30.0);
                         let script_name = format!("http-hook-{wrapper_index}.sh");
                         wrapper_index += 1;
-                        let script_path = codex_hooks_dir.join(&script_name);
+                        let script_path = harness_hooks_dir.join(&script_name);
                         let headers = handler_obj.get("headers").filter(|v| v.is_object());
-                        fs::create_dir_all(codex_hooks_dir).await?;
+                        fs::create_dir_all(harness_hooks_dir).await?;
                         let script = build_http_wrapper_script(url.trim(), timeout, headers)?;
                         write_file_atomic(&script_path, &script, Some(0o755)).await?;
 
@@ -347,7 +347,7 @@ pub(super) async fn transform_hooks_for_codex(
                             .insert("type".to_string(), Value::String("command".to_string()));
                         new_handler.insert(
                             "command".to_string(),
-                            Value::String(build_codex_hook_command(&script_name)),
+                            Value::String(build_harness_hook_command(&script_name)),
                         );
                         let timeout_number =
                             serde_json::Number::from_f64(timeout).ok_or_else(|| {
@@ -386,14 +386,14 @@ pub(super) async fn transform_hooks_for_codex(
         }
 
         if !transformed_groups.is_empty() {
-            codex_hooks.insert(event_name.clone(), Value::Array(transformed_groups));
+            harness_hooks.insert(event_name.clone(), Value::Array(transformed_groups));
         }
     }
 
-    if codex_hooks.is_empty() {
+    if harness_hooks.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(codex_hooks))
+        Ok(Some(harness_hooks))
     }
 }
 
@@ -459,25 +459,25 @@ mod tests {
     }
 
     #[test]
-    fn normalize_codex_command_relative_script() {
+    fn normalize_harness_command_relative_script() {
         // 相对脚本 → 包 git toplevel 前缀
-        let cmd = normalize_codex_command("scripts/hook.sh");
+        let cmd = normalize_harness_command("scripts/hook.sh");
         assert!(cmd.starts_with("bash \"$(git rev-parse --show-toplevel"));
         assert!(cmd.contains("scripts/hook.sh"));
     }
 
     #[test]
-    fn normalize_codex_command_codex_hooks_short() {
-        // .codex/hooks/<name>.sh (无子目录) → buildCodexHookCommand
-        let cmd = normalize_codex_command(".codex/hooks/pre.sh");
-        assert!(cmd.contains(".codex/hooks/pre.sh"));
+    fn normalize_harness_command_harness_hooks_short() {
+        // .nuwax-harness/hooks/<name>.sh (无子目录) → buildCodexHookCommand
+        let cmd = normalize_harness_command(".nuwax-harness/hooks/pre.sh");
+        assert!(cmd.contains(".nuwax-harness/hooks/pre.sh"));
         assert!(cmd.starts_with("bash \"$(git rev-parse"));
     }
 
     #[test]
-    fn normalize_codex_command_passes_through_non_script() {
-        assert_eq!(normalize_codex_command("node index.js"), "node index.js");
-        assert_eq!(normalize_codex_command("echo hi"), "echo hi");
+    fn normalize_harness_command_passes_through_non_script() {
+        assert_eq!(normalize_harness_command("node index.js"), "node index.js");
+        assert_eq!(normalize_harness_command("echo hi"), "echo hi");
     }
 
     #[test]

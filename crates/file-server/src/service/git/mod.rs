@@ -44,7 +44,7 @@ pub const DEFAULT_GITIGNORE_ENTRIES: &[&str] = &[
     ".agents/",
     ".claude/",
     ".opencode/",
-    ".codex/",
+    ".nuwax-harness/",
     ".grok/",
     ".pi/",
     // 智能体技能实体库（对齐 TS 6ab47b7——store 不入 git 版本管理）

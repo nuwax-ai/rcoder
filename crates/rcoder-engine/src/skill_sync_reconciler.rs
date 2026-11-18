@@ -257,7 +257,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws = tmp.path().join("ws");
         // 源与全部实体目标顶层名称集一致 → skip (marker 内容无关, 不做任何写)
-        for dir in [".agents", ".claude", ".opencode", ".codex"] {
+        for dir in [".agents", ".claude", ".opencode", ".nuwax-harness"] {
             tokio::fs::create_dir_all(ws.join(dir).join("skills/sk1"))
                 .await
                 .unwrap();
@@ -296,7 +296,7 @@ mod tests {
         }
         // 实体副本只有 sk1 (生产 15/13 漂移的最小形态), 且 marker 预置为"最新"——
         // 修复前 marker 等值比较会跳过、漂移永不自愈
-        for dir in [".claude", ".opencode", ".codex"] {
+        for dir in [".claude", ".opencode", ".nuwax-harness"] {
             tokio::fs::create_dir_all(ws.join(dir).join("skills/sk1"))
                 .await
                 .unwrap();
@@ -319,7 +319,7 @@ mod tests {
         .await;
 
         assert_eq!(stats.synced, 1, "stale marker must not block self-healing");
-        for dir in [".claude", ".opencode", ".codex"] {
+        for dir in [".claude", ".opencode", ".nuwax-harness"] {
             assert!(
                 ws.join(dir).join("skills/sk2/SKILL.md").exists(),
                 "{dir} healed to source name set"

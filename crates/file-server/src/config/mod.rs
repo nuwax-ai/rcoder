@@ -85,7 +85,7 @@ impl std::str::FromStr for DeploymentMode {
 // ── 默认值常量 (Default impl 与 load.rs env 回退共享, 单一事实源) ────────────────
 
 /// 遍历时排除的目录 (对齐 TS env.development TRAVERSE_EXCLUDE_DIRS)。
-pub(crate) const DEFAULT_TRAVERSE_EXCLUDE_DIRS: &str = "dist,node_modules,.pnpm-store,__MACOSX,.attachments,.git,.agents,.codex,.opencode,.grok,.pi,.logs";
+pub(crate) const DEFAULT_TRAVERSE_EXCLUDE_DIRS: &str = "dist,node_modules,.pnpm-store,__MACOSX,.attachments,.git,.agents,.nuwax-harness,.opencode,.grok,.pi,.logs";
 /// 备份时排除的文件。
 pub(crate) const DEFAULT_BACKUP_TRAVERSE_EXCLUDE_FILES: &str =
     "pnpm-lock.yaml,yarn.lock,package-lock.json";
@@ -97,7 +97,7 @@ pub(crate) const DEFAULT_INLINE_IMAGE_EXTENSIONS: &str =
     ".png,.jpg,.jpeg,.gif,.bmp,.svg,.ico,.webp,.avif";
 /// zip-workspace 排除列表（含 dev 部署运行目录 .run/.previous/.staging——平台
 /// 生成的解压产物与轮换现场，不进下载包；.agent-store 技能实体库对齐 TS 6ab47b7）。
-pub(crate) const DEFAULT_ZIP_WORKSPACE_EXCLUDE: &str = ".git,.tmp,.claude,.agents,.codex,.opencode,.grok,.pi,.agent-store,.logs,.npmrc,__pycache__,node_modules,dist,pnpm-lock.yaml,yarn.lock,package-lock.json,.run,.previous,.staging";
+pub(crate) const DEFAULT_ZIP_WORKSPACE_EXCLUDE: &str = ".git,.tmp,.claude,.agents,.nuwax-harness,.opencode,.grok,.pi,.agent-store,.logs,.npmrc,__pycache__,node_modules,dist,pnpm-lock.yaml,yarn.lock,package-lock.json,.run,.previous,.staging";
 
 /// 全局配置 (启动时构造一次, 经 AppState 共享)。
 #[derive(Clone, Debug, Deserialize, Serialize)]

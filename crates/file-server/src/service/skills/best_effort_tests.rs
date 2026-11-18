@@ -203,7 +203,7 @@ async fn skill_url_failures_project_and_computer_http_push_continue_and_report_e
             failed[2]["reason"],
             "No skill directory found in downloaded zip"
         );
-        for dir in [".agents", ".claude", ".codex", ".opencode"] {
+        for dir in [".agents", ".claude", ".nuwax-harness", ".opencode"] {
             assert_eq!(
                 fs::read_to_string(ws.join(dir).join("skills/good/SKILL.md"))
                     .await
