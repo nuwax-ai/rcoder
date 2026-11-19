@@ -339,7 +339,21 @@ async fn resolve_owner_uid(client: kube::Client, namespace: &str, pod: &Pod) -> 
             reference.controller.unwrap_or(false) && reference.kind == "ReplicaSet"
         })?;
     let replica_sets: Api<ReplicaSet> = Api::namespaced(client, namespace);
-    let replica_set = replica_sets.get(&controller.name).await.ok()?;
+    let replica_set = match replica_sets.get(&controller.name).await {
+        Ok(replica_set) => replica_set,
+        // RS 已删除：owner 链确实断了，静默返回 None（证据失效的合理形态）。
+        Err(kube::Error::Api(response)) if response.code == 404 => return None,
+        // 非 NotFound 失败（网络/权限/5xx）：链**不可判** ≠ 链不匹配——静默
+        // 会让 drift 治理对该 app 持续失效而只有 info 级痕迹，提 warn 可观测。
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                replicaset = %controller.name,
+                "[IMAGE_DRIFT_WATCH] owner chain resolution failed"
+            );
+            return None;
+        }
+    };
     replica_set
         .metadata
         .owner_references
