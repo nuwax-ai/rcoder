@@ -966,12 +966,10 @@ async fn marker_completer(
     let client = runtime.client.clone();
     let namespace = runtime.namespace.clone();
     let cache = std::sync::Arc::clone(&runtime.workspace_exists_cache);
-    let user_id = identifier.to_string();
     // 主流程 await 完成者（第九轮 P1）：标记 PATCH + 判据缓存写都确认后才
     // 继续（此前派发即继续建 RBD agent，PATCH 失败只记日志）。取消安全保
     // 留：外层 future 取消只是不再等结果——spawn 的任务继续跑完并持门禁
     // 至 PATCH/缓存落定（JoinHandle drop 不取消任务）。
-    let _user_id = user_id;
     let handle = tokio::spawn(async move {
         let _held = gate;
         crate::runtime::kubernetes_runtime::workspace_runtime::set_migration_state_detached(
