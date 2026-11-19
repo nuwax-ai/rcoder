@@ -101,6 +101,26 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
         "RCODER_USERAPP_PROTECTION_SECONDS",
         &mut config.userapp_recycle.protection_seconds,
     );
+    env_override_bool(
+        "RCODER_USERAPP_IMAGE_DRIFT_INVENTORY_ENABLED",
+        &mut config.userapp_image_drift.inventory_enabled,
+    );
+    env_override_u64(
+        "RCODER_USERAPP_IMAGE_DRIFT_INVENTORY_INTERVAL_SECONDS",
+        &mut config.userapp_image_drift.inventory_interval_seconds,
+    );
+    env_override_bool(
+        "RCODER_USERAPP_IMAGE_DRIFT_WATCH_ENABLED",
+        &mut config.userapp_image_drift.watch_enabled,
+    );
+    env_override_u64(
+        "RCODER_USERAPP_IMAGE_DRIFT_PULL_FAILURE_WINDOW_SECONDS",
+        &mut config.userapp_image_drift.pull_failure_window_seconds,
+    );
+    env_override_u64(
+        "RCODER_USERAPP_IMAGE_DRIFT_RECOVERY_COOLDOWN_SECONDS",
+        &mut config.userapp_image_drift.recovery_cooldown_seconds,
+    );
 
     storage::apply_storage_env_overrides(&mut config)?;
     config

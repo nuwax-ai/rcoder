@@ -1487,6 +1487,26 @@ pub trait UserAppDeploymentRuntime: Send + Sync {
         Ok(None)
     }
 
+    /// 列出本运行时管理的 UserApp 工作负载及其当前模板镜像（只读）。
+    /// 漂移对账台账（spec sandbox-image-version-drift R3/R5）的数据源；
+    /// 不做任何判定或收敛，分类与记录由引擎侧扫描器完成。
+    async fn list_userapp_workload_images(
+        &self,
+    ) -> ContainerRuntimeResult<Vec<shared_types::UserAppWorkloadImageInfo>> {
+        Ok(Vec::new())
+    }
+
+    /// 启动镜像漂移观察兜底（spec sandbox-image-version-drift R4，K8s 专有；
+    /// Docker 无控制器自愈形态，默认不启动）。返回后台任务句柄；None 表示
+    /// 该运行时不支持。收敛动作复用既有启动/补丁路径，观察只做事件排队。
+    async fn start_userapp_image_drift_watch(
+        &self,
+        _config: shared_types::UserAppImageDriftWatchConfig,
+        _shutdown: tokio::sync::broadcast::Receiver<()>,
+    ) -> ContainerRuntimeResult<Option<tokio::task::JoinHandle<()>>> {
+        Ok(None)
+    }
+
     /// Refresh only a single-write restart target after proving its original
     /// write has not committed. None means observe the original result instead.
     async fn prepare_app_compute_start_retry(

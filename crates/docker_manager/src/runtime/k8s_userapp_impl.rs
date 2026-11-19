@@ -895,6 +895,34 @@ impl UserAppDeploymentRuntime for KubernetesRuntime {
         self.prepare_captured_compute_retry(target).await
     }
 
+    async fn list_userapp_workload_images(
+        &self,
+    ) -> ContainerRuntimeResult<Vec<shared_types::UserAppWorkloadImageInfo>> {
+        self.list_userapp_workload_images().await
+    }
+
+    async fn start_userapp_image_drift_watch(
+        &self,
+        mut config: shared_types::UserAppImageDriftWatchConfig,
+        shutdown: tokio::sync::broadcast::Receiver<()>,
+    ) -> ContainerRuntimeResult<Option<tokio::task::JoinHandle<()>>> {
+        if config.platform_image.trim().is_empty() {
+            tracing::warn!(
+                "[IMAGE_DRIFT_WATCH] platform image reference missing; watch not started"
+            );
+            return Ok(None);
+        }
+        if config.namespace.trim().is_empty() {
+            config.namespace = self.namespace.clone();
+        }
+        Ok(Some(crate::runtime::k8s_drift_watch::spawn_drift_watch(
+            self.client.clone(),
+            config.namespace.clone(),
+            config,
+            shutdown,
+        )))
+    }
+
     async fn fence_app_compute_start(
         &self,
         target: &shared_types::UserAppComputeStartTarget,

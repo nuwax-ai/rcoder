@@ -34,6 +34,7 @@ pub mod startup_tasks;
 pub mod storage;
 pub mod userapp_builder;
 pub mod userapp_dbx_probe;
+pub mod userapp_drift_inventory;
 pub mod userapp_error_page;
 #[cfg(feature = "kubernetes")]
 pub mod userapp_error_page_configmap;

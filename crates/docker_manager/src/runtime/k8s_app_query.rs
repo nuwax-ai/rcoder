@@ -548,6 +548,103 @@ impl KubernetesRuntime {
             })
             .unwrap_or_default()
     }
+
+    /// 列出受管 UserApp 工作负载的模板镜像（漂移台账数据源，spec
+    /// sandbox-image-version-drift R3；只读，rv=0 走 watch cache）。
+    /// prod=app Deployment（agent 容器按 APP_CONTAINER_NAME），dev=builder
+    /// StatefulSet（agent 容器名 "agent"）。
+    pub(super) async fn list_userapp_workload_images(
+        &self,
+    ) -> ContainerRuntimeResult<Vec<shared_types::UserAppWorkloadImageInfo>> {
+        let mut out = Vec::new();
+        let lp = ListParams {
+            label_selector: Some(format!("{APP_LABEL_PREFIX}/managed-by={APP_MANAGED_BY}")),
+            resource_version: Some("0".to_string()),
+            ..Default::default()
+        };
+        let deploys =
+            self.deployments_api().list(&lp).await.map_err(|e| {
+                ContainerRuntimeError::K8sError(format!("list app deployments: {e}"))
+            })?;
+        for deploy in deploys.items {
+            let app_id = deploy
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(&format!("{RCODER_LABEL_PREFIX}/app-id")))
+                .cloned()
+                .unwrap_or_default();
+            let name = deploy.metadata.name.clone().unwrap_or_default();
+            if app_id.is_empty() || name.is_empty() {
+                continue;
+            }
+            let image = deploy
+                .spec
+                .and_then(|spec| spec.template.spec)
+                .and_then(|spec| {
+                    spec.containers
+                        .into_iter()
+                        .find(|container| container.name == APP_CONTAINER_NAME)
+                })
+                .and_then(|container| container.image)
+                .unwrap_or_default();
+            if image.is_empty() {
+                continue;
+            }
+            out.push(shared_types::UserAppWorkloadImageInfo {
+                app_id,
+                stage: "prod".into(),
+                workload_name: name,
+                image,
+            });
+        }
+        let sts: Api<k8s_openapi::api::apps::v1::StatefulSet> =
+            Api::namespaced(self.client.clone(), &self.namespace);
+        let builder_lp = ListParams {
+            label_selector: Some(format!(
+                "{RCODER_LABEL_PREFIX}/service-type={}",
+                shared_types::ServiceType::UserappBuilder
+            )),
+            resource_version: Some("0".to_string()),
+            ..Default::default()
+        };
+        let builders = sts.list(&builder_lp).await.map_err(|e| {
+            ContainerRuntimeError::K8sError(format!("list builder statefulsets: {e}"))
+        })?;
+        for builder in builders.items {
+            let app_id = builder
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(&format!("{RCODER_LABEL_PREFIX}/identifier")))
+                .cloned()
+                .unwrap_or_default();
+            let name = builder.metadata.name.clone().unwrap_or_default();
+            if app_id.is_empty() || name.is_empty() {
+                continue;
+            }
+            let image = builder
+                .spec
+                .and_then(|spec| spec.template.spec)
+                .and_then(|spec| {
+                    spec.containers
+                        .into_iter()
+                        .find(|container| container.name == "agent")
+                })
+                .and_then(|container| container.image)
+                .unwrap_or_default();
+            if image.is_empty() {
+                continue;
+            }
+            out.push(shared_types::UserAppWorkloadImageInfo {
+                app_id,
+                stage: "dev".into(),
+                workload_name: name,
+                image,
+            });
+        }
+        Ok(out)
+    }
 }
 
 // 纯推导函数（derive_phase/derive_port_statuses/container_error_message/

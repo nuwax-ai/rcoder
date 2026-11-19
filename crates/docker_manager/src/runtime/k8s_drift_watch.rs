@@ -1,0 +1,398 @@
+//! UserApp 镜像漂移观察兜底（spec sandbox-image-version-drift R4，K8s 专有）。
+//!
+//! 承认 Kubernetes 控制器会先按旧模板创建替换 Pod：这里不做首次注入，只在
+//! 「替换 Pod 因旧平台镜像持续无法提供服务」（ImagePullBackOff 跨越判定
+//! 窗口）且模板镜像与平台当前引用同仓库（平台管理，归属守卫同 R1）时，
+//! 有界触发一次受控镜像对齐。观察到旧镜像自行恢复服务（Running）时不做
+//! 任何事；外部/钉住镜像保留；同一 app 冷却期内不重复尝试；对齐后仍失败
+//! 只记录，不循环改模板。
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use futures_util::StreamExt as _;
+use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::core::v1::Pod;
+use kube::Api;
+use kube::runtime::watcher;
+use kube::runtime::watcher::Config as WatcherConfig;
+use shared_types::UserAppImageDriftWatchConfig;
+
+use super::k8s_deployment::{
+    APP_CONTAINER_NAME, APP_LABEL_PREFIX, APP_MANAGED_BY, RCODER_LABEL_PREFIX,
+};
+
+/// 拉取失败类 waiting reason（kubelet 报告的镜像不可得形态）。
+fn is_image_pull_failure(pod: &Pod) -> bool {
+    pod.status
+        .as_ref()
+        .and_then(|status| status.container_statuses.as_ref())
+        .is_some_and(|statuses| {
+            statuses.iter().any(|status| {
+                status
+                    .state
+                    .as_ref()
+                    .and_then(|state| state.waiting.as_ref())
+                    .is_some_and(|waiting| {
+                        matches!(
+                            waiting.reason.as_deref(),
+                            Some("ImagePullBackOff")
+                                | Some("ErrImagePull")
+                                | Some("ErrImageUploadBackOff")
+                                | Some("InvalidImageName")
+                        )
+                    })
+            })
+        })
+}
+
+fn pod_app_id(pod: &Pod) -> Option<String> {
+    pod.metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(&format!("{RCODER_LABEL_PREFIX}/app-id")))
+        .filter(|id| !id.is_empty())
+        .cloned()
+}
+
+/// 启动漂移观察任务。返回句柄由调用方并入后台任务治理。
+pub(crate) fn spawn_drift_watch(
+    client: kube::Client,
+    namespace: String,
+    config: UserAppImageDriftWatchConfig,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let platform_repo = container_runtime_api::image_repository(&config.platform_image);
+        let window = std::time::Duration::from_secs(config.pull_failure_window_seconds);
+        let cooldown = std::time::Duration::from_secs(config.recovery_cooldown_seconds);
+        let mut first_failure: HashMap<String, std::time::Instant> = HashMap::new();
+        let last_recovery: Arc<Mutex<HashMap<String, std::time::Instant>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        tracing::info!(
+            namespace = %namespace,
+            platform_image = %config.platform_image,
+            window_seconds = config.pull_failure_window_seconds,
+            cooldown_seconds = config.recovery_cooldown_seconds,
+            "[IMAGE_DRIFT_WATCH] started"
+        );
+        let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
+        let selector = format!("{APP_LABEL_PREFIX}/managed-by={APP_MANAGED_BY}");
+        let watch_config = WatcherConfig::default().labels(&selector).timeout(290);
+        let stream = watcher(pods, watch_config);
+        let mut stream = Box::pin(stream);
+        loop {
+            tokio::select! {
+                _ = shutdown.recv() => {
+                    tracing::info!("[IMAGE_DRIFT_WATCH] stopped");
+                    return;
+                }
+                event = stream.next() => {
+                    let Some(event) = event else {
+                        tracing::warn!("[IMAGE_DRIFT_WATCH] watch stream ended; restarting");
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        continue;
+                    };
+                    let pod = match event {
+                        Ok(watcher::Event::Apply(pod)) | Ok(watcher::Event::InitApply(pod)) => pod,
+                        Ok(watcher::Event::Delete(_)) | Ok(watcher::Event::Init) | Ok(watcher::Event::InitDone) => {
+                            // 删除/初始化不携带增量信息；失败窗口由后续 Apply 重建。
+                            continue;
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "[IMAGE_DRIFT_WATCH] watch error (watcher retries internally)");
+                            continue;
+                        }
+                    };
+                    let Some(app_id) = pod_app_id(&pod) else {
+                        continue;
+                    };
+                    if !is_image_pull_failure(&pod) {
+                        first_failure.remove(&app_id);
+                        continue;
+                    }
+                    let started = *first_failure.entry(app_id.clone()).or_insert_with(std::time::Instant::now);
+                    if started.elapsed() < window {
+                        continue;
+                    }
+                    first_failure.remove(&app_id);
+                    if last_recovery
+                        .lock()
+                        .expect("drift watch recovery ledger")
+                        .get(&app_id)
+                        .is_some_and(|at| at.elapsed() < cooldown)
+                    {
+                        tracing::warn!(app = %app_id, "[IMAGE_DRIFT_WATCH] recovery on cooldown");
+                        continue;
+                    }
+                    if let Err(error) = recover_drifted_app(
+                        client.clone(),
+                        &namespace,
+                        &app_id,
+                        &config.platform_image,
+                        platform_repo,
+                    )
+                    .await
+                    {
+                        tracing::warn!(app = %app_id, %error, "[IMAGE_DRIFT_WATCH] bounded recovery failed");
+                    }
+                    last_recovery
+                        .lock()
+                        .expect("drift watch recovery ledger")
+                        .insert(app_id, std::time::Instant::now());
+                }
+            }
+        }
+    })
+}
+
+/// 单次有界受控对齐：仅平台仓库内的旧模板滚动到当前引用。任何不满足条
+/// 件都只记录并返回 Ok（不重试、不循环改模板）。
+async fn recover_drifted_app(
+    client: kube::Client,
+    namespace: &str,
+    app_id: &str,
+    platform_image: &str,
+    platform_repo: &str,
+) -> anyhow::Result<()> {
+    let deployments: Api<Deployment> = Api::namespaced(client, namespace);
+    let name = format!("rcoder-app-{app_id}");
+    let deployment = deployments
+        .get(&name)
+        .await
+        .map_err(|error| anyhow::anyhow!("read drifted deployment {name}: {error}"))?;
+    let managed = deployment
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(&format!("{APP_LABEL_PREFIX}/managed-by")))
+        .is_some_and(|value| value == APP_MANAGED_BY);
+    let lifecycle_adopted = deployment
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get("rcoder.io/application-id"))
+        .is_some();
+    if !managed || !lifecycle_adopted {
+        anyhow::bail!("deployment {name} is not rcoder-managed lifecycle state");
+    }
+    let template_image = deployment
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.spec.as_ref())
+        .and_then(|spec| {
+            spec.containers
+                .iter()
+                .find(|container| container.name == APP_CONTAINER_NAME)
+        })
+        .and_then(|container| container.image.clone());
+    let Some(template_image) = template_image else {
+        anyhow::bail!("deployment {name} has no app container image");
+    };
+    if template_image == platform_image {
+        tracing::info!(
+            app = app_id,
+            "[IMAGE_DRIFT_WATCH] template already aligned; pull failure is not drift"
+        );
+        return Ok(());
+    }
+    if container_runtime_api::image_repository(&template_image) != platform_repo {
+        tracing::warn!(
+            app = app_id,
+            image = %template_image,
+            "[IMAGE_DRIFT_WATCH] template image is not platform-managed; kept"
+        );
+        return Ok(());
+    }
+    let patch = serde_json::json!({
+        "metadata": {"annotations": {
+            "rcoder.io/image-drift-recovery": format!(
+                "auto epoch-{} platform {}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or_default(),
+                platform_image
+            )
+        }},
+        "spec": {"template": {"spec": {"containers": [
+            {"name": APP_CONTAINER_NAME, "image": platform_image}
+        ]}}}
+    });
+    deployments
+        .patch(
+            &name,
+            &kube::api::PatchParams::default(),
+            &kube::api::Patch::Strategic(patch),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("align drifted deployment {name}: {error}"))?;
+    tracing::warn!(
+        app = app_id,
+        from = %template_image,
+        to = %platform_image,
+        "[IMAGE_DRIFT_WATCH] platform-managed stale template aligned after persistent pull failure"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pod(json: serde_json::Value) -> Pod {
+        serde_json::from_value(json).expect("pod")
+    }
+
+    #[test]
+    fn pull_failure_detection_covers_kubelet_reasons() {
+        let failing = pod(serde_json::json!({
+            "metadata": {"name": "p"},
+            "status": {"containerStatuses": [
+                {"name": "app", "state": {"waiting": {"reason": "ImagePullBackOff"}}}
+            ]}
+        }));
+        assert!(is_image_pull_failure(&failing));
+        let crash = pod(serde_json::json!({
+            "metadata": {"name": "p"},
+            "status": {"containerStatuses": [
+                {"name": "app", "state": {"waiting": {"reason": "CrashLoopBackOff"}}}
+            ]}
+        }));
+        assert!(
+            !is_image_pull_failure(&crash),
+            "业务崩溃不是镜像漂移兜底范围"
+        );
+        let running = pod(serde_json::json!({
+            "metadata": {"name": "p"},
+            "status": {"containerStatuses": [
+                {"name": "app", "state": {"running": {"startedAt": "2026-01-01T00:00:00Z"}}}
+            ]}
+        }));
+        assert!(!is_image_pull_failure(&running));
+    }
+
+    #[test]
+    fn app_id_reads_managed_label() {
+        let labeled = pod(serde_json::json!({
+            "metadata": {"labels": {"rcoder.io/app-id": "184"}}
+        }));
+        assert_eq!(pod_app_id(&labeled).as_deref(), Some("184"));
+        assert_eq!(pod_app_id(&pod(serde_json::json!({"metadata": {}}))), None);
+    }
+
+    /// 有界恢复三态：平台仓库旧模板滚动；外部镜像与已对齐模板不动。
+    #[tokio::test]
+    async fn bounded_recovery_rolls_only_platform_managed_stale_templates() {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            for scenario in ["stale", "foreign", "aligned", "unmanaged"] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                drop(rustls::crypto::ring::default_provider().install_default());
+                let client =
+                    kube::Client::try_from(kube::Config::new(format!("http://{address}").parse().unwrap()))
+                        .unwrap();
+                let image = match scenario {
+                    "stale" => "registry.test/app-runtime:0.1.306",
+                    "foreign" => "docker.io/someone/custom:1",
+                    _ => "registry.test/app-runtime:0.1.456",
+                };
+                let mut deployment = serde_json::json!({
+                    "apiVersion": "apps/v1", "kind": "Deployment",
+                    "metadata": {
+                        "name": "rcoder-app-9", "uid": "deploy-uid-1", "resourceVersion": "1",
+                        "labels": {"app.kubernetes.io/managed-by": "rcoder-app-manager"},
+                        "annotations": {"rcoder.io/application-id": "9"}
+                    },
+                    "spec": {"template": {"spec": {"containers": [
+                        {"name": "app", "image": image}
+                    ]}}}
+                });
+                if scenario == "unmanaged" {
+                    deployment["metadata"]["labels"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("app.kubernetes.io/managed-by");
+                }
+                let patches = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+                let server_patches = patches.clone();
+                let server = tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    loop {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let mut bytes = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        let (head, offset, length) = loop {
+                            let count = stream.read(&mut chunk).await.unwrap();
+                            assert!(count > 0);
+                            bytes.extend_from_slice(&chunk[..count]);
+                            if let Some(end) = bytes.windows(4).position(|b| b == b"\r\n\r\n") {
+                                let head = String::from_utf8_lossy(&bytes[..end]).into_owned();
+                                let length = head.lines().find_map(|line| {
+                                    let (k, v) = line.split_once(':')?;
+                                    k.eq_ignore_ascii_case("content-length")
+                                        .then(|| v.trim().parse::<usize>().unwrap())
+                                }).unwrap_or(0);
+                                break (head, end + 4, length);
+                            }
+                        };
+                        while bytes.len() < offset + length {
+                            let count = stream.read(&mut chunk).await.unwrap();
+                            assert!(count > 0);
+                            bytes.extend_from_slice(&chunk[..count]);
+                        }
+                        let method = head.split_whitespace().next().unwrap();
+                        let path = head.split_whitespace().nth(1).unwrap().split('?').next().unwrap();
+                        let (code, value) = if path.ends_with("/deployments/rcoder-app-9") {
+                            if method == "PATCH" {
+                                let patch: serde_json::Value =
+                                    serde_json::from_slice(&bytes[offset..offset + length]).unwrap();
+                                server_patches.lock().unwrap().push(patch);
+                            }
+                            (200, deployment.clone())
+                        } else {
+                            (404, serde_json::json!({"kind": "Status", "code": 404}))
+                        };
+                        let body = value.to_string();
+                        let response = format!(
+                            "HTTP/1.1 {code} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        stream.write_all(response.as_bytes()).await.unwrap();
+                    }
+                });
+                let result = recover_drifted_app(
+                    client,
+                    "drift-test",
+                    "9",
+                    "registry.test/app-runtime:0.1.456",
+                    "registry.test/app-runtime",
+                )
+                .await;
+                server.abort();
+                let writes = patches.lock().unwrap().clone();
+                match scenario {
+                    "stale" => {
+                        result.expect("stale rolls");
+                        assert_eq!(writes.len(), 1);
+                        assert_eq!(
+                            writes[0]["spec"]["template"]["spec"]["containers"][0]["image"],
+                            "registry.test/app-runtime:0.1.456"
+                        );
+                    }
+                    "foreign" | "aligned" => {
+                        result.expect("keep is Ok without writes");
+                        assert!(writes.is_empty(), "{scenario} must not patch");
+                    }
+                    "unmanaged" => {
+                        assert!(result.is_err(), "unmanaged workload rejected");
+                        assert!(writes.is_empty());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+}

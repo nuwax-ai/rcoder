@@ -105,3 +105,5 @@ mod lifecycle_discovery;
 
 #[cfg(feature = "kubernetes")]
 mod k8s_default_recovery;
+#[cfg(feature = "kubernetes")]
+pub(crate) mod k8s_drift_watch;

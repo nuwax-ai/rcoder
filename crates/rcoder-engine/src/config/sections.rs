@@ -217,6 +217,54 @@ impl Default for CleanupConfigSettings {
 ///
 /// 默认 `enabled=true`：免费用户 app 闲置超阈值自动 scale0 回收；付费 app 经
 /// `CreateAppRequest.recycle_enabled=false`（注解 `rcoder.io/recycle-enabled=false`）opt-out 永不回收。
+/// UserApp 镜像漂移治理（spec sandbox-image-version-drift）：R3 只读对账
+/// 台账与 R4 观察兜底（K8s 专有；Docker 豁免 watch，仅台账）。全部只读或
+/// 有界收敛，不影响运行中工作负载。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserAppImageDriftConfig {
+    /// 只读漂移台账扫描（默认 true；纯日志，无副作用）
+    #[serde(default = "default_true")]
+    pub inventory_enabled: bool,
+    /// 台账扫描间隔（秒），默认 3600
+    #[serde(default = "default_drift_inventory_interval_seconds")]
+    pub inventory_interval_seconds: u64,
+    /// 拉取失败观察兜底（默认 true；仅平台仓库内旧模板 + 持续拉取失败才
+    /// 有界对齐一次）
+    #[serde(default = "default_true")]
+    pub watch_enabled: bool,
+    /// 拉取失败持续判定窗口（秒），默认 120
+    #[serde(default = "default_drift_pull_failure_window_seconds")]
+    pub pull_failure_window_seconds: u64,
+    /// 同一 app 收敛尝试冷却（秒），默认 3600
+    #[serde(default = "default_drift_recovery_cooldown_seconds")]
+    pub recovery_cooldown_seconds: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_drift_inventory_interval_seconds() -> u64 {
+    3600
+}
+fn default_drift_pull_failure_window_seconds() -> u64 {
+    120
+}
+fn default_drift_recovery_cooldown_seconds() -> u64 {
+    3600
+}
+
+impl Default for UserAppImageDriftConfig {
+    fn default() -> Self {
+        Self {
+            inventory_enabled: true,
+            inventory_interval_seconds: default_drift_inventory_interval_seconds(),
+            watch_enabled: true,
+            pull_failure_window_seconds: default_drift_pull_failure_window_seconds(),
+            recovery_cooldown_seconds: default_drift_recovery_cooldown_seconds(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserAppRecycleConfig {
     /// 是否启用定时闲置回收（默认 true；不关闭显式启动或流量唤醒）

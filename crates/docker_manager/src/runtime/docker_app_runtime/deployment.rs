@@ -708,6 +708,67 @@ impl UserAppDeploymentRuntime for DockerRuntime {
         self.start_captured_target(target).await
     }
 
+    /// UserApp 工作负载模板镜像清单（漂移台账数据源，spec R3；只读）。
+    /// Docker 形态：app 容器与 builder 容器经 `service-type` label 过滤；
+    /// 镜像取列表返回的创建引用（`Config.Image`）。
+    async fn list_userapp_workload_images(
+        &self,
+    ) -> ContainerRuntimeResult<Vec<shared_types::UserAppWorkloadImageInfo>> {
+        use bollard::query_parameters::ListContainersOptions;
+        use shared_types::ServiceType;
+        let options = ListContainersOptions {
+            all: true,
+            filters: Some(HashMap::from([(
+                "label".to_string(),
+                vec!["service-type".to_string()],
+            )])),
+            ..Default::default()
+        };
+        let listed = self
+            .inner
+            .get_docker_client()
+            .list_containers(Some(options))
+            .await
+            .map_err(|error| {
+                ContainerRuntimeError::DockerError(format!("list userapp containers: {error}"))
+            })?;
+        let mut out = Vec::new();
+        for container in listed {
+            let Some(labels) = container.labels.as_ref() else {
+                continue;
+            };
+            let userapp_tag = ServiceType::Userapp.to_string();
+            let builder_tag = ServiceType::UserappBuilder.to_string();
+            let stage = match labels.get("service-type").map(String::as_str) {
+                Some(value) if value == userapp_tag => "prod",
+                Some(value) if value == builder_tag => "dev",
+                _ => continue,
+            };
+            let app_id = labels
+                .get(shared_types::USERAPP_DOCKER_APP_ID_LABEL)
+                .or_else(|| labels.get(shared_types::USERAPP_RESOURCE_IDENTITY_KEYS[0]))
+                .cloned()
+                .unwrap_or_default();
+            let name = container
+                .names
+                .as_ref()
+                .and_then(|names| names.first())
+                .map(|name| name.trim_start_matches('/').to_string())
+                .unwrap_or_default();
+            let image = container.image.clone().unwrap_or_default();
+            if app_id.is_empty() || name.is_empty() || image.is_empty() {
+                continue;
+            }
+            out.push(shared_types::UserAppWorkloadImageInfo {
+                app_id,
+                stage: stage.into(),
+                workload_name: name,
+                image,
+            });
+        }
+        Ok(out)
+    }
+
     /// 启动路径镜像对齐的归属守卫（与 K8s `start_captured_with_policy` 同一
     /// 判定，spec sandbox-image-version-drift R1）：仅当捕获容器当前镜像与
     /// 平台当前引用同仓库时才滚动；外部/显式钉住的镜像保留原容器启动。

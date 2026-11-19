@@ -196,8 +196,8 @@ pub use shared_types_i18n::{
 };
 
 // Validation 模块
-pub mod validation;
 pub mod sandbox;
+pub mod validation;
 pub use validation::{
     ABSOLUTE_DIR_MAX_LEN, AGENT_WORK_DIR_MAX_SEGMENTS, IDENTIFIER_RE, USERAPP_APP_ID_MAX_LEN,
     garde_err_to_app_error, is_absolute_path_like, normalize_absolute_dir, validate_agent_work_dir,
@@ -366,6 +366,8 @@ pub use userapp::lifecycle::*;
 pub use userapp::workspace_clear::*;
 
 pub use userapp::builder_control::*;
+
+pub use userapp::image_drift::*;
 
 pub use userapp::resource_binding::{
     AdoptApplicationRequest, AdoptBuilderRequest, AppAdoptionTarget, UserAppResourceBinding,
