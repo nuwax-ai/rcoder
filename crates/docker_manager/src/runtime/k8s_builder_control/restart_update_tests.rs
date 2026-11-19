@@ -248,7 +248,7 @@ async fn non_rollout_restart_freezes_existing_configuration() {
     );
     let state = state.lock().expect("state");
     let candidate = &state.puts[0]["spec"]["template"]["spec"];
-    assert_eq!(candidate["containers"][0]["image"], "old-release:1");
+    assert_eq!(candidate["containers"][0]["image"], "paired-runtime:old-release");
     assert_eq!(candidate["serviceAccountName"], "test");
     assert_eq!(
         candidate["containers"][0]["resources"], legacy_resources,

@@ -331,6 +331,15 @@ pub async fn rollback(
         .await
         .map_err(|e| wrap("set_not_migrated", e))?;
     steps.push("migration state = not-migrated".to_string());
+    // 复审第四轮 P1: 新用户直上 RBD 后 rollback, 共享目录本就可能不存在——
+    // 卷上的 fresh-init 标记必须改写为 rolled-back, 否则 ensure 的首建续接
+    // 分支会重放 Migrated, 撤销刚写入的切回决定。
+    state
+        .runtime()
+        .mark_workspace_volume_rolled_back(user_id, &service_type)
+        .await
+        .map_err(|e| wrap("mark_volume_rolled_back", e))?;
+    steps.push("volume origin = rolled-back".to_string());
     // 与 cutover 对称: 重建 agent(此时 NotMigrated → 共享卷形态)。
     // ensure 前释放锁(不可重入)。
     drop(migration_lock);

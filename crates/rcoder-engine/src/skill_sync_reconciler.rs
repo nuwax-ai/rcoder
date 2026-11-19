@@ -139,10 +139,15 @@ async fn scan_and_reconcile(
 /// - 否则 → `sync_agents_with_wait` (持工作区锁 fan-out, 内部写新 marker);
 ///   锁 busy → skip (另一副本在同步, 不算失败), 真实错误才计 failed
 async fn reconcile_workspace(workspace: &Path, agents: &Path, current: &str, stats: &mut Stats) {
-    if !tokio::fs::try_exists(agents.join("skills"))
+    // 复审第四轮 P2: 同步源含 skills 与 agents 两类(可独立存在)——只查
+    // skills 会跳过仅有 .agents/agents 的工作区。
+    let has_skills = tokio::fs::try_exists(agents.join("skills"))
         .await
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+    let has_agents = tokio::fs::try_exists(agents.join("agents"))
+        .await
+        .unwrap_or(false);
+    if !has_skills && !has_agents {
         stats.skipped += 1;
         return;
     }

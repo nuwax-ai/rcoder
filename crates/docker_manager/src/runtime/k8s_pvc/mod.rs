@@ -89,6 +89,15 @@ pub(crate) trait K8sPvcOps {
         storage_size: Option<&str>,
     ) -> ContainerRuntimeResult<()>;
 
+    /// 新用户首建专用：与 ensure_workspace_pvc 同规格，但打 fresh-init 来源
+    /// 标记（复审第四轮 P1——续接/回滚判据见 VOLUME_ORIGIN_LABEL 注释）。
+    async fn ensure_fresh_workspace_pvc(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        storage_size: Option<&str>,
+    ) -> ContainerRuntimeResult<()>;
+
     /// Userapp 生产运行容器历史第二块数据卷（`-data` 后缀）的卷名。
     ///
     /// 格式：`{container_prefix}-{sanitized_id}-data`。**已随单卷四 subPath 化退役**
@@ -200,6 +209,13 @@ pub(crate) fn per_agent_rbd_storage_class() -> String {
 /// 生效, 关闭时与现状逐字节一致。env 读取全部在调用方完成——本函数不触 env,
 /// 单测无需进程级 env 写入（crate 禁 unsafe, edition 2024 下 env::set_var 不可用）。
 #[cfg(feature = "kubernetes")]
+/// 工作区卷的初始化来源标记（复审第四轮 P1）：ensure 的首建续接分支只认
+/// fresh-init——phase-a 卷（不打标）、存量卷（无标）、rolled-back 卷都不会
+/// 被自动切回 RBD。
+pub(crate) const VOLUME_ORIGIN_LABEL: &str = "rcoder.io/volume-origin";
+pub(crate) const VOLUME_ORIGIN_FRESH_INIT: &str = "fresh-init";
+pub(crate) const VOLUME_ORIGIN_ROLLED_BACK: &str = "rolled-back";
+
 fn select_volume_spec(
     service_type: &ServiceType,
     global_access_mode: &str,
@@ -272,6 +288,40 @@ impl K8sPvcOps for KubernetesRuntime {
                 shared_types::legacy_composite_app_segment(identifier).to_string(),
             ));
         }
+        self.ensure_pvc_core(
+            &pvc_name,
+            &service_type.to_string(),
+            access_mode,
+            storage_class_name,
+            storage_size.unwrap_or(default_size),
+            None,
+            &extra_labels,
+        )
+        .await
+    }
+
+    /// 新用户首建专用：与 ensure_workspace_pvc 同规格，但打 fresh-init 来源
+    /// 标记——rollback 后该标记被改写为 rolled-back，ensure 的续接分支据此
+    /// 区分「首建中断可续接」与「显式回滚不得自动切回」（复审第四轮 P1）。
+    async fn ensure_fresh_workspace_pvc(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+        storage_size: Option<&str>,
+    ) -> ContainerRuntimeResult<()> {
+        let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
+        let (access_mode, storage_class_name, default_size) = select_volume_spec(
+            service_type,
+            &self.config.access_mode,
+            &self.config.storage_class,
+            userapp_storage_class(),
+            shared_types::per_agent_rbd_enabled(),
+            Some(per_agent_rbd_storage_class()),
+        );
+        let extra_labels = vec![(
+            VOLUME_ORIGIN_LABEL.to_string(),
+            VOLUME_ORIGIN_FRESH_INIT.to_string(),
+        )];
         self.ensure_pvc_core(
             &pvc_name,
             &service_type.to_string(),

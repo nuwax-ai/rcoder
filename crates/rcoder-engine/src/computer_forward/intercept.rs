@@ -94,42 +94,63 @@ pub async fn computer_rbd_intercept(
     if !is_pass_through_path(&path) {
         return next.run(req).await;
     }
-    // Git JSON 定位兜底（复审 P1）：Git handler 允许 POST 在 JSON body 里带
-    // userId/cId，仅靠 header/query/静态路径定位会让已迁移用户的 Git 写绕过
-    // 转发与写门禁直达旧共享卷。对「写方法 + Git 族 + 无 header + JSON」
-    // 的请求缓冲 body（≤64KB，Git JSON 均远小于此）提取 userId 注入 header。
-    // 非该形态（GET/带 header/非 JSON/body 超限）不动 body 原样放行。
+    // 定位优先级（复审第四轮 P1 重排）：已有定位来源（header/query/静态
+    // 路径）的请求不做任何 body 缓冲；无定位的 Git JSON **写**才需要从
+    // body 提取 userId——Git handler 允许 JSON 携带 userId/cId，不提取会让
+    // 已迁移用户的 Git 写绕过转发与写门禁直达旧共享卷。
+    // 体积分级：缓冲上限 2MB（对齐平台常规请求体量级）；超限且仍无定位的
+    // Git 写明确 400（codex：可控错误优于静默写共享卷——Java 侧补
+    // x-user-id header 后任意体积恢复，不破坏大请求契约）。
     let mut req = req;
-    if !req.headers().contains_key(shared_types::USER_ID_HEADER)
-        && super::migration_gate::is_write_method(req.method())
+    let is_write = super::migration_gate::is_write_method(req.method());
+    let is_git_json_write = is_write
         && path.starts_with("/api/git/")
         && req
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.to_ascii_lowercase().contains("application/json"))
-    {
-        let content_length_ok = req
-            .headers()
-            .get(axum::http::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<usize>().ok())
-            .is_none_or(|len| len <= 64 * 1024);
-        if content_length_ok {
-            match extract_git_json_user(req).await {
-                Ok((parts, body)) => req = Request::from_parts(parts, body),
-                Err(response) => return response,
-            }
-        }
-    }
-    // 注入成功时从新请求重读（None → Some 的唯一来源）。
-    let user_id_header = req
+            .is_some_and(|v| v.to_ascii_lowercase().contains("application/json"));
+    let header_snapshot = req
         .headers()
         .get(shared_types::USER_ID_HEADER)
-        .and_then(|v| v.to_str().ok());
-    let target = match resolve_target(user_id_header, req.uri().query(), &path) {
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let mut resolved = resolve_target(
+        header_snapshot.as_deref(),
+        req.uri().query(),
+        &path,
+    );
+    if matches!(resolved, TargetResolution::Absent) && is_git_json_write {
+        match extract_git_json_user(req).await {
+            Ok((parts, body)) => {
+                req = Request::from_parts(parts, body);
+                let header = req
+                    .headers()
+                    .get(shared_types::USER_ID_HEADER)
+                    .and_then(|v| v.to_str().ok());
+                resolved = resolve_target(header, req.uri().query(), &path);
+            }
+            Err(response) => return response,
+        }
+    }
+    let target = match resolved {
         TargetResolution::Found(target) => target,
-        TargetResolution::Absent => return next.run(req).await,
+        TargetResolution::Absent => {
+            if is_git_json_write {
+                // 无定位来源的 Git JSON 写（含 >2MB 未缓冲）：拒绝——放行会
+                // 让已迁移用户写旧共享卷且不经过写门禁。
+                tracing::warn!(
+                    path,
+                    "[COMPUTER_FORWARD] unlocatable git json write, rejecting (send x-user-id header)"
+                );
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "git write requires locatable user (x-user-id header or userId in body <=2MB)",
+                )
+                    .into_response();
+            }
+            return next.run(req).await;
+        }
         TargetResolution::Invalid => {
             // 有定位来源但值非法: 显式 400——静默放行会让 RBD 用户请求落
             // 本地共享卷读到空数据(看似成功的错误响应)
@@ -144,26 +165,21 @@ pub async fn computer_rbd_intercept(
                 .into_response();
         }
     };
-    // 迁移写门禁(终审 F1): cutover 进行中(停agent→增量sync→翻标记)该用户
-    // 判据仍 NotMigrated, 写请求若放行本地会写共享卷且不在最终 RBD
-    // (增量sync后的已确认写丢失)——一律 503, 切换完成后重试成功。
-    // 只拦写: 读旧卷不影响切换后一致性。门禁在判据查询前(省一次 API 调用),
-    // 且同时保护转发与本地放行两条去向。
-    if super::migration_gate::is_write_method(req.method())
-        && super::migration_gate::is_migrating(&target.user_id)
-    {
-        tracing::info!(
-            user_id = %target.user_id,
-            "[COMPUTER_FORWARD] write gated during migration, 503"
-        );
-        return service_unavailable("workspace migration in progress, retry shortly");
-    }
-    // 在途写登记（复审 P1）：门禁通过 ≠ 落盘完成——cutover begin 后到这笔写
-    // 异步落盘之间，最终同步可能已跑完导致写落旧卷。登记后 cutover 在停
-    // agent 前排空（drain_user_writes）。guard 持有到本 middleware 返回
-    // （= 响应完成），所有早退路径自动释放。
-    let _write_admission = if super::migration_gate::is_write_method(req.method()) {
-        Some(super::migration_gate::write_admitted(&target.user_id))
+    // 迁移写门禁 + 在途写登记（终审 F1 + 第四轮 P1 原子化）：检查与计数在
+    // migration_gate 的同一把短锁内完成——cutover begin 置位后，此处必然
+    // 拒绝，drain 归零即真正排空边界。guard 注入响应流（见 finish_with_guard），
+    // 流式正文的发送期仍在途。
+    let write_admission = if is_write {
+        match super::migration_gate::admit_write(&target.user_id) {
+            super::migration_gate::WriteAdmission::Admitted(guard) => Some(guard),
+            super::migration_gate::WriteAdmission::Gated => {
+                tracing::info!(
+                    user_id = %target.user_id,
+                    "[COMPUTER_FORWARD] write gated during migration, 503"
+                );
+                return service_unavailable("workspace migration in progress, retry shortly");
+            }
+        }
     } else {
         None
     };
@@ -190,7 +206,7 @@ pub async fn computer_rbd_intercept(
     };
     let is_rbd_user = migration_state == shared_types::WorkspaceMigrationState::Migrated;
     if decide(true, true, true, is_rbd_user) == InterceptDecision::PassThrough {
-        return next.run(req).await;
+        return finish_with_guard(next.run(req).await, write_admission);
     }
     tracing::info!(
         user_id = %target.user_id,
@@ -198,7 +214,47 @@ pub async fn computer_rbd_intercept(
         "[COMPUTER_FORWARD] {} -> agent container",
         req.uri().path()
     );
-    forward_to_agent(&state, &target.user_id, req).await
+    finish_with_guard(
+        forward_to_agent(&state, &target.user_id, req).await,
+        write_admission,
+    )
+}
+
+/// 把在途写 guard 注入响应 body 流：流终结/放弃（客户端断开）时释放——
+/// 流式正文的发送期写仍算在途，排空边界覆盖真实副作用结束（第四轮 P1）。
+fn finish_with_guard(
+    response: Response,
+    guard: Option<super::migration_gate::WriteAdmissionGuard>,
+) -> Response {
+    let Some(guard) = guard else {
+        return response;
+    };
+    let (parts, body) = response.into_parts();
+    let stream = Body::into_data_stream(body);
+    struct GuardedStream<S> {
+        inner: S,
+        _guard: Option<super::migration_gate::WriteAdmissionGuard>,
+    }
+    impl<S> futures::Stream for GuardedStream<S>
+    where
+        S: futures::Stream + Unpin,
+    {
+        type Item = S::Item;
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            futures::Stream::poll_next(std::pin::Pin::new(&mut self.inner), cx)
+        }
+    }
+    let guarded = GuardedStream {
+        inner: stream,
+        _guard: Some(guard),
+    };
+    Response::from_parts(
+        parts,
+        Body::from_stream(guarded),
+    )
 }
 
 /// wake（幂等 ensure agent 容器, ≤WAKE_BUDGET）+ 全流式转发其 :8086。
@@ -448,9 +504,14 @@ mod tests {
     }
 }
 
-/// 缓冲 Git JSON 请求提取 userId 并注入定位 header（复审 P1）。
-/// body 读取失败（连接截断/超限）返回 Err(400)——半截 body 放行下游只会
-/// 得到更晚也更迷惑的失败。无可定位 userId 时原样重建（body 保持字节不变）。
+/// 缓冲上限：对齐平台常规请求体量级。超限或无定位 userId 的 Git 写在
+/// 调用方被明确 400（不静默写共享卷）。
+const GIT_JSON_BUFFER_CAP: usize = 2 * 1024 * 1024;
+
+/// 缓冲 Git JSON 请求提取 userId 并注入定位 header（复审 P1 + 第四轮 P1）。
+/// body 读取失败（连接截断/**超 2MB 上限**）返回 Err(400)——半截 body 放行
+/// 下游只会得到更晚也更迷惑的失败；超限错误给出 header 契约提示。
+/// 无可定位 userId 时原样重建（body 保持字节不变）。
 async fn extract_git_json_user(
     req: Request,
 ) -> Result<
@@ -458,13 +519,13 @@ async fn extract_git_json_user(
     Response,
 > {
     let (mut parts, body) = req.into_parts();
-    let bytes = match axum::body::to_bytes(body, 64 * 1024).await {
+    let bytes = match axum::body::to_bytes(body, GIT_JSON_BUFFER_CAP).await {
         Ok(bytes) => bytes,
         Err(error) => {
-            tracing::warn!(error = %error, "[COMPUTER_FORWARD] git json body read failed");
+            tracing::warn!(error = %error, "[COMPUTER_FORWARD] git json body exceeds buffer cap or unreadable");
             return Err((
                 axum::http::StatusCode::BAD_REQUEST,
-                "unreadable request body",
+                "git write body exceeds 2MB and carries no locatable userId; send x-user-id header for large requests",
             )
                 .into_response());
         }

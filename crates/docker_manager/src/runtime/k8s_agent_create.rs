@@ -116,7 +116,7 @@ impl KubernetesRuntime {
                     //   （下方 legacy 防护同语义）。
                     // PVC 读失败原样上抛（fail-fast，不猜——暂态错误下误判
                     // "真新用户"会让存量用户被切到空卷）。
-                    let pvc_exists = self
+                    let pvc = self
                         .pvcs()
                         .get_opt(
                             &self.workspace_pvc_name(identifier, &service_type)?,
@@ -126,17 +126,27 @@ impl KubernetesRuntime {
                             ContainerRuntimeError::ConnectionError(format!(
                                 "cannot read workspace PVC state for '{identifier}': {error}"
                             ))
-                        })?
-                        .is_some();
+                        })?;
+                    let volume_origin = pvc.as_ref().and_then(|existing| {
+                        existing
+                            .metadata
+                            .labels
+                            .as_ref()
+                            .and_then(|labels| labels.get(crate::runtime::k8s_pvc::VOLUME_ORIGIN_LABEL))
+                            .cloned()
+                    });
                     let shared_state = probe_shared_dir(identifier).await;
-                    match (pvc_exists, shared_state) {
-                        // phase-a 预同步卷(共享卷有存量) 或 探测不可信: 保持共享路径
-                        (true, SharedDirProbe::NonEmpty)
-                        | (true, SharedDirProbe::ProbeFailed)
-                        | (false, SharedDirProbe::NonEmpty) => false,
-                        // 真新用户: 初始化直上 RBD
-                        (false, SharedDirProbe::Absent) => {
-                        self.ensure_workspace_pvc(
+                    match (pvc.is_some(), volume_origin.as_deref(), shared_state) {
+                        // phase-a 预同步卷(共享卷有存量/无来源标) 或 探测不可
+                        // 信: 保持共享路径。phase-a 与存量卷不打 fresh-init 标,
+                        // rolled-back 卷显式排除在续接之外(复审第四轮 P1: 回滚
+                        // 后的 ensure 不得撤销刚写入的切回决定)。
+                        (true, _, SharedDirProbe::NonEmpty)
+                        | (true, _, SharedDirProbe::ProbeFailed)
+                        | (false, _, SharedDirProbe::NonEmpty) => false,
+                        // 真新用户: 初始化直上 RBD（fresh-init 标记来源）
+                        (false, _, SharedDirProbe::Absent) => {
+                        self.ensure_fresh_workspace_pvc(
                             identifier,
                             &service_type,
                             params.storage_size.as_deref(),
@@ -153,13 +163,12 @@ impl KubernetesRuntime {
                             );
                             true
                         }
-                        // 新用户初始化中断的自愈: 卷已建但 Migrated 未落——
-                        // 重放标记完成初始化(幂等), 不留在共享卷等显式迁移。
-                        // 残余边角(已评估接受): phase-a 用户在预同步期把共享卷
-                        // 删空会落入本象限被误判——后果是被切到预同步快照
-                        // (删除操作"复活"为旧数据, 非新数据丢失); 需要同时满足
-                        // "删空全部数据 + 恰逢 agent 重建"两个条件, 概率极低。
-                        (true, SharedDirProbe::Absent) => {
+                        // 首建中断的自愈: **只认 fresh-init 来源标**——卷确由
+                        // 新用户首建路径创建且 rollback 未改写标记, 重放
+                        // Migrated 完成初始化(幂等)。无标卷(phase-a 残留/同步
+                        // 失败留卷/存量卷)与 rolled-back 卷一律走共享, 不凭
+                        // "空目录"推断卷的来历。
+                        (true, Some(crate::runtime::k8s_pvc::VOLUME_ORIGIN_FRESH_INIT), SharedDirProbe::Absent) => {
                             self.set_workspace_migration_state(
                                 identifier,
                                 &service_type,
@@ -167,17 +176,20 @@ impl KubernetesRuntime {
                             )
                             .await?;
                             info!(
-                                "[K8S] new user '{identifier}' RBD init resumed (fresh volume existed, marker replayed)"
+                                "[K8S] new user '{identifier}' RBD init resumed (fresh-init volume, marker replayed)"
                             );
                             true
                         }
-                        // 探测不可信(env 未设/IO 错误): fail-closed 拒绝初始化
-                        // ——误判新用户会让存量用户数据"消失"(空 RBD 卷+存在即
-                        // 转发)。上抛可重试错误, 不静默回落(语义随机漂移)。
-                        (false, SharedDirProbe::ProbeFailed) => {
+                        // 有卷但无 fresh-init 凭据 + 共享 Absent: 保守共享路径
+                        // (phase-a 残留 / rolled-back / 存量卷的统一归宿)。
+                        (true, _, SharedDirProbe::Absent) => false,
+                        // 探测不可信(env 未设/IO 错误/共享根缺失): fail-closed
+                        // 拒绝初始化——误判新用户会让存量用户数据"消失"(空
+                        // RBD 卷+存在即转发)。上抛可重试错误, 不静默回落。
+                        (false, _, SharedDirProbe::ProbeFailed) => {
                             return Err(ContainerRuntimeError::ConnectionError(format!(
                                 "cannot probe shared workspace for '{identifier}' \
-                                 (COMPUTER_WORKSPACE_DIR unset or IO error); \
+                                 (COMPUTER_WORKSPACE_DIR unset, IO error or shared root missing); \
                                  refusing new-user RBD initialization"
                             )));
                         }
@@ -886,6 +898,11 @@ async fn probe_shared_dir(identifier: &str) -> SharedDirProbe {
     let Some(root) = legacy_shared_root() else {
         return SharedDirProbe::ProbeFailed;
     };
+    // 共享根本身缺失/不可读 = 环境配置错误或卷未挂载, 不是"该用户无数据"
+    // ——按探测失败处理(fail-closed), 不能当 Absent 误判新用户(复审第四轮 P1)。
+    if tokio::fs::metadata(&root).await.is_err() {
+        return SharedDirProbe::ProbeFailed;
+    }
     let path = root.join(identifier);
     match tokio::fs::read_dir(&path).await {
         Ok(mut rd) => match rd.next_entry().await {

@@ -67,11 +67,16 @@ async fn scan(dir: &Path, depth: u32, synced: &mut u32) {
 }
 
 async fn reconcile_workspace(workspace: &Path, synced: &mut u32) {
-    // 与主进程 reconcile_workspace 同款：有 skills 源 + fanout 漂移 → 补同步。
-    if !tokio::fs::try_exists(workspace.join(".agents/skills"))
+    // 与主进程 reconcile_workspace 同款：有任一同步源(skills 或 agents——
+    // 复审第四轮 P2: 仅有 .agents/agents 的工作区此前被跳过) + fanout 漂移
+    // → 补同步。
+    let has_skills = tokio::fs::try_exists(workspace.join(".agents/skills"))
         .await
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+    let has_agents = tokio::fs::try_exists(workspace.join(".agents/agents"))
+        .await
+        .unwrap_or(false);
+    if !has_skills && !has_agents {
         return;
     }
     match file_server::fanout_names_drifted(workspace).await {

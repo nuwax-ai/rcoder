@@ -141,6 +141,60 @@ impl WorkspaceRuntime for KubernetesRuntime {
     /// 翻迁移状态（patch PVC annotation; NotMigrated = 移除 annotation）。
     /// 成功后即时写缓存（否则 30s TTL 窗口内判据滞后——cutover 后首个
     /// 请求可能仍走共享卷）。PVC 不存在 → NotFound。
+    async fn mark_workspace_volume_rolled_back(
+        &self,
+        identifier: &str,
+        service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<()> {
+        use crate::runtime::k8s_pvc::K8sPvcOps;
+        let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
+        // 卷不存在（rollback 前卷已被清理等）→ no-op：标记的对象都缺了，
+        // 续接分支自然不成立。
+        let Some(existing) = self
+            .pvcs()
+            .get_opt(&pvc_name)
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!("get PVC '{pvc_name}': {e}")))?
+        else {
+            return Ok(());
+        };
+        let origin = existing
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(crate::runtime::k8s_pvc::VOLUME_ORIGIN_LABEL))
+            .cloned()
+            .unwrap_or_default();
+        if origin != crate::runtime::k8s_pvc::VOLUME_ORIGIN_FRESH_INIT {
+            // 非 fresh-init 卷（phase-a/存量）本就不会被续接分支认领。
+            return Ok(());
+        }
+        let uid = existing.metadata.uid.clone().ok_or_else(|| {
+            ContainerRuntimeError::Conflict(format!("PVC '{pvc_name}' has no UID"))
+        })?;
+        let rv = existing.metadata.resource_version.clone().ok_or_else(|| {
+            ContainerRuntimeError::Conflict(format!("PVC '{pvc_name}' has no resourceVersion"))
+        })?;
+        let patch = serde_json::json!({
+            "metadata": {
+                "uid": uid,
+                "resourceVersion": rv,
+                "labels": {crate::runtime::k8s_pvc::VOLUME_ORIGIN_LABEL: crate::runtime::k8s_pvc::VOLUME_ORIGIN_ROLLED_BACK}
+            }
+        });
+        self.pvcs()
+            .patch(
+                &pvc_name,
+                &kube::api::PatchParams::default(),
+                &kube::api::Patch::Merge(&patch),
+            )
+            .await
+            .map_err(|e| ContainerRuntimeError::K8sError(format!(
+                "patch PVC '{pvc_name}' origin label: {e}"
+            )))?;
+        Ok(())
+    }
+
     async fn set_workspace_migration_state(
         &self,
         identifier: &str,

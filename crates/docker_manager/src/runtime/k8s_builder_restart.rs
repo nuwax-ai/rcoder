@@ -163,7 +163,31 @@ impl KubernetesRuntime {
             .builder_app_id(target.context.app_id.clone())
             .service_type(shared_types::ServiceType::UserappBuilder)
             .build();
-        let apply_platform_recipe = target.restart_image.is_some();
+        let original_agent = original
+            .containers
+            .iter()
+            .find(|container| container.name == "agent")
+            .ok_or_else(|| Error::Conflict("Restart original agent container missing".into()))?;
+        // 冷启动/重启镜像对齐归属守卫（spec sandbox-image-version-drift R1）：
+        // 平台配方仅在保留 agent 镜像与期望引用同仓库（平台管理）时应用；
+        // 外部/显式钉住的镜像保留原始配置与镜像原样续跑。
+        let desired_image = target.restart_image.as_deref().filter(|desired| {
+            original_agent
+                .image
+                .as_deref()
+                .map(container_runtime_api::image_repository)
+                .is_some_and(|repository| {
+                    repository == container_runtime_api::image_repository(desired)
+                })
+        });
+        if target.restart_image.is_some() && desired_image.is_none() {
+            tracing::warn!(
+                app = %target.context.app_id,
+                desired = ?target.restart_image,
+                "builder restart image alignment skipped: agent image is not platform-managed"
+            );
+        }
+        let apply_platform_recipe = desired_image.is_some();
         let mut candidate = if apply_platform_recipe {
             self.build_agent_pod_spec(
                 &target.context.app_id,
@@ -182,11 +206,6 @@ impl KubernetesRuntime {
         {
             Self::install_builder_credential(&mut candidate, credential)?;
         }
-        let original_agent = original
-            .containers
-            .iter()
-            .find(|container| container.name == "agent")
-            .ok_or_else(|| Error::Conflict("Restart original agent container missing".into()))?;
         let agent = candidate
             .containers
             .iter_mut()
@@ -194,9 +213,8 @@ impl KubernetesRuntime {
             .ok_or_else(|| {
                 Error::ConfigurationError("Restart candidate agent container missing".into())
             })?;
-        agent.image = target
-            .restart_image
-            .clone()
+        agent.image = desired_image
+            .map(str::to_string)
             .or_else(|| original_agent.image.clone());
         agent.resources = original_agent.resources.clone();
         // A rollout that adopts the current platform template also adopts the

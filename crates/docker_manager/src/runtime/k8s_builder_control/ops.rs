@@ -1195,15 +1195,46 @@ impl KubernetesRuntime {
                 let receipt = serde_json::to_string(&target.context).map_err(|error| {
                     Error::ConfigurationError(format!("Encode builder start receipt: {error}"))
                 })?;
+                // 冷唤醒镜像对齐归属守卫（spec sandbox-image-version-drift R1）：
+                // 仅当保留模板的 agent 容器与平台当前引用同仓库时才滚动到新
+                // tag；外部/显式钉住的镜像保留模板原样唤醒。
+                let restart_image = match target.restart_image.as_deref() {
+                    Some(desired) => {
+                        let template_repo = current
+                            .spec
+                            .as_ref()
+                            .and_then(|spec| spec.template.spec.as_ref())
+                            .and_then(|spec| {
+                                spec.containers
+                                    .iter()
+                                    .find(|container| container.name == "agent")
+                            })
+                            .and_then(|container| container.image.as_deref())
+                            .map(container_runtime_api::image_repository);
+                        if template_repo.is_some_and(|repository| {
+                            repository == container_runtime_api::image_repository(desired)
+                        }) {
+                            Some(desired)
+                        } else {
+                            tracing::warn!(
+                                app = %target.context.app_id,
+                                desired,
+                                "builder wake image alignment skipped: agent image is not platform-managed"
+                            );
+                            None
+                        }
+                    }
+                    None => None,
+                };
                 let patch = builder_compute_start_patch(
                     workload,
                     &current,
                     &receipt,
-                    target.restart_image.as_deref(),
+                    restart_image,
                     target.restart_runtime_workspace.as_deref(),
                     target.builder_startup_mode,
                 )?;
-                if target.restart_image.is_some()
+                if restart_image.is_some()
                     || target.restart_runtime_workspace.is_some()
                     || target.builder_startup_mode
                         == shared_types::BuilderStartupMode::ManagementOnly

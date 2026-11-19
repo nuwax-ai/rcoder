@@ -128,6 +128,11 @@ pub async fn submit_physical_start(
 }
 
 /// Restore compute for a file or Source request without replaying old business.
+///
+/// 流量访问唤起与显式启动同语义（spec sandbox-image-version-drift R1）：冷启动
+/// 对齐平台当前镜像——roll=true；auto_repair 保持 roll=false（修复续跑不滚动，
+/// 见 auto_repair.rs 的 RequestRejected 语义）。非平台镜像由 k8s 写边界归属
+/// 守卫保留（k8s_builder_control/ops.rs 与 k8s_builder_restart.rs）。
 pub(crate) async fn submit_physical_start_for_access(
     state: &Arc<AppState>,
     app_id: String,
@@ -141,7 +146,7 @@ pub(crate) async fn submit_physical_start_for_access(
         scope,
         ComputeControlAction::Restart,
         request,
-        false,
+        true,
         mode,
     )
     .await

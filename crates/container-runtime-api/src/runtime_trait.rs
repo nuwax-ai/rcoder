@@ -917,6 +917,17 @@ pub trait WorkspaceRuntime: Send + Sync {
     /// 翻迁移状态（cutover 落 / 回滚撤）。K8s: patch PVC annotation
     /// （UID+resourceVersion 条件化, 与 resize 同款 CAS 语义）; PVC 不存在
     /// 报 NotFound（未 phase-a 不能 cutover）。Docker: 不支持。
+    /// rollback 后把 fresh-init 卷的来源标记改写为 rolled-back（复审第四
+    /// 轮 P1）：ensure 的首建续接分支只认 NotMigrated + fresh-init，改写后
+    /// 显式回滚不会被自动切回 RBD。默认 no-op（无 PVC 概念的形态）。
+    async fn mark_workspace_volume_rolled_back(
+        &self,
+        _identifier: &str,
+        _service_type: &ServiceType,
+    ) -> ContainerRuntimeResult<()> {
+        Ok(())
+    }
+
     async fn set_workspace_migration_state(
         &self,
         _identifier: &str,

@@ -1462,8 +1462,12 @@ impl SandboxManager {
                         updated_at = record.updated_at_us,
                         "e2b reaper: Terminating 卡死超宽限，强制收敛"
                     );
+                    // KillReason 用 Recover 而非 ReapExpired: 卡死行的 expires
+                    // 可能是 NULL/未来值(kill 两步间中断的历史残留),
+                    // ReapExpired 的到期复核会直接放弃——Recover 只复核非终态
+                    // (复审第四轮 P2), 10min 卡死宽限本身就是处置凭据。
                     if let Err(error) = self
-                        .kill_by_record(&record, KillReason::ReapExpired)
+                        .kill_by_record(&record, KillReason::Recover)
                         .await
                     {
                         tracing::warn!(sandbox_id = %record.sandbox_id, error = %error, "e2b reaper 卡死收敛失败，下轮重试");

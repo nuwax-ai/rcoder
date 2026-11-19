@@ -77,6 +77,24 @@ def write_receipt(output, value):
     print(json.dumps(value, sort_keys=True))
 
 
+def _require_catalog_commit_match(catalog, version, commit):
+    """Refuse an explicit pin conflict even when asset records are incomplete.
+
+    Reads the tracked catalog directly (identity only): an entry for `version`
+    whose commit differs from the request is a provenance conflict regardless of
+    whether the architecture asset is present. A missing version entry keeps the
+    lenient fallback (digest recorded in the receipt for reconciliation).
+    """
+    release = (catalog or {}).get('releases', {}).get(version)
+    if not release:
+        return
+    pinned = release.get('commit')
+    if isinstance(pinned, str) and re.fullmatch(r'[0-9a-f]{40}', pinned) and pinned != commit:
+        raise ValueError('official release source pin mismatch: catalog records '
+                         + repr(pinned) + ' for version ' + repr(version)
+                         + ' but the request pinned ' + repr(commit))
+
+
 def install(args, version, commit):
     # Linux-only archive machinery is loaded lazily so Windows source builds do
     # not import runtime_assets' fcntl dependency.
@@ -87,6 +105,12 @@ def install(args, version, commit):
     try:
         release = assets.trusted_pingap_release(version, [args.arch], catalog)
     except (ValueError, KeyError) as error:
+        # Review 4th-round P2: before any lenient fallback, independently verify
+        # the release *identity* from the catalog. A catalog entry for this
+        # version (even one missing the requested architecture asset) with a
+        # different commit pin means the artifact provenance cannot be proven —
+        # refuse instead of silently shipping a mismatched build.
+        _require_catalog_commit_match(catalog, version, commit)
         # A release missing from (or invalid in) the trusted catalog no longer
         # blocks image builds: fall back to the official naming convention and
         # record the downloaded digest in the receipt for later reconciliation.
