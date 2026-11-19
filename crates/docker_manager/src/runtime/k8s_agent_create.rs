@@ -970,6 +970,11 @@ async fn marker_completer(
     // 继续（此前派发即继续建 RBD agent，PATCH 失败只记日志）。取消安全保
     // 留：外层 future 取消只是不再等结果——spawn 的任务继续跑完并持门禁
     // 至 PATCH/缓存落定（JoinHandle drop 不取消任务）。
+    let reconcile_client = client.clone();
+    let reconcile_ns = namespace.clone();
+    let reconcile_pvc = pvc_name.clone();
+    let reconcile_key = cache_key.clone();
+    let reconcile_cache = std::sync::Arc::clone(&cache);
     let handle = tokio::spawn(async move {
         let _held = gate;
         crate::runtime::kubernetes_runtime::workspace_runtime::set_migration_state_detached(
@@ -985,12 +990,36 @@ async fn marker_completer(
     match handle.await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => {
-            tracing::warn!(
-                user_id = identifier,
-                error = %error,
-                "[K8S] fresh-init marker PATCH failed in completer; gate released on drop"
-            );
-            Err(error)
+            // 错误路径对账（第十轮 P1）：PATCH 报错但可能已到达服务端（响应
+            // 丢失/超时）——此刻错误地放行门禁会让写经旧缓存落共享卷，而
+            // PVC 实际已 Migrated。重读实际标记：已迁移则补写缓存按成功
+            // 收敛；确未迁移才是真失败（放行安全——路由与 PVC 一致）。
+            match crate::runtime::kubernetes_runtime::workspace_runtime::reconcile_migration_marker(
+                reconcile_client,
+                &reconcile_ns,
+                &reconcile_pvc,
+                &reconcile_key,
+                reconcile_cache,
+            )
+            .await
+            {
+                Some(()) => {
+                    tracing::warn!(
+                        user_id = identifier,
+                        error = %error,
+                        "[K8S] fresh-init marker PATCH errored but server applied it; cache reconciled, treating as success"
+                    );
+                    Ok(())
+                }
+                None => {
+                    tracing::warn!(
+                        user_id = identifier,
+                        error = %error,
+                        "[K8S] fresh-init marker PATCH failed (server did not apply); gate released on drop"
+                    );
+                    Err(error)
+                }
+            }
         }
         Err(error) => Err(ContainerRuntimeError::ConnectionError(format!(
             "marker completer task failed: {error}"

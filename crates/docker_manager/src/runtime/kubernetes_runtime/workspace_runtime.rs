@@ -531,3 +531,34 @@ pub(crate) async fn set_migration_state_detached(
     );
     Ok(())
 }
+
+/// 完成者错误路径的对账（第十轮 P1）：PATCH 报错但可能已到达服务端（响应
+/// 丢失/超时）——重读同一 PVC 的实际标记：已 migrated 则补写判据缓存
+/// （成功收敛）；未 migrated 才是真失败。返回 Some(()) = 已收敛。
+pub(crate) async fn reconcile_migration_marker(
+    client: Client,
+    namespace: &str,
+    pvc_name: &str,
+    cache_key: &str,
+    cache: Arc<RwLock<std::collections::HashMap<String, WorkspaceMigrationCacheValue>>>,
+) -> Option<()> {
+    use crate::runtime::k8s_pvc::K8sPvcOps;
+    let pvcs: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
+        kube::Api::namespaced(client, namespace);
+    let pvc = pvcs.get(pvc_name).await.ok()?;
+    let migrated = pvc
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(shared_types::WORKSPACE_MIGRATION_ANNOTATION))
+        .map(|value| value == "migrated")
+        .unwrap_or(false);
+    if !migrated {
+        return None;
+    }
+    cache.write().await.insert(
+        cache_key.to_string(),
+        (true, shared_types::WorkspaceMigrationState::Migrated, std::time::Instant::now()),
+    );
+    Some(())
+}

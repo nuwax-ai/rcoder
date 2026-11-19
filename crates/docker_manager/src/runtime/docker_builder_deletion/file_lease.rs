@@ -168,9 +168,26 @@ pub(super) fn validate_file_receipt(
         .take(token.len() as u64 + 1)
         .read_to_end(&mut owner)
         .map_err(|error| Error::DockerError(format!("Read operation lease owner: {error}")))?;
+    if owner == token.as_bytes() {
+        return Ok(true);
+    }
+    // 活 marker 与回执不符（含被归档清零的空文件）：查归档旁文件——孤儿
+    // 回收回时原 token 被移入 {lock}.lock.orphaned（append 带 [unix秒] 前
+    // 缀），替代执行者仍持原回执，其完成/清除确认必须仍能匹配到 token
+    // （第十轮 P1：归档只保审计线索会让恢复链对替代执行者失去凭据）。
+    let archive = path.with_extension("lock.orphaned");
+    if let Ok(content) = std::fs::read_to_string(&archive) {
+        let last = content
+            .lines()
+            .filter_map(|line| line.split_once(' ').map(|(_, token)| token.trim()))
+            .next_back();
+        if last == Some(token.as_str()) {
+            return Ok(true);
+        }
+    }
     // Empty markers are already released, not authority to resume this operation.
     // Dropping this temporary fd unlocks without clearing or rewriting the marker.
-    Ok(owner == token.as_bytes())
+    Ok(false)
 }
 
 #[cfg(not(unix))]

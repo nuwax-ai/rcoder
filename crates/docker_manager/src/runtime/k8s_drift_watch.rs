@@ -201,10 +201,15 @@ async fn recover_drifted_app(
 ) -> anyhow::Result<RecoveryOutcome> {
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
     let name = format!("rcoder-app-{app_id}");
-    let deployment = deployments
-        .get(&name)
-        .await
-        .map_err(|error| anyhow::anyhow!("read drifted deployment {name}: {error}"))?;
+    let deployment = match deployments.get(&name).await {
+        Ok(deployment) => deployment,
+        // 读失败（第十轮 P2）：PATCH 未发，不构成对齐尝试——warn + Skipped，
+        // 不进入调用方的冷却登记（Err 分支保留给 PATCH 尝试失败）。
+        Err(error) => {
+            tracing::warn!(app = %app_id, %error, "[IMAGE_DRIFT_WATCH] deployment read failed; skipping");
+            return Ok(RecoveryOutcome::Skipped);
+        }
+    };
     // 写前复查（第七轮复审 P1）：Ready 副本已达期望说明业务容器健康——
     // 拉取失败只属于 sidecar 或瞬时抖动，不对齐。
     let ready_replicas = deployment
