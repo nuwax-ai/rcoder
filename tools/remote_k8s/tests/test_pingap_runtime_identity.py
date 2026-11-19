@@ -56,9 +56,53 @@ class PingapRuntimeIdentityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             c = self.config(Path(temporary))
             bases = {key: 'example/' + key.lower() + '@sha256:' + 'a' * 64 for key in identity.BASES}
-            for pingap, node in [('pingap 0.14.3', 'v22.23.2'), ('pingap 0.15.0', 'v24.0.0'), ('pingap 0.15.00', 'v22.23.2')]:
+            for pingap, node in [('pingap 0.14.3', 'v22.23.2'), ('pingap 0.15.0', 'v24.0.0'), ('pingap 0.15.00', 'v22.23.2'), ('pingap 0.17.0', 'v22.23.2')]:
                 with self.subTest(pingap=pingap, node=node), self.assertRaises(ValueError):
                     self.observations(c, bases, pingap, node)
+
+    def test_newer_compatible_patch_base_is_accepted_with_own_commit(self):
+        # 基础镜像随最新同 minor pingap 发布(如 0.16.2 基座 vs 0.16.1 源码),
+        # patch 内向后兼容,携带自身 commit 放行;回执内部一致性照常核验。
+        with tempfile.TemporaryDirectory() as temporary:
+            c = self.config(Path(temporary))
+            bases = {key: 'example/' + key.lower() + '@sha256:' + 'a' * 64 for key in identity.BASES}
+            source = identity.source_identity()
+            newer_commit = 'b' * 40
+            newer = '.'.join([*source['version'].split('.')[:2],
+                              str(int(source['version'].split('.')[2]) + 1)])
+            def ssh(args, **kwargs):
+                entry = args[args.index('--entrypoint') + 1]
+                if entry == 'node':
+                    return 'v22.23.2'
+                if args[-1] == '--version':
+                    return 'pingap ' + newer + ' (' + newer_commit + ', tls=openssl)'
+                return 'pingap ' + newer
+            with patch.object(c, 'ssh', side_effect=ssh):
+                receipt = identity.inspect_bases(c, bases, source)
+            self.assertEqual(identity.validate_receipt(receipt, bases), source)
+            for record in receipt['bases'].values():
+                self.assertEqual(record['pingap_version'], newer)
+                self.assertEqual(record['pingap_commit'], newer_commit)
+
+    def test_newer_patch_receipt_with_inconsistent_observations_is_rejected(self):
+        # 兼容放宽不放松内部一致性:-V 版本与完整身份版本不一致的回执仍拒绝。
+        with tempfile.TemporaryDirectory() as temporary:
+            c = self.config(Path(temporary))
+            bases = {key: 'example/' + key.lower() + '@sha256:' + 'a' * 64 for key in identity.BASES}
+            source = identity.source_identity()
+            newer = '.'.join([*source['version'].split('.')[:2],
+                              str(int(source['version'].split('.')[2]) + 1)])
+            receipt = {'status': 'verified', 'source': source, 'node_version': identity.NODE_VERSION,
+                       'bases': {key: {'image': bases[key], 'pingap_version': newer,
+                                       'node_version': identity.NODE_VERSION,
+                                       'pingap_stdout': 'pingap ' + newer,
+                                       'node_stdout': 'v' + identity.NODE_VERSION,
+                                       # full 身份仍报源码版本 → 不一致
+                                       'pingap_full_stdout': 'pingap ' + source['version'] + ' (' + source['commit'] + ', tls=openssl)',
+                                       'pingap_commit': source['commit'], 'tls': 'openssl'}
+                                  for key in identity.BASES}}
+            with self.assertRaises(ValueError):
+                identity.validate_receipt(receipt, bases)
 
     def test_override_cannot_forge_actual_build_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
