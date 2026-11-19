@@ -258,4 +258,4 @@ mod migration_ops;
 mod pod_overview;
 #[cfg(feature = "kubernetes")]
 #[cfg(feature = "kubernetes")]
-mod workspace_runtime;
+pub(crate) mod workspace_runtime;

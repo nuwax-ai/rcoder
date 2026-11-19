@@ -23,25 +23,17 @@ use super::k8s_deployment::{
 };
 
 /// 拉取失败类 waiting reason（kubelet 报告的镜像不可得形态）。
-/// 只关注**业务容器**：sidecar（log-shipper/log-collector）拉取失败不应
-/// 触发对齐——业务容器健康 Ready 时模板没漂移（第七轮复审 P1：曾对
-/// Ready 的 Deployment 发出 PATCH）。名称前缀判定与 e2b 数据面的
-/// SIDECAR_PREFIXES 同一约定。
-const SIDECAR_NAME_PREFIXES: &[&str] = &["log-shipper", "log-collector"];
-
-fn is_sidecar_container(name: &str) -> bool {
-    SIDECAR_NAME_PREFIXES
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-}
-
+/// 只认**业务容器**（`APP_CONTAINER_NAME`，精确名匹配）：任意 sidecar
+/// （日志/网格/注入类）拉取失败都不触发对齐——业务容器拉取失败才是模板
+/// 漂移的证据（第八轮复审 P1：前缀白名单挡不住普通 sidecar，业务容器
+/// Ready 而其他 sidecar 失败时曾对 Deployment 误发 PATCH）。
 fn is_image_pull_failure(pod: &Pod) -> bool {
     pod.status
         .as_ref()
         .and_then(|status| status.container_statuses.as_ref())
         .is_some_and(|statuses| {
             statuses.iter().any(|status| {
-                if is_sidecar_container(&status.name) {
+                if status.name != APP_CONTAINER_NAME {
                     return false;
                 }
                 status
@@ -133,6 +125,11 @@ pub(crate) fn spawn_drift_watch(
                     let Some(app_id) = pod_app_id(&pod) else {
                         continue;
                     };
+                    let triggering_pod = pod
+                        .metadata
+                        .name
+                        .clone()
+                        .unwrap_or_default();
                     if !is_image_pull_failure(&pod) {
                         first_failure.remove(&app_id);
                         continue;
@@ -155,6 +152,7 @@ pub(crate) fn spawn_drift_watch(
                         client.clone(),
                         &namespace,
                         &app_id,
+                        &triggering_pod,
                         &config.platform_image,
                         platform_repo,
                     )
@@ -178,10 +176,11 @@ async fn recover_drifted_app(
     client: kube::Client,
     namespace: &str,
     app_id: &str,
+    triggering_pod_name: &str,
     platform_image: &str,
     platform_repo: &str,
 ) -> anyhow::Result<()> {
-    let deployments: Api<Deployment> = Api::namespaced(client, namespace);
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
     let name = format!("rcoder-app-{app_id}");
     let deployment = deployments
         .get(&name)
@@ -203,6 +202,44 @@ async fn recover_drifted_app(
             "[IMAGE_DRIFT_WATCH] deployment already ready; skipping alignment"
         );
         return Ok(());
+    }
+    // 写前复查触发 Pod（第八轮复审 P1）：重新读取触发 pod——业务容器必须
+    // **此刻仍**拉取失败（窗口期间自愈/被人工修复则不对齐），且其 owner
+    // UID 与当前 deployment 一致（换代后旧触发不作数）。
+    if !triggering_pod_name.is_empty() {
+        let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+        match pods.get(triggering_pod_name).await {
+            Ok(current) => {
+                let owner_matches = deployment.metadata.uid.as_deref().is_some_and(|deployment_uid| {
+                    current
+                        .metadata
+                        .owner_references
+                        .as_ref()
+                        .is_some_and(|refs| {
+                            refs.iter().any(|reference| reference.uid == deployment_uid)
+                        })
+                });
+                if !owner_matches || !is_image_pull_failure(&current) {
+                    tracing::info!(
+                        app = %app_id,
+                        pod = triggering_pod_name,
+                        owner_matches,
+                        "[IMAGE_DRIFT_WATCH] trigger pod no longer valid; skipping alignment"
+                    );
+                    return Ok(());
+                }
+            }
+            Err(error) => {
+                // 触发 pod 已消失（删除/重建）→ 证据失效，本轮不对齐。
+                tracing::info!(
+                    app = %app_id,
+                    pod = triggering_pod_name,
+                    %error,
+                    "[IMAGE_DRIFT_WATCH] trigger pod unreadable; skipping alignment"
+                );
+                return Ok(());
+            }
+        }
     }
     let managed = deployment
         .metadata
@@ -415,6 +452,7 @@ mod tests {
                     client,
                     "drift-test",
                     "9",
+                    "",  // 无触发 pod 名 → 跳过 pod 复核（单元测试聚焦 patch 语义）
                     "registry.test/app-runtime:0.1.456",
                     "registry.test/app-runtime",
                 )

@@ -145,7 +145,8 @@ impl KubernetesRuntime {
                     // 也会经 Drop 释放——手写 end 无法覆盖取消路径（曾致写准入
                     // 永久冻结的变体）。已派发但结果未知的 K8s 写由 ensure 幂等
                     // + 四象限重探测天然对账。
-                    let _migration_gate = shared_types::migration_gate::begin_guarded(identifier);
+                    let mut migration_gate =
+                        Some(shared_types::migration_gate::begin_guarded(identifier));
                     let drain_left = shared_types::migration_gate::drain_user_writes(
                         identifier,
                         std::time::Duration::from_secs(10),
@@ -182,16 +183,7 @@ impl KubernetesRuntime {
                         {
                             return Err(error);
                         }
-                        if let Err(error) = self
-                            .set_workspace_migration_state(
-                                identifier,
-                                &service_type,
-                                shared_types::WorkspaceMigrationState::Migrated,
-                            )
-                            .await
-                        {
-                            return Err(error);
-                        }
+                        spawn_marker_completer(self, migration_gate.take(), identifier, &service_type);
                             info!(
                                 "[K8S] new user '{identifier}' initialized on per-agent RBD"
                             );
@@ -203,17 +195,7 @@ impl KubernetesRuntime {
                         // 失败留卷/存量卷)与 rolled-back 卷一律走共享, 不凭
                         // "空目录"推断卷的来历。
                         (true, Some(crate::runtime::k8s_pvc::VOLUME_ORIGIN_FRESH_INIT), SharedDirProbe::Absent) => {
-                            if let Err(error) = self
-                                .set_workspace_migration_state(
-                                    identifier,
-                                    &service_type,
-                                    shared_types::WorkspaceMigrationState::Migrated,
-                                )
-                                .await
-                            {
-                                shared_types::migration_gate::end(identifier);
-                                return Err(error);
-                            }
+                            spawn_marker_completer(self, migration_gate.take(), identifier, &service_type);
                             info!(
                                 "[K8S] new user '{identifier}' RBD init resumed (fresh-init volume, marker replayed)"
                             );
@@ -956,4 +938,52 @@ async fn probe_shared_dir(identifier: &str) -> SharedDirProbe {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => SharedDirProbe::Absent,
         Err(_) => SharedDirProbe::ProbeFailed,
     }
+}
+
+/// 首建 marker PATCH 的完成者（第八轮复审 P1）：门禁所有权随任务转移——
+/// 编排 future 在 PATCH 派发后被取消不再提前放行写；完成者核对同一 PVC
+/// （uid+rv 前置条件）、写判据缓存后才解除门禁。此前反例：取消后门禁
+/// 放行 + 服务端 PATCH 仍提交 → 缓存 NotMigrated 与 PVC Migrated 分裂，
+/// 并发写落旧共享卷。
+fn spawn_marker_completer(
+    runtime: &KubernetesRuntime,
+    gate: Option<shared_types::migration_gate::MigrationGuard>,
+    identifier: &str,
+    service_type: &ServiceType,
+) {
+    use crate::runtime::k8s_pvc::K8sPvcOps;
+    let Some(gate) = gate else {
+        tracing::warn!(user_id = identifier, "marker completer called without gate");
+        return;
+    };
+    let Ok(pvc_name) = runtime.workspace_pvc_name(identifier, service_type) else {
+        tracing::warn!(user_id = identifier, "completer: pvc name resolution failed");
+        return;
+    };
+    // 与 migration_cache_key 同构的键（完成者不依赖 &self 的方法）。
+    let cache_key = format!("{service_type}/{identifier}");
+    let client = runtime.client.clone();
+    let namespace = runtime.namespace.clone();
+    let cache = std::sync::Arc::clone(&runtime.workspace_exists_cache);
+    let user_id = identifier.to_string();
+    tokio::spawn(async move {
+        let _held = gate;
+        if let Err(error) =
+            crate::runtime::kubernetes_runtime::workspace_runtime::set_migration_state_detached(
+                client,
+                namespace,
+                cache,
+                pvc_name,
+                cache_key,
+                shared_types::WorkspaceMigrationState::Migrated,
+            )
+            .await
+        {
+            tracing::warn!(
+                user_id = %user_id,
+                error = %error,
+                "[K8S] fresh-init marker PATCH failed in completer; gate released on drop"
+            );
+        }
+    });
 }

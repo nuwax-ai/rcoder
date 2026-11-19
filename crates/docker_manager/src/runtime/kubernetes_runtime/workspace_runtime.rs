@@ -466,3 +466,68 @@ impl KubernetesRuntime {
         ))
     }
 }
+
+/// [`WorkspaceRuntime::set_workspace_migration_state`] 的 `'static` 版本
+/// （第八轮复审 P1）：首建的完成者任务在编排 future 取消后仍要完成
+/// marker PATCH + 判据缓存写，门禁（migration_guard）随任务持有至此——
+/// 提前放行会让路由缓存（仍 NotMigrated）与 PVC（已 Migrated）分裂，
+/// 并发写落旧共享卷。
+pub(crate) async fn set_migration_state_detached(
+    client: Client,
+    namespace: String,
+    cache: Arc<RwLock<std::collections::HashMap<String, WorkspaceMigrationCacheValue>>>,
+    pvc_name: String,
+    cache_key: String,
+    state: shared_types::WorkspaceMigrationState,
+) -> ContainerRuntimeResult<()> {
+    use crate::runtime::k8s_pvc::K8sPvcOps;
+    let pvcs: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
+        kube::Api::namespaced(client, &namespace);
+    let existing = pvcs
+        .get_opt(&pvc_name)
+        .await
+        .map_err(|e| ContainerRuntimeError::K8sError(format!("get PVC '{pvc_name}': {e}")))?
+        .ok_or_else(|| {
+            ContainerRuntimeError::ContainerNotFound(format!(
+                "PVC '{pvc_name}' not found; refusing to flip migration state"
+            ))
+        })?;
+    let uid = existing.metadata.uid.clone().ok_or_else(|| {
+        ContainerRuntimeError::Conflict(format!("PVC '{pvc_name}' has no UID"))
+    })?;
+    let rv = existing.metadata.resource_version.clone().ok_or_else(|| {
+        ContainerRuntimeError::Conflict(format!("PVC '{pvc_name}' has no resourceVersion"))
+    })?;
+    let annotations = match state.as_annotation() {
+        Some(value) => serde_json::json!({
+            shared_types::WORKSPACE_MIGRATION_ANNOTATION: value
+        }),
+        None => serde_json::json!({
+            shared_types::WORKSPACE_MIGRATION_ANNOTATION: serde_json::Value::Null
+        }),
+    };
+    let patch = serde_json::json!({
+        "metadata": {"uid": uid, "resourceVersion": rv, "annotations": annotations}
+    });
+    pvcs.patch(&pvc_name, &kube::api::PatchParams::default(), &kube::api::Patch::Merge(&patch))
+        .await
+        .map_err(|e| match &e {
+            kube::Error::Api(response) if response.code == 404 => {
+                ContainerRuntimeError::ContainerNotFound(format!("PVC '{pvc_name}' vanished"))
+            }
+            kube::Error::Api(response) if response.code == 409 => {
+                ContainerRuntimeError::Conflict(format!(
+                    "PVC '{pvc_name}' changed concurrently; retry"
+                ))
+            }
+            other => ContainerRuntimeError::K8sError(format!(
+                "patch PVC '{pvc_name}' migration state: {other}"
+            )),
+        })?;
+    // 即时写缓存：完成者场景下这是"取消后路由与 PVC 收敛"的关键一步。
+    cache.write().await.insert(
+        cache_key,
+        (true, state, std::time::Instant::now()),
+    );
+    Ok(())
+}
