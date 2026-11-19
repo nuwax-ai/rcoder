@@ -541,11 +541,20 @@ pub(crate) async fn reconcile_migration_marker(
     pvc_name: &str,
     cache_key: &str,
     cache: Arc<RwLock<std::collections::HashMap<String, WorkspaceMigrationCacheValue>>>,
+    expected_pvc_uid: Option<&str>,
 ) -> Option<()> {
     use crate::runtime::k8s_pvc::K8sPvcOps;
     let pvcs: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
         kube::Api::namespaced(client, namespace);
     let pvc = pvcs.get(pvc_name).await.ok()?;
+    // 按原 PVC UID 对账（第十一轮 P1）：同名 PVC 删建换代后，新对象的
+    // migrated 状态与本次 PATCH 无关——不能当成功收敛的证据。
+    if let Some(expected) = expected_pvc_uid {
+        let actual = pvc.metadata.uid.as_deref();
+        if actual != Some(expected) {
+            return None;
+        }
+    }
     let migrated = pvc
         .metadata
         .annotations

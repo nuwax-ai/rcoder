@@ -171,18 +171,26 @@ pub(super) fn validate_file_receipt(
     if owner == token.as_bytes() {
         return Ok(true);
     }
-    // 活 marker 与回执不符（含被归档清零的空文件）：查归档旁文件——孤儿
-    // 回收回时原 token 被移入 {lock}.lock.orphaned（append 带 [unix秒] 前
-    // 缀），替代执行者仍持原回执，其完成/清除确认必须仍能匹配到 token
-    // （第十轮 P1：归档只保审计线索会让恢复链对替代执行者失去凭据）。
+    // 活 marker 非空且与回执不符：当前权威属于其他执行者——**不走归档**
+    // （第十一轮 P1：旧回执曾凭归档在同 inode 新执行者写入时误验真）。
+    if !owner.is_empty() {
+        return Ok(false);
+    }
+    // 活 marker 为空（被归档回收清零）：查归档旁文件的最新 token——替代
+    // 执行者仍持原回执在途时，其完成/清除确认必须仍能匹配（第十轮 P1）。
+    // 已释放（done 标记）的 token 不再验真（第十一轮 P1 的另一半反例）。
     let archive = path.with_extension("lock.orphaned");
     if let Ok(content) = std::fs::read_to_string(&archive) {
-        let last = content
+        let latest = content
             .lines()
-            .filter_map(|line| line.split_once(' ').map(|(_, token)| token.trim()))
-            .next_back();
-        if last == Some(token.as_str()) {
-            return Ok(true);
+            .rev()
+            .find_map(|line| line.split_once(' ').map(|(_, rest)| rest.trim()));
+        if let Some(latest) = latest {
+            if let Some(token_part) = latest.strip_prefix("done ") {
+                let _ = token_part; // 最新条目是释放标记：无在途权威
+                return Ok(false);
+            }
+            return Ok(latest == token.as_str());
         }
     }
     // Empty markers are already released, not authority to resume this operation.
@@ -289,6 +297,27 @@ pub(super) fn release_file_receipt(
     marker
         .complete(&file)
         .map_err(|error| Error::Conflict(format!("Operation lease ownership changed: {error}")))?;
+    // 释放成功：向归档旁文件追加 done 标记——validate 的归档 fallback 据此
+    // 停止把该 token 验真（第十一轮 P1：已释放回执不得凭归档复活）。
+    // best-effort（归档不可写只影响 fallback 精度，不影响释放本身）。
+    {
+        let archive = path.with_extension("lock.orphaned");
+        let entry = format!(
+            "[{}] done {}\n",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            token
+        );
+        if let Some(parent) = archive.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&archive) {
+            use std::io::Write as _;
+            let _ = file.write_all(entry.as_bytes());
+        }
+    }
     file.unlock()
         .map_err(|error| Error::DockerError(format!("Unlock completed operation lease: {error}")))
 }

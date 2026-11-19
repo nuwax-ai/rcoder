@@ -970,57 +970,68 @@ async fn marker_completer(
     // 继续（此前派发即继续建 RBD agent，PATCH 失败只记日志）。取消安全保
     // 留：外层 future 取消只是不再等结果——spawn 的任务继续跑完并持门禁
     // 至 PATCH/缓存落定（JoinHandle drop 不取消任务）。
-    let reconcile_client = client.clone();
-    let reconcile_ns = namespace.clone();
-    let reconcile_pvc = pvc_name.clone();
-    let reconcile_key = cache_key.clone();
-    let reconcile_cache = std::sync::Arc::clone(&cache);
+    // 第十一轮 P1 重排：PATCH、错误对账（按原 PVC UID）、缓存更新全部在
+    // 同一个后台任务内——门禁由任务持有至三步落定（此前对账在外层，任务
+    // 结束即释放门禁，对账期间写已开放；外层取消时对账不执行）。取消安全
+    // 保留：JoinHandle drop 不取消任务，外层取消只是不再等结果。
+    let identifier_for_log = identifier.to_string();
     let handle = tokio::spawn(async move {
         let _held = gate;
-        crate::runtime::kubernetes_runtime::workspace_runtime::set_migration_state_detached(
-            client,
-            namespace,
-            cache,
-            pvc_name,
-            cache_key,
-            shared_types::WorkspaceMigrationState::Migrated,
-        )
-        .await
-    });
-    match handle.await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => {
-            // 错误路径对账（第十轮 P1）：PATCH 报错但可能已到达服务端（响应
-            // 丢失/超时）——此刻错误地放行门禁会让写经旧缓存落共享卷，而
-            // PVC 实际已 Migrated。重读实际标记：已迁移则补写缓存按成功
-            // 收敛；确未迁移才是真失败（放行安全——路由与 PVC 一致）。
-            match crate::runtime::kubernetes_runtime::workspace_runtime::reconcile_migration_marker(
-                reconcile_client,
-                &reconcile_ns,
-                &reconcile_pvc,
-                &reconcile_key,
-                reconcile_cache,
+        // PATCH 前记 UID：错误对账按同一对象核对（同名换代不作数）。
+        let expected_uid = {
+            use crate::runtime::k8s_pvc::K8sPvcOps;
+            let pvcs: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
+                kube::Api::namespaced(client.clone(), &namespace);
+            pvcs.get(&pvc_name).await.ok().and_then(|pvc| pvc.metadata.uid)
+        };
+        let outcome =
+            crate::runtime::kubernetes_runtime::workspace_runtime::set_migration_state_detached(
+                client.clone(),
+                namespace.clone(),
+                std::sync::Arc::clone(&cache),
+                pvc_name.clone(),
+                cache_key.clone(),
+                shared_types::WorkspaceMigrationState::Migrated,
             )
-            .await
-            {
-                Some(()) => {
-                    tracing::warn!(
-                        user_id = identifier,
-                        error = %error,
-                        "[K8S] fresh-init marker PATCH errored but server applied it; cache reconciled, treating as success"
-                    );
-                    Ok(())
-                }
-                None => {
-                    tracing::warn!(
-                        user_id = identifier,
-                        error = %error,
-                        "[K8S] fresh-init marker PATCH failed (server did not apply); gate released on drop"
-                    );
-                    Err(error)
+            .await;
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // 错误路径对账（第十轮 P1）：PATCH 报错但可能已到达服务端。
+                // 同 UID 且已 migrated → 缓存补写按成功收敛；否则真失败
+                // （路由与 PVC 一致，gate 随任务结束释放安全）。
+                match crate::runtime::kubernetes_runtime::workspace_runtime::reconcile_migration_marker(
+                    client,
+                    &namespace,
+                    &pvc_name,
+                    &cache_key,
+                    cache,
+                    expected_uid.as_deref(),
+                )
+                .await
+                {
+                    Some(()) => {
+                        tracing::warn!(
+                            user_id = %identifier_for_log,
+                            error = %error,
+                            "[K8S] fresh-init marker PATCH errored but server applied it; cache reconciled, treating as success"
+                        );
+                        Ok(())
+                    }
+                    None => {
+                        tracing::warn!(
+                            user_id = %identifier_for_log,
+                            error = %error,
+                            "[K8S] fresh-init marker PATCH failed (server did not apply); gate released on task end"
+                        );
+                        Err(error)
+                    }
                 }
             }
         }
+    });
+    match handle.await {
+        Ok(result) => result,
         Err(error) => Err(ContainerRuntimeError::ConnectionError(format!(
             "marker completer task failed: {error}"
         ))),

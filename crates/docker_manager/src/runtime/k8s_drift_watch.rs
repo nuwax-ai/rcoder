@@ -291,7 +291,8 @@ async fn recover_drifted_app(
         .and_then(|annotations| annotations.get("rcoder.io/application-id"))
         .is_some();
     if !managed || !lifecycle_adopted {
-        anyhow::bail!("deployment {name} is not rcoder-managed lifecycle state");
+        tracing::info!(app = %app_id, "[IMAGE_DRIFT_WATCH] deployment not rcoder-managed; skipping");
+        return Ok(RecoveryOutcome::Skipped);
     }
     let template_image = deployment
         .spec
@@ -304,7 +305,8 @@ async fn recover_drifted_app(
         })
         .and_then(|container| container.image.clone());
     let Some(template_image) = template_image else {
-        anyhow::bail!("deployment {name} has no app container image");
+        tracing::info!(app = %app_id, "[IMAGE_DRIFT_WATCH] deployment has no app container image; skipping");
+        return Ok(RecoveryOutcome::Skipped);
     };
     if template_image == platform_image {
         tracing::info!(
@@ -557,7 +559,9 @@ mod tests {
                         assert!(writes.is_empty(), "{scenario} must not patch");
                     }
                     "unmanaged" => {
-                        assert!(result.is_err(), "unmanaged workload rejected");
+                        // 第十一轮 P2：前置不满足是 Skipped（不消耗冷却），
+                        // 不再是 Err。
+                        result.expect("unmanaged skip is Ok(Skipped)");
                         assert!(writes.is_empty());
                     }
                     _ => unreachable!(),
