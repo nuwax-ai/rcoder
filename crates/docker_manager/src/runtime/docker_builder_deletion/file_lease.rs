@@ -34,8 +34,27 @@ pub(super) fn prepare_builder_file(
         .map_err(|e| Error::DockerError(format!("builder operation lock file: {e}")))?;
     file.try_lock()
         .map_err(|e| Error::Conflict(format!("builder operation lease unavailable: {e}")))?;
-    shared_types::AppFileMutationMarker::check_clean(&file)
-        .map_err(|e| Error::Conflict(format!("builder operation requires recovery: {e}")))?;
+    // The exclusive flock is held here: a nonempty marker can only be a former
+    // holder's remnant (kernel-released flock proves the holder stopped), so
+    // reclaim it instead of fencing the application forever. Record-backed
+    // fencing (compute control records, operation leases) is unaffected — it
+    // reads durable storage, not this physical remnant.
+    match shared_types::AppFileMutationMarker::reclaim_orphaned(&file) {
+        Ok(None) => {}
+        Ok(Some(orphan_operation_id)) => {
+            tracing::warn!(
+                lock_path = %root.join(name).display(),
+                orphan_operation_id,
+                "Reclaimed orphaned builder operation marker under held flock; previous holder is proven stopped"
+            );
+        }
+        Err(error) => {
+            return Err(Error::Conflict(format!(
+                "builder operation lease marker at {}: {error}",
+                root.join(name).display()
+            )));
+        }
+    }
     Ok(BuilderFileLease {
         file,
         path: root.join(name),

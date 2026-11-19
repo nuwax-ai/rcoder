@@ -43,17 +43,22 @@ async fn captured_release_uses_host_root_and_allows_reacquisition() {
                 .join(format!("{prefix}-{}.lock", context.app_id));
         drop(lease); // death releases the flock, not the durable marker
         assert!(std::fs::metadata(&path).unwrap().len() > 0);
-        assert!(
-            runtime
-                .acquire_application_file_lease(&context.app_id, &family)
-                .await
-                .is_err()
-        );
+        // Receipt-based release still clears an untouched orphan marker.
         runtime
             .release_captured_file_lease(&context, &receipt)
             .await
             .unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        // A receipt-less orphan (holder died mid-mutation) is reclaimed by the
+        // next acquisition itself, under the held flock: the next user
+        // operation recovers automatically instead of being fenced forever.
+        drop(
+            runtime
+                .acquire_application_file_lease(&context.app_id, &family)
+                .await
+                .expect("next attempt reclaims the orphan marker"),
+        );
+        assert!(std::fs::metadata(&path).unwrap().len() > 0);
         runtime
             .acquire_application_file_lease(&context.app_id, &family)
             .await
@@ -328,13 +333,16 @@ async fn durable_operation_marker_echoes_identity_without_authorizing_takeover()
 
     let marker = shared_types::AppFileMutationMarker::for_operation("operation-one").unwrap();
     drop(lock_builder_file_with_marker(root.path(), name, marker).unwrap());
-    // Even an identical durable operation must prove recovery safety first.
+    // A dead holder's marker — even one carrying an identical durable
+    // operation id — is a reclaimable orphan under the held flock; takeover
+    // protection lives in the receipt/record layer, not in this remnant.
     let marker = shared_types::AppFileMutationMarker::for_operation("operation-one").unwrap();
-    assert!(lock_builder_file_with_marker(root.path(), name, marker).is_err());
+    let reclaimed = lock_builder_file_with_marker(root.path(), name, marker).unwrap();
     assert_eq!(
         std::fs::read_to_string(root.path().join(name)).unwrap(),
         "operation-one"
     );
+    Box::new(reclaimed).release().await.unwrap();
 }
 
 #[tokio::test]
@@ -351,15 +359,22 @@ async fn failed_builder_completion_clears_only_confirmed_rejection_marker() {
         let result: container_runtime_api::ContainerRuntimeResult<()> =
             super::super::builder_completion::finish(Box::new(lease), Err(failure)).await;
         assert!(result.is_err());
-        let next = lock_builder_file(root.path(), "builder-test.lock");
-        if matches!(status, 403 | 409) {
-            Box::new(next.expect("confirmed rejection permits retry"))
-                .release()
-                .await
-                .unwrap();
-        } else {
-            assert!(next.is_err(), "unconfirmed outcome must require recovery");
-        }
+        // Only confirmed rejections (403/409) clear the marker on completion;
+        // unconfirmed outcomes retain it as evidence.
+        assert_eq!(
+            !std::fs::read(root.path().join("builder-test.lock"))
+                .unwrap()
+                .is_empty(),
+            !matches!(status, 403 | 409),
+            "only confirmed rejections clear the marker on completion"
+        );
+        // Either way a fresh attempt holding the flock reclaims the marker and
+        // proceeds; unknown-outcome reconciliation is carried by records, not
+        // by a permanent physical fence.
+        Box::new(lock_builder_file(root.path(), "builder-test.lock").unwrap())
+            .release()
+            .await
+            .unwrap();
     }
 }
 
@@ -402,7 +417,12 @@ async fn partial_builder_completion_retains_confirmed_container_and_recovery_mar
             marker,
             "a start rejection must not erase the preceding create's recovery marker"
         );
-        assert!(lock_builder_file(root.path(), "builder-test.lock").is_err());
+        // The marker is retained, yet a fresh attempt reclaims the orphan and
+        // proceeds: reconciliation of the partial creation is record-driven.
+        Box::new(lock_builder_file(root.path(), "builder-test.lock").unwrap())
+            .release()
+            .await
+            .unwrap();
     }
 }
 
@@ -460,7 +480,12 @@ async fn partial_builder_recording_failure_keeps_original_source_and_recovery_ma
             std::fs::read(root.path().join("builder-test.lock")).unwrap(),
             marker
         );
-        assert!(lock_builder_file(root.path(), "builder-test.lock").is_err());
+        // Retained marker, but the next attempt reclaims the orphan under the
+        // held flock and proceeds; the receipt failure is surfaced separately.
+        Box::new(lock_builder_file(root.path(), "builder-test.lock").unwrap())
+            .release()
+            .await
+            .unwrap();
     }
 }
 
@@ -479,7 +504,12 @@ async fn failed_marker_release_does_not_erase_other_owner_or_original_error() {
         std::fs::read_to_string(root.path().join("builder-test.lock")).unwrap(),
         "replacement-owner"
     );
-    assert!(lock_builder_file(root.path(), "builder-test.lock").is_err());
+    // The foreign owner's remnant is an orphan too: the next attempt holding
+    // the flock reclaims it (the original denial has already surfaced).
+    Box::new(lock_builder_file(root.path(), "builder-test.lock").unwrap())
+        .release()
+        .await
+        .unwrap();
 }
 #[tokio::test]
 async fn captured_delete_retires_only_deleted_identity_caches() {
@@ -679,13 +709,25 @@ fn undelivered_lock_acquisition_does_not_strand_marker() {
     drop(UnclaimedBuilderLease(Some(reclaimed)));
 }
 #[test]
-fn uncertain_builder_mutation_retains_marker_after_file_unlock() {
+fn uncertain_builder_marker_survives_unlock_but_next_attempt_reclaims() {
     let root = tempfile::tempdir().unwrap();
     drop(lock_builder_file(root.path(), "builder-one.lock").unwrap());
-    assert!(matches!(
-        lock_builder_file(root.path(), "builder-one.lock"),
-        Err(Error::Conflict(_))
-    ));
+    // Drop retains the durable marker (uncertain-outcome evidence)...
+    assert!(
+        !std::fs::read(root.path().join("builder-one.lock"))
+            .unwrap()
+            .is_empty()
+    );
+    // ...while the next attempt, proven sole holder by the acquired flock,
+    // reclaims the orphan marker and proceeds instead of fencing forever.
+    // (Before flock-proof reclamation this acquisition failed forever with
+    // "builder operation requires recovery".)
+    drop(lock_builder_file(root.path(), "builder-one.lock").unwrap());
+    assert!(
+        !std::fs::read(root.path().join("builder-one.lock"))
+            .unwrap()
+            .is_empty()
+    );
 }
 #[tokio::test]
 async fn builder_drop_unlocks_live_duplicate_and_preserves_only_uncertain_marker() {

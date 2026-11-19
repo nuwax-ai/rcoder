@@ -183,10 +183,9 @@ mod tests {
         use shared_types::AppOperationLease as _;
         let receipt = original.receipt().unwrap();
         drop(original); // Process exit leaves a dirty marker, not a held flock.
-        assert!(
-            lock_builder_file(directory.path(), name).is_err(),
-            "slot release alone does not recover Docker creation"
-        );
+        // The exact-receipt handoff path (record-driven recovery) still
+        // retains the old ordinary marker; fresh acquires meanwhile reclaim
+        // orphan markers themselves under the held flock (see tests.rs).
         let ComputeHandoff::Acquired { guard, .. } = retain(
             directory.path(),
             name,

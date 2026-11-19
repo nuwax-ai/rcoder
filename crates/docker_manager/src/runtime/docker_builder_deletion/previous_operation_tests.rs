@@ -99,12 +99,6 @@ async fn previous_ordinary_marker_resumes_original_compute_through_runtime_trait
             }
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), owner.operation_id);
-        assert!(
-            runtime
-                .prepare_compute_operation(&current, scope)
-                .await
-                .is_err()
-        );
         for mismatch in [
             "app",
             "lifecycle",
@@ -176,6 +170,25 @@ async fn previous_ordinary_marker_resumes_original_compute_through_runtime_trait
         assert_eq!(std::fs::read_to_string(&path).unwrap(), current.executor_id);
         prepared.release().await.unwrap();
         assert!(std::fs::read(&path).unwrap().is_empty());
+        // 孤儿 marker 不再永久拦截新 compute 尝试(修复前此处
+        // prepare_compute_operation 返回 Conflict "requires recovery"):
+        // 持 flock 的获取点受控回收死者残留并放行,逻辑围栏仍由记录层承担。
+        drop(
+            runtime
+                .acquire_application_file_lease_with_context(&owner.app_id, &family, Some(&owner))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), owner.operation_id);
+        let reclaimed = runtime
+            .prepare_compute_operation(&current, scope)
+            .await
+            .expect("fresh compute attempt reclaims the orphan marker");
+        assert!(
+            std::fs::read(&path).unwrap().is_empty(),
+            "orphan marker reclaimed at prepare"
+        );
+        drop(reclaimed);
     }
 }
 
