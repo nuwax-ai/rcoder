@@ -77,7 +77,30 @@ def artifact_matches(config, reference):
     返回 (ok, error_class)：error_class 仅在 ok=False 时有意义——
     artifact-missing 触发正常重建；registry-error 是权限/网络故障，
     调用方必须明确报告，不得静默当 miss 或成功。
+
+    HTTP 私有 registry（REMOTE_K8S_REGISTRY_HTTP=true）下 buildx
+    imagetools 对裸 IP 仓库坚持 HTTPS，连接层失败会被误归 registry-error
+    （且缓存命中路径仅此一处调用，HTTP registry 首次缓存命中必然误报）；
+    改经 curl 直查 manifest 端点：200=存在；404=缺失；其余=registry-error。
     """
+    registry = config.get('REGISTRY', '')
+    if str(config.get('REGISTRY_HTTP', '')).lower() in ('1', 'true', 'yes') and registry:
+        repository, reference_digest = reference.split('@')
+        repository = repository.split('/', 1)[1]
+        status = config.ssh(
+            ['curl', '-s', '-o', '/dev/null', '-w', '%{http_code}',
+             '-H', 'Accept: application/vnd.docker.distribution.manifest.v2+json, '
+                   'application/vnd.docker.distribution.manifest.list.v2+json, '
+                   'application/vnd.oci.image.manifest.v1+json, '
+                   'application/vnd.oci.image.index.v1+json',
+             'http://' + registry.split('/')[0] + '/v2/' + repository
+             + '/manifests/' + reference_digest],
+            timeout=180).strip()
+        if status == '200':
+            return True, None
+        if status == '404':
+            return False, 'artifact-missing'
+        return False, 'registry-error'
     try:
         info = config.ssh(['docker', 'buildx', 'imagetools', 'inspect', reference], timeout=180)
     except RuntimeError as error:
