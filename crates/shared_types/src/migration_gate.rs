@@ -229,3 +229,50 @@ mod tests {
         assert_eq!(remaining, 0);
     }
 }
+
+/// RAII 编排门禁（第七轮复审 P1）：`begin_guarded` 置位并返回本 guard，
+/// Drop 时自动 `end`——编排 future 在任意 `await` 点被取消（drop）时也会
+/// 释放，杜绝手写 `end` 遗漏导致的该用户写准入永久冻结。
+pub struct MigrationGuard {
+    user_id: String,
+}
+
+impl Drop for MigrationGuard {
+    fn drop(&mut self) {
+        end(&self.user_id);
+    }
+}
+
+/// 置位并返回 RAII guard（编排路径持有到编排完成/取消）。
+pub fn begin_guarded(user_id: &str) -> MigrationGuard {
+    begin(user_id);
+    MigrationGuard {
+        user_id: user_id.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod cancel_safety_tests {
+    use super::*;
+
+    /// 第七轮 P1 反例：编排 future 在 begin 后被取消（guard 随 future drop）
+    /// ——写准入必须恢复，不得永久 Gated。
+    #[test]
+    fn cancelled_choreography_releases_gate() {
+        let user = "cancel-safety-user";
+        {
+            let _guard = begin_guarded(user);
+            assert!(is_migrating(user));
+            // 模拟编排 future 在 await 点被取消：guard 随作用域 drop。
+        }
+        assert!(
+            !is_migrating(user),
+            "guard drop 后必须解除门禁——否则该用户写永久 503"
+        );
+        // 取消后写准入恢复
+        assert!(matches!(
+            admit_write(user),
+            WriteAdmission::Admitted(_)
+        ));
+    }
+}

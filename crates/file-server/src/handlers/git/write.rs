@@ -43,12 +43,12 @@ fn with_repo<T>(path: &Path, f: impl FnOnce(&Repository) -> AppResult<T>) -> App
     responses((status = 200, description = "初始化结果（幂等）", body = GitInitResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn init(
     State(state): State<AppState>,
-    admission: Extension<Option<WriteAdmissionGuard>>,
+    admission: Option<Extension<WriteAdmissionGuard>>,
     Json(body): Json<GitWriteBody>,
 ) -> Result<Json<GitInitResult>, AppError> {
     let (path, log_id) = resolve_body(&state, &body).await?;
     // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
-    let _admission = admission.0.as_ref().cloned();
+    let _admission = admission.as_ref().map(|extension| extension.0.clone());
     let already = tokio::task::spawn_blocking(move || {
         let _hold = _admission;
         // init 幂等创建仓库 (含不存在的目录), 与其他 git 写操作共用工作区锁
@@ -77,13 +77,13 @@ pub(crate) async fn init(
     responses((status = 200, description = "暂存结果", body = GitAddResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn add(
     State(state): State<AppState>,
-    admission: Extension<Option<WriteAdmissionGuard>>,
+    admission: Option<Extension<WriteAdmissionGuard>>,
     Json(body): Json<FilesBody>,
 ) -> Result<Json<GitAddResult>, AppError> {
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let files = body.files.unwrap_or_default();
         // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
-    let _admission = admission.0.as_ref().cloned();
+    let _admission = admission.as_ref().map(|extension| extension.0.clone());
     tokio::task::spawn_blocking(move || {
         let _hold = _admission;
         with_repo(&path, |repo| git::stage_files(repo, &files))
@@ -104,7 +104,7 @@ pub(crate) async fn add(
     responses((status = 200, description = "提交结果（含 nothingToCommit 分支）", body = GitCommitResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn commit(
     State(state): State<AppState>,
-    admission: Extension<Option<WriteAdmissionGuard>>,
+    admission: Option<Extension<WriteAdmissionGuard>>,
     Json(body): Json<CommitBody>,
 ) -> Result<Json<GitCommitResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
@@ -118,7 +118,7 @@ pub(crate) async fn commit(
         .author_email
         .unwrap_or_else(|| state.config.git_default_author_email.clone());
     // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
-    let _admission = admission.0.as_ref().cloned();
+    let _admission = admission.as_ref().map(|extension| extension.0.clone());
     let result = tokio::task::spawn_blocking(move || {
         let _hold = _admission;
         with_repo(&path, |repo| {
@@ -153,7 +153,7 @@ pub(crate) async fn commit(
     responses((status = 200, description = "取消暂存结果（files 为 all 或路径数组）", body = GitUnstageResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn unstage(
     State(state): State<AppState>,
-    admission: Extension<Option<WriteAdmissionGuard>>,
+    admission: Option<Extension<WriteAdmissionGuard>>,
     Json(body): Json<FilesBody>,
 ) -> Result<Json<GitUnstageResult>, AppError> {
     let (path, log_id) = resolve_body(&state, &body.base).await?;
@@ -161,7 +161,7 @@ pub(crate) async fn unstage(
     let all = files.is_empty();
     let files_echo = files.clone();
         // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
-    let _admission = admission.0.as_ref().cloned();
+    let _admission = admission.as_ref().map(|extension| extension.0.clone());
     tokio::task::spawn_blocking(move || {
         let _hold = _admission;
         with_repo(&path, |repo| git::unstage_files(repo, &files))
@@ -194,13 +194,13 @@ pub(crate) async fn unstage(
     responses((status = 200, description = "丢弃结果分桶", body = DiscardResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn discard(
     State(state): State<AppState>,
-    admission: Extension<Option<WriteAdmissionGuard>>,
+    admission: Option<Extension<WriteAdmissionGuard>>,
     Json(body): Json<FilesBody>,
 ) -> Result<Json<DiscardResult>, AppError> {
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let files = body.files.unwrap_or_default();
     // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
-    let _admission = admission.0.as_ref().cloned();
+    let _admission = admission.as_ref().map(|extension| extension.0.clone());
     let buckets = tokio::task::spawn_blocking(move || {
         let _hold = _admission;
         with_repo(&path, |repo| git::discard_files(repo, &files))
@@ -230,7 +230,7 @@ pub(crate) async fn discard(
 #[utoipa::path(post, path = "/diff", request_body = DiffBody, responses((status = 200, description = "unified diff 与汇总", body = GitDiffResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn diff(
     State(state): State<AppState>,
-    admission: Extension<Option<WriteAdmissionGuard>>,
+    admission: Option<Extension<WriteAdmissionGuard>>,
     Json(body): Json<DiffBody>,
 ) -> Result<Json<GitDiffResult>, AppError> {
     let (path, log_id) = resolve_body(&state, &body.base).await?;
@@ -245,7 +245,7 @@ pub(crate) async fn diff(
         max_output_bytes: state.config.git_diff_max_output_bytes,
     };
     // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
-    let _admission = admission.0.as_ref().cloned();
+    let _admission = admission.as_ref().map(|extension| extension.0.clone());
     let result = tokio::task::spawn_blocking(move || {
         let _hold = _admission;
         with_repo(&path, |repo| git::compute_diff(repo, &params))
@@ -281,7 +281,7 @@ pub(crate) async fn diff(
 #[utoipa::path(post, path = "/reset", request_body = ResetBody, responses((status = 200, description = "重置结果（含 previousHead）", body = GitResetResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn reset(
     State(state): State<AppState>,
-    admission: Extension<Option<WriteAdmissionGuard>>,
+    admission: Option<Extension<WriteAdmissionGuard>>,
     Json(body): Json<ResetBody>,
 ) -> Result<Json<GitResetResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
@@ -292,7 +292,7 @@ pub(crate) async fn reset(
     let author_name = state.config.git_default_author_name.clone();
     let author_email = state.config.git_default_author_email.clone();
     // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
-    let _admission = admission.0.as_ref().cloned();
+    let _admission = admission.as_ref().map(|extension| extension.0.clone());
     let outcome = tokio::task::spawn_blocking(move || {
         let _hold = _admission;
         with_repo(&path, |repo| {
@@ -317,14 +317,14 @@ pub(crate) async fn reset(
 #[utoipa::path(post, path = "/checkout", request_body = TargetBody, responses((status = 200, description = "检出结果", body = GitCheckoutResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn checkout(
     State(state): State<AppState>,
-    admission: Extension<Option<WriteAdmissionGuard>>,
+    admission: Option<Extension<WriteAdmissionGuard>>,
     Json(body): Json<TargetBody>,
 ) -> Result<Json<GitCheckoutResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let target = body.target.clone();
         // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
-    let _admission = admission.0.as_ref().cloned();
+    let _admission = admission.as_ref().map(|extension| extension.0.clone());
     tokio::task::spawn_blocking(move || {
         let _hold = _admission;
         with_repo(&path, |repo| git::checkout_tree(repo, &target))
@@ -345,7 +345,7 @@ pub(crate) async fn checkout(
 #[utoipa::path(post, path = "/revert", request_body = RevertBody, responses((status = 200, description = "回退结果（含 nothingToCommit 分支）", body = GitRevertResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn revert(
     State(state): State<AppState>,
-    admission: Extension<Option<WriteAdmissionGuard>>,
+    admission: Option<Extension<WriteAdmissionGuard>>,
     Json(body): Json<RevertBody>,
 ) -> Result<Json<GitRevertResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
@@ -359,7 +359,7 @@ pub(crate) async fn revert(
         .author_email
         .unwrap_or_else(|| state.config.git_default_author_email.clone());
     // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
-    let _admission = admission.0.as_ref().cloned();
+    let _admission = admission.as_ref().map(|extension| extension.0.clone());
     let outcome = tokio::task::spawn_blocking(move || {
         let _hold = _admission;
         with_repo(&path, |repo| {
@@ -430,5 +430,60 @@ mod tests {
             serde_json::from_str(r#"{"workspaceType":"project","message":"m"}"#).unwrap();
         assert!(body.base.project_id.is_none());
         assert!(body.base.tenant_id.is_none());
+    }
+}
+
+#[cfg(test)]
+mod admission_extractor_tests {
+    //! 路由级提取测试（第七轮 P1 根因层）：此前的 `Extension<Option<T>>`
+    //! 签名在 axum 路由提取时永远 500（extensions 里没有 Option<T> 类型），
+    //! 且测试直接调 handler 绕过了提取层没测出来。本测试走完整路由。
+
+    #[tokio::test]
+    async fn admission_extractor_tolerates_missing_and_present_extension() {
+        use axum::{routing::post, Router};
+        use tower::ServiceExt;
+
+        async fn probe(
+            admission: Option<axum::Extension<shared_types::migration_gate::WriteAdmissionGuard>>,
+        ) -> &'static str {
+            let _held = admission.map(|extension| extension.0);
+            "ok"
+        }
+
+        let app = Router::new().route("/probe", post(probe));
+        // 无扩展（RBD 关闭/非迁移路径）→ 必须可提取
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/probe")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK, "无扩展时不得 500");
+
+        // 有扩展（intercept 注入 guard）→ 必须可提取且 handler 可持有
+        let guard = match shared_types::migration_gate::admit_write("router-extract-probe") {
+            shared_types::migration_gate::WriteAdmission::Admitted(guard) => guard,
+            shared_types::migration_gate::WriteAdmission::Gated => {
+                panic!("probe user must not be gated")
+            }
+        };
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/probe")
+                    .extension(guard)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK, "有扩展时不得 500");
     }
 }

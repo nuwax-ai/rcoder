@@ -21,7 +21,7 @@ use crate::service::git;
     responses((status = 200, description = "分支操作结果", body = GitBranchOpResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn branch_create(
     State(state): State<AppState>,
-    admission: Extension<Option<WriteAdmissionGuard>>,
+    admission: Option<Extension<WriteAdmissionGuard>>,
     Json(body): Json<BranchCreateBody>,
 ) -> Result<Json<GitBranchOpResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
@@ -31,7 +31,7 @@ pub(crate) async fn branch_create(
     let author_name = state.config.git_default_author_name.clone();
     let author_email = state.config.git_default_author_email.clone();
     // 迁移写准入副本: 闭包持有至同步写副作用结束(复审第六轮补齐 refs 写路径)。
-    let _admission = admission.0.as_ref().cloned();
+    let _admission = admission.as_ref().map(|extension| extension.0.clone());
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         let _hold = _admission;
         // 分支创建+切换写 HEAD/index/工作树, 必须与 commit 等写操作共用工作区锁
@@ -65,7 +65,7 @@ pub(crate) async fn branch_create(
     responses((status = 200, description = "分支操作结果", body = GitBranchOpResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn branch_delete(
     State(state): State<AppState>,
-    admission: Extension<Option<WriteAdmissionGuard>>,
+    admission: Option<Extension<WriteAdmissionGuard>>,
     Json(body): Json<BranchNameBody>,
 ) -> Result<Json<GitBranchOpResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
@@ -73,7 +73,7 @@ pub(crate) async fn branch_delete(
     let name = body.branch_name.clone();
     let force = body.force.unwrap_or(false);
     // 迁移写准入副本: 闭包持有至同步写副作用结束(复审第六轮补齐 refs 写路径)。
-    let _admission = admission.0.as_ref().cloned();
+    let _admission = admission.as_ref().map(|extension| extension.0.clone());
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         let _hold = _admission;
         let _guard = git::workspace_lock::acquire(&path)?;
@@ -100,7 +100,7 @@ pub(crate) async fn branch_delete(
     responses((status = 200, description = "标签操作结果", body = GitTagOpResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn tag_create(
     State(state): State<AppState>,
-    admission: Extension<Option<WriteAdmissionGuard>>,
+    admission: Option<Extension<WriteAdmissionGuard>>,
     Json(body): Json<TagCreateBody>,
 ) -> Result<Json<GitTagOpResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
@@ -110,7 +110,7 @@ pub(crate) async fn tag_create(
     let an = state.config.git_default_author_name.clone();
     let ae = state.config.git_default_author_email.clone();
     // 迁移写准入副本: 闭包持有至同步写副作用结束(复审第六轮补齐 refs 写路径)。
-    let _admission = admission.0.as_ref().cloned();
+    let _admission = admission.as_ref().map(|extension| extension.0.clone());
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         let _hold = _admission;
         let _guard = git::workspace_lock::acquire(&path)?;
@@ -135,14 +135,14 @@ pub(crate) async fn tag_create(
     responses((status = 200, description = "标签操作结果", body = GitTagOpResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn tag_delete(
     State(state): State<AppState>,
-    admission: Extension<Option<WriteAdmissionGuard>>,
+    admission: Option<Extension<WriteAdmissionGuard>>,
     Json(body): Json<TagNameBody>,
 ) -> Result<Json<GitTagOpResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let name = body.tag_name.clone();
     // 迁移写准入副本: 闭包持有至同步写副作用结束(复审第六轮补齐 refs 写路径)。
-    let _admission = admission.0.as_ref().cloned();
+    let _admission = admission.as_ref().map(|extension| extension.0.clone());
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         let _hold = _admission;
         let _guard = git::workspace_lock::acquire(&path)?;
@@ -168,14 +168,14 @@ pub(crate) async fn tag_delete(
     responses((status = 200, description = "分支操作结果", body = GitBranchOpResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn branch_switch(
     State(state): State<AppState>,
-    admission: Extension<Option<WriteAdmissionGuard>>,
+    admission: Option<Extension<WriteAdmissionGuard>>,
     Json(body): Json<BranchNameBody>,
 ) -> Result<Json<GitBranchOpResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let name = body.branch_name.clone();
     // 迁移写准入副本: 闭包持有至同步写副作用结束(复审第六轮补齐 refs 写路径)。
-    let _admission = admission.0.as_ref().cloned();
+    let _admission = admission.as_ref().map(|extension| extension.0.clone());
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
         let _hold = _admission;
         // 切分支写 HEAD/index/工作树, 必须与 commit 等写操作共用工作区锁

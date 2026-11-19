@@ -141,14 +141,17 @@ impl KubernetesRuntime {
                     // 重新探测共享目录。与 cutover 的编排锁互斥保证 begin/end
                     // 不交叉。排空超时（10s 内在途写未归零）上抛可重试错误，
                     // 本次保持现状（不切卷）。
-                    shared_types::migration_gate::begin(identifier);
+                    // RAII 门禁（第七轮复审 P1）：编排 future 在任意 await 点被取消
+                    // 也会经 Drop 释放——手写 end 无法覆盖取消路径（曾致写准入
+                    // 永久冻结的变体）。已派发但结果未知的 K8s 写由 ensure 幂等
+                    // + 四象限重探测天然对账。
+                    let _migration_gate = shared_types::migration_gate::begin_guarded(identifier);
                     let drain_left = shared_types::migration_gate::drain_user_writes(
                         identifier,
                         std::time::Duration::from_secs(10),
                     )
                     .await;
                     if drain_left > 0 {
-                        shared_types::migration_gate::end(identifier);
                         return Err(ContainerRuntimeError::ConnectionError(format!(
                             "in-flight writes for '{identifier}' did not drain within 10s \
                              (left={drain_left}); refusing fresh-init decision, retry later"
@@ -177,7 +180,6 @@ impl KubernetesRuntime {
                             )
                             .await
                         {
-                            shared_types::migration_gate::end(identifier);
                             return Err(error);
                         }
                         if let Err(error) = self
@@ -188,7 +190,6 @@ impl KubernetesRuntime {
                             )
                             .await
                         {
-                            shared_types::migration_gate::end(identifier);
                             return Err(error);
                         }
                             info!(
@@ -225,7 +226,6 @@ impl KubernetesRuntime {
                         // 拒绝初始化——误判新用户会让存量用户数据"消失"(空
                         // RBD 卷+存在即转发)。上抛可重试错误, 不静默回落。
                         (false, _, SharedDirProbe::ProbeFailed) => {
-                            shared_types::migration_gate::end(identifier);
                             return Err(ContainerRuntimeError::ConnectionError(format!(
                                 "cannot probe shared workspace for '{identifier}' \
                                  (COMPUTER_WORKSPACE_DIR unset, IO error or shared root missing); \
@@ -233,9 +233,9 @@ impl KubernetesRuntime {
                             )));
                         }
                     };
-                    // 决策完成：恢复该用户写准入。两条成功路径（新建/续接）的
-                    // 建卷+翻标记都发生在门禁内——与文件写路由串行化。
-                    shared_types::migration_gate::end(identifier);
+                    // 决策完成（_migration_guard 随作用域 drop 自动恢复写准入）。
+                    // 两条成功路径（新建/续接）的建卷+翻标记都发生在门禁内——
+                    // 与文件写路由串行化。
                     fresh_init_decision
                 }
             }

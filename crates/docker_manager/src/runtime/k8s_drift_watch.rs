@@ -23,12 +23,27 @@ use super::k8s_deployment::{
 };
 
 /// 拉取失败类 waiting reason（kubelet 报告的镜像不可得形态）。
+/// 只关注**业务容器**：sidecar（log-shipper/log-collector）拉取失败不应
+/// 触发对齐——业务容器健康 Ready 时模板没漂移（第七轮复审 P1：曾对
+/// Ready 的 Deployment 发出 PATCH）。名称前缀判定与 e2b 数据面的
+/// SIDECAR_PREFIXES 同一约定。
+const SIDECAR_NAME_PREFIXES: &[&str] = &["log-shipper", "log-collector"];
+
+fn is_sidecar_container(name: &str) -> bool {
+    SIDECAR_NAME_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
 fn is_image_pull_failure(pod: &Pod) -> bool {
     pod.status
         .as_ref()
         .and_then(|status| status.container_statuses.as_ref())
         .is_some_and(|statuses| {
             statuses.iter().any(|status| {
+                if is_sidecar_container(&status.name) {
+                    return false;
+                }
                 status
                     .state
                     .as_ref()
@@ -172,6 +187,23 @@ async fn recover_drifted_app(
         .get(&name)
         .await
         .map_err(|error| anyhow::anyhow!("read drifted deployment {name}: {error}"))?;
+    // 写前复查（第七轮复审 P1）：Ready 副本已达期望说明业务容器健康——
+    // 拉取失败只属于 sidecar 或瞬时抖动，不对齐。
+    let ready_replicas = deployment
+        .status
+        .as_ref()
+        .and_then(|status| status.ready_replicas)
+        .unwrap_or(0);
+    let desired_replicas = deployment.spec.as_ref().and_then(|spec| spec.replicas).unwrap_or(1);
+    if ready_replicas >= desired_replicas.max(1) {
+        tracing::info!(
+            app = %app_id,
+            ready = ready_replicas,
+            desired = desired_replicas,
+            "[IMAGE_DRIFT_WATCH] deployment already ready; skipping alignment"
+        );
+        return Ok(());
+    }
     let managed = deployment
         .metadata
         .labels
