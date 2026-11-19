@@ -138,7 +138,9 @@ def install(args, version, commit):
         archive = args.archive
         if args.download:
             archive = Path(temporary) / asset_name
-            assets.download([asset_url, 'https://ghproxy.net/' + asset_url], archive)
+            # ghproxy.net is unreachable from CN networks; gh-proxy.org is the
+            # same class of GitHub accelerator already used by ttyd assets.
+            assets.download([asset_url, 'https://gh-proxy.org/' + asset_url], archive)
         if expected_sha is not None and digest(archive) != expected_sha:
             raise ValueError('trusted official asset SHA256 mismatch')
         actual_sha = digest(archive)

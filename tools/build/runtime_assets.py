@@ -75,7 +75,7 @@ def specs(component, version, architectures):
         elif component == 'pingap':
             name = 'pingap-linux-gnu-' + ('x86' if arch == 'amd64' else 'aarch64') + '-full'
             url = f'https://github.com/vicanso/pingap/releases/download/v{version}/{name}.tar.gz'
-            yield arch, f'cache/{name.replace("pingap-", "pingap-v" + version + "-", 1)}.tar.gz', name, [url, 'https://ghproxy.net/' + url]
+            yield arch, f'cache/{name.replace("pingap-", "pingap-v" + version + "-", 1)}.tar.gz', name, [url, 'https://gh-proxy.org/' + url]
         else:
             raise ValueError(f'unsupported component: {component}')
 
