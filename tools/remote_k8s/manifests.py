@@ -69,7 +69,21 @@ def render(c, images, password, registry_auth=None, pingap_identity=None):
     obj('StatefulSet', 'postgres', {'serviceName': 'postgres', 'replicas': 1,
         'selector': {'matchLabels': {'app': 'postgres', **labels}},
         'template': {'metadata': {'labels': {'app': 'postgres', **labels}}, 'spec': {
+            # fsGroup 70 = alpine postgres gid: the RWO data volume stays
+            # group-writable for the non-root container below. AppArmor
+            # Unconfined: Ubuntu's signal mediation denies same-uid kill()
+            # between postgres processes in pods on some node/kernel combos
+            # (observed: kernel 7.0 + k3s containerd; "could not signal for
+            # checkpoint: Permission denied"), breaking the temp-server
+            # handshake — unconfined restores standard signal semantics.
+            'securityContext': {'fsGroup': 70, 'appArmorProfile': {'type': 'Unconfined'}},
             'containers': [{'name': 'postgres', 'image': c.get('POSTGRES_IMAGE', 'postgres:16-alpine'),
+                # Run as the postgres uid directly: the official entrypoint then
+                # execs postgres without gosu. gosu (Go runtime) deterministically
+                # spins at 100% CPU under some containerd/kernel combinations
+                # (observed: kernel 7.0 + k3s containerd; dockerd unaffected),
+                # which left initdb never starting.
+                'securityContext': {'runAsUser': 70, 'runAsGroup': 70},
                 'env': [{'name': 'POSTGRES_USER', 'value': 'rcoder'}, {'name': 'POSTGRES_DB', 'value': 'rcoder'},
                         {'name': 'PGDATA', 'value': '/var/lib/postgresql/data/pgdata'},
                         {'name': 'POSTGRES_PASSWORD', 'valueFrom': {'secretKeyRef': {'name': 'postgres', 'key': 'password'}}}],
