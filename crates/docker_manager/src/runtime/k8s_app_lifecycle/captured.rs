@@ -215,7 +215,9 @@ impl KubernetesRuntime {
     /// platform's image repository. Read-only precheck for the start-path
     /// alignment guard; the caller's conditional patch still fences concurrent
     /// mutations, and a UID change between this read and the patch surfaces as
-    /// a capture conflict on retry.
+    /// a capture conflict on retry. The app container is matched by name (the
+    /// pod may carry sidecars); a template without the named container is
+    /// treated as not platform-managed and keeps its image.
     async fn template_runs_platform_image(
         &self,
         target: &shared_types::UserAppMutationTarget,
@@ -233,7 +235,11 @@ impl KubernetesRuntime {
         let template_image = deployment
             .spec
             .and_then(|spec| spec.template.spec)
-            .and_then(|spec| spec.containers.into_iter().next())
+            .and_then(|spec| {
+                spec.containers
+                    .into_iter()
+                    .find(|container| container.name == APP_CONTAINER_NAME)
+            })
             .and_then(|container| container.image);
         Ok(template_image
             .as_deref()
