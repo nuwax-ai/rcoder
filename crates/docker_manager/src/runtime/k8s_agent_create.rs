@@ -167,18 +167,30 @@ impl KubernetesRuntime {
                         | (false, _, SharedDirProbe::NonEmpty) => false,
                         // 真新用户: 初始化直上 RBD（fresh-init 标记来源）
                         (false, _, SharedDirProbe::Absent) => {
-                        self.ensure_fresh_workspace_pvc(
-                            identifier,
-                            &service_type,
-                            params.storage_size.as_deref(),
-                        )
-                        .await?;
-                        self.set_workspace_migration_state(
-                            identifier,
-                            &service_type,
-                            shared_types::WorkspaceMigrationState::Migrated,
-                        )
-                        .await?;
+                        // begin 之后的所有失败路径必须先 end 再上抛——
+                        // `?` 直接 return 会跳过收尾，该用户写准入永久冻结。
+                        if let Err(error) = self
+                            .ensure_fresh_workspace_pvc(
+                                identifier,
+                                &service_type,
+                                params.storage_size.as_deref(),
+                            )
+                            .await
+                        {
+                            shared_types::migration_gate::end(identifier);
+                            return Err(error);
+                        }
+                        if let Err(error) = self
+                            .set_workspace_migration_state(
+                                identifier,
+                                &service_type,
+                                shared_types::WorkspaceMigrationState::Migrated,
+                            )
+                            .await
+                        {
+                            shared_types::migration_gate::end(identifier);
+                            return Err(error);
+                        }
                             info!(
                                 "[K8S] new user '{identifier}' initialized on per-agent RBD"
                             );
@@ -190,12 +202,17 @@ impl KubernetesRuntime {
                         // 失败留卷/存量卷)与 rolled-back 卷一律走共享, 不凭
                         // "空目录"推断卷的来历。
                         (true, Some(crate::runtime::k8s_pvc::VOLUME_ORIGIN_FRESH_INIT), SharedDirProbe::Absent) => {
-                            self.set_workspace_migration_state(
-                                identifier,
-                                &service_type,
-                                shared_types::WorkspaceMigrationState::Migrated,
-                            )
-                            .await?;
+                            if let Err(error) = self
+                                .set_workspace_migration_state(
+                                    identifier,
+                                    &service_type,
+                                    shared_types::WorkspaceMigrationState::Migrated,
+                                )
+                                .await
+                            {
+                                shared_types::migration_gate::end(identifier);
+                                return Err(error);
+                            }
                             info!(
                                 "[K8S] new user '{identifier}' RBD init resumed (fresh-init volume, marker replayed)"
                             );
