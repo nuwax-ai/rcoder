@@ -210,15 +210,14 @@ async fn recover_drifted_app(
         let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
         match pods.get(triggering_pod_name).await {
             Ok(current) => {
-                let owner_matches = deployment.metadata.uid.as_deref().is_some_and(|deployment_uid| {
-                    current
-                        .metadata
-                        .owner_references
-                        .as_ref()
-                        .is_some_and(|refs| {
-                            refs.iter().any(|reference| reference.uid == deployment_uid)
-                        })
-                });
+                // owner 链是 Pod → ReplicaSet → Deployment（实测修正：直接比
+                // pod owner 与 Deployment uid 必然不匹配，会把所有对齐挡掉）。
+                let owner_matches = match resolve_owner_uid(client.clone(), namespace, &current).await {
+                    Some(owner_uid) => {
+                        deployment.metadata.uid.as_deref() == Some(owner_uid.as_str())
+                    }
+                    None => false,
+                };
                 if !owner_matches || !is_image_pull_failure(&current) {
                     tracing::info!(
                         app = %app_id,
@@ -321,6 +320,29 @@ async fn recover_drifted_app(
         "[IMAGE_DRIFT_WATCH] platform-managed stale template aligned after persistent pull failure"
     );
     Ok(())
+}
+
+
+/// 沿 Pod → ReplicaSet → Deployment 解析最终 owner UID（None = 链断/非受管形态）。
+async fn resolve_owner_uid(
+    client: kube::Client,
+    namespace: &str,
+    pod: &Pod,
+) -> Option<String> {
+    use k8s_openapi::api::apps::v1::ReplicaSet;
+    let controller = pod.metadata.owner_references.as_ref()?.iter().find(|reference| {
+        reference.controller.unwrap_or(false)
+            && reference.kind == "ReplicaSet"
+    })?;
+    let replica_sets: Api<ReplicaSet> = Api::namespaced(client, namespace);
+    let replica_set = replica_sets.get(&controller.name).await.ok()?;
+    replica_set
+        .metadata
+        .owner_references
+        .as_ref()?
+        .iter()
+        .find(|reference| reference.controller.unwrap_or(false) && reference.kind == "Deployment")
+        .map(|reference| reference.uid.clone())
 }
 
 #[cfg(test)]
