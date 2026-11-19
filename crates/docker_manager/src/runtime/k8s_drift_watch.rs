@@ -148,7 +148,7 @@ pub(crate) fn spawn_drift_watch(
                         tracing::warn!(app = %app_id, "[IMAGE_DRIFT_WATCH] recovery on cooldown");
                         continue;
                     }
-                    if let Err(error) = recover_drifted_app(
+                    match recover_drifted_app(
                         client.clone(),
                         &namespace,
                         &app_id,
@@ -158,20 +158,39 @@ pub(crate) fn spawn_drift_watch(
                     )
                     .await
                     {
-                        tracing::warn!(app = %app_id, %error, "[IMAGE_DRIFT_WATCH] bounded recovery failed");
+                        Ok(RecoveryOutcome::Aligned) => {
+                            // 只有实际发出 PATCH 才消耗冷却（第九轮 P2）。
+                            last_recovery
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(app_id, std::time::Instant::now());
+                        }
+                        Ok(RecoveryOutcome::Skipped) => {}
+                        Err(error) => {
+                            // PATCH 尝试失败也计冷却（防止对同一失败每窗口重试打爆）。
+                            tracing::warn!(app = %app_id, %error, "[IMAGE_DRIFT_WATCH] bounded recovery failed");
+                            last_recovery
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(app_id, std::time::Instant::now());
+                        }
                     }
-                    last_recovery
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(app_id, std::time::Instant::now());
                 }
             }
         }
     })
 }
 
+/// 恢复结果：Aligned = 实际发出 PATCH（消耗冷却）；Skipped = 证据失效/
+/// 不满足条件跳过（**不消耗冷却**——第九轮 P2：RS 读失败等暂态错误曾把
+/// 无 PATCH 的尝试也计入 1h 冷却）。
+enum RecoveryOutcome {
+    Aligned,
+    Skipped,
+}
+
 /// 单次有界受控对齐：仅平台仓库内的旧模板滚动到当前引用。任何不满足条
-/// 件都只记录并返回 Ok（不重试、不循环改模板）。
+/// 件都只记录并返回 Ok(Skipped)（不重试、不循环改模板）。
 async fn recover_drifted_app(
     client: kube::Client,
     namespace: &str,
@@ -179,7 +198,7 @@ async fn recover_drifted_app(
     triggering_pod_name: &str,
     platform_image: &str,
     platform_repo: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<RecoveryOutcome> {
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
     let name = format!("rcoder-app-{app_id}");
     let deployment = deployments
@@ -198,6 +217,15 @@ async fn recover_drifted_app(
         .as_ref()
         .and_then(|spec| spec.replicas)
         .unwrap_or(1);
+    if desired_replicas == 0 {
+        // 缩零 = 用户主动停机：拉取失败是停机前遗留的 pod 尸体，模板不该
+        // 被"修复"（第九轮 P1）。
+        tracing::info!(
+            app = %app_id,
+            "[IMAGE_DRIFT_WATCH] deployment scaled to zero; skipping alignment"
+        );
+        return Ok(RecoveryOutcome::Skipped);
+    }
     if ready_replicas >= desired_replicas.max(1) {
         tracing::info!(
             app = %app_id,
@@ -205,7 +233,7 @@ async fn recover_drifted_app(
             desired = desired_replicas,
             "[IMAGE_DRIFT_WATCH] deployment already ready; skipping alignment"
         );
-        return Ok(());
+        return Ok(RecoveryOutcome::Skipped);
     }
     // 写前复查触发 Pod（第八轮复审 P1）：重新读取触发 pod——业务容器必须
     // **此刻仍**拉取失败（窗口期间自愈/被人工修复则不对齐），且其 owner
@@ -230,7 +258,7 @@ async fn recover_drifted_app(
                         owner_matches,
                         "[IMAGE_DRIFT_WATCH] trigger pod no longer valid; skipping alignment"
                     );
-                    return Ok(());
+                    return Ok(RecoveryOutcome::Skipped);
                 }
             }
             Err(error) => {
@@ -241,7 +269,7 @@ async fn recover_drifted_app(
                     %error,
                     "[IMAGE_DRIFT_WATCH] trigger pod unreadable; skipping alignment"
                 );
-                return Ok(());
+                return Ok(RecoveryOutcome::Skipped);
             }
         }
     }
@@ -278,7 +306,7 @@ async fn recover_drifted_app(
             app = app_id,
             "[IMAGE_DRIFT_WATCH] template already aligned; pull failure is not drift"
         );
-        return Ok(());
+        return Ok(RecoveryOutcome::Skipped);
     }
     if container_runtime_api::image_repository(&template_image) != platform_repo {
         tracing::warn!(
@@ -286,7 +314,7 @@ async fn recover_drifted_app(
             image = %template_image,
             "[IMAGE_DRIFT_WATCH] template image is not platform-managed; kept"
         );
-        return Ok(());
+        return Ok(RecoveryOutcome::Skipped);
     }
     // 前置条件：带上读取到的 resourceVersion——并发用户操作（deploy/stop 的
     // 模板写）与本次对齐互为 409 冲突，由冷却期抑制重试，不做 last-write-wins。
@@ -324,7 +352,7 @@ async fn recover_drifted_app(
         to = %platform_image,
         "[IMAGE_DRIFT_WATCH] platform-managed stale template aligned after persistent pull failure"
     );
-    Ok(())
+    Ok(RecoveryOutcome::Aligned)
 }
 
 /// 沿 Pod → ReplicaSet → Deployment 解析最终 owner UID（None = 链断/非受管形态）。
@@ -339,8 +367,15 @@ async fn resolve_owner_uid(client: kube::Client, namespace: &str, pod: &Pod) -> 
             reference.controller.unwrap_or(false) && reference.kind == "ReplicaSet"
         })?;
     let replica_sets: Api<ReplicaSet> = Api::namespaced(client, namespace);
-    let replica_set = match replica_sets.get(&controller.name).await {
-        Ok(replica_set) => replica_set,
+    let replica_set: Option<ReplicaSet> = match replica_sets.get(&controller.name).await {
+        Ok(replica_set)
+            if replica_set.metadata.uid.as_deref() != Some(controller.uid.as_str()) =>
+        {
+            // 名字复用（RS 重建同名）：取到的是新 RS，不是 pod 声明的 owner——
+            // 视为链断（第九轮 P1：不核 UID 会把旧证据接到新链上）。
+            None
+        }
+        Ok(replica_set) => Some(replica_set),
         // RS 已删除：owner 链确实断了，静默返回 None（证据失效的合理形态）。
         Err(kube::Error::Api(response)) if response.code == 404 => return None,
         // 非 NotFound 失败（网络/权限/5xx）：链**不可判** ≠ 链不匹配——静默
@@ -354,7 +389,7 @@ async fn resolve_owner_uid(client: kube::Client, namespace: &str, pod: &Pod) -> 
             return None;
         }
     };
-    replica_set
+    replica_set?
         .metadata
         .owner_references
         .as_ref()?

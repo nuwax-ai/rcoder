@@ -183,7 +183,7 @@ impl KubernetesRuntime {
                         {
                             return Err(error);
                         }
-                        spawn_marker_completer(self, migration_gate.take(), identifier, &service_type);
+                        marker_completer(self, migration_gate.take(), identifier, &service_type).await?;
                             info!(
                                 "[K8S] new user '{identifier}' initialized on per-agent RBD"
                             );
@@ -195,7 +195,7 @@ impl KubernetesRuntime {
                         // 失败留卷/存量卷)与 rolled-back 卷一律走共享, 不凭
                         // "空目录"推断卷的来历。
                         (true, Some(crate::runtime::k8s_pvc::VOLUME_ORIGIN_FRESH_INIT), SharedDirProbe::Absent) => {
-                            spawn_marker_completer(self, migration_gate.take(), identifier, &service_type);
+                            marker_completer(self, migration_gate.take(), identifier, &service_type).await?;
                             info!(
                                 "[K8S] new user '{identifier}' RBD init resumed (fresh-init volume, marker replayed)"
                             );
@@ -945,45 +945,57 @@ async fn probe_shared_dir(identifier: &str) -> SharedDirProbe {
 /// （uid+rv 前置条件）、写判据缓存后才解除门禁。此前反例：取消后门禁
 /// 放行 + 服务端 PATCH 仍提交 → 缓存 NotMigrated 与 PVC Migrated 分裂，
 /// 并发写落旧共享卷。
-fn spawn_marker_completer(
+async fn marker_completer(
     runtime: &KubernetesRuntime,
     gate: Option<shared_types::migration_gate::MigrationGuard>,
     identifier: &str,
     service_type: &ServiceType,
-) {
+) -> ContainerRuntimeResult<()> {
     use crate::runtime::k8s_pvc::K8sPvcOps;
     let Some(gate) = gate else {
         tracing::warn!(user_id = identifier, "marker completer called without gate");
-        return;
+        return Ok(());
     };
-    let Ok(pvc_name) = runtime.workspace_pvc_name(identifier, service_type) else {
-        tracing::warn!(user_id = identifier, "completer: pvc name resolution failed");
-        return;
-    };
-    // 与 migration_cache_key 同构的键（完成者不依赖 &self 的方法）。
-    let cache_key = format!("{service_type}/{identifier}");
+    let pvc_name = runtime.workspace_pvc_name(identifier, service_type)?;
+    // 缓存键 = 物理 PVC 名（与 migration_cache_key 严格一致——第九轮 P1：
+    // 此前硬编码 {service_type}/{identifier} fallback 格式，PATCH 成功却写
+    // 错键，路由读不到 → 继续走旧共享卷）。
+    let cache_key = runtime
+        .workspace_pvc_name(identifier, service_type)
+        .unwrap_or_else(|_| format!("{service_type}/{identifier}"));
     let client = runtime.client.clone();
     let namespace = runtime.namespace.clone();
     let cache = std::sync::Arc::clone(&runtime.workspace_exists_cache);
     let user_id = identifier.to_string();
-    tokio::spawn(async move {
+    // 主流程 await 完成者（第九轮 P1）：标记 PATCH + 判据缓存写都确认后才
+    // 继续（此前派发即继续建 RBD agent，PATCH 失败只记日志）。取消安全保
+    // 留：外层 future 取消只是不再等结果——spawn 的任务继续跑完并持门禁
+    // 至 PATCH/缓存落定（JoinHandle drop 不取消任务）。
+    let _user_id = user_id;
+    let handle = tokio::spawn(async move {
         let _held = gate;
-        if let Err(error) =
-            crate::runtime::kubernetes_runtime::workspace_runtime::set_migration_state_detached(
-                client,
-                namespace,
-                cache,
-                pvc_name,
-                cache_key,
-                shared_types::WorkspaceMigrationState::Migrated,
-            )
-            .await
-        {
+        crate::runtime::kubernetes_runtime::workspace_runtime::set_migration_state_detached(
+            client,
+            namespace,
+            cache,
+            pvc_name,
+            cache_key,
+            shared_types::WorkspaceMigrationState::Migrated,
+        )
+        .await
+    });
+    match handle.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
             tracing::warn!(
-                user_id = %user_id,
+                user_id = identifier,
                 error = %error,
                 "[K8S] fresh-init marker PATCH failed in completer; gate released on drop"
             );
+            Err(error)
         }
-    });
+        Err(error) => Err(ContainerRuntimeError::ConnectionError(format!(
+            "marker completer task failed: {error}"
+        ))),
+    }
 }

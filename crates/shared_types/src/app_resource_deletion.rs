@@ -409,13 +409,36 @@ impl AppFileMutationMarker {
     /// (decoded lossily, for audit logging only) is returned; an already-clean
     /// file returns `None` (idempotent). I/O failures propagate so callers
     /// keep fencing (fail-safe).
-    pub fn reclaim_orphaned(mut file: &std::fs::File) -> std::io::Result<Option<String>> {
-        use std::io::{Read, Seek, SeekFrom};
+    /// `archive_to`：截断锁文件前把孤儿内容归档到旁文件（append 时间戳），
+    /// 保留原操作的恢复凭据——抢到 flock 只证明写入进程已停，Docker daemon/
+    /// app-cli 已派发的动作可能仍在执行，其 operation_id 是事后对账的唯一
+    /// 线索（第九轮复审 P1：清零即丢弃凭据）。归档失败按 I/O 错误传播
+    /// （保持围栏，fail-safe）。
+    pub fn reclaim_orphaned(
+        mut file: &std::fs::File,
+        archive_to: Option<&std::path::Path>,
+    ) -> std::io::Result<Option<String>> {
+        use std::io::{Read, Seek, SeekFrom, Write};
         let mut owner = Vec::new();
         file.seek(SeekFrom::Start(0))?;
-        file.by_ref().take(4096).read_to_end(&mut owner)?;
+        Read::take(&mut file, 4096).read_to_end(&mut owner)?;
         if owner.is_empty() {
             return Ok(None);
+        }
+        if let Some(archive) = archive_to {
+            let mut entry = chrono_or_system_time();
+            entry.push_str(" ");
+            entry.push_str(&String::from_utf8_lossy(&owner));
+            entry.push('\n');
+            if let Some(parent) = archive.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut archive = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(archive)?;
+            archive.write_all(entry.as_bytes())?;
+            archive.sync_all()?;
         }
         file.set_len(0)?;
         file.sync_all()?;
@@ -548,7 +571,7 @@ mod reclaim_orphaned_tests {
     fn clean_file_returns_none() {
         let file = lock_file(b"");
         assert_eq!(
-            AppFileMutationMarker::reclaim_orphaned(&file).expect("reclaim"),
+            AppFileMutationMarker::reclaim_orphaned(&file, None).expect("reclaim"),
             None
         );
         assert_eq!(file_len(&file), 0);
@@ -559,12 +582,12 @@ mod reclaim_orphaned_tests {
     fn orphaned_marker_returns_id_and_truncates() {
         let file = lock_file(b"0192f0ac-1111-4222-8333-444455556666");
         assert_eq!(
-            AppFileMutationMarker::reclaim_orphaned(&file).expect("reclaim"),
+            AppFileMutationMarker::reclaim_orphaned(&file, None).expect("reclaim"),
             Some("0192f0ac-1111-4222-8333-444455556666".to_owned())
         );
         assert_eq!(file_len(&file), 0);
         assert_eq!(
-            AppFileMutationMarker::reclaim_orphaned(&file).expect("reclaim again"),
+            AppFileMutationMarker::reclaim_orphaned(&file, None).expect("reclaim again"),
             None,
             "reclaim is idempotent"
         );
@@ -578,8 +601,15 @@ mod reclaim_orphaned_tests {
             0xff, 0xfe, b' ', b'd', b'e', b'a', b'd', b' ', b'h', b'o', b'l', b'd', b'e', b'r',
         ]);
         let reclaimed =
-            AppFileMutationMarker::reclaim_orphaned(&file).expect("reclaim corrupted remnant");
+            AppFileMutationMarker::reclaim_orphaned(&file, None).expect("reclaim corrupted remnant");
         assert!(reclaimed.is_some());
         assert_eq!(file_len(&file), 0);
     }
+}
+
+fn chrono_or_system_time() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| format!("[{}]", d.as_secs()))
+        .unwrap_or_else(|_| "[?]".to_string())
 }

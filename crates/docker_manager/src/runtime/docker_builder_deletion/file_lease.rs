@@ -39,19 +39,24 @@ pub(super) fn prepare_builder_file(
     // reclaim it instead of fencing the application forever. Record-backed
     // fencing (compute control records, operation leases) is unaffected — it
     // reads durable storage, not this physical remnant.
-    match shared_types::AppFileMutationMarker::reclaim_orphaned(&file) {
+    let lock_path = root.join(name);
+    match shared_types::AppFileMutationMarker::reclaim_orphaned(
+        &file,
+        Some(&lock_path.with_extension("lock.orphaned")),
+    ) {
         Ok(None) => {}
         Ok(Some(orphan_operation_id)) => {
             tracing::warn!(
-                lock_path = %root.join(name).display(),
+                lock_path = %lock_path.display(),
+                archive = %lock_path.with_extension("lock.orphaned").display(),
                 orphan_operation_id,
-                "Reclaimed orphaned builder operation marker under held flock; previous holder is proven stopped"
+                "Reclaimed orphaned builder operation marker under held flock; previous holder is proven stopped; operation id archived for reconciliation"
             );
         }
         Err(error) => {
             return Err(Error::Conflict(format!(
                 "builder operation lease marker at {}: {error}",
-                root.join(name).display()
+                lock_path.display()
             )));
         }
     }
