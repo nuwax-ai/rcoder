@@ -193,7 +193,11 @@ async fn recover_drifted_app(
         .as_ref()
         .and_then(|status| status.ready_replicas)
         .unwrap_or(0);
-    let desired_replicas = deployment.spec.as_ref().and_then(|spec| spec.replicas).unwrap_or(1);
+    let desired_replicas = deployment
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.replicas)
+        .unwrap_or(1);
     if ready_replicas >= desired_replicas.max(1) {
         tracing::info!(
             app = %app_id,
@@ -212,12 +216,13 @@ async fn recover_drifted_app(
             Ok(current) => {
                 // owner 链是 Pod → ReplicaSet → Deployment（实测修正：直接比
                 // pod owner 与 Deployment uid 必然不匹配，会把所有对齐挡掉）。
-                let owner_matches = match resolve_owner_uid(client.clone(), namespace, &current).await {
-                    Some(owner_uid) => {
-                        deployment.metadata.uid.as_deref() == Some(owner_uid.as_str())
-                    }
-                    None => false,
-                };
+                let owner_matches =
+                    match resolve_owner_uid(client.clone(), namespace, &current).await {
+                        Some(owner_uid) => {
+                            deployment.metadata.uid.as_deref() == Some(owner_uid.as_str())
+                        }
+                        None => false,
+                    };
                 if !owner_matches || !is_image_pull_failure(&current) {
                     tracing::info!(
                         app = %app_id,
@@ -322,18 +327,17 @@ async fn recover_drifted_app(
     Ok(())
 }
 
-
 /// 沿 Pod → ReplicaSet → Deployment 解析最终 owner UID（None = 链断/非受管形态）。
-async fn resolve_owner_uid(
-    client: kube::Client,
-    namespace: &str,
-    pod: &Pod,
-) -> Option<String> {
+async fn resolve_owner_uid(client: kube::Client, namespace: &str, pod: &Pod) -> Option<String> {
     use k8s_openapi::api::apps::v1::ReplicaSet;
-    let controller = pod.metadata.owner_references.as_ref()?.iter().find(|reference| {
-        reference.controller.unwrap_or(false)
-            && reference.kind == "ReplicaSet"
-    })?;
+    let controller = pod
+        .metadata
+        .owner_references
+        .as_ref()?
+        .iter()
+        .find(|reference| {
+            reference.controller.unwrap_or(false) && reference.kind == "ReplicaSet"
+        })?;
     let replica_sets: Api<ReplicaSet> = Api::namespaced(client, namespace);
     let replica_set = replica_sets.get(&controller.name).await.ok()?;
     replica_set
@@ -508,5 +512,166 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// 触发 pod 复核的 owner 链反例（221aa662 回归）：真实 K8s 中 Pod 的
+    /// controller owner 是 ReplicaSet 而非 Deployment——修复前直接比对 pod
+    /// owner uid 与 deployment uid，两级链必然不匹配，全部对齐被跳过
+    /// （旧逻辑下 chain-matched 场景 0 次 PATCH，本测试随之失败）。
+    #[tokio::test]
+    async fn two_level_owner_chain_gates_trigger_pod_recheck() {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            for (scenario, pod_waiting, rs_owner_uid, expect_patch) in [
+                // 两级链 Pod→RS→Deployment 归属一致且业务容器仍拉取失败 → 必须对齐
+                ("chain-matched", true, "deploy-uid-1", true),
+                // RS 的 Deployment owner 已换代（uid 不同）→ 旧触发不作数
+                ("chain-superseded", true, "old-deploy-uid", false),
+                // 窗口期内 pod 已自愈 Running → 证据失效，不对齐
+                ("pod-recovered", false, "deploy-uid-1", false),
+            ] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                drop(rustls::crypto::ring::default_provider().install_default());
+                let client =
+                    kube::Client::try_from(kube::Config::new(format!("http://{address}").parse().unwrap()))
+                        .unwrap();
+                let deployment = serde_json::json!({
+                    "apiVersion": "apps/v1", "kind": "Deployment",
+                    "metadata": {
+                        "name": "rcoder-app-9", "uid": "deploy-uid-1", "resourceVersion": "1",
+                        "labels": {"app.kubernetes.io/managed-by": "rcoder-app-manager"},
+                        "annotations": {"rcoder.io/application-id": "9"}
+                    },
+                    "spec": {"template": {"spec": {"containers": [
+                        {"name": "app", "image": "registry.test/app-runtime:0.1.306"}
+                    ]}}}
+                });
+                let container_state = if pod_waiting {
+                    serde_json::json!({"waiting": {"reason": "ImagePullBackOff"}})
+                } else {
+                    serde_json::json!({"running": {"startedAt": "2026-01-01T00:00:00Z"}})
+                };
+                let trigger_pod = serde_json::json!({
+                    "apiVersion": "v1", "kind": "Pod",
+                    "metadata": {
+                        "name": "trigger-pod",
+                        "ownerReferences": [{
+                            "apiVersion": "apps/v1", "kind": "ReplicaSet", "name": "rs-1",
+                            "uid": "rs-uid-1", "controller": true
+                        }]
+                    },
+                    "status": {"containerStatuses": [
+                        {"name": "app", "state": container_state}
+                    ]}
+                });
+                let replica_set = serde_json::json!({
+                    "apiVersion": "apps/v1", "kind": "ReplicaSet",
+                    "metadata": {
+                        "name": "rs-1", "uid": "rs-uid-1",
+                        "ownerReferences": [{
+                            "apiVersion": "apps/v1", "kind": "Deployment", "name": "rcoder-app-9",
+                            "uid": rs_owner_uid, "controller": true
+                        }]
+                    }
+                });
+                let patches = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+                let server_patches = patches.clone();
+                let server = tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    loop {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let mut bytes = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        let (head, offset, length) = loop {
+                            let count = stream.read(&mut chunk).await.unwrap();
+                            assert!(count > 0);
+                            bytes.extend_from_slice(&chunk[..count]);
+                            if let Some(end) = bytes.windows(4).position(|b| b == b"\r\n\r\n") {
+                                let head = String::from_utf8_lossy(&bytes[..end]).into_owned();
+                                let length = head.lines().find_map(|line| {
+                                    let (k, v) = line.split_once(':')?;
+                                    k.eq_ignore_ascii_case("content-length")
+                                        .then(|| v.trim().parse::<usize>().unwrap())
+                                }).unwrap_or(0);
+                                break (head, end + 4, length);
+                            }
+                        };
+                        while bytes.len() < offset + length {
+                            let count = stream.read(&mut chunk).await.unwrap();
+                            assert!(count > 0);
+                            bytes.extend_from_slice(&chunk[..count]);
+                        }
+                        let method = head.split_whitespace().next().unwrap();
+                        let path = head.split_whitespace().nth(1).unwrap().split('?').next().unwrap();
+                        let (code, value) = if path.ends_with("/deployments/rcoder-app-9") {
+                            if method == "PATCH" {
+                                let patch: serde_json::Value =
+                                    serde_json::from_slice(&bytes[offset..offset + length]).unwrap();
+                                server_patches.lock().unwrap().push(patch);
+                            }
+                            (200, deployment.clone())
+                        } else if path.ends_with("/pods/trigger-pod") {
+                            (200, trigger_pod.clone())
+                        } else if path.ends_with("/replicasets/rs-1") {
+                            (200, replica_set.clone())
+                        } else {
+                            (404, serde_json::json!({"kind": "Status", "code": 404}))
+                        };
+                        let body = value.to_string();
+                        let response = format!(
+                            "HTTP/1.1 {code} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        stream.write_all(response.as_bytes()).await.unwrap();
+                    }
+                });
+                let result = recover_drifted_app(
+                    client,
+                    "drift-test",
+                    "9",
+                    "trigger-pod",
+                    "registry.test/app-runtime:0.1.456",
+                    "registry.test/app-runtime",
+                )
+                .await;
+                server.abort();
+                result.expect("recheck outcomes are Ok (skip or align)");
+                let writes = patches.lock().unwrap().clone();
+                if expect_patch {
+                    assert_eq!(
+                        writes.len(),
+                        1,
+                        "{scenario}: Pod→ReplicaSet→Deployment 两级链不得挡住对齐"
+                    );
+                    assert_eq!(
+                        writes[0]["spec"]["template"]["spec"]["containers"][0]["image"],
+                        "registry.test/app-runtime:0.1.456"
+                    );
+                } else {
+                    assert!(writes.is_empty(), "{scenario} must not patch");
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    /// 非受管形态直接判 None（不发起任何 K8s 请求）：无 ownerReferences，
+    /// 或 controller owner 不是 ReplicaSet（如 StatefulSet 直管 Pod）。
+    #[tokio::test]
+    async fn resolve_owner_uid_requires_replicaset_controller() {
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let client =
+            kube::Client::try_from(kube::Config::new("http://127.0.0.1:1".parse().unwrap()))
+                .unwrap();
+        let bare = pod(serde_json::json!({"metadata": {"name": "p"}}));
+        assert_eq!(resolve_owner_uid(client.clone(), "ns", &bare).await, None);
+        let stateful = pod(serde_json::json!({
+            "metadata": {"name": "p", "ownerReferences": [{
+                "apiVersion": "apps/v1", "kind": "StatefulSet", "name": "sts",
+                "uid": "sts-uid", "controller": true
+            }]}
+        }));
+        assert_eq!(resolve_owner_uid(client, "ns", &stateful).await, None);
     }
 }
