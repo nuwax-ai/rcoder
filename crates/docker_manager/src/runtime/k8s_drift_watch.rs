@@ -99,8 +99,15 @@ pub(crate) fn spawn_drift_watch(
                     };
                     let pod = match event {
                         Ok(watcher::Event::Apply(pod)) | Ok(watcher::Event::InitApply(pod)) => pod,
-                        Ok(watcher::Event::Delete(_)) | Ok(watcher::Event::Init) | Ok(watcher::Event::InitDone) => {
-                            // 删除/初始化不携带增量信息；失败窗口由后续 Apply 重建。
+                        Ok(watcher::Event::Delete(pod)) => {
+                            // 删除事件：清理该 app 的窗口起点（避免残留 entry）。
+                            if let Some(app_id) = pod_app_id(&pod) {
+                                first_failure.remove(&app_id);
+                            }
+                            continue;
+                        }
+                        Ok(watcher::Event::Init) | Ok(watcher::Event::InitDone) => {
+                            // 初始化不携带增量信息；失败窗口由后续 Apply 重建。
                             continue;
                         }
                         Err(error) => {
@@ -122,7 +129,7 @@ pub(crate) fn spawn_drift_watch(
                     first_failure.remove(&app_id);
                     if last_recovery
                         .lock()
-                        .expect("drift watch recovery ledger")
+                        .unwrap_or_else(|e| e.into_inner())
                         .get(&app_id)
                         .is_some_and(|at| at.elapsed() < cooldown)
                     {
@@ -142,7 +149,7 @@ pub(crate) fn spawn_drift_watch(
                     }
                     last_recovery
                         .lock()
-                        .expect("drift watch recovery ledger")
+                        .unwrap_or_else(|e| e.into_inner())
                         .insert(app_id, std::time::Instant::now());
                 }
             }
