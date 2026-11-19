@@ -205,3 +205,37 @@ class OfficialBuildTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class RequireCatalogCommitMatchTests(unittest.TestCase):
+    """复审第五轮 P2: 回退前预核验版本身份——缺架构资产不得跳过 pin 冲突。"""
+
+    @staticmethod
+    def _catalog(commit, with_asset):
+        assets = {'tag': 'v9.9.9', 'commit': commit}
+        if with_asset:
+            assets['assets'] = {
+                'amd64': {'name': 'pingap-linux-gnu-x86-full.tar.gz', 'id': 1,
+                          'sha256': 'a' * 64, 'url': 'https://example/asset'}
+            }
+        else:
+            assets['assets'] = {}
+        return {'protocol': 'pingap-release-assets-v1', 'repository': 'vicanso/pingap',
+                'releases': {'9.9.9': assets}}
+
+    def test_same_pin_with_missing_asset_falls_back(self):
+        import tools.build.pingap_official as po
+        catalog = self._catalog('b' * 40, with_asset=False)
+        # 同 pin：不应抛错（回退路径由调用方继续）
+        po._require_catalog_commit_match(catalog, '9.9.9', 'b' * 40)
+
+    def test_wrong_pin_with_missing_asset_refused(self):
+        import tools.build.pingap_official as po
+        catalog = self._catalog('b' * 40, with_asset=False)
+        with self.assertRaises(ValueError):
+            po._require_catalog_commit_match(catalog, '9.9.9', 'c' * 40)
+
+    def test_missing_version_entry_passes(self):
+        import tools.build.pingap_official as po
+        catalog = {'protocol': 'pingap-release-assets-v1', 'repository': 'vicanso/pingap',
+                   'releases': {}}
+        po._require_catalog_commit_match(catalog, '8.8.8', 'd' * 40)

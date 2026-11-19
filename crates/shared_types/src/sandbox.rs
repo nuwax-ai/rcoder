@@ -230,7 +230,10 @@ pub trait SandboxStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError>;
     /// 回收器扫描：非终态且 expires_at_us <= now 的实例。
-    async fn list_expired(&self, now_us: i64) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError>;
+    async fn list_expired(
+        &self,
+        now_us: i64,
+    ) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError>;
     /// 非终态且 CleanupPending 的待对账实例（M3 使用；M1 返回空亦可）。
     async fn list_cleanup_pending(&self) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError>;
     /// 全部非终态实例（重启恢复用；不按租户过滤）。
@@ -277,17 +280,13 @@ pub trait SandboxStore: Send + Sync {
         name: &str,
     ) -> Result<Option<SandboxVolumeRecord>, SandboxStoreError>;
     /// 全部未软删卷（回收器对账"行在 PVC 缺失"的空卷用）。
-    async fn list_all_active_volumes(&self)
-    -> Result<Vec<SandboxVolumeRecord>, SandboxStoreError>;
+    async fn list_all_active_volumes(&self) -> Result<Vec<SandboxVolumeRecord>, SandboxStoreError>;
     async fn list_volumes(
         &self,
         tenant_id: &str,
     ) -> Result<Vec<SandboxVolumeRecord>, SandboxStoreError>;
     /// 软删除（deleted_at_us 置值；物理 PVC 删除由服务层协调）。
-    async fn mark_volume_deleted(
-        &self,
-        volume_id: &str,
-    ) -> Result<(), SandboxStoreError>;
+    async fn mark_volume_deleted(&self, volume_id: &str) -> Result<(), SandboxStoreError>;
 }
 
 /// sha256 hex（token/api key 摘要的唯一哈希入口）。

@@ -80,7 +80,8 @@ pub const COMPUTER_PASS_THROUGH_PATHS: &[&str] = &[
     "/api/git/branch-delete",
     "/api/git/branch-switch",
     "/api/git/tag-create",
-    "/api/git/tag-delete",];
+    "/api/git/tag-delete",
+];
 
 /// 转发目标（per-agent RBD 用户的 agent 容器）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,7 +314,11 @@ mod tests {
     #[test]
     fn encoded_static_segment_is_decoded_and_routed() {
         // %36 → 6: 编码形态与明文形态路由到同一目标(不再绕过转发读旧卷)
-        let t = found(resolve_target(None, None, "/api/computer/static/%36/1696379/f.txt"));
+        let t = found(resolve_target(
+            None,
+            None,
+            "/api/computer/static/%36/1696379/f.txt",
+        ));
         assert_eq!(t.user_id, "6");
         // 非法编码段 → Invalid, 不落 Absent
         assert_eq!(

@@ -135,8 +135,29 @@ impl KubernetesRuntime {
                             .and_then(|labels| labels.get(crate::runtime::k8s_pvc::VOLUME_ORIGIN_LABEL))
                             .cloned()
                     });
+                    // 写排空后探测（复审第五轮 P1）：受理中的共享写尚未创建
+                    // 目录时，盲探测会误判 Absent——先关该用户的新写（begin，
+                    // 与 intercept 的 admit_write 同一把锁），排空在途写，再
+                    // 重新探测共享目录。与 cutover 的编排锁互斥保证 begin/end
+                    // 不交叉。排空超时（10s 内在途写未归零）上抛可重试错误，
+                    // 本次保持现状（不切卷）。
+                    shared_types::migration_gate::begin(identifier);
+                    let drain_left = shared_types::migration_gate::drain_user_writes(
+                        identifier,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await;
+                    if drain_left > 0 {
+                        shared_types::migration_gate::end(identifier);
+                        return Err(ContainerRuntimeError::ConnectionError(format!(
+                            "in-flight writes for '{identifier}' did not drain within 10s \
+                             (left={drain_left}); refusing fresh-init decision, retry later"
+                        )));
+                    }
                     let shared_state = probe_shared_dir(identifier).await;
-                    match (pvc.is_some(), volume_origin.as_deref(), shared_state) {
+                    // 探测异常时也走统一收尾路径（下方 ProbeFailed 分支 return 前
+                    // 先 end，恢复该用户可写）。
+                    let fresh_init_decision = match (pvc.is_some(), volume_origin.as_deref(), shared_state) {
                         // phase-a 预同步卷(共享卷有存量/无来源标) 或 探测不可
                         // 信: 保持共享路径。phase-a 与存量卷不打 fresh-init 标,
                         // rolled-back 卷显式排除在续接之外(复审第四轮 P1: 回滚
@@ -187,13 +208,18 @@ impl KubernetesRuntime {
                         // 拒绝初始化——误判新用户会让存量用户数据"消失"(空
                         // RBD 卷+存在即转发)。上抛可重试错误, 不静默回落。
                         (false, _, SharedDirProbe::ProbeFailed) => {
+                            shared_types::migration_gate::end(identifier);
                             return Err(ContainerRuntimeError::ConnectionError(format!(
                                 "cannot probe shared workspace for '{identifier}' \
                                  (COMPUTER_WORKSPACE_DIR unset, IO error or shared root missing); \
                                  refusing new-user RBD initialization"
                             )));
                         }
-                    }
+                    };
+                    // 决策完成：恢复该用户写准入。两条成功路径（新建/续接）的
+                    // 建卷+翻标记都发生在门禁内——与文件写路由串行化。
+                    shared_types::migration_gate::end(identifier);
+                    fresh_init_decision
                 }
             }
         } else {

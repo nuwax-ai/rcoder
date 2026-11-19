@@ -115,14 +115,16 @@ pub async fn computer_rbd_intercept(
         .get(shared_types::USER_ID_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let mut resolved = resolve_target(
-        header_snapshot.as_deref(),
-        req.uri().query(),
-        &path,
-    );
+    let mut resolved = resolve_target(header_snapshot.as_deref(), req.uri().query(), &path);
     if matches!(resolved, TargetResolution::Absent) && is_git_json_write {
         match extract_git_json_user(req).await {
-            Ok((parts, body)) => {
+            Ok((parts, body, locator)) => {
+                // 工作区类型分流（复审第五轮 P1）：pageApp/userApp 按 projectId
+                // 定位（非本转发层职责）——不注入 userId 直接放行；仅
+                // computer 域（normalProject/taskAgent/缺省）要求可定位 userId。
+                if matches!(locator, GitJsonLocator::NonComputer) {
+                    return next.run(Request::from_parts(parts, body)).await;
+                }
                 req = Request::from_parts(parts, body);
                 let header = req
                     .headers()
@@ -169,9 +171,15 @@ pub async fn computer_rbd_intercept(
     // migration_gate 的同一把短锁内完成——cutover begin 置位后，此处必然
     // 拒绝，drain 归零即真正排空边界。guard 注入响应流（见 finish_with_guard），
     // 流式正文的发送期仍在途。
-    let write_admission = if is_write {
+    let mut write_admission = if is_write {
         match super::migration_gate::admit_write(&target.user_id) {
-            super::migration_gate::WriteAdmission::Admitted(guard) => Some(guard),
+            super::migration_gate::WriteAdmission::Admitted(guard) => {
+                // 副本一：request extension——本地路径的 file-server handler
+                // （git 同步写等 spawn_blocking 线程）持有至副作用结束；
+                // HTTP 取消不中止已启动的写（复审第五轮 P1）。
+                req.extensions_mut().insert(guard.clone());
+                Some(guard)
+            }
             super::migration_gate::WriteAdmission::Gated => {
                 tracing::info!(
                     user_id = %target.user_id,
@@ -251,10 +259,7 @@ fn finish_with_guard(
         inner: stream,
         _guard: Some(guard),
     };
-    Response::from_parts(
-        parts,
-        Body::from_stream(guarded),
-    )
+    Response::from_parts(parts, Body::from_stream(guarded))
 }
 
 /// wake（幂等 ensure agent 容器, ≤WAKE_BUDGET）+ 全流式转发其 :8086。
@@ -512,12 +517,16 @@ const GIT_JSON_BUFFER_CAP: usize = 2 * 1024 * 1024;
 /// body 读取失败（连接截断/**超 2MB 上限**）返回 Err(400)——半截 body 放行
 /// 下游只会得到更晚也更迷惑的失败；超限错误给出 header 契约提示。
 /// 无可定位 userId 时原样重建（body 保持字节不变）。
+/// Git JSON 定位结果：computer 域用户（已注入 header）或非 computer
+/// 工作区（pageApp/userApp——按 projectId 定位，转发层放行）。
+enum GitJsonLocator {
+    ComputerUser,
+    NonComputer,
+}
+
 async fn extract_git_json_user(
     req: Request,
-) -> Result<
-    (axum::http::request::Parts, Body),
-    Response,
-> {
+) -> Result<(axum::http::request::Parts, Body, GitJsonLocator), Response> {
     let (mut parts, body) = req.into_parts();
     let bytes = match axum::body::to_bytes(body, GIT_JSON_BUFFER_CAP).await {
         Ok(bytes) => bytes,
@@ -530,8 +539,24 @@ async fn extract_git_json_user(
                 .into_response());
         }
     };
-    let user_id = serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
+    let parsed = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+    // 工作区类型分流：四值词表 userApp/pageApp/normalProject/taskAgent
+    // （大小写不敏感，缺省 taskAgent）——userApp/pageApp 不以 userId 定位。
+    let non_computer = parsed
+        .as_ref()
+        .and_then(|value| value.get("workspaceType"))
+        .and_then(|value| value.as_str())
+        .map(|text| {
+            matches!(
+                text.trim().to_ascii_lowercase().as_str(),
+                "pageapp" | "userapp"
+            )
+        })
+        .unwrap_or(false);
+    if non_computer {
+        return Ok((parts, Body::from(bytes), GitJsonLocator::NonComputer));
+    }
+    let user_id = parsed
         .and_then(|value| value.get("userId").cloned())
         .and_then(|value| match value {
             serde_json::Value::String(text) => Some(text),
@@ -543,7 +568,9 @@ async fn extract_git_json_user(
     if let Some(user_id) = user_id {
         match axum::http::HeaderValue::from_str(&user_id) {
             Ok(header_value) => {
-                parts.headers.insert(shared_types::USER_ID_HEADER, header_value);
+                parts
+                    .headers
+                    .insert(shared_types::USER_ID_HEADER, header_value);
             }
             Err(error) => {
                 // 非法 userId 显式 400（对齐 resolve_target 的 Invalid 语义——
@@ -561,5 +588,5 @@ async fn extract_git_json_user(
             }
         }
     }
-    Ok((parts, Body::from(bytes)))
+    Ok((parts, Body::from(bytes), GitJsonLocator::ComputerUser))
 }

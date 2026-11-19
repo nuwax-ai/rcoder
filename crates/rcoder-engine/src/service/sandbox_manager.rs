@@ -17,14 +17,12 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 
 use shared_types::sandbox::{
-    sha256_hex, CreateSandboxParams, SandboxApiKeyRecord, SandboxInstanceRecord,
-    SandboxInstanceState, SandboxStore, SandboxStoreError, SandboxTemplateSpec,
+    CreateSandboxParams, SandboxApiKeyRecord, SandboxInstanceRecord, SandboxInstanceState,
+    SandboxStore, SandboxStoreError, SandboxTemplateSpec, sha256_hex,
 };
 
 use crate::config::E2bSandboxConfig;
-use docker_manager::runtime::k8s_sandbox::{
-    SandboxK8s, SandboxK8sError, SandboxPodParams,
-};
+use docker_manager::runtime::k8s_sandbox::{SandboxK8s, SandboxK8sError, SandboxPodParams};
 
 pub const ENVD_PORT: i32 = 49983;
 
@@ -187,7 +185,10 @@ impl SandboxManager {
                 image: template.image.clone(),
                 image_digest: template.image_digest.clone(),
                 envd_version: template.envd_version.clone(),
-                runtime_class: template.runtime_class.clone().filter(|value| !value.is_empty()),
+                runtime_class: template
+                    .runtime_class
+                    .clone()
+                    .filter(|value| !value.is_empty()),
                 cpu_millicores: template.cpu_millicores,
                 memory_mib: template.memory_mib,
                 default_user: template.default_user.clone(),
@@ -222,7 +223,10 @@ impl SandboxManager {
         self.store.list_templates().await.map_err(store_error)
     }
 
-    pub async fn authenticate(&self, provided_key: &str) -> Result<SandboxApiKeyRecord, SandboxApiError> {
+    pub async fn authenticate(
+        &self,
+        provided_key: &str,
+    ) -> Result<SandboxApiKeyRecord, SandboxApiError> {
         let record = self
             .store
             .find_api_key_by_hash(&sha256_hex(provided_key))
@@ -250,12 +254,18 @@ impl SandboxManager {
             .map_err(|error| SandboxApiError::Unavailable(format!("token encrypt: {error}")))?;
         let mut packed = nonce_bytes.to_vec();
         packed.extend_from_slice(&ciphertext);
-        Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &packed))
+        Ok(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            &packed,
+        ))
     }
 
     pub fn decrypt_token(&self, record: &SandboxInstanceRecord) -> Result<String, SandboxApiError> {
-        let packed = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, record.encrypted_token.as_deref().unwrap_or_default())
-            .map_err(|error| SandboxApiError::Unavailable(format!("token b64: {error}")))?;
+        let packed = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            record.encrypted_token.as_deref().unwrap_or_default(),
+        )
+        .map_err(|error| SandboxApiError::Unavailable(format!("token b64: {error}")))?;
         if packed.len() < 12 {
             return Err(SandboxApiError::Unavailable("token 密文损坏".into()));
         }
@@ -286,7 +296,10 @@ impl SandboxManager {
                     SandboxInstanceState::Ready => {
                         tracing::info!(sandbox_id = %existing.sandbox_id, "e2b create 幂等命中，返回已有实例");
                         let token = self.decrypt_token(&existing)?;
-                        Ok(CreateOutcome { record: existing, token })
+                        Ok(CreateOutcome {
+                            record: existing,
+                            token,
+                        })
                     }
                     state => Err(SandboxApiError::Conflict(format!(
                         "同幂等键的沙箱正在{state:?}，请稍后重试"
@@ -308,7 +321,9 @@ impl SandboxManager {
             .get_template_spec(&params.template_id)
             .await
             .map_err(store_error)?
-            .ok_or_else(|| SandboxApiError::Invalid(format!("template {} 不可用", params.template_id)))?;
+            .ok_or_else(|| {
+                SandboxApiError::Invalid(format!("template {} 不可用", params.template_id))
+            })?;
         let ttl_seconds = params.timeout_seconds.unwrap_or(self.default_ttl_seconds);
         if ttl_seconds <= 0 {
             return Err(SandboxApiError::Invalid("timeout 必须为正数秒".into()));
@@ -329,10 +344,7 @@ impl SandboxManager {
         let now = chrono::Utc::now().timestamp_micros();
         // hard_deadline：不可续期硬顶 = 创建时刻 + 模板最大存活 + 创建等待余量。
         let hard_deadline_us = now
-            + (spec.ttl_max_seconds
-                + self.create_ready_timeout.as_secs() as i64
-                + 120)
-                * 1_000_000;
+            + (spec.ttl_max_seconds + self.create_ready_timeout.as_secs() as i64 + 120) * 1_000_000;
 
         let record = SandboxInstanceRecord {
             sandbox_id: sandbox_id.clone(),
@@ -379,7 +391,10 @@ impl SandboxManager {
                 return Err(SandboxApiError::Invalid("mountPath 不允许路径穿越".into()));
             }
             const SENSITIVE: &[&str] = &["/proc", "/sys", "/dev", "/etc", "/var/run", "/run"];
-            if SENSITIVE.iter().any(|p| mount.mount_path == *p || mount.mount_path.starts_with(&format!("{}/", p))) {
+            if SENSITIVE
+                .iter()
+                .any(|p| mount.mount_path == *p || mount.mount_path.starts_with(&format!("{}/", p)))
+            {
                 return Err(SandboxApiError::Invalid(format!(
                     "mountPath \"{}\" 不允许挂载系统路径",
                     mount.mount_path
@@ -391,10 +406,7 @@ impl SandboxManager {
                 .await
                 .map_err(store_error)?
                 .ok_or_else(|| {
-                    SandboxApiError::Invalid(format!(
-                        "volume \"{}\" 不存在",
-                        mount.volume_name
-                    ))
+                    SandboxApiError::Invalid(format!("volume \"{}\" 不存在", mount.volume_name))
                 })?;
             resolved_volume_mounts.push((volume.pvc_name.clone(), mount.mount_path.clone()));
         }
@@ -418,7 +430,10 @@ impl SandboxManager {
                                 "e2b create 幂等冲突收敛，返回已有实例"
                             );
                             let token = self.decrypt_token(&existing)?;
-                            return Ok(CreateOutcome { record: existing, token });
+                            return Ok(CreateOutcome {
+                                record: existing,
+                                token,
+                            });
                         }
                         return Err(SandboxApiError::Conflict(format!(
                             "同幂等键的沙箱正在{:?}，请稍后重试",
@@ -439,7 +454,9 @@ impl SandboxManager {
             cpu_millicores: record.cpu_millicores,
             memory_mib: record.memory_mib,
             envd_port: ENVD_PORT,
-            max_lifetime_seconds: spec.ttl_max_seconds + self.create_ready_timeout.as_secs() as i64 + 120,
+            max_lifetime_seconds: spec.ttl_max_seconds
+                + self.create_ready_timeout.as_secs() as i64
+                + 120,
             env: Vec::new(),
             volume_mounts: resolved_volume_mounts,
         };
@@ -448,7 +465,11 @@ impl SandboxManager {
                 .fail_create(&record, &format!("create pod: {error}"))
                 .await;
         }
-        let status = match self.k8s.wait_ready(&record.pod_name, self.create_ready_timeout).await {
+        let status = match self
+            .k8s
+            .wait_ready(&record.pod_name, self.create_ready_timeout)
+            .await
+        {
             Ok(status) => status,
             Err(error) => {
                 return self
@@ -478,7 +499,9 @@ impl SandboxManager {
         match self.envd_init(&pod_ip, &token, &spec, &env_map).await {
             Ok(()) => {}
             Err(error) => {
-                return self.fail_create(&record, &format!("envd init: {error}")).await;
+                return self
+                    .fail_create(&record, &format!("envd init: {error}"))
+                    .await;
             }
         }
 
@@ -534,7 +557,9 @@ impl SandboxManager {
                     .await;
             }
         }
-        Err(SandboxApiError::Unavailable(format!("create failed: {reason}")))
+        Err(SandboxApiError::Unavailable(format!(
+            "create failed: {reason}"
+        )))
     }
 
     async fn envd_init(
@@ -560,12 +585,15 @@ impl SandboxManager {
             match self.http.post(&url).json(&body).send().await {
                 Ok(response) if response.status().is_success() => return Ok(()),
                 Ok(response) if response.status().is_client_error() => {
-                    return Err(format!("envd /init 4xx: {}", response.status()))
+                    return Err(format!("envd /init 4xx: {}", response.status()));
                 }
                 Ok(response) => {
                     let status = response.status();
                     if attempt >= self.envd_init_retries {
-                        return Err(format!("envd /init {status} 重试 {} 次后放弃", self.envd_init_retries));
+                        return Err(format!(
+                            "envd /init {status} 重试 {} 次后放弃",
+                            self.envd_init_retries
+                        ));
                     }
                 }
                 Err(error) => {
@@ -651,10 +679,7 @@ impl SandboxManager {
                 // 处置资格复核：并发续期（expires 推后）或温池认领（expires 置
                 // NULL、状态 Initializing）都使本方丧失回收资格。
                 let now = chrono::Utc::now().timestamp_micros();
-                if !record
-                    .expires_at_us
-                    .is_some_and(|expires| expires <= now)
-                {
+                if !record.expires_at_us.is_some_and(|expires| expires <= now) {
                     tracing::info!(
                         sandbox_id = %record.sandbox_id,
                         ?record.expires_at_us,
@@ -830,7 +855,8 @@ impl SandboxManager {
                                 }
                             }
                             // Provisioning/Initializing 且 Pod 终相 → kill
-                            SandboxInstanceState::Provisioning | SandboxInstanceState::Initializing
+                            SandboxInstanceState::Provisioning
+                            | SandboxInstanceState::Initializing
                                 if matches!(status.phase.as_str(), "Failed" | "Succeeded") =>
                             {
                                 tracing::info!(sandbox_id = %record.sandbox_id, phase = %status.phase, "recover: Pod 终相，kill");
@@ -858,9 +884,11 @@ impl SandboxManager {
                                 let _ = self.kill_by_record(&record, KillReason::Recover).await;
                             }
                             // Provisioning/Initializing 超时（创建时间 + 超时上限 < now）→ kill
-                            SandboxInstanceState::Provisioning | SandboxInstanceState::Initializing => {
+                            SandboxInstanceState::Provisioning
+                            | SandboxInstanceState::Initializing => {
                                 let deadline = record.created_at_us
-                                    + (self.create_ready_timeout.as_secs() as i64 + 120) * 1_000_000;
+                                    + (self.create_ready_timeout.as_secs() as i64 + 120)
+                                        * 1_000_000;
                                 if chrono::Utc::now().timestamp_micros() > deadline {
                                     tracing::info!(sandbox_id = %record.sandbox_id, "recover: 创建超时，kill");
                                     let _ = self.kill_by_record(&record, KillReason::Recover).await;
@@ -930,7 +958,9 @@ impl SandboxManager {
             let new_expires = now + timeout_seconds * 1_000_000;
             if let Some(hard) = record.hard_deadline_us {
                 if new_expires > hard {
-                    return Err(SandboxApiError::Invalid("续期越过硬顶（hard_deadline）".into()));
+                    return Err(SandboxApiError::Invalid(
+                        "续期越过硬顶（hard_deadline）".into(),
+                    ));
                 }
             }
             match self
@@ -955,7 +985,9 @@ impl SandboxManager {
                 Err(error) => return Err(store_error(error)),
             }
         }
-        Err(SandboxApiError::Conflict("set_timeout CAS 重试 5 次后放弃".into()))
+        Err(SandboxApiError::Conflict(
+            "set_timeout CAS 重试 5 次后放弃".into(),
+        ))
     }
 
     /// 数据面授权：沙箱存在、Ready、未到期、token 匹配。
@@ -996,7 +1028,6 @@ impl SandboxManager {
             .pod_ip
             .ok_or_else(|| SandboxApiError::Unavailable("pod 无 IP".into()))
     }
-
 
     // ---------- Volumes（M5） ----------
 
@@ -1099,7 +1130,6 @@ impl SandboxManager {
         Ok(())
     }
 
-
     // ---------- 温池（M4） ----------
 
     /// 尝试从温池认领一个实例。成功返回 Some(CreateOutcome)；池空/被并发抢先
@@ -1129,18 +1159,12 @@ impl SandboxManager {
             )));
         }
 
-        let candidates = self
-            .store
-            .list_warm_ready()
-            .await
-            .map_err(store_error)?;
+        let candidates = self.store.list_warm_ready().await.map_err(store_error)?;
         // 候选必须匹配当前修订：模板升级（rev+1）后旧修订的温池实例不得再
         // 认领——它们由闲置过期自然排空，新修订池由补池器按新水位补建。
         let Some(mut record) = candidates
             .into_iter()
-            .find(|r| {
-                r.template_id == params.template_id && r.template_revision == spec.revision
-            })
+            .find(|r| r.template_id == params.template_id && r.template_revision == spec.revision)
         else {
             return Ok(None);
         };
@@ -1423,7 +1447,11 @@ impl SandboxManager {
     }
 
     /// 超时回收循环（tokio 任务体）：到期实例与待清理实例的收敛。
-    pub async fn run_reaper(self: Arc<Self>, mut shutdown: tokio::sync::broadcast::Receiver<()>, interval_seconds: u64) {
+    pub async fn run_reaper(
+        self: Arc<Self>,
+        mut shutdown: tokio::sync::broadcast::Receiver<()>,
+        interval_seconds: u64,
+    ) {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_seconds.max(1)));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -1466,10 +1494,7 @@ impl SandboxManager {
                     // 可能是 NULL/未来值(kill 两步间中断的历史残留),
                     // ReapExpired 的到期复核会直接放弃——Recover 只复核非终态
                     // (复审第四轮 P2), 10min 卡死宽限本身就是处置凭据。
-                    if let Err(error) = self
-                        .kill_by_record(&record, KillReason::Recover)
-                        .await
-                    {
+                    if let Err(error) = self.kill_by_record(&record, KillReason::Recover).await {
                         tracing::warn!(sandbox_id = %record.sandbox_id, error = %error, "e2b reaper 卡死收敛失败，下轮重试");
                     }
                 }
@@ -1563,10 +1588,12 @@ impl SandboxManager {
         }
         tracing::info!("e2b reaper stopped");
     }
-
 }
 
-fn ensure_tenant(record: &SandboxInstanceRecord, key: &SandboxApiKeyRecord) -> Result<(), SandboxApiError> {
+fn ensure_tenant(
+    record: &SandboxInstanceRecord,
+    key: &SandboxApiKeyRecord,
+) -> Result<(), SandboxApiError> {
     if record.tenant_id != key.tenant_id {
         // 跨租户访问按不存在处理，不泄露存在性。
         return Err(SandboxApiError::NotFound(record.sandbox_id.clone()));

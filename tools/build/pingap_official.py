@@ -9,6 +9,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import platform
 import shutil

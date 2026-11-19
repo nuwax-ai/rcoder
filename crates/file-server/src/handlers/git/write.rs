@@ -2,11 +2,13 @@
 
 use std::path::Path;
 
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use garde::Validate;
 use gix::Repository;
 
 use super::resolve_body;
+use shared_types::migration_gate::WriteAdmissionGuard;
+
 use crate::AppState;
 use crate::error::{AppError, AppResult};
 use crate::extract::AppJson as Json;
@@ -41,10 +43,14 @@ fn with_repo<T>(path: &Path, f: impl FnOnce(&Repository) -> AppResult<T>) -> App
     responses((status = 200, description = "初始化结果（幂等）", body = GitInitResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn init(
     State(state): State<AppState>,
+    admission: Extension<Option<WriteAdmissionGuard>>,
     Json(body): Json<GitWriteBody>,
 ) -> Result<Json<GitInitResult>, AppError> {
     let (path, log_id) = resolve_body(&state, &body).await?;
+    // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
+    let _admission = admission.0.as_ref().cloned();
     let already = tokio::task::spawn_blocking(move || {
+        let _hold = _admission;
         // init 幂等创建仓库 (含不存在的目录), 与其他 git 写操作共用工作区锁
         let _guard = git::workspace_lock::acquire(&path)?;
         git::init_repo_only(&path)
@@ -71,11 +77,17 @@ pub(crate) async fn init(
     responses((status = 200, description = "暂存结果", body = GitAddResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn add(
     State(state): State<AppState>,
+    admission: Extension<Option<WriteAdmissionGuard>>,
     Json(body): Json<FilesBody>,
 ) -> Result<Json<GitAddResult>, AppError> {
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let files = body.files.unwrap_or_default();
-    tokio::task::spawn_blocking(move || with_repo(&path, |repo| git::stage_files(repo, &files)))
+        // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
+    let _admission = admission.0.as_ref().cloned();
+    tokio::task::spawn_blocking(move || {
+        let _hold = _admission;
+        with_repo(&path, |repo| git::stage_files(repo, &files))
+    })
         .await
         .map_err(|e| AppError::system(format!("git join: {e}")))??;
     Ok(Json(GitAddResult {
@@ -92,6 +104,7 @@ pub(crate) async fn add(
     responses((status = 200, description = "提交结果（含 nothingToCommit 分支）", body = GitCommitResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn commit(
     State(state): State<AppState>,
+    admission: Extension<Option<WriteAdmissionGuard>>,
     Json(body): Json<CommitBody>,
 ) -> Result<Json<GitCommitResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
@@ -104,7 +117,10 @@ pub(crate) async fn commit(
     let ae = body
         .author_email
         .unwrap_or_else(|| state.config.git_default_author_email.clone());
+    // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
+    let _admission = admission.0.as_ref().cloned();
     let result = tokio::task::spawn_blocking(move || {
+        let _hold = _admission;
         with_repo(&path, |repo| {
             // 事务化 stage+commit (codex v4): 同一把 index.lock 内完成批量
             // 暂存、冲突拒绝、tree 比对与 CAS 发布; 不再 stage 后全工作区 status
@@ -137,13 +153,19 @@ pub(crate) async fn commit(
     responses((status = 200, description = "取消暂存结果（files 为 all 或路径数组）", body = GitUnstageResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn unstage(
     State(state): State<AppState>,
+    admission: Extension<Option<WriteAdmissionGuard>>,
     Json(body): Json<FilesBody>,
 ) -> Result<Json<GitUnstageResult>, AppError> {
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let files = body.files.unwrap_or_default();
     let all = files.is_empty();
     let files_echo = files.clone();
-    tokio::task::spawn_blocking(move || with_repo(&path, |repo| git::unstage_files(repo, &files)))
+        // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
+    let _admission = admission.0.as_ref().cloned();
+    tokio::task::spawn_blocking(move || {
+        let _hold = _admission;
+        with_repo(&path, |repo| git::unstage_files(repo, &files))
+    })
         .await
         .map_err(|e| AppError::system(format!("git join: {e}")))??;
     let (message, files_val) = if all {
@@ -172,11 +194,15 @@ pub(crate) async fn unstage(
     responses((status = 200, description = "丢弃结果分桶", body = DiscardResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn discard(
     State(state): State<AppState>,
+    admission: Extension<Option<WriteAdmissionGuard>>,
     Json(body): Json<FilesBody>,
 ) -> Result<Json<DiscardResult>, AppError> {
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let files = body.files.unwrap_or_default();
+    // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
+    let _admission = admission.0.as_ref().cloned();
     let buckets = tokio::task::spawn_blocking(move || {
+        let _hold = _admission;
         with_repo(&path, |repo| git::discard_files(repo, &files))
     })
     .await
@@ -204,6 +230,7 @@ pub(crate) async fn discard(
 #[utoipa::path(post, path = "/diff", request_body = DiffBody, responses((status = 200, description = "unified diff 与汇总", body = GitDiffResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn diff(
     State(state): State<AppState>,
+    admission: Extension<Option<WriteAdmissionGuard>>,
     Json(body): Json<DiffBody>,
 ) -> Result<Json<GitDiffResult>, AppError> {
     let (path, log_id) = resolve_body(&state, &body.base).await?;
@@ -217,7 +244,10 @@ pub(crate) async fn diff(
         max_total_bytes: state.config.git_diff_max_total_bytes,
         max_output_bytes: state.config.git_diff_max_output_bytes,
     };
+    // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
+    let _admission = admission.0.as_ref().cloned();
     let result = tokio::task::spawn_blocking(move || {
+        let _hold = _admission;
         with_repo(&path, |repo| git::compute_diff(repo, &params))
     })
     .await
@@ -251,6 +281,7 @@ pub(crate) async fn diff(
 #[utoipa::path(post, path = "/reset", request_body = ResetBody, responses((status = 200, description = "重置结果（含 previousHead）", body = GitResetResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn reset(
     State(state): State<AppState>,
+    admission: Extension<Option<WriteAdmissionGuard>>,
     Json(body): Json<ResetBody>,
 ) -> Result<Json<GitResetResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
@@ -260,7 +291,10 @@ pub(crate) async fn reset(
     let mode_label = mode.to_string();
     let author_name = state.config.git_default_author_name.clone();
     let author_email = state.config.git_default_author_email.clone();
+    // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
+    let _admission = admission.0.as_ref().cloned();
     let outcome = tokio::task::spawn_blocking(move || {
+        let _hold = _admission;
         with_repo(&path, |repo| {
             git::reset(repo, &target, mode, &author_name, &author_email)
         })
@@ -283,12 +317,18 @@ pub(crate) async fn reset(
 #[utoipa::path(post, path = "/checkout", request_body = TargetBody, responses((status = 200, description = "检出结果", body = GitCheckoutResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn checkout(
     State(state): State<AppState>,
+    admission: Extension<Option<WriteAdmissionGuard>>,
     Json(body): Json<TargetBody>,
 ) -> Result<Json<GitCheckoutResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let target = body.target.clone();
-    tokio::task::spawn_blocking(move || with_repo(&path, |repo| git::checkout_tree(repo, &target)))
+        // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
+    let _admission = admission.0.as_ref().cloned();
+    tokio::task::spawn_blocking(move || {
+        let _hold = _admission;
+        with_repo(&path, |repo| git::checkout_tree(repo, &target))
+    })
         .await
         .map_err(|e| AppError::system(format!("git join: {e}")))??;
     Ok(Json(GitCheckoutResult {
@@ -305,6 +345,7 @@ pub(crate) async fn checkout(
 #[utoipa::path(post, path = "/revert", request_body = RevertBody, responses((status = 200, description = "回退结果（含 nothingToCommit 分支）", body = GitRevertResult), crate::openapi::ErrorApiResponses), tag = "Git")]
 pub(crate) async fn revert(
     State(state): State<AppState>,
+    admission: Extension<Option<WriteAdmissionGuard>>,
     Json(body): Json<RevertBody>,
 ) -> Result<Json<GitRevertResult>, AppError> {
     body.validate().map_err(crate::error::from_garde)?;
@@ -317,7 +358,10 @@ pub(crate) async fn revert(
     let ae = body
         .author_email
         .unwrap_or_else(|| state.config.git_default_author_email.clone());
+    // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
+    let _admission = admission.0.as_ref().cloned();
     let outcome = tokio::task::spawn_blocking(move || {
+        let _hold = _admission;
         with_repo(&path, |repo| {
             git::revert_to_commit(repo, &target, message.as_deref(), &an, &ae)
         })
