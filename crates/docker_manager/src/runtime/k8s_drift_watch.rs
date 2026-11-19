@@ -79,8 +79,7 @@ pub(crate) fn spawn_drift_watch(
         let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
         let selector = format!("{APP_LABEL_PREFIX}/managed-by={APP_MANAGED_BY}");
         let watch_config = WatcherConfig::default().labels(&selector).timeout(290);
-        let stream = watcher(pods, watch_config);
-        let mut stream = Box::pin(stream);
+        let mut stream = Box::pin(watcher(pods, watch_config));
         loop {
             tokio::select! {
                 _ = shutdown.recv() => {
@@ -89,8 +88,13 @@ pub(crate) fn spawn_drift_watch(
                 }
                 event = stream.next() => {
                     let Some(event) = event else {
-                        tracing::warn!("[IMAGE_DRIFT_WATCH] watch stream ended; restarting");
+                        // stream 已终结：必须重建 watcher，否则 next() 永远返回
+                        // None 退化成告警空转。
+                        tracing::warn!("[IMAGE_DRIFT_WATCH] watch stream ended; rebuilding watcher");
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
+                        let rebuild = WatcherConfig::default().labels(&selector).timeout(290);
+                        stream = Box::pin(watcher(pods, rebuild));
                         continue;
                     };
                     let pod = match event {
@@ -204,8 +208,15 @@ async fn recover_drifted_app(
         );
         return Ok(());
     }
+    // 前置条件：带上读取到的 resourceVersion——并发用户操作（deploy/stop 的
+    // 模板写）与本次对齐互为 409 冲突，由冷却期抑制重试，不做 last-write-wins。
+    let resource_version = deployment
+        .metadata
+        .resource_version
+        .clone()
+        .unwrap_or_default();
     let patch = serde_json::json!({
-        "metadata": {"annotations": {
+        "metadata": {"resourceVersion": resource_version, "annotations": {
             "rcoder.io/image-drift-recovery": format!(
                 "auto epoch-{} platform {}",
                 std::time::SystemTime::now()
@@ -378,6 +389,10 @@ mod tests {
                         assert_eq!(
                             writes[0]["spec"]["template"]["spec"]["containers"][0]["image"],
                             "registry.test/app-runtime:0.1.456"
+                        );
+                        assert_eq!(
+                            writes[0]["metadata"]["resourceVersion"], "1",
+                            "对齐写必须携带读取时的 resourceVersion 前置条件"
                         );
                     }
                     "foreign" | "aligned" => {
