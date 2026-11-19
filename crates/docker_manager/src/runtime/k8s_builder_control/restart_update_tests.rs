@@ -248,7 +248,10 @@ async fn non_rollout_restart_freezes_existing_configuration() {
     );
     let state = state.lock().expect("state");
     let candidate = &state.puts[0]["spec"]["template"]["spec"];
-    assert_eq!(candidate["containers"][0]["image"], "paired-runtime:old-release");
+    assert_eq!(
+        candidate["containers"][0]["image"],
+        "paired-runtime:old-release"
+    );
     assert_eq!(candidate["serviceAccountName"], "test");
     assert_eq!(
         candidate["containers"][0]["resources"], legacy_resources,
@@ -609,5 +612,84 @@ async fn restart_applies_frozen_archive_resources_without_policy_catch_up() {
         "the frozen archive value wins; a later policy never rewrites it"
     );
     assert_eq!(resources["limits"]["memory"], "6Gi");
+    server.abort();
+}
+
+/// 外部仓库镜像的冷启动唤醒：归属守卫跳过滚动，保留模板原样扩容（spec
+/// sandbox-image-version-drift R1——仅平台管理镜像才对齐）。
+#[tokio::test]
+async fn foreign_agent_image_cold_wake_keeps_template_without_rolling() {
+    let (runtime, params, state, server) = resume_tests::fixture(None).await;
+    state.lock().expect("state").allow_writes = true;
+    state.lock().expect("state").sts["spec"]["template"]["spec"]["containers"][0]["image"] =
+        "custom.example/someone/agent:1".into();
+    {
+        let mut state = state.lock().expect("state");
+        state.sts["spec"]["replicas"] = 0.into();
+        state.sts["metadata"]["resourceVersion"] = "9".into();
+        state.pod = serde_json::Value::Null;
+    }
+    let mut target = captured(&runtime, &params).await;
+    target.restart_image = Some("paired-runtime:new".into());
+    let started = runtime
+        .start_builder_compute(&target)
+        .await
+        .expect("foreign cold wake")
+        .expect("ready");
+    assert_eq!(started.container_id, "pod-updated");
+    let state = state.lock().expect("state");
+    assert_eq!(
+        state.sts["spec"]["template"]["spec"]["containers"][0]["image"],
+        "custom.example/someone/agent:1",
+        "foreign template image must be retained on cold wake"
+    );
+    assert_eq!(state.sts["spec"]["replicas"], 1);
+    assert!(
+        !state
+            .patches
+            .iter()
+            .any(|patch| patch["spec"]["template"]["spec"]["containers"][0]
+                .get("image")
+                .is_some()),
+        "no write may roll the foreign image"
+    );
+    server.abort();
+}
+
+/// 外部仓库镜像的重启归档：平台配方不应用，候选保留原镜像与配置。
+#[tokio::test]
+async fn foreign_agent_image_restart_archive_keeps_original_configuration() {
+    let (runtime, params, state, server) = resume_tests::fixture(None).await;
+    state.lock().expect("state").allow_writes = true;
+    state.lock().expect("state").sts["spec"]["template"]["spec"]["containers"][0]["image"] =
+        "custom.example/someone/agent:1".into();
+    let mut source = captured(&runtime, &params).await;
+    source.restart_image = Some("paired-runtime:new".into());
+    let template = runtime
+        .archive_builder_restart(&source)
+        .await
+        .expect("archive")
+        .expect("template");
+    assert!(
+        runtime
+            .apply_builder_control(&source, false)
+            .await
+            .expect("stop")
+            .is_none()
+    );
+    let mut stopped = captured(&runtime, &params).await;
+    stopped.restart_image = source.restart_image.clone();
+    let restarted = runtime
+        .start_builder_control_with_restart(&stopped, &template)
+        .await
+        .expect("foreign archive restart")
+        .expect("ready");
+    assert_eq!(restarted.container_id, "pod-updated");
+    let state = state.lock().expect("state");
+    let candidate = &state.puts[0]["spec"]["template"]["spec"];
+    assert_eq!(
+        candidate["containers"][0]["image"], "custom.example/someone/agent:1",
+        "foreign original image must survive the restart archive"
+    );
     server.abort();
 }

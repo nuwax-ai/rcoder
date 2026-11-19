@@ -311,7 +311,7 @@ impl KubernetesRuntime {
             })?;
         if receipt.as_ref() != Some(&target.context)
             || current.metadata.deletion_timestamp.is_some()
-            || !statefulset_agent_image_matches(&current, target.restart_image.as_deref())
+            || !statefulset_agent_image_satisfies(&current, target.restart_image.as_deref())
             || !statefulset_agent_workspace_matches(
                 &current,
                 target.restart_runtime_workspace.as_deref(),
@@ -330,7 +330,7 @@ impl KubernetesRuntime {
         };
         if pod.metadata.deletion_timestamp.is_some()
             || !builder_agent_running(&pod)
-            || !pod_agent_image_matches(&pod, target.restart_image.as_deref())
+            || !pod_agent_image_satisfies(&pod, target.restart_image.as_deref())
             || !pod_agent_workspace_matches(&pod, target.restart_runtime_workspace.as_deref())
         {
             return Ok(None);
@@ -397,12 +397,12 @@ impl KubernetesRuntime {
         if after.metadata.uid != current.metadata.uid
             || after_receipt.as_ref() != Some(&target.context)
             || after.spec.as_ref().and_then(|spec| spec.replicas) != Some(1)
-            || !statefulset_agent_image_matches(&after, target.restart_image.as_deref())
+            || !statefulset_agent_image_satisfies(&after, target.restart_image.as_deref())
             || !statefulset_agent_workspace_matches(
                 &after,
                 target.restart_runtime_workspace.as_deref(),
             )
-            || !pod_agent_image_matches(&after_pod, target.restart_image.as_deref())
+            || !pod_agent_image_satisfies(&after_pod, target.restart_image.as_deref())
             || !pod_agent_workspace_matches(&after_pod, target.restart_runtime_workspace.as_deref())
         {
             return Ok(None);
@@ -1450,7 +1450,7 @@ impl KubernetesRuntime {
                                 "Builder pod changed between observation and verification".into(),
                             ));
                         }
-                        if !pod_agent_image_matches(&pod, target.restart_image.as_deref())
+                        if !pod_agent_image_satisfies(&pod, target.restart_image.as_deref())
                             || !pod_agent_workspace_matches(
                                 &pod,
                                 target.restart_runtime_workspace.as_deref(),
@@ -1479,7 +1479,7 @@ impl KubernetesRuntime {
                         // K02：同上——写后（wake/restart 的 scale 写入已发生）复核
                         // 冲突保持未知结果保护，不当作写前拒绝
                         .map_err(Error::Conflict)?;
-                        if !statefulset_agent_image_matches(
+                        if !statefulset_agent_image_satisfies(
                             &current,
                             target.restart_image.as_deref(),
                         ) || !statefulset_agent_workspace_matches(
