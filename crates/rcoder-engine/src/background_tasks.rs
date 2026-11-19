@@ -125,6 +125,9 @@ async fn spawn_single_instance_tasks(
     let userapp_recycle_handle = if config.userapp_recycle.enabled {
         let recycle_cfg = userapp_recycle::UserAppRecycleRuntimeConfig {
             idle_timeout: Duration::from_secs(config.userapp_recycle.idle_timeout_seconds),
+            never_accessed_timeout: Duration::from_secs(
+                config.userapp_recycle.never_accessed_timeout_seconds,
+            ),
             scan_interval: Duration::from_secs(config.userapp_recycle.scan_interval_seconds),
             protection: Duration::from_secs(config.userapp_recycle.protection_seconds),
         };

@@ -286,6 +286,15 @@ pub struct UserAppRecycleConfig {
     /// 新建 app 最小保护期（秒），默认 300；龄期小于此值不回收
     #[serde(default = "default_userapp_protection_seconds")]
     pub protection_seconds: u64,
+    /// 从未访问工作负载的弃置龄期（秒），默认 86400（24h）：健康运行但
+    /// 无任何访问记录超过该龄期即回收（app-184 反例；龄期不替代近期闲置
+    /// 证据，仅闭合从未访问的永久 grace）
+    #[serde(default = "default_userapp_never_accessed_timeout_seconds")]
+    pub never_accessed_timeout_seconds: u64,
+}
+
+fn default_userapp_never_accessed_timeout_seconds() -> u64 {
+    86400
 }
 
 fn default_userapp_recycle_enabled() -> bool {
@@ -347,6 +356,7 @@ impl Default for UserAppRecycleConfig {
             wake_timeout_seconds: default_userapp_wake_timeout_seconds(),
             dev_entry_wait_timeout_seconds: default_userapp_dev_entry_wait_timeout_seconds(),
             protection_seconds: default_userapp_protection_seconds(),
+            never_accessed_timeout_seconds: default_userapp_never_accessed_timeout_seconds(),
         }
     }
 }

@@ -101,6 +101,10 @@ pub fn load_config_with_args(cli_args: CliArgs) -> anyhow::Result<AppConfig> {
         "RCODER_USERAPP_PROTECTION_SECONDS",
         &mut config.userapp_recycle.protection_seconds,
     );
+    env_override_u64(
+        "RCODER_USERAPP_NEVER_ACCESSED_TIMEOUT_SECONDS",
+        &mut config.userapp_recycle.never_accessed_timeout_seconds,
+    );
     env_override_bool(
         "RCODER_USERAPP_IMAGE_DRIFT_INVENTORY_ENABLED",
         &mut config.userapp_image_drift.inventory_enabled,

@@ -29,6 +29,9 @@ mod expired_wake_scan_tests;
 pub(crate) struct UserAppRecycleRuntimeConfig {
     /// 闲置阈值(秒;per-app 注解可覆盖)
     pub idle_timeout: Duration,
+    /// 从未访问工作负载的弃置龄期(app-184 反例:健康 + 无任何访问记录
+    /// 不再永久 grace;默认 24h,取 max(protection) 兜底)。
+    pub never_accessed_timeout: Duration,
     /// 扫描间隔
     pub scan_interval: Duration,
     /// 新建 app 最小保护期(龄期小于此值不回收)
@@ -493,7 +496,14 @@ fn decide_recycle(input: &RecycleEvalInput, cfg: &UserAppRecycleRuntimeConfig) -
             {
                 duration
             }
-            _ => return RecycleDecision::Skip(SkipReason::NeverAccessed),
+            // 健康但从未访问:创建至今超过 never_accessed_timeout 视为弃置
+            // (spec sandbox-image-version-drift R3——app-184 五十六天挂 1
+            // 副本的反例)。龄期不是近期闲置的替代证据,只对"从未有任何
+            // 访问记录"的长龄工作负载生效;阈值远大于 protection/idle。
+            _ => match input.age {
+                Some(age) if age >= cfg.never_accessed_timeout.max(cfg.protection) => age,
+                _ => return RecycleDecision::Skip(SkipReason::NeverAccessed),
+            },
         },
     };
     if idle < threshold {
@@ -521,6 +531,9 @@ mod tests {
         UserAppRecycleRuntimeConfig {
             idle_timeout: Duration::from_secs(
                 crate::config::UserAppRecycleConfig::default().idle_timeout_seconds,
+            ),
+            never_accessed_timeout: Duration::from_secs(
+                crate::config::UserAppRecycleConfig::default().never_accessed_timeout_seconds,
             ),
             scan_interval: Duration::from_secs(3600),
             protection: Duration::from_secs(300),
@@ -613,6 +626,65 @@ mod tests {
             &cfg(),
         );
         assert_eq!(d, RecycleDecision::Skip(SkipReason::NeverAccessed));
+    }
+
+    // ---- 从未访问的有界弃置(app-184 反例;spec sandbox-image-version-drift R3) ----
+
+    #[test]
+    fn decide_recycles_never_accessed_beyond_abandon_age() {
+        // 健康运行 + 从无访问记录 + 龄期超过 never_accessed_timeout(24h) → 弃置回收
+        let d = decide_recycle(
+            &RecycleEvalInput {
+                replicas: 1,
+                ready_replicas: 1,
+                age: Some(Duration::from_secs(56 * 24 * 3600)),
+                idle: None,
+                ..Default::default()
+            },
+            &cfg(),
+        );
+        assert_eq!(d, RecycleDecision::Recycle);
+    }
+
+    #[test]
+    fn decide_keeps_never_accessed_within_abandon_age_and_unknown_age() {
+        // 龄期未到弃置线 → 保留既有 grace
+        let within = decide_recycle(
+            &RecycleEvalInput {
+                replicas: 1,
+                ready_replicas: 1,
+                age: Some(Duration::from_secs(3600)),
+                idle: None,
+                ..Default::default()
+            },
+            &cfg(),
+        );
+        assert_eq!(within, RecycleDecision::Skip(SkipReason::NeverAccessed));
+        // 龄期未知(无法判定) → 不凭空回收
+        let unknown = decide_recycle(
+            &RecycleEvalInput {
+                replicas: 1,
+                ready_replicas: 1,
+                age: None,
+                idle: None,
+                ..Default::default()
+            },
+            &cfg(),
+        );
+        assert_eq!(unknown, RecycleDecision::Skip(SkipReason::NeverAccessed));
+        // 弃置判定不越过付费 opt-out / 唤醒中前置闸门
+        let opted_out = decide_recycle(
+            &RecycleEvalInput {
+                replicas: 1,
+                ready_replicas: 1,
+                age: Some(Duration::from_secs(56 * 24 * 3600)),
+                idle: None,
+                recycle_enabled: Some(false),
+                ..Default::default()
+            },
+            &cfg(),
+        );
+        assert_eq!(opted_out, RecycleDecision::Skip(SkipReason::OptOut));
     }
 
     #[test]
