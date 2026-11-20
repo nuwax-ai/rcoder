@@ -70,6 +70,11 @@ pub async fn has_live_group_members(pid: u32) -> io::Result<bool> {
 }
 
 async fn observe(pid: u32, include_root: bool) -> io::Result<bool> {
+    // codex follow-up（2026-11-20）：before/after 漂移时 yield_now 热循环在
+    // macOS 上 1s 内可打 21 次 ps——探测持续漂移（僵尸 EPERM 等）时放大为
+    // 频率失控。加最小间隔与指数退避，超出内层重试预算按观察失败上抛
+    // （调用方保守按存活，但不再热转）。
+    let mut drift_retries = 0u32;
     loop {
         let before = probe(pid, include_root)?;
         if before == (Presence::Absent, Presence::Absent) {
@@ -89,7 +94,14 @@ async fn observe(pid: u32, include_root: bool) -> io::Result<bool> {
         // within the caller's same absolute deadline, never splice old live
         // state with a later permission response or invent a stable errno cause.
         if before != after {
-            tokio::task::yield_now().await;
+            drift_retries += 1;
+            if drift_retries > 8 {
+                return Err(io::Error::other(
+                    "observe execution states: probe kept drifting; retry budget exhausted",
+                ));
+            }
+            let backoff = std::time::Duration::from_millis(25 * (1 << drift_retries.min(5)));
+            tokio::time::sleep(backoff).await;
             continue;
         }
         let output = output?;

@@ -384,6 +384,9 @@ impl Drop for BusinessReadyGuard {
     }
 }
 
+/// owner 资源清理的连续失败预算（每次间隔 1s）：超限按未确认收尾。
+const OWNER_CLEANUP_RETRY_LIMIT: u32 = 8;
+
 pub struct OwnerSession {
     core: Arc<SessionCore>,
     _owner: Owner,
@@ -510,6 +513,7 @@ impl OwnerSession {
             preparing: None,
             owner_cleanup_task: None,
             next_owner_cleanup: tokio::time::Instant::now(),
+            owner_cleanup_failures: 0,
         };
         Ok(Self {
             core,
@@ -817,6 +821,11 @@ struct RunState {
     preparing: Option<PreparingStop>,
     owner_cleanup_task: Option<AbortOnDrop<Result<()>>>,
     next_owner_cleanup: tokio::time::Instant,
+    /// owner 资源清理的连续失败计数（成功即清零）。超过
+    /// [`OWNER_CLEANUP_RETRY_LIMIT`] 后放弃重试，按未确认收尾——避免
+    /// ENOENT 等确定性失败让 owner 永不退出、锁永不释放（codex follow-up
+    /// 2026-11-20：测试夹具目录被析构后 owner 在已删路径上无限重试）。
+    owner_cleanup_failures: u32,
 }
 
 struct PreparingStop {
@@ -928,7 +937,10 @@ impl RunState {
                 .context("owner cleanup task failed")
                 .and_then(|result| result);
             return match result {
-                Ok(()) => Ok(true),
+                Ok(()) => {
+                    self.owner_cleanup_failures = 0;
+                    Ok(true)
+                }
                 Err(error) => {
                     self.core.with_discovery(|discovery| {
                         discovery.snapshot.phase = Phase::RecoveryRequired;
@@ -940,14 +952,20 @@ impl RunState {
                         });
                         Ok(())
                     })?;
-                    if self.shutdown.is_cancelled() {
+                    self.owner_cleanup_failures += 1;
+                    if self.shutdown.is_cancelled()
+                        || self.owner_cleanup_failures >= OWNER_CLEANUP_RETRY_LIMIT
+                    {
                         // While the process itself is exiting (outer container
                         // teardown), retrying the owner-resource adapter is
                         // deterministically futile: the unconfirmed record is
                         // already written above; let the shutdown exit proceed
                         // instead of re-arming the one-second retry forever.
+                        // 确定性失败（如状态目录已删除后的 ENOENT）同理——
+                        // 超出重试预算即按未确认收尾，owner 必须可退出。
                         tracing::warn!(
-                            "owner resource cleanup abandoned during process shutdown; outcome stays unconfirmed"
+                            failures = self.owner_cleanup_failures,
+                            "owner resource cleanup abandoned; outcome stays unconfirmed"
                         );
                         self.owner_cleanup_abandoned = true;
                         return Ok(true);
