@@ -51,10 +51,12 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Rust 工具链已由 rust:trixie 镜像提供 (cargo 在 /usr/local/cargo/bin, CARGO_HOME=/usr/local/cargo, 已在 PATH)。
-# builder 阶段 cargo 镜像 (rsproxy-sparse) 写到 /usr/local/cargo/config.toml 生效
+# builder 阶段 cargo 镜像写到 /usr/local/cargo/config.toml 生效
 # (仓库根 .cargo/config.toml 为空, 故用 printf 内联生成, 不污染宿主)
+# 2026-11-20: rsproxy-sparse 下载端持续故障（bulk 下载 "transfer too slow" 三次
+# 均在不同 crate 失败，单请求可达=限流），换 USTC sparse（实测 200/0.12s）。
 RUN mkdir -p /usr/local/cargo && \
-    printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"\n' \
+    printf '[source.crates-io]\nreplace-with = "ustc"\n[source.ustc]\nregistry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"\n' \
     > /usr/local/cargo/config.toml
 
 # 复制整个项目源代码（通过 .dockerignore 排除不需要的文件）
