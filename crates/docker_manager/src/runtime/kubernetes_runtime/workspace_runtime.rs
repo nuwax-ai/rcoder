@@ -560,16 +560,16 @@ pub(crate) async fn reconcile_migration_marker(
     expected_pvc_uid: Option<&str>,
 ) -> MarkerReconciliation {
     use crate::runtime::k8s_pvc::K8sPvcOps;
+    // 对账身份检查先行（第十二轮 P1 + 终审 P3：None 时那次 GET 读不读都
+    // invalidate，先检查省一次浪费请求；None 不得降级为按名验真）。
+    let Some(expected) = expected_pvc_uid else {
+        return MarkerReconciliation::invalidate(cache_key, &cache).await;
+    };
     let pvcs: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
         kube::Api::namespaced(client, namespace);
     let pvc = match pvcs.get(pvc_name).await {
         Ok(pvc) => pvc,
         Err(_) => return MarkerReconciliation::invalidate(cache_key, &cache).await,
-    };
-    // 对账身份必须存在且匹配（第十二轮 P1：None 不得降级为按名验真——
-    // 前置读失败时同名新 PVC 的 migrated 不是本操作的证据）。
-    let Some(expected) = expected_pvc_uid else {
-        return MarkerReconciliation::invalidate(cache_key, &cache).await;
     };
     if pvc.metadata.uid.as_deref() != Some(expected) {
         return MarkerReconciliation::invalidate(cache_key, &cache).await;

@@ -146,10 +146,18 @@ impl KubernetesRuntime {
                     // 永久冻结的变体）。已派发但结果未知的 K8s 写由 ensure 幂等
                     // + 四象限重探测天然对账。
                     // begin_guarded 返回 Option（同用户已有门禁时 None——
-                    // 旧后台任务仍在切换中，重试请求走共享路径放弃本次编排，
-                    // 不得并发做 fresh-init 决策，第十二轮 P1）。
-                    let mut migration_gate =
-                        shared_types::migration_gate::begin_guarded(identifier);
+                    // 旧后台任务仍在切换中，重试请求**立即走共享路径**放弃
+                    // 本编排（终审 P1：此前未短路，take() 得 None 后静默跳过
+                    // marker PATCH 但卷已建、决策返回 true → agent RBD 形态
+                    // 而无 Migrated 标 → 路由落共享卷，agent/数据面分裂）。
+                    let mut migration_gate = shared_types::migration_gate::begin_guarded(identifier);
+                    if migration_gate.is_none() {
+                        // 共享路径：不做 RBD 决策（fresh-init 编排整体放弃）。
+                        info!(
+                            "[K8S] '{identifier}' stays on shared volume this round"
+                        );
+                        false
+                    } else {
                     let drain_left = shared_types::migration_gate::drain_user_writes(
                         identifier,
                         std::time::Duration::from_secs(10),
@@ -222,6 +230,7 @@ impl KubernetesRuntime {
                     // 两条成功路径（新建/续接）的建卷+翻标记都发生在门禁内——
                     // 与文件写路由串行化。
                     fresh_init_decision
+                    }
                 }
             }
         } else {
