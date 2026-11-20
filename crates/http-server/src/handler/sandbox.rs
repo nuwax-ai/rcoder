@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::router::sandbox::SandboxDeps;
 use rcoder_engine::service::sandbox_manager::{CreateOutcome, SandboxApiError, SandboxManager};
 
-fn wire_error(error: SandboxApiError) -> Response {
+fn wire_error(error: SandboxApiError, locale: &str) -> Response {
     let status = match &error {
         SandboxApiError::Unauthorized => StatusCode::UNAUTHORIZED,
         SandboxApiError::NotFound(_) => StatusCode::NOT_FOUND,
@@ -26,7 +26,10 @@ fn wire_error(error: SandboxApiError) -> Response {
     let message = match &error {
         SandboxApiError::Unavailable(reason) => {
             tracing::warn!(error = %reason, "e2b sandbox 5xx（细节已隐藏）");
-            "服务暂不可用，请稍后重试".to_string()
+            shared_types::error_codes::get_error_message(
+                shared_types::error_codes::ERR_SERVICE_UNAVAILABLE,
+                locale,
+            )
         }
         other => other.to_string(),
     };
@@ -136,9 +139,17 @@ fn domain_of(manager: &SandboxManager) -> String {
 // Err 载荷是 axum Response（≥128 字节）：handler 内以 Result<_, Response> 表达
 // 短路响应是 axum 惯用形态，装箱会扩散到所有调用点。
 #[allow(clippy::result_large_err)]
-async fn manager_of(deps: &SandboxDeps) -> Result<Arc<SandboxManager>, Response> {
+async fn manager_of(deps: &SandboxDeps, locale: &str) -> Result<Arc<SandboxManager>, Response> {
     deps.manager()
-        .ok_or_else(|| wire_error(SandboxApiError::Unavailable("e2b sandbox 未启用".into())))
+        .ok_or_else(|| {
+            wire_error(
+                SandboxApiError::Unavailable(shared_types::error_codes::get_error_message(
+                    shared_types::error_codes::ERR_E2B_NOT_ENABLED,
+                    locale,
+                )),
+                locale,
+            )
+        })
 }
 
 pub async fn create_sandbox(
@@ -147,13 +158,23 @@ pub async fn create_sandbox(
     headers: axum::http::HeaderMap,
     axum::Json(body): axum::Json<CreateSandboxBody>,
 ) -> Response {
-    let manager = match manager_of(&deps).await {
+    let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+    let manager = match manager_of(&deps, locale).await {
         Ok(manager) => manager,
         Err(response) => return response,
     };
     let template = match body.template.clone().or_else(|| Some("base".to_string())) {
         Some(template) if !template.is_empty() => template,
-        _ => return wire_error(SandboxApiError::Invalid("template 必填".into())),
+        _ => {
+            let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+            return wire_error(
+                SandboxApiError::Invalid(shared_types::error_codes::get_error_message(
+                    shared_types::error_codes::ERR_E2B_TEMPLATE_REQUIRED,
+                    locale,
+                )),
+                locale,
+            );
+        }
     };
     let mut env = Vec::new();
     if let Some(map) = &body.envVars {
@@ -229,16 +250,21 @@ pub async fn create_sandbox(
             );
             (StatusCode::OK, axum::Json(wire)).into_response()
         }
-        Err(error) => wire_error(error),
+        Err(error) => {
+            let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+            wire_error(error, locale)
+        },
     }
 }
 
 pub async fn get_sandbox(
     State(deps): State<SandboxDeps>,
     Extension(key): Extension<SandboxApiKeyRecord>,
+    headers: axum::http::HeaderMap,
     Path(sandbox_id): Path<String>,
 ) -> Response {
-    let manager = match manager_of(&deps).await {
+    let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+    let manager = match manager_of(&deps, locale).await {
         Ok(manager) => manager,
         Err(response) => return response,
     };
@@ -247,23 +273,31 @@ pub async fn get_sandbox(
             let wire = detail_wire(&manager, &record, &domain_of(&manager));
             (StatusCode::OK, axum::Json(wire)).into_response()
         }
-        Err(error) => wire_error(error),
+        Err(error) => {
+            let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+            wire_error(error, locale)
+        },
     }
 }
 
 pub async fn list_sandboxes(
     State(deps): State<SandboxDeps>,
     Extension(key): Extension<SandboxApiKeyRecord>,
+    headers: axum::http::HeaderMap,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Response {
-    let manager = match manager_of(&deps).await {
+    let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+    let manager = match manager_of(&deps, locale).await {
         Ok(manager) => manager,
         Err(response) => return response,
     };
     // M1: 无过滤参数；游标经 x-next-token 请求头（edvabe 同款）。
     let records = match manager.list(&key, None, 100).await {
         Ok(records) => records,
-        Err(error) => return wire_error(error),
+        Err(error) => {
+            let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+            return wire_error(error, locale);
+        },
     };
     let domain = domain_of(&manager);
     let items: Vec<serde_json::Value> = records
@@ -283,15 +317,20 @@ pub async fn list_sandboxes(
 pub async fn kill_sandbox(
     State(deps): State<SandboxDeps>,
     Extension(key): Extension<SandboxApiKeyRecord>,
+    headers: axum::http::HeaderMap,
     Path(sandbox_id): Path<String>,
 ) -> Response {
-    let manager = match manager_of(&deps).await {
+    let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+    let manager = match manager_of(&deps, locale).await {
         Ok(manager) => manager,
         Err(response) => return response,
     };
     match manager.kill(&key, &sandbox_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => wire_error(error),
+        Err(error) => {
+            let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+            wire_error(error, locale)
+        },
     }
 }
 
@@ -303,25 +342,32 @@ pub struct TimeoutBody {
 pub async fn set_timeout(
     State(deps): State<SandboxDeps>,
     Extension(key): Extension<SandboxApiKeyRecord>,
+    headers: axum::http::HeaderMap,
     Path(sandbox_id): Path<String>,
     axum::Json(body): axum::Json<TimeoutBody>,
 ) -> Response {
-    let manager = match manager_of(&deps).await {
+    let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+    let manager = match manager_of(&deps, locale).await {
         Ok(manager) => manager,
         Err(response) => return response,
     };
     match manager.set_timeout(&key, &sandbox_id, body.timeout).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => wire_error(error),
+        Err(error) => {
+            let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+            wire_error(error, locale)
+        },
     }
 }
 
 pub async fn connect_sandbox(
     State(deps): State<SandboxDeps>,
     Extension(key): Extension<SandboxApiKeyRecord>,
+    headers: axum::http::HeaderMap,
     Path(sandbox_id): Path<String>,
 ) -> Response {
-    let manager = match manager_of(&deps).await {
+    let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+    let manager = match manager_of(&deps, locale).await {
         Ok(manager) => manager,
         Err(response) => return response,
     };
@@ -330,16 +376,30 @@ pub async fn connect_sandbox(
             let wire = detail_wire(&manager, &record, &domain_of(&manager));
             (StatusCode::OK, axum::Json(wire)).into_response()
         }
-        Ok(_) => wire_error(SandboxApiError::Invalid("sandbox 非 Ready".into())),
-        Err(error) => wire_error(error),
+        Ok(_) => {
+            let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+            wire_error(
+                SandboxApiError::Invalid(shared_types::error_codes::get_error_message(
+                    shared_types::error_codes::ERR_E2B_NOT_READY,
+                    locale,
+                )),
+                locale,
+            )
+        }
+        Err(error) => {
+            let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+            wire_error(error, locale)
+        }
     }
 }
 
 pub async fn list_templates(
     State(deps): State<SandboxDeps>,
     Extension(_key): Extension<SandboxApiKeyRecord>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
-    let manager = match manager_of(&deps).await {
+    let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+    let manager = match manager_of(&deps, locale).await {
         Ok(manager) => manager,
         Err(response) => return response,
     };
@@ -358,12 +418,22 @@ pub async fn list_templates(
             )),
         )
             .into_response(),
-        Err(error) => wire_error(error),
+        Err(error) => {
+            let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+            wire_error(error, locale)
+        },
     }
 }
 
-pub async fn not_supported(Extension(_key): Extension<SandboxApiKeyRecord>) -> Response {
-    wire_error(SandboxApiError::NotSupported("e2b sandbox M1 不支持该能力"))
+pub async fn not_supported(
+    Extension(_key): Extension<SandboxApiKeyRecord>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+    wire_error(
+        SandboxApiError::NotSupported("e2b sandbox M1 does not support this capability"),
+        locale,
+    )
 }
 
 // ---------- Volume handlers（M5） ----------
@@ -394,9 +464,11 @@ pub struct VolumeWire {
 pub async fn create_volume(
     State(deps): State<SandboxDeps>,
     Extension(key): Extension<SandboxApiKeyRecord>,
+    headers: axum::http::HeaderMap,
     axum::Json(body): axum::Json<CreateVolumeBody>,
 ) -> Response {
-    let manager = match manager_of(&deps).await {
+    let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+    let manager = match manager_of(&deps, locale).await {
         Ok(manager) => manager,
         Err(response) => return response,
     };
@@ -410,15 +482,20 @@ pub async fn create_volume(
             };
             (StatusCode::CREATED, axum::Json(wire)).into_response()
         }
-        Err(error) => wire_error(error),
+        Err(error) => {
+            let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+            wire_error(error, locale)
+        },
     }
 }
 
 pub async fn list_volumes(
     State(deps): State<SandboxDeps>,
     Extension(key): Extension<SandboxApiKeyRecord>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
-    let manager = match manager_of(&deps).await {
+    let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+    let manager = match manager_of(&deps, locale).await {
         Ok(manager) => manager,
         Err(response) => return response,
     };
@@ -435,7 +512,10 @@ pub async fn list_volumes(
                 .collect();
             (StatusCode::OK, axum::Json(items)).into_response()
         }
-        Err(error) => wire_error(error),
+        Err(error) => {
+            let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+            wire_error(error, locale)
+        },
     }
 }
 
@@ -443,13 +523,18 @@ pub async fn delete_volume(
     State(deps): State<SandboxDeps>,
     Extension(key): Extension<SandboxApiKeyRecord>,
     Path(volume_id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
-    let manager = match manager_of(&deps).await {
+    let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+    let manager = match manager_of(&deps, locale).await {
         Ok(manager) => manager,
         Err(response) => return response,
     };
     match manager.delete_volume(&key, &volume_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => wire_error(error),
+        Err(error) => {
+            let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
+            wire_error(error, locale)
+        },
     }
 }

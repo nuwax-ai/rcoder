@@ -40,7 +40,7 @@ pub async fn pod_ensure(
     ) {
         Ok(AppTarget::NotApp) => {}
         Ok(AppTarget::Dev(app_id)) => {
-            return ensure_userapp_dev(&state, app_id, request.user_id.as_str()).await;
+            return ensure_userapp_dev(&state, locale, app_id, request.user_id.as_str()).await;
         }
         Ok(AppTarget::Prod(app_id)) => {
             return ensure_userapp_prod(&state, locale, app_id, request.user_id.as_str()).await;
@@ -205,9 +205,11 @@ pub(super) async fn ensure_ordinary_pod_with_admission(
 /// created 由探活版判定（复用=false / 重建或新建=true）。
 async fn ensure_userapp_dev(
     state: &Arc<AppState>,
+    locale: &str,
     app_id: String,
     _user_id: &str,
 ) -> Result<axum::response::Response, AppError> {
+    let msg = |code: &str| shared_types::error_codes::get_error_message(code, locale);
     match crate::userapp_builder::inspect_builder_compute(state, &app_id)
         .await
         .map_err(|error| crate::userapp_builder::control_error(&error))?
@@ -219,7 +221,7 @@ async fn ensure_userapp_dev(
                     container_id: info.container_id,
                     status: info.status,
                 },
-                message: "UserApp dev 计算容器正在运行；业务服务状态请单独查询".into(),
+                message: msg(shared_types::error_codes::ERR_USERAPP_BUILDER_RUNNING).into(),
             })
             .into_response());
         }
@@ -256,7 +258,7 @@ async fn ensure_userapp_dev(
                     container_id: info.container_id,
                     status: info.status,
                 },
-                message: "UserApp dev 计算容器已使用原工作区重建".into(),
+                message: msg(shared_types::error_codes::ERR_USERAPP_BUILDER_REBUILT).into(),
             })
             .into_response());
         }
@@ -278,7 +280,7 @@ async fn ensure_userapp_dev(
             container_id: info.container_id.clone(),
             status: info.status.clone(),
         },
-        message: "Userapp dev 容器已就绪（虚拟终端/文件服务经反向代理访问）".to_string(),
+        message: msg(shared_types::error_codes::ERR_USERAPP_BUILDER_READY).to_string(),
     })
     .into_response())
 }
@@ -342,7 +344,11 @@ async fn ensure_userapp_prod(
                 container_id: app_id,
                 status: runtime.phase,
             },
-            message: "UserApp prod 计算资源已请求运行；业务服务状态请单独查询".into(),
+            message: shared_types::error_codes::get_error_message(
+                shared_types::error_codes::ERR_USERAPP_PROD_REQUESTED,
+                locale,
+            )
+            .into(),
         })
         .into_response());
     }
@@ -541,7 +547,11 @@ async fn ensure_userapp_prod_created(
                     container_id: app_id.clone(),
                     status: format!("{:?}", result.runtime.status),
                 },
-                message: "Userapp 生产容器已预创建（应用未部署，PG/终端服务可用）".to_string(),
+                message: shared_types::error_codes::get_error_message(
+                    shared_types::error_codes::ERR_USERAPP_PROD_PRECREATED,
+                    locale,
+                )
+                .to_string(),
             }))
         }
         Err(e) => {

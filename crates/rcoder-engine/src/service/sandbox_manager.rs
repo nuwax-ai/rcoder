@@ -267,7 +267,7 @@ impl SandboxManager {
         )
         .map_err(|error| SandboxApiError::Unavailable(format!("token b64: {error}")))?;
         if packed.len() < 12 {
-            return Err(SandboxApiError::Unavailable("token 密文损坏".into()));
+            return Err(SandboxApiError::Unavailable("token ciphertext is corrupted".into()));
         }
         let (nonce_bytes, ciphertext) = packed.split_at(12);
         self.cipher
@@ -302,7 +302,7 @@ impl SandboxManager {
                     })
                 }
                 state => Err(SandboxApiError::Conflict(format!(
-                    "同幂等键的沙箱正在{state:?}，请稍后重试"
+                    "a sandbox with the same idempotency key is in state {state:?}; retry later"
                 ))),
             };
         }
@@ -322,16 +322,21 @@ impl SandboxManager {
             .await
             .map_err(store_error)?
             .ok_or_else(|| {
-                SandboxApiError::Invalid(format!("template {} 不可用", params.template_id))
+                SandboxApiError::Invalid(format!(
+                    "template {} is unavailable",
+                    params.template_id
+                ))
             })?;
         let ttl_seconds = params.timeout_seconds.unwrap_or(self.default_ttl_seconds);
         if ttl_seconds <= 0 {
-            return Err(SandboxApiError::Invalid("timeout 必须为正数秒".into()));
+            return Err(SandboxApiError::Invalid(
+                "timeout must be a positive number of seconds".into(),
+            ));
         }
         let ttl_cap = self.max_ttl_seconds.min(spec.ttl_max_seconds);
         if ttl_seconds > ttl_cap {
             return Err(SandboxApiError::Invalid(format!(
-                "timeout {ttl_seconds}s 超过上限 {ttl_cap}s"
+                "timeout {ttl_seconds}s exceeds the maximum {ttl_cap}s"
             )));
         }
 
@@ -383,12 +388,12 @@ impl SandboxManager {
         for mount in &params.volume_mounts {
             if !mount.mount_path.starts_with('/') {
                 return Err(SandboxApiError::Invalid(format!(
-                    "mountPath \"{}\" 必须以 / 开头",
+                    "mountPath \"{}\" must start with /",
                     mount.mount_path
                 )));
             }
             if mount.mount_path.contains("..") {
-                return Err(SandboxApiError::Invalid("mountPath 不允许路径穿越".into()));
+                return Err(SandboxApiError::Invalid("mountPath must not contain path traversal".into()));
             }
             const SENSITIVE: &[&str] = &["/proc", "/sys", "/dev", "/etc", "/var/run", "/run"];
             if SENSITIVE
@@ -396,7 +401,7 @@ impl SandboxManager {
                 .any(|p| mount.mount_path == *p || mount.mount_path.starts_with(&format!("{}/", p)))
             {
                 return Err(SandboxApiError::Invalid(format!(
-                    "mountPath \"{}\" 不允许挂载系统路径",
+                    "mountPath \"{}\" must not mount a system path",
                     mount.mount_path
                 )));
             }
@@ -406,7 +411,7 @@ impl SandboxManager {
                 .await
                 .map_err(store_error)?
                 .ok_or_else(|| {
-                    SandboxApiError::Invalid(format!("volume \"{}\" 不存在", mount.volume_name))
+                    SandboxApiError::Invalid(format!("volume \"{}\" does not exist", mount.volume_name))
                 })?;
             resolved_volume_mounts.push((volume.pvc_name.clone(), mount.mount_path.clone()));
         }
@@ -436,7 +441,7 @@ impl SandboxManager {
                         });
                     }
                     return Err(SandboxApiError::Conflict(format!(
-                        "同幂等键的沙箱正在{:?}，请稍后重试",
+                        "a sandbox with the same idempotency key is in state {:?}; retry later",
                         existing.desired_state
                     )));
                 }
@@ -938,10 +943,12 @@ impl SandboxManager {
     ) -> Result<(), SandboxApiError> {
         let record = self.get(key, sandbox_id).await?;
         if record.desired_state != SandboxInstanceState::Ready {
-            return Err(SandboxApiError::Invalid("仅 Ready 状态可续期".into()));
+            return Err(SandboxApiError::Invalid("only a Ready sandbox can be renewed".into()));
         }
         if timeout_seconds <= 0 {
-            return Err(SandboxApiError::Invalid("timeout 必须为正数秒".into()));
+            return Err(SandboxApiError::Invalid(
+                "timeout must be a positive number of seconds".into(),
+            ));
         }
         let spec_cap = self.max_ttl_seconds.min(
             self.store
@@ -983,7 +990,7 @@ impl SandboxManager {
                         .map_err(store_error)?
                         .ok_or_else(|| SandboxApiError::NotFound(sandbox_id.to_string()))?;
                     if record.desired_state != SandboxInstanceState::Ready {
-                        return Err(SandboxApiError::Invalid("沙箱已不在 Ready 状态".into()));
+                        return Err(SandboxApiError::Invalid("sandbox is no longer in Ready state".into()));
                     }
                     continue;
                 }
@@ -1155,12 +1162,14 @@ impl SandboxManager {
         };
         let ttl_seconds = params.timeout_seconds.unwrap_or(self.default_ttl_seconds);
         if ttl_seconds <= 0 {
-            return Err(SandboxApiError::Invalid("timeout 必须为正数秒".into()));
+            return Err(SandboxApiError::Invalid(
+                "timeout must be a positive number of seconds".into(),
+            ));
         }
         let ttl_cap = self.max_ttl_seconds.min(spec.ttl_max_seconds);
         if ttl_seconds > ttl_cap {
             return Err(SandboxApiError::Invalid(format!(
-                "timeout {ttl_seconds}s 超过上限 {ttl_cap}s"
+                "timeout {ttl_seconds}s exceeds the maximum {ttl_cap}s"
             )));
         }
 

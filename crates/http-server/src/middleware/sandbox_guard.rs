@@ -105,7 +105,10 @@ fn proxy_client() -> &'static reqwest::Client {
     })
 }
 
-fn error_response(status: StatusCode, message: &str) -> Response {
+/// 数据面错误响应：message 按错误码 + Accept-Language 解析（默认 en-US，
+/// 见 shared_types_i18n）。HTTP 状态语义码保持 status，避免破坏既有客户端。
+fn error_response(status: StatusCode, code: &str, locale: &str) -> Response {
+    let message = shared_types::error_codes::get_error_message(code, locale);
     (
         status,
         axum::Json(serde_json::json!({ "code": status.as_u16(), "message": message })),
@@ -150,30 +153,42 @@ pub async fn e2b_data_plane_guard(
     let Some((sandbox_id, port, rest)) = resolve_target(request.uri(), request.headers()) else {
         return next.run(request).await;
     };
+    let locale = crate::handler::utils::locale::get_locale_from_headers(request.headers());
     let Some(manager) = deps.manager() else {
-        return error_response(StatusCode::NOT_FOUND, "e2b sandbox 未启用");
+        return error_response(StatusCode::NOT_FOUND, shared_types::error_codes::ERR_E2B_NOT_ENABLED, locale);
     };
     if !deps.allowed_ports.contains(&port) {
         return error_response(
             StatusCode::FORBIDDEN,
-            &format!("端口 {port} 不在白名单（allowed_ports）"),
+            shared_types::error_codes::ERR_E2B_PORT_NOT_ALLOWED,
+            locale,
         );
     }
     let token = access_token(request.headers(), request.uri());
     let record = match manager.authorize_data_plane(&sandbox_id, &token).await {
         Ok(record) => record,
         Err(_) => {
-            return error_response(StatusCode::UNAUTHORIZED, "沙箱不存在、已到期或 token 无效");
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                shared_types::error_codes::ERR_E2B_SANDBOX_UNAVAILABLE,
+                locale,
+            );
         }
     };
     let pod_ip = match manager.pod_ip(&record).await {
         Ok(ip) => ip,
-        Err(_) => return error_response(StatusCode::NOT_FOUND, "沙箱 Pod 不可达"),
+        Err(_) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                shared_types::error_codes::ERR_E2B_POD_UNREACHABLE,
+                locale,
+            );
+        }
     };
     let target = format!("{pod_ip}:{port}");
 
     if is_websocket_upgrade(request.headers()) {
-        return websocket_tunnel(request, &target, &rest, &token).await;
+        return websocket_tunnel(request, &target, &rest, &token, locale).await;
     }
 
     let (parts, body) = request.into_parts();
@@ -209,7 +224,11 @@ pub async fn e2b_data_plane_guard(
         Ok(response) => response,
         Err(error) => {
             tracing::warn!(sandbox_id = %sandbox_id, error = %error, "e2b 数据面代理失败");
-            return error_response(StatusCode::BAD_GATEWAY, "沙箱数据面不可达");
+            return error_response(
+            StatusCode::BAD_GATEWAY,
+            shared_types::error_codes::ERR_E2B_DATA_PLANE_UNREACHABLE,
+            locale,
+        );
         }
     };
     let status =
@@ -231,7 +250,11 @@ pub async fn e2b_data_plane_guard(
         .map(|chunk| chunk.map_err(std::io::Error::other));
     match builder.body(Body::from_stream(byte_stream)) {
         Ok(response) => response,
-        Err(_) => error_response(StatusCode::BAD_GATEWAY, "代理响应构造失败"),
+        Err(_) => error_response(
+            StatusCode::BAD_GATEWAY,
+            shared_types::error_codes::ERR_PROXY_RESPONSE_FAILED,
+            locale,
+        ),
     }
 }
 
@@ -247,6 +270,7 @@ async fn websocket_tunnel(
     target: &str,
     rest: &str,
     token: &str,
+    locale: &str,
 ) -> Response {
     use tokio::io::AsyncWriteExt;
 
@@ -268,23 +292,43 @@ async fn websocket_tunnel(
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) => {
             tracing::warn!(target = %target, error = %error, "e2b ws 隧道连接沙箱失败");
-            return error_response(StatusCode::BAD_GATEWAY, "沙箱 WS 上游不可达");
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                shared_types::error_codes::ERR_E2B_WS_UPSTREAM_UNREACHABLE,
+                locale,
+            );
         }
         Err(_) => {
-            return error_response(StatusCode::GATEWAY_TIMEOUT, "沙箱 WS 上游连接超时");
+            return error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                shared_types::error_codes::ERR_E2B_WS_UPSTREAM_TIMEOUT,
+                locale,
+            );
         }
     };
     if let Err(error) = upstream.write_all(&handshake).await {
         tracing::warn!(target = %target, error = %error, "e2b ws 隧道写握手失败");
-        return error_response(StatusCode::BAD_GATEWAY, "沙箱 WS 上游不可达");
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            shared_types::error_codes::ERR_E2B_WS_UPSTREAM_UNREACHABLE,
+            locale,
+        );
     }
     let head = match tokio::time::timeout(HEAD_TIMEOUT, read_response_head(&mut upstream)).await {
         Ok(Ok(Some(head))) => head,
         Ok(Ok(None)) | Ok(Err(_)) => {
-            return error_response(StatusCode::BAD_GATEWAY, "沙箱 WS 上游握手响应畸形");
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                shared_types::error_codes::ERR_E2B_WS_UPSTREAM_HANDSHAKE,
+                locale,
+            );
         }
         Err(_) => {
-            return error_response(StatusCode::GATEWAY_TIMEOUT, "沙箱 WS 上游握手超时");
+            return error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                shared_types::error_codes::ERR_E2B_WS_UPSTREAM_TIMEOUT,
+                locale,
+            );
         }
     };
 
@@ -329,9 +373,17 @@ async fn websocket_tunnel(
         return match body {
             Some(bytes) => match builder.body(Body::from(bytes)) {
                 Ok(response) => response,
-                Err(_) => error_response(StatusCode::BAD_GATEWAY, "代理响应构造失败"),
+                Err(_) => error_response(
+                    StatusCode::BAD_GATEWAY,
+                    shared_types::error_codes::ERR_PROXY_RESPONSE_FAILED,
+                    locale,
+                ),
             },
-            None => error_response(StatusCode::BAD_GATEWAY, "上游错误响应体读取失败"),
+            None => error_response(
+                StatusCode::BAD_GATEWAY,
+                shared_types::error_codes::ERR_PROXY_RESPONSE_FAILED,
+                locale,
+            ),
         };
     }
 
