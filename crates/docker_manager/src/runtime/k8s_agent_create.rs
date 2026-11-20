@@ -148,16 +148,21 @@ impl KubernetesRuntime {
                     // 永久冻结的变体）。已派发但结果未知的 K8s 写由 ensure 幂等
                     // + 四象限重探测天然对账。
                     // begin_guarded 返回 Option（同用户已有门禁时 None——
-                    // 旧后台任务仍在切换中，重试请求**立即走共享路径**放弃
-                    // 本编排（终审 P1：此前未短路，take() 得 None 后静默跳过
-                    // marker PATCH 但卷已建、决策返回 true → agent RBD 形态
-                    // 而无 Migrated 标 → 路由落共享卷，agent/数据面分裂）。
+                    // 旧后台任务仍在切换中；重试请求返回可重试错误，等门禁
+                    // 释放后按真实标记重新判定卷。历史：曾"立即走共享路径"
+                    // 放弃编排（codex 复审证伪：原任务随后完成切换会造成
+                    // agent/数据面分裂），更早版本则未短路静默跳过 marker。）
                     let mut migration_gate =
                         shared_types::migration_gate::begin_guarded(identifier);
                     if migration_gate.is_none() {
-                        // 共享路径：不做 RBD 决策（fresh-init 编排整体放弃）。
-                        info!("[K8S] '{identifier}' stays on shared volume this round");
-                        false
+                        // codex 复审（2026-11-20）：撞门禁时选共享卷会在原任务
+                        // 随后完成切换（标记→Migrated）时造成 agent 建在共享
+                        // 卷、文件请求路由 RBD 的分裂。改为可重试错误——调用
+                        // 方稍后重试，门禁释放后按真实标记重新判定卷。
+                        return Err(ContainerRuntimeError::ConnectionError(format!(
+                            "migration decision for '{identifier}' is in flight \
+                             (gate held by an earlier operation); retry later"
+                        )));
                     } else {
                         let drain_left = shared_types::migration_gate::drain_user_writes(
                             identifier,
@@ -1025,37 +1030,70 @@ async fn marker_completer(
             Ok(_patched_uid) => Ok(()),
             Err(error) => {
                 // setter 失败时无法得知它是否发出过写（其内部 GET 也可能
-                // 失败）→ 无 PATCH 身份 → 对账只能走 Inconclusive 语义。
-                // 仍做一次对账尝试（若 PVC 恰好可读且此前是 fresh-init
-                // 续接路径、PVC 已 migrated 且键缓存未变，读到的 migrated
-                // 至少让下一请求立即正确）——但身份未知，按 Inconclusive
-                // 处理：invalidate，不断言成功/失败。
-                match crate::runtime::kubernetes_runtime::workspace_runtime::reconcile_migration_marker(
-                    client,
-                    &namespace,
-                    &pvc_name,
-                    &cache_key,
-                    cache,
-                    None,
-                )
-                .await
-                {
-                    crate::runtime::kubernetes_runtime::workspace_runtime::MarkerReconciliation::Confirmed => {
-                        // 无身份对账不该返回 Confirmed（None 输入必走
-                        // Inconclusive）；防御性按成功处理。
-                        tracing::warn!(user_id = %identifier_for_log, error = %error, "[K8S] marker PATCH error reconciled as confirmed");
-                        Ok(())
+                // 失败）→ 无 PATCH 身份。codex 复审（2026-11-20，夹具复现）：
+                // 此处提前返回会随任务结束释放门禁——迟到 PATCH 落地前，
+                // 新请求同步重读 PVC 能读到旧标记并获准写共享卷，随后 PATCH
+                // 落地切路由 → RBD/共享分裂。
+                //
+                // 修正：门禁不随错误释放，锚定**当前** PVC UID 自行对账——
+                // 迟到 PATCH 按名落地只可能命中当前对象（对象若被替换，旧
+                // PATCH 落在已删对象上，对新对象路由无效）：
+                // - 标记已 migrated → Confirmed：缓存收敛，放行（路由 RBD）
+                // - 同 UID 连续 not-migrated 超过落地宽限窗（PATCH 客户端
+                //   已超时，服务端落地不可能再晚于窗）→ 确未生效：不写
+                //   缓存（保持 invalidate），返回错误放行（路由共享，与
+                //   无标记一致）
+                // - API 不可读/UID 换代（观察重启）→ 继续持有门禁重试：
+                //   共享写被拒而非被误放，写保护优先于可用性
+                const LATE_PATCH_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+                let pvcs: kube::Client = client.clone();
+                let api = kube::Api::<k8s_openapi::api::core::v1::PersistentVolumeClaim>::namespaced(pvcs, &namespace);
+                let mut backoff = std::time::Duration::from_secs(2);
+                let mut anchor: Option<(String, std::time::Instant)> = None;
+                loop {
+                    let observed = api.get(&pvc_name).await.ok().and_then(|pvc| {
+                        let uid = pvc.metadata.uid.clone()?;
+                        let migrated = pvc
+                            .metadata
+                            .annotations
+                            .as_ref()
+                            .and_then(|annotations| {
+                                annotations.get(shared_types::WORKSPACE_MIGRATION_ANNOTATION)
+                            })
+                            .is_some_and(|value| value == "migrated");
+                        Some((uid, migrated))
+                    });
+                    match observed {
+                        Some((uid, true)) => {
+                            tracing::warn!(user_id = %identifier_for_log, error = %error, pvc_uid = %uid, "[K8S] marker PATCH error reconciled: late patch landed (migrated)");
+                            cache.write().await.insert(
+                                cache_key.clone(),
+                                (true, shared_types::WorkspaceMigrationState::Migrated, std::time::Instant::now()),
+                            );
+                            return Ok(());
+                        }
+                        Some((uid, false)) => {
+                            let now = std::time::Instant::now();
+                            let stable_since = match &anchor {
+                                Some((anchored, since)) if anchored == &uid => *since,
+                                _ => {
+                                    anchor = Some((uid.clone(), now));
+                                    tracing::warn!(user_id = %identifier_for_log, error = %error, pvc_uid = %uid, "[K8S] marker PATCH outcome unknown; holding migration gate, anchoring current PVC");
+                                    now
+                                }
+                            };
+                            if now.duration_since(stable_since) >= LATE_PATCH_GRACE {
+                                tracing::warn!(user_id = %identifier_for_log, error = %error, pvc_uid = %uid, "[K8S] fresh-init marker PATCH confirmed not landed within grace; gate released (stays shared)");
+                                return Err(error);
+                            }
+                        }
+                        None => {
+                            // PVC 读失败：门禁继续持有，退避重试（API 恢复后收敛）。
+                            tracing::warn!(user_id = %identifier_for_log, error = %error, retry_backoff_secs = backoff.as_secs(), "[K8S] marker PATCH outcome unknown; PVC unreadable, holding migration gate");
+                        }
                     }
-                    crate::runtime::kubernetes_runtime::workspace_runtime::MarkerReconciliation::NotMigrated => {
-                        tracing::warn!(user_id = %identifier_for_log, error = %error, "[K8S] fresh-init marker PATCH failed (same object not migrated); gate released on task end");
-                        Err(error)
-                    }
-                    crate::runtime::kubernetes_runtime::workspace_runtime::MarkerReconciliation::Inconclusive => {
-                        // 缓存键已 invalidate：门禁释放后下一请求同步查询
-                        // 真实 annotation，无旧缓存可误用。
-                        tracing::warn!(user_id = %identifier_for_log, error = %error, "[K8S] marker PATCH outcome unknown; cache invalidated, next request re-reads PVC");
-                        Err(error)
-                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(10));
                 }
             }
         }
