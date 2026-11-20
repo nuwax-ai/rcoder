@@ -178,15 +178,34 @@ pub(super) fn validate_file_receipt(
     }
     // 活 marker 为空（被归档回收清零）：查归档中**本 token 自身的最后一条
     // 记录**（第十二轮 P2：只看全局最新一条时，A 的迟到重复 release 追加
-    // done A 会撤销尚未结算的 B——跨 token 串扰）。本 token 最后出现形式：
-    // `done <token>` → 已结算不验真；裸 `<token>` → 在途权威仍验真。
+    // done A 会撤销尚未结算的 B——跨 token 串扰）。
+    // codex 复审（2026-11-20，flock 夹具复现）补后继代次撤销：A 被归档后
+    // B 接管锁并正常结束（done B），A 的裸在途记录不应复活——锁的同一
+    // 世代上任何**更晚的 done 记录**（无论哪个 token）都撤销更早的裸
+    // 权威。规则：本 token 验真 ⟺ 其最后一条自身记录为裸 `<token>` 且
+    // 该行之后归档中没有任何 done 记录。
     let archive = path.with_extension("lock.orphaned");
     if let Ok(content) = std::fs::read_to_string(&archive) {
-        let own_last = content
-            .lines()
-            .filter_map(|line| line.split_once(' ').map(|(_, rest)| rest.trim()))
-            .rfind(|rest| *rest == token.as_str() || *rest == format!("done {}", token));
-        return Ok(own_last == Some(token.as_str()));
+        let mut own_last_bare_index: Option<usize> = None;
+        let mut own_settled = false;
+        let mut settled_after_own_bare = false;
+        for (index, line) in content.lines().enumerate() {
+            let Some((_, rest)) = line.split_once(' ') else {
+                continue;
+            };
+            let rest = rest.trim();
+            if rest == token.as_str() {
+                own_last_bare_index = Some(index);
+                own_settled = false;
+                settled_after_own_bare = false;
+            } else if rest == format!("done {}", token) {
+                own_settled = true;
+                settled_after_own_bare = true;
+            } else if rest.starts_with("done ") {
+                settled_after_own_bare = true;
+            }
+        }
+        return Ok(own_last_bare_index.is_some() && !settled_after_own_bare);
     }
     // Empty markers are already released, not authority to resume this operation.
     // Dropping this temporary fd unlocks without clearing or rewriting the marker.

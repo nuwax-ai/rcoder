@@ -752,3 +752,52 @@ async fn builder_drop_unlocks_live_duplicate_and_preserves_only_uncertain_marker
         drop(duplicate);
     }
 }
+
+/// codex 复审回归（2026-11-20，flock 夹具复现）：A 被归档（归档裸记录 +
+/// marker 清零）后，B 接管锁（marker=token-b）期间 A 不验真；**B 正常结束
+/// （done token-b）后 A 也不得复活**——后继代次的结算撤销更早的裸在途权威。
+/// 同时保留：仅裸记录无后继时 A 仍验真（在途权威）；A 的迟到重复释放
+/// （done token-a）不改变结论。
+#[cfg(unix)]
+#[test]
+fn successor_completion_revokes_archived_in_flight_authority() {
+    let root = tempfile::tempdir().expect("fixture");
+    let name = "builder-revoke.lock";
+    let path = root.path().join(name);
+    let lease = lock_builder_file_with_marker(
+        root.path(),
+        name,
+        shared_types::AppFileMutationMarker::for_operation("token-a").expect("marker"),
+    )
+    .expect("lease");
+    let receipt_a = lease.receipt().expect("receipt");
+    drop(lease);
+    let archive = path.with_extension("lock.orphaned");
+
+    // 归档态：marker 清零 + 归档裸记录。
+    std::fs::write(&path, "").expect("clear marker");
+    std::fs::write(&archive, "[1] token-a\n").expect("archive bare entry");
+    assert_eq!(
+        validate_file_receipt(&path, &receipt_a).ok(),
+        Some(true),
+        "仅裸记录、无后继结算：在途权威仍验真"
+    );
+
+    // B 接管：marker=token-b → A 不验真（活 marker 属于其他执行者）。
+    std::fs::write(&path, "token-b").expect("b holds marker");
+    assert_eq!(validate_file_receipt(&path, &receipt_a).ok(), Some(false));
+
+    // B 正常结束：marker 清零 + 归档追加 done token-b → A 不得复活。
+    std::fs::write(&path, "").expect("b completes, marker cleared");
+    std::fs::write(&archive, "[1] token-a\n[2] done token-b\n").expect("archive with successor done");
+    assert_eq!(
+        validate_file_receipt(&path, &receipt_a).ok(),
+        Some(false),
+        "后继代次的 done 撤销更早的裸在途权威（codex 复审修复）"
+    );
+
+    // A 的迟到重复释放不改变结论。
+    std::fs::write(&archive, "[1] token-a\n[2] done token-b\n[3] done token-a\n")
+        .expect("late duplicate release");
+    assert_eq!(validate_file_receipt(&path, &receipt_a).ok(), Some(false));
+}
