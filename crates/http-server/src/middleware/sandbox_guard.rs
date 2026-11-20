@@ -638,7 +638,7 @@ mod tests {
 
     #[test]
     fn port_whitelist_rejects_out_of_list() {
-        let allowed = vec![49983, 8787, 8788];
+        let allowed = [49983, 8787, 8788];
         assert!(allowed.contains(&8788));
         assert!(!allowed.contains(&9999));
     }

@@ -5,7 +5,10 @@
 //! 数据面不在此路由：请求带 `E2b-Sandbox-Id` 头时由最外层守卫
 //! （middleware/sandbox_guard）短路进流式代理，路径与 rcoder 自有路由
 //! 天然解耦（/health、/files 同名冲突即由此消解）。
+#[cfg(feature = "kubernetes")]
 use std::sync::Arc;
+
+use axum::Router;
 
 #[cfg(feature = "kubernetes")]
 use axum::Json;
@@ -19,14 +22,11 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 #[cfg(feature = "kubernetes")]
 use axum::routing::{delete, get, post, put};
-use axum::Router;
 
 #[cfg(feature = "kubernetes")]
-pub use rcoder_engine::service::sandbox_manager::SandboxManager;
-#[cfg(not(feature = "kubernetes"))]
-pub enum SandboxManager {} // 占位：非 kubernetes 构建下的不可达空类型
-#[cfg(feature = "kubernetes")]
 use crate::handler::sandbox as sbx_handler;
+#[cfg(feature = "kubernetes")]
+pub use rcoder_engine::service::sandbox_manager::SandboxManager;
 
 /// 门面依赖容器（http-server 侧的注入边界；kubernetes feature 关闭时恒为空）。
 #[derive(Clone, Default)]
@@ -38,15 +38,11 @@ pub struct SandboxDeps {
 }
 
 impl SandboxDeps {
-    pub fn manager(&self) -> Option<Arc<SandboxManager>> {
-        #[cfg(feature = "kubernetes")]
-        {
-            self.manager.clone()
-        }
-        #[cfg(not(feature = "kubernetes"))]
-        {
-            None::<Arc<SandboxManager>>
-        }
+    /// 门面内部取用点（handler/middleware/路由鉴权链）；非 kubernetes 构建
+    /// 没有 manager 字段，调用方本身也随 feature 一起编译掉，故同门控。
+    #[cfg(feature = "kubernetes")]
+    pub(crate) fn manager(&self) -> Option<Arc<SandboxManager>> {
+        self.manager.clone()
     }
     #[cfg(feature = "kubernetes")]
     pub fn new(manager: Arc<SandboxManager>, allowed_ports: Vec<i32>) -> Self {

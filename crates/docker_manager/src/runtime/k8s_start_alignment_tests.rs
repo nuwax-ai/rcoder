@@ -185,8 +185,7 @@ async fn aligned_start_patches(template_image: &str, desired: Option<&str>) -> V
         .await
         .expect("aligned start");
     server.abort();
-    let captured = patches.lock().unwrap().clone();
-    captured
+    patches.lock().unwrap().clone()
 }
 
 #[tokio::test]

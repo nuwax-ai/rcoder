@@ -471,44 +471,6 @@ fn connection_listed(headers: &HeaderMap) -> Vec<String> {
         .unwrap_or_default()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decision_all_gates_required() {
-        assert_eq!(decide(true, true, true, true), InterceptDecision::Forward);
-        // 任一闸门关闭 → 放行（flag 关 = 现状逐字节一致的关键）
-        assert_eq!(
-            decide(false, true, true, true),
-            InterceptDecision::PassThrough
-        );
-        assert_eq!(
-            decide(true, false, true, true),
-            InterceptDecision::PassThrough
-        );
-        assert_eq!(
-            decide(true, true, false, true),
-            InterceptDecision::PassThrough
-        );
-        assert_eq!(
-            decide(true, true, true, false),
-            InterceptDecision::PassThrough
-        );
-    }
-
-    #[test]
-    fn hop_by_hop_static_and_dynamic() {
-        let mut headers = HeaderMap::new();
-        headers.insert("connection", "X-Custom, keep-alive".parse().unwrap());
-        let listed = connection_listed(&headers);
-        assert!(is_hop_by_hop("te", &listed));
-        assert!(is_hop_by_hop("x-custom", &listed)); // Connection 动态列举
-        assert!(!is_hop_by_hop("content-type", &listed));
-        assert!(!is_hop_by_hop("x-app-id", &listed));
-    }
-}
-
 /// 缓冲上限：对齐平台常规请求体量级。超限或无定位 userId 的 Git 写在
 /// 调用方被明确 400（不静默写共享卷）。
 const GIT_JSON_BUFFER_CAP: usize = 2 * 1024 * 1024;
@@ -592,4 +554,42 @@ async fn extract_git_json_user(
         }
     }
     Ok((parts, Body::from(bytes), GitJsonLocator::ComputerUser))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decision_all_gates_required() {
+        assert_eq!(decide(true, true, true, true), InterceptDecision::Forward);
+        // 任一闸门关闭 → 放行（flag 关 = 现状逐字节一致的关键）
+        assert_eq!(
+            decide(false, true, true, true),
+            InterceptDecision::PassThrough
+        );
+        assert_eq!(
+            decide(true, false, true, true),
+            InterceptDecision::PassThrough
+        );
+        assert_eq!(
+            decide(true, true, false, true),
+            InterceptDecision::PassThrough
+        );
+        assert_eq!(
+            decide(true, true, true, false),
+            InterceptDecision::PassThrough
+        );
+    }
+
+    #[test]
+    fn hop_by_hop_static_and_dynamic() {
+        let mut headers = HeaderMap::new();
+        headers.insert("connection", "X-Custom, keep-alive".parse().unwrap());
+        let listed = connection_listed(&headers);
+        assert!(is_hop_by_hop("te", &listed));
+        assert!(is_hop_by_hop("x-custom", &listed)); // Connection 动态列举
+        assert!(!is_hop_by_hop("content-type", &listed));
+        assert!(!is_hop_by_hop("x-app-id", &listed));
+    }
 }
