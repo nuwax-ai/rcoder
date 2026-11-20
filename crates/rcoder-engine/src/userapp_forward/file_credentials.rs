@@ -38,7 +38,7 @@ pub async fn credentials(
     deadline: tokio::time::Instant,
 ) -> Result<FileServerRequestCredentials, WakeFailure> {
     if stage == UserappStage::Dev {
-        return development_credentials(state).await;
+        return development_credentials();
     }
     let configured = state
         .config
@@ -65,9 +65,7 @@ pub async fn credentials(
     Ok(FileServerRequestCredentials { proxy_token: token })
 }
 
-async fn development_credentials(
-    state: &AppState,
-) -> Result<FileServerRequestCredentials, WakeFailure> {
+fn development_credentials() -> Result<FileServerRequestCredentials, WakeFailure> {
     // Dev builder 的文件入口由容器编排边界承担：K8s NetworkPolicy 仅放行
     // rcoder-main 入站；agent_runner 容器形态 token 为可选注入（缺省无
     // 鉴权，file_server_embed 注释明示"网络边界由容器编排承担"），本平台
@@ -79,18 +77,17 @@ async fn development_credentials(
     // profile 拒 ptrace/read，CAP_SYS_PTRACE 也无法越过）下对任何非自身
     // 子进程 /proc/<pid>/fd 均 EACCES → ManagementNotRunning 死循环 →
     // ensure 永不 Succeeded → 登记回执缺失 → 滚代后 health 永久 NotFound
-    // （2026-11-20 P0，31.45 实证 12/12 全败）。改为仅当平台自身配置了
-    // 静态 file-server token（与 builder 共享同一注入的部署形态）时携带，
-    // 否则无凭据直连。
-    let configured = state
-        .config
-        .file_server_proxy
-        .as_ref()
-        .and_then(|config| config.auth_token.clone())
-        .filter(|token| !token.is_empty());
-    Ok(FileServerRequestCredentials {
-        proxy_token: configured,
-    })
+    // （2026-11-20 P0，31.45 实证 12/12 全败）。
+    //
+    // 受管 dev builder 链路恒定无凭据（codex 复审定案）：文件入口由容器
+    // 编排边界承担——K8s NetworkPolicy 仅放行 rcoder-main 入站；agent_runner
+    // 容器形态 token 可选注入而平台从不注入。不继承主入口
+    // file_server_proxy.auth_token：主入口 token 属于独立 file-server-proxy
+    // 的认证契约，泄给 builder 既无必要也混同两套边界（主入口配置了 token、
+    // 客户端带入站 token 时，发往 builder 的请求仍必须无 X-Proxy-Token——
+    // 入站 token 的剔除由 upstream 转发边界负责）。目标 app/生命周期/Pod
+    // UID/CID 核验与 5xx 脱敏照旧。
+    Ok(FileServerRequestCredentials { proxy_token: None })
 }
 
 fn configuration_runtime_failure(

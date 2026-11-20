@@ -30,8 +30,8 @@ use std::sync::{
 };
 
 const FILES_PATH: &str = "/api/v1/userapp/get-file-list";
-/// dev 转发凭证为平台静态配置（fd-scan 活读已删，见 file_credentials.rs）。
-const PLATFORM_STATIC_TOKEN: &str = "platform-static-token";
+/// dev 转发恒定无凭据（fd-scan 已删且不继承主入口 token，见 file_credentials.rs）。
+/// fixture 的 file peer 以"期望空 token"表达无鉴权形态。
 
 #[derive(Clone)]
 struct CurrentPeer {
@@ -221,7 +221,11 @@ async fn file_peer(
         token: token.clone(),
     });
     let actual = peer.current.lock().unwrap();
-    if token.as_deref() != Some(actual.token.as_str()) || headers.contains_key("x-api-key") {
+    let token_ok = match actual.token.as_str() {
+        "" => token.is_none(),
+        expected => token.as_deref() == Some(expected),
+    };
+    if !token_ok || headers.contains_key("x-api-key") {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"success": false})),
@@ -355,7 +359,7 @@ async fn real_turso_probe_forward_pipeline_reads_cold_twice_hot_once_and_current
             service_url: format!("http://127.0.0.1:{}", shared_types::AGENT_FILE_SERVER_PORT),
             workload_uid: None,
         },
-        token: PLATFORM_STATIC_TOKEN.into(),
+        token: String::new(),
     }));
     let runtime = Arc::new(PipelineRuntime {
         current: current.clone(),
@@ -367,7 +371,7 @@ async fn real_turso_probe_forward_pipeline_reads_cold_twice_hot_once_and_current
     {
         let config = &mut Arc::get_mut(&mut state).unwrap().config;
         config.file_server_proxy = Some(file_server_proxy::FileServerProxyConfig {
-            auth_token: Some(PLATFORM_STATIC_TOKEN.into()),
+            auth_token: Some("main-entry-token-must-not-reach-builder".into()),
             ..Default::default()
         });
         config.userapp_storage.ensure_timeout_seconds = 10;
@@ -413,11 +417,11 @@ async fn real_turso_probe_forward_pipeline_reads_cold_twice_hot_once_and_current
         vec![
             ObservedHttp {
                 path: "/api/version".into(),
-                token: Some(PLATFORM_STATIC_TOKEN.into())
+                token: None
             },
             ObservedHttp {
                 path: FILES_PATH.into(),
-                token: Some(PLATFORM_STATIC_TOKEN.into())
+                token: None
             },
         ]
     );
@@ -441,7 +445,7 @@ async fn real_turso_probe_forward_pipeline_reads_cold_twice_hot_once_and_current
         requests.lock().unwrap()[2],
         ObservedHttp {
             path: FILES_PATH.into(),
-            token: Some(PLATFORM_STATIC_TOKEN.into()),
+            token: None,
         }
     );
 
@@ -478,7 +482,7 @@ async fn real_turso_probe_forward_pipeline_reads_cold_twice_hot_once_and_current
             observed[3],
             ObservedHttp {
                 path: FILES_PATH.into(),
-                token: Some(PLATFORM_STATIC_TOKEN.into()),
+                token: None,
             }
         );
     }

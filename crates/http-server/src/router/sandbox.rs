@@ -60,7 +60,9 @@ pub(crate) async fn e2b_auth(
     mut request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    let unauthorized = |message: &str| {
+    let locale = crate::handler::utils::locale::get_locale_from_headers(request.headers());
+    let unauthorized = |code: &str| {
+        let message = shared_types::error_codes::get_error_message(code, locale);
         (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "code": 401, "message": message })),
@@ -68,7 +70,7 @@ pub(crate) async fn e2b_auth(
             .into_response()
     };
     let Some(manager) = deps.manager() else {
-        return unauthorized("e2b sandbox 未启用");
+        return unauthorized(shared_types::error_codes::ERR_E2B_NOT_ENABLED);
     };
     let key = request
         .headers()
@@ -76,14 +78,14 @@ pub(crate) async fn e2b_auth(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
     if key.is_empty() {
-        return unauthorized("缺少 X-API-Key");
+        return unauthorized(shared_types::error_codes::ERR_E2B_API_KEY_MISSING);
     }
     match manager.authenticate(key).await {
         Ok(record) => {
             request.extensions_mut().insert(record);
             next.run(request).await
         }
-        Err(_) => unauthorized("API key 无效"),
+        Err(_) => unauthorized(shared_types::error_codes::ERR_E2B_API_KEY_INVALID),
     }
 }
 

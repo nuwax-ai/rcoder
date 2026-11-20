@@ -85,7 +85,9 @@ async fn state_with_configured_token(token: Option<&str>) -> (Arc<AppState>, tem
 }
 
 #[tokio::test]
-async fn dev_credentials_carry_configured_static_token_without_runtime_reads() {
+async fn dev_credentials_never_inherit_main_entry_token() {
+    // 主入口 file_server_proxy.auth_token 配置了 token 时，dev builder 链路
+    // 仍恒定无凭据（codex 复审定案：两套认证边界不得混同）。
     let (state, _directory) = state_with_configured_token(Some("platform-static-token")).await;
     let actual = credentials(
         &state,
@@ -95,7 +97,7 @@ async fn dev_credentials_carry_configured_static_token_without_runtime_reads() {
     )
     .await
     .unwrap();
-    assert_eq!(actual.proxy_token.as_deref(), Some("platform-static-token"));
+    assert_eq!(actual.proxy_token, None);
     state.userapp_store_control.shutdown().await.unwrap();
 }
 
