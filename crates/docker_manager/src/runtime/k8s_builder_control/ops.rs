@@ -7,52 +7,6 @@ pub(crate) struct BuilderReuseSnapshot {
 }
 
 impl KubernetesRuntime {
-    pub(crate) async fn read_builder_file_credentials(
-        &self,
-        target: &BuilderControlTarget,
-    ) -> Result<shared_types::FileServerRequestCredentials> {
-        target.validate().map_err(Error::ConfigurationError)?;
-        let expected = target.pod.as_ref().ok_or(Error::ManagementNotRunning)?;
-        let before = self
-            .capture_builder_compute_with_binding(
-                &target.context,
-                target.resource_binding.as_ref(),
-                false,
-            )
-            .await?;
-        if before.workload.as_ref().map(|value| &value.uid)
-            != target.workload.as_ref().map(|value| &value.uid)
-            || before.pod.as_ref().map(|value| &value.uid) != Some(&expected.uid)
-        {
-            return Err(Error::Conflict(
-                "Builder physical identity changed before credential read".into(),
-            ));
-        }
-        let result = self
-            .exec_pod_container(
-                &expected.name,
-                "agent",
-                super::super::builder_file_credentials::read_command(),
-            )
-            .await?;
-        let after = self
-            .capture_builder_compute_with_binding(
-                &target.context,
-                target.resource_binding.as_ref(),
-                false,
-            )
-            .await?;
-        if after.workload.as_ref().map(|value| &value.uid)
-            != before.workload.as_ref().map(|value| &value.uid)
-            || after.pod.as_ref().map(|value| &value.uid) != Some(&expected.uid)
-        {
-            return Err(Error::Conflict(
-                "Builder physical identity changed during credential read".into(),
-            ));
-        }
-        super::super::builder_file_credentials::credentials(result)
-    }
-
     pub(crate) async fn capture_builder_volume_witness(
         &self,
         target: &BuilderControlTarget,

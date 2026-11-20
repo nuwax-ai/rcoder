@@ -114,13 +114,6 @@ impl AgentContainerRuntime for DockerRuntime {
             .await
     }
 
-    async fn get_bound_builder_file_credentials(
-        &self,
-        target: &shared_types::BuilderControlTarget,
-    ) -> ContainerRuntimeResult<shared_types::FileServerRequestCredentials> {
-        self.read_builder_file_credentials(target).await
-    }
-
     async fn start_builder_control_with_options(
         &self,
         target: &shared_types::BuilderControlTarget,

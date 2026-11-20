@@ -38,7 +38,7 @@ pub async fn credentials(
     deadline: tokio::time::Instant,
 ) -> Result<FileServerRequestCredentials, WakeFailure> {
     if stage == UserappStage::Dev {
-        return development_credentials(state, app_id, deadline).await;
+        return development_credentials(state).await;
     }
     let configured = state
         .config
@@ -67,126 +67,30 @@ pub async fn credentials(
 
 async fn development_credentials(
     state: &AppState,
-    app_id: &str,
-    deadline: tokio::time::Instant,
 ) -> Result<FileServerRequestCredentials, WakeFailure> {
-    let read = async {
-        let app = state
-            .userapp_store
-            .get_application(app_id)
-            .await
-            .map_err(store_configuration_failure)?
-            .ok_or_else(|| {
-                WakeFailure::new(
-                    shared_types::ERR_APP_NOT_FOUND,
-                    "file_credentials_configuration",
-                    "Application identity is unavailable for development file credentials",
-                )
-            })?;
-        let context = shared_types::UserAppExecutionContext {
-            app_id: app_id.to_owned(),
-            lifecycle_id: app.lifecycle_id.clone(),
-            operation_id: "file-credentials-observation".into(),
-            executor_id: "reader".into(),
-            request_fingerprint: "0".repeat(64),
-        };
-        let target = crate::userapp_builder::adoption::capture_bound_target(state, &context)
-            .await
-            .map_err(|error| {
-                if let Some(runtime) =
-                    error.downcast_ref::<container_runtime_api::ContainerRuntimeError>()
-                {
-                    configuration_runtime_failure(runtime)
-                } else {
-                    WakeFailure::new(
-                        shared_types::ERR_BACKEND_ERROR,
-                        "file_credentials_configuration",
-                        shared_types::sanitize_error_text(&format!(
-                            "Capture development file peer: {error:#}"
-                        )),
-                    )
-                }
-            })?;
-        let credentials =
-            development_credentials_for_target(state.runtime().as_ref(), &target, deadline).await?;
-        let current = state
-            .userapp_store
-            .get_application(app_id)
-            .await
-            .map_err(store_configuration_failure)?;
-        if !current.is_some_and(|current| {
-            current.lifecycle_id == app.lifecycle_id && current.state == app.state
-        }) {
-            return Err(WakeFailure::new(
-                shared_types::ERR_CONFLICT,
-                "file_credentials_configuration",
-                "Application lifecycle changed during development file credential observation",
-            ));
-        }
-        Ok(credentials)
-    };
-    tokio::time::timeout_at(deadline, read)
-        .await
-        .map_err(|_| WakeFailure::timeout("file_credentials_configuration", None, true))?
-}
-
-fn store_configuration_failure(error: shared_types::UserAppStoreError) -> WakeFailure {
-    let error = shared_types::AppError::from(app_manager::AppOperationError::from(error));
-    match error {
-        shared_types::AppError::Structured(detail) => WakeFailure::new(
-            detail.code,
-            "file_credentials_configuration",
-            detail.internal_message.unwrap_or_else(|| {
-                "Development file credential identity observation failed".into()
-            }),
-        ),
-        error => WakeFailure::new(
-            shared_types::ERR_BACKEND_ERROR,
-            "file_credentials_configuration",
-            shared_types::sanitize_error_text(&error.to_string()),
-        ),
-    }
-}
-
-async fn development_credentials_for_target(
-    runtime: &dyn container_runtime_api::AgentContainerRuntime,
-    target: &shared_types::BuilderControlTarget,
-    deadline: tokio::time::Instant,
-) -> Result<FileServerRequestCredentials, WakeFailure> {
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(WakeFailure::timeout(
-                "file_credentials_configuration",
-                None,
-                true,
-            ));
-        }
-        let result =
-            tokio::time::timeout_at(deadline, runtime.get_bound_builder_file_credentials(target))
-                .await
-                .map_err(|_| WakeFailure::timeout("file_credentials_configuration", None, true))?;
-        if tokio::time::Instant::now() >= deadline {
-            return Err(WakeFailure::timeout(
-                "file_credentials_configuration",
-                None,
-                true,
-            ));
-        }
-        match result {
-            Err(container_runtime_api::ContainerRuntimeError::ManagementNotRunning) => {
-                // Only a known startup window is retryable. The runtime checks
-                // the same captured Pod/controller each time; replacement or
-                // permission errors never fall back to platform credentials.
-                tokio::time::sleep_until(
-                    (tokio::time::Instant::now() + std::time::Duration::from_millis(100))
-                        .min(deadline),
-                )
-                .await;
-            }
-            Ok(credentials) => return Ok(credentials),
-            Err(error) => return Err(configuration_runtime_failure(&error)),
-        }
-    }
+    // Dev builder 的文件入口由容器编排边界承担：K8s NetworkPolicy 仅放行
+    // rcoder-main 入站；agent_runner 容器形态 token 为可选注入（缺省无
+    // 鉴权，file_server_embed 注释明示"网络边界由容器编排承担"），本平台
+    // 从不向 builder 注入 FILE_SERVER_PROXY_TOKEN（31.45 实测 STS env 无
+    // 该变量，60000 前置代理以无鉴权模式运行）。
+    //
+    // 历史实现经 exec 读 agent_runner 进程 environ 取 token（fd-scan）：
+    // ptrace 受限宿主（Yama ptrace_scope=1 + containerd 默认 AppArmor
+    // profile 拒 ptrace/read，CAP_SYS_PTRACE 也无法越过）下对任何非自身
+    // 子进程 /proc/<pid>/fd 均 EACCES → ManagementNotRunning 死循环 →
+    // ensure 永不 Succeeded → 登记回执缺失 → 滚代后 health 永久 NotFound
+    // （2026-11-20 P0，31.45 实证 12/12 全败）。改为仅当平台自身配置了
+    // 静态 file-server token（与 builder 共享同一注入的部署形态）时携带，
+    // 否则无凭据直连。
+    let configured = state
+        .config
+        .file_server_proxy
+        .as_ref()
+        .and_then(|config| config.auth_token.clone())
+        .filter(|token| !token.is_empty());
+    Ok(FileServerRequestCredentials {
+        proxy_token: configured,
+    })
 }
 
 fn configuration_runtime_failure(

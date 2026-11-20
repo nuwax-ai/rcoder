@@ -6,7 +6,7 @@ use container_runtime_api::{
 };
 use shared_types::{
     AppResourceIdentity, AppResourceKind, BuilderControlTarget, BuilderPodIdentity,
-    ContainerBasicInfo, FileServerRequestCredentials, ProjectAndContainerInfo, UserAppAdmission,
+    ContainerBasicInfo, ProjectAndContainerInfo, UserAppAdmission,
     UserAppAdmissionOutcome, UserAppExecutionContext, UserAppLifecycleStore, UserAppOperationKind,
     UserAppOperationProgress, UserAppOperationState, UserAppResourceBinding,
 };
@@ -261,13 +261,6 @@ impl AgentContainerRuntime for LocatorRuntime {
     }
     async fn health_check(&self) -> ContainerRuntimeResult<()> {
         Ok(())
-    }
-    async fn get_bound_builder_file_credentials(
-        &self,
-        _: &BuilderControlTarget,
-    ) -> ContainerRuntimeResult<FileServerRequestCredentials> {
-        self.credential_reads.fetch_add(1, Ordering::SeqCst);
-        Err(ContainerRuntimeError::ManagementNotRunning)
     }
     async fn inspect_builder_candidate(
         &self,

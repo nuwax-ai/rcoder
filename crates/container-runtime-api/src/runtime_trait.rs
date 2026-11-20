@@ -288,17 +288,6 @@ pub trait AgentContainerRuntime: Send + Sync {
         self.capture_builder_control(context).await
     }
 
-    /// Read credentials from this captured live builder, never from a later
-    /// platform template. Implementations must not expose the credential in logs.
-    async fn get_bound_builder_file_credentials(
-        &self,
-        _target: &shared_types::BuilderControlTarget,
-    ) -> ContainerRuntimeResult<shared_types::FileServerRequestCredentials> {
-        Err(ContainerRuntimeError::ConfigurationError(
-            "Captured builder file credentials are unsupported".into(),
-        ))
-    }
-
     /// Recover an original successful create response from a durable runtime
     /// receipt. May release only that receipt's original inactive lease; never
     /// create/start resources or infer success from a same-named container.

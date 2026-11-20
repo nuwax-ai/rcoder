@@ -5,7 +5,6 @@
 
 pub(crate) mod builder_completion;
 mod builder_creation_receipt;
-mod builder_file_credentials;
 mod docker_agent_retirement;
 mod docker_agent_stop;
 mod docker_app_configuration;
