@@ -108,13 +108,18 @@ fn captured_target() -> shared_types::UserAppMutationTarget {
 
 /// One aligned start attempt against a mock API server. Returns the final
 /// deployment PATCH bodies (claim writes go to PVCs, not the deployment).
-async fn aligned_start_patches(template_image: &str, desired: Option<&str>) -> Vec<serde_json::Value> {
+async fn aligned_start_patches(
+    template_image: &str,
+    desired: Option<&str>,
+) -> Vec<serde_json::Value> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     drop(rustls::crypto::ring::default_provider().install_default());
     let runtime = runtime(
-        kube::Client::try_from(kube::Config::new(format!("http://{address}").parse().unwrap()))
-            .unwrap(),
+        kube::Client::try_from(kube::Config::new(
+            format!("http://{address}").parse().unwrap(),
+        ))
+        .unwrap(),
     );
     let deployment = deployment_fixture(template_image);
     let patches = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
@@ -147,7 +152,13 @@ async fn aligned_start_patches(template_image: &str, desired: Option<&str>) -> V
                 bytes.extend_from_slice(&chunk[..count]);
             }
             let method = head.split_whitespace().next().unwrap();
-            let path = head.split_whitespace().nth(1).unwrap().split('?').next().unwrap();
+            let path = head
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .split('?')
+                .next()
+                .unwrap();
             let (code, value) = if path.ends_with("/deployments/rcoder-app-9") {
                 if method == "PATCH" {
                     let patch: serde_json::Value =
@@ -212,11 +223,8 @@ async fn start_rolls_platform_managed_template_onto_current_platform_image() {
 async fn start_keeps_foreign_and_pinned_images_without_rolling() {
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
         for template in ["docker.io/someone/custom:1", "sha256:0123abcd"] {
-            let patches = aligned_start_patches(
-                template,
-                Some("registry.test/app-runtime:0.1.450"),
-            )
-            .await;
+            let patches =
+                aligned_start_patches(template, Some("registry.test/app-runtime:0.1.450")).await;
             assert_eq!(patches.len(), 1, "one deployment write for {template}");
             assert!(
                 patches[0]["spec"].get("template").is_none()
@@ -233,8 +241,7 @@ async fn start_keeps_foreign_and_pinned_images_without_rolling() {
 #[tokio::test]
 async fn start_without_desired_image_never_touches_containers() {
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        let patches =
-            aligned_start_patches("registry.test/app-runtime:0.1.293", None).await;
+        let patches = aligned_start_patches("registry.test/app-runtime:0.1.293", None).await;
         assert_eq!(patches.len(), 1);
         assert!(patches[0]["spec"].get("template").is_none());
     })

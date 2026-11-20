@@ -17,13 +17,12 @@ use axum::{
     routing::get,
 };
 use container_runtime_api::{
-    AgentContainerRuntime, ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult,
-    ContainerRuntimeStatus, RuntimeContainerInfo, UserAppDeploymentRuntime, WorkspaceRuntime,
+    AgentContainerRuntime, ContainerCreateParams, ContainerRuntimeResult, ContainerRuntimeStatus,
+    RuntimeContainerInfo, UserAppDeploymentRuntime, WorkspaceRuntime,
 };
 use shared_types::{
     AppResourceIdentity, AppResourceKind, BuilderControlTarget, ContainerBasicInfo,
-    ProjectAndContainerInfo, ServiceType, UserAppExecutionContext,
-    UserAppLifecycleStore,
+    ProjectAndContainerInfo, ServiceType, UserAppExecutionContext, UserAppLifecycleStore,
 };
 use std::sync::{
     Arc, Mutex,
@@ -172,7 +171,6 @@ impl AgentContainerRuntime for PipelineRuntime {
         assert!(binding.is_none(), "this fixture has no legacy binding");
         Ok(self.target(context))
     }
-
 }
 
 #[async_trait::async_trait]
@@ -330,7 +328,8 @@ async fn real_turso_probe_forward_pipeline_reads_cold_twice_hot_once_and_current
         "probepipe{}",
         &uuid::Uuid::new_v4().simple().to_string()[..10]
     );
-    let lifecycle = store.ensure_identity(&app).await.unwrap();
+    // 身份必须在 run 之前落库（后续流程按 app 解析 lifecycle），返回值本身不再断言。
+    store.ensure_identity(&app).await.unwrap();
     // Full physical IDs are unique as well as the alias: a parallel fixture
     // cannot share this case's published-observation invalidation generation.
     let old_uid = format!(

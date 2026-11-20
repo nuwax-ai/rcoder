@@ -95,9 +95,18 @@ pub fn sandbox_routes(deps: SandboxDeps) -> Router {
         .route("/v2/sandboxes", get(sbx_handler::list_sandboxes))
         .route("/sandboxes/{sandbox_id}", get(sbx_handler::get_sandbox))
         .route("/sandboxes/{sandbox_id}", delete(sbx_handler::kill_sandbox))
-        .route("/sandboxes/{sandbox_id}/timeout", post(sbx_handler::set_timeout))
-        .route("/sandboxes/{sandbox_id}/connect", post(sbx_handler::connect_sandbox))
-        .route("/v2/sandboxes/{sandbox_id}/connect", post(sbx_handler::connect_sandbox))
+        .route(
+            "/sandboxes/{sandbox_id}/timeout",
+            post(sbx_handler::set_timeout),
+        )
+        .route(
+            "/sandboxes/{sandbox_id}/connect",
+            post(sbx_handler::connect_sandbox),
+        )
+        .route(
+            "/v2/sandboxes/{sandbox_id}/connect",
+            post(sbx_handler::connect_sandbox),
+        )
         .route("/templates", get(sbx_handler::list_templates))
         .route("/volumes", post(sbx_handler::create_volume))
         .route("/volumes", get(sbx_handler::list_volumes))
@@ -122,10 +131,7 @@ pub fn sandbox_routes(deps: SandboxDeps) -> Router {
             "/sandboxes/{sandbox_id}/network",
             put(sbx_handler::not_supported),
         )
-        .layer(axum::middleware::from_fn_with_state(
-            deps.clone(),
-            e2b_auth,
-        ))
+        .layer(axum::middleware::from_fn_with_state(deps.clone(), e2b_auth))
         .with_state(deps)
 }
 

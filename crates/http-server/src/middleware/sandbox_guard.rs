@@ -39,7 +39,10 @@ const HOP_BY_HOP: &[&str] = &[
 
 /// 从请求解析数据面目标：(sandbox_id, port, 剩余路径与查询)。
 /// 返回 None = 不拦截（放行路由树）。
-pub(crate) fn resolve_target(uri: &Uri, headers: &axum::http::HeaderMap) -> Option<(String, i32, String)> {
+pub(crate) fn resolve_target(
+    uri: &Uri,
+    headers: &axum::http::HeaderMap,
+) -> Option<(String, i32, String)> {
     // 模式 1：头路由（官方 SDK）
     if let Some(id) = headers
         .get("E2b-Sandbox-Id")
@@ -160,10 +163,7 @@ pub async fn e2b_data_plane_guard(
     let record = match manager.authorize_data_plane(&sandbox_id, &token).await {
         Ok(record) => record,
         Err(_) => {
-            return error_response(
-                StatusCode::UNAUTHORIZED,
-                "沙箱不存在、已到期或 token 无效",
-            )
+            return error_response(StatusCode::UNAUTHORIZED, "沙箱不存在、已到期或 token 无效");
         }
     };
     let pod_ip = match manager.pod_ip(&record).await {
@@ -178,8 +178,10 @@ pub async fn e2b_data_plane_guard(
 
     let (parts, body) = request.into_parts();
     let url = format!("http://{target}{rest}");
-    let mut outgoing = proxy_client()
-        .request(Method::from_bytes(parts.method.as_str().as_bytes()).expect("method"), &url);
+    let mut outgoing = proxy_client().request(
+        Method::from_bytes(parts.method.as_str().as_bytes()).expect("method"),
+        &url,
+    );
     for (name, value) in parts.headers.iter() {
         if HOP_BY_HOP.contains(&name.as_str())
             || name.as_str() == "e2b-sandbox-id"
@@ -196,9 +198,9 @@ pub async fn e2b_data_plane_guard(
     }
     // envd 侧鉴权：代理注入已校验的 token（客户端值与库内哈希一致）。
     outgoing = outgoing.header("X-Access-Token", &token);
-    let stream = body.into_data_stream().map(|chunk| {
-        chunk.map_err(std::io::Error::other)
-    });
+    let stream = body
+        .into_data_stream()
+        .map(|chunk| chunk.map_err(std::io::Error::other));
     let response = match outgoing
         .body(reqwest::Body::wrap_stream(stream))
         .send()
@@ -210,7 +212,8 @@ pub async fn e2b_data_plane_guard(
             return error_response(StatusCode::BAD_GATEWAY, "沙箱数据面不可达");
         }
     };
-    let status = StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut builder = Response::builder().status(status);
     for (name, value) in response.headers().iter() {
         if HOP_BY_HOP.contains(&name.as_str()) {
@@ -223,9 +226,9 @@ pub async fn e2b_data_plane_guard(
             builder = builder.header(name, value);
         }
     }
-    let byte_stream = response.bytes_stream().map(|chunk| {
-        chunk.map_err(std::io::Error::other)
-    });
+    let byte_stream = response
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(std::io::Error::other));
     match builder.body(Body::from_stream(byte_stream)) {
         Ok(response) => response,
         Err(_) => error_response(StatusCode::BAD_GATEWAY, "代理响应构造失败"),
@@ -239,7 +242,12 @@ pub async fn e2b_data_plane_guard(
 /// `Sec-WebSocket-Accept`）原样回传客户端；随后双向透传，不解 WS 帧
 /// （copy_bidirectional 直通，天然支持 CDP/MCP 等任意子协议）。
 /// 上游不可达或拒绝握手时，客户端拿到真实错误而非一个随后黑洞的 101。
-async fn websocket_tunnel(request: Request<Body>, target: &str, rest: &str, token: &str) -> Response {
+async fn websocket_tunnel(
+    request: Request<Body>,
+    target: &str,
+    rest: &str,
+    token: &str,
+) -> Response {
     use tokio::io::AsyncWriteExt;
 
     const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -290,14 +298,11 @@ async fn websocket_tunnel(request: Request<Body>, target: &str, rest: &str, toke
             .iter()
             .find(|(name, _)| name == "content-length")
             .and_then(|(_, value)| value.parse::<u64>().ok());
-        let chunked = head
-            .headers
-            .iter()
-            .any(|(name, value)| {
-                name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked")
-            });
-        let mut builder =
-            Response::builder().status(StatusCode::from_u16(head.status).unwrap_or(StatusCode::BAD_GATEWAY));
+        let chunked = head.headers.iter().any(|(name, value)| {
+            name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked")
+        });
+        let mut builder = Response::builder()
+            .status(StatusCode::from_u16(head.status).unwrap_or(StatusCode::BAD_GATEWAY));
         for (name, value) in &head.headers {
             // 定界头不透传（body 已解帧为明文，由本端重新编码）。
             if HOP_BY_HOP.contains(&name.as_str())
@@ -380,7 +385,11 @@ async fn websocket_tunnel(request: Request<Body>, target: &str, rest: &str, toke
 /// 头模式即原始路径）；网关路由头剔除、客户端 X-Access-Token 剔除后注入
 /// 网关已校验的值——query 模式的令牌（rest 携带）之外，上游同时得到
 /// 标准头形式。Sec-WebSocket-Key/Protocol/Version 必须原样到达上游。
-fn serialize_upgrade_request(parts: &axum::http::request::Parts, rest: &str, token: &str) -> Vec<u8> {
+fn serialize_upgrade_request(
+    parts: &axum::http::request::Parts,
+    rest: &str,
+    token: &str,
+) -> Vec<u8> {
     let mut out = format!("GET {rest} HTTP/1.1\r\n").into_bytes();
     for (name, value) in parts.headers.iter() {
         let name = name.as_str();
@@ -410,15 +419,14 @@ struct UpstreamHead {
 
 /// 从上游 socket 读到首个 `\r\n\r\n` 并解析状态行与头。
 /// 返回 `Ok(None)` = 连接 EOF / 头超长 / 畸形（调用方按 502 处理）。
-async fn read_response_head(stream: &mut tokio::net::TcpStream) -> std::io::Result<Option<UpstreamHead>> {
+async fn read_response_head(
+    stream: &mut tokio::net::TcpStream,
+) -> std::io::Result<Option<UpstreamHead>> {
     use tokio::io::AsyncReadExt as _;
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
-        if let Some(position) = buf
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-        {
+        if let Some(position) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
             let head_end = position + 4;
             let leftover = buf.split_off(head_end);
             buf.truncate(position);
@@ -480,9 +488,7 @@ async fn read_upstream_error_body(
                 buffer.truncate(length as usize);
                 return Some(buffer);
             }
-        } else if chunked
-            && let Some((plain, _consumed)) = dechunk(&buffer)
-        {
+        } else if chunked && let Some((plain, _consumed)) = dechunk(&buffer) {
             return Some(plain);
         }
         if buffer.len() > cap {
@@ -514,7 +520,10 @@ fn dechunk(buffer: &[u8]) -> Option<(Vec<u8>, usize)> {
         let line_end = buffer[pos..].windows(2).position(|w| w == b"\r\n")? + pos;
         let size_text = &buffer[pos..line_end];
         // chunk 扩展（";ext=..."）取分号前；u8 切片无稳定 split_once。
-        let size_hex_end = size_text.iter().position(|b| *b == b';').unwrap_or(size_text.len());
+        let size_hex_end = size_text
+            .iter()
+            .position(|b| *b == b';')
+            .unwrap_or(size_text.len());
         let size_hex = &size_text[..size_hex_end];
         let size = usize::from_str_radix(std::str::from_utf8(size_hex).ok()?.trim(), 16).ok()?;
         pos = line_end + 2;
@@ -560,17 +569,27 @@ mod tests {
     fn header_mode_routes_to_envd_by_default() {
         let uri: Uri = "/anything/here?x=1".parse().unwrap();
         let resolved = resolve_target(&uri, &headers(&[("e2b-sandbox-id", "abc123")]));
-        assert_eq!(resolved, Some(("abc123".to_string(), 49983, "/anything/here?x=1".to_string())));
+        assert_eq!(
+            resolved,
+            Some((
+                "abc123".to_string(),
+                49983,
+                "/anything/here?x=1".to_string()
+            ))
+        );
     }
 
     #[test]
     fn header_mode_honours_port_header() {
         let uri: Uri = "/mcp".parse().unwrap();
-        let resolved = resolve_target(&uri, &headers(&[
-            ("e2b-sandbox-id", "abc123"),
-            ("e2b-sandbox-port", "8788"),
-        ]));
-        assert_eq!(resolved, Some(("abc123".to_string(), 8788, "/mcp".to_string())));
+        let resolved = resolve_target(
+            &uri,
+            &headers(&[("e2b-sandbox-id", "abc123"), ("e2b-sandbox-port", "8788")]),
+        );
+        assert_eq!(
+            resolved,
+            Some(("abc123".to_string(), 8788, "/mcp".to_string()))
+        );
     }
 
     #[test]
@@ -581,10 +600,7 @@ mod tests {
             assert_eq!(
                 resolve_target(
                     &uri,
-                    &headers(&[
-                        ("e2b-sandbox-id", "abc123"),
-                        ("e2b-sandbox-port", bad),
-                    ])
+                    &headers(&[("e2b-sandbox-id", "abc123"), ("e2b-sandbox-port", bad),])
                 ),
                 None,
                 "端口 {bad:?} 应放行给控制面"
@@ -596,7 +612,10 @@ mod tests {
     fn path_mode_extracts_id_port_and_rest() {
         let uri: Uri = "/sandboxes/abc123/8788/mcp?session=1".parse().unwrap();
         let resolved = resolve_target(&uri, &headers(&[]));
-        assert_eq!(resolved, Some(("abc123".to_string(), 8788, "/mcp?session=1".to_string())));
+        assert_eq!(
+            resolved,
+            Some(("abc123".to_string(), 8788, "/mcp?session=1".to_string()))
+        );
     }
 
     #[test]
@@ -615,7 +634,11 @@ mod tests {
             "/sandboxes/abc123/metrics",
         ] {
             let uri: Uri = path.parse().unwrap();
-            assert_eq!(resolve_target(&uri, &headers(&[])), None, "path {path} 应放行");
+            assert_eq!(
+                resolve_target(&uri, &headers(&[])),
+                None,
+                "path {path} 应放行"
+            );
         }
     }
 
@@ -623,13 +646,19 @@ mod tests {
     fn unrelated_paths_fall_through() {
         for path in ["/health", "/templates", "/computer/chat", "/v2/sandboxes"] {
             let uri: Uri = path.parse().unwrap();
-            assert_eq!(resolve_target(&uri, &headers(&[])), None, "path {path} 应放行");
+            assert_eq!(
+                resolve_target(&uri, &headers(&[])),
+                None,
+                "path {path} 应放行"
+            );
         }
     }
 
     #[test]
     fn access_token_prefers_header_then_query() {
-        let uri: Uri = "/sandboxes/a/49983/health?access_token=fromquery".parse().unwrap();
+        let uri: Uri = "/sandboxes/a/49983/health?access_token=fromquery"
+            .parse()
+            .unwrap();
         let token = access_token(&headers(&[("x-access-token", "fromheader")]), &uri);
         assert_eq!(token, "fromheader");
         let token = access_token(&headers(&[]), &uri);
