@@ -66,33 +66,12 @@ impl<'a> ContainerCreator<'a> {
         let command = config.command.clone();
         let entrypoint = config.entrypoint.clone();
         let resource_limits = config.resource_limits.clone();
-        let config_security = config.security.clone();
+        let security = config.security.clone();
         let extra_mounts = config.extra_mounts.clone();
         let config_labels = config.labels;
         let protected_builder = config_labels
             .as_ref()
             .is_some_and(|labels| labels.contains_key("rcoder.io/lifecycle-id"));
-        // builder 凭证读取（fd-scan）要求 exec 进程能读容器内其他进程的
-        // /proc/<pid>/fd；Yama ptrace_scope=1 宿主（Ubuntu 默认）无
-        // SYS_PTRACE 时全部 EACCES → ManagementNotRunning 死循环（与 K8s
-        // 路径同因，31.45 实证 2026-11-20）。protected builder 无条件补齐
-        // 该 cap，运维显式配置已含时去重不重复。
-        let security = if protected_builder {
-            let mut merged = config_security.unwrap_or_default();
-            if !merged
-                .cap_add
-                .as_ref()
-                .is_some_and(|caps| caps.iter().any(|cap| cap == "SYS_PTRACE"))
-            {
-                merged
-                    .cap_add
-                    .get_or_insert_with(Vec::new)
-                    .push("SYS_PTRACE".to_string());
-            }
-            Some(merged)
-        } else {
-            config_security
-        };
 
         // 1. 生成容器名称
         let container_identifier = config.pod_id.as_ref().unwrap_or(&project_id);
