@@ -7,6 +7,8 @@ use container_runtime_api::{
 const READ_TOKEN: &str = r#"
 import os, sys
 peers = []
+denied = False
+inspected = False
 try:
     listeners = set()
     port = int(sys.argv[1])
@@ -26,8 +28,11 @@ try:
             continue
         try:
             fds = os.listdir('/proc/' + name + '/fd')
-        except (FileNotFoundError, ProcessLookupError, PermissionError):
+        except (FileNotFoundError, ProcessLookupError, PermissionError) as error:
+            if isinstance(error, PermissionError):
+                denied = True
             continue
+        inspected = True
         owns_listener = False
         for fd in fds:
             try:
@@ -49,7 +54,9 @@ try:
             continue
         peers.append(values)
     if not peers:
-        sys.exit(3)
+        # ptrace_scope=1 且无 CAP_SYS_PTRACE 时，每个进程的 fd 目录都不可读，
+        # 与"file peer 未启动"区分开，避免把能力缺失误诊为 ManagementNotRunning。
+        sys.exit(7 if denied and not inspected else 3)
     if len(peers) != 1:
         sys.exit(4)
     key = b'FILE_SERVER_PROXY_TOKEN='
@@ -82,6 +89,11 @@ pub(super) fn credentials(
         3 => Err(Error::ManagementNotRunning),
         4 => Err(Error::Conflict(
             "Multiple embedded file peers require process reconciliation".into(),
+        )),
+        7 => Err(Error::ContainerExecError(
+            "File peer fd scan lacks CAP_SYS_PTRACE: host yama.ptrace_scope blocks \
+             /proc/<pid>/fd inspection for every process"
+                .into(),
         )),
         5 => Err(Error::ContainerExecError(
             "Permission denied reading embedded file peer credentials".into(),
@@ -123,6 +135,10 @@ mod tests {
         assert!(matches!(
             credentials(result(3, "")),
             Err(Error::ManagementNotRunning)
+        ));
+        assert!(matches!(
+            credentials(result(7, "")),
+            Err(Error::ContainerExecError(_))
         ));
         for exit in [4, 5, 127] {
             assert!(credentials(result(exit, "must-not-be-logged")).is_err());

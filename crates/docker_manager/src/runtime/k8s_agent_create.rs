@@ -871,6 +871,23 @@ impl KubernetesRuntime {
                     // 故日志排查不受影响。
                     tty: Some(true),
                     stdin: Some(true),
+                    security_context: matches!(service_type, ServiceType::UserappBuilder).then(
+                        || k8s_openapi::api::core::v1::SecurityContext {
+                            // 平台凭证读取（read_builder_file_credentials）经 exec
+                            // 遍历 /proc/<pid>/fd 定位内嵌 file peer；Yama
+                            // ptrace_scope=1（Ubuntu 默认）下 exec 进程读非自身
+                            // 子进程的 fd 全部 EACCES → ManagementNotRunning
+                            // 死循环 → ensure 永远失败、登记回执缺失 → 滚代后
+                            // health 永久 NotFound（31.45 实证，2026-11-20）。
+                            // 容器内进程同处一个 pid namespace，此 cap 只恢复
+                            // 容器内互视，不产生跨容器/宿主能力。
+                            capabilities: Some(k8s_openapi::api::core::v1::Capabilities {
+                                add: Some(vec!["SYS_PTRACE".to_string()]),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    ),
                     ..Default::default()
                 }];
                 // sidecar(只来自 kubernetes_config.services[].sidecars)。
