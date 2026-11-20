@@ -5,6 +5,32 @@ pub(super) fn lock_builder_file(root: &std::path::Path, name: &str) -> Result<Bu
     lock_builder_file_with_marker(root, name, shared_types::AppFileMutationMarker::new())
 }
 
+/// 归档旁文件追加一条记录（best-effort：I/O 失败只影响 validate fallback
+/// 的精度，不影响持锁/释放本身）。
+#[cfg(unix)]
+fn append_lock_archive(lock_path: &std::path::Path, suffix: &str) {
+    let archive = lock_path.with_extension("lock.orphaned");
+    let entry = format!(
+        "[{}] {}\n",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        suffix,
+    );
+    if let Some(parent) = archive.parent() {
+        let _unused = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&archive)
+    {
+        use std::io::Write as _;
+        let _unused = file.write_all(entry.as_bytes());
+    }
+}
+
 pub(super) fn lock_builder_file_with_marker(
     root: &std::path::Path,
     name: &str,
@@ -15,6 +41,10 @@ pub(super) fn lock_builder_file_with_marker(
         .marker
         .begin(&lease.file)
         .map_err(|e| Error::DockerError(format!("persist builder operation marker: {e}")))?;
+    // 获取即落归档授权记录（codex 复审 2026-11-20）：正常持锁不写归档会让
+    // 后继完成的 done 无法撤销更早的裸权威（行序不能替代锁代次）。
+    #[cfg(unix)]
+    append_lock_archive(&lease.path, lease.marker.operation_id());
     Ok(lease)
 }
 
@@ -74,7 +104,10 @@ impl shared_types::PreparedComputeLease for BuilderFileLease {
     async fn activate(&mut self) -> std::result::Result<(), String> {
         self.marker
             .begin(&self.file)
-            .map_err(|error| format!("Activate compute lease: {error}"))
+            .map_err(|error| format!("Activate compute lease: {error}"))?;
+        #[cfg(unix)]
+        append_lock_archive(&self.path, self.marker.operation_id());
+        Ok(())
     }
 }
 
@@ -176,36 +209,65 @@ pub(super) fn validate_file_receipt(
     if !owner.is_empty() {
         return Ok(false);
     }
-    // 活 marker 为空（被归档回收清零）：查归档中**本 token 自身的最后一条
-    // 记录**（第十二轮 P2：只看全局最新一条时，A 的迟到重复 release 追加
-    // done A 会撤销尚未结算的 B——跨 token 串扰）。
-    // codex 复审（2026-11-20，flock 夹具复现）补后继代次撤销：A 被归档后
-    // B 接管锁并正常结束（done B），A 的裸在途记录不应复活——锁的同一
-    // 世代上任何**更晚的 done 记录**（无论哪个 token）都撤销更早的裸
-    // 权威。规则：本 token 验真 ⟺ 其最后一条自身记录为裸 `<token>` 且
-    // 该行之后归档中没有任何 done 记录。
+    // 活 marker 为空（被归档回收清零）：查归档。codex 复审（2026-11-20）
+    // 两反例定案的代次规则——归档行序不等于锁代次：
+    // - 本 token 验真 ⟺ 存在裸授权记录（获取/归档写入），且其后：
+    //   · 无本 token 的 done（已结算，幂等——重复 done 不改变结论）
+    //   · 无**更晚获取**的其他 token 裸记录（后继代次接管）
+    //   · 无"没有任何裸记录"的其他 token done（兼容无获取记录的旧归档/
+    //     旧部署：无法证明其代次更早，按后继处置）
+    // - 更早获取的其他 token 的迟到 done **不撤销**本 token（裸记录位置
+    //   在本 token 之前 = 旧代次，其重复释放不改变在逈权威）。
     let archive = path.with_extension("lock.orphaned");
     if let Ok(content) = std::fs::read_to_string(&archive) {
-        let mut own_last_bare_index: Option<usize> = None;
-        let mut own_settled = false;
-        let mut settled_after_own_bare = false;
-        for (index, line) in content.lines().enumerate() {
-            let Some((_, rest)) = line.split_once(' ') else {
-                continue;
-            };
-            let rest = rest.trim();
-            if rest == token.as_str() {
-                own_last_bare_index = Some(index);
-                own_settled = false;
-                settled_after_own_bare = false;
-            } else if rest == format!("done {}", token) {
-                own_settled = true;
-                settled_after_own_bare = true;
-            } else if rest.starts_with("done ") {
-                settled_after_own_bare = true;
-            }
+        struct Record {
+            token: String,
+            done: bool,
         }
-        return Ok(own_last_bare_index.is_some() && !settled_after_own_bare);
+        let records: Vec<(usize, Record)> = content
+            .lines()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                let (_, rest) = line.split_once(' ')?;
+                let rest = rest.trim();
+                let (token, done) = match rest.strip_prefix("done ") {
+                    Some(token) => (token.trim().to_string(), true),
+                    None => (rest.to_string(), false),
+                };
+                (!token.is_empty()).then_some((index, Record { token, done }))
+            })
+            .collect();
+        let own_last_bare = records
+            .iter()
+            .filter(|(_, record)| !record.done && record.token == token.as_str())
+            .map(|(index, _)| *index)
+            .max();
+        let Some(own_last_bare) = own_last_bare else {
+            return Ok(false);
+        };
+        let revoked = records.iter().any(|(index, record)| {
+            if *index <= own_last_bare {
+                return false;
+            }
+            if record.token == token.as_str() {
+                // 本 token 的 done：结算。
+                record.done
+            } else if record.done {
+                // 其他 token 的 done：仅当其为更晚获取（裸记录在本 token
+                // 之后）或完全无裸记录（代次不可证，按后继处置）时撤销。
+                let acquired_after = records.iter().any(|(bare_index, bare)| {
+                    *bare_index > own_last_bare && !bare.done && bare.token == record.token
+                });
+                let has_any_bare = records
+                    .iter()
+                    .any(|(_, candidate)| !candidate.done && candidate.token == record.token);
+                acquired_after || !has_any_bare
+            } else {
+                // 其他 token 更晚获取的裸记录：后继代次接管。
+                true
+            }
+        });
+        return Ok(!revoked);
     }
     // Empty markers are already released, not authority to resume this operation.
     // Dropping this temporary fd unlocks without clearing or rewriting the marker.
@@ -440,6 +502,10 @@ impl shared_types::AppOperationLease for BuilderFileLease {
         self.marker
             .complete(&self.file)
             .map_err(|error| format!("complete builder operation marker: {error}"))?;
+        // 结算即落归档 done 记录：validate fallback 据此停止把本 token 的
+        // 裸授权验真（codex 反例：不写则归档裸记录在正常完成后仍复活）。
+        #[cfg(unix)]
+        append_lock_archive(&self.path, &format!("done {}", self.marker.operation_id()));
         self.file
             .unlock()
             .map_err(|error| format!("release builder operation lease: {error}"))?;

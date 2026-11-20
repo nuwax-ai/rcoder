@@ -753,51 +753,103 @@ async fn builder_drop_unlocks_live_duplicate_and_preserves_only_uncertain_marker
     }
 }
 
-/// codex 复审回归（2026-11-20，flock 夹具复现）：A 被归档（归档裸记录 +
-/// marker 清零）后，B 接管锁（marker=token-b）期间 A 不验真；**B 正常结束
-/// （done token-b）后 A 也不得复活**——后继代次的结算撤销更早的裸在途权威。
-/// 同时保留：仅裸记录无后继时 A 仍验真（在途权威）；A 的迟到重复释放
-/// （done token-a）不改变结论。
+/// codex 复审回归（2026-11-20）：全部走真实 acquire/reclaim/release 路径，
+/// 不手工写归档。场景一：A 被归档后 B 接管并**正常释放**——真实 release 必
+/// 须落 `done B` 归档（此前只有清 marker），A 的裸授权被后继代次撤销。
 #[cfg(unix)]
-#[test]
-fn successor_completion_revokes_archived_in_flight_authority() {
+#[tokio::test]
+async fn real_release_records_done_and_revokes_archived_authority() {
     let root = tempfile::tempdir().expect("fixture");
-    let name = "builder-revoke.lock";
-    let path = root.path().join(name);
-    let lease = lock_builder_file_with_marker(
+    let name = "builder-real-release.lock";
+    let lease_a = lock_builder_file_with_marker(
         root.path(),
         name,
-        shared_types::AppFileMutationMarker::for_operation("token-a").expect("marker"),
+        shared_types::AppFileMutationMarker::for_operation("op-a").expect("marker"),
     )
-    .expect("lease");
-    let receipt_a = lease.receipt().expect("receipt");
-    drop(lease);
-    let archive = path.with_extension("lock.orphaned");
+    .expect("acquire a");
+    let receipt_a = lease_a.receipt().expect("receipt a");
+    drop(lease_a); // A 死亡：flock 释放，marker 残留
 
-    // 归档态：marker 清零 + 归档裸记录。
-    std::fs::write(&path, "").expect("clear marker");
-    std::fs::write(&archive, "[1] token-a\n").expect("archive bare entry");
-    assert_eq!(
-        validate_file_receipt(&path, &receipt_a).ok(),
-        Some(true),
-        "仅裸记录、无后继结算：在途权威仍验真"
+    // B 接管：prepare 持锁后 reclaim 归档 A 的孤儿 marker（真实归档路径）。
+    let lease_b = lock_builder_file_with_marker(
+        root.path(),
+        name,
+        shared_types::AppFileMutationMarker::for_operation("op-b").expect("marker"),
+    )
+    .expect("acquire b");
+    let receipt_b = lease_b.receipt().expect("receipt b");
+    assert!(
+        validate_file_receipt(&root.path().join(name), &receipt_a).is_err(),
+        "B 活跃持锁期间 A 的验证应 Err（锁活跃），而非误判验真"
     );
+    Box::new(lease_b).release().await.expect("b normal release");
 
-    // B 接管：marker=token-b → A 不验真（活 marker 属于其他执行者）。
-    std::fs::write(&path, "token-b").expect("b holds marker");
-    assert_eq!(validate_file_receipt(&path, &receipt_a).ok(), Some(false));
-
-    // B 正常结束：marker 清零 + 归档追加 done token-b → A 不得复活。
-    std::fs::write(&path, "").expect("b completes, marker cleared");
-    std::fs::write(&archive, "[1] token-a\n[2] done token-b\n").expect("archive with successor done");
+    let archive = std::fs::read_to_string(root.path().join(name).with_extension("lock.orphaned"))
+        .expect("archive readable");
+    assert!(
+        archive.contains("done op-b"),
+        "真实 release 必须落 done 归档（codex 反例：archive_has_B_done=false）: {archive}"
+    );
     assert_eq!(
-        validate_file_receipt(&path, &receipt_a).ok(),
+        validate_file_receipt(&root.path().join(name), &receipt_a).ok(),
         Some(false),
-        "后继代次的 done 撤销更早的裸在途权威（codex 复审修复）"
+        "B 正常完成后 A 的裸授权不得复活"
     );
+    let _ = receipt_b;
+}
 
-    // A 的迟到重复释放不改变结论。
-    std::fs::write(&archive, "[1] token-a\n[2] done token-b\n[3] done token-a\n")
-        .expect("late duplicate release");
-    assert_eq!(validate_file_receipt(&path, &receipt_a).ok(), Some(false));
+/// codex 复审回归：场景二（交错时序）——先完成 A，再归档 B（真实
+/// reclaim_orphaned 路径，无后继获取），最后 A 迟到重复 release（真实
+/// release_file_receipt 路径）：更早代次的迟到 done **不撤销** B 的在途
+/// 授权；A 自身结算幂等。
+#[cfg(unix)]
+#[test]
+fn late_duplicate_release_of_older_generation_keeps_successor_authority() {
+    let root = tempfile::tempdir().expect("fixture");
+    let name = "builder-interleave.lock";
+    let lock_path = root.path().join(name);
+    let archive = lock_path.with_extension("lock.orphaned");
+
+    let lease_a = lock_builder_file_with_marker(
+        root.path(),
+        name,
+        shared_types::AppFileMutationMarker::for_operation("op-a").expect("marker"),
+    )
+    .expect("acquire a");
+    let receipt_a = lease_a.receipt().expect("receipt a");
+    drop(lease_a);
+
+    let lease_b = lock_builder_file_with_marker(
+        root.path(),
+        name,
+        shared_types::AppFileMutationMarker::for_operation("op-b").expect("marker"),
+    )
+    .expect("acquire b");
+    let receipt_b = lease_b.receipt().expect("receipt b");
+    drop(lease_b); // B 死亡未结算：marker 残留 op-b
+
+    // 归档 B（生产 reclaim 路径：持 flock → 归档孤儿 marker → 清零）。
+    {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open for reclaim");
+        file.try_lock().expect("flock for reclaim");
+        shared_types::AppFileMutationMarker::reclaim_orphaned(&file, Some(&archive))
+            .expect("archive orphaned b");
+    }
+
+    // A 迟到重复释放（真实恢复路径）：marker 已空 → complete 放行 + 追加 done op-a。
+    release_file_receipt(&lock_path, &receipt_a).expect("late duplicate release a");
+    assert_eq!(
+        validate_file_receipt(&lock_path, &receipt_b).ok(),
+        Some(true),
+        "更早代次的迟到 done 不撤销 B 的在途授权（148a8fa0 语义保持）"
+    );
+    assert_eq!(
+        validate_file_receipt(&lock_path, &receipt_a).ok(),
+        Some(false),
+        "A 已结算，重复释放幂等"
+    );
 }
