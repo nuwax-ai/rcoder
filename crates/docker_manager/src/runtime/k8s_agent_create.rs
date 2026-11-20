@@ -981,6 +981,13 @@ async fn probe_shared_dir(identifier: &str) -> SharedDirProbe {
 /// （uid+rv 前置条件）、写判据缓存后才解除门禁。此前反例：取消后门禁
 /// 放行 + 服务端 PATCH 仍提交 → 缓存 NotMigrated 与 PVC Migrated 分裂，
 /// 并发写落旧共享卷。
+fn chrono_or_epoch_secs() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_default()
+}
+
 async fn marker_completer(
     runtime: &KubernetesRuntime,
     gate: Option<shared_types::migration_gate::MigrationGuard>,
@@ -1008,10 +1015,11 @@ async fn marker_completer(
     // 至 PATCH/缓存落定（JoinHandle drop 不取消任务）。
     // 第十二轮 P1-a/b 重排：PATCH 身份来自 setter **自身**读取的同一对象
     // （返回其 UID）——外部前置 GET 是另一次采样，同名换代时会认错对象，
-    // 已删除。错误路径对账三态：Confirmed（同 UID 已迁移→缓存收敛按成功）；
-    // NotMigrated（同 UID 确未迁移→真失败，放行安全）；Inconclusive（读
-    // 失败/身份不符→invalidate 缓存键，下一请求 miss 后同步查真实状态，
-    // 不沿用旧缓存放行写共享卷）。取消安全保留（JoinHandle detach）。
+    // 已删除。codex 复审（2026-11-20）三态重排：setter 区分
+    // Applied / NothingApplied（GET 失败或 4xx 拒绝=确定无在途写，直接
+    // 收束）/ Unknown{UID,RV}（写已发出结果未知——完成者以 RV 栅栏推进
+    // 对象淘汰在途写后按重读终态收束；换代/删除本身即栅栏）。取消安全
+    // 保留（JoinHandle detach）。
     let identifier_for_log = identifier.to_string();
     let handle = tokio::spawn(async move {
         let _held = gate;
@@ -1025,76 +1033,161 @@ async fn marker_completer(
                 shared_types::WorkspaceMigrationState::Migrated,
             )
             .await;
+        use crate::runtime::kubernetes_runtime::workspace_runtime::MarkerSetOutcome;
         match outcome {
             // PATCH 成功：缓存已写、身份即该对象，直接成功。
-            Ok(_patched_uid) => Ok(()),
-            Err(error) => {
-                // setter 失败时无法得知它是否发出过写（其内部 GET 也可能
-                // 失败）→ 无 PATCH 身份。codex 复审（2026-11-20，夹具复现）：
-                // 此处提前返回会随任务结束释放门禁——迟到 PATCH 落地前，
-                // 新请求同步重读 PVC 能读到旧标记并获准写共享卷，随后 PATCH
-                // 落地切路由 → RBD/共享分裂。
-                //
-                // 修正：门禁不随错误释放，锚定**当前** PVC UID 自行对账——
-                // 迟到 PATCH 按名落地只可能命中当前对象（对象若被替换，旧
-                // PATCH 落在已删对象上，对新对象路由无效）：
-                // - 标记已 migrated → Confirmed：缓存收敛，放行（路由 RBD）
-                // - 同 UID 连续 not-migrated 超过落地宽限窗（PATCH 客户端
-                //   已超时，服务端落地不可能再晚于窗）→ 确未生效：不写
-                //   缓存（保持 invalidate），返回错误放行（路由共享，与
-                //   无标记一致）
-                // - API 不可读/UID 换代（观察重启）→ 继续持有门禁重试：
-                //   共享写被拒而非被误放，写保护优先于可用性
-                const LATE_PATCH_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
-                let pvcs: kube::Client = client.clone();
-                let api = kube::Api::<k8s_openapi::api::core::v1::PersistentVolumeClaim>::namespaced(pvcs, &namespace);
-                let mut backoff = std::time::Duration::from_secs(2);
-                let mut anchor: Option<(String, std::time::Instant)> = None;
+            Ok(MarkerSetOutcome::Applied(_patched_uid)) => Ok(()),
+            // codex 复审（2026-11-20）：GET 阶段失败或服务端明确拒绝 =
+            // 确定无在途写——直接收束（Err + 门禁随任务结束释放）。绝不把
+            // 后续同名对象的标记当作本操作证据。
+            Ok(MarkerSetOutcome::NothingApplied) => {
+                tracing::warn!(user_id = %identifier_for_log, "[K8S] fresh-init marker write definitely not applied; gate released");
+                cache.write().await.remove(&cache_key);
+                Err(ContainerRuntimeError::Conflict(format!(
+                    "fresh-init marker write not applied for '{identifier_for_log}'"
+                )))
+            }
+            // PATCH 已发出、结果未知：门禁不释放，按写入前提（UID+RV）做
+            // RV 栅栏淘汰——对象 RV 越过前提值后，在途写永远 409 不可能再
+            // 落地（codex 反例：固定宽限窗放行后旧写仍可迟到落地）。
+            Ok(MarkerSetOutcome::Unknown {
+                pvc_uid,
+                resource_version,
+            }) => {
+                let pvcs =
+                    kube::Api::<k8s_openapi::api::core::v1::PersistentVolumeClaim>::namespaced(
+                        client.clone(),
+                        &namespace,
+                    );
+                let mut backoff = std::time::Duration::from_secs(1);
                 loop {
-                    let observed = api.get(&pvc_name).await.ok().and_then(|pvc| {
-                        let uid = pvc.metadata.uid.clone()?;
-                        let migrated = pvc
-                            .metadata
-                            .annotations
-                            .as_ref()
-                            .and_then(|annotations| {
-                                annotations.get(shared_types::WORKSPACE_MIGRATION_ANNOTATION)
-                            })
-                            .is_some_and(|value| value == "migrated");
-                        Some((uid, migrated))
-                    });
+                    let observed = pvcs.get_opt(&pvc_name).await;
                     match observed {
-                        Some((uid, true)) => {
-                            tracing::warn!(user_id = %identifier_for_log, error = %error, pvc_uid = %uid, "[K8S] marker PATCH error reconciled: late patch landed (migrated)");
-                            cache.write().await.insert(
-                                cache_key.clone(),
-                                (true, shared_types::WorkspaceMigrationState::Migrated, std::time::Instant::now()),
-                            );
-                            return Ok(());
+                        Err(error) => {
+                            tracing::warn!(user_id = %identifier_for_log, error = %error, retry_backoff_secs = backoff.as_secs(), "[K8S] marker outcome unknown; PVC read failed, holding migration gate");
                         }
-                        Some((uid, false)) => {
-                            let now = std::time::Instant::now();
-                            let stable_since = match &anchor {
-                                Some((anchored, since)) if anchored == &uid => *since,
-                                _ => {
-                                    anchor = Some((uid.clone(), now));
-                                    tracing::warn!(user_id = %identifier_for_log, error = %error, pvc_uid = %uid, "[K8S] marker PATCH outcome unknown; holding migration gate, anchoring current PVC");
-                                    now
-                                }
-                            };
-                            if now.duration_since(stable_since) >= LATE_PATCH_GRACE {
-                                tracing::warn!(user_id = %identifier_for_log, error = %error, pvc_uid = %uid, "[K8S] fresh-init marker PATCH confirmed not landed within grace; gate released (stays shared)");
-                                return Err(error);
+                        Ok(None) => {
+                            // 目标对象已删除：在途写不可能影响任何现存对象。
+                            tracing::warn!(user_id = %identifier_for_log, "[K8S] marker outcome unknown but target PVC deleted; write eliminated, gate released");
+                            cache.write().await.remove(&cache_key);
+                            return Err(ContainerRuntimeError::Conflict(format!(
+                                "fresh-init PVC vanished before marker for '{identifier_for_log}'"
+                            )));
+                        }
+                        Ok(Some(pvc)) if pvc.metadata.uid.as_deref() != Some(pvc_uid.as_str()) => {
+                            // 同名换代：在途写的前提 RV 属旧对象，新对象 RV
+                            // 恒更大 → 迟到写必 409，已被换代本身淘汰。
+                            tracing::warn!(user_id = %identifier_for_log, "[K8S] marker outcome unknown but PVC replaced; stale write fenced by generation change, gate released");
+                            cache.write().await.remove(&cache_key);
+                            return Err(ContainerRuntimeError::Conflict(format!(
+                                "fresh-init PVC replaced before marker for '{identifier_for_log}'"
+                            )));
+                        }
+                        Ok(Some(pvc)) => {
+                            let migrated = pvc
+                                .metadata
+                                .annotations
+                                .as_ref()
+                                .and_then(|annotations| {
+                                    annotations.get(shared_types::WORKSPACE_MIGRATION_ANNOTATION)
+                                })
+                                .is_some_and(|value| value == "migrated");
+                            if migrated {
+                                tracing::warn!(user_id = %identifier_for_log, pvc_uid = %pvc_uid, "[K8S] marker reconciled: patch landed (migrated)");
+                                cache.write().await.insert(
+                                    cache_key.clone(),
+                                    (
+                                        true,
+                                        shared_types::WorkspaceMigrationState::Migrated,
+                                        std::time::Instant::now(),
+                                    ),
+                                );
+                                return Ok(());
                             }
-                        }
-                        None => {
-                            // PVC 读失败：门禁继续持有，退避重试（API 恢复后收敛）。
-                            tracing::warn!(user_id = %identifier_for_log, error = %error, retry_backoff_secs = backoff.as_secs(), "[K8S] marker PATCH outcome unknown; PVC unreadable, holding migration gate");
+                            // 未迁移：以当前 RV 推进对象（写栅栏时间戳注解）。
+                            // 成功即对象 RV 越过在途写前提 → 旧写永久淘汰；
+                            // 409 = 有人已推进（可能在途写已落地）→ 重读判定。
+                            let Some(current_rv) = pvc.metadata.resource_version.clone() else {
+                                tracing::warn!(user_id = %identifier_for_log, "[K8S] PVC without resourceVersion; retrying fence");
+                                tokio::time::sleep(backoff).await;
+                                backoff = (backoff * 2).min(std::time::Duration::from_secs(10));
+                                continue;
+                            };
+                            let fence = serde_json::json!({
+                                "metadata": {
+                                    "uid": pvc_uid,
+                                    "resourceVersion": current_rv,
+                                    "annotations": {
+                                        "rcoder.io/marker-fenced-at": chrono_or_epoch_secs(),
+                                    },
+                                }
+                            });
+                            match pvcs
+                                .patch(
+                                    &pvc_name,
+                                    &kube::api::PatchParams::default(),
+                                    &kube::api::Patch::Merge(&fence),
+                                )
+                                .await
+                            {
+                                Ok(_) => {
+                                    // 栅栏成功后重读最终状态：迁移标记若在栅栏
+                                    // 前落地，此处能读到；否则旧写已被淘汰。
+                                    match pvcs.get_opt(&pvc_name).await {
+                                        Ok(Some(final_state))
+                                            if final_state.metadata.uid.as_deref() == Some(pvc_uid.as_str())
+                                                && final_state
+                                                    .metadata
+                                                    .annotations
+                                                    .as_ref()
+                                                    .and_then(|annotations| {
+                                                        annotations.get(shared_types::WORKSPACE_MIGRATION_ANNOTATION)
+                                                    })
+                                                    .is_some_and(|value| value == "migrated") =>
+                                        {
+                                            tracing::warn!(user_id = %identifier_for_log, pvc_uid = %pvc_uid, "[K8S] marker reconciled after fence: late patch landed");
+                                            cache.write().await.insert(
+                                                cache_key.clone(),
+                                                (true, shared_types::WorkspaceMigrationState::Migrated, std::time::Instant::now()),
+                                            );
+                                            return Ok(());
+                                        }
+                                        Ok(Some(final_state))
+                                            if final_state.metadata.uid.as_deref() == Some(pvc_uid.as_str()) =>
+                                        {
+                                            tracing::warn!(user_id = %identifier_for_log, pvc_uid = %pvc_uid, "[K8S] stale marker write fenced (RV advanced); not migrated confirmed, gate released");
+                                            cache.write().await.remove(&cache_key);
+                                            return Err(ContainerRuntimeError::Conflict(format!(
+                                                "fresh-init marker write fenced as not landed for '{identifier_for_log}'"
+                                            )));
+                                        }
+                                        _ => {
+                                            // 读失败或换代：回到循环按新状态判定。
+                                        }
+                                    }
+                                }
+                                Err(kube::Error::Api(response)) if response.code == 409 => {
+                                    // 对象已被推进（可能在途写落地）→ 重读判定。
+                                }
+                                Err(error) => {
+                                    tracing::warn!(user_id = %identifier_for_log, error = %error, "[K8S] fence patch failed; holding migration gate");
+                                }
+                            }
                         }
                     }
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(std::time::Duration::from_secs(10));
                 }
+            }
+            Err(error) => {
+                // GET 阶段错误（NotSent 语义在 setter 内部已分流为
+                // NothingApplied；此处到达的 Err 仅为携带错误上下文的
+                // 包装）——按未发出写收束。
+                tracing::warn!(user_id = %identifier_for_log, error = %error, "[K8S] marker write never sent; gate released");
+                cache.write().await.remove(&cache_key);
+                Err(ContainerRuntimeError::Conflict(format!(
+                    "fresh-init marker write failed before send for '{identifier_for_log}'"
+                )))
             }
         }
     });
@@ -1103,5 +1196,370 @@ async fn marker_completer(
         Err(error) => Err(ContainerRuntimeError::ConnectionError(format!(
             "marker completer task failed: {error}"
         ))),
+    }
+}
+
+/// codex 复审（2026-11-20）RBD 三态+RV 栅栏回归：受控 K8s API transport
+/// 上验证完成者对 NotSent / Unknown（未落地/迟到落地/换代）的处置。
+#[cfg(all(test, feature = "kubernetes"))]
+mod marker_fence_tests {
+    use super::*;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn runtime(client: kube::Client) -> KubernetesRuntime {
+        use crate::runtime::kubernetes_runtime::KubernetesRuntimeConfig;
+        KubernetesRuntime {
+            client,
+            namespace: "fence-test".into(),
+            config: KubernetesRuntimeConfig {
+                namespace: "fence-test".into(),
+                cluster_domain: "cluster.local".into(),
+                pod_ttl_seconds: None,
+                image_pull_secret: None,
+                service_account_name: "test".into(),
+                nfs_server: "unused".into(),
+                nfs_path: "/unused".into(),
+                storage_class: "unused".into(),
+                access_mode: "ReadWriteOnce".into(),
+                docker_manager_config: Default::default(),
+                kubernetes_config: Default::default(),
+                execution_authority: "k8s:test".into(),
+            },
+            pod_cache: Default::default(),
+            subvolume_path_cache: Default::default(),
+            workspace_exists_cache: Default::default(),
+            event_publisher: Default::default(),
+            event_counters: Arc::new(
+                crate::runtime::k8s_event_publisher::PublisherCounters::default(),
+            ),
+        }
+    }
+
+    struct PvcState {
+        uid: &'static str,
+        rv: u64,
+        migrated: bool,
+        present: bool,
+    }
+
+    struct Fixture {
+        pvc: Mutex<PvcState>,
+        get_status: AtomicU16,
+        patch_status: AtomicU16,
+        /// 栅栏 PATCH 到达时同时落地迁移标记（模拟迟到写恰在栅栏前落地）。
+        late_land_on_fence: AtomicBool,
+        replace_uid_on_get: AtomicUsize,
+        migration_patches: AtomicUsize,
+        fence_patches: AtomicUsize,
+    }
+
+    async fn serve(listener: tokio::net::TcpListener, fixture: Arc<Fixture>) {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let fixture = fixture.clone();
+            tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let (head, offset, length) = loop {
+                    let Ok(count) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    if count == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = bytes.windows(4).position(|b| b == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&bytes[..end]).into_owned();
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                let (k, v) = line.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        break (head, end + 4, length);
+                    }
+                };
+                while bytes.len() < offset + length {
+                    let Ok(count) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    if count == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                let method = head.split_whitespace().next().unwrap_or("");
+                let path = head.split_whitespace().nth(1).unwrap_or("");
+                if !path.contains("/persistentvolumeclaims/") {
+                    let body = r#"{"apiVersion":"v1","kind":"Status","code":404}"#;
+                    let response = format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    return;
+                }
+                let pvc_json = |state: &PvcState| {
+                    serde_json::json!({
+                        "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                        "metadata": {
+                            "name": "pvc", "uid": state.uid,
+                            "resourceVersion": state.rv.to_string(),
+                            "annotations": if state.migrated {
+                                serde_json::json!({shared_types::WORKSPACE_MIGRATION_ANNOTATION: "migrated"})
+                            } else { serde_json::json!({}) },
+                        },
+                    })
+                };
+                let (code, value) = if method == "GET" {
+                    let status = fixture.get_status.load(Ordering::SeqCst);
+                    if status != 200 {
+                        (
+                            status as u16,
+                            serde_json::json!({"kind":"Status","code":status,"message":"injected"}),
+                        )
+                    } else {
+                        let mut state = fixture.pvc.lock().unwrap();
+                        let generation = fixture
+                            .replace_uid_on_get
+                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                                left.checked_sub(1)
+                            })
+                            .unwrap_or(0);
+                        if generation > 0 {
+                            state.uid = "replacement-uid";
+                        }
+                        if !state.present {
+                            (
+                                404,
+                                serde_json::json!({"kind":"Status","code":404,"reason":"NotFound"}),
+                            )
+                        } else {
+                            (200, pvc_json(&state))
+                        }
+                    }
+                } else if method == "PATCH" {
+                    let status = fixture.patch_status.load(Ordering::SeqCst);
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&bytes[offset..offset + length]).unwrap_or_default();
+                    let annotations = &body["metadata"]["annotations"];
+                    let is_fence = annotations
+                        .get("rcoder.io/marker-fenced-at")
+                        .is_some_and(|value| !value.is_null());
+                    let is_migration = annotations
+                        .get(shared_types::WORKSPACE_MIGRATION_ANNOTATION)
+                        .is_some_and(|value| value == "migrated");
+                    if status != 200 {
+                        // 注入失败（仅第一次迁移 PATCH；后续栅栏 PATCH 正常处理）。
+                        if is_migration {
+                            fixture.migration_patches.fetch_add(1, Ordering::SeqCst);
+                            fixture.patch_status.store(200, Ordering::SeqCst);
+                            return_body(&mut stream, status, &serde_json::json!({"kind":"Status","code":status,"message":"injected"})).await;
+                            return;
+                        }
+                        return_body(&mut stream, status, &serde_json::json!({"kind":"Status","code":status,"message":"injected"})).await;
+                        return;
+                    }
+                    let mut state = fixture.pvc.lock().unwrap();
+                    if is_fence {
+                        fixture.fence_patches.fetch_add(1, Ordering::SeqCst);
+                        if fixture.late_land_on_fence.load(Ordering::SeqCst) {
+                            state.migrated = true;
+                        }
+                    }
+                    if is_migration {
+                        fixture.migration_patches.fetch_add(1, Ordering::SeqCst);
+                        state.migrated = true;
+                    }
+                    state.rv += 1;
+                    (200, pvc_json(&state))
+                } else {
+                    (405, serde_json::json!({"kind":"Status","code":405}))
+                };
+                return_body(&mut stream, code, &value).await;
+            });
+        }
+    }
+
+    async fn return_body(stream: &mut tokio::net::TcpStream, code: u16, value: &serde_json::Value) {
+        let body = value.to_string();
+        let response = format!(
+            "HTTP/1.1 {code} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+    }
+
+    struct Harness {
+        runtime: KubernetesRuntime,
+        fixture: Arc<Fixture>,
+        identifier: &'static str,
+    }
+
+    async fn harness(pvc: PvcState) -> Harness {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(rustls::crypto::ring::default_provider().install_default());
+        let client = kube::Client::try_from(kube::Config::new(
+            format!("http://{address}").parse().unwrap(),
+        ))
+        .unwrap();
+        let fixture = Arc::new(Fixture {
+            pvc: Mutex::new(pvc),
+            get_status: AtomicU16::new(200),
+            patch_status: AtomicU16::new(200),
+            late_land_on_fence: AtomicBool::new(false),
+            replace_uid_on_get: AtomicUsize::new(0),
+            migration_patches: AtomicUsize::new(0),
+            fence_patches: AtomicUsize::new(0),
+        });
+        let server_fixture = fixture.clone();
+        tokio::spawn(serve(listener, server_fixture));
+        Harness {
+            runtime: runtime(client),
+            fixture,
+            identifier: "rcoder-app-51",
+        }
+    }
+
+    impl Harness {
+        async fn complete(&self) -> ContainerRuntimeResult<()> {
+            let gate = shared_types::migration_gate::begin_guarded(self.identifier)
+                .expect("gate free before completer");
+            marker_completer(
+                &self.runtime,
+                Some(gate),
+                self.identifier,
+                &ServiceType::UserappBuilder,
+            )
+            .await
+        }
+
+        fn gate_released(&self) -> bool {
+            shared_types::migration_gate::begin_guarded(self.identifier).is_some()
+        }
+    }
+
+    /// 场景 A（codex 反例）：写前 GET 持续 5xx——确定未发出写，必须立即
+    /// 收束（不得无限重试持门禁），也不得把任何对象状态当作成功。
+    #[tokio::test]
+    async fn get_failure_terminates_without_confirming() {
+        let harness = harness(PvcState {
+            uid: "u1",
+            rv: 1,
+            migrated: false,
+            present: true,
+        })
+        .await;
+        harness.fixture.get_status.store(400, Ordering::SeqCst);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(8), harness.complete())
+            .await
+            .expect("NotSent 必须立即收束，不得循环");
+        assert!(result.is_err(), "未发出写不得确认为成功");
+        assert!(harness.gate_released(), "门禁必须随收束释放");
+        assert_eq!(harness.fixture.migration_patches.load(Ordering::SeqCst), 0);
+    }
+
+    /// 场景 A'：PVC 持续 404——NothingApplied，立即收束。
+    #[tokio::test]
+    async fn absent_pvc_terminates() {
+        let harness = harness(PvcState {
+            uid: "u1",
+            rv: 1,
+            migrated: false,
+            present: false,
+        })
+        .await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(8), harness.complete())
+            .await
+            .expect("404 必须立即收束");
+        assert!(result.is_err());
+        assert!(harness.gate_released());
+    }
+
+    /// 场景 C：PATCH 结果未知 + 旧写确实未落地——RV 栅栏推进后按重读
+    /// 终态收束为未迁移，门禁释放。
+    #[tokio::test]
+    async fn unknown_patch_fenced_when_not_landed() {
+        let harness = harness(PvcState {
+            uid: "u1",
+            rv: 1,
+            migrated: false,
+            present: true,
+        })
+        .await;
+        harness.fixture.patch_status.store(500, Ordering::SeqCst);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), harness.complete())
+            .await
+            .expect("栅栏路径必须收敛");
+        assert!(result.is_err(), "旧写被栅栏淘汰且未迁移 → 收束为失败");
+        assert!(
+            harness.fixture.fence_patches.load(Ordering::SeqCst) >= 1,
+            "必须发生 RV 栅栏推进"
+        );
+        assert!(harness.gate_released());
+    }
+
+    /// 场景 D：迟到写恰在栅栏前落地——重读到 migrated，确认成功并写缓存。
+    #[tokio::test]
+    async fn unknown_patch_late_landing_confirmed() {
+        let harness = harness(PvcState {
+            uid: "u1",
+            rv: 1,
+            migrated: false,
+            present: true,
+        })
+        .await;
+        harness.fixture.patch_status.store(500, Ordering::SeqCst);
+        harness
+            .fixture
+            .late_land_on_fence
+            .store(true, Ordering::SeqCst);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), harness.complete())
+            .await
+            .expect("迟到落地必须收敛");
+        assert!(result.is_ok(), "迟到写落地 → migrated 确认成功");
+        let pvc_name = harness
+            .runtime
+            .workspace_pvc_name(harness.identifier, &ServiceType::UserappBuilder)
+            .unwrap();
+        let cache = harness.runtime.workspace_exists_cache.read().await;
+        let (_, state, _) = cache
+            .get(&pvc_name)
+            .expect("确认后判据缓存必须收敛为 Migrated");
+        assert_eq!(*state, shared_types::WorkspaceMigrationState::Migrated);
+        drop(cache);
+        assert!(harness.gate_released());
+    }
+
+    /// 场景 E：同名换代——旧写的前提 RV 属旧对象，被换代本身淘汰，收束释放。
+    #[tokio::test]
+    async fn replaced_pvc_fences_stale_write() {
+        let harness = harness(PvcState {
+            uid: "u1",
+            rv: 1,
+            migrated: false,
+            present: true,
+        })
+        .await;
+        harness.fixture.patch_status.store(500, Ordering::SeqCst);
+        harness
+            .fixture
+            .replace_uid_on_get
+            .store(2, Ordering::SeqCst);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), harness.complete())
+            .await
+            .expect("换代场景必须收敛");
+        assert!(result.is_err());
+        assert!(harness.gate_released());
     }
 }

@@ -467,6 +467,24 @@ impl KubernetesRuntime {
 /// 并发写落旧共享卷。
 /// 成功时返回**本次实际读取并 PATCH 的 PVC UID**——对账必须以此身份核对
 ///（第十二轮 P1：外部再 GET 是另一次采样，同名换代时会认错对象）。
+/// marker 写入三态（codex 复审 2026-11-20）：完成者的门禁处置必须区分
+/// "从未发出写"与"写已发出结果未知"——前者可直接收束，后者需 RV 栅栏
+/// 淘汰在途写后才可放行。
+pub(crate) enum MarkerSetOutcome {
+    /// PATCH 已确认应用（缓存已写）。携带 setter 自身读到的 PVC UID。
+    Applied(String),
+    /// 确定没有任何写落地：GET 阶段失败（未发出），或 PATCH 被服务端
+    /// 明确拒绝（404 目标消失 / 409 RV 冲突 / 其他 4xx 拒绝）。
+    NothingApplied,
+    /// PATCH 已发出但结果未知（传输失败/超时/5xx——可能已到达服务端）。
+    /// 携带目标对象 UID 与写入前提 RV：完成者据此做 RV 条件的状态推进
+    /// 栅栏——对象 RV 越过该值后，此在途写永远 409，不可能再落地。
+    Unknown {
+        pvc_uid: String,
+        resource_version: String,
+    },
+}
+
 pub(crate) async fn set_migration_state_detached(
     client: Client,
     namespace: String,
@@ -474,25 +492,29 @@ pub(crate) async fn set_migration_state_detached(
     pvc_name: String,
     cache_key: String,
     state: shared_types::WorkspaceMigrationState,
-) -> ContainerRuntimeResult<String> {
+) -> ContainerRuntimeResult<MarkerSetOutcome> {
     let pvcs: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
         kube::Api::namespaced(client, &namespace);
-    let existing = pvcs
-        .get_opt(&pvc_name)
-        .await
-        .map_err(|e| ContainerRuntimeError::K8sError(format!("get PVC '{pvc_name}': {e}")))?
-        .ok_or_else(|| {
-            ContainerRuntimeError::ContainerNotFound(format!(
-                "PVC '{pvc_name}' not found; refusing to flip migration state"
-            ))
-        })?;
-    let uid =
-        existing.metadata.uid.clone().ok_or_else(|| {
-            ContainerRuntimeError::Conflict(format!("PVC '{pvc_name}' has no UID"))
-        })?;
-    let rv = existing.metadata.resource_version.clone().ok_or_else(|| {
-        ContainerRuntimeError::Conflict(format!("PVC '{pvc_name}' has no resourceVersion"))
-    })?;
+    // GET 阶段的任何失败 = 从未发出写（NotSent）：不携带对象身份，完成者
+    // 直接收束，不得把后续同名对象的标记当作本操作证据（codex 反例：
+    // GET 失败后同名替换 PVC 自带 migrated 被误认成功）。
+    let existing = match pvcs.get_opt(&pvc_name).await {
+        Ok(Some(existing)) => existing,
+        Ok(None) => return Ok(MarkerSetOutcome::NothingApplied),
+        Err(error) => {
+            return Err(ContainerRuntimeError::K8sError(format!(
+                "get PVC '{pvc_name}': {error}"
+            )));
+        }
+    };
+    let (Some(uid), Some(rv)) = (
+        existing.metadata.uid.clone(),
+        existing.metadata.resource_version.clone(),
+    ) else {
+        return Err(ContainerRuntimeError::Conflict(format!(
+            "PVC '{pvc_name}' has no uid/resourceVersion"
+        )));
+    };
     let annotations = match state.as_annotation() {
         Some(value) => serde_json::json!({
             shared_types::WORKSPACE_MIGRATION_ANNOTATION: value
@@ -504,29 +526,48 @@ pub(crate) async fn set_migration_state_detached(
     let patch = serde_json::json!({
         "metadata": {"uid": uid, "resourceVersion": rv, "annotations": annotations}
     });
-    pvcs.patch(
-        &pvc_name,
-        &kube::api::PatchParams::default(),
-        &kube::api::Patch::Merge(&patch),
-    )
-    .await
-    .map_err(|e| match &e {
-        kube::Error::Api(response) if response.code == 404 => {
-            ContainerRuntimeError::ContainerNotFound(format!("PVC '{pvc_name}' vanished"))
-        }
-        kube::Error::Api(response) if response.code == 409 => {
-            ContainerRuntimeError::Conflict(format!("PVC '{pvc_name}' changed concurrently; retry"))
-        }
-        other => ContainerRuntimeError::K8sError(format!(
-            "patch PVC '{pvc_name}' migration state: {other}"
-        )),
-    })?;
-    // 即时写缓存：完成者场景下这是"取消后路由与 PVC 收敛"的关键一步。
-    cache
-        .write()
+    match pvcs
+        .patch(
+            &pvc_name,
+            &kube::api::PatchParams::default(),
+            &kube::api::Patch::Merge(&patch),
+        )
         .await
-        .insert(cache_key, (true, state, std::time::Instant::now()));
-    Ok(uid)
+    {
+        Ok(_) => {
+            // 即时写缓存：完成者场景下这是"取消后路由与 PVC 收敛"的关键一步。
+            cache
+                .write()
+                .await
+                .insert(cache_key, (true, state, std::time::Instant::now()));
+            Ok(MarkerSetOutcome::Applied(uid))
+        }
+        Err(kube::Error::Api(response)) if response.code == 404 => {
+            // 目标在应用时已消失：本次写确定未落地。
+            Ok(MarkerSetOutcome::NothingApplied)
+        }
+        Err(kube::Error::Api(response)) if response.code == 409 => {
+            // RV 冲突被拒：服务端证明本次写未落地。
+            Ok(MarkerSetOutcome::NothingApplied)
+        }
+        Err(kube::Error::Api(response)) if (400..500).contains(&response.code) => {
+            // 其他 4xx 明确拒绝：未落地。
+            Ok(MarkerSetOutcome::NothingApplied)
+        }
+        Err(other) => {
+            // 传输失败/超时/5xx：写可能已到达服务端——结果未知。交出写入
+            // 前提（UID+RV）供完成者做 RV 栅栏淘汰；原始错误仅记日志。
+            tracing::warn!(
+                pvc = %pvc_name,
+                error = %other,
+                "migration marker PATCH outcome unknown; handing UID/RV precondition to completer fence"
+            );
+            Ok(MarkerSetOutcome::Unknown {
+                pvc_uid: uid,
+                resource_version: rv,
+            })
+        }
+    }
 }
 
 /// 完成者错误路径的对账（第十轮 P1）：PATCH 报错但可能已到达服务端（响应
