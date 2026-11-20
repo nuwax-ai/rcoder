@@ -16,15 +16,23 @@
 //! 范围：进程内（单副本）。多副本需共享门禁态（与 TTL 判据同批的生产
 //! 前置）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use axum::http::Method;
 
 #[derive(Default)]
 struct GateState {
-    migrating: HashSet<String>,
+    /// 门禁按持有者 token 记账（第十二轮 P1：HashSet 语义下任一 guard 的
+    /// Drop 都会清掉整个用户标志——重试请求的 guard 会提前放行旧后台任务
+    /// 仍持有的门禁）。token 匹配才允许解除。
+    migrating: HashMap<String, u64>,
     inflight: HashMap<String, usize>,
+}
+
+fn next_gate_token() -> u64 {
+    static TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 static STATE: LazyLock<std::sync::Mutex<GateState>> =
@@ -34,21 +42,27 @@ static DRAINED: LazyLock<tokio::sync::Notify> = LazyLock::new(tokio::sync::Notif
 
 /// 标记用户迁移/首建进行中（编排路径调用）。与 `admit_write` 共享同一把
 /// 锁——置位后所有新的写准入立即失败。
-pub fn begin(user_id: &str) {
-    STATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .migrating
-        .insert(user_id.to_string());
+/// 登记（已存在时**不覆盖**并返回 None——insert 覆盖会让旧持有者的
+/// Drop 解除新门禁，第十二轮 P1）。调用方对 None 按编排冲突处理。
+pub fn begin(user_id: &str) -> Option<u64> {
+    let token = next_gate_token();
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    match state.migrating.entry(user_id.to_string()) {
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(token);
+            Some(token)
+        }
+        std::collections::hash_map::Entry::Occupied(_) => None,
+    }
 }
 
 /// 清除标记（编排结束——成功/失败路径都必须调）。
-pub fn end(user_id: &str) {
-    STATE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .migrating
-        .remove(user_id);
+/// 按持有者 token 解除（不匹配时无操作——别的持有者仍在门禁内）。
+pub fn end_with_token(user_id: &str, token: u64) {
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if state.migrating.get(user_id).copied() == Some(token) {
+        state.migrating.remove(user_id);
+    }
 }
 
 /// 该用户编排是否进行中（仅观测用；准入判定必须走 admit_write）。
@@ -57,7 +71,7 @@ pub fn is_migrating(user_id: &str) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .migrating
-        .contains(user_id)
+        .contains_key(user_id)
 }
 
 /// 写准入结果：Ok=已登记在途（所有副本结束时副作用视为完成）；Err=门禁拦截。
@@ -69,7 +83,7 @@ pub enum WriteAdmission {
 /// 原子写准入：同一把锁内检查编排标记 + 登记在途计数。
 pub fn admit_write(user_id: &str) -> WriteAdmission {
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if state.migrating.contains(user_id) {
+    if state.migrating.contains_key(user_id) {
         return WriteAdmission::Gated;
     }
     let count = state.inflight.entry(user_id.to_string()).or_insert(0);
@@ -162,9 +176,9 @@ mod tests {
 
     #[test]
     fn gate_begin_end_cycle() {
-        begin("gate-test-user");
+        let token = begin("gate-test-user").expect("first begin");
         assert!(is_migrating("gate-test-user"));
-        end("gate-test-user");
+        end_with_token("gate-test-user", token);
         assert!(!is_migrating("gate-test-user"));
     }
 
@@ -181,9 +195,9 @@ mod tests {
     #[test]
     fn admit_after_begin_is_gated_and_drain_sees_registered() {
         let user = "atomic-admit-user";
-        begin(user);
+        let token = begin(user).expect("begin");
         assert!(matches!(admit_write(user), WriteAdmission::Gated));
-        end(user);
+        end_with_token(user, token);
         let guard = match admit_write(user) {
             WriteAdmission::Admitted(guard) => guard,
             WriteAdmission::Gated => panic!("admission must succeed after end"),
@@ -235,20 +249,24 @@ mod tests {
 /// 释放，杜绝手写 `end` 遗漏导致的该用户写准入永久冻结。
 pub struct MigrationGuard {
     user_id: String,
+    token: u64,
 }
 
 impl Drop for MigrationGuard {
     fn drop(&mut self) {
-        end(&self.user_id);
+        end_with_token(&self.user_id, self.token);
     }
 }
 
-/// 置位并返回 RAII guard（编排路径持有到编排完成/取消）。
-pub fn begin_guarded(user_id: &str) -> MigrationGuard {
-    begin(user_id);
-    MigrationGuard {
+/// 置位并返回 RAII guard。**同用户已有门禁时返回 None**（旧后台任务仍在
+/// 切换中——重试请求不得并发做 fresh-init 决策，调用方应走共享路径放弃
+/// 本次编排，而非叠加第二个门禁）。
+pub fn begin_guarded(user_id: &str) -> Option<MigrationGuard> {
+    let token = begin(user_id)?;
+    Some(MigrationGuard {
         user_id: user_id.to_string(),
-    }
+        token,
+    })
 }
 
 #[cfg(test)]
@@ -261,7 +279,7 @@ mod cancel_safety_tests {
     fn cancelled_choreography_releases_gate() {
         let user = "cancel-safety-user";
         {
-            let _guard = begin_guarded(user);
+            let _guard = begin_guarded(user).expect("first acquisition");
             assert!(is_migrating(user));
             // 模拟编排 future 在 await 点被取消：guard 随作用域 drop。
         }
@@ -275,4 +293,19 @@ mod cancel_safety_tests {
             WriteAdmission::Admitted(_)
         ));
     }
+}
+
+/// 第十二轮 P1 核心反例：A 后台持门禁 → B 重试 begin 被拒（None）→
+/// B 的任何 drop 不得清除 A 的门禁。
+#[test]
+fn retry_guard_cannot_release_older_holder_gate() {
+    let user = "gate-overlap-user";
+    let guard_a = begin_guarded(user).expect("A acquires");
+    // B 重试：门禁被 A 持有 → 拒绝并发 fresh-init
+    assert!(begin_guarded(user).is_none(), "B must be rejected while A holds");
+    // 裸 begin 撞已有持有者：不覆盖、返回 None（旧实现 insert 覆盖会让
+    // B 的 Drop 解除 A 的门禁——测试在旧实现上曾红）。
+    assert!(begin(user).is_none(), "裸 begin 撞已有必须拒绝且不覆盖");
+    drop(guard_a);
+    assert!(!is_migrating(user));
 }

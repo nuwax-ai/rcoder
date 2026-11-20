@@ -145,8 +145,11 @@ impl KubernetesRuntime {
                     // 也会经 Drop 释放——手写 end 无法覆盖取消路径（曾致写准入
                     // 永久冻结的变体）。已派发但结果未知的 K8s 写由 ensure 幂等
                     // + 四象限重探测天然对账。
+                    // begin_guarded 返回 Option（同用户已有门禁时 None——
+                    // 旧后台任务仍在切换中，重试请求走共享路径放弃本次编排，
+                    // 不得并发做 fresh-init 决策，第十二轮 P1）。
                     let mut migration_gate =
-                        Some(shared_types::migration_gate::begin_guarded(identifier));
+                        shared_types::migration_gate::begin_guarded(identifier);
                     let drain_left = shared_types::migration_gate::drain_user_writes(
                         identifier,
                         std::time::Duration::from_secs(10),
@@ -970,20 +973,15 @@ async fn marker_completer(
     // 继续（此前派发即继续建 RBD agent，PATCH 失败只记日志）。取消安全保
     // 留：外层 future 取消只是不再等结果——spawn 的任务继续跑完并持门禁
     // 至 PATCH/缓存落定（JoinHandle drop 不取消任务）。
-    // 第十一轮 P1 重排：PATCH、错误对账（按原 PVC UID）、缓存更新全部在
-    // 同一个后台任务内——门禁由任务持有至三步落定（此前对账在外层，任务
-    // 结束即释放门禁，对账期间写已开放；外层取消时对账不执行）。取消安全
-    // 保留：JoinHandle drop 不取消任务，外层取消只是不再等结果。
+    // 第十二轮 P1-a/b 重排：PATCH 身份来自 setter **自身**读取的同一对象
+    // （返回其 UID）——外部前置 GET 是另一次采样，同名换代时会认错对象，
+    // 已删除。错误路径对账三态：Confirmed（同 UID 已迁移→缓存收敛按成功）；
+    // NotMigrated（同 UID 确未迁移→真失败，放行安全）；Inconclusive（读
+    // 失败/身份不符→invalidate 缓存键，下一请求 miss 后同步查真实状态，
+    // 不沿用旧缓存放行写共享卷）。取消安全保留（JoinHandle detach）。
     let identifier_for_log = identifier.to_string();
     let handle = tokio::spawn(async move {
         let _held = gate;
-        // PATCH 前记 UID：错误对账按同一对象核对（同名换代不作数）。
-        let expected_uid = {
-            use crate::runtime::k8s_pvc::K8sPvcOps;
-            let pvcs: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
-                kube::Api::namespaced(client.clone(), &namespace);
-            pvcs.get(&pvc_name).await.ok().and_then(|pvc| pvc.metadata.uid)
-        };
         let outcome =
             crate::runtime::kubernetes_runtime::workspace_runtime::set_migration_state_detached(
                 client.clone(),
@@ -995,35 +993,39 @@ async fn marker_completer(
             )
             .await;
         match outcome {
-            Ok(()) => Ok(()),
+            // PATCH 成功：缓存已写、身份即该对象，直接成功。
+            Ok(_patched_uid) => Ok(()),
             Err(error) => {
-                // 错误路径对账（第十轮 P1）：PATCH 报错但可能已到达服务端。
-                // 同 UID 且已 migrated → 缓存补写按成功收敛；否则真失败
-                // （路由与 PVC 一致，gate 随任务结束释放安全）。
+                // setter 失败时无法得知它是否发出过写（其内部 GET 也可能
+                // 失败）→ 无 PATCH 身份 → 对账只能走 Inconclusive 语义。
+                // 仍做一次对账尝试（若 PVC 恰好可读且此前是 fresh-init
+                // 续接路径、PVC 已 migrated 且键缓存未变，读到的 migrated
+                // 至少让下一请求立即正确）——但身份未知，按 Inconclusive
+                // 处理：invalidate，不断言成功/失败。
                 match crate::runtime::kubernetes_runtime::workspace_runtime::reconcile_migration_marker(
                     client,
                     &namespace,
                     &pvc_name,
                     &cache_key,
                     cache,
-                    expected_uid.as_deref(),
+                    None,
                 )
                 .await
                 {
-                    Some(()) => {
-                        tracing::warn!(
-                            user_id = %identifier_for_log,
-                            error = %error,
-                            "[K8S] fresh-init marker PATCH errored but server applied it; cache reconciled, treating as success"
-                        );
+                    crate::runtime::kubernetes_runtime::workspace_runtime::MarkerReconciliation::Confirmed => {
+                        // 无身份对账不该返回 Confirmed（None 输入必走
+                        // Inconclusive）；防御性按成功处理。
+                        tracing::warn!(user_id = %identifier_for_log, error = %error, "[K8S] marker PATCH error reconciled as confirmed");
                         Ok(())
                     }
-                    None => {
-                        tracing::warn!(
-                            user_id = %identifier_for_log,
-                            error = %error,
-                            "[K8S] fresh-init marker PATCH failed (server did not apply); gate released on task end"
-                        );
+                    crate::runtime::kubernetes_runtime::workspace_runtime::MarkerReconciliation::NotMigrated => {
+                        tracing::warn!(user_id = %identifier_for_log, error = %error, "[K8S] fresh-init marker PATCH failed (same object not migrated); gate released on task end");
+                        Err(error)
+                    }
+                    crate::runtime::kubernetes_runtime::workspace_runtime::MarkerReconciliation::Inconclusive => {
+                        // 缓存键已 invalidate：门禁释放后下一请求同步查询
+                        // 真实 annotation，无旧缓存可误用。
+                        tracing::warn!(user_id = %identifier_for_log, error = %error, "[K8S] marker PATCH outcome unknown; cache invalidated, next request re-reads PVC");
                         Err(error)
                     }
                 }

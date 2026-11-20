@@ -472,6 +472,8 @@ impl KubernetesRuntime {
 /// marker PATCH + 判据缓存写，门禁（migration_guard）随任务持有至此——
 /// 提前放行会让路由缓存（仍 NotMigrated）与 PVC（已 Migrated）分裂，
 /// 并发写落旧共享卷。
+/// 成功时返回**本次实际读取并 PATCH 的 PVC UID**——对账必须以此身份核对
+///（第十二轮 P1：外部再 GET 是另一次采样，同名换代时会认错对象）。
 pub(crate) async fn set_migration_state_detached(
     client: Client,
     namespace: String,
@@ -479,7 +481,7 @@ pub(crate) async fn set_migration_state_detached(
     pvc_name: String,
     cache_key: String,
     state: shared_types::WorkspaceMigrationState,
-) -> ContainerRuntimeResult<()> {
+) -> ContainerRuntimeResult<String> {
     use crate::runtime::k8s_pvc::K8sPvcOps;
     let pvcs: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
         kube::Api::namespaced(client, &namespace);
@@ -529,12 +531,26 @@ pub(crate) async fn set_migration_state_detached(
         cache_key,
         (true, state, std::time::Instant::now()),
     );
-    Ok(())
+    Ok(uid)
 }
 
 /// 完成者错误路径的对账（第十轮 P1）：PATCH 报错但可能已到达服务端（响应
 /// 丢失/超时）——重读同一 PVC 的实际标记：已 migrated 则补写判据缓存
 /// （成功收敛）；未 migrated 才是真失败。返回 Some(()) = 已收敛。
+/// 对账三态（第十二轮 P1）：
+/// - Confirmed：同一 UID（setter 实际 PATCH 的对象）且已 migrated → 缓存收敛。
+/// - NotMigrated：同一 UID 且确未迁移 → 放行安全（路由与 PVC 一致）。
+/// - Inconclusive：**读失败 / UID 不匹配（无 PATCH 身份或对象换代）**——
+///   已提交的 PATCH 结果未知。此时不写缓存、不按任何一侧断言，改为
+///   **invalidate 缓存键**：下一个请求 cache-miss 后同步查询真实
+///   annotation，一致性由查询保证；门禁可安全释放（不会沿用旧缓存
+///   放行写共享卷）。
+pub(crate) enum MarkerReconciliation {
+    Confirmed,
+    NotMigrated,
+    Inconclusive,
+}
+
 pub(crate) async fn reconcile_migration_marker(
     client: Client,
     namespace: &str,
@@ -542,18 +558,21 @@ pub(crate) async fn reconcile_migration_marker(
     cache_key: &str,
     cache: Arc<RwLock<std::collections::HashMap<String, WorkspaceMigrationCacheValue>>>,
     expected_pvc_uid: Option<&str>,
-) -> Option<()> {
+) -> MarkerReconciliation {
     use crate::runtime::k8s_pvc::K8sPvcOps;
     let pvcs: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
         kube::Api::namespaced(client, namespace);
-    let pvc = pvcs.get(pvc_name).await.ok()?;
-    // 按原 PVC UID 对账（第十一轮 P1）：同名 PVC 删建换代后，新对象的
-    // migrated 状态与本次 PATCH 无关——不能当成功收敛的证据。
-    if let Some(expected) = expected_pvc_uid {
-        let actual = pvc.metadata.uid.as_deref();
-        if actual != Some(expected) {
-            return None;
-        }
+    let pvc = match pvcs.get(pvc_name).await {
+        Ok(pvc) => pvc,
+        Err(_) => return MarkerReconciliation::invalidate(cache_key, &cache).await,
+    };
+    // 对账身份必须存在且匹配（第十二轮 P1：None 不得降级为按名验真——
+    // 前置读失败时同名新 PVC 的 migrated 不是本操作的证据）。
+    let Some(expected) = expected_pvc_uid else {
+        return MarkerReconciliation::invalidate(cache_key, &cache).await;
+    };
+    if pvc.metadata.uid.as_deref() != Some(expected) {
+        return MarkerReconciliation::invalidate(cache_key, &cache).await;
     }
     let migrated = pvc
         .metadata
@@ -562,12 +581,23 @@ pub(crate) async fn reconcile_migration_marker(
         .and_then(|annotations| annotations.get(shared_types::WORKSPACE_MIGRATION_ANNOTATION))
         .map(|value| value == "migrated")
         .unwrap_or(false);
-    if !migrated {
-        return None;
+    if migrated {
+        cache.write().await.insert(
+            cache_key.to_string(),
+            (true, shared_types::WorkspaceMigrationState::Migrated, std::time::Instant::now()),
+        );
+        MarkerReconciliation::Confirmed
+    } else {
+        MarkerReconciliation::NotMigrated
     }
-    cache.write().await.insert(
-        cache_key.to_string(),
-        (true, shared_types::WorkspaceMigrationState::Migrated, std::time::Instant::now()),
-    );
-    Some(())
+}
+
+impl MarkerReconciliation {
+    async fn invalidate(
+        cache_key: &str,
+        cache: &Arc<RwLock<std::collections::HashMap<String, WorkspaceMigrationCacheValue>>>,
+    ) -> Self {
+        cache.write().await.remove(cache_key);
+        Self::Inconclusive
+    }
 }

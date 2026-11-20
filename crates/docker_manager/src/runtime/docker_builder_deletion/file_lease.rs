@@ -176,22 +176,18 @@ pub(super) fn validate_file_receipt(
     if !owner.is_empty() {
         return Ok(false);
     }
-    // 活 marker 为空（被归档回收清零）：查归档旁文件的最新 token——替代
-    // 执行者仍持原回执在途时，其完成/清除确认必须仍能匹配（第十轮 P1）。
-    // 已释放（done 标记）的 token 不再验真（第十一轮 P1 的另一半反例）。
+    // 活 marker 为空（被归档回收清零）：查归档中**本 token 自身的最后一条
+    // 记录**（第十二轮 P2：只看全局最新一条时，A 的迟到重复 release 追加
+    // done A 会撤销尚未结算的 B——跨 token 串扰）。本 token 最后出现形式：
+    // `done <token>` → 已结算不验真；裸 `<token>` → 在途权威仍验真。
     let archive = path.with_extension("lock.orphaned");
     if let Ok(content) = std::fs::read_to_string(&archive) {
-        let latest = content
+        let own_last = content
             .lines()
-            .rev()
-            .find_map(|line| line.split_once(' ').map(|(_, rest)| rest.trim()));
-        if let Some(latest) = latest {
-            if let Some(token_part) = latest.strip_prefix("done ") {
-                let _ = token_part; // 最新条目是释放标记：无在途权威
-                return Ok(false);
-            }
-            return Ok(latest == token.as_str());
-        }
+            .filter_map(|line| line.split_once(' ').map(|(_, rest)| rest.trim()))
+            .filter(|rest| *rest == token.as_str() || *rest == format!("done {}", token))
+            .next_back();
+        return Ok(own_last == Some(token.as_str()));
     }
     // Empty markers are already released, not authority to resume this operation.
     // Dropping this temporary fd unlocks without clearing or rewriting the marker.

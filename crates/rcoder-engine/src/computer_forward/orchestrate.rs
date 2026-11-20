@@ -27,27 +27,31 @@ use crate::service::computer_container_manager::{
 /// 走 Drop），成功路径显式 `forget` 后手动 end（保证步骤信息完整）。
 struct MigrationGateGuard {
     user_id: String,
+    token: u64,
     disarmed: bool,
 }
 
 impl MigrationGateGuard {
-    fn new(user_id: &str) -> Self {
-        super::migration_gate::begin(user_id);
-        Self {
+    /// None = 同用户已有门禁（旧后台任务仍在切换中）——调用方应中止编排。
+    fn acquire(user_id: &str) -> Option<Self> {
+        let token = super::migration_gate::begin(user_id)?;
+        Some(Self {
             user_id: user_id.to_string(),
+            token,
             disarmed: false,
-        }
+        })
     }
-    /// 成功路径：解除 Drop 语义（end 由调用方在打完日志后手动调）。
-    fn disarm(mut self) {
+    /// 成功路径：按自身 token 解除门禁（替代 Drop）。
+    fn release(mut self) {
         self.disarmed = true;
+        super::migration_gate::end_with_token(&self.user_id, self.token);
     }
 }
 
 impl Drop for MigrationGateGuard {
     fn drop(&mut self) {
         if !self.disarmed {
-            super::migration_gate::end(&self.user_id);
+            super::migration_gate::end_with_token(&self.user_id, self.token);
         }
     }
 }
@@ -181,7 +185,15 @@ pub async fn cutover(
     // 写门禁开(终审 F1): 从停 agent 起该用户文件写一律 503。guard 的 Drop
     // 覆盖所有 `?` 失败路径(失败即解除, 该用户恢复可写——失败中间态下写
     // 共享卷是安全方向: 标记未翻, 数据面本就仍在共享卷)。
-    let _migration_gate_guard = MigrationGateGuard::new(user_id);
+    let _migration_gate_guard = MigrationGateGuard::acquire(user_id).ok_or_else(|| {
+        wrap(
+            "migration_gate",
+            ContainerRuntimeError::Conflict(
+                "another migration orchestration is still settling for this user; retry shortly"
+                    .to_string(),
+            ),
+        )
+    })?;
 
     // 在途写排空(复审 P1): 门禁开启前已受理的写(长上传/慢盘)还在异步执行,
     // 不等它们落盘就停 agent + 最终 sync 会把这些写留在旧卷 → 源/目标分叉。
@@ -279,8 +291,7 @@ pub async fn cutover(
         .map_err(|e| wrap("ensure_agent", runtime_error_from_app(e)))?;
     steps.push("agent restarted on RBD".to_string());
 
-    _migration_gate_guard.disarm();
-    super::migration_gate::end(user_id);
+    _migration_gate_guard.release();
     Ok(MigrationOutcome {
         user_id: user_id.to_string(),
         action: "cutover",
