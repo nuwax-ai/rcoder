@@ -1772,7 +1772,7 @@ mod tests {
                         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
-                    let _ = socket.write_all(response.as_bytes());
+                    let _unused = socket.write_all(response.as_bytes());
                 });
             }
         });
@@ -1817,7 +1817,7 @@ mod tests {
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
-                    let _ = socket.write_all(response.as_bytes());
+                    let _unused = socket.write_all(response.as_bytes());
                 });
             }
         });
@@ -1905,7 +1905,7 @@ path = "/"
                     "HTTP/1.1 200 OK\r\nX-Rcoder-Publication: {marker}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{marker}",
                     marker.len()
                 );
-                let _ = socket.write_all(response.as_bytes());
+                let _unused = socket.write_all(response.as_bytes());
             }
         });
         let admin = std::net::TcpListener::bind("127.0.0.1:3018").expect("bind fake admin 3018");

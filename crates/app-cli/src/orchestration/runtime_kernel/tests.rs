@@ -1809,7 +1809,7 @@ mod cases {
                 "{ this is not json",
             )
             .expect("corrupt record");
-            let _ = RuntimeStore::open(&workspace).expect("open ignores record content");
+            let _unused = RuntimeStore::open(&workspace).expect("open ignores record content");
         }
         let kernel = kernel(dir.path());
         let recovered = kernel.recover().await.expect("recover");

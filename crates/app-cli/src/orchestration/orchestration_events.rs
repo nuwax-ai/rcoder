@@ -27,8 +27,8 @@ pub fn emit(event: &OrchestrationEvent) {
         bridge(json.clone());
     }
     let mut out = std::io::stdout().lock();
-    let _ = writeln!(out, "{EVT_PREFIX}{json}");
-    let _ = out.flush();
+    let _unused = writeln!(out, "{EVT_PREFIX}{json}");
+    let _unused = out.flush();
 }
 
 /// 进程内事件桥（server 形态安装；直跑/测试形态为 None）。
@@ -38,7 +38,7 @@ static EVENT_BRIDGE: std::sync::OnceLock<Box<dyn Fn(String) + Send + Sync>> =
 
 /// 安装进程内事件桥（幂等：首次安装生效）。
 pub fn install_bridge(bridge: Box<dyn Fn(String) + Send + Sync>) {
-    let _ = EVENT_BRIDGE.set(bridge);
+    let _unused = EVENT_BRIDGE.set(bridge);
 }
 
 fn bridge() -> Option<&'static (dyn Fn(String) + Send + Sync)> {

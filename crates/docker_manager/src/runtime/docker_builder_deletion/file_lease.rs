@@ -185,8 +185,7 @@ pub(super) fn validate_file_receipt(
         let own_last = content
             .lines()
             .filter_map(|line| line.split_once(' ').map(|(_, rest)| rest.trim()))
-            .filter(|rest| *rest == token.as_str() || *rest == format!("done {}", token))
-            .next_back();
+            .rfind(|rest| *rest == token.as_str() || *rest == format!("done {}", token));
         return Ok(own_last == Some(token.as_str()));
     }
     // Empty markers are already released, not authority to resume this operation.
@@ -307,11 +306,11 @@ pub(super) fn release_file_receipt(
             token
         );
         if let Some(parent) = archive.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            let _unused = std::fs::create_dir_all(parent);
         }
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&archive) {
             use std::io::Write as _;
-            let _ = file.write_all(entry.as_bytes());
+            let _unused = file.write_all(entry.as_bytes());
         }
     }
     file.unlock()

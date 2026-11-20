@@ -3144,7 +3144,6 @@ dependencies = [
  "bollard",
  "chrono",
  "container-runtime-api",
- "dashmap 6.2.1",
  "futures-util",
  "k8s-openapi",
  "kube",

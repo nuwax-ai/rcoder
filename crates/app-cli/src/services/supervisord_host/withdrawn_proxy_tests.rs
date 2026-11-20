@@ -25,7 +25,7 @@ async fn rpc_response(stream: &mut tokio::net::UnixStream, value: &str) {
     let body = format!(
         "<methodResponse><params><param><value>{value}</value></param></params></methodResponse>"
     );
-    let _ = stream
+    let _unused = stream
         .write_all(
             format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -117,7 +117,7 @@ fn withdrawn_stopped_proxy_with_process_null_receipt_is_reconciled_by_original_d
         let result = host.drain_entry_until(&runtime_root,
             tokio::time::Instant::now() + std::time::Duration::from_secs(2)).await;
         rpc.abort();
-        let _ = rpc.await;
+        let _unused = rpc.await;
         supervisor::resident::shutdown().await.unwrap();
         drop(lease);
         owner_test_context::restore_spec_env(saved);
@@ -257,7 +257,7 @@ fn withdrawn_case(
         let result = host.drain_entry_until(&runtime_root, deadline()).await;
         let repeated = if expected_success { Some(host.drain_entry_until(&runtime_root, deadline()).await) } else { None };
         let observed = calls.lock().unwrap().clone();
-        rpc.abort(); let _ = rpc.await;
+        rpc.abort(); let _unused = rpc.await;
         supervisor::resident::shutdown().await.unwrap(); drop(lease);
         owner_test_context::restore_spec_env(saved);
         assert_eq!(result.is_ok(), expected_success, "{claim}/{state}/{pid:?}: {result:?}");
@@ -498,7 +498,7 @@ fn withdrawn_owner_shutdown_case(
         let repeated = if expected_success { Some(host.shutdown_owner_entry_until(&runtime_root, &scope,
             tokio::time::Instant::now() + std::time::Duration::from_secs(2)).await) } else { None };
         let observed = calls.lock().unwrap().clone();
-        rpc.abort(); let _ = rpc.await;
+        rpc.abort(); let _unused = rpc.await;
         scope.close().unwrap(); scope.record_quiescent().unwrap(); drop(lease);
         owner_test_context::restore_spec_env(saved);
         if self_owner {unsafe{match saved_socket{Some(value)=>std::env::set_var("APP_CLI_SUPERVISOR_SOCKET",value),None=>std::env::remove_var("APP_CLI_SUPERVISOR_SOCKET")}}}

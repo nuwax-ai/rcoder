@@ -54,7 +54,6 @@ edition = "2024"
 authors = ["soddy <soddygo@qq.com>"]
 license = "Apache-2.0"
 description = "Rust-based AI agent framework"
-homepage = "https://github.com/nuwax-ai/rcoder"
 repository = "https://github.com/nuwax-ai/rcoder"
 publish = false
 

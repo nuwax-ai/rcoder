@@ -171,7 +171,7 @@ pub async fn computer_rbd_intercept(
     // migration_gate 的同一把短锁内完成——cutover begin 置位后，此处必然
     // 拒绝，drain 归零即真正排空边界。guard 注入响应流（见 finish_with_guard），
     // 流式正文的发送期仍在途。
-    let mut write_admission = if is_write {
+    let write_admission = if is_write {
         match super::migration_gate::admit_write(&target.user_id) {
             super::migration_gate::WriteAdmission::Admitted(guard) => {
                 // 副本一：request extension——本地路径的 file-server handler
@@ -524,6 +524,9 @@ enum GitJsonLocator {
     NonComputer,
 }
 
+// Err 载荷是 axum Response（≥128 字节）：中间件内以 Result<_, Response>
+// 表达短路返回是 axum 惯用形态，装箱会扩散到所有调用点，收益为负。
+#[allow(clippy::result_large_err)]
 async fn extract_git_json_user(
     req: Request,
 ) -> Result<(axum::http::request::Parts, Body, GitJsonLocator), Response> {

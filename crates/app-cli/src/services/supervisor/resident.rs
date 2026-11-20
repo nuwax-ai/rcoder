@@ -2029,7 +2029,7 @@ mod tests {
             "late cancelled request spawned a process"
         );
         task.abort();
-        let _ = task.await;
+        let _unused = task.await;
     }
     /// Real Child/OS liveness with local fixture config; this does not claim
     /// Pingap HTTP acceptance. The observer cannot create or revive a process.
@@ -2497,7 +2497,7 @@ mod tests {
                     "resumed actor did not reap the exact dead Child"
                 );
                 actor.abort();
-                let _ = actor.await;
+                let _unused = actor.await;
             });
     }
 

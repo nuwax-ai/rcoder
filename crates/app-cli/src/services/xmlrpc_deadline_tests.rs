@@ -60,7 +60,7 @@ async fn slow_rpc_reads_and_each_mutation_consume_the_original_absolute_deadline
             received.send(()).unwrap();
             release.await.unwrap();
             // An observation may cancel its socket; a dispatched write retains it.
-            let _ = stream
+            let _unused = stream
                 .write_all(
                     format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{TRUE}",

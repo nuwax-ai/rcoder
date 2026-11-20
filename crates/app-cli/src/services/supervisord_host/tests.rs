@@ -947,7 +947,7 @@ mod owner_shutdown_domain_tests {
                 assert_eq!(std::fs::read(&standalone).unwrap(), standalone_bytes);
             }
             server.abort();
-            let _ = server.await;
+            let _unused = server.await;
             scope.close().unwrap();
             scope.record_quiescent().unwrap();
             owner_test_context::restore_spec_env(saved);

@@ -12,8 +12,8 @@ struct Process(Child);
 impl Drop for Process {
     fn drop(&mut self) {
         if matches!(self.0.try_wait(), Ok(None)) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            let _unused = self.0.kill();
+            let _unused = self.0.wait();
         }
     }
 }
@@ -179,7 +179,7 @@ async fn recover(live: bool, corrupt_identity: bool, moved_source: bool) {
     let stopped = operation(&client, &base, &old_identity, "original-stop", "stop").await;
     assert_eq!(stopped["state"], "succeeded");
     // Capture a real running management generation, even though business is stopped.
-    let _ = ready(&mut old, &client, &state, &wrong).await;
+    let _unused = ready(&mut old, &client, &state, &wrong).await;
     let captured = runtime_supervisor::last_snapshot(&state).unwrap();
     let generation = captured.generation.clone().unwrap();
     let operation_bytes = std::fs::read(state.join("operations/original-stop.json")).unwrap();

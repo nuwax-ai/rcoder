@@ -24,7 +24,8 @@ macro_rules! define_components {
             $($variant),+
         }
         impl Component {
-            /// 全部变体（迭代/测试用）。
+            /// 全部变体（迭代/测试用；仅测试消费，非测试构建允许未使用）。
+            #[cfg_attr(not(test), allow(dead_code))]
             pub(crate) const ALL: &'static [Component] = &[$(Component::$variant),+];
             fn name(self) -> &'static str {
                 match self {

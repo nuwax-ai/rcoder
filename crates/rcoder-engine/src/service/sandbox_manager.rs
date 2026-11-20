@@ -1183,18 +1183,18 @@ impl SandboxManager {
         // 原子认领；CAS 冲突 = 被并发 create 抢先 → 回落冷启动而非报 409。
         record = match self
             .store
-            .claim_warm_instance(
-                &record.sandbox_id,
-                record.instance_revision,
-                &key.tenant_id,
-                &key.key_id,
-                &token_hash,
-                &encrypted_token,
-                &env_json,
-                params.metadata.as_deref(),
-                params.idempotency_key.as_deref(),
+            .claim_warm_instance(shared_types::sandbox::ClaimWarmInstance {
+                sandbox_id: &record.sandbox_id,
+                expected_revision: record.instance_revision,
+                tenant_id: &key.tenant_id,
+                key_id: &key.key_id,
+                token_hash: &token_hash,
+                encrypted_token: &encrypted_token,
+                env_json: &env_json,
+                metadata_json: params.metadata.as_deref(),
+                idempotency_key: params.idempotency_key.as_deref(),
                 hard_deadline_us,
-            )
+            })
             .await
         {
             Ok(record) => record,

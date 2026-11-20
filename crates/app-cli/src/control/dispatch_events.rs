@@ -78,9 +78,9 @@ pub(super) async fn forward_operation_events(
         use std::io::Write as _;
         let mut out = std::io::stdout().lock();
         for line in lines {
-            let _ = writeln!(out, "{}{}", shared_types::APP_CLI_EVT_PREFIX, line);
+            let _unused = writeln!(out, "{}{}", shared_types::APP_CLI_EVT_PREFIX, line);
         }
-        let _ = out.flush();
+        let _unused = out.flush();
     }
     done
 }
@@ -164,8 +164,8 @@ pub(super) fn emit_captured_done(done: &serde_json::Value) {
         return;
     };
     let mut out = std::io::stdout().lock();
-    let _ = writeln!(out, "{}{}", shared_types::APP_CLI_EVT_PREFIX, json);
-    let _ = out.flush();
+    let _unused = writeln!(out, "{}{}", shared_types::APP_CLI_EVT_PREFIX, json);
+    let _unused = out.flush();
 }
 
 /// 终态 → EVT orchestration_done 兜底行（终局时无一致捕获件则按视图

@@ -427,7 +427,7 @@ impl AppFileMutationMarker {
         }
         if let Some(archive) = archive_to {
             let mut entry = chrono_or_system_time();
-            entry.push_str(" ");
+            entry.push(' ');
             entry.push_str(&String::from_utf8_lossy(&owner));
             entry.push('\n');
             if let Some(parent) = archive.parent() {

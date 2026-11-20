@@ -7,17 +7,22 @@
 //! 天然解耦（/health、/files 同名冲突即由此消解）。
 use std::sync::Arc;
 
+#[cfg(feature = "kubernetes")]
 use axum::extract::State;
+#[cfg(feature = "kubernetes")]
 use axum::http::{Request, StatusCode};
+#[cfg(feature = "kubernetes")]
 use axum::middleware::Next;
+#[cfg(feature = "kubernetes")]
 use axum::response::{IntoResponse, Response};
+#[cfg(feature = "kubernetes")]
 use axum::routing::{delete, get, post, put};
-use axum::{Extension, Json, Router};
+use axum::Router;
 
 #[cfg(feature = "kubernetes")]
 pub use rcoder_engine::service::sandbox_manager::SandboxManager;
 #[cfg(not(feature = "kubernetes"))]
-enum SandboxManager {} // 占位：非 kubernetes 构建下的不可达空类型
+pub enum SandboxManager {} // 占位：非 kubernetes 构建下的不可达空类型
 #[cfg(feature = "kubernetes")]
 use crate::handler::sandbox as sbx_handler;
 

@@ -14,8 +14,8 @@ struct Process(Child);
 impl Drop for Process {
     fn drop(&mut self) {
         if matches!(self.0.try_wait(), Ok(None)) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            let _unused = self.0.kill();
+            let _unused = self.0.wait();
         }
     }
 }
@@ -137,7 +137,7 @@ async fn repeated_control_only_preserves_stopped_owner_and_operations_without_so
             );
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
-        let _ = ready(&mut original, &client, &state).await;
+        let _unused = ready(&mut original, &client, &state).await;
         let operations = operation_files(&state);
         let desired = std::fs::read(state.join("desired.json")).unwrap();
         let native = runtime_supervisor::last_snapshot(&state).unwrap();

@@ -56,7 +56,7 @@ fn hold_probes(addr: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("convert idle hold listener: {e}"))?;
     tokio::spawn(async move {
         // 无限等待：task 随进程终止（SIGTERM → runtime 关闭）退出
-        let _ = axum::serve(listener, idle_router()).await;
+        let _unused = axum::serve(listener, idle_router()).await;
     });
     Ok(())
 }

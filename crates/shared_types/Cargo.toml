@@ -9,7 +9,7 @@ license.workspace = true
 default = []
 kubernetes = []
 # deploy-host 宿主机运行形态（Phase 2 引入；编译期隔离，生产二进制不含）
-deploy-host = []
+deploy-host = ["dep:dashmap"]
 
 [lints]
 workspace = true
@@ -22,7 +22,7 @@ workspace-manifest = { workspace = true }
 serde_json.workspace = true
 semver = { workspace = true }
 winnow = { workspace = true }
-dashmap = { workspace = true }
+dashmap = { workspace = true, optional = true }
 uuid.workspace = true
 # ACP Protocol - 官方 SDK（完全 Send-safe，无需 LocalSet）
 agent-client-protocol = { workspace = true }

@@ -42,7 +42,6 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 
 # Utilities
-dashmap = { workspace = true }
 moka = { workspace = true, features = ["future"] }
 
 # Shared types

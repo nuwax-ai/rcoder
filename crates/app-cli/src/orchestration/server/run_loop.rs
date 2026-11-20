@@ -2130,7 +2130,7 @@ mod lifecycle_tests {
             assert!(response.ends_with(&format!("old-pid={pid}")));
         }
         task.abort();
-        let _ = task.await;
+        let _unused = task.await;
         business.kill().await.unwrap();
         business.wait().await.unwrap();
     }

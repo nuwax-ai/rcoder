@@ -10,7 +10,7 @@ use crate::db::{
 };
 use futures::future::BoxFuture;
 use shared_types::sandbox::{
-    SandboxApiKeyRecord, SandboxInstanceRecord, SandboxInstanceState,
+    ClaimWarmInstance, SandboxApiKeyRecord, SandboxInstanceRecord, SandboxInstanceState,
     SandboxStore, SandboxStoreError, SandboxTemplateSpec, SandboxTemplateSummary,
     SandboxVolumeRecord,
 };
@@ -713,17 +713,20 @@ impl SandboxStore for PgSandboxStore {
 
     async fn claim_warm_instance(
         &self,
-        sandbox_id: &str,
-        expected_revision: i64,
-        tenant_id: &str,
-        key_id: &str,
-        token_hash: &str,
-        encrypted_token: &str,
-        env_json: &str,
-        metadata_json: Option<&str>,
-        idempotency_key: Option<&str>,
-        hard_deadline_us: i64,
+        claim: ClaimWarmInstance<'_>,
     ) -> Result<SandboxInstanceRecord, SandboxStoreError> {
+        let ClaimWarmInstance {
+            sandbox_id,
+            expected_revision,
+            tenant_id,
+            key_id,
+            token_hash,
+            encrypted_token,
+            env_json,
+            metadata_json,
+            idempotency_key,
+            hard_deadline_us,
+        } = claim;
         let sandbox_id = sandbox_id.to_string();
         let (tenant_id, key_id, token_hash, encrypted_token) = (
             tenant_id.to_string(), key_id.to_string(),

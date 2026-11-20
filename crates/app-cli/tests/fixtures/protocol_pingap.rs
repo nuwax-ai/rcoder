@@ -112,7 +112,7 @@ pub fn run(args: &[String]) -> Result<()> {
             let user = user.clone();
             let password = password.clone();
             std::thread::spawn(move || {
-                let _ = respond(stream, state, Some((user, password)));
+                let _unused = respond(stream, state, Some((user, password)));
             });
         }
     });
@@ -123,7 +123,7 @@ pub fn run(args: &[String]) -> Result<()> {
             for stream in listener.incoming().flatten() {
                 let state = state.clone();
                 std::thread::spawn(move || {
-                    let _ = respond(stream, state, None);
+                    let _unused = respond(stream, state, None);
                 });
             }
         });

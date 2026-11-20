@@ -182,7 +182,7 @@ pub fn create_router(
         crate::middleware::sandbox_guard::e2b_data_plane_guard,
     ));
     #[cfg(not(feature = "kubernetes"))]
-    let _ = sandbox_deps;
+    let _unused = sandbox_deps;
     app
 }
 

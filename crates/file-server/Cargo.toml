@@ -6,7 +6,6 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "Rust file-server (tree/git/build/dev/upload/skills) — replaces nuwax-file-server, lives in rcoder pod"
-homepage.workspace = true
 repository.workspace = true
 publish.workspace = true
 

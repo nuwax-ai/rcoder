@@ -357,7 +357,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _unused = axum::serve(listener, app).await;
         });
         for method in ["GET", "HEAD"] {
             let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");

@@ -210,7 +210,7 @@ fn static_path_user_id(path: &str) -> Result<String, ()> {
     // 路径段 percent-decode：URI path 是原始形式(%36 不解码), axum 实际
     // 路由的 Path 提取器会解码——两层口径必须一致。
     let decoded = percent_decode(raw_segment);
-    valid_identifier(&decoded).then(|| decoded).ok_or(())
+    valid_identifier(&decoded).then_some(decoded).ok_or(())
 }
 
 fn valid_identifier(value: &str) -> bool {

@@ -10,18 +10,37 @@ use container_runtime_api::ContainerCreateParams;
 use k8s_openapi::api::core::v1::EnvVar;
 use shared_types::{K8sServiceConfig, ServiceImageConfig, ServiceType};
 
+/// [`build_agent_env_vars`] 的入参上下文（纯函数无副作用；字段语义见各 env 注入块）。
 #[cfg(feature = "kubernetes")]
-pub(crate) fn build_agent_env_vars(
-    project_id_val: &str,
-    user_id_val: &str,
-    service_type_str: &str,
-    service_type: &ServiceType,
-    service_configs: (Option<&ServiceImageConfig>, Option<&K8sServiceConfig>),
-    params: &ContainerCreateParams,
-    builder_deploy_credential: Option<&EnvVar>,
-    per_agent_volume: bool,
-) -> Vec<EnvVar> {
-    let (docker_service, k8s_service) = service_configs;
+pub(crate) struct AgentEnvInputs<'a> {
+    /// 工作区 project_id（存量复合键原样传入，函数内按需右切还原）。
+    pub project_id_val: &'a str,
+    pub user_id_val: &'a str,
+    /// SERVICE_TYPE env 的字符串形态（与 `service_type` 枚举一一对应）。
+    pub service_type_str: &'a str,
+    pub service_type: &'a ServiceType,
+    /// service environment 合并源：docker 配置兜底、k8s 配置覆盖（K8s 主）。
+    pub docker_service: Option<&'a ServiceImageConfig>,
+    pub k8s_service: Option<&'a K8sServiceConfig>,
+    pub params: &'a ContainerCreateParams,
+    pub builder_deploy_credential: Option<&'a EnvVar>,
+    /// per-agent 卷形态标识（注入 RCODER_AGENT_BOUND_USER_ID）。
+    pub per_agent_volume: bool,
+}
+
+#[cfg(feature = "kubernetes")]
+pub(crate) fn build_agent_env_vars(inputs: AgentEnvInputs<'_>) -> Vec<EnvVar> {
+    let AgentEnvInputs {
+        project_id_val,
+        user_id_val,
+        service_type_str,
+        service_type,
+        docker_service,
+        k8s_service,
+        params,
+        builder_deploy_credential,
+        per_agent_volume,
+    } = inputs;
     // 容器内契约（agent_runner profiler 标签、PROJECT_ID env）要纯 app_id：
     // 优先取显式 builder_app_id（创建路径直传，语义不重载）；存量复合键
     // 残留时右切还原纯 app 段，其余原样透传。
@@ -337,16 +356,17 @@ mod b03_tests {
         };
         // builder：无论 service env 是否带开关，链恒补全
         for service in [k8s_service(false), k8s_service(true)] {
-            let on = build_agent_env_vars(
-                "app-b03",
-                "u1",
-                "userapp-builder",
-                &ServiceType::UserappBuilder,
-                (None, Some(&service)),
-                &base,
-                Some(&credential),
-                false,
-            );
+            let on = build_agent_env_vars(AgentEnvInputs {
+                project_id_val: "app-b03",
+                user_id_val: "u1",
+                service_type_str: "userapp-builder",
+                service_type: &ServiceType::UserappBuilder,
+                docker_service: None,
+                k8s_service: Some(&service),
+                params: &base,
+                builder_deploy_credential: Some(&credential),
+                per_agent_volume: false,
+            });
             assert_eq!(
                 value_of(&on, "APP_CLI_MANAGED").as_deref(),
                 Some("1"),
@@ -368,16 +388,17 @@ mod b03_tests {
         disabled
             .environment
             .insert("APP_CLI_MANAGED".to_string(), "0".to_string());
-        let forced = build_agent_env_vars(
-            "app-b03",
-            "u1",
-            "userapp-builder",
-            &ServiceType::UserappBuilder,
-            (None, Some(&disabled)),
-            &base,
-            Some(&credential),
-                false,
-        );
+        let forced = build_agent_env_vars(AgentEnvInputs {
+            project_id_val: "app-b03",
+            user_id_val: "u1",
+            service_type_str: "userapp-builder",
+            service_type: &ServiceType::UserappBuilder,
+            docker_service: None,
+            k8s_service: Some(&disabled),
+            params: &base,
+            builder_deploy_credential: Some(&credential),
+            per_agent_volume: false,
+        });
         assert_eq!(value_of(&forced, "APP_CLI_MANAGED").as_deref(), Some("1"));
         // 键唯一性：kubelet 取后值，重复键会让 config 的 0 实际生效。
         for name in [
@@ -392,16 +413,17 @@ mod b03_tests {
         // 普通 agent：不注入（包装脚本 no-op，范围不扩大）
         let mut web = k8s_service(false);
         web.service_type = ServiceType::WebAgentRunner;
-        let off = build_agent_env_vars(
-            "web-b03",
-            "u1",
-            "web-agent-runner",
-            &ServiceType::WebAgentRunner,
-            (None, Some(&web)),
-            &base,
-            None,
-                false,
-        );
+        let off = build_agent_env_vars(AgentEnvInputs {
+            project_id_val: "web-b03",
+            user_id_val: "u1",
+            service_type_str: "web-agent-runner",
+            service_type: &ServiceType::WebAgentRunner,
+            docker_service: None,
+            k8s_service: Some(&web),
+            params: &base,
+            builder_deploy_credential: None,
+            per_agent_volume: false,
+        });
         assert!(value_of(&off, "APP_CLI_MANAGED").is_none());
         assert!(value_of(&off, "APP_CLI_RUNTIME_WORKSPACE").is_none());
         assert!(value_of(&off, "APP_CLI_DEPLOY_TOKEN").is_none());

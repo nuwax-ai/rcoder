@@ -514,7 +514,7 @@ impl SupervisordHost {
         }
         runtime_status.set_ready(ready);
         ServiceSpecFile::prune_other_generations(&release.release_id);
-        let _ = started; // 全部成功；失败路径由外层 stop_all 清理
+        let _unused = started; // 全部成功；失败路径由外层 stop_all 清理
         Ok(())
     }
 

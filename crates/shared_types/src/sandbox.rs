@@ -157,6 +157,29 @@ pub enum SandboxStoreError {
     InvalidOperation(String),
 }
 
+/// [`SandboxStore::claim_warm_instance`] 的入参（原子认领温池实例的全部字段，
+/// 借用调用方数据避免克隆）。
+#[derive(Debug, Clone, Copy)]
+pub struct ClaimWarmInstance<'a> {
+    /// 目标实例（必须处于 WarmReady）。
+    pub sandbox_id: &'a str,
+    /// CAS 前提：调用方读到的 instance_revision。
+    pub expected_revision: i64,
+    /// 认领租户与其 API key 身份。
+    pub tenant_id: &'a str,
+    pub key_id: &'a str,
+    /// 新发放 token 的哈希与密文（明文只返回给调用方，不入库）。
+    pub token_hash: &'a str,
+    pub encrypted_token: &'a str,
+    /// 注入的 env/metadata（JSON 字符串原样存储）。
+    pub env_json: &'a str,
+    pub metadata_json: Option<&'a str>,
+    /// 幂等键（Idempotency-Key 头）：同键并发 claim 撞唯一索引 → Conflict。
+    pub idempotency_key: Option<&'a str>,
+    /// 认领时刻起的不可续期硬顶（微秒）。
+    pub hard_deadline_us: i64,
+}
+
 /// E2B 兼容沙箱存储契约（PG 实现：rcoder-storage；启用组件 `Sandbox`）。
 #[async_trait::async_trait]
 pub trait SandboxStore: Send + Sync {
@@ -250,16 +273,7 @@ pub trait SandboxStore: Send + Sync {
     /// CAS on instance_revision；返回更新后的完整记录。
     async fn claim_warm_instance(
         &self,
-        sandbox_id: &str,
-        expected_revision: i64,
-        tenant_id: &str,
-        key_id: &str,
-        token_hash: &str,
-        encrypted_token: &str,
-        env_json: &str,
-        metadata_json: Option<&str>,
-        idempotency_key: Option<&str>,
-        hard_deadline_us: i64,
+        claim: ClaimWarmInstance<'_>,
     ) -> Result<SandboxInstanceRecord, SandboxStoreError>;
     /// 全部 WarmReady 实例（温池候选与水位统计；调用方按模板过滤）。
     async fn list_warm_ready(&self) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError>;

@@ -88,7 +88,7 @@ fn startup_failure_cleanup_cannot_revoke_admitted_native_drain() {
             tx.send(Request::Shutdown { reply }).await.unwrap();
             let shutdown = done.await.unwrap();
             actor.abort();
-            let _ = actor.await;
+            let _unused = actor.await;
             *RESIDENT.lock().unwrap() = None;
             assert!(retained_before_drain);
             assert_eq!(

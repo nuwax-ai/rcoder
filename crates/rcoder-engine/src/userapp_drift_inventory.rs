@@ -56,7 +56,7 @@ impl DriftInventoryScanner {
         Self { config, state }
     }
 
-    pub(crate) async fn run(mut self, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
+    pub(crate) async fn run(self, mut shutdown_rx: tokio::sync::broadcast::Receiver<()>) {
         let mut interval = tokio::time::interval(self.config.scan_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.tick().await; // 消耗首次立即 tick（启动 grace）

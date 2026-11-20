@@ -7,7 +7,6 @@
 
 use container_runtime_api::{
     ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult, ContainerRuntimeStatus,
-    WorkspaceRuntime,
 };
 use k8s_openapi::api::core::v1::{
     Container as K8sContainer, ContainerPort, EnvVar, LocalObjectReference,
@@ -182,18 +181,15 @@ impl KubernetesRuntime {
                         | (false, _, SharedDirProbe::NonEmpty) => false,
                         // 真新用户: 初始化直上 RBD（fresh-init 标记来源）
                         (false, _, SharedDirProbe::Absent) => {
-                        // begin 之后的所有失败路径必须先 end 再上抛——
-                        // `?` 直接 return 会跳过收尾，该用户写准入永久冻结。
-                        if let Err(error) = self
-                            .ensure_fresh_workspace_pvc(
-                                identifier,
-                                &service_type,
-                                params.storage_size.as_deref(),
-                            )
-                            .await
-                        {
-                            return Err(error);
-                        }
+                        // begin 之后的所有失败路径必须先 end 再上抛——end 由
+                        // MigrationGuard 的 Drop 自动执行（含 `?` 直接 return），
+                        // 不会冻结该用户写准入。
+                        self.ensure_fresh_workspace_pvc(
+                            identifier,
+                            &service_type,
+                            params.storage_size.as_deref(),
+                        )
+                        .await?;
                         marker_completer(self, migration_gate.take(), identifier, &service_type).await?;
                             info!(
                                 "[K8S] new user '{identifier}' initialized on per-agent RBD"
@@ -758,14 +754,17 @@ impl KubernetesRuntime {
                     },
                     env: {
                         let mut env = super::k8s_agent_env::build_agent_env_vars(
-                            &project_id_val,
-                            &user_id_val,
-                            &service_type_str,
-                            service_type,
-                            (docker_service, k8s_service),
-                            params,
-                            None,
-                            per_agent_volume,
+                            super::k8s_agent_env::AgentEnvInputs {
+                                project_id_val: &project_id_val,
+                                user_id_val: &user_id_val,
+                                service_type_str: &service_type_str,
+                                service_type,
+                                docker_service,
+                                k8s_service,
+                                params,
+                                builder_deploy_credential: None,
+                                per_agent_volume,
+                            },
                         );
                         if matches!(service_type, ServiceType::UserappBuilder) {
                             // 执行域身份（进程域退出回执的绑定锚点）：instance 经

@@ -20,8 +20,8 @@ struct OwnedServer(Child);
 impl Drop for OwnedServer {
     fn drop(&mut self) {
         if matches!(self.0.try_wait(), Ok(None)) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            let _unused = self.0.kill();
+            let _unused = self.0.wait();
         }
     }
 }
@@ -404,7 +404,7 @@ async fn retry_after_startup_failure_reexecutes_and_replay_returns_original() {
     }
 
     // 清理
-    let _ = Command::new("kill")
+    let _unused = Command::new("kill")
         .args(["-TERM", &server.0.id().to_string()])
         .status();
     let deadline = Instant::now() + Duration::from_secs(10);

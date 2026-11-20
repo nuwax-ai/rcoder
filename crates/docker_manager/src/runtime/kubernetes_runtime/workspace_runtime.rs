@@ -482,7 +482,6 @@ pub(crate) async fn set_migration_state_detached(
     cache_key: String,
     state: shared_types::WorkspaceMigrationState,
 ) -> ContainerRuntimeResult<String> {
-    use crate::runtime::k8s_pvc::K8sPvcOps;
     let pvcs: kube::Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
         kube::Api::namespaced(client, &namespace);
     let existing = pvcs
@@ -559,7 +558,6 @@ pub(crate) async fn reconcile_migration_marker(
     cache: Arc<RwLock<std::collections::HashMap<String, WorkspaceMigrationCacheValue>>>,
     expected_pvc_uid: Option<&str>,
 ) -> MarkerReconciliation {
-    use crate::runtime::k8s_pvc::K8sPvcOps;
     // 对账身份检查先行（第十二轮 P1 + 终审 P3：None 时那次 GET 读不读都
     // invalidate，先检查省一次浪费请求；None 不得降级为按名验真）。
     let Some(expected) = expected_pvc_uid else {

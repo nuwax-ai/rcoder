@@ -93,7 +93,7 @@ impl Preparations {
             };
             // An ordinary artifact error is a completed writer, not a shutdown failure.
             // A join panic remains sticky even after the task itself has disappeared.
-            let _ = OwnedJob {
+            let _unused = OwnedJob {
                 owner: self.clone(),
                 job: Some(job),
             }

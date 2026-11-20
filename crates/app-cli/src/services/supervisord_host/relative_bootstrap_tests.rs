@@ -39,8 +39,8 @@ struct ForeignChild(std::process::Child);
 
 impl Drop for ForeignChild {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _unused = self.0.kill();
+        let _unused = self.0.wait();
     }
 }
 
@@ -311,7 +311,7 @@ fn recovery_case_for_release(
                 assert!(calls.lock().unwrap().is_empty(), "valid history needs no recovery");
             }
             rpc.abort();
-            let _ = rpc.await;
+            let _unused = rpc.await;
             supervisor::resident::shutdown().await.unwrap();
             drop(lease);
         });
