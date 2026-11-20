@@ -285,35 +285,35 @@ impl SandboxManager {
         // 幂等：同 Idempotency-Key 的非终态实例直接返回（网络重试去重）。
         // 仅租户内匹配 + 仅 Ready 视为可复用成功；进行中/清理中返回 409 让
         // 客户端重试（官方幂等语义：创建未完成不得当成功发布）。
-        if let Some(idem_key) = &params.idempotency_key {
-            if let Some(existing) = self
+        if let Some(idem_key) = &params.idempotency_key
+            && let Some(existing) = self
                 .store
                 .find_by_idempotency_key(&key.tenant_id, idem_key)
                 .await
                 .map_err(store_error)?
-            {
-                return match existing.desired_state {
-                    SandboxInstanceState::Ready => {
-                        tracing::info!(sandbox_id = %existing.sandbox_id, "e2b create 幂等命中，返回已有实例");
-                        let token = self.decrypt_token(&existing)?;
-                        Ok(CreateOutcome {
-                            record: existing,
-                            token,
-                        })
-                    }
-                    state => Err(SandboxApiError::Conflict(format!(
-                        "同幂等键的沙箱正在{state:?}，请稍后重试"
-                    ))),
-                };
-            }
+        {
+            return match existing.desired_state {
+                SandboxInstanceState::Ready => {
+                    tracing::info!(sandbox_id = %existing.sandbox_id, "e2b create 幂等命中，返回已有实例");
+                    let token = self.decrypt_token(&existing)?;
+                    Ok(CreateOutcome {
+                        record: existing,
+                        token,
+                    })
+                }
+                state => Err(SandboxApiError::Conflict(format!(
+                    "同幂等键的沙箱正在{state:?}，请稍后重试"
+                ))),
+            };
         }
 
         // 温池认领：找 WarmReady 实例 → 原子认领 → /init → Ready（跳过 Pod 创建）。
         // 卷挂载只能冷启动——温池 Pod 创建时没有任何 PVC。
-        if self.warm_pool_enabled && params.volume_mounts.is_empty() {
-            if let Some(outcome) = self.try_claim_warm(&key, &params).await? {
-                return Ok(outcome);
-            }
+        if self.warm_pool_enabled
+            && params.volume_mounts.is_empty()
+            && let Some(outcome) = self.try_claim_warm(key, params).await?
+        {
+            return Ok(outcome);
         }
 
         let spec = self
@@ -417,29 +417,28 @@ impl SandboxManager {
         let record = match self.store.insert_instance(&record).await {
             Ok(inserted) => inserted,
             Err(SandboxStoreError::Conflict(reason)) => {
-                if let Some(idem_key) = &params.idempotency_key {
-                    if let Some(existing) = self
+                if let Some(idem_key) = &params.idempotency_key
+                    && let Some(existing) = self
                         .store
                         .find_by_idempotency_key(&key.tenant_id, idem_key)
                         .await
                         .map_err(store_error)?
-                    {
-                        if existing.desired_state == SandboxInstanceState::Ready {
-                            tracing::info!(
-                                sandbox_id = %existing.sandbox_id,
-                                "e2b create 幂等冲突收敛，返回已有实例"
-                            );
-                            let token = self.decrypt_token(&existing)?;
-                            return Ok(CreateOutcome {
-                                record: existing,
-                                token,
-                            });
-                        }
-                        return Err(SandboxApiError::Conflict(format!(
-                            "同幂等键的沙箱正在{:?}，请稍后重试",
-                            existing.desired_state
-                        )));
+                {
+                    if existing.desired_state == SandboxInstanceState::Ready {
+                        tracing::info!(
+                            sandbox_id = %existing.sandbox_id,
+                            "e2b create 幂等冲突收敛，返回已有实例"
+                        );
+                        let token = self.decrypt_token(&existing)?;
+                        return Ok(CreateOutcome {
+                            record: existing,
+                            token,
+                        });
                     }
+                    return Err(SandboxApiError::Conflict(format!(
+                        "同幂等键的沙箱正在{:?}，请稍后重试",
+                        existing.desired_state
+                    )));
                 }
                 return Err(SandboxApiError::Conflict(reason));
             }
@@ -534,7 +533,7 @@ impl SandboxManager {
         // Pod 删除结果未知/失败 → CleanupPending 交回收器；成功 → Failed 终态。
         match self.k8s.delete_pod(&record.pod_name).await {
             Ok(_) => {
-                let _ = self
+                let _unused = self
                     .store
                     .finish(
                         &record.sandbox_id,
@@ -545,7 +544,7 @@ impl SandboxManager {
                     .await;
             }
             Err(delete_error) => {
-                let _ = self
+                let _unused = self
                     .store
                     .transition_state(
                         &record.sandbox_id,
@@ -757,7 +756,7 @@ impl SandboxManager {
             Ok(_) => {}
             Err(error) => {
                 tracing::warn!(sandbox_id = %record.sandbox_id, error = %error.to_string(), "kill: pod 删除失败，置 CleanupPending");
-                let _ = self
+                let _unused = self
                     .store
                     .transition_state(
                         &record.sandbox_id,
@@ -771,7 +770,7 @@ impl SandboxManager {
             }
         }
         // 第三步：终态 Deleted。
-        let _ = self
+        let _unused = self
             .store
             .finish(
                 &record.sandbox_id,
@@ -788,6 +787,7 @@ impl SandboxManager {
     /// - Pod 不存在 → Deleted（终态化）
     /// - Pod 存在但 Provisioning/Initializing 超时 → kill
     /// - Pod 存在且 Ready → 检查 envd 存活，不活则 kill
+    ///
     /// 在 seed_registry 之后、run_reaper 启动之前调用。
     pub async fn recover_orphans(&self) {
         {
@@ -804,7 +804,7 @@ impl SandboxManager {
                     // Pod 不存在 → 终态化
                     Ok(None) => {
                         tracing::info!(sandbox_id = %record.sandbox_id, ?record.desired_state, "recover: pod 不存在，终态化");
-                        let _ = self
+                        let _unused = self
                             .store
                             .finish(
                                 &record.sandbox_id,
@@ -825,7 +825,7 @@ impl SandboxManager {
                                 // （CleanupPending 由 reaper 兜底再扫）。
                                 match self.k8s.delete_pod(&record.pod_name).await {
                                     Ok(_) => {
-                                        let _ = self
+                                        let _unused = self
                                             .store
                                             .finish(
                                                 &record.sandbox_id,
@@ -841,7 +841,7 @@ impl SandboxManager {
                                             error = %delete_error.to_string(),
                                             "recover: Pod 删除失败，保留待清理状态"
                                         );
-                                        let _ = self
+                                        let _unused = self
                                             .store
                                             .transition_state(
                                                 &record.sandbox_id,
@@ -860,12 +860,12 @@ impl SandboxManager {
                                 if matches!(status.phase.as_str(), "Failed" | "Succeeded") =>
                             {
                                 tracing::info!(sandbox_id = %record.sandbox_id, phase = %status.phase, "recover: Pod 终相，kill");
-                                let _ = self.kill_by_record(&record, KillReason::Recover).await;
+                                let _unused = self.kill_by_record(&record, KillReason::Recover).await;
                             }
                             // Ready 且 Pod 非 Running → kill
                             SandboxInstanceState::Ready if status.phase != "Running" => {
                                 tracing::info!(sandbox_id = %record.sandbox_id, phase = %status.phase, "recover: Ready 但 Pod 非 Running，kill");
-                                let _ = self.kill_by_record(&record, KillReason::Recover).await;
+                                let _unused = self.kill_by_record(&record, KillReason::Recover).await;
                             }
                             // Ready + Running → envd 存活检查（Pod 活着但 envd 死掉的
                             // 场景正是生产事故里"沙箱不响应"的形态）
@@ -875,13 +875,13 @@ impl SandboxManager {
                                 };
                                 if !self.envd_alive(&pod_ip).await {
                                     tracing::warn!(sandbox_id = %record.sandbox_id, "recover: envd 无响应，kill");
-                                    let _ = self.kill_by_record(&record, KillReason::Recover).await;
+                                    let _unused = self.kill_by_record(&record, KillReason::Recover).await;
                                 }
                             }
                             // WarmReady 且 Pod 非 Running（节点回收等）→ kill 交回收器补池
                             SandboxInstanceState::WarmReady if status.phase != "Running" => {
                                 tracing::info!(sandbox_id = %record.sandbox_id, phase = %status.phase, "recover: 温池 Pod 非 Running，kill");
-                                let _ = self.kill_by_record(&record, KillReason::Recover).await;
+                                let _unused = self.kill_by_record(&record, KillReason::Recover).await;
                             }
                             // Provisioning/Initializing 超时（创建时间 + 超时上限 < now）→ kill
                             SandboxInstanceState::Provisioning
@@ -891,7 +891,7 @@ impl SandboxManager {
                                         * 1_000_000;
                                 if chrono::Utc::now().timestamp_micros() > deadline {
                                     tracing::info!(sandbox_id = %record.sandbox_id, "recover: 创建超时，kill");
-                                    let _ = self.kill_by_record(&record, KillReason::Recover).await;
+                                    let _unused = self.kill_by_record(&record, KillReason::Recover).await;
                                 }
                             }
                             _ => {} // Ready + Running = 健康，跳过
@@ -956,12 +956,12 @@ impl SandboxManager {
         for attempt in 0..5 {
             let now = chrono::Utc::now().timestamp_micros();
             let new_expires = now + timeout_seconds * 1_000_000;
-            if let Some(hard) = record.hard_deadline_us {
-                if new_expires > hard {
-                    return Err(SandboxApiError::Invalid(
-                        "续期越过硬顶（hard_deadline）".into(),
-                    ));
-                }
+            if let Some(hard) = record.hard_deadline_us
+                && new_expires > hard
+            {
+                return Err(SandboxApiError::Invalid(
+                    "续期越过硬顶（hard_deadline）".into(),
+                ));
             }
             match self
                 .store
@@ -1005,10 +1005,10 @@ impl SandboxManager {
         if record.desired_state != SandboxInstanceState::Ready {
             return Err(SandboxApiError::NotFound(sandbox_id.to_string()));
         }
-        if let Some(expires) = record.expires_at_us {
-            if expires <= chrono::Utc::now().timestamp_micros() {
-                return Err(SandboxApiError::NotFound(sandbox_id.to_string()));
-            }
+        if let Some(expires) = record.expires_at_us
+            && expires <= chrono::Utc::now().timestamp_micros()
+        {
+            return Err(SandboxApiError::NotFound(sandbox_id.to_string()));
         }
         if record.token_hash != sha256_hex(token) {
             return Err(SandboxApiError::Unauthorized);
@@ -1086,8 +1086,8 @@ impl SandboxManager {
             .await
         {
             // 建卷失败回滚：软删行 + 清理可能半建的 PVC。
-            let _ = self.store.mark_volume_deleted(&volume_id).await;
-            let _ = self.k8s.delete_pvc(&pvc_name).await;
+            let _unused = self.store.mark_volume_deleted(&volume_id).await;
+            let _unused = self.k8s.delete_pvc(&pvc_name).await;
             return Err(k8s_error(error));
         }
         Ok(record)
@@ -1125,7 +1125,7 @@ impl SandboxManager {
             .mark_volume_deleted(volume_id)
             .await
             .map_err(store_error)?;
-        let _ = self.k8s.delete_pvc(&record.pvc_name).await; // PVC 删除失败不阻塞（回收器兜底）
+        let _unused = self.k8s.delete_pvc(&record.pvc_name).await; // PVC 删除失败不阻塞（回收器兜底）
         tracing::info!(volume_id = %record.volume_id, "e2b volume deleted");
         Ok(())
     }
@@ -1263,7 +1263,7 @@ impl SandboxManager {
                     error = %error.to_string(),
                     "e2b warm claim 失败，回收实例"
                 );
-                let _ = self.kill_by_record(&record, KillReason::Explicit).await;
+                let _unused = self.kill_by_record(&record, KillReason::Explicit).await;
                 Err(error)
             }
         }
@@ -1399,8 +1399,8 @@ impl SandboxManager {
         match self.k8s.create_pod(&pod_params).await {
             Ok(_) => {}
             Err(error) => {
-                let _ = self.k8s.delete_pod(&record.pod_name).await;
-                let _ = self
+                let _unused = self.k8s.delete_pod(&record.pod_name).await;
+                let _unused = self
                     .store
                     .finish(
                         &sandbox_id,
@@ -1419,8 +1419,8 @@ impl SandboxManager {
         {
             Ok(_) => {}
             Err(error) => {
-                let _ = self.k8s.delete_pod(&record.pod_name).await;
-                let _ = self
+                let _unused = self.k8s.delete_pod(&record.pod_name).await;
+                let _unused = self
                     .store
                     .finish(
                         &sandbox_id,
@@ -1509,7 +1509,7 @@ impl SandboxManager {
             for record in pending {
                 match self.k8s.delete_pod(&record.pod_name).await {
                     Ok(_) => {
-                        let _ = self
+                        let _unused = self
                             .store
                             .finish(
                                 &record.sandbox_id,
@@ -1583,7 +1583,7 @@ impl SandboxManager {
                     pvc = %volume.pvc_name,
                     "e2b reaper: 卷行活跃但 PVC 缺失超宽限期，软删释放占名"
                 );
-                let _ = self.store.mark_volume_deleted(&volume.volume_id).await;
+                let _unused = self.store.mark_volume_deleted(&volume.volume_id).await;
             }
         }
         tracing::info!("e2b reaper stopped");

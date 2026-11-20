@@ -97,7 +97,8 @@ def main():
         (directory / 'verify.log').write_text(verification.stdout + verification.stderr)
         result = json.loads(verification.stdout) if verification.returncode == 0 else {}
         record('Native terminal retry not executed again', verification.returncode == 0 and result.get('terminal_not_reexecuted') is True)
-        record('Native unreceipted marker not reclaimed', verification.returncode == 0 and result.get('marker_retained') is True)
+        # aafff772 语义：可获取 flock 下的遗留 marker 为死者遗物，受控回收（归档留证）而非永久围栏。
+        record('Native orphan marker reclaimed with owner evidence', verification.returncode == 0 and result.get('marker_orphan_reclaimed') is True)
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
         record('Native crash execution', False, type(error).__name__)
     finally:

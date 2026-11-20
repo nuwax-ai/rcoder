@@ -8,6 +8,8 @@
 use std::sync::Arc;
 
 #[cfg(feature = "kubernetes")]
+use axum::Json;
+#[cfg(feature = "kubernetes")]
 use axum::extract::State;
 #[cfg(feature = "kubernetes")]
 use axum::http::{Request, StatusCode};

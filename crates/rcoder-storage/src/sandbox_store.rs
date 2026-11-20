@@ -883,8 +883,7 @@ impl SandboxStore for PgSandboxStore {
                     .await
                     .map_err(unavailable)?;
                 rows.into_iter()
-                    .filter(|row| row.name == name && row.deleted_at_us.is_none())
-                    .next()
+                    .find(|row| row.name == name && row.deleted_at_us.is_none())
                     .map(volume_record)
                     .transpose()
             })
@@ -927,7 +926,7 @@ impl SandboxStore for PgSandboxStore {
                     .filter(|row| row.deleted_at_us.is_none())
                     .map(volume_record)
                     .collect::<Result<Vec<_>, _>>()?;
-                records.sort_by(|a, b| b.created_at_us.cmp(&a.created_at_us));
+                records.sort_by_key(|record| std::cmp::Reverse(record.created_at_us));
                 Ok(records)
             })
         })

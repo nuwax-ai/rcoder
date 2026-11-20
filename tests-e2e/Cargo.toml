@@ -19,13 +19,12 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
 zip = { workspace = true, default-features = false, features = ["deflate"] }
-# 终端 ws 场景（ttyd 协议）：workspace 级 0.30，与 agent_runner ws_terminal 同款
-# tests/*.rs 集成测试真实使用（WS 预览/生命周期）。cargo unused-dependencies lint
-# 不解析集成测试目录用法，会误报 unused——勿据该告警删除。
-tokio-tungstenite = { workspace = true }
-
 [dev-dependencies]
 axum = { workspace = true }
+# 终端 ws 场景（ttyd 协议）：workspace 级 0.30，与 agent_runner ws_terminal 同款。
+# 仅 tests/*.rs 集成测试使用（WS 预览/生命周期），故放 dev-dependencies——
+# cargo unused-dependencies lint 不解析集成测试目录用法，若误报回迁此处即可。
+tokio-tungstenite = { workspace = true }
 
 [lints]
 workspace = true

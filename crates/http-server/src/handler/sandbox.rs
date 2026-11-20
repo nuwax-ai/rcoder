@@ -43,6 +43,8 @@ fn rfc3339(micros: i64) -> String {
         .unwrap_or_default()
 }
 
+// E2B 兼容线格式：字段名与官方 API 的 camelCase 保持一致，不做 snake_case 改写。
+#[allow(non_snake_case)]
 #[derive(Debug, serde::Deserialize)]
 pub struct CreateSandboxBody {
     #[serde(rename = "templateID", alias = "template", alias = "templateId")]
@@ -55,6 +57,8 @@ pub struct CreateSandboxBody {
     pub volumeMounts: Option<serde_json::Value>,
 }
 
+// E2B 兼容线格式：字段名与官方 API 的 camelCase 保持一致，不做 snake_case 改写。
+#[allow(non_snake_case)]
 #[derive(Debug, serde::Serialize)]
 pub struct SandboxWire {
     pub sandboxID: String,
@@ -129,6 +133,9 @@ fn domain_of(manager: &SandboxManager) -> String {
     manager.public_domain().to_string()
 }
 
+// Err 载荷是 axum Response（≥128 字节）：handler 内以 Result<_, Response> 表达
+// 短路响应是 axum 惯用形态，装箱会扩散到所有调用点。
+#[allow(clippy::result_large_err)]
 async fn manager_of(deps: &SandboxDeps) -> Result<Arc<SandboxManager>, Response> {
     deps.manager().ok_or_else(|| {
         wire_error(SandboxApiError::Unavailable("e2b sandbox 未启用".into()))
@@ -268,7 +275,7 @@ pub async fn list_sandboxes(
             serde_json::to_value(&wire).unwrap_or_default()
         })
         .collect();
-    let _ = query;
+    let _unused = query;
     (StatusCode::OK, axum::Json(serde_json::Value::Array(items))).into_response()
 }
 
@@ -356,6 +363,8 @@ pub async fn not_supported(
 
 // ---------- Volume handlers（M5） ----------
 
+// E2B 兼容线格式：字段名与官方 API 的 camelCase 保持一致，不做 snake_case 改写。
+#[allow(non_snake_case)]
 #[derive(Debug, serde::Deserialize)]
 pub struct CreateVolumeBody {
     pub name: String,
@@ -367,6 +376,8 @@ fn default_volume_size() -> i32 {
     1
 }
 
+// E2B 兼容线格式：字段名与官方 API 的 camelCase 保持一致，不做 snake_case 改写。
+#[allow(non_snake_case)]
 #[derive(Debug, serde::Serialize)]
 pub struct VolumeWire {
     pub volumeID: String,

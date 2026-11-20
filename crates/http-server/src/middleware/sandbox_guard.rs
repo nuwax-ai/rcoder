@@ -51,9 +51,7 @@ pub(crate) fn resolve_target(uri: &Uri, headers: &axum::http::HeaderMap) -> Opti
             // 端口头非法（非数字/越界）不得静默回落默认端口——那会把
             // 恶意构造的端口重定向到 envd；放行给控制面（404）。
             Some(value) => {
-                let Some(text) = value.to_str().ok() else {
-                    return None;
-                };
+                let text = value.to_str().ok()?;
                 let Ok(port) = text.trim().parse::<i32>() else {
                     return None;
                 };
@@ -353,7 +351,7 @@ async fn websocket_tunnel(request: Request<Body>, target: &str, rest: &str, toke
                 let mut server = upstream;
                 // 响应头之后可能已经跟着到达的帧字节——先冲给客户端再进双通。
                 if !head.leftover.is_empty() {
-                    let _ = client.write_all(&head.leftover).await;
+                    let _unused = client.write_all(&head.leftover).await;
                 }
                 match tokio::io::copy_bidirectional(&mut client, &mut server).await {
                     Ok((client_to_server, server_to_client)) => {
@@ -482,10 +480,10 @@ async fn read_upstream_error_body(
                 buffer.truncate(length as usize);
                 return Some(buffer);
             }
-        } else if chunked {
-            if let Some((plain, _consumed)) = dechunk(&buffer) {
-                return Some(plain);
-            }
+        } else if chunked
+            && let Some((plain, _consumed)) = dechunk(&buffer)
+        {
+            return Some(plain);
         }
         if buffer.len() > cap {
             return None;
