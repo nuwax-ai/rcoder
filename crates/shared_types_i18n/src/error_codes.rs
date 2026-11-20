@@ -79,6 +79,11 @@ pub const ERR_E2B_CAPABILITY_NOT_SUPPORTED: &str = "ERR_E2B_CAPABILITY_NOT_SUPPO
 /// E2B 控制面鉴权
 pub const ERR_E2B_API_KEY_MISSING: &str = "ERR_E2B_API_KEY_MISSING";
 pub const ERR_E2B_API_KEY_INVALID: &str = "ERR_E2B_API_KEY_INVALID";
+/// mountPath / volume 附加参数码（codex follow-up：SandboxApiError 带码化）
+pub const ERR_E2B_MOUNT_PATH_ABSOLUTE: &str = "ERR_E2B_MOUNT_PATH_ABSOLUTE";
+pub const ERR_E2B_MOUNT_PATH_SYSTEM: &str = "ERR_E2B_MOUNT_PATH_SYSTEM";
+pub const ERR_E2B_VOLUME_NOT_FOUND: &str = "ERR_E2B_VOLUME_NOT_FOUND";
+pub const ERR_E2B_VOLUME_SIZE_INVALID: &str = "ERR_E2B_VOLUME_SIZE_INVALID";
 /// UserApp ensure 成功态消息（计算容器状态说明）
 pub const ERR_USERAPP_BUILDER_RUNNING: &str = "ERR_USERAPP_BUILDER_RUNNING";
 pub const ERR_USERAPP_BUILDER_REBUILT: &str = "ERR_USERAPP_BUILDER_REBUILT";
@@ -370,6 +375,10 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_E2B_CAPABILITY_NOT_SUPPORTED => "error.e2b_capability_not_supported",
         ERR_E2B_API_KEY_MISSING => "error.e2b_api_key_missing",
         ERR_E2B_API_KEY_INVALID => "error.e2b_api_key_invalid",
+        ERR_E2B_MOUNT_PATH_ABSOLUTE => "error.e2b_mount_path_absolute",
+        ERR_E2B_MOUNT_PATH_SYSTEM => "error.e2b_mount_path_system",
+        ERR_E2B_VOLUME_NOT_FOUND => "error.e2b_volume_not_found",
+        ERR_E2B_VOLUME_SIZE_INVALID => "error.e2b_volume_size_invalid",
         ERR_USERAPP_BUILDER_RUNNING => "error.userapp_builder_running",
         ERR_USERAPP_BUILDER_REBUILT => "error.userapp_builder_rebuilt",
         ERR_USERAPP_BUILDER_READY => "error.userapp_builder_ready",
@@ -656,6 +665,10 @@ mod tests {
             ERR_E2B_CAPABILITY_NOT_SUPPORTED,
             ERR_E2B_API_KEY_MISSING,
             ERR_E2B_API_KEY_INVALID,
+            ERR_E2B_MOUNT_PATH_ABSOLUTE,
+            ERR_E2B_MOUNT_PATH_SYSTEM,
+            ERR_E2B_VOLUME_NOT_FOUND,
+            ERR_E2B_VOLUME_SIZE_INVALID,
             ERR_USERAPP_BUILDER_RUNNING,
             ERR_USERAPP_BUILDER_REBUILT,
             ERR_USERAPP_BUILDER_READY,

@@ -155,7 +155,11 @@ pub async fn e2b_data_plane_guard(
     };
     let locale = crate::handler::utils::locale::get_locale_from_headers(request.headers());
     let Some(manager) = deps.manager() else {
-        return error_response(StatusCode::NOT_FOUND, shared_types::error_codes::ERR_E2B_NOT_ENABLED, locale);
+        return error_response(
+            StatusCode::NOT_FOUND,
+            shared_types::error_codes::ERR_E2B_NOT_ENABLED,
+            locale,
+        );
     };
     if !deps.allowed_ports.contains(&port) {
         return error_response(
@@ -225,10 +229,10 @@ pub async fn e2b_data_plane_guard(
         Err(error) => {
             tracing::warn!(sandbox_id = %sandbox_id, error = %error, "e2b 数据面代理失败");
             return error_response(
-            StatusCode::BAD_GATEWAY,
-            shared_types::error_codes::ERR_E2B_DATA_PLANE_UNREACHABLE,
-            locale,
-        );
+                StatusCode::BAD_GATEWAY,
+                shared_types::error_codes::ERR_E2B_DATA_PLANE_UNREACHABLE,
+                locale,
+            );
         }
     };
     let status =

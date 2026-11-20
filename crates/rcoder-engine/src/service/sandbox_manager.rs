@@ -52,6 +52,12 @@ pub enum SandboxApiError {
     Invalid(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    /// 参数/状态错误带错误码：HTTP 边缘按 Accept-Language 翻译
+    /// （en 默认）；动态细节（模板名/数值）由构造点记日志，不进响应。
+    #[error("invalid: code {0}")]
+    InvalidCode(&'static str),
+    #[error("conflict: code {0}")]
+    ConflictCode(&'static str),
     #[error("capability not supported: {0}")]
     NotSupported(&'static str),
     #[error("unavailable: {0}")]
@@ -267,7 +273,9 @@ impl SandboxManager {
         )
         .map_err(|error| SandboxApiError::Unavailable(format!("token b64: {error}")))?;
         if packed.len() < 12 {
-            return Err(SandboxApiError::Unavailable("token ciphertext is corrupted".into()));
+            return Err(SandboxApiError::Unavailable(
+                "token ciphertext is corrupted".into(),
+            ));
         }
         let (nonce_bytes, ciphertext) = packed.split_at(12);
         self.cipher
@@ -301,9 +309,12 @@ impl SandboxManager {
                         token,
                     })
                 }
-                state => Err(SandboxApiError::Conflict(format!(
-                    "a sandbox with the same idempotency key is in state {state:?}; retry later"
-                ))),
+                state => {
+                    tracing::info!(?state, "e2b create idempotency conflict");
+                    Err(SandboxApiError::ConflictCode(
+                        shared_types::error_codes::ERR_E2B_IDEMPOTENCY_IN_PROGRESS,
+                    ))
+                }
             };
         }
 
@@ -322,22 +333,23 @@ impl SandboxManager {
             .await
             .map_err(store_error)?
             .ok_or_else(|| {
-                SandboxApiError::Invalid(format!(
-                    "template {} is unavailable",
-                    params.template_id
-                ))
+                tracing::info!(template = %params.template_id, "e2b template unavailable");
+                SandboxApiError::InvalidCode(
+                    shared_types::error_codes::ERR_E2B_TEMPLATE_UNAVAILABLE,
+                )
             })?;
         let ttl_seconds = params.timeout_seconds.unwrap_or(self.default_ttl_seconds);
         if ttl_seconds <= 0 {
-            return Err(SandboxApiError::Invalid(
-                "timeout must be a positive number of seconds".into(),
+            return Err(SandboxApiError::InvalidCode(
+                shared_types::error_codes::ERR_E2B_TIMEOUT_INVALID,
             ));
         }
         let ttl_cap = self.max_ttl_seconds.min(spec.ttl_max_seconds);
         if ttl_seconds > ttl_cap {
-            return Err(SandboxApiError::Invalid(format!(
-                "timeout {ttl_seconds}s exceeds the maximum {ttl_cap}s"
-            )));
+            tracing::info!(ttl_seconds, ttl_cap, "e2b timeout exceeds cap");
+            return Err(SandboxApiError::InvalidCode(
+                shared_types::error_codes::ERR_E2B_TIMEOUT_EXCEEDS_CAP,
+            ));
         }
 
         let sandbox_id = random_id(12);
@@ -393,7 +405,9 @@ impl SandboxManager {
                 )));
             }
             if mount.mount_path.contains("..") {
-                return Err(SandboxApiError::Invalid("mountPath must not contain path traversal".into()));
+                return Err(SandboxApiError::Invalid(
+                    "mountPath must not contain path traversal".into(),
+                ));
             }
             const SENSITIVE: &[&str] = &["/proc", "/sys", "/dev", "/etc", "/var/run", "/run"];
             if SENSITIVE
@@ -411,7 +425,10 @@ impl SandboxManager {
                 .await
                 .map_err(store_error)?
                 .ok_or_else(|| {
-                    SandboxApiError::Invalid(format!("volume \"{}\" does not exist", mount.volume_name))
+                    SandboxApiError::Invalid(format!(
+                        "volume \"{}\" does not exist",
+                        mount.volume_name
+                    ))
                 })?;
             resolved_volume_mounts.push((volume.pvc_name.clone(), mount.mount_path.clone()));
         }
@@ -943,11 +960,13 @@ impl SandboxManager {
     ) -> Result<(), SandboxApiError> {
         let record = self.get(key, sandbox_id).await?;
         if record.desired_state != SandboxInstanceState::Ready {
-            return Err(SandboxApiError::Invalid("only a Ready sandbox can be renewed".into()));
+            return Err(SandboxApiError::InvalidCode(
+                shared_types::error_codes::ERR_E2B_RENEW_REQUIRES_READY,
+            ));
         }
         if timeout_seconds <= 0 {
-            return Err(SandboxApiError::Invalid(
-                "timeout must be a positive number of seconds".into(),
+            return Err(SandboxApiError::InvalidCode(
+                shared_types::error_codes::ERR_E2B_TIMEOUT_INVALID,
             ));
         }
         let spec_cap = self.max_ttl_seconds.min(
@@ -990,7 +1009,9 @@ impl SandboxManager {
                         .map_err(store_error)?
                         .ok_or_else(|| SandboxApiError::NotFound(sandbox_id.to_string()))?;
                     if record.desired_state != SandboxInstanceState::Ready {
-                        return Err(SandboxApiError::Invalid("sandbox is no longer in Ready state".into()));
+                        return Err(SandboxApiError::InvalidCode(
+                            shared_types::error_codes::ERR_E2B_NOT_READY,
+                        ));
                     }
                     continue;
                 }
@@ -1162,15 +1183,16 @@ impl SandboxManager {
         };
         let ttl_seconds = params.timeout_seconds.unwrap_or(self.default_ttl_seconds);
         if ttl_seconds <= 0 {
-            return Err(SandboxApiError::Invalid(
-                "timeout must be a positive number of seconds".into(),
+            return Err(SandboxApiError::InvalidCode(
+                shared_types::error_codes::ERR_E2B_TIMEOUT_INVALID,
             ));
         }
         let ttl_cap = self.max_ttl_seconds.min(spec.ttl_max_seconds);
         if ttl_seconds > ttl_cap {
-            return Err(SandboxApiError::Invalid(format!(
-                "timeout {ttl_seconds}s exceeds the maximum {ttl_cap}s"
-            )));
+            tracing::info!(ttl_seconds, ttl_cap, "e2b timeout exceeds cap");
+            return Err(SandboxApiError::InvalidCode(
+                shared_types::error_codes::ERR_E2B_TIMEOUT_EXCEEDS_CAP,
+            ));
         }
 
         let candidates = self.store.list_warm_ready().await.map_err(store_error)?;

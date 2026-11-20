@@ -17,8 +17,8 @@ fn wire_error(error: SandboxApiError, locale: &str) -> Response {
     let status = match &error {
         SandboxApiError::Unauthorized => StatusCode::UNAUTHORIZED,
         SandboxApiError::NotFound(_) => StatusCode::NOT_FOUND,
-        SandboxApiError::Invalid(_) => StatusCode::BAD_REQUEST,
-        SandboxApiError::Conflict(_) => StatusCode::CONFLICT,
+        SandboxApiError::Invalid(_) | SandboxApiError::InvalidCode(_) => StatusCode::BAD_REQUEST,
+        SandboxApiError::Conflict(_) | SandboxApiError::ConflictCode(_) => StatusCode::CONFLICT,
         SandboxApiError::NotSupported(_) => StatusCode::NOT_IMPLEMENTED,
         SandboxApiError::Unavailable(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -30,6 +30,9 @@ fn wire_error(error: SandboxApiError, locale: &str) -> Response {
                 shared_types::error_codes::ERR_SERVICE_UNAVAILABLE,
                 locale,
             )
+        }
+        SandboxApiError::InvalidCode(code) | SandboxApiError::ConflictCode(code) => {
+            shared_types::error_codes::get_error_message(code, locale)
         }
         other => other.to_string(),
     };
@@ -140,16 +143,15 @@ fn domain_of(manager: &SandboxManager) -> String {
 // 短路响应是 axum 惯用形态，装箱会扩散到所有调用点。
 #[allow(clippy::result_large_err)]
 async fn manager_of(deps: &SandboxDeps, locale: &str) -> Result<Arc<SandboxManager>, Response> {
-    deps.manager()
-        .ok_or_else(|| {
-            wire_error(
-                SandboxApiError::Unavailable(shared_types::error_codes::get_error_message(
-                    shared_types::error_codes::ERR_E2B_NOT_ENABLED,
-                    locale,
-                )),
+    deps.manager().ok_or_else(|| {
+        wire_error(
+            SandboxApiError::Unavailable(shared_types::error_codes::get_error_message(
+                shared_types::error_codes::ERR_E2B_NOT_ENABLED,
                 locale,
-            )
-        })
+            )),
+            locale,
+        )
+    })
 }
 
 pub async fn create_sandbox(
@@ -168,10 +170,7 @@ pub async fn create_sandbox(
         _ => {
             let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
             return wire_error(
-                SandboxApiError::Invalid(shared_types::error_codes::get_error_message(
-                    shared_types::error_codes::ERR_E2B_TEMPLATE_REQUIRED,
-                    locale,
-                )),
+                SandboxApiError::InvalidCode(shared_types::error_codes::ERR_E2B_TEMPLATE_REQUIRED),
                 locale,
             );
         }
@@ -253,7 +252,7 @@ pub async fn create_sandbox(
         Err(error) => {
             let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
             wire_error(error, locale)
-        },
+        }
     }
 }
 
@@ -276,7 +275,7 @@ pub async fn get_sandbox(
         Err(error) => {
             let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
             wire_error(error, locale)
-        },
+        }
     }
 }
 
@@ -297,7 +296,7 @@ pub async fn list_sandboxes(
         Err(error) => {
             let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
             return wire_error(error, locale);
-        },
+        }
     };
     let domain = domain_of(&manager);
     let items: Vec<serde_json::Value> = records
@@ -330,7 +329,7 @@ pub async fn kill_sandbox(
         Err(error) => {
             let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
             wire_error(error, locale)
-        },
+        }
     }
 }
 
@@ -356,7 +355,7 @@ pub async fn set_timeout(
         Err(error) => {
             let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
             wire_error(error, locale)
-        },
+        }
     }
 }
 
@@ -379,10 +378,7 @@ pub async fn connect_sandbox(
         Ok(_) => {
             let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
             wire_error(
-                SandboxApiError::Invalid(shared_types::error_codes::get_error_message(
-                    shared_types::error_codes::ERR_E2B_NOT_READY,
-                    locale,
-                )),
+                SandboxApiError::InvalidCode(shared_types::error_codes::ERR_E2B_NOT_READY),
                 locale,
             )
         }
@@ -421,7 +417,7 @@ pub async fn list_templates(
         Err(error) => {
             let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
             wire_error(error, locale)
-        },
+        }
     }
 }
 
@@ -485,7 +481,7 @@ pub async fn create_volume(
         Err(error) => {
             let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
             wire_error(error, locale)
-        },
+        }
     }
 }
 
@@ -515,7 +511,7 @@ pub async fn list_volumes(
         Err(error) => {
             let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
             wire_error(error, locale)
-        },
+        }
     }
 }
 
@@ -535,6 +531,6 @@ pub async fn delete_volume(
         Err(error) => {
             let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
             wire_error(error, locale)
-        },
+        }
     }
 }
