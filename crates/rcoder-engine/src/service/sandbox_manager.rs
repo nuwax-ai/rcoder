@@ -860,12 +860,14 @@ impl SandboxManager {
                                 if matches!(status.phase.as_str(), "Failed" | "Succeeded") =>
                             {
                                 tracing::info!(sandbox_id = %record.sandbox_id, phase = %status.phase, "recover: Pod 终相，kill");
-                                let _unused = self.kill_by_record(&record, KillReason::Recover).await;
+                                let _unused =
+                                    self.kill_by_record(&record, KillReason::Recover).await;
                             }
                             // Ready 且 Pod 非 Running → kill
                             SandboxInstanceState::Ready if status.phase != "Running" => {
                                 tracing::info!(sandbox_id = %record.sandbox_id, phase = %status.phase, "recover: Ready 但 Pod 非 Running，kill");
-                                let _unused = self.kill_by_record(&record, KillReason::Recover).await;
+                                let _unused =
+                                    self.kill_by_record(&record, KillReason::Recover).await;
                             }
                             // Ready + Running → envd 存活检查（Pod 活着但 envd 死掉的
                             // 场景正是生产事故里"沙箱不响应"的形态）
@@ -875,13 +877,15 @@ impl SandboxManager {
                                 };
                                 if !self.envd_alive(&pod_ip).await {
                                     tracing::warn!(sandbox_id = %record.sandbox_id, "recover: envd 无响应，kill");
-                                    let _unused = self.kill_by_record(&record, KillReason::Recover).await;
+                                    let _unused =
+                                        self.kill_by_record(&record, KillReason::Recover).await;
                                 }
                             }
                             // WarmReady 且 Pod 非 Running（节点回收等）→ kill 交回收器补池
                             SandboxInstanceState::WarmReady if status.phase != "Running" => {
                                 tracing::info!(sandbox_id = %record.sandbox_id, phase = %status.phase, "recover: 温池 Pod 非 Running，kill");
-                                let _unused = self.kill_by_record(&record, KillReason::Recover).await;
+                                let _unused =
+                                    self.kill_by_record(&record, KillReason::Recover).await;
                             }
                             // Provisioning/Initializing 超时（创建时间 + 超时上限 < now）→ kill
                             SandboxInstanceState::Provisioning
@@ -891,7 +895,8 @@ impl SandboxManager {
                                         * 1_000_000;
                                 if chrono::Utc::now().timestamp_micros() > deadline {
                                     tracing::info!(sandbox_id = %record.sandbox_id, "recover: 创建超时，kill");
-                                    let _unused = self.kill_by_record(&record, KillReason::Recover).await;
+                                    let _unused =
+                                        self.kill_by_record(&record, KillReason::Recover).await;
                                 }
                             }
                             _ => {} // Ready + Running = 健康，跳过

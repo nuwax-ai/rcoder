@@ -13,7 +13,7 @@ use k8s_openapi::api::core::v1::{
     ResourceRequirements, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use kube::{api::ObjectMeta, Api, Client};
+use kube::{Api, Client, api::ObjectMeta};
 use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
@@ -63,7 +63,9 @@ impl SandboxK8s {
     /// 独立发现 kube 配置并自建 client（不依赖 KubernetesRuntime 实例；
     /// 组合根装配用，与主运行时共享同一集群凭据来源）。
     pub async fn discover(namespace: String) -> Result<Self, SandboxK8sError> {
-        let config = kube::Config::infer().await.map_err(|error| err("kube config", error))?;
+        let config = kube::Config::infer()
+            .await
+            .map_err(|error| err("kube config", error))?;
         let client = Client::try_from(config).map_err(|error| err("kube client", error))?;
         Ok(Self::new(client, namespace))
     }
@@ -79,7 +81,6 @@ impl SandboxK8s {
     pub fn namespace(&self) -> &str {
         &self.namespace
     }
-
 
     /// 创建 CephFS PVC（RWX，多沙箱可并发挂载）。
     pub async fn create_pvc(
@@ -133,8 +134,7 @@ impl SandboxK8s {
     /// 列出本沙箱命名空间的卷 PVC（label 由 create_pvc 打上）。
     /// 回收器用它对账"行已软删/不存在"的孤儿 PVC。
     pub async fn list_volume_pvcs(&self) -> Result<Vec<String>, SandboxK8sError> {
-        let params = kube::api::ListParams::default()
-            .labels("app=e2b-sandbox,e2b-volume=true");
+        let params = kube::api::ListParams::default().labels("app=e2b-sandbox,e2b-volume=true");
         let pvcs = Api::<PersistentVolumeClaim>::namespaced(self.client.clone(), &self.namespace)
             .list(&params)
             .await
@@ -217,15 +217,21 @@ impl SandboxK8s {
                     "vol-{}",
                     pvc_name.strip_prefix("e2b-vol-").unwrap_or(pvc_name)
                 ),
-                persistent_volume_claim: Some(k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
-                    claim_name: pvc_name.clone(),
-                    ..Default::default()
-                }),
+                persistent_volume_claim: Some(
+                    k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+                        claim_name: pvc_name.clone(),
+                        ..Default::default()
+                    },
+                ),
                 ..Default::default()
             })
             .collect();
         let spec = PodSpec {
-            volumes: if volumes.is_empty() { None } else { Some(volumes) },
+            volumes: if volumes.is_empty() {
+                None
+            } else {
+                Some(volumes)
+            },
             containers: vec![container],
             runtime_class_name: params.runtime_class.clone(),
             active_deadline_seconds: Some(params.max_lifetime_seconds),
@@ -253,7 +259,11 @@ impl SandboxK8s {
 
     /// 删除沙箱 Pod；返回是否存在（404 视为已删除，幂等成功）。
     pub async fn delete_pod(&self, name: &str) -> Result<bool, SandboxK8sError> {
-        match self.pods().delete(name, &kube::api::DeleteParams::default()).await {
+        match self
+            .pods()
+            .delete(name, &kube::api::DeleteParams::default())
+            .await
+        {
             Ok(_) => Ok(true),
             Err(kube::Error::Api(response)) if response.code == 404 => Ok(false),
             Err(error) => Err(err("delete pod", error)),
@@ -262,7 +272,11 @@ impl SandboxK8s {
 
     /// 重置 Pod activeDeadlineSeconds（温池认领时续命：K8s 语义为更新即重置计时，
     /// 否则认领的实例会在"spawn 时刻 + 温池闲置 TTL"被无条件杀掉）。
-    pub async fn patch_pod_deadline(&self, name: &str, seconds: i64) -> Result<(), SandboxK8sError> {
+    pub async fn patch_pod_deadline(
+        &self,
+        name: &str,
+        seconds: i64,
+    ) -> Result<(), SandboxK8sError> {
         let patch = kube::api::Patch::Merge(serde_json::json!({
             "spec": { "activeDeadlineSeconds": seconds }
         }));
@@ -273,7 +287,10 @@ impl SandboxK8s {
             .map_err(|error| err("patch pod deadline", error))
     }
 
-    pub async fn pod_status(&self, name: &str) -> Result<Option<SandboxPodStatus>, SandboxK8sError> {
+    pub async fn pod_status(
+        &self,
+        name: &str,
+    ) -> Result<Option<SandboxPodStatus>, SandboxK8sError> {
         match self.pods().get(name).await {
             Ok(pod) => Ok(Some(SandboxPodStatus {
                 phase: pod
@@ -305,13 +322,13 @@ impl SandboxK8s {
             let status = self.pod_status(name).await?;
             match status {
                 Some(status) if status.phase == "Running" && status.pod_ip.is_some() => {
-                    return Ok(status)
+                    return Ok(status);
                 }
                 Some(status) if matches!(status.phase.as_str(), "Failed" | "Succeeded") => {
                     return Err(SandboxK8sError(format!(
                         "sandbox pod {name} reached terminal phase {}",
                         status.phase
-                    )))
+                    )));
                 }
                 _ => {}
             }

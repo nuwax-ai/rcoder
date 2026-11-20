@@ -140,7 +140,6 @@ pub async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-
 /// E2B 兼容沙箱装配：PG store + 独立 kube client + manager + 种子 + 回收任务。
 /// 失败 fail-fast（token key 非法/PG 不可达/kube 配置缺失都不允许静默降级）。
 #[cfg(all(feature = "kubernetes", feature = "rcoder-pg"))]
@@ -164,12 +163,8 @@ async fn build_sandbox_deps(
                 .map_err(|error| format!("sandbox pg: {error}"))?,
         );
         let manager = StdArc::new(
-            service::sandbox_manager::SandboxManager::new(
-                store,
-                k8s,
-                &config.e2b_sandbox,
-            )
-            .map_err(|error| format!("sandbox manager: {error}"))?,
+            service::sandbox_manager::SandboxManager::new(store, k8s, &config.e2b_sandbox)
+                .map_err(|error| format!("sandbox manager: {error}"))?,
         );
         manager
             .seed_registry(&config.e2b_sandbox)
@@ -183,18 +178,19 @@ async fn build_sandbox_deps(
         Ok(manager) => {
             let reaper = std::sync::Arc::clone(&manager);
             let shutdown_rx = shutdown_tx.subscribe();
-            tokio::spawn(reaper.run_reaper(
-                shutdown_rx,
-                config.e2b_sandbox.reaper_interval_seconds,
-            ));
+            tokio::spawn(
+                reaper.run_reaper(shutdown_rx, config.e2b_sandbox.reaper_interval_seconds),
+            );
             // M4 温池补池器（run_pool_replenisher 内部检查 warm_pool_enabled，
             // 关闭时立即返回——保持装配路径与开关解耦）。
             let replenisher = std::sync::Arc::clone(&manager);
             let shutdown_rx = shutdown_tx.subscribe();
-            tokio::spawn(replenisher.run_pool_replenisher(
-                shutdown_rx,
-                config.e2b_sandbox.warm_pool_interval_seconds,
-            ));
+            tokio::spawn(
+                replenisher.run_pool_replenisher(
+                    shutdown_rx,
+                    config.e2b_sandbox.warm_pool_interval_seconds,
+                ),
+            );
             router::sandbox::SandboxDeps::new(manager, config.e2b_sandbox.allowed_ports.clone())
         }
         Err(error) => {

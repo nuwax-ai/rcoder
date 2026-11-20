@@ -308,7 +308,11 @@ pub(super) fn release_file_receipt(
         if let Some(parent) = archive.parent() {
             let _unused = std::fs::create_dir_all(parent);
         }
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&archive) {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&archive)
+        {
             use std::io::Write as _;
             let _unused = file.write_all(entry.as_bytes());
         }

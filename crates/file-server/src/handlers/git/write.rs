@@ -82,14 +82,14 @@ pub(crate) async fn add(
 ) -> Result<Json<GitAddResult>, AppError> {
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let files = body.files.unwrap_or_default();
-        // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
+    // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
     let _admission = admission.as_ref().map(|extension| extension.0.clone());
     tokio::task::spawn_blocking(move || {
         let _hold = _admission;
         with_repo(&path, |repo| git::stage_files(repo, &files))
     })
-        .await
-        .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
     Ok(Json(GitAddResult {
         success: true,
         message: "Files staged successfully".to_string(),
@@ -160,14 +160,14 @@ pub(crate) async fn unstage(
     let files = body.files.unwrap_or_default();
     let all = files.is_empty();
     let files_echo = files.clone();
-        // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
+    // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
     let _admission = admission.as_ref().map(|extension| extension.0.clone());
     tokio::task::spawn_blocking(move || {
         let _hold = _admission;
         with_repo(&path, |repo| git::unstage_files(repo, &files))
     })
-        .await
-        .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
     let (message, files_val) = if all {
         (
             "All files unstaged successfully",
@@ -323,14 +323,14 @@ pub(crate) async fn checkout(
     body.validate().map_err(crate::error::from_garde)?;
     let (path, log_id) = resolve_body(&state, &body.base).await?;
     let target = body.target.clone();
-        // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
+    // 迁移写准入副本: 闭包持有至同步写副作用结束(HTTP 取消不中止, 复审第五轮 P1)。
     let _admission = admission.as_ref().map(|extension| extension.0.clone());
     tokio::task::spawn_blocking(move || {
         let _hold = _admission;
         with_repo(&path, |repo| git::checkout_tree(repo, &target))
     })
-        .await
-        .map_err(|e| AppError::system(format!("git join: {e}")))??;
+    .await
+    .map_err(|e| AppError::system(format!("git join: {e}")))??;
     Ok(Json(GitCheckoutResult {
         success: true,
         message: format!("Checkout files from {} successful", body.target),
@@ -441,7 +441,7 @@ mod admission_extractor_tests {
 
     #[tokio::test]
     async fn admission_extractor_tolerates_missing_and_present_extension() {
-        use axum::{routing::post, Router};
+        use axum::{Router, routing::post};
         use tower::ServiceExt;
 
         async fn probe(
@@ -464,7 +464,11 @@ mod admission_extractor_tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), axum::http::StatusCode::OK, "无扩展时不得 500");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "无扩展时不得 500"
+        );
 
         // 有扩展（intercept 注入 guard）→ 必须可提取且 handler 可持有
         let guard = match shared_types::migration_gate::admit_write("router-extract-probe") {
@@ -484,6 +488,10 @@ mod admission_extractor_tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), axum::http::StatusCode::OK, "有扩展时不得 500");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "有扩展时不得 500"
+        );
     }
 }

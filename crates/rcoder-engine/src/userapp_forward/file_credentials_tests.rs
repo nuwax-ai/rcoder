@@ -65,9 +65,7 @@ impl UserAppDeploymentRuntime for PeerRuntime {
     }
 }
 
-async fn state_with_configured_token(
-    token: Option<&str>,
-) -> (Arc<AppState>, tempfile::TempDir) {
+async fn state_with_configured_token(token: Option<&str>) -> (Arc<AppState>, tempfile::TempDir) {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(
         rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
@@ -77,8 +75,7 @@ async fn state_with_configured_token(
         .unwrap(),
     );
     let runtime = Arc::new(PeerRuntime);
-    let mut state =
-        crate::userapp_builder::builder_runtime_test_state(runtime, store, None).await;
+    let mut state = crate::userapp_builder::builder_runtime_test_state(runtime, store, None).await;
     Arc::get_mut(&mut state).unwrap().config.file_server_proxy =
         Some(file_server_proxy::FileServerProxyConfig {
             auth_token: token.map(str::to_string),

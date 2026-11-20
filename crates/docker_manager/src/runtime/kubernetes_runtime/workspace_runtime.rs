@@ -150,11 +150,10 @@ impl WorkspaceRuntime for KubernetesRuntime {
         let pvc_name = self.workspace_pvc_name(identifier, service_type)?;
         // 卷不存在（rollback 前卷已被清理等）→ no-op：标记的对象都缺了，
         // 续接分支自然不成立。
-        let Some(existing) = self
-            .pvcs()
-            .get_opt(&pvc_name)
-            .await
-            .map_err(|e| ContainerRuntimeError::K8sError(format!("get PVC '{pvc_name}': {e}")))?
+        let Some(existing) =
+            self.pvcs().get_opt(&pvc_name).await.map_err(|e| {
+                ContainerRuntimeError::K8sError(format!("get PVC '{pvc_name}': {e}"))
+            })?
         else {
             return Ok(());
         };
@@ -189,9 +188,9 @@ impl WorkspaceRuntime for KubernetesRuntime {
                 &kube::api::Patch::Merge(&patch),
             )
             .await
-            .map_err(|e| ContainerRuntimeError::K8sError(format!(
-                "patch PVC '{pvc_name}' origin label: {e}"
-            )))?;
+            .map_err(|e| {
+                ContainerRuntimeError::K8sError(format!("patch PVC '{pvc_name}' origin label: {e}"))
+            })?;
         Ok(())
     }
 
@@ -409,16 +408,11 @@ impl WorkspaceRuntime for KubernetesRuntime {
 }
 
 impl KubernetesRuntime {
-
     /// 判据缓存键 = 物理 PVC 名（终审 F5）：ComputerAgentRunner 与
     /// ComputerNormalProject 同 PVC 但不同 service_type——此前
     /// `{service_type}/{identifier}` 双键会同一 PVC 返回 Migrated 与
     /// NotMigrated 并存（cutover 只 warm 一个键）。PVC 名是物理唯一键。
-    fn migration_cache_key(
-        &self,
-        identifier: &str,
-        service_type: &ServiceType,
-    ) -> String {
+    fn migration_cache_key(&self, identifier: &str, service_type: &ServiceType) -> String {
         use crate::runtime::k8s_pvc::K8sPvcOps;
         self.workspace_pvc_name(identifier, service_type)
             .unwrap_or_else(|_| format!("{service_type}/{identifier}"))
@@ -443,7 +437,6 @@ impl KubernetesRuntime {
             (value.0, value.1, std::time::Instant::now()),
         );
     }
-
 
     /// 读 PVC 的迁移 annotation（无法识别的值 → NotMigrated）。私有 helper
     /// （非 WorkspaceRuntime 接口——内部实现细节）。
@@ -493,9 +486,10 @@ pub(crate) async fn set_migration_state_detached(
                 "PVC '{pvc_name}' not found; refusing to flip migration state"
             ))
         })?;
-    let uid = existing.metadata.uid.clone().ok_or_else(|| {
-        ContainerRuntimeError::Conflict(format!("PVC '{pvc_name}' has no UID"))
-    })?;
+    let uid =
+        existing.metadata.uid.clone().ok_or_else(|| {
+            ContainerRuntimeError::Conflict(format!("PVC '{pvc_name}' has no UID"))
+        })?;
     let rv = existing.metadata.resource_version.clone().ok_or_else(|| {
         ContainerRuntimeError::Conflict(format!("PVC '{pvc_name}' has no resourceVersion"))
     })?;
@@ -510,26 +504,28 @@ pub(crate) async fn set_migration_state_detached(
     let patch = serde_json::json!({
         "metadata": {"uid": uid, "resourceVersion": rv, "annotations": annotations}
     });
-    pvcs.patch(&pvc_name, &kube::api::PatchParams::default(), &kube::api::Patch::Merge(&patch))
-        .await
-        .map_err(|e| match &e {
-            kube::Error::Api(response) if response.code == 404 => {
-                ContainerRuntimeError::ContainerNotFound(format!("PVC '{pvc_name}' vanished"))
-            }
-            kube::Error::Api(response) if response.code == 409 => {
-                ContainerRuntimeError::Conflict(format!(
-                    "PVC '{pvc_name}' changed concurrently; retry"
-                ))
-            }
-            other => ContainerRuntimeError::K8sError(format!(
-                "patch PVC '{pvc_name}' migration state: {other}"
-            )),
-        })?;
+    pvcs.patch(
+        &pvc_name,
+        &kube::api::PatchParams::default(),
+        &kube::api::Patch::Merge(&patch),
+    )
+    .await
+    .map_err(|e| match &e {
+        kube::Error::Api(response) if response.code == 404 => {
+            ContainerRuntimeError::ContainerNotFound(format!("PVC '{pvc_name}' vanished"))
+        }
+        kube::Error::Api(response) if response.code == 409 => {
+            ContainerRuntimeError::Conflict(format!("PVC '{pvc_name}' changed concurrently; retry"))
+        }
+        other => ContainerRuntimeError::K8sError(format!(
+            "patch PVC '{pvc_name}' migration state: {other}"
+        )),
+    })?;
     // 即时写缓存：完成者场景下这是"取消后路由与 PVC 收敛"的关键一步。
-    cache.write().await.insert(
-        cache_key,
-        (true, state, std::time::Instant::now()),
-    );
+    cache
+        .write()
+        .await
+        .insert(cache_key, (true, state, std::time::Instant::now()));
     Ok(uid)
 }
 
@@ -582,7 +578,11 @@ pub(crate) async fn reconcile_migration_marker(
     if migrated {
         cache.write().await.insert(
             cache_key.to_string(),
-            (true, shared_types::WorkspaceMigrationState::Migrated, std::time::Instant::now()),
+            (
+                true,
+                shared_types::WorkspaceMigrationState::Migrated,
+                std::time::Instant::now(),
+            ),
         );
         MarkerReconciliation::Confirmed
     } else {

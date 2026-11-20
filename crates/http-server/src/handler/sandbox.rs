@@ -3,10 +3,10 @@
 //! wire DTO 的字段名与 E2B SDK 期望严格一致（camelCase + ID 大写，如
 //! `sandboxID/envdVersion`）；鉴权由 router/sandbox.rs 的 e2b key 中间件
 //! 完成（`Extension<SandboxApiKeyRecord>`），数据面走 middleware/sandbox_guard。
+use axum::Extension;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Extension;
 use shared_types::sandbox::{SandboxApiKeyRecord, SandboxInstanceRecord, SandboxInstanceState};
 use std::sync::Arc;
 
@@ -137,9 +137,8 @@ fn domain_of(manager: &SandboxManager) -> String {
 // 短路响应是 axum 惯用形态，装箱会扩散到所有调用点。
 #[allow(clippy::result_large_err)]
 async fn manager_of(deps: &SandboxDeps) -> Result<Arc<SandboxManager>, Response> {
-    deps.manager().ok_or_else(|| {
-        wire_error(SandboxApiError::Unavailable("e2b sandbox 未启用".into()))
-    })
+    deps.manager()
+        .ok_or_else(|| wire_error(SandboxApiError::Unavailable("e2b sandbox 未启用".into())))
 }
 
 pub async fn create_sandbox(
@@ -216,16 +215,18 @@ pub async fn create_sandbox(
         template_id: template,
         timeout_seconds: body.timeout,
         env,
-        metadata: body
-            .metadata
-            .as_ref()
-            .map(|value| value.to_string()),
+        metadata: body.metadata.as_ref().map(|value| value.to_string()),
         volume_mounts,
         idempotency_key,
     };
     match manager.create(&key, &params).await {
         Ok(CreateOutcome { record, token }) => {
-            let wire = wire_from_record(&record, token, record.sandbox_id[..8].to_string(), &domain_of(&manager));
+            let wire = wire_from_record(
+                &record,
+                token,
+                record.sandbox_id[..8].to_string(),
+                &domain_of(&manager),
+            );
             (StatusCode::OK, axum::Json(wire)).into_response()
         }
         Err(error) => wire_error(error),
@@ -343,21 +344,25 @@ pub async fn list_templates(
         Err(response) => return response,
     };
     match manager.list_templates().await {
-        Ok(templates) => (StatusCode::OK, axum::Json(serde_json::json!(templates
-            .into_iter()
-            .map(|summary| serde_json::json!({
-                "templateID": summary.template_id,
-                "name": summary.display_name.unwrap_or_default(),
-                "publicConfigs": [],
-            }))
-            .collect::<Vec<_>>()))).into_response(),
+        Ok(templates) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!(
+                templates
+                    .into_iter()
+                    .map(|summary| serde_json::json!({
+                        "templateID": summary.template_id,
+                        "name": summary.display_name.unwrap_or_default(),
+                        "publicConfigs": [],
+                    }))
+                    .collect::<Vec<_>>()
+            )),
+        )
+            .into_response(),
         Err(error) => wire_error(error),
     }
 }
 
-pub async fn not_supported(
-    Extension(_key): Extension<SandboxApiKeyRecord>,
-) -> Response {
+pub async fn not_supported(Extension(_key): Extension<SandboxApiKeyRecord>) -> Response {
     wire_error(SandboxApiError::NotSupported("e2b sandbox M1 不支持该能力"))
 }
 

@@ -99,7 +99,10 @@ impl KubernetesRuntime {
             )
         {
             use container_runtime_api::WorkspaceRuntime;
-            match self.workspace_migration_state(identifier, &service_type).await? {
+            match self
+                .workspace_migration_state(identifier, &service_type)
+                .await?
+            {
                 shared_types::WorkspaceMigrationState::Migrated => true,
                 shared_types::WorkspaceMigrationState::NotMigrated => {
                     // 新用户初始化（终审 F8 + 复审 P2）：flag 开 + 共享卷无该
@@ -117,9 +120,7 @@ impl KubernetesRuntime {
                     // "真新用户"会让存量用户被切到空卷）。
                     let pvc = self
                         .pvcs()
-                        .get_opt(
-                            &self.workspace_pvc_name(identifier, &service_type)?,
-                        )
+                        .get_opt(&self.workspace_pvc_name(identifier, &service_type)?)
                         .await
                         .map_err(|error| {
                             ContainerRuntimeError::ConnectionError(format!(
@@ -131,7 +132,9 @@ impl KubernetesRuntime {
                             .metadata
                             .labels
                             .as_ref()
-                            .and_then(|labels| labels.get(crate::runtime::k8s_pvc::VOLUME_ORIGIN_LABEL))
+                            .and_then(|labels| {
+                                labels.get(crate::runtime::k8s_pvc::VOLUME_ORIGIN_LABEL)
+                            })
                             .cloned()
                     });
                     // 写排空后探测（复审第五轮 P1）：受理中的共享写尚未创建
@@ -149,83 +152,100 @@ impl KubernetesRuntime {
                     // 本编排（终审 P1：此前未短路，take() 得 None 后静默跳过
                     // marker PATCH 但卷已建、决策返回 true → agent RBD 形态
                     // 而无 Migrated 标 → 路由落共享卷，agent/数据面分裂）。
-                    let mut migration_gate = shared_types::migration_gate::begin_guarded(identifier);
+                    let mut migration_gate =
+                        shared_types::migration_gate::begin_guarded(identifier);
                     if migration_gate.is_none() {
                         // 共享路径：不做 RBD 决策（fresh-init 编排整体放弃）。
-                        info!(
-                            "[K8S] '{identifier}' stays on shared volume this round"
-                        );
+                        info!("[K8S] '{identifier}' stays on shared volume this round");
                         false
                     } else {
-                    let drain_left = shared_types::migration_gate::drain_user_writes(
-                        identifier,
-                        std::time::Duration::from_secs(10),
-                    )
-                    .await;
-                    if drain_left > 0 {
-                        return Err(ContainerRuntimeError::ConnectionError(format!(
-                            "in-flight writes for '{identifier}' did not drain within 10s \
-                             (left={drain_left}); refusing fresh-init decision, retry later"
-                        )));
-                    }
-                    let shared_state = probe_shared_dir(identifier).await;
-                    // 探测异常时也走统一收尾路径（下方 ProbeFailed 分支 return 前
-                    // 先 end，恢复该用户可写）。
-                    let fresh_init_decision = match (pvc.is_some(), volume_origin.as_deref(), shared_state) {
-                        // phase-a 预同步卷(共享卷有存量/无来源标) 或 探测不可
-                        // 信: 保持共享路径。phase-a 与存量卷不打 fresh-init 标,
-                        // rolled-back 卷显式排除在续接之外(复审第四轮 P1: 回滚
-                        // 后的 ensure 不得撤销刚写入的切回决定)。
-                        (true, _, SharedDirProbe::NonEmpty)
-                        | (true, _, SharedDirProbe::ProbeFailed)
-                        | (false, _, SharedDirProbe::NonEmpty) => false,
-                        // 真新用户: 初始化直上 RBD（fresh-init 标记来源）
-                        (false, _, SharedDirProbe::Absent) => {
-                        // begin 之后的所有失败路径必须先 end 再上抛——end 由
-                        // MigrationGuard 的 Drop 自动执行（含 `?` 直接 return），
-                        // 不会冻结该用户写准入。
-                        self.ensure_fresh_workspace_pvc(
+                        let drain_left = shared_types::migration_gate::drain_user_writes(
                             identifier,
-                            &service_type,
-                            params.storage_size.as_deref(),
+                            std::time::Duration::from_secs(10),
                         )
-                        .await?;
-                        marker_completer(self, migration_gate.take(), identifier, &service_type).await?;
-                            info!(
-                                "[K8S] new user '{identifier}' initialized on per-agent RBD"
-                            );
-                            true
-                        }
-                        // 首建中断的自愈: **只认 fresh-init 来源标**——卷确由
-                        // 新用户首建路径创建且 rollback 未改写标记, 重放
-                        // Migrated 完成初始化(幂等)。无标卷(phase-a 残留/同步
-                        // 失败留卷/存量卷)与 rolled-back 卷一律走共享, 不凭
-                        // "空目录"推断卷的来历。
-                        (true, Some(crate::runtime::k8s_pvc::VOLUME_ORIGIN_FRESH_INIT), SharedDirProbe::Absent) => {
-                            marker_completer(self, migration_gate.take(), identifier, &service_type).await?;
-                            info!(
-                                "[K8S] new user '{identifier}' RBD init resumed (fresh-init volume, marker replayed)"
-                            );
-                            true
-                        }
-                        // 有卷但无 fresh-init 凭据 + 共享 Absent: 保守共享路径
-                        // (phase-a 残留 / rolled-back / 存量卷的统一归宿)。
-                        (true, _, SharedDirProbe::Absent) => false,
-                        // 探测不可信(env 未设/IO 错误/共享根缺失): fail-closed
-                        // 拒绝初始化——误判新用户会让存量用户数据"消失"(空
-                        // RBD 卷+存在即转发)。上抛可重试错误, 不静默回落。
-                        (false, _, SharedDirProbe::ProbeFailed) => {
+                        .await;
+                        if drain_left > 0 {
                             return Err(ContainerRuntimeError::ConnectionError(format!(
-                                "cannot probe shared workspace for '{identifier}' \
-                                 (COMPUTER_WORKSPACE_DIR unset, IO error or shared root missing); \
-                                 refusing new-user RBD initialization"
+                                "in-flight writes for '{identifier}' did not drain within 10s \
+                             (left={drain_left}); refusing fresh-init decision, retry later"
                             )));
                         }
-                    };
-                    // 决策完成（_migration_guard 随作用域 drop 自动恢复写准入）。
-                    // 两条成功路径（新建/续接）的建卷+翻标记都发生在门禁内——
-                    // 与文件写路由串行化。
-                    fresh_init_decision
+                        let shared_state = probe_shared_dir(identifier).await;
+                        // 探测异常时也走统一收尾路径（下方 ProbeFailed 分支 return 前
+                        // 先 end，恢复该用户可写）。
+                        let fresh_init_decision = match (
+                            pvc.is_some(),
+                            volume_origin.as_deref(),
+                            shared_state,
+                        ) {
+                            // phase-a 预同步卷(共享卷有存量/无来源标) 或 探测不可
+                            // 信: 保持共享路径。phase-a 与存量卷不打 fresh-init 标,
+                            // rolled-back 卷显式排除在续接之外(复审第四轮 P1: 回滚
+                            // 后的 ensure 不得撤销刚写入的切回决定)。
+                            (true, _, SharedDirProbe::NonEmpty)
+                            | (true, _, SharedDirProbe::ProbeFailed)
+                            | (false, _, SharedDirProbe::NonEmpty) => false,
+                            // 真新用户: 初始化直上 RBD（fresh-init 标记来源）
+                            (false, _, SharedDirProbe::Absent) => {
+                                // begin 之后的所有失败路径必须先 end 再上抛——end 由
+                                // MigrationGuard 的 Drop 自动执行（含 `?` 直接 return），
+                                // 不会冻结该用户写准入。
+                                self.ensure_fresh_workspace_pvc(
+                                    identifier,
+                                    &service_type,
+                                    params.storage_size.as_deref(),
+                                )
+                                .await?;
+                                marker_completer(
+                                    self,
+                                    migration_gate.take(),
+                                    identifier,
+                                    &service_type,
+                                )
+                                .await?;
+                                info!("[K8S] new user '{identifier}' initialized on per-agent RBD");
+                                true
+                            }
+                            // 首建中断的自愈: **只认 fresh-init 来源标**——卷确由
+                            // 新用户首建路径创建且 rollback 未改写标记, 重放
+                            // Migrated 完成初始化(幂等)。无标卷(phase-a 残留/同步
+                            // 失败留卷/存量卷)与 rolled-back 卷一律走共享, 不凭
+                            // "空目录"推断卷的来历。
+                            (
+                                true,
+                                Some(crate::runtime::k8s_pvc::VOLUME_ORIGIN_FRESH_INIT),
+                                SharedDirProbe::Absent,
+                            ) => {
+                                marker_completer(
+                                    self,
+                                    migration_gate.take(),
+                                    identifier,
+                                    &service_type,
+                                )
+                                .await?;
+                                info!(
+                                    "[K8S] new user '{identifier}' RBD init resumed (fresh-init volume, marker replayed)"
+                                );
+                                true
+                            }
+                            // 有卷但无 fresh-init 凭据 + 共享 Absent: 保守共享路径
+                            // (phase-a 残留 / rolled-back / 存量卷的统一归宿)。
+                            (true, _, SharedDirProbe::Absent) => false,
+                            // 探测不可信(env 未设/IO 错误/共享根缺失): fail-closed
+                            // 拒绝初始化——误判新用户会让存量用户数据"消失"(空
+                            // RBD 卷+存在即转发)。上抛可重试错误, 不静默回落。
+                            (false, _, SharedDirProbe::ProbeFailed) => {
+                                return Err(ContainerRuntimeError::ConnectionError(format!(
+                                    "cannot probe shared workspace for '{identifier}' \
+                                 (COMPUTER_WORKSPACE_DIR unset, IO error or shared root missing); \
+                                 refusing new-user RBD initialization"
+                                )));
+                            }
+                        };
+                        // 决策完成（_migration_guard 随作用域 drop 自动恢复写准入）。
+                        // 两条成功路径（新建/续接）的建卷+翻标记都发生在门禁内——
+                        // 与文件写路由串行化。
+                        fresh_init_decision
                     }
                 }
             }

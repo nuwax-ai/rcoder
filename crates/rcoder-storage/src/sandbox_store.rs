@@ -4,7 +4,9 @@
 //! 事务纪律沿用 preview store：变更严格在提交后返回，未知结果由
 //! 调用方按 operation 语义对账（M3 引入台账前的过渡约束）。
 use crate::db::{
-    models::{SandboxApiKey, SandboxInstance, SandboxTemplate, SandboxTemplateRevision, SandboxVolume},
+    models::{
+        SandboxApiKey, SandboxInstance, SandboxTemplate, SandboxTemplateRevision, SandboxVolume,
+    },
     owner::DatabaseOwner,
     schema::Component,
 };
@@ -30,7 +32,9 @@ fn now_us() -> i64 {
 }
 
 impl PgSandboxStore {
-    pub async fn connect(config: &crate::config::PostgresConfig) -> Result<Self, SandboxStoreError> {
+    pub async fn connect(
+        config: &crate::config::PostgresConfig,
+    ) -> Result<Self, SandboxStoreError> {
         Ok(Self {
             owner: crate::db::postgres::open(config, vec![Component::Sandbox])
                 .await
@@ -206,10 +210,7 @@ impl SandboxStore for PgSandboxStore {
     async fn list_templates(&self) -> Result<Vec<SandboxTemplateSummary>, SandboxStoreError> {
         self.run(move |tx| {
             Box::pin(async move {
-                let heads = SandboxTemplate::all()
-                    .exec(tx)
-                    .await
-                    .map_err(unavailable)?;
+                let heads = SandboxTemplate::all().exec(tx).await.map_err(unavailable)?;
                 Ok(heads
                     .into_iter()
                     .map(|head| SandboxTemplateSummary {
@@ -605,7 +606,10 @@ impl SandboxStore for PgSandboxStore {
         .await
     }
 
-    async fn list_expired(&self, now_us: i64) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError> {
+    async fn list_expired(
+        &self,
+        now_us: i64,
+    ) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError> {
         self.run(move |tx| {
             Box::pin(async move {
                 // Ready（用户 TTL 到期）+ WarmReady（温池闲置到期）+ Terminating
@@ -643,28 +647,34 @@ impl SandboxStore for PgSandboxStore {
         .await
     }
 
-
-
-    async fn list_all_non_terminal(
-        &self,
-    ) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError> {
+    async fn list_all_non_terminal(&self) -> Result<Vec<SandboxInstanceRecord>, SandboxStoreError> {
         self.run(move |tx| {
             Box::pin(async move {
                 // 重启恢复需要全量扫描——按 desired_state 逐一列出非终态。
                 let mut all = Vec::new();
-                for state in ["provisioning", "warm_ready", "initializing", "ready", "terminating", "cleanup_pending"] {
+                for state in [
+                    "provisioning",
+                    "warm_ready",
+                    "initializing",
+                    "ready",
+                    "terminating",
+                    "cleanup_pending",
+                ] {
                     let rows = SandboxInstance::filter_by_desired_state(state)
                         .exec(tx)
                         .await
                         .map_err(unavailable)?;
-                    all.extend(rows.into_iter().map(instance_record).collect::<Result<Vec<_>, _>>()?);
+                    all.extend(
+                        rows.into_iter()
+                            .map(instance_record)
+                            .collect::<Result<Vec<_>, _>>()?,
+                    );
                 }
                 Ok(all)
             })
         })
         .await
     }
-
 
     async fn find_by_idempotency_key(
         &self,
@@ -710,7 +720,6 @@ impl SandboxStore for PgSandboxStore {
         .await
     }
 
-
     async fn claim_warm_instance(
         &self,
         claim: ClaimWarmInstance<'_>,
@@ -729,8 +738,10 @@ impl SandboxStore for PgSandboxStore {
         } = claim;
         let sandbox_id = sandbox_id.to_string();
         let (tenant_id, key_id, token_hash, encrypted_token) = (
-            tenant_id.to_string(), key_id.to_string(),
-            token_hash.to_string(), encrypted_token.to_string(),
+            tenant_id.to_string(),
+            key_id.to_string(),
+            token_hash.to_string(),
+            encrypted_token.to_string(),
         );
         let (env_json, metadata_json, idempotency_key) = (
             env_json.to_string(),
@@ -891,15 +902,10 @@ impl SandboxStore for PgSandboxStore {
         .await
     }
 
-    async fn list_all_active_volumes(
-        &self,
-    ) -> Result<Vec<SandboxVolumeRecord>, SandboxStoreError> {
+    async fn list_all_active_volumes(&self) -> Result<Vec<SandboxVolumeRecord>, SandboxStoreError> {
         self.run(move |tx| {
             Box::pin(async move {
-                let rows = SandboxVolume::all()
-                    .exec(tx)
-                    .await
-                    .map_err(unavailable)?;
+                let rows = SandboxVolume::all().exec(tx).await.map_err(unavailable)?;
                 rows.into_iter()
                     .filter(|row| row.deleted_at_us.is_none())
                     .map(volume_record)
@@ -933,10 +939,7 @@ impl SandboxStore for PgSandboxStore {
         .await
     }
 
-    async fn mark_volume_deleted(
-        &self,
-        volume_id: &str,
-    ) -> Result<(), SandboxStoreError> {
+    async fn mark_volume_deleted(&self, volume_id: &str) -> Result<(), SandboxStoreError> {
         let volume_id = volume_id.to_string();
         self.run(move |tx| {
             Box::pin(async move {
@@ -953,7 +956,6 @@ impl SandboxStore for PgSandboxStore {
         })
         .await
     }
-
 }
 
 fn volume_record(row: SandboxVolume) -> Result<SandboxVolumeRecord, SandboxStoreError> {

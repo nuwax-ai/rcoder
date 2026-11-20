@@ -34,8 +34,6 @@ pub mod manager;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_agent_create;
 #[cfg(feature = "kubernetes")]
-pub mod k8s_sandbox;
-#[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_agent_env;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_agent_pod;
@@ -83,6 +81,8 @@ pub(crate) mod k8s_pvc;
 mod k8s_readiness;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_resolution;
+#[cfg(feature = "kubernetes")]
+pub mod k8s_sandbox;
 #[cfg(feature = "kubernetes")]
 pub(crate) mod k8s_service;
 #[cfg(feature = "kubernetes")]

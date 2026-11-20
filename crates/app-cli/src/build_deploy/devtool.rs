@@ -156,10 +156,9 @@ mod tests {
             "根 workspace 的 pingap-config 版本与 devtool DEFAULT_PINGAP_VERSION 漂移——\
              升级 pingap 时两处必须同步修改"
         );
-        let catalog: serde_json::Value = serde_json::from_str(
-            include_str!("../../../../tools/build/pingap-assets.json"),
-        )
-        .expect("官方资产目录 JSON 合法");
+        let catalog: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../tools/build/pingap-assets.json"))
+                .expect("官方资产目录 JSON 合法");
         let release = &catalog["releases"][DEFAULT_PINGAP_VERSION];
         assert_eq!(
             release["tag"],

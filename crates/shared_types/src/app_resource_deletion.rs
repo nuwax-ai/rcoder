@@ -600,8 +600,8 @@ mod reclaim_orphaned_tests {
         let file = lock_file(&[
             0xff, 0xfe, b' ', b'd', b'e', b'a', b'd', b' ', b'h', b'o', b'l', b'd', b'e', b'r',
         ]);
-        let reclaimed =
-            AppFileMutationMarker::reclaim_orphaned(&file, None).expect("reclaim corrupted remnant");
+        let reclaimed = AppFileMutationMarker::reclaim_orphaned(&file, None)
+            .expect("reclaim corrupted remnant");
         assert!(reclaimed.is_some());
         assert_eq!(file_len(&file), 0);
     }

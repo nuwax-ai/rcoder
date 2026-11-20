@@ -115,8 +115,14 @@ fn image_repository_extracts_platform_scope_from_references() {
         image_repository("registry.test/ns/app-runtime"),
         "registry.test/ns/app-runtime"
     );
-    assert_eq!(image_repository("localhost:5000/ns/app:v1"), "localhost:5000/ns/app");
-    assert_eq!(image_repository("localhost:5000/ns/app"), "localhost:5000/ns/app");
+    assert_eq!(
+        image_repository("localhost:5000/ns/app:v1"),
+        "localhost:5000/ns/app"
+    );
+    assert_eq!(
+        image_repository("localhost:5000/ns/app"),
+        "localhost:5000/ns/app"
+    );
     assert_eq!(image_repository("app:v1"), "app");
     assert_eq!(image_repository("sha256:deadbeef"), "sha256");
 }

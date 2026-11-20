@@ -6,9 +6,9 @@ use container_runtime_api::{
 };
 use shared_types::{
     AppResourceIdentity, AppResourceKind, BuilderControlTarget, BuilderPodIdentity,
-    ContainerBasicInfo, ProjectAndContainerInfo, UserAppAdmission,
-    UserAppAdmissionOutcome, UserAppExecutionContext, UserAppLifecycleStore, UserAppOperationKind,
-    UserAppOperationProgress, UserAppOperationState, UserAppResourceBinding,
+    ContainerBasicInfo, ProjectAndContainerInfo, UserAppAdmission, UserAppAdmissionOutcome,
+    UserAppExecutionContext, UserAppLifecycleStore, UserAppOperationKind, UserAppOperationProgress,
+    UserAppOperationState, UserAppResourceBinding,
 };
 use std::sync::{
     Mutex,

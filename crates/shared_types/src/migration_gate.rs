@@ -288,10 +288,7 @@ mod cancel_safety_tests {
             "guard drop 后必须解除门禁——否则该用户写永久 503"
         );
         // 取消后写准入恢复
-        assert!(matches!(
-            admit_write(user),
-            WriteAdmission::Admitted(_)
-        ));
+        assert!(matches!(admit_write(user), WriteAdmission::Admitted(_)));
     }
 }
 
@@ -302,7 +299,10 @@ fn retry_guard_cannot_release_older_holder_gate() {
     let user = "gate-overlap-user";
     let guard_a = begin_guarded(user).expect("A acquires");
     // B 重试：门禁被 A 持有 → 拒绝并发 fresh-init
-    assert!(begin_guarded(user).is_none(), "B must be rejected while A holds");
+    assert!(
+        begin_guarded(user).is_none(),
+        "B must be rejected while A holds"
+    );
     // 裸 begin 撞已有持有者：不覆盖、返回 None（旧实现 insert 覆盖会让
     // B 的 Drop 解除 A 的门禁——测试在旧实现上曾红）。
     assert!(begin(user).is_none(), "裸 begin 撞已有必须拒绝且不覆盖");

@@ -2,9 +2,9 @@
 //! observations come from the API server; no cache, resource writes or new ledger.
 
 use container_runtime_api::{
-    ContainerRuntimeResult,
     AgentWorkspaceIdentity, ContainerCreateParams, ContainerRuntimeError as Error,
-    ContainerRuntimeResult as Result, ContainerRuntimeStatus, VerifiedAgentReplacement,
+    ContainerRuntimeResult, ContainerRuntimeResult as Result, ContainerRuntimeStatus,
+    VerifiedAgentReplacement,
 };
 use k8s_openapi::api::core::v1::{Pod, PodSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -166,7 +166,6 @@ fn controlled_by(pod: &Pod, workload_name: &str, workload_uid: &str) -> bool {
 }
 
 impl KubernetesRuntime {
-
     /// per-agent 卷判据的**权威**版（终审 F4）：异步直读（读穿缓存）——
     /// replacement 是恢复关键路径，冷缓存（重启后/无流量用户）误判 false 会
     /// 把健康 RBD 工作负载与共享模板比较而 Conflict，且无自然 warm 通道。
@@ -190,7 +189,8 @@ impl KubernetesRuntime {
             return Ok(false);
         }
         Ok(matches!(
-            self.workspace_migration_state(identifier, service_type).await?,
+            self.workspace_migration_state(identifier, service_type)
+                .await?,
             shared_types::WorkspaceMigrationState::Migrated
         ))
     }
@@ -381,7 +381,8 @@ impl KubernetesRuntime {
                 identifier,
                 &service_type,
                 params,
-                self.authoritative_per_agent_volume(identifier, &service_type).await?,
+                self.authoritative_per_agent_volume(identifier, &service_type)
+                    .await?,
             )?,
             None,
         )?;
@@ -419,7 +420,8 @@ impl KubernetesRuntime {
                     identifier,
                     &service_type,
                     &workspace_params,
-                    self.authoritative_per_agent_volume(identifier, &service_type).await?,
+                    self.authoritative_per_agent_volume(identifier, &service_type)
+                        .await?,
                 )?,
                 None,
             )?

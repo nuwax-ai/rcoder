@@ -375,9 +375,7 @@ async fn resolve_owner_uid(client: kube::Client, namespace: &str, pod: &Pod) -> 
         })?;
     let replica_sets: Api<ReplicaSet> = Api::namespaced(client, namespace);
     let replica_set: Option<ReplicaSet> = match replica_sets.get(&controller.name).await {
-        Ok(replica_set)
-            if replica_set.metadata.uid.as_deref() != Some(controller.uid.as_str()) =>
-        {
+        Ok(replica_set) if replica_set.metadata.uid.as_deref() != Some(controller.uid.as_str()) => {
             // 名字复用（RS 重建同名）：取到的是新 RS，不是 pod 声明的 owner——
             // 视为链断（第九轮 P1：不核 UID 会把旧证据接到新链上）。
             None
