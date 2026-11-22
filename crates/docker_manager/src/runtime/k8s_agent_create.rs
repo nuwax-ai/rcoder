@@ -1052,8 +1052,14 @@ async fn marker_completer(
             // 落地（codex 反例：固定宽限窗放行后旧写仍可迟到落地）。
             Ok(MarkerSetOutcome::Unknown {
                 pvc_uid,
-                resource_version,
+                resource_version: precondition_rv,
             }) => {
+                tracing::warn!(
+                    user_id = %identifier_for_log,
+                    pvc_uid = %pvc_uid,
+                    precondition_rv = %precondition_rv,
+                    "[K8S] marker PATCH outcome unknown; holding gate, fencing stale write by RV"
+                );
                 let pvcs =
                     kube::Api::<k8s_openapi::api::core::v1::PersistentVolumeClaim>::namespaced(
                         client.clone(),
@@ -1305,7 +1311,7 @@ mod marker_fence_tests {
                         body.len(),
                         body
                     );
-                    let _ = stream.write_all(response.as_bytes()).await;
+                    drop(stream.write_all(response.as_bytes()).await);
                     return;
                 }
                 let pvc_json = |state: &PvcState| {
@@ -1331,7 +1337,7 @@ mod marker_fence_tests {
                         let mut state = fixture.pvc.lock().unwrap();
                         let generation = fixture
                             .replace_uid_on_get
-                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                                 left.checked_sub(1)
                             })
                             .unwrap_or(0);
@@ -1396,7 +1402,7 @@ mod marker_fence_tests {
             "HTTP/1.1 {code} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
-        let _ = stream.write_all(response.as_bytes()).await;
+        drop(stream.write_all(response.as_bytes()).await);
     }
 
     struct Harness {

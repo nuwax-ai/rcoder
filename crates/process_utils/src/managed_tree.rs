@@ -316,12 +316,6 @@ impl ManagedChild {
         }
     }
 
-    /// 进程组是否仍有存活成员（观察失败按存活处理——保守不误报收束）。
-    #[cfg(unix)]
-    async fn process_group_alive(&self, deadline: tokio::time::Instant) -> bool {
-        self.observe_group_alive(deadline).await.unwrap_or(true)
-    }
-
     /// 三值观察：Some(alive) = 观察成功；None = 观察失败（保守按存活，
     /// 由调用方决定退避策略）。
     #[cfg(unix)]

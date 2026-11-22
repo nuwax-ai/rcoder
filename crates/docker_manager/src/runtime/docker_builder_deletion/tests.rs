@@ -795,7 +795,7 @@ async fn real_release_records_done_and_revokes_archived_authority() {
         Some(false),
         "B 正常完成后 A 的裸授权不得复活"
     );
-    let _ = receipt_b;
+    drop(receipt_b);
 }
 
 /// codex 复审回归：场景二（交错时序）——先完成 A，再归档 B（真实
