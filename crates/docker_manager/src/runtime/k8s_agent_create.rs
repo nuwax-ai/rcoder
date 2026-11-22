@@ -1023,17 +1023,42 @@ async fn marker_completer(
     let identifier_for_log = identifier.to_string();
     let handle = tokio::spawn(async move {
         let _held = gate;
-        let outcome =
-            crate::runtime::kubernetes_runtime::workspace_runtime::set_migration_state_detached(
-                client.clone(),
-                namespace.clone(),
-                std::sync::Arc::clone(&cache),
-                pvc_name.clone(),
-                cache_key.clone(),
-                shared_types::WorkspaceMigrationState::Migrated,
-            )
-            .await;
         use crate::runtime::kubernetes_runtime::workspace_runtime::MarkerSetOutcome;
+        // NothingApplied 的典型来源是刚建 PVC 的 RV 竞争：CSI volume binder
+        // 在建卷后毫秒级写入 bind 注解推进 RV，marker PATCH 带的前提 RV 撞
+        // 409（服务端证明未落地——正确，但首次 ensure 会假失败）。带上限
+        // 重试整个 setter（重 GET 拿新 RV），binder 写完后即收敛；另一个
+        // 副本并发 fresh-init 同用户亦经此收敛（重试后 GET 读到 migrated）。
+        // 2026-11-22 31.45 实测：autoheal-test-01 首次 ensure 18ms 内 409。
+        const NOTHING_APPLIED_ATTEMPTS: u8 = 3;
+        let mut outcome = None;
+        for attempt in 0..=NOTHING_APPLIED_ATTEMPTS {
+            let result =
+                crate::runtime::kubernetes_runtime::workspace_runtime::set_migration_state_detached(
+                    client.clone(),
+                    namespace.clone(),
+                    std::sync::Arc::clone(&cache),
+                    pvc_name.clone(),
+                    cache_key.clone(),
+                    shared_types::WorkspaceMigrationState::Migrated,
+                )
+                .await;
+            match result {
+                Ok(MarkerSetOutcome::NothingApplied) if attempt < NOTHING_APPLIED_ATTEMPTS => {
+                    tracing::warn!(
+                        user_id = %identifier_for_log,
+                        attempt = attempt + 1,
+                        "[K8S] marker write rejected (fresh PVC RV race?); retrying with fresh read"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+                result => {
+                    outcome = Some(result);
+                    break;
+                }
+            }
+        }
+        let outcome = outcome.expect("retry loop always sets outcome on break");
         match outcome {
             // PATCH 成功：缓存已写、身份即该对象，直接成功。
             Ok(MarkerSetOutcome::Applied(_patched_uid)) => Ok(()),
