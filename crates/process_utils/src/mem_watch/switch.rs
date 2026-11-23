@@ -472,10 +472,8 @@ impl Switch {
                         return;
                     }
                     // 不可信文件写坏：沿用它自己上一份有效内容（可能没有），然后照常
-                    // 往下找可信基线。缓存的是别的文件的内容时不能拿来冒充。
-                    if !same_file {
-                        self.forget_cached(first_path);
-                    }
+                    // 往下找可信基线。
+                    self.retain_untrusted(first_path, same_file);
                 }
             },
             FileRead::Unreadable => {
@@ -483,9 +481,7 @@ impl Switch {
                 if is_trusted {
                     return;
                 }
-                if !same_file {
-                    self.forget_cached(first_path);
-                }
+                self.retain_untrusted(first_path, same_file);
             }
             FileRead::Missing => {}
         }
@@ -528,6 +524,18 @@ impl Switch {
             }
             // 基线写坏了：保留上一份有效基线
             Err(err) => self.report_parse_error(&err),
+        }
+    }
+
+    /// 当前文件不可信、且这一轮没读到它的新内容（读不出来 / 写坏）: 换了文件就
+    /// 丢掉旧缓存（别的文件的内容不能冒充它的覆盖），没换就沿用它自己上一份内容。
+    /// 沿用的那份内容若来自它的**可信时期**（比如只读挂载刚被撤掉），不能再保有
+    /// 完整覆盖权，只能收紧。
+    fn retain_untrusted(&mut self, path: &Path, same_file: bool) {
+        if same_file {
+            self.cached_trusted = false;
+        } else {
+            self.forget_cached(path);
         }
     }
 
@@ -1183,29 +1191,73 @@ tmpfs /mnt/ba\04d tmpfs ro 0 0
         }
     }
 
-    /// 经真实文件走一遍: /tmp 文件被截断成空，可信层照常生效；内容恢复后它又能收紧。
+    /// 反例（评审复核）：文件从可信被重新归类为不可信（只读挂载被撤掉）的同时读不出来
+    /// 或写坏，缓存里还是它可信时期的内容——不能再保有完整覆盖权，只能收紧。
+    #[test]
+    fn a_file_reclassified_as_untrusted_loses_full_override_even_if_unreadable() {
+        static TOP_TRUSTED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(true);
+        fn trust_top(path: &Path) -> bool {
+            path.file_name().is_some_and(|name| name == "top.conf")
+                && TOP_TRUSTED.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        let mut switch = Switch::with_trust(Vec::new(), trust_top);
+        let base = Config {
+            mode: Mode::On,
+            ..Config::default()
+        };
+        // 可信时期: mode=off 是完整覆盖
+        switch.apply(&reads(&[("top.conf", off())]));
+        assert_eq!(switch.current(&base).mode, Mode::Off);
+
+        TOP_TRUSTED.store(false, std::sync::atomic::Ordering::Relaxed);
+        for unreadable in [FileRead::Content("x\n".to_string()), FileRead::Unreadable] {
+            switch.apply(&reads(&[("top.conf", unreadable)]));
+            assert_eq!(
+                switch.current(&base).mode,
+                Mode::On,
+                "重新归类为不可信之后只能收紧: 不能把看门狗关在 off"
+            );
+        }
+        TOP_TRUSTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 经真实文件走一遍: /tmp 文件被截断成空，可信层照常生效，它自己上一份收紧也
+    /// 保留（要撤销就删文件）；内容更新后以新内容为准。
     #[tokio::test]
     async fn an_untrusted_file_truncated_to_empty_keeps_the_trusted_layer_effective() {
         let dir = tempfile::tempdir().unwrap();
         let untrusted = dir.path().join("untrusted.conf");
         let trusted = dir.path().join("trusted.conf");
-        std::fs::write(&untrusted, "mode=dry\n").unwrap();
+        std::fs::write(&untrusted, "ratio=0.5\n").unwrap();
         std::fs::write(&trusted, "mode=on\n").unwrap();
         let mut switch = Switch::with_trust(vec![untrusted.clone(), trusted], trust_named);
-        let base = Config::default(); // off
-        assert_eq!(settled(&mut switch, &base).await.mode, Mode::On);
+        let base = Config::default(); // off / 0.85
+        let effective = settled(&mut switch, &base).await;
+        assert_eq!(effective.mode, Mode::On);
+        assert_eq!(effective.ratio, 0.5, "不可信文件的收紧生效");
 
         std::fs::write(&untrusted, "").unwrap();
         let effective = settled(&mut switch, &base).await;
-        assert_eq!(effective.mode, Mode::On, "可信层照常生效");
         assert_eq!(
-            effective.ratio, base.ratio,
-            "读不出内容的不可信文件不参与收紧"
+            effective.mode,
+            Mode::On,
+            "可信层照常生效，没有被截断的文件遮住"
+        );
+        assert_eq!(
+            effective.ratio, 0.5,
+            "读不出内容时沿用它自己上一份有效内容（要撤销收紧就删掉文件）"
         );
 
-        std::fs::write(&untrusted, "ratio=0.5\n").unwrap();
+        std::fs::write(&untrusted, "ratio=0.4\n").unwrap();
+        assert_eq!(
+            settled(&mut switch, &base).await.ratio,
+            0.4,
+            "内容更新后以新内容为准"
+        );
+        std::fs::remove_file(&untrusted).unwrap();
         let effective = settled(&mut switch, &base).await;
-        assert_eq!(effective.ratio, 0.5, "恢复后不可信文件的收紧重新生效");
         assert_eq!(effective.mode, Mode::On);
+        assert_eq!(effective.ratio, base.ratio, "删掉文件 = 撤销它的收紧");
     }
 }
