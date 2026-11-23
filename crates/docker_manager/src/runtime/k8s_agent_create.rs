@@ -998,11 +998,26 @@ fn pvc_migration_state(
     shared_types::WorkspaceMigrationState::from_annotation(value)
 }
 
-fn epoch_secs_string() -> String {
-    std::time::SystemTime::now()
+/// 栅栏推进值必须**唯一**（codex 复审 2026-11-23 P1：秒级时间戳同秒重复
+/// PATCH 是 no-op，RV 不推进，旧写前提仍有效——k3s 实测复现）。纳秒+随机
+/// 后缀保证每次写入都是实际更新。
+fn fence_value_unique() -> String {
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs().to_string())
-        .unwrap_or_default()
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{nanos}-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// 对象 RV 是否已越过旧写前提（k8s RV 为数字串；解析失败按未越过处理）。
+fn rv_advanced_past(current: Option<&str>, precondition: &str) -> bool {
+    match (
+        current.and_then(|value| value.parse::<u64>().ok()),
+        precondition.parse::<u64>().ok(),
+    ) {
+        (Some(current), Some(precondition)) => current > precondition,
+        _ => false,
+    }
 }
 
 async fn marker_completer(
@@ -1041,44 +1056,26 @@ async fn marker_completer(
     let handle = tokio::spawn(async move {
         let _held = gate;
         use crate::runtime::kubernetes_runtime::workspace_runtime::MarkerSetOutcome;
-        // NothingApplied 的典型来源是刚建 PVC 的 RV 竞争：CSI volume binder
-        // 在建卷后毫秒级写入 bind 注解推进 RV，marker PATCH 带的前提 RV 撞
-        // 409（服务端证明未落地——正确，但首次 ensure 会假失败）。带上限
-        // 重试整个 setter（重 GET 拿新 RV），binder 写完后即收敛；另一个
-        // 副本并发 fresh-init 同用户亦经此收敛（重试后 GET 读到 migrated）。
-        // 2026-11-22 31.45 实测：autoheal-test-01 首次 ensure 18ms 内 409。
-        const NOTHING_APPLIED_ATTEMPTS: u8 = 3;
-        let mut attempt: u8 = 0;
-        let outcome = loop {
-            let result =
-                crate::runtime::kubernetes_runtime::workspace_runtime::set_migration_state_detached(
-                    client.clone(),
-                    namespace.clone(),
-                    std::sync::Arc::clone(&cache),
-                    pvc_name.clone(),
-                    cache_key.clone(),
-                    shared_types::WorkspaceMigrationState::Migrated,
-                )
-                .await;
-            match result {
-                Ok(MarkerSetOutcome::NothingApplied) if attempt < NOTHING_APPLIED_ATTEMPTS => {
-                    attempt += 1;
-                    tracing::warn!(
-                        user_id = %identifier_for_log,
-                        attempt,
-                        "[K8S] marker write rejected (fresh PVC RV race?); retrying with fresh read"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                }
-                result => break result,
-            }
-        };
+        // RV 竞争重试已内聚 setter（锚定首次 GET 的 UID+volume-origin，重试
+        // 只刷新 RV——codex 复审 2026-11-23 P1：外层重试的全新 GET 会重新
+        // 认领同名对象，phase-a 换代卷/rolled-back 卷都能被误写 migrated）。
+        let outcome =
+            crate::runtime::kubernetes_runtime::workspace_runtime::set_migration_state_detached(
+                client.clone(),
+                namespace.clone(),
+                std::sync::Arc::clone(&cache),
+                pvc_name.clone(),
+                cache_key.clone(),
+                shared_types::WorkspaceMigrationState::Migrated,
+            )
+            .await;
         match outcome {
             // PATCH 成功：缓存已写、身份即该对象，直接成功。
             Ok(MarkerSetOutcome::Applied(_patched_uid)) => Ok(()),
-            // codex 复审（2026-11-20）：GET 阶段失败或服务端明确拒绝 =
-            // 确定无在途写——直接收束（Err + 门禁随任务结束释放）。绝不把
-            // 后续同名对象的标记当作本操作证据。
+            // codex 复审（2026-11-20/23）：GET 失败/404/明确拒绝/重试预算
+            // 耗尽/重试中同名换代或 volume-origin 变更 = 确定无在途写——
+            // 直接收束（Err + 门禁随任务结束释放）。绝不把后续同名对象的
+            // 标记当作本操作证据，也绝不重新认领。
             Ok(MarkerSetOutcome::NothingApplied) => {
                 tracing::warn!(user_id = %identifier_for_log, "[K8S] fresh-init marker write definitely not applied; gate released");
                 cache.write().await.remove(&cache_key);
@@ -1157,7 +1154,7 @@ async fn marker_completer(
                                     "uid": pvc_uid,
                                     "resourceVersion": current_rv,
                                     "annotations": {
-                                        MARKER_FENCE_ANNOTATION: epoch_secs_string(),
+                                        MARKER_FENCE_ANNOTATION: fence_value_unique(),
                                     },
                                 }
                             });
@@ -1188,11 +1185,21 @@ async fn marker_completer(
                                         Ok(Some(final_state))
                                             if final_state.metadata.uid.as_deref() == Some(pvc_uid.as_str()) =>
                                         {
-                                            tracing::warn!(user_id = %identifier_for_log, pvc_uid = %pvc_uid, "[K8S] stale marker write fenced (RV advanced); not migrated confirmed, gate released");
-                                            cache.write().await.remove(&cache_key);
-                                            return Err(ContainerRuntimeError::Conflict(format!(
-                                                "fresh-init marker write fenced as not landed for '{identifier_for_log}'"
-                                            )));
+                                            // codex 复审 2026-11-23 P1：栅栏 PATCH 成功 ≠ RV
+                                            // 已推进（no-op 写实测不推 RV）——必须读到对象 RV
+                                            // 越过旧写前提，旧写才被确定淘汰；否则回到循环
+                                            // 重新栅栏（唯一值保证下次是实际更新）。
+                                            if rv_advanced_past(
+                                                final_state.metadata.resource_version.as_deref(),
+                                                &precondition_rv,
+                                            ) {
+                                                tracing::warn!(user_id = %identifier_for_log, pvc_uid = %pvc_uid, "[K8S] stale marker write fenced (RV advanced past precondition); not migrated confirmed, gate released");
+                                                cache.write().await.remove(&cache_key);
+                                                return Err(ContainerRuntimeError::Conflict(format!(
+                                                    "fresh-init marker write fenced as not landed for '{identifier_for_log}'"
+                                                )));
+                                            }
+                                            tracing::warn!(user_id = %identifier_for_log, pvc_uid = %pvc_uid, "[K8S] fence did not advance RV past precondition; re-fencing");
                                         }
                                         _ => {
                                             // 读失败或换代：回到循环按新状态判定。
@@ -1283,6 +1290,8 @@ mod marker_fence_tests {
         pvc: Mutex<PvcState>,
         get_status: AtomicU16,
         patch_status: AtomicU16,
+        /// 第一次 migration PATCH 返回 409（RV 竞争注入），之后 200。
+        inject_409_once: AtomicBool,
         /// 栅栏 PATCH 到达时同时落地迁移标记（模拟迟到写恰在栅栏前落地）。
         late_land_on_fence: AtomicBool,
         replace_uid_on_get: AtomicUsize,
@@ -1368,7 +1377,7 @@ mod marker_fence_tests {
                                 left.checked_sub(1)
                             })
                             .unwrap_or(0);
-                        if generation > 0 {
+                        if generation <= 1 {
                             state.uid = "replacement-uid";
                         }
                         if !state.present {
@@ -1382,6 +1391,21 @@ mod marker_fence_tests {
                     }
                 } else if method == "PATCH" {
                     let status = fixture.patch_status.load(Ordering::SeqCst);
+                    let body409: serde_json::Value =
+                        serde_json::from_slice(&bytes[offset..offset + length]).unwrap_or_default();
+                    let wants_migration = body409["metadata"]["annotations"]
+                        .get(shared_types::WORKSPACE_MIGRATION_ANNOTATION)
+                        .is_some_and(|value| value == "migrated");
+                    if wants_migration && fixture.inject_409_once.swap(false, Ordering::SeqCst) {
+                        fixture.migration_patches.fetch_add(1, Ordering::SeqCst);
+                        return_body(
+                            &mut stream,
+                            409,
+                            &serde_json::json!({"kind":"Status","code":409,"reason":"Conflict"}),
+                        )
+                        .await;
+                        return;
+                    }
                     let body: serde_json::Value =
                         serde_json::from_slice(&bytes[offset..offset + length]).unwrap_or_default();
                     let annotations = &body["metadata"]["annotations"];
@@ -1452,6 +1476,7 @@ mod marker_fence_tests {
             pvc: Mutex::new(pvc),
             get_status: AtomicU16::new(200),
             patch_status: AtomicU16::new(200),
+            inject_409_once: AtomicBool::new(false),
             late_land_on_fence: AtomicBool::new(false),
             replace_uid_on_get: AtomicUsize::new(0),
             migration_patches: AtomicUsize::new(0),
@@ -1595,6 +1620,58 @@ mod marker_fence_tests {
             .await
             .expect("换代场景必须收敛");
         assert!(result.is_err());
+        assert!(harness.gate_released());
+    }
+
+    /// codex 复审（2026-11-23）P1-2 场景：409 RV 竞争后**同 UID** 重试——
+    /// 刷新 RV 后重写成功（Applied），这是 binder 竞争的正确收敛路径。
+    #[tokio::test]
+    async fn rv_race_same_identity_retry_succeeds() {
+        let harness = harness(PvcState {
+            uid: "u1",
+            rv: 1,
+            migrated: false,
+            present: true,
+        })
+        .await;
+        harness
+            .fixture
+            .inject_409_once
+            .store(true, Ordering::SeqCst);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), harness.complete())
+            .await
+            .expect("同 UID 重试必须收敛");
+        assert!(result.is_ok(), "binder RV 竞争在同 UID 下经内聚重试成功");
+        assert!(harness.gate_released());
+    }
+
+    /// codex 复审 P1-2 反例：409 后重试的 GET 读到**同名换代** PVC——
+    /// 必须拒绝重新认领（NothingApplied 终态），不得把新对象的决策覆盖。
+    #[tokio::test]
+    async fn rv_race_replaced_pvc_refuses_reclaim() {
+        let harness = harness(PvcState {
+            uid: "u1",
+            rv: 1,
+            migrated: false,
+            present: true,
+        })
+        .await;
+        harness
+            .fixture
+            .inject_409_once
+            .store(true, Ordering::SeqCst);
+        // 第一次 GET(u1) → PATCH 409 → 重试 GET 返回换代 uid(u2) → 拒绝。
+        harness
+            .fixture
+            .replace_uid_on_get
+            .store(2, Ordering::SeqCst);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), harness.complete())
+            .await
+            .expect("换代拒绝必须立即收敛");
+        assert!(result.is_err(), "同名换代不得被重试重新认领");
+        let state = harness.fixture.pvc.lock().unwrap();
+        assert!(!state.migrated, "换代对象绝不能被写入 migrated");
+        drop(state);
         assert!(harness.gate_released());
     }
 }
