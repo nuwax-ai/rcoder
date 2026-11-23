@@ -139,24 +139,22 @@ pub fn sample_agent_resources(
     prune_stale_baselines();
 
     let tps = procfs::ticks_per_second();
-    let mut rss_bytes: u64 = 0;
-    let mut total_ticks: u64 = 0;
-    let mut process_count: u32 = 0;
 
     // 进程表统一走 process_utils 的公共快照：与内存看门狗共用同一份
     // /proc/<pid>/stat 解析（字段下标、comm 括号、rss 页→字节换算只维护一处）。
     // /proc 整体不可读时返回空表 ⇒ process_count == 0 ⇒ 按降级语义返回 None。
+    // 累加规则（saturating、utime+stime、进程数）与资源面板的 `agent_executions`
+    // 共用 `GroupTotal`：两处各写一遍，改了规则就会让状态面板与资源面板对
+    // 同一进程组给出不同的数。
     let table = process_utils::proc_scan::snapshot();
+    let mut total = GroupTotal::default();
     for info in table.values() {
-        if info.pgrp != pgid {
-            continue;
+        if info.pgrp == pgid {
+            total.add(info);
         }
-        rss_bytes = rss_bytes.saturating_add(info.rss_bytes);
-        total_ticks = total_ticks.saturating_add(info.utime_ticks.saturating_add(info.stime_ticks));
-        process_count += 1;
     }
 
-    if process_count == 0 {
+    if total.process_count == 0 {
         return None;
     }
 
@@ -186,12 +184,13 @@ pub fn sample_agent_resources(
         return None;
     }
 
-    let cpu_percent = advance_cpu_baseline(project_id, execution, pgid, total_ticks, now, tps).0;
+    let cpu_percent =
+        advance_cpu_baseline(project_id, execution, pgid, total.cpu_ticks, now, tps).0;
 
     Some(AgentResourceSample {
-        memory_mb: ((rss_bytes as f64 / 1_048_576.0).round()) as i64,
+        memory_mb: ((total.rss_bytes as f64 / 1_048_576.0).round()) as i64,
         cpu_percent,
-        process_count,
+        process_count: total.process_count,
     })
 }
 

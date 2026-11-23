@@ -349,8 +349,8 @@ impl AgentHttpService for LocalAgentHttpService {
             );
         }
         // 没有正在执行的回合（Idle / Terminating）时取消幂等成功；只有
-        // is_busy()（Active / Pending）才需要真正发取消信号。
-        if !target.status.is_busy() {
+        // is_processing()（Active / Pending）才需要真正发取消信号。
+        if !target.status.is_processing() {
             return HttpResult::success(RcoderAgentCancelResponse {
                 success: true,
                 session_id,

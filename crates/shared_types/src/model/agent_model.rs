@@ -191,13 +191,18 @@ impl From<AgentStatus> for AgentExecutionStatus {
 }
 
 impl AgentStatus {
-    /// 是否有一个**正在执行**的回合（取消 / 忙等判断用）。
+    /// 是否有一个**正在执行**的回合（已入队或处理中；取消判断用）。
     ///
-    /// 注意与 gRPC `GetStatus` 的 "busy" 不是同一个概念：那里
-    /// `Terminating` 也报 "busy"（含义是"还没 idle"），而这里
-    /// `Terminating` 不算在执行——取消请求对它幂等成功，无需再发信号。
-    pub fn is_busy(self) -> bool {
-        matches!(self, Self::Active | Self::Pending)
+    /// 由 [`AgentExecutionStatus::from`] 推导：`Pending`/`Active` 同归
+    /// `Processing` 这个分组只在 `From` 里定义一次，新增变体时那边的穷尽
+    /// match 先编译失败——这里不会静默把新状态当成"没在执行"。
+    ///
+    /// **不是**"是否空闲"：gRPC `GetStatus` 的 "busy" 与活跃任务计数把
+    /// `Terminating` 也算作未空闲（还没 idle），而本函数对 `Terminating`
+    /// 返回 false——取消请求对它幂等成功，无需再发信号。忙等、回收、下发
+    /// 新回合之类的判断不要用本函数。
+    pub fn is_processing(self) -> bool {
+        AgentExecutionStatus::from(self) == AgentExecutionStatus::Processing
     }
 }
 
