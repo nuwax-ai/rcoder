@@ -206,6 +206,7 @@ impl KubernetesRuntime {
                                     migration_gate.take(),
                                     identifier,
                                     &service_type,
+                                    MARKER_UNKNOWN_MAX_HOLD,
                                 )
                                 .await?;
                                 info!("[K8S] new user '{identifier}' initialized on per-agent RBD");
@@ -226,6 +227,7 @@ impl KubernetesRuntime {
                                     migration_gate.take(),
                                     identifier,
                                     &service_type,
+                                    MARKER_UNKNOWN_MAX_HOLD,
                                 )
                                 .await?;
                                 info!(
@@ -1020,11 +1022,25 @@ fn rv_advanced_past(current: Option<&str>, precondition: &str) -> bool {
     }
 }
 
+/// 标记结果长期未知时，门禁的最长持有时间。
+///
+/// 为什么必须有上限：门禁挡住的是**该用户的写**（503）。PVC 读持续失败
+/// （API server 抖动 / 权限突变）时无限持有 = 用户无限期不能写，而这是
+/// 一个"读不到状态"的观测问题，不是必须堵住写的正确性理由。
+///
+/// 到期即释放门禁并返回可重试的 `Conflict`——与"对象已删除 / 已换代 /
+/// RV 已越过前提"这三条未知但可证安全的路径同一收束形状。绝不在超时后
+/// 猜一个结果放行：那要么把未落地的标记当成成功（数据回旧卷），要么把
+/// 已落地的当成失败（重复初始化）。
+const MARKER_UNKNOWN_MAX_HOLD: std::time::Duration = std::time::Duration::from_secs(300);
+
 async fn marker_completer(
     runtime: &KubernetesRuntime,
     gate: Option<shared_types::migration_gate::MigrationGuard>,
     identifier: &str,
     service_type: &ServiceType,
+    // 未知态持门禁上限；生产传 MARKER_UNKNOWN_MAX_HOLD，测试传小值
+    marker_unknown_max_hold: std::time::Duration,
 ) -> ContainerRuntimeResult<()> {
     use crate::runtime::k8s_pvc::K8sPvcOps;
     let Some(gate) = gate else {
@@ -1102,6 +1118,7 @@ async fn marker_completer(
                         &namespace,
                     );
                 let mut backoff = std::time::Duration::from_secs(1);
+                let held_since = std::time::Instant::now();
                 loop {
                     let observed = pvcs.get_opt(&pvc_name).await;
                     match observed {
@@ -1215,6 +1232,22 @@ async fn marker_completer(
                             }
                         }
                     }
+                    // 总时限：读一直失败也不能无限持门禁（挡住的是该用户的
+                    // 写）。到期按"未知但可证安全"的同一形状收束——释放门禁
+                    // + 可重试 Conflict，不猜结果放行。
+                    if held_since.elapsed() >= marker_unknown_max_hold {
+                        tracing::error!(
+                            user_id = %identifier_for_log,
+                            pvc_uid = %pvc_uid,
+                            held_secs = marker_unknown_max_hold.as_secs(),
+                            "[K8S] marker outcome unresolved after max hold; releasing migration gate (outcome unknown, ensure must retry)"
+                        );
+                        cache.write().await.remove(&cache_key);
+                        return Err(ContainerRuntimeError::Conflict(format!(
+                            "marker outcome for '{identifier_for_log}' unresolved after {}s; gate released, retry",
+                            marker_unknown_max_hold.as_secs()
+                        )));
+                    }
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(std::time::Duration::from_secs(10));
                 }
@@ -1297,6 +1330,12 @@ mod marker_fence_tests {
         replace_uid_on_get: AtomicUsize,
         migration_patches: AtomicUsize,
         fence_patches: AtomicUsize,
+        /// GET 调用计数（从 0 起）。
+        get_calls: AtomicUsize,
+        /// 第 N 次 GET 起改用 `get_status` 返回失败；0 = 从第一次就失败
+        /// （默认，保持"GET 全失败"的既有写法）。用于"写前 GET 成功、之后
+        /// 读取全失败"——完成者持门禁的读失败路径。
+        get_fail_after: AtomicUsize,
     }
 
     async fn serve(listener: tokio::net::TcpListener, fixture: Arc<Fixture>) {
@@ -1363,7 +1402,13 @@ mod marker_fence_tests {
                     })
                 };
                 let (code, value) = if method == "GET" {
-                    let status = fixture.get_status.load(Ordering::SeqCst);
+                    let calls = fixture.get_calls.fetch_add(1, Ordering::SeqCst);
+                    let fail_after = fixture.get_fail_after.load(Ordering::SeqCst);
+                    let status = if calls >= fail_after {
+                        fixture.get_status.load(Ordering::SeqCst)
+                    } else {
+                        200
+                    };
                     if status != 200 {
                         (
                             status as u16,
@@ -1462,6 +1507,8 @@ mod marker_fence_tests {
         runtime: KubernetesRuntime,
         fixture: Arc<Fixture>,
         identifier: &'static str,
+        /// 测试可覆盖的持门禁上限（生产默认值见 `super::MARKER_UNKNOWN_MAX_HOLD`）
+        marker_unknown_max_hold: std::time::Duration,
     }
 
     async fn harness(pvc: PvcState) -> Harness {
@@ -1481,6 +1528,8 @@ mod marker_fence_tests {
             replace_uid_on_get: AtomicUsize::new(0),
             migration_patches: AtomicUsize::new(0),
             fence_patches: AtomicUsize::new(0),
+            get_calls: AtomicUsize::new(0),
+            get_fail_after: AtomicUsize::new(0),
         });
         let server_fixture = fixture.clone();
         tokio::spawn(serve(listener, server_fixture));
@@ -1488,6 +1537,8 @@ mod marker_fence_tests {
             runtime: runtime(client),
             fixture,
             identifier: "rcoder-app-51",
+            // 默认与生产同值：既有场景都不依赖这个上限（都会先收敛）
+            marker_unknown_max_hold: MARKER_UNKNOWN_MAX_HOLD,
         }
     }
 
@@ -1500,6 +1551,7 @@ mod marker_fence_tests {
                 Some(gate),
                 self.identifier,
                 &ServiceType::UserappBuilder,
+                self.marker_unknown_max_hold,
             )
             .await
         }
@@ -1621,6 +1673,40 @@ mod marker_fence_tests {
             .expect("换代场景必须收敛");
         assert!(result.is_err());
         assert!(harness.gate_released());
+    }
+
+    /// 场景 F（评审 L3）：PATCH 结果未知 + **之后的 PVC 读取持续失败**——
+    /// 完成者必须有限地持门禁，到期释放并返回可重试错误，不能无限循环
+    /// （那等于该用户无限期不能写，而根因只是读不到状态）。
+    #[tokio::test]
+    async fn unknown_holds_gate_only_until_max_hold_then_releases() {
+        let mut harness = harness(PvcState {
+            uid: "u1",
+            rv: 1,
+            migrated: false,
+            present: true,
+        })
+        .await;
+        // 写前 GET 放行（setter 需要它拿到身份），之后全部读取失败
+        harness.fixture.get_fail_after.store(1, Ordering::SeqCst);
+        harness.fixture.get_status.store(500, Ordering::SeqCst);
+        // PATCH 也失败 → setter 给出 Unknown，进入完成者的持门禁循环
+        harness.fixture.patch_status.store(500, Ordering::SeqCst);
+        harness.marker_unknown_max_hold = std::time::Duration::from_millis(300);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(8), harness.complete())
+            .await
+            .expect("持门禁必须有总时限，不得无限循环");
+        assert!(result.is_err(), "超时收束不得被当成成功");
+        assert!(
+            harness.gate_released(),
+            "到期必须释放门禁——否则该用户永远不能写"
+        );
+        assert_eq!(
+            harness.fixture.fence_patches.load(Ordering::SeqCst),
+            0,
+            "读一直失败时栅栏 PATCH 发不出去，不该有栅栏计数"
+        );
     }
 
     /// codex 复审（2026-11-23）P1-2 场景：409 RV 竞争后**同 UID** 重试——
