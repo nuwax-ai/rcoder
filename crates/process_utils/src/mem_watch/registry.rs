@@ -340,7 +340,18 @@ pub fn mark_session_active(project: &str) {
         return;
     }
     let table = sys::read_all();
-    registry.seal_project(project, &table);
+    let sealed = registry.seal_project(project, &table);
+    if sealed > 0 {
+        // 灰度判据（docs/agent-mem-watch.md §9/§11）：首条消息封窗此前完全
+        // 无日志，运维只能从"后来没再杀"反推。cap 强制封窗那条路已有
+        // `mem_watch.bootstrap_timeout`，这里补正常路径。
+        tracing::info!(
+            event = "mem_watch.bootstrap_sealed",
+            project = %project,
+            reason = "first_prompt",
+            sealed_roots = sealed,
+        );
+    }
 }
 
 #[cfg(test)]

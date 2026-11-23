@@ -411,10 +411,17 @@ if (data.degraded.length) console.warn("部分分区降级:", data.degraded);
 A: `health.last_termination.is_oom === true` 且 `restart_count` 相比上次增加。
 
 **Q: `restart_count` 在 docker 模式下总是 0？**
-A: 正常——docker 下容器退出即消失，不存在 die→start 的恢复对。用 `pod_uid` 变化识别重建。
+A: **不再是**。docker 下容器退出即消失（`RestartCount` 只统计策略重启，原样透出），
+但 agent 容器停止后**保留 10 分钟**（不再 `auto_remove`），因此 `die→start`
+恢复对可被事件还原，`restart_count` 会有非 0 值，`restart_source="docker_events"`。
+仍可用 `pod_uid` 变化识别重建。
 
 **Q: 为什么 `overview` 里的 Pod 比 `kubectl get pods` 多/少？**
-A: 默认隐藏了已完成的 Job（`Succeeded`）；用前端过滤或看 `summary.pods` 总数。
+A: 数量差异来自**列表口径**（docker 下是本 daemon 全部容器；k8s 下是当前 namespace
+全部 Pod，含未登记的系统组件），**不是** phase 过滤——`overview` 不做 phase 过滤，
+`Succeeded` 的 Pod 会原样返回，只是不计入 `summary.not_ready`
+（终态任务的 `ready=false` 是正常终态，不是异常）。
+要按状态筛请在前端按 `phase` 过滤，或看 `summary` 计数。
 
 **Q: 想看某个 Pod 的事件明细？**
 A: `overview.pods[].events`（数量由 `events_limit` 控制）。

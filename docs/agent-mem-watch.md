@@ -214,7 +214,8 @@ kubectl -n nuwax-k8s-test patch configmap agent-runtime-flags --type merge \
 | 事件 | 说明 |
 |---|---|
 | `mem_watch.started` | 启动参数快照 |
-| `mem_watch.bootstrap_sealed` | 窗口关闭（reason=first_prompt / cap） |
+| `mem_watch.bootstrap_sealed` | 首条消息封窗（reason=`first_prompt`） |
+| `mem_watch.bootstrap_timeout` | `bootstrap_cap_ms` 到期强制封窗（钩子漏挂时的兜底） |
 | `mem_watch.would_evict` | dry-run 候选 |
 | `mem_watch.evict` | 实际执行（pid/rss/comm/project/working_set） |
 | `mem_watch.no_candidate` | **超阈值但无可杀对象**（全被保护或都太小）——没有这条就无法判断"看门狗是否在工作" |
@@ -333,7 +334,12 @@ OK
 - **运行期从 `off` 切到 `on`**：第一次活跃 tick 会把当下所有进程当作"启动窗口"保护起来
   （因为无法回溯区分"agent"与"命令"）。结果是：切换前就在跑的重任务不会被杀，
   只有切换后新起的命令才会被淘汰。这是安全方向，但会让"开了没效果"看起来像 bug。
-- **`node` 系进程全被保护**（规则 4：`exe == root.exe`）：用户自己跑的 node 脚本也不会被淘汰。
+- **解释器系进程不再按 exe 相等全保护**（规则 4，`registry.rs` `matches_exe`）：`exe == root.exe`
+  只在**专用二进制**上算身份证据。node/python 这类解释器的 `/proc/<pid>/exe` 指向解释器本体，
+  容器里所有同语言进程路径完全相同（实测 compose 容器里 4 个 node 进程全是 `/usr/local/bin/node`），
+  按相等判定会把整个解释器家族一起保护掉、agent 自己 spawn 的 node 负载再也杀不动。
+  这类 exe 改走 `script_hint`（安装路径含 root 的脚本名）判定——比旧的"全保护"松，
+  属于有意的收紧，不是回归。
 - **多会话时按全局最大 RSS 选**：可能杀掉"没在泄漏的那个会话"的命令（v1 限制）。
 - **子树终止仍有极小竞态**：从读进程表到发信号之间新 fork 的子进程不在终止列表里，
   父进程死后它会 reparent 到 PID 1 并脱离范围。窗口是毫秒级，v2 可用 SIGSTOP 后再扫描消除。

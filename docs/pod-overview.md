@@ -231,7 +231,7 @@ GET /computer/pod/overview
 | `service_type` | string | — | 按 `RuntimeContainerInfo.service_type` 过滤 |
 | `user_id` / `app_id` / `project_id` | string | — | 按结构化身份过滤 |
 | `label_selector` | string | — | 透传（k8s）；docker 下映射为 `label=` 过滤 |
-| `include_sidecars` | bool | false | 是否在 `usage.containers[]` 里带上内部 sidecar（默认隐藏 `log-shipper` / `log-collector`） |
+| `include_sidecars` | bool | false | 是否在 **`spec.containers[]`** 里保留内部 sidecar（默认按 `SIDECAR_PREFIXES` 过滤 `log-shipper` / `log-collector`）。**v1 只影响 spec 段**——`usage` 段没有逐容器拆分，也没有 `hidden_containers` 计数（见 §13 决策 2 的现状说明） |
 | `limit` | u32 | 500 | 安全上限，防一次吐爆 |
 
 > 已移除 `only_problem`（当前不需要）。将来若要"只看异常"，两种低成本补法：
@@ -305,11 +305,6 @@ GET /computer/pod/overview
         "mem_used_mb": 1186,
         "mem_limit_mb": 6144,
         "process_count": 84,        // 拿不到就是 null
-        "containers": [             // 按容器拆分；默认隐藏 sidecar（include_sidecars=false）
-          { "name": "agent", "cpu_cores": 0.03, "mem_used_mb": 1186, "hidden": false },
-          { "name": "log-collector", "cpu_cores": 0.0, "mem_used_mb": 7, "hidden": true }
-        ],
-        "hidden_containers": 1      // 被隐藏的 sidecar 数量，UI 可提示"另有 1 个内部容器"
       },
       "events": [
         { "type": "Warning", "reason": "OOMKilling", "count": 2,
@@ -393,10 +388,14 @@ http-server  handler/pod_handler/overview.rs      ← 新增，只依赖下面�
 `agent`+`log-collector`）。`spec` 顶层的 cpu/mem 取**主容器**（按 `agent`/`app`/`rcoder`
 顺序匹配，匹配不到取第一个），同时保留 `spec.containers[]` 逐容器的 request/limit。
 
-**sidecar 策略（已定）**：`usage.containers[]` 默认**隐藏** `log-shipper` / `log-collector`
-这类内部容器（`include_sidecars=false`），只暴露用户关心的主容器；被隐藏的数量用
-`hidden_containers` 透出，UI 可显示"另有 N 个内部容器"。隐藏名单放在
-`shared_types` 常量里（可配置），不散落在 handler 里。
+**sidecar 策略（v1 现状，与原始设计有差距，如实记录）**：`spec.containers[]` 默认按
+`SIDECAR_PREFIXES`（`log-shipper` / `log-collector`）过滤掉内部容器，
+`include_sidecars=true` 时保留。**原始设计里的两项没有实现**：
+① `usage.containers[]` 逐容器用量拆分（`PodUsage` 当前只有 Pod 合计，
+没有 per-container 字段）；② `hidden_containers` 计数（被隐藏的数量客户端无从得知）。
+要补实现：`PodUsage` 加 per-container 向量（k8s metrics-server / docker stats
+都能量到单容器），采集侧回填被过滤掉的数量，handler 侧随 `include_sidecars`
+一起决定是否透出。在那之前，UI 不要承诺"另有 N 个内部容器"。
 
 **磁盘**：
 - `volumes[].persistentVolumeClaim.claimName` → PVC `status.capacity.storage`（配额）；
@@ -528,7 +527,7 @@ P1 的收益最直接：**立刻能定位"哪个容器在反复被 OOM 杀"**（
 | # | 问题 | 决定 |
 |---|---|---|
 | 1 | docker 策略重启是否要计入 `RestartCount` | **不用计入**。`RestartCount` 原样透出（仅策略重启），重启次数以 events 为准，不额外加探针 |
-| 2 | 多容器 Pod 的 usage | **拆开**：`usage.containers[]` 逐容器；默认隐藏 `log-shipper` / `log-collector` 等内部 sidecar，用 `hidden_containers` 提示数量 |
+| 2 | 多容器 Pod 的 usage | **拆开**：`usage.containers[]` 逐容器；默认隐藏 `log-shipper` / `log-collector` 等内部 sidecar，用 `hidden_containers` 提示数量。**v1 只落地了 spec 段的 sidecar 过滤**（usage 逐容器与计数未实现，见 §"sidecar 策略（v1 现状）"） |
 | 3 | `only_problem` 过滤器 | **当前不需要，移除**；改提供 `search` 关键字过滤（子串匹配 name/identity） |
 | 4 | 缓存 | **硬要求**：10s 服务端缓存 + 单飞；过滤参数在缓存快照上做内存过滤 |
 | 5 | 事件默认条数 | **20**（上限 50） |
