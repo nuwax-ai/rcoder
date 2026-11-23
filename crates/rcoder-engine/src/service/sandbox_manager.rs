@@ -154,7 +154,6 @@ impl SandboxManager {
         })
     }
 
-    /// 配置驱动的幂等种子（api key 哈希 + 模板注册表）。
     pub async fn seed_registry(&self, config: &E2bSandboxConfig) -> Result<(), SandboxApiError> {
         // 温池系统 key：sandbox_instances.key_id 有外键，占位实例必须引用一个真实行；
         // expires=1（1970）使其永远无法通过 authenticate。
@@ -1222,11 +1221,10 @@ impl SandboxManager {
         }
 
         let candidates = self.store.list_warm_ready().await.map_err(store_error)?;
-        // 候选必须匹配当前修订：模板升级（rev+1）后旧修订的温池实例不得再
-        // 认领——它们由闲置过期自然排空，新修订池由补池器按新水位补建。
-        let Some(mut record) = candidates
-            .into_iter()
-            .find(|r| r.template_id == params.template_id && r.template_revision == spec.revision)
+        let claim_now = chrono::Utc::now().timestamp_micros();
+        let Some(mut record) =
+            select_warm_candidate(&candidates, &params.template_id, spec.revision, claim_now)
+                .cloned()
         else {
             return Ok(None);
         };
@@ -1663,6 +1661,29 @@ impl SandboxManager {
     }
 }
 
+/// 从温池候选里挑一个可认领的实例（纯决策，便于单测）。
+///
+/// 条件一：模板与修订匹配。模板升级（rev+1）后旧修订的温池实例不得再认领——
+/// 它们由闲置过期自然排空，新修订池由补池器按新水位补建。
+///
+/// 条件二：闲置期未过（`expires_at_us` 晚于 `now_us`）。已过闲置期、只等回收器
+/// 来收的实例不能认领：认领时要把 Pod 的 `activeDeadlineSeconds` 续到
+/// "认领时刻 + 生命周期"，而 K8s 只允许下调——对已过期的实例这是上调，必然
+/// 被拒，结果是认领后的清理 + 用户请求 500，而不是回落冷启动。没有闲置到期
+/// 时间的温池实例同样按不可认领处理（闲置 TTL 是创建温池实例时就写下的）。
+fn select_warm_candidate<'a>(
+    candidates: &'a [SandboxInstanceRecord],
+    template_id: &str,
+    revision: i64,
+    now_us: i64,
+) -> Option<&'a SandboxInstanceRecord> {
+    candidates.iter().find(|record| {
+        record.template_id == template_id
+            && record.template_revision == revision
+            && record.expires_at_us.is_some_and(|expiry| expiry > now_us)
+    })
+}
+
 fn ensure_tenant(
     record: &SandboxInstanceRecord,
     key: &SandboxApiKeyRecord,
@@ -1672,4 +1693,86 @@ fn ensure_tenant(
         return Err(SandboxApiError::NotFound(record.sandbox_id.clone()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod warm_claim_tests {
+    use super::select_warm_candidate;
+    use shared_types::sandbox::{SandboxInstanceRecord, SandboxInstanceState};
+
+    const NOW: i64 = 1_000_000;
+
+    fn warm(
+        sandbox_id: &str,
+        template_id: &str,
+        revision: i64,
+        expires_at_us: i64,
+    ) -> SandboxInstanceRecord {
+        SandboxInstanceRecord {
+            sandbox_id: sandbox_id.to_string(),
+            tenant_id: "tenant".to_string(),
+            key_id: "key".to_string(),
+            template_id: template_id.to_string(),
+            template_revision: revision,
+            image: "envd:test".to_string(),
+            image_digest: None,
+            envd_version: "0.1.0".to_string(),
+            runtime_class: None,
+            cpu_millicores: 1000,
+            memory_mib: 1024,
+            desired_state: SandboxInstanceState::WarmReady,
+            observed_state: None,
+            instance_revision: 1,
+            namespace: "sbx".to_string(),
+            pod_name: format!("pod-{sandbox_id}"),
+            pod_uid: None,
+            token_hash: "hash".to_string(),
+            encrypted_token: None,
+            token_generation: 0,
+            env: Vec::new(),
+            metadata: None,
+            idempotency_key: None,
+            failure_reason: None,
+            created_at_us: 0,
+            updated_at_us: 0,
+            ready_at_us: None,
+            expires_at_us: Some(expires_at_us),
+            hard_deadline_us: None,
+            deleted_at_us: None,
+        }
+    }
+
+    #[test]
+    fn picks_the_candidate_matching_template_and_revision() {
+        let candidates = [
+            warm("old", "tpl", 1, NOW + 60),
+            warm("fresh", "tpl", 2, NOW + 60),
+            warm("other", "tpl-b", 2, NOW + 60),
+        ];
+        let picked = select_warm_candidate(&candidates, "tpl", 2, NOW).expect("有匹配候选");
+        assert_eq!(picked.sandbox_id, "fresh");
+        assert!(select_warm_candidate(&candidates, "tpl", 3, NOW).is_none());
+    }
+
+    /// 反例（评审 L16）：已过闲置期、只等回收器来收的实例不能认领——认领要
+    /// 上调 Pod 的 activeDeadlineSeconds（K8s 只允许下调），对它必然失败，
+    /// 结果是把用户请求打成 500 而不是回落冷启动。
+    #[test]
+    fn skips_a_candidate_whose_idle_ttl_already_expired() {
+        let candidates = [
+            warm("expired", "tpl", 2, NOW - 1),
+            warm("fresh", "tpl", 2, NOW + 60),
+        ];
+        let picked = select_warm_candidate(&candidates, "tpl", 2, NOW).expect("应挑到未过期的那个");
+        assert_eq!(picked.sandbox_id, "fresh", "已过闲置期的实例应留给回收器");
+    }
+
+    #[test]
+    fn no_fresh_candidate_means_no_claim() {
+        let candidates = [
+            warm("expired", "tpl", 2, NOW),
+            warm("just-gone", "tpl", 2, 0),
+        ];
+        assert!(select_warm_candidate(&candidates, "tpl", 2, NOW).is_none());
+    }
 }
