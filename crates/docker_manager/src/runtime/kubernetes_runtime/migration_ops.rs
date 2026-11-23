@@ -53,29 +53,30 @@ pub(crate) struct MigrationJobPlan {
 }
 
 impl MigrationJobPlan {
-    /// rclone 参数串（Job 容器内 exec 的 argv tail; 单测断言点）。
+    /// rclone 参数：数组字面量的元素列表（见 [`job_script`]；单测断言点）。
     ///
-    /// 每个来自数据的参数都单引号包裹：脚本是 `bash -c` 收字符串，
-    /// `set -f` 只防 glob 展开、不防分词——`src_subpath` 里进一个空白或
-    /// shell 元字符就会把一条参数裂成两条（或变成重定向）。引用后
-    /// 参数的边界只由引号决定，与内容无关。
+    /// 来自数据的每个参数值都单引号包裹（[`shared_types::shell::single_quote`]）。
+    /// 脚本以 `ARGS=( … )` 接收，日志与 `exec` 都从这个数组取——参数边界只由
+    /// 数组元素决定，与内容里的空白、元字符、引号无关；也不存在"同一个参数串
+    /// 被第二处 shell 上下文（比如 `echo "…"` 的双引号）重新解释"的问题。
     pub fn rclone_args(&self) -> String {
-        let source = shell_quote(&format!("/src/{}", self.src_subpath));
+        let source = shared_types::shell::single_quote(&format!("/src/{}", self.src_subpath));
         let mut args = format!("sync {source} /dst --links --metadata --transfers 8 --checkers 8");
         if let Some(limit) = &self.bwlimit {
-            args.push_str(&format!(" --bwlimit {}", shell_quote(limit)));
+            args.push_str(&format!(
+                " --bwlimit {}",
+                shared_types::shell::single_quote(limit)
+            ));
         }
         for exclude in &self.excludes {
-            args.push_str(&format!(" --exclude {}", shell_quote(exclude)));
+            args.push_str(&format!(
+                " --exclude {}",
+                shared_types::shell::single_quote(exclude)
+            ));
         }
         args.push_str(" --stats-one-line --stats 300s");
         args
     }
-}
-
-/// 单引号 shell 字面量；内嵌单引号用 `'\''` 闭合-转义-重开。
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// src 子路径（= user_id）白名单校验，规则取全仓单一事实源
@@ -127,8 +128,20 @@ fn resolve_migration_image(
     ))
 }
 
-/// 容器内执行脚本（rclone 缺失时下载 fallback——与 k8s/migration job-template 同语义,
-/// `set -f` 防 exclude 模式被 bash 按 CWD 展开）。
+/// 按 env 解析迁移 Job 镜像（见 [`resolve_migration_image`]）。
+fn resolve_migration_image_from_env() -> ContainerRuntimeResult<(String, bool)> {
+    resolve_migration_image(
+        std::env::var("RCODER_MIGRATION_IMAGE").ok(),
+        std::env::var("RCODER_MIGRATION_ALT_IMAGE").ok(),
+    )
+}
+
+/// 容器内执行脚本（rclone 缺失时下载 fallback——与 k8s/migration job-template 同语义）。
+///
+/// 参数只在一处进入脚本：`ARGS=( … )` 数组字面量，每个数据值已单引号包裹。
+/// 之后日志（printf）与 `exec rclone` 都展开 `"${ARGS[@]}"`——每个元素恰好
+/// 是一个 argv，不存在第二次 shell 解析。`set -f` 保留为纵深防御（数组赋值
+/// 与带引号的 `"${ARGS[@]}"` 展开本就不做 glob）。
 fn job_script(plan: &MigrationJobPlan) -> String {
     let download = if plan.download_rclone {
         r#"if ! command -v rclone >/dev/null 2>&1; then
@@ -146,8 +159,9 @@ fn job_script(plan: &MigrationJobPlan) -> String {
         r#"set -euo pipefail
 set -f
 {download}rclone version | head -1
-echo "[migrate] exec: rclone {args}"
-exec rclone {args}"#,
+ARGS=({args})
+printf '[migrate] exec:'; printf ' %s' "${{ARGS[@]}}"; printf '\n'
+exec rclone "${{ARGS[@]}}""#,
         download = download,
         args = plan.rclone_args(),
     )
@@ -266,6 +280,15 @@ impl KubernetesRuntime {
         Ok(attached)
     }
 
+    /// 迁移 Job 的前置配置校验：镜像必须已配置（纯 env 读取，无 I/O、无副作用）。
+    ///
+    /// 供编排入口在产生任何副作用（建 PVC、停 agent）**之前**调用。配置问题
+    /// 拖到 `run_workspace_migration_sync_inner` 里才报，留下的是 phase-a 的
+    /// 残留 PVC 或 cutover 的停机残留。本函数保留为纵深防御，不替代入口检查。
+    pub(crate) fn workspace_migration_config_check(&self) -> ContainerRuntimeResult<()> {
+        resolve_migration_image_from_env().map(|_| ())
+    }
+
     /// 起 rclone 双卷 Job 跑一轮同步, 等完成（成功 = succeeded>=1）。
     pub(crate) async fn run_workspace_migration_sync_inner(
         &self,
@@ -275,9 +298,16 @@ impl KubernetesRuntime {
         src_pvc: &str,
     ) -> ContainerRuntimeResult<()> {
         use crate::runtime::k8s_pvc::K8sPvcOps;
-        // 先校验再动手：src 子路径要拼进 rclone 源路径，非法值必须在建 Job
-        // 之前就拒掉（否则 Job 建起来也只是同步一个越界路径或直接失败）。
+        // 纯检查排在任何 I/O 之前（纵深防御：编排入口已先做过一遍）。
+        // - src 子路径要拼进 rclone 源路径，非法值必须在建 Job 之前就拒掉
+        //   （否则 Job 建起来也只是同步一个越界路径或直接失败）；
+        // - 镜像是纯 env 读取，配置缺失不该等到读过 PVC 之后才报。
         validate_src_subpath(identifier)?;
+        // 镜像选择（显式配置即信任——部署方设 RCODER_MIGRATION_IMAGE 意味着
+        // 专用 rclone-migrate 镜像已构建推送; 无法在本地可靠探测远端镜像存在性,
+        // 之前"恒 false 走 fallback"会让显式配置被静默忽略）。两者都缺即报错,
+        // 不再回退字面默认值（见 `resolve_migration_image`）。
+        let (final_image, download_rclone) = resolve_migration_image_from_env()?;
         let dst_pvc = self.workspace_pvc_name(identifier, service_type)?;
         // dst 必须存在（phase-a 已 ensure）且未挂载（调用方已防呆, 这里复核）
         if self
@@ -291,14 +321,6 @@ impl KubernetesRuntime {
                 "destination PVC '{dst_pvc}' not found; run phase-a first"
             )));
         }
-        // 镜像选择（显式配置即信任——部署方设 RCODER_MIGRATION_IMAGE 意味着
-        // 专用 rclone-migrate 镜像已构建推送; 无法在本地可靠探测远端镜像存在性,
-        // 之前"恒 false 走 fallback"会让显式配置被静默忽略）。两者都缺即报错,
-        // 不再回退字面默认值（见 `resolve_migration_image`）。
-        let (final_image, download_rclone) = resolve_migration_image(
-            std::env::var("RCODER_MIGRATION_IMAGE").ok(),
-            std::env::var("RCODER_MIGRATION_ALT_IMAGE").ok(),
-        )?;
         let plan = MigrationJobPlan {
             job_name: format!("migrate-{}-{}", identifier.replace('_', "-"), mode.as_str()),
             namespace: self.namespace.clone(),
@@ -520,6 +542,107 @@ mod tests {
         .unwrap();
         assert_eq!(image, "reg/rclone-migrate:1.76.0");
         assert!(!download);
+    }
+
+    /// 端到端：生成的脚本在**真实 bash** 下执行，rclone 收到的 argv 必须与
+    /// 逐参数的预期完全一致——数据里的空白 / 元字符 / 引号 / `$()` / glob
+    /// 既不得改变参数边界，也不得在 `exec` 之前被日志行提前解释。
+    /// 没有 bash 的环境跳过。
+    #[cfg(unix)]
+    #[test]
+    fn job_script_delivers_each_argument_as_one_argv_element() {
+        let Ok(probe) = std::process::Command::new("bash")
+            .arg("--version")
+            .stderr(std::process::Stdio::null())
+            .output()
+        else {
+            eprintln!("skipping: bash not found");
+            return;
+        };
+        assert!(probe.status.success(), "bash --version 失败");
+
+        let mut p = plan(WorkspaceSyncMode::Full);
+        p.src_subpath = "u 1;rm -rf /".to_string();
+        p.bwlimit = Some("1M".to_string());
+        p.excludes = vec![
+            "a b".to_string(),
+            "it's".to_string(),
+            "$(id)".to_string(),
+            "core.[0-9]*".to_string(),
+            "`id`".to_string(),
+        ];
+
+        // 假 rclone：把收到的 argv 逐行打到 stdout（`version` 子命令照常应答）
+        let dir = std::env::temp_dir().join(format!("rcoder-migrate-argv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("rclone");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n\
+             if [ \"$1\" = version ]; then echo rclone v0; exit 0; fi\n\
+             for a in \"$@\"; do printf '<%s>\\n' \"$a\"; done\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(job_script(&p))
+            // PATH 只含我们的目录 + 系统默认：不继承测试进程可能被改过的 PATH
+            .env(
+                "PATH",
+                format!("{}:/usr/local/bin:/usr/bin:/bin", dir.display()),
+            )
+            .stderr(std::process::Stdio::inherit())
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            output.status.success(),
+            "脚本应以 rclone 的退出码结束；stderr 见上"
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let argv: Vec<String> = stdout
+            .lines()
+            .filter(|line| line.starts_with('<'))
+            .map(|line| line.trim_matches(['<', '>']).to_string())
+            .collect();
+        assert_eq!(
+            argv,
+            vec![
+                "sync",
+                "/src/u 1;rm -rf /",
+                "/dst",
+                "--links",
+                "--metadata",
+                "--transfers",
+                "8",
+                "--checkers",
+                "8",
+                "--bwlimit",
+                "1M",
+                "--exclude",
+                "a b",
+                "--exclude",
+                "it's",
+                "--exclude",
+                "$(id)",
+                "--exclude",
+                "core.[0-9]*",
+                "--exclude",
+                "`id`",
+                "--stats-one-line",
+                "--stats",
+                "300s",
+            ],
+            "rclone 实际收到的 argv 与预期不一致；脚本输出：\n{stdout}"
+        );
+        // 日志行照常打印了这条命令（不是静默执行）
+        assert!(stdout.contains("[migrate] exec:"), "{stdout}");
     }
 
     #[test]

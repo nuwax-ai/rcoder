@@ -144,6 +144,7 @@ pub use api_key_validator::{ApiKeyAuthConfig, ApiKeyAuthError, ApiKeyValidator};
 
 pub mod permission_types;
 pub mod pg_utils;
+pub mod shell;
 pub use permission_types::{
     PermissionResolveRequest, ResolvePermissionHttpRequest, ResolvePermissionRequestDto,
     ResolvePermissionResponseDto,

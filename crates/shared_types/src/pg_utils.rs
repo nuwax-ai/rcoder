@@ -131,8 +131,11 @@ echo \"postgres or business db $POSTGRES_DB not ready\" >&2; exit 1"
 // ── 容器内 PG 凭据对齐命令构造（userApp dev/prod 双环境共用；经各自执行通道跑 sh -c） ──
 
 /// sh 单引号安全包裹（`'` → `'\''`）——密码等自由文本进 shell 环境变量的标准转义。
+///
+/// 实现在通用的 [`crate::shell::single_quote`]（迁移 Job 的 rclone 参数用同一
+/// 套转义，避免两份实现漂移）；本名保留给 PG 命令构造的既有调用方。
 pub fn pg_shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+    crate::shell::single_quote(value)
 }
 
 /// 凭据验证命令（TCP scram 认证）：exit 0 = 传入密码与该账号当前密码一致。
