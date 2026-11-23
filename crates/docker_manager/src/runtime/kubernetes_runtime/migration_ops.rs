@@ -46,10 +46,12 @@ fn job_delete_params() -> DeleteParams {
     DeleteParams::background()
 }
 
-/// Job 的 Pod 起不来时（拉不到镜像、容器创建失败）的检查节拍：Job 创建后先等
-/// 这么久再看第一次（给正常拉镜像留时间），之后每次间隔。
-const POD_CHECK_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
-const POD_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+/// Job 的 Pod 起不来时（拉不到镜像、容器创建失败）的检查节奏：Job 创建后先等
+/// 这么久再看第一次（给正常拉镜像留时间），之后每次间隔；退避状态从首次出现到
+/// 判失败至少持续 [`POD_STUCK_FOR`]。镜像确实拉不到时约 30 秒判失败。
+const POD_CHECK_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+const POD_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+const POD_STUCK_FOR: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// 不会自愈的容器等待态。`ErrImagePull` 不在其中：首次拉取失败可能只是网络
 /// 抖动，重试即恢复；连续失败后 kubelet 才转成 `ImagePullBackOff`。
@@ -60,6 +62,10 @@ const BLOCKING_WAITING_REASONS: &[&str] = &[
     "CreateContainerError",
     "CreateContainerConfigError",
 ];
+
+/// 拉取失败、kubelet 会按退避重试的等待态。单独出现不判失败（可能只是抖动），
+/// 但也不清零已经累计的退避命中。
+const RETRYING_WAITING_REASONS: &[&str] = &["ErrImagePull"];
 
 /// 迁移 Job 的执行参数（纯数据, 供单测构造/断言）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,51 +303,96 @@ fn build_job(plan: &MigrationJobPlan) -> Job {
 
 /// Job 的 Pod 里有没有卡在"起不来"状态的容器；有则返回可读原因。
 fn blocked_container<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> Option<String> {
-    for pod in pods {
-        let Some(statuses) = pod
-            .status
-            .as_ref()
-            .and_then(|s| s.container_statuses.as_ref())
-        else {
-            continue;
-        };
-        let pod_name = pod.metadata.name.as_deref().unwrap_or("<unnamed>");
-        for status in statuses {
-            let Some(waiting) = status
-                .state
-                .as_ref()
-                .and_then(|state| state.waiting.as_ref())
-            else {
-                continue;
-            };
-            let Some(reason) = waiting.reason.as_deref() else {
-                continue;
-            };
-            if BLOCKING_WAITING_REASONS.contains(&reason) {
-                let detail = waiting
-                    .message
-                    .as_deref()
-                    .map(|message| format!(": {message}"))
-                    .unwrap_or_default();
-                return Some(format!("{pod_name}/{}: {reason}{detail}", status.name));
-            }
-        }
-    }
-    None
+    waiting_reasons(pods).find_map(|(pod_name, container, reason, message)| {
+        BLOCKING_WAITING_REASONS.contains(&reason).then(|| {
+            let detail = message.map(|m| format!(": {m}")).unwrap_or_default();
+            format!("{pod_name}/{container}: {reason}{detail}")
+        })
+    })
 }
 
-/// 起不来的原因要连续两次观测到同一个才判失败：单次观测可能是瞬时状态
-/// （两次观测间隔 [`POD_CHECK_EVERY`]）。观测不到（列表失败/没有异常）就重新计数。
+/// 所有容器当前的等待态：`(Pod 名, 容器名, 原因, 消息)`。
+fn waiting_reasons<'a>(
+    pods: impl IntoIterator<Item = &'a Pod>,
+) -> impl Iterator<Item = (&'a str, &'a str, &'a str, Option<&'a str>)> {
+    pods.into_iter().flat_map(|pod| {
+        let pod_name = pod.metadata.name.as_deref().unwrap_or("<unnamed>");
+        let statuses = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.container_statuses.as_ref());
+        statuses.into_iter().flatten().filter_map(move |status| {
+            let waiting = status
+                .state
+                .as_ref()
+                .and_then(|state| state.waiting.as_ref())?;
+            Some((
+                pod_name,
+                status.name.as_str(),
+                waiting.reason.as_deref()?,
+                waiting.message.as_deref(),
+            ))
+        })
+    })
+}
+
+/// Job 的 Pod 当前卡在哪一类"起不来"的状态上。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum PodBlockage {
+    /// 没有异常：在拉镜像、在创建、在跑、已退出。
+    #[default]
+    None,
+    /// 拉取失败后 kubelet 在重试。中性：不累计，也不清零。
+    Retrying,
+    /// 停在不会自愈的等待态上。
+    Blocked,
+}
+
+fn pod_blockage<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> PodBlockage {
+    let mut blockage = PodBlockage::None;
+    for (_, _, reason, _) in waiting_reasons(pods) {
+        if BLOCKING_WAITING_REASONS.contains(&reason) {
+            return PodBlockage::Blocked;
+        }
+        if RETRYING_WAITING_REASONS.contains(&reason) {
+            blockage = PodBlockage::Retrying;
+        }
+    }
+    blockage
+}
+
+/// 起不来要确认才判失败：单次观测可能是瞬时状态。
+///
+/// 拉不到镜像时 kubelet 的状态在**退避**与**重试**之间来回切——`ImagePullBackOff`
+/// →（重试的一瞬）`ErrImagePull` → `ImagePullBackOff`，退避窗口越拉越长（10s、
+/// 20s、40s…）。此前要求"连续两次观测到同一个原因"，中间夹一次重试就清零重来，
+/// 31.45 实测同一套逻辑要 100 秒才判出来（cutover 的 agent 全程停着）。现在按
+/// 累计判：退避状态计一次命中，重试的一瞬不计也不清零，没有异常才清零；首次命中
+/// 之后满 `min_stuck` 且至少两次命中即确认。
 #[derive(Default)]
-struct StuckObservation(Option<String>);
+struct StuckObservation {
+    hits: u32,
+    first_hit: Option<std::time::Instant>,
+}
 
 impl StuckObservation {
-    fn confirmed(&mut self, observation: Option<String>) -> Option<String> {
-        match (&self.0, &observation) {
-            (Some(previous), Some(current)) if previous == current => observation,
-            _ => {
-                self.0 = observation;
-                None
+    fn confirmed(
+        &mut self,
+        blockage: PodBlockage,
+        now: std::time::Instant,
+        min_stuck: std::time::Duration,
+    ) -> bool {
+        match blockage {
+            PodBlockage::Blocked => {
+                self.hits += 1;
+                let first_hit = *self.first_hit.get_or_insert(now);
+                self.hits >= 2 && now.duration_since(first_hit) >= min_stuck
+            }
+            PodBlockage::Retrying => false,
+            PodBlockage::None => {
+                self.hits = 0;
+                self.first_hit = None;
+                false
             }
         }
     }
@@ -492,19 +543,24 @@ impl KubernetesRuntime {
             // agent 重建回共享卷。
             if std::time::Instant::now() >= next_pod_check {
                 next_pod_check = std::time::Instant::now() + POD_CHECK_EVERY;
-                let observed = match pods.list(&ListParams::default().labels(&selector)).await {
-                    Ok(list) => blocked_container(list.items.iter()),
+                let now = std::time::Instant::now();
+                match pods.list(&ListParams::default().labels(&selector)).await {
+                    Ok(list) => {
+                        let blockage = pod_blockage(list.items.iter());
+                        if stuck.confirmed(blockage, now, POD_STUCK_FOR) {
+                            break Err(blocked_container(list.items.iter())
+                                .unwrap_or_else(|| "pod is not starting".to_string()));
+                        }
+                    }
                     Err(e) => {
                         tracing::debug!(
                             job = %plan.job_name,
                             error = %e,
                             "migration sync job pod status check failed"
                         );
-                        None
+                        // 这次没观测到：按"没有异常"处理，重新计数
+                        stuck.confirmed(PodBlockage::None, now, POD_STUCK_FOR);
                     }
-                };
-                if let Some(reason) = stuck.confirmed(observed) {
-                    break Err(reason);
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -919,28 +975,103 @@ mod tests {
         );
     }
 
-    /// 单次观测可能是瞬时状态：同一个原因连续两次才确认；中途换原因或观测不到
-    /// 就重新计数。
+    /// 单次观测可能是瞬时状态：退避状态要累计到"满 20 秒且至少两次"才确认。
     #[test]
-    fn stuck_observation_needs_two_consecutive_hits_of_the_same_reason() {
-        let reason = Some("pod/sync: ImagePullBackOff".to_string());
+    fn stuck_observation_needs_time_and_two_hits_in_backoff() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let stuck_for = Duration::from_secs(20);
         let mut stuck = StuckObservation::default();
-        assert_eq!(stuck.confirmed(None), None);
-        assert_eq!(stuck.confirmed(reason.clone()), None, "第一次只记录");
-        assert_eq!(
-            stuck.confirmed(reason.clone()),
-            reason,
-            "连续第二次确认失败"
-        );
 
-        stuck = StuckObservation::default();
-        assert_eq!(stuck.confirmed(reason.clone()), None);
-        assert_eq!(stuck.confirmed(None), None, "观测不到: 重新计数");
-        assert_eq!(stuck.confirmed(reason.clone()), None);
+        // 一直在退避: 第一次只记录, 满 20 秒才确认
+        assert!(!stuck.confirmed(PodBlockage::Blocked, t0, stuck_for));
+        assert!(!stuck.confirmed(
+            PodBlockage::Blocked,
+            t0 + Duration::from_secs(19),
+            stuck_for
+        ));
+        assert!(stuck.confirmed(
+            PodBlockage::Blocked,
+            t0 + Duration::from_secs(20),
+            stuck_for
+        ));
+
+        // 只命中一次、之后一直只是"在重试": 不确认（至少两次命中）
+        let mut stuck = StuckObservation::default();
+        assert!(!stuck.confirmed(PodBlockage::Blocked, t0, stuck_for));
+        assert!(
+            !stuck.confirmed(
+                PodBlockage::Retrying,
+                t0 + Duration::from_secs(600),
+                stuck_for
+            ),
+            "重试的一瞬既不计也不清零"
+        );
+        assert!(stuck.confirmed(
+            PodBlockage::Blocked,
+            t0 + Duration::from_secs(605),
+            stuck_for
+        ));
+
+        // 没有异常: 清零重来
+        let mut stuck = StuckObservation::default();
+        assert!(!stuck.confirmed(PodBlockage::Blocked, t0, stuck_for));
+        assert!(!stuck.confirmed(PodBlockage::None, t0 + Duration::from_secs(5), stuck_for));
+        assert!(!stuck.confirmed(
+            PodBlockage::Blocked,
+            t0 + Duration::from_secs(60),
+            stuck_for
+        ));
+    }
+
+    /// 反例（31.45 实测）：kubelet 在退避与重试之间来回切——`ImagePullBackOff`
+    /// → `ErrImagePull` → `ImagePullBackOff`。旧判据要求连续两次同一个原因，
+    /// 中间夹一次重试就清零，100 秒才判出来。
+    #[test]
+    fn a_retry_between_two_backoffs_does_not_reset_the_stuck_detection() {
+        use std::time::{Duration, Instant};
+        let stuck_for = Duration::from_secs(20);
+        let t0 = Instant::now();
+        let backoff = pod_with_container_state(
+            "migrate-u1-full-aaaaa",
+            serde_json::json!({"waiting": {"reason": "ImagePullBackOff", "message": "Back-off pulling image"}}),
+        );
+        let retrying = pod_with_container_state(
+            "migrate-u1-full-aaaaa",
+            serde_json::json!({"waiting": {"reason": "ErrImagePull", "message": "manifest unknown"}}),
+        );
+        let pulling = pod_with_container_state(
+            "migrate-u1-full-aaaaa",
+            serde_json::json!({"waiting": {"reason": "ContainerCreating"}}),
+        );
+        assert_eq!(pod_blockage([&pulling]), PodBlockage::None);
+        assert_eq!(pod_blockage([&retrying]), PodBlockage::Retrying);
+        assert_eq!(pod_blockage([&backoff]), PodBlockage::Blocked);
+
+        // 每 5 秒一次的真实节奏: 10s 退避, 15s 正在重试, 20s 退避, ... 30s 确认
+        let mut stuck = StuckObservation::default();
+        let timeline = [
+            (10, &backoff),
+            (15, &retrying),
+            (20, &backoff),
+            (25, &backoff),
+            (30, &backoff),
+        ];
+        let mut confirmed_at = None;
+        for (secs, pod) in timeline {
+            if stuck.confirmed(
+                pod_blockage(std::iter::once(pod)),
+                t0 + Duration::from_secs(secs),
+                stuck_for,
+            ) && confirmed_at.is_none()
+            {
+                confirmed_at = Some(secs);
+            }
+        }
         assert_eq!(
-            stuck.confirmed(Some("pod/sync: CreateContainerError".to_string())),
-            None,
-            "原因变了: 重新计数"
+            confirmed_at,
+            Some(30),
+            "中间夹一次重试不该把判定推到 100 秒以后"
         );
     }
 
