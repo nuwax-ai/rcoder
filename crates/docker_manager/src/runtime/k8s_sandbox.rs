@@ -9,8 +9,8 @@
 //! 层拒绝，而非静默回退 runc。
 
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod, PodSpec,
-    ResourceRequirements, Volume, VolumeMount,
+    Container, ContainerPort, PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod,
+    PodSecurityContext, PodSpec, ResourceRequirements, SeccompProfile, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::{Api, Client, api::ObjectMeta};
@@ -53,6 +53,125 @@ pub struct SandboxPodStatus {
 pub struct SandboxK8s {
     client: Client,
     namespace: String,
+}
+
+/// 组装裸沙箱 Pod（纯函数，便于单测；创建见 [`SandboxK8s::create_pod`]）。
+fn sandbox_pod(params: &SandboxPodParams) -> Pod {
+    let cpu = format!("{}m", params.cpu_millicores);
+    let memory = format!("{}Mi", params.memory_mib);
+    // Guaranteed：requests 与 limits 严格同值。
+    let resources = ResourceRequirements {
+        requests: Some(std::collections::BTreeMap::from([
+            ("cpu".to_string(), Quantity(cpu.clone())),
+            ("memory".to_string(), Quantity(memory.clone())),
+        ])),
+        limits: Some(std::collections::BTreeMap::from([
+            ("cpu".to_string(), Quantity(cpu)),
+            ("memory".to_string(), Quantity(memory)),
+        ])),
+        ..Default::default()
+    };
+    let container = Container {
+        name: "envd".to_string(),
+        image: Some(params.image.clone()),
+        image_pull_policy: Some("IfNotPresent".to_string()),
+        ports: Some(vec![ContainerPort {
+            container_port: params.envd_port,
+            protocol: Some("TCP".to_string()),
+            name: Some("envd".to_string()),
+            ..Default::default()
+        }]),
+        resources: Some(resources),
+        volume_mounts: if params.volume_mounts.is_empty() {
+            None
+        } else {
+            Some(
+                params
+                    .volume_mounts
+                    .iter()
+                    .map(|(pvc_name, mount_path)| VolumeMount {
+                        // strip_prefix 而非 trim_start_matches——后者会重复剥
+                        // （"e2b-vol-e2b-vol-x" → "x"）且不校验前缀存在。
+                        name: format!(
+                            "vol-{}",
+                            pvc_name.strip_prefix("e2b-vol-").unwrap_or(pvc_name)
+                        ),
+                        mount_path: mount_path.clone(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            )
+        },
+        env: Some(
+            params
+                .env
+                .iter()
+                .map(|(key, value)| k8s_openapi::api::core::v1::EnvVar {
+                    name: key.clone(),
+                    value: Some(value.clone()),
+                    ..Default::default()
+                })
+                .collect(),
+        ),
+        ..Default::default()
+    };
+    let volumes: Vec<Volume> = params
+        .volume_mounts
+        .iter()
+        .map(|(pvc_name, _)| Volume {
+            name: format!(
+                "vol-{}",
+                pvc_name.strip_prefix("e2b-vol-").unwrap_or(pvc_name)
+            ),
+            persistent_volume_claim: Some(
+                k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+                    claim_name: pvc_name.clone(),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        })
+        .collect();
+    let spec = PodSpec {
+        volumes: if volumes.is_empty() {
+            None
+        } else {
+            Some(volumes)
+        },
+        containers: vec![container],
+        runtime_class_name: params.runtime_class.clone(),
+        active_deadline_seconds: Some(params.max_lifetime_seconds),
+        restart_policy: Some("Never".to_string()),
+        // 沙箱里跑的是调用方的任意代码。rcoder 的 ServiceAccount 对 secrets、
+        // pods/exec、statefulsets 等有完整读写权限——token 自动挂载等于把这份
+        // 凭据交给沙箱内的进程。envd 与业务进程都不需要访问 K8s API（对沙箱的
+        // 全部操作由 rcoder 在外部完成），关掉。
+        automount_service_account_token: Some(false),
+        // seccomp：显式取 RuntimeDefault（K8s ≥1.27 未指定时的默认值），不依赖
+        // 集群版本。其余加固项**有意不加**：runAsNonRoot / drop ALL capabilities /
+        // allowPrivilegeEscalation=false 会破坏沙箱镜像里以 root 启动、或依赖
+        // sudo 的常见用法，属于产品取舍，不在加固时顺手打开。
+        security_context: Some(PodSecurityContext {
+            seccomp_profile: Some(SeccompProfile {
+                type_: "RuntimeDefault".to_string(),
+                localhost_profile: None,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    Pod {
+        metadata: ObjectMeta {
+            name: Some(params.name.clone()),
+            labels: Some(std::collections::BTreeMap::from([
+                ("app".to_string(), "e2b-sandbox".to_string()),
+                ("e2b-sandbox-id".to_string(), params.name.clone()),
+            ])),
+            ..Default::default()
+        },
+        spec: Some(spec),
+        ..Default::default()
+    }
 }
 
 impl SandboxK8s {
@@ -151,105 +270,7 @@ impl SandboxK8s {
 
     /// 创建裸沙箱 Pod（幂等由调用方以 sandbox_id 命名承担；同名冲突报错）。
     pub async fn create_pod(&self, params: &SandboxPodParams) -> Result<(), SandboxK8sError> {
-        let cpu = format!("{}m", params.cpu_millicores);
-        let memory = format!("{}Mi", params.memory_mib);
-        // Guaranteed：requests 与 limits 严格同值。
-        let resources = ResourceRequirements {
-            requests: Some(std::collections::BTreeMap::from([
-                ("cpu".to_string(), Quantity(cpu.clone())),
-                ("memory".to_string(), Quantity(memory.clone())),
-            ])),
-            limits: Some(std::collections::BTreeMap::from([
-                ("cpu".to_string(), Quantity(cpu)),
-                ("memory".to_string(), Quantity(memory)),
-            ])),
-            ..Default::default()
-        };
-        let container = Container {
-            name: "envd".to_string(),
-            image: Some(params.image.clone()),
-            image_pull_policy: Some("IfNotPresent".to_string()),
-            ports: Some(vec![ContainerPort {
-                container_port: params.envd_port,
-                protocol: Some("TCP".to_string()),
-                name: Some("envd".to_string()),
-                ..Default::default()
-            }]),
-            resources: Some(resources),
-            volume_mounts: if params.volume_mounts.is_empty() {
-                None
-            } else {
-                Some(
-                    params
-                        .volume_mounts
-                        .iter()
-                        .map(|(pvc_name, mount_path)| VolumeMount {
-                            // strip_prefix 而非 trim_start_matches——后者会重复剥
-                            // （"e2b-vol-e2b-vol-x" → "x"）且不校验前缀存在。
-                            name: format!(
-                                "vol-{}",
-                                pvc_name.strip_prefix("e2b-vol-").unwrap_or(pvc_name)
-                            ),
-                            mount_path: mount_path.clone(),
-                            ..Default::default()
-                        })
-                        .collect(),
-                )
-            },
-            env: Some(
-                params
-                    .env
-                    .iter()
-                    .map(|(key, value)| k8s_openapi::api::core::v1::EnvVar {
-                        name: key.clone(),
-                        value: Some(value.clone()),
-                        ..Default::default()
-                    })
-                    .collect(),
-            ),
-            ..Default::default()
-        };
-        let volumes: Vec<Volume> = params
-            .volume_mounts
-            .iter()
-            .map(|(pvc_name, _)| Volume {
-                name: format!(
-                    "vol-{}",
-                    pvc_name.strip_prefix("e2b-vol-").unwrap_or(pvc_name)
-                ),
-                persistent_volume_claim: Some(
-                    k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
-                        claim_name: pvc_name.clone(),
-                        ..Default::default()
-                    },
-                ),
-                ..Default::default()
-            })
-            .collect();
-        let spec = PodSpec {
-            volumes: if volumes.is_empty() {
-                None
-            } else {
-                Some(volumes)
-            },
-            containers: vec![container],
-            runtime_class_name: params.runtime_class.clone(),
-            active_deadline_seconds: Some(params.max_lifetime_seconds),
-            restart_policy: Some("Never".to_string()),
-            ..Default::default()
-        };
-        let pod = Pod {
-            metadata: ObjectMeta {
-                name: Some(params.name.clone()),
-                labels: Some(std::collections::BTreeMap::from([
-                    ("app".to_string(), "e2b-sandbox".to_string()),
-                    ("e2b-sandbox-id".to_string(), params.name.clone()),
-                ])),
-                ..Default::default()
-            },
-            spec: Some(spec),
-            ..Default::default()
-        };
+        let pod = sandbox_pod(params);
         self.pods()
             .create(&kube::api::PostParams::default(), &pod)
             .await
@@ -340,5 +361,88 @@ impl SandboxK8s {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params() -> SandboxPodParams {
+        SandboxPodParams {
+            name: "sbx-test".to_string(),
+            image: "envd:test".to_string(),
+            runtime_class: None,
+            cpu_millicores: 1000,
+            memory_mib: 1024,
+            envd_port: 49983,
+            max_lifetime_seconds: 300,
+            env: Vec::new(),
+            volume_mounts: Vec::new(),
+        }
+    }
+
+    /// 反例（评审 L11）：沙箱 Pod 此前默认挂载 rcoder 的 ServiceAccount token，
+    /// 而该账号对 secrets / pods/exec / statefulsets 有完整读写权限。
+    #[test]
+    fn sandbox_pod_does_not_mount_the_service_account_token() {
+        let spec = sandbox_pod(&params()).spec.expect("pod spec");
+        assert_eq!(spec.automount_service_account_token, Some(false));
+    }
+
+    #[test]
+    fn sandbox_pod_pins_the_default_seccomp_profile() {
+        let spec = sandbox_pod(&params()).spec.expect("pod spec");
+        let profile = spec
+            .security_context
+            .expect("pod security context")
+            .seccomp_profile;
+        assert_eq!(
+            profile.map(|profile| profile.type_),
+            Some("RuntimeDefault".to_string())
+        );
+    }
+
+    /// 有意不加的加固项不能悄悄出现：runAsNonRoot 会破坏以 root / sudo 运行
+    /// 的沙箱镜像，是否开启是产品取舍，不在这里默认打开。
+    #[test]
+    fn sandbox_pod_leaves_user_and_capabilities_to_the_image() {
+        let spec = sandbox_pod(&params()).spec.expect("pod spec");
+        let context = spec.security_context.expect("pod security context");
+        assert!(context.run_as_non_root.is_none());
+        assert!(context.run_as_user.is_none());
+        assert!(
+            spec.containers[0]
+                .security_context
+                .as_ref()
+                .and_then(|context| context.capabilities.as_ref())
+                .is_none(),
+            "容器级不应默认 drop capabilities"
+        );
+    }
+
+    #[test]
+    fn sandbox_pod_keeps_its_existing_shape() {
+        let pod = sandbox_pod(&params());
+        assert_eq!(pod.metadata.name.as_deref(), Some("sbx-test"));
+        assert_eq!(
+            pod.metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("e2b-sandbox-id")),
+            Some(&"sbx-test".to_string())
+        );
+        let spec = pod.spec.expect("pod spec");
+        assert_eq!(spec.restart_policy.as_deref(), Some("Never"));
+        assert_eq!(spec.active_deadline_seconds, Some(300));
+        assert!(spec.runtime_class_name.is_none());
+        let container = &spec.containers[0];
+        assert_eq!(container.name, "envd");
+        assert_eq!(container.image.as_deref(), Some("envd:test"));
+        let resources = container.resources.as_ref().expect("resources");
+        assert_eq!(
+            resources.requests, resources.limits,
+            "Guaranteed：requests 与 limits 严格同值"
+        );
     }
 }
