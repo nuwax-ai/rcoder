@@ -5,11 +5,19 @@ pub(super) fn lock_builder_file(root: &std::path::Path, name: &str) -> Result<Bu
     lock_builder_file_with_marker(root, name, shared_types::AppFileMutationMarker::new())
 }
 
+/// 锁归档旁文件后缀（`<lock>.lock.orphaned`）：孤儿授权/获取/结算记录的
+/// 追加日志，validate fallback 按行解析。
+const LOCK_ARCHIVE_EXTENSION: &str = "lock.orphaned";
+
+fn lock_archive_path(lock_path: &std::path::Path) -> std::path::PathBuf {
+    lock_path.with_extension(LOCK_ARCHIVE_EXTENSION)
+}
+
 /// 归档旁文件追加一条记录（best-effort：I/O 失败只影响 validate fallback
 /// 的精度，不影响持锁/释放本身）。
 #[cfg(unix)]
 fn append_lock_archive(lock_path: &std::path::Path, suffix: &str) {
-    let archive = lock_path.with_extension("lock.orphaned");
+    let archive = lock_archive_path(lock_path);
     let entry = format!(
         "[{}] {}\n",
         std::time::SystemTime::now()
@@ -78,7 +86,7 @@ pub(super) fn prepare_builder_file(
         Ok(Some(orphan_operation_id)) => {
             tracing::warn!(
                 lock_path = %lock_path.display(),
-                archive = %lock_path.with_extension("lock.orphaned").display(),
+                archive = %lock_archive_path(&lock_path).display(),
                 orphan_operation_id,
                 "Reclaimed orphaned builder operation marker under held flock; previous holder is proven stopped; operation id archived for reconciliation"
             );
@@ -218,7 +226,7 @@ pub(super) fn validate_file_receipt(
     //     旧部署：无法证明其代次更早，按后继处置）
     // - 更早获取的其他 token 的迟到 done **不撤销**本 token（裸记录位置
     //   在本 token 之前 = 旧代次，其重复释放不改变在逈权威）。
-    let archive = path.with_extension("lock.orphaned");
+    let archive = lock_archive_path(path);
     if let Ok(content) = std::fs::read_to_string(&archive) {
         struct Record {
             token: String,
@@ -377,7 +385,7 @@ pub(super) fn release_file_receipt(
     // 停止把该 token 验真（第十一轮 P1：已释放回执不得凭归档复活）。
     // best-effort（归档不可写只影响 fallback 精度，不影响释放本身）。
     {
-        let archive = path.with_extension("lock.orphaned");
+        let archive = lock_archive_path(path);
         let entry = format!(
             "[{}] done {}\n",
             std::time::SystemTime::now()

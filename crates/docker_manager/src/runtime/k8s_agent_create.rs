@@ -981,7 +981,24 @@ async fn probe_shared_dir(identifier: &str) -> SharedDirProbe {
 /// （uid+rv 前置条件）、写判据缓存后才解除门禁。此前反例：取消后门禁
 /// 放行 + 服务端 PATCH 仍提交 → 缓存 NotMigrated 与 PVC Migrated 分裂，
 /// 并发写落旧共享卷。
-fn chrono_or_epoch_secs() -> String {
+/// RV 栅栏推进注解（codex 复审三态的 Unknown 收敛手段）：写当前时间戳
+/// 推进对象 RV，淘汰携带旧前提 RV 的在途 marker PATCH（其后必 409）。
+const MARKER_FENCE_ANNOTATION: &str = "rcoder.io/marker-fenced-at";
+
+/// PVC 迁移标记的规范读取：走 [`WorkspaceMigrationState::from_annotation`]
+/// 的 fail-safe 词表（无法识别的值按未迁移），不裸比字符串。
+fn pvc_migration_state(
+    pvc: &k8s_openapi::api::core::v1::PersistentVolumeClaim,
+) -> shared_types::WorkspaceMigrationState {
+    let value = pvc.metadata.annotations.as_ref().and_then(|annotations| {
+        annotations
+            .get(shared_types::WORKSPACE_MIGRATION_ANNOTATION)
+            .map(|value| value.as_str())
+    });
+    shared_types::WorkspaceMigrationState::from_annotation(value)
+}
+
+fn epoch_secs_string() -> String {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs().to_string())
@@ -1031,8 +1048,8 @@ async fn marker_completer(
         // 副本并发 fresh-init 同用户亦经此收敛（重试后 GET 读到 migrated）。
         // 2026-11-22 31.45 实测：autoheal-test-01 首次 ensure 18ms 内 409。
         const NOTHING_APPLIED_ATTEMPTS: u8 = 3;
-        let mut outcome = None;
-        for attempt in 0..=NOTHING_APPLIED_ATTEMPTS {
+        let mut attempt: u8 = 0;
+        let outcome = loop {
             let result =
                 crate::runtime::kubernetes_runtime::workspace_runtime::set_migration_state_detached(
                     client.clone(),
@@ -1045,20 +1062,17 @@ async fn marker_completer(
                 .await;
             match result {
                 Ok(MarkerSetOutcome::NothingApplied) if attempt < NOTHING_APPLIED_ATTEMPTS => {
+                    attempt += 1;
                     tracing::warn!(
                         user_id = %identifier_for_log,
-                        attempt = attempt + 1,
+                        attempt,
                         "[K8S] marker write rejected (fresh PVC RV race?); retrying with fresh read"
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 }
-                result => {
-                    outcome = Some(result);
-                    break;
-                }
+                result => break result,
             }
-        }
-        let outcome = outcome.expect("retry loop always sets outcome on break");
+        };
         match outcome {
             // PATCH 成功：缓存已写、身份即该对象，直接成功。
             Ok(MarkerSetOutcome::Applied(_patched_uid)) => Ok(()),
@@ -1115,14 +1129,8 @@ async fn marker_completer(
                             )));
                         }
                         Ok(Some(pvc)) => {
-                            let migrated = pvc
-                                .metadata
-                                .annotations
-                                .as_ref()
-                                .and_then(|annotations| {
-                                    annotations.get(shared_types::WORKSPACE_MIGRATION_ANNOTATION)
-                                })
-                                .is_some_and(|value| value == "migrated");
+                            let migrated = pvc_migration_state(&pvc)
+                                == shared_types::WorkspaceMigrationState::Migrated;
                             if migrated {
                                 tracing::warn!(user_id = %identifier_for_log, pvc_uid = %pvc_uid, "[K8S] marker reconciled: patch landed (migrated)");
                                 cache.write().await.insert(
@@ -1149,7 +1157,7 @@ async fn marker_completer(
                                     "uid": pvc_uid,
                                     "resourceVersion": current_rv,
                                     "annotations": {
-                                        "rcoder.io/marker-fenced-at": chrono_or_epoch_secs(),
+                                        MARKER_FENCE_ANNOTATION: epoch_secs_string(),
                                     },
                                 }
                             });
@@ -1167,14 +1175,8 @@ async fn marker_completer(
                                     match pvcs.get_opt(&pvc_name).await {
                                         Ok(Some(final_state))
                                             if final_state.metadata.uid.as_deref() == Some(pvc_uid.as_str())
-                                                && final_state
-                                                    .metadata
-                                                    .annotations
-                                                    .as_ref()
-                                                    .and_then(|annotations| {
-                                                        annotations.get(shared_types::WORKSPACE_MIGRATION_ANNOTATION)
-                                                    })
-                                                    .is_some_and(|value| value == "migrated") =>
+                                                && pvc_migration_state(&final_state)
+                                                    == shared_types::WorkspaceMigrationState::Migrated =>
                                         {
                                             tracing::warn!(user_id = %identifier_for_log, pvc_uid = %pvc_uid, "[K8S] marker reconciled after fence: late patch landed");
                                             cache.write().await.insert(
@@ -1384,11 +1386,13 @@ mod marker_fence_tests {
                         serde_json::from_slice(&bytes[offset..offset + length]).unwrap_or_default();
                     let annotations = &body["metadata"]["annotations"];
                     let is_fence = annotations
-                        .get("rcoder.io/marker-fenced-at")
+                        .get(MARKER_FENCE_ANNOTATION)
                         .is_some_and(|value| !value.is_null());
-                    let is_migration = annotations
-                        .get(shared_types::WORKSPACE_MIGRATION_ANNOTATION)
-                        .is_some_and(|value| value == "migrated");
+                    let is_migration = shared_types::WorkspaceMigrationState::from_annotation(
+                        annotations
+                            .get(shared_types::WORKSPACE_MIGRATION_ANNOTATION)
+                            .and_then(|value| value.as_str()),
+                    ) == shared_types::WorkspaceMigrationState::Migrated;
                     if status != 200 {
                         // 注入失败（仅第一次迁移 PATCH；后续栅栏 PATCH 正常处理）。
                         if is_migration {
