@@ -67,6 +67,33 @@ const BLOCKING_WAITING_REASONS: &[&str] = &[
 /// 但也不清零已经累计的退避命中。
 const RETRYING_WAITING_REASONS: &[&str] = &["ErrImagePull"];
 
+/// 读 Job 状态连续失败容忍多久。
+///
+/// kube 客户端内置的重试只覆盖 429/503/504；连接重置、502、超时会直接报错。
+/// 同步一跑几分钟到几小时，期间 API server 抖一下，不该让几个小时的 phase-a
+/// 白跑、更不该让 cutover 在 agent 已经停了的状态下失败。短暂的读失败按"这一轮
+/// 状态未知"跳过，持续失败到这里的时间才判失败。Job 被人删掉（NotFound）
+/// 没什么可等的，立刻失败。
+const JOB_GET_ERROR_TOLERANCE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// 读 Job 状态的连续失败计时（纯逻辑，便于单测）。
+#[derive(Default)]
+struct GetErrorBudget {
+    failed_since: Option<std::time::Instant>,
+}
+
+impl GetErrorBudget {
+    /// 记一次失败；返回 `true` = 已经连续失败太久，应当放弃。
+    fn exhausted(&mut self, now: std::time::Instant, tolerance: std::time::Duration) -> bool {
+        let failed_since = *self.failed_since.get_or_insert(now);
+        now.duration_since(failed_since) >= tolerance
+    }
+
+    fn recovered(&mut self) {
+        self.failed_since = None;
+    }
+}
+
 /// 迁移 Job 的执行参数（纯数据, 供单测构造/断言）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MigrationJobPlan {
@@ -508,12 +535,14 @@ impl KubernetesRuntime {
         let selector = format!("job-name={}", plan.job_name);
         let mut stuck = StuckObservation::default();
         let mut next_pod_check = std::time::Instant::now() + POD_CHECK_DELAY;
+        let mut get_errors = GetErrorBudget::default();
         let outcome = loop {
             if std::time::Instant::now() > deadline {
                 break Err("timeout".to_string());
             }
             match jobs.get(&plan.job_name).await {
                 Ok(job) => {
+                    get_errors.recovered();
                     let status = job.status.as_ref();
                     if status.and_then(|s| s.succeeded).unwrap_or(0) >= 1 {
                         break Ok(());
@@ -534,7 +563,22 @@ impl KubernetesRuntime {
                         break Err(format!("failed={failed}, active={active}"));
                     }
                 }
-                Err(e) => break Err(format!("get job: {e}")),
+                Err(kube::Error::Api(error)) if error.code == 404 => {
+                    break Err(format!("job is gone: {}", error.message));
+                }
+                Err(e) => {
+                    // 瞬时读失败: 这一轮状态未知, 跳过; 连续失败太久才放弃
+                    if get_errors.exhausted(std::time::Instant::now(), JOB_GET_ERROR_TOLERANCE) {
+                        break Err(format!(
+                            "reading the job status kept failing for at least {JOB_GET_ERROR_TOLERANCE:?}: {e}"
+                        ));
+                    }
+                    tracing::debug!(
+                        job = %plan.job_name,
+                        error = %e,
+                        "migration sync job status read failed; will retry"
+                    );
+                }
             }
             // Pod 起不来时（拉不到镜像、容器创建失败）Job 的 active 恒为 1、failed
             // 恒为 0——上面的判据要等到 activeDeadlineSeconds（4h）才成立，而这期间
@@ -843,6 +887,29 @@ mod tests {
     /// Job 只跑 rclone，不访问 API server：不挂 ServiceAccount token（namespace 里
     /// 的 SA token 能读到什么，挂进数据面 Job 就是多大的面），系统调用面收敛到
     /// 运行时默认 seccomp profile。与沙箱 Pod 同款加固。
+    /// 读 Job 状态的瞬时失败要容忍，持续失败才放弃（连接重置、502 不在 kube 客户端
+    /// 的内置重试范围内；同步一跑几小时，API server 抖一下不该让它白跑）。
+    #[test]
+    fn transient_job_status_read_failures_are_tolerated_until_they_persist() {
+        use std::time::{Duration, Instant};
+        let tolerance = JOB_GET_ERROR_TOLERANCE;
+        let t0 = Instant::now();
+        let mut budget = GetErrorBudget::default();
+        assert!(!budget.exhausted(t0, tolerance), "第一次失败只计时");
+        assert!(!budget.exhausted(t0 + tolerance - Duration::from_secs(1), tolerance));
+        assert!(
+            budget.exhausted(t0 + tolerance, tolerance),
+            "持续满时限才放弃"
+        );
+
+        // 中间成功过一次: 重新计时
+        let mut budget = GetErrorBudget::default();
+        assert!(!budget.exhausted(t0, tolerance));
+        budget.recovered();
+        assert!(!budget.exhausted(t0 + tolerance * 10, tolerance));
+        assert!(budget.exhausted(t0 + tolerance * 11, tolerance));
+    }
+
     /// 反例（31.45 实测）：不带传播策略删 Job，Pod 被孤儿化、永久留在命名空间里。
     #[test]
     fn deleting_the_job_cascades_to_its_pods() {

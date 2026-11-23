@@ -576,6 +576,15 @@ fn wrap(step: &str, error: ContainerRuntimeError) -> ContainerRuntimeError {
         ContainerRuntimeError::Timeout(payload) => {
             ContainerRuntimeError::Timeout(prefixed(&payload))
         }
+        // 这三个变体自带 HTTP 语义（503 / 409 / 按拒绝里的状态码），载荷不是能加
+        // 前缀的字符串：原样透传。agent 正在启动时 find_container 会给出前两个。
+        ContainerRuntimeError::ManagementNotRunning => ContainerRuntimeError::ManagementNotRunning,
+        ContainerRuntimeError::OperationInProgress(data) => {
+            ContainerRuntimeError::OperationInProgress(data)
+        }
+        ContainerRuntimeError::RequestRejected(rejection) => {
+            ContainerRuntimeError::RequestRejected(rejection)
+        }
         other => {
             ContainerRuntimeError::K8sError(format!("migration step '{step}' failed: {other}"))
         }
@@ -670,6 +679,41 @@ mod agent_restore_tests {
                 "步骤名要带进去: {after}"
             );
         }
+
+        // 自带 HTTP 语义、载荷不是字符串的变体原样透传。agent 正在启动（StatefulSet
+        // 在、Pod 还没就绪）时 find_container 会给出前两个；此前被压成 K8sError，
+        // 可重试的状态变成了 500。
+        assert!(matches!(
+            wrap(
+                "agent_present_check",
+                ContainerRuntimeError::ManagementNotRunning
+            ),
+            ContainerRuntimeError::ManagementNotRunning
+        ));
+        assert!(matches!(
+            wrap(
+                "agent_present_check",
+                ContainerRuntimeError::OperationInProgress(Box::new(
+                    shared_types::UserAppOperationInProgress {
+                        app_id: "app-1".to_string(),
+                        service_type: shared_types::ServiceType::ComputerAgentRunner,
+                        resource_name: "rcoder-computer-agent-runner-u1".to_string(),
+                        operation_id: None,
+                    }
+                ))
+            ),
+            ContainerRuntimeError::OperationInProgress(_)
+        ));
+        assert!(matches!(
+            wrap(
+                "agent_present_check",
+                ContainerRuntimeError::RequestRejected(shared_types::RuntimeRequestRejection {
+                    status: 409,
+                    message: "busy".to_string(),
+                })
+            ),
+            ContainerRuntimeError::RequestRejected(ref rejection) if rejection.status == 409
+        ));
 
         // 上游失败类变体仍归并为 K8sError（没有更具体的 HTTP 语义），文案不变
         let error = wrap(
