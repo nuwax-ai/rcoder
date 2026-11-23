@@ -216,6 +216,29 @@ fn parse_volume_mounts(
     Ok(volume_mounts)
 }
 
+/// `Idempotency-Key` 请求头 → 幂等键。Err 载荷是错误码。
+///
+/// 长度上限与官方契约一致（1-255 个字符；存储是 TEXT，没有更紧的限制——
+/// 此前把上限误写成 128，129-255 的合法键被静默丢弃）。头存在但不合规时
+/// **报 400**，不静默当作没带：那会让调用方以为有去重保护，网络重试时多建
+/// 一个沙箱。字符集不额外限制（任意字符串都能去重）。
+fn parse_idempotency_key(headers: &axum::http::HeaderMap) -> Result<Option<String>, &'static str> {
+    const INVALID: &str = shared_types::error_codes::ERR_E2B_IDEMPOTENCY_KEY_INVALID;
+    // 官方契约：`Idempotency-Key` 为 1-255 个字符。
+    const MAX_LEN: usize = 255;
+    let Some(value) = headers.get("Idempotency-Key") else {
+        return Ok(None);
+    };
+    // 头存在但不是可见 ASCII（无法按文本解读）同样是不合规，而不是"没带"。
+    let Ok(value) = value.to_str() else {
+        return Err(INVALID);
+    };
+    if value.is_empty() || value.len() > MAX_LEN {
+        return Err(INVALID);
+    }
+    Ok(Some(value.to_string()))
+}
+
 pub async fn create_sandbox(
     State(deps): State<SandboxDeps>,
     Extension(key): Extension<SandboxApiKeyRecord>,
@@ -256,11 +279,10 @@ pub async fn create_sandbox(
             Err(code) => return wire_error(SandboxApiError::InvalidCode(code), locale),
         }
     }
-    let idempotency_key = headers
-        .get("Idempotency-Key")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty() && value.len() <= 128)
-        .map(str::to_string);
+    let idempotency_key = match parse_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(code) => return wire_error(SandboxApiError::InvalidCode(code), locale),
+    };
     let params = shared_types::sandbox::CreateSandboxParams {
         template_id: template,
         timeout_seconds: body.timeout,
@@ -678,5 +700,55 @@ mod volume_mounts_tests {
                 "标量形态必须报错而不是被静默忽略"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod idempotency_key_tests {
+    use super::parse_idempotency_key;
+    use axum::http::{HeaderMap, HeaderValue};
+    use shared_types::error_codes::ERR_E2B_IDEMPOTENCY_KEY_INVALID;
+
+    fn headers(value: Option<&str>) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        if let Some(value) = value {
+            map.insert("Idempotency-Key", HeaderValue::from_str(value).unwrap());
+        }
+        map
+    }
+
+    #[test]
+    fn absent_header_means_no_idempotency() {
+        assert_eq!(parse_idempotency_key(&headers(None)), Ok(None));
+    }
+
+    #[test]
+    fn key_within_the_official_limit_is_honoured() {
+        let key = "6f1c0b0e-3b7c-4b1e-9d4e-0f3f8f2c1a2b";
+        assert_eq!(
+            parse_idempotency_key(&headers(Some(key))),
+            Ok(Some(key.to_string()))
+        );
+        // 官方契约的上限是 255 个字符。129-255 此前被静默丢弃（上限误写成
+        // 128）——调用方带了合法的键，却得不到去重保护。
+        let longest = "k".repeat(255);
+        assert_eq!(
+            parse_idempotency_key(&headers(Some(&longest))),
+            Ok(Some(longest))
+        );
+    }
+
+    /// 反例：头存在但不合规时曾被静默当作没带——调用方以为有去重保护，
+    /// 网络重试会多建一个沙箱。必须报错。
+    #[test]
+    fn present_but_invalid_key_is_rejected_not_silently_dropped() {
+        assert_eq!(
+            parse_idempotency_key(&headers(Some(""))),
+            Err(ERR_E2B_IDEMPOTENCY_KEY_INVALID)
+        );
+        assert_eq!(
+            parse_idempotency_key(&headers(Some(&"k".repeat(256)))),
+            Err(ERR_E2B_IDEMPOTENCY_KEY_INVALID)
+        );
     }
 }

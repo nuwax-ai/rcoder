@@ -73,6 +73,8 @@ pub const ERR_E2B_VOLUME_NAME_INVALID: &str = "ERR_E2B_VOLUME_NAME_INVALID";
 pub const ERR_E2B_MOUNT_PATH_INVALID: &str = "ERR_E2B_MOUNT_PATH_INVALID";
 /// volumeMounts 整体形态不对（非数组/对象、条目缺字段、字段类型错）
 pub const ERR_E2B_VOLUME_MOUNTS_INVALID: &str = "ERR_E2B_VOLUME_MOUNTS_INVALID";
+/// Idempotency-Key 请求头存在但不合规（空，或超过 255 个字符）
+pub const ERR_E2B_IDEMPOTENCY_KEY_INVALID: &str = "ERR_E2B_IDEMPOTENCY_KEY_INVALID";
 /// 续期后的到期时间越过了沙箱创建时定下的硬性截止时间
 pub const ERR_E2B_RENEW_EXCEEDS_HARD_DEADLINE: &str = "ERR_E2B_RENEW_EXCEEDS_HARD_DEADLINE";
 /// 续期与并发的回收/终止操作反复冲突（CAS 重试耗尽）
@@ -375,6 +377,7 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_E2B_VOLUME_NAME_INVALID => "error.e2b_volume_name_invalid",
         ERR_E2B_MOUNT_PATH_INVALID => "error.e2b_mount_path_invalid",
         ERR_E2B_VOLUME_MOUNTS_INVALID => "error.e2b_volume_mounts_invalid",
+        ERR_E2B_IDEMPOTENCY_KEY_INVALID => "error.e2b_idempotency_key_invalid",
         ERR_E2B_RENEW_EXCEEDS_HARD_DEADLINE => "error.e2b_renew_exceeds_hard_deadline",
         ERR_E2B_RENEW_CONFLICT => "error.e2b_renew_conflict",
         ERR_E2B_TIMEOUT_INVALID => "error.e2b_timeout_invalid",
@@ -668,6 +671,7 @@ mod tests {
             ERR_E2B_VOLUME_NAME_INVALID,
             ERR_E2B_MOUNT_PATH_INVALID,
             ERR_E2B_VOLUME_MOUNTS_INVALID,
+            ERR_E2B_IDEMPOTENCY_KEY_INVALID,
             ERR_E2B_RENEW_EXCEEDS_HARD_DEADLINE,
             ERR_E2B_RENEW_CONFLICT,
             ERR_E2B_TIMEOUT_INVALID,
