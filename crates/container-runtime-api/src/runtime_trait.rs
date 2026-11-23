@@ -962,6 +962,15 @@ pub trait WorkspaceRuntime: Send + Sync {
         ))
     }
 
+    /// 迁移 Job 的前置配置校验（镜像等）——**无 I/O、无副作用**。
+    ///
+    /// 编排入口在产生任何副作用（建 PVC、停 agent）之前调用：配置问题若拖到
+    /// `run_workspace_migration_sync` 里才报，留下的是残留 PVC 或停机。
+    /// 默认 `Ok(())`：不支持迁移的后端与测试替身无需实现。
+    async fn check_workspace_migration_config(&self) -> ContainerRuntimeResult<()> {
+        Ok(())
+    }
+
     /// 确保 per-agent workspace PVC 存在 (幂等: 已存在则复用, 不存在则创建)。
     ///
     /// K8s: 调 `ensure_workspace_pvc`; Docker: no-op。

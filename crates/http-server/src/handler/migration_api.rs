@@ -53,7 +53,16 @@ fn user_allowed(allowed: &HashSet<String>, user_id: &str) -> bool {
     allowed.contains(user_id) || allowed.contains(ALLOW_ALL)
 }
 
+/// 入口准入（五个端点共用，先便宜后贵）。返回 `Some(响应)` = 请求被拒。
+///
+/// 1. `user_id` 形态：全仓统一的标识符白名单（与 file-server 解析路径、迁移
+///    Job 的源路径校验是同一份规则）。白名单为 `*` 的批量窗口里任何字符串都
+///    能到这里；不拦的话，非法值要到 cutover **停完 agent** 之后才在同步步骤
+///    被拒，留下停机残留。
+/// 2. 必须是 Kubernetes 运行时。
+/// 3. 用户白名单。
 fn ensure_allowed(user_id: &str) -> Option<Response> {
+    invalid_user_id(user_id)?;
     // Docker Compose 形态: 迁移编排只对 K8s 有意义(trait 默认 sync=Err),
     // 显式拒绝防误设(白名单与 flag 双误设时 cutover 会真停容器然后失败)。
     let kubernetes_runtime = shared_types::is_kubernetes_runtime()
@@ -80,6 +89,30 @@ fn ensure_allowed(user_id: &str) -> Option<Response> {
         )
             .into_response(),
     )
+}
+
+/// `user_id` 路径参数的形态校验（fail fast）。文案默认英文；用 `{:?}` 回显
+/// 原始入参，控制字符被转义，不会污染日志或终端。
+fn invalid_user_id(user_id: &str) -> Option<Response> {
+    shared_types::validate_identifier(user_id, "userId")
+        .is_err()
+        .then(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "invalid user_id {user_id:?}: \
+                     expected 1-64 characters of letters, digits, '_' or '-'"
+                ),
+            )
+                .into_response()
+        })
+}
+
+/// 运行时/编排错误 → HTTP 状态：走全仓统一映射（运行时变体 → 错误码 →
+/// 状态），本模块不另写一份。前置不满足（已迁移、门禁被占、PVC 不存在）是
+/// 4xx，"稍后重试"是 503，超时 504，部署配置问题与上游失败是 5xx。
+fn status_for(error: &container_runtime_api::ContainerRuntimeError) -> StatusCode {
+    shared_types::error_status_from_code(container_runtime_api::runtime_error_code(error).0)
 }
 
 /// GET /api/migration/{user_id}/status
@@ -186,11 +219,8 @@ pub async fn set_state(
             "updated": true,
         }))
         .into_response(),
-        Err(container_runtime_api::ContainerRuntimeError::ContainerNotFound(message)) => {
-            (StatusCode::CONFLICT, message).into_response()
-        }
         Err(error) => (
-            StatusCode::BAD_GATEWAY,
+            status_for(&error),
             format!("set migration state failed: {error}"),
         )
             .into_response(),
@@ -215,7 +245,7 @@ pub async fn phase_a(
             "steps": outcome.steps,
         }))
         .into_response(),
-        Err(error) => (StatusCode::BAD_GATEWAY, format!("phase-a failed: {error}")).into_response(),
+        Err(error) => (status_for(&error), format!("phase-a failed: {error}")).into_response(),
     }
 }
 
@@ -237,7 +267,7 @@ pub async fn cutover(
             "steps": outcome.steps,
         }))
         .into_response(),
-        Err(error) => (StatusCode::BAD_GATEWAY, format!("cutover failed: {error}")).into_response(),
+        Err(error) => (status_for(&error), format!("cutover failed: {error}")).into_response(),
     }
 }
 
@@ -258,9 +288,7 @@ pub async fn rollback(
             "steps": outcome.steps,
         }))
         .into_response(),
-        Err(error) => {
-            (StatusCode::BAD_GATEWAY, format!("rollback failed: {error}")).into_response()
-        }
+        Err(error) => (status_for(&error), format!("rollback failed: {error}")).into_response(),
     }
 }
 
@@ -301,9 +329,59 @@ pub fn routes() -> axum::Router<std::sync::Arc<AppState>> {
 #[cfg(test)]
 mod user_allowed_tests {
     use super::*;
+    use container_runtime_api::ContainerRuntimeError;
 
     fn allowed(names: &[&str]) -> HashSet<String> {
         names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// 反例：白名单为 `*` 的批量窗口里，非法 `user_id` 此前可以一路走到编排，
+    /// 到 cutover 停完 agent 之后才在同步步骤被拒。必须在入口就 400。
+    #[test]
+    fn malformed_user_id_is_rejected_at_the_boundary() {
+        for id in [
+            "", " ", "a/b", "../etc", "a.b", "u;id", "u\n", "用户", "u id",
+        ] {
+            let response = invalid_user_id(id).unwrap_or_else(|| panic!("{id:?} 必须在入口被拒"));
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{id:?}");
+        }
+        for id in ["6", "mig-u1", "user_42", "A", "rbd-v2-u1"] {
+            assert!(invalid_user_id(id).is_none(), "{id:?} 是合法 user_id");
+        }
+    }
+
+    /// 此前编排错误一律 502：调用方分不清"重试有用"与"重试没用"。
+    #[test]
+    fn runtime_errors_map_to_actionable_status_codes() {
+        let cases = [
+            (
+                ContainerRuntimeError::Conflict(String::new()),
+                StatusCode::CONFLICT,
+            ),
+            (
+                ContainerRuntimeError::ContainerNotFound(String::new()),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                ContainerRuntimeError::ConnectionError(String::new()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                ContainerRuntimeError::Timeout(String::new()),
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+            (
+                ContainerRuntimeError::ConfigurationError(String::new()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                ContainerRuntimeError::K8sError(String::new()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(status_for(&error), expected, "{error:?}");
+        }
     }
 
     #[test]

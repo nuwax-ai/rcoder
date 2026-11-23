@@ -281,6 +281,10 @@ impl WorkspaceRuntime for KubernetesRuntime {
             .await
     }
 
+    async fn check_workspace_migration_config(&self) -> ContainerRuntimeResult<()> {
+        self.workspace_migration_config_check()
+    }
+
     /// 枚举某 service_type 的所有 per-app PVC，从 PVC 名反解 identifier（app_id）。
     ///
     /// 用于 storage/query 发现"有持久数据"的 app（含已 delete 但 PVC 保留的孤儿）——

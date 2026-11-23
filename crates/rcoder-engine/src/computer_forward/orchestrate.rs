@@ -18,7 +18,9 @@
 //! 一半人去翻标记"的中间态）。
 
 use container_runtime_api::ContainerRuntimeError;
-use shared_types::{ServiceType, WorkspaceMigrationState, WorkspaceSyncMode};
+use shared_types::{
+    ServiceResourceLimits, ServiceType, WorkspaceMigrationState, WorkspaceSyncMode,
+};
 
 use crate::app_state::AppState;
 use crate::service::computer_container_manager::{
@@ -65,6 +67,85 @@ async fn agent_present(state: &AppState, user_id: &str) -> Result<bool, Containe
         .find_container(user_id, &ServiceType::ComputerAgentRunner)
         .await?
         .is_some())
+}
+
+/// 入口前置：迁移 Job 的镜像必须已配置（纯 env 读取）。
+///
+/// 配置问题必须在产生任何副作用**之前**暴露——拖到同步步骤才报，留下的是
+/// phase-a 的残留 PVC 或 cutover 的停机残留（与 cutover 的"PVC 必须存在"
+/// 入口校验同一条原则）。
+async fn require_migration_job_config(state: &AppState) -> Result<(), ContainerRuntimeError> {
+    state
+        .runtime()
+        .check_workspace_migration_config()
+        .await
+        .map_err(|e| wrap("migration_config_check", e))
+}
+
+/// computer-agent-runner 的资源限额（纯配置读取）。`None` = 配置缺失：重建
+/// agent 会回落到 DEFAULT_AGENT_* 常量，与 intercept.rs 的 wake 路径同口径——
+/// 拒绝。
+fn computer_agent_resource_limits(state: &AppState) -> Option<ServiceResourceLimits> {
+    state
+        .config
+        .kubernetes_config
+        .as_ref()
+        .and_then(|kc| kc.get_service_config(&ServiceType::ComputerAgentRunner))
+        .map(|sc| sc.resource_limits.clone())
+}
+
+fn missing_resource_limits_error(refusing: &str) -> ContainerRuntimeError {
+    ContainerRuntimeError::Conflict(format!(
+        "kubernetes_config missing resource_limits for computer-agent-runner; \
+         refusing to {refusing}: the agent could not be rebuilt without falling back \
+         to default limits (fix config and retry)"
+    ))
+}
+
+/// 入口前置：这次切换收尾需要重建 agent 时，限额配置缺失必须在**停 agent
+/// 之前**拒绝（纯决策，便于单测）。
+///
+/// 停了却起不来只会留下停机——wake 路径对同一缺失同样拒绝，下一次请求也
+/// 救不回来。收尾保持停止的闲置用户不需要重建，不受此限。
+fn require_limits_when_rebuilding(
+    user_id: &str,
+    will_rebuild: bool,
+    resource_limits: Option<&ServiceResourceLimits>,
+) -> Result<(), ContainerRuntimeError> {
+    match (will_rebuild, resource_limits) {
+        (false, _) | (true, Some(_)) => Ok(()),
+        (true, None) => Err(missing_resource_limits_error(&format!(
+            "stop the running agent of '{user_id}'"
+        ))),
+    }
+}
+
+/// 在当前标记对应的卷上重建 agent（ensure 幂等）。
+///
+/// 调用前必须已释放编排锁——ensure 内部 acquire 同一 key，tokio Mutex 不可
+/// 重入，持锁调用必死锁（creation::acquire 的 WAITER_BUDGET 30s 全耗尽）。
+///
+/// 返回的 Err 只代表"重建这一步"失败：标记已翻，迁移本身已完成。
+async fn rebuild_agent_on_current_volume(
+    state: &AppState,
+    user_id: &str,
+    resource_limits: ServiceResourceLimits,
+) -> Result<(), ContainerRuntimeError> {
+    let options = ContainerCreateOptions {
+        user_id: user_id.to_string(),
+        project_id: user_id.to_string(),
+        resource_limits: Some(resource_limits),
+        pod_id: None,
+        isolation_type: None,
+        tenant_id: None,
+        space_id: None,
+        service_type: ServiceType::ComputerAgentRunner,
+    };
+    ComputerContainerManager::ensure_container_for_user_with_type(&options, state.runtime())
+        .await
+        // 返回的 (容器信息, 是否新建) 这里用不到：ensure 幂等，重建成功即可。
+        .map(|_| ())
+        .map_err(|e| wrap("ensure_agent", runtime_error_from_app(e)))
 }
 
 /// 切换收尾对 agent 的处置（纯决策，便于单测）。
@@ -117,6 +198,8 @@ pub async fn phase_a(
     let _migration_lock = ComputerContainerManager::acquire_migration_lock(user_id)
         .await
         .map_err(|e| wrap("acquire_migration_lock", runtime_error_from_app(e)))?;
+    // 入口校验⓪: 迁移 Job 镜像必须已配置——先于任何 I/O 与建 PVC。
+    require_migration_job_config(state).await?;
 
     // 入口校验: 已 Migrated 用户重跑 phase-a, rclone mirror 会把 RBD 上
     // cutover 后新写、共享卷没有的文件**全部删除**——必须显式拒绝。
@@ -216,16 +299,22 @@ pub async fn cutover(
         )));
     }
 
+    // 入口校验③: 迁移 Job 镜像必须已配置（纯 env 读取）。同样是"配置问题
+    // 不能等到停 agent 之后才触发"——否则留下停机残留。
+    require_migration_job_config(state).await?;
+
     // 写门禁开(终审 F1): 从停 agent 起该用户文件写一律 503。guard 的 Drop
     // 覆盖所有 `?` 失败路径(失败即解除, 该用户恢复可写——失败中间态下写
     // 共享卷是安全方向: 标记未翻, 数据面本就仍在共享卷)。
+    //
+    // 撞门禁用 ConnectionError 而不是 Conflict：它会自行解除、调用方应当重试
+    // （HTTP 503，retryable）；Conflict 的语义是"确定性拒绝、重试无用"。
     let _migration_gate_guard = MigrationGateGuard::acquire(user_id).ok_or_else(|| {
         wrap(
             "migration_gate",
-            ContainerRuntimeError::Conflict(
-                "another migration orchestration is still settling for this user; retry shortly"
-                    .to_string(),
-            ),
+            ContainerRuntimeError::ConnectionError(format!(
+                "another migration orchestration for '{user_id}' is still settling; retry shortly"
+            )),
         )
     })?;
 
@@ -247,6 +336,10 @@ pub async fn cutover(
     let agent_was_present = agent_present(state, user_id)
         .await
         .map_err(|e| wrap("agent_present_check", e))?;
+    // 切换前在运行 → 收尾要重建它 → 限额配置必须存在，且必须在停 agent
+    // **之前**判定（guard 随 Drop 解除，此刻没有任何残留）。
+    let resource_limits = computer_agent_resource_limits(state);
+    require_limits_when_rebuilding(user_id, agent_was_present, resource_limits.as_ref())?;
 
     // 1. 停 agent（删 STS → 卷卸载开始）
     state
@@ -304,9 +397,7 @@ pub async fn cutover(
         .map_err(|e| wrap("agent_present_check", e))?;
 
     // 5. 恢复 agent 的切换前形态（ensure 幂等; migrated 已生效 → 重建即挂
-    // per-agent RBD）。先释放编排锁——ensure 内部 acquire 同一 key, tokio
-    // Mutex 不可重入, 持锁调用必死锁(creation::acquire 的 WAITER_BUDGET 30s
-    // 全耗尽)。
+    // per-agent RBD）。
     let restart_step = match AgentRestore::decide(agent_was_present, agent_present_after_flip) {
         AgentRestore::KeepStopped => {
             drop(migration_lock);
@@ -329,35 +420,14 @@ pub async fn cutover(
         }
         AgentRestore::Restart => "agent restarted on RBD",
     };
+    // 重建前释放编排锁（原因见 rebuild_agent_on_current_volume）。限额在入口
+    // 已对"切换前在运行"判过；这里兜住 ReplaceWoken——切换期间被其他副本在
+    // 旧卷上唤醒的 agent 已停，同样必须重建。
     drop(migration_lock);
-    let resource_limits = state
-        .config
-        .kubernetes_config
-        .as_ref()
-        .and_then(|kc| kc.get_service_config(&service_type))
-        .map(|sc| sc.resource_limits.clone());
-    if resource_limits.is_none() {
-        // 与 intercept.rs wake 路径同口径 fail-fast——None 会回落
-        // DEFAULT_AGENT_* 常量, 同一用户两条创建路径 limits 分裂。
-        return Err(ContainerRuntimeError::Conflict(
-            "kubernetes_config missing resource_limits for computer-agent-runner; \
-             refusing to restart agent with fallback limits"
-                .to_string(),
-        ));
-    }
-    let options = ContainerCreateOptions {
-        user_id: user_id.to_string(),
-        project_id: user_id.to_string(),
-        resource_limits,
-        pod_id: None,
-        isolation_type: None,
-        tenant_id: None,
-        space_id: None,
-        service_type,
+    let Some(resource_limits) = resource_limits else {
+        return Err(missing_resource_limits_error("restart agent"));
     };
-    ComputerContainerManager::ensure_container_for_user_with_type(&options, state.runtime())
-        .await
-        .map_err(|e| wrap("ensure_agent", runtime_error_from_app(e)))?;
+    rebuild_agent_on_current_volume(state, user_id, resource_limits).await?;
     steps.push(restart_step.to_string());
 
     _migration_gate_guard.release();
@@ -401,6 +471,10 @@ pub async fn rollback(
     let agent_was_present = agent_present(state, user_id)
         .await
         .map_err(|e| wrap("agent_present_check", e))?;
+    // 与 cutover 对称：切换前在运行 → 收尾要重建 → 限额缺失必须在停 agent
+    // 之前拒绝。rollback 是回退路径，但"停了起不来"比"保持现状并报错"更糟。
+    let resource_limits = computer_agent_resource_limits(state);
+    require_limits_when_rebuilding(user_id, agent_was_present, resource_limits.as_ref())?;
     // C-1(终审): 翻标记前先停 agent——否则挂 RBD 的存量 agent 继续写 RBD,
     // 而转发层判 NotMigrated 放行共享卷(双卷读写分裂, 窗口无界)。
     state
@@ -432,15 +506,12 @@ pub async fn rollback(
     let agent_present_after_flip = agent_present(state, user_id)
         .await
         .map_err(|e| wrap("agent_present_check", e))?;
-    let restore = AgentRestore::decide(agent_was_present, agent_present_after_flip);
-    // 与 cutover 同构（评审"规范 2"：此前 rollback 缺 resource_limits 时静默
-    // 不重启也不记步骤，且 ReplaceWoken 的停止动作被 limits 条件绑住）：
-    //   KeepStopped  → 不需要重建，直接收束（limits 与此无关）
-    //   ReplaceWoken → **无条件先停**：停止不需要 limits。缺 limits 时不停
-    //     = 标记已翻回 NotMigrated 而 agent 还在 RBD 上跑，流量去共享卷
-    //     （双卷读写分裂，块设备还有双挂 ext4 损坏风险）
-    //   Restart/ReplaceWoken → 只有重建才需要 limits，缺则 fail-fast
-    let restart_step = match restore {
+    // 与 cutover 同构：KeepStopped 不需要重建，直接收束；ReplaceWoken **无条件
+    // 先停**（停止不需要 limits，且标记已翻回 NotMigrated——不停的话它继续挂
+    // 在 RBD 上跑，双卷读写分裂，块设备还有同节点双挂 ext4 的损坏风险）；
+    // Restart/ReplaceWoken 只有重建才需要 limits（入口已对"切换前在运行"判过，
+    // 这里兜住 ReplaceWoken）。
+    let restart_step = match AgentRestore::decide(agent_was_present, agent_present_after_flip) {
         AgentRestore::KeepStopped => {
             drop(migration_lock);
             steps.push("agent left stopped (not running before rollback)".to_string());
@@ -461,42 +532,16 @@ pub async fn rollback(
         }
         AgentRestore::Restart => "agent restarted on shared volume",
     };
-    // 与 cutover 对称: 恢复 agent 的切换前形态(此时 NotMigrated → 共享卷形态)。
-    // ensure 前释放锁(不可重入)。
+    // 恢复 agent 的切换前形态(此时 NotMigrated → 共享卷形态)。重建前释放锁。
     drop(migration_lock);
-    let resource_limits = state
-        .config
-        .kubernetes_config
-        .as_ref()
-        .and_then(|kc| kc.get_service_config(&service_type))
-        .map(|sc| sc.resource_limits.clone());
-    if resource_limits.is_none() {
-        // 与 cutover 同口径 fail-fast——None 会回落 DEFAULT_AGENT_* 常量,
-        // 同一用户两条创建路径 limits 分裂。标记已翻回 NotMigrated, 重试
-        // rollback 是 no-op 成功, 不会把用户卡住。
-        return Err(ContainerRuntimeError::Conflict(
-            "kubernetes_config missing resource_limits for computer-agent-runner; \
-             refusing to restart agent with fallback limits"
-                .to_string(),
-        ));
-    }
-    let options = ContainerCreateOptions {
-        user_id: user_id.to_string(),
-        project_id: user_id.to_string(),
-        resource_limits,
-        pod_id: None,
-        isolation_type: None,
-        tenant_id: None,
-        space_id: None,
-        service_type,
+    let Some(resource_limits) = resource_limits else {
+        return Err(missing_resource_limits_error("restart agent"));
     };
-    match ComputerContainerManager::ensure_container_for_user_with_type(&options, state.runtime())
-        .await
-    {
-        Ok(_) => steps.push(restart_step.to_string()),
-        Err(e) => {
+    match rebuild_agent_on_current_volume(state, user_id, resource_limits).await {
+        Ok(()) => steps.push(restart_step.to_string()),
+        Err(error) => {
             // 重建失败不阻断 rollback(标记已翻, 下次请求自会 ensure 重建)
-            tracing::warn!(user_id, error = %e, "[MIGRATION] rollback ensure agent failed");
+            tracing::warn!(user_id, error = %error, "[MIGRATION] rollback ensure agent failed");
             steps.push("agent restart deferred (will rebuild on next request)".to_string());
         }
     }
@@ -508,8 +553,33 @@ pub async fn rollback(
     })
 }
 
+/// 把某一步的运行时错误包上步骤名（排障时一眼看出断在哪一步）。
+///
+/// **保留有 HTTP 语义的变体**（前置不满足 / 对象不存在 / 需稍后重试 / 超时 /
+/// 配置错误）：HTTP 层按变体映射状态码，全压成 `K8sError` 会让"门禁被占、
+/// 稍后重试"也变成 500。其余变体维持 `K8sError`（上游失败）。
 fn wrap(step: &str, error: ContainerRuntimeError) -> ContainerRuntimeError {
-    ContainerRuntimeError::K8sError(format!("migration step '{step}' failed: {error}"))
+    let prefixed = |payload: &str| format!("migration step '{step}' failed: {payload}");
+    match error {
+        ContainerRuntimeError::Conflict(payload) => {
+            ContainerRuntimeError::Conflict(prefixed(&payload))
+        }
+        ContainerRuntimeError::ContainerNotFound(payload) => {
+            ContainerRuntimeError::ContainerNotFound(prefixed(&payload))
+        }
+        ContainerRuntimeError::ConfigurationError(payload) => {
+            ContainerRuntimeError::ConfigurationError(prefixed(&payload))
+        }
+        ContainerRuntimeError::ConnectionError(payload) => {
+            ContainerRuntimeError::ConnectionError(prefixed(&payload))
+        }
+        ContainerRuntimeError::Timeout(payload) => {
+            ContainerRuntimeError::Timeout(prefixed(&payload))
+        }
+        other => {
+            ContainerRuntimeError::K8sError(format!("migration step '{step}' failed: {other}"))
+        }
+    }
 }
 
 /// ComputerContainerManager 返回 AppError（engine 域错误）; 编排链路统一
@@ -520,7 +590,87 @@ fn runtime_error_from_app(error: crate::AppError) -> ContainerRuntimeError {
 
 #[cfg(test)]
 mod agent_restore_tests {
-    use super::AgentRestore;
+    use super::{AgentRestore, ServiceResourceLimits, require_limits_when_rebuilding, wrap};
+    use container_runtime_api::ContainerRuntimeError;
+
+    #[test]
+    fn idle_user_needs_no_limits_to_be_left_stopped() {
+        assert!(require_limits_when_rebuilding("u1", false, None).is_ok());
+    }
+
+    #[test]
+    fn running_user_with_limits_may_be_stopped_and_rebuilt() {
+        let limits = ServiceResourceLimits::default();
+        assert!(require_limits_when_rebuilding("u1", true, Some(&limits)).is_ok());
+    }
+
+    /// 反例：切换前 agent 在运行、限额配置缺失——必须在停 agent **之前**拒绝。
+    /// 停了起不来（wake 路径对同一缺失同样拒绝），只会留下停机。
+    #[test]
+    fn running_user_without_limits_is_refused_before_any_stop() {
+        let error = require_limits_when_rebuilding("u1", true, None).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("resource_limits"),
+            "错误要点名缺的是哪项配置: {message}"
+        );
+        assert!(message.contains("'u1'"), "错误要点名用户: {message}");
+        assert!(
+            matches!(error, ContainerRuntimeError::Conflict(_)),
+            "配置缺失是确定性拒绝: {error:?}"
+        );
+    }
+
+    /// 反例：`wrap` 曾把所有错误压成 K8sError——"门禁被占、稍后重试"到 HTTP 层
+    /// 变成 500，调用方分不清该重试还是该改配置。
+    #[test]
+    fn wrap_keeps_the_variants_that_http_status_depends_on() {
+        let preserved = [
+            (
+                ContainerRuntimeError::Conflict("already migrated".to_string()),
+                "already migrated",
+                "must stay Conflict",
+            ),
+            (
+                ContainerRuntimeError::ConnectionError("gate held; retry shortly".to_string()),
+                "gate held; retry shortly",
+                "must stay ConnectionError",
+            ),
+            (
+                ContainerRuntimeError::ConfigurationError("image not configured".to_string()),
+                "image not configured",
+                "must stay ConfigurationError",
+            ),
+        ];
+        for (error, payload, expectation) in preserved {
+            let before = format!("{error:?}");
+            let wrapped = wrap("migration_gate", error);
+            let after = format!("{wrapped:?}");
+            assert!(
+                after.starts_with(&before.split('(').next().unwrap_or_default()),
+                "{expectation}: {before} -> {after}"
+            );
+            assert!(
+                after.contains(&format!(
+                    "migration step 'migration_gate' failed: {payload}"
+                )),
+                "步骤名要带进去: {after}"
+            );
+        }
+
+        // 上游失败类变体仍归并为 K8sError（没有更具体的 HTTP 语义），文案不变
+        let error = wrap(
+            "stop_agent",
+            ContainerRuntimeError::ContainerStopError("boom".to_string()),
+        );
+        let ContainerRuntimeError::K8sError(message) = error else {
+            panic!("上游失败应归并为 K8sError，实际是 {error:?}");
+        };
+        assert_eq!(
+            message,
+            "migration step 'stop_agent' failed: Container stop failed: boom"
+        );
+    }
 
     #[test]
     fn running_agent_is_restarted_whatever_the_later_observation() {
