@@ -140,13 +140,21 @@ fn access_token(headers: &axum::http::HeaderMap, uri: &Uri) -> String {
         return token.to_string();
     }
     // WS 客户端不便带自定义头：支持 ?access_token= 查询参数。
+    // 值按 RFC 3986 做百分号解码：通用 URL 构造器会把所有参数值
+    // encodeURIComponent 一遍，不解码就永远比对不上（token 里出现保留
+    // 字符时）。只解百分号、不把 '+' 当空格——查询串里 '+' 是字面量，
+    // form 体的规则不适用。解不出 UTF-8 就原样返回：交给后面的哈希
+    // 比对失败（fail-closed），不在这里放行。
     let query = uri.query().unwrap_or("");
     for pair in query.split('&') {
         let mut parts = pair.splitn(2, '=');
         if parts.next() == Some("access_token")
             && let Some(value) = parts.next()
         {
-            return value.to_string();
+            return percent_encoding::percent_decode_str(value)
+                .decode_utf8()
+                .map(|decoded| decoded.into_owned())
+                .unwrap_or_else(|_| value.to_string());
         }
     }
     String::new()
@@ -743,6 +751,36 @@ mod tests {
         assert_eq!(token, "fromheader");
         let token = access_token(&headers(&[]), &uri);
         assert_eq!(token, "fromquery");
+    }
+
+    #[test]
+    fn access_token_query_value_is_percent_decoded() {
+        // 通用 URL 构造器会把参数值整体 encodeURIComponent：%2F / %3D 之类
+        // 必须还原，否则 token 里出现保留字符时永远比对不上。
+        let uri: Uri = "/sandboxes/a/49983/health?access_token=a%2Fb%3Dc%20d"
+            .parse()
+            .unwrap();
+        assert_eq!(access_token(&headers(&[]), &uri), "a/b=c d");
+    }
+
+    #[test]
+    fn access_token_keeps_plus_literal_in_query() {
+        // 查询串里 '+' 是字面量，不按 form 体规则变成空格
+        let uri: Uri = "/sandboxes/a/49983/health?access_token=a+b"
+            .parse()
+            .unwrap();
+        assert_eq!(access_token(&headers(&[]), &uri), "a+b");
+    }
+
+    #[test]
+    fn access_token_absent_or_undecodable_yields_empty_or_raw() {
+        let none: Uri = "/sandboxes/a/49983/health".parse().unwrap();
+        assert_eq!(access_token(&headers(&[]), &none), "");
+        // 解不出 UTF-8：原样返回，交给后面的哈希比对失败（fail-closed）
+        let broken: Uri = "/sandboxes/a/49983/health?access_token=%FF"
+            .parse()
+            .unwrap();
+        assert_eq!(access_token(&headers(&[]), &broken), "%FF");
     }
 
     #[test]

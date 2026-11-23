@@ -6567,6 +6567,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot 0.13.0",
  "path-clean",
+ "percent-encoding",
  "preview-coordinator",
  "rand 0.10.4",
  "rcoder-engine",

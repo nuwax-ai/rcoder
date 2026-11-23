@@ -127,6 +127,9 @@ futures-util = { workspace = true }
 base64 = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
+# 查询串百分号解码（?access_token=）。worktree 里已是 url 的传递依赖，
+# 版本与 lock 一致，显式声明只为直接用其 API。
+percent-encoding = { workspace = true }
 bollard = { workspace = true }
 rustls = { workspace = true }
 

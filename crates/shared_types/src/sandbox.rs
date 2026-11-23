@@ -190,7 +190,11 @@ pub trait SandboxStore: Send + Sync {
     ) -> Result<Option<SandboxTemplateSpec>, SandboxStoreError>;
     async fn list_templates(&self) -> Result<Vec<SandboxTemplateSummary>, SandboxStoreError>;
 
-    /// 幂等种子写入（配置驱动；存在即跳过，不覆盖）。
+    /// 幂等种子写入（配置驱动；同 `key_id` 按配置收敛——**轮换会生效**）。
+    ///
+    /// 配置是这类 key 的唯一事实源：运维换掉同一个 `key_id` 的 secret 后，
+    /// 重启必须让库里跟着换成新 `key_hash`（旧 secret 失效、新 secret 可用），
+    /// 而不是留着旧值让轮换静默失败。`created_at_us` 保留首次入库时间。
     async fn seed_api_key(&self, record: &SandboxApiKeyRecord) -> Result<(), SandboxStoreError>;
     async fn seed_template(
         &self,

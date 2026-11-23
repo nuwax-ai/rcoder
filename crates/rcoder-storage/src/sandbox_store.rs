@@ -225,13 +225,27 @@ impl SandboxStore for PgSandboxStore {
         .await
     }
 
+    /// 配置驱动的 api key 种子（幂等，且**轮换可生效**）。
+    ///
+    /// `ON CONFLICT(key_id) DO UPDATE` 而不是 `DO NOTHING`：运维在配置里
+    /// 换掉同一个 `key_id` 的 secret 后，`DO NOTHING` 会让库里留着旧
+    /// `key_hash`——新 secret 全部 401，而已经轮换掉的旧 secret 仍然有效
+    /// （实测复现：第二次 seed 后 `key_hash` 原样不动）。配置是这类 key 的
+    /// 唯一事实源，重启后必须按配置收敛。
+    ///
+    /// `created_at_us` 故意不在 SET 列表里：保留首次入库时间，不因重复
+    /// seed 被反复改写。`key_hash` 上有 UNIQUE 约束，配置里两个 key 共用
+    /// 一个 secret 会在这里直接报错（fail-fast），不会被静默吞掉。
     async fn seed_api_key(&self, record: &SandboxApiKeyRecord) -> Result<(), SandboxStoreError> {
         let record = record.clone();
         self.run(move |tx| {
             Box::pin(async move {
                 let count = toasty::sql::statement(
                     "INSERT INTO sandbox_api_keys(key_id,tenant_id,public_prefix,key_hash,scopes,created_at_us,expires_at_us,revoked_at_us) \
-                     VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(key_id) DO NOTHING",
+                     VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(key_id) DO UPDATE SET \
+                     tenant_id=EXCLUDED.tenant_id, public_prefix=EXCLUDED.public_prefix, \
+                     key_hash=EXCLUDED.key_hash, scopes=EXCLUDED.scopes, \
+                     expires_at_us=EXCLUDED.expires_at_us, revoked_at_us=EXCLUDED.revoked_at_us",
                 )
                 .bind(&record.key_id)
                 .bind(&record.tenant_id)
@@ -991,4 +1005,104 @@ async fn read_back(
             SandboxStoreError::Unavailable("sandbox row vanished in transaction".into())
         })?;
     instance_record(row)
+}
+
+/// 轮换合同：同一个 `key_id` 换 secret 后，旧 secret 必须失效、新 secret
+/// 必须可用（`ON CONFLICT DO NOTHING` 会让两者都反着来）。
+///
+/// 需要可破坏的 PG：`docker run -d --name probe -e POSTGRES_PASSWORD=p \
+/// -e POSTGRES_DB=probe -p 55432:5432 postgres:17`，
+/// 然后 `RCODER_PG_TEST_DSN=postgres://postgres:p@127.0.0.1:55432/probe \
+/// cargo nextest run -p rcoder-storage --features pg seed_api_key_rotation --run-ignored all`
+#[cfg(all(test, feature = "pg"))]
+mod api_key_rotation_tests {
+    use shared_types::sandbox::{SandboxApiKeyRecord, SandboxStore};
+
+    use super::PgSandboxStore;
+
+    fn key(key_id: &str, secret: &str) -> SandboxApiKeyRecord {
+        SandboxApiKeyRecord {
+            key_id: key_id.to_string(),
+            tenant_id: "rotation-tenant".to_string(),
+            public_prefix: secret.chars().take(8).collect(),
+            // 直接以 secret 当 hash：测试只关心"库里存的是哪一个"
+            key_hash: secret.to_string(),
+            scopes: "sandbox".to_string(),
+            expires_at_us: None,
+            revoked_at_us: None,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires RCODER_PG_TEST_DSN for a disposable PostgreSQL instance"]
+    async fn seed_api_key_rotation_replaces_the_stored_hash() {
+        let dsn =
+            std::env::var("RCODER_PG_TEST_DSN").expect("explicit PostgreSQL test DSN required");
+        // 独立 schema：不碰公共表，测试可反复跑
+        let schema = format!("sandbox_rotation_{}", uuid::Uuid::new_v4().simple());
+        let mut admin = toasty::Db::builder().connect(&dsn).await.unwrap();
+        toasty::sql::statement(format!("CREATE SCHEMA {schema}"))
+            .exec(&mut admin)
+            .await
+            .unwrap();
+        drop(admin);
+        let separator = if dsn.contains('?') { '&' } else { '?' };
+        let scoped = format!("{dsn}{separator}options=-csearch_path%3D{schema}");
+        let store = PgSandboxStore::connect(&crate::config::PostgresConfig {
+            url: Some(scoped.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // 1) 首次 seed：新 secret 可用
+        store
+            .seed_api_key(&key("k-rotate", "secret_a"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .find_api_key_by_hash("secret_a")
+                .await
+                .unwrap()
+                .is_some(),
+            "首次 seed 后新 secret 必须可用"
+        );
+
+        // 2) 同一 key_id 换 secret：旧的失效、新的可用
+        store
+            .seed_api_key(&key("k-rotate", "secret_b"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .find_api_key_by_hash("secret_b")
+                .await
+                .unwrap()
+                .is_some(),
+            "轮换后新 secret 必须可用（DO NOTHING 下这里会是 None）"
+        );
+        assert!(
+            store
+                .find_api_key_by_hash("secret_a")
+                .await
+                .unwrap()
+                .is_none(),
+            "轮换后旧 secret 必须失效（DO NOTHING 下它仍然可用——这才是缺陷）"
+        );
+
+        // 3) 幂等：同样的配置再 seed 一次，状态不变
+        store
+            .seed_api_key(&key("k-rotate", "secret_b"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .find_api_key_by_hash("secret_b")
+                .await
+                .unwrap()
+                .is_some(),
+            "重复 seed 必须保持幂等"
+        );
+    }
 }
