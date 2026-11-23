@@ -1111,9 +1111,12 @@ mod api_key_seed_tests {
         async fn cleanup(self) {
             let schema = self.schema.clone();
             let mut admin = toasty::Db::builder().connect(&self.dsn).await.unwrap();
-            let _ = toasty::sql::statement(format!("DROP SCHEMA {schema} CASCADE"))
-                .exec(&mut admin)
-                .await;
+            // 尽力而为：清理失败不影响断言结论，显式丢弃 Result。
+            drop(
+                toasty::sql::statement(format!("DROP SCHEMA {schema} CASCADE"))
+                    .exec(&mut admin)
+                    .await,
+            );
         }
     }
 

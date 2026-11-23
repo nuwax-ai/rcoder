@@ -647,7 +647,7 @@ mod agent_restore_tests {
             let wrapped = wrap("migration_gate", error);
             let after = format!("{wrapped:?}");
             assert!(
-                after.starts_with(&before.split('(').next().unwrap_or_default()),
+                after.starts_with(before.split('(').next().unwrap_or_default()),
                 "{expectation}: {before} -> {after}"
             );
             assert!(

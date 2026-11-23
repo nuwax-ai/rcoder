@@ -599,7 +599,7 @@ mod tests {
             .stderr(std::process::Stdio::inherit())
             .output()
             .unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(std::fs::remove_dir_all(&dir));
         assert!(
             output.status.success(),
             "脚本应以 rclone 的退出码结束；stderr 见上"
