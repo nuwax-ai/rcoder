@@ -213,11 +213,26 @@ pub struct MigrationStateBody {
 pub async fn set_state(
     State(state): State<std::sync::Arc<AppState>>,
     Path(user_id): Path<String>,
-    Json(body): Json<MigrationStateBody>,
+    // 不用 `Json<T>` 提取器：提取器在函数体之前运行，请求体不合法时名单外的调用方
+    // 会先拿到 400/422 而不是 403（31.45 实测）。先过准入，再解析请求体。
+    body: axum::body::Bytes,
 ) -> Response {
     if let Err(response) = ensure_allowed(&user_id) {
         return *response;
     }
+    // 解析错误里只有位置信息，不回显请求体内容
+    let body: MigrationStateBody = match serde_json::from_slice(&body) {
+        Ok(body) => body,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "invalid body ({err}): expected {{\"state\":\"migrated\"|\"not-migrated\"}}"
+                ),
+            )
+                .into_response();
+        }
+    };
     let target = match body.state.as_str() {
         "migrated" => shared_types::WorkspaceMigrationState::Migrated,
         "not-migrated" => shared_types::WorkspaceMigrationState::NotMigrated,
@@ -540,7 +555,7 @@ mod guard_route_tests {
     }
 
     /// 对五个端点各发一次请求，返回状态码（按 `ENDPOINTS` 的顺序）。
-    async fn statuses(router: &axum::Router, user: &str) -> Vec<StatusCode> {
+    async fn statuses(router: &axum::Router, user: &str, body: &'static str) -> Vec<StatusCode> {
         let mut statuses = Vec::with_capacity(ENDPOINTS.len());
         for (method, path) in ENDPOINTS {
             let uri = path.replace("{u}", user);
@@ -548,7 +563,7 @@ mod guard_route_tests {
                 .method(*method)
                 .uri(uri)
                 .header("content-type", "application/json")
-                .body(Body::from(r#"{"state":"migrated"}"#))
+                .body(Body::from(body))
                 .unwrap();
             let response = router.clone().oneshot(request).await.unwrap();
             statuses.push(response.status());
@@ -598,9 +613,13 @@ mod guard_route_tests {
         let forbidden = StatusCode::FORBIDDEN;
         let bad_request = StatusCode::BAD_REQUEST;
 
-        let outsider = statuses(&router, "outsider").await;
-        let shaped = statuses(&router, "ABC123").await;
-        let member = statuses(&router, "member-1").await;
+        let valid = r#"{"state":"migrated"}"#;
+        let outsider = statuses(&router, "outsider", valid).await;
+        let shaped = statuses(&router, "ABC123", valid).await;
+        let member = statuses(&router, "member-1", valid).await;
+        // 请求体不合法也不能让名单外的调用方绕过 403（Json 提取器曾先于守卫运行）
+        let outsider_bad_body = statuses(&router, "outsider", "{}").await;
+        let member_bad_body = statuses(&router, "member-1", "{}").await;
         for (index, (method, path)) in ENDPOINTS.iter().enumerate() {
             let (outsider, shaped, member) = (outsider[index], shaped[index], member[index]);
             eprintln!(
@@ -609,6 +628,21 @@ mod guard_route_tests {
             match case.as_str() {
                 "list" => {
                     assert_eq!(outsider, forbidden, "名单外: {method} {path}");
+                    assert_eq!(
+                        outsider_bad_body[index], forbidden,
+                        "名单外 + 不合法请求体: 仍然 403, {method} {path}"
+                    );
+                    // 名单内的判定不依赖请求体；migration-state 过了准入之后才解析它
+                    assert_ne!(
+                        member_bad_body[index], forbidden,
+                        "名单内 + 不合法请求体不该被白名单拒: {method} {path}"
+                    );
+                    if path.contains("migration-state") && member != StatusCode::NOT_IMPLEMENTED {
+                        assert_eq!(
+                            member_bad_body[index], bad_request,
+                            "过了准入之后不合法请求体是 400: {method} {path}"
+                        );
+                    }
                     assert_eq!(shaped, bad_request, "id 拼不出合法 Job 名: {method} {path}");
                     assert!(
                         member != forbidden && member != bad_request,
