@@ -35,6 +35,9 @@ pub async fn run(config: Config) {
 
     let mut switch = Switch::default();
     let mut last_action: Option<Instant> = None;
+    // "超阈值但无可杀对象"的节流时间戳。独立于 last_action：更新它会顺带
+    // 把紧随其后的真实 evict 推迟一个冷却期（那是行为变化，不是日志变化）。
+    let mut last_no_candidate: Option<Instant> = None;
     let mut last_mode = Mode::Off;
     // cgroup 归属启动时解析一次（进程生命周期内不变）。
     let probe = cgroup::CgroupProbe::resolve();
@@ -71,7 +74,15 @@ pub async fn run(config: Config) {
             last_mode = cfg.mode;
         }
         if cfg.mode != Mode::Off {
-            step(&reg, &cfg, &probe, &mut last_action, &mut scope_warned).await;
+            step(
+                &reg,
+                &cfg,
+                &probe,
+                &mut last_action,
+                &mut last_no_candidate,
+                &mut scope_warned,
+            )
+            .await;
         }
         // 用 sleep 而不是 interval：开关文件可以改 interval_ms 并立刻生效。
         tokio::time::sleep(cfg.interval).await;
@@ -138,6 +149,7 @@ async fn step(
     cfg: &Config,
     probe: &cgroup::CgroupProbe,
     last_action: &mut Option<Instant>,
+    last_no_candidate: &mut Option<Instant>,
     scope_warned: &mut bool,
 ) {
     // 每轮重新读本组限额：限额可以在运行中调整，启动快照不能作为归属证明
@@ -220,10 +232,19 @@ async fn step(
     let protected = protected_set(&roots, &table);
 
     let Some(victim) = select_victim(&table, &root_pids, &protected, cfg.min_rss(limit)) else {
-        tracing::debug!(
+        // 超阈值却无可杀对象 = 看门狗对这个容器已失效（候选全在保护集外、
+        // 或都低于 min_rss），只剩内核 OOM 兜底。灰度期要能看见这个信号，
+        // 故 info 而非 debug；按 cooldown 节流（与 would_evict 同款），
+        // 否则超阈值期间每 tick 一条会把日志淹掉。
+        if last_no_candidate.is_some_and(|at| at.elapsed() < cfg.cooldown) {
+            return;
+        }
+        *last_no_candidate = Some(Instant::now());
+        tracing::info!(
             event = "mem_watch.no_candidate",
             working_set_mb = working_set >> 20,
             limit_mb = limit >> 20,
+            hint = "working set over threshold but no evictable process; only kernel OOM remains",
         );
         return;
     };

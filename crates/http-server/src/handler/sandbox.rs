@@ -154,6 +154,67 @@ async fn manager_of(deps: &SandboxDeps, locale: &str) -> Result<Arc<SandboxManag
     })
 }
 
+/// 解析 `volumeMounts`（两种 wire 形态）→ 挂载清单。Err 载荷是错误码。
+///
+/// 形态不对一律报错，不再静默丢弃：丢弃会让沙箱创建成功却没挂卷，调用方
+/// 拿到一个"看起来正常"的沙箱，直到在里面找不到数据才发觉。
+fn parse_volume_mounts(
+    mounts: &serde_json::Value,
+) -> Result<Vec<shared_types::sandbox::VolumeMountRequest>, &'static str> {
+    const INVALID: &str = shared_types::error_codes::ERR_E2B_VOLUME_MOUNTS_INVALID;
+    let mut volume_mounts = Vec::new();
+    match mounts {
+        // 官方 REST wire 格式：数组 [{name: "vol-name", path: "/mount/path"}]
+        serde_json::Value::Array(items) => {
+            for item in items {
+                let Some(obj) = item.as_object() else {
+                    return Err(INVALID);
+                };
+                // name / path 必须存在且是字符串：缺字段或类型错都说明调用方
+                // 按错了契约，猜一个默认值只会把错误推后。
+                let (Some(name), Some(path)) = (
+                    obj.get("name").and_then(|v| v.as_str()),
+                    obj.get("path").and_then(|v| v.as_str()),
+                ) else {
+                    return Err(INVALID);
+                };
+                if name.is_empty() || path.is_empty() {
+                    return Err(INVALID);
+                }
+                volume_mounts.push(shared_types::sandbox::VolumeMountRequest {
+                    volume_name: name.to_string(),
+                    mount_path: path.to_string(),
+                });
+            }
+        }
+        // SDK 客户端形态：map {mountPath: volumeName 或 {name: volumeName}}
+        serde_json::Value::Object(map) => {
+            for (mount_path, vol_ref) in map {
+                let volume_name = match vol_ref {
+                    serde_json::Value::String(name) => name.clone(),
+                    serde_json::Value::Object(obj) => obj
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    // 值既不是字符串也不是 {name: ...}：契约不对
+                    _ => return Err(INVALID),
+                };
+                if volume_name.is_empty() || mount_path.is_empty() {
+                    return Err(INVALID);
+                }
+                volume_mounts.push(shared_types::sandbox::VolumeMountRequest {
+                    volume_name,
+                    mount_path: mount_path.clone(),
+                });
+            }
+        }
+        // 字符串/数字/布尔/null：整体形态就不对
+        _ => return Err(INVALID),
+    }
+    Ok(volume_mounts)
+}
+
 pub async fn create_sandbox(
     State(deps): State<SandboxDeps>,
     Extension(key): Extension<SandboxApiKeyRecord>,
@@ -187,43 +248,11 @@ pub async fn create_sandbox(
     }
     let mut volume_mounts = Vec::new();
     if let Some(mounts) = &body.volumeMounts {
-        match mounts {
-            // 官方 REST wire 格式：数组 [{name: "vol-name", path: "/mount/path"}]
-            serde_json::Value::Array(items) => {
-                for item in items {
-                    if let Some(obj) = item.as_object() {
-                        let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or_default();
-                        let path = obj.get("path").and_then(|v| v.as_str()).unwrap_or_default();
-                        if !name.is_empty() && !path.is_empty() {
-                            volume_mounts.push(shared_types::sandbox::VolumeMountRequest {
-                                volume_name: name.to_string(),
-                                mount_path: path.to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-            // SDK 客户端形态：map {mountPath: volumeName 或 {name: volumeName}}
-            serde_json::Value::Object(map) => {
-                for (mount_path, vol_ref) in map {
-                    let volume_name = match vol_ref {
-                        serde_json::Value::String(name) => name.clone(),
-                        serde_json::Value::Object(obj) => obj
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                        _ => continue,
-                    };
-                    if !volume_name.is_empty() {
-                        volume_mounts.push(shared_types::sandbox::VolumeMountRequest {
-                            volume_name,
-                            mount_path: mount_path.clone(),
-                        });
-                    }
-                }
-            }
-            _ => {}
+        match parse_volume_mounts(mounts) {
+            Ok(parsed) => volume_mounts = parsed,
+            // InvalidCode 载荷是 &'static str：错误码本身就是静态常量，
+            // 包装成 String 只会多一次分配（编译期就会被类型系统挡住）。
+            Err(code) => return wire_error(SandboxApiError::InvalidCode(code), locale),
         }
     }
     let idempotency_key = headers
@@ -531,6 +560,122 @@ pub async fn delete_volume(
         Err(error) => {
             let locale = crate::handler::utils::locale::get_locale_from_headers(&headers);
             wire_error(error, locale)
+        }
+    }
+}
+
+#[cfg(test)]
+mod volume_mounts_tests {
+    use super::parse_volume_mounts;
+    use shared_types::error_codes::ERR_E2B_VOLUME_MOUNTS_INVALID;
+
+    fn json(value: serde_json::Value) -> serde_json::Value {
+        value
+    }
+
+    #[test]
+    fn array_wire_form_parses_name_and_path() {
+        let mounts = parse_volume_mounts(&json(serde_json::json!([
+            {"name": "vol-a", "path": "/data"},
+            {"name": "vol-b", "path": "/mnt/b"},
+        ])))
+        .unwrap();
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts[0].volume_name, "vol-a");
+        assert_eq!(mounts[0].mount_path, "/data");
+    }
+
+    #[test]
+    fn sdk_object_form_accepts_string_and_object_refs() {
+        let mounts = parse_volume_mounts(&json(serde_json::json!({
+            "/data": "vol-a",
+            "/mnt/b": {"name": "vol-b"},
+        })))
+        .unwrap();
+        assert_eq!(mounts.len(), 2);
+        assert!(
+            mounts
+                .iter()
+                .any(|m| m.mount_path == "/data" && m.volume_name == "vol-a")
+        );
+        assert!(
+            mounts
+                .iter()
+                .any(|m| m.mount_path == "/mnt/b" && m.volume_name == "vol-b")
+        );
+    }
+
+    #[test]
+    fn absent_mounts_key_is_not_an_error() {
+        // None 由调用方分流（不进本函数）；空数组 = 合法地不挂卷
+        let mounts = parse_volume_mounts(&json(serde_json::json!([]))).unwrap();
+        assert!(mounts.is_empty());
+    }
+
+    #[test]
+    fn array_item_that_is_not_an_object_is_rejected() {
+        let error = parse_volume_mounts(&json(serde_json::json!(["vol-a"]))).unwrap_err();
+        assert_eq!(error, ERR_E2B_VOLUME_MOUNTS_INVALID);
+    }
+
+    #[test]
+    fn array_item_missing_or_non_string_field_is_rejected() {
+        // 缺 name
+        assert_eq!(
+            parse_volume_mounts(&json(serde_json::json!([{"path": "/data"}]))).unwrap_err(),
+            ERR_E2B_VOLUME_MOUNTS_INVALID
+        );
+        // 缺 path
+        assert_eq!(
+            parse_volume_mounts(&json(serde_json::json!([{"name": "vol-a"}]))).unwrap_err(),
+            ERR_E2B_VOLUME_MOUNTS_INVALID
+        );
+        // path 是数字（类型错，不是空串）
+        assert_eq!(
+            parse_volume_mounts(&json(serde_json::json!([{"name": "vol-a", "path": 7}])))
+                .unwrap_err(),
+            ERR_E2B_VOLUME_MOUNTS_INVALID
+        );
+    }
+
+    #[test]
+    fn empty_name_or_path_is_rejected() {
+        assert_eq!(
+            parse_volume_mounts(&json(serde_json::json!([{"name": "", "path": "/data"}])))
+                .unwrap_err(),
+            ERR_E2B_VOLUME_MOUNTS_INVALID
+        );
+        assert_eq!(
+            parse_volume_mounts(&json(serde_json::json!([{"name": "vol-a", "path": ""}])))
+                .unwrap_err(),
+            ERR_E2B_VOLUME_MOUNTS_INVALID
+        );
+    }
+
+    #[test]
+    fn object_form_value_of_wrong_type_is_rejected() {
+        // 值既不是字符串也不是 {name: ...}
+        let error = parse_volume_mounts(&json(serde_json::json!({"/data": 42}))).unwrap_err();
+        assert_eq!(error, ERR_E2B_VOLUME_MOUNTS_INVALID);
+        // {name: 7} 同样拿不到字符串
+        let error =
+            parse_volume_mounts(&json(serde_json::json!({"/data": {"name": 7}}))).unwrap_err();
+        assert_eq!(error, ERR_E2B_VOLUME_MOUNTS_INVALID);
+    }
+
+    #[test]
+    fn scalar_top_level_is_rejected() {
+        for value in [
+            serde_json::json!("vol-a"),
+            serde_json::json!(7),
+            serde_json::json!(true),
+            serde_json::json!(null),
+        ] {
+            assert_eq!(
+                parse_volume_mounts(&json(value)).unwrap_err(),
+                ERR_E2B_VOLUME_MOUNTS_INVALID,
+                "标量形态必须报错而不是被静默忽略"
+            );
         }
     }
 }

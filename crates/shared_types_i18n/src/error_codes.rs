@@ -71,6 +71,8 @@ pub const ERR_E2B_NOT_READY: &str = "ERR_E2B_NOT_READY";
 pub const ERR_E2B_RENEW_REQUIRES_READY: &str = "ERR_E2B_RENEW_REQUIRES_READY";
 pub const ERR_E2B_VOLUME_NAME_INVALID: &str = "ERR_E2B_VOLUME_NAME_INVALID";
 pub const ERR_E2B_MOUNT_PATH_INVALID: &str = "ERR_E2B_MOUNT_PATH_INVALID";
+/// volumeMounts 整体形态不对（非数组/对象、条目缺字段、字段类型错）
+pub const ERR_E2B_VOLUME_MOUNTS_INVALID: &str = "ERR_E2B_VOLUME_MOUNTS_INVALID";
 pub const ERR_E2B_TIMEOUT_INVALID: &str = "ERR_E2B_TIMEOUT_INVALID";
 pub const ERR_E2B_TIMEOUT_EXCEEDS_CAP: &str = "ERR_E2B_TIMEOUT_EXCEEDS_CAP";
 pub const ERR_E2B_TEMPLATE_UNAVAILABLE: &str = "ERR_E2B_TEMPLATE_UNAVAILABLE";
@@ -368,6 +370,7 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_E2B_RENEW_REQUIRES_READY => "error.e2b_renew_requires_ready",
         ERR_E2B_VOLUME_NAME_INVALID => "error.e2b_volume_name_invalid",
         ERR_E2B_MOUNT_PATH_INVALID => "error.e2b_mount_path_invalid",
+        ERR_E2B_VOLUME_MOUNTS_INVALID => "error.e2b_volume_mounts_invalid",
         ERR_E2B_TIMEOUT_INVALID => "error.e2b_timeout_invalid",
         ERR_E2B_TIMEOUT_EXCEEDS_CAP => "error.e2b_timeout_exceeds_cap",
         ERR_E2B_TEMPLATE_UNAVAILABLE => "error.e2b_template_unavailable",
@@ -658,6 +661,7 @@ mod tests {
             ERR_E2B_RENEW_REQUIRES_READY,
             ERR_E2B_VOLUME_NAME_INVALID,
             ERR_E2B_MOUNT_PATH_INVALID,
+            ERR_E2B_VOLUME_MOUNTS_INVALID,
             ERR_E2B_TIMEOUT_INVALID,
             ERR_E2B_TIMEOUT_EXCEEDS_CAP,
             ERR_E2B_TEMPLATE_UNAVAILABLE,

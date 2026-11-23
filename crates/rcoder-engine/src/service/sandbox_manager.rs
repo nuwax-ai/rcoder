@@ -1339,9 +1339,19 @@ impl SandboxManager {
                 }
             };
             for template in templates {
+                // 数据库错误与"模板没配 spec"是两件事：前者会让这个模板本轮
+                // 静默不补池（水位悄悄补不满，只能靠事后发现），必须单独 warn。
                 let spec = match self.store.get_template_spec(&template.template_id).await {
                     Ok(Some(spec)) => spec,
-                    _ => continue,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(
+                            template = %template.template_id,
+                            error = %error,
+                            "warm pool: 模板 spec 获取失败"
+                        );
+                        continue;
+                    }
                 };
                 if spec.warm_target <= 0 {
                     continue;
