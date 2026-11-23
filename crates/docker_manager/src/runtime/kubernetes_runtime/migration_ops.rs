@@ -54,20 +54,47 @@ pub(crate) struct MigrationJobPlan {
 
 impl MigrationJobPlan {
     /// rclone 参数串（Job 容器内 exec 的 argv tail; 单测断言点）。
+    ///
+    /// 每个来自数据的参数都单引号包裹：脚本是 `bash -c` 收字符串，
+    /// `set -f` 只防 glob 展开、不防分词——`src_subpath` 里进一个空白或
+    /// shell 元字符就会把一条参数裂成两条（或变成重定向）。引用后
+    /// 参数的边界只由引号决定，与内容无关。
     pub fn rclone_args(&self) -> String {
-        let mut args = format!(
-            "sync /src/{} /dst --links --metadata --transfers 8 --checkers 8",
-            self.src_subpath
-        );
+        let source = shell_quote(&format!("/src/{}", self.src_subpath));
+        let mut args = format!("sync {source} /dst --links --metadata --transfers 8 --checkers 8");
         if let Some(limit) = &self.bwlimit {
-            args.push_str(&format!(" --bwlimit {limit}"));
+            args.push_str(&format!(" --bwlimit {}", shell_quote(limit)));
         }
         for exclude in &self.excludes {
-            args.push_str(&format!(" --exclude {exclude}"));
+            args.push_str(&format!(" --exclude {}", shell_quote(exclude)));
         }
         args.push_str(" --stats-one-line --stats 300s");
         args
     }
+}
+
+/// 单引号 shell 字面量；内嵌单引号用 `'\''` 闭合-转义-重开。
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// src 子路径（= user_id）白名单校验，规则取全仓单一事实源
+/// [`shared_types::validate_identifier`]（file-server 解析 computer 路径时
+/// 用的就是它，合法用户不会被这里新拦一道）。
+///
+/// 为什么必须拦：这个值被拼进 `/src/<subpath>` 当 rclone 的源路径段，
+/// 放进 `/`、`..` 或空白就是越出共享卷读取（rclone 会老老实实跟着走）。
+/// PVC 名那边对 identifier 做的是 **sanitize**（非法字符替成 `-`）——
+/// 洗干净名字的同时原值仍会进路径，sanitize 不等于校验。
+fn validate_src_subpath(identifier: &str) -> ContainerRuntimeResult<()> {
+    if shared_types::validate_identifier(identifier, "userId").is_err() {
+        return Err(ContainerRuntimeError::ConfigurationError(format!(
+            "migration source identifier '{identifier}' is not a valid userId: \
+             expected 1-64 characters of letters, digits, '_' or '-' \
+             (it is joined under the shared volume as a path segment)"
+        )));
+    }
+    Ok(())
 }
 
 /// 解析迁移 Job 镜像（纯函数, 供单测）→ `(镜像, 是否需容器内下载 rclone)`。
@@ -248,6 +275,9 @@ impl KubernetesRuntime {
         src_pvc: &str,
     ) -> ContainerRuntimeResult<()> {
         use crate::runtime::k8s_pvc::K8sPvcOps;
+        // 先校验再动手：src 子路径要拼进 rclone 源路径，非法值必须在建 Job
+        // 之前就拒掉（否则 Job 建起来也只是同步一个越界路径或直接失败）。
+        validate_src_subpath(identifier)?;
         let dst_pvc = self.workspace_pvc_name(identifier, service_type)?;
         // dst 必须存在（phase-a 已 ensure）且未挂载（调用方已防呆, 这里复核）
         if self
@@ -382,17 +412,56 @@ mod tests {
     #[test]
     fn full_mode_args_carry_bwlimit_and_excludes() {
         let args = plan(WorkspaceSyncMode::Full).rclone_args();
-        assert!(args.starts_with("sync /src/u_1 /dst --links --metadata"));
-        assert!(args.contains("--bwlimit 150M"));
-        assert!(args.contains("--exclude node_modules/"));
-        assert!(args.contains("--exclude core.[0-9]*"));
+        assert!(args.starts_with("sync '/src/u_1' /dst --links --metadata"));
+        assert!(args.contains("--bwlimit '150M'"));
+        assert!(args.contains("--exclude 'node_modules/'"));
+        assert!(args.contains("--exclude 'core.[0-9]*'"));
     }
 
     #[test]
     fn incremental_mode_omits_bwlimit() {
         let args = plan(WorkspaceSyncMode::Incremental).rclone_args();
         assert!(!args.contains("--bwlimit"));
-        assert!(args.contains("--exclude dist/"));
+        assert!(args.contains("--exclude 'dist/'"));
+    }
+
+    #[test]
+    fn every_data_derived_argument_is_shell_quoted() {
+        // 引用后参数边界只由引号决定：subpath 里的空白/元字符不会被
+        // bash 分词或当成重定向。set -f 只防 glob，不防这个。
+        let mut p = plan(WorkspaceSyncMode::Full);
+        p.src_subpath = "u 1;rm -rf /".to_string();
+        p.bwlimit = Some("150M".to_string());
+        p.excludes = vec!["a b".to_string(), "it's".to_string()];
+        let args = p.rclone_args();
+        assert!(args.starts_with("sync '/src/u 1;rm -rf /' /dst"), "{args}");
+        assert!(args.contains("--exclude 'a b'"), "{args}");
+        // 内嵌单引号必须闭合-转义-重开，不能直接把引号断掉
+        assert!(args.contains("--exclude 'it'\\''s'"), "{args}");
+    }
+
+    #[test]
+    fn src_subpath_whitelist_accepts_real_user_ids() {
+        for id in ["u_1", "user-42", "ABC123", "a", "migrate-rbd-test-user-1"] {
+            assert!(validate_src_subpath(id).is_ok(), "{id} 应通过");
+        }
+    }
+
+    #[test]
+    fn src_subpath_whitelist_rejects_path_and_shell_escape() {
+        for id in [
+            "", " ", "../etc", "a/b", "a b", "u;id", "u$(id)", "u`id`", "u|cat", "u*", "..", ".",
+            "u\n", "用户",
+        ] {
+            let error = validate_src_subpath(id).unwrap_err().to_string();
+            assert!(
+                error.contains("not a valid userId"),
+                "'{id}' 必须以 userId 白名单为由拒绝: {error}"
+            );
+        }
+        // 超长同样拒（规则与 file-server 同一份：1-64）
+        let long = "u".repeat(65);
+        assert!(validate_src_subpath(&long).is_err());
     }
 
     #[test]
