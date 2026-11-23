@@ -104,8 +104,8 @@ pub struct StateAwareNotifier<R: SessionRegistry> {
     /// 通过 trait 引用操作注册表，不直接依赖 AGENT_REGISTRY
     registry: Arc<R>,
     /// 每会话当前轮次的计时聚合指标（纯观测，不参与任何业务判断）。
-    /// key 为 (project, session, request)：结束事件按同一 key 移除，
-    /// 不会取走同 session 下一轮（新 request）的指标。
+    /// key 为 [`RoundKey`] = (project, session)——**不含 request_id**，原因见
+    /// 其类型定义。结束事件按同一 key 移除，跨轮污染靠时间界防。
     /// 仅单 key get_mut/insert/remove 短临界区，无嵌套锁、无跨锁调用。
     round_metrics: DashMap<RoundKey, RoundMetrics>,
     /// 慢轮判定阈值，超过则 [ROUND] 汇总行升级为 WARN

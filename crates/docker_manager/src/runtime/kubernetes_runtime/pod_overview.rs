@@ -346,14 +346,22 @@ fn pod_health_from_status(pod: &Pod) -> (bool, PodHealth) {
 }
 
 /// 主容器名（从 **spec** 选，与状态列表解耦）：`agent` > `app` > `rcoder` > 第一个。
+///
+/// 状态侧（`main_container_status` 的口径）与资源侧（`main_container_resources`）
+/// 都走这一个函数：优先级各写一遍就会漂移，届时面板上的"主容器"在两处对不上。
 fn main_container_name_from_spec(pod: &Pod) -> Option<String> {
-    let spec = pod.spec.as_ref()?;
-    for name in ["agent", "app", "rcoder"] {
-        if let Some(c) = spec.containers.iter().find(|c| c.name == name) {
-            return Some(c.name.clone());
-        }
-    }
-    spec.containers.first().map(|c| c.name.clone())
+    main_container_name(pod.spec.as_ref()?).map(str::to_string)
+}
+
+/// 主容器选取优先级（spec 侧唯一实现；按序第一个命中的即主容器）。
+const MAIN_CONTAINER_PREFERENCE: [&str; 3] = ["agent", "app", "rcoder"];
+
+/// 主容器名：按 [`MAIN_CONTAINER_PREFERENCE`] 取第一个存在的，都没有则取第一个容器。
+fn main_container_name(spec: &k8s_openapi::api::core::v1::PodSpec) -> Option<&str> {
+    MAIN_CONTAINER_PREFERENCE
+        .into_iter()
+        .find(|name| spec.containers.iter().any(|c| c.name == *name))
+        .or_else(|| spec.containers.first().map(|c| c.name.as_str()))
 }
 
 /// 主容器规格 + 逐容器规格 + 卷。
@@ -483,15 +491,12 @@ struct ContainerResourcesSpecLocal {
     ephemeral_storage_limit: Option<i64>,
 }
 
-/// 主容器选取（与 main_container_status 同一顺序）。
+/// 主容器选取（与状态侧同一函数，不再各写一遍优先级）。
 fn main_container_resources<'a>(
     containers: &'a [ContainerResourcesSpecLocal],
     spec: &'a k8s_openapi::api::core::v1::PodSpec,
 ) -> Option<&'a ContainerResourcesSpecLocal> {
-    let main_name = ["agent", "app", "rcoder"]
-        .into_iter()
-        .find(|name| spec.containers.iter().any(|c| c.name == *name))
-        .or_else(|| spec.containers.first().map(|c| c.name.as_str()))?;
+    let main_name = main_container_name(spec)?;
     containers.iter().find(|c| c.name == main_name)
 }
 

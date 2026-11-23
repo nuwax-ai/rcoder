@@ -140,8 +140,10 @@ pub async fn status(
             shared_types::WorkspaceMigrationState::Migrated => "migrated",
         },
         "routing": match migration_state {
+            // 穷尽匹配：WorkspaceMigrationState 只有两态，写 `_ =>` 会让
+            // 第三态被静默当成共享卷（评审"规范 1"）。
             shared_types::WorkspaceMigrationState::Migrated => "rbd-forward",
-            _ => "shared-volume",
+            shared_types::WorkspaceMigrationState::NotMigrated => "shared-volume",
         },
     });
     Json(body).into_response()

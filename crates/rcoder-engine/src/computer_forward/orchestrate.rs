@@ -433,53 +433,71 @@ pub async fn rollback(
         .await
         .map_err(|e| wrap("agent_present_check", e))?;
     let restore = AgentRestore::decide(agent_was_present, agent_present_after_flip);
+    // 与 cutover 同构（评审"规范 2"：此前 rollback 缺 resource_limits 时静默
+    // 不重启也不记步骤，且 ReplaceWoken 的停止动作被 limits 条件绑住）：
+    //   KeepStopped  → 不需要重建，直接收束（limits 与此无关）
+    //   ReplaceWoken → **无条件先停**：停止不需要 limits。缺 limits 时不停
+    //     = 标记已翻回 NotMigrated 而 agent 还在 RBD 上跑，流量去共享卷
+    //     （双卷读写分裂，块设备还有双挂 ext4 损坏风险）
+    //   Restart/ReplaceWoken → 只有重建才需要 limits，缺则 fail-fast
+    let restart_step = match restore {
+        AgentRestore::KeepStopped => {
+            drop(migration_lock);
+            steps.push("agent left stopped (not running before rollback)".to_string());
+            return Ok(MigrationOutcome {
+                user_id: user_id.to_string(),
+                action: "rollback",
+                migration_state: WorkspaceMigrationState::NotMigrated,
+                steps,
+            });
+        }
+        AgentRestore::ReplaceWoken => {
+            state
+                .runtime()
+                .stop_container_by_identifier(user_id, &service_type)
+                .await
+                .map_err(|e| wrap("stop_agent_woken_during_rollback", e))?;
+            "agent woken during rollback replaced on shared volume"
+        }
+        AgentRestore::Restart => "agent restarted on shared volume",
+    };
+    // 与 cutover 对称: 恢复 agent 的切换前形态(此时 NotMigrated → 共享卷形态)。
+    // ensure 前释放锁(不可重入)。
+    drop(migration_lock);
     let resource_limits = state
         .config
         .kubernetes_config
         .as_ref()
         .and_then(|kc| kc.get_service_config(&service_type))
         .map(|sc| sc.resource_limits.clone());
-    if restore == AgentRestore::ReplaceWoken && resource_limits.is_some() {
-        // 仅在随后能重建时才停（缺 limits 时停了起不来，不如留着）。
-        state
-            .runtime()
-            .stop_container_by_identifier(user_id, &service_type)
-            .await
-            .map_err(|e| wrap("stop_agent_woken_during_rollback", e))?;
+    if resource_limits.is_none() {
+        // 与 cutover 同口径 fail-fast——None 会回落 DEFAULT_AGENT_* 常量,
+        // 同一用户两条创建路径 limits 分裂。标记已翻回 NotMigrated, 重试
+        // rollback 是 no-op 成功, 不会把用户卡住。
+        return Err(ContainerRuntimeError::Conflict(
+            "kubernetes_config missing resource_limits for computer-agent-runner; \
+             refusing to restart agent with fallback limits"
+                .to_string(),
+        ));
     }
-    // 与 cutover 对称: 恢复 agent 的切换前形态(此时 NotMigrated → 共享卷形态)。
-    // ensure 前释放锁(不可重入)。
-    drop(migration_lock);
-    if restore == AgentRestore::KeepStopped {
-        steps.push("agent left stopped (not running before rollback)".to_string());
-    } else if let Some(limits) = resource_limits {
-        let restart_step = if restore == AgentRestore::Restart {
-            "agent restarted on shared volume"
-        } else {
-            "agent woken during rollback replaced on shared volume"
-        };
-        let options = ContainerCreateOptions {
-            user_id: user_id.to_string(),
-            project_id: user_id.to_string(),
-            resource_limits: Some(limits),
-            pod_id: None,
-            isolation_type: None,
-            tenant_id: None,
-            space_id: None,
-            service_type,
-        };
-        match ComputerContainerManager::ensure_container_for_user_with_type(
-            &options,
-            state.runtime(),
-        )
+    let options = ContainerCreateOptions {
+        user_id: user_id.to_string(),
+        project_id: user_id.to_string(),
+        resource_limits,
+        pod_id: None,
+        isolation_type: None,
+        tenant_id: None,
+        space_id: None,
+        service_type,
+    };
+    match ComputerContainerManager::ensure_container_for_user_with_type(&options, state.runtime())
         .await
-        {
-            Ok(_) => steps.push(restart_step.to_string()),
-            Err(e) => {
-                // 重建失败不阻断 rollback(标记已翻, 下次请求自会 ensure 重建)
-                tracing::warn!(user_id, error = %e, "[MIGRATION] rollback ensure agent failed");
-                steps.push("agent restart deferred (will rebuild on next request)".to_string());
-            }
+    {
+        Ok(_) => steps.push(restart_step.to_string()),
+        Err(e) => {
+            // 重建失败不阻断 rollback(标记已翻, 下次请求自会 ensure 重建)
+            tracing::warn!(user_id, error = %e, "[MIGRATION] rollback ensure agent failed");
+            steps.push("agent restart deferred (will rebuild on next request)".to_string());
         }
     }
     Ok(MigrationOutcome {

@@ -41,6 +41,11 @@ fn resolve(path: &Path) -> AppResult<&'static Mutex<()>> {
     let mut map = registry
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // 条目**故意**永不回收（Box::leak）：回收是安全问题而不是内存问题——
+    // 某个路径的条目被移除时，后来的调用方会拿到一个**新的** Mutex，两个
+    // "持锁"线程实际互斥不了，git 写的串行化保证当场失效。内存量级 =
+    // 进程生命周期内出现过的不同 canonical 路径数 × 一个空 Mutex，
+    // 由 workspace 数量天然有界。宁可泄漏也不要失去互斥。
     let lock: &'static Mutex<()> = map
         .entry(canonical)
         .or_insert_with(|| Box::leak(Box::new(Mutex::new(()))));
