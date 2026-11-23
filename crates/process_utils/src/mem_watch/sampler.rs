@@ -19,6 +19,36 @@ use super::{cgroup, kill, registry, sys};
 /// LSM 拒绝信号后的全局降级标志（kill EPERM 时置位）。
 static DISABLED: AtomicBool = AtomicBool::new(false);
 
+/// 一次性信号的节流状态。每类信号各自一个实例——共用时间戳会互相压制：
+/// "无可杀对象"的日志不该把紧随其后的真实 `evict` 推迟一个冷却期
+/// （那是行为变化，不是日志变化）。
+#[derive(Debug, Default)]
+struct Throttle(Option<Instant>);
+
+impl Throttle {
+    /// 冷却期已过（或从未发过）才返回 `true`，并记下这一次的时间。
+    fn due(&mut self, cooldown: Duration) -> bool {
+        if self.0.is_some_and(|at| at.elapsed() < cooldown) {
+            return false;
+        }
+        self.0 = Some(Instant::now());
+        true
+    }
+}
+
+/// 采样循环的跨 tick 状态。
+#[derive(Debug, Default)]
+struct Sampler {
+    /// 上一次处置动作（`would_evict` / `evict` 共用：二者都是"处置"）。
+    action: Throttle,
+    /// "超阈值但无可杀对象"。
+    no_candidate: Throttle,
+    /// "超阈值但没有任何已注册会话"。
+    no_roots: Throttle,
+    /// 口径/用量异常只报一次：否则每 tick 一条，日志会被同一条原因淹没。
+    scope_warned: bool,
+}
+
 /// 启动单例采样任务。`registry` 需已通过 [`registry::install`] 安装。
 pub fn start(config: Config) -> JoinHandle<()> {
     tokio::spawn(run(config))
@@ -34,15 +64,10 @@ pub async fn run(config: Config) {
     };
 
     let mut switch = Switch::default();
-    let mut last_action: Option<Instant> = None;
-    // "超阈值但无可杀对象"的节流时间戳。独立于 last_action：更新它会顺带
-    // 把紧随其后的真实 evict 推迟一个冷却期（那是行为变化，不是日志变化）。
-    let mut last_no_candidate: Option<Instant> = None;
+    let mut sampler = Sampler::default();
     let mut last_mode = Mode::Off;
     // cgroup 归属启动时解析一次（进程生命周期内不变）。
     let probe = cgroup::CgroupProbe::resolve();
-    // 口径异常只报一次：否则每 tick 一条，日志会被同一条原因淹没。
-    let mut scope_warned = false;
 
     tracing::info!(
         event = "mem_watch.started",
@@ -74,15 +99,7 @@ pub async fn run(config: Config) {
             last_mode = cfg.mode;
         }
         if cfg.mode != Mode::Off {
-            step(
-                &reg,
-                &cfg,
-                &probe,
-                &mut last_action,
-                &mut last_no_candidate,
-                &mut scope_warned,
-            )
-            .await;
+            step(&reg, &cfg, &probe, &mut sampler).await;
         }
         // 用 sleep 而不是 interval：开关文件可以改 interval_ms 并立刻生效。
         tokio::time::sleep(cfg.interval).await;
@@ -148,9 +165,7 @@ async fn step(
     reg: &Arc<Registry>,
     cfg: &Config,
     probe: &cgroup::CgroupProbe,
-    last_action: &mut Option<Instant>,
-    last_no_candidate: &mut Option<Instant>,
-    scope_warned: &mut bool,
+    sampler: &mut Sampler,
 ) {
     // 每轮重新读本组限额：限额可以在运行中调整，启动快照不能作为归属证明
     let group_max = sys::read_memory_max(probe);
@@ -159,15 +174,15 @@ async fn step(
         // env 覆盖——看门狗无法判断阈值，保持空闲（安全方向）。
         return;
     };
-    if !scope_ok(probe, limit, group_max, scope_warned) {
+    if !scope_ok(probe, limit, group_max, &mut sampler.scope_warned) {
         return;
     }
 
     // 用量读不到就放弃本轮：不能退化成 0（那会让保护静默失效），
     // 也不能拿上次的旧值继续判断。
     let Some(current) = sys::read_memory_current(probe) else {
-        if !*scope_warned {
-            *scope_warned = true;
+        if !sampler.scope_warned {
+            sampler.scope_warned = true;
             tracing::warn!(
                 event = "mem_watch.usage_unreadable",
                 path = %probe.current_path().display(),
@@ -182,6 +197,18 @@ async fn step(
 
     let roots = reg.all();
     if roots.is_empty() {
+        // 超阈值但没有任何已注册会话——会话已结束、后台负载还在（§21 盲区的
+        // 常见形态）。看门狗对此无能为力，但必须留痕：否则这种状态与"看门狗
+        // 没开 / 从未超阈值"在日志上无法区分，而 §9 承诺的超阈值信号会缺失。
+        // 同样按 cooldown 节流。
+        if working_set >= threshold && sampler.no_roots.due(cfg.cooldown) {
+            tracing::info!(
+                event = "mem_watch.no_roots",
+                working_set_mb = working_set >> 20,
+                limit_mb = limit >> 20,
+                hint = "working set over threshold but no registered agent session; nothing is evictable",
+            );
+        }
         return;
     }
     let bootstrapping = roots.iter().any(|root| !root.is_sealed());
@@ -236,10 +263,9 @@ async fn step(
         // 或都低于 min_rss），只剩内核 OOM 兜底。灰度期要能看见这个信号，
         // 故 info 而非 debug；按 cooldown 节流（与 would_evict 同款），
         // 否则超阈值期间每 tick 一条会把日志淹掉。
-        if last_no_candidate.is_some_and(|at| at.elapsed() < cfg.cooldown) {
+        if !sampler.no_candidate.due(cfg.cooldown) {
             return;
         }
-        *last_no_candidate = Some(Instant::now());
         tracing::info!(
             event = "mem_watch.no_candidate",
             working_set_mb = working_set >> 20,
@@ -251,10 +277,9 @@ async fn step(
 
     if cfg.mode == Mode::DryRun {
         // dry-run 也按冷却节流：否则超阈值期间每 tick 一条，一周的日志会淹没一切。
-        if last_action.is_some_and(|at| at.elapsed() < cfg.cooldown) {
+        if !sampler.action.due(cfg.cooldown) {
             return;
         }
-        *last_action = Some(Instant::now());
         tracing::info!(
             event = "mem_watch.would_evict",
             pid = victim.pid,
@@ -266,10 +291,9 @@ async fn step(
         return;
     }
 
-    if last_action.is_some_and(|at| at.elapsed() < cfg.cooldown) {
+    if !sampler.action.due(cfg.cooldown) {
         return;
     }
-    *last_action = Some(Instant::now());
 
     tracing::warn!(
         event = "mem_watch.evict",
@@ -565,5 +589,38 @@ mod tests {
         let p = probe(None, None);
         let mut warned = false;
         assert!(!scope_ok(&p, 4 << 30, None, &mut warned));
+    }
+
+    /// 节流：首次放行，冷却期内压住，冷却期为 0 时不压制。
+    #[test]
+    fn throttle_fires_once_per_cooldown() {
+        let mut throttle = Throttle::default();
+        assert!(throttle.due(Duration::from_secs(3600)), "首次必须放行");
+        assert!(
+            !throttle.due(Duration::from_secs(3600)),
+            "冷却期内必须压住——否则超阈值期间每 tick 一条"
+        );
+
+        let mut unthrottled = Throttle::default();
+        assert!(unthrottled.due(Duration::ZERO));
+        assert!(unthrottled.due(Duration::ZERO), "冷却期为 0 不应压制");
+    }
+
+    /// 各信号的节流必须互相独立：一条信号刚发过，不得压制另一条——
+    /// "无可杀对象"的日志如果把真实 evict 推迟一个冷却期，那是行为变化。
+    #[test]
+    fn throttles_are_independent_per_signal() {
+        let mut sampler = Sampler::default();
+        let cooldown = Duration::from_secs(3600);
+        assert!(sampler.no_candidate.due(cooldown));
+        assert!(
+            sampler.no_roots.due(cooldown),
+            "no_roots 不受 no_candidate 影响"
+        );
+        assert!(
+            sampler.action.due(cooldown),
+            "action 不受 no_candidate 影响"
+        );
+        assert!(!sampler.no_candidate.due(cooldown), "自己仍在冷却期内");
     }
 }

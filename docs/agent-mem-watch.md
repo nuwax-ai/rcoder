@@ -218,7 +218,8 @@ kubectl -n nuwax-k8s-test patch configmap agent-runtime-flags --type merge \
 | `mem_watch.bootstrap_timeout` | `bootstrap_cap_ms` 到期强制封窗（钩子漏挂时的兜底） |
 | `mem_watch.would_evict` | dry-run 候选 |
 | `mem_watch.evict` | 实际执行（pid/rss/comm/project/working_set） |
-| `mem_watch.no_candidate` | **超阈值但无可杀对象**（全被保护或都太小）——没有这条就无法判断"看门狗是否在工作" |
+| `mem_watch.no_candidate` | **超阈值但无可杀对象**（全被保护或都太小）——没有这条就无法判断"看门狗是否在工作"。按 `cooldown_ms` 节流，不能当计数器用 |
+| `mem_watch.no_roots` | **超阈值但没有任何已注册会话**——会话已结束、后台负载还在（§21 盲区的常见形态）。看门狗对此无能为力，只能留痕；同样按 `cooldown_ms` 节流 |
 | `mem_watch.disabled` | EPERM / 无限制 / 关闭原因 |
 
 Phase 2（可选）：`/computer/status` 只读暴露 `mode / evicted_total`。
