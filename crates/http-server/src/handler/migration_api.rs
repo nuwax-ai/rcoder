@@ -452,9 +452,10 @@ mod user_allowed_tests {
 #[cfg(test)]
 mod guard_route_tests {
     use super::routes;
-    use crate::handler::userapp_agent_target::test_support::Fixture;
+    use crate::handler::userapp_agent_target::test_support::ControlledRuntime;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
+    use std::sync::{Arc, Mutex, atomic::AtomicUsize};
     use tower::ServiceExt as _;
 
     const CHILD_CASE: &str = "RCODER_MIGRATION_GUARD_TEST_CASE";
@@ -467,6 +468,76 @@ mod guard_route_tests {
         ("POST", "/api/migration/{u}/cutover"),
         ("POST", "/api/migration/{u}/rollback"),
     ];
+
+    /// 够用的最小 [`AppState`]：守卫在任何状态被用到之前就把请求拒了；名单内的请求在
+    /// 非 K8s 构建里停在"需要 Kubernetes 运行时"。
+    ///
+    /// 不用 `test_support::Fixture`——它会绑定一个固定端口，全量并行时别的用例正占着
+    /// 这个端口，本用例的子进程里 `AddrInUse` 直接崩。
+    async fn bare_state() -> (tempfile::TempDir, Arc<crate::app_state::AppState>) {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            rcoder_storage::userapp_lifecycle::TursoUserAppStore::open_exclusive(
+                &root.path().join("control.db"),
+            )
+            .await
+            .unwrap(),
+        );
+        let runtime: Arc<dyn container_runtime_api::ContainerRuntime> =
+            Arc::new(ControlledRuntime {
+                builder: Mutex::new(None),
+                lookups: Mutex::new(vec![]),
+                writes: AtomicUsize::new(0),
+            });
+        let activity = Arc::new(app_manager::AppActivityRegistry::new(
+            std::time::Duration::from_secs(300),
+        ));
+        let app_service = Arc::new(
+            app_manager::service::AppService::new(
+                app_manager::config::AppManagerConfig {
+                    access_mode: app_manager::config::AppAccessMode::Docker,
+                    ..Default::default()
+                },
+                runtime.clone(),
+                activity.clone(),
+                None,
+                store.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+        let projects = Arc::new(crate::storage::ProjectStoreBackend::Memory(Arc::new(
+            crate::storage::ProjectAdapter::new("guard-test".into(), "cluster.local".into()),
+        )));
+        let (pod_created_tx, _) = tokio::sync::broadcast::channel(8);
+        let state = Arc::new(crate::app_state::AppState {
+            userapp_store: store.clone(),
+            userapp_store_control: store,
+            userapp_op_flight: Arc::new(Default::default()),
+            userapp_recovery_handle: Arc::new(Mutex::new(None)),
+            config: crate::config::AppConfig::default(),
+            projects,
+            pingora_service: None,
+            userapp_error_page: None,
+            grpc_pool: Arc::new(crate::grpc::GrpcChannelPool::new()),
+            session_stream_registry: Arc::new(crate::grpc::SessionStreamRegistry::new()),
+            api_key_config: Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::config::ApiKeyAuthConfig::default(),
+            )),
+            pod_creating: Arc::new(dashmap::DashMap::new()),
+            pod_created_tx: Arc::new(pod_created_tx),
+            container_prefix_rcoder: "guard-test-web".into(),
+            container_prefix_computer: "guard-test-computer".into(),
+            runtime,
+            agent_download_manager: Arc::new(
+                agent_provisioning::AgentDownloadManager::new(root.path()).unwrap(),
+            ),
+            app_service,
+            activity,
+            cluster_domain: "cluster.local".into(),
+        });
+        (root, state)
+    }
 
     /// 对五个端点各发一次请求，返回状态码（按 `ENDPOINTS` 的顺序）。
     async fn statuses(router: &axum::Router, user: &str) -> Vec<StatusCode> {
@@ -522,8 +593,8 @@ mod guard_route_tests {
             "子进程必须带着本场景的白名单启动（名单在首次调用时读取）"
         );
 
-        let fixture = Fixture::new().await;
-        let router = routes().with_state(fixture.state.clone());
+        let (_root, state) = bare_state().await;
+        let router = routes().with_state(state);
         let forbidden = StatusCode::FORBIDDEN;
         let bad_request = StatusCode::BAD_REQUEST;
 
