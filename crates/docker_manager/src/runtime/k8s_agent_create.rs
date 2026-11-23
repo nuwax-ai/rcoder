@@ -1025,14 +1025,17 @@ fn rv_advanced_past(current: Option<&str>, precondition: &str) -> bool {
 
 /// 标记结果长期未知时，门禁的最长持有时间。
 ///
-/// 为什么必须有上限：门禁挡住的是**该用户的写**（503）。PVC 读持续失败
-/// （API server 抖动 / 权限突变）时无限持有 = 用户无限期不能写，而这是
-/// 一个"读不到状态"的观测问题，不是必须堵住写的正确性理由。
+/// 未知态循环每轮重读 PVC 并做 RV 栅栏，读恢复后第一轮好读就会收敛——所以
+/// 读失败期间持门禁并不额外伤害用户：转发层判不出卷，本来也 503。真正需要
+/// 上限的是循环**始终走不到出口**的情形（读得到、但栅栏 PATCH 一直被拒，
+/// 如 RBAC 漂移）：否则门禁无限期挡住该用户的写，直到进程重启。
 ///
-/// 到期即释放门禁并返回可重试的 `Conflict`——与"对象已删除 / 已换代 /
-/// RV 已越过前提"这三条未知但可证安全的路径同一收束形状。绝不在超时后
-/// 猜一个结果放行：那要么把未落地的标记当成成功（数据回旧卷），要么把
-/// 已落地的当成失败（重复初始化）。
+/// 到期释放门禁并返回 `ConnectionError`（结果未知、可重试）。**这与本函数
+/// 另外三条"未知但可证安全"的出口不同类**：那三条（对象已删除 / 已换代 /
+/// RV 已越过前提）证明了在途写已被淘汰；这里没有证明，释放是基于时间的
+/// 判断——API server 对单个请求有分钟级超时，在途 PATCH 不可能拖到一个
+/// 数量级更大的时限之后才落地。不猜结果：标记是什么样就保持什么样，下一次
+/// ensure 在自己的门禁内重新判定（未落地 → 首建续接分支重放 Migrated）。
 const MARKER_UNKNOWN_MAX_HOLD: std::time::Duration = std::time::Duration::from_secs(300);
 
 async fn marker_completer(
@@ -1121,6 +1124,24 @@ async fn marker_completer(
                 let mut backoff = std::time::Duration::from_secs(1);
                 let held_since = std::time::Instant::now();
                 loop {
+                    // 总时限检查必须在循环**顶部**：循环体里有 `continue`
+                    // （PVC 无 resourceVersion 的分支），放在末尾会被它绕过。
+                    // 错误类型必须是 ConnectionError：Conflict 在本仓的语义是
+                    // "确定性拒绝、远端无在途"（retryable=false），而这里是
+                    // "结果未知、稍后重试"——与下面两条 in-flight 出口同类。
+                    if held_since.elapsed() >= marker_unknown_max_hold {
+                        tracing::error!(
+                            user_id = %identifier_for_log,
+                            pvc_uid = %pvc_uid,
+                            max_hold_secs = marker_unknown_max_hold.as_secs(),
+                            "[K8S] marker outcome unresolved after max hold; releasing migration gate (outcome unknown, ensure must retry)"
+                        );
+                        cache.write().await.remove(&cache_key);
+                        return Err(ContainerRuntimeError::ConnectionError(format!(
+                            "marker outcome for '{identifier_for_log}' unresolved after {:?}; gate released, retry later",
+                            held_since.elapsed()
+                        )));
+                    }
                     let observed = pvcs.get_opt(&pvc_name).await;
                     match observed {
                         Err(error) => {
@@ -1233,22 +1254,6 @@ async fn marker_completer(
                             }
                         }
                     }
-                    // 总时限：读一直失败也不能无限持门禁（挡住的是该用户的
-                    // 写）。到期按"未知但可证安全"的同一形状收束——释放门禁
-                    // + 可重试 Conflict，不猜结果放行。
-                    if held_since.elapsed() >= marker_unknown_max_hold {
-                        tracing::error!(
-                            user_id = %identifier_for_log,
-                            pvc_uid = %pvc_uid,
-                            held_secs = marker_unknown_max_hold.as_secs(),
-                            "[K8S] marker outcome unresolved after max hold; releasing migration gate (outcome unknown, ensure must retry)"
-                        );
-                        cache.write().await.remove(&cache_key);
-                        return Err(ContainerRuntimeError::Conflict(format!(
-                            "marker outcome for '{identifier_for_log}' unresolved after {}s; gate released, retry",
-                            marker_unknown_max_hold.as_secs()
-                        )));
-                    }
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(std::time::Duration::from_secs(10));
                 }
@@ -1337,6 +1342,9 @@ mod marker_fence_tests {
         /// （默认，保持"GET 全失败"的既有写法）。用于"写前 GET 成功、之后
         /// 读取全失败"——完成者持门禁的读失败路径。
         get_fail_after: AtomicUsize,
+        /// 第 N 次 GET 起，返回的 PVC **不带 resourceVersion**（usize::MAX = 从不）。
+        /// 用于覆盖完成者循环里走 `continue` 的那个分支（PVC 无 RV → 重读）。
+        omit_rv_after: AtomicUsize,
     }
 
     async fn serve(listener: tokio::net::TcpListener, fixture: Arc<Fixture>) {
@@ -1390,21 +1398,25 @@ mod marker_fence_tests {
                     drop(stream.write_all(response.as_bytes()).await);
                     return;
                 }
-                let pvc_json = |state: &PvcState| {
-                    serde_json::json!({
+                let pvc_json = |state: &PvcState, omit_rv: bool| {
+                    let mut object = serde_json::json!({
                         "apiVersion": "v1", "kind": "PersistentVolumeClaim",
                         "metadata": {
                             "name": "pvc", "uid": state.uid,
-                            "resourceVersion": state.rv.to_string(),
                             "annotations": if state.migrated {
                                 serde_json::json!({shared_types::WORKSPACE_MIGRATION_ANNOTATION: "migrated"})
                             } else { serde_json::json!({}) },
                         },
-                    })
+                    });
+                    if !omit_rv {
+                        object["metadata"]["resourceVersion"] = state.rv.to_string().into();
+                    }
+                    object
                 };
                 let (code, value) = if method == "GET" {
                     let calls = fixture.get_calls.fetch_add(1, Ordering::SeqCst);
                     let fail_after = fixture.get_fail_after.load(Ordering::SeqCst);
+                    let omit_rv = calls >= fixture.omit_rv_after.load(Ordering::SeqCst);
                     let status = if calls >= fail_after {
                         fixture.get_status.load(Ordering::SeqCst)
                     } else {
@@ -1412,7 +1424,7 @@ mod marker_fence_tests {
                     };
                     if status != 200 {
                         (
-                            status as u16,
+                            status,
                             serde_json::json!({"kind":"Status","code":status,"message":"injected"}),
                         )
                     } else {
@@ -1432,7 +1444,7 @@ mod marker_fence_tests {
                                 serde_json::json!({"kind":"Status","code":404,"reason":"NotFound"}),
                             )
                         } else {
-                            (200, pvc_json(&state))
+                            (200, pvc_json(&state, omit_rv))
                         }
                     }
                 } else if method == "PATCH" {
@@ -1486,7 +1498,7 @@ mod marker_fence_tests {
                         state.migrated = true;
                     }
                     state.rv += 1;
-                    (200, pvc_json(&state))
+                    (200, pvc_json(&state, false))
                 } else {
                     (405, serde_json::json!({"kind":"Status","code":405}))
                 };
@@ -1531,6 +1543,7 @@ mod marker_fence_tests {
             fence_patches: AtomicUsize::new(0),
             get_calls: AtomicUsize::new(0),
             get_fail_after: AtomicUsize::new(0),
+            omit_rv_after: AtomicUsize::new(usize::MAX),
         });
         let server_fixture = fixture.clone();
         tokio::spawn(serve(listener, server_fixture));
@@ -1698,7 +1711,18 @@ mod marker_fence_tests {
         let result = tokio::time::timeout(std::time::Duration::from_secs(8), harness.complete())
             .await
             .expect("持门禁必须有总时限，不得无限循环");
-        assert!(result.is_err(), "超时收束不得被当成成功");
+        // 错误类型必须是"结果未知、可重试"。Conflict 在本仓的语义是
+        // "确定性拒绝、远端无在途"（ERR_CONFLICT，retryable=false）——
+        // 对一个"请稍后重试"的出口是错的。
+        match result {
+            Err(ContainerRuntimeError::ConnectionError(message)) => {
+                assert!(message.contains("unresolved"), "{message}");
+            }
+            Err(other) => {
+                panic!("超时出口必须是 ConnectionError（结果未知、需重试），实际是 {other:?}")
+            }
+            Ok(()) => panic!("超时收束不得被当成成功"),
+        }
         assert!(
             harness.gate_released(),
             "到期必须释放门禁——否则该用户永远不能写"
@@ -1708,6 +1732,33 @@ mod marker_fence_tests {
             0,
             "读一直失败时栅栏 PATCH 发不出去，不该有栅栏计数"
         );
+    }
+
+    /// 场景 F'：读成功，但返回的 PVC 没有 resourceVersion——循环体在这个
+    /// 分支直接 `continue` 回到循环头。总时限的检查必须放在循环**顶部**才
+    /// 拦得住它（放在末尾会被绕过，回到无限持门禁）。
+    #[tokio::test]
+    async fn unknown_max_hold_covers_the_continue_branch() {
+        let mut harness = harness(PvcState {
+            uid: "u1",
+            rv: 1,
+            migrated: false,
+            present: true,
+        })
+        .await;
+        // 写前 GET 正常（setter 拿到带 RV 的对象），之后的 GET 都不带 RV
+        harness.fixture.omit_rv_after.store(1, Ordering::SeqCst);
+        harness.fixture.patch_status.store(500, Ordering::SeqCst);
+        harness.marker_unknown_max_hold = std::time::Duration::from_millis(300);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(8), harness.complete())
+            .await
+            .expect("总时限必须覆盖 continue 分支，不得无限循环");
+        assert!(
+            matches!(result, Err(ContainerRuntimeError::ConnectionError(_))),
+            "实际结果: {result:?}"
+        );
+        assert!(harness.gate_released(), "到期必须释放门禁");
     }
 
     /// codex 复审（2026-11-23）P1-2 场景：409 RV 竞争后**同 UID** 重试——
