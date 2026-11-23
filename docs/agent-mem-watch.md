@@ -160,13 +160,28 @@ working_set = memory.current - memory.stat.inactive_file
 
 四层来源 + 内置默认，优先级从高到低，每 1s 比对内容指纹：
 
-| 优先级 | 路径 | 作用域 | 生效 | 改动成本 |
-|---|---|---|---|---|
-| 1 | `/tmp/mem-watch.conf` | 单容器 | <1s | 0（exec） |
-| 2 | `/home/user/.rcoder/mem-watch.conf` | 单用户所有容器 | 秒级 | 0（PVC 已挂载） |
-| 3 | `/etc/agent-runtime/mem-watch.conf` | 全集群 | ~1min | rcoder 加 optional volume |
-| 4 | `RCODER_MEM_WATCH*` env | 容器启动默认 | 重建容器 | pod spec |
-| 5 | 代码内置默认 | — | — | — |
+| 优先级 | 路径 | 作用域 | 生效 | 改动成本 | 能做什么 |
+|---|---|---|---|---|---|
+| 1 | `/tmp/mem-watch.conf` | 单容器 | <1s | 0（exec） | 只能收紧 |
+| 2 | `/home/user/.rcoder/mem-watch.conf` | 单用户所有容器 | 秒级 | 0（PVC 已挂载） | 只能收紧 |
+| 3 | `/etc/agent-runtime/mem-watch.conf` | 全集群 | ~1min | rcoder 加 optional volume | 任意覆盖 |
+| 4 | `RCODER_MEM_WATCH*` env | 容器启动默认 | 重建容器 | pod spec | 任意覆盖（可信基线） |
+| 5 | 代码内置默认 | — | — | — | — |
+
+**信任边界**：第 1、2 层所在目录对容器内的业务进程可写，而它们正是看门狗要
+淘汰的对象。不设防的话，一个失控的进程写一行 `mode=off`（或把 `ratio`、
+`interval_ms` 调到不起作用）就能让看门狗闭嘴。所以：
+
+- **可信层**（第 3、4、5 层）可以任意覆盖；
+- **第 1、2 层只能把配置调得更严**：`mode` 只能沿 off → dry → on 方向走，
+  数值参数取与可信配置相比更小的那个；它们也遮不住可信层（可信配置 =
+  环境变量 + 第 3 层文件）。
+- 约束是相对**可信基线**，不是相对当前值——所以按容器用 `/tmp` 在
+  dry ↔ on 之间来回切都行，`on → dry` 的回滚照样是秒级。
+
+按层而不是按文件属主判定：agent 容器里的全部进程（agent_runner、agent 拉起
+的工具、桌面组件）都以 root 运行，`kubectl exec` 也是 root，业务进程写出的
+文件与运维写的无法区分。
 
 ```ini
 mode             = on        # off | dry | on
@@ -185,19 +200,28 @@ bootstrap_cap_ms = 300000
 1. 文件不存在 → 下一层；
 2. **解析失败保留上一份有效配置，只打一次 error**；
 3. 未知键忽略；
-4. `mode=off` 立即停止新的 kill（进行中的终止序列走完）。
+4. `mode=off` 立即停止新的 kill（进行中的终止序列走完）；
+5. 不可信的文件只能收紧，低于可信配置的取值按可信配置生效（见"信任边界"）。
 
 运维操作：
 
 ```bash
-kubectl -n nuwax-k8s-test exec <pod> -c agent -- sh -c 'echo "mode=dry" > /tmp/mem-watch.conf'
+# 按容器灰度（基线 off/dry 时可用）：只能往更严的方向切
+kubectl -n <namespace> exec <pod> -c agent -- sh -c 'echo "mode=dry" > /tmp/mem-watch.conf'
+# 单用户自行开启
 echo "mode=on" > /home/user/.rcoder/mem-watch.conf
-kubectl -n nuwax-k8s-test patch configmap agent-runtime-flags --type merge \
+# 全集群策略（可信层，可任意覆盖，包括关掉）
+kubectl -n <namespace> patch configmap agent-runtime-flags --type merge \
   -p '{"data":{"mem-watch.conf":"mode=on\n"}}'
 ```
 
 坑：ConfigMap **必须目录挂载**（subPath 不更新）；kubelet 同步约 1 分钟；
 第 3 层是可选增强，v1 只用 1/2/4/5。
+
+**把基线设成 `on` 之前先挂第 3 层**：基线是 `on` 时第 1、2 层关不掉它，
+回滚只能改 ConfigMap（约 1 分钟，不重建 Pod）或环境变量（重建容器）。
+基线是 off 或 dry 时不受影响——从 `/tmp` 切上去的 `on` 可以用 `/tmp`
+切回 `dry`，kill 立即停止。
 
 ## 8. 终止与失败处理
 
@@ -241,7 +265,9 @@ Phase 2（可选）：`/computer/status` 只读暴露 `mode / evicted_total`。
 1. 默认 `off`（内置），合并零影响；
 2. dev 节点设 `dry`，观察一周 `would_evict` / `no_candidate` / `bootstrap_sealed`；
 3. 确认候选都是 python/ffmpeg/编译进程后，单节点 `on`；
-4. 回滚：`mode=off` 或 env 改回，**不需要发版**。
+4. 回滚（**不需要发版**）：`/tmp` 写回 `mode=dry`，秒级，kill 立即停；要连
+   采样一起停，改可信层——ConfigMap（约 1 分钟，不重建 Pod）或 env（重建
+   容器）。注意基线设成 `on` 之后 `/tmp` 关不掉它（§7 信任边界）。
 
 ## 12. 提交拆分
 
