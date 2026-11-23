@@ -140,11 +140,14 @@ fn access_token(headers: &axum::http::HeaderMap, uri: &Uri) -> String {
         return token.to_string();
     }
     // WS 客户端不便带自定义头：支持 ?access_token= 查询参数。
-    // 值按 RFC 3986 做百分号解码：通用 URL 构造器会把所有参数值
-    // encodeURIComponent 一遍，不解码就永远比对不上（token 里出现保留
-    // 字符时）。只解百分号、不把 '+' 当空格——查询串里 '+' 是字面量，
-    // form 体的规则不适用。解不出 UTF-8 就原样返回：交给后面的哈希
-    // 比对失败（fail-closed），不在这里放行。
+    // 值按 RFC 3986 做百分号解码，与服务端"查询参数是百分号编码的"这一
+    // 通用约定一致（通用 URL 构造器会对参数值整体 encodeURIComponent）。
+    // 如实说明：当前 `random_token()` 的字母表是 [a-z0-9]，编码后不变，
+    // 所以对平台签发的 token 这是空操作；保留它是为了字母表将来放宽时
+    // 不会变成 401 悬案（请求头路径不编码、查询路径编码，两路在这里对齐）。
+    // 只解百分号、不把 '+' 当空格——查询串里 '+' 是字面量，form 体的规则
+    // 不适用。解不出 UTF-8 就原样返回：交给后面的哈希比对失败
+    // （fail-closed），不在这里放行。
     let query = uri.query().unwrap_or("");
     for pair in query.split('&') {
         let mut parts = pair.splitn(2, '=');

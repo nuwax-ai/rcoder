@@ -136,7 +136,7 @@ async fn cache_write(key: CacheKey, health: container_runtime_api::ContainerHeal
     tag = "pod",
     operation_id = "computer_pod_health",
     summary = "查询单个容器的健康/OOM 信息（供前端轮询）",
-    description = "只查一个容器（k8s 单 Pod GET / docker inspect+events），**容器被 OOM 杀掉后仍可查询**——数据源在运行时侧，不在容器内。\n\n字段以**终止**为主语，不以 OOM 为主语：`last_termination` 对任何原因的终止都完整给出（`reason`/`exit_code`/`finished_at`），OOM 只是 `reason` 的一个取值；`is_oom` 是 `reason==OOMKilled` 的派生便捷位（**不要**用 exit_code==137 推断——liveness SIGKILL 同样给 137）。`last_termination=null` 表示从未终止过；`started_at` 是本次容器启动时间。`pod_uid` 变化 = 容器被删除重建（计数归零）。\n\n默认 3s 缓存；`fresh=true` 强制直读。k8s 用 `lastState.terminated.finishedAt` 作为最近一次重启时间；docker 用 `die` 事件时间（`State` 字段在运行中会被重置，靠事件补历史）。\n\n**能力差异（务必按部署模式解读）**：k8s 下 OOM 归因完整（`OOMKilled` + exit code + 终止时间 + 重启数），且容器 OOM 后由 kubelet 自动重启。docker compose 下 rcoder 创建的容器是 `auto_remove=true` 且无 restart policy：**容器退出即被删除、不会自动重启**，需要业务侧检测 `phase=NotFound` 后主动 `/computer/pod/ensure` 重建。此时 `last_termination` 仍会尽量从**Docker daemon 的事件历史**还原（`oom` 事件 → `reason=OOMKilled`；`die` 事件 → exit code 与终止时间），但受事件回放窗口限制（最近 256 条 / 1 小时），超出窗口则返回 null。"
+    description = "只查一个容器（k8s 单 Pod GET / docker inspect+events），**容器被 OOM 杀掉后仍可查询**——数据源在运行时侧，不在容器内。\n\n字段以**终止**为主语，不以 OOM 为主语：`last_termination` 对任何原因的终止都完整给出（`reason`/`exit_code`/`finished_at`），OOM 只是 `reason` 的一个取值；`is_oom` 是 `reason==OOMKilled` 的派生便捷位（**不要**用 exit_code==137 推断——liveness SIGKILL 同样给 137）。`last_termination=null` 表示从未终止过；`started_at` 是本次容器启动时间。`pod_uid` 变化 = 容器被删除重建（计数归零）。\n\n默认 3s 缓存；`fresh=true` 强制直读。k8s 用 `lastState.terminated.finishedAt` 作为最近一次重启时间；docker 用 `die` 事件时间（`State` 字段在运行中会被重置，靠事件补历史）。\n\n**能力差异（务必按部署模式解读）**：k8s 下 OOM 归因完整（`OOMKilled` + exit code + 终止时间 + 重启数），且容器 OOM 后由 kubelet 自动重启。docker compose 下 agent 容器没有 restart policy：**被 OOM 杀掉后不会自动重启**，需要业务侧检测到容器已停止后主动 `/computer/pod/ensure` 重建；容器停止后保留 10 分钟（`RCODER_STOPPED_AGENT_RETENTION_SECS`，默认 600）再由对账任务回收，这期间 `State.OOMKilled`、退出码与终止时间可直接读到。回收之后 `last_termination` 仍会尽量从**Docker daemon 的事件历史**还原（`oom` 事件 → `reason=OOMKilled`；`die` 事件 → exit code 与终止时间），但受事件回放窗口限制（最近 256 条 / 1 小时），超出窗口则返回 null。"
 )]
 #[instrument(skip(state))]
 pub async fn computer_pod_health(
@@ -266,8 +266,8 @@ pub async fn computer_pod_health(
         })?;
 
     let Some(health) = health else {
-        // 登记表仍认为容器在、但运行时侧已查不到（docker auto_remove 删除的
-        // 典型窗口）。与"locate 就失败"同样处理：从事件历史尽量还原
+        // 登记表仍认为容器在、但运行时侧已查不到（docker 下的典型窗口：
+        // 停止后超过保留期，被对账任务回收）。与"locate 就失败"同样处理：从事件历史尽量还原
         // "它是怎么没的"，而不是只回一句"消失了"。
         let history = runtime
             .container_termination_history(&container.container_name)
@@ -283,7 +283,7 @@ pub async fn computer_pod_health(
             phase: "NotFound".to_string(),
             last_termination: history,
             detail: Some(
-                "container disappeared between locate and inspect (docker auto_remove)".to_string(),
+                "container disappeared between locate and inspect (docker: reaped after the retention window)".to_string(),
             ),
             source: "none".to_string(),
             sampled_at: container_runtime_api::pod_overview::sampled_now(),

@@ -347,8 +347,8 @@ fn pod_health_from_status(pod: &Pod) -> (bool, PodHealth) {
 
 /// 主容器名（从 **spec** 选，与状态列表解耦）：`agent` > `app` > `rcoder` > 第一个。
 ///
-/// 状态侧（`main_container_status` 的口径）与资源侧（`main_container_resources`）
-/// 都走这一个函数：优先级各写一遍就会漂移，届时面板上的"主容器"在两处对不上。
+/// 状态侧（`pod_health_from_status`）与资源侧（`main_container_resources`）都
+/// 走这一个函数：优先级各写一遍就会漂移，届时面板上的"主容器"在两处对不上。
 fn main_container_name_from_spec(pod: &Pod) -> Option<String> {
     main_container_name(pod.spec.as_ref()?).map(str::to_string)
 }
