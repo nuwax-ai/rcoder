@@ -7,8 +7,10 @@
 //! ```text
 //! phase_a:  ensure PVC(不翻标记) → sync(Full, 限速)              → NotMigrated
 //! cutover: stop agent → 等 detach(防呆 fail-closed) → sync(Incremental)
-//!           → set Migrated → ensure agent(重建挂 RBD)              → Migrated
-//! rollback: set NotMigrated（共享卷数据全程保留, 回切即恢复）
+//!           → set Migrated → 恢复 agent 切换前形态                 → Migrated
+//!              (在运行 → 重建挂 RBD; 闲置已停 → 保持停止;
+//!               切换期间在旧卷被唤醒 → 替换到 RBD)
+//! rollback: stop agent → set NotMigrated → 恢复 agent 切换前形态(共享卷)
 //! ```
 //!
 //! 与外部脚本（k8s/migration）的关系: 脚本是**人工单次**工具; 本编排是
@@ -52,6 +54,38 @@ impl Drop for MigrationGateGuard {
     fn drop(&mut self) {
         if !self.disarmed {
             super::migration_gate::end_with_token(&self.user_id, self.token);
+        }
+    }
+}
+
+/// agent 工作负载当前是否存在（运行中或启动中）。
+async fn agent_present(state: &AppState, user_id: &str) -> Result<bool, ContainerRuntimeError> {
+    Ok(state
+        .runtime()
+        .find_container(user_id, &ServiceType::ComputerAgentRunner)
+        .await?
+        .is_some())
+}
+
+/// 切换收尾对 agent 的处置（纯决策，便于单测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentRestore {
+    /// 切换前 agent 在运行：按原样重建（标记已翻 → 挂目标卷）。
+    Restart,
+    /// 切换前 agent 不在（闲置已回收）：保持停止，不为它拉起 agent。
+    KeepStopped,
+    /// 切换前不在、翻标记时已在：切换期间（agent 已停、标记未翻）其他副本
+    /// 的流量唤醒在**旧卷**上重建了 agent——ensure 幂等会原样复用它，必须
+    /// 先停再重建到目标卷。
+    ReplaceWoken,
+}
+
+impl AgentRestore {
+    fn decide(was_present: bool, present_after_flip: bool) -> Self {
+        match (was_present, present_after_flip) {
+            (true, _) => Self::Restart,
+            (false, true) => Self::ReplaceWoken,
+            (false, false) => Self::KeepStopped,
         }
     }
 }
@@ -208,6 +242,12 @@ pub async fn cutover(
     }
     steps.push("in-flight writes drained".to_string());
 
+    // 切换前 agent 形态采样：收尾据此恢复原状（夜间批量迁移空闲用户时，
+    // agent 本就被闲置回收，不为每个用户拉起）。
+    let agent_was_present = agent_present(state, user_id)
+        .await
+        .map_err(|e| wrap("agent_present_check", e))?;
+
     // 1. 停 agent（删 STS → 卷卸载开始）
     state
         .runtime()
@@ -257,9 +297,38 @@ pub async fn cutover(
         .map_err(|e| wrap("set_migrated", e))?;
     steps.push("migration state = migrated".to_string());
 
-    // 5. 起 agent（ensure 幂等; migrated 已生效 → 重建即挂 per-agent RBD）。
-    // 先释放编排锁——ensure 内部 acquire 同一 key, tokio Mutex 不可重入,
-    // 持锁调用必死锁(creation::acquire 的 WAITER_BUDGET 30s 全耗尽)。
+    // 翻标记后再采样一次（持锁）：此刻若 agent 已在，只能是切换期间在旧
+    // 共享卷上被其他副本唤醒重建的——见 AgentRestore::ReplaceWoken。
+    let agent_present_after_flip = agent_present(state, user_id)
+        .await
+        .map_err(|e| wrap("agent_present_check", e))?;
+
+    // 5. 恢复 agent 的切换前形态（ensure 幂等; migrated 已生效 → 重建即挂
+    // per-agent RBD）。先释放编排锁——ensure 内部 acquire 同一 key, tokio
+    // Mutex 不可重入, 持锁调用必死锁(creation::acquire 的 WAITER_BUDGET 30s
+    // 全耗尽)。
+    let restart_step = match AgentRestore::decide(agent_was_present, agent_present_after_flip) {
+        AgentRestore::KeepStopped => {
+            drop(migration_lock);
+            steps.push("agent left stopped (not running before cutover)".to_string());
+            _migration_gate_guard.release();
+            return Ok(MigrationOutcome {
+                user_id: user_id.to_string(),
+                action: "cutover",
+                migration_state: WorkspaceMigrationState::Migrated,
+                steps,
+            });
+        }
+        AgentRestore::ReplaceWoken => {
+            state
+                .runtime()
+                .stop_container_by_identifier(user_id, &service_type)
+                .await
+                .map_err(|e| wrap("stop_agent_woken_during_cutover", e))?;
+            "agent woken during cutover replaced on RBD"
+        }
+        AgentRestore::Restart => "agent restarted on RBD",
+    };
     drop(migration_lock);
     let resource_limits = state
         .config
@@ -289,7 +358,7 @@ pub async fn cutover(
     ComputerContainerManager::ensure_container_for_user_with_type(&options, state.runtime())
         .await
         .map_err(|e| wrap("ensure_agent", runtime_error_from_app(e)))?;
-    steps.push("agent restarted on RBD".to_string());
+    steps.push(restart_step.to_string());
 
     _migration_gate_guard.release();
     Ok(MigrationOutcome {
@@ -328,6 +397,10 @@ pub async fn rollback(
             steps: vec!["already not-migrated, no-op".to_string()],
         });
     }
+    // 切换前 agent 形态采样（与 cutover 对称）：收尾据此恢复原状。
+    let agent_was_present = agent_present(state, user_id)
+        .await
+        .map_err(|e| wrap("agent_present_check", e))?;
     // C-1(终审): 翻标记前先停 agent——否则挂 RBD 的存量 agent 继续写 RBD,
     // 而转发层判 NotMigrated 放行共享卷(双卷读写分裂, 窗口无界)。
     state
@@ -354,16 +427,37 @@ pub async fn rollback(
         .await
         .map_err(|e| wrap("set_not_migrated", e))?;
     steps.push("migration state = not-migrated".to_string());
-    // 与 cutover 对称: 重建 agent(此时 NotMigrated → 共享卷形态)。
-    // ensure 前释放锁(不可重入)。
-    drop(migration_lock);
+    // 翻标记后再采样（与 cutover 对称）：此刻若 agent 已在，只能是回滚期间
+    // 在 RBD 上被其他副本唤醒重建的（标记当时仍 Migrated）。
+    let agent_present_after_flip = agent_present(state, user_id)
+        .await
+        .map_err(|e| wrap("agent_present_check", e))?;
+    let restore = AgentRestore::decide(agent_was_present, agent_present_after_flip);
     let resource_limits = state
         .config
         .kubernetes_config
         .as_ref()
         .and_then(|kc| kc.get_service_config(&service_type))
         .map(|sc| sc.resource_limits.clone());
-    if let Some(limits) = resource_limits {
+    if restore == AgentRestore::ReplaceWoken && resource_limits.is_some() {
+        // 仅在随后能重建时才停（缺 limits 时停了起不来，不如留着）。
+        state
+            .runtime()
+            .stop_container_by_identifier(user_id, &service_type)
+            .await
+            .map_err(|e| wrap("stop_agent_woken_during_rollback", e))?;
+    }
+    // 与 cutover 对称: 恢复 agent 的切换前形态(此时 NotMigrated → 共享卷形态)。
+    // ensure 前释放锁(不可重入)。
+    drop(migration_lock);
+    if restore == AgentRestore::KeepStopped {
+        steps.push("agent left stopped (not running before rollback)".to_string());
+    } else if let Some(limits) = resource_limits {
+        let restart_step = if restore == AgentRestore::Restart {
+            "agent restarted on shared volume"
+        } else {
+            "agent woken during rollback replaced on shared volume"
+        };
         let options = ContainerCreateOptions {
             user_id: user_id.to_string(),
             project_id: user_id.to_string(),
@@ -380,7 +474,7 @@ pub async fn rollback(
         )
         .await
         {
-            Ok(_) => steps.push("agent restarted on shared volume".to_string()),
+            Ok(_) => steps.push(restart_step.to_string()),
             Err(e) => {
                 // 重建失败不阻断 rollback(标记已翻, 下次请求自会 ensure 重建)
                 tracing::warn!(user_id, error = %e, "[MIGRATION] rollback ensure agent failed");
@@ -404,4 +498,31 @@ fn wrap(step: &str, error: ContainerRuntimeError) -> ContainerRuntimeError {
 /// ContainerRuntimeError, 此处投影（消息保留原文）。
 fn runtime_error_from_app(error: crate::AppError) -> ContainerRuntimeError {
     ContainerRuntimeError::K8sError(error.to_string())
+}
+
+#[cfg(test)]
+mod agent_restore_tests {
+    use super::AgentRestore;
+
+    #[test]
+    fn running_agent_is_restarted_whatever_the_later_observation() {
+        assert_eq!(AgentRestore::decide(true, false), AgentRestore::Restart);
+        assert_eq!(AgentRestore::decide(true, true), AgentRestore::Restart);
+    }
+
+    #[test]
+    fn idle_agent_stays_stopped() {
+        assert_eq!(
+            AgentRestore::decide(false, false),
+            AgentRestore::KeepStopped
+        );
+    }
+
+    #[test]
+    fn agent_woken_during_cutover_is_replaced() {
+        assert_eq!(
+            AgentRestore::decide(false, true),
+            AgentRestore::ReplaceWoken
+        );
+    }
 }

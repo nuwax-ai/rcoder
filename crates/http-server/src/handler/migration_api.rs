@@ -1,8 +1,12 @@
-//! per-agent workspace 迁移编排 API（测试期门面）。
+//! per-agent workspace 迁移编排 API。
 //!
-//! 边界（重要）：本 API 是**测试阶段**用的编排入口——env
-//! `RCODER_MIGRATION_TEST_USERS`（逗号分隔）白名单外的 user_id 一律 403。
-//! 生产批量迁移由 rcoder 内部的迁移编排器驱动（P2 后续），不经 HTTP。
+//! 边界（重要）：本 API 是运维/测试用的编排入口，受两层约束——
+//! 1. env `RCODER_MIGRATION_TEST_USERS`（逗号分隔）白名单，名单外的
+//!    user_id 一律 403；值为 `*` 时对全部用户开放（夜间批量迁移窗口用，
+//!    平时应留空）。批量脚本 `k8s/migration/migrate-batch.sh MODE=api` 经本
+//!    API 驱动 phase-a / cutover / rollback。
+//! 2. 启用 API key 鉴权的部署上，本路由与其他 `/api` 路由同受全局 x-api-key
+//!    保护（不在放行名单）。
 //!
 //! 端点：
 //! - `GET  /api/migration/{user_id}/status`           查 PVC/标记/agent 卷形态
@@ -29,6 +33,9 @@ use serde::Deserialize;
 use crate::router::AppState;
 use shared_types::ServiceType;
 
+/// 白名单通配值：对全部用户开放（批量迁移窗口）。
+const ALLOW_ALL: &str = "*";
+
 /// 白名单（env `RCODER_MIGRATION_TEST_USERS`, 逗号分隔; 未设 = 空 = 全部拒绝）。
 fn allowed_users() -> &'static HashSet<String> {
     static USERS: OnceLock<HashSet<String>> = OnceLock::new();
@@ -40,6 +47,10 @@ fn allowed_users() -> &'static HashSet<String> {
             .filter(|s| !s.is_empty())
             .collect()
     })
+}
+
+fn user_allowed(allowed: &HashSet<String>, user_id: &str) -> bool {
+    allowed.contains(user_id) || allowed.contains(ALLOW_ALL)
 }
 
 fn ensure_allowed(user_id: &str) -> Option<Response> {
@@ -56,7 +67,7 @@ fn ensure_allowed(user_id: &str) -> Option<Response> {
                 .into_response(),
         );
     }
-    if allowed_users().contains(user_id) {
+    if user_allowed(allowed_users(), user_id) {
         return None;
     }
     Some(
@@ -64,7 +75,7 @@ fn ensure_allowed(user_id: &str) -> Option<Response> {
             StatusCode::FORBIDDEN,
             format!(
                 "user '{user_id}' is not in RCODER_MIGRATION_TEST_USERS \
-                 (migration API is test-phase only)"
+                 (migration API is restricted to that list)"
             ),
         )
             .into_response(),
@@ -72,6 +83,9 @@ fn ensure_allowed(user_id: &str) -> Option<Response> {
 }
 
 /// GET /api/migration/{user_id}/status
+///
+/// `agent_present`：agent 工作负载存在（运行中或启动中）。批量脚本据此判断
+/// 用户是否活跃——闲置回收后 agent 不在；存在即视为活跃，跳过本轮切换。
 pub async fn status(
     State(state): State<std::sync::Arc<AppState>>,
     Path(user_id): Path<String>,
@@ -101,10 +115,26 @@ pub async fn status(
             .await,
         Ok(true)
     );
+    // 查询失败按未知上抛（502）：误报“不存在”会让批量脚本切到活跃用户。
+    let agent_present = match state
+        .runtime()
+        .find_container(&user_id, &service_type)
+        .await
+    {
+        Ok(presence) => presence.is_some(),
+        Err(error) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("query agent presence failed: {error}"),
+            )
+                .into_response();
+        }
+    };
     let body = serde_json::json!({
         "user_id": user_id,
         "service_type": service_type.to_string(),
         "pvc_exists": pvc_exists,
+        "agent_present": agent_present,
         "migration_state": match migration_state {
             shared_types::WorkspaceMigrationState::NotMigrated => "not-migrated",
             shared_types::WorkspaceMigrationState::Migrated => "migrated",
@@ -188,7 +218,7 @@ pub async fn phase_a(
 }
 
 /// POST /api/migration/{user_id}/cutover —— 停 agent → 防呆等 detach →
-/// 增量 sync → 翻 Migrated → 起 agent（原子编排; 失败即整体失败）。
+/// 增量 sync → 翻 Migrated → 恢复 agent 切换前形态（原子编排; 失败即整体失败）。
 pub async fn cutover(
     State(state): State<std::sync::Arc<AppState>>,
     Path(user_id): Path<String>,
@@ -264,4 +294,31 @@ pub fn routes() -> axum::Router<std::sync::Arc<AppState>> {
             "/api/migration/{user_id}/rollback",
             axum::routing::post(rollback),
         )
+}
+
+#[cfg(test)]
+mod user_allowed_tests {
+    use super::*;
+
+    fn allowed(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    #[test]
+    fn unset_list_rejects_everyone() {
+        assert!(!user_allowed(&allowed(&[]), "u1"));
+    }
+
+    #[test]
+    fn listed_user_passes_and_others_do_not() {
+        let list = allowed(&["u1", "u2"]);
+        assert!(user_allowed(&list, "u1"));
+        assert!(!user_allowed(&list, "u3"));
+    }
+
+    #[test]
+    fn wildcard_opens_all_users_for_the_batch_window() {
+        let list = allowed(&["*"]);
+        assert!(user_allowed(&list, "anyone"));
+    }
 }
