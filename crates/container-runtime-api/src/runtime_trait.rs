@@ -122,10 +122,13 @@ pub trait AgentContainerRuntime: Send + Sync {
     ///
     /// 容器已不存在时，探测它**最近一次终止**的证据。
     ///
-    /// 场景：docker 下 rcoder 创建的容器 `auto_remove=true`，容器退出即被
-    /// 删除，`inspect` 无从查询；但 daemon 的**事件历史仍在**，其中
-    /// `oom` 事件是 Docker 专为 cgroup OOM 发出的（比 exitCode 可靠——
-    /// 137 同样来自 SIGKILL）。k8s 不需要本方法（Pod 保留 terminated 状态）。
+    /// 场景：docker 下**auto_remove 的容器**退出即被删除，`inspect` 无从
+    /// 查询；但 daemon 的**事件历史仍在**，其中 `oom` 事件是 Docker 专为
+    /// cgroup OOM 发出的（比 exitCode 可靠——137 同样来自 SIGKILL）。
+    /// ⚠️ agent 容器已不再 auto_remove（停止后保留 10 分钟，见 B1），
+    /// 对它们 `inspect` 通常还能直接读到；本方法是**容器真被删掉**时的
+    /// 兜底，不再是 agent 的常规路径。k8s 不需要本方法（Pod 保留
+    /// terminated 状态）。
     ///
     /// 返回 `None` = 事件窗口内查不到（超出回放条数/时间窗，或从未运行过）。
     /// 默认实现返回 `None`（老实现/测试替身行为不变）。

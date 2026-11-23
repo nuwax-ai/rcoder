@@ -76,8 +76,9 @@ pub struct LocalWorkspaceResolver {
     /// 单用户卷视角（终审 F2）: Some(bound_user_id) 时 computer 解析为
     /// `{root}/{cid}`（跳过 user_id 段）——per-agent RBD 卷根即该用户家
     /// 目录（agent 工作目录 /home/user/{cid}），共享卷的 {root}/{uid}/{cid}
-    /// 双层布局不再适用。同时做归属校验：请求 user_id ≠ 绑定 user_id → 403
-    /// （转发层定位错误时防跨用户读写）。
+    /// 双层布局不再适用。同时做归属校验：请求 user_id ≠ 绑定 user_id 时
+    /// 拒绝解析（validation 错误而非 403——转发层定位错误属于请求不合法，
+    /// 不是已鉴权但无权限）。
     single_user_computer: Option<String>,
 }
 

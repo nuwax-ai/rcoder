@@ -195,11 +195,13 @@ pub async fn computer_pod_health(
         super::resources::locate_container(&state, &target, params.user_id.as_deref()).await?;
     let Some(container) = container else {
         // 容器不存在不是错误，但仍要尽量回答"它是怎么没的"：
-        // docker 模式下 rcoder 创建的容器 auto_remove=true，容器退出即被
-        // 删除，inspect 无从查询——但 **daemon 侧的事件历史仍在**，其中
-        // `oom` 事件是 Docker 专为 cgroup OOM 发出的（比 exitCode 可靠：
-        // 137 同样来自 SIGKILL）。所以这里再问一次运行时：容器没了，
-        // 但"最近一次终止"可能还能从事件还原。
+        // docker 模式下 **auto_remove 的容器**退出即被删除，inspect 无从
+        // 查询——但 **daemon 侧的事件历史仍在**，其中 `oom` 事件是 Docker
+        // 专为 cgroup OOM 发出的（比 exitCode 可靠：137 同样来自 SIGKILL）。
+        // 所以这里再问一次运行时：容器没了，但"最近一次终止"可能还能从
+        // 事件还原。
+        // 注意 agent 容器已不再 auto_remove（停止后保留 10 分钟，见 B1），
+        // 上面 locate_container 正常能查到；走到这里多为真被清理/换代的容器。
         debug!(
             event = "pod_health.container_absent",
             identifier = %target.identifier,

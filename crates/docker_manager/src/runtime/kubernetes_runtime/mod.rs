@@ -79,7 +79,9 @@ pub struct KubernetesRuntime {
     /// 阶段2: rcoder 挂根聚合访问 agent subvolume (/app/cephfs-root/{subvolumePath}/...)。
     pub(crate) subvolume_path_cache: Arc<RwLock<std::collections::HashMap<String, String>>>,
     /// per-agent PVC 存在性 + 迁移状态缓存（混住判据, 30s TTL）：
-    /// key=`{service_type}/{identifier}`，value 见 [`WorkspaceMigrationCacheValue`]。
+    /// key=**物理 PVC 名**（与 `workspace_pvc_name` 一致；早期曾用
+    /// `{service_type}/{identifier}`，PATCH 成功却写错键 → 路由读不到，
+    /// 已改，勿回退），value 见 [`WorkspaceMigrationCacheValue`]。
     pub(crate) workspace_exists_cache:
         Arc<RwLock<std::collections::HashMap<String, WorkspaceMigrationCacheValue>>>,
     /// 受管共享 Event publisher（批次 C）：Arc 共享，clone 不重建；非阻塞

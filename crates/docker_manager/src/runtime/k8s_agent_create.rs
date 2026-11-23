@@ -944,8 +944,9 @@ fn legacy_shared_root() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
-/// 该 identifier 的共享卷目录是否非空。NotFound → false（新用户）；
-/// 其他 IO 错误 → false（fail-open：探测失败不阻断创建，迁移流程是真源）。
+/// 该 identifier 的共享卷目录是否非空。NotFound → Absent（新用户）；
+/// 其他 IO 错误 → ProbeFailed（**不是** false——三态改造后"探测失败"与
+/// "确实没有存量"必须可区分，混为一谈会让存量用户被当成新用户）。
 /// 共享卷探测三态（终审 P1）：Absent=目录不存在（真新用户）；
 /// NonEmpty=有存量（存量用户）；ProbeFailed=无法探测（env 未设/IO 错误）。
 /// 消费方语义相反：legacy 防护把 ProbeFailed 当"无存量"放行（fail-open，
