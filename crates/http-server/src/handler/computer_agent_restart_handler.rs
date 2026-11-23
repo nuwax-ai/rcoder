@@ -177,10 +177,11 @@ pub async fn computer_agent_restart(
             "⛔ [COMPUTER_RESTART] Owner mismatch: project_id={}, claimed user_id={}, owner={}",
             project_id, claimed, owner
         );
-        return Ok(HttpResult::error_with_message(
+        // 归属不符的语义完全由错误码表达：按 Accept-Language 取码表文案
+        // （en 默认），不再用一段自定义文案覆盖它。
+        return Ok(HttpResult::error_with_locale(
             shared_types::error_codes::ERR_COMPUTER_OWNER_CONFLICT,
             locale,
-            "project_id 不属于该 user_id，拒绝重启",
         ));
     }
 
@@ -320,13 +321,15 @@ pub async fn computer_agent_restart(
                         "[COMPUTER_RESTART] Session mismatch: project_id={}, expected={:?}, current={:?}",
                         project_id, request.session_id, current
                     );
+                    // 带两侧身份的自定义文案（默认英文；动态值无法走码表），
+                    // 同一份信息上面的 warn 已留痕。
                     return Ok(HttpResult::error_with_message(
                         shared_types::error_codes::ERR_CONFLICT,
                         locale,
                         &format!(
-                            "执行已换代：期望 {}，当前 {}；请刷新后重试",
-                            request.session_id.as_deref().unwrap_or("<任意>"),
-                            current.as_deref().unwrap_or("<无>")
+                            "execution superseded: expected {}, current {}; refresh and retry",
+                            request.session_id.as_deref().unwrap_or("<any>"),
+                            current.as_deref().unwrap_or("<none>")
                         ),
                     ));
                 }

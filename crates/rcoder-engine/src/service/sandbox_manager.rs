@@ -122,11 +122,11 @@ impl SandboxManager {
         config: &E2bSandboxConfig,
     ) -> Result<Self, String> {
         let key_bytes = hex::decode(config.token_key_hex.trim())
-            .map_err(|error| format!("e2b_sandbox token_key_hex 解析失败: {error}"))?;
+            .map_err(|error| format!("e2b_sandbox token_key_hex is not valid hex: {error}"))?;
         // 长度校验必须在 from_slice 之前——它对错误长度是 panic 而非错误。
         if key_bytes.len() != 32 {
             return Err(format!(
-                "e2b_sandbox token_key_hex 长度错误: {} 字节（需要 32）",
+                "e2b_sandbox token_key_hex has the wrong length: {} bytes (need 32)",
                 key_bytes.len()
             ));
         }
@@ -612,14 +612,14 @@ impl SandboxManager {
                     let status = response.status();
                     if attempt >= self.envd_init_retries {
                         return Err(format!(
-                            "envd /init {status} 重试 {} 次后放弃",
+                            "envd /init returned {status}; gave up after {} attempts",
                             self.envd_init_retries
                         ));
                     }
                 }
                 Err(error) => {
                     if attempt >= self.envd_init_retries {
-                        return Err(format!("envd /init 网络错误: {error}"));
+                        return Err(format!("envd /init network error: {error}"));
                     }
                 }
             }
@@ -978,9 +978,16 @@ impl SandboxManager {
                 .unwrap_or(self.max_ttl_seconds),
         );
         if timeout_seconds > spec_cap {
-            return Err(SandboxApiError::Invalid(format!(
-                "timeout {timeout_seconds}s 超过上限 {spec_cap}s"
-            )));
+            // 数值细节只进日志；响应按错误码 + Accept-Language 翻译（en 默认）。
+            tracing::info!(
+                sandbox_id,
+                timeout_seconds,
+                spec_cap,
+                "e2b set_timeout: timeout exceeds the template cap"
+            );
+            return Err(SandboxApiError::InvalidCode(
+                shared_types::error_codes::ERR_E2B_TIMEOUT_EXCEEDS_CAP,
+            ));
         }
         // CAS 重试：续期与回收/kill 可能并发
         let mut record = record;
@@ -990,8 +997,14 @@ impl SandboxManager {
             if let Some(hard) = record.hard_deadline_us
                 && new_expires > hard
             {
-                return Err(SandboxApiError::Invalid(
-                    "续期越过硬顶（hard_deadline）".into(),
+                tracing::info!(
+                    sandbox_id,
+                    timeout_seconds,
+                    hard_deadline_us = hard,
+                    "e2b set_timeout: renewal crosses the sandbox hard deadline"
+                );
+                return Err(SandboxApiError::InvalidCode(
+                    shared_types::error_codes::ERR_E2B_RENEW_EXCEEDS_HARD_DEADLINE,
                 ));
             }
             match self
@@ -1018,8 +1031,13 @@ impl SandboxManager {
                 Err(error) => return Err(store_error(error)),
             }
         }
-        Err(SandboxApiError::Conflict(
-            "set_timeout CAS 重试 5 次后放弃".into(),
+        tracing::warn!(
+            sandbox_id,
+            attempts = 5,
+            "e2b set_timeout: gave up after repeated CAS conflicts"
+        );
+        Err(SandboxApiError::ConflictCode(
+            shared_types::error_codes::ERR_E2B_RENEW_CONFLICT,
         ))
     }
 
@@ -1059,7 +1077,7 @@ impl SandboxManager {
             .ok_or_else(|| SandboxApiError::NotFound(record.pod_name.clone()))?;
         status
             .pod_ip
-            .ok_or_else(|| SandboxApiError::Unavailable("pod 无 IP".into()))
+            .ok_or_else(|| SandboxApiError::Unavailable("pod has no IP address yet".into()))
     }
 
     // ---------- Volumes（M5） ----------
@@ -1071,13 +1089,21 @@ impl SandboxManager {
         size_gib: i32,
     ) -> Result<shared_types::sandbox::SandboxVolumeRecord, SandboxApiError> {
         if name.is_empty() || name.len() > 64 {
-            return Err(SandboxApiError::Invalid("volume 名称长度 1-64".into()));
+            return Err(SandboxApiError::InvalidCode(
+                shared_types::error_codes::ERR_E2B_VOLUME_NAME_INVALID,
+            ));
         }
         if size_gib <= 0 || size_gib > self.volume_max_size_gib {
-            return Err(SandboxApiError::Invalid(format!(
-                "size {}Gi 超限（1-{}Gi）",
-                size_gib, self.volume_max_size_gib
-            )));
+            // 数值细节只进日志；响应按错误码 + Accept-Language 翻译（en 默认）。
+            tracing::info!(
+                name,
+                size_gib,
+                volume_max_size_gib = self.volume_max_size_gib,
+                "e2b create_volume: size exceeds the allowed range"
+            );
+            return Err(SandboxApiError::InvalidCode(
+                shared_types::error_codes::ERR_E2B_VOLUME_SIZE_INVALID,
+            ));
         }
         // 同名检查
         if self
@@ -1088,7 +1114,7 @@ impl SandboxManager {
             .is_some()
         {
             return Err(SandboxApiError::Conflict(format!(
-                "volume \"{name}\" 已存在"
+                "volume \"{name}\" already exists"
             )));
         }
         // 先落行（(tenant,name) 唯一索引承担并发仲裁），再建 PVC——
@@ -1248,11 +1274,12 @@ impl SandboxManager {
                 .pod_status(&record.pod_name)
                 .await
                 .map_err(k8s_error)?
-                .ok_or_else(|| SandboxApiError::Unavailable("温池 Pod 消失".into()))?;
-            let pod_ip = status
-                .pod_ip
-                .clone()
-                .ok_or_else(|| SandboxApiError::Unavailable("温池 Pod 无 IP".into()))?;
+                .ok_or_else(|| {
+                    SandboxApiError::Unavailable("warm-pool pod no longer exists".into())
+                })?;
+            let pod_ip = status.pod_ip.clone().ok_or_else(|| {
+                SandboxApiError::Unavailable("warm-pool pod has no IP address yet".into())
+            })?;
             // K8s 的 activeDeadlineSeconds 只允许下调；deadline 计时从 Pod startTime
             // 起算。认领要的"认领时刻 + lifetime"换算为绝对秒数 =
             // lifetime + 已闲置时长（spawn 时给了 idle_ttl+lifetime 全程余量，

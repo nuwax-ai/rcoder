@@ -93,8 +93,11 @@ impl super::DockerRuntime {
             degraded.push(PodOverviewDegraded {
                 section: "events".to_string(),
                 reason: "docker_events_partial".to_string(),
+                // detail 是默认英文的人类可读补充（与 k8s 采集器、运行时原始
+                // 错误串同语言）；程序化处理请用 section + reason。
                 detail: Some(
-                    "timebox 或条数上限截断；且 docker 只回放最近 256 条，覆盖可能不足 1h"
+                    "event history truncated by the time box or the count cap; docker only \
+                     replays the last 256 events, so coverage may be shorter than 1h"
                         .to_string(),
                 ),
             });
@@ -133,7 +136,9 @@ impl super::DockerRuntime {
             degraded.push(PodOverviewDegraded {
                 section: "usage".to_string(),
                 reason: "docker_stats_partial".to_string(),
-                detail: Some(format!("{stats_failed} 个容器 stats 采集失败")),
+                detail: Some(format!(
+                    "{stats_failed} container(s) failed to collect docker stats"
+                )),
             });
         }
         let (inspections, inspect_failures) = inspect_all(self, &names, &expected_cids).await;
@@ -147,7 +152,7 @@ impl super::DockerRuntime {
                 section: "inspect".to_string(),
                 reason: "inspect_failed".to_string(),
                 detail: Some(format!(
-                    "{} 个容器 inspect 失败（规格/状态按未知处理）: {}",
+                    "{} container(s) failed to inspect (spec and health reported as unknown): {}",
                     real_failures.len(),
                     real_failures
                         .iter()

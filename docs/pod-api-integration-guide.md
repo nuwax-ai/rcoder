@@ -411,10 +411,11 @@ if (data.degraded.length) console.warn("部分分区降级:", data.degraded);
 A: `health.last_termination.is_oom === true` 且 `restart_count` 相比上次增加。
 
 **Q: `restart_count` 在 docker 模式下总是 0？**
-A: **不再是**。docker 下容器退出即消失（`RestartCount` 只统计策略重启，原样透出），
-但 agent 容器停止后**保留 10 分钟**（不再 `auto_remove`），因此 `die→start`
-恢复对可被事件还原，`restart_count` 会有非 0 值，`restart_source="docker_events"`。
-仍可用 `pod_uid` 变化识别重建。
+A: 不一定。docker 的 `RestartCount` 只统计 restart policy 触发的重启（agent 容器没有
+restart policy，这个字段原样透出时为 0）；rcoder 另外从 `docker events` 里数同一容器的
+`die→start` 恢复对作为 `restart_count`，来源见 `restart_source="docker_events"`。agent 容器
+停止后保留 10 分钟再回收（`RCODER_STOPPED_AGENT_RETENTION_SECS`），保留期内发生过的
+恢复对都能数到，所以 `restart_count` 可能非 0。重建（新容器实例）用 `pod_uid` 变化识别。
 
 **Q: 为什么 `overview` 里的 Pod 比 `kubectl get pods` 多/少？**
 A: 数量差异来自**列表口径**（docker 下是本 daemon 全部容器；k8s 下是当前 namespace
@@ -422,6 +423,10 @@ A: 数量差异来自**列表口径**（docker 下是本 daemon 全部容器；k
 `Succeeded` 的 Pod 会原样返回，只是不计入 `summary.not_ready`
 （终态任务的 `ready=false` 是正常终态，不是异常）。
 要按状态筛请在前端按 `phase` 过滤，或看 `summary` 计数。
+
+**Q: `degraded[].detail` 是什么语言？**
+A: 英文（可能带运行时的原始错误串）。响应有服务端缓存、跨请求复用，所以不按
+`Accept-Language` 渲染；需要本地化文案时请按 `section` + `reason` 自行映射。
 
 **Q: 想看某个 Pod 的事件明细？**
 A: `overview.pods[].events`（数量由 `events_limit` 控制）。

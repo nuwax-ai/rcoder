@@ -209,7 +209,8 @@ fn parse_volume_mounts(
                 });
             }
         }
-        // 字符串/数字/布尔/null：整体形态就不对
+        // 字符串/数字/布尔：整体形态就不对。（JSON `null` 走不到这里：
+        // `volumeMounts` 是 `Option<Value>`，serde 把 null 反序列化成 None。）
         _ => return Err(INVALID),
     }
     Ok(volume_mounts)

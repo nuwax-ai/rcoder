@@ -47,22 +47,24 @@ impl TargetReject {
         }
     }
 
+    /// 错误明细：默认英文的自由文本（会原样进入响应）；本地化文案由调用方
+    /// 按 `reason_code` 解析。不要写中文。
     pub(super) fn detail(&self) -> String {
         match self {
             Self::InvalidAppTarget(message) => message.clone(),
             Self::MissingIdentifier => "user_id or pod_id is required".to_string(),
             Self::BuilderNeedsAppId => concat!(
-                "user-app 开发容器请按 /computer/pod/ensure 的形态传参：",
-                "service_type=userapp&app_id=<app_id>&app_stage=dev",
-                "（本接口不接受 user-app-builder 作为独立 service_type）"
+                "user-app dev containers must be addressed the same way as /computer/pod/ensure: ",
+                "service_type=userapp&app_id=<app_id>&app_stage=dev ",
+                "(this endpoint does not accept userapp-builder as a standalone service_type)"
             )
             .to_string(),
             Self::UnsupportedProd(app_id) => format!(
                 concat!(
-                    "app_id={} 的 app_stage=prod 不提供资源监控：",
-                    "业务运行 Deployment 里没有 agent_runner，",
-                    "本接口的数据源（gRPC GetContainerStatus + 容器内 /proc 扫描）不存在，",
-                    "需要容器外部数据源（metrics-server / cAdvisor）另行实现"
+                    "resource monitoring is not available for app_stage=prod of app_id={}: ",
+                    "the production Deployment has no agent_runner, so this endpoint's data ",
+                    "sources (gRPC GetContainerStatus + in-container /proc scan) do not exist; ",
+                    "an external source (metrics-server / cAdvisor) is required"
                 ),
                 app_id
             ),

@@ -73,6 +73,10 @@ pub const ERR_E2B_VOLUME_NAME_INVALID: &str = "ERR_E2B_VOLUME_NAME_INVALID";
 pub const ERR_E2B_MOUNT_PATH_INVALID: &str = "ERR_E2B_MOUNT_PATH_INVALID";
 /// volumeMounts 整体形态不对（非数组/对象、条目缺字段、字段类型错）
 pub const ERR_E2B_VOLUME_MOUNTS_INVALID: &str = "ERR_E2B_VOLUME_MOUNTS_INVALID";
+/// 续期后的到期时间越过了沙箱创建时定下的硬性截止时间
+pub const ERR_E2B_RENEW_EXCEEDS_HARD_DEADLINE: &str = "ERR_E2B_RENEW_EXCEEDS_HARD_DEADLINE";
+/// 续期与并发的回收/终止操作反复冲突（CAS 重试耗尽）
+pub const ERR_E2B_RENEW_CONFLICT: &str = "ERR_E2B_RENEW_CONFLICT";
 pub const ERR_E2B_TIMEOUT_INVALID: &str = "ERR_E2B_TIMEOUT_INVALID";
 pub const ERR_E2B_TIMEOUT_EXCEEDS_CAP: &str = "ERR_E2B_TIMEOUT_EXCEEDS_CAP";
 pub const ERR_E2B_TEMPLATE_UNAVAILABLE: &str = "ERR_E2B_TEMPLATE_UNAVAILABLE";
@@ -371,6 +375,8 @@ fn get_error_i18n_key(code: &str) -> &'static str {
         ERR_E2B_VOLUME_NAME_INVALID => "error.e2b_volume_name_invalid",
         ERR_E2B_MOUNT_PATH_INVALID => "error.e2b_mount_path_invalid",
         ERR_E2B_VOLUME_MOUNTS_INVALID => "error.e2b_volume_mounts_invalid",
+        ERR_E2B_RENEW_EXCEEDS_HARD_DEADLINE => "error.e2b_renew_exceeds_hard_deadline",
+        ERR_E2B_RENEW_CONFLICT => "error.e2b_renew_conflict",
         ERR_E2B_TIMEOUT_INVALID => "error.e2b_timeout_invalid",
         ERR_E2B_TIMEOUT_EXCEEDS_CAP => "error.e2b_timeout_exceeds_cap",
         ERR_E2B_TEMPLATE_UNAVAILABLE => "error.e2b_template_unavailable",
@@ -662,6 +668,8 @@ mod tests {
             ERR_E2B_VOLUME_NAME_INVALID,
             ERR_E2B_MOUNT_PATH_INVALID,
             ERR_E2B_VOLUME_MOUNTS_INVALID,
+            ERR_E2B_RENEW_EXCEEDS_HARD_DEADLINE,
+            ERR_E2B_RENEW_CONFLICT,
             ERR_E2B_TIMEOUT_INVALID,
             ERR_E2B_TIMEOUT_EXCEEDS_CAP,
             ERR_E2B_TEMPLATE_UNAVAILABLE,
@@ -728,6 +736,19 @@ mod tests {
             );
         }
         assert_eq!(ERR_APP_NOT_FOUND, "ERR_APP_NOT_FOUND");
+    }
+
+    /// `ERR_CONFLICT` 在映射表里一直有，语言文件里却没有条目——走
+    /// `get_error_message` 会把裸键名 `error.conflict` 漏给客户端。
+    #[test]
+    fn generic_conflict_message_exists_in_every_catalog() {
+        for locale in crate::SUPPORTED_LOCALES {
+            let message = get_error_message(ERR_CONFLICT, locale);
+            assert!(
+                !message.is_empty() && !message.starts_with("error."),
+                "{ERR_CONFLICT}: {locale} -> {message}"
+            );
+        }
     }
 
     #[test]

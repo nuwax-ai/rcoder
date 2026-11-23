@@ -335,7 +335,12 @@ pub struct PodOverviewSnapshot {
 pub struct PodOverviewDegraded {
     /// 失败的分区：events / pvc / …
     pub section: String,
+    /// 机器可读的稳定标识（如 `docker_events_partial`、`pvc_list_failed`）。
+    /// 客户端做程序化判断或本地化文案时以 `section` + `reason` 为准。
     pub reason: String,
+    /// 人类可读的补充说明，**默认英文**（可能附带运行时的原始错误串）。
+    /// 响应有服务端缓存、跨请求复用，所以这里不按请求语言渲染；需要本地化
+    /// 文案的客户端请按 `reason` 自行映射。不要写入中文。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
