@@ -91,13 +91,21 @@ fn router(state: Arc<AppState>) -> Router {
 }
 
 async fn post_json(app: Router, path: &str, body: serde_json::Value) -> serde_json::Value {
+    post_json_in(app, path, body, None).await
+}
+
+async fn post_json_in(
+    app: Router,
+    path: &str,
+    body: serde_json::Value,
+    accept_language: Option<&str>,
+) -> serde_json::Value {
+    let mut request = Request::post(path).header("content-type", "application/json");
+    if let Some(language) = accept_language {
+        request = request.header("accept-language", language);
+    }
     let response = app
-        .oneshot(
-            Request::post(path)
-                .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
         .await
         .unwrap();
     let status = response.status();
@@ -447,6 +455,34 @@ async fn restart_rejects_project_owned_by_another_user() {
         shared_types::ERR_COMPUTER_OWNER_CONFLICT,
         "{result}"
     );
+    // 文案是重启场景的：错误码与聊天接口共用，但码表里那条说的是"消息未发送"。
+    let message = result["message"].as_str().expect("message");
+    assert_eq!(
+        message,
+        "The project compute ownership does not match this request. The agent was not restarted.",
+        "{result}"
+    );
+    for (language, expected) in [
+        (
+            "zh-CN",
+            "当前项目的计算资源归属与请求身份不一致，未重启 agent。",
+        ),
+        (
+            "zh-TW",
+            "目前專案的計算資源歸屬與請求身分不一致，未重新啟動 agent。",
+        ),
+    ] {
+        let localized = post_json_in(
+            router(state.clone()),
+            "/computer/agent/restart",
+            serde_json::json!({
+                "user_id": "attacker-user", "project_id": project,
+            }),
+            Some(language),
+        )
+        .await;
+        assert_eq!(localized["message"], expected, "{language}: {localized}");
+    }
     // 拒绝路径不得停止执行、也不得清注册。
     assert_eq!(
         fixture.agent.sessions.lock().unwrap().get(&project),

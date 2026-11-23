@@ -317,6 +317,7 @@ userapp_error_page.provisioning.message: "The development environment for this a
 # Ordinary Computer ownership conflict
 error.computer_owner_conflict: "The project compute ownership does not match this request. No message was sent."
 hint.computer_owner_conflict: "Ask an administrator to check the project ownership and request identity before sending again. Do not retry automatically."
+error.computer_restart_owner_conflict: "The project compute ownership does not match this request. The agent was not restarted."
 error.computer_owner_user_mismatch: "The runtime account linked to this conversation does not match this request. No message was sent."
 error.computer_owner_pod_mismatch: "The runtime instance linked to this conversation does not match this request. No message was sent."
 error.computer_owner_service_family_mismatch: "The service type linked to this conversation does not match this request. No message was sent."

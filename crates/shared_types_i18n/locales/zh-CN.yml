@@ -317,6 +317,7 @@ userapp_error_page.provisioning.message: "应用的开发环境正在准备运�
 # Ordinary Computer ownership conflict
 error.computer_owner_conflict: "当前项目的计算资源归属与请求身份不一致，消息未发送。"
 hint.computer_owner_conflict: "请联系管理员核对项目归属与请求身份，修正后再发送；不要自动重试。"
+error.computer_restart_owner_conflict: "当前项目的计算资源归属与请求身份不一致，未重启 agent。"
 error.computer_owner_user_mismatch: "当前会话关联的运行账号与本次请求不一致，消息未发送。"
 error.computer_owner_pod_mismatch: "当前会话关联的运行实例与本次请求不一致，消息未发送。"
 error.computer_owner_service_family_mismatch: "当前会话的服务类型与本次请求不一致，消息未发送。"

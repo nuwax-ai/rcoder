@@ -313,6 +313,7 @@ userapp_error_page.provisioning.message: "應用的開發環境正在準備執�
 # Ordinary Computer ownership conflict
 error.computer_owner_conflict: "目前專案的計算資源歸屬與請求身分不一致，訊息未傳送。"
 hint.computer_owner_conflict: "請聯絡管理員核對專案歸屬與請求身分，修正後再傳送；不要自動重試。"
+error.computer_restart_owner_conflict: "目前專案的計算資源歸屬與請求身分不一致，未重新啟動 agent。"
 error.computer_owner_user_mismatch: "目前會話關聯的執行帳號與本次請求不一致，訊息未傳送。"
 error.computer_owner_pod_mismatch: "目前會話關聯的執行個體與本次請求不一致，訊息未傳送。"
 error.computer_owner_service_family_mismatch: "目前會話的服務類型與本次請求不一致，訊息未傳送。"

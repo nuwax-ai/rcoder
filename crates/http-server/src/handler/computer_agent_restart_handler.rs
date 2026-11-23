@@ -177,11 +177,16 @@ pub async fn computer_agent_restart(
             "⛔ [COMPUTER_RESTART] Owner mismatch: project_id={}, claimed user_id={}, owner={}",
             project_id, claimed, owner
         );
-        // 归属不符的语义完全由错误码表达：按 Accept-Language 取码表文案
-        // （en 默认），不再用一段自定义文案覆盖它。
-        return Ok(HttpResult::error_with_locale(
+        // 归属不符：错误码沿用 ERR_COMPUTER_OWNER_CONFLICT（调用方按码分支），文案按
+        // Accept-Language 取重启场景的那条——码表里该码默认的文案是聊天场景的
+        // （"消息未发送"），对重启请求是错的。
+        return Ok(HttpResult::error_with_message(
             shared_types::error_codes::ERR_COMPUTER_OWNER_CONFLICT,
             locale,
+            &shared_types::get_i18n_message(
+                shared_types::error_codes::COMPUTER_RESTART_OWNER_CONFLICT_MESSAGE_KEY,
+                locale,
+            ),
         ));
     }
 

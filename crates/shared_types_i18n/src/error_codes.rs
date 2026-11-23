@@ -252,6 +252,11 @@ pub const ERR_NOT_FOUND: &str = "ERR_NOT_FOUND";
 pub const ERR_CONFLICT: &str = "ERR_CONFLICT";
 /// Ordinary Computer ownership conflict, rejected before task dispatch.
 pub const ERR_COMPUTER_OWNER_CONFLICT: &str = "ERR_COMPUTER_OWNER_CONFLICT";
+/// 重启 agent 时的归属冲突文案。与聊天接口共用 [`ERR_COMPUTER_OWNER_CONFLICT`]
+/// 这个码（调用方按码分支），但码表里那条文案说的是"消息未发送"——重启场景
+/// 没有消息，另取这条。
+pub const COMPUTER_RESTART_OWNER_CONFLICT_MESSAGE_KEY: &str =
+    "error.computer_restart_owner_conflict";
 /// Diagnostic reasons; these do not expose the registered or requested values.
 pub const COMPUTER_OWNER_USER_MISMATCH: &str = "COMPUTER_OWNER_USER_MISMATCH";
 pub const COMPUTER_OWNER_POD_MISMATCH: &str = "COMPUTER_OWNER_POD_MISMATCH";
@@ -740,6 +745,29 @@ mod tests {
             );
         }
         assert_eq!(ERR_APP_NOT_FOUND, "ERR_APP_NOT_FOUND");
+    }
+
+    /// 反例：重启接口的归属冲突曾直接取码表里聊天场景的文案（"消息未发送"），
+    /// 对重启请求是错的。重启场景的那条必须在每种语言里都有，且不提消息。
+    #[test]
+    fn computer_restart_owner_conflict_has_its_own_message_in_every_catalog() {
+        for locale in crate::SUPPORTED_LOCALES {
+            let message = get_i18n_message(COMPUTER_RESTART_OWNER_CONFLICT_MESSAGE_KEY, locale);
+            assert!(
+                !message.is_empty() && !message.starts_with("error."),
+                "{locale}: {message}"
+            );
+            let chat = get_error_message(ERR_COMPUTER_OWNER_CONFLICT, locale);
+            assert_ne!(message, chat, "{locale}: 不能与聊天场景共用文案");
+        }
+        assert!(
+            get_i18n_message(COMPUTER_RESTART_OWNER_CONFLICT_MESSAGE_KEY, "zh-CN")
+                .contains("未重启 agent")
+        );
+        assert!(
+            !get_i18n_message(COMPUTER_RESTART_OWNER_CONFLICT_MESSAGE_KEY, "zh-CN")
+                .contains("消息未发送")
+        );
     }
 
     /// `ERR_CONFLICT` 在映射表里一直有，语言文件里却没有条目——走
