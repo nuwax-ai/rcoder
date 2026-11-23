@@ -376,17 +376,10 @@ impl super::DockerRuntime {
         // 对正常 stop 也发，标成 Error 会把"优雅停止"计成崩溃。
         let state_oom = state.and_then(|s| s.oom_killed).unwrap_or(false);
         let is_oom = oom_in_cycle || state_oom;
-        let reason = if is_oom {
-            Some("OOMKilled".to_string())
-        } else {
-            match die_exit_code {
-                Some(0) => Some("Completed".to_string()),
-                Some(_) => Some("Error".to_string()),
-                // 有 die 但拿不到退出码：不能猜 0（会伪装成正常）
-                None if last_die.is_some() => Some("Unknown".to_string()),
-                None => None,
-            }
-        };
+        // 终止原因走共享判定；`died` = 事件里有 die。没有 die 且不是 OOM 时
+        // 没有原因（容器从未终止过）。
+        let reason =
+            termination_reason(is_oom, die_exit_code, last_die.is_some()).map(str::to_string);
         // `State.OOMKilled` 为真但事件里没有 oom（events 采集失败/超出 256 条
         // 回放窗口）时，`last_oom_at` 不能空着——否则 oom_killed_last=true 却
         // 没有时间，前端无法记录"什么时候 OOM 的"。退回 State.FinishedAt。
@@ -502,15 +495,8 @@ impl super::DockerRuntime {
         // 而不是"历史任何 oom"——否则容器先 OOM 恢复、后来正常退出，也会
         // 被误报成最近一次是 OOM。
         let (oom_in_cycle, die_exit_code) = last_exit_cycle(&own);
-        let reason = if oom_in_cycle {
-            Some("OOMKilled".to_string())
-        } else {
-            match die_exit_code {
-                Some(0) => Some("Completed".to_string()),
-                Some(_) => Some("Error".to_string()),
-                None => Some("Unknown".to_string()),
-            }
-        };
+        // 本函数开头已确认事件里有 die，`died` 恒为 true。
+        let reason = termination_reason(oom_in_cycle, die_exit_code, true).map(str::to_string);
         Ok(Some(LastTermination {
             reason,
             exit_code: die_exit_code.map(|c| c as i32),
@@ -828,20 +814,16 @@ fn docker_health(state: Option<&ContainerState>, events: &[&RawEvent]) -> PodHea
     // 也不该报——否则会出现 "reason=OOMKilled 但 last_terminate_at=None"
     // 的自相矛盾。
     let terminated = has_die || stopped;
-    let last_terminate_reason = if !terminated {
-        None
-    } else if oom_killed_last {
-        Some("OOMKilled".to_string())
-    } else {
-        Some(
-            match exit_code {
-                Some(0) => "Completed",
-                Some(_) => "Error",
-                None => "Unknown",
-            }
-            .to_string(),
-        )
-    };
+    // `oom_killed_last && terminated`：未真实终止时**不报** OOM（运行中的
+    // 容器即便 State.OOMKilled=true 也不报，否则会出现 "reason=OOMKilled 但
+    // last_terminate_at=None" 的自相矛盾）——这一优先序只属于本采集器，由
+    // 调用方相与表达，不进共享函数（见 `termination_reason` 文档）。
+    let last_terminate_reason = termination_reason(
+        oom_killed_last && terminated,
+        exit_code.map(i64::from),
+        terminated,
+    )
+    .map(str::to_string);
     // 终止时间：事件里最近 die 的时间优先，退回 State.FinishedAt
     let finished_at = events
         .iter()
@@ -868,7 +850,8 @@ fn docker_health(state: Option<&ContainerState>, events: &[&RawEvent]) -> PodHea
         restart_count,
         restart_source: "docker_events".to_string(),
         last_termination: last_terminate_reason.map(|reason| {
-            let is_oom = reason == "OOMKilled";
+            let is_oom =
+                reason == container_runtime_api::ContainerFailureReason::OOMKilled.as_str();
             container_runtime_api::pod_overview::LastTermination {
                 reason: Some(reason),
                 exit_code,
@@ -880,6 +863,35 @@ fn docker_health(state: Option<&ContainerState>, events: &[&RawEvent]) -> PodHea
         detail: state
             .and_then(|s| s.error.clone())
             .filter(|e| !e.is_empty()),
+    }
+}
+
+/// docker 侧终止原因的**唯一**判定（三处采集共用：`container_health_inner`、
+/// `termination_history_inner`、`docker_health`）。
+///
+/// 词表与 k8s 侧同一套字符串，调用方按 `reason == "OOMKilled"` 判定 OOM
+/// （见 `container_runtime_api::pod_overview` 模块文档）——**不要**改用
+/// `exit_code == 137` 猜。
+///
+/// - `is_oom` 优先于一切：退出周期归因或 `State.OOMKilled` 为真即 OOM；
+/// - `died` = 发生了真实终止。非 OOM 且从未终止时没有原因；
+/// - `exit_code`：0 = `Completed`（优雅停止，不是 Error），非 0 = `Error`，
+///   拿不到 = `Unknown`（不能猜 0，那会把崩溃伪装成正常退出）。
+///
+/// 调用方若要求"未终止则一律不报"（含不报 OOM），自行把 `is_oom` 与 `died`
+/// 相与后传入——`docker_health` 即如此（运行中的容器即便 `State.OOMKilled=true`
+/// 也不能报，否则出现 "reason=OOMKilled 但 finished_at=None" 的自相矛盾）。
+fn termination_reason(is_oom: bool, exit_code: Option<i64>, died: bool) -> Option<&'static str> {
+    if is_oom {
+        return Some(container_runtime_api::ContainerFailureReason::OOMKilled.as_str());
+    }
+    if !died {
+        return None;
+    }
+    match exit_code {
+        Some(0) => Some("Completed"),
+        Some(_) => Some("Error"),
+        None => Some("Unknown"),
     }
 }
 

@@ -247,6 +247,7 @@ pub use shared_types_grpc::MaskedModelConfig;
 pub use model::{
     AcpRequestPermission,
     AgentBinarySnapshot,
+    AgentExecutionStatus,
     AgentLifecycle,
     AgentLifecycleGuard,
     AgentSessionUpdate,

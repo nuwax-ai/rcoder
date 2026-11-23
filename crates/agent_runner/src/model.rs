@@ -2,6 +2,7 @@
 
 pub use shared_types::{
     // Agent model exports
+    AgentExecutionStatus,
     AgentStatus,
     // Session and message exports
     Attachment,

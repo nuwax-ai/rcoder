@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, instrument};
 
-use crate::model::AgentStatus;
+use crate::model::{AgentExecutionStatus, AgentStatus};
 use crate::router::AppState;
 use crate::service::AGENT_REGISTRY;
 
@@ -47,11 +47,14 @@ pub async fn get_status(
         let (status_str, is_found) = if let Some(ref pid) = project_id {
             if let Some(agent_info) = AGENT_REGISTRY.get_agent_info(pid)
                 .filter(|info| req.session_id.is_empty() || info.session_id.to_string() == req.session_id) {
-                let status_str = match agent_info.status {
-                    AgentStatus::Pending => "busy",
-                    AgentStatus::Active => "busy",
-                    AgentStatus::Idle => "idle",
-                    AgentStatus::Terminating => "busy",
+                // 对外只有 busy/idle 两档："还没空闲"即 busy（Terminating 也算）。
+                // 经 AgentExecutionStatus 收拢，新增 AgentStatus 变体时 `From`
+                // 的穷尽 match 先编译失败。
+                let status_str = match AgentExecutionStatus::from(agent_info.status) {
+                    AgentExecutionStatus::Idle => "idle",
+                    AgentExecutionStatus::Processing | AgentExecutionStatus::Terminating => {
+                        "busy"
+                    }
                 };
                 // 确认的执行身份:调用方(状态聚合/资源核验)以此为单一事实源,
                 // 不得事后从注册表重读(读取与确认之间可能换代)。

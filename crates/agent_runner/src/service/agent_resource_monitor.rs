@@ -922,6 +922,34 @@ pub struct AgentScan {
     pub stats: AgentScanStats,
 }
 
+/// 按 pgid 累加的进程组总量。
+///
+/// 字段具名：原先是 `(u64, u64, u32)` 元组配 `slot.0/.1/.2` 累加，读代码时
+/// 必须回头数下标；与本文件其它聚合结构保持具名风格。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Default)]
+struct GroupTotal {
+    /// 组内进程 RSS 之和（字节）
+    rss_bytes: u64,
+    /// 组内进程 utime+stime 之和（时钟 tick）
+    cpu_ticks: u64,
+    /// 组内进程数
+    process_count: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl GroupTotal {
+    /// 累加一个进程。RSS / CPU 用 saturating 相加：畸形 `/proc` 值不应让
+    /// 观测路径 panic（这里失败会带塌整个资源接口）。
+    fn add(&mut self, info: &process_utils::proc_scan::ProcInfo) {
+        self.rss_bytes = self.rss_bytes.saturating_add(info.rss_bytes);
+        self.cpu_ticks = self
+            .cpu_ticks
+            .saturating_add(info.utime_ticks.saturating_add(info.stime_ticks));
+        self.process_count += 1;
+    }
+}
+
 /// 按 agent 进程组聚合容器内进程，**每个 project 一条**。
 ///
 /// 一个 user 容器可以并存多个 project（工作目录 `/home/user/<project_id>`），
@@ -953,18 +981,12 @@ pub fn agent_executions(
     }
 
     // 单次遍历进程表，按 pgid 累加
-    let mut totals: std::collections::HashMap<u32, (u64, u64, u32)> =
-        std::collections::HashMap::new();
+    let mut totals: std::collections::HashMap<u32, GroupTotal> = std::collections::HashMap::new();
     for info in table.values() {
         if !pgids.contains(&info.pgrp) {
             continue;
         }
-        let slot = totals.entry(info.pgrp).or_insert((0, 0, 0));
-        slot.0 = slot.0.saturating_add(info.rss_bytes);
-        slot.1 = slot
-            .1
-            .saturating_add(info.utime_ticks.saturating_add(info.stime_ticks));
-        slot.2 += 1;
+        totals.entry(info.pgrp).or_default().add(info);
     }
 
     let tps = procfs::ticks_per_second().max(1) as f64;
@@ -981,27 +1003,21 @@ pub fn agent_executions(
             stats.duplicate_pgid += 1;
             continue;
         }
-        let Some(&(rss_bytes, ticks, process_count)) = totals.get(&pgid) else {
+        let Some(total) = totals.get(&pgid) else {
             stats.pgid_not_found += 1;
             continue;
         };
-        // 全量匹配，不写 `_ =>`：以后新增 AgentStatus 变体时，这里必须编译失败，
-        // 避免新状态被悄悄当成"Processing"。
-        let status = match exec.status {
-            // Pending = 任务已入队、等待 worker。对外仍是"忙"，
-            // 与 GetStatus 的 busy 口径一致。
-            crate::model::AgentStatus::Pending => "Processing",
-            crate::model::AgentStatus::Active => "Processing",
-            crate::model::AgentStatus::Idle => "Idle",
-            crate::model::AgentStatus::Terminating => "Terminating",
-        };
+        // 对外词表集中在 `AgentExecutionStatus`：Pending/Active 同归 Processing
+        // （与 GetStatus 的 busy 口径一致）。新增 AgentStatus 变体时 `From` 的
+        // 穷尽 match 先编译失败，不会被悄悄当成 Processing。
+        let status = crate::model::AgentExecutionStatus::from(exec.status);
         out.push(AgentExecutionSummary {
             project_id: exec.project_id.clone(),
             session_id: Some(exec.session_id.clone()),
-            status: status.to_string(),
-            rss_bytes,
-            cpu_seconds: ticks as f64 / tps,
-            process_count,
+            status: status.as_str().to_string(),
+            rss_bytes: total.rss_bytes,
+            cpu_seconds: total.cpu_ticks as f64 / tps,
+            process_count: total.process_count,
         });
     }
     // RSS 降序（内存占用大的排在前面），同 RSS 按 project_id 升序保证稳定
