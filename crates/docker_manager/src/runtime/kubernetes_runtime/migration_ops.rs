@@ -22,8 +22,8 @@
 
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
-    Container, EnvVar, PersistentVolumeClaimVolumeSource, PodSpec, PodTemplateSpec, Volume,
-    VolumeMount,
+    Container, EnvVar, PersistentVolumeClaimVolumeSource, Pod, PodSecurityContext, PodSpec,
+    PodTemplateSpec, SeccompProfile, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, DeleteParams, ListParams, PostParams};
@@ -35,6 +35,21 @@ use super::*;
 
 /// Job 等待上限（4h, 与迁移脚本 activeDeadlineSeconds 对齐）。
 const JOB_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(14400);
+
+/// Job 的 Pod 起不来时（拉不到镜像、容器创建失败）的检查节拍：Job 创建后先等
+/// 这么久再看第一次（给正常拉镜像留时间），之后每次间隔。
+const POD_CHECK_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+const POD_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// 不会自愈的容器等待态。`ErrImagePull` 不在其中：首次拉取失败可能只是网络
+/// 抖动，重试即恢复；连续失败后 kubelet 才转成 `ImagePullBackOff`。
+const BLOCKING_WAITING_REASONS: &[&str] = &[
+    "ImagePullBackOff",
+    "ErrImageNeverPull",
+    "InvalidImageName",
+    "CreateContainerError",
+    "CreateContainerConfigError",
+];
 
 /// 迁移 Job 的执行参数（纯数据, 供单测构造/断言）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +108,24 @@ fn validate_src_subpath(identifier: &str) -> ContainerRuntimeResult<()> {
             "migration source identifier '{identifier}' is not a valid userId: \
              expected 1-64 characters of letters, digits, '_' or '-' \
              (it is joined under the shared volume as a path segment)"
+        )));
+    }
+    Ok(())
+}
+
+/// Job 名：`migrate-{user_id 下划线→连字符}-{full|incremental}`。
+/// 能通过 [`validate_migration_identifier`] 的 user_id 拼出来一定是合法的 DNS label。
+fn migration_job_name(identifier: &str, mode: WorkspaceSyncMode) -> String {
+    format!("migrate-{}-{}", identifier.replace('_', "-"), mode.as_str())
+}
+
+/// 同步开始前（任何 I/O 之前）对 user_id 的全部要求：能当共享卷下的路径段，
+/// 也能拼出合法的 Job 名与标签值。编排入口已按同一规则拒过一次，这里是纵深防御。
+fn validate_migration_identifier(identifier: &str) -> ContainerRuntimeResult<()> {
+    validate_src_subpath(identifier)?;
+    if let Err(reason) = shared_types::validate_migration_user_id(identifier) {
+        return Err(ContainerRuntimeError::ConfigurationError(format!(
+            "cannot run workspace migration for '{identifier}': {reason}"
         )));
     }
     Ok(())
@@ -189,6 +222,16 @@ fn build_job(plan: &MigrationJobPlan) -> Job {
                 metadata: None,
                 spec: Some(PodSpec {
                     restart_policy: Some("Never".to_string()),
+                    // Job 只跑 rclone, 不访问 API server——不挂 ServiceAccount token
+                    // （与沙箱 Pod 同款加固）；系统调用面收敛到运行时默认 profile。
+                    automount_service_account_token: Some(false),
+                    security_context: Some(PodSecurityContext {
+                        seccomp_profile: Some(SeccompProfile {
+                            type_: "RuntimeDefault".to_string(),
+                            localhost_profile: None,
+                        }),
+                        ..Default::default()
+                    }),
                     containers: vec![Container {
                         name: "sync".to_string(),
                         image: Some(plan.image.clone()),
@@ -239,6 +282,58 @@ fn build_job(plan: &MigrationJobPlan) -> Job {
             ..Default::default()
         }),
         ..Default::default()
+    }
+}
+
+/// Job 的 Pod 里有没有卡在"起不来"状态的容器；有则返回可读原因。
+fn blocked_container<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> Option<String> {
+    for pod in pods {
+        let Some(statuses) = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.container_statuses.as_ref())
+        else {
+            continue;
+        };
+        let pod_name = pod.metadata.name.as_deref().unwrap_or("<unnamed>");
+        for status in statuses {
+            let Some(waiting) = status
+                .state
+                .as_ref()
+                .and_then(|state| state.waiting.as_ref())
+            else {
+                continue;
+            };
+            let Some(reason) = waiting.reason.as_deref() else {
+                continue;
+            };
+            if BLOCKING_WAITING_REASONS.contains(&reason) {
+                let detail = waiting
+                    .message
+                    .as_deref()
+                    .map(|message| format!(": {message}"))
+                    .unwrap_or_default();
+                return Some(format!("{pod_name}/{}: {reason}{detail}", status.name));
+            }
+        }
+    }
+    None
+}
+
+/// 起不来的原因要连续两次观测到同一个才判失败：单次观测可能是瞬时状态
+/// （两次观测间隔 [`POD_CHECK_EVERY`]）。观测不到（列表失败/没有异常）就重新计数。
+#[derive(Default)]
+struct StuckObservation(Option<String>);
+
+impl StuckObservation {
+    fn confirmed(&mut self, observation: Option<String>) -> Option<String> {
+        match (&self.0, &observation) {
+            (Some(previous), Some(current)) if previous == current => observation,
+            _ => {
+                self.0 = observation;
+                None
+            }
+        }
     }
 }
 
@@ -299,10 +394,11 @@ impl KubernetesRuntime {
     ) -> ContainerRuntimeResult<()> {
         use crate::runtime::k8s_pvc::K8sPvcOps;
         // 纯检查排在任何 I/O 之前（纵深防御：编排入口已先做过一遍）。
-        // - src 子路径要拼进 rclone 源路径，非法值必须在建 Job 之前就拒掉
-        //   （否则 Job 建起来也只是同步一个越界路径或直接失败）；
+        // - user_id 既要能当 rclone 源路径段，也要能拼出合法的 Job 名与标签值，
+        //   非法值必须在建 Job 之前就拒掉（否则 Job 建起来也只是同步一个越界
+        //   路径，或者直接被 apiserver 打回）；
         // - 镜像是纯 env 读取，配置缺失不该等到读过 PVC 之后才报。
-        validate_src_subpath(identifier)?;
+        validate_migration_identifier(identifier)?;
         // 镜像选择（显式配置即信任——部署方设 RCODER_MIGRATION_IMAGE 意味着
         // 专用 rclone-migrate 镜像已构建推送; 无法在本地可靠探测远端镜像存在性,
         // 之前"恒 false 走 fallback"会让显式配置被静默忽略）。两者都缺即报错,
@@ -322,7 +418,7 @@ impl KubernetesRuntime {
             )));
         }
         let plan = MigrationJobPlan {
-            job_name: format!("migrate-{}-{}", identifier.replace('_', "-"), mode.as_str()),
+            job_name: migration_job_name(identifier, mode),
             namespace: self.namespace.clone(),
             image: final_image,
             download_rclone,
@@ -349,6 +445,10 @@ impl KubernetesRuntime {
         // 等完成: 轮询 condition=Complete / succeeded>=1（不依赖 wait 子命令,
         // 超时即失败——Job 的 activeDeadlineSeconds 会兜底杀掉 rclone）
         let deadline = std::time::Instant::now() + JOB_WAIT_TIMEOUT;
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        let selector = format!("job-name={}", plan.job_name);
+        let mut stuck = StuckObservation::default();
+        let mut next_pod_check = std::time::Instant::now() + POD_CHECK_DELAY;
         let outcome = loop {
             if std::time::Instant::now() > deadline {
                 break Err("timeout".to_string());
@@ -359,14 +459,45 @@ impl KubernetesRuntime {
                     if status.and_then(|s| s.succeeded).unwrap_or(0) >= 1 {
                         break Ok(());
                     }
-                    // Failed 条件出现且无成功可能（backoffLimit 耗尽）
+                    // Failed 条件（backoffLimit 耗尽；不依赖具体的重试次数），或
+                    // 失败计数耗尽且没有在跑的 Pod
                     let failed = status.and_then(|s| s.failed).unwrap_or(0);
                     let active = status.and_then(|s| s.active).unwrap_or(0);
-                    if failed >= 3 && active == 0 {
-                        break Err(format!("failed={failed}"));
+                    let failed_condition =
+                        status
+                            .and_then(|s| s.conditions.as_ref())
+                            .is_some_and(|conditions| {
+                                conditions
+                                    .iter()
+                                    .any(|c| c.type_ == "Failed" && c.status == "True")
+                            });
+                    if failed_condition || (failed >= 3 && active == 0) {
+                        break Err(format!("failed={failed}, active={active}"));
                     }
                 }
                 Err(e) => break Err(format!("get job: {e}")),
+            }
+            // Pod 起不来时（拉不到镜像、容器创建失败）Job 的 active 恒为 1、failed
+            // 恒为 0——上面的判据要等到 activeDeadlineSeconds（4h）才成立，而这期间
+            // cutover 的 agent 停着，写门禁与该用户的编排锁都被占着。这类等待态
+            // 不会自愈，确认后立即失败：调用方拿到原因，用户的下一个请求会把
+            // agent 重建回共享卷。
+            if std::time::Instant::now() >= next_pod_check {
+                next_pod_check = std::time::Instant::now() + POD_CHECK_EVERY;
+                let observed = match pods.list(&ListParams::default().labels(&selector)).await {
+                    Ok(list) => blocked_container(list.items.iter()),
+                    Err(e) => {
+                        tracing::debug!(
+                            job = %plan.job_name,
+                            error = %e,
+                            "migration sync job pod status check failed"
+                        );
+                        None
+                    }
+                };
+                if let Some(reason) = stuck.confirmed(observed) {
+                    break Err(reason);
+                }
             }
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         };
@@ -643,6 +774,157 @@ mod tests {
         );
         // 日志行照常打印了这条命令（不是静默执行）
         assert!(stdout.contains("[migrate] exec:"), "{stdout}");
+    }
+
+    /// Job 只跑 rclone，不访问 API server：不挂 ServiceAccount token（namespace 里
+    /// 的 SA token 能读到什么，挂进数据面 Job 就是多大的面），系统调用面收敛到
+    /// 运行时默认 seccomp profile。与沙箱 Pod 同款加固。
+    #[test]
+    fn job_pod_mounts_no_service_account_token_and_sets_seccomp_profile() {
+        let job = build_job(&plan(WorkspaceSyncMode::Full));
+        let pod = job
+            .spec
+            .as_ref()
+            .expect("spec")
+            .template
+            .spec
+            .as_ref()
+            .expect("pod spec");
+        assert_eq!(pod.automount_service_account_token, Some(false));
+        let profile = pod
+            .security_context
+            .as_ref()
+            .and_then(|context| context.seccomp_profile.as_ref())
+            .expect("pod seccomp profile");
+        assert_eq!(profile.type_, "RuntimeDefault");
+        assert_eq!(profile.localhost_profile, None);
+        assert_eq!(pod.service_account_name, None);
+    }
+
+    #[test]
+    fn job_name_is_a_valid_dns_label_for_every_accepted_user_id() {
+        for id in ["6", "mig-u1", &"u".repeat(43)] {
+            for mode in [WorkspaceSyncMode::Full, WorkspaceSyncMode::Incremental] {
+                let name = migration_job_name(id, mode);
+                assert!(
+                    name.len() <= 63
+                        && name.starts_with("migrate-")
+                        && name
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    /// 反例（部署评审）：这些 id 能通过标识符白名单，却拼不出合法的 Job 名或
+    /// 标签值——拖到 Job 创建时才被 apiserver 拒绝（422）就晚了。
+    #[test]
+    fn migration_identifier_rejects_ids_that_cannot_name_the_job() {
+        for id in ["6", "mig-u1", "user_42", &"u".repeat(43)] {
+            assert!(validate_migration_identifier(id).is_ok(), "{id}");
+        }
+        for id in ["ABC123", "-mig", "mig-", "mig_", &"u".repeat(44)] {
+            let error = validate_migration_identifier(id).unwrap_err();
+            assert!(
+                matches!(error, ContainerRuntimeError::ConfigurationError(_)),
+                "{id}: {error:?}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot name a Kubernetes migration Job")
+            );
+        }
+        // 路径段规则仍在：越出共享卷的值以它为由拒绝
+        let error = validate_migration_identifier("../etc").unwrap_err();
+        assert!(error.to_string().contains("not a valid userId"), "{error}");
+    }
+
+    fn pod_with_container_state(name: &str, state: serde_json::Value) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": name},
+            "status": {"containerStatuses": [{"name": "sync", "state": state}]}
+        }))
+        .unwrap()
+    }
+
+    /// Job 起不来时 active 恒为 1、failed 恒为 0，只看 Job 状态要等满 4 小时——
+    /// 期间 cutover 的 agent 停着、写门禁与编排锁都被占着。
+    #[test]
+    fn blocked_container_reports_only_waits_that_do_not_recover() {
+        let pulling = pod_with_container_state(
+            "migrate-u1-full-aaaaa",
+            serde_json::json!({"waiting": {"reason": "ContainerCreating"}}),
+        );
+        // 首次拉取失败可能只是抖动, 重试即恢复: 不算
+        let first_failure = pod_with_container_state(
+            "migrate-u1-full-bbbbb",
+            serde_json::json!({"waiting": {"reason": "ErrImagePull", "message": "timeout"}}),
+        );
+        let running = pod_with_container_state(
+            "migrate-u1-full-ccccc",
+            serde_json::json!({"running": {"startedAt": "2026-11-23T00:00:00Z"}}),
+        );
+        let empty = pod_with_container_state(
+            "migrate-u1-full-ddddd",
+            serde_json::json!({"terminated": {"exitCode": 1}}),
+        );
+        assert_eq!(
+            blocked_container([&pulling, &first_failure, &running, &empty]),
+            None
+        );
+
+        let backoff = pod_with_container_state(
+            "migrate-u1-full-eeeee",
+            serde_json::json!({"waiting": {
+                "reason": "ImagePullBackOff",
+                "message": "Back-off pulling image \"reg/rclone-migrate:1.76.0\""
+            }}),
+        );
+        assert_eq!(
+            blocked_container([&pulling, &backoff]),
+            Some(
+                "migrate-u1-full-eeeee/sync: ImagePullBackOff: Back-off pulling image \
+                 \"reg/rclone-migrate:1.76.0\""
+                    .to_string()
+            )
+        );
+        let broken = pod_with_container_state(
+            "migrate-u1-full-fffff",
+            serde_json::json!({"waiting": {"reason": "CreateContainerError"}}),
+        );
+        assert_eq!(
+            blocked_container([&broken]),
+            Some("migrate-u1-full-fffff/sync: CreateContainerError".to_string())
+        );
+    }
+
+    /// 单次观测可能是瞬时状态：同一个原因连续两次才确认；中途换原因或观测不到
+    /// 就重新计数。
+    #[test]
+    fn stuck_observation_needs_two_consecutive_hits_of_the_same_reason() {
+        let reason = Some("pod/sync: ImagePullBackOff".to_string());
+        let mut stuck = StuckObservation::default();
+        assert_eq!(stuck.confirmed(None), None);
+        assert_eq!(stuck.confirmed(reason.clone()), None, "第一次只记录");
+        assert_eq!(
+            stuck.confirmed(reason.clone()),
+            reason,
+            "连续第二次确认失败"
+        );
+
+        stuck = StuckObservation::default();
+        assert_eq!(stuck.confirmed(reason.clone()), None);
+        assert_eq!(stuck.confirmed(None), None, "观测不到: 重新计数");
+        assert_eq!(stuck.confirmed(reason.clone()), None);
+        assert_eq!(
+            stuck.confirmed(Some("pod/sync: CreateContainerError".to_string())),
+            None,
+            "原因变了: 重新计数"
+        );
     }
 
     #[test]

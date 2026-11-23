@@ -102,6 +102,36 @@ pub static IDENTIFIER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLoc
     regex::Regex::new(r"\A[a-zA-Z0-9_-]{1,64}\z").expect("identifier whitelist regex")
 });
 
+/// 迁移 Job 名里留给 `user_id` 的长度。Job 名是
+/// `migrate-{user_id 下划线→连字符}-{full|incremental}`，必须是一个 DNS-1123
+/// label（≤63 位）；前后缀最长共占 20 位。
+pub const MIGRATION_USER_ID_MAX_LEN: usize = 43;
+
+/// 迁移编排可接受的 `user_id`：[`validate_identifier`] 之上再加 Kubernetes
+/// 对象名的限制。
+///
+/// user_id（下划线→连字符）同时是迁移 Job 名的中段和 Job 的标签值：对象名只能
+/// 是小写字母、数字、连字符，标签值还得首尾都是字母数字。放不下的 user_id 此前
+/// 要到 cutover **停完 agent** 之后建 Job 才被 apiserver 拒绝，留下停机残留——
+/// 所以在编排入口就拒绝。文案默认英文。
+pub fn validate_migration_user_id(value: &str) -> Result<(), String> {
+    validate_identifier(value, "userId")?;
+    let name_part = value.replace('_', "-");
+    let edge_alphanumeric = name_part.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name_part.ends_with(|c: char| c.is_ascii_alphanumeric());
+    let dns_safe = name_part
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if name_part.len() > MIGRATION_USER_ID_MAX_LEN || !edge_alphanumeric || !dns_safe {
+        return Err(format!(
+            "userId {value:?} cannot name a Kubernetes migration Job: expected at most {} \
+             lowercase letters, digits, '_' or '-', starting and ending with a letter or digit",
+            MIGRATION_USER_ID_MAX_LEN
+        ));
+    }
+    Ok(())
+}
+
 // ── 多平台绝对路径规范化（自 file-server workspace.rs 提取，单一事实源）──────
 //
 // 首个消费方为 file-server 的项目绑定目录 workspaceDir（TS nuwax-file-server
@@ -364,6 +394,40 @@ mod tests {
         assert!(validate_identifier("../etc", "id").is_err());
         assert!(validate_identifier("..\\etc", "id").is_err());
         assert!(validate_identifier("é", "id").is_err());
+    }
+
+    /// 反例（部署评审）：`validate_identifier` 放行大写、首尾连字符/下划线和 64 位
+    /// 的 id，但这样的 id 拼出来的迁移 Job 名或标签值不合法——此前要到 cutover
+    /// 停完 agent、建 Job 时才被 apiserver 拒绝（422）。
+    #[test]
+    fn migration_user_id_must_be_able_to_name_the_kubernetes_job() {
+        for id in ["6", "mig-u1", "user_42", "rbd-v2-u1", &"u".repeat(43)] {
+            assert!(validate_migration_user_id(id).is_ok(), "{id} 应通过");
+        }
+        // 长度上界刚好让最长的 Job 名落在 63 位以内
+        assert_eq!(format!("migrate-{}-incremental", "u".repeat(43)).len(), 63);
+
+        let long = "u".repeat(44);
+        for id in [
+            "",
+            "a/b",
+            "a.b",
+            "用户",
+            "ABC123", // 对象名/标签值只认小写
+            "-mig",   // 标签值首尾必须是字母数字
+            "mig-",
+            "_mig",
+            "mig_",
+            long.as_str(),
+        ] {
+            let error = validate_migration_user_id(id).unwrap_err();
+            if validate_identifier(id, "userId").is_ok() {
+                assert!(
+                    error.contains("cannot name a Kubernetes migration Job"),
+                    "'{id:?}' 应以 Job 命名限制为由拒绝: {error}"
+                );
+            }
+        }
     }
 
     // ── normalize_absolute_dir / is_absolute_path_like（与 file-server 既有

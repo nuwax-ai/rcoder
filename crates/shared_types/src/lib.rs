@@ -201,9 +201,10 @@ pub mod migration_gate;
 pub mod sandbox;
 pub mod validation;
 pub use validation::{
-    ABSOLUTE_DIR_MAX_LEN, AGENT_WORK_DIR_MAX_SEGMENTS, IDENTIFIER_RE, USERAPP_APP_ID_MAX_LEN,
-    garde_err_to_app_error, is_absolute_path_like, normalize_absolute_dir, validate_agent_work_dir,
-    validate_agent_work_dir_for_service, validate_identifier,
+    ABSOLUTE_DIR_MAX_LEN, AGENT_WORK_DIR_MAX_SEGMENTS, IDENTIFIER_RE, MIGRATION_USER_ID_MAX_LEN,
+    USERAPP_APP_ID_MAX_LEN, garde_err_to_app_error, is_absolute_path_like, normalize_absolute_dir,
+    validate_agent_work_dir, validate_agent_work_dir_for_service, validate_identifier,
+    validate_migration_user_id,
 };
 
 pub use userapp::builder_instance::legacy_composite_app_segment;

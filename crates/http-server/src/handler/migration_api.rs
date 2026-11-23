@@ -9,14 +9,18 @@
 //!    保护（不在放行名单）。
 //!
 //! 端点：
-//! - `GET  /api/migration/{user_id}/status`           查 PVC/标记/agent 卷形态
-//! - `POST /api/migration/{user_id}/migration-state`  翻标记（body `{state}`）
+//! - `GET  /api/migration/{user_id}/status`            查 PVC/标记/agent 是否存在
+//! - `POST /api/migration/{user_id}/phase-a`           建 PVC + 全量预同步（不翻标记）
+//! - `POST /api/migration/{user_id}/cutover`           停 agent → 增量 → 翻标记 → 恢复 agent
+//! - `POST /api/migration/{user_id}/rollback`          翻回共享卷 → 恢复 agent
+//! - `POST /api/migration/{user_id}/migration-state`   只翻标记（body `{state}`；排障用）
 //!
-//! 数据流（两阶段迁移, 详见 k8s/migration README 与 plan §5.6）：
+//! 编排（原子完成；失败语义与已知窗口见 k8s/migration README §10）在
+//! `computer_forward::orchestrate`：
 //! ```text
-//! phase-a: 外部工具(rclone Job)建 PVC + 全量 copy —— **不翻标记**
-//! cutover: 停 agent → 增量 sync → POST migration-state {migrated} → 起 agent
-//! rollback: POST migration-state {not-migrated} → 用户回共享卷
+//! phase-a: ensure PVC → sync(Full)                                  → NotMigrated
+//! cutover: stop agent → 等 detach → sync(Incremental) → set Migrated → 恢复 agent
+//! rollback: stop agent → set NotMigrated → 恢复 agent（共享卷）
 //! ```
 //! 判据层（转发路由 + agent 卷选择）以 `migrated` 标记为唯一开关——
 //! phase-a 后标记未翻，用户照常走共享卷，预同步期双份共存不裂。
@@ -56,9 +60,10 @@ fn user_allowed(allowed: &HashSet<String>, user_id: &str) -> bool {
 /// 入口准入（五个端点共用，先便宜后贵）。返回 `Some(响应)` = 请求被拒。
 ///
 /// 1. `user_id` 形态：全仓统一的标识符白名单（与 file-server 解析路径、迁移
-///    Job 的源路径校验是同一份规则）。白名单为 `*` 的批量窗口里任何字符串都
-///    能到这里；不拦的话，非法值要到 cutover **停完 agent** 之后才在同步步骤
-///    被拒，留下停机残留。
+///    Job 的源路径校验是同一份规则），外加迁移 Job 的命名限制（见
+///    [`invalid_user_id`]）。白名单为 `*` 的批量窗口里任何字符串都能到这里；
+///    不拦的话，非法值要到 cutover **停完 agent** 之后才在同步步骤被拒，留下
+///    停机残留。
 /// 2. 必须是 Kubernetes 运行时。
 /// 3. 用户白名单。
 fn ensure_allowed(user_id: &str) -> Option<Response> {
@@ -93,10 +98,13 @@ fn ensure_allowed(user_id: &str) -> Option<Response> {
 
 /// `user_id` 路径参数的形态校验（fail fast）。文案默认英文；用 `{:?}` 回显
 /// 原始入参，控制字符被转义，不会污染日志或终端。
+///
+/// 两段规则：标识符白名单（非法字符/长度），以及"能拼出合法的迁移 Job 名与
+/// 标签值"（小写、≤43 位、首尾字母数字）。后者不过关的 id 本可以建 PVC，
+/// 但 Job 建不出来——同样必须在停 agent 之前拒绝。
 fn invalid_user_id(user_id: &str) -> Option<Response> {
-    shared_types::validate_identifier(user_id, "userId")
-        .is_err()
-        .then(|| {
+    if shared_types::validate_identifier(user_id, "userId").is_err() {
+        return Some(
             (
                 StatusCode::BAD_REQUEST,
                 format!(
@@ -104,8 +112,16 @@ fn invalid_user_id(user_id: &str) -> Option<Response> {
                      expected 1-64 characters of letters, digits, '_' or '-'"
                 ),
             )
-                .into_response()
-        })
+                .into_response(),
+        );
+    }
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            shared_types::validate_migration_user_id(user_id).err()?,
+        )
+            .into_response(),
+    )
 }
 
 /// 运行时/编排错误 → HTTP 状态：走全仓统一映射（运行时变体 → 错误码 →
@@ -345,8 +361,19 @@ mod user_allowed_tests {
             let response = invalid_user_id(id).unwrap_or_else(|| panic!("{id:?} 必须在入口被拒"));
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{id:?}");
         }
-        for id in ["6", "mig-u1", "user_42", "A", "rbd-v2-u1"] {
+        for id in ["6", "mig-u1", "user_42", "rbd-v2-u1", &"u".repeat(43)] {
             assert!(invalid_user_id(id).is_none(), "{id:?} 是合法 user_id");
+        }
+    }
+
+    /// 反例（部署评审）：这些 id 能通过标识符白名单，却拼不出合法的迁移 Job 名
+    /// 或标签值（对象名只认小写、≤63 位；标签值首尾必须是字母数字）。不拦的话
+    /// cutover 会先停 agent、再在建 Job 时被 apiserver 拒绝（422）。
+    #[test]
+    fn user_ids_that_cannot_name_the_migration_job_are_rejected_at_the_boundary() {
+        for id in ["ABC123", "-mig", "mig-", "_mig", "mig_", &"u".repeat(44)] {
+            let response = invalid_user_id(id).unwrap_or_else(|| panic!("{id:?} 必须在入口被拒"));
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{id:?}");
         }
     }
 
