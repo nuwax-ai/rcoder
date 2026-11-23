@@ -57,43 +57,51 @@ fn user_allowed(allowed: &HashSet<String>, user_id: &str) -> bool {
     allowed.contains(user_id) || allowed.contains(ALLOW_ALL)
 }
 
-/// 入口准入（五个端点共用，先便宜后贵）。返回 `Some(响应)` = 请求被拒。
+/// 入口准入（五个端点共用，先便宜后贵）。返回 `Err(响应)` = 请求被拒。
 ///
 /// 1. `user_id` 形态：全仓统一的标识符白名单（与 file-server 解析路径、迁移
 ///    Job 的源路径校验是同一份规则），外加迁移 Job 的命名限制（见
 ///    [`invalid_user_id`]）。白名单为 `*` 的批量窗口里任何字符串都能到这里；
 ///    不拦的话，非法值要到 cutover **停完 agent** 之后才在同步步骤被拒，留下
 ///    停机残留。
-/// 2. 必须是 Kubernetes 运行时。
-/// 3. 用户白名单。
-fn ensure_allowed(user_id: &str) -> Option<Response> {
+/// 2. 用户白名单。
+/// 3. 必须是 Kubernetes 运行时。
+///
+/// 两个守卫都返回 `Result<(), Box<Response>>`（`Err` = 拒绝；装箱是为了过
+/// `result_large_err`），不返回 `Option<Response>`：
+/// 守卫曾经是 `Option`，调用处写成 `invalid_user_id(user_id)?;`——在同样返回
+/// `Option<Response>` 的函数里，`?` 遇到 `None`（id 合法）是**提前返回 `None`，即
+/// 放行**，并跳过后面所有检查；遇到 `Some`（id 非法）反而解包丢弃、继续往下走。
+/// 结果合法 id 一律放行、白名单形同虚设（2026-11-24 在 31.45 上实测到的回归）。
+/// 用 `Result` 之后，`?` 与 `Err` 的语义一致，这类反写不再能编译出错误行为。
+fn ensure_allowed(user_id: &str) -> Result<(), Box<Response>> {
     invalid_user_id(user_id)?;
+    if !user_allowed(allowed_users(), user_id) {
+        return Err(Box::new(
+            (
+                StatusCode::FORBIDDEN,
+                format!(
+                    "user '{user_id}' is not in RCODER_MIGRATION_TEST_USERS \
+                     (migration API is restricted to that list)"
+                ),
+            )
+                .into_response(),
+        ));
+    }
     // Docker Compose 形态: 迁移编排只对 K8s 有意义(trait 默认 sync=Err),
     // 显式拒绝防误设(白名单与 flag 双误设时 cutover 会真停容器然后失败)。
     let kubernetes_runtime = shared_types::is_kubernetes_runtime()
         && docker_manager::runtime_selection::RuntimeType::from_env().is_kubernetes();
     if !kubernetes_runtime {
-        return Some(
+        return Err(Box::new(
             (
                 StatusCode::NOT_IMPLEMENTED,
                 "workspace migration requires the Kubernetes runtime",
             )
                 .into_response(),
-        );
+        ));
     }
-    if user_allowed(allowed_users(), user_id) {
-        return None;
-    }
-    Some(
-        (
-            StatusCode::FORBIDDEN,
-            format!(
-                "user '{user_id}' is not in RCODER_MIGRATION_TEST_USERS \
-                 (migration API is restricted to that list)"
-            ),
-        )
-            .into_response(),
-    )
+    Ok(())
 }
 
 /// `user_id` 路径参数的形态校验（fail fast）。文案默认英文；用 `{:?}` 回显
@@ -102,9 +110,9 @@ fn ensure_allowed(user_id: &str) -> Option<Response> {
 /// 两段规则：标识符白名单（非法字符/长度），以及"能拼出合法的迁移 Job 名与
 /// 标签值"（小写、≤43 位、首尾字母数字）。后者不过关的 id 本可以建 PVC，
 /// 但 Job 建不出来——同样必须在停 agent 之前拒绝。
-fn invalid_user_id(user_id: &str) -> Option<Response> {
+fn invalid_user_id(user_id: &str) -> Result<(), Box<Response>> {
     if shared_types::validate_identifier(user_id, "userId").is_err() {
-        return Some(
+        return Err(Box::new(
             (
                 StatusCode::BAD_REQUEST,
                 format!(
@@ -113,15 +121,12 @@ fn invalid_user_id(user_id: &str) -> Option<Response> {
                 ),
             )
                 .into_response(),
-        );
+        ));
     }
-    Some(
-        (
-            StatusCode::BAD_REQUEST,
-            shared_types::validate_migration_user_id(user_id).err()?,
-        )
-            .into_response(),
-    )
+    if let Err(reason) = shared_types::validate_migration_user_id(user_id) {
+        return Err(Box::new((StatusCode::BAD_REQUEST, reason).into_response()));
+    }
+    Ok(())
 }
 
 /// 运行时/编排错误 → HTTP 状态：走全仓统一映射（运行时变体 → 错误码 →
@@ -139,8 +144,8 @@ pub async fn status(
     State(state): State<std::sync::Arc<AppState>>,
     Path(user_id): Path<String>,
 ) -> Response {
-    if let Some(resp) = ensure_allowed(&user_id) {
-        return resp;
+    if let Err(response) = ensure_allowed(&user_id) {
+        return *response;
     }
     let service_type = ServiceType::ComputerAgentRunner;
     let migration_state = match state
@@ -210,8 +215,8 @@ pub async fn set_state(
     Path(user_id): Path<String>,
     Json(body): Json<MigrationStateBody>,
 ) -> Response {
-    if let Some(resp) = ensure_allowed(&user_id) {
-        return resp;
+    if let Err(response) = ensure_allowed(&user_id) {
+        return *response;
     }
     let target = match body.state.as_str() {
         "migrated" => shared_types::WorkspaceMigrationState::Migrated,
@@ -249,8 +254,8 @@ pub async fn phase_a(
     State(state): State<std::sync::Arc<AppState>>,
     Path(user_id): Path<String>,
 ) -> Response {
-    if let Some(resp) = ensure_allowed(&user_id) {
-        return resp;
+    if let Err(response) = ensure_allowed(&user_id) {
+        return *response;
     }
     let src_pvc = migration_src_pvc();
     match crate::computer_forward::orchestrate::phase_a(&state, &user_id, &src_pvc).await {
@@ -271,8 +276,8 @@ pub async fn cutover(
     State(state): State<std::sync::Arc<AppState>>,
     Path(user_id): Path<String>,
 ) -> Response {
-    if let Some(resp) = ensure_allowed(&user_id) {
-        return resp;
+    if let Err(response) = ensure_allowed(&user_id) {
+        return *response;
     }
     let src_pvc = migration_src_pvc();
     match crate::computer_forward::orchestrate::cutover(&state, &user_id, &src_pvc).await {
@@ -293,8 +298,8 @@ pub async fn rollback(
     State(state): State<std::sync::Arc<AppState>>,
     Path(user_id): Path<String>,
 ) -> Response {
-    if let Some(resp) = ensure_allowed(&user_id) {
-        return resp;
+    if let Err(response) = ensure_allowed(&user_id) {
+        return *response;
     }
     match crate::computer_forward::orchestrate::rollback(&state, &user_id).await {
         Ok(outcome) => Json(serde_json::json!({
@@ -358,11 +363,13 @@ mod user_allowed_tests {
         for id in [
             "", " ", "a/b", "../etc", "a.b", "u;id", "u\n", "用户", "u id",
         ] {
-            let response = invalid_user_id(id).unwrap_or_else(|| panic!("{id:?} 必须在入口被拒"));
+            let Err(response) = invalid_user_id(id) else {
+                panic!("{id:?} 必须在入口被拒")
+            };
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{id:?}");
         }
         for id in ["6", "mig-u1", "user_42", "rbd-v2-u1", &"u".repeat(43)] {
-            assert!(invalid_user_id(id).is_none(), "{id:?} 是合法 user_id");
+            assert!(invalid_user_id(id).is_ok(), "{id:?} 是合法 user_id");
         }
     }
 
@@ -372,7 +379,9 @@ mod user_allowed_tests {
     #[test]
     fn user_ids_that_cannot_name_the_migration_job_are_rejected_at_the_boundary() {
         for id in ["ABC123", "-mig", "mig-", "_mig", "mig_", &"u".repeat(44)] {
-            let response = invalid_user_id(id).unwrap_or_else(|| panic!("{id:?} 必须在入口被拒"));
+            let Err(response) = invalid_user_id(id) else {
+                panic!("{id:?} 必须在入口被拒")
+            };
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{id:?}");
         }
     }
@@ -427,5 +436,118 @@ mod user_allowed_tests {
     fn wildcard_opens_all_users_for_the_batch_window() {
         let list = allowed(&["*"]);
         assert!(user_allowed(&list, "anyone"));
+    }
+}
+
+/// 走真实路由的准入回归。
+///
+/// 反例（2026-11-24，31.45 实测）：守卫调用处曾写成 `invalid_user_id(user_id)?;`，
+/// 合法 id 一律放行、白名单被跳过——名单外用户能查状态、能发起 cutover。当时的单测
+/// 只直接调 `invalid_user_id`，函数本身是对的，调用方反了却全绿。所以这里的用例经过
+/// 路由和五个真实 handler，不碰私有函数。
+///
+/// 白名单是进程级 `OnceLock`（首次调用时读 env），一个进程里只能验证一份名单：
+/// 每个场景在子进程里跑——父进程用自己的可执行文件加 `--exact` 拉起本用例，并用
+/// 环境变量选中场景。
+#[cfg(test)]
+mod guard_route_tests {
+    use super::routes;
+    use crate::handler::userapp_agent_target::test_support::Fixture;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt as _;
+
+    const CHILD_CASE: &str = "RCODER_MIGRATION_GUARD_TEST_CASE";
+    const TEST_NAME: &str =
+        "handler::migration_api::guard_route_tests::whitelist_gates_every_endpoint";
+    const ENDPOINTS: &[(&str, &str)] = &[
+        ("GET", "/api/migration/{u}/status"),
+        ("POST", "/api/migration/{u}/migration-state"),
+        ("POST", "/api/migration/{u}/phase-a"),
+        ("POST", "/api/migration/{u}/cutover"),
+        ("POST", "/api/migration/{u}/rollback"),
+    ];
+
+    /// 对五个端点各发一次请求，返回状态码（按 `ENDPOINTS` 的顺序）。
+    async fn statuses(router: &axum::Router, user: &str) -> Vec<StatusCode> {
+        let mut statuses = Vec::with_capacity(ENDPOINTS.len());
+        for (method, path) in ENDPOINTS {
+            let uri = path.replace("{u}", user);
+            let request = Request::builder()
+                .method(*method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"state":"migrated"}"#))
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            statuses.push(response.status());
+            drop(to_bytes(response.into_body(), 64 * 1024).await.unwrap());
+        }
+        statuses
+    }
+
+    /// 每个场景对应的白名单 env 值。
+    fn whitelist_for(case: &str) -> &'static str {
+        match case {
+            "list" => "member-1,member-2",
+            "empty" => "",
+            "star" => "*",
+            other => panic!("unknown guard case {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn whitelist_gates_every_endpoint() {
+        let Ok(case) = std::env::var(CHILD_CASE) else {
+            for case in ["list", "empty", "star"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST_NAME, "--nocapture"])
+                    .env(CHILD_CASE, case)
+                    .env("RCODER_MIGRATION_TEST_USERS", whitelist_for(case))
+                    .env("CONTAINER_RUNTIME", "kubernetes")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "guard case '{case}' failed:\n{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        assert_eq!(
+            std::env::var("RCODER_MIGRATION_TEST_USERS").unwrap(),
+            whitelist_for(&case),
+            "子进程必须带着本场景的白名单启动（名单在首次调用时读取）"
+        );
+
+        let fixture = Fixture::new().await;
+        let router = routes().with_state(fixture.state.clone());
+        let forbidden = StatusCode::FORBIDDEN;
+        let bad_request = StatusCode::BAD_REQUEST;
+
+        let outsider = statuses(&router, "outsider").await;
+        let shaped = statuses(&router, "ABC123").await;
+        let member = statuses(&router, "member-1").await;
+        for (index, (method, path)) in ENDPOINTS.iter().enumerate() {
+            let (outsider, shaped, member) = (outsider[index], shaped[index], member[index]);
+            eprintln!(
+                "{case} {method} {path}: outsider={outsider} ABC123={shaped} member={member}"
+            );
+            match case.as_str() {
+                "list" => {
+                    assert_eq!(outsider, forbidden, "名单外: {method} {path}");
+                    assert_eq!(shaped, bad_request, "id 拼不出合法 Job 名: {method} {path}");
+                    assert!(
+                        member != forbidden && member != bad_request,
+                        "名单内不该被准入拒绝: {method} {path} → {member}"
+                    );
+                }
+                "empty" => assert_eq!(member, forbidden, "名单未设 = 全拒: {method} {path}"),
+                "star" => assert_ne!(outsider, forbidden, "批量窗口 `*`: {method} {path}"),
+                _ => {}
+            }
+        }
     }
 }
