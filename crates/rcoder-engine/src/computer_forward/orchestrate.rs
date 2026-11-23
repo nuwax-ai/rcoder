@@ -584,8 +584,21 @@ fn wrap(step: &str, error: ContainerRuntimeError) -> ContainerRuntimeError {
 
 /// ComputerContainerManager 返回 AppError（engine 域错误）; 编排链路统一
 /// ContainerRuntimeError, 此处投影（消息保留原文）。
+///
+/// **保留 HTTP 语义**：AppError 自己的状态码能对上运行时变体的，投到那个变体。
+/// 编排锁冲突（"另一请求仍在确保该容器，稍后重试"）是 503——此前一律压成
+/// `K8sError`（500），到 HTTP 层就成了"上游故障"，调用方分不清重试有没有用。
+/// 对不上的（400、500 等）维持 `K8sError`。
 fn runtime_error_from_app(error: crate::AppError) -> ContainerRuntimeError {
-    ContainerRuntimeError::K8sError(error.to_string())
+    use axum::http::StatusCode;
+    let message = error.to_string();
+    match error.status_code() {
+        StatusCode::SERVICE_UNAVAILABLE => ContainerRuntimeError::ConnectionError(message),
+        StatusCode::NOT_FOUND => ContainerRuntimeError::ContainerNotFound(message),
+        StatusCode::CONFLICT => ContainerRuntimeError::Conflict(message),
+        StatusCode::GATEWAY_TIMEOUT => ContainerRuntimeError::Timeout(message),
+        _ => ContainerRuntimeError::K8sError(message),
+    }
 }
 
 #[cfg(test)]
@@ -669,6 +682,62 @@ mod agent_restore_tests {
         assert_eq!(
             message,
             "migration step 'stop_agent' failed: Container stop failed: boom"
+        );
+    }
+
+    /// 反例（部署评审）：编排锁冲突是"稍后重试"，AppError 的状态码是 503；此前
+    /// 投影成 K8sError，到 HTTP 层变成 500，与文档承诺的 503 不符。
+    #[test]
+    fn app_errors_keep_their_http_semantics_when_projected() {
+        use crate::AppError;
+        use axum::http::StatusCode;
+        use shared_types::error_codes::*;
+
+        let cases = [
+            // 锁冲突："稍后重试"
+            (
+                AppError::with_message(
+                    ERR_CONTAINER_ADDRESS_NOT_READY,
+                    "Another request is still ensuring this container; retry later",
+                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                AppError::with_message(ERR_OPERATION_IN_PROGRESS, "blocked"),
+                StatusCode::CONFLICT,
+            ),
+            (
+                AppError::with_message(ERR_CONTAINER_NOT_FOUND, "gone"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                AppError::with_message(ERR_RUNTIME_TIMEOUT, "slow"),
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+            (
+                AppError::with_message(ERR_BACKEND_ERROR, "upstream"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+        for (error, expected) in cases {
+            let own_status = error.status_code();
+            let projected = super::runtime_error_from_app(error);
+            let status = shared_types::error_status_from_code(
+                container_runtime_api::runtime_error_code(&projected).0,
+            );
+            assert_eq!(
+                status, own_status,
+                "AppError 自己的状态码要原样带到 HTTP 层: {projected:?}"
+            );
+            assert_eq!(status, expected, "{projected:?}");
+        }
+
+        // 运行时错误里没有 400 的对应变体：对不上的维持 K8sError（500）
+        let projected =
+            super::runtime_error_from_app(AppError::with_message(ERR_VALIDATION, "bad input"));
+        assert!(
+            matches!(projected, ContainerRuntimeError::K8sError(_)),
+            "{projected:?}"
         );
     }
 
