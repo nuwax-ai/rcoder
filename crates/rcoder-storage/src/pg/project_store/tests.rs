@@ -47,6 +47,23 @@ fn container_for(project_id: &str) -> ContainerBasicInfo {
     }
 }
 
+/// `find_by_user_id` 的期望值：与 `resolve_backend_addr` 同一条规则按构建形态
+/// 取值——deploy-host 返回注册表键（容器名），K8s 返回 Service FQDN，Docker 返回
+/// 容器 IP。此前硬编码成 IP，CI 的 `--all-features` 腿（含 deploy-host）必失败。
+fn expected_backend_addr(project_id: &str) -> String {
+    if cfg!(feature = "deploy-host") {
+        return format!("container-{project_id}");
+    }
+    if shared_types::is_kubernetes_runtime() {
+        return shared_types::build_k8s_service_fqdn(
+            &format!("container-{project_id}"),
+            "test-ns",
+            "cluster.local",
+        );
+    }
+    "10.42.0.9".to_string()
+}
+
 fn pg_config(dsn: &str) -> PostgresConfig {
     PostgresConfig {
         url: Some(dsn.to_string()),
@@ -1956,7 +1973,7 @@ async fn user_lookup_miss_recovers_through_pg_read_through() {
     let found = reader.find_by_user_id(&user_id, &shared_types::ServiceType::ComputerAgentRunner);
     assert_eq!(
         found.as_deref(),
-        Some("10.42.0.9"),
+        Some(expected_backend_addr(&id).as_str()),
         "the read-through resolves the user's live container past orphan rows"
     );
 }
@@ -2018,7 +2035,7 @@ async fn user_refresh_candidates_are_scoped_to_the_requested_family() {
     let found = reader.find_by_user_id(&user_id, &shared_types::ServiceType::ComputerAgentRunner);
     assert_eq!(
         found.as_deref(),
-        Some("10.42.0.9"),
+        Some(expected_backend_addr(&id).as_str()),
         "newer other-family rows must not crowd out the family candidate set"
     );
 }
