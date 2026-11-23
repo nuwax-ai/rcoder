@@ -11,8 +11,11 @@
 //! failed 是累计计数器, backoffLimit 内重试一次即成功时仍为 1; 脚本侧踩过
 //! 这个坑, rcoder 侧不再犯）。
 //!
-//! Job 镜像: env `RCODER_MIGRATION_IMAGE`（专用 rclone-migrate; 未设时用
-//! env `RCODER_MIGRATION_ALT_IMAGE` + 容器内下载 rclone 的 fallback 命令）。
+//! Job 镜像: env `RCODER_MIGRATION_IMAGE`（专用 rclone-migrate, rclone 已在
+//! 镜像内, 零下载）。未设即报错——不再回退字面默认值（原缺省指向**测试仓库**
+//! 镜像, 生产集群拉不到 → Job 卡死, 编排最长等 4 小时, 期间被迁移用户的
+//! agent 一直停着）。确需"镜像内无 rclone + 容器内在线下载"的测试期形态,
+//! 显式设 `RCODER_MIGRATION_ALT_IMAGE`（自行承担 32MB 外网下载耗时）。
 
 // 与 workspace_runtime 同款: kubernetes feature 门(模块注册处) + super::* 导入
 // KubernetesRuntime/K8sPvcOps; k8s_openapi/kube 具体类型显式 import。
@@ -30,7 +33,6 @@ use shared_types::{ServiceType, WorkspaceSyncMode};
 
 use super::*;
 
-const DEFAULT_MIGRATION_ALT_IMAGE: &str = "nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-k8s-test/rcoder-computer-agent-runner:0.1.426";
 /// Job 等待上限（4h, 与迁移脚本 activeDeadlineSeconds 对齐）。
 const JOB_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(14400);
 
@@ -66,6 +68,36 @@ impl MigrationJobPlan {
         args.push_str(" --stats-one-line --stats 300s");
         args
     }
+}
+
+/// 解析迁移 Job 镜像（纯函数, 供单测）→ `(镜像, 是否需容器内下载 rclone)`。
+///
+/// - `migration_image` 显式设置 → 直接用（rclone 已在镜像内, 零下载）；
+/// - 否则 `alt_image`（调用方自行承担容器内在线下载 rclone 的耗时）；
+/// - 两者都缺 → **报错**。没有字面默认值：那会指向测试仓库镜像, 生产集群
+///   拉不到, 表现为 Job 卡死 + 编排干等 4 小时 + 用户 agent 全程停机,
+///   比一句"没配镜像"难查得多。
+fn resolve_migration_image(
+    migration_image: Option<String>,
+    alt_image: Option<String>,
+) -> ContainerRuntimeResult<(String, bool)> {
+    let configured = |value: Option<String>| {
+        value
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    if let Some(image) = configured(migration_image) {
+        return Ok((image, false));
+    }
+    if let Some(image) = configured(alt_image) {
+        return Ok((image, true));
+    }
+    Err(ContainerRuntimeError::ConfigurationError(
+        "migration image is not configured: set RCODER_MIGRATION_IMAGE \
+         (chart key rcoder.perAgentPvcRbd.migrationImage) to a rclone-migrate image; \
+         set RCODER_MIGRATION_ALT_IMAGE instead to allow downloading rclone inside the job"
+            .to_string(),
+    ))
 }
 
 /// 容器内执行脚本（rclone 缺失时下载 fallback——与 k8s/migration job-template 同语义,
@@ -231,25 +263,12 @@ impl KubernetesRuntime {
         }
         // 镜像选择（显式配置即信任——部署方设 RCODER_MIGRATION_IMAGE 意味着
         // 专用 rclone-migrate 镜像已构建推送; 无法在本地可靠探测远端镜像存在性,
-        // 之前"恒 false 走 fallback"会让显式配置被静默忽略）:
-        //   1. RCODER_MIGRATION_IMAGE 显式设置 → 直接用（rclone 已在镜像内, 零下载）
-        //   2. 否则 fallback: RCODER_MIGRATION_ALT_IMAGE（缺省 agent-runner）
-        //      + 容器内在线下载 rclone（32MB 外网, 10-55s 随机——仅测试期可接受）
-        let (final_image, download_rclone) = match std::env::var("RCODER_MIGRATION_IMAGE")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            Some(image) => (image, false),
-            None => (
-                std::env::var("RCODER_MIGRATION_ALT_IMAGE")
-                    .ok()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| DEFAULT_MIGRATION_ALT_IMAGE.to_string()),
-                true,
-            ),
-        };
+        // 之前"恒 false 走 fallback"会让显式配置被静默忽略）。两者都缺即报错,
+        // 不再回退字面默认值（见 `resolve_migration_image`）。
+        let (final_image, download_rclone) = resolve_migration_image(
+            std::env::var("RCODER_MIGRATION_IMAGE").ok(),
+            std::env::var("RCODER_MIGRATION_ALT_IMAGE").ok(),
+        )?;
         let plan = MigrationJobPlan {
             job_name: format!("migrate-{}-{}", identifier.replace('_', "-"), mode.as_str()),
             namespace: self.namespace.clone(),
@@ -384,6 +403,54 @@ mod tests {
         let f_pos = script.find("set -f").unwrap();
         let exec_pos = script.find("exec rclone").unwrap();
         assert!(f_pos < exec_pos);
+    }
+
+    #[test]
+    fn explicit_migration_image_skips_download() {
+        let (image, download) =
+            resolve_migration_image(Some("reg/rclone-migrate:1.76.0".into()), None).unwrap();
+        assert_eq!(image, "reg/rclone-migrate:1.76.0");
+        assert!(!download, "专用镜像内已有 rclone, 不该走下载");
+    }
+
+    #[test]
+    fn alt_image_is_explicit_opt_in_for_download() {
+        let (image, download) =
+            resolve_migration_image(None, Some("reg/agent-runner:0.1.479".into())).unwrap();
+        assert_eq!(image, "reg/agent-runner:0.1.479");
+        assert!(download, "alt 镜像内没有 rclone, 必须容器内下载");
+    }
+
+    #[test]
+    fn blank_env_values_are_not_configuration() {
+        // 空串/纯空格 = 没配（K8s env 留空即是这种值），不能当成有效镜像
+        assert!(resolve_migration_image(Some("   ".into()), None).is_err());
+        assert!(resolve_migration_image(None, Some(String::new())).is_err());
+    }
+
+    #[test]
+    fn missing_image_fails_fast_instead_of_defaulting_to_test_registry() {
+        let err = resolve_migration_image(None, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RCODER_MIGRATION_IMAGE"),
+            "错误必须点名该设的 env, 便于运维直接照做: {msg}"
+        );
+        assert!(
+            !msg.contains("nuwax-k8s-test"),
+            "不得再把测试仓库镜像写进错误文案: {msg}"
+        );
+    }
+
+    #[test]
+    fn explicit_image_wins_over_alt() {
+        let (image, download) = resolve_migration_image(
+            Some("reg/rclone-migrate:1.76.0".into()),
+            Some("reg/agent-runner:0.1.479".into()),
+        )
+        .unwrap();
+        assert_eq!(image, "reg/rclone-migrate:1.76.0");
+        assert!(!download);
     }
 
     #[test]
