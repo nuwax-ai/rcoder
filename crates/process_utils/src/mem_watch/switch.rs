@@ -269,6 +269,9 @@ pub struct Switch {
     trusted_raw: Option<String>,
     trusted_cached: Option<Overrides>,
     last_error: Option<String>,
+    /// 最近一次报过"不在只读挂载上"的可信目录文件。与 `last_error` 分开记：解析成功
+    /// 会清掉后者，最高优先级的文件一换就会把同一条告警再报一遍。
+    untrusted_mount_noted: Option<PathBuf>,
 }
 
 impl Default for Switch {
@@ -294,6 +297,7 @@ impl Switch {
             trusted_raw: None,
             trusted_cached: None,
             last_error: None,
+            untrusted_mount_noted: None,
         }
     }
 
@@ -359,12 +363,10 @@ impl Switch {
                 }
             }
         }
-        // 排在解析之后：上面那条 `last_error = None` 会清掉去重记录。
         if let Some(message) = untrusted_mount
-            && self.last_error.as_deref() != Some(message.as_str())
+            && self.should_report_untrusted_mount(first)
         {
             tracing::warn!(event = "mem_watch.switch_untrusted_mount", "{message}");
-            self.last_error = Some(message);
         }
 
         if self.cached_trusted {
@@ -391,6 +393,15 @@ impl Switch {
             // 基线写坏了：保留上一份有效基线
             Err(err) => self.report_parse_error(&err),
         }
+    }
+
+    /// 可信目录下的文件不在只读挂载上：同一路径只报一次。
+    fn should_report_untrusted_mount(&mut self, path: &Path) -> bool {
+        if self.untrusted_mount_noted.as_deref() == Some(path) {
+            return false;
+        }
+        self.untrusted_mount_noted = Some(path.to_path_buf());
+        true
     }
 
     /// 同一条解析错误只报一次。
@@ -421,6 +432,7 @@ impl Switch {
         self.cached_trusted = false;
         self.trusted_cached = None;
         self.trusted_raw = None;
+        self.untrusted_mount_noted = None;
     }
 }
 
@@ -634,6 +646,29 @@ tmpfs /mnt/ba\04d tmpfs ro 0 0
         assert_eq!(
             effective.ratio, 0.5,
             "可信层没写 ratio：不可信文件的收紧仍然有效"
+        );
+    }
+
+    /// 反例（31.45 实测）：去重记录与解析错误共用时，`/tmp` 的文件被删掉、伪造的可信
+    /// 路径文件升为最高优先级，同一条告警 6 秒内又报了一遍。
+    #[test]
+    fn untrusted_mount_is_reported_once_per_path_even_if_the_parse_log_resets() {
+        let mut switch = Switch::with_trust(Vec::new(), |_| false);
+        let path = Path::new("/etc/agent-runtime/mem-watch.conf");
+        assert!(switch.should_report_untrusted_mount(path));
+        switch.last_error = None; // 另一个文件解析成功时会清掉
+        assert!(
+            !switch.should_report_untrusted_mount(path),
+            "同一路径不重复报"
+        );
+        assert!(
+            switch.should_report_untrusted_mount(Path::new("/etc/agent-runtime/other.conf")),
+            "换了路径要报"
+        );
+        switch.clear();
+        assert!(
+            switch.should_report_untrusted_mount(path),
+            "文件全部消失后再出现, 重新报"
         );
     }
 
