@@ -158,12 +158,13 @@ working_set = memory.current - memory.stat.inactive_file
 
 ## 7. 控制开关（热更新，不重启容器）
 
-四层来源 + 内置默认，优先级从高到低，每 1s 比对内容指纹：
+四层来源 + 内置默认，优先级从高到低；文件在后台线程里读（每秒最多发起一次），
+采样循环不等它，改动约 1–2s 生效：
 
 | 优先级 | 路径 | 作用域 | 生效 | 改动成本 | 能做什么 |
 |---|---|---|---|---|---|
-| 1 | `/tmp/mem-watch.conf` | 单容器 | <1s | 0（exec） | 只能收紧 |
-| 2 | `/home/user/.rcoder/mem-watch.conf` | 单用户所有容器 | 秒级 | 0（PVC 已挂载） | 只能收紧 |
+| 1 | `/tmp/mem-watch.conf` | 单容器 | ~1–2s | 0（exec） | 只能收紧 |
+| 2 | `/home/user/.rcoder/mem-watch.conf` | 单用户所有容器 | ~1–2s | 0（PVC 已挂载） | 只能收紧 |
 | 3 | `/etc/agent-runtime/mem-watch.conf` | 全集群 | ~1min | agent 加 ConfigMap 只读挂载 | 任意覆盖（须落在只读挂载上） |
 | 4 | `RCODER_MEM_WATCH*` env | 容器启动默认 | 重建容器 | pod spec | 任意覆盖（可信基线） |
 | 5 | 代码内置默认 | — | — | — | — |
@@ -188,6 +189,15 @@ working_set = memory.current - memory.stat.inactive_file
   可信。
 - 约束是相对**可信基线**，不是相对当前值——所以按容器用 `/tmp` 在
   dry ↔ on 之间来回切都行，`on → dry` 的回滚照样是秒级。
+- **不可信文件读不出来、被截断或写坏时，遮不住可信层**：沿用它自己上一份有效
+  内容（没有就当空），可信层照常生效，可信层之后的改动（紧急止损）也照常生效。
+  只看最高优先级的文件、解析失败就返回的话，往 `/tmp` 写一个 `x` 就能把
+  ConfigMap 里的 `mode=on` 变成 off（评审实测复现过）。
+- **只认常规文件**：目录、FIFO、设备一律当作不存在。读文件以非阻塞方式打开、
+  最多读 16KiB，并且在后台线程里做——容器内进程 `mkfifo /tmp/mem-watch.conf`
+  的话，普通的 `open` 会一直阻塞到有写者，采样循环卡死、看门狗从此不再采样，
+  而且不是 panic，监督任务也不会报。用户卷卡住时同理：上一次读取没回来就不再
+  发起新的，开关文件的改动要等卷恢复后才生效，采样本身不受影响。
 
 按层而不是按文件属主判定：agent 容器里的全部进程（agent_runner、agent 拉起
 的工具、桌面组件）都以 root 运行，`kubectl exec` 也是 root，业务进程写出的
@@ -208,8 +218,9 @@ bootstrap_cap_ms = 300000
 
 解析规则：
 
-1. 文件不存在 → 下一层；
-2. **解析失败保留上一份有效配置，只打一次 error**；
+1. 文件不存在（或不是常规文件）→ 下一层；
+2. **解析失败保留上一份有效配置，只打一次 error**（不可信文件解析失败时仍然
+   往下找可信基线）；
 3. 未知键忽略；
 4. `mode=off` 立即停止新的 kill（进行中的终止序列走完）；
 5. 不可信的文件只能收紧：可信层没写的字段，低于可信配置的取值按可信配置
@@ -277,7 +288,8 @@ Phase 2（可选）：`/computer/status` 只读暴露 `mode / evicted_total`。
 | 单测 | **窗口竞态**：先 mark 后 spawn 子进程 → 子进程仍被保护（验证最终快照） |
 | 单测 | 选择器：只选最大、不选 root/其它 root、`min_ratio` 边界 |
 | 单测 | pid 复用：starttime 变化 → 条目被清理 |
-| 单测 | 开关信任边界：`/proc/mounts` 判只读挂载（没挂/可写/嵌套可写子挂载/转义）；可信层的 `off` 压过不可信文件的 `on` |
+| 单测 | 开关信任边界：`/proc/mounts` 判只读挂载（没挂/可写/嵌套可写子挂载/转义）；可信层的 `off` 压过不可信文件的 `on`；不可信文件写坏/截断/被替换时可信层照常生效；FIFO、目录、超长文件、非 UTF-8 |
+| 单测 | 后台读取：第一次调用只发起不等待；上一次读取没回来时不重发 |
 | 集成 | 假树（父 + 3 个 hog）：dry 不杀；on 杀 1 个且父存活 |
 | 容器 | `examples/mem_watch_scenarios.sh`（需要 Docker）：`unmounted` 模式验证伪造的可信路径文件关不掉看门狗；`mounted` 模式经只读挂载验证可信层 off/dry、`/tmp` 关不掉、可信层 `off` 压过 `/tmp` 的 `on` |
 | 集群 | 复用已验证的 3 组对照，Rust 版复跑确认 `restarts=0` |
@@ -287,7 +299,7 @@ Phase 2（可选）：`/computer/status` 只读暴露 `mode / evicted_total`。
 1. 默认 `off`（内置），合并零影响；
 2. dev 节点设 `dry`，观察一周 `would_evict` / `no_candidate` / `bootstrap_sealed`；
 3. 确认候选都是 python/ffmpeg/编译进程后，单节点 `on`；
-4. 回滚（**不需要发版**）：`/tmp` 写回 `mode=dry`，秒级，kill 立即停；要连
+4. 回滚（**不需要发版**）：`/tmp` 写回 `mode=dry`，约 1–2s，kill 立即停；要连
    采样一起停，改可信层——ConfigMap（约 1 分钟，不重建 Pod）或 env（重建
    容器）。可信层写 `mode=off` 对所有容器生效，包括用 `/tmp` 调严过的灰度
    容器；注意基线设成 `on` 之后，没挂第 3 层就只能靠 env 回滚（§7 信任边界）。

@@ -1,12 +1,14 @@
 //! 文件开关：热更新、不用重启容器。
 //!
 //! 四层来源（优先级从高到低）：
-//! 1. `/tmp/mem-watch.conf`             —— 单容器，`kubectl exec` 即改（<1s）
+//! 1. `/tmp/mem-watch.conf`             —— 单容器，`kubectl exec` 即改（约 1–2s）
 //! 2. `/home/user/.rcoder/mem-watch.conf` —— 单用户（共享 PVC）
 //! 3. `/etc/agent-runtime/mem-watch.conf` —— 全集群（ConfigMap 只读挂载）
 //! 4. `RCODER_MEM_WATCH*` 环境变量       —— 启动默认值
 //!
-//! 读盘频率限制为 1s；内容没变不重新解析。解析失败**保留上一份有效配置**。
+//! 读盘在后台线程里做，采样循环不等它：开关文件可能在用户卷上，卷一卡住
+//! `stat`/`open` 就长时间不返回，看门狗不能跟着卡死。每秒最多发起一次读取，
+//! 文件改动约 1–2 秒生效；内容没变不重新解析。解析失败**保留上一份有效配置**。
 //!
 //! # 信任边界
 //!
@@ -22,8 +24,13 @@
 //! - **其余文件**，以及可信目录下不在只读挂载上的文件，只能把配置调得**更严**：
 //!   `mode` 只能沿 off → dry → on 方向走，数值参数取与可信配置相比更小的那个。
 //!   它们也遮不住可信层——可信配置由环境变量与第一个存在的可信文件共同决定。
+//!   不可信文件读不出来、被截断或写坏时，沿用它上一份有效内容（没有就当空），
+//!   **可信层照常生效**。
+//! - 只认**常规文件**。目录、FIFO、设备一律当作不存在：容器内进程
+//!   `mkfifo /tmp/mem-watch.conf` 的话，普通的 `open` 会一直阻塞到有写者，
+//!   采样循环就停在那里了。
 //!
-//! 不能按路径名或文件属主判定：agent 容器里的全部进程（agent_runner、agent 拉起
+//!不能按路径名或文件属主判定：agent 容器里的全部进程（agent_runner、agent 拉起
 //! 的工具、桌面组件）都以 root 运行，`kubectl exec` 也是 root，业务进程写出的
 //! 文件与运维写的无法区分（31.45 实测）。只读挂载是容器内造不出来的——那需要
 //! `CAP_SYS_ADMIN`，agent 容器没有。可信目录**没有挂载**时，容器内进程
@@ -33,6 +40,7 @@
 //! 生效必须以只读方式挂载（没挂、或挂成可写，都只算不可信文件，日志里有
 //! `mem_watch.switch_untrusted_mount` 提示）。
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -256,12 +264,86 @@ fn millis(raw: &str) -> Option<u64> {
     raw.parse::<u64>().ok().filter(|v| *v > 0)
 }
 
+/// 一次刷新读到的某个路径的内容。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileRead {
+    /// 不存在，或者不是常规文件（目录、FIFO、设备……）。
+    Missing,
+    /// 是常规文件但没读到内容：刚被清空、读出错、内容不是合法 UTF-8。
+    Unreadable,
+    Content(String),
+}
+
+/// 单个开关文件的读取上限。配置只有七个键，远用不到；超过就不读完，防止把它
+/// 做成指向超大文件的软链接后整份读进内存。
+const MAX_FILE_BYTES: u64 = 16 * 1024;
+
+/// 只认常规文件，以非阻塞方式打开，最多读 [`MAX_FILE_BYTES`] 字节。
+///
+/// `stat` 不会打开文件，FIFO / 设备 / 目录在这一步就被挡下。
+fn read_switch_file(path: &Path) -> FileRead {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return FileRead::Missing;
+    };
+    if !metadata.is_file() {
+        return FileRead::Missing;
+    }
+    read_regular_file(path)
+}
+
+/// 打开并读取。`stat` 与 `open` 之间路径还可能被换成 FIFO，所以非阻塞必须加在
+/// `open` 上：否则 `mkfifo /tmp/mem-watch.conf` 之后 `open` 会一直阻塞到有写者，
+/// 采样循环就停在这一行了。
+fn read_regular_file(path: &Path) -> FileRead {
+    use rustix::fs::OFlags;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(file) = std::fs::File::options()
+        .read(true)
+        .custom_flags(OFlags::NONBLOCK.bits() as i32)
+        .open(path)
+    else {
+        return FileRead::Unreadable;
+    };
+    let mut raw = String::new();
+    match file.take(MAX_FILE_BYTES + 1).read_to_string(&mut raw) {
+        Ok(_) if !raw.is_empty() => FileRead::Content(raw),
+        _ => FileRead::Unreadable,
+    }
+}
+
+/// 一次刷新读到的全部内容（按优先级）。
+type ReadResult = Vec<(PathBuf, FileRead)>;
+
+/// 后台读取的句柄：读线程 panic 时得到 `None`，调用方沿用当前配置——绝不能当成
+/// "文件都没了"。
+type ReadTask = tokio::task::JoinHandle<Option<ReadResult>>;
+
+/// 在阻塞线程池里读所有路径（按优先级）。
+async fn read_switch_files(paths: Vec<PathBuf>) -> Option<ReadResult> {
+    tokio::task::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .map(|path| {
+                let read = read_switch_file(&path);
+                (path, read)
+            })
+            .collect()
+    })
+    .await
+    .ok()
+}
+
 /// 带缓存的开关解析器。sampler 每 tick 调 [`Switch::effective`]。
 pub struct Switch {
     paths: Vec<PathBuf>,
     trusted: fn(&Path) -> bool,
     last_refresh: Option<Instant>,
-    /// 当前生效的覆盖：来自优先级最高的那个**存在**的文件。
+    /// 上一次发起的后台读取。还没回来（用户卷卡住）时不再发起新的：被阻塞的
+    /// 线程最多只占一个。
+    reading: Option<ReadTask>,
+    /// 当前生效的覆盖：来自优先级最高的那个**存在**的文件；`cached_path` 记着
+    /// 它来自哪个文件（换了文件之后，旧缓存不能冒充新文件的覆盖）。
+    cached_path: Option<PathBuf>,
     cached_raw: Option<String>,
     cached: Overrides,
     cached_trusted: bool,
@@ -285,12 +367,15 @@ impl Switch {
         Self::with_trust(paths, is_trusted_path)
     }
 
-    /// `trusted` 判定一个开关文件能否任意覆盖配置（默认：位于可信目录下）。
+    /// `trusted` 判定一个开关文件能否任意覆盖配置（默认：位于可信目录下的只读
+    /// 挂载上）。
     pub fn with_trust(paths: Vec<PathBuf>, trusted: fn(&Path) -> bool) -> Self {
         Self {
             paths,
             trusted,
             last_refresh: None,
+            reading: None,
+            cached_path: None,
             cached_raw: None,
             cached: Overrides::default(),
             cached_trusted: false,
@@ -301,13 +386,20 @@ impl Switch {
         }
     }
 
-    /// 当前生效配置 = 不可信文件在可信配置之上收紧，可信层写明的字段最终生效。
+    /// 当前生效配置：不可信文件在可信配置之上收紧，可信层写明的字段最终生效。
     ///
     /// 每个字段的取值：可信文件写了就是它；没写则取（环境变量基线, 不可信
     /// 文件）里更严的那个。不可信文件永远只能让配置更严，而可信层可以
     /// 反向覆盖它——包括用 `mode=off` 做集群级紧急止损。
-    pub fn effective(&mut self, base: &Config) -> Config {
-        self.refresh_if_due();
+    ///
+    /// 文件在后台读，这里从不阻塞在文件系统上；上一次读取还没回来时返回的
+    /// 就是上一份生效配置。
+    pub async fn effective(&mut self, base: &Config) -> Config {
+        self.refresh_if_due().await;
+        self.current(base)
+    }
+
+    fn current(&self, base: &Config) -> Config {
         if self.cached_trusted {
             return self.cached.apply(base);
         }
@@ -318,53 +410,87 @@ impl Switch {
         }
     }
 
-    fn refresh_if_due(&mut self) {
+    async fn refresh_if_due(&mut self) {
+        // 上一次读取回来了就先并入——这一步不受节流限制
+        if self
+            .reading
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+            && let Some(task) = self.reading.take()
+        {
+            // 读线程 panic / 被取消: 不更新, 沿用当前配置
+            if let Ok(Some(files)) = task.await {
+                self.apply(&files);
+            }
+        }
         let now = Instant::now();
+        // 上一次读取还没回来（卷卡住）: 不催也不重发
+        if self.reading.is_some() {
+            return;
+        }
         if let Some(last) = self.last_refresh
             && now.duration_since(last) < REFRESH_EVERY
         {
             return;
         }
         self.last_refresh = Some(now);
+        self.reading = Some(tokio::spawn(read_switch_files(self.paths.clone())));
+    }
 
-        let existing: Vec<PathBuf> = self
-            .paths
+    /// 把一次刷新读到的内容并入状态（纯状态机：读失败的各种形态可以直接喂进来）。
+    fn apply(&mut self, files: &[(PathBuf, FileRead)]) {
+        let Some((first_path, first_read)) = files
             .iter()
-            .filter(|path| path.exists())
-            .cloned()
-            .collect();
-        let Some(first) = existing.first() else {
+            .find(|(_, read)| !matches!(read, FileRead::Missing))
+        else {
             // 所有路径都不存在 ⇒ 回到默认（文件被删除是"关闭覆盖"的意图）
             self.clear();
             return;
         };
-        let raw = std::fs::read_to_string(first).unwrap_or_default();
-        if raw.is_empty() {
-            // 存在但暂时读不出来：保留上一份有效配置，等下次刷新
-            return;
-        }
-
-        let is_trusted = (self.trusted)(first);
-        let untrusted_mount = Self::untrusted_mount_note(first, is_trusted);
-        if self.cached_raw.as_deref() == Some(raw.as_str()) {
-            self.cached_trusted = is_trusted;
-        } else {
-            match parse(&raw) {
+        let is_trusted = (self.trusted)(first_path);
+        let same_file = self.cached_path.as_deref() == Some(first_path.as_path());
+        match first_read {
+            // 内容没变：只刷新可信判定（比如只读挂载这时才出现）
+            FileRead::Content(raw)
+                if same_file && self.cached_raw.as_deref() == Some(raw.as_str()) =>
+            {
+                self.cached_trusted = is_trusted;
+            }
+            FileRead::Content(raw) => match parse(raw) {
                 Ok(overrides) => {
                     self.cached = overrides;
-                    self.cached_raw = Some(raw);
+                    self.cached_raw = Some(raw.clone());
                     self.cached_trusted = is_trusted;
+                    self.cached_path = Some(first_path.clone());
                     self.last_error = None;
                 }
                 Err(err) => {
-                    // 半成品/写坏的文件不能改变运行配置
+                    // 写坏的文件不能改变运行配置
                     self.report_parse_error(&err);
+                    // 可信文件就是全部来源：到此为止
+                    if is_trusted {
+                        return;
+                    }
+                    // 不可信文件写坏：沿用它自己上一份有效内容（可能没有），然后照常
+                    // 往下找可信基线。缓存的是别的文件的内容时不能拿来冒充。
+                    if !same_file {
+                        self.forget_cached(first_path);
+                    }
+                }
+            },
+            FileRead::Unreadable => {
+                // 存在但暂时读不出来：保留上一份有效配置
+                if is_trusted {
                     return;
                 }
+                if !same_file {
+                    self.forget_cached(first_path);
+                }
             }
+            FileRead::Missing => {}
         }
-        if let Some(message) = untrusted_mount
-            && self.should_report_untrusted_mount(first)
+        if let Some(message) = Self::untrusted_mount_note(first_path, is_trusted)
+            && self.should_report_untrusted_mount(first_path)
         {
             tracing::warn!(event = "mem_watch.switch_untrusted_mount", "{message}");
         }
@@ -376,23 +502,39 @@ impl Switch {
             return;
         }
         // 当前文件不可信：找可信基线——其余（更低优先级）路径里第一个存在的可信文件。
-        let Some(baseline) = existing.iter().skip(1).find(|path| (self.trusted)(path)) else {
+        // 内容这一轮已经读过，这里不再碰文件系统。
+        let baseline = files
+            .iter()
+            .skip_while(|(path, _)| path != first_path)
+            .skip(1)
+            .find_map(|(path, read)| match read {
+                FileRead::Content(raw) if (self.trusted)(path) => Some(raw),
+                _ => None,
+            });
+        let Some(raw) = baseline else {
             self.trusted_cached = None;
             self.trusted_raw = None;
             return;
         };
-        let raw = std::fs::read_to_string(baseline).unwrap_or_default();
-        if raw.is_empty() || self.trusted_raw.as_deref() == Some(raw.as_str()) {
+        if self.trusted_raw.as_deref() == Some(raw.as_str()) {
             return;
         }
-        match parse(&raw) {
+        match parse(raw) {
             Ok(overrides) => {
                 self.trusted_cached = Some(overrides);
-                self.trusted_raw = Some(raw);
+                self.trusted_raw = Some(raw.clone());
             }
             // 基线写坏了：保留上一份有效基线
             Err(err) => self.report_parse_error(&err),
         }
+    }
+
+    /// 丢掉当前缓存的覆盖，只记住"当前文件是这一个"。
+    fn forget_cached(&mut self, path: &Path) {
+        self.cached = Overrides::default();
+        self.cached_raw = None;
+        self.cached_trusted = false;
+        self.cached_path = Some(path.to_path_buf());
     }
 
     /// 可信目录下的文件不在只读挂载上：同一路径只报一次。
@@ -428,6 +570,7 @@ impl Switch {
 
     fn clear(&mut self) {
         self.cached = Overrides::default();
+        self.cached_path = None;
         self.cached_raw = None;
         self.cached_trusted = false;
         self.trusted_cached = None;
@@ -439,6 +582,36 @@ impl Switch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 等后台读取回来并应用，返回应用后的配置。读不回来（阻塞）时 3 秒后失败。
+    async fn settled(switch: &mut Switch, base: &Config) -> Config {
+        switch.last_refresh = None; // 不等节流，测试用
+        switch.effective(base).await; // 发起读取
+        for _ in 0..1500 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            let config = switch.effective(base).await;
+            if switch.reading.is_none() {
+                return config; // 已并入；节流期内不会再发起读取
+            }
+        }
+        panic!("开关文件的后台读取没有回来");
+    }
+
+    // 构造一次刷新的结果，不必真的落盘。
+    fn reads(files: &[(&str, FileRead)]) -> Vec<(PathBuf, FileRead)> {
+        files
+            .iter()
+            .map(|(name, read)| (PathBuf::from(name), read.clone()))
+            .collect()
+    }
+
+    fn on() -> FileRead {
+        FileRead::Content("mode=on\n".to_string())
+    }
+
+    fn off() -> FileRead {
+        FileRead::Content("mode=off\n".to_string())
+    }
 
     #[test]
     fn parses_full_file() {
@@ -482,31 +655,101 @@ unknown_key = ignored
         assert_eq!(cfg.interval, base.interval, "未覆盖的字段保持默认");
     }
 
-    #[test]
-    fn switch_reads_file_and_survives_broken_write() {
+    #[tokio::test]
+    async fn switch_reads_file_and_survives_broken_write() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mem-watch.conf");
         std::fs::write(&path, "mode=on\n").unwrap();
 
         let base = Config::default();
         let mut switch = Switch::new(vec![path.clone()]);
-        assert_eq!(switch.effective(&base).mode, Mode::On);
+        assert_eq!(settled(&mut switch, &base).await.mode, Mode::On);
 
         // 写坏：保留上一份有效值
         std::fs::write(&path, "mode=on\nratio=2.0\n").unwrap();
-        switch.last_refresh = None; // 跳过 1s 节流，测试用
-        assert_eq!(switch.effective(&base).mode, Mode::On);
-        assert_eq!(switch.effective(&base).ratio, base.ratio);
+        let config = settled(&mut switch, &base).await;
+        assert_eq!(config.mode, Mode::On);
+        assert_eq!(config.ratio, base.ratio);
 
         // 修复：重新生效
         std::fs::write(&path, "mode=off\n").unwrap();
-        switch.last_refresh = None;
-        assert_eq!(switch.effective(&base).mode, Mode::Off);
+        assert_eq!(settled(&mut switch, &base).await.mode, Mode::Off);
 
         // 删除：回到默认
         std::fs::remove_file(&path).unwrap();
-        switch.last_refresh = None;
-        assert_eq!(switch.effective(&base).mode, base.mode);
+        assert_eq!(settled(&mut switch, &base).await.mode, base.mode);
+    }
+
+    // ── 读取本身 ──────────────────────────────────────────────────────────
+
+    /// 反例（评审，实测复现）：路径上放一个 FIFO 时，普通的 `open` 会一直阻塞到
+    /// 有写者——采样循环卡死，看门狗从此不再采样，而且不是 panic、监督任务也不报。
+    #[tokio::test]
+    async fn a_fifo_at_the_switch_path_does_not_block_the_sampler() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("untrusted.conf");
+        let mkfifo = std::process::Command::new("mkfifo").arg(&fifo).status();
+        match mkfifo {
+            Ok(status) if status.success() => {}
+            // 没有 mkfifo 工具的环境: 只跳过真实 FIFO 的部分
+            _ => return,
+        }
+
+        // stat 这一步就挡下
+        assert_eq!(read_switch_file(&fifo), FileRead::Missing);
+        // stat 与 open 之间被换成 FIFO 的情形：非阻塞 open 立刻返回，读不到内容
+        assert_eq!(read_regular_file(&fifo), FileRead::Unreadable);
+        // 目录、设备同理
+        assert_eq!(read_switch_file(dir.path()), FileRead::Missing);
+        assert_eq!(
+            read_switch_file(&dir.path().join("absent.conf")),
+            FileRead::Missing
+        );
+
+        let mut switch = switch_in(dir.path(), &[("trusted.conf", "mode=on\n")]);
+        switch.paths.insert(0, fifo.clone());
+        let base = Config::default();
+        let effective = tokio::time::timeout(Duration::from_secs(5), settled(&mut switch, &base))
+            .await
+            .expect("采样循环不能被 FIFO 卡住");
+        assert_eq!(effective.mode, Mode::On, "FIFO 当作不存在，可信层照常生效");
+    }
+
+    #[test]
+    fn switch_file_read_is_bounded_and_non_utf8_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let huge = dir.path().join("huge.conf");
+        std::fs::write(&huge, vec![b'x'; 1024 * 1024]).unwrap();
+        assert_eq!(
+            read_switch_file(&huge),
+            FileRead::Content("x".repeat(MAX_FILE_BYTES as usize + 1)),
+            "超长文件只读前 16KiB + 1 字节，不会整份读进内存"
+        );
+        let binary = dir.path().join("binary.conf");
+        std::fs::write(&binary, [0xff, 0xfe, 0x00]).unwrap();
+        assert_eq!(read_switch_file(&binary), FileRead::Unreadable);
+        let empty = dir.path().join("empty.conf");
+        std::fs::write(&empty, "").unwrap();
+        assert_eq!(read_switch_file(&empty), FileRead::Unreadable);
+    }
+
+    /// 读线程还没回来时（用户卷卡住），采样循环不等它，也不会再发起一次读取
+    /// ——被阻塞的线程最多只占一个。
+    #[tokio::test]
+    async fn a_read_that_has_not_come_back_is_not_awaited_and_not_reissued() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mem-watch.conf");
+        std::fs::write(&path, "mode=on\n").unwrap();
+        let base = Config::default();
+        let mut switch = Switch::new(vec![path]);
+        switch.effective(&base).await; // 发起第一次读取
+        assert!(switch.reading.is_some(), "第一次调用只发起读取，不等待");
+        let first = switch.last_refresh;
+        for _ in 0..200 {
+            // 都在节流期内：不再发起读取，调用立刻返回
+            switch.effective(&base).await;
+        }
+        assert_eq!(switch.last_refresh, first, "上一次读取没并入之前不重发");
     }
 
     // ── 信任边界 ──────────────────────────────────────────────────────────
@@ -620,35 +863,6 @@ tmpfs /mnt/ba\04d tmpfs ro 0 0
         assert_eq!(decode_mount_field("a\\04b"), None);
     }
 
-    /// 反例（部署评审）：文档承诺"可信层可任意覆盖，包括关掉"，但旧实现是
-    /// 逐字段取更严的——灰度容器里 `/tmp` 写过 `mode=on`，运维把 ConfigMap
-    /// 改成 `mode=off` 也关不掉它，只能逐个 exec 进容器删文件。
-    #[test]
-    fn trusted_layer_can_stop_a_watchdog_that_an_untrusted_file_tightened() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut switch = switch_in(
-            dir.path(),
-            &[
-                ("untrusted.conf", "mode=on\nratio=0.5\n"),
-                ("trusted.conf", "mode=off\n"),
-            ],
-        );
-        let base = Config {
-            mode: Mode::DryRun,
-            ..Config::default()
-        };
-        let effective = switch.effective(&base);
-        assert_eq!(
-            effective.mode,
-            Mode::Off,
-            "可信层的 mode=off 是紧急止损，必须压过 /tmp 的 on"
-        );
-        assert_eq!(
-            effective.ratio, 0.5,
-            "可信层没写 ratio：不可信文件的收紧仍然有效"
-        );
-    }
-
     /// 反例（31.45 实测）：去重记录与解析错误共用时，`/tmp` 的文件被删掉、伪造的可信
     /// 路径文件升为最高优先级，同一条告警 6 秒内又报了一遍。
     #[test]
@@ -672,8 +886,37 @@ tmpfs /mnt/ba\04d tmpfs ro 0 0
         );
     }
 
-    #[test]
-    fn fields_the_trusted_layer_specifies_win_over_untrusted_tightening() {
+    /// 反例（部署评审）：文档承诺"可信层可任意覆盖，包括关掉"，但旧实现是
+    /// 逐字段取更严的——灰度容器里 `/tmp` 写过 `mode=on`，运维把 ConfigMap
+    /// 改成 `mode=off` 也关不掉它，只能逐个 exec 进容器删文件。
+    #[tokio::test]
+    async fn trusted_layer_can_stop_a_watchdog_that_an_untrusted_file_tightened() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut switch = switch_in(
+            dir.path(),
+            &[
+                ("untrusted.conf", "mode=on\nratio=0.5\n"),
+                ("trusted.conf", "mode=off\n"),
+            ],
+        );
+        let base = Config {
+            mode: Mode::DryRun,
+            ..Config::default()
+        };
+        let effective = settled(&mut switch, &base).await;
+        assert_eq!(
+            effective.mode,
+            Mode::Off,
+            "可信层的 mode=off 是紧急止损，必须压过 /tmp 的 on"
+        );
+        assert_eq!(
+            effective.ratio, 0.5,
+            "可信层没写 ratio：不可信文件的收紧仍然有效"
+        );
+    }
+
+    #[tokio::test]
+    async fn fields_the_trusted_layer_specifies_win_over_untrusted_tightening() {
         let dir = tempfile::tempdir().unwrap();
         let mut switch = switch_in(
             dir.path(),
@@ -682,7 +925,7 @@ tmpfs /mnt/ba\04d tmpfs ro 0 0
                 ("trusted.conf", "ratio=0.9\n"),
             ],
         );
-        let effective = switch.effective(&Config::default());
+        let effective = settled(&mut switch, &Config::default()).await;
         assert_eq!(effective.ratio, 0.9, "可信层写了 ratio：以它为准");
         assert_eq!(
             effective.interval,
@@ -693,8 +936,8 @@ tmpfs /mnt/ba\04d tmpfs ro 0 0
 
     /// 反例（评审 L2）：/tmp 与用户家目录对容器内的业务进程可写，而它们正是
     /// 看门狗要淘汰的对象。不可信的文件不能把看门狗关掉，也不能把它调松。
-    #[test]
-    fn untrusted_file_cannot_weaken_the_trusted_baseline() {
+    #[tokio::test]
+    async fn untrusted_file_cannot_weaken_the_trusted_baseline() {
         let dir = tempfile::tempdir().unwrap();
         let mut switch = switch_in(
             dir.path(),
@@ -708,7 +951,7 @@ tmpfs /mnt/ba\04d tmpfs ro 0 0
             mode: Mode::On,
             ..Config::default()
         };
-        let effective = switch.effective(&base);
+        let effective = settled(&mut switch, &base).await;
         assert_eq!(effective.mode, Mode::On, "不可信文件不能关掉看门狗");
         assert_eq!(effective.ratio, base.ratio);
         assert_eq!(effective.interval, base.interval);
@@ -718,15 +961,15 @@ tmpfs /mnt/ba\04d tmpfs ro 0 0
         assert_eq!(effective.bootstrap_cap, base.bootstrap_cap);
     }
 
-    #[test]
-    fn untrusted_file_can_tighten() {
+    #[tokio::test]
+    async fn untrusted_file_can_tighten() {
         let dir = tempfile::tempdir().unwrap();
         let mut switch = switch_in(
             dir.path(),
             &[("untrusted.conf", "mode=dry\nratio=0.5\ninterval_ms=250\n")],
         );
         // 基线：off / 0.85 / 500ms
-        let effective = switch.effective(&Config::default());
+        let effective = settled(&mut switch, &Config::default()).await;
         assert_eq!(effective.mode, Mode::DryRun);
         assert_eq!(effective.ratio, 0.5);
         assert_eq!(effective.interval, Duration::from_millis(250));
@@ -734,8 +977,8 @@ tmpfs /mnt/ba\04d tmpfs ro 0 0
 
     /// 灰度流程依赖这条：基线是 off 或 dry 时，按容器用不可信文件在
     /// dry ↔ on 之间来回切都行——约束是相对可信基线，不是相对当前值。
-    #[test]
-    fn untrusted_file_may_go_back_and_forth_above_the_baseline() {
+    #[tokio::test]
+    async fn untrusted_file_may_go_back_and_forth_above_the_baseline() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("untrusted.conf");
         std::fs::write(&path, "mode=on\n").unwrap();
@@ -744,23 +987,25 @@ tmpfs /mnt/ba\04d tmpfs ro 0 0
             mode: Mode::DryRun,
             ..Config::default()
         };
-        assert_eq!(switch.effective(&base).mode, Mode::On);
+        assert_eq!(settled(&mut switch, &base).await.mode, Mode::On);
         std::fs::write(&path, "mode=dry\n").unwrap();
-        switch.last_refresh = None;
         assert_eq!(
-            switch.effective(&base).mode,
+            settled(&mut switch, &base).await.mode,
             Mode::DryRun,
             "on → dry 是回滚，必须可用"
         );
         std::fs::write(&path, "mode=off\n").unwrap();
-        switch.last_refresh = None;
-        assert_eq!(switch.effective(&base).mode, Mode::DryRun, "不能低于基线");
+        assert_eq!(
+            settled(&mut switch, &base).await.mode,
+            Mode::DryRun,
+            "不能低于基线"
+        );
     }
 
     /// 不可信的高优先级文件遮不住可信层：普通用户写的 /tmp 文件不能让
     /// ConfigMap 里的 mode=on 失效。
-    #[test]
-    fn untrusted_file_cannot_shadow_a_trusted_lower_layer() {
+    #[tokio::test]
+    async fn untrusted_file_cannot_shadow_a_trusted_lower_layer() {
         let dir = tempfile::tempdir().unwrap();
         let mut switch = switch_in(
             dir.path(),
@@ -770,13 +1015,13 @@ tmpfs /mnt/ba\04d tmpfs ro 0 0
             ],
         );
         // 环境变量：off；可信层（ConfigMap）：on；/tmp：off
-        let effective = switch.effective(&Config::default());
+        let effective = settled(&mut switch, &Config::default()).await;
         assert_eq!(effective.mode, Mode::On);
         assert_eq!(effective.ratio, Config::default().ratio);
     }
 
-    #[test]
-    fn trusted_file_may_weaken_and_wins_over_lower_layers() {
+    #[tokio::test]
+    async fn trusted_file_may_weaken_and_wins_over_lower_layers() {
         let dir = tempfile::tempdir().unwrap();
         let mut switch = switch_in(
             dir.path(),
@@ -789,7 +1034,7 @@ tmpfs /mnt/ba\04d tmpfs ro 0 0
             mode: Mode::On,
             ..Config::default()
         };
-        let effective = switch.effective(&base);
+        let effective = settled(&mut switch, &base).await;
         assert_eq!(effective.mode, Mode::Off, "可信文件可以关掉看门狗");
         assert_eq!(
             effective.ratio, base.ratio,
@@ -797,8 +1042,8 @@ tmpfs /mnt/ba\04d tmpfs ro 0 0
         );
     }
 
-    #[test]
-    fn removing_the_untrusted_file_falls_back_to_the_trusted_layer() {
+    #[tokio::test]
+    async fn removing_the_untrusted_file_falls_back_to_the_trusted_layer() {
         let dir = tempfile::tempdir().unwrap();
         let untrusted = dir.path().join("untrusted.conf");
         let trusted = dir.path().join("trusted.conf");
@@ -806,11 +1051,125 @@ tmpfs /mnt/ba\04d tmpfs ro 0 0
         std::fs::write(&trusted, "mode=on\nratio=0.7\n").unwrap();
         let mut switch = Switch::with_trust(vec![untrusted.clone(), trusted], trust_named);
         let base = Config::default();
-        assert_eq!(switch.effective(&base).mode, Mode::On);
+        assert_eq!(settled(&mut switch, &base).await.mode, Mode::On);
         std::fs::remove_file(&untrusted).unwrap();
-        switch.last_refresh = None;
-        let effective = switch.effective(&base);
+        let effective = settled(&mut switch, &base).await;
         assert_eq!(effective.mode, Mode::On);
         assert_eq!(effective.ratio, 0.7, "只剩可信文件时它可任意覆盖");
+    }
+
+    // ── 不可信文件读不出来的时候 ──────────────────────────────────────────
+
+    /// 反例（评审，实测复现）：环境变量基线 off、ConfigMap 写 `mode=on`（文档推荐给
+    /// 生产 `on` 用的拓扑）时，容器内进程往 `/tmp` 写一个 `x`，最高优先级的文件解析
+    /// 失败，旧实现在读可信层之前就返回了——看门狗变成 off。
+    #[test]
+    fn a_malformed_untrusted_file_cannot_mask_the_trusted_layer() {
+        let mut switch = Switch::with_trust(Vec::new(), trust_named);
+        for untrusted in [
+            FileRead::Content("x\n".to_string()),
+            FileRead::Content("mode=on\nratio=2.0\n".to_string()),
+            FileRead::Unreadable, // 被截断成空 / 刚被清空
+        ] {
+            let files = reads(&[("/tmp/mem-watch.conf", untrusted), ("trusted.conf", on())]);
+            switch.apply(&files);
+            assert_eq!(
+                switch.current(&Config::default()).mode,
+                Mode::On,
+                "不可信文件读不出来或写坏: 可信层照常生效 ({:?})",
+                switch.cached_path
+            );
+        }
+    }
+
+    /// 稳态：不可信文件后来写坏了，可信层之后的改动（紧急止损）仍然要生效。
+    #[test]
+    fn trusted_layer_changes_apply_while_the_untrusted_file_is_unreadable() {
+        let mut switch = Switch::with_trust(Vec::new(), trust_named);
+        let base = Config::default(); // off
+        let files = reads(&[
+            (
+                "/tmp/mem-watch.conf",
+                FileRead::Content("mode=dry\n".to_string()),
+            ),
+            ("trusted.conf", on()),
+        ]);
+        switch.apply(&files);
+        assert_eq!(switch.current(&base).mode, Mode::On);
+
+        // /tmp 文件被截断成空，同时运维把 ConfigMap 改成 off
+        let files = reads(&[
+            ("/tmp/mem-watch.conf", FileRead::Unreadable),
+            ("trusted.conf", off()),
+        ]);
+        switch.apply(&files);
+        assert_eq!(
+            switch.current(&base).mode,
+            Mode::Off,
+            "紧急止损不能被一个读不出来的不可信文件挡住"
+        );
+    }
+
+    /// 缓存的覆盖是"某一个文件"的：当前文件换成另一个（而且读不出来）之后，
+    /// 旧缓存不能冒充它的覆盖。
+    #[test]
+    fn overrides_of_a_replaced_file_are_not_passed_off_as_the_new_files() {
+        let mut switch = Switch::with_trust(Vec::new(), |_| false);
+        let base = Config::default(); // off
+        switch.apply(&reads(&[("a.conf", on())]));
+        assert_eq!(switch.current(&base).mode, Mode::On);
+
+        for unreadable in [
+            FileRead::Content("garbage".to_string()),
+            FileRead::Unreadable,
+        ] {
+            switch.apply(&reads(&[("b.conf", unreadable)]));
+            assert_eq!(
+                switch.current(&base).mode,
+                Mode::Off,
+                "b.conf 读不出来: 只剩基线，不能沿用 a.conf 的 mode=on"
+            );
+        }
+        // 没有任何一个文件存在: 回到默认
+        switch.apply(&reads(&[("b.conf", FileRead::Missing)]));
+        assert_eq!(switch.current(&base).mode, Mode::Off);
+    }
+
+    /// 可信文件自己写坏 / 读不出来: 保留上一份有效配置（它就是全部来源）。
+    #[test]
+    fn a_broken_trusted_file_keeps_the_previous_valid_config() {
+        let mut switch = Switch::with_trust(Vec::new(), trust_named);
+        let base = Config::default();
+        switch.apply(&reads(&[("trusted.conf", on())]));
+        for broken in [FileRead::Content("x\n".to_string()), FileRead::Unreadable] {
+            switch.apply(&reads(&[("trusted.conf", broken)]));
+            assert_eq!(switch.current(&base).mode, Mode::On);
+        }
+    }
+
+    /// 经真实文件走一遍: /tmp 文件被截断成空，可信层照常生效；内容恢复后它又能收紧。
+    #[tokio::test]
+    async fn an_untrusted_file_truncated_to_empty_keeps_the_trusted_layer_effective() {
+        let dir = tempfile::tempdir().unwrap();
+        let untrusted = dir.path().join("untrusted.conf");
+        let trusted = dir.path().join("trusted.conf");
+        std::fs::write(&untrusted, "mode=dry\n").unwrap();
+        std::fs::write(&trusted, "mode=on\n").unwrap();
+        let mut switch = Switch::with_trust(vec![untrusted.clone(), trusted], trust_named);
+        let base = Config::default(); // off
+        assert_eq!(settled(&mut switch, &base).await.mode, Mode::On);
+
+        std::fs::write(&untrusted, "").unwrap();
+        let effective = settled(&mut switch, &base).await;
+        assert_eq!(effective.mode, Mode::On, "可信层照常生效");
+        assert_eq!(
+            effective.ratio, base.ratio,
+            "读不出内容的不可信文件不参与收紧"
+        );
+
+        std::fs::write(&untrusted, "ratio=0.5\n").unwrap();
+        let effective = settled(&mut switch, &base).await;
+        assert_eq!(effective.ratio, 0.5, "恢复后不可信文件的收紧重新生效");
+        assert_eq!(effective.mode, Mode::On);
     }
 }

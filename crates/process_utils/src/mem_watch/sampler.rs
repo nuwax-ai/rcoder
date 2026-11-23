@@ -89,7 +89,7 @@ pub async fn run(config: Config) {
             tokio::time::sleep(Duration::from_secs(60)).await;
             continue;
         }
-        let cfg = switch.effective(&config);
+        let cfg = switch.effective(&config).await;
         if cfg.mode != last_mode {
             tracing::info!(
                 event = "mem_watch.mode_changed",

@@ -5,8 +5,11 @@
 //! `crates/process_utils/examples/mem_watch_scenarios.sh` 起容器，并按本程序打印的
 //! `SCN-SET trusted=<off|dry|absent>` 行改写挂载源（模拟运维改 ConfigMap）。
 //!
-//! * `unmounted`——可信目录没有只读挂载：容器内进程自己 `mkdir -p` 出来的
-//!   "可信文件"（`mode=off`）不生效，hog 照常被淘汰。
+//! * `unmounted`——可信目录没有只读挂载：
+//!   - 容器内进程自己 `mkdir -p` 出来的"可信文件"（`mode=off`）不生效，
+//!     hog 照常被淘汰；
+//!   - **开关路径上放一个 FIFO**：采样循环不能被卡住，hog 照常被淘汰
+//!     （普通的 `open` 会一直阻塞到有写者）。
 //! * `mounted`——可信目录是宿主侧目录的只读挂载：
 //!   1. **可信层 off** → hog 不被杀；
 //!   2. **不可信的 /tmp 关不掉看门狗**：移除可信文件（回落到传入的默认
@@ -45,8 +48,9 @@ const TRUSTED_CONF: &str = "/etc/agent-runtime/mem-watch.conf";
 /// 上界保证总分配不超过限额的 ~75%。
 const MIN_TESTABLE_LIMIT: u64 = 512 * 1024 * 1024;
 const MAX_TESTABLE_LIMIT: u64 = 1024 * 1024 * 1024;
-/// 开关刷新节流是 1s；等过它再下断言，避免"配置还没生效"被误判成通过。
-const SETTLE: Duration = Duration::from_millis(1500);
+/// 开关在后台读、每秒最多发起一次：文件改动到生效最多约 1.5s。等过它再下断言，
+/// 避免"配置还没生效"被误判成通过。
+const SETTLE: Duration = Duration::from_millis(3000);
 /// 一次淘汰观测窗：grace 1s + 采样/冷却的余量。
 const KILL_WINDOW: Duration = Duration::from_secs(7);
 
@@ -188,6 +192,21 @@ impl Stage {
         std::thread::sleep(KILL_WINDOW);
         hog_u.must_be_dead("hogU")?;
         println!("[scn-u] PASS hogU 被淘汰（伪造的可信文件没能关掉看门狗）");
+
+        // ── 场景 u2：开关路径上放 FIFO ────────────────────────────────
+        // 不可信的 /tmp 文件就是最高优先级的开关文件。把它换成 FIFO 之后，采样
+        // 循环必须照常运行（读取在后台、只认常规文件），新的 hog 照常被淘汰。
+        let fifo = Path::new(UNTRUSTED_CONF);
+        drop(std::fs::remove_file(fifo));
+        let status = std::process::Command::new("mkfifo").arg(fifo).status()?;
+        anyhow::ensure!(status.success(), "mkfifo failed");
+        std::thread::sleep(SETTLE);
+        println!("[scn-u2] FIFO at {UNTRUSTED_CONF}; spawn hogF");
+        let mut hog_f = self.spawn(self.big_hog_mb)?;
+        std::thread::sleep(KILL_WINDOW);
+        hog_f.must_be_dead("hogF")?;
+        drop(std::fs::remove_file(fifo));
+        println!("[scn-u2] PASS hogF 被淘汰（FIFO 没能卡住采样循环）");
         Ok(())
     }
 
