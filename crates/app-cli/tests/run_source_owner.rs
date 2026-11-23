@@ -452,7 +452,7 @@ impl Drop for Fixture {
                         runtime_supervisor::Request::new(runtime_supervisor::Action::Shutdown);
                     request.capture_generation(before.generation.as_deref());
                     let _result =
-                        runtime_supervisor::control_verified(&state, request, &owner).await;
+                        runtime_supervisor::control_verified(&state, request, owner).await;
                 }
                 // 确认条件：锁可获取，或捕获的 owner 进程已退出；两者都无
                 // 从观察（无 owner id 且无 pid）时不得据此判失败。

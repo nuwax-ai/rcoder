@@ -221,7 +221,7 @@ async fn ensure_userapp_dev(
                     container_id: info.container_id,
                     status: info.status,
                 },
-                message: msg(shared_types::error_codes::ERR_USERAPP_BUILDER_RUNNING).into(),
+                message: msg(shared_types::error_codes::ERR_USERAPP_BUILDER_RUNNING),
             })
             .into_response());
         }
@@ -258,7 +258,7 @@ async fn ensure_userapp_dev(
                     container_id: info.container_id,
                     status: info.status,
                 },
-                message: msg(shared_types::error_codes::ERR_USERAPP_BUILDER_REBUILT).into(),
+                message: msg(shared_types::error_codes::ERR_USERAPP_BUILDER_REBUILT),
             })
             .into_response());
         }
@@ -347,8 +347,7 @@ async fn ensure_userapp_prod(
             message: shared_types::error_codes::get_error_message(
                 shared_types::error_codes::ERR_USERAPP_PROD_REQUESTED,
                 locale,
-            )
-            .into(),
+            ),
         })
         .into_response());
     }
