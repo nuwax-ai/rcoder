@@ -1,5 +1,8 @@
 #!/bin/bash
-# 在 192.168.31.45（单节点 k3s）上验证内存看门狗 —— 免镜像构建方案。
+# 在单节点 k3s 集群上验证内存看门狗 —— 免镜像构建方案。
+#
+# 目标集群由 kubectl 当前 context 决定（AGENTS.md §4：脚本不写死个人网络
+# 地址；切集群用 `kubectl config use-context`）。所有可调值均可用 env 覆盖。
 #
 # 原理：45 的 docker 内容存储有损坏（save 只出 37KB 空壳 tar，见 AGENTS.md 已知
 # 问题 2 的同类形态），因此完全绕过 docker：
@@ -10,11 +13,12 @@
 #      wd-behavior    —— 场景化 e2e，512Mi 限额，验证 off / on+窗口 / dry
 set -euo pipefail
 
-NS=oom-test
-SRC=/tmp/rcoder-src/target/release
-BINDIR=/tmp/oom-bin
-TAG_REF=nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-k8s-test/rcoder-computer-agent-runner:0.1.407
-NEW_TAG=oom-watchdog-test:dev-oom
+NS=${NS:-oom-test}
+SRC=${SRC:-/tmp/rcoder-src/target/release}
+BINDIR=${BINDIR:-/tmp/oom-bin}
+# 被复刻的基线镜像（registry/仓库/版本全部可覆盖）
+TAG_REF=${TAG_REF:-nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com/nuwax-k8s-test/rcoder-computer-agent-runner:0.1.407}
+NEW_TAG=${NEW_TAG:-oom-watchdog-test:dev-oom}
 
 echo "== 1/6 准备二进制目录（hostPath 源）=="
 mkdir -p "$BINDIR"

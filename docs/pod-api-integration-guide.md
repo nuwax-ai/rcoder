@@ -8,9 +8,9 @@
 
 | 项 | 值 |
 |---|---|
-| **在线文档（Scalar，可交互调试）** | **http://192.168.1.19:30295/api/docs/scalar** |
-| OpenAPI JSON | http://192.168.1.19:30295/api/docs/openapi.json |
-| 服务地址 | `http://192.168.1.19:30295` |
+| **在线文档（Scalar，可交互调试）** | `http://<test-cluster-host>:<rcoder-nodeport>/api/docs/scalar` |
+| OpenAPI JSON | `http://<test-cluster-host>:<rcoder-nodeport>/api/docs/openapi.json` |
+| 服务地址 | `http://<test-cluster-host>:<rcoder-nodeport>` |
 | 命名空间 | `nuwax-k8s-test` |
 | 当前版本 | `rcoder-k8s:0.1.452` |
 | 测试用 user_id | `6`（已有 `rcoder-computer-agent-runner-6-0` 在跑） |

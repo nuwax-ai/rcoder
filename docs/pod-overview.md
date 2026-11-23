@@ -580,7 +580,7 @@ P1 的收益最直接：**立刻能定位"哪个容器在反复被 OOM 杀"**（
 ### 15.4 布局草案（在现有页面上增量加，不推翻）
 
 ```
-┌ OOM 观测面板  k8s · 192.168.1.19:30295 · user 6        [切换] [复位] ┐
+┌ OOM 观测面板  k8s · <test-cluster>:<nodeport> · user 6        [切换] [复位] ┐
 ├ [目标栏：rcoder 地址 / user_id / project_id]  ← 已存在                  ┤
 ├ ▼ 命名空间概览（84 pods · 3 个有问题）        ← B 档新增（可折叠）      │
 │   ⚠ backend-7f6d…  CrashLoop  重启 62  近1h: BackOff×3                   │

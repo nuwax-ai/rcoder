@@ -414,7 +414,7 @@ OK
 首次运行发现的问题：`mem_watch::start` 需要 tokio 上下文，example 里改为
 自建 runtime `rt.spawn(run(cfg))`（同时导出 `mem_watch::run`）。
 
-## 19. 单节点 k8s 部署验证（192.168.31.45，k3s v1.35.4）
+## 19. 单节点 k8s 部署验证（个人开发集群，k3s v1.35.4）
 
 部署脚本：`scripts/deploy-oom-test-45.sh`（45 的 docker 内容存储损坏——save 只出
 37KB 空壳 tar，同 AGENTS.md 已知问题 2 的形态——所以完全绕开 docker：
@@ -452,7 +452,7 @@ kubectl exec <agent-pod> -- cat /sys/fs/cgroup/memory.max   # 8589934592=私有n
 ```
 是 `max` 就必须注入 env（或改集群 kubelet `cgroupNamespaceMode: private`）。
 
-### 19.3 与生产集群（192.168.1.19…）的差异
+### 19.3 与生产测试集群的差异
 
 | 检查项 | 45（测试） | 生产（待确认） |
 |---|---|---|
@@ -514,7 +514,7 @@ hostPath 注入 + initContainer 覆盖是**测试专用**形态。生产正确�
 `dev-oom` 分支构建正式镜像（`build-agent-runner-amd64` 等），rcoder 的 pod 模板加
 appArmorProfile 与 `RCODER_MEM_WATCH_LIMIT_BYTES` env。
 
-## 20. 生产测试集群部署验证（192.168.1.19，nuwax-k8s-test）
+## 20. 生产测试集群部署验证（nuwax-k8s-test 命名空间）
 
 标准发版流程验证闭环（`make k8s-helm-rcoder-version-publish ENV=test`，源码冻结
 commit `7accc5e1` = dev-oom，含 rcoder 改造 + 看门狗）：
@@ -562,7 +562,7 @@ ALL SCENARIOS PASS
 
 ### 21.1 现象
 
-预发布环境（`nuwax-k8s-test`，`192.168.1.19`）用真实模型驱动一次工具调用：
+预发布环境（`nuwax-k8s-test` 命名空间）用真实模型驱动一次工具调用：
 
 ```
 nohup python3 -c "…bytearray(1200*1024*1024)…" > /tmp/hog.log 2>&1 &

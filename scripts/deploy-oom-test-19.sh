@@ -1,9 +1,12 @@
 #!/bin/bash
-# 在 192.168.1.19（k3s 单/多节点）的 nuwax-k8s-test 命名空间验证内存看门狗。
+# 在测试集群的指定命名空间里验证内存看门狗。
+#
+# 目标集群由 kubectl 当前 context 决定（AGENTS.md §4：脚本不写死个人网络
+# 地址；切集群用 `kubectl config use-context`）。NS / REG / IMAGE 可用 env 覆盖。
 #
 # 前提：
-#   - 镜像已按 20-local-fast 流程推送到 nuwax-k8s-test 仓库（版本 0.1.416 或传参覆盖）
-#   - /tmp/oom-bin/ 下有 mem_watch_scenarios + mem_hog（19 本机构建）
+#   - 镜像已按 20-local-fast 流程推送到测试仓库（版本见下方默认值或传参覆盖）
+#   - /tmp/oom-bin/ 下有 mem_watch_scenarios + mem_hog（本机构建）
 #   - 集群可拉取 aliyun 仓库（imagePullSecrets 已在 namespace 配置）
 #
 # 两个验证 Pod：
@@ -14,8 +17,8 @@
 # 用法：IMAGE=<tag> bash deploy-oom-test-19.sh
 set -euo pipefail
 
-NS=nuwax-k8s-test
-REG=nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com
+NS=${NS:-nuwax-k8s-test}
+REG=${REG:-nuwax-docker-images-registry.cn-hangzhou.cr.aliyuncs.com}
 IMAGE=${IMAGE:-$REG/nuwax-k8s-test/rcoder-computer-agent-runner:0.1.416}
 
 echo "使用镜像: $IMAGE"
