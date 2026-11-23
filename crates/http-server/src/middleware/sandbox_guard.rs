@@ -16,7 +16,7 @@
 //! copy_bidirectional 直通，天然支持任意子协议如 CDP）。
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
+use axum::http::{HeaderName, HeaderValue, Request, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
@@ -91,18 +91,25 @@ pub(crate) fn resolve_target(
     Some((id.to_string(), port, rest))
 }
 
-fn proxy_client() -> &'static reqwest::Client {
+/// 数据面反代客户端（进程内单例）。
+///
+/// 构造失败（TLS 后端初始化失败）时返回错误，由调用方转 500——不用
+/// `expect`：客户端构造失败不该让请求级 panic 带塌整个中间件。
+fn proxy_client() -> Result<&'static reqwest::Client, String> {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            // 数据面流不设总超时（长任务/PTY 由沙箱生命周期约束）。
-            // 禁止跟随重定向：沙箱侧 3xx 不得让 rcoder 进程向授权外的目标
-            // 发起请求（白名单只覆盖首次连接）；3xx 原样交还客户端。
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("e2b proxy client")
-    })
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let built = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        // 数据面流不设总超时（长任务/PTY 由沙箱生命周期约束）。
+        // 禁止跟随重定向：沙箱侧 3xx 不得让 rcoder 进程向授权外的目标
+        // 发起请求（白名单只覆盖首次连接）；3xx 原样交还客户端。
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("e2b proxy client init failed: {error}"))?;
+    // 竞争下只保留一个实例（get_or_init 语义），另一个构建结果丢弃
+    Ok(CLIENT.get_or_init(|| built))
 }
 
 /// 数据面错误响应：message 按错误码 + Accept-Language 解析（默认 en-US，
@@ -197,10 +204,24 @@ pub async fn e2b_data_plane_guard(
 
     let (parts, body) = request.into_parts();
     let url = format!("http://{target}{rest}");
-    let mut outgoing = proxy_client().request(
-        Method::from_bytes(parts.method.as_str().as_bytes()).expect("method"),
-        &url,
-    );
+    let client = match proxy_client() {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::error!(
+                sandbox_id = %sandbox_id,
+                error = %error,
+                "e2b 数据面代理客户端初始化失败"
+            );
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                shared_types::error_codes::ERR_E2B_DATA_PLANE_UNREACHABLE,
+                locale,
+            );
+        }
+    };
+    // method 已是合法的 http::Method（hyper 解析过），直接克隆即可——
+    // 原先 from_bytes(...).expect() 是把同一值绕一圈再赌它不会失败。
+    let mut outgoing = client.request(parts.method.clone(), &url);
     for (name, value) in parts.headers.iter() {
         if HOP_BY_HOP.contains(&name.as_str())
             || name.as_str() == "e2b-sandbox-id"
@@ -393,16 +414,19 @@ async fn websocket_tunnel(
 
     // 101：上游握手头逐字回传（Upgrade/Connection/Sec-WebSocket-Accept 等均
     // 由上游生成，对客户端同样合法——Key 是客户端发的同一个值）。
-    let mut builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+    // 不用 Response::builder()：body() 返回 Result，固定状态码+空 body 没有
+    // 失败可能，为一个不可能失败的分支写 expect 等于白送一个 panic 点。
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
     for (name, value) in &head.headers {
         if let (Ok(name), Ok(value)) = (
             HeaderName::from_bytes(name.as_bytes()),
             HeaderValue::from_str(value),
         ) {
-            builder = builder.header(name, value);
+            // append 而非 insert：与 builder.header() 语义一致（同名头累积）
+            response.headers_mut().append(name, value);
         }
     }
-    let response = builder.body(Body::empty()).expect("101 response");
 
     tokio::spawn(async move {
         match on_upgrade.await {
@@ -730,7 +754,7 @@ mod tests {
 
     fn upgrade_parts(uri: &str, pairs: &[(&str, &str)]) -> axum::http::request::Parts {
         let request: Request<()> = Request::builder()
-            .method(Method::GET)
+            .method(axum::http::Method::GET)
             .uri(uri)
             .body(())
             .unwrap();
