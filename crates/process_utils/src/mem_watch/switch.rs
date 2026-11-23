@@ -3,7 +3,7 @@
 //! 四层来源（优先级从高到低）：
 //! 1. `/tmp/mem-watch.conf`             —— 单容器，`kubectl exec` 即改（<1s）
 //! 2. `/home/user/.rcoder/mem-watch.conf` —— 单用户（共享 PVC）
-//! 3. `/etc/agent-runtime/mem-watch.conf` —— 全集群（ConfigMap 挂载）
+//! 3. `/etc/agent-runtime/mem-watch.conf` —— 全集群（ConfigMap 只读挂载）
 //! 4. `RCODER_MEM_WATCH*` 环境变量       —— 启动默认值
 //!
 //! 读盘频率限制为 1s；内容没变不重新解析。解析失败**保留上一份有效配置**。
@@ -14,19 +14,24 @@
 //! 不设防的话，一个失控的进程写一行 `mode=off`（或把 `ratio` / `interval_ms`
 //! 调到不起作用）就能让看门狗闭嘴。按**层**划分信任：
 //!
-//! - **可信层** = 环境变量/内置默认，以及可信目录 [`TRUSTED_DIR`] 下的文件
-//!   （ConfigMap 挂载，只有运维能写）。可信层可以任意覆盖。
-//! - **其余文件**只能把配置调得**更严**：`mode` 只能沿 off → dry → on 方向
-//!   走，数值参数取与可信配置相比更小的那个。它们也遮不住可信层——可信
-//!   配置由环境变量与第一个存在的可信文件共同决定。
+//! - **可信层** = 环境变量/内置默认，以及可信目录 [`TRUSTED_DIR`] 下**位于只读
+//!   挂载上**的文件（ConfigMap 以 `readOnly: true` 挂入，只有运维能写）。
+//! - **可信层写明的字段最终生效**——包括关掉看门狗。所以把基线设成 `on`
+//!   之后，集群级的紧急止损只需在 ConfigMap 里写一行 `mode=off`，连被
+//!   `/tmp` 调严过的灰度容器也一并停下。
+//! - **其余文件**，以及可信目录下不在只读挂载上的文件，只能把配置调得**更严**：
+//!   `mode` 只能沿 off → dry → on 方向走，数值参数取与可信配置相比更小的那个。
+//!   它们也遮不住可信层——可信配置由环境变量与第一个存在的可信文件共同决定。
 //!
-//! 不能按文件属主判定：agent 容器里的全部进程（agent_runner、agent 拉起的
-//! 工具、桌面组件）都以 root 运行，`kubectl exec` 也是 root，业务进程写出的
-//! 文件与运维写的无法区分（31.45 实测）。
+//! 不能按路径名或文件属主判定：agent 容器里的全部进程（agent_runner、agent 拉起
+//! 的工具、桌面组件）都以 root 运行，`kubectl exec` 也是 root，业务进程写出的
+//! 文件与运维写的无法区分（31.45 实测）。只读挂载是容器内造不出来的——那需要
+//! `CAP_SYS_ADMIN`，agent 容器没有。可信目录**没有挂载**时，容器内进程
+//! `mkdir -p` 出来的同名文件自然落在可写层上，按不可信处理。
 //!
-//! 运维含义：按容器用 `/tmp` 在 dry ↔ on 之间切换的灰度流程不变（基线是
-//! off 或 dry）；一旦把基线设成 `on`，容器内的文件就关不掉它，回滚要改
-//! ConfigMap 或环境变量——所以全量开启前先把第 3 层挂上。
+//! 运维含义：按容器用 `/tmp` 在 dry ↔ on 之间切换的灰度流程不变；第 3 层要
+//! 生效必须以只读方式挂载（没挂、或挂成可写，都只算不可信文件，日志里有
+//! `mem_watch.switch_untrusted_mount` 提示）。
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -40,23 +45,93 @@ pub const DEFAULT_PATHS: &[&str] = &[
     "/etc/agent-runtime/mem-watch.conf",
 ];
 
-/// 可信目录：ConfigMap 挂载点。只有运维能写，容器内的业务进程改不了。
+/// 可信目录：ConfigMap 的只读挂载点。只有运维（集群侧）能写——见模块文档
+/// "信任边界"。文件必须落在只读挂载上才算可信，光在这个目录下不够。
 pub const TRUSTED_DIR: &str = "/etc/agent-runtime";
+
+/// 挂载表。容器里读到的就是本容器挂载命名空间的视图。读不到按空表处理
+/// （非 Linux、或 `/proc` 被限制）：没有挂载点信息 ⇒ 一律不可信。
+const MOUNT_TABLE: &str = "/proc/mounts";
 
 const REFRESH_EVERY: Duration = Duration::from_secs(1);
 
-/// 开关文件是否属于可信层（可以任意覆盖配置）：位于 [`TRUSTED_DIR`] 之下。
+/// 开关文件是否属于可信层：位于 [`TRUSTED_DIR`] 之下，**且**所在挂载点只读。
+pub fn is_trusted_path(path: &Path) -> bool {
+    under_trusted_dir(path) && readonly_mount(&mount_table(), path) == Some(true)
+}
+
+/// 路径是否位于 [`TRUSTED_DIR`] 之下（只看路径名，不判可信）。
 ///
 /// 按路径分量比较，`/etc/agent-runtime-evil/…` 不算；含 `..` / `.` 分量的
 /// 路径一律不算——`Path::starts_with` 不做规范化，
 /// `/etc/agent-runtime/../tmp/x` 会被它当成可信目录之下。
-pub fn is_trusted_path(path: &Path) -> bool {
+pub fn under_trusted_dir(path: &Path) -> bool {
     use std::path::Component;
     let escapes = path.components().any(|component| match component {
         Component::Prefix(_) | Component::RootDir | Component::Normal(_) => false,
         Component::CurDir | Component::ParentDir => true,
     });
     !escapes && path.starts_with(TRUSTED_DIR)
+}
+
+fn mount_table() -> String {
+    std::fs::read_to_string(MOUNT_TABLE).unwrap_or_default()
+}
+
+/// `path` 所在的挂载点是否只读：取挂载点是它祖先的那条里最长（最近）的。
+/// 没有祖先挂载点（表为空）返回 `None`。
+fn readonly_mount(mount_table: &str, path: &Path) -> Option<bool> {
+    let mut nearest: Option<(usize, bool)> = None;
+    for line in mount_table.lines() {
+        let mut fields = line.split(' ');
+        let (Some(_source), Some(mount), Some(_fstype), Some(options)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let Some(mount) = decode_mount_field(mount) else {
+            continue;
+        };
+        let mount = Path::new(&mount);
+        if !path.starts_with(mount) {
+            continue;
+        }
+        let depth = mount.components().count();
+        // 最近的一层挂载决定读写属性：只读挂载里再挂一个可写子目录，子目录里的
+        // 文件就是可写的。
+        if nearest.is_none_or(|(best, _)| depth > best) {
+            nearest = Some((depth, options.split(',').any(|option| option == "ro")));
+        }
+    }
+    nearest.map(|(_, readonly)| readonly)
+}
+
+/// `/proc/mounts` 的字段把空白与反斜杠转义成 `\040` `\011` `\012` `\134`。
+/// 别的转义序列不认识，返回 `None`（这一行按不匹配处理）。
+fn decode_mount_field(raw: &str) -> Option<String> {
+    if !raw.contains('\\') {
+        return Some(raw.to_string());
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        let mut code = String::new();
+        for _ in 0..3 {
+            code.push(chars.next()?);
+        }
+        out.push(match code.as_str() {
+            "040" => ' ',
+            "011" => '\t',
+            "012" => '\n',
+            "134" => '\\',
+            _ => return None,
+        });
+    }
+    Some(out)
 }
 
 /// 开关文件里可以覆盖的字段；`None` 表示沿用下一层。
@@ -222,17 +297,21 @@ impl Switch {
         }
     }
 
-    /// 当前生效配置 = 可信配置 + 开关文件覆盖（不可信的文件只能收紧）。
+    /// 当前生效配置 = 不可信文件在可信配置之上收紧，可信层写明的字段最终生效。
+    ///
+    /// 每个字段的取值：可信文件写了就是它；没写则取（环境变量基线, 不可信
+    /// 文件）里更严的那个。不可信文件永远只能让配置更严，而可信层可以
+    /// 反向覆盖它——包括用 `mode=off` 做集群级紧急止损。
     pub fn effective(&mut self, base: &Config) -> Config {
         self.refresh_if_due();
         if self.cached_trusted {
             return self.cached.apply(base);
         }
-        let trusted = match &self.trusted_cached {
-            Some(overrides) => overrides.apply(base),
-            None => base.clone(),
-        };
-        self.cached.tighten(&trusted)
+        let tightened = self.cached.tighten(base);
+        match &self.trusted_cached {
+            Some(trusted) => trusted.apply(&tightened),
+            None => tightened,
+        }
     }
 
     fn refresh_if_due(&mut self) {
@@ -244,7 +323,12 @@ impl Switch {
         }
         self.last_refresh = Some(now);
 
-        let existing: Vec<&PathBuf> = self.paths.iter().filter(|path| path.exists()).collect();
+        let existing: Vec<PathBuf> = self
+            .paths
+            .iter()
+            .filter(|path| path.exists())
+            .cloned()
+            .collect();
         let Some(first) = existing.first() else {
             // 所有路径都不存在 ⇒ 回到默认（文件被删除是"关闭覆盖"的意图）
             self.clear();
@@ -257,6 +341,7 @@ impl Switch {
         }
 
         let is_trusted = (self.trusted)(first);
+        let untrusted_mount = Self::untrusted_mount_note(first, is_trusted);
         if self.cached_raw.as_deref() == Some(raw.as_str()) {
             self.cached_trusted = is_trusted;
         } else {
@@ -274,6 +359,13 @@ impl Switch {
                 }
             }
         }
+        // 排在解析之后：上面那条 `last_error = None` 会清掉去重记录。
+        if let Some(message) = untrusted_mount
+            && self.last_error.as_deref() != Some(message.as_str())
+        {
+            tracing::warn!(event = "mem_watch.switch_untrusted_mount", "{message}");
+            self.last_error = Some(message);
+        }
 
         if self.cached_trusted {
             // 可信文件可任意覆盖，没有"可信基线"一说
@@ -282,12 +374,7 @@ impl Switch {
             return;
         }
         // 当前文件不可信：找可信基线——其余（更低优先级）路径里第一个存在的可信文件。
-        let Some(baseline) = existing
-            .iter()
-            .skip(1)
-            .copied()
-            .find(|path| (self.trusted)(path))
-        else {
+        let Some(baseline) = existing.iter().skip(1).find(|path| (self.trusted)(path)) else {
             self.trusted_cached = None;
             self.trusted_raw = None;
             return;
@@ -312,6 +399,20 @@ impl Switch {
             tracing::error!(event = "mem_watch.switch_invalid", error = %err);
             self.last_error = Some(err.to_string());
         }
+    }
+
+    /// 可信目录下的文件没落在只读挂载上 ⇒ 它其实不可信。给运维一个明确信号：
+    /// 挂了 ConfigMap 却忘了 `readOnly: true`、或压根没挂（那这个文件只能是
+    /// 容器内的进程写的），都会在这里现形。
+    fn untrusted_mount_note(path: &Path, is_trusted: bool) -> Option<String> {
+        if is_trusted || !under_trusted_dir(path) {
+            return None;
+        }
+        Some(format!(
+            "{} is under {} but not on a read-only mount; it can only tighten the configuration",
+            path.display(),
+            TRUSTED_DIR
+        ))
     }
 
     fn clear(&mut self) {
@@ -425,21 +526,134 @@ unknown_key = ignored
     }
 
     #[test]
-    fn only_the_configmap_directory_is_trusted_by_default() {
-        assert!(is_trusted_path(Path::new(
+    fn only_paths_under_the_configmap_directory_may_be_trusted() {
+        assert!(under_trusted_dir(Path::new(
             "/etc/agent-runtime/mem-watch.conf"
         )));
-        assert!(!is_trusted_path(Path::new("/tmp/mem-watch.conf")));
-        assert!(!is_trusted_path(Path::new(
+        assert!(!under_trusted_dir(Path::new("/tmp/mem-watch.conf")));
+        assert!(!under_trusted_dir(Path::new(
             "/home/user/.rcoder/mem-watch.conf"
         )));
         // 按路径分量比较，不是字符串前缀
-        assert!(!is_trusted_path(Path::new(
+        assert!(!under_trusted_dir(Path::new(
             "/etc/agent-runtime-evil/mem-watch.conf"
         )));
-        assert!(!is_trusted_path(Path::new(
+        assert!(!under_trusted_dir(Path::new(
             "/etc/agent-runtime/../tmp/mem-watch.conf"
         )));
+    }
+
+    /// 反例（部署评审）：只按路径名判可信时，可信目录没有挂载，容器内进程
+    /// `mkdir -p` 再写一个 `mode=off`，就能经"可信层"把看门狗关掉。可信目录
+    /// 下的文件必须落在只读挂载上才算数。
+    #[test]
+    fn trusted_directory_that_is_not_a_readonly_mount_is_not_trusted() {
+        let unmounted = "\
+overlay / overlay rw,relatime 0 0
+proc /proc proc rw,nosuid 0 0
+tmpfs /tmp tmpfs rw,nosuid,size=65536k 0 0
+";
+        let conf = Path::new("/etc/agent-runtime/mem-watch.conf");
+        assert!(
+            under_trusted_dir(conf),
+            "只看路径名它确实在可信目录下——所以光看名字不够"
+        );
+        assert_eq!(
+            readonly_mount(unmounted, conf),
+            Some(false),
+            "没挂载：文件落在可写的根挂载（容器层）上"
+        );
+
+        // 同一个路径，ConfigMap 以 readOnly 挂上之后才算可信
+        let mounted =
+            format!("{unmounted}tmpfs /etc/agent-runtime tmpfs ro,relatime,size=1024k 0 0\n");
+        assert_eq!(readonly_mount(&mounted, conf), Some(true));
+
+        // 挂了但没设 readOnly：容器内写得进去，一样不算
+        let writable = format!("{unmounted}tmpfs /etc/agent-runtime tmpfs rw,relatime 0 0\n");
+        assert_eq!(readonly_mount(&writable, conf), Some(false));
+    }
+
+    #[test]
+    fn nearest_mount_decides_and_ro_must_be_a_whole_option() {
+        let table = "\
+tmpfs /etc/agent-runtime tmpfs ro,relatime 0 0
+tmpfs /etc/agent-runtime/sub tmpfs rw,relatime 0 0
+/dev/vda1 /data ext4 rw,errors=remount-ro 0 0
+";
+        // 只读挂载里再挂一个可写子目录：子目录里的文件是可写的
+        assert_eq!(
+            readonly_mount(table, Path::new("/etc/agent-runtime/sub/x.conf")),
+            Some(false)
+        );
+        assert_eq!(
+            readonly_mount(table, Path::new("/etc/agent-runtime/x.conf")),
+            Some(true)
+        );
+        // `errors=remount-ro` 带 ro 字样，但不是 ro 选项
+        assert_eq!(readonly_mount(table, Path::new("/data/x")), Some(false));
+    }
+
+    #[test]
+    fn escaped_and_malformed_mount_points() {
+        assert_eq!(readonly_mount("", Path::new("/etc/agent-runtime/x")), None);
+        let table = r#"overlay / overlay rw 0 0
+tmpfs /mnt/a\040b tmpfs ro 0 0
+tmpfs /mnt/ba\04d tmpfs ro 0 0
+"#;
+        assert_eq!(readonly_mount(table, Path::new("/mnt/a b/x")), Some(true));
+        assert_eq!(readonly_mount(table, Path::new("/mnt/a b")), Some(true));
+        // 不认识的转义序列：这一行不参与匹配，落回根挂载
+        assert_eq!(readonly_mount(table, Path::new("/mnt/bad/x")), Some(false));
+        assert_eq!(decode_mount_field("a\\04b"), None);
+    }
+
+    /// 反例（部署评审）：文档承诺"可信层可任意覆盖，包括关掉"，但旧实现是
+    /// 逐字段取更严的——灰度容器里 `/tmp` 写过 `mode=on`，运维把 ConfigMap
+    /// 改成 `mode=off` 也关不掉它，只能逐个 exec 进容器删文件。
+    #[test]
+    fn trusted_layer_can_stop_a_watchdog_that_an_untrusted_file_tightened() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut switch = switch_in(
+            dir.path(),
+            &[
+                ("untrusted.conf", "mode=on\nratio=0.5\n"),
+                ("trusted.conf", "mode=off\n"),
+            ],
+        );
+        let base = Config {
+            mode: Mode::DryRun,
+            ..Config::default()
+        };
+        let effective = switch.effective(&base);
+        assert_eq!(
+            effective.mode,
+            Mode::Off,
+            "可信层的 mode=off 是紧急止损，必须压过 /tmp 的 on"
+        );
+        assert_eq!(
+            effective.ratio, 0.5,
+            "可信层没写 ratio：不可信文件的收紧仍然有效"
+        );
+    }
+
+    #[test]
+    fn fields_the_trusted_layer_specifies_win_over_untrusted_tightening() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut switch = switch_in(
+            dir.path(),
+            &[
+                ("untrusted.conf", "ratio=0.5\ninterval_ms=250\n"),
+                ("trusted.conf", "ratio=0.9\n"),
+            ],
+        );
+        let effective = switch.effective(&Config::default());
+        assert_eq!(effective.ratio, 0.9, "可信层写了 ratio：以它为准");
+        assert_eq!(
+            effective.interval,
+            Duration::from_millis(250),
+            "可信层没写 interval_ms：不可信文件的收紧仍然有效"
+        );
     }
 
     /// 反例（评审 L2）：/tmp 与用户家目录对容器内的业务进程可写，而它们正是

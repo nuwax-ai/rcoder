@@ -164,7 +164,7 @@ working_set = memory.current - memory.stat.inactive_file
 |---|---|---|---|---|---|
 | 1 | `/tmp/mem-watch.conf` | 单容器 | <1s | 0（exec） | 只能收紧 |
 | 2 | `/home/user/.rcoder/mem-watch.conf` | 单用户所有容器 | 秒级 | 0（PVC 已挂载） | 只能收紧 |
-| 3 | `/etc/agent-runtime/mem-watch.conf` | 全集群 | ~1min | rcoder 加 optional volume | 任意覆盖 |
+| 3 | `/etc/agent-runtime/mem-watch.conf` | 全集群 | ~1min | agent 加 ConfigMap 只读挂载 | 任意覆盖（须落在只读挂载上） |
 | 4 | `RCODER_MEM_WATCH*` env | 容器启动默认 | 重建容器 | pod spec | 任意覆盖（可信基线） |
 | 5 | 代码内置默认 | — | — | — | — |
 
@@ -172,16 +172,27 @@ working_set = memory.current - memory.stat.inactive_file
 淘汰的对象。不设防的话，一个失控的进程写一行 `mode=off`（或把 `ratio`、
 `interval_ms` 调到不起作用）就能让看门狗闭嘴。所以：
 
-- **可信层**（第 3、4、5 层）可以任意覆盖；
+- **可信层**（第 3、4、5 层）写明的字段最终生效，可以任意覆盖——包括关掉
+  看门狗。集群级的紧急止损就是第 3 层写一行 `mode=off`，对所有容器生效，
+  连被 `/tmp` 调严过的灰度容器也一并停下。
 - **第 1、2 层只能把配置调得更严**：`mode` 只能沿 off → dry → on 方向走，
-  数值参数取与可信配置相比更小的那个；它们也遮不住可信层（可信配置 =
+  数值参数取与可信配置相比更小的那个；可信层写了的字段以可信层为准，
+  没写的才轮到它们收紧。它们也遮不住可信层（可信配置 =
   环境变量 + 第 3 层文件）。
+- **第 3 层必须落在只读挂载上才算可信**。只看路径名不够：目录没挂载时，
+  容器内进程 `mkdir -p /etc/agent-runtime` 再写一个文件，照样在这个路径下。
+  实现读 `/proc/mounts`，取该路径最近的一层挂载，`ro` 才算可信；没挂、或挂成
+  可写，都按第 1、2 层的规则处理，并打一条 `mem_watch.switch_untrusted_mount`
+  （warn）提示运维。ConfigMap 卷在容器里通常是只读挂载（31.45 的 k3s v1.35
+  实测如此），显式写上 `readOnly: true` 更稳妥——挂成可写的话这个文件就不算
+  可信。
 - 约束是相对**可信基线**，不是相对当前值——所以按容器用 `/tmp` 在
   dry ↔ on 之间来回切都行，`on → dry` 的回滚照样是秒级。
 
 按层而不是按文件属主判定：agent 容器里的全部进程（agent_runner、agent 拉起
 的工具、桌面组件）都以 root 运行，`kubectl exec` 也是 root，业务进程写出的
-文件与运维写的无法区分。
+文件与运维写的无法区分。只读挂载则是容器内造不出来的——那需要
+`CAP_SYS_ADMIN`，agent 容器没有。
 
 ```ini
 mode             = on        # off | dry | on
@@ -201,7 +212,8 @@ bootstrap_cap_ms = 300000
 2. **解析失败保留上一份有效配置，只打一次 error**；
 3. 未知键忽略；
 4. `mode=off` 立即停止新的 kill（进行中的终止序列走完）；
-5. 不可信的文件只能收紧，低于可信配置的取值按可信配置生效（见"信任边界"）。
+5. 不可信的文件只能收紧：可信层没写的字段，低于可信配置的取值按可信配置
+   生效（见"信任边界"）。
 
 运维操作：
 
@@ -210,16 +222,23 @@ bootstrap_cap_ms = 300000
 kubectl -n <namespace> exec <pod> -c agent -- sh -c 'echo "mode=dry" > /tmp/mem-watch.conf'
 # 单用户自行开启
 echo "mode=on" > /home/user/.rcoder/mem-watch.conf
-# 全集群策略（可信层，可任意覆盖，包括关掉）
+# 全集群策略 / 紧急止损（可信层，写什么生效什么，包括关掉）
 kubectl -n <namespace> patch configmap agent-runtime-flags --type merge \
   -p '{"data":{"mem-watch.conf":"mode=on\n"}}'
 ```
 
-坑：ConfigMap **必须目录挂载**（subPath 不更新）；kubelet 同步约 1 分钟；
-第 3 层是可选增强，v1 只用 1/2/4/5。
+坑：
+
+- ConfigMap **必须目录挂载**（subPath 不更新）；kubelet 同步约 1 分钟。
+- **chart 目前没有挂第 3 层**（v1 只用 1/2/4/5）。要用的话给 agent Pod 加一个
+  ConfigMap 卷挂到 `/etc/agent-runtime`。注意 ConfigMap 卷是强依赖：命名空间里
+  没有这个 ConfigMap 的 Pod 会卡在 `ContainerCreating`，所以要先建好再上线。
+- 没挂第 3 层时，`/etc/agent-runtime/mem-watch.conf` 这个路径下的文件只有
+  容器内的进程写得出来，按不可信处理。
 
 **把基线设成 `on` 之前先挂第 3 层**：基线是 `on` 时第 1、2 层关不掉它，
 回滚只能改 ConfigMap（约 1 分钟，不重建 Pod）或环境变量（重建容器）。
+第 3 层写 `mode=off` 对所有容器生效，包括用 `/tmp` 调严过的灰度容器。
 基线是 off 或 dry 时不受影响——从 `/tmp` 切上去的 `on` 可以用 `/tmp`
 切回 `dry`，kill 立即停止。
 
@@ -244,6 +263,7 @@ kubectl -n <namespace> patch configmap agent-runtime-flags --type merge \
 | `mem_watch.evict` | 实际执行（pid/rss/comm/project/working_set） |
 | `mem_watch.no_candidate` | **超阈值但无可杀对象**（全被保护或都太小）——没有这条就无法判断"看门狗是否在工作"。按 `cooldown_ms` 节流，不能当计数器用 |
 | `mem_watch.no_roots` | **超阈值但没有任何已注册会话**——会话已结束、后台负载还在（§21 盲区的常见形态）。看门狗对此无能为力，只能留痕；同样按 `cooldown_ms` 节流 |
+| `mem_watch.switch_untrusted_mount` | **warn**：`/etc/agent-runtime` 下有开关文件，但它不在只读挂载上，只能收紧。第 3 层挂了却没生效时看这条（同一路径只报一次）；没挂第 3 层却出现这条，说明容器内有进程在往这个路径写文件 |
 | `mem_watch.disabled` | EPERM / 无限制 / 关闭原因 |
 
 Phase 2（可选）：`/computer/status` 只读暴露 `mode / evicted_total`。
@@ -257,7 +277,9 @@ Phase 2（可选）：`/computer/status` 只读暴露 `mode / evicted_total`。
 | 单测 | **窗口竞态**：先 mark 后 spawn 子进程 → 子进程仍被保护（验证最终快照） |
 | 单测 | 选择器：只选最大、不选 root/其它 root、`min_ratio` 边界 |
 | 单测 | pid 复用：starttime 变化 → 条目被清理 |
+| 单测 | 开关信任边界：`/proc/mounts` 判只读挂载（没挂/可写/嵌套可写子挂载/转义）；可信层的 `off` 压过不可信文件的 `on` |
 | 集成 | 假树（父 + 3 个 hog）：dry 不杀；on 杀 1 个且父存活 |
+| 容器 | `examples/mem_watch_scenarios.sh`（需要 Docker）：`unmounted` 模式验证伪造的可信路径文件关不掉看门狗；`mounted` 模式经只读挂载验证可信层 off/dry、`/tmp` 关不掉、可信层 `off` 压过 `/tmp` 的 `on` |
 | 集群 | 复用已验证的 3 组对照，Rust 版复跑确认 `restarts=0` |
 
 ## 11. 灰度与回滚
@@ -267,7 +289,8 @@ Phase 2（可选）：`/computer/status` 只读暴露 `mode / evicted_total`。
 3. 确认候选都是 python/ffmpeg/编译进程后，单节点 `on`；
 4. 回滚（**不需要发版**）：`/tmp` 写回 `mode=dry`，秒级，kill 立即停；要连
    采样一起停，改可信层——ConfigMap（约 1 分钟，不重建 Pod）或 env（重建
-   容器）。注意基线设成 `on` 之后 `/tmp` 关不掉它（§7 信任边界）。
+   容器）。可信层写 `mode=off` 对所有容器生效，包括用 `/tmp` 调严过的灰度
+   容器；注意基线设成 `on` 之后，没挂第 3 层就只能靠 env 回滚（§7 信任边界）。
 
 ## 12. 提交拆分
 
