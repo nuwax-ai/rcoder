@@ -18,7 +18,7 @@ pub mod kill;
 pub mod proc_tree;
 pub mod registry;
 pub mod sampler;
-mod switch;
+pub mod switch;
 mod sys;
 
 pub use config::{Config, Mode};

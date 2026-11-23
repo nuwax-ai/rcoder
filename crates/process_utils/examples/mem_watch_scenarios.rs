@@ -1,12 +1,19 @@
-//! 场景化端到端验证：文件开关、启动窗口保护、dry-run。
+//! 场景化端到端验证：文件开关的信任边界、启动窗口保护、dry-run。
 //!
-//! 在受限 cgroup 中运行（建议 `--memory=512m`），覆盖四个场景：
+//! 在受限 cgroup 中运行（建议 `--memory=512m`，容器内以 root 运行），覆盖
+//! 四个场景：
 //!
-//! 1. **off**：`/tmp/mem-watch.conf` 写 `mode=off` → hog 不被杀；
-//! 2. **on**：删除开关文件（回落到传入的默认 `On`）→ 新 hog 被杀，
-//!    而**封窗前**启动的 hog 因启动窗口保护而存活；
-//! 3. **dry**：写 `mode=dry` → 超阈值但只记录，hog 存活；
+//! 1. **可信层 off**：`/etc/agent-runtime/mem-watch.conf` 写 `mode=off` →
+//!    hog 不被杀；
+//! 2. **不可信的 /tmp 关不掉看门狗**：删除可信文件（回落到传入的默认
+//!    `On`），同时在 `/tmp/mem-watch.conf` 写 `mode=off`（模拟容器内的业务
+//!    进程想关掉它）→ 新 hog 照常被杀，而**封窗前**启动的 hog 因启动窗口
+//!    保护而存活；
+//! 3. **可信层 dry**：写 `mode=dry` → 超阈值但只记录，hog 存活；
 //! 4. 全程 agent 根进程（本进程）存活，容器不被 OOM。
+//!
+//! 开关文件的信任规则见 `mem_watch::switch` 的模块文档：只有可信目录下的
+//! 文件能任意覆盖，`/tmp` 与用户家目录只能把配置调得更严。
 //!
 //! ```bash
 //! docker run --rm --memory=512m \
@@ -23,9 +30,19 @@
 use std::process::Child;
 use std::time::Duration;
 
-use process_utils::mem_watch::{self, Config, Mode, cgroup::CgroupProbe, registry};
+use std::path::Path;
 
-const CONF: &str = "/tmp/mem-watch.conf";
+use process_utils::mem_watch::{
+    self, Config, Mode,
+    cgroup::CgroupProbe,
+    registry,
+    switch::{DEFAULT_PATHS, is_trusted_path},
+};
+
+/// 不可信的开关文件：容器内任何进程都能写。
+const UNTRUSTED_CONF: &str = "/tmp/mem-watch.conf";
+/// 可信的开关文件：ConfigMap 挂载点，只有运维能写（本示例以 root 运行）。
+const TRUSTED_CONF: &str = "/etc/agent-runtime/mem-watch.conf";
 /// 可安全测试的限额区间：下界保证 hogB 能超过 min_rss 下限，
 /// 上界保证总分配不超过限额的 ~75%。
 const MIN_TESTABLE_LIMIT: u64 = 512 * 1024 * 1024;
@@ -75,7 +92,7 @@ fn main() -> anyhow::Result<()> {
         hog_bin.display()
     );
 
-    // 传入默认 On；场景 1 用文件覆盖成 off。
+    // 传入默认 On（可信基线）。场景 1、3 用**可信层**的文件把它改掉。
     let cfg = Config {
         mode: Mode::On,
         ratio: 0.4, // 阈值 = 40% 实测限额
@@ -86,6 +103,20 @@ fn main() -> anyhow::Result<()> {
         bootstrap_cap: Duration::from_secs(120),
         ..Default::default()
     };
+    // 自检：本示例依赖两个路径的信任分类，分类变了场景就会测错东西。
+    anyhow::ensure!(
+        is_trusted_path(Path::new(TRUSTED_CONF)),
+        "可信路径的判定变了：{TRUSTED_CONF} 不再被视为可信层"
+    );
+    anyhow::ensure!(
+        !is_trusted_path(Path::new(UNTRUSTED_CONF)),
+        "不可信路径的判定变了：{UNTRUSTED_CONF} 被视为可信层"
+    );
+    anyhow::ensure!(
+        DEFAULT_PATHS.contains(&TRUSTED_CONF) && DEFAULT_PATHS.contains(&UNTRUSTED_CONF),
+        "默认查找路径变了，示例里的两个路径不再是其中之一"
+    );
+
     // mem_watch::start 需要 tokio 上下文：起一个后台 runtime 承载采样任务。
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -93,43 +124,52 @@ fn main() -> anyhow::Result<()> {
         .build()?;
     let _watcher = rt.spawn(mem_watch::run(cfg));
 
-    // ── 场景 1：off ────────────────────────────────────────────────
-    std::fs::write(CONF, "mode=off\n")?;
+    // ── 场景 1：可信层 off ─────────────────────────────────────────
+    std::fs::create_dir_all(
+        Path::new(TRUSTED_CONF)
+            .parent()
+            .unwrap_or(Path::new("/etc")),
+    )?;
+    std::fs::write(TRUSTED_CONF, "mode=off\n")?;
     // 等开关生效（刷新节流 1s）：确保 spawn 时配置已经是 off，
     // 否则场景 1 通过可能只是"内存没到阈值"，而不是"off 生效"。
     std::thread::sleep(Duration::from_millis(1500));
-    println!("[scn1] mode=off, spawn hogA({hog_a_mb}MB，单进程即超阈值)");
+    println!("[scn1] 可信层 mode=off, spawn hogA({hog_a_mb}MB，单进程即超阈值)");
     let mut hog_a = spawn(&hog_bin, hog_a_mb)?;
     std::thread::sleep(Duration::from_secs(4));
     assert_child_alive(&mut hog_a, "hogA")?;
-    println!("[scn1] PASS hogA 存活（off 不杀）");
+    println!("[scn1] PASS hogA 存活（可信层 off，不杀）");
 
-    // ── 场景 2：on + 启动窗口保护 ──────────────────────────────────
-    // 删除开关文件 → 回落到默认 On。hogA 在封窗前启动，会被启动窗口
-    // 快照保护；此时封窗（模拟首条用户消息），再启动 hogB → 应被淘汰。
-    std::fs::remove_file(CONF)?;
-    println!("[scn2] conf removed → default On; seal（封窗，hogA 受保护）");
+    // ── 场景 2：不可信的 /tmp 关不掉看门狗 + 启动窗口保护 ──────────
+    // 删除可信文件 → 回落到默认 On。同时在 /tmp 写 mode=off：/tmp 是不可信
+    // 层，关不掉基线为 On 的看门狗。hogA 在封窗前启动，会被启动窗口快照
+    // 保护；此时封窗（模拟首条用户消息），再启动 hogB → 应被淘汰。
+    std::fs::remove_file(TRUSTED_CONF)?;
+    std::fs::write(UNTRUSTED_CONF, "mode=off\n")?;
     std::thread::sleep(Duration::from_millis(400)); // 让 off 状态结束、快照吸收 hogA
+    println!("[scn2] 可信文件已删 → 默认 On；/tmp 写 mode=off（不可信，不生效）；seal");
     mem_watch::mark_session_active("scn");
     println!("[scn2] sealed, spawn hogB");
     let mut hog_b = spawn(&hog_bin, hog_b_mb)?;
     std::thread::sleep(Duration::from_secs(7));
     assert_child_alive(&mut hog_a, "hogA")?;
     assert_child_dead(&mut hog_b, "hogB")?;
-    println!("[scn2] PASS hogB 被淘汰，hogA（窗口内）存活");
+    println!("[scn2] PASS hogB 被淘汰（/tmp 的 mode=off 没能关掉看门狗），hogA（窗口内）存活");
 
-    // ── 场景 3：dry ────────────────────────────────────────────────
-    std::fs::write(CONF, "mode=dry\n")?;
+    // ── 场景 3：可信层 dry ─────────────────────────────────────────
+    std::fs::remove_file(UNTRUSTED_CONF)?;
+    std::fs::write(TRUSTED_CONF, "mode=dry\n")?;
     // 等旧配置（on）过期，避免 hogC 在残留的 on 窗口内被杀。
     std::thread::sleep(Duration::from_millis(1500));
-    println!("[scn3] mode=dry, spawn hogC");
+    println!("[scn3] 可信层 mode=dry, spawn hogC");
     let mut hog_c = spawn(&hog_bin, hog_b_mb)?;
     std::thread::sleep(Duration::from_secs(5));
     assert_child_alive(&mut hog_c, "hogC")?;
     println!("[scn3] PASS hogC 存活（dry 只记录）");
 
     // ── 清理 ───────────────────────────────────────────────────────
-    drop(std::fs::remove_file(CONF));
+    drop(std::fs::remove_file(TRUSTED_CONF));
+    drop(std::fs::remove_file(UNTRUSTED_CONF));
     for child in [&mut hog_a, &mut hog_c] {
         drop(child.kill());
         drop(child.wait());
@@ -138,7 +178,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn spawn(hog_bin: &std::path::Path, mb: usize) -> anyhow::Result<Child> {
+fn spawn(hog_bin: &Path, mb: usize) -> anyhow::Result<Child> {
     let child = std::process::Command::new(hog_bin)
         .arg(mb.to_string())
         .spawn()?;
