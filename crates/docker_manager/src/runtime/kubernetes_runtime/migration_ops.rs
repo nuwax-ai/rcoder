@@ -36,6 +36,16 @@ use super::*;
 /// Job 等待上限（4h, 与迁移脚本 activeDeadlineSeconds 对齐）。
 const JOB_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(14400);
 
+/// 删迁移 Job 的参数：显式后台级联，让垃圾回收把 Job 的 Pod 一并删掉。
+///
+/// 不能用 `DeleteParams::default()`——它不带传播策略，Job 的资源级默认是"孤儿化依赖"：
+/// Job 没了、Pod 永久留下（31.45 实测，每轮同步留一个已完成的 Pod，批量迁移就是
+/// 每用户两个）。不用前台级联：那会让 Job 带着删除时间戳多活一会儿，紧接着重建
+/// 同名 Job 会撞 409。
+fn job_delete_params() -> DeleteParams {
+    DeleteParams::background()
+}
+
 /// Job 的 Pod 起不来时（拉不到镜像、容器创建失败）的检查节拍：Job 创建后先等
 /// 这么久再看第一次（给正常拉镜像留时间），之后每次间隔。
 const POD_CHECK_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
@@ -436,9 +446,7 @@ impl KubernetesRuntime {
             mode,
         };
         let jobs: Api<Job> = Api::namespaced(self.client.clone(), &self.namespace);
-        jobs.delete(&plan.job_name, &DeleteParams::default())
-            .await
-            .ok();
+        drop(jobs.delete(&plan.job_name, &job_delete_params()).await);
         jobs.create(&PostParams::default(), &build_job(&plan))
             .await
             .map_err(|e| ContainerRuntimeError::K8sError(format!("create migration Job: {e}")))?;
@@ -514,7 +522,7 @@ impl KubernetesRuntime {
                 .unwrap_or_default();
             // 清理 best-effort：删除失败不改变主结果，但必须可观测
             // （Job 静默残留会误导后续迁移与排障）。
-            if let Err(e) = jobs.delete(&plan.job_name, &DeleteParams::default()).await {
+            if let Err(e) = jobs.delete(&plan.job_name, &job_delete_params()).await {
                 tracing::warn!(
                     job = %plan.job_name,
                     error = %e,
@@ -526,7 +534,7 @@ impl KubernetesRuntime {
                 plan.job_name
             )));
         }
-        if let Err(e) = jobs.delete(&plan.job_name, &DeleteParams::default()).await {
+        if let Err(e) = jobs.delete(&plan.job_name, &job_delete_params()).await {
             tracing::warn!(
                 job = %plan.job_name,
                 error = %e,
@@ -779,6 +787,15 @@ mod tests {
     /// Job 只跑 rclone，不访问 API server：不挂 ServiceAccount token（namespace 里
     /// 的 SA token 能读到什么，挂进数据面 Job 就是多大的面），系统调用面收敛到
     /// 运行时默认 seccomp profile。与沙箱 Pod 同款加固。
+    /// 反例（31.45 实测）：不带传播策略删 Job，Pod 被孤儿化、永久留在命名空间里。
+    #[test]
+    fn deleting_the_job_cascades_to_its_pods() {
+        assert_eq!(
+            job_delete_params().propagation_policy,
+            Some(kube::api::PropagationPolicy::Background)
+        );
+    }
+
     #[test]
     fn job_pod_mounts_no_service_account_token_and_sets_seccomp_profile() {
         let job = build_job(&plan(WorkspaceSyncMode::Full));
