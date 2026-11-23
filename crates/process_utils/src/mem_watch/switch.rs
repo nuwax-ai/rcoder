@@ -507,13 +507,15 @@ impl Switch {
             .iter()
             .skip_while(|(path, _)| path != first_path)
             .skip(1)
-            .find_map(|(path, read)| match read {
-                FileRead::Content(raw) if (self.trusted)(path) => Some(raw),
-                _ => None,
-            });
-        let Some(raw) = baseline else {
+            .find(|(path, read)| !matches!(read, FileRead::Missing) && (self.trusted)(path));
+        let Some((_, baseline_read)) = baseline else {
+            // 可信文件被删了: "关闭覆盖"的意图
             self.trusted_cached = None;
             self.trusted_raw = None;
+            return;
+        };
+        // 存在但暂时读不出来: 保留上一份有效基线
+        let FileRead::Content(raw) = baseline_read else {
             return;
         };
         if self.trusted_raw.as_deref() == Some(raw.as_str()) {
@@ -1107,6 +1109,40 @@ tmpfs /mnt/ba\04d tmpfs ro 0 0
             switch.current(&base).mode,
             Mode::Off,
             "紧急止损不能被一个读不出来的不可信文件挡住"
+        );
+    }
+
+    /// 可信层文件存在但暂时读不出来（被截断、IO 错误）: 保留上一份有效基线，不退回
+    /// 环境变量默认值；被删掉才算关闭覆盖。
+    #[test]
+    fn an_unreadable_trusted_file_keeps_the_previous_baseline() {
+        let mut switch = Switch::with_trust(Vec::new(), trust_named);
+        let base = Config::default(); // off
+        let untrusted = FileRead::Content("mode=off\n".to_string());
+        switch.apply(&reads(&[
+            ("/tmp/mem-watch.conf", untrusted.clone()),
+            ("trusted.conf", on()),
+        ]));
+        assert_eq!(switch.current(&base).mode, Mode::On);
+
+        switch.apply(&reads(&[
+            ("/tmp/mem-watch.conf", untrusted.clone()),
+            ("trusted.conf", FileRead::Unreadable),
+        ]));
+        assert_eq!(
+            switch.current(&base).mode,
+            Mode::On,
+            "可信文件暂时读不出来: 沿用上一份基线"
+        );
+
+        switch.apply(&reads(&[
+            ("/tmp/mem-watch.conf", untrusted),
+            ("trusted.conf", FileRead::Missing),
+        ]));
+        assert_eq!(
+            switch.current(&base).mode,
+            Mode::Off,
+            "可信文件被删: 只剩环境变量基线"
         );
     }
 
