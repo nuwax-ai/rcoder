@@ -10,6 +10,12 @@ use super::types::{DevServerManager, LocalLaunch};
 use crate::models::DevProcess;
 use shared_types::ExecutorStopOutcome;
 
+// 夹具的信号处理函数一律用 `os._exit(0)` 退出，**不要**用 `sys.exit(0)`：
+// 信号处理函数里（尤其是在它自己 sleep 过之后）抛出的 SystemExit，在
+// Python 3.15 / macOS 上偶发被吞掉（脱离测试框架单独压测：约 3-5%），进程
+// 回到主循环继续活着——夹具从此对 `release` 文件毫无反应，被测的 stop 只能
+// 等满优雅宽限期后以 "exit not confirmed" 收场，用例间歇性失败（本机约 1/3）。
+// 夹具只需要"立刻以 0 退出"，`os._exit` 不经解释器收尾，各平台行为一致。
 const SIGNAL_BARRIER: &str = r#"
 import os, signal, sys, time
 root = sys.argv[1]
@@ -17,7 +23,7 @@ def stop(signum, frame):
     open(os.path.join(root, 'term-entered'), 'w').write('signal received')
     while not os.path.exists(os.path.join(root, 'release')):
         time.sleep(.005)
-    sys.exit(0)
+    os._exit(0)
 signal.signal(signal.SIGTERM, stop)
 open(os.path.join(root, 'ready'), 'w').write(str(os.getpid()))
 while True:
@@ -316,7 +322,7 @@ root, port = sys.argv[1], int(sys.argv[2])
 def stop(signum, frame):
     open(os.path.join(root, 'term-entered'), 'w').write('real signal')
     while not os.path.exists(os.path.join(root, 'release')): time.sleep(.005)
-    sys.exit(0)
+    os._exit(0)
 signal.signal(signal.SIGTERM, stop)
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):

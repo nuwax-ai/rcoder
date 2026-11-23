@@ -36,9 +36,13 @@ impl Fixture {
             app_cli_bin: Some("/bin/false".into()),
             app_cli_admin_probe_addr: "127.0.0.1:1".into(),
             dev_stop_check_interval_ms: 5,
-            // This is an IO-routing fixture, not a 10ms stop-budget test.
-            // Allow the actual kernel-pinned group-state observation to finish.
-            dev_stop_max_attempts: 40,
+            // This is an IO-routing fixture, not a stop-budget test. Allow the
+            // actual kernel-pinned group-state observation to finish: one
+            // observation spawns `ps` twice (normally 50-120ms on macOS), so a
+            // 200ms budget (40 attempts) still timed out under suite-parallel
+            // load (reproduced ~2/15 locally) and reported the already-dead
+            // `sleep` as "exit not confirmed". 400 attempts = 2s.
+            dev_stop_max_attempts: 400,
             ..crate::Config::default()
         };
         Self {
