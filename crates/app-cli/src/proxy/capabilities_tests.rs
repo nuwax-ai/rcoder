@@ -57,7 +57,7 @@ fn basic(pid: u32) -> BasicCapabilities {
 }
 
 #[test]
-fn capabilities_require_the_owned_worker_and_exact_official_source() {
+fn capabilities_require_the_owned_worker_and_treat_identity_as_advisory() {
     let mut response = basic(19);
     assert!(validate_basic(&response, 19).is_ok());
     assert!(
@@ -66,8 +66,12 @@ fn capabilities_require_the_owned_worker_and_exact_official_source() {
             .to_string()
             .contains("another process")
     );
+    // 版本/来源身份差异只告警，不拦截启动（app-cli pin 与镜像 pingap 版本不一致时
+    // 不能让用户应用起不来）。
     response.git_hash = "unrelated-source".into();
-    assert!(validate_basic(&response, 19).is_err());
+    assert!(validate_basic(&response, 19).is_ok());
+    response.version = "9.9.9".into();
+    assert!(validate_basic(&response, 19).is_ok());
     response.git_hash = PINNED_COMMIT.into();
     response.supported_plugins.clear();
     assert!(validate_basic(&response, 19).is_err());

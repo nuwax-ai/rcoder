@@ -472,10 +472,18 @@ fn validate_basic(basic: &BasicCapabilities, expected_pid: u32) -> Result<()> {
             == expected_pid,
         "proxy capability response belongs to another process"
     );
-    anyhow::ensure!(
-        basic.version == PINNED_VERSION && basic.git_hash == PINNED_COMMIT,
-        "proxy capability process does not match the pinned official Pingap version and source"
-    );
+    // 版本/来源身份只告警不拦截：pingap 向后兼容，候选配置的兼容性由本机语法
+    // 校验与配置编译保证；app-cli 编译期 pin 与镜像内 pingap 版本不一致时
+    // 不应让用户应用无法启动（如 app-cli 按 0.16.1 编译、镜像装 0.16.2）。
+    if basic.version != PINNED_VERSION || basic.git_hash != PINNED_COMMIT {
+        tracing::warn!(
+            expected_version = %PINNED_VERSION,
+            expected_commit = %PINNED_COMMIT,
+            observed_version = %basic.version,
+            observed_commit = %basic.git_hash,
+            "official Pingap capability identity differs from the pinned release; continuing (advisory only)"
+        );
+    }
     anyhow::ensure!(
         !basic.supported_plugins.is_empty(),
         "official Pingap capability response has no supported plugins"
