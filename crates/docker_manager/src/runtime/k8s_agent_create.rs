@@ -18,7 +18,7 @@ use shared_types::{
 };
 use tracing::info;
 
-use super::k8s_app_helpers::{build_hostname_spread_constraint, unconfined_app_armor_profile};
+use super::k8s_app_helpers::build_hostname_spread_constraint;
 use super::k8s_pod::K8sPodOps;
 use super::k8s_pvc::K8sPvcOps;
 use super::k8s_service::K8sServiceOps;
@@ -711,7 +711,6 @@ impl KubernetesRuntime {
             image_pull_secrets,
             security_context: Some(PodSecurityContext {
                 run_as_non_root: Some(false),
-                app_armor_profile: Some(unconfined_app_armor_profile()),
                 ..Default::default()
             }),
             termination_grace_period_seconds: Some(15),
@@ -1290,7 +1289,7 @@ mod marker_fence_tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    pub(super) fn runtime(client: kube::Client) -> KubernetesRuntime {
+    fn runtime(client: kube::Client) -> KubernetesRuntime {
         use crate::runtime::kubernetes_runtime::KubernetesRuntimeConfig;
         KubernetesRuntime {
             client,
@@ -1812,42 +1811,5 @@ mod marker_fence_tests {
         assert!(!state.migrated, "换代对象绝不能被写入 migrated");
         drop(state);
         assert!(harness.gate_released());
-    }
-}
-
-/// agent 族 pod 的 pod 级安全上下文回归：某些宿主上运行时默认的 AppArmor profile 会拒绝
-/// 容器内进程互发信号（命令停不掉、看门狗发不出 SIGTERM/SIGKILL），必须显式不套它。
-#[cfg(all(test, feature = "kubernetes"))]
-mod pod_security_context_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn agent_pods_opt_out_of_the_runtime_apparmor_profile() {
-        drop(rustls::crypto::ring::default_provider().install_default());
-        let mut config = kube::Config::new("http://127.0.0.1:9".parse().unwrap());
-        config.default_retry = false;
-        let runtime = marker_fence_tests::runtime(kube::Client::try_from(config).unwrap());
-        for service_type in [
-            ServiceType::ComputerAgentRunner,
-            ServiceType::ComputerNormalProject,
-            ServiceType::WebAgentRunner,
-            ServiceType::UserappBuilder,
-        ] {
-            let params = ContainerCreateParams::builder()
-                .service_type(service_type)
-                .user_id("user")
-                .project_id("project")
-                .build();
-            let spec = runtime
-                .build_agent_pod_spec("owner", &service_type, &params, false)
-                .unwrap();
-            let profile = spec
-                .security_context
-                .expect("pod security context")
-                .app_armor_profile
-                .expect("pod apparmor profile");
-            assert_eq!(profile.type_, "Unconfined", "{service_type:?}");
-            assert!(profile.localhost_profile.is_none());
-        }
     }
 }

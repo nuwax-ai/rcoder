@@ -156,7 +156,6 @@ fn sandbox_pod(params: &SandboxPodParams) -> Pod {
                 type_: "RuntimeDefault".to_string(),
                 localhost_profile: None,
             }),
-            app_armor_profile: Some(super::k8s_app_helpers::unconfined_app_armor_profile()),
             ..Default::default()
         }),
         ..Default::default()
@@ -402,19 +401,6 @@ mod tests {
             profile.map(|profile| profile.type_),
             Some("RuntimeDefault".to_string())
         );
-    }
-
-    /// 某些宿主上运行时默认的 AppArmor profile 会拒绝容器内进程互发信号，沙箱必须显式不套它。
-    #[test]
-    fn sandbox_pod_opts_out_of_the_runtime_apparmor_profile() {
-        let spec = sandbox_pod(&params()).spec.expect("pod spec");
-        let profile = spec
-            .security_context
-            .expect("pod security context")
-            .app_armor_profile
-            .expect("pod apparmor profile");
-        assert_eq!(profile.type_, "Unconfined");
-        assert!(profile.localhost_profile.is_none());
     }
 
     /// 有意不加的加固项不能悄悄出现：runAsNonRoot 会破坏以 root / sudo 运行
