@@ -119,7 +119,13 @@ impl MigrationJobPlan {
     /// 被第二处 shell 上下文（比如 `echo "…"` 的双引号）重新解释"的问题。
     pub fn rclone_args(&self) -> String {
         let source = shared_types::shell::single_quote(&format!("/src/{}", self.src_subpath));
-        let mut args = format!("sync {source} /dst --links --metadata --transfers 8 --checkers 8");
+        // `--create-empty-src-dirs`：rclone 默认不建空目录。用户工作区里的空目录是
+        // 数据的一部分（PG 的 pg_notify / pg_stat / pg_wal/archive_status 等必需目录，
+        // 用户建的空项目目录）——丢了 PG 起不来（实测 "could not open directory
+        // pg_notify"）。`rclone check --size-only` 看不见这种缺失，只有目录树比对能发现。
+        let mut args = format!(
+            "sync {source} /dst --links --metadata --create-empty-src-dirs --transfers 8 --checkers 8"
+        );
         if let Some(limit) = &self.bwlimit {
             args.push_str(&format!(
                 " --bwlimit {}",
@@ -673,7 +679,7 @@ mod tests {
     #[test]
     fn full_mode_args_carry_bwlimit_and_excludes() {
         let args = plan(WorkspaceSyncMode::Full).rclone_args();
-        assert!(args.starts_with("sync '/src/u_1' /dst --links --metadata"));
+        assert!(args.starts_with("sync '/src/u_1' /dst --links --metadata --create-empty-src-dirs"));
         assert!(args.contains("--bwlimit '150M'"));
         assert!(args.contains("--exclude 'node_modules/'"));
         assert!(args.contains("--exclude 'core.[0-9]*'"));
@@ -858,6 +864,7 @@ mod tests {
                 "/dst",
                 "--links",
                 "--metadata",
+                "--create-empty-src-dirs",
                 "--transfers",
                 "8",
                 "--checkers",

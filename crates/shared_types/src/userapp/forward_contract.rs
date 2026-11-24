@@ -77,6 +77,27 @@ pub fn is_userapp_service_type_value(value: &str) -> bool {
     normalize_computer_service_type(value) == Some(ComputerServiceKind::Userapp)
 }
 
+/// 判断 `x-service-type` 值是否标记 computer 域（taskAgent / normalProject）。
+///
+/// 60000 分流代理（`file_server_proxy` 的 `ts_first` 策略）据此把 computer 域流量
+/// 导向 Rust 上游：per-agent RBD 下用户工作区只在 agent 容器里，TS 侧读不到——
+/// 这些请求必须进 rcoder 的转发层（RBD 用户转发进容器，shared 用户本地读共享卷）。
+/// userApp 由 [`is_userapp_service_type_value`] 单独判定；pageApp（web 域）不在本集合，
+/// 继续走 TS。
+///
+/// 两套词表都认：Java 下发的容器运行时类型（`computer-agent-runner` /
+/// `computer-normal-project`，[`crate::ServiceType`] 的 wire 值）与工作空间类型
+/// （`taskAgent` / `normalProject`）——同一物理容器的两种叫法。
+pub fn is_computer_domain_service_type_value(value: &str) -> bool {
+    matches!(
+        normalize_computer_service_type(value),
+        Some(ComputerServiceKind::TaskAgent | ComputerServiceKind::NormalProject)
+    ) || value
+        .trim()
+        .parse::<crate::ServiceType>()
+        .is_ok_and(crate::ServiceType::is_computer_family)
+}
+
 /// 开发容器定位 header：Java 调 rcoder 主服务的所有 userApp 请求统一携带，
 /// rcoder 零 body 解析定位 per-app 开发容器（multipart/SSE 全覆盖）。
 pub const APP_ID_HEADER: &str = "x-app-id";
@@ -147,6 +168,31 @@ mod tests {
         assert!(!is_userapp_service_type_value("user-app"));
         assert!(!is_userapp_service_type_value("computer-agent-runner"));
         assert!(!is_userapp_service_type_value(""));
+    }
+
+    /// computer 域判定：Java 的容器运行时类型与工作空间类型两套词都命中；
+    /// userApp/pageApp/web 容器与空值不命中（60000 分流据此决定是否进转发层）。
+    #[test]
+    fn computer_domain_service_type_value_matches_both_vocabularies() {
+        for value in [
+            "computer-agent-runner",
+            "computer-normal-project",
+            "taskAgent",
+            "normalProject",
+            "  TASKAGENT  ",
+        ] {
+            assert!(is_computer_domain_service_type_value(value), "{value}");
+        }
+        for value in [
+            "userapp",
+            "pageApp",
+            "web-agent-runner",
+            "normalProjectX",
+            "general",
+            "",
+        ] {
+            assert!(!is_computer_domain_service_type_value(value), "{value}");
+        }
     }
 
     /// 四值词表归一化：驼峰与全小写变体均命中，未匹配（含 general 旧值）→ None

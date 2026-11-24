@@ -81,7 +81,8 @@ pub use userapp::forward_contract::{
     APP_ID_HEADER, APP_STAGE_DEV, APP_STAGE_HEADER, APP_STAGE_PROD, ComputerServiceKind,
     SERVICE_TYPE_HEADER, SERVICE_TYPE_NORMAL_PROJECT, SERVICE_TYPE_PAGE_APP,
     SERVICE_TYPE_TASK_AGENT, SERVICE_TYPE_USERAPP, USER_ID_HEADER, WORKSPACE_PATH_HEADER,
-    WORKSPACE_TYPE_HEADER, is_userapp_service_type_value, normalize_computer_service_type,
+    WORKSPACE_TYPE_HEADER, is_computer_domain_service_type_value, is_userapp_service_type_value,
+    normalize_computer_service_type,
 };
 pub use userapp::http_credentials::{FileServerCredentialsProvider, FileServerRequestCredentials};
 pub use userapp::metadata::AppMetadataRecord;
