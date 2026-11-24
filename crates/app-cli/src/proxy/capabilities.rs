@@ -28,10 +28,30 @@ static CACHE: OnceLock<CapabilityCache> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
 struct BasicCapabilities {
+    // pingap 历史上报字符串；同时接受数字形态，避免上游字段类型变化直接把候选校验打挂
+    // （确实解析不出进程号时在 validate_basic 里降级为告警）。
+    #[serde(deserialize_with = "string_or_number")]
     pid: String,
     version: String,
     git_hash: String,
     supported_plugins: Vec<String>,
+}
+
+fn string_or_number<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum TextOrNumber {
+        Text(String),
+        Number(u64),
+    }
+    Ok(match TextOrNumber::deserialize(deserializer)? {
+        TextOrNumber::Text(text) => text,
+        TextOrNumber::Number(number) => number.to_string(),
+    })
 }
 
 /// Every stage shares the caller's deadline. Cancellation retains the exact
@@ -464,14 +484,19 @@ async fn read_basic(mut response: reqwest::Response) -> Result<BasicCapabilities
 }
 
 fn validate_basic(basic: &BasicCapabilities, expected_pid: u32) -> Result<()> {
-    anyhow::ensure!(
-        basic
-            .pid
-            .parse::<u32>()
-            .context("invalid proxy capability PID")?
-            == expected_pid,
-        "proxy capability response belongs to another process"
-    );
+    // 归属校验：响应必须来自我们拉起的那个进程。进程号解析不出来（上游格式漂移）
+    // 只告警放行；能解析但与预期不符仍拒绝——那说明串到了别的进程，插件列表不可信。
+    match basic.pid.trim().parse::<u32>() {
+        Ok(pid) if pid == expected_pid => {}
+        Ok(pid) => anyhow::bail!(
+            "proxy capability response belongs to another process (observed {pid}, expected {expected_pid})"
+        ),
+        Err(error) => tracing::warn!(
+            observed_pid = %basic.pid,
+            %error,
+            "proxy capability PID is not a valid process id; continuing (advisory only)"
+        ),
+    }
     // 版本/来源身份只告警不拦截：pingap 向后兼容，候选配置的兼容性由本机语法
     // 校验与配置编译保证；app-cli 编译期 pin 与镜像内 pingap 版本不一致时
     // 不应让用户应用无法启动（如 app-cli 按 0.16.1 编译、镜像装 0.16.2）。
