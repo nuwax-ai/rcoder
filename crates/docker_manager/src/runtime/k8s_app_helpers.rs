@@ -5,7 +5,9 @@
 #[cfg(feature = "kubernetes")]
 use container_runtime_api::{AppResourceRequirements, ContainerCreateParams, ExposeType};
 #[cfg(feature = "kubernetes")]
-use k8s_openapi::api::core::v1::{Probe, ResourceRequirements, TopologySpreadConstraint};
+use k8s_openapi::api::core::v1::{
+    AppArmorProfile, Probe, ResourceRequirements, TopologySpreadConstraint,
+};
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 #[cfg(feature = "kubernetes")]
@@ -25,6 +27,15 @@ pub(crate) const IDLE_TIMEOUT_ANNOTATION: &str = "rcoder.io/idle-timeout-seconds
 /// pod-template-hash 三者互不可比，不使用）。
 pub(crate) const DEPLOY_TEMPLATE_TOKEN_ANNOTATION: &str = "rcoder.io/deploy-template-token";
 pub(crate) const WAKE_ON_TRAFFIC_ANNOTATION: &str = "rcoder.io/wake-on-traffic";
+
+/// 运行用户代码的 pod 不套 AppArmor：部分宿主会让运行时默认 profile 拒绝容器内进程互发信号（命令停不掉、看门狗发不出 SIGTERM/SIGKILL）。
+#[cfg(feature = "kubernetes")]
+pub(crate) fn unconfined_app_armor_profile() -> AppArmorProfile {
+    AppArmorProfile {
+        type_: "Unconfined".to_string(),
+        localhost_profile: None,
+    }
+}
 
 /// ports → annotation（`rcoder.io/port-expose: "80:http,5432:tcp"`）；无端口返 None。
 #[cfg(feature = "kubernetes")]
