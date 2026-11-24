@@ -551,22 +551,24 @@ Unconfined 只是排障手段。正式方案 `k8s/scripts/node-apparmor/`：
 2. rcoder pod 模板加 `appArmorProfile: {type: Localhost, localhostProfile: cri-containerd-signal}`；
 3. 部署后用探针验证一次。
 
-**2026-11-24 更新：实际落地的是 pod 级 `Unconfined`，不是上面的 Localhost 方案。**
-客户宿主机没法逐节点安装 profile，所以 agent 族 pod（`build_agent_pod_spec`：
-ComputerAgentRunner / ComputerNormalProject / WebAgentRunner / UserappBuilder）与 E2B 沙箱 pod
-从 `490d1d22`（平台 0.1.484）起默认 `appArmorProfile: {type: Unconfined}`。两点代价：
-这些 pod 没有 AppArmor 隔离（E2B 沙箱的 seccomp RuntimeDefault 仍在）；PodSecurity
-`baseline` / `restricted` 的 enforce 会拒绝它们，rcoder 所在 namespace 不能打 enforce。
-上面的 `cri-containerd-signal` + `install.sh` 留给"必须保留 LSM 且能逐节点安装"的环境。
+**2026-11-24 更新：问题范围与最终决定**
+
+范围：只在"内核带提交 `08c2f7c8d4b1`（Ubuntu 26.04 的 7.0.0-42 起）"**且**
+`kernel.apparmor_restrict_unprivileged_unconfined=1`（26.04 的默认值；24.04 为 0）的宿主上出现。
+生产（Ubuntu 24.04）与 Docker / Docker Compose 部署不受影响。
 
 同一问题的另一个表现：agent 每次启动时 `agent_runner` 跑两次 `nuwaxcode -v`，此时容器正被
 CPU 限流，Bun/JavaScriptCore 的 GC 用信号暂停线程失败（`embedder failed to suspend thread`），
 进程 SIGTRAP 并往 `/home/user` 写 core（排查经过见
-`docs-local/20261120-p0-builder-registration-deadlock.md` 附 9）。根因是内核提交 `08c2f7c8d4b1`
-（CVE-2026-90231 修复）加上宿主 `kernel.apparmor_restrict_unprivileged_unconfined=1`
-（Ubuntu 26.04 默认）；containerd 的模板修复 PR #14487 已合入 2.0/2.3/2.4 分支但尚未发版，
-k3s 等 containerd 发版后跟进（k3s #13625）。**k3s 升级到带修复的 containerd 之后，
-应撤回这里的 `Unconfined`。**
+`docs-local/20261120-p0-builder-registration-deadlock.md` 附 9）。
+
+**决定（用户，2026-11-24）：rcoder 不为这个问题做改动，等 k3s 升级到带 containerd 修复
+（PR #14487，已合入 2.0/2.3/2.4 分支、尚未发版；k3s #13625）的版本。**
+当天试过 pod 级 `appArmorProfile: {type: Unconfined}`（`490d1d22`，平台 0.1.484）：功能有效，
+但 agent pod 因此失去 AppArmor 隔离、PodSecurity `baseline` 的 enforce 会拒绝它们，已撤回
+（`ef4245ba`），**0.1.484 不晋级**。受影响的宿主在升级前用宿主机参数临时规避：
+`kernel.apparmor_restrict_unprivileged_unconfined=0`（31.45 已这样处理）。
+上面的 `cri-containerd-signal` + `install.sh` 保留给"必须保留 LSM 且能逐节点安装"的环境。
 
 ### 19.5 附：调研结论——"kill 子进程能否交给内核"
 
