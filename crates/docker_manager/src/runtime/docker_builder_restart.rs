@@ -524,7 +524,45 @@ impl DockerRuntime {
             .as_ref()
             .filter(|resource| resource.kind == AppResourceKind::Container)
             .ok_or_else(|| conflict("Restart source container is missing"))?;
+        self.replace_builder_container(template, &archive, original)
+            .await?;
         let client = self.inner.get_docker_client();
+        let restored = self
+            .capture_builder_compute_with_binding(&template.source.context, None, false)
+            .await?;
+        let resource = restored
+            .workload
+            .as_ref()
+            .filter(|resource| resource.kind == AppResourceKind::Container)
+            .ok_or_else(|| conflict("Restart did not produce a replacement builder"))?;
+        if resource.uid == original.uid {
+            return Err(conflict("Restart did not produce a replacement builder"));
+        }
+        let inspect = client
+            .inspect_container(&resource.uid, None)
+            .await
+            .map_err(|error| fail(format!("Verify replacement builder: {error}")))?;
+        if bind_witness(&inspect)? != template.volumes {
+            return Err(conflict("Restart workspace binds changed"));
+        }
+        // Replacement is deliberately stopped here. Its Direct IP and
+        // published ports are not available until start_builder_compute.
+        Ok(restored)
+    }
+
+    /// 用归档重放出替代 builder：必要时先移除仍被保留的旧容器，核对 bind 源，再创建。
+    ///
+    /// 整段都在挂载围栏的读锁内。旧容器的挂载消失、到替代容器的挂载登记之间，日志清理器
+    /// 不能插进来：归档里的 bind 源若正好是可回收的日志目录，会被它在这一段回收。期间
+    /// 可能拉镜像，清理器只是顺延到下一轮。
+    async fn replace_builder_container(
+        &self,
+        template: &BuilderRestartTemplate,
+        archive: &Archive,
+        original: &AppResourceIdentity,
+    ) -> Result<()> {
+        let client = self.inner.get_docker_client();
+        let _log_mount_guard = crate::LOG_MOUNT_GATE.read().await;
         // Old versions may retain stopped builders. Replace that exact instance
         // only after its stop receipt and mount witnesses are confirmed.
         if let Some(existing) = inspect_absent(
@@ -616,7 +654,7 @@ impl DockerRuntime {
                 .map_err(|error| {
                     Error::DockerError(format!("Prepare restart image {image}: {error}"))
                 })?;
-            let mut body = restore_body(template, &archive)?;
+            let mut body = restore_body(template, archive)?;
             crate::native_domain::stamp(client, &mut body)
                 .await
                 .map_err(|e| fail(format!("bind replacement execution domain: {e:#}")))?;
@@ -628,7 +666,6 @@ impl DockerRuntime {
             // "name already in use". The daemon finishes auto-remove quickly;
             // wait it out bounded instead of failing the whole restart.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-            let log_mount_guard = crate::LOG_MOUNT_GATE.read().await;
             let created = loop {
                 match client
                     .create_container(Some(options.clone()), body.clone())
@@ -646,32 +683,11 @@ impl DockerRuntime {
                     Err(error) => return Err(fail(format!("Create replacement builder: {error}"))),
                 }
             };
-            drop(log_mount_guard);
             if created.id.is_empty() {
                 return Err(fail("Replacement builder create returned no physical ID"));
             }
         }
-        let restored = self
-            .capture_builder_compute_with_binding(&template.source.context, None, false)
-            .await?;
-        let resource = restored
-            .workload
-            .as_ref()
-            .filter(|resource| resource.kind == AppResourceKind::Container)
-            .ok_or_else(|| conflict("Restart did not produce a replacement builder"))?;
-        if resource.uid == original.uid {
-            return Err(conflict("Restart did not produce a replacement builder"));
-        }
-        let inspect = client
-            .inspect_container(&resource.uid, None)
-            .await
-            .map_err(|error| fail(format!("Verify replacement builder: {error}")))?;
-        if bind_witness(&inspect)? != template.volumes {
-            return Err(conflict("Restart workspace binds changed"));
-        }
-        // Replacement is deliberately stopped here. Its Direct IP and
-        // published ports are not available until start_builder_compute.
-        Ok(restored)
+        Ok(())
     }
 
     pub(super) async fn remove_builder_restart_archive(
@@ -862,3 +878,6 @@ fn restore_body(
         ..Default::default()
     })
 }
+
+#[cfg(test)]
+mod tests;
