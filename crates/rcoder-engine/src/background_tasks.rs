@@ -368,8 +368,14 @@ fn cleanup_runtime_config(config: &AppConfig) -> cleanup_task::CleanupConfig {
         long_idle_timeout: Duration::from_secs(config.cleanup_config.long_idle_timeout_seconds),
         active_window: Duration::from_secs(5 * 60),
         log_dir: config.cleanup_config.log_cleanup.log_dir.clone(),
+        // saturating_mul：保留天数来自配置，直接相乘在 release 下会静默回绕
+        // （例如 144115188075855872 天回绕成 0 秒 = 保留期 0 天），debug 下则 panic
         log_retention_duration: Duration::from_secs(
-            config.cleanup_config.log_cleanup.log_retention_days * 24 * 60 * 60,
+            config
+                .cleanup_config
+                .log_cleanup
+                .log_retention_days
+                .saturating_mul(24 * 60 * 60),
         ),
     }
 }

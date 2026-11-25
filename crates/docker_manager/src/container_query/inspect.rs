@@ -2,6 +2,8 @@
 //!
 //! 从 container_query.rs 目录化拆出（extension-impl，方法体原样搬迁）。
 
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -89,6 +91,45 @@ impl DockerManager {
         identifier: &str,
     ) -> DockerResult<Option<ContainerQueryResult>> {
         self.find_container_status(identifier, false).await
+    }
+
+    /// Host paths currently claimed by some container as a bind mount source,
+    /// including containers that are stopped but not yet removed.
+    ///
+    /// One list call covers every container, so a periodic caller pays a single
+    /// request instead of one inspect per candidate. Paths are normalized the
+    /// same way the mount builder normalizes them, so callers can compare
+    /// against paths they built themselves.
+    pub(crate) async fn mounted_host_paths(&self) -> DockerResult<HashSet<PathBuf>> {
+        let options = Some(bollard::query_parameters::ListContainersOptions {
+            all: true,
+            ..Default::default()
+        });
+        let containers = self.docker.list_containers(options).await.map_err(|e| {
+            DockerError::ConnectionError(format!("failed to list container mounts: {e}"))
+        })?;
+
+        let mut sources = HashSet::new();
+        for container in containers {
+            for mount in container.mounts.unwrap_or_default() {
+                // bollard 把挂载类型建模成字符串（"bind" / "volume" / ...），
+                // 与容器创建侧的判断保持一致
+                if mount.typ.as_deref() != Some("bind") {
+                    continue;
+                }
+                if let Some(source) = mount.source {
+                    // 与容器创建侧相同的规范化：消除冗余分隔符和尾部分隔符
+                    let normalized = std::path::Path::new(&source)
+                        .components()
+                        .collect::<PathBuf>();
+                    if normalized.as_os_str().is_empty() {
+                        continue;
+                    }
+                    sources.insert(normalized);
+                }
+            }
+        }
+        Ok(sources)
     }
 
     async fn find_container_status(

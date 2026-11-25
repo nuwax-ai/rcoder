@@ -711,6 +711,28 @@ pub trait AgentContainerRuntime: Send + Sync {
         self.find_container(identifier, service_type).await
     }
 
+    /// Host paths currently claimed by some container as a bind mount source,
+    /// including containers that are stopped but not yet removed.
+    ///
+    /// Callers use it to protect host directories a container is still mounting:
+    /// while a path is in this set it must not be deleted. Deciding by mounted
+    /// paths rather than by container name is deliberate — a container that was
+    /// renamed still holds its mounts, so a name lookup would wrongly report it
+    /// as gone and get its log directory deleted.
+    ///
+    /// Implementations must read the real runtime and must not answer from the
+    /// in-process container cache: that cache starts empty after a restart and
+    /// only refills as containers are touched again. The default reports `Err`
+    /// ("unknown"), so a caller can never mistake an unsupported inventory for
+    /// "nothing is mounted".
+    async fn mounted_host_paths(
+        &self,
+    ) -> ContainerRuntimeResult<std::collections::HashSet<std::path::PathBuf>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "mounted host path inventory is not supported by this runtime".to_string(),
+        ))
+    }
+
     /// Stop and remove container
     async fn stop_container(&self, project_id: &str) -> ContainerRuntimeResult<()>;
 

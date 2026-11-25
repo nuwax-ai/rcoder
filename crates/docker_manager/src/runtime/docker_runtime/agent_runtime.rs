@@ -928,6 +928,22 @@ impl AgentContainerRuntime for DockerRuntime {
         }))
     }
 
+    /// 一次列表调用拿到全部容器的 bind 挂载源，因此周期调用方只需一次请求。
+    /// 改名后的容器依然持有原挂载，按名字判断会把它误判成已消失。
+    async fn mounted_host_paths(
+        &self,
+    ) -> ContainerRuntimeResult<std::collections::HashSet<std::path::PathBuf>> {
+        self.inner
+            .mounted_host_paths()
+            .await
+            .map_err(|error| match error {
+                crate::DockerError::Timeout(message) => ContainerRuntimeError::Timeout(message),
+                other => ContainerRuntimeError::DockerError(format!(
+                    "List container mount sources: {other}"
+                )),
+            })
+    }
+
     /// Docker 基础诊断：find_container → docker inspect → 读 State(OOMKilled/exit_code/running)。
     /// 用于 gRPC 连接失败时的根因识别（OOM / 容器不在），生成精准友好错误，而非裸 transport error。
     /// inspect 失败(容器重建中等)→ 返回默认诊断(无根因)，调用方按"保留原文"处理，不误判。

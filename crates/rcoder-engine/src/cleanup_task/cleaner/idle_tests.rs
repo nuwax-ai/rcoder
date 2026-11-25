@@ -118,6 +118,8 @@ struct Runtime {
     absence_release: tokio::sync::Notify,
     physical: std::sync::Mutex<String>,
     docker: std::sync::Mutex<Option<physical_docker::Target>>,
+    /// 被认为"仍被容器挂载"的宿主机路径，供 `mounted_host_paths` 回答；默认为空
+    mounted_paths: std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
 }
 
 impl Default for Runtime {
@@ -138,6 +140,7 @@ impl Default for Runtime {
             absence_release: tokio::sync::Notify::new(),
             physical: std::sync::Mutex::new("physical-original".into()),
             docker: std::sync::Mutex::new(None),
+            mounted_paths: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 }
@@ -301,6 +304,12 @@ impl AgentContainerRuntime for Runtime {
     }
     async fn list_containers(&self) -> ContainerRuntimeResult<Vec<RuntimeContainerInfo>> {
         Ok(vec![])
+    }
+    async fn mounted_host_paths(
+        &self,
+    ) -> ContainerRuntimeResult<std::collections::HashSet<std::path::PathBuf>> {
+        // 与生产契约一致：直接回答挂载清单，不读任何缓存
+        Ok(self.mounted_paths.lock().unwrap().clone())
     }
     async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {
         panic!("cleanup must not delete unrelated resources")
@@ -638,4 +647,43 @@ async fn cancelled_sweep_does_not_publish_previous_idle_confirmation() {
     f.cleaner.cleanup_once().await.unwrap();
     assert_eq!(f.runtime.stops.load(Ordering::SeqCst), 1);
     f.close().await;
+}
+
+/// 生产装配路径：清理任务必须按"当前是否还被容器挂载"来决定是否删除过期目录。
+/// 挂着的保留，没挂的回收。
+///
+/// 回归背景：清理器曾按目录修改时间删掉了仍在运行的容器的日志目录，容器里的
+/// `/app/container-logs` 随之失效。
+#[tokio::test]
+async fn sweep_keeps_mounted_expired_log_dir_and_reclaims_unmounted() {
+    let mut fixture = Fixture::new(0).await;
+    let log_dir = std::path::PathBuf::from(&fixture.cleaner.config.log_dir);
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let old_time = std::time::SystemTime::now() - Duration::from_secs(15 * 24 * 60 * 60);
+    let aged = |name: &str| {
+        let dir = log_dir.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_times(&dir, std::fs::FileTimes::new().set_modified(old_time)).unwrap();
+        dir
+    };
+    let in_use = aged("computer-agent-runner-longlived-20261029035324");
+    let orphan = aged("computer-agent-runner-retired-20261029035324");
+    fixture
+        .runtime
+        .mounted_paths
+        .lock()
+        .unwrap()
+        .insert(in_use.clone());
+
+    fixture.cleaner.cleanup_once().await.unwrap();
+
+    assert!(
+        in_use.exists(),
+        "log directory still mounted by a container must survive the sweep"
+    );
+    assert!(
+        !orphan.exists(),
+        "log directory no container mounts must be reclaimed by the sweep"
+    );
+    fixture.close().await;
 }

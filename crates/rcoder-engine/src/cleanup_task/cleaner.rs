@@ -50,10 +50,14 @@ impl AgentCleaner {
         // 判断是否是 K8s 运行时（通过 features flag）
         let is_kubernetes = shared_types::is_kubernetes_runtime();
 
-        // 创建日志清理器（使用配置）
+        // 创建日志清理器（使用配置）。日志目录是容器 /app/container-logs 的挂载源，
+        // 删除前须确认当前没有容器还在挂它。
         let log_cleaner = super::logs::LogCleaner::new(
             config.log_dir.clone(),
             config.log_retention_duration.as_secs() / 24 / 60 / 60,
+            Arc::new(super::logs::RuntimeMountedPaths::new(
+                state.runtime().clone(),
+            )),
         );
 
         Self {
@@ -92,8 +96,17 @@ impl AgentCleaner {
         // 1. 清理过期日志文件
         match self.log_cleaner.cleanup_once().await {
             Ok(log_stats) => {
-                if log_stats.files_deleted > 0 || log_stats.failed_deletions > 0 {
+                // 查询失败或删除失败说明环境有问题，必须告警；
+                // "仍被挂载所以保留"只是长期运行容器的常态，记 debug 即可。
+                if log_stats.dirs_skipped_unconfirmed > 0 || log_stats.failed_deletions > 0 {
+                    warn!(
+                        "[cleaner] Log cleanup needs attention: {}",
+                        log_stats.summary()
+                    );
+                } else if log_stats.files_deleted > 0 || log_stats.dirs_deleted > 0 {
                     info!("[cleaner] Cleanup completed: {}", log_stats.summary());
+                } else if log_stats.dirs_skipped_in_use > 0 {
+                    debug!("[cleaner] Log cleanup: {}", log_stats.summary());
                 }
             }
             Err(e) => {
