@@ -54,7 +54,7 @@ impl ContainerSelfInspector {
     ///
     /// 自检出的挂载表要和其它 Docker 查询放在一起比对时用这个构造器：各自建连接的话，
     /// 配置了非默认 daemon 时"自己"和被查询的容器可能不在同一个 daemon 上。
-    pub async fn with_docker_client(docker_client: Docker) -> Result<Self> {
+    pub(crate) async fn with_docker_client(docker_client: Docker) -> Result<Self> {
         // 测试 Docker 连接
         docker_client.ping().await.context(
             "Failed to test Docker connection, please check socket path and permissions",

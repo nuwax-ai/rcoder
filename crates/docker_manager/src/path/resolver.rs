@@ -116,7 +116,7 @@ impl HostPathResolver {
     ///
     /// 映射结果要和其它 Docker 查询放在一起比对时用这个构造器：各自建连接的话，
     /// 配置了非默认 daemon 时两边观察的可能不是同一个。
-    pub async fn new_with_docker_client(docker_client: Docker) -> DockerResult<Self> {
+    pub(crate) async fn new_with_docker_client(docker_client: Docker) -> DockerResult<Self> {
         let inspector = ContainerSelfInspector::with_docker_client(docker_client)
             .await
             .map_err(|e| {
@@ -144,9 +144,9 @@ impl HostPathResolver {
 
     /// 用已知的挂载表构造解析器，不做容器自检
     ///
-    /// `mounts` 为 `(容器内路径, 宿主机路径)`，不能为空。供挂载表已知的调用方使用，
-    /// 也用于测试注入：在不便做容器自检的环境里验证依赖映射的逻辑。
-    pub fn from_mount_table(mounts: Vec<(PathBuf, PathBuf)>) -> DockerResult<Self> {
+    /// `mounts` 为 `(容器内路径, 宿主机路径)`，不能为空，按原样使用。只在本 crate 内使用；
+    /// 其它 crate 的测试注入走 `test-support` feature 下的专用入口。
+    pub(crate) fn from_mount_table(mounts: Vec<(PathBuf, PathBuf)>) -> DockerResult<Self> {
         if mounts.is_empty() {
             return Err(DockerError::ConfigurationError(
                 "No mount points detected, check if running inside container and ensure docker-compose.yml has volume mounts configured".to_string()
@@ -195,6 +195,15 @@ impl HostPathResolver {
             all_mounts,
             inspector: None,
         })
+    }
+
+    /// 仅供其它 crate 的测试使用：用已知的挂载表构造解析器，不做容器自检
+    ///
+    /// 需要启用 `test-support` feature，生产构建里不存在。用于在不便做容器自检的环境里
+    /// 验证依赖路径映射的逻辑；`mounts` 按原样使用，不做校验。
+    #[cfg(feature = "test-support")]
+    pub fn from_mount_table_for_tests(mounts: Vec<(PathBuf, PathBuf)>) -> DockerResult<Self> {
+        Self::from_mount_table(mounts)
     }
 
     /// 将容器内路径解析为宿主机路径

@@ -40,9 +40,10 @@ impl DockerRuntime {
 
     /// 用已知的挂载表构造，日志目录的路径映射不再做容器自检
     ///
-    /// 供挂载表已知的调用方使用，也用于测试注入：在不便做容器自检的环境里验证
-    /// 依赖路径映射的逻辑。
-    pub fn with_log_path_resolver(
+    /// 只供测试使用：本 crate 的测试，或其它 crate 经下面的专用入口。显式注入的挂载表
+    /// 优先于 deploy-host 形态。
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn with_log_path_resolver(
         inner: Arc<DockerManager>,
         log_path_resolver: crate::HostPathResolver,
     ) -> Self {
@@ -51,6 +52,18 @@ impl DockerRuntime {
             list_cache: Self::new_list_cache(),
             log_path_resolver: tokio::sync::OnceCell::from(log_path_resolver),
         }
+    }
+
+    /// 仅供其它 crate 的测试使用：显式注入日志目录的路径映射，不做容器自检
+    ///
+    /// 需要启用 `test-support` feature，生产构建里不存在。注入的挂载表优先于
+    /// deploy-host 形态，这样真实 Docker 见证在任意 feature 组合下都是确定的。
+    #[cfg(feature = "test-support")]
+    pub fn with_log_path_resolver_for_tests(
+        inner: Arc<DockerManager>,
+        log_path_resolver: crate::HostPathResolver,
+    ) -> Self {
+        Self::with_log_path_resolver(inner, log_path_resolver)
     }
 
     fn new_list_cache() -> Cache<(), (u64, Vec<RuntimeContainerInfo>)> {

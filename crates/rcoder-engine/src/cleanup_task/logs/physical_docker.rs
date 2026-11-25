@@ -123,7 +123,7 @@ impl Sandbox {
         .unwrap();
         let process = TempDir::new_in(&scratch).unwrap();
         let host = TempDir::new_in(&scratch).unwrap();
-        let resolver = docker_manager::HostPathResolver::from_mount_table(vec![(
+        let resolver = docker_manager::HostPathResolver::from_mount_table_for_tests(vec![(
             process.path().to_path_buf(),
             host.path().to_path_buf(),
         )])
@@ -135,7 +135,7 @@ impl Sandbox {
         );
         // 直接落成 trait object，和 `state.runtime()` 的形态一致。
         let runtime: Arc<dyn container_runtime_api::ContainerRuntime> = Arc::new(
-            docker_manager::runtime::DockerRuntime::with_log_path_resolver(
+            docker_manager::runtime::DockerRuntime::with_log_path_resolver_for_tests(
                 manager,
                 resolver.clone(),
             ),
