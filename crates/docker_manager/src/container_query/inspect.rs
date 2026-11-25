@@ -93,13 +93,12 @@ impl DockerManager {
         self.find_container_status(identifier, false).await
     }
 
-    /// Host paths currently claimed by some container as a bind mount source,
-    /// including containers that are stopped but not yet removed.
+    /// 当前被某个容器当作挂载源的宿主机路径，含已停止但尚未删除的容器。
     ///
-    /// One list call covers every container, so a periodic caller pays a single
-    /// request instead of one inspect per candidate. Paths are normalized the
-    /// same way the mount builder normalizes them, so callers can compare
-    /// against paths they built themselves.
+    /// 一次列表调用覆盖全部容器，周期调用方只需一次请求。路径按与挂载创建侧相同的
+    /// 方式归一化，调用方可以直接拿自己推导出的路径来比对。响应里任何让"挂载源是否
+    /// 完整"存疑的地方都报错，不会被当成"没有挂载"，见
+    /// [`crate::runtime::docker_runtime::log_dir_mounts::mount_sources`]。
     pub(crate) async fn mounted_host_paths(&self) -> DockerResult<HashSet<PathBuf>> {
         let options = Some(bollard::query_parameters::ListContainersOptions {
             all: true,
@@ -112,29 +111,7 @@ impl DockerManager {
             .map_err(|error| {
                 DockerError::ConnectionError(format!("List container mounts: {error}"))
             })?;
-
-        let mut sources = HashSet::new();
-        for container in containers {
-            for mount in container.mounts.unwrap_or_default() {
-                // bollard 把挂载类型建模成字符串（"bind" / "volume" / ...），
-                // 与容器创建侧的判断保持一致
-                if mount.typ.as_deref() != Some("bind") {
-                    continue;
-                }
-                let source = mount
-                    .source
-                    .as_deref()
-                    .map(std::path::Path::new)
-                    .filter(|path| path.is_absolute());
-                let source = source.ok_or_else(|| {
-                    DockerError::ConnectionError(
-                        "Docker bind mount is missing an absolute source path".to_owned(),
-                    )
-                })?;
-                sources.insert(crate::normalize_path(source));
-            }
-        }
-        Ok(sources)
+        crate::runtime::docker_runtime::log_dir_mounts::mount_sources(&containers)
     }
 
     async fn find_container_status(

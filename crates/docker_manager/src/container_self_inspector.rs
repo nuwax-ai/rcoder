@@ -47,6 +47,14 @@ impl ContainerSelfInspector {
             Docker::connect_with_socket(docker_socket_path, 120, API_DEFAULT_VERSION)
                 .context("Failed to connect to Docker socket")?;
 
+        Self::with_docker_client(docker_client).await
+    }
+
+    /// 用调用方已有的 Docker 客户端构造自检器
+    ///
+    /// 自检出的挂载表要和其它 Docker 查询放在一起比对时用这个构造器：各自建连接的话，
+    /// 配置了非默认 daemon 时"自己"和被查询的容器可能不在同一个 daemon 上。
+    pub async fn with_docker_client(docker_client: Docker) -> Result<Self> {
         // 测试 Docker 连接
         docker_client.ping().await.context(
             "Failed to test Docker connection, please check socket path and permissions",
@@ -158,13 +166,9 @@ impl ContainerSelfInspector {
     async fn get_current_container_id() -> Result<String> {
         debug!("starting get containerID");
 
-        let cgroup_content = match fs::read_to_string("/proc/self/cgroup").await {
-            Ok(content) => content,
-            Err(error) => {
-                debug!(%error, "Cannot read process cgroup, trying container hostname");
-                String::new()
-            }
-        };
+        let cgroup_content = fs::read_to_string("/proc/self/cgroup")
+            .await
+            .with_context(|| "Failed to read /proc/self/cgroup file")?;
 
         debug!("cgroup file: {}", cgroup_content);
 
@@ -234,8 +238,7 @@ impl ContainerSelfInspector {
         // 方法3：尝试读取主机名（某些环境容器ID会作为主机名）
         if let Ok(hostname) = std::env::var("HOSTNAME") {
             debug!("check HOSTNAME: {}", hostname);
-            if matches!(hostname.len(), 12 | 64) && hostname.chars().all(|c| c.is_ascii_hexdigit())
-            {
+            if hostname.len() == 12 && hostname.chars().all(|c| c.is_ascii_hexdigit()) {
                 // 可能是短格式的容器ID（前12位）
                 info!(" HOSTNAME get containerID: {}", hostname);
                 return Ok(hostname);

@@ -308,9 +308,12 @@ impl AgentContainerRuntime for Runtime {
     async fn mounted_log_directories(
         &self,
         _candidates: &[std::path::PathBuf],
-    ) -> ContainerRuntimeResult<std::collections::HashSet<std::path::PathBuf>> {
-        // 与生产契约一致：直接回答挂载清单，不读任何缓存
-        Ok(self.mounted_paths.lock().unwrap().clone())
+    ) -> ContainerRuntimeResult<container_runtime_api::LogDirectoryMounts> {
+        // 与生产契约一致：直接回答挂载判定，不读任何缓存
+        Ok(container_runtime_api::LogDirectoryMounts {
+            mounted: self.mounted_paths.lock().unwrap().clone(),
+            unconfirmed: Vec::new(),
+        })
     }
     async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {
         panic!("cleanup must not delete unrelated resources")

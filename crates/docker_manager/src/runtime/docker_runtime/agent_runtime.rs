@@ -928,7 +928,7 @@ impl AgentContainerRuntime for DockerRuntime {
         }))
     }
 
-    /// 一次列表调用拿到全部容器的 bind 挂载源，因此周期调用方只需一次请求。
+    /// 一次列表调用拿到全部容器的挂载源，因此周期调用方只需一次请求。
     /// 改名后的容器依然持有原挂载，按名字判断会把它误判成已消失。
     async fn mounted_host_paths(
         &self,
@@ -936,67 +936,15 @@ impl AgentContainerRuntime for DockerRuntime {
         self.inner
             .mounted_host_paths()
             .await
-            .map_err(|error| match error {
-                crate::DockerError::Timeout(message) => ContainerRuntimeError::Timeout(message),
-                other => ContainerRuntimeError::DockerError(format!(
-                    "List container mount sources: {other}"
-                )),
-            })
+            .map_err(log_dir_mounts::list_error)
     }
 
     async fn mounted_log_directories(
         &self,
         candidates: &[std::path::PathBuf],
-    ) -> ContainerRuntimeResult<std::collections::HashSet<std::path::PathBuf>> {
-        let resolver = if shared_types::is_deploy_host() {
-            None
-        } else {
-            let timeout = Duration::from_secs(self.inner.config.api_timeout_quick_seconds);
-            let resolver = self
-                .log_path_resolver
-                .get_or_try_init(crate::HostPathResolver::new);
-            Some(
-                tokio::time::timeout(timeout, resolver)
-                    .await
-                    .map_err(|_| {
-                        ContainerRuntimeError::Timeout(
-                            "Resolve log directory mounts timed out".into(),
-                        )
-                    })?
-                    .map_err(|error| {
-                        ContainerRuntimeError::DockerError(format!(
-                            "Resolve log directory mounts: {error}"
-                        ))
-                    })?,
-            )
-        };
-        let mut protected = std::collections::HashSet::new();
-        for source in self.mounted_host_paths().await? {
-            protected.extend(source.ancestors().map(std::path::Path::to_path_buf));
-        }
-        let mut mounted = std::collections::HashSet::new();
-        for candidate in candidates {
-            let local_path = tokio::fs::canonicalize(candidate).await.map_err(|error| {
-                ContainerRuntimeError::DockerError(format!(
-                    "Resolve local log directory '{}': {error}",
-                    candidate.display()
-                ))
-            })?;
-            let backing_path = match &resolver {
-                Some(resolver) => resolver
-                    .resolve_to_host_path(&local_path)
-                    .map_err(|error| {
-                        ContainerRuntimeError::DockerError(format!(
-                            "Resolve log directory mount: {error}"
-                        ))
-                    })?,
-                None => local_path,
-            };
-            if protected.contains(&crate::normalize_path(&backing_path)) {
-                mounted.insert(candidate.clone());
-            }
-        }
-        Ok(mounted)
+    ) -> ContainerRuntimeResult<container_runtime_api::LogDirectoryMounts> {
+        log_dir_mounts::mounted_log_directories(&self.inner, &self.log_path_resolver, candidates)
+            .await
     }
 
     /// Docker 基础诊断：find_container → docker inspect → 读 State(OOMKilled/exit_code/running)。

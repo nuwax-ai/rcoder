@@ -3,6 +3,7 @@
 //! 从 rcoder/utils/host_path_resolver.rs 迁移
 
 use crate::{ContainerSelfInspector, DockerError, DockerResult};
+use bollard::Docker;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -100,22 +101,52 @@ impl HostPathResolver {
             })
             .unwrap_or_else(|| "/var/run/docker.sock".to_owned());
 
-        let inspector = Arc::new(
-            ContainerSelfInspector::new(&socket_path)
-                .await
-                .map_err(|e| {
-                    DockerError::ConfigurationError(format!(
-                        "failed to create container self-inspector: {}",
-                        e
-                    ))
-                })?,
-        );
+        let inspector = ContainerSelfInspector::new(&socket_path)
+            .await
+            .map_err(|e| {
+                DockerError::ConfigurationError(format!(
+                    "failed to create container self-inspector: {}",
+                    e
+                ))
+            })?;
+        Self::with_inspector(Arc::new(inspector)).await
+    }
 
-        // 获取所有挂载点信息
+    /// 用已有的 Docker 客户端检测本容器的挂载表
+    ///
+    /// 映射结果要和其它 Docker 查询放在一起比对时用这个构造器：各自建连接的话，
+    /// 配置了非默认 daemon 时两边观察的可能不是同一个。
+    pub async fn new_with_docker_client(docker_client: Docker) -> DockerResult<Self> {
+        let inspector = ContainerSelfInspector::with_docker_client(docker_client)
+            .await
+            .map_err(|e| {
+                DockerError::ConfigurationError(format!(
+                    "failed to create container self-inspector: {}",
+                    e
+                ))
+            })?;
+        Self::with_inspector(Arc::new(inspector)).await
+    }
+
+    async fn with_inspector(inspector: Arc<ContainerSelfInspector>) -> DockerResult<Self> {
         let mounts = inspector.get_all_mounts().await.map_err(|e| {
             DockerError::ConfigurationError(format!("failed to get mount points: {}", e))
         })?;
+        let mut resolver = Self::from_mount_table(
+            mounts
+                .iter()
+                .map(|(container, host)| (PathBuf::from(container), PathBuf::from(host)))
+                .collect(),
+        )?;
+        resolver.inspector = Some(inspector);
+        Ok(resolver)
+    }
 
+    /// 用已知的挂载表构造解析器，不做容器自检
+    ///
+    /// `mounts` 为 `(容器内路径, 宿主机路径)`，不能为空。供挂载表已知的调用方使用，
+    /// 也用于测试注入：在不便做容器自检的环境里验证依赖映射的逻辑。
+    pub fn from_mount_table(mounts: Vec<(PathBuf, PathBuf)>) -> DockerResult<Self> {
         if mounts.is_empty() {
             return Err(DockerError::ConfigurationError(
                 "No mount points detected, check if running inside container and ensure docker-compose.yml has volume mounts configured".to_string()
@@ -123,10 +154,7 @@ impl HostPathResolver {
         }
 
         // 🔍 缓存所有挂载点，按路径长度降序排列（最具体的路径优先匹配）
-        let mut all_mounts: Vec<(PathBuf, PathBuf)> = mounts
-            .iter()
-            .map(|(cp, hp)| (PathBuf::from(cp), PathBuf::from(hp)))
-            .collect();
+        let mut all_mounts = mounts;
         // 按容器路径长度降序排列，确保最具体的路径优先匹配
         all_mounts.sort_by_key(|m| std::cmp::Reverse(m.0.as_os_str().len()));
 
@@ -165,7 +193,7 @@ impl HostPathResolver {
             host_project_workspace: host_workspace,
             container_project_workspace: container_workspace,
             all_mounts,
-            inspector: Some(inspector),
+            inspector: None,
         })
     }
 
@@ -239,6 +267,23 @@ impl HostPathResolver {
                 .map(|(c, h)| format!("{} -> {}", c.display(), h.display()))
                 .collect::<Vec<_>>()
         )))
+    }
+
+    /// 把宿主机路径换算回容器内路径
+    ///
+    /// 取宿主机前缀最长的那条挂载；不在任何挂载之下时返回 `None`。只做词法前缀替换，
+    /// 与 [`Self::resolve_to_host_path`] 互为逆运算。
+    pub fn resolve_from_host_path(&self, host_path: &Path) -> Option<PathBuf> {
+        self.all_mounts
+            .iter()
+            .filter_map(|(container, host)| {
+                host_path
+                    .strip_prefix(host)
+                    .ok()
+                    .map(|rest| (host.as_os_str().len(), container.join(rest)))
+            })
+            .max_by_key(|(host_prefix_len, _)| *host_prefix_len)
+            .map(|(_, container_path)| container_path)
     }
 
     /// 获取宿主机工作空间根目录

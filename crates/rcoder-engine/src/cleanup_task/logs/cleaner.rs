@@ -16,10 +16,14 @@
 //! 返回 404，但它的挂载还在——按名字判断会把运行中容器的日志目录删掉。挂载清单同时
 //! 覆盖已停止未删除的容器，所以"停了但还没回收"的容器同样受保护。
 //!
-//! # 拿不到清单时
+//! # 保留、顺延与告警
 //!
-//! 清单获取失败（Docker/K8s 无应答等）时，本轮**不删除任何目录**，只告警。
-//! 没有任何路径会把"查不到"当成"没有挂载"。
+//! - **保留并告警**才需要人看：整份清单拿不到；某个候选无法确认物理身份；删除失败。
+//!   没有任何路径会把"查不到"当成"没有挂载"。
+//! - **顺延**不是故障，下一轮继续：取锁时正好有挂载准备在进行；或者本轮删除目录的
+//!   时间预算用完。两者分别计数，不告警。
+//!
+//! 单个候选判不出来只影响它自己：其余能判定的目录照常回收。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,6 +36,13 @@ use super::owner::MountedPathsProbe;
 /// 一天的秒数：保留天数换算秒数的乘数
 const SECS_PER_DAY: u64 = 24 * 60 * 60;
 
+/// 一轮里删除目录的时间预算：到期后不再开始删除新的目录，余下的留到下一轮。
+///
+/// 删除期间一直占着挂载围栏的写锁，agent 容器创建和 builder 恢复都在锁外等。没有预算
+/// 的话，积压的过期目录越多，锁被占得越久。预算只决定"要不要开始下一次删除"，不会
+/// 中途放弃进行中的删除——放弃之后底层可能还在删，锁却已经放开了。
+const DIR_RECLAIM_BUDGET: Duration = Duration::from_secs(2);
+
 /// 日志清理器
 pub struct LogCleaner {
     /// 日志目录路径
@@ -40,6 +51,8 @@ pub struct LogCleaner {
     retention_duration: Duration,
     /// 当前被容器挂载的宿主机路径清单
     mounted_paths: Arc<dyn MountedPathsProbe>,
+    /// 一轮里删除目录的时间预算，见 [`DIR_RECLAIM_BUDGET`]
+    reclaim_budget: Duration,
 }
 
 impl LogCleaner {
@@ -58,7 +71,15 @@ impl LogCleaner {
             log_dir: log_dir.into(),
             retention_duration: Duration::from_secs(retention_days.saturating_mul(SECS_PER_DAY)),
             mounted_paths,
+            reclaim_budget: DIR_RECLAIM_BUDGET,
         }
+    }
+
+    /// 把一轮的删除时间预算改成 `budget`。测试用：零预算可以确定性地验证"到期即顺延"
+    #[cfg(test)]
+    pub(super) fn with_reclaim_budget(mut self, budget: Duration) -> Self {
+        self.reclaim_budget = budget;
+        self
     }
 
     /// 执行一次日志清理
@@ -202,39 +223,66 @@ impl LogCleaner {
         if candidates.is_empty() {
             return;
         }
-        // 取清单到删除的这一段与挂载准备、builder 恢复互斥；对方进行中就整轮顺延
+        // 取清单到删除的这一段与挂载准备、builder 恢复互斥。对方正在进行属于正常现象：
+        // 本轮顺延，单独计数，不告警。
         let Some(_guard) = docker_manager::try_begin_log_mount_cleanup() else {
-            stats.dirs_skipped_unconfirmed += candidates.len() as u64;
+            stats.dirs_deferred_while_mounting += candidates.len() as u64;
             return;
         };
-        let mounted = match self
+        let mounts = match self
             .mounted_paths
             .mounted_log_directories(&candidates)
             .await
         {
-            Ok(inventory) => inventory,
+            Ok(mounts) => mounts,
             Err(error) => {
                 stats.dirs_skipped_unconfirmed += candidates.len() as u64;
-                warn!(%error, "[log_cleaner] Cannot confirm log directory mounts");
+                warn!(
+                    %error,
+                    "[log_cleaner] Cannot confirm log directory mounts, keeping every expired directory this cycle"
+                );
                 return;
             }
         };
 
+        let reclaim_started = std::time::Instant::now();
         for path in candidates {
-            if mounted.contains(&path) {
+            if mounts.mounted.contains(&path) {
                 stats.dirs_skipped_in_use += 1;
                 continue;
             }
-            let still_expired = fs::symlink_metadata(&path).await.is_ok_and(|metadata| {
-                metadata.is_dir()
-                    && metadata
-                        .modified()
-                        .ok()
-                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                        .is_some_and(|modified| modified.as_secs() < cutoff)
-            });
+            if let Some(reason) = mounts.unconfirmed_reason(&path) {
+                stats.dirs_skipped_unconfirmed += 1;
+                warn!(
+                    candidate = %path.display(),
+                    %reason,
+                    "[log_cleaner] Cannot confirm whether an expired log directory is still mounted, keeping it"
+                );
+                continue;
+            }
+            if reclaim_started.elapsed() >= self.reclaim_budget {
+                stats.dirs_deferred_by_budget += 1;
+                continue;
+            }
+            let still_expired = match fs::symlink_metadata(&path).await {
+                Ok(metadata) => metadata.is_dir() && is_older_than(&metadata, cutoff),
+                // 列目录之后目录已经消失：没有东西可删，也不是故障
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    debug!(?path, "[log_cleaner] Expired directory is already gone");
+                    continue;
+                }
+                Err(error) => {
+                    stats.dirs_skipped_unconfirmed += 1;
+                    warn!(?path, %error, "[log_cleaner] Cannot re-check an expired directory, keeping it");
+                    continue;
+                }
+            };
             if !still_expired {
                 stats.dirs_skipped_unconfirmed += 1;
+                warn!(
+                    ?path,
+                    "[log_cleaner] Expired directory changed since the scan, keeping it"
+                );
                 continue;
             }
             match fs::remove_dir_all(&path).await {
@@ -261,6 +309,15 @@ impl LogCleaner {
     }
 }
 
+/// 修改时间是否早于 `cutoff`（Unix 秒）；取不到修改时间视为未过期
+fn is_older_than(metadata: &std::fs::Metadata, cutoff: u64) -> bool {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .is_some_and(|modified| modified.as_secs() < cutoff)
+}
+
 /// 日志清理统计
 #[derive(Debug, Clone, Default)]
 pub struct LogCleanupStats {
@@ -270,8 +327,12 @@ pub struct LogCleanupStats {
     pub dirs_deleted: u64,
     /// 已过期但仍被容器挂载、因此保留的目录数量（正常现象，不是错误）
     pub dirs_skipped_in_use: u64,
-    /// 已过期但因拿不到挂载清单而保留的目录数量（需要关注）
+    /// 已过期但无法确认是否仍被挂载、因此保留的目录数量（需要关注）
     pub dirs_skipped_unconfirmed: u64,
+    /// 因挂载准备正在进行而顺延到下一轮的目录数量（正常现象）
+    pub dirs_deferred_while_mounting: u64,
+    /// 因本轮删除时间预算用完而顺延到下一轮的目录数量（正常现象）
+    pub dirs_deferred_by_budget: u64,
     /// 释放的字节数
     pub bytes_freed: u64,
     /// 删除失败的文件/目录数量
@@ -303,8 +364,20 @@ impl LogCleanupStats {
             }
             if self.dirs_skipped_unconfirmed > 0 {
                 parts.push(format!(
-                    "kept: {} dirs without a mount inventory",
+                    "kept: {} dirs without a confirmed mount status",
                     self.dirs_skipped_unconfirmed
+                ));
+            }
+            if self.dirs_deferred_while_mounting > 0 {
+                parts.push(format!(
+                    "deferred: {} dirs (mount preparation in progress)",
+                    self.dirs_deferred_while_mounting
+                ));
+            }
+            if self.dirs_deferred_by_budget > 0 {
+                parts.push(format!(
+                    "deferred: {} dirs (deletion budget spent)",
+                    self.dirs_deferred_by_budget
                 ));
             }
             if self.failed_deletions > 0 {
@@ -314,12 +387,14 @@ impl LogCleanupStats {
         }
     }
 
-    /// 本轮既没有删除任何东西，也没有需要报告的保留项
+    /// 本轮既没有删除任何东西，也没有需要报告的保留或顺延项
     fn is_empty(&self) -> bool {
         self.files_deleted == 0
             && self.dirs_deleted == 0
             && self.dirs_skipped_in_use == 0
             && self.dirs_skipped_unconfirmed == 0
+            && self.dirs_deferred_while_mounting == 0
+            && self.dirs_deferred_by_budget == 0
             && self.failed_deletions == 0
     }
 }

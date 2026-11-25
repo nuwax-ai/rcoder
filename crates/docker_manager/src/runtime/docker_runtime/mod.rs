@@ -33,12 +33,31 @@ impl DockerRuntime {
     pub fn new(inner: Arc<DockerManager>) -> Self {
         Self {
             inner,
-            list_cache: Cache::builder()
-                .max_capacity(1)
-                .time_to_live(Duration::from_secs(15))
-                .build(),
+            list_cache: Self::new_list_cache(),
             log_path_resolver: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// 用已知的挂载表构造，日志目录的路径映射不再做容器自检
+    ///
+    /// 供挂载表已知的调用方使用，也用于测试注入：在不便做容器自检的环境里验证
+    /// 依赖路径映射的逻辑。
+    pub fn with_log_path_resolver(
+        inner: Arc<DockerManager>,
+        log_path_resolver: crate::HostPathResolver,
+    ) -> Self {
+        Self {
+            inner,
+            list_cache: Self::new_list_cache(),
+            log_path_resolver: tokio::sync::OnceCell::from(log_path_resolver),
+        }
+    }
+
+    fn new_list_cache() -> Cache<(), (u64, Vec<RuntimeContainerInfo>)> {
+        Cache::builder()
+            .max_capacity(1)
+            .time_to_live(Duration::from_secs(15))
+            .build()
     }
 }
 
@@ -204,6 +223,7 @@ pub(super) fn extract_container_ports(
 
 mod agent_runtime;
 mod container_query;
+pub(crate) mod log_dir_mounts;
 mod partial_creation;
 mod pod_overview;
 #[cfg(test)]

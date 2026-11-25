@@ -96,8 +96,9 @@ impl AgentCleaner {
         // 1. 清理过期日志文件
         match self.log_cleaner.cleanup_once().await {
             Ok(log_stats) => {
-                // 查询失败或删除失败说明环境有问题，必须告警；
-                // "仍被挂载所以保留"只是长期运行容器的常态，记 debug 即可。
+                // 无法确认或删除失败说明环境有问题，必须告警；
+                // "仍被挂载所以保留"是长期运行容器的常态，"顺延"是挂载准备正在进行或
+                // 本轮删除预算用完，都会在下一轮继续——这两类只记 debug。
                 if log_stats.dirs_skipped_unconfirmed > 0 || log_stats.failed_deletions > 0 {
                     warn!(
                         "[cleaner] Log cleanup needs attention: {}",
@@ -105,7 +106,7 @@ impl AgentCleaner {
                     );
                 } else if log_stats.files_deleted > 0 || log_stats.dirs_deleted > 0 {
                     info!("[cleaner] Cleanup completed: {}", log_stats.summary());
-                } else if log_stats.dirs_skipped_in_use > 0 {
+                } else {
                     debug!("[cleaner] Log cleanup: {}", log_stats.summary());
                 }
             }

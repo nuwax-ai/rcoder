@@ -1,6 +1,7 @@
-//! 日志清理器的单元测试：用临时目录和假的挂载清单，不依赖 Docker / K8s。
+//! 日志清理器的单元测试：用临时目录和假的挂载判定，不依赖 Docker / K8s。
 
 use async_trait::async_trait;
+use container_runtime_api::LogDirectoryMounts;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,11 +13,15 @@ use tokio::fs;
 use super::cleaner::{LogCleaner, LogCleanupStats};
 use super::owner::MountedPathsProbe;
 
-/// 假的挂载清单：`mounted` 里的路径回答"还被容器挂着"，`failing` 为 true 时回答
-/// "无法确认"，其余路径回答"没有容器挂"。同时记录被询问的次数。
+/// 假的挂载判定：`mounted` 里的路径回答"仍被容器挂着"，`unconfirmed` 里的回答"无法确认"，
+/// 其余路径回答"没有容器挂"；`failing` 为 true 时整份清单拿不到。同时记录被询问的次数。
 struct FakeInventory {
     /// 被认为"仍被挂载"的宿主机路径；测试中途可以改动，用来模拟容器被回收
     mounted: Mutex<HashSet<PathBuf>>,
+    /// 被判为"无法确认"的路径
+    unconfirmed: Mutex<Vec<PathBuf>>,
+    /// 被询问时顺手删掉的目录，用来模拟"列目录之后、删除之前目录消失"
+    vanish_on_probe: Mutex<Vec<PathBuf>>,
     failing: Mutex<bool>,
     calls: AtomicUsize,
 }
@@ -25,6 +30,8 @@ impl FakeInventory {
     fn new(mounted: &[&str]) -> Arc<Self> {
         Arc::new(Self {
             mounted: Mutex::new(mounted.iter().map(PathBuf::from).collect()),
+            unconfirmed: Mutex::new(Vec::new()),
+            vanish_on_probe: Mutex::new(Vec::new()),
             failing: Mutex::new(false),
             calls: AtomicUsize::new(0),
         })
@@ -37,6 +44,17 @@ impl FakeInventory {
         } else {
             set.remove(PathBuf::from(path).as_path());
         }
+    }
+
+    fn set_unconfirmed(&self, path: &Path) {
+        self.unconfirmed.lock().unwrap().push(path.to_path_buf());
+    }
+
+    fn vanish_on_probe(&self, path: &Path) {
+        self.vanish_on_probe
+            .lock()
+            .unwrap()
+            .push(path.to_path_buf());
     }
 
     fn set_failing(&self, failing: bool) {
@@ -53,12 +71,25 @@ impl MountedPathsProbe for FakeInventory {
     async fn mounted_log_directories(
         &self,
         _candidates: &[PathBuf],
-    ) -> Result<HashSet<PathBuf>, String> {
+    ) -> Result<LogDirectoryMounts, String> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if *self.failing.lock().unwrap() {
             return Err("docker unreachable".to_string());
         }
-        Ok(self.mounted.lock().unwrap().clone())
+        for path in self.vanish_on_probe.lock().unwrap().drain(..) {
+            std::fs::remove_dir_all(path).expect("remove the vanished directory");
+        }
+        Ok(LogDirectoryMounts {
+            mounted: self.mounted.lock().unwrap().clone(),
+            unconfirmed: self
+                .unconfirmed
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .map(|path| (path, "fixture cannot confirm it".to_owned()))
+                .collect(),
+        })
     }
 }
 
@@ -76,35 +107,117 @@ fn cleaner(log_dir: &Path, inventory: Arc<FakeInventory>) -> LogCleaner {
     LogCleaner::new(log_dir.to_str().expect("utf-8 path"), 10, inventory)
 }
 
+/// 挂载准备正在进行时取不到锁：本轮顺延、不询问判定，也不算故障。
 #[tokio::test]
-async fn cleanup_defers_when_another_sweep_holds_the_mount_gate() {
+async fn cleanup_defers_while_mount_preparation_holds_the_gate() {
     let root = TempDir::new().unwrap();
     let expired = aged_dir(root.path(), "retired", 15);
     let inventory = FakeInventory::new(&[]);
     let cleaner = cleaner(root.path(), inventory.clone());
-    let guard = docker_manager::try_begin_log_mount_cleanup().unwrap();
+    let gate = docker_manager::try_begin_log_mount_cleanup().unwrap();
+
     let stats = cleaner.cleanup_once().await.unwrap();
+
     assert!(expired.is_dir());
-    assert_eq!(stats.dirs_skipped_unconfirmed, 1);
+    assert_eq!(stats.dirs_deferred_while_mounting, 1);
+    assert_eq!(
+        stats.dirs_skipped_unconfirmed, 0,
+        "waiting for a mount preparation is not a failure"
+    );
     assert_eq!(inventory.calls(), 0);
-    drop(guard);
+    drop(gate);
     assert_eq!(cleaner.cleanup_once().await.unwrap().dirs_deleted, 1);
 }
 
+/// 一轮里删除目录的时间有预算：到期后不再开始删除新的目录，余下的留到下一轮。
+#[tokio::test]
+async fn deletion_budget_defers_the_rest_until_the_next_cycle() {
+    let temp_dir = TempDir::new().unwrap();
+    let first = aged_dir(temp_dir.path(), "runner-a-20261029035324", 15);
+    let second = aged_dir(temp_dir.path(), "runner-b-20261029035324", 15);
+    let inventory = FakeInventory::new(&[]);
+
+    // 零预算：任何一次删除开始之前预算都已经用完
+    let exhausted = cleaner(temp_dir.path(), inventory.clone()).with_reclaim_budget(Duration::ZERO);
+    let stats = exhausted.cleanup_once().await.unwrap();
+
+    assert!(first.exists() && second.exists());
+    assert_eq!(stats.dirs_deleted, 0);
+    assert_eq!(stats.dirs_deferred_by_budget, 2);
+    assert_eq!(stats.dirs_deferred_while_mounting, 0);
+    assert_eq!(stats.dirs_skipped_unconfirmed, 0);
+    // 下一轮预算恢复，两个目录都被回收
+    assert_eq!(
+        cleaner(temp_dir.path(), inventory)
+            .cleanup_once()
+            .await
+            .unwrap()
+            .dirs_deleted,
+        2
+    );
+    assert!(!first.exists() && !second.exists());
+}
+
+/// 单个候选判不出来只保留它自己：其余能判定的目录照常回收。
+#[tokio::test]
+async fn an_unconfirmable_candidate_is_kept_without_stopping_the_others() {
+    let temp_dir = TempDir::new().unwrap();
+    let opaque = aged_dir(temp_dir.path(), "runner-opaque-20261029035324", 15);
+    let orphan = aged_dir(temp_dir.path(), "runner-gone-20261029035324", 15);
+    let inventory = FakeInventory::new(&[]);
+    inventory.set_unconfirmed(&opaque);
+
+    let stats = cleaner(temp_dir.path(), inventory)
+        .cleanup_once()
+        .await
+        .unwrap();
+
+    assert!(opaque.exists(), "an unconfirmable directory must be kept");
+    assert!(
+        !orphan.exists(),
+        "a decidable orphan must still be reclaimed"
+    );
+    assert_eq!(stats.dirs_deleted, 1);
+    assert_eq!(stats.dirs_skipped_unconfirmed, 1);
+}
+
+/// 列目录之后、删除之前目录已经消失：既不算删除成功，也不告警。
+#[tokio::test]
+async fn a_directory_that_vanishes_before_deletion_is_not_reported_as_a_failure() {
+    let temp_dir = TempDir::new().unwrap();
+    let vanished = aged_dir(temp_dir.path(), "runner-vanished-20261029035324", 15);
+    let inventory = FakeInventory::new(&[]);
+    inventory.vanish_on_probe(&vanished);
+
+    let stats = cleaner(temp_dir.path(), inventory)
+        .cleanup_once()
+        .await
+        .unwrap();
+
+    assert!(!vanished.exists());
+    assert_eq!(stats.dirs_deleted, 0);
+    assert_eq!(stats.dirs_skipped_unconfirmed, 0);
+    assert_eq!(stats.failed_deletions, 0);
+}
+
 #[test]
-fn stats_summary_reports_kept_and_failed_items() {
+fn stats_summary_reports_kept_deferred_and_failed_items() {
     let stats = LogCleanupStats {
         files_deleted: 2,
         bytes_freed: 3 * 1024 * 1024,
         dirs_skipped_in_use: 1,
         dirs_skipped_unconfirmed: 1,
+        dirs_deferred_while_mounting: 4,
+        dirs_deferred_by_budget: 5,
         failed_deletions: 1,
         ..LogCleanupStats::default()
     };
     assert_eq!(
         stats.summary(),
         "Deleted: 2 files, freed: 3.00 MB, kept: 1 dirs still mounted, \
-         kept: 1 dirs without a mount inventory, failed: 1"
+         kept: 1 dirs without a confirmed mount status, \
+         deferred: 4 dirs (mount preparation in progress), \
+         deferred: 5 dirs (deletion budget spent), failed: 1"
     );
     assert_eq!(LogCleanupStats::default().summary(), "No expired logs");
 }

@@ -3,7 +3,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shared_types::ServiceType;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 use utoipa::ToSchema;
@@ -28,6 +29,34 @@ pub enum AppOperationLeaseObservation {
     /// settled, and never authorizes drain or takeover by itself.
     AbsentOriginalIdentity,
     Unconfirmed,
+}
+
+/// Per-candidate outcome of one mount lookup for log directories.
+///
+/// A candidate that appears in neither field is confirmed to be mounted by no
+/// container. A failure that concerns one candidate is reported in
+/// `unconfirmed` and leaves the other candidates decidable; an `Err` from
+/// [`crate::AgentContainerRuntime::mounted_log_directories`] is reserved for
+/// failures that invalidate the whole inventory.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LogDirectoryMounts {
+    /// Candidates that some container still mounts.
+    pub mounted: HashSet<PathBuf>,
+    /// Candidates whose physical identity could not be confirmed, each with
+    /// the reason. Callers must keep them: none of them may be treated as
+    /// unmounted.
+    pub unconfirmed: Vec<(PathBuf, String)>,
+}
+
+impl LogDirectoryMounts {
+    /// The recorded reason when `candidate` is unconfirmed.
+    #[must_use]
+    pub fn unconfirmed_reason(&self, candidate: &Path) -> Option<&str> {
+        self.unconfirmed
+            .iter()
+            .find(|(path, _)| path == candidate)
+            .map(|(_, reason)| reason.as_str())
+    }
 }
 
 /// Pre-fence physical exclusion for an early compute coordinator. This is not

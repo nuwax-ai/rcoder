@@ -1,10 +1,14 @@
 //! 真实 Docker 见证：真实的 `DockerRuntime` 加真实的 `LogCleaner`，不使用替身。
 //!
-//! 显式开启才运行。需要一个本地的 Alpine 镜像 ID，不拉取镜像；只移除本次运行创建的
-//! 见证容器（按容器 ID，不带 `--volumes`）。
+//! 显式开启才运行。需要三个环境变量：
 //!
-//! 覆盖四种真实形态，其中"改名后仍保留"是审查意见 P1-1 的回归：按容器名已经查不到它，
-//! 但挂载还在，目录必须活。
+//! - `RCODER_LOG_CLEANER_DOCKER_IMAGE`：本地 Alpine 镜像 ID。不拉取镜像。
+//! - `RCODER_LOG_CLEANER_TEST_ROOT`：Docker 能 bind 的可写目录（如 `/tmp`）。测试在里面建两个
+//!   目录，分别充当 RCoder 进程一侧与宿主机一侧的日志根，两边前缀不同，与 compose 一致。
+//! - `HOSTNAME`：任一连接了网络的真实容器的 ID。`DockerManager::new` 检测主网络时按它
+//!   inspect；日志路径的挂载表由测试显式注入，与它无关。
+//!
+//! 只移除本次运行创建的见证容器（按容器 ID，不带 `--volumes`）。
 
 use super::cleaner::LogCleaner;
 use super::owner::RuntimeMountedPaths;
@@ -15,12 +19,26 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 const OWNER_LABEL: &str = "rcoder.validation.log-cleaner";
-
 fn docker(args: &[&str]) -> Output {
     Command::new("docker")
         .args(args)
         .output()
         .expect("run the docker CLI")
+}
+
+fn image() -> String {
+    let image =
+        std::env::var("RCODER_LOG_CLEANER_DOCKER_IMAGE").expect("explicit local fixture image");
+    assert!(
+        image.starts_with("sha256:") && image.len() == 71,
+        "use an exact existing local image ID"
+    );
+    image
+}
+
+/// 与生产布局一致的目录名：`<容器名>-<时间戳>`
+fn dir_name(prefix: &str, owner: &str) -> String {
+    format!("rcoder-log-cleaner-{prefix}-{owner}-20261029035324")
 }
 
 /// 本次运行创建的见证容器；离开作用域时移除
@@ -30,7 +48,7 @@ struct Witness {
 
 impl Drop for Witness {
     fn drop(&mut self) {
-        drop(docker(&["rm", "--force", &self.id]));
+        let _removed = docker(&["rm", "--force", &self.id]);
     }
 }
 
@@ -80,46 +98,82 @@ fn run_witness(image: &str, owner: &str, name: &str, host_dir: &Path) -> Witness
     witness
 }
 
-#[tokio::test]
-#[ignore = "requires Docker and RCODER_LOG_CLEANER_DOCKER_IMAGE set to a local Alpine image ID; never pulls images"]
-async fn physical_docker_keeps_every_mounted_dir_and_reclaims_the_rest() {
-    let image =
-        std::env::var("RCODER_LOG_CLEANER_DOCKER_IMAGE").expect("explicit local fixture image");
-    assert!(
-        image.starts_with("sha256:") && image.len() == 71,
-        "use an exact existing local image ID"
-    );
-    let owner = uuid::Uuid::new_v4().simple().to_string();
+/// 一次见证的脚手架。进程侧根 `process` 经注入的挂载表映射到宿主机侧根 `host`：生产里
+/// 前者是 rcoder 容器内的路径，后者是 Docker daemon 看到的路径。
+struct Sandbox {
+    _process: TempDir,
+    _host: TempDir,
+    process: PathBuf,
+    host: PathBuf,
+    resolver: docker_manager::HostPathResolver,
+    runtime: Arc<dyn container_runtime_api::ContainerRuntime>,
+}
 
-    // HOSTNAME names a witness that maps the test process's local root to a
-    // Docker host root. The two path prefixes may differ, as in Compose.
-    let root = std::env::var_os("RCODER_LOG_CLEANER_TEST_ROOT").expect("test mount root");
-    let log_root = TempDir::new_in(std::fs::canonicalize(root).unwrap()).unwrap();
-    let resolver = docker_manager::HostPathResolver::new().await.unwrap();
-    let host_root = resolver.resolve_to_host_path(log_root.path()).unwrap();
-    std::fs::create_dir_all(&host_root).unwrap();
+impl Sandbox {
+    async fn new() -> Self {
+        let scratch = std::fs::canonicalize(
+            std::env::var_os("RCODER_LOG_CLEANER_TEST_ROOT")
+                .expect("a scratch root that Docker can bind"),
+        )
+        .unwrap();
+        let process = TempDir::new_in(&scratch).unwrap();
+        let host = TempDir::new_in(&scratch).unwrap();
+        let resolver = docker_manager::HostPathResolver::from_mount_table(vec![(
+            process.path().to_path_buf(),
+            host.path().to_path_buf(),
+        )])
+        .unwrap();
+        let manager = Arc::new(
+            docker_manager::DockerManager::new(docker_manager::DockerManagerConfig::default())
+                .await
+                .expect("connect to the local Docker daemon"),
+        );
+        // 直接落成 trait object，和 `state.runtime()` 的形态一致。
+        let runtime: Arc<dyn container_runtime_api::ContainerRuntime> = Arc::new(
+            docker_manager::runtime::DockerRuntime::with_log_path_resolver(
+                manager,
+                resolver.clone(),
+            ),
+        );
+        Self {
+            process: process.path().to_path_buf(),
+            host: host.path().to_path_buf(),
+            _process: process,
+            _host: host,
+            resolver,
+            runtime,
+        }
+    }
+
+    /// `local`（进程侧）对应的宿主机侧路径，父目录在宿主机侧建好
+    fn host_path(&self, local: &Path) -> PathBuf {
+        let path = self.resolver.resolve_to_host_path(local).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn cleaner(&self, log_dir: &Path) -> LogCleaner {
+        LogCleaner::new(
+            log_dir.to_str().unwrap(),
+            10,
+            Arc::new(RuntimeMountedPaths::new(Arc::clone(&self.runtime))),
+        )
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Docker, RCODER_LOG_CLEANER_DOCKER_IMAGE (a local Alpine image ID; never pulls images), RCODER_LOG_CLEANER_TEST_ROOT and HOSTNAME; see the module docs"]
+async fn physical_docker_keeps_every_mounted_dir_and_reclaims_the_rest() {
+    let image = image();
+    let owner = uuid::Uuid::new_v4().simple().to_string();
+    let sandbox = Sandbox::new().await;
+
     // 四个目录按修改时间都已过期；区别只在于当前有没有容器挂着
-    let mounted_running = aged_dir(
-        log_root.path(),
-        &format!("rcoder-log-cleaner-running-{owner}-20261029035324"),
-        15,
-    );
-    let mounted_stopped = aged_dir(
-        log_root.path(),
-        &format!("rcoder-log-cleaner-stopped-{owner}-20261029035324"),
-        15,
-    );
+    let mounted_running = aged_dir(&sandbox.process, &dir_name("running", &owner), 15);
+    let mounted_stopped = aged_dir(&sandbox.process, &dir_name("stopped", &owner), 15);
     // 目录名用的是容器创建时的名字；容器随后被改名，这个名字已经查不到任何容器
-    let mounted_renamed = aged_dir(
-        log_root.path(),
-        &format!("rcoder-log-cleaner-renamed-{owner}-20261029035324"),
-        15,
-    );
-    let unmounted = aged_dir(
-        log_root.path(),
-        &format!("rcoder-log-cleaner-gone-{owner}-20261029035324"),
-        15,
-    );
+    let mounted_renamed = aged_dir(&sandbox.process, &dir_name("renamed", &owner), 15);
+    let unmounted = aged_dir(&sandbox.process, &dir_name("gone", &owner), 15);
 
     let child = mounted_running.join("nested");
     std::fs::create_dir(&child).unwrap();
@@ -130,14 +184,9 @@ async fn physical_docker_keeps_every_mounted_dir_and_reclaims_the_rest() {
             .set_modified(std::time::SystemTime::now() - Duration::from_secs(15 * 86400)),
     )
     .unwrap();
-    let host_source = |local: &Path| {
-        let path = resolver.resolve_to_host_path(local).unwrap();
-        std::fs::create_dir_all(&path).unwrap();
-        path
-    };
-    let host_running = host_source(&child);
-    let host_stopped = host_source(&mounted_stopped);
-    let host_renamed = host_source(&mounted_renamed);
+    let host_running = sandbox.host_path(&child);
+    let host_stopped = sandbox.host_path(&mounted_stopped);
+    let host_renamed = sandbox.host_path(&mounted_renamed);
     let running = run_witness(
         &image,
         &owner,
@@ -174,18 +223,12 @@ async fn physical_docker_keeps_every_mounted_dir_and_reclaims_the_rest() {
         "precondition: the original name must no longer resolve"
     );
 
-    // 与生产相同的构造方式：真实 DockerManager → 真实 DockerRuntime
-    let manager = Arc::new(
-        docker_manager::DockerManager::new(docker_manager::DockerManagerConfig::default())
-            .await
-            .expect("connect to the local Docker daemon"),
-    );
-    // 直接落成 trait object，和 `state.runtime()` 的形态一致。
-    let runtime: Arc<dyn container_runtime_api::ContainerRuntime> =
-        Arc::new(docker_manager::runtime::DockerRuntime::new(manager));
-
     // 运行时自检：清单里必须包含三个被挂载的目录，且不包含没挂的那个
-    let inventory = runtime.mounted_host_paths().await.expect("inventory");
+    let inventory = sandbox
+        .runtime
+        .mounted_host_paths()
+        .await
+        .expect("inventory");
     for mounted in [&host_running, &host_stopped, &host_renamed] {
         assert!(
             inventory.contains(mounted),
@@ -194,16 +237,11 @@ async fn physical_docker_keeps_every_mounted_dir_and_reclaims_the_rest() {
         );
     }
     assert!(
-        !inventory.contains(&resolver.resolve_to_host_path(&unmounted).unwrap()),
+        !inventory.contains(&sandbox.host_path(&unmounted)),
         "inventory must not include the unmounted path"
     );
 
-    let cleaner = LogCleaner::new(
-        log_root.path().to_str().unwrap(),
-        10,
-        Arc::new(RuntimeMountedPaths::new(Arc::clone(&runtime))),
-    );
-
+    let cleaner = sandbox.cleaner(&sandbox.process);
     let stats = cleaner.cleanup_once().await.unwrap();
 
     assert!(
@@ -231,7 +269,11 @@ async fn physical_docker_keeps_every_mounted_dir_and_reclaims_the_rest() {
     drop(renamed);
     drop(stopped);
     drop(running);
-    let inventory = runtime.mounted_host_paths().await.expect("inventory");
+    let inventory = sandbox
+        .runtime
+        .mounted_host_paths()
+        .await
+        .expect("inventory");
     assert!(
         !inventory.contains(&host_renamed),
         "precondition: mount must be gone after the container is removed"
@@ -241,4 +283,84 @@ async fn physical_docker_keeps_every_mounted_dir_and_reclaims_the_rest() {
     assert!(!mounted_stopped.exists());
     assert!(!mounted_renamed.exists());
     assert_eq!(second.dirs_deleted, 3);
+}
+
+/// 回归（Codex 第三轮 P1）：日志根本身是一层符号链接。创建侧和 Docker 用的都是别名路径，
+/// 按解析了符号链接的物理路径去比，会把仍在挂载的目录判成未挂载而删掉。
+///
+/// 覆盖三种登记方式：容器经别名登记、容器经真实路径登记、没有容器挂。前两个必须保留，
+/// 第三个必须回收；容器移除后前两个也能回收。
+#[tokio::test]
+#[ignore = "requires Docker, RCODER_LOG_CLEANER_DOCKER_IMAGE (a local Alpine image ID; never pulls images), RCODER_LOG_CLEANER_TEST_ROOT and HOSTNAME; see the module docs"]
+async fn physical_docker_keeps_dirs_mounted_through_a_symlinked_log_root() {
+    let image = image();
+    let owner = uuid::Uuid::new_v4().simple().to_string();
+    let sandbox = Sandbox::new().await;
+
+    // 进程侧：`container-real` 是真目录，`container` 是指向它的相对符号链接。宿主机侧做成
+    // 同样的结构：Docker 解析宿主机上的符号链接后挂的是真目录，Source 报的却是别名。
+    for root in [&sandbox.process, &sandbox.host] {
+        std::fs::create_dir(root.join("container-real")).unwrap();
+        std::os::unix::fs::symlink("container-real", root.join("container")).unwrap();
+    }
+    let log_dir = sandbox.process.join("container");
+    let by_alias = aged_dir(&log_dir, &dir_name("alias", &owner), 15);
+    let by_real = aged_dir(&log_dir, &dir_name("real", &owner), 15);
+    let orphan = aged_dir(&log_dir, &dir_name("orphan", &owner), 15);
+    let host = &sandbox.host;
+    let alias_registered = host.join("container").join(by_alias.file_name().unwrap());
+    let real_registered = host
+        .join("container-real")
+        .join(by_real.file_name().unwrap());
+    // 两侧的目录树各自独立：宿主机一侧的目录要单独建出来，Docker 才有东西可挂
+    for mounted in [&alias_registered, &real_registered] {
+        std::fs::create_dir_all(mounted).unwrap();
+    }
+    let alias = run_witness(
+        &image,
+        &owner,
+        &format!("rcoder-log-cleaner-alias-{owner}"),
+        &alias_registered,
+    );
+    let real = run_witness(
+        &image,
+        &owner,
+        &format!("rcoder-log-cleaner-real-{owner}"),
+        &real_registered,
+    );
+    // 前置：Docker 报回的确实是登记时的路径，一个别名、一个真实路径
+    let inventory = sandbox
+        .runtime
+        .mounted_host_paths()
+        .await
+        .expect("inventory");
+    assert!(
+        inventory.contains(&alias_registered) && inventory.contains(&real_registered),
+        "Docker must report both registered paths as given: {inventory:?}"
+    );
+
+    let cleaner = sandbox.cleaner(&log_dir);
+    let stats = cleaner.cleanup_once().await.unwrap();
+
+    assert!(
+        by_alias.exists(),
+        "a directory mounted through the alias must be kept"
+    );
+    assert!(
+        by_real.exists(),
+        "a directory mounted through the real path must be kept"
+    );
+    assert!(
+        !orphan.exists(),
+        "an unmounted directory under the symlinked root must be reclaimed"
+    );
+    assert_eq!(stats.dirs_deleted, 1);
+    assert_eq!(stats.dirs_skipped_in_use, 2);
+    assert_eq!(stats.dirs_skipped_unconfirmed, 0);
+
+    drop(real);
+    drop(alias);
+    let second = cleaner.cleanup_once().await.unwrap();
+    assert!(!by_alias.exists() && !by_real.exists());
+    assert_eq!(second.dirs_deleted, 2);
 }

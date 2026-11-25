@@ -16,7 +16,8 @@ use super::container_params::ContainerCreateParams;
 use super::types::{
     AgentPodDiagnostic, AppEventInfo, ContainerLogEntry, ContainerRuntimeError,
     ContainerRuntimeResult, ContainerRuntimeStatus, ContainerSpecSnapshot, DeploymentStatus,
-    ExecResult, RemovedContainerInfo, ResourceUsage, RuntimeContainerInfo, StorageResizeOutcome,
+    ExecResult, LogDirectoryMounts, RemovedContainerInfo, ResourceUsage, RuntimeContainerInfo,
+    StorageResizeOutcome,
 };
 
 // mpsc 仍在 lib.rs re-export（`container_runtime_api::mpsc::Receiver` 被 docker_manager /
@@ -733,12 +734,19 @@ pub trait AgentContainerRuntime: Send + Sync {
         ))
     }
 
-    /// Return candidate directories whose backing host path contains a bind source.
-    /// Candidates are in the RCoder process's filesystem namespace.
+    /// Decide for every candidate log directory whether a container still
+    /// mounts it. Candidates are in the RCoder process's filesystem namespace.
+    ///
+    /// Each candidate ends up mounted, unconfirmed, or in neither set, which
+    /// means no container mounts it. A candidate that cannot be mapped or
+    /// resolved is reported unconfirmed on its own, so one bad directory never
+    /// stops the others from being reclaimed. Like the inventory above, the
+    /// default reports `Err`: an unsupported runtime must never be mistaken for
+    /// "nothing is mounted".
     async fn mounted_log_directories(
         &self,
         _candidates: &[std::path::PathBuf],
-    ) -> ContainerRuntimeResult<std::collections::HashSet<std::path::PathBuf>> {
+    ) -> ContainerRuntimeResult<LogDirectoryMounts> {
         Err(ContainerRuntimeError::ConfigurationError(
             "log directory mount inventory is not supported by this runtime".to_string(),
         ))
