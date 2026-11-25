@@ -601,11 +601,12 @@ async fn one_list_request_decides_every_candidate() {
             tree.path("alias/runner-a"),
         ])
     );
+    assert_eq!(mounts.unconfirmed.len(), 1, "{:?}", mounts.unconfirmed);
     assert!(
-        matches!(
-            mounts.unconfirmed.as_slice(),
-            [(path, reason)] if path == &outside && reason.contains("Map a log directory onto the host")
-        ),
+        mounts
+            .unconfirmed
+            .get(&outside)
+            .is_some_and(|reason| reason.contains("Map a log directory onto the host")),
         "{:?}",
         mounts.unconfirmed
     );

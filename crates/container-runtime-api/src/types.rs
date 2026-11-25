@@ -42,20 +42,17 @@ pub enum AppOperationLeaseObservation {
 pub struct LogDirectoryMounts {
     /// Candidates that some container still mounts.
     pub mounted: HashSet<PathBuf>,
-    /// Candidates whose physical identity could not be confirmed, each with
-    /// the reason. Callers must keep them: none of them may be treated as
+    /// Candidates whose mount status could not be confirmed, with the reason,
+    /// indexed by path. Callers must keep them: none of them may be treated as
     /// unmounted.
-    pub unconfirmed: Vec<(PathBuf, String)>,
+    pub unconfirmed: HashMap<PathBuf, String>,
 }
 
 impl LogDirectoryMounts {
     /// The recorded reason when `candidate` is unconfirmed.
     #[must_use]
     pub fn unconfirmed_reason(&self, candidate: &Path) -> Option<&str> {
-        self.unconfirmed
-            .iter()
-            .find(|(path, _)| path == candidate)
-            .map(|(_, reason)| reason.as_str())
+        self.unconfirmed.get(candidate).map(String::as_str)
     }
 }
 

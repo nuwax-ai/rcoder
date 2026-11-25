@@ -129,7 +129,8 @@ async fn cleanup_defers_while_mount_preparation_holds_the_gate() {
     assert_eq!(cleaner.cleanup_once().await.unwrap().dirs_deleted, 1);
 }
 
-/// 一轮里删除目录的时间有预算：到期后不再开始删除新的目录，余下的留到下一轮。
+/// 一轮里删除目录的时间有预算，从开始判定起计：到期后不再发起删除，余下的留到下一轮。
+/// 检查就在真正发起删除之前，复查目录所花的时间也算在预算里。
 #[tokio::test]
 async fn deletion_budget_defers_the_rest_until_the_next_cycle() {
     let temp_dir = TempDir::new().unwrap();
@@ -137,7 +138,7 @@ async fn deletion_budget_defers_the_rest_until_the_next_cycle() {
     let second = aged_dir(temp_dir.path(), "runner-b-20261029035324", 15);
     let inventory = FakeInventory::new(&[]);
 
-    // 零预算：任何一次删除开始之前预算都已经用完
+    // 零预算：任何一次删除发起之前预算都已经用完
     let exhausted = cleaner(temp_dir.path(), inventory.clone()).with_reclaim_budget(Duration::ZERO);
     let stats = exhausted.cleanup_once().await.unwrap();
 
@@ -156,6 +157,38 @@ async fn deletion_budget_defers_the_rest_until_the_next_cycle() {
         2
     );
     assert!(!first.exists() && !second.exists());
+}
+
+/// 每轮最多删除一批目录，余下的留到下一轮。时间预算管不住"每个都很快、合起来却很多"
+/// 的批次，持锁期间的工作量还得有数量上限。
+#[tokio::test]
+async fn each_cycle_reclaims_at_most_one_batch_of_directories() {
+    let temp_dir = TempDir::new().unwrap();
+    let dirs: Vec<PathBuf> = (0..3)
+        .map(|index| {
+            aged_dir(
+                temp_dir.path(),
+                &format!("runner-{index}-20261029035324"),
+                15,
+            )
+        })
+        .collect();
+    let inventory = FakeInventory::new(&[]);
+
+    let limited = cleaner(temp_dir.path(), inventory.clone()).with_reclaim_batch(2);
+    let stats = limited.cleanup_once().await.unwrap();
+
+    assert_eq!(stats.dirs_deleted, 2);
+    assert_eq!(stats.dirs_deferred_by_budget, 1, "the third must wait");
+    assert_eq!(dirs.iter().filter(|dir| dir.exists()).count(), 1);
+
+    // 下一轮接着删
+    let stats = cleaner(temp_dir.path(), inventory)
+        .cleanup_once()
+        .await
+        .unwrap();
+    assert_eq!(stats.dirs_deleted, 1);
+    assert!(dirs.iter().all(|dir| !dir.exists()));
 }
 
 /// 单个候选判不出来只保留它自己：其余能判定的目录照常回收。
@@ -217,7 +250,7 @@ fn stats_summary_reports_kept_deferred_and_failed_items() {
         "Deleted: 2 files, freed: 3.00 MB, kept: 1 dirs still mounted, \
          kept: 1 dirs without a confirmed mount status, \
          deferred: 4 dirs (mount preparation in progress), \
-         deferred: 5 dirs (deletion budget spent), failed: 1"
+         deferred: 5 dirs (reclaim budget spent), failed: 1"
     );
     assert_eq!(LogCleanupStats::default().summary(), "No expired logs");
 }

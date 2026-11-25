@@ -312,7 +312,7 @@ impl AgentContainerRuntime for Runtime {
         // 与生产契约一致：直接回答挂载判定，不读任何缓存
         Ok(container_runtime_api::LogDirectoryMounts {
             mounted: self.mounted_paths.lock().unwrap().clone(),
-            unconfirmed: Vec::new(),
+            unconfirmed: Default::default(),
         })
     }
     async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {

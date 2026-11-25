@@ -18,10 +18,10 @@
 //!
 //! # 保留、顺延与告警
 //!
-//! - **保留并告警**才需要人看：整份清单拿不到；某个候选无法确认物理身份；删除失败。
+//! - **保留并告警**才需要人看：整份清单拿不到；某个候选无法确认是否仍被挂载；删除失败。
 //!   没有任何路径会把"查不到"当成"没有挂载"。
 //! - **顺延**不是故障，下一轮继续：取锁时正好有挂载准备在进行；或者本轮删除目录的
-//!   时间预算用完。两者分别计数，不告警。
+//!   预算用完（时间或数量）。两者分别计数，不告警。
 //!
 //! 单个候选判不出来只影响它自己：其余能判定的目录照常回收。
 
@@ -36,12 +36,16 @@ use super::owner::MountedPathsProbe;
 /// 一天的秒数：保留天数换算秒数的乘数
 const SECS_PER_DAY: u64 = 24 * 60 * 60;
 
-/// 一轮里删除目录的时间预算：到期后不再开始删除新的目录，余下的留到下一轮。
+/// 一轮里删除目录的时间预算：从开始判定起计，到期后不再发起删除，余下的留到下一轮。
 ///
 /// 删除期间一直占着挂载围栏的写锁，agent 容器创建和 builder 恢复都在锁外等。没有预算
-/// 的话，积压的过期目录越多，锁被占得越久。预算只决定"要不要开始下一次删除"，不会
+/// 的话，积压的过期目录越多，锁被占得越久。预算只决定"要不要发起下一次删除"，不会
 /// 中途放弃进行中的删除——放弃之后底层可能还在删，锁却已经放开了。
 const DIR_RECLAIM_BUDGET: Duration = Duration::from_secs(2);
+
+/// 一轮里最多删除的目录数。时间预算管不住"每个都很快、合起来却很多"的批次，数量另设
+/// 上限，余下的留到下一轮。
+const DIR_RECLAIM_BATCH: usize = 64;
 
 /// 日志清理器
 pub struct LogCleaner {
@@ -53,6 +57,8 @@ pub struct LogCleaner {
     mounted_paths: Arc<dyn MountedPathsProbe>,
     /// 一轮里删除目录的时间预算，见 [`DIR_RECLAIM_BUDGET`]
     reclaim_budget: Duration,
+    /// 一轮里最多删除的目录数，见 [`DIR_RECLAIM_BATCH`]
+    reclaim_batch: usize,
 }
 
 impl LogCleaner {
@@ -72,6 +78,7 @@ impl LogCleaner {
             retention_duration: Duration::from_secs(retention_days.saturating_mul(SECS_PER_DAY)),
             mounted_paths,
             reclaim_budget: DIR_RECLAIM_BUDGET,
+            reclaim_batch: DIR_RECLAIM_BATCH,
         }
     }
 
@@ -79,6 +86,13 @@ impl LogCleaner {
     #[cfg(test)]
     pub(super) fn with_reclaim_budget(mut self, budget: Duration) -> Self {
         self.reclaim_budget = budget;
+        self
+    }
+
+    /// 把一轮最多删除的目录数改成 `batch`。测试用
+    #[cfg(test)]
+    pub(super) fn with_reclaim_batch(mut self, batch: usize) -> Self {
+        self.reclaim_batch = batch;
         self
     }
 
@@ -229,6 +243,8 @@ impl LogCleaner {
             stats.dirs_deferred_while_mounting += candidates.len() as u64;
             return;
         };
+        // 预算从这一刻开始计：接下来取清单、逐个复查的时间同样占着写锁
+        let reclaim_started = std::time::Instant::now();
         let mounts = match self
             .mounted_paths
             .mounted_log_directories(&candidates)
@@ -245,7 +261,7 @@ impl LogCleaner {
             }
         };
 
-        let reclaim_started = std::time::Instant::now();
+        let mut reclaimed = 0usize;
         for path in candidates {
             if mounts.mounted.contains(&path) {
                 stats.dirs_skipped_in_use += 1;
@@ -260,7 +276,8 @@ impl LogCleaner {
                 );
                 continue;
             }
-            if reclaim_started.elapsed() >= self.reclaim_budget {
+            // 这一批的额度已用完：余下的不再复查，留到下一轮
+            if reclaimed >= self.reclaim_batch {
                 stats.dirs_deferred_by_budget += 1;
                 continue;
             }
@@ -285,9 +302,15 @@ impl LogCleaner {
                 );
                 continue;
             }
+            // 复查也可能很慢：真正发起删除之前再确认一次时间预算
+            if reclaim_started.elapsed() >= self.reclaim_budget {
+                stats.dirs_deferred_by_budget += 1;
+                continue;
+            }
             match fs::remove_dir_all(&path).await {
                 Ok(()) => {
                     stats.dirs_deleted += 1;
+                    reclaimed += 1;
                     debug!(?path, "[log_cleaner] Deleted expired unmounted directory");
                 }
                 Err(error) => {
@@ -331,7 +354,7 @@ pub struct LogCleanupStats {
     pub dirs_skipped_unconfirmed: u64,
     /// 因挂载准备正在进行而顺延到下一轮的目录数量（正常现象）
     pub dirs_deferred_while_mounting: u64,
-    /// 因本轮删除时间预算用完而顺延到下一轮的目录数量（正常现象）
+    /// 因本轮的删除预算用完（时间或数量）而顺延到下一轮的目录数量（正常现象）
     pub dirs_deferred_by_budget: u64,
     /// 释放的字节数
     pub bytes_freed: u64,
@@ -376,7 +399,7 @@ impl LogCleanupStats {
             }
             if self.dirs_deferred_by_budget > 0 {
                 parts.push(format!(
-                    "deferred: {} dirs (deletion budget spent)",
+                    "deferred: {} dirs (reclaim budget spent)",
                     self.dirs_deferred_by_budget
                 ));
             }

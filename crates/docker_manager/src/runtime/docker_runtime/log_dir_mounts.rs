@@ -388,7 +388,7 @@ pub(super) async fn mounted_log_directories(
             }
             LogDirMount::Unmounted => {}
             LogDirMount::Unconfirmed(reason) => {
-                mounts.unconfirmed.push((candidate.clone(), reason));
+                mounts.unconfirmed.insert(candidate.clone(), reason);
             }
         }
     }
