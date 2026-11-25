@@ -944,6 +944,61 @@ impl AgentContainerRuntime for DockerRuntime {
             })
     }
 
+    async fn mounted_log_directories(
+        &self,
+        candidates: &[std::path::PathBuf],
+    ) -> ContainerRuntimeResult<std::collections::HashSet<std::path::PathBuf>> {
+        let resolver = if shared_types::is_deploy_host() {
+            None
+        } else {
+            let timeout = Duration::from_secs(self.inner.config.api_timeout_quick_seconds);
+            let resolver = self
+                .log_path_resolver
+                .get_or_try_init(crate::HostPathResolver::new);
+            Some(
+                tokio::time::timeout(timeout, resolver)
+                    .await
+                    .map_err(|_| {
+                        ContainerRuntimeError::Timeout(
+                            "Resolve log directory mounts timed out".into(),
+                        )
+                    })?
+                    .map_err(|error| {
+                        ContainerRuntimeError::DockerError(format!(
+                            "Resolve log directory mounts: {error}"
+                        ))
+                    })?,
+            )
+        };
+        let mut protected = std::collections::HashSet::new();
+        for source in self.mounted_host_paths().await? {
+            protected.extend(source.ancestors().map(std::path::Path::to_path_buf));
+        }
+        let mut mounted = std::collections::HashSet::new();
+        for candidate in candidates {
+            let local_path = tokio::fs::canonicalize(candidate).await.map_err(|error| {
+                ContainerRuntimeError::DockerError(format!(
+                    "Resolve local log directory '{}': {error}",
+                    candidate.display()
+                ))
+            })?;
+            let backing_path = match &resolver {
+                Some(resolver) => resolver
+                    .resolve_to_host_path(&local_path)
+                    .map_err(|error| {
+                        ContainerRuntimeError::DockerError(format!(
+                            "Resolve log directory mount: {error}"
+                        ))
+                    })?,
+                None => local_path,
+            };
+            if protected.contains(&crate::normalize_path(&backing_path)) {
+                mounted.insert(candidate.clone());
+            }
+        }
+        Ok(mounted)
+    }
+
     /// Docker 基础诊断：find_container → docker inspect → 读 State(OOMKilled/exit_code/running)。
     /// 用于 gRPC 连接失败时的根因识别（OOM / 容器不在），生成精准友好错误，而非裸 transport error。
     /// inspect 失败(容器重建中等)→ 返回默认诊断(无根因)，调用方按"保留原文"处理，不误判。

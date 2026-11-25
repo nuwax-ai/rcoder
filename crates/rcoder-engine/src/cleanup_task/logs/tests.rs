@@ -9,7 +9,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::fs;
 
-use super::cleaner::{LogCleaner, LogCleanupStats, normalize_path};
+use super::cleaner::{LogCleaner, LogCleanupStats};
 use super::owner::MountedPathsProbe;
 
 /// 假的挂载清单：`mounted` 里的路径回答"还被容器挂着"，`failing` 为 true 时回答
@@ -50,7 +50,10 @@ impl FakeInventory {
 
 #[async_trait]
 impl MountedPathsProbe for FakeInventory {
-    async fn mounted_host_paths(&self) -> Result<HashSet<PathBuf>, String> {
+    async fn mounted_log_directories(
+        &self,
+        _candidates: &[PathBuf],
+    ) -> Result<HashSet<PathBuf>, String> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if *self.failing.lock().unwrap() {
             return Err("docker unreachable".to_string());
@@ -73,18 +76,19 @@ fn cleaner(log_dir: &Path, inventory: Arc<FakeInventory>) -> LogCleaner {
     LogCleaner::new(log_dir.to_str().expect("utf-8 path"), 10, inventory)
 }
 
-#[test]
-fn normalize_path_collapses_redundant_separators() {
-    assert_eq!(
-        normalize_path(Path::new("/app/logs/container//x/")),
-        PathBuf::from("/app/logs/container/x")
-    );
-    assert_eq!(
-        normalize_path(Path::new("/app/logs/container/./x")),
-        PathBuf::from("/app/logs/container/x")
-    );
-    // 组件级比较：尾部分隔符不影响相等性，因此挂载清单里的路径能直接匹配
-    assert_eq!(Path::new("/a/b/"), Path::new("/a/b"));
+#[tokio::test]
+async fn cleanup_defers_when_another_sweep_holds_the_mount_gate() {
+    let root = TempDir::new().unwrap();
+    let expired = aged_dir(root.path(), "retired", 15);
+    let inventory = FakeInventory::new(&[]);
+    let cleaner = cleaner(root.path(), inventory.clone());
+    let guard = docker_manager::try_begin_log_mount_cleanup().unwrap();
+    let stats = cleaner.cleanup_once().await.unwrap();
+    assert!(expired.is_dir());
+    assert_eq!(stats.dirs_skipped_unconfirmed, 1);
+    assert_eq!(inventory.calls(), 0);
+    drop(guard);
+    assert_eq!(cleaner.cleanup_once().await.unwrap().dirs_deleted, 1);
 }
 
 #[test]

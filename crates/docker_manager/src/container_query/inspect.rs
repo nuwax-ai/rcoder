@@ -105,9 +105,13 @@ impl DockerManager {
             all: true,
             ..Default::default()
         });
-        let containers = self.docker.list_containers(options).await.map_err(|e| {
-            DockerError::ConnectionError(format!("failed to list container mounts: {e}"))
-        })?;
+        let timeout = Duration::from_secs(self.config.api_timeout_quick_seconds);
+        let containers = tokio::time::timeout(timeout, self.docker.list_containers(options))
+            .await
+            .map_err(|_| DockerError::Timeout("List container mount sources timed out".to_owned()))?
+            .map_err(|error| {
+                DockerError::ConnectionError(format!("List container mounts: {error}"))
+            })?;
 
         let mut sources = HashSet::new();
         for container in containers {
@@ -117,16 +121,17 @@ impl DockerManager {
                 if mount.typ.as_deref() != Some("bind") {
                     continue;
                 }
-                if let Some(source) = mount.source {
-                    // 与容器创建侧相同的规范化：消除冗余分隔符和尾部分隔符
-                    let normalized = std::path::Path::new(&source)
-                        .components()
-                        .collect::<PathBuf>();
-                    if normalized.as_os_str().is_empty() {
-                        continue;
-                    }
-                    sources.insert(normalized);
-                }
+                let source = mount
+                    .source
+                    .as_deref()
+                    .map(std::path::Path::new)
+                    .filter(|path| path.is_absolute());
+                let source = source.ok_or_else(|| {
+                    DockerError::ConnectionError(
+                        "Docker bind mount is missing an absolute source path".to_owned(),
+                    )
+                })?;
+                sources.insert(crate::normalize_path(source));
             }
         }
         Ok(sources)

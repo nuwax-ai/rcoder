@@ -305,8 +305,9 @@ impl AgentContainerRuntime for Runtime {
     async fn list_containers(&self) -> ContainerRuntimeResult<Vec<RuntimeContainerInfo>> {
         Ok(vec![])
     }
-    async fn mounted_host_paths(
+    async fn mounted_log_directories(
         &self,
+        _candidates: &[std::path::PathBuf],
     ) -> ContainerRuntimeResult<std::collections::HashSet<std::path::PathBuf>> {
         // 与生产契约一致：直接回答挂载清单，不读任何缓存
         Ok(self.mounted_paths.lock().unwrap().clone())

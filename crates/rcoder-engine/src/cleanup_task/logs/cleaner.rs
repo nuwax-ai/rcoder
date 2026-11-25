@@ -21,7 +21,6 @@
 //! 清单获取失败（Docker/K8s 无应答等）时，本轮**不删除任何目录**，只告警。
 //! 没有任何路径会把"查不到"当成"没有挂载"。
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,12 +31,6 @@ use super::owner::MountedPathsProbe;
 
 /// 一天的秒数：保留天数换算秒数的乘数
 const SECS_PER_DAY: u64 = 24 * 60 * 60;
-
-/// 与容器创建侧相同的路径规范化：消除冗余分隔符和尾部分隔符，
-/// 使清理器手里的路径能和运行时报回来的宿主机路径直接比较。
-pub(super) fn normalize_path(path: &Path) -> PathBuf {
-    path.components().collect()
-}
 
 /// 日志清理器
 pub struct LogCleaner {
@@ -125,10 +118,7 @@ impl LogCleaner {
             }
         };
 
-        // 挂载清单按需拉取一次：没有过期目录就一次接口都不调；拉取失败则本轮不再删目录。
-        // 这一条同时限定了每轮对运行时的请求次数上限为 1。
-        let mut mounted: Option<HashSet<PathBuf>> = None;
-        let mut inventory_failed = false;
+        let mut expired_dirs = Vec::new();
 
         // 遍历目录中的文件和子目录
         while let Some(entry) = entries.next_entry().await? {
@@ -181,16 +171,13 @@ impl LogCleaner {
                         }
                     }
                 } else if metadata.is_dir() {
-                    self.reclaim_expired_dir(
-                        &path,
-                        &mut mounted,
-                        &mut inventory_failed,
-                        &mut stats,
-                    )
-                    .await;
+                    expired_dirs.push(path);
                 }
             }
         }
+
+        self.reclaim_expired_dirs(expired_dirs, cutoff_time, &mut stats)
+            .await;
 
         if stats.files_deleted > 0 || stats.dirs_deleted > 0 {
             info!(
@@ -206,62 +193,60 @@ impl LogCleaner {
         Ok(stats)
     }
 
-    /// 处理一个已过期的目录：仍在被挂载就保留，否则删除，并更新统计。
-    ///
-    /// `mounted` / `inventory_failed` 由调用方在整轮里共享：清单只拉取一次，
-    /// 拉取失败后本轮剩余目录全部按"无法确认"保留。
-    async fn reclaim_expired_dir(
+    async fn reclaim_expired_dirs(
         &self,
-        path: &Path,
-        mounted: &mut Option<HashSet<PathBuf>>,
-        inventory_failed: &mut bool,
+        candidates: Vec<PathBuf>,
+        cutoff: u64,
         stats: &mut LogCleanupStats,
     ) {
-        if *inventory_failed {
-            // 本轮已经拿不到清单：不再删除任何目录
-            stats.dirs_skipped_unconfirmed += 1;
+        if candidates.is_empty() {
             return;
         }
-        if mounted.is_none() {
-            match self.mounted_paths.mounted_host_paths().await {
-                Ok(inventory) => *mounted = Some(inventory),
-                Err(error) => {
-                    *inventory_failed = true;
-                    stats.dirs_skipped_unconfirmed += 1;
-                    warn!(
-                        "[log_cleaner] Cannot list mounted host paths ({}); \
-                         keeping every expired directory this cycle",
-                        error
-                    );
-                    return;
-                }
-            }
-        }
-
-        let normalized = normalize_path(path);
-        if mounted
-            .as_ref()
-            .is_some_and(|inventory| inventory.contains(&normalized))
+        // The inventory and deletion share a boundary with Docker mount
+        // preparation and restore. Defer cleanup while either is in progress.
+        let Some(_guard) = docker_manager::try_begin_log_mount_cleanup() else {
+            stats.dirs_skipped_unconfirmed += candidates.len() as u64;
+            return;
+        };
+        let mounted = match self
+            .mounted_paths
+            .mounted_log_directories(&candidates)
+            .await
         {
-            stats.dirs_skipped_in_use += 1;
-            debug!(
-                "[log_cleaner] Kept log directory, it is still mounted by a container: {:?}",
-                path
-            );
-            return;
-        }
-
-        match fs::remove_dir_all(path).await {
-            Ok(_) => {
-                stats.dirs_deleted += 1;
-                debug!("[log_cleaner] Deleted directory: {:?}", path);
+            Ok(inventory) => inventory,
+            Err(error) => {
+                stats.dirs_skipped_unconfirmed += candidates.len() as u64;
+                warn!(%error, "[log_cleaner] Cannot confirm log directory mounts");
+                return;
             }
-            Err(e) => {
-                stats.failed_deletions += 1;
-                warn!(
-                    "[log_cleaner] Failed to delete directory: {:?} - {}",
-                    path, e
-                );
+        };
+
+        for path in candidates {
+            if mounted.contains(&path) {
+                stats.dirs_skipped_in_use += 1;
+                continue;
+            }
+            let still_expired = fs::symlink_metadata(&path).await.is_ok_and(|metadata| {
+                metadata.is_dir()
+                    && metadata
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                        .is_some_and(|age| age.as_secs() < cutoff)
+            });
+            if !still_expired {
+                stats.dirs_skipped_unconfirmed += 1;
+                continue;
+            }
+            match fs::remove_dir_all(&path).await {
+                Ok(()) => {
+                    stats.dirs_deleted += 1;
+                    debug!(?path, "[log_cleaner] Deleted expired unmounted directory");
+                }
+                Err(error) => {
+                    stats.failed_deletions += 1;
+                    warn!(?path, %error, "[log_cleaner] Failed to delete directory");
+                }
             }
         }
     }

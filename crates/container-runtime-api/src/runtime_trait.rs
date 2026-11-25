@@ -733,6 +733,17 @@ pub trait AgentContainerRuntime: Send + Sync {
         ))
     }
 
+    /// Return candidate directories whose backing host path contains a bind source.
+    /// Candidates are in the RCoder process's filesystem namespace.
+    async fn mounted_log_directories(
+        &self,
+        _candidates: &[std::path::PathBuf],
+    ) -> ContainerRuntimeResult<std::collections::HashSet<std::path::PathBuf>> {
+        Err(ContainerRuntimeError::ConfigurationError(
+            "log directory mount inventory is not supported by this runtime".to_string(),
+        ))
+    }
+
     /// Stop and remove container
     async fn stop_container(&self, project_id: &str) -> ContainerRuntimeResult<()>;
 

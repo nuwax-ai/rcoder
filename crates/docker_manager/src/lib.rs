@@ -47,6 +47,13 @@ pub use path::{
     HostPathResolver, get_host_path_resolver, normalize_path, resolve_container_path_to_host,
 };
 
+// Bind preparation and directory reclamation share this lock in a RCoder process.
+static LOG_MOUNT_GATE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+pub fn try_begin_log_mount_cleanup() -> Option<tokio::sync::RwLockWriteGuard<'static, ()>> {
+    LOG_MOUNT_GATE.try_write().ok()
+}
+
 /// Docker manager error type
 #[derive(Error, Debug)]
 pub enum DockerError {

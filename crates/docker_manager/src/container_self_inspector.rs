@@ -158,9 +158,13 @@ impl ContainerSelfInspector {
     async fn get_current_container_id() -> Result<String> {
         debug!("starting get containerID");
 
-        let cgroup_content = fs::read_to_string("/proc/self/cgroup")
-            .await
-            .with_context(|| "Failed to read /proc/self/cgroup file")?;
+        let cgroup_content = match fs::read_to_string("/proc/self/cgroup").await {
+            Ok(content) => content,
+            Err(error) => {
+                debug!(%error, "Cannot read process cgroup, trying container hostname");
+                String::new()
+            }
+        };
 
         debug!("cgroup file: {}", cgroup_content);
 
@@ -230,7 +234,8 @@ impl ContainerSelfInspector {
         // 方法3：尝试读取主机名（某些环境容器ID会作为主机名）
         if let Ok(hostname) = std::env::var("HOSTNAME") {
             debug!("check HOSTNAME: {}", hostname);
-            if hostname.len() == 12 && hostname.chars().all(|c| c.is_ascii_hexdigit()) {
+            if matches!(hostname.len(), 12 | 64) && hostname.chars().all(|c| c.is_ascii_hexdigit())
+            {
                 // 可能是短格式的容器ID（前12位）
                 info!(" HOSTNAME get containerID: {}", hostname);
                 return Ok(hostname);

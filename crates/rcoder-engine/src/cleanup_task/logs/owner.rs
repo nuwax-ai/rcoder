@@ -15,7 +15,10 @@ pub trait MountedPathsProbe: Send + Sync {
     /// 当前被任意容器挂载为 bind 源的宿主机路径（含已停止但尚未删除的容器）。
     ///
     /// `Err` 表示无法确认，调用方按"仍在用"处理，不删除任何目录。
-    async fn mounted_host_paths(&self) -> Result<HashSet<PathBuf>, String>;
+    async fn mounted_log_directories(
+        &self,
+        candidates: &[PathBuf],
+    ) -> Result<HashSet<PathBuf>, String>;
 }
 
 /// 生产实现：经运行时的权威清单判断哪些宿主机路径还被容器挂着。
@@ -31,9 +34,12 @@ impl RuntimeMountedPaths {
 
 #[async_trait]
 impl MountedPathsProbe for RuntimeMountedPaths {
-    async fn mounted_host_paths(&self) -> Result<HashSet<PathBuf>, String> {
+    async fn mounted_log_directories(
+        &self,
+        candidates: &[PathBuf],
+    ) -> Result<HashSet<PathBuf>, String> {
         self.runtime
-            .mounted_host_paths()
+            .mounted_log_directories(candidates)
             .await
             .map_err(|error| error.to_string())
     }

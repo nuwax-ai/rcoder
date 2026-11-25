@@ -628,6 +628,7 @@ impl DockerRuntime {
             // "name already in use". The daemon finishes auto-remove quickly;
             // wait it out bounded instead of failing the whole restart.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let log_mount_guard = crate::LOG_MOUNT_GATE.read().await;
             let created = loop {
                 match client
                     .create_container(Some(options.clone()), body.clone())
@@ -645,6 +646,7 @@ impl DockerRuntime {
                     Err(error) => return Err(fail(format!("Create replacement builder: {error}"))),
                 }
             };
+            drop(log_mount_guard);
             if created.id.is_empty() {
                 return Err(fail("Replacement builder create returned no physical ID"));
             }

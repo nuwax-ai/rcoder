@@ -24,6 +24,8 @@ pub struct DockerRuntime {
     /// 列表缓存携带状态代次：命中时与 [`ContainerStateHandle::list_epoch`]
     /// 比对，变更（创建/删除/更新）后立即可见，不再单靠 TTL。
     list_cache: Cache<(), (u64, Vec<RuntimeContainerInfo>)>,
+    // The RCoder container's mount table stays fixed for its lifetime.
+    log_path_resolver: tokio::sync::OnceCell<crate::HostPathResolver>,
 }
 
 impl DockerRuntime {
@@ -35,6 +37,7 @@ impl DockerRuntime {
                 .max_capacity(1)
                 .time_to_live(Duration::from_secs(15))
                 .build(),
+            log_path_resolver: tokio::sync::OnceCell::new(),
         }
     }
 }

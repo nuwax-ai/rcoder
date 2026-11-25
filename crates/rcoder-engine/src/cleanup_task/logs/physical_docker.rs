@@ -91,7 +91,13 @@ async fn physical_docker_keeps_every_mounted_dir_and_reclaims_the_rest() {
     );
     let owner = uuid::Uuid::new_v4().simple().to_string();
 
-    let log_root = TempDir::new().unwrap();
+    // HOSTNAME names a witness that maps the test process's local root to a
+    // Docker host root. The two path prefixes may differ, as in Compose.
+    let root = std::env::var_os("RCODER_LOG_CLEANER_TEST_ROOT").expect("test mount root");
+    let log_root = TempDir::new_in(std::fs::canonicalize(root).unwrap()).unwrap();
+    let resolver = docker_manager::HostPathResolver::new().await.unwrap();
+    let host_root = resolver.resolve_to_host_path(log_root.path()).unwrap();
+    std::fs::create_dir_all(&host_root).unwrap();
     // 四个目录按修改时间都已过期；区别只在于当前有没有容器挂着
     let mounted_running = aged_dir(
         log_root.path(),
@@ -115,23 +121,40 @@ async fn physical_docker_keeps_every_mounted_dir_and_reclaims_the_rest() {
         15,
     );
 
+    let child = mounted_running.join("nested");
+    std::fs::create_dir(&child).unwrap();
+    // Restore the parent mtime after preparing the nested bind source.
+    std::fs::set_times(
+        &mounted_running,
+        std::fs::FileTimes::new()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(15 * 86400)),
+    )
+    .unwrap();
+    let host_source = |local: &Path| {
+        let path = resolver.resolve_to_host_path(local).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    };
+    let host_running = host_source(&child);
+    let host_stopped = host_source(&mounted_stopped);
+    let host_renamed = host_source(&mounted_renamed);
     let _running = run_witness(
         &image,
         &owner,
         &format!("rcoder-log-cleaner-running-{owner}"),
-        &mounted_running,
+        &host_running,
     );
     let stopped = run_witness(
         &image,
         &owner,
         &format!("rcoder-log-cleaner-stopped-{owner}"),
-        &mounted_stopped,
+        &host_stopped,
     );
     let renamed = run_witness(
         &image,
         &owner,
         &format!("rcoder-log-cleaner-renamed-{owner}"),
-        &mounted_renamed,
+        &host_renamed,
     );
     // 停止但保留容器：Docker 仍然报告它的挂载
     let stopped_result = docker(&["stop", "--time", "2", &stopped.id]);
@@ -164,7 +187,7 @@ async fn physical_docker_keeps_every_mounted_dir_and_reclaims_the_rest() {
 
     // 运行时自检：清单里必须包含三个被挂载的目录，且不包含没挂的那个
     let inventory = runtime.mounted_host_paths().await.expect("inventory");
-    for mounted in [&mounted_running, &mounted_stopped, &mounted_renamed] {
+    for mounted in [&host_running, &host_stopped, &host_renamed] {
         assert!(
             inventory.contains(mounted),
             "inventory must include the mounted path {}",
@@ -172,7 +195,7 @@ async fn physical_docker_keeps_every_mounted_dir_and_reclaims_the_rest() {
         );
     }
     assert!(
-        !inventory.contains(&unmounted),
+        !inventory.contains(&resolver.resolve_to_host_path(&unmounted).unwrap()),
         "inventory must not include the unmounted path"
     );
 
@@ -211,7 +234,7 @@ async fn physical_docker_keeps_every_mounted_dir_and_reclaims_the_rest() {
     drop(_running);
     let inventory = runtime.mounted_host_paths().await.expect("inventory");
     assert!(
-        !inventory.contains(&mounted_renamed),
+        !inventory.contains(&host_renamed),
         "precondition: mount must be gone after the container is removed"
     );
     let second = cleaner.cleanup_once().await.unwrap();
