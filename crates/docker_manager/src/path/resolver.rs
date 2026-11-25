@@ -269,21 +269,31 @@ impl HostPathResolver {
         )))
     }
 
-    /// 把宿主机路径换算回容器内路径
+    /// 一个宿主机路径在容器内看到的全部路径，每项是 `(容器内的挂载根, 容器内的路径)`
     ///
-    /// 取宿主机前缀最长的那条挂载；不在任何挂载之下时返回 `None`。只做词法前缀替换，
-    /// 与 [`Self::resolve_to_host_path`] 互为逆运算。
-    pub fn resolve_from_host_path(&self, host_path: &Path) -> Option<PathBuf> {
-        self.all_mounts
+    /// 同一个宿主机目录挂进容器几次就有几项；宿主机前缀最长的排在最前。不在任何挂载之下
+    /// 时为空。这只是词法前缀替换，**不是** [`Self::resolve_to_host_path`] 的逆运算：容器内
+    /// 的路径被另一条挂载遮蔽时，或者一个宿主机前缀对应多条挂载时，换算回去不一定得到
+    /// 原来的路径，调用方需要时自己做正向核对。
+    pub(crate) fn projections_from_host_path(&self, host_path: &Path) -> Vec<(PathBuf, PathBuf)> {
+        let mut projections: Vec<(usize, PathBuf, PathBuf)> = self
+            .all_mounts
             .iter()
             .filter_map(|(container, host)| {
-                host_path
-                    .strip_prefix(host)
-                    .ok()
-                    .map(|rest| (host.as_os_str().len(), container.join(rest)))
+                host_path.strip_prefix(host).ok().map(|rest| {
+                    (
+                        host.as_os_str().len(),
+                        crate::normalize_path(container),
+                        crate::normalize_path(&container.join(rest)),
+                    )
+                })
             })
-            .max_by_key(|(host_prefix_len, _)| *host_prefix_len)
-            .map(|(_, container_path)| container_path)
+            .collect();
+        projections.sort_by_key(|(host_prefix_len, _, _)| std::cmp::Reverse(*host_prefix_len));
+        projections
+            .into_iter()
+            .map(|(_, root, path)| (root, path))
+            .collect()
     }
 
     /// 获取宿主机工作空间根目录

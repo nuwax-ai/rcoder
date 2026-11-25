@@ -98,31 +98,36 @@ fn mounts_without_a_host_path_are_skipped_for_non_bind_types() {
 // ─── 路径换算 ───────────────────────────────────────────────────────────────
 
 #[test]
-fn reverse_mapping_takes_the_longest_host_prefix_and_refuses_paths_outside() {
+fn projections_enumerate_every_view_of_a_host_path() {
     let resolver = HostPathResolver::from_mount_table(vec![
         (PathBuf::from("/app"), PathBuf::from("/host/root")),
         (PathBuf::from("/app/logs"), PathBuf::from("/host/root/logs")),
+        (PathBuf::from("/mirror"), PathBuf::from("/host/root")),
     ])
     .unwrap();
 
     assert_eq!(
-        resolver.resolve_from_host_path(Path::new("/host/root/logs/container/x")),
-        Some(PathBuf::from("/app/logs/container/x"))
+        resolver.projections_from_host_path(Path::new("/host/root/logs/container/x")),
+        vec![
+            (
+                PathBuf::from("/app/logs"),
+                PathBuf::from("/app/logs/container/x")
+            ),
+            (
+                PathBuf::from("/mirror"),
+                PathBuf::from("/mirror/logs/container/x")
+            ),
+            (
+                PathBuf::from("/app"),
+                PathBuf::from("/app/logs/container/x")
+            ),
+        ],
+        "one view per mount that covers the host path, most specific first"
     );
-    assert_eq!(
-        resolver.resolve_from_host_path(Path::new("/host/root/other")),
-        Some(PathBuf::from("/app/other"))
-    );
-    assert_eq!(
-        resolver.resolve_from_host_path(Path::new("/elsewhere/logs")),
-        None
-    );
-    assert_eq!(
+    assert!(
         resolver
-            .resolve_to_host_path(Path::new("/app/logs/./container"))
-            .unwrap(),
-        PathBuf::from("/host/root/logs/container"),
-        "forward and reverse mapping must round-trip"
+            .projections_from_host_path(Path::new("/elsewhere/logs"))
+            .is_empty()
     );
 }
 
@@ -153,18 +158,49 @@ impl Tree {
             .unwrap()
     }
 
+    /// 同一个宿主机根再挂一次的第二个视图。它不需要在磁盘上存在：[`SecondView`] 把它的
+    /// 身份读取折到了第一个视图上
+    fn mirror(&self) -> PathBuf {
+        self.base.join("mirror")
+    }
+
     /// 以 `sources` 为 Docker 报回的挂载源，走生产同一条路径判定 `candidate`
     async fn verdict(&self, candidate: &Path, sources: &[&str]) -> LogDirMount {
         let resolver = self.resolver();
         let space = HostPathSpace::Container(&resolver);
-        Self::decide(&space, candidate, sources).await
+        Self::decide(&space, candidate, sources, &FileSystemIdentities).await
     }
 
-    async fn decide(space: &HostPathSpace<'_>, candidate: &Path, sources: &[&str]) -> LogDirMount {
+    async fn decide(
+        space: &HostPathSpace<'_>,
+        candidate: &Path,
+        sources: &[&str],
+        identities: &dyn DirectoryIdentities,
+    ) -> LogDirMount {
         let sources: Vec<PathBuf> = sources.iter().map(PathBuf::from).collect();
-        let registered = with_ancestors(sources.iter().cloned());
-        let physical = physical_mount_points(space, &sources).await;
-        classify(candidate, space, &registered, &physical).await
+        let observations = observe(space, &sources, identities).await;
+        classify(candidate, space, &observations, identities).await
+    }
+}
+
+/// 同一个宿主机目录挂进 RCoder 两次时的两个视图：`second` 视图下的路径其实也是
+/// `first` 视图下的那个目录，读出来的身份应当相同。
+///
+/// 没有特权做不了真实的 bind mount，而"两个视图身份相同"正是 bind mount 的性质，所以把
+/// `second` 下的身份读取折到 `first` 上。
+struct SecondView {
+    first: PathBuf,
+    second: PathBuf,
+}
+
+#[async_trait]
+impl DirectoryIdentities for SecondView {
+    async fn identity(&self, path: &Path) -> std::io::Result<DirectoryId> {
+        let path = match path.strip_prefix(&self.second) {
+            Ok(rest) => self.first.join(rest),
+            Err(_) => path.to_path_buf(),
+        };
+        FileSystemIdentities.identity(&path).await
     }
 }
 
@@ -189,7 +225,7 @@ async fn a_directory_registered_on_the_creation_path_is_mounted() {
 }
 
 /// 回归（Codex 第三轮 P1）：创建侧和 Docker 用的都是别名路径。只按解析了符号链接的
-/// 物理路径去比，会把一个仍在挂载的目录判成未挂载。
+/// 路径去比，会把一个仍在挂载的目录判成未挂载。
 #[tokio::test]
 async fn an_alias_registered_mount_keeps_the_candidate_listed_through_the_alias() {
     let tree = Tree::new();
@@ -210,7 +246,7 @@ async fn a_real_path_registered_mount_keeps_the_candidate_listed_through_the_ali
     );
 }
 
-/// 反方向的同一个漏洞：候选走真实路径，容器经别名登记。
+/// 反方向的同一个漏洞：候选走真实路径、容器经别名登记。
 #[tokio::test]
 async fn an_alias_registered_mount_keeps_the_candidate_listed_through_the_real_path() {
     let tree = Tree::new();
@@ -236,6 +272,35 @@ async fn a_mount_below_the_candidate_keeps_it_however_it_was_registered() {
             "registered through {source}"
         );
     }
+}
+
+/// 文件级 bind 没有目录身份可取，但挂的是候选目录里面的文件，候选目录同样要保留。
+#[tokio::test]
+async fn a_file_bind_inside_the_candidate_keeps_it() {
+    let tree = Tree::new();
+    std::fs::write(tree.path("logs/runner-a/app.log"), "log").unwrap();
+
+    assert_eq!(
+        tree.verdict(
+            &tree.path("logs/runner-a"),
+            &["/host/base/alias/runner-a/app.log"]
+        )
+        .await,
+        LogDirMount::Mounted
+    );
+}
+
+/// 日志总根自己被挂载（RCoder 容器就挂着它）不会让总根下的每个子目录都被算作占用：
+/// 受保护的是等于挂载源的目录和它上面的祖先，不是它下面的子目录。
+#[tokio::test]
+async fn mounting_the_log_root_does_not_occupy_its_subdirectories() {
+    let tree = Tree::new();
+
+    assert_eq!(
+        tree.verdict(&tree.path("logs/runner-a"), &[HOST_BASE])
+            .await,
+        LogDirMount::Unmounted
+    );
 }
 
 #[tokio::test]
@@ -274,10 +339,26 @@ async fn a_candidate_that_vanished_after_listing_is_unmounted() {
     );
 }
 
-/// deploy-host 形态不做前缀替换，两边的物理身份都在宿主机文件系统上直接解析，
-/// 别名在这里不留死角。
+/// 容器还在、它的目录已经被删：这正是故障现场的样子。它没有可保护的东西，也不能卡住
+/// 其余目录的清理。
 #[tokio::test]
-async fn host_space_matches_aliases_by_physical_identity() {
+async fn a_mount_source_that_no_longer_exists_does_not_block_other_directories() {
+    let tree = Tree::new();
+
+    assert_eq!(
+        tree.verdict(
+            &tree.path("logs/runner-a"),
+            &["/host/base/logs/runner-gone"]
+        )
+        .await,
+        LogDirMount::Unmounted
+    );
+}
+
+/// deploy-host 形态不做前缀替换，两边的目录身份都在宿主机文件系统上直接读取，别名在这里
+/// 不留死角。
+#[tokio::test]
+async fn host_space_matches_aliases_by_directory_identity() {
     let tree = Tree::new();
     let real = tree.path("logs/runner-a");
     let alias = tree.path("alias/runner-a");
@@ -293,13 +374,123 @@ async fn host_space_matches_aliases_by_physical_identity() {
     ] {
         let source_text = source.to_string_lossy().into_owned();
         assert_eq!(
-            Tree::decide(&space, candidate, &[&source_text]).await,
+            Tree::decide(&space, candidate, &[&source_text], &FileSystemIdentities).await,
             expected,
             "source {} candidate {}",
             source.display(),
             candidate.display()
         );
     }
+}
+
+// ─── 同一个宿主机目录挂进 RCoder 两次 ──────────────────────────────────────
+
+/// 双重视图下的挂载表：第一个视图是 `Tree::base`，第二个是 `Tree::mirror`
+fn mounted_twice(tree: &Tree) -> HostPathResolver {
+    HostPathResolver::from_mount_table(vec![
+        (tree.base.clone(), PathBuf::from(HOST_BASE)),
+        (tree.mirror(), PathBuf::from(HOST_BASE)),
+    ])
+    .unwrap()
+}
+
+/// 回归（Codex 第四轮 P1）：同一个宿主机目录挂进 RCoder 两次。候选从第一个视图扫出，
+/// 容器登记的是经别名指向它里面子目录的路径。按路径字符串比对时，反向换算只落到其中
+/// 一个视图，另一个视图里的候选对不上，会被判成未挂载而删掉。
+#[tokio::test]
+async fn a_mount_seen_through_a_second_view_keeps_the_candidate_listed_in_the_first_view() {
+    let tree = Tree::new();
+    let space = HostPathSpace::Container(&mounted_twice(&tree));
+    let identities = SecondView {
+        first: tree.base.clone(),
+        second: tree.mirror(),
+    };
+
+    for candidate in [tree.path("logs"), tree.mirror().join("logs")] {
+        assert_eq!(
+            Tree::decide(&space, &candidate, &[ALIAS_A], &identities).await,
+            LogDirMount::Mounted,
+            "{} contains a directory that is still mounted",
+            candidate.display()
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_orphan_is_reclaimed_even_when_the_log_root_is_mounted_twice() {
+    let tree = Tree::new();
+    std::fs::create_dir(tree.path("logs/runner-b")).unwrap();
+    let space = HostPathSpace::Container(&mounted_twice(&tree));
+    let identities = SecondView {
+        first: tree.base.clone(),
+        second: tree.mirror(),
+    };
+
+    assert_eq!(
+        Tree::decide(&space, &tree.path("logs/runner-a"), &[ALIAS_A], &identities).await,
+        LogDirMount::Mounted,
+        "the mounted directory itself is still kept"
+    );
+    assert_eq!(
+        Tree::decide(&space, &tree.path("logs/runner-b"), &[ALIAS_A], &identities).await,
+        LogDirMount::Unmounted,
+        "a true orphan must stay reclaimable"
+    );
+}
+
+/// 回归（Codex 第四轮 P1 的另一面）：容器里的路径被另一条挂载遮蔽时，反向换算得到的路径
+/// 看到的是另一棵宿主机目录。把它当成该挂载源的视图，会让无关目录被误判为仍被挂载。
+#[tokio::test]
+async fn a_view_hidden_behind_another_mount_is_not_taken_for_the_mount_source() {
+    let tree = Tree::new();
+    // RCoder 里 `shadowed` 是另一棵宿主机目录 /other；/host/base/shadowed 在 RCoder 里看不到
+    std::fs::create_dir_all(tree.path("shadowed/runner-x")).unwrap();
+    let hidden = format!("{HOST_BASE}/shadowed/runner-x");
+    let space = HostPathSpace::Container(
+        &HostPathResolver::from_mount_table(vec![
+            (tree.path("shadowed"), PathBuf::from("/other")),
+            (tree.base.clone(), PathBuf::from(HOST_BASE)),
+        ])
+        .unwrap(),
+    );
+
+    // 没有别的视图看得到它：无法辨识，保留并说明原因，而不是判成仍被挂载
+    let verdict = Tree::decide(
+        &space,
+        &tree.path("shadowed"),
+        &[&hidden],
+        &FileSystemIdentities,
+    )
+    .await;
+    assert!(
+        matches!(&verdict, LogDirMount::Unconfirmed(reason) if reason.contains("hidden behind another mount")),
+        "{verdict:?}"
+    );
+
+    // 同一个宿主机根还有第二个视图，从那里读得到身份：第二个视图里的候选被保留
+    let space = HostPathSpace::Container(
+        &HostPathResolver::from_mount_table(vec![
+            (tree.path("shadowed"), PathBuf::from("/other")),
+            (tree.base.clone(), PathBuf::from(HOST_BASE)),
+            (tree.mirror(), PathBuf::from(HOST_BASE)),
+        ])
+        .unwrap(),
+    );
+    let identities = SecondView {
+        first: tree.base.clone(),
+        second: tree.mirror(),
+    };
+
+    assert_eq!(
+        Tree::decide(
+            &space,
+            &tree.mirror().join("shadowed"),
+            &[&hidden],
+            &identities
+        )
+        .await,
+        LogDirMount::Mounted
+    );
 }
 
 // ─── 协议：真实 Bollard 客户端 + 假 daemon ───────────────────────────────────

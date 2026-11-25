@@ -62,9 +62,17 @@ fn aged_dir(parent: &Path, name: &str, days: u64) -> PathBuf {
     dir
 }
 
-/// 起一个把 `host_dir` 挂到 `/app/container-logs` 的容器
-fn run_witness(image: &str, owner: &str, name: &str, host_dir: &Path) -> Witness {
-    let created = docker(&[
+/// 起一个见证容器；`mount` 有值时把该宿主机目录挂到 `/app/container-logs`，
+/// 否则不带任何挂载
+fn run_witness(image: &str, owner: &str, name: &str, mount: Option<&Path>) -> Witness {
+    let label = format!("{OWNER_LABEL}={owner}");
+    let bind = mount.map(|host_dir| {
+        format!(
+            "type=bind,src={},dst=/app/container-logs",
+            host_dir.display()
+        )
+    });
+    let mut args = vec![
         "run",
         "--pull=never",
         "--detach",
@@ -73,16 +81,13 @@ fn run_witness(image: &str, owner: &str, name: &str, host_dir: &Path) -> Witness
         "--name",
         name,
         "--label",
-        &format!("{OWNER_LABEL}={owner}"),
-        "--mount",
-        &format!(
-            "type=bind,src={},dst=/app/container-logs",
-            host_dir.display()
-        ),
-        image,
-        "sleep",
-        "600",
-    ]);
+        &label,
+    ];
+    if let Some(bind) = &bind {
+        args.extend(["--mount", bind.as_str()]);
+    }
+    args.extend([image, "sleep", "600"]);
+    let created = docker(&args);
     assert!(
         created.status.success(),
         "owned fixture creation failed: {}",
@@ -167,6 +172,14 @@ async fn physical_docker_keeps_every_mounted_dir_and_reclaims_the_rest() {
     let image = image();
     let owner = uuid::Uuid::new_v4().simple().to_string();
     let sandbox = Sandbox::new().await;
+    // 一个没有任何挂载的容器：真实 Docker 对它报回空的挂载列表，清单查询必须照常成功
+    // 绑定一直持有到函数结束，离开时移除容器
+    let _bare = run_witness(
+        &image,
+        &owner,
+        &format!("rcoder-log-cleaner-bare-{owner}"),
+        None,
+    );
 
     // 四个目录按修改时间都已过期；区别只在于当前有没有容器挂着
     let mounted_running = aged_dir(&sandbox.process, &dir_name("running", &owner), 15);
@@ -191,19 +204,19 @@ async fn physical_docker_keeps_every_mounted_dir_and_reclaims_the_rest() {
         &image,
         &owner,
         &format!("rcoder-log-cleaner-running-{owner}"),
-        &host_running,
+        Some(&host_running),
     );
     let stopped = run_witness(
         &image,
         &owner,
         &format!("rcoder-log-cleaner-stopped-{owner}"),
-        &host_stopped,
+        Some(&host_stopped),
     );
     let renamed = run_witness(
         &image,
         &owner,
         &format!("rcoder-log-cleaner-renamed-{owner}"),
-        &host_renamed,
+        Some(&host_renamed),
     );
     // 停止但保留容器：Docker 仍然报告它的挂载
     let stopped_result = docker(&["stop", "--time", "2", &stopped.id]);
@@ -228,7 +241,7 @@ async fn physical_docker_keeps_every_mounted_dir_and_reclaims_the_rest() {
         .runtime
         .mounted_host_paths()
         .await
-        .expect("inventory");
+        .expect("a container without mounts must not break the inventory");
     for mounted in [&host_running, &host_stopped, &host_renamed] {
         assert!(
             inventory.contains(mounted),
@@ -320,13 +333,13 @@ async fn physical_docker_keeps_dirs_mounted_through_a_symlinked_log_root() {
         &image,
         &owner,
         &format!("rcoder-log-cleaner-alias-{owner}"),
-        &alias_registered,
+        Some(&alias_registered),
     );
     let real = run_witness(
         &image,
         &owner,
         &format!("rcoder-log-cleaner-real-{owner}"),
-        &real_registered,
+        Some(&real_registered),
     );
     // 前置：Docker 报回的确实是登记时的路径，一个别名、一个真实路径
     let inventory = sandbox
