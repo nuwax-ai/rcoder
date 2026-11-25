@@ -452,6 +452,7 @@ pub struct ProcessGroups {
 /// 角色语义与看门狗**淘汰范围**严格对齐(共用 `mem_watch::evictable_pids`):
 /// - `workload` 会话工作负载 = 在淘汰范围内 → 可能被杀;
 /// - `platform` 平台服务 / `infra` 系统其他 = 不在范围内 → 永不淘汰。
+///
 /// 进程命令行逐个读取并**脱敏**后截断到 120 字符;平台判定用未脱敏的原始
 /// 命令行(脱敏会抹掉标记),原始串不外泄。
 #[cfg(target_os = "linux")]
@@ -490,7 +491,7 @@ fn collect_rows(
             args_head,
         });
     }
-    rows.sort_by(|a, b| b.rss_bytes.cmp(&a.rss_bytes));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.rss_bytes));
     rows
 }
 
