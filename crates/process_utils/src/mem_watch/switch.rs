@@ -295,13 +295,7 @@ fn read_switch_file(path: &Path) -> FileRead {
 /// `open` 上：否则 `mkfifo /tmp/mem-watch.conf` 之后 `open` 会一直阻塞到有写者，
 /// 采样循环就停在这一行了。
 fn read_regular_file(path: &Path) -> FileRead {
-    use rustix::fs::OFlags;
-    use std::os::unix::fs::OpenOptionsExt;
-    let Ok(file) = std::fs::File::options()
-        .read(true)
-        .custom_flags(OFlags::NONBLOCK.bits() as i32)
-        .open(path)
-    else {
+    let Ok(file) = open_for_read(path) else {
         return FileRead::Unreadable;
     };
     let mut raw = String::new();
@@ -309,6 +303,24 @@ fn read_regular_file(path: &Path) -> FileRead {
         Ok(_) if !raw.is_empty() => FileRead::Content(raw),
         _ => FileRead::Unreadable,
     }
+}
+
+/// Unix：带 `O_NONBLOCK` 打开，遇到 FIFO 立刻返回，而不是等到有写者。
+#[cfg(unix)]
+fn open_for_read(path: &Path) -> std::io::Result<std::fs::File> {
+    use rustix::fs::OFlags;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::File::options()
+        .read(true)
+        .custom_flags(OFlags::NONBLOCK.bits() as i32)
+        .open(path)
+}
+
+/// Windows 的文件系统里没有 FIFO 这种打开时会等写者的对象，前面的 `stat` 已经把目录和
+/// 其它非常规文件挡下，普通打开即可。
+#[cfg(not(unix))]
+fn open_for_read(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
 }
 
 /// 一次刷新读到的全部内容（按优先级）。

@@ -570,7 +570,7 @@ mod resident_domain_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod inactive_entry_ownership_tests {
     use super::*;
 
@@ -754,7 +754,7 @@ mod inactive_entry_ownership_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod owner_test_context {
     use super::*;
 
@@ -795,7 +795,7 @@ mod owner_test_context {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod owner_shutdown_domain_tests {
     use super::*;
 
@@ -955,7 +955,7 @@ mod owner_shutdown_domain_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod publication_receipt_tests {
     use super::*;
     use crate::proxy::publication::{ProcessHost, ProcessInstance};
@@ -1074,7 +1074,7 @@ mod publication_receipt_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod official_orchestration_protocol_tests {
     use super::*;
 
@@ -1269,7 +1269,7 @@ mod official_orchestration_protocol_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod official_proxy_only_stop_tests {
     use super::*;
 

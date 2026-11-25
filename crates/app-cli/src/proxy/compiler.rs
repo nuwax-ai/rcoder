@@ -42,7 +42,7 @@ pub struct ServiceProbeTarget {
     pub path: String,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn fixture_publication_config(
     config: PingapConfig,
     operation: &str,

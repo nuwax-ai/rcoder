@@ -29,7 +29,7 @@ mod cleanup;
 mod cleanup_empty_tests;
 #[cfg(all(test, unix))]
 mod current_domain_recovery_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod deadline_tests;
 mod legacy;
 mod official_host;
@@ -107,7 +107,7 @@ impl SupervisordHost {
     pub(crate) fn mutations_pending() -> Result<bool> {
         SupervisorClient::mutations_pending()
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn protocol_fixture(socket: PathBuf, conf_path: PathBuf) -> Self {
         Self {
             client: SupervisorClient::new(socket),

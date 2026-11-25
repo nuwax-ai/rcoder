@@ -1875,7 +1875,7 @@ pub(super) fn bridge_event_fields(json: &str) -> Option<BridgeEvent> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod lifecycle_tests {
     use super::*;
     use std::io::{Read, Write};

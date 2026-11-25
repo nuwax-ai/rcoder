@@ -263,7 +263,7 @@ pub(super) async fn run_migration_with_receipt_and_timeout(
 
 // The generic transient helpers keep strict failure semantics. Only the
 // application migration wrapper above turns a confirmed script failure advisory.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(all(test, unix)), allow(dead_code))]
 pub(crate) async fn run_transient_with_env(
     argv: &[String],
     cwd: &Path,
@@ -281,7 +281,7 @@ pub(super) async fn run_transient_with_timeout(
     run_transient_with_environment_and_timeout(argv, cwd, &Default::default(), timeout).await
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(all(test, unix)), allow(dead_code))]
 pub(super) async fn run_transient_with_environment_and_timeout(
     argv: &[String],
     cwd: &Path,

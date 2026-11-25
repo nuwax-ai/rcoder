@@ -158,10 +158,10 @@ fn xp01_two_cli_concurrent_first_start_single_winner() {
                 status.success(),
                 "control-only caller must reuse the verified owner"
             );
-            let _ = Command::new("taskkill")
+            let _killed = Command::new("taskkill")
                 .args(["/PID", &first.id().to_string(), "/F", "/T"])
                 .output();
-            let _ = first.wait();
+            let _reaped = first.wait();
             return;
         }
         if http_get_health(&address) == Some(200) && second_status.is_none() && !first_alive {
@@ -170,10 +170,10 @@ fn xp01_two_cli_concurrent_first_start_single_winner() {
                 status.success(),
                 "control-only caller must reuse the verified owner"
             );
-            let _ = Command::new("taskkill")
+            let _killed = Command::new("taskkill")
                 .args(["/PID", &second.id().to_string(), "/F", "/T"])
                 .output();
-            let _ = second.wait();
+            let _reaped = second.wait();
             return;
         }
         std::thread::sleep(Duration::from_millis(200));

@@ -1261,7 +1261,7 @@ impl ResidentProxy {
         unconfirmed_error(&self.owner, message)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     async fn reject_initial_attempt(
         &mut self,
         error: anyhow::Error,

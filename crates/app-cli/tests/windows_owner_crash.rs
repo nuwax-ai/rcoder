@@ -12,9 +12,9 @@ impl Drop for CapturedOwner {
         // Retain the original process handle even when a fixture assertion
         // fails. Never rediscover or terminate a process by a recorded PID.
         if self.0.try_wait().ok().flatten().is_none() {
-            let _ = self.0.kill();
+            let _killed = self.0.kill();
         }
-        let _ = self.0.wait();
+        let _reaped = self.0.wait();
     }
 }
 
@@ -125,8 +125,8 @@ strip_prefix = true
         }
         std::thread::sleep(Duration::from_millis(100));
     };
-    let _ = owner.0.kill(); // TerminateProcess(owner), deliberately not tree kill.
-    let _ = owner.0.wait();
+    let _killed = owner.0.kill(); // TerminateProcess(owner), deliberately not tree kill.
+    let _reaped = owner.0.wait();
     let deadline = Instant::now() + Duration::from_secs(5);
     while (listening(ports[0]) || listening(ports[1])) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
