@@ -202,8 +202,7 @@ impl LogCleaner {
         if candidates.is_empty() {
             return;
         }
-        // The inventory and deletion share a boundary with Docker mount
-        // preparation and restore. Defer cleanup while either is in progress.
+        // 取清单到删除的这一段与挂载准备、builder 恢复互斥；对方进行中就整轮顺延
         let Some(_guard) = docker_manager::try_begin_log_mount_cleanup() else {
             stats.dirs_skipped_unconfirmed += candidates.len() as u64;
             return;
@@ -232,7 +231,7 @@ impl LogCleaner {
                         .modified()
                         .ok()
                         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                        .is_some_and(|age| age.as_secs() < cutoff)
+                        .is_some_and(|modified| modified.as_secs() < cutoff)
             });
             if !still_expired {
                 stats.dirs_skipped_unconfirmed += 1;

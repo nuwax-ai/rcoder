@@ -47,9 +47,10 @@ pub use path::{
     HostPathResolver, get_host_path_resolver, normalize_path, resolve_container_path_to_host,
 };
 
-// Bind preparation and directory reclamation share this lock in a RCoder process.
+/// 同一个 RCoder 进程内，挂载准备与日志目录回收共用这把锁
 static LOG_MOUNT_GATE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
+/// 清理器回收日志目录前调用；返回 `None` 说明挂载准备正在进行，本轮顺延
 pub fn try_begin_log_mount_cleanup() -> Option<tokio::sync::RwLockWriteGuard<'static, ()>> {
     LOG_MOUNT_GATE.try_write().ok()
 }

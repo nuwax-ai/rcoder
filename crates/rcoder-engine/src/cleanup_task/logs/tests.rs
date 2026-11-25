@@ -288,12 +288,18 @@ async fn one_inventory_request_per_cycle() {
         );
     }
 
-    let stats = cleaner(temp_dir.path(), FakeInventory::new(&[]))
+    let inventory = FakeInventory::new(&[]);
+    let stats = cleaner(temp_dir.path(), inventory.clone())
         .cleanup_once()
         .await
         .unwrap();
 
     assert_eq!(stats.dirs_deleted, 5);
+    assert_eq!(
+        inventory.calls(),
+        1,
+        "five expired directories must cost one inventory request, not one each"
+    );
 }
 
 /// 没有过期目录时一次接口都不调。
@@ -361,16 +367,17 @@ async fn mixed_directories_are_handled_independently() {
 
 /// 保留天数是不受信任的配置输入，换算成秒时不能回绕。
 ///
-/// `144115188075855872` 天直接相乘正好回绕成 0 秒，也就是保留期变成 0 天——任何目录
-/// 都会被判为过期。release 构建下这是静默的，debug 构建下直接 panic。
+/// `1 << 57` 天（即 144115188075855872）直接乘以一天的秒数正好回绕成 0 秒，也就是保留期
+/// 变成 0 天——任何目录都会被判为过期。release 构建下这是静默的，debug 构建下直接 panic。
 #[tokio::test]
 async fn oversized_retention_does_not_wrap_into_zero() {
     let temp_dir = TempDir::new().unwrap();
     // 一个 11 天前的目录，没有任何容器挂它
     let dir = aged_dir(temp_dir.path(), "runner-gone-20261029035324", 11);
+    let days_that_wrap_to_zero: u64 = 1 << 57;
     let cleaner = LogCleaner::new(
         temp_dir.path().to_str().unwrap(),
-        144115188075855872,
+        days_that_wrap_to_zero,
         FakeInventory::new(&[]),
     );
 

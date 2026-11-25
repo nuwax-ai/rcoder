@@ -138,7 +138,7 @@ async fn physical_docker_keeps_every_mounted_dir_and_reclaims_the_rest() {
     let host_running = host_source(&child);
     let host_stopped = host_source(&mounted_stopped);
     let host_renamed = host_source(&mounted_renamed);
-    let _running = run_witness(
+    let running = run_witness(
         &image,
         &owner,
         &format!("rcoder-log-cleaner-running-{owner}"),
@@ -180,7 +180,6 @@ async fn physical_docker_keeps_every_mounted_dir_and_reclaims_the_rest() {
             .await
             .expect("connect to the local Docker daemon"),
     );
-    // 与生产相同的构造方式：真实 DockerManager → 真实 DockerRuntime。
     // 直接落成 trait object，和 `state.runtime()` 的形态一致。
     let runtime: Arc<dyn container_runtime_api::ContainerRuntime> =
         Arc::new(docker_manager::runtime::DockerRuntime::new(manager));
@@ -231,7 +230,7 @@ async fn physical_docker_keeps_every_mounted_dir_and_reclaims_the_rest() {
     // 容器回收后挂载消失，下一轮同一目录就能删掉
     drop(renamed);
     drop(stopped);
-    drop(_running);
+    drop(running);
     let inventory = runtime.mounted_host_paths().await.expect("inventory");
     assert!(
         !inventory.contains(&host_renamed),
