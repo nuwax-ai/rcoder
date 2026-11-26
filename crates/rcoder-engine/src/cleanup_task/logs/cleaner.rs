@@ -36,12 +36,15 @@ use super::owner::MountedPathsProbe;
 /// 一天的秒数：保留天数换算秒数的乘数
 const SECS_PER_DAY: u64 = 24 * 60 * 60;
 
-/// 一轮里删除目录的时间预算：从开始判定起计，到期后不再做任何 I/O——既不发起删除，也
-/// 不再复查余下的候选；余下的留到下一轮。
+/// 一轮的截止时间：从拿到挂载围栏的写锁那一刻起计，取清单、逐个判定、逐个删除共用它。
 ///
-/// 删除期间一直占着挂载围栏的写锁，agent 容器创建和 builder 恢复都在锁外等。没有预算
-/// 的话，积压的过期目录越多，锁被占得越久。它是软预算：只决定"要不要开始下一步"，不会
-/// 中途放弃进行中的删除——放弃之后底层可能还在删，锁却已经放开了。
+/// 删除期间一直占着这把写锁，agent 容器创建和 builder 恢复都在锁外等。没有截止时间的话，
+/// 积压的过期目录越多、Docker 越慢，锁被占得越久。到期之后不再开始下一步：
+/// - 判定还没回来：这一轮所有候选都保留，放锁；
+/// - 判定回来了：不再发起删除，也不再复查余下的候选，余下的留到下一轮。
+///
+/// 它是软预算：不会中途放弃进行中的删除——放弃之后底层可能还在删，锁却已经放开了。所以
+/// 实际持锁时间会比它多出最后一次删除所花的时间。
 const DIR_RECLAIM_BUDGET: Duration = Duration::from_secs(2);
 
 /// 一轮里最多发起多少次目录删除，失败的也算。时间预算管不住"每个都很快、合起来却很多"
@@ -256,19 +259,31 @@ impl LogCleaner {
             stats.dirs_deferred_while_mounting += candidates.len() as u64;
             return;
         };
-        // 预算从这一刻开始计：接下来取清单、逐个复查的时间同样占着写锁
+        // 截止时间从这一刻开始计：取清单、逐个判定、逐个删除共用它。判定到期还没回来就保留
+        // 全部候选、放锁；已经发起的删除不包在超时里，照旧等它结束
         let reclaim_started = std::time::Instant::now();
-        let mounts = match self
-            .mounted_paths
-            .mounted_log_directories(&candidates)
-            .await
+        let deadline = tokio::time::Instant::from_std(reclaim_started) + self.reclaim_budget;
+        let mounts = match tokio::time::timeout_at(
+            deadline,
+            self.mounted_paths.mounted_log_directories(&candidates),
+        )
+        .await
         {
-            Ok(mounts) => mounts,
-            Err(error) => {
+            Ok(Ok(mounts)) => mounts,
+            Ok(Err(error)) => {
                 stats.dirs_skipped_unconfirmed += candidates.len() as u64;
                 warn!(
                     %error,
                     "[log_cleaner] Cannot confirm log directory mounts, keeping every expired directory this cycle"
+                );
+                return;
+            }
+            Err(_elapsed) => {
+                stats.dirs_skipped_unconfirmed += candidates.len() as u64;
+                warn!(
+                    candidates = candidates.len(),
+                    budget_ms = self.reclaim_budget.as_millis() as u64,
+                    "[log_cleaner] Log directory mounts were not confirmed within the reclaim budget, keeping every expired directory this cycle"
                 );
                 return;
             }
@@ -290,7 +305,7 @@ impl LogCleaner {
                 continue;
             }
             // 这一批的名额或时间预算已用完：余下的不再做任何 I/O，留到下一轮
-            if attempts >= self.reclaim_batch || reclaim_started.elapsed() >= self.reclaim_budget {
+            if attempts >= self.reclaim_batch || tokio::time::Instant::now() >= deadline {
                 stats.dirs_deferred_by_budget += 1;
                 continue;
             }
@@ -315,8 +330,8 @@ impl LogCleaner {
                 );
                 continue;
             }
-            // 复查也可能很慢：真正发起删除之前再确认一次时间预算
-            if reclaim_started.elapsed() >= self.reclaim_budget {
+            // 复查也可能很慢：真正发起删除之前再确认一次截止时间
+            if tokio::time::Instant::now() >= deadline {
                 stats.dirs_deferred_by_budget += 1;
                 continue;
             }

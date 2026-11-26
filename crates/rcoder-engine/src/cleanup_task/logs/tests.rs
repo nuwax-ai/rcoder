@@ -23,6 +23,8 @@ struct FakeInventory {
     /// 被询问时顺手删掉的目录，用来模拟"列目录之后、删除之前目录消失"
     vanish_on_probe: Mutex<Vec<PathBuf>>,
     failing: Mutex<bool>,
+    /// 回答之前先等这么久，用来模拟很慢的 Docker
+    delay: Mutex<Duration>,
     calls: AtomicUsize,
 }
 
@@ -33,6 +35,7 @@ impl FakeInventory {
             unconfirmed: Mutex::new(Vec::new()),
             vanish_on_probe: Mutex::new(Vec::new()),
             failing: Mutex::new(false),
+            delay: Mutex::new(Duration::ZERO),
             calls: AtomicUsize::new(0),
         })
     }
@@ -61,6 +64,10 @@ impl FakeInventory {
         *self.failing.lock().unwrap() = failing;
     }
 
+    fn set_delay(&self, delay: Duration) {
+        *self.delay.lock().unwrap() = delay;
+    }
+
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
@@ -75,6 +82,10 @@ impl MountedPathsProbe for FakeInventory {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if *self.failing.lock().unwrap() {
             return Err("docker unreachable".to_string());
+        }
+        let delay = *self.delay.lock().unwrap();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
         }
         for path in self.vanish_on_probe.lock().unwrap().drain(..) {
             std::fs::remove_dir_all(path).expect("remove the vanished directory");
@@ -157,6 +168,49 @@ async fn deletion_budget_defers_the_rest_until_the_next_cycle() {
         2
     );
     assert!(!first.exists() && !second.exists());
+}
+
+/// 取清单和逐个判定都在写锁里，和删除共用同一个截止时间：判定迟迟不回来时，到期就保留全部
+/// 候选、放锁，而不是一直等下去。
+#[tokio::test]
+async fn a_slow_observation_keeps_every_directory_and_releases_the_gate() {
+    let temp_dir = TempDir::new().unwrap();
+    let first = aged_dir(temp_dir.path(), "runner-a-20261029035324", 15);
+    let second = aged_dir(temp_dir.path(), "runner-b-20261029035324", 15);
+    let inventory = FakeInventory::new(&[]);
+    inventory.set_delay(Duration::from_secs(3));
+
+    let started = std::time::Instant::now();
+    let stats = cleaner(temp_dir.path(), inventory.clone())
+        .with_reclaim_budget(Duration::from_millis(50))
+        .cleanup_once()
+        .await
+        .unwrap();
+
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "an unfinished observation must not hold the gate: {:?}",
+        started.elapsed()
+    );
+    assert!(first.exists() && second.exists());
+    assert_eq!(stats.dirs_skipped_unconfirmed, 2);
+    assert_eq!(stats.dirs_deleted, 0);
+    assert_eq!(
+        stats.dirs_deferred_by_budget, 0,
+        "an unfinished observation is reported as unconfirmed, not as a spent deletion budget"
+    );
+    assert!(
+        docker_manager::try_begin_log_mount_cleanup().is_some(),
+        "the gate must be released while the observation is unfinished"
+    );
+
+    inventory.set_delay(Duration::ZERO);
+    let stats = cleaner(temp_dir.path(), inventory)
+        .cleanup_once()
+        .await
+        .unwrap();
+    assert!(!first.exists() && !second.exists());
+    assert_eq!(stats.dirs_deleted, 2);
 }
 
 /// 每轮最多发起一批目录删除，余下的留到下一轮。时间预算管不住"每个都很快、合起来却很多"
