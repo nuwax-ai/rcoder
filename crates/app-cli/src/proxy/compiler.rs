@@ -376,6 +376,8 @@ fn runtime_root_from_override(
 
 /// Resolve the existing ancestor through the filesystem before retaining a
 /// missing suffix. In particular, `link/..` must follow the link before `..`.
+/// Once links are resolved, the ancestor must be a directory when a suffix is
+/// missing: Windows reports a file in the middle of a path as "not found".
 pub(crate) fn canonical_path_with_missing_tail(path: &Path) -> Result<PathBuf> {
     let mut ancestor = path;
     let mut missing = Vec::new();
@@ -385,6 +387,11 @@ pub(crate) fn canonical_path_with_missing_tail(path: &Path) -> Result<PathBuf> {
                 let mut resolved = std::fs::canonicalize(ancestor).with_context(|| {
                     format!("resolve proxy runtime ancestor {}", ancestor.display())
                 })?;
+                anyhow::ensure!(
+                    missing.is_empty() || resolved.is_dir(),
+                    "proxy runtime ancestor {} is not a directory",
+                    ancestor.display()
+                );
                 for component in missing.into_iter().rev() {
                     resolved.push(component);
                 }
@@ -2223,6 +2230,46 @@ mod runtime_root_tests {
             runtime_root_from_override(Path::new("unused"), Some(requested.as_os_str())).unwrap(),
             physical.canonicalize().unwrap().join("future/runtime")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_ancestor_with_missing_suffix_resolves_to_its_target() {
+        let temporary = tempfile::tempdir().unwrap();
+        let physical = temporary.path().join("physical");
+        std::fs::create_dir_all(&physical).unwrap();
+        std::os::unix::fs::symlink(&physical, temporary.path().join("alias")).unwrap();
+        let requested = temporary.path().join("alias").join("future");
+        assert_eq!(
+            runtime_root_from_override(Path::new("unused"), Some(requested.as_os_str())).unwrap(),
+            physical.canonicalize().unwrap().join("future")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junction_ancestor_with_missing_suffix_resolves_to_its_target() {
+        let temporary = tempfile::tempdir().unwrap();
+        let physical = temporary.path().join("physical");
+        std::fs::create_dir_all(&physical).unwrap();
+        let junction = temporary.path().join("alias");
+        let created = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&physical)
+            .output()
+            .unwrap();
+        assert!(
+            created.status.success(),
+            "mklink /J failed: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let requested = junction.join("future");
+        assert_eq!(
+            runtime_root_from_override(Path::new("unused"), Some(requested.as_os_str())).unwrap(),
+            physical.canonicalize().unwrap().join("future")
+        );
+        std::fs::remove_dir(&junction).unwrap();
     }
 
     #[cfg(unix)]
