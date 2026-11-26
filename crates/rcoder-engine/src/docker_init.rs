@@ -78,7 +78,11 @@ pub async fn init_path_resolver(runtime_type: RuntimeType) -> anyhow::Result<()>
 pub fn build_docker_manager_config(config: &AppConfig) -> docker_manager::DockerManagerConfig {
     if let Some(docker_config) = &config.docker_config {
         info!("using Docker config, merging config");
-        let mut default_config = docker_manager::DockerManagerConfig::default();
+        // 可回收的日志根与日志清理器同源：落在它下面的 bind 源必须是新建的目录
+        let mut default_config = docker_manager::DockerManagerConfig {
+            log_reclaim_root: std::path::PathBuf::from(&config.cleanup_config.log_cleanup.log_dir),
+            ..docker_manager::DockerManagerConfig::default()
+        };
 
         let app_multi_config = docker_config.get_multi_image_config();
         default_config.multi_image_config = app_multi_config;
@@ -153,6 +157,7 @@ pub fn build_docker_manager_config(config: &AppConfig) -> docker_manager::Docker
         }
         docker_manager::DockerManagerConfig {
             kubernetes_config: k8s_cfg,
+            log_reclaim_root: std::path::PathBuf::from(&config.cleanup_config.log_cleanup.log_dir),
             ..Default::default()
         }
     }

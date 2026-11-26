@@ -113,7 +113,7 @@ pub struct LogCleanupConfig {
 }
 
 fn default_log_dir() -> String {
-    "/app/logs/container".to_string()
+    shared_types::paths::CONTAINER_LOG_ROOT.to_string()
 }
 
 fn default_log_retention_days() -> u64 {

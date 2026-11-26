@@ -20,16 +20,20 @@ use tracing::{info, warn};
 use super::{HostPathLookup, MountContext};
 use crate::DockerError;
 use crate::container_builder::ContainerConfigBuilder;
+use crate::log_directory::LogDomain;
 use shared_types::{IsolationType, ServiceType};
 
 /// 自动注入 workspace 挂载，注入过的容器内路径记进 `auto_injected_paths`。
 ///
 /// 宿主机路径解析失败时：UserappBuilder 直接报错（它的 workspace 是"数据即产品"卷，落到
 /// overlay 临时层等于回收即丢）；其余只告警、继续。
+///
+/// workspace 和数据目录不能落在可回收的日志根下面：清理器会把它们当过期日志回收。
 pub(super) async fn inject_workspace_mounts(
     mut builder: ContainerConfigBuilder,
     ctx: &MountContext<'_>,
     lookup: &dyn HostPathLookup,
+    log_domain: &LogDomain,
     auto_injected_paths: &mut HashSet<String>,
 ) -> crate::DockerResult<ContainerConfigBuilder> {
     let workspace_resolution = ctx.workspace_resolution;
@@ -150,6 +154,7 @@ pub(super) async fn inject_workspace_mounts(
             };
 
             let host_mount = workspace_host_path.join(&host_sub);
+            refuse_reclaimable(log_domain, &host_mount, &container_mount)?;
 
             // 创建宿主机挂载目录。容器形态：经容器内路径创建（compose bind 双向
             // 同步宿主机）。deploy-host 宿主机形态：rcoder 进程即宿主机进程，
@@ -217,6 +222,7 @@ pub(super) async fn inject_workspace_mounts(
                     ),
                 ] {
                     let hm = workspace_host_path.join(&sub);
+                    refuse_reclaimable(log_domain, &hm, std::path::Path::new(container_path))?;
                     // 宿主目录预创建（rcoder 容器内经 bind 同步宿主; bind 源必须存在）
                     #[cfg(feature = "deploy-host")]
                     let hdc = if shared_types::is_deploy_host() {
@@ -266,4 +272,21 @@ pub(super) async fn inject_workspace_mounts(
     }
 
     Ok(builder)
+}
+
+/// workspace 这类数据目录落在可回收的日志根下面：拒绝。清理器回收日志根下面过期且没有被
+/// 挂载的目录，数据目录停用一阵就会被当成日志删掉
+fn refuse_reclaimable(
+    log_domain: &LogDomain,
+    host_path: &std::path::Path,
+    container_path: &std::path::Path,
+) -> crate::DockerResult<()> {
+    if !log_domain.contains(&host_path.to_string_lossy()) {
+        return Ok(());
+    }
+    Err(DockerError::ConfigurationError(format!(
+        "Data mount {} binds {}, which lies under the reclaimable log root; the log cleaner would reclaim it. Move the data directory or cleanup_config.log_cleanup.log_dir",
+        container_path.display(),
+        host_path.display()
+    )))
 }

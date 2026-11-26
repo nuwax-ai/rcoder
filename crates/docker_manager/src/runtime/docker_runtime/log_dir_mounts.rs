@@ -52,6 +52,12 @@
 //! - 目录身份只在 Unix 平台可读，其它平台一律按无法确认处理。
 //!
 //! 路径空间怎么换算（[`HostPathSpace`]）在 `host_path_space`，判定和新建目录共用。
+//!
+//! # 正在准备挂载的目录
+//!
+//! 日志目录建好到 Docker 登记这个挂载之间（可能隔着一次很慢的镜像拉取），清单里还没有它。
+//! 这段时间它由创建方按路径登记（`crate::log_directory::PendingBinds`），这里和真实挂载
+//! 一视同仁：登记着的目录按"仍被挂载"处理。
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
@@ -508,7 +514,8 @@ async fn classify(
 
 /// 判定每个候选日志目录是否仍被容器挂载。
 ///
-/// 清单一律取自真实 Docker，不读进程内缓存，整轮只发一次列表请求。单个候选换算失败或读不到
+/// 清单一律取自真实 Docker，不读进程内缓存，整轮只发一次列表请求；另加上正在准备挂载的
+/// 目录的占用登记（`crate::log_directory::pending_bind_sources`）。单个候选换算失败或读不到
 /// 身份只影响它自己，记为无法确认；只有整份清单拿不到时才返回 `Err`。
 pub(super) async fn mounted_log_directories(
     manager: &DockerManager,
@@ -518,11 +525,13 @@ pub(super) async fn mounted_log_directories(
     if candidates.is_empty() {
         return Ok(LogDirectoryMounts::default());
     }
-    let sources: Vec<PathBuf> = manager
-        .mounted_host_paths()
-        .await
-        .map_err(list_error)?
+    // 先读占用登记，再取 Docker 清单，顺序不能反。登记在 Docker 应答之后才注销：一个目录
+    // 要么此刻登记着，要么注销时容器已经登记进 Docker、会出现在之后取的清单里。反过来先取
+    // 清单再读登记会两头落空。
+    let pending = crate::log_directory::pending_bind_sources();
+    let sources: Vec<PathBuf> = pending
         .into_iter()
+        .chain(manager.mounted_host_paths().await.map_err(list_error)?)
         .collect();
 
     let space = path_space(manager, log_path_resolver).await?;

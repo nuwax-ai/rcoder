@@ -352,9 +352,13 @@ impl<'a> AgentContainerStarter<'a> {
         let network_name = self.manager.get_main_network_name().await;
         builder = builder.network_name(network_name);
 
-        let builder = mounts::apply_auto_mounts(
+        let mounts::AppliedMounts {
+            builder,
+            pending_binds,
+        } = mounts::apply_auto_mounts(
             builder,
             &mounts::MountContext {
+                log_reclaim_root: &self.manager.config.log_reclaim_root,
                 container_id: &container_id,
                 container_prefix: &container_prefix,
                 service_config: &service_config,
@@ -391,6 +395,8 @@ impl<'a> AgentContainerStarter<'a> {
         // Never cancel this future: Docker may still be creating or starting
         // the container. Only acknowledged writes permit handing over the lease.
         let created = self.manager.create_container(config).await?;
+        // Docker 已经应答：容器要么登记了这些日志目录，要么确实没建成，占用登记可以注销
+        drop(pending_binds);
         if is_cancelled() {
             return Err(DockerError::BuilderCreationCancelled);
         }

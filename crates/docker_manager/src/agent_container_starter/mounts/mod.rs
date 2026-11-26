@@ -6,12 +6,11 @@
 //! - [`config`]：config mounts 解析（冲突检测/宿主目录预创建/日志挂载 env），模板变量替换和
 //!   建目录路径的算法在 [`templates`]。
 //!
-//! 日志挂载（容器内路径带 `container-logs`）的目录是一次性的：每个容器绑定的都是启动它
-//! 时独占新建的目录，已存在的同名目录不复用（见 `crate::log_directory`），规则在
-//! [`log_mount`]。日志清理器据此不必和这里的挂载准备互斥。
+//! bind 源落在可回收日志根下面的挂载，绑定的必须是为本容器独占新建的目录
+//! （见 [`log_domain`] 和 `crate::log_directory`）。日志清理器据此不必和这里的挂载准备互斥。
 
 mod config;
-mod log_mount;
+mod log_domain;
 mod templates;
 mod workspace;
 
@@ -19,10 +18,12 @@ mod workspace;
 mod tests;
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use async_trait::async_trait;
 
 use crate::container_builder::ContainerConfigBuilder;
+use crate::log_directory::PendingBinds;
 use shared_types::{ServiceImageConfig, ServiceType};
 
 /// 把 RCoder 进程里的路径换算成宿主机路径
@@ -37,7 +38,7 @@ pub(super) struct ProcessMounts;
 #[async_trait]
 impl HostPathLookup for ProcessMounts {
     async fn host_path(&self, container_path: &str) -> crate::DockerResult<std::path::PathBuf> {
-        crate::path::resolve_container_path_to_host(std::path::Path::new(container_path)).await
+        crate::path::resolve_container_path_to_host(Path::new(container_path)).await
     }
 }
 
@@ -56,6 +57,15 @@ pub(super) struct MountContext<'a> {
     pub(super) pod_id: Option<&'a str>,
     pub(super) tenant_id: Option<&'a str>,
     pub(super) space_id: Option<&'a str>,
+    /// 可回收的日志根（RCoder 进程里的路径），见 `DockerManagerConfig::log_reclaim_root`
+    pub(super) log_reclaim_root: &'a Path,
+}
+
+/// 挂载构建的结果
+pub(super) struct AppliedMounts {
+    pub(super) builder: ContainerConfigBuilder,
+    /// 为这个容器新建的日志目录。Docker 应答之前一直登记着，清理器不会把它们当成没人用
+    pub(super) pending_binds: PendingBinds,
 }
 
 /// 给 agent 容器加上挂载：先自动注入 workspace，再处理配置里的挂载点
@@ -63,11 +73,31 @@ pub(super) async fn apply_auto_mounts(
     builder: ContainerConfigBuilder,
     ctx: &MountContext<'_>,
     lookup: &dyn HostPathLookup,
-) -> crate::DockerResult<ContainerConfigBuilder> {
+) -> crate::DockerResult<AppliedMounts> {
+    let log_domain = log_domain::resolve_log_domain(ctx.log_reclaim_root, lookup).await;
     // 记录 auto-inject 已添加的 container_path，用于后续冲突检测
     let mut auto_injected_paths: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    let builder =
-        workspace::inject_workspace_mounts(builder, ctx, lookup, &mut auto_injected_paths).await?;
-    config::add_config_mounts(builder, ctx, lookup, &auto_injected_paths).await
+    let mut pending_binds = PendingBinds::default();
+    let builder = workspace::inject_workspace_mounts(
+        builder,
+        ctx,
+        lookup,
+        &log_domain,
+        &mut auto_injected_paths,
+    )
+    .await?;
+    let builder = config::add_config_mounts(
+        builder,
+        ctx,
+        lookup,
+        &log_domain,
+        &auto_injected_paths,
+        &mut pending_binds,
+    )
+    .await?;
+    Ok(AppliedMounts {
+        builder,
+        pending_binds,
+    })
 }

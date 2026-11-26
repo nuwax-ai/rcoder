@@ -30,6 +30,12 @@ pub struct DockerManagerConfig {
     #[serde(default)]
     pub kubernetes_config: shared_types::KubernetesConfig,
 
+    /// 可回收的日志根目录（RCoder 进程里的路径），和日志清理器的
+    /// `cleanup_config.log_cleanup.log_dir` 是同一个目录。
+    ///
+    /// 落在它下面的 bind 源必须是为本容器独占新建的目录：清理器会回收它下面过期且没有被
+    /// 挂载的目录，绑定一个已有目录会和回收撞上。见 `crate::log_directory`。
+    pub log_reclaim_root: std::path::PathBuf,
     /// 网络基础名称（不含 project name 前缀）
     /// Docker Compose 会自动添加 project name 前缀，实际网络名称为 {project_name}_{network_base_name}
     /// 例如: network_base_name="agent-network" 时，实际网络为 "rcoder_agent-network"
@@ -117,6 +123,7 @@ impl Default for DockerManagerConfig {
             default_work_dir: crate::DEFAULT_WORK_DIR.to_string(),
             auto_cleanup: true,
             container_ttl_seconds: Some(3600), // 1小时
+            log_reclaim_root: std::path::PathBuf::from(shared_types::paths::CONTAINER_LOG_ROOT),
 
             multi_image_config: shared_types::create_default_multi_image_config(), // 默认多镜像配置
             kubernetes_config: shared_types::KubernetesConfig::default(), // K8s 模式从 config.yml 填充;docker 模式空默认

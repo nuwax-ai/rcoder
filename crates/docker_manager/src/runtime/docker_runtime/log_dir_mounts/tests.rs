@@ -1,6 +1,7 @@
 //! 判定逻辑的单元测试：真实目录加真实符号链接，不依赖 Docker；
 //! 另有用真实 Bollard 客户端对着假 daemon 的协议测试，验证整轮只发一次列表请求。
 use super::*;
+use crate::log_directory::PendingBinds;
 use crate::runtime::docker_runtime::DockerRuntime;
 use container_runtime_api::AgentContainerRuntime as _;
 use serde_json::{Value, json};
@@ -870,10 +871,16 @@ impl Drop for FakeDaemon {
 }
 
 async fn fake_daemon(list: Value) -> FakeDaemon {
+    fake_daemon_hooked(list, || {}).await
+}
+
+/// 同上，另在每个请求到达、应答之前调用 `hook`
+async fn fake_daemon_hooked(list: Value, hook: impl Fn() + Send + Sync + 'static) -> FakeDaemon {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&requests);
+    let hook = Arc::new(hook);
     let server = tokio::spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
@@ -891,6 +898,7 @@ async fn fake_daemon(list: Value) -> FakeDaemon {
                 .lock()
                 .unwrap()
                 .push(head.lines().next().unwrap().to_owned());
+            hook();
             let body = list.to_string();
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -1001,4 +1009,103 @@ async fn a_malformed_inventory_fails_the_whole_lookup() {
         error.contains("opaque") && error.contains("no mount list"),
         "{error}"
     );
+}
+
+// ─── 正在准备挂载的目录 ─────────────────────────────────────────────────────
+
+/// 日志目录建好了、Docker 清单里还没有：登记着的目录按"仍被挂载"处理；登记注销后只看清单。
+#[tokio::test]
+async fn a_pending_bind_counts_as_mounted() {
+    let tree = Tree::new();
+    std::fs::create_dir_all(tree.path("logs/runner-fresh")).unwrap();
+    let daemon = fake_daemon(json!([])).await;
+    let runtime = runtime(daemon.address, tree.resolver());
+    let fresh = tree.path("logs/runner-fresh");
+    let mut pending = PendingBinds::default();
+    pending.claim(Path::new("/host/base/logs/runner-fresh"));
+
+    let mounts = runtime
+        .mounted_log_directories(std::slice::from_ref(&fresh))
+        .await
+        .unwrap();
+
+    assert_eq!(mounts.mounted, HashSet::from([fresh.clone()]));
+    assert!(mounts.unconfirmed.is_empty(), "{:?}", mounts.unconfirmed);
+    drop(pending);
+    let mounts = runtime
+        .mounted_log_directories(std::slice::from_ref(&fresh))
+        .await
+        .unwrap();
+    assert!(mounts.mounted.is_empty());
+}
+
+/// 清单里还没有这个容器时，登记同样保护"包含它的上级目录"——和真实挂载一个规矩。
+#[tokio::test]
+async fn a_pending_bind_also_protects_the_directories_above_it() {
+    let tree = Tree::new();
+    std::fs::create_dir_all(tree.path("logs/tenant/runner-fresh")).unwrap();
+    let daemon = fake_daemon(json!([])).await;
+    let runtime = runtime(daemon.address, tree.resolver());
+    let tenant = tree.path("logs/tenant");
+    let mut pending = PendingBinds::default();
+    pending.claim(Path::new("/host/base/logs/tenant/runner-fresh"));
+
+    let mounts = runtime
+        .mounted_log_directories(std::slice::from_ref(&tenant))
+        .await
+        .unwrap();
+
+    assert_eq!(mounts.mounted, HashSet::from([tenant]));
+}
+
+/// 读取顺序：先读登记、后取清单，顺序不能反。登记在 Docker 应答之后才注销——这里让注销恰好
+/// 发生在清单请求到达 daemon 的那一刻（登记已经读完），清单里又还没有这个容器，结论仍必须是
+/// "仍被挂载"。反过来先取清单再读登记，两头都会落空。
+#[tokio::test]
+async fn the_pending_registry_is_read_before_the_docker_inventory() {
+    let tree = Tree::new();
+    std::fs::create_dir_all(tree.path("logs/runner-fresh")).unwrap();
+    let fresh = tree.path("logs/runner-fresh");
+    let mut pending = PendingBinds::default();
+    pending.claim(Path::new("/host/base/logs/runner-fresh"));
+    let release = Arc::new(Mutex::new(Some(pending)));
+    let on_list = Arc::clone(&release);
+    let daemon = fake_daemon_hooked(json!([]), move || {
+        *on_list.lock().unwrap() = None;
+    })
+    .await;
+    let runtime = runtime(daemon.address, tree.resolver());
+
+    let mounts = runtime
+        .mounted_log_directories(std::slice::from_ref(&fresh))
+        .await
+        .unwrap();
+
+    assert!(
+        release.lock().unwrap().is_none(),
+        "the claim must have been released while the list request was being served"
+    );
+    assert_eq!(
+        mounts.mounted,
+        HashSet::from([fresh]),
+        "the registry was read before the list, so the claim is still seen"
+    );
+}
+
+/// 清单拿不到时整轮保留，登记不改变这一点。
+#[tokio::test]
+async fn a_pending_bind_does_not_rescue_an_unavailable_inventory() {
+    let tree = Tree::new();
+    std::fs::create_dir_all(tree.path("logs/runner-fresh")).unwrap();
+    let daemon = fake_daemon(json!([{"Id": "opaque", "Mounts": null}])).await;
+    let runtime = runtime(daemon.address, tree.resolver());
+    let mut pending = PendingBinds::default();
+    pending.claim(Path::new("/host/base/logs/runner-fresh"));
+
+    let error = runtime
+        .mounted_log_directories(&[tree.path("logs/runner-fresh")])
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("no mount list"), "{error}");
 }

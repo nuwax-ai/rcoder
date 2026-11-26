@@ -2,13 +2,23 @@
 //!
 //! 每个容器的日志目录只在"建目录 → Docker 登记这个挂载"那一刻被绑定一次，之后不再被任何
 //! 新容器复用：agent 容器启动时新建一个（`agent_container_starter::mounts`），builder 重启出
-//! 替代容器时也新建一个（`runtime::docker_builder_restart`）。日志清理器凭这一点只看"目录
-//! 已过期、清单里没有容器挂着它"就回收，不必和挂载准备互斥：清理器手里的候选都是旧目录，
-//! 正在准备挂载的都是刚建的目录，两边没有交集。
+//! 替代容器时也新建一个（`runtime::docker_builder_restart`）。日志清理器据此只看三件事就
+//! 回收：目录已过期、清单里没有容器挂着它、也没有人正在准备挂它。它不必和挂载准备互斥。
 //!
 //! "新建"必须是真的新建：[`create_fresh_directory`] 用独占创建建目录，同名目录已经存在
 //! （时钟回拨到同一秒、同名容器的并发创建）时换一个名字，不复用。旧目录可能已经过期、正被
-//! 清理器回收。
+//! 清理器回收。建不出来就是建不出来，不退回去绑定任何已有的路径。
+//!
+//! 哪些 bind 源必须走这一套，按**源路径**判定，不看容器内的挂载点叫什么：落在可回收的日志根
+//! （`DockerManagerConfig::log_reclaim_root`）下面的都是。见 `agent_container_starter::mounts`。
+//!
+//! # 正在准备挂载的目录
+//!
+//! 目录建好到 Docker 登记这个挂载之间（中间可能隔着一次很慢的镜像拉取，多久没有上界），它在
+//! 挂载清单里还看不到。这段时间靠 [`pending`] 按路径登记，清理器把登记着的目录当作仍被挂载。
+
+mod domain;
+mod pending;
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -17,6 +27,19 @@ use tracing::warn;
 
 /// 同名目录已存在时，名字最多试到 `<名字>-16`
 pub(crate) const NAME_ATTEMPTS: u32 = 16;
+
+pub(crate) use domain::LogDomain;
+pub use pending::PendingBinds;
+pub(crate) use pending::pending_bind_sources;
+
+/// 仅供其它 crate 的测试使用：登记一条正在准备挂载的宿主机路径，守卫 drop 时注销。需要启用
+/// `test-support` feature，生产构建里不存在。
+#[cfg(feature = "test-support")]
+pub fn claim_pending_bind_for_test(host_path: &Path) -> PendingBinds {
+    let mut binds = PendingBinds::default();
+    binds.claim(host_path);
+    binds
+}
 
 /// 日志目录名：`<容器名>-<UTC 时间>`，精确到秒
 pub(crate) fn log_directory_name(owner: &str, now: chrono::DateTime<chrono::Utc>) -> String {
@@ -49,8 +72,13 @@ pub(crate) async fn create_fresh_directory(
     tokio::fs::create_dir_all(parent)
         .await
         .map_err(FreshDirectoryError::Io)?;
-    let mut name = preferred.to_owned();
-    for attempt in 2..=NAME_ATTEMPTS {
+    // 首选名字被占，依次换 -2、-3 …：连同首选一共试 NAME_ATTEMPTS 个
+    for attempt in 0..NAME_ATTEMPTS {
+        let name = if attempt == 0 {
+            preferred.to_owned()
+        } else {
+            format!("{preferred}-{}", attempt + 1)
+        };
         let path = parent.join(&name);
         match tokio::fs::create_dir(&path).await {
             Ok(()) => return Ok(path),
@@ -59,7 +87,6 @@ pub(crate) async fn create_fresh_directory(
                     directory = %path.display(),
                     "Log directory name is already taken; binding a new directory under another name instead of reusing it"
                 );
-                name = format!("{preferred}-{attempt}");
             }
             Err(error) => return Err(FreshDirectoryError::Io(error)),
         }

@@ -24,6 +24,11 @@ pub const WORKSPACE_ROOT: &str = "/app/project_workspace";
 /// Docker Compose 将独立 data 目录挂载到这里；deploy-host 经路径映射解析。
 pub const RCODER_DATA_ROOT: &str = "/app/data";
 
+/// agent 容器日志目录的根（**rcoder 主容器视角**）。RCoder 为每个容器在它下面独占新建一个
+/// 目录（`{容器名}-{时间}`），绑到容器内的 `/app/container-logs`；日志清理器回收它下面过期
+/// 且没有被挂载的目录。`cleanup_config.log_cleanup.log_dir` 的默认值。
+pub const CONTAINER_LOG_ROOT: &str = "/app/logs/container";
+
 /// computer agent 工作区根目录 (**rcoder 主容器视角**)。
 ///
 /// 注意: computer agent sub-container 的挂载点是 `/home/user`

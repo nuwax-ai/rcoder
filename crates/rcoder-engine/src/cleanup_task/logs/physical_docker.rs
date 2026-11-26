@@ -298,6 +298,48 @@ async fn physical_docker_keeps_every_mounted_dir_and_reclaims_the_rest() {
     assert_eq!(second.dirs_deleted, 3);
 }
 
+/// 回归（撤锁复审 P1）：日志目录建好了，容器还没建出来——中间在拉镜像，多久没有上界。
+/// 这期间清单里没有它，靠"正在准备挂载"的登记保护：登记着就保留；Docker 应答、登记注销
+/// 之后，没有容器挂它才回收。
+#[tokio::test]
+#[ignore = "requires Docker, RCODER_LOG_CLEANER_DOCKER_IMAGE (a local Alpine image ID; never pulls images), RCODER_LOG_CLEANER_TEST_ROOT and HOSTNAME; see the module docs"]
+async fn physical_docker_keeps_a_log_directory_that_is_still_being_mounted() {
+    let image = image();
+    let owner = uuid::Uuid::new_v4().simple().to_string();
+    let sandbox = Sandbox::new().await;
+    // 目录按修改时间已经过期（保留期配到最低、镜像拉了很久的情况），没有任何容器挂着
+    let pending = aged_dir(&sandbox.process, &dir_name("pending", &owner), 15);
+    let host_pending = sandbox.host_path(&pending);
+    let claim = docker_manager::claim_pending_bind_for_test(&host_pending);
+    let cleaner = sandbox.cleaner(&sandbox.process);
+
+    let inventory = sandbox
+        .runtime
+        .mounted_host_paths()
+        .await
+        .expect("inventory");
+    assert!(
+        !inventory.contains(&host_pending),
+        "precondition: no container mounts the directory yet"
+    );
+
+    let first = cleaner.cleanup_once().await.unwrap();
+
+    assert!(
+        pending.exists(),
+        "a directory that is still being mounted must be kept"
+    );
+    assert_eq!(first.dirs_skipped_in_use, 1);
+    assert_eq!(first.dirs_deleted, 0);
+
+    // Docker 应答之后登记注销：确实没有容器挂它，下一轮回收
+    drop(claim);
+    let second = cleaner.cleanup_once().await.unwrap();
+    assert!(!pending.exists());
+    assert_eq!(second.dirs_deleted, 1);
+    drop(image);
+}
+
 /// 回归（Codex 第三轮 P1）：日志根本身是一层符号链接。创建侧和 Docker 用的都是别名路径，
 /// 按解析了符号链接的物理路径去比，会把仍在挂载的目录判成未挂载而删掉。
 ///

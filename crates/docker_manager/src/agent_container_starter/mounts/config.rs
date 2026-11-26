@@ -1,22 +1,28 @@
 //! 配置里的挂载点（`service_config.mounts`）：解析模板、处理与自动注入的冲突、预建宿主
-//! 目录、给日志挂载加环境变量。
+//! 目录；指向可回收日志域的那几条换成新建的目录，并给日志挂载加环境变量。
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use tracing::{debug, info, warn};
 
-use super::log_mount::{create_log_directory, is_log_mount, require_new_log_directory};
+use super::log_domain::{create_reclaimable_directory, sets_log_env};
 use super::templates::{directory_visible_to_this_process, path_after_resolved_base, substitute};
 use super::{HostPathLookup, MountContext};
 use crate::DockerError;
 use crate::container_builder::ContainerConfigBuilder;
+use crate::log_directory::LogDomain;
+use crate::log_directory::PendingBinds;
 
-/// 按配置逐条加挂载。`auto_injected_paths` 是自动注入已经占用的容器内路径
+/// 按配置逐条加挂载。`auto_injected_paths` 是自动注入已经占用的容器内路径；新建的日志目录
+/// 登记进 `pending_binds`
 pub(super) async fn add_config_mounts(
     mut builder: ContainerConfigBuilder,
     ctx: &MountContext<'_>,
     lookup: &dyn HostPathLookup,
+    log_domain: &LogDomain,
     auto_injected_paths: &HashSet<String>,
+    pending_binds: &mut PendingBinds,
 ) -> crate::DockerResult<ContainerConfigBuilder> {
     let service_config = ctx.service_config;
     let variables = ctx.variables;
@@ -149,24 +155,19 @@ pub(super) async fn add_config_mounts(
             continue;
         }
 
-        let log_mount = is_log_mount(mount_config);
-
-        // 日志目录一次性使用：独占新建这个容器的日志目录。同名目录已存在时会换个名字，
-        // 绑定的路径和 CONTAINER_LOG_NAME 都跟着用最终的名字
+        // 指向可回收日志域的挂载：绑定的必须是为本容器独占新建的目录。同名目录已存在时会换个
+        // 名字，绑定的路径和 CONTAINER_LOG_NAME 都跟着用最终的名字
+        let reclaimable = log_domain.contains(&resolved_host_path);
         let mut log_dir_name = log_dir_name.clone();
-        if log_mount {
-            require_new_log_directory(mount_config)?;
-            if !mount_config.read_only
-                && let Some(name) = create_log_directory(mount_config, &mount_variables).await?
-            {
-                log_dir_name = name;
-                mount_variables.insert("log_dir_name".to_string(), log_dir_name.clone());
-                resolved_host_path = resolve_host_path(&mount_variables);
-                resolved_container_path = resolve_container_path(&mount_variables);
-            }
+        if reclaimable {
+            log_dir_name = create_reclaimable_directory(mount_config, &mount_variables).await?;
+            mount_variables.insert("log_dir_name".to_string(), log_dir_name.clone());
+            resolved_host_path = resolve_host_path(&mount_variables);
+            resolved_container_path = resolve_container_path(&mount_variables);
+            pending_binds.claim(Path::new(&resolved_host_path));
         }
 
-        // 确保目录存在（仅对非只读挂载创建目录；日志目录在上面已经新建）
+        // 确保目录存在（仅对非只读挂载创建目录；日志域里的目录在上面已经新建）
         // 重要：Docker bind mount 要求宿主机路径必须存在
         //
         // 由于代码运行在容器内，无法直接访问宿主机路径（如 /Volumes/soddygo/...）
@@ -174,7 +175,7 @@ pub(super) async fn add_config_mounts(
         //
         // 策略：必须配置 resolve_from 才能正确创建目录
         // 使用 resolve_from + 相对路径 来创建目录
-        if !mount_config.read_only && !log_mount {
+        if !mount_config.read_only && !reclaimable {
             if let Some(ref resolve_from_path) = mount_config.resolve_from {
                 // host_path 模板里 {resolved_path} 之后的部分，例如 "/{project_id}"
                 let relative_part = path_after_resolved_base(mount_config, &mount_variables);
@@ -206,9 +207,8 @@ pub(super) async fn add_config_mounts(
             }
         }
 
-        // 如果是日志挂载，添加环境变量。CONTAINER_LOGS_DIR 写实际挂载点（变量已替换）：builder
-        // 重启靠它认出归档里的日志挂载
-        if log_mount {
+        // 日志挂载的环境变量。CONTAINER_LOGS_DIR 写实际挂载点（变量已替换）
+        if sets_log_env(mount_config) {
             builder = builder.env("CONTAINER_LOGS_DIR", &resolved_container_path);
             builder = builder.env("CONTAINER_LOG_NAME", &log_dir_name);
         }
