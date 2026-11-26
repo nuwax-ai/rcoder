@@ -2,16 +2,40 @@
 //!
 //! `apply_auto_mounts`：workspace 隔离挂载 auto-inject（service_type/隔离级别
 //! 决定挂载策略）+ config mounts 解析（冲突检测/宿主目录预创建/日志挂载 env）。
+//!
+//! 日志挂载（容器内路径带 `container-logs`）的目录是一次性的：每个容器绑定的都是启动它
+//! 时独占新建的目录，已存在的同名目录不复用（见 `crate::log_directory`）。日志清理器据此
+//! 不必和这里的挂载准备互斥。
 
 use std::collections::HashMap;
+
 use std::str::FromStr;
 
+use async_trait::async_trait;
 use tracing::{debug, info, warn};
 
 use crate::DockerError;
 use crate::container_builder::ContainerConfigBuilder;
-use chrono::Utc;
-use shared_types::{IsolationType, ServiceImageConfig, ServiceType};
+use shared_types::{IsolationType, ServiceImageConfig, ServiceMountConfig, ServiceType};
+
+/// 日志目录名在 `host_path` 模板里的变量
+const LOG_DIR_NAME_VARIABLE: &str = "{log_dir_name}";
+
+/// 把 RCoder 进程里的路径换算成宿主机路径
+#[async_trait]
+pub(super) trait HostPathLookup: Send + Sync {
+    async fn host_path(&self, container_path: &str) -> crate::DockerResult<std::path::PathBuf>;
+}
+
+/// 按 RCoder 所在容器的挂载表换算；deploy-host 形态下进程路径就是宿主机路径
+pub(super) struct ProcessMounts;
+
+#[async_trait]
+impl HostPathLookup for ProcessMounts {
+    async fn host_path(&self, container_path: &str) -> crate::DockerResult<std::path::PathBuf> {
+        crate::path::resolve_container_path_to_host(std::path::Path::new(container_path)).await
+    }
+}
 
 /// 挂载构建所需上下文（start() 的局部变量打包）。
 pub(super) struct MountContext<'a> {
@@ -33,6 +57,7 @@ pub(super) struct MountContext<'a> {
 pub(super) async fn apply_auto_mounts(
     mut builder: ContainerConfigBuilder,
     ctx: &MountContext<'_>,
+    lookup: &dyn HostPathLookup,
 ) -> crate::DockerResult<ContainerConfigBuilder> {
     let container_id = ctx.container_id;
     let container_prefix = ctx.container_prefix;
@@ -59,9 +84,7 @@ pub(super) async fn apply_auto_mounts(
     let mut auto_injected_paths: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
-    match crate::path::resolve_container_path_to_host(std::path::Path::new(&workspace_resolution))
-        .await
-    {
+    match lookup.host_path(workspace_resolution).await {
         Ok(workspace_host_path) => {
             let (host_sub, container_mount) = if pod_id.is_some() {
                 // pod_id 有值：根据 isolation_type 决定挂载级别
@@ -289,8 +312,9 @@ pub(super) async fn apply_auto_mounts(
     let container_name =
         crate::utils::DockerUtils::generate_container_name(container_prefix, container_id)
             .map_err(DockerError::ConfigurationError)?;
-    let timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
-    let log_dir_name = format!("{}-{}", container_name, timestamp);
+    let now = chrono::Utc::now();
+    let timestamp = now.format("%Y%m%d%H%M%S").to_string();
+    let log_dir_name = crate::log_directory::log_directory_name(&container_name, now);
 
     // 设置命令（放在获取 container_name 之后，因为会移动 service_config.command）
     builder = builder.command(service_config.command.clone());
@@ -330,11 +354,7 @@ pub(super) async fn apply_auto_mounts(
                 Some(cached.clone())
             } else {
                 // 解析 resolve_from 路径到宿主机基础路径
-                match crate::path::resolve_container_path_to_host(std::path::Path::new(
-                    resolve_from_path,
-                ))
-                .await
-                {
+                match lookup.host_path(resolve_from_path).await {
                     Ok(host_base_path) => {
                         info!(
                             "[DOCKER_MGR] Resolved from {} to host path: {}",
@@ -373,8 +393,15 @@ pub(super) async fn apply_auto_mounts(
             }
         }
 
-        // 解析宿主机路径中的变量
-        let resolved_host_path = mount_config.resolve_host_path(&mount_variables);
+        // 解析宿主机路径中的变量，并用 PathBuf 规范化（消除多余的斜杠）
+        let resolve_host_path = |variables: &HashMap<String, String>| {
+            std::path::PathBuf::from(mount_config.resolve_host_path(variables))
+                .components()
+                .collect::<std::path::PathBuf>()
+                .to_string_lossy()
+                .to_string()
+        };
+        let mut resolved_host_path = resolve_host_path(&mount_variables);
 
         // 检查是否还有未替换的变量（如 {logs_host_path} 等）
         if resolved_host_path.contains('{') && resolved_host_path.contains('}') {
@@ -385,26 +412,44 @@ pub(super) async fn apply_auto_mounts(
             continue;
         }
 
-        // 使用 PathBuf 规范化路径（消除多余的斜杠）
-        let resolved_host_path = std::path::PathBuf::from(&resolved_host_path)
-            .components()
-            .collect::<std::path::PathBuf>()
-            .to_string_lossy()
-            .to_string();
-
         // 解析容器路径中的变量
-        let mut resolved_container_path = mount_config.container_path.clone();
-        for (key, value) in &mount_variables {
-            resolved_container_path =
-                resolved_container_path.replace(&format!("{{{}}}", key), value);
-        }
+        let resolve_container_path =
+            |values: &HashMap<String, String>| substitute(&mount_config.container_path, values);
+        let mut resolved_container_path = resolve_container_path(&mount_variables);
 
         info!(
             "Adding mount point: {} -> {} (read_only: {})",
             resolved_host_path, resolved_container_path, mount_config.read_only
         );
 
-        // 确保目录存在（仅对非只读挂载创建目录）
+        // 冲突检测：如果 config 挂载的 container_path 与 auto-inject 重复，丢弃 config 挂载
+        if auto_injected_paths.contains(&resolved_container_path) {
+            warn!(
+                "[DOCKER_MGR] Skipping config mount (conflicts with auto-inject): \
+                 {} -> {}",
+                resolved_container_path, resolved_host_path
+            );
+            continue;
+        }
+
+        let log_mount = is_log_mount(mount_config);
+
+        // 日志目录一次性使用：独占新建这个容器的日志目录。同名目录已存在时会换个名字，
+        // 绑定的路径和 CONTAINER_LOG_NAME 都跟着用最终的名字
+        let mut log_dir_name = log_dir_name.clone();
+        if log_mount {
+            require_new_log_directory(mount_config)?;
+            if !mount_config.read_only
+                && let Some(name) = create_log_directory(mount_config, &mount_variables).await?
+            {
+                log_dir_name = name;
+                mount_variables.insert("log_dir_name".to_string(), log_dir_name.clone());
+                resolved_host_path = resolve_host_path(&mount_variables);
+                resolved_container_path = resolve_container_path(&mount_variables);
+            }
+        }
+
+        // 确保目录存在（仅对非只读挂载创建目录；日志目录在上面已经新建）
         // 重要：Docker bind mount 要求宿主机路径必须存在
         //
         // 由于代码运行在容器内，无法直接访问宿主机路径（如 /Volumes/soddygo/...）
@@ -412,40 +457,15 @@ pub(super) async fn apply_auto_mounts(
         //
         // 策略：必须配置 resolve_from 才能正确创建目录
         // 使用 resolve_from + 相对路径 来创建目录
-        if !mount_config.read_only {
+        if !mount_config.read_only && !log_mount {
             if let Some(ref resolve_from_path) = mount_config.resolve_from {
-                // 非 pod 模式：从 host_path 模板中提取相对路径部分
-                // host_path 格式通常是 "{resolved_path}/{variable}"
-                // 我们需要取 {resolved_path} 之后的部分，并拼接到 resolve_from 上
-                let host_path_template = &mount_config.host_path;
-                let relative_part = if host_path_template.starts_with("{resolved_path}") {
-                    // 提取 {resolved_path} 之后的模板部分并替换变量
-                    let suffix = host_path_template
-                        .strip_prefix("{resolved_path}")
-                        .unwrap_or("");
-                    let mut resolved_suffix = suffix.to_string();
-                    for (key, value) in &mount_variables {
-                        resolved_suffix = resolved_suffix.replace(&format!("{{{}}}", key), value);
-                    }
-                    resolved_suffix
-                } else {
-                    // 如果不是以 {resolved_path} 开头，尝试计算相对路径
-                    // 这种情况不太常见，使用空字符串作为后备
-                    String::new()
-                };
-
-                // 构建预创建路径。容器形态：容器内路径（compose bind 双向同步
-                // 宿主机，rcoder 进程经挂载卷可写）。deploy-host：rcoder 进程即
-                // 宿主机进程，直接在 bind 源（resolved_host_path + 相对部分）
-                // 创建——容器常量路径在宿主机常为只读根。
-                #[cfg(feature = "deploy-host")]
-                let create_path = if shared_types::is_deploy_host() {
-                    format!("{}{}", resolved_host_path, relative_part)
-                } else {
-                    format!("{}{}", resolve_from_path, relative_part)
-                };
-                #[cfg(not(feature = "deploy-host"))]
-                let create_path = format!("{}{}", resolve_from_path, relative_part);
+                // host_path 模板里 {resolved_path} 之后的部分，例如 "/{project_id}"
+                let relative_part = path_after_resolved_base(mount_config, &mount_variables);
+                let create_path = directory_visible_to_this_process(
+                    &resolved_host_path,
+                    resolve_from_path,
+                    &relative_part,
+                );
                 debug!(
                     "Creating directory using container path: {} (resolve_from: {}, relative: {})",
                     create_path, resolve_from_path, relative_part
@@ -469,16 +489,6 @@ pub(super) async fn apply_auto_mounts(
             }
         }
 
-        // 冲突检测：如果 config 挂载的 container_path 与 auto-inject 重复，丢弃 config 挂载
-        if auto_injected_paths.contains(&resolved_container_path) {
-            warn!(
-                "[DOCKER_MGR] Skipping config mount (conflicts with auto-inject): \
-                 {} -> {}",
-                resolved_container_path, resolved_host_path
-            );
-            continue;
-        }
-
         builder = builder.add_mount(crate::MountPoint {
             host_path: resolved_host_path,
             container_path: resolved_container_path,
@@ -486,11 +496,425 @@ pub(super) async fn apply_auto_mounts(
         });
 
         // 如果是日志挂载，添加环境变量
-        if mount_config.container_path.contains("container-logs") {
+        if log_mount {
             builder = builder.env("CONTAINER_LOGS_DIR", &mount_config.container_path);
             builder = builder.env("CONTAINER_LOG_NAME", &log_dir_name);
         }
     }
 
     Ok(builder)
+}
+
+/// 把模板里的 `{变量}` 换成 `values` 里的值
+fn substitute(template: &str, values: &HashMap<String, String>) -> String {
+    values
+        .iter()
+        .fold(template.to_owned(), |rendered, (key, value)| {
+            rendered.replace(&format!("{{{key}}}"), value)
+        })
+}
+
+/// 这条挂载是不是容器的日志目录：容器内的路径带 `container-logs`
+fn is_log_mount(mount_config: &ServiceMountConfig) -> bool {
+    mount_config.container_path.contains("container-logs")
+}
+
+/// 日志挂载必须绑定 `{log_dir_name}` 目录。绑别的目录等于让新容器复用一个已经存在的目录，
+/// 它可能已经过期、正被日志清理器回收
+fn require_new_log_directory(mount_config: &ServiceMountConfig) -> crate::DockerResult<()> {
+    if mount_config.host_path.ends_with(LOG_DIR_NAME_VARIABLE) {
+        return Ok(());
+    }
+    Err(DockerError::ConfigurationError(format!(
+        "Log mount {} must bind a new directory whose name ends with {}; its host path {:?} does not",
+        mount_config.container_path, LOG_DIR_NAME_VARIABLE, mount_config.host_path
+    )))
+}
+
+/// 日志目录一次性使用：独占新建这个容器的日志目录，返回最终的名字。
+///
+/// 返回 `None` 表示不由 RCoder 建：没配 `resolve_from`，或者建目录时出了错。两种情况都沿用
+/// 首选的名字，目录由 Docker 在创建容器时补建（建不出来会告警）。名字全被占不在此列：
+/// 沿用哪个都是复用旧目录，直接拒绝。
+async fn create_log_directory(
+    mount_config: &ServiceMountConfig,
+    variables: &HashMap<String, String>,
+) -> crate::DockerResult<Option<String>> {
+    let (Some(resolve_from), Some(resolved_base)) = (
+        mount_config.resolve_from.as_deref(),
+        variables.get("resolved_path"),
+    ) else {
+        return Ok(None);
+    };
+    let suffix = path_after_resolved_base(mount_config, variables);
+    let create_path = directory_visible_to_this_process(resolved_base, resolve_from, &suffix);
+    let (Some(parent), Some(preferred)) = (
+        std::path::Path::new(&create_path).parent(),
+        std::path::Path::new(&create_path)
+            .file_name()
+            .and_then(|name| name.to_str()),
+    ) else {
+        return Err(DockerError::ConfigurationError(format!(
+            "Log mount {} has no directory to create: {:?}",
+            mount_config.container_path, create_path
+        )));
+    };
+    match crate::log_directory::create_fresh_directory(parent, preferred).await {
+        Ok(created) => Ok(created
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)),
+        Err(error @ crate::log_directory::FreshDirectoryError::Exhausted) => {
+            Err(DockerError::ContainerCreationError(format!(
+                "Cannot create a new log directory for mount {}: {error} ({})",
+                mount_config.container_path,
+                parent.display()
+            )))
+        }
+        Err(crate::log_directory::FreshDirectoryError::Io(error)) => {
+            warn!(
+                "[DOCKER_MGR] createdmountdirectoryfailed: {} - {}",
+                create_path, error
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// `host_path` 模板里 `{resolved_path}` 之后的部分，变量已替换；模板不是以 `{resolved_path}`
+/// 开头时为空
+fn path_after_resolved_base(
+    mount_config: &ServiceMountConfig,
+    values: &HashMap<String, String>,
+) -> String {
+    substitute(
+        mount_config
+            .host_path
+            .strip_prefix("{resolved_path}")
+            .unwrap_or(""),
+        values,
+    )
+}
+
+/// RCoder 进程里用来建目录的路径，它对应宿主机上的 `host_path`（`{resolved_path}` 之后的
+/// 部分是 `suffix`）。
+///
+/// 容器形态：用容器内的路径（compose bind 双向同步宿主机，rcoder 进程经挂载卷可写）。
+/// deploy-host：rcoder 进程即宿主机进程，直接在 bind 源上创建——容器常量路径在宿主机常为
+/// 只读根。
+fn directory_visible_to_this_process(host_path: &str, resolve_from: &str, suffix: &str) -> String {
+    #[cfg(feature = "deploy-host")]
+    if shared_types::is_deploy_host() {
+        return host_path.to_owned();
+    }
+    #[cfg(not(feature = "deploy-host"))]
+    let _ = host_path;
+    format!("{resolve_from}{suffix}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    const CONTAINER: &str = "computer-agent-runner-user_42";
+
+    /// 一次测试用的目录布局：`host` 是 daemon 看到的日志总根，`visible` 是同一个目录在 RCoder
+    /// 进程里的样子（一个符号链接）
+    struct Layout {
+        root: tempfile::TempDir,
+    }
+
+    impl Layout {
+        fn new() -> Self {
+            let layout = Self {
+                root: tempfile::tempdir().unwrap(),
+            };
+            std::fs::create_dir_all(layout.host_log_root()).unwrap();
+            std::fs::create_dir(layout.root.path().join("visible")).unwrap();
+            std::os::unix::fs::symlink("../host/container", layout.visible_log_root()).unwrap();
+            layout
+        }
+
+        fn host_log_root(&self) -> PathBuf {
+            self.root.path().join("host/container")
+        }
+
+        fn visible_log_root(&self) -> PathBuf {
+            self.root.path().join("visible/container")
+        }
+    }
+
+    /// 假的路径换算：只有日志总根解析得出来，别的路径一律失败（工作区挂载因此被跳过）
+    struct FakeLookup {
+        visible: PathBuf,
+        host: PathBuf,
+    }
+
+    #[async_trait]
+    impl HostPathLookup for FakeLookup {
+        async fn host_path(&self, container_path: &str) -> crate::DockerResult<PathBuf> {
+            if container_path == self.visible.to_str().unwrap() {
+                Ok(self.host.clone())
+            } else {
+                Err(DockerError::ConfigurationError(format!(
+                    "no host path for {container_path}"
+                )))
+            }
+        }
+    }
+
+    fn mount(
+        container_path: &str,
+        host_path: &str,
+        read_only: bool,
+        resolve_from: &Path,
+    ) -> ServiceMountConfig {
+        ServiceMountConfig {
+            container_path: container_path.into(),
+            host_path: host_path.into(),
+            read_only,
+            mount_type: "bind".into(),
+            resolve_from: Some(resolve_from.to_str().unwrap().into()),
+        }
+    }
+
+    fn log_mount(layout: &Layout) -> ServiceMountConfig {
+        mount(
+            "/app/container-logs",
+            "{resolved_path}/{log_dir_name}",
+            false,
+            &layout.visible_log_root(),
+        )
+    }
+
+    async fn apply(
+        layout: &Layout,
+        mounts: Vec<ServiceMountConfig>,
+    ) -> crate::DockerResult<crate::DockerContainerConfig> {
+        let service_config: ServiceImageConfig = serde_json::from_value(serde_json::json!({
+            "service_type": "computer-agent-runner",
+            "enabled": true,
+            "mounts": mounts,
+        }))
+        .unwrap();
+        let variables = HashMap::new();
+        let ctx = MountContext {
+            container_id: "user_42",
+            container_prefix: "computer-agent-runner",
+            service_config: &service_config,
+            variables: &variables,
+            workspace_resolution: "/app/computer-project-workspace",
+            workspace_container: "/home/user",
+            service_type: &ServiceType::ComputerAgentRunner,
+            isolation_type: None,
+            project_id: None,
+            user_id: Some("user_42"),
+            pod_id: None,
+            tenant_id: None,
+            space_id: None,
+        };
+        apply_auto_mounts(
+            ContainerConfigBuilder::new("user_42"),
+            &ctx,
+            &FakeLookup {
+                visible: layout.visible_log_root(),
+                host: layout.host_log_root(),
+            },
+        )
+        .await?
+        .build()
+    }
+
+    fn only_mount(config: &crate::DockerContainerConfig) -> &crate::MountPoint {
+        let [mount] = config.extra_mounts.as_slice() else {
+            panic!("expected exactly one mount: {:?}", config.extra_mounts)
+        };
+        mount
+    }
+
+    fn file_name(path: &str) -> &str {
+        Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
+    }
+
+    fn entries(directory: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_str().unwrap().to_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// 占住接下来几秒里可能用到的名字：首选名，以及 `fallbacks` 个备选名
+    fn take_upcoming_names(layout: &Layout, fallbacks: u32) {
+        let now = chrono::Utc::now();
+        for seconds in [-1, 0, 1, 2] {
+            let stamp = (now + chrono::Duration::seconds(seconds)).format("%Y%m%d%H%M%S");
+            std::fs::create_dir_all(layout.host_log_root().join(format!("{CONTAINER}-{stamp}")))
+                .unwrap();
+            for attempt in 2..=fallbacks {
+                std::fs::create_dir_all(
+                    layout
+                        .host_log_root()
+                        .join(format!("{CONTAINER}-{stamp}-{attempt}")),
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_container_gets_a_log_directory_of_its_own() {
+        let layout = Layout::new();
+
+        let config = apply(&layout, vec![log_mount(&layout)]).await.unwrap();
+
+        let mount = only_mount(&config);
+        assert_eq!(mount.container_path, "/app/container-logs");
+        assert!(!mount.read_only);
+        let name = file_name(&mount.host_path);
+        assert_eq!(
+            name.strip_prefix(CONTAINER).map(str::len),
+            Some(15),
+            "the directory is named after the container and the UTC second: {name}"
+        );
+        assert_eq!(
+            mount.host_path,
+            layout.host_log_root().join(name).to_str().unwrap()
+        );
+        assert!(layout.host_log_root().join(name).is_dir());
+        assert_eq!(
+            config
+                .env_vars
+                .get("CONTAINER_LOGS_DIR")
+                .map(String::as_str),
+            Some("/app/container-logs")
+        );
+        assert_eq!(
+            config
+                .env_vars
+                .get("CONTAINER_LOG_NAME")
+                .map(String::as_str),
+            Some(name)
+        );
+        assert_eq!(entries(&layout.host_log_root()), [name.to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn an_existing_log_directory_is_never_bound_again() {
+        let layout = Layout::new();
+        take_upcoming_names(&layout, 2);
+
+        let config = apply(&layout, vec![log_mount(&layout)]).await.unwrap();
+
+        let mount = only_mount(&config);
+        let name = file_name(&mount.host_path);
+        assert!(
+            name.ends_with("-3"),
+            "the preferred name and the first fallback are taken: {name}"
+        );
+        assert!(layout.host_log_root().join(name).is_dir());
+        assert_eq!(
+            config
+                .env_vars
+                .get("CONTAINER_LOG_NAME")
+                .map(String::as_str),
+            Some(name),
+            "the container is told the name that was actually bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_log_directory_that_cannot_get_a_fresh_name_is_refused() {
+        let layout = Layout::new();
+        take_upcoming_names(&layout, crate::log_directory::NAME_ATTEMPTS);
+
+        let error = apply(&layout, vec![log_mount(&layout)]).await.unwrap_err();
+
+        assert!(
+            matches!(&error, DockerError::ContainerCreationError(message) if message.contains("Cannot create a new log directory")),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_log_mount_that_reuses_a_directory_is_rejected() {
+        let layout = Layout::new();
+        let shared = mount(
+            "/app/container-logs",
+            "{resolved_path}/shared",
+            false,
+            &layout.visible_log_root(),
+        );
+
+        let error = apply(&layout, vec![shared]).await.unwrap_err();
+
+        assert!(
+            matches!(&error, DockerError::ConfigurationError(message) if message.contains("must bind a new directory whose name ends with {log_dir_name}")),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_only_log_mount_is_not_created_here() {
+        let layout = Layout::new();
+        let read_only = ServiceMountConfig {
+            read_only: true,
+            ..log_mount(&layout)
+        };
+
+        let config = apply(&layout, vec![read_only]).await.unwrap();
+
+        let mount = only_mount(&config);
+        assert!(mount.read_only);
+        let name = file_name(&mount.host_path);
+        assert_eq!(name.strip_prefix(CONTAINER).map(str::len), Some(15));
+        assert!(
+            !layout.host_log_root().join(name).exists(),
+            "a read-only mount is left for Docker to create"
+        );
+        assert_eq!(
+            config
+                .env_vars
+                .get("CONTAINER_LOG_NAME")
+                .map(String::as_str),
+            Some(name)
+        );
+    }
+
+    /// 别的挂载不受影响：目录已经存在就沿用
+    #[tokio::test]
+    async fn other_mounts_keep_using_the_existing_directory() {
+        let layout = Layout::new();
+        let wallpaper = layout.host_log_root().join("wallpaper");
+        std::fs::create_dir_all(&wallpaper).unwrap();
+        std::fs::write(wallpaper.join("keep.txt"), b"kept").unwrap();
+
+        let config = apply(
+            &layout,
+            vec![mount(
+                "/app/wallpaper",
+                "{resolved_path}/wallpaper",
+                false,
+                &layout.visible_log_root(),
+            )],
+        )
+        .await
+        .unwrap();
+
+        let mount = only_mount(&config);
+        assert_eq!(mount.container_path, "/app/wallpaper");
+        assert_eq!(
+            mount.host_path,
+            wallpaper.to_str().unwrap(),
+            "the bind is the existing directory itself"
+        );
+        assert_eq!(std::fs::read(wallpaper.join("keep.txt")).unwrap(), b"kept");
+        assert_eq!(entries(&wallpaper), ["keep.txt".to_owned()]);
+        assert!(!config.env_vars.contains_key("CONTAINER_LOG_NAME"));
+    }
 }

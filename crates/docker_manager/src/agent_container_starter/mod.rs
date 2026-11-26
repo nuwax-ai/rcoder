@@ -352,7 +352,6 @@ impl<'a> AgentContainerStarter<'a> {
         let network_name = self.manager.get_main_network_name().await;
         builder = builder.network_name(network_name);
 
-        let log_mount_guard = crate::LOG_MOUNT_GATE.read().await;
         let builder = mounts::apply_auto_mounts(
             builder,
             &mounts::MountContext {
@@ -370,6 +369,7 @@ impl<'a> AgentContainerStarter<'a> {
                 tenant_id: tenant_id.as_deref(),
                 space_id: space_id.as_deref(),
             },
+            &mounts::ProcessMounts,
         )
         .await?;
 
@@ -391,7 +391,6 @@ impl<'a> AgentContainerStarter<'a> {
         // Never cancel this future: Docker may still be creating or starting
         // the container. Only acknowledged writes permit handing over the lease.
         let created = self.manager.create_container(config).await?;
-        drop(log_mount_guard);
         if is_cancelled() {
             return Err(DockerError::BuilderCreationCancelled);
         }
