@@ -246,3 +246,32 @@ async fn a_deferred_sweep_that_deleted_something_is_not_stalled() {
     );
     fixture.close().await;
 }
+
+/// 日志目录整体卡住（连初次扫描都不返回）时，一轮日志清理到时间上限就放弃，不把清扫
+/// 任务一起停掉；也不在下一轮马上重试——底层还没返回的阻塞调用仍占着线程。
+#[tokio::test]
+async fn a_hung_log_cleanup_is_abandoned_at_the_deadline_and_waits_for_the_next_interval() {
+    let mut fixture = Fixture::new(0).await;
+    let log_dir = std::path::PathBuf::from(&fixture.cleaner.config.log_dir);
+    let expired = aged_log_dir(&log_dir, "runner-expired");
+    fixture
+        .cleaner
+        .log_cleaner
+        .set_scan_delay(Duration::from_secs(3));
+    fixture
+        .cleaner
+        .set_log_cleanup_sweep_timeout(Duration::from_millis(50));
+
+    let started = std::time::Instant::now();
+    fixture.cleaner.cleanup_once().await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the sweep must not wait for the hung scan"
+    );
+    assert!(
+        !fixture.cleaner.log_cleanup_due(),
+        "a hung run must not be retried on the very next sweep"
+    );
+    assert!(expired.exists());
+    fixture.close().await;
+}

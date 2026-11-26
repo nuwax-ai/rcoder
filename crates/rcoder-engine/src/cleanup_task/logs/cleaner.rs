@@ -36,6 +36,9 @@
 //! 超时记录带过期时间（[`RECHECK_TIMEOUT_MEMORY`]），不长期占着内存：隔离中的目录过了这段
 //! 时间，后面的日志清理会再试一次；文件系统恢复了它就被正常回收，仍然卡住就再隔离一轮。
 //! 隔离不触发重试，所以"再试一次"是下一次日志清理（默认一天之后）。
+//!
+//! 隔离在**初次扫描**里就生效：已隔离的目录连第一次 metadata 都不读。复查和初次扫描读的是
+//! 同一个目录的同类调用，上一次卡在复查的目录，下一轮很可能连扫描都卡住。
 
 use moka::ops::compute::{CompResult, Op};
 use std::path::{Path, PathBuf};
@@ -99,6 +102,9 @@ pub struct LogCleaner {
     /// 复查之前先等这么久（毫秒）。测试用：模拟卡住的文件系统，中途可以改
     #[cfg(test)]
     recheck_delay_ms: std::sync::atomic::AtomicU64,
+    /// 初次扫描读每个条目的 metadata 之前先等这么久（毫秒）。测试用
+    #[cfg(test)]
+    scan_delay_ms: std::sync::atomic::AtomicU64,
 }
 
 impl LogCleaner {
@@ -125,6 +131,8 @@ impl LogCleaner {
             fail_deletions: false,
             #[cfg(test)]
             recheck_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            scan_delay_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -152,6 +160,15 @@ impl LogCleaner {
     #[cfg(test)]
     pub(super) fn set_recheck_delay(&self, delay: Duration) {
         self.recheck_delay_ms.store(
+            delay.as_millis() as u64,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// 测试用：初次扫描读 metadata 之前先等 `delay`，模拟卡住的文件系统
+    #[cfg(test)]
+    pub(in crate::cleanup_task) fn set_scan_delay(&self, delay: Duration) {
+        self.scan_delay_ms.store(
             delay.as_millis() as u64,
             std::sync::atomic::Ordering::SeqCst,
         );
@@ -229,10 +246,24 @@ impl LogCleaner {
         };
 
         let mut expired_dirs = Vec::new();
+        let mut quarantined = Vec::new();
 
         // 遍历目录中的文件和子目录
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
+            // 已隔离的目录连第一次 metadata 都不读：卡住复查的是同类调用，读它可能连扫描
+            // 一起卡住，后面的目录和整个清扫任务都跟着停
+            if self.is_quarantined(&path) {
+                quarantined.push(path);
+                continue;
+            }
+            #[cfg(test)]
+            {
+                let delay_ms = self.scan_delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+                if delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+            }
             let metadata = match entry.metadata().await {
                 Ok(m) => m,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -289,6 +320,15 @@ impl LogCleaner {
             }
         }
 
+        if !quarantined.is_empty() {
+            stats.dirs_quarantined = quarantined.len() as u64;
+            warn!(
+                count = quarantined.len(),
+                paths = %summarize_paths(&quarantined),
+                "[log_cleaner] Keeping expired directories whose re-check kept timing out; they stay quarantined until their timeout records expire",
+            );
+        }
+
         self.reclaim_expired_dirs(expired_dirs, cutoff_time, &mut stats)
             .await;
 
@@ -312,11 +352,6 @@ impl LogCleaner {
         cutoff: u64,
         stats: &mut LogCleanupStats,
     ) {
-        if candidates.is_empty() {
-            return;
-        }
-        // 已隔离的候选不占预算、不取锁：保留目录、计数、告警，其余目录照常回收
-        let candidates = self.without_quarantined(candidates, stats);
         if candidates.is_empty() {
             return;
         }
@@ -465,39 +500,11 @@ impl LogCleaner {
         }
     }
 
-    /// 去掉已隔离的候选，把它们计入本轮的隔离数。返回的顺序不变
-    fn without_quarantined(
-        &self,
-        candidates: Vec<PathBuf>,
-        stats: &mut LogCleanupStats,
-    ) -> Vec<PathBuf> {
-        if self.recheck_timeouts.iter().next().is_none() {
-            return candidates;
-        }
-        let mut quarantined = Vec::new();
-        let remaining = candidates
-            .into_iter()
-            .filter(|path| {
-                // 读不会延长记录的寿命：隔离中的目录到了时间一定会被重新尝试
-                let quarantined_already = self
-                    .recheck_timeouts
-                    .get(path)
-                    .is_some_and(|sweeps| sweeps >= RECHECK_TIMEOUT_QUARANTINE_SWEEPS);
-                if quarantined_already {
-                    quarantined.push(path.clone());
-                }
-                !quarantined_already
-            })
-            .collect();
-        if !quarantined.is_empty() {
-            stats.dirs_quarantined = quarantined.len() as u64;
-            warn!(
-                count = quarantined.len(),
-                paths = %summarize_paths(&quarantined),
-                "[log_cleaner] Keeping expired directories whose re-check kept timing out; they stay quarantined until their timeout records expire",
-            );
-        }
-        remaining
+    /// 这个目录是否在隔离中。读不会延长记录的寿命：隔离中的目录到了时间一定会被重新尝试
+    fn is_quarantined(&self, path: &Path) -> bool {
+        self.recheck_timeouts
+            .get(path)
+            .is_some_and(|sweeps| sweeps >= RECHECK_TIMEOUT_QUARANTINE_SWEEPS)
     }
 
     /// 记一次复查超时，记录的保留时间从此刻重新起算。刚达到隔离轮数时返回轮数，

@@ -863,3 +863,31 @@ async fn timeout_records_expire_so_a_quarantined_directory_is_tried_again() {
     assert_eq!(stats.dirs_deleted, 1);
     assert!(!expired.exists());
 }
+
+/// 隔离在初次扫描里就生效：已隔离的目录连第一次 metadata 都不读。读它的是和复查同类的
+/// 调用，上一次卡在复查的目录，下一轮很可能连扫描都卡住。
+#[tokio::test]
+async fn a_quarantined_directory_is_skipped_before_its_metadata_is_read() {
+    let root = TempDir::new().unwrap();
+    let stuck = aged_dir(root.path(), "runner-stuck", 15);
+    let inventory = FakeInventory::new(&[]);
+    let cleaner = cleaner(root.path(), inventory.clone())
+        .with_reclaim_budget(Duration::from_millis(40))
+        .with_fair_recheck_window(Duration::from_millis(20))
+        .with_recheck_delay(Duration::from_secs(3));
+    for _ in 0..3 {
+        cleaner.cleanup_once().await.unwrap();
+    }
+
+    // 文件系统继续恶化：现在连初次扫描的 metadata 都卡住
+    cleaner.set_scan_delay(Duration::from_secs(3));
+    let started = std::time::Instant::now();
+    let stats = cleaner.cleanup_once().await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "a quarantined directory must not be touched by the scan"
+    );
+    assert_eq!(stats.dirs_quarantined, 1);
+    assert_eq!(inventory.calls(), 3);
+    assert!(stuck.is_dir());
+}
