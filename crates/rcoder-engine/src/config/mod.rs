@@ -132,6 +132,12 @@ pub struct AppConfig {
     /// 已死（无租约绑定 / 物理租约过期）→ 自动收束 Failed，不再永久占受理 slot。
     #[serde(default)]
     pub fence_settle_grace_secs: Option<u64>,
+    /// 无执行者围栏（历史版本数据/人工 SQL 产生的 RecoveryRequired）收束的
+    /// 超龄门槛（秒）；None/缺省 = 默认 60s（对齐租约 TTL，只需覆盖扫描周期
+    /// 与并发副本的竞争窗口）。这类围栏没有持有者，不存在在途写入需要等待；
+    /// 收束一律 Failed，不伪造任何运行时结果。
+    #[serde(default)]
+    pub unclaimed_settle_grace_secs: Option<u64>,
 }
 
 pub(crate) fn default_agent_id() -> String {
@@ -190,6 +196,7 @@ impl Default for AppConfig {
             },
             app_manager: app_manager::AppManagerConfig::default(),
             fence_settle_grace_secs: None,
+            unclaimed_settle_grace_secs: None,
         }
     }
 }

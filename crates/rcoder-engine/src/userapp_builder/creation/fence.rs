@@ -281,13 +281,12 @@ const UNCLAIMED_RELEASE_NOTE: &str =
 const DEFINITE_RELEASE_NOTE: &str = "physical state verified definite by recovery scanner";
 /// 围栏 holder 死亡兜底的默认超龄门槛（秒）：≫ 操作 deadline + 租约 TTL 60s。
 const DEFAULT_FENCE_SETTLE_GRACE_SECS: u64 = 900;
+/// 无执行者围栏的默认收束门槛（秒）：对齐租约 TTL，只需覆盖扫描周期与并发
+/// 副本的竞争窗口——这类围栏没有持有者，不存在在途写入需要等待。
+const DEFAULT_UNCLAIMED_SETTLE_GRACE_SECS: u64 = 60;
 
 /// 围栏是否已超过收束留出的宽限期（自 created_at 计龄，保守取更长的等待）。
-fn fence_exceeds_settle_grace(
-    grace_setting: Option<u64>,
-    record: &UserAppOperationRecord,
-) -> bool {
-    let grace_secs = grace_setting.unwrap_or(DEFAULT_FENCE_SETTLE_GRACE_SECS);
+fn fence_aged_beyond(record: &UserAppOperationRecord, grace_secs: u64) -> bool {
     let grace_us = i64::try_from(grace_secs.saturating_mul(1_000_000)).unwrap_or(i64::MAX);
     let now_us = chrono::Utc::now().timestamp_micros();
     now_us.saturating_sub(record.created_at.timestamp_micros()) >= grace_us
@@ -315,7 +314,11 @@ pub(crate) async fn holder_expired(state: &AppState, record: &UserAppOperationRe
     }
     // 计龄从 created_at 起算（记录仅暴露 created_at；created ≤ updated，
     // 保守取更长的等待）。
-    if !fence_exceeds_settle_grace(state.config.fence_settle_grace_secs, record) {
+    let grace = state
+        .config
+        .fence_settle_grace_secs
+        .unwrap_or(DEFAULT_FENCE_SETTLE_GRACE_SECS);
+    if !fence_aged_beyond(record, grace) {
         return false;
     }
     match state
@@ -413,7 +416,11 @@ pub(crate) async fn reconcile_fenced_ensure(
     // 永久占用受理槽：超龄后按"无人认领"收束为 Failed（只记账，不授权
     // 任何运行时工作），宽限期内保守等待。
     if record.executor_id.is_none() {
-        if !fence_exceeds_settle_grace(state.config.fence_settle_grace_secs, &record) {
+        let grace = state
+            .config
+            .unclaimed_settle_grace_secs
+            .unwrap_or(DEFAULT_UNCLAIMED_SETTLE_GRACE_SECS);
+        if !fence_aged_beyond(&record, grace) {
             tracing::warn!(
                 operation_id = %record.operation_id,
                 app_id = %record.app_id,
@@ -555,13 +562,31 @@ mod settle_grace_tests {
     }
 
     #[test]
-    fn default_grace_requires_age_beyond_900s() {
-        assert!(!fence_exceeds_settle_grace(None, &record_aged_secs(899)));
-        assert!(fence_exceeds_settle_grace(None, &record_aged_secs(901)));
+    fn holder_grace_defaults_to_900s() {
+        assert!(!fence_aged_beyond(
+            &record_aged_secs(899),
+            DEFAULT_FENCE_SETTLE_GRACE_SECS
+        ));
+        assert!(fence_aged_beyond(
+            &record_aged_secs(901),
+            DEFAULT_FENCE_SETTLE_GRACE_SECS
+        ));
+    }
+
+    #[test]
+    fn unclaimed_grace_defaults_to_60s() {
+        assert!(!fence_aged_beyond(
+            &record_aged_secs(59),
+            DEFAULT_UNCLAIMED_SETTLE_GRACE_SECS
+        ));
+        assert!(fence_aged_beyond(
+            &record_aged_secs(61),
+            DEFAULT_UNCLAIMED_SETTLE_GRACE_SECS
+        ));
     }
 
     #[test]
     fn zero_grace_settles_any_aged_record() {
-        assert!(fence_exceeds_settle_grace(Some(0), &record_aged_secs(1)));
+        assert!(fence_aged_beyond(&record_aged_secs(1), 0));
     }
 }
