@@ -28,4 +28,13 @@ impl LogDomain {
                 .is_ok_and(|under| !under.as_os_str().is_empty())
         })
     }
+
+    /// 一条 `源:挂载点[:选项]` 形式的 bind，它的源是否落在日志根之下。只看前缀，不切分
+    pub(crate) fn contains_bind_source(&self, bind: &str) -> bool {
+        let Some(root) = self.0.as_ref() else {
+            return false;
+        };
+        let under_root = format!("{}/", root.display());
+        bind.starts_with(under_root.as_str())
+    }
 }

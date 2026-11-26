@@ -2,11 +2,16 @@
 //!
 //! 假 daemon 按剧本逐步响应，并记下每个请求的正文。替代容器绑定了什么、带了哪些环境变量和
 //! label，都在创建请求的正文里，可以确定性地断言，不用靠 sleep 碰运气。
+//!
+//! 这里有假 daemon、恢复所需的输入和用例，以及不涉及日志目录的几条用例；替代容器的日志
+//! 目录在 [`log_directories`]。
 
 use super::*;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+mod log_directories;
 
 const ORIGINAL_UID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const REPLACEMENT_UID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -23,6 +28,8 @@ struct Step {
     contains: String,
     status: u16,
     body: Value,
+    /// 不应答，直接断开连接：模拟应答丢失
+    hang_up: bool,
 }
 
 fn step(method: &'static str, contains: impl Into<String>, status: u16, body: Value) -> Step {
@@ -31,6 +38,18 @@ fn step(method: &'static str, contains: impl Into<String>, status: u16, body: Va
         contains: contains.into(),
         status,
         body,
+        hang_up: false,
+    }
+}
+
+/// 应答丢失
+fn lost_reply(method: &'static str, contains: impl Into<String>) -> Step {
+    Step {
+        method,
+        contains: contains.into(),
+        status: 0,
+        body: Value::Null,
+        hang_up: true,
     }
 }
 
@@ -48,6 +67,15 @@ fn daemon_info() -> Value {
         ..Default::default()
     };
     serde_json::to_value(info).unwrap()
+}
+
+type RequestHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// 创建替代容器的剧本：原容器已不在，镜像就绪后创建
+fn creation_script(create: Step) -> Vec<Step> {
+    let mut script = absent_original();
+    script.extend(creation_prelude(create));
+    script
 }
 
 struct ScriptedDaemon {
@@ -87,6 +115,11 @@ impl ScriptedDaemon {
 }
 
 async fn scripted(steps: Vec<Step>) -> ScriptedDaemon {
+    scripted_with_hook(steps, Arc::new(|_: &str| {})).await
+}
+
+/// 假 daemon 按剧本应答，并在每个请求到达、应答之前调用 `hook`（传入请求行）
+async fn scripted_with_hook(steps: Vec<Step>, hook: RequestHook) -> ScriptedDaemon {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let mut script = std::collections::VecDeque::new();
@@ -137,11 +170,15 @@ async fn scripted(steps: Vec<Step>) -> ScriptedDaemon {
                 ));
             }
             let step = expected.filter(|_| matched);
-            recorded.lock().unwrap().push(request);
+            recorded.lock().unwrap().push(request.clone());
             recorded_bodies
                 .lock()
                 .unwrap()
                 .push(String::from_utf8_lossy(&body).into_owned());
+            hook(&request);
+            if step.as_ref().is_some_and(|step| step.hang_up) {
+                continue;
+            }
             let body = step.as_ref().map_or_else(
                 || no_such_container().to_string(),
                 |step| step.body.to_string(),
@@ -166,6 +203,14 @@ async fn scripted(steps: Vec<Step>) -> ScriptedDaemon {
 // ─── 恢复所需的输入 ─────────────────────────────────────────────────────────
 
 fn docker_manager(address: std::net::SocketAddr) -> Arc<crate::DockerManager> {
+    docker_manager_configured(address, crate::DockerManagerConfig::default())
+}
+
+/// 直接装配 `DockerManager`（不做容器自检）
+fn docker_manager_configured(
+    address: std::net::SocketAddr,
+    config: crate::DockerManagerConfig,
+) -> Arc<crate::DockerManager> {
     let (actor, containers) = crate::container_state_actor::ContainerStateActor::new();
     tokio::spawn(actor.run());
     Arc::new(crate::DockerManager {
@@ -175,24 +220,30 @@ fn docker_manager(address: std::net::SocketAddr) -> Arc<crate::DockerManager> {
             bollard::API_DEFAULT_VERSION,
         )
         .unwrap(),
-        config: crate::DockerManagerConfig::default(),
+        config,
         containers,
         main_network_name: Arc::new(tokio::sync::RwLock::new("test".into())),
         api_cache: Arc::new(crate::api_cache::DockerApiCache::new(600, 600, 100)),
     })
 }
 
+/// 挂载表里没有日志根：没有 bind 落在可回收的日志域里。不做容器自检
 fn runtime(address: std::net::SocketAddr) -> DockerRuntime {
-    DockerRuntime::new(docker_manager(address))
+    runtime_with_mounts(
+        address,
+        vec![(
+            PathBuf::from("/app/workspace"),
+            PathBuf::from("/restart-fence-workspace"),
+        )],
+    )
 }
 
-/// 用注入的挂载表构造运行时：RCoder 进程里的 `visible` 对应宿主机上的 `host`，不做容器自检
+/// 用注入的挂载表构造运行时：RCoder 进程里的路径对应宿主机上的路径，不做容器自检
 fn runtime_with_mounts(
     address: std::net::SocketAddr,
-    visible: PathBuf,
-    host: PathBuf,
+    mounts: Vec<(PathBuf, PathBuf)>,
 ) -> DockerRuntime {
-    let resolver = crate::HostPathResolver::from_mount_table(vec![(visible, host)]).unwrap();
+    let resolver = crate::HostPathResolver::from_mount_table(mounts).unwrap();
     DockerRuntime::with_log_path_resolver(docker_manager(address), resolver)
 }
 
@@ -339,135 +390,35 @@ fn creation_prelude(create: Step) -> Vec<Step> {
     ]
 }
 
-// ─── 带日志挂载的重启 ───────────────────────────────────────────────────────
-
-/// 一次带日志挂载的重启。`host` 是 daemon 看到的路径，`visible` 是同一批位置在 RCoder 进程里
-/// 的样子；两边各是真实的目录，靠注入的挂载表对应起来
-struct LoggedRestart {
-    root: tempfile::TempDir,
-    workspace: tempfile::TempDir,
-    template: BuilderRestartTemplate,
-    archive: Archive,
-    /// 原容器的日志目录（宿主机路径）
-    old_directory: String,
-    old_name: String,
-}
-
-impl LoggedRestart {
-    fn new() -> Self {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        let container = "rcoder-app-builder-265";
-        let old_name = format!("{container}-20251026080000");
-        let old_directory = root
-            .path()
-            .join("host/container")
-            .join(&old_name)
-            .to_string_lossy()
-            .into_owned();
-        std::fs::create_dir_all(&old_directory).unwrap();
-        std::fs::write(std::path::Path::new(&old_directory).join("old.log"), b"old").unwrap();
-        let template = template_for(vec![
-            host_path_volume(WORKSPACE_TARGET, &workspace.path().to_string_lossy()),
-            host_path_volume(LOG_TARGET, &old_directory),
-        ]);
-        let archive = archive_for(
-            &template,
-            vec![
-                format!("{old_directory}:{LOG_TARGET}:rw,z"),
-                format!("{}:{WORKSPACE_TARGET}", workspace.path().display()),
-            ],
-            vec![
-                format!("CONTAINER_LOGS_DIR={LOG_TARGET}"),
-                format!("CONTAINER_LOG_NAME={old_name}"),
-                "PATH=/usr/bin".into(),
-            ],
-        );
-        Self {
-            root,
-            workspace,
-            template,
-            archive,
-            old_directory,
-            old_name,
-        }
-    }
-
-    fn runtime(&self, address: std::net::SocketAddr) -> DockerRuntime {
-        runtime_with_mounts(
-            address,
-            self.root.path().join("visible/logs"),
-            self.root.path().join("host"),
-        )
-    }
-
-    /// RCoder 进程里新建日志目录的位置
-    fn visible_root(&self) -> PathBuf {
-        self.root.path().join("visible/logs/container")
-    }
-
-    /// 替代容器绑定的日志目录名：取自创建请求里的 bind
-    fn bound_log_name(&self, daemon: &ScriptedDaemon, request: usize) -> String {
-        let binds = daemon.body(request)["HostConfig"]["Binds"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        let target = format!(":{LOG_TARGET}");
-        let source = binds
-            .iter()
-            .filter_map(Value::as_str)
-            .find_map(|bind| bind.split_once(target.as_str()).map(|(source, _)| source))
-            .unwrap_or_else(|| panic!("no bind targets {LOG_TARGET}: {binds:?}"));
-        std::path::Path::new(source)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_owned()
-    }
-
-    fn expected_volumes(&self, log_source: &str) -> Vec<AppResourceIdentity> {
-        vec![
-            self.template.volumes[0].clone(),
-            host_path_volume(LOG_TARGET, log_source),
-        ]
-    }
-
-    /// 按 `self` 的模板和归档重放出替代容器
-    async fn restore(&self, daemon: &ScriptedDaemon) -> Result<Vec<AppResourceIdentity>> {
-        self.runtime(daemon.address)
-            .replace_builder_container(&self.template, &self.archive, original(&self.template))
-            .await
-    }
-}
-
-// ─── 用例 ───────────────────────────────────────────────────────────────────
+// ─── 用例：不涉及日志目录 ───────────────────────────────────────────────────
 
 #[tokio::test]
 async fn the_replacement_is_created_once_the_image_is_ready() {
     let workspace = tempfile::tempdir().unwrap();
     let template = restart_template(workspace.path());
     let archive = restart_archive(&template);
-    let mut script = absent_original();
-    script.extend(creation_prelude(step(
+    let daemon = scripted(creation_script(step(
         "POST",
         "/containers/create",
         200,
         created(),
-    )));
-    let daemon = scripted(script).await;
+    )))
+    .await;
     let runtime = runtime(daemon.address);
 
-    runtime
+    let replacement = runtime
         .replace_builder_container(&template, &archive, original(&template))
         .await
         .unwrap();
 
     daemon.assert_followed(5);
+    assert_eq!(replacement.id, REPLACEMENT_UID);
+    assert_eq!(replacement.expected_volumes, template.volumes);
     let body = daemon.body(4);
     assert_eq!(
         body["HostConfig"]["Binds"],
         json!([format!("{}:{WORKSPACE_TARGET}", workspace.path().display())]),
-        "binds without a log mount are replayed verbatim"
+        "binds outside the reclaimable log root are replayed verbatim"
     );
     assert_eq!(body["Labels"][RESTORE], template.archive.uid);
     assert!(body["Labels"].get(RESTART_LOG_DIR).is_none());
@@ -500,12 +451,13 @@ async fn a_retained_original_is_removed_before_the_replacement_is_created() {
     .await;
     let runtime = runtime(daemon.address);
 
-    runtime
+    let replacement = runtime
         .replace_builder_container(&template, &archive, original(&template))
         .await
         .unwrap();
 
     daemon.assert_followed(8);
+    assert_eq!(replacement.id, REPLACEMENT_UID);
 }
 
 /// 工作区这类数据挂载的源目录不在了，恢复必须拒绝，而且不能走到创建那一步。
@@ -527,275 +479,4 @@ async fn a_missing_bind_source_conflicts_before_anything_is_created() {
         "{result:?}"
     );
     daemon.assert_followed(2);
-}
-
-// ─── 替代容器的日志目录 ─────────────────────────────────────────────────────
-
-/// 日志挂载不照原样重放：替代容器绑定同级的新目录，环境变量和 label 跟着换，其它 bind 原样。
-#[tokio::test]
-async fn the_replacement_gets_a_new_log_directory() {
-    let restart = LoggedRestart::new();
-    let mut script = absent_original();
-    script.extend(creation_prelude(step(
-        "POST",
-        "/containers/create",
-        200,
-        created(),
-    )));
-    let daemon = scripted(script).await;
-
-    let expected = restart.restore(&daemon).await.unwrap();
-
-    daemon.assert_followed(5);
-    let body = daemon.body(4);
-    let name = restart.bound_log_name(&daemon, 4);
-    assert_eq!(
-        name.strip_prefix("rcoder-app-builder-265-").map(str::len),
-        Some(14),
-        "the new directory keeps the container name and takes a new timestamp: {name}"
-    );
-    assert_ne!(name, restart.old_name);
-    let new_directory = restart.root.path().join("host/container").join(&name);
-    assert_eq!(
-        body["HostConfig"]["Binds"],
-        json!([
-            format!("{}:{LOG_TARGET}:rw,z", new_directory.display()),
-            format!("{}:{WORKSPACE_TARGET}", restart.workspace.path().display()),
-        ]),
-        "the log bind keeps its target and options; the workspace bind is replayed verbatim"
-    );
-    let env = body["Env"].as_array().cloned().unwrap_or_default();
-    assert_eq!(
-        env.len(),
-        4,
-        "the archived environment is kept as it was, plus the execution domain stamp: {env:?}"
-    );
-    assert_eq!(
-        env[..3],
-        [
-            json!(format!("CONTAINER_LOGS_DIR={LOG_TARGET}")),
-            json!(format!("CONTAINER_LOG_NAME={name}")),
-            json!("PATH=/usr/bin"),
-        ],
-        "CONTAINER_LOG_NAME follows the directory that is actually bound"
-    );
-    assert!(
-        env[3]
-            .as_str()
-            .is_some_and(|entry| entry.starts_with("RCODER_EXECUTION_DOMAIN=")),
-        "{env:?}"
-    );
-    assert_eq!(
-        body["Labels"][RESTART_LOG_DIR],
-        json!(new_directory.to_string_lossy()),
-        "a resumed restore learns the directory from this label"
-    );
-    // 新目录是 RCoder 经自己的挂载视图建的
-    assert!(restart.visible_root().join(&name).is_dir());
-    // 旧目录原样留着，留给日志清理器
-    assert_eq!(
-        std::fs::read_dir(std::path::Path::new(&restart.old_directory))
-            .unwrap()
-            .count(),
-        1
-    );
-    assert_eq!(
-        expected,
-        restart.expected_volumes(&new_directory.to_string_lossy())
-    );
-}
-
-/// CONTAINER_LOGS_DIR 与归档里的任何一条挂载都对不上（旧版本把带变量的容器路径原样写了进去）：
-/// 认不出日志挂载就不换目录，bind 照归档重放。
-#[tokio::test]
-async fn a_log_directory_env_without_a_matching_bind_leaves_the_bind_as_archived() {
-    let restart = LoggedRestart::new();
-    let mut archive = restart.archive.clone();
-    archive.env[0] = "CONTAINER_LOGS_DIR=/app/container-logs/{timestamp}".into();
-    let mut script = absent_original();
-    script.extend(creation_prelude(step(
-        "POST",
-        "/containers/create",
-        200,
-        created(),
-    )));
-    let daemon = scripted(script).await;
-    let runtime = restart.runtime(daemon.address);
-
-    let expected = runtime
-        .replace_builder_container(&restart.template, &archive, original(&restart.template))
-        .await
-        .unwrap();
-
-    daemon.assert_followed(5);
-    let body = daemon.body(4);
-    assert_eq!(
-        body["HostConfig"]["Binds"],
-        json!([
-            format!("{}:{LOG_TARGET}:rw,z", restart.old_directory),
-            format!("{}:{WORKSPACE_TARGET}", restart.workspace.path().display()),
-        ]),
-        "nothing is rebound when the log mount cannot be recognised"
-    );
-    assert!(body["Labels"].get(RESTART_LOG_DIR).is_none());
-    assert_eq!(expected, restart.template.volumes);
-    assert!(
-        !restart.visible_root().exists(),
-        "no new directory is made for an unrecognised log mount"
-    );
-}
-
-/// 旧日志目录已经不在了（停得久，被日志清理器回收）照样能恢复：替代容器用的本来就是新目录。
-#[tokio::test]
-async fn a_missing_old_log_directory_does_not_block_the_restart() {
-    let restart = LoggedRestart::new();
-    std::fs::remove_dir_all(&restart.old_directory).unwrap();
-    let mut script = absent_original();
-    script.extend(creation_prelude(step(
-        "POST",
-        "/containers/create",
-        200,
-        created(),
-    )));
-    let daemon = scripted(script).await;
-
-    restart.restore(&daemon).await.unwrap();
-
-    daemon.assert_followed(5);
-    assert_eq!(
-        std::fs::read_dir(restart.visible_root()).unwrap().count(),
-        1,
-        "the replacement still gets a new directory"
-    );
-}
-
-/// 上一次中断前建好的替代容器被原样接受，不再建第二个；它用的日志目录从 label 里读。
-#[tokio::test]
-async fn a_resumed_replacement_is_accepted_with_the_log_directory_it_was_given() {
-    let restart = LoggedRestart::new();
-    let given = "/srv/logs/container/rcoder-app-builder-265-20251026090000";
-    let daemon = scripted(vec![
-        step("GET", ORIGINAL_UID, 404, no_such_container()),
-        step(
-            "GET",
-            "rcoder-app-builder-",
-            200,
-            retained_replacement(
-                &restart.template,
-                json!({
-                    RESTORE: restart.template.archive.uid.clone(),
-                    RESTART_LOG_DIR: given,
-                }),
-            ),
-        ),
-    ])
-    .await;
-
-    let expected = restart.restore(&daemon).await.unwrap();
-
-    daemon.assert_followed(2);
-    assert_eq!(expected, restart.expected_volumes(given));
-}
-
-/// 没有这个 label 的替代容器是旧版本建的：那时归档原样重放，它绑的就是归档里的目录。
-#[tokio::test]
-async fn a_resumed_replacement_from_an_older_version_is_verified_against_the_archive() {
-    let restart = LoggedRestart::new();
-    let daemon = scripted(vec![
-        step("GET", ORIGINAL_UID, 404, no_such_container()),
-        step(
-            "GET",
-            "rcoder-app-builder-",
-            200,
-            retained_replacement(
-                &restart.template,
-                json!({ RESTORE: restart.template.archive.uid }),
-            ),
-        ),
-    ])
-    .await;
-
-    let expected = restart.restore(&daemon).await.unwrap();
-
-    daemon.assert_followed(2);
-    assert_eq!(expected, restart.template.volumes);
-    assert!(
-        !restart.visible_root().exists(),
-        "nothing is created for a replacement that already exists"
-    );
-}
-
-/// 替代容器没建成：刚为它建的日志目录没人用，删掉。
-#[tokio::test]
-async fn the_new_log_directory_is_discarded_when_the_replacement_cannot_be_created() {
-    let restart = LoggedRestart::new();
-    let mut script = absent_original();
-    script.extend(creation_prelude(step(
-        "POST",
-        "/containers/create",
-        500,
-        json!({"message": "daemon refused"}),
-    )));
-    let daemon = scripted(script).await;
-
-    let result = restart.restore(&daemon).await;
-
-    assert!(
-        matches!(&result, Err(Error::DockerError(message)) if message.contains("Create replacement builder")),
-        "{result:?}"
-    );
-    daemon.assert_followed(5);
-    assert_eq!(
-        std::fs::read_dir(restart.visible_root()).unwrap().count(),
-        0,
-        "the directory made for a replacement that was never created is removed"
-    );
-}
-
-/// 归档里的 bind 与模板记的挂载对不上：认不出哪一条是日志挂载，拒绝，什么都不建。
-#[tokio::test]
-async fn a_log_bind_that_does_not_match_the_witness_conflicts_and_creates_nothing() {
-    let restart = LoggedRestart::new();
-    let mut archive = restart.archive.clone();
-    archive.binds[0] = format!("/elsewhere/logs:{LOG_TARGET}");
-    let daemon = scripted(absent_original()).await;
-    let runtime = restart.runtime(daemon.address);
-
-    let result = runtime
-        .replace_builder_container(&restart.template, &archive, original(&restart.template))
-        .await;
-
-    assert!(
-        matches!(&result, Err(Error::Conflict(message)) if message.contains("Restart log bind does not match")),
-        "{result:?}"
-    );
-    daemon.assert_followed(2);
-    assert!(
-        !restart.visible_root().exists(),
-        "the directory is only created after every check has passed"
-    );
-}
-
-/// 工作区核对不过时不建日志目录。
-#[tokio::test]
-async fn no_log_directory_is_created_when_another_bind_source_is_missing() {
-    let restart = LoggedRestart::new();
-    std::fs::remove_dir_all(restart.workspace.path()).unwrap();
-    let daemon = scripted(absent_original()).await;
-    let runtime = restart.runtime(daemon.address);
-
-    let result = runtime
-        .replace_builder_container(
-            &restart.template,
-            &restart.archive,
-            original(&restart.template),
-        )
-        .await;
-
-    assert!(
-        matches!(&result, Err(Error::Conflict(message)) if message.contains("Restart bind source is missing")),
-        "{result:?}"
-    );
-    daemon.assert_followed(2);
-    assert!(!restart.visible_root().exists());
 }

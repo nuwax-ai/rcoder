@@ -20,9 +20,24 @@
 use super::docker_runtime::DockerRuntime;
 use container_runtime_api::{ContainerRuntimeError as Error, ContainerRuntimeResult as Result};
 use log_directory::{
-    LogDirectory, LogDirectoryPlan, RESTART_LOG_DIR, discard_log_directory, rebind_log_directory,
-    volumes_with_log_source,
+    FreshLogDirectories, RESTART_LOG_DIR, plan, resumed_sources, with_log_sources,
 };
+
+/// 这次恢复给出的替代容器：按名称找到或刚创建的那一个，以及它应当有的挂载
+#[derive(Debug, PartialEq)]
+struct Replacement {
+    /// 替代容器的 Docker ID。最终核验必须是同一个容器
+    id: String,
+    expected_volumes: Vec<AppResourceIdentity>,
+}
+
+/// 替代容器没建成。两种情况的善后不一样
+enum CreateFailure {
+    /// 请求没有发出去，或者 daemon 明确拒绝：替代容器不存在
+    NotCreated(Error),
+    /// 请求发出去了，结果不明：替代容器可能已经存在
+    Unknown(Error),
+}
 use sha2::{Digest as _, Sha256};
 use shared_types::{
     AppResourceIdentity, AppResourceKind, BuilderControlTarget, BuilderRestartTemplate,
@@ -531,7 +546,7 @@ impl DockerRuntime {
             .as_ref()
             .filter(|resource| resource.kind == AppResourceKind::Container)
             .ok_or_else(|| conflict("Restart source container is missing"))?;
-        let expected_volumes = self
+        let replacement = self
             .replace_builder_container(template, &archive, original)
             .await?;
         let client = self.inner.get_docker_client();
@@ -546,11 +561,18 @@ impl DockerRuntime {
         if resource.uid == original.uid {
             return Err(conflict("Restart did not produce a replacement builder"));
         }
+        // 核验的必须就是上面认下的那一个替代容器：同名容器在这之间被换掉的话，它记的日志
+        // 目录 label 就不作数了
+        if resource.uid != replacement.id {
+            return Err(conflict(
+                "Restart target was replaced before it could be verified",
+            ));
+        }
         let inspect = client
             .inspect_container(&resource.uid, None)
             .await
             .map_err(|error| fail(format!("Verify replacement builder: {error}")))?;
-        if bind_witness(&inspect)? != expected_volumes {
+        if bind_witness(&inspect)? != replacement.expected_volumes {
             return Err(conflict("Restart workspace binds changed"));
         }
         // Replacement is deliberately stopped here. Its Direct IP and
@@ -559,17 +581,16 @@ impl DockerRuntime {
     }
 
     /// 用归档重放出替代 builder：必要时先移除仍被保留的旧容器，核对 bind 源，再创建。
-    /// 返回替代容器应当有的挂载。
     ///
-    /// 日志挂载不照原样重放，换成同级的新目录：旧目录可能已经过期，日志清理器正在回收它，
-    /// 和 builder 停了多久无关。替代容器绑定的是刚建的新目录，清理器手里的候选碰不到它，
-    /// 这一段不需要和清理器互斥。
+    /// 落在可回收日志根下面的 bind 不照原样重放，换成同级的新目录：旧目录可能已经过期，
+    /// 日志清理器正在回收它。新目录登记为正在准备挂载，清理器碰不到它，这一段不需要和
+    /// 清理器互斥。
     async fn replace_builder_container(
         &self,
         template: &BuilderRestartTemplate,
         archive: &Archive,
         original: &AppResourceIdentity,
-    ) -> Result<Vec<AppResourceIdentity>> {
+    ) -> Result<Replacement> {
         let client = self.inner.get_docker_client();
         let mut replay = archive.clone();
         // Old versions may retain stopped builders. Replace that exact instance
@@ -623,8 +644,7 @@ impl DockerRuntime {
         // Idempotent re-entry: an interrupted restore may have created the
         // replacement already. Accept only this archive's marker, never a
         // running occupant or a different container under the same name.
-        let mut resumed = false;
-        let mut resumed_log_directory: Option<String> = None;
+        let mut resumed: Option<(String, Option<String>)> = None;
         match inspect_absent(
             client.inspect_container(&original.name, None).await,
             "Inspect restart target",
@@ -636,90 +656,99 @@ impl DockerRuntime {
                     .as_ref()
                     .and_then(|config| config.labels.clone())
                     .unwrap_or_default();
+                let id = existing.id.clone().filter(|id| !id.is_empty());
                 if labels.get(RESTORE) != Some(&template.archive.uid)
                     || existing.state.as_ref().and_then(|state| state.running) == Some(true)
                 {
                     return Err(conflict("Another builder occupies restart target"));
                 }
-                resumed = true;
-                // 上一次中断前建好的替代容器，它拿到的日志目录记在这个 label 里。没有 label 的
-                // 是旧版本建的：那时归档原样重放，它绑的就是归档里的目录
-                resumed_log_directory = labels.get(RESTART_LOG_DIR).cloned();
+                // 上一次中断前建好的替代容器。它拿到的日志目录记在 RESTART_LOG_DIR 上；没有
+                // 这个 label 的是旧版本建的，那时归档原样重放，它绑的就是归档里的目录
+                resumed = Some((
+                    id.ok_or_else(|| conflict("Restart target has no physical ID"))?,
+                    labels.get(RESTART_LOG_DIR).cloned(),
+                ));
             }
         }
-        let mut expected = template.volumes.clone();
-        if !resumed {
-            // 先定下要新建日志目录，再核对其它 bind 源：核对不过就不建
-            let plan = LogDirectoryPlan::plan(template, archive)?;
-            for volume in &template.volumes {
-                // 日志目录换成新建的，旧的可能早已被清理器回收，不要求它还在
-                if plan.as_ref().is_some_and(|plan| plan.volume == volume) {
-                    continue;
+        let domain = self.log_domain().await?;
+        let plans = plan(template, archive, &domain)?;
+        if let Some((id, label)) = resumed {
+            let expected_volumes = match label {
+                None => template.volumes.clone(),
+                Some(label) => {
+                    with_log_sources(&template.volumes, &resumed_sources(&label, &plans)?)
                 }
-                if !bind_source_exists(&volume.uid)? {
-                    return Err(conflict(format!(
-                        "Restart bind source is missing: {}",
-                        volume.uid
-                    )));
-                }
-            }
-            let image = archive
-                .source
-                .restart_image
-                .as_deref()
-                .unwrap_or(&archive.image);
-            self.inner
-                .ensure_image_exists(image)
-                .await
-                .map_err(|error| {
-                    Error::DockerError(format!("Prepare restart image {image}: {error}"))
-                })?;
-            let log_directory = match &plan {
-                Some(plan) => {
-                    let log_directory = self.create_log_directory(plan).await?;
-                    rebind_log_directory(&mut replay, plan, &log_directory);
-                    Some(log_directory)
-                }
-                None => None,
             };
-            if let Err(error) = self
-                .create_replacement(template, &replay, log_directory.as_ref(), original)
-                .await
-            {
-                if let Some(created) = log_directory
-                    .as_ref()
-                    .and_then(|log_directory| log_directory.created.as_deref())
-                {
-                    discard_log_directory(created).await;
-                }
-                return Err(error);
-            }
-            if let Some(log_directory) = &log_directory {
-                expected = volumes_with_log_source(
-                    &template.volumes,
-                    &log_directory.target,
-                    &log_directory.source,
-                );
-            }
-        } else if let (Some(target), Some(source)) = (archive.log_target(), resumed_log_directory) {
-            expected = volumes_with_log_source(&template.volumes, target, &source);
+            return Ok(Replacement {
+                id,
+                expected_volumes,
+            });
         }
-        Ok(expected)
+        // 先定下要换哪些日志目录，再核对其它 bind 源：核对不过就不建
+        for volume in &template.volumes {
+            // 日志目录换成新建的，旧的可能早已被清理器回收，不要求它还在
+            if plans.iter().any(|plan| plan.volume == volume) {
+                continue;
+            }
+            if !bind_source_exists(&volume.uid)? {
+                return Err(conflict(format!(
+                    "Restart bind source is missing: {}",
+                    volume.uid
+                )));
+            }
+        }
+        let image = archive
+            .source
+            .restart_image
+            .as_deref()
+            .unwrap_or(&archive.image);
+        self.inner
+            .ensure_image_exists(image)
+            .await
+            .map_err(|error| {
+                Error::DockerError(format!("Prepare restart image {image}: {error}"))
+            })?;
+        let fresh = FreshLogDirectories::create(self, &plans).await?;
+        fresh.apply(&mut replay, &plans);
+        let log_label = (!plans.is_empty()).then(|| fresh.label());
+        match self
+            .create_replacement(template, &replay, log_label.as_deref(), original)
+            .await
+        {
+            Ok(id) => Ok(Replacement {
+                id,
+                expected_volumes: fresh.expected_volumes(&template.volumes),
+            }),
+            // 确认没建成：刚建的日志目录没人用，删掉
+            Err(CreateFailure::NotCreated(error)) => {
+                fresh.discard_created().await;
+                Err(error)
+            }
+            // 结果不明：替代容器可能已经建出来、正绑着这些目录。原样留着，下一次恢复按
+            // 名称找到它、按它的 label 核对；确实没建成的，过完保留期由清理器回收
+            Err(CreateFailure::Unknown(error)) => Err(error),
+        }
     }
 
-    /// Create the stopped replacement. The caller verifies it through a fresh capture.
+    /// Create the stopped replacement and return its physical ID.
+    ///
+    /// 只有请求发出去之前失败、或者 daemon 以 4xx 明确拒绝，才确认替代容器不存在。其余
+    /// （连接断了、应答丢了、5xx、应答里没有 ID）结果不明。
     async fn create_replacement(
         &self,
         template: &BuilderRestartTemplate,
         replay: &Archive,
-        log_directory: Option<&LogDirectory>,
+        log_label: Option<&str>,
         original: &AppResourceIdentity,
-    ) -> Result<()> {
+    ) -> std::result::Result<String, CreateFailure> {
         let client = self.inner.get_docker_client();
-        let mut body = restore_body(template, replay, log_directory)?;
+        let mut body =
+            restore_body(template, replay, log_label).map_err(CreateFailure::NotCreated)?;
         crate::native_domain::stamp(client, &mut body)
             .await
-            .map_err(|e| fail(format!("bind replacement execution domain: {e:#}")))?;
+            .map_err(|e| {
+                CreateFailure::NotCreated(fail(format!("bind replacement execution domain: {e:#}")))
+            })?;
         let options = bollard::query_parameters::CreateContainerOptions {
             name: Some(original.name.clone()),
             platform: self.inner.config.default_platform.clone(),
@@ -733,7 +762,7 @@ impl DockerRuntime {
                 .create_container(Some(options.clone()), body.clone())
                 .await
             {
-                Ok(created) => break created,
+                Ok(created) => break Ok(created),
                 Err(bollard::errors::Error::DockerResponseServerError {
                     status_code: 409,
                     message,
@@ -742,13 +771,27 @@ impl DockerRuntime {
                 {
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 }
-                Err(error) => return Err(fail(format!("Create replacement builder: {error}"))),
+                Err(error) => break Err(error),
+            }
+        };
+        let created = match created {
+            Ok(created) => created,
+            Err(error) => {
+                let message = fail(format!("Create replacement builder: {error}"));
+                return Err(if explicitly_rejected(&error) {
+                    CreateFailure::NotCreated(message)
+                } else {
+                    CreateFailure::Unknown(message)
+                });
             }
         };
         if created.id.is_empty() {
-            return Err(fail("Replacement builder create returned no physical ID"));
+            // 请求发出去并得到了成功应答，却拿不到 ID：容器可能已经建出来了
+            return Err(CreateFailure::Unknown(fail(
+                "Replacement builder create returned no physical ID",
+            )));
         }
-        Ok(())
+        Ok(created.id)
     }
 
     pub(super) async fn remove_builder_restart_archive(
@@ -817,14 +860,25 @@ impl DockerRuntime {
     }
 }
 
+/// daemon 是否以 4xx 明确拒绝了这次请求。5xx 和 408、499 不算：请求可能已经生效。
+/// 与 `container_runtime_api::runtime_mutation_outcome_unknown` 的口径一致
+fn explicitly_rejected(error: &bollard::errors::Error) -> bool {
+    match error {
+        bollard::errors::Error::DockerResponseServerError { status_code, .. } => {
+            (400..500).contains(status_code) && !matches!(status_code, 408 | 499)
+        }
+        _ => false,
+    }
+}
+
 /// Rebuild the create body from the archive. Identity labels are re-derived
 /// from the operation context (never replayed), the restore marker makes a
 /// retry idempotent, and the captured image/config replay verbatim — except the
-/// log mount, which follows `log_directory` when there is one.
+/// log mounts, which follow `log_label` when there are any.
 fn restore_body(
     template: &BuilderRestartTemplate,
     archive: &Archive,
-    log_directory: Option<&LogDirectory>,
+    log_label: Option<&str>,
 ) -> Result<bollard::models::ContainerCreateBody> {
     let context = &template.source.context;
     let name = template
@@ -842,8 +896,8 @@ fn restore_body(
     );
     labels.insert("identifier".into(), context.app_id.clone());
     labels.insert(RESTORE.into(), template.archive.uid.clone());
-    if let Some(log_directory) = log_directory {
-        labels.insert(RESTART_LOG_DIR.into(), log_directory.source.clone());
+    if let Some(log_label) = log_label {
+        labels.insert(RESTART_LOG_DIR.into(), log_label.to_owned());
     }
     let (networking_config, network_mode) = if archive.network_mode == "host" {
         (None, "host".to_string())

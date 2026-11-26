@@ -20,6 +20,7 @@ use std::time::Duration;
 use container_runtime_api::{ContainerRuntimeError, ContainerRuntimeResult};
 use tokio::sync::OnceCell;
 
+use crate::log_directory::LogDomain;
 use crate::{DockerManager, DockerResult, HostPathResolver};
 
 /// RCoder 进程命名空间里的路径如何与宿主机路径互相换算
@@ -174,5 +175,19 @@ pub(super) async fn path_space<'a>(
         Some(resolver) => HostPathSpace::Container(resolver),
         None if shared_types::is_deploy_host() => HostPathSpace::Host,
         None => HostPathSpace::Container(container_resolver(manager, log_path_resolver).await?),
+    })
+}
+
+/// 可回收的日志根（RCoder 进程里的路径）在宿主机上的位置。日志根换算不出宿主机路径时为空：
+/// 那说明没有 bind 能指向它。builder 重启用它判断哪些 bind 不能原样重放
+pub(crate) async fn resolve_log_domain(
+    manager: &DockerManager,
+    log_path_resolver: &OnceCell<HostPathResolver>,
+    reclaim_root: &Path,
+) -> ContainerRuntimeResult<LogDomain> {
+    let space = path_space(manager, log_path_resolver).await?;
+    Ok(match space.to_host(reclaim_root) {
+        Ok(host_root) => LogDomain::new(host_root),
+        Err(_) => LogDomain::none(),
     })
 }
