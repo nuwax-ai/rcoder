@@ -303,6 +303,33 @@ async fn a_read_only_log_mount_is_not_created_here() {
     );
 }
 
+/// CONTAINER_LOGS_DIR 写的是实际挂载点（变量已替换），不是配置里的模板：builder 重启靠它
+/// 认出归档里的日志挂载。
+#[tokio::test]
+async fn the_log_directory_env_names_the_path_that_is_actually_mounted() {
+    let layout = Layout::new();
+    let templated = mount(
+        "/app/container-logs/{timestamp}",
+        "{resolved_path}/{log_dir_name}",
+        false,
+        &layout.visible_log_root(),
+    );
+
+    let config = apply(&layout, vec![templated]).await.unwrap();
+
+    let mount = only_mount(&config);
+    assert_ne!(mount.container_path, "/app/container-logs/{timestamp}");
+    assert!(mount.container_path.starts_with("/app/container-logs/"));
+    assert_eq!(
+        config
+            .env_vars
+            .get("CONTAINER_LOGS_DIR")
+            .map(String::as_str),
+        Some(mount.container_path.as_str()),
+        "the container is told where its logs really are"
+    );
+}
+
 /// 别的挂载不受影响：目录已经存在就沿用
 #[tokio::test]
 async fn other_mounts_keep_using_the_existing_directory() {

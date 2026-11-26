@@ -605,6 +605,46 @@ async fn the_replacement_gets_a_new_log_directory() {
     );
 }
 
+/// CONTAINER_LOGS_DIR 与归档里的任何一条挂载都对不上（旧版本把带变量的容器路径原样写了进去）：
+/// 认不出日志挂载就不换目录，bind 照归档重放。
+#[tokio::test]
+async fn a_log_directory_env_without_a_matching_bind_leaves_the_bind_as_archived() {
+    let restart = LoggedRestart::new();
+    let mut archive = restart.archive.clone();
+    archive.env[0] = "CONTAINER_LOGS_DIR=/app/container-logs/{timestamp}".into();
+    let mut script = absent_original();
+    script.extend(creation_prelude(step(
+        "POST",
+        "/containers/create",
+        200,
+        created(),
+    )));
+    let daemon = scripted(script).await;
+    let runtime = restart.runtime(daemon.address);
+
+    let expected = runtime
+        .replace_builder_container(&restart.template, &archive, original(&restart.template))
+        .await
+        .unwrap();
+
+    daemon.assert_followed(5);
+    let body = daemon.body(4);
+    assert_eq!(
+        body["HostConfig"]["Binds"],
+        json!([
+            format!("{}:{LOG_TARGET}:rw,z", restart.old_directory),
+            format!("{}:{WORKSPACE_TARGET}", restart.workspace.path().display()),
+        ]),
+        "nothing is rebound when the log mount cannot be recognised"
+    );
+    assert!(body["Labels"].get(RESTART_LOG_DIR).is_none());
+    assert_eq!(expected, restart.template.volumes);
+    assert!(
+        !restart.visible_root().exists(),
+        "no new directory is made for an unrecognised log mount"
+    );
+}
+
 /// 旧日志目录已经不在了（停得久，被日志清理器回收）照样能恢复：替代容器用的本来就是新目录。
 #[tokio::test]
 async fn a_missing_old_log_directory_does_not_block_the_restart() {

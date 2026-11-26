@@ -206,17 +206,18 @@ pub(super) async fn add_config_mounts(
             }
         }
 
+        // 如果是日志挂载，添加环境变量。CONTAINER_LOGS_DIR 写实际挂载点（变量已替换）：builder
+        // 重启靠它认出归档里的日志挂载
+        if log_mount {
+            builder = builder.env("CONTAINER_LOGS_DIR", &resolved_container_path);
+            builder = builder.env("CONTAINER_LOG_NAME", &log_dir_name);
+        }
+
         builder = builder.add_mount(crate::MountPoint {
             host_path: resolved_host_path,
             container_path: resolved_container_path,
             read_only: mount_config.read_only,
         });
-
-        // 如果是日志挂载，添加环境变量
-        if log_mount {
-            builder = builder.env("CONTAINER_LOGS_DIR", &mount_config.container_path);
-            builder = builder.env("CONTAINER_LOG_NAME", &log_dir_name);
-        }
     }
 
     Ok(builder)

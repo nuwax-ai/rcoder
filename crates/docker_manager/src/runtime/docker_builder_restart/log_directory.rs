@@ -14,14 +14,13 @@ use crate::runtime::docker_runtime::host_path_space::{
     CreateHostDirectoryError, create_host_directory,
 };
 
-/// The log directory given to a replacement by restart restore.
+/// 替代容器拿到的日志目录（宿主机路径），记在它的 label 上
 pub(super) const RESTART_LOG_DIR: &str = "rcoder.io/restart-log-dir";
 const CONTAINER_LOGS_DIR_ENV: &str = "CONTAINER_LOGS_DIR";
 const CONTAINER_LOG_NAME_ENV: &str = "CONTAINER_LOG_NAME";
 
 impl Archive {
-    /// Where the container keeps its logs: set by `apply_auto_mounts` for the
-    /// mount whose container path carries `container-logs`
+    /// 容器的日志挂载点：`apply_auto_mounts` 给容器内路径带 `container-logs` 的那条挂载写的
     pub(super) fn log_target(&self) -> Option<&str> {
         self.env
             .iter()
@@ -29,16 +28,15 @@ impl Archive {
     }
 }
 
-/// The original's log mount, and where the replacement's log directory goes
+/// 原容器的日志挂载，以及替代容器的日志目录放在哪
 pub(super) struct LogDirectoryPlan<'a> {
-    /// Archived mount witness of the log mount: `name` is the target, `uid` the
-    /// directory that must not be bound again
+    /// 日志挂载在归档模板里的见证：`name` 是挂载点，`uid` 是不能再绑一次的旧目录
     pub(super) volume: &'a AppResourceIdentity,
-    /// Index of that mount's entry in `Archive::binds`
+    /// 这条挂载在 `Archive::binds` 里的下标
     pub(super) bind: usize,
-    /// Parent of the old directory, on the host
+    /// 旧目录的上级目录（宿主机路径）
     pub(super) parent: PathBuf,
-    /// Name the new directory gets unless it is already taken
+    /// 新目录的名字；已被占用时换别的
     pub(super) preferred: String,
 }
 
@@ -51,11 +49,16 @@ impl LogDirectoryPlan<'_> {
             return Ok(None);
         };
         let Some(volume) = template.volumes.iter().find(|volume| volume.name == target) else {
+            // CONTAINER_LOGS_DIR 与任何一条挂载都对不上（旧版本把带变量的容器路径原样写了进去）。
+            // 认不出日志挂载就换不了目录，只能照归档重放
+            tracing::warn!(
+                target,
+                "Restart log mount target does not match any archived bind; replaying the archived log directory as it is"
+            );
             return Ok(None);
         };
-        // Match the bind by the witness (source and target) rather than by
-        // splitting on colons: a Windows drive letter in the source makes that
-        // ambiguous.
+        // 按见证（源加挂载点）整段前缀去找那条 bind，不按冒号切分：源路径里有 Windows 盘符时
+        // 切分有歧义。
         let archived = format!("{}:{}", volume.uid, volume.name);
         let bind = archive
             .binds
@@ -88,18 +91,17 @@ impl LogDirectoryPlan<'_> {
     }
 }
 
-/// The log directory the replacement binds
+/// 替代容器绑定的日志目录
 pub(super) struct LogDirectory {
-    /// Container mount target of the log directory
+    /// 日志目录在容器内的挂载点
     pub(super) target: String,
-    /// The new directory on the host
+    /// 新目录在宿主机上的路径
     pub(super) source: String,
-    /// The directory as RCoder created it. `None` when Docker has to create it
+    /// RCoder 亲手建出来的那个目录（RCoder 进程里的路径）；改由 Docker 建时为 `None`
     pub(super) created: Option<PathBuf>,
 }
 
-/// The mounts the replacement must have: the template's volumes, with the log
-/// mount at `target` pointing at `source`.
+/// 替代容器应当有的挂载：模板里的卷，其中 `target` 上的日志挂载指向 `source`。
 pub(super) fn volumes_with_log_source(
     volumes: &[AppResourceIdentity],
     target: &str,
@@ -120,8 +122,8 @@ pub(super) fn volumes_with_log_source(
         .collect()
 }
 
-/// Point the replayed archive at the replacement's new log directory. Everything
-/// else about that bind — target, options — and every other bind is left alone.
+/// 把重放用的归档指向替代容器的新日志目录。这条 bind 的其它部分（挂载点、选项）和别的
+/// bind 都不动。
 pub(super) fn rebind_log_directory(
     replay: &mut Archive,
     plan: &LogDirectoryPlan<'_>,
@@ -129,7 +131,7 @@ pub(super) fn rebind_log_directory(
 ) {
     let archived = format!("{}:{}", plan.volume.uid, plan.volume.name);
     let Some(options) = replay.binds[plan.bind].strip_prefix(&archived) else {
-        // `plan` only comes from this same archive, where the prefix was verified
+        // `plan` 只可能来自同一份归档，前缀在那里核对过
         return;
     };
     replay.binds[plan.bind] = format!("{}:{}{}", log.source, plan.volume.name, options);
@@ -145,11 +147,10 @@ pub(super) fn rebind_log_directory(
 }
 
 impl DockerRuntime {
-    /// Give the replacement a new log directory next to the archived one.
+    /// 在归档里的日志目录旁边，给替代容器新建一个。
     ///
-    /// Creating it is best effort, as it is at container creation: when RCoder cannot
-    /// create it, Docker creates it with the container. Every name being taken is
-    /// different — binding any existing directory is exactly what must not happen.
+    /// 建目录和创建容器时一样尽力而为：RCoder 建不出来，就由 Docker 随容器一起建。名字全被
+    /// 占是另一回事——绑定任何已有目录正是这里不能做的。
     pub(super) async fn create_log_directory(
         &self,
         plan: &LogDirectoryPlan<'_>,
@@ -182,7 +183,7 @@ impl DockerRuntime {
                 });
             }
         };
-        // The name may have changed: a taken name is never reused
+        // 名字可能换过：被占用的名字不复用
         let name = created
             .file_name()
             .map(PathBuf::from)
@@ -195,8 +196,7 @@ impl DockerRuntime {
     }
 }
 
-/// The replacement was not created: the directory just made for it has no user.
-/// Only an empty directory is removed, never one something has written to.
+/// 替代容器没建成：刚为它建的目录没人用。只删空目录，有东西写进去的不删。
 pub(super) async fn discard_log_directory(created: &std::path::Path) {
     if let Err(error) = tokio::fs::remove_dir(created).await
         && error.kind() != std::io::ErrorKind::NotFound
