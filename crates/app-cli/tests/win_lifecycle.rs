@@ -10,10 +10,12 @@ use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// 结束 app-cli 及其子进程并回收它。`taskkill /T` 的退出码不可靠：它先枚举进程树再
-/// 逐个结束，轮到某个子进程时那个进程可能已经退出，这时它会报错；它报告成功时，目标
-/// 进程可能还没完全退出。所以只看目标进程是否真的结束：没结束就再试，最后用进程句柄结束。
-fn kill_tree(child: &mut Child) {
+/// 结束 app-cli 并确认它已经退出。先 `taskkill /T`，尽力连子进程一起结束；它的退出码
+/// 不可靠：它先枚举进程树再逐个结束，轮到某个子进程时那个进程可能已经退出，这时它会
+/// 报错；它报告成功时，目标进程可能还没完全退出。所以只以 app-cli 自己是否真的退出为准，
+/// 这里不保证它的子进程都已结束。`taskkill` 之后仍在，就用进程句柄结束它；句柄结束之后
+/// 还不退出，明确报错，不留下没人管的进程。
+fn terminate_and_confirm(child: &mut Child) {
     for _ in 0..3 {
         let _killed = Command::new("taskkill")
             .args(["/PID", &child.id().to_string(), "/F", "/T"])
@@ -23,8 +25,16 @@ fn kill_tree(child: &mut Child) {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    let _killed = child.kill();
-    let _reaped = child.wait();
+    let killed = child.kill().err();
+    let grace = Instant::now() + Duration::from_secs(5);
+    while child.try_wait().expect("observe app-cli").is_none() {
+        assert!(
+            killed.is_none() && Instant::now() < grace,
+            "app-cli (pid {}) did not exit after TerminateProcess; kill reported {killed:?}",
+            child.id()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 fn free_port_address() -> String {
@@ -96,7 +106,7 @@ fn windows_idle_serve_lifecycle() {
     assert!(healthy, "idle app-cli must answer /health 200 at {address}");
 
     // 强杀（容器终止等价物）
-    kill_tree(&mut child);
+    terminate_and_confirm(&mut child);
 
     // 端口随进程终止释放（可重新绑定）
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -166,7 +176,7 @@ fn xp01_two_cli_concurrent_first_start_single_winner() {
                 status.success(),
                 "control-only caller must reuse the verified owner"
             );
-            kill_tree(&mut first);
+            terminate_and_confirm(&mut first);
             return;
         }
         if http_get_health(&address) == Some(200) && second_status.is_none() && !first_alive {
@@ -175,7 +185,7 @@ fn xp01_two_cli_concurrent_first_start_single_winner() {
                 status.success(),
                 "control-only caller must reuse the verified owner"
             );
-            kill_tree(&mut second);
+            terminate_and_confirm(&mut second);
             return;
         }
         std::thread::sleep(Duration::from_millis(200));
