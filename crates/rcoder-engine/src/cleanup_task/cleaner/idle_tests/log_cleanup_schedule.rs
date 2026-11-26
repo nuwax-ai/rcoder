@@ -182,3 +182,67 @@ async fn an_unavailable_inventory_retries_on_the_next_sweep() {
     assert!(!fixture.cleaner.log_cleanup_due());
     fixture.close().await;
 }
+
+/// 连续"要重试却没删掉任何东西"的轮数会被记下来（第 3 轮起告警）；一旦有进展就清零。
+/// 顺延本身只记 debug，没有这个计数，一个卡住的候选会让清理无声地停在原地。
+#[tokio::test]
+async fn sweeps_without_progress_are_counted_until_progress_resumes() {
+    let mut fixture = Fixture::new(0).await;
+    let log_dir = std::path::PathBuf::from(&fixture.cleaner.config.log_dir);
+    let expired = aged_log_dir(&log_dir, "runner-expired");
+    fixture
+        .runtime
+        .inventory_failing
+        .store(true, Ordering::SeqCst);
+
+    for sweep in 1..=4 {
+        fixture.cleaner.cleanup_once().await.unwrap();
+        assert_eq!(
+            fixture.cleaner.log_cleanup_stalled_sweeps(),
+            sweep,
+            "every sweep that retries without deleting anything counts"
+        );
+        assert!(expired.exists());
+    }
+
+    // 清单恢复：这一轮删掉了东西，是进展
+    fixture
+        .runtime
+        .inventory_failing
+        .store(false, Ordering::SeqCst);
+    fixture.cleaner.cleanup_once().await.unwrap();
+    assert!(!expired.exists());
+    assert_eq!(fixture.cleaner.log_cleanup_stalled_sweeps(), 0);
+    fixture.close().await;
+}
+
+/// 删掉了东西的顺延是进展，不算停滞：批次上限留下的目录下一轮接着删。
+#[tokio::test]
+async fn a_deferred_sweep_that_deleted_something_is_not_stalled() {
+    let mut fixture = Fixture::new(0).await;
+    let log_dir = std::path::PathBuf::from(&fixture.cleaner.config.log_dir);
+    // 比一轮的批次上限多一个
+    for index in 0..65 {
+        aged_log_dir(&log_dir, &format!("runner-{index:03}"));
+    }
+
+    fixture.cleaner.cleanup_once().await.unwrap();
+    assert!(
+        fixture.cleaner.log_cleanup_due(),
+        "the rest is deferred to the next sweep"
+    );
+    assert_eq!(
+        fixture.cleaner.log_cleanup_stalled_sweeps(),
+        0,
+        "deleting a batch is progress even though the sweep is incomplete"
+    );
+
+    fixture.cleaner.cleanup_once().await.unwrap();
+    assert!(!fixture.cleaner.log_cleanup_due());
+    assert_eq!(
+        std::fs::read_dir(&log_dir).unwrap().count(),
+        0,
+        "the deferred remainder is reclaimed next"
+    );
+    fixture.close().await;
+}

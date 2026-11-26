@@ -30,6 +30,9 @@ pub struct AgentCleaner {
     log_cleaner: super::logs::LogCleaner,
     /// 上一次完成日志清扫的时间。未完成的扫描留到下一轮清扫重试。
     last_log_cleanup: Option<tokio::time::Instant>,
+    /// 日志清理连续"要重试、却没删掉任何东西"的轮数。有进展或干净完成时清零；
+    /// 达到 [`Self::LOG_CLEANUP_STALLED_SWEEPS`] 时告警
+    log_cleanup_stalled_sweeps: u32,
 
     /// Qualified idle observations from the last completed sweep only.
     /// Shared projects cannot advance a physical workload twice in one sweep.
@@ -37,6 +40,10 @@ pub struct AgentCleaner {
 }
 
 impl AgentCleaner {
+    /// 日志清理连续这么多轮没有进展就告警。顺延本身只记 debug：一个目录的复查一直卡住时，
+    /// 每轮都在它身上耗掉预算、其余目录轮不到，清理会无声地停在原地
+    const LOG_CLEANUP_STALLED_SWEEPS: u32 = 3;
+
     pub fn new(
         config: super::config::CleanupConfig,
         state: Arc<crate::app_state::AppState>,
@@ -82,6 +89,7 @@ impl AgentCleaner {
             },
             log_cleaner,
             last_log_cleanup: None,
+            log_cleanup_stalled_sweeps: 0,
             pending_destroy: std::collections::HashSet::new(),
         }
     }
@@ -178,6 +186,15 @@ impl AgentCleaner {
         }
         match self.log_cleaner.cleanup_once().await {
             Ok(log_stats) => {
+                // 要重试却什么都没删掉，才算停在原地；删掉了东西（哪怕批次没做完）是进展
+                let stalled = log_stats.needs_retry()
+                    && log_stats.files_deleted == 0
+                    && log_stats.dirs_deleted == 0;
+                self.log_cleanup_stalled_sweeps = if stalled {
+                    self.log_cleanup_stalled_sweeps.saturating_add(1)
+                } else {
+                    0
+                };
                 self.last_log_cleanup = if log_stats.needs_retry() {
                     None
                 } else {
@@ -196,12 +213,30 @@ impl AgentCleaner {
                 } else {
                     debug!("[cleaner] Log cleanup: {}", log_stats.summary());
                 }
+                if self.log_cleanup_stalled_sweeps >= Self::LOG_CLEANUP_STALLED_SWEEPS {
+                    warn!(
+                        sweeps = self.log_cleanup_stalled_sweeps,
+                        first_deferred = log_stats
+                            .first_deferred
+                            .as_deref()
+                            .map(|path| path.display().to_string()),
+                        "[cleaner] Log cleanup keeps retrying without deleting anything: {}",
+                        log_stats.summary()
+                    );
+                }
             }
+            // 出错的那一轮自己告警，不动停滞计数
             Err(e) => {
                 self.last_log_cleanup = None;
                 warn!("[cleaner] Cleanup failed: {}", e);
             }
         }
+    }
+
+    /// 测试用：日志清理连续"要重试却没删掉任何东西"的轮数
+    #[cfg(test)]
+    pub(super) fn log_cleanup_stalled_sweeps(&self) -> u32 {
+        self.log_cleanup_stalled_sweeps
     }
 
     /// 清理单个 agent
