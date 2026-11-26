@@ -8,7 +8,6 @@ use chrono::Utc;
 use shared_types::ProjectStore as _;
 use shared_types::ServiceType;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
@@ -34,8 +33,6 @@ pub struct AgentCleaner {
     /// 日志清理连续"要重试、却没删掉任何东西"的轮数。有进展或干净完成时清零；
     /// 达到 [`Self::LOG_CLEANUP_STALLED_SWEEPS`] 时告警
     log_cleanup_stalled_sweeps: u32,
-    /// 一轮日志清理最多允许占住清扫任务这么久，见 [`Self::LOG_CLEANUP_SWEEP_TIMEOUT`]
-    log_cleanup_sweep_timeout: Duration,
 
     /// Qualified idle observations from the last completed sweep only.
     /// Shared projects cannot advance a physical workload twice in one sweep.
@@ -46,10 +43,6 @@ impl AgentCleaner {
     /// 日志清理连续这么多轮没有进展就告警。顺延本身只记 debug：一个目录的复查一直卡住时，
     /// 每轮都在它身上耗掉预算、其余目录轮不到，清理会无声地停在原地
     const LOG_CLEANUP_STALLED_SWEEPS: u32 = 3;
-
-    /// 一轮日志清理的时间上限。扫描日志目录没有逐项的截止时间，整个目录卡住时不设上限会
-    /// 连容器清扫一起停掉；正常一轮远用不了这么久
-    const LOG_CLEANUP_SWEEP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
     pub fn new(
         config: super::config::CleanupConfig,
@@ -97,7 +90,6 @@ impl AgentCleaner {
             log_cleaner,
             last_log_cleanup: None,
             log_cleanup_stalled_sweeps: 0,
-            log_cleanup_sweep_timeout: Self::LOG_CLEANUP_SWEEP_TIMEOUT,
             pending_destroy: std::collections::HashSet::new(),
         }
     }
@@ -183,12 +175,6 @@ impl AgentCleaner {
         }
     }
 
-    /// 测试用：缩短一轮日志清理的时间上限
-    #[cfg(test)]
-    pub(super) fn set_log_cleanup_sweep_timeout(&mut self, timeout: Duration) {
-        self.log_cleanup_sweep_timeout = timeout;
-    }
-
     /// 完成的日志扫描推进独立周期，临时失败和未完成的批次在下一轮清扫续做。
     async fn cleanup_logs_if_due(&mut self) {
         if !self.log_cleanup_due() {
@@ -198,13 +184,8 @@ impl AgentCleaner {
             );
             return;
         }
-        match tokio::time::timeout(
-            self.log_cleanup_sweep_timeout,
-            self.log_cleaner.cleanup_once(),
-        )
-        .await
-        {
-            Ok(Ok(log_stats)) => {
+        match self.log_cleaner.cleanup_once().await {
+            Ok(log_stats) => {
                 // 要重试却什么都没删掉，才算停在原地；删掉了东西（哪怕批次没做完）是进展
                 let stalled = log_stats.needs_retry()
                     && log_stats.files_deleted == 0
@@ -244,20 +225,21 @@ impl AgentCleaner {
                     );
                 }
             }
-            // 出错的那一轮自己告警，不动停滞计数
-            Ok(Err(e)) => {
-                self.last_log_cleanup = None;
-                warn!("[cleaner] Cleanup failed: {}", e);
-            }
-            // 日志目录整体卡住：放弃这一轮，等下一个完整周期再试。底层还没返回的阻塞调用
-            // 仍占着线程，不能每 5 分钟再搭一个进去
-            Err(_elapsed) => {
+            // 日志目录卡在扫描里：放弃这一轮，等下一个完整周期再试。底层还没返回的阻塞调用
+            // 仍占着线程，不能每个清扫周期再搭一个进去
+            Err(error @ super::logs::LogCleanupError::ScanTimedOut(timeout)) => {
                 self.last_log_cleanup = Some(tokio::time::Instant::now());
                 warn!(
-                    timeout_secs = self.log_cleanup_sweep_timeout.as_secs(),
-                    "[cleaner] Log cleanup did not finish within {}s; abandoning this run and retrying at the next log cleanup interval",
-                    self.log_cleanup_sweep_timeout.as_secs()
+                    timeout_secs = timeout.as_secs(),
+                    "[cleaner] Log cleanup scan did not finish within {}s; abandoning this run and retrying at the next log cleanup interval: {}",
+                    timeout.as_secs(),
+                    error
                 );
+            }
+            // 出错的那一轮自己告警，不动停滞计数
+            Err(super::logs::LogCleanupError::Io(e)) => {
+                self.last_log_cleanup = None;
+                warn!("[cleaner] Cleanup failed: {}", e);
             }
         }
     }

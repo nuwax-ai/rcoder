@@ -44,5 +44,6 @@ mod physical_docker;
 #[cfg(test)]
 mod tests;
 
+pub(in crate::cleanup_task) use cleaner::LogCleanupError;
 pub use cleaner::{LogCleaner, LogCleanupStats};
 pub use owner::{MountedPathsProbe, RuntimeMountedPaths};
