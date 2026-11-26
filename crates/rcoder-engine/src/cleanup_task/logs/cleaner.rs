@@ -5,7 +5,7 @@
 //! 目录的修改时间只用来判断"是否已超过保留期"，**不单独决定删除**。一个目录会被
 //! `remove_dir_all` 删掉，必须同时满足：
 //!
-//! 1. 修改时间早于保留期；
+//! 1. 修改时间早于保留期（保留期有下限 [`MIN_RETENTION`]，刚建出来的目录不会是候选）；
 //! 2. **当前没有任何容器把它当 bind mount 源**（运行中的、以及已停止未删除的都算）。
 //!
 //! 第 2 条是本次修复的核心：这些目录正是 RCoder 为每个容器创建的日志目录，同时也是
@@ -58,6 +58,14 @@ use super::owner::MountedPathsProbe;
 
 /// 一天的秒数：保留天数换算秒数的乘数
 const SECS_PER_DAY: u64 = 24 * 60 * 60;
+
+/// 保留期下限：配置的保留期比它短时按它计。
+///
+/// 容器的日志目录是创建容器时新建的（`docker_manager` 的 `log_directory`），所以清理器不必和
+/// 挂载准备互斥：手里的候选都是旧目录，正在准备挂载的都是刚建的目录。保留期配成 0 时这个
+/// 前提不成立——建出来不到一秒的目录也算过期，"建目录"到"Docker 登记这个挂载"之间被扫到，
+/// 删掉的就是正在使用的目录。按保留下限算，停掉的容器的日志最多晚这么久回收。
+const MIN_RETENTION: Duration = Duration::from_secs(10 * 60);
 
 /// 一轮的截止时间：从拿到挂载围栏的写锁那一刻起计，取清单、逐个判定、逐个删除共用它。
 ///
@@ -127,8 +135,8 @@ impl LogCleaner {
     ///
     /// `retention_days` 来自配置文件（`cleanup_config.log_cleanup.log_retention_days`），
     /// 是不受信任的输入：换算成秒时必须用 `saturating_mul`。直接相乘在 debug 构建下会
-    /// panic，在 release 构建下会静默回绕——例如 `144115188075855872` 天会回绕成 0 秒，
-    /// 等于把保留期变成 0，任何目录都会被判为过期。
+    /// panic，在 release 构建下会静默回绕——例如 `144115188075855872` 天会回绕成 0 秒。
+    /// 不足 [`MIN_RETENTION`] 的保留期按它计。
     pub fn new(
         log_dir: impl Into<String>,
         retention_days: u64,
@@ -136,7 +144,8 @@ impl LogCleaner {
     ) -> Self {
         Self {
             log_dir: log_dir.into(),
-            retention_duration: Duration::from_secs(retention_days.saturating_mul(SECS_PER_DAY)),
+            retention_duration: Duration::from_secs(retention_days.saturating_mul(SECS_PER_DAY))
+                .max(MIN_RETENTION),
             mounted_paths,
             reclaim_budget: DIR_RECLAIM_BUDGET,
             reclaim_batch: DIR_RECLAIM_BATCH,
@@ -272,9 +281,8 @@ impl LogCleaner {
         }
 
         info!(
-            "[log_cleaner] Starting log directory cleanup: {}, retention: {} days",
-            self.log_dir,
-            self.retention_duration.as_secs() / SECS_PER_DAY
+            "[log_cleaner] Starting log directory cleanup: {}, retention: {:?}",
+            self.log_dir, self.retention_duration
         );
 
         // 读取目录内容
