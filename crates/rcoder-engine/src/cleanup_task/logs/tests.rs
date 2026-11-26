@@ -824,7 +824,7 @@ async fn a_quarantined_directory_does_not_block_the_others() {
 }
 
 /// 超时记录会过期，隔离不是永久的：
-/// - 两轮之间隔得比保留时长还久，计数每次从头开始，到不了隔离轮数；
+/// - 两轮之间隔得比保留时长还久，记录失效，计数从头开始，不会被误隔离；
 /// - 隔离中的目录过了保留时长会被重新尝试，文件系统恢复了就正常回收。
 #[tokio::test]
 async fn timeout_records_expire_so_a_quarantined_directory_is_tried_again() {
@@ -835,33 +835,29 @@ async fn timeout_records_expire_so_a_quarantined_directory_is_tried_again() {
         .with_reclaim_budget(Duration::from_millis(10))
         .with_fair_recheck_window(Duration::from_millis(2))
         .with_recheck_delay(Duration::from_secs(3))
-        .with_recheck_timeout_memory(Duration::from_millis(300));
+        .with_recheck_timeout_memory(Duration::from_secs(1));
 
-    // 每轮之后都隔得比保留时长久：每轮都从 1 记起，到不了隔离轮数
+    // 第一轮超时之后隔得比保留时长久：记录失效
+    cleaner.cleanup_once().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // 接下来的三轮每轮都超时。记录若没失效，第二轮之后就会隔离
     for _ in 0..3 {
         let stats = cleaner.cleanup_once().await.unwrap();
-        assert_eq!(stats.dirs_quarantined, 0);
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(stats.dirs_deferred_by_budget, 1);
+        assert_eq!(
+            stats.dirs_quarantined, 0,
+            "the count started over after the gap"
+        );
     }
-    // 上一轮是第三次超时：记录若还在，这一轮就该隔离了
-    let stats = cleaner.cleanup_once().await.unwrap();
-    assert_eq!(
-        stats.dirs_deferred_by_budget, 1,
-        "the count started over after a long gap"
-    );
-    assert_eq!(stats.dirs_quarantined, 0);
-
-    // 连续第 2、3 轮：达到隔离轮数，再下一轮起隔离
-    for _ in 0..2 {
-        cleaner.cleanup_once().await.unwrap();
-    }
+    // 连续第三轮达到隔离轮数：下一轮起隔离
     let stats = cleaner.cleanup_once().await.unwrap();
     assert_eq!(stats.dirs_quarantined, 1);
     assert_eq!(stats.dirs_deferred_by_budget, 0);
 
     // 记录过期之后，后面的日志清理再试一次；文件系统已恢复，目录被回收
     cleaner.set_recheck_delay(Duration::ZERO);
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
     let stats = cleaner.cleanup_once().await.unwrap();
     assert_eq!(stats.dirs_quarantined, 0);
     assert_eq!(stats.dirs_deleted, 1);
