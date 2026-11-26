@@ -86,8 +86,8 @@ pub(crate) async fn finalize_observed_wake(
 /// A fence without an executor claim (legacy rows or manual SQL — the current
 /// API cannot produce one) has no executor that could ever resume it. It is
 /// settled under the scanner identity only under a narrow, evidence-first
-/// gate: non-destructive kind, a step at which no runtime write could have
-/// been dispatched (`claimed`), and **no lease receipt row**. A recorded
+/// gate: the known historical builder preflight rejection, the scanner's
+/// positive absence observation, and **no lease receipt row**. A recorded
 /// receipt means a native lease (K8s Lease / Docker flock) may still be alive
 /// and renewable; those fences are left untouched for their dedicated
 /// recovery paths.
@@ -110,20 +110,16 @@ pub(crate) async fn settle_fenced_operation(
         return Err(Error::VersionConflict);
     }
     let before_app = app.clone();
-    // 无执行者声明的围栏（历史版本数据或人工 SQL；admit 之后必须先取得执行
-    // 者才会流转，当前 API 产生不了这种记录）没有任何执行器可以续做。收束
-    // 的前提是能证明"没有写入被派发过"，在事务内逐项核对：
-    // · 非破坏性 kind（删除族与存储销毁/清空/口令/库准备另有专用恢复路径）；
-    // · step 处于未派发白名单（创建超时路径会在写围栏后继续等待已派发的
-    //   运行时创建，原生租约可能仍有活着）；
-    // · 不存在任何租约回执行（有回执意味着原生锁可能仍活着且可续租）。
-    // 满足才由扫描器身份认领（AcquireExecutor 语义）落 Failed，只记账，
-    // 绝不授权任何运行时工作。
+    // Neither a claimed checkpoint nor a missing SQL receipt proves that
+    // creation was never dispatched. Require the historical preflight result
+    // together with its runtime observation, then recheck the SQL receipt.
     if op.executor_id.is_none() {
-        if !op.kind.may_unclaimed_settle(&op.step) {
+        if !op.is_legacy_builder_preflight_rejection()
+            || evidence.get("kind").and_then(serde_json::Value::as_str)
+                != Some(LEGACY_BUILDER_PREFLIGHT_ABSENCE_EVIDENCE)
+        {
             return Err(Error::InvalidOperation(
-                "unclaimed fence settlement requires a dedicated recovery path for this kind/step"
-                    .into(),
+                "unclaimed fence settlement requires a verified builder preflight rejection".into(),
             ));
         }
         if get_operation_lease(tx, backend, &op.app_id, &op.operation_id)

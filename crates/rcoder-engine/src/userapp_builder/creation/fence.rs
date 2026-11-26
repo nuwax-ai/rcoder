@@ -72,12 +72,8 @@ pub(crate) async fn observe_fence_evidence(
             // Historical versions fenced a definite read-side PVC identity
             // rejection. Only that acknowledged result, absent compute, and a
             // dead/absent native holder permit closing it as Failed.
-            let legacy_preflight = record.kind == UserAppOperationKind::EnsureBuilder
-                && record.step == "creation_result" && record.checkpoint.is_null()
-                && record.error_message.as_deref().is_some_and(|message| message.starts_with(
-                    "ensure UserappBuilder failed: Concurrent resource update: Application resource identity mismatch:"));
             if state.config.userapp_storage.default_recovery_enabled
-                && legacy_preflight
+                && record.is_legacy_builder_preflight_rejection()
                 && matches!(
                     state
                         .userapp_store
@@ -94,7 +90,7 @@ pub(crate) async fn observe_fence_evidence(
                 )
             {
                 return FenceEvidence::Observed(
-                    serde_json::json!({"kind":"legacy_creation_preflight_rejected_compute_absent", "observed_at_us":chrono::Utc::now().timestamp_micros()}),
+                    serde_json::json!({"kind":shared_types::LEGACY_BUILDER_PREFLIGHT_ABSENCE_EVIDENCE, "observed_at_us":chrono::Utc::now().timestamp_micros()}),
                 );
             }
             if state.config.userapp_storage.default_recovery_enabled
@@ -276,13 +272,12 @@ const HOLDER_EXPIRED_RELEASE_NOTE: &str =
     "holder expired, outcome unverifiable; retry the operation";
 /// 无执行者声明的围栏收束留痕说明。
 const UNCLAIMED_RELEASE_NOTE: &str =
-    "unclaimed beyond settle grace, outcome unverifiable; retry the operation";
+    "unclaimed beyond settle grace; historical preflight rejection verified; retry the operation";
 /// 物理状态确定性观察收束的留痕说明。
 const DEFINITE_RELEASE_NOTE: &str = "physical state verified definite by recovery scanner";
 /// 围栏 holder 死亡兜底的默认超龄门槛（秒）：≫ 操作 deadline + 租约 TTL 60s。
 const DEFAULT_FENCE_SETTLE_GRACE_SECS: u64 = 900;
-/// 无执行者围栏的默认收束门槛（秒）：对齐租约 TTL，只需覆盖扫描周期与并发
-/// 副本的竞争窗口——这类围栏没有持有者，不存在在途写入需要等待。
+/// Minimum age before inspecting an unclaimed historical preflight rejection.
 const DEFAULT_UNCLAIMED_SETTLE_GRACE_SECS: u64 = 60;
 
 /// 时间点是否已早于"当前 − 宽限期"。
@@ -290,8 +285,7 @@ const DEFAULT_UNCLAIMED_SETTLE_GRACE_SECS: u64 = 60;
 /// 两条收束路径的计龄基准不同：
 /// - holder 死亡兜底用 `created_at`（记录仅暴露该时间；它早于最近状态变更，
 ///   门槛因此更容易满足——该路径的安全依赖死亡探针，年龄只是下限）；
-/// - 无执行者快路径用 `updated_at`（最近一次状态变更 ≈ 落围栏时刻），
-///   因为它没有任何探针，年龄就是唯一的安全门。
+/// - 无执行者路径按 `updated_at` 退避，是否能收束由已核验的证据决定。
 fn aged_beyond(timestamp: chrono::DateTime<chrono::Utc>, grace_secs: u64) -> bool {
     let grace_us = i64::try_from(grace_secs.saturating_mul(1_000_000)).unwrap_or(i64::MAX);
     let now_us = chrono::Utc::now().timestamp_micros();
@@ -318,8 +312,7 @@ pub(crate) async fn holder_expired(state: &AppState, record: &UserAppOperationRe
         // Losing lease authority does not retract an already-issued DELETE.
         return false;
     }
-    // 计龄从 created_at 起算（记录仅暴露 created_at；created ≤ updated，
-    // 保守取更长的等待）。
+    // Age from admission is an observation threshold, not proof of holder death.
     let grace = state
         .config
         .fence_settle_grace_secs
@@ -416,20 +409,13 @@ pub(crate) async fn reconcile_fenced_ensure(
         );
         return Ok(());
     };
-    // 无执行者声明的围栏（历史版本数据或人工 SQL；admit 之后必须先取得执行
-    // 者才会流转，当前 API 产生不了这种记录）没有任何执行器可以续做。
-    // RecoveryRequired 只允许持有者推进，而这里根本没有持有者——留着只会
-    // 永久占用受理槽，因此按"证据优先"的窄门收束（只落 Failed 记账，绝不
-    // 授权任何运行时工作）：
-    // · 必须先证明没有写入被派发过：创建超时等路径会在写围栏之后继续等待
-    //   已派发的运行时创建，K8s Lease / Docker flock 可能仍然活着且可续租，
-    //   仅凭 kind 和年龄放行不安全。首批只覆盖 step = claimed（尚未派发），
-    //   由 UserAppOperationKind::may_unclaimed_settle 统一裁决；
-    // · 存在任何租约回执行 → 保持围栏，交给各 kind 的专用恢复路径；
-    // · 无回执行才允许按扫描器身份收束；updated_at 的 60s 只是退避下限
-    //   （人工 SQL 只清执行者时 updated_at 不变，不代表"连续无声明 60s"）。
+    // Claimed records can already have a native holder or a dispatched write.
+    // Only the known historical read-side rejection has affirmative evidence
+    // that it was rejected before the write. Also verify physical absence.
     if record.executor_id.is_none() {
-        if !record.kind.may_unclaimed_settle(&record.step) {
+        if !state.config.userapp_storage.default_recovery_enabled
+            || !record.is_legacy_builder_preflight_rejection()
+        {
             tracing::warn!(
                 operation_id = %record.operation_id,
                 app_id = %record.app_id,
@@ -489,12 +475,19 @@ pub(crate) async fn reconcile_fenced_ensure(
             );
             return Ok(());
         }
-        let evidence = serde_json::json!({
-            "kind": "unclaimed",
-            "identity": "scanner",
-            "step": record.step.clone(),
-            "checked_at_us": chrono::Utc::now().timestamp_micros(),
-        });
+        let observation = tokio::time::timeout(
+            Duration::from_secs(10),
+            observe_fence_evidence(state, &record),
+        )
+        .await;
+        let Ok(FenceEvidence::Observed(evidence)) = observation else {
+            return Ok(());
+        };
+        if evidence.get("kind").and_then(serde_json::Value::as_str)
+            != Some(shared_types::LEGACY_BUILDER_PREFLIGHT_ABSENCE_EVIDENCE)
+        {
+            return Ok(());
+        }
         state
             .userapp_store
             .settle_fenced_operation(&record, &evidence, UNCLAIMED_RELEASE_NOTE)

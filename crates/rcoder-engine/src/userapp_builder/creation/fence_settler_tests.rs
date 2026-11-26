@@ -2063,11 +2063,11 @@ async fn default_recovery_metadata_claim_reconciles_but_unknown_generation_write
 
 /// 无执行者围栏夹具：自定义围栏 step，返回 store 句柄供 test-support 钩子
 /// 清空执行者（构造历史版本数据 / 人工 SQL 的形态）。
-pub(crate) async fn fence_state_with_step(
+async fn unclaimed_fence_state(
     runtime: Arc<FenceRuntime>,
     kind: shared_types::UserAppOperationKind,
     operation_id: &str,
-    step: &'static str,
+    seed: TerminalSeed,
     fence_settle_grace_secs: Option<u64>,
     bind_receipt: Option<shared_types::UserAppOperationLeaseReceipt>,
 ) -> (
@@ -2090,26 +2090,35 @@ pub(crate) async fn fence_state_with_step(
         store,
         fence_settle_grace_secs,
         bind_receipt,
-        TerminalSeed {
-            state: UserAppOperationState::RecoveryRequired,
-            step,
-            checkpoint: None,
-            error_message: None,
-        },
+        seed,
     )
     .await
 }
 
-/// 无执行者围栏（未派发 step、无回执、超龄）→ 扫描器身份收束，受理槽释放。
+fn legacy_preflight_seed() -> TerminalSeed {
+    TerminalSeed {
+        state: UserAppOperationState::RecoveryRequired,
+        step: "creation_result",
+        checkpoint: Some(serde_json::Value::Null),
+        error_message: Some(
+            "ensure UserappBuilder failed: Concurrent resource update: Application resource identity mismatch: rcoder.io/application-id",
+        ),
+    }
+}
+
+/// A positive observation of the recognized historical rejection frees admission.
 #[tokio::test]
-async fn unclaimed_pre_dispatch_fence_settles_with_scanner_identity() {
-    let operation_id = "op-unclaimed-claimed";
+async fn unclaimed_legacy_preflight_settles_after_positive_absence() {
+    let operation_id = "op-unclaimed-legacy-preflight";
     let runtime = FenceRuntime::scenario(None, None);
-    let (state, store) = fence_state_with_step(
+    runtime
+        .retained_creation_absent
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (state, store) = unclaimed_fence_state(
         runtime,
         UserAppOperationKind::EnsureBuilder,
         operation_id,
-        "claimed",
+        legacy_preflight_seed(),
         Some(0),
         None,
     )
@@ -2126,7 +2135,8 @@ async fn unclaimed_pre_dispatch_fence_settles_with_scanner_identity() {
     let record = settled(&state, operation_id).await;
     assert_eq!(record.state, UserAppOperationState::Failed);
     assert_eq!(
-        record.checkpoint["fence_released_evidence"]["kind"], "unclaimed",
+        record.checkpoint["fence_released_evidence"]["kind"],
+        shared_types::LEGACY_BUILDER_PREFLIGHT_ABSENCE_EVIDENCE,
         "{:?}",
         record.checkpoint["fence_released_evidence"]
     );
@@ -2160,11 +2170,11 @@ async fn unclaimed_pre_dispatch_fence_settles_with_scanner_identity() {
 async fn unclaimed_fence_with_original_receipt_keeps() {
     let operation_id = "op-unclaimed-receipt";
     let runtime = FenceRuntime::scenario(None, None);
-    let (state, store) = fence_state_with_step(
+    let (state, store) = unclaimed_fence_state(
         runtime,
         UserAppOperationKind::EnsureBuilder,
         operation_id,
-        "claimed",
+        legacy_preflight_seed(),
         Some(0),
         Some(shared_types::UserAppOperationLeaseReceipt::Docker {
             service_type: ServiceType::UserappBuilder,
@@ -2190,32 +2200,60 @@ async fn unclaimed_fence_with_original_receipt_keeps() {
     );
 }
 
-/// 无执行者围栏落在已派发步骤（runtime_updated）→ 保持围栏：创建超时路径
-/// 会在写围栏后继续等待已派发的运行时创建。
 #[tokio::test]
-async fn unclaimed_dispatched_step_fence_keeps() {
-    let operation_id = "op-unclaimed-dispatched";
-    let runtime = FenceRuntime::scenario(None, None);
-    let (state, store) = fence_state_with_step(
-        runtime,
-        UserAppOperationKind::EnsureBuilder,
-        operation_id,
-        "runtime_updated",
-        Some(0),
-        None,
-    )
-    .await;
-    store
-        .clear_operation_executor_for_test("fenced", operation_id)
-        .await
-        .expect("clear executor");
-    let snapshot = settled(&state, operation_id).await;
-    reconcile_fenced_ensure(&state, &snapshot)
-        .await
-        .expect("scan keeps dispatched fence");
-    assert_eq!(
-        settled(&state, operation_id).await.state,
-        UserAppOperationState::RecoveryRequired,
-        "已派发步骤不得收束"
-    );
+async fn unclaimed_fences_without_preflight_and_runtime_evidence_stay_fenced() {
+    for (step, seed, confirms_absence) in [
+        (
+            "claimed",
+            TerminalSeed {
+                state: UserAppOperationState::RecoveryRequired,
+                step: "claimed",
+                checkpoint: Some(serde_json::Value::Null),
+                error_message: None,
+            },
+            true,
+        ),
+        (
+            "runtime_updated",
+            TerminalSeed::fence(UserAppOperationState::RecoveryRequired),
+            true,
+        ),
+        ("creation_result", legacy_preflight_seed(), false),
+    ] {
+        let operation_id = format!("op-unclaimed-{step}");
+        let runtime = FenceRuntime::scenario(None, None);
+        runtime
+            .retained_creation_absent
+            .store(confirms_absence, std::sync::atomic::Ordering::SeqCst);
+        let (state, store) = unclaimed_fence_state(
+            runtime,
+            UserAppOperationKind::EnsureBuilder,
+            &operation_id,
+            seed,
+            Some(0),
+            None,
+        )
+        .await;
+        store
+            .clear_operation_executor_for_test("fenced", &operation_id)
+            .await
+            .expect("clear executor");
+        let snapshot = settled(&state, &operation_id).await;
+        assert_eq!(snapshot.step, step);
+        assert!(snapshot.executor_id.is_none());
+        reconcile_fenced_ensure(&state, &snapshot)
+            .await
+            .expect("scan leaves fence in place");
+        assert_eq!(settled(&state, &operation_id).await, snapshot);
+        let app = state
+            .userapp_store
+            .get_application("fenced")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            app.active_operations.dev.as_deref(),
+            Some(operation_id.as_str())
+        );
+    }
 }

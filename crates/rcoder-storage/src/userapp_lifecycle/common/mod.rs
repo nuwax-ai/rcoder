@@ -77,16 +77,20 @@ impl ToastyUserAppStore {
         let operation_id = operation_id.to_owned();
         self.run(false, move |tx, backend| {
             Box::pin(async move {
-                toasty::sql::statement(repo::sql(
+                let changed = toasty::sql::statement(repo::sql(
                     backend,
                     "UPDATE userapp_operations SET executor_id=NULL \
-                     WHERE app_id=$1 AND operation_id=$2",
+                     WHERE app_id=$1 AND operation_id=$2 \
+                       AND state='recovery_required' AND executor_id IS NOT NULL",
                 ))
                 .bind(&app_id)
                 .bind(&operation_id)
                 .exec(tx)
                 .await
                 .map_err(storage)?;
+                if changed != 1 {
+                    return Err(UserAppStoreError::VersionConflict);
+                }
                 Ok(())
             })
         })

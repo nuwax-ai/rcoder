@@ -399,50 +399,6 @@ pub enum UserAppOperationKind {
     DeleteApplication,
 }
 impl UserAppOperationKind {
-    /// 无执行者声明的围栏（历史版本数据/人工 SQL）能否被通用扫描器收束。
-    ///
-    /// 只覆盖非破坏性意图：删除族与存储销毁/清空/口令/库准备操作即使没有
-    /// 执行者，也可能已发出不可撤销的副作用，必须走各自的专用恢复路径，
-    /// 不允许按"无人认领"直接终态化。新增 kind 必须在此显式决定。
-    pub const fn allows_unclaimed_settle(self) -> bool {
-        match self {
-            Self::EnsureBuilder
-            | Self::AdoptBuilder
-            | Self::AdoptApplication
-            | Self::StopBuilder
-            | Self::RestartBuilder
-            | Self::Create
-            | Self::StartDeployment
-            | Self::RestartDeployment
-            | Self::Update
-            | Self::Start
-            | Self::Restart
-            | Self::Stop
-            | Self::SetRecyclePolicy
-            | Self::HotDeploy => true,
-            Self::DeleteCompute
-            | Self::PurgeResources
-            | Self::DeleteApplication
-            | Self::DestroyDevStorage
-            | Self::DestroyProdStorage
-            | Self::ClearDevStorage
-            | Self::ClearProdStorage
-            | Self::PrepareProdDatabase
-            | Self::ResetDevDatabasePassword
-            | Self::ResetProdDatabasePassword => false,
-        }
-    }
-
-    /// 无执行者围栏能否在 `step` 上被通用扫描器收束。
-    ///
-    /// 证据前提是"没有任何写入被派发过"：创建超时等路径会在写围栏之后继续
-    /// 等待**已经派发**的运行时创建，原生租约（K8s Lease / Docker flock）可能
-    /// 仍然活着——只凭 kind 与年龄放行会清掉受理槽而把在途写入留在原地。
-    /// 目前只有尚未派发的 `claimed` 步骤满足；新增 step 必须逐项评估，
-    /// 已向运行时派发写入的 step 一律不得加入。
-    pub fn may_unclaimed_settle(self, step: &str) -> bool {
-        self.allows_unclaimed_settle() && matches!(step, "claimed")
-    }
     pub fn supports_hot_deployment(self) -> bool {
         match self {
             Self::HotDeploy | Self::StartDeployment | Self::RestartDeployment => true,
@@ -561,7 +517,23 @@ pub struct UserAppOperationRecord {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Evidence recorded after verifying that a historical builder preflight
+/// rejection left no active builder or operation lease.
+pub const LEGACY_BUILDER_PREFLIGHT_ABSENCE_EVIDENCE: &str =
+    "legacy_creation_preflight_rejected_compute_absent";
+
 impl UserAppOperationRecord {
+    /// Recognize the historical read-side identity rejection before creation.
+    /// A generic `claimed` checkpoint does not prove that no write was sent.
+    pub fn is_legacy_builder_preflight_rejection(&self) -> bool {
+        self.kind == UserAppOperationKind::EnsureBuilder
+            && self.step == "creation_result"
+            && self.checkpoint.is_null()
+            && self.error_message.as_deref().is_some_and(|message| {
+                message.starts_with("ensure UserappBuilder failed: Concurrent resource update: Application resource identity mismatch:")
+            })
+    }
+
     /// Structured conflict detail naming this operation as the blocker of an
     /// admission or replay attempt.
     pub fn blocker(&self) -> UserAppOperationBlocker {
@@ -2142,71 +2114,5 @@ mod kani_scope_conflict_proofs {
             userapp_scope_blocks_request(requested, blocker),
             userapp_scope_blocks_request(blocker, requested)
         );
-    }
-}
-
-#[cfg(test)]
-mod unclaimed_settle_policy_tests {
-    use super::UserAppOperationKind;
-
-    #[test]
-    fn non_destructive_kinds_allow_unclaimed_settle() {
-        for kind in [
-            UserAppOperationKind::EnsureBuilder,
-            UserAppOperationKind::AdoptBuilder,
-            UserAppOperationKind::AdoptApplication,
-            UserAppOperationKind::StopBuilder,
-            UserAppOperationKind::RestartBuilder,
-            UserAppOperationKind::Create,
-            UserAppOperationKind::StartDeployment,
-            UserAppOperationKind::RestartDeployment,
-            UserAppOperationKind::Update,
-            UserAppOperationKind::Start,
-            UserAppOperationKind::Restart,
-            UserAppOperationKind::Stop,
-            UserAppOperationKind::SetRecyclePolicy,
-            UserAppOperationKind::HotDeploy,
-        ] {
-            assert!(kind.allows_unclaimed_settle(), "{kind:?}");
-        }
-    }
-
-    #[test]
-    fn only_pre_dispatch_steps_may_settle_unclaimed() {
-        assert!(UserAppOperationKind::EnsureBuilder.may_unclaimed_settle("claimed"));
-        for step in [
-            "runtime_updated",
-            "creation_result",
-            "adopted",
-            "confirmed",
-            "compute_confirmed",
-            "storage_captured",
-            "worker_interrupted",
-        ] {
-            assert!(
-                !UserAppOperationKind::EnsureBuilder.may_unclaimed_settle(step),
-                "{step}"
-            );
-        }
-        // kind 门与 step 门同时生效。
-        assert!(!UserAppOperationKind::PrepareProdDatabase.may_unclaimed_settle("claimed"));
-    }
-
-    #[test]
-    fn destructive_and_delete_kinds_keep_dedicated_recovery() {
-        for kind in [
-            UserAppOperationKind::DeleteCompute,
-            UserAppOperationKind::PurgeResources,
-            UserAppOperationKind::DeleteApplication,
-            UserAppOperationKind::DestroyDevStorage,
-            UserAppOperationKind::DestroyProdStorage,
-            UserAppOperationKind::ClearDevStorage,
-            UserAppOperationKind::ClearProdStorage,
-            UserAppOperationKind::PrepareProdDatabase,
-            UserAppOperationKind::ResetDevDatabasePassword,
-            UserAppOperationKind::ResetProdDatabasePassword,
-        ] {
-            assert!(!kind.allows_unclaimed_settle(), "{kind:?}");
-        }
     }
 }

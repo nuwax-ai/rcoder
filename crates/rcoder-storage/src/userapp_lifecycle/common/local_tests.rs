@@ -828,7 +828,7 @@ async fn unclaimed_fenced_record_settles_and_frees_admission_slot() {
             step: step.into(),
             checkpoint: serde_json::Value::Null,
             error_code: None,
-            error_message: None,
+            error_message: (step == "creation_result").then(|| "ensure UserappBuilder failed: Concurrent resource update: Application resource identity mismatch: rcoder.io/application-id".into()),
         }
     };
     let running = store
@@ -843,7 +843,7 @@ async fn unclaimed_fenced_record_settles_and_frees_admission_slot() {
         .advance(&progress(
             &running,
             UserAppOperationState::RecoveryRequired,
-            "claimed",
+            "creation_result",
         ))
         .await
         .expect("fence");
@@ -870,10 +870,17 @@ async fn unclaimed_fenced_record_settles_and_frees_admission_slot() {
     assert_eq!(unclaimed.state, UserAppOperationState::RecoveryRequired);
     assert!(unclaimed.executor_id.is_none(), "fixture: 无执行者声明");
 
+    assert!(matches!(
+        store
+            .settle_fenced_operation(&unclaimed, &serde_json::json!({}), "missing observation")
+            .await,
+        Err(Error::InvalidOperation(_))
+    ));
+
     let settled = store
         .settle_fenced_operation(
             &unclaimed,
-            &serde_json::json!({"kind": "unclaimed"}),
+            &serde_json::json!({"kind": shared_types::LEGACY_BUILDER_PREFLIGHT_ABSENCE_EVIDENCE}),
             "unclaimed beyond settle grace; outcome unverifiable; retry the operation",
         )
         .await
@@ -952,7 +959,7 @@ async fn unclaimed_fence_with_original_lease_is_refused() {
             step: step.into(),
             checkpoint: serde_json::Value::Null,
             error_code: None,
-            error_message: None,
+            error_message: (step == "creation_result").then(|| "ensure UserappBuilder failed: Concurrent resource update: Application resource identity mismatch: rcoder.io/application-id".into()),
         }
     };
     let running = store
@@ -985,7 +992,7 @@ async fn unclaimed_fence_with_original_lease_is_refused() {
         .advance(&progress(
             &running,
             UserAppOperationState::RecoveryRequired,
-            "claimed",
+            "creation_result",
         ))
         .await
         .expect("fence");
@@ -1012,7 +1019,7 @@ async fn unclaimed_fence_with_original_lease_is_refused() {
     let error = store
         .settle_fenced_operation(
             &unclaimed,
-            &serde_json::json!({"kind": "unclaimed", "identity": "scanner"}),
+            &serde_json::json!({"kind": shared_types::LEGACY_BUILDER_PREFLIGHT_ABSENCE_EVIDENCE}),
             "unclaimed beyond settle grace; outcome unverifiable; retry the operation",
         )
         .await
