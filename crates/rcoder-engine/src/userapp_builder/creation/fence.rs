@@ -285,11 +285,17 @@ const DEFAULT_FENCE_SETTLE_GRACE_SECS: u64 = 900;
 /// 副本的竞争窗口——这类围栏没有持有者，不存在在途写入需要等待。
 const DEFAULT_UNCLAIMED_SETTLE_GRACE_SECS: u64 = 60;
 
-/// 围栏是否已超过收束留出的宽限期（自 created_at 计龄，保守取更长的等待）。
-fn fence_aged_beyond(record: &UserAppOperationRecord, grace_secs: u64) -> bool {
+/// 时间点是否已早于"当前 − 宽限期"。
+///
+/// 两条收束路径的计龄基准不同：
+/// - holder 死亡兜底用 `created_at`（记录仅暴露该时间；它早于最近状态变更，
+///   门槛因此更容易满足——该路径的安全依赖死亡探针，年龄只是下限）；
+/// - 无执行者快路径用 `updated_at`（最近一次状态变更 ≈ 落围栏时刻），
+///   因为它没有任何探针，年龄就是唯一的安全门。
+fn aged_beyond(timestamp: chrono::DateTime<chrono::Utc>, grace_secs: u64) -> bool {
     let grace_us = i64::try_from(grace_secs.saturating_mul(1_000_000)).unwrap_or(i64::MAX);
     let now_us = chrono::Utc::now().timestamp_micros();
-    now_us.saturating_sub(record.created_at.timestamp_micros()) >= grace_us
+    now_us.saturating_sub(timestamp.timestamp_micros()) >= grace_us
 }
 
 /// holder 死亡兜底判定（围栏有界保证）：**围栏超龄 ∧ 持有者已死**。
@@ -318,7 +324,7 @@ pub(crate) async fn holder_expired(state: &AppState, record: &UserAppOperationRe
         .config
         .fence_settle_grace_secs
         .unwrap_or(DEFAULT_FENCE_SETTLE_GRACE_SECS);
-    if !fence_aged_beyond(record, grace) {
+    if !aged_beyond(record.created_at, grace) {
         return false;
     }
     match state
@@ -413,25 +419,86 @@ pub(crate) async fn reconcile_fenced_ensure(
     // 无执行者声明的围栏（历史版本数据或人工 SQL；admit 之后必须先取得执行
     // 者才会流转，当前 API 产生不了这种记录）没有任何执行器可以续做——
     // RecoveryRequired 只允许持有者推进，而这里根本没有持有者。留着只会
-    // 永久占用受理槽：超龄后按"无人认领"收束为 Failed（只记账，不授权
-    // 任何运行时工作），宽限期内保守等待。
+    // 永久占用受理槽，因此按两条受控路径收束（都只落 Failed 记账，绝不
+    // 授权任何运行时工作）。
     if record.executor_id.is_none() {
-        let grace = state
-            .config
-            .unclaimed_settle_grace_secs
-            .unwrap_or(DEFAULT_UNCLAIMED_SETTLE_GRACE_SECS);
-        if !fence_aged_beyond(&record, grace) {
+        // 删除族与存储销毁/清空/口令/库准备不走这条快路径：即使没有执行者，
+        // 它们也可能已发出不可撤销的副作用，必须由各自的专用恢复路径处理。
+        if !record.kind.allows_unclaimed_settle() {
             tracing::warn!(
                 operation_id = %record.operation_id,
                 app_id = %record.app_id,
-                "Fence kept: unclaimed record within settle grace"
+                kind = ?record.kind,
+                "Fence kept: unclaimed record requires a dedicated recovery path"
             );
             return Ok(());
         }
-        let evidence = serde_json::json!({
-            "kind": "unclaimed",
-            "checked_at_us": chrono::Utc::now().timestamp_micros(),
-        });
+        let binding = state
+            .userapp_store
+            .get_operation_lease(&record.app_id, &record.operation_id)
+            .await?;
+        let evidence = if binding.is_some() {
+            // 原租约回执仍在：沿用 holder 死亡语义对账（宽限 + 运行时死亡
+            // 探针）；收束时存储层沿用回执里的原执行者身份，终态租约扫描
+            // 才能按 owns() 命中并完成清理，物理标记也留在原授权链上。
+            if !holder_expired(state, &record).await {
+                tracing::warn!(
+                    operation_id = %record.operation_id,
+                    app_id = %record.app_id,
+                    "Fence kept: unclaimed record with original lease binding not proven dead"
+                );
+                return Ok(());
+            }
+            serde_json::json!({
+                "kind": "unclaimed",
+                "identity": "original",
+                "checked_at_us": chrono::Utc::now().timestamp_micros(),
+            })
+        } else {
+            // 无任何租约行：没有在途写入。计龄取 updated_at（最近一次状态
+            // 变更 ≈ 落围栏时刻），读不到就保守保持围栏等下一轮。
+            let updated_at = match state
+                .userapp_store
+                .get_operation_updated_at(&record.app_id, &record.operation_id, record.revision)
+                .await
+            {
+                Ok(Some(updated_at)) => updated_at,
+                Ok(None) => {
+                    tracing::warn!(
+                        operation_id = %record.operation_id,
+                        app_id = %record.app_id,
+                        "Fence kept: unclaimed record has no readable updated_at"
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        operation_id = %record.operation_id,
+                        app_id = %record.app_id,
+                        %error,
+                        "Fence kept: unclaimed record updated_at read failed"
+                    );
+                    return Ok(());
+                }
+            };
+            let grace = state
+                .config
+                .unclaimed_settle_grace_secs
+                .unwrap_or(DEFAULT_UNCLAIMED_SETTLE_GRACE_SECS);
+            if !aged_beyond(updated_at, grace) {
+                tracing::warn!(
+                    operation_id = %record.operation_id,
+                    app_id = %record.app_id,
+                    "Fence kept: unclaimed record within settle grace"
+                );
+                return Ok(());
+            }
+            serde_json::json!({
+                "kind": "unclaimed",
+                "identity": "scanner",
+                "checked_at_us": chrono::Utc::now().timestamp_micros(),
+            })
+        };
         state
             .userapp_store
             .settle_fenced_operation(&record, &evidence, UNCLAIMED_RELEASE_NOTE)
@@ -563,30 +630,30 @@ mod settle_grace_tests {
 
     #[test]
     fn holder_grace_defaults_to_900s() {
-        assert!(!fence_aged_beyond(
-            &record_aged_secs(899),
+        assert!(!aged_beyond(
+            record_aged_secs(899).created_at,
             DEFAULT_FENCE_SETTLE_GRACE_SECS
         ));
-        assert!(fence_aged_beyond(
-            &record_aged_secs(901),
+        assert!(aged_beyond(
+            record_aged_secs(901).created_at,
             DEFAULT_FENCE_SETTLE_GRACE_SECS
         ));
     }
 
     #[test]
     fn unclaimed_grace_defaults_to_60s() {
-        assert!(!fence_aged_beyond(
-            &record_aged_secs(59),
+        assert!(!aged_beyond(
+            record_aged_secs(59).created_at,
             DEFAULT_UNCLAIMED_SETTLE_GRACE_SECS
         ));
-        assert!(fence_aged_beyond(
-            &record_aged_secs(61),
+        assert!(aged_beyond(
+            record_aged_secs(61).created_at,
             DEFAULT_UNCLAIMED_SETTLE_GRACE_SECS
         ));
     }
 
     #[test]
     fn zero_grace_settles_any_aged_record() {
-        assert!(fence_aged_beyond(&record_aged_secs(1), 0));
+        assert!(aged_beyond(record_aged_secs(1).created_at, 0));
     }
 }

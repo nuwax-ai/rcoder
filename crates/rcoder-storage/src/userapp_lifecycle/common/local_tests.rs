@@ -879,6 +879,11 @@ async fn unclaimed_fenced_record_settles_and_frees_admission_slot() {
         .await
         .expect("unclaimed fence must settle");
     assert_eq!(settled.state, UserAppOperationState::Failed);
+    assert_eq!(
+        settled.executor_id.as_deref(),
+        Some("rcoder-recovery-settle"),
+        "无租约行时由扫描器身份认领终态"
+    );
     assert!(
         settled
             .error_message
@@ -898,5 +903,215 @@ async fn unclaimed_fenced_record_settles_and_frees_admission_slot() {
         UserAppAdmissionOutcome::Accepted(_) => {}
         other => panic!("收束后同 scope 必须可受理: {other:?}"),
     }
+    store.shutdown().await.expect("shutdown");
+}
+
+/// 无执行者围栏但原租约回执仍在：收束必须沿用回执里的原执行者身份——
+/// 终态租约扫描按 owns() 比对执行者，换身份会让回执永久滞留、失去清理入口。
+#[tokio::test]
+async fn unclaimed_fence_with_original_lease_adopts_original_executor() {
+    use shared_types::{
+        UserAppAdmission, UserAppAdmissionOutcome, UserAppExecutionContext, UserAppOperationKind,
+        UserAppOperationLeaseReceipt, UserAppOperationProgress, UserAppOperationState,
+    };
+
+    let dir = tempfile::tempdir().expect("dir");
+    let path = std::path::absolute(dir.path().join("unclaimed-lease.turso.db")).expect("abs");
+    let store = TursoUserAppStore::open_exclusive(&path)
+        .await
+        .expect("open");
+    store.ensure_identity("unclaimedlease").await.expect("identity");
+
+    let request = UserAppAdmission {
+        runtime_policy_on_success: None,
+        command: None,
+        metadata: None,
+        app_id: "unclaimedlease".into(),
+        lifecycle_id: None,
+        operation_id: "op-unclaimed-lease".into(),
+        request_id: Some("req-op-unclaimed-lease".into()),
+        request_fingerprint: "c".repeat(64),
+        kind: UserAppOperationKind::EnsureBuilder,
+    };
+    let admitted = match store.admit(&request).await.expect("admit") {
+        UserAppAdmissionOutcome::Accepted(op) => op,
+        other => panic!("unexpected admission: {other:?}"),
+    };
+    let progress = |op: &UserAppOperationRecord,
+                    state: UserAppOperationState,
+                    step: &str| UserAppOperationProgress {
+        app_id: op.app_id.clone(),
+        operation_id: op.operation_id.clone(),
+        lifecycle_id: op.lifecycle_id.clone(),
+        expected_revision: op.revision,
+        executor_id: "worker-legacy".into(),
+        state,
+        step: step.into(),
+        checkpoint: serde_json::Value::Null,
+        error_code: None,
+        error_message: None,
+    };
+    let running = store
+        .advance(&progress(
+            &admitted,
+            UserAppOperationState::Running,
+            "claimed",
+        ))
+        .await
+        .expect("claim");
+    store
+        .bind_operation_lease(
+            &UserAppExecutionContext {
+                app_id: running.app_id.clone(),
+                lifecycle_id: running.lifecycle_id.clone(),
+                operation_id: running.operation_id.clone(),
+                executor_id: "worker-legacy".into(),
+                request_fingerprint: running.request_fingerprint.clone(),
+            },
+            &UserAppOperationLeaseReceipt::Docker {
+                service_type: shared_types::ServiceType::UserappBuilder,
+                device: 1,
+                inode: 42,
+                token: "legacy".into(),
+            },
+        )
+        .await
+        .expect("bind lease");
+    store
+        .advance(&progress(
+            &running,
+            UserAppOperationState::RecoveryRequired,
+            "runtime_updated",
+        ))
+        .await
+        .expect("fence");
+    store
+        .owner
+        .execute(|mut db| async move {
+            toasty::sql::statement(
+                "UPDATE userapp_operations SET executor_id=NULL \
+                 WHERE app_id='unclaimedlease' AND operation_id='op-unclaimed-lease'",
+            )
+            .exec(&mut db)
+            .await?;
+            Ok(())
+        })
+        .await
+        .expect("clear executor");
+
+    let unclaimed = store
+        .get_operation("unclaimedlease", "op-unclaimed-lease")
+        .await
+        .expect("read")
+        .expect("record");
+    assert!(unclaimed.executor_id.is_none(), "fixture: 无执行者声明");
+    let settled = store
+        .settle_fenced_operation(
+            &unclaimed,
+            &serde_json::json!({"kind": "unclaimed", "identity": "original"}),
+            "unclaimed beyond settle grace; outcome unverifiable; retry the operation",
+        )
+        .await
+        .expect("settle adopts original lease identity");
+    assert_eq!(settled.state, UserAppOperationState::Failed);
+    assert_eq!(
+        settled.executor_id.as_deref(),
+        Some("worker-legacy"),
+        "原租约回执在时收束必须沿用原执行者身份，终态租约扫描才能命中清理"
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+/// 破坏性 kind（库准备/销毁/口令族）的无执行者围栏不允许走通用收束快路径——
+/// 必须留给各自的专用恢复路径。
+#[tokio::test]
+async fn unclaimed_destructive_fence_is_refused() {
+    use shared_types::{
+        UserAppAdmission, UserAppAdmissionOutcome, UserAppControlCommand, UserAppOperationKind,
+        UserAppOperationProgress, UserAppOperationState,
+    };
+
+    let dir = tempfile::tempdir().expect("dir");
+    let path = std::path::absolute(dir.path().join("unclaimed-destructive.turso.db")).expect("abs");
+    let store = TursoUserAppStore::open_exclusive(&path)
+        .await
+        .expect("open");
+    store.ensure_identity("unclaimeddestr").await.expect("identity");
+
+    let request = UserAppAdmission {
+        runtime_policy_on_success: None,
+        command: Some(UserAppControlCommand::PrepareProdDatabase),
+        metadata: None,
+        app_id: "unclaimeddestr".into(),
+        lifecycle_id: None,
+        operation_id: "op-unclaimed-destr".into(),
+        request_id: Some("req-op-unclaimed-destr".into()),
+        request_fingerprint: "d".repeat(64),
+        kind: UserAppOperationKind::PrepareProdDatabase,
+    };
+    let admitted = match store.admit(&request).await.expect("admit") {
+        UserAppAdmissionOutcome::Accepted(op) => op,
+        other => panic!("unexpected admission: {other:?}"),
+    };
+    let progress = |op: &UserAppOperationRecord,
+                    state: UserAppOperationState,
+                    step: &str| UserAppOperationProgress {
+        app_id: op.app_id.clone(),
+        operation_id: op.operation_id.clone(),
+        lifecycle_id: op.lifecycle_id.clone(),
+        expected_revision: op.revision,
+        executor_id: "worker-legacy".into(),
+        state,
+        step: step.into(),
+        checkpoint: serde_json::Value::Null,
+        error_code: None,
+        error_message: None,
+    };
+    let running = store
+        .advance(&progress(
+            &admitted,
+            UserAppOperationState::Running,
+            "claimed",
+        ))
+        .await
+        .expect("claim");
+    store
+        .advance(&progress(
+            &running,
+            UserAppOperationState::RecoveryRequired,
+            "runtime_updated",
+        ))
+        .await
+        .expect("fence");
+    store
+        .owner
+        .execute(|mut db| async move {
+            toasty::sql::statement(
+                "UPDATE userapp_operations SET executor_id=NULL \
+                 WHERE app_id='unclaimeddestr' AND operation_id='op-unclaimed-destr'",
+            )
+            .exec(&mut db)
+            .await?;
+            Ok(())
+        })
+        .await
+        .expect("clear executor");
+    let unclaimed = store
+        .get_operation("unclaimeddestr", "op-unclaimed-destr")
+        .await
+        .expect("read")
+        .expect("record");
+    let error = store
+        .settle_fenced_operation(
+            &unclaimed,
+            &serde_json::json!({"kind": "unclaimed"}),
+            "unclaimed beyond settle grace; outcome unverifiable; retry the operation",
+        )
+        .await
+        .expect_err("destructive kind must be refused");
+    assert!(
+        matches!(error, Error::InvalidOperation(_)),
+        "破坏性 kind 必须走专用恢复路径: {error:?}"
+    );
     store.shutdown().await.expect("shutdown");
 }

@@ -85,8 +85,12 @@ pub(crate) async fn finalize_observed_wake(
 ///
 /// A fence without an executor claim (legacy rows or manual SQL — the current
 /// API cannot produce one) has no executor that could ever resume it; it is
-/// settled the same way, with the settling scanner recorded as the executor of
-/// the terminal transition only.
+/// settled the same way for non-destructive kinds only. The terminal identity
+/// matters downstream: the terminal-lease recovery scan matches a lease to its
+/// operation by executor identity (`owns`), so when the original lease receipt
+/// still exists the settle **adopts the original executor identity** — the
+/// receipt keeps its normal cleanup entry. Only a fence with no lease row at
+/// all is settled under the scanner identity.
 pub(crate) async fn settle_fenced_operation(
     tx: &mut dyn Executor,
     backend: Backend,
@@ -105,17 +109,40 @@ pub(crate) async fn settle_fenced_operation(
     if op != *snapshot || op.state != UserAppOperationState::RecoveryRequired {
         return Err(Error::VersionConflict);
     }
+    // 无执行者声明的围栏只允许非破坏性 kind 收束：删除族与存储销毁/清空/
+    // 口令/库准备即使没有执行者，也可能已发出不可撤销的副作用，必须走各自
+    // 的专用恢复路径（引擎侧同样先行分流，这里兜底拒绝）。
+    if op.executor_id.is_none() && !op.kind.allows_unclaimed_settle() {
+        return Err(Error::InvalidOperation(
+            "unclaimed fence settlement requires a dedicated recovery path for this kind".into(),
+        ));
+    }
     let before_app = app.clone();
     // 无执行者声明的围栏（历史版本数据或人工 SQL；admit 之后必须先取得执行
     // 者才会流转，当前 API 产生不了这种记录）没有任何执行器可以续做——把
-    // 它留着只会永久占用受理槽。收束者为这次终态转移认领记录
-    // （AcquireExecutor 语义），只落 Failed 记账，绝不授权运行时工作。
+    // 它留着只会永久占用受理槽。终态身份必须与下游对账入口一致：
+    // · 原租约回执仍在 → 沿用回执里的原执行者身份收束（终态租约扫描按
+    //   owns() 才能命中并完成清理，物理标记也留在原授权链上）；
+    // · 无任何租约行 → 由扫描器身份认领（AcquireExecutor 语义）后终态化。
+    // 两者都只落 Failed 记账，绝不授权任何运行时工作。
     let settling_executor = match op.executor_id.clone() {
         Some(executor) => executor,
         None => {
-            let executor = UNCLAIMED_SETTLE_EXECUTOR.to_owned();
-            op.executor_id = Some(executor.clone());
-            executor
+            match get_operation_lease(tx, backend, &op.app_id, &op.operation_id).await? {
+                Some(binding) => {
+                    if binding.context.lifecycle_id != op.lifecycle_id {
+                        return Err(Error::VersionConflict);
+                    }
+                    let executor = binding.context.executor_id;
+                    op.executor_id = Some(executor.clone());
+                    executor
+                }
+                None => {
+                    let executor = UNCLAIMED_SETTLE_EXECUTOR.to_owned();
+                    op.executor_id = Some(executor.clone());
+                    executor
+                }
+            }
         }
     };
     let mut checkpoint = op.checkpoint.clone();

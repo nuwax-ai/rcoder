@@ -399,6 +399,39 @@ pub enum UserAppOperationKind {
     DeleteApplication,
 }
 impl UserAppOperationKind {
+    /// 无执行者声明的围栏（历史版本数据/人工 SQL）能否被通用扫描器收束。
+    ///
+    /// 只覆盖非破坏性意图：删除族与存储销毁/清空/口令/库准备操作即使没有
+    /// 执行者，也可能已发出不可撤销的副作用，必须走各自的专用恢复路径，
+    /// 不允许按"无人认领"直接终态化。新增 kind 必须在此显式决定。
+    pub const fn allows_unclaimed_settle(self) -> bool {
+        match self {
+            Self::EnsureBuilder
+            | Self::AdoptBuilder
+            | Self::AdoptApplication
+            | Self::StopBuilder
+            | Self::RestartBuilder
+            | Self::Create
+            | Self::StartDeployment
+            | Self::RestartDeployment
+            | Self::Update
+            | Self::Start
+            | Self::Restart
+            | Self::Stop
+            | Self::SetRecyclePolicy
+            | Self::HotDeploy => true,
+            Self::DeleteCompute
+            | Self::PurgeResources
+            | Self::DeleteApplication
+            | Self::DestroyDevStorage
+            | Self::DestroyProdStorage
+            | Self::ClearDevStorage
+            | Self::ClearProdStorage
+            | Self::PrepareProdDatabase
+            | Self::ResetDevDatabasePassword
+            | Self::ResetProdDatabasePassword => false,
+        }
+    }
     pub fn supports_hot_deployment(self) -> bool {
         match self {
             Self::HotDeploy | Self::StartDeployment | Self::RestartDeployment => true,
@@ -2098,5 +2131,51 @@ mod kani_scope_conflict_proofs {
             userapp_scope_blocks_request(requested, blocker),
             userapp_scope_blocks_request(blocker, requested)
         );
+    }
+}
+
+
+#[cfg(test)]
+mod unclaimed_settle_policy_tests {
+    use super::UserAppOperationKind;
+
+    #[test]
+    fn non_destructive_kinds_allow_unclaimed_settle() {
+        for kind in [
+            UserAppOperationKind::EnsureBuilder,
+            UserAppOperationKind::AdoptBuilder,
+            UserAppOperationKind::AdoptApplication,
+            UserAppOperationKind::StopBuilder,
+            UserAppOperationKind::RestartBuilder,
+            UserAppOperationKind::Create,
+            UserAppOperationKind::StartDeployment,
+            UserAppOperationKind::RestartDeployment,
+            UserAppOperationKind::Update,
+            UserAppOperationKind::Start,
+            UserAppOperationKind::Restart,
+            UserAppOperationKind::Stop,
+            UserAppOperationKind::SetRecyclePolicy,
+            UserAppOperationKind::HotDeploy,
+        ] {
+            assert!(kind.allows_unclaimed_settle(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn destructive_and_delete_kinds_keep_dedicated_recovery() {
+        for kind in [
+            UserAppOperationKind::DeleteCompute,
+            UserAppOperationKind::PurgeResources,
+            UserAppOperationKind::DeleteApplication,
+            UserAppOperationKind::DestroyDevStorage,
+            UserAppOperationKind::DestroyProdStorage,
+            UserAppOperationKind::ClearDevStorage,
+            UserAppOperationKind::ClearProdStorage,
+            UserAppOperationKind::PrepareProdDatabase,
+            UserAppOperationKind::ResetDevDatabasePassword,
+            UserAppOperationKind::ResetProdDatabasePassword,
+        ] {
+            assert!(!kind.allows_unclaimed_settle(), "{kind:?}");
+        }
     }
 }
