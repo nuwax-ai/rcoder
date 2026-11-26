@@ -525,3 +525,103 @@ fn docker_diagnostic_evidence_uses_actual_cid_and_library_time() {
     inspect.id = None;
     assert!(docker_diagnostic_evidence(&inspect).is_none());
 }
+
+/// 隔离环境（租约标记根）后跑真实的 verify_absent_builder_recovery 断言。
+/// 子进程保持环境变量不污染并发测试。
+#[cfg(unix)]
+fn run_in_lease_root_child(test_name: &str) {
+    if std::env::var_os("RCODER_RECEIPT_ROOT_TEST_CHILD").is_none() {
+        let root = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("runtime::docker_runtime::agent_runtime::tests::{test_name}"),
+                "--nocapture",
+            ])
+            .env("RCODER_RECEIPT_ROOT_TEST_CHILD", "1")
+            .env("RCODER_OPERATION_RECEIPT_ROOT", root.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        // 防止测试名漂移导致子进程 0 匹配、断言空跑。
+        assert!(
+            stdout.contains("1 passed"),
+            "child test filter matched nothing:\n{stdout}\n{stderr}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn verify_absent_builder_recovery_accepts_absent_compute_and_authority() {
+    if std::env::var_os("RCODER_RECEIPT_ROOT_TEST_CHILD").is_none() {
+        run_in_lease_root_child(
+            "verify_absent_builder_recovery_accepts_absent_compute_and_authority",
+        );
+        return;
+    }
+    // inspect 404 → list 空 → recheck 404：计算确实缺席且无残留标记。
+    let f = fixture(
+        ServiceType::UserappBuilder,
+        vec![
+            (404, json!({"message":"not found"})),
+            (200, json!([])),
+            (404, json!({"message":"not found"})),
+        ],
+    )
+    .await;
+    assert!(
+        f.runtime
+            .verify_absent_builder_recovery(&context())
+            .await
+            .unwrap(),
+        "缺席计算 + 无原生授权必须发布缺席"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn verify_absent_builder_recovery_rejects_present_compute() {
+    if std::env::var_os("RCODER_RECEIPT_ROOT_TEST_CHILD").is_none() {
+        run_in_lease_root_child("verify_absent_builder_recovery_rejects_present_compute");
+        return;
+    }
+    let f = fixture(
+        ServiceType::UserappBuilder,
+        vec![(200, inspect(OLD_ID, "running"))],
+    )
+    .await;
+    assert!(
+        !f.runtime
+            .verify_absent_builder_recovery(&context())
+            .await
+            .unwrap(),
+        "builder 容器在时必须保持围栏"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn verify_absent_builder_recovery_rejects_live_authority() {
+    if std::env::var_os("RCODER_RECEIPT_ROOT_TEST_CHILD").is_none() {
+        run_in_lease_root_child("verify_absent_builder_recovery_rejects_live_authority");
+        return;
+    }
+    // 无 Docker 应答需求：活持有者的判断在原生锁探针处就返回 false。
+    let f = fixture(ServiceType::UserappBuilder, vec![]).await;
+    let lease = f
+        .runtime
+        .acquire_application_file_lease(&context().app_id, &ServiceType::UserappBuilder)
+        .await
+        .expect("hold builder family lease");
+    assert!(
+        !f.runtime
+            .verify_absent_builder_recovery(&context())
+            .await
+            .unwrap(),
+        "活持有者的原生锁在时必须保持围栏"
+    );
+    drop(lease);
+}

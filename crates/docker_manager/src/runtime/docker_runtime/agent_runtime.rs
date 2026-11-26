@@ -461,6 +461,41 @@ impl AgentContainerRuntime for DockerRuntime {
         }
     }
 
+    async fn verify_absent_builder_recovery(
+        &self,
+        context: &shared_types::UserAppExecutionContext,
+    ) -> ContainerRuntimeResult<bool> {
+        #[cfg(unix)]
+        {
+            use container_runtime_api::UnboundBuilderCreationAuthority;
+            // 仅用于"已核验的历史预检拒绝"围栏收束：要求计算缺席，且没有
+            // 任何原生创建授权（.app-operation-locks 的 flock 标记）。
+            // 活持有者 / 过期但未清理的原持有者 / 他人持有 / 查询失败
+            // 一律保持围栏——它们证明不了"没有写入被派发过"。
+            if !matches!(
+                self.observe_unbound_builder_creation_authority(context)
+                    .await?,
+                UnboundBuilderCreationAuthority::Absent
+            ) {
+                return Ok(false);
+            }
+            if !self.builder_compute_absent(context).await? {
+                return Ok(false);
+            }
+            // 探针期间可能有新创建拿到标记：发布缺席前再核一次授权面。
+            Ok(matches!(
+                self.observe_unbound_builder_creation_authority(context)
+                    .await?,
+                UnboundBuilderCreationAuthority::Absent
+            ))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = context;
+            Ok(false)
+        }
+    }
+
     async fn exec_builder_control_target(
         &self,
         target: &shared_types::BuilderControlTarget,
