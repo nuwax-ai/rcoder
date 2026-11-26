@@ -387,13 +387,30 @@ async fn locate(
                 }
                 // 链接自己被它的目标取代：相对目标从链接所在的目录接着走
                 resolved.pop();
+                let mut target_components = components(&target).peekable();
                 if target.is_absolute() {
-                    resolved.clear();
-                    confirmed.clear();
+                    // Keep the already traversed common host prefix. Starting
+                    // from scratch would treat even the shared, invisible
+                    // parents of the configured mount as a new visibility gap.
+                    let mut common = 0;
+                    for parent in &resolved {
+                        if target_components.next_if_eq(parent).is_none() {
+                            break;
+                        }
+                        common += 1;
+                    }
+                    resolved.truncate(common);
+                    confirmed.truncate(common);
                 }
-                queue = components(&target).chain(queue).collect();
+                queue = target_components.chain(queue).collect();
             }
             Sight::Seen(Entry::Missing) => return Ok(Location::Absent),
+            Sight::Unmounted if followed_link => {
+                return unconfirmed(
+                    "it leads through a symbolic link into a path RCoder cannot verify, so where it ends is unknown"
+                        .to_owned(),
+                );
+            }
             Sight::Unmounted => confirmed.push(false),
             Sight::Hidden => {
                 return unconfirmed(

@@ -792,6 +792,31 @@ async fn a_link_into_a_path_rcoder_cannot_verify_keeps_every_candidate() {
     }
 }
 
+#[tokio::test]
+async fn a_visible_leaf_does_not_prove_its_hidden_ancestors_are_unrelated() {
+    let tree = Tree::new();
+    let (unseen, real) = reentry_chain(&tree);
+    let backing = unseen.path().canonicalize().unwrap().join("reentry");
+    // Model a second bind of the nested directory. The leaf itself is
+    // observable by that mount, but the host path leading to it is not.
+    let resolver = HostPathResolver::from_mount_table(vec![
+        (real.join("nested"), backing.clone()),
+        (tree.base.clone(), PathBuf::from(HOST_BASE)),
+    ])
+    .unwrap();
+    let source = backing.to_str().unwrap();
+    assert!(matches!(
+        Tree::decide(
+            &HostPathSpace::Container(&resolver),
+            &real,
+            &[HOST_BASE, source, "/host/base/logs/alias/leaf"],
+            &LocalFileSystem,
+        )
+        .await,
+        LogDirMount::Unconfirmed(_)
+    ));
+}
+
 /// 同一条链，deploy-host 形态下每一级都看得到：解析到候选里面的目录，候选仍被挂载。
 #[tokio::test]
 async fn the_same_chain_is_resolved_by_the_full_host_view() {

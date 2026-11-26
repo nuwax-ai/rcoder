@@ -66,6 +66,8 @@ pub struct LogCleaner {
     /// 让每一次目录删除都失败而不真的删除。测试用：验证失败的删除同样占用每轮的名额
     #[cfg(test)]
     fail_deletions: bool,
+    #[cfg(test)]
+    recheck_delay: Duration,
 }
 
 impl LogCleaner {
@@ -88,6 +90,8 @@ impl LogCleaner {
             reclaim_batch: DIR_RECLAIM_BATCH,
             #[cfg(test)]
             fail_deletions: false,
+            #[cfg(test)]
+            recheck_delay: Duration::ZERO,
         }
     }
 
@@ -95,6 +99,12 @@ impl LogCleaner {
     #[cfg(test)]
     pub(super) fn with_reclaim_budget(mut self, budget: Duration) -> Self {
         self.reclaim_budget = budget;
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_recheck_delay(mut self, delay: Duration) -> Self {
+        self.recheck_delay = delay;
         self
     }
 
@@ -309,7 +319,22 @@ impl LogCleaner {
                 stats.dirs_deferred_by_budget += 1;
                 continue;
             }
-            let still_expired = match fs::symlink_metadata(&path).await {
+            let metadata = match tokio::time::timeout_at(deadline, async {
+                #[cfg(test)]
+                if !self.recheck_delay.is_zero() {
+                    tokio::time::sleep(self.recheck_delay).await;
+                }
+                fs::symlink_metadata(&path).await
+            })
+            .await
+            {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    stats.dirs_deferred_by_budget += 1;
+                    continue;
+                }
+            };
+            let still_expired = match metadata {
                 Ok(metadata) => metadata.is_dir() && is_older_than(&metadata, cutoff),
                 // 列目录之后目录已经消失：没有东西可删，也不是故障
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

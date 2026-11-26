@@ -213,6 +213,25 @@ async fn a_slow_observation_keeps_every_directory_and_releases_the_gate() {
     assert_eq!(stats.dirs_deleted, 2);
 }
 
+#[tokio::test]
+async fn a_slow_last_metadata_read_is_deferred_within_the_same_budget() {
+    let root = TempDir::new().unwrap();
+    let expired = aged_dir(root.path(), "runner-a", 15);
+    let inventory = FakeInventory::new(&[]);
+    let cleaner = cleaner(root.path(), inventory.clone())
+        .with_reclaim_budget(Duration::from_millis(100))
+        .with_recheck_delay(Duration::from_secs(3));
+
+    let started = std::time::Instant::now();
+    let stats = cleaner.cleanup_once().await.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(inventory.calls(), 1);
+    assert_eq!(stats.dirs_deferred_by_budget, 1);
+    assert_eq!(stats.dirs_skipped_unconfirmed, 0);
+    assert!(expired.is_dir());
+    assert!(docker_manager::try_begin_log_mount_cleanup().is_some());
+}
+
 /// 每轮最多发起一批目录删除，余下的留到下一轮。时间预算管不住"每个都很快、合起来却很多"
 /// 的批次，持锁期间的工作量还得有数量上限。
 #[tokio::test]
