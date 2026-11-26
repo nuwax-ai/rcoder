@@ -64,6 +64,36 @@ pub struct ToastyUserAppStore {
     #[cfg(test)]
     admission_gate: Option<std::sync::Arc<admission_cancellation_tests::AdmissionGate>>,
 }
+#[cfg(any(test, feature = "test-support"))]
+impl ToastyUserAppStore {
+    /// 测试辅助：把一条操作记录的执行者清空，构造"历史版本数据 / 人工 SQL"
+    /// 产生的无执行者声明形态（当前 API 产生不了这种记录）。
+    pub async fn clear_operation_executor_for_test(
+        &self,
+        app_id: &str,
+        operation_id: &str,
+    ) -> Result<(), UserAppStoreError> {
+        let app_id = app_id.to_owned();
+        let operation_id = operation_id.to_owned();
+        self.run(false, move |tx, backend| {
+            Box::pin(async move {
+                toasty::sql::statement(repo::sql(
+                    backend,
+                    "UPDATE userapp_operations SET executor_id=NULL \
+                     WHERE app_id=$1 AND operation_id=$2",
+                ))
+                .bind(&app_id)
+                .bind(&operation_id)
+                .exec(tx)
+                .await
+                .map_err(storage)?;
+                Ok(())
+            })
+        })
+        .await
+    }
+}
+
 impl ToastyUserAppStore {
     pub(crate) fn from_owner(owner: DatabaseOwner, backend: Backend) -> Self {
         Self {

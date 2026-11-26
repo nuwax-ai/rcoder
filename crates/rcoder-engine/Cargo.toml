@@ -50,6 +50,8 @@ deploy-host = ["shared_types/deploy-host", "docker_manager/deploy-host", "rcoder
 [dev-dependencies]
 # 真实 Docker 见证需要显式注入挂载表
 docker_manager = { workspace = true, features = ["test-support"] }
+# 围栏测试需要构造"历史数据/人工 SQL"的无执行者声明形态
+rcoder-storage = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 http-body-util = { workspace = true }
 toasty = { workspace = true }

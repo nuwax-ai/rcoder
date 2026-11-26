@@ -417,19 +417,25 @@ pub(crate) async fn reconcile_fenced_ensure(
         return Ok(());
     };
     // 无执行者声明的围栏（历史版本数据或人工 SQL；admit 之后必须先取得执行
-    // 者才会流转，当前 API 产生不了这种记录）没有任何执行器可以续做——
-    // RecoveryRequired 只允许持有者推进，而这里根本没有持有者。留着只会
-    // 永久占用受理槽，因此按两条受控路径收束（都只落 Failed 记账，绝不
-    // 授权任何运行时工作）。
+    // 者才会流转，当前 API 产生不了这种记录）没有任何执行器可以续做。
+    // RecoveryRequired 只允许持有者推进，而这里根本没有持有者——留着只会
+    // 永久占用受理槽，因此按"证据优先"的窄门收束（只落 Failed 记账，绝不
+    // 授权任何运行时工作）：
+    // · 必须先证明没有写入被派发过：创建超时等路径会在写围栏之后继续等待
+    //   已派发的运行时创建，K8s Lease / Docker flock 可能仍然活着且可续租，
+    //   仅凭 kind 和年龄放行不安全。首批只覆盖 step = claimed（尚未派发），
+    //   由 UserAppOperationKind::may_unclaimed_settle 统一裁决；
+    // · 存在任何租约回执行 → 保持围栏，交给各 kind 的专用恢复路径；
+    // · 无回执行才允许按扫描器身份收束；updated_at 的 60s 只是退避下限
+    //   （人工 SQL 只清执行者时 updated_at 不变，不代表"连续无声明 60s"）。
     if record.executor_id.is_none() {
-        // 删除族与存储销毁/清空/口令/库准备不走这条快路径：即使没有执行者，
-        // 它们也可能已发出不可撤销的副作用，必须由各自的专用恢复路径处理。
-        if !record.kind.allows_unclaimed_settle() {
+        if !record.kind.may_unclaimed_settle(&record.step) {
             tracing::warn!(
                 operation_id = %record.operation_id,
                 app_id = %record.app_id,
                 kind = ?record.kind,
-                "Fence kept: unclaimed record requires a dedicated recovery path"
+                step = %record.step,
+                "Fence kept: unclaimed record has no proof of pre-dispatch state"
             );
             return Ok(());
         }
@@ -437,68 +443,58 @@ pub(crate) async fn reconcile_fenced_ensure(
             .userapp_store
             .get_operation_lease(&record.app_id, &record.operation_id)
             .await?;
-        let evidence = if binding.is_some() {
-            // 原租约回执仍在：沿用 holder 死亡语义对账（宽限 + 运行时死亡
-            // 探针）；收束时存储层沿用回执里的原执行者身份，终态租约扫描
-            // 才能按 owns() 命中并完成清理，物理标记也留在原授权链上。
-            if !holder_expired(state, &record).await {
+        if binding.is_some() {
+            tracing::warn!(
+                operation_id = %record.operation_id,
+                app_id = %record.app_id,
+                "Fence kept: unclaimed record still has an original lease receipt"
+            );
+            return Ok(());
+        }
+        // 无任何租约行：计龄取 updated_at（最近一次状态变更 ≈ 落围栏时刻），
+        // 读不到就保守保持围栏等下一轮。
+        let updated_at = match state
+            .userapp_store
+            .get_operation_updated_at(&record.app_id, &record.operation_id, record.revision)
+            .await
+        {
+            Ok(Some(updated_at)) => updated_at,
+            Ok(None) => {
                 tracing::warn!(
                     operation_id = %record.operation_id,
                     app_id = %record.app_id,
-                    "Fence kept: unclaimed record with original lease binding not proven dead"
+                    "Fence kept: unclaimed record has no readable updated_at"
                 );
                 return Ok(());
             }
-            serde_json::json!({
-                "kind": "unclaimed",
-                "identity": "original",
-                "checked_at_us": chrono::Utc::now().timestamp_micros(),
-            })
-        } else {
-            // 无任何租约行：没有在途写入。计龄取 updated_at（最近一次状态
-            // 变更 ≈ 落围栏时刻），读不到就保守保持围栏等下一轮。
-            let updated_at = match state
-                .userapp_store
-                .get_operation_updated_at(&record.app_id, &record.operation_id, record.revision)
-                .await
-            {
-                Ok(Some(updated_at)) => updated_at,
-                Ok(None) => {
-                    tracing::warn!(
-                        operation_id = %record.operation_id,
-                        app_id = %record.app_id,
-                        "Fence kept: unclaimed record has no readable updated_at"
-                    );
-                    return Ok(());
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        operation_id = %record.operation_id,
-                        app_id = %record.app_id,
-                        %error,
-                        "Fence kept: unclaimed record updated_at read failed"
-                    );
-                    return Ok(());
-                }
-            };
-            let grace = state
-                .config
-                .unclaimed_settle_grace_secs
-                .unwrap_or(DEFAULT_UNCLAIMED_SETTLE_GRACE_SECS);
-            if !aged_beyond(updated_at, grace) {
+            Err(error) => {
                 tracing::warn!(
                     operation_id = %record.operation_id,
                     app_id = %record.app_id,
-                    "Fence kept: unclaimed record within settle grace"
+                    %error,
+                    "Fence kept: unclaimed record updated_at read failed"
                 );
                 return Ok(());
             }
-            serde_json::json!({
-                "kind": "unclaimed",
-                "identity": "scanner",
-                "checked_at_us": chrono::Utc::now().timestamp_micros(),
-            })
         };
+        let grace = state
+            .config
+            .unclaimed_settle_grace_secs
+            .unwrap_or(DEFAULT_UNCLAIMED_SETTLE_GRACE_SECS);
+        if !aged_beyond(updated_at, grace) {
+            tracing::warn!(
+                operation_id = %record.operation_id,
+                app_id = %record.app_id,
+                "Fence kept: unclaimed record within settle grace"
+            );
+            return Ok(());
+        }
+        let evidence = serde_json::json!({
+            "kind": "unclaimed",
+            "identity": "scanner",
+            "step": record.step.clone(),
+            "checked_at_us": chrono::Utc::now().timestamp_micros(),
+        });
         state
             .userapp_store
             .settle_fenced_operation(&record, &evidence, UNCLAIMED_RELEASE_NOTE)
@@ -601,8 +597,7 @@ pub(crate) async fn reconcile_default_recovery_before_ensure(
 mod settle_grace_tests {
     use super::*;
     use shared_types::{
-        UserAppOperationKind, UserAppOperationRecord, UserAppOperationScope,
-        UserAppOperationState,
+        UserAppOperationKind, UserAppOperationRecord, UserAppOperationScope, UserAppOperationState,
     };
 
     fn record_aged_secs(age_secs: i64) -> UserAppOperationRecord {
