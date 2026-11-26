@@ -453,3 +453,94 @@ async fn physical_docker_keeps_the_real_ancestors_of_a_dir_mounted_through_a_sta
     assert!(!candidate.exists());
     assert_eq!(second.dirs_deleted, 1);
 }
+
+/// 回归（Codex 第六轮 P1）：挂载源的路径里有一个 RCoder **看得到**的链接，它指向 RCoder 没有挂载的
+/// 宿主机路径，那里的链接又指回候选里面的目录。容器经 `<根>/latest/sub` 登记，实际挂的是
+/// `<候选>/log/sub`。RCoder 读到 `latest` 之后走进看不见的路径，那里还有没有链接绕回来它无从知道，
+/// 不能当成"与候选无关"。
+///
+/// 见证里用第三个目录充当 RCoder 没有挂载的宿主机路径，与进程侧、宿主机侧并列。
+#[tokio::test]
+#[ignore = "requires Docker, RCODER_LOG_CLEANER_DOCKER_IMAGE (a local Alpine image ID; never pulls images), RCODER_LOG_CLEANER_TEST_ROOT and HOSTNAME; see the module docs"]
+async fn physical_docker_keeps_a_candidate_that_a_visible_link_reaches_through_an_unseen_path() {
+    let image = image();
+    let owner = uuid::Uuid::new_v4().simple().to_string();
+    let sandbox = Sandbox::new().await;
+    let scratch = std::fs::canonicalize(
+        std::env::var_os("RCODER_LOG_CLEANER_TEST_ROOT")
+            .expect("a scratch root that Docker can bind"),
+    )
+    .unwrap();
+    let unseen = TempDir::new_in(&scratch).unwrap();
+    let unseen = unseen.path().canonicalize().unwrap();
+
+    // 两侧各自建出同样的结构：<候选>/log/sub/inner.log，日志根下的 latest 指向看不见的位置
+    let name = dir_name("reentered", &owner);
+    let mut candidate = None;
+    for root in [&sandbox.process, &sandbox.host] {
+        let nested = root.join(&name).join("log/sub");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("inner.log"), "from-sub").unwrap();
+        std::os::unix::fs::symlink(unseen.join("reentry"), root.join("latest")).unwrap();
+        if candidate.is_none() {
+            candidate = Some(root.join(&name));
+        }
+    }
+    let candidate = candidate.unwrap();
+    // 看不见的位置上有一个链接，指回宿主机一侧的 <候选>/log
+    std::os::unix::fs::symlink(sandbox.host.join(&name).join("log"), unseen.join("reentry"))
+        .unwrap();
+    let old_time = std::time::SystemTime::now() - Duration::from_secs(15 * 86400);
+    std::fs::set_times(&candidate, std::fs::FileTimes::new().set_modified(old_time)).unwrap();
+    let orphan = aged_dir(&sandbox.process, &dir_name("orphan", &owner), 15);
+    let registered = sandbox.host.join("latest").join("sub");
+    let reentered = run_witness(
+        &image,
+        &owner,
+        &format!("rcoder-log-cleaner-reentered-{owner}"),
+        Some(&registered),
+    );
+
+    // 前置：Docker 报回的是登记时的路径；挂进去的是经两个链接绕回候选里面的那个目录
+    let inventory = sandbox
+        .runtime
+        .mounted_host_paths()
+        .await
+        .expect("inventory");
+    assert!(
+        inventory.contains(&registered),
+        "Docker must report the registered path as given: {inventory:?}"
+    );
+    let inside = docker(&[
+        "exec",
+        &reentered.id,
+        "cat",
+        "/app/container-logs/inner.log",
+    ]);
+    assert!(
+        inside.status.success() && String::from_utf8_lossy(&inside.stdout).trim() == "from-sub",
+        "the container must be serving the directory inside the candidate: {}",
+        String::from_utf8_lossy(&inside.stderr)
+    );
+
+    let cleaner = sandbox.cleaner(&sandbox.process);
+    let stats = cleaner.cleanup_once().await.unwrap();
+
+    // 无法确认的源可能指向任何候选，所以是整轮保留：无关的孤儿这一轮也留着
+    assert!(
+        candidate.exists(),
+        "a candidate the mount may reach through an unseen path must be kept"
+    );
+    assert!(
+        orphan.exists(),
+        "one unconfirmable mount source keeps every candidate for the cycle"
+    );
+    assert_eq!(stats.dirs_deleted, 0);
+    assert_eq!(stats.dirs_skipped_unconfirmed, 2);
+    assert_eq!(stats.dirs_skipped_in_use, 0);
+
+    drop(reentered);
+    let second = cleaner.cleanup_once().await.unwrap();
+    assert!(!candidate.exists() && !orphan.exists());
+    assert_eq!(second.dirs_deleted, 2);
+}

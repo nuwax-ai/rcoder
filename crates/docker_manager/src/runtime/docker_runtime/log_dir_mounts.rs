@@ -24,8 +24,9 @@
 //! - 停在一个存在的对象上：它（是文件则是它的父目录）连同各级父目录都在占用中；
 //! - 路径上有一级不存在：源已经消失，没有可保护的东西，也不卡住其余目录的清理——
 //!   容器还在、目录被删，正是这次要修的故障现场；
-//! - 整条路径都在 RCoder 的挂载之外：与任何候选无关；
-//! - 其余——被另一条挂载遮蔽、`..` 回退到 RCoder 看不到的那一级、读取出错、链接层数
+//! - 从头到尾没有读到过链接，整条路径都在 RCoder 的挂载之外：与任何候选无关；
+//! - 其余——读到过链接、之后却走进 RCoder 看不见的路径（看不见的那一段里可能还有链接
+//!   绕回来），被另一条挂载遮蔽，`..` 回退到 RCoder 看不到的那一级，读取出错，链接层数
 //!   过多：无法确认，整轮所有候选都保留。这样的源可能指向任何候选。
 //!
 //! # 判定规则
@@ -43,9 +44,9 @@
 //!
 //! # 边界
 //!
-//! - 容器形态下，只有落在 RCoder 自身挂载之下的路径才看得到。第三方容器经由 RCoder 看不到
-//!   的宿主机别名挂载同一个目录，从容器内识别不了；RCoder 看不到的那段路径里如果有符号
-//!   链接，词法上的推断也可能不对。
+//! - 容器形态下，只有落在 RCoder 自身挂载之下的路径才看得到。从头到尾都看不见的外部挂载
+//!   按无关处理，前提是部署上没有外部路径经别名指回日志根——这一点从 RCoder 内部证明不了。
+//!   只要在看得见的路径上读到了链接，之后就不再按词法推断：走进看不见的地方就算无法确认。
 //! - 挂载别名里的符号链接在使用期间必须保持稳定。Docker 在挂载那一刻解析符号链接；之后
 //!   别名被改指别处时，运行中的容器仍持有旧目录，而这里重新解析得到的是新位置，对不上。
 //! - 目录身份只在 Unix 平台可读，其它平台一律按无法确认处理。
@@ -349,6 +350,7 @@ async fn locate(
     let mut last = Entry::Missing;
     let mut queue: VecDeque<OsString> = components(source).collect();
     let mut links = 0usize;
+    let mut followed_link = false;
     while let Some(component) = queue.pop_front() {
         if component == ".." {
             match confirmed.pop() {
@@ -377,6 +379,7 @@ async fn locate(
             }
             Sight::Seen(Entry::Link(target)) => {
                 links += 1;
+                followed_link = true;
                 if links > MAX_SYMLINKS {
                     return unconfirmed(format!(
                         "it passes through more than {MAX_SYMLINKS} symbolic links"
@@ -399,6 +402,13 @@ async fn locate(
                 );
             }
         }
+    }
+    if followed_link && confirmed.last() != Some(&true) {
+        // 读到过链接之后走进了看不见的路径：那一段里有没有链接绕回来，无从知道
+        return unconfirmed(
+            "it leads through a symbolic link into a path RCoder cannot verify, so where it ends is unknown"
+                .to_owned(),
+        );
     }
     Ok(if confirmed.last() == Some(&true) {
         Location::Present {

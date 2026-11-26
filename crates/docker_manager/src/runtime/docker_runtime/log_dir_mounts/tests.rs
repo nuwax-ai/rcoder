@@ -662,16 +662,20 @@ async fn a_source_vanished_through_a_stable_alias_does_not_block_other_directori
     );
 }
 
-/// 绝对链接指向 RCoder 没挂的宿主机位置：与任何候选无关
+/// 可见的链接指向 RCoder 没挂的宿主机位置：链接之后的那一段 RCoder 无法核验，整轮保留。
+/// "观察不足"不能写成"与候选无关"。
 #[tokio::test]
-async fn an_absolute_link_to_an_unmounted_location_is_unrelated_to_every_candidate() {
+async fn a_visible_link_leaving_every_mount_keeps_every_candidate() {
     let tree = Tree::new();
     std::os::unix::fs::symlink("/elsewhere/logs/real/nested", tree.path("logs/alias")).unwrap();
 
-    assert_eq!(
-        tree.verdict(&tree.path("logs/runner-a"), &["/host/base/logs/alias"])
-            .await,
-        LogDirMount::Unmounted
+    assert!(
+        matches!(
+            tree.verdict(&tree.path("logs/runner-a"), &["/host/base/logs/alias"])
+                .await,
+            LogDirMount::Unconfirmed(_)
+        ),
+        "where the link leads cannot be verified, so every candidate must be kept"
     );
 }
 
@@ -752,6 +756,77 @@ async fn a_symlink_loop_is_unconfirmed() {
             .await,
         LogDirMount::Unconfirmed(_)
     ));
+}
+
+// ─── 可见链接走进 RCoder 看不见的路径（Codex 第六轮 P1）────────────────────
+
+/// 日志根下可见的 `logs/alias` 指向 RCoder 没有挂载的宿主机路径，那里的 `reentry` 又指回
+/// `logs/real/nested`。返回真实位置所在的候选 `logs/real`；第一个返回值要一直留着。
+fn reentry_chain(tree: &Tree) -> (tempfile::TempDir, PathBuf) {
+    std::fs::create_dir_all(tree.path("logs/real/nested/leaf")).unwrap();
+    let unseen = tempfile::tempdir().unwrap();
+    let unseen_path = unseen.path().canonicalize().unwrap();
+    std::os::unix::fs::symlink(tree.path("logs/real/nested"), unseen_path.join("reentry")).unwrap();
+    std::os::unix::fs::symlink(unseen_path.join("reentry"), tree.path("logs/alias")).unwrap();
+    (unseen, tree.path("logs/real"))
+}
+
+/// 回归（Codex 第六轮 P1）：解析时读到了 `logs/alias` 这个链接，顺着它走进 RCoder 看不见的路径。
+/// 那里还有没有链接、指回哪里，RCoder 无从知道，不能当成"与候选无关"。容器实际挂的是候选
+/// `logs/real` 里面的目录。
+#[tokio::test]
+async fn a_link_into_a_path_rcoder_cannot_verify_keeps_every_candidate() {
+    let tree = Tree::new();
+    std::fs::create_dir(tree.path("logs/runner-b")).unwrap();
+    let (_unseen, real) = reentry_chain(&tree);
+
+    for candidate in [&real, &tree.path("logs/runner-b")] {
+        assert!(
+            matches!(
+                tree.verdict(candidate, &["/host/base/logs/alias/leaf"]).await,
+                LogDirMount::Unconfirmed(reason) if reason.contains("cannot verify")
+            ),
+            "{} must be kept: where the link leads cannot be verified",
+            candidate.display()
+        );
+    }
+}
+
+/// 同一条链，deploy-host 形态下每一级都看得到：解析到候选里面的目录，候选仍被挂载。
+#[tokio::test]
+async fn the_same_chain_is_resolved_by_the_full_host_view() {
+    let tree = Tree::new();
+    std::fs::create_dir(tree.path("logs/runner-b")).unwrap();
+    let (_unseen, real) = reentry_chain(&tree);
+    let source = tree.path("logs/alias/leaf").to_string_lossy().into_owned();
+
+    assert_eq!(
+        Tree::decide(&HostPathSpace::Host, &real, &[&source], &LocalFileSystem).await,
+        LogDirMount::Mounted
+    );
+    assert_eq!(
+        Tree::decide(
+            &HostPathSpace::Host,
+            &tree.path("logs/runner-b"),
+            &[&source],
+            &LocalFileSystem
+        )
+        .await,
+        LogDirMount::Unmounted
+    );
+}
+
+/// 对照：挂载源从头到尾都在 RCoder 的挂载之外，RCoder 什么也观察不到。它只能作为部署边界按无关
+/// 处理，否则同一台宿主机上别的容器会让清理永久停摆。
+#[tokio::test]
+async fn an_external_mount_outside_every_view_stays_unrelated() {
+    let tree = Tree::new();
+
+    assert_eq!(
+        tree.verdict(&tree.path("logs/runner-a"), &["/srv/elsewhere/logs"])
+            .await,
+        LogDirMount::Unmounted
+    );
 }
 
 // ─── 协议：真实 Bollard 客户端 + 假 daemon ───────────────────────────────────
