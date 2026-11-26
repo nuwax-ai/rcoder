@@ -472,6 +472,13 @@ impl AgentContainerRuntime for DockerRuntime {
             // 任何原生创建授权（.app-operation-locks 的 flock 标记）。
             // 活持有者 / 过期但未清理的原持有者 / 他人持有 / 查询失败
             // 一律保持围栏——它们证明不了"没有写入被派发过"。
+            //
+            // 只读探针只能缩小窗口，无法把物理缺席保护到 SQL 清槽：探针之后
+            // 仍可能有新身份拿到同一 flock。本条路径的放行前提是"旧 dev 槽
+            // 仍被这条围栏占着"——正常 Ensure 走耐久受理边界、计算控制先排干
+            // 旧操作，所以窗口内没有合法写入方。若将来把本探针复用到更宽的
+            // kind/step，应改用 docker_builder_deletion 的 handoff guard：
+            // 持有 flock、复验计算缺席，并保持到 SQL CAS 完成。
             if !matches!(
                 self.observe_unbound_builder_creation_authority(context)
                     .await?,

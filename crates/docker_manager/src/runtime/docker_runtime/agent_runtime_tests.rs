@@ -22,12 +22,22 @@ impl Drop for Fixture {
 }
 
 async fn fixture(service_type: ServiceType, replies: Vec<(u16, Value)>) -> Fixture {
+    fixture_with_hook(service_type, replies, None).await
+}
+
+/// 变体：可在指定应答序号（0 起）返回后执行一次回调，用于构造"探测期间
+/// 世界发生变化"的交错用例。
+async fn fixture_with_hook(
+    service_type: ServiceType,
+    replies: Vec<(u16, Value)>,
+    mut after_reply: Option<Box<dyn FnMut(usize) + Send + 'static>>,
+) -> Fixture {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let recorded = requests.clone();
     let server = tokio::spawn(async move {
-        for (status, response) in replies {
+        for (index, (status, response)) in replies.into_iter().enumerate() {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
             while !request.ends_with(b"\r\n\r\n") {
@@ -42,6 +52,9 @@ async fn fixture(service_type: ServiceType, replies: Vec<(u16, Value)>) -> Fixtu
             recorded.lock().unwrap().push(request);
             let body = response.to_string();
             stream.write_all(format!("HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            if let Some(hook) = after_reply.as_mut() {
+                hook(index);
+            }
         }
     });
     let (actor, containers) = crate::container_state_actor::ContainerStateActor::new();
@@ -624,4 +637,57 @@ async fn verify_absent_builder_recovery_rejects_live_authority() {
         "活持有者的原生锁在时必须保持围栏"
     );
     drop(lease);
+}
+
+/// Codex 复审点：探针读之间世界会变。第一次授权探测 Absent、计算也缺席，
+/// 但在第二次授权探测之前另一个身份拿到了 flock 标记——第二次检查必须
+/// 把这个窗口关掉（删掉第二次检查本用例会挂）。
+#[cfg(unix)]
+#[tokio::test]
+async fn verify_absent_builder_recovery_closes_flock_window_between_probes() {
+    if std::env::var_os("RCODER_RECEIPT_ROOT_TEST_CHILD").is_none() {
+        run_in_lease_root_child(
+            "verify_absent_builder_recovery_closes_flock_window_between_probes",
+        );
+        return;
+    }
+    let held: Arc<Mutex<Option<std::fs::File>>> = Arc::new(Mutex::new(None));
+    let hook_state = held.clone();
+    let f = fixture_with_hook(
+        ServiceType::UserappBuilder,
+        vec![
+            (404, json!({"message":"not found"})),
+            (200, json!([])),
+            (404, json!({"message":"not found"})),
+        ],
+        Some(Box::new(move |served: usize| {
+            if served != 2 {
+                return;
+            }
+            // 第二次授权探测之前：另一个身份拿到 builder 族的 flock 标记。
+            let root = std::path::PathBuf::from(
+                std::env::var_os("RCODER_OPERATION_RECEIPT_ROOT").expect("child lease root"),
+            );
+            let dir = root.join(".app-operation-locks");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("builder-{APP}.lock"));
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&path)
+                .unwrap();
+            file.try_lock().expect("hook acquires the free flock");
+            *hook_state.lock().unwrap() = Some(file);
+        })),
+    )
+    .await;
+    assert!(
+        !f.runtime
+            .verify_absent_builder_recovery(&context())
+            .await
+            .unwrap(),
+        "探测窗口内出现的活持有者必须让缺席判定失败"
+    );
 }
