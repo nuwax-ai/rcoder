@@ -48,17 +48,6 @@ pub use path::{
     HostPathResolver, get_host_path_resolver, normalize_path, resolve_container_path_to_host,
 };
 
-/// 同一个 RCoder 进程内，builder 恢复与日志目录回收共用这把锁。
-///
-/// agent 容器启动不参与：它绑定的日志目录是启动时独占新建的（见 [`log_directory`]），不会是
-/// 清理器手里的候选。
-static LOG_MOUNT_GATE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
-
-/// 清理器回收日志目录前调用；返回 `None` 说明 builder 恢复正在进行，本轮顺延
-pub fn try_begin_log_mount_cleanup() -> Option<tokio::sync::RwLockWriteGuard<'static, ()>> {
-    LOG_MOUNT_GATE.try_write().ok()
-}
-
 /// Docker manager error type
 #[derive(Error, Debug)]
 pub enum DockerError {

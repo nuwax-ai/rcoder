@@ -759,21 +759,3 @@ async fn no_log_directory_is_created_when_another_bind_source_is_missing() {
     daemon.assert_followed(2);
     assert!(!restart.visible_root().exists());
 }
-
-/// 创建方持有围栏时清理拿不到写锁；创建方放开后清理恢复。
-#[tokio::test]
-async fn a_creator_holding_the_fence_excludes_cleanup_until_it_releases() {
-    let reservation = crate::LOG_MOUNT_GATE.read().await;
-
-    assert!(
-        crate::try_begin_log_mount_cleanup().is_none(),
-        "cleanup must not interleave with a creator holding the fence"
-    );
-
-    drop(reservation);
-
-    assert!(
-        crate::try_begin_log_mount_cleanup().is_some(),
-        "cleanup must resume once no creator holds the fence"
-    );
-}

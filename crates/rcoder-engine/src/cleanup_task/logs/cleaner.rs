@@ -16,12 +16,22 @@
 //! 返回 404，但它的挂载还在——按名字判断会把运行中容器的日志目录删掉。挂载清单同时
 //! 覆盖已停止未删除的容器，所以"停了但还没回收"的容器同样受保护。
 //!
+//! # 为什么不用和挂载准备互斥
+//!
+//! 清理器手里的候选都是旧目录。正在准备挂载的容器绑定的都是刚建的新目录——创建容器和
+//! builder 重启都独占新建，不复用已有的目录（`docker_manager::log_directory`）——保留期内
+//! 成不了候选。还在用旧目录的只有已经存在的容器，它们就在清单里。所以"查清单 + 删之前
+//! 再确认一次"就够了。
+//!
+//! 以前这里有一把全局锁：挂载准备拿读锁，清理拿写锁。它护住的是 builder 重启重放旧日志
+//! 目录的那段窗口，代价是一次卡住的删除会把锁占住，所有 agent 容器启动、所有 builder 重启
+//! 跟着一起等。
+//!
 //! # 保留、顺延与告警
 //!
 //! - **保留并告警**才需要人看：整份清单拿不到；某个候选无法确认是否仍被挂载；删除失败。
 //!   没有任何路径会把"查不到"当成"没有挂载"。
-//! - **顺延**不是故障，下一轮继续：取锁时正好有挂载准备在进行；或者本轮删除目录的
-//!   预算用完（时间或数量）。两者分别计数，不告警。
+//! - **顺延**不是故障，下一轮继续：本轮删除目录的预算用完（时间或数量）。只计数，不告警。
 //!
 //! 单个候选判不出来只影响它自己：其余能判定的目录照常回收。
 //!
@@ -43,9 +53,10 @@
 //! # 扫描的时限
 //!
 //! 初次扫描整体限时（[`SCAN_TIMEOUT`]）：读目录、读每个条目的 metadata 都没有逐项的截止
-//! 时间，整个日志目录卡住时不设上限会把清扫任务一起停掉。时限只管扫描。已经发起的目录
-//! 删除照旧等到结束，期间挂载围栏一直在清理器手里——builder 恢复会复用归档里的旧 bind 源，
-//! 删除没结束就放锁，它可能挂到被删了一半的目录上。
+//! 时间，整个日志目录卡住时不设上限会把这个任务永远停在这里。时限只管扫描。已经发起的
+//! 目录删除照旧等到结束：中途放弃的话底层可能还在删，这个任务不能同时再起一轮。
+//!
+//! 一轮的统计见 [`LogCleanupStats`]。
 
 use moka::ops::compute::{CompResult, Op};
 use std::path::{Path, PathBuf};
@@ -55,27 +66,28 @@ use tokio::fs;
 use tracing::{debug, info, warn};
 
 use super::owner::MountedPathsProbe;
+use super::stats::LogCleanupStats;
 
 /// 一天的秒数：保留天数换算秒数的乘数
 const SECS_PER_DAY: u64 = 24 * 60 * 60;
 
 /// 保留期下限：配置的保留期比它短时按它计。
 ///
-/// 容器的日志目录是创建容器时新建的（`docker_manager` 的 `log_directory`），所以清理器不必和
-/// 挂载准备互斥：手里的候选都是旧目录，正在准备挂载的都是刚建的目录。保留期配成 0 时这个
+/// 容器的日志目录是新建的（`docker_manager` 的 `log_directory`），所以清理器不必和挂载准备
+/// 互斥：手里的候选都是旧目录，正在准备挂载的都是刚建的目录。保留期配成 0 时这个
 /// 前提不成立——建出来不到一秒的目录也算过期，"建目录"到"Docker 登记这个挂载"之间被扫到，
 /// 删掉的就是正在使用的目录。按保留下限算，停掉的容器的日志最多晚这么久回收。
 const MIN_RETENTION: Duration = Duration::from_secs(10 * 60);
 
-/// 一轮的截止时间：从拿到挂载围栏的写锁那一刻起计，取清单、逐个判定、逐个删除共用它。
+/// 一轮回收的截止时间：从开始取清单起计，取清单、逐个判定、逐个删除共用它。
 ///
-/// 删除期间一直占着这把写锁，agent 容器创建和 builder 恢复都在锁外等。没有截止时间的话，
-/// 积压的过期目录越多、Docker 越慢，锁被占得越久。到期之后不再开始下一步：
-/// - 判定还没回来：这一轮所有候选都保留，放锁；
+/// 没有截止时间的话，积压的过期目录越多、Docker 越慢，一轮拖得越久，日志清理迟迟不结束。
+/// 到期之后不再开始下一步：
+/// - 判定还没回来：这一轮所有候选都保留；
 /// - 判定回来了：不再发起删除，也不再复查余下的候选，余下的留到下一轮。
 ///
-/// 它是软预算：不会中途放弃进行中的删除——放弃之后底层可能还在删，锁却已经放开了。所以
-/// 实际持锁时间会比它多出最后一次删除所花的时间。
+/// 它是软预算：不会中途放弃进行中的删除——放弃之后底层可能还在删。所以一轮实际花的时间
+/// 会比它多出最后一次删除所花的时间。
 const DIR_RECLAIM_BUDGET: Duration = Duration::from_secs(2);
 
 /// 一轮里最多发起多少次目录删除，失败的也算。时间预算管不住"每个都很快、合起来却很多"
@@ -87,7 +99,7 @@ const DIR_RECLAIM_BATCH: usize = 64;
 const FAIR_RECHECK_WINDOW: Duration = Duration::from_millis(500);
 
 /// 连续这么多轮复查都慢的候选被隔离
-const RECHECK_TIMEOUT_QUARANTINE_SWEEPS: u32 = 3;
+pub(super) const RECHECK_TIMEOUT_QUARANTINE_SWEEPS: u32 = 3;
 
 /// 一条超时记录从最后一次更新起保留这么久。两轮重试之间隔得比它久，计数从头开始
 const RECHECK_TIMEOUT_MEMORY: Duration = Duration::from_secs(60 * 60);
@@ -409,15 +421,8 @@ impl LogCleaner {
         if candidates.is_empty() {
             return;
         }
-        // 取清单到删除的这一段与挂载准备、builder 恢复互斥。对方正在进行属于正常现象：
-        // 本轮顺延，单独计数，不告警。
-        let Some(_guard) = docker_manager::try_begin_log_mount_cleanup() else {
-            stats.dirs_deferred_while_mounting += candidates.len() as u64;
-            stats.note_deferred(candidates.first().map(PathBuf::as_path));
-            return;
-        };
         // 截止时间从这一刻开始计：取清单、逐个判定、逐个删除共用它。判定到期还没回来就保留
-        // 全部候选、放锁；已经发起的删除不包在超时里，照旧等它结束
+        // 全部候选；已经发起的删除不包在超时里，照旧等它结束
         let reclaim_started = std::time::Instant::now();
         let deadline = tokio::time::Instant::from_std(reclaim_started) + self.reclaim_budget;
         let mounts = match tokio::time::timeout_at(
@@ -665,137 +670,5 @@ impl std::error::Error for LogCleanupError {}
 impl From<std::io::Error> for LogCleanupError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
-    }
-}
-
-/// 日志清理统计
-#[derive(Debug, Clone, Default)]
-pub struct LogCleanupStats {
-    /// 删除的文件数量
-    pub files_deleted: u64,
-    /// 删除的目录数量
-    pub dirs_deleted: u64,
-    /// 已过期但仍被容器挂载、因此保留的目录数量（正常现象，不是错误）
-    pub dirs_skipped_in_use: u64,
-    /// 已过期但无法确认是否仍被挂载、因此保留的目录数量（需要关注）
-    pub dirs_skipped_unconfirmed: u64,
-    /// 因挂载准备正在进行而顺延到下一轮的目录数量（正常现象）
-    pub dirs_deferred_while_mounting: u64,
-    /// 因本轮的删除预算用完（时间或数量）而顺延到下一轮的目录数量（正常现象）
-    pub dirs_deferred_by_budget: u64,
-    /// 释放的字节数
-    pub bytes_freed: u64,
-    /// 删除失败的文件/目录数量
-    pub failed_deletions: u64,
-    /// 挂载清单拿不到（查询失败或超时）而保留的候选数量。短暂失败，下一轮重试
-    pub inventory_unavailable: u64,
-    /// 复查候选时出错的次数。短暂失败，下一轮重试
-    pub recheck_errors: u64,
-    /// 初次扫描时无法读取条目或修改时间的数量
-    pub entry_inspection_errors: u64,
-    /// 连续复查超时而被隔离、本轮不再处理的目录数量（需要关注）
-    pub dirs_quarantined: u64,
-    /// 本轮第一个被顺延的目录（争锁、预算用完或复查超时），告警时用来定位
-    pub first_deferred: Option<PathBuf>,
-}
-
-impl LogCleanupStats {
-    pub(crate) fn has_errors(&self) -> bool {
-        self.dirs_skipped_unconfirmed > 0
-            || self.failed_deletions > 0
-            || self.entry_inspection_errors > 0
-            || self.dirs_quarantined > 0
-    }
-
-    /// 记下本轮第一个被顺延的目录
-    fn note_deferred(&mut self, path: Option<&Path>) {
-        if self.first_deferred.is_none()
-            && let Some(path) = path
-        {
-            self.first_deferred = Some(path.to_path_buf());
-        }
-    }
-
-    /// 这一轮有没有"本该做完却没做完"、值得下一轮清扫接着做的事：清单拿不到、复查出错、
-    /// 删除失败、条目读取失败、争锁顺延、批次或时间预算顺延。
-    ///
-    /// 不含"挂载源无法确认指向哪里"和"目录在扫描后变了"：前者是持续状态（只要那个容器还在，
-    /// 每轮都会得到同样的结论，重试不会变得可确认），后者是正常竞态。它们只计数、照常保留，
-    /// 不重置日志清理的周期。
-    pub(crate) fn needs_retry(&self) -> bool {
-        self.inventory_unavailable > 0
-            || self.recheck_errors > 0
-            || self.failed_deletions > 0
-            || self.entry_inspection_errors > 0
-            || self.dirs_deferred_while_mounting > 0
-            || self.dirs_deferred_by_budget > 0
-    }
-
-    /// 获取格式化的统计摘要
-    pub fn summary(&self) -> String {
-        if self.is_empty() {
-            "No expired logs".to_string()
-        } else {
-            let mut parts = Vec::new();
-            if self.files_deleted > 0 {
-                parts.push(format!(
-                    "Deleted: {} files, freed: {:.2} MB",
-                    self.files_deleted,
-                    self.bytes_freed as f64 / 1024.0 / 1024.0
-                ));
-            }
-            if self.dirs_deleted > 0 {
-                parts.push(format!("deleted: {} dirs", self.dirs_deleted));
-            }
-            if self.dirs_skipped_in_use > 0 {
-                parts.push(format!(
-                    "kept: {} dirs still mounted",
-                    self.dirs_skipped_in_use
-                ));
-            }
-            if self.dirs_skipped_unconfirmed > 0 {
-                parts.push(format!(
-                    "kept: {} dirs without a confirmed mount status",
-                    self.dirs_skipped_unconfirmed
-                ));
-            }
-            if self.dirs_deferred_while_mounting > 0 {
-                parts.push(format!(
-                    "deferred: {} dirs (mount preparation in progress)",
-                    self.dirs_deferred_while_mounting
-                ));
-            }
-            if self.dirs_deferred_by_budget > 0 {
-                parts.push(format!(
-                    "deferred: {} dirs (reclaim budget spent)",
-                    self.dirs_deferred_by_budget
-                ));
-            }
-            if self.failed_deletions > 0 {
-                parts.push(format!("failed: {}", self.failed_deletions));
-            }
-            if self.entry_inspection_errors > 0 {
-                parts.push(format!(
-                    "uninspected: {} entries",
-                    self.entry_inspection_errors
-                ));
-            }
-            if self.dirs_quarantined > 0 {
-                parts.push(format!(
-                    "quarantined: {} dirs (re-check timed out {} sweeps in a row)",
-                    self.dirs_quarantined, RECHECK_TIMEOUT_QUARANTINE_SWEEPS
-                ));
-            }
-            parts.join(", ")
-        }
-    }
-
-    /// 本轮既没有删除任何东西，也没有需要报告的保留或顺延项
-    fn is_empty(&self) -> bool {
-        self.files_deleted == 0
-            && self.dirs_deleted == 0
-            && self.dirs_skipped_in_use == 0
-            && self.dirs_quarantined == 0
-            && !self.needs_retry()
     }
 }

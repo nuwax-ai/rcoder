@@ -18,10 +18,9 @@
 //! - **路径空间**：清理器手里的 `log_dir` 是 RCoder 进程自己命名空间里的路径，而 Docker
 //!   报回的挂载源是宿主机路径，两者不能直接比对；同一个目录还可能有别名。换算与比对都
 //!   由运行时负责（`mounted_log_directories`），compose 部署下两侧前缀本就不同。
-//! - **与挂载准备的互斥**：删除和"建目录 → Docker 登记挂载"之间存在竞态（builder 恢复会
-//!   复用归档里的 bind 路径）。同一进程内由 `docker_manager::LOG_MOUNT_GATE` 协调：
-//!   agent 容器创建、builder 恢复（从移除旧容器到创建替代容器）持读锁，清理持写锁。
-//!   拿不到写锁不是故障：本轮顺延，下一轮继续。
+//! - **日志目录一次性使用**：删除和"建目录 → Docker 登记挂载"之间不互斥，靠的是每个容器
+//!   绑定的都是给它新建的目录（创建容器和 builder 重启都是，`docker_manager::log_directory`）。
+//!   所以清理器手里的候选都是旧目录，还在用旧目录的容器都在清单里。
 //!
 //! # 运行时接口的调用频率
 //!
@@ -29,8 +28,8 @@
 //! 1 天）：容器清理任务每一轮只检查是否到期，到期才扫一遍目录——日志保留期以天计，
 //! 没必要跟着闲置容器回收的节奏反复扫描。每次扫描只在**真的出现过期目录时**才会向运行
 //! 要一次挂载清单，且每次最多一次——没有过期目录就一次接口都不调。清单获取失败则本轮不再
-//! 删任何候选目录，下一轮清扫重试。持写锁删除目录有时间和批次预算，未完成的扫描在下轮
-//! 清扫继续，不等待完整扫描周期。
+//! 删任何候选目录，下一轮清扫重试。删除目录有时间和批次预算，没做完的在下轮清扫继续，
+//! 不等待完整扫描周期。
 //!
 //! K8s 部署下 rcoder 所在的 Pod 没有这个目录，清理在访问运行时之前就已跳过。
 //!
@@ -38,12 +37,14 @@
 
 mod cleaner;
 mod owner;
+mod stats;
 
 #[cfg(test)]
 mod physical_docker;
 #[cfg(test)]
 mod tests;
 
+pub use cleaner::LogCleaner;
 pub(in crate::cleanup_task) use cleaner::LogCleanupError;
-pub use cleaner::{LogCleaner, LogCleanupStats};
 pub use owner::{MountedPathsProbe, RuntimeMountedPaths};
+pub use stats::LogCleanupStats;

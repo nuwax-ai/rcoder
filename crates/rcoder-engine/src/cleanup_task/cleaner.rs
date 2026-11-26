@@ -201,8 +201,8 @@ impl AgentCleaner {
                     Some(tokio::time::Instant::now())
                 };
                 // 无法确认或删除失败说明环境有问题，必须告警；
-                // "仍被挂载所以保留"是长期运行容器的常态，"顺延"是挂载准备正在进行或
-                // 本轮删除预算用完，都会在下一轮继续——这两类只记 debug。
+                // "仍被挂载所以保留"是长期运行容器的常态，"顺延"是本轮删除预算用完、
+                // 下一轮继续——这两类只记 debug。
                 if log_stats.has_errors() {
                     warn!(
                         "[cleaner] Log cleanup needs attention: {}",

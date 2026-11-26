@@ -68,23 +68,6 @@ async fn a_log_path_that_is_not_a_directory_advances_the_schedule() {
 }
 
 #[tokio::test]
-async fn log_cleanup_retries_on_the_next_sweep_after_mount_gate_contention() {
-    let mut fixture = Fixture::new(0).await;
-    let log_dir = std::path::PathBuf::from(&fixture.cleaner.config.log_dir);
-    let expired = aged_log_dir(&log_dir, "runner-expired");
-    let guard = docker_manager::try_begin_log_mount_cleanup().unwrap();
-
-    fixture.cleaner.cleanup_once().await.unwrap();
-    assert!(expired.exists());
-    drop(guard);
-
-    fixture.cleaner.cleanup_once().await.unwrap();
-    assert!(!expired.exists());
-    assert!(!fixture.cleaner.log_cleanup_due());
-    fixture.close().await;
-}
-
-#[tokio::test]
 async fn log_cleanup_continues_an_incomplete_batch_on_the_next_sweep() {
     let mut fixture = Fixture::new(0).await;
     let log_dir = std::path::PathBuf::from(&fixture.cleaner.config.log_dir);
@@ -277,11 +260,9 @@ async fn a_hung_log_cleanup_is_abandoned_at_the_deadline_and_waits_for_the_next_
     fixture.close().await;
 }
 
-/// 扫描的时间上限不管已经发起的目录删除：等删除结束，期间挂载围栏一直在清理器手里。
-/// builder 恢复会复用归档里的旧 bind 源，删除没结束就放锁，它可能挂到被删了一半的
-/// 目录上。
+/// 扫描的时间上限不管已经发起的目录删除：等到删除结束，这一轮才算做完、才推进周期。
 #[tokio::test]
-async fn a_slow_deletion_is_waited_for_and_keeps_the_mount_fence_until_it_ends() {
+async fn a_slow_deletion_is_waited_for() {
     let mut fixture = Fixture::new(0).await;
     let log_dir = std::path::PathBuf::from(&fixture.cleaner.config.log_dir);
     let expired = aged_log_dir(&log_dir, "runner-expired");
@@ -294,20 +275,12 @@ async fn a_slow_deletion_is_waited_for_and_keeps_the_mount_fence_until_it_ends()
         .log_cleaner
         .set_delete_delay(Duration::from_millis(400));
 
-    let (sweep, fence_held_during_deletion) = tokio::join!(fixture.cleaner.cleanup_once(), async {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        docker_manager::try_begin_log_mount_cleanup().is_none()
-    });
-    sweep.unwrap();
-    assert!(
-        fence_held_during_deletion,
-        "the mount fence must stay with the cleaner while a deletion is in flight"
-    );
+    fixture.cleaner.cleanup_once().await.unwrap();
+
     assert!(!expired.exists(), "the deletion must run to the end");
     assert!(
         !fixture.cleaner.log_cleanup_due(),
         "a completed run advances the schedule"
     );
-    assert!(docker_manager::try_begin_log_mount_cleanup().is_some());
     fixture.close().await;
 }
