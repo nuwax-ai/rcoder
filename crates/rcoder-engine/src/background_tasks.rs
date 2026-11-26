@@ -377,6 +377,9 @@ fn cleanup_runtime_config(config: &AppConfig) -> cleanup_task::CleanupConfig {
                 .log_retention_days
                 .saturating_mul(24 * 60 * 60),
         ),
+        log_cleanup_interval: Duration::from_secs(
+            config.cleanup_config.log_cleanup.cleanup_interval_seconds,
+        ),
     }
 }
 

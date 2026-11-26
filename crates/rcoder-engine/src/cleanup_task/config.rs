@@ -23,6 +23,8 @@ pub struct CleanupConfig {
     pub log_dir: String,
     /// 日志保留时长
     pub log_retention_duration: Duration,
+    /// 日志清理的检查间隔（默认24小时）——容器清理任务每轮只检查是否到期
+    pub log_cleanup_interval: Duration,
 }
 
 impl Default for CleanupConfig {
@@ -36,6 +38,7 @@ impl Default for CleanupConfig {
             active_window: Duration::from_secs(5 * 60),
             log_dir: "/app/logs/container".to_string(),
             log_retention_duration: Duration::from_secs(7 * 24 * 60 * 60),
+            log_cleanup_interval: Duration::from_secs(24 * 60 * 60),
         }
     }
 }

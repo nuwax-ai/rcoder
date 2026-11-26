@@ -37,6 +37,9 @@ cleanup_config:
     # 日志保留天数
     # 默认值: 10
     log_retention_days: 10
+    # 日志清理的检查间隔（秒）。容器清理任务每一轮只检查是否到期
+    # 默认值: 86400 (1天)
+    cleanup_interval_seconds: 86400
 
 # Pingora 反向代理配置
 proxy_config:

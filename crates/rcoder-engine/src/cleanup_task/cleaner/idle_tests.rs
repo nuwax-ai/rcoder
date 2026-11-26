@@ -16,6 +16,7 @@ use tonic::{Request, Response, Status};
 
 mod absence_recovery;
 mod builder_pod_recovery;
+mod log_cleanup_schedule;
 mod physical_docker;
 
 #[derive(Clone, Default)]

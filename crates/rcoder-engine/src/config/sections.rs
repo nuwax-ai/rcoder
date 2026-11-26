@@ -106,6 +106,9 @@ pub struct LogCleanupConfig {
     /// 日志保留天数，默认10天
     #[serde(default = "default_log_retention_days")]
     pub log_retention_days: u64,
+    /// 日志清理的检查间隔（秒）。容器清理任务每一轮只检查是否到期，默认86400秒（1天）
+    #[serde(default = "default_log_cleanup_interval_seconds")]
+    pub cleanup_interval_seconds: u64,
 }
 
 fn default_log_dir() -> String {
@@ -116,11 +119,16 @@ fn default_log_retention_days() -> u64 {
     10
 }
 
+fn default_log_cleanup_interval_seconds() -> u64 {
+    24 * 60 * 60
+}
+
 impl Default for LogCleanupConfig {
     fn default() -> Self {
         Self {
             log_dir: default_log_dir(),
             log_retention_days: default_log_retention_days(),
+            cleanup_interval_seconds: default_log_cleanup_interval_seconds(),
         }
     }
 }
@@ -753,5 +761,25 @@ impl Default for E2bSandboxConfig {
             api_keys: Vec::new(),
             templates: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod log_cleanup_tests {
+    use super::LogCleanupConfig;
+
+    /// 旧配置里没有这一项：按默认 1 天
+    #[test]
+    fn the_log_cleanup_interval_defaults_to_one_day() {
+        let config: LogCleanupConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(config.cleanup_interval_seconds, 24 * 60 * 60);
+        assert_eq!(config.log_retention_days, 10);
+    }
+
+    #[test]
+    fn an_explicit_log_cleanup_interval_is_honoured() {
+        let config: LogCleanupConfig =
+            serde_yaml::from_str("cleanup_interval_seconds: 3600").unwrap();
+        assert_eq!(config.cleanup_interval_seconds, 3600);
     }
 }

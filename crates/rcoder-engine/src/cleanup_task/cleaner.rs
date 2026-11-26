@@ -28,6 +28,8 @@ pub struct AgentCleaner {
     container_destroyer: super::container::ContainerDestroyer,
     agent_scanner: super::agent::AgentScanner,
     log_cleaner: super::logs::LogCleaner,
+    /// 上一次执行日志清理的时间。日志清理有自己的周期（默认 1 天），每一轮只检查是否到期
+    last_log_cleanup: Option<tokio::time::Instant>,
 
     /// Qualified idle observations from the last completed sweep only.
     /// Shared projects cannot advance a physical workload twice in one sweep.
@@ -79,6 +81,7 @@ impl AgentCleaner {
                 AgentScanner::new(state.clone(), config_clone)
             },
             log_cleaner,
+            last_log_cleanup: None,
             pending_destroy: std::collections::HashSet::new(),
         }
     }
@@ -93,27 +96,9 @@ impl AgentCleaner {
         // 重置本次清理的统计
         let mut current_stats = super::config::CleanupStats::default();
 
-        // 1. 清理过期日志文件
-        match self.log_cleaner.cleanup_once().await {
-            Ok(log_stats) => {
-                // 无法确认或删除失败说明环境有问题，必须告警；
-                // "仍被挂载所以保留"是长期运行容器的常态，"顺延"是挂载准备正在进行或
-                // 本轮删除预算用完，都会在下一轮继续——这两类只记 debug。
-                if log_stats.dirs_skipped_unconfirmed > 0 || log_stats.failed_deletions > 0 {
-                    warn!(
-                        "[cleaner] Log cleanup needs attention: {}",
-                        log_stats.summary()
-                    );
-                } else if log_stats.files_deleted > 0 || log_stats.dirs_deleted > 0 {
-                    info!("[cleaner] Cleanup completed: {}", log_stats.summary());
-                } else {
-                    debug!("[cleaner] Log cleanup: {}", log_stats.summary());
-                }
-            }
-            Err(e) => {
-                warn!("[cleaner] Cleanup failed: {}", e);
-            }
-        }
+        // 1. 清理过期日志文件。日志清理有独立的周期（默认 1 天）：这里只检查是否到期，
+        //    到期才扫一遍日志目录——日志保留期以天计，不必跟着容器回收的节奏反复扫描。
+        self.cleanup_logs_if_due().await;
 
         // 2. 扫描需要清理的 agent
         let idle_agents = self.agent_scanner.scan_idle_agents().await?;
@@ -169,6 +154,48 @@ impl AgentCleaner {
         info!("[cleaner] Stats: {}", self.stats.summary());
 
         Ok(current_stats)
+    }
+
+    /// 日志清理是否到期：从未执行过，或距上一次已满一个周期
+    fn log_cleanup_due(&self) -> bool {
+        match self.last_log_cleanup {
+            None => true,
+            Some(last) => tokio::time::Instant::now() >= last + self.config.log_cleanup_interval,
+        }
+    }
+
+    /// 到期才执行一次日志清理。先记时间再执行，清扫期间不会被重复触发；读目录等出错时
+    /// 清掉记录，下一轮就重试，不必等下一个周期。
+    async fn cleanup_logs_if_due(&mut self) {
+        if !self.log_cleanup_due() {
+            debug!(
+                "[cleaner] Log cleanup is not due yet (every {}s)",
+                self.config.log_cleanup_interval.as_secs()
+            );
+            return;
+        }
+        self.last_log_cleanup = Some(tokio::time::Instant::now());
+        match self.log_cleaner.cleanup_once().await {
+            Ok(log_stats) => {
+                // 无法确认或删除失败说明环境有问题，必须告警；
+                // "仍被挂载所以保留"是长期运行容器的常态，"顺延"是挂载准备正在进行或
+                // 本轮删除预算用完，都会在下一轮继续——这两类只记 debug。
+                if log_stats.dirs_skipped_unconfirmed > 0 || log_stats.failed_deletions > 0 {
+                    warn!(
+                        "[cleaner] Log cleanup needs attention: {}",
+                        log_stats.summary()
+                    );
+                } else if log_stats.files_deleted > 0 || log_stats.dirs_deleted > 0 {
+                    info!("[cleaner] Cleanup completed: {}", log_stats.summary());
+                } else {
+                    debug!("[cleaner] Log cleanup: {}", log_stats.summary());
+                }
+            }
+            Err(e) => {
+                self.last_log_cleanup = None;
+                warn!("[cleaner] Cleanup failed: {}", e);
+            }
+        }
     }
 
     /// 清理单个 agent
