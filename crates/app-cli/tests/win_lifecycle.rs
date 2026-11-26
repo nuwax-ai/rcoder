@@ -7,8 +7,25 @@
 #![cfg(windows)]
 
 use std::net::TcpStream;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// 结束 app-cli 及其子进程并回收它。`taskkill /T` 的退出码不可靠：它先枚举进程树再
+/// 逐个结束，轮到某个子进程时那个进程可能已经退出，这时它会报错；它报告成功时，目标
+/// 进程可能还没完全退出。所以只看目标进程是否真的结束：没结束就再试，最后用进程句柄结束。
+fn kill_tree(child: &mut Child) {
+    for _ in 0..3 {
+        let _killed = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/F", "/T"])
+            .output();
+        if child.try_wait().expect("observe app-cli").is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let _killed = child.kill();
+    let _reaped = child.wait();
+}
 
 fn free_port_address() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
@@ -79,16 +96,7 @@ fn windows_idle_serve_lifecycle() {
     assert!(healthy, "idle app-cli must answer /health 200 at {address}");
 
     // 强杀（容器终止等价物）
-    let killed = Command::new("taskkill")
-        .args(["/PID", &child.id().to_string(), "/F", "/T"])
-        .output()
-        .expect("taskkill");
-    assert!(
-        killed.status.success(),
-        "taskkill must succeed: {}",
-        String::from_utf8_lossy(&killed.stderr)
-    );
-    child.wait().expect("reap app-cli");
+    kill_tree(&mut child);
 
     // 端口随进程终止释放（可重新绑定）
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -158,10 +166,7 @@ fn xp01_two_cli_concurrent_first_start_single_winner() {
                 status.success(),
                 "control-only caller must reuse the verified owner"
             );
-            let _killed = Command::new("taskkill")
-                .args(["/PID", &first.id().to_string(), "/F", "/T"])
-                .output();
-            let _reaped = first.wait();
+            kill_tree(&mut first);
             return;
         }
         if http_get_health(&address) == Some(200) && second_status.is_none() && !first_alive {
@@ -170,10 +175,7 @@ fn xp01_two_cli_concurrent_first_start_single_winner() {
                 status.success(),
                 "control-only caller must reuse the verified owner"
             );
-            let _killed = Command::new("taskkill")
-                .args(["/PID", &second.id().to_string(), "/F", "/T"])
-                .output();
-            let _reaped = second.wait();
+            kill_tree(&mut second);
             return;
         }
         std::thread::sleep(Duration::from_millis(200));

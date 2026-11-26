@@ -234,12 +234,15 @@ async fn artifact_dispatch_returns_bootstrap_handover_without_accepting_a_new_de
     };
     let journal = owner.state.join("original-deployment-result.json");
     std::fs::write(&journal, b"unconfirmed migration must not be replayed").unwrap();
+    // The deadline only bounds a hang: production passes the whole run
+    // deadline (see run_client.rs). Under parallel load the handover has been
+    // seen to outlast 3 seconds on Windows, so use the dispatch fixtures' 15.
     let result = dispatch_environment_deployment(
         &args,
         &owner.state,
         &owner.identity.application_id,
         &deployment,
-        tokio::time::Instant::now() + Duration::from_secs(3),
+        tokio::time::Instant::now() + Duration::from_secs(15),
     )
     .await
     .unwrap();

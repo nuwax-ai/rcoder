@@ -47,10 +47,8 @@ fn windows_owner_crash_closes_managed_job_and_grandchild() {
     assert!(proxy_version.status.success());
     let proxy_version = String::from_utf8(proxy_version.stdout).unwrap();
     let proxy_version = proxy_version.trim().strip_prefix("pingap ").unwrap();
-    let package: toml::Value = toml::from_str(include_str!("../Cargo.toml")).unwrap();
-    let proxy_commit = package["dependencies"]["pingap-config"]["rev"]
-        .as_str()
-        .unwrap();
+    // `pingap-config` is a crates.io release: the lock's commit is recorded
+    // and forwarded, never matched against the proxy binary.
     std::fs::write(
         workspace.join("release.lock.toml"),
         format!(
@@ -63,7 +61,7 @@ runtime_image_digest = "local-test"
 [pingap]
 mode = "managed"
 version = "{proxy_version}"
-commit = "{proxy_commit}"
+commit = "fixture"
 [[services]]
 service_id = "web"
 name = "Web"

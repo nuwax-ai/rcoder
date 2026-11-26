@@ -615,10 +615,18 @@ mod tests {
         assert!(proxy_spec_relative_config_legacy(&legacy));
         assert!(!proxy_spec_contract_ok(&legacy));
 
+        // 绝对路径要按平台构造：`/home/user/…` 在 Windows 上没有盘符前缀，不算绝对路径。
+        let temporary = tempfile::tempdir().unwrap();
         let absolute = spec_file(vec![
             "/usr/local/bin/pingap".into(),
             "-c".into(),
-            "/home/user/2/.local-logs/pingap/active/pingap.toml".into(),
+            temporary
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join(".local-logs/pingap/active/pingap.toml")
+                .to_string_lossy()
+                .into_owned(),
         ]);
         assert!(!proxy_spec_relative_config_legacy(&absolute));
         assert!(proxy_spec_contract_ok(&absolute));
