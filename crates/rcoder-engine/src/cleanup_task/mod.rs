@@ -8,6 +8,7 @@ pub mod agent;
 pub mod cleaner;
 pub mod config;
 pub mod container;
+mod log_cleanup;
 pub mod logs;
 pub mod storage;
 pub mod strategies;
@@ -20,11 +21,15 @@ pub use cleaner::AgentCleaner;
 pub use config::CleanupConfig;
 #[allow(unused_imports)] // CleanupStats 用于类型导出
 pub use config::CleanupStats;
+use log_cleanup::LogCleanupTask;
 
-/// Start this leadership generation's idle scanner.
+/// Start this leadership generation's idle scanner and log cleanup.
 ///
 /// Metadata retirement has no detached physical-deletion consumer. Each
 /// generation owns only its scanner and can be joined and started again.
+/// Log cleanup rides in the same task so that it is started and joined with
+/// the scanner, but it runs as a loop of its own: a log directory stuck on the
+/// file system must not hold up idle reclaim.
 pub async fn start_cleanup_task(
     config: CleanupConfig,
     state: Arc<crate::app_state::AppState>,
@@ -38,10 +43,15 @@ pub async fn start_cleanup_task(
 
     // AgentCleaner 运行时无关 (destroyer 走 ContainerRuntime trait),
     // Docker / K8s 都从这里复用同一套清理逻辑。
+    let mut log_cleanup = LogCleanupTask::from_config(&config, state.runtime().clone());
     let mut cleaner = AgentCleaner::new(config, state, pingora_service);
 
-    let shutdown_rx = shutdown_tx.subscribe();
+    let cleaner_shutdown = shutdown_tx.subscribe();
+    let log_cleanup_shutdown = shutdown_tx.subscribe();
     Ok(tokio::task::spawn(async move {
-        cleaner.run(shutdown_rx).await;
+        tokio::join!(
+            cleaner.run(cleaner_shutdown),
+            log_cleanup.run(log_cleanup_shutdown),
+        );
     }))
 }

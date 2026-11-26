@@ -1,5 +1,6 @@
 //! Exercise complete cleanup sweeps through real memory storage and gRPC.
 use super::*;
+use crate::cleanup_task::log_cleanup::LogCleanupTask;
 use container_runtime_api::{
     AgentContainerRuntime, AgentResourceIdentity, AgentResourceKind, AgentStopOutcome,
     AgentStopSnapshot, ContainerCreateParams, ContainerRuntimeError, ContainerRuntimeResult,
@@ -16,7 +17,7 @@ use tonic::{Request, Response, Status};
 
 mod absence_recovery;
 mod builder_pod_recovery;
-mod log_cleanup_schedule;
+mod log_cleanup_independence;
 mod physical_docker;
 
 #[derive(Clone, Default)]
@@ -672,14 +673,14 @@ async fn cancelled_sweep_does_not_publish_previous_idle_confirmation() {
     f.close().await;
 }
 
-/// 生产装配路径：清理任务必须按"当前是否还被容器挂载"来决定是否删除过期目录。
+/// 生产装配路径：日志清理任务必须按"当前是否还被容器挂载"来决定是否删除过期目录。
 /// 挂着的保留，没挂的回收。
 ///
 /// 回归背景：清理器曾按目录修改时间删掉了仍在运行的容器的日志目录，容器里的
 /// `/app/container-logs` 随之失效。
 #[tokio::test]
 async fn sweep_keeps_mounted_expired_log_dir_and_reclaims_unmounted() {
-    let mut fixture = Fixture::new(0).await;
+    let fixture = Fixture::new(0).await;
     let log_dir = std::path::PathBuf::from(&fixture.cleaner.config.log_dir);
     std::fs::create_dir_all(&log_dir).unwrap();
     let old_time = std::time::SystemTime::now() - Duration::from_secs(15 * 24 * 60 * 60);
@@ -698,15 +699,19 @@ async fn sweep_keeps_mounted_expired_log_dir_and_reclaims_unmounted() {
         .unwrap()
         .insert(in_use.clone());
 
-    fixture.cleaner.cleanup_once().await.unwrap();
+    let mut log_cleanup = LogCleanupTask::from_config(
+        &fixture.cleaner.config,
+        fixture.cleaner.state.runtime().clone(),
+    );
+    log_cleanup.run_if_due().await;
 
     assert!(
         in_use.exists(),
-        "log directory still mounted by a container must survive the sweep"
+        "log directory still mounted by a container must be kept"
     );
     assert!(
         !orphan.exists(),
-        "log directory no container mounts must be reclaimed by the sweep"
+        "log directory no container mounts must be reclaimed"
     );
     fixture.close().await;
 }

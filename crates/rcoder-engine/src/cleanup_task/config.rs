@@ -23,7 +23,7 @@ pub struct CleanupConfig {
     pub log_dir: String,
     /// 日志保留时长
     pub log_retention_duration: Duration,
-    /// 日志清理的检查间隔（默认24小时）——容器清理任务每轮只检查是否到期
+    /// 日志清理的周期（默认 24 小时）——日志清理任务每个清扫间隔检查一次是否到期
     pub log_cleanup_interval: Duration,
 }
 

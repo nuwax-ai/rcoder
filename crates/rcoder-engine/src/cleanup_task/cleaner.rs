@@ -1,6 +1,6 @@
-//! 主清理器
+//! 主清理器：扫描闲置的 agent 并回收它们的容器。
 //!
-//! 协调各模块完成清理任务
+//! 过期日志目录的清理不在这里，它是独立运行的 [`super::log_cleanup::LogCleanupTask`]。
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -27,12 +27,6 @@ pub struct AgentCleaner {
     // 组件
     container_destroyer: super::container::ContainerDestroyer,
     agent_scanner: super::agent::AgentScanner,
-    log_cleaner: super::logs::LogCleaner,
-    /// 上一次完成日志清扫的时间。未完成的扫描留到下一轮清扫重试。
-    last_log_cleanup: Option<tokio::time::Instant>,
-    /// 日志清理连续"要重试、却没删掉任何东西"的轮数。有进展或干净完成时清零；
-    /// 达到 [`Self::LOG_CLEANUP_STALLED_SWEEPS`] 时告警
-    log_cleanup_stalled_sweeps: u32,
 
     /// Qualified idle observations from the last completed sweep only.
     /// Shared projects cannot advance a physical workload twice in one sweep.
@@ -40,10 +34,6 @@ pub struct AgentCleaner {
 }
 
 impl AgentCleaner {
-    /// 日志清理连续这么多轮没有进展就告警。顺延本身只记 debug：一个目录的复查一直卡住时，
-    /// 每轮都在它身上耗掉预算、其余目录轮不到，清理会无声地停在原地
-    const LOG_CLEANUP_STALLED_SWEEPS: u32 = 3;
-
     pub fn new(
         config: super::config::CleanupConfig,
         state: Arc<crate::app_state::AppState>,
@@ -58,16 +48,6 @@ impl AgentCleaner {
 
         // 判断是否是 K8s 运行时（通过 features flag）
         let is_kubernetes = shared_types::is_kubernetes_runtime();
-
-        // 创建日志清理器（使用配置）。日志目录是容器 /app/container-logs 的挂载源，
-        // 删除前须确认当前没有容器还在挂它。
-        let log_cleaner = super::logs::LogCleaner::new(
-            config.log_dir.clone(),
-            config.log_retention_duration.as_secs() / 24 / 60 / 60,
-            Arc::new(super::logs::RuntimeMountedPaths::new(
-                state.runtime().clone(),
-            )),
-        );
 
         Self {
             config,
@@ -87,9 +67,6 @@ impl AgentCleaner {
                 use crate::cleanup_task::agent::AgentScanner;
                 AgentScanner::new(state.clone(), config_clone)
             },
-            log_cleaner,
-            last_log_cleanup: None,
-            log_cleanup_stalled_sweeps: 0,
             pending_destroy: std::collections::HashSet::new(),
         }
     }
@@ -104,15 +81,11 @@ impl AgentCleaner {
         // 重置本次清理的统计
         let mut current_stats = super::config::CleanupStats::default();
 
-        // 1. 清理过期日志文件。日志清理有独立的周期（默认 1 天）：这里只检查是否到期，
-        //    到期才扫一遍日志目录——日志保留期以天计，不必跟着容器回收的节奏反复扫描。
-        self.cleanup_logs_if_due().await;
-
-        // 2. 扫描需要清理的 agent
+        // 1. 扫描需要清理的 agent
         let idle_agents = self.agent_scanner.scan_idle_agents().await?;
         info!("[cleaner] Found {} idle agents to clean", idle_agents.len());
 
-        // 3. 清理每个 agent
+        // 2. 清理每个 agent
         for project_id in idle_agents {
             // Retiring a captured workload can remove all its old references.
             // Never erase a surviving/new registration just because a sibling
@@ -145,7 +118,7 @@ impl AgentCleaner {
         }
         self.pending_destroy = idle_sweep.into_pending();
 
-        // 4. 更新累计统计
+        // 3. 更新累计统计
         current_stats.last_cleanup = Some(Utc::now());
         self.stats.total_cleaned += current_stats.total_cleaned;
         self.stats.success_cleaned += current_stats.success_cleaned;
@@ -162,92 +135,6 @@ impl AgentCleaner {
         info!("[cleaner] Stats: {}", self.stats.summary());
 
         Ok(current_stats)
-    }
-
-    /// 日志清理是否到期：从未执行过，或距上一次已满一个周期
-    fn log_cleanup_due(&self) -> bool {
-        match self.last_log_cleanup {
-            None => true,
-            Some(last) => {
-                tokio::time::Instant::now().saturating_duration_since(last)
-                    >= self.config.log_cleanup_interval
-            }
-        }
-    }
-
-    /// 完成的日志扫描推进独立周期，临时失败和未完成的批次在下一轮清扫续做。
-    async fn cleanup_logs_if_due(&mut self) {
-        if !self.log_cleanup_due() {
-            debug!(
-                "[cleaner] Log cleanup is not due yet (every {}s)",
-                self.config.log_cleanup_interval.as_secs()
-            );
-            return;
-        }
-        match self.log_cleaner.cleanup_once().await {
-            Ok(log_stats) => {
-                // 要重试却什么都没删掉，才算停在原地；删掉了东西（哪怕批次没做完）是进展
-                let stalled = log_stats.needs_retry()
-                    && log_stats.files_deleted == 0
-                    && log_stats.dirs_deleted == 0;
-                self.log_cleanup_stalled_sweeps = if stalled {
-                    self.log_cleanup_stalled_sweeps.saturating_add(1)
-                } else {
-                    0
-                };
-                self.last_log_cleanup = if log_stats.needs_retry() {
-                    None
-                } else {
-                    Some(tokio::time::Instant::now())
-                };
-                // 无法确认或删除失败说明环境有问题，必须告警；
-                // "仍被挂载所以保留"是长期运行容器的常态，"顺延"是本轮删除预算用完、
-                // 下一轮继续——这两类只记 debug。
-                if log_stats.has_errors() {
-                    warn!(
-                        "[cleaner] Log cleanup needs attention: {}",
-                        log_stats.summary()
-                    );
-                } else if log_stats.files_deleted > 0 || log_stats.dirs_deleted > 0 {
-                    info!("[cleaner] Cleanup completed: {}", log_stats.summary());
-                } else {
-                    debug!("[cleaner] Log cleanup: {}", log_stats.summary());
-                }
-                if self.log_cleanup_stalled_sweeps >= Self::LOG_CLEANUP_STALLED_SWEEPS {
-                    warn!(
-                        sweeps = self.log_cleanup_stalled_sweeps,
-                        first_deferred = log_stats
-                            .first_deferred
-                            .as_deref()
-                            .map(|path| path.display().to_string()),
-                        "[cleaner] Log cleanup keeps retrying without deleting anything: {}",
-                        log_stats.summary()
-                    );
-                }
-            }
-            // 日志目录卡在扫描里：放弃这一轮，等下一个完整周期再试。底层还没返回的阻塞调用
-            // 仍占着线程，不能每个清扫周期再搭一个进去
-            Err(error @ super::logs::LogCleanupError::ScanTimedOut(timeout)) => {
-                self.last_log_cleanup = Some(tokio::time::Instant::now());
-                warn!(
-                    timeout_secs = timeout.as_secs(),
-                    "[cleaner] Log cleanup scan did not finish within {}s; abandoning this run and retrying at the next log cleanup interval: {}",
-                    timeout.as_secs(),
-                    error
-                );
-            }
-            // 出错的那一轮自己告警，不动停滞计数
-            Err(super::logs::LogCleanupError::Io(e)) => {
-                self.last_log_cleanup = None;
-                warn!("[cleaner] Cleanup failed: {}", e);
-            }
-        }
-    }
-
-    /// 测试用：日志清理连续"要重试却没删掉任何东西"的轮数
-    #[cfg(test)]
-    pub(super) fn log_cleanup_stalled_sweeps(&self) -> u32 {
-        self.log_cleanup_stalled_sweeps
     }
 
     /// 清理单个 agent
