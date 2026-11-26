@@ -377,3 +377,79 @@ async fn physical_docker_keeps_dirs_mounted_through_a_symlinked_log_root() {
     assert!(!by_alias.exists() && !by_real.exists());
     assert_eq!(second.dirs_deleted, 2);
 }
+
+/// 回归（Codex 第五轮 P1）：挂载源的路径中间有一个一直稳定的符号链接，指向候选里面的深层
+/// 子目录。Docker 报回的是别名路径，挂载的是它指向的目录；候选是那个目录的真实父目录，
+/// 按别名路径的词法父级找不到它。
+///
+/// 别名放在路径中间而不是最后一级：最后一级是链接时 Docker 并不会把目标目录挂进容器，
+/// 那种容器本身就拿不到挂载。
+#[tokio::test]
+#[ignore = "requires Docker, RCODER_LOG_CLEANER_DOCKER_IMAGE (a local Alpine image ID; never pulls images), RCODER_LOG_CLEANER_TEST_ROOT and HOSTNAME; see the module docs"]
+async fn physical_docker_keeps_the_real_ancestors_of_a_dir_mounted_through_a_stable_alias() {
+    let image = image();
+    let owner = uuid::Uuid::new_v4().simple().to_string();
+    let sandbox = Sandbox::new().await;
+
+    // 两侧各自建出同样的结构：<候选>/log/sub 是真目录，日志根下的 latest 指向 <候选>/log
+    let name = dir_name("aliased", &owner);
+    let mut candidate = None;
+    for root in [&sandbox.process, &sandbox.host] {
+        let nested = root.join(&name).join("log/sub");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("inner.log"), "from-sub").unwrap();
+        std::os::unix::fs::symlink(Path::new(&name).join("log"), root.join("latest")).unwrap();
+        if candidate.is_none() {
+            candidate = Some(root.join(&name));
+        }
+    }
+    let candidate = candidate.unwrap();
+    let old_time = std::time::SystemTime::now() - Duration::from_secs(15 * 86400);
+    std::fs::set_times(&candidate, std::fs::FileTimes::new().set_modified(old_time)).unwrap();
+    let orphan = aged_dir(&sandbox.process, &dir_name("orphan", &owner), 15);
+    // 容器经别名登记：路径中间经过 latest
+    let registered = sandbox.host.join("latest").join("sub");
+    let aliased = run_witness(
+        &image,
+        &owner,
+        &format!("rcoder-log-cleaner-aliased-{owner}"),
+        Some(&registered),
+    );
+
+    // 前置：Docker 报回的是别名路径，挂进去的却是别名指向的目录
+    let inventory = sandbox
+        .runtime
+        .mounted_host_paths()
+        .await
+        .expect("inventory");
+    assert!(
+        inventory.contains(&registered),
+        "Docker must report the registered path as given: {inventory:?}"
+    );
+    let inside = docker(&["exec", &aliased.id, "cat", "/app/container-logs/inner.log"]);
+    assert!(
+        inside.status.success() && String::from_utf8_lossy(&inside.stdout).trim() == "from-sub",
+        "the container must be serving the directory the alias points to: {}",
+        String::from_utf8_lossy(&inside.stderr)
+    );
+
+    let cleaner = sandbox.cleaner(&sandbox.process);
+    let stats = cleaner.cleanup_once().await.unwrap();
+
+    assert!(
+        candidate.exists(),
+        "a directory that contains the real location of a mounted path must be kept"
+    );
+    assert!(
+        !orphan.exists(),
+        "a directory no container mounts must be reclaimed"
+    );
+    assert_eq!(stats.dirs_deleted, 1);
+    assert_eq!(stats.dirs_skipped_in_use, 1);
+    assert_eq!(stats.dirs_skipped_unconfirmed, 0);
+
+    drop(aliased);
+    let second = cleaner.cleanup_once().await.unwrap();
+    assert!(!candidate.exists());
+    assert_eq!(second.dirs_deleted, 1);
+}

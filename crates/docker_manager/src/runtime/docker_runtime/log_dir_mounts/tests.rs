@@ -168,39 +168,48 @@ impl Tree {
     async fn verdict(&self, candidate: &Path, sources: &[&str]) -> LogDirMount {
         let resolver = self.resolver();
         let space = HostPathSpace::Container(&resolver);
-        Self::decide(&space, candidate, sources, &FileSystemIdentities).await
+        Self::decide(&space, candidate, sources, &LocalFileSystem).await
     }
 
     async fn decide(
         space: &HostPathSpace<'_>,
         candidate: &Path,
         sources: &[&str],
-        identities: &dyn DirectoryIdentities,
+        fs: &dyn FileSystemView,
     ) -> LogDirMount {
         let sources: Vec<PathBuf> = sources.iter().map(PathBuf::from).collect();
-        let observations = observe(space, &sources, identities).await;
-        classify(candidate, space, &observations, identities).await
+        let observations = observe(space, &sources, fs).await;
+        classify(candidate, space, &observations, fs).await
     }
 }
 
 /// 同一个宿主机目录挂进 RCoder 两次时的两个视图：`second` 视图下的路径其实也是
-/// `first` 视图下的那个目录，读出来的身份应当相同。
+/// `first` 视图下的那个目录，读出来的内容应当相同。
 ///
-/// 没有特权做不了真实的 bind mount，而"两个视图身份相同"正是 bind mount 的性质，所以把
-/// `second` 下的身份读取折到 `first` 上。
+/// 没有特权做不了真实的 bind mount，而"两个视图是同一个目录"正是 bind mount 的性质，所以把
+/// `second` 下的读取折到 `first` 上。
 struct SecondView {
     first: PathBuf,
     second: PathBuf,
 }
 
-#[async_trait]
-impl DirectoryIdentities for SecondView {
-    async fn identity(&self, path: &Path) -> std::io::Result<DirectoryId> {
-        let path = match path.strip_prefix(&self.second) {
+impl SecondView {
+    fn folded(&self, path: &Path) -> PathBuf {
+        match path.strip_prefix(&self.second) {
             Ok(rest) => self.first.join(rest),
             Err(_) => path.to_path_buf(),
-        };
-        FileSystemIdentities.identity(&path).await
+        }
+    }
+}
+
+#[async_trait]
+impl FileSystemView for SecondView {
+    async fn entry(&self, path: &Path) -> std::io::Result<Entry> {
+        LocalFileSystem.entry(&self.folded(path)).await
+    }
+
+    async fn identity(&self, path: &Path) -> std::io::Result<DirectoryId> {
+        LocalFileSystem.identity(&self.folded(path)).await
     }
 }
 
@@ -374,7 +383,7 @@ async fn host_space_matches_aliases_by_directory_identity() {
     ] {
         let source_text = source.to_string_lossy().into_owned();
         assert_eq!(
-            Tree::decide(&space, candidate, &[&source_text], &FileSystemIdentities).await,
+            Tree::decide(&space, candidate, &[&source_text], &LocalFileSystem).await,
             expected,
             "source {} candidate {}",
             source.display(),
@@ -455,13 +464,7 @@ async fn a_view_hidden_behind_another_mount_is_not_taken_for_the_mount_source() 
     );
 
     // 没有别的视图看得到它：无法辨识，保留并说明原因，而不是判成仍被挂载
-    let verdict = Tree::decide(
-        &space,
-        &tree.path("shadowed"),
-        &[&hidden],
-        &FileSystemIdentities,
-    )
-    .await;
+    let verdict = Tree::decide(&space, &tree.path("shadowed"), &[&hidden], &LocalFileSystem).await;
     assert!(
         matches!(&verdict, LogDirMount::Unconfirmed(reason) if reason.contains("hidden behind another mount")),
         "{verdict:?}"
@@ -491,6 +494,264 @@ async fn a_view_hidden_behind_another_mount_is_not_taken_for_the_mount_source() 
         .await,
         LogDirMount::Mounted
     );
+}
+
+// ─── 挂载源经符号链接指到别处（Codex 第五轮 P1）────────────────────────────
+
+/// `logs/real/nested` 是真目录，`logs/alias` 一直指向它。返回真实位置和它的父目录
+fn stable_alias(base: &Path) -> (PathBuf, PathBuf) {
+    let nested = base.join("logs/real/nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::os::unix::fs::symlink("real/nested", base.join("logs/alias")).unwrap();
+    (nested, base.join("logs/real"))
+}
+
+/// 容器里的路径经别名登记，挂载的是别名指向的目录。候选是那个目录的真实父目录、它本身、
+/// 或日志总根时都要保留；与真实位置无关的目录不受牵连。
+#[tokio::test]
+async fn a_stable_alias_to_a_nested_directory_keeps_the_real_ancestors() {
+    let tree = Tree::new();
+    let (nested, parent) = stable_alias(&tree.base);
+    std::fs::create_dir(tree.path("logs/runner-b")).unwrap();
+
+    for candidate in [&parent, &nested, &tree.path("logs")] {
+        assert_eq!(
+            tree.verdict(candidate, &["/host/base/logs/alias"]).await,
+            LogDirMount::Mounted,
+            "{} contains a directory that is still mounted",
+            candidate.display()
+        );
+    }
+    assert_eq!(
+        tree.verdict(&tree.path("logs/runner-b"), &["/host/base/logs/alias"])
+            .await,
+        LogDirMount::Unmounted,
+        "a directory unrelated to the real location is not kept"
+    );
+}
+
+/// 别名在路径中间：容器经 `<别名>/leaf` 登记，挂的是别名指向的目录里面的 `leaf`。真实 Docker
+/// 上能正常工作的是这一种（最后一级是链接时 Docker 不会把目标挂进容器）。
+#[tokio::test]
+async fn a_stable_alias_in_the_middle_of_the_mount_path_keeps_the_real_ancestors() {
+    let tree = Tree::new();
+    let (nested, parent) = stable_alias(&tree.base);
+    let leaf = nested.join("leaf");
+    std::fs::create_dir(&leaf).unwrap();
+
+    for candidate in [&leaf, &nested, &parent, &tree.path("logs")] {
+        assert_eq!(
+            tree.verdict(candidate, &["/host/base/logs/alias/leaf"])
+                .await,
+            LogDirMount::Mounted,
+            "{}",
+            candidate.display()
+        );
+    }
+    std::fs::create_dir(leaf.join("below")).unwrap();
+    assert_eq!(
+        tree.verdict(&leaf.join("below"), &["/host/base/logs/alias/leaf"])
+            .await,
+        LogDirMount::Unmounted,
+        "a subdirectory of the mounted directory is not occupied"
+    );
+}
+
+/// deploy-host 形态不做前缀替换，符号链接就在宿主机上解析
+#[tokio::test]
+async fn a_stable_alias_keeps_the_real_ancestors_in_host_space() {
+    let tree = Tree::new();
+    let (nested, parent) = stable_alias(&tree.base);
+    let source = tree.path("logs/alias").to_string_lossy().into_owned();
+
+    for candidate in [&parent, &nested, &tree.path("logs")] {
+        assert_eq!(
+            Tree::decide(
+                &HostPathSpace::Host,
+                candidate,
+                &[&source],
+                &LocalFileSystem
+            )
+            .await,
+            LogDirMount::Mounted,
+            "{}",
+            candidate.display()
+        );
+    }
+}
+
+/// 同一个宿主机目录有宽窄两个视图，挂载源里的相对链接在窄视图里解析出了挂载根。词法回查
+/// 两个视图都通过，但只有宽视图看得到链接真正指向的目录；窄视图里那一头要么不存在，要么
+/// 是另一个真实存在的目录。
+#[tokio::test]
+async fn a_relative_link_leaving_the_narrower_view_is_followed_through_the_wider_one() {
+    for elsewhere in [false, true] {
+        let tree = Tree::new();
+        std::fs::create_dir_all(tree.path("logs/real/nested")).unwrap();
+        std::fs::create_dir(tree.path("logs/sub")).unwrap();
+        std::os::unix::fs::symlink("../real", tree.path("logs/sub/link")).unwrap();
+        // 窄视图经另一条路径看到同一个 logs/sub（真实场景里是经另一个挂载点）
+        std::fs::create_dir(tree.path("narrow")).unwrap();
+        std::os::unix::fs::symlink("../real", tree.path("narrow/link")).unwrap();
+        if elsewhere {
+            // 窄视图里的 ../real 落到挂载根之外，是另一个真实存在的目录
+            std::fs::create_dir_all(tree.path("real")).unwrap();
+        }
+        let resolver = HostPathResolver::from_mount_table(vec![
+            (tree.base.clone(), PathBuf::from(HOST_BASE)),
+            (tree.path("narrow"), PathBuf::from("/host/base/logs/sub")),
+        ])
+        .unwrap();
+        let space = HostPathSpace::Container(&resolver);
+
+        // 链接真正指向的是 logs/real：它本身和它上面的各级都要保留
+        for candidate in [tree.path("logs/real"), tree.path("logs")] {
+            assert_eq!(
+                Tree::decide(
+                    &space,
+                    &candidate,
+                    &["/host/base/logs/sub/link"],
+                    &LocalFileSystem
+                )
+                .await,
+                LogDirMount::Mounted,
+                "elsewhere={elsewhere}: {} contains a directory that is still mounted",
+                candidate.display()
+            );
+        }
+        // 受保护的是挂载目录和它的父级，不是它的子目录
+        assert_eq!(
+            Tree::decide(
+                &space,
+                &tree.path("logs/real/nested"),
+                &["/host/base/logs/sub/link"],
+                &LocalFileSystem
+            )
+            .await,
+            LogDirMount::Unmounted,
+            "elsewhere={elsewhere}: a subdirectory of the mounted directory is not occupied"
+        );
+    }
+}
+
+/// 文件级 bind 经符号链接落在候选里面，候选目录同样要保留
+#[tokio::test]
+async fn a_file_bind_through_a_link_inside_the_candidate_keeps_it() {
+    let tree = Tree::new();
+    std::fs::create_dir_all(tree.path("logs/real")).unwrap();
+    std::fs::write(tree.path("logs/real/app.log"), "log").unwrap();
+    std::os::unix::fs::symlink("real/app.log", tree.path("logs/link")).unwrap();
+
+    assert_eq!(
+        tree.verdict(&tree.path("logs/real"), &["/host/base/logs/link"])
+            .await,
+        LogDirMount::Mounted
+    );
+}
+
+/// 容器还在、它挂着的目录已经经别名被删：链接悬空，没有可保护的东西，也不能卡住其余目录
+#[tokio::test]
+async fn a_source_vanished_through_a_stable_alias_does_not_block_other_directories() {
+    let tree = Tree::new();
+    std::os::unix::fs::symlink("real/nested", tree.path("logs/alias")).unwrap();
+
+    assert_eq!(
+        tree.verdict(&tree.path("logs/runner-a"), &["/host/base/logs/alias"])
+            .await,
+        LogDirMount::Unmounted
+    );
+}
+
+/// 绝对链接指向 RCoder 没挂的宿主机位置：与任何候选无关
+#[tokio::test]
+async fn an_absolute_link_to_an_unmounted_location_is_unrelated_to_every_candidate() {
+    let tree = Tree::new();
+    std::os::unix::fs::symlink("/elsewhere/logs/real/nested", tree.path("logs/alias")).unwrap();
+
+    assert_eq!(
+        tree.verdict(&tree.path("logs/runner-a"), &["/host/base/logs/alias"])
+            .await,
+        LogDirMount::Unmounted
+    );
+}
+
+/// 容器形态下绝对链接指向的是宿主机上的路径。它落在另一个视图里时，从那个视图解析
+#[tokio::test]
+async fn an_absolute_link_into_another_view_is_followed_there() {
+    let tree = Tree::new();
+    std::fs::create_dir_all(tree.path("other/real/nested")).unwrap();
+    std::os::unix::fs::symlink("/host/other/real/nested", tree.path("logs/alias")).unwrap();
+    let resolver = HostPathResolver::from_mount_table(vec![
+        (tree.base.clone(), PathBuf::from(HOST_BASE)),
+        (tree.path("other"), PathBuf::from("/host/other")),
+    ])
+    .unwrap();
+    let space = HostPathSpace::Container(&resolver);
+
+    for candidate in [tree.path("other/real"), tree.path("other/real/nested")] {
+        assert_eq!(
+            Tree::decide(
+                &space,
+                &candidate,
+                &["/host/base/logs/alias"],
+                &LocalFileSystem
+            )
+            .await,
+            LogDirMount::Mounted,
+            "{}",
+            candidate.display()
+        );
+    }
+}
+
+/// 链接里的 `..` 回退到了 RCoder 看不到的那一级：之后的位置只能靠词法推断，不能当成与候选
+/// 无关。这里链接绕一圈回到日志根里面。
+#[tokio::test]
+async fn a_link_climbing_above_every_mount_keeps_every_candidate() {
+    let tree = Tree::new();
+    std::fs::create_dir_all(tree.path("logs/sub")).unwrap();
+    std::fs::create_dir_all(tree.path("logs/real/x")).unwrap();
+    std::os::unix::fs::symlink("../../../host/base/logs/real/x", tree.path("logs/sub/link"))
+        .unwrap();
+    // 只有日志根被挂载，它上面各级 RCoder 都看不到
+    let resolver = HostPathResolver::from_mount_table(vec![(
+        tree.path("logs"),
+        PathBuf::from("/host/base/logs"),
+    )])
+    .unwrap();
+    let space = HostPathSpace::Container(&resolver);
+
+    for candidate in [tree.path("logs/real"), tree.path("logs/runner-a")] {
+        assert!(
+            matches!(
+                Tree::decide(
+                    &space,
+                    &candidate,
+                    &["/host/base/logs/sub/link"],
+                    &LocalFileSystem
+                )
+                .await,
+                LogDirMount::Unconfirmed(_)
+            ),
+            "{} must be kept: {}",
+            candidate.display(),
+            "where the link leads cannot be confirmed"
+        );
+    }
+}
+
+/// 链接成环
+#[tokio::test]
+async fn a_symlink_loop_is_unconfirmed() {
+    let tree = Tree::new();
+    std::os::unix::fs::symlink("b", tree.path("logs/a")).unwrap();
+    std::os::unix::fs::symlink("a", tree.path("logs/b")).unwrap();
+
+    assert!(matches!(
+        tree.verdict(&tree.path("logs/runner-a"), &["/host/base/logs/a"])
+            .await,
+        LogDirMount::Unconfirmed(_)
+    ));
 }
 
 // ─── 协议：真实 Bollard 客户端 + 假 daemon ───────────────────────────────────
