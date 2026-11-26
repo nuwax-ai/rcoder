@@ -50,18 +50,20 @@
 //! - 挂载别名里的符号链接在使用期间必须保持稳定。Docker 在挂载那一刻解析符号链接；之后
 //!   别名被改指别处时，运行中的容器仍持有旧目录，而这里重新解析得到的是新位置，对不上。
 //! - 目录身份只在 Unix 平台可读，其它平台一律按无法确认处理。
+//!
+//! 路径空间怎么换算（[`HostPathSpace`]）在 `host_path_space`，判定和新建目录共用。
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use bollard::models::ContainerSummary;
 use container_runtime_api::{ContainerRuntimeError, ContainerRuntimeResult, LogDirectoryMounts};
 use tokio::sync::OnceCell;
 
+use super::host_path_space::{HostPathSpace, Viewed, path_space, viewing};
 use crate::{DockerError, DockerManager, DockerResult, HostPathResolver};
 
 /// 一条路径上最多跟随多少个符号链接，与内核的上限相同
@@ -125,50 +127,6 @@ pub(super) fn list_error(error: DockerError) -> ContainerRuntimeError {
         other => {
             ContainerRuntimeError::DockerError(format!("List container mount sources: {other}"))
         }
-    }
-}
-
-/// RCoder 进程命名空间里的路径如何与宿主机路径互相换算
-enum HostPathSpace<'a> {
-    /// deploy-host 形态：RCoder 与 daemon 同在宿主机，进程路径就是宿主机路径
-    Host,
-    /// 容器形态：按 RCoder 所在容器的挂载表替换前缀
-    Container(&'a HostPathResolver),
-}
-
-/// 一个宿主机路径在 RCoder 命名空间里的一个视图：这个宿主机路径经某条挂载看到的路径
-struct Projection {
-    path: PathBuf,
-}
-
-impl HostPathSpace<'_> {
-    /// 与创建侧 `apply_auto_mounts` 登记挂载时逐字一致：先做词法归一化，再替换前缀
-    fn to_host(&self, path: &Path) -> DockerResult<PathBuf> {
-        let lexical = crate::normalize_path(path);
-        match self {
-            HostPathSpace::Host => Ok(lexical),
-            HostPathSpace::Container(resolver) => resolver.resolve_to_host_path(&lexical),
-        }
-    }
-
-    /// `host_path` 在 RCoder 命名空间里的全部视图：同一个宿主机目录挂了几次就有几个
-    fn projections(&self, host_path: &Path) -> Vec<Projection> {
-        let host_path = crate::normalize_path(host_path);
-        match self {
-            HostPathSpace::Host => vec![Projection { path: host_path }],
-            HostPathSpace::Container(resolver) => resolver
-                .projections_from_host_path(&host_path)
-                .into_iter()
-                .map(|(_, path)| Projection { path })
-                .collect(),
-        }
-    }
-
-    /// 这个视图看到的确实是 `host_path`：把视图里的路径再正向换算回去，必须得到 `host_path`。
-    /// 路径中途被另一条挂载遮蔽时，看到的是另一棵目录，换算回去就对不上。
-    fn shows(&self, projection: &Projection, host_path: &Path) -> bool {
-        self.to_host(&projection.path)
-            .is_ok_and(|mapped| mapped == crate::normalize_path(host_path))
     }
 }
 
@@ -247,32 +205,6 @@ impl FileSystemView for LocalFileSystem {
 /// 路径不存在，或者路径中间有一级不是目录
 fn is_absent(error: &std::io::Error) -> bool {
     matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
-}
-
-/// 一个宿主机路径经哪个视图看得到
-enum Viewed {
-    Through(Projection),
-    /// RCoder 的任何挂载都不覆盖它
-    Unmounted,
-    /// 有挂载覆盖，但每个视图都对不上：这个位置被另一条挂载遮蔽了
-    Hidden,
-}
-
-/// 取最具体的那个能核验的视图。视图里的路径要能换算回这个宿主机路径才算数：路径中途被
-/// 另一条挂载遮蔽时，看到的是另一棵目录，换算回去就对不上
-fn viewing(space: &HostPathSpace<'_>, host_path: &Path) -> Viewed {
-    let mut hidden = false;
-    for projection in space.projections(host_path) {
-        if space.shows(&projection, host_path) {
-            return Viewed::Through(projection);
-        }
-        hidden = true;
-    }
-    if hidden {
-        Viewed::Hidden
-    } else {
-        Viewed::Unmounted
-    }
 }
 
 /// 经 RCoder 的挂载看到的一个宿主机路径
@@ -574,26 +506,6 @@ async fn classify(
     LogDirMount::Unmounted
 }
 
-/// 解析器只在首次用到时创建，并且必须用取清单的同一个 Docker 客户端：两者观察的得是
-/// 同一个 daemon、同一个"自己"，否则换算出的宿主机路径和清单对不上。
-async fn container_resolver<'a>(
-    manager: &DockerManager,
-    cell: &'a OnceCell<HostPathResolver>,
-) -> ContainerRuntimeResult<&'a HostPathResolver> {
-    let client = manager.get_docker_client().clone();
-    tokio::time::timeout(
-        Duration::from_secs(manager.config.api_timeout_quick_seconds),
-        cell.get_or_try_init(|| HostPathResolver::new_with_docker_client(client)),
-    )
-    .await
-    .map_err(|_| {
-        ContainerRuntimeError::Timeout("Resolve log directory mounts timed out".to_owned())
-    })?
-    .map_err(|error| {
-        ContainerRuntimeError::DockerError(format!("Resolve log directory mounts: {error}"))
-    })
-}
-
 /// 判定每个候选日志目录是否仍被容器挂载。
 ///
 /// 清单一律取自真实 Docker，不读进程内缓存，整轮只发一次列表请求。单个候选换算失败或读不到
@@ -613,12 +525,7 @@ pub(super) async fn mounted_log_directories(
         .into_iter()
         .collect();
 
-    let space = match log_path_resolver.get() {
-        // 显式注入的挂载表优先：调用方已经知道映射关系，不再自检
-        Some(resolver) => HostPathSpace::Container(resolver),
-        None if shared_types::is_deploy_host() => HostPathSpace::Host,
-        None => HostPathSpace::Container(container_resolver(manager, log_path_resolver).await?),
-    };
+    let space = path_space(manager, log_path_resolver).await?;
     let fs = LocalFileSystem;
     let observations = observe(&space, &sources, &fs).await;
 

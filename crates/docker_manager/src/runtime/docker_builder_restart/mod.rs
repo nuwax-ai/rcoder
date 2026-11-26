@@ -14,8 +14,15 @@
 //! existing private operation receipts. Identity labels
 //! are re-derived from the operation context so the replacement binds to the
 //! current lifecycle instead of replaying possibly stale labels.
+//!
+//! The log mount is the one bind that is not replayed verbatim: the replacement
+//! gets a new log directory instead, see [`log_directory`].
 use super::docker_runtime::DockerRuntime;
 use container_runtime_api::{ContainerRuntimeError as Error, ContainerRuntimeResult as Result};
+use log_directory::{
+    LogDirectory, LogDirectoryPlan, RESTART_LOG_DIR, discard_log_directory, rebind_log_directory,
+    volumes_with_log_source,
+};
 use sha2::{Digest as _, Sha256};
 use shared_types::{
     AppResourceIdentity, AppResourceKind, BuilderControlTarget, BuilderRestartTemplate,
@@ -32,7 +39,7 @@ use std::{
 const RESTORE: &str = "rcoder.io/restart-archive-uid";
 const ARCHIVE_LIMIT: u64 = 96 * 1024;
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Archive {
     source: BuilderControlTarget,
@@ -524,7 +531,8 @@ impl DockerRuntime {
             .as_ref()
             .filter(|resource| resource.kind == AppResourceKind::Container)
             .ok_or_else(|| conflict("Restart source container is missing"))?;
-        self.replace_builder_container(template, &archive, original)
+        let expected_volumes = self
+            .replace_builder_container(template, &archive, original)
             .await?;
         let client = self.inner.get_docker_client();
         let restored = self
@@ -542,7 +550,7 @@ impl DockerRuntime {
             .inspect_container(&resource.uid, None)
             .await
             .map_err(|error| fail(format!("Verify replacement builder: {error}")))?;
-        if bind_witness(&inspect)? != template.volumes {
+        if bind_witness(&inspect)? != expected_volumes {
             return Err(conflict("Restart workspace binds changed"));
         }
         // Replacement is deliberately stopped here. Its Direct IP and
@@ -551,18 +559,19 @@ impl DockerRuntime {
     }
 
     /// 用归档重放出替代 builder：必要时先移除仍被保留的旧容器，核对 bind 源，再创建。
+    /// 返回替代容器应当有的挂载。
     ///
-    /// 整段都在挂载围栏的读锁内。旧容器的挂载消失、到替代容器的挂载登记之间，日志清理器
-    /// 不能插进来：归档里的 bind 源若正好是可回收的日志目录，会被它在这一段回收。期间
-    /// 可能拉镜像，清理器只是顺延到下一轮。
+    /// 日志挂载不照原样重放，换成同级的新目录：旧目录可能已经过期，日志清理器正在回收它，
+    /// 和 builder 停了多久无关。替代容器绑定的是刚建的新目录，清理器手里的候选碰不到它，
+    /// 这一段不需要和清理器互斥。
     async fn replace_builder_container(
         &self,
         template: &BuilderRestartTemplate,
         archive: &Archive,
         original: &AppResourceIdentity,
-    ) -> Result<()> {
+    ) -> Result<Vec<AppResourceIdentity>> {
         let client = self.inner.get_docker_client();
-        let _log_mount_guard = crate::LOG_MOUNT_GATE.read().await;
+        let mut replay = archive.clone();
         // Old versions may retain stopped builders. Replace that exact instance
         // only after its stop receipt and mount witnesses are confirmed.
         if let Some(existing) = inspect_absent(
@@ -615,6 +624,7 @@ impl DockerRuntime {
         // replacement already. Accept only this archive's marker, never a
         // running occupant or a different container under the same name.
         let mut resumed = false;
+        let mut resumed_log_directory: Option<String> = None;
         match inspect_absent(
             client.inspect_container(&original.name, None).await,
             "Inspect restart target",
@@ -632,10 +642,20 @@ impl DockerRuntime {
                     return Err(conflict("Another builder occupies restart target"));
                 }
                 resumed = true;
+                // 上一次中断前建好的替代容器，它拿到的日志目录记在这个 label 里。没有 label 的
+                // 是旧版本建的：那时归档原样重放，它绑的就是归档里的目录
+                resumed_log_directory = labels.get(RESTART_LOG_DIR).cloned();
             }
         }
+        let mut expected = template.volumes.clone();
         if !resumed {
+            // 先定下要新建日志目录，再核对其它 bind 源：核对不过就不建
+            let plan = LogDirectoryPlan::plan(template, archive)?;
             for volume in &template.volumes {
+                // 日志目录换成新建的，旧的可能早已被清理器回收，不要求它还在
+                if plan.as_ref().is_some_and(|plan| plan.volume == volume) {
+                    continue;
+                }
                 if !bind_source_exists(&volume.uid)? {
                     return Err(conflict(format!(
                         "Restart bind source is missing: {}",
@@ -654,38 +674,79 @@ impl DockerRuntime {
                 .map_err(|error| {
                     Error::DockerError(format!("Prepare restart image {image}: {error}"))
                 })?;
-            let mut body = restore_body(template, archive)?;
-            crate::native_domain::stamp(client, &mut body)
-                .await
-                .map_err(|e| fail(format!("bind replacement execution domain: {e:#}")))?;
-            let options = bollard::query_parameters::CreateContainerOptions {
-                name: Some(original.name.clone()),
-                platform: self.inner.config.default_platform.clone(),
-            };
-            // A container mid-removal still owns its name: creation 409s with
-            // "name already in use". The daemon finishes auto-remove quickly;
-            // wait it out bounded instead of failing the whole restart.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-            let created = loop {
-                match client
-                    .create_container(Some(options.clone()), body.clone())
-                    .await
-                {
-                    Ok(created) => break created,
-                    Err(bollard::errors::Error::DockerResponseServerError {
-                        status_code: 409,
-                        message,
-                    }) if message.contains("already in use")
-                        && std::time::Instant::now() < deadline =>
-                    {
-                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    }
-                    Err(error) => return Err(fail(format!("Create replacement builder: {error}"))),
+            let log_directory = match &plan {
+                Some(plan) => {
+                    let log_directory = self.create_log_directory(plan).await?;
+                    rebind_log_directory(&mut replay, plan, &log_directory);
+                    Some(log_directory)
                 }
+                None => None,
             };
-            if created.id.is_empty() {
-                return Err(fail("Replacement builder create returned no physical ID"));
+            if let Err(error) = self
+                .create_replacement(template, &replay, log_directory.as_ref(), original)
+                .await
+            {
+                if let Some(created) = log_directory
+                    .as_ref()
+                    .and_then(|log_directory| log_directory.created.as_deref())
+                {
+                    discard_log_directory(created).await;
+                }
+                return Err(error);
             }
+            if let Some(log_directory) = &log_directory {
+                expected = volumes_with_log_source(
+                    &template.volumes,
+                    &log_directory.target,
+                    &log_directory.source,
+                );
+            }
+        } else if let (Some(target), Some(source)) = (archive.log_target(), resumed_log_directory) {
+            expected = volumes_with_log_source(&template.volumes, target, &source);
+        }
+        Ok(expected)
+    }
+
+    /// Create the stopped replacement. The caller verifies it through a fresh capture.
+    async fn create_replacement(
+        &self,
+        template: &BuilderRestartTemplate,
+        replay: &Archive,
+        log_directory: Option<&LogDirectory>,
+        original: &AppResourceIdentity,
+    ) -> Result<()> {
+        let client = self.inner.get_docker_client();
+        let mut body = restore_body(template, replay, log_directory)?;
+        crate::native_domain::stamp(client, &mut body)
+            .await
+            .map_err(|e| fail(format!("bind replacement execution domain: {e:#}")))?;
+        let options = bollard::query_parameters::CreateContainerOptions {
+            name: Some(original.name.clone()),
+            platform: self.inner.config.default_platform.clone(),
+        };
+        // A container mid-removal still owns its name: creation 409s with
+        // "name already in use". The daemon finishes auto-remove quickly;
+        // wait it out bounded instead of failing the whole restart.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let created = loop {
+            match client
+                .create_container(Some(options.clone()), body.clone())
+                .await
+            {
+                Ok(created) => break created,
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 409,
+                    message,
+                }) if message.contains("already in use")
+                    && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+                Err(error) => return Err(fail(format!("Create replacement builder: {error}"))),
+            }
+        };
+        if created.id.is_empty() {
+            return Err(fail("Replacement builder create returned no physical ID"));
         }
         Ok(())
     }
@@ -758,10 +819,12 @@ impl DockerRuntime {
 
 /// Rebuild the create body from the archive. Identity labels are re-derived
 /// from the operation context (never replayed), the restore marker makes a
-/// retry idempotent, and the captured image/config replay verbatim.
+/// retry idempotent, and the captured image/config replay verbatim — except the
+/// log mount, which follows `log_directory` when there is one.
 fn restore_body(
     template: &BuilderRestartTemplate,
     archive: &Archive,
+    log_directory: Option<&LogDirectory>,
 ) -> Result<bollard::models::ContainerCreateBody> {
     let context = &template.source.context;
     let name = template
@@ -779,6 +842,9 @@ fn restore_body(
     );
     labels.insert("identifier".into(), context.app_id.clone());
     labels.insert(RESTORE.into(), template.archive.uid.clone());
+    if let Some(log_directory) = log_directory {
+        labels.insert(RESTART_LOG_DIR.into(), log_directory.source.clone());
+    }
     let (networking_config, network_mode) = if archive.network_mode == "host" {
         (None, "host".to_string())
     } else {
@@ -878,6 +944,8 @@ fn restore_body(
         ..Default::default()
     })
 }
+
+mod log_directory;
 
 #[cfg(test)]
 mod tests;

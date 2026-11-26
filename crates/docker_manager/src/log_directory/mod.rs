@@ -23,6 +23,21 @@ pub(crate) fn log_directory_name(owner: &str, now: chrono::DateTime<chrono::Utc>
     format!("{}-{}", owner, now.format("%Y%m%d%H%M%S"))
 }
 
+/// 替代容器的日志目录名：沿用原目录名里时间戳之前的部分，换上新的时间
+pub(crate) fn replacement_log_directory_name(
+    previous: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    match previous.rsplit_once('-') {
+        Some((owner, timestamp)) if is_timestamp(timestamp) => log_directory_name(owner, now),
+        _ => log_directory_name(previous, now),
+    }
+}
+
+fn is_timestamp(text: &str) -> bool {
+    text.len() == 14 && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 /// 在 `parent` 下新建一个目录，名字优先用 `preferred`，返回新建目录的路径。
 ///
 /// `parent` 不存在时一并建出来。同名目录已经存在时不算成功：换一个名字再建，宁可多建一个
@@ -74,66 +89,4 @@ impl std::fmt::Display for FreshDirectoryError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn at(text: &str) -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::parse_from_rfc3339(text)
-            .unwrap()
-            .with_timezone(&chrono::Utc)
-    }
-
-    #[test]
-    fn a_log_directory_is_named_after_its_container_and_the_utc_second() {
-        assert_eq!(
-            log_directory_name("rcoder-app-builder-265", at("2025-10-26T08:00:00Z")),
-            "rcoder-app-builder-265-20251026080000"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_fresh_directory_is_created_under_its_preferred_name() {
-        let root = tempfile::tempdir().unwrap();
-        let parent = root.path().join("logs").join("container");
-
-        let created = create_fresh_directory(&parent, "runner-20251026080000")
-            .await
-            .unwrap();
-
-        assert_eq!(created, parent.join("runner-20251026080000"));
-        assert!(created.is_dir());
-    }
-
-    #[tokio::test]
-    async fn an_existing_directory_is_never_reused() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join("runner-20251026080000")).unwrap();
-        std::fs::write(root.path().join("runner-20251026080000-2"), b"a file").unwrap();
-
-        let created = create_fresh_directory(root.path(), "runner-20251026080000")
-            .await
-            .unwrap();
-
-        assert_eq!(created, root.path().join("runner-20251026080000-3"));
-        assert!(root.path().join("runner-20251026080000").is_dir());
-        assert_eq!(
-            std::fs::read(root.path().join("runner-20251026080000-2")).unwrap(),
-            b"a file"
-        );
-    }
-
-    #[tokio::test]
-    async fn every_taken_name_is_reported_instead_of_reusing_one() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join("runner")).unwrap();
-        for attempt in 2..=NAME_ATTEMPTS {
-            std::fs::create_dir(root.path().join(format!("runner-{attempt}"))).unwrap();
-        }
-
-        let error = create_fresh_directory(root.path(), "runner")
-            .await
-            .unwrap_err();
-
-        assert!(matches!(error, FreshDirectoryError::Exhausted));
-    }
-}
+mod tests;

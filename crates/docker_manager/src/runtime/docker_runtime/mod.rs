@@ -24,8 +24,10 @@ pub struct DockerRuntime {
     /// 列表缓存携带状态代次：命中时与 [`ContainerStateHandle::list_epoch`]
     /// 比对，变更（创建/删除/更新）后立即可见，不再单靠 TTL。
     list_cache: Cache<(), (u64, Vec<RuntimeContainerInfo>)>,
-    // The RCoder container's mount table stays fixed for its lifetime.
-    log_path_resolver: tokio::sync::OnceCell<crate::HostPathResolver>,
+    // The RCoder container's mount table stays fixed for its lifetime. Shared by
+    // the log directory mount check and by creating a replacement builder's log
+    // directory, so both see the same mapping.
+    pub(super) log_path_resolver: tokio::sync::OnceCell<crate::HostPathResolver>,
 }
 
 impl DockerRuntime {
@@ -236,6 +238,7 @@ pub(super) fn extract_container_ports(
 
 mod agent_runtime;
 mod container_query;
+pub(crate) mod host_path_space;
 pub(crate) mod log_dir_mounts;
 mod partial_creation;
 mod pod_overview;
