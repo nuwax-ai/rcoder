@@ -24,7 +24,20 @@
 //!   预算用完（时间或数量）。两者分别计数，不告警。
 //!
 //! 单个候选判不出来只影响它自己：其余能判定的目录照常回收。
+//!
+//! # 卡住的候选
+//!
+//! 候选按顺序复查，复查共用这一轮的截止时间。一个目录的复查如果一直不回来（文件系统
+//! 或挂载卡住），每轮的预算都耗在它身上，排在后面的目录永远轮不到；而"顺延"不算故障，
+//! 只有 debug 日志，卡住不会被发现。所以给足了时间（[`FAIR_RECHECK_WINDOW`]）还超时的候选
+//! 记一轮，连续 [`RECHECK_TIMEOUT_QUARANTINE_SWEEPS`] 轮之后就**隔离**：保留目录、告警、
+//! 不再参与后面的轮次，其余目录照常回收。预算本来就快用完时的超时只是没轮到它，不记。
+//!
+//! 超时记录带过期时间（[`RECHECK_TIMEOUT_MEMORY`]），不长期占着内存：隔离中的目录过了这段
+//! 时间，后面的日志清理会再试一次；文件系统恢复了它就被正常回收，仍然卡住就再隔离一轮。
+//! 隔离不触发重试，所以"再试一次"是下一次日志清理（默认一天之后）。
 
+use moka::ops::compute::{CompResult, Op};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,6 +64,19 @@ const DIR_RECLAIM_BUDGET: Duration = Duration::from_secs(2);
 /// 的批次，数量另设上限，余下的留到下一轮。
 const DIR_RECLAIM_BATCH: usize = 64;
 
+/// 复查开始时剩余时间不少于这个值，超时才算这个候选自己慢。剩余时间更少时的超时只是
+/// 预算快用完、没轮到它，记在它头上会冤枉排在后面的目录
+const FAIR_RECHECK_WINDOW: Duration = Duration::from_millis(500);
+
+/// 连续这么多轮复查都慢的候选被隔离
+const RECHECK_TIMEOUT_QUARANTINE_SWEEPS: u32 = 3;
+
+/// 一条超时记录从最后一次更新起保留这么久。两轮重试之间隔得比它久，计数从头开始
+const RECHECK_TIMEOUT_MEMORY: Duration = Duration::from_secs(60 * 60);
+
+/// 最多记住多少个目录的超时记录，防止异常情况下无限增长
+const RECHECK_TIMEOUT_MAX_ENTRIES: u64 = 10_000;
+
 /// 日志清理器
 pub struct LogCleaner {
     /// 日志目录路径
@@ -63,11 +89,16 @@ pub struct LogCleaner {
     reclaim_budget: Duration,
     /// 一轮里最多发起的目录删除次数，见 [`DIR_RECLAIM_BATCH`]
     reclaim_batch: usize,
+    /// 复查开始时至少要有多少剩余时间，超时才记在候选头上，见 [`FAIR_RECHECK_WINDOW`]
+    fair_recheck_window: Duration,
+    /// 每个候选连续复查超时的轮数，带过期时间。见模块说明"卡住的候选"
+    recheck_timeouts: moka::sync::Cache<PathBuf, u32>,
     /// 让每一次目录删除都失败而不真的删除。测试用：验证失败的删除同样占用每轮的名额
     #[cfg(test)]
     fail_deletions: bool,
+    /// 复查之前先等这么久（毫秒）。测试用：模拟卡住的文件系统，中途可以改
     #[cfg(test)]
-    recheck_delay: Duration,
+    recheck_delay_ms: std::sync::atomic::AtomicU64,
 }
 
 impl LogCleaner {
@@ -88,11 +119,20 @@ impl LogCleaner {
             mounted_paths,
             reclaim_budget: DIR_RECLAIM_BUDGET,
             reclaim_batch: DIR_RECLAIM_BATCH,
+            fair_recheck_window: FAIR_RECHECK_WINDOW,
+            recheck_timeouts: Self::recheck_timeouts(RECHECK_TIMEOUT_MEMORY),
             #[cfg(test)]
             fail_deletions: false,
             #[cfg(test)]
-            recheck_delay: Duration::ZERO,
+            recheck_delay_ms: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    fn recheck_timeouts(memory: Duration) -> moka::sync::Cache<PathBuf, u32> {
+        moka::sync::Cache::builder()
+            .time_to_live(memory)
+            .max_capacity(RECHECK_TIMEOUT_MAX_ENTRIES)
+            .build()
     }
 
     /// 把一轮的删除时间预算改成 `budget`。测试用：零预算可以确定性地验证"到期即顺延"
@@ -103,8 +143,31 @@ impl LogCleaner {
     }
 
     #[cfg(test)]
-    pub(super) fn with_recheck_delay(mut self, delay: Duration) -> Self {
-        self.recheck_delay = delay;
+    pub(super) fn with_recheck_delay(self, delay: Duration) -> Self {
+        self.set_recheck_delay(delay);
+        self
+    }
+
+    /// 测试用：中途改变复查前的等待，模拟文件系统卡住之后恢复
+    #[cfg(test)]
+    pub(super) fn set_recheck_delay(&self, delay: Duration) {
+        self.recheck_delay_ms.store(
+            delay.as_millis() as u64,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// 把"算这个候选自己慢"的剩余时间门槛改成 `window`。测试用：缩短用例耗时
+    #[cfg(test)]
+    pub(super) fn with_fair_recheck_window(mut self, window: Duration) -> Self {
+        self.fair_recheck_window = window;
+        self
+    }
+
+    /// 把超时记录的保留时长改成 `memory`。测试用：验证记录过期后目录会被重新尝试
+    #[cfg(test)]
+    pub(super) fn with_recheck_timeout_memory(mut self, memory: Duration) -> Self {
+        self.recheck_timeouts = Self::recheck_timeouts(memory);
         self
     }
 
@@ -252,10 +315,16 @@ impl LogCleaner {
         if candidates.is_empty() {
             return;
         }
+        // 已隔离的候选不占预算、不取锁：保留目录、计数、告警，其余目录照常回收
+        let candidates = self.without_quarantined(candidates, stats);
+        if candidates.is_empty() {
+            return;
+        }
         // 取清单到删除的这一段与挂载准备、builder 恢复互斥。对方正在进行属于正常现象：
         // 本轮顺延，单独计数，不告警。
         let Some(_guard) = docker_manager::try_begin_log_mount_cleanup() else {
             stats.dirs_deferred_while_mounting += candidates.len() as u64;
+            stats.note_deferred(candidates.first().map(PathBuf::as_path));
             return;
         };
         // 截止时间从这一刻开始计：取清单、逐个判定、逐个删除共用它。判定到期还没回来就保留
@@ -308,12 +377,19 @@ impl LogCleaner {
             // 这一批的名额或时间预算已用完：余下的不再做任何 I/O，留到下一轮
             if attempts >= self.reclaim_batch || tokio::time::Instant::now() >= deadline {
                 stats.dirs_deferred_by_budget += 1;
+                stats.note_deferred(Some(&path));
                 continue;
             }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let metadata = match tokio::time::timeout_at(deadline, async {
                 #[cfg(test)]
-                if !self.recheck_delay.is_zero() {
-                    tokio::time::sleep(self.recheck_delay).await;
+                {
+                    let delay_ms = self
+                        .recheck_delay_ms
+                        .load(std::sync::atomic::Ordering::SeqCst);
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
                 }
                 fs::symlink_metadata(&path).await
             })
@@ -322,9 +398,22 @@ impl LogCleaner {
                 Ok(metadata) => metadata,
                 Err(_) => {
                     stats.dirs_deferred_by_budget += 1;
+                    stats.note_deferred(Some(&path));
+                    // 给足了时间还没回来才记在它头上；预算本来就快用完只是没轮到它
+                    if remaining >= self.fair_recheck_window
+                        && let Some(sweeps) = self.note_recheck_timeout(&path)
+                    {
+                        warn!(
+                            path = %path.display(),
+                            sweeps,
+                            "[log_cleaner] Re-check of an expired directory timed out on {} consecutive sweeps; keeping it and quarantining it until its timeout record expires",
+                            sweeps
+                        );
+                    }
                     continue;
                 }
             };
+            self.clear_recheck_timeout(&path);
             let still_expired = match metadata {
                 Ok(metadata) => metadata.is_dir() && is_older_than(&metadata, cutoff),
                 // 列目录之后目录已经消失：没有东西可删，也不是故障
@@ -350,6 +439,7 @@ impl LogCleaner {
             // 复查也可能很慢：真正发起删除之前再确认一次截止时间
             if tokio::time::Instant::now() >= deadline {
                 stats.dirs_deferred_by_budget += 1;
+                stats.note_deferred(Some(&path));
                 continue;
             }
             #[cfg(test)]
@@ -375,6 +465,68 @@ impl LogCleaner {
         }
     }
 
+    /// 去掉已隔离的候选，把它们计入本轮的隔离数。返回的顺序不变
+    fn without_quarantined(
+        &self,
+        candidates: Vec<PathBuf>,
+        stats: &mut LogCleanupStats,
+    ) -> Vec<PathBuf> {
+        if self.recheck_timeouts.iter().next().is_none() {
+            return candidates;
+        }
+        let mut quarantined = Vec::new();
+        let remaining = candidates
+            .into_iter()
+            .filter(|path| {
+                // 读不会延长记录的寿命：隔离中的目录到了时间一定会被重新尝试
+                let quarantined_already = self
+                    .recheck_timeouts
+                    .get(path)
+                    .is_some_and(|sweeps| sweeps >= RECHECK_TIMEOUT_QUARANTINE_SWEEPS);
+                if quarantined_already {
+                    quarantined.push(path.clone());
+                }
+                !quarantined_already
+            })
+            .collect();
+        if !quarantined.is_empty() {
+            stats.dirs_quarantined = quarantined.len() as u64;
+            warn!(
+                count = quarantined.len(),
+                paths = %summarize_paths(&quarantined),
+                "[log_cleaner] Keeping expired directories whose re-check kept timing out; they stay quarantined until their timeout records expire",
+            );
+        }
+        remaining
+    }
+
+    /// 记一次复查超时，记录的保留时间从此刻重新起算。刚达到隔离轮数时返回轮数，
+    /// 调用方据此告警
+    fn note_recheck_timeout(&self, path: &Path) -> Option<u32> {
+        let result = self
+            .recheck_timeouts
+            .entry(path.to_path_buf())
+            .and_compute_with(|entry| {
+                Op::Put(
+                    entry
+                        .map_or(0, |entry| entry.into_value())
+                        .saturating_add(1),
+                )
+            });
+        match result {
+            CompResult::Inserted(entry) | CompResult::ReplacedWith(entry) => {
+                let sweeps = entry.into_value();
+                (sweeps == RECHECK_TIMEOUT_QUARANTINE_SWEEPS).then_some(sweeps)
+            }
+            // 本次调用只会 Put：走到这里说明这条记录被别的调用方动了
+            _ => None,
+        }
+    }
+
+    fn clear_recheck_timeout(&self, path: &Path) {
+        self.recheck_timeouts.invalidate(path);
+    }
+
     /// 获取日志目录路径
     pub fn log_dir(&self) -> &str {
         &self.log_dir
@@ -383,6 +535,21 @@ impl LogCleaner {
     /// 获取保留时长（秒）
     pub fn retention_duration(&self) -> Duration {
         self.retention_duration
+    }
+}
+
+/// 告警里的路径清单：最多列前 5 个
+fn summarize_paths(paths: &[PathBuf]) -> String {
+    const SHOWN: usize = 5;
+    let shown: Vec<String> = paths
+        .iter()
+        .take(SHOWN)
+        .map(|path| path.display().to_string())
+        .collect();
+    if paths.len() > SHOWN {
+        format!("{} … (+{})", shown.join(", "), paths.len() - SHOWN)
+    } else {
+        shown.join(", ")
     }
 }
 
@@ -427,6 +594,10 @@ pub struct LogCleanupStats {
     pub recheck_errors: u64,
     /// 初次扫描时无法读取条目或修改时间的数量
     pub entry_inspection_errors: u64,
+    /// 连续复查超时而被隔离、本轮不再处理的目录数量（需要关注）
+    pub dirs_quarantined: u64,
+    /// 本轮第一个被顺延的目录（争锁、预算用完或复查超时），告警时用来定位
+    pub first_deferred: Option<PathBuf>,
 }
 
 impl LogCleanupStats {
@@ -434,6 +605,16 @@ impl LogCleanupStats {
         self.dirs_skipped_unconfirmed > 0
             || self.failed_deletions > 0
             || self.entry_inspection_errors > 0
+            || self.dirs_quarantined > 0
+    }
+
+    /// 记下本轮第一个被顺延的目录
+    fn note_deferred(&mut self, path: Option<&Path>) {
+        if self.first_deferred.is_none()
+            && let Some(path) = path
+        {
+            self.first_deferred = Some(path.to_path_buf());
+        }
     }
 
     /// 这一轮有没有"本该做完却没做完"、值得下一轮清扫接着做的事：清单拿不到、复查出错、
@@ -500,6 +681,12 @@ impl LogCleanupStats {
                     self.entry_inspection_errors
                 ));
             }
+            if self.dirs_quarantined > 0 {
+                parts.push(format!(
+                    "quarantined: {} dirs (re-check timed out {} sweeps in a row)",
+                    self.dirs_quarantined, RECHECK_TIMEOUT_QUARANTINE_SWEEPS
+                ));
+            }
             parts.join(", ")
         }
     }
@@ -509,6 +696,7 @@ impl LogCleanupStats {
         self.files_deleted == 0
             && self.dirs_deleted == 0
             && self.dirs_skipped_in_use == 0
+            && self.dirs_quarantined == 0
             && !self.needs_retry()
     }
 }
