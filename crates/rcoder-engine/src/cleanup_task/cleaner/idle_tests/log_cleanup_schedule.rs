@@ -66,3 +66,55 @@ async fn a_log_path_that_is_not_a_directory_advances_the_schedule() {
 
     fixture.close().await;
 }
+
+#[tokio::test]
+async fn log_cleanup_retries_on_the_next_sweep_after_mount_gate_contention() {
+    let mut fixture = Fixture::new(0).await;
+    let log_dir = std::path::PathBuf::from(&fixture.cleaner.config.log_dir);
+    let expired = aged_log_dir(&log_dir, "runner-expired");
+    let guard = docker_manager::try_begin_log_mount_cleanup().unwrap();
+
+    fixture.cleaner.cleanup_once().await.unwrap();
+    assert!(expired.exists());
+    drop(guard);
+
+    fixture.cleaner.cleanup_once().await.unwrap();
+    assert!(!expired.exists());
+    assert!(!fixture.cleaner.log_cleanup_due());
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn log_cleanup_continues_an_incomplete_batch_on_the_next_sweep() {
+    let mut fixture = Fixture::new(0).await;
+    let log_dir = std::path::PathBuf::from(&fixture.cleaner.config.log_dir);
+    for index in 0..65 {
+        aged_log_dir(&log_dir, &format!("runner-expired-{index}"));
+    }
+
+    fixture.cleaner.cleanup_once().await.unwrap();
+    assert_eq!(std::fs::read_dir(&log_dir).unwrap().count(), 1);
+
+    fixture.cleaner.cleanup_once().await.unwrap();
+    assert_eq!(std::fs::read_dir(&log_dir).unwrap().count(), 0);
+    assert!(!fixture.cleaner.log_cleanup_due());
+    fixture.close().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn log_directory_lookup_errors_retry_after_the_path_is_repaired() {
+    let mut fixture = Fixture::new(0).await;
+    let log_dir = std::path::PathBuf::from(&fixture.cleaner.config.log_dir);
+    std::os::unix::fs::symlink(&log_dir, &log_dir).unwrap();
+
+    fixture.cleaner.cleanup_once().await.unwrap();
+    assert!(fixture.cleaner.log_cleanup_due());
+
+    std::fs::remove_file(&log_dir).unwrap();
+    let expired = aged_log_dir(&log_dir, "runner-expired");
+    fixture.cleaner.cleanup_once().await.unwrap();
+    assert!(!expired.exists());
+    assert!(!fixture.cleaner.log_cleanup_due());
+    fixture.close().await;
+}

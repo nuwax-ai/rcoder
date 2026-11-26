@@ -129,29 +129,20 @@ impl LogCleaner {
     pub async fn cleanup_once(&self) -> Result<LogCleanupStats, std::io::Error> {
         let log_path = Path::new(&self.log_dir);
 
-        // 检查目录是否存在
-        // 两处判断刻意不合并成单次 metadata：两个分支的日志级别与文案不同（不存在走
-        // debug、存在但非目录走 warn），而旧 exists() 对权限错误等也返回 false 从而走
-        // debug 分支，合并后无法复刻。多一次 syscall 在周期清理任务里可忽略。
-        if !fs::try_exists(log_path).await.unwrap_or(false) {
-            debug!(
-                "[log_cleaner] Log directory does not exist, skipping cleanup: {}",
-                self.log_dir
-            );
-            return Ok(LogCleanupStats::default());
-        }
-
-        // 检查是否是目录
-        if !fs::metadata(log_path)
-            .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false)
-        {
-            warn!(
-                "[log_cleaner] Path is not a directory, skip cleanup: {}",
-                self.log_dir
-            );
-            return Ok(LogCleanupStats::default());
+        match fs::metadata(log_path).await {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                warn!(
+                    ?log_path,
+                    "[log_cleaner] Path is not a directory, skip cleanup"
+                );
+                return Ok(LogCleanupStats::default());
+            }
+            Err(error) if log_directory_absent(&error) => {
+                debug!(?log_path, %error, "[log_cleaner] Log directory does not exist, skipping cleanup");
+                return Ok(LogCleanupStats::default());
+            }
+            Err(error) => return Err(error),
         }
 
         info!(
@@ -161,22 +152,17 @@ impl LogCleaner {
         );
 
         let mut stats = LogCleanupStats::default();
-        let cutoff_time = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            Ok(duration) => duration.as_secs(),
-            Err(e) => {
-                warn!("[log_cleaner] Invalid timestamp, skip cleanup: {}", e);
-                return Ok(LogCleanupStats::default());
-            }
-        };
+        let cutoff_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_secs();
         let cutoff_time = cutoff_time.saturating_sub(self.retention_duration.as_secs());
 
         // 读取目录内容
         let mut entries = match fs::read_dir(log_path).await {
             Ok(entries) => entries,
-            Err(e) => {
-                warn!("[log_cleaner] Failed to read directory: {}", e);
-                return Ok(LogCleanupStats::default());
-            }
+            Err(error) if log_directory_absent(&error) => return Ok(stats),
+            Err(error) => return Err(error),
         };
 
         let mut expired_dirs = Vec::new();
@@ -186,7 +172,9 @@ impl LogCleaner {
             let path = entry.path();
             let metadata = match entry.metadata().await {
                 Ok(m) => m,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
+                    stats.entry_inspection_errors += 1;
                     debug!("[log_cleaner] get file failed: {:?} - {}", path, e);
                     continue;
                 }
@@ -196,6 +184,7 @@ impl LogCleaner {
             let modified = match metadata.modified() {
                 Ok(time) => time,
                 Err(e) => {
+                    stats.entry_inspection_errors += 1;
                     debug!("[log_cleaner] get modified time failed: {:?} - {}", path, e);
                     continue;
                 }
@@ -394,6 +383,13 @@ impl LogCleaner {
     }
 }
 
+fn log_directory_absent(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
 /// 修改时间是否早于 `cutoff`（Unix 秒）；取不到修改时间视为未过期
 fn is_older_than(metadata: &std::fs::Metadata, cutoff: u64) -> bool {
     metadata
@@ -422,9 +418,23 @@ pub struct LogCleanupStats {
     pub bytes_freed: u64,
     /// 删除失败的文件/目录数量
     pub failed_deletions: u64,
+    /// 初次扫描时无法读取条目或修改时间的数量
+    pub entry_inspection_errors: u64,
 }
 
 impl LogCleanupStats {
+    pub(crate) fn has_errors(&self) -> bool {
+        self.dirs_skipped_unconfirmed > 0
+            || self.failed_deletions > 0
+            || self.entry_inspection_errors > 0
+    }
+
+    pub(crate) fn needs_retry(&self) -> bool {
+        self.has_errors()
+            || self.dirs_deferred_while_mounting > 0
+            || self.dirs_deferred_by_budget > 0
+    }
+
     /// 获取格式化的统计摘要
     pub fn summary(&self) -> String {
         if self.is_empty() {
@@ -468,6 +478,12 @@ impl LogCleanupStats {
             if self.failed_deletions > 0 {
                 parts.push(format!("failed: {}", self.failed_deletions));
             }
+            if self.entry_inspection_errors > 0 {
+                parts.push(format!(
+                    "uninspected: {} entries",
+                    self.entry_inspection_errors
+                ));
+            }
             parts.join(", ")
         }
     }
@@ -477,9 +493,6 @@ impl LogCleanupStats {
         self.files_deleted == 0
             && self.dirs_deleted == 0
             && self.dirs_skipped_in_use == 0
-            && self.dirs_skipped_unconfirmed == 0
-            && self.dirs_deferred_while_mounting == 0
-            && self.dirs_deferred_by_budget == 0
-            && self.failed_deletions == 0
+            && !self.needs_retry()
     }
 }
