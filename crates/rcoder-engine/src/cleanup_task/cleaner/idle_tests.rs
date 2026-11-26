@@ -121,6 +121,10 @@ struct Runtime {
     docker: std::sync::Mutex<Option<physical_docker::Target>>,
     /// 被认为"仍被容器挂载"的宿主机路径，供 `mounted_host_paths` 回答；默认为空
     mounted_paths: std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+    /// 判为"无法确认是否仍被挂载"的路径；默认为空
+    unconfirmed_paths: std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+    /// 清单查询直接失败，模拟 Docker 暂时不可用
+    inventory_failing: AtomicBool,
 }
 
 impl Default for Runtime {
@@ -142,6 +146,8 @@ impl Default for Runtime {
             physical: std::sync::Mutex::new("physical-original".into()),
             docker: std::sync::Mutex::new(None),
             mounted_paths: std::sync::Mutex::new(std::collections::HashSet::new()),
+            unconfirmed_paths: std::sync::Mutex::new(std::collections::HashSet::new()),
+            inventory_failing: AtomicBool::new(false),
         }
     }
 }
@@ -311,9 +317,21 @@ impl AgentContainerRuntime for Runtime {
         _candidates: &[std::path::PathBuf],
     ) -> ContainerRuntimeResult<container_runtime_api::LogDirectoryMounts> {
         // 与生产契约一致：直接回答挂载判定，不读任何缓存
+        if self.inventory_failing.load(Ordering::SeqCst) {
+            return Err(ContainerRuntimeError::DockerError(
+                "fixture: mount inventory unavailable".into(),
+            ));
+        }
         Ok(container_runtime_api::LogDirectoryMounts {
             mounted: self.mounted_paths.lock().unwrap().clone(),
-            unconfirmed: Default::default(),
+            unconfirmed: self
+                .unconfirmed_paths
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .map(|path| (path, "fixture: cannot confirm this source".to_owned()))
+                .collect(),
         })
     }
     async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {

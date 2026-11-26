@@ -549,6 +549,49 @@ async fn missing_inventory_keeps_every_directory_and_probes_once() {
     assert_eq!(inventory.calls(), 1);
 }
 
+/// 挂载源无法确认指向哪里是持续状态：只计数、保留目录，但不请求"下一轮重试"——重试不会
+/// 让它变得可确认，周期照常推进。
+#[tokio::test]
+async fn a_standing_unconfirmed_candidate_does_not_request_a_retry() {
+    let temp_dir = TempDir::new().unwrap();
+    let opaque = aged_dir(temp_dir.path(), "runner-opaque-20261029035324", 15);
+    let inventory = FakeInventory::new(&[]);
+    inventory.set_unconfirmed(&opaque);
+
+    let stats = cleaner(temp_dir.path(), inventory)
+        .cleanup_once()
+        .await
+        .unwrap();
+
+    assert!(opaque.exists());
+    assert_eq!(stats.dirs_skipped_unconfirmed, 1);
+    assert_eq!(stats.inventory_unavailable, 0);
+    assert!(stats.has_errors(), "it is still worth a warning");
+    assert!(
+        !stats.needs_retry(),
+        "a standing unconfirmable source must not reset the schedule"
+    );
+}
+
+/// 清单拿不到是短暂失败：保留全部候选，并请求下一轮重试。
+#[tokio::test]
+async fn an_unavailable_inventory_requests_a_retry() {
+    let temp_dir = TempDir::new().unwrap();
+    aged_dir(temp_dir.path(), "runner-a-20261029035324", 15);
+    aged_dir(temp_dir.path(), "runner-b-20261029035324", 15);
+    let inventory = FakeInventory::new(&[]);
+    inventory.set_failing(true);
+
+    let stats = cleaner(temp_dir.path(), inventory)
+        .cleanup_once()
+        .await
+        .unwrap();
+
+    assert_eq!(stats.dirs_skipped_unconfirmed, 2);
+    assert_eq!(stats.inventory_unavailable, 2);
+    assert!(stats.needs_retry());
+}
+
 /// 每轮最多向运行要一次清单，无论有多少个过期目录。
 #[tokio::test]
 async fn one_inventory_request_per_cycle() {

@@ -131,3 +131,54 @@ async fn log_cleanup_interval_comparison_handles_the_full_config_range() {
     assert!(fixture.cleaner.log_cleanup_due());
     fixture.close().await;
 }
+
+/// 挂载源持续"无法确认"：目录保留、周期不被重置，下一次扫描按日推进。
+#[tokio::test]
+async fn a_standing_unconfirmed_mount_does_not_reset_the_schedule() {
+    let mut fixture = Fixture::new(0).await;
+    let log_dir = std::path::PathBuf::from(&fixture.cleaner.config.log_dir);
+    let kept = aged_log_dir(&log_dir, "runner-unconfirmed");
+    fixture
+        .runtime
+        .unconfirmed_paths
+        .lock()
+        .unwrap()
+        .insert(kept.clone());
+
+    fixture.cleaner.cleanup_once().await.unwrap();
+
+    assert!(kept.exists(), "an unconfirmable candidate must be kept");
+    assert!(
+        !fixture.cleaner.log_cleanup_due(),
+        "a standing unconfirmable mount must not reset the schedule"
+    );
+    fixture.close().await;
+}
+
+/// 清单暂时拿不到：下一轮清扫接着做，周期不推进；恢复后这一轮就完成。
+#[tokio::test]
+async fn an_unavailable_inventory_retries_on_the_next_sweep() {
+    let mut fixture = Fixture::new(0).await;
+    let log_dir = std::path::PathBuf::from(&fixture.cleaner.config.log_dir);
+    let expired = aged_log_dir(&log_dir, "runner-expired");
+    fixture
+        .runtime
+        .inventory_failing
+        .store(true, Ordering::SeqCst);
+
+    fixture.cleaner.cleanup_once().await.unwrap();
+    assert!(expired.exists());
+    assert!(
+        fixture.cleaner.log_cleanup_due(),
+        "an unavailable inventory must retry on the next sweep"
+    );
+
+    fixture
+        .runtime
+        .inventory_failing
+        .store(false, Ordering::SeqCst);
+    fixture.cleaner.cleanup_once().await.unwrap();
+    assert!(!expired.exists());
+    assert!(!fixture.cleaner.log_cleanup_due());
+    fixture.close().await;
+}

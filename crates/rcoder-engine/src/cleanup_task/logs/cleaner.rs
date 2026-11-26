@@ -271,6 +271,7 @@ impl LogCleaner {
             Ok(Ok(mounts)) => mounts,
             Ok(Err(error)) => {
                 stats.dirs_skipped_unconfirmed += candidates.len() as u64;
+                stats.inventory_unavailable += candidates.len() as u64;
                 warn!(
                     %error,
                     "[log_cleaner] Cannot confirm log directory mounts, keeping every expired directory this cycle"
@@ -279,6 +280,7 @@ impl LogCleaner {
             }
             Err(_elapsed) => {
                 stats.dirs_skipped_unconfirmed += candidates.len() as u64;
+                stats.inventory_unavailable += candidates.len() as u64;
                 warn!(
                     candidates = candidates.len(),
                     budget_ms = self.reclaim_budget.as_millis() as u64,
@@ -332,6 +334,7 @@ impl LogCleaner {
                 }
                 Err(error) => {
                     stats.dirs_skipped_unconfirmed += 1;
+                    stats.recheck_errors += 1;
                     warn!(?path, %error, "[log_cleaner] Cannot re-check an expired directory, keeping it");
                     continue;
                 }
@@ -418,6 +421,10 @@ pub struct LogCleanupStats {
     pub bytes_freed: u64,
     /// 删除失败的文件/目录数量
     pub failed_deletions: u64,
+    /// 挂载清单拿不到（查询失败或超时）而保留的候选数量。短暂失败，下一轮重试
+    pub inventory_unavailable: u64,
+    /// 复查候选时出错的次数。短暂失败，下一轮重试
+    pub recheck_errors: u64,
     /// 初次扫描时无法读取条目或修改时间的数量
     pub entry_inspection_errors: u64,
 }
@@ -429,8 +436,17 @@ impl LogCleanupStats {
             || self.entry_inspection_errors > 0
     }
 
+    /// 这一轮有没有"本该做完却没做完"、值得下一轮清扫接着做的事：清单拿不到、复查出错、
+    /// 删除失败、条目读取失败、争锁顺延、批次或时间预算顺延。
+    ///
+    /// 不含"挂载源无法确认指向哪里"和"目录在扫描后变了"：前者是持续状态（只要那个容器还在，
+    /// 每轮都会得到同样的结论，重试不会变得可确认），后者是正常竞态。它们只计数、照常保留，
+    /// 不重置日志清理的周期。
     pub(crate) fn needs_retry(&self) -> bool {
-        self.has_errors()
+        self.inventory_unavailable > 0
+            || self.recheck_errors > 0
+            || self.failed_deletions > 0
+            || self.entry_inspection_errors > 0
             || self.dirs_deferred_while_mounting > 0
             || self.dirs_deferred_by_budget > 0
     }
