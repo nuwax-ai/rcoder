@@ -777,3 +777,126 @@ async fn retained_storage_identity_preserves_lifecycle_and_rejects_foreign_or_de
     assert!(store.restore_storage_identity(&storage).await.is_err());
     store.shutdown().await.unwrap();
 }
+
+/// 复现：围栏（RecoveryRequired）记录没有执行者声明。
+///
+/// 当前 API 产生不了这种记录（admit 后必须先拿到执行者才会流转），来源只
+/// 可能是历史版本数据或人工 SQL（app-154 运维先例）。现行为：
+/// `settle_fenced_operation` 直接 `VersionConflict`，引擎扫描器对这类记录
+/// 永远跳过——没有任何执行器能认领 `RecoveryRequired`，该 app 的受理槽被
+/// 永久占用，重启 rcoder 也不会解除。
+///
+/// 期望（修复后）：超龄的无执行者围栏可被收束为 Failed（收束者只记录终态，
+/// 不授权任何运行时工作），受理槽随之释放。
+#[tokio::test]
+async fn unclaimed_fenced_record_settles_and_frees_admission_slot() {
+    use shared_types::{
+        UserAppAdmission, UserAppAdmissionOutcome, UserAppOperationKind,
+        UserAppOperationProgress, UserAppOperationState,
+    };
+
+    let dir = tempfile::tempdir().expect("dir");
+    let path = std::path::absolute(dir.path().join("unclaimed-fence.turso.db")).expect("abs");
+    let store = TursoUserAppStore::open_exclusive(&path)
+        .await
+        .expect("open");
+    store.ensure_identity("unclaimed").await.expect("identity");
+
+    let request = UserAppAdmission {
+        runtime_policy_on_success: None,
+        command: None,
+        metadata: None,
+        app_id: "unclaimed".into(),
+        lifecycle_id: None,
+        operation_id: "op-unclaimed".into(),
+        request_id: Some("req-op-unclaimed".into()),
+        request_fingerprint: "b".repeat(64),
+        kind: UserAppOperationKind::EnsureBuilder,
+    };
+    let admitted = match store.admit(&request).await.expect("admit") {
+        UserAppAdmissionOutcome::Accepted(op) => op,
+        other => panic!("unexpected admission: {other:?}"),
+    };
+    let progress = |op: &UserAppOperationRecord,
+                    state: UserAppOperationState,
+                    step: &str| UserAppOperationProgress {
+        app_id: op.app_id.clone(),
+        operation_id: op.operation_id.clone(),
+        lifecycle_id: op.lifecycle_id.clone(),
+        expected_revision: op.revision,
+        executor_id: "worker-legacy".into(),
+        state,
+        step: step.into(),
+        checkpoint: serde_json::Value::Null,
+        error_code: None,
+        error_message: None,
+    };
+    let running = store
+        .advance(&progress(
+            &admitted,
+            UserAppOperationState::Running,
+            "claimed",
+        ))
+        .await
+        .expect("claim");
+    store
+        .advance(&progress(
+            &running,
+            UserAppOperationState::RecoveryRequired,
+            "runtime_updated",
+        ))
+        .await
+        .expect("fence");
+    // 人工 SQL / 历史版本数据形态：围栏记录没有执行者声明。
+    store
+        .owner
+        .execute(|mut db| async move {
+            toasty::sql::statement(
+                "UPDATE userapp_operations SET executor_id=NULL \
+                 WHERE app_id='unclaimed' AND operation_id='op-unclaimed'",
+            )
+            .exec(&mut db)
+            .await?;
+            Ok(())
+        })
+        .await
+        .expect("clear executor");
+
+    let unclaimed = store
+        .get_operation("unclaimed", "op-unclaimed")
+        .await
+        .expect("read")
+        .expect("record");
+    assert_eq!(unclaimed.state, UserAppOperationState::RecoveryRequired);
+    assert!(unclaimed.executor_id.is_none(), "fixture: 无执行者声明");
+
+    let settled = store
+        .settle_fenced_operation(
+            &unclaimed,
+            &serde_json::json!({"kind": "unclaimed"}),
+            "unclaimed beyond settle grace; outcome unverifiable; retry the operation",
+        )
+        .await
+        .expect("unclaimed fence must settle");
+    assert_eq!(settled.state, UserAppOperationState::Failed);
+    assert!(
+        settled
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("unclaimed beyond settle grace")),
+        "{:?}",
+        settled.error_message
+    );
+
+    // 端到端：收束后同 app 同 scope 新受理必须 Accepted。
+    let retry = UserAppAdmission {
+        operation_id: "op-unclaimed-retry".into(),
+        request_id: Some("req-op-unclaimed-retry".into()),
+        ..request
+    };
+    match store.admit(&retry).await.expect("admit after settle") {
+        UserAppAdmissionOutcome::Accepted(_) => {}
+        other => panic!("收束后同 scope 必须可受理: {other:?}"),
+    }
+    store.shutdown().await.expect("shutdown");
+}

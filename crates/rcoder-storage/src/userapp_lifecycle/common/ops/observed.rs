@@ -1,5 +1,9 @@
 use super::*;
 
+/// 收束"无执行者声明"围栏时使用的记账执行者身份。只用于终态转移的
+/// AcquireExecutor 语义，不关联任何运行时进程，也不授权任何运行时工作。
+const UNCLAIMED_SETTLE_EXECUTOR: &str = "rcoder-recovery-settle";
+
 pub(crate) async fn finalize_observed_wake(
     tx: &mut dyn Executor,
     backend: Backend,
@@ -78,6 +82,11 @@ pub(crate) async fn finalize_observed_wake(
 /// Failed with the original error preserved plus the observation evidence.
 /// Callers must have validated the evidence predicate for the kind; this
 /// method validates identity, revision and state only.
+///
+/// A fence without an executor claim (legacy rows or manual SQL — the current
+/// API cannot produce one) has no executor that could ever resume it; it is
+/// settled the same way, with the settling scanner recorded as the executor of
+/// the terminal transition only.
 pub(crate) async fn settle_fenced_operation(
     tx: &mut dyn Executor,
     backend: Backend,
@@ -93,13 +102,22 @@ pub(crate) async fn settle_fenced_operation(
         &snapshot.lifecycle_id,
     )
     .await?;
-    if op != *snapshot
-        || op.state != UserAppOperationState::RecoveryRequired
-        || op.executor_id.is_none()
-    {
+    if op != *snapshot || op.state != UserAppOperationState::RecoveryRequired {
         return Err(Error::VersionConflict);
     }
     let before_app = app.clone();
+    // 无执行者声明的围栏（历史版本数据或人工 SQL；admit 之后必须先取得执行
+    // 者才会流转，当前 API 产生不了这种记录）没有任何执行器可以续做——把
+    // 它留着只会永久占用受理槽。收束者为这次终态转移认领记录
+    // （AcquireExecutor 语义），只落 Failed 记账，绝不授权运行时工作。
+    let settling_executor = match op.executor_id.clone() {
+        Some(executor) => executor,
+        None => {
+            let executor = UNCLAIMED_SETTLE_EXECUTOR.to_owned();
+            op.executor_id = Some(executor.clone());
+            executor
+        }
+    };
     let mut checkpoint = op.checkpoint.clone();
     checkpoint["fence_released_evidence"] = evidence.clone();
     // Internal transition only, under this transaction.
@@ -109,7 +127,7 @@ pub(crate) async fn settle_fenced_operation(
         lifecycle_id: op.lifecycle_id.clone(),
         operation_id: op.operation_id.clone(),
         expected_revision: op.revision,
-        executor_id: op.executor_id.clone().ok_or(Error::VersionConflict)?,
+        executor_id: settling_executor,
         state: UserAppOperationState::Failed,
         step: op.step.clone(),
         checkpoint,

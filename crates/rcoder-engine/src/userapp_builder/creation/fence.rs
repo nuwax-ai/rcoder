@@ -274,10 +274,24 @@ pub(crate) async fn observe_fence_evidence(
 /// holder 死亡兜底的收束留痕说明。
 const HOLDER_EXPIRED_RELEASE_NOTE: &str =
     "holder expired, outcome unverifiable; retry the operation";
+/// 无执行者声明的围栏收束留痕说明。
+const UNCLAIMED_RELEASE_NOTE: &str =
+    "unclaimed beyond settle grace, outcome unverifiable; retry the operation";
 /// 物理状态确定性观察收束的留痕说明。
 const DEFINITE_RELEASE_NOTE: &str = "physical state verified definite by recovery scanner";
 /// 围栏 holder 死亡兜底的默认超龄门槛（秒）：≫ 操作 deadline + 租约 TTL 60s。
 const DEFAULT_FENCE_SETTLE_GRACE_SECS: u64 = 900;
+
+/// 围栏是否已超过收束留出的宽限期（自 created_at 计龄，保守取更长的等待）。
+fn fence_exceeds_settle_grace(
+    grace_setting: Option<u64>,
+    record: &UserAppOperationRecord,
+) -> bool {
+    let grace_secs = grace_setting.unwrap_or(DEFAULT_FENCE_SETTLE_GRACE_SECS);
+    let grace_us = i64::try_from(grace_secs.saturating_mul(1_000_000)).unwrap_or(i64::MAX);
+    let now_us = chrono::Utc::now().timestamp_micros();
+    now_us.saturating_sub(record.created_at.timestamp_micros()) >= grace_us
+}
 
 /// holder 死亡兜底判定（围栏有界保证）：**围栏超龄 ∧ 持有者已死**。
 ///
@@ -299,15 +313,9 @@ pub(crate) async fn holder_expired(state: &AppState, record: &UserAppOperationRe
         // Losing lease authority does not retract an already-issued DELETE.
         return false;
     }
-    let grace_secs = state
-        .config
-        .fence_settle_grace_secs
-        .unwrap_or(DEFAULT_FENCE_SETTLE_GRACE_SECS);
-    let grace_us = i64::try_from(grace_secs.saturating_mul(1_000_000)).unwrap_or(i64::MAX);
-    let now_us = chrono::Utc::now().timestamp_micros();
     // 计龄从 created_at 起算（记录仅暴露 created_at；created ≤ updated，
     // 保守取更长的等待）。
-    if now_us.saturating_sub(record.created_at.timestamp_micros()) < grace_us {
+    if !fence_exceeds_settle_grace(state.config.fence_settle_grace_secs, record) {
         return false;
     }
     match state
@@ -399,12 +407,33 @@ pub(crate) async fn reconcile_fenced_ensure(
         );
         return Ok(());
     };
-    // 无执行者声明的记录不可被扫描器收束（store 侧同样拒绝）。
+    // 无执行者声明的围栏（历史版本数据或人工 SQL；admit 之后必须先取得执行
+    // 者才会流转，当前 API 产生不了这种记录）没有任何执行器可以续做——
+    // RecoveryRequired 只允许持有者推进，而这里根本没有持有者。留着只会
+    // 永久占用受理槽：超龄后按"无人认领"收束为 Failed（只记账，不授权
+    // 任何运行时工作），宽限期内保守等待。
     if record.executor_id.is_none() {
+        if !fence_exceeds_settle_grace(state.config.fence_settle_grace_secs, &record) {
+            tracing::warn!(
+                operation_id = %record.operation_id,
+                app_id = %record.app_id,
+                "Fence kept: unclaimed record within settle grace"
+            );
+            return Ok(());
+        }
+        let evidence = serde_json::json!({
+            "kind": "unclaimed",
+            "checked_at_us": chrono::Utc::now().timestamp_micros(),
+        });
+        state
+            .userapp_store
+            .settle_fenced_operation(&record, &evidence, UNCLAIMED_RELEASE_NOTE)
+            .await?;
         tracing::warn!(
             operation_id = %record.operation_id,
             app_id = %record.app_id,
-            "Fence kept: record has no executor claim"
+            kind = ?record.kind,
+            "Fenced operation settled as Failed: unclaimed beyond settle grace"
         );
         return Ok(());
     }
@@ -492,4 +521,47 @@ pub(crate) async fn reconcile_default_recovery_before_ensure(
         reconcile_fenced_ensure(state, &operation).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod settle_grace_tests {
+    use super::*;
+    use shared_types::{
+        UserAppOperationKind, UserAppOperationRecord, UserAppOperationScope,
+        UserAppOperationState,
+    };
+
+    fn record_aged_secs(age_secs: i64) -> UserAppOperationRecord {
+        UserAppOperationRecord {
+            runtime_policy_on_success: None,
+            command: None,
+            admitted_metadata: None,
+            operation_id: "op-grace".into(),
+            app_id: "app-grace".into(),
+            lifecycle_id: "life".into(),
+            request_id: None,
+            request_fingerprint: "a".repeat(64),
+            kind: UserAppOperationKind::EnsureBuilder,
+            scope: UserAppOperationScope::Dev,
+            state: UserAppOperationState::RecoveryRequired,
+            revision: 3,
+            executor_id: None,
+            step: "runtime_updated".into(),
+            checkpoint: serde_json::Value::Null,
+            error_code: None,
+            error_message: None,
+            created_at: chrono::Utc::now() - chrono::Duration::seconds(age_secs),
+        }
+    }
+
+    #[test]
+    fn default_grace_requires_age_beyond_900s() {
+        assert!(!fence_exceeds_settle_grace(None, &record_aged_secs(899)));
+        assert!(fence_exceeds_settle_grace(None, &record_aged_secs(901)));
+    }
+
+    #[test]
+    fn zero_grace_settles_any_aged_record() {
+        assert!(fence_exceeds_settle_grace(Some(0), &record_aged_secs(1)));
+    }
 }
