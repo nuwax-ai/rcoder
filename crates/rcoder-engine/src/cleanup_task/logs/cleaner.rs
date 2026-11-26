@@ -36,15 +36,16 @@ use super::owner::MountedPathsProbe;
 /// 一天的秒数：保留天数换算秒数的乘数
 const SECS_PER_DAY: u64 = 24 * 60 * 60;
 
-/// 一轮里删除目录的时间预算：从开始判定起计，到期后不再发起删除，余下的留到下一轮。
+/// 一轮里删除目录的时间预算：从开始判定起计，到期后不再做任何 I/O——既不发起删除，也
+/// 不再复查余下的候选；余下的留到下一轮。
 ///
 /// 删除期间一直占着挂载围栏的写锁，agent 容器创建和 builder 恢复都在锁外等。没有预算
-/// 的话，积压的过期目录越多，锁被占得越久。预算只决定"要不要发起下一次删除"，不会
+/// 的话，积压的过期目录越多，锁被占得越久。它是软预算：只决定"要不要开始下一步"，不会
 /// 中途放弃进行中的删除——放弃之后底层可能还在删，锁却已经放开了。
 const DIR_RECLAIM_BUDGET: Duration = Duration::from_secs(2);
 
-/// 一轮里最多删除的目录数。时间预算管不住"每个都很快、合起来却很多"的批次，数量另设
-/// 上限，余下的留到下一轮。
+/// 一轮里最多发起多少次目录删除，失败的也算。时间预算管不住"每个都很快、合起来却很多"
+/// 的批次，数量另设上限，余下的留到下一轮。
 const DIR_RECLAIM_BATCH: usize = 64;
 
 /// 日志清理器
@@ -57,8 +58,11 @@ pub struct LogCleaner {
     mounted_paths: Arc<dyn MountedPathsProbe>,
     /// 一轮里删除目录的时间预算，见 [`DIR_RECLAIM_BUDGET`]
     reclaim_budget: Duration,
-    /// 一轮里最多删除的目录数，见 [`DIR_RECLAIM_BATCH`]
+    /// 一轮里最多发起的目录删除次数，见 [`DIR_RECLAIM_BATCH`]
     reclaim_batch: usize,
+    /// 让每一次目录删除都失败而不真的删除。测试用：验证失败的删除同样占用每轮的名额
+    #[cfg(test)]
+    fail_deletions: bool,
 }
 
 impl LogCleaner {
@@ -79,6 +83,8 @@ impl LogCleaner {
             mounted_paths,
             reclaim_budget: DIR_RECLAIM_BUDGET,
             reclaim_batch: DIR_RECLAIM_BATCH,
+            #[cfg(test)]
+            fail_deletions: false,
         }
     }
 
@@ -93,6 +99,13 @@ impl LogCleaner {
     #[cfg(test)]
     pub(super) fn with_reclaim_batch(mut self, batch: usize) -> Self {
         self.reclaim_batch = batch;
+        self
+    }
+
+    /// 让每一次目录删除都失败而不真的删除。测试用
+    #[cfg(test)]
+    pub(super) fn failing_deletions(mut self) -> Self {
+        self.fail_deletions = true;
         self
     }
 
@@ -261,7 +274,7 @@ impl LogCleaner {
             }
         };
 
-        let mut reclaimed = 0usize;
+        let mut attempts = 0usize;
         for path in candidates {
             if mounts.mounted.contains(&path) {
                 stats.dirs_skipped_in_use += 1;
@@ -276,8 +289,8 @@ impl LogCleaner {
                 );
                 continue;
             }
-            // 这一批的额度已用完：余下的不再复查，留到下一轮
-            if reclaimed >= self.reclaim_batch {
+            // 这一批的名额或时间预算已用完：余下的不再做任何 I/O，留到下一轮
+            if attempts >= self.reclaim_batch || reclaim_started.elapsed() >= self.reclaim_budget {
                 stats.dirs_deferred_by_budget += 1;
                 continue;
             }
@@ -307,10 +320,19 @@ impl LogCleaner {
                 stats.dirs_deferred_by_budget += 1;
                 continue;
             }
-            match fs::remove_dir_all(&path).await {
+            #[cfg(test)]
+            let removed = if self.fail_deletions {
+                Err(std::io::Error::other("fixture: directory deletion refused"))
+            } else {
+                fs::remove_dir_all(&path).await
+            };
+            #[cfg(not(test))]
+            let removed = fs::remove_dir_all(&path).await;
+            // 名额在发起时消耗：失败的删除同样占这一轮的名额
+            attempts += 1;
+            match removed {
                 Ok(()) => {
                     stats.dirs_deleted += 1;
-                    reclaimed += 1;
                     debug!(?path, "[log_cleaner] Deleted expired unmounted directory");
                 }
                 Err(error) => {
