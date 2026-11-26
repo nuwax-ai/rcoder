@@ -28,8 +28,10 @@ pub(super) fn path_after_resolved_base(
     )
 }
 
-/// RCoder 进程里用来建目录的路径，它对应宿主机上的 `host_path`（`{resolved_path}` 之后的
-/// 部分是 `suffix`）。
+/// RCoder 进程里用来建目录的路径，它对应宿主机上的目录 `host_path`。
+///
+/// `host_path` 必须是这个目录在宿主机上的**完整**路径，`suffix` 是它在 `{resolved_path}` 之后
+/// 的部分（两者要指向同一个目录）。
 ///
 /// 容器形态：用容器内的路径（compose bind 双向同步宿主机，rcoder 进程经挂载卷可写）。
 /// deploy-host：rcoder 进程即宿主机进程，直接在 bind 源上创建——容器常量路径在宿主机常为

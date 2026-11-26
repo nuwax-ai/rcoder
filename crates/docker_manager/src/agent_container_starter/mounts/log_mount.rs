@@ -51,7 +51,9 @@ pub(super) async fn create_log_directory(
         return Ok(None);
     };
     let suffix = path_after_resolved_base(mount_config, variables);
-    let create_path = directory_visible_to_this_process(resolved_base, resolve_from, &suffix);
+    // 宿主机上的完整路径：deploy-host 形态直接在它上面建目录
+    let host_path = format!("{resolved_base}{suffix}");
+    let create_path = directory_visible_to_this_process(&host_path, resolve_from, &suffix);
     let (Some(parent), Some(preferred)) = (
         std::path::Path::new(&create_path).parent(),
         std::path::Path::new(&create_path)

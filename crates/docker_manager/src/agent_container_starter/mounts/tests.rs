@@ -1,4 +1,7 @@
 //! `apply_auto_mounts` 的测试：用临时目录和假的路径换算，不连 Docker。
+//!
+//! 带不带 `deploy-host` 特性各编译一次，两种配置下这些用例都要成立：建目录走哪个路径在
+//! 那里分叉，所以目录布局按形态各留了一条用例。
 
 use super::*;
 use std::path::{Path, PathBuf};
@@ -12,15 +15,29 @@ use shared_types::ServiceMountConfig;
 const CONTAINER: &str = "computer-agent-runner-user_42";
 
 /// 一次测试用的目录布局：`host` 是 daemon 看到的日志总根，`visible` 是同一个目录在 RCoder
-/// 进程里的样子（一个符号链接）
+/// 进程里的样子。
+///
+/// [`Layout::new`] 让两者是同一个路径，带不带 `deploy-host` 特性都成立。容器形态下两者是
+/// 两个路径，见 [`Layout::with_separate_views`]。
 struct Layout {
     root: tempfile::TempDir,
+    /// `visible` 是不是另一个路径（指向 `host` 的符号链接）
+    separate_views: bool,
 }
 
 impl Layout {
     fn new() -> Self {
+        Self {
+            root: tempfile::tempdir().unwrap(),
+            separate_views: false,
+        }
+    }
+
+    /// 容器形态的布局：`visible/container` 是指向 `host/container` 的符号链接
+    fn with_separate_views() -> Self {
         let layout = Self {
             root: tempfile::tempdir().unwrap(),
+            separate_views: true,
         };
         std::fs::create_dir_all(layout.host_log_root()).unwrap();
         std::fs::create_dir(layout.root.path().join("visible")).unwrap();
@@ -29,11 +46,19 @@ impl Layout {
     }
 
     fn host_log_root(&self) -> PathBuf {
-        self.root.path().join("host/container")
+        if self.separate_views {
+            self.root.path().join("host/container")
+        } else {
+            self.root.path().join("container")
+        }
     }
 
     fn visible_log_root(&self) -> PathBuf {
-        self.root.path().join("visible/container")
+        if self.separate_views {
+            self.root.path().join("visible/container")
+        } else {
+            self.host_log_root()
+        }
     }
 }
 
@@ -308,4 +333,50 @@ async fn other_mounts_keep_using_the_existing_directory() {
     assert_eq!(std::fs::read(wallpaper.join("keep.txt")).unwrap(), b"kept");
     assert_eq!(entries(&wallpaper), ["keep.txt".to_owned()]);
     assert!(!config.env_vars.contains_key("CONTAINER_LOG_NAME"));
+}
+
+/// 容器形态：目录经 RCoder 进程里的路径建出来——它和宿主机路径不是同一个字符串；bind 用
+/// 的是宿主机路径。
+#[cfg(not(feature = "deploy-host"))]
+#[tokio::test]
+async fn in_container_form_the_directory_is_created_through_the_process_path() {
+    let layout = Layout::with_separate_views();
+
+    let config = apply(&layout, vec![log_mount(&layout)]).await.unwrap();
+
+    let mount = only_mount(&config);
+    let name = file_name(&mount.host_path);
+    assert!(
+        mount
+            .host_path
+            .starts_with(layout.host_log_root().to_str().unwrap()),
+        "the bind is the host path: {}",
+        mount.host_path
+    );
+    assert!(layout.host_log_root().join(name).is_dir());
+    assert!(layout.visible_log_root().join(name).is_dir());
+    assert_eq!(entries(&layout.host_log_root()), [name.to_owned()]);
+}
+
+/// deploy-host 形态：RCoder 进程就是宿主机进程，目录直接建在 bind 源上。bind 源里面不再
+/// 多出一层同名目录。
+#[cfg(feature = "deploy-host")]
+#[tokio::test]
+async fn in_deploy_host_form_the_directory_is_created_on_the_bind_source_itself() {
+    let layout = Layout::with_separate_views();
+
+    let config = apply(&layout, vec![log_mount(&layout)]).await.unwrap();
+
+    let mount = only_mount(&config);
+    let bound = layout.host_log_root().join(file_name(&mount.host_path));
+    assert_eq!(mount.host_path, bound.to_str().unwrap());
+    assert!(bound.is_dir());
+    assert!(
+        entries(&bound).is_empty(),
+        "the bind source must not contain a nested directory of the same name"
+    );
+    assert_eq!(
+        entries(&layout.host_log_root()),
+        [bound.file_name().unwrap().to_str().unwrap().to_owned()]
+    );
 }
