@@ -106,7 +106,7 @@ pub struct LogCleanupConfig {
     /// 日志保留天数，默认10天
     #[serde(default = "default_log_retention_days")]
     pub log_retention_days: u64,
-    /// 日志清理的检查间隔（秒）。容器清理任务每一轮只检查是否到期，默认86400秒（1天）
+    /// 日志清理的检查间隔（秒），默认 86400 秒（1 天）。设为 0 表示每轮容器清扫都运行。
     #[serde(default = "default_log_cleanup_interval_seconds")]
     pub cleanup_interval_seconds: u64,
 }

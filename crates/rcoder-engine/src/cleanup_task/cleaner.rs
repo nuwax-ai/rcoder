@@ -160,7 +160,10 @@ impl AgentCleaner {
     fn log_cleanup_due(&self) -> bool {
         match self.last_log_cleanup {
             None => true,
-            Some(last) => tokio::time::Instant::now() >= last + self.config.log_cleanup_interval,
+            Some(last) => {
+                tokio::time::Instant::now().saturating_duration_since(last)
+                    >= self.config.log_cleanup_interval
+            }
         }
     }
 

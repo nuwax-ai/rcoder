@@ -118,3 +118,16 @@ async fn log_directory_lookup_errors_retry_after_the_path_is_repaired() {
     assert!(!fixture.cleaner.log_cleanup_due());
     fixture.close().await;
 }
+
+#[tokio::test]
+async fn log_cleanup_interval_comparison_handles_the_full_config_range() {
+    let mut fixture = Fixture::new(0).await;
+    fixture.cleaner.last_log_cleanup = Some(tokio::time::Instant::now());
+
+    fixture.cleaner.config.log_cleanup_interval = Duration::from_secs(u64::MAX);
+    assert!(!fixture.cleaner.log_cleanup_due());
+
+    fixture.cleaner.config.log_cleanup_interval = Duration::ZERO;
+    assert!(fixture.cleaner.log_cleanup_due());
+    fixture.close().await;
+}
