@@ -310,7 +310,7 @@ async fn physical_docker_keeps_a_log_directory_that_is_still_being_mounted() {
     // 目录按修改时间已经过期（保留期配到最低、镜像拉了很久的情况），没有任何容器挂着
     let pending = aged_dir(&sandbox.process, &dir_name("pending", &owner), 15);
     let host_pending = sandbox.host_path(&pending);
-    let claim = docker_manager::claim_pending_bind_for_test(&host_pending);
+    let claim = docker_manager::claim_pending_bind_for_test(&host_pending).await;
     let cleaner = sandbox.cleaner(&sandbox.process);
 
     let inventory = sandbox

@@ -297,3 +297,89 @@ async fn a_log_directory_created_while_a_sweep_runs_is_not_touched() {
         .unwrap();
     assert!(fresh.is_dir());
 }
+
+/// 回归（Codex 第四轮 P1）：创建方在清理器取完清单**之后**才登记了一个已过期的旧目录。清单里
+/// 看不到它，但删除之前的最后一次确认看得到：目录保留，数据不丢。
+///
+/// 这个顺序是真实可能的：清理器读登记 → 创建方登记旧目录、删旧容器 → Docker 返回清单 → 新容器
+/// 还没建出来。
+#[tokio::test]
+async fn a_directory_registered_after_the_inventory_is_still_kept() {
+    let temp_dir = TempDir::new().unwrap();
+    // 先放数据再置过期时间：顺序反了的话，写文件会把目录的修改时间刷成现在
+    let reused = aged_dir(temp_dir.path(), "runner-a-20261029035324", 15);
+    let orphan = aged_dir(temp_dir.path(), "runner-gone-20261029035324", 15);
+    std::fs::write(reused.join("keep.log"), b"still bound").unwrap();
+    let old_time = std::time::SystemTime::now() - Duration::from_secs(15 * 24 * 60 * 60);
+    std::fs::set_times(
+        &reused,
+        std::fs::FileTimes::new().set_modified(old_time),
+    )
+    .unwrap();
+    let inventory = FakeInventory::new(&[]);
+    // 清单读不到它：创建方登记在清理器取完清单之后
+    inventory.refuse_reclaim(&reused);
+
+    let stats = cleaner(temp_dir.path(), inventory.clone())
+        .cleanup_once()
+        .await
+        .unwrap();
+
+    assert!(
+        reused.exists(),
+        "a directory a starting container registered after the inventory must be kept"
+    );
+    assert!(
+        !orphan.exists(),
+        "a decidable orphan is still reclaimed"
+    );
+    assert_eq!(stats.dirs_deleted, 1);
+    assert_eq!(stats.dirs_skipped_in_use, 1);
+    assert!(
+        reused.join("keep.log").is_file(),
+        "what the directory holds survives"
+    );
+}
+
+/// 最后一次确认判不出来：目录保留，和清单阶段的"无法确认"一样处理
+#[tokio::test]
+async fn a_directory_the_runtime_cannot_confirm_before_deleting_is_kept() {
+    let temp_dir = TempDir::new().unwrap();
+    let kept = aged_dir(temp_dir.path(), "runner-a-20261029035324", 15);
+    let orphan = aged_dir(temp_dir.path(), "runner-gone-20261029035324", 15);
+    let inventory = FakeInventory::new(&[]);
+    inventory.refuse_reclaim_as_unconfirmed(&kept);
+
+    let stats = cleaner(temp_dir.path(), inventory)
+        .cleanup_once()
+        .await
+        .unwrap();
+
+    assert!(kept.exists());
+    assert!(!orphan.exists());
+    assert_eq!(stats.dirs_deleted, 1);
+    assert_eq!(stats.dirs_skipped_unconfirmed, 1);
+}
+
+/// 删除之前每个候选都要过一次最后一次确认，被拒的那个不再发起删除
+#[tokio::test]
+async fn the_final_check_is_asked_for_every_candidate_that_is_about_to_be_deleted() {
+    let temp_dir = TempDir::new().unwrap();
+    let kept = aged_dir(temp_dir.path(), "runner-a-20261029035324", 15);
+    let orphan = aged_dir(temp_dir.path(), "runner-gone-20261029035324", 15);
+    let inventory = FakeInventory::new(&[]);
+    inventory.refuse_reclaim(&kept);
+
+    let stats = cleaner(temp_dir.path(), inventory.clone())
+        .cleanup_once()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        inventory.reclaim_checks(),
+        vec![kept.clone(), orphan.clone()],
+        "both candidates are confirmed right before deletion, in scan order"
+    );
+    assert_eq!(stats.dirs_deleted, 1);
+    assert_eq!(stats.dirs_skipped_in_use, 1);
+}

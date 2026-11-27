@@ -2,7 +2,7 @@
 //! 清理任务的调度测试共用。
 
 use async_trait::async_trait;
-use container_runtime_api::LogDirectoryMounts;
+use container_runtime_api::{LogDirectoryMounts, ReclaimPermit, ReclaimRefused};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,6 +23,12 @@ pub(in crate::cleanup_task) struct FakeInventory {
     pub(in crate::cleanup_task) vanish_on_probe: Mutex<Vec<PathBuf>>,
     /// 被询问时顺手建出来的目录，用来模拟"扫描之后有容器刚启动"
     pub(in crate::cleanup_task) create_on_probe: Mutex<Vec<PathBuf>>,
+    /// 最后一次确认时拒绝删除的目录：模拟"创建方在清理器取完清单之后才登记了它"
+    pub(in crate::cleanup_task) refused_reclaims: Mutex<Vec<PathBuf>>,
+    /// 最后一次确认问过的目录，按询问顺序
+    pub(in crate::cleanup_task) reclaim_checks: Mutex<Vec<PathBuf>>,
+    /// 最后一次确认拒绝时给出的原因种类。默认"仍被占用"
+    pub(in crate::cleanup_task) reclaim_unconfirmed: Mutex<bool>,
     pub(in crate::cleanup_task) failing: Mutex<bool>,
     /// 回答之前先等这么久，用来模拟很慢的 Docker
     pub(in crate::cleanup_task) delay: Mutex<Duration>,
@@ -36,6 +42,9 @@ impl FakeInventory {
             unconfirmed: Mutex::new(Vec::new()),
             vanish_on_probe: Mutex::new(Vec::new()),
             create_on_probe: Mutex::new(Vec::new()),
+            refused_reclaims: Mutex::new(Vec::new()),
+            reclaim_checks: Mutex::new(Vec::new()),
+            reclaim_unconfirmed: Mutex::new(false),
             failing: Mutex::new(false),
             delay: Mutex::new(Duration::ZERO),
             calls: AtomicUsize::new(0),
@@ -67,6 +76,25 @@ impl FakeInventory {
             .lock()
             .unwrap()
             .push(path.to_path_buf());
+    }
+
+    /// 最后一次确认时拒绝删除 `path`
+    pub(in crate::cleanup_task) fn refuse_reclaim(&self, path: &Path) {
+        self.refused_reclaims
+            .lock()
+            .unwrap()
+            .push(path.to_path_buf());
+    }
+
+    /// 拒绝时说"判不出来"，而不是"仍被占用"
+    pub(in crate::cleanup_task) fn refuse_reclaim_as_unconfirmed(&self, path: &Path) {
+        self.refuse_reclaim(path);
+        *self.reclaim_unconfirmed.lock().unwrap() = true;
+    }
+
+    /// 最后一次确认问过的目录，按询问顺序
+    pub(in crate::cleanup_task) fn reclaim_checks(&self) -> Vec<PathBuf> {
+        self.reclaim_checks.lock().unwrap().clone()
     }
 
     pub(in crate::cleanup_task) fn set_failing(&self, failing: bool) {
@@ -113,6 +141,24 @@ impl MountedPathsProbe for FakeInventory {
                 .map(|path| (path, "fixture cannot confirm it".to_owned()))
                 .collect(),
         })
+    }
+
+    async fn begin_reclaim(&self, candidate: &Path) -> Result<ReclaimPermit, ReclaimRefused> {
+        self.reclaim_checks.lock().unwrap().push(candidate.to_path_buf());
+        if self
+            .refused_reclaims
+            .lock()
+            .unwrap()
+            .contains(&candidate.to_path_buf())
+        {
+            let reason = "fixture: a starting container registered it after the inventory was read";
+            return Err(if *self.reclaim_unconfirmed.lock().unwrap() {
+                ReclaimRefused::Unconfirmed(reason.to_owned())
+            } else {
+                ReclaimRefused::InUse(reason.to_owned())
+            });
+        }
+        Ok(ReclaimPermit::noop())
     }
 }
 

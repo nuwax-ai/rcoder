@@ -335,6 +335,16 @@ impl AgentContainerRuntime for Runtime {
                 .collect(),
         })
     }
+    async fn begin_log_directory_reclaim(
+        &self,
+        _candidate: &std::path::Path,
+    ) -> Result<
+        container_runtime_api::ReclaimPermit,
+        container_runtime_api::ReclaimRefused,
+    > {
+        // 与生产契约一致：清单之后的最后一次确认，这里没有创建方，一律放行
+        Ok(container_runtime_api::ReclaimPermit::noop())
+    }
     async fn cleanup_all(&self) -> ContainerRuntimeResult<()> {
         panic!("cleanup must not delete unrelated resources")
     }
