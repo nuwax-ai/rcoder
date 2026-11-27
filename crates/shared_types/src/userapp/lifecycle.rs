@@ -1335,6 +1335,22 @@ pub trait UserAppLifecycleStore: Send + Sync {
         target: &crate::BuilderControlTarget,
     ) -> Result<crate::ComputeControlRecord, UserAppStoreError>;
 
+    /// Same CAS as [`Self::resume_builder_restart_start`], but the builder's mount
+    /// witness becomes `volumes` (the `builder_volumes` JSON) instead of the
+    /// snapshot's. Used when the restart deliberately replaced bind sources the
+    /// caller has already verified; the witness must describe the mounts the
+    /// replacement actually has. The default ignores `volumes` and keeps the
+    /// snapshot's witness.
+    async fn resume_builder_restart_start_with_volumes(
+        &self,
+        snapshot: &crate::ComputeControlRecord,
+        target: &crate::BuilderControlTarget,
+        volumes: &serde_json::Value,
+    ) -> Result<crate::ComputeControlRecord, UserAppStoreError> {
+        let _ = volumes;
+        self.resume_builder_restart_start(snapshot, target).await
+    }
+
     /// Retain a new private archive only after the same retained builder's
     /// stopped execution, original lease and volumes were observed. This CAS
     /// preserves the original operation/stage and historical reference.

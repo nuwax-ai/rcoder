@@ -2,6 +2,8 @@
 //! These fixtures exercise archive/lease ordering, not an actual Docker daemon.
 use super::*;
 
+mod log_directory_swap;
+
 const OLD_UID: &str = "original-docker-container";
 const NEW_UID: &str = "restored-docker-container";
 const INVALID_ARCHIVE: &str = "original-docker-archive-is-invalid";
@@ -9,12 +11,37 @@ const INVALID_ARCHIVE: &str = "original-docker-archive-is-invalid";
 pub(super) struct Mode {
     store: Arc<dyn UserAppLifecycleStore>,
     volume: AppResourceIdentity,
+    /// 可回收日志根下的日志挂载：重启时运行时把它的 bind 源换成新目录
+    log: Option<LogSwap>,
+    /// 恢复之后工作区的 bind 源也变了——运行时不该这么做，引擎必须拒绝
+    workspace_swap: bool,
+    /// daemon 以这个状态码明确拒绝创建替代容器
+    reject_with: Mutex<Option<u16>>,
     saved: Mutex<Option<BuilderRestartTemplate>>,
     restored: AtomicBool,
     omit_archive: AtomicBool,
     corrupt_archive: AtomicBool,
     restore_snapshots: Mutex<Vec<ComputeControlRecord>>,
     start_snapshots: Mutex<Vec<ComputeControlRecord>>,
+}
+
+/// 一条会被换源的日志挂载
+pub(super) struct LogSwap {
+    before: AppResourceIdentity,
+    after: AppResourceIdentity,
+    /// 运行时有没有把这条挂载报给引擎（`builder_restart_replaced_mounts`）
+    declared: bool,
+}
+
+/// 一次夹具里恢复之后哪些 bind 源会变
+#[derive(Default)]
+pub(super) struct Swaps {
+    /// 日志目录换源：`Some((旧目录, 新目录))`
+    pub(super) log: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    /// 运行时把日志挂载报给引擎
+    pub(super) declared: bool,
+    /// 工作区的 bind 源也被换了
+    pub(super) workspace_swap: bool,
 }
 
 pub(super) fn receipt(context: &UserAppExecutionContext) -> UserAppOperationLeaseReceipt {
@@ -66,8 +93,34 @@ impl Mode {
         }
     }
 
+    /// 此刻 builder 的挂载：恢复之前是归档里的，恢复之后是替代容器的
     pub(super) fn volumes(&self) -> Vec<AppResourceIdentity> {
-        vec![self.volume.clone()]
+        let restored = self.restored.load(Ordering::SeqCst);
+        let mut volumes = vec![if restored && self.workspace_swap {
+            AppResourceIdentity {
+                uid: self.volume.uid.clone() + "-swapped",
+                ..self.volume.clone()
+            }
+        } else {
+            self.volume.clone()
+        }];
+        if let Some(log) = &self.log {
+            volumes.push(if restored {
+                log.after.clone()
+            } else {
+                log.before.clone()
+            });
+        }
+        volumes
+    }
+
+    /// 运行时报给引擎的"重启会换 bind 源的挂载点"
+    pub(super) fn replaced_mounts(&self) -> Vec<String> {
+        self.log
+            .as_ref()
+            .filter(|log| log.declared)
+            .map(|log| vec![log.before.name.clone()])
+            .unwrap_or_default()
     }
 
     async fn snapshot(&self, context: &UserAppExecutionContext) -> ComputeControlRecord {
@@ -114,6 +167,15 @@ impl Mode {
     ) -> ContainerRuntimeResult<BuilderControlTarget> {
         if !self.archive_valid(template) {
             return Err(ContainerRuntimeError::Conflict(INVALID_ARCHIVE.into()));
+        }
+        if let Some(status) = *self.reject_with.lock().unwrap() {
+            return Err(ContainerRuntimeError::RequestRejected(
+                RuntimeRequestRejection::from_status(
+                    status,
+                    "daemon refused the replacement".into(),
+                )
+                .unwrap(),
+            ));
         }
         let snapshot = self.snapshot(&template.source.context).await;
         assert_eq!(
@@ -180,10 +242,42 @@ async fn fixture() -> (
     ComputeControlRecord,
     tempfile::TempDir,
 ) {
+    fixture_with(Swaps::default()).await
+}
+
+async fn fixture_with(
+    swaps: Swaps,
+) -> (
+    Arc<AppState>,
+    Arc<Runtime>,
+    Arc<Mode>,
+    ComputeControlRecord,
+    tempfile::TempDir,
+) {
     let (state, runtime, pending, directory) = super::fixture().await;
     let workspace = directory.path().join("retained-workspace");
     std::fs::create_dir(&workspace).unwrap();
     std::fs::write(workspace.join("sentinel"), "retained-original-data").unwrap();
+    let log = swaps.log.map(|(before, after)| {
+        for directory in [&before, &after] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        LogSwap {
+            before: AppResourceIdentity {
+                kind: AppResourceKind::HostPath,
+                name: "/app/container-logs".into(),
+                uid: before.to_str().unwrap().into(),
+                resource_version: None,
+            },
+            after: AppResourceIdentity {
+                kind: AppResourceKind::HostPath,
+                name: "/app/container-logs".into(),
+                uid: after.to_str().unwrap().into(),
+                resource_version: None,
+            },
+            declared: swaps.declared,
+        }
+    });
     let mode = Arc::new(Mode {
         store: state.userapp_store.clone(),
         volume: AppResourceIdentity {
@@ -192,6 +286,9 @@ async fn fixture() -> (
             uid: workspace.to_str().unwrap().into(),
             resource_version: None,
         },
+        log,
+        workspace_swap: swaps.workspace_swap,
+        reject_with: Mutex::new(None),
         saved: Default::default(),
         restored: AtomicBool::new(false),
         omit_archive: AtomicBool::new(false),

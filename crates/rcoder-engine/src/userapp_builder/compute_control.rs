@@ -1209,6 +1209,8 @@ async fn execute_claimed(
         crate::userapp_forward::invalidate_probe_cache(&record.app_id);
     }
     if policy::is_restart(record.action) {
+        // 本次重启允许换 bind 源的挂载点，由运行时点名；没有走归档重放时为空
+        let mut replaced: Vec<String> = Vec::new();
         // Scale-down changed resourceVersion. Refresh only the SAME physical UID.
         let mut fresh = if builder_scope {
             let old: BuilderControlTarget = serde_json::from_value(target.clone())?;
@@ -1256,6 +1258,9 @@ async fn execute_claimed(
                 ensure!(template.source == old, "Restart archive source differs");
                 state.userapp_store.check_compute_executor(identity).await?;
                 *settled = false;
+                // 运行时重建替代容器时，会把它点名的那几条挂载（可回收日志根下的日志目录）
+                // 换成新目录；其余挂载重启前后必须一致
+                replaced = replaced_restart_mounts(state, &template).await?;
                 fresh = state.runtime().restore_builder_restart(&template).await?;
                 fresh.restart_image = old.restart_image.clone();
                 fresh.restart_runtime_workspace = old.restart_runtime_workspace.clone();
@@ -1268,7 +1273,7 @@ async fn execute_claimed(
             } else if let Some(template) = target.get("builder_restart_template") {
                 prepared["builder_restart_template"] = template.clone();
             }
-            verify_builder_volume_witness(&target, &prepared)?;
+            verify_builder_volume_witness(&target, &prepared, &replaced)?;
             prepared
         } else {
             let prior: UserAppComputeStartTarget = serde_json::from_value(target.clone())?;
@@ -2648,8 +2653,9 @@ async fn resume_builder_start_with_guard(
                 current == old,
                 "Missing builder target changed before continuation"
             );
+            // 没有 bind 被换：缺失的 builder 由保留下来的卷重建，不是归档重放
             let prepared = builder_compute_checkpoint(state, &current, true).await?;
-            verify_builder_volume_witness(&snapshot.checkpoint, &prepared)?;
+            verify_builder_volume_witness(&snapshot.checkpoint, &prepared, &[])?;
             RestartContinuation::Dev(old.clone())
         };
         ensure!(
@@ -2662,6 +2668,8 @@ async fn resume_builder_start_with_guard(
             .await?;
         return run_restart_continuation_with_guard(state, record, prepared, held_guard).await;
     }
+    // 本次重启允许换 bind 源的挂载点，由运行时点名；没有走归档重放时为空
+    let mut replaced: Vec<String> = Vec::new();
     let target = if snapshot.stage == ComputeControlStage::Starting.as_str() {
         if state
             .runtime()
@@ -2726,6 +2734,7 @@ async fn resume_builder_start_with_guard(
             // The durable stopped boundary already confirms old compute exited.
             // Restore only a zero-replica controller; the CAS below must succeed
             // before any new business instance can start.
+            replaced = replaced_restart_mounts(state, &template).await?;
             let mut restored = state.runtime().restore_builder_restart(&template).await?;
             restored.restart_image = old.restart_image.clone();
             restored.restart_runtime_workspace = old.restart_runtime_workspace.clone();
@@ -2753,10 +2762,12 @@ async fn resume_builder_start_with_guard(
         "Builder lease changed before continuation claim"
     );
     let prepared = builder_compute_checkpoint(state, &target, true).await?;
-    verify_builder_volume_witness(&continuing.checkpoint, &prepared)?;
+    verify_builder_volume_witness(&continuing.checkpoint, &prepared, &replaced)?;
+    // 见证写替代容器实际有的挂载：换过源的日志目录从此以它为准
+    let volumes = prepared["builder_volumes"].clone();
     let record = state
         .userapp_store
-        .resume_builder_restart_start(&continuing, &target)
+        .resume_builder_restart_start_with_volumes(&continuing, &target, &volumes)
         .await?;
     run_restart_continuation_with_guard(state, record, RestartContinuation::Dev(target), held_guard)
         .await
@@ -2879,9 +2890,30 @@ async fn confirmed_missing_builder_checkpoint(
     Ok(prepared)
 }
 
+/// The mounts a restart may change for `template`, reported by the runtime: only
+/// the reclaimable log directories under it are replaced with fresh ones. An
+/// error means the runtime cannot tell, which fails the restart.
+async fn replaced_restart_mounts(
+    state: &AppState,
+    template: &BuilderRestartTemplate,
+) -> Result<Vec<String>> {
+    Ok(state
+        .runtime()
+        .builder_restart_replaced_mounts(template)
+        .await?)
+}
+
+/// The builder's mounts must come back from a restart exactly as they were, with
+/// one exception: at the mount targets in `replaced` (container paths, named by
+/// the runtime) the bind source (`uid`) may differ, because the runtime hands the
+/// replacement a fresh log directory there. Every other field of a named mount,
+/// and every field of any other mount, must be unchanged, and so must the count
+/// and the order: a replaced mount cannot stand in for another one. The runtime
+/// itself checks the replacement's actual mounts against the sources it handed out.
 fn verify_builder_volume_witness(
     original: &serde_json::Value,
     prepared: &serde_json::Value,
+    replaced: &[String],
 ) -> Result<()> {
     let old = original
         .get("builder_volumes")
@@ -2892,9 +2924,19 @@ fn verify_builder_volume_witness(
     let old: Vec<AppResourceIdentity> = serde_json::from_value(old.clone())?;
     let new: Vec<AppResourceIdentity> = serde_json::from_value(new.clone())?;
     ensure!(
-        old == new,
+        old.len() == new.len(),
         "Builder workspace volume identity changed during restart"
     );
+    for (old, new) in old.iter().zip(&new) {
+        let mut expected = old.clone();
+        if replaced.contains(&old.name) {
+            expected.uid = new.uid.clone();
+        }
+        ensure!(
+            expected == *new,
+            "Builder workspace volume identity changed during restart"
+        );
+    }
     if prepared
         .get("builder_compute_single_write")
         .and_then(serde_json::Value::as_bool)
@@ -3013,6 +3055,9 @@ mod restart_resolution_tests {
         assert_eq!(runtime.restores.load(Ordering::SeqCst), 1);
     }
 }
+
+#[cfg(test)]
+mod restart_volume_tests;
 
 #[cfg(test)]
 mod restart_workspace_tests {

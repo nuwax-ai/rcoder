@@ -1253,11 +1253,13 @@ pub(super) async fn capture_stopped_builder_template(
     compute::current(tx, &identity).await
 }
 
+/// `volumes` 给出时成为新的挂载见证（调用方已经核对过换源）；没给出时沿用快照里的
 pub(super) async fn resume_builder_restart(
     tx: &mut dyn Executor,
     backend: Backend,
     snapshot: &ComputeControlRecord,
     target: &BuilderControlTarget,
+    volumes: Option<&serde_json::Value>,
 ) -> Result<ComputeControlRecord, Error> {
     repo::claim_app(tx, backend, &snapshot.app_id).await?;
     let context = snapshot.execution_context().map_err(|e| invalid(&e))?;
@@ -1346,8 +1348,13 @@ pub(super) async fn resume_builder_restart(
     if target.workload.is_some() && snapshot.has_conditional_compute_write() {
         checkpoint["builder_compute_single_write"] = serde_json::Value::Bool(true);
     }
-    if let Some(volumes) = snapshot.checkpoint.get("builder_volumes") {
-        checkpoint["builder_volumes"] = volumes.clone();
+    match volumes {
+        Some(volumes) => checkpoint["builder_volumes"] = volumes.clone(),
+        None => {
+            if let Some(volumes) = snapshot.checkpoint.get("builder_volumes") {
+                checkpoint["builder_volumes"] = volumes.clone();
+            }
+        }
     }
     if let Some(template) = snapshot.checkpoint.get("builder_restart_template") {
         checkpoint["builder_restart_template"] = template.clone();

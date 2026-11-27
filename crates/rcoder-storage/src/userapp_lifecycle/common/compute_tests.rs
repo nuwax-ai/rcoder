@@ -1469,6 +1469,9 @@ async fn stopped_restart_replacement_uid_requires_witness_and_single_cas_winner(
 #[path = "compute_restart_absence_tests.rs"]
 mod absence;
 
+#[path = "compute_restart_witness_tests.rs"]
+mod restart_witness;
+
 #[path = "compute_stop_observation_tests.rs"]
 mod stop_observation;
 

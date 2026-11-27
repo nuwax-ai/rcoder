@@ -670,14 +670,16 @@ impl UserAppLifecycleStore for ToastyUserAppStore {
         snapshot: &ComputeControlRecord,
         target: &BuilderControlTarget,
     ) -> Result<ComputeControlRecord, UserAppStoreError> {
-        let snapshot = snapshot.clone();
-        let target = target.clone();
-        self.run(false, move |tx, backend| {
-            Box::pin(async move {
-                compute_execution::resume_builder_restart(tx, backend, &snapshot, &target).await
-            })
-        })
-        .await
+        resume_builder_restart_start_with(self, snapshot, target, None).await
+    }
+
+    async fn resume_builder_restart_start_with_volumes(
+        &self,
+        snapshot: &ComputeControlRecord,
+        target: &BuilderControlTarget,
+        volumes: &serde_json::Value,
+    ) -> Result<ComputeControlRecord, UserAppStoreError> {
+        resume_builder_restart_start_with(self, snapshot, target, Some(volumes)).await
     }
 
     async fn capture_stopped_builder_restart_template(
@@ -1697,4 +1699,30 @@ pub async fn offline_compute_snapshot(
         .await;
     owner.shutdown().await?;
     result
+}
+
+/// Stopped → Starting 的续做。`volumes` 给出时它成为新的挂载见证；没给出时沿用快照里的
+async fn resume_builder_restart_start_with(
+    store: &ToastyUserAppStore,
+    snapshot: &ComputeControlRecord,
+    target: &BuilderControlTarget,
+    volumes: Option<&serde_json::Value>,
+) -> Result<ComputeControlRecord, UserAppStoreError> {
+    let snapshot = snapshot.clone();
+    let target = target.clone();
+    let volumes = volumes.cloned();
+    store
+        .run(false, move |tx, backend| {
+            Box::pin(async move {
+                compute_execution::resume_builder_restart(
+                    tx,
+                    backend,
+                    &snapshot,
+                    &target,
+                    volumes.as_ref(),
+                )
+                .await
+            })
+        })
+        .await
 }

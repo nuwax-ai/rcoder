@@ -467,6 +467,18 @@ impl AgentContainerRuntime for Runtime {
             .expect("Docker archive fixture");
         mode.restore(template).await
     }
+    async fn builder_restart_replaced_mounts(
+        &self,
+        _template: &BuilderRestartTemplate,
+    ) -> ContainerRuntimeResult<Vec<String>> {
+        let replaced = self
+            .docker
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|mode| mode.replaced_mounts());
+        Ok(replaced.unwrap_or_default())
+    }
     async fn ensure_absent_builder_control(
         &self,
         _: &BuilderControlTarget,
